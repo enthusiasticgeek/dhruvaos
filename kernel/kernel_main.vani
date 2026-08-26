@@ -925,6 +925,23 @@ fn kernel_main() -> i64 {
   // per path (not the first, not a mix) and an unrelated path is
   // unaffected.
   let _ = fs_init();
+
+  // Report what recovery alone found, BEFORE any fresh writes this
+  // boot might make -- test/power_yank.py checks exactly this line
+  // against a deliberately torn image. Reading it only after the
+  // fresh fs_append calls just below would defeat the whole test:
+  // those calls run unconditionally every boot and would silently
+  // paper over whatever recovery actually did with brand new records.
+  let recovery_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let recovery_len: i64 = fs_read("/config/mode", recovery_buf);
+  let _ = uart_puts("FS: post-recovery /config/mode = \"");
+  if recovery_len >= 0 {
+    let _ = fs_print_data(recovery_buf, recovery_len);
+  } else {
+    let _ = uart_puts("(not found)");
+  }
+  let _ = uart_puts("\"\n");
+
   let _ = fs_append("/config/mode", "auto");
   let _ = fs_append("/config/name", "dhruva");
   let _ = fs_append("/config/mode", "manual");
