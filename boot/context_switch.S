@@ -7,6 +7,17 @@
  * from both the timer-tick path (scheduler_switch_from_irq) and the
  * new voluntary path (task_sleep_ticks) -- the same policy either way.
  *
+ * Priority numbering reservation (DHRUVA_ARCHITECTURE.md §4): idle is
+ * deliberately the numerically-worst priority in this scheme (3, right
+ * now), not a hardcoded "always exactly 3" constant elsewhere -- when
+ * phase 6 networking adds a best-effort/network task band, it belongs
+ * numerically *between* the lowest hard-RT priority and idle (i.e.
+ * idle's number moves up to make room, network tasks take what used
+ * to be idle's slot), never above any hard-RT task. Nothing to build
+ * for that yet -- this is the one-line reservation the architecture
+ * doc asks for now so the scheduler never needs a structural change
+ * later, not a stub to maintain in the meantime.
+ *
  * Why dhruva_prio_lock/dhruva_prio_unlock don't need a locked-flag or owner field:
  * this is the actual point of Immediate Priority Ceiling Protocol, not
  * a shortcut. They just write the CALLING task's eff_prio_table entry
