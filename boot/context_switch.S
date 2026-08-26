@@ -25,16 +25,36 @@
  * everything else (task bodies, the print loop, printing decisions)
  * stays in kernel_main.vani.
  *
- * Real, load-bearing limitation this design works around: vani has no
- * way to take the address of a function (confirmed empirically -- `f as
- * i64` on a `fn() -> i64` value is rejected by the checker as an
- * unrelated-type cast, and there is no builtin for it either). A
- * general "spawn task at this entry point" API would need that. Until
- * vani gains function-pointer support, each task needs its own named
- * *_init_stack stub below, hardcoded to its entry function by symbol
- * name at the assembly level -- fine for Phase 1's fixed, small task
- * count, a real constraint worth solving later for anything more
- * general.
+ * ABI note, corrected 2026-08-25: every address crossing into this file
+ * from vani is `mut ref i64`, not a bare `i64` (initial versions used
+ * plain i64 out of a wrong assumption that raw pointer types couldn't
+ * cross extern "C" at all -- disproven by testing the actual LLVM IR,
+ * where `mut ref i64` lowers to plain `i64*`, always exactly one
+ * register). This matters here specifically because vani's `i64` is a
+ * genuine 64-bit value and AAPCS passes a 64-bit *scalar* argument as a
+ * register PAIR with alignment padding, which silently shifts later
+ * arguments by a register -- the exact bug that first broke this file
+ * (a plain-i64 stack_bytes argument was assumed to be in r1, but a
+ * preceding i64 stack_base argument pushed it to r2). A `mut ref i64`
+ * pointer argument never has this problem: always one register,
+ * regardless of what precedes it. `stack_bytes` below is still a plain
+ * `i64` (a byte count, not an address) and still needs the pairing rule
+ * accounted for -- that part of the original finding still applies and
+ * is not a mistake to walk back.
+ *
+ * Real, load-bearing limitation this design still works around: vani
+ * has no way to take the address of a function as data (confirmed
+ * empirically -- `f as i64` on a `fn() -> i64` value is rejected as an
+ * unrelated-type cast). It *can*, however, pass a named function
+ * directly where an extern parameter's declared type is itself
+ * `fn() -> i64` (confirmed: this lowers to a plain function-pointer
+ * argument, one register). That would allow a single generic
+ * `task_init_stack(stack_base, stack_bytes, entry)` instead of one
+ * named stub per task -- not done yet, since mixing a `mut ref i64`, a
+ * plain `i64`, and a `fn() -> i64` in one signature raises the register/
+ * stack-spill layout past what's been verified here, and Phase 1's two
+ * hardcoded tasks don't need it yet. Worth doing before task count grows
+ * past a handful.
  */
 
 .section ".bss"
@@ -65,8 +85,8 @@ yield_now:
     pop {r4-r11, lr}
     bx lr
 
-/* *mut i64 task_a_init_stack(*mut i64 stack_base, i64 stack_bytes)
- * *mut i64 task_b_init_stack(*mut i64 stack_base, i64 stack_bytes)
+/* mut ref i64 task_a_init_stack(mut ref i64 stack_base, i64 stack_bytes)
+ * mut ref i64 task_b_init_stack(mut ref i64 stack_base, i64 stack_bytes)
  * Builds the fake initial register frame at the top of a fresh stack
  * region so yield_now's restore half (pop {r4-r11,lr}; bx lr) can
  * bootstrap a never-before-run task exactly like it resumes one that
@@ -74,20 +94,17 @@ yield_now:
  * point, so "returning" into this fake frame for the first time is
  * indistinguishable from a normal resume.
  *
- * ABI note (found the hard way, first real QEMU boot): vani's `i64` is
- * a genuine 64-bit value, and AAPCS passes a 64-bit argument in a
- * register PAIR, not one register -- so stack_base is r0:r1 (r0=low,
- * r1=high, always 0 for any real 32-bit address) and stack_bytes is
- * r2:r3, NOT r1 as a naive "one arg = one register" reading would
- * assume. Every function below only ever touches the low register of
- * each pair and ignores the high one, which is safe and self-consistent
- * as long as every value passed through this whole file stays within
- * 32 bits -- true for every address/byte-count/index Dhruva deals with
- * on this 32-bit target, but a real, load-bearing assumption worth
- * stating plainly rather than leaving implicit. */
+ * stack_base (a ref/pointer) is exactly one register: r0. stack_bytes
+ * (a plain i64) still gets AAPCS's 64-bit-argument treatment -- aligned
+ * to the next even register, which means it lands in r2:r3, not r1.
+ * r1 is simply unused here (it would be stack_base's "high word" under
+ * the old plain-i64 design; under a ref it's not even that, just a
+ * padding gap AAPCS leaves for the i64 alignment rule). Return value is
+ * a ref too, so it's one register (r0) on the way out as well -- no
+ * pairing concern in either direction. */
 .global task_a_init_stack
 task_a_init_stack:
-    add r0, r0, r2      /* stack_bytes is r2 (r1 is stack_base's high word) */
+    add r0, r0, r2      /* stack_top = stack_base + stack_bytes */
     ldr r1, =task_a
     b prepare_stack_common
 
@@ -111,24 +128,23 @@ prepare_stack_common:
     str r1, [r0, #32]    /* lr slot = entry point */
     bx lr
 
-/* i64 start_multitasking(i64 sp_a, i64 sp_b)
+/* i64 start_multitasking(mut ref i64 sp_a, mut ref i64 sp_b)
  * Seeds the scheduler state and jumps into task_a for the first time.
  * Never returns in the Phase 1 demo (both tasks loop forever).
  *
- * Two i64 args -> AAPCS register pairs: sp_a is r0:r1, sp_b is r2:r3
- * (not r1 -- same register-pairing gotcha as above). r2 must be saved
- * off before it gets clobbered by loading sp_table's address; r4 is a
- * safe scratch register here since the pop just below overwrites it
- * anyway when it restores task_a's fake initial frame. */
+ * Two ref args, each exactly one register, land in r0 and r1
+ * consecutively -- no alignment/pairing gap, unlike two plain i64 args
+ * (which would put the second one in r2:r3, as the earlier plain-i64
+ * version of this function had to work around). This is the version
+ * that's actually simpler than what it replaced. */
 .global start_multitasking
 start_multitasking:
-    mov r4, r2             /* save sp_b (r2) before r2 gets reused below */
     ldr r2, =sp_table
     str r0, [r2, #0]       /* sp_table[0] = sp_a */
-    str r4, [r2, #4]       /* sp_table[1] = sp_b */
+    str r1, [r2, #4]       /* sp_table[1] = sp_b */
     ldr r3, =current_task
-    mov r5, #0
-    str r5, [r3]
+    mov r4, #0
+    str r4, [r3]
     mov sp, r0
     pop {r4-r11, lr}
     bx lr

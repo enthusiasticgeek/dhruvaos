@@ -3,17 +3,36 @@ intent "Dhruva Phase 0+1 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model 
 
 // Context-switch mechanics (boot/context_switch.S) and the tiny amount
 // of raw memory allocation they need (boot/rpi1/runtime_stubs.c) are
-// necessarily outside vani: extern fn addresses can't be taken in vani
-// (confirmed empirically -- there is no fn-to-address conversion), and
-// extern "C" doesn't support raw pointer types across the FFI boundary
-// (confirmed empirically -- only scalars/Str/ref T are wired through
-// the v1 ABI). Every address below is therefore threaded as a plain
-// i64, which is also exactly how the assembly on the other side treats
-// it: an opaque machine word, never dereferenced as vani-typed data.
-extern "C" fn dhruva_alloc_bytes(n: i64) -> i64;
-extern "C" fn task_a_init_stack(stack_base: i64, stack_bytes: i64) -> i64;
-extern "C" fn task_b_init_stack(stack_base: i64, stack_bytes: i64) -> i64;
-extern "C" fn start_multitasking(sp_a: i64, sp_b: i64) -> i64;
+// necessarily outside vani: a task-to-task context switch needs to save/
+// restore raw CPU registers and swap the live stack pointer mid-function,
+// which no high-level language's normal control flow can express.
+//
+// Every address crossing this boundary is `mut ref i64`, not a bare
+// `i64` -- corrected 2026-08-25 after finding this was never actually a
+// vani limitation. Initial versions of this file used plain `i64`
+// because of two wrong assumptions, both disproven by testing the real
+// LLVM IR/ARM codegen directly rather than guessing from the first error
+// message: (1) that raw pointer types can't cross extern "C" at all --
+// false, `ref T`/`mut ref T` cross cleanly as single-register pointers
+// (confirmed: `mut ref i64` params/returns lower to plain `i64*` in LLVM
+// IR, always exactly one register on this 32-bit target); (2) that a
+// second-class reference can't be stored in a `let` and reused across
+// several later calls within the same function -- also false, only
+// escaping the *enclosing function's* scope is disallowed, and nothing
+// here needs that.
+//
+// This isn't just cleaner -- it fixes a real bug class. vani's `i64` is
+// a genuine 64-bit value, and AAPCS passes a 64-bit *scalar* argument as
+// a register PAIR (with alignment padding that can silently shift a
+// later argument by a register). A pointer never has that problem: it's
+// always exactly one register, on any 32-bit target, regardless of how
+// many other arguments precede it. Using `mut ref i64` for every
+// address here removes the entire "which register is this actually in"
+// risk class the earlier plain-i64 version had to work around by hand.
+extern "C" fn dhruva_alloc_bytes(n: i64) -> mut ref i64;
+extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64) -> i64;
 extern "C" fn yield_now() -> i64;
 
 fn delay(count: i64) -> i64 {
@@ -140,11 +159,11 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("Dhruva Phase 1: cooperative multitasking\n");
 
   let stack_bytes: i64 = 4096;
-  let stack_a: i64 = dhruva_alloc_bytes(stack_bytes);
-  let stack_b: i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_a: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_b: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
 
-  let sp_a: i64 = task_a_init_stack(stack_a, stack_bytes);
-  let sp_b: i64 = task_b_init_stack(stack_b, stack_bytes);
+  let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
+  let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
 
   // Never returns -- control passes permanently to task_a, which
   // yields back and forth with task_b from here on.

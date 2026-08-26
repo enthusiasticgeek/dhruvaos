@@ -39,14 +39,14 @@ void exit(int code) {
 
 /* Dhruva Phase 1 -- minimal bump allocator for task stacks.
  *
- * Returns a raw address as a plain integer rather than a typed pointer
- * on purpose: vani's extern "C" FFI (v1) only supports scalars (i64/f64/
- * bool), Str, and ref T across the boundary -- raw pointer types like
- * *mut i64 are explicitly rejected ("not yet wired through the v1 FFI
- * ABI", confirmed empirically). Since every consumer of this address is
- * hand-written assembly that only ever treats it as an opaque 32-bit
- * word anyway, returning i64 and letting vani pass it straight through
- * is both the only option the FFI allows and the natural fit.
+ * Returns a genuine pointer -- corrected 2026-08-25. Earlier versions
+ * returned a plain `long` out of a wrong assumption that vani's extern
+ * "C" FFI couldn't carry raw pointer types across the boundary at all;
+ * disproven by testing the actual LLVM IR, where `mut ref i64` lowers to
+ * plain `i64*`, exactly the pointer-sized ABI slot this function's
+ * result was already occupying either way. `void*` is the honest C-side
+ * type for what this actually is now that the vani side calls it what
+ * it is instead of routing it through a same-width integer.
  *
  * Deliberately a bump allocator, never freed -- matches the
  * architecture doc's Phase 1 call for a fixed-block allocator, not a
@@ -56,11 +56,11 @@ void exit(int code) {
 static unsigned char dhruva_heap[DHRUVA_HEAP_BYTES];
 static unsigned long dhruva_heap_used = 0;
 
-long dhruva_alloc_bytes(long n) {
+void *dhruva_alloc_bytes(long n) {
     unsigned long need = (unsigned long)n;
     unsigned long aligned_used = (dhruva_heap_used + 7UL) & ~7UL;
     if (aligned_used + need > DHRUVA_HEAP_BYTES) {
-        return 0; /* out of kernel heap -- caller must check for 0 */
+        return (void*)0; /* out of kernel heap -- caller must check for null */
     }
     unsigned char *p = dhruva_heap + aligned_used;
     unsigned long i = 0;
@@ -69,5 +69,5 @@ long dhruva_alloc_bytes(long n) {
         i = i + 1;
     }
     dhruva_heap_used = aligned_used + need;
-    return (long)p;
+    return (void*)p;
 }
