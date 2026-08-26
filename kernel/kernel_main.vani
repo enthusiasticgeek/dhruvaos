@@ -77,6 +77,24 @@ extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, word_count: i64) ->
 extern "C" fn test_fill_pattern(buf: mut ref i64, byte_count: i64) -> i64;
 extern "C" fn test_compare_buffers(a: mut ref i64, b: mut ref i64, byte_count: i64) -> i64;
 
+// Phase 3 task #4 -- boot/fs_buf.S. Every parameter here is `u32`, not
+// `i64`, specifically to avoid the AAPCS argument/return-register bug
+// classes task #3 hit -- see that file's header for why this sidesteps
+// them by construction.
+extern "C" fn buf_write_byte(buf: mut ref i64, offset: u32, value: u32) -> u32;
+extern "C" fn buf_read_byte(buf: mut ref i64, offset: u32) -> u32;
+extern "C" fn buf_write_u32(buf: mut ref i64, offset: u32, value: u32) -> u32;
+extern "C" fn buf_read_u32(buf: mut ref i64, offset: u32) -> u32;
+extern "C" fn buf_checksum(buf: mut ref i64, start_offset: u32, byte_len: u32) -> u32;
+
+// boot/fs_state.S -- persists fs_init()'s recovery-scan result (where
+// the log's append cursor sits, the highest sequence number seen)
+// across the vani-call-boundary gap the same way sd_state does for
+// the SD driver's own RCA/addressing-mode.
+extern "C" fn fs_state_set(next_block: u32, next_seq: u32) -> u32;
+extern "C" fn fs_state_get_next_block() -> u32;
+extern "C" fn fs_state_get_next_seq() -> u32;
+
 fn delay(count: i64) -> i64 {
   let i: i64 = 0;
   while i < count {
@@ -542,6 +560,206 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   return 0;
 }
 
+// Phase 3 task #4 -- minimal log-structured filesystem. NOT a general
+// POSIX filesystem (per DHRUVA_ARCHITECTURE.md's own framing): a
+// flat, append-only log of fixed-size (one SD block, 512 bytes),
+// checksummed, path-keyed records. Overwriting a path just appends a
+// newer record with the same path and a higher sequence number --
+// the older one is left in place (reclaiming it is task #5's job,
+// running as a low-priority background task, never touching this
+// hard-real-time-adjacent append/read path). Block 0 is reserved
+// (unused for now -- a natural home for a future superblock, not
+// needed yet since fs_init's recovery scan reconstructs everything
+// from the log itself).
+//
+// Record layout (512 bytes):
+//   [0:4)   checksum   -- covers [4:512) only, computed fresh on
+//                         every read and compared against this
+//   [4:8)   seq_num    -- monotonically increasing across every
+//                         record ever appended; ties never happen,
+//                         so ">=" during recovery is really "the
+//                         first one wins if this ever changes"
+//   [8:12)  path_len
+//   [12:44) path bytes (32-byte max path; enforced on append)
+//   [44:48) data_len
+//   [48:512) data bytes (464-byte max payload; enforced on append)
+//
+// Why a checksum, not just trusting the write succeeded: this is
+// exactly the property test/power_yank.py exists to test -- a write
+// interrupted mid-block (power lost, or here, QEMU killed) leaves
+// SOME bytes updated and others not, and the checksum is what turns
+// "silently corrupt, half-old half-new data" into "this record fails
+// validation, ignore it and use whatever the previous valid record
+// for this path was." Genuinely torn writes are rejected, not just
+// unlikely -- provable by the sweep, not merely hoped for.
+fn fs_init() -> i64 {
+  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let blk: i64 = 1;
+  let max_blk: i64 = 2048; // 1MB log region for this v1 -- keeps a
+                            // fresh/large device's recovery scan
+                            // bounded rather than reading the whole
+                            // disk looking for the first free block.
+  let highest_seq: u32 = 0 as u32;
+  while blk < max_blk {
+    let rd_status: i64 = sdhost_read_block(blk, buf);
+    if rd_status != 0 {
+      break;
+    }
+    let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+    let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let this_seq: u32 = buf_read_u32(buf, 4 as u32);
+    // A checksum match ALONE isn't enough: buf_checksum's rotate-mix
+    // of an all-zero region is itself exactly 0, matching the
+    // all-zero stored-checksum field a genuinely unwritten (fresh
+    // device, never appended to) block already has -- so an empty
+    // block would otherwise look like a perfectly valid, trivially
+    // empty record, and recovery would silently scan straight past
+    // every real free block instead of stopping at the first one.
+    // Every genuine record's sequence number is >= 1 (fs_append never
+    // hands out 0), so requiring seq_num != 0 too is what actually
+    // distinguishes "real record" from "blank space that happens to
+    // checksum-match its own all-zero checksum field." Found by the
+    // append cursor landing at block 2040 on a device where nothing
+    // had ever been written below that -- exactly where an unrelated
+    // test (task #3's SD round-trip sweep) happens to write raw,
+    // non-record data, which is what finally failed the checksum
+    // check and looked like where the log "ended."
+    if (stored_checksum != computed_checksum) || (this_seq == (0 as u32)) {
+      break;
+    }
+    if this_seq > highest_seq {
+      highest_seq = this_seq;
+    }
+    blk = blk + 1;
+  }
+  let _ = fs_state_set(blk as u32, highest_seq + (1 as u32));
+  return 0;
+}
+
+fn fs_append(path: Str, data: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  let data_len: i64 = str_len_bytes(data);
+  if path_len > 32 {
+    return 1;
+  }
+  if data_len > 464 {
+    return 1;
+  }
+
+  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let next_block: u32 = fs_state_get_next_block();
+  let next_seq: u32 = fs_state_get_next_seq();
+
+  let _ = buf_write_u32(buf, 4 as u32, next_seq);
+  let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+  let i: i64 = 0;
+  while i < path_len {
+    let b: i64 = str_byte_at(path, i);
+    let _ = buf_write_byte(buf, (12 + i) as u32, b as u32);
+    i = i + 1;
+  }
+  let _ = buf_write_u32(buf, 44 as u32, data_len as u32);
+  let j: i64 = 0;
+  while j < data_len {
+    let b2: i64 = str_byte_at(data, j);
+    let _ = buf_write_byte(buf, (48 + j) as u32, b2 as u32);
+    j = j + 1;
+  }
+
+  // Checksum last, over everything written above -- covers exactly
+  // what a torn write could have left half-updated.
+  let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+  let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+  let wr_status: i64 = sdhost_write_block(next_block as i64, buf);
+  if wr_status != 0 {
+    return 1;
+  }
+
+  let _ = fs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+  return 0;
+}
+
+// Internal: the block number of the newest valid record for `path`,
+// or -1 if none exists. Shared by fs_read and (later) task #5's
+// compaction, which needs exactly this same "what's actually live"
+// query to know what's safe to reclaim.
+fn fs_find_latest_block(path: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  let next_block: u32 = fs_state_get_next_block();
+  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let best_block: i64 = 0 - 1;
+  let best_seq: u32 = 0 as u32;
+  let blk: i64 = 1;
+  while (blk as u32) < next_block {
+    let rd_status: i64 = sdhost_read_block(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      // Same "checksum match alone isn't enough" reasoning as
+      // fs_init's recovery scan -- see that comment for why seq_num
+      // != 0 is required too.
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        if (rec_path_len as i64) == path_len {
+          let matches: i64 = 1;
+          let k: i64 = 0;
+          while k < path_len {
+            let want: i64 = str_byte_at(path, k);
+            let got: u32 = buf_read_byte(buf, (12 + k) as u32);
+            if (got as i64) != want {
+              matches = 0;
+            }
+            k = k + 1;
+          }
+          if matches == 1 {
+            if rec_seq >= best_seq {
+              best_seq = rec_seq;
+              best_block = blk;
+            }
+          }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  return best_block;
+}
+
+// Copies the newest valid record's data bytes for `path` into
+// out_buf, returning the data length, or -1 if no valid record for
+// that path exists at all.
+fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
+  let blk: i64 = fs_find_latest_block(path);
+  if blk < 0 {
+    return 0 - 1;
+  }
+  let tmp: mut ref i64 = dhruva_alloc_bytes(512);
+  let rd_status: i64 = sdhost_read_block(blk, tmp);
+  if rd_status != 0 {
+    return 0 - 1;
+  }
+  let data_len: u32 = buf_read_u32(tmp, 44 as u32);
+  let i: i64 = 0;
+  while (i as u32) < data_len {
+    let b: u32 = buf_read_byte(tmp, (48 + i) as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  return data_len as i64;
+}
+
+fn fs_print_data(buf: mut ref i64, byte_len: i64) -> i64 {
+  let i: i64 = 0;
+  while i < byte_len {
+    let b: u32 = buf_read_byte(buf, i as u32);
+    let _ = uart_putc(b as i64);
+    i = i + 1;
+  }
+  return 0;
+}
+
 // Runs in real IRQ context (called from boot/irq_entry.S's irq_entry,
 // itself reached only via the hardware vector table -- never via a
 // normal vani call chain). #[interrupt] gets real value here: it
@@ -679,12 +897,16 @@ fn kernel_main() -> i64 {
 
   // Task #3 verification: write+read+compare across several distinct
   // blocks, to confirm the driver holds up across many consecutive
-  // data commands, not just a single lucky pair.
+  // data commands, not just a single lucky pair. Uses blocks near the
+  // top of fs_init's scan range (2040-2047, just under its 2048 cap),
+  // not 0-7 -- task #4's filesystem grows forward from block 1, so
+  // low block numbers are real, live log data as of this same boot,
+  // not a spare scratch area to overwrite with test patterns.
   let sd_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let sd_buf2: mut ref i64 = dhruva_alloc_bytes(512);
-  let sd_blk: i64 = 0;
+  let sd_blk: i64 = 2040;
   let sd_any_fail: i64 = 0;
-  while sd_blk < 8 {
+  while sd_blk < 2048 {
     let _ = test_fill_pattern(sd_buf, 512);
     let sd_wr: i64 = sdhost_write_block(sd_blk, sd_buf);
     let sd_rd: i64 = sdhost_read_block(sd_blk, sd_buf2);
@@ -697,6 +919,31 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("SD: 8-block round-trip sweep any_fail=");
   let _ = uart_put_hex32(sd_any_fail as u32);
   let _ = uart_puts("\n");
+
+  // Task #4 verification: append several path/value pairs, overwrite
+  // one path with a newer value, confirm reads see the latest write
+  // per path (not the first, not a mix) and an unrelated path is
+  // unaffected.
+  let _ = fs_init();
+  let _ = fs_append("/config/mode", "auto");
+  let _ = fs_append("/config/name", "dhruva");
+  let _ = fs_append("/config/mode", "manual");
+  let fs_out: mut ref i64 = dhruva_alloc_bytes(512);
+
+  let mode_len: i64 = fs_read("/config/mode", fs_out);
+  let _ = uart_puts("FS: /config/mode = \"");
+  let _ = fs_print_data(fs_out, mode_len);
+  let _ = uart_puts("\" (expect \"manual\")\n");
+
+  let name_len: i64 = fs_read("/config/name", fs_out);
+  let _ = uart_puts("FS: /config/name = \"");
+  let _ = fs_print_data(fs_out, name_len);
+  let _ = uart_puts("\" (expect \"dhruva\")\n");
+
+  let missing_len: i64 = fs_read("/config/missing", fs_out);
+  let _ = uart_puts("FS: /config/missing lookup result=");
+  let _ = uart_put_hex32(missing_len as u32);
+  let _ = uart_puts(" (expect FFFFFFFF, i.e. -1, not found)\n");
 
   let _ = timer_ic_init();
 
