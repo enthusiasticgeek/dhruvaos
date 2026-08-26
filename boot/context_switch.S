@@ -196,18 +196,26 @@ task_sleep_ticks:
  * lock-state/switch is needed here. */
 .global dhruva_prio_lock
 dhruva_prio_lock:
-    ldr r1, =current_task
-    ldr r2, [r1]
-    ldr r3, =eff_prio_table
-    str r0, [r3, r2, lsl #2]
+    ldr r2, =current_task
+    ldr r3, [r2]
+    ldr r2, =eff_prio_table
+    str r0, [r2, r3, lsl #2]
+    mov r0, #0              /* return value: 0 (unused by every caller
+                              * today, but see test_compare_buffers'
+                              * comment in sdcard_state.S for why a
+                              * garbage-high-word i64 return is a real,
+                              * not just theoretical, bug class here) */
+    mov r1, #0
     bx lr
 
 .global dhruva_prio_unlock
 dhruva_prio_unlock:
-    ldr r1, =current_task
-    ldr r2, [r1]
-    ldr r3, =eff_prio_table
-    str r0, [r3, r2, lsl #2]
+    ldr r2, =current_task
+    ldr r3, [r2]
+    ldr r2, =eff_prio_table
+    str r0, [r2, r3, lsl #2]
+    mov r0, #0
+    mov r1, #0
     bx lr
 
 /* mut ref i64 task_{a,b,c,d}_init_stack(mut ref i64 stack_base, i64 stack_bytes)

@@ -46,6 +46,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/rpi1/vectors.S" -o "${BUILD_DIR}/vectors.o"
 
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/sdcard_state.S" -o "${BUILD_DIR}/sdcard_state.o"
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
@@ -60,6 +63,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   -Wl,--gc-sections -Wl,-T,"${ROOT}/boot/rpi1/link.ld" \
   "${BUILD_DIR}/boot.o" "${BUILD_DIR}/context_switch.o" \
   "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/vectors.o" \
+  "${BUILD_DIR}/sdcard_state.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
   -o "${BUILD_DIR}/dhruva.elf"
 

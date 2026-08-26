@@ -58,6 +58,25 @@ extern "C" fn task_sleep_ticks(ticks: i64) -> i64;
 extern "C" fn dhruva_prio_lock(ceiling: i64) -> i64;
 extern "C" fn dhruva_prio_unlock(base_priority: i64) -> i64;
 
+// Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
+// addressing mode sdhost_init() discovers, across the vani-call-
+// boundary gap kernel_main.vani's own header explains -- no top-level
+// vani global exists to hold them instead. sdhost_drain_fifo_to_buffer/
+// sdhost_fill_fifo_from_buffer move raw 32-bit words between the
+// SDDATA FIFO register and a `mut ref i64` buffer -- vani has no
+// operation that turns a reference into the plain address
+// mmio_read_u32/mmio_write_u32 need, so this one small transfer loop
+// lives in hand-written assembly like every other raw-pointer gap
+// this project has hit.
+extern "C" fn sd_state_set(rca: i64, is_sdhc: i64) -> i64;
+extern "C" fn sd_state_get_rca() -> i64;
+extern "C" fn sd_state_get_is_sdhc() -> i64;
+extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, word_count: i64) -> i64;
+extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, word_count: i64) -> i64;
+// TEST-ONLY, task #3 verification -- see boot/sdcard_state.S.
+extern "C" fn test_fill_pattern(buf: mut ref i64, byte_count: i64) -> i64;
+extern "C" fn test_compare_buffers(a: mut ref i64, b: mut ref i64, byte_count: i64) -> i64;
+
 fn delay(count: i64) -> i64 {
   let i: i64 = 0;
   while i < count {
@@ -157,6 +176,25 @@ fn uart_puts(s: Str) -> i64 {
   return 0;
 }
 
+// Debug helper for bringing up new MMIO peripherals (Phase 3's SD
+// driver first): print a u32 as 8 hex digits, most-significant nibble
+// first. Not on any hard-RT path, so plain uart_putc's blocking wait
+// is fine here (unlike irq_dispatch's uart_putc_nonblocking).
+fn uart_put_hex32(v: u32) -> i64 {
+  let shift: i64 = 28;
+  while shift >= 0 {
+    let nibble: u32 = (v >> (shift as u32)) & (0xF as u32);
+    let n: i64 = nibble as i64;
+    if n < 10 {
+      let _ = uart_putc(48 + n);
+    } else {
+      let _ = uart_putc(55 + n);
+    }
+    shift = shift - 4;
+  }
+  return 0;
+}
+
 // Phase 2 -- BCM2835 system timer (base 0x20003000) + interrupt
 // controller (base 0x2000B000). Timer channel 1 (C1) is free for ARM
 // use on real hardware (channels 0 and 2 are reserved for the GPU
@@ -240,6 +278,267 @@ fn watchdog_init() -> i64 {
 fn watchdog_kick() -> i64 {
   let two_seconds_in_ticks: u32 = 131072 as u32;
   let _ = watchdog_arm(two_seconds_in_ticks);
+  return 0;
+}
+
+// Phase 3 -- BCM2835 SDHOST controller (base 0x20202000), the real SD
+// interface Pi 1 (and every earlier/simpler Pi) uses -- not the newer
+// EMMC/SDHCI interface later boards have. Register semantics are the
+// real, documented bcm2835-sdhost hardware protocol (same one Linux's
+// own bcm2835-sdhost.c targets), confirmed empirically against QEMU
+// before writing any of this: SDEDM/SDHSTS/SDCMD all read back sane,
+// documented reset-state values at this exact base before any driver
+// code touches them. Unlike the PM watchdog (Phase 2), this peripheral
+// is genuinely modeled under QEMU's raspi1ap, not just accepted and
+// simplified -- confirmed via the emulator binary itself carrying full
+// bcm2835-sdhost read/write/IRQ trace events, not just a stub.
+//
+// Bring-up only so far: CMD0 (GO_IDLE_STATE), polled rather than
+// interrupt-driven, no timeout error path yet. Deliberately not
+// wcet-annotated -- sdhost_cmd's poll loop has a real iteration cap
+// (unlike Phase 2's uart_putc, which had none and got caught by
+// exactly this class of check) but the full init/read/write state
+// machine isn't done enough yet to annotate meaningfully; that lands
+// once the driver is complete, not incrementally per bring-up step.
+fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
+  let sdarg: i64 = 0x20202004;
+  let sdcmd: i64 = 0x20202000;
+  let sdcmd_new_flag: u32 = 0x8000 as u32;
+  let _ = mmio_write_u32(sdarg, arg);
+  let _ = mmio_write_u32(sdcmd, sdcmd_new_flag | cmd_and_flags);
+
+  // Poll until the controller clears NEW_FLAG (command, and its
+  // response if any, complete) or the iteration cap is hit -- capped,
+  // not `while true`, specifically so a wedged card can never hang
+  // the caller forever the way an unbounded wait would.
+  let iter: i64 = 0;
+  while iter < 1000000 {
+    let v: u32 = mmio_read_u32(sdcmd);
+    if (v & sdcmd_new_flag) == (0 as u32) {
+      break;
+    }
+    iter = iter + 1;
+  }
+  return mmio_read_u32(sdcmd);
+}
+
+// BCM2835 GPIO 48-53 (the "SD_*_R" pins) are shared, muxed pins: on
+// THESE SPECIFIC pins, hardware alt-function encoding 0b100 (ALT0)
+// routes the card to SDHOST, while function-select 0b000 (plain GPIO
+// input, the post-reset default) routes it to SDHCI/EMMC instead --
+// the same real-hardware pin-muxing GPU firmware configures via
+// config.txt before jumping to the ARM kernel on real boards. Nothing
+// in this project's boot path plays that firmware role, so the mux
+// stays at its SDHCI-routed default until this runs.
+//
+// Found by reading QEMU's own hw/gpio/bcm2835_gpio.c source after
+// sdhost_init's CMD8/ACMD41 sequence kept timing out for no reason
+// visible from the SDHOST registers alone: SDCMD/SDHSTS both looked
+// completely correct mechanically (real bit values, real semantics,
+// confirmed against QEMU's own hw/sd/bcm2835_sdhost.c source too),
+// because the actual bug was one level up the emulated hardware
+// stack -- the drive attached via `-drive if=sd` was reparented onto
+// SDHCI by default, so SDHOST was issuing every command to a bus with
+// no card on it at all. First attempt at this fix used bit pattern
+// 0b011 (going by the generic "ALT4" naming convention used
+// elsewhere, e.g. UART's ALT0=0b100 on GPIO14/15) and still failed --
+// QEMU's own gpfsel_set() checks the raw fsel value against a literal
+// 4 (0b100) for these pins specifically, which Broadcom's datasheet
+// calls "ALT0" here, not "ALT4"; alt-function-number-to-bit-pattern
+// mapping is per-pin-group, not a single global convention, and
+// re-reading the emulator source directly (not guessing from another
+// peripheral's pin group) is what caught the mismatch.
+fn gpio_sdhost_alt_init() -> i64 {
+  let gpfsel4: i64 = 0x20200010;
+  let gpfsel5: i64 = 0x20200014;
+
+  // Pins 48 (bits 24-26) and 49 (bits 27-29) live in GPFSEL4.
+  let r4: u32 = mmio_read_u32(gpfsel4);
+  let clear_mask4: u32 = 0xC0FFFFFF as u32;
+  let sd_alt_bits4: u32 = 0x24000000 as u32; // 0b100 on both pins
+  let _ = mmio_write_u32(gpfsel4, (r4 & clear_mask4) | sd_alt_bits4);
+
+  // Pins 50-53 (bits 0-11, 3 bits each) live in GPFSEL5.
+  let r5: u32 = mmio_read_u32(gpfsel5);
+  let clear_mask5: u32 = 0xFFFFF000 as u32;
+  let sd_alt_bits5: u32 = 0x00000924 as u32; // 0b100 on all four pins
+  let _ = mmio_write_u32(gpfsel5, (r5 & clear_mask5) | sd_alt_bits5);
+  return 0;
+}
+
+fn sdhost_init() -> i64 {
+  let _ = gpio_sdhost_alt_init();
+
+  let sdvdd: i64 = 0x20202030;
+  let sdcdiv: i64 = 0x2020200C;
+  let sdtout: i64 = 0x20202008;
+  let sdhcfg: i64 = 0x20202038;
+  let sdhbct: i64 = 0x2020203C;
+  let sdhblc: i64 = 0x20202050;
+  let sdhsts: i64 = 0x20202020;
+  let sdedm: i64 = 0x20202034;
+
+  // Power off, then back on -- a clean, known starting FSM state
+  // rather than trusting whatever QEMU's reset default happens to be.
+  let _ = mmio_write_u32(sdvdd, 0 as u32);
+  let _ = delay(10000);
+  let _ = mmio_write_u32(sdvdd, 1 as u32);
+  let _ = delay(10000);
+
+  // Identification-speed clock divisor and a generous command
+  // timeout -- real-hardware bcm2835-sdhost values, not QEMU-specific
+  // tuning.
+  let _ = mmio_write_u32(sdcdiv, 0x148 as u32);
+  let _ = mmio_write_u32(sdtout, 0xF00000 as u32);
+  let _ = mmio_write_u32(sdhbct, 0 as u32);
+  let _ = mmio_write_u32(sdhblc, 0 as u32);
+  // Interrupts stay disabled -- this driver polls SDCMD/SDHSTS
+  // directly, the same way Phase 0-2's own peripherals were brought
+  // up before anything needed a real IRQ line.
+  let _ = mmio_write_u32(sdhcfg, 0 as u32);
+
+  let sdcmd_no_response: u32 = 0x400 as u32;
+  let sdcmd_long_response: u32 = 0x200 as u32;
+  let sdcmd_busywait: u32 = 0x800 as u32;
+  let sdrsp0: i64 = 0x20202010;
+
+  // CMD0: GO_IDLE_STATE. No response expected.
+  let _ = sdhost_cmd(sdcmd_no_response, 0 as u32);
+
+  // CMD8: SEND_IF_COND -- 0x1AA = 2.7-3.6V range + the 0xAA check
+  // pattern. A card that doesn't echo it back either doesn't
+  // implement CMD8 (an old SDSC card -- not supported by this driver
+  // yet) or something's wrong with the link; not checked yet, just
+  // logged, since the only card this needs to handle right now is
+  // QEMU's own `-drive if=sd` image.
+  let _ = sdhost_cmd(8 as u32, 0x1AA as u32);
+  let _ = uart_puts("SD: CMD8 RSP0=0x");
+  let _ = uart_put_hex32(mmio_read_u32(sdrsp0));
+  let _ = uart_puts("\n");
+
+  // ACMD41 loop: CMD55 (APP_CMD) then CMD41 (SD_SEND_OP_COND) with
+  // the HCS bit set (this driver only supports SDHC/SDXC-style
+  // block-addressed cards) until the card's busy bit (bit 31 of the
+  // OCR response) sets, meaning it finished its own internal power-up
+  // sequence. Capped iteration count, not `while true` -- same
+  // reasoning as sdhost_cmd's own poll loop.
+  let ocr_busy: u32 = 0x80000000 as u32;
+  let hcs: u32 = 0x40000000 as u32;
+  let voltage_window: u32 = 0x00FF8000 as u32;
+  let acmd_iter: i64 = 0;
+  let ocr: u32 = 0 as u32;
+  while acmd_iter < 1000 {
+    let _ = sdhost_cmd(55 as u32, 0 as u32);
+    let _ = sdhost_cmd(41 as u32, hcs | voltage_window);
+    ocr = mmio_read_u32(sdrsp0);
+    if (ocr & ocr_busy) != (0 as u32) {
+      break;
+    }
+    acmd_iter = acmd_iter + 1;
+  }
+  let _ = uart_puts("SD: ACMD41 done, OCR=0x");
+  let _ = uart_put_hex32(ocr);
+  let _ = uart_puts("\n");
+
+  // CMD2: ALL_SEND_CID -- long (136-bit) response. No addressing yet
+  // (this is the one open-drain-style "every card on the bus
+  // responds" command) -- fine here since exactly one card exists.
+  let _ = sdhost_cmd(sdcmd_long_response | (2 as u32), 0 as u32);
+
+  // CMD3: SEND_RELATIVE_ADDR -- the card publishes its own RCA in the
+  // top 16 bits of the (short) response; every later addressed
+  // command needs it in that same position, so no shift is needed
+  // between reading it here and using it below.
+  let _ = sdhost_cmd(3 as u32, 0 as u32);
+  let rca: u32 = mmio_read_u32(sdrsp0) & (0xFFFF0000 as u32);
+
+  // CMD9: SEND_CSD -- long response, addressed by the RCA just
+  // published. Not parsed yet (card capacity/speed class live here on
+  // real hardware) -- deferred until the driver actually needs it.
+  let _ = sdhost_cmd(sdcmd_long_response | (9 as u32), rca);
+
+  // CMD7: SELECT_CARD -- moves the card from stand-by to transfer
+  // state; every data command (CMD17/CMD24 etc., task #3) requires
+  // this first.
+  let _ = sdhost_cmd(sdcmd_busywait | (7 as u32), rca);
+
+  // CMD16: SET_BLOCKLEN -- this driver only ever uses 512-byte
+  // blocks, set once here rather than before every single read/write.
+  let _ = sdhost_cmd(16 as u32, 512 as u32);
+
+  // OCR bit 30 (CCS, Card Capacity Status) is only meaningful once
+  // ACMD41 reported busy=0 (ready) above -- 1 means SDHC/SDXC
+  // (block-addressed), 0 means SDSC (byte-addressed, block_num*512).
+  // QEMU's generic SD card model derives this from the attached
+  // image's size, not anything this driver controls.
+  let ccs_bit: u32 = 0x40000000 as u32;
+  let is_sdhc: i64 = if (ocr & ccs_bit) != (0 as u32) { 1 } else { 0 };
+  let _ = sd_state_set(rca as i64, is_sdhc);
+
+  let _ = uart_puts("SD: init done, RCA=0x");
+  let _ = uart_put_hex32(rca);
+  let _ = uart_puts(" is_sdhc=");
+  let _ = uart_put_hex32(is_sdhc as u32);
+  let _ = uart_puts(" SDHSTS=0x");
+  let _ = uart_put_hex32(mmio_read_u32(sdhsts));
+  let _ = uart_puts(" SDEDM=0x");
+  let _ = uart_put_hex32(mmio_read_u32(sdedm));
+  let _ = uart_puts("\n");
+  return rca as i64;
+}
+
+// CMD17 (READ_SINGLE_BLOCK) / CMD24 (WRITE_BLOCK). block_num is a
+// logical 512-byte block index regardless of the card's own
+// addressing mode -- SDSC cards want a byte address (block_num*512)
+// on the wire, SDHC/SDXC cards want the block number directly; the
+// distinction is handled here, once, so nothing above this layer
+// (the Phase 3 filesystem, task #4) ever needs to care which kind of
+// card it's talking to.
+fn sdhost_card_addr(block_num: i64) -> u32 {
+  let is_sdhc: i64 = sd_state_get_is_sdhc();
+  if is_sdhc != 0 {
+    return block_num as u32;
+  }
+  return (block_num * 512) as u32;
+}
+
+fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
+  let sdhbct: i64 = 0x2020203C;
+  let sdhblc: i64 = 0x20202050;
+  let sdhsts: i64 = 0x20202020;
+  let sdcmd_read: u32 = 0x40 as u32;
+
+  let addr: u32 = sdhost_card_addr(block_num);
+  let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
+  let _ = mmio_write_u32(sdhbct, 512 as u32);
+  let _ = mmio_write_u32(sdhblc, 1 as u32);
+  let _ = sdhost_drain_fifo_to_buffer(buf, 128);
+  let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
+  let _ = mmio_write_u32(sdhsts, errs);
+  if errs != (0 as u32) {
+    return 1;
+  }
+  let _ = status;
+  return 0;
+}
+
+fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
+  let sdhbct: i64 = 0x2020203C;
+  let sdhblc: i64 = 0x20202050;
+  let sdhsts: i64 = 0x20202020;
+  let sdcmd_write: u32 = 0x80 as u32;
+
+  let addr: u32 = sdhost_card_addr(block_num);
+  let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
+  let _ = mmio_write_u32(sdhbct, 512 as u32);
+  let _ = mmio_write_u32(sdhblc, 1 as u32);
+  let _ = sdhost_fill_fifo_from_buffer(buf, 128);
+  let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
+  let _ = mmio_write_u32(sdhsts, errs);
+  if errs != (0 as u32) {
+    return 1;
+  }
+  let _ = status;
   return 0;
 }
 
@@ -375,6 +674,29 @@ fn task_d() -> i64 {
 fn kernel_main() -> i64 {
   let _ = uart_init();
   let _ = uart_puts("Dhruva Phase 2: fixed-priority scheduling + priority ceiling\n");
+
+  let _ = sdhost_init();
+
+  // Task #3 verification: write+read+compare across several distinct
+  // blocks, to confirm the driver holds up across many consecutive
+  // data commands, not just a single lucky pair.
+  let sd_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let sd_buf2: mut ref i64 = dhruva_alloc_bytes(512);
+  let sd_blk: i64 = 0;
+  let sd_any_fail: i64 = 0;
+  while sd_blk < 8 {
+    let _ = test_fill_pattern(sd_buf, 512);
+    let sd_wr: i64 = sdhost_write_block(sd_blk, sd_buf);
+    let sd_rd: i64 = sdhost_read_block(sd_blk, sd_buf2);
+    let sd_mismatch: i64 = test_compare_buffers(sd_buf, sd_buf2, 512);
+    if (sd_wr != 0) || (sd_rd != 0) || (sd_mismatch != 0) {
+      sd_any_fail = 1;
+    }
+    sd_blk = sd_blk + 1;
+  }
+  let _ = uart_puts("SD: 8-block round-trip sweep any_fail=");
+  let _ = uart_put_hex32(sd_any_fail as u32);
+  let _ = uart_puts("\n");
 
   let _ = timer_ic_init();
 
