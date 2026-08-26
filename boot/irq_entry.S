@@ -1,49 +1,62 @@
-/* Dhruva Phase 2 -- IRQ entry/exit (ARM32).
+/* Dhruva Phase 2 -- IRQ entry/exit (ARM32), now with real preemption.
  *
- * Genuinely different from Phase 1's cooperative yield_now: a hardware
- * interrupt can land on ANY instruction boundary, so unlike a normal
- * function call -- where AAPCS guarantees the caller already saved
- * anything it cares about in the caller-saved registers -- NOTHING
- * about the interrupted code's register state can be assumed dead.
- * r0-r3 and r12 must be saved here explicitly; r4-r11 don't need to be,
- * because `bl irq_dispatch` below calls a normal AAPCS-compliant
- * function, and AAPCS already guarantees any well-behaved callee
- * preserves r4-r11 across its own execution -- that's the same
- * guarantee every other function call in this whole codebase already
- * relies on, not a new assumption specific to interrupts.
+ * Step A (BUG-229 fixed, tick delivery proven) always returned to
+ * whatever was interrupted. This step lets the timer tick actually
+ * switch which task runs -- the core of "preemptive," not just
+ * "periodic."
+ *
+ * Why the FULL register set (r0-r12), not just the callee-saved r4-r11
+ * Phase 1's cooperative yield_now uses: yield_now is a real `bl` call,
+ * so AAPCS already guarantees the caller-saved registers (r0-r3, r12)
+ * are dead by the time control reaches it -- nothing to preserve. This
+ * routine can't rely on that anymore: if scheduler_switch_from_irq
+ * below decides to switch to a genuinely different task, the CURRENT
+ * task's r0-r3/r12 must survive on ITS OWN stack until it's resumed
+ * later, since nothing else will remember them. Saving everything,
+ * always, is what makes "resume this task later, from any point it
+ * was ever interrupted at" possible.
  *
  * ARM IRQ mode has its own banked r13(sp)/r14(lr), set up once in
- * boot.S, so entering IRQ mode doesn't disturb whatever stack the
- * interrupted code was using. This first cut of the handler does all
- * its work on that small dedicated IRQ stack and always returns to
- * wherever it interrupted -- it does not yet switch tasks. Real
- * preemption (the IRQ handler deciding a *different* task should run
- * next) needs a bigger redesign of this file, deferred until the
- * basic "does an IRQ even arrive and get handled correctly" question
- * is proven first -- same staged approach as Phase 0/1.
+ * boot.S -- entering IRQ mode doesn't disturb whatever stack the
+ * interrupted task was using, which is exactly why the full-context
+ * save below can safely push onto *that* stack (via `stmdb sp!`, still
+ * using IRQ mode's own banked sp) and read the interrupted task's real
+ * per-task stack only indirectly, through the pointer scheduler_
+ * switch_from_irq hands back.
  */
 
 .section ".text"
 .global irq_entry
 irq_entry:
-    sub lr, lr, #4              /* IRQ's lr is 4 ahead of the instruction
-                                  * that should actually resume */
-    stmdb sp!, {r0-r3, r12, lr}  /* 6 words = 24 bytes */
+    sub lr, lr, #4               /* IRQ's lr is 4 ahead of the instruction
+                                   * that should actually resume */
+    stmdb sp!, {r0-r12, lr}       /* 14 words = 56 bytes */
     mrs r0, spsr
-    stmdb sp!, {r0, r1}          /* spsr + one padding word = 8 bytes,
-                                  * keeping the total 32 bytes -- AAPCS
-                                  * requires 8-byte stack alignment at
-                                  * any call boundary, and 7 words (the
-                                  * 6 above plus a lone spsr push) would
-                                  * leave sp 4 bytes short of that right
-                                  * before `bl irq_dispatch` below. */
+    stmdb sp!, {r0, r1}           /* spsr + one padding word = 8 bytes,
+                                   * keeping the total 64 bytes (8-byte
+                                   * AAPCS alignment; see BUG-229 writeup
+                                   * for what happens when this is off
+                                   * by a word). */
 
-    bl irq_dispatch
+    bl irq_dispatch               /* ack + reschedule the timer, print --
+                                   * unrelated to *which* task runs next,
+                                   * still done every tick regardless */
 
-    ldmia sp!, {r0, r1}          /* r0 = spsr; r1 = discarded padding */
+    mov r0, sp                    /* r0 = pointer to the context just
+                                   * saved -- this task's resume point */
+    bl scheduler_switch_from_irq   /* returns r0 = the SP to resume,
+                                   * possibly a different task's */
+    mov sp, r0
+
+    ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
-    ldmia sp!, {r0-r3, r12, lr}
-    subs pc, lr, #0              /* return from IRQ: pc=lr, cpsr=spsr */
+    ldmia sp!, {r0-r12, lr}
+    subs pc, lr, #0               /* return from IRQ: pc=lr, cpsr=spsr --
+                                   * for a task resumed here for the
+                                   * first time, this is indistinguishable
+                                   * from a normal exception return, by
+                                   * the same fake-initial-frame
+                                   * construction Phase 1 established. */
 
 /* void enable_irqs(void) -- vani can't manipulate CPSR directly, so
  * this one-instruction wrapper is the only way to unmask IRQs from

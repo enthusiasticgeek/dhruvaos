@@ -1,5 +1,5 @@
 // श्री।
-intent "Dhruva Phase 0+1 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model B / QEMU raspi1ap), plus cooperative multitasking between two tasks via explicit yield. Entered from boot/rpi1/boot.S's _start after the stack pointer is set up and BSS is cleared.";
+intent "Dhruva Phase 0-2 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model B / QEMU raspi1ap), timer-IRQ-driven preemptive multitasking between two tasks. Entered from boot/rpi1/boot.S's _start after the stack pointer is set up and BSS is cleared.";
 
 // Context-switch mechanics (boot/context_switch.S) and the tiny amount
 // of raw memory allocation they need (boot/rpi1/runtime_stubs.c) are
@@ -33,7 +33,12 @@ extern "C" fn dhruva_alloc_bytes(n: i64) -> mut ref i64;
 extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64) -> i64;
-extern "C" fn yield_now() -> i64;
+// Phase 1's yield_now is gone -- Phase 2's timer tick preempts task_a/
+// task_b directly (boot/irq_entry.S + boot/context_switch.S's
+// scheduler_switch_from_irq), so neither task calls anything to give
+// up the CPU anymore. No vani-side declaration needed for
+// scheduler_switch_from_irq either: it's called only from hand-written
+// assembly (boot/irq_entry.S), never from a vani call chain.
 
 fn delay(count: i64) -> i64 {
   let i: i64 = 0;
@@ -180,62 +185,58 @@ fn irq_dispatch() -> i64 {
   return 0;
 }
 
-// Phase 1 demo tasks. Neither ever returns -- there is no task-exit
-// mechanism yet (that's a later phase's problem, once the scheduler
-// tracks task state beyond "which of two slots is current"). Each
-// prints a fixed number of times, interleaved with the other via
-// yield_now, then parks in a yield-forever loop so the ping-pong
-// keeps proving the switch still works cleanly even after the
-// "interesting" part is over.
+// Phase 2 demo tasks. Neither ever returns, and neither calls anything
+// to give up the CPU -- unlike Phase 1's cooperative task_a/task_b,
+// which had to explicitly call yield_now, these are ordinary infinite
+// loops that would hog the CPU forever if nothing preempted them. The
+// timer tick does that: boot/irq_entry.S saves each task's full
+// context whenever the tick lands, mid-loop, at whatever instruction
+// happened to be executing -- proving real preemption, not just
+// periodic notification. The small delay between prints exists purely
+// so a burst of one task's output between ticks stays human-readable;
+// it has no effect on correctness (removing it would just produce
+// longer bursts of "task A"/"task B" per tick, not break anything).
 #[no_mangle]
 fn task_a() -> i64 {
-  let i: i64 = 0;
-  while i < 5 {
-    let _ = uart_puts("task A\n");
-    let _ = yield_now();
-    i = i + 1;
-  }
-  let _ = uart_puts("task A: done, parking\n");
   while true {
-    let _ = yield_now();
+    let _ = uart_puts("task A\n");
+    let _ = delay(200000);
   }
   return 0;
 }
 
 #[no_mangle]
 fn task_b() -> i64 {
-  let i: i64 = 0;
-  while i < 5 {
-    let _ = uart_puts("task B\n");
-    let _ = yield_now();
-    i = i + 1;
-  }
-  let _ = uart_puts("task B: done, parking\n");
-  let _ = uart_puts("PASS\n");
   while true {
-    let _ = yield_now();
+    let _ = uart_puts("task B\n");
+    let _ = delay(200000);
   }
   return 0;
 }
 
-// Phase 2 Step A: prove basic timer-IRQ delivery in isolation before
-// wiring it into the task scheduler -- same staged approach as every
-// earlier phase. task_a/task_b/start_multitasking above are Phase 1's
-// still-working cooperative demo, temporarily not invoked while this
-// step is being validated on its own; Step B re-integrates them under
-// real preemption.
 #[no_mangle]
 fn kernel_main() -> i64 {
   let _ = uart_init();
-  let _ = uart_puts("Dhruva Phase 2 Step A: timer IRQ\n");
+  let _ = uart_puts("Dhruva Phase 2: preemptive multitasking\n");
 
   let _ = timer_ic_init();
-  let _ = enable_irqs();
+
+  let stack_bytes: i64 = 4096;
+  let stack_a: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_b: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
+  let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
 
   let _ = uart_puts("PASS\n");
-  while true {
-    let _ = delay(1000000);
-  }
+
+  // Never returns. start_multitasking's own restore sets CPSR (via
+  // the fake frame's spsr=0x13) with interrupts already enabled, so
+  // there's no separate enable_irqs() call needed here -- interrupts
+  // stay masked for all of kernel_main's own setup above, and turn on
+  // exactly when task_a first runs.
+  let _ = start_multitasking(sp_a, sp_b);
+
+  // Unreachable, but kernel_main must still type-check as returning i64.
   return 0;
 }
 
