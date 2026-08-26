@@ -1,5 +1,5 @@
 // श्री।
-intent "Dhruva Phase 0-2 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model B / QEMU raspi1ap), timer-IRQ-driven preemptive multitasking between two tasks. Entered from boot/rpi1/boot.S's _start after the stack pointer is set up and BSS is cleared.";
+intent "Dhruva Phase 0-2 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model B / QEMU raspi1ap), fixed-priority preemptive scheduling across three tasks plus a minimal Immediate Priority Ceiling Protocol mutex demonstrating bounded (not unbounded) priority inversion. Entered from boot/rpi1/boot.S's _start after the stack pointer is set up and BSS is cleared.";
 
 // Context-switch mechanics (boot/context_switch.S) and the tiny amount
 // of raw memory allocation they need (boot/rpi1/runtime_stubs.c) are
@@ -32,13 +32,31 @@ intent "Dhruva Phase 0-2 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model 
 extern "C" fn dhruva_alloc_bytes(n: i64) -> mut ref i64;
 extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
-extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64) -> i64;
-// Phase 1's yield_now is gone -- Phase 2's timer tick preempts task_a/
-// task_b directly (boot/irq_entry.S + boot/context_switch.S's
-// scheduler_switch_from_irq), so neither task calls anything to give
-// up the CPU anymore. No vani-side declaration needed for
-// scheduler_switch_from_irq either: it's called only from hand-written
-// assembly (boot/irq_entry.S), never from a vani call chain.
+extern "C" fn task_c_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn task_d_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut ref i64, sp_d: mut ref i64) -> i64;
+// task_a=HIGH(priority 0), task_b=MEDIUM(priority 1), task_c=LOW(priority 2),
+// task_d=IDLE(priority 3, always ready, never sleeps) -- the standard
+// RTOS answer to "what runs when nothing else is," and load-bearing
+// here specifically: without it, scheduler_pick_next's "seed with the
+// current task regardless of readiness" fallback (needed so a tied,
+// ready incumbent is preferred without special-casing the comparison)
+// could silently re-select a task that just called task_sleep_ticks to
+// stop running, ignoring its own sleep request entirely. Idle
+// guarantees there's always a genuinely ready task to fall back to.
+// task_sleep_ticks/dhruva_prio_lock/dhruva_prio_unlock are boot/context_switch.S's
+// scheduler primitives -- see that file for why dhruva_prio_lock/unlock need
+// no lock-state of their own (the Immediate Priority Ceiling Protocol's
+// whole point is that a correctly-assigned ceiling makes an explicit
+// lock/wait-queue unnecessary for a single shared resource) while
+// task_sleep_ticks needs a full context save (giving up the CPU
+// voluntarily is just as real a suspension as being preempted).
+// scheduler_switch_from_irq has no vani-side declaration: it's called
+// only from hand-written assembly (boot/irq_entry.S), never from a
+// vani call chain.
+extern "C" fn task_sleep_ticks(ticks: i64) -> i64;
+extern "C" fn dhruva_prio_lock(ceiling: i64) -> i64;
+extern "C" fn dhruva_prio_unlock(base_priority: i64) -> i64;
 
 fn delay(count: i64) -> i64 {
   let i: i64 = 0;
@@ -185,22 +203,38 @@ fn irq_dispatch() -> i64 {
   return 0;
 }
 
-// Phase 2 demo tasks. Neither ever returns, and neither calls anything
-// to give up the CPU -- unlike Phase 1's cooperative task_a/task_b,
-// which had to explicitly call yield_now, these are ordinary infinite
-// loops that would hog the CPU forever if nothing preempted them. The
-// timer tick does that: boot/irq_entry.S saves each task's full
-// context whenever the tick lands, mid-loop, at whatever instruction
-// happened to be executing -- proving real preemption, not just
-// periodic notification. The small delay between prints exists purely
-// so a burst of one task's output between ticks stays human-readable;
-// it has no effect on correctness (removing it would just produce
-// longer bursts of "task A"/"task B" per tick, not break anything).
+// Phase 2 priority-inversion demo. All three tasks share one mutex
+// (ceiling = 0, HIGH's own priority -- the highest priority of any
+// task that will ever lock it). None of the three ever calls
+// yield_now (gone since Step B) -- the timer tick preempts freely
+// whenever a strictly higher *effective* priority task is ready.
+//
+// task_c (LOW) holds the mutex for a real stretch of wall-clock time
+// (the delay() inside its critical section) specifically so
+// task_b (MEDIUM)'s frequent 1-tick sleep is likely to expire *during*
+// that window at least once per run. Without the ceiling protocol,
+// that's exactly the classic failure: MEDIUM (priority 1) would
+// preempt LOW (priority 2) the instant it's ready, LOW could never
+// finish and release, and task_a (HIGH, priority 0) -- which also
+// wants the same mutex -- would be blocked not just by LOW's bounded
+// critical section but by however long MEDIUM feels like running:
+// unbounded inversion via a task that doesn't even touch the
+// resource. With it, LOW's dhruva_prio_lock(0) call boosts LOW to
+// priority 0 for the duration -- tied with HIGH's own true priority,
+// and scheduler_pick_next's "ties favor the incumbent" rule means
+// neither MEDIUM nor HIGH preempts LOW while it holds the lock, no
+// matter how many tick-driven scheduling decisions happen in between.
+// The bound on how long HIGH can be kept waiting is now just LOW's
+// own critical-section length -- provable, not open-ended.
 #[no_mangle]
 fn task_a() -> i64 {
   while true {
-    let _ = uart_puts("task A\n");
-    let _ = delay(200000);
+    let _ = task_sleep_ticks(3);
+    let _ = uart_puts("HIGH: waking, requesting resource\n");
+    let _ = dhruva_prio_lock(0);
+    let _ = uart_puts("HIGH: acquired resource\n");
+    let _ = dhruva_prio_unlock(0);
+    let _ = uart_puts("HIGH: released resource\n");
   }
   return 0;
 }
@@ -208,8 +242,35 @@ fn task_a() -> i64 {
 #[no_mangle]
 fn task_b() -> i64 {
   while true {
-    let _ = uart_puts("task B\n");
-    let _ = delay(200000);
+    let _ = task_sleep_ticks(1);
+    let _ = uart_puts("MEDIUM: running (never touches the resource)\n");
+  }
+  return 0;
+}
+
+#[no_mangle]
+fn task_c() -> i64 {
+  while true {
+    let _ = dhruva_prio_lock(0);
+    let _ = uart_puts("LOW: locked, entering critical section\n");
+    let _ = delay(3000000);
+    let _ = uart_puts("LOW: leaving critical section, unlocking\n");
+    let _ = dhruva_prio_unlock(2);
+    let _ = task_sleep_ticks(2);
+  }
+  return 0;
+}
+
+// Idle: always ready, lowest priority, never sleeps. Only ever runs
+// when HIGH/MEDIUM/LOW are all genuinely asleep at the same moment --
+// seeing "idle" in the log at all is a real, useful signal that the
+// scheduler correctly fell through every real task's readiness check
+// rather than a sign of anything wrong.
+#[no_mangle]
+fn task_d() -> i64 {
+  while true {
+    let _ = uart_puts("idle\n");
+    let _ = delay(500000);
   }
   return 0;
 }
@@ -217,15 +278,19 @@ fn task_b() -> i64 {
 #[no_mangle]
 fn kernel_main() -> i64 {
   let _ = uart_init();
-  let _ = uart_puts("Dhruva Phase 2: preemptive multitasking\n");
+  let _ = uart_puts("Dhruva Phase 2: fixed-priority scheduling + priority ceiling\n");
 
   let _ = timer_ic_init();
 
   let stack_bytes: i64 = 4096;
   let stack_a: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
   let stack_b: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_c: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_d: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
+  let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
+  let sp_d: mut ref i64 = task_d_init_stack(stack_d, stack_bytes);
 
   let _ = uart_puts("PASS\n");
 
@@ -234,7 +299,7 @@ fn kernel_main() -> i64 {
   // there's no separate enable_irqs() call needed here -- interrupts
   // stay masked for all of kernel_main's own setup above, and turn on
   // exactly when task_a first runs.
-  let _ = start_multitasking(sp_a, sp_b);
+  let _ = start_multitasking(sp_a, sp_b, sp_c, sp_d);
 
   // Unreachable, but kernel_main must still type-check as returning i64.
   return 0;
