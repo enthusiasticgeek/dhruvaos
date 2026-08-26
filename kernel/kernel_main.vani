@@ -167,6 +167,63 @@ fn timer_ic_init() -> i64 {
   return 0;
 }
 
+// BCM2835 power-management watchdog (base 0x20100000) -- the same
+// peripheral real Pi firmware/Linux use to reboot the board on demand
+// (bcm2835_wdt) and to recover from a genuinely wedged system. This is
+// the *last-resort* answer to "the scheduler locked up and irq_dispatch
+// stopped running at all," a failure mode nothing at the vani/scheduler
+// level can protect against once it happens -- the intent is exactly
+// what Linux's own driver uses it for: arm a countdown, kick it once
+// per tick, let the SoC reset itself the instant the kicks stop.
+//
+// Implemented per the real, documented register semantics (matches
+// bcm2835_wdt.c's constants exactly), but NOT wired into kernel_main/
+// irq_dispatch's live path -- confirmed empirically that QEMU's
+// raspi1ap machine model does not honor PM_WDOG's timeout field at
+// all: writing PM_RSTC with WRCFG=FULL_RESET resets the emulated
+// machine immediately, regardless of what's in PM_WDOG (tested at both
+// a 2-second timeout and the maximum possible 20-bit value, 0xFFFFF --
+// both reset within milliseconds; disabling only the PM_RSTC write,
+// leaving PM_WDOG alone, restores completely normal operation, which
+// isolates the immediate-reset behavior to that one write). Since this
+// project tests exclusively via QEMU's raspi1ap, arming this for real
+// would make the one and only test method permanently unable to boot
+// the system at all -- a hardware-verification gap, not a Dhruva or
+// vani-compiler bug, tracked here rather than silently worked around.
+// PM_WDOG/PM_RSTC both require a magic password in their top byte on
+// every write, or the write is silently ignored -- not optional, not
+// a Dhruva convention, this is how the peripheral itself is gated
+// against accidental writes.
+fn watchdog_arm(timeout_ticks: u32) -> i64 {
+  let pm_password: u32 = 0x5A000000 as u32;
+  let pm_rstc: i64 = 0x2010001C;
+  let pm_wdog: i64 = 0x20100024;
+  let wrcfg_clr: u32 = 0xFFFFFFCF as u32;
+  let wrcfg_full_reset: u32 = 0x00000020 as u32;
+
+  let _ = mmio_write_u32(pm_wdog, pm_password | (timeout_ticks & (0xFFFFF as u32)));
+  let cur: u32 = mmio_read_u32(pm_rstc);
+  let _ = mmio_write_u32(pm_rstc, pm_password | (cur & wrcfg_clr) | wrcfg_full_reset);
+  return 0;
+}
+
+// Ticks run at 65536 Hz (a fixed property of this peripheral, same
+// SECS_TO_WDOG_TICKS(x) = x << 16 constant Linux's bcm2835_wdt driver
+// uses) -- 2 seconds gives four missed 500ms ticks of margin before a
+// reset, generous for jitter but still tight enough to prove the
+// watchdog actually does something if irq_dispatch ever stops running.
+fn watchdog_init() -> i64 {
+  let two_seconds_in_ticks: u32 = 131072 as u32; // 2 << 16
+  let _ = watchdog_arm(two_seconds_in_ticks);
+  return 0;
+}
+
+fn watchdog_kick() -> i64 {
+  let two_seconds_in_ticks: u32 = 131072 as u32;
+  let _ = watchdog_arm(two_seconds_in_ticks);
+  return 0;
+}
+
 // Runs in real IRQ context (called from boot/irq_entry.S's irq_entry,
 // itself reached only via the hardware vector table -- never via a
 // normal vani call chain). #[interrupt] gets real value here: it
@@ -198,6 +255,11 @@ fn irq_dispatch() -> i64 {
     let next: u32 = now + interval;
     let _ = mmio_write_u32(timer_c1, next);
 
+    // watchdog_kick() would belong here, once per tick -- see
+    // watchdog_arm's comment for why it isn't actually called: doing
+    // so resets QEMU's raspi1ap immediately rather than arming a real
+    // countdown, which would break the only test method this project
+    // has.
     let _ = uart_puts("tick\n");
   }
   return 0;
@@ -294,6 +356,10 @@ fn kernel_main() -> i64 {
 
   let _ = uart_puts("PASS\n");
 
+  // watchdog_init() would belong here, right before handing off to the
+  // scheduler -- see watchdog_arm's comment for why it isn't actually
+  // called under QEMU's raspi1ap.
+  //
   // Never returns. start_multitasking's own restore sets CPSR (via
   // the fake frame's spsr=0x13) with interrupts already enabled, so
   // there's no separate enable_irqs() call needed here -- interrupts
