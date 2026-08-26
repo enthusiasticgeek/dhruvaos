@@ -36,3 +36,38 @@ void exit(int code) {
         /* halt -- there is no OS to return to */
     }
 }
+
+/* Dhruva Phase 1 -- minimal bump allocator for task stacks.
+ *
+ * Returns a raw address as a plain integer rather than a typed pointer
+ * on purpose: vani's extern "C" FFI (v1) only supports scalars (i64/f64/
+ * bool), Str, and ref T across the boundary -- raw pointer types like
+ * *mut i64 are explicitly rejected ("not yet wired through the v1 FFI
+ * ABI", confirmed empirically). Since every consumer of this address is
+ * hand-written assembly that only ever treats it as an opaque 32-bit
+ * word anyway, returning i64 and letting vani pass it straight through
+ * is both the only option the FFI allows and the natural fit.
+ *
+ * Deliberately a bump allocator, never freed -- matches the
+ * architecture doc's Phase 1 call for a fixed-block allocator, not a
+ * general heap: task stacks are allocated once at boot and live for
+ * the process's whole lifetime. */
+#define DHRUVA_HEAP_BYTES (64 * 1024)
+static unsigned char dhruva_heap[DHRUVA_HEAP_BYTES];
+static unsigned long dhruva_heap_used = 0;
+
+long dhruva_alloc_bytes(long n) {
+    unsigned long need = (unsigned long)n;
+    unsigned long aligned_used = (dhruva_heap_used + 7UL) & ~7UL;
+    if (aligned_used + need > DHRUVA_HEAP_BYTES) {
+        return 0; /* out of kernel heap -- caller must check for 0 */
+    }
+    unsigned char *p = dhruva_heap + aligned_used;
+    unsigned long i = 0;
+    while (i < need) {
+        p[i] = 0;
+        i = i + 1;
+    }
+    dhruva_heap_used = aligned_used + need;
+    return (long)p;
+}

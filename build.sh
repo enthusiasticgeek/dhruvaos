@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Dhruva Phase 0 build: boot.S + kernel_main.vani -> dhruva.elf, bootable
-# under `qemu-system-arm -M raspi1ap` with zero physical hardware.
+# Dhruva Phase 0+1 build: boot.S + context_switch.S + kernel_main.vani ->
+# dhruva.elf, bootable under `qemu-system-arm -M raspi1ap` with zero
+# physical hardware.
 #
 # Pipeline, and why each step is shaped this way:
 #   1. Assemble boot.S natively with arm-none-eabi-gcc.
@@ -36,6 +37,9 @@ mkdir -p "${BUILD_DIR}"
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/rpi1/boot.S" -o "${BUILD_DIR}/boot.o"
 
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/context_switch.S" -o "${BUILD_DIR}/context_switch.o"
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
@@ -48,7 +52,8 @@ llc -mtriple="${TRIPLE}" -mcpu="${CPU}" -filetype=obj \
 
 arm-none-eabi-gcc -nostdlib -ffreestanding \
   -Wl,--gc-sections -Wl,-T,"${ROOT}/boot/rpi1/link.ld" \
-  "${BUILD_DIR}/boot.o" "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
+  "${BUILD_DIR}/boot.o" "${BUILD_DIR}/context_switch.o" \
+  "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
   -o "${BUILD_DIR}/dhruva.elf"
 
 echo "Built ${BUILD_DIR}/dhruva.elf"

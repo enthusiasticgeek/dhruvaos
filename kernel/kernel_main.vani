@@ -1,5 +1,20 @@
 // श्री।
-intent "Dhruva Phase 0 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model B / QEMU raspi1ap). Entered from boot/rpi1/boot.S's _start after the stack pointer is set up and BSS is cleared. This is the very first vani code Dhruva runs.";
+intent "Dhruva Phase 0+1 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model B / QEMU raspi1ap), plus cooperative multitasking between two tasks via explicit yield. Entered from boot/rpi1/boot.S's _start after the stack pointer is set up and BSS is cleared.";
+
+// Context-switch mechanics (boot/context_switch.S) and the tiny amount
+// of raw memory allocation they need (boot/rpi1/runtime_stubs.c) are
+// necessarily outside vani: extern fn addresses can't be taken in vani
+// (confirmed empirically -- there is no fn-to-address conversion), and
+// extern "C" doesn't support raw pointer types across the FFI boundary
+// (confirmed empirically -- only scalars/Str/ref T are wired through
+// the v1 ABI). Every address below is therefore threaded as a plain
+// i64, which is also exactly how the assembly on the other side treats
+// it: an opaque machine word, never dereferenced as vani-typed data.
+extern "C" fn dhruva_alloc_bytes(n: i64) -> i64;
+extern "C" fn task_a_init_stack(stack_base: i64, stack_bytes: i64) -> i64;
+extern "C" fn task_b_init_stack(stack_base: i64, stack_bytes: i64) -> i64;
+extern "C" fn start_multitasking(sp_a: i64, sp_b: i64) -> i64;
+extern "C" fn yield_now() -> i64;
 
 fn delay(count: i64) -> i64 {
   let i: i64 = 0;
@@ -81,11 +96,61 @@ fn uart_puts(s: Str) -> i64 {
   return 0;
 }
 
+// Phase 1 demo tasks. Neither ever returns -- there is no task-exit
+// mechanism yet (that's a later phase's problem, once the scheduler
+// tracks task state beyond "which of two slots is current"). Each
+// prints a fixed number of times, interleaved with the other via
+// yield_now, then parks in a yield-forever loop so the ping-pong
+// keeps proving the switch still works cleanly even after the
+// "interesting" part is over.
+#[no_mangle]
+fn task_a() -> i64 {
+  let i: i64 = 0;
+  while i < 5 {
+    let _ = uart_puts("task A\n");
+    let _ = yield_now();
+    i = i + 1;
+  }
+  let _ = uart_puts("task A: done, parking\n");
+  while true {
+    let _ = yield_now();
+  }
+  return 0;
+}
+
+#[no_mangle]
+fn task_b() -> i64 {
+  let i: i64 = 0;
+  while i < 5 {
+    let _ = uart_puts("task B\n");
+    let _ = yield_now();
+    i = i + 1;
+  }
+  let _ = uart_puts("task B: done, parking\n");
+  let _ = uart_puts("PASS\n");
+  while true {
+    let _ = yield_now();
+  }
+  return 0;
+}
+
 #[no_mangle]
 fn kernel_main() -> i64 {
   let _ = uart_init();
-  let _ = uart_puts("Dhruva Phase 0: hello from BCM2835 UART0\n");
-  let _ = uart_puts("PASS\n");
+  let _ = uart_puts("Dhruva Phase 1: cooperative multitasking\n");
+
+  let stack_bytes: i64 = 4096;
+  let stack_a: i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_b: i64 = dhruva_alloc_bytes(stack_bytes);
+
+  let sp_a: i64 = task_a_init_stack(stack_a, stack_bytes);
+  let sp_b: i64 = task_b_init_stack(stack_b, stack_bytes);
+
+  // Never returns -- control passes permanently to task_a, which
+  // yields back and forth with task_b from here on.
+  let _ = start_multitasking(sp_a, sp_b);
+
+  // Unreachable, but kernel_main must still type-check as returning i64.
   return 0;
 }
 
