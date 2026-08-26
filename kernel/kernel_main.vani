@@ -98,6 +98,17 @@ extern "C" fn fs_state_get_next_seq() -> u32;
 extern "C" fn fs_state_set_log_start(log_start: u32) -> u32;
 extern "C" fn fs_state_get_log_start() -> u32;
 
+// Phase 4 -- boot/shell_state.S: the interactive shell's line buffer,
+// filled one byte at a time from irq_dispatch's new UART-RX branch
+// (real IRQ context, so this needs to be genuinely simple -- see that
+// file's own header) and drained by the shell's command loop once a
+// complete line is ready.
+extern "C" fn shell_rx_push_char(c: u32) -> u32;
+extern "C" fn shell_get_line_len() -> u32;
+extern "C" fn shell_get_line_ready() -> u32;
+extern "C" fn shell_get_line_byte(offset: u32) -> u32;
+extern "C" fn shell_clear_line() -> u32;
+
 fn delay(count: i64) -> i64 {
   let i: i64 = 0;
   while i < count {
@@ -150,6 +161,30 @@ fn uart_init() -> i64 {
   let _ = mmio_write_u32(uart_lcrh, 0x70 as u32);
   // Enable UART + TX + RX.
   let _ = mmio_write_u32(uart_cr, 0x301 as u32);
+  return 0;
+}
+
+// Phase 4 -- UART0's own interrupt (RX FIFO non-empty), routed through
+// the same BCM2835 interrupt controller as the Phase 2 timer, but a
+// different GPU IRQ line (57, not 1) landing in the controller's
+// SECOND pending/enable register (IRQs 32-63), not the first --
+// confirmed against QEMU's own hw/arm/raspi_platform.h source rather
+// than assumed, the same discipline every other MMIO peripheral in
+// this project has needed. PL011 register offsets (IMSC/RIS/MIS/ICR)
+// are the standard ARM PrimeCell UART layout, not BCM2835-specific --
+// already load-bearing elsewhere in this file (uart_icr at the same
+// 0x44 offset used here, from uart_init/the existing TX path).
+fn uart_rx_irq_init() -> i64 {
+  let uart_imsc: i64 = 0x20201038;
+  // RXIM (bit 4): interrupt whenever the RX FIFO is above its trigger
+  // level -- left at the PL011 default (1/8 full), close enough to
+  // "every keystroke" for interactive typing at human speed.
+  let _ = mmio_write_u32(uart_imsc, 0x10 as u32);
+
+  let ic_enable2: i64 = 0x2000B214;
+  // GPU IRQ 57 (UART0) is bit 25 of the controller's second
+  // enable/pending register group (IRQs 32-63).
+  let _ = mmio_write_u32(ic_enable2, 0x02000000 as u32);
   return 0;
 }
 
@@ -951,6 +986,38 @@ fn irq_dispatch() -> i64 {
     // the log without reintroducing a blocking call to a hard-RT ISR.
     let _ = uart_putc_nonblocking(46);
   }
+
+  let ic_pending2: i64 = 0x2000B208;
+  let pending2: u32 = mmio_read_u32(ic_pending2);
+  if (pending2 & (0x02000000 as u32)) != (0 as u32) {
+    let uart_fr: i64 = 0x20201018;
+    let uart_dr: i64 = 0x20201000;
+    let uart_icr: i64 = 0x20201044;
+    // Drain the RX FIFO, always exactly 16 iterations -- a real
+    // hardware FIFO's own depth, not an arbitrary choice. A `while`
+    // loop here, even one with a literal constant bound checked every
+    // iteration, is unconditionally treated as UNBOUNDED by vani's v1
+    // WCET estimator (confirmed in src/safety.rs: `S::While { .. } =>
+    // None -- unbounded, no static iteration count`, with no attempt
+    // to prove a bound from the loop body at all) -- only `for i from
+    // LOW to HIGH` (vani's own range-for syntax -- not Rust's `0..N`,
+    // which the parser rejects) carries a statically-known trip count
+    // the estimator can multiply through. `break` was a red herring
+    // on the way to finding this: the *first* fix attempt (skip-
+    // instead-of-break, still inside a `while`) still failed for the
+    // real underlying reason, not the one guessed first.
+    for i from 0 to 16 {
+      let fr: u32 = mmio_read_u32(uart_fr);
+      if (fr & (0x10 as u32)) == (0 as u32) {
+        let c: u32 = mmio_read_u32(uart_dr) & (0xFF as u32);
+        let _ = shell_rx_push_char(c);
+      }
+    }
+    // Draining the FIFO above is what actually de-asserts this
+    // level-triggered condition; this just clears any stale raw
+    // status defensively, same pattern as the timer branch above.
+    let _ = mmio_write_u32(uart_icr, 0x10 as u32);
+  }
   return 0;
 }
 
@@ -1176,6 +1243,7 @@ fn kernel_main() -> i64 {
   let _ = fs_append("/config/mode", "post-compact-2");
 
   let _ = timer_ic_init();
+  let _ = uart_rx_irq_init();
 
   let stack_bytes: i64 = 4096;
   let stack_a: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
