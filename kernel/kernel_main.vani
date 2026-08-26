@@ -115,6 +115,71 @@ fn uart_puts(s: Str) -> i64 {
   return 0;
 }
 
+// Phase 2 -- BCM2835 system timer (base 0x20003000) + interrupt
+// controller (base 0x2000B000). Timer channel 1 (C1) is free for ARM
+// use on real hardware (channels 0 and 2 are reserved for the GPU
+// firmware); its compare-match interrupt is IRQ line 1, i.e. bit 1 of
+// the IC's "pending 1" / "enable 1" registers. The timer free-runs at
+// 1MHz (1 tick = 1 microsecond) -- a fixed property of this peripheral,
+// not something Dhruva configures.
+extern "C" fn enable_irqs() -> i64;
+
+fn timer_ic_init() -> i64 {
+  let timer_cs: i64 = 0x20003000;
+  let timer_clo: i64 = 0x20003004;
+  let timer_c1: i64 = 0x20003010;
+  let ic_enable1: i64 = 0x2000B210;
+
+  // Arm the first compare match 500ms out (500000 us @ 1MHz).
+  let now: u32 = mmio_read_u32(timer_clo);
+  let interval: u32 = 500000 as u32;
+  let first: u32 = now + interval;
+  let _ = mmio_write_u32(timer_c1, first);
+
+  // Clear any stale match flag for channel 1 before enabling its IRQ.
+  let _ = mmio_write_u32(timer_cs, 2 as u32);
+
+  // Enable IC line 1 (timer channel 1's compare-match interrupt).
+  let _ = mmio_write_u32(ic_enable1, 2 as u32);
+  return 0;
+}
+
+// Runs in real IRQ context (called from boot/irq_entry.S's irq_entry,
+// itself reached only via the hardware vector table -- never via a
+// normal vani call chain). #[interrupt] gets real value here: it
+// statically forbids heap allocation, unbounded recursion, lock-
+// acquiring calls, and task/parallel-for spawns in this function's
+// body -- exactly the set of things that would be genuinely unsafe to
+// do from inside an ISR. It does NOT generate any ISR-specific
+// codegen (register save/restore, vector entry, interrupt-return
+// instruction) -- confirmed by checking all four backends contain no
+// reference to the `interrupt` flag at all. That part is entirely
+// boot/irq_entry.S and boot/rpi1/vectors.S's job.
+#[no_mangle]
+#[interrupt]
+fn irq_dispatch() -> i64 {
+  let ic_pending1: i64 = 0x2000B204;
+  let pending: u32 = mmio_read_u32(ic_pending1);
+  if (pending & (2 as u32)) != (0 as u32) {
+    let timer_cs: i64 = 0x20003000;
+    let timer_clo: i64 = 0x20003004;
+    let timer_c1: i64 = 0x20003010;
+
+    // Acknowledge channel 1's match (write-1-to-clear) and reschedule
+    // the next one 500ms out, before doing anything else -- if the
+    // tick-handling work below ever took long enough to matter, the
+    // next deadline should already be armed, not computed late.
+    let _ = mmio_write_u32(timer_cs, 2 as u32);
+    let now: u32 = mmio_read_u32(timer_clo);
+    let interval: u32 = 500000 as u32;
+    let next: u32 = now + interval;
+    let _ = mmio_write_u32(timer_c1, next);
+
+    let _ = uart_puts("tick\n");
+  }
+  return 0;
+}
+
 // Phase 1 demo tasks. Neither ever returns -- there is no task-exit
 // mechanism yet (that's a later phase's problem, once the scheduler
 // tracks task state beyond "which of two slots is current"). Each
@@ -153,23 +218,24 @@ fn task_b() -> i64 {
   return 0;
 }
 
+// Phase 2 Step A: prove basic timer-IRQ delivery in isolation before
+// wiring it into the task scheduler -- same staged approach as every
+// earlier phase. task_a/task_b/start_multitasking above are Phase 1's
+// still-working cooperative demo, temporarily not invoked while this
+// step is being validated on its own; Step B re-integrates them under
+// real preemption.
 #[no_mangle]
 fn kernel_main() -> i64 {
   let _ = uart_init();
-  let _ = uart_puts("Dhruva Phase 1: cooperative multitasking\n");
+  let _ = uart_puts("Dhruva Phase 2 Step A: timer IRQ\n");
 
-  let stack_bytes: i64 = 4096;
-  let stack_a: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
-  let stack_b: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let _ = timer_ic_init();
+  let _ = enable_irqs();
 
-  let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
-  let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
-
-  // Never returns -- control passes permanently to task_a, which
-  // yields back and forth with task_b from here on.
-  let _ = start_multitasking(sp_a, sp_b);
-
-  // Unreachable, but kernel_main must still type-check as returning i64.
+  let _ = uart_puts("PASS\n");
+  while true {
+    let _ = delay(1000000);
+  }
   return 0;
 }
 

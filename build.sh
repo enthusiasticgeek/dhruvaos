@@ -40,6 +40,12 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/context_switch.S" -o "${BUILD_DIR}/context_switch.o"
 
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/irq_entry.S" -o "${BUILD_DIR}/irq_entry.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/rpi1/vectors.S" -o "${BUILD_DIR}/vectors.o"
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
@@ -53,6 +59,7 @@ llc -mtriple="${TRIPLE}" -mcpu="${CPU}" -filetype=obj \
 arm-none-eabi-gcc -nostdlib -ffreestanding \
   -Wl,--gc-sections -Wl,-T,"${ROOT}/boot/rpi1/link.ld" \
   "${BUILD_DIR}/boot.o" "${BUILD_DIR}/context_switch.o" \
+  "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/vectors.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
   -o "${BUILD_DIR}/dhruva.elf"
 
