@@ -8,15 +8,19 @@
  * new voluntary path (task_sleep_ticks) -- the same policy either way.
  *
  * Priority numbering reservation (DHRUVA_ARCHITECTURE.md §4): idle is
- * deliberately the numerically-worst priority in this scheme (3, right
- * now), not a hardcoded "always exactly 3" constant elsewhere -- when
- * phase 6 networking adds a best-effort/network task band, it belongs
- * numerically *between* the lowest hard-RT priority and idle (i.e.
- * idle's number moves up to make room, network tasks take what used
- * to be idle's slot), never above any hard-RT task. Nothing to build
- * for that yet -- this is the one-line reservation the architecture
- * doc asks for now so the scheduler never needs a structural change
- * later, not a stub to maintain in the meantime.
+ * deliberately the numerically-worst priority in this scheme (4, as
+ * of Phase 3's task #5 below), not a hardcoded constant elsewhere --
+ * when phase 6 networking adds a best-effort/network task band, it
+ * belongs numerically *between* the lowest hard-RT priority and idle,
+ * never above any hard-RT task. Phase 3's GC/compaction task is the
+ * first tenant of exactly that reserved band: task index 4 (GC),
+ * priority 3 -- below every hard-RT task (HIGH/MEDIUM/LOW, priorities
+ * 0-2), above idle (priority 4, moved up one from Phase 2 to make
+ * room). Task INDEX and priority NUMBER are independent by design
+ * (eff_prio_table maps one to the other) -- GC is task index 4 here
+ * only because it's the newest addition, not because index and
+ * priority need to match; idle keeps its original index (3) with a
+ * new priority value (4).
  *
  * Why dhruva_prio_lock/dhruva_prio_unlock don't need a locked-flag or owner field:
  * this is the actual point of Immediate Priority Ceiling Protocol, not
@@ -50,14 +54,15 @@
 .section ".bss"
 .align 4
 sp_table:
-    .word 0, 0, 0, 0     /* saved/current sp per task; index 3 = idle */
+    .word 0, 0, 0, 0, 0  /* saved/current sp per task; index 3 = idle,
+                          * index 4 = GC/compaction (task #5) */
 eff_prio_table:
-    .word 0, 0, 0, 0     /* effective (possibly ceiling-boosted) priority;
+    .word 0, 0, 0, 0, 0  /* effective (possibly ceiling-boosted) priority;
                           * initialized to each task's true priority by
                           * start_multitasking, since .bss is merely
-                          * zeroed at boot, not set to {0,1,2,3} */
+                          * zeroed at boot, not set to {0,1,2,3,4} */
 sleep_until_table:
-    .word 0, 0, 0, 0     /* tick_count value at which a task becomes
+    .word 0, 0, 0, 0, 0  /* tick_count value at which a task becomes
                           * ready again; 0 (the zeroed .bss default)
                           * means "never slept, always ready" since
                           * 0 <= any tick_count trivially holds -- true
@@ -108,7 +113,7 @@ scheduler_pick_next:
 
     mov r9, #0
 spn_loop:
-    cmp r9, #4                     /* 4 tasks now: HIGH, MEDIUM, LOW, IDLE */
+    cmp r9, #5                     /* 5 tasks now: HIGH, MEDIUM, LOW, IDLE, GC */
     bge spn_done
     cmp r9, r3
     beq spn_next                   /* current already accounted for above --
@@ -249,6 +254,12 @@ task_d_init_stack:
     ldr r1, =task_d
     b prepare_stack_common
 
+.global task_e_init_stack
+task_e_init_stack:
+    add r0, r0, r2
+    ldr r1, =task_e
+    b prepare_stack_common
+
 prepare_stack_common:
     sub r0, r0, #64
     mov r2, #0x13
@@ -272,37 +283,52 @@ prepare_stack_common:
     bx lr
 
 /* i64 start_multitasking(mut ref i64 sp_a, mut ref i64 sp_b,
- *                          mut ref i64 sp_c, mut ref i64 sp_d)
+ *                          mut ref i64 sp_c, mut ref i64 sp_d,
+ *                          mut ref i64 sp_e)
  * Seeds sp_table and eff_prio_table (base priorities -- .bss is only
- * zeroed by boot.S, not pre-set to {0,1,2,3}) and enters task_a (HIGH)
- * for the first time. Four ref args -> r0, r1, r2, r3, one register
- * each, no AAPCS pairing concern (that's only for plain i64 scalar
- * args) -- all four fit in registers with none left over to spill to
- * the stack. r3 (sp_d) must be saved off before it's reused as
- * scratch for table addresses below. Never returns in practice. */
+ * zeroed by boot.S, not pre-set to {0,1,2,3,4}) and enters task_a
+ * (HIGH) for the first time. Five ref args: the first four -> r0, r1,
+ * r2, r3, one register each (no AAPCS pairing concern -- that's only
+ * for plain i64 scalar args), filling every core argument register
+ * with none left over. The fifth (sp_e) has nowhere left to go but
+ * the stack -- confirmed directly from a throwaway probe function's
+ * callsite disassembly (`str r0, [sp]`) before writing this, same
+ * discipline as every other AAPCS assumption this project has been
+ * burned by trusting instead of checking. r3 (sp_d) must be saved off
+ * before it's reused as scratch for table addresses below, and sp_e
+ * must be read from [sp, #0] before this function's own first push
+ * changes what that offset means. Never returns in practice. */
 .global start_multitasking
 start_multitasking:
-    mov r4, r3                /* save sp_d before r3 becomes scratch */
+    ldr r4, [sp, #0]           /* sp_e, passed on the stack -- read
+                                 * before anything below touches sp */
+    mov r5, r3                 /* save sp_d before r3 becomes scratch */
 
-    ldr r5, =sp_table
-    str r0, [r5, #0]
-    str r1, [r5, #4]
-    str r2, [r5, #8]
-    str r4, [r5, #12]
+    ldr r6, =sp_table
+    str r0, [r6, #0]
+    str r1, [r6, #4]
+    str r2, [r6, #8]
+    str r5, [r6, #12]
+    str r4, [r6, #16]          /* task 4 (GC) */
 
-    ldr r5, =eff_prio_table
-    mov r6, #0
-    str r6, [r5, #0]        /* task 0 (HIGH) priority 0 */
-    mov r6, #1
-    str r6, [r5, #4]        /* task 1 (MEDIUM) priority 1 */
-    mov r6, #2
-    str r6, [r5, #8]        /* task 2 (LOW) priority 2 */
-    mov r6, #3
-    str r6, [r5, #12]       /* task 3 (IDLE) priority 3 */
+    ldr r6, =eff_prio_table
+    mov r7, #0
+    str r7, [r6, #0]         /* task 0 (HIGH) priority 0 */
+    mov r7, #1
+    str r7, [r6, #4]         /* task 1 (MEDIUM) priority 1 */
+    mov r7, #2
+    str r7, [r6, #8]         /* task 2 (LOW) priority 2 */
+    mov r7, #3
+    str r7, [r6, #16]        /* task 4 (GC) priority 3 -- the reserved
+                               * best-effort band, below every hard-RT
+                               * task, above idle */
+    mov r7, #4
+    str r7, [r6, #12]        /* task 3 (IDLE) priority 4 -- moved up
+                               * one from Phase 2 to make room */
 
-    ldr r5, =current_task
-    mov r6, #0
-    str r6, [r5]
+    ldr r6, =current_task
+    mov r7, #0
+    str r7, [r6]
 
     mov sp, r0
     ldmia sp!, {r0, r1}

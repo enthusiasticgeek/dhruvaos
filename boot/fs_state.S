@@ -27,6 +27,16 @@ fs_next_seq:
                      * during recovery -- guarantees every future
                      * append's sequence number is a genuine new
                      * high, even across many reboots */
+fs_log_start:
+    .word 0        /* first block still scanned/trusted; task #5's
+                     * compaction moves this forward past blocks whose
+                     * every record has a newer copy beyond it. fs_init
+                     * always sets this back to 1 (block 0 reserved) --
+                     * NOT persisted to the card itself in this v1, so
+                     * a crash before the next successful compaction
+                     * just means recovery re-scans a prefix it could
+                     * have skipped, never a correctness problem, only
+                     * a lost optimization for that one boot. */
 
 .section ".text"
 
@@ -48,5 +58,18 @@ fs_state_get_next_block:
 .global fs_state_get_next_seq
 fs_state_get_next_seq:
     ldr r0, =fs_next_seq
+    ldr r0, [r0]
+    bx lr
+
+.global fs_state_set_log_start
+fs_state_set_log_start:
+    ldr r1, =fs_log_start
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global fs_state_get_log_start
+fs_state_get_log_start:
+    ldr r0, =fs_log_start
     ldr r0, [r0]
     bx lr

@@ -34,7 +34,8 @@ extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mu
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_c_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_d_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
-extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut ref i64, sp_d: mut ref i64) -> i64;
+extern "C" fn task_e_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut ref i64, sp_d: mut ref i64, sp_e: mut ref i64) -> i64;
 // task_a=HIGH(priority 0), task_b=MEDIUM(priority 1), task_c=LOW(priority 2),
 // task_d=IDLE(priority 3, always ready, never sleeps) -- the standard
 // RTOS answer to "what runs when nothing else is," and load-bearing
@@ -94,6 +95,8 @@ extern "C" fn buf_checksum(buf: mut ref i64, start_offset: u32, byte_len: u32) -
 extern "C" fn fs_state_set(next_block: u32, next_seq: u32) -> u32;
 extern "C" fn fs_state_get_next_block() -> u32;
 extern "C" fn fs_state_get_next_seq() -> u32;
+extern "C" fn fs_state_set_log_start(log_start: u32) -> u32;
+extern "C" fn fs_state_get_log_start() -> u32;
 
 fn delay(count: i64) -> i64 {
   let i: i64 = 0;
@@ -633,12 +636,24 @@ fn fs_init() -> i64 {
     blk = blk + 1;
   }
   let _ = fs_state_set(blk as u32, highest_seq + (1 as u32));
+  // log_start always resets to 1 on boot -- it's an in-RAM-only
+  // optimization task #5's compaction earns back within a session
+  // (fewer blocks to scan), not something persisted across reboots.
+  // Recovery has no other safe starting point to trust anyway: with
+  // nothing on the card recording where a prior compaction left off,
+  // block 1 is the only assumption that can't be wrong.
+  let _ = fs_state_set_log_start(1 as u32);
   return 0;
 }
 
-fn fs_append(path: Str, data: Str) -> i64 {
-  let path_len: i64 = str_len_bytes(path);
-  let data_len: i64 = str_len_bytes(data);
+// Core append logic against raw buffers, not Str -- shared by
+// fs_append (the normal Str-based path) and task #5's compaction,
+// which only ever has raw record bytes already read from the card
+// (a path/data value living inside someone else's log record has no
+// Str form to hand over; there's no vani-level operation that builds
+// one from arbitrary bytes, same reasoning as every other raw-buffer
+// gap this project has hit at its extern "C" boundaries).
+fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64) -> i64 {
   if path_len > 32 {
     return 1;
   }
@@ -654,15 +669,15 @@ fn fs_append(path: Str, data: Str) -> i64 {
   let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
   let i: i64 = 0;
   while i < path_len {
-    let b: i64 = str_byte_at(path, i);
-    let _ = buf_write_byte(buf, (12 + i) as u32, b as u32);
+    let b: u32 = buf_read_byte(path_buf, i as u32);
+    let _ = buf_write_byte(buf, (12 + i) as u32, b);
     i = i + 1;
   }
   let _ = buf_write_u32(buf, 44 as u32, data_len as u32);
   let j: i64 = 0;
   while j < data_len {
-    let b2: i64 = str_byte_at(data, j);
-    let _ = buf_write_byte(buf, (48 + j) as u32, b2 as u32);
+    let b2: u32 = buf_read_byte(data_buf, j as u32);
+    let _ = buf_write_byte(buf, (48 + j) as u32, b2);
     j = j + 1;
   }
 
@@ -680,17 +695,46 @@ fn fs_append(path: Str, data: Str) -> i64 {
   return 0;
 }
 
-// Internal: the block number of the newest valid record for `path`,
-// or -1 if none exists. Shared by fs_read and (later) task #5's
-// compaction, which needs exactly this same "what's actually live"
-// query to know what's safe to reclaim.
-fn fs_find_latest_block(path: Str) -> i64 {
+fn fs_append(path: Str, data: Str) -> i64 {
   let path_len: i64 = str_len_bytes(path);
+  let data_len: i64 = str_len_bytes(data);
+  // Checked here too, not just inside fs_append_raw: these fixed-size
+  // temp buffers are sized exactly to the record format's own limits,
+  // and the copy loops below would overrun them before fs_append_raw
+  // ever got a chance to reject an oversized path/data itself.
+  if path_len > 32 {
+    return 1;
+  }
+  if data_len > 464 {
+    return 1;
+  }
+  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  let data_buf: mut ref i64 = dhruva_alloc_bytes(464);
+  let j: i64 = 0;
+  while j < data_len {
+    let _ = buf_write_byte(data_buf, j as u32, str_byte_at(data, j) as u32);
+    j = j + 1;
+  }
+  return fs_append_raw(path_buf, path_len, data_buf, data_len);
+}
+
+// Core lookup against a raw path buffer, not Str -- same reasoning as
+// fs_append_raw: task #5's compaction only ever has a path it just
+// read out of someone else's record, with no Str form to construct
+// from arbitrary bytes.  The block number of the newest valid record
+// matching the path at path_buf[0:path_len), or -1 if none exists.
+fn fs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   let next_block: u32 = fs_state_get_next_block();
+  let log_start: u32 = fs_state_get_log_start();
   let buf: mut ref i64 = dhruva_alloc_bytes(512);
   let best_block: i64 = 0 - 1;
   let best_seq: u32 = 0 as u32;
-  let blk: i64 = 1;
+  let blk: i64 = log_start as i64;
   while (blk as u32) < next_block {
     let rd_status: i64 = sdhost_read_block(blk, buf);
     if rd_status == 0 {
@@ -706,9 +750,9 @@ fn fs_find_latest_block(path: Str) -> i64 {
           let matches: i64 = 1;
           let k: i64 = 0;
           while k < path_len {
-            let want: i64 = str_byte_at(path, k);
+            let want: u32 = buf_read_byte(path_buf, k as u32);
             let got: u32 = buf_read_byte(buf, (12 + k) as u32);
-            if (got as i64) != want {
+            if got != want {
               matches = 0;
             }
             k = k + 1;
@@ -725,6 +769,108 @@ fn fs_find_latest_block(path: Str) -> i64 {
     blk = blk + 1;
   }
   return best_block;
+}
+
+// Shared by fs_read and task #5's compaction -- exactly the "what's
+// actually live" query compaction needs to know what's safe to
+// reclaim.
+fn fs_find_latest_block(path: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  // No record could ever have a path this long (fs_append rejects it
+  // at write time) -- reject here too, before the copy below would
+  // overrun the fixed 32-byte temp buffer.
+  if path_len > 32 {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return fs_find_latest_block_raw(path_buf, path_len);
+}
+
+// Task #5: garbage collection / log compaction, run periodically from
+// a dedicated low-priority background task (task_gc), never on the
+// hard-RT path. Scans the current live region [log_start, next_block)
+// once; any record that ISN'T the latest for its path (fs_find_latest_
+// block_raw returns some OTHER block) is dead -- superseded by a
+// later write already in the log. Every record that IS still live
+// gets re-appended (through the exact same crash-safe fs_append_raw
+// every normal write goes through) into fresh blocks past the
+// current end of the log, and only once every live record has been
+// safely re-appended does log_start move forward past the entire
+// old region -- at that point everything before it is provably dead
+// (an equivalent live copy exists beyond it) and stops being scanned
+// by fs_read/fs_find_latest_block_raw for the rest of this boot.
+//
+// Deliberately NOT free-space reuse: blocks before log_start are
+// abandoned, never reclaimed for new writes, in this v1 -- turning
+// this into a true circular log (wrapping around to actually reuse
+// that space) is real future work, not needed to demonstrate the
+// architectural property DHRUVA_ARCHITECTURE.md actually asks for
+// here (compaction running safely off the hard-RT path). Also NOT
+// persisted across reboots (see fs_state.S's fs_log_start comment) --
+// a crash between this compaction's re-appends finishing and its
+// final log_start update just means one boot's recovery rescans a
+// prefix it didn't strictly need to, never a correctness problem,
+// since "latest wins" already tolerates the old and new copies of a
+// record coexisting.
+fn fs_compact() -> i64 {
+  let log_start: u32 = fs_state_get_log_start();
+  let old_next_block: u32 = fs_state_get_next_block();
+
+  // Not worth the SD traffic on a short log -- stay genuinely
+  // low-cost when there's nothing meaningful to reclaim yet.
+  if (old_next_block - log_start) < (4 as u32) {
+    return 0;
+  }
+
+  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let data_buf: mut ref i64 = dhruva_alloc_bytes(464);
+  let blk: i64 = log_start as i64;
+  while (blk as u32) < old_next_block {
+    let rd_status: i64 = sdhost_read_block(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        let k: i64 = 0;
+        while (k as u32) < rec_path_len {
+          let pb: u32 = buf_read_byte(buf, (12 + k) as u32);
+          let _ = buf_write_byte(path_buf, k as u32, pb);
+          k = k + 1;
+        }
+        let latest_blk: i64 = fs_find_latest_block_raw(path_buf, rec_path_len as i64);
+        if latest_blk == blk {
+          // This IS the live copy for its path -- carry it forward.
+          // fs_append_raw always targets fs_state_get_next_block(),
+          // which by now is already past old_next_block (every
+          // earlier iteration's re-append only ever grows it), so
+          // this can never write back into the region still being
+          // scanned.
+          let rec_data_len: u32 = buf_read_u32(buf, 44 as u32);
+          let m: i64 = 0;
+          while (m as u32) < rec_data_len {
+            let db: u32 = buf_read_byte(buf, (48 + m) as u32);
+            let _ = buf_write_byte(data_buf, m as u32, db);
+            m = m + 1;
+          }
+          let _ = fs_append_raw(path_buf, rec_path_len as i64, data_buf, rec_data_len as i64);
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+
+  // Everything before old_next_block now has an equivalent live copy
+  // at or beyond it (or was already dead) -- safe to stop scanning.
+  let _ = fs_state_set_log_start(old_next_block);
+  return 0;
 }
 
 // Copies the newest valid record's data bytes for `path` into
@@ -888,6 +1034,35 @@ fn task_d() -> i64 {
   return 0;
 }
 
+// Task #5: GC/compaction, running as its own dedicated best-effort
+// task -- priority 3 (below every hard-RT task, above idle; see
+// context_switch.S's start_multitasking comment for the reserved-band
+// reasoning), never on the hard-RT path. Deliberately NOT #[no_heap]
+// (unlike task_a/b/c/d above): fs_compact's re-appends genuinely need
+// dhruva_alloc_bytes, and that's fine here specifically because this
+// task can never preempt or block anything hard-RT -- the same
+// compiler boundary that forbids heap allocation in an ISR or a
+// hard-RT task doesn't need to (and structurally can't usefully)
+// forbid it in a task whose whole job is best-effort background work.
+// Sleeps far longer between passes than any hard-RT task's own
+// period (fs_compact's own short-log check already makes a pass with
+// nothing to reclaim cheap, but there's no reason to even attempt one
+// every tick).
+#[no_mangle]
+#[bounded_stack(bytes=1024)]
+fn task_e() -> i64 {
+  let gc_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  while true {
+    let _ = task_sleep_ticks(20);
+    let _ = fs_compact();
+    let gc_mode_len: i64 = fs_read("/config/mode", gc_buf);
+    let _ = uart_puts("GC: compaction pass, /config/mode = \"");
+    let _ = fs_print_data(gc_buf, gc_mode_len);
+    let _ = uart_puts("\"\n");
+  }
+  return 0;
+}
+
 #[no_mangle]
 fn kernel_main() -> i64 {
   let _ = uart_init();
@@ -962,6 +1137,44 @@ fn kernel_main() -> i64 {
   let _ = uart_put_hex32(missing_len as u32);
   let _ = uart_puts(" (expect FFFFFFFF, i.e. -1, not found)\n");
 
+  // Task #5 verification: pile up several more dead versions of the
+  // same path, run one compaction pass, confirm reads still see the
+  // correct latest value afterward and log_start actually advanced
+  // (i.e. compaction did real work, not a no-op).
+  let _ = fs_append("/config/mode", "override1");
+  let _ = fs_append("/config/mode", "override2");
+  let _ = fs_append("/config/mode", "final");
+  let log_start_before: u32 = fs_state_get_log_start();
+  let next_block_before: u32 = fs_state_get_next_block();
+  let _ = fs_compact();
+  let log_start_after: u32 = fs_state_get_log_start();
+  let next_block_after: u32 = fs_state_get_next_block();
+  let _ = uart_puts("FS: compact log_start ");
+  let _ = uart_put_hex32(log_start_before);
+  let _ = uart_puts(" -> ");
+  let _ = uart_put_hex32(log_start_after);
+  let _ = uart_puts(", next_block ");
+  let _ = uart_put_hex32(next_block_before);
+  let _ = uart_puts(" -> ");
+  let _ = uart_put_hex32(next_block_after);
+  let _ = uart_puts("\n");
+
+  let mode_len2: i64 = fs_read("/config/mode", fs_out);
+  let _ = uart_puts("FS: post-compact /config/mode = \"");
+  let _ = fs_print_data(fs_out, mode_len2);
+  let _ = uart_puts("\" (expect \"final\")\n");
+
+  let name_len2: i64 = fs_read("/config/name", fs_out);
+  let _ = uart_puts("FS: post-compact /config/name = \"");
+  let _ = fs_print_data(fs_out, name_len2);
+  let _ = uart_puts("\" (expect \"dhruva\")\n");
+
+  // Leave task_e (GC) real work to find on its own first scheduled
+  // wake-up, rather than only ever seeing an already-compacted log
+  // from the manual pass above.
+  let _ = fs_append("/config/mode", "post-compact-1");
+  let _ = fs_append("/config/mode", "post-compact-2");
+
   let _ = timer_ic_init();
 
   let stack_bytes: i64 = 4096;
@@ -969,10 +1182,12 @@ fn kernel_main() -> i64 {
   let stack_b: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
   let stack_c: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
   let stack_d: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_e: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
   let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
   let sp_d: mut ref i64 = task_d_init_stack(stack_d, stack_bytes);
+  let sp_e: mut ref i64 = task_e_init_stack(stack_e, stack_bytes);
 
   let _ = uart_puts("PASS\n");
 
@@ -985,7 +1200,7 @@ fn kernel_main() -> i64 {
   // there's no separate enable_irqs() call needed here -- interrupts
   // stay masked for all of kernel_main's own setup above, and turn on
   // exactly when task_a first runs.
-  let _ = start_multitasking(sp_a, sp_b, sp_c, sp_d);
+  let _ = start_multitasking(sp_a, sp_b, sp_c, sp_d, sp_e);
 
   // Unreachable, but kernel_main must still type-check as returning i64.
   return 0;
