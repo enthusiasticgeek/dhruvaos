@@ -889,13 +889,28 @@ fn fs_compact() -> i64 {
           // this can never write back into the region still being
           // scanned.
           let rec_data_len: u32 = buf_read_u32(buf, 44 as u32);
-          let m: i64 = 0;
-          while (m as u32) < rec_data_len {
-            let db: u32 = buf_read_byte(buf, (48 + m) as u32);
-            let _ = buf_write_byte(data_buf, m as u32, db);
-            m = m + 1;
+          if rec_data_len == (0xFFFFFFFF as u32) {
+            // A live tombstone (fs_delete's newest record for this
+            // path) -- carry it forward AS a tombstone, not as a
+            // 4-billion-byte "data" copy. Missing this case doesn't
+            // just mis-handle a delete: rec_data_len is read directly
+            // into the loop bound below when it's a real record, so
+            // treating the sentinel as a genuine length turns this
+            // into an unbounded copy loop that reads/writes far past
+            // data_buf's real 464-byte allocation -- a real hang
+            // (found by GC silently never completing a pass again
+            // once this path was ever exercised), not merely a
+            // logic error that happens to still terminate wrong.
+            let _ = fs_delete_raw(path_buf, rec_path_len as i64);
+          } else {
+            let m: i64 = 0;
+            while (m as u32) < rec_data_len {
+              let db: u32 = buf_read_byte(buf, (48 + m) as u32);
+              let _ = buf_write_byte(data_buf, m as u32, db);
+              m = m + 1;
+            }
+            let _ = fs_append_raw(path_buf, rec_path_len as i64, data_buf, rec_data_len as i64);
           }
-          let _ = fs_append_raw(path_buf, rec_path_len as i64, data_buf, rec_data_len as i64);
         }
       }
     }
@@ -910,7 +925,8 @@ fn fs_compact() -> i64 {
 
 // Copies the newest valid record's data bytes for `path` into
 // out_buf, returning the data length, or -1 if no valid record for
-// that path exists at all.
+// that path exists at all (never written, or its newest record is a
+// tombstone -- see fs_delete).
 fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
   let blk: i64 = fs_find_latest_block(path);
   if blk < 0 {
@@ -922,6 +938,9 @@ fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
     return 0 - 1;
   }
   let data_len: u32 = buf_read_u32(tmp, 44 as u32);
+  if data_len == (0xFFFFFFFF as u32) {
+    return 0 - 1;
+  }
   let i: i64 = 0;
   while (i as u32) < data_len {
     let b: u32 = buf_read_byte(tmp, (48 + i) as u32);
@@ -929,6 +948,129 @@ fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
     i = i + 1;
   }
   return data_len as i64;
+}
+
+// fs_delete: appends a tombstone record for `path` -- a normal,
+// crash-safe log entry (same checksum/sequence-number machinery as
+// any other write) whose data_len field is the sentinel 0xFFFFFFFF,
+// a value no genuine record can ever have (data is capped at 464
+// bytes). fs_read/fs_list treat the newest tombstone for a path
+// exactly like the path never existed; compaction (fs_compact) can
+// still find and re-carry a tombstone forward as "the latest record"
+// for its path like any other -- deleting something, then compacting,
+// correctly keeps it deleted rather than resurrecting an older
+// pre-delete version.
+fn fs_delete_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  if path_len > 32 {
+    return 1;
+  }
+  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let next_block: u32 = fs_state_get_next_block();
+  let next_seq: u32 = fs_state_get_next_seq();
+
+  let _ = buf_write_u32(buf, 4 as u32, next_seq);
+  let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+  let i: i64 = 0;
+  while i < path_len {
+    let b: u32 = buf_read_byte(path_buf, i as u32);
+    let _ = buf_write_byte(buf, (12 + i) as u32, b);
+    i = i + 1;
+  }
+  let _ = buf_write_u32(buf, 44 as u32, 0xFFFFFFFF as u32);
+
+  let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+  let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+  let wr_status: i64 = sdhost_write_block(next_block as i64, buf);
+  if wr_status != 0 {
+    return 1;
+  }
+  let _ = fs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+  return 0;
+}
+
+fn fs_delete(path: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  if path_len > 32 {
+    return 1;
+  }
+  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return fs_delete_raw(path_buf, path_len);
+}
+
+// Prints every live path (not tombstoned, and the newest record for
+// that exact path -- an older, superseded occurrence in the log is
+// correctly skipped even though it's still individually valid) whose
+// first prefix_len bytes match `prefix`. An empty prefix matches
+// every path -- "list everything" -- since matching zero bytes always
+// trivially holds. Same "is this occurrence actually the champion for
+// its path" check fs_compact uses to decide what's safe to reclaim.
+fn fs_list(prefix: Str) -> i64 {
+  let prefix_len: i64 = str_len_bytes(prefix);
+  let next_block: u32 = fs_state_get_next_block();
+  let log_start: u32 = fs_state_get_log_start();
+  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let blk: i64 = log_start as i64;
+  while (blk as u32) < next_block {
+    let rd_status: i64 = sdhost_read_block(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        let rec_data_len: u32 = buf_read_u32(buf, 44 as u32);
+        let long_enough: i64 = 0;
+        if (rec_path_len as i64) >= prefix_len {
+          long_enough = 1;
+        }
+        if (long_enough == 1) && (rec_data_len != (0xFFFFFFFF as u32)) {
+          let prefix_matches: i64 = 1;
+          let k: i64 = 0;
+          while k < prefix_len {
+            let want: i64 = str_byte_at(prefix, k);
+            let got: u32 = buf_read_byte(buf, (12 + k) as u32);
+            if (got as i64) != want {
+              prefix_matches = 0;
+            }
+            k = k + 1;
+          }
+          if prefix_matches == 1 {
+            // Copy the path out before calling fs_find_latest_block_
+            // raw below, which allocates and reads its own buffer --
+            // `buf` above stays valid (it's a separate allocation),
+            // but building the comparison path fresh from `buf`
+            // avoids any doubt about which buffer holds what.
+            let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+            let m: i64 = 0;
+            while (m as u32) < rec_path_len {
+              let pb: u32 = buf_read_byte(buf, (12 + m) as u32);
+              let _ = buf_write_byte(path_buf, m as u32, pb);
+              m = m + 1;
+            }
+            let latest_blk: i64 = fs_find_latest_block_raw(path_buf, rec_path_len as i64);
+            if latest_blk == blk {
+              let _ = uart_puts("  ");
+              let p: i64 = 0;
+              while (p as u32) < rec_path_len {
+                let pc: u32 = buf_read_byte(path_buf, p as u32);
+                let _ = uart_putc(pc as i64);
+                p = p + 1;
+              }
+              let _ = uart_puts("\n");
+            }
+          }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  return 0;
 }
 
 fn fs_print_data(buf: mut ref i64, byte_len: i64) -> i64 {
@@ -1241,6 +1383,17 @@ fn kernel_main() -> i64 {
   // from the manual pass above.
   let _ = fs_append("/config/mode", "post-compact-1");
   let _ = fs_append("/config/mode", "post-compact-2");
+
+  // Task #8 verification: prefix-scan listing and tombstone delete.
+  let _ = uart_puts("FS: ls /config/ (expect mode, name):\n");
+  let _ = fs_list("/config/");
+  let _ = fs_delete("/config/name");
+  let _ = uart_puts("FS: ls /config/ after deleting name (expect only mode):\n");
+  let _ = fs_list("/config/");
+  let deleted_len: i64 = fs_read("/config/name", fs_out);
+  let _ = uart_puts("FS: read of deleted /config/name result=");
+  let _ = uart_put_hex32(deleted_len as u32);
+  let _ = uart_puts(" (expect FFFFFFFF, i.e. -1, not found)\n");
 
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();
