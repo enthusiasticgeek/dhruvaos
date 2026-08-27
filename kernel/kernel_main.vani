@@ -341,24 +341,55 @@ fn uart_put_hex32(v: u32) -> i64 {
 // scratch buffer (24 bytes -- comfortably more than i64's own max 20
 // decimal digits plus a sign) sidesteps the question entirely rather
 // than relying on however deep vani's recursion support actually goes.
+// BUG (round 6 audit, 2026-08-27): this function used to negate the
+// whole value up front (`value = 0 - value`) to convert a negative
+// input into the positive domain before building its digit string.
+// i64::MIN is the one i64 value whose own negation overflows -- its
+// magnitude (9223372036854775808) is one more than i64::MAX can hold
+// -- and unconditionally executing an operation that can overflow,
+// rather than checking first, is the exact bug class round 2's audit
+// spent a whole pass closing in eval_apply (see i64_mul_would_overflow's
+// own comment): confirmed live against the real vani-compiler on this
+// target that negating i64::MIN panics ("integer overflow in int64_t
+// sub") in `vanic run`'s own interpreter, and this project has already
+// separately confirmed that same trap's firing behavior is inconsistent
+// between that interpreted context and the actual llc-compiled ARM
+// object code this kernel ships as -- meaning the realistic outcomes
+// here were either a silent wrong answer (a wraparound negation stays
+// negative, so the digit loop below would never run, printing "-0"
+// instead of "-9223372036854775808") or a full kernel hang
+// (runtime_stubs.c's exit() is an infinite halt loop with no OS to
+// return to). No caller passes i64::MIN today, but this is a general-
+// purpose print helper used throughout the codebase -- worth closing
+// before some future caller does.
+//
+// Fixed by working in the NEGATIVE domain throughout instead: a
+// negative value's own quotient and remainder by 10 always shrink in
+// magnitude (never grow), so neither can ever land on something i64
+// can't represent, and the single-digit remainder negated at the very
+// end (`0 - d`, d always in [-9, 0]) never comes close to overflowing
+// either. This avoids ever negating the full value, so i64::MIN prints
+// correctly with no special-case needed.
 fn uart_put_i64(v: i64) -> i64 {
-  let value: i64 = v;
   let is_neg: i64 = 0;
-  if value < 0 {
+  if v < 0 {
     is_neg = 1;
-    value = 0 - value;
+  }
+  let neg_value: i64 = v;
+  if v > 0 {
+    neg_value = 0 - v;
   }
   let digits: mut ref i64 = uart_digits_scratch_get();
   let n: i64 = 0;
-  if value == 0 {
+  if neg_value == 0 {
     let _ = buf_write_byte(digits, 0 as u32, 48 as u32);
     n = 1;
   } else {
-    while value > 0 {
-      let d: i64 = value - ((value / 10) * 10);
+    while neg_value < 0 {
+      let d: i64 = 0 - (neg_value - ((neg_value / 10) * 10));
       let _ = buf_write_byte(digits, n as u32, (48 + d) as u32);
       n = n + 1;
-      value = value / 10;
+      neg_value = neg_value / 10;
     }
   }
   if is_neg == 1 {
@@ -5033,6 +5064,17 @@ fn kernel_main() -> i64 {
   // overflow-rejection path.
   let _ = eval_self_test("999999999999*999999999999", 0, 1);
   let _ = eval_self_test("5000000000+5000000000", 10000000000, 0);
+
+  // Round 6 audit regression: uart_put_i64 used to negate its whole
+  // input up front, which overflows for exactly one value, i64::MIN --
+  // see uart_put_i64's own comment for why that's a real hang/wrong-
+  // answer risk on this target, not just theoretical. No caller passes
+  // i64::MIN today, but this is a general-purpose print helper, so
+  // this exercises it directly rather than only through whatever
+  // happens to call it elsewhere.
+  let _ = uart_puts("UART: uart_put_i64(i64::MIN)=");
+  let _ = uart_put_i64(0 - 9223372036854775807 - 1);
+  let _ = uart_puts(" (expect -9223372036854775808)\n");
 
   // Phase 5 verification: governor_desired_freq_mhz's threshold
   // boundaries, via boot-time self-test rather than live introspection
