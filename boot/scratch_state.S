@@ -70,6 +70,23 @@ uart_digits_scratch_addr:
                          * it gets its own dedicated buffer rather than
                          * risking aliasing one already in active use
                          * by whatever called it. */
+dwc2_dma_scratch_addr:
+    .word 0             /* 64 bytes: the DWC2 host channel's DMA
+                         * buffer for control transfers (SETUP packet,
+                         * descriptor data). This model is DMA-only
+                         * (FIFO/slave-mode MMIO is unimplemented, see
+                         * kernel_main.vani's dwc2 section header
+                         * comment) -- HCDMA(n) must point at a real
+                         * buffer, and the same "never call
+                         * dhruva_alloc_bytes on every call" lesson
+                         * from the FS/shell bug applies here too, since
+                         * enumeration issues many transfers over one
+                         * session. Not shared with the FS-layer
+                         * scratch buffers above -- USB has no
+                         * established call-graph relationship to those
+                         * yet, so it gets its own dedicated buffer
+                         * rather than assuming sharing is safe without
+                         * verifying it the way those were. */
 
 .section ".text"
 
@@ -169,4 +186,30 @@ uart_digits_scratch_get:
     ldr r0, =uart_digits_scratch_addr
     ldr r0, [r0]
     mov r1, #0
+    bx lr
+
+.global dwc2_dma_scratch_set
+dwc2_dma_scratch_set:
+    ldr r1, =dwc2_dma_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dwc2_dma_scratch_get
+dwc2_dma_scratch_get:
+    ldr r0, =dwc2_dma_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+/* u32 ptr_to_u32(mut ref i64 p) -- a pointer and a raw address integer
+ * are the identical bits in the same register at the AAPCS level;
+ * vani's own type system just has no `as` cast between them (a
+ * `mut ref i64 as u32` cast is rejected at compile time). Needed for
+ * MMIO registers that take a literal DMA buffer address as a plain
+ * value (DWC2's HCDMA(n)) rather than a typed pointer parameter some
+ * extern "C" accessor stores on the vani side -- nothing to compute,
+ * r0 already holds exactly what's wanted on entry. */
+.global ptr_to_u32
+ptr_to_u32:
     bx lr

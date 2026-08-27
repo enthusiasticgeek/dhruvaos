@@ -49,6 +49,9 @@ extern "C" fn eval_ops_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn eval_ops_scratch_get() -> mut ref i64;
 extern "C" fn uart_digits_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn uart_digits_scratch_get() -> mut ref i64;
+extern "C" fn dwc2_dma_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dwc2_dma_scratch_get() -> mut ref i64;
+extern "C" fn ptr_to_u32(p: mut ref i64) -> u32;
 extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_c_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
@@ -2398,7 +2401,215 @@ fn dwc2_init() -> i64 {
   if enabled == 0 {
     return 0 - 1;
   }
+  return dwc2_probe_device0();
+}
+
+// Host channel 0 register block: base 0x500, one control-endpoint
+// transfer at a time, stride 0x20 unused here since only channel 0 is
+// ever used by this driver so far -- confirmed against hcd-dwc2.h's
+// own `hreg1[((_ch) << 3) + N]` macros (each `hreg1` word is 4 bytes,
+// so `<<3` word-index-shift is a 0x20-byte channel stride).
+fn dwc2_hcchar0_addr() -> i64 {
+  return dwc2_base() + 0x500;
+}
+fn dwc2_hcint0_addr() -> i64 {
+  return dwc2_base() + 0x508;
+}
+fn dwc2_hcintmsk0_addr() -> i64 {
+  return dwc2_base() + 0x50C;
+}
+fn dwc2_hctsiz0_addr() -> i64 {
+  return dwc2_base() + 0x510;
+}
+fn dwc2_hcdma0_addr() -> i64 {
+  return dwc2_base() + 0x514;
+}
+
+// HCCHAR field layout confirmed against hcd-dwc2.c's dwc2_enable_chan
+// (CHENA=bit31, DEVADDR=bits[28:22], EPTYPE=bits[19:18] (0=control),
+// EPDIR=bit15 (0=out,1=in), EPNUM=bits[14:11], MPS=bits[10:0]).
+fn dwc2_build_hcchar(devaddr: u32, eptype: u32, epdir: u32, epnum: u32, mps: u32) -> u32 {
+  let chena: u32 = 1 as u32;
+  let v: u32 = (chena << (31 as u32))
+    | (devaddr << (22 as u32))
+    | (eptype << (18 as u32))
+    | (epdir << (15 as u32))
+    | (epnum << (11 as u32))
+    | mps;
+  return v;
+}
+
+// HCTSIZ field layout confirmed against hcd-dwc2.c (PID=bits[30:29],
+// PKTCNT=bits[28:19], XFERSIZE=bits[18:0]). PID encoding for a
+// CONTROL endpoint specifically (not the generic non-control 0/1/2/3
+// = DATA0/DATA1/DATA2/MDATA scheme): 0=DATA0, 1=DATA2, 2=DATA1,
+// 3=SETUP -- this project's own DWC2 register reference (gathered
+// directly from hcd-dwc2.c/.h before writing any of this code, same
+// discipline as every other peripheral here) confirmed this
+// control-specific encoding explicitly, since assuming the generic
+// non-control PID numbering here would silently mislabel every DATA1
+// packet as DATA2 and vice versa.
+fn dwc2_pid_setup() -> u32 {
+  return 3 as u32;
+}
+fn dwc2_pid_data1() -> u32 {
+  return 2 as u32;
+}
+
+fn dwc2_build_hctsiz(pid: u32, pktcnt: u32, xfersize: u32) -> u32 {
+  let v: u32 = (pid << (29 as u32)) | (pktcnt << (19 as u32)) | xfersize;
+  return v;
+}
+
+// Kicks off whatever channel 0 is already programmed for (HCCHAR/
+// HCTSIZ/HCDMA must be set by the caller first) and polls HCINT(0)
+// directly for completion -- bounded, not `while true`, matching this
+// project's own established pattern for any hardware poll (the
+// mailbox property-interface call earlier in this same phase uses the
+// identical shape).
+//
+// Deliberately polls HCINT(0) itself, NOT HAINT: confirmed against
+// hcd-dwc2.c's dwc2_update_hc_irq that HAINT's per-channel bit only
+// ever reflects `HCINT & HCINTMSK`, and HCINTMSK(0) is 0 (every
+// source masked) at reset -- a driver that never explicitly unmasks
+// it would see HCINT(0) get the real completion bits from
+// dwc2_handle_packet every time, while HAINT stayed permanently 0
+// regardless (found the hard way: the very first version of this
+// function polled HAINT and timed out on every single transfer, even
+// though the transfer itself was completing correctly one MMIO write
+// later). Since this driver polls registers directly instead of using
+// the IRQ line, there's no need to program HCINTMSK/GINTMSK at all --
+// reading the raw, always-current HCINT(0) value sidesteps the whole
+// masking mechanism real interrupt-driven code would have to set up.
+// Returns the HCINT value observed at completion (0 on a timeout,
+// which is not a valid real HCINT value since XFERCOMPL or CHHLTD
+// would always be set on a genuine completion -- callers check for
+// exactly 0 to distinguish a timeout from a real, if unsuccessful,
+// transfer outcome), and always clears whatever HCINT bits it saw
+// (write-1-to-clear) before returning.
+fn dwc2_wait_chan0_done() -> u32 {
+  let hcint0: i64 = dwc2_hcint0_addr();
+  let tries: i64 = 0;
+  while tries < 1000000 {
+    let hi: u32 = mmio_read_u32(hcint0);
+    if hi != (0 as u32) {
+      let _ = mmio_write_u32(hcint0, hi);
+      return hi;
+    }
+    tries = tries + 1;
+  }
+  return 0 as u32;
+}
+
+// One complete control transfer (SETUP + optional IN data stage +
+// zero-length STATUS stage) targeting device address `devaddr`,
+// endpoint 0, using `mps` as the control endpoint's max packet size
+// (8 is always safe for the very first transfer to any USB device,
+// per spec -- every device supports at least an 8-byte EP0 before its
+// real bMaxPacketSize0 is even known). Fetches `want_len` bytes of
+// whatever descriptor `setup_buf` (already built by the caller into
+// dwc2_dma_scratch) requests, copying the result into `out_buf`
+// (caller-owned, at least `want_len` bytes). Returns 0 on success, -1
+// on any stage failing to complete (channel-halt error bits set, or a
+// poll timeout).
+fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  // SETUP stage: the 8-byte request already sits in dwc2_dma_scratch
+  // (dma), written by the caller before this call.
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_setup(), 1 as u32, 8 as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
+  let setup_result: u32 = dwc2_wait_chan0_done();
+  if (setup_result & (1 as u32)) == (0 as u32) {
+    return 0 - 1; // XFERCOMPL (bit0) never set -- timeout or error
+  }
+
+  // DATA stage (IN): read want_len bytes back into the same DMA
+  // buffer, then copy out to the caller's own out_buf.
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, want_len));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
+  let data_result: u32 = dwc2_wait_chan0_done();
+  if (data_result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  let want_len_i: i64 = want_len as i64;
+  while i < want_len_i {
+    let b: u32 = buf_read_byte(dma, i as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+
+  // STATUS stage (OUT, zero-length, DATA1) -- acknowledges the
+  // transfer is complete; no data buffer content matters here since
+  // xfersize=0 means the model transfers nothing regardless of what
+  // HCDMA points at, but a valid pointer is still supplied.
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
+  let status_result: u32 = dwc2_wait_chan0_done();
+  if (status_result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
   return 0;
+}
+
+// Builds a standard GET_DESCRIPTOR(Device) SETUP packet directly into
+// dwc2_dma_scratch: bmRequestType=0x80 (device-to-host, standard,
+// device), bRequest=6 (GET_DESCRIPTOR), wValue=0x0100 (type=1/DEVICE,
+// index=0), wIndex=0, wLength as given (8 for the very first probe --
+// enough to learn bMaxPacketSize0 at byte 7 without assuming the real
+// device's MPS in advance).
+fn dwc2_build_get_device_descriptor_setup(want_len: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0x80 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 6 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 3 as u32, 1 as u32);
+  let _ = buf_write_byte(dma, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 5 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 6 as u32, want_len & (0xFF as u32));
+  let _ = buf_write_byte(dma, 7 as u32, (want_len >> (8 as u32)) & (0xFF as u32));
+  return 0;
+}
+
+// First real enumeration milestone: fetch the first 8 bytes of device
+// address 0's device descriptor (every USB device answers at address
+// 0 before a host assigns it a real one) and confirm the two fixed
+// fields a genuine device descriptor always has -- bLength=18 (byte 0)
+// and bDescriptorType=1/DEVICE (byte 1) -- match, not just that the
+// transfer completed without an error bit. A transfer "succeeding"
+// but returning garbage bytes would be a much worse silent failure
+// than an honest error return, the same reasoning behind every
+// checksum/validation check elsewhere in this project.
+fn dwc2_probe_device0() -> i64 {
+  let desc: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
+  let status: i64 = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, desc);
+  if status != 0 {
+    let _ = uart_puts("USB: GET_DESCRIPTOR(Device) transfer failed\n");
+    return 0 - 1;
+  }
+  let blength: u32 = buf_read_byte(desc, 0 as u32);
+  let bdesctype: u32 = buf_read_byte(desc, 1 as u32);
+  let mps0: u32 = buf_read_byte(desc, 7 as u32);
+  let _ = uart_puts("USB: device0 descriptor bLength=");
+  let _ = uart_put_hex32(blength);
+  let _ = uart_puts(" bDescriptorType=");
+  let _ = uart_put_hex32(bdesctype);
+  let _ = uart_puts(" bMaxPacketSize0=");
+  let _ = uart_put_hex32(mps0);
+  if (blength == (18 as u32)) && (bdesctype == (1 as u32)) {
+    let _ = uart_puts(" (PASS)\n");
+    return 0;
+  }
+  let _ = uart_puts(" (FAIL, expected bLength=12 bDescriptorType=01)\n");
+  return 0 - 1;
 }
 
 // Phase 2 priority-inversion demo. All three tasks share one mutex
@@ -3295,6 +3506,7 @@ fn kernel_main() -> i64 {
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(64));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
   let _ = uart_digits_scratch_set(dhruva_alloc_bytes(24));
+  let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(64));
 
   let _ = sdhost_init();
 
