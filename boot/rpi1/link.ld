@@ -47,7 +47,24 @@ SECTIONS
     . = . + 0x1000;
     _irq_stack_top = .;
 
-    /* No exception unwinding on bare metal -- discard rather than link
-     * the personality-routine references these would otherwise pull in. */
-    /DISCARD/ : { *(.ARM.exidx*) *(.ARM.extab*) }
+    /* No exception unwinding on bare metal, and no real .ARM.exidx
+     * content to keep either -- but libgcc.a's unwind-arm.o (pulled in
+     * for __aeabi_ldivmod, needed once Phase 4 task #10's expression
+     * evaluator started doing i64 division on a CPU with no hardware
+     * divide instruction) references __exidx_start/__exidx_end
+     * unconditionally, and ld only auto-defines those at the boundaries
+     * of a REAL .ARM.exidx output section -- discarding the section
+     * outright (the previous approach here) leaves them undefined.
+     * Defining an empty section instead of discarding it satisfies the
+     * reference without keeping any actual unwind-table content: this
+     * program never throws/unwinds, so the boundary being a zero-length
+     * range is exactly correct, not a workaround with a hidden cost. */
+    /* .ARM.extab must be kept alongside .ARM.exidx, not discarded:
+     * kernel_main.o's own per-function exidx entries (LLVM's default
+     * ARM EABI codegen emits these regardless of whether the function
+     * ever throws) reference matching extab entries by name, and a
+     * dangling reference into a discarded section is a hard link
+     * error, not just wasted space. */
+    .ARM.exidx : { __exidx_start = .; *(.ARM.exidx*) __exidx_end = .; }
+    .ARM.extab : { *(.ARM.extab*) }
 }

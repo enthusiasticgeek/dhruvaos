@@ -20,6 +20,25 @@ size_t strlen(const char *s) {
     return n;
 }
 
+/* Phase 4 task #10 -- pulled in transitively: linking -lgcc for
+ * __aeabi_ldivmod (ARMv6 has no hardware integer divide, needed once
+ * the expression evaluator started dividing i64s) drags in libgcc's
+ * unwind-arm.o as a side effect of static-archive linking granularity,
+ * which references memcpy from its (dead-code-for-us) exception-
+ * propagation path. Same category as strlen/dprintf/exit above: a
+ * hosted-libc assumption baked into code we didn't write, not
+ * something to route around. */
+void *memcpy(void *dst, const void *src, size_t n) {
+    unsigned char *d = (unsigned char*)dst;
+    const unsigned char *s = (const unsigned char*)src;
+    size_t i = 0;
+    while (i < n) {
+        d[i] = s[i];
+        i = i + 1;
+    }
+    return dst;
+}
+
 int dprintf(int fd, const char *fmt, ...) {
     (void)fd;
     (void)fmt;

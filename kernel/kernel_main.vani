@@ -252,6 +252,47 @@ fn uart_put_hex32(v: u32) -> i64 {
   return 0;
 }
 
+// Task #10: decimal (not hex) printer for eval's results -- a
+// calculator that only ever prints hex isn't a useful demo. Iterative,
+// not recursive (build the digit string in reverse into a scratch
+// buffer, then print it forwards): this project's vani v1 checkers
+// have already shown real friction with anything not statically
+// bounded (see eval_expr_raw's own header comment), so a fixed-size
+// scratch buffer (24 bytes -- comfortably more than i64's own max 20
+// decimal digits plus a sign) sidesteps the question entirely rather
+// than relying on however deep vani's recursion support actually goes.
+fn uart_put_i64(v: i64) -> i64 {
+  let value: i64 = v;
+  let is_neg: i64 = 0;
+  if value < 0 {
+    is_neg = 1;
+    value = 0 - value;
+  }
+  let digits: mut ref i64 = dhruva_alloc_bytes(24);
+  let n: i64 = 0;
+  if value == 0 {
+    let _ = buf_write_byte(digits, 0 as u32, 48 as u32);
+    n = 1;
+  } else {
+    while value > 0 {
+      let d: i64 = value - ((value / 10) * 10);
+      let _ = buf_write_byte(digits, n as u32, (48 + d) as u32);
+      n = n + 1;
+      value = value / 10;
+    }
+  }
+  if is_neg == 1 {
+    let _ = uart_putc(45); // '-'
+  }
+  let i: i64 = n - 1;
+  while i >= 0 {
+    let c: u32 = buf_read_byte(digits, i as u32);
+    let _ = uart_putc(c as i64);
+    i = i - 1;
+  }
+  return 0;
+}
+
 // Phase 2 -- BCM2835 system timer (base 0x20003000) + interrupt
 // controller (base 0x2000B000). Timer channel 1 (C1) is free for ARM
 // use on real hardware (channels 0 and 2 are reserved for the GPU
@@ -1374,6 +1415,276 @@ fn shell_copy_range(buf: mut ref i64, start: i64, end: i64, out_buf: mut ref i64
   return n;
 }
 
+// Task #10: minimal arithmetic expression evaluator -- +, -, *, /,
+// parentheses, standard precedence, integers -- wired into the shell
+// as `eval <expr>`. The closest thing to a "vani REPL entry point"
+// achievable on bare metal: vanic itself is a host Rust program and
+// can't be embedded on target. Deliberately an ITERATIVE two-stack
+// (values + operators) evaluator, not recursive descent: this project
+// has already hit real friction with vani's v1 checkers around
+// anything not statically bounded (the UART drain loop's `while` vs
+// `for`, `#[interrupt]`'s outright ban on recursion) -- a hand-rolled
+// explicit-stack algorithm with a fixed max depth sidesteps that whole
+// class of question instead of hoping recursion through shell_dispatch
+// (already #[bounded_stack]-constrained via task_f) happens to check
+// out.
+//
+// Values are stored as u32 words with manual sign-extension on read
+// (`eval_to_i64`): `buf_write_u32`/`buf_read_u32` are u32-native, and
+// vani's own `as` cast from u32 to i64 zero-extends rather than sign-
+// extends, which would silently turn a stored -5 into a large positive
+// number on the way back out -- every other buffer-based value in this
+// file is a block number, length, or checksum, all non-negative, so
+// this is the first place that gap actually mattered.
+
+// True iff the low bit of `raw` marks it as negative (bit 31 set),
+// reversing the zero-extension `as u32 -> i64` would otherwise do.
+fn eval_to_i64(raw: u32) -> i64 {
+  if (raw & (0x80000000 as u32)) != (0 as u32) {
+    return (raw as i64) - 4294967296;
+  }
+  return raw as i64;
+}
+
+fn eval_prec(op: i64) -> i64 {
+  if (op == (42 as i64)) || (op == (47 as i64)) { // '*' '/'
+    return 2;
+  }
+  if (op == (43 as i64)) || (op == (45 as i64)) { // '+' '-'
+    return 1;
+  }
+  return 0;
+}
+
+fn eval_has_error(error_buf: mut ref i64) -> u32 {
+  return buf_read_u32(error_buf, 0 as u32);
+}
+
+fn eval_apply(op: i64, a: i64, b: i64, error_buf: mut ref i64) -> i64 {
+  if op == (43 as i64) { // '+'
+    return a + b;
+  }
+  if op == (45 as i64) { // '-'
+    return a - b;
+  }
+  if op == (42 as i64) { // '*'
+    return a * b;
+  }
+  if op == (47 as i64) { // '/'
+    if b == 0 {
+      let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+      return 0;
+    }
+    return a / b;
+  }
+  let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+  return 0;
+}
+
+// Evaluates buf[0..expr_len) as an arithmetic expression. error_buf[0]
+// is set to 1 on any malformed input, unbalanced parens, stack overflow
+// (more than 16 nested values/operators -- generous for anything that
+// fits in the shell's own 128-byte line buffer), or division by zero;
+// the returned i64 is meaningless whenever error_buf[0] is nonzero.
+fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64 {
+  let _ = buf_write_u32(error_buf, 0 as u32, 0 as u32);
+  let values: mut ref i64 = dhruva_alloc_bytes(64); // 16 slots * 4 bytes
+  let ops: mut ref i64 = dhruva_alloc_bytes(64);
+  let vtop: i64 = 0;
+  let otop: i64 = 0;
+  let i: i64 = 0;
+  // true if the NEXT token should start a value (a number, '(', or a
+  // unary '-') rather than a binary operator or ')' -- what tells
+  // "3 - 4" (binary) apart from "3 * -4" (unary) at the same '-' byte.
+  let expect_value: i64 = 1;
+
+  while (i < expr_len) && (eval_has_error(error_buf) == 0) {
+    let c: u32 = buf_read_byte(buf, i as u32);
+    if c == (32 as u32) {
+      i = i + 1;
+    } else {
+      if (c >= (48 as u32)) && (c <= (57 as u32)) {
+        let n: i64 = 0;
+        while (i < expr_len) && (buf_read_byte(buf, i as u32) >= (48 as u32)) && (buf_read_byte(buf, i as u32) <= (57 as u32)) {
+          let d: u32 = buf_read_byte(buf, i as u32);
+          n = n * 10 + ((d - (48 as u32)) as i64);
+          i = i + 1;
+        }
+        if vtop >= 16 {
+          let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+        } else {
+          let _ = buf_write_u32(values, (vtop * 4) as u32, n as u32);
+          vtop = vtop + 1;
+          expect_value = 0;
+        }
+      } else {
+        if c == (40 as u32) { // '('
+          if otop >= 16 {
+            let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+          } else {
+            let _ = buf_write_u32(ops, (otop * 4) as u32, 40 as u32);
+            otop = otop + 1;
+            i = i + 1;
+            expect_value = 1;
+          }
+        } else {
+          if c == (41 as u32) { // ')'
+            let found_open: i64 = 0;
+            while (otop > 0) && (found_open == 0) && (eval_has_error(error_buf) == 0) {
+              let top_op: u32 = buf_read_u32(ops, ((otop - 1) * 4) as u32);
+              if top_op == (40 as u32) {
+                otop = otop - 1;
+                found_open = 1;
+              } else {
+                if vtop < 2 {
+                  let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+                } else {
+                  let b: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 1) * 4) as u32));
+                  let a: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 2) * 4) as u32));
+                  vtop = vtop - 2;
+                  otop = otop - 1;
+                  let r: i64 = eval_apply(top_op as i64, a, b, error_buf);
+                  let _ = buf_write_u32(values, (vtop * 4) as u32, r as u32);
+                  vtop = vtop + 1;
+                }
+              }
+            }
+            if found_open == 0 {
+              let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+            } else {
+              i = i + 1;
+              expect_value = 0;
+            }
+          } else {
+            if (c == (43 as u32)) || (c == (45 as u32)) || (c == (42 as u32)) || (c == (47 as u32)) {
+              if (expect_value == 1) && (c == (45 as u32)) {
+                // Unary minus: push a 0 operand so "-4" becomes the
+                // equivalent binary expression "0 - 4".
+                if vtop >= 16 {
+                  let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+                } else {
+                  let _ = buf_write_u32(values, (vtop * 4) as u32, 0 as u32);
+                  vtop = vtop + 1;
+                }
+              } else {
+                if expect_value == 1 {
+                  let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+                }
+              }
+              if eval_has_error(error_buf) == 0 {
+                let op_i: i64 = c as i64;
+                while (otop > 0) && (eval_has_error(error_buf) == 0) && (eval_prec(eval_to_i64(buf_read_u32(ops, ((otop - 1) * 4) as u32))) >= eval_prec(op_i)) {
+                  let top_op2: u32 = buf_read_u32(ops, ((otop - 1) * 4) as u32);
+                  if vtop < 2 {
+                    let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+                  } else {
+                    let b2: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 1) * 4) as u32));
+                    let a2: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 2) * 4) as u32));
+                    vtop = vtop - 2;
+                    otop = otop - 1;
+                    let r2: i64 = eval_apply(top_op2 as i64, a2, b2, error_buf);
+                    let _ = buf_write_u32(values, (vtop * 4) as u32, r2 as u32);
+                    vtop = vtop + 1;
+                  }
+                }
+                if otop >= 16 {
+                  let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+                } else {
+                  let _ = buf_write_u32(ops, (otop * 4) as u32, op_i as u32);
+                  otop = otop + 1;
+                  i = i + 1;
+                  expect_value = 1;
+                }
+              }
+            } else {
+              let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  while (otop > 0) && (eval_has_error(error_buf) == 0) {
+    let top_op3: u32 = buf_read_u32(ops, ((otop - 1) * 4) as u32);
+    if top_op3 == (40 as u32) {
+      let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32); // unbalanced '('
+    } else {
+      if vtop < 2 {
+        let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+      } else {
+        let b3: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 1) * 4) as u32));
+        let a3: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 2) * 4) as u32));
+        vtop = vtop - 2;
+        otop = otop - 1;
+        let r3: i64 = eval_apply(top_op3 as i64, a3, b3, error_buf);
+        let _ = buf_write_u32(values, (vtop * 4) as u32, r3 as u32);
+        vtop = vtop + 1;
+      }
+    }
+  }
+
+  if (vtop != 1) || (eval_has_error(error_buf) != 0) {
+    let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+    return 0;
+  }
+  return eval_to_i64(buf_read_u32(values, 0 as u32));
+}
+
+// Boot-time self-test for eval_expr_raw, run from kernel_main() below
+// with a fixed set of hand-picked cases -- the same "verify at boot,
+// print PASS/FAIL, read the log" discipline every other kernel_main
+// self-test in this file already uses, and the ONLY verification
+// available for this feature in this sandbox: end-to-end interactive
+// testing (typing "eval 2+3" at the shell and reading the reply) is
+// blocked by a QEMU/environment issue where stdin never reaches either
+// BCM2835 UART's hardware FIFO at all (see task #9's memory writeup) --
+// nothing to do with this evaluator's own correctness, which this
+// self-test can still fully exercise via a Str literal converted to a
+// buffer, the same conversion fs_append does for its own path/data
+// arguments.
+fn eval_self_test(expr: Str, expected: i64, expect_error: i64) -> i64 {
+  let expr_len: i64 = str_len_bytes(expr);
+  let expr_buf: mut ref i64 = dhruva_alloc_bytes(128);
+  let i: i64 = 0;
+  while i < expr_len {
+    let _ = buf_write_byte(expr_buf, i as u32, str_byte_at(expr, i) as u32);
+    i = i + 1;
+  }
+  let error_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let result: i64 = eval_expr_raw(expr_buf, expr_len, error_buf);
+  let got_error: u32 = eval_has_error(error_buf);
+
+  let _ = uart_puts("EVAL: \"");
+  let _ = uart_puts(expr);
+  let _ = uart_puts("\" = ");
+  if got_error != (0 as u32) {
+    let _ = uart_puts("error");
+  } else {
+    let _ = uart_put_i64(result);
+  }
+
+  let ok: i64 = 0;
+  if (expect_error == 1) && (got_error != (0 as u32)) {
+    ok = 1;
+  }
+  if (expect_error == 0) && (got_error == (0 as u32)) && (result == expected) {
+    ok = 1;
+  }
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL, expected ");
+    if expect_error == 1 {
+      let _ = uart_puts("error");
+    } else {
+      let _ = uart_put_i64(expected);
+    }
+    let _ = uart_puts(")\n");
+  }
+  return 0;
+}
+
 // Parses and runs exactly one already-complete shell line. Deliberately
 // NOT #[no_heap] (same reasoning as task_e's GC pass above): every
 // scratch buffer here is a fresh dhruva_alloc_bytes, and this task can
@@ -1482,7 +1793,27 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/write)\n");
+  if shell_word_matches(line_buf, 0, cmd_end, "eval") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: eval <expr>\n");
+      return 0;
+    }
+    let expr_start: i64 = cmd_end + 1;
+    let expr_len: i64 = line_len - expr_start;
+    let expr_buf: mut ref i64 = dhruva_alloc_bytes(128);
+    let _ = shell_copy_range(line_buf, expr_start, line_len, expr_buf);
+    let error_buf: mut ref i64 = dhruva_alloc_bytes(4);
+    let result: i64 = eval_expr_raw(expr_buf, expr_len, error_buf);
+    if eval_has_error(error_buf) != (0 as u32) {
+      let _ = uart_puts("error\n");
+    } else {
+      let _ = uart_put_i64(result);
+      let _ = uart_puts("\n");
+    }
+    return 0;
+  }
+
+  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval)\n");
   return 0;
 }
 
@@ -1628,6 +1959,18 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("FS: read of deleted /config/name result=");
   let _ = uart_put_hex32(deleted_len as u32);
   let _ = uart_puts(" (expect FFFFFFFF, i.e. -1, not found)\n");
+
+  // Task #10 verification: eval_expr_raw, via boot-time self-test
+  // rather than live shell input (see eval_self_test's own comment).
+  let _ = eval_self_test("2+3", 5, 0);
+  let _ = eval_self_test("2 + 3 * 4", 14, 0);
+  let _ = eval_self_test("(2+3)*4", 20, 0);
+  let _ = eval_self_test("10-2-3", 5, 0);
+  let _ = eval_self_test("2*(3+4*(5-1))", 38, 0);
+  let _ = eval_self_test("-5+10", 5, 0);
+  let _ = eval_self_test("100/3", 33, 0);
+  let _ = eval_self_test("10/0", 0, 1);
+  let _ = eval_self_test("(1+2", 0, 1);
 
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();

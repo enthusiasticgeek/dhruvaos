@@ -24,6 +24,14 @@
 #      these (str_len_bytes() calls strlen(); the compiler-inserted
 #      bounds-check panic path calls dprintf()+exit()), so any bare-metal
 #      vani program needs them from somewhere.
+#   6. -lgcc at link time -- ARMv6 (arm1176jzf-s) has no hardware
+#      integer-divide instruction, so any `/` on an i64 (first needed by
+#      Phase 4 task #10's expression evaluator; nothing before it ever
+#      divided) compiles down to a call to `__aeabi_ldivmod`. That's a
+#      *compiler support* routine, not part of libc -- arm-none-eabi's
+#      own libgcc.a supplies it and is safe to link into a freestanding
+#      build (no OS/libc dependencies of its own), unlike pulling in a
+#      real libc would be.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,6 +83,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/sdcard_state.o" "${BUILD_DIR}/fs_buf.o" \
   "${BUILD_DIR}/fs_state.o" "${BUILD_DIR}/shell_state.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
+  -lgcc \
   -o "${BUILD_DIR}/dhruva.elf"
 
 echo "Built ${BUILD_DIR}/dhruva.elf"
