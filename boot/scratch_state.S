@@ -59,7 +59,14 @@ shell_line_scratch_addr:
     .word 0             /* 128 bytes: shell_dispatch's own copy of the
                          * current input line */
 eval_values_scratch_addr:
-    .word 0             /* 64 bytes: eval_expr_raw's value stack */
+    .word 0             /* 128 bytes: eval_expr_raw's value stack, 16
+                         * slots of 8 bytes each (a hi/lo u32 pair per
+                         * i64) -- was 64 bytes / 4 bytes-per-slot until
+                         * round 2's audit found that storing each value
+                         * as a single truncating u32 silently corrupted
+                         * any number beyond +-2 billion the instant it
+                         * was pushed (see eval_write_value/
+                         * eval_read_value in kernel_main.vani) */
 eval_ops_scratch_addr:
     .word 0             /* 64 bytes: eval_expr_raw's operator stack */
 uart_digits_scratch_addr:

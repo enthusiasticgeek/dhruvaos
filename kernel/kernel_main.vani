@@ -1017,6 +1017,23 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
       let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
       if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
         let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        // BUG (found via audit, 2026-08-27): rec_path_len/rec_data_len
+        // are on-disk fields covered by the checksum just verified
+        // above, so a random bit-flip or torn write is already very
+        // likely to be caught there -- but buf_checksum is a simple
+        // rotate-mix, not a cryptographic/collision-resistant hash,
+        // so a checksum match is strong evidence, not a proof, that
+        // these fields weren't corrupted into something out of range.
+        // Both used to feed straight into a copy-loop bound with only
+        // the tombstone-sentinel check below, no explicit range check
+        // against path_buf/data_buf's own real 32/464-byte capacity --
+        // the exact same "trust a length field, no bound" shape as
+        // the networking-layer bugs found earlier the same day, just
+        // with corrupted disk data playing the untrusted-input role
+        // instead of a hostile network segment. Skip the record
+        // entirely (same as failing the checksum check) rather than
+        // guess at truncating it.
+        if rec_path_len <= (32 as u32) {
         let k: i64 = 0;
         while (k as u32) < rec_path_len {
           let pb: u32 = buf_read_byte(buf, (12 + k) as u32);
@@ -1046,6 +1063,7 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
             // logic error that happens to still terminate wrong.
             let _ = fs_delete_raw(path_buf, rec_path_len as i64);
           } else {
+            if rec_data_len <= (464 as u32) {
             let m: i64 = 0;
             while (m as u32) < rec_data_len {
               let db: u32 = buf_read_byte(buf, (48 + m) as u32);
@@ -1053,7 +1071,9 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
               m = m + 1;
             }
             let _ = fs_append_raw(path_buf, rec_path_len as i64, data_buf, rec_data_len as i64);
+            }
           }
+        }
         }
       }
     }
@@ -1084,6 +1104,18 @@ fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
   if data_len == (0xFFFFFFFF as u32) {
     return 0 - 1;
   }
+  // BUG (found via audit, 2026-08-27): data_len is an on-disk field
+  // covered by fs_find_latest_block_raw's own checksum validation,
+  // but a checksum match is strong evidence, not proof, against
+  // corruption (buf_checksum is a simple rotate-mix, not collision-
+  // resistant) -- and out_buf's own real capacity is entirely up to
+  // the caller regardless. Reject rather than trust an out-of-range
+  // length as a copy-loop bound, same "reject, don't guess" posture
+  // as every other bounds check this project's storage/networking
+  // layers use.
+  if data_len > (464 as u32) {
+    return 0 - 1;
+  }
   let i: i64 = 0;
   while (i as u32) < data_len {
     let b: u32 = buf_read_byte(tmp, (48 + i) as u32);
@@ -1109,6 +1141,18 @@ fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i6
   }
   let data_len: u32 = buf_read_u32(tmp, 44 as u32);
   if data_len == (0xFFFFFFFF as u32) {
+    return 0 - 1;
+  }
+  // BUG (found via audit, 2026-08-27): data_len is an on-disk field
+  // covered by fs_find_latest_block_raw's own checksum validation,
+  // but a checksum match is strong evidence, not proof, against
+  // corruption (buf_checksum is a simple rotate-mix, not collision-
+  // resistant) -- and out_buf's own real capacity is entirely up to
+  // the caller regardless. Reject rather than trust an out-of-range
+  // length as a copy-loop bound, same "reject, don't guess" posture
+  // as every other bounds check this project's storage/networking
+  // layers use.
+  if data_len > (464 as u32) {
     return 0 - 1;
   }
   let i: i64 = 0;
@@ -1210,7 +1254,13 @@ fn fs_list(prefix: Str) -> i64 {
             }
             k = k + 1;
           }
-          if prefix_matches == 1 {
+          // BUG (found via audit, 2026-08-27): rec_path_len feeds the
+          // copy loop below with only a checksum match backing it --
+          // strong evidence against corruption, not proof (see fs_
+          // compact's identical fix for the full reasoning). Reject
+          // rather than let an out-of-range length overflow fs_path_
+          // scratch's real 32-byte capacity.
+          if (prefix_matches == 1) && (rec_path_len <= (32 as u32)) {
             // Copy the path out before calling fs_find_latest_block_
             // raw below: it reuses fs_sd_scratch (the same persistent
             // buffer as `buf` above) for its own scan, so `buf`'s
@@ -1482,8 +1532,26 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
 }
 
 // Receives the oldest pending frame into out_buf, returning its
-// length, or -1 if nothing is queued.
-fn netif_recv_frame(out_buf: mut ref i64) -> i64 {
+// length, or -1 if nothing is queued OR the queued frame is larger
+// than max_len (see below).
+//
+// BUG (found via audit, 2026-08-27, same shape as round 1's socket_
+// udp_recv/tcp_conn_handle_segment fixes, just one layer lower): this
+// used to copy up to 512 bytes (a queued frame's real length, valid
+// per netif_send_frame's own 512-byte-slot check) into out_buf with
+// no idea how big out_buf actually is. Every current caller happens
+// to either use a 512-byte buffer (matching the slot size exactly) or
+// a smaller one paired with self-generated traffic that never
+// actually exceeds it -- but that's a property of today's callers,
+// not something this function itself ever enforced. Since all netif
+// traffic shares ONE queue, nothing stops a future/different sender's
+// larger frame from being the next one a smaller-buffered caller
+// dequeues. max_len is now required (no way to ask a dhruva_alloc_
+// bytes result its own size at runtime) and a too-large frame is
+// dropped (dequeued, not left stuck blocking the queue forever) and
+// reported as -1, same "reject, don't guess/truncate" posture as
+// every other bounds check this project's networking layer uses.
+fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   if netif_get_count() <= 0 {
     return 0 - 1;
   }
@@ -1491,6 +1559,10 @@ fn netif_recv_frame(out_buf: mut ref i64) -> i64 {
   let tail: i64 = netif_get_tail();
   let base: i64 = tail * 512;
   let frame_len: i64 = netif_get_slot_len(tail);
+  if frame_len > max_len {
+    let _ = netif_advance_tail();
+    return 0 - 1;
+  }
   let i: i64 = 0;
   while i < frame_len {
     let b: u32 = buf_read_byte(qbuf, (base + i) as u32);
@@ -1510,7 +1582,7 @@ fn netif_recv_frame(out_buf: mut ref i64) -> i64 {
 fn netif_self_test() -> i64 {
   let ok: i64 = 1;
 
-  let empty_len: i64 = netif_recv_frame(dhruva_alloc_bytes(64));
+  let empty_len: i64 = netif_recv_frame(dhruva_alloc_bytes(64), 64);
   if empty_len != (0 - 1) {
     ok = 0;
   }
@@ -1540,7 +1612,7 @@ fn netif_self_test() -> i64 {
   }
 
   let recv_buf: mut ref i64 = dhruva_alloc_bytes(64);
-  let recv_len: i64 = netif_recv_frame(recv_buf);
+  let recv_len: i64 = netif_recv_frame(recv_buf, 64);
   if recv_len != 16 {
     ok = 0;
   }
@@ -1572,8 +1644,29 @@ fn netif_self_test() -> i64 {
   // the ARP/IPv4/UDP self-tests that follow it at boot.
   let m: i64 = 0;
   while m < 4 {
-    let _ = netif_recv_frame(recv_buf);
+    let _ = netif_recv_frame(recv_buf, 64);
     m = m + 1;
+  }
+
+  // Regression test for the missing-destination-capacity fix found by
+  // audit (2026-08-27, see netif_recv_frame's own comment): a queued
+  // frame larger than the caller's own buffer must be dropped, not
+  // used as a copy-loop bound that overflows that buffer. Queues a
+  // real 16-byte frame (the same one used above) and asks for it with
+  // a deliberately too-small max_len -- it must be rejected AND
+  // actually dequeued (so a caller with a too-small buffer can't
+  // permanently wedge the queue on a frame it will never fit).
+  let small_send_status: i64 = netif_send_frame(frame, 16);
+  if small_send_status != 0 {
+    ok = 0;
+  }
+  let too_small_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let too_small_status: i64 = netif_recv_frame(too_small_buf, 4);
+  if too_small_status != (0 - 1) {
+    ok = 0;
+  }
+  if netif_get_count() != 0 {
+    ok = 0; // must have been dequeued despite being rejected
   }
 
   let _ = uart_puts("NETIF: loopback send/recv + empty/full edge cases");
@@ -2008,7 +2101,7 @@ fn ipv4_self_test() -> i64 {
   }
 
   let recv_frame: mut ref i64 = dhruva_alloc_bytes(64);
-  let recv_len: i64 = netif_recv_frame(recv_frame);
+  let recv_len: i64 = netif_recv_frame(recv_frame, 64);
   if recv_len != 36 {
     ok = 0;
   }
@@ -2162,7 +2255,7 @@ fn socket_udp_send(my_mac: mut ref i64, local_ip: u32, remote_ip: u32, local_por
 // comment on the identical fix for the send side.
 fn socket_udp_recv(out_payload: mut ref i64, out_meta: mut ref i64, max_payload_len: i64) -> i64 {
   let frame: mut ref i64 = net_recv_scratch_get();
-  let frame_len: i64 = netif_recv_frame(frame);
+  let frame_len: i64 = netif_recv_frame(frame, 512);
   if frame_len < 0 {
     return 0 - 1;
   }
@@ -2521,7 +2614,7 @@ fn tcp_self_test() -> i64 {
   }
 
   let recv_frame: mut ref i64 = dhruva_alloc_bytes(64);
-  let recv_len: i64 = netif_recv_frame(recv_frame);
+  let recv_len: i64 = netif_recv_frame(recv_frame, 64);
   if recv_len != 54 { // 14 (eth) + 20 (ip) + 20 (tcp), no payload
     ok = 0;
   }
@@ -2829,17 +2922,17 @@ fn tcp_conn_self_test() -> i64 {
   // client's final ACK -> server.
   let scratch: mut ref i64 = dhruva_alloc_bytes(512);
   let f1: mut ref i64 = dhruva_alloc_bytes(64);
-  let l1: i64 = netif_recv_frame(f1); // client's SYN
+  let l1: i64 = netif_recv_frame(f1, 64); // client's SYN
   let s1: i64 = tcp_conn_handle_segment(server_id, f1, l1, my_mac, my_mac, scratch, 512);
   if (l1 <= 0) || (s1 != 0) { ok = 0; }
 
   let f2: mut ref i64 = dhruva_alloc_bytes(64);
-  let l2: i64 = netif_recv_frame(f2); // server's SYN-ACK
+  let l2: i64 = netif_recv_frame(f2, 64); // server's SYN-ACK
   let s2: i64 = tcp_conn_handle_segment(client_id, f2, l2, my_mac, my_mac, scratch, 512);
   if (l2 <= 0) || (s2 != 0) { ok = 0; }
 
   let f3: mut ref i64 = dhruva_alloc_bytes(64);
-  let l3: i64 = netif_recv_frame(f3); // client's final ACK
+  let l3: i64 = netif_recv_frame(f3, 64); // client's final ACK
   let s3: i64 = tcp_conn_handle_segment(server_id, f3, l3, my_mac, my_mac, scratch, 512);
   if (l3 <= 0) || (s3 != 0) { ok = 0; }
 
@@ -2854,7 +2947,7 @@ fn tcp_conn_self_test() -> i64 {
   if send_status != 0 { ok = 0; }
 
   let f4: mut ref i64 = dhruva_alloc_bytes(64);
-  let l4: i64 = netif_recv_frame(f4); // client's data segment
+  let l4: i64 = netif_recv_frame(f4, 64); // client's data segment
   let recv_payload: mut ref i64 = dhruva_alloc_bytes(2);
   let recv_len: i64 = tcp_conn_handle_segment(server_id, f4, l4, my_mac, my_mac, recv_payload, 2);
   if (l4 <= 0) || (recv_len != 2) { ok = 0; }
@@ -2863,7 +2956,7 @@ fn tcp_conn_self_test() -> i64 {
   }
 
   let f5: mut ref i64 = dhruva_alloc_bytes(64);
-  let l5: i64 = netif_recv_frame(f5); // server's ACK of the data
+  let l5: i64 = netif_recv_frame(f5, 64); // server's ACK of the data
   let s5: i64 = tcp_conn_handle_segment(client_id, f5, l5, my_mac, my_mac, scratch, 512);
   if (l5 <= 0) || (s5 != 0) { ok = 0; }
 
@@ -2873,19 +2966,19 @@ fn tcp_conn_self_test() -> i64 {
   if close_status != 0 { ok = 0; }
 
   let f6: mut ref i64 = dhruva_alloc_bytes(64);
-  let l6: i64 = netif_recv_frame(f6); // client's FIN+ACK
+  let l6: i64 = netif_recv_frame(f6, 64); // client's FIN+ACK
   let s6: i64 = tcp_conn_handle_segment(server_id, f6, l6, my_mac, my_mac, scratch, 512);
   if (l6 <= 0) || (s6 != 0) { ok = 0; }
   if tcp_conn_get_state(server_id) != tcp_state_fin_wait() { ok = 0; }
 
   let f7: mut ref i64 = dhruva_alloc_bytes(64);
-  let l7: i64 = netif_recv_frame(f7); // server's FIN+ACK (piggybacked)
+  let l7: i64 = netif_recv_frame(f7, 64); // server's FIN+ACK (piggybacked)
   let s7: i64 = tcp_conn_handle_segment(client_id, f7, l7, my_mac, my_mac, scratch, 512);
   if (l7 <= 0) || (s7 != 0) { ok = 0; }
   if tcp_conn_get_state(client_id) != tcp_state_closed_final() { ok = 0; }
 
   let f8: mut ref i64 = dhruva_alloc_bytes(64);
-  let l8: i64 = netif_recv_frame(f8); // client's final ACK
+  let l8: i64 = netif_recv_frame(f8, 64); // client's final ACK
   let s8: i64 = tcp_conn_handle_segment(server_id, f8, l8, my_mac, my_mac, scratch, 512);
   if (l8 <= 0) || (s8 != 0) { ok = 0; }
   if tcp_conn_get_state(server_id) != tcp_state_closed_final() { ok = 0; }
@@ -4121,6 +4214,34 @@ fn eval_to_i64(raw: u32) -> i64 {
   return raw as i64;
 }
 
+// BUG found in round 2's audit: the values stack below used to store
+// each number as a single u32 word (4 bytes/slot) via
+// `buf_write_u32(values, slot*4, n as u32)` -- silently truncating any
+// value outside +-2 billion the instant it was pushed, before any
+// arithmetic in eval_apply ever ran. `eval "999999999999*999999999999"`
+// produced a wrong SILENT answer (no error, no hang) because both
+// operands were already corrupted to small values before the multiply,
+// so the multiply itself never overflowed. Fixed by storing each i64 as
+// a hi/lo u32 pair, 8 bytes apart (verified round-trip for both large
+// positive and negative values via a standalone test against the real
+// vani-compiler on this ARM target). The `ops` stack is NOT affected --
+// it only ever holds small ASCII operator codes (43/45/42/47/40), so
+// its own `eval_to_i64(buf_read_u32(ops, ...))` call sites are
+// unchanged.
+fn eval_write_value(values: mut ref i64, slot: i64, n: i64) -> i64 {
+  let lo: u32 = n as u32;
+  let hi: u32 = (n >> 32) as u32;
+  let _ = buf_write_u32(values, (slot * 8) as u32, lo);
+  let _ = buf_write_u32(values, (slot * 8 + 4) as u32, hi);
+  return 0;
+}
+
+fn eval_read_value(values: mut ref i64, slot: i64) -> i64 {
+  let lo: u32 = buf_read_u32(values, (slot * 8) as u32);
+  let hi: u32 = buf_read_u32(values, (slot * 8 + 4) as u32);
+  return ((hi as i64) << 32) | ((lo as i64) & 4294967295);
+}
+
 fn eval_prec(op: i64) -> i64 {
   if (op == (42 as i64)) || (op == (47 as i64)) { // '*' '/'
     return 2;
@@ -4135,18 +4256,150 @@ fn eval_has_error(error_buf: mut ref i64) -> u32 {
   return buf_read_u32(error_buf, 0 as u32);
 }
 
+// BUG (found via audit, 2026-08-27, two layers deep): this function
+// used to compute a+b/a-b/a*b directly (to compare against
+// i64_saturating_add/sub/mul and detect overflow after the fact) and
+// rely on vani's own compiler-inserted overflow trap to either not
+// fire (silent wraparound, caught by the saturating comparison) or, if
+// it ever DID fire, at least not be reached because the values stack
+// (see eval_write_value/eval_read_value above) was truncating every
+// operand to u32 before it got this far, so no real overflow was ever
+// actually happening at this layer. Fixing the values-stack truncation
+// bug first exposed the real problem underneath: once a and b actually
+// carry their full, correct magnitude, computing the plain `a * b` for
+// "999999999999*999999999999" HANGS THE ENTIRE KERNEL FOREVER on this
+// exact ARM target/build (confirmed live -- QEMU output stops dead at
+// that exact self-test line and never resumes even after 60s, whereas
+// the identical `999999999999*999999999999` compiled standalone via
+// `vanic run` panics-and-exits(3) instead of hanging; ARM-native
+// codegen and lli-interpreted bitcode disagree on whether/how the trap
+// fires -- a vani-compiler-level gap, out of scope to fix here).
+// runtime_stubs.c's exit() is an infinite halt loop with no OS to
+// return to, so ANY trap firing on this path freezes the whole kernel,
+// not just the "eval" command that triggered it -- computing the
+// overflowing operation at all, even just to compare it against a safe
+// saturating result afterward, is not survivable here.
+//
+// Fixed by never executing an operation that can overflow in the first
+// place: i64_add_would_overflow/i64_sub_would_overflow/
+// i64_mul_would_overflow below decide purely from a and b, using only
+// subtractions/comparisons/divisions that are themselves provably safe
+// across the full i64 domain (see each function's own comment), and
+// the real +/-/* only ever runs once that check has already proven it
+// cannot overflow.
+fn i64_add_would_overflow(a: i64, b: i64) -> i64 {
+  let i64_max: i64 = 9223372036854775807;
+  let i64_min: i64 = 0 - 9223372036854775807 - 1;
+  if b > 0 {
+    // b>0 here, so i64_max - b is in [0, i64_max-1] -- never overflows.
+    if a > (i64_max - b) {
+      return 1;
+    }
+    return 0;
+  }
+  if b < 0 {
+    // b<0 here (down to i64_min); i64_min - b is in [i64_min+1, -1]
+    // for b > i64_min, and exactly 0 for b == i64_min -- never
+    // overflows either way.
+    if a < (i64_min - b) {
+      return 1;
+    }
+    return 0;
+  }
+  return 0; // b == 0 never overflows
+}
+
+fn i64_sub_would_overflow(a: i64, b: i64) -> i64 {
+  let i64_max: i64 = 9223372036854775807;
+  let i64_min: i64 = 0 - 9223372036854775807 - 1;
+  if b < 0 {
+    // b<0 here, so i64_max + b is in [-1, i64_max-1] -- never overflows.
+    if a > (i64_max + b) {
+      return 1;
+    }
+    return 0;
+  }
+  if b > 0 {
+    // b>0 here, so i64_min + b is in [i64_min+1, -1] -- never overflows.
+    if a < (i64_min + b) {
+      return 1;
+    }
+    return 0;
+  }
+  return 0; // b == 0 never overflows
+}
+
+fn i64_mul_would_overflow(a: i64, b: i64) -> i64 {
+  if (a == 0) || (b == 0) {
+    return 0;
+  }
+  let i64_max: i64 = 9223372036854775807;
+  let i64_min: i64 = 0 - 9223372036854775807 - 1;
+  // i64_min is the one value that can't be negated (-i64_min doesn't
+  // fit in i64) -- handled explicitly so the abs_a/abs_b step below
+  // never has to negate it.
+  if a == i64_min {
+    if b == 1 {
+      return 0;
+    }
+    return 1;
+  }
+  if b == i64_min {
+    if a == 1 {
+      return 0;
+    }
+    return 1;
+  }
+  let abs_a: i64 = a;
+  if a < 0 {
+    abs_a = 0 - a;
+  }
+  let abs_b: i64 = b;
+  if b < 0 {
+    abs_b = 0 - b;
+  }
+  // abs_a * abs_b overflows i64 iff abs_a > i64_max / abs_b (both
+  // sides already known positive and neither is i64_min at this
+  // point, so this division is always safe).
+  if abs_a > (i64_max / abs_b) {
+    return 1;
+  }
+  return 0;
+}
+
 fn eval_apply(op: i64, a: i64, b: i64, error_buf: mut ref i64) -> i64 {
   if op == (43 as i64) { // '+'
+    if i64_add_would_overflow(a, b) == 1 {
+      let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+      return 0;
+    }
     return a + b;
   }
   if op == (45 as i64) { // '-'
+    if i64_sub_would_overflow(a, b) == 1 {
+      let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+      return 0;
+    }
     return a - b;
   }
   if op == (42 as i64) { // '*'
+    if i64_mul_would_overflow(a, b) == 1 {
+      let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+      return 0;
+    }
     return a * b;
   }
   if op == (47 as i64) { // '/'
     if b == 0 {
+      let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+      return 0;
+    }
+    // i64::MIN / -1 is the one division that itself overflows (the
+    // mathematical result, 2^63, doesn't fit in i64) -- not caught by
+    // the b==0 check above, and (per this function's own history
+    // above) a raw division trap here would hit the exact same "no OS
+    // to return to" hang risk as +/-/* did.
+    if (a == (0 - 9223372036854775807 - 1)) && (b == (0 - 1)) {
       let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
       return 0;
     }
@@ -4163,7 +4416,7 @@ fn eval_apply(op: i64, a: i64, b: i64, error_buf: mut ref i64) -> i64 {
 // the returned i64 is meaningless whenever error_buf[0] is nonzero.
 fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64 {
   let _ = buf_write_u32(error_buf, 0 as u32, 0 as u32);
-  let values: mut ref i64 = eval_values_scratch_get(); // 16 slots * 4 bytes
+  let values: mut ref i64 = eval_values_scratch_get(); // 16 slots * 8 bytes (see eval_write_value/eval_read_value)
   let ops: mut ref i64 = eval_ops_scratch_get();
   let vtop: i64 = 0;
   let otop: i64 = 0;
@@ -4180,15 +4433,32 @@ fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64
     } else {
       if (c >= (48 as u32)) && (c <= (57 as u32)) {
         let n: i64 = 0;
-        while (i < expr_len) && (buf_read_byte(buf, i as u32) >= (48 as u32)) && (buf_read_byte(buf, i as u32) <= (57 as u32)) {
+        // Same overflow-detection fix as eval_apply's own comment
+        // explains in full -- a long enough digit run (e.g. 25+
+        // digits) overflows i64 here too, before the value even
+        // reaches an operator, and this build's overflow trap
+        // doesn't reliably fire on this target either.
+        while (i < expr_len) && (buf_read_byte(buf, i as u32) >= (48 as u32)) && (buf_read_byte(buf, i as u32) <= (57 as u32)) && (eval_has_error(error_buf) == 0) {
           let d: u32 = buf_read_byte(buf, i as u32);
-          n = n * 10 + ((d - (48 as u32)) as i64);
+          let digit: i64 = (d - (48 as u32)) as i64;
+          // n and digit are always >= 0 here, so (i64_max - digit) can
+          // never overflow (digit is at most 9) -- same "check before
+          // you compute" discipline as eval_apply's i64_*_would_overflow
+          // helpers, needed for the identical reason: actually computing
+          // n*10+digit before checking it can hang the whole kernel on
+          // this target once it truly overflows (see eval_apply's own
+          // comment for the full story).
+          if n > ((9223372036854775807 - digit) / 10) {
+            let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
+          } else {
+            n = n * 10 + digit;
+          }
           i = i + 1;
         }
         if vtop >= 16 {
           let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
         } else {
-          let _ = buf_write_u32(values, (vtop * 4) as u32, n as u32);
+          let _ = eval_write_value(values, vtop, n);
           vtop = vtop + 1;
           expect_value = 0;
         }
@@ -4214,12 +4484,12 @@ fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64
                 if vtop < 2 {
                   let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
                 } else {
-                  let b: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 1) * 4) as u32));
-                  let a: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 2) * 4) as u32));
+                  let b: i64 = eval_read_value(values, vtop - 1);
+                  let a: i64 = eval_read_value(values, vtop - 2);
                   vtop = vtop - 2;
                   otop = otop - 1;
                   let r: i64 = eval_apply(top_op as i64, a, b, error_buf);
-                  let _ = buf_write_u32(values, (vtop * 4) as u32, r as u32);
+                  let _ = eval_write_value(values, vtop, r);
                   vtop = vtop + 1;
                 }
               }
@@ -4238,7 +4508,7 @@ fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64
                 if vtop >= 16 {
                   let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
                 } else {
-                  let _ = buf_write_u32(values, (vtop * 4) as u32, 0 as u32);
+                  let _ = eval_write_value(values, vtop, 0);
                   vtop = vtop + 1;
                 }
               } else {
@@ -4253,12 +4523,12 @@ fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64
                   if vtop < 2 {
                     let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
                   } else {
-                    let b2: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 1) * 4) as u32));
-                    let a2: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 2) * 4) as u32));
+                    let b2: i64 = eval_read_value(values, vtop - 1);
+                    let a2: i64 = eval_read_value(values, vtop - 2);
                     vtop = vtop - 2;
                     otop = otop - 1;
                     let r2: i64 = eval_apply(top_op2 as i64, a2, b2, error_buf);
-                    let _ = buf_write_u32(values, (vtop * 4) as u32, r2 as u32);
+                    let _ = eval_write_value(values, vtop, r2);
                     vtop = vtop + 1;
                   }
                 }
@@ -4288,12 +4558,12 @@ fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64
       if vtop < 2 {
         let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
       } else {
-        let b3: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 1) * 4) as u32));
-        let a3: i64 = eval_to_i64(buf_read_u32(values, ((vtop - 2) * 4) as u32));
+        let b3: i64 = eval_read_value(values, vtop - 1);
+        let a3: i64 = eval_read_value(values, vtop - 2);
         vtop = vtop - 2;
         otop = otop - 1;
         let r3: i64 = eval_apply(top_op3 as i64, a3, b3, error_buf);
-        let _ = buf_write_u32(values, (vtop * 4) as u32, r3 as u32);
+        let _ = eval_write_value(values, vtop, r3);
         vtop = vtop + 1;
       }
     }
@@ -4303,7 +4573,7 @@ fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64
     let _ = buf_write_u32(error_buf, 0 as u32, 1 as u32);
     return 0;
   }
-  return eval_to_i64(buf_read_u32(values, 0 as u32));
+  return eval_read_value(values, 0);
 }
 
 // Boot-time self-test for eval_expr_raw, run from kernel_main() below
@@ -4526,7 +4796,7 @@ fn kernel_main() -> i64 {
   let _ = fs_path_scratch_set(dhruva_alloc_bytes(32));
   let _ = fs_data_scratch_set(dhruva_alloc_bytes(464));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
-  let _ = eval_values_scratch_set(dhruva_alloc_bytes(64));
+  let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
   let _ = uart_digits_scratch_set(dhruva_alloc_bytes(24));
   let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(64));
@@ -4666,6 +4936,15 @@ fn kernel_main() -> i64 {
   let _ = eval_self_test("100/3", 33, 0);
   let _ = eval_self_test("10/0", 0, 1);
   let _ = eval_self_test("(1+2", 0, 1);
+  // Round 2 audit regression: values stack used to store each number as
+  // a truncating single u32 word, silently corrupting operands beyond
+  // +-2 billion before eval_apply ever saw them -- this used to return
+  // a wrong silent answer (no error) instead of correctly detecting
+  // overflow. Also exercises a large-but-in-range value end to end to
+  // confirm the hi/lo split round-trips correctly, not just the
+  // overflow-rejection path.
+  let _ = eval_self_test("999999999999*999999999999", 0, 1);
+  let _ = eval_self_test("5000000000+5000000000", 10000000000, 0);
 
   // Phase 5 verification: governor_desired_freq_mhz's threshold
   // boundaries, via boot-time self-test rather than live introspection
