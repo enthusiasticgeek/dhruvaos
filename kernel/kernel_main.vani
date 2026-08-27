@@ -680,11 +680,32 @@ fn sdhost_card_addr(block_num: i64) -> u32 {
   return (block_num * 512) as u32;
 }
 
+// BUG (round 5 audit, 2026-08-27): both functions below computed
+// `status`, sdhost_cmd's own return value, then explicitly discarded
+// it (`let _ = status;`) and relied purely on SDHSTS's error bits
+// (0xF8: REW_TIME_OUT/CMD_TIME_OUT/CRC16/CRC7/FIFO_ERROR) to detect a
+// failed transfer. That mask genuinely does cover the hardware's own
+// SDTOUT-driven CMD_TIME_OUT condition -- but SDTOUT is configured to
+// 0xF00000 (sdhost_init), a real-hardware-timescale value (tens of
+// seconds' worth of card-clock cycles at identification speed), while
+// sdhost_cmd's own SOFTWARE poll loop gives up after a fixed 1,000,000
+// MMIO-read iterations -- far fewer wall-clock seconds under QEMU's
+// own MMIO emulation. A card that genuinely never responds would hit
+// that software cap and return with NEW_FLAG (bit 0x8000) still SET,
+// well before the hardware's own CMD_TIME_OUT bit ever fires --
+// meaning `errs` would read 0 (no hardware error yet) and the caller
+// would treat a read/write that never actually happened as a success,
+// handing the FS layer either a stale/garbage buffer (read) or silent
+// data loss with no error reported at all (write). Fixed by checking
+// NEW_FLAG in `status` too: still set means sdhost_cmd's own poll gave
+// up before the command ever completed, a failure regardless of what
+// SDHSTS shows.
 fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = 0x2020203C;
   let sdhblc: i64 = 0x20202050;
   let sdhsts: i64 = 0x20202020;
   let sdcmd_read: u32 = 0x40 as u32;
+  let sdcmd_new_flag: u32 = 0x8000 as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
   let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
@@ -693,10 +714,12 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   let _ = sdhost_drain_fifo_to_buffer(buf, 128);
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
+  if (status & sdcmd_new_flag) != (0 as u32) {
+    return 1;
+  }
   if errs != (0 as u32) {
     return 1;
   }
-  let _ = status;
   return 0;
 }
 
@@ -705,6 +728,7 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhblc: i64 = 0x20202050;
   let sdhsts: i64 = 0x20202020;
   let sdcmd_write: u32 = 0x80 as u32;
+  let sdcmd_new_flag: u32 = 0x8000 as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
   let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
@@ -713,10 +737,12 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   let _ = sdhost_fill_fifo_from_buffer(buf, 128);
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
+  if (status & sdcmd_new_flag) != (0 as u32) {
+    return 1;
+  }
   if errs != (0 as u32) {
     return 1;
   }
-  let _ = status;
   return 0;
 }
 
