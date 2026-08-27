@@ -87,6 +87,69 @@ dwc2_dma_scratch_addr:
                          * yet, so it gets its own dedicated buffer
                          * rather than assuming sharing is safe without
                          * verifying it the way those were. */
+tcp_empty_payload_scratch_addr:
+    .word 0             /* 1 byte: the placeholder payload pointer
+                         * every TCP control segment (SYN, ACK, FIN,
+                         * ...) passes to tcp_send_segment with
+                         * payload_len=0 -- its CONTENT is never read
+                         * or written (tcp_build_header's own payload
+                         * copy loop never executes when payload_len is
+                         * 0), only a valid non-null pointer is needed.
+                         * Found via the exact same audit as every
+                         * other entry in this file: tcp_conn_handle_
+                         * segment allocated a fresh one of these on
+                         * every one of its five response branches, and
+                         * it's called once per INCOMING SEGMENT --
+                         * potentially many times over one real TCP
+                         * connection's lifetime, the identical "called
+                         * repeatedly at runtime, not just once at
+                         * boot" shape as the FS-layer bug this file
+                         * was created to fix. */
+net_send_scratch_addr:
+    .word 0             /* 512 bytes: the one Ethernet+IP(+UDP/TCP)
+                         * frame buffer ipv4_send/udp_send/
+                         * tcp_send_segment each build their outgoing
+                         * frame into. Found via the SAME audit as
+                         * tcp_empty_payload_scratch above, and just as
+                         * serious: these three ARE this whole
+                         * project's real network send path, each
+                         * originally allocating its own fresh 512-byte
+                         * buffer on every single call -- undetected so
+                         * far only because nothing has driven them in
+                         * a real loop yet (self-tests call each a
+                         * handful of times), but tcp_send_segment
+                         * alone is reachable from tcp_conn_handle_
+                         * segment (once per incoming TCP segment) as
+                         * well as every tcp_conn_* API function, so
+                         * any real, sustained use of this networking
+                         * stack -- exactly what it exists for -- would
+                         * have exhausted the 64KB heap in well under
+                         * 150 sends. Safe to share one instance
+                         * across all three: none of them call each
+                         * other (each independently builds a complete
+                         * frame from scratch, no nesting), so there's
+                         * no point where two of them could need this
+                         * buffer's contents to coexist.
+                         *
+                         * NOT YET verified safe against a second
+                         * concurrent task using this networking stack
+                         * (unlike the FS-layer buffers above, whose
+                         * task_e/task_f-only, tied-priority safety
+                         * argument was checked call site by call
+                         * site) -- nothing calls into networking from
+                         * any task today, only single-threaded boot
+                         * self-tests. Re-verify this sharing argument
+                         * before wiring any task up to send network
+                         * traffic. */
+net_recv_scratch_addr:
+    .word 0             /* 512 bytes: socket_udp_recv's own internal
+                         * received-frame buffer -- same bug, same
+                         * fix. A future TCP-level socket_tcp_recv
+                         * equivalent would need the same treatment;
+                         * tcp_conn_handle_segment itself doesn't need
+                         * this one since its `frame` is always a
+                         * caller-supplied parameter, never its own
+                         * internal allocation. */
 
 .section ".text"
 
@@ -198,6 +261,48 @@ dwc2_dma_scratch_set:
 .global dwc2_dma_scratch_get
 dwc2_dma_scratch_get:
     ldr r0, =dwc2_dma_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global tcp_empty_payload_scratch_set
+tcp_empty_payload_scratch_set:
+    ldr r1, =tcp_empty_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global tcp_empty_payload_scratch_get
+tcp_empty_payload_scratch_get:
+    ldr r0, =tcp_empty_payload_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global net_send_scratch_set
+net_send_scratch_set:
+    ldr r1, =net_send_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global net_send_scratch_get
+net_send_scratch_get:
+    ldr r0, =net_send_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global net_recv_scratch_set
+net_recv_scratch_set:
+    ldr r1, =net_recv_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global net_recv_scratch_get
+net_recv_scratch_get:
+    ldr r0, =net_recv_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

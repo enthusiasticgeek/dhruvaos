@@ -51,6 +51,12 @@ extern "C" fn uart_digits_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn uart_digits_scratch_get() -> mut ref i64;
 extern "C" fn dwc2_dma_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dwc2_dma_scratch_get() -> mut ref i64;
+extern "C" fn tcp_empty_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tcp_empty_payload_scratch_get() -> mut ref i64;
+extern "C" fn net_send_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn net_send_scratch_get() -> mut ref i64;
+extern "C" fn net_recv_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn net_recv_scratch_get() -> mut ref i64;
 extern "C" fn ptr_to_u32(p: mut ref i64) -> u32;
 extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
@@ -1951,8 +1957,14 @@ fn ipv4_verify_checksum(frame: mut ref i64, ip_offset: i64) -> i64 {
 // Builds a full Ethernet+IPv4 frame around payload[0..payload_len) and
 // sends it via netif. Frame layout: [14-byte Ethernet header][20-byte
 // IP header][payload].
+//
+// `frame` is net_send_scratch, not a fresh dhruva_alloc_bytes call --
+// see scratch_state.S's own comment on that buffer for why: this
+// function (and udp_send/tcp_send_segment right after it) is the
+// actual network SEND path, callable many times over a real session,
+// not just from a boot self-test.
 fn ipv4_send(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, protocol: u32, payload: mut ref i64, payload_len: i64) -> i64 {
-  let frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let frame: mut ref i64 = net_send_scratch_get();
   let i: i64 = 0;
   while i < 6 {
     let db: u32 = buf_read_byte(dst_mac, i as u32);
@@ -2105,8 +2117,9 @@ fn udp_get_length(frame: mut ref i64, udp_offset: i64) -> u32 {
 
 // Builds and sends a full Ethernet+IPv4+UDP frame. Offsets are fixed
 // (14 for IP, 34 for UDP) since this stack never sends IP options.
+// `frame` is net_send_scratch -- see ipv4_send's own comment above.
 fn udp_send(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, payload: mut ref i64, payload_len: i64) -> i64 {
-  let frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let frame: mut ref i64 = net_send_scratch_get();
   let i: i64 = 0;
   while i < 6 {
     let db: u32 = buf_read_byte(dst_mac, i as u32);
@@ -2142,9 +2155,13 @@ fn socket_udp_send(my_mac: mut ref i64, local_ip: u32, remote_ip: u32, local_por
 // Receives the next queued frame; if it's UDP, copies its payload into
 // out_payload and writes [src_ip(4, BE)][src_port(2, BE)][dst_port(2,
 // BE)] into out_meta (8 bytes), returning the payload length. Returns
-// -1 if nothing is queued or the frame isn't UDP.
-fn socket_udp_recv(out_payload: mut ref i64, out_meta: mut ref i64) -> i64 {
-  let frame: mut ref i64 = dhruva_alloc_bytes(512);
+// -1 if nothing is queued, the frame isn't UDP, or the segment fails
+// the sanity checks below (see the comment at those checks for what
+// they guard against and why they're not optional). `frame` is
+// net_recv_scratch, not a fresh allocation -- see ipv4_send's own
+// comment on the identical fix for the send side.
+fn socket_udp_recv(out_payload: mut ref i64, out_meta: mut ref i64, max_payload_len: i64) -> i64 {
+  let frame: mut ref i64 = net_recv_scratch_get();
   let frame_len: i64 = netif_recv_frame(frame);
   if frame_len < 0 {
     return 0 - 1;
@@ -2157,6 +2174,37 @@ fn socket_udp_recv(out_payload: mut ref i64, out_meta: mut ref i64) -> i64 {
   }
   let udp_len: u32 = udp_get_length(frame, 34);
   let payload_len: i64 = (udp_len as i64) - 8;
+  // BUG (found via audit, 2026-08-27, never actually triggered since
+  // nothing exercises this against real/malformed network input yet):
+  // payload_len came entirely from the UDP header's OWN self-reported
+  // length field -- untrusted data carried INSIDE the very frame this
+  // function is parsing, not validated against anything. A field
+  // claiming an absurd length (corrupted on the wire, or crafted, on
+  // any real non-loopback link) would drive the copy loop below to
+  // read far past frame's real bounds and write far past out_payload's
+  // real allocated size -- a heap buffer over-read/overflow, the exact
+  // kind of bug a from-scratch network stack has to guard against at
+  // exactly this boundary (untrusted bytes off the wire), not trust
+  // the way this project trusts its own already-checksummed FS
+  // records. Three checks, all required: the declared length can't be
+  // negative (a UDP length < 8 doesn't even cover its own header), the
+  // declared segment can't claim to extend past what netif actually
+  // received (frame_len), and the payload can't be larger than the
+  // caller's own out_payload buffer (max_payload_len, now a required
+  // parameter -- there is no way to ask a dhruva_alloc_bytes result
+  // its own size at runtime, so the caller has to say). Any violation
+  // is treated as a malformed/hostile segment and dropped outright,
+  // never silently truncated -- same "reject, don't guess" posture as
+  // fs_init's own checksum-based recovery scan.
+  if payload_len < 0 {
+    return 0 - 1;
+  }
+  if (34 + (udp_len as i64)) > frame_len {
+    return 0 - 1;
+  }
+  if payload_len > max_payload_len {
+    return 0 - 1;
+  }
   let i: i64 = 0;
   while i < payload_len {
     let b: u32 = buf_read_byte(frame, (42 + i) as u32); // 14 + 20 + 8
@@ -2198,7 +2246,7 @@ fn udp_self_test() -> i64 {
 
   let recv_payload: mut ref i64 = dhruva_alloc_bytes(16);
   let recv_meta: mut ref i64 = dhruva_alloc_bytes(8);
-  let recv_len: i64 = socket_udp_recv(recv_payload, recv_meta);
+  let recv_len: i64 = socket_udp_recv(recv_payload, recv_meta, 16);
   if recv_len != 5 {
     ok = 0;
   }
@@ -2225,12 +2273,70 @@ fn udp_self_test() -> i64 {
     ok = 0;
   }
 
-  let empty_status: i64 = socket_udp_recv(recv_payload, recv_meta);
+  let empty_status: i64 = socket_udp_recv(recv_payload, recv_meta, 16);
   if empty_status != (0 - 1) {
     ok = 0;
   }
 
   let _ = uart_puts("UDP: socket send/recv over loopback + checksum");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Regression test for the length-validation fix found by audit
+// (2026-08-27, see socket_udp_recv's own comment): a UDP segment
+// whose header claims a length far beyond what was actually received
+// must be rejected outright, not trusted as a copy-loop bound. Builds
+// a real, small, correctly-queued frame (so netif_recv_frame reports
+// its true, small length), then corrupts only the UDP header's own
+// length field to claim far more data than that -- exactly the shape
+// a corrupted-on-the-wire or hostile segment would have on any real
+// (non-loopback) link.
+fn udp_recv_bounds_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let local_ip: u32 = 0xC0A80101 as u32;
+  let remote_ip: u32 = 0xC0A80102 as u32;
+
+  let frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let i: i64 = 0;
+  while i < 12 {
+    let _ = buf_write_byte(frame, i as u32, 0 as u32); // dst/src MAC, don't care
+    i = i + 1;
+  }
+  let _ = buf_write_u16_be(frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let payload: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = buf_write_byte(payload, 0 as u32, 65 as u32);
+  let real_udp_len: i64 = udp_build(frame, 34, 1 as u32, 2 as u32, payload, 1, local_ip, remote_ip);
+  let real_total_len: i64 = 20 + real_udp_len;
+  let _ = ipv4_build_header(frame, 14, real_total_len, 17 as u32, local_ip, remote_ip);
+  let real_frame_len: i64 = 14 + real_total_len; // 14+20+9 = 43 bytes, actually queued
+
+  // Corrupt ONLY the UDP header's own length field (checksum is left
+  // stale/mismatched on purpose -- this test targets the length
+  // bounds check specifically, not checksum validation, and
+  // socket_udp_recv doesn't check the checksum at all currently; see
+  // that function's own comment).
+  let _ = buf_write_u16_be(frame, 34 + 4, 60000 as u32);
+
+  let send_status: i64 = netif_send_frame(frame, real_frame_len);
+  if send_status != 0 {
+    ok = 0;
+  }
+
+  let recv_payload: mut ref i64 = dhruva_alloc_bytes(4);
+  let recv_meta: mut ref i64 = dhruva_alloc_bytes(8);
+  let status: i64 = socket_udp_recv(recv_payload, recv_meta, 4);
+  if status != (0 - 1) {
+    ok = 0;
+  }
+
+  let _ = uart_puts("UDP: recv rejects a length field past what was actually received");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -2369,7 +2475,7 @@ fn tcp_verify_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, tcp_offset:
 // Fixed offsets (14 for IP, 34 for TCP) since this stack never sends
 // IP options, matching udp_send's own layout exactly.
 fn tcp_send_segment(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32, payload: mut ref i64, payload_len: i64) -> i64 {
-  let frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let frame: mut ref i64 = net_send_scratch_get();
   let i: i64 = 0;
   while i < 6 {
     let db: u32 = buf_read_byte(dst_mac, i as u32);
@@ -2407,7 +2513,7 @@ fn tcp_self_test() -> i64 {
   let dst_port: u32 = 80 as u32;
   let seq: u32 = 1000 as u32;
   let ack: u32 = 0 as u32;
-  let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+  let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
 
   let send_status: i64 = tcp_send_segment(my_mac, my_mac, src_ip, dst_ip, src_port, dst_port, seq, ack, tcp_flag_syn(), 65535 as u32, empty_payload, 0);
   if send_status != 0 {
@@ -2499,7 +2605,7 @@ fn tcp_conn_active_open(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64,
   let _ = tcp_conn_set_local_seq(conn_id, initial_seq);
   let _ = tcp_conn_set_remote_seq(conn_id, 0 as u32);
   let _ = tcp_conn_set_state(conn_id, tcp_state_syn_sent());
-  let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+  let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
   return tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, initial_seq, 0 as u32, tcp_flag_syn(), 65535 as u32, empty_payload, 0);
 }
 
@@ -2529,7 +2635,7 @@ fn tcp_conn_passive_open(conn_id: u32, local_ip: u32, local_port: u32) -> i64 {
 //         (silently ignored, matching a real TCP's own tolerance of
 //         duplicate/out-of-order segments in a scope this minimal
 //         implementation doesn't attempt to handle)
-fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, my_mac: mut ref i64, dst_mac: mut ref i64, out_payload: mut ref i64) -> i64 {
+fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_mac: mut ref i64, dst_mac: mut ref i64, out_payload: mut ref i64, max_payload_len: i64) -> i64 {
   let state: u32 = tcp_conn_get_state(conn_id);
   let flags: u32 = tcp_get_flags(frame, 34);
   let seg_seq: u32 = tcp_get_seq(frame, 34);
@@ -2555,7 +2661,7 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, my_mac: mut ref i64
     let server_isn: u32 = 5000 as u32;
     let _ = tcp_conn_set_local_seq(conn_id, server_isn);
     let _ = tcp_conn_set_state(conn_id, tcp_state_syn_rcvd());
-    let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+    let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
     let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), server_isn, tcp_conn_get_remote_seq(conn_id), tcp_flag_syn() | tcp_flag_ack(), 65535 as u32, empty_payload, 0);
     return 0;
   }
@@ -2569,7 +2675,7 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, my_mac: mut ref i64
     let new_local_seq: u32 = tcp_conn_get_local_seq(conn_id) + (1 as u32); // our own SYN consumed one
     let _ = tcp_conn_set_local_seq(conn_id, new_local_seq);
     let _ = tcp_conn_set_state(conn_id, tcp_state_established());
-    let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+    let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
     let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), new_local_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
     return 0;
   }
@@ -2583,10 +2689,41 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, my_mac: mut ref i64
 
   // Established, a data segment arrives in order: copy the payload
   // out, advance what we expect next, and acknowledge it.
+  //
+  // BUG (found via audit, 2026-08-27, same shape and same "never
+  // actually triggered yet" caveat as socket_udp_recv's identical
+  // fix -- see that function's own comment for the full reasoning):
+  // payload_len came entirely from the segment's OWN self-reported
+  // IPv4 total-length field, untrusted data carried inside the frame
+  // being parsed, never checked against recv_len (what netif actually
+  // received) or against out_payload's real capacity. A malformed or
+  // hostile segment on any real link could drive the copy loop to
+  // read past frame's real bounds and write past out_payload's real
+  // allocation. Same three-fold guard as socket_udp_recv: reject
+  // (don't truncate) a negative length, a declared extent past
+  // recv_len, or a payload bigger than the caller's own buffer
+  // (max_payload_len, now a required parameter for the same reason).
+  // data_offset also gets a sanity floor -- a value under 20 bytes
+  // isn't a valid TCP header at all (this stack never sends or
+  // expects options, so it should always read exactly 20, but a
+  // malformed segment could claim otherwise) and would otherwise let
+  // the "payload" start being read from inside the header itself.
   if (state == tcp_state_established()) && (has_psh == 1) && (seg_seq == tcp_conn_get_remote_seq(conn_id)) {
     let tcp_len: i64 = ipv4_get_total_len(frame, 14) as i64 - 20;
     let data_offset: i64 = tcp_get_data_offset_bytes(frame, 34);
     let payload_len: i64 = tcp_len - data_offset;
+    if data_offset < 20 {
+      return 0 - 1;
+    }
+    if payload_len < 0 {
+      return 0 - 1;
+    }
+    if (34 + data_offset + payload_len) > recv_len {
+      return 0 - 1;
+    }
+    if payload_len > max_payload_len {
+      return 0 - 1;
+    }
     let i: i64 = 0;
     while i < payload_len {
       let b: u32 = buf_read_byte(frame, (34 + data_offset + i) as u32);
@@ -2594,7 +2731,7 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, my_mac: mut ref i64
       i = i + 1;
     }
     let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (payload_len as u32));
-    let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+    let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
     let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
     return payload_len;
   }
@@ -2612,7 +2749,7 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, my_mac: mut ref i64
   if (state == tcp_state_established()) && (has_fin == 1) {
     let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32)); // FIN consumes one seq number
     let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait());
-    let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+    let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
     let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack() | tcp_flag_fin(), 65535 as u32, empty_payload, 0);
     let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // our own FIN
     return 0;
@@ -2634,7 +2771,7 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, my_mac: mut ref i64
   if (state == tcp_state_fin_wait()) && (has_ack == 1) {
     if has_fin == 1 {
       let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
-      let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+      let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
       let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
     }
     let _ = tcp_conn_set_state(conn_id, tcp_state_closed_final());
@@ -2660,7 +2797,7 @@ fn tcp_conn_send_data(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, p
 // tcp_conn_handle_segment and it in turn produces the final ACK this
 // side is waiting for.
 fn tcp_conn_close(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
-  let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+  let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
   let status: i64 = tcp_send_segment(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_fin() | tcp_flag_ack(), 65535 as u32, empty_payload, 0);
   let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // FIN consumes one
   let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait());
@@ -2693,17 +2830,17 @@ fn tcp_conn_self_test() -> i64 {
   let scratch: mut ref i64 = dhruva_alloc_bytes(512);
   let f1: mut ref i64 = dhruva_alloc_bytes(64);
   let l1: i64 = netif_recv_frame(f1); // client's SYN
-  let s1: i64 = tcp_conn_handle_segment(server_id, f1, my_mac, my_mac, scratch);
+  let s1: i64 = tcp_conn_handle_segment(server_id, f1, l1, my_mac, my_mac, scratch, 512);
   if (l1 <= 0) || (s1 != 0) { ok = 0; }
 
   let f2: mut ref i64 = dhruva_alloc_bytes(64);
   let l2: i64 = netif_recv_frame(f2); // server's SYN-ACK
-  let s2: i64 = tcp_conn_handle_segment(client_id, f2, my_mac, my_mac, scratch);
+  let s2: i64 = tcp_conn_handle_segment(client_id, f2, l2, my_mac, my_mac, scratch, 512);
   if (l2 <= 0) || (s2 != 0) { ok = 0; }
 
   let f3: mut ref i64 = dhruva_alloc_bytes(64);
   let l3: i64 = netif_recv_frame(f3); // client's final ACK
-  let s3: i64 = tcp_conn_handle_segment(server_id, f3, my_mac, my_mac, scratch);
+  let s3: i64 = tcp_conn_handle_segment(server_id, f3, l3, my_mac, my_mac, scratch, 512);
   if (l3 <= 0) || (s3 != 0) { ok = 0; }
 
   if tcp_conn_get_state(client_id) != tcp_state_established() { ok = 0; }
@@ -2719,7 +2856,7 @@ fn tcp_conn_self_test() -> i64 {
   let f4: mut ref i64 = dhruva_alloc_bytes(64);
   let l4: i64 = netif_recv_frame(f4); // client's data segment
   let recv_payload: mut ref i64 = dhruva_alloc_bytes(2);
-  let recv_len: i64 = tcp_conn_handle_segment(server_id, f4, my_mac, my_mac, recv_payload);
+  let recv_len: i64 = tcp_conn_handle_segment(server_id, f4, l4, my_mac, my_mac, recv_payload, 2);
   if (l4 <= 0) || (recv_len != 2) { ok = 0; }
   if (buf_read_byte(recv_payload, 0 as u32) != (104 as u32)) || (buf_read_byte(recv_payload, 1 as u32) != (105 as u32)) {
     ok = 0;
@@ -2727,7 +2864,7 @@ fn tcp_conn_self_test() -> i64 {
 
   let f5: mut ref i64 = dhruva_alloc_bytes(64);
   let l5: i64 = netif_recv_frame(f5); // server's ACK of the data
-  let s5: i64 = tcp_conn_handle_segment(client_id, f5, my_mac, my_mac, scratch);
+  let s5: i64 = tcp_conn_handle_segment(client_id, f5, l5, my_mac, my_mac, scratch, 512);
   if (l5 <= 0) || (s5 != 0) { ok = 0; }
 
   // Close: client sends FIN+ACK; server piggybacks its own FIN onto
@@ -2737,23 +2874,82 @@ fn tcp_conn_self_test() -> i64 {
 
   let f6: mut ref i64 = dhruva_alloc_bytes(64);
   let l6: i64 = netif_recv_frame(f6); // client's FIN+ACK
-  let s6: i64 = tcp_conn_handle_segment(server_id, f6, my_mac, my_mac, scratch);
+  let s6: i64 = tcp_conn_handle_segment(server_id, f6, l6, my_mac, my_mac, scratch, 512);
   if (l6 <= 0) || (s6 != 0) { ok = 0; }
   if tcp_conn_get_state(server_id) != tcp_state_fin_wait() { ok = 0; }
 
   let f7: mut ref i64 = dhruva_alloc_bytes(64);
   let l7: i64 = netif_recv_frame(f7); // server's FIN+ACK (piggybacked)
-  let s7: i64 = tcp_conn_handle_segment(client_id, f7, my_mac, my_mac, scratch);
+  let s7: i64 = tcp_conn_handle_segment(client_id, f7, l7, my_mac, my_mac, scratch, 512);
   if (l7 <= 0) || (s7 != 0) { ok = 0; }
   if tcp_conn_get_state(client_id) != tcp_state_closed_final() { ok = 0; }
 
   let f8: mut ref i64 = dhruva_alloc_bytes(64);
   let l8: i64 = netif_recv_frame(f8); // client's final ACK
-  let s8: i64 = tcp_conn_handle_segment(server_id, f8, my_mac, my_mac, scratch);
+  let s8: i64 = tcp_conn_handle_segment(server_id, f8, l8, my_mac, my_mac, scratch, 512);
   if (l8 <= 0) || (s8 != 0) { ok = 0; }
   if tcp_conn_get_state(server_id) != tcp_state_closed_final() { ok = 0; }
 
   let _ = uart_puts("TCP: connection lifecycle (handshake + data + close)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Regression test for the length-validation fix found by audit
+// (2026-08-27, see tcp_conn_handle_segment's own comment): a TCP data
+// segment whose IPv4 header claims a length far beyond what was
+// actually received must be rejected, not trusted as a copy-loop
+// bound. Drives connection slot 0 directly into ESTABLISHED (a
+// white-box setup, not a real handshake -- this test targets the
+// data-segment length check specifically) and hands it a real, small,
+// correctly-queued segment whose IP total-length field has been
+// corrupted to claim far more data than that.
+fn tcp_conn_recv_bounds_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let conn_id: u32 = 0 as u32;
+  let local_ip: u32 = 0xC0A80101 as u32;
+  let remote_ip: u32 = 0xC0A80102 as u32;
+  let start_seq: u32 = 9000 as u32;
+
+  let _ = tcp_conn_set_local_ip(conn_id, local_ip);
+  let _ = tcp_conn_set_remote_ip(conn_id, remote_ip);
+  let _ = tcp_conn_set_local_port(conn_id, 7 as u32);
+  let _ = tcp_conn_set_remote_port(conn_id, 54321 as u32);
+  let _ = tcp_conn_set_local_seq(conn_id, 1 as u32);
+  let _ = tcp_conn_set_remote_seq(conn_id, start_seq);
+  let _ = tcp_conn_set_state(conn_id, tcp_state_established());
+
+  let frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let payload: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = buf_write_byte(payload, 0 as u32, 66 as u32);
+  let real_tcp_len: i64 = tcp_build_header(frame, 34, 54321 as u32, 7 as u32, start_seq, 1 as u32, tcp_flag_psh() | tcp_flag_ack(), 65535 as u32, payload, 1, remote_ip, local_ip);
+  let real_total_len: i64 = 20 + real_tcp_len;
+  let _ = ipv4_build_header(frame, 14, real_total_len, 6 as u32, remote_ip, local_ip);
+  let real_frame_len: i64 = 14 + real_total_len; // 14+20+21 = 55 bytes, actually queued
+
+  // Corrupt ONLY the IPv4 header's own total-length field (the field
+  // tcp_conn_handle_segment's payload_len calculation actually reads)
+  // to claim far more data than was really sent.
+  let _ = buf_write_u16_be(frame, 14 + 2, 60000 as u32);
+
+  let scratch: mut ref i64 = dhruva_alloc_bytes(4);
+  let status: i64 = tcp_conn_handle_segment(conn_id, frame, real_frame_len, my_mac, my_mac, scratch, 4);
+  if status != (0 - 1) {
+    ok = 0;
+  }
+  // The malformed segment must not have been treated as accepted --
+  // remote_seq should be untouched (still start_seq, not advanced).
+  if tcp_conn_get_remote_seq(conn_id) != start_seq {
+    ok = 0;
+  }
+
+  let _ = uart_puts("TCP: handle_segment rejects a length field past what was actually received");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -4334,6 +4530,9 @@ fn kernel_main() -> i64 {
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
   let _ = uart_digits_scratch_set(dhruva_alloc_bytes(24));
   let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(64));
+  let _ = tcp_empty_payload_scratch_set(dhruva_alloc_bytes(1));
+  let _ = net_send_scratch_set(dhruva_alloc_bytes(512));
+  let _ = net_recv_scratch_set(dhruva_alloc_bytes(512));
 
   let _ = sdhost_init();
 
@@ -4487,8 +4686,10 @@ fn kernel_main() -> i64 {
   let _ = arp_self_test();
   let _ = ipv4_self_test();
   let _ = udp_self_test();
+  let _ = udp_recv_bounds_self_test();
   let _ = tcp_self_test();
   let _ = tcp_conn_self_test();
+  let _ = tcp_conn_recv_bounds_self_test();
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device
