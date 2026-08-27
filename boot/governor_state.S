@@ -23,6 +23,23 @@ governor_last_applied_mhz:
                      * exactly like fs_init's own "0 means never
                      * written" convention. */
 
+/* Phase 5 step 2 -- fixed-size run-queue-depth history for the
+ * smoothed scoring function (see kernel_main.vani's governor_desired_
+ * freq_mhz_v2 and power/train_governor.py's own header comment for
+ * why smoothing over a short window, not the instantaneous sample
+ * alone, is what step 2 actually adds). h0 = most recent sample after
+ * a push, h3 = oldest of the 4 kept. Zero-initialized by .bss, same
+ * as every other piece of state in this file -- a fresh boot correctly
+ * starts as if the last 4 samples were all "0 load." */
+governor_history_h0:
+    .word 0
+governor_history_h1:
+    .word 0
+governor_history_h2:
+    .word 0
+governor_history_h3:
+    .word 0
+
 .section ".text"
 
 .global governor_get_last_applied_mhz
@@ -37,6 +54,77 @@ governor_set_last_applied_mhz:
     ldr r1, =governor_last_applied_mhz
     str r0, [r1]
     mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* i64 governor_history_push(i64 new_sample) -- shifts the window and
+ * inserts new_sample as h0. Only ever needs r0-r2: h3=h2, h2=h1,
+ * h1=h0(old), h0=new_sample, read/written oldest-first so no temp
+ * beyond the value already in a register is needed. */
+.global governor_history_push
+governor_history_push:
+    ldr r1, =governor_history_h2
+    ldr r2, [r1]
+    ldr r1, =governor_history_h3
+    str r2, [r1]                     /* h3 = old h2 */
+    ldr r1, =governor_history_h1
+    ldr r2, [r1]
+    ldr r1, =governor_history_h2
+    str r2, [r1]                     /* h2 = old h1 */
+    ldr r1, =governor_history_h0
+    ldr r2, [r1]
+    ldr r1, =governor_history_h1
+    str r2, [r1]                     /* h1 = old h0 */
+    ldr r1, =governor_history_h0
+    str r0, [r1]                     /* h0 = new_sample */
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global governor_history_get0
+governor_history_get0:
+    ldr r0, =governor_history_h0
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global governor_history_get1
+governor_history_get1:
+    ldr r0, =governor_history_h1
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global governor_history_get2
+governor_history_get2:
+    ldr r0, =governor_history_h2
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global governor_history_get3
+governor_history_get3:
+    ldr r0, =governor_history_h3
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+/* i64 governor_history_reset() -- zeroes the window. Used after the
+ * boot-time replay self-test (which deliberately drives the SAME
+ * synthetic workload power/train_governor.py trained against through
+ * this history buffer) so live operation starts clean, not carrying
+ * over the last few synthetic samples from that test. */
+.global governor_history_reset
+governor_history_reset:
+    mov r0, #0
+    ldr r1, =governor_history_h0
+    str r0, [r1]
+    ldr r1, =governor_history_h1
+    str r0, [r1]
+    ldr r1, =governor_history_h2
+    str r0, [r1]
+    ldr r1, =governor_history_h3
+    str r0, [r1]
     mov r1, #0
     bx lr
 
