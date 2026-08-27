@@ -2530,8 +2530,32 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
 
   // DATA stage (IN): read want_len bytes back into the same DMA
   // buffer, then copy out to the caller's own out_buf.
+  //
+  // BUG (found via a live STALL on the very first multi-packet
+  // transfer this driver ever attempted -- want_len=18 > mps=8):
+  // pktcnt must be the real number of MPS-sized packets the transfer
+  // needs (ceil(want_len/mps)), not a hardcoded 1. hcd-dwc2.c's own
+  // dwc2_handle_packet caps a single packet's actual transfer length
+  // to `mps` whenever the overall length is "small" (<=1536 bytes,
+  // true for every transfer this driver issues) -- with pktcnt wrongly
+  // fixed at 1, the model still marks the WHOLE transfer "done" the
+  // instant that single MPS-sized packet lands (pcnt hits 0 via
+  // `pcnt -= min(tpcnt, pcnt)` clamping), silently truncating the
+  // data stage to just `mps` bytes instead of the real want_len this
+  // driver asked for and copied out assuming it got. The device's own
+  // control-endpoint state machine, still expecting to send the
+  // REMAINING data it hasn't transmitted yet, then sees a premature
+  // STATUS token and STALLs it -- a real, spec-shaped protocol
+  // violation this driver caused, not a QEMU model quirk. Multi-packet
+  // completion itself needs no extra driver-side loop: hcd-dwc2.c's
+  // dwc2_enable_chan always schedules its async bottom half after the
+  // first packet regardless, and dwc2_work_bh keeps servicing this
+  // channel (via p->needs_service) until pcnt/len both reach 0 -- this
+  // driver's own poll loop already waits for that same final HCINT,
+  // it just needs pktcnt to describe the truth up front.
+  let pktcnt: u32 = (want_len + mps - (1 as u32)) / mps;
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
-  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, want_len));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), pktcnt, want_len));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
   let data_result: u32 = dwc2_wait_chan0_done();
   if (data_result & (1 as u32)) == (0 as u32) {
@@ -2559,6 +2583,56 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   return 0;
 }
 
+// One control transfer with NO data stage: SETUP, then a zero-length
+// STATUS stage in the OPPOSITE direction of the request (IN, since
+// every no-data-stage standard request this driver issues -- SET_
+// ADDRESS, SET_CONFIGURATION -- is host-to-device). Used for requests
+// whose entire effect is encoded in the 8-byte SETUP packet itself,
+// with nothing to read back or send afterward.
+fn dwc2_control_no_data(devaddr: u32, mps: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_setup(), 1 as u32, 8 as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
+  let setup_result: u32 = dwc2_wait_chan0_done();
+  if (setup_result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+
+  // STATUS stage (IN, zero-length, DATA1).
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
+  let status_result: u32 = dwc2_wait_chan0_done();
+  if (status_result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  return 0;
+}
+
+// Builds a standard SET_ADDRESS SETUP packet: bmRequestType=0x00
+// (host-to-device, standard, device), bRequest=5, wValue=new_addr,
+// wIndex=0, wLength=0. Per USB spec this request is always issued
+// TO address 0 (the device hasn't adopted new_addr yet -- it only
+// does so after this transfer's STATUS stage completes), regardless
+// of what new_addr itself is.
+fn dwc2_build_set_address_setup(new_addr: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 5 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, new_addr & (0xFF as u32));
+  let _ = buf_write_byte(dma, 3 as u32, (new_addr >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 5 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 6 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
+  return 0;
+}
+
 // Builds a standard GET_DESCRIPTOR(Device) SETUP packet directly into
 // dwc2_dma_scratch: bmRequestType=0x80 (device-to-host, standard,
 // device), bRequest=6 (GET_DESCRIPTOR), wValue=0x0100 (type=1/DEVICE,
@@ -2578,37 +2652,90 @@ fn dwc2_build_get_device_descriptor_setup(want_len: u32) -> i64 {
   return 0;
 }
 
+// The address every device answers at before the host assigns it a
+// real one, and the first real address this driver hands out --
+// exactly one device is ever attached to this single-port controller
+// in every configuration this project can actually test, so there's
+// no allocator needed for it yet.
+fn dwc2_new_device_addr() -> u32 {
+  return 1 as u32;
+}
+
 // First real enumeration milestone: fetch the first 8 bytes of device
 // address 0's device descriptor (every USB device answers at address
-// 0 before a host assigns it a real one) and confirm the two fixed
+// 0 before a host assigns it a real one), confirm the two fixed
 // fields a genuine device descriptor always has -- bLength=18 (byte 0)
-// and bDescriptorType=1/DEVICE (byte 1) -- match, not just that the
-// transfer completed without an error bit. A transfer "succeeding"
-// but returning garbage bytes would be a much worse silent failure
-// than an honest error return, the same reasoning behind every
-// checksum/validation check elsewhere in this project.
+// and bDescriptorType=1/DEVICE (byte 1) -- then assign it a real
+// address (SET_ADDRESS) and re-fetch the FULL 18-byte descriptor from
+// that new address, confirming addressing itself actually worked (a
+// device that silently ignored SET_ADDRESS but still happened to
+// answer at address 0 forever would otherwise look identical to a
+// success). Prints idVendor/idProduct (bytes 8-9/10-11, little-endian)
+// from the final full descriptor -- the two fields that actually
+// identify which real device this is, the natural next thing an
+// enumeration milestone should be able to show. A transfer
+// "succeeding" but returning garbage bytes would be a much worse
+// silent failure than an honest error return, the same reasoning
+// behind every checksum/validation check elsewhere in this project.
 fn dwc2_probe_device0() -> i64 {
-  let desc: mut ref i64 = dhruva_alloc_bytes(8);
+  let desc8: mut ref i64 = dhruva_alloc_bytes(8);
   let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
-  let status: i64 = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, desc);
-  if status != 0 {
+  let status0: i64 = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, desc8);
+  if status0 != 0 {
     let _ = uart_puts("USB: GET_DESCRIPTOR(Device) transfer failed\n");
     return 0 - 1;
   }
-  let blength: u32 = buf_read_byte(desc, 0 as u32);
-  let bdesctype: u32 = buf_read_byte(desc, 1 as u32);
-  let mps0: u32 = buf_read_byte(desc, 7 as u32);
-  let _ = uart_puts("USB: device0 descriptor bLength=");
-  let _ = uart_put_hex32(blength);
-  let _ = uart_puts(" bDescriptorType=");
-  let _ = uart_put_hex32(bdesctype);
+  let blength0: u32 = buf_read_byte(desc8, 0 as u32);
+  let bdesctype0: u32 = buf_read_byte(desc8, 1 as u32);
+  let mps0: u32 = buf_read_byte(desc8, 7 as u32);
+  if (blength0 != (18 as u32)) || (bdesctype0 != (1 as u32)) {
+    let _ = uart_puts("USB: device0 descriptor probe (FAIL, bad bLength/bDescriptorType)\n");
+    return 0 - 1;
+  }
+
+  let new_addr: u32 = dwc2_new_device_addr();
+  let _ = dwc2_build_set_address_setup(new_addr);
+  let addr_status: i64 = dwc2_control_no_data(0 as u32, mps0);
+  if addr_status != 0 {
+    let _ = uart_puts("USB: SET_ADDRESS transfer failed\n");
+    return 0 - 1;
+  }
+  // Real hardware/most devices need a short settle time after SET_
+  // ADDRESS before answering at the new address -- bounded, matching
+  // this project's own established pattern for any post-hardware-
+  // action settle wait (the port reset sequence earlier uses the
+  // same shape).
+  let _ = delay(50000);
+
+  let desc18: mut ref i64 = dhruva_alloc_bytes(18);
+  let _ = dwc2_build_get_device_descriptor_setup(18 as u32);
+  let status1: i64 = dwc2_control_in(new_addr, mps0, 18 as u32, desc18);
+  if status1 != 0 {
+    let _ = uart_puts("USB: GET_DESCRIPTOR(Device) at new address failed\n");
+    return 0 - 1;
+  }
+  let blength1: u32 = buf_read_byte(desc18, 0 as u32);
+  let bdesctype1: u32 = buf_read_byte(desc18, 1 as u32);
+  let vendor_lo: u32 = buf_read_byte(desc18, 8 as u32);
+  let vendor_hi: u32 = buf_read_byte(desc18, 9 as u32);
+  let product_lo: u32 = buf_read_byte(desc18, 10 as u32);
+  let product_hi: u32 = buf_read_byte(desc18, 11 as u32);
+  let id_vendor: u32 = vendor_lo | (vendor_hi << (8 as u32));
+  let id_product: u32 = product_lo | (product_hi << (8 as u32));
+
+  let _ = uart_puts("USB: enumerated device addr=");
+  let _ = uart_put_hex32(new_addr);
   let _ = uart_puts(" bMaxPacketSize0=");
   let _ = uart_put_hex32(mps0);
-  if (blength == (18 as u32)) && (bdesctype == (1 as u32)) {
+  let _ = uart_puts(" idVendor=");
+  let _ = uart_put_hex32(id_vendor);
+  let _ = uart_puts(" idProduct=");
+  let _ = uart_put_hex32(id_product);
+  if (blength1 == (18 as u32)) && (bdesctype1 == (1 as u32)) {
     let _ = uart_puts(" (PASS)\n");
     return 0;
   }
-  let _ = uart_puts(" (FAIL, expected bLength=12 bDescriptorType=01)\n");
+  let _ = uart_puts(" (FAIL, bad bLength/bDescriptorType after SET_ADDRESS)\n");
   return 0 - 1;
 }
 
