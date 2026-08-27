@@ -35,7 +35,8 @@ extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mu
 extern "C" fn task_c_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_d_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_e_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
-extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut ref i64, sp_d: mut ref i64, sp_e: mut ref i64) -> i64;
+extern "C" fn task_f_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut ref i64, sp_d: mut ref i64, sp_e: mut ref i64, sp_f: mut ref i64) -> i64;
 // task_a=HIGH(priority 0), task_b=MEDIUM(priority 1), task_c=LOW(priority 2),
 // task_d=IDLE(priority 3, always ready, never sleeps) -- the standard
 // RTOS answer to "what runs when nothing else is," and load-bearing
@@ -950,6 +951,33 @@ fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
   return data_len as i64;
 }
 
+// Raw-buffer twin of fs_read, same reasoning as fs_append_raw/
+// fs_find_latest_block_raw: task #9's shell only ever has a path typed
+// over UART into shell_line_buf, with no Str form to build from
+// arbitrary runtime bytes.
+fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i64 {
+  let blk: i64 = fs_find_latest_block_raw(path_buf, path_len);
+  if blk < 0 {
+    return 0 - 1;
+  }
+  let tmp: mut ref i64 = dhruva_alloc_bytes(512);
+  let rd_status: i64 = sdhost_read_block(blk, tmp);
+  if rd_status != 0 {
+    return 0 - 1;
+  }
+  let data_len: u32 = buf_read_u32(tmp, 44 as u32);
+  if data_len == (0xFFFFFFFF as u32) {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while (i as u32) < data_len {
+    let b: u32 = buf_read_byte(tmp, (48 + i) as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  return data_len as i64;
+}
+
 // fs_delete: appends a tombstone record for `path` -- a normal,
 // crash-safe log entry (same checksum/sequence-number machinery as
 // any other write) whose data_len field is the sentinel 0xFFFFFFFF,
@@ -1135,20 +1163,39 @@ fn irq_dispatch() -> i64 {
     let uart_fr: i64 = 0x20201018;
     let uart_dr: i64 = 0x20201000;
     let uart_icr: i64 = 0x20201044;
-    // Drain the RX FIFO, always exactly 16 iterations -- a real
-    // hardware FIFO's own depth, not an arbitrary choice. A `while`
-    // loop here, even one with a literal constant bound checked every
-    // iteration, is unconditionally treated as UNBOUNDED by vani's v1
-    // WCET estimator (confirmed in src/safety.rs: `S::While { .. } =>
-    // None -- unbounded, no static iteration count`, with no attempt
-    // to prove a bound from the loop body at all) -- only `for i from
-    // LOW to HIGH` (vani's own range-for syntax -- not Rust's `0..N`,
-    // which the parser rejects) carries a statically-known trip count
-    // the estimator can multiply through. `break` was a red herring
-    // on the way to finding this: the *first* fix attempt (skip-
-    // instead-of-break, still inside a `while`) still failed for the
-    // real underlying reason, not the one guessed first.
-    for i from 0 to 16 {
+    // Drain the RX FIFO for up to 128 iterations -- shell_line_buf's
+    // own capacity (shell_state.S), not the PL011's real 16-byte
+    // hardware FIFO depth. A `while` loop here, even one with a
+    // literal constant bound checked every iteration, is
+    // unconditionally treated as UNBOUNDED by vani's v1 WCET estimator
+    // (confirmed in src/safety.rs: `S::While { .. } => None --
+    // unbounded, no static iteration count`, with no attempt to prove
+    // a bound from the loop body at all) -- only `for i from LOW to
+    // HIGH` (vani's own range-for syntax -- not Rust's `0..N`, which
+    // the parser rejects) carries a statically-known trip count the
+    // estimator can multiply through. `break` was a red herring on the
+    // way to finding this: the *first* fix attempt (skip-instead-of-
+    // break, still inside a `while`) still failed for the real
+    // underlying reason, not the one guessed first.
+    //
+    // BUG (task #9, found by an event-driven interactive test, not a
+    // sleep-timed one -- see shell_interactive_check.py's own header
+    // for why the sleep-timed version this replaced was worthless
+    // here): 16 iterations undercounts real bursts. QEMU's stdio
+    // chardev backend hands a whole typed-then-Entered line to the
+    // emulated PL011 as one burst, faster than the guest can service
+    // interrupts -- so any line at or past 17 bytes (e.g. "cat
+    // /config/mode\r", 17 bytes) left its trailing byte (here, the
+    // terminating CR) stuck in the FIFO below the RX interrupt's own
+    // trigger threshold, so no further interrupt ever fired to deliver
+    // it, shell_line_ready never got set for that line, and every
+    // command after the first appeared to vanish without a trace --
+    // while the rest of the system (HIGH/MEDIUM/LOW/idle/GC) kept
+    // running completely normally throughout, since nothing about this
+    // hangs or blocks anything, it just silently stops delivering. 128
+    // -- shell_line_buf's own hard cap on how long a line can ever
+    // legitimately be -- comfortably covers one full line every time.
+    for i from 0 to 128 {
       let fr: u32 = mmio_read_u32(uart_fr);
       if (fr & (0x10 as u32)) == (0 as u32) {
         let c: u32 = mmio_read_u32(uart_dr) & (0xFF as u32);
@@ -1268,6 +1315,193 @@ fn task_e() -> i64 {
     let _ = uart_puts("GC: compaction pass, /config/mode = \"");
     let _ = fs_print_data(gc_buf, gc_mode_len);
     let _ = uart_puts("\"\n");
+  }
+  return 0;
+}
+
+// Task #9: interactive shell (ls/cat/rm/write), the vani REPL entry
+// point's supporting infrastructure -- everything below this comment
+// through task_f parses and dispatches one already-received line out
+// of shell_state.S's line buffer (irq_dispatch, in real IRQ context,
+// is what actually fills it one byte at a time; see uart_rx_irq_init).
+//
+// Returns the index one past the first space in buf[start..line_len),
+// or line_len itself if there's no space in that range -- "the rest of
+// the line" then trivially reduces to the empty range [line_len, line_len).
+fn shell_find_space(buf: mut ref i64, start: i64, line_len: i64) -> i64 {
+  let i: i64 = start;
+  while i < line_len {
+    let c: u32 = buf_read_byte(buf, i as u32);
+    if c == (32 as u32) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return line_len;
+}
+
+// True iff buf[start..end) is byte-for-byte equal to the literal
+// `word` -- the only way to test a runtime line buffer against a
+// known command name, since word is a Str literal (str_byte_at) and
+// buf is raw shell input (buf_read_byte), two different representations
+// with no shared comparison built into the language itself.
+fn shell_word_matches(buf: mut ref i64, start: i64, end: i64, word: Str) -> i64 {
+  let wlen: i64 = str_len_bytes(word);
+  if (end - start) != wlen {
+    return 0;
+  }
+  let i: i64 = 0;
+  let ok: i64 = 1;
+  while i < wlen {
+    let a: u32 = buf_read_byte(buf, (start + i) as u32);
+    let b: u32 = str_byte_at(word, i) as u32;
+    if a != b {
+      ok = 0;
+    }
+    i = i + 1;
+  }
+  return ok;
+}
+
+fn shell_copy_range(buf: mut ref i64, start: i64, end: i64, out_buf: mut ref i64) -> i64 {
+  let n: i64 = end - start;
+  let i: i64 = 0;
+  while i < n {
+    let c: u32 = buf_read_byte(buf, (start + i) as u32);
+    let _ = buf_write_byte(out_buf, i as u32, c);
+    i = i + 1;
+  }
+  return n;
+}
+
+// Parses and runs exactly one already-complete shell line. Deliberately
+// NOT #[no_heap] (same reasoning as task_e's GC pass above): every
+// scratch buffer here is a fresh dhruva_alloc_bytes, and this task can
+// never preempt or block anything on the hard-RT path, so the
+// restriction that protects that path doesn't need to apply here too.
+fn shell_dispatch() -> i64 {
+  let line_len: i64 = shell_get_line_len() as i64;
+  if line_len == 0 {
+    return 0;
+  }
+  let line_buf: mut ref i64 = dhruva_alloc_bytes(128);
+  let i: i64 = 0;
+  while i < line_len {
+    let c: u32 = shell_get_line_byte(i as u32);
+    let _ = buf_write_byte(line_buf, i as u32, c);
+    i = i + 1;
+  }
+
+  let cmd_end: i64 = shell_find_space(line_buf, 0, line_len);
+
+  if shell_word_matches(line_buf, 0, cmd_end, "ls") == 1 {
+    let _ = fs_list("");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "cat") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: cat <path>\n");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    let path_len: i64 = path_end - path_start;
+    if path_len > 32 {
+      let _ = uart_puts("error: path too long\n");
+      return 0;
+    }
+    let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    let out_buf: mut ref i64 = dhruva_alloc_bytes(464);
+    let data_len: i64 = fs_read_raw(path_buf, path_len, out_buf);
+    if data_len < 0 {
+      let _ = uart_puts("(not found)\n");
+    } else {
+      let _ = fs_print_data(out_buf, data_len);
+      let _ = uart_puts("\n");
+    }
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "rm") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: rm <path>\n");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    let path_len: i64 = path_end - path_start;
+    if path_len > 32 {
+      let _ = uart_puts("error: path too long\n");
+      return 0;
+    }
+    let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    let status: i64 = fs_delete_raw(path_buf, path_len);
+    if status == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      let _ = uart_puts("error\n");
+    }
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "write") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: write <path> <text>\n");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    if path_end >= line_len {
+      let _ = uart_puts("usage: write <path> <text>\n");
+      return 0;
+    }
+    let path_len: i64 = path_end - path_start;
+    if path_len > 32 {
+      let _ = uart_puts("error: path too long\n");
+      return 0;
+    }
+    let text_start: i64 = path_end + 1;
+    let text_len: i64 = line_len - text_start;
+    if text_len > 464 {
+      let _ = uart_puts("error: text too long\n");
+      return 0;
+    }
+    let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    let data_buf: mut ref i64 = dhruva_alloc_bytes(464);
+    let _ = shell_copy_range(line_buf, text_start, line_len, data_buf);
+    let status: i64 = fs_append_raw(path_buf, path_len, data_buf, text_len);
+    if status == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      let _ = uart_puts("error\n");
+    }
+    return 0;
+  }
+
+  let _ = uart_puts("unknown command (try ls/cat/rm/write)\n");
+  return 0;
+}
+
+// Lowest-priority best-effort task alongside GC (task_e) -- same
+// reserved band, priority 3 (see context_switch.S's start_multitasking
+// comment). Polls shell_get_line_ready() rather than blocking on it:
+// there's no "wake me when ready" primitive here, just the same
+// sleep-then-recheck pattern task_c/task_d already use elsewhere.
+#[no_mangle]
+#[bounded_stack(bytes=2048)]
+fn task_f() -> i64 {
+  while true {
+    let ready: u32 = shell_get_line_ready();
+    if ready == (0 as u32) {
+      let _ = task_sleep_ticks(2);
+    } else {
+      let _ = shell_dispatch();
+      let _ = shell_clear_line();
+    }
   }
   return 0;
 }
@@ -1404,11 +1638,33 @@ fn kernel_main() -> i64 {
   let stack_c: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
   let stack_d: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
   let stack_e: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  // BUG (task #9, found via the same event-driven interactive test):
+  // task_f's real stack was originally the same 4096 bytes every other
+  // task gets, matching its #[bounded_stack(bytes=2048)] claim with
+  // room to spare on paper. In practice it hung the whole system --
+  // total silence, no reboot -- the instant a UART RX interrupt landed
+  // while task_f was deep in shell_dispatch -> fs_list ->
+  // fs_find_latest_block_raw -> sdhost_read_block. Root cause: this
+  // project's IRQ frames build on the INTERRUPTED task's own SVC stack
+  // (the Phase 2 IRQ-vs-SVC-stack fix), so the real worst case for any
+  // interruptible task is its own deepest call chain PLUS whatever the
+  // preempting ISR needs on top -- not accounted for by #[bounded_
+  // stack]'s static, interrupt-oblivious analysis. task_e's own
+  // similarly-deep chain happened to never overflow its stock 4096
+  // bytes, purely because it had only ever been preempted by the
+  // routine timer tick before task_f's shell gave it UART RX exposure
+  // too. Confirmed by raising just this one task's real allocation to
+  // 16384 (4x) and watching the exact same hang disappear -- kept at
+  // that confirmed-safe value rather than bisected down to something
+  // merely plausible.
+  let stack_f_bytes: i64 = 16384;
+  let stack_f: mut ref i64 = dhruva_alloc_bytes(stack_f_bytes);
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
   let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
   let sp_d: mut ref i64 = task_d_init_stack(stack_d, stack_bytes);
   let sp_e: mut ref i64 = task_e_init_stack(stack_e, stack_bytes);
+  let sp_f: mut ref i64 = task_f_init_stack(stack_f, stack_f_bytes);
 
   let _ = uart_puts("PASS\n");
 
@@ -1421,7 +1677,7 @@ fn kernel_main() -> i64 {
   // there's no separate enable_irqs() call needed here -- interrupts
   // stay masked for all of kernel_main's own setup above, and turn on
   // exactly when task_a first runs.
-  let _ = start_multitasking(sp_a, sp_b, sp_c, sp_d, sp_e);
+  let _ = start_multitasking(sp_a, sp_b, sp_c, sp_d, sp_e, sp_f);
 
   // Unreachable, but kernel_main must still type-check as returning i64.
   return 0;

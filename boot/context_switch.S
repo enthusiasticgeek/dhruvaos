@@ -54,15 +54,17 @@
 .section ".bss"
 .align 4
 sp_table:
-    .word 0, 0, 0, 0, 0  /* saved/current sp per task; index 3 = idle,
-                          * index 4 = GC/compaction (task #5) */
+    .word 0, 0, 0, 0, 0, 0  /* saved/current sp per task; index 3 =
+                          * idle, index 4 = GC/compaction (Phase 3
+                          * task #5), index 5 = shell (Phase 4) */
 eff_prio_table:
-    .word 0, 0, 0, 0, 0  /* effective (possibly ceiling-boosted) priority;
-                          * initialized to each task's true priority by
-                          * start_multitasking, since .bss is merely
-                          * zeroed at boot, not set to {0,1,2,3,4} */
+    .word 0, 0, 0, 0, 0, 0  /* effective (possibly ceiling-boosted)
+                          * priority; initialized to each task's true
+                          * priority by start_multitasking, since .bss
+                          * is merely zeroed at boot, not set to
+                          * {0,1,2,3,4,3} */
 sleep_until_table:
-    .word 0, 0, 0, 0, 0  /* tick_count value at which a task becomes
+    .word 0, 0, 0, 0, 0, 0  /* tick_count value at which a task becomes
                           * ready again; 0 (the zeroed .bss default)
                           * means "never slept, always ready" since
                           * 0 <= any tick_count trivially holds -- true
@@ -113,7 +115,7 @@ scheduler_pick_next:
 
     mov r9, #0
 spn_loop:
-    cmp r9, #5                     /* 5 tasks now: HIGH, MEDIUM, LOW, IDLE, GC */
+    cmp r9, #6                     /* 6 tasks now: HIGH, MEDIUM, LOW, IDLE, GC, SHELL */
     bge spn_done
     cmp r9, r3
     beq spn_next                   /* current already accounted for above --
@@ -260,6 +262,12 @@ task_e_init_stack:
     ldr r1, =task_e
     b prepare_stack_common
 
+.global task_f_init_stack
+task_f_init_stack:
+    add r0, r0, r2
+    ldr r1, =task_f
+    b prepare_stack_common
+
 prepare_stack_common:
     sub r0, r0, #64
     mov r2, #0x13
@@ -284,24 +292,27 @@ prepare_stack_common:
 
 /* i64 start_multitasking(mut ref i64 sp_a, mut ref i64 sp_b,
  *                          mut ref i64 sp_c, mut ref i64 sp_d,
- *                          mut ref i64 sp_e)
+ *                          mut ref i64 sp_e, mut ref i64 sp_f)
  * Seeds sp_table and eff_prio_table (base priorities -- .bss is only
- * zeroed by boot.S, not pre-set to {0,1,2,3,4}) and enters task_a
- * (HIGH) for the first time. Five ref args: the first four -> r0, r1,
+ * zeroed by boot.S, not pre-set to {0,1,2,3,4,3}) and enters task_a
+ * (HIGH) for the first time. Six ref args: the first four -> r0, r1,
  * r2, r3, one register each (no AAPCS pairing concern -- that's only
  * for plain i64 scalar args), filling every core argument register
- * with none left over. The fifth (sp_e) has nowhere left to go but
- * the stack -- confirmed directly from a throwaway probe function's
- * callsite disassembly (`str r0, [sp]`) before writing this, same
- * discipline as every other AAPCS assumption this project has been
- * burned by trusting instead of checking. r3 (sp_d) must be saved off
- * before it's reused as scratch for table addresses below, and sp_e
- * must be read from [sp, #0] before this function's own first push
- * changes what that offset means. Never returns in practice. */
+ * with none left over. The fifth and sixth (sp_e, sp_f) have nowhere
+ * left to go but the stack, at [sp,#0] and [sp,#4] respectively --
+ * confirmed directly from throwaway probe functions' callsite
+ * disassembly (`strd r8, [sp]`, storing r8 and r9 as a pair) before
+ * writing this, same discipline as every other AAPCS assumption this
+ * project has been burned by trusting instead of checking. r3 (sp_d)
+ * must be saved off before it's reused as scratch for table addresses
+ * below, and sp_e/sp_f must be read from the stack before this
+ * function's own first push changes what those offsets mean. Never
+ * returns in practice. */
 .global start_multitasking
 start_multitasking:
     ldr r4, [sp, #0]           /* sp_e, passed on the stack -- read
                                  * before anything below touches sp */
+    ldr r8, [sp, #4]           /* sp_f, likewise */
     mov r5, r3                 /* save sp_d before r3 becomes scratch */
 
     ldr r6, =sp_table
@@ -310,6 +321,7 @@ start_multitasking:
     str r2, [r6, #8]
     str r5, [r6, #12]
     str r4, [r6, #16]          /* task 4 (GC) */
+    str r8, [r6, #20]          /* task 5 (SHELL) */
 
     ldr r6, =eff_prio_table
     mov r7, #0
@@ -322,9 +334,14 @@ start_multitasking:
     str r7, [r6, #16]        /* task 4 (GC) priority 3 -- the reserved
                                * best-effort band, below every hard-RT
                                * task, above idle */
+    str r7, [r6, #20]        /* task 5 (SHELL) priority 3 too -- same
+                               * best-effort band as GC; ties between
+                               * them favor whichever is incumbent,
+                               * fine since both are normally sleeping
+                               * and rarely contend at the same instant */
     mov r7, #4
-    str r7, [r6, #12]        /* task 3 (IDLE) priority 4 -- moved up
-                               * one from Phase 2 to make room */
+    str r7, [r6, #12]        /* task 3 (IDLE) priority 4 -- worst,
+                               * as always */
 
     ldr r6, =current_task
     mov r7, #0

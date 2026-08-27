@@ -56,18 +56,59 @@ void exit(int code) {
 static unsigned char dhruva_heap[DHRUVA_HEAP_BYTES];
 static unsigned long dhruva_heap_used = 0;
 
+/* BUG (Phase 4 task #9, found via a real crash-and-reboot loop only
+ * visible under an event-driven interactive test, not a sleep-timed
+ * one -- see test/shell_interactive_check.py's header): this bump
+ * pointer's read-modify-write of dhruva_heap_used had no locking at
+ * all. Harmless for as long as only one preemptible task ever called
+ * this at real runtime (task_e/GC, Phase 3) -- every other caller was
+ * kernel_main's own single-threaded setup, before start_multitasking
+ * hands off to the scheduler. Once task_f (the shell) became a SECOND
+ * independently-scheduled task that also calls this during normal
+ * multitasking, the two could race: the timer tick can preempt this
+ * function between reading dhruva_heap_used and writing its updated
+ * value back, and if the task it switches to also calls this before
+ * the first one resumes, both compute the same `aligned_used` and get
+ * back OVERLAPPING pointers into the same heap region -- silent
+ * corruption the instant either side writes through its "own" buffer,
+ * observed as sporadic crashes (PC landing back at _start, the same
+ * signature as every other memory-corruption bug this project has
+ * hit) a few shell commands into a session, once GC's periodic wake
+ * finally landed inside this window. Single-core bare metal, so a
+ * short IRQ-disable around just the bookkeeping (not the zero-fill,
+ * which only ever touches this call's own now-exclusive region) is
+ * sufficient -- no real critical-section primitive needed.
+ *
+ * SECOND BUG in the first fix attempt: unconditionally re-enabling
+ * IRQs (`cpsie i`) on the way out silently broke kernel_main's own
+ * boot-time invariant that interrupts stay masked for the whole of
+ * its single-threaded setup, only turning on via start_multitasking's
+ * own deliberate final CPSR restore. kernel_main calls this function
+ * many times during that setup (sd_buf, task stacks, ...), so the
+ * very first call would have flipped IRQs on early -- long before
+ * start_multitasking had finished writing sp_table/eff_prio_table/
+ * current_task -- letting the timer tick (and, once uart_rx_irq_init
+ * ran, UART RX too) preempt into a scheduler with half-built state.
+ * Exactly the kind of bug that looks like pure flakiness: sometimes
+ * the race window is missed and everything looks fine, sometimes it
+ * corrupts scheduling and the whole system goes silent forever. Save
+ * and restore the real prior state instead of forcing it back on. */
 void *dhruva_alloc_bytes(long n) {
     unsigned long need = (unsigned long)n;
+    unsigned long saved_cpsr;
+    __asm__ volatile ("mrs %0, cpsr\n\tcpsid i" : "=r"(saved_cpsr) :: "memory");
     unsigned long aligned_used = (dhruva_heap_used + 7UL) & ~7UL;
     if (aligned_used + need > DHRUVA_HEAP_BYTES) {
+        __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
         return (void*)0; /* out of kernel heap -- caller must check for null */
     }
     unsigned char *p = dhruva_heap + aligned_used;
+    dhruva_heap_used = aligned_used + need;
+    __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
     unsigned long i = 0;
     while (i < need) {
         p[i] = 0;
         i = i + 1;
     }
-    dhruva_heap_used = aligned_used + need;
     return (void*)p;
 }
