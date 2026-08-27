@@ -2220,6 +2220,220 @@ fn udp_self_test() -> i64 {
   return 0;
 }
 
+// Phase 6 continued: TCP (RFC 793), the last protocol layer
+// DHRUVA_ARCHITECTURE.md §4 calls for ("ARP, IPv4, UDP, TCP, a small
+// socket-style API"). No options (data offset always 5 words/20
+// bytes, matching this stack's own "no IP options either" convention
+// -- nothing here sends or needs to parse them). This first slice is
+// the stateless header layer only (build/parse/checksum), verified by
+// its own self-test exactly like ARP/IPv4 were introduced before
+// UDP's stateful socket layer landed on top -- the three-way-
+// handshake + data-transfer + close connection state machine is
+// deliberately a separate, later slice, not attempted in the same
+// pass as this header layer.
+//
+// Header layout (offsets relative to tcp_offset, 34 bytes into a
+// netif-backed frame with no IP options, exactly where UDP's own
+// header starts):
+//   0-1 source port          2-3 destination port
+//   4-7 sequence number      8-11 acknowledgment number
+//   12 data offset (upper 4 bits, in 32-bit words) + reserved (0)
+//   13 flags (bit0=FIN bit1=SYN bit2=RST bit3=PSH bit4=ACK bit5=URG)
+//   14-15 window size        16-17 checksum        18-19 urgent ptr (0)
+//
+// Checksum uses the identical pseudo-header technique as UDP (source
+// IP, destination IP, zero byte, protocol=6, TCP segment length) --
+// see udp_checksum's own comment for why the pseudo-header matters,
+// same reasoning applies verbatim here.
+
+fn tcp_flag_fin() -> u32 { return 0x01 as u32; }
+fn tcp_flag_syn() -> u32 { return 0x02 as u32; }
+fn tcp_flag_rst() -> u32 { return 0x04 as u32; }
+fn tcp_flag_psh() -> u32 { return 0x08 as u32; }
+fn tcp_flag_ack() -> u32 { return 0x10 as u32; }
+
+fn tcp_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, tcp_offset: i64, tcp_len: i64) -> u32 {
+  let sum: u32 = 0 as u32;
+  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (src_ip & (0xFFFF as u32));
+  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (dst_ip & (0xFFFF as u32));
+  sum = sum + (6 as u32); // protocol (pseudo-header's zero byte contributes nothing)
+  sum = sum + (tcp_len as u32);
+  let i: i64 = 0;
+  while (i + 1) < tcp_len {
+    let word: u32 = buf_read_u16_be(frame, tcp_offset + i);
+    sum = sum + word;
+    i = i + 2;
+  }
+  if i < tcp_len {
+    let b: u32 = buf_read_byte(frame, (tcp_offset + i) as u32);
+    sum = sum + (b << (8 as u32)); // odd trailing byte, zero-padded low
+  }
+  while (sum >> (16 as u32)) != (0 as u32) {
+    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
+  }
+  return (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+}
+
+// Writes the TCP header+payload at frame[tcp_offset..), returning the
+// segment length (header+payload). Caller builds the IP header around
+// this afterward (see tcp_send_segment below), same split as UDP's
+// own udp_build/udp_send for the same reason (a self-test can exercise
+// header construction alone without a full send/recv round trip).
+fn tcp_build_header(frame: mut ref i64, tcp_offset: i64, src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32, payload: mut ref i64, payload_len: i64, src_ip: u32, dst_ip: u32) -> i64 {
+  let tcp_len: i64 = 20 + payload_len;
+  let _ = buf_write_u16_be(frame, tcp_offset, src_port);
+  let _ = buf_write_u16_be(frame, tcp_offset + 2, dst_port);
+  let _ = buf_write_u32_be(frame, tcp_offset + 4, seq);
+  let _ = buf_write_u32_be(frame, tcp_offset + 8, ack);
+  let _ = buf_write_byte(frame, (tcp_offset + 12) as u32, 0x50 as u32); // data offset=5, reserved=0
+  let _ = buf_write_byte(frame, (tcp_offset + 13) as u32, flags);
+  let _ = buf_write_u16_be(frame, tcp_offset + 14, window);
+  let _ = buf_write_u16_be(frame, tcp_offset + 16, 0 as u32); // checksum placeholder
+  let _ = buf_write_u16_be(frame, tcp_offset + 18, 0 as u32); // urgent pointer, unused
+  let i: i64 = 0;
+  while i < payload_len {
+    let b: u32 = buf_read_byte(payload, i as u32);
+    let _ = buf_write_byte(frame, (tcp_offset + 20 + i) as u32, b);
+    i = i + 1;
+  }
+  let checksum: u32 = tcp_checksum(src_ip, dst_ip, frame, tcp_offset, tcp_len);
+  let _ = buf_write_u16_be(frame, tcp_offset + 16, checksum);
+  return tcp_len;
+}
+
+fn tcp_get_src_port(frame: mut ref i64, tcp_offset: i64) -> u32 {
+  return buf_read_u16_be(frame, tcp_offset);
+}
+fn tcp_get_dst_port(frame: mut ref i64, tcp_offset: i64) -> u32 {
+  return buf_read_u16_be(frame, tcp_offset + 2);
+}
+fn tcp_get_seq(frame: mut ref i64, tcp_offset: i64) -> u32 {
+  return buf_read_u32_be(frame, tcp_offset + 4);
+}
+fn tcp_get_ack(frame: mut ref i64, tcp_offset: i64) -> u32 {
+  return buf_read_u32_be(frame, tcp_offset + 8);
+}
+fn tcp_get_flags(frame: mut ref i64, tcp_offset: i64) -> u32 {
+  return buf_read_byte(frame, (tcp_offset + 13) as u32);
+}
+fn tcp_get_data_offset_bytes(frame: mut ref i64, tcp_offset: i64) -> i64 {
+  let raw: u32 = buf_read_byte(frame, (tcp_offset + 12) as u32);
+  return ((raw >> (4 as u32)) as i64) * 4;
+}
+
+// A correctly-checksummed segment's bytes, summed again as
+// transmitted (checksum field included, unlike at build time), yield
+// exactly zero -- NOT all-ones. This differs from ipv4_verify_
+// checksum's own convention on purpose, not by accident: ipv4_
+// checksum returns the raw pre-complement sum (its caller,
+// ipv4_build_header, does the `^ 0xFFFF` complement itself), so
+// summing again including the stored checksum reaches all-ones
+// (S + ~S, the defining identity of one's-complement negation).
+// tcp_checksum instead complements its OWN running sum internally
+// before returning (matching udp_checksum's shape, which this
+// function was modeled on) -- so calling it again over the as-
+// transmitted bytes computes ~(S + C) = ~(S + ~S) = ~0xFFFF = 0x0000
+// instead. Found live: the first version of this function copied
+// ipv4_verify_checksum's `== 0xFFFF` comparison without accounting
+// for that difference, and failed on every single correctly-built
+// segment.
+fn tcp_verify_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, tcp_offset: i64, tcp_len: i64) -> i64 {
+  if tcp_checksum(src_ip, dst_ip, frame, tcp_offset, tcp_len) == (0 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+// Builds a full Ethernet+IPv4+TCP segment and sends it via netif.
+// Fixed offsets (14 for IP, 34 for TCP) since this stack never sends
+// IP options, matching udp_send's own layout exactly.
+fn tcp_send_segment(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32, payload: mut ref i64, payload_len: i64) -> i64 {
+  let frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let i: i64 = 0;
+  while i < 6 {
+    let db: u32 = buf_read_byte(dst_mac, i as u32);
+    let _ = buf_write_byte(frame, i as u32, db);
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    let sb: u32 = buf_read_byte(my_mac, j as u32);
+    let _ = buf_write_byte(frame, (6 + j) as u32, sb);
+    j = j + 1;
+  }
+  let _ = buf_write_u16_be(frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let tcp_len: i64 = tcp_build_header(frame, 34, src_port, dst_port, seq, ack, flags, window, payload, payload_len, src_ip, dst_ip);
+  let total_len: i64 = 20 + tcp_len;
+  let _ = ipv4_build_header(frame, 14, total_len, 6 as u32, src_ip, dst_ip);
+  return netif_send_frame(frame, 14 + total_len);
+}
+
+// Boot-time self-test: build/send/receive a single SYN segment over
+// the loopback netif and verify every TCP header field, the checksum,
+// and the (empty, for a SYN) payload round-tripped correctly -- the
+// same "prove the stateless header layer is byte-correct" role
+// ipv4_self_test plays for IPv4, before UDP's stateful socket layer
+// was introduced on top of ITS header layer. The three-way-handshake/
+// data-transfer/close connection state machine gets its own, later
+// self-test once that stateful layer exists.
+fn tcp_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let src_ip: u32 = 0xC0A80101 as u32;
+  let dst_ip: u32 = 0xC0A80102 as u32;
+  let src_port: u32 = 54321 as u32;
+  let dst_port: u32 = 80 as u32;
+  let seq: u32 = 1000 as u32;
+  let ack: u32 = 0 as u32;
+  let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+
+  let send_status: i64 = tcp_send_segment(my_mac, my_mac, src_ip, dst_ip, src_port, dst_port, seq, ack, tcp_flag_syn(), 65535 as u32, empty_payload, 0);
+  if send_status != 0 {
+    ok = 0;
+  }
+
+  let recv_frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let recv_len: i64 = netif_recv_frame(recv_frame);
+  if recv_len != 54 { // 14 (eth) + 20 (ip) + 20 (tcp), no payload
+    ok = 0;
+  }
+  if tcp_get_src_port(recv_frame, 34) != src_port {
+    ok = 0;
+  }
+  if tcp_get_dst_port(recv_frame, 34) != dst_port {
+    ok = 0;
+  }
+  if tcp_get_seq(recv_frame, 34) != seq {
+    ok = 0;
+  }
+  if tcp_get_ack(recv_frame, 34) != ack {
+    ok = 0;
+  }
+  if tcp_get_flags(recv_frame, 34) != tcp_flag_syn() {
+    ok = 0;
+  }
+  if tcp_get_data_offset_bytes(recv_frame, 34) != 20 {
+    ok = 0;
+  }
+  if tcp_verify_checksum(src_ip, dst_ip, recv_frame, 34, 20) != 1 {
+    ok = 0;
+  }
+  if ipv4_get_protocol(recv_frame, 14) != (6 as u32) {
+    ok = 0;
+  }
+
+  let _ = uart_puts("TCP: header build/send/recv + checksum verify (SYN)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Phase 6 continued: DWC2 USB host controller bring-up (BCM2835's real
 // on-chip USB silicon -- the Pi 1 Model B has no native Ethernet, so
 // DHRUVA_ARCHITECTURE.md's whole "real networking" path runs through
@@ -3945,6 +4159,7 @@ fn kernel_main() -> i64 {
   let _ = arp_self_test();
   let _ = ipv4_self_test();
   let _ = udp_self_test();
+  let _ = tcp_self_test();
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device
