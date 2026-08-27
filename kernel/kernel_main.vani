@@ -1321,9 +1321,31 @@ fn fs_print_data(buf: mut ref i64, byte_len: i64) -> i64 {
 #[interrupt(priority=0)]
 #[bounded_stack(bytes=1024)]
 #[wcet(cycles=100000)]
+// BUG (round 4 audit, 2026-08-27): this function's return value used
+// to be unconditionally 0, unused by every caller. scheduler_switch_
+// from_irq (context_switch.S) -- called from irq_entry.S right after
+// this function returns, on EVERY IRQ entry -- increments tick_count
+// unconditionally too, even though its own doc comment claims it does
+// so "every timer tick, exactly once." Those two facts together are a
+// real bug: a UART RX interrupt (fires whenever a character is typed
+// at the interactive shell, entirely independent of the 500ms timer)
+// advanced tick_count exactly as much as a genuine timer tick did.
+// tick_count is this whole scheduler's only notion of elapsed time --
+// every task_sleep_ticks call and every sleep_until_table comparison
+// is defined in terms of it -- so typing at the shell while any
+// task's sleep was pending silently shortened that sleep, system-wide,
+// with no relationship to how much real wall-clock time had actually
+// passed. Concretely live in this project's own phase4_milestone.py,
+// which types multiple shell commands while task_a/b/c's priority-
+// inversion demo and task_e's GC pass are running concurrently in the
+// background -- exactly the scenario that would speed both up.
+// Fixed by returning 1 here iff the timer branch below actually fired
+// this call, 0 otherwise, so irq_entry.S can pass that flag through to
+// scheduler_switch_from_irq and gate the tick_count increment on it.
 fn irq_dispatch() -> i64 {
   let ic_pending1: i64 = 0x2000B204;
   let pending: u32 = mmio_read_u32(ic_pending1);
+  let was_timer_tick: i64 = 0;
   if (pending & (2 as u32)) != (0 as u32) {
     let timer_cs: i64 = 0x20003000;
     let timer_clo: i64 = 0x20003004;
@@ -1350,6 +1372,7 @@ fn irq_dispatch() -> i64 {
     // comment) -- a single best-effort byte keeps ticks visible in
     // the log without reintroducing a blocking call to a hard-RT ISR.
     let _ = uart_putc_nonblocking(46);
+    was_timer_tick = 1;
   }
 
   let ic_pending2: i64 = 0x2000B208;
@@ -1402,7 +1425,7 @@ fn irq_dispatch() -> i64 {
     // status defensively, same pattern as the timer branch above.
     let _ = mmio_write_u32(uart_icr, 0x10 as u32);
   }
-  return 0;
+  return was_timer_tick;
 }
 
 // Phase 6: network byte order helpers, shared by ARP/IPv4/UDP/TCP
@@ -5027,7 +5050,27 @@ fn kernel_main() -> i64 {
   let stack_b: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
   let stack_c: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
   let stack_d: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
-  let stack_e: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  // BUG (round 4 audit, 2026-08-27): task_e was still allocated the
+  // same stock 4096 bytes every non-FS task gets, even though this
+  // very file's own task_f comment right below already names task_e
+  // as sharing task_f's "similarly-deep chain" -- fs_compact calls
+  // through the same FS/SD block layer (fs_state_get_log_start/
+  // next_block, sdhost_read_block/write_block) that overflowed task_f's
+  // stock stack the instant a UART RX IRQ landed mid-call-chain. task_e
+  // never hit this live only because no test so far happened to have a
+  // UART RX interrupt (which fires whenever a character is typed at the
+  // shell, completely independent of which task is actually running at
+  // that instant) land while task_e -- not task_f -- was the one
+  // currently executing deep in fs_compact. That's a timing accident,
+  // not a structural difference between the two tasks: IRQ frames build
+  // on whichever task's own SVC stack happens to be current when the
+  // interrupt fires (the same Phase 2 IRQ-vs-SVC-stack design task_f's
+  // fix explains), so task_e was exposed to the identical worst case
+  // the whole time. Given the task_f fix, matched here rather than
+  // bisected down to something merely plausible: same task, same class
+  // of call chain, same fix.
+  let stack_e_bytes: i64 = 16384;
+  let stack_e: mut ref i64 = dhruva_alloc_bytes(stack_e_bytes);
   // BUG (task #9, found via the same event-driven interactive test):
   // task_f's real stack was originally the same 4096 bytes every other
   // task gets, matching its #[bounded_stack(bytes=2048)] claim with
@@ -5053,7 +5096,7 @@ fn kernel_main() -> i64 {
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
   let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
   let sp_d: mut ref i64 = task_d_init_stack(stack_d, stack_bytes);
-  let sp_e: mut ref i64 = task_e_init_stack(stack_e, stack_bytes);
+  let sp_e: mut ref i64 = task_e_init_stack(stack_e, stack_e_bytes);
   let sp_f: mut ref i64 = task_f_init_stack(stack_f, stack_f_bytes);
 
   let _ = uart_puts("PASS\n");

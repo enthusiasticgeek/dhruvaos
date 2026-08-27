@@ -138,23 +138,42 @@ spn_done:
     ldr r0, [r6, r8, lsl #2]      /* r0 = sp_table[best] */
     bx lr
 
-/* void *scheduler_switch_from_irq(void *current_sp)
+/* void *scheduler_switch_from_irq(void *current_sp, i64 was_timer_tick)
  * Called only from boot/irq_entry.S, after it has saved the
  * interrupted task's full context. Records that context, advances
- * tick_count (every timer tick, exactly once), and tail-calls the
- * shared policy. */
+ * tick_count (once, but ONLY when was_timer_tick is nonzero), and
+ * tail-calls the shared policy.
+ *
+ * BUG (round 4 audit, 2026-08-27): this function used to advance
+ * tick_count unconditionally, on every call -- i.e. on every IRQ
+ * entry, not just a real timer tick -- directly contradicting this
+ * comment's own claim of "every timer tick, exactly once". A UART RX
+ * interrupt (fires whenever a character is typed at the interactive
+ * shell, entirely unrelated to the 500ms timer) advanced tick_count
+ * exactly as much as a genuine tick. Since tick_count is this whole
+ * scheduler's only notion of elapsed time -- every task_sleep_ticks
+ * call and sleep_until_table comparison is defined in terms of it --
+ * typing at the shell silently sped up every other task's sleep
+ * system-wide, with no relationship to real elapsed wall-clock time.
+ * Fixed by having irq_entry.S pass through irq_dispatch's own new
+ * return value (1 iff this IRQ was actually the timer) as a second
+ * argument here, and only incrementing when it's nonzero. */
 .global scheduler_switch_from_irq
 scheduler_switch_from_irq:
+    mov r9, r1                     /* stash was_timer_tick -- r1 is about
+                                    * to be reused as scratch below */
     ldr r1, =current_task
     ldr r2, [r1]
     ldr r3, =sp_table
     str r0, [r3, r2, lsl #2]      /* sp_table[current] = current_sp */
 
+    cmp r9, #0
+    beq scheduler_switch_from_irq_skip_tick
     ldr r4, =tick_count
     ldr r5, [r4]
     add r5, r5, #1
     str r5, [r4]
-
+scheduler_switch_from_irq_skip_tick:
     b scheduler_pick_next          /* tail call: its `bx lr` returns to
                                     * OUR caller (irq_entry.S) directly */
 

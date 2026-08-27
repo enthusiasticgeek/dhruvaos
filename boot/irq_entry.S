@@ -95,11 +95,23 @@ irq_relocate_loop:
                                    * unrelated to *which* task runs next,
                                    * still done every tick regardless; a
                                    * plain `bl` works the same from SVC mode
-                                   * as it did from IRQ mode */
+                                   * as it did from IRQ mode. Returns r0=1
+                                   * iff this IRQ was a real timer tick (as
+                                   * opposed to, e.g., a UART RX interrupt)
+                                   * -- see irq_dispatch's own comment for
+                                   * why scheduler_switch_from_irq needs to
+                                   * know this. r9 stashes it across the
+                                   * `mov r0, r6` below: r4-r11 are callee-
+                                   * saved across `bl` per AAPCS, so r9
+                                   * survives untouched. */
+    mov r9, r0
 
     mov r0, r6                    /* r0 = pointer to the relocated context --
                                    * this task's real resume point, now
                                    * correctly on ITS OWN stack */
+    mov r1, r9                    /* r1 = was_timer_tick, for
+                                   * scheduler_switch_from_irq to gate its
+                                   * tick_count increment on */
     bl scheduler_switch_from_irq   /* returns r0 = the SP to resume,
                                    * possibly a different task's -- also
                                    * always a real per-task-stack pointer */
