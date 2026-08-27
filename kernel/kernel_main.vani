@@ -30,6 +30,25 @@ intent "Dhruva Phase 0-2 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model 
 // address here removes the entire "which register is this actually in"
 // risk class the earlier plain-i64 version had to work around by hand.
 extern "C" fn dhruva_alloc_bytes(n: i64) -> mut ref i64;
+
+// Shared, persistent scratch buffers -- see scratch_state.S's own doc
+// comment for why these exist (fs_compact wasn't the only place a
+// dhruva_alloc_bytes call was hiding inside something called every GC
+// wake or every shell command instead of once at boot).
+extern "C" fn fs_sd_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn fs_sd_scratch_get() -> mut ref i64;
+extern "C" fn fs_path_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn fs_path_scratch_get() -> mut ref i64;
+extern "C" fn fs_data_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn fs_data_scratch_get() -> mut ref i64;
+extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_line_scratch_get() -> mut ref i64;
+extern "C" fn eval_values_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn eval_values_scratch_get() -> mut ref i64;
+extern "C" fn eval_ops_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn eval_ops_scratch_get() -> mut ref i64;
+extern "C" fn uart_digits_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn uart_digits_scratch_get() -> mut ref i64;
 extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_c_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
@@ -73,6 +92,25 @@ extern "C" fn governor_history_get1() -> i64;
 extern "C" fn governor_history_get2() -> i64;
 extern "C" fn governor_history_get3() -> i64;
 extern "C" fn governor_history_reset() -> i64;
+// Phase 6: netif loopback queue state -- netif_state.S.
+extern "C" fn netif_set_queue_buf(buf: mut ref i64) -> i64;
+extern "C" fn netif_get_queue_buf() -> mut ref i64;
+extern "C" fn netif_get_head() -> i64;
+extern "C" fn netif_get_tail() -> i64;
+extern "C" fn netif_get_count() -> i64;
+extern "C" fn netif_get_slot_len(slot_index: i64) -> i64;
+extern "C" fn netif_set_slot_len(slot_index: i64, value: i64) -> i64;
+extern "C" fn netif_advance_head() -> i64;
+extern "C" fn netif_advance_tail() -> i64;
+// Phase 6: ARP cache state -- arp_state.S.
+extern "C" fn arp_cache_set_macs_buf(buf: mut ref i64) -> u32;
+extern "C" fn arp_cache_get_macs_buf() -> mut ref i64;
+extern "C" fn arp_cache_get_count() -> u32;
+extern "C" fn arp_cache_set_count(count: u32) -> u32;
+extern "C" fn arp_cache_get_next_slot() -> u32;
+extern "C" fn arp_cache_set_next_slot(slot: u32) -> u32;
+extern "C" fn arp_cache_get_ip(index: u32) -> u32;
+extern "C" fn arp_cache_set_ip(index: u32, value: u32) -> u32;
 
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
 // addressing mode sdhost_init() discovers, across the vani-call-
@@ -282,7 +320,7 @@ fn uart_put_i64(v: i64) -> i64 {
     is_neg = 1;
     value = 0 - value;
   }
-  let digits: mut ref i64 = dhruva_alloc_bytes(24);
+  let digits: mut ref i64 = uart_digits_scratch_get();
   let n: i64 = 0;
   if value == 0 {
     let _ = buf_write_byte(digits, 0 as u32, 48 as u32);
@@ -752,7 +790,7 @@ fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, da
     return 1;
   }
 
-  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let buf: mut ref i64 = fs_sd_scratch_get();
   let next_block: u32 = fs_state_get_next_block();
   let next_seq: u32 = fs_state_get_next_seq();
 
@@ -799,13 +837,13 @@ fn fs_append(path: Str, data: Str) -> i64 {
   if data_len > 464 {
     return 1;
   }
-  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let path_buf: mut ref i64 = fs_path_scratch_get();
   let i: i64 = 0;
   while i < path_len {
     let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
     i = i + 1;
   }
-  let data_buf: mut ref i64 = dhruva_alloc_bytes(464);
+  let data_buf: mut ref i64 = fs_data_scratch_get();
   let j: i64 = 0;
   while j < data_len {
     let _ = buf_write_byte(data_buf, j as u32, str_byte_at(data, j) as u32);
@@ -822,7 +860,7 @@ fn fs_append(path: Str, data: Str) -> i64 {
 fn fs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   let next_block: u32 = fs_state_get_next_block();
   let log_start: u32 = fs_state_get_log_start();
-  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let buf: mut ref i64 = fs_sd_scratch_get();
   let best_block: i64 = 0 - 1;
   let best_seq: u32 = 0 as u32;
   let blk: i64 = log_start as i64;
@@ -873,7 +911,7 @@ fn fs_find_latest_block(path: Str) -> i64 {
   if path_len > 32 {
     return 0 - 1;
   }
-  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let path_buf: mut ref i64 = fs_path_scratch_get();
   let i: i64 = 0;
   while i < path_len {
     let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
@@ -908,7 +946,31 @@ fn fs_find_latest_block(path: Str) -> i64 {
 // prefix it didn't strictly need to, never a correctness problem,
 // since "latest wins" already tolerates the old and new copies of a
 // record coexisting.
-fn fs_compact() -> i64 {
+// buf/path_buf/data_buf are caller-owned scratch space (512/32/464
+// bytes respectively), not allocated in here.
+//
+// BUG (found via a real crash-and-reboot loop under Phase 6's
+// checkpoint regression test, not by inspection): this function used
+// to call dhruva_alloc_bytes for all three buffers itself, on every
+// single call. dhruva_alloc_bytes is a bump allocator that never
+// frees (see runtime_stubs.c's own doc comment -- by design, for
+// once-at-boot task-stack allocation) -- fine for a function called
+// once, but fs_compact() is task_e/GC's main per-pass work, called
+// every 20 ticks for as long as the system runs. Once the log grew
+// past the "not worth compacting yet" threshold below, every
+// subsequent pass leaked another 512+32+464 = 1008 bytes permanently.
+// Against the 64KB kernel heap, a long-running session (tens of
+// seconds of continuous GC wakeups, easily reached once Phase 6 added
+// enough boot-time work to make longer test runs routine) eventually
+// exhausted it; dhruva_alloc_bytes returned null, and this function
+// wrote straight through it with zero null check -- corrupting
+// address 0 (the vector table), so the next interrupt jumped through
+// garbage and the whole system reset. Passing the same three buffers
+// in from each caller (task_e allocates its copy once, alongside its
+// existing gc_buf; kernel_main's own one-off self-test call does the
+// same) makes this function's heap footprint bounded regardless of
+// how many times it runs.
+fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) -> i64 {
   let log_start: u32 = fs_state_get_log_start();
   let old_next_block: u32 = fs_state_get_next_block();
 
@@ -918,9 +980,6 @@ fn fs_compact() -> i64 {
     return 0;
   }
 
-  let buf: mut ref i64 = dhruva_alloc_bytes(512);
-  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
-  let data_buf: mut ref i64 = dhruva_alloc_bytes(464);
   let blk: i64 = log_start as i64;
   while (blk as u32) < old_next_block {
     let rd_status: i64 = sdhost_read_block(blk, buf);
@@ -988,7 +1047,7 @@ fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
   if blk < 0 {
     return 0 - 1;
   }
-  let tmp: mut ref i64 = dhruva_alloc_bytes(512);
+  let tmp: mut ref i64 = fs_sd_scratch_get();
   let rd_status: i64 = sdhost_read_block(blk, tmp);
   if rd_status != 0 {
     return 0 - 1;
@@ -1015,7 +1074,7 @@ fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i6
   if blk < 0 {
     return 0 - 1;
   }
-  let tmp: mut ref i64 = dhruva_alloc_bytes(512);
+  let tmp: mut ref i64 = fs_sd_scratch_get();
   let rd_status: i64 = sdhost_read_block(blk, tmp);
   if rd_status != 0 {
     return 0 - 1;
@@ -1047,7 +1106,7 @@ fn fs_delete_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   if path_len > 32 {
     return 1;
   }
-  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let buf: mut ref i64 = fs_sd_scratch_get();
   let next_block: u32 = fs_state_get_next_block();
   let next_seq: u32 = fs_state_get_next_seq();
 
@@ -1077,7 +1136,7 @@ fn fs_delete(path: Str) -> i64 {
   if path_len > 32 {
     return 1;
   }
-  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let path_buf: mut ref i64 = fs_path_scratch_get();
   let i: i64 = 0;
   while i < path_len {
     let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
@@ -1097,7 +1156,7 @@ fn fs_list(prefix: Str) -> i64 {
   let prefix_len: i64 = str_len_bytes(prefix);
   let next_block: u32 = fs_state_get_next_block();
   let log_start: u32 = fs_state_get_log_start();
-  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let buf: mut ref i64 = fs_sd_scratch_get();
   let blk: i64 = log_start as i64;
   while (blk as u32) < next_block {
     let rd_status: i64 = sdhost_read_block(blk, buf);
@@ -1125,11 +1184,14 @@ fn fs_list(prefix: Str) -> i64 {
           }
           if prefix_matches == 1 {
             // Copy the path out before calling fs_find_latest_block_
-            // raw below, which allocates and reads its own buffer --
-            // `buf` above stays valid (it's a separate allocation),
-            // but building the comparison path fresh from `buf`
-            // avoids any doubt about which buffer holds what.
-            let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+            // raw below: it reuses fs_sd_scratch (the same persistent
+            // buffer as `buf` above) for its own scan, so `buf`'s
+            // current record is only safe to keep reading from up to
+            // this point -- everything this branch still needs from it
+            // (rec_path_len, and now these bytes) has to be pulled out
+            // first. path_buf itself is a separate persistent buffer
+            // (fs_path_scratch), untouched by that scan.
+            let path_buf: mut ref i64 = fs_path_scratch_get();
             let m: i64 = 0;
             while (m as u32) < rec_path_len {
               let pb: u32 = buf_read_byte(buf, (12 + m) as u32);
@@ -1261,6 +1323,896 @@ fn irq_dispatch() -> i64 {
     // level-triggered condition; this just clears any stale raw
     // status defensively, same pattern as the timer branch above.
     let _ = mmio_write_u32(uart_icr, 0x10 as u32);
+  }
+  return 0;
+}
+
+// Phase 6: network byte order helpers, shared by ARP/IPv4/UDP/TCP
+// below. Every multi-byte field in a real network protocol is
+// transmitted big-endian ("network byte order"), regardless of the
+// host CPU's own endianness -- and ARM1176JZF-S here defaults to
+// little-endian, the same as the rest of this project's MMIO/buffer
+// code (buf_read_u32/buf_write_u32 from fs_buf.S use plain ldr/str,
+// which read/write in the HOST's native order, correct for this
+// project's own filesystem records but wrong for anything that has to
+// interoperate with a real remote host). These read/write byte-by-byte
+// in the correct wire order regardless of host endianness, exactly
+// like every multi-byte field already handled by hand in netif's own
+// MAC/ethertype writes above -- just named and reusable instead of
+// repeated inline each time.
+fn buf_write_u16_be(buf: mut ref i64, offset: i64, value: u32) -> i64 {
+  let b0: u32 = (value >> (8 as u32)) & (0xFF as u32);
+  let b1: u32 = value & (0xFF as u32);
+  let _ = buf_write_byte(buf, offset as u32, b0);
+  let _ = buf_write_byte(buf, (offset + 1) as u32, b1);
+  return 0;
+}
+
+fn buf_read_u16_be(buf: mut ref i64, offset: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, offset as u32);
+  let b1: u32 = buf_read_byte(buf, (offset + 1) as u32);
+  return (b0 << (8 as u32)) | b1;
+}
+
+fn buf_write_u32_be(buf: mut ref i64, offset: i64, value: u32) -> i64 {
+  let b0: u32 = (value >> (24 as u32)) & (0xFF as u32);
+  let b1: u32 = (value >> (16 as u32)) & (0xFF as u32);
+  let b2: u32 = (value >> (8 as u32)) & (0xFF as u32);
+  let b3: u32 = value & (0xFF as u32);
+  let _ = buf_write_byte(buf, offset as u32, b0);
+  let _ = buf_write_byte(buf, (offset + 1) as u32, b1);
+  let _ = buf_write_byte(buf, (offset + 2) as u32, b2);
+  let _ = buf_write_byte(buf, (offset + 3) as u32, b3);
+  return 0;
+}
+
+fn buf_read_u32_be(buf: mut ref i64, offset: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, offset as u32);
+  let b1: u32 = buf_read_byte(buf, (offset + 1) as u32);
+  let b2: u32 = buf_read_byte(buf, (offset + 2) as u32);
+  let b3: u32 = buf_read_byte(buf, (offset + 3) as u32);
+  return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+// Phase 6: generic netif abstraction (DHRUVA_ARCHITECTURE.md §4's own
+// "get-go hook": "send/receive a raw frame, MTU, MAC address... just
+// an interface, no implementation. Both the LAN9512 wired path and
+// the WiFi dongle plug into the same upper-stack path without a
+// redesign"). This is the ONE implementation that exists so far: a
+// loopback netif, backing everything built on top of it (ARP/IPv4/
+// UDP/TCP) for QEMU testing, per §4's own note that no real network
+// hardware is emulated for any Pi generation QEMU models. vani has no
+// dynamic dispatch -- no way to swap netif implementations at runtime
+// via a function-pointer table, since a function's address can't be
+// taken as arbitrary integer data (an established finding from this
+// project's own Phase 1 work) -- so "the interface" here is a
+// naming/layering convention (ARP/IPv4 call netif_send_frame/
+// netif_recv_frame by name) rather than a true runtime-swappable
+// vtable, consistent with how every other layer in this project
+// (fs_*, shell_*) is already structured, and the only netif
+// implementation that will ever exist under QEMU regardless of how
+// this is designed.
+//
+// Frames are raw Ethernet: [dst_mac(6)][src_mac(6)][ethertype(2)]
+// [payload...] -- the same framing a real hardware netif (LAN9512,
+// the WiFi dongle) will need later, so ARP/IPv4 above this get written
+// hardware-realistic from the start, not as a loopback-only shortcut.
+fn netif_init() -> i64 {
+  let buf: mut ref i64 = dhruva_alloc_bytes(2048);
+  let _ = netif_set_queue_buf(buf);
+  return 0;
+}
+
+// Payload MTU: the 512-byte slot (netif_state.S) minus the 14-byte
+// Ethernet header -- deliberately not a real 1500-byte Ethernet MTU,
+// since nothing this project can test end-to-end under QEMU (no real
+// NIC emulated) needs a full-size frame. A real hardware netif
+// implementation later would need its own, larger buffers and report
+// the real 1500 here instead.
+fn netif_get_mtu() -> i64 {
+  return 498;
+}
+
+// Loopback's own placeholder MAC: a locally-administered address (bit
+// 1 of the first octet set, per IEEE 802 convention for non-vendor
+// addresses) rather than a real vendor OUI, so it can never collide
+// with an actual NIC's burned-in address.
+fn netif_get_mac(out_buf: mut ref i64) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, 0x02 as u32);
+  let _ = buf_write_byte(out_buf, 1 as u32, 0 as u32);
+  let _ = buf_write_byte(out_buf, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(out_buf, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(out_buf, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(out_buf, 5 as u32, 0x01 as u32);
+  return 0;
+}
+
+// Sends a raw frame (buf[0..len)) by copying it into the next free
+// queue slot. Returns 0 on success, -1 if the queue is already full
+// (dropped, matching real best-effort networking behavior under
+// congestion -- nothing here can afford to block) or the frame is too
+// big for a slot.
+fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
+  if netif_get_count() >= 4 {
+    return 0 - 1;
+  }
+  if frame_len > 512 {
+    return 0 - 1;
+  }
+  let qbuf: mut ref i64 = netif_get_queue_buf();
+  let head: i64 = netif_get_head();
+  let base: i64 = head * 512;
+  let i: i64 = 0;
+  while i < frame_len {
+    let b: u32 = buf_read_byte(buf, i as u32);
+    let _ = buf_write_byte(qbuf, (base + i) as u32, b);
+    i = i + 1;
+  }
+  let _ = netif_set_slot_len(head, frame_len);
+  let _ = netif_advance_head();
+  return 0;
+}
+
+// Receives the oldest pending frame into out_buf, returning its
+// length, or -1 if nothing is queued.
+fn netif_recv_frame(out_buf: mut ref i64) -> i64 {
+  if netif_get_count() <= 0 {
+    return 0 - 1;
+  }
+  let qbuf: mut ref i64 = netif_get_queue_buf();
+  let tail: i64 = netif_get_tail();
+  let base: i64 = tail * 512;
+  let frame_len: i64 = netif_get_slot_len(tail);
+  let i: i64 = 0;
+  while i < frame_len {
+    let b: u32 = buf_read_byte(qbuf, (base + i) as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  let _ = netif_advance_tail();
+  return frame_len;
+}
+
+// Boot-time self-test: builds a tiny synthetic Ethernet frame
+// (broadcast destination, our own loopback MAC as source, ethertype
+// 0x0800 = IPv4, payload "hi"), sends it, receives it back, and checks
+// every field round-tripped correctly -- plus the empty-queue and
+// full-queue edge cases, both real conditions netif_send_frame/
+// netif_recv_frame handle explicitly above.
+fn netif_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let empty_len: i64 = netif_recv_frame(dhruva_alloc_bytes(64));
+  if empty_len != (0 - 1) {
+    ok = 0;
+  }
+
+  let frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(mac);
+  let i: i64 = 0;
+  while i < 6 {
+    let _ = buf_write_byte(frame, i as u32, 0xFF as u32); // dst: broadcast
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    let mb: u32 = buf_read_byte(mac, j as u32);
+    let _ = buf_write_byte(frame, (6 + j) as u32, mb); // src: our own MAC
+    j = j + 1;
+  }
+  let _ = buf_write_byte(frame, 12 as u32, 0x08 as u32); // ethertype hi (IPv4)
+  let _ = buf_write_byte(frame, 13 as u32, 0x00 as u32); // ethertype lo
+  let _ = buf_write_byte(frame, 14 as u32, 104 as u32);  // 'h'
+  let _ = buf_write_byte(frame, 15 as u32, 105 as u32);  // 'i'
+
+  let send_status: i64 = netif_send_frame(frame, 16);
+  if send_status != 0 {
+    ok = 0;
+  }
+
+  let recv_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let recv_len: i64 = netif_recv_frame(recv_buf);
+  if recv_len != 16 {
+    ok = 0;
+  }
+  let et_hi: u32 = buf_read_byte(recv_buf, 12 as u32);
+  let et_lo: u32 = buf_read_byte(recv_buf, 13 as u32);
+  if (et_hi != (0x08 as u32)) || (et_lo != (0x00 as u32)) {
+    ok = 0;
+  }
+  let c0: u32 = buf_read_byte(recv_buf, 14 as u32);
+  let c1: u32 = buf_read_byte(recv_buf, 15 as u32);
+  if (c0 != (104 as u32)) || (c1 != (105 as u32)) {
+    ok = 0;
+  }
+
+  // Queue-full: 4 slots total: send 4 more (filling the queue from
+  // empty, since the one above was already drained) then a 5th, which
+  // must be dropped.
+  let k: i64 = 0;
+  while k < 4 {
+    let _ = netif_send_frame(frame, 16);
+    k = k + 1;
+  }
+  let overflow_status: i64 = netif_send_frame(frame, 16);
+  if overflow_status != (0 - 1) {
+    ok = 0;
+  }
+  // Drain the 4 real frames back out before anything else uses the
+  // queue, so this self-test doesn't leave stale frames behind for
+  // the ARP/IPv4/UDP self-tests that follow it at boot.
+  let m: i64 = 0;
+  while m < 4 {
+    let _ = netif_recv_frame(recv_buf);
+    m = m + 1;
+  }
+
+  let _ = uart_puts("NETIF: loopback send/recv + empty/full edge cases");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Phase 6: ARP (RFC 826), built directly on netif's own Ethernet
+// framing. Field layout (offsets within the full 42-byte frame,
+// after netif's own 14-byte dst/src/ethertype header):
+//   14-15 hwtype(1=Ethernet)  16-17 ptype(0x0800=IPv4)
+//   18 hwlen(6)  19 plen(4)  20-21 op(1=request,2=reply)
+//   22-27 sender_mac  28-31 sender_ip
+//   32-37 target_mac  38-41 target_ip
+// A loopback link doesn't actually need address resolution (there's
+// no separate "other host" on the wire to resolve), but the packet
+// format and cache logic below are real and directly testable without
+// one -- exactly like eval_expr_raw or the governor were verified via
+// self-test rather than live input earlier in this project.
+
+fn arp_build_request(out_frame: mut ref i64, my_mac: mut ref i64, my_ip: u32, target_ip: u32) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    let _ = buf_write_byte(out_frame, i as u32, 0xFF as u32); // dst: broadcast
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    let mb: u32 = buf_read_byte(my_mac, j as u32);
+    let _ = buf_write_byte(out_frame, (6 + j) as u32, mb);
+    j = j + 1;
+  }
+  let _ = buf_write_u16_be(out_frame, 12, 0x0806 as u32); // ethertype: ARP
+  let _ = buf_write_u16_be(out_frame, 14, 1 as u32);      // hwtype: Ethernet
+  let _ = buf_write_u16_be(out_frame, 16, 0x0800 as u32); // ptype: IPv4
+  let _ = buf_write_byte(out_frame, 18 as u32, 6 as u32);
+  let _ = buf_write_byte(out_frame, 19 as u32, 4 as u32);
+  let _ = buf_write_u16_be(out_frame, 20, 1 as u32);      // op: request
+  let k: i64 = 0;
+  while k < 6 {
+    let mb2: u32 = buf_read_byte(my_mac, k as u32);
+    let _ = buf_write_byte(out_frame, (22 + k) as u32, mb2); // sender mac
+    k = k + 1;
+  }
+  let _ = buf_write_u32_be(out_frame, 28, my_ip);
+  let m: i64 = 0;
+  while m < 6 {
+    let _ = buf_write_byte(out_frame, (32 + m) as u32, 0 as u32); // target mac: unknown
+    m = m + 1;
+  }
+  let _ = buf_write_u32_be(out_frame, 38, target_ip);
+  return 42;
+}
+
+fn arp_build_reply(out_frame: mut ref i64, my_mac: mut ref i64, my_ip: u32, requester_mac: mut ref i64, requester_ip: u32) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    let tb: u32 = buf_read_byte(requester_mac, i as u32);
+    let _ = buf_write_byte(out_frame, i as u32, tb); // dst: the requester
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    let mb: u32 = buf_read_byte(my_mac, j as u32);
+    let _ = buf_write_byte(out_frame, (6 + j) as u32, mb);
+    j = j + 1;
+  }
+  let _ = buf_write_u16_be(out_frame, 12, 0x0806 as u32);
+  let _ = buf_write_u16_be(out_frame, 14, 1 as u32);
+  let _ = buf_write_u16_be(out_frame, 16, 0x0800 as u32);
+  let _ = buf_write_byte(out_frame, 18 as u32, 6 as u32);
+  let _ = buf_write_byte(out_frame, 19 as u32, 4 as u32);
+  let _ = buf_write_u16_be(out_frame, 20, 2 as u32);      // op: reply
+  let k: i64 = 0;
+  while k < 6 {
+    let mb2: u32 = buf_read_byte(my_mac, k as u32);
+    let _ = buf_write_byte(out_frame, (22 + k) as u32, mb2); // sender: us
+    k = k + 1;
+  }
+  let _ = buf_write_u32_be(out_frame, 28, my_ip);
+  let m: i64 = 0;
+  while m < 6 {
+    let tb2: u32 = buf_read_byte(requester_mac, m as u32);
+    let _ = buf_write_byte(out_frame, (32 + m) as u32, tb2); // target: the requester
+    m = m + 1;
+  }
+  let _ = buf_write_u32_be(out_frame, 38, requester_ip);
+  return 42;
+}
+
+fn arp_get_ethertype(frame: mut ref i64) -> u32 {
+  return buf_read_u16_be(frame, 12);
+}
+
+fn arp_is_arp_frame(frame: mut ref i64) -> i64 {
+  if arp_get_ethertype(frame) == (0x0806 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+fn arp_get_operation(frame: mut ref i64) -> u32 {
+  return buf_read_u16_be(frame, 20);
+}
+
+fn arp_get_sender_ip(frame: mut ref i64) -> u32 {
+  return buf_read_u32_be(frame, 28);
+}
+
+fn arp_get_target_ip(frame: mut ref i64) -> u32 {
+  return buf_read_u32_be(frame, 38);
+}
+
+fn arp_get_sender_mac(frame: mut ref i64, out_mac: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    let b: u32 = buf_read_byte(frame, (22 + i) as u32);
+    let _ = buf_write_byte(out_mac, i as u32, b);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn arp_cache_init() -> i64 {
+  let buf: mut ref i64 = dhruva_alloc_bytes(48);
+  let _ = arp_cache_set_macs_buf(buf);
+  return 0;
+}
+
+// Looks up ip in the cache; if found, copies its MAC into out_mac and
+// returns 1; if not found, returns 0 (out_mac left untouched).
+fn arp_cache_lookup(ip: u32, out_mac: mut ref i64) -> i64 {
+  let count: u32 = arp_cache_get_count();
+  let i: u32 = 0 as u32;
+  while i < count {
+    if arp_cache_get_ip(i) == ip {
+      let macs: mut ref i64 = arp_cache_get_macs_buf();
+      let base: u32 = i * (6 as u32);
+      let j: i64 = 0;
+      while j < 6 {
+        let b: u32 = buf_read_byte(macs, base + (j as u32));
+        let _ = buf_write_byte(out_mac, j as u32, b);
+        j = j + 1;
+      }
+      return 1;
+    }
+    i = i + (1 as u32);
+  }
+  return 0;
+}
+
+// Inserts/updates an IP -> MAC mapping. Updates in place if the IP is
+// already cached; otherwise appends while there's room, or overwrites
+// the oldest entry round-robin once full (arp_cache_next_slot) -- a
+// demo-scoped cache, not a production one with real aging/timeouts.
+fn arp_cache_insert(ip: u32, mac: mut ref i64) -> i64 {
+  let count: u32 = arp_cache_get_count();
+  let i: u32 = 0 as u32;
+  while i < count {
+    if arp_cache_get_ip(i) == ip {
+      let macs: mut ref i64 = arp_cache_get_macs_buf();
+      let base: u32 = i * (6 as u32);
+      let j: i64 = 0;
+      while j < 6 {
+        let b: u32 = buf_read_byte(mac, j as u32);
+        let _ = buf_write_byte(macs, base + (j as u32), b);
+        j = j + 1;
+      }
+      return 0;
+    }
+    i = i + (1 as u32);
+  }
+  let slot: u32 = 0 as u32;
+  if count < (8 as u32) {
+    slot = count;
+    let _ = arp_cache_set_count(count + (1 as u32));
+  } else {
+    slot = arp_cache_get_next_slot();
+    let next: u32 = (slot + (1 as u32)) & (7 as u32);
+    let _ = arp_cache_set_next_slot(next);
+  }
+  let _ = arp_cache_set_ip(slot, ip);
+  let macs2: mut ref i64 = arp_cache_get_macs_buf();
+  let base2: u32 = slot * (6 as u32);
+  let k: i64 = 0;
+  while k < 6 {
+    let b2: u32 = buf_read_byte(mac, k as u32);
+    let _ = buf_write_byte(macs2, base2 + (k as u32), b2);
+    k = k + 1;
+  }
+  return 0;
+}
+
+// Boot-time self-test: build+parse a request and a reply (round-
+// tripping every field), then exercise the cache (insert, lookup,
+// lookup-miss, and update-in-place -- re-inserting the same IP with a
+// different MAC must overwrite, not append a second entry).
+fn arp_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let my_ip: u32 = 0xC0A80101 as u32;     // 192.168.1.1
+  let target_ip: u32 = 0xC0A80102 as u32; // 192.168.1.2
+
+  let req_frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let req_len: i64 = arp_build_request(req_frame, my_mac, my_ip, target_ip);
+  if req_len != 42 {
+    ok = 0;
+  }
+  if arp_is_arp_frame(req_frame) != 1 {
+    ok = 0;
+  }
+  if arp_get_operation(req_frame) != (1 as u32) {
+    ok = 0;
+  }
+  if arp_get_sender_ip(req_frame) != my_ip {
+    ok = 0;
+  }
+  if arp_get_target_ip(req_frame) != target_ip {
+    ok = 0;
+  }
+  let parsed_sender_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = arp_get_sender_mac(req_frame, parsed_sender_mac);
+  let mi: i64 = 0;
+  while mi < 6 {
+    let a: u32 = buf_read_byte(my_mac, mi as u32);
+    let b: u32 = buf_read_byte(parsed_sender_mac, mi as u32);
+    if a != b {
+      ok = 0;
+    }
+    mi = mi + 1;
+  }
+
+  // A peer (192.168.1.2) replying to our request.
+  let peer_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = buf_write_byte(peer_mac, 0 as u32, 0x02 as u32);
+  let _ = buf_write_byte(peer_mac, 1 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac, 5 as u32, 0x02 as u32);
+  let reply_frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let reply_len: i64 = arp_build_reply(reply_frame, peer_mac, target_ip, my_mac, my_ip);
+  if reply_len != 42 {
+    ok = 0;
+  }
+  if arp_get_operation(reply_frame) != (2 as u32) {
+    ok = 0;
+  }
+  if arp_get_sender_ip(reply_frame) != target_ip {
+    ok = 0;
+  }
+
+  let _ = arp_cache_init();
+  let _ = arp_cache_insert(target_ip, peer_mac);
+  let looked_up: mut ref i64 = dhruva_alloc_bytes(8);
+  let found: i64 = arp_cache_lookup(target_ip, looked_up);
+  if found != 1 {
+    ok = 0;
+  }
+  let ci: i64 = 0;
+  while ci < 6 {
+    let a2: u32 = buf_read_byte(peer_mac, ci as u32);
+    let b2: u32 = buf_read_byte(looked_up, ci as u32);
+    if a2 != b2 {
+      ok = 0;
+    }
+    ci = ci + 1;
+  }
+  let not_found: i64 = arp_cache_lookup(0xDEADBEEF as u32, looked_up);
+  if not_found != 0 {
+    ok = 0;
+  }
+
+  // Re-insert the same IP with a different MAC: must overwrite the
+  // existing entry, not grow the cache.
+  let peer_mac2: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = buf_write_byte(peer_mac2, 0 as u32, 0x02 as u32);
+  let _ = buf_write_byte(peer_mac2, 1 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac2, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac2, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac2, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac2, 5 as u32, 0x03 as u32);
+  let _ = arp_cache_insert(target_ip, peer_mac2);
+  let count_after: u32 = arp_cache_get_count();
+  if count_after != (1 as u32) {
+    ok = 0;
+  }
+  let looked_up2: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = arp_cache_lookup(target_ip, looked_up2);
+  let last_byte: u32 = buf_read_byte(looked_up2, 5 as u32);
+  if last_byte != (0x03 as u32) {
+    ok = 0;
+  }
+
+  let _ = uart_puts("ARP: build/parse + cache insert/lookup/update");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Phase 6: IPv4 (RFC 791), no options (IHL always 5 -- a 20-byte
+// header, deliberately not supporting IP options at all: nothing this
+// project's own from-scratch stack sends or needs to receive requires
+// them, matching the doc's own "scoped like uIP/picoTCP" framing for
+// this whole phase). Sits directly on netif's Ethernet framing, no
+// new persistent state needed -- unlike ARP's cache, there's nothing
+// here that needs to survive across calls, so this stays pure vani
+// logic over the existing buf_* helpers with no new assembly file.
+//
+// Header layout (offsets relative to ip_offset, i.e. 14 bytes into
+// the full Ethernet frame for anything netif-backed):
+//   0 version(4 bits)+IHL(4 bits)   1 DSCP+ECN (unused, 0)
+//   2-3 total length (header+payload)   4-5 identification (unused, 0)
+//   6-7 flags+fragment offset (unused, 0 -- no fragmentation support)
+//   8 TTL   9 protocol (1=ICMP, 6=TCP, 17=UDP)
+//   10-11 header checksum   12-15 source IP   16-19 destination IP
+
+fn ipv4_checksum(frame: mut ref i64, ip_offset: i64) -> u32 {
+  let sum: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < 20 {
+    let word: u32 = buf_read_u16_be(frame, ip_offset + i);
+    sum = sum + word;
+    i = i + 2;
+  }
+  while (sum >> (16 as u32)) != (0 as u32) {
+    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
+  }
+  return sum & (0xFFFF as u32);
+}
+
+fn ipv4_build_header(frame: mut ref i64, ip_offset: i64, total_len: i64, protocol: u32, src_ip: u32, dst_ip: u32) -> i64 {
+  let _ = buf_write_byte(frame, ip_offset as u32, 0x45 as u32); // version 4, IHL 5
+  let _ = buf_write_byte(frame, (ip_offset + 1) as u32, 0 as u32);
+  let _ = buf_write_u16_be(frame, ip_offset + 2, total_len as u32);
+  let _ = buf_write_u16_be(frame, ip_offset + 4, 0 as u32);
+  let _ = buf_write_u16_be(frame, ip_offset + 6, 0 as u32);
+  let _ = buf_write_byte(frame, (ip_offset + 8) as u32, 64 as u32); // TTL
+  let _ = buf_write_byte(frame, (ip_offset + 9) as u32, protocol);
+  let _ = buf_write_u16_be(frame, ip_offset + 10, 0 as u32); // checksum placeholder
+  let _ = buf_write_u32_be(frame, ip_offset + 12, src_ip);
+  let _ = buf_write_u32_be(frame, ip_offset + 16, dst_ip);
+  // One's complement of the sum, computed with the checksum field
+  // itself still zero -- standard IPv4 checksum construction.
+  let checksum: u32 = (ipv4_checksum(frame, ip_offset) ^ (0xFFFF as u32)) & (0xFFFF as u32);
+  let _ = buf_write_u16_be(frame, ip_offset + 10, checksum);
+  return 20;
+}
+
+fn ipv4_get_total_len(frame: mut ref i64, ip_offset: i64) -> u32 {
+  return buf_read_u16_be(frame, ip_offset + 2);
+}
+fn ipv4_get_protocol(frame: mut ref i64, ip_offset: i64) -> u32 {
+  return buf_read_byte(frame, (ip_offset + 9) as u32);
+}
+fn ipv4_get_src_ip(frame: mut ref i64, ip_offset: i64) -> u32 {
+  return buf_read_u32_be(frame, ip_offset + 12);
+}
+fn ipv4_get_dst_ip(frame: mut ref i64, ip_offset: i64) -> u32 {
+  return buf_read_u32_be(frame, ip_offset + 16);
+}
+
+// A correctly-checksummed header sums (as transmitted, checksum field
+// included) to all-ones -- the standard IPv4 checksum verification
+// trick, avoiding needing to zero the field out again to re-check it.
+fn ipv4_verify_checksum(frame: mut ref i64, ip_offset: i64) -> i64 {
+  if ipv4_checksum(frame, ip_offset) == (0xFFFF as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+// Builds a full Ethernet+IPv4 frame around payload[0..payload_len) and
+// sends it via netif. Frame layout: [14-byte Ethernet header][20-byte
+// IP header][payload].
+fn ipv4_send(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, protocol: u32, payload: mut ref i64, payload_len: i64) -> i64 {
+  let frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let i: i64 = 0;
+  while i < 6 {
+    let db: u32 = buf_read_byte(dst_mac, i as u32);
+    let _ = buf_write_byte(frame, i as u32, db);
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    let sb: u32 = buf_read_byte(my_mac, j as u32);
+    let _ = buf_write_byte(frame, (6 + j) as u32, sb);
+    j = j + 1;
+  }
+  let _ = buf_write_u16_be(frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let total_len: i64 = 20 + payload_len;
+  let _ = ipv4_build_header(frame, 14, total_len, protocol, src_ip, dst_ip);
+  let k: i64 = 0;
+  while k < payload_len {
+    let pb: u32 = buf_read_byte(payload, k as u32);
+    let _ = buf_write_byte(frame, (34 + k) as u32, pb); // 14 + 20 = 34
+    k = k + 1;
+  }
+  return netif_send_frame(frame, 34 + payload_len);
+}
+
+// Boot-time self-test: send an IPv4 packet over the loopback netif,
+// receive it back, and verify every header field plus the checksum
+// and payload round-tripped correctly.
+fn ipv4_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let src_ip: u32 = 0xC0A80101 as u32;
+  let dst_ip: u32 = 0xC0A80102 as u32;
+  let payload: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = buf_write_byte(payload, 0 as u32, 104 as u32); // 'h'
+  let _ = buf_write_byte(payload, 1 as u32, 105 as u32); // 'i'
+
+  let send_status: i64 = ipv4_send(my_mac, my_mac, src_ip, dst_ip, 17 as u32, payload, 2);
+  if send_status != 0 {
+    ok = 0;
+  }
+
+  let recv_frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let recv_len: i64 = netif_recv_frame(recv_frame);
+  if recv_len != 36 {
+    ok = 0;
+  }
+  if ipv4_get_total_len(recv_frame, 14) != (22 as u32) {
+    ok = 0;
+  }
+  if ipv4_get_protocol(recv_frame, 14) != (17 as u32) {
+    ok = 0;
+  }
+  if ipv4_get_src_ip(recv_frame, 14) != src_ip {
+    ok = 0;
+  }
+  if ipv4_get_dst_ip(recv_frame, 14) != dst_ip {
+    ok = 0;
+  }
+  if ipv4_verify_checksum(recv_frame, 14) != 1 {
+    ok = 0;
+  }
+  let p0: u32 = buf_read_byte(recv_frame, 34 as u32);
+  let p1: u32 = buf_read_byte(recv_frame, 35 as u32);
+  if (p0 != (104 as u32)) || (p1 != (105 as u32)) {
+    ok = 0;
+  }
+
+  let _ = uart_puts("IPV4: build/send/recv + checksum verify");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Phase 6: UDP (RFC 768), sitting on ipv4_build_header/netif exactly
+// like IPv4 sits on netif -- no new persistent state, pure vani logic.
+// Header: src_port(2) dst_port(2) length(2, header+data) checksum(2).
+//
+// The checksum covers a "pseudo-header" (source IP, destination IP,
+// a zero byte, the protocol number, and the UDP length) PREPENDED to
+// the real UDP header+data before summing -- not because those bytes
+// are transmitted twice, but because it's what lets a corrupted IP
+// address (not just corrupted UDP bytes) be caught by the receiver,
+// per RFC 768's own design. A UDP checksum of exactly 0 is illegal on
+// the wire (0 means "no checksum was computed" by convention) --
+// RFC 768 requires transmitting 0xFFFF instead in that case.
+
+fn udp_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, udp_offset: i64, udp_len: i64) -> u32 {
+  let sum: u32 = 0 as u32;
+  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (src_ip & (0xFFFF as u32));
+  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (dst_ip & (0xFFFF as u32));
+  sum = sum + (17 as u32); // protocol (the pseudo-header's zero byte contributes nothing)
+  sum = sum + (udp_len as u32);
+  let i: i64 = 0;
+  while (i + 1) < udp_len {
+    let word: u32 = buf_read_u16_be(frame, udp_offset + i);
+    sum = sum + word;
+    i = i + 2;
+  }
+  if i < udp_len {
+    let b: u32 = buf_read_byte(frame, (udp_offset + i) as u32);
+    sum = sum + (b << (8 as u32)); // odd trailing byte, zero-padded low
+  }
+  while (sum >> (16 as u32)) != (0 as u32) {
+    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
+  }
+  let result: u32 = (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+  if result == (0 as u32) {
+    return 0xFFFF as u32; // RFC 768: transmit all-ones, never a literal 0
+  }
+  return result;
+}
+
+// Writes the UDP header+payload at frame[udp_offset..), returning the
+// UDP length (header+payload). Caller still has to build the IP
+// header around this afterward (see udp_send below) -- kept separate
+// so a self-test can exercise header construction without needing a
+// full send/recv round trip too.
+fn udp_build(frame: mut ref i64, udp_offset: i64, src_port: u32, dst_port: u32, payload: mut ref i64, payload_len: i64, src_ip: u32, dst_ip: u32) -> i64 {
+  let udp_len: i64 = 8 + payload_len;
+  let _ = buf_write_u16_be(frame, udp_offset, src_port);
+  let _ = buf_write_u16_be(frame, udp_offset + 2, dst_port);
+  let _ = buf_write_u16_be(frame, udp_offset + 4, udp_len as u32);
+  let _ = buf_write_u16_be(frame, udp_offset + 6, 0 as u32); // checksum placeholder
+  let i: i64 = 0;
+  while i < payload_len {
+    let b: u32 = buf_read_byte(payload, i as u32);
+    let _ = buf_write_byte(frame, (udp_offset + 8 + i) as u32, b);
+    i = i + 1;
+  }
+  let checksum: u32 = udp_checksum(src_ip, dst_ip, frame, udp_offset, udp_len);
+  let _ = buf_write_u16_be(frame, udp_offset + 6, checksum);
+  return udp_len;
+}
+
+fn udp_get_src_port(frame: mut ref i64, udp_offset: i64) -> u32 {
+  return buf_read_u16_be(frame, udp_offset);
+}
+fn udp_get_dst_port(frame: mut ref i64, udp_offset: i64) -> u32 {
+  return buf_read_u16_be(frame, udp_offset + 2);
+}
+fn udp_get_length(frame: mut ref i64, udp_offset: i64) -> u32 {
+  return buf_read_u16_be(frame, udp_offset + 4);
+}
+
+// Builds and sends a full Ethernet+IPv4+UDP frame. Offsets are fixed
+// (14 for IP, 34 for UDP) since this stack never sends IP options.
+fn udp_send(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, payload: mut ref i64, payload_len: i64) -> i64 {
+  let frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let i: i64 = 0;
+  while i < 6 {
+    let db: u32 = buf_read_byte(dst_mac, i as u32);
+    let _ = buf_write_byte(frame, i as u32, db);
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    let sb: u32 = buf_read_byte(my_mac, j as u32);
+    let _ = buf_write_byte(frame, (6 + j) as u32, sb);
+    j = j + 1;
+  }
+  let _ = buf_write_u16_be(frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let udp_len: i64 = udp_build(frame, 34, src_port, dst_port, payload, payload_len, src_ip, dst_ip);
+  let total_len: i64 = 20 + udp_len;
+  let _ = ipv4_build_header(frame, 14, total_len, 17 as u32, src_ip, dst_ip);
+  return netif_send_frame(frame, 14 + total_len);
+}
+
+// Phase 6's "small socket-style API" (DHRUVA_ARCHITECTURE.md §4): a
+// thin, deliberately minimal wrapper hiding the raw Ethernet/IP/UDP
+// plumbing above. This demo stack has exactly one implicit "socket" --
+// no per-port binding/filtering table exists yet, so socket_udp_recv
+// just reports whatever the next queued UDP frame's own header says
+// it's addressed to/from, silently skipping (returning -1 for) any
+// non-UDP frame rather than actually demultiplexing by port. A real
+// multi-socket implementation would need that; this is enough to
+// prove the layers below it end-to-end, per this phase's own scope.
+fn socket_udp_send(my_mac: mut ref i64, local_ip: u32, remote_ip: u32, local_port: u32, remote_port: u32, payload: mut ref i64, payload_len: i64) -> i64 {
+  return udp_send(my_mac, my_mac, local_ip, remote_ip, local_port, remote_port, payload, payload_len);
+}
+
+// Receives the next queued frame; if it's UDP, copies its payload into
+// out_payload and writes [src_ip(4, BE)][src_port(2, BE)][dst_port(2,
+// BE)] into out_meta (8 bytes), returning the payload length. Returns
+// -1 if nothing is queued or the frame isn't UDP.
+fn socket_udp_recv(out_payload: mut ref i64, out_meta: mut ref i64) -> i64 {
+  let frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let frame_len: i64 = netif_recv_frame(frame);
+  if frame_len < 0 {
+    return 0 - 1;
+  }
+  if buf_read_u16_be(frame, 12) != (0x0800 as u32) {
+    return 0 - 1;
+  }
+  if ipv4_get_protocol(frame, 14) != (17 as u32) {
+    return 0 - 1;
+  }
+  let udp_len: u32 = udp_get_length(frame, 34);
+  let payload_len: i64 = (udp_len as i64) - 8;
+  let i: i64 = 0;
+  while i < payload_len {
+    let b: u32 = buf_read_byte(frame, (42 + i) as u32); // 14 + 20 + 8
+    let _ = buf_write_byte(out_payload, i as u32, b);
+    i = i + 1;
+  }
+  let src_ip: u32 = ipv4_get_src_ip(frame, 14);
+  let src_port: u32 = udp_get_src_port(frame, 34);
+  let dst_port: u32 = udp_get_dst_port(frame, 34);
+  let _ = buf_write_u32_be(out_meta, 0, src_ip);
+  let _ = buf_write_u16_be(out_meta, 4, src_port);
+  let _ = buf_write_u16_be(out_meta, 6, dst_port);
+  return payload_len;
+}
+
+// Boot-time self-test: send a UDP datagram over the loopback netif,
+// receive it back through the socket API, and verify the payload,
+// port/address metadata, and the empty-queue case afterward.
+fn udp_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let local_ip: u32 = 0xC0A80101 as u32;
+  let remote_ip: u32 = 0xC0A80102 as u32;
+  let local_port: u32 = 12345 as u32;
+  let remote_port: u32 = 7 as u32;
+
+  let payload: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = buf_write_byte(payload, 0 as u32, 104 as u32); // "hello"
+  let _ = buf_write_byte(payload, 1 as u32, 101 as u32);
+  let _ = buf_write_byte(payload, 2 as u32, 108 as u32);
+  let _ = buf_write_byte(payload, 3 as u32, 108 as u32);
+  let _ = buf_write_byte(payload, 4 as u32, 111 as u32);
+
+  let send_status: i64 = socket_udp_send(my_mac, local_ip, remote_ip, local_port, remote_port, payload, 5);
+  if send_status != 0 {
+    ok = 0;
+  }
+
+  let recv_payload: mut ref i64 = dhruva_alloc_bytes(16);
+  let recv_meta: mut ref i64 = dhruva_alloc_bytes(8);
+  let recv_len: i64 = socket_udp_recv(recv_payload, recv_meta);
+  if recv_len != 5 {
+    ok = 0;
+  }
+  let i: i64 = 0;
+  while i < 5 {
+    let a: u32 = buf_read_byte(payload, i as u32);
+    let b: u32 = buf_read_byte(recv_payload, i as u32);
+    if a != b {
+      ok = 0;
+    }
+    i = i + 1;
+  }
+
+  let got_src_ip: u32 = buf_read_u32_be(recv_meta, 0);
+  let got_src_port: u32 = buf_read_u16_be(recv_meta, 4);
+  let got_dst_port: u32 = buf_read_u16_be(recv_meta, 6);
+  if got_src_ip != local_ip {
+    ok = 0;
+  }
+  if got_src_port != local_port {
+    ok = 0;
+  }
+  if got_dst_port != remote_port {
+    ok = 0;
+  }
+
+  let empty_status: i64 = socket_udp_recv(recv_payload, recv_meta);
+  if empty_status != (0 - 1) {
+    ok = 0;
+  }
+
+  let _ = uart_puts("UDP: socket send/recv over loopback + checksum");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
   }
   return 0;
 }
@@ -1651,9 +2603,12 @@ fn task_d() -> i64 {
 #[bounded_stack(bytes=1024)]
 fn task_e() -> i64 {
   let gc_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let compact_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(464);
   while true {
     let _ = task_sleep_ticks(20);
-    let _ = fs_compact();
+    let _ = fs_compact(compact_buf, compact_path_buf, compact_data_buf);
     let gc_mode_len: i64 = fs_read("/config/mode", gc_buf);
     let _ = uart_puts("GC: compaction pass, /config/mode = \"");
     let _ = fs_print_data(gc_buf, gc_mode_len);
@@ -1790,8 +2745,8 @@ fn eval_apply(op: i64, a: i64, b: i64, error_buf: mut ref i64) -> i64 {
 // the returned i64 is meaningless whenever error_buf[0] is nonzero.
 fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64 {
   let _ = buf_write_u32(error_buf, 0 as u32, 0 as u32);
-  let values: mut ref i64 = dhruva_alloc_bytes(64); // 16 slots * 4 bytes
-  let ops: mut ref i64 = dhruva_alloc_bytes(64);
+  let values: mut ref i64 = eval_values_scratch_get(); // 16 slots * 4 bytes
+  let ops: mut ref i64 = eval_ops_scratch_get();
   let vtop: i64 = 0;
   let otop: i64 = 0;
   let i: i64 = 0;
@@ -1947,13 +2902,13 @@ fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64
 // arguments.
 fn eval_self_test(expr: Str, expected: i64, expect_error: i64) -> i64 {
   let expr_len: i64 = str_len_bytes(expr);
-  let expr_buf: mut ref i64 = dhruva_alloc_bytes(128);
+  let expr_buf: mut ref i64 = fs_data_scratch_get(); // 464 bytes, ample for a 128-byte expr; unused by FS during eval
   let i: i64 = 0;
   while i < expr_len {
     let _ = buf_write_byte(expr_buf, i as u32, str_byte_at(expr, i) as u32);
     i = i + 1;
   }
-  let error_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let error_buf: mut ref i64 = fs_path_scratch_get(); // 32 bytes, ample for a 4-byte flag; unused by FS during eval
   let result: i64 = eval_expr_raw(expr_buf, expr_len, error_buf);
   let got_error: u32 = eval_has_error(error_buf);
 
@@ -1997,7 +2952,7 @@ fn shell_dispatch() -> i64 {
   if line_len == 0 {
     return 0;
   }
-  let line_buf: mut ref i64 = dhruva_alloc_bytes(128);
+  let line_buf: mut ref i64 = shell_line_scratch_get();
   let i: i64 = 0;
   while i < line_len {
     let c: u32 = shell_get_line_byte(i as u32);
@@ -2024,9 +2979,9 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("error: path too long\n");
       return 0;
     }
-    let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+    let path_buf: mut ref i64 = fs_path_scratch_get();
     let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
-    let out_buf: mut ref i64 = dhruva_alloc_bytes(464);
+    let out_buf: mut ref i64 = fs_data_scratch_get();
     let data_len: i64 = fs_read_raw(path_buf, path_len, out_buf);
     if data_len < 0 {
       let _ = uart_puts("(not found)\n");
@@ -2049,7 +3004,7 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("error: path too long\n");
       return 0;
     }
-    let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+    let path_buf: mut ref i64 = fs_path_scratch_get();
     let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
     let status: i64 = fs_delete_raw(path_buf, path_len);
     if status == 0 {
@@ -2082,9 +3037,9 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("error: text too long\n");
       return 0;
     }
-    let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+    let path_buf: mut ref i64 = fs_path_scratch_get();
     let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
-    let data_buf: mut ref i64 = dhruva_alloc_bytes(464);
+    let data_buf: mut ref i64 = fs_data_scratch_get();
     let _ = shell_copy_range(line_buf, text_start, line_len, data_buf);
     let status: i64 = fs_append_raw(path_buf, path_len, data_buf, text_len);
     if status == 0 {
@@ -2102,9 +3057,9 @@ fn shell_dispatch() -> i64 {
     }
     let expr_start: i64 = cmd_end + 1;
     let expr_len: i64 = line_len - expr_start;
-    let expr_buf: mut ref i64 = dhruva_alloc_bytes(128);
+    let expr_buf: mut ref i64 = fs_data_scratch_get();
     let _ = shell_copy_range(line_buf, expr_start, line_len, expr_buf);
-    let error_buf: mut ref i64 = dhruva_alloc_bytes(4);
+    let error_buf: mut ref i64 = fs_path_scratch_get();
     let result: i64 = eval_expr_raw(expr_buf, expr_len, error_buf);
     if eval_has_error(error_buf) != (0 as u32) {
       let _ = uart_puts("error\n");
@@ -2143,6 +3098,19 @@ fn task_f() -> i64 {
 fn kernel_main() -> i64 {
   let _ = uart_init();
   let _ = uart_puts("Dhruva Phase 2: fixed-priority scheduling + priority ceiling\n");
+
+  // Shared, persistent scratch buffers for the FS layer, shell
+  // dispatch, eval, and uart_put_i64 -- allocated exactly once, here,
+  // before anything that uses them ever runs. See scratch_state.S's
+  // own doc comment for why these exist and why sharing them across
+  // call sites is safe.
+  let _ = fs_sd_scratch_set(dhruva_alloc_bytes(512));
+  let _ = fs_path_scratch_set(dhruva_alloc_bytes(32));
+  let _ = fs_data_scratch_set(dhruva_alloc_bytes(464));
+  let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
+  let _ = eval_values_scratch_set(dhruva_alloc_bytes(64));
+  let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
+  let _ = uart_digits_scratch_set(dhruva_alloc_bytes(24));
 
   let _ = sdhost_init();
 
@@ -2222,7 +3190,10 @@ fn kernel_main() -> i64 {
   let _ = fs_append("/config/mode", "final");
   let log_start_before: u32 = fs_state_get_log_start();
   let next_block_before: u32 = fs_state_get_next_block();
-  let _ = fs_compact();
+  let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let compact_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(464);
+  let _ = fs_compact(compact_buf, compact_path_buf, compact_data_buf);
   let log_start_after: u32 = fs_state_get_log_start();
   let next_block_after: u32 = fs_state_get_next_block();
   let _ = uart_puts("FS: compact log_start ");
@@ -2286,6 +3257,13 @@ fn kernel_main() -> i64 {
   let _ = governor_self_test(4, 700);
   let _ = governor_self_test(5, 700);
   let _ = governor_replay_test();
+
+  // Phase 6 verification: netif's own loopback implementation.
+  let _ = netif_init();
+  let _ = netif_self_test();
+  let _ = arp_self_test();
+  let _ = ipv4_self_test();
+  let _ = udp_self_test();
 
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();
