@@ -59,6 +59,12 @@ extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut
 extern "C" fn task_sleep_ticks(ticks: i64) -> i64;
 extern "C" fn dhruva_prio_lock(ceiling: i64) -> i64;
 extern "C" fn dhruva_prio_unlock(base_priority: i64) -> i64;
+// Phase 5: cpu_wfi/scheduler_ready_count -- context_switch.S.
+extern "C" fn cpu_wfi() -> i64;
+extern "C" fn scheduler_ready_count() -> i64;
+extern "C" fn governor_get_last_applied_mhz() -> i64;
+extern "C" fn governor_set_last_applied_mhz(mhz: i64) -> i64;
+extern "C" fn governor_apply_freq_mhz(mhz: i64) -> i64;
 
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
 // addressing mode sdhost_init() discovers, across the vani-call-
@@ -1315,18 +1321,125 @@ fn task_c() -> i64 {
   return 0;
 }
 
+// Phase 5 step 1: classical power governor -- "board-specific: the
+// Phase 5 DVFS frequency/voltage *tables*" per DHRUVA_ARCHITECTURE.md
+// §0's own framing (the algorithm below is the portable baseline; the
+// actual MHz numbers are per-board). Three fixed levels, not a
+// finer-grained table: this is a demonstration governor proving the
+// architecture (deterministic, run-queue-depth-driven, fully
+// QEMU-testable for logic per §7 Phase 5), not a tuned production one.
+// BCM2835's ARM core on a Pi 1 Model B (ARM1176JZF-S) documents a
+// settable range roughly 250-700MHz via the VideoCore mailbox's own
+// "set clock rate" property tag (see governor_apply below).
+fn governor_freq_low() -> i64 {
+  return 250;
+}
+fn governor_freq_mid() -> i64 {
+  return 450;
+}
+fn governor_freq_high() -> i64 {
+  return 700;
+}
+
+// Maps run-queue depth (how many of the 5 real tasks -- HIGH/MEDIUM/
+// LOW/GC/SHELL, not counting idle itself -- are ready RIGHT NOW; see
+// scheduler_ready_count's own comment) to a desired frequency level.
+// Deliberately a pure function with no I/O or hardware access at all:
+// fully deterministic and unit-testable under QEMU regardless of
+// whether governor_apply's actual mailbox write has any real effect
+// in emulation (it doesn't -- QEMU doesn't model wattage, only timing;
+// see DHRUVA_ARCHITECTURE.md §7 Phase 5's own caveat about this).
+fn governor_desired_freq_mhz(ready_count: i64) -> i64 {
+  if ready_count <= 1 {
+    return governor_freq_low();
+  }
+  if ready_count <= 3 {
+    return governor_freq_mid();
+  }
+  return governor_freq_high();
+}
+
+// Boot-time self-test, the same discipline as eval_self_test above:
+// deterministic pure logic like this needs no live interactive input
+// to verify, unlike governor_apply's own real-hardware effect.
+fn governor_self_test(ready_count: i64, expected_mhz: i64) -> i64 {
+  let got: i64 = governor_desired_freq_mhz(ready_count);
+  let _ = uart_puts("GOVERNOR: ready_count=");
+  let _ = uart_put_i64(ready_count);
+  let _ = uart_puts(" -> ");
+  let _ = uart_put_i64(got);
+  let _ = uart_puts("MHz");
+  if got == expected_mhz {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL, expected ");
+    let _ = uart_put_i64(expected_mhz);
+    let _ = uart_puts(")\n");
+  }
+  return 0;
+}
+
+// Live governor step -- called from task_d (idle) below, deliberately
+// NOT from the timer tick/ISR path: governor_apply_freq_mhz's mailbox
+// round-trip is real hardware I/O with its own (bounded, but nonzero)
+// latency, and this project's whole architecture keeps anything like
+// that off the hard-RT dispatch path on purpose (see
+// DHRUVA_ARCHITECTURE.md §7 Phase 5: "never consulted for hard-RT
+// dispatch"). Tying it to idle specifically is a real, acknowledged
+// simplification, not a full production design: it means an upward
+// frequency step (system suddenly gets busy) only gets applied the
+// next time idle happens to run, not instantly -- acceptable for a
+// step-1 demonstration governor per the architecture doc's own
+// framing ("classical governor first"), less so for a tuned one.
+// hex (not decimal) output here on purpose: uart_put_i64 allocates
+// scratch space via dhruva_alloc_bytes, and task_d is #[no_heap] --
+// uart_put_hex32 doesn't, so it's what's actually available in this
+// context. Only prints on an actual level change, not every idle wake,
+// since governor_get_last_applied_mhz gives a cheap way to skip the
+// mailbox round-trip (and the log spam) entirely when nothing changed.
+fn governor_step() -> i64 {
+  let ready: i64 = scheduler_ready_count();
+  let desired: i64 = governor_desired_freq_mhz(ready);
+  let last: i64 = governor_get_last_applied_mhz();
+  if desired != last {
+    let status: i64 = governor_apply_freq_mhz(desired);
+    if status == 0 {
+      let _ = governor_set_last_applied_mhz(desired);
+    }
+    let _ = uart_puts("GOVERNOR: step ready=");
+    let _ = uart_put_hex32(ready as u32);
+    let _ = uart_puts(" desired_mhz=");
+    let _ = uart_put_hex32(desired as u32);
+    let _ = uart_puts(" apply_status=");
+    let _ = uart_put_hex32(status as u32);
+    let _ = uart_puts("\n");
+  }
+  return 0;
+}
+
 // Idle: always ready, lowest priority, never sleeps. Only ever runs
 // when HIGH/MEDIUM/LOW are all genuinely asleep at the same moment --
 // seeing "idle" in the log at all is a real, useful signal that the
 // scheduler correctly fell through every real task's readiness check
 // rather than a sign of anything wrong.
+//
+// Phase 5 task #1 -- "race to idle": the old body busy-waited via
+// delay()'s pure spin loop, burning cycles (and, on real hardware,
+// power) doing nothing between prints. cpu_wfi() actually halts
+// instruction fetch until the next interrupt (the 500ms timer tick, if
+// nothing else preempts sooner) instead of spinning -- the real
+// hardware benefit QEMU can't put a wattage number on (see
+// DHRUVA_ARCHITECTURE.md §7 Phase 5's own caveat), but the scheduling
+// behavior itself (idle genuinely blocking rather than burning a fixed
+// cycle count every pass) is real and observable here too.
 #[no_mangle]
 #[no_heap]
 #[bounded_stack(bytes=512)]
 fn task_d() -> i64 {
   while true {
     let _ = uart_puts("idle\n");
-    let _ = delay(500000);
+    let _ = governor_step();
+    let _ = cpu_wfi();
   }
   return 0;
 }
@@ -1971,6 +2084,18 @@ fn kernel_main() -> i64 {
   let _ = eval_self_test("100/3", 33, 0);
   let _ = eval_self_test("10/0", 0, 1);
   let _ = eval_self_test("(1+2", 0, 1);
+
+  // Phase 5 verification: governor_desired_freq_mhz's threshold
+  // boundaries, via boot-time self-test rather than live introspection
+  // (scheduler_ready_count() only means anything once start_multitasking
+  // has handed off, at the very end of this function -- deterministic
+  // logic like this needs no live task juggling to check).
+  let _ = governor_self_test(0, 250);
+  let _ = governor_self_test(1, 250);
+  let _ = governor_self_test(2, 450);
+  let _ = governor_self_test(3, 450);
+  let _ = governor_self_test(4, 700);
+  let _ = governor_self_test(5, 700);
 
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();

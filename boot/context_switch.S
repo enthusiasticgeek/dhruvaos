@@ -225,6 +225,59 @@ dhruva_prio_unlock:
     mov r1, #0
     bx lr
 
+/* Phase 5 task #1 -- i64 cpu_wfi(): halts instruction fetch until ANY
+ * exception is asserted (an IRQ, here -- the 500ms timer tick if
+ * nothing else), then resumes at the very next instruction once the
+ * interrupt has been taken and serviced, exactly as if it had never
+ * paused. Assembles as the ARMv6K hint-space encoding (confirmed via
+ * `arm-none-eabi-gcc -mcpu=arm1176jzf-s`'s own disassembly, e320f003 --
+ * not the older CP15 `MCR p15,0,Rd,c7,c0,4` sequence some ARMv6
+ * implementations need instead), which ARM1176JZF-S implements
+ * directly. The real point of this over the idle task's old busy-delay
+ * loop: real hardware stops clocking most of the pipeline while
+ * halted, which QEMU can't meaningfully validate the wattage of (see
+ * DHRUVA_ARCHITECTURE.md §7 Phase 5's own caveat about this), but the
+ * *scheduling* effect -- idle genuinely blocking instead of spinning
+ * until the next tick -- is real and observable under QEMU too. */
+.global cpu_wfi
+cpu_wfi:
+    wfi
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* i64 scheduler_ready_count() -- Phase 5's run-queue-depth signal for
+ * the governor: how many of the 6 tasks have sleep_until_table[i] <=
+ * the current tick_count (i.e. are actually ready right now), not
+ * counting idle (task_d, index 3, always ready by design -- see
+ * scheduler_pick_next's own comment on why idle must always qualify;
+ * counting it would make "ready_count" read as "at least 1" forever,
+ * useless as a load signal). Pure read-only introspection, safe to
+ * call from any context including an ISR: no state changes, no
+ * scheduling decision made here. */
+.global scheduler_ready_count
+scheduler_ready_count:
+    ldr r1, =tick_count
+    ldr r1, [r1]                   /* r1 = tick_count */
+    ldr r2, =sleep_until_table
+    mov r3, #0                     /* r3 = count */
+    mov r9, #0                     /* r9 = task index */
+srq_loop:
+    cmp r9, #6
+    bge srq_done
+    cmp r9, #3                     /* skip idle (index 3) -- see comment above */
+    beq srq_next
+    ldr r4, [r2, r9, lsl #2]       /* sleep_until[i] */
+    cmp r4, r1
+    addle r3, r3, #1               /* ready if sleep_until[i] <= tick_count */
+srq_next:
+    add r9, r9, #1
+    b srq_loop
+srq_done:
+    mov r0, r3
+    mov r1, #0
+    bx lr
+
 /* mut ref i64 task_{a,b,c,d}_init_stack(mut ref i64 stack_base, i64 stack_bytes)
  * Builds a fake initial context, shaped identically to what every
  * restore path above expects (spsr, pad, r0-r12, lr). spsr=0x13 (SVC
