@@ -2614,6 +2614,58 @@ fn dwc2_control_no_data(devaddr: u32, mps: u32) -> i64 {
   return 0;
 }
 
+// Generic SETUP packet builder -- every standard AND class-specific
+// request (GET_DESCRIPTOR, SET_ADDRESS, and the hub-class port
+// requests below) is just these five fields in the same 8-byte
+// layout; the standard-request builders above predate this one and
+// are kept as-is (each still correct, just less general) rather than
+// churning already-verified code for a cosmetic refactor.
+fn dwc2_build_setup(bm_request_type: u32, b_request: u32, w_value: u32, w_index: u32, w_length: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, bm_request_type);
+  let _ = buf_write_byte(dma, 1 as u32, b_request);
+  let _ = buf_write_byte(dma, 2 as u32, w_value & (0xFF as u32));
+  let _ = buf_write_byte(dma, 3 as u32, (w_value >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 4 as u32, w_index & (0xFF as u32));
+  let _ = buf_write_byte(dma, 5 as u32, (w_index >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 6 as u32, w_length & (0xFF as u32));
+  let _ = buf_write_byte(dma, 7 as u32, (w_length >> (8 as u32)) & (0xFF as u32));
+  return 0;
+}
+
+// USB 2.0 spec chapter 11 hub-class port feature selectors (the ones
+// this driver actually uses -- ports "power up" reset-disabled by
+// default, and PORT_RESET's own completion has to be observed via
+// the port's status/change bits rather than assumed from timing
+// alone, same "don't trust a bounded delay over a real status check
+// where one exists" reasoning as this project's own IPCP/scheduler
+// code, just applied to a hub port instead of a task).
+fn hub_feature_port_enable() -> u32 { return 1 as u32; }
+fn hub_feature_port_reset() -> u32 { return 4 as u32; }
+fn hub_feature_port_power() -> u32 { return 8 as u32; }
+fn hub_feature_c_port_connection() -> u32 { return 16 as u32; }
+fn hub_feature_c_port_reset() -> u32 { return 20 as u32; }
+
+// SET_PORT_FEATURE / CLEAR_PORT_FEATURE / GET_PORT_STATUS -- class-
+// specific (not standard) requests, recipient=OTHER (a port, not the
+// hub device itself): bmRequestType 0x23 for the two SET/CLEAR
+// (host-to-device, class, other) and 0xA3 for GET_PORT_STATUS
+// (device-to-host, class, other). `port` is 1-based per spec.
+fn dwc2_hub_set_port_feature(hub_addr: u32, hub_mps: u32, port: u32, feature: u32) -> i64 {
+  let _ = dwc2_build_setup(0x23 as u32, 3 as u32, feature, port, 0 as u32);
+  return dwc2_control_no_data(hub_addr, hub_mps);
+}
+fn dwc2_hub_clear_port_feature(hub_addr: u32, hub_mps: u32, port: u32, feature: u32) -> i64 {
+  let _ = dwc2_build_setup(0x23 as u32, 1 as u32, feature, port, 0 as u32);
+  return dwc2_control_no_data(hub_addr, hub_mps);
+}
+// out_buf must be at least 4 bytes: wPortStatus (bytes 0-1, LE),
+// wPortChange (bytes 2-3, LE).
+fn dwc2_hub_get_port_status(hub_addr: u32, hub_mps: u32, port: u32, out_buf: mut ref i64) -> i64 {
+  let _ = dwc2_build_setup(0xA3 as u32, 0 as u32, 0 as u32, port, 4 as u32);
+  return dwc2_control_in(hub_addr, hub_mps, 4 as u32, out_buf);
+}
+
 // Builds a standard SET_ADDRESS SETUP packet: bmRequestType=0x00
 // (host-to-device, standard, device), bRequest=5, wValue=new_addr,
 // wIndex=0, wLength=0. Per USB spec this request is always issued
@@ -2653,12 +2705,118 @@ fn dwc2_build_get_device_descriptor_setup(want_len: u32) -> i64 {
 }
 
 // The address every device answers at before the host assigns it a
-// real one, and the first real address this driver hands out --
-// exactly one device is ever attached to this single-port controller
-// in every configuration this project can actually test, so there's
-// no allocator needed for it yet.
-fn dwc2_new_device_addr() -> u32 {
+// real one. Two real addresses get handed out across this driver's
+// whole enumeration sequence -- 1 for whatever sits directly on the
+// DWC2 root port (raspi1ap's controller always has a synthetic root
+// hub there, confirmed live and byte-for-byte against QEMU's own
+// hw/usb/dev-hub.c), 2 for whatever's actually plugged into that
+// hub's first downstream port. No general allocator needed for more
+// than that yet -- this project's own QEMU testing never attaches
+// more than one real device at a time.
+fn dwc2_hub_addr() -> u32 {
   return 1 as u32;
+}
+fn dwc2_downstream_addr() -> u32 {
+  return 2 as u32;
+}
+fn dwc2_hub_port1() -> u32 {
+  return 1 as u32;
+}
+
+// Powers on and resets hub downstream port 1, then enumerates
+// whatever answers at address 0 behind it (a fresh, independent
+// per-device address space -- the hub itself already moved to
+// dwc2_hub_addr(), so address 0 unambiguously means "the downstream
+// device" from this point on: `usb_find_device`'s own address-0-first
+// lookup against the hub falls through to the hub class's recursive
+// `find_device` once the hub's own addr no longer matches, per QEMU's
+// hw/usb/core.c/bus.c -- confirmed by reading that dispatch chain
+// before assuming a control transfer "through" a hub would just work).
+// Mirrors dwc2_probe_device0's own root-port sequence closely on
+// purpose: same shape of problem (bring a port up, then enumerate
+// whatever answers at address 0 through it), just reached via hub
+// class requests (SET_PORT_FEATURE/GET_PORT_STATUS) instead of HPRT0's
+// raw register bits.
+fn dwc2_enumerate_downstream() -> i64 {
+  let hub_addr: u32 = dwc2_hub_addr();
+  let hub_mps: u32 = 8 as u32; // learned from dwc2_probe_device0's own hub descriptor fetch
+  let port: u32 = dwc2_hub_port1();
+
+  let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port, hub_feature_port_power());
+  let _ = delay(50000);
+  let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port, hub_feature_port_reset());
+  let _ = delay(50000);
+
+  let status_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let status_result: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
+  if status_result != 0 {
+    let _ = uart_puts("USB: hub GET_PORT_STATUS failed\n");
+    return 0 - 1;
+  }
+  let port_status_lo: u32 = buf_read_byte(status_buf, 0 as u32);
+  let port_status_hi: u32 = buf_read_byte(status_buf, 1 as u32);
+  let port_status: u32 = port_status_lo | (port_status_hi << (8 as u32));
+  let _ = uart_puts("USB: hub port1 status=");
+  let _ = uart_put_hex32(port_status);
+  let _ = uart_puts("\n");
+
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port, hub_feature_c_port_reset());
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port, hub_feature_c_port_connection());
+
+  // PORT_CONNECTION=bit0, PORT_ENABLE=bit1.
+  if (port_status & (0x3 as u32)) != (0x3 as u32) {
+    let _ = uart_puts("USB: no downstream device (port not connected+enabled)\n");
+    return 0 - 1;
+  }
+
+  let ddesc8: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
+  let dstatus0: i64 = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, ddesc8);
+  if dstatus0 != 0 {
+    let _ = uart_puts("USB: downstream GET_DESCRIPTOR(Device) failed\n");
+    return 0 - 1;
+  }
+  let dmps0: u32 = buf_read_byte(ddesc8, 7 as u32);
+
+  let downstream_addr: u32 = dwc2_downstream_addr();
+  let _ = dwc2_build_set_address_setup(downstream_addr);
+  let daddr_status: i64 = dwc2_control_no_data(0 as u32, dmps0);
+  if daddr_status != 0 {
+    let _ = uart_puts("USB: downstream SET_ADDRESS failed\n");
+    return 0 - 1;
+  }
+  let _ = delay(50000);
+
+  let ddesc18: mut ref i64 = dhruva_alloc_bytes(18);
+  let _ = dwc2_build_get_device_descriptor_setup(18 as u32);
+  let dstatus1: i64 = dwc2_control_in(downstream_addr, dmps0, 18 as u32, ddesc18);
+  if dstatus1 != 0 {
+    let _ = uart_puts("USB: downstream GET_DESCRIPTOR(Device) at new address failed\n");
+    return 0 - 1;
+  }
+  let dblength: u32 = buf_read_byte(ddesc18, 0 as u32);
+  let dbdesctype: u32 = buf_read_byte(ddesc18, 1 as u32);
+  let dvendor_lo: u32 = buf_read_byte(ddesc18, 8 as u32);
+  let dvendor_hi: u32 = buf_read_byte(ddesc18, 9 as u32);
+  let dproduct_lo: u32 = buf_read_byte(ddesc18, 10 as u32);
+  let dproduct_hi: u32 = buf_read_byte(ddesc18, 11 as u32);
+  let d_id_vendor: u32 = dvendor_lo | (dvendor_hi << (8 as u32));
+  let d_id_product: u32 = dproduct_lo | (dproduct_hi << (8 as u32));
+
+  let _ = uart_puts("USB: enumerated downstream device addr=");
+  let _ = uart_put_hex32(downstream_addr);
+  let _ = uart_puts(" bMaxPacketSize0=");
+  let _ = uart_put_hex32(dmps0);
+  let _ = uart_puts(" idVendor=");
+  let _ = uart_put_hex32(d_id_vendor);
+  let _ = uart_puts(" idProduct=");
+  let _ = uart_put_hex32(d_id_product);
+  if (dblength == (18 as u32)) && (dbdesctype == (1 as u32)) {
+    let _ = uart_puts(" (PASS)\n");
+    return 0;
+  }
+  let _ = uart_puts(" (FAIL, bad bLength/bDescriptorType)\n");
+  return 0 - 1;
 }
 
 // First real enumeration milestone: fetch the first 8 bytes of device
@@ -2693,7 +2851,7 @@ fn dwc2_probe_device0() -> i64 {
     return 0 - 1;
   }
 
-  let new_addr: u32 = dwc2_new_device_addr();
+  let new_addr: u32 = dwc2_hub_addr();
   let _ = dwc2_build_set_address_setup(new_addr);
   let addr_status: i64 = dwc2_control_no_data(0 as u32, mps0);
   if addr_status != 0 {
@@ -2731,12 +2889,12 @@ fn dwc2_probe_device0() -> i64 {
   let _ = uart_put_hex32(id_vendor);
   let _ = uart_puts(" idProduct=");
   let _ = uart_put_hex32(id_product);
-  if (blength1 == (18 as u32)) && (bdesctype1 == (1 as u32)) {
-    let _ = uart_puts(" (PASS)\n");
-    return 0;
+  if (blength1 != (18 as u32)) || (bdesctype1 != (1 as u32)) {
+    let _ = uart_puts(" (FAIL, bad bLength/bDescriptorType after SET_ADDRESS)\n");
+    return 0 - 1;
   }
-  let _ = uart_puts(" (FAIL, bad bLength/bDescriptorType after SET_ADDRESS)\n");
-  return 0 - 1;
+  let _ = uart_puts(" (PASS)\n");
+  return dwc2_enumerate_downstream();
 }
 
 // Phase 2 priority-inversion demo. All three tasks share one mutex
