@@ -3342,8 +3342,47 @@ fn dwc2_wait_chan0_done() -> u32 {
 // dwc2_dma_scratch) requests, copying the result into `out_buf`
 // (caller-owned, at least `want_len` bytes). Returns 0 on success, -1
 // on any stage failing to complete (channel-halt error bits set, or a
-// poll timeout).
+// poll timeout), or on either of the two bad-input cases guarded
+// below.
+//
+// BUG (round 3 audit, 2026-08-27), two findings, both here:
+//
+// 1. The data stage below programs HCDMA to point straight at
+// dwc2_dma_scratch and HCTSIZ's xfersize to `want_len` -- the DWC2
+// controller then DMAs that many bytes into dwc2_dma_scratch directly
+// in hardware, with nothing on this function's own side checking
+// `want_len` against that buffer's actual, fixed 64-byte capacity
+// (see scratch_state.S). Every call site today only ever asks for
+// 4, 8, or 18 bytes, so this hasn't been hit live, but it's the exact
+// same shape of bug rounds 1 and 2 both found and fixed elsewhere
+// (netif_recv_frame, socket_udp_recv, tcp_conn_handle_segment, the FS
+// layer) -- a length used as a hardware DMA/copy bound with no check
+// against the destination's real size -- just with the DMA engine as
+// the "writer" instead of a software loop this time. Worth closing
+// now rather than after DHRUVA_ARCHITECTURE.md's own planned next
+// step (real LAN9512/WiFi/BLE class drivers) adds a config-descriptor
+// read whose length comes from the device's own reported wTotalLength
+// and quietly exceeds 64.
+//
+// 2. `mps` is used below as a divisor when computing pktcnt for the
+// data stage. Every real call site passes either a fixed 8 (the
+// spec-guaranteed-safe default before a device's own MPS is known) or
+// `mps0`/`dmps0` -- bMaxPacketSize0 read straight out of a device's
+// own descriptor response, i.e. attacker/device-controlled data. A
+// misbehaving or malicious device reporting bMaxPacketSize0=0 would
+// divide by zero the moment this driver tried its next control
+// transfer to that device (the 18-byte full-descriptor re-fetch,
+// concretely) -- the exact same "validate untrusted external data
+// before using it in an operation that can crash/hang" lesson as
+// eval_apply's own division-by-zero guard, just with a USB device
+// standing in for shell input this time.
 fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) -> i64 {
+  if mps == (0 as u32) {
+    return 0 - 1;
+  }
+  if want_len > (64 as u32) {
+    return 0 - 1;
+  }
   let dma: mut ref i64 = dwc2_dma_scratch_get();
   let hcchar0: i64 = dwc2_hcchar0_addr();
   let hctsiz0: i64 = dwc2_hctsiz0_addr();
