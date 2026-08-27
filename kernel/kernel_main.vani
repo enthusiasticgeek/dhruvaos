@@ -115,6 +115,25 @@ extern "C" fn arp_cache_set_next_slot(slot: u32) -> u32;
 extern "C" fn arp_cache_get_ip(index: u32) -> u32;
 extern "C" fn arp_cache_set_ip(index: u32, value: u32) -> u32;
 
+// Phase 6 (boot/tcp_state.S): two-slot persistent TCP connection
+// state -- see that file's own comment for why two slots (a real
+// handshake/data/close cycle needs both sides tracked independently
+// in this single-threaded, no-second-task-available environment).
+extern "C" fn tcp_conn_get_state(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_state(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_local_seq(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_local_seq(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_remote_seq(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_remote_seq(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_local_port(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_local_port(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_remote_port(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_remote_port(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_local_ip(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_local_ip(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_remote_ip(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_remote_ip(conn_id: u32, value: u32) -> u32;
+
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
 // addressing mode sdhost_init() discovers, across the vani-call-
 // boundary gap kernel_main.vani's own header explains -- no top-level
@@ -2434,6 +2453,315 @@ fn tcp_self_test() -> i64 {
   return 0;
 }
 
+// Phase 6 continued: the stateful TCP connection state machine --
+// three-way handshake, data transfer, and a simplified close, closing
+// out DHRUVA_ARCHITECTURE.md §4's "small socket-style API" for TCP.
+//
+// Deliberately event-driven (one segment in, one reaction out) rather
+// than a blocking `tcp_connect()` that internally loops waiting for a
+// response: this is a single-threaded environment with no second task
+// available to run "the other side" concurrently while a blocking
+// call waits, the same reasoning arp_self_test's own design already
+// reflects (it never actually blocks on a real request/reply round
+// trip either). The self-test below plays traffic cop, manually
+// handing each side's own outgoing segment to the OTHER side's
+// tcp_conn_handle_segment call -- two independent connection slots
+// (boot/tcp_state.S), not one, so both a real "active open" client
+// role and a real "passive open" server role can be tracked
+// simultaneously.
+//
+// Deliberately NOT implemented, matching this phase's own "scoped
+// like uIP/picoTCP, not full lwIP feature parity" framing: no
+// retransmission timers (this stack never drops/reorders its own
+// loopback traffic, so nothing here would ever exercise one), no
+// simultaneous-open/simultaneous-close edge cases, no window-size
+// enforcement (window is always advertised as the maximum and never
+// actually consulted), no urgent-pointer handling. A real, useful,
+// correctly-sequenced happy-path connection lifecycle, not a
+// spec-complete implementation.
+
+fn tcp_state_closed() -> u32 { return 0 as u32; }
+fn tcp_state_syn_sent() -> u32 { return 1 as u32; }
+fn tcp_state_syn_rcvd() -> u32 { return 2 as u32; }
+fn tcp_state_established() -> u32 { return 3 as u32; }
+fn tcp_state_fin_wait() -> u32 { return 4 as u32; }
+fn tcp_state_closed_final() -> u32 { return 5 as u32; }
+
+// Active open (the connecting/"client" side): records connection
+// identity, picks an initial sequence number, and sends the opening
+// SYN. Conn moves to SYN_SENT; the handshake only completes once the
+// caller feeds a matching SYN-ACK segment into tcp_conn_handle_segment.
+fn tcp_conn_active_open(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, local_ip: u32, remote_ip: u32, local_port: u32, remote_port: u32, initial_seq: u32) -> i64 {
+  let _ = tcp_conn_set_local_ip(conn_id, local_ip);
+  let _ = tcp_conn_set_remote_ip(conn_id, remote_ip);
+  let _ = tcp_conn_set_local_port(conn_id, local_port);
+  let _ = tcp_conn_set_remote_port(conn_id, remote_port);
+  let _ = tcp_conn_set_local_seq(conn_id, initial_seq);
+  let _ = tcp_conn_set_remote_seq(conn_id, 0 as u32);
+  let _ = tcp_conn_set_state(conn_id, tcp_state_syn_sent());
+  let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+  return tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, initial_seq, 0 as u32, tcp_flag_syn(), 65535 as u32, empty_payload, 0);
+}
+
+// Passive open (the listening/"server" side): records only the local
+// identity it's willing to accept a connection on -- remote identity
+// and sequence numbers get filled in once tcp_conn_handle_segment sees
+// the actual incoming SYN. Conn stays CLOSED until then (there's no
+// separate LISTEN state in this minimal scope; a CLOSED connection
+// with local_port already set is what handle_segment treats as
+// "willing to accept").
+fn tcp_conn_passive_open(conn_id: u32, local_ip: u32, local_port: u32) -> i64 {
+  let _ = tcp_conn_set_local_ip(conn_id, local_ip);
+  let _ = tcp_conn_set_local_port(conn_id, local_port);
+  let _ = tcp_conn_set_state(conn_id, tcp_state_closed());
+  return 0;
+}
+
+// The core state-machine step: given one already-received TCP segment
+// (frame, with its IPv4/Ethernet headers still in place at their
+// usual fixed offsets) addressed to this connection, takes whatever
+// single reaction the current state calls for -- sending at most one
+// reply segment via my_mac/dst_mac -- and returns:
+//   >= 0  a data segment was accepted; return value is the payload
+//         length copied into out_payload (0 for a control-only
+//         segment with no data, which is the common case)
+//   -1    the segment didn't match anything this state expects
+//         (silently ignored, matching a real TCP's own tolerance of
+//         duplicate/out-of-order segments in a scope this minimal
+//         implementation doesn't attempt to handle)
+fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, my_mac: mut ref i64, dst_mac: mut ref i64, out_payload: mut ref i64) -> i64 {
+  let state: u32 = tcp_conn_get_state(conn_id);
+  let flags: u32 = tcp_get_flags(frame, 34);
+  let seg_seq: u32 = tcp_get_seq(frame, 34);
+  let seg_ack: u32 = tcp_get_ack(frame, 34);
+  let local_ip: u32 = tcp_conn_get_local_ip(conn_id);
+  let local_port: u32 = tcp_conn_get_local_port(conn_id);
+
+  let has_syn: i64 = 0;
+  if (flags & tcp_flag_syn()) != (0 as u32) { has_syn = 1; }
+  let has_ack: i64 = 0;
+  if (flags & tcp_flag_ack()) != (0 as u32) { has_ack = 1; }
+  let has_fin: i64 = 0;
+  if (flags & tcp_flag_fin()) != (0 as u32) { has_fin = 1; }
+  let has_psh: i64 = 0;
+  if (flags & tcp_flag_psh()) != (0 as u32) { has_psh = 1; }
+
+  // Passive open, first SYN arriving: only reachable from CLOSED with
+  // a local_port already configured by tcp_conn_passive_open.
+  if (state == tcp_state_closed()) && (has_syn == 1) && (tcp_get_dst_port(frame, 34) == local_port) {
+    let _ = tcp_conn_set_remote_ip(conn_id, ipv4_get_src_ip(frame, 14));
+    let _ = tcp_conn_set_remote_port(conn_id, tcp_get_src_port(frame, 34));
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32)); // SYN consumes one seq number
+    let server_isn: u32 = 5000 as u32;
+    let _ = tcp_conn_set_local_seq(conn_id, server_isn);
+    let _ = tcp_conn_set_state(conn_id, tcp_state_syn_rcvd());
+    let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), server_isn, tcp_conn_get_remote_seq(conn_id), tcp_flag_syn() | tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+    return 0;
+  }
+
+  // Active-open side receiving the SYN-ACK: completes with our own
+  // final ACK, moving straight to ESTABLISHED (this side never
+  // actually waits in a separate "just sent the final ACK" state --
+  // once it's sent, the handshake is done from this side's view).
+  if (state == tcp_state_syn_sent()) && (has_syn == 1) && (has_ack == 1) && (seg_ack == (tcp_conn_get_local_seq(conn_id) + (1 as u32))) {
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
+    let new_local_seq: u32 = tcp_conn_get_local_seq(conn_id) + (1 as u32); // our own SYN consumed one
+    let _ = tcp_conn_set_local_seq(conn_id, new_local_seq);
+    let _ = tcp_conn_set_state(conn_id, tcp_state_established());
+    let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), new_local_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+    return 0;
+  }
+
+  // Passive-open side receiving the final ACK of the handshake.
+  if (state == tcp_state_syn_rcvd()) && (has_ack == 1) && (seg_ack == (tcp_conn_get_local_seq(conn_id) + (1 as u32))) {
+    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32));
+    let _ = tcp_conn_set_state(conn_id, tcp_state_established());
+    return 0;
+  }
+
+  // Established, a data segment arrives in order: copy the payload
+  // out, advance what we expect next, and acknowledge it.
+  if (state == tcp_state_established()) && (has_psh == 1) && (seg_seq == tcp_conn_get_remote_seq(conn_id)) {
+    let tcp_len: i64 = ipv4_get_total_len(frame, 14) as i64 - 20;
+    let data_offset: i64 = tcp_get_data_offset_bytes(frame, 34);
+    let payload_len: i64 = tcp_len - data_offset;
+    let i: i64 = 0;
+    while i < payload_len {
+      let b: u32 = buf_read_byte(frame, (34 + data_offset + i) as u32);
+      let _ = buf_write_byte(out_payload, i as u32, b);
+      i = i + 1;
+    }
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (payload_len as u32));
+    let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+    return payload_len;
+  }
+
+  // Established, a pure ACK for data we sent: nothing to do in this
+  // minimal, no-retransmission-tracking scope.
+  if (state == tcp_state_established()) && (has_ack == 1) && (has_fin == 0) && (has_psh == 0) && (has_syn == 0) {
+    return 0;
+  }
+
+  // Established, the peer starts closing: this side has nothing more
+  // to send either, so it piggybacks its own FIN onto the ACK
+  // (a real, legitimate simplified-close shape, not a shortcut this
+  // implementation invented) and moves to FIN_WAIT for the final ACK.
+  if (state == tcp_state_established()) && (has_fin == 1) {
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32)); // FIN consumes one seq number
+    let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait());
+    let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack() | tcp_flag_fin(), 65535 as u32, empty_payload, 0);
+    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // our own FIN
+    return 0;
+  }
+
+  // The initiating closer receiving the peer's response to its own
+  // FIN. BUG (found live, via the self-test's own final ACK never
+  // showing up in the loopback queue): the peer's response here is
+  // the SAME simplified-close shape this side's own ESTABLISHED/FIN
+  // branch above produces when IT'S the one responding to a FIN --
+  // a single segment carrying BOTH the ACK of this side's FIN AND the
+  // peer's own piggybacked closing FIN, not just a bare ACK. The
+  // first version of this branch checked only has_ack and moved
+  // straight to CLOSED_FINAL, silently never acknowledging the peer's
+  // own FIN bit riding along in that same segment -- the peer was
+  // then left waiting forever in FIN_WAIT for an ACK that this side
+  // never sends. Fixed: if the peer's FIN bit is ALSO set here, send
+  // that ACK before considering the connection closed.
+  if (state == tcp_state_fin_wait()) && (has_ack == 1) {
+    if has_fin == 1 {
+      let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
+      let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+      let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+    }
+    let _ = tcp_conn_set_state(conn_id, tcp_state_closed_final());
+    return 0;
+  }
+
+  return 0 - 1;
+}
+
+// Sends one data segment on an ESTABLISHED connection. No
+// retransmission tracking in this minimal scope (see this section's
+// own header comment) -- local_seq advances immediately rather than
+// waiting for the peer's ACK to confirm it.
+fn tcp_conn_send_data(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, payload: mut ref i64, payload_len: i64) -> i64 {
+  let status: i64 = tcp_send_segment(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_psh() | tcp_flag_ack(), 65535 as u32, payload, payload_len);
+  let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (payload_len as u32));
+  return status;
+}
+
+// Starts closing an ESTABLISHED connection from this side: sends FIN,
+// moves to FIN_WAIT. Teardown completes once the caller feeds the
+// peer's own FIN+ACK (or separate FIN) back into
+// tcp_conn_handle_segment and it in turn produces the final ACK this
+// side is waiting for.
+fn tcp_conn_close(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
+  let empty_payload: mut ref i64 = dhruva_alloc_bytes(1);
+  let status: i64 = tcp_send_segment(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_fin() | tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+  let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // FIN consumes one
+  let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait());
+  return status;
+}
+
+// Boot-time self-test: a complete, real connection lifecycle --
+// three-way handshake, one data transfer each direction... actually
+// one direction (client-to-server) is enough to prove the data path
+// end to end -- and a full close, driven entirely by this function
+// acting as traffic cop between connection slot 0 (client/active
+// open) and slot 1 (server/passive open), exactly as this section's
+// own header comment describes.
+fn tcp_conn_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let client_id: u32 = 0 as u32;
+  let server_id: u32 = 1 as u32;
+  let client_ip: u32 = 0xC0A80101 as u32;
+  let server_ip: u32 = 0xC0A80102 as u32;
+  let client_port: u32 = 54321 as u32;
+  let server_port: u32 = 7 as u32;
+
+  let _ = tcp_conn_passive_open(server_id, server_ip, server_port);
+  let _ = tcp_conn_active_open(client_id, my_mac, my_mac, client_ip, server_ip, client_port, server_port, 1000 as u32);
+
+  // Handshake: client's SYN -> server; server's SYN-ACK -> client;
+  // client's final ACK -> server.
+  let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let f1: mut ref i64 = dhruva_alloc_bytes(64);
+  let l1: i64 = netif_recv_frame(f1); // client's SYN
+  let s1: i64 = tcp_conn_handle_segment(server_id, f1, my_mac, my_mac, scratch);
+  if (l1 <= 0) || (s1 != 0) { ok = 0; }
+
+  let f2: mut ref i64 = dhruva_alloc_bytes(64);
+  let l2: i64 = netif_recv_frame(f2); // server's SYN-ACK
+  let s2: i64 = tcp_conn_handle_segment(client_id, f2, my_mac, my_mac, scratch);
+  if (l2 <= 0) || (s2 != 0) { ok = 0; }
+
+  let f3: mut ref i64 = dhruva_alloc_bytes(64);
+  let l3: i64 = netif_recv_frame(f3); // client's final ACK
+  let s3: i64 = tcp_conn_handle_segment(server_id, f3, my_mac, my_mac, scratch);
+  if (l3 <= 0) || (s3 != 0) { ok = 0; }
+
+  if tcp_conn_get_state(client_id) != tcp_state_established() { ok = 0; }
+  if tcp_conn_get_state(server_id) != tcp_state_established() { ok = 0; }
+
+  // Data transfer: client sends "hi", server receives + ACKs it.
+  let payload: mut ref i64 = dhruva_alloc_bytes(2);
+  let _ = buf_write_byte(payload, 0 as u32, 104 as u32); // 'h'
+  let _ = buf_write_byte(payload, 1 as u32, 105 as u32); // 'i'
+  let send_status: i64 = tcp_conn_send_data(client_id, my_mac, my_mac, payload, 2);
+  if send_status != 0 { ok = 0; }
+
+  let f4: mut ref i64 = dhruva_alloc_bytes(64);
+  let l4: i64 = netif_recv_frame(f4); // client's data segment
+  let recv_payload: mut ref i64 = dhruva_alloc_bytes(2);
+  let recv_len: i64 = tcp_conn_handle_segment(server_id, f4, my_mac, my_mac, recv_payload);
+  if (l4 <= 0) || (recv_len != 2) { ok = 0; }
+  if (buf_read_byte(recv_payload, 0 as u32) != (104 as u32)) || (buf_read_byte(recv_payload, 1 as u32) != (105 as u32)) {
+    ok = 0;
+  }
+
+  let f5: mut ref i64 = dhruva_alloc_bytes(64);
+  let l5: i64 = netif_recv_frame(f5); // server's ACK of the data
+  let s5: i64 = tcp_conn_handle_segment(client_id, f5, my_mac, my_mac, scratch);
+  if (l5 <= 0) || (s5 != 0) { ok = 0; }
+
+  // Close: client sends FIN+ACK; server piggybacks its own FIN onto
+  // the ACK; client sends the final ACK.
+  let close_status: i64 = tcp_conn_close(client_id, my_mac, my_mac);
+  if close_status != 0 { ok = 0; }
+
+  let f6: mut ref i64 = dhruva_alloc_bytes(64);
+  let l6: i64 = netif_recv_frame(f6); // client's FIN+ACK
+  let s6: i64 = tcp_conn_handle_segment(server_id, f6, my_mac, my_mac, scratch);
+  if (l6 <= 0) || (s6 != 0) { ok = 0; }
+  if tcp_conn_get_state(server_id) != tcp_state_fin_wait() { ok = 0; }
+
+  let f7: mut ref i64 = dhruva_alloc_bytes(64);
+  let l7: i64 = netif_recv_frame(f7); // server's FIN+ACK (piggybacked)
+  let s7: i64 = tcp_conn_handle_segment(client_id, f7, my_mac, my_mac, scratch);
+  if (l7 <= 0) || (s7 != 0) { ok = 0; }
+  if tcp_conn_get_state(client_id) != tcp_state_closed_final() { ok = 0; }
+
+  let f8: mut ref i64 = dhruva_alloc_bytes(64);
+  let l8: i64 = netif_recv_frame(f8); // client's final ACK
+  let s8: i64 = tcp_conn_handle_segment(server_id, f8, my_mac, my_mac, scratch);
+  if (l8 <= 0) || (s8 != 0) { ok = 0; }
+  if tcp_conn_get_state(server_id) != tcp_state_closed_final() { ok = 0; }
+
+  let _ = uart_puts("TCP: connection lifecycle (handshake + data + close)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Phase 6 continued: DWC2 USB host controller bring-up (BCM2835's real
 // on-chip USB silicon -- the Pi 1 Model B has no native Ethernet, so
 // DHRUVA_ARCHITECTURE.md's whole "real networking" path runs through
@@ -4160,6 +4488,7 @@ fn kernel_main() -> i64 {
   let _ = ipv4_self_test();
   let _ = udp_self_test();
   let _ = tcp_self_test();
+  let _ = tcp_conn_self_test();
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device
