@@ -57,6 +57,12 @@ extern "C" fn net_send_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn net_send_scratch_get() -> mut ref i64;
 extern "C" fn net_recv_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn net_recv_scratch_get() -> mut ref i64;
+extern "C" fn dhcp_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dhcp_payload_scratch_get() -> mut ref i64;
+extern "C" fn dhcp_frame_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dhcp_frame_scratch_get() -> mut ref i64;
+extern "C" fn dhcp_bcast_mac_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dhcp_bcast_mac_scratch_get() -> mut ref i64;
 extern "C" fn ptr_to_u32(p: mut ref i64) -> u32;
 extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
@@ -139,6 +145,20 @@ extern "C" fn tcp_conn_get_local_ip(conn_id: u32) -> u32;
 extern "C" fn tcp_conn_set_local_ip(conn_id: u32, value: u32) -> u32;
 extern "C" fn tcp_conn_get_remote_ip(conn_id: u32) -> u32;
 extern "C" fn tcp_conn_set_remote_ip(conn_id: u32, value: u32) -> u32;
+
+// Phase 6 continued (boot/dhcp_state.S): the DHCP client's own
+// persistent state -- same vani-call-boundary gap as every other
+// stateful layer in this file, see that file's own header comment.
+extern "C" fn dhcp_state_get_client_state() -> u32;
+extern "C" fn dhcp_state_set_client_state(value: u32) -> u32;
+extern "C" fn dhcp_state_get_xid() -> u32;
+extern "C" fn dhcp_state_set_xid(value: u32) -> u32;
+extern "C" fn dhcp_state_get_offered_ip() -> u32;
+extern "C" fn dhcp_state_set_offered_ip(value: u32) -> u32;
+extern "C" fn dhcp_state_get_server_ip() -> u32;
+extern "C" fn dhcp_state_set_server_ip(value: u32) -> u32;
+extern "C" fn dhcp_state_get_leased_ip() -> u32;
+extern "C" fn dhcp_state_set_leased_ip(value: u32) -> u32;
 
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
 // addressing mode sdhost_init() discovers, across the vani-call-
@@ -2168,7 +2188,23 @@ fn ipv4_verify_checksum(frame: mut ref i64, ip_offset: i64) -> i64 {
 // function (and udp_send/tcp_send_segment right after it) is the
 // actual network SEND path, callable many times over a real session,
 // not just from a boot self-test.
+// BUG (round 9 audit, 2026-08-27): payload_len used to feed straight
+// into the copy loop below with no check against net_send_scratch's
+// real 512-byte capacity -- netif_send_frame's own `frame_len > 512`
+// check runs AFTER this function has already built (and, for an
+// oversized payload_len, already overrun) the frame in net_send_
+// scratch, so it catches the problem one step too late to actually
+// prevent it. Every caller today passes a small, trusted payload_len,
+// so not live-hit, but this is the send-side twin of the exact bug
+// round 1 already fixed on the receive side (socket_udp_recv/
+// tcp_conn_handle_segment trusting a length without checking
+// destination capacity) -- worth closing before any future socket-API
+// consumer (an echo server turning a received payload_len around into
+// a send call, a DHCP client, etc.) can trip it.
 fn ipv4_send(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, protocol: u32, payload: mut ref i64, payload_len: i64) -> i64 {
+  if (payload_len < 0) || (payload_len > 478) { // 512 - 34 (Ethernet+IP headers)
+    return 0 - 1;
+  }
   let frame: mut ref i64 = net_send_scratch_get();
   let i: i64 = 0;
   while i < 6 {
@@ -2350,7 +2386,15 @@ fn udp_get_length(frame: mut ref i64, udp_offset: i64) -> u32 {
 // Builds and sends a full Ethernet+IPv4+UDP frame. Offsets are fixed
 // (14 for IP, 34 for UDP) since this stack never sends IP options.
 // `frame` is net_send_scratch -- see ipv4_send's own comment above.
+//
+// BUG (round 9 audit, 2026-08-27): same send-side missing-bounds-check
+// shape as ipv4_send's own fix above, one layer higher -- payload_len
+// fed udp_build's copy loop with nothing checking it against net_send_
+// scratch's real 512-byte capacity first.
 fn udp_send(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, payload: mut ref i64, payload_len: i64) -> i64 {
+  if (payload_len < 0) || (payload_len > 470) { // 512 - 34 (Eth+IP) - 8 (UDP header)
+    return 0 - 1;
+  }
   let frame: mut ref i64 = net_send_scratch_get();
   let i: i64 = 0;
   while i < 6 {
@@ -2770,7 +2814,15 @@ fn tcp_verify_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, tcp_offset:
 // Builds a full Ethernet+IPv4+TCP segment and sends it via netif.
 // Fixed offsets (14 for IP, 34 for TCP) since this stack never sends
 // IP options, matching udp_send's own layout exactly.
+//
+// BUG (round 9 audit, 2026-08-27): same send-side missing-bounds-check
+// shape as ipv4_send/udp_send's own fixes -- payload_len fed tcp_build_
+// header's copy loop with nothing checking it against net_send_
+// scratch's real 512-byte capacity first.
 fn tcp_send_segment(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32, payload: mut ref i64, payload_len: i64) -> i64 {
+  if (payload_len < 0) || (payload_len > 458) { // 512 - 34 (Eth+IP) - 20 (TCP header)
+    return 0 - 1;
+  }
   let frame: mut ref i64 = net_send_scratch_get();
   let i: i64 = 0;
   while i < 6 {
@@ -3267,6 +3319,469 @@ fn tcp_conn_recv_bounds_self_test() -> i64 {
   }
 
   let _ = uart_puts("TCP: handle_segment rejects a length field past what was actually received");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Phase 6 continued: DHCP (RFC 2131), a minimal client -- DISCOVER ->
+// OFFER -> REQUEST -> ACK, sitting on socket_udp_send/udp_send exactly
+// like TCP sits on ipv4_build_header, no new transport of its own.
+// Only the client side exists (no server): this stack has no need to
+// hand out addresses to anyone.
+//
+// Message layout (RFC 2131 s2, offsets relative to dhcp_offset, the
+// start of the UDP payload):
+//   0 op(1, 1=BOOTREQUEST/2=BOOTREPLY)  1 htype(1)  2 hlen(1)  3 hops(1)
+//   4-7 xid(4)  8-9 secs(2)  10-11 flags(2, 0x8000=broadcast)
+//   12-15 ciaddr(4)  16-19 yiaddr(4)  20-23 siaddr(4)  24-27 giaddr(4)
+//   28-43 chaddr(16, only the first 6 bytes -- an Ethernet MAC -- ever
+//         used here)  44-107 sname(64, unused)  108-235 file(128, unused)
+//   236-239 magic cookie (99.130.83.99, fixed)
+//   240+ options: TLV (code(1) len(1) data(len)), 0=Pad (no length
+//         byte), 255=End. This client only ever sends/reads option 53
+//         (DHCP Message Type, 1 byte), 50 (Requested IP Address, 4
+//         bytes), and 54 (Server Identifier, 4 bytes) -- the minimum
+//         RFC 2131 s4.3.2 requires for the SELECTING->REQUESTING step.
+//
+// Client ports are fixed by the protocol, not negotiated: 68 (client)
+// and 67 (server). DISCOVER/REQUEST always go out from 0.0.0.0 (no
+// address yet) to 255.255.255.255 at the Ethernet broadcast address
+// (the server's real MAC isn't known until an OFFER names an IP, and
+// this client has no ARP-before-we-have-an-IP path anyway) -- exactly
+// what RFC 2131 requires before an address is bound, not a loopback-
+// only shortcut.
+fn dhcp_op_bootrequest() -> u32 { return 1 as u32; }
+fn dhcp_op_bootreply() -> u32 { return 2 as u32; }
+fn dhcp_htype_ethernet() -> u32 { return 1 as u32; }
+fn dhcp_hlen_ethernet() -> u32 { return 6 as u32; }
+fn dhcp_msgtype_discover() -> u32 { return 1 as u32; }
+fn dhcp_msgtype_offer() -> u32 { return 2 as u32; }
+fn dhcp_msgtype_request() -> u32 { return 3 as u32; }
+fn dhcp_msgtype_ack() -> u32 { return 5 as u32; }
+fn dhcp_msgtype_nak() -> u32 { return 6 as u32; }
+fn dhcp_state_init() -> u32 { return 0 as u32; }
+fn dhcp_state_selecting() -> u32 { return 1 as u32; }
+fn dhcp_state_requesting() -> u32 { return 2 as u32; }
+fn dhcp_state_bound() -> u32 { return 3 as u32; }
+fn dhcp_client_port() -> u32 { return 68 as u32; }
+fn dhcp_server_port() -> u32 { return 67 as u32; }
+
+// Zero-fills buf[offset..offset+count) -- vani has no memset builtin
+// (every buffer-clearing loop in this project writes byte by byte;
+// see e.g. fs_compact's own copy loops), needed here for chaddr's
+// padding and the sname/file fields every message carries but this
+// client never uses.
+fn dhcp_zero_range(buf: mut ref i64, offset: i64, count: i64) -> i64 {
+  let i: i64 = 0;
+  while i < count {
+    let _ = buf_write_byte(buf, (offset + i) as u32, 0 as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Writes the 240-byte fixed BOOTP header + magic cookie every DHCP
+// message shares, at buf[dhcp_offset..). Shared by both the client's
+// own DISCOVER/REQUEST builders (op=BOOTREQUEST, yiaddr/siaddr=0) and
+// the self-test's synthetic OFFER/ACK builders (op=BOOTREPLY,
+// yiaddr/siaddr set) -- one function, not duplicated per message type,
+// since the only real difference between them is which fields are
+// zero. Returns 240, the offset where type-specific options begin.
+fn dhcp_build_fixed_header(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, op: u32, ciaddr: u32, yiaddr: u32, siaddr: u32) -> i64 {
+  let _ = buf_write_byte(buf, dhcp_offset as u32, op);
+  let _ = buf_write_byte(buf, (dhcp_offset + 1) as u32, dhcp_htype_ethernet());
+  let _ = buf_write_byte(buf, (dhcp_offset + 2) as u32, dhcp_hlen_ethernet());
+  let _ = buf_write_byte(buf, (dhcp_offset + 3) as u32, 0 as u32); // hops
+  let _ = buf_write_u32_be(buf, dhcp_offset + 4, xid);
+  let _ = buf_write_u16_be(buf, dhcp_offset + 8, 0 as u32); // secs
+  let _ = buf_write_u16_be(buf, dhcp_offset + 10, 0x8000 as u32); // flags: broadcast
+  let _ = buf_write_u32_be(buf, dhcp_offset + 12, ciaddr);
+  let _ = buf_write_u32_be(buf, dhcp_offset + 16, yiaddr);
+  let _ = buf_write_u32_be(buf, dhcp_offset + 20, siaddr);
+  let _ = buf_write_u32_be(buf, dhcp_offset + 24, 0 as u32); // giaddr: no relay agent
+  let i: i64 = 0;
+  while i < 6 {
+    let mb: u32 = buf_read_byte(mac, i as u32);
+    let _ = buf_write_byte(buf, (dhcp_offset + 28 + i) as u32, mb);
+    i = i + 1;
+  }
+  let _ = dhcp_zero_range(buf, dhcp_offset + 34, 10); // chaddr padding (16 - 6)
+  let _ = dhcp_zero_range(buf, dhcp_offset + 44, 64); // sname
+  let _ = dhcp_zero_range(buf, dhcp_offset + 108, 128); // file
+  let _ = buf_write_byte(buf, (dhcp_offset + 236) as u32, 99 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 237) as u32, 130 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 238) as u32, 83 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 239) as u32, 99 as u32);
+  return 240;
+}
+
+fn dhcp_build_discover(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32) -> i64 {
+  let _ = dhcp_build_fixed_header(buf, dhcp_offset, mac, xid, dhcp_op_bootrequest(), 0 as u32, 0 as u32, 0 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 240) as u32, 53 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 241) as u32, 1 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 242) as u32, dhcp_msgtype_discover());
+  let _ = buf_write_byte(buf, (dhcp_offset + 243) as u32, 255 as u32); // End
+  return 244;
+}
+
+// RFC 2131 s4.3.2: the REQUEST following an OFFER echoes the offered
+// address back via option 50 and names which server it's accepting
+// via option 54 -- required so every OTHER server that also offered
+// (this client only ever sees one, but a real network can have many)
+// knows this client picked someone else and its own offer expired.
+fn dhcp_build_request(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, requested_ip: u32, server_ip: u32) -> i64 {
+  let _ = dhcp_build_fixed_header(buf, dhcp_offset, mac, xid, dhcp_op_bootrequest(), 0 as u32, 0 as u32, 0 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 240) as u32, 53 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 241) as u32, 1 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 242) as u32, dhcp_msgtype_request());
+  let _ = buf_write_byte(buf, (dhcp_offset + 243) as u32, 50 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 244) as u32, 4 as u32);
+  let _ = buf_write_u32_be(buf, dhcp_offset + 245, requested_ip);
+  let _ = buf_write_byte(buf, (dhcp_offset + 249) as u32, 54 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 250) as u32, 4 as u32);
+  let _ = buf_write_u32_be(buf, dhcp_offset + 251, server_ip);
+  let _ = buf_write_byte(buf, (dhcp_offset + 255) as u32, 255 as u32); // End
+  return 256;
+}
+
+fn dhcp_get_op(buf: mut ref i64, dhcp_offset: i64) -> u32 {
+  return buf_read_byte(buf, dhcp_offset as u32);
+}
+fn dhcp_get_xid(buf: mut ref i64, dhcp_offset: i64) -> u32 {
+  return buf_read_u32_be(buf, dhcp_offset + 4);
+}
+fn dhcp_get_yiaddr(buf: mut ref i64, dhcp_offset: i64) -> u32 {
+  return buf_read_u32_be(buf, dhcp_offset + 16);
+}
+
+fn dhcp_verify_magic_cookie(buf: mut ref i64, dhcp_offset: i64) -> i64 {
+  let c0: u32 = buf_read_byte(buf, (dhcp_offset + 236) as u32);
+  let c1: u32 = buf_read_byte(buf, (dhcp_offset + 237) as u32);
+  let c2: u32 = buf_read_byte(buf, (dhcp_offset + 238) as u32);
+  let c3: u32 = buf_read_byte(buf, (dhcp_offset + 239) as u32);
+  if (c0 == (99 as u32)) && (c1 == (130 as u32)) && (c2 == (83 as u32)) && (c3 == (99 as u32)) {
+    return 1;
+  }
+  return 0;
+}
+
+// Scans buf[dhcp_offset+240 .. dhcp_offset+dhcp_len) for `want_code`'s
+// single-byte value (option 53, DHCP Message Type). Bounded (max 64
+// options), same "capped, not `while true`" posture as every other
+// poll/scan loop in this codebase -- a malformed or hostile options
+// list with a bad length byte can't spin this forever, and every
+// length read is checked against `end` before being trusted as a skip
+// distance. Returns -1 if not found, the option is malformed (wrong
+// length or truncated), or the scan runs off the end without hitting
+// End (255) first.
+fn dhcp_find_option_byte(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64, want_code: u32) -> i64 {
+  let pos: i64 = dhcp_offset + 240;
+  let end: i64 = dhcp_offset + dhcp_len;
+  let iter: i64 = 0;
+  while (pos < end) && (iter < 64) {
+    let code: u32 = buf_read_byte(buf, pos as u32);
+    if code == (255 as u32) {
+      return 0 - 1;
+    }
+    if code == (0 as u32) {
+      pos = pos + 1;
+    } else {
+      if (pos + 1) >= end {
+        return 0 - 1;
+      }
+      let opt_len: u32 = buf_read_byte(buf, (pos + 1) as u32);
+      if code == want_code {
+        if (opt_len != (1 as u32)) || ((pos + 2) >= end) {
+          return 0 - 1;
+        }
+        return buf_read_byte(buf, (pos + 2) as u32) as i64;
+      }
+      pos = pos + 2 + (opt_len as i64);
+    }
+    iter = iter + 1;
+  }
+  return 0 - 1;
+}
+
+// Same shape as dhcp_find_option_byte, for a 4-byte option value
+// (50=Requested IP, 54=Server Identifier). Returns 0 if not found --
+// 0.0.0.0 is never a real address to find here, matching arp_cache's
+// own "0 means unused" convention.
+fn dhcp_find_option_u32(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64, want_code: u32) -> u32 {
+  let pos: i64 = dhcp_offset + 240;
+  let end: i64 = dhcp_offset + dhcp_len;
+  let iter: i64 = 0;
+  while (pos < end) && (iter < 64) {
+    let code: u32 = buf_read_byte(buf, pos as u32);
+    if code == (255 as u32) {
+      return 0 as u32;
+    }
+    if code == (0 as u32) {
+      pos = pos + 1;
+    } else {
+      if (pos + 1) >= end {
+        return 0 as u32;
+      }
+      let opt_len: u32 = buf_read_byte(buf, (pos + 1) as u32);
+      if code == want_code {
+        if (opt_len != (4 as u32)) || ((pos + 2 + 4) > end) {
+          return 0 as u32;
+        }
+        return buf_read_u32_be(buf, pos + 2);
+      }
+      pos = pos + 2 + (opt_len as i64);
+    }
+    iter = iter + 1;
+  }
+  return 0 as u32;
+}
+
+fn dhcp_broadcast_mac(out_mac: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    let _ = buf_write_byte(out_mac, i as u32, 0xFF as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Starts (or restarts) address acquisition: broadcasts a DHCPDISCOVER
+// and moves to SELECTING. xid should differ across separate
+// acquisition attempts (RFC 2131 uses it to match replies to the
+// request that triggered them) -- this driver has no random-number
+// source, so callers supply it (a boot-time tick count, a counter,
+// anything that varies run to run is fine; the self-test uses a fixed
+// constant since it doesn't need uniqueness across multiple real
+// attempts).
+fn dhcp_client_start(my_mac: mut ref i64, xid: u32) -> i64 {
+  let _ = dhcp_state_set_client_state(dhcp_state_selecting());
+  let _ = dhcp_state_set_xid(xid);
+  let _ = dhcp_state_set_offered_ip(0 as u32);
+  let _ = dhcp_state_set_server_ip(0 as u32);
+
+  let payload: mut ref i64 = dhcp_payload_scratch_get();
+  let payload_len: i64 = dhcp_build_discover(payload, 0, my_mac, xid);
+  let bcast_mac: mut ref i64 = dhcp_bcast_mac_scratch_get();
+  let _ = dhcp_broadcast_mac(bcast_mac);
+  let no_ip: u32 = 0 as u32;
+  let bcast_ip: u32 = 0xFFFFFFFF as u32;
+  return udp_send(my_mac, bcast_mac, no_ip, bcast_ip, dhcp_client_port(), dhcp_server_port(), payload, payload_len);
+}
+
+// Dequeues and processes the next queued frame if it's a DHCP reply
+// relevant to this client's current attempt -- advances SELECTING->
+// REQUESTING on a matching OFFER (broadcasting a DHCPREQUEST for the
+// offered address) and REQUESTING->BOUND on a matching ACK. Any other
+// queued traffic (non-IPv4, non-UDP, wrong port, wrong xid, a
+// corrupted checksum, a NAK, an OFFER/ACK arriving in a state that
+// doesn't expect one) is dequeued and silently ignored -- the same
+// "not every queued frame is mine" tolerance socket_udp_recv already
+// has, just with DHCP's own state machine and xid check on top
+// (mirroring tcp_conn_handle_segment's own "-1 means this didn't
+// match anything this state expects" posture). Returns 1 if a state
+// transition happened, 0 if a frame was dequeued but irrelevant, -1
+// if nothing was queued.
+fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
+  let frame: mut ref i64 = dhcp_frame_scratch_get();
+  let frame_len: i64 = netif_recv_frame(frame, 512);
+  if frame_len < 0 {
+    return 0 - 1;
+  }
+  if buf_read_u16_be(frame, 12) != (0x0800 as u32) {
+    return 0;
+  }
+  if ipv4_get_protocol(frame, 14) != (17 as u32) {
+    return 0;
+  }
+  if udp_get_dst_port(frame, 34) != dhcp_client_port() {
+    return 0;
+  }
+  let udp_len: u32 = udp_get_length(frame, 34);
+  let dhcp_len: i64 = (udp_len as i64) - 8;
+  // Same "reject, don't guess" bounds posture as socket_udp_recv's own
+  // fix: a UDP length claiming more than netif actually delivered, or
+  // too short to even hold a DHCP message's fixed header, is dropped
+  // outright before anything below trusts it.
+  if dhcp_len < 240 {
+    return 0;
+  }
+  if (34 + (udp_len as i64)) > frame_len {
+    return 0;
+  }
+  let src_ip: u32 = ipv4_get_src_ip(frame, 14);
+  let dst_ip: u32 = ipv4_get_dst_ip(frame, 14);
+  if udp_verify_checksum(src_ip, dst_ip, frame, 34, udp_len as i64) != 1 {
+    return 0;
+  }
+  let dhcp_offset: i64 = 42; // 14 (Ethernet) + 20 (IP) + 8 (UDP)
+  if dhcp_verify_magic_cookie(frame, dhcp_offset) != 1 {
+    return 0;
+  }
+  if dhcp_get_op(frame, dhcp_offset) != dhcp_op_bootreply() {
+    return 0;
+  }
+  if dhcp_get_xid(frame, dhcp_offset) != dhcp_state_get_xid() {
+    return 0;
+  }
+  let msg_type: i64 = dhcp_find_option_byte(frame, dhcp_offset, dhcp_len, 53 as u32);
+  let client_state: u32 = dhcp_state_get_client_state();
+
+  if (client_state == dhcp_state_selecting()) && (msg_type == (dhcp_msgtype_offer() as i64)) {
+    let offered_ip: u32 = dhcp_get_yiaddr(frame, dhcp_offset);
+    let server_ip: u32 = dhcp_find_option_u32(frame, dhcp_offset, dhcp_len, 54 as u32);
+    if (offered_ip == (0 as u32)) || (server_ip == (0 as u32)) {
+      return 0; // malformed offer, missing what's needed to request it
+    }
+    let _ = dhcp_state_set_offered_ip(offered_ip);
+    let _ = dhcp_state_set_server_ip(server_ip);
+    let _ = dhcp_state_set_client_state(dhcp_state_requesting());
+
+    let payload: mut ref i64 = dhcp_payload_scratch_get();
+    let xid: u32 = dhcp_state_get_xid();
+    let payload_len: i64 = dhcp_build_request(payload, 0, my_mac, xid, offered_ip, server_ip);
+    let bcast_mac: mut ref i64 = dhcp_bcast_mac_scratch_get();
+    let _ = dhcp_broadcast_mac(bcast_mac);
+    let no_ip: u32 = 0 as u32;
+    let bcast_ip: u32 = 0xFFFFFFFF as u32;
+    let _ = udp_send(my_mac, bcast_mac, no_ip, bcast_ip, dhcp_client_port(), dhcp_server_port(), payload, payload_len);
+    return 1;
+  }
+
+  if (client_state == dhcp_state_requesting()) && (msg_type == (dhcp_msgtype_ack() as i64)) {
+    let leased_ip: u32 = dhcp_get_yiaddr(frame, dhcp_offset);
+    if leased_ip == (0 as u32) {
+      return 0;
+    }
+    let _ = dhcp_state_set_leased_ip(leased_ip);
+    let _ = dhcp_state_set_client_state(dhcp_state_bound());
+    return 1;
+  }
+
+  return 0;
+}
+
+// Boot-time self-test: no real DHCP server exists in this loopback-
+// only environment (same reasoning ARP/TCP's own self-tests already
+// establish), so this drives the client through a full DISCOVER ->
+// OFFER -> REQUEST -> ACK -> BOUND cycle by manually building the
+// server's two replies exactly as a real server would and queuing
+// them via the real netif -- proving the client's own state machine
+// end to end without needing a real second host.
+fn dhcp_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let xid: u32 = 0x12345678 as u32;
+  let offered_ip: u32 = 0xC0A80164 as u32; // 192.168.1.100
+  let server_ip: u32 = 0xC0A80101 as u32;  // 192.168.1.1
+  let bcast_ip: u32 = 0xFFFFFFFF as u32;
+
+  let start_status: i64 = dhcp_client_start(my_mac, xid);
+  if start_status != 0 { ok = 0; }
+  if dhcp_state_get_client_state() != dhcp_state_selecting() { ok = 0; }
+
+  // Drain the client's own broadcast DISCOVER off the loopback queue
+  // and sanity-check it before injecting the synthetic OFFER below.
+  let discover_frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let discover_len: i64 = netif_recv_frame(discover_frame, 512);
+  if discover_len < 240 { ok = 0; }
+  if dhcp_get_op(discover_frame, 42) != dhcp_op_bootrequest() { ok = 0; }
+  if dhcp_find_option_byte(discover_frame, 42, discover_len - 42, 53 as u32) != (dhcp_msgtype_discover() as i64) { ok = 0; }
+
+  // Build the synthetic DHCPOFFER: fixed header (op=BOOTREPLY,
+  // yiaddr=offered_ip, siaddr=server_ip, chaddr echoed back per RFC
+  // 2131) plus Message-Type + Server-Identifier options.
+  let offer_msg: mut ref i64 = dhruva_alloc_bytes(300);
+  let _ = dhcp_build_fixed_header(offer_msg, 0, my_mac, xid, dhcp_op_bootreply(), 0 as u32, offered_ip, server_ip);
+  let _ = buf_write_byte(offer_msg, 240 as u32, 53 as u32);
+  let _ = buf_write_byte(offer_msg, 241 as u32, 1 as u32);
+  let _ = buf_write_byte(offer_msg, 242 as u32, dhcp_msgtype_offer());
+  let _ = buf_write_byte(offer_msg, 243 as u32, 54 as u32);
+  let _ = buf_write_byte(offer_msg, 244 as u32, 4 as u32);
+  let _ = buf_write_u32_be(offer_msg, 245, server_ip);
+  let _ = buf_write_byte(offer_msg, 249 as u32, 255 as u32); // End
+  let offer_dhcp_len: i64 = 250;
+
+  let offer_frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let oi: i64 = 0;
+  while oi < 6 {
+    let mb: u32 = buf_read_byte(my_mac, oi as u32);
+    let _ = buf_write_byte(offer_frame, oi as u32, mb); // dst: us
+    oi = oi + 1;
+  }
+  let oj: i64 = 0;
+  while oj < 6 {
+    let _ = buf_write_byte(offer_frame, (6 + oj) as u32, 0xAA as u32); // src: arbitrary "server" MAC
+    oj = oj + 1;
+  }
+  let _ = buf_write_u16_be(offer_frame, 12, 0x0800 as u32);
+  let offer_udp_len: i64 = udp_build(offer_frame, 34, dhcp_server_port(), dhcp_client_port(), offer_msg, offer_dhcp_len, server_ip, bcast_ip);
+  let offer_total_len: i64 = 20 + offer_udp_len;
+  let _ = ipv4_build_header(offer_frame, 14, offer_total_len, 17 as u32, server_ip, bcast_ip);
+  let offer_frame_len: i64 = 14 + offer_total_len;
+
+  let send_status1: i64 = netif_send_frame(offer_frame, offer_frame_len);
+  if send_status1 != 0 { ok = 0; }
+
+  let poll1: i64 = dhcp_client_poll(my_mac);
+  if poll1 != 1 { ok = 0; }
+  if dhcp_state_get_client_state() != dhcp_state_requesting() { ok = 0; }
+  if dhcp_state_get_offered_ip() != offered_ip { ok = 0; }
+  if dhcp_state_get_server_ip() != server_ip { ok = 0; }
+
+  // Drain the client's own broadcast DHCPREQUEST (triggered by the
+  // OFFER above) and confirm it correctly echoed the offered address
+  // and chosen server back per RFC 2131 s4.3.2.
+  let request_frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let request_len: i64 = netif_recv_frame(request_frame, 512);
+  if request_len < 240 { ok = 0; }
+  if dhcp_find_option_byte(request_frame, 42, request_len - 42, 53 as u32) != (dhcp_msgtype_request() as i64) { ok = 0; }
+  if dhcp_find_option_u32(request_frame, 42, request_len - 42, 50 as u32) != offered_ip { ok = 0; }
+  if dhcp_find_option_u32(request_frame, 42, request_len - 42, 54 as u32) != server_ip { ok = 0; }
+
+  // Build and queue the synthetic DHCPACK.
+  let ack_msg: mut ref i64 = dhruva_alloc_bytes(300);
+  let _ = dhcp_build_fixed_header(ack_msg, 0, my_mac, xid, dhcp_op_bootreply(), 0 as u32, offered_ip, server_ip);
+  let _ = buf_write_byte(ack_msg, 240 as u32, 53 as u32);
+  let _ = buf_write_byte(ack_msg, 241 as u32, 1 as u32);
+  let _ = buf_write_byte(ack_msg, 242 as u32, dhcp_msgtype_ack());
+  let _ = buf_write_byte(ack_msg, 243 as u32, 54 as u32);
+  let _ = buf_write_byte(ack_msg, 244 as u32, 4 as u32);
+  let _ = buf_write_u32_be(ack_msg, 245, server_ip);
+  let _ = buf_write_byte(ack_msg, 249 as u32, 255 as u32); // End
+  let ack_dhcp_len: i64 = 250;
+
+  let ack_frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let ai: i64 = 0;
+  while ai < 6 {
+    let mb2: u32 = buf_read_byte(my_mac, ai as u32);
+    let _ = buf_write_byte(ack_frame, ai as u32, mb2);
+    ai = ai + 1;
+  }
+  let aj: i64 = 0;
+  while aj < 6 {
+    let _ = buf_write_byte(ack_frame, (6 + aj) as u32, 0xAA as u32);
+    aj = aj + 1;
+  }
+  let _ = buf_write_u16_be(ack_frame, 12, 0x0800 as u32);
+  let ack_udp_len: i64 = udp_build(ack_frame, 34, dhcp_server_port(), dhcp_client_port(), ack_msg, ack_dhcp_len, server_ip, bcast_ip);
+  let ack_total_len: i64 = 20 + ack_udp_len;
+  let _ = ipv4_build_header(ack_frame, 14, ack_total_len, 17 as u32, server_ip, bcast_ip);
+  let ack_frame_len: i64 = 14 + ack_total_len;
+
+  let send_status2: i64 = netif_send_frame(ack_frame, ack_frame_len);
+  if send_status2 != 0 { ok = 0; }
+
+  let poll2: i64 = dhcp_client_poll(my_mac);
+  if poll2 != 1 { ok = 0; }
+  if dhcp_state_get_client_state() != dhcp_state_bound() { ok = 0; }
+  if dhcp_state_get_leased_ip() != offered_ip { ok = 0; }
+
+  let _ = uart_puts("DHCP: client DISCOVER->OFFER->REQUEST->ACK->BOUND");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -5066,6 +5581,9 @@ fn kernel_main() -> i64 {
   let _ = tcp_empty_payload_scratch_set(dhruva_alloc_bytes(1));
   let _ = net_send_scratch_set(dhruva_alloc_bytes(512));
   let _ = net_recv_scratch_set(dhruva_alloc_bytes(512));
+  let _ = dhcp_payload_scratch_set(dhruva_alloc_bytes(300));
+  let _ = dhcp_frame_scratch_set(dhruva_alloc_bytes(512));
+  let _ = dhcp_bcast_mac_scratch_set(dhruva_alloc_bytes(8));
 
   let _ = sdhost_init();
 
@@ -5244,6 +5762,7 @@ fn kernel_main() -> i64 {
   let _ = tcp_self_test();
   let _ = tcp_conn_self_test();
   let _ = tcp_conn_recv_bounds_self_test();
+  let _ = dhcp_self_test();
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device

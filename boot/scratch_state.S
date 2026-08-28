@@ -157,6 +157,39 @@ net_recv_scratch_addr:
                          * this one since its `frame` is always a
                          * caller-supplied parameter, never its own
                          * internal allocation. */
+dhcp_payload_scratch_addr:
+    .word 0             /* 300 bytes: the DHCP client's own message
+                         * build buffer (DISCOVER/REQUEST), shared by
+                         * dhcp_client_start and dhcp_client_poll --
+                         * same "never dhruva_alloc_bytes on every
+                         * call" reasoning as every other buffer in
+                         * this file, since dhcp_client_poll is meant
+                         * to be called repeatedly (once per received
+                         * frame) for as long as address acquisition
+                         * takes. 240 bytes of fixed BOOTP header/magic
+                         * cookie plus up to 16 bytes of options
+                         * (message type + requested-IP + server-ID +
+                         * end) comfortably fits. */
+dhcp_frame_scratch_addr:
+    .word 0             /* 512 bytes: dhcp_client_poll's own received-
+                         * frame buffer, same shape as net_recv_scratch
+                         * above but kept separate (not shared with
+                         * socket_udp_recv) since nothing has verified
+                         * the two could safely alias yet -- same
+                         * "don't assume sharing is safe without
+                         * checking" caution net_send_scratch's own
+                         * comment already flags for a different pair
+                         * of buffers. */
+dhcp_bcast_mac_scratch_addr:
+    .word 0             /* 8 bytes: the FF:FF:FF:FF:FF:FF Ethernet
+                         * broadcast address DHCPDISCOVER/DHCPREQUEST
+                         * both go out to (the server's real MAC isn't
+                         * known until an OFFER names it) -- built once
+                         * per send rather than turned into a
+                         * compile-time constant only because vani has
+                         * no way to write a byte-buffer literal
+                         * directly; still just one persistent buffer,
+                         * not a fresh allocation per call. */
 
 .section ".text"
 
@@ -310,6 +343,48 @@ net_recv_scratch_set:
 .global net_recv_scratch_get
 net_recv_scratch_get:
     ldr r0, =net_recv_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dhcp_payload_scratch_set
+dhcp_payload_scratch_set:
+    ldr r1, =dhcp_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_payload_scratch_get
+dhcp_payload_scratch_get:
+    ldr r0, =dhcp_payload_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dhcp_frame_scratch_set
+dhcp_frame_scratch_set:
+    ldr r1, =dhcp_frame_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_frame_scratch_get
+dhcp_frame_scratch_get:
+    ldr r0, =dhcp_frame_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dhcp_bcast_mac_scratch_set
+dhcp_bcast_mac_scratch_set:
+    ldr r1, =dhcp_bcast_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_bcast_mac_scratch_get
+dhcp_bcast_mac_scratch_get:
+    ldr r0, =dhcp_bcast_mac_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
