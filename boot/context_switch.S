@@ -318,10 +318,26 @@ cpu_wfi:
  * dwc2_init touches on the way into and through dwc2_port_reset
  * (GSNPSID, GAHBCFG, HPRT0) lives in the one DWC2 IP block at base
  * 0x20980000 -- no cross-peripheral switch ever happens in that path,
- * so no barrier is architecturally required there. The SD/GPIO
- * question above likely resolves the same way (each is also a single
- * peripheral's own internal register sequence) but wasn't re-verified
- * against actual call sites this round -- still open until it is. */
+ * so no barrier is architecturally required there. Same reasoning
+ * closes SDHOST's own command sequence (sdhost_cmd/sdhost_init's CMD0
+ * through CMD16, all SDHOST-to-SDHOST, base 0x20202000) -- no fix
+ * needed there either.
+ *
+ * FIXED for round 18's real finding (2026-08-28): GPIO alt-function
+ * setup is a genuine, different case from the two resolved above --
+ * gpio_uart_alt_init/gpio_sdhost_alt_init each write GPIO registers
+ * (base 0x20200000) to mux specific pins onto a DIFFERENT peripheral
+ * (PL011 UART / SDHOST), and the caller (uart_init/sdhost_init) then
+ * immediately starts driving that other peripheral -- a real
+ * cross-peripheral switch, exactly the case Broadcom's guidance says
+ * DOES need a barrier. mem_barrier() added at both call sites, right
+ * after the GPIO helper returns and before the first register write
+ * to the peripheral being muxed for. This is the same class of gap
+ * this project already hit for real once before, with a wrong mux
+ * VALUE rather than a timing gap around a correct one (see
+ * gpio_sdhost_alt_init's own header comment) -- a missing barrier
+ * here would fail the same way, just intermittently on real hardware
+ * instead of always, and invisible under QEMU either way. */
 .global mem_barrier
 mem_barrier:
     mov r0, #0

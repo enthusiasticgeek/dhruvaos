@@ -252,6 +252,24 @@ fn gpio_uart_alt_init() -> i64 {
 fn uart_init() -> i64 {
   let _ = gpio_uart_alt_init();
 
+  // BUG (round 18 audit, 2026-08-28): gpio_uart_alt_init() just wrote
+  // GPIO peripheral registers (GPFSEL1/GPPUD/GPPUDCLK0, base
+  // 0x20200000) to mux pins 14/15 onto the PL011 UART -- the writes
+  // immediately below are the first access to a genuinely DIFFERENT
+  // peripheral (PL011 UART, base 0x20201000). Round 17's "same
+  // peripheral always arrives in-order" finding does NOT cover this:
+  // that finding only applies WITHIN one peripheral's own registers;
+  // this is exactly the case Broadcom's own BCM2835 guidance (see
+  // context_switch.S's mem_barrier comment) says DOES need a barrier
+  // -- "a memory write barrier before the first write to a
+  // peripheral" when switching from one peripheral to another. On
+  // real hardware, nothing guaranteed the GPIO mux write had actually
+  // landed before UART_CR/IBRD/FBRD/LCRH start programming a
+  // peripheral whose pins might not be routed yet. Invisible under
+  // QEMU for the same reason every other barrier gap in this project
+  // is: TCG never reorders anything.
+  let _ = mem_barrier();
+
   let uart_cr: i64 = 0x20201030;
   let uart_icr: i64 = 0x20201044;
   let uart_ibrd: i64 = 0x20201024;
@@ -650,6 +668,21 @@ fn gpio_sdhost_alt_init() -> i64 {
 
 fn sdhost_init() -> i64 {
   let _ = gpio_sdhost_alt_init();
+
+  // BUG (round 18 audit, 2026-08-28): same real gap uart_init's own
+  // comment explains in full -- gpio_sdhost_alt_init() just wrote
+  // GPIO peripheral registers (GPFSEL4/GPFSEL5, base 0x20200000) to
+  // mux pins 48-53 onto SDHOST, and the writes immediately below are
+  // the first access to a genuinely different peripheral (SDHOST,
+  // base 0x20202000). This is a real cross-peripheral switch, not the
+  // same-peripheral case round 17 already confirmed is safe without a
+  // barrier -- higher-stakes here than UART, since this project has
+  // already hit a real bug from this exact mux (see
+  // gpio_sdhost_alt_init's own header comment: SDHOST issuing
+  // commands to a bus with no card on it because the mux was wrong)
+  // -- a timing gap on top of a correct mux value would fail the same
+  // way, just intermittently instead of always, on real hardware.
+  let _ = mem_barrier();
 
   let sdvdd: i64 = 0x20202030;
   let sdcdiv: i64 = 0x2020200C;
