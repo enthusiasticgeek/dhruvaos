@@ -4050,6 +4050,78 @@ fn tcp_conn_close(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i6
   return status;
 }
 
+// Round 29 (2026-08-28): the live counterpart to tcp_conn_self_test's
+// own hand-driven "traffic cop" role. tcp_conn_active_open/
+// passive_open/handle_segment/send_data/close have all existed since
+// this whole section was written, fully correct and self-tested, but
+// -- like ARP resolve before round 26, and DHCP before round 27 --
+// never had a single live caller anywhere in this codebase. This is
+// the general-purpose piece that makes one possible: dequeues the
+// next queued frame and, if it's TCP addressed to either of this
+// project's two connection slots (0=client, 1=server -- the same
+// fixed pair tcp_conn_self_test already uses), routes it to
+// tcp_conn_handle_segment for that connection instead of the
+// self-test's own hardcoded "I already know which frame this is"
+// sequencing.
+//
+// Also the live echo-service responder: if the SERVER connection
+// (slot 1) just received real data (a positive return from
+// handle_segment, not the 0 every control-only segment produces),
+// echoes it straight back via tcp_conn_send_data -- the same "answer
+// automatically, no caller involvement" shape icmp_poll's own
+// auto-responder already established for ping. Returns -2 for that
+// case (matching icmp_poll's own "handled a request, not a reply for
+// you" convention), -1 for anything not addressed to either
+// connection, and otherwise whatever tcp_conn_handle_segment itself
+// returned (>=0 on the client side is a genuine received payload --
+// the echoed data coming back, from this round's own only live
+// caller's point of view).
+//
+// Same shared-netif-queue concurrency note task_e's own comment
+// already makes for DHCP vs. the shell's ping command: the shell's
+// new `tcpecho` command below drives several rounds of this poll
+// function back to back, entirely synchronously within one
+// shell_dispatch() call -- but nothing stops task_e's own periodic
+// dhcp_client_poll from being scheduled in between two of those polls
+// and dequeuing a TCP frame tcpecho was actually waiting for. A third
+// instance of the same already-accepted, not-yet-solved tradeoff,
+// not a new one.
+fn tcp_conn_poll(my_mac: mut ref i64, out_payload: mut ref i64, max_payload_len: i64) -> i64 {
+  let frame: mut ref i64 = net_recv_scratch_get();
+  let frame_len: i64 = netif_recv_frame(frame, 512);
+  if frame_len < 0 {
+    return 0 - 1;
+  }
+  if buf_read_u16_be(frame, 12) != (0x0800 as u32) {
+    return 0 - 1;
+  }
+  if ipv4_get_protocol(frame, 14) != (6 as u32) {
+    return 0 - 1;
+  }
+  let dst_port: u32 = tcp_get_dst_port(frame, 34);
+  let client_id: u32 = 0 as u32;
+  let server_id: u32 = 1 as u32;
+  let target_conn: u32 = client_id;
+  let matched: i64 = 0;
+  if dst_port == tcp_conn_get_local_port(client_id) {
+    target_conn = client_id;
+    matched = 1;
+  }
+  if dst_port == tcp_conn_get_local_port(server_id) {
+    target_conn = server_id;
+    matched = 1;
+  }
+  if matched == 0 {
+    return 0 - 1;
+  }
+  let result: i64 = tcp_conn_handle_segment(target_conn, frame, frame_len, my_mac, my_mac, out_payload, max_payload_len);
+  if (target_conn == server_id) && (result > 0) {
+    let _ = tcp_conn_send_data(server_id, my_mac, my_mac, out_payload, result);
+    return 0 - 2;
+  }
+  return result;
+}
+
 // Boot-time self-test: a complete, real connection lifecycle --
 // three-way handshake, one data transfer each direction... actually
 // one direction (client-to-server) is enough to prove the data path
@@ -6611,16 +6683,18 @@ fn task_d() -> i64 {
 //
 // Known, real limitation this creates rather than just theorizes
 // about: netif has ONE shared FIFO queue with no per-protocol demux
-// (see socket_udp_recv/icmp_poll/dhcp_client_poll's own comments on
-// this already-accepted tradeoff) -- before this round, only self-
-// tests (which run strictly sequentially, one at a time, before any
-// task exists) ever touched it live. Now task_e's own periodic
-// dhcp_client_poll and the shell's `ping` command's icmp_poll (round
-// 26) are two genuinely concurrent, independently-scheduled live
-// consumers of that same queue -- either one can dequeue-and-drop a
-// frame the other was actually waiting for. Not fixed here (a real
-// per-protocol receive path is a separate, larger redesign); flagged
-// honestly rather than silently shipped as if it were fully safe.
+// (see socket_udp_recv/icmp_poll/dhcp_client_poll/tcp_conn_poll's own
+// comments on this already-accepted tradeoff) -- before this round,
+// only self-tests (which run strictly sequentially, one at a time,
+// before any task exists) ever touched it live. Now task_e's own
+// periodic dhcp_client_poll and the shell's own live network commands
+// -- `ping`'s icmp_poll (round 26) and `tcpecho`'s tcp_conn_poll
+// (round 29) -- are genuinely concurrent, independently-scheduled
+// live consumers of that same queue -- any one of them can dequeue-
+// and-drop a frame another was actually waiting for. Not fixed here
+// (a real per-protocol receive path is a separate, larger redesign);
+// flagged honestly rather than silently shipped as if it were fully
+// safe.
 // BUG (round 27 audit): #[bounded_stack(bytes=1024)] was already too
 // tight for this task's own pre-existing fs_compact chain in
 // principle (never actually caught, since nothing before this round
@@ -7506,7 +7580,105 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig)\n");
+  // Round 29: gives the entire TCP connection API (round 22's own
+  // feature ledger flagged this as the single biggest "correct, never
+  // used live" gap left in this project) a real, self-contained live
+  // caller -- the same self-talk-over-loopback trick `ping` already
+  // uses for ICMP, generalized to a full three-way handshake, one
+  // data transfer, and a full close, all driven through the real
+  // netif queue via tcp_conn_poll rather than tcp_conn_self_test's own
+  // hand-fed frames. Uses connection slots 0 (client) and 1 (server),
+  // the same fixed pair every TCP self-test already uses -- both
+  // start fresh every call via active_open/passive_open's own state
+  // resets, so there's no leftover state from a prior self-test or a
+  // prior `tcpecho` run to worry about. 127.0.0.1 and dedicated
+  // ports (54322/7777, distinct from any self-test's own port
+  // numbers) are used purely so a boot log reading this output is
+  // never confused with a self-test's own traffic -- this is still a
+  // pure loopback round trip regardless of which addresses are used.
+  if shell_word_matches(line_buf, 0, cmd_end, "tcpecho") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: tcpecho <text>\n");
+      return 0;
+    }
+    let text_start: i64 = cmd_end + 1;
+    let text_len: i64 = line_len - text_start;
+    if text_len > (64 as i64) {
+      let _ = uart_puts("error: text too long (max 64)\n");
+      return 0;
+    }
+    let payload: mut ref i64 = dhruva_alloc_bytes(64);
+    let _ = shell_copy_range(line_buf, text_start, line_len, payload);
+
+    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let _ = netif_get_mac(my_mac);
+    let client_id: u32 = 0 as u32;
+    let server_id: u32 = 1 as u32;
+    let loop_ip: u32 = 0x7F000001 as u32; // 127.0.0.1
+    let client_port: u32 = 54322 as u32;
+    let server_port: u32 = 7777 as u32;
+
+    let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
+    let isn: u32 = scheduler_get_tick_count() + (1000 as u32);
+    let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    if open_status != 0 {
+      let _ = uart_puts("tcpecho: SYN send failed\n");
+      return 0;
+    }
+
+    // Handshake: SYN -> server, SYN-ACK -> client, final ACK -> server
+    // is exactly 3 frames -- bounded well past that for margin, same
+    // "bounded, not `while true`" discipline every poll loop in this
+    // project already follows.
+    let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+    let handshake_iter: i64 = 0;
+    while (handshake_iter < 10) && ((tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established())) {
+      let _ = tcp_conn_poll(my_mac, scratch, 512);
+      handshake_iter = handshake_iter + 1;
+    }
+    if (tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established()) {
+      let _ = uart_puts("tcpecho: handshake failed\n");
+      return 0;
+    }
+
+    let send_status: i64 = tcp_conn_send_data(client_id, my_mac, my_mac, payload, text_len);
+    if send_status != 0 {
+      let _ = uart_puts("tcpecho: send failed\n");
+      return 0;
+    }
+
+    // Data + echo is exactly 2 frames (client's data segment, the
+    // server's echoed reply) -- tcp_conn_poll's own auto-responder
+    // (see its comment) is what actually sends the second one.
+    let recv_payload: mut ref i64 = dhruva_alloc_bytes(64);
+    let echoed: i64 = 0 - 1;
+    let data_iter: i64 = 0;
+    while (data_iter < 10) && (echoed < 0) {
+      let poll_result: i64 = tcp_conn_poll(my_mac, recv_payload, 64);
+      if poll_result > 0 {
+        echoed = poll_result;
+      }
+      data_iter = data_iter + 1;
+    }
+
+    let _ = tcp_conn_close(client_id, my_mac, my_mac);
+    let close_iter: i64 = 0;
+    while (close_iter < 10) && (tcp_conn_get_state(client_id) != tcp_state_closed_final()) {
+      let _ = tcp_conn_poll(my_mac, scratch, 512);
+      close_iter = close_iter + 1;
+    }
+
+    if echoed < 0 {
+      let _ = uart_puts("tcpecho: no echo received\n");
+      return 0;
+    }
+    let _ = uart_puts("tcpecho: echoed \"");
+    let _ = fs_print_data(recv_payload, echoed);
+    let _ = uart_puts("\"\n");
+    return 0;
+  }
+
+  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/tcpecho)\n");
   return 0;
 }
 

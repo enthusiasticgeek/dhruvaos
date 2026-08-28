@@ -85,6 +85,16 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     # same "DHCP never actually binds under QEMU" reason above.
     send("ifconfig")
     time.sleep(SETTLE_S)
+    # Round 29: gives the entire TCP connection API (handshake, data
+    # transfer, close) a permanent live regression check too, matching
+    # round 28's own "don't leave a new command's verification
+    # ephemeral" discipline -- this one drives a full, self-contained
+    # loopback round trip (127.0.0.1 to itself) through tcp_conn_poll's
+    # real netif-queue routing, not tcp_conn_self_test's own hand-fed
+    # frames, so it's a genuinely different (live) code path getting
+    # covered here, not a duplicate of that self-test.
+    send("tcpecho hello-tcp")
+    time.sleep(SETTLE_S)
     # "ls" last, deliberately: every other command in this sequence has
     # a LATER command's own settle time to absorb any scheduling slack,
     # but the last command has only the trailing sleep below to work
@@ -110,6 +120,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         ("ping 0.0.0.0 replies (self-ping over loopback)", "reply from 0.0.0.0"),
         ("ifconfig shows mac", "mac 02:00:00:00:00:01"),
         ("ifconfig shows dhcp state", "dhcp state=SELECTING ip=0.0.0.0"),
+        ("tcpecho completes a live handshake+data+close round trip", 'tcpecho: echoed "hello-tcp"'),
         ("ls shows /milestone/note", "  /milestone/note"),
     ]
 
