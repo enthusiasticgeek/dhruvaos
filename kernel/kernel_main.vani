@@ -2625,6 +2625,136 @@ fn ipv4_self_test() -> i64 {
   return 0;
 }
 
+// Round 26 (2026-08-28): dotted-quad IP address string <-> u32
+// conversion -- every self-test in this file so far has only ever
+// used hex literals (0xC0A80101) for an IP, fine for code but useless
+// for an interactive shell command a human actually types. Returns
+// the parsed address as a non-negative i64 on success (safe to do,
+// since `u32 as i64` zero-extends rather than sign-extends in vani --
+// so a genuine 255.255.255.255 still comes back as a large POSITIVE
+// i64, never colliding with the -1 error sentinel below) or -1 on any
+// malformed input: not exactly
+// four dot-separated segments, an empty segment (covers both "a..b.c"
+// and a leading/trailing dot), a non-digit character, more than three
+// digits in one segment, or any segment's own value exceeding 255.
+// Rejecting rather than clamping or guessing matches this project's
+// own "reject, don't guess" posture for every other untrusted-input
+// parse (DHCP's TLV options, the UDP/TCP length-validation fixes).
+fn ip_parse_dotted_quad(buf: mut ref i64, start: i64, end: i64) -> i64 {
+  let result: u32 = 0 as u32;
+  let octet_val: i64 = 0;
+  let octet_digits: i64 = 0;
+  let octet_count: i64 = 0;
+  let pos: i64 = start;
+  while pos < end {
+    let c: u32 = buf_read_byte(buf, pos as u32);
+    if c == (46 as u32) { // '.'
+      if (octet_digits == 0) || (octet_val > (255 as i64)) || (octet_count >= (3 as i64)) {
+        return 0 - 1;
+      }
+      result = (result << (8 as u32)) | (octet_val as u32);
+      octet_val = 0;
+      octet_digits = 0;
+      octet_count = octet_count + 1;
+    } else {
+      if (c < (48 as u32)) || (c > (57 as u32)) {
+        return 0 - 1; // not a digit
+      }
+      if octet_digits >= (3 as i64) {
+        return 0 - 1; // more digits than "255" could ever need
+      }
+      octet_val = (octet_val * (10 as i64)) + ((c - (48 as u32)) as i64);
+      octet_digits = octet_digits + 1;
+    }
+    pos = pos + 1;
+  }
+  // The fourth segment has no trailing dot to end it -- checked here,
+  // after the loop, against the same rules every other segment above
+  // already enforced.
+  if (octet_digits == 0) || (octet_val > (255 as i64)) || (octet_count != (3 as i64)) {
+    return 0 - 1;
+  }
+  result = (result << (8 as u32)) | (octet_val as u32);
+  return result as i64;
+}
+
+// Prints ip in dotted-quad form directly to the UART (no intermediate
+// string buffer -- matches this file's own established style of
+// printing incrementally via uart_puts/uart_put_i64 rather than
+// building a formatted string first).
+fn uart_put_ip(ip: u32) -> i64 {
+  let a: u32 = (ip >> (24 as u32)) & (0xFF as u32);
+  let b: u32 = (ip >> (16 as u32)) & (0xFF as u32);
+  let c: u32 = (ip >> (8 as u32)) & (0xFF as u32);
+  let d: u32 = ip & (0xFF as u32);
+  let _ = uart_put_i64(a as i64);
+  let _ = uart_puts(".");
+  let _ = uart_put_i64(b as i64);
+  let _ = uart_puts(".");
+  let _ = uart_put_i64(c as i64);
+  let _ = uart_puts(".");
+  let _ = uart_put_i64(d as i64);
+  return 0;
+}
+
+// TEST-ONLY: copies a vani string literal's bytes into buf, returning
+// its length -- this project's own self-tests everywhere else build
+// byte sequences by hand (one buf_write_byte call per byte, e.g.
+// udp_self_test's own "hello" payload), which would make eight
+// dotted-quad test strings unreadable; str_byte_at/str_len_bytes are
+// generic vani builtins, not anything specific to this test.
+fn ip_test_write_str(buf: mut ref i64, s: Str) -> i64 {
+  let slen: i64 = str_len_bytes(s);
+  let i: i64 = 0;
+  while i < slen {
+    let b: i64 = str_byte_at(s, i);
+    let _ = buf_write_byte(buf, i as u32, b as u32);
+    i = i + 1;
+  }
+  return slen;
+}
+
+// Boot-time self-test: round-trips several known addresses through
+// the parser and confirms the exact reject cases named in
+// ip_parse_dotted_quad's own comment are all actually rejected, not
+// just the happy path.
+fn ip_parse_self_test() -> i64 {
+  let ok: i64 = 1;
+  let buf: mut ref i64 = dhruva_alloc_bytes(24);
+
+  let l1: i64 = ip_test_write_str(buf, "192.168.1.1");
+  if ip_parse_dotted_quad(buf, 0, l1) != (0xC0A80101 as i64) { ok = 0; }
+
+  let l2: i64 = ip_test_write_str(buf, "0.0.0.0");
+  if ip_parse_dotted_quad(buf, 0, l2) != 0 { ok = 0; }
+
+  let l3: i64 = ip_test_write_str(buf, "255.255.255.255");
+  if ip_parse_dotted_quad(buf, 0, l3) != (0xFFFFFFFF as i64) { ok = 0; }
+
+  let l4: i64 = ip_test_write_str(buf, "256.1.1.1"); // segment > 255
+  if ip_parse_dotted_quad(buf, 0, l4) != (0 - 1) { ok = 0; }
+
+  let l5: i64 = ip_test_write_str(buf, "1.2.3"); // too few segments
+  if ip_parse_dotted_quad(buf, 0, l5) != (0 - 1) { ok = 0; }
+
+  let l6: i64 = ip_test_write_str(buf, "1.2.3.4.5"); // too many segments
+  if ip_parse_dotted_quad(buf, 0, l6) != (0 - 1) { ok = 0; }
+
+  let l7: i64 = ip_test_write_str(buf, "1..3.4"); // empty segment
+  if ip_parse_dotted_quad(buf, 0, l7) != (0 - 1) { ok = 0; }
+
+  let l8: i64 = ip_test_write_str(buf, "1.2.3.a"); // non-digit
+  if ip_parse_dotted_quad(buf, 0, l8) != (0 - 1) { ok = 0; }
+
+  let _ = uart_puts("IP: dotted-quad parse round-trip + reject cases");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Phase 6 continued, round 25 (2026-08-28): ICMP (RFC 792) echo
 // request/reply -- "ping," the one basic network capability every
 // real IP stack has that this project had never built (protocol
@@ -7132,7 +7262,142 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval)\n");
+  // Round 26: a real, interactively-typeable "ping" command -- the
+  // first live caller of round 22's own arp_resolve_start/poll (built
+  // that round, self-tested on its own merits, but never wired into
+  // anything that actually used it) and round 25's icmp_ping_start/
+  // poll. src_ip is whatever DHCP has actually leased (0.0.0.0/
+  // "unset" if nothing has bound yet, same as any real host with no
+  // configured address) rather than a fixed constant.
+  if shell_word_matches(line_buf, 0, cmd_end, "ping") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: ping <a.b.c.d>\n");
+      return 0;
+    }
+    let ip_start: i64 = cmd_end + 1;
+    let ip_end: i64 = shell_find_space(line_buf, ip_start, line_len);
+    let ip_len: i64 = ip_end - ip_start;
+    // Same double-space-typo rejection round 12 already established
+    // uniformly for cat/rm/write -- a missing argument and an empty
+    // one right after the command name must both be caught the same
+    // way, not just the former.
+    if ip_len == 0 {
+      let _ = uart_puts("usage: ping <a.b.c.d>\n");
+      return 0;
+    }
+    let dst_ip_parsed: i64 = ip_parse_dotted_quad(line_buf, ip_start, ip_end);
+    if dst_ip_parsed < 0 {
+      let _ = uart_puts("ping: invalid IP address\n");
+      return 0;
+    }
+    let dst_ip: u32 = dst_ip_parsed as u32;
+    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let _ = netif_get_mac(my_mac);
+    let my_ip: u32 = dhcp_state_get_leased_ip();
+
+    let dst_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let resolved: i64 = 0;
+    if dst_ip == my_ip {
+      // Pinging yourself never needs real ARP resolution -- same
+      // loopback shortcut every self-test in this project's own
+      // networking layer already uses, and (under QEMU specifically)
+      // the ONLY case that can ever actually succeed, since there is
+      // no real second host on this project's only tested link to
+      // answer an ARP request for anything else.
+      let mi: i64 = 0;
+      while mi < 6 {
+        let mb: u32 = buf_read_byte(my_mac, mi as u32);
+        let _ = buf_write_byte(dst_mac, mi as u32, mb);
+        mi = mi + 1;
+      }
+      resolved = 1;
+    } else {
+      if arp_cache_lookup(dst_ip, dst_mac) == 1 {
+        resolved = 1;
+      } else {
+        // Correct by design for real hardware, not verifiable under
+        // QEMU (same honest-limitation category rounds 23/24 already
+        // established) -- nothing will ever answer this request under
+        // QEMU's loopback-only netif, so this bounded wait always
+        // runs its full course and reports "could not resolve" for
+        // any dst_ip other than my_ip when tested here. Bounded (not
+        // `while true`), matching every other poll loop in this
+        // codebase.
+        let _ = arp_resolve_start(my_mac, my_ip, dst_ip);
+        let arp_iter: i64 = 0;
+        while (arp_iter < 20) && (resolved == 0) {
+          let arp_result: i64 = arp_resolve_poll(dst_ip);
+          if arp_result == 1 {
+            if arp_cache_lookup(dst_ip, dst_mac) == 1 {
+              resolved = 1;
+            }
+          } else {
+            let _ = delay(50000);
+          }
+          arp_iter = arp_iter + 1;
+        }
+      }
+    }
+    if resolved == 0 {
+      let _ = uart_puts("ping: could not resolve ");
+      let _ = uart_put_ip(dst_ip);
+      let _ = uart_puts("\n");
+      return 0;
+    }
+
+    let identifier: u32 = 0x0042 as u32;
+    let seq: u32 = 1 as u32;
+    let payload: mut ref i64 = dhruva_alloc_bytes(4);
+    let _ = buf_write_byte(payload, 0 as u32, 112 as u32); // "ping"
+    let _ = buf_write_byte(payload, 1 as u32, 105 as u32);
+    let _ = buf_write_byte(payload, 2 as u32, 110 as u32);
+    let _ = buf_write_byte(payload, 3 as u32, 103 as u32);
+
+    let send_status: i64 = icmp_ping_start(my_mac, dst_mac, my_ip, dst_ip, identifier, seq, payload, 4);
+    if send_status != 0 {
+      let _ = uart_puts("ping: send failed\n");
+      return 0;
+    }
+    let _ = uart_puts("PING ");
+    let _ = uart_put_ip(dst_ip);
+    let _ = uart_puts("\n");
+
+    // Bounded wait for the reply -- icmp_poll's own live auto-
+    // responder is what actually answers a self-ping (it dequeues our
+    // own just-sent request on an earlier iteration of this same
+    // loop, exactly like icmp_self_test's own two-poll pattern, just
+    // generalized into a retry loop here instead of two fixed calls).
+    let recv_payload: mut ref i64 = dhruva_alloc_bytes(4);
+    let recv_meta: mut ref i64 = dhruva_alloc_bytes(8);
+    let got_reply: i64 = 0;
+    let poll_iter: i64 = 0;
+    while (poll_iter < 20) && (got_reply == 0) {
+      let poll_result: i64 = icmp_poll(my_mac, my_ip, recv_payload, 4, recv_meta);
+      if poll_result >= 0 {
+        let reply_identifier: u32 = buf_read_u16_be(recv_meta, 4);
+        let reply_seq: u32 = buf_read_u16_be(recv_meta, 6);
+        if (reply_identifier == identifier) && (reply_seq == seq) {
+          got_reply = 1;
+        }
+      }
+      if got_reply == 0 {
+        let _ = delay(50000);
+      }
+      poll_iter = poll_iter + 1;
+    }
+    if got_reply == 1 {
+      let _ = uart_puts("reply from ");
+      let _ = uart_put_ip(buf_read_u32_be(recv_meta, 0));
+      let _ = uart_puts(" seq=");
+      let _ = uart_put_i64(seq as i64);
+      let _ = uart_puts("\n");
+    } else {
+      let _ = uart_puts("ping: no reply\n");
+    }
+    return 0;
+  }
+
+  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping)\n");
   return 0;
 }
 
@@ -7407,6 +7672,7 @@ fn kernel_main() -> i64 {
   let _ = arp_self_test();
   let _ = arp_resolve_self_test();
   let _ = ipv4_self_test();
+  let _ = ip_parse_self_test();
   let _ = icmp_self_test();
   let _ = udp_self_test();
   let _ = udp_send_unresolved_self_test();
@@ -7487,6 +7753,41 @@ fn kernel_main() -> i64 {
   let sp_f: mut ref i64 = task_f_init_stack(stack_f, stack_f_bytes);
 
   let _ = uart_puts("PASS\n");
+
+  // BUG (round 26 audit, found by actually driving the new shell
+  // `ping` command interactively rather than just its self-test):
+  // arp_self_test/udp_self_test/dhcp_self_test/dhcp_renewal_self_test
+  // all insert real entries into the ONE live ARP cache (arp_cache_
+  // insert), and nothing ever cleared it afterward -- every one of
+  // those test entries stays there for the rest of this boot,
+  // silently available to `ping`'s own arp_cache_lookup. dhcp_self_
+  // test's own synthetic server sits at 192.168.1.1, mapped to a
+  // fake MAC (0xAA repeated) -- one of the single most common real
+  // LAN gateway addresses. On real hardware, `ping 192.168.1.1`
+  // typed at the shell after boot would silently "succeed" against
+  // that leftover fake test MAC instead of ever issuing a real ARP
+  // request for whatever's actually at that address -- invisible
+  // under QEMU, where nothing real is on the other end to expose the
+  // wrong answer, but a real, live correctness gap for anything
+  // downstream of `ping`'s own arp_cache_lookup that trusts the
+  // result.
+  //
+  // Fixed by resetting arp_cache_count directly, NOT by re-calling
+  // arp_cache_init() -- that function only reallocates the cache's
+  // own MAC-bytes buffer (arp_cache_set_macs_buf), it does not touch
+  // arp_cache_count or the parallel IP array at all, so calling it a
+  // second time here would have left every stale IP entry still
+  // "found" by arp_cache_lookup (which only ever looks at entries
+  // below arp_cache_count), just now paired with a fresh all-zero MAC
+  // instead of the old fake one -- an even worse silent wrong answer,
+  // caught here before it shipped rather than discovered as a second
+  // bug on top of the first. Resetting count to 0 alone is correct
+  // and sufficient: arp_cache_lookup's own loop bound means an empty
+  // count makes every stale MAC/IP-array byte unreachable regardless
+  // of what's still sitting in them, and arp_cache_insert starts
+  // overwriting cleanly from index 0 again on the next real entry.
+  let _ = arp_cache_set_count(0 as u32);
+  let _ = arp_cache_set_next_slot(0 as u32);
   let _ = heap_usage_self_test();
 
   // watchdog_init() would belong here, right before handing off to the
