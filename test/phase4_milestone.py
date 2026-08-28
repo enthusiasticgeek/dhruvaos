@@ -102,6 +102,15 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     # formalization discipline as round 28/29's own commands.
     send("udpecho hello-udp")
     time.sleep(SETTLE_S)
+    # Round 31: "netstat" is read-only (sends no traffic of its own),
+    # so it's placed after tcpecho/udpecho specifically to observe
+    # their real, already-live side effects (the ARP cache entry
+    # udpecho inserts for loopback self-talk, and both TCP connection
+    # slots' post-close state) rather than exercising anything new
+    # itself -- same "don't leave a new command's verification
+    # ephemeral" discipline as every prior round's own new command.
+    send("netstat")
+    time.sleep(SETTLE_S)
     # "ls" last, deliberately: every other command in this sequence has
     # a LATER command's own settle time to absorb any scheduling slack,
     # but the last command has only the trailing sleep below to work
@@ -129,6 +138,8 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         ("ifconfig shows dhcp state", "dhcp state=SELECTING ip=0.0.0.0"),
         ("tcpecho completes a live handshake+data+close round trip", 'tcpecho: echoed "hello-tcp"'),
         ("udpecho completes a live socket_udp_send/recv round trip", 'udpecho: echoed "hello-udp"'),
+        ("netstat shows the ARP entry udpecho inserted", "127.0.0.1 -> 02:00:00:00:00:01"),
+        ("netstat shows tcpecho's client connection closed", "conn 0 state=CLOSED_FINAL local=127.0.0.1:54322 remote=127.0.0.1:7777"),
         ("ls shows /milestone/note", "  /milestone/note"),
     ]
 

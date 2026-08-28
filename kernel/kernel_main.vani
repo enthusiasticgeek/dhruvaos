@@ -7581,6 +7581,70 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Round 31: a read-only diagnostic exposing two pieces of state that
+  // are already genuinely live (the ARP cache, driven by `ping` since
+  // round 26; TCP connection slots, driven by `tcpecho` since round
+  // 29) but that a user could previously only infer from a command's
+  // side effects, never inspect directly. Unlike ping/tcpecho/udpecho,
+  // this sends no traffic of its own -- pure state dump via the
+  // existing arp_cache_get_*/tcp_conn_get_* accessors, same "expose
+  // what's already there, don't add new protocol plumbing" shape as
+  // ifconfig above.
+  if shell_word_matches(line_buf, 0, cmd_end, "netstat") == 1 {
+    let _ = uart_puts("ARP cache:\n");
+    let arp_count: u32 = arp_cache_get_count();
+    let ai: u32 = 0 as u32;
+    while ai < arp_count {
+      let _ = uart_puts("  ");
+      let _ = uart_put_ip(arp_cache_get_ip(ai));
+      let _ = uart_puts(" -> ");
+      let macs: mut ref i64 = arp_cache_get_macs_buf();
+      let base: u32 = ai * (6 as u32);
+      let mi: i64 = 0;
+      while mi < 6 {
+        let mb: u32 = buf_read_byte(macs, base + (mi as u32));
+        let _ = uart_put_hex_byte(mb);
+        if mi < 5 {
+          let _ = uart_puts(":");
+        }
+        mi = mi + 1;
+      }
+      let _ = uart_puts("\n");
+      ai = ai + (1 as u32);
+    }
+    if arp_count == (0 as u32) {
+      let _ = uart_puts("  (empty)\n");
+    }
+
+    let _ = uart_puts("TCP connections:\n");
+    let conn_id: u32 = 0 as u32;
+    while conn_id < (2 as u32) {
+      let state: u32 = tcp_conn_get_state(conn_id);
+      let _ = uart_puts("  conn ");
+      let _ = uart_put_i64(conn_id as i64);
+      let _ = uart_puts(" state=");
+      // Mutually exclusive by construction, same style as ifconfig's
+      // own dhcp_state_get_client_state() dispatch above.
+      if state == tcp_state_closed() { let _ = uart_puts("CLOSED"); }
+      if state == tcp_state_syn_sent() { let _ = uart_puts("SYN_SENT"); }
+      if state == tcp_state_syn_rcvd() { let _ = uart_puts("SYN_RCVD"); }
+      if state == tcp_state_established() { let _ = uart_puts("ESTABLISHED"); }
+      if state == tcp_state_fin_wait() { let _ = uart_puts("FIN_WAIT"); }
+      if state == tcp_state_closed_final() { let _ = uart_puts("CLOSED_FINAL"); }
+      let _ = uart_puts(" local=");
+      let _ = uart_put_ip(tcp_conn_get_local_ip(conn_id));
+      let _ = uart_puts(":");
+      let _ = uart_put_i64(tcp_conn_get_local_port(conn_id) as i64);
+      let _ = uart_puts(" remote=");
+      let _ = uart_put_ip(tcp_conn_get_remote_ip(conn_id));
+      let _ = uart_puts(":");
+      let _ = uart_put_i64(tcp_conn_get_remote_port(conn_id) as i64);
+      let _ = uart_puts("\n");
+      conn_id = conn_id + (1 as u32);
+    }
+    return 0;
+  }
+
   // Round 29: gives the entire TCP connection API (round 22's own
   // feature ledger flagged this as the single biggest "correct, never
   // used live" gap left in this project) a real, self-contained live
@@ -7761,7 +7825,7 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/tcpecho/udpecho)\n");
+  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/netstat/tcpecho/udpecho)\n");
   return 0;
 }
 
