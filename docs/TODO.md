@@ -42,35 +42,81 @@ See `docs/PORTING.md` for the full writeup this backlog references.
   software concern — only the host controller silicon matters.
   Real-hardware bring-up required; no QEMU safety net available.
 
-## Test infra debt (flagged by the Dhruva Feature Ledger, not yet fixed)
+## New capability roadmap (Pi 1, buildable and regression-testable under QEMU now)
 
-- **Stale "stdin delivery unconfirmed" status headers** — `[S, part
-  of a round]`
-  `test/shell_interactive_check.py` and `test/shell_interactive_check.sh`
-  both carry 2026-08-26 header comments claiming interactive-shell
-  stdin delivery "could not be confirmed to actually exercise the
-  shell in this sandbox." That's now stale: `test/phase4_milestone.py`'s
-  `subprocess.Popen(..., stdin=subprocess.PIPE)` + write+flush method
-  has reliably driven the shell every round since (write/cat/eval,
-  then ping/ifconfig/tcpecho/udpecho on top). Fix: update both files'
-  status headers to point at `phase4_milestone.py` as the confirmed
-  working method (or retire the two stale files outright in favor of
-  it), so a future session doesn't waste time re-litigating a solved
-  problem.
+Unlike the storage/USB portability section above, these three don't
+need new hardware to build OR verify — they deepen subsystems this
+project already targets on Pi 1, and QEMU's fidelity is sufficient for
+the whole build-and-regress loop this project has used every round so
+far. Expect each to span multiple rounds/sessions, same as any
+multi-round item elsewhere in this backlog.
 
-- **Concurrency-hazard regression test** — `[S-M, ~1 round]`
-  `task_e`'s own comment (round 27, extended in rounds 29/30) documents
-  a real, still-unfixed hazard: netif has one shared FIFO queue with no
-  per-protocol demux, and `task_e`'s periodic `dhcp_client_poll` plus
-  the shell's live network commands (`ping`, `tcpecho`, `udpecho`) are
-  genuinely concurrent consumers of it — any one can dequeue a frame
-  another was waiting for. This has only ever been documented, never
-  exercised by a test that actually reproduces the race (e.g., firing
-  two live commands back-to-back with minimal settle time and checking
-  for a dropped-frame retry rather than a hang or wrong answer). Not a
-  fix for the hazard itself (that's a separate, larger per-protocol
-  receive-path redesign) — just closing the gap between "documented"
-  and "verified to behave safely under the documented conditions."
+- **USB mass storage class driver** — `[L, ~4-6 rounds]`
+  Today's DWC2 driver does enumeration only (`GET_DESCRIPTOR`,
+  `SET_ADDRESS`, `SET_CONFIGURATION`) — "no bulk or interrupt
+  transfers, control only" per the driver's own comment. A real
+  prerequisite, not optional: bulk transfer support has to land in the
+  DWC2 driver first (a materially different endpoint/transfer-type
+  path than control transfers), before Bulk-Only Transport (CBW/CSW)
+  and a minimal SCSI subset (`INQUIRY`, `READ CAPACITY`, `READ(10)`,
+  `WRITE(10)`, `TEST UNIT READY`) can be built on top. Fully
+  QEMU-testable throughout — `-device usb-storage` (already used every
+  round for enumeration regression) emulates a real BOT+SCSI device,
+  so bring-up and regression don't need to wait for real hardware.
+  Natural integration point once built: the block-device abstraction
+  above — a USB mass-storage device becomes a third backend behind the
+  same interface as SDHOST/EMMC2, not a special case.
+  Depends on: block-device abstraction (above), for the FS-integration
+  half specifically.
+
+- **TCP retransmission + simultaneous open** — `[M-L, ~3-4 rounds]`
+  Today's TCP is "a real, useful, correctly-sequenced happy-path
+  connection lifecycle, not a spec-complete implementation" (the
+  code's own words) — no retransmission timers, no simultaneous-open/
+  simultaneous-close, and the advertised window is never consulted.
+  Retransmission needs an RTO mechanism that fits this project's
+  poll-don't-block design (comparing `scheduler_get_tick_count()`
+  deltas against a per-segment retry deadline, not a real async
+  timer) plus per-segment retry state. Fully QEMU-testable: packet
+  loss can be synthesized directly in a self-test (deliberately not
+  delivering a segment `tcp_conn_poll` would otherwise see, then
+  checking recovery) — no real network loss scenario or hardware
+  needed. Simultaneous-open/close is a smaller, more contained
+  addition to the existing state machine once retransmission's own
+  timing plumbing exists.
+
+- **FS directory hierarchy + multi-block files + journaling
+  hardening** — `[L, ~4-5 rounds]`
+  Today's FS is "flat, append-only, checksummed log" — paths are
+  opaque strings (`ls` does prefix filtering, not real directory
+  listing), and every record is capped at one 512-byte block (464-byte
+  payload). Real hierarchy needs path-segment parsing and directory
+  metadata; multi-block files need a block-chaining scheme (a
+  "next block" pointer per record) so a payload can span more than one
+  block. The existing checksum-verified crash recovery and
+  compaction/GC are already a basic journal — "hardening" here means
+  extending `power_yank.py`'s own crash-consistency sweep to the new
+  multi-block case specifically, since a torn write spanning multiple
+  chained blocks is a genuinely new crash-consistency risk class the
+  current single-block-per-record design never has to handle. Fully
+  QEMU-testable — `power_yank.py`'s existing tear-point-sweep
+  methodology extends directly, no hardware needed.
+
+## Hardware-in-loop testing (once a real Pi 1B is available)
+
+Every item in this backlog should get as much regression coverage as
+QEMU can actually provide before it's considered done — that's the
+default, not an exception. Real hardware only enters the loop for
+what QEMU's fidelity genuinely can't reach: real USB device timing/
+quirks (the mass storage driver above, and anything in the "known
+real-hardware-only gaps" section of the Dhruva Feature Ledger —
+governor wattage, memory-ordering barriers, the real LAN9512's
+hub port-2 behavior), and any future storage backend's real-media
+behavior. When a real Pi 1B is connected, treat it as an additional
+verification pass on top of the existing QEMU battery, not a
+replacement for it — everything QEMU can already catch should still
+be caught in QEMU first, keeping the fast local loop as the default
+and hardware-in-loop as the final confirmation pass.
 
 ## Not yet scoped (flagged in `docs/PORTING.md`, no estimate yet)
 
