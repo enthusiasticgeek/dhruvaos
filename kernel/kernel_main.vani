@@ -6688,10 +6688,11 @@ fn task_d() -> i64 {
 // only self-tests (which run strictly sequentially, one at a time,
 // before any task exists) ever touched it live. Now task_e's own
 // periodic dhcp_client_poll and the shell's own live network commands
-// -- `ping`'s icmp_poll (round 26) and `tcpecho`'s tcp_conn_poll
-// (round 29) -- are genuinely concurrent, independently-scheduled
-// live consumers of that same queue -- any one of them can dequeue-
-// and-drop a frame another was actually waiting for. Not fixed here
+// -- `ping`'s icmp_poll (round 26), `tcpecho`'s tcp_conn_poll (round
+// 29), and `udpecho`'s own inlined socket_udp_recv polling (round 30)
+// -- are genuinely concurrent, independently-scheduled live consumers
+// of that same queue -- any one of them can dequeue-and-drop a frame
+// another was actually waiting for. Not fixed here
 // (a real per-protocol receive path is a separate, larger redesign);
 // flagged honestly rather than silently shipped as if it were fully
 // safe.
@@ -7678,7 +7679,89 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/tcpecho)\n");
+  // Round 30: the last major "correct, never used live" gap the
+  // feature ledger flagged -- socket_udp_send/socket_udp_recv (Phase
+  // 6's own socket-style API, see socket_udp_send's comment) had run
+  // only inside udp_self_test's hand-fed traffic since round 21 added
+  // the ARP-cache-hit requirement. UDP is connectionless, so unlike
+  // tcp_conn_poll there's no per-connection state to route by --
+  // instead this builds a tiny, self-contained "echo service"
+  // entirely within this one command: every queued UDP datagram is
+  // read via socket_udp_recv's own reported metadata (out_meta's
+  // dst_port, not a separate frame parse), and if it's addressed to
+  // the fixed echo_port, it's answered immediately, right here, the
+  // same "no separate caller involvement" shape icmp_poll/
+  // tcp_conn_poll's own auto-responders already established -- just
+  // inlined rather than factored into a standalone *_poll function,
+  // since there's no ongoing connection state for a caller elsewhere
+  // to also need access to. 127.0.0.1 and dedicated ports (54323/7778,
+  // distinct from udp_self_test's own 12345/7 and tcpecho's
+  // 54322/7777) keep this obviously a distinct live round trip in the
+  // boot log, not a rerun of that self-test.
+  if shell_word_matches(line_buf, 0, cmd_end, "udpecho") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: udpecho <text>\n");
+      return 0;
+    }
+    let text_start: i64 = cmd_end + 1;
+    let text_len: i64 = line_len - text_start;
+    if text_len > (64 as i64) {
+      let _ = uart_puts("error: text too long (max 64)\n");
+      return 0;
+    }
+    let payload: mut ref i64 = dhruva_alloc_bytes(64);
+    let _ = shell_copy_range(line_buf, text_start, line_len, payload);
+
+    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let _ = netif_get_mac(my_mac);
+    let loop_ip: u32 = 0x7F000001 as u32; // 127.0.0.1
+    let client_port: u32 = 54323 as u32;
+    let echo_port: u32 = 7778 as u32;
+
+    // socket_udp_send requires a real ARP-cache hit (round 21) -- for
+    // a genuine off-loopback peer this would only ever succeed after a
+    // live arp_resolve_start/poll round trip like `ping` runs, but for
+    // this self-talk case the "peer" is ourselves, so inserting our
+    // own MAC once up front stands in for that, matching udp_self_
+    // test's own established precedent for the identical requirement.
+    let _ = arp_cache_insert(loop_ip, my_mac);
+
+    let send_status: i64 = socket_udp_send(my_mac, loop_ip, loop_ip, client_port, echo_port, payload, text_len);
+    if send_status != 0 {
+      let _ = uart_puts("udpecho: send failed (destination not ARP-resolved)\n");
+      return 0;
+    }
+
+    let recv_payload: mut ref i64 = dhruva_alloc_bytes(64);
+    let recv_meta: mut ref i64 = dhruva_alloc_bytes(8);
+    let echoed: i64 = 0 - 1;
+    let poll_iter: i64 = 0;
+    while (poll_iter < 10) && (echoed < 0) {
+      let recv_len: i64 = socket_udp_recv(recv_payload, recv_meta, 64);
+      if recv_len >= 0 {
+        let dst_port: u32 = buf_read_u16_be(recv_meta, 6);
+        if dst_port == echo_port {
+          let src_port: u32 = buf_read_u16_be(recv_meta, 4);
+          let _ = socket_udp_send(my_mac, loop_ip, loop_ip, echo_port, src_port, recv_payload, recv_len);
+        }
+        if dst_port == client_port {
+          echoed = recv_len;
+        }
+      }
+      poll_iter = poll_iter + 1;
+    }
+
+    if echoed < 0 {
+      let _ = uart_puts("udpecho: no echo received\n");
+      return 0;
+    }
+    let _ = uart_puts("udpecho: echoed \"");
+    let _ = fs_print_data(recv_payload, echoed);
+    let _ = uart_puts("\"\n");
+    return 0;
+  }
+
+  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/tcpecho/udpecho)\n");
   return 0;
 }
 
@@ -7687,8 +7770,19 @@ fn shell_dispatch() -> i64 {
 // comment). Polls shell_get_line_ready() rather than blocking on it:
 // there's no "wake me when ready" primitive here, just the same
 // sleep-then-recheck pattern task_c/task_d already use elsewhere.
+//
+// BUG (round 30 audit): #[bounded_stack(bytes=2048)] was already too
+// tight once `udpecho`'s own locals were added to shell_dispatch --
+// compiler-reported worst case 2184 bytes via chain task_f ->
+// shell_dispatch -> tcp_conn_poll -> tcp_conn_handle_segment ->
+// tcp_send_segment -> tcp_build_header -> tcp_checksum ->
+// buf_read_u16_be (the same class of real, compile-time-caught
+// violation round 27's task_e comment documents in full -- this is
+// its second occurrence). Raised to 4096, well past the reported
+// worst case, to leave headroom for future shell commands rather than
+// only barely clearing today's exact number.
 #[no_mangle]
-#[bounded_stack(bytes=2048)]
+#[bounded_stack(bytes=4096)]
 fn task_f() -> i64 {
   while true {
     let ready: u32 = shell_get_line_ready();

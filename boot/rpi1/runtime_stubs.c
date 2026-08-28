@@ -163,7 +163,27 @@ void *dhruva_alloc_bytes(long n) {
  * early-warning canary added by the same round-10 fix that resized
  * this heap, so a future round eating back into the new headroom
  * fails loudly at boot instead of reproducing this exact bug again
- * as a silent reboot loop. */
-long dhruva_heap_used_bytes(void) {
-    return (long)dhruva_heap_used;
+ * as a silent reboot loop.
+ *
+ * BUG (round 30 audit, found via live-testing scrutiny of the boot
+ * log, not this self-test's own PASS/FAIL count -- the same "read the
+ * actual output, don't just trust a name" discipline that caught
+ * round 26's ARP-cache bug): this returned plain `long`, which is
+ * 32-bit under this target's AAPCS (arm-none-eabi ILP32), but vani's
+ * own extern declaration (kernel_main.vani line ~33) says `-> i64`, a
+ * genuine 64-bit return. AAPCS returns a 64-bit value in the r0:r1
+ * register pair; a 32-bit `long` return only ever populates r0,
+ * leaving r1 as whatever was left over from a prior call. Every
+ * caller reading this as a real i64 got a huge, non-deterministic
+ * garbage value in the high 32 bits (heap_usage_self_test's own boot
+ * print showed something like "used=572811198400528" instead of the
+ * real, entirely reasonable ~67600) -- silently printing "(FAIL,
+ * expect headroom >= 16384)" at every single boot since this function
+ * was introduced (round 10), never noticed because attention went to
+ * self-tests' PASS/FAIL counts, not this one line's own literal text.
+ * Fixed by actually returning a 64-bit value end to end, matching
+ * vani's declared i64 rather than silently truncating across the FFI
+ * boundary. */
+long long dhruva_heap_used_bytes(void) {
+    return (long long)dhruva_heap_used;
 }

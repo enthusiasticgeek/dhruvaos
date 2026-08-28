@@ -95,6 +95,13 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     # covered here, not a duplicate of that self-test.
     send("tcpecho hello-tcp")
     time.sleep(SETTLE_S)
+    # Round 30: closes the last major "correct, never used live" gap
+    # the feature ledger flagged -- socket_udp_send/socket_udp_recv
+    # (Phase 6's socket-style API) had only ever run inside
+    # udp_self_test's hand-fed traffic since round 21. Same immediate-
+    # formalization discipline as round 28/29's own commands.
+    send("udpecho hello-udp")
+    time.sleep(SETTLE_S)
     # "ls" last, deliberately: every other command in this sequence has
     # a LATER command's own settle time to absorb any scheduling slack,
     # but the last command has only the trailing sleep below to work
@@ -121,6 +128,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         ("ifconfig shows mac", "mac 02:00:00:00:00:01"),
         ("ifconfig shows dhcp state", "dhcp state=SELECTING ip=0.0.0.0"),
         ("tcpecho completes a live handshake+data+close round trip", 'tcpecho: echoed "hello-tcp"'),
+        ("udpecho completes a live socket_udp_send/recv round trip", 'udpecho: echoed "hello-udp"'),
         ("ls shows /milestone/note", "  /milestone/note"),
     ]
 
