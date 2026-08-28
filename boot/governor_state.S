@@ -200,6 +200,20 @@ governor_apply_freq_mhz:
     str r7, [r4, #28]                /* buf[7]: skip setting turbo */
     str r7, [r4, #32]                /* buf[8]: end tag */
 
+    /* BUG (round 16 audit, 2026-08-28): the mailbox buffer above is
+     * built via plain stores, then handed off to the VideoCore -- a
+     * genuinely separate hardware bus master that reads it via its
+     * own path once MAILBOX_WRITE is written below -- with nothing
+     * guaranteeing those stores had actually reached memory first.
+     * See context_switch.S's mem_barrier for the full story on why
+     * this is a real gap on real hardware regardless of the MMU/cache
+     * state (both permanently off for this whole image), and why
+     * QEMU's own testing can't reveal it. Same DMB this project's
+     * vani-callable mem_barrier() wraps, inlined here since this
+     * function is already hand-written assembly. */
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5
+
     mov r8, r4
     bic r8, r8, #0xF                 /* defensive -- buf is already
                                        * 16-byte aligned via .align 4 */

@@ -265,6 +265,60 @@ cpu_wfi:
     mov r1, #0
     bx lr
 
+/* i64 mem_barrier() -- ARMv6 data memory barrier (DMB), issued via the
+ * CP15 "old" encoding this architecture version uses (ARMv6 predates
+ * the dedicated `dmb`/`dsb` mnemonics later architectures have; `mcr
+ * p15, 0, Rd, c7, c10, 5` is the documented ARMv6-era equivalent).
+ *
+ * BUG (round 16 audit, 2026-08-28): needed anywhere this driver writes
+ * ordinary memory via plain stores (a DMA buffer, the VideoCore
+ * mailbox's own request buffer) and then writes a peripheral register
+ * to hand that memory off to a genuinely separate hardware bus master
+ * (the DWC2 host controller's own DMA engine, reading dwc2_dma_scratch
+ * once HCDMA/HCCHAR are written; the VideoCore, reading governor_
+ * mbox_buf once MAILBOX_WRITE is written) that accesses it via its own
+ * independent path, not through the CPU at all. This project's own
+ * boot.S header comment already documents that the MMU and caches are
+ * off for this whole image's lifetime -- but that alone does NOT
+ * guarantee write ordering on BCM2835: confirmed against Broadcom's
+ * own documented peripheral-access precautions (raspberrypi.com forum
+ * t=181306, citing the SoC's own errata/guidance), which state
+ * peripheral accesses can complete out of order relative to each
+ * other and to normal memory writes -- a property of the AXI bus's
+ * multiple-in-flight-transaction model, independent of MMU/cache
+ * state -- and explicitly recommend a write barrier before the first
+ * write to a peripheral for exactly this "wrote memory, now handing
+ * it to hardware" pattern. QEMU's own TCG emulation executes
+ * everything in strict program order and never reorders anything, so
+ * this entire bug class is invisible under this project's only
+ * testing method (confirmed empirically: every DWC2/mailbox self-test
+ * already passes without this barrier, under QEMU) -- it would only
+ * ever surface as data corruption on real hardware, exactly the kind
+ * of gap this project's own "verify against QEMU source, but know
+ * what QEMU can't validate" discipline (already applied to DVFS
+ * wattage in Phase 5, USB timing here in Phase 6) exists to catch
+ * before it ships to a real board.
+ *
+ * Deliberately NOT applied to every MMIO sequence in this codebase --
+ * only the two spots (DWC2's dwc2_control_in/control_no_data,
+ * governor_apply_freq_mhz's own mailbox write) where the CPU hands
+ * memory IT wrote to a genuinely separate hardware bus master reading
+ * it via an independent path. Ordinary peripheral-register-to-
+ * register sequences (the SD host command/data-transfer path, GPIO
+ * alt-function setup, DWC2's own HPRT0 reset sequence) can in
+ * principle reorder too per the same Broadcom guidance, but that's a
+ * different, lower-severity variant (registers on the SAME peripheral
+ * completing out of order, not a DMA engine reading stale application
+ * data) -- flagged here as a real, open question for a future round
+ * rather than silently left unmentioned, not fixed in this one. */
+.global mem_barrier
+mem_barrier:
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
 /* i64 scheduler_ready_count() -- Phase 5's run-queue-depth signal for
  * the governor: how many of the 6 tasks have sleep_until_table[i] <=
  * the current tick_count (i.e. are actually ready right now), not

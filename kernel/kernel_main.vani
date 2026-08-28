@@ -97,6 +97,10 @@ extern "C" fn dhruva_prio_unlock(base_priority: i64) -> i64;
 // Phase 5: cpu_wfi/scheduler_ready_count -- context_switch.S.
 extern "C" fn cpu_wfi() -> i64;
 extern "C" fn scheduler_ready_count() -> i64;
+// Round 16 audit -- context_switch.S's own comment on mem_barrier has
+// the full story: a real-hardware memory-ordering gap this project's
+// only test environment (QEMU) can't reveal.
+extern "C" fn mem_barrier() -> i64;
 extern "C" fn governor_get_last_applied_mhz() -> i64;
 extern "C" fn governor_set_last_applied_mhz(mhz: i64) -> i64;
 extern "C" fn governor_apply_freq_mhz(mhz: i64) -> i64;
@@ -4383,6 +4387,21 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   let hctsiz0: i64 = dwc2_hctsiz0_addr();
   let hcdma0: i64 = dwc2_hcdma0_addr();
 
+  // BUG (round 16 audit, 2026-08-28): the caller already wrote the
+  // SETUP packet into dwc2_dma_scratch via plain stores before calling
+  // this function -- nothing guaranteed that write had actually
+  // reached memory before the HCDMA/HCCHAR writes just below hand this
+  // same address off to the DWC2 controller's own DMA engine, a
+  // genuinely separate hardware bus master that reads it via its own
+  // path, not through the CPU. See mem_barrier's own comment
+  // (context_switch.S) for why this is a real gap on real hardware
+  // regardless of the MMU/cache state, and why QEMU's own testing
+  // can't reveal it. Centralized here rather than at every call site
+  // that builds a SETUP packet, matching this function's own existing
+  // role as the one choke point every control transfer already goes
+  // through.
+  let _ = mem_barrier();
+
   // SETUP stage: the 8-byte request already sits in dwc2_dma_scratch
   // (dma), written by the caller before this call.
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
@@ -4459,6 +4478,11 @@ fn dwc2_control_no_data(devaddr: u32, mps: u32) -> i64 {
   let hcchar0: i64 = dwc2_hcchar0_addr();
   let hctsiz0: i64 = dwc2_hctsiz0_addr();
   let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  // Same real-hardware DMA-coherency gap dwc2_control_in's own comment
+  // explains in full -- the caller already wrote the SETUP packet into
+  // dwc2_dma_scratch via plain stores before calling this function.
+  let _ = mem_barrier();
 
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_setup(), 1 as u32, 8 as u32));
