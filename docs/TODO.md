@@ -42,6 +42,36 @@ See `docs/PORTING.md` for the full writeup this backlog references.
   software concern — only the host controller silicon matters.
   Real-hardware bring-up required; no QEMU safety net available.
 
+## Test infra debt (flagged by the Dhruva Feature Ledger, not yet fixed)
+
+- **Stale "stdin delivery unconfirmed" status headers** — `[S, part
+  of a round]`
+  `test/shell_interactive_check.py` and `test/shell_interactive_check.sh`
+  both carry 2026-08-26 header comments claiming interactive-shell
+  stdin delivery "could not be confirmed to actually exercise the
+  shell in this sandbox." That's now stale: `test/phase4_milestone.py`'s
+  `subprocess.Popen(..., stdin=subprocess.PIPE)` + write+flush method
+  has reliably driven the shell every round since (write/cat/eval,
+  then ping/ifconfig/tcpecho/udpecho on top). Fix: update both files'
+  status headers to point at `phase4_milestone.py` as the confirmed
+  working method (or retire the two stale files outright in favor of
+  it), so a future session doesn't waste time re-litigating a solved
+  problem.
+
+- **Concurrency-hazard regression test** — `[S-M, ~1 round]`
+  `task_e`'s own comment (round 27, extended in rounds 29/30) documents
+  a real, still-unfixed hazard: netif has one shared FIFO queue with no
+  per-protocol demux, and `task_e`'s periodic `dhcp_client_poll` plus
+  the shell's live network commands (`ping`, `tcpecho`, `udpecho`) are
+  genuinely concurrent consumers of it — any one can dequeue a frame
+  another was waiting for. This has only ever been documented, never
+  exercised by a test that actually reproduces the race (e.g., firing
+  two live commands back-to-back with minimal settle time and checking
+  for a dropped-frame retry rather than a hang or wrong answer). Not a
+  fix for the hazard itself (that's a separate, larger per-protocol
+  receive-path redesign) — just closing the gap between "documented"
+  and "verified to behave safely under the documented conditions."
+
 ## Not yet scoped (flagged in `docs/PORTING.md`, no estimate yet)
 
 - ARMv8-A (Cortex-A72/A76) boot path — `boot/rpi1/boot.S` and
