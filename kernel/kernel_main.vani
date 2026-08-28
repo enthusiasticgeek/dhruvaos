@@ -4514,15 +4514,60 @@ fn dwc2_enumerate_downstream() -> i64 {
   let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port, hub_feature_port_reset());
   let _ = delay(50000);
 
+  // BUG (round 14 audit, 2026-08-28): this function's own comment right
+  // above (see the header comment on hub_feature_port_enable et al.)
+  // states the design principle in so many words -- "PORT_RESET's own
+  // completion has to be observed via the port's status/change bits
+  // rather than assumed from timing alone" -- but the code used to do
+  // exactly the thing that comment says it doesn't: one fixed delay,
+  // then a SINGLE GET_PORT_STATUS read, trusting wPortStatus's ENABLE
+  // bit immediately with no check that the hub had actually finished
+  // processing the reset yet. That's a real gap, not just a stale
+  // comment: unlike the ROOT port (HPRT0's ENA bit is set synchronously
+  // by the model itself during the very same RST-deassert MMIO write,
+  // per dwc2_port_reset's own extensively-verified comment), a
+  // downstream hub is a separate device that processes SET_PORT_
+  // FEATURE(PORT_RESET) asynchronously -- there's no guarantee its
+  // internal port state machine has finished resetting by the time the
+  // control transfer's STATUS stage completes on the wire, only that
+  // the REQUEST was received. This only worked at all because QEMU's
+  // emulated hub happens to finish fast enough within one 50000-unit
+  // delay; it would not be robust against a real hub, or even a
+  // differently-timed emulated one. Fixed by actually polling
+  // wPortChange's C_PORT_RESET bit (bit4, 0x10 -- a completely
+  // different numbering space from the SET/CLEAR_PORT_FEATURE feature
+  // selectors just above, which is why this couldn't just reuse
+  // hub_feature_c_port_reset()'s own value of 20) until it's genuinely
+  // observed set, bounded (not `while true`) like every other poll
+  // loop in this codebase.
   let status_buf: mut ref i64 = dhruva_alloc_bytes(4);
-  let status_result: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
-  if status_result != 0 {
-    let _ = uart_puts("USB: hub GET_PORT_STATUS failed\n");
+  let c_port_reset_bit: u32 = 0x10 as u32; // wPortChange bit4
+  let reset_seen: i64 = 0;
+  let port_status: u32 = 0 as u32;
+  let poll_iter: i64 = 0;
+  while (poll_iter < 20) && (reset_seen == 0) {
+    let status_result: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
+    if status_result != 0 {
+      let _ = uart_puts("USB: hub GET_PORT_STATUS failed\n");
+      return 0 - 1;
+    }
+    let change_lo: u32 = buf_read_byte(status_buf, 2 as u32);
+    let change_hi: u32 = buf_read_byte(status_buf, 3 as u32);
+    let port_change: u32 = change_lo | (change_hi << (8 as u32));
+    if (port_change & c_port_reset_bit) != (0 as u32) {
+      reset_seen = 1;
+      let status_lo: u32 = buf_read_byte(status_buf, 0 as u32);
+      let status_hi: u32 = buf_read_byte(status_buf, 1 as u32);
+      port_status = status_lo | (status_hi << (8 as u32));
+    } else {
+      let _ = delay(50000);
+    }
+    poll_iter = poll_iter + 1;
+  }
+  if reset_seen == 0 {
+    let _ = uart_puts("USB: hub port1 never reported PORT_RESET complete\n");
     return 0 - 1;
   }
-  let port_status_lo: u32 = buf_read_byte(status_buf, 0 as u32);
-  let port_status_hi: u32 = buf_read_byte(status_buf, 1 as u32);
-  let port_status: u32 = port_status_lo | (port_status_hi << (8 as u32));
   let _ = uart_puts("USB: hub port1 status=");
   let _ = uart_put_hex32(port_status);
   let _ = uart_puts("\n");
