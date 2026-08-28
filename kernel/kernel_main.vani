@@ -5599,6 +5599,24 @@ fn shell_dispatch() -> i64 {
     let path_start: i64 = cmd_end + 1;
     let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
     let path_len: i64 = path_end - path_start;
+    // BUG (round 12 audit, 2026-08-27): a double space right after the
+    // command name (e.g. "cat  /foo") used to parse as a legitimate,
+    // silently EMPTY path (path_start landed exactly on the second
+    // space, so shell_find_space returned immediately) rather than
+    // failing the same way a genuinely missing argument already does
+    // above -- the intended path was silently swallowed instead of
+    // ever being looked at. Harmless for `cat` specifically (an empty
+    // path just reports "(not found)"), but the identical parsing gap
+    // in `rm`/`write` right below is worse: it silently succeeds
+    // ("ok") while writing a real, permanently-wasted record keyed to
+    // an empty path, misleading the user into thinking their actual
+    // command ran. Fixed uniformly across all three path-taking
+    // commands with the same "usage" rejection an outright-missing
+    // argument already gets.
+    if path_len == 0 {
+      let _ = uart_puts("usage: cat <path>\n");
+      return 0;
+    }
     if path_len > 32 {
       let _ = uart_puts("error: path too long\n");
       return 0;
@@ -5624,6 +5642,14 @@ fn shell_dispatch() -> i64 {
     let path_start: i64 = cmd_end + 1;
     let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
     let path_len: i64 = path_end - path_start;
+    // See cat's own identical fix above for why this check exists --
+    // here specifically, a double-space typo used to silently write a
+    // real, wasted tombstone record keyed to an empty path while still
+    // reporting "ok", as if the user's actual `rm` had succeeded.
+    if path_len == 0 {
+      let _ = uart_puts("usage: rm <path>\n");
+      return 0;
+    }
     if path_len > 32 {
       let _ = uart_puts("error: path too long\n");
       return 0;
@@ -5651,6 +5677,17 @@ fn shell_dispatch() -> i64 {
       return 0;
     }
     let path_len: i64 = path_end - path_start;
+    // See cat's own identical fix above for why this check exists --
+    // here specifically, a double-space typo right after "write" used
+    // to silently write real, permanent data keyed to an empty path
+    // while still reporting "ok", as if it had gone to the path the
+    // user actually typed. (path_end >= line_len above already rejects
+    // a double space right before the text, e.g. "write /path  " with
+    // no text following, but not this earlier one.)
+    if path_len == 0 {
+      let _ = uart_puts("usage: write <path> <text>\n");
+      return 0;
+    }
     if path_len > 32 {
       let _ = uart_puts("error: path too long\n");
       return 0;
