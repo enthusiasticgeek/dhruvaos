@@ -70,8 +70,35 @@ void exit(int code) {
  * Deliberately a bump allocator, never freed -- matches the
  * architecture doc's Phase 1 call for a fixed-block allocator, not a
  * general heap: task stacks are allocated once at boot and live for
- * the process's whole lifetime. */
-#define DHRUVA_HEAP_BYTES (64 * 1024)
+ * the process's whole lifetime.
+ *
+ * BUG (round 10 audit, 2026-08-27): 64KB was a Phase 1 guess, never
+ * tied to any real hardware constraint -- QEMU's raspi1ap model (and
+ * the real Pi 1 Model B it emulates) has 512MB of actual RAM; nothing
+ * about this bare-metal image needs the heap capped this tight. It
+ * quietly crept up over many rounds of self-tests and task-stack
+ * growth until round 9's DHCP client (dhcp_self_test alone allocates
+ * over a dozen buffers, boot-time-only but never freed like everything
+ * else here) pushed measured usage to 65352/65536 bytes -- only 184
+ * bytes of margin -- and round 10's own added dhcp_nak_self_test
+ * tipped it over: task_e's first scheduled run allocates its own
+ * ~1520 bytes of persistent scratch (gc_buf/compact_buf/
+ * compact_path_buf/compact_data_buf, see kernel_main.vani), which
+ * dhruva_alloc_bytes correctly returned null for once the heap was
+ * exhausted -- and that null pointer got written through with no
+ * check, corrupting memory and reproducing this project's own
+ * previously-documented heap-exhaustion crash signature (PC landing
+ * back at _start) via a new path. Found via phase4_milestone.py
+ * showing 12 boot banners instead of 1 -- a genuine reboot loop, not
+ * the settle-time timing flake this project has hit before. Fixed by
+ * actually sizing the heap to the real constraint (there isn't one
+ * worth worrying about at this image's scale) instead of continuing
+ * to shave bytes off self-test buffers every time a new feature nudges
+ * the total over some arbitrary line -- see kernel_main.vani's new
+ * heap_usage_self_test for the permanent early-warning check this
+ * fix added so a future round hits a loud, graded self-test failure
+ * instead of a silent, hard-to-diagnose reboot loop. */
+#define DHRUVA_HEAP_BYTES (256 * 1024)
 static unsigned char dhruva_heap[DHRUVA_HEAP_BYTES];
 static unsigned long dhruva_heap_used = 0;
 
@@ -130,4 +157,13 @@ void *dhruva_alloc_bytes(long n) {
         i = i + 1;
     }
     return (void*)p;
+}
+
+/* Backs kernel_main.vani's heap_usage_self_test -- a permanent
+ * early-warning canary added by the same round-10 fix that resized
+ * this heap, so a future round eating back into the new headroom
+ * fails loudly at boot instead of reproducing this exact bug again
+ * as a silent reboot loop. */
+long dhruva_heap_used_bytes(void) {
+    return (long)dhruva_heap_used;
 }
