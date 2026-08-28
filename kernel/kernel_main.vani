@@ -1782,6 +1782,23 @@ fn netif_init() -> i64 {
 // NIC emulated) needs a full-size frame. A real hardware netif
 // implementation later would need its own, larger buffers and report
 // the real 1500 here instead.
+//
+// RE-AUDITED (round 20, 2026-08-28), no drift found: ipv4_send/
+// udp_send/tcp_send_segment (round 11 fix) still derive their bounds
+// from this function alone, still boundary-exact (max payload always
+// produces exactly a 512-byte frame, matching netif_send_frame's own
+// cutoff with zero slack), and no new hardcoded literal duplicating
+// this value has crept back in anywhere since. Receive-side callers
+// (socket_udp_recv, tcp_conn_handle_segment, dhcp_client_poll) take
+// the caller's real buffer capacity as a required parameter rather
+// than re-deriving a number, so they were never exposed to this
+// class of drift in the first place -- confirmed every call site's
+// allocation still matches what it passes. Also checked dhcp_find_
+// option_byte/u32's own TLV parsing (untouched by round 11, since
+// that round's scope was send-path bounds only): already correctly
+// bounds-checks every option read against `end` before dereferencing,
+// including the malicious-opt_len case, so no over-read is possible
+// even from a hostile DHCP reply.
 fn netif_get_mtu() -> i64 {
   return 498;
 }
