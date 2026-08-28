@@ -3,26 +3,34 @@
 UART, waiting on each expected response line rather than a blind sleep
 before sending the next command.
 
-STATUS (2026-08-26): kept for reference, but NOT the trusted verification
-path -- see test/shell_interactive_check.sh instead. Deep investigation
-this session traced test failures through three real bugs in THIS
-script (below) before discovering the actual remaining blocker isn't in
-Dhruva or in this script at all: a raw hardware-level poll of both
-BCM2835 UART peripherals' RX status registers, added directly to
-kernel_main.vani as a temporary probe, showed zero bytes EVER arriving
-at either UART's FIFO under this sandbox's QEMU, across every input
-method tried (a bash coprocess pipe, a raw-mode PTY, sustained slow
-character streams, multiple -serial/-nographic flag combinations) --
-while output (TX) has worked flawlessly all session. That basic-level
-non-delivery makes end-to-end interactive shell verification impossible
-in this specific environment for now, independent of which harness
-sends the bytes. If a future session finds a QEMU invocation that
-actually delivers stdin to `-M raspi1ap`'s UART0, this script's
-approach (event-driven polling via a background reader thread with a
-consumed-position cursor -- see below) is sound and can resume being
-the primary tool; until then, treat any past "PASS" from an earlier
-version of this file with suspicion, since two of its three bugs
-produced false positives, not just failures.
+STATUS (2026-08-26, superseded 2026-08-28 -- round 31/32 doc-debt
+cleanup): kept for reference, but NOT the trusted verification path --
+see test/phase4_milestone.py instead (not shell_interactive_check.sh,
+despite what this note originally said; see that file's own updated
+header for why). Deep investigation the 2026-08-26 session traced test
+failures through three real bugs in THIS script (below) before
+concluding stdin delivery itself was broken in that sandbox: a raw
+hardware-level poll of both BCM2835 UART peripherals' RX status
+registers, added directly to kernel_main.vani as a temporary probe,
+showed zero bytes EVER arriving at either UART's FIFO under that
+session's QEMU, across every input method tried (a bash coprocess
+pipe, a raw-mode PTY, sustained slow character streams, multiple
+-serial/-nographic flag combinations) -- while output (TX) worked
+flawlessly. That conclusion turned out to be sandbox/session-specific,
+not a real Dhruva or QEMU limitation: `phase4_milestone.py`'s
+`subprocess.Popen(..., stdin=subprocess.PIPE)` + `write() + flush()`
+method has reliably driven the shell every round since round 26
+(write/cat/eval, then ping/ifconfig/netstat/tcpecho/udpecho on top,
+all confirmed live) -- this file's own three-bugs-deep debugging
+effort was real, but the environment it was diagnosing turned out not
+to be the one every later session actually ran in. Kept as reference
+for the event-driven polling technique below (background reader
+thread with a consumed-position cursor), which is still sound in
+principle, just unnecessary now that the much simpler Popen+write+
+sleep approach is confirmed to work end to end. Treat any past "PASS"
+from an earlier version of this file with suspicion regardless, since
+two of its three original bugs produced false positives, not just
+failures.
 
 Second rewrite. The first version used `proc.stdout.read(1)` with no
 per-syscall timeout and could hang forever. The second version switched

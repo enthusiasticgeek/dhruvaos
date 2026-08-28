@@ -2,19 +2,26 @@
 # Phase 4 task #9: drive Dhruva's interactive shell over QEMU's stdio
 # UART using the bash-coprocess input method.
 #
-# STATUS (2026-08-26): this script is believed CORRECT but could not be
-# confirmed to actually exercise the shell in this sandbox. A raw
-# hardware-level poll of both BCM2835 UART peripherals' RX status
-# registers (added directly to kernel_main.vani as a temporary probe,
-# since removed) showed zero bytes EVER arriving at either UART's FIFO
-# under this sandbox's QEMU, across every input method tried (a bash
-# coprocess pipe, a raw-mode PTY, sustained slow character streams,
-# multiple -serial/-nographic flag combinations) -- while TX has
-# worked flawlessly all session. That is a QEMU/environment-level
-# input-delivery gap, not a bug in Dhruva's UART RX code (irq_dispatch,
-# shell_rx_push_char, task_f) or in this script: see
-# project_dhruva_os_architecture_2026_08_24.md's task #9 writeup for
-# the full chain of evidence. Every substring check below is applied
+# STATUS (2026-08-26, superseded 2026-08-28 -- round 31/32 doc-debt
+# cleanup): this script is believed CORRECT, but is NOT the trusted
+# verification path -- see test/phase4_milestone.py instead. The
+# 2026-08-26 session concluded stdin delivery was broken in that
+# sandbox: a raw hardware-level poll of both BCM2835 UART peripherals'
+# RX status registers (added directly to kernel_main.vani as a
+# temporary probe, since removed) showed zero bytes EVER arriving at
+# either UART's FIFO under that session's QEMU, across every input
+# method tried (a bash coprocess pipe, a raw-mode PTY, sustained slow
+# character streams, multiple -serial/-nographic flag combinations) --
+# while TX worked flawlessly. That conclusion turned out to be
+# sandbox/session-specific, not a real Dhruva or QEMU limitation:
+# phase4_milestone.py's `subprocess.Popen(..., stdin=subprocess.PIPE)`
+# + write()/flush() method has reliably driven the shell every round
+# since round 26 (write/cat/eval, then ping/ifconfig/netstat/tcpecho/
+# udpecho on top, all confirmed live). This script's own bash-
+# coprocess method was never actually re-tried against a working
+# input path -- kept here for reference (the coprocess technique is
+# still sound in principle), not as a live-verified alternative. Every
+# substring check below is applied
 # to ONLY the portion of the log strictly after the PASS line -- the
 # boot-time self-test prints "/config/mode", "not found", etc. on its
 # own before the shell ever runs a single command, and task_e's own
