@@ -5266,6 +5266,164 @@ fn dwc2_build_get_device_descriptor_setup(want_len: u32) -> i64 {
   return 0;
 }
 
+// Round 24 (WiFi dongle enumeration prep, 2026-08-28): same shape as
+// dwc2_build_get_device_descriptor_setup right above, but wValue's
+// high byte is 2 (CONFIGURATION) instead of 1 (DEVICE) -- everything
+// else about a GET_DESCRIPTOR request is identical regardless of
+// which descriptor type is being asked for.
+fn dwc2_build_get_config_descriptor_setup(want_len: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0x80 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 6 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 3 as u32, 2 as u32);
+  let _ = buf_write_byte(dma, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 5 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 6 as u32, want_len & (0xFF as u32));
+  let _ = buf_write_byte(dma, 7 as u32, (want_len >> (8 as u32)) & (0xFF as u32));
+  return 0;
+}
+
+// Round 24: bmRequestType=0x00 (host-to-device, standard, device),
+// bRequest=9 (SET_CONFIGURATION), wValue=config_value, wIndex=0,
+// wLength=0 -- a no-data control transfer, same shape as SET_ADDRESS.
+// USB 2.0 spec chapter 9.4.7: a device sits in the non-functional
+// Address state (it will answer control requests, and nothing else)
+// until this request moves it to the Configured state -- every real
+// device this driver will eventually need to actually exchange data
+// with (a WiFi dongle's bulk/interrupt endpoints, LAN9512's own
+// Ethernet bulk endpoints) needs this, not just WiFi specifically.
+// Neither dwc2_probe_device0 nor dwc2_enumerate_downstream ever issued
+// it before this round -- enumeration got as far as learning a
+// device's identity, never as far as making it usable.
+fn dwc2_build_set_configuration_setup(config_value: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 9 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, config_value & (0xFF as u32));
+  let _ = buf_write_byte(dma, 3 as u32, (config_value >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 5 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 6 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
+  return 0;
+}
+
+// Fetches the configuration descriptor (first its own fixed 9-byte
+// header to learn wTotalLength/bConfigurationValue -- the same
+// "short fetch to learn a length, then a full fetch" progressive
+// pattern dwc2_probe_device0 already uses for the device descriptor
+// -- then as much of the full interface/endpoint descriptor chain as
+// fits in dwc2_dma_scratch's own 64-byte capacity), walks it counting
+// INTERFACE (type 4) and ENDPOINT (type 5) descriptors -- the two
+// things a real class driver (WiFi, or LAN9512's own Ethernet
+// function) needs to know exist before it can do anything with
+// them -- and issues SET_CONFIGURATION so the device actually leaves
+// the non-functional Address state. Logs a summary but doesn't keep
+// any interface/endpoint descriptor fields around: this is
+// enumeration-completeness prep (get every device to a genuinely
+// Configured, usable state and prove what's inside its configuration
+// is visible), not the start of a class driver -- parsing individual
+// endpoint addresses/types into something a future bulk-transfer
+// driver would consume is real, separate work for whenever that
+// driver actually gets built.
+fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
+  let cfg9: mut ref i64 = dhruva_alloc_bytes(9);
+  let _ = dwc2_build_get_config_descriptor_setup(9 as u32);
+  let status0: i64 = dwc2_control_in(devaddr, mps, 9 as u32, cfg9);
+  if status0 != 0 {
+    let _ = uart_puts("USB: GET_DESCRIPTOR(Configuration) short fetch failed\n");
+    return 0 - 1;
+  }
+  let clength: u32 = buf_read_byte(cfg9, 0 as u32);
+  let cdesctype: u32 = buf_read_byte(cfg9, 1 as u32);
+  if (clength != (9 as u32)) || (cdesctype != (2 as u32)) {
+    let _ = uart_puts("USB: config descriptor probe (FAIL, bad bLength/bDescriptorType)\n");
+    return 0 - 1;
+  }
+  let total_lo: u32 = buf_read_byte(cfg9, 2 as u32);
+  let total_hi: u32 = buf_read_byte(cfg9, 3 as u32);
+  let total_length: u32 = total_lo | (total_hi << (8 as u32));
+  let num_interfaces: u32 = buf_read_byte(cfg9, 4 as u32);
+  let config_value: u32 = buf_read_byte(cfg9, 5 as u32);
+
+  // dwc2_control_in's own 64-byte cap (round 3 audit -- the DMA
+  // scratch buffer's real capacity) means a configuration whose
+  // wTotalLength exceeds it can only be read partially here. Grab as
+  // much as fits rather than failing outright -- everything counted
+  // below still reflects real descriptors, just possibly not all of
+  // them for an unusually large configuration (most simple devices,
+  // including every one this project can attach under QEMU, fit
+  // comfortably under 64 bytes).
+  let full_want_len: u32 = if total_length > (64 as u32) { 64 as u32 } else { total_length };
+  let truncated: i64 = if total_length > (64 as u32) { 1 } else { 0 };
+
+  let cfgfull: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = dwc2_build_get_config_descriptor_setup(full_want_len);
+  let status1: i64 = dwc2_control_in(devaddr, mps, full_want_len, cfgfull);
+  if status1 != 0 {
+    let _ = uart_puts("USB: GET_DESCRIPTOR(Configuration) full fetch failed\n");
+    return 0 - 1;
+  }
+
+  // Standard USB descriptor-chain traversal: each descriptor names its
+  // own bLength (byte 0), so an unrecognized bDescriptorType (a
+  // class-specific or vendor-specific descriptor, common right after
+  // an INTERFACE descriptor for anything more complex than a trivial
+  // device) is still skipped correctly rather than misread as
+  // something fixed-size. Bounds-checked against full_want_len before
+  // every read -- a corrupt or truncated descriptor chain is dropped,
+  // not trusted, same "reject, don't guess" posture as every other
+  // untrusted-length parse in this project (DHCP's own TLV option
+  // parser, most recently).
+  let pos: i64 = 0;
+  let iface_count: i64 = 0;
+  let ep_count: i64 = 0;
+  let full_want_len_i: i64 = full_want_len as i64;
+  while pos < full_want_len_i {
+    let dlen: u32 = buf_read_byte(cfgfull, pos as u32);
+    if dlen == (0 as u32) {
+      pos = full_want_len_i; // malformed -- stop rather than loop forever
+    } else {
+      if (pos + 1) >= full_want_len_i {
+        pos = full_want_len_i; // truncated -- can't read bDescriptorType
+      } else {
+        let dtype: u32 = buf_read_byte(cfgfull, (pos + 1) as u32);
+        if dtype == (4 as u32) {
+          iface_count = iface_count + 1;
+        }
+        if dtype == (5 as u32) {
+          ep_count = ep_count + 1;
+        }
+        pos = pos + (dlen as i64);
+      }
+    }
+  }
+
+  let _ = uart_puts("USB: config bConfigurationValue=");
+  let _ = uart_put_hex32(config_value);
+  let _ = uart_puts(" bNumInterfaces=");
+  let _ = uart_put_hex32(num_interfaces);
+  let _ = uart_puts(" wTotalLength=");
+  let _ = uart_put_hex32(total_length);
+  let _ = uart_puts(" interfaces_seen=");
+  let _ = uart_put_hex32(iface_count as u32);
+  let _ = uart_puts(" endpoints_seen=");
+  let _ = uart_put_hex32(ep_count as u32);
+  if truncated == 1 {
+    let _ = uart_puts(" (truncated, exceeds 64-byte scratch)");
+  }
+  let _ = uart_puts("\n");
+
+  let _ = dwc2_build_set_configuration_setup(config_value);
+  let set_status: i64 = dwc2_control_no_data(devaddr, mps);
+  if set_status != 0 {
+    let _ = uart_puts("USB: SET_CONFIGURATION failed\n");
+    return 0 - 1;
+  }
+  return 0;
+}
+
 // The address every device answers at before the host assigns it a
 // real one. Two real addresses get handed out across this driver's
 // whole enumeration sequence -- 1 for whatever sits directly on the
@@ -5485,12 +5643,21 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   let _ = uart_put_hex32(d_id_vendor);
   let _ = uart_puts(" idProduct=");
   let _ = uart_put_hex32(d_id_product);
-  if (dblength == (18 as u32)) && (dbdesctype == (1 as u32)) {
-    let _ = uart_puts(" (PASS)\n");
-    return 0;
+  if (dblength != (18 as u32)) || (dbdesctype != (1 as u32)) {
+    let _ = uart_puts(" (FAIL, bad bLength/bDescriptorType)\n");
+    return 0 - 1;
   }
-  let _ = uart_puts(" (FAIL, bad bLength/bDescriptorType)\n");
-  return 0 - 1;
+  let _ = uart_puts(" (PASS)\n");
+
+  // Round 24 (WiFi dongle enumeration prep, 2026-08-28): every device
+  // this driver enumerates -- LAN9512's own Ethernet function today,
+  // a real WiFi dongle eventually -- needs to actually reach the
+  // Configured state before its endpoints are usable for anything.
+  // See dwc2_fetch_and_set_configuration's own comment for the full
+  // story; this is the downstream device's own configuration step,
+  // the same one dwc2_probe_device0 does for whatever sits on the
+  // root port.
+  return dwc2_fetch_and_set_configuration(downstream_addr, dmps0);
 }
 
 // First real enumeration milestone: fetch the first 8 bytes of device
@@ -5568,6 +5735,21 @@ fn dwc2_probe_device0() -> i64 {
     return 0 - 1;
   }
   let _ = uart_puts(" (PASS)\n");
+
+  // Round 24 (WiFi dongle enumeration prep, 2026-08-28): the hub
+  // itself needs to reach the Configured state too, same as any other
+  // device -- USB 2.0 spec chapter 11 hub-class requests (SET_PORT_
+  // FEATURE/GET_PORT_STATUS, already in live use one call below) are
+  // never actually specified as requiring it, and QEMU's own
+  // synthetic hub has always answered them regardless, which is
+  // exactly why this gap went unnoticed through round 14's hub-
+  // enumeration work -- but per spec this is still the correct order
+  // of operations, and a real hub is under no obligation to be as
+  // forgiving as QEMU's model about it.
+  let config_status: i64 = dwc2_fetch_and_set_configuration(new_addr, mps0);
+  if config_status != 0 {
+    return 0 - 1;
+  }
   return dwc2_enumerate_downstream(mps0);
 }
 
