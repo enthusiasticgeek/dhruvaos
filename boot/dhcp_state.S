@@ -38,6 +38,21 @@ dhcp_leased_ip:
                      * address; stored separately from dhcp_offered_ip
                      * rather than assumed identical, since the ACK is
                      * the authoritative source of truth, not the OFFER */
+dhcp_lease_time:
+    .word 0        /* round 22 (2026-08-28): option 51 from the ACK,
+                     * in seconds. 0 means "no lease timer armed" --
+                     * either nothing has ever been bound yet, or the
+                     * ACK didn't carry option 51 at all (real servers
+                     * always should, but this client doesn't insist on
+                     * it; a client that never learns a lease time
+                     * simply never renews, matching how a permanent/
+                     * unknown-length lease would behave in practice). */
+dhcp_lease_start_tick:
+    .word 0        /* round 22: scheduler_get_tick_count()'s value at
+                     * the moment the most recent ACK was accepted --
+                     * T1/T2/expiry are all measured as elapsed ticks
+                     * from THIS point, per RFC 2131 s4.4, not reset at
+                     * each RENEWING/REBINDING state change. */
 
 .section ".text"
 
@@ -102,6 +117,32 @@ dhcp_state_get_leased_ip:
 .global dhcp_state_set_leased_ip
 dhcp_state_set_leased_ip:
     ldr r1, =dhcp_leased_ip
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_state_get_lease_time
+dhcp_state_get_lease_time:
+    ldr r0, =dhcp_lease_time
+    ldr r0, [r0]
+    bx lr
+
+.global dhcp_state_set_lease_time
+dhcp_state_set_lease_time:
+    ldr r1, =dhcp_lease_time
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_state_get_lease_start_tick
+dhcp_state_get_lease_start_tick:
+    ldr r0, =dhcp_lease_start_tick
+    ldr r0, [r0]
+    bx lr
+
+.global dhcp_state_set_lease_start_tick
+dhcp_state_set_lease_start_tick:
+    ldr r1, =dhcp_lease_start_tick
     str r0, [r1]
     mov r0, #0
     bx lr

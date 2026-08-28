@@ -367,6 +367,48 @@ mem_barrier:
     mov r1, #0
     bx lr
 
+/* u32 scheduler_get_tick_count() -- round 22 (2026-08-28): read-only
+ * access to this whole scheduler's own notion of elapsed time (see
+ * this file's own header comment on tick_count, and irq_entry.S's
+ * comment on what actually increments it), needed by DHCP's new
+ * lease-renewal timer (kernel_main.vani's dhcp_client_check_lease) to
+ * measure elapsed time since a lease was granted. u32, not i64,
+ * matching tick_count's own single-word storage and every other
+ * scalar accessor in this project's convention of returning a single
+ * AAPCS register rather than risking the r0:r1-pairing bug class
+ * netif_state.S's netif_set_slot_len hit. Pure read-only
+ * introspection, same safety argument as scheduler_ready_count right
+ * below: no state changes, no scheduling decision made here, safe to
+ * call from any context including an ISR. */
+.global scheduler_get_tick_count
+scheduler_get_tick_count:
+    ldr r0, =tick_count
+    ldr r0, [r0]
+    bx lr
+
+/* TEST-ONLY (round 22, dhcp_renewal_self_test -- not part of any
+ * live path): directly sets tick_count, so a boot self-test can
+ * stage "N seconds have elapsed since the lease was granted" without
+ * either waiting real wall-clock time for real ticks, or subtracting
+ * an assumed margin from whatever tick_count happens to already be
+ * at self-test time -- which, this early in boot, can genuinely
+ * still be 0 or 1, and subtracting from that in u32 space is exactly
+ * the kind of underflow this project's own inconsistent overflow
+ * trap has hit for real before (see e.g. round 2's eval_apply
+ * finding). Safe to mutate directly here specifically because every
+ * self-test in this project runs from kernel_main's own single-
+ * threaded setup, strictly BEFORE start_multitasking creates any task
+ * or unmasks IRQs (see that function's own comment) -- no task's
+ * sleep_until_table entry is meaningful yet, and no real timer IRQ
+ * can fire concurrently to race this write, so there is no scheduling
+ * side effect to worry about. */
+.global scheduler_set_tick_count_test_only
+scheduler_set_tick_count_test_only:
+    ldr r1, =tick_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
 /* i64 scheduler_ready_count() -- Phase 5's run-queue-depth signal for
  * the governor: how many of the 6 tasks have sleep_until_table[i] <=
  * the current tick_count (i.e. are actually ready right now), not

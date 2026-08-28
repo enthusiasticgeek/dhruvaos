@@ -60,6 +60,12 @@ extern "C" fn net_recv_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn net_recv_scratch_get() -> mut ref i64;
 extern "C" fn udp_send_arp_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn udp_send_arp_scratch_get() -> mut ref i64;
+extern "C" fn arp_resolve_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn arp_resolve_scratch_get() -> mut ref i64;
+extern "C" fn dhcp_server_mac_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dhcp_server_mac_scratch_get() -> mut ref i64;
+extern "C" fn arp_resolve_mac_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn arp_resolve_mac_scratch_get() -> mut ref i64;
 extern "C" fn dhcp_payload_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dhcp_payload_scratch_get() -> mut ref i64;
 extern "C" fn dhcp_frame_scratch_set(addr: mut ref i64) -> i64;
@@ -103,6 +109,13 @@ extern "C" fn scheduler_ready_count() -> i64;
 // the full story: a real-hardware memory-ordering gap this project's
 // only test environment (QEMU) can't reveal.
 extern "C" fn mem_barrier() -> i64;
+// Round 22 audit -- context_switch.S's own comment on
+// scheduler_get_tick_count has the full story: DHCP's new lease-
+// renewal timer needs a read-only view of elapsed scheduler time.
+extern "C" fn scheduler_get_tick_count() -> u32;
+// TEST-ONLY -- see context_switch.S's own comment on
+// scheduler_set_tick_count_test_only.
+extern "C" fn scheduler_set_tick_count_test_only(value: u32) -> i64;
 extern "C" fn governor_get_last_applied_mhz() -> i64;
 extern "C" fn governor_set_last_applied_mhz(mhz: i64) -> i64;
 extern "C" fn governor_apply_freq_mhz(mhz: i64) -> i64;
@@ -166,6 +179,12 @@ extern "C" fn dhcp_state_get_server_ip() -> u32;
 extern "C" fn dhcp_state_set_server_ip(value: u32) -> u32;
 extern "C" fn dhcp_state_get_leased_ip() -> u32;
 extern "C" fn dhcp_state_set_leased_ip(value: u32) -> u32;
+// Round 22 (2026-08-28): lease-renewal timer state, same file, same
+// vani-call-boundary reasoning.
+extern "C" fn dhcp_state_get_lease_time() -> u32;
+extern "C" fn dhcp_state_set_lease_time(value: u32) -> u32;
+extern "C" fn dhcp_state_get_lease_start_tick() -> u32;
+extern "C" fn dhcp_state_set_lease_start_tick(value: u32) -> u32;
 
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
 // addressing mode sdhost_init() discovers, across the vani-call-
@@ -2289,6 +2308,130 @@ fn arp_self_test() -> i64 {
   return 0;
 }
 
+// Round 22 audit, 2026-08-28: the live ARP resolution round trip
+// round 21 explicitly deferred rather than building unboundedly --
+// see socket_udp_send's own comment for why a cache MISS there is
+// reported as a real failure rather than triggering a live
+// resolution attempt mid-call. Built here as its own small,
+// poll-based capability instead, matching every other stateful
+// protocol in this project's design (DHCP, TCP): a single synchronous
+// call structurally cannot wait for a live reply, so resolution is
+// split into "send the request" (arp_resolve_start) and a separate
+// "check whether a reply has arrived yet" (arp_resolve_poll) the
+// caller invokes on its own later poll(s) -- exactly dhcp_client_
+// start/dhcp_client_poll's own shape. Not wired into any live caller
+// this round; this is the general capability itself, proven on its
+// own merits by arp_resolve_self_test below. DHCP's own new lease-
+// renewal code (dhcp_client_check_lease) doesn't use this either --
+// it learns the server's MAC for free from the ACK frame it already
+// received, sidestepping the need for a live round trip for that
+// specific, narrower case.
+fn arp_resolve_start(my_mac: mut ref i64, my_ip: u32, target_ip: u32) -> i64 {
+  let req_frame: mut ref i64 = arp_resolve_scratch_get();
+  let req_len: i64 = arp_build_request(req_frame, my_mac, my_ip, target_ip);
+  return netif_send_frame(req_frame, req_len);
+}
+
+// Dequeues the next queued frame and checks whether it's an ARP
+// reply resolving target_ip -- if so, caches it (arp_cache_insert)
+// and returns 1. Returns 0 otherwise, whether because nothing was
+// queued, the frame wasn't ARP, wasn't a reply, or resolved a
+// different address -- same "not every queued frame is mine, drop it
+// and move on" tolerance dhcp_client_poll/socket_udp_recv already
+// have. This project's netif has one shared FIFO queue with no
+// selective peek, so any consumer that finds a frame isn't for it
+// has already consumed it regardless of what this function decides
+// -- an accepted, pre-existing tradeoff (see socket_udp_recv's own
+// comment: "no per-port binding/filtering table exists yet"), not a
+// new limitation introduced here.
+fn arp_resolve_poll(target_ip: u32) -> i64 {
+  let frame: mut ref i64 = arp_resolve_scratch_get();
+  let frame_len: i64 = netif_recv_frame(frame, 64);
+  if frame_len < 0 {
+    return 0;
+  }
+  if arp_is_arp_frame(frame) != 1 {
+    return 0;
+  }
+  if arp_get_operation(frame) != (2 as u32) {
+    return 0;
+  }
+  if arp_get_sender_ip(frame) != target_ip {
+    return 0;
+  }
+  let sender_mac: mut ref i64 = arp_resolve_mac_scratch_get();
+  let _ = arp_get_sender_mac(frame, sender_mac);
+  let _ = arp_cache_insert(target_ip, sender_mac);
+  return 1;
+}
+
+// Boot-time self-test: no real second host exists in this loopback-
+// only environment (same reasoning DHCP's own self-test already
+// establishes), so this drains the request arp_resolve_start queues
+// on the real netif and sanity-checks it, then manually builds a
+// synthetic reply exactly as a real peer would and queues it via the
+// real netif, proving arp_resolve_poll picks it up and updates the
+// cache correctly -- plus the "nothing arrived yet" and "queued
+// frame doesn't match" cases, both real conditions a live caller
+// would hit.
+fn arp_resolve_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let my_ip: u32 = 0xC0A80101 as u32;
+  let target_ip: u32 = 0xC0A80105 as u32; // .5, not touched by any earlier self-test
+
+  // Nothing queued yet -- must report "not resolved," not a false
+  // positive.
+  let none_yet: i64 = arp_resolve_poll(target_ip);
+  if none_yet != 0 {
+    ok = 0;
+  }
+
+  let start_status: i64 = arp_resolve_start(my_mac, my_ip, target_ip);
+  if start_status != 0 {
+    ok = 0;
+  }
+
+  // Drain and sanity-check the request itself before injecting the
+  // synthetic reply below, the same "verify what actually went out"
+  // discipline dhcp_self_test already uses for its own DISCOVER.
+  let req_check: mut ref i64 = dhruva_alloc_bytes(64);
+  let req_check_len: i64 = netif_recv_frame(req_check, 64);
+  if req_check_len < 0 { ok = 0; }
+  if arp_is_arp_frame(req_check) != 1 { ok = 0; }
+  if arp_get_operation(req_check) != (1 as u32) { ok = 0; }
+  if arp_get_target_ip(req_check) != target_ip { ok = 0; }
+
+  // A peer (192.168.1.5) replying to our request.
+  let peer_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = buf_write_byte(peer_mac, 0 as u32, 0x02 as u32);
+  let _ = buf_write_byte(peer_mac, 1 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(peer_mac, 5 as u32, 0x05 as u32);
+  let reply_frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let reply_len: i64 = arp_build_reply(reply_frame, peer_mac, target_ip, my_mac, my_ip);
+  let send_status: i64 = netif_send_frame(reply_frame, reply_len);
+  if send_status != 0 { ok = 0; }
+
+  let resolved: i64 = arp_resolve_poll(target_ip);
+  if resolved != 1 { ok = 0; }
+  let looked_up: mut ref i64 = dhruva_alloc_bytes(8);
+  let found: i64 = arp_cache_lookup(target_ip, looked_up);
+  if found != 1 { ok = 0; }
+  if buf_read_byte(looked_up, 5 as u32) != (0x05 as u32) { ok = 0; }
+
+  let _ = uart_puts("ARP: arp_resolve_start/poll live round trip");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Phase 6: IPv4 (RFC 791), no options (IHL always 5 -- a 20-byte
 // header, deliberately not supporting IP options at all: nothing this
 // project's own from-scratch stack sends or needs to receive requires
@@ -3654,6 +3797,13 @@ fn dhcp_state_init() -> u32 { return 0 as u32; }
 fn dhcp_state_selecting() -> u32 { return 1 as u32; }
 fn dhcp_state_requesting() -> u32 { return 2 as u32; }
 fn dhcp_state_bound() -> u32 { return 3 as u32; }
+// Round 22 (2026-08-28): RFC 2131 s4.4's lease lifecycle, past BOUND
+// -- RENEWING (unicasting to the original server after T1) and
+// REBINDING (broadcasting after T2 if the server never answered the
+// unicast attempt). See dhcp_client_check_lease's own comment for
+// the full state machine.
+fn dhcp_state_renewing() -> u32 { return 4 as u32; }
+fn dhcp_state_rebinding() -> u32 { return 5 as u32; }
 fn dhcp_client_port() -> u32 { return 68 as u32; }
 fn dhcp_server_port() -> u32 { return 67 as u32; }
 
@@ -3735,6 +3885,27 @@ fn dhcp_build_request(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid:
   return 256;
 }
 
+// RFC 2131 s4.3.2: the RENEWING/REBINDING REQUEST is a different
+// shape from dhcp_build_request's own SELECTING-time broadcast --
+// ciaddr is set to the client's own already-leased address (not 0,
+// since the client already has an address it's asking to keep), and
+// neither option 50 (Requested IP) nor option 54 (Server Identifier)
+// are included: ciaddr already conveys the address, and there's no
+// "other server" to disambiguate from since this message either goes
+// unicast directly to the one server that granted the lease
+// (RENEWING) or broadcast with the client fully expecting only its
+// own lessor to recognize and renew it (REBINDING). Whether it goes
+// out unicast or broadcast is entirely the caller's choice of dst_mac/
+// dst_ip -- this builder only knows how to shape the message itself.
+fn dhcp_build_renew_request(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, ciaddr: u32) -> i64 {
+  let _ = dhcp_build_fixed_header(buf, dhcp_offset, mac, xid, dhcp_op_bootrequest(), ciaddr, 0 as u32, 0 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 240) as u32, 53 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 241) as u32, 1 as u32);
+  let _ = buf_write_byte(buf, (dhcp_offset + 242) as u32, dhcp_msgtype_request());
+  let _ = buf_write_byte(buf, (dhcp_offset + 243) as u32, 255 as u32); // End
+  return 244;
+}
+
 fn dhcp_get_op(buf: mut ref i64, dhcp_offset: i64) -> u32 {
   return buf_read_byte(buf, dhcp_offset as u32);
 }
@@ -3743,6 +3914,14 @@ fn dhcp_get_xid(buf: mut ref i64, dhcp_offset: i64) -> u32 {
 }
 fn dhcp_get_yiaddr(buf: mut ref i64, dhcp_offset: i64) -> u32 {
   return buf_read_u32_be(buf, dhcp_offset + 16);
+}
+
+// Round 22: needed to verify dhcp_build_renew_request's own ciaddr
+// field from a self-test -- nothing needed to READ this field before
+// this round, since ciaddr was always 0 in every message this client
+// built until now.
+fn dhcp_get_ciaddr(buf: mut ref i64, dhcp_offset: i64) -> u32 {
+  return buf_read_u32_be(buf, dhcp_offset + 12);
 }
 
 fn dhcp_verify_magic_cookie(buf: mut ref i64, dhcp_offset: i64) -> i64 {
@@ -3849,6 +4028,11 @@ fn dhcp_client_start(my_mac: mut ref i64, xid: u32) -> i64 {
   let _ = dhcp_state_set_xid(xid);
   let _ = dhcp_state_set_offered_ip(0 as u32);
   let _ = dhcp_state_set_server_ip(0 as u32);
+  // Round 22: a stale lease_time from a prior acquisition cycle must
+  // not leak into a fresh DISCOVER attempt and arm a renewal timer
+  // for an address this client no longer holds.
+  let _ = dhcp_state_set_lease_time(0 as u32);
+  let _ = dhcp_state_set_lease_start_tick(0 as u32);
 
   let payload: mut ref i64 = dhcp_payload_scratch_get();
   let payload_len: i64 = dhcp_build_discover(payload, 0, my_mac, xid);
@@ -3873,6 +4057,17 @@ fn dhcp_client_start(my_mac: mut ref i64, xid: u32) -> i64 {
 // transition happened, 0 if a frame was dequeued but irrelevant, -1
 // if nothing was queued.
 fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
+  // Round 22: the lease-expiry/renewal timer has to fire on its own
+  // schedule regardless of whether a frame happens to be queued right
+  // now -- checked first, unconditionally, rather than after the
+  // early "nothing queued" return below (which used to skip past
+  // everything for the exact case -- no traffic -- this check most
+  // needs to run in).
+  let lease_transition: i64 = dhcp_client_check_lease(my_mac);
+  if lease_transition == 1 {
+    return 1;
+  }
+
   let frame: mut ref i64 = dhcp_frame_scratch_get();
   let frame_len: i64 = netif_recv_frame(frame, 512);
   if frame_len < 0 {
@@ -3938,13 +4133,42 @@ fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
     return 1;
   }
 
-  if (client_state == dhcp_state_requesting()) && (msg_type == (dhcp_msgtype_ack() as i64)) {
+  // Round 22: an ACK is expected not just fresh out of REQUESTING but
+  // also as the (re)answer to a RENEWING (unicast) or REBINDING
+  // (broadcast) lease-renewal attempt -- RFC 2131 s4.4 treats all
+  // three the same way, back to BOUND with a refreshed lease.
+  let ack_expected: i64 = if (client_state == dhcp_state_requesting()) || (client_state == dhcp_state_renewing()) || (client_state == dhcp_state_rebinding()) { 1 } else { 0 };
+  if (ack_expected == 1) && (msg_type == (dhcp_msgtype_ack() as i64)) {
     let leased_ip: u32 = dhcp_get_yiaddr(frame, dhcp_offset);
     if leased_ip == (0 as u32) {
       return 0;
     }
     let _ = dhcp_state_set_leased_ip(leased_ip);
     let _ = dhcp_state_set_client_state(dhcp_state_bound());
+
+    // Round 22: arm (or refresh) the lease-renewal timer from option
+    // 51. lease_time staying 0 (the server didn't send option 51) is
+    // treated as "no timer armed" -- see dhcp_lease_time's own .bss
+    // comment for why that's acceptable rather than a hard error.
+    let lease_time: u32 = dhcp_find_option_u32(frame, dhcp_offset, dhcp_len, 51 as u32);
+    let _ = dhcp_state_set_lease_time(lease_time);
+    let _ = dhcp_state_set_lease_start_tick(scheduler_get_tick_count());
+
+    // Round 22: learn the server's MAC for free from this ACK's own
+    // Ethernet source address -- exactly what a real minimal
+    // implementation needs to send a later unicast renewal REQUEST
+    // without a live ARP round trip (see dhcp_client_check_lease's
+    // own comment). Every ACK carries this, not just the very first
+    // one, so a RENEWING/REBINDING refresh keeps it current too.
+    let server_mac: mut ref i64 = dhcp_server_mac_scratch_get();
+    let mi: i64 = 0;
+    while mi < 6 {
+      let mb: u32 = buf_read_byte(frame, (6 + mi) as u32);
+      let _ = buf_write_byte(server_mac, mi as u32, mb);
+      mi = mi + 1;
+    }
+    let _ = arp_cache_insert(dhcp_state_get_server_ip(), server_mac);
+
     return 1;
   }
 
@@ -3965,10 +4189,111 @@ fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
   // already uses -- resetting to INIT and leaving it to the caller to
   // call dhcp_client_start again (with a fresh xid) avoids baking in a
   // retry policy this minimal client has no good way to choose itself.
-  if (client_state == dhcp_state_requesting()) && (msg_type == (dhcp_msgtype_nak() as i64)) {
+  // Round 22: RFC 2131 s4.4 -- "If the client receives a DHCPNAK
+  // message, it cannot reuse its remembered lease and MUST return to
+  // INIT," and that applies just as much to a NAK'd RENEWING/
+  // REBINDING attempt as to the original REQUESTING one this check
+  // already covered.
+  let nak_expected: i64 = if (client_state == dhcp_state_requesting()) || (client_state == dhcp_state_renewing()) || (client_state == dhcp_state_rebinding()) { 1 } else { 0 };
+  if (nak_expected == 1) && (msg_type == (dhcp_msgtype_nak() as i64)) {
     let _ = dhcp_state_set_client_state(dhcp_state_init());
     let _ = dhcp_state_set_offered_ip(0 as u32);
     let _ = dhcp_state_set_server_ip(0 as u32);
+    let _ = dhcp_state_set_leased_ip(0 as u32);
+    let _ = dhcp_state_set_lease_time(0 as u32);
+    return 1;
+  }
+
+  return 0;
+}
+
+// RFC 2131 s4.4's lease lifecycle past BOUND, entirely time-driven
+// (not frame-driven) -- called unconditionally at the top of every
+// dhcp_client_poll, since a lease timeout has nothing to do with
+// whether a frame happens to be queued. lease_time == 0 means no
+// timer is armed at all (never bound yet this cycle, or the server
+// never sent option 51 -- see dhcp_lease_time's own .bss comment).
+// All three thresholds (T1, T2, final expiry) are measured as elapsed
+// ticks from the SAME lease_start_tick throughout -- per spec, not
+// reset at each RENEWING/REBINDING transition. Ticks run at 2/second
+// (timer_ic_init's own 500ms compare interval), computed here rather
+// than assumed inline so the arithmetic's own units are visible at
+// every step: T1 = lease/2, T2 = lease*7/8, both converted from
+// seconds to ticks by the same factor.
+//
+// Deliberately sends at most ONE attempt per threshold (no
+// retransmission/backoff while RENEWING) -- matching this client's
+// own already-established, deliberate scope everywhere else (neither
+// the original DISCOVER nor the original REQUEST retry on their own
+// either; a lost renewal attempt is recovered the same way a lost
+// DISCOVER always has been, by REBINDING's broadcast fallback or,
+// failing that, full re-acquisition from INIT). Returns 1 if a state
+// transition happened (matching dhcp_client_poll's own frame-handling
+// branches), 0 otherwise.
+fn dhcp_client_check_lease(my_mac: mut ref i64) -> i64 {
+  let lease_time: u32 = dhcp_state_get_lease_time();
+  if lease_time == (0 as u32) {
+    return 0;
+  }
+  let client_state: u32 = dhcp_state_get_client_state();
+  if (client_state != dhcp_state_bound()) && (client_state != dhcp_state_renewing()) && (client_state != dhcp_state_rebinding()) {
+    return 0;
+  }
+
+  let ticks_per_second: i64 = 2;
+  let lease_ticks: i64 = (lease_time as i64) * ticks_per_second;
+  let t1_ticks: i64 = lease_ticks / 2;
+  let t2_ticks: i64 = (lease_ticks * 7) / 8;
+  let elapsed_ticks: i64 = (scheduler_get_tick_count() as i64) - (dhcp_state_get_lease_start_tick() as i64);
+
+  if (client_state == dhcp_state_bound()) && (elapsed_ticks >= t1_ticks) {
+    // RFC 2131 s4.3.2: renewal is unicast directly to the server that
+    // granted the lease. Uses the MAC learned for free from that
+    // original ACK's own Ethernet source address (see the ACK-
+    // handling branch above) rather than a live ARP round trip --
+    // arp_cache_lookup here is a defensive fallback (e.g. an older
+    // cache entry evicted by unrelated traffic), not the primary
+    // path; a miss here just means this one attempt is skipped, not
+    // a hang, since RENEWING's own elapsed-time check above already
+    // guarantees forward progress to REBINDING regardless.
+    let server_ip: u32 = dhcp_state_get_server_ip();
+    let dst_mac: mut ref i64 = dhcp_server_mac_scratch_get();
+    if arp_cache_lookup(server_ip, dst_mac) == 1 {
+      let payload: mut ref i64 = dhcp_payload_scratch_get();
+      let xid: u32 = dhcp_state_get_xid();
+      let leased_ip: u32 = dhcp_state_get_leased_ip();
+      let payload_len: i64 = dhcp_build_renew_request(payload, 0, my_mac, xid, leased_ip);
+      let _ = udp_send(my_mac, dst_mac, leased_ip, server_ip, dhcp_client_port(), dhcp_server_port(), payload, payload_len);
+    }
+    let _ = dhcp_state_set_client_state(dhcp_state_renewing());
+    return 1;
+  }
+
+  if (client_state == dhcp_state_renewing()) && (elapsed_ticks >= t2_ticks) {
+    // RFC 2131 s4.3.2: no answer to the unicast attempt by T2 --
+    // broadcast instead, giving ANY server that recognizes this
+    // client's lease a chance to renew it, not just the original one.
+    let payload: mut ref i64 = dhcp_payload_scratch_get();
+    let xid: u32 = dhcp_state_get_xid();
+    let leased_ip: u32 = dhcp_state_get_leased_ip();
+    let payload_len: i64 = dhcp_build_renew_request(payload, 0, my_mac, xid, leased_ip);
+    let bcast_mac: mut ref i64 = dhcp_bcast_mac_scratch_get();
+    let _ = dhcp_broadcast_mac(bcast_mac);
+    let bcast_ip: u32 = 0xFFFFFFFF as u32;
+    let _ = udp_send(my_mac, bcast_mac, leased_ip, bcast_ip, dhcp_client_port(), dhcp_server_port(), payload, payload_len);
+    let _ = dhcp_state_set_client_state(dhcp_state_rebinding());
+    return 1;
+  }
+
+  if (client_state == dhcp_state_rebinding()) && (elapsed_ticks >= lease_ticks) {
+    // RFC 2131 s4.4: the lease has genuinely expired with no response
+    // at all -- give up the address and restart from scratch, same
+    // reset shape as a NAK.
+    let _ = dhcp_state_set_client_state(dhcp_state_init());
+    let _ = dhcp_state_set_offered_ip(0 as u32);
+    let _ = dhcp_state_set_server_ip(0 as u32);
+    let _ = dhcp_state_set_leased_ip(0 as u32);
+    let _ = dhcp_state_set_lease_time(0 as u32);
     return 1;
   }
 
@@ -4093,6 +4418,182 @@ fn dhcp_self_test() -> i64 {
   if dhcp_state_get_leased_ip() != offered_ip { ok = 0; }
 
   let _ = uart_puts("DHCP: client DISCOVER->OFFER->REQUEST->ACK->BOUND");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round 22 audit, 2026-08-28: exercises dhcp_client_check_lease's
+// whole state machine (BOUND -T1-> RENEWING -T2-> REBINDING, plus a
+// refresh ACK and full expiry) -- the RFC 2131 s4.4 lease lifecycle
+// dhcp_self_test above never reaches, since it only ever proves the
+// initial acquisition handshake. Starts directly from an
+// already-BOUND precondition (set up via the same state-setter
+// accessors dhcp_client_poll itself uses) rather than replaying that
+// whole handshake again -- dhcp_self_test already independently
+// covers it, matching arp_resolve_self_test's own "each self-test
+// proves its own concern" reasoning from earlier this round.
+//
+// Backdates lease_start_tick directly to simulate each threshold
+// having elapsed, rather than waiting real wall-clock time for real
+// ticks (a boot self-test cannot afford to actually wait out even an
+// 8-second lease, let alone a realistic one) -- this project's own
+// established way of staging an otherwise-unstageable timing
+// condition without adding any test-only mutation of real system
+// time (see e.g. sdcard_state.S's TEST-ONLY buffer-pattern helpers
+// for the same spirit applied to a different layer). Uses a
+// lease_time (8 seconds) chosen specifically so every threshold's
+// integer tick math divides evenly at this project's fixed 2-ticks/
+// second rate, avoiding any rounding-driven off-by-one between this
+// test's own expectations and dhcp_client_check_lease's actual
+// arithmetic.
+fn dhcp_renewal_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let xid: u32 = 0x22334455 as u32;
+  let leased_ip: u32 = 0xC0A80165 as u32; // 192.168.1.101
+  let server_ip: u32 = 0xC0A80110 as u32; // 192.168.1.16 -- distinct from every other self-test's IPs, avoids any ARP-cache cross-talk
+  let lease_time: u32 = 8 as u32; // seconds
+  let bcast_ip: u32 = 0xFFFFFFFF as u32;
+
+  // Round 22: a known, fixed tick_count baseline -- rather than
+  // reading whatever scheduler_get_tick_count() happens to already be
+  // this early in boot (plausibly still 0 or 1, since timer_ic_init's
+  // very first compare match is 500ms out and self-tests run well
+  // before that elapses) and then trying to backdate FROM it via
+  // subtraction. Subtracting an assumed margin from a small,
+  // uncertain u32 tick_count is exactly the kind of underflow this
+  // project's own inconsistent overflow trap has hit for real before
+  // (round 2's eval_apply finding) -- this test hung outright the
+  // first time it was written that way. Safe to set directly: see
+  // scheduler_set_tick_count_test_only's own comment for why (no task
+  // exists yet, IRQs stay masked through all of kernel_main's setup).
+  // Every threshold below is reached by advancing tick_count FORWARD
+  // from this fixed baseline, never by subtracting.
+  let baseline_tick: u32 = 1000 as u32;
+  let _ = scheduler_set_tick_count_test_only(baseline_tick);
+
+  let _ = dhcp_state_set_client_state(dhcp_state_bound());
+  let _ = dhcp_state_set_xid(xid);
+  let _ = dhcp_state_set_leased_ip(leased_ip);
+  let _ = dhcp_state_set_server_ip(server_ip);
+  let _ = dhcp_state_set_lease_time(lease_time);
+  let _ = dhcp_state_set_lease_start_tick(baseline_tick);
+  let server_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let smi: i64 = 0;
+  while smi < 6 {
+    let _ = buf_write_byte(server_mac, smi as u32, 0xBB as u32);
+    smi = smi + 1;
+  }
+  let _ = arp_cache_insert(server_ip, server_mac);
+
+  // A fresh lease (elapsed=0) must not renew early.
+  let too_early: i64 = dhcp_client_check_lease(my_mac);
+  if too_early != 0 { ok = 0; }
+  if dhcp_state_get_client_state() != dhcp_state_bound() { ok = 0; }
+
+  // Simulate T1 (lease_time/2 seconds = lease_time ticks at this
+  // project's 2-ticks/second rate) having elapsed.
+  let _ = scheduler_set_tick_count_test_only(baseline_tick + lease_time + (1 as u32));
+  let renew_transition: i64 = dhcp_client_check_lease(my_mac);
+  if renew_transition != 1 { ok = 0; }
+  if dhcp_state_get_client_state() != dhcp_state_renewing() { ok = 0; }
+
+  // The renewal REQUEST must go out UNICAST to the server's learned
+  // MAC (not broadcast), with ciaddr set and options 50/54 both
+  // absent, per RFC 2131 s4.3.2.
+  let renew_frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let renew_len: i64 = netif_recv_frame(renew_frame, 512);
+  if renew_len < 240 { ok = 0; }
+  let rmi: i64 = 0;
+  while rmi < 6 {
+    if buf_read_byte(renew_frame, rmi as u32) != (0xBB as u32) { ok = 0; }
+    rmi = rmi + 1;
+  }
+  if dhcp_find_option_byte(renew_frame, 42, renew_len - 42, 53 as u32) != (dhcp_msgtype_request() as i64) { ok = 0; }
+  if dhcp_find_option_u32(renew_frame, 42, renew_len - 42, 50 as u32) != (0 as u32) { ok = 0; }
+  if dhcp_get_ciaddr(renew_frame, 42) != leased_ip { ok = 0; }
+
+  // Simulate T2 (lease_time*7/8 seconds = lease_time*7/4 ticks) too --
+  // measured from the SAME baseline_tick lease_start_tick was set to
+  // above (never reset until a fresh ACK arrives, matching real
+  // RFC 2131 semantics), so this advances tick_count further forward
+  // from baseline_tick, not from wherever the T1 check left it.
+  let t2_ticks_test: u32 = ((lease_time as u32) * (7 as u32)) / (4 as u32);
+  let _ = scheduler_set_tick_count_test_only(baseline_tick + t2_ticks_test + (1 as u32));
+  let rebind_transition: i64 = dhcp_client_check_lease(my_mac);
+  if rebind_transition != 1 { ok = 0; }
+  if dhcp_state_get_client_state() != dhcp_state_rebinding() { ok = 0; }
+
+  let rebind_frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let rebind_len: i64 = netif_recv_frame(rebind_frame, 512);
+  if rebind_len < 240 { ok = 0; }
+  let rbi: i64 = 0;
+  while rbi < 6 {
+    if buf_read_byte(rebind_frame, rbi as u32) != (0xFF as u32) { ok = 0; } // dst: broadcast this time
+    rbi = rbi + 1;
+  }
+
+  // A real ACK arriving while REBINDING must refresh the lease back
+  // to BOUND -- same handling as the original REQUESTING->BOUND
+  // transition, just reached via REBINDING this time.
+  let ack2_msg: mut ref i64 = dhruva_alloc_bytes(300);
+  let _ = dhcp_build_fixed_header(ack2_msg, 0, my_mac, xid, dhcp_op_bootreply(), 0 as u32, leased_ip, server_ip);
+  let _ = buf_write_byte(ack2_msg, 240 as u32, 53 as u32);
+  let _ = buf_write_byte(ack2_msg, 241 as u32, 1 as u32);
+  let _ = buf_write_byte(ack2_msg, 242 as u32, dhcp_msgtype_ack());
+  let _ = buf_write_byte(ack2_msg, 243 as u32, 51 as u32);
+  let _ = buf_write_byte(ack2_msg, 244 as u32, 4 as u32);
+  let _ = buf_write_u32_be(ack2_msg, 245, lease_time);
+  let _ = buf_write_byte(ack2_msg, 249 as u32, 255 as u32); // End
+  let ack2_dhcp_len: i64 = 250;
+
+  let ack2_frame: mut ref i64 = dhruva_alloc_bytes(512);
+  let a2i: i64 = 0;
+  while a2i < 6 {
+    let mb3: u32 = buf_read_byte(my_mac, a2i as u32);
+    let _ = buf_write_byte(ack2_frame, a2i as u32, mb3);
+    a2i = a2i + 1;
+  }
+  let a2j: i64 = 0;
+  while a2j < 6 {
+    let _ = buf_write_byte(ack2_frame, (6 + a2j) as u32, 0xBB as u32); // src: same server MAC
+    a2j = a2j + 1;
+  }
+  let _ = buf_write_u16_be(ack2_frame, 12, 0x0800 as u32);
+  let ack2_udp_len: i64 = udp_build(ack2_frame, 34, dhcp_server_port(), dhcp_client_port(), ack2_msg, ack2_dhcp_len, server_ip, bcast_ip);
+  let ack2_total_len: i64 = 20 + ack2_udp_len;
+  let _ = ipv4_build_header(ack2_frame, 14, ack2_total_len, 17 as u32, server_ip, bcast_ip);
+  let ack2_frame_len: i64 = 14 + ack2_total_len;
+  let send_status3: i64 = netif_send_frame(ack2_frame, ack2_frame_len);
+  if send_status3 != 0 { ok = 0; }
+
+  let poll3: i64 = dhcp_client_poll(my_mac);
+  if poll3 != 1 { ok = 0; }
+  if dhcp_state_get_client_state() != dhcp_state_bound() { ok = 0; }
+  if dhcp_state_get_lease_time() != lease_time { ok = 0; }
+
+  // Finally: full expiry with no response at all while REBINDING must
+  // give up the address, matching a NAK's own reset shape. The
+  // refresh ACK above just reset lease_start_tick to whatever
+  // tick_count was at that moment (dhcp_client_poll's own ACK-
+  // handling branch) -- read it back and advance FORWARD from there
+  // (safe: addition, never subtraction) rather than assuming its
+  // value.
+  let _ = dhcp_state_set_client_state(dhcp_state_rebinding());
+  let lease_ticks_test: u32 = (lease_time as u32) * (2 as u32);
+  let refreshed_start: u32 = dhcp_state_get_lease_start_tick();
+  let _ = scheduler_set_tick_count_test_only(refreshed_start + lease_ticks_test + (1 as u32));
+  let expiry_transition: i64 = dhcp_client_check_lease(my_mac);
+  if expiry_transition != 1 { ok = 0; }
+  if dhcp_state_get_client_state() != dhcp_state_init() { ok = 0; }
+  if dhcp_state_get_leased_ip() != (0 as u32) { ok = 0; }
+
+  let _ = uart_puts("DHCP: lease renewal (BOUND->RENEWING unicast->REBINDING broadcast->refresh/expiry)");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -6164,6 +6665,9 @@ fn kernel_main() -> i64 {
   let _ = net_send_scratch_set(dhruva_alloc_bytes(512));
   let _ = net_recv_scratch_set(dhruva_alloc_bytes(512));
   let _ = udp_send_arp_scratch_set(dhruva_alloc_bytes(6));
+  let _ = arp_resolve_scratch_set(dhruva_alloc_bytes(64));
+  let _ = dhcp_server_mac_scratch_set(dhruva_alloc_bytes(6));
+  let _ = arp_resolve_mac_scratch_set(dhruva_alloc_bytes(6));
   let _ = dhcp_payload_scratch_set(dhruva_alloc_bytes(300));
   let _ = dhcp_frame_scratch_set(dhruva_alloc_bytes(512));
   let _ = dhcp_bcast_mac_scratch_set(dhruva_alloc_bytes(8));
@@ -6354,6 +6858,7 @@ fn kernel_main() -> i64 {
   let _ = netif_init();
   let _ = netif_self_test();
   let _ = arp_self_test();
+  let _ = arp_resolve_self_test();
   let _ = ipv4_self_test();
   let _ = udp_self_test();
   let _ = udp_send_unresolved_self_test();
@@ -6363,6 +6868,7 @@ fn kernel_main() -> i64 {
   let _ = tcp_conn_self_test();
   let _ = tcp_conn_recv_bounds_self_test();
   let _ = dhcp_self_test();
+  let _ = dhcp_renewal_self_test();
   let _ = dhcp_nak_self_test();
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is

@@ -167,6 +167,40 @@ udp_send_arp_scratch_addr:
                          * server, per this project's own existing
                          * comment on the layer it belongs to), not
                          * just its own single-call self-test. */
+arp_resolve_scratch_addr:
+    .word 0             /* 64 bytes: arp_resolve_start's own outgoing
+                         * ARP-request frame buffer (round 22 audit,
+                         * 2026-08-28) -- same shape/size as arp_self_
+                         * test's own req_frame, but this one backs a
+                         * LIVE function meant to be called repeatedly
+                         * (once per address that needs resolving),
+                         * not a single self-test call. */
+dhcp_server_mac_scratch_addr:
+    .word 0             /* 6 bytes: round 22 audit, 2026-08-28 --
+                         * holds the DHCP server's MAC, either just
+                         * extracted from an ACK frame's own Ethernet
+                         * source address (learned for free, no ARP
+                         * round trip needed) or read back via
+                         * arp_cache_lookup right before a unicast
+                         * lease-renewal REQUEST. Dedicated rather than
+                         * reusing udp_send_arp_scratch above -- same
+                         * per-buffer-single-purpose discipline this
+                         * whole file already follows (see e.g. this
+                         * file's own USB-vs-FS-scratch reasoning
+                         * further up), even though the two would
+                         * never actually collide in practice (DHCP
+                         * sends go through udp_send directly, never
+                         * through socket_udp_send). */
+arp_resolve_mac_scratch_addr:
+    .word 0             /* 6 bytes: arp_resolve_poll's own transient
+                         * holding spot for a just-parsed reply's
+                         * sender MAC, before arp_cache_insert. Kept
+                         * separate from dhcp_server_mac_scratch above
+                         * even though nothing currently calls both in
+                         * the same graph -- same reasoning, a name
+                         * that says what actually uses it beats a
+                         * borrowed one that would read as a hidden
+                         * coupling that doesn't exist. */
 dhcp_payload_scratch_addr:
     .word 0             /* 300 bytes: the DHCP client's own message
                          * build buffer (DISCOVER/REQUEST), shared by
@@ -367,6 +401,48 @@ udp_send_arp_scratch_set:
 .global udp_send_arp_scratch_get
 udp_send_arp_scratch_get:
     ldr r0, =udp_send_arp_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global arp_resolve_scratch_set
+arp_resolve_scratch_set:
+    ldr r1, =arp_resolve_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global arp_resolve_scratch_get
+arp_resolve_scratch_get:
+    ldr r0, =arp_resolve_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dhcp_server_mac_scratch_set
+dhcp_server_mac_scratch_set:
+    ldr r1, =dhcp_server_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_server_mac_scratch_get
+dhcp_server_mac_scratch_get:
+    ldr r0, =dhcp_server_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global arp_resolve_mac_scratch_set
+arp_resolve_mac_scratch_set:
+    ldr r1, =arp_resolve_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global arp_resolve_mac_scratch_get
+arp_resolve_mac_scratch_get:
+    ldr r0, =arp_resolve_mac_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
