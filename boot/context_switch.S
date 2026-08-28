@@ -305,12 +305,23 @@ cpu_wfi:
  * memory IT wrote to a genuinely separate hardware bus master reading
  * it via an independent path. Ordinary peripheral-register-to-
  * register sequences (the SD host command/data-transfer path, GPIO
- * alt-function setup, DWC2's own HPRT0 reset sequence) can in
- * principle reorder too per the same Broadcom guidance, but that's a
- * different, lower-severity variant (registers on the SAME peripheral
- * completing out of order, not a DMA engine reading stale application
- * data) -- flagged here as a real, open question for a future round
- * rather than silently left unmentioned, not fixed in this one. */
+ * alt-function setup) were flagged as a real, open question for a
+ * future round rather than silently left unmentioned, not fixed here.
+ *
+ * RESOLVED for DWC2's own HPRT0 reset sequence (round 17 audit,
+ * 2026-08-28, see dwc2_port_reset's own comment in kernel_main.vani
+ * for the full writeup): re-checked against the same Broadcom source
+ * this comment already cites, which draws the line precisely --
+ * "accesses to the same peripheral will always arrive and return
+ * in-order, but it is only when switching from one peripheral to
+ * another that data can arrive out-of-order." Every register
+ * dwc2_init touches on the way into and through dwc2_port_reset
+ * (GSNPSID, GAHBCFG, HPRT0) lives in the one DWC2 IP block at base
+ * 0x20980000 -- no cross-peripheral switch ever happens in that path,
+ * so no barrier is architecturally required there. The SD/GPIO
+ * question above likely resolves the same way (each is also a single
+ * peripheral's own internal register sequence) but wasn't re-verified
+ * against actual call sites this round -- still open until it is. */
 .global mem_barrier
 mem_barrier:
     mov r0, #0

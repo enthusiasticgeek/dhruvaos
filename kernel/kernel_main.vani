@@ -4167,6 +4167,21 @@ fn dwc2_hprt0_w1c_group_mask() -> u32 {
   return 0x2E as u32; // bits 1,2,3,5: CONNDET,ENA,ENACHG,OVRCURRCHG
 }
 
+// AUDITED (round 17, 2026-08-28) -- this function's own read/write/
+// read/write/read/write sequence against HPRT0, and the read/write
+// sequence dwc2_init() runs against GSNPSID/GAHBCFG/HPRT0 on the way
+// in, do NOT need a memory barrier (context_switch.S's mem_barrier,
+// added round 16 for a genuinely different problem -- see that
+// function's own comment). Checked directly against the same
+// Broadcom BCM2835 guidance round 16 already cited: "accesses to the
+// same peripheral will always arrive and return in-order... it is
+// only when switching from one peripheral to another that data can
+// arrive out-of-order." GSNPSID, GAHBCFG, and HPRT0 are all registers
+// of the one DWC2 IP block at base 0x20980000 -- dwc2_init never
+// switches to a different peripheral anywhere on this path, so the
+// out-of-order risk that guidance describes doesn't apply here. This
+// closes the "HPRT0 reset sequence" half of the open question round
+// 16's own mem_barrier comment flagged for a future round.
 fn dwc2_port_reset() -> i64 {
   let hprt0: i64 = dwc2_hprt0_addr();
   let w1c_mask: u32 = dwc2_hprt0_w1c_group_mask();
