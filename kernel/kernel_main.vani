@@ -552,6 +552,54 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   return mmio_read_u32(sdcmd);
 }
 
+// BUG (round 15 audit, 2026-08-28): sdhost_init's own command sequence
+// below used to discard every sdhost_cmd return value outright (`let
+// _ = sdhost_cmd(...)`), self-documented at the time as "no timeout
+// error path yet" -- an acknowledged gap, but still a real one. Round
+// 5's audit fixed exactly this class of bug one layer up
+// (sdhost_read_block/write_block silently treating a software-level
+// poll timeout as success, because SDHSTS's own error bits can't
+// distinguish "the card genuinely errored" from "sdhost_cmd's own
+// 1,000,000-iteration poll gave up before the command ever completed,
+// well before the hardware's own much-longer SDTOUT-based timeout
+// would have fired"). That exact same gap was still open here, in the
+// one-shot commands that bring the card up in the first place --
+// arguably higher-stakes than the read/write path, since a wedged
+// controller during INIT means every later read/write is operating on
+// top of a card that was never actually brought up correctly at all,
+// with nothing anywhere in the boot log to say so. This helper is
+// sdhost_init's own version of the same check.
+fn sdhost_cmd_timed_out(status: u32) -> i64 {
+  if (status & (0x8000 as u32)) != (0 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+// Boot-time self-test for the pure detection logic itself. Actually
+// triggering a genuine sdhost_cmd timeout under QEMU would mean making
+// the emulated card wedge, which isn't something this project has a
+// way to simulate (unlike, say, a corrupted network packet, which is
+// just bytes this driver builds itself) -- but sdhost_cmd_timed_out is
+// a pure function of the raw SDCMD value, directly testable with
+// synthetic inputs exactly like governor_desired_freq_mhz or
+// eval_apply already are, regardless of whether a real timeout can be
+// staged live.
+fn sdhost_cmd_timed_out_self_test() -> i64 {
+  let ok: i64 = 1;
+  if sdhost_cmd_timed_out(0x8000 as u32) != 1 { ok = 0; } // NEW_FLAG still set -> timed out
+  if sdhost_cmd_timed_out(0 as u32) != 0 { ok = 0; }      // NEW_FLAG clear -> completed
+  if sdhost_cmd_timed_out(0x8001 as u32) != 1 { ok = 0; } // NEW_FLAG set + other bits -> still timed out
+  if sdhost_cmd_timed_out(1 as u32) != 0 { ok = 0; }      // other bits set, NEW_FLAG clear -> completed
+  let _ = uart_puts("SD: sdhost_cmd_timed_out detects NEW_FLAG correctly");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // BCM2835 GPIO 48-53 (the "SD_*_R" pins) are shared, muxed pins: on
 // THESE SPECIFIC pins, hardware alt-function encoding 0b100 (ALT0)
 // routes the card to SDHOST, while function-select 0b000 (plain GPIO
@@ -633,15 +681,27 @@ fn sdhost_init() -> i64 {
   let sdrsp0: i64 = 0x20202010;
 
   // CMD0: GO_IDLE_STATE. No response expected.
-  let _ = sdhost_cmd(sdcmd_no_response, 0 as u32);
+  let cmd0_status: u32 = sdhost_cmd(sdcmd_no_response, 0 as u32);
+  if sdhost_cmd_timed_out(cmd0_status) == 1 {
+    let _ = uart_puts("SD: CMD0 (GO_IDLE_STATE) timed out\n");
+    return 0 - 1;
+  }
 
   // CMD8: SEND_IF_COND -- 0x1AA = 2.7-3.6V range + the 0xAA check
   // pattern. A card that doesn't echo it back either doesn't
   // implement CMD8 (an old SDSC card -- not supported by this driver
   // yet) or something's wrong with the link; not checked yet, just
   // logged, since the only card this needs to handle right now is
-  // QEMU's own `-drive if=sd` image.
-  let _ = sdhost_cmd(8 as u32, 0x1AA as u32);
+  // QEMU's own `-drive if=sd` image. A genuine software-level timeout
+  // (the controller itself wedged, not just an old card that doesn't
+  // implement this command) is still a real, distinct failure worth
+  // catching -- an unresponsive CMD8 either way means nothing later in
+  // this sequence stands a real chance either.
+  let cmd8_status: u32 = sdhost_cmd(8 as u32, 0x1AA as u32);
+  if sdhost_cmd_timed_out(cmd8_status) == 1 {
+    let _ = uart_puts("SD: CMD8 (SEND_IF_COND) timed out\n");
+    return 0 - 1;
+  }
   let _ = uart_puts("SD: CMD8 RSP0=0x");
   let _ = uart_put_hex32(mmio_read_u32(sdrsp0));
   let _ = uart_puts("\n");
@@ -657,14 +717,32 @@ fn sdhost_init() -> i64 {
   let voltage_window: u32 = 0x00FF8000 as u32;
   let acmd_iter: i64 = 0;
   let ocr: u32 = 0 as u32;
-  while acmd_iter < 1000 {
-    let _ = sdhost_cmd(55 as u32, 0 as u32);
-    let _ = sdhost_cmd(41 as u32, hcs | voltage_window);
-    ocr = mmio_read_u32(sdrsp0);
-    if (ocr & ocr_busy) != (0 as u32) {
-      break;
+  let acmd41_wedged: i64 = 0;
+  while (acmd_iter < 1000) && (acmd41_wedged == 0) {
+    let cmd55_status: u32 = sdhost_cmd(55 as u32, 0 as u32);
+    let cmd41_status: u32 = sdhost_cmd(41 as u32, hcs | voltage_window);
+    // A software-level timeout on either command here is a different,
+    // more severe condition than the ordinary "OCR busy bit not set
+    // yet" retry this loop already exists to tolerate -- that's the
+    // card correctly reporting it isn't ready; a timeout means the
+    // controller itself never even completed the command, and
+    // retrying against a wedged controller for the remaining
+    // iterations would just be a long wait for something that was
+    // never going to succeed. Distinguished from the ordinary retry
+    // path so it fails fast instead.
+    if (sdhost_cmd_timed_out(cmd55_status) == 1) || (sdhost_cmd_timed_out(cmd41_status) == 1) {
+      acmd41_wedged = 1;
+    } else {
+      ocr = mmio_read_u32(sdrsp0);
+      if (ocr & ocr_busy) != (0 as u32) {
+        break;
+      }
+      acmd_iter = acmd_iter + 1;
     }
-    acmd_iter = acmd_iter + 1;
+  }
+  if acmd41_wedged == 1 {
+    let _ = uart_puts("SD: ACMD41 (CMD55/CMD41) timed out\n");
+    return 0 - 1;
   }
   let _ = uart_puts("SD: ACMD41 done, OCR=0x");
   let _ = uart_put_hex32(ocr);
@@ -673,28 +751,48 @@ fn sdhost_init() -> i64 {
   // CMD2: ALL_SEND_CID -- long (136-bit) response. No addressing yet
   // (this is the one open-drain-style "every card on the bus
   // responds" command) -- fine here since exactly one card exists.
-  let _ = sdhost_cmd(sdcmd_long_response | (2 as u32), 0 as u32);
+  let cmd2_status: u32 = sdhost_cmd(sdcmd_long_response | (2 as u32), 0 as u32);
+  if sdhost_cmd_timed_out(cmd2_status) == 1 {
+    let _ = uart_puts("SD: CMD2 (ALL_SEND_CID) timed out\n");
+    return 0 - 1;
+  }
 
   // CMD3: SEND_RELATIVE_ADDR -- the card publishes its own RCA in the
   // top 16 bits of the (short) response; every later addressed
   // command needs it in that same position, so no shift is needed
   // between reading it here and using it below.
-  let _ = sdhost_cmd(3 as u32, 0 as u32);
+  let cmd3_status: u32 = sdhost_cmd(3 as u32, 0 as u32);
+  if sdhost_cmd_timed_out(cmd3_status) == 1 {
+    let _ = uart_puts("SD: CMD3 (SEND_RELATIVE_ADDR) timed out\n");
+    return 0 - 1;
+  }
   let rca: u32 = mmio_read_u32(sdrsp0) & (0xFFFF0000 as u32);
 
   // CMD9: SEND_CSD -- long response, addressed by the RCA just
   // published. Not parsed yet (card capacity/speed class live here on
   // real hardware) -- deferred until the driver actually needs it.
-  let _ = sdhost_cmd(sdcmd_long_response | (9 as u32), rca);
+  let cmd9_status: u32 = sdhost_cmd(sdcmd_long_response | (9 as u32), rca);
+  if sdhost_cmd_timed_out(cmd9_status) == 1 {
+    let _ = uart_puts("SD: CMD9 (SEND_CSD) timed out\n");
+    return 0 - 1;
+  }
 
   // CMD7: SELECT_CARD -- moves the card from stand-by to transfer
   // state; every data command (CMD17/CMD24 etc., task #3) requires
   // this first.
-  let _ = sdhost_cmd(sdcmd_busywait | (7 as u32), rca);
+  let cmd7_status: u32 = sdhost_cmd(sdcmd_busywait | (7 as u32), rca);
+  if sdhost_cmd_timed_out(cmd7_status) == 1 {
+    let _ = uart_puts("SD: CMD7 (SELECT_CARD) timed out\n");
+    return 0 - 1;
+  }
 
   // CMD16: SET_BLOCKLEN -- this driver only ever uses 512-byte
   // blocks, set once here rather than before every single read/write.
-  let _ = sdhost_cmd(16 as u32, 512 as u32);
+  let cmd16_status: u32 = sdhost_cmd(16 as u32, 512 as u32);
+  if sdhost_cmd_timed_out(cmd16_status) == 1 {
+    let _ = uart_puts("SD: CMD16 (SET_BLOCKLEN) timed out\n");
+    return 0 - 1;
+  }
 
   // OCR bit 30 (CCS, Card Capacity Status) is only meaningful once
   // ACMD41 reported busy=0 (ready) above -- 1 means SDHC/SDXC
@@ -5873,7 +5971,23 @@ fn kernel_main() -> i64 {
   let _ = dhcp_frame_scratch_set(dhruva_alloc_bytes(512));
   let _ = dhcp_bcast_mac_scratch_set(dhruva_alloc_bytes(8));
 
-  let _ = sdhost_init();
+  let _ = sdhost_cmd_timed_out_self_test();
+
+  // BUG (round 15 audit, 2026-08-28): sdhost_init's own return value
+  // (RCA on success, -1 on a newly-detected command timeout -- see
+  // sdhost_cmd_timed_out's own comment) used to be discarded entirely
+  // here, same as every individual command inside sdhost_init used to
+  // discard its own status. Even after fixing detection inside
+  // sdhost_init itself, a failure would have stayed completely
+  // invisible one level up -- boot would have silently continued into
+  // fs_init() and beyond against a card that was never actually
+  // brought up, with nothing in the log to explain why every later SD
+  // operation was failing. Reported the same way dwc2_init's own
+  // status already is, just below.
+  let sd_status: i64 = sdhost_init();
+  if sd_status < 0 {
+    let _ = uart_puts("SD: sdhost_init FAILED (see the timeout message above for which command)\n");
+  }
 
   // Task #3 verification: write+read+compare across several distinct
   // blocks, to confirm the driver holds up across many consecutive
