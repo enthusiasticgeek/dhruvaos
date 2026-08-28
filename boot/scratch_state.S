@@ -157,6 +157,16 @@ net_recv_scratch_addr:
                          * this one since its `frame` is always a
                          * caller-supplied parameter, never its own
                          * internal allocation. */
+udp_send_arp_scratch_addr:
+    .word 0             /* 6 bytes: socket_udp_send's own resolved-
+                         * destination-MAC buffer (round 21 audit,
+                         * 2026-08-28). Same "never dhruva_alloc_bytes
+                         * on every call" reasoning as every other
+                         * buffer in this file -- socket_udp_send is
+                         * meant to be reused by real callers (an echo
+                         * server, per this project's own existing
+                         * comment on the layer it belongs to), not
+                         * just its own single-call self-test. */
 dhcp_payload_scratch_addr:
     .word 0             /* 300 bytes: the DHCP client's own message
                          * build buffer (DISCOVER/REQUEST), shared by
@@ -343,6 +353,20 @@ net_recv_scratch_set:
 .global net_recv_scratch_get
 net_recv_scratch_get:
     ldr r0, =net_recv_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global udp_send_arp_scratch_set
+udp_send_arp_scratch_set:
+    ldr r1, =udp_send_arp_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global udp_send_arp_scratch_get
+udp_send_arp_scratch_get:
+    ldr r0, =udp_send_arp_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

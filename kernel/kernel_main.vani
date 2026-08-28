@@ -58,6 +58,8 @@ extern "C" fn net_send_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn net_send_scratch_get() -> mut ref i64;
 extern "C" fn net_recv_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn net_recv_scratch_get() -> mut ref i64;
+extern "C" fn udp_send_arp_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn udp_send_arp_scratch_get() -> mut ref i64;
 extern "C" fn dhcp_payload_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dhcp_payload_scratch_get() -> mut ref i64;
 extern "C" fn dhcp_frame_scratch_set(addr: mut ref i64) -> i64;
@@ -2626,8 +2628,34 @@ fn udp_send(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32,
 // non-UDP frame rather than actually demultiplexing by port. A real
 // multi-socket implementation would need that; this is enough to
 // prove the layers below it end-to-end, per this phase's own scope.
+// BUG (round 21 audit, 2026-08-28): this used to hardcode `my_mac` as
+// the destination MAC unconditionally -- a loopback-only assumption
+// baked directly into the one layer explicitly documented as hiding
+// this exact plumbing from callers. It happened to "work" only
+// because there is no other real host on this project's only tested
+// link: whatever remote_ip claims, the frame still had to physically
+// go to yourself to be receivable at all. On real hardware
+// (LAN9512/WiFi), a genuinely different peer's MAC has to actually be
+// known before a unicast frame can reach it -- arp_cache_lookup/
+// arp_cache_insert/arp_build_request/arp_build_reply were all already
+// implemented and self-tested (arp_self_test), but had ZERO live
+// callers anywhere in the codebase, the same "correct function nobody
+// calls" bug class rounds 8 and 11 already found in this file. Fixed
+// by requiring the destination to already be ARP-resolved (a cache
+// hit) before sending -- matching every other layer in this project's
+// established poll-don't-block design (DHCP/TCP never block inside a
+// single call waiting on a live round trip either): a synchronous
+// send function has no way to synchronously wait for an ARP reply
+// without restructuring this whole layer into a stateful poll loop,
+// so a cache miss is reported as a real, honest failure (-1, "no
+// route to host") rather than silently substituting a MAC that's
+// certain to be wrong for any real off-loopback destination.
 fn socket_udp_send(my_mac: mut ref i64, local_ip: u32, remote_ip: u32, local_port: u32, remote_port: u32, payload: mut ref i64, payload_len: i64) -> i64 {
-  return udp_send(my_mac, my_mac, local_ip, remote_ip, local_port, remote_port, payload, payload_len);
+  let dst_mac: mut ref i64 = udp_send_arp_scratch_get();
+  if arp_cache_lookup(remote_ip, dst_mac) != 1 {
+    return 0 - 1;
+  }
+  return udp_send(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, payload, payload_len);
 }
 
 // Receives the next queued frame; if it's UDP, copies its payload into
@@ -2713,6 +2741,19 @@ fn socket_udp_recv(out_payload: mut ref i64, out_meta: mut ref i64, max_payload_
 // Boot-time self-test: send a UDP datagram over the loopback netif,
 // receive it back through the socket API, and verify the payload,
 // port/address metadata, and the empty-queue case afterward.
+//
+// BUG (round 21 audit, 2026-08-28): socket_udp_send now requires
+// remote_ip to already be ARP-resolved (see its own comment for the
+// full story) rather than silently sending to itself -- so this test
+// pre-populates the cache with arp_cache_insert(remote_ip, my_mac)
+// before calling it, standing in for "ARP already happened" the same
+// way DHCP's own self-test manually builds a synthetic server reply
+// instead of needing a real second host. This tests UDP header
+// build/parse/checksum round-tripping specifically; arp_self_test
+// already independently covers the ARP mechanics themselves. Depends
+// on arp_self_test having already run this boot (it's the one place
+// arp_cache_init actually gets called) -- see kernel_main's own call
+// order.
 fn udp_self_test() -> i64 {
   let ok: i64 = 1;
   let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
@@ -2729,6 +2770,7 @@ fn udp_self_test() -> i64 {
   let _ = buf_write_byte(payload, 3 as u32, 108 as u32);
   let _ = buf_write_byte(payload, 4 as u32, 111 as u32);
 
+  let _ = arp_cache_insert(remote_ip, my_mac);
   let send_status: i64 = socket_udp_send(my_mac, local_ip, remote_ip, local_port, remote_port, payload, 5);
   if send_status != 0 {
     ok = 0;
@@ -2769,6 +2811,44 @@ fn udp_self_test() -> i64 {
   }
 
   let _ = uart_puts("UDP: socket send/recv over loopback + checksum");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Regression test for round 21's fix (see socket_udp_send's own
+// comment): sending to an IP that was never ARP-resolved must be
+// rejected outright, not silently sent to whatever MAC happens to be
+// convenient (this project's own MAC, the loopback-only shortcut that
+// used to sit here unconditionally). Deliberately uses an IP no
+// earlier self-test this boot has ever called arp_cache_insert for.
+fn udp_send_unresolved_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let local_ip: u32 = 0xC0A80101 as u32;
+  let never_resolved_ip: u32 = 0xC0A80103 as u32; // .3, never cached
+  let payload: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = buf_write_byte(payload, 0 as u32, 65 as u32);
+
+  let send_status: i64 = socket_udp_send(my_mac, local_ip, never_resolved_ip, 12345 as u32, 7 as u32, payload, 1);
+  if send_status != (0 - 1) {
+    ok = 0;
+  }
+  // Confirm the rejection didn't leak a phantom frame onto the queue
+  // either -- a caller retrying after resolving the address must see
+  // an empty queue, not a stale, wrongly-addressed one from the
+  // rejected attempt.
+  let drain: mut ref i64 = dhruva_alloc_bytes(16);
+  let drain_status: i64 = netif_recv_frame(drain, 16);
+  if drain_status != (0 - 1) {
+    ok = 0;
+  }
+
+  let _ = uart_puts("UDP: socket_udp_send rejects an unresolved destination");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -6083,6 +6163,7 @@ fn kernel_main() -> i64 {
   let _ = tcp_empty_payload_scratch_set(dhruva_alloc_bytes(1));
   let _ = net_send_scratch_set(dhruva_alloc_bytes(512));
   let _ = net_recv_scratch_set(dhruva_alloc_bytes(512));
+  let _ = udp_send_arp_scratch_set(dhruva_alloc_bytes(6));
   let _ = dhcp_payload_scratch_set(dhruva_alloc_bytes(300));
   let _ = dhcp_frame_scratch_set(dhruva_alloc_bytes(512));
   let _ = dhcp_bcast_mac_scratch_set(dhruva_alloc_bytes(8));
@@ -6275,6 +6356,7 @@ fn kernel_main() -> i64 {
   let _ = arp_self_test();
   let _ = ipv4_self_test();
   let _ = udp_self_test();
+  let _ = udp_send_unresolved_self_test();
   let _ = udp_recv_bounds_self_test();
   let _ = udp_checksum_reject_self_test();
   let _ = tcp_self_test();
