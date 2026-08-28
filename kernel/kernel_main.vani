@@ -5284,57 +5284,56 @@ fn dwc2_downstream_addr() -> u32 {
 fn dwc2_hub_port1() -> u32 {
   return 1 as u32;
 }
+// Round 23 (real-hardware-only prep, 2026-08-28): this project's own
+// documented real target, the LAN9512 combo hub/Ethernet chip every
+// Pi 1 Model B actually has (BCM2835 itself has no native Ethernet
+// MAC), has exactly two downstream USB PHYs -- confirmed against
+// Microchip's own LAN9512/LAN9512i datasheet. See dwc2_enumerate_
+// downstream's own comment for why both ports get tried.
+fn dwc2_hub_port2() -> u32 {
+  return 2 as u32;
+}
 
-// Powers on and resets hub downstream port 1, then enumerates
-// whatever answers at address 0 behind it (a fresh, independent
-// per-device address space -- the hub itself already moved to
-// dwc2_hub_addr(), so address 0 unambiguously means "the downstream
-// device" from this point on: `usb_find_device`'s own address-0-first
-// lookup against the hub falls through to the hub class's recursive
-// `find_device` once the hub's own addr no longer matches, per QEMU's
-// hw/usb/core.c/bus.c -- confirmed by reading that dispatch chain
-// before assuming a control transfer "through" a hub would just work).
-// Mirrors dwc2_probe_device0's own root-port sequence closely on
-// purpose: same shape of problem (bring a port up, then enumerate
-// whatever answers at address 0 through it), just reached via hub
-// class requests (SET_PORT_FEATURE/GET_PORT_STATUS) instead of HPRT0's
-// raw register bits.
-fn dwc2_enumerate_downstream() -> i64 {
-  let hub_addr: u32 = dwc2_hub_addr();
-  let hub_mps: u32 = 8 as u32; // learned from dwc2_probe_device0's own hub descriptor fetch
-  let port: u32 = dwc2_hub_port1();
-
+// Powers on and resets one hub downstream port, polling for the hub's
+// own PORT_RESET completion rather than trusting a fixed delay.
+//
+// BUG (round 14 audit, 2026-08-28): this function's own comment
+// (see the header comment on hub_feature_port_enable et al.) states
+// the design principle in so many words -- "PORT_RESET's own
+// completion has to be observed via the port's status/change bits
+// rather than assumed from timing alone" -- but the code used to do
+// exactly the thing that comment says it doesn't: one fixed delay,
+// then a SINGLE GET_PORT_STATUS read, trusting wPortStatus's ENABLE
+// bit immediately with no check that the hub had actually finished
+// processing the reset yet. That's a real gap, not just a stale
+// comment: unlike the ROOT port (HPRT0's ENA bit is set synchronously
+// by the model itself during the very same RST-deassert MMIO write,
+// per dwc2_port_reset's own extensively-verified comment), a
+// downstream hub is a separate device that processes SET_PORT_
+// FEATURE(PORT_RESET) asynchronously -- there's no guarantee its
+// internal port state machine has finished resetting by the time the
+// control transfer's STATUS stage completes on the wire, only that
+// the REQUEST was received. This only worked at all because QEMU's
+// emulated hub happens to finish fast enough within one 50000-unit
+// delay; it would not be robust against a real hub, or even a
+// differently-timed emulated one. Fixed by actually polling
+// wPortChange's C_PORT_RESET bit (bit4, 0x10 -- a completely
+// different numbering space from the SET/CLEAR_PORT_FEATURE feature
+// selectors just above, which is why this couldn't just reuse
+// hub_feature_c_port_reset()'s own value of 20) until it's genuinely
+// observed set, bounded (not `while true`) like every other poll
+// loop in this codebase.
+//
+// Returns 0 if the port came up connected+enabled, 1 if it's simply
+// not connected (a normal condition -- the caller may try another
+// port), -1 on a genuine hub communication failure (worth aborting
+// on, not worth trying another port for).
+fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
   let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port, hub_feature_port_power());
   let _ = delay(50000);
   let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port, hub_feature_port_reset());
   let _ = delay(50000);
 
-  // BUG (round 14 audit, 2026-08-28): this function's own comment right
-  // above (see the header comment on hub_feature_port_enable et al.)
-  // states the design principle in so many words -- "PORT_RESET's own
-  // completion has to be observed via the port's status/change bits
-  // rather than assumed from timing alone" -- but the code used to do
-  // exactly the thing that comment says it doesn't: one fixed delay,
-  // then a SINGLE GET_PORT_STATUS read, trusting wPortStatus's ENABLE
-  // bit immediately with no check that the hub had actually finished
-  // processing the reset yet. That's a real gap, not just a stale
-  // comment: unlike the ROOT port (HPRT0's ENA bit is set synchronously
-  // by the model itself during the very same RST-deassert MMIO write,
-  // per dwc2_port_reset's own extensively-verified comment), a
-  // downstream hub is a separate device that processes SET_PORT_
-  // FEATURE(PORT_RESET) asynchronously -- there's no guarantee its
-  // internal port state machine has finished resetting by the time the
-  // control transfer's STATUS stage completes on the wire, only that
-  // the REQUEST was received. This only worked at all because QEMU's
-  // emulated hub happens to finish fast enough within one 50000-unit
-  // delay; it would not be robust against a real hub, or even a
-  // differently-timed emulated one. Fixed by actually polling
-  // wPortChange's C_PORT_RESET bit (bit4, 0x10 -- a completely
-  // different numbering space from the SET/CLEAR_PORT_FEATURE feature
-  // selectors just above, which is why this couldn't just reuse
-  // hub_feature_c_port_reset()'s own value of 20) until it's genuinely
-  // observed set, bounded (not `while true`) like every other poll
-  // loop in this codebase.
   let status_buf: mut ref i64 = dhruva_alloc_bytes(4);
   let c_port_reset_bit: u32 = 0x10 as u32; // wPortChange bit4
   let reset_seen: i64 = 0;
@@ -5360,10 +5359,10 @@ fn dwc2_enumerate_downstream() -> i64 {
     poll_iter = poll_iter + 1;
   }
   if reset_seen == 0 {
-    let _ = uart_puts("USB: hub port1 never reported PORT_RESET complete\n");
+    let _ = uart_puts("USB: hub port never reported PORT_RESET complete\n");
     return 0 - 1;
   }
-  let _ = uart_puts("USB: hub port1 status=");
+  let _ = uart_puts("USB: hub port status=");
   let _ = uart_put_hex32(port_status);
   let _ = uart_puts("\n");
 
@@ -5372,7 +5371,75 @@ fn dwc2_enumerate_downstream() -> i64 {
 
   // PORT_CONNECTION=bit0, PORT_ENABLE=bit1.
   if (port_status & (0x3 as u32)) != (0x3 as u32) {
-    let _ = uart_puts("USB: no downstream device (port not connected+enabled)\n");
+    return 1;
+  }
+  return 0;
+}
+
+// Tries hub downstream port 1, then port 2, and enumerates whatever
+// answers at address 0 behind whichever one actually has a device
+// (a fresh, independent per-device address space -- the hub itself
+// already moved to dwc2_hub_addr(), so address 0 unambiguously means
+// "the downstream device" from this point on: `usb_find_device`'s own
+// address-0-first lookup against the hub falls through to the hub
+// class's recursive `find_device` once the hub's own addr no longer
+// matches, per QEMU's hw/usb/core.c/bus.c -- confirmed by reading
+// that dispatch chain before assuming a control transfer "through" a
+// hub would just work). Mirrors dwc2_probe_device0's own root-port
+// sequence closely on purpose: same shape of problem (bring a port
+// up, then enumerate whatever answers at address 0 through it), just
+// reached via hub class requests (SET_PORT_FEATURE/GET_PORT_STATUS)
+// instead of HPRT0's raw register bits. Which port ends up carrying
+// the device doesn't matter beyond this point -- once a port is
+// enabled, address-0 control transfers reach whatever's plugged into
+// it regardless of the port number, so nothing below needs to know
+// which one it was.
+//
+// hub_mps is the hub's OWN bMaxPacketSize0, learned by the caller
+// (dwc2_probe_device0) from its device descriptor fetch and passed in
+// here -- round 23 audit, 2026-08-28 (real-hardware-only prep): this
+// used to be a hardcoded literal 8 with a comment claiming it was
+// "learned from dwc2_probe_device0's own hub descriptor fetch," which
+// was misleading -- nothing actually threaded that learned value
+// here, the literal just happened to match QEMU's own synthetic hub
+// model, which does report bMaxPacketSize0=8. A real hub reports
+// something else: confirmed against this project's real target, the
+// LAN9512 combo hub/Ethernet chip every Pi 1 Model B actually has
+// (BCM2835 has no native Ethernet MAC), whose hub function enumerates
+// with idVendor:idProduct 0424:9512 and bMaxPacketSize0=64 -- every
+// control transfer this function makes to the hub itself would have
+// silently miscalculated its own transfer size against real hardware.
+// The same "derive from the single learned source of truth, don't
+// hardcode a number that merely matches today" fix round 11 already
+// applied to netif_get_mtu().
+//
+// Round 23 also generalizes port 1 -> port 1-then-2: LAN9512 has
+// exactly two downstream USB PHYs (confirmed against Microchip's own
+// datasheet), and its internally-wired Ethernet function's specific
+// port number is EEPROM-configured per board design, not a fixed
+// constant ("the downstream ports... can be reordered... to support
+// multiple platform designs," per that same datasheet) -- hardcoding
+// "port 1 only" risks silently never finding a real device wired to
+// port 2. QEMU's own synthetic root hub here only ever exposes one
+// addressable port (confirmed empirically: attaching a second QEMU
+// USB device at port=2 on this same bus fails with "port 2 ... not
+// found"), so the port-2 fallback path is correct by inspection
+// against the real datasheet, not verified behaviorally the way
+// everything else in this project is -- the same category of gap as
+// this project's own DVFS-wattage and USB-timing caveats elsewhere,
+// flagged rather than silently assumed away. Costs nothing when
+// nothing's there: the existing "not connected" handling already
+// covers a genuinely empty port 2 cleanly.
+fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
+  let hub_addr: u32 = dwc2_hub_addr();
+
+  let bring_up_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port1());
+  let final_result: i64 = bring_up_result;
+  if bring_up_result == 1 {
+    final_result = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port2());
+  }
+  if final_result != 0 {
+    let _ = uart_puts("USB: no downstream device (checked both hub ports)\n");
     return 0 - 1;
   }
 
@@ -5501,7 +5568,7 @@ fn dwc2_probe_device0() -> i64 {
     return 0 - 1;
   }
   let _ = uart_puts(" (PASS)\n");
-  return dwc2_enumerate_downstream();
+  return dwc2_enumerate_downstream(mps0);
 }
 
 // Phase 2 priority-inversion demo. All three tasks share one mutex
