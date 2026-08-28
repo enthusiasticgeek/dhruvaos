@@ -2288,6 +2288,33 @@ fn udp_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, udp_offset: i64, u
   return result;
 }
 
+// BUG (round 8 audit, 2026-08-27): no udp_verify_checksum existed at
+// all, and socket_udp_recv (the live UDP receive path) never checked
+// an incoming datagram's checksum against anything -- despite every
+// other layer in this stack having a working, self-tested verify
+// function (ipv4_verify_checksum, tcp_verify_checksum) sitting right
+// next to its own build/checksum function. A corrupted UDP datagram
+// (bit-flipped in transit -- the exact threat model this project's
+// own FS layer takes seriously enough to checksum every record for)
+// would be silently accepted and handed to the caller as valid data.
+//
+// The verify criterion here is NOT the same as tcp_verify_checksum's
+// `== 0` -- confirmed by working through the arithmetic (and checked
+// against a standalone vani test): udp_checksum has an extra step
+// tcp_checksum doesn't (RFC 768's "never transmit a literal 0, send
+// 0xFFFF instead" substitution). Re-summing a valid, as-transmitted
+// datagram (checksum field included) always folds to exactly 0xFFFF,
+// which udp_checksum's own zero-substitution rule then maps back to
+// 0xFFFF again (not 0) -- so a valid datagram makes udp_checksum
+// return 0xFFFF, matching ipv4_verify_checksum's convention, not
+// tcp_verify_checksum's.
+fn udp_verify_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, udp_offset: i64, udp_len: i64) -> i64 {
+  if udp_checksum(src_ip, dst_ip, frame, udp_offset, udp_len) == (0xFFFF as u32) {
+    return 1;
+  }
+  return 0;
+}
+
 // Writes the UDP header+payload at frame[udp_offset..), returning the
 // UDP length (header+payload). Caller still has to build the IP
 // header around this afterward (see udp_send below) -- kept separate
@@ -2410,6 +2437,18 @@ fn socket_udp_recv(out_payload: mut ref i64, out_meta: mut ref i64, max_payload_
   if payload_len > max_payload_len {
     return 0 - 1;
   }
+  // BUG (round 8 audit, 2026-08-27): this function never checked the
+  // datagram's own checksum against anything -- see udp_verify_
+  // checksum's own comment for the full story. Checked here, after
+  // the length/bounds validation above (so the checksum is computed
+  // over a range already known to be in-bounds) and before the
+  // payload copy, same "reject, don't guess" posture as every other
+  // check in this function.
+  let src_ip_for_checksum: u32 = ipv4_get_src_ip(frame, 14);
+  let dst_ip_for_checksum: u32 = ipv4_get_dst_ip(frame, 14);
+  if udp_verify_checksum(src_ip_for_checksum, dst_ip_for_checksum, frame, 34, udp_len as i64) != 1 {
+    return 0 - 1;
+  }
   let i: i64 = 0;
   while i < payload_len {
     let b: u32 = buf_read_byte(frame, (42 + i) as u32); // 14 + 20 + 8
@@ -2524,9 +2563,10 @@ fn udp_recv_bounds_self_test() -> i64 {
 
   // Corrupt ONLY the UDP header's own length field (checksum is left
   // stale/mismatched on purpose -- this test targets the length
-  // bounds check specifically, not checksum validation, and
-  // socket_udp_recv doesn't check the checksum at all currently; see
-  // that function's own comment).
+  // bounds check specifically, not checksum validation; the too-large
+  // length is rejected by the bounds check below before checksum
+  // verification is even reached. See udp_checksum_reject_self_test
+  // right after this function for the checksum-specific case).
   let _ = buf_write_u16_be(frame, 34 + 4, 60000 as u32);
 
   let send_status: i64 = netif_send_frame(frame, real_frame_len);
@@ -2542,6 +2582,57 @@ fn udp_recv_bounds_self_test() -> i64 {
   }
 
   let _ = uart_puts("UDP: recv rejects a length field past what was actually received");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Regression test for round 8's checksum-verification fix (see
+// udp_verify_checksum's own comment): a UDP datagram with a perfectly
+// valid length but corrupted PAYLOAD bytes must now be rejected too --
+// before this fix, socket_udp_recv never checked the checksum at all,
+// so this exact corruption would have been silently accepted and
+// handed to the caller as if it were valid data.
+fn udp_checksum_reject_self_test() -> i64 {
+  let ok: i64 = 1;
+  let local_ip: u32 = 0xC0A80101 as u32;
+  let remote_ip: u32 = 0xC0A80102 as u32;
+
+  let frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let i: i64 = 0;
+  while i < 12 {
+    let _ = buf_write_byte(frame, i as u32, 0 as u32); // dst/src MAC, don't care
+    i = i + 1;
+  }
+  let _ = buf_write_u16_be(frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let payload: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = buf_write_byte(payload, 0 as u32, 65 as u32); // 'A'
+  let real_udp_len: i64 = udp_build(frame, 34, 1 as u32, 2 as u32, payload, 1, local_ip, remote_ip);
+  let real_total_len: i64 = 20 + real_udp_len;
+  let _ = ipv4_build_header(frame, 14, real_total_len, 17 as u32, local_ip, remote_ip);
+  let real_frame_len: i64 = 14 + real_total_len;
+
+  // Corrupt ONLY the payload byte -- length fields (both IPv4 and UDP)
+  // stay correct, so this must pass every bounds check and be rejected
+  // by checksum verification specifically.
+  let _ = buf_write_byte(frame, 42 as u32, 66 as u32); // 'A' -> 'B', 14+20+8=42
+
+  let send_status: i64 = netif_send_frame(frame, real_frame_len);
+  if send_status != 0 {
+    ok = 0;
+  }
+
+  let recv_payload: mut ref i64 = dhruva_alloc_bytes(4);
+  let recv_meta: mut ref i64 = dhruva_alloc_bytes(8);
+  let status: i64 = socket_udp_recv(recv_payload, recv_meta, 4);
+  if status != (0 - 1) {
+    ok = 0;
+  }
+
+  let _ = uart_puts("UDP: recv rejects a datagram with a corrupted checksum");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -2841,6 +2932,27 @@ fn tcp_conn_passive_open(conn_id: u32, local_ip: u32, local_port: u32) -> i64 {
 //         duplicate/out-of-order segments in a scope this minimal
 //         implementation doesn't attempt to handle)
 fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_mac: mut ref i64, dst_mac: mut ref i64, out_payload: mut ref i64, max_payload_len: i64) -> i64 {
+  // BUG (round 8 audit, 2026-08-27): this function -- the live TCP
+  // receive path -- never checked an incoming segment's checksum
+  // against anything, despite tcp_checksum/tcp_verify_checksum both
+  // already existing, working, and self-tested. A corrupted segment
+  // (bit-flipped in transit) would be processed as if valid, its
+  // flags/seq/ack all trusted outright. Checked here, before any of
+  // the state-machine branches below, so it covers every segment type
+  // uniformly (a control-only segment's flags could be corrupted just
+  // as easily as a data segment's payload) -- same "reject, don't
+  // guess" posture as every other check in this networking layer.
+  // tcp_len is computed from recv_len (already trusted -- how many
+  // bytes netif actually received, per round 1's audit) rather than
+  // the segment's own data_offset field, since the checksum has to
+  // cover the whole segment as received regardless of which branch
+  // below ends up handling it.
+  let tcp_seg_len: i64 = recv_len - 34;
+  let checksum_src_ip: u32 = ipv4_get_src_ip(frame, 14);
+  let checksum_dst_ip: u32 = ipv4_get_dst_ip(frame, 14);
+  if tcp_verify_checksum(checksum_src_ip, checksum_dst_ip, frame, 34, tcp_seg_len) != 1 {
+    return 0 - 1;
+  }
   let state: u32 = tcp_conn_get_state(conn_id);
   let flags: u32 = tcp_get_flags(frame, 34);
   let seg_seq: u32 = tcp_get_seq(frame, 34);
@@ -5128,6 +5240,7 @@ fn kernel_main() -> i64 {
   let _ = ipv4_self_test();
   let _ = udp_self_test();
   let _ = udp_recv_bounds_self_test();
+  let _ = udp_checksum_reject_self_test();
   let _ = tcp_self_test();
   let _ = tcp_conn_self_test();
   let _ = tcp_conn_recv_bounds_self_test();
