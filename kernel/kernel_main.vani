@@ -5227,6 +5227,113 @@ fn dhcp_nak_self_test() -> i64 {
   return 0;
 }
 
+// Round 32: closes the feature ledger's last open item -- a permanent
+// regression test for the shared-netif-queue hazard task_e's own
+// comment has documented (and named more live consumers of, rounds
+// 27/29/30) since round 27, but that was only ever documented, never
+// actually exercised by a test. netif_recv_frame (see its own
+// comment) unconditionally dequeues the OLDEST queued frame regardless
+// of what the caller actually wants -- every *_poll/*_recv function
+// relies on that, checking the frame's own type only AFTER dequeuing
+// it, and silently dropping (not requeuing) a mismatch. That's the
+// real mechanism behind the live hazard: task_e's periodic
+// dhcp_client_poll and the shell's ping/tcpecho/udpecho are
+// independently-scheduled concurrent consumers of that same queue, so
+// whichever one happens to poll next can steal-and-drop a frame a
+// different one was actually waiting for.
+//
+// Reproducing the live timing-dependent version directly would need
+// real preemption luck (and DHCP never receives anything live under
+// this project's loopback-only QEMU netif to even compete over -- see
+// dhcp_client_poll's own "never actually binds" note). Instead this
+// proves the underlying MECHANISM deterministically, with no timing
+// dependency at all: queue a real ICMP echo request first, a real UDP
+// datagram second (both self-to-self over loopback, reusing the exact
+// same already-proven send paths icmp_self_test/udp_self_test/
+// icmp_poll/socket_udp_recv individually rely on), then deliberately
+// poll for UDP before ICMP. socket_udp_recv dequeues the OLDEST frame
+// (the ICMP one), rejects it (protocol != 17), and drops it --
+// icmp_poll then dequeues the only frame left (the UDP one), rejects
+// it too (protocol != 1), and drops that as well. Neither caller ever
+// sees the frame it was actually waiting for, even though both were
+// valid and genuinely queued -- exactly the failure mode task_e's
+// comment describes, reproduced without needing any specific
+// interleaving to get lucky on.
+fn netif_queue_contention_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let loop_ip: u32 = 0x7F000001 as u32; // 127.0.0.1
+
+  // Drain any leftover queue state from earlier self-tests so the two
+  // enqueues below land in a known, empty queue.
+  let drain: mut ref i64 = dhruva_alloc_bytes(512);
+  let drain_iter: i64 = 0;
+  while (drain_iter < 8) && (netif_recv_frame(drain, 512) >= 0) {
+    drain_iter = drain_iter + 1;
+  }
+
+  // Frame 1, queued first (so it's the oldest -- dequeued first):
+  // a real ICMP echo request.
+  let icmp_payload: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = buf_write_byte(icmp_payload, 0 as u32, 104 as u32); // 'h'
+  let send1: i64 = icmp_ping_start(my_mac, my_mac, loop_ip, loop_ip, 4242 as u32, 1 as u32, icmp_payload, 1);
+  if send1 != 0 {
+    ok = 0;
+  }
+
+  // Frame 2, queued second: a real UDP datagram. socket_udp_send
+  // needs an ARP-cache hit (round 21) -- same self-insert precedent
+  // udp_self_test/udpecho already established.
+  let _ = arp_cache_insert(loop_ip, my_mac);
+  let udp_payload: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = buf_write_byte(udp_payload, 0 as u32, 117 as u32); // 'u'
+  let send2: i64 = socket_udp_send(my_mac, loop_ip, loop_ip, 54399 as u32, 54398 as u32, udp_payload, 1);
+  if send2 != 0 {
+    ok = 0;
+  }
+  if netif_get_count() != 2 {
+    ok = 0; // exactly one frame per send call -- both queued, neither
+             // dequeued yet
+  }
+
+  // Poll for UDP FIRST, even though the ICMP frame is queued ahead of
+  // it -- proves the steal: socket_udp_recv dequeues the oldest frame
+  // (ICMP, protocol 1 != 17), rejects it, and drops it. Its own real
+  // UDP datagram is still queued behind, unseen by this call.
+  let recv_payload: mut ref i64 = dhruva_alloc_bytes(4);
+  let recv_meta: mut ref i64 = dhruva_alloc_bytes(8);
+  let udp_result: i64 = socket_udp_recv(recv_payload, recv_meta, 4);
+  if udp_result != (0 - 1) {
+    ok = 0; // if this ever starts succeeding, the queue got demuxed
+             // by something else -- worth re-examining this test, not
+             // silently trusting a changed assumption.
+  }
+
+  // Now poll for ICMP -- but its frame was already stolen-and-dropped
+  // above. Only the UDP frame is left; icmp_poll rejects (protocol 17
+  // != 1) and drops that one too.
+  let icmp_meta: mut ref i64 = dhruva_alloc_bytes(8);
+  let icmp_result: i64 = icmp_poll(my_mac, loop_ip, recv_payload, 4, icmp_meta);
+  if icmp_result != (0 - 1) {
+    ok = 0;
+  }
+
+  // Both frames are now gone -- neither caller ever got the one it
+  // was actually waiting for. This is the hazard, reproduced.
+  if netif_get_count() != 0 {
+    ok = 0;
+  }
+
+  let _ = uart_puts("NETIF: shared-queue contention hazard reproduced as documented");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Phase 6 continued: DWC2 USB host controller bring-up (BCM2835's real
 // on-chip USB silicon -- the Pi 1 Model B has no native Ethernet, so
 // DHRUVA_ARCHITECTURE.md's whole "real networking" path runs through
@@ -8123,6 +8230,7 @@ fn kernel_main() -> i64 {
   let _ = dhcp_self_test();
   let _ = dhcp_renewal_self_test();
   let _ = dhcp_nak_self_test();
+  let _ = netif_queue_contention_self_test();
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device
