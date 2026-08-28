@@ -1065,6 +1065,26 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
     return 0;
   }
 
+  // BUG (round 7 audit, 2026-08-27): every carry-forward write below
+  // used to discard its own return status (`let _ = fs_append_raw(...)`
+  // / `let _ = fs_delete_raw(...)`), and log_start advanced past
+  // old_next_block unconditionally once the scan finished -- regardless
+  // of whether any of those re-appends actually succeeded. Once
+  // log_start moves forward, the old copy of a record stops being
+  // scanned by fs_read/fs_find_latest_block_raw/fs_list for the rest
+  // of this boot (see this function's own header comment on why that's
+  // normally safe: an equivalent live copy exists beyond it). If a
+  // single SD write genuinely failed mid-pass -- round 5's audit fixed
+  // sdhost_write_block to actually detect that instead of silently
+  // reporting success, so this is now a real, live-detectable failure
+  // mode, not a hypothetical one -- the "equivalent live copy" premise
+  // is false: the new copy was never written, the old copy is about to
+  // become unreachable anyway, and that record's data is gone for good.
+  // Fixed by tracking every carry-forward's actual result and only
+  // advancing log_start if the whole pass was clean; a single failure
+  // leaves log_start where it was, so the old (still valid) copies stay
+  // reachable and the next compaction pass gets another chance.
+  let all_ok: i64 = 1;
   let blk: i64 = log_start as i64;
   while (blk as u32) < old_next_block {
     let rd_status: i64 = sdhost_read_block(blk, buf);
@@ -1118,7 +1138,10 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
             // (found by GC silently never completing a pass again
             // once this path was ever exercised), not merely a
             // logic error that happens to still terminate wrong.
-            let _ = fs_delete_raw(path_buf, rec_path_len as i64);
+            let del_status: i64 = fs_delete_raw(path_buf, rec_path_len as i64);
+            if del_status != 0 {
+              all_ok = 0;
+            }
           } else {
             if rec_data_len <= (464 as u32) {
             let m: i64 = 0;
@@ -1127,7 +1150,10 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
               let _ = buf_write_byte(data_buf, m as u32, db);
               m = m + 1;
             }
-            let _ = fs_append_raw(path_buf, rec_path_len as i64, data_buf, rec_data_len as i64);
+            let append_status: i64 = fs_append_raw(path_buf, rec_path_len as i64, data_buf, rec_data_len as i64);
+            if append_status != 0 {
+              all_ok = 0;
+            }
             }
           }
         }
@@ -1139,7 +1165,13 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
 
   // Everything before old_next_block now has an equivalent live copy
   // at or beyond it (or was already dead) -- safe to stop scanning.
-  let _ = fs_state_set_log_start(old_next_block);
+  // Only true if every carry-forward above actually succeeded (see
+  // this function's own header comment) -- a failed one leaves its
+  // only copy in the region about to be abandoned, so log_start must
+  // stay put in that case rather than orphan it.
+  if all_ok == 1 {
+    let _ = fs_state_set_log_start(old_next_block);
+  }
   return 0;
 }
 
