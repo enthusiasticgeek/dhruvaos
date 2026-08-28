@@ -66,6 +66,25 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     time.sleep(SETTLE_S)
     send("eval 6*7")
     time.sleep(SETTLE_S)
+    # Round 28: round 26 shipped a real, interactively-typeable "ping"
+    # command and verified it worked live -- but only via a throwaway
+    # scratchpad script, never added to this project's own permanent
+    # regression suite. Formalized here instead of leaving that
+    # verification ephemeral. "ping 0.0.0.0" reliably hits the
+    # self-ping path (round 27's own live DHCP kickoff never actually
+    # binds under QEMU -- no real server exists on this project's
+    # loopback-only netif -- so dhcp_state_get_leased_ip() is
+    # guaranteed 0.0.0.0 for the whole life of any QEMU test run,
+    # making this the one ping target this suite can reliably expect
+    # a real reply from).
+    send("ping 0.0.0.0")
+    time.sleep(SETTLE_S)
+    # Round 28's own new command -- also given permanent coverage
+    # immediately, not left for a future round to formalize the way
+    # ping's was. The exact state/IP text is deterministic for the
+    # same "DHCP never actually binds under QEMU" reason above.
+    send("ifconfig")
+    time.sleep(SETTLE_S)
     # "ls" last, deliberately: every other command in this sequence has
     # a LATER command's own settle time to absorb any scheduling slack,
     # but the last command has only the trailing sleep below to work
@@ -88,6 +107,9 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         ("write /milestone/note ok", "ok"),
         ("cat /milestone/note == hello-dhruva", "hello-dhruva"),
         ("eval 6*7 == 42", "\n42\n"),
+        ("ping 0.0.0.0 replies (self-ping over loopback)", "reply from 0.0.0.0"),
+        ("ifconfig shows mac", "mac 02:00:00:00:00:01"),
+        ("ifconfig shows dhcp state", "dhcp state=SELECTING ip=0.0.0.0"),
         ("ls shows /milestone/note", "  /milestone/note"),
     ]
 

@@ -396,6 +396,25 @@ fn uart_put_hex32(v: u32) -> i64 {
   return 0;
 }
 
+// Round 28: same nibble-printing logic as uart_put_hex32 right above,
+// just two digits instead of eight -- needed for MAC address
+// formatting (AA:BB:CC:DD:EE:FF), where a full 32-bit-wide print
+// would be wrong for a single byte.
+fn uart_put_hex_byte(v: u32) -> i64 {
+  let shift: i64 = 4;
+  while shift >= 0 {
+    let nibble: u32 = (v >> (shift as u32)) & (0xF as u32);
+    let n: i64 = nibble as i64;
+    if n < 10 {
+      let _ = uart_putc(48 + n);
+    } else {
+      let _ = uart_putc(55 + n);
+    }
+    shift = shift - 4;
+  }
+  return 0;
+}
+
 // Task #10: decimal (not hex) printer for eval's results -- a
 // calculator that only ever prints hex isn't a useful demo. Iterative,
 // not recursive (build the digit string in reverse into a scratch
@@ -7436,7 +7455,58 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping)\n");
+  // Round 28: a live network-status command -- until now, the only
+  // way to see what round 27's own live DHCP client or netif's own
+  // MAC actually reported this boot was scrolling back through boot
+  // log output; nothing let a user ask "what's my network state
+  // right now" interactively. Deliberately just reads and prints
+  // existing state (dhcp_state_get_client_state/leased_ip/lease_time,
+  // netif_get_mac) rather than performing any network activity of its
+  // own, so it's always safe to run regardless of what else is
+  // happening on netif's own shared queue (see task_e's own comment
+  // on that queue's concurrent-consumer hazard) and fully
+  // deterministic to test.
+  if shell_word_matches(line_buf, 0, cmd_end, "ifconfig") == 1 {
+    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let _ = netif_get_mac(my_mac);
+    let _ = uart_puts("mac ");
+    let mi: i64 = 0;
+    while mi < 6 {
+      let mb: u32 = buf_read_byte(my_mac, mi as u32);
+      let _ = uart_put_hex_byte(mb);
+      if mi < 5 {
+        let _ = uart_puts(":");
+      }
+      mi = mi + 1;
+    }
+    let _ = uart_puts("\n");
+
+    let client_state: u32 = dhcp_state_get_client_state();
+    let _ = uart_puts("dhcp state=");
+    // Mutually exclusive by construction (client_state is only ever
+    // set to one of these six named constants) -- separate top-level
+    // checks rather than an if/else-if chain, matching this file's
+    // own established style for multi-way state dispatch (see
+    // dhcp_client_poll's own message-type branches).
+    if client_state == dhcp_state_init() { let _ = uart_puts("INIT"); }
+    if client_state == dhcp_state_selecting() { let _ = uart_puts("SELECTING"); }
+    if client_state == dhcp_state_requesting() { let _ = uart_puts("REQUESTING"); }
+    if client_state == dhcp_state_bound() { let _ = uart_puts("BOUND"); }
+    if client_state == dhcp_state_renewing() { let _ = uart_puts("RENEWING"); }
+    if client_state == dhcp_state_rebinding() { let _ = uart_puts("REBINDING"); }
+    let _ = uart_puts(" ip=");
+    let _ = uart_put_ip(dhcp_state_get_leased_ip());
+    let lease_time: u32 = dhcp_state_get_lease_time();
+    if lease_time != (0 as u32) {
+      let _ = uart_puts(" lease=");
+      let _ = uart_put_i64(lease_time as i64);
+      let _ = uart_puts("s");
+    }
+    let _ = uart_puts("\n");
+    return 0;
+  }
+
+  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig)\n");
   return 0;
 }
 
