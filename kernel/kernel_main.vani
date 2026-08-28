@@ -2202,8 +2202,25 @@ fn ipv4_verify_checksum(frame: mut ref i64, ip_offset: i64) -> i64 {
 // destination capacity) -- worth closing before any future socket-API
 // consumer (an echo server turning a received payload_len around into
 // a send call, a DHCP client, etc.) can trip it.
+//
+// BUG (round 11 audit, 2026-08-27): this check's own bound used to be
+// a hardcoded literal (478) rather than derived from netif_get_mtu()
+// -- netif's own declared, authoritative "how much payload fits above
+// the Ethernet layer" answer (DHRUVA_ARCHITECTURE.md's own framing:
+// netif is supposed to be "an interface" exactly so higher layers
+// don't need to know its internals). A hardcoded number that merely
+// happens to match today's netif_get_mtu()-20 arithmetic is a second,
+// silently-divergeable source of truth: the moment a real hardware
+// netif (LAN9512/WiFi, this project's own documented next step)
+// reports a different MTU -- larger (a real 1500-byte Ethernet MTU)
+// or, in principle, smaller -- this hardcoded check stops matching
+// reality, either rejecting valid traffic or (worse) failing to catch
+// an overflow netif_get_mtu() would have correctly flagged. Every
+// send-path bound in this file now derives from netif_get_mtu() at
+// call time instead.
 fn ipv4_send(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, protocol: u32, payload: mut ref i64, payload_len: i64) -> i64 {
-  if (payload_len < 0) || (payload_len > 478) { // 512 - 34 (Ethernet+IP headers)
+  let ipv4_max_payload: i64 = netif_get_mtu() - 20; // netif's own payload budget, minus the 20-byte IP header
+  if (payload_len < 0) || (payload_len > ipv4_max_payload) {
     return 0 - 1;
   }
   let frame: mut ref i64 = net_send_scratch_get();
@@ -2392,8 +2409,13 @@ fn udp_get_length(frame: mut ref i64, udp_offset: i64) -> u32 {
 // shape as ipv4_send's own fix above, one layer higher -- payload_len
 // fed udp_build's copy loop with nothing checking it against net_send_
 // scratch's real 512-byte capacity first.
+//
+// BUG (round 11 audit, 2026-08-27): same "derive from netif_get_mtu(),
+// don't hardcode a number that merely matches it today" fix as
+// ipv4_send's own comment explains in full.
 fn udp_send(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, payload: mut ref i64, payload_len: i64) -> i64 {
-  if (payload_len < 0) || (payload_len > 470) { // 512 - 34 (Eth+IP) - 8 (UDP header)
+  let udp_max_payload: i64 = netif_get_mtu() - 20 - 8; // minus IP header, minus UDP header
+  if (payload_len < 0) || (payload_len > udp_max_payload) {
     return 0 - 1;
   }
   let frame: mut ref i64 = net_send_scratch_get();
@@ -2820,8 +2842,13 @@ fn tcp_verify_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, tcp_offset:
 // shape as ipv4_send/udp_send's own fixes -- payload_len fed tcp_build_
 // header's copy loop with nothing checking it against net_send_
 // scratch's real 512-byte capacity first.
+//
+// BUG (round 11 audit, 2026-08-27): same "derive from netif_get_mtu(),
+// don't hardcode a number that merely matches it today" fix as
+// ipv4_send's own comment explains in full.
 fn tcp_send_segment(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32, payload: mut ref i64, payload_len: i64) -> i64 {
-  if (payload_len < 0) || (payload_len > 458) { // 512 - 34 (Eth+IP) - 20 (TCP header)
+  let tcp_max_payload: i64 = netif_get_mtu() - 20 - 20; // minus IP header, minus TCP header (no options)
+  if (payload_len < 0) || (payload_len > tcp_max_payload) {
     return 0 - 1;
   }
   let frame: mut ref i64 = net_send_scratch_get();
