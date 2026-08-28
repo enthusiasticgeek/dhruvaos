@@ -471,6 +471,33 @@ fn timer_ic_init() -> i64 {
   // Clear any stale match flag for channel 1 before enabling its IRQ.
   let _ = mmio_write_u32(timer_cs, 2 as u32);
 
+  // BUG (round 19 audit, 2026-08-28): the write above is this
+  // function's own stated guarantee ("clear any stale match flag...
+  // before enabling its IRQ") -- but timer_cs (system timer, base
+  // 0x20003000) and ic_enable1 (interrupt controller, base
+  // 0x2000B000) are two different peripherals, and nothing enforced
+  // that the clear had actually landed before the enable below
+  // reached the IC. A genuinely stale match flag left over from
+  // whatever ran before this (or simply a slow-draining posted write)
+  // could let IC line 1 come up already pending, firing IRQ1 the
+  // instant interrupts are unmasked (start_multitasking's restore,
+  // much later in boot) rather than at the first real compare match.
+  // In practice CPSR's I-bit stays set for the rest of kernel_main
+  // (see this function's own two call sites and start_multitasking's
+  // comment), so a huge amount of intervening work almost certainly
+  // drains any posted write long before that matters -- but "almost
+  // certainly, given how much code runs after this" is exactly the
+  // kind of reasoning rounds 16-18 already found isn't a substitute
+  // for the barrier Broadcom's own BCM2835 guidance calls for at a
+  // cross-peripheral switch (see context_switch.S's mem_barrier
+  // comment). uart_rx_irq_init's own IMSC-then-IC_ENABLE2 switch,
+  // right next to this one, does NOT need the same fix -- PL011's
+  // interrupt line is level-sensitive, re-evaluated live from IMSC &
+  // RIS, not a one-shot flag a race could permanently corrupt, so
+  // write order between those two specific registers can't lose an
+  // event the way it can here.
+  let _ = mem_barrier();
+
   // Enable IC line 1 (timer channel 1's compare-match interrupt).
   let _ = mmio_write_u32(ic_enable1, 2 as u32);
   return 0;

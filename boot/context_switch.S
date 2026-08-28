@@ -337,7 +337,28 @@ cpu_wfi:
  * VALUE rather than a timing gap around a correct one (see
  * gpio_sdhost_alt_init's own header comment) -- a missing barrier
  * here would fail the same way, just intermittently on real hardware
- * instead of always, and invisible under QEMU either way. */
+ * instead of always, and invisible under QEMU either way.
+ *
+ * FS journaling AUDITED, no barrier question even arises (round 19,
+ * 2026-08-28): fs_init/fs_append/fs_compact never touch GPIO or UART
+ * at all -- their only hardware dependency is sdhost_read_block/
+ * write_block (SDHOST, base 0x20202000), already covered by the
+ * SDHOST resolution above; everything else is local .bss state
+ * (fs_state_*) or UART logging that's pure debug output, not a
+ * functional dependency. Round 19's continued sweep of the rest of
+ * the boot-time peripheral-init sequence found one more real gap of
+ * the same class round 18 fixed: timer_ic_init() (kernel_main.vani)
+ * writes the system timer's own match-flag-clear register then
+ * immediately writes the interrupt controller's enable register --
+ * a cross-peripheral switch this function's own comment says is
+ * supposed to guarantee an order ("clear... before enabling"), fixed
+ * the same way. uart_rx_irq_init()'s own analogous IMSC-then-
+ * IC_ENABLE2 switch was checked and does NOT need the same fix --
+ * PL011's interrupt line is level-sensitive (live IMSC & RIS), not a
+ * one-shot flag a race could lose, so write order there doesn't
+ * affect correctness. watchdog_arm() only ever touches the one PM
+ * peripheral (same-peripheral, already covered) and isn't even wired
+ * into the live boot path -- not applicable either way. */
 .global mem_barrier
 mem_barrier:
     mov r0, #0
