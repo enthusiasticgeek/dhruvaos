@@ -6577,13 +6577,51 @@ fn task_d() -> i64 {
 // period (fs_compact's own short-log check already makes a pass with
 // nothing to reclaim cheap, but there's no reason to even attempt one
 // every tick).
+// Round 27 (2026-08-28): also this project's periodic maintenance
+// heartbeat for the DHCP client -- see the comment on kernel_main's
+// own live dhcp_client_start call for why nothing had ever done this
+// before now. Folded into task_e rather than given a dedicated task:
+// this project's scheduler has a hardcoded 6-task table
+// (context_switch.S's sleep_until_table, scheduler_ready_count's own
+// "6 tasks" comment), so adding a 7th would mean touching scheduler
+// internals for a periodic poll that fits naturally into an already-
+// existing best-effort loop instead. task_e is the right home
+// specifically because it's already the one task whose whole job is
+// "not hard-RT, needs heap, tolerates a multi-tick sleep between
+// passes" -- exactly DHCP's own requirements too.
+//
+// Known, real limitation this creates rather than just theorizes
+// about: netif has ONE shared FIFO queue with no per-protocol demux
+// (see socket_udp_recv/icmp_poll/dhcp_client_poll's own comments on
+// this already-accepted tradeoff) -- before this round, only self-
+// tests (which run strictly sequentially, one at a time, before any
+// task exists) ever touched it live. Now task_e's own periodic
+// dhcp_client_poll and the shell's `ping` command's icmp_poll (round
+// 26) are two genuinely concurrent, independently-scheduled live
+// consumers of that same queue -- either one can dequeue-and-drop a
+// frame the other was actually waiting for. Not fixed here (a real
+// per-protocol receive path is a separate, larger redesign); flagged
+// honestly rather than silently shipped as if it were fully safe.
+// BUG (round 27 audit): #[bounded_stack(bytes=1024)] was already too
+// tight for this task's own pre-existing fs_compact chain in
+// principle (never actually caught, since nothing before this round
+// added a deeper call from here) -- adding dhcp_client_poll's own
+// chain (dhcp_client_check_lease -> udp_send -> udp_build ->
+// udp_checksum) pushed the compiler's own static worst-case analysis
+// past it for real: 1120 bytes via that exact chain, caught at
+// compile time, not silently left as a real-hardware-only risk the
+// way an unchecked stack depth normally would be. Raised to 2048 --
+// matching task_f's own already-established bound -- for headroom,
+// not just the bare minimum.
 #[no_mangle]
-#[bounded_stack(bytes=1024)]
+#[bounded_stack(bytes=2048)]
 fn task_e() -> i64 {
   let gc_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
   let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(464);
+  let dhcp_my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(dhcp_my_mac);
   while true {
     let _ = task_sleep_ticks(20);
     let _ = fs_compact(compact_buf, compact_path_buf, compact_data_buf);
@@ -6591,6 +6629,7 @@ fn task_e() -> i64 {
     let _ = uart_puts("GC: compaction pass, /config/mode = \"");
     let _ = fs_print_data(gc_buf, gc_mode_len);
     let _ = uart_puts("\"\n");
+    let _ = dhcp_client_poll(dhcp_my_mac);
   }
   return 0;
 }
@@ -7789,6 +7828,35 @@ fn kernel_main() -> i64 {
   let _ = arp_cache_set_count(0 as u32);
   let _ = arp_cache_set_next_slot(0 as u32);
   let _ = heap_usage_self_test();
+
+  // Round 27 (2026-08-28): actually start real DHCP address
+  // acquisition -- dhcp_client_start/dhcp_client_poll have existed
+  // since round 9, been fixed and extended twice since (round 10's
+  // NAK handling, round 22's full RFC 2131 lease renewal), and every
+  // single call to them anywhere in this codebase before this line
+  // was from a self-test that always finishes by resetting the state
+  // machine back to INIT (dhcp_nak_self_test's own final branch is
+  // the last DHCP self-test that runs) -- the same "correct, fully
+  // built, never actually used live" pattern rounds 8/11/21 already
+  // found and fixed for other subsystems, just for the single most
+  // complete protocol layer in this whole project. xid varies run to
+  // run via scheduler_get_tick_count(), matching dhcp_client_start's
+  // own comment on what a caller should supply (this driver has no
+  // random-number source). task_e's own periodic dhcp_client_poll
+  // call (see that function's own comment) is what actually drives
+  // this forward from here -- DISCOVER goes out now, but nothing
+  // ever answers it under QEMU (no real DHCP server exists on this
+  // project's loopback-only netif), so this permanently sits in
+  // SELECTING under the only testing method this project has --
+  // correct by design for real hardware, not something QEMU can
+  // verify end to end, the same honest-limitation category rounds
+  // 23/24/26 already established.
+  let boot_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(boot_mac);
+  let dhcp_boot_status: i64 = dhcp_client_start(boot_mac, scheduler_get_tick_count());
+  let _ = uart_puts("DHCP: client_start status=");
+  let _ = uart_put_hex32(dhcp_boot_status as u32);
+  let _ = uart_puts(" (0=DISCOVER sent, state=SELECTING)\n");
 
   // watchdog_init() would belong here, right before handing off to the
   // scheduler -- see watchdog_arm's comment for why it isn't actually
