@@ -4863,12 +4863,26 @@ fn governor_desired_freq_mhz_v2(h0: i64, h1: i64, h2: i64, h3: i64) -> i64 {
 // next time idle happens to run, not instantly -- acceptable for a
 // step-1 demonstration governor per the architecture doc's own
 // framing ("classical governor first"), less so for a tuned one.
-// hex (not decimal) output here on purpose: uart_put_i64 allocates
-// scratch space via dhruva_alloc_bytes, and task_d is #[no_heap] --
-// uart_put_hex32 doesn't, so it's what's actually available in this
-// context. Only prints on an actual level change, not every idle wake,
-// since governor_get_last_applied_mhz gives a cheap way to skip the
-// mailbox round-trip (and the log spam) entirely when nothing changed.
+// BUG (round 13 audit, 2026-08-27): this used to print hex instead of
+// decimal, reasoning that uart_put_i64 "allocates scratch space via
+// dhruva_alloc_bytes" and task_d (this function's only caller) is
+// #[no_heap]. That premise went stale at some point (uart_put_i64
+// hasn't allocated on every call for a while now -- it reads a
+// persistent scratch buffer via uart_digits_scratch_get instead, set
+// up once at boot; see uart_put_i64's own comment) and nobody updated
+// this one to match, leaving the one governor log line that actually
+// matters live (this one) printing hex while every other governor
+// print in this file (governor_self_test, governor_replay_test) uses
+// plain decimal MHz -- forcing a reader to mentally convert hex to
+// make sense of it, the only place in this subsystem that needed to.
+// Confirmed empirically, not just by re-reading uart_put_i64: this
+// file still builds and runs correctly calling it here, proving
+// vani's own #[no_heap] checker doesn't reject it (it wouldn't have
+// compiled at all if it did). Switched to uart_put_i64 for consistency
+// with every other governor print. Only prints on an actual level
+// change, not every idle wake, since governor_get_last_applied_mhz
+// gives a cheap way to skip the mailbox round-trip (and the log spam)
+// entirely when nothing changed.
 fn governor_step() -> i64 {
   let ready: i64 = scheduler_ready_count();
   // Step 2 live: push the real sample into the smoothing window and
@@ -4892,11 +4906,11 @@ fn governor_step() -> i64 {
       let _ = governor_set_last_applied_mhz(desired);
     }
     let _ = uart_puts("GOVERNOR: step ready=");
-    let _ = uart_put_hex32(ready as u32);
+    let _ = uart_put_i64(ready);
     let _ = uart_puts(" desired_mhz=");
-    let _ = uart_put_hex32(desired as u32);
+    let _ = uart_put_i64(desired);
     let _ = uart_puts(" apply_status=");
-    let _ = uart_put_hex32(status as u32);
+    let _ = uart_put_i64(status);
     let _ = uart_puts("\n");
   }
   return 0;
