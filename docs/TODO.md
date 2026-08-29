@@ -9,21 +9,29 @@ not calendar time.
 
 ## Storage & USB portability (Pi 4 / Pi 5 / Compute Module)
 
+The filesystem layer below is named **DharaFS** ("dhara" — धर,
+Sanskrit for "bearer/holder") — every `dharafs_*` function in
+`kernel/kernel_main.vani` is this component, distinct from Dhruva
+itself. Grew well past its original "task #4" scope across rounds
+39/42 (multi-block files, journaling hardening, owner/group/other
+rwx permissions, real directory hierarchy) into a real enough
+component to warrant its own name.
+
 See `docs/PORTING.md` for the full writeup this backlog references.
 
 - **Block-device abstraction for the FS layer** — `[S, ~1 round —
   DONE, round 36]`
   Replaced the FS layer's 8 real direct `sdhost_read_block`/
-  `sdhost_write_block` call sites (`fs_init`/`fs_append_raw`/`fs_find_
-  latest_block_raw`/`fs_compact`/`fs_read_raw` — more than the
+  `sdhost_write_block` call sites (`dharafs_init`/`dharafs_append_raw`/`dharafs_find_
+  latest_block_raw`/`dharafs_compact`/`dharafs_read_raw` — more than the
   original ~5 estimate once actually counted; the SD driver's own
   8-block self-test sweep deliberately still calls SDHOST directly,
   since its whole point is testing that peripheral specifically) with
-  calls through `fs_block_read`/`fs_block_write`. Not a function-
+  calls through `dharafs_block_read`/`dharafs_block_write`. Not a function-
   pointer/vtable interface as originally envisioned here — no evidence
   vani supports storing a callable function value persistently across
   calls the way this project's own `extern "C"` state-accessor pattern
-  needs, so a simple `fs_state`-backed integer selector (0=SDHOST,
+  needs, so a simple `dharafs_state`-backed integer selector (0=SDHOST,
   1=USB mass storage) with an `if`/`else` dispatch was used instead,
   matching this codebase's own established mutually-exclusive-`if`
   state-dispatch style elsewhere (`ifconfig`'s DHCP state print,
@@ -118,19 +126,19 @@ multi-round item elsewhere in this backlog.
     confirmed still completely unaffected.
   - Done (round 36): built the block-device abstraction (see that item
     above) and routed the FS layer's own 8 real `sdhost_read_block`/
-    `write_block` call sites (`fs_init`/`fs_append_raw`/`fs_find_
-    latest_block_raw`/`fs_compact`/`fs_read_raw` — more than the
-    original ~5 estimate once actually counted) through `fs_block_
-    read`/`fs_block_write` instead. SDHOST stays the permanent default
-    (`fs_state`'s new `fs_block_dev` selector defaults to 0 via `.bss`
+    `write_block` call sites (`dharafs_init`/`dharafs_append_raw`/`dharafs_find_
+    latest_block_raw`/`dharafs_compact`/`dharafs_read_raw` — more than the
+    original ~5 estimate once actually counted) through `dharafs_block_
+    read`/`dharafs_block_write` instead. SDHOST stays the permanent default
+    (`dharafs_state`'s new `dharafs_block_dev` selector defaults to 0 via `.bss`
     zero-init) — every real FS operation (boot self-tests, shell
     `ls`/`cat`/`write`, `phase4_milestone.py`, `power_yank.py`'s own
     tear-sweep) is unaffected, confirmed by the full existing battery
     staying green unchanged. Then proved USB mass storage genuinely
     works as a second backend THROUGH the same abstraction (not just
-    via round 35's own raw primitives): `fs_block_dev_self_check`
-    temporarily flips the selector, writes a pattern via `fs_block_
-    write`, reads it back via `fs_block_read`, byte-compares, then
+    via round 35's own raw primitives): `dharafs_block_dev_self_check`
+    temporarily flips the selector, writes a pattern via `dharafs_block_
+    write`, reads it back via `dharafs_block_read`, byte-compares, then
     restores SDHOST. Independently verified at the host level again
     (LBA 200 in the backing image holds the real persisted pattern).
     `usb-net` (no BOT interface, selector never touched) confirmed
@@ -138,7 +146,7 @@ multi-round item elsewhere in this backlog.
     Scope note: this proves the raw block-I/O layer is genuinely
     backend-agnostic, live-verified both ways. It does NOT mean the OS
     can boot/operate its whole filesystem from a USB drive yet — that
-    would need selecting the backend before `fs_init()` runs (today
+    would need selecting the backend before `dharafs_init()` runs (today
     always SDHOST) and validating the full self-test/normal-operation
     battery against a freshly-attached, unformatted USB device, which
     is a separate, larger step nobody has asked for yet.
@@ -172,9 +180,9 @@ multi-round item elsewhere in this backlog.
   2. *Using a USB drive as Dhruva's own filesystem storage once
      already running* (as opposed to loading the kernel from it). This
      is the piece rounds 33-36 above already deliver the low-level
-     primitives for (`fs_block_read`/`fs_block_write` genuinely work
+     primitives for (`dharafs_block_read`/`dharafs_block_write` genuinely work
      against USB mass storage) — what's still missing is selecting
-     that backend BEFORE `fs_init()` runs and validating the full
+     that backend BEFORE `dharafs_init()` runs and validating the full
      self-test/normal-operation battery against a freshly-attached,
      unformatted USB device (the scope note on the USB mass storage
      item above). This part is real, buildable software work, not
@@ -197,8 +205,8 @@ multi-round item elsewhere in this backlog.
   chain-loader; or (b) there's a concrete reason to want the FS's
   primary storage to be USB rather than SD specifically (problem 2
   alone), at which point it's a small, well-understood extension of
-  the existing `fs_block_dev` selector — pick it before `fs_init()`
-  runs instead of only inside `fs_block_dev_self_check`, and validate
+  the existing `dharafs_block_dev` selector — pick it before `dharafs_init()`
+  runs instead of only inside `dharafs_block_dev_self_check`, and validate
   the existing self-test battery against it.
 
 - **TCP retransmission + simultaneous open** — `[M-L, ~3-4 rounds —
@@ -262,11 +270,11 @@ multi-round item elsewhere in this backlog.
 
   **Multi-block files + journaling hardening: DONE (round 39).**
   Record format gained a `next_block` field (offset 48) and a
-  460-byte-per-block payload cap (`fs_block_payload_cap()`); files up
-  to 4096 bytes (`fs_file_max_len()`) now chain across multiple
+  460-byte-per-block payload cap (`dharafs_block_payload_cap()`); files up
+  to 4096 bytes (`dharafs_file_max_len()`) now chain across multiple
   blocks. `path_len == 0` is a reserved continuation-block sentinel
-  (real lookups always have `path_len > 0`, so `fs_find_latest_block_
-  raw`'s matching logic needed zero changes; `fs_compact`/`fs_list`
+  (real lookups always have `path_len > 0`, so `dharafs_find_latest_block_
+  raw`'s matching logic needed zero changes; `dharafs_compact`/`dharafs_list`
   needed an explicit skip-continuation-blocks guard added to their
   full-table scans). Crash safety: multi-block writes happen in
   *reverse* order — every continuation chunk first, the head block
@@ -274,11 +282,11 @@ multi-round item elsewhere in this backlog.
   one commit point that makes the whole chain reachable; a crash
   before it leaves only unreachable orphan blocks and the prior
   version of the file (or no file) intact, exactly like the existing
-  single-block torn-write case. `fs_read`/`fs_read_raw` were
-  consolidated (the old duplicated block-reading logic in `fs_read` is
+  single-block torn-write case. `dharafs_read`/`dharafs_read_raw` were
+  consolidated (the old duplicated block-reading logic in `dharafs_read` is
   gone). Verified: two new self-tests (a real 1000-byte/3-chunk
   round-trip + overwrite, and a simulated-crash test that raw-writes
-  an orphan continuation block without ever calling `fs_state_set` —
+  an orphan continuation block without ever calling `dharafs_state_set` —
   the state-accounting + head-write omission a real crash would leave
   — confirming the old version is still returned intact), the full
   existing self-test battery unchanged (0 FAIL), `phase4_milestone.py`
@@ -290,7 +298,7 @@ multi-round item elsewhere in this backlog.
   itself never lets a torn write reach a discoverable half-written
   chain.
 
-  **Directory hierarchy: DONE (round 42).** `fs_list_dir_raw` groups
+  **Directory hierarchy: DONE (round 42).** `dharafs_list_dir_raw` groups
   live records by the first path segment after a given directory,
   distinguishing a leaf file (nothing follows) from a subdirectory
   (something does, printed once regardless of how many files live
@@ -299,9 +307,9 @@ multi-round item elsewhere in this backlog.
   exact original flat, full-path-per-line behavior unchanged
   (`phase4_milestone.py`'s own check depends on it). Round 42 also
   added owner/group/other rwx permissions on top of this same record
-  format (`fs_check_permission`, `fs_user_set`/`fs_stat`/`fs_chmod`/
-  `fs_chown`, permission-checked `fs_read_raw_checked`/`fs_write_raw_
-  checked`/`fs_delete_raw_checked` wired into the shell's `cat`/
+  format (`dharafs_check_permission`, `dharafs_user_set`/`dharafs_stat`/`dharafs_chmod`/
+  `dharafs_chown`, permission-checked `dharafs_read_raw_checked`/`dharafs_write_raw_
+  checked`/`dharafs_delete_raw_checked` wired into the shell's `cat`/
   `write`/`rm`, new `id`/`su`/`chmod` shell commands) — not originally
   scoped under this TODO item by name, but a natural, real extension
   of the same "flat opaque-path log" limitation this item exists to
@@ -457,7 +465,7 @@ for by name.
 
 - **Media (at-rest) encryption** — `[M-L, ~2-3 rounds beyond the
   crypto foundation]`
-  Encrypt FS blocks before `fs_block_write`/after `fs_block_read`
+  Encrypt FS blocks before `dharafs_block_write`/after `dharafs_block_read`
   (the block-device abstraction rounds 33-36 built is the natural
   integration point — a cipher becomes a transform in that same
   pipeline, not a separate subsystem). Needs a key-management story

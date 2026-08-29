@@ -7,7 +7,7 @@
  * top-level vani global to hold it instead.
  *
  * Every parameter here is deliberately `u32` (never `i64`), the same
- * defensive choice fs_buf.S already documents and netif_state.S's own
+ * defensive choice dharafs_buf.S already documents and netif_state.S's own
  * netif_set_slot_len bug (found via a live self-test failure, not by
  * inspection -- see that file's own comment) is a direct example of
  * getting wrong: a `u32` is a genuine single 32-bit AAPCS value,

@@ -16,7 +16,7 @@
  * (allocated once, in kernel_main(), via dhruva_alloc_bytes, then
  * handed to netif_set_queue_buf below) so the real byte-copying logic
  * can stay in vani using the already-generic buf_read_byte/
- * buf_write_byte (fs_buf.S) -- only the buffer's OWN address and the
+ * buf_write_byte (dharafs_buf.S) -- only the buffer's OWN address and the
  * small ring-queue bookkeeping (head/tail/count, per-slot lengths)
  * need a persistent home outside vani's call-stack-only world.
  *

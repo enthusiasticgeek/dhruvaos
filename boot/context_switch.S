@@ -340,11 +340,11 @@ cpu_wfi:
  * instead of always, and invisible under QEMU either way.
  *
  * FS journaling AUDITED, no barrier question even arises (round 19,
- * 2026-08-28): fs_init/fs_append/fs_compact never touch GPIO or UART
+ * 2026-08-28): dharafs_init/dharafs_append/dharafs_compact never touch GPIO or UART
  * at all -- their only hardware dependency is sdhost_read_block/
  * write_block (SDHOST, base 0x20202000), already covered by the
  * SDHOST resolution above; everything else is local .bss state
- * (fs_state_*) or UART logging that's pure debug output, not a
+ * (dharafs_state_*) or UART logging that's pure debug output, not a
  * functional dependency. Round 19's continued sweep of the rest of
  * the boot-time peripheral-init sequence found one more real gap of
  * the same class round 18 fixed: timer_ic_init() (kernel_main.vani)

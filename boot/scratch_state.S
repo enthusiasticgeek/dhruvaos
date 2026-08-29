@@ -4,11 +4,11 @@
  *
  * BUG this file exists to fix (found via a real, reproducible
  * crash-and-reboot-then-GC-runaway-loop under Phase 6's checkpoint
- * regression test -- see fs_compact's own doc comment in
+ * regression test -- see dharafs_compact's own doc comment in
  * kernel_main.vani for the first half of this same story): almost
- * every FS primitive (fs_find_latest_block_raw, fs_append_raw,
- * fs_delete_raw, fs_read, fs_read_raw, fs_list, plus the Str-based
- * fs_find_latest_block/fs_append/fs_delete wrappers) called
+ * every FS primitive (dharafs_find_latest_block_raw, dharafs_append_raw,
+ * dharafs_delete_raw, dharafs_read, dharafs_read_raw, dharafs_list, plus the Str-based
+ * dharafs_find_latest_block/dharafs_append/dharafs_delete wrappers) called
  * dhruva_alloc_bytes for its own internal scratch buffer on *every
  * call*, not just once. dhruva_alloc_bytes is a bump allocator that
  * never frees (see runtime_stubs.c) -- fine for something called once
@@ -17,7 +17,7 @@
  * shell command (task_f). shell_dispatch's own per-command buffers
  * (line_buf, path_buf, out_buf/data_buf, expr_buf/error_buf) and
  * eval_expr_raw's own value/operator stacks had the exact same shape
- * of bug. Fixing fs_compact's own three buffers alone (its own
+ * of bug. Fixing dharafs_compact's own three buffers alone (its own
  * separate, earlier bug) was not enough -- the heap kept draining
  * through all of these until dhruva_alloc_bytes returned null and
  * something wrote straight through it with no null check, corrupting
@@ -37,31 +37,31 @@
  * chain, whichever function still needs a buffer's contents always
  * finishes reading them before any nested call that reuses the same
  * buffer for something else runs (verified call site by call site,
- * not assumed) -- exactly the same reasoning fs_list's own pre-
+ * not assumed) -- exactly the same reasoning dharafs_list's own pre-
  * existing comment about buf/path_buf already relied on for its two
  * allocations, just carried through consistently instead of paired
  * with a fresh allocation every time. */
 
 .section ".bss"
 .align 4
-fs_sd_scratch_addr:
+dharafs_sd_scratch_addr:
     .word 0             /* 512 bytes: one on-disk block's worth,
                          * shared by every FS primitive that reads or
                          * builds exactly one raw SD block for its own
                          * internal use */
-fs_path_scratch_addr:
+dharafs_path_scratch_addr:
     .word 0             /* 32 bytes: one path's worth */
-fs_data_scratch_addr:
+dharafs_data_scratch_addr:
     .word 0             /* 464 bytes: one record's data payload, or
                          * (shared, never at the same time) one eval
                          * expression's source text */
-fs_stat_scratch_addr:
-    .word 0             /* Round 42: 12 bytes -- fs_stat_raw's output
+dharafs_stat_scratch_addr:
+    .word 0             /* Round 42: 12 bytes -- dharafs_stat_raw's output
                          * (owner_uid/owner_gid/mode, 4 bytes each) */
-fs_dir_scratch_addr:
-    .word 0             /* Round 42: 32 bytes -- fs_list_dir_raw's own
+dharafs_dir_scratch_addr:
+    .word 0             /* Round 42: 32 bytes -- dharafs_list_dir_raw's own
                          * `dir` argument, held stable across its whole
-                         * scan. Deliberately separate from fs_path_
+                         * scan. Deliberately separate from dharafs_path_
                          * scratch, which that same scan reuses
                          * per-record for each candidate's OWN path --
                          * aliasing the two would corrupt `dir` the
@@ -263,71 +263,71 @@ usb_bulk_data_scratch_addr:
 
 .section ".text"
 
-.global fs_sd_scratch_set
-fs_sd_scratch_set:
-    ldr r1, =fs_sd_scratch_addr
+.global dharafs_sd_scratch_set
+dharafs_sd_scratch_set:
+    ldr r1, =dharafs_sd_scratch_addr
     str r0, [r1]
     mov r0, #0
     bx lr
 
-.global fs_sd_scratch_get
-fs_sd_scratch_get:
-    ldr r0, =fs_sd_scratch_addr
+.global dharafs_sd_scratch_get
+dharafs_sd_scratch_get:
+    ldr r0, =dharafs_sd_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
 
-.global fs_path_scratch_set
-fs_path_scratch_set:
-    ldr r1, =fs_path_scratch_addr
+.global dharafs_path_scratch_set
+dharafs_path_scratch_set:
+    ldr r1, =dharafs_path_scratch_addr
     str r0, [r1]
     mov r0, #0
     bx lr
 
-.global fs_path_scratch_get
-fs_path_scratch_get:
-    ldr r0, =fs_path_scratch_addr
+.global dharafs_path_scratch_get
+dharafs_path_scratch_get:
+    ldr r0, =dharafs_path_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
 
-.global fs_data_scratch_set
-fs_data_scratch_set:
-    ldr r1, =fs_data_scratch_addr
+.global dharafs_data_scratch_set
+dharafs_data_scratch_set:
+    ldr r1, =dharafs_data_scratch_addr
     str r0, [r1]
     mov r0, #0
     bx lr
 
-.global fs_data_scratch_get
-fs_data_scratch_get:
-    ldr r0, =fs_data_scratch_addr
+.global dharafs_data_scratch_get
+dharafs_data_scratch_get:
+    ldr r0, =dharafs_data_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
 
-.global fs_stat_scratch_set
-fs_stat_scratch_set:
-    ldr r1, =fs_stat_scratch_addr
+.global dharafs_stat_scratch_set
+dharafs_stat_scratch_set:
+    ldr r1, =dharafs_stat_scratch_addr
     str r0, [r1]
     mov r0, #0
     bx lr
 
-.global fs_stat_scratch_get
-fs_stat_scratch_get:
-    ldr r0, =fs_stat_scratch_addr
+.global dharafs_stat_scratch_get
+dharafs_stat_scratch_get:
+    ldr r0, =dharafs_stat_scratch_addr
     ldr r0, [r0]
     bx lr
 
-.global fs_dir_scratch_set
-fs_dir_scratch_set:
-    ldr r1, =fs_dir_scratch_addr
+.global dharafs_dir_scratch_set
+dharafs_dir_scratch_set:
+    ldr r1, =dharafs_dir_scratch_addr
     str r0, [r1]
     mov r0, #0
     bx lr
 
-.global fs_dir_scratch_get
-fs_dir_scratch_get:
-    ldr r0, =fs_dir_scratch_addr
+.global dharafs_dir_scratch_get
+dharafs_dir_scratch_get:
+    ldr r0, =dharafs_dir_scratch_addr
     ldr r0, [r0]
     bx lr
 

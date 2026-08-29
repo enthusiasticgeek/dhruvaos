@@ -51,7 +51,7 @@ MACHINE = "raspi1ap"
 BOOT_TIMEOUT_S = 8
 BLOCK_SIZE = 512
 # Block 3 (0-indexed from the device start) is where the current
-# kernel_main.vani's third fs_append call (/config/mode, "manual",
+# kernel_main.vani's third dharafs_append call (/config/mode, "manual",
 # overwriting the first record at block 1) lands: block 0 is reserved,
 # blocks 1/2/3 hold the auto/dhruva/manual records in that order.
 TORN_BLOCK = 3
@@ -103,18 +103,18 @@ def extract_marker_value(output: str, marker: str) -> str | None:
 
 
 def extract_final_mode_value(output: str) -> str | None:
-    """The value after this same boot's own fresh fs_append calls --
+    """The value after this same boot's own fresh dharafs_append calls --
     only meaningful for validating the reference image build itself."""
-    return extract_marker_value(output, 'FS: /config/mode = "')
+    return extract_marker_value(output, 'DharaFS: /config/mode = "')
 
 
 def extract_recovery_mode_value(output: str) -> str | None:
-    """What fs_init's recovery scan alone found, BEFORE this boot's own
+    """What dharafs_init's recovery scan alone found, BEFORE this boot's own
     fresh writes -- the actual signal this test cares about. kernel_main
     prints this separately specifically so power_yank.py can check it
     without every boot's own unconditional demo re-appends masking a
     torn record's rejection."""
-    return extract_marker_value(output, 'FS: post-recovery /config/mode = "')
+    return extract_marker_value(output, 'DharaFS: post-recovery /config/mode = "')
 
 
 def build_reference_image(elf_path: str, size_mb: int, work_dir: Path) -> Path:

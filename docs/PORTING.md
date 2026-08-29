@@ -7,8 +7,8 @@ port, so the scope is written down before any of it is built.
 
 ## Storage: current coupling, and what's actually portable
 
-`fs_init`/`fs_append_raw`/`fs_find_latest_block_raw`/`fs_compact`/
-`fs_read_raw` (kernel/kernel_main.vani) call `sdhost_read_block` /
+`dharafs_init`/`dharafs_append_raw`/`dharafs_find_latest_block_raw`/`dharafs_compact`/
+`dharafs_read_raw` (kernel/kernel_main.vani) call `sdhost_read_block` /
 `sdhost_write_block` directly. Those two functions are BCM2835
 SDHOST-specific — register layout, command sequencing, FIFO drain/fill
 all live in `sdhost_cmd`/`sdhost_init` and friends, none of which

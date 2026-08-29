@@ -20,7 +20,7 @@ governor_last_applied_mhz:
                      * main.vani's frequency table) -- the .bss zero
                      * default naturally forces the very first
                      * governor_step() call to treat "apply" as new,
-                     * exactly like fs_init's own "0 means never
+                     * exactly like dharafs_init's own "0 means never
                      * written" convention. */
 
 /* Phase 5 step 2 -- fixed-size run-queue-depth history for the
