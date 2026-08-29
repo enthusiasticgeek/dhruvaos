@@ -386,18 +386,47 @@ for by name.
   ×2, USB enumeration both device types, `heap_stress.py`, and
   `power_yank.py` all still clean with the new module present.
 
-  **Still open**: a symmetric cipher (ChaCha20 over AES: AES's
-  standard software implementations lean on table lookups that are a
-  timing-side-channel risk on hardware WITH a cache; ChaCha20 was
-  designed for fast, naturally constant-time software implementation
-  without them, and ARMv6 has no AES instruction extension to fall
-  back on regardless — same `sha256_wrap_add32`-style wraparound
-  workaround will be needed for its own add-rotate-xor quarter
-  rounds). Bignum/asymmetric primitives (ECC point arithmetic, at
-  minimum, for anything below needing real signatures) are a separate,
-  larger sub-effort on top of both. Fully QEMU-testable via the
-  ChaCha20 RFC 8439 known-answer test vectors, same technique as
-  SHA-256 above.
+  **ChaCha20: DONE (round 44).** `chacha20_block`/
+  `chacha20_quarter_round`/`chacha20_encrypt`, RFC 8439's IETF variant
+  (96-bit nonce, 32-bit counter). Uses round 42's `wrapping_add`
+  builtin directly for the add-rotate-xor quarter round — the exact
+  compiler feature that entry's own commit anticipated this reuse for,
+  no local workaround needed the way SHA-256 needed before that
+  builtin existed. Key/nonce load with no byte-swapping (ChaCha20's
+  wire format is little-endian throughout, unlike SHA-256's big-endian
+  boundaries — `buf_read_u32`'s native order already matches).
+  Verified against RFC 8439 section 2.3.2's own worked block-function
+  example plus a 3-block encrypt/decrypt round trip exercising the
+  counter-increment loop the single-block KAT alone can't reach.
+
+  **Bignum arithmetic foundation: DONE (round 44).**
+  `bignum_add_raw`/`bignum_sub_raw`/`bignum_mul_raw`/`bignum_cmp_raw`
+  — arbitrary-width (parameterized by limb count) unsigned integer
+  arithmetic on little-endian u32 limbs. Multiply widens each limb
+  pair to u64 before multiplying (a u32×u32 product never actually
+  overflows u64, verified by construction — the worst-case
+  accumulation of an existing limb + partial product + carry sums to
+  exactly 2^64-1, still in range) rather than reusing `wrapping_mul`,
+  which stays within u32 and would truncate the high half. Verified
+  against ground truth computed independently in Python for a 128-bit
+  test case, confirmed byte-correct on the host via a standalone
+  `vanic` spike before being ported into the kernel — same fast-
+  iteration technique SHA-256 established in round 41.
+
+  Both new self-tests verified against the full existing battery
+  unchanged (0 FAIL/FATAL, 46 PASS with a real SD card),
+  `phase4_milestone.py` ×2, USB enumeration both device types,
+  `heap_stress.py`, and `power_yank.py` all clean (this round doesn't
+  touch the FS layer at all, so the crash-safety sweep is unaffected
+  by design).
+
+  **This item's core scope is now fully closed.** Still open, and
+  explicitly a separate, larger sub-effort per this entry's own
+  original framing: real EC point arithmetic and modular reduction —
+  needed only once a future round actually requires asymmetric crypto
+  (e.g. the PKI/secure-boot roadmap items below, both of which
+  currently just note this dependency rather than being blocked
+  waiting on it).
 
 - **Packet filtering / iptables-equivalent** — `[M, ~2-3 rounds]`
   A rule table (allow/deny by src/dst IP, port, protocol) with a hook
