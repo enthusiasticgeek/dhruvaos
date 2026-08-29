@@ -290,9 +290,31 @@ multi-round item elsewhere in this backlog.
   itself never lets a torn write reach a discoverable half-written
   chain.
 
-  **Still open**: real directory hierarchy (path-segment parsing,
-  directory metadata, real hierarchical `ls` instead of prefix
-  filtering) — deferred to a future round of this item.
+  **Directory hierarchy: DONE (round 42).** `fs_list_dir_raw` groups
+  live records by the first path segment after a given directory,
+  distinguishing a leaf file (nothing follows) from a subdirectory
+  (something does, printed once regardless of how many files live
+  under it, deduplicated via a fixed 128-slot set). Shell gets
+  `ls <dir>` as a new form of the existing `ls`; bare `ls` keeps its
+  exact original flat, full-path-per-line behavior unchanged
+  (`phase4_milestone.py`'s own check depends on it). Round 42 also
+  added owner/group/other rwx permissions on top of this same record
+  format (`fs_check_permission`, `fs_user_set`/`fs_stat`/`fs_chmod`/
+  `fs_chown`, permission-checked `fs_read_raw_checked`/`fs_write_raw_
+  checked`/`fs_delete_raw_checked` wired into the shell's `cat`/
+  `write`/`rm`, new `id`/`su`/`chmod` shell commands) — not originally
+  scoped under this TODO item by name, but a natural, real extension
+  of the same "flat opaque-path log" limitation this item exists to
+  close. Verified: two new self-tests, full existing battery unchanged
+  (0 FAIL, 44 PASS), `phase4_milestone.py` ×2, USB enumeration both
+  device types, `heap_stress.py`/`power_yank.py` both PASS (the new
+  owner/group/mode fields shrank the per-block payload cap from 460 to
+  448 bytes; `power_yank.py`'s tear sweep needed zero test changes and
+  confirmed the new format's crash-safety holds, 70/70 recovered), plus
+  live interactive shell verification (not just self-tests) of `su`/
+  permission-denied/`chmod`/hierarchical `ls`.
+
+  This TODO item is now **fully closed** — both halves done.
 
 ## General DMA controller (not scoped — recommendation only, round 35)
 
