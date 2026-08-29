@@ -37,6 +37,19 @@ fs_log_start:
                      * just means recovery re-scans a prefix it could
                      * have skipped, never a correctness problem, only
                      * a lost optimization for that one boot. */
+fs_current_uid:
+    .word 0        /* Round 42: the active user ID for permission
+                     * checks (fs_check_permission in kernel_main.vani).
+                     * .bss zero-init means uid 0 (root/superuser) by
+                     * default -- Dhruva has no login yet, so this is
+                     * both "the only user that exists today" and "the
+                     * user that bypasses all permission checks",
+                     * exactly like a real Unix system's root account.
+                     * fs_user_set lets a caller (a self-test, or a
+                     * future real multi-user shell) switch context. */
+fs_current_gid:
+    .word 0        /* Round 42: the active group ID, same role as
+                     * fs_current_uid above. */
 fs_block_dev:
     .word 0        /* Round 36: which block-device backend fs_block_
                      * read/fs_block_write (kernel_main.vani) dispatch
@@ -100,5 +113,26 @@ fs_state_set_block_dev:
 .global fs_state_get_block_dev
 fs_state_get_block_dev:
     ldr r0, =fs_block_dev
+    ldr r0, [r0]
+    bx lr
+
+.global fs_user_set
+fs_user_set:
+    ldr r2, =fs_current_uid
+    str r0, [r2]
+    ldr r2, =fs_current_gid
+    str r1, [r2]
+    mov r0, #0
+    bx lr
+
+.global fs_user_get_uid
+fs_user_get_uid:
+    ldr r0, =fs_current_uid
+    ldr r0, [r0]
+    bx lr
+
+.global fs_user_get_gid
+fs_user_get_gid:
+    ldr r0, =fs_current_gid
     ldr r0, [r0]
     bx lr

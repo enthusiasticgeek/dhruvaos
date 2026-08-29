@@ -42,6 +42,10 @@ extern "C" fn fs_path_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn fs_path_scratch_get() -> mut ref i64;
 extern "C" fn fs_data_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn fs_data_scratch_get() -> mut ref i64;
+extern "C" fn fs_stat_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn fs_stat_scratch_get() -> mut ref i64;
+extern "C" fn fs_dir_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn fs_dir_scratch_get() -> mut ref i64;
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn shell_line_scratch_get() -> mut ref i64;
 extern "C" fn eval_values_scratch_set(addr: mut ref i64) -> i64;
@@ -267,6 +271,11 @@ extern "C" fn fs_state_get_log_start() -> u32;
 // dispatch to -- see fs_state.S's own comment on fs_block_dev.
 extern "C" fn fs_state_set_block_dev(dev: u32) -> u32;
 extern "C" fn fs_state_get_block_dev() -> u32;
+// Round 42: the active user/group context for FS permission checks --
+// see fs_state.S's own comment on fs_current_uid/fs_current_gid.
+extern "C" fn fs_user_set(uid: u32, gid: u32) -> u32;
+extern "C" fn fs_user_get_uid() -> u32;
+extern "C" fn fs_user_get_gid() -> u32;
 
 // Phase 4 -- boot/shell_state.S: the interactive shell's line buffer,
 // filled one byte at a time from irq_dispatch's new UART-RX branch
@@ -1167,7 +1176,25 @@ fn fs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
 //                         before this round) is a single head block
 //                         with next_block=0, byte-identical in spirit
 //                         to the pre-round-39 format.
-//   [52:512) data bytes (460-byte max payload PER BLOCK; enforced on
+//   [52:56) owner_uid  -- Round 42: the file's owning user ID (on a
+//                         HEAD block; zero/unused on a continuation
+//                         block, same convention as path). 0 = root/
+//                         superuser -- Dhruva has no login yet, so
+//                         everything runs as uid 0 by default; see
+//                         fs_user_get_uid()/fs_user_set() for the
+//                         current-user context this is checked
+//                         against.
+//   [56:60) owner_gid  -- Round 42: the file's owning group ID, same
+//                         zero-on-continuation convention as owner_uid.
+//   [60:64) mode       -- Round 42: Unix-style owner/group/other rwx
+//                         permission bits (bit 8 = owner-read down to
+//                         bit 0 = other-execute; see
+//                         fs_check_permission()). Zero/unused on a
+//                         continuation block. New files default to
+//                         0x1A4 (0o644, rw-r--r--) via fs_default_
+//                         mode() unless fs_append_raw is called with
+//                         an explicit mode.
+//   [64:512) data bytes (448-byte max payload PER BLOCK; enforced on
 //                        append -- a file's own TOTAL length can be up
 //                        to fs_file_max_len(), spread across multiple
 //                        chained blocks)
@@ -1197,10 +1224,49 @@ fn fs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
 // for this path was." Genuinely torn writes are rejected, not just
 // unlikely -- provable by the sweep, not merely hoped for.
 fn fs_block_payload_cap() -> i64 {
-  return 460;
+  return 448;
 }
 fn fs_file_max_len() -> i64 {
   return 4096;
+}
+
+// Round 42: default permission bits for a newly-created file --
+// 0x1A4 = 0o644 = rw-r--r-- (owner read+write, group/other read-only).
+// A conservative, ordinary default; callers needing something else
+// (e.g. an executable or a group-writable shared file) pass an
+// explicit mode to fs_append_raw instead.
+fn fs_default_mode() -> u32 {
+  return 0x1A4 as u32;
+}
+
+// Round 42: Unix-style rwx permission check. `mode`'s bit layout
+// matches traditional octal permissions: bit 8 = owner-read, 7 =
+// owner-write, 6 = owner-execute, 5/4/3 = group r/w/x, 2/1/0 =
+// other r/w/x. uid 0 (root) always passes -- Dhruva has no login yet,
+// so uid 0 is both "the superuser" and "the only user that exists
+// today" (see fs_user_get_uid()/fs_user_set()); real enforcement
+// still applies to any other uid a caller explicitly sets, which is
+// what the self-test below exercises. Exactly one of want_read/
+// want_write/want_exec should be 1 per call (checked independently,
+// not combined, so a caller needing both read+write makes two calls).
+fn fs_check_permission(owner_uid: u32, owner_gid: u32, mode: u32, req_uid: u32, req_gid: u32, want_read: i64, want_write: i64, _want_exec: i64) -> i64 {
+  if req_uid == (0 as u32) {
+    return 1;
+  }
+  let shift: u32 = if req_uid == owner_uid {
+    6 as u32
+  } else {
+    if req_gid == owner_gid { 3 as u32 } else { 0 as u32 }
+  };
+  let bit: u32 = if want_read == 1 {
+    (4 as u32) << shift
+  } else {
+    if want_write == 1 { (2 as u32) << shift } else { (1 as u32) << shift }
+  };
+  if (mode & bit) != (0 as u32) {
+    return 1;
+  }
+  return 0;
 }
 fn fs_init() -> i64 {
   let buf: mut ref i64 = dhruva_alloc_bytes(512);
@@ -1260,7 +1326,7 @@ fn fs_init() -> i64 {
 // Str form to hand over; there's no vani-level operation that builds
 // one from arbitrary bytes, same reasoning as every other raw-buffer
 // gap this project has hit at its extern "C" boundaries).
-fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64) -> i64 {
+fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
   if path_len <= 0 {
     return 1; // reserved as the continuation-block sentinel, see
               // fs_init's own header comment -- a genuine empty path
@@ -1291,10 +1357,13 @@ fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, da
     }
     let _ = buf_write_u32(buf, 44 as u32, data_len as u32);
     let _ = buf_write_u32(buf, 48 as u32, 0 as u32); // next_block: none
+    let _ = buf_write_u32(buf, 52 as u32, owner_uid);
+    let _ = buf_write_u32(buf, 56 as u32, owner_gid);
+    let _ = buf_write_u32(buf, 60 as u32, mode);
     let j: i64 = 0;
     while j < data_len {
       let b2: u32 = buf_read_byte(data_buf, j as u32);
-      let _ = buf_write_byte(buf, (52 + j) as u32, b2);
+      let _ = buf_write_byte(buf, (64 + j) as u32, b2);
       j = j + 1;
     }
 
@@ -1345,6 +1414,9 @@ fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, da
         i = i + 1;
       }
       let _ = buf_write_u32(buf, 44 as u32, data_len as u32); // TOTAL length
+      let _ = buf_write_u32(buf, 52 as u32, owner_uid);
+      let _ = buf_write_u32(buf, 56 as u32, owner_gid);
+      let _ = buf_write_u32(buf, 60 as u32, mode);
     } else {
       let _ = buf_write_u32(buf, 8 as u32, 0 as u32); // continuation marker
       let z: i64 = 0;
@@ -1353,12 +1425,15 @@ fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, da
         z = z + 1;
       }
       let _ = buf_write_u32(buf, 44 as u32, chunk_len as u32); // THIS chunk's own length
+      let _ = buf_write_u32(buf, 52 as u32, 0 as u32);
+      let _ = buf_write_u32(buf, 56 as u32, 0 as u32);
+      let _ = buf_write_u32(buf, 60 as u32, 0 as u32);
     }
     let _ = buf_write_u32(buf, 48 as u32, next_block_field);
     let j: i64 = 0;
     while j < chunk_len {
       let b2: u32 = buf_read_byte(data_buf, (chunk_offset + j) as u32);
-      let _ = buf_write_byte(buf, (52 + j) as u32, b2);
+      let _ = buf_write_byte(buf, (64 + j) as u32, b2);
       j = j + 1;
     }
 
@@ -1380,6 +1455,14 @@ fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, da
   return 0;
 }
 
+// Round 42: preserve-on-overwrite semantics, matching ordinary Unix
+// behavior -- writing to an existing file doesn't change its owner/
+// group/mode. Looks up the file's current metadata first (fs_stat);
+// a genuinely new path gets the current user context (fs_user_get_
+// uid/gid) and fs_default_mode() instead. Callers needing full control
+// (a specific owner/mode regardless of what a caller session's uid
+// is, or task #5's compaction re-carrying an existing record forward
+// unchanged) call fs_append_raw directly.
 fn fs_append(path: Str, data: Str) -> i64 {
   let path_len: i64 = str_len_bytes(path);
   let data_len: i64 = str_len_bytes(data);
@@ -1396,6 +1479,11 @@ fn fs_append(path: Str, data: Str) -> i64 {
   if data_len > fs_file_max_len() {
     return 1;
   }
+  let meta_buf: mut ref i64 = fs_stat_scratch_get();
+  let stat_status: i64 = fs_stat(path, meta_buf);
+  let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { fs_user_get_uid() };
+  let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { fs_user_get_gid() };
+  let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { fs_default_mode() };
   let path_buf: mut ref i64 = fs_path_scratch_get();
   let i: i64 = 0;
   while i < path_len {
@@ -1408,7 +1496,129 @@ fn fs_append(path: Str, data: Str) -> i64 {
     let _ = buf_write_byte(data_buf, j as u32, str_byte_at(data, j) as u32);
     j = j + 1;
   }
-  return fs_append_raw(path_buf, path_len, data_buf, data_len);
+  return fs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+// Round 42: permission-enforcing entry points. fs_read_raw/
+// fs_append_raw/fs_delete_raw themselves stay UNCHECKED, trusted
+// primitives -- fs_compact and fs_list both need to operate across
+// every file regardless of ownership for their own housekeeping
+// (GC, listing), exactly like a real filesystem's kernel-internal
+// paths bypass permission checks that only apply at the user-facing
+// syscall boundary. These _checked wrappers are that boundary here;
+// the shell's cat/write/rm commands go through them (using fs_user_
+// get_uid/gid as the requester), not the raw primitives directly.
+//
+// Return convention: -1 not found (same as the unchecked functions),
+// -2 permission denied (new), else success (data length for read, 0
+// for write/delete) -- callers that only cared about "-1 or success"
+// before still work unchanged as long as they don't mistake -2 for
+// -1's meaning.
+fn fs_read_raw_checked(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = fs_stat_scratch_get();
+  let stat_status: i64 = fs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  let allowed: i64 = fs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 1, 0, 0);
+  if allowed == 0 {
+    return 0 - 2;
+  }
+  return fs_read_raw(path_buf, path_len, out_buf);
+}
+
+// A brand-new path (fs_stat_raw returns "not found") is always
+// writable -- Dhruva has no real directory objects to hold a
+// directory-level "who may create files here" permission the way a
+// real Unix filesystem would; allowing creation freely is the
+// honestly-scoped v1 simplification (noted here rather than silently
+// assumed). An EXISTING path's write permission is enforced normally.
+fn fs_write_raw_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = fs_stat_scratch_get();
+  let stat_status: i64 = fs_stat_raw(path_buf, path_len, meta_buf);
+  let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { req_uid };
+  let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { req_gid };
+  let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { fs_default_mode() };
+  if stat_status == 0 {
+    let allowed: i64 = fs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
+    if allowed == 0 {
+      return 0 - 2;
+    }
+  }
+  return fs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+fn fs_delete_raw_checked(path_buf: mut ref i64, path_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = fs_stat_scratch_get();
+  let stat_status: i64 = fs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  // Deletion needs write permission, same simplified-from-real-Unix
+  // rule fs_write_raw_checked's own comment already explains (a real
+  // system checks the containing DIRECTORY's write bit, not the
+  // file's own -- Dhruva has no directory objects to check instead).
+  let allowed: i64 = fs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
+  if allowed == 0 {
+    return 0 - 2;
+  }
+  return fs_delete_raw(path_buf, path_len);
+}
+
+// fs_chmod/fs_chown: read the file's full current content + whichever
+// half of its metadata isn't changing, then re-append with the new
+// metadata -- same "read whole, re-append whole" shape fs_compact's
+// own re-carry already uses, not a new mechanism. Returns -1 if the
+// path doesn't exist.
+fn fs_chmod(path: Str, mode: u32) -> i64 {
+  let meta_buf: mut ref i64 = fs_stat_scratch_get();
+  let stat_status: i64 = fs_stat(path, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let data_buf: mut ref i64 = fs_data_scratch_get();
+  let data_len: i64 = fs_read(path, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  let path_len: i64 = str_len_bytes(path);
+  let path_buf: mut ref i64 = fs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return fs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+fn fs_chown(path: Str, uid: u32, gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = fs_stat_scratch_get();
+  let stat_status: i64 = fs_stat(path, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  let data_buf: mut ref i64 = fs_data_scratch_get();
+  let data_len: i64 = fs_read(path, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  let path_len: i64 = str_len_bytes(path);
+  let path_buf: mut ref i64 = fs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return fs_append_raw(path_buf, path_len, data_buf, data_len, uid, gid, mode);
 }
 
 // Core lookup against a raw path buffer, not Str -- same reasoning as
@@ -1631,7 +1841,7 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
             // blocks now -- reconstruct the FULL logical content via
             // fs_read_raw (the same chain-following, checksum-
             // verifying logic every other caller uses) rather than
-            // copying just this one block's own up-to-460-byte chunk,
+            // copying just this one block's own up-to-448-byte chunk,
             // which would silently truncate any multi-block record.
             // fs_read_raw's own internal fs_sd_scratch use doesn't
             // conflict with `buf` here -- separate, caller-owned
@@ -1641,7 +1851,17 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
             if full_len < 0 {
               all_ok = 0;
             } else {
-              let append_status: i64 = fs_append_raw(path_buf, rec_path_len as i64, data_buf, full_len);
+              // Round 42: preserve the existing owner/group/mode --
+              // compaction relocates a record's storage, it must never
+              // change who owns it or what it's permitted for. `buf`
+              // here is still this HEAD block as read off the card
+              // (rec_path_len/etc. above were read from it directly),
+              // so its owner_uid/owner_gid/mode fields are still the
+              // real, current ones.
+              let rec_uid: u32 = buf_read_u32(buf, 52 as u32);
+              let rec_gid: u32 = buf_read_u32(buf, 56 as u32);
+              let rec_mode: u32 = buf_read_u32(buf, 60 as u32);
+              let append_status: i64 = fs_append_raw(path_buf, rec_path_len as i64, data_buf, full_len, rec_uid, rec_gid, rec_mode);
               if append_status != 0 {
                 all_ok = 0;
               }
@@ -1678,6 +1898,52 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
 // whole read rather than silently return a truncated prefix, same
 // "reject, don't guess" posture as every other bounds check this
 // project's storage/networking layers use).
+// Round 42: writes the newest valid record's owner_uid/owner_gid/mode
+// into meta_buf ([0:4)/[4:8)/[8:12)), or returns -1 if no valid record
+// for that path exists. Shares fs_find_latest_block_raw's own lookup
+// with fs_read_raw -- deliberately NOT folded into fs_read_raw itself
+// (which already has plenty of parameters and a hot, chain-following
+// loop); most callers need data OR metadata, rarely both in the same
+// call, so a second small lookup here is simpler than threading an
+// optional out-param through the read path for the common case that
+// doesn't need it.
+fn fs_stat_raw(path_buf: mut ref i64, path_len: i64, meta_buf: mut ref i64) -> i64 {
+  let blk: i64 = fs_find_latest_block_raw(path_buf, path_len);
+  if blk < 0 {
+    return 0 - 1;
+  }
+  let tmp: mut ref i64 = fs_sd_scratch_get();
+  let rd_status: i64 = fs_block_read(blk, tmp);
+  if rd_status != 0 {
+    return 0 - 1;
+  }
+  let data_len: u32 = buf_read_u32(tmp, 44 as u32);
+  if data_len == (0xFFFFFFFF as u32) {
+    return 0 - 1; // tombstone -- deleted, same as fs_read_raw's own check
+  }
+  let _ = buf_write_u32(meta_buf, 0 as u32, buf_read_u32(tmp, 52 as u32));
+  let _ = buf_write_u32(meta_buf, 4 as u32, buf_read_u32(tmp, 56 as u32));
+  let _ = buf_write_u32(meta_buf, 8 as u32, buf_read_u32(tmp, 60 as u32));
+  return 0;
+}
+
+fn fs_stat(path: Str, meta_buf: mut ref i64) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  if path_len <= 0 {
+    return 0 - 1;
+  }
+  if path_len > 32 {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = fs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return fs_stat_raw(path_buf, path_len, meta_buf);
+}
+
 fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i64 {
   let blk: i64 = fs_find_latest_block_raw(path_buf, path_len);
   if blk < 0 {
@@ -1707,7 +1973,7 @@ fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i6
   let head_chunk: i64 = if total_len_i < cap { total_len_i } else { cap };
   let i: i64 = 0;
   while i < head_chunk {
-    let b: u32 = buf_read_byte(tmp, (52 + i) as u32);
+    let b: u32 = buf_read_byte(tmp, (64 + i) as u32);
     let _ = buf_write_byte(out_buf, i as u32, b);
     i = i + 1;
   }
@@ -1716,7 +1982,9 @@ fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i6
   let next_blk: i64 = buf_read_u32(tmp, 48 as u32) as i64;
 
   // Round 39: follow the chain for anything past the head's own
-  // 460-byte chunk. Every continuation block gets the SAME "reject,
+  // 448-byte chunk (Round 42 shrank the per-block payload cap from
+  // 460 to make room for owner_uid/owner_gid/mode). Every continuation
+  // block gets the SAME "reject,
   // don't guess" checksum/sentinel validation as any other record --
   // a broken or corrupted chain fails the whole read rather than
   // silently handing back a truncated prefix.
@@ -1745,7 +2013,7 @@ fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i6
     let this_chunk: i64 = if cont_len < remaining { cont_len } else { remaining };
     let k: i64 = 0;
     while k < this_chunk {
-      let b2: u32 = buf_read_byte(cont, (52 + k) as u32);
+      let b2: u32 = buf_read_byte(cont, (64 + k) as u32);
       let _ = buf_write_byte(out_buf, (copied + k) as u32, b2);
       k = k + 1;
     }
@@ -1816,6 +2084,12 @@ fn fs_delete_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   // rather than assumed zero; a stale next_block from whatever this
   // buffer last held would otherwise leak into a brand-new record.
   let _ = buf_write_u32(buf, 48 as u32, 0 as u32);
+  // Round 42: same stale-scratch-buffer reasoning as next_block above
+  // -- a tombstone has no meaningful owner/mode, but fs_sd_scratch is
+  // reused, so these must be zeroed explicitly rather than assumed.
+  let _ = buf_write_u32(buf, 52 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 56 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 60 as u32, 0 as u32);
 
   let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
   let _ = buf_write_u32(buf, 0 as u32, checksum);
@@ -1842,10 +2116,12 @@ fn fs_delete(path: Str) -> i64 {
   return fs_delete_raw(path_buf, path_len);
 }
 
-// Round 39's live milestone: write a payload well past the 460-byte
-// per-block cap, confirm it round-trips byte-for-byte through
-// fs_append_raw's own chaining (reverse-order write) and fs_read_raw's
-// own chain-following read. 1000 bytes needs 3 chunks (460+460+80) --
+// Round 39's live milestone: write a payload well past the 448-byte
+// per-block cap (Round 42 shrank it from 460 to make room for
+// owner_uid/owner_gid/mode), confirm it round-trips byte-for-byte
+// through fs_append_raw's own chaining (reverse-order write) and
+// fs_read_raw's own chain-following read. 1000 bytes needs 3 chunks
+// (448+448+104) --
 // comfortably past the "needs exactly one continuation" minimum case,
 // enough to prove the loop over MULTIPLE chained blocks, not just a
 // head-plus-one edge case. Reuses test_fill_pattern/test_compare_
@@ -1870,7 +2146,7 @@ fn fs_multiblock_self_test() -> i64 {
     let _ = buf_write_byte(path_buf, pi as u32, str_byte_at(path_bytes, pi) as u32);
     pi = pi + 1;
   }
-  let write_status: i64 = fs_append_raw(path_buf, path_len, write_buf, file_len);
+  let write_status: i64 = fs_append_raw(path_buf, path_len, write_buf, file_len, fs_user_get_uid(), fs_user_get_gid(), fs_default_mode());
   if write_status != 0 {
     ok = 0;
   }
@@ -1897,7 +2173,7 @@ fn fs_multiblock_self_test() -> i64 {
     let _ = buf_write_byte(write_buf2, qi as u32, ((qi * 7) & 0xFF) as u32);
     qi = qi + 1;
   }
-  let write_status2: i64 = fs_append_raw(path_buf, path_len, write_buf2, file_len);
+  let write_status2: i64 = fs_append_raw(path_buf, path_len, write_buf2, file_len, fs_user_get_uid(), fs_user_get_gid(), fs_default_mode());
   if write_status2 != 0 {
     ok = 0;
   }
@@ -2000,6 +2276,437 @@ fn fs_multiblock_crash_consistency_self_test() -> i64 {
 // every path -- "list everything" -- since matching zero bytes always
 // trivially holds. Same "is this occurrence actually the champion for
 // its path" check fs_compact uses to decide what's safe to reclaim.
+// Round 42: linear membership check into a fixed-capacity "already
+// printed" set of path segments, used by fs_list_dir's own
+// deduplication below. `seen` holds up to 128 32-byte slots (byte 0 =
+// this slot's real length 0-31, bytes 1..31 = the name itself) --
+// reuses fs_data_scratch's full 4096 bytes, safe because fs_list_dir
+// never touches file DATA itself, only record headers.
+fn fs_dirlist_seen_contains(seen: mut ref i64, count: i64, path_buf: mut ref i64, seg_start: i64, seg_len: i64) -> i64 {
+  let idx: i64 = 0;
+  while idx < count {
+    let slot_off: i64 = idx * 32;
+    let slot_len: u32 = buf_read_byte(seen, slot_off as u32);
+    if (slot_len as i64) == seg_len {
+      let matches: i64 = 1;
+      let k: i64 = 0;
+      while k < seg_len {
+        let a: u32 = buf_read_byte(seen, (slot_off + 1 + k) as u32);
+        let b: u32 = buf_read_byte(path_buf, (seg_start + k) as u32);
+        if a != b {
+          matches = 0;
+        }
+        k = k + 1;
+      }
+      if matches == 1 {
+        return 1;
+      }
+    }
+    idx = idx + 1;
+  }
+  return 0;
+}
+
+// Round 42: does query_buf[0:query_len) exactly equal
+// path_buf[seg_start:seg_start+seg_len)? Used by fs_list_dir_raw's
+// classify mode (fs_list_dir_classify).
+fn fs_dirlist_segment_equals(query_buf: mut ref i64, query_len: i64, path_buf: mut ref i64, seg_start: i64, seg_len: i64) -> i64 {
+  if query_len != seg_len {
+    return 0;
+  }
+  let k: i64 = 0;
+  while k < seg_len {
+    let a: u32 = buf_read_byte(query_buf, k as u32);
+    let b: u32 = buf_read_byte(path_buf, (seg_start + k) as u32);
+    if a != b {
+      return 0;
+    }
+    k = k + 1;
+  }
+  return 1;
+}
+
+// Round 42: real single-level directory listing -- closes the
+// directory-hierarchy half of this TODO item that round 39's
+// multi-block-files work explicitly left open. fs_list (below) does a
+// flat "every live record whose path starts with this exact prefix"
+// scan and prints the whole remaining path -- "/config/mode" and
+// "/config/sub/deep" print identically as full paths, with no notion
+// that the second one lives in a subdirectory. fs_list_dir instead
+// looks only at the FIRST path segment after `dir`, printing a leaf
+// file's own name when nothing follows it, or a subdirectory's name
+// (deduplicated, however many files actually live under it) with a
+// trailing "/" when something does.
+//
+// `dir_buf`/`dir_len` is a directory path with a leading slash and no
+// trailing one ("/config"), or length 0 for the root -- matching how
+// every real path in this filesystem already starts with "/". Raw-
+// buffer core (not Str) for the same reason fs_append_raw/fs_read_raw
+// are: the shell's own "ls <dir>" only ever has the path as bytes
+// copied out of its line buffer, with no Str form to build from
+// arbitrary bytes (there's no vani-level operation for that). See
+// fs_list_dir (below) for the Str-based wrapper self-tests use.
+// `query_len > 0` switches this from printing (the shell "ls <dir>"
+// use) to a silent, assertable classification query used by
+// fs_list_dir_classify/its self-test: does `query_buf[0:query_len)`
+// exactly match some live entry's first segment under `dir`, and if
+// so is it a leaf file or a subdirectory? Same scan either way --
+// splitting this into two near-duplicate functions would risk exactly
+// the "the two diverge and only one gets fixed later" drift class
+// this project has hit before with duplicated read/chain-follow logic
+// (see fs_read's own doc comment on why it got consolidated).
+// Returns (query mode only): 0 = no match, 1 = file, 2 = directory.
+fn fs_list_dir_raw(dir_buf: mut ref i64, dir_len: i64, query_buf: mut ref i64, query_len: i64) -> i64 {
+  let skip_len: i64 = if dir_len == 0 { 1 } else { dir_len + 1 };
+  let next_block: u32 = fs_state_get_next_block();
+  let log_start: u32 = fs_state_get_log_start();
+  let buf: mut ref i64 = fs_sd_scratch_get();
+  let seen: mut ref i64 = fs_data_scratch_get();
+  let seen_count: i64 = 0;
+  let classify_result: i64 = 0;
+  let blk: i64 = log_start as i64;
+  while (blk as u32) < next_block {
+    let rd_status: i64 = fs_block_read(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        let rec_data_len: u32 = buf_read_u32(buf, 44 as u32);
+        let long_enough: i64 = 0;
+        if (rec_path_len > (0 as u32)) && ((rec_path_len as i64) > skip_len) {
+          long_enough = 1;
+        }
+        if (long_enough == 1) && (rec_data_len != (0xFFFFFFFF as u32)) {
+          let prefix_matches: i64 = 1;
+          if dir_len == 0 {
+            let first: u32 = buf_read_byte(buf, 12 as u32);
+            if first != (47 as u32) {
+              prefix_matches = 0;
+            }
+          } else {
+            let k: i64 = 0;
+            while k < dir_len {
+              let want: u32 = buf_read_byte(dir_buf, k as u32);
+              let got: u32 = buf_read_byte(buf, (12 + k) as u32);
+              if got != want {
+                prefix_matches = 0;
+              }
+              k = k + 1;
+            }
+            let slash: u32 = buf_read_byte(buf, (12 + dir_len) as u32);
+            if slash != (47 as u32) {
+              prefix_matches = 0;
+            }
+          }
+          if (prefix_matches == 1) && (rec_path_len <= (32 as u32)) {
+            let path_buf: mut ref i64 = fs_path_scratch_get();
+            let m: i64 = 0;
+            while (m as u32) < rec_path_len {
+              let pb: u32 = buf_read_byte(buf, (12 + m) as u32);
+              let _ = buf_write_byte(path_buf, m as u32, pb);
+              m = m + 1;
+            }
+            let latest_blk: i64 = fs_find_latest_block_raw(path_buf, rec_path_len as i64);
+            if latest_blk == blk {
+              let rec_path_len_i: i64 = rec_path_len as i64;
+              let seg_start: i64 = skip_len;
+              let seg_end: i64 = seg_start;
+              let found_slash: i64 = 0;
+              while (seg_end < rec_path_len_i) && (found_slash == 0) {
+                let c: u32 = buf_read_byte(path_buf, seg_end as u32);
+                if c == (47 as u32) {
+                  found_slash = 1;
+                } else {
+                  seg_end = seg_end + 1;
+                }
+              }
+              let seg_len: i64 = seg_end - seg_start;
+              if query_len > 0 {
+                let is_match: i64 = fs_dirlist_segment_equals(query_buf, query_len, path_buf, seg_start, seg_len);
+                if is_match == 1 {
+                  classify_result = if found_slash == 1 { 2 } else { 1 };
+                }
+              } else {
+                if found_slash == 1 {
+                  // Subdirectory -- print its name once, however many
+                  // live files actually sit underneath it.
+                  let already_seen: i64 = fs_dirlist_seen_contains(seen, seen_count, path_buf, seg_start, seg_len);
+                  if (already_seen == 0) && (seen_count < 128) {
+                    let _ = uart_puts("  ");
+                    let p: i64 = seg_start;
+                    while p < seg_end {
+                      let pc: u32 = buf_read_byte(path_buf, p as u32);
+                      let _ = uart_putc(pc as i64);
+                      p = p + 1;
+                    }
+                    let _ = uart_puts("/\n");
+                    let slot_off: i64 = seen_count * 32;
+                    let _ = buf_write_byte(seen, slot_off as u32, seg_len as u32);
+                    let q: i64 = 0;
+                    while q < seg_len {
+                      let sc: u32 = buf_read_byte(path_buf, (seg_start + q) as u32);
+                      let _ = buf_write_byte(seen, (slot_off + 1 + q) as u32, sc);
+                      q = q + 1;
+                    }
+                    seen_count = seen_count + 1;
+                  }
+                } else {
+                  // Leaf file directly in this directory.
+                  let _ = uart_puts("  ");
+                  let p: i64 = seg_start;
+                  while p < seg_end {
+                    let pc: u32 = buf_read_byte(path_buf, p as u32);
+                    let _ = uart_putc(pc as i64);
+                    p = p + 1;
+                  }
+                  let _ = uart_puts("\n");
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  return classify_result;
+}
+
+fn fs_list_dir(dir: Str) -> i64 {
+  let dir_len: i64 = str_len_bytes(dir);
+  if dir_len > 32 {
+    return 1;
+  }
+  let dir_buf: mut ref i64 = fs_dir_scratch_get();
+  let i: i64 = 0;
+  while i < dir_len {
+    let _ = buf_write_byte(dir_buf, i as u32, str_byte_at(dir, i) as u32);
+    i = i + 1;
+  }
+  let dummy: mut ref i64 = fs_stat_scratch_get();
+  return fs_list_dir_raw(dir_buf, dir_len, dummy, 0);
+}
+
+// Round 42: silent classification query for self-tests -- does
+// `segment` exist as an entry directly under `dir`, and is it a leaf
+// file (1) or a subdirectory (2)? 0 if no such entry. Real assertable
+// coverage for fs_list_dir_raw's segment-splitting/classification
+// logic, since the print-oriented fs_list_dir has no return value a
+// self-test could check (matching fs_list's own long-standing print-
+// only convention -- this project has no UART-capture mechanism in
+// self-tests to assert against printed output instead).
+fn fs_list_dir_classify(dir: Str, segment: Str) -> i64 {
+  let dir_len: i64 = str_len_bytes(dir);
+  let seg_len: i64 = str_len_bytes(segment);
+  if dir_len > 32 {
+    return 0;
+  }
+  // seg_buf below reuses the 12-byte fs_stat_scratch buffer (nothing
+  // else needs a dedicated one just for this) -- plenty for any
+  // realistic single path segment, but genuinely a real cap, not an
+  // arbitrary one, so enforce it rather than silently overrunning.
+  if seg_len > 11 {
+    return 0;
+  }
+  let dir_buf: mut ref i64 = fs_dir_scratch_get();
+  let i: i64 = 0;
+  while i < dir_len {
+    let _ = buf_write_byte(dir_buf, i as u32, str_byte_at(dir, i) as u32);
+    i = i + 1;
+  }
+  let seg_buf: mut ref i64 = fs_stat_scratch_get();
+  let j: i64 = 0;
+  while j < seg_len {
+    let _ = buf_write_byte(seg_buf, j as u32, str_byte_at(segment, j) as u32);
+    j = j + 1;
+  }
+  return fs_list_dir_raw(dir_buf, dir_len, seg_buf, seg_len);
+}
+
+// Round 42: real, assertable coverage for the owner/group/other rwx
+// permission model -- not just "does it compile", but a genuine
+// allowed-vs-denied round trip from a non-root context, plus root's
+// bypass and fs_chmod actually changing the outcome. Rebuilds path/
+// data scratch buffers fresh before each raw-buffer call rather than
+// assuming they survive an intervening Str-based call unclobbered
+// (fs_chmod, for one, reuses both internally for its own purposes).
+fn fs_permissions_self_test() -> i64 {
+  let ok: i64 = 1;
+  let _ = fs_user_set(0 as u32, 0 as u32); // start as root, the default
+
+  let _ = fs_append("/perm/rootfile", "secret"); // root, default mode 0o644
+
+  let path1: Str = "/perm/rootfile";
+  let path1_len: i64 = str_len_bytes(path1);
+
+  // Non-root, non-owning-group user: mode 644's other-read bit allows
+  // reading...
+  let _ = fs_user_set(100 as u32, 100 as u32);
+  let path1_buf: mut ref i64 = fs_path_scratch_get();
+  let i1: i64 = 0;
+  while i1 < path1_len {
+    let _ = buf_write_byte(path1_buf, i1 as u32, str_byte_at(path1, i1) as u32);
+    i1 = i1 + 1;
+  }
+  let read_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let read_status: i64 = fs_read_raw_checked(path1_buf, path1_len, read_buf, 100 as u32, 100 as u32);
+  if read_status < 0 {
+    ok = 0;
+  }
+
+  // ...but 644 has no other-write bit, so writing is denied.
+  let data1: Str = "hacked";
+  let data1_len: i64 = str_len_bytes(data1);
+  let data1_buf: mut ref i64 = fs_data_scratch_get();
+  let j1: i64 = 0;
+  while j1 < data1_len {
+    let _ = buf_write_byte(data1_buf, j1 as u32, str_byte_at(data1, j1) as u32);
+    j1 = j1 + 1;
+  }
+  let write_status: i64 = fs_write_raw_checked(path1_buf, path1_len, data1_buf, data1_len, 100 as u32, 100 as u32);
+  if write_status != (0 - 2) {
+    ok = 0;
+  }
+
+  // Deletion needs write permission too -- also denied.
+  let del_status: i64 = fs_delete_raw_checked(path1_buf, path1_len, 100 as u32, 100 as u32);
+  if del_status != (0 - 2) {
+    ok = 0;
+  }
+
+  // A brand-new path has no existing owner to be denied by -- non-root
+  // creation succeeds, and the new file's owner is the REQUESTER
+  // (100), not incidentally root, proving fs_write_raw_checked's
+  // new-file default actually uses its req_uid/req_gid parameters.
+  let path2: Str = "/perm/userfile";
+  let path2_len: i64 = str_len_bytes(path2);
+  let path2_buf: mut ref i64 = fs_dir_scratch_get();
+  let i2: i64 = 0;
+  while i2 < path2_len {
+    let _ = buf_write_byte(path2_buf, i2 as u32, str_byte_at(path2, i2) as u32);
+    i2 = i2 + 1;
+  }
+  let data2: Str = "mine";
+  let data2_len: i64 = str_len_bytes(data2);
+  let data2_buf: mut ref i64 = dhruva_alloc_bytes(16);
+  let j2: i64 = 0;
+  while j2 < data2_len {
+    let _ = buf_write_byte(data2_buf, j2 as u32, str_byte_at(data2, j2) as u32);
+    j2 = j2 + 1;
+  }
+  let create_status: i64 = fs_write_raw_checked(path2_buf, path2_len, data2_buf, data2_len, 100 as u32, 100 as u32);
+  if create_status != 0 {
+    ok = 0;
+  }
+  let meta_check: mut ref i64 = dhruva_alloc_bytes(12);
+  let stat_check: i64 = fs_stat("/perm/userfile", meta_check);
+  if stat_check != 0 {
+    ok = 0;
+  }
+  if buf_read_u32(meta_check, 0 as u32) != (100 as u32) {
+    ok = 0;
+  }
+
+  // Root bypasses every check regardless of mode.
+  let _ = fs_user_set(0 as u32, 0 as u32);
+  let path1_buf_r: mut ref i64 = fs_path_scratch_get();
+  let i3: i64 = 0;
+  while i3 < path1_len {
+    let _ = buf_write_byte(path1_buf_r, i3 as u32, str_byte_at(path1, i3) as u32);
+    i3 = i3 + 1;
+  }
+  let data1_buf_r: mut ref i64 = fs_data_scratch_get();
+  let j3: i64 = 0;
+  while j3 < data1_len {
+    let _ = buf_write_byte(data1_buf_r, j3 as u32, str_byte_at(data1, j3) as u32);
+    j3 = j3 + 1;
+  }
+  let root_write_status: i64 = fs_write_raw_checked(path1_buf_r, path1_len, data1_buf_r, data1_len, 0 as u32, 0 as u32);
+  if root_write_status != 0 {
+    ok = 0;
+  }
+
+  // fs_chmod loosens rootfile to world-writable (0o666 = 438 decimal);
+  // the same non-root write that was denied above now succeeds.
+  let _ = fs_chmod("/perm/rootfile", 438 as u32);
+  let _ = fs_user_set(100 as u32, 100 as u32);
+  let path1_buf2: mut ref i64 = fs_path_scratch_get();
+  let i4: i64 = 0;
+  while i4 < path1_len {
+    let _ = buf_write_byte(path1_buf2, i4 as u32, str_byte_at(path1, i4) as u32);
+    i4 = i4 + 1;
+  }
+  let data1_buf2: mut ref i64 = fs_data_scratch_get();
+  let j4: i64 = 0;
+  while j4 < data1_len {
+    let _ = buf_write_byte(data1_buf2, j4 as u32, str_byte_at(data1, j4) as u32);
+    j4 = j4 + 1;
+  }
+  let write_status2: i64 = fs_write_raw_checked(path1_buf2, path1_len, data1_buf2, data1_len, 100 as u32, 100 as u32);
+  if write_status2 != 0 {
+    ok = 0;
+  }
+
+  // Restore the default root context so later self-tests/the shell
+  // don't inherit this test's leftover non-root session.
+  let _ = fs_user_set(0 as u32, 0 as u32);
+
+  let _ = uart_puts("FS: permission model (owner/group/other rwx, root bypass, chmod) enforces read/write/delete correctly");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round 42: real, assertable coverage for directory-hierarchy
+// listing -- fs_list_dir_classify (the query-mode twin of the print-
+// oriented fs_list_dir the shell's "ls <dir>" uses) confirms a leaf
+// file is classified as a file, a nested path's first segment is
+// classified as a directory (not the flat full-path string fs_list's
+// own prefix scan would show), and a name that doesn't exist under
+// that directory classifies as neither.
+fn fs_directory_hierarchy_self_test() -> i64 {
+  let ok: i64 = 1;
+  let _ = fs_append("/docs/readme", "hello");
+  let _ = fs_append("/docs/notes", "abc");
+  let _ = fs_append("/docs/sub/deep", "nested");
+
+  if fs_list_dir_classify("/docs", "readme") != 1 {
+    ok = 0;
+  }
+  if fs_list_dir_classify("/docs", "notes") != 1 {
+    ok = 0;
+  }
+  if fs_list_dir_classify("/docs", "sub") != 2 {
+    ok = 0;
+  }
+  // "deep" lives under /docs/sub, not directly under /docs -- must
+  // NOT show up as an entry of /docs itself.
+  if fs_list_dir_classify("/docs", "deep") != 0 {
+    ok = 0;
+  }
+  // Querying the actual subdirectory directly finds its own leaf file.
+  if fs_list_dir_classify("/docs/sub", "deep") != 1 {
+    ok = 0;
+  }
+  // Root-level listing: /docs itself is a top-level directory.
+  if fs_list_dir_classify("", "docs") != 2 {
+    ok = 0;
+  }
+
+  let _ = uart_puts("FS: directory hierarchy (fs_list_dir) distinguishes files from subdirectories");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 fn fs_list(prefix: Str) -> i64 {
   let prefix_len: i64 = str_len_bytes(prefix);
   let next_block: u32 = fs_state_get_next_block();
@@ -8174,6 +8881,37 @@ fn shell_copy_range(buf: mut ref i64, start: i64, end: i64, out_buf: mut ref i64
   return n;
 }
 
+// Round 42: minimal ASCII-decimal parser for shell command arguments
+// (chmod's mode, su's uid/gid) -- a plain digit-by-digit accumulator,
+// same directness as this file's other shell helpers rather than
+// reaching for eval_expr_raw (that evaluator handles arithmetic
+// expressions, not bare unsigned integers, and building a Str just to
+// hand to a richer parser would be more machinery than this needs).
+// Returns -1 if the range is empty or contains a non-digit.
+fn shell_parse_decimal(buf: mut ref i64, start: i64, end: i64) -> i64 {
+  if start >= end {
+    return 0 - 1;
+  }
+  // 10 digits comfortably covers any real uid/gid/mode value while
+  // staying nowhere near i64 overflow (max i64 has 19 digits) --
+  // rejecting outright rather than letting a pathological input reach
+  // the accumulator below and trap.
+  if (end - start) > 10 {
+    return 0 - 1;
+  }
+  let value: i64 = 0;
+  let i: i64 = start;
+  while i < end {
+    let c: u32 = buf_read_byte(buf, i as u32);
+    if (c < (48 as u32)) || (c > (57 as u32)) {
+      return 0 - 1;
+    }
+    value = (value * 10) + ((c - (48 as u32)) as i64);
+    i = i + 1;
+  }
+  return value;
+}
+
 // Task #10: minimal arithmetic expression evaluator -- +, -, *, /,
 // parentheses, standard precedence, integers -- wired into the shell
 // as `eval <expr>`. The closest thing to a "vani REPL entry point"
@@ -8642,7 +9380,35 @@ fn shell_dispatch() -> i64 {
   let cmd_end: i64 = shell_find_space(line_buf, 0, line_len);
 
   if shell_word_matches(line_buf, 0, cmd_end, "ls") == 1 {
-    let _ = fs_list("");
+    // Round 42: bare "ls" keeps its original flat, every-live-record
+    // behavior unchanged (phase4_milestone.py's own "ls shows
+    // /milestone/note" check depends on that exact full-path output).
+    // "ls <dir>" is new -- real single-level directory listing via
+    // fs_list_dir, distinguishing files from subdirectories instead
+    // of printing every full path flatly.
+    if cmd_end >= line_len {
+      let _ = fs_list("");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    let path_len: i64 = path_end - path_start;
+    if path_len == 0 {
+      let _ = fs_list("");
+      return 0;
+    }
+    if path_len > 32 {
+      let _ = uart_puts("error: path too long\n");
+      return 0;
+    }
+    // fs_list_dir_raw (not the Str-based fs_list_dir) directly -- same
+    // raw-buffer boundary reasoning as cat/write/rm above: the shell
+    // only ever has a path as bytes copied out of its line buffer,
+    // with no Str form to build from arbitrary bytes.
+    let dir_buf: mut ref i64 = fs_dir_scratch_get();
+    let _ = shell_copy_range(line_buf, path_start, path_end, dir_buf);
+    let dummy: mut ref i64 = fs_stat_scratch_get();
+    let _ = fs_list_dir_raw(dir_buf, path_len, dummy, 0);
     return 0;
   }
 
@@ -8679,12 +9445,18 @@ fn shell_dispatch() -> i64 {
     let path_buf: mut ref i64 = fs_path_scratch_get();
     let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
     let out_buf: mut ref i64 = fs_data_scratch_get();
-    let data_len: i64 = fs_read_raw(path_buf, path_len, out_buf);
-    if data_len < 0 {
-      let _ = uart_puts("(not found)\n");
+    // Round 42: permission-checked, as the current shell user
+    // (fs_user_get_uid/gid) -- not the raw, unchecked primitive.
+    let data_len: i64 = fs_read_raw_checked(path_buf, path_len, out_buf, fs_user_get_uid(), fs_user_get_gid());
+    if data_len == (0 - 2) {
+      let _ = uart_puts("permission denied\n");
     } else {
-      let _ = fs_print_data(out_buf, data_len);
-      let _ = uart_puts("\n");
+      if data_len < 0 {
+        let _ = uart_puts("(not found)\n");
+      } else {
+        let _ = fs_print_data(out_buf, data_len);
+        let _ = uart_puts("\n");
+      }
     }
     return 0;
   }
@@ -8711,11 +9483,15 @@ fn shell_dispatch() -> i64 {
     }
     let path_buf: mut ref i64 = fs_path_scratch_get();
     let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
-    let status: i64 = fs_delete_raw(path_buf, path_len);
+    let status: i64 = fs_delete_raw_checked(path_buf, path_len, fs_user_get_uid(), fs_user_get_gid());
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
-      let _ = uart_puts("error\n");
+      if status == (0 - 2) {
+        let _ = uart_puts("permission denied\n");
+      } else {
+        let _ = uart_puts("error\n");
+      }
     }
     return 0;
   }
@@ -8761,7 +9537,110 @@ fn shell_dispatch() -> i64 {
     let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
     let data_buf: mut ref i64 = fs_data_scratch_get();
     let _ = shell_copy_range(line_buf, text_start, line_len, data_buf);
-    let status: i64 = fs_append_raw(path_buf, path_len, data_buf, text_len);
+    let status: i64 = fs_write_raw_checked(path_buf, path_len, data_buf, text_len, fs_user_get_uid(), fs_user_get_gid());
+    if status == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      if status == (0 - 2) {
+        let _ = uart_puts("permission denied\n");
+      } else {
+        let _ = uart_puts("error\n");
+      }
+    }
+    return 0;
+  }
+
+  // Round 42: show the active permission-check context. Dhruva has no
+  // login yet, so this is always uid 0 (root) unless a session used
+  // `su` (below) to switch it.
+  if shell_word_matches(line_buf, 0, cmd_end, "id") == 1 {
+    let _ = uart_puts("uid=");
+    let _ = uart_put_i64(fs_user_get_uid() as i64);
+    let _ = uart_puts(" gid=");
+    let _ = uart_put_i64(fs_user_get_gid() as i64);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+
+  // Round 42: switch the active user/group context, so cat/write/rm's
+  // permission checks (and fs_append's owner-on-create default) run
+  // as someone other than root -- the only way to exercise real
+  // enforcement from the live shell rather than just self-tests,
+  // since there's no login flow to arrive as a non-root user through.
+  if shell_word_matches(line_buf, 0, cmd_end, "su") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: su <uid> <gid>\n");
+      return 0;
+    }
+    let uid_start: i64 = cmd_end + 1;
+    let uid_end: i64 = shell_find_space(line_buf, uid_start, line_len);
+    if uid_end >= line_len {
+      let _ = uart_puts("usage: su <uid> <gid>\n");
+      return 0;
+    }
+    let gid_start: i64 = uid_end + 1;
+    let gid_end: i64 = shell_find_space(line_buf, gid_start, line_len);
+    let uid: i64 = shell_parse_decimal(line_buf, uid_start, uid_end);
+    let gid: i64 = shell_parse_decimal(line_buf, gid_start, gid_end);
+    if (uid < 0) || (gid < 0) {
+      let _ = uart_puts("usage: su <uid> <gid> (both non-negative integers)\n");
+      return 0;
+    }
+    let _ = fs_user_set(uid as u32, gid as u32);
+    let _ = uart_puts("ok\n");
+    return 0;
+  }
+
+  // Round 42: change an existing file's permission bits. Mode is a
+  // plain decimal number matching the standard octal bit layout (e.g.
+  // 420 = 0o644 = rw-r--r--) -- see fs_check_permission's own comment
+  // for the exact bit assignment. Requires the file to already exist;
+  // ownership is unaffected (see fs_chmod's own doc comment).
+  if shell_word_matches(line_buf, 0, cmd_end, "chmod") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: chmod <path> <mode-decimal, e.g. 420 for rw-r--r-->\n");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    if path_end >= line_len {
+      let _ = uart_puts("usage: chmod <path> <mode-decimal, e.g. 420 for rw-r--r-->\n");
+      return 0;
+    }
+    let path_len: i64 = path_end - path_start;
+    if (path_len == 0) || (path_len > 32) {
+      let _ = uart_puts("usage: chmod <path> <mode-decimal, e.g. 420 for rw-r--r-->\n");
+      return 0;
+    }
+    let mode_start: i64 = path_end + 1;
+    let mode_end: i64 = shell_find_space(line_buf, mode_start, line_len);
+    let mode: i64 = shell_parse_decimal(line_buf, mode_start, mode_end);
+    if mode < 0 {
+      let _ = uart_puts("usage: chmod <path> <mode-decimal, e.g. 420 for rw-r--r-->\n");
+      return 0;
+    }
+    let path_buf: mut ref i64 = fs_path_scratch_get();
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    // fs_chmod itself takes a Str; the shell only has the path as raw
+    // bytes in path_buf -- fs_stat_raw/fs_read_raw/fs_append_raw all
+    // work on raw buffers directly, so this reimplements fs_chmod's
+    // own three-step "stat, read, re-append" shape against path_buf
+    // instead of round-tripping through a Str.
+    let meta_buf: mut ref i64 = fs_stat_scratch_get();
+    let stat_status: i64 = fs_stat_raw(path_buf, path_len, meta_buf);
+    if stat_status != 0 {
+      let _ = uart_puts("(not found)\n");
+      return 0;
+    }
+    let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+    let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+    let data_buf: mut ref i64 = fs_data_scratch_get();
+    let data_len: i64 = fs_read_raw(path_buf, path_len, data_buf);
+    if data_len < 0 {
+      let _ = uart_puts("(not found)\n");
+      return 0;
+    }
+    let status: i64 = fs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode as u32);
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
@@ -9775,6 +10654,8 @@ fn kernel_main() -> i64 {
   let _ = fs_sd_scratch_set(dhruva_alloc_bytes(512));
   let _ = fs_path_scratch_set(dhruva_alloc_bytes(32));
   let _ = fs_data_scratch_set(dhruva_alloc_bytes(4096));
+  let _ = fs_stat_scratch_set(dhruva_alloc_bytes(12));
+  let _ = fs_dir_scratch_set(dhruva_alloc_bytes(32));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
@@ -9932,6 +10813,10 @@ fn kernel_main() -> i64 {
   // Round 39: multi-block files + journaling hardening.
   let _ = fs_multiblock_self_test();
   let _ = fs_multiblock_crash_consistency_self_test();
+
+  // Round 42: directory hierarchy + owner/group/other rwx permissions.
+  let _ = fs_permissions_self_test();
+  let _ = fs_directory_hierarchy_self_test();
 
   // Task #10 verification: eval_expr_raw, via boot-time self-test
   // rather than live shell input (see eval_self_test's own comment).

@@ -55,6 +55,19 @@ fs_data_scratch_addr:
     .word 0             /* 464 bytes: one record's data payload, or
                          * (shared, never at the same time) one eval
                          * expression's source text */
+fs_stat_scratch_addr:
+    .word 0             /* Round 42: 12 bytes -- fs_stat_raw's output
+                         * (owner_uid/owner_gid/mode, 4 bytes each) */
+fs_dir_scratch_addr:
+    .word 0             /* Round 42: 32 bytes -- fs_list_dir_raw's own
+                         * `dir` argument, held stable across its whole
+                         * scan. Deliberately separate from fs_path_
+                         * scratch, which that same scan reuses
+                         * per-record for each candidate's OWN path --
+                         * aliasing the two would corrupt `dir` the
+                         * moment the first record's path got copied
+                         * into what the caller thought was a stable
+                         * buffer. */
 shell_line_scratch_addr:
     .word 0             /* 128 bytes: shell_dispatch's own copy of the
                          * current input line */
@@ -290,6 +303,32 @@ fs_data_scratch_get:
     ldr r0, =fs_data_scratch_addr
     ldr r0, [r0]
     mov r1, #0
+    bx lr
+
+.global fs_stat_scratch_set
+fs_stat_scratch_set:
+    ldr r1, =fs_stat_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global fs_stat_scratch_get
+fs_stat_scratch_get:
+    ldr r0, =fs_stat_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global fs_dir_scratch_set
+fs_dir_scratch_set:
+    ldr r1, =fs_dir_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global fs_dir_scratch_get
+fs_dir_scratch_get:
+    ldr r0, =fs_dir_scratch_addr
+    ldr r0, [r0]
     bx lr
 
 .global shell_line_scratch_set
