@@ -6301,34 +6301,39 @@ fn bot_build_cbw(out_buf: mut ref i64, tag: u32, data_len: u32, flags: u32, cb_l
   return 0;
 }
 
-// Round 33's live milestone: TEST UNIT READY (SCSI opcode 0x00, a
-// fixed 6-byte all-zero CDB -- the simplest possible SCSI command,
-// with no data stage at all) sent through a real CBW/CSW round trip
-// over the bulk endpoints this same boot's config-descriptor parse
-// discovered. Proves the whole new bulk-transfer/BOT chain end to end
-// -- toggle tracking, endpoint direction, CBW/CSW framing -- without
-// yet needing a data-stage transfer (READ(10)/WRITE(10), moving a
-// real 512-byte sector) or FS integration, both later rounds' scope
-// per docs/TODO.md. Returns bCSWStatus (0=success, 1=command failed,
-// 2=phase error) on a well-formed CSW, or -1 on any transport failure
-// or a malformed/mismatched CSW (wrong signature or tag -- same
-// "reject, don't guess" posture as every other wire-format check in
-// this project).
-fn usb_msd_test_unit_ready(devaddr: u32) -> i64 {
+// Round 34: generic BOT "data-IN" SCSI command round trip -- CBW out
+// (declaring data_len bytes of IN data, or 0 for a command with no
+// data stage at all), the data stage itself if data_len > 0, then CSW
+// in. Round 33's own usb_msd_test_unit_ready originally inlined this
+// exact shape for TEST UNIT READY alone (data_len=0); factored out
+// once a third near-identical call site (INQUIRY, READ CAPACITY(10),
+// below) would otherwise have duplicated it twice more. Every command
+// this project issues is host-reads-from-device (IN) -- WRITE(10)'s
+// own OUT data stage is later-round scope (needs a larger DMA-capable
+// buffer than the shared 64-byte one this whole layer still uses; see
+// docs/TODO.md). Returns bCSWStatus (0=success, 1=command failed,
+// 2=phase error) on a well-formed CSW, or -1 on any transport failure,
+// a short data-stage transfer, or a malformed/mismatched CSW (wrong
+// signature or tag) -- same "reject, don't guess" posture as every
+// other wire-format check in this project.
+fn usb_msd_scsi_command_in(devaddr: u32, cdb: mut ref i64, cdb_len: i64, tag: u32, data_len: u32, out_data: mut ref i64) -> i64 {
   let out_mps: u32 = usb_msd_get_bulk_out_mps();
   let in_mps: u32 = usb_msd_get_bulk_in_mps();
-  let cdb: mut ref i64 = dhruva_alloc_bytes(6); // all-zero: opcode 0
-                                                  // (TEST UNIT READY),
-                                                  // LUN/reserved/
-                                                  // control all 0
-  let tag: u32 = 0x54555230 as u32; // "TUR0", just a recognizable,
-                                      // non-zero tag value
+  let flags: u32 = if data_len > (0 as u32) { 0x80 as u32 } else { 0 as u32 }; // bit7: IN
   let cbw: mut ref i64 = dhruva_alloc_bytes(31);
-  let _ = bot_build_cbw(cbw, tag, 0 as u32, 0 as u32, 6 as u32, cdb, 6);
+  let _ = bot_build_cbw(cbw, tag, data_len, flags, cdb_len as u32, cdb, cdb_len);
   let out_status: i64 = dwc2_bulk_out(devaddr, out_mps, cbw, 31);
   if out_status != 0 {
     let _ = uart_puts("USB: BOT CBW send failed\n");
     return 0 - 1;
+  }
+
+  if data_len > (0 as u32) {
+    let data_status: i64 = dwc2_bulk_in(devaddr, in_mps, out_data, data_len as i64);
+    if data_status != (data_len as i64) {
+      let _ = uart_puts("USB: BOT data-in stage failed\n");
+      return 0 - 1;
+    }
   }
 
   let csw: mut ref i64 = dhruva_alloc_bytes(13);
@@ -6348,9 +6353,33 @@ fn usb_msd_test_unit_ready(devaddr: u32) -> i64 {
     let _ = uart_puts("USB: BOT CSW tag mismatch\n");
     return 0 - 1;
   }
+  return csw_status as i64;
+}
+
+// Round 33's live milestone: TEST UNIT READY (SCSI opcode 0x00, a
+// fixed 6-byte all-zero CDB -- the simplest possible SCSI command,
+// with no data stage at all) sent through a real CBW/CSW round trip
+// over the bulk endpoints this same boot's config-descriptor parse
+// discovered. Proves the whole bulk-transfer/BOT chain end to end --
+// toggle tracking, endpoint direction, CBW/CSW framing.
+fn usb_msd_test_unit_ready(devaddr: u32) -> i64 {
+  let cdb: mut ref i64 = dhruva_alloc_bytes(6); // all-zero: opcode 0
+                                                  // (TEST UNIT READY),
+                                                  // LUN/reserved/
+                                                  // control all 0
+  let tag: u32 = 0x54555230 as u32; // "TUR0", just a recognizable,
+                                      // non-zero tag value
+  // Passing cdb again as the (unused) out_data buffer: data_len=0
+  // means usb_msd_scsi_command_in's own data-stage block never
+  // touches it, so reusing the already-allocated cdb avoids a
+  // pointless extra allocation for a buffer that's guaranteed dead.
+  let csw_status: i64 = usb_msd_scsi_command_in(devaddr, cdb, 6, tag, 0 as u32, cdb);
+  if csw_status < 0 {
+    return csw_status;
+  }
   let _ = uart_puts("USB: BOT TEST UNIT READY csw_status=");
-  let _ = uart_put_hex32(csw_status);
-  if csw_status == (0 as u32) {
+  let _ = uart_put_hex32(csw_status as u32);
+  if csw_status == 0 {
     let _ = uart_puts(" (PASS)\n");
   } else {
     // A real device can legitimately report "not ready" (status=1) --
@@ -6361,7 +6390,88 @@ fn usb_msd_test_unit_ready(devaddr: u32) -> i64 {
     // the two checks above), not a normal SCSI-level status.
     let _ = uart_puts(" (not ready or check condition -- transport itself OK)\n");
   }
-  return csw_status as i64;
+  return csw_status;
+}
+
+// Round 34: SCSI INQUIRY (opcode 0x12) -- unlike TEST UNIT READY,
+// this has a real 36-byte data-IN stage, the first this driver
+// exercises. CDB byte 4 (allocation length) is a single byte here, so
+// unlike READ CAPACITY(10)'s response below there's no endianness
+// question for the request itself; the RESPONSE data, like every
+// other SCSI data-in payload, is big-endian/most-significant-byte-
+// first where it has multi-byte fields at all (INQUIRY's own don't,
+// beyond the two fixed ASCII strings printed below) -- see READ_
+// CAPACITY10's own comment for where that actually matters. Standard
+// INQUIRY response layout: byte 0 bits[4:0] = peripheral device type,
+// bytes 8-15 = vendor identification (8 ASCII chars), bytes 16-31 =
+// product identification (16 ASCII chars).
+fn usb_msd_inquiry(devaddr: u32) -> i64 {
+  let cdb: mut ref i64 = dhruva_alloc_bytes(6);
+  let _ = buf_write_byte(cdb, 0 as u32, 0x12 as u32); // INQUIRY
+  let _ = buf_write_byte(cdb, 4 as u32, 36 as u32);   // allocation length
+  let tag: u32 = 0x494E5130 as u32; // "INQ0"
+  let data: mut ref i64 = dhruva_alloc_bytes(36);
+  let csw_status: i64 = usb_msd_scsi_command_in(devaddr, cdb, 6, tag, 36 as u32, data);
+  if csw_status != 0 {
+    let _ = uart_puts("USB: INQUIRY failed, csw_status/transport=");
+    let _ = uart_put_hex32(csw_status as u32);
+    let _ = uart_puts("\n");
+    return csw_status;
+  }
+  let periph_type: u32 = buf_read_byte(data, 0 as u32) & (0x1F as u32);
+  let _ = uart_puts("USB: INQUIRY peripheral_type=");
+  let _ = uart_put_hex32(periph_type);
+  let _ = uart_puts(" vendor=\"");
+  let vi: i64 = 0;
+  while vi < 8 {
+    let b: u32 = buf_read_byte(data, (8 + vi) as u32);
+    let _ = uart_putc(b as i64);
+    vi = vi + 1;
+  }
+  let _ = uart_puts("\" product=\"");
+  let pi: i64 = 0;
+  while pi < 16 {
+    let b: u32 = buf_read_byte(data, (16 + pi) as u32);
+    let _ = uart_putc(b as i64);
+    pi = pi + 1;
+  }
+  let _ = uart_puts("\" (PASS)\n");
+  return 0;
+}
+
+// Round 34: SCSI READ CAPACITY(10) (opcode 0x25) -- a fixed 10-byte
+// CDB (opcode plus 9 zero bytes; no allocation-length field at all,
+// the response is always exactly 8 bytes), returning the device's
+// last valid LBA and its block size. BOTH 4-byte response fields are
+// big-endian -- SCSI's own wire convention for multi-byte data,
+// confirmed against the SCSI Block Commands spec before writing this,
+// distinct from (and easy to confuse with) the BOT wrapper's own
+// little-endian CBW/CSW fields bot_build_cbw/usb_msd_scsi_command_in
+// already handle -- reused this project's EXISTING buf_read_u32_be
+// (built for Ethernet/IP/TCP/UDP's own big-endian fields) rather than
+// the new buf_read_u32_le added for the BOT wrapper, precisely because
+// this is the one place in the whole BOT/SCSI chain where the byte
+// order actually flips back to big-endian.
+fn usb_msd_read_capacity10(devaddr: u32) -> i64 {
+  let cdb: mut ref i64 = dhruva_alloc_bytes(10); // all-zero except opcode
+  let _ = buf_write_byte(cdb, 0 as u32, 0x25 as u32); // READ CAPACITY(10)
+  let tag: u32 = 0x52433130 as u32; // "RC10"
+  let data: mut ref i64 = dhruva_alloc_bytes(8);
+  let csw_status: i64 = usb_msd_scsi_command_in(devaddr, cdb, 10, tag, 8 as u32, data);
+  if csw_status != 0 {
+    let _ = uart_puts("USB: READ CAPACITY(10) failed, csw_status/transport=");
+    let _ = uart_put_hex32(csw_status as u32);
+    let _ = uart_puts("\n");
+    return csw_status;
+  }
+  let last_lba: u32 = buf_read_u32_be(data, 0);
+  let block_len: u32 = buf_read_u32_be(data, 4);
+  let _ = uart_puts("USB: READ CAPACITY(10) last_lba=");
+  let _ = uart_put_hex32(last_lba);
+  let _ = uart_puts(" block_len=");
+  let _ = uart_put_hex32(block_len);
+  let _ = uart_puts(" (PASS)\n");
+  return 0;
 }
 
 // The address every device answers at before the host assigns it a
@@ -6624,6 +6734,14 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
     if first_status != 0 {
       let _ = usb_msd_test_unit_ready(downstream_addr);
     }
+    // Round 34: two more SCSI commands over the same live bulk
+    // endpoints, both exercising a real data-IN stage (TEST UNIT
+    // READY above has none) -- INQUIRY for device identification,
+    // READ CAPACITY(10) for the device's real sector count/size,
+    // needed before any future round can actually read/write a real
+    // sector.
+    let _ = usb_msd_inquiry(downstream_addr);
+    let _ = usb_msd_read_capacity10(downstream_addr);
   }
   return 0;
 }
