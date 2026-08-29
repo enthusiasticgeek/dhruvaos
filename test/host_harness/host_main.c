@@ -47,6 +47,8 @@ int64_t fn_dharafs_stat(const char *path, int64_t *meta_buf);
 int64_t fn_dharafs_read_raw(int64_t *path_buf, int64_t path_len, int64_t *out_buf);
 int64_t fn_dharafs_read(const char *path, int64_t *out_buf);
 int64_t fn_dharafs_delete_raw(int64_t *path_buf, int64_t path_len);
+int64_t fn_dharafs_rename_raw(int64_t *old_path_buf, int64_t old_path_len, int64_t *new_path_buf, int64_t new_path_len);
+int64_t fn_dharafs_rename_raw_checked(int64_t *old_path_buf, int64_t old_path_len, int64_t *new_path_buf, int64_t new_path_len, uint32_t req_uid, uint32_t req_gid);
 int64_t fn_dharafs_delete(const char *path);
 int64_t fn_dharafs_dirlist_seen_contains(int64_t *seen, int64_t count, int64_t *path_buf, int64_t seg_start, int64_t seg_len);
 int64_t fn_dharafs_dirlist_segment_equals(int64_t *query_buf, int64_t query_len, int64_t *path_buf, int64_t seg_start, int64_t seg_len);
@@ -228,6 +230,68 @@ static void test_delete(void) {
 
     int64_t blk = fn_dharafs_find_latest_block_raw(path, 5);
     CHECK(blk >= 0, "delete: tombstone record itself is still findable as the latest block");
+}
+
+/* ================= Rename (round 47) ================= */
+
+static void test_rename(void) {
+    reset_fs();
+    int64_t *old_path = mkbuf("/a", 2);
+    int64_t *new_path = mkbuf("/b", 2);
+    int64_t *data = mkbuf("hello-world", 11);
+    CHECK(fn_dharafs_append_raw(old_path, 2, data, 11, 7, 8, 0644) == 0, "rename: create /a succeeds");
+    CHECK(fn_dharafs_rename_raw(old_path, 2, new_path, 2) == 0, "rename: /a -> /b succeeds");
+
+    int64_t *out = dhruva_alloc_bytes(11);
+    CHECK(fn_dharafs_read_raw(old_path, 2, out) == -1, "rename: old path no longer readable");
+    int64_t rd = fn_dharafs_read_raw(new_path, 2, out);
+    CHECK(rd == 11, "rename: new path readable with correct length");
+    CHECK(memcmp(out, "hello-world", 11) == 0, "rename: new path has correct bytes");
+
+    int64_t *meta = dhruva_alloc_bytes(12);
+    CHECK(fn_dharafs_stat_raw(new_path, 2, meta) == 0, "rename: new path stat succeeds");
+    CHECK(buf_read_u32(meta, 0) == 7, "rename: owner_uid preserved across rename");
+    CHECK(buf_read_u32(meta, 4) == 8, "rename: owner_gid preserved across rename");
+
+    /* Rename to self is a no-op success, not a self-tombstone. */
+    CHECK(fn_dharafs_rename_raw(new_path, 2, new_path, 2) == 0, "rename: /b -> /b (self) succeeds");
+    CHECK(fn_dharafs_read_raw(new_path, 2, out) == 11, "rename: self-rename did not delete the file");
+
+    /* Renaming a path that doesn't exist fails cleanly. */
+    int64_t *missing = mkbuf("/nope", 5);
+    int64_t *dest = mkbuf("/dest", 5);
+    CHECK(fn_dharafs_rename_raw(missing, 5, dest, 5) == -1, "rename: nonexistent source returns -1");
+
+    /* Path length boundaries, same 32-byte limit as every other entry point. */
+    char path33[33];
+    memset(path33, 'z', 33);
+    int64_t *huge = mkbuf(path33, 33);
+    CHECK(fn_dharafs_rename_raw(new_path, 2, huge, 33) == 1, "rename: new path > 32 bytes rejected");
+    CHECK(fn_dharafs_rename_raw(huge, 33, new_path, 2) == 1, "rename: old path > 32 bytes rejected");
+
+    /* Permission model: owner may rename; a non-owner may not, even
+     * onto a path that doesn't exist yet (write permission is checked
+     * on the OLD path, which is what's actually being removed). */
+    reset_fs();
+    int64_t *owned = mkbuf("/owned", 6);
+    int64_t *stolen = mkbuf("/stolen", 7);
+    int64_t *d2 = mkbuf("secret", 6);
+    CHECK(fn_dharafs_append_raw(owned, 6, d2, 6, 42, 42, 0644) == 0, "rename_perm: create /owned as uid 42");
+    CHECK(fn_dharafs_rename_raw_checked(owned, 6, stolen, 7, 99, 99) == -2, "rename_perm: non-owner rename denied");
+    CHECK(fn_dharafs_rename_raw_checked(owned, 6, stolen, 7, 42, 42) == 0, "rename_perm: owner rename succeeds");
+
+    /* Renaming onto an EXISTING file owned by someone else, without
+     * permission on that destination, must also be denied -- renaming
+     * shouldn't be a backdoor around dharafs_write_raw_checked's own
+     * overwrite-permission check. */
+    reset_fs();
+    int64_t *mine = mkbuf("/mine", 5);
+    int64_t *theirs = mkbuf("/theirs", 7);
+    int64_t *d3 = mkbuf("m", 1);
+    int64_t *d4 = mkbuf("t", 1);
+    CHECK(fn_dharafs_append_raw(mine, 5, d3, 1, 42, 42, 0644) == 0, "rename_dest_perm: create /mine as uid 42");
+    CHECK(fn_dharafs_append_raw(theirs, 7, d4, 1, 7, 7, 0644) == 0, "rename_dest_perm: create /theirs as uid 7 (world-readable, not world-writable)");
+    CHECK(fn_dharafs_rename_raw_checked(mine, 5, theirs, 7, 42, 42) == -2, "rename_dest_perm: renaming onto someone else's file without write permission on it is denied");
 }
 
 /* ================= Permission model boundaries ================= */
@@ -507,6 +571,7 @@ int main(void) {
     test_zero_length_data();
     test_overwrite();
     test_delete();
+    test_rename();
     test_permission_boundaries();
     test_directory_hierarchy();
     test_dirlist_helpers();

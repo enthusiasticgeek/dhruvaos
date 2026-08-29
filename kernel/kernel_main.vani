@@ -1593,6 +1593,47 @@ fn dharafs_delete_raw_checked(path_buf: mut ref i64, path_len: i64, req_uid: u32
   return dharafs_delete_raw(path_buf, path_len);
 }
 
+// Round 47: permission-enforcing entry point for dharafs_rename_raw (below).
+// Renaming removes the OLD path's identity -- same "needs write
+// permission" rule dharafs_delete_raw_checked already applies to a plain
+// delete. The NEW path gets the SAME check dharafs_write_raw_checked
+// already applies when overwriting an existing file: if new_path
+// already exists, the caller must have write permission on IT too,
+// not just on old_path -- otherwise a user could clobber someone
+// else's differently-permissioned file just by renaming their own
+// file onto its path. A genuinely new path is always writable (no
+// separate check), same policy dharafs_write_raw_checked documents.
+fn dharafs_rename_raw_checked(old_path_buf: mut ref i64, old_path_len: i64, new_path_buf: mut ref i64, new_path_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(old_path_buf, old_path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
+  if allowed == 0 {
+    return 0 - 2;
+  }
+
+  // meta_buf is reused here -- old_path's owner/gid/mode were already
+  // captured into the locals above, so overwriting it with new_path's
+  // metadata (if any) is safe.
+  let new_stat_status: i64 = dharafs_stat_raw(new_path_buf, new_path_len, meta_buf);
+  if new_stat_status == 0 {
+    let new_owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+    let new_owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+    let new_mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+    let new_allowed: i64 = dharafs_check_permission(new_owner_uid, new_owner_gid, new_mode, req_uid, req_gid, 0, 1, 0);
+    if new_allowed == 0 {
+      return 0 - 2;
+    }
+  }
+
+  return dharafs_rename_raw(old_path_buf, old_path_len, new_path_buf, new_path_len);
+}
+
 // dharafs_chmod/dharafs_chown: read the file's full current content + whichever
 // half of its metadata isn't changing, then re-append with the new
 // metadata -- same "read whole, re-append whole" shape dharafs_compact's
@@ -2151,6 +2192,97 @@ fn dharafs_delete(path: Str) -> i64 {
     i = i + 1;
   }
   return dharafs_delete_raw(path_buf, path_len);
+}
+
+// Round 47: DharaFS had no rename at all until now -- docs/TODO.md's
+// own "dharafs_rename_raw + a real multi-file transaction primitive"
+// backlog item's first increment. Implemented as read-old + append-
+// under-new (preserving owner/mode) + delete-old, reusing dharafs_
+// stat_raw/dharafs_read_raw/dharafs_append_raw/dharafs_delete_raw
+// entirely -- no new on-disk record shape needed.
+//
+// NOT yet atomic across the two records the way a single dharafs_
+// append_raw call is atomic across ITS OWN blocks (reverse-order
+// continuation writes, head committed last): a crash between the
+// append below and the delete below leaves BOTH the new and old
+// copies live and independently readable. Not silent data loss, but
+// not a clean atomic rename either -- a real dharafs_tx_begin/
+// dharafs_tx_commit wrapping both operations is the documented
+// follow-up in docs/TODO.md, deliberately out of scope here.
+fn dharafs_rename_raw(old_path_buf: mut ref i64, old_path_len: i64, new_path_buf: mut ref i64, new_path_len: i64) -> i64 {
+  if (old_path_len <= 0) || (old_path_len > 32) || (new_path_len <= 0) || (new_path_len > 32) {
+    return 1;
+  }
+
+  // Renaming a path to itself must be a no-op success, checked BEFORE
+  // anything else below: without this, appending under new_path
+  // (identical to old_path) would immediately be tombstoned by the
+  // delete-old step that follows it.
+  if old_path_len == new_path_len {
+    let same: i64 = 1;
+    let si: i64 = 0;
+    while si < old_path_len {
+      if buf_read_byte(old_path_buf, si as u32) != buf_read_byte(new_path_buf, si as u32) {
+        same = 0;
+      }
+      si = si + 1;
+    }
+    if same == 1 {
+      return 0;
+    }
+  }
+
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(old_path_buf, old_path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1; // old path not found
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read_raw(old_path_buf, old_path_len, data_buf);
+  if data_len < 0 {
+    return 0 - 1; // tombstone or corrupt -- nothing real to rename
+  }
+
+  let append_status: i64 = dharafs_append_raw(new_path_buf, new_path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+  if append_status != 0 {
+    return 1; // new path write failed -- old path is untouched
+  }
+
+  let del_status: i64 = dharafs_delete_raw(old_path_buf, old_path_len);
+  if del_status != 0 {
+    return 1;
+  }
+  return 0;
+}
+
+fn dharafs_rename(old_path: Str, new_path: Str) -> i64 {
+  let old_len: i64 = str_len_bytes(old_path);
+  let new_len: i64 = str_len_bytes(new_path);
+  if (old_len <= 0) || (old_len > 32) || (new_len <= 0) || (new_len > 32) {
+    return 1;
+  }
+  let old_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < old_len {
+    let _ = buf_write_byte(old_buf, i as u32, str_byte_at(old_path, i) as u32);
+    i = i + 1;
+  }
+  // dharafs_path_scratch is the one shared path buffer every other
+  // Str-based DharaFS entry point above already uses -- a rename needs
+  // a SECOND path live at once, so new_path gets its own fresh buffer
+  // rather than contending for the same scratch slot old_path just
+  // filled.
+  let new_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let j: i64 = 0;
+  while j < new_len {
+    let _ = buf_write_byte(new_buf, j as u32, str_byte_at(new_path, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_rename_raw(old_buf, old_len, new_buf, new_len);
 }
 
 // Round 39's live milestone: write a payload well past the 448-byte
@@ -9533,6 +9665,61 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Round 47: DharaFS's first rename -- see dharafs_rename_raw_checked's
+  // own comment for the permission model (write permission on the old
+  // path, AND on the new path too if it already exists).
+  if shell_word_matches(line_buf, 0, cmd_end, "mv") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: mv <old-path> <new-path>\n");
+      return 0;
+    }
+    let old_start: i64 = cmd_end + 1;
+    let old_end: i64 = shell_find_space(line_buf, old_start, line_len);
+    if old_end >= line_len {
+      let _ = uart_puts("usage: mv <old-path> <new-path>\n");
+      return 0;
+    }
+    let old_len: i64 = old_end - old_start;
+    if old_len == 0 {
+      let _ = uart_puts("usage: mv <old-path> <new-path>\n");
+      return 0;
+    }
+    if old_len > 32 {
+      let _ = uart_puts("error: path too long\n");
+      return 0;
+    }
+    let new_start: i64 = old_end + 1;
+    let new_end: i64 = shell_find_space(line_buf, new_start, line_len);
+    let new_len: i64 = new_end - new_start;
+    if new_len == 0 {
+      let _ = uart_puts("usage: mv <old-path> <new-path>\n");
+      return 0;
+    }
+    if new_len > 32 {
+      let _ = uart_puts("error: path too long\n");
+      return 0;
+    }
+    let old_buf: mut ref i64 = dharafs_path_scratch_get();
+    let _ = shell_copy_range(line_buf, old_start, old_end, old_buf);
+    // Two paths need to be live at once here -- old_buf already claims
+    // the one shared dharafs_path_scratch slot cat/rm/write also use,
+    // so new_buf gets its own fresh allocation, same reasoning as
+    // dharafs_rename's own comment on this.
+    let new_buf: mut ref i64 = dhruva_alloc_bytes(32);
+    let _ = shell_copy_range(line_buf, new_start, new_end, new_buf);
+    let status: i64 = dharafs_rename_raw_checked(old_buf, old_len, new_buf, new_len, dharafs_user_get_uid(), dharafs_user_get_gid());
+    if status == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      if status == (0 - 2) {
+        let _ = uart_puts("permission denied\n");
+      } else {
+        let _ = uart_puts("error\n");
+      }
+    }
+    return 0;
+  }
+
   if shell_word_matches(line_buf, 0, cmd_end, "write") == 1 {
     if cmd_end >= line_len {
       let _ = uart_puts("usage: write <path> <text>\n");
@@ -10265,7 +10452,7 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
+  let _ = uart_puts("unknown command (try ls/cat/rm/mv/write/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
   return 0;
 }
 

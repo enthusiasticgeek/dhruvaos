@@ -42,6 +42,8 @@ WHITELIST = [
     "dharafs_read",
     "dharafs_delete_raw",
     "dharafs_delete",
+    "dharafs_rename_raw",
+    "dharafs_rename_raw_checked",
     "dharafs_dirlist_seen_contains",
     "dharafs_dirlist_segment_equals",
     "dharafs_list_dir_raw",
