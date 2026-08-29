@@ -186,6 +186,27 @@ extern "C" fn dhcp_state_set_lease_time(value: u32) -> u32;
 extern "C" fn dhcp_state_get_lease_start_tick() -> u32;
 extern "C" fn dhcp_state_set_lease_start_tick(value: u32) -> u32;
 
+// Round 33 (boot/usb_msd_state.S): USB mass-storage (Bulk-Only
+// Transport) bring-up state -- same vani-call-boundary gap as every
+// other stateful layer in this file, see that file's own header
+// comment for why (bulk endpoint discovery and the bulk-transfer
+// calls that use it are separate calls with nothing else to carry
+// this across).
+extern "C" fn usb_msd_get_bot() -> u32;
+extern "C" fn usb_msd_set_bot(value: u32) -> u32;
+extern "C" fn usb_msd_get_bulk_in_epaddr() -> u32;
+extern "C" fn usb_msd_set_bulk_in_epaddr(value: u32) -> u32;
+extern "C" fn usb_msd_get_bulk_in_mps() -> u32;
+extern "C" fn usb_msd_set_bulk_in_mps(value: u32) -> u32;
+extern "C" fn usb_msd_get_bulk_out_epaddr() -> u32;
+extern "C" fn usb_msd_set_bulk_out_epaddr(value: u32) -> u32;
+extern "C" fn usb_msd_get_bulk_out_mps() -> u32;
+extern "C" fn usb_msd_set_bulk_out_mps(value: u32) -> u32;
+extern "C" fn usb_msd_get_in_toggle() -> u32;
+extern "C" fn usb_msd_set_in_toggle(value: u32) -> u32;
+extern "C" fn usb_msd_get_out_toggle() -> u32;
+extern "C" fn usb_msd_set_out_toggle(value: u32) -> u32;
+
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
 // addressing mode sdhost_init() discovers, across the vani-call-
 // boundary gap kernel_main.vani's own header explains -- no top-level
@@ -1785,6 +1806,34 @@ fn buf_read_u32_be(buf: mut ref i64, offset: i64) -> u32 {
   let b2: u32 = buf_read_byte(buf, (offset + 2) as u32);
   let b3: u32 = buf_read_byte(buf, (offset + 3) as u32);
   return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+// Little-endian counterparts to the two above -- every multi-byte
+// field this project has built on the wire so far (Ethernet/IP/ICMP/
+// UDP/TCP/DHCP) is network byte order (big-endian), but USB's own
+// wire format (descriptors, and round 33's Bulk-Only Transport CBW/
+// CSW fields) is little-endian throughout, per spec. Kept as their
+// own small helpers rather than a byte-order parameter on the BE
+// versions, matching this project's own preference for a distinct,
+// obviously-named function over a flag that silently changes behavior.
+fn buf_write_u32_le(buf: mut ref i64, offset: i64, value: u32) -> i64 {
+  let b0: u32 = value & (0xFF as u32);
+  let b1: u32 = (value >> (8 as u32)) & (0xFF as u32);
+  let b2: u32 = (value >> (16 as u32)) & (0xFF as u32);
+  let b3: u32 = (value >> (24 as u32)) & (0xFF as u32);
+  let _ = buf_write_byte(buf, offset as u32, b0);
+  let _ = buf_write_byte(buf, (offset + 1) as u32, b1);
+  let _ = buf_write_byte(buf, (offset + 2) as u32, b2);
+  let _ = buf_write_byte(buf, (offset + 3) as u32, b3);
+  return 0;
+}
+
+fn buf_read_u32_le(buf: mut ref i64, offset: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, offset as u32);
+  let b1: u32 = buf_read_byte(buf, (offset + 1) as u32);
+  let b2: u32 = buf_read_byte(buf, (offset + 2) as u32);
+  let b3: u32 = buf_read_byte(buf, (offset + 3) as u32);
+  return b0 | (b1 << (8 as u32)) | (b2 << (16 as u32)) | (b3 << (24 as u32));
 }
 
 // Phase 6: generic netif abstraction (DHRUVA_ARCHITECTURE.md §4's own
@@ -6002,9 +6051,28 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
   // not trusted, same "reject, don't guess" posture as every other
   // untrusted-length parse in this project (DHCP's own TLV option
   // parser, most recently).
+  // Round 33: while walking this same descriptor chain, also actually
+  // extract (not just count) the bulk endpoints of a USB Mass Storage
+  // / SCSI / Bulk-Only Transport interface, if one is present --
+  // class 0x08 (Mass Storage), subclass 0x06 (SCSI transparent
+  // command set), protocol 0x50 (Bulk-Only Transport). cur_iface_is_bot
+  // reflects the MOST RECENTLY seen INTERFACE descriptor's class triad
+  // and is consulted at each ENDPOINT descriptor that follows it --
+  // standard descriptor-chain attribution (endpoints always
+  // immediately follow the interface they belong to in a well-formed
+  // config descriptor), same walk this loop already does for
+  // iface_count/ep_count, just also acting on what it sees instead of
+  // only counting it. Reset bot=0 at the top of every call (not just
+  // once at boot): this function runs once per newly-enumerated
+  // device, and a non-mass-storage device (the hub itself, or a
+  // usb-net gadget) must not retain a stale BOT flag/endpoints from
+  // a previous call.
+  let _ = usb_msd_set_bot(0 as u32);
   let pos: i64 = 0;
   let iface_count: i64 = 0;
   let ep_count: i64 = 0;
+  let cur_iface_is_bot: i64 = 0;
+  let found_bot: i64 = 0;
   let full_want_len_i: i64 = full_want_len as i64;
   while pos < full_want_len_i {
     let dlen: u32 = buf_read_byte(cfgfull, pos as u32);
@@ -6017,13 +6085,58 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
         let dtype: u32 = buf_read_byte(cfgfull, (pos + 1) as u32);
         if dtype == (4 as u32) {
           iface_count = iface_count + 1;
+          cur_iface_is_bot = 0;
+          if (pos + 7) < full_want_len_i {
+            let iclass: u32 = buf_read_byte(cfgfull, (pos + 5) as u32);
+            let isubclass: u32 = buf_read_byte(cfgfull, (pos + 6) as u32);
+            let iproto: u32 = buf_read_byte(cfgfull, (pos + 7) as u32);
+            if (iclass == (0x08 as u32)) && (isubclass == (0x06 as u32)) && (iproto == (0x50 as u32)) {
+              cur_iface_is_bot = 1;
+              found_bot = 1;
+            }
+          }
         }
         if dtype == (5 as u32) {
           ep_count = ep_count + 1;
+          if (cur_iface_is_bot == 1) && ((pos + 5) < full_want_len_i) {
+            let ep_addr: u32 = buf_read_byte(cfgfull, (pos + 2) as u32);
+            let ep_attr: u32 = buf_read_byte(cfgfull, (pos + 3) as u32);
+            let ep_mps_lo: u32 = buf_read_byte(cfgfull, (pos + 4) as u32);
+            let ep_mps_hi: u32 = buf_read_byte(cfgfull, (pos + 5) as u32);
+            let ep_mps: u32 = ep_mps_lo | (ep_mps_hi << (8 as u32));
+            // bmAttributes bits[1:0]: 2 = bulk (0=control, 1=iso,
+            // 3=interrupt) -- only bulk endpoints matter for BOT.
+            if (ep_attr & (0x03 as u32)) == (0x02 as u32) {
+              if (ep_addr & (0x80 as u32)) != (0 as u32) {
+                let _ = usb_msd_set_bulk_in_epaddr(ep_addr);
+                let _ = usb_msd_set_bulk_in_mps(ep_mps);
+              } else {
+                let _ = usb_msd_set_bulk_out_epaddr(ep_addr);
+                let _ = usb_msd_set_bulk_out_mps(ep_mps);
+              }
+            }
+          }
         }
         pos = pos + (dlen as i64);
       }
     }
+  }
+  if found_bot == 1 {
+    let _ = usb_msd_set_bot(1 as u32);
+    // SET_CONFIGURATION (below) resets every endpoint's data toggle
+    // to DATA0 per spec -- mirrored here so this driver's own toggle
+    // tracking starts in sync with the device's real state.
+    let _ = usb_msd_set_in_toggle(0 as u32);
+    let _ = usb_msd_set_out_toggle(0 as u32);
+    let _ = uart_puts("USB: mass storage (BOT) interface detected, bulk_in_ep=");
+    let _ = uart_put_hex32(usb_msd_get_bulk_in_epaddr());
+    let _ = uart_puts(" mps=");
+    let _ = uart_put_hex32(usb_msd_get_bulk_in_mps());
+    let _ = uart_puts(" bulk_out_ep=");
+    let _ = uart_put_hex32(usb_msd_get_bulk_out_epaddr());
+    let _ = uart_puts(" mps=");
+    let _ = uart_put_hex32(usb_msd_get_bulk_out_mps());
+    let _ = uart_puts("\n");
   }
 
   let _ = uart_puts("USB: config bConfigurationValue=");
@@ -6048,6 +6161,207 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
     return 0 - 1;
   }
   return 0;
+}
+
+// Round 33: USB mass storage (Bulk-Only Transport, USB Mass Storage
+// Class Bulk-Only Transport spec) bring-up -- the first live caller
+// of real bulk transfers anywhere in this project. Every control
+// transfer above (dwc2_control_in/no_data) uses a fixed PID encoding
+// specific to endpoint 0/control (see dwc2_pid_setup/data1's own
+// comment); bulk endpoints use the GENERIC non-control PID/DATA-
+// toggle encoding instead (0=DATA0, 1=DATA1 -- not control's 2/3),
+// and unlike a control transfer's fixed per-stage toggle, a bulk
+// endpoint's toggle must keep alternating correctly across every
+// separate transfer for as long as the endpoint stays configured --
+// tracked persistently via usb_msd_state.S, reset to DATA0 the moment
+// SET_CONFIGURATION establishes the endpoint (see the detection block
+// above). Otherwise this reuses dwc2_control_in/no_data's own proven
+// channel-0/HCCHAR/HCTSIZ/HCDMA/dwc2_wait_chan0_done plumbing
+// unchanged -- the DWC2 controller doesn't care whether channel 0 was
+// last used for a control or bulk transfer, only what's programmed
+// into it for the transfer about to be kicked off.
+fn dwc2_bulk_pid_data0() -> u32 {
+  return 0 as u32;
+}
+fn dwc2_bulk_pid_data1() -> u32 {
+  return 1 as u32;
+}
+
+// One bulk OUT transfer (host -> device), <= 64 bytes (dwc2_dma_
+// scratch's real capacity, same cap dwc2_control_in enforces for the
+// same reason -- see its own round-3-audit comment). Every BOT
+// transfer this round issues fits comfortably under that (a 31-byte
+// CBW): a real READ(10)/WRITE(10) data stage moving a full 512-byte
+// sector is out of scope for this round, flagged in docs/TODO.md.
+fn dwc2_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i64 {
+  if mps == (0 as u32) {
+    return 0 - 1;
+  }
+  if (out_len < 0) || (out_len > (64 as i64)) {
+    return 0 - 1;
+  }
+  let epaddr: u32 = usb_msd_get_bulk_out_epaddr();
+  let epnum: u32 = epaddr & (0x0F as u32);
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  let i: i64 = 0;
+  while i < out_len {
+    let b: u32 = buf_read_byte(buf, i as u32);
+    let _ = buf_write_byte(dma, i as u32, b);
+    i = i + 1;
+  }
+  // Same real-hardware DMA-coherency gap dwc2_control_in's own comment
+  // explains in full -- buf was just copied into dma via plain stores
+  // above, before handing that same address to the DWC2 controller's
+  // own DMA engine below.
+  let _ = mem_barrier();
+
+  let toggle: u32 = usb_msd_get_out_toggle();
+  let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
+  let pktcnt: u32 = if out_len == 0 { 1 as u32 } else { ((out_len as u32) + mps - (1 as u32)) / mps };
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
+  let result: u32 = dwc2_wait_chan0_done();
+  if (result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  let _ = usb_msd_set_out_toggle(next_toggle);
+  return 0;
+}
+
+// One bulk IN transfer (device -> host), <= 64 bytes, same scratch-
+// capacity reasoning as dwc2_bulk_out above.
+fn dwc2_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> i64 {
+  if mps == (0 as u32) {
+    return 0 - 1;
+  }
+  if (want_len < 0) || (want_len > (64 as i64)) {
+    return 0 - 1;
+  }
+  let epaddr: u32 = usb_msd_get_bulk_in_epaddr();
+  let epnum: u32 = epaddr & (0x0F as u32);
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  let toggle: u32 = usb_msd_get_in_toggle();
+  let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
+  let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
+  let result: u32 = dwc2_wait_chan0_done();
+  if (result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < want_len {
+    let b: u32 = buf_read_byte(dma, i as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  let _ = usb_msd_set_in_toggle(next_toggle);
+  return want_len;
+}
+
+// Bulk-Only Transport command/status framing (USB Mass Storage Class
+// Bulk-Only Transport spec, section 5). CBW is 31 bytes, all fields
+// little-endian (see buf_write_u32_le's own comment on why this
+// project needed a distinct helper from its existing network-byte-
+// order ones): dCBWSignature (fixed 0x43425355, "USBC" on the wire),
+// dCBWTag (arbitrary, echoed back in the CSW so a caller can confirm
+// the status belongs to this exact command), dCBWDataTransferLength,
+// bmCBWFlags (data stage direction, meaningless when length is 0),
+// bCBWLUN, bCBWCBLength (length of the real SCSI CDB that follows),
+// then the 16-byte CBWCB itself (zero-padded).
+fn bot_build_cbw(out_buf: mut ref i64, tag: u32, data_len: u32, flags: u32, cb_len: u32, cdb: mut ref i64, cdb_len: i64) -> i64 {
+  let _ = buf_write_u32_le(out_buf, 0, 0x43425355 as u32);
+  let _ = buf_write_u32_le(out_buf, 4, tag);
+  let _ = buf_write_u32_le(out_buf, 8, data_len);
+  let _ = buf_write_byte(out_buf, 12 as u32, flags);
+  let _ = buf_write_byte(out_buf, 13 as u32, 0 as u32); // LUN 0 -- the
+                                                          // only one
+                                                          // this
+                                                          // project
+                                                          // targets
+  let _ = buf_write_byte(out_buf, 14 as u32, cb_len);
+  let i: i64 = 0;
+  while i < 16 {
+    let b: u32 = if i < cdb_len { buf_read_byte(cdb, i as u32) } else { 0 as u32 };
+    let _ = buf_write_byte(out_buf, (15 + i) as u32, b);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Round 33's live milestone: TEST UNIT READY (SCSI opcode 0x00, a
+// fixed 6-byte all-zero CDB -- the simplest possible SCSI command,
+// with no data stage at all) sent through a real CBW/CSW round trip
+// over the bulk endpoints this same boot's config-descriptor parse
+// discovered. Proves the whole new bulk-transfer/BOT chain end to end
+// -- toggle tracking, endpoint direction, CBW/CSW framing -- without
+// yet needing a data-stage transfer (READ(10)/WRITE(10), moving a
+// real 512-byte sector) or FS integration, both later rounds' scope
+// per docs/TODO.md. Returns bCSWStatus (0=success, 1=command failed,
+// 2=phase error) on a well-formed CSW, or -1 on any transport failure
+// or a malformed/mismatched CSW (wrong signature or tag -- same
+// "reject, don't guess" posture as every other wire-format check in
+// this project).
+fn usb_msd_test_unit_ready(devaddr: u32) -> i64 {
+  let out_mps: u32 = usb_msd_get_bulk_out_mps();
+  let in_mps: u32 = usb_msd_get_bulk_in_mps();
+  let cdb: mut ref i64 = dhruva_alloc_bytes(6); // all-zero: opcode 0
+                                                  // (TEST UNIT READY),
+                                                  // LUN/reserved/
+                                                  // control all 0
+  let tag: u32 = 0x54555230 as u32; // "TUR0", just a recognizable,
+                                      // non-zero tag value
+  let cbw: mut ref i64 = dhruva_alloc_bytes(31);
+  let _ = bot_build_cbw(cbw, tag, 0 as u32, 0 as u32, 6 as u32, cdb, 6);
+  let out_status: i64 = dwc2_bulk_out(devaddr, out_mps, cbw, 31);
+  if out_status != 0 {
+    let _ = uart_puts("USB: BOT CBW send failed\n");
+    return 0 - 1;
+  }
+
+  let csw: mut ref i64 = dhruva_alloc_bytes(13);
+  let in_status: i64 = dwc2_bulk_in(devaddr, in_mps, csw, 13);
+  if in_status != (13 as i64) {
+    let _ = uart_puts("USB: BOT CSW receive failed\n");
+    return 0 - 1;
+  }
+  let csw_sig: u32 = buf_read_u32_le(csw, 0);
+  let csw_tag: u32 = buf_read_u32_le(csw, 4);
+  let csw_status: u32 = buf_read_byte(csw, 12 as u32);
+  if csw_sig != (0x53425355 as u32) {
+    let _ = uart_puts("USB: BOT CSW bad signature\n");
+    return 0 - 1;
+  }
+  if csw_tag != tag {
+    let _ = uart_puts("USB: BOT CSW tag mismatch\n");
+    return 0 - 1;
+  }
+  let _ = uart_puts("USB: BOT TEST UNIT READY csw_status=");
+  let _ = uart_put_hex32(csw_status);
+  if csw_status == (0 as u32) {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    // A real device can legitimately report "not ready" (status=1) --
+    // QEMU's usb-storage backend answers success once a real backing
+    // image is attached, but this is still a genuine, well-formed BOT
+    // round trip either way, not a driver failure -- only signal loud
+    // FAIL-style attention for a transport-level problem (handled by
+    // the two checks above), not a normal SCSI-level status.
+    let _ = uart_puts(" (not ready or check condition -- transport itself OK)\n");
+  }
+  return csw_status as i64;
 }
 
 // The address every device answers at before the host assigns it a
@@ -6283,7 +6597,35 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   // story; this is the downstream device's own configuration step,
   // the same one dwc2_probe_device0 does for whatever sits on the
   // root port.
-  return dwc2_fetch_and_set_configuration(downstream_addr, dmps0);
+  let config_status: i64 = dwc2_fetch_and_set_configuration(downstream_addr, dmps0);
+  if config_status != 0 {
+    return config_status;
+  }
+  // Round 33: if that configuration step just found a mass-storage
+  // (BOT) interface, prove the new bulk-transfer/BOT chain live right
+  // here, the same "verify live at boot, not just self-test" pattern
+  // every USB round in this project has followed -- gated on usb_msd_
+  // get_bot() so a usb-net (or any non-mass-storage) device's own
+  // enumeration is completely unaffected.
+  if usb_msd_get_bot() == (1 as u32) {
+    // A SCSI device commonly reports CHECK CONDITION / Unit Attention
+    // on the very first command after attach (a standard "something
+    // changed since you last talked to me" signal, not a real
+    // failure) -- confirmed live under QEMU's own usb-storage model:
+    // the first TEST UNIT READY reported csw_status=1, the second
+    // (identical) call reported csw_status=0. Retrying once, bounded
+    // (not `while true`), matches this project's own established
+    // polling discipline and real SCSI initiator convention. This
+    // also happens to be a genuine second exercise of the bulk-
+    // transfer data-toggle tracking across a full extra CBW-out/
+    // CSW-in round trip -- exactly the kind of repeat-transfer
+    // scenario a toggle bug would show up in.
+    let first_status: i64 = usb_msd_test_unit_ready(downstream_addr);
+    if first_status != 0 {
+      let _ = usb_msd_test_unit_ready(downstream_addr);
+    }
+  }
+  return 0;
 }
 
 // First real enumeration milestone: fetch the first 8 bytes of device
