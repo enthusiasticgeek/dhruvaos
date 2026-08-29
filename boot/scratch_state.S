@@ -234,6 +234,19 @@ dhcp_bcast_mac_scratch_addr:
                          * no way to write a byte-buffer literal
                          * directly; still just one persistent buffer,
                          * not a fresh allocation per call. */
+usb_bulk_data_scratch_addr:
+    .word 0             /* Round 35: 512 bytes -- dwc2_bulk_out/
+                         * dwc2_bulk_in's own DMA buffer, separate from
+                         * dwc2_dma_scratch (64 bytes, control transfers
+                         * only). USB mass storage's CBW (31B)/CSW (13B)
+                         * fit easily in either, but READ(10)/WRITE(10)
+                         * need to move a full 512-byte sector -- a
+                         * dedicated buffer sized for that real need
+                         * rather than growing the control-transfer
+                         * scratch (which every already-proven control
+                         * transfer call site still only ever needs 64
+                         * bytes for) and risking a change to code that
+                         * didn't need to change. */
 
 .section ".text"
 
@@ -485,6 +498,20 @@ dhcp_bcast_mac_scratch_set:
 .global dhcp_bcast_mac_scratch_get
 dhcp_bcast_mac_scratch_get:
     ldr r0, =dhcp_bcast_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_bulk_data_scratch_set
+usb_bulk_data_scratch_set:
+    ldr r1, =usb_bulk_data_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global usb_bulk_data_scratch_get
+usb_bulk_data_scratch_get:
+    ldr r0, =usb_bulk_data_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

@@ -52,6 +52,13 @@ extern "C" fn uart_digits_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn uart_digits_scratch_get() -> mut ref i64;
 extern "C" fn dwc2_dma_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dwc2_dma_scratch_get() -> mut ref i64;
+// Round 35 (boot/scratch_state.S): dwc2_bulk_out/dwc2_bulk_in's own
+// dedicated 512-byte DMA buffer, separate from dwc2_dma_scratch (64
+// bytes, control transfers only) -- see that state file's own comment
+// for why a full sector's worth of headroom is a real, not
+// speculative, need (READ(10)/WRITE(10)).
+extern "C" fn usb_bulk_data_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn usb_bulk_data_scratch_get() -> mut ref i64;
 extern "C" fn tcp_empty_payload_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn tcp_empty_payload_scratch_get() -> mut ref i64;
 extern "C" fn net_send_scratch_set(addr: mut ref i64) -> i64;
@@ -6187,22 +6194,25 @@ fn dwc2_bulk_pid_data1() -> u32 {
   return 1 as u32;
 }
 
-// One bulk OUT transfer (host -> device), <= 64 bytes (dwc2_dma_
-// scratch's real capacity, same cap dwc2_control_in enforces for the
-// same reason -- see its own round-3-audit comment). Every BOT
-// transfer this round issues fits comfortably under that (a 31-byte
-// CBW): a real READ(10)/WRITE(10) data stage moving a full 512-byte
-// sector is out of scope for this round, flagged in docs/TODO.md.
+// One bulk OUT transfer (host -> device), <= 512 bytes (usb_bulk_
+// data_scratch's real capacity -- round 35 raised this from 64, a cap
+// that only ever needed to cover a 31-byte CBW, once READ(10)/
+// WRITE(10) needed to move a full 512-byte sector through this same
+// function. Uses its own dedicated scratch buffer, NOT dwc2_dma_
+// scratch (still 64 bytes, still used unchanged by dwc2_control_in/
+// no_data -- see usb_bulk_data_scratch_addr's own comment in
+// scratch_state.S for why a separate buffer was safer than growing
+// the control-transfer one those already-proven functions still use).
 fn dwc2_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i64 {
   if mps == (0 as u32) {
     return 0 - 1;
   }
-  if (out_len < 0) || (out_len > (64 as i64)) {
+  if (out_len < 0) || (out_len > (512 as i64)) {
     return 0 - 1;
   }
   let epaddr: u32 = usb_msd_get_bulk_out_epaddr();
   let epnum: u32 = epaddr & (0x0F as u32);
-  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let dma: mut ref i64 = usb_bulk_data_scratch_get();
   let hcchar0: i64 = dwc2_hcchar0_addr();
   let hctsiz0: i64 = dwc2_hctsiz0_addr();
   let hcdma0: i64 = dwc2_hcdma0_addr();
@@ -6234,18 +6244,18 @@ fn dwc2_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i64 
   return 0;
 }
 
-// One bulk IN transfer (device -> host), <= 64 bytes, same scratch-
+// One bulk IN transfer (device -> host), <= 512 bytes, same scratch-
 // capacity reasoning as dwc2_bulk_out above.
 fn dwc2_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> i64 {
   if mps == (0 as u32) {
     return 0 - 1;
   }
-  if (want_len < 0) || (want_len > (64 as i64)) {
+  if (want_len < 0) || (want_len > (512 as i64)) {
     return 0 - 1;
   }
   let epaddr: u32 = usb_msd_get_bulk_in_epaddr();
   let epnum: u32 = epaddr & (0x0F as u32);
-  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let dma: mut ref i64 = usb_bulk_data_scratch_get();
   let hcchar0: i64 = dwc2_hcchar0_addr();
   let hctsiz0: i64 = dwc2_hctsiz0_addr();
   let hcdma0: i64 = dwc2_hcdma0_addr();
@@ -6301,25 +6311,27 @@ fn bot_build_cbw(out_buf: mut ref i64, tag: u32, data_len: u32, flags: u32, cb_l
   return 0;
 }
 
-// Round 34: generic BOT "data-IN" SCSI command round trip -- CBW out
-// (declaring data_len bytes of IN data, or 0 for a command with no
-// data stage at all), the data stage itself if data_len > 0, then CSW
-// in. Round 33's own usb_msd_test_unit_ready originally inlined this
-// exact shape for TEST UNIT READY alone (data_len=0); factored out
-// once a third near-identical call site (INQUIRY, READ CAPACITY(10),
-// below) would otherwise have duplicated it twice more. Every command
-// this project issues is host-reads-from-device (IN) -- WRITE(10)'s
-// own OUT data stage is later-round scope (needs a larger DMA-capable
-// buffer than the shared 64-byte one this whole layer still uses; see
-// docs/TODO.md). Returns bCSWStatus (0=success, 1=command failed,
-// 2=phase error) on a well-formed CSW, or -1 on any transport failure,
-// a short data-stage transfer, or a malformed/mismatched CSW (wrong
-// signature or tag) -- same "reject, don't guess" posture as every
-// other wire-format check in this project.
-fn usb_msd_scsi_command_in(devaddr: u32, cdb: mut ref i64, cdb_len: i64, tag: u32, data_len: u32, out_data: mut ref i64) -> i64 {
+// Round 34: generic BOT SCSI command round trip -- CBW out (declaring
+// data_len bytes of data in whichever direction is_write says, or
+// data_len=0 for a command with no data stage at all), the data stage
+// itself if data_len > 0, then CSW in. Round 33's own usb_msd_test_
+// unit_ready originally inlined this exact shape for TEST UNIT READY
+// alone (data_len=0); round 34 factored it out as usb_msd_scsi_
+// command_in once INQUIRY/READ CAPACITY(10) needed the identical
+// IN-direction shape. Round 35 generalized it further (renamed
+// accordingly) to also cover WRITE(10)'s OUT data stage, once that
+// needed the same shape with the direction flipped and a real
+// DMA-capable buffer to move a full sector through (see dwc2_bulk_
+// out/in's own comment on usb_bulk_data_scratch). Returns bCSWStatus
+// (0=success, 1=command failed, 2=phase error) on a well-formed CSW,
+// or -1 on any transport failure, a short data-stage transfer, or a
+// malformed/mismatched CSW (wrong signature or tag) -- same "reject,
+// don't guess" posture as every other wire-format check in this
+// project.
+fn usb_msd_scsi_command(devaddr: u32, cdb: mut ref i64, cdb_len: i64, tag: u32, data_len: u32, is_write: i64, data: mut ref i64) -> i64 {
   let out_mps: u32 = usb_msd_get_bulk_out_mps();
   let in_mps: u32 = usb_msd_get_bulk_in_mps();
-  let flags: u32 = if data_len > (0 as u32) { 0x80 as u32 } else { 0 as u32 }; // bit7: IN
+  let flags: u32 = if (data_len > (0 as u32)) && (is_write == 0) { 0x80 as u32 } else { 0 as u32 }; // bit7: IN
   let cbw: mut ref i64 = dhruva_alloc_bytes(31);
   let _ = bot_build_cbw(cbw, tag, data_len, flags, cdb_len as u32, cdb, cdb_len);
   let out_status: i64 = dwc2_bulk_out(devaddr, out_mps, cbw, 31);
@@ -6329,10 +6341,18 @@ fn usb_msd_scsi_command_in(devaddr: u32, cdb: mut ref i64, cdb_len: i64, tag: u3
   }
 
   if data_len > (0 as u32) {
-    let data_status: i64 = dwc2_bulk_in(devaddr, in_mps, out_data, data_len as i64);
-    if data_status != (data_len as i64) {
-      let _ = uart_puts("USB: BOT data-in stage failed\n");
-      return 0 - 1;
+    if is_write == 1 {
+      let data_status: i64 = dwc2_bulk_out(devaddr, out_mps, data, data_len as i64);
+      if data_status != 0 {
+        let _ = uart_puts("USB: BOT data-out stage failed\n");
+        return 0 - 1;
+      }
+    } else {
+      let data_status: i64 = dwc2_bulk_in(devaddr, in_mps, data, data_len as i64);
+      if data_status != (data_len as i64) {
+        let _ = uart_puts("USB: BOT data-in stage failed\n");
+        return 0 - 1;
+      }
     }
   }
 
@@ -6373,7 +6393,7 @@ fn usb_msd_test_unit_ready(devaddr: u32) -> i64 {
   // means usb_msd_scsi_command_in's own data-stage block never
   // touches it, so reusing the already-allocated cdb avoids a
   // pointless extra allocation for a buffer that's guaranteed dead.
-  let csw_status: i64 = usb_msd_scsi_command_in(devaddr, cdb, 6, tag, 0 as u32, cdb);
+  let csw_status: i64 = usb_msd_scsi_command(devaddr, cdb, 6, tag, 0 as u32, 0, cdb);
   if csw_status < 0 {
     return csw_status;
   }
@@ -6411,7 +6431,7 @@ fn usb_msd_inquiry(devaddr: u32) -> i64 {
   let _ = buf_write_byte(cdb, 4 as u32, 36 as u32);   // allocation length
   let tag: u32 = 0x494E5130 as u32; // "INQ0"
   let data: mut ref i64 = dhruva_alloc_bytes(36);
-  let csw_status: i64 = usb_msd_scsi_command_in(devaddr, cdb, 6, tag, 36 as u32, data);
+  let csw_status: i64 = usb_msd_scsi_command(devaddr, cdb, 6, tag, 36 as u32, 0, data);
   if csw_status != 0 {
     let _ = uart_puts("USB: INQUIRY failed, csw_status/transport=");
     let _ = uart_put_hex32(csw_status as u32);
@@ -6457,7 +6477,7 @@ fn usb_msd_read_capacity10(devaddr: u32) -> i64 {
   let _ = buf_write_byte(cdb, 0 as u32, 0x25 as u32); // READ CAPACITY(10)
   let tag: u32 = 0x52433130 as u32; // "RC10"
   let data: mut ref i64 = dhruva_alloc_bytes(8);
-  let csw_status: i64 = usb_msd_scsi_command_in(devaddr, cdb, 10, tag, 8 as u32, data);
+  let csw_status: i64 = usb_msd_scsi_command(devaddr, cdb, 10, tag, 8 as u32, 0, data);
   if csw_status != 0 {
     let _ = uart_puts("USB: READ CAPACITY(10) failed, csw_status/transport=");
     let _ = uart_put_hex32(csw_status as u32);
@@ -6470,6 +6490,91 @@ fn usb_msd_read_capacity10(devaddr: u32) -> i64 {
   let _ = uart_put_hex32(last_lba);
   let _ = uart_puts(" block_len=");
   let _ = uart_put_hex32(block_len);
+  let _ = uart_puts(" (PASS)\n");
+  return 0;
+}
+
+// Round 35: SCSI READ(10) (opcode 0x28) -- moves exactly one 512-byte
+// block (this project's own established block-size convention
+// throughout: the SD driver, the FS layer, and netif's own queue
+// slots all already use 512 everywhere) starting at LBA lba into
+// out_data (caller-owned, >= 512 bytes). CDB fields beyond the opcode
+// are big-endian, same SCSI wire convention as READ CAPACITY(10)'s
+// own response. This is the first command whose data stage needed
+// usb_bulk_data_scratch's real 512-byte capacity (round 34's CDB/CSW
+// traffic never exceeded 64 bytes).
+fn usb_msd_read10(devaddr: u32, lba: u32, out_data: mut ref i64) -> i64 {
+  let cdb: mut ref i64 = dhruva_alloc_bytes(10);
+  let _ = buf_write_byte(cdb, 0 as u32, 0x28 as u32); // READ(10)
+  let _ = buf_write_u32_be(cdb, 2, lba);
+  let _ = buf_write_u16_be(cdb, 7, 1 as u32); // transfer length: 1 block
+  let tag: u32 = 0x52443130 as u32; // "RD10"
+  let csw_status: i64 = usb_msd_scsi_command(devaddr, cdb, 10, tag, 512 as u32, 0, out_data);
+  if csw_status != 0 {
+    let _ = uart_puts("USB: READ(10) failed, csw_status/transport=");
+    let _ = uart_put_hex32(csw_status as u32);
+    let _ = uart_puts("\n");
+    return csw_status;
+  }
+  return 0;
+}
+
+// Round 35: SCSI WRITE(10) (opcode 0x2A) -- same CDB layout as
+// READ(10) above, same one-512-byte-block scope, data stage direction
+// flipped to OUT (usb_msd_scsi_command's is_write=1 path).
+fn usb_msd_write10(devaddr: u32, lba: u32, data: mut ref i64) -> i64 {
+  let cdb: mut ref i64 = dhruva_alloc_bytes(10);
+  let _ = buf_write_byte(cdb, 0 as u32, 0x2A as u32); // WRITE(10)
+  let _ = buf_write_u32_be(cdb, 2, lba);
+  let _ = buf_write_u16_be(cdb, 7, 1 as u32);
+  let tag: u32 = 0x57523130 as u32; // "WR10"
+  let csw_status: i64 = usb_msd_scsi_command(devaddr, cdb, 10, tag, 512 as u32, 1, data);
+  if csw_status != 0 {
+    let _ = uart_puts("USB: WRITE(10) failed, csw_status/transport=");
+    let _ = uart_put_hex32(csw_status as u32);
+    let _ = uart_puts("\n");
+    return csw_status;
+  }
+  return 0;
+}
+
+// Round 35's live milestone: a real READ(10)/WRITE(10) round trip --
+// write a real pattern to a real sector, read it back, and confirm
+// the bytes actually match, not just that both transports reported
+// success. LBA 100 is arbitrary but safely inside this project's own
+// 8MB test image (16384 total 512-byte blocks) and far from block 0,
+// where a real filesystem would keep boot-sector/partition-table
+// metadata this driver doesn't parse or care about. Reuses
+// test_fill_pattern/test_compare_buffers -- the SAME generic
+// pattern-fill/compare helpers the SD driver's own 8-block round-trip
+// sweep already uses for the identical shape of check, rather than
+// writing a second, duplicate byte-compare loop.
+fn usb_msd_read10_write10_check(devaddr: u32) -> i64 {
+  let lba: u32 = 100 as u32;
+  let write_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let _ = test_fill_pattern(write_buf, 512);
+  let write_status: i64 = usb_msd_write10(devaddr, lba, write_buf);
+  if write_status != 0 {
+    let _ = uart_puts("USB: WRITE(10)/READ(10) round trip (FAIL, write_status=");
+    let _ = uart_put_hex32(write_status as u32);
+    let _ = uart_puts(")\n");
+    return 0 - 1;
+  }
+  let read_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let read_status: i64 = usb_msd_read10(devaddr, lba, read_buf);
+  if read_status != 0 {
+    let _ = uart_puts("USB: WRITE(10)/READ(10) round trip (FAIL, read_status=");
+    let _ = uart_put_hex32(read_status as u32);
+    let _ = uart_puts(")\n");
+    return 0 - 1;
+  }
+  let mismatch: i64 = test_compare_buffers(write_buf, read_buf, 512);
+  if mismatch != 0 {
+    let _ = uart_puts("USB: WRITE(10)/READ(10) round trip (FAIL, data mismatch)\n");
+    return 0 - 1;
+  }
+  let _ = uart_puts("USB: WRITE(10)/READ(10) round trip lba=");
+  let _ = uart_put_hex32(lba);
   let _ = uart_puts(" (PASS)\n");
   return 0;
 }
@@ -6742,6 +6847,10 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
     // sector.
     let _ = usb_msd_inquiry(downstream_addr);
     let _ = usb_msd_read_capacity10(downstream_addr);
+    // Round 35: the actual point of this whole feature -- a real
+    // sector write, then a real sector read back, over the bulk
+    // endpoints this same boot's config-descriptor parse discovered.
+    let _ = usb_msd_read10_write10_check(downstream_addr);
   }
   return 0;
 }
@@ -8479,6 +8588,7 @@ fn kernel_main() -> i64 {
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
   let _ = uart_digits_scratch_set(dhruva_alloc_bytes(24));
   let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(64));
+  let _ = usb_bulk_data_scratch_set(dhruva_alloc_bytes(512));
   let _ = tcp_empty_payload_scratch_set(dhruva_alloc_bytes(1));
   let _ = net_send_scratch_set(dhruva_alloc_bytes(512));
   let _ = net_recv_scratch_set(dhruva_alloc_bytes(512));
