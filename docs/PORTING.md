@@ -78,12 +78,84 @@ different timer peripheral. None of that is in scope for this note;
 it's flagged here so the storage/USB estimates below aren't read as
 "the whole port."
 
-QEMU's `raspi1ap` machine model is Pi-1-only — there is no equivalent
-QEMU target for Pi 4/5 at the fidelity this project currently relies
-on for its whole verification discipline (self-tests, `phase4_
-milestone.py`, `heap_stress.py`, `power_yank.py`, all run headless
-under QEMU every round). A Pi 4/5 port loses that safety net and
-needs real-hardware bring-up, which is a slower iteration loop than
-anything this project has done so far.
+### Correction (round 40, 2026-08-29): a Pi 4 QEMU target *does* exist
+
+An earlier version of this note claimed there is no QEMU target for
+Pi 4/5 at all. That was checked properly for the first time in round
+40 and is **wrong for Pi 4** — it was an assumption carried over from
+`raspi1ap` being Pi-1-only, never actually verified against QEMU's
+full machine list:
+
+- `qemu-system-arm -M help` (the 32-bit emulator this whole project
+  has used exclusively) indeed lists no Pi 4/5 model.
+- `qemu-system-aarch64 -M help` (the **64-bit** emulator, a separate
+  binary, already installed on this machine) lists `raspi4b`
+  (revision 1.5) alongside `raspi0`/`raspi1ap`/`raspi2b`/`raspi3ap`/
+  `raspi3b`. No `raspi5` yet in this QEMU version — Pi 5 still has no
+  emulation target.
+- Verified live, not just from `-M help` output: a minimal bare-metal
+  AArch64 stub (raw `_start`, no exception vectors, no MMU) built with
+  the already-installed `aarch64-linux-gnu-gcc` (`-mgeneral-regs-only
+  -nostdlib`, linked at `0x80000` like the standard Linux arm64 kernel
+  load address) boots correctly under
+  `qemu-system-aarch64 -M raspi4b -nographic -kernel <elf>` and
+  successfully polls/writes a PL011 UART at **`0xFE201000`**
+  (BCM2711's low-peripheral-mode base `0xFE000000` + the same
+  `0x201000` UART0 offset every earlier BCM2835/2837 SoC in this
+  project's history has used). QEMU accepts the ELF directly via
+  `-kernel`, the same convention `dhruva.elf` already relies on for
+  Pi 1.
+- Also checked: QEMU's `raspi4b` starts execution at **EL3** (Secure
+  Monitor), confirmed via a live `mrs x0, CurrentEL` read printed over
+  the UART. Real Pi 4 firmware normally does EL3→EL2→EL1 handoff via
+  ARM Trusted Firmware before jumping to an OS; QEMU's raw `-kernel`
+  boot skips that firmware entirely and drops straight into EL3, so a
+  real port's boot code must do that EL3→EL1 (or EL3→EL2→EL1) drop
+  itself — `SCR_EL3`/`HCR_EL2`/`SPSR_EL3` setup + `eret`, nothing like
+  ARM1176's single flat mode-switch model in `boot/rpi1/boot.S` today.
+
+**Toolchain is also not a blocker**, contrary to what might be
+assumed from `vani-compiler`'s history of only ever targeting 32-bit
+ARM/x86 for this project: `vani-compiler`'s `--backend=c` /
+`--backend=llvm` pipelines already contain generic bare-metal
+cross-compilation logic keyed off the `--target=<triple>` string
+(`is_bare_metal_triple`/`cross_cc_for_triple` in `src/main.rs`), with
+explicit `aarch64` handling already present (QEMU-dispatch, NEON
+vectorize-width hints in `backend_llvm.rs`). A bare-metal triple like
+`aarch64-none-elf` would make the compiler look for a
+`aarch64-none-elf-gcc` cross-compiler, which is **not** installed —
+but the `CROSS_CC` environment variable override (already supported)
+can point it at the `aarch64-linux-gnu-gcc` toolchain that **is**
+installed on this machine; that toolchain works fine for freestanding
+bare-metal AArch64 output with `-nostdlib -ffreestanding`, exactly as
+used for the spike above. No changes to `vani-compiler` itself appear
+to be needed to start emitting AArch64 object code.
+
+**What this changes**: the "no safety net, real-hardware-only"
+framing below no longer applies to Pi 4 (it still applies to Pi 5,
+which has no QEMU model at all). A Pi 4 port can keep this project's
+entire existing verification discipline — self-tests, `phase4_
+milestone.py`-style smoke tests, `heap_stress.py`, `power_yank.py` —
+run headless under `qemu-system-aarch64 -M raspi4b`, the same as
+every round of this project has done under `qemu-system-arm -M
+raspi1ap`. This makes a real Pi 4 port a dramatically more tractable,
+iterable effort than previously scoped; Pi 5 remains real-hardware-
+only until QEMU grows a BCM2712/RP1 model.
+
+The verified spike (boot stub + linker script) is not yet checked
+into this repository — round 40 was research/validation only. The
+real work still ahead, now precisely scoped rather than assumed:
+EL3→EL1 drop + real AArch64 exception vector table (`VBAR_EL1`, 16
+entries not ARM32's ~7), ARMv8-A MMU (radically different from
+ARMv6's short-descriptor sections — TTBR0_EL1/TCR_EL1, 4-level or
+folded page tables), GICv2 or GICv3 interrupt controller in place of
+BCM2835's simple IC, BCM2711 timer peripheral (still the same generic
+ARM timer core the existing scheduler code assumes, but at new
+addresses), then only after all of that: EMMC2 (storage) and XHCI
+(USB) drivers from scratch, both already flagged above as
+substantially larger than their Pi 1 SDHOST/DWC2 counterparts.
+
+QEMU's `raspi1ap` machine model remains Pi-1-only; there is still no
+QEMU target for Pi 5.
 
 See `docs/TODO.md` for the backlog entries and effort estimates.
