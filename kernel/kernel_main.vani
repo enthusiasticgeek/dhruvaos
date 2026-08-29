@@ -2029,7 +2029,22 @@ fn dharafs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) 
       return 0 - 1; // not a continuation marker -- chain is wrong
     }
     let cont_len: i64 = buf_read_u32(cont, 44 as u32) as i64;
-    if (cont_len < 0) || (cont_len > cap) {
+    // BUG (found via host-side ASAN/UBSAN harness, 2026-08-29): this used
+    // to accept cont_len == 0 (the `< 0` half of this check is dead code
+    // in the first place -- a u32-read-then-cast-to-i64 can never be
+    // negative). No REAL append path ever writes a zero-length
+    // continuation chunk (every genuine chunk's own length is > 0 by
+    // construction in dharafs_append_raw's multi-block split), but a
+    // corrupted or deliberately adversarial disk image can contain one
+    // -- and `this_chunk` below would then be 0, `remaining` would never
+    // decrease, and a `next_block` field pointing back into the chain
+    // (even at just this same block) turns this loop into a genuine
+    // infinite loop / hang, not merely a logic error that still
+    // terminates wrong. Rejecting cont_len <= 0 closes it: every real
+    // chain still reads correctly (see this comment's own reasoning for
+    // why a real chunk is always > 0), and a malformed one now fails
+    // the read instead of hanging the caller forever.
+    if (cont_len <= 0) || (cont_len > cap) {
       return 0 - 1;
     }
     let this_chunk: i64 = if cont_len < remaining { cont_len } else { remaining };
