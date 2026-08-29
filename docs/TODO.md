@@ -581,7 +581,7 @@ replacement for it — everything QEMU can already catch should still
 be caught in QEMU first, keeping the fast local loop as the default
 and hardware-in-loop as the final confirmation pass.
 
-## Pi 4/5 port — now started (round 40, opening research + spike)
+## Pi 4/5 port — now started (round 40 research, round 43 boot skeleton)
 
 **Round 40 correction**: `docs/PORTING.md` previously claimed no QEMU
 target exists for Pi 4/5 at all. Verified false for Pi 4 — QEMU's
@@ -606,23 +606,36 @@ style smoke tests, `heap_stress.py`, `power_yank.py`) — it is NOT
 real-hardware-only the way it was previously assumed to be. Pi 5
 remains real-hardware-only (no QEMU model exists for BCM2712/RP1).
 
+**Round 43: real EL3→EL1 boot skeleton — DONE, checked in.**
+`boot/rpi4/boot.S` (EL3→EL1 privilege drop), `boot/rpi4/vectors.S` (a
+real 16-entry AArch64 exception vector table, diagnostic-only —
+reports `ESR_EL1`/`ELR_EL1`/`FAR_EL1` then halts, same "never silently
+loop forever" convention round 38 established), `boot/rpi4/link.ld`,
+built via the new `build_rpi4.sh`, verified via the new
+`test/rpi4_boot_smoke.py`. Both halves live-verified: the drop prints
+`CurrentEL=1` (read AFTER dropping, at EL1), and the vector table was
+proven to genuinely dispatch by deliberately executing `udf` and
+confirming the correct vector fires with an architecturally-correct
+`ESR_EL1`. That fault-injection test caught a real bug during
+development (`uart_puts_rpi4_el` clobbered its own return address via
+two un-saved nested calls) — fixed before the round closed. Full
+details: `docs/PORTING.md`'s "Round 43" section.
+
 Remaining scope for a real Pi 4 boot, now precisely identified rather
 than assumed:
 
-- ARMv8-A EL3→EL1 (or EL3→EL2→EL1) exception-level drop — new,
-  ARM1176 has no equivalent.
-- Real AArch64 exception vector table (`VBAR_EL1`, 16 entries) —
-  `boot/rpi1/vectors.S` is ARMv6-specific and doesn't carry over.
 - ARMv8-A MMU (TTBR0_EL1/TCR_EL1, radically different from ARMv6's
   short-descriptor 1MB sections used in `boot/mmu_init.S`).
 - GICv2/GICv3 interrupt controller (replaces BCM2835's simple
   interrupt controller — `timer_ic_init` and everything built on it).
 - BCM2711 generic ARM timer at new peripheral addresses (same timer
   core the scheduler already assumes, different base).
+- Porting `kernel_main.vani` itself (or a fresh AArch64-native rewrite
+  of its boot-facing pieces) to this target — round 43's kernel is
+  deliberately hand-written assembly only, no vani-compiled code yet.
 - Only after all of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
 
 Still not sized (each of the bullets above is its own multi-round
-effort); the spike above is validation/scoping only, not yet checked
-into the repository.
+effort).

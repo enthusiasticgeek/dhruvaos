@@ -142,18 +142,50 @@ raspi1ap`. This makes a real Pi 4 port a dramatically more tractable,
 iterable effort than previously scoped; Pi 5 remains real-hardware-
 only until QEMU grows a BCM2712/RP1 model.
 
-The verified spike (boot stub + linker script) is not yet checked
-into this repository — round 40 was research/validation only. The
-real work still ahead, now precisely scoped rather than assumed:
-EL3→EL1 drop + real AArch64 exception vector table (`VBAR_EL1`, 16
-entries not ARM32's ~7), ARMv8-A MMU (radically different from
-ARMv6's short-descriptor sections — TTBR0_EL1/TCR_EL1, 4-level or
-folded page tables), GICv2 or GICv3 interrupt controller in place of
-BCM2835's simple IC, BCM2711 timer peripheral (still the same generic
-ARM timer core the existing scheduler code assumes, but at new
-addresses), then only after all of that: EMMC2 (storage) and XHCI
-(USB) drivers from scratch, both already flagged above as
-substantially larger than their Pi 1 SDHOST/DWC2 counterparts.
+### Round 43: real EL3→EL1 boot skeleton, checked in
+
+Round 40's spike was research/validation only, deliberately left in
+`/tmp`. Round 43 replaced it with real, permanent code:
+`boot/rpi4/boot.S` (EL3→EL1 privilege drop — `HCR_EL2.RW`, `SCR_EL3`
+(NS/RES1/HCE/RW), `SPSR_EL3` targeting EL1h with DAIF masked,
+`ELR_EL3` + `eret`), `boot/rpi4/vectors.S` (a real 16-entry AArch64
+exception vector table, `VBAR_EL1`-installed, each entry a diagnostic
+handler reporting `ESR_EL1`/`ELR_EL1`/`FAR_EL1` over the PL011 UART
+before halting — same "never silently loop forever on a fault"
+convention round 38 established for the Pi 1 MMU work), and
+`boot/rpi4/link.ld`. Built via the new `build_rpi4.sh` (a deliberately
+separate script from `build.sh` — different instruction set, different
+cross-compiler, no vani-compiled kernel code yet), verified via the
+new `test/rpi4_boot_smoke.py`.
+
+Both halves live-verified, not just asserted: the EL3→EL1 drop prints
+`CurrentEL=1` (read AFTER the drop, at EL1 — the actual regression
+check `rpi4_boot_smoke.py` runs), and the vector table was proven to
+genuinely dispatch by deliberately executing a `udf` instruction and
+confirming the correct vector (4 — Current EL, SPx, Synchronous) fires
+with an architecturally-correct `ESR_EL1` value (`0x02000000`: EC=0
+"Unknown reason" — the real classification for an undefined encoding,
+not a separate "undefined instruction" code as might be assumed;
+IL=1, correctly reflecting that AArch64 instructions are always
+32 bits). That same fault-injection test caught a real bug during
+development: `uart_puts_rpi4_el` made two nested calls without saving
+its own return address, silently corrupting it and jumping to garbage
+on return — fixed before this round closed.
+
+v1 scope is deliberately narrow: hand-written assembly only, no vani-
+compiled kernel code yet (a real `kernel_main.vani`-style AArch64 port
+needs its own round once this boot layer exists), no MMU, no GIC, no
+timer. Real work still ahead, now precisely scoped rather than
+assumed: ARMv8-A MMU (radically different from ARMv6's short-
+descriptor sections — TTBR0_EL1/TCR_EL1, 4-level or folded page
+tables), GICv2 or GICv3 interrupt controller in place of BCM2835's
+simple IC, BCM2711 timer peripheral (still the same generic ARM timer
+core the existing scheduler code assumes, but at new addresses), then
+only after all of that: EMMC2 (storage) and XHCI (USB) drivers from
+scratch, both already flagged above as substantially larger than
+their Pi 1 SDHOST/DWC2 counterparts, and — the largest remaining
+unknown — porting `kernel_main.vani` itself (or a fresh AArch64-native
+rewrite of its boot-facing pieces) to this target at all.
 
 QEMU's `raspi1ap` machine model remains Pi-1-only; there is still no
 QEMU target for Pi 5.
