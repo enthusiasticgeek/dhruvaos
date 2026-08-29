@@ -70,6 +70,10 @@ extern "C" fn dharafs_verified_digest_a_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_verified_digest_a_scratch_get() -> mut ref i64;
 extern "C" fn dharafs_verified_digest_b_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_verified_digest_b_scratch_get() -> mut ref i64;
+// Round 50: dharafs_attr_check_write's own persistent scratch -- see
+// boot/scratch_state.S's own comment.
+extern "C" fn dharafs_appendonly_check_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_appendonly_check_scratch_get() -> mut ref i64;
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn shell_line_scratch_get() -> mut ref i64;
 extern "C" fn eval_values_scratch_set(addr: mut ref i64) -> i64;
@@ -1582,6 +1586,102 @@ fn dharafs_read_raw_checked(path_buf: mut ref i64, path_len: i64, out_buf: mut r
 // real Unix filesystem would; allowing creation freely is the
 // honestly-scoped v1 simplification (noted here rather than silently
 // assumed). An EXISTING path's write permission is enforced normally.
+// Round 50: immutable/append-only/system file attributes (docs/
+// TODO.md's own backlog item). Stored in the EXISTING `mode` u32's
+// otherwise-unused high bits (only the low 9 bits are real rwx
+// permission bits, per dharafs_check_permission's own shift-by-6/3/0
+// logic) -- no on-disk record format change needed, matching the same
+// "don't touch the 512-byte record layout without a real consumer
+// forcing it" reasoning round 48's companion-file digest already
+// established. Same precedent as real Unix's own setuid/setgid/sticky
+// bits living above the base 0777 permission bits in a single mode
+// word.
+fn dharafs_attr_immutable() -> u32 {
+  return 0x200 as u32;
+}
+fn dharafs_attr_append_only() -> u32 {
+  return 0x400 as u32;
+}
+fn dharafs_attr_system() -> u32 {
+  return 0x800 as u32;
+}
+fn dharafs_attr_mask() -> u32 {
+  return 0xE00 as u32;
+}
+
+fn dharafs_mode_is_immutable(mode: u32) -> i64 {
+  return if (mode & dharafs_attr_immutable()) != (0 as u32) { 1 } else { 0 };
+}
+fn dharafs_mode_is_append_only(mode: u32) -> i64 {
+  return if (mode & dharafs_attr_append_only()) != (0 as u32) { 1 } else { 0 };
+}
+
+// Both immutable and append-only forbid deleting the file outright --
+// matches real chattr +i/+a semantics.
+fn dharafs_mode_blocks_delete(mode: u32) -> i64 {
+  return if (dharafs_mode_is_immutable(mode) == 1) || (dharafs_mode_is_append_only(mode) == 1) { 1 } else { 0 };
+}
+// Only immutable blocks being the SOURCE of a rename -- an append-only
+// file's content protection travels with it across a rename (real
+// chattr +a allows renaming; only +i blocks it).
+fn dharafs_mode_blocks_rename_source(mode: u32) -> i64 {
+  return dharafs_mode_is_immutable(mode);
+}
+// Both attributes forbid this record being silently replaced wholesale
+// -- an ordinary overwriting write(), or being the DESTINATION of a
+// rename -- both are a full content swap, exactly what either
+// attribute exists to prevent.
+fn dharafs_mode_blocks_overwrite(mode: u32) -> i64 {
+  return dharafs_mode_blocks_delete(mode);
+}
+
+// True if `new_buf[0:new_len)` is a valid append-only write against
+// `old_buf[0:old_len)` -- i.e. the OLD content is an exact byte prefix
+// of the new content (this project's storage is log-structured
+// "replace with newest full content", not a literal incremental
+// write, so "append-only" for a regular file means "the new full
+// content still starts with everything that was already there").
+fn dharafs_is_valid_append_only_write(old_buf: mut ref i64, old_len: i64, new_buf: mut ref i64, new_len: i64) -> i64 {
+  if new_len < old_len {
+    return 0;
+  }
+  let i: i64 = 0;
+  while i < old_len {
+    if buf_read_byte(old_buf, i as u32) != buf_read_byte(new_buf, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// Shared by dharafs_write_raw_checked/dharafs_write_verified_checked
+// (both duplicate the same permission-check shape already, see their
+// own comments) -- returns 0 - 4 if the write is blocked by an
+// attribute, 0 if it's allowed to proceed, leaving the actual
+// permission check to the caller. Uses dharafs_appendonly_check_
+// scratch (persistent, boot/scratch_state.S) to read the old content
+// for the append-only prefix check -- deliberately NOT dharafs_data_
+// scratch, which callers already use for the NEW data being written;
+// aliasing the two would corrupt the very buffer being compared
+// against.
+fn dharafs_attr_check_write(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, mode: u32) -> i64 {
+  if dharafs_mode_is_immutable(mode) == 1 {
+    return 0 - 4;
+  }
+  if dharafs_mode_is_append_only(mode) == 1 {
+    let old_content: mut ref i64 = dharafs_appendonly_check_scratch_get();
+    let old_len: i64 = dharafs_read_raw(path_buf, path_len, old_content);
+    if old_len < 0 {
+      return 0 - 4;
+    }
+    if dharafs_is_valid_append_only_write(old_content, old_len, data_buf, data_len) == 0 {
+      return 0 - 4;
+    }
+  }
+  return 0;
+}
+
 fn dharafs_write_raw_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, req_uid: u32, req_gid: u32) -> i64 {
   let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
   let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
@@ -1589,6 +1689,10 @@ fn dharafs_write_raw_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut
   let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { req_gid };
   let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { dharafs_default_mode() };
   if stat_status == 0 {
+    let attr_status: i64 = dharafs_attr_check_write(path_buf, path_len, data_buf, data_len, mode);
+    if attr_status != 0 {
+      return attr_status;
+    }
     let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
     if allowed == 0 {
       return 0 - 2;
@@ -1606,6 +1710,9 @@ fn dharafs_delete_raw_checked(path_buf: mut ref i64, path_len: i64, req_uid: u32
   let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
   let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
   let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  if dharafs_mode_blocks_delete(mode) == 1 {
+    return 0 - 4;
+  }
   // Deletion needs write permission, same simplified-from-real-Unix
   // rule dharafs_write_raw_checked's own comment already explains (a real
   // system checks the containing DIRECTORY's write bit, not the
@@ -1627,6 +1734,9 @@ fn dharafs_delete_raw_checked(path_buf: mut ref i64, path_len: i64, req_uid: u32
 // else's differently-permissioned file just by renaming their own
 // file onto its path. A genuinely new path is always writable (no
 // separate check), same policy dharafs_write_raw_checked documents.
+// Round 50: also blocked by attributes -- see dharafs_mode_blocks_
+// rename_source/dharafs_mode_blocks_overwrite's own comments for
+// exactly which attribute blocks which side of a rename.
 fn dharafs_rename_raw_checked(old_path_buf: mut ref i64, old_path_len: i64, new_path_buf: mut ref i64, new_path_len: i64, req_uid: u32, req_gid: u32) -> i64 {
   let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
   let stat_status: i64 = dharafs_stat_raw(old_path_buf, old_path_len, meta_buf);
@@ -1636,6 +1746,9 @@ fn dharafs_rename_raw_checked(old_path_buf: mut ref i64, old_path_len: i64, new_
   let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
   let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
   let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  if dharafs_mode_blocks_rename_source(mode) == 1 {
+    return 0 - 4;
+  }
   let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
   if allowed == 0 {
     return 0 - 2;
@@ -1649,6 +1762,9 @@ fn dharafs_rename_raw_checked(old_path_buf: mut ref i64, old_path_len: i64, new_
     let new_owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
     let new_owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
     let new_mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+    if dharafs_mode_blocks_overwrite(new_mode) == 1 {
+      return 0 - 4;
+    }
     let new_allowed: i64 = dharafs_check_permission(new_owner_uid, new_owner_gid, new_mode, req_uid, req_gid, 0, 1, 0);
     if new_allowed == 0 {
       return 0 - 2;
@@ -1706,6 +1822,66 @@ fn dharafs_chown(path: Str, uid: u32, gid: u32) -> i64 {
     i = i + 1;
   }
   return dharafs_append_raw(path_buf, path_len, data_buf, data_len, uid, gid, mode);
+}
+
+// Round 50: set/query the immutable/append-only/system attribute bits
+// (dharafs_attr_immutable/_append_only/_system) packed into the
+// existing `mode` field's high bits. Unlike dharafs_chmod/dharafs_chown
+// above (which have NO permission check at all -- a pre-existing gap,
+// left alone here since fixing it is out of this round's own scope),
+// attribute changes ARE permission-checked: only the file's owner or
+// uid 0 (root) may change them at all, and a non-root owner may only
+// ADD immutable/append-only, never CLEAR them once set -- matches real
+// chattr's own CAP_LINUX_IMMUTABLE requirement to remove +i/+a (root
+// can always undo either). The SYSTEM attribute has no enforcement
+// behavior of its own in this v1 (informational/identification only),
+// so it's exempt from the no-clearing rule.
+// req_gid is intentionally unused -- matches real chattr's own model,
+// which grants attribute-change rights to the file's OWNER or root
+// only, never via group membership (unlike the rwx permission model
+// dharafs_check_permission implements elsewhere).
+fn dharafs_set_attr_raw(path_buf: mut ref i64, path_len: i64, new_attr_bits: u32, req_uid: u32, _req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  let is_owner: i64 = if req_uid == owner_uid { 1 } else { 0 };
+  let is_root: i64 = if req_uid == (0 as u32) { 1 } else { 0 };
+  if (is_owner == 0) && (is_root == 0) {
+    return 0 - 2;
+  }
+  let current_attr: u32 = mode & dharafs_attr_mask();
+  let requested_attr: u32 = new_attr_bits & dharafs_attr_mask();
+  if is_root == 0 {
+    let clearing_immutable: i64 = if ((current_attr & dharafs_attr_immutable()) != (0 as u32)) && ((requested_attr & dharafs_attr_immutable()) == (0 as u32)) { 1 } else { 0 };
+    let clearing_append: i64 = if ((current_attr & dharafs_attr_append_only()) != (0 as u32)) && ((requested_attr & dharafs_attr_append_only()) == (0 as u32)) { 1 } else { 0 };
+    if (clearing_immutable == 1) || (clearing_append == 1) {
+      return 0 - 2;
+    }
+  }
+  let not_attr_mask: u32 = dharafs_attr_mask() ^ (0xFFFFFFFF as u32);
+  let new_mode: u32 = (mode & not_attr_mask) | requested_attr;
+
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read_raw(path_buf, path_len, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, new_mode);
+}
+
+fn dharafs_get_attr_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  return (mode & dharafs_attr_mask()) as i64;
 }
 
 // Core lookup against a raw path buffer, not Str -- same reasoning as
@@ -2402,6 +2578,10 @@ fn dharafs_write_verified_checked(path_buf: mut ref i64, path_len: i64, data_buf
   let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { req_gid };
   let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { dharafs_default_mode() };
   if stat_status == 0 {
+    let attr_status: i64 = dharafs_attr_check_write(path_buf, path_len, data_buf, data_len, mode);
+    if attr_status != 0 {
+      return attr_status;
+    }
     let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
     if allowed == 0 {
       return 0 - 2;
@@ -10069,7 +10249,11 @@ fn shell_dispatch() -> i64 {
       if status == (0 - 2) {
         let _ = uart_puts("permission denied\n");
       } else {
-        let _ = uart_puts("error\n");
+        if status == (0 - 4) {
+          let _ = uart_puts("error: blocked (immutable or append-only)\n");
+        } else {
+          let _ = uart_puts("error\n");
+        }
       }
     }
     return 0;
@@ -10124,7 +10308,11 @@ fn shell_dispatch() -> i64 {
       if status == (0 - 2) {
         let _ = uart_puts("permission denied\n");
       } else {
-        let _ = uart_puts("error\n");
+        if status == (0 - 4) {
+          let _ = uart_puts("error: blocked (immutable source, or destination is immutable/append-only)\n");
+        } else {
+          let _ = uart_puts("error\n");
+        }
       }
     }
     return 0;
@@ -10178,7 +10366,11 @@ fn shell_dispatch() -> i64 {
       if status == (0 - 2) {
         let _ = uart_puts("permission denied\n");
       } else {
-        let _ = uart_puts("error\n");
+        if status == (0 - 4) {
+          let _ = uart_puts("error: blocked (immutable, or not a valid append-only extension)\n");
+        } else {
+          let _ = uart_puts("error\n");
+        }
       }
     }
     return 0;
@@ -10228,7 +10420,11 @@ fn shell_dispatch() -> i64 {
         if status == (0 - 1) {
           let _ = uart_puts("error: path too long for a companion digest (max 25 bytes)\n");
         } else {
-          let _ = uart_puts("error\n");
+          if status == (0 - 4) {
+            let _ = uart_puts("error: blocked (immutable, or not a valid append-only extension)\n");
+          } else {
+            let _ = uart_puts("error\n");
+          }
         }
       }
     }
@@ -10372,6 +10568,97 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("ok\n");
     } else {
       let _ = uart_puts("error\n");
+    }
+    return 0;
+  }
+
+  // Round 50: `attr <path>` alone queries the current immutable/
+  // append/system flags; `attr <path> <flag> <on|off>` changes one.
+  // See dharafs_set_attr_raw's own comment for the permission model
+  // (owner-or-root, and a non-root owner can't clear immutable/append
+  // once set).
+  if shell_word_matches(line_buf, 0, cmd_end, "attr") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: attr <path> [<immutable|append|system> <on|off>]\n");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    let path_len: i64 = path_end - path_start;
+    if (path_len == 0) || (path_len > 32) {
+      let _ = uart_puts("usage: attr <path> [<immutable|append|system> <on|off>]\n");
+      return 0;
+    }
+    let path_buf: mut ref i64 = dharafs_path_scratch_get();
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+
+    if path_end >= line_len {
+      let current: i64 = dharafs_get_attr_raw(path_buf, path_len);
+      if current < 0 {
+        let _ = uart_puts("(not found)\n");
+        return 0;
+      }
+      let cur_u: u32 = current as u32;
+      let _ = uart_puts("immutable=");
+      let _ = uart_puts(if (cur_u & dharafs_attr_immutable()) != (0 as u32) { "on" } else { "off" });
+      let _ = uart_puts(" append=");
+      let _ = uart_puts(if (cur_u & dharafs_attr_append_only()) != (0 as u32) { "on" } else { "off" });
+      let _ = uart_puts(" system=");
+      let _ = uart_puts(if (cur_u & dharafs_attr_system()) != (0 as u32) { "on" } else { "off" });
+      let _ = uart_puts("\n");
+      return 0;
+    }
+
+    let flag_start: i64 = path_end + 1;
+    let flag_end: i64 = shell_find_space(line_buf, flag_start, line_len);
+    if flag_end >= line_len {
+      let _ = uart_puts("usage: attr <path> [<immutable|append|system> <on|off>]\n");
+      return 0;
+    }
+    let flag_bit: u32 = if shell_word_matches(line_buf, flag_start, flag_end, "immutable") == 1 {
+      dharafs_attr_immutable()
+    } else {
+      if shell_word_matches(line_buf, flag_start, flag_end, "append") == 1 {
+        dharafs_attr_append_only()
+      } else {
+        if shell_word_matches(line_buf, flag_start, flag_end, "system") == 1 {
+          dharafs_attr_system()
+        } else {
+          0 as u32
+        }
+      }
+    };
+    if flag_bit == (0 as u32) {
+      let _ = uart_puts("usage: attr <path> [<immutable|append|system> <on|off>]\n");
+      return 0;
+    }
+    let onoff_start: i64 = flag_end + 1;
+    let onoff_end: i64 = shell_find_space(line_buf, onoff_start, line_len);
+    let turning_on: i64 = if shell_word_matches(line_buf, onoff_start, onoff_end, "on") == 1 {
+      1
+    } else {
+      if shell_word_matches(line_buf, onoff_start, onoff_end, "off") == 1 { 0 } else { 0 - 1 }
+    };
+    if turning_on == (0 - 1) {
+      let _ = uart_puts("usage: attr <path> [<immutable|append|system> <on|off>]\n");
+      return 0;
+    }
+    let current2: i64 = dharafs_get_attr_raw(path_buf, path_len);
+    if current2 < 0 {
+      let _ = uart_puts("(not found)\n");
+      return 0;
+    }
+    let not_flag_bit: u32 = flag_bit ^ (0xFFFFFFFF as u32);
+    let new_attr: u32 = if turning_on == 1 { (current2 as u32) | flag_bit } else { (current2 as u32) & not_flag_bit };
+    let status2: i64 = dharafs_set_attr_raw(path_buf, path_len, new_attr, dharafs_user_get_uid(), dharafs_user_get_gid());
+    if status2 == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      if status2 == (0 - 2) {
+        let _ = uart_puts("permission denied\n");
+      } else {
+        let _ = uart_puts("error\n");
+      }
     }
     return 0;
   }
@@ -10955,7 +11242,7 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/catv/rm/mv/write/writev/log/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
+  let _ = uart_puts("unknown command (try ls/cat/catv/rm/mv/write/writev/log/attr/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
   return 0;
 }
 
@@ -11993,6 +12280,7 @@ fn kernel_main() -> i64 {
   let _ = dharafs_verified_companion_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_verified_digest_a_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_verified_digest_b_scratch_set(dhruva_alloc_bytes(32));
+  let _ = dharafs_appendonly_check_scratch_set(dhruva_alloc_bytes(4096));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));

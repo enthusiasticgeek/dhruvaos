@@ -323,6 +323,14 @@ dharafs_verified_digest_b_scratch_addr:
                          * (compared against digest_a above). Kept
                          * separate from digest_a since both need to be
                          * live at once for the comparison. */
+dharafs_appendonly_check_scratch_addr:
+    .word 0             /* Round 50: 4096 bytes (dharafs_file_max_len())
+                         * -- dharafs_attr_check_write's own OLD-content
+                         * buffer for validating an append-only write's
+                         * prefix. Deliberately NOT dharafs_data_scratch,
+                         * which the caller's NEW data already occupies
+                         * -- aliasing the two would corrupt the very
+                         * buffer being compared against. */
 
 .section ".text"
 
@@ -726,6 +734,20 @@ dharafs_verified_digest_b_scratch_set:
 .global dharafs_verified_digest_b_scratch_get
 dharafs_verified_digest_b_scratch_get:
     ldr r0, =dharafs_verified_digest_b_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_appendonly_check_scratch_set
+dharafs_appendonly_check_scratch_set:
+    ldr r1, =dharafs_appendonly_check_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_appendonly_check_scratch_get
+dharafs_appendonly_check_scratch_get:
+    ldr r0, =dharafs_appendonly_check_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

@@ -764,13 +764,24 @@ building blocks for a diagnostics command, not a green field.
   needed, just new entry points over the existing one.
 
 - **Immutable / append-only / system file attributes**
-  (`DHARA_ATTR_IMMUTABLE`/`APPEND_ONLY`/`SYSTEM`) — `[S-M, ~1 round]`
-  Extend the existing `mode` field's semantics (or add a parallel
-  attribute u32 alongside owner_uid/owner_gid/mode in the record
-  header) checked in `dharafs_write_raw_checked`/
-  `dharafs_delete_raw_checked` before the existing permission check.
-  Natural fit for `/firmware`, `/certificates`, `/config` once secure
-  boot/PKI work above exists to make tampering with them meaningful.
+  (`DHARA_ATTR_IMMUTABLE`/`APPEND_ONLY`/`SYSTEM`) — `[S-M, ~1 round —
+  DONE, round 50]`
+  Packed into the EXISTING `mode` u32's otherwise-unused high bits
+  (only the low 9 bits are real rwx permission bits) rather than a
+  record-format change — same "don't touch the 512-byte layout without
+  a real forcing need" reasoning round 48's companion-file digest
+  already established. Checked in `dharafs_write_raw_checked`/
+  `dharafs_write_verified_checked`/`dharafs_delete_raw_checked`/
+  `dharafs_rename_raw_checked` (both source- and destination-side).
+  Real chattr-matching semantics: immutable blocks write/delete/rename-
+  as-source/being-a-rename-destination; append-only blocks delete and
+  non-prefix-extending writes but allows rename (content travels with
+  it); a non-root owner can set either but never clear them once set
+  (only root can); `SYSTEM` is informational-only, no enforcement, so
+  it's exempt from the no-clearing rule. New `dharafs_set_attr_raw`/
+  `dharafs_get_attr_raw` + shell `attr`. Verified live over QEMU (all
+  12 designed scenarios correct) and via 36 new host-harness tests
+  (173/173 PASS clean under ASAN/UBSAN).
 
 - **Priority/deadline-aware FS request queue** — `[M, ~2 rounds —
   shared dependency with the scheduler-side observability work below]`

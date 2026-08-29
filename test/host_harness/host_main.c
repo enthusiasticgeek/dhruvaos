@@ -55,6 +55,14 @@ int64_t fn_dharafs_log_record_max_len(void);
 int64_t fn_dharafs_log_path_raw(int64_t *name_buf, int64_t name_len, uint32_t index, int64_t *out_buf);
 int64_t fn_dharafs_log_header_path_raw(int64_t *name_buf, int64_t name_len, int64_t *out_buf);
 int64_t fn_dharafs_log_append_raw(int64_t *name_buf, int64_t name_len, int64_t *record_buf, int64_t record_len, uint32_t owner_uid, uint32_t owner_gid, uint32_t mode);
+uint32_t fn_dharafs_attr_immutable(void);
+uint32_t fn_dharafs_attr_append_only(void);
+uint32_t fn_dharafs_attr_system(void);
+int64_t fn_dharafs_mode_is_immutable(uint32_t mode);
+int64_t fn_dharafs_mode_is_append_only(uint32_t mode);
+int64_t fn_dharafs_is_valid_append_only_write(int64_t *old_buf, int64_t old_len, int64_t *new_buf, int64_t new_len);
+int64_t fn_dharafs_set_attr_raw(int64_t *path_buf, int64_t path_len, uint32_t new_attr_bits, uint32_t req_uid, uint32_t req_gid);
+int64_t fn_dharafs_get_attr_raw(int64_t *path_buf, int64_t path_len);
 int64_t fn_dharafs_write_verified_raw(int64_t *path_buf, int64_t path_len, int64_t *data_buf, int64_t data_len, uint32_t owner_uid, uint32_t owner_gid, uint32_t mode);
 int64_t fn_dharafs_write_verified_checked(int64_t *path_buf, int64_t path_len, int64_t *data_buf, int64_t data_len, uint32_t req_uid, uint32_t req_gid);
 int64_t fn_dharafs_read_verified_checked(int64_t *path_buf, int64_t path_len, int64_t *out_buf, uint32_t req_uid, uint32_t req_gid);
@@ -118,6 +126,7 @@ extern int64_t dharafs_log_combined_scratch_set(int64_t *addr);
 extern int64_t dharafs_verified_companion_scratch_set(int64_t *addr);
 extern int64_t dharafs_verified_digest_a_scratch_set(int64_t *addr);
 extern int64_t dharafs_verified_digest_b_scratch_set(int64_t *addr);
+extern int64_t dharafs_appendonly_check_scratch_set(int64_t *addr);
 
 static void reset_fs(void) {
     host_virtual_disk_reset();
@@ -140,6 +149,7 @@ static void reset_fs(void) {
     dharafs_verified_companion_scratch_set(dhruva_alloc_bytes(32));
     dharafs_verified_digest_a_scratch_set(dhruva_alloc_bytes(32));
     dharafs_verified_digest_b_scratch_set(dhruva_alloc_bytes(32));
+    dharafs_appendonly_check_scratch_set(dhruva_alloc_bytes(4096));
     fn_dharafs_init();
 }
 
@@ -635,6 +645,97 @@ static void test_log_append(void) {
     CHECK(fn_dharafs_log_append_raw(name, 6, record_buf, 0, 0, 0, 0644) == 1, "log: empty record rejected");
 }
 
+/* ================= File attributes (round 50) ================= */
+
+static void test_attributes(void) {
+    reset_fs();
+
+    /* Basic set/get round trip, owner setting immutable on their own file. */
+    int64_t *path = mkbuf("/firmware.bin", 13);
+    int64_t *data = mkbuf("v1", 2);
+    CHECK(fn_dharafs_append_raw(path, 13, data, 2, 42, 42, 0644) == 0, "attr: create /firmware.bin as uid 42");
+    CHECK(fn_dharafs_get_attr_raw(path, 13) == 0, "attr: new file has no attributes set");
+    uint32_t immutable = fn_dharafs_attr_immutable();
+    CHECK(fn_dharafs_set_attr_raw(path, 13, immutable, 42, 42) == 0, "attr: owner sets immutable");
+    CHECK(fn_dharafs_get_attr_raw(path, 13) == (int64_t)immutable, "attr: get_attr reflects the immutable bit");
+
+    /* Immutable blocks write, delete, and being a rename source or destination. */
+    int64_t *data2 = mkbuf("v2", 2);
+    CHECK(fn_dharafs_write_raw_checked(path, 13, data2, 2, 42, 42) == -4, "attr: write to immutable file is blocked (-4)");
+    CHECK(fn_dharafs_delete_raw_checked(path, 13, 42, 42) == -4, "attr: delete of immutable file is blocked (-4)");
+    int64_t *dest = mkbuf("/renamed.bin", 12);
+    CHECK(fn_dharafs_rename_raw_checked(path, 13, dest, 12, 42, 42) == -4, "attr: renaming an immutable file (as source) is blocked (-4)");
+    int64_t *other = mkbuf("/other.bin", 10);
+    int64_t *odata = mkbuf("o", 1);
+    CHECK(fn_dharafs_append_raw(other, 10, odata, 1, 42, 42, 0644) == 0, "attr: create /other.bin");
+    CHECK(fn_dharafs_rename_raw_checked(other, 10, path, 13, 42, 42) == -4, "attr: renaming ONTO an immutable file (as destination) is blocked (-4)");
+
+    /* A non-root owner cannot clear immutable once set; root can. */
+    CHECK(fn_dharafs_set_attr_raw(path, 13, 0, 42, 42) == -2, "attr: non-root owner cannot clear immutable (-2)");
+    CHECK(fn_dharafs_set_attr_raw(path, 13, 0, 0, 0) == 0, "attr: root CAN clear immutable");
+    CHECK(fn_dharafs_get_attr_raw(path, 13) == 0, "attr: immutable is actually cleared after root's change");
+    /* Now that it's cleared, normal operations work again. */
+    CHECK(fn_dharafs_write_raw_checked(path, 13, data2, 2, 42, 42) == 0, "attr: write succeeds again once immutable is cleared");
+
+    /* A non-owner, non-root caller cannot set attributes at all. */
+    CHECK(fn_dharafs_set_attr_raw(path, 13, immutable, 99, 99) == -2, "attr: non-owner cannot set attributes (-2)");
+
+    /* Append-only: valid extensions succeed, anything else is blocked. */
+    reset_fs();
+    int64_t *apath = mkbuf("/audit.log", 10);
+    int64_t *a1 = mkbuf("event1;", 7);
+    CHECK(fn_dharafs_append_raw(apath, 10, a1, 7, 7, 7, 0644) == 0, "attr_append: create /audit.log");
+    uint32_t append_only = fn_dharafs_attr_append_only();
+    CHECK(fn_dharafs_set_attr_raw(apath, 10, append_only, 7, 7) == 0, "attr_append: owner sets append-only");
+
+    int64_t *a2 = mkbuf("event1;event2;", 14);
+    CHECK(fn_dharafs_write_raw_checked(apath, 10, a2, 14, 7, 7) == 0, "attr_append: valid extension (old content as exact prefix) succeeds");
+    int64_t *out = dhruva_alloc_bytes(14);
+    CHECK(fn_dharafs_read_raw(apath, 10, out) == 14, "attr_append: content actually extended");
+    CHECK(memcmp(out, "event1;event2;", 14) == 0, "attr_append: extended content is correct");
+
+    int64_t *bad_not_prefix = mkbuf("totally-different", 17);
+    CHECK(fn_dharafs_write_raw_checked(apath, 10, bad_not_prefix, 17, 7, 7) == -4, "attr_append: a write that doesn't start with the old content is blocked (-4)");
+    int64_t *bad_shorter = mkbuf("event1", 6);
+    CHECK(fn_dharafs_write_raw_checked(apath, 10, bad_shorter, 6, 7, 7) == -4, "attr_append: a SHORTER write (truncation) is blocked (-4)");
+    int64_t *bad_same = mkbuf("event1;event2;", 14);
+    CHECK(fn_dharafs_write_raw_checked(apath, 10, bad_same, 14, 7, 7) == 0, "attr_append: re-writing the exact same content is a valid (zero-length) extension");
+
+    /* Append-only also blocks delete, but NOT rename (real chattr +a semantics). */
+    CHECK(fn_dharafs_delete_raw_checked(apath, 10, 7, 7) == -4, "attr_append: delete of append-only file is blocked (-4)");
+    int64_t *arenamed = mkbuf("/audit-renamed.log", 18);
+    CHECK(fn_dharafs_rename_raw_checked(apath, 10, arenamed, 18, 7, 7) == 0, "attr_append: rename of an append-only file (as source) DOES succeed");
+    int64_t *out2 = dhruva_alloc_bytes(14);
+    CHECK(fn_dharafs_read_raw(arenamed, 18, out2) == 14, "attr_append: content survives the rename intact");
+
+    /* Direct unit tests of the pure prefix-check helper. */
+    int64_t *old_c = mkbuf("abc", 3);
+    int64_t *new_c1 = mkbuf("abcdef", 6);
+    int64_t *new_c2 = mkbuf("abd", 3);
+    int64_t *new_c3 = mkbuf("ab", 2);
+    CHECK(fn_dharafs_is_valid_append_only_write(old_c, 3, new_c1, 6) == 1, "append_only_helper: real extension is valid");
+    CHECK(fn_dharafs_is_valid_append_only_write(old_c, 3, new_c2, 3) == 0, "append_only_helper: same-length but different content is invalid");
+    CHECK(fn_dharafs_is_valid_append_only_write(old_c, 3, new_c3, 2) == 0, "append_only_helper: shorter content is invalid");
+
+    /* System attribute: settable/queryable, no enforcement of its own. */
+    reset_fs();
+    int64_t *spath = mkbuf("/marker", 7);
+    int64_t *sdata = mkbuf("s", 1);
+    CHECK(fn_dharafs_append_raw(spath, 7, sdata, 1, 3, 3, 0644) == 0, "attr_system: create /marker");
+    uint32_t system_attr = fn_dharafs_attr_system();
+    CHECK(fn_dharafs_set_attr_raw(spath, 7, system_attr, 3, 3) == 0, "attr_system: owner sets system attribute");
+    CHECK(fn_dharafs_get_attr_raw(spath, 7) == (int64_t)system_attr, "attr_system: get_attr reflects it");
+    int64_t *sdata2 = mkbuf("t", 1);
+    CHECK(fn_dharafs_write_raw_checked(spath, 7, sdata2, 1, 3, 3) == 0, "attr_system: write still works (no enforcement for this attribute)");
+    CHECK(fn_dharafs_delete_raw_checked(spath, 7, 3, 3) == 0, "attr_system: delete still works (no enforcement for this attribute)");
+    /* Non-root CAN clear system (only immutable/append-only are protected from clearing). */
+    reset_fs();
+    int64_t *spath2 = mkbuf("/marker2", 8);
+    CHECK(fn_dharafs_append_raw(spath2, 8, sdata, 1, 5, 5, 0644) == 0, "attr_system2: create /marker2");
+    CHECK(fn_dharafs_set_attr_raw(spath2, 8, system_attr, 5, 5) == 0, "attr_system2: owner sets system");
+    CHECK(fn_dharafs_set_attr_raw(spath2, 8, 0, 5, 5) == 0, "attr_system2: non-root owner CAN clear system");
+}
+
 /* ================= Crypto / bignum smoke tests through the real
  * on-disk-adjacent entry points (byte-for-byte correctness matters
  * here just as much as for DharaFS, since these back the security-
@@ -747,6 +848,7 @@ int main(void) {
     test_self_referential_continuation_chain();
     test_verified_integrity();
     test_log_append();
+    test_attributes();
     test_sha256_boundaries();
     test_chacha20_boundaries();
     test_bignum_boundaries();
