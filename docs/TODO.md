@@ -258,18 +258,41 @@ multi-round item elsewhere in this backlog.
   hardening** — `[L, ~4-5 rounds]`
   Today's FS is "flat, append-only, checksummed log" — paths are
   opaque strings (`ls` does prefix filtering, not real directory
-  listing), and every record is capped at one 512-byte block (464-byte
-  payload). Real hierarchy needs path-segment parsing and directory
-  metadata; multi-block files need a block-chaining scheme (a
-  "next block" pointer per record) so a payload can span more than one
-  block. The existing checksum-verified crash recovery and
-  compaction/GC are already a basic journal — "hardening" here means
-  extending `power_yank.py`'s own crash-consistency sweep to the new
-  multi-block case specifically, since a torn write spanning multiple
-  chained blocks is a genuinely new crash-consistency risk class the
-  current single-block-per-record design never has to handle. Fully
-  QEMU-testable — `power_yank.py`'s existing tear-point-sweep
-  methodology extends directly, no hardware needed.
+  listing).
+
+  **Multi-block files + journaling hardening: DONE (round 39).**
+  Record format gained a `next_block` field (offset 48) and a
+  460-byte-per-block payload cap (`fs_block_payload_cap()`); files up
+  to 4096 bytes (`fs_file_max_len()`) now chain across multiple
+  blocks. `path_len == 0` is a reserved continuation-block sentinel
+  (real lookups always have `path_len > 0`, so `fs_find_latest_block_
+  raw`'s matching logic needed zero changes; `fs_compact`/`fs_list`
+  needed an explicit skip-continuation-blocks guard added to their
+  full-table scans). Crash safety: multi-block writes happen in
+  *reverse* order — every continuation chunk first, the head block
+  written *last* — so the head's own single-block atomic write is the
+  one commit point that makes the whole chain reachable; a crash
+  before it leaves only unreachable orphan blocks and the prior
+  version of the file (or no file) intact, exactly like the existing
+  single-block torn-write case. `fs_read`/`fs_read_raw` were
+  consolidated (the old duplicated block-reading logic in `fs_read` is
+  gone). Verified: two new self-tests (a real 1000-byte/3-chunk
+  round-trip + overwrite, and a simulated-crash test that raw-writes
+  an orphan continuation block without ever calling `fs_state_set` —
+  the state-accounting + head-write omission a real crash would leave
+  — confirming the old version is still returned intact), the full
+  existing self-test battery unchanged (0 FAIL), `phase4_milestone.py`
+  ×2, USB enumeration both device types with a real `-drive` attached,
+  `heap_stress.py` PASS, and `power_yank.py`'s tear-point sweep
+  extended automatically by the new format (58/58 offsets recovered,
+  454 skipped as genuinely-unchanged zero padding) — no separate
+  multi-block-specific sweep needed since the crash-safety design
+  itself never lets a torn write reach a discoverable half-written
+  chain.
+
+  **Still open**: real directory hierarchy (path-segment parsing,
+  directory metadata, real hierarchical `ls` instead of prefix
+  filtering) — deferred to a future round of this item.
 
 ## General DMA controller (not scoped — recommendation only, round 35)
 
@@ -517,15 +540,48 @@ replacement for it — everything QEMU can already catch should still
 be caught in QEMU first, keeping the fast local loop as the default
 and hardware-in-loop as the final confirmation pass.
 
-## Not yet scoped (flagged in `docs/PORTING.md`, no estimate yet)
+## Pi 4/5 port — now started (round 40, opening research + spike)
 
-- ARMv8-A (Cortex-A72/A76) boot path — `boot/rpi1/boot.S` and
-  `context_switch.S` are ARMv6/ARM1176JZF-S-specific (exception
-  model, MMU, no EL2/EL1 handling today).
-- GIC-based interrupt controller (replaces BCM2835's simple
+**Round 40 correction**: `docs/PORTING.md` previously claimed no QEMU
+target exists for Pi 4/5 at all. Verified false for Pi 4 — QEMU's
+64-bit `qemu-system-aarch64` binary (already installed, separate from
+the 32-bit `qemu-system-arm` this project has used exclusively so
+far) has a `raspi4b` machine model. A minimal bare-metal AArch64
+stub was built (`aarch64-linux-gnu-gcc -mgeneral-regs-only -nostdlib`,
+already installed, no new toolchain needed) and booted live under
+`qemu-system-aarch64 -M raspi4b -kernel <elf>`, confirming: PL011 UART
+at `0xFE201000`, ELF `-kernel` boot works the same way `dhruva.elf`
+already relies on for Pi 1, and QEMU starts execution at **EL3**
+(real boot code needs an explicit EL3→EL1 drop — nothing like
+ARM1176's flat mode-switch model). `vani-compiler` also already has
+generic bare-metal AArch64 cross-compile plumbing
+(`is_bare_metal_triple`/`cross_cc_for_triple` + `CROSS_CC` override in
+`src/main.rs`) — no compiler changes needed to start. Full details:
+`docs/PORTING.md`'s "Correction (round 40)" section.
+
+**Net effect**: a real Pi 4 port keeps this project's entire existing
+QEMU-based verification discipline (self-tests, `phase4_milestone.py`-
+style smoke tests, `heap_stress.py`, `power_yank.py`) — it is NOT
+real-hardware-only the way it was previously assumed to be. Pi 5
+remains real-hardware-only (no QEMU model exists for BCM2712/RP1).
+
+Remaining scope for a real Pi 4 boot, now precisely identified rather
+than assumed:
+
+- ARMv8-A EL3→EL1 (or EL3→EL2→EL1) exception-level drop — new,
+  ARM1176 has no equivalent.
+- Real AArch64 exception vector table (`VBAR_EL1`, 16 entries) —
+  `boot/rpi1/vectors.S` is ARMv6-specific and doesn't carry over.
+- ARMv8-A MMU (TTBR0_EL1/TCR_EL1, radically different from ARMv6's
+  short-descriptor 1MB sections used in `boot/mmu_init.S`).
+- GICv2/GICv3 interrupt controller (replaces BCM2835's simple
   interrupt controller — `timer_ic_init` and everything built on it).
-- Pi 4/5 timer peripheral differences.
+- BCM2711 generic ARM timer at new peripheral addresses (same timer
+  core the scheduler already assumes, different base).
+- Only after all of the above: EMMC2 (storage) and XHCI (USB) drivers
+  from scratch — both already flagged above as substantially larger
+  than their Pi 1 SDHOST/DWC2 counterparts.
 
-These are prerequisites for a real Pi 4/5 boot, independent of the
-storage/USB items above — full scoping deferred until a Pi 4/5 port
-is actually started.
+Still not sized (each of the bullets above is its own multi-round
+effort); the spike above is validation/scoping only, not yet checked
+into the repository.

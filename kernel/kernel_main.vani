@@ -1148,10 +1148,45 @@ fn fs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
 //                         record ever appended; ties never happen,
 //                         so ">=" during recovery is really "the
 //                         first one wins if this ever changes"
-//   [8:12)  path_len
-//   [12:44) path bytes (32-byte max path; enforced on append)
-//   [44:48) data_len
-//   [48:512) data bytes (464-byte max payload; enforced on append)
+//   [8:12)  path_len   -- Round 39: 0 is a reserved sentinel marking
+//                         this record as a CONTINUATION block, not an
+//                         independently-addressable head (fs_append
+//                         now rejects a genuine empty path outright,
+//                         so this can never collide with a real
+//                         record) -- see below.
+//   [12:44) path bytes (32-byte max path; enforced on append; unused/
+//                       zero on a continuation block)
+//   [44:48) data_len   -- on a HEAD block (path_len > 0): the file's
+//                         TOTAL logical length across every chained
+//                         block. On a CONTINUATION block (path_len ==
+//                         0): just THIS block's own chunk length.
+//   [48:52) next_block -- Round 39: 0 = this is the last block in the
+//                         chain; otherwise the block number of the
+//                         next chunk. A file whose data fits in one
+//                         block (the common case, and the only case
+//                         before this round) is a single head block
+//                         with next_block=0, byte-identical in spirit
+//                         to the pre-round-39 format.
+//   [52:512) data bytes (460-byte max payload PER BLOCK; enforced on
+//                        append -- a file's own TOTAL length can be up
+//                        to fs_file_max_len(), spread across multiple
+//                        chained blocks)
+//
+// Multi-block files (round 39): fs_append_raw writes a chain's blocks
+// in REVERSE order -- every continuation chunk first, the head block
+// LAST -- so the head's own single-block write is the one atomic
+// "commit point" for the whole file. A crash/power-loss before that
+// final write leaves only orphaned, unreachable continuation blocks
+// (nothing ever finds them without a head pointing in) -- the OLD
+// version of the file (or no file at all, if this was the first
+// write) is still exactly what fs_find_latest_block_raw returns,
+// completely unaffected, the same guarantee single-block writes have
+// always had. A crash DURING the head block's own write is caught by
+// its own checksum exactly like any other torn write already is. This
+// is the actual new crash-consistency risk class docs/TODO.md flagged
+// multi-block files as introducing -- solved by never making a new
+// chain reachable until it's entirely durable, not by anything new at
+// the single-block level.
 //
 // Why a checksum, not just trusting the write succeeded: this is
 // exactly the property test/power_yank.py exists to test -- a write
@@ -1161,6 +1196,12 @@ fn fs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
 // validation, ignore it and use whatever the previous valid record
 // for this path was." Genuinely torn writes are rejected, not just
 // unlikely -- provable by the sweep, not merely hoped for.
+fn fs_block_payload_cap() -> i64 {
+  return 460;
+}
+fn fs_file_max_len() -> i64 {
+  return 4096;
+}
 fn fs_init() -> i64 {
   let buf: mut ref i64 = dhruva_alloc_bytes(512);
   let blk: i64 = 1;
@@ -1220,44 +1261,122 @@ fn fs_init() -> i64 {
 // one from arbitrary bytes, same reasoning as every other raw-buffer
 // gap this project has hit at its extern "C" boundaries).
 fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64) -> i64 {
+  if path_len <= 0 {
+    return 1; // reserved as the continuation-block sentinel, see
+              // fs_init's own header comment -- a genuine empty path
+              // is rejected outright so it can never collide with one
+  }
   if path_len > 32 {
     return 1;
   }
-  if data_len > 464 {
+  if data_len > fs_file_max_len() {
     return 1;
   }
 
-  let buf: mut ref i64 = fs_sd_scratch_get();
-  let next_block: u32 = fs_state_get_next_block();
-  let next_seq: u32 = fs_state_get_next_seq();
+  let cap: i64 = fs_block_payload_cap();
+  if data_len <= cap {
+    // Single block -- byte-identical in spirit to every pre-round-39
+    // record: one head block, next_block=0.
+    let buf: mut ref i64 = fs_sd_scratch_get();
+    let next_block: u32 = fs_state_get_next_block();
+    let next_seq: u32 = fs_state_get_next_seq();
 
-  let _ = buf_write_u32(buf, 4 as u32, next_seq);
-  let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
-  let i: i64 = 0;
-  while i < path_len {
-    let b: u32 = buf_read_byte(path_buf, i as u32);
-    let _ = buf_write_byte(buf, (12 + i) as u32, b);
-    i = i + 1;
+    let _ = buf_write_u32(buf, 4 as u32, next_seq);
+    let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+    let i: i64 = 0;
+    while i < path_len {
+      let b: u32 = buf_read_byte(path_buf, i as u32);
+      let _ = buf_write_byte(buf, (12 + i) as u32, b);
+      i = i + 1;
+    }
+    let _ = buf_write_u32(buf, 44 as u32, data_len as u32);
+    let _ = buf_write_u32(buf, 48 as u32, 0 as u32); // next_block: none
+    let j: i64 = 0;
+    while j < data_len {
+      let b2: u32 = buf_read_byte(data_buf, j as u32);
+      let _ = buf_write_byte(buf, (52 + j) as u32, b2);
+      j = j + 1;
+    }
+
+    // Checksum last, over everything written above -- covers exactly
+    // what a torn write could have left half-updated.
+    let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+    let wr_status: i64 = fs_block_write(next_block as i64, buf);
+    if wr_status != 0 {
+      return 1;
+    }
+
+    let _ = fs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+    return 0;
   }
-  let _ = buf_write_u32(buf, 44 as u32, data_len as u32);
-  let j: i64 = 0;
-  while j < data_len {
-    let b2: u32 = buf_read_byte(data_buf, j as u32);
-    let _ = buf_write_byte(buf, (48 + j) as u32, b2);
-    j = j + 1;
+
+  // Multi-block: split into ceil(data_len/cap) chunks, block numbers
+  // and sequence numbers allocated up front (chunk i lands at
+  // base_block+i regardless of write order), then WRITTEN IN REVERSE
+  // -- every continuation chunk first, the head block last -- so the
+  // head's own single-block write is the one atomic point at which
+  // the whole chain becomes reachable at all. See fs_init's own header
+  // comment for the full crash-consistency reasoning.
+  let num_chunks: i64 = (data_len + cap - 1) / cap;
+  let base_block: u32 = fs_state_get_next_block();
+  let base_seq: u32 = fs_state_get_next_seq();
+
+  let chunk_idx: i64 = num_chunks - 1;
+  while chunk_idx >= 0 {
+    let this_block: u32 = base_block + (chunk_idx as u32);
+    let this_seq: u32 = base_seq + (chunk_idx as u32);
+    let is_head: i64 = if chunk_idx == 0 { 1 } else { 0 };
+    let chunk_offset: i64 = chunk_idx * cap;
+    let remaining_from_here: i64 = data_len - chunk_offset;
+    let chunk_len: i64 = if remaining_from_here < cap { remaining_from_here } else { cap };
+    let is_last_chunk: i64 = if chunk_idx == (num_chunks - 1) { 1 } else { 0 };
+    let next_block_field: u32 = if is_last_chunk == 1 { 0 as u32 } else { base_block + ((chunk_idx + 1) as u32) };
+
+    let buf: mut ref i64 = fs_sd_scratch_get();
+    let _ = buf_write_u32(buf, 4 as u32, this_seq);
+    if is_head == 1 {
+      let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+      let i: i64 = 0;
+      while i < path_len {
+        let b: u32 = buf_read_byte(path_buf, i as u32);
+        let _ = buf_write_byte(buf, (12 + i) as u32, b);
+        i = i + 1;
+      }
+      let _ = buf_write_u32(buf, 44 as u32, data_len as u32); // TOTAL length
+    } else {
+      let _ = buf_write_u32(buf, 8 as u32, 0 as u32); // continuation marker
+      let z: i64 = 0;
+      while z < 32 {
+        let _ = buf_write_byte(buf, (12 + z) as u32, 0 as u32);
+        z = z + 1;
+      }
+      let _ = buf_write_u32(buf, 44 as u32, chunk_len as u32); // THIS chunk's own length
+    }
+    let _ = buf_write_u32(buf, 48 as u32, next_block_field);
+    let j: i64 = 0;
+    while j < chunk_len {
+      let b2: u32 = buf_read_byte(data_buf, (chunk_offset + j) as u32);
+      let _ = buf_write_byte(buf, (52 + j) as u32, b2);
+      j = j + 1;
+    }
+
+    let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+    let wr_status: i64 = fs_block_write(this_block as i64, buf);
+    if wr_status != 0 {
+      // Stop without advancing state -- the next real append reuses
+      // base_block and overwrites whatever partial chain was left,
+      // same "state only advances on full success" posture as the
+      // single-block path above.
+      return 1;
+    }
+    chunk_idx = chunk_idx - 1;
   }
 
-  // Checksum last, over everything written above -- covers exactly
-  // what a torn write could have left half-updated.
-  let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
-  let _ = buf_write_u32(buf, 0 as u32, checksum);
-
-  let wr_status: i64 = fs_block_write(next_block as i64, buf);
-  if wr_status != 0 {
-    return 1;
-  }
-
-  let _ = fs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+  let _ = fs_state_set(base_block + (num_chunks as u32), base_seq + (num_chunks as u32));
   return 0;
 }
 
@@ -1268,10 +1387,13 @@ fn fs_append(path: Str, data: Str) -> i64 {
   // temp buffers are sized exactly to the record format's own limits,
   // and the copy loops below would overrun them before fs_append_raw
   // ever got a chance to reject an oversized path/data itself.
+  if path_len <= 0 {
+    return 1;
+  }
   if path_len > 32 {
     return 1;
   }
-  if data_len > 464 {
+  if data_len > fs_file_max_len() {
     return 1;
   }
   let path_buf: mut ref i64 = fs_path_scratch_get();
@@ -1383,8 +1505,10 @@ fn fs_find_latest_block(path: Str) -> i64 {
 // prefix it didn't strictly need to, never a correctness problem,
 // since "latest wins" already tolerates the old and new copies of a
 // record coexisting.
-// buf/path_buf/data_buf are caller-owned scratch space (512/32/464
-// bytes respectively), not allocated in here.
+// buf/path_buf/data_buf are caller-owned scratch space (512/32/4096
+// bytes respectively -- data_buf's cap raised in round 39 to hold a
+// full multi-block file's reconstructed content, see fs_read_raw),
+// not allocated in here.
 //
 // BUG (found via a real crash-and-reboot loop under Phase 6's
 // checkpoint regression test, not by inspection): this function used
@@ -1455,14 +1579,22 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
         // these fields weren't corrupted into something out of range.
         // Both used to feed straight into a copy-loop bound with only
         // the tombstone-sentinel check below, no explicit range check
-        // against path_buf/data_buf's own real 32/464-byte capacity --
-        // the exact same "trust a length field, no bound" shape as
-        // the networking-layer bugs found earlier the same day, just
-        // with corrupted disk data playing the untrusted-input role
-        // instead of a hostile network segment. Skip the record
-        // entirely (same as failing the checksum check) rather than
-        // guess at truncating it.
-        if rec_path_len <= (32 as u32) {
+        // against path_buf/data_buf's own real capacity -- the exact
+        // same "trust a length field, no bound" shape as the
+        // networking-layer bugs found earlier the same day, just with
+        // corrupted disk data playing the untrusted-input role instead
+        // of a hostile network segment. Skip the record entirely (same
+        // as failing the checksum check) rather than guess at
+        // truncating it.
+        //
+        // Round 39: rec_path_len == 0 marks a CONTINUATION block (see
+        // fs_init's own header comment) -- skip it here unconditionally.
+        // It's never independently live/dead; it gets carried forward
+        // correctly as part of its own HEAD block's fs_read_raw/
+        // fs_append_raw round trip below, not by being re-appended on
+        // its own (which would be meaningless -- a continuation has no
+        // path to look up or preserve identity for).
+        if (rec_path_len > (0 as u32)) && (rec_path_len <= (32 as u32)) {
         let k: i64 = 0;
         while (k as u32) < rec_path_len {
           let pb: u32 = buf_read_byte(buf, (12 + k) as u32);
@@ -1486,26 +1618,33 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
             // into the loop bound below when it's a real record, so
             // treating the sentinel as a genuine length turns this
             // into an unbounded copy loop that reads/writes far past
-            // data_buf's real 464-byte allocation -- a real hang
-            // (found by GC silently never completing a pass again
-            // once this path was ever exercised), not merely a
-            // logic error that happens to still terminate wrong.
+            // data_buf's real allocation -- a real hang (found by GC
+            // silently never completing a pass again once this path
+            // was ever exercised), not merely a logic error that
+            // happens to still terminate wrong.
             let del_status: i64 = fs_delete_raw(path_buf, rec_path_len as i64);
             if del_status != 0 {
               all_ok = 0;
             }
           } else {
-            if rec_data_len <= (464 as u32) {
-            let m: i64 = 0;
-            while (m as u32) < rec_data_len {
-              let db: u32 = buf_read_byte(buf, (48 + m) as u32);
-              let _ = buf_write_byte(data_buf, m as u32, db);
-              m = m + 1;
-            }
-            let append_status: i64 = fs_append_raw(path_buf, rec_path_len as i64, data_buf, rec_data_len as i64);
-            if append_status != 0 {
+            // Round 39: this HEAD block may chain across several
+            // blocks now -- reconstruct the FULL logical content via
+            // fs_read_raw (the same chain-following, checksum-
+            // verifying logic every other caller uses) rather than
+            // copying just this one block's own up-to-460-byte chunk,
+            // which would silently truncate any multi-block record.
+            // fs_read_raw's own internal fs_sd_scratch use doesn't
+            // conflict with `buf` here -- separate, caller-owned
+            // buffers, and this block's own fields have already been
+            // read out above before this call.
+            let full_len: i64 = fs_read_raw(path_buf, rec_path_len as i64, data_buf);
+            if full_len < 0 {
               all_ok = 0;
-            }
+            } else {
+              let append_status: i64 = fs_append_raw(path_buf, rec_path_len as i64, data_buf, full_len);
+              if append_status != 0 {
+                all_ok = 0;
+              }
             }
           }
         }
@@ -1527,49 +1666,18 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
   return 0;
 }
 
-// Copies the newest valid record's data bytes for `path` into
-// out_buf, returning the data length, or -1 if no valid record for
-// that path exists at all (never written, or its newest record is a
-// tombstone -- see fs_delete).
-fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
-  let blk: i64 = fs_find_latest_block(path);
-  if blk < 0 {
-    return 0 - 1;
-  }
-  let tmp: mut ref i64 = fs_sd_scratch_get();
-  let rd_status: i64 = fs_block_read(blk, tmp);
-  if rd_status != 0 {
-    return 0 - 1;
-  }
-  let data_len: u32 = buf_read_u32(tmp, 44 as u32);
-  if data_len == (0xFFFFFFFF as u32) {
-    return 0 - 1;
-  }
-  // BUG (found via audit, 2026-08-27): data_len is an on-disk field
-  // covered by fs_find_latest_block_raw's own checksum validation,
-  // but a checksum match is strong evidence, not proof, against
-  // corruption (buf_checksum is a simple rotate-mix, not collision-
-  // resistant) -- and out_buf's own real capacity is entirely up to
-  // the caller regardless. Reject rather than trust an out-of-range
-  // length as a copy-loop bound, same "reject, don't guess" posture
-  // as every other bounds check this project's storage/networking
-  // layers use.
-  if data_len > (464 as u32) {
-    return 0 - 1;
-  }
-  let i: i64 = 0;
-  while (i as u32) < data_len {
-    let b: u32 = buf_read_byte(tmp, (48 + i) as u32);
-    let _ = buf_write_byte(out_buf, i as u32, b);
-    i = i + 1;
-  }
-  return data_len as i64;
-}
-
-// Raw-buffer twin of fs_read, same reasoning as fs_append_raw/
-// fs_find_latest_block_raw: task #9's shell only ever has a path typed
-// over UART into shell_line_buf, with no Str form to build from
-// arbitrary runtime bytes.
+// Raw-buffer core, shared by fs_read (below) and anything else that
+// only has a path as raw bytes (task #9's shell, over UART into
+// shell_line_buf, with no Str form to build from arbitrary runtime
+// bytes) -- same reasoning as fs_append_raw/fs_find_latest_block_raw.
+// Copies the newest valid record's FULL logical data for `path` into
+// out_buf, following the record's own next_block chain (round 39) if
+// it spans more than one block, returning the total data length, or
+// -1 if no valid record exists at all (never written, its newest
+// record is a tombstone, or the chain is corrupt/broken -- reject the
+// whole read rather than silently return a truncated prefix, same
+// "reject, don't guess" posture as every other bounds check this
+// project's storage/networking layers use).
 fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i64 {
   let blk: i64 = fs_find_latest_block_raw(path_buf, path_len);
   if blk < 0 {
@@ -1580,8 +1688,8 @@ fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i6
   if rd_status != 0 {
     return 0 - 1;
   }
-  let data_len: u32 = buf_read_u32(tmp, 44 as u32);
-  if data_len == (0xFFFFFFFF as u32) {
+  let total_len: u32 = buf_read_u32(tmp, 44 as u32);
+  if total_len == (0xFFFFFFFF as u32) {
     return 0 - 1;
   }
   // BUG (found via audit, 2026-08-27): data_len is an on-disk field
@@ -1590,32 +1698,103 @@ fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i6
   // corruption (buf_checksum is a simple rotate-mix, not collision-
   // resistant) -- and out_buf's own real capacity is entirely up to
   // the caller regardless. Reject rather than trust an out-of-range
-  // length as a copy-loop bound, same "reject, don't guess" posture
-  // as every other bounds check this project's storage/networking
-  // layers use.
-  if data_len > (464 as u32) {
+  // length as a copy-loop bound.
+  if (total_len as i64) > fs_file_max_len() {
     return 0 - 1;
   }
+  let cap: i64 = fs_block_payload_cap();
+  let total_len_i: i64 = total_len as i64;
+  let head_chunk: i64 = if total_len_i < cap { total_len_i } else { cap };
   let i: i64 = 0;
-  while (i as u32) < data_len {
-    let b: u32 = buf_read_byte(tmp, (48 + i) as u32);
+  while i < head_chunk {
+    let b: u32 = buf_read_byte(tmp, (52 + i) as u32);
     let _ = buf_write_byte(out_buf, i as u32, b);
     i = i + 1;
   }
-  return data_len as i64;
+  let copied: i64 = head_chunk;
+  let remaining: i64 = total_len_i - head_chunk;
+  let next_blk: i64 = buf_read_u32(tmp, 48 as u32) as i64;
+
+  // Round 39: follow the chain for anything past the head's own
+  // 460-byte chunk. Every continuation block gets the SAME "reject,
+  // don't guess" checksum/sentinel validation as any other record --
+  // a broken or corrupted chain fails the whole read rather than
+  // silently handing back a truncated prefix.
+  while remaining > 0 {
+    if next_blk == 0 {
+      return 0 - 1; // chain ended early -- corrupt/broken, reject
+    }
+    let cont: mut ref i64 = fs_sd_scratch_get();
+    if fs_block_read(next_blk, cont) != 0 {
+      return 0 - 1;
+    }
+    let stored_checksum: u32 = buf_read_u32(cont, 0 as u32);
+    let computed_checksum: u32 = buf_checksum(cont, 4 as u32, 508 as u32);
+    let cont_seq: u32 = buf_read_u32(cont, 4 as u32);
+    if (stored_checksum != computed_checksum) || (cont_seq == (0 as u32)) {
+      return 0 - 1;
+    }
+    let cont_path_len: u32 = buf_read_u32(cont, 8 as u32);
+    if cont_path_len != (0 as u32) {
+      return 0 - 1; // not a continuation marker -- chain is wrong
+    }
+    let cont_len: i64 = buf_read_u32(cont, 44 as u32) as i64;
+    if (cont_len < 0) || (cont_len > cap) {
+      return 0 - 1;
+    }
+    let this_chunk: i64 = if cont_len < remaining { cont_len } else { remaining };
+    let k: i64 = 0;
+    while k < this_chunk {
+      let b2: u32 = buf_read_byte(cont, (52 + k) as u32);
+      let _ = buf_write_byte(out_buf, (copied + k) as u32, b2);
+      k = k + 1;
+    }
+    copied = copied + this_chunk;
+    remaining = remaining - this_chunk;
+    next_blk = buf_read_u32(cont, 48 as u32) as i64;
+  }
+  return total_len_i;
+}
+
+// Copies the newest valid record's data bytes for `path` into
+// out_buf, returning the data length, or -1 if no valid record for
+// that path exists at all (never written, or its newest record is a
+// tombstone -- see fs_delete). Thin Str-to-raw-buffer wrapper around
+// fs_read_raw -- the two used to duplicate the entire read/chain-
+// follow logic; consolidated once round 39's chain-following made
+// that duplication a real maintenance risk, not just a stylistic one.
+fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  if path_len <= 0 {
+    return 0 - 1;
+  }
+  if path_len > 32 {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = fs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return fs_read_raw(path_buf, path_len, out_buf);
 }
 
 // fs_delete: appends a tombstone record for `path` -- a normal,
 // crash-safe log entry (same checksum/sequence-number machinery as
 // any other write) whose data_len field is the sentinel 0xFFFFFFFF,
-// a value no genuine record can ever have (data is capped at 464
-// bytes). fs_read/fs_list treat the newest tombstone for a path
+// a value no genuine record can ever have (a file's total length is
+// capped at fs_file_max_len(), 4096 bytes as of round 39). fs_read/
+// fs_list treat the newest tombstone for a path
 // exactly like the path never existed; compaction (fs_compact) can
 // still find and re-carry a tombstone forward as "the latest record"
 // for its path like any other -- deleting something, then compacting,
 // correctly keeps it deleted rather than resurrecting an older
 // pre-delete version.
 fn fs_delete_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  if path_len <= 0 {
+    return 1; // same reserved-sentinel reasoning as fs_append_raw
+  }
   if path_len > 32 {
     return 1;
   }
@@ -1632,6 +1811,11 @@ fn fs_delete_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
     i = i + 1;
   }
   let _ = buf_write_u32(buf, 44 as u32, 0xFFFFFFFF as u32);
+  // Round 39: a tombstone never chains -- but buf is fs_sd_scratch, a
+  // PERSISTENT reused buffer, so this field must be written explicitly
+  // rather than assumed zero; a stale next_block from whatever this
+  // buffer last held would otherwise leak into a brand-new record.
+  let _ = buf_write_u32(buf, 48 as u32, 0 as u32);
 
   let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
   let _ = buf_write_u32(buf, 0 as u32, checksum);
@@ -1658,6 +1842,157 @@ fn fs_delete(path: Str) -> i64 {
   return fs_delete_raw(path_buf, path_len);
 }
 
+// Round 39's live milestone: write a payload well past the 460-byte
+// per-block cap, confirm it round-trips byte-for-byte through
+// fs_append_raw's own chaining (reverse-order write) and fs_read_raw's
+// own chain-following read. 1000 bytes needs 3 chunks (460+460+80) --
+// comfortably past the "needs exactly one continuation" minimum case,
+// enough to prove the loop over MULTIPLE chained blocks, not just a
+// head-plus-one edge case. Reuses test_fill_pattern/test_compare_
+// buffers, the same generic pattern-fill/compare helpers the SD/USB
+// mass storage round-trip checks already use, rather than a third
+// hand-rolled comparison loop.
+fn fs_multiblock_self_test() -> i64 {
+  let ok: i64 = 1;
+  let file_len: i64 = 1000;
+  let write_buf: mut ref i64 = dhruva_alloc_bytes(1000);
+  let _ = test_fill_pattern(write_buf, 1000);
+
+  // Raw pattern bytes aren't valid Str/UTF-8 content, so this goes
+  // through fs_append_raw/fs_read_raw directly rather than fs_append's
+  // own Str-based wrapper, matching every other raw-content self-test
+  // in this project.
+  let path_buf: mut ref i64 = dhruva_alloc_bytes(16);
+  let path_bytes: Str = "/bigfile/data";
+  let path_len: i64 = str_len_bytes(path_bytes);
+  let pi: i64 = 0;
+  while pi < path_len {
+    let _ = buf_write_byte(path_buf, pi as u32, str_byte_at(path_bytes, pi) as u32);
+    pi = pi + 1;
+  }
+  let write_status: i64 = fs_append_raw(path_buf, path_len, write_buf, file_len);
+  if write_status != 0 {
+    ok = 0;
+  }
+
+  let read_buf: mut ref i64 = dhruva_alloc_bytes(1000);
+  let read_len: i64 = fs_read_raw(path_buf, path_len, read_buf);
+  if read_len != file_len {
+    ok = 0;
+  }
+  let mismatch: i64 = test_compare_buffers(write_buf, read_buf, file_len);
+  if mismatch != 0 {
+    ok = 0;
+  }
+
+  // Overwrite with a DIFFERENT multi-block payload, confirm the
+  // lookup correctly follows the NEW chain's head, not a leftover
+  // continuation block from the old one (every continuation block's
+  // path_len=0 sentinel makes this structurally impossible to get
+  // wrong, but proving it live is still the point, not just trusting
+  // the design on paper).
+  let write_buf2: mut ref i64 = dhruva_alloc_bytes(1000);
+  let qi: i64 = 0;
+  while qi < 1000 {
+    let _ = buf_write_byte(write_buf2, qi as u32, ((qi * 7) & 0xFF) as u32);
+    qi = qi + 1;
+  }
+  let write_status2: i64 = fs_append_raw(path_buf, path_len, write_buf2, file_len);
+  if write_status2 != 0 {
+    ok = 0;
+  }
+  let read_buf2: mut ref i64 = dhruva_alloc_bytes(1000);
+  let read_len2: i64 = fs_read_raw(path_buf, path_len, read_buf2);
+  if read_len2 != file_len {
+    ok = 0;
+  }
+  let mismatch2: i64 = test_compare_buffers(write_buf2, read_buf2, file_len);
+  if mismatch2 != 0 {
+    ok = 0;
+  }
+
+  let _ = uart_puts("FS: multi-block file round trip (1000 bytes, 3 chunks) + overwrite");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round 39's journaling-hardening proof: the actual crash-consistency
+// claim fs_init's own header comment makes for multi-block files --
+// that a crash/power-loss before a new chain's HEAD block is written
+// leaves the OLD version of the file completely intact and reachable,
+// because the head write is the one atomic point a new chain becomes
+// visible at all. This project's own single-threaded, synchronous
+// execution can't literally interrupt a write mid-chain the way
+// test/power_yank.py does at the QEMU-process level for single-block
+// writes -- so this reproduces the EXACT end state such a crash would
+// leave instead: a real, valid, checksummed CONTINUATION block
+// (path_len=0) written directly to the block number fs_state's own
+// next_block would use next, with NO corresponding head ever written
+// and fs_state deliberately left untouched (not calling fs_state_set
+// IS the simulated crash -- that accounting update, and the real head
+// write, are exactly the two things a crash prevents). Gives the
+// phantom block an artificially huge sequence number specifically so
+// that if it were EVER wrongly visible to a lookup, it would
+// incorrectly "win" over the real record -- making this a genuine
+// stress case, not a trivially-passing one.
+fn fs_multiblock_crash_consistency_self_test() -> i64 {
+  let ok: i64 = 1;
+  let path: Str = "/crashtest/file";
+  let old_value: Str = "safe-old-value";
+  let _ = fs_append(path, old_value);
+
+  let phantom_block: i64 = fs_state_get_next_block() as i64;
+  let phantom_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let _ = buf_write_u32(phantom_buf, 4 as u32, 999999 as u32); // seq far
+                          // higher than any real record so far
+  let _ = buf_write_u32(phantom_buf, 8 as u32, 0 as u32); // continuation marker
+  let z: i64 = 0;
+  while z < 32 {
+    let _ = buf_write_byte(phantom_buf, (12 + z) as u32, 0 as u32);
+    z = z + 1;
+  }
+  let _ = buf_write_u32(phantom_buf, 44 as u32, 10 as u32);
+  let _ = buf_write_u32(phantom_buf, 48 as u32, 0 as u32); // next_block=0
+  let p: i64 = 0;
+  while p < 10 {
+    let _ = buf_write_byte(phantom_buf, (52 + p) as u32, 88 as u32); // 'X'
+    p = p + 1;
+  }
+  let checksum: u32 = buf_checksum(phantom_buf, 4 as u32, 508 as u32);
+  let _ = buf_write_u32(phantom_buf, 0 as u32, checksum);
+  let _ = fs_block_write(phantom_block, phantom_buf);
+  // Deliberately no fs_state_set call -- see this function's own
+  // header comment for why that omission IS the simulated crash.
+
+  let out_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let read_len: i64 = fs_read(path, out_buf);
+  let expected_len: i64 = str_len_bytes(old_value);
+  if read_len != expected_len {
+    ok = 0;
+  }
+  let ci: i64 = 0;
+  while ci < expected_len {
+    let want: i64 = str_byte_at(old_value, ci);
+    let got: u32 = buf_read_byte(out_buf, ci as u32);
+    if (got as i64) != want {
+      ok = 0;
+    }
+    ci = ci + 1;
+  }
+
+  let _ = uart_puts("FS: simulated crash mid-multi-block-write leaves old version intact");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Prints every live path (not tombstoned, and the newest record for
 // that exact path -- an older, superseded occurrence in the log is
 // correctly skipped even though it's still individually valid) whose
@@ -1681,7 +2016,12 @@ fn fs_list(prefix: Str) -> i64 {
         let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
         let rec_data_len: u32 = buf_read_u32(buf, 44 as u32);
         let long_enough: i64 = 0;
-        if (rec_path_len as i64) >= prefix_len {
+        // Round 39: rec_path_len == 0 marks a continuation block (see
+        // fs_init's own header comment), never independently listable
+        // -- excluded explicitly rather than relying on the >=
+        // prefix_len check below to happen to exclude it (it wouldn't,
+        // for an empty "list everything" prefix, prefix_len == 0 too).
+        if (rec_path_len > (0 as u32)) && ((rec_path_len as i64) >= prefix_len) {
           long_enough = 1;
         }
         if (long_enough == 1) && (rec_data_len != (0xFFFFFFFF as u32)) {
@@ -7764,7 +8104,7 @@ fn task_e() -> i64 {
   let gc_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
-  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(464);
+  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(4096);
   let dhcp_my_mac: mut ref i64 = dhruva_alloc_bytes(8);
   let _ = netif_get_mac(dhcp_my_mac);
   while true {
@@ -8241,7 +8581,7 @@ fn eval_expr_raw(buf: mut ref i64, expr_len: i64, error_buf: mut ref i64) -> i64
 // arguments.
 fn eval_self_test(expr: Str, expected: i64, expect_error: i64) -> i64 {
   let expr_len: i64 = str_len_bytes(expr);
-  let expr_buf: mut ref i64 = fs_data_scratch_get(); // 464 bytes, ample for a 128-byte expr; unused by FS during eval
+  let expr_buf: mut ref i64 = fs_data_scratch_get(); // 4096 bytes (round 39), ample for a 128-byte expr; unused by FS during eval
   let i: i64 = 0;
   while i < expr_len {
     let _ = buf_write_byte(expr_buf, i as u32, str_byte_at(expr, i) as u32);
@@ -8409,7 +8749,11 @@ fn shell_dispatch() -> i64 {
     }
     let text_start: i64 = path_end + 1;
     let text_len: i64 = line_len - text_start;
-    if text_len > 464 {
+    // Round 39: matches fs_file_max_len(), though in practice the
+    // shell's own 128-byte line buffer (shell_line_scratch) already
+    // makes this unreachable -- kept accurate to the real FS-layer cap
+    // regardless, rather than left stale at the old 464-byte number.
+    if text_len > (fs_file_max_len() as i64) {
       let _ = uart_puts("error: text too long\n");
       return 0;
     }
@@ -9030,7 +9374,7 @@ fn kernel_main() -> i64 {
   // call sites is safe.
   let _ = fs_sd_scratch_set(dhruva_alloc_bytes(512));
   let _ = fs_path_scratch_set(dhruva_alloc_bytes(32));
-  let _ = fs_data_scratch_set(dhruva_alloc_bytes(464));
+  let _ = fs_data_scratch_set(dhruva_alloc_bytes(4096));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
@@ -9144,7 +9488,7 @@ fn kernel_main() -> i64 {
   let next_block_before: u32 = fs_state_get_next_block();
   let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
-  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(464);
+  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(4096);
   let _ = fs_compact(compact_buf, compact_path_buf, compact_data_buf);
   let log_start_after: u32 = fs_state_get_log_start();
   let next_block_after: u32 = fs_state_get_next_block();
@@ -9184,6 +9528,10 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("FS: read of deleted /config/name result=");
   let _ = uart_put_hex32(deleted_len as u32);
   let _ = uart_puts(" (expect FFFFFFFF, i.e. -1, not found)\n");
+
+  // Round 39: multi-block files + journaling hardening.
+  let _ = fs_multiblock_self_test();
+  let _ = fs_multiblock_crash_consistency_self_test();
 
   // Task #10 verification: eval_expr_raw, via boot-time self-test
   // rather than live shell input (see eval_self_test's own comment).
