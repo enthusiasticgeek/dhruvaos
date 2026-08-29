@@ -52,7 +52,7 @@ far. Expect each to span multiple rounds/sessions, same as any
 multi-round item elsewhere in this backlog.
 
 - **USB mass storage class driver** — `[L, ~4-6 rounds — in progress,
-  round 33 landed the foundation]`
+  rounds 33-35 landed real sector I/O, FS integration remains]`
   Today's DWC2 driver does enumeration only (`GET_DESCRIPTOR`,
   `SET_ADDRESS`, `SET_CONFIGURATION`) — "no bulk or interrupt
   transfers, control only" per the driver's own comment. A real
@@ -87,14 +87,25 @@ multi-round item elsewhere in this backlog.
     last_lba=0x3FFF/block_len=0x200 — exactly matching a fresh 8MB
     backing image (16384 × 512 = 8388608 bytes). `usb-net` confirmed
     still completely unaffected.
-  - Remaining: `READ(10)`/`WRITE(10)` — both need an actual data-stage
-    transfer moving a full 512-byte sector, which exceeds the shared
-    64-byte `dwc2_dma_scratch` every bulk/control transfer in this
-    driver still uses; needs either a larger dedicated bulk-data
-    scratch buffer or resizing the shared one (control transfers never
-    use more than 64 bytes today, so growing it doesn't risk them, but
-    the increase should still be verified deliberately, not assumed
-    safe). Then FS integration via the block-device abstraction below.
+  - Done (round 35): added a new dedicated 512-byte `usb_bulk_data_
+    scratch` (not a resize of the shared 64-byte `dwc2_dma_scratch`,
+    which still backs control transfers unchanged) and pointed
+    `dwc2_bulk_out`/`dwc2_bulk_in` at it, raising their cap from 64 to
+    512 bytes. Generalized round 34's `usb_msd_scsi_command_in` into
+    `usb_msd_scsi_command` (added an `is_write` direction) once
+    `WRITE(10)`'s OUT data stage needed the same shape as `READ(10)`'s
+    IN. Added `usb_msd_read10`/`usb_msd_write10` and a live round-trip
+    check (write a real pattern to LBA 100, read it back, byte-compare
+    via the SAME `test_fill_pattern`/`test_compare_buffers` helpers the
+    SD driver's own round-trip sweep uses). Worked first try.
+    Verified at the strongest level available: read the QEMU backing
+    image file directly from the host at byte offset 100×512 and
+    confirmed it holds the real, persisted pattern — not just an
+    in-session round trip, a genuinely durable sector write. `usb-net`
+    confirmed still completely unaffected.
+  - Remaining: FS integration via the block-device abstraction below —
+    the actual point of this whole feature. Real sector I/O now works
+    end to end; nothing in the FS layer talks to it yet.
   Natural integration point once built: the block-device abstraction
   above — a USB mass-storage device becomes a third backend behind the
   same interface as SDHOST/EMMC2, not a special case.
@@ -133,6 +144,40 @@ multi-round item elsewhere in this backlog.
   current single-block-per-record design never has to handle. Fully
   QEMU-testable — `power_yank.py`'s existing tear-point-sweep
   methodology extends directly, no hardware needed.
+
+## General DMA controller (not scoped — recommendation only, round 35)
+
+User asked about a general "DMA interface for faster stuff" while
+this round was growing the USB bulk-transfer buffer. Recorded here
+rather than only in chat, since it's a real architectural question
+worth a documented answer:
+
+BCM2835 has two genuinely separate DMA facilities. DWC2's own HCDMA
+(what this project's USB driver already uses, control and bulk alike)
+is peripheral-specific — internal to the USB host controller, already
+about as fast as this hardware allows, nothing more to add there. The
+SoC's *general-purpose* DMA controller (16 independent channels,
+`0x20007000`) is a different, currently-untouched peripheral — the one
+actual candidate for "faster stuff" in this codebase today is
+`sdhost_drain_fifo_to_buffer`/`sdhost_fill_fifo_from_buffer`
+(`boot/sdcard_state.S`), which still move every SD FIFO word via a
+plain CPU copy loop.
+
+**Recommendation**: don't build a general BCM2835 DMA-controller
+driver speculatively now — same reasoning as not building the
+block-device abstraction ahead of a second real backend. Build it
+targeted at the SD FIFO path specifically once SD throughput actually
+matters for something (e.g. once FS integration below makes real file
+I/O throughput visible), verified live under QEMU the same way every
+other peripheral in this project has been, rather than as
+infrastructure nobody's calling yet.
+
+**NEON**: not available on this project's current target. BCM2835's
+ARM1176JZF-S is ARMv6 — scalar VFPv2 floating point only, no SIMD unit
+of any kind. NEON (Advanced SIMD) was introduced with ARMv7-A and
+needs a Cortex-A-class core; it becomes available "for free" (nothing
+to build) whenever the Pi 4/5 port (Cortex-A72/A76, both ARMv8-A)
+happens — see `docs/PORTING.md`. Nothing to do for it before then.
 
 ## Hardware-in-loop testing (once a real Pi 1B is available)
 
