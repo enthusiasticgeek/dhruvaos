@@ -74,11 +74,27 @@ multi-round item elsewhere in this backlog.
     status on retry — also exercising toggle tracking across a second
     transfer). `usb-net` enumeration confirmed completely unaffected
     (gated on the BOT interface actually being present).
-  - Remaining: a minimal SCSI command subset beyond `TEST UNIT READY`
-    (`INQUIRY`, `READ CAPACITY`, `READ(10)`, `WRITE(10)` — the last two
-    need a data-stage transfer moving a full 512-byte sector, out of
-    this round's scope since `TEST UNIT READY` has no data stage at
-    all), then FS integration.
+  - Done (round 34): factored the CBW-out/data-in/CSW-in shape into a
+    generic `usb_msd_scsi_command_in` (rule of three, once a third
+    near-identical call site appeared); added `INQUIRY` (real 36-byte
+    data-in stage, the first this driver exercises) and
+    `READ CAPACITY(10)` (8-byte data-in, both fields big-endian —
+    SCSI's own wire convention, distinct from and easy to confuse with
+    the BOT wrapper's little-endian CBW/CSW fields). Live-verified
+    against QEMU's real `usb-storage` backend with independently
+    checkable ground truth: `INQUIRY` returned the real "QEMU"/"QEMU
+    HARDDISK" vendor/product strings, `READ CAPACITY(10)` returned
+    last_lba=0x3FFF/block_len=0x200 — exactly matching a fresh 8MB
+    backing image (16384 × 512 = 8388608 bytes). `usb-net` confirmed
+    still completely unaffected.
+  - Remaining: `READ(10)`/`WRITE(10)` — both need an actual data-stage
+    transfer moving a full 512-byte sector, which exceeds the shared
+    64-byte `dwc2_dma_scratch` every bulk/control transfer in this
+    driver still uses; needs either a larger dedicated bulk-data
+    scratch buffer or resizing the shared one (control transfers never
+    use more than 64 bytes today, so growing it doesn't risk them, but
+    the increase should still be verified deliberately, not assumed
+    safe). Then FS integration via the block-device abstraction below.
   Natural integration point once built: the block-device abstraction
   above — a USB mass-storage device becomes a third backend behind the
   same interface as SDHOST/EMMC2, not a special case.
