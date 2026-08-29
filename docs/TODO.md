@@ -340,23 +340,42 @@ for by name.
 
 - **Crypto primitives foundation** — `[L, ~3-5 rounds — the real
   prerequisite for PKI/secure boot/media encryption below]`
-  A hash function (SHA-256 is the sane default: simple, no S-boxes/
-  lookup tables to get constant-time on hardware with no cache anyway
-  — see the AI-attack-hardening item below for why that lack of cache
-  is an accidental advantage here) and a symmetric cipher (ChaCha20
-  over AES: AES's standard software implementations lean on table
-  lookups that are a timing-side-channel risk on hardware WITH a
-  cache; ChaCha20 was designed for fast, naturally constant-time
-  software implementation without them, and ARMv6 has no AES
-  instruction extension to fall back on regardless). Needs vani to
-  actually support the bit-twiddling this requires efficiently
-  (rotates, XOR-heavy loops) — worth a small spike to confirm before
-  committing to the full build. Bignum/asymmetric primitives (ECC
-  point arithmetic, at minimum, for anything below needing real
-  signatures) are a separate, larger sub-effort on top of this.
-  Fully QEMU-testable via known-answer test vectors (NIST's own SHA-256
-  KATs, the ChaCha20 RFC 8439 test vectors) — no hardware or network
-  needed to verify a hash/cipher implementation is byte-correct.
+
+  **SHA-256: DONE (round 41).** Full FIPS 180-4 implementation
+  (`sha256_hash`/`sha256_compress` + supporting K-table/message-
+  schedule/padding logic) in `kernel/kernel_main.vani`. The spike this
+  entry itself recommended ("worth a small spike to confirm [vani's
+  bit-twiddling support] before committing to the full build") found a
+  real, concrete constraint: vani's checker/runtime traps on u32
+  addition overflow rather than wrapping (confirmed both as a compile-
+  time constant-fold rejection and as a genuine runtime trap), but
+  SHA-256's compression function depends completely on mod-2^32
+  addition. Not a blocker — every 32-bit add goes through a
+  `sha256_wrap_add32` helper that widens to i64 (always safely in
+  range for any u32+u32), masks to the low 32 bits, and truncates back
+  to u32. Rotate (via shift+or), XOR/AND/OR, and left/right shift all
+  behave with standard 32-bit truncating semantics with no similar
+  issue. Verified against 3 FIPS 180-4/NIST known-answer vectors
+  (empty string, "abc", and a 56-byte message whose padding lands
+  exactly on a second block — the case a single-block-only
+  implementation would get wrong) via `sha256_self_test`, wired into
+  the permanent boot self-test suite; full existing battery unchanged
+  (0 FAIL/FATAL, 42 PASS with a real SD card), `phase4_milestone.py`
+  ×2, USB enumeration both device types, `heap_stress.py`, and
+  `power_yank.py` all still clean with the new module present.
+
+  **Still open**: a symmetric cipher (ChaCha20 over AES: AES's
+  standard software implementations lean on table lookups that are a
+  timing-side-channel risk on hardware WITH a cache; ChaCha20 was
+  designed for fast, naturally constant-time software implementation
+  without them, and ARMv6 has no AES instruction extension to fall
+  back on regardless — same `sha256_wrap_add32`-style wraparound
+  workaround will be needed for its own add-rotate-xor quarter
+  rounds). Bignum/asymmetric primitives (ECC point arithmetic, at
+  minimum, for anything below needing real signatures) are a separate,
+  larger sub-effort on top of both. Fully QEMU-testable via the
+  ChaCha20 RFC 8439 known-answer test vectors, same technique as
+  SHA-256 above.
 
 - **Packet filtering / iptables-equivalent** — `[M, ~2-3 rounds]`
   A rule table (allow/deny by src/dst IP, port, protocol) with a hook

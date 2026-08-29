@@ -9328,6 +9328,406 @@ fn task_f() -> i64 {
   return 0;
 }
 
+// Round 41: SHA-256 (FIPS 180-4), the crypto-primitives-foundation
+// security-roadmap item's hash function half (see docs/TODO.md).
+// Chosen over any table-driven cipher for the same reason ChaCha20 (a
+// later round of this item) is preferred over AES: no S-boxes/lookup
+// tables to make constant-time on hardware with no data cache anyway.
+//
+// vani's checker/runtime traps on u32 addition overflow (confirmed via
+// a small standalone spike before committing to this build, exactly as
+// docs/TODO.md's own crypto-foundation entry flagged as worth doing) --
+// SHA-256's compression function depends completely on wraparound
+// (mod 2^32) addition, so every 32-bit add here goes through
+// sha256_wrap_add32, which widens to i64 (safely inside i64's range for
+// any u32+u32), masks to the low 32 bits, and truncates back to u32,
+// rather than using vani's native `+` on u32 operands directly.
+fn sha256_wrap_add32(a: u32, b: u32) -> u32 {
+  let wide: i64 = (a as i64) + (b as i64);
+  return (wide & 4294967295) as u32;
+}
+
+fn sha256_rotr32(x: u32, n: u32) -> u32 {
+  return (x >> n) | (x << ((32 as u32) - n));
+}
+
+// The 64 round constants: first 32 bits of the fractional parts of the
+// cube roots of the first 64 primes (FIPS 180-4 section 4.2.2).
+fn sha256_k_init(k: mut ref i64) -> i64 {
+  let _ = buf_write_u32(k, 0 as u32, 0x428a2f98 as u32);
+  let _ = buf_write_u32(k, 4 as u32, 0x71374491 as u32);
+  let _ = buf_write_u32(k, 8 as u32, 0xb5c0fbcf as u32);
+  let _ = buf_write_u32(k, 12 as u32, 0xe9b5dba5 as u32);
+  let _ = buf_write_u32(k, 16 as u32, 0x3956c25b as u32);
+  let _ = buf_write_u32(k, 20 as u32, 0x59f111f1 as u32);
+  let _ = buf_write_u32(k, 24 as u32, 0x923f82a4 as u32);
+  let _ = buf_write_u32(k, 28 as u32, 0xab1c5ed5 as u32);
+  let _ = buf_write_u32(k, 32 as u32, 0xd807aa98 as u32);
+  let _ = buf_write_u32(k, 36 as u32, 0x12835b01 as u32);
+  let _ = buf_write_u32(k, 40 as u32, 0x243185be as u32);
+  let _ = buf_write_u32(k, 44 as u32, 0x550c7dc3 as u32);
+  let _ = buf_write_u32(k, 48 as u32, 0x72be5d74 as u32);
+  let _ = buf_write_u32(k, 52 as u32, 0x80deb1fe as u32);
+  let _ = buf_write_u32(k, 56 as u32, 0x9bdc06a7 as u32);
+  let _ = buf_write_u32(k, 60 as u32, 0xc19bf174 as u32);
+  let _ = buf_write_u32(k, 64 as u32, 0xe49b69c1 as u32);
+  let _ = buf_write_u32(k, 68 as u32, 0xefbe4786 as u32);
+  let _ = buf_write_u32(k, 72 as u32, 0x0fc19dc6 as u32);
+  let _ = buf_write_u32(k, 76 as u32, 0x240ca1cc as u32);
+  let _ = buf_write_u32(k, 80 as u32, 0x2de92c6f as u32);
+  let _ = buf_write_u32(k, 84 as u32, 0x4a7484aa as u32);
+  let _ = buf_write_u32(k, 88 as u32, 0x5cb0a9dc as u32);
+  let _ = buf_write_u32(k, 92 as u32, 0x76f988da as u32);
+  let _ = buf_write_u32(k, 96 as u32, 0x983e5152 as u32);
+  let _ = buf_write_u32(k, 100 as u32, 0xa831c66d as u32);
+  let _ = buf_write_u32(k, 104 as u32, 0xb00327c8 as u32);
+  let _ = buf_write_u32(k, 108 as u32, 0xbf597fc7 as u32);
+  let _ = buf_write_u32(k, 112 as u32, 0xc6e00bf3 as u32);
+  let _ = buf_write_u32(k, 116 as u32, 0xd5a79147 as u32);
+  let _ = buf_write_u32(k, 120 as u32, 0x06ca6351 as u32);
+  let _ = buf_write_u32(k, 124 as u32, 0x14292967 as u32);
+  let _ = buf_write_u32(k, 128 as u32, 0x27b70a85 as u32);
+  let _ = buf_write_u32(k, 132 as u32, 0x2e1b2138 as u32);
+  let _ = buf_write_u32(k, 136 as u32, 0x4d2c6dfc as u32);
+  let _ = buf_write_u32(k, 140 as u32, 0x53380d13 as u32);
+  let _ = buf_write_u32(k, 144 as u32, 0x650a7354 as u32);
+  let _ = buf_write_u32(k, 148 as u32, 0x766a0abb as u32);
+  let _ = buf_write_u32(k, 152 as u32, 0x81c2c92e as u32);
+  let _ = buf_write_u32(k, 156 as u32, 0x92722c85 as u32);
+  let _ = buf_write_u32(k, 160 as u32, 0xa2bfe8a1 as u32);
+  let _ = buf_write_u32(k, 164 as u32, 0xa81a664b as u32);
+  let _ = buf_write_u32(k, 168 as u32, 0xc24b8b70 as u32);
+  let _ = buf_write_u32(k, 172 as u32, 0xc76c51a3 as u32);
+  let _ = buf_write_u32(k, 176 as u32, 0xd192e819 as u32);
+  let _ = buf_write_u32(k, 180 as u32, 0xd6990624 as u32);
+  let _ = buf_write_u32(k, 184 as u32, 0xf40e3585 as u32);
+  let _ = buf_write_u32(k, 188 as u32, 0x106aa070 as u32);
+  let _ = buf_write_u32(k, 192 as u32, 0x19a4c116 as u32);
+  let _ = buf_write_u32(k, 196 as u32, 0x1e376c08 as u32);
+  let _ = buf_write_u32(k, 200 as u32, 0x2748774c as u32);
+  let _ = buf_write_u32(k, 204 as u32, 0x34b0bcb5 as u32);
+  let _ = buf_write_u32(k, 208 as u32, 0x391c0cb3 as u32);
+  let _ = buf_write_u32(k, 212 as u32, 0x4ed8aa4a as u32);
+  let _ = buf_write_u32(k, 216 as u32, 0x5b9cca4f as u32);
+  let _ = buf_write_u32(k, 220 as u32, 0x682e6ff3 as u32);
+  let _ = buf_write_u32(k, 224 as u32, 0x748f82ee as u32);
+  let _ = buf_write_u32(k, 228 as u32, 0x78a5636f as u32);
+  let _ = buf_write_u32(k, 232 as u32, 0x84c87814 as u32);
+  let _ = buf_write_u32(k, 236 as u32, 0x8cc70208 as u32);
+  let _ = buf_write_u32(k, 240 as u32, 0x90befffa as u32);
+  let _ = buf_write_u32(k, 244 as u32, 0xa4506ceb as u32);
+  let _ = buf_write_u32(k, 248 as u32, 0xbef9a3f7 as u32);
+  let _ = buf_write_u32(k, 252 as u32, 0xc67178f2 as u32);
+  return 0;
+}
+
+fn sha256_h_init(h: mut ref i64) -> i64 {
+  let _ = buf_write_u32(h, 0 as u32, 0x6a09e667 as u32);
+  let _ = buf_write_u32(h, 4 as u32, 0xbb67ae85 as u32);
+  let _ = buf_write_u32(h, 8 as u32, 0x3c6ef372 as u32);
+  let _ = buf_write_u32(h, 12 as u32, 0xa54ff53a as u32);
+  let _ = buf_write_u32(h, 16 as u32, 0x510e527f as u32);
+  let _ = buf_write_u32(h, 20 as u32, 0x9b05688c as u32);
+  let _ = buf_write_u32(h, 24 as u32, 0x1f83d9ab as u32);
+  let _ = buf_write_u32(h, 28 as u32, 0x5be0cd19 as u32);
+  return 0;
+}
+
+// Message bytes are big-endian 32-bit words per FIPS 180-4, unlike
+// buf_read_u32/buf_write_u32 (native little-endian, per fs_buf.S's
+// plain ldr/str) -- so message-block parsing and digest-byte output
+// both go through explicit big-endian byte packing here. The K table,
+// H state, and W schedule buffers above are internal-only u32
+// containers always read back through the same accessor, so their
+// storage order never needs to match FIPS 180-4's wire format.
+fn sha256_read_be32(buf: mut ref i64, off: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, off as u32);
+  let b1: u32 = buf_read_byte(buf, (off + 1) as u32);
+  let b2: u32 = buf_read_byte(buf, (off + 2) as u32);
+  let b3: u32 = buf_read_byte(buf, (off + 3) as u32);
+  return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+fn sha256_write_be32(buf: mut ref i64, off: i64, v: u32) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, (v >> (24 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 1) as u32, (v >> (16 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 2) as u32, (v >> (8 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 3) as u32, v & (255 as u32));
+  return 0;
+}
+
+// Process one 64-byte block starting at byte offset `block_off` inside
+// `msg`, folding it into the running state `h` (8 words / 32 bytes).
+// `w` is a 256-byte (64-word) message-schedule scratch buffer, `k` the
+// 64-word round-constant table from sha256_k_init.
+fn sha256_compress(h: mut ref i64, msg: mut ref i64, block_off: i64, w: mut ref i64, k: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 16 {
+    let word: u32 = sha256_read_be32(msg, block_off + i * 4);
+    let _ = buf_write_u32(w, (i * 4) as u32, word);
+    i = i + 1;
+  }
+  i = 16;
+  while i < 64 {
+    let w15: u32 = buf_read_u32(w, ((i - 15) * 4) as u32);
+    let w2: u32 = buf_read_u32(w, ((i - 2) * 4) as u32);
+    let w16: u32 = buf_read_u32(w, ((i - 16) * 4) as u32);
+    let w7: u32 = buf_read_u32(w, ((i - 7) * 4) as u32);
+    let s0: u32 = sha256_rotr32(w15, 7 as u32) ^ sha256_rotr32(w15, 18 as u32) ^ (w15 >> (3 as u32));
+    let s1: u32 = sha256_rotr32(w2, 17 as u32) ^ sha256_rotr32(w2, 19 as u32) ^ (w2 >> (10 as u32));
+    let wi: u32 = sha256_wrap_add32(sha256_wrap_add32(w16, s0), sha256_wrap_add32(w7, s1));
+    let _ = buf_write_u32(w, (i * 4) as u32, wi);
+    i = i + 1;
+  }
+
+  let a: u32 = buf_read_u32(h, 0 as u32);
+  let b: u32 = buf_read_u32(h, 4 as u32);
+  let c: u32 = buf_read_u32(h, 8 as u32);
+  let d: u32 = buf_read_u32(h, 12 as u32);
+  let e: u32 = buf_read_u32(h, 16 as u32);
+  let f: u32 = buf_read_u32(h, 20 as u32);
+  let g: u32 = buf_read_u32(h, 24 as u32);
+  let hh: u32 = buf_read_u32(h, 28 as u32);
+  let ones: u32 = 4294967295 as u32;
+
+  i = 0;
+  while i < 64 {
+    let bige1: u32 = sha256_rotr32(e, 6 as u32) ^ sha256_rotr32(e, 11 as u32) ^ sha256_rotr32(e, 25 as u32);
+    let ch: u32 = (e & f) ^ ((e ^ ones) & g);
+    let kw: u32 = buf_read_u32(k, (i * 4) as u32);
+    let ww: u32 = buf_read_u32(w, (i * 4) as u32);
+    let t1: u32 = sha256_wrap_add32(sha256_wrap_add32(hh, bige1), sha256_wrap_add32(ch, sha256_wrap_add32(kw, ww)));
+    let bige0: u32 = sha256_rotr32(a, 2 as u32) ^ sha256_rotr32(a, 13 as u32) ^ sha256_rotr32(a, 22 as u32);
+    let maj: u32 = (a & b) ^ (a & c) ^ (b & c);
+    let t2: u32 = sha256_wrap_add32(bige0, maj);
+
+    hh = g;
+    g = f;
+    f = e;
+    e = sha256_wrap_add32(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = sha256_wrap_add32(t1, t2);
+
+    i = i + 1;
+  }
+
+  let _ = buf_write_u32(h, 0 as u32, sha256_wrap_add32(buf_read_u32(h, 0 as u32), a));
+  let _ = buf_write_u32(h, 4 as u32, sha256_wrap_add32(buf_read_u32(h, 4 as u32), b));
+  let _ = buf_write_u32(h, 8 as u32, sha256_wrap_add32(buf_read_u32(h, 8 as u32), c));
+  let _ = buf_write_u32(h, 12 as u32, sha256_wrap_add32(buf_read_u32(h, 12 as u32), d));
+  let _ = buf_write_u32(h, 16 as u32, sha256_wrap_add32(buf_read_u32(h, 16 as u32), e));
+  let _ = buf_write_u32(h, 20 as u32, sha256_wrap_add32(buf_read_u32(h, 20 as u32), f));
+  let _ = buf_write_u32(h, 24 as u32, sha256_wrap_add32(buf_read_u32(h, 24 as u32), g));
+  let _ = buf_write_u32(h, 28 as u32, sha256_wrap_add32(buf_read_u32(h, 28 as u32), hh));
+  return 0;
+}
+
+// Hashes `msg_len` bytes at `msg` into the 32-byte buffer `out`
+// (FIPS 180-4 padding: a single 0x80 byte, zero bytes up to a
+// 56-mod-64 boundary, then the original bit-length as a big-endian
+// 8-byte integer).
+fn sha256_hash(msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  let with_one: i64 = msg_len + 1;
+  let rem: i64 = with_one % 64;
+  let zero_pad: i64 = 0;
+  if rem <= 56 {
+    zero_pad = 56 - rem;
+  } else {
+    zero_pad = (64 - rem) + 56;
+  }
+  let total_len: i64 = with_one + zero_pad + 8;
+
+  let padded: mut ref i64 = dhruva_alloc_bytes(total_len);
+  let i: i64 = 0;
+  while i < msg_len {
+    let _ = buf_write_byte(padded, i as u32, buf_read_byte(msg, i as u32));
+    i = i + 1;
+  }
+  let _ = buf_write_byte(padded, msg_len as u32, 128 as u32);
+  i = msg_len + 1;
+  while i < (with_one + zero_pad) {
+    let _ = buf_write_byte(padded, i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let bit_len: i64 = msg_len * 8;
+  let _ = sha256_write_be32(padded, total_len - 8, 0 as u32);
+  let _ = sha256_write_be32(padded, total_len - 4, bit_len as u32);
+
+  let h: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = sha256_h_init(h);
+  let k: mut ref i64 = dhruva_alloc_bytes(256);
+  let _ = sha256_k_init(k);
+  let w: mut ref i64 = dhruva_alloc_bytes(256);
+
+  let num_blocks: i64 = total_len / 64;
+  let blk: i64 = 0;
+  while blk < num_blocks {
+    let _ = sha256_compress(h, padded, blk * 64, w, k);
+    blk = blk + 1;
+  }
+
+  let j: i64 = 0;
+  while j < 8 {
+    let word: u32 = buf_read_u32(h, (j * 4) as u32);
+    let _ = sha256_write_be32(out, j * 4, word);
+    j = j + 1;
+  }
+  return 0;
+}
+
+fn sha256_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if buf_read_byte(a, i as u32) != buf_read_byte(b, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// Three FIPS 180-4 / NIST known-answer vectors: the empty string, the
+// "abc" worked example from the spec itself, and a 56-byte message
+// whose padding lands exactly on a second 64-byte block -- the one
+// case a single-block-only implementation would get wrong.
+fn sha256_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let msg0: mut ref i64 = dhruva_alloc_bytes(1);
+  let out0: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = sha256_hash(msg0, 0, out0);
+  let exp0: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(exp0, 0 as u32, 0xe3 as u32);
+  let _ = buf_write_byte(exp0, 1 as u32, 0xb0 as u32);
+  let _ = buf_write_byte(exp0, 2 as u32, 0xc4 as u32);
+  let _ = buf_write_byte(exp0, 3 as u32, 0x42 as u32);
+  let _ = buf_write_byte(exp0, 4 as u32, 0x98 as u32);
+  let _ = buf_write_byte(exp0, 5 as u32, 0xfc as u32);
+  let _ = buf_write_byte(exp0, 6 as u32, 0x1c as u32);
+  let _ = buf_write_byte(exp0, 7 as u32, 0x14 as u32);
+  let _ = buf_write_byte(exp0, 8 as u32, 0x9a as u32);
+  let _ = buf_write_byte(exp0, 9 as u32, 0xfb as u32);
+  let _ = buf_write_byte(exp0, 10 as u32, 0xf4 as u32);
+  let _ = buf_write_byte(exp0, 11 as u32, 0xc8 as u32);
+  let _ = buf_write_byte(exp0, 12 as u32, 0x99 as u32);
+  let _ = buf_write_byte(exp0, 13 as u32, 0x6f as u32);
+  let _ = buf_write_byte(exp0, 14 as u32, 0xb9 as u32);
+  let _ = buf_write_byte(exp0, 15 as u32, 0x24 as u32);
+  let _ = buf_write_byte(exp0, 16 as u32, 0x27 as u32);
+  let _ = buf_write_byte(exp0, 17 as u32, 0xae as u32);
+  let _ = buf_write_byte(exp0, 18 as u32, 0x41 as u32);
+  let _ = buf_write_byte(exp0, 19 as u32, 0xe4 as u32);
+  let _ = buf_write_byte(exp0, 20 as u32, 0x64 as u32);
+  let _ = buf_write_byte(exp0, 21 as u32, 0x9b as u32);
+  let _ = buf_write_byte(exp0, 22 as u32, 0x93 as u32);
+  let _ = buf_write_byte(exp0, 23 as u32, 0x4c as u32);
+  let _ = buf_write_byte(exp0, 24 as u32, 0xa4 as u32);
+  let _ = buf_write_byte(exp0, 25 as u32, 0x95 as u32);
+  let _ = buf_write_byte(exp0, 26 as u32, 0x99 as u32);
+  let _ = buf_write_byte(exp0, 27 as u32, 0x1b as u32);
+  let _ = buf_write_byte(exp0, 28 as u32, 0x78 as u32);
+  let _ = buf_write_byte(exp0, 29 as u32, 0x52 as u32);
+  let _ = buf_write_byte(exp0, 30 as u32, 0xb8 as u32);
+  let _ = buf_write_byte(exp0, 31 as u32, 0x55 as u32);
+  if sha256_bytes_equal(out0, exp0, 32) == 0 { ok = 0; }
+
+  let msg1: mut ref i64 = dhruva_alloc_bytes(3);
+  let _ = buf_write_byte(msg1, 0 as u32, 97 as u32);
+  let _ = buf_write_byte(msg1, 1 as u32, 98 as u32);
+  let _ = buf_write_byte(msg1, 2 as u32, 99 as u32);
+  let out1: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = sha256_hash(msg1, 3, out1);
+  let exp1: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(exp1, 0 as u32, 0xba as u32);
+  let _ = buf_write_byte(exp1, 1 as u32, 0x78 as u32);
+  let _ = buf_write_byte(exp1, 2 as u32, 0x16 as u32);
+  let _ = buf_write_byte(exp1, 3 as u32, 0xbf as u32);
+  let _ = buf_write_byte(exp1, 4 as u32, 0x8f as u32);
+  let _ = buf_write_byte(exp1, 5 as u32, 0x01 as u32);
+  let _ = buf_write_byte(exp1, 6 as u32, 0xcf as u32);
+  let _ = buf_write_byte(exp1, 7 as u32, 0xea as u32);
+  let _ = buf_write_byte(exp1, 8 as u32, 0x41 as u32);
+  let _ = buf_write_byte(exp1, 9 as u32, 0x41 as u32);
+  let _ = buf_write_byte(exp1, 10 as u32, 0x40 as u32);
+  let _ = buf_write_byte(exp1, 11 as u32, 0xde as u32);
+  let _ = buf_write_byte(exp1, 12 as u32, 0x5d as u32);
+  let _ = buf_write_byte(exp1, 13 as u32, 0xae as u32);
+  let _ = buf_write_byte(exp1, 14 as u32, 0x22 as u32);
+  let _ = buf_write_byte(exp1, 15 as u32, 0x23 as u32);
+  let _ = buf_write_byte(exp1, 16 as u32, 0xb0 as u32);
+  let _ = buf_write_byte(exp1, 17 as u32, 0x03 as u32);
+  let _ = buf_write_byte(exp1, 18 as u32, 0x61 as u32);
+  let _ = buf_write_byte(exp1, 19 as u32, 0xa3 as u32);
+  let _ = buf_write_byte(exp1, 20 as u32, 0x96 as u32);
+  let _ = buf_write_byte(exp1, 21 as u32, 0x17 as u32);
+  let _ = buf_write_byte(exp1, 22 as u32, 0x7a as u32);
+  let _ = buf_write_byte(exp1, 23 as u32, 0x9c as u32);
+  let _ = buf_write_byte(exp1, 24 as u32, 0xb4 as u32);
+  let _ = buf_write_byte(exp1, 25 as u32, 0x10 as u32);
+  let _ = buf_write_byte(exp1, 26 as u32, 0xff as u32);
+  let _ = buf_write_byte(exp1, 27 as u32, 0x61 as u32);
+  let _ = buf_write_byte(exp1, 28 as u32, 0xf2 as u32);
+  let _ = buf_write_byte(exp1, 29 as u32, 0x00 as u32);
+  let _ = buf_write_byte(exp1, 30 as u32, 0x15 as u32);
+  let _ = buf_write_byte(exp1, 31 as u32, 0xad as u32);
+  if sha256_bytes_equal(out1, exp1, 32) == 0 { ok = 0; }
+
+  let s2: Str = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+  let len2: i64 = str_len_bytes(s2);
+  let msg2: mut ref i64 = dhruva_alloc_bytes(len2);
+  let i2: i64 = 0;
+  while i2 < len2 {
+    let _ = buf_write_byte(msg2, i2 as u32, str_byte_at(s2, i2) as u32);
+    i2 = i2 + 1;
+  }
+  let out2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = sha256_hash(msg2, len2, out2);
+  let exp2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(exp2, 0 as u32, 0x24 as u32);
+  let _ = buf_write_byte(exp2, 1 as u32, 0x8d as u32);
+  let _ = buf_write_byte(exp2, 2 as u32, 0x6a as u32);
+  let _ = buf_write_byte(exp2, 3 as u32, 0x61 as u32);
+  let _ = buf_write_byte(exp2, 4 as u32, 0xd2 as u32);
+  let _ = buf_write_byte(exp2, 5 as u32, 0x06 as u32);
+  let _ = buf_write_byte(exp2, 6 as u32, 0x38 as u32);
+  let _ = buf_write_byte(exp2, 7 as u32, 0xb8 as u32);
+  let _ = buf_write_byte(exp2, 8 as u32, 0xe5 as u32);
+  let _ = buf_write_byte(exp2, 9 as u32, 0xc0 as u32);
+  let _ = buf_write_byte(exp2, 10 as u32, 0x26 as u32);
+  let _ = buf_write_byte(exp2, 11 as u32, 0x93 as u32);
+  let _ = buf_write_byte(exp2, 12 as u32, 0x0c as u32);
+  let _ = buf_write_byte(exp2, 13 as u32, 0x3e as u32);
+  let _ = buf_write_byte(exp2, 14 as u32, 0x60 as u32);
+  let _ = buf_write_byte(exp2, 15 as u32, 0x39 as u32);
+  let _ = buf_write_byte(exp2, 16 as u32, 0xa3 as u32);
+  let _ = buf_write_byte(exp2, 17 as u32, 0x3c as u32);
+  let _ = buf_write_byte(exp2, 18 as u32, 0xe4 as u32);
+  let _ = buf_write_byte(exp2, 19 as u32, 0x59 as u32);
+  let _ = buf_write_byte(exp2, 20 as u32, 0x64 as u32);
+  let _ = buf_write_byte(exp2, 21 as u32, 0xff as u32);
+  let _ = buf_write_byte(exp2, 22 as u32, 0x21 as u32);
+  let _ = buf_write_byte(exp2, 23 as u32, 0x67 as u32);
+  let _ = buf_write_byte(exp2, 24 as u32, 0xf6 as u32);
+  let _ = buf_write_byte(exp2, 25 as u32, 0xec as u32);
+  let _ = buf_write_byte(exp2, 26 as u32, 0xed as u32);
+  let _ = buf_write_byte(exp2, 27 as u32, 0xd4 as u32);
+  let _ = buf_write_byte(exp2, 28 as u32, 0x19 as u32);
+  let _ = buf_write_byte(exp2, 29 as u32, 0xdb as u32);
+  let _ = buf_write_byte(exp2, 30 as u32, 0x06 as u32);
+  let _ = buf_write_byte(exp2, 31 as u32, 0xc1 as u32);
+  if sha256_bytes_equal(out2, exp2, 32) == 0 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: SHA-256 vs 3 NIST/FIPS-180-4 KATs (empty, \"abc\", 2-block)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Early-warning canary for the exact heap-exhaustion bug class this
 // project has now hit twice (once in fs_compact's own per-pass leak,
 // once in round 10's DHCP self-tests tipping total boot-time usage
@@ -9598,6 +9998,9 @@ fn kernel_main() -> i64 {
   let _ = dhcp_renewal_self_test();
   let _ = dhcp_nak_self_test();
   let _ = netif_queue_contention_self_test();
+
+  // Round 41: crypto primitives foundation, hash-function half.
+  let _ = sha256_self_test();
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device
