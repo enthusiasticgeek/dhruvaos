@@ -31,9 +31,11 @@
 /* ---- 1a. Heap: dhruva_alloc_bytes / dhruva_heap_used_bytes ---- */
 
 static int64_t g_heap_used = 0;
+static int64_t g_alloc_count = 0;
 
 int64_t *dhruva_alloc_bytes(int64_t n) {
     g_heap_used += n;
+    g_alloc_count += 1;
     /* calloc, not malloc: the real allocator zeroes new memory (see
      * runtime_stubs.c's dhruva_alloc_bytes), and DharaFS code relies
      * on that for e.g. the continuation-block path-bytes region. */
@@ -42,6 +44,19 @@ int64_t *dhruva_alloc_bytes(int64_t n) {
 
 int64_t dhruva_heap_used_bytes(void) {
     return g_heap_used;
+}
+
+int64_t dhruva_alloc_count_get(void) {
+    return g_alloc_count;
+}
+
+/* Round 51 fault injection: never armed by the host harness (nothing
+ * here tests the real OOM-fatal halt path -- that's round 45's own
+ * standalone bare-metal harness's job, see its own comment). Present
+ * only so the linker resolves the symbol. */
+int64_t dhruva_fault_inject_alloc_arm(int64_t after_n) {
+    (void)after_n;
+    return 0;
 }
 
 /* ---- 1b. Raw buffer accessors -- byte-for-byte match of
@@ -168,6 +183,10 @@ uint32_t dharafs_user_set(uint32_t uid, uint32_t gid) {
 }
 uint32_t dharafs_user_get_uid(void) { return g_uid; }
 uint32_t dharafs_user_get_gid(void) { return g_gid; }
+
+static uint32_t g_commit_count = 0;
+uint32_t dharafs_commit_count_increment(void) { g_commit_count += 1; return g_commit_count; }
+uint32_t dharafs_commit_count_get(void) { return g_commit_count; }
 
 /* ---- 1e. host_virtual_disk_read/write -- the in-memory "SD card"
  * dharafs_block_read/dharafs_block_write's dev==2 branch calls. Sized

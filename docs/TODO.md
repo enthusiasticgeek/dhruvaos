@@ -896,19 +896,40 @@ ones.
   Don't start building either without deciding which model this is
   actually demonstrating.
 
-- **Fault injection framework** (dev-build-only: forced allocation
-  failure, forced FS write latency, IRQ bursts, forced retransmission)
-  — `[M, ~1-2 rounds]`
-  Directly useful for THIS session's own hardening work — round 45's
-  new `dhruva_alloc_bytes` OOM-fatal path and `test/host_harness/` have
-  no way to exercise "what happens when allocation genuinely fails
-  mid-boot on real hardware" today, only via the host harness's
-  synthetic constructions. A `dhruva fault inject alloc --after N`
-  style hook (fail the Nth call to `dhruva_alloc_bytes` instead of the
-  256KB-exhaustion path) would let the *existing* boot self-test
-  battery exercise real OOM-fatal handling under QEMU, not just the
-  host harness's assertion-based coverage. Worth prioritizing above
-  its brainstorm-doc ranking for that reason alone.
+- **Fault injection framework** — `[M, ~1-2 rounds — allocation-failure
+  half DONE, round 51; FS write latency/IRQ bursts/forced
+  retransmission not started]`
+  `dhruva_fault_inject_alloc_arm(after_n)` + shell `fault alloc <n>`:
+  arms a countdown, and the Nth subsequent `dhruva_alloc_bytes` call
+  fails via the real `dhruva_oom_fatal` halt regardless of whether
+  genuine heap space remains — exactly the "exercise the OOM-fatal
+  path under QEMU, not just the host harness's synthetic
+  constructions" goal this item was written for.
+
+  **Found a second real bug this way, not just exercised the first
+  one**: live-testing this feature (arming a fault, watching what
+  actually happened) revealed `dhruva_oom_fatal`'s own "Halting"
+  didn't actually halt the SYSTEM — only the one calling task. Every
+  caller reached it with interrupts already re-enabled (`dhruva_alloc_
+  bytes` restored its saved CPSR before calling in), so the scheduler's
+  timer tick kept firing and every OTHER task kept running normally,
+  directly contradicting the documented "unrecoverable, whole-system
+  halt" intent from round 45 and the same convention `boot/rpi1/
+  vectors.S`'s `fault_data_abort`/`fault_prefetch_abort` correctly
+  follow (ARM's own exception entry auto-disables IRQ for those; nothing
+  re-enables it in either handler). Fixed by disabling IRQ explicitly
+  and unconditionally at the top of `dhruva_oom_fatal` itself, so it's
+  safe by construction regardless of caller state, not by caller
+  discipline. This is exactly the kind of bug only live behavioral
+  testing catches — code review alone would have seen a `while(1)`
+  and reasonably assumed "halted."
+
+  Also added two simple, real event counters wired into `diagnose`
+  (`dhruva_alloc_count_get`, `dharafs_commit_count_get`) — genuinely
+  useful and cheap, but NOT the full "context switches, IRQ rate,
+  mutex acquisitions" list from the original brainstorm doc, which
+  needs touching the scheduler/interrupt assembly (materially larger
+  scope, still open, see the "self-observing kernel" item above).
 
 - **"Why is my task late?" query + determinism-certificate report** —
   `[L, depends on the deadline model + event ring buffer above, not

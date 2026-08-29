@@ -101,6 +101,23 @@ void exit(int code) {
 #define DHRUVA_HEAP_BYTES (256 * 1024)
 static unsigned char dhruva_heap[DHRUVA_HEAP_BYTES];
 static unsigned long dhruva_heap_used = 0;
+/* Round 51: total number of dhruva_alloc_bytes calls so far (distinct
+ * from dhruva_heap_used, which tracks BYTES) -- a cheap, always-
+ * available "how many permanent allocations has this boot made"
+ * counter for kernel_main.vani's `diagnose` command. */
+static unsigned long dhruva_alloc_count = 0;
+/* Round 51: fault-injection countdown for exercising the OOM-fatal
+ * path (dhruva_oom_fatal below) deterministically under QEMU, rather
+ * than only via the host harness's synthetic constructions (see
+ * test/host_harness/) or genuine, hard-to-reproduce exhaustion. 0
+ * means disarmed (the default -- production behavior is completely
+ * unaffected unless a caller explicitly arms this). When armed to N,
+ * the Nth subsequent dhruva_alloc_bytes call fails via dhruva_oom_
+ * fatal regardless of whether real heap space remains -- a real,
+ * unrecoverable halt, same as genuine exhaustion, deliberately not a
+ * softer "return null" simulation, since round 45's whole point was
+ * that a softer failure mode doesn't exist for this allocator. */
+static unsigned long dhruva_fault_inject_alloc_countdown = 0;
 
 /* BUG (Phase 4 task #9, found via a real crash-and-reboot loop only
  * visible under an event-driven interactive test, not a sleep-timed
@@ -204,37 +221,108 @@ static void dhruva_oom_put_u64(unsigned long long v) {
     }
 }
 
-static void dhruva_oom_fatal(unsigned long requested, unsigned long used) {
+static void dhruva_oom_fatal(unsigned long requested, unsigned long used, int injected) {
+    /* BUG (found via round 51's own fault-injection testing -- live
+     * QEMU verification, not just code review, is what actually
+     * caught this): every caller reaches this function with interrupts
+     * already re-enabled (dhruva_alloc_bytes restores its saved CPSR
+     * before calling in), so the `while(1)` below only ever froze the
+     * ONE calling task -- the scheduler's own timer tick kept firing,
+     * and every OTHER task kept running normally, completely
+     * contradicting this function's own "Halting" diagnostic text and
+     * round 45's original documented intent (an unrecoverable,
+     * whole-system halt, matching boot/rpi1/vectors.S's fault_data_
+     * abort/fault_prefetch_abort -- both of which halt correctly only
+     * because ARM's own exception entry automatically disables IRQ,
+     * and neither handler ever re-enables it). Disabling IRQ here
+     * explicitly, unconditionally, regardless of what state a future
+     * caller leaves CPSR in, makes this function safe by construction
+     * rather than by caller discipline. */
+    __asm__ volatile ("cpsid i" ::: "memory");
     dhruva_oom_puts("\nFATAL: dhruva_alloc_bytes out of memory -- requested ");
     dhruva_oom_put_u64((unsigned long long)requested);
     dhruva_oom_puts(" bytes, ");
     dhruva_oom_put_u64((unsigned long long)used);
     dhruva_oom_puts(" of ");
     dhruva_oom_put_u64((unsigned long long)DHRUVA_HEAP_BYTES);
-    dhruva_oom_puts(" already used. Halting -- heap_usage_self_test's own"
-                     " boot-time headroom check should have caught this"
-                     " before it ever reached here; if it fires here"
-                     " instead, some runtime code path is allocating far"
-                     " more than boot-time self-tests account for.\n");
+    if (injected) {
+        dhruva_oom_puts(" already used. This is a DELIBERATELY INJECTED"
+                         " fault (dhruva_fault_inject_alloc_arm), not"
+                         " genuine exhaustion -- real heap space may"
+                         " still remain. Halting anyway, exactly as a"
+                         " real exhaustion would, to exercise this"
+                         " path's actual behavior.\n");
+    } else {
+        dhruva_oom_puts(" already used. Halting -- heap_usage_self_test's own"
+                         " boot-time headroom check should have caught this"
+                         " before it ever reached here; if it fires here"
+                         " instead, some runtime code path is allocating far"
+                         " more than boot-time self-tests account for.\n");
+    }
     while (1) {
         /* halt -- there is no safe way to continue with a request this
          * function could not satisfy */
     }
 }
 
+/* Round 51: arms/disarms the fault-injection countdown above. after_n
+ * <= 0 disarms it. Not itself gated behind any "dev build only" flag
+ * -- this project has no compile-time feature-flag mechanism (see
+ * docs/TODO.md's own note on that), and the countdown defaults to 0
+ * (disarmed), so production behavior is unaffected unless a caller
+ * explicitly calls this. */
+long long dhruva_fault_inject_alloc_arm(long long after_n) {
+    /* Returns a real 64-bit value end to end, matching vani's own
+     * `-> i64` extern declaration -- see dhruva_heap_used_bytes's own
+     * comment a few lines below for the exact ABI mismatch bug class
+     * (a 32-bit `void`/`long` C return silently truncating a real i64
+     * caller expects in the r0:r1 register pair) this avoids repeating. */
+    dhruva_fault_inject_alloc_countdown = (after_n > 0) ? (unsigned long)after_n : 0;
+    return 0;
+}
+
+long long dhruva_alloc_count_get(void) {
+    return (long long)dhruva_alloc_count;
+}
+
 void *dhruva_alloc_bytes(long n) {
     unsigned long need = (unsigned long)n;
     unsigned long saved_cpsr;
     __asm__ volatile ("mrs %0, cpsr\n\tcpsid i" : "=r"(saved_cpsr) :: "memory");
+
+    /* Round 51 fault injection -- checked BEFORE the real exhaustion
+     * check below, so it can fire deterministically even when genuine
+     * heap space remains. Disarmed (0) by default; see dhruva_fault_
+     * inject_alloc_arm's own comment. */
+    int injected_fault = 0;
+    if (dhruva_fault_inject_alloc_countdown > 0) {
+        dhruva_fault_inject_alloc_countdown = dhruva_fault_inject_alloc_countdown - 1;
+        if (dhruva_fault_inject_alloc_countdown == 0) {
+            injected_fault = 1;
+        }
+    }
+    if (injected_fault) {
+        /* Deliberately do NOT restore saved_cpsr here -- IRQ stays
+         * disabled (already masked by the cpsid i at function entry)
+         * all the way into dhruva_oom_fatal's own halt loop, with no
+         * gap where a timer tick could sneak in a task switch before
+         * its own belt-and-suspenders cpsid i runs. See dhruva_oom_
+         * fatal's own comment for the bug this fixes. */
+        unsigned long used_at_failure = dhruva_heap_used;
+        dhruva_oom_fatal(need, used_at_failure, 1);
+        /* unreachable -- dhruva_oom_fatal never returns */
+    }
+
     unsigned long aligned_used = (dhruva_heap_used + 7UL) & ~7UL;
     if (aligned_used + need > DHRUVA_HEAP_BYTES) {
+        /* Same reasoning as the injected-fault branch above. */
         unsigned long used_at_failure = dhruva_heap_used;
-        __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
-        dhruva_oom_fatal(need, used_at_failure);
+        dhruva_oom_fatal(need, used_at_failure, 0);
         /* unreachable -- dhruva_oom_fatal never returns */
     }
     unsigned char *p = dhruva_heap + aligned_used;
     dhruva_heap_used = aligned_used + need;
+    dhruva_alloc_count = dhruva_alloc_count + 1;
     __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
     unsigned long i = 0;
     while (i < need) {

@@ -66,6 +66,15 @@ dharafs_block_dev:
                      * actually works through the same abstraction,
                      * then restores it before any real FS operation
                      * runs. */
+dharafs_commit_count:
+    .word 0        /* Round 51: total number of successful dharafs_
+                     * block_write calls this boot -- a cheap, always-
+                     * available "how much has DharaFS actually
+                     * written" counter for kernel_main.vani's
+                     * `diagnose` command. Incremented from vani code
+                     * (dharafs_block_write) via dharafs_commit_count_
+                     * increment below, not automatically -- this file
+                     * has no way to hook the write call itself. */
 
 .section ".text"
 
@@ -134,5 +143,20 @@ dharafs_user_get_uid:
 .global dharafs_user_get_gid
 dharafs_user_get_gid:
     ldr r0, =dharafs_current_gid
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_commit_count_increment
+dharafs_commit_count_increment:
+    ldr r0, =dharafs_commit_count
+    ldr r1, [r0]
+    add r1, r1, #1
+    str r1, [r0]
+    mov r0, r1
+    bx lr
+
+.global dharafs_commit_count_get
+dharafs_commit_count_get:
+    ldr r0, =dharafs_commit_count
     ldr r0, [r0]
     bx lr

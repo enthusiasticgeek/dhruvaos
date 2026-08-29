@@ -31,6 +31,11 @@ intent "Dhruva Phase 0-2 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model 
 // risk class the earlier plain-i64 version had to work around by hand.
 extern "C" fn dhruva_alloc_bytes(n: i64) -> mut ref i64;
 extern "C" fn dhruva_heap_used_bytes() -> i64;
+// Round 51: total dhruva_alloc_bytes call count (distinct from bytes
+// used above) + fault-injection arming -- see runtime_stubs.c's own
+// comment on dhruva_fault_inject_alloc_arm.
+extern "C" fn dhruva_alloc_count_get() -> i64;
+extern "C" fn dhruva_fault_inject_alloc_arm(after_n: i64) -> i64;
 
 // Shared, persistent scratch buffers -- see scratch_state.S's own doc
 // comment for why these exist (dharafs_compact wasn't the only place a
@@ -314,6 +319,12 @@ extern "C" fn host_virtual_disk_write(block_num: i64, buf: mut ref i64) -> i64;
 // see dharafs_state.S's own comment on dharafs_current_uid/dharafs_current_gid.
 extern "C" fn dharafs_user_set(uid: u32, gid: u32) -> u32;
 extern "C" fn dharafs_user_get_uid() -> u32;
+// Round 51: total successful dharafs_block_write count -- u32, not
+// i64, matching every other assembly-backed state accessor in this
+// file (a real AAPCS pitfall for a 32-bit ARM target, not a style
+// choice -- see boot/dharafs_buf.S's own file-level comment).
+extern "C" fn dharafs_commit_count_increment() -> u32;
+extern "C" fn dharafs_commit_count_get() -> u32;
 extern "C" fn dharafs_user_get_gid() -> u32;
 
 // Phase 4 -- boot/shell_state.S: the interactive shell's line buffer,
@@ -1174,13 +1185,23 @@ fn dharafs_block_read(block_num: i64, buf: mut ref i64) -> i64 {
 }
 
 fn dharafs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
-  if dharafs_state_get_block_dev() == (2 as u32) {
-    return host_virtual_disk_write(block_num, buf);
+  let status: i64 = if dharafs_state_get_block_dev() == (2 as u32) {
+    host_virtual_disk_write(block_num, buf)
+  } else {
+    if dharafs_state_get_block_dev() == (1 as u32) {
+      usb_msd_write10(dwc2_downstream_addr(), block_num as u32, buf)
+    } else {
+      sdhost_write_block(block_num, buf)
+    }
+  };
+  // Round 51: counts every successful commit, across all three
+  // backends, for kernel_main.vani's `diagnose` command -- the one
+  // choke point every real FS write already passes through regardless
+  // of which backend is active.
+  if status == 0 {
+    let _ = dharafs_commit_count_increment();
   }
-  if dharafs_state_get_block_dev() == (1 as u32) {
-    return usb_msd_write10(dwc2_downstream_addr(), block_num as u32, buf);
-  }
-  return sdhost_write_block(block_num, buf);
+  return status;
 }
 
 // DharaFS ("dhara" - धर, Sanskrit for "bearer/holder", the thing that
@@ -10986,6 +11007,56 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts(", ");
     let _ = uart_put_i64(governor_history_get3());
     let _ = uart_puts(")\n");
+
+    // Round 51: the first two real event counters -- see docs/TODO.md
+    // for why context-switch/IRQ/mutex counters aren't here yet
+    // (touching the scheduler/interrupt assembly is materially larger
+    // scope, deliberately deferred rather than half-done here).
+    let _ = uart_puts("  allocations: ");
+    let _ = uart_put_i64(dhruva_alloc_count_get());
+    let _ = uart_puts(" total (never-freed bump allocator)\n");
+    let _ = uart_puts("  FS commits: ");
+    let _ = uart_put_i64(dharafs_commit_count_get() as i64);
+    let _ = uart_puts(" total (successful dharafs_block_write calls)\n");
+    return 0;
+  }
+
+  // Round 51: deliberately triggers the SAME real, unrecoverable
+  // dhruva_alloc_bytes OOM-fatal halt (runtime_stubs.c) that a genuine
+  // heap exhaustion would -- see dhruva_fault_inject_alloc_arm's own
+  // comment. Arms a countdown; the Nth subsequent allocation anywhere
+  // in the system (not just future shell commands) halts. There is
+  // deliberately no confirmation prompt and no way to disarm it once
+  // the countdown reaches zero -- that IS the real failure mode this
+  // exists to exercise, matching round 45's own "no OOM, no
+  // surprises" mandate empirically under QEMU rather than only via
+  // the host harness's synthetic constructions.
+  if shell_word_matches(line_buf, 0, cmd_end, "fault") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: fault alloc <n>  (halts on the Nth allocation from now)\n");
+      return 0;
+    }
+    let sub_start: i64 = cmd_end + 1;
+    let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+    if shell_word_matches(line_buf, sub_start, sub_end, "alloc") == 0 {
+      let _ = uart_puts("usage: fault alloc <n>  (halts on the Nth allocation from now)\n");
+      return 0;
+    }
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: fault alloc <n>  (halts on the Nth allocation from now)\n");
+      return 0;
+    }
+    let n_start: i64 = sub_end + 1;
+    let n_end: i64 = shell_find_space(line_buf, n_start, line_len);
+    let n: i64 = shell_parse_decimal(line_buf, n_start, n_end);
+    if n <= 0 {
+      let _ = uart_puts("usage: fault alloc <n>  (n must be a positive integer)\n");
+      return 0;
+    }
+    let _ = dhruva_fault_inject_alloc_arm(n);
+    let _ = uart_puts("armed: will halt with a FATAL diagnostic after ");
+    let _ = uart_put_i64(n);
+    let _ = uart_puts(" more allocation(s).\n");
     return 0;
   }
 
@@ -11242,7 +11313,7 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/catv/rm/mv/write/writev/log/attr/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
+  let _ = uart_puts("unknown command (try ls/cat/catv/rm/mv/write/writev/log/attr/eval/ping/ifconfig/netstat/diagnose/fault/tcpecho/udpecho/tcprtx)\n");
   return 0;
 }
 
