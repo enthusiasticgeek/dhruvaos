@@ -49,6 +49,10 @@ int64_t fn_dharafs_read(const char *path, int64_t *out_buf);
 int64_t fn_dharafs_delete_raw(int64_t *path_buf, int64_t path_len);
 int64_t fn_dharafs_rename_raw(int64_t *old_path_buf, int64_t old_path_len, int64_t *new_path_buf, int64_t new_path_len);
 int64_t fn_dharafs_rename_raw_checked(int64_t *old_path_buf, int64_t old_path_len, int64_t *new_path_buf, int64_t new_path_len, uint32_t req_uid, uint32_t req_gid);
+int64_t fn_dharafs_verified_companion_path_raw(int64_t *path_buf, int64_t path_len, int64_t *out_buf);
+int64_t fn_dharafs_write_verified_raw(int64_t *path_buf, int64_t path_len, int64_t *data_buf, int64_t data_len, uint32_t owner_uid, uint32_t owner_gid, uint32_t mode);
+int64_t fn_dharafs_write_verified_checked(int64_t *path_buf, int64_t path_len, int64_t *data_buf, int64_t data_len, uint32_t req_uid, uint32_t req_gid);
+int64_t fn_dharafs_read_verified_checked(int64_t *path_buf, int64_t path_len, int64_t *out_buf, uint32_t req_uid, uint32_t req_gid);
 int64_t fn_dharafs_delete(const char *path);
 int64_t fn_dharafs_dirlist_seen_contains(int64_t *seen, int64_t count, int64_t *path_buf, int64_t seg_start, int64_t seg_len);
 int64_t fn_dharafs_dirlist_segment_equals(int64_t *query_buf, int64_t query_len, int64_t *path_buf, int64_t seg_start, int64_t seg_len);
@@ -468,6 +472,71 @@ static void test_self_referential_continuation_chain(void) {
           "never reaches the loop's only exit condition");
 }
 
+/* ================= Verified (SHA-256 companion digest) I/O (round 48) ================= */
+
+extern uint32_t dharafs_state_get_next_block(void);
+extern uint32_t dharafs_state_get_next_seq(void);
+
+static void test_verified_integrity(void) {
+    reset_fs();
+    int64_t *path = mkbuf("/secure", 7);
+    int64_t *data = mkbuf("top-secret-config", 17);
+    CHECK(fn_dharafs_write_verified_checked(path, 7, data, 17, 0, 0) == 0, "verified: writev succeeds");
+
+    int64_t *out = dhruva_alloc_bytes(17);
+    int64_t rd = fn_dharafs_read_verified_checked(path, 7, out, 0, 0);
+    CHECK(rd == 17, "verified: readv returns correct length when digest matches");
+    CHECK(memcmp(out, "top-secret-config", 17) == 0, "verified: readv returns correct bytes when digest matches");
+
+    int64_t *companion = dhruva_alloc_bytes(32);
+    int64_t companion_len = fn_dharafs_verified_companion_path_raw(path, 7, companion);
+    CHECK(companion_len == 14, "verified: companion path is path + \".sha256\" (14 bytes)");
+    CHECK(memcmp(companion, "/secure.sha256", 14) == 0, "verified: companion path bytes are correct");
+
+    int64_t *out2 = dhruva_alloc_bytes(17);
+    CHECK(fn_dharafs_read_raw(path, 7, out2) == 17, "verified: plain dharafs_read_raw still works on a verified file");
+
+    /* Verification is opt-in per path: a plain (non-verified) write
+     * has no companion digest, and readv on it must not error. */
+    int64_t *plain_path = mkbuf("/plain", 6);
+    int64_t *plain_data = mkbuf("nothing-special", 15);
+    CHECK(fn_dharafs_append_raw(plain_path, 6, plain_data, 15, 0, 0, 0644) == 0, "verified: plain (non-verified) write succeeds");
+    int64_t *out3 = dhruva_alloc_bytes(15);
+    CHECK(fn_dharafs_read_verified_checked(plain_path, 6, out3, 0, 0) == 15, "verified: readv on a file with no companion digest just returns plain data length");
+
+    /* Path length boundary: 25 bytes + 7-byte suffix fits exactly in
+     * the 32-byte path cap; 26 does not. */
+    char path25[25];
+    memset(path25, 'p', 25);
+    int64_t *out4 = dhruva_alloc_bytes(32);
+    CHECK(fn_dharafs_verified_companion_path_raw(mkbuf(path25, 25), 25, out4) == 32, "verified: 25-byte path fits exactly a companion digest path (32 bytes)");
+    char path26[26];
+    memset(path26, 'q', 26);
+    CHECK(fn_dharafs_verified_companion_path_raw(mkbuf(path26, 26), 26, out4) == -1, "verified: 26-byte path has no room for a companion digest");
+    CHECK(fn_dharafs_write_verified_checked(mkbuf(path26, 26), 26, data, 17, 0, 0) == -1, "verified: writev on a 26-byte path is rejected (-1), not silently written without a digest");
+
+    /* Tamper detection: directly corrupt the companion digest RECORD
+     * on the virtual disk (simulating an attacker or corruption event
+     * touching the digest sidecar independently of the data it
+     * protects) -- readv must detect the mismatch, not trust it. */
+    reset_fs();
+    int64_t *path2 = mkbuf("/firmware", 9);
+    int64_t *data2 = mkbuf("real-firmware-bytes", 19);
+    uint32_t block_before = dharafs_state_get_next_block();
+    uint32_t seq_before = dharafs_state_get_next_seq();
+    CHECK(fn_dharafs_write_verified_checked(path2, 9, data2, 19, 0, 0) == 0, "tamper: writev succeeds");
+
+    char wrong_digest[32];
+    memset(wrong_digest, 0xAB, 32);
+    write_raw_record(block_before + 1, seq_before + 2, "/firmware.sha256", 16, 32, 0, wrong_digest, 32, /*corrupt_checksum=*/0);
+    extern uint32_t dharafs_state_set(uint32_t, uint32_t);
+    dharafs_state_set(block_before + 2, seq_before + 3);
+
+    int64_t *out5 = dhruva_alloc_bytes(19);
+    int64_t rd2 = fn_dharafs_read_verified_checked(path2, 9, out5, 0, 0);
+    CHECK(rd2 == -3, "tamper: readv detects a companion digest that doesn't match the data");
+}
+
 /* ================= Crypto / bignum smoke tests through the real
  * on-disk-adjacent entry points (byte-for-byte correctness matters
  * here just as much as for DharaFS, since these back the security-
@@ -578,6 +647,7 @@ int main(void) {
     test_corrupted_checksum_skipped();
     test_oversized_data_len_field_rejected();
     test_self_referential_continuation_chain();
+    test_verified_integrity();
     test_sha256_boundaries();
     test_chacha20_boundaries();
     test_bignum_boundaries();

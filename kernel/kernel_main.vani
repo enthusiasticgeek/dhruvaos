@@ -2285,6 +2285,127 @@ fn dharafs_rename(old_path: Str, new_path: Str) -> i64 {
   return dharafs_rename_raw(old_buf, old_len, new_buf, new_len);
 }
 
+// Round 48: opt-in stronger integrity for security-critical paths
+// (docs/TODO.md's own backlog item). buf_checksum's rotate-mix (32
+// bits, not collision-resistant) already catches torn/partial writes
+// -- what it can't meaningfully catch is deliberate tampering. Round
+// 41's sha256_hash already exists; this wires it in WITHOUT touching
+// the 512-byte on-disk record format at all (every existing call site
+// hardcodes that record's field offsets -- dharafs_append_raw/
+// dharafs_read_raw/dharafs_compact/dharafs_find_latest_block_raw/
+// dharafs_list_dir_raw/dharafs_init/dharafs_stat_raw, plus the host
+// harness's own write_raw_record helper -- changing it to make room
+// for a stored digest would be a real, invasive format migration for
+// a feature that's opt-in and has no current PKI/secure-boot consumer
+// yet to justify that cost). Instead, the digest for `path` lives in
+// its own ordinary DharaFS file at `path` + ".sha256" -- a companion
+// record using the SAME existing primitives, no format change.
+//
+// A path already at the 32-byte cap has no room left for a 7-byte
+// ".sha256" companion path -- dharafs_verified_companion_path_raw
+// reports that explicitly (-1) rather than silently truncating or
+// colliding with an unrelated path.
+fn dharafs_verified_companion_path_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i64 {
+  if (path_len + 7) > 32 {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < path_len {
+    let b: u32 = buf_read_byte(path_buf, i as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  let _ = buf_write_byte(out_buf, (path_len + 0) as u32, 46 as u32);  // '.'
+  let _ = buf_write_byte(out_buf, (path_len + 1) as u32, 115 as u32); // 's'
+  let _ = buf_write_byte(out_buf, (path_len + 2) as u32, 104 as u32); // 'h'
+  let _ = buf_write_byte(out_buf, (path_len + 3) as u32, 97 as u32);  // 'a'
+  let _ = buf_write_byte(out_buf, (path_len + 4) as u32, 50 as u32);  // '2'
+  let _ = buf_write_byte(out_buf, (path_len + 5) as u32, 53 as u32);  // '5'
+  let _ = buf_write_byte(out_buf, (path_len + 6) as u32, 54 as u32);  // '6'
+  return path_len + 7;
+}
+
+// Writes `path` normally, then a SHA-256 digest of its data under the
+// companion path above. Both writes use the given owner/mode -- the
+// digest record is never independently owner/permission-managed, it
+// always mirrors whatever the data file it protects has.
+fn dharafs_write_verified_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
+  let companion_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let companion_len: i64 = dharafs_verified_companion_path_raw(path_buf, path_len, companion_buf);
+  if companion_len < 0 {
+    // -1 is otherwise unused by the write path (dharafs_write_raw_checked's
+    // own convention has no "not found" case -- any path is writable),
+    // so it's free to mean "path too long for a companion digest" here
+    // specifically, distinct from a generic write failure (1).
+    return 0 - 1;
+  }
+  let write_status: i64 = dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+  if write_status != 0 {
+    return write_status;
+  }
+  let digest: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = sha256_hash(data_buf, data_len, digest);
+  return dharafs_append_raw(companion_buf, companion_len, digest, 32, owner_uid, owner_gid, mode);
+}
+
+// Permission-enforcing entry point -- IDENTICAL preserve-on-overwrite
+// and write-permission logic to dharafs_write_raw_checked, just also
+// carrying the digest write through dharafs_write_verified_raw above.
+fn dharafs_write_verified_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { req_uid };
+  let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { req_gid };
+  let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { dharafs_default_mode() };
+  if stat_status == 0 {
+    let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
+    if allowed == 0 {
+      return 0 - 2;
+    }
+  }
+  return dharafs_write_verified_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+// Reads `path` (permission-checked, same as dharafs_read_raw_checked)
+// then, if a companion digest was ever written for it, recomputes
+// SHA-256 over the data just read and compares. Return convention
+// extends dharafs_read_raw_checked's own (-1 not found, -2 permission
+// denied, else data length) with one more case: -3 means the read
+// itself succeeded but the companion digest exists and does NOT
+// match -- tamper or corruption beyond what the per-block checksum
+// alone catches. No companion digest at all is NOT an error --
+// verification is opt-in per path, so that case just returns the
+// plain data length, same as an unverified read.
+fn dharafs_read_verified_checked(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64, req_uid: u32, req_gid: u32) -> i64 {
+  let data_len: i64 = dharafs_read_raw_checked(path_buf, path_len, out_buf, req_uid, req_gid);
+  if data_len < 0 {
+    return data_len;
+  }
+  let companion_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let companion_len: i64 = dharafs_verified_companion_path_raw(path_buf, path_len, companion_buf);
+  if companion_len < 0 {
+    return data_len;
+  }
+  let stored_digest: mut ref i64 = dhruva_alloc_bytes(32);
+  // Unchecked read of the companion digest -- the caller already
+  // passed the real permission check on the DATA file above, and
+  // nothing in this project ever gives the sidecar digest record a
+  // different owner/mode than the file it protects (see dharafs_
+  // write_verified_raw), so a separate permission grant on it would
+  // only make verification silently fail closed for no real reason.
+  let digest_len: i64 = dharafs_read_raw(companion_buf, companion_len, stored_digest);
+  if digest_len != 32 {
+    return data_len; // no companion digest was ever written for this path
+  }
+  let computed_digest: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = sha256_hash(out_buf, data_len, computed_digest);
+  let matches: i64 = sha256_bytes_equal(stored_digest, computed_digest, 32);
+  if matches == 0 {
+    return 0 - 3;
+  }
+  return data_len;
+}
+
 // Round 39's live milestone: write a payload well past the 448-byte
 // per-block cap (Round 42 shrank it from 460 to make room for
 // owner_uid/owner_gid/mode), confirm it round-trips byte-for-byte
@@ -9630,6 +9751,47 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Round 48: same as `cat` above, but also verifies a companion
+  // SHA-256 digest at <path>.sha256 if `writev` ever wrote one for
+  // this path (see dharafs_read_verified_checked's own comment --
+  // verification is opt-in per path, not mandatory for every read).
+  if shell_word_matches(line_buf, 0, cmd_end, "catv") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: catv <path>\n");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    let path_len: i64 = path_end - path_start;
+    if path_len == 0 {
+      let _ = uart_puts("usage: catv <path>\n");
+      return 0;
+    }
+    if path_len > 32 {
+      let _ = uart_puts("error: path too long\n");
+      return 0;
+    }
+    let path_buf: mut ref i64 = dharafs_path_scratch_get();
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    let out_buf: mut ref i64 = dharafs_data_scratch_get();
+    let data_len: i64 = dharafs_read_verified_checked(path_buf, path_len, out_buf, dharafs_user_get_uid(), dharafs_user_get_gid());
+    if data_len == (0 - 2) {
+      let _ = uart_puts("permission denied\n");
+    } else {
+      if data_len == (0 - 3) {
+        let _ = uart_puts("INTEGRITY FAILURE: data does not match stored digest\n");
+      } else {
+        if data_len < 0 {
+          let _ = uart_puts("(not found)\n");
+        } else {
+          let _ = dharafs_print_data(out_buf, data_len);
+          let _ = uart_puts("\n");
+        }
+      }
+    }
+    return 0;
+  }
+
   if shell_word_matches(line_buf, 0, cmd_end, "rm") == 1 {
     if cmd_end >= line_len {
       let _ = uart_puts("usage: rm <path>\n");
@@ -9769,6 +9931,57 @@ fn shell_dispatch() -> i64 {
         let _ = uart_puts("permission denied\n");
       } else {
         let _ = uart_puts("error\n");
+      }
+    }
+    return 0;
+  }
+
+  // Round 48: same parsing/limits as `write` above, but also stores a
+  // SHA-256 digest at <path>.sha256 (dharafs_write_verified_raw) --
+  // see that function's own comment for why this is a companion
+  // record rather than a change to the on-disk block format.
+  if shell_word_matches(line_buf, 0, cmd_end, "writev") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: writev <path> <text>\n");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    if path_end >= line_len {
+      let _ = uart_puts("usage: writev <path> <text>\n");
+      return 0;
+    }
+    let path_len: i64 = path_end - path_start;
+    if path_len == 0 {
+      let _ = uart_puts("usage: writev <path> <text>\n");
+      return 0;
+    }
+    if path_len > 32 {
+      let _ = uart_puts("error: path too long\n");
+      return 0;
+    }
+    let text_start: i64 = path_end + 1;
+    let text_len: i64 = line_len - text_start;
+    if text_len > (dharafs_file_max_len() as i64) {
+      let _ = uart_puts("error: text too long\n");
+      return 0;
+    }
+    let path_buf: mut ref i64 = dharafs_path_scratch_get();
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    let data_buf: mut ref i64 = dharafs_data_scratch_get();
+    let _ = shell_copy_range(line_buf, text_start, line_len, data_buf);
+    let status: i64 = dharafs_write_verified_checked(path_buf, path_len, data_buf, text_len, dharafs_user_get_uid(), dharafs_user_get_gid());
+    if status == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      if status == (0 - 2) {
+        let _ = uart_puts("permission denied\n");
+      } else {
+        if status == (0 - 1) {
+          let _ = uart_puts("error: path too long for a companion digest (max 25 bytes)\n");
+        } else {
+          let _ = uart_puts("error\n");
+        }
       }
     }
     return 0;
@@ -10452,7 +10665,7 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/mv/write/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
+  let _ = uart_puts("unknown command (try ls/cat/catv/rm/mv/write/writev/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
   return 0;
 }
 
