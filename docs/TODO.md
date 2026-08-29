@@ -11,17 +11,30 @@ not calendar time.
 
 See `docs/PORTING.md` for the full writeup this backlog references.
 
-- **Block-device abstraction for the FS layer** — `[S, ~1 round]`
-  Replace the ~5 direct `sdhost_read_block`/`sdhost_write_block` call
-  sites in `fs_init`/`fs_append_raw`/`fs_find_latest_block_raw`/
-  `fs_compact`/`fs_read_raw` with calls through a small function-
-  pointer device interface, SDHOST becoming the first backend behind
-  it. No new hardware needed to build or verify — fully covered by
-  the existing self-test + `phase4_milestone.py` + `power_yank.py`
-  battery on the current Pi 1/QEMU target. Low risk: single backend,
-  same behavior, just indirected.
-  Blocks: any future non-SDHOST storage backend (EMMC2, NVMe, a
-  USB-mass-storage-backed block device).
+- **Block-device abstraction for the FS layer** — `[S, ~1 round —
+  DONE, round 36]`
+  Replaced the FS layer's 8 real direct `sdhost_read_block`/
+  `sdhost_write_block` call sites (`fs_init`/`fs_append_raw`/`fs_find_
+  latest_block_raw`/`fs_compact`/`fs_read_raw` — more than the
+  original ~5 estimate once actually counted; the SD driver's own
+  8-block self-test sweep deliberately still calls SDHOST directly,
+  since its whole point is testing that peripheral specifically) with
+  calls through `fs_block_read`/`fs_block_write`. Not a function-
+  pointer/vtable interface as originally envisioned here — no evidence
+  vani supports storing a callable function value persistently across
+  calls the way this project's own `extern "C"` state-accessor pattern
+  needs, so a simple `fs_state`-backed integer selector (0=SDHOST,
+  1=USB mass storage) with an `if`/`else` dispatch was used instead,
+  matching this codebase's own established mutually-exclusive-`if`
+  state-dispatch style elsewhere (`ifconfig`'s DHCP state print,
+  `netstat`'s TCP state names). Same functional outcome, simpler and
+  provably within the language's actual capabilities. SDHOST remains
+  the permanent default (`.bss` zero-init) — zero behavior change for
+  every real FS operation, confirmed by the full existing battery.
+  USB mass storage proved as a genuine second backend through this
+  same abstraction (see the USB mass storage item below).
+  Unblocks: EMMC2 (needs Pi 4 hardware regardless) and NVMe, whenever
+  either is actually built — same abstraction, a new backend behind it.
 
 - **EMMC2 block driver (Pi 4 storage)** — `[M, ~2-3 rounds]`
   New low-level driver for BCM2711's EMMC2 controller, implementing
@@ -51,8 +64,8 @@ the whole build-and-regress loop this project has used every round so
 far. Expect each to span multiple rounds/sessions, same as any
 multi-round item elsewhere in this backlog.
 
-- **USB mass storage class driver** — `[L, ~4-6 rounds — in progress,
-  rounds 33-35 landed real sector I/O, FS integration remains]`
+- **USB mass storage class driver** — `[L, ~4-6 rounds — DONE (rounds
+  33-36); see scope note below on what "done" does and doesn't mean]`
   Today's DWC2 driver does enumeration only (`GET_DESCRIPTOR`,
   `SET_ADDRESS`, `SET_CONFIGURATION`) — "no bulk or interrupt
   transfers, control only" per the driver's own comment. A real
@@ -103,14 +116,36 @@ multi-round item elsewhere in this backlog.
     confirmed it holds the real, persisted pattern — not just an
     in-session round trip, a genuinely durable sector write. `usb-net`
     confirmed still completely unaffected.
-  - Remaining: FS integration via the block-device abstraction below —
-    the actual point of this whole feature. Real sector I/O now works
-    end to end; nothing in the FS layer talks to it yet.
-  Natural integration point once built: the block-device abstraction
-  above — a USB mass-storage device becomes a third backend behind the
-  same interface as SDHOST/EMMC2, not a special case.
-  Depends on: block-device abstraction (above), for the FS-integration
-  half specifically.
+  - Done (round 36): built the block-device abstraction (see that item
+    above) and routed the FS layer's own 8 real `sdhost_read_block`/
+    `write_block` call sites (`fs_init`/`fs_append_raw`/`fs_find_
+    latest_block_raw`/`fs_compact`/`fs_read_raw` — more than the
+    original ~5 estimate once actually counted) through `fs_block_
+    read`/`fs_block_write` instead. SDHOST stays the permanent default
+    (`fs_state`'s new `fs_block_dev` selector defaults to 0 via `.bss`
+    zero-init) — every real FS operation (boot self-tests, shell
+    `ls`/`cat`/`write`, `phase4_milestone.py`, `power_yank.py`'s own
+    tear-sweep) is unaffected, confirmed by the full existing battery
+    staying green unchanged. Then proved USB mass storage genuinely
+    works as a second backend THROUGH the same abstraction (not just
+    via round 35's own raw primitives): `fs_block_dev_self_check`
+    temporarily flips the selector, writes a pattern via `fs_block_
+    write`, reads it back via `fs_block_read`, byte-compares, then
+    restores SDHOST. Independently verified at the host level again
+    (LBA 200 in the backing image holds the real persisted pattern).
+    `usb-net` (no BOT interface, selector never touched) confirmed
+    unaffected.
+    Scope note: this proves the raw block-I/O layer is genuinely
+    backend-agnostic, live-verified both ways. It does NOT mean the OS
+    can boot/operate its whole filesystem from a USB drive yet — that
+    would need selecting the backend before `fs_init()` runs (today
+    always SDHOST) and validating the full self-test/normal-operation
+    battery against a freshly-attached, unformatted USB device, which
+    is a separate, larger step nobody has asked for yet.
+  This closes the USB mass storage driver feature's originally-scoped
+  work (rounds 33-36). Anything past the scope note above (booting
+  from USB, multiple LUNs, etc.) would be new scope, not a remaining
+  piece of this item.
 
 - **TCP retransmission + simultaneous open** — `[M-L, ~3-4 rounds]`
   Today's TCP is "a real, useful, correctly-sequenced happy-path
