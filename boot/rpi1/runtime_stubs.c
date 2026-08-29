@@ -272,3 +272,25 @@ void *dhruva_alloc_bytes(long n) {
 long long dhruva_heap_used_bytes(void) {
     return (long long)dhruva_heap_used;
 }
+
+/* dev==2 block-device backend is host-harness-only (see kernel_main.
+ * vani's own comment on dharafs_block_read/dharafs_block_write and
+ * host_virtual_disk_read/write) -- dharafs_state_get_block_dev() is
+ * never set to 2 anywhere in real bare-metal code, so these two
+ * symbols exist purely to satisfy the linker and should never
+ * actually be called on real hardware. Return -1 (the same "I/O
+ * error" convention sdhost_read_block/write_block and usb_msd_
+ * read10/write10 already use) rather than silently succeeding or
+ * touching real memory, so that if this ever *did* get reached via
+ * some future bug, it fails loudly instead of pretending to work. */
+long long host_virtual_disk_read(long long block_num, void *buf) {
+    (void)block_num;
+    (void)buf;
+    return -1;
+}
+
+long long host_virtual_disk_write(long long block_num, void *buf) {
+    (void)block_num;
+    (void)buf;
+    return -1;
+}

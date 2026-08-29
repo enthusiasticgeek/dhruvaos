@@ -271,6 +271,17 @@ extern "C" fn dharafs_state_get_log_start() -> u32;
 // dispatch to -- see dharafs_state.S's own comment on dharafs_block_dev.
 extern "C" fn dharafs_state_set_block_dev(dev: u32) -> u32;
 extern "C" fn dharafs_state_get_block_dev() -> u32;
+// dev==2 is a THIRD block-device backend used only by the host-side
+// ASAN/UBSAN test harness (test/host_harness/) to exercise DharaFS's
+// real logic against an in-memory virtual disk, without touching any
+// real hardware -- MMIO addresses are baked directly into generated C
+// by the compiler and can't be intercepted, so SDHOST/USB (dev 0/1)
+// are not host-testable. On the real bare-metal target this branch is
+// dead code: dharafs_state_get_block_dev() is never set to 2 outside
+// the host harness's own main(), and runtime_stubs.c's implementation
+// of these two externs always fails if ever reached.
+extern "C" fn host_virtual_disk_read(block_num: i64, buf: mut ref i64) -> i64;
+extern "C" fn host_virtual_disk_write(block_num: i64, buf: mut ref i64) -> i64;
 // Round 42: the active user/group context for FS permission checks --
 // see dharafs_state.S's own comment on dharafs_current_uid/dharafs_current_gid.
 extern "C" fn dharafs_user_set(uid: u32, gid: u32) -> u32;
@@ -1125,6 +1136,9 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
 // this project: exactly one real device has ever been tested attached
 // to the one hub port this driver enumerates.
 fn dharafs_block_read(block_num: i64, buf: mut ref i64) -> i64 {
+  if dharafs_state_get_block_dev() == (2 as u32) {
+    return host_virtual_disk_read(block_num, buf);
+  }
   if dharafs_state_get_block_dev() == (1 as u32) {
     return usb_msd_read10(dwc2_downstream_addr(), block_num as u32, buf);
   }
@@ -1132,6 +1146,9 @@ fn dharafs_block_read(block_num: i64, buf: mut ref i64) -> i64 {
 }
 
 fn dharafs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
+  if dharafs_state_get_block_dev() == (2 as u32) {
+    return host_virtual_disk_write(block_num, buf);
+  }
   if dharafs_state_get_block_dev() == (1 as u32) {
     return usb_msd_write10(dwc2_downstream_addr(), block_num as u32, buf);
   }
