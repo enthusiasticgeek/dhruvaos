@@ -725,14 +725,33 @@ building blocks for a diagnostics command, not a green field.
   next boot), not just an API wrapper around already-atomic single ops.
 
 - **Stronger optional integrity hash for security-critical paths** —
-  `[S, ~1 round]`
+  `[S, ~1 round — DONE, round 48]`
   `buf_checksum`'s rotate-mix (32 bits, not collision-resistant) is
   fine for catching torn writes but not tamper detection. Round 41's
-  `sha256_hash` already exists — wire it in as an opt-in per-file
-  stronger digest (e.g. any path under `/firmware/` or `/certificates/`
-  also gets a stored SHA-256 alongside the existing checksum, checked
-  on read). Small, mostly plumbing, and a genuine prerequisite for the
-  security roadmap's PKI/secure-boot items above.
+  `sha256_hash` reused as an opt-in per-file stronger digest, stored at
+  a companion `<path>.sha256` file rather than a change to the 512-byte
+  on-disk record format (no PKI/secure-boot consumer exists yet to
+  justify that larger cost). New `dharafs_write_verified_raw/_checked`/
+  `dharafs_read_verified_checked` + shell `writev`/`catv`. Verified
+  live, 110/110 host-harness PASS including a deliberate tamper test.
+
+  **Follow-up, not yet done**: `sha256_hash` itself still allocates its
+  own internal working buffers (padded message, H/K/W tables) fresh on
+  every call via `dhruva_alloc_bytes` — fine when its only caller was a
+  once-at-boot self-test (round 41), but `writev`/`catv` call it on
+  every real use, permanently costing up to ~4.7KB of heap per call
+  (a file near `dharafs_file_max_len()`). Bounded and safely handled
+  (round 45's OOM-fatal path halts cleanly rather than corrupting
+  memory if this ever exhausts the heap), not unbounded or silent —
+  but a real limitation: not suited to high-frequency verified I/O
+  within one boot session. Fixing it means giving `sha256_hash`
+  persistent scratch internally (same treatment round 48's own
+  companion-buffer bug already got, fixed before it shipped further —
+  see `boot/scratch_state.S`'s comment on `dharafs_verified_companion_
+  scratch`/`dharafs_verified_digest_a/b_scratch`), sized to the largest
+  real caller (`dharafs_file_max_len()` = 4096 bytes) — a genuine,
+  separate small round, not bundled into 48 to keep that round's own
+  crypto-correctness re-verification scope contained.
 
 - **Append-only log convenience API** (`dharafs_log_open`/`_append`/
   `_sync`, automatic rollover across numbered files) — `[M, ~1-2

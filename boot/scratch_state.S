@@ -260,6 +260,69 @@ usb_bulk_data_scratch_addr:
                          * transfer call site still only ever needs 64
                          * bytes for) and risking a change to code that
                          * didn't need to change. */
+dharafs_log_path_scratch_addr:
+    .word 0             /* Round 49: 32 bytes -- dharafs_log_append_raw's
+                         * own current-log-file path buffer. Same "never
+                         * dhruva_alloc_bytes on every call" reasoning as
+                         * every other buffer in this file -- a log is
+                         * exactly the "called repeatedly at runtime"
+                         * shape this file exists to fix (sensor logging
+                         * appends once per reading, not once at boot). */
+dharafs_log_header_path_scratch_addr:
+    .word 0             /* Round 49: 32 bytes -- the log's own small
+                         * ".hdr" file's path (current file index +
+                         * current size), separate from dharafs_log_path_
+                         * scratch above since both need to be live at
+                         * once within a single dharafs_log_append_raw
+                         * call. */
+dharafs_log_header_data_scratch_addr:
+    .word 0             /* Round 49: 8 bytes -- the header's own 8-byte
+                         * payload (u32 current_index, u32 current_size),
+                         * read then overwritten with the new values
+                         * within one call -- safe since every field is
+                         * read into a local before this buffer is
+                         * reused for the write-back. */
+dharafs_log_existing_scratch_addr:
+    .word 0             /* Round 49: 4096 bytes (dharafs_file_max_len())
+                         * -- the current log file's existing content,
+                         * read back so a new record can be concatenated
+                         * onto it before re-appending the whole file
+                         * (this project's append-to-an-existing-path
+                         * primitive is always "replace with the newest
+                         * full content", not a true byte-level append). */
+dharafs_log_combined_scratch_addr:
+    .word 0             /* Round 49: 4096 bytes -- existing content +
+                         * the new record, built here before being
+                         * written back as the log file's new full
+                         * content. Bounded safely under 4096 by
+                         * dharafs_log_append_raw's own rollover
+                         * threshold (3584) plus its own per-record size
+                         * cap (512) -- see that function's own comment. */
+dharafs_verified_companion_scratch_addr:
+    .word 0             /* Round 48 BUG FIX (found during round 49's
+                         * own audit, before this ever shipped further):
+                         * dharafs_write_verified_raw/dharafs_read_
+                         * verified_checked originally called dhruva_
+                         * alloc_bytes fresh on every call for this
+                         * 32-byte companion-path buffer -- the exact
+                         * "never dhruva_alloc_bytes on every call" bug
+                         * this whole file exists to prevent, and catv/
+                         * writev are meant to be called repeatedly, not
+                         * once at boot. Shared by both functions since
+                         * neither ever calls the other (same reasoning
+                         * as every other shared buffer in this file). */
+dharafs_verified_digest_a_scratch_addr:
+    .word 0             /* Round 48 bug fix: 32 bytes -- the freshly
+                         * COMPUTED digest, in both the write path
+                         * (computed once from the data just written)
+                         * and the read path (computed from the data
+                         * just read, compared against digest_b below). */
+dharafs_verified_digest_b_scratch_addr:
+    .word 0             /* Round 48 bug fix: 32 bytes -- the STORED
+                         * digest read back off disk, read path only
+                         * (compared against digest_a above). Kept
+                         * separate from digest_a since both need to be
+                         * live at once for the comparison. */
 
 .section ".text"
 
@@ -551,6 +614,118 @@ usb_bulk_data_scratch_set:
 .global usb_bulk_data_scratch_get
 usb_bulk_data_scratch_get:
     ldr r0, =usb_bulk_data_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_log_path_scratch_set
+dharafs_log_path_scratch_set:
+    ldr r1, =dharafs_log_path_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_log_path_scratch_get
+dharafs_log_path_scratch_get:
+    ldr r0, =dharafs_log_path_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_log_header_path_scratch_set
+dharafs_log_header_path_scratch_set:
+    ldr r1, =dharafs_log_header_path_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_log_header_path_scratch_get
+dharafs_log_header_path_scratch_get:
+    ldr r0, =dharafs_log_header_path_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_log_header_data_scratch_set
+dharafs_log_header_data_scratch_set:
+    ldr r1, =dharafs_log_header_data_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_log_header_data_scratch_get
+dharafs_log_header_data_scratch_get:
+    ldr r0, =dharafs_log_header_data_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_log_existing_scratch_set
+dharafs_log_existing_scratch_set:
+    ldr r1, =dharafs_log_existing_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_log_existing_scratch_get
+dharafs_log_existing_scratch_get:
+    ldr r0, =dharafs_log_existing_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_log_combined_scratch_set
+dharafs_log_combined_scratch_set:
+    ldr r1, =dharafs_log_combined_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_log_combined_scratch_get
+dharafs_log_combined_scratch_get:
+    ldr r0, =dharafs_log_combined_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_verified_companion_scratch_set
+dharafs_verified_companion_scratch_set:
+    ldr r1, =dharafs_verified_companion_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_verified_companion_scratch_get
+dharafs_verified_companion_scratch_get:
+    ldr r0, =dharafs_verified_companion_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_verified_digest_a_scratch_set
+dharafs_verified_digest_a_scratch_set:
+    ldr r1, =dharafs_verified_digest_a_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_verified_digest_a_scratch_get
+dharafs_verified_digest_a_scratch_get:
+    ldr r0, =dharafs_verified_digest_a_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_verified_digest_b_scratch_set
+dharafs_verified_digest_b_scratch_set:
+    ldr r1, =dharafs_verified_digest_b_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_verified_digest_b_scratch_get
+dharafs_verified_digest_b_scratch_get:
+    ldr r0, =dharafs_verified_digest_b_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

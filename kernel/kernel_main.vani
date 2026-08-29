@@ -46,6 +46,30 @@ extern "C" fn dharafs_stat_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_stat_scratch_get() -> mut ref i64;
 extern "C" fn dharafs_dir_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_dir_scratch_get() -> mut ref i64;
+// Round 49: dharafs_log_append_raw's own persistent scratch -- see
+// boot/scratch_state.S's own comment on each buffer's exact role.
+// Same "never dhruva_alloc_bytes on every call" discipline as every
+// other buffer in that file (a log append is meant to be called
+// repeatedly at runtime, not once at boot).
+extern "C" fn dharafs_log_path_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_log_path_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_log_header_path_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_log_header_path_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_log_header_data_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_log_header_data_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_log_existing_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_log_existing_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_log_combined_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_log_combined_scratch_get() -> mut ref i64;
+// Round 48 bug fix (found during round 49's own audit): dharafs_write_
+// verified_raw/dharafs_read_verified_checked need persistent scratch
+// too -- see boot/scratch_state.S's own comment.
+extern "C" fn dharafs_verified_companion_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_verified_companion_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_verified_digest_a_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_verified_digest_a_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_verified_digest_b_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_verified_digest_b_scratch_get() -> mut ref i64;
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn shell_line_scratch_get() -> mut ref i64;
 extern "C" fn eval_values_scratch_set(addr: mut ref i64) -> i64;
@@ -2329,8 +2353,28 @@ fn dharafs_verified_companion_path_raw(path_buf: mut ref i64, path_len: i64, out
 // companion path above. Both writes use the given owner/mode -- the
 // digest record is never independently owner/permission-managed, it
 // always mirrors whatever the data file it protects has.
+// BUG FIX (found during round 49's own scratch-buffer audit, before
+// this ever shipped further): companion_buf/digest originally called
+// dhruva_alloc_bytes fresh on every call -- the exact "never dhruva_
+// alloc_bytes on every call" bug boot/scratch_state.S exists to
+// prevent, and writev is meant to be called repeatedly. Now uses
+// dharafs_verified_companion_scratch/dharafs_verified_digest_a_scratch,
+// persistent buffers allocated once at boot.
+//
+// KNOWN remaining cost, deliberately not fixed here (see docs/
+// TODO.md): sha256_hash ITSELF still allocates its own internal
+// working buffers (padded message, H/K/W tables) fresh on every call
+// -- up to ~4.7KB per call for a file near dharafs_file_max_len().
+// Every writev/catv call permanently costs that much heap. Bounded
+// and safely handled (round 45's dhruva_alloc_bytes OOM-fatal path
+// halts cleanly rather than corrupting memory if the heap is ever
+// actually exhausted this way), not unbounded or silent -- but a
+// real, documented limitation: this feature is not suited to
+// high-frequency verified I/O within a single boot session. Giving
+// sha256_hash the same persistent-scratch treatment is real, separate
+// follow-up work, not a small addition to this round.
 fn dharafs_write_verified_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
-  let companion_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let companion_buf: mut ref i64 = dharafs_verified_companion_scratch_get();
   let companion_len: i64 = dharafs_verified_companion_path_raw(path_buf, path_len, companion_buf);
   if companion_len < 0 {
     // -1 is otherwise unused by the write path (dharafs_write_raw_checked's
@@ -2343,7 +2387,7 @@ fn dharafs_write_verified_raw(path_buf: mut ref i64, path_len: i64, data_buf: mu
   if write_status != 0 {
     return write_status;
   }
-  let digest: mut ref i64 = dhruva_alloc_bytes(32);
+  let digest: mut ref i64 = dharafs_verified_digest_a_scratch_get();
   let _ = sha256_hash(data_buf, data_len, digest);
   return dharafs_append_raw(companion_buf, companion_len, digest, 32, owner_uid, owner_gid, mode);
 }
@@ -2381,12 +2425,12 @@ fn dharafs_read_verified_checked(path_buf: mut ref i64, path_len: i64, out_buf: 
   if data_len < 0 {
     return data_len;
   }
-  let companion_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let companion_buf: mut ref i64 = dharafs_verified_companion_scratch_get();
   let companion_len: i64 = dharafs_verified_companion_path_raw(path_buf, path_len, companion_buf);
   if companion_len < 0 {
     return data_len;
   }
-  let stored_digest: mut ref i64 = dhruva_alloc_bytes(32);
+  let stored_digest: mut ref i64 = dharafs_verified_digest_b_scratch_get();
   // Unchecked read of the companion digest -- the caller already
   // passed the real permission check on the DATA file above, and
   // nothing in this project ever gives the sidecar digest record a
@@ -2397,13 +2441,217 @@ fn dharafs_read_verified_checked(path_buf: mut ref i64, path_len: i64, out_buf: 
   if digest_len != 32 {
     return data_len; // no companion digest was ever written for this path
   }
-  let computed_digest: mut ref i64 = dhruva_alloc_bytes(32);
+  let computed_digest: mut ref i64 = dharafs_verified_digest_a_scratch_get();
   let _ = sha256_hash(out_buf, data_len, computed_digest);
   let matches: i64 = sha256_bytes_equal(stored_digest, computed_digest, 32);
   if matches == 0 {
     return 0 - 3;
   }
   return data_len;
+}
+
+// Round 49: append-only log convenience API (docs/TODO.md's own
+// backlog item) -- the embedded sensor-logging shape ("sensor ->
+// record -> append -> record -> append", not desktop-style create/
+// delete/rename) this project's storage layer never had ergonomics
+// for. Built entirely on existing primitives (dharafs_append_raw/
+// dharafs_read_raw), no new on-disk record format: a log named `name`
+// lives as numbered files /logs/<name>-0001.log, /logs/<name>-0002.log,
+// ... plus a small /logs/<name>.hdr header (8 bytes: u32 current_file_
+// index, u32 current_file_size) tracking where the next record goes.
+// Every working buffer is PERSISTENT scratch (boot/scratch_state.S),
+// never dhruva_alloc_bytes per call -- this is exactly the "called
+// repeatedly at runtime" shape that file's own header comment warns
+// about, doubly so for a logging feature whose entire point is being
+// called often over a session's lifetime.
+fn dharafs_log_rollover_threshold() -> i64 {
+  return 3584; // headroom under dharafs_file_max_len() (4096) --
+               // combined with the 512-byte per-record cap below,
+               // dharafs_log_combined_scratch (sized exactly 4096)
+               // can never overflow: 3584 + 512 = 4096 exactly.
+}
+
+fn dharafs_log_record_max_len() -> i64 {
+  return 512; // one "reasonable log line" -- generous for a sensor
+              // reading or short structured record, small enough that
+              // the rollover-threshold math above stays exact.
+}
+
+// Writes exactly 4 ASCII decimal digits (zero-padded, 0000-9999) for
+// `index` starting at out_buf[offset).
+fn dharafs_log_write_index_digits(out_buf: mut ref i64, offset: i64, index: u32) -> i64 {
+  let d0: u32 = (index / (1000 as u32)) % (10 as u32);
+  let d1: u32 = (index / (100 as u32)) % (10 as u32);
+  let d2: u32 = (index / (10 as u32)) % (10 as u32);
+  let d3: u32 = index % (10 as u32);
+  let _ = buf_write_byte(out_buf, offset as u32, (48 as u32) + d0);
+  let _ = buf_write_byte(out_buf, (offset + 1) as u32, (48 as u32) + d1);
+  let _ = buf_write_byte(out_buf, (offset + 2) as u32, (48 as u32) + d2);
+  let _ = buf_write_byte(out_buf, (offset + 3) as u32, (48 as u32) + d3);
+  return 0;
+}
+
+// Builds "/logs/" + name + "-" + 4-digit index + ".log" into out_buf,
+// returning its length, or -1 if the combined path would exceed the
+// 32-byte path cap (6 + name_len + 1 + 4 + 4 = 15 + name_len).
+fn dharafs_log_path_raw(name_buf: mut ref i64, name_len: i64, index: u32, out_buf: mut ref i64) -> i64 {
+  let total_len: i64 = 15 + name_len;
+  if total_len > 32 {
+    return 0 - 1;
+  }
+  let _ = buf_write_byte(out_buf, 0 as u32, 47 as u32);  // '/'
+  let _ = buf_write_byte(out_buf, 1 as u32, 108 as u32); // 'l'
+  let _ = buf_write_byte(out_buf, 2 as u32, 111 as u32); // 'o'
+  let _ = buf_write_byte(out_buf, 3 as u32, 103 as u32); // 'g'
+  let _ = buf_write_byte(out_buf, 4 as u32, 115 as u32); // 's'
+  let _ = buf_write_byte(out_buf, 5 as u32, 47 as u32);  // '/'
+  let i: i64 = 0;
+  while i < name_len {
+    let b: u32 = buf_read_byte(name_buf, i as u32);
+    let _ = buf_write_byte(out_buf, (6 + i) as u32, b);
+    i = i + 1;
+  }
+  let dash_off: i64 = 6 + name_len;
+  let _ = buf_write_byte(out_buf, dash_off as u32, 45 as u32); // '-'
+  let _ = dharafs_log_write_index_digits(out_buf, dash_off + 1, index);
+  let ext_off: i64 = dash_off + 5;
+  let _ = buf_write_byte(out_buf, ext_off as u32, 46 as u32);      // '.'
+  let _ = buf_write_byte(out_buf, (ext_off + 1) as u32, 108 as u32); // 'l'
+  let _ = buf_write_byte(out_buf, (ext_off + 2) as u32, 111 as u32); // 'o'
+  let _ = buf_write_byte(out_buf, (ext_off + 3) as u32, 103 as u32); // 'g'
+  return total_len;
+}
+
+// Builds "/logs/" + name + ".hdr" into out_buf, returning its length,
+// or -1 if the combined path would exceed the 32-byte path cap.
+fn dharafs_log_header_path_raw(name_buf: mut ref i64, name_len: i64, out_buf: mut ref i64) -> i64 {
+  let total_len: i64 = 10 + name_len;
+  if total_len > 32 {
+    return 0 - 1;
+  }
+  let _ = buf_write_byte(out_buf, 0 as u32, 47 as u32);
+  let _ = buf_write_byte(out_buf, 1 as u32, 108 as u32);
+  let _ = buf_write_byte(out_buf, 2 as u32, 111 as u32);
+  let _ = buf_write_byte(out_buf, 3 as u32, 103 as u32);
+  let _ = buf_write_byte(out_buf, 4 as u32, 115 as u32);
+  let _ = buf_write_byte(out_buf, 5 as u32, 47 as u32);
+  let i: i64 = 0;
+  while i < name_len {
+    let b: u32 = buf_read_byte(name_buf, i as u32);
+    let _ = buf_write_byte(out_buf, (6 + i) as u32, b);
+    i = i + 1;
+  }
+  let ext_off: i64 = 6 + name_len;
+  let _ = buf_write_byte(out_buf, ext_off as u32, 46 as u32);       // '.'
+  let _ = buf_write_byte(out_buf, (ext_off + 1) as u32, 104 as u32); // 'h'
+  let _ = buf_write_byte(out_buf, (ext_off + 2) as u32, 100 as u32); // 'd'
+  let _ = buf_write_byte(out_buf, (ext_off + 3) as u32, 114 as u32); // 'r'
+  return total_len;
+}
+
+// Appends `record` to the currently active numbered file for log
+// `name`, rolling over to a new file automatically once the current
+// one would exceed dharafs_log_rollover_threshold(). This project's
+// storage layer has no true byte-level append to an existing path
+// (dharafs_append_raw always replaces a path's visible content with a
+// new full version) -- so a non-rollover append here reads the
+// current file's existing content, concatenates the new record, and
+// writes the whole thing back, same "read whole, re-append whole"
+// shape dharafs_compact's own carry-forward and dharafs_chmod/
+// dharafs_chown already use elsewhere in this file.
+fn dharafs_log_append_raw(name_buf: mut ref i64, name_len: i64, record_buf: mut ref i64, record_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
+  if (name_len <= 0) || (record_len <= 0) {
+    return 1;
+  }
+  if record_len > dharafs_log_record_max_len() {
+    return 1;
+  }
+  let header_buf: mut ref i64 = dharafs_log_header_path_scratch_get();
+  let header_len: i64 = dharafs_log_header_path_raw(name_buf, name_len, header_buf);
+  if header_len < 0 {
+    return 0 - 1; // log name too long
+  }
+  let header_data: mut ref i64 = dharafs_log_header_data_scratch_get();
+  let hdr_read_len: i64 = dharafs_read_raw(header_buf, header_len, header_data);
+  let current_index: u32 = if hdr_read_len == 8 { buf_read_u32(header_data, 0 as u32) } else { 0 as u32 };
+  let current_size: i64 = if hdr_read_len == 8 { buf_read_u32(header_data, 4 as u32) as i64 } else { 0 };
+
+  let log_path_buf: mut ref i64 = dharafs_log_path_scratch_get();
+  let needs_rollover: i64 = if current_index == (0 as u32) { 1 } else {
+    if (current_size + record_len) > dharafs_log_rollover_threshold() { 1 } else { 0 }
+  };
+
+  if needs_rollover == 1 {
+    let new_index: u32 = current_index + (1 as u32);
+    if new_index > (9999 as u32) {
+      return 1; // exhausted the 4-digit rollover space
+    }
+    let log_path_len: i64 = dharafs_log_path_raw(name_buf, name_len, new_index, log_path_buf);
+    if log_path_len < 0 {
+      return 0 - 1; // log name too long once combined with the file suffix
+    }
+    let write_status: i64 = dharafs_append_raw(log_path_buf, log_path_len, record_buf, record_len, owner_uid, owner_gid, mode);
+    if write_status != 0 {
+      return write_status;
+    }
+    let _ = buf_write_u32(header_data, 0 as u32, new_index);
+    let _ = buf_write_u32(header_data, 4 as u32, record_len as u32);
+    return dharafs_append_raw(header_buf, header_len, header_data, 8, owner_uid, owner_gid, mode);
+  }
+
+  let log_path_len: i64 = dharafs_log_path_raw(name_buf, name_len, current_index, log_path_buf);
+  if log_path_len < 0 {
+    return 0 - 1;
+  }
+  let existing_data: mut ref i64 = dharafs_log_existing_scratch_get();
+  let existing_len_raw: i64 = dharafs_read_raw(log_path_buf, log_path_len, existing_data);
+  // Self-heals from an inconsistent header (e.g. the file it points at
+  // is somehow missing/corrupt) by treating the existing content as
+  // empty rather than failing the whole append -- the new record still
+  // gets written, just as if it were the first in a fresh file.
+  let existing_len: i64 = if existing_len_raw < 0 { 0 } else { existing_len_raw };
+  let combined_buf: mut ref i64 = dharafs_log_combined_scratch_get();
+  let i: i64 = 0;
+  while i < existing_len {
+    let b: u32 = buf_read_byte(existing_data, i as u32);
+    let _ = buf_write_byte(combined_buf, i as u32, b);
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < record_len {
+    let b2: u32 = buf_read_byte(record_buf, j as u32);
+    let _ = buf_write_byte(combined_buf, (existing_len + j) as u32, b2);
+    j = j + 1;
+  }
+  let combined_len: i64 = existing_len + record_len;
+  let write_status2: i64 = dharafs_append_raw(log_path_buf, log_path_len, combined_buf, combined_len, owner_uid, owner_gid, mode);
+  if write_status2 != 0 {
+    return write_status2;
+  }
+  let _ = buf_write_u32(header_data, 0 as u32, current_index);
+  let _ = buf_write_u32(header_data, 4 as u32, combined_len as u32);
+  return dharafs_append_raw(header_buf, header_len, header_data, 8, owner_uid, owner_gid, mode);
+}
+
+fn dharafs_log_append(name: Str, line: Str) -> i64 {
+  let name_len: i64 = str_len_bytes(name);
+  let line_len_s: i64 = str_len_bytes(line);
+  if (name_len <= 0) || (line_len_s <= 0) {
+    return 1;
+  }
+  let name_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < name_len {
+    let _ = buf_write_byte(name_buf, i as u32, str_byte_at(name, i) as u32);
+    i = i + 1;
+  }
+  let record_buf: mut ref i64 = dharafs_data_scratch_get();
+  let j: i64 = 0;
+  while j < line_len_s {
+    let _ = buf_write_byte(record_buf, j as u32, str_byte_at(line, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_log_append_raw(name_buf, name_len, record_buf, line_len_s, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
 }
 
 // Round 39's live milestone: write a payload well past the 448-byte
@@ -9987,6 +10235,48 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Round 49: append-only log convenience API -- see dharafs_log_
+  // append_raw's own comment for the on-disk layout (numbered /logs/
+  // <name>-NNNN.log files + a small /logs/<name>.hdr header).
+  if shell_word_matches(line_buf, 0, cmd_end, "log") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: log <name> <text>\n");
+      return 0;
+    }
+    let name_start: i64 = cmd_end + 1;
+    let name_end: i64 = shell_find_space(line_buf, name_start, line_len);
+    if name_end >= line_len {
+      let _ = uart_puts("usage: log <name> <text>\n");
+      return 0;
+    }
+    let name_len: i64 = name_end - name_start;
+    if name_len == 0 {
+      let _ = uart_puts("usage: log <name> <text>\n");
+      return 0;
+    }
+    let text_start: i64 = name_end + 1;
+    let text_len: i64 = line_len - text_start;
+    if text_len > dharafs_log_record_max_len() {
+      let _ = uart_puts("error: record too long (max 512 bytes)\n");
+      return 0;
+    }
+    let name_buf: mut ref i64 = dharafs_path_scratch_get();
+    let _ = shell_copy_range(line_buf, name_start, name_end, name_buf);
+    let record_buf: mut ref i64 = dharafs_data_scratch_get();
+    let _ = shell_copy_range(line_buf, text_start, line_len, record_buf);
+    let status: i64 = dharafs_log_append_raw(name_buf, name_len, record_buf, text_len, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
+    if status == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      if status == (0 - 1) {
+        let _ = uart_puts("error: log name too long\n");
+      } else {
+        let _ = uart_puts("error\n");
+      }
+    }
+    return 0;
+  }
+
   // Round 42: show the active permission-check context. Dhruva has no
   // login yet, so this is always uid 0 (root) unless a session used
   // `su` (below) to switch it.
@@ -10665,7 +10955,7 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/catv/rm/mv/write/writev/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
+  let _ = uart_puts("unknown command (try ls/cat/catv/rm/mv/write/writev/log/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
   return 0;
 }
 
@@ -11695,6 +11985,14 @@ fn kernel_main() -> i64 {
   let _ = dharafs_data_scratch_set(dhruva_alloc_bytes(4096));
   let _ = dharafs_stat_scratch_set(dhruva_alloc_bytes(12));
   let _ = dharafs_dir_scratch_set(dhruva_alloc_bytes(32));
+  let _ = dharafs_log_path_scratch_set(dhruva_alloc_bytes(32));
+  let _ = dharafs_log_header_path_scratch_set(dhruva_alloc_bytes(32));
+  let _ = dharafs_log_header_data_scratch_set(dhruva_alloc_bytes(8));
+  let _ = dharafs_log_existing_scratch_set(dhruva_alloc_bytes(4096));
+  let _ = dharafs_log_combined_scratch_set(dhruva_alloc_bytes(4096));
+  let _ = dharafs_verified_companion_scratch_set(dhruva_alloc_bytes(32));
+  let _ = dharafs_verified_digest_a_scratch_set(dhruva_alloc_bytes(32));
+  let _ = dharafs_verified_digest_b_scratch_set(dhruva_alloc_bytes(32));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));

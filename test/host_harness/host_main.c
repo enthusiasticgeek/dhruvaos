@@ -50,6 +50,11 @@ int64_t fn_dharafs_delete_raw(int64_t *path_buf, int64_t path_len);
 int64_t fn_dharafs_rename_raw(int64_t *old_path_buf, int64_t old_path_len, int64_t *new_path_buf, int64_t new_path_len);
 int64_t fn_dharafs_rename_raw_checked(int64_t *old_path_buf, int64_t old_path_len, int64_t *new_path_buf, int64_t new_path_len, uint32_t req_uid, uint32_t req_gid);
 int64_t fn_dharafs_verified_companion_path_raw(int64_t *path_buf, int64_t path_len, int64_t *out_buf);
+int64_t fn_dharafs_log_rollover_threshold(void);
+int64_t fn_dharafs_log_record_max_len(void);
+int64_t fn_dharafs_log_path_raw(int64_t *name_buf, int64_t name_len, uint32_t index, int64_t *out_buf);
+int64_t fn_dharafs_log_header_path_raw(int64_t *name_buf, int64_t name_len, int64_t *out_buf);
+int64_t fn_dharafs_log_append_raw(int64_t *name_buf, int64_t name_len, int64_t *record_buf, int64_t record_len, uint32_t owner_uid, uint32_t owner_gid, uint32_t mode);
 int64_t fn_dharafs_write_verified_raw(int64_t *path_buf, int64_t path_len, int64_t *data_buf, int64_t data_len, uint32_t owner_uid, uint32_t owner_gid, uint32_t mode);
 int64_t fn_dharafs_write_verified_checked(int64_t *path_buf, int64_t path_len, int64_t *data_buf, int64_t data_len, uint32_t req_uid, uint32_t req_gid);
 int64_t fn_dharafs_read_verified_checked(int64_t *path_buf, int64_t path_len, int64_t *out_buf, uint32_t req_uid, uint32_t req_gid);
@@ -105,6 +110,14 @@ extern int64_t dharafs_path_scratch_set(int64_t *addr);
 extern int64_t dharafs_data_scratch_set(int64_t *addr);
 extern int64_t dharafs_stat_scratch_set(int64_t *addr);
 extern int64_t dharafs_dir_scratch_set(int64_t *addr);
+extern int64_t dharafs_log_path_scratch_set(int64_t *addr);
+extern int64_t dharafs_log_header_path_scratch_set(int64_t *addr);
+extern int64_t dharafs_log_header_data_scratch_set(int64_t *addr);
+extern int64_t dharafs_log_existing_scratch_set(int64_t *addr);
+extern int64_t dharafs_log_combined_scratch_set(int64_t *addr);
+extern int64_t dharafs_verified_companion_scratch_set(int64_t *addr);
+extern int64_t dharafs_verified_digest_a_scratch_set(int64_t *addr);
+extern int64_t dharafs_verified_digest_b_scratch_set(int64_t *addr);
 
 static void reset_fs(void) {
     host_virtual_disk_reset();
@@ -119,6 +132,14 @@ static void reset_fs(void) {
     dharafs_data_scratch_set(g_data_scratch);
     dharafs_stat_scratch_set(g_stat_scratch);
     dharafs_dir_scratch_set(g_dir_scratch);
+    dharafs_log_path_scratch_set(dhruva_alloc_bytes(32));
+    dharafs_log_header_path_scratch_set(dhruva_alloc_bytes(32));
+    dharafs_log_header_data_scratch_set(dhruva_alloc_bytes(8));
+    dharafs_log_existing_scratch_set(dhruva_alloc_bytes(4096));
+    dharafs_log_combined_scratch_set(dhruva_alloc_bytes(4096));
+    dharafs_verified_companion_scratch_set(dhruva_alloc_bytes(32));
+    dharafs_verified_digest_a_scratch_set(dhruva_alloc_bytes(32));
+    dharafs_verified_digest_b_scratch_set(dhruva_alloc_bytes(32));
     fn_dharafs_init();
 }
 
@@ -537,6 +558,83 @@ static void test_verified_integrity(void) {
     CHECK(rd2 == -3, "tamper: readv detects a companion digest that doesn't match the data");
 }
 
+/* ================= Append-only log API (round 49) ================= */
+
+static void test_log_append(void) {
+    reset_fs();
+
+    int64_t *name = mkbuf("sensor", 6);
+    int64_t *log_path = dhruva_alloc_bytes(32);
+    int64_t log_path_len = fn_dharafs_log_path_raw(name, 6, 1, log_path);
+    CHECK(log_path_len == 21, "log: path for index 1 is 21 bytes");
+    CHECK(memcmp(log_path, "/logs/sensor-0001.log", 21) == 0, "log: path bytes are correct (zero-padded 4-digit index)");
+
+    int64_t *header_path = dhruva_alloc_bytes(32);
+    int64_t header_path_len = fn_dharafs_log_header_path_raw(name, 6, header_path);
+    CHECK(header_path_len == 16, "log: header path is 16 bytes");
+    CHECK(memcmp(header_path, "/logs/sensor.hdr", 16) == 0, "log: header path bytes are correct");
+
+    /* First-ever append to a brand-new log name always rolls over to
+     * index 1, regardless of size. */
+    char record[400];
+    memset(record, 'x', 400);
+    int64_t *record_buf = mkbuf(record, 400);
+    CHECK(fn_dharafs_log_append_raw(name, 6, record_buf, 400, 0, 0, 0644) == 0, "log: first append succeeds (rolls over to index 1)");
+
+    int64_t *out = dhruva_alloc_bytes(4096);
+    int64_t rd = fn_dharafs_read_raw(log_path, log_path_len, out);
+    CHECK(rd == 400, "log: file 1 has exactly the first record's bytes");
+    CHECK(memcmp(out, record, 400) == 0, "log: file 1 content matches the record written");
+
+    /* 7 more 400-byte appends (total 8 records, 3200 bytes) stay
+     * within the rollover threshold (3584) and accumulate into the
+     * SAME file. */
+    for (int k = 0; k < 7; k++) {
+        CHECK(fn_dharafs_log_append_raw(name, 6, record_buf, 400, 0, 0, 0644) == 0, "log: accumulating append succeeds");
+    }
+    int64_t rd2 = fn_dharafs_read_raw(log_path, log_path_len, out);
+    CHECK(rd2 == 3200, "log: file 1 accumulated to 8 * 400 = 3200 bytes, no rollover yet");
+
+    /* The 9th append (3200 + 400 = 3600 > 3584) must roll over to a
+     * NEW file, index 2, containing ONLY the new record -- file 1
+     * stays at 3200 bytes, untouched. */
+    CHECK(fn_dharafs_log_append_raw(name, 6, record_buf, 400, 0, 0, 0644) == 0, "log: 9th append succeeds (triggers rollover)");
+    int64_t *log_path2 = dhruva_alloc_bytes(32);
+    int64_t log_path2_len = fn_dharafs_log_path_raw(name, 6, 2, log_path2);
+    int64_t rd3 = fn_dharafs_read_raw(log_path2, log_path2_len, out);
+    CHECK(rd3 == 400, "log: file 2 (post-rollover) has exactly the 9th record's bytes");
+    int64_t rd4 = fn_dharafs_read_raw(log_path, log_path_len, out);
+    CHECK(rd4 == 3200, "log: file 1 is UNCHANGED after rollover (still 3200 bytes)");
+
+    /* Header tracks the CURRENT file correctly after rollover. */
+    int64_t *hdr_out = dhruva_alloc_bytes(8);
+    int64_t hdr_rd = fn_dharafs_read_raw(header_path, header_path_len, hdr_out);
+    CHECK(hdr_rd == 8, "log: header file is exactly 8 bytes");
+    CHECK(buf_read_u32(hdr_out, 0) == 2, "log: header's current_index is 2 after rollover");
+    CHECK(buf_read_u32(hdr_out, 4) == 400, "log: header's current_size is 400 (just the new file's content)");
+
+    /* A record over the 512-byte per-record cap is rejected. */
+    char big_record[513];
+    memset(big_record, 'y', 513);
+    int64_t *big_record_buf = mkbuf(big_record, 513);
+    CHECK(fn_dharafs_log_append_raw(name, 6, big_record_buf, 513, 0, 0, 0644) == 1, "log: record over 512 bytes is rejected");
+    CHECK(fn_dharafs_log_record_max_len() == 512, "log: record_max_len() is 512");
+    CHECK(fn_dharafs_log_rollover_threshold() == 3584, "log: rollover_threshold() is 3584");
+
+    /* A log name long enough that "/logs/" + name + ".hdr" fits (<=32)
+     * but "/logs/" + name + "-0001.log" does NOT (> 32) is rejected
+     * with -1, not a half-written, inconsistent state. */
+    char long_name[20];
+    memset(long_name, 'n', 20);
+    int64_t *long_name_buf = mkbuf(long_name, 20);
+    int64_t status = fn_dharafs_log_append_raw(long_name_buf, 20, record_buf, 400, 0, 0, 0644);
+    CHECK(status == -1, "log: name too long for the log file path (though short enough for the header path) is rejected");
+
+    /* Empty name / empty record rejected. */
+    CHECK(fn_dharafs_log_append_raw(name, 0, record_buf, 400, 0, 0, 0644) == 1, "log: empty name rejected");
+    CHECK(fn_dharafs_log_append_raw(name, 6, record_buf, 0, 0, 0, 0644) == 1, "log: empty record rejected");
+}
+
 /* ================= Crypto / bignum smoke tests through the real
  * on-disk-adjacent entry points (byte-for-byte correctness matters
  * here just as much as for DharaFS, since these back the security-
@@ -648,6 +746,7 @@ int main(void) {
     test_oversized_data_len_field_rejected();
     test_self_referential_continuation_chain();
     test_verified_integrity();
+    test_log_append();
     test_sha256_boundaries();
     test_chacha20_boundaries();
     test_bignum_boundaries();

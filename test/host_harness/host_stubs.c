@@ -118,6 +118,14 @@ SCRATCH_PTR(tcp_empty_payload_scratch)
 SCRATCH_PTR(uart_digits_scratch)
 SCRATCH_PTR(udp_send_arp_scratch)
 SCRATCH_PTR(usb_bulk_data_scratch)
+SCRATCH_PTR(dharafs_log_path_scratch)
+SCRATCH_PTR(dharafs_log_header_path_scratch)
+SCRATCH_PTR(dharafs_log_header_data_scratch)
+SCRATCH_PTR(dharafs_log_existing_scratch)
+SCRATCH_PTR(dharafs_log_combined_scratch)
+SCRATCH_PTR(dharafs_verified_companion_scratch)
+SCRATCH_PTR(dharafs_verified_digest_a_scratch)
+SCRATCH_PTR(dharafs_verified_digest_b_scratch)
 
 /* ---- 1d. dharafs_state_* / dharafs_user_* -- real state, matching
  * boot/dharafs_state.S's semantics closely enough for host testing
