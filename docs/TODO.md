@@ -427,26 +427,79 @@ for by name.
      established practice) rather than treating "AI attacks" as a
      separate initiative — it's the same threat model at higher
      volume, not a different one.
-  2. **Enable real memory protection** — `[L, several rounds, its own
-     real item]`: the MMU is currently OFF for this entire image (see
-     `context_switch.S`'s own comments on why, going back to round
-     16-18's memory-ordering work) — meaning there is no page-level
-     read/write/execute separation anywhere in Dhruva today; every
-     page is fully readable, writable, AND executable simultaneously.
-     Turning the MMU on with even basic W^X page permissions (code
-     pages executable-but-read-only, data/stack pages
-     writable-but-never-executable) would be a genuine, concrete
-     hardening step, independent of any "AI" framing — it closes off
-     an entire class of code-injection exploitation that currently has
-     no obstacle at all. This is arguably the single highest-value
-     item in this whole security section relative to its effort, and
-     doesn't depend on the crypto foundation above at all. One
-     accidental upside of this project's current MMU-off, cache-off
-     design worth noting: it also means NO cache-timing side-channel
-     surface exists today (there's no cache to leak through) — a
-     property worth explicitly preserving (e.g., picking ChaCha20 over
-     table-lookup-heavy AES above) rather than losing by accident once
-     the MMU/caching eventually does get enabled for the Pi 4/5 port.
+  2. **Enable real memory protection** — `[L — DONE (round 38) for the
+     write-protection half; execute-protection is a tracked known
+     limitation, see below]`
+     The MMU is now on (`boot/mmu_init.S`), identity-mapped, with the
+     code section (vectors/.text.boot/.text/.rodata) marked read+
+     execute but genuinely never writable, and data/heap/stack/
+     peripherals marked read+write. `link.ld` now pads `.data` to the
+     next 1MB boundary so ARMv6's 1MB section granularity can express
+     a clean code/data split at all.
+     - **Live-verified, not just present in the table**: a deliberate
+       write to the code section was proven to fault with a genuine
+       section-permission status. Getting there took two real,
+       non-obvious fixes found only by testing the actual enforcement
+       rather than trusting the encoding: (1) `AP=11` combined with
+       `APX=1` for "read-only" did not actually enforce it on this
+       core/QEMU model; switched to `AP=01` (privileged read-only,
+       which is all this kernel needs since it never runs unprivileged
+       code); (2) that alone still didn't work — the real missing
+       piece was `SCTLR.XP` (bit 23), which disables ARMv5's legacy
+       "subpage AP" compatibility scheme in favor of the whole-section
+       AP interpretation this table actually uses. Once both were in
+       place, the deliberate write correctly faulted.
+     - **Known limitation, NOT fixed this round**: the parallel
+       deliberate test for execute-protection (`XN=1` on the data
+       section, jumping into it and expecting a Prefetch Abort) never
+       faulted — execution ran straight through hundreds of KB of
+       zero-filled data as harmless no-ops. A bit-position mix-up
+       between `APX`/`XN` was ruled out (the code section's `APX=1`
+       demonstrably didn't block its own execution, which a misplaced
+       `XN` there would have).
+       Found *after* this live test: a local Yocto build tree happened
+       to have QEMU 4.2.0's own ARM emulation source checked out
+       (`target/arm/helper.c`) — older than the 10.0.11 actually
+       installed and tested against, but real reference material where
+       none was expected. That source's `get_phys_addr_v6` (confirmed
+       reached whenever `SCTLR.XP` is set, exactly this table's own
+       setup) matches this table's encoding in every particular that
+       matters: `XN` really is bit 4; `domain_prot==1` (client, what
+       this table's DACR sets) takes the real AP/XN-checked path, not
+       `domain_prot==3`'s (manager) full-access bypass; the combined
+       APX/AP value correctly yields read-only for the code section's
+       own encoding and read-write for data's, both already proven
+       live; and a section with `xn=1` should never gain `PAGE_EXEC`
+       regardless of AP/APX, which should then fail the instruction-
+       fetch permission check and fault. Every step of that older
+       source's own logic agrees with this table's intent — yet the
+       currently-installed, five-plus-years-newer QEMU still didn't
+       enforce it. This now points more specifically at a **QEMU
+       version-specific behavior difference** than at a bug in this
+       table's own encoding, though without 10.0.11's own source to
+       diff against directly, that remains a strong inference, not a
+       proven fact. The `XN` bits are kept set anyway — free if real
+       hardware (or a different QEMU version) enforces them correctly,
+       harmless if this specific installed QEMU doesn't.
+       **Revisit once a real Pi 1B is connected** (see the
+       hardware-in-loop section below) — testing the identical
+       deliberate-execute probe against real silicon would
+       definitively settle this either way, since real hardware's
+       behavior is the actual ground truth regardless of which QEMU
+       version's source agrees with the table.
+     - New abort-mode diagnostics (`vectors.S`'s `fault_data_abort`/
+       `fault_prefetch_abort`, previously both a silent infinite loop
+       with zero output) were a real prerequisite built first, not
+       optional scaffolding — printing the faulting address and status
+       is what made this round's own live verification possible at
+       all, and is now permanent, genuinely useful infrastructure for
+       diagnosing any future real fault, not just this round's testing.
+     - Full existing self-test/regression battery (including the full
+       USB mass storage DMA chain — DWC2's own DMA engine reads/writes
+       heap-allocated buffers under the exact same RAM mapping) verified
+       to behave identically with the MMU on, confirming the Normal-
+       Non-cacheable memory type choice preserves this project's
+       existing zero-caching DMA-coherency assumptions unchanged.
 
 ## Hardware-in-loop testing (once a real Pi 1B is available)
 
