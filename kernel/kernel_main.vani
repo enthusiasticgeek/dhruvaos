@@ -172,6 +172,17 @@ extern "C" fn tcp_conn_get_local_ip(conn_id: u32) -> u32;
 extern "C" fn tcp_conn_set_local_ip(conn_id: u32, value: u32) -> u32;
 extern "C" fn tcp_conn_get_remote_ip(conn_id: u32) -> u32;
 extern "C" fn tcp_conn_set_remote_ip(conn_id: u32, value: u32) -> u32;
+// Round 37 (boot/tcp_state.S): per-connection retransmission state --
+// see that file's own comment on each field.
+extern "C" fn tcp_conn_get_rtx_deadline(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_rtx_deadline(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_rtx_count(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_rtx_count(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_rtx_seq(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_rtx_seq(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_rtx_len(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_rtx_len(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_rtx_buf(conn_id: u32) -> mut ref i64;
 
 // Phase 6 continued (boot/dhcp_state.S): the DHCP client's own
 // persistent state -- same vani-call-boundary gap as every other
@@ -3907,10 +3918,28 @@ fn tcp_state_established() -> u32 { return 3 as u32; }
 fn tcp_state_fin_wait() -> u32 { return 4 as u32; }
 fn tcp_state_closed_final() -> u32 { return 5 as u32; }
 
+// Round 37: retransmission timing constants. 4 ticks (timer_ic_init's
+// own 500ms compare interval -- confirmed against that function's own
+// comment) = 2 real seconds, short enough for a live test to actually
+// wait one out without an excessive delay, long enough to be a real
+// timeout rather than firing on ordinary scheduling jitter. 3 retries
+// before giving up, matching this project's own established "bounded,
+// not forever" polling discipline used everywhere else.
+fn tcp_rtx_timeout_ticks() -> u32 {
+  return 4 as u32;
+}
+fn tcp_rtx_max_retries() -> u32 {
+  return 3 as u32;
+}
+
 // Active open (the connecting/"client" side): records connection
 // identity, picks an initial sequence number, and sends the opening
 // SYN. Conn moves to SYN_SENT; the handshake only completes once the
 // caller feeds a matching SYN-ACK segment into tcp_conn_handle_segment.
+// Round 37: also arms the SYN's own retransmission timer -- rtx_len=0
+// marks this as a bare-SYN retransmission (no payload buffer needed),
+// rtx_seq=initial_seq is what tcp_conn_check_retransmit resends if the
+// SYN-ACK never arrives.
 fn tcp_conn_active_open(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, local_ip: u32, remote_ip: u32, local_port: u32, remote_port: u32, initial_seq: u32) -> i64 {
   let _ = tcp_conn_set_local_ip(conn_id, local_ip);
   let _ = tcp_conn_set_remote_ip(conn_id, remote_ip);
@@ -3919,6 +3948,10 @@ fn tcp_conn_active_open(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64,
   let _ = tcp_conn_set_local_seq(conn_id, initial_seq);
   let _ = tcp_conn_set_remote_seq(conn_id, 0 as u32);
   let _ = tcp_conn_set_state(conn_id, tcp_state_syn_sent());
+  let _ = tcp_conn_set_rtx_seq(conn_id, initial_seq);
+  let _ = tcp_conn_set_rtx_len(conn_id, 0 as u32);
+  let _ = tcp_conn_set_rtx_count(conn_id, 0 as u32);
+  let _ = tcp_conn_set_rtx_deadline(conn_id, scheduler_get_tick_count() + tcp_rtx_timeout_ticks());
   let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
   return tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, initial_seq, 0 as u32, tcp_flag_syn(), 65535 as u32, empty_payload, 0);
 }
@@ -4005,13 +4038,38 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
   // final ACK, moving straight to ESTABLISHED (this side never
   // actually waits in a separate "just sent the final ACK" state --
   // once it's sent, the handshake is done from this side's view).
+  // Round 37: the peer answered, so whatever SYN retransmission timer
+  // active_open armed is no longer needed -- cancel it.
   if (state == tcp_state_syn_sent()) && (has_syn == 1) && (has_ack == 1) && (seg_ack == (tcp_conn_get_local_seq(conn_id) + (1 as u32))) {
+    let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
     let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
     let new_local_seq: u32 = tcp_conn_get_local_seq(conn_id) + (1 as u32); // our own SYN consumed one
     let _ = tcp_conn_set_local_seq(conn_id, new_local_seq);
     let _ = tcp_conn_set_state(conn_id, tcp_state_established());
     let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
     let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), new_local_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+    return 0;
+  }
+
+  // Round 37: simultaneous open -- both sides issue active_open at
+  // roughly the same time, so this side is still in SYN_SENT when the
+  // peer's own bare SYN (no ACK -- it hasn't seen OUR SYN yet either)
+  // arrives instead of a SYN-ACK. Real, spec-legitimate TCP behavior
+  // (RFC 793), not a shortcut: answer with SYN+ACK (acknowledging the
+  // peer's SYN) and move to SYN_RCVD -- the EXACT state passive_open's
+  // own first-SYN branch above already produces, so the existing
+  // "Passive-open side receiving the final ACK" branch below already
+  // knows how to complete this side's handshake with no further
+  // changes needed. Our own local_seq is left exactly as active_open
+  // already set it -- our SYN was already sent at that value; nothing
+  // here re-sends or re-picks it, matching passive_open's own
+  // "server_isn set once" pattern.
+  if (state == tcp_state_syn_sent()) && (has_syn == 1) && (has_ack == 0) {
+    let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32); // peer answered
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
+    let _ = tcp_conn_set_state(conn_id, tcp_state_syn_rcvd());
+    let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_syn() | tcp_flag_ack(), 65535 as u32, empty_payload, 0);
     return 0;
   }
 
@@ -4071,9 +4129,22 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
     return payload_len;
   }
 
-  // Established, a pure ACK for data we sent: nothing to do in this
-  // minimal, no-retransmission-tracking scope.
+  // Established, a pure ACK for data we sent. Round 37: if a data
+  // retransmission is pending (rtx_deadline != 0) and this ACK covers
+  // it (seg_ack has advanced at least to the byte past the pending
+  // segment's own last byte), the peer got it -- cancel the timer.
+  // rtx_len==0 would mean no data is pending (only a SYN could be,
+  // and a SYN's own retransmission is cancelled by the two branches
+  // above instead, never here), so this check is naturally a no-op in
+  // that case without needing a separate guard.
   if (state == tcp_state_established()) && (has_ack == 1) && (has_fin == 0) && (has_psh == 0) && (has_syn == 0) {
+    if tcp_conn_get_rtx_deadline(conn_id) != (0 as u32) {
+      let rtx_seq: u32 = tcp_conn_get_rtx_seq(conn_id);
+      let rtx_len: u32 = tcp_conn_get_rtx_len(conn_id);
+      if seg_ack >= (rtx_seq + rtx_len) {
+        let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
+      }
+    }
     return 0;
   }
 
@@ -4116,13 +4187,38 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
   return 0 - 1;
 }
 
-// Sends one data segment on an ESTABLISHED connection. No
-// retransmission tracking in this minimal scope (see this section's
-// own header comment) -- local_seq advances immediately rather than
-// waiting for the peer's ACK to confirm it.
+// Sends one data segment on an ESTABLISHED connection. local_seq
+// advances immediately rather than waiting for the peer's ACK to
+// confirm it (this project's own segments are never split/coalesced,
+// so there's no window/buffering complexity that choice would
+// otherwise create). Round 37: also buffers the segment (its starting
+// seq + payload bytes) into this connection's own retransmit slot and
+// arms the retransmit timer -- tcp_conn_check_retransmit resends it
+// if tcp_conn_handle_segment's own "pure ACK" branch never cancels the
+// timer in time. payload_len is capped at 64 bytes, tcp_conn_rtx_buf's
+// real per-connection capacity (tcp_state.S) -- every real payload
+// this project ever sends (tcpecho's own text, capped at 64 bytes by
+// the shell command itself) already fits comfortably under that.
 fn tcp_conn_send_data(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, payload: mut ref i64, payload_len: i64) -> i64 {
-  let status: i64 = tcp_send_segment(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_psh() | tcp_flag_ack(), 65535 as u32, payload, payload_len);
-  let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (payload_len as u32));
+  if (payload_len < 0) || (payload_len > (64 as i64)) {
+    return 0 - 1;
+  }
+  let seq_before: u32 = tcp_conn_get_local_seq(conn_id);
+  let status: i64 = tcp_send_segment(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), seq_before, tcp_conn_get_remote_seq(conn_id), tcp_flag_psh() | tcp_flag_ack(), 65535 as u32, payload, payload_len);
+  let _ = tcp_conn_set_local_seq(conn_id, seq_before + (payload_len as u32));
+  if status == 0 {
+    let rtx_buf: mut ref i64 = tcp_conn_get_rtx_buf(conn_id);
+    let i: i64 = 0;
+    while i < payload_len {
+      let b: u32 = buf_read_byte(payload, i as u32);
+      let _ = buf_write_byte(rtx_buf, i as u32, b);
+      i = i + 1;
+    }
+    let _ = tcp_conn_set_rtx_seq(conn_id, seq_before);
+    let _ = tcp_conn_set_rtx_len(conn_id, payload_len as u32);
+    let _ = tcp_conn_set_rtx_count(conn_id, 0 as u32);
+    let _ = tcp_conn_set_rtx_deadline(conn_id, scheduler_get_tick_count() + tcp_rtx_timeout_ticks());
+  }
   return status;
 }
 
@@ -4139,7 +4235,65 @@ fn tcp_conn_close(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i6
   return status;
 }
 
-// Round 29 (2026-08-28): the live counterpart to tcp_conn_self_test's
+// Round 37: fires whenever a connection's own pending retransmission
+// (armed by active_open for a SYN, or send_data for a data segment)
+// is actually due -- called from tcp_conn_poll on EVERY poll, for
+// BOTH connection slots, regardless of whether a frame was even
+// dequeued this call. That "regardless" is the whole point: a LOST
+// segment produces no frame at all, so nothing else could ever notice
+// the silence and react to it. Returns 0 if nothing was due (including
+// "nothing pending" -- the common case), 1 if a retransmission was
+// just sent, -1 if this connection just gave up (exceeded
+// tcp_rtx_max_retries) -- a SYN give-up resets the connection to
+// CLOSED (stuck forever in SYN_SENT otherwise); a data give-up leaves
+// the connection's own state alone, since ESTABLISHED is still
+// otherwise valid and the caller's own bounded poll loop (see
+// tcpecho's own shell command) will simply time out waiting for data
+// that never arrives, exactly the honest observable outcome for a
+// send that truly never got through.
+fn tcp_conn_check_retransmit(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
+  let deadline: u32 = tcp_conn_get_rtx_deadline(conn_id);
+  if deadline == (0 as u32) {
+    return 0;
+  }
+  if scheduler_get_tick_count() < deadline {
+    return 0;
+  }
+  let count: u32 = tcp_conn_get_rtx_count(conn_id);
+  if count >= tcp_rtx_max_retries() {
+    let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
+    if tcp_conn_get_state(conn_id) == tcp_state_syn_sent() {
+      let _ = tcp_conn_set_state(conn_id, tcp_state_closed());
+    }
+    return 0 - 1;
+  }
+
+  let local_ip: u32 = tcp_conn_get_local_ip(conn_id);
+  let local_port: u32 = tcp_conn_get_local_port(conn_id);
+  let remote_ip: u32 = tcp_conn_get_remote_ip(conn_id);
+  let remote_port: u32 = tcp_conn_get_remote_port(conn_id);
+  let rtx_seq: u32 = tcp_conn_get_rtx_seq(conn_id);
+  let rtx_len: i64 = tcp_conn_get_rtx_len(conn_id) as i64;
+  if rtx_len == 0 {
+    // Bare-SYN retransmission -- active_open's own SYN never got a
+    // reply.
+    let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, rtx_seq, 0 as u32, tcp_flag_syn(), 65535 as u32, empty_payload, 0);
+  } else {
+    // Data-segment retransmission -- send_data's own segment never
+    // got acked. Uses the CURRENT remote_seq for the ack field (this
+    // side's own view of what it expects next hasn't changed just
+    // because a retransmit is happening), same as every other
+    // outgoing segment this project builds.
+    let rtx_buf: mut ref i64 = tcp_conn_get_rtx_buf(conn_id);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, rtx_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_psh() | tcp_flag_ack(), 65535 as u32, rtx_buf, rtx_len);
+  }
+  let _ = tcp_conn_set_rtx_count(conn_id, count + (1 as u32));
+  let _ = tcp_conn_set_rtx_deadline(conn_id, scheduler_get_tick_count() + tcp_rtx_timeout_ticks());
+  return 1;
+}
+
+// Round 29 (2026-08-24): the live counterpart to tcp_conn_self_test's
 // own hand-driven "traffic cop" role. tcp_conn_active_open/
 // passive_open/handle_segment/send_data/close have all existed since
 // this whole section was written, fully correct and self-tested, but
@@ -4176,6 +4330,13 @@ fn tcp_conn_close(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i6
 // instance of the same already-accepted, not-yet-solved tradeoff,
 // not a new one.
 fn tcp_conn_poll(my_mac: mut ref i64, out_payload: mut ref i64, max_payload_len: i64) -> i64 {
+  // Round 37: checked on every call, for both connection slots,
+  // regardless of whether a frame is even queued below -- a lost
+  // segment produces no frame at all, so this is the only thing that
+  // can ever notice and react to it.
+  let _ = tcp_conn_check_retransmit(0 as u32, my_mac, my_mac);
+  let _ = tcp_conn_check_retransmit(1 as u32, my_mac, my_mac);
+
   let frame: mut ref i64 = net_recv_scratch_get();
   let frame_len: i64 = netif_recv_frame(frame, 512);
   if frame_len < 0 {
@@ -4357,6 +4518,77 @@ fn tcp_conn_recv_bounds_self_test() -> i64 {
   }
 
   let _ = uart_puts("TCP: handle_segment rejects a length field past what was actually received");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round 37: simultaneous open (RFC 793) -- both sides call
+// active_open (neither is a passive_open listener), so both start out
+// in SYN_SENT and each receives the OTHER's bare SYN instead of a
+// SYN-ACK. Real, spec-legitimate TCP behavior, not a shortcut this
+// implementation invented -- see tcp_conn_handle_segment's own new
+// SYN_SENT+bare-SYN branch. Drives this the same "traffic cop" way
+// tcp_conn_self_test already does: dequeue each side's own segment
+// via netif_recv_frame, hand it directly to the OTHER side's
+// handle_segment, and confirm the whole 4-segment exchange (two bare
+// SYNs, two SYN+ACKs) still reaches ESTABLISHED on both sides purely
+// through the EXISTING SYN_RCVD-handling machinery plus the one new
+// branch -- no other state-machine code needed changing for this.
+// Also confirms both sides' SYN retransmission timers (armed by
+// active_open) end up cancelled once the peer actually answers,
+// rather than still ticking down toward a spurious retransmit.
+fn tcp_conn_simultaneous_open_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let conn_a: u32 = 0 as u32;
+  let conn_b: u32 = 1 as u32;
+  let ip_a: u32 = 0xC0A80103 as u32;
+  let ip_b: u32 = 0xC0A80104 as u32;
+  let port_a: u32 = 54322 as u32;
+  let port_b: u32 = 8 as u32;
+
+  let _ = tcp_conn_active_open(conn_a, my_mac, my_mac, ip_a, ip_b, port_a, port_b, 2000 as u32);
+  let _ = tcp_conn_active_open(conn_b, my_mac, my_mac, ip_b, ip_a, port_b, port_a, 9000 as u32);
+
+  if tcp_conn_get_rtx_deadline(conn_a) == (0 as u32) { ok = 0; } // SYN rtx armed
+  if tcp_conn_get_rtx_deadline(conn_b) == (0 as u32) { ok = 0; }
+
+  let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let f1: mut ref i64 = dhruva_alloc_bytes(64);
+  let l1: i64 = netif_recv_frame(f1, 64); // a's bare SYN
+  let s1: i64 = tcp_conn_handle_segment(conn_b, f1, l1, my_mac, my_mac, scratch, 512);
+  if (l1 <= 0) || (s1 != 0) { ok = 0; }
+  if tcp_conn_get_state(conn_b) != tcp_state_syn_rcvd() { ok = 0; }
+
+  let f2: mut ref i64 = dhruva_alloc_bytes(64);
+  let l2: i64 = netif_recv_frame(f2, 64); // b's bare SYN
+  let s2: i64 = tcp_conn_handle_segment(conn_a, f2, l2, my_mac, my_mac, scratch, 512);
+  if (l2 <= 0) || (s2 != 0) { ok = 0; }
+  if tcp_conn_get_state(conn_a) != tcp_state_syn_rcvd() { ok = 0; }
+
+  // Both bare SYNs answered -- neither side should still be waiting to
+  // retransmit its own original SYN.
+  if tcp_conn_get_rtx_deadline(conn_a) != (0 as u32) { ok = 0; }
+  if tcp_conn_get_rtx_deadline(conn_b) != (0 as u32) { ok = 0; }
+
+  let f3: mut ref i64 = dhruva_alloc_bytes(64);
+  let l3: i64 = netif_recv_frame(f3, 64); // b's SYN+ACK (answering a's SYN)
+  let s3: i64 = tcp_conn_handle_segment(conn_a, f3, l3, my_mac, my_mac, scratch, 512);
+  if (l3 <= 0) || (s3 != 0) { ok = 0; }
+  if tcp_conn_get_state(conn_a) != tcp_state_established() { ok = 0; }
+
+  let f4: mut ref i64 = dhruva_alloc_bytes(64);
+  let l4: i64 = netif_recv_frame(f4, 64); // a's SYN+ACK (answering b's SYN)
+  let s4: i64 = tcp_conn_handle_segment(conn_b, f4, l4, my_mac, my_mac, scratch, 512);
+  if (l4 <= 0) || (s4 != 0) { ok = 0; }
+  if tcp_conn_get_state(conn_b) != tcp_state_established() { ok = 0; }
+
+  let _ = uart_puts("TCP: simultaneous open (both sides active_open) reaches ESTABLISHED");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -8587,7 +8819,80 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/netstat/tcpecho/udpecho)\n");
+  // Round 37: proves TCP retransmission recovers a REAL simulated
+  // packet loss, live -- not just that the state machine reacts
+  // correctly to hand-fed frames (the boot-time self-tests already
+  // cover that; this needs the real timer tick to actually elapse,
+  // which no boot-time self-test can ever observe since it runs
+  // before timer_ic_init/start_multitasking, hence this being a shell
+  // command like tcpecho/udpecho rather than another self-test).
+  // Sends the client's SYN, then deliberately dequeues-and-drops that
+  // exact frame before the server side ever sees it -- simulating a
+  // real lost segment directly, the same technique docs/TODO.md's own
+  // retransmission item called for, since this project's loopback
+  // netif never drops anything on its own. Sleeps out the real 2-
+  // second RTO (tcp_rtx_timeout_ticks) so tcp_conn_check_retransmit's
+  // own tick-based deadline genuinely elapses, then polls normally --
+  // the retransmitted SYN (sent by tcp_conn_poll's own retransmit
+  // check) reaches the server through the same shared queue every
+  // other live TCP/UDP/ICMP command already uses, completing the
+  // handshake despite the induced loss.
+  if shell_word_matches(line_buf, 0, cmd_end, "tcprtx") == 1 {
+    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let _ = netif_get_mac(my_mac);
+    let client_id: u32 = 0 as u32;
+    let server_id: u32 = 1 as u32;
+    let loop_ip: u32 = 0x7F000001 as u32; // 127.0.0.1
+    let client_port: u32 = 54324 as u32;
+    let server_port: u32 = 7779 as u32;
+
+    let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
+    let isn: u32 = scheduler_get_tick_count() + (2000 as u32);
+    let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    if open_status != 0 {
+      let _ = uart_puts("tcprtx: SYN send failed\n");
+      return 0;
+    }
+
+    // Deliberately drain the queue here -- normally this dequeues our
+    // own just-sent SYN directly. If task_e's own periodic
+    // dhcp_client_poll happens to preempt in the brief window between
+    // active_open sending the SYN and this drain (the same shared-
+    // netif-queue hazard task_e's own comment documents, and
+    // netif_queue_contention_self_test proves the mechanism of), it
+    // may have already dequeued-and-dropped the SYN itself, leaving
+    // this call to find an empty queue. Either way the SYN is now
+    // genuinely gone -- exactly the condition this test needs -- so
+    // this isn't treated as a failure, just two different paths to
+    // the same real loss.
+    let drop_buf: mut ref i64 = dhruva_alloc_bytes(64);
+    let _ = netif_recv_frame(drop_buf, 64);
+
+    let _ = task_sleep_ticks((tcp_rtx_timeout_ticks() + (1 as u32)) as i64);
+
+    let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+    let handshake_iter: i64 = 0;
+    while (handshake_iter < 10) && ((tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established())) {
+      let _ = tcp_conn_poll(my_mac, scratch, 512);
+      handshake_iter = handshake_iter + 1;
+    }
+
+    if (tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established()) {
+      let _ = uart_puts("tcprtx: handshake failed to recover after simulated SYN loss\n");
+      return 0;
+    }
+    let rtx_count: u32 = tcp_conn_get_rtx_count(client_id);
+    if rtx_count == (0 as u32) {
+      let _ = uart_puts("tcprtx: handshake completed but no retransmit was observed (test didn't exercise what it claims to)\n");
+      return 0;
+    }
+    let _ = uart_puts("tcprtx: recovered from simulated SYN loss via retransmission, retries=");
+    let _ = uart_put_hex32(rtx_count);
+    let _ = uart_puts(" (PASS)\n");
+    return 0;
+  }
+
+  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/netstat/tcpecho/udpecho/tcprtx)\n");
   return 0;
 }
 
@@ -8883,6 +9188,7 @@ fn kernel_main() -> i64 {
   let _ = tcp_self_test();
   let _ = tcp_conn_self_test();
   let _ = tcp_conn_recv_bounds_self_test();
+  let _ = tcp_conn_simultaneous_open_self_test();
   let _ = dhcp_self_test();
   let _ = dhcp_renewal_self_test();
   let _ = dhcp_nak_self_test();

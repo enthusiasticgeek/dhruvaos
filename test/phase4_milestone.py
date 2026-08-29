@@ -111,6 +111,20 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     # ephemeral" discipline as every prior round's own new command.
     send("netstat")
     time.sleep(SETTLE_S)
+    # Round 37: proves TCP retransmission recovers a REAL simulated
+    # packet loss (not just a hand-fed-frame self-test) -- sends a SYN,
+    # deliberately drops it, sleeps out the real ~2-second RTO, then
+    # confirms the handshake still completes via a retransmit. Placed
+    # AFTER netstat deliberately: it reuses the same two connection
+    # slots tcpecho/netstat's own checks above already exercised, and
+    # (unlike tcpecho) never closes them -- leaving conn 0/1 in
+    # ESTABLISHED would break netstat's own CLOSED_FINAL assertion if
+    # this ran first. Needs extra settle time on top of the standard
+    # SETTLE_S: the command's own internal sleep (tcp_rtx_timeout_ticks
+    # + 1 = 5 ticks = ~2.5s) plus handshake polling has to fit inside
+    # the window before the next command is sent.
+    send("tcprtx")
+    time.sleep(SETTLE_S + 4)
     # "ls" last, deliberately: every other command in this sequence has
     # a LATER command's own settle time to absorb any scheduling slack,
     # but the last command has only the trailing sleep below to work
@@ -140,6 +154,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         ("udpecho completes a live socket_udp_send/recv round trip", 'udpecho: echoed "hello-udp"'),
         ("netstat shows the ARP entry udpecho inserted", "127.0.0.1 -> 02:00:00:00:00:01"),
         ("netstat shows tcpecho's client connection closed", "conn 0 state=CLOSED_FINAL local=127.0.0.1:54322 remote=127.0.0.1:7777"),
+        ("tcprtx recovers a real simulated SYN loss via retransmission", "recovered from simulated SYN loss via retransmission"),
         ("ls shows /milestone/note", "  /milestone/note"),
     ]
 
