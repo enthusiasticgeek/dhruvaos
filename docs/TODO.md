@@ -51,18 +51,34 @@ the whole build-and-regress loop this project has used every round so
 far. Expect each to span multiple rounds/sessions, same as any
 multi-round item elsewhere in this backlog.
 
-- **USB mass storage class driver** — `[L, ~4-6 rounds]`
+- **USB mass storage class driver** — `[L, ~4-6 rounds — in progress,
+  round 33 landed the foundation]`
   Today's DWC2 driver does enumeration only (`GET_DESCRIPTOR`,
   `SET_ADDRESS`, `SET_CONFIGURATION`) — "no bulk or interrupt
   transfers, control only" per the driver's own comment. A real
   prerequisite, not optional: bulk transfer support has to land in the
   DWC2 driver first (a materially different endpoint/transfer-type
   path than control transfers), before Bulk-Only Transport (CBW/CSW)
-  and a minimal SCSI subset (`INQUIRY`, `READ CAPACITY`, `READ(10)`,
-  `WRITE(10)`, `TEST UNIT READY`) can be built on top. Fully
-  QEMU-testable throughout — `-device usb-storage` (already used every
-  round for enumeration regression) emulates a real BOT+SCSI device,
-  so bring-up and regression don't need to wait for real hardware.
+  and a minimal SCSI subset can be built on top. Fully QEMU-testable
+  throughout — `-device usb-storage` (already used every round for
+  enumeration regression) emulates a real BOT+SCSI device, so
+  bring-up and regression don't need to wait for real hardware.
+  - Done (round 33): config-descriptor parsing now actually extracts
+    (not just counts) bulk endpoint address/max-packet-size for a
+    detected Mass Storage/SCSI/BOT interface (class 0x08/subclass
+    0x06/protocol 0x50); `dwc2_bulk_out`/`dwc2_bulk_in` primitives with
+    correct generic (non-control) PID/data-toggle tracking, persistent
+    per endpoint; CBW/CSW framing and a live `TEST UNIT READY` round
+    trip, verified against QEMU's real `usb-storage` backend (correctly
+    reproduced a genuine SCSI Unit Attention on the first command, GOOD
+    status on retry — also exercising toggle tracking across a second
+    transfer). `usb-net` enumeration confirmed completely unaffected
+    (gated on the BOT interface actually being present).
+  - Remaining: a minimal SCSI command subset beyond `TEST UNIT READY`
+    (`INQUIRY`, `READ CAPACITY`, `READ(10)`, `WRITE(10)` — the last two
+    need a data-stage transfer moving a full 512-byte sector, out of
+    this round's scope since `TEST UNIT READY` has no data stage at
+    all), then FS integration.
   Natural integration point once built: the block-device abstraction
   above — a USB mass-storage device becomes a third backend behind the
   same interface as SDHOST/EMMC2, not a special case.
