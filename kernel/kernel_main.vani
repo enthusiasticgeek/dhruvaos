@@ -10607,6 +10607,552 @@ fn sha256_self_test() -> i64 {
   return 0;
 }
 
+// Round 44: ChaCha20 (RFC 8439), the crypto-primitives-foundation
+// security-roadmap item's symmetric-cipher half (SHA-256, the hash
+// half, landed in round 41 -- see docs/TODO.md). Chosen over AES for
+// the same reason recorded there: AES's standard software
+// implementations lean on table lookups that are a timing-side-
+// channel risk on hardware WITH a data cache; ChaCha20 is fast and
+// naturally constant-time without them, and ARMv6 has no AES
+// instruction extension to fall back on regardless.
+//
+// Uses round 42's own wrapping_add builtin directly -- the exact
+// mod-2^32 wraparound arithmetic ChaCha20's add-rotate-xor quarter
+// round needs, and the reason that builtin was added to vani-compiler
+// in the first place (see round 42's own commit message). No local
+// widen-mask-truncate workaround needed here the way round 41's
+// SHA-256 needed before that builtin existed.
+fn chacha20_rotl32(x: u32, n: u32) -> u32 {
+  return (x << n) | (x >> ((32 as u32) - n));
+}
+
+// Operates on `state`, a 16-word (64-byte) buffer, indices a/b/c/d
+// selecting which 4 of the 16 words this quarter round mixes -- see
+// chacha20_block's own call sites for the column/diagonal index
+// patterns RFC 8439 section 2.2 defines.
+fn chacha20_quarter_round(state: mut ref i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+  let av: u32 = buf_read_u32(state, (a * 4) as u32);
+  let bv: u32 = buf_read_u32(state, (b * 4) as u32);
+  let cv: u32 = buf_read_u32(state, (c * 4) as u32);
+  let dv: u32 = buf_read_u32(state, (d * 4) as u32);
+
+  av = wrapping_add(av, bv);
+  dv = dv ^ av;
+  dv = chacha20_rotl32(dv, 16 as u32);
+
+  cv = wrapping_add(cv, dv);
+  bv = bv ^ cv;
+  bv = chacha20_rotl32(bv, 12 as u32);
+
+  av = wrapping_add(av, bv);
+  dv = dv ^ av;
+  dv = chacha20_rotl32(dv, 8 as u32);
+
+  cv = wrapping_add(cv, dv);
+  bv = bv ^ cv;
+  bv = chacha20_rotl32(bv, 7 as u32);
+
+  let _ = buf_write_u32(state, (a * 4) as u32, av);
+  let _ = buf_write_u32(state, (b * 4) as u32, bv);
+  let _ = buf_write_u32(state, (c * 4) as u32, cv);
+  let _ = buf_write_u32(state, (d * 4) as u32, dv);
+  return 0;
+}
+
+// Produces one 64-byte keystream block into `out`. `key` is 32 bytes,
+// `nonce` is 12 bytes (RFC 8439's IETF variant -- 96-bit nonce, 32-bit
+// counter -- not the original Bernstein 64/64-bit split). `state_buf`/
+// `working_buf` are caller-supplied 64-byte scratch (no real live
+// caller exists yet for this v1 -- see fs_stat_scratch's own comment
+// history for why this project always prefers persistent/caller-
+// supplied scratch over a fresh dhruva_alloc_bytes per call once
+// something is called repeatedly; a future round wiring this into an
+// actual encryption feature should follow that same convention rather
+// than allocating fresh buffers per block).
+//
+// Key/nonce bytes load directly via buf_read_u32 with NO explicit
+// byte-order handling, unlike SHA-256's message/digest boundaries
+// (which needed manual big-endian packing since buf_read_u32/
+// buf_write_u32 are native little-endian) -- ChaCha20's OWN wire
+// format is little-endian throughout (RFC 8439 section 2.3: "the
+// state is treated as a vector of 16 32-bit words... little-endian"),
+// so the native accessor's byte order already matches the spec
+// exactly. Verified against RFC 8439 section 2.3.2's own worked
+// example before this was ported into the kernel (see
+// chacha20_self_test).
+fn chacha20_block(key: mut ref i64, counter: u32, nonce: mut ref i64, state_buf: mut ref i64, working_buf: mut ref i64, out: mut ref i64) -> i64 {
+  let _ = buf_write_u32(state_buf, 0 as u32, 0x61707865 as u32);
+  let _ = buf_write_u32(state_buf, 4 as u32, 0x3320646e as u32);
+  let _ = buf_write_u32(state_buf, 8 as u32, 0x79622d32 as u32);
+  let _ = buf_write_u32(state_buf, 12 as u32, 0x6b206574 as u32);
+
+  let i: i64 = 0;
+  while i < 8 {
+    let kw: u32 = buf_read_u32(key, (i * 4) as u32);
+    let _ = buf_write_u32(state_buf, (16 + i * 4) as u32, kw);
+    i = i + 1;
+  }
+
+  let _ = buf_write_u32(state_buf, 48 as u32, counter);
+
+  let j: i64 = 0;
+  while j < 3 {
+    let nw: u32 = buf_read_u32(nonce, (j * 4) as u32);
+    let _ = buf_write_u32(state_buf, (52 + j * 4) as u32, nw);
+    j = j + 1;
+  }
+
+  let k: i64 = 0;
+  while k < 16 {
+    let w: u32 = buf_read_u32(state_buf, (k * 4) as u32);
+    let _ = buf_write_u32(working_buf, (k * 4) as u32, w);
+    k = k + 1;
+  }
+
+  // 10 double-rounds (4 column quarter-rounds + 4 diagonal quarter-
+  // rounds each) = 20 rounds total, per RFC 8439 section 2.3.
+  let round: i64 = 0;
+  while round < 10 {
+    let _ = chacha20_quarter_round(working_buf, 0, 4, 8, 12);
+    let _ = chacha20_quarter_round(working_buf, 1, 5, 9, 13);
+    let _ = chacha20_quarter_round(working_buf, 2, 6, 10, 14);
+    let _ = chacha20_quarter_round(working_buf, 3, 7, 11, 15);
+    let _ = chacha20_quarter_round(working_buf, 0, 5, 10, 15);
+    let _ = chacha20_quarter_round(working_buf, 1, 6, 11, 12);
+    let _ = chacha20_quarter_round(working_buf, 2, 7, 8, 13);
+    let _ = chacha20_quarter_round(working_buf, 3, 4, 9, 14);
+    round = round + 1;
+  }
+
+  let m: i64 = 0;
+  while m < 16 {
+    let a: u32 = buf_read_u32(working_buf, (m * 4) as u32);
+    let b: u32 = buf_read_u32(state_buf, (m * 4) as u32);
+    let _ = buf_write_u32(out, (m * 4) as u32, wrapping_add(a, b));
+    m = m + 1;
+  }
+  return 0;
+}
+
+// Encrypts (or, identically, decrypts -- ChaCha20 is a symmetric XOR
+// stream cipher) `in_len` bytes from `in_buf` into `out_buf`, using
+// `initial_counter` as the first block's counter value (RFC 8439's
+// own convention: 1 for the first block when a protocol reserves
+// block 0 for something else, e.g. Poly1305 key derivation in the
+// AEAD construction -- not implemented here, just the cipher itself).
+// `key`/`nonce`/`state_buf`/`working_buf` match chacha20_block's own
+// parameters; `keystream_buf` is a 64-byte scratch for one block's
+// worth of keystream bytes.
+fn chacha20_encrypt(key: mut ref i64, nonce: mut ref i64, initial_counter: u32, in_buf: mut ref i64, in_len: i64, state_buf: mut ref i64, working_buf: mut ref i64, keystream_buf: mut ref i64, out_buf: mut ref i64) -> i64 {
+  let counter: u32 = initial_counter;
+  let offset: i64 = 0;
+  while offset < in_len {
+    let _ = chacha20_block(key, counter, nonce, state_buf, working_buf, keystream_buf);
+    let remaining: i64 = in_len - offset;
+    let this_block: i64 = if remaining < 64 { remaining } else { 64 };
+    let i: i64 = 0;
+    while i < this_block {
+      let p: u32 = buf_read_byte(in_buf, (offset + i) as u32);
+      let ks: u32 = buf_read_byte(keystream_buf, i as u32);
+      let _ = buf_write_byte(out_buf, (offset + i) as u32, p ^ ks);
+      i = i + 1;
+    }
+    offset = offset + 64;
+    counter = wrapping_add(counter, 1 as u32);
+  }
+  return 0;
+}
+
+fn chacha20_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if buf_read_byte(a, i as u32) != buf_read_byte(b, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// Two checks: RFC 8439 section 2.3.2's own worked block-function
+// example (a real external oracle -- the exact 64-byte keystream a
+// correct implementation must produce for a fixed key/nonce/counter,
+// byte-verified against this implementation on the host via a
+// standalone spike before ever being ported into the kernel), and an
+// encrypt-then-decrypt round trip (ChaCha20's own symmetric-XOR
+// property -- applying the identical keystream twice must recover the
+// original plaintext exactly), which exercises chacha20_encrypt's
+// multi-block counter-increment logic the single-block KAT alone
+// can't reach (the KAT is exactly one block; the round trip below
+// spans three).
+fn chacha20_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let key: mut ref i64 = dhruva_alloc_bytes(32);
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(key, i as u32, i as u32);
+    i = i + 1;
+  }
+  let nonce: mut ref i64 = dhruva_alloc_bytes(12);
+  let _ = buf_write_byte(nonce, 0 as u32, 0 as u32);
+  let _ = buf_write_byte(nonce, 1 as u32, 0 as u32);
+  let _ = buf_write_byte(nonce, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(nonce, 3 as u32, 9 as u32);
+  let _ = buf_write_byte(nonce, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(nonce, 5 as u32, 0 as u32);
+  let _ = buf_write_byte(nonce, 6 as u32, 0 as u32);
+  let _ = buf_write_byte(nonce, 7 as u32, 0x4a as u32);
+  let _ = buf_write_byte(nonce, 8 as u32, 0 as u32);
+  let _ = buf_write_byte(nonce, 9 as u32, 0 as u32);
+  let _ = buf_write_byte(nonce, 10 as u32, 0 as u32);
+  let _ = buf_write_byte(nonce, 11 as u32, 0 as u32);
+
+  let state_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let working_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let block_out: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = chacha20_block(key, 1 as u32, nonce, state_buf, working_buf, block_out);
+
+  let expected: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = buf_write_byte(expected, 0 as u32, 0x10 as u32);
+  let _ = buf_write_byte(expected, 1 as u32, 0xf1 as u32);
+  let _ = buf_write_byte(expected, 2 as u32, 0xe7 as u32);
+  let _ = buf_write_byte(expected, 3 as u32, 0xe4 as u32);
+  let _ = buf_write_byte(expected, 4 as u32, 0xd1 as u32);
+  let _ = buf_write_byte(expected, 5 as u32, 0x3b as u32);
+  let _ = buf_write_byte(expected, 6 as u32, 0x59 as u32);
+  let _ = buf_write_byte(expected, 7 as u32, 0x15 as u32);
+  let _ = buf_write_byte(expected, 8 as u32, 0x50 as u32);
+  let _ = buf_write_byte(expected, 9 as u32, 0x0f as u32);
+  let _ = buf_write_byte(expected, 10 as u32, 0xdd as u32);
+  let _ = buf_write_byte(expected, 11 as u32, 0x1f as u32);
+  let _ = buf_write_byte(expected, 12 as u32, 0xa3 as u32);
+  let _ = buf_write_byte(expected, 13 as u32, 0x20 as u32);
+  let _ = buf_write_byte(expected, 14 as u32, 0x71 as u32);
+  let _ = buf_write_byte(expected, 15 as u32, 0xc4 as u32);
+  let _ = buf_write_byte(expected, 16 as u32, 0xc7 as u32);
+  let _ = buf_write_byte(expected, 17 as u32, 0xd1 as u32);
+  let _ = buf_write_byte(expected, 18 as u32, 0xf4 as u32);
+  let _ = buf_write_byte(expected, 19 as u32, 0xc7 as u32);
+  let _ = buf_write_byte(expected, 20 as u32, 0x33 as u32);
+  let _ = buf_write_byte(expected, 21 as u32, 0xc0 as u32);
+  let _ = buf_write_byte(expected, 22 as u32, 0x68 as u32);
+  let _ = buf_write_byte(expected, 23 as u32, 0x03 as u32);
+  let _ = buf_write_byte(expected, 24 as u32, 0x04 as u32);
+  let _ = buf_write_byte(expected, 25 as u32, 0x22 as u32);
+  let _ = buf_write_byte(expected, 26 as u32, 0xaa as u32);
+  let _ = buf_write_byte(expected, 27 as u32, 0x9a as u32);
+  let _ = buf_write_byte(expected, 28 as u32, 0xc3 as u32);
+  let _ = buf_write_byte(expected, 29 as u32, 0xd4 as u32);
+  let _ = buf_write_byte(expected, 30 as u32, 0x6c as u32);
+  let _ = buf_write_byte(expected, 31 as u32, 0x4e as u32);
+  let _ = buf_write_byte(expected, 32 as u32, 0xd2 as u32);
+  let _ = buf_write_byte(expected, 33 as u32, 0x82 as u32);
+  let _ = buf_write_byte(expected, 34 as u32, 0x64 as u32);
+  let _ = buf_write_byte(expected, 35 as u32, 0x46 as u32);
+  let _ = buf_write_byte(expected, 36 as u32, 0x07 as u32);
+  let _ = buf_write_byte(expected, 37 as u32, 0x9f as u32);
+  let _ = buf_write_byte(expected, 38 as u32, 0xaa as u32);
+  let _ = buf_write_byte(expected, 39 as u32, 0x09 as u32);
+  let _ = buf_write_byte(expected, 40 as u32, 0x14 as u32);
+  let _ = buf_write_byte(expected, 41 as u32, 0xc2 as u32);
+  let _ = buf_write_byte(expected, 42 as u32, 0xd7 as u32);
+  let _ = buf_write_byte(expected, 43 as u32, 0x05 as u32);
+  let _ = buf_write_byte(expected, 44 as u32, 0xd9 as u32);
+  let _ = buf_write_byte(expected, 45 as u32, 0x8b as u32);
+  let _ = buf_write_byte(expected, 46 as u32, 0x02 as u32);
+  let _ = buf_write_byte(expected, 47 as u32, 0xa2 as u32);
+  let _ = buf_write_byte(expected, 48 as u32, 0xb5 as u32);
+  let _ = buf_write_byte(expected, 49 as u32, 0x12 as u32);
+  let _ = buf_write_byte(expected, 50 as u32, 0x9c as u32);
+  let _ = buf_write_byte(expected, 51 as u32, 0xd1 as u32);
+  let _ = buf_write_byte(expected, 52 as u32, 0xde as u32);
+  let _ = buf_write_byte(expected, 53 as u32, 0x16 as u32);
+  let _ = buf_write_byte(expected, 54 as u32, 0x4e as u32);
+  let _ = buf_write_byte(expected, 55 as u32, 0xb9 as u32);
+  let _ = buf_write_byte(expected, 56 as u32, 0xcb as u32);
+  let _ = buf_write_byte(expected, 57 as u32, 0xd0 as u32);
+  let _ = buf_write_byte(expected, 58 as u32, 0x83 as u32);
+  let _ = buf_write_byte(expected, 59 as u32, 0xe8 as u32);
+  let _ = buf_write_byte(expected, 60 as u32, 0xa2 as u32);
+  let _ = buf_write_byte(expected, 61 as u32, 0x50 as u32);
+  let _ = buf_write_byte(expected, 62 as u32, 0x3c as u32);
+  let _ = buf_write_byte(expected, 63 as u32, 0x4e as u32);
+  if chacha20_bytes_equal(block_out, expected, 64) == 0 {
+    ok = 0;
+  }
+
+  // Encrypt-then-decrypt round trip, 3 blocks (192 bytes) -- exercises
+  // chacha20_encrypt's own counter-increment loop, which the 1-block
+  // KAT above never touches.
+  let msg_len: i64 = 192;
+  let plaintext: mut ref i64 = dhruva_alloc_bytes(msg_len);
+  let pi: i64 = 0;
+  while pi < msg_len {
+    let _ = buf_write_byte(plaintext, pi as u32, ((pi * 7) & 0xFF) as u32);
+    pi = pi + 1;
+  }
+  let keystream_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let ciphertext: mut ref i64 = dhruva_alloc_bytes(msg_len);
+  let _ = chacha20_encrypt(key, nonce, 1 as u32, plaintext, msg_len, state_buf, working_buf, keystream_buf, ciphertext);
+  // A real ciphertext must not equal the plaintext byte-for-byte
+  // (would indicate the XOR never actually happened).
+  if chacha20_bytes_equal(plaintext, ciphertext, msg_len) == 1 {
+    ok = 0;
+  }
+  let decrypted: mut ref i64 = dhruva_alloc_bytes(msg_len);
+  let _ = chacha20_encrypt(key, nonce, 1 as u32, ciphertext, msg_len, state_buf, working_buf, keystream_buf, decrypted);
+  if chacha20_bytes_equal(plaintext, decrypted, msg_len) == 0 {
+    ok = 0;
+  }
+
+  let _ = uart_puts("CRYPTO: ChaCha20 vs RFC 8439 KAT + 3-block encrypt/decrypt round trip");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round 44: bignum foundation, the crypto-primitives-foundation
+// security-roadmap item's third and final piece (SHA-256 and ChaCha20
+// landed in rounds 41/44 above -- see docs/TODO.md). "Bignum/
+// asymmetric primitives (ECC point arithmetic, at minimum...) are a
+// separate, larger sub-effort on top of" the hash/cipher work, per
+// that same roadmap entry -- this round builds the arithmetic
+// FOUNDATION (add/sub/mul/compare on arbitrary-width unsigned
+// integers), deliberately not attempting modular reduction or actual
+// EC point arithmetic yet, matching this whole project's own
+// established pattern of landing one real, complete, verified slice
+// of a multi-round item at a time (e.g. USB mass storage's four
+// rounds, or SHA-256 landing before ChaCha20 within this very item).
+//
+// Representation: little-endian limbs (limb 0 = least-significant 32
+// bits) in a plain byte buffer, same raw-buffer convention as every
+// other module in this file. No fixed width is baked into the
+// functions themselves -- `n` (limb count) is a parameter throughout,
+// so the same code serves whatever width a future round's modular-
+// arithmetic/ECC work actually needs (256-bit/8-limb is the likely
+// target for a common curve like P-256, but nothing here assumes it).
+//
+// Every operation below was verified against ground truth computed
+// independently in Python (arbitrary-precision arithmetic the host
+// language already gets right) via a standalone spike before being
+// ported into the kernel -- not derived from the vani implementation
+// itself, which would only prove internal consistency, not
+// correctness.
+
+// out = a + b (n limbs each), returns the carry out of the top limb
+// (0 or 1) -- the caller's job to detect true overflow of the
+// intended bit-width, same convention hardware ADC/carry-flag
+// semantics use. Classic ripple-carry: each limb's own wraparound add
+// (via round 42's wrapping_add) can itself carry, and adding the
+// incoming carry can ALSO carry a second time -- at most one of the
+// two ever fires for a given limb (adding a 0-or-1 carry to an
+// already-wrapped sum can't wrap twice), so ORing both flags is exact,
+// not merely an approximation.
+fn bignum_add_raw(a: mut ref i64, b: mut ref i64, out: mut ref i64, n: i64) -> u32 {
+  let carry: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < n {
+    let av: u32 = buf_read_u32(a, (i * 4) as u32);
+    let bv: u32 = buf_read_u32(b, (i * 4) as u32);
+    let sum1: u32 = wrapping_add(av, bv);
+    let carry1: u32 = if sum1 < av { 1 as u32 } else { 0 as u32 };
+    let sum2: u32 = wrapping_add(sum1, carry);
+    let carry2: u32 = if sum2 < sum1 { 1 as u32 } else { 0 as u32 };
+    let _ = buf_write_u32(out, (i * 4) as u32, sum2);
+    carry = carry1 | carry2;
+    i = i + 1;
+  }
+  return carry;
+}
+
+// out = a - b (n limbs each), returns the borrow out of the top limb
+// (0 = a >= b, 1 = the true result is negative and `out` holds the
+// 2^(32n)'s-complement wraparound instead) -- same ripple-borrow
+// shape as bignum_add_raw's ripple-carry, mirrored: a limb borrows
+// when the minuend is smaller than the subtrahend, and subtracting an
+// incoming borrow can borrow a second time under the identical "at
+// most one of the two ever fires" reasoning.
+fn bignum_sub_raw(a: mut ref i64, b: mut ref i64, out: mut ref i64, n: i64) -> u32 {
+  let borrow: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < n {
+    let av: u32 = buf_read_u32(a, (i * 4) as u32);
+    let bv: u32 = buf_read_u32(b, (i * 4) as u32);
+    let diff1: u32 = wrapping_sub(av, bv);
+    let borrow1: u32 = if av < bv { 1 as u32 } else { 0 as u32 };
+    let diff2: u32 = wrapping_sub(diff1, borrow);
+    let borrow2: u32 = if diff1 < borrow { 1 as u32 } else { 0 as u32 };
+    let _ = buf_write_u32(out, (i * 4) as u32, diff2);
+    borrow = borrow1 | borrow2;
+    i = i + 1;
+  }
+  return borrow;
+}
+
+// out = a * b, where a/b are n limbs each and out is 2n limbs -- a
+// full-width product always fits in twice the input width, so unlike
+// add/sub there's no carry-out to report; the result is exact.
+// Schoolbook (O(n^2)) multiplication: every u32*u32 partial product
+// fits in 64 bits WITHOUT overflowing u64 (max (2^32-1)^2 is a few
+// bits under 2^64), and accumulating that product with the existing
+// output limb and an incoming carry (each up to 2^32-1) still can't
+// exceed u64::MAX -- verified by construction, not just assumed: the
+// worst case sums to exactly 2^64-1, still in range. This is exactly
+// why the multiply is done in u64 (widening the operands up first)
+// rather than reusing round 42's wrapping_mul, which stays within
+// u32 and would truncate the high half of every partial product.
+fn bignum_mul_raw(a: mut ref i64, b: mut ref i64, out: mut ref i64, n: i64) -> i64 {
+  let total: i64 = 2 * n;
+  let z: i64 = 0;
+  while z < total {
+    let _ = buf_write_u32(out, (z * 4) as u32, 0 as u32);
+    z = z + 1;
+  }
+  let i: i64 = 0;
+  while i < n {
+    let a_i: u64 = buf_read_u32(a, (i * 4) as u32) as u64;
+    let carry: u64 = 0 as u64;
+    let j: i64 = 0;
+    while j < n {
+      let b_j: u64 = buf_read_u32(b, (j * 4) as u32) as u64;
+      let existing: u64 = buf_read_u32(out, ((i + j) * 4) as u32) as u64;
+      let sum: u64 = existing + (a_i * b_j) + carry;
+      let _ = buf_write_u32(out, ((i + j) * 4) as u32, (sum & (4294967295 as u64)) as u32);
+      carry = sum >> (32 as u64);
+      j = j + 1;
+    }
+    // The row's final carry can itself ripple through more than one
+    // output limb (rare, but not impossible -- e.g. when several
+    // preceding rows already left near-saturated limbs behind), so
+    // this keeps propagating until it genuinely dies out rather than
+    // assuming one limb is always enough.
+    let pos: i64 = i + n;
+    let c: u64 = carry;
+    while c > (0 as u64) {
+      let existing2: u64 = buf_read_u32(out, (pos * 4) as u32) as u64;
+      let sum2: u64 = existing2 + c;
+      let _ = buf_write_u32(out, (pos * 4) as u32, (sum2 & (4294967295 as u64)) as u32);
+      c = sum2 >> (32 as u64);
+      pos = pos + 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// 1 if a > b, -1 if a < b, 0 if equal (n limbs each) -- most-
+// significant limb first, standard big-endian-style magnitude
+// comparison despite the little-endian storage, since the top limb is
+// what actually decides magnitude first.
+fn bignum_cmp_raw(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = n - 1;
+  while i >= 0 {
+    let av: u32 = buf_read_u32(a, (i * 4) as u32);
+    let bv: u32 = buf_read_u32(b, (i * 4) as u32);
+    if av > bv {
+      return 1;
+    }
+    if av < bv {
+      return 0 - 1;
+    }
+    i = i - 1;
+  }
+  return 0;
+}
+
+fn bignum_limbs_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if buf_read_u32(a, (i * 4) as u32) != buf_read_u32(b, (i * 4) as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn bignum_set_limbs4(buf: mut ref i64, l0: u32, l1: u32, l2: u32, l3: u32) -> i64 {
+  let _ = buf_write_u32(buf, 0 as u32, l0);
+  let _ = buf_write_u32(buf, 4 as u32, l1);
+  let _ = buf_write_u32(buf, 8 as u32, l2);
+  let _ = buf_write_u32(buf, 12 as u32, l3);
+  return 0;
+}
+
+// Verified against ground truth computed independently in Python
+// (arbitrary-precision arithmetic the host language already gets
+// right, not derived from this implementation) before being ported
+// in: a = 0xdeadbeefcafebabe1234567890abcdef, b =
+// 0x0123456789abcdeffedcba9876543210 (128-bit, 4 limbs each).
+fn bignum_self_test() -> i64 {
+  let ok: i64 = 1;
+  let a: mut ref i64 = dhruva_alloc_bytes(16);
+  let b: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = bignum_set_limbs4(a, 0x90abcdef as u32, 0x12345678 as u32, 0xcafebabe as u32, 0xdeadbeef as u32);
+  let _ = bignum_set_limbs4(b, 0x76543210 as u32, 0xfedcba98 as u32, 0x89abcdef as u32, 0x01234567 as u32);
+
+  let add_expected: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = bignum_set_limbs4(add_expected, 0x06ffffff as u32, 0x11111111 as u32, 0x54aa88ae as u32, 0xdfd10457 as u32);
+  let add_out: mut ref i64 = dhruva_alloc_bytes(16);
+  let add_carry: u32 = bignum_add_raw(a, b, add_out, 4);
+  if bignum_limbs_equal(add_out, add_expected, 4) == 0 {
+    ok = 0;
+  }
+  if add_carry != (0 as u32) {
+    ok = 0;
+  }
+
+  let sub_expected: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = bignum_set_limbs4(sub_expected, 0x1a579bdf as u32, 0x13579be0 as u32, 0x4152ecce as u32, 0xdd8a7988 as u32);
+  let sub_out: mut ref i64 = dhruva_alloc_bytes(16);
+  let sub_borrow: u32 = bignum_sub_raw(a, b, sub_out, 4);
+  if bignum_limbs_equal(sub_out, sub_expected, 4) == 0 {
+    ok = 0;
+  }
+  if sub_borrow != (0 as u32) {
+    ok = 0;
+  }
+
+  let mul_expected: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_u32(mul_expected, 0 as u32, 0x55618cf0 as u32);
+  let _ = buf_write_u32(mul_expected, 4 as u32, 0x236d88fe as u32);
+  let _ = buf_write_u32(mul_expected, 8 as u32, 0x32274443 as u32);
+  let _ = buf_write_u32(mul_expected, 12 as u32, 0x7f1977af as u32);
+  let _ = buf_write_u32(mul_expected, 16 as u32, 0x89c48eae as u32);
+  let _ = buf_write_u32(mul_expected, 20 as u32, 0x5c7ba373 as u32);
+  let _ = buf_write_u32(mul_expected, 24 as u32, 0xeeb2a01e as u32);
+  let _ = buf_write_u32(mul_expected, 28 as u32, 0x00fd5bde as u32);
+  let mul_out: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = bignum_mul_raw(a, b, mul_out, 4);
+  if bignum_limbs_equal(mul_out, mul_expected, 8) == 0 {
+    ok = 0;
+  }
+
+  // a > b (both are known, fixed constants above -- confirmed by
+  // inspection, not just trusting the comparison it's testing).
+  if bignum_cmp_raw(a, b, 4) != 1 {
+    ok = 0;
+  }
+  if bignum_cmp_raw(b, a, 4) != (0 - 1) {
+    ok = 0;
+  }
+  if bignum_cmp_raw(a, a, 4) != 0 {
+    ok = 0;
+  }
+
+  let _ = uart_puts("CRYPTO: bignum add/sub/mul/cmp vs independently-computed 128-bit ground truth");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Early-warning canary for the exact heap-exhaustion bug class this
 // project has now hit twice (once in fs_compact's own per-pass leak,
 // once in round 10's DHCP self-tests tipping total boot-time usage
@@ -10886,6 +11432,12 @@ fn kernel_main() -> i64 {
 
   // Round 41: crypto primitives foundation, hash-function half.
   let _ = sha256_self_test();
+
+  // Round 44: crypto primitives foundation, symmetric-cipher half.
+  let _ = chacha20_self_test();
+
+  // Round 44: crypto primitives foundation, bignum arithmetic base.
+  let _ = bignum_self_test();
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device
