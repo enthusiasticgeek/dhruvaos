@@ -43,21 +43,54 @@ _vectors:
 .word irq_entry
 .word fault_fiq
 
-/* Phase 2 doesn't recover from any of these -- just halts, so a real
+/* Phase 2 doesn't recover from most of these -- just halts, so a real
  * bug shows up as "the board stopped," not as running on into
- * corrupted state. A UART diagnostic (fault type + address) is future
- * work once there's a reason to need it; not required for this phase's
- * milestone. */
+ * corrupted state. undef/swi/reserved/fiq still have no UART
+ * diagnostic; not required for anything built so far.
+ *
+ * Round 38: fault_data_abort/fault_prefetch_abort get a real
+ * diagnostic instead -- MMU permission faults (this round's own W^X
+ * enforcement) are now a genuinely expected event, not an
+ * unrecoverable bug, and a silent `b .` would make debugging any real
+ * page-table mistake here effectively impossible (no JTAG on this
+ * project's QEMU target). Neither handler ever returns -- both halt
+ * forever after printing, same as every other fault here -- so
+ * there's no need to preserve/restore any register state, only to
+ * read the fault info before it's gone and report it.
+ *
+ * DFAR/DFSR (data) and IFAR/IFSR (prefetch) are read here, in Abort
+ * mode, BEFORE switching to SVC mode with `cps` -- the exact same
+ * proven pattern irq_entry.S already uses to reach vani code safely
+ * (Abort mode's own banked sp only needs to survive these few MRC
+ * reads, never a real push, so _abort_stack_top's 4KB is generous
+ * headroom, not a tight fit). IFAR is an ARMv6 addition (ARM1176JZF-S
+ * implements it) -- confirmed empirically as part of this round's own
+ * live verification, not just assumed from architecture docs alone,
+ * since QEMU's own source wasn't available to cross-check against
+ * this time (unlike every other peripheral in this project). */
 .global fault_undef
 .global fault_swi
-.global fault_prefetch_abort
-.global fault_data_abort
 .global fault_reserved
 .global fault_fiq
 fault_undef:
 fault_swi:
-fault_prefetch_abort:
-fault_data_abort:
 fault_reserved:
 fault_fiq:
+    b .
+
+.global fault_data_abort
+fault_data_abort:
+    mrc p15, 0, r0, c6, c0, 0   /* DFAR: data fault address */
+    mrc p15, 0, r1, c5, c0, 0   /* DFSR: data fault status */
+    cps #0x13                   /* SVC mode -- never returning, safe to
+                                  * reuse whatever's on that stack */
+    bl abort_report_data
+    b .
+
+.global fault_prefetch_abort
+fault_prefetch_abort:
+    mrc p15, 0, r0, c6, c0, 2   /* IFAR: instruction fault address */
+    mrc p15, 0, r1, c5, c0, 1   /* IFSR: instruction fault status */
+    cps #0x13
+    bl abort_report_prefetch
     b .

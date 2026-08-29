@@ -46,6 +46,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/rpi1/boot.S" -o "${BUILD_DIR}/boot.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/mmu_init.S" -o "${BUILD_DIR}/mmu_init.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/context_switch.S" -o "${BUILD_DIR}/context_switch.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -99,7 +102,7 @@ llc -mtriple="${TRIPLE}" -mcpu="${CPU}" -filetype=obj \
 
 arm-none-eabi-gcc -nostdlib -ffreestanding \
   -Wl,--gc-sections -Wl,-T,"${ROOT}/boot/rpi1/link.ld" \
-  "${BUILD_DIR}/boot.o" "${BUILD_DIR}/context_switch.o" \
+  "${BUILD_DIR}/boot.o" "${BUILD_DIR}/mmu_init.o" "${BUILD_DIR}/context_switch.o" \
   "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/vectors.o" \
   "${BUILD_DIR}/sdcard_state.o" "${BUILD_DIR}/fs_buf.o" \
   "${BUILD_DIR}/fs_state.o" "${BUILD_DIR}/shell_state.o" \

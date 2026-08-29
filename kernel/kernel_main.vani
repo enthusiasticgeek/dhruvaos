@@ -439,6 +439,63 @@ fn uart_put_hex32(v: u32) -> i64 {
   return 0;
 }
 
+// Round 38: called directly from vectors.S's fault_data_abort/
+// fault_prefetch_abort -- see that file's own comment on why these
+// exist now (MMU permission faults, this round's own W^X enforcement,
+// are a genuinely expected event rather than an unrecoverable bug,
+// and a silent halt would make any real page-table mistake here
+// undebuggable). #[no_mangle] so assembly can `bl` these by plain
+// name, the same convention irq_dispatch/scheduler_switch_from_irq
+// already establish. #[no_heap]: both only ever call uart_puts/
+// uart_put_hex32 (already proven not to allocate, used from task_d's
+// own #[no_heap] idle loop), and a fault handler is exactly the place
+// that must never depend on heap state being sane -- the fault itself
+// could have been caused by heap corruption. Neither function ever
+// returns in practice (the assembly caller always follows with `b .`
+// regardless of what these do), so the return value is unused.
+//
+// Status bits[3:0] == 0b1101 (0xD) identifies a section permission
+// fault under the plain (non-remapped, non-LPAE) ARMv6 short-
+// descriptor format this project's page table uses -- called out
+// explicitly here since it's the ONE fault type this round's own live
+// verification deliberately triggers (a write to the read-only code
+// section, or an execute attempt from an XN-marked data section) to
+// prove W^X is actually enforced, not just present in the table.
+fn abort_fault_is_section_permission(status: u32) -> i64 {
+  if (status & (0xF as u32)) == (0xD as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+#[no_mangle]
+#[no_heap]
+fn abort_report_data(addr: u32, status: u32) -> i64 {
+  let _ = uart_puts("\nFATAL: Data Abort at address ");
+  let _ = uart_put_hex32(addr);
+  let _ = uart_puts(" status=");
+  let _ = uart_put_hex32(status);
+  if abort_fault_is_section_permission(status) == 1 {
+    let _ = uart_puts(" (section permission fault)");
+  }
+  let _ = uart_puts(" -- halting\n");
+  return 0;
+}
+
+#[no_mangle]
+#[no_heap]
+fn abort_report_prefetch(addr: u32, status: u32) -> i64 {
+  let _ = uart_puts("\nFATAL: Prefetch Abort at address ");
+  let _ = uart_put_hex32(addr);
+  let _ = uart_puts(" status=");
+  let _ = uart_put_hex32(status);
+  if abort_fault_is_section_permission(status) == 1 {
+    let _ = uart_puts(" (section permission fault)");
+  }
+  let _ = uart_puts(" -- halting\n");
+  return 0;
+}
+
 // Round 28: same nibble-printing logic as uart_put_hex32 right above,
 // just two digits instead of eight -- needed for MAC address
 // formatting (AA:BB:CC:DD:EE:FF), where a full 32-bit-wide print

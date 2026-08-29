@@ -24,6 +24,21 @@ SECTIONS
     .text.boot : { *(.text.boot) }
     .text : { *(.text*) }
     .rodata : { *(.rodata*) }
+
+    /* Round 38: push everything writable (.data/.bss -- including the
+     * 256KB heap -- /stacks) to the next 1MB boundary, so the MMU's
+     * page table (mmu_init.S) can mark 0x00000000-0x000FFFFF read+
+     * execute-only (vectors+.text.boot+.text+.rodata, ~113KB today,
+     * comfortably inside this 1MB with wide margin) and everything
+     * from 0x00100000 on read+write-but-never-execute, at ARMv6's own
+     * 1MB section granularity -- with no per-file boundary tracking
+     * needed beyond this one ALIGN. Real W^X enforcement needs this
+     * gap; ARMv6 sections can't express a finer boundary than 1MB
+     * without a second-level (4KB page) table, out of this round's
+     * scope. Costs unused ADDRESS SPACE only (~896KB here), not
+     * physical RAM commitment -- a trivial trade on a 512MB board. */
+    . = ALIGN(0x100000);
+
     .data : { *(.data*) }
 
     . = ALIGN(4);
@@ -46,6 +61,20 @@ SECTIONS
     . = ALIGN(16);
     . = . + 0x1000;
     _irq_stack_top = .;
+
+    /* Round 38: 4KB Abort-mode stack, same size class as IRQ's own --
+     * boot.S never gave Abort mode a banked sp before now (nothing
+     * could trigger a Data/Prefetch Abort worth handling until this
+     * round's MMU work made permission faults a real, expected event
+     * rather than an unrecoverable bug). fault_data_abort/
+     * fault_prefetch_abort (vectors.S) switch to SVC mode before
+     * calling into vani, the exact same proven pattern irq_entry.S
+     * already uses -- so this stack only needs to hold the handful of
+     * raw MRC reads staged before that switch, not a full vani call
+     * frame. */
+    . = ALIGN(16);
+    . = . + 0x1000;
+    _abort_stack_top = .;
 
     /* No exception unwinding on bare metal, and no real .ARM.exidx
      * content to keep either -- but libgcc.a's unwind-arm.o (pulled in
