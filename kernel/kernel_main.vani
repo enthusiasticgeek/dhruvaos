@@ -252,6 +252,10 @@ extern "C" fn fs_state_get_next_block() -> u32;
 extern "C" fn fs_state_get_next_seq() -> u32;
 extern "C" fn fs_state_set_log_start(log_start: u32) -> u32;
 extern "C" fn fs_state_get_log_start() -> u32;
+// Round 36: which block-device backend fs_block_read/fs_block_write
+// dispatch to -- see fs_state.S's own comment on fs_block_dev.
+extern "C" fn fs_state_set_block_dev(dev: u32) -> u32;
+extern "C" fn fs_state_get_block_dev() -> u32;
 
 // Phase 4 -- boot/shell_state.S: the interactive shell's line buffer,
 // filled one byte at a time from irq_dispatch's new UART-RX branch
@@ -1028,6 +1032,35 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   return 0;
 }
 
+// Round 36: block-device abstraction the FS layer's own raw block I/O
+// goes through, rather than calling sdhost_read_block/write_block
+// directly -- the "block-device abstraction" docs/TODO.md called for,
+// built now that a real second backend (USB mass storage's
+// usb_msd_read10/write10, rounds 33-35) actually exists to shape it
+// against, not speculatively ahead of one. Dispatches on fs_state_
+// get_block_dev() (0=SDHOST, the permanent default for every real FS
+// operation -- boot self-tests, shell ls/cat/write, phase4_
+// milestone.py, all unchanged; 1=USB mass storage, flipped only by
+// fs_block_dev_self_check below to prove the abstraction genuinely
+// works for both backends without ever touching a real FS operation's
+// own backend). dwc2_downstream_addr() is correct here for the same
+// reason it's correct everywhere else USB mass storage is used in
+// this project: exactly one real device has ever been tested attached
+// to the one hub port this driver enumerates.
+fn fs_block_read(block_num: i64, buf: mut ref i64) -> i64 {
+  if fs_state_get_block_dev() == (1 as u32) {
+    return usb_msd_read10(dwc2_downstream_addr(), block_num as u32, buf);
+  }
+  return sdhost_read_block(block_num, buf);
+}
+
+fn fs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
+  if fs_state_get_block_dev() == (1 as u32) {
+    return usb_msd_write10(dwc2_downstream_addr(), block_num as u32, buf);
+  }
+  return sdhost_write_block(block_num, buf);
+}
+
 // Phase 3 task #4 -- minimal log-structured filesystem. NOT a general
 // POSIX filesystem (per DHRUVA_ARCHITECTURE.md's own framing): a
 // flat, append-only log of fixed-size (one SD block, 512 bytes),
@@ -1069,7 +1102,7 @@ fn fs_init() -> i64 {
                             // disk looking for the first free block.
   let highest_seq: u32 = 0 as u32;
   while blk < max_blk {
-    let rd_status: i64 = sdhost_read_block(blk, buf);
+    let rd_status: i64 = fs_block_read(blk, buf);
     if rd_status != 0 {
       break;
     }
@@ -1151,7 +1184,7 @@ fn fs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, da
   let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
   let _ = buf_write_u32(buf, 0 as u32, checksum);
 
-  let wr_status: i64 = sdhost_write_block(next_block as i64, buf);
+  let wr_status: i64 = fs_block_write(next_block as i64, buf);
   if wr_status != 0 {
     return 1;
   }
@@ -1201,7 +1234,7 @@ fn fs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   let best_seq: u32 = 0 as u32;
   let blk: i64 = log_start as i64;
   while (blk as u32) < next_block {
-    let rd_status: i64 = sdhost_read_block(blk, buf);
+    let rd_status: i64 = fs_block_read(blk, buf);
     if rd_status == 0 {
       let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
       let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
@@ -1338,7 +1371,7 @@ fn fs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) ->
   let all_ok: i64 = 1;
   let blk: i64 = log_start as i64;
   while (blk as u32) < old_next_block {
-    let rd_status: i64 = sdhost_read_block(blk, buf);
+    let rd_status: i64 = fs_block_read(blk, buf);
     if rd_status == 0 {
       let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
       let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
@@ -1436,7 +1469,7 @@ fn fs_read(path: Str, out_buf: mut ref i64) -> i64 {
     return 0 - 1;
   }
   let tmp: mut ref i64 = fs_sd_scratch_get();
-  let rd_status: i64 = sdhost_read_block(blk, tmp);
+  let rd_status: i64 = fs_block_read(blk, tmp);
   if rd_status != 0 {
     return 0 - 1;
   }
@@ -1475,7 +1508,7 @@ fn fs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i6
     return 0 - 1;
   }
   let tmp: mut ref i64 = fs_sd_scratch_get();
-  let rd_status: i64 = sdhost_read_block(blk, tmp);
+  let rd_status: i64 = fs_block_read(blk, tmp);
   if rd_status != 0 {
     return 0 - 1;
   }
@@ -1535,7 +1568,7 @@ fn fs_delete_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
   let _ = buf_write_u32(buf, 0 as u32, checksum);
 
-  let wr_status: i64 = sdhost_write_block(next_block as i64, buf);
+  let wr_status: i64 = fs_block_write(next_block as i64, buf);
   if wr_status != 0 {
     return 1;
   }
@@ -1571,7 +1604,7 @@ fn fs_list(prefix: Str) -> i64 {
   let buf: mut ref i64 = fs_sd_scratch_get();
   let blk: i64 = log_start as i64;
   while (blk as u32) < next_block {
-    let rd_status: i64 = sdhost_read_block(blk, buf);
+    let rd_status: i64 = fs_block_read(blk, buf);
     if rd_status == 0 {
       let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
       let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
@@ -6579,6 +6612,54 @@ fn usb_msd_read10_write10_check(devaddr: u32) -> i64 {
   return 0;
 }
 
+// Round 36's live milestone: prove fs_block_read/fs_block_write
+// (this round's own new block-device abstraction, see its comment
+// right after sdhost_write_block) genuinely work against the USB mass
+// storage backend too, not just SDHOST -- every real FS operation's
+// own permanent default, completely untouched by this check.
+// Temporarily flips fs_state's own block-device selector to USB mass
+// storage, writes a real pattern to a block through the SAME
+// abstraction fs_init/fs_append_raw/fs_compact/etc. call, reads it
+// back through it, byte-compares, then restores the selector to
+// SDHOST before returning -- this project's real FS never runs with
+// anything but SDHOST selected; only this one self-check ever flips
+// it, and only for the duration of these two calls. LBA 200 (distinct
+// from round 35's own LBA 100, so their host-side backing-image bytes
+// never interfere with each other) is arbitrary but safely inside the
+// 8MB test image.
+fn fs_block_dev_self_check() -> i64 {
+  let lba: i64 = 200;
+  let write_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let _ = test_fill_pattern(write_buf, 512);
+
+  let _ = fs_state_set_block_dev(1 as u32);
+  let write_status: i64 = fs_block_write(lba, write_buf);
+  let read_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let read_status: i64 = fs_block_read(lba, read_buf);
+  let _ = fs_state_set_block_dev(0 as u32); // restore before anything
+                                              // else can observe it
+
+  if write_status != 0 {
+    let _ = uart_puts("USB: fs_block_write via FS abstraction (FAIL, write_status=");
+    let _ = uart_put_hex32(write_status as u32);
+    let _ = uart_puts(")\n");
+    return 0 - 1;
+  }
+  if read_status != 0 {
+    let _ = uart_puts("USB: fs_block_read via FS abstraction (FAIL, read_status=");
+    let _ = uart_put_hex32(read_status as u32);
+    let _ = uart_puts(")\n");
+    return 0 - 1;
+  }
+  let mismatch: i64 = test_compare_buffers(write_buf, read_buf, 512);
+  if mismatch != 0 {
+    let _ = uart_puts("USB: fs_block_read/write via FS abstraction (FAIL, data mismatch)\n");
+    return 0 - 1;
+  }
+  let _ = uart_puts("USB: fs_block_read/write via FS abstraction (PASS -- USB mass storage now a real FS backend)\n");
+  return 0;
+}
+
 // The address every device answers at before the host assigns it a
 // real one. Two real addresses get handed out across this driver's
 // whole enumeration sequence -- 1 for whatever sits directly on the
@@ -6851,6 +6932,11 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
     // sector write, then a real sector read back, over the bulk
     // endpoints this same boot's config-descriptor parse discovered.
     let _ = usb_msd_read10_write10_check(downstream_addr);
+    // Round 36: prove the FS layer's own block-device abstraction
+    // (fs_block_read/fs_block_write) genuinely works against this
+    // same device, not just the low-level usb_msd_read10/write10
+    // primitives round 35 already proved.
+    let _ = fs_block_dev_self_check();
   }
   return 0;
 }

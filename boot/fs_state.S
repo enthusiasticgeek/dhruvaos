@@ -37,6 +37,22 @@ fs_log_start:
                      * just means recovery re-scans a prefix it could
                      * have skipped, never a correctness problem, only
                      * a lost optimization for that one boot. */
+fs_block_dev:
+    .word 0        /* Round 36: which block-device backend fs_block_
+                     * read/fs_block_write (kernel_main.vani) dispatch
+                     * to -- 0 = SDHOST (the permanent default for
+                     * every normal FS operation: boot self-tests,
+                     * shell ls/cat/write, phase4_milestone.py), 1 =
+                     * USB mass storage (rounds 33-35's own real,
+                     * live-proven READ(10)/WRITE(10)). .bss zero-init
+                     * means SDHOST is exactly what every existing FS
+                     * call gets with zero behavior change -- this is
+                     * purely additive, not a default switch. Only
+                     * fs_block_dev_self_check (kernel_main.vani)
+                     * temporarily flips this to prove the USB backend
+                     * actually works through the same abstraction,
+                     * then restores it before any real FS operation
+                     * runs. */
 
 .section ".text"
 
@@ -71,5 +87,18 @@ fs_state_set_log_start:
 .global fs_state_get_log_start
 fs_state_get_log_start:
     ldr r0, =fs_log_start
+    ldr r0, [r0]
+    bx lr
+
+.global fs_state_set_block_dev
+fs_state_set_block_dev:
+    ldr r1, =fs_block_dev
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global fs_state_get_block_dev
+fs_state_get_block_dev:
+    ldr r0, =fs_block_dev
     ldr r0, [r0]
     bx lr
