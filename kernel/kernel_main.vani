@@ -9956,6 +9956,62 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Round 46: the cheapest possible first step of the "Darshana"
+  // observability backlog (docs/TODO.md) -- nearly every number here
+  // already existed as a live extern accessor (heap usage from round
+  // 10's own headroom self-test, the governor's frequency history,
+  // the scheduler's own tick/ready-task counters); this just formats
+  // what's already there into one readable report, same "expose what's
+  // already there" shape as ifconfig/netstat above. Deadline-miss and
+  // per-task event counters are deliberately NOT included yet -- this
+  // project has no deadline/budget concept for a task today (see
+  // docs/TODO.md's own "per-task deadline/budget model" backlog item),
+  // and inventing a fake always-zero counter here would be actively
+  // misleading rather than merely incomplete. Round 51's event-counter
+  // work is the real place those numbers belong.
+  if shell_word_matches(line_buf, 0, cmd_end, "diagnose") == 1 {
+    let _ = uart_puts("DhruvaOS diagnose\n");
+
+    let ticks: u32 = scheduler_get_tick_count();
+    let _ = uart_puts("  uptime_ticks: ");
+    let _ = uart_put_i64(ticks as i64);
+    let _ = uart_puts("\n");
+
+    let ready: i64 = scheduler_ready_count();
+    let _ = uart_puts("  scheduler ready: ");
+    let _ = uart_put_i64(ready);
+    let _ = uart_puts(" task(s)\n");
+
+    let used: i64 = dhruva_heap_used_bytes();
+    let capacity: i64 = 262144; // DHRUVA_HEAP_BYTES, runtime_stubs.c -- same constant heap_usage_self_test uses
+    let pct: i64 = (used * 100) / capacity;
+    let _ = uart_puts("  heap: ");
+    let _ = uart_put_i64(used);
+    let _ = uart_puts(" / ");
+    let _ = uart_put_i64(capacity);
+    let _ = uart_puts(" bytes (");
+    let _ = uart_put_i64(pct);
+    // Never-freed bump allocator by design (see feedback_dhruva_
+    // never_free_heap_pattern) -- "used" only ever grows, so this
+    // figure is already this boot's own high-water mark, not merely
+    // a current snapshot.
+    let _ = uart_puts("% used, high-water mark since boot)\n");
+
+    let cur_mhz: i64 = governor_get_last_applied_mhz();
+    let _ = uart_puts("  cpu freq: ");
+    let _ = uart_put_i64(cur_mhz);
+    let _ = uart_puts(" MHz (recent history: ");
+    let _ = uart_put_i64(governor_history_get0());
+    let _ = uart_puts(", ");
+    let _ = uart_put_i64(governor_history_get1());
+    let _ = uart_puts(", ");
+    let _ = uart_put_i64(governor_history_get2());
+    let _ = uart_puts(", ");
+    let _ = uart_put_i64(governor_history_get3());
+    let _ = uart_puts(")\n");
+    return 0;
+  }
+
   // Round 29: gives the entire TCP connection API (round 22's own
   // feature ledger flagged this as the single biggest "correct, never
   // used live" gap left in this project) a real, self-contained live
@@ -10209,7 +10265,7 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/netstat/tcpecho/udpecho/tcprtx)\n");
+  let _ = uart_puts("unknown command (try ls/cat/rm/write/eval/ping/ifconfig/netstat/diagnose/tcpecho/udpecho/tcprtx)\n");
   return 0;
 }
 
