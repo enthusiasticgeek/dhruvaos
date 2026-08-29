@@ -676,3 +676,245 @@ than assumed:
 
 Still not sized (each of the bullets above is its own multi-round
 effort).
+
+## DharaFS advanced features + DhruvaOS observability ("Darshana") — distilled from 2026-08-29 brainstorm docs
+
+Distilled from two brainstorm documents the user wrote (`~/dharafs-
+idea.txt`, `~/dhruvaos-idea.txt`) — positioning/marketing framing
+("benchmark against embedded requirements, not ext4", the ext4-
+comparison table, "what Linux can't easily give you") is deliberately
+left out below as non-actionable; only concrete, buildable mechanisms
+are turned into backlog items. Several proposals turned out to
+already be substantially built — called out explicitly so future work
+extends rather than re-implements them. Everything here is new
+backlog, not committed to a schedule; ordered roughly cheapest/
+highest-leverage first within each subsection.
+
+**Already substantially in place, don't re-build:**
+`dharafs_append_raw`'s reverse-order multi-block write (every
+continuation chunk before the head, so the head's own single-block
+write is the one atomic commit point) already gives single-file
+atomic updates and power-loss consistency (the brainstorm doc's items
+3/4) — a real transaction API below would need to extend this across
+*multiple* files, not introduce atomicity that doesn't exist yet.
+Per-record checksums (`buf_checksum`) already give corruption
+detection (item 5) — real gap is only that it's a simple rotate-mix,
+not a real CRC/hash. Owner/group/other rwx (round 42) already covers
+"Built-in ACLs" (item in the differentiation table). The frequency
+governor already keeps a small history (`governor_history_get0..3`)
+and `dhruva_heap_used_bytes` already exposes live heap usage — real
+building blocks for a diagnostics command, not a green field.
+
+### DharaFS
+
+- **`dharafs_rename` + a real multi-file transaction primitive** —
+  `[M, ~2 rounds]`
+  DharaFS has no rename today (`dharafs_chmod`/`dharafs_chown`/
+  `dharafs_delete` exist, rename doesn't) — and the brainstorm doc's
+  own motivating transaction example (`write "calibration.new"` →
+  `fsync` → `rename` to the real name, as one atomic unit) depends on
+  it. First increment: `dharafs_rename_raw` (append the existing
+  record's data under the new path, preserving owner/mode, then
+  tombstone the old path) — cheap given `dharafs_append_raw`/
+  `dharafs_read_raw`/`dharafs_delete_raw` already do the hard parts.
+  Second increment, the actual ask: a `dharafs_tx_begin`/
+  `dharafs_tx_commit` pair wrapping 2+ of these calls so a crash
+  mid-transaction leaves either the fully-old or fully-new state, not
+  a partial rename — needs real design work (e.g. a small pending-
+  transaction record type recovery can detect and roll forward/back on
+  next boot), not just an API wrapper around already-atomic single ops.
+
+- **Stronger optional integrity hash for security-critical paths** —
+  `[S, ~1 round]`
+  `buf_checksum`'s rotate-mix (32 bits, not collision-resistant) is
+  fine for catching torn writes but not tamper detection. Round 41's
+  `sha256_hash` already exists — wire it in as an opt-in per-file
+  stronger digest (e.g. any path under `/firmware/` or `/certificates/`
+  also gets a stored SHA-256 alongside the existing checksum, checked
+  on read). Small, mostly plumbing, and a genuine prerequisite for the
+  security roadmap's PKI/secure-boot items above.
+
+- **Append-only log convenience API** (`dharafs_log_open`/`_append`/
+  `_sync`, automatic rollover across numbered files) — `[M, ~1-2
+  rounds]`
+  The underlying primitives (append, checksum, chain-follow) already
+  support this; what's missing is the ergonomic layer for the
+  sensor-logging use case specifically (rollover to a new numbered
+  file at a size threshold, sequence numbers, GC of old rolled files).
+  A genuinely scoped, near-term-buildable win — no new on-disk format
+  needed, just new entry points over the existing one.
+
+- **Immutable / append-only / system file attributes**
+  (`DHARA_ATTR_IMMUTABLE`/`APPEND_ONLY`/`SYSTEM`) — `[S-M, ~1 round]`
+  Extend the existing `mode` field's semantics (or add a parallel
+  attribute u32 alongside owner_uid/owner_gid/mode in the record
+  header) checked in `dharafs_write_raw_checked`/
+  `dharafs_delete_raw_checked` before the existing permission check.
+  Natural fit for `/firmware`, `/certificates`, `/config` once secure
+  boot/PKI work above exists to make tampering with them meaningful.
+
+- **Priority/deadline-aware FS request queue** — `[M, ~2 rounds —
+  shared dependency with the scheduler-side observability work below]`
+  Every `dharafs_*` call today runs synchronously inline in whatever
+  task called it — there's no separate FS request queue for a
+  higher-priority task's I/O to preempt/precede a lower-priority one's.
+  Real version needs a queue + the calling task's own priority
+  (already tracked by the scheduler) as sort key. Lower priority than
+  the items above — no current workload in this project actually
+  contends on FS access across priority levels yet, so this is
+  speculative until one does (per this project's own "don't design for
+  hypothetical requirements" discipline).
+
+- **Snapshots / versioned rollback** — `[L, several rounds, not
+  started]`
+  DharaFS is already log-structured with a full append history until
+  `dharafs_compact` reclaims it — a "snapshot" is conceptually "pin
+  sequence range N..M so compaction can't reclaim it, plus a query API
+  to read a specific historical sequence." Real complexity is in
+  `dharafs_compact`'s reclaim logic needing to respect pins it doesn't
+  know about today. Defer until a concrete use case needs it (the
+  brainstorm doc's own example — config rollback after a failed
+  update — is exactly what the transaction primitive above already
+  handles for the *single* "did the last write fully commit" case;
+  snapshots only add value for "roll back further than the last
+  write," a materially bigger ask).
+
+- **Hashed directory index, wear/erase statistics, capability tokens
+  beyond uid/gid/mode** — not started, explicitly deferred. Directory
+  lookup is already bounded by `dharafs_init`'s own 2048-block scan
+  ceiling and this project's realistic embedded file counts (tens to
+  low hundreds, not millions) — a hash index is solving a scaling
+  problem this project doesn't have yet. Wear/erase stats need a real
+  flash-aware backend (EMMC2/NAND) to mean anything; both current
+  backends (SDHOST, USB mass storage) don't expose that information at
+  this layer. Capability tokens are a genuine security-model expansion
+  beyond uid/gid/mode, sized similarly to (and worth designing
+  alongside, if ever started) the security roadmap's PKI item above —
+  not scoped further here.
+
+### DhruvaOS observability ("Darshana")
+
+Currently there is no profiling/observability subsystem at all beyond
+raw self-test PASS/FAIL output and the frequency governor's own small
+history buffer — this is genuinely new work, not an extension of an
+existing subsystem the way most DharaFS items above are. Ordered
+cheapest-and-highest-leverage first; later items depend on earlier
+ones.
+
+- **`dhruva diagnose` shell command** — `[S, ~1 round — cheapest
+  possible first step]`
+  Nearly all of its inputs already exist as extern accessors:
+  `dhruva_heap_used_bytes`, `scheduler_ready_count`,
+  `scheduler_get_tick_count`, `governor_get_last_applied_mhz`/
+  `governor_history_get0..3`. This item is mostly "add a shell command
+  that formats what's already there into one readable report" plus a
+  couple of genuinely new counters (deadline misses, allocation
+  failures — the latter now meaningful since this session's round 45
+  gave `dhruva_alloc_bytes` a real, countable OOM-fatal path instead of
+  silent NULL). The single best first round of this whole section —
+  low effort, immediately useful, and every later item in this
+  subsection adds another row to the same report rather than needing
+  its own new command.
+
+- **Self-observing kernel: event counters + ring buffer**
+  (`TASK_SWITCH`/`TASK_BLOCK`/`IRQ_ENTER`/`MUTEX_ACQUIRE`/`ALLOC`/
+  `FREE`/`IO_SUBMIT`/`FS_COMMIT` etc.) — `[M, ~2 rounds]`
+  Foundation for everything else in this subsection. Counters-only
+  first (cheap, bounded memory, matches this project's own
+  never-free-heap constraint — see
+  `feedback_dhruva_never_free_heap_pattern`); a real fixed-size ring
+  buffer of recent events (for "last N seconds" queries) is a second,
+  separable increment once counters alone prove useful. Needs a
+  concrete decision on where instrumentation hooks live (scheduler
+  context-switch path, `irq_dispatch`, `dhruva_alloc_bytes`/
+  `dhruva_prio_lock`/`dharafs_block_write` are the natural sites) and
+  what the fixed overhead budget is — this project has no
+  "instrumentation must cost < X% CPU" target set yet, worth deciding
+  explicitly before writing hooks that touch every context switch.
+
+- **Per-task runtime histograms** (p50/p90/p99/max execution time,
+  context-switch counts) — `[M, ~1-2 rounds, depends on the event
+  counters above]`
+  Buildable directly on `scheduler_get_tick_count` timestamps taken at
+  each context switch. The demo tasks (LOW/MEDIUM/HIGH) are fixed
+  hardcoded loops today with no notion of "expected" runtime, so this
+  starts as pure observation (what actually happened) before any
+  deadline/budget concept (next item) can compare against an
+  expectation.
+
+- **Per-task deadline/budget model + deadline-miss reporting** —
+  `[M-L, ~2-3 rounds]`
+  Needs a real design decision this project hasn't made yet: today's
+  demo tasks have no declared period/deadline/budget at all (unlike
+  `tcp_conn`'s own unrelated retransmission deadline field, which is
+  protocol timing, not a scheduling concept). Adding
+  `task.deadline`/`task.budget` fields and comparing actual runtime
+  against them is the real prerequisite for "why-late" queries and any
+  meaningful "deadline compliance %" health metric below.
+
+- **Priority-inversion detection/logging** — `[M, needs a design
+  choice, not started]`
+  The scheduler already implements priority-ceiling protocol for the
+  demo mutex (`dhruva_prio_lock`/`dhruva_prio_unlock`) — which
+  *prevents* inversion by construction rather than allowing it to
+  happen and detecting it after the fact. Real choice to make: (a)
+  instrument the ceiling boundary to count/log how close a call came to
+  a real inversion (a lower-priority holder blocking a higher-priority
+  waiter, bounded by the ceiling protocol's own guarantee), or (b)
+  actually implement a priority-inheritance mutex as an alternative
+  primitive where genuine inversion can occur and be measured for real.
+  Don't start building either without deciding which model this is
+  actually demonstrating.
+
+- **Fault injection framework** (dev-build-only: forced allocation
+  failure, forced FS write latency, IRQ bursts, forced retransmission)
+  — `[M, ~1-2 rounds]`
+  Directly useful for THIS session's own hardening work — round 45's
+  new `dhruva_alloc_bytes` OOM-fatal path and `test/host_harness/` have
+  no way to exercise "what happens when allocation genuinely fails
+  mid-boot on real hardware" today, only via the host harness's
+  synthetic constructions. A `dhruva fault inject alloc --after N`
+  style hook (fail the Nth call to `dhruva_alloc_bytes` instead of the
+  256KB-exhaustion path) would let the *existing* boot self-test
+  battery exercise real OOM-fatal handling under QEMU, not just the
+  host harness's assertion-based coverage. Worth prioritizing above
+  its brainstorm-doc ranking for that reason alone.
+
+- **"Why is my task late?" query + determinism-certificate report** —
+  `[L, depends on the deadline model + event ring buffer above, not
+  started]`
+  The causal-chain explanation (blocked on mutex X for Y us, preempted
+  by IRQ Z for W us) needs both the event ring buffer (to reconstruct
+  what happened) and the deadline model (to know a task WAS late) as
+  prerequisites — genuinely the most sophisticated item in this list,
+  correctly last in the brainstorm doc's own ordering.
+
+- **Incident/flight-recorder capture on watchdog reset** — `[L, not
+  started, currently blocked on a real gap]`
+  `watchdog_arm`/`watchdog_init`/`watchdog_kick` already exist
+  (Phase 2), but `watchdog_kick`'s own comment notes it is NOT
+  currently called anywhere in the scheduler loop — so today a real
+  hang would never actually trigger a watchdog reset to capture an
+  incident from. Wiring `watchdog_kick` into the real per-tick path is
+  a real prerequisite this item depends on, not just missing
+  instrumentation around an existing reset path.
+
+- **CI-integrated real-time regression thresholds** — `[M, depends on
+  the histograms above]`
+  Natural fit for this project's existing `test/*.py` convention (same
+  shape as `heap_stress.py`/`power_yank.py`) — run under QEMU, compare
+  scheduler-latency/context-switch histograms against a checked-in
+  baseline, fail on regression past a threshold. Needs the histogram
+  work above first; QEMU's own timing won't match real hardware
+  absolute numbers, so any threshold would need to be QEMU-relative
+  (regression-detection against its own prior runs), not an absolute
+  real-time guarantee claim.
+
+- **Production vs. developer profiling levels** — `[S-M, once
+  something above exists to gate]`
+  This project has no compile-time feature-flag system today (one
+  `kernel_main.vani`, compiled as a single unit) — a simple runtime
+  on/off toggle per instrumentation tier (checked at each hook site) is
+  the realistic near-term version; true compile-time stripping would
+  need a real build-flag mechanism this project doesn't have yet and
+  shouldn't be built speculatively ahead of an actual need for it.
