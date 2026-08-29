@@ -139,14 +139,99 @@ static unsigned long dhruva_heap_used = 0;
  * the race window is missed and everything looks fine, sometimes it
  * corrupts scheduling and the whole system goes silent forever. Save
  * and restore the real prior state instead of forcing it back on. */
+/* Memory-safety hardening pass (2026-08-29): dhruva_alloc_bytes
+ * returning NULL on exhaustion was never actually a safe contract --
+ * see this function's own BUG comment above documenting the exact
+ * corruption that happened the one time this project hit it for real
+ * (round 10): a caller wrote straight through the returned null with
+ * no check, corrupting low memory (the vector table lives at address
+ * 0). None of the 218 real call sites across kernel_main.vani check
+ * for null today either, and most of them are one-time boot-time
+ * scratch-buffer/self-test allocations with no sensible "try again
+ * smaller" recovery path anyway -- adding 218 individual null checks
+ * would be more code for less robustness than making the ONE place
+ * that actually detects exhaustion incapable of handing back an
+ * unchecked value at all.
+ *
+ * This makes exhaustion a loud, diagnosable, immediate halt instead --
+ * matching this project's own established "trap, don't corrupt
+ * silently" convention already used for checked arithmetic (vani's
+ * default +/-/* overflow traps) and hardware faults (boot/rpi1/
+ * vectors.S's fault_data_abort/fault_prefetch_abort, boot/rpi4/
+ * vectors.S's aarch64_fault_common) -- out-of-memory is exactly the
+ * same class of condition: unrecoverable at this layer, and far
+ * better surfaced immediately with real diagnostic data than left to
+ * manifest later as unexplained corruption. heap_usage_self_test's
+ * own boot-time 16KB-headroom canary is the thing that should catch
+ * this in practice, every time -- this halt is the backstop for
+ * whatever that canary doesn't (a runtime code path allocating far
+ * more than boot-time self-tests account for), not the primary
+ * defense. Raw MMIO UART output here (not a call into vani) matches
+ * boot/rpi1/vectors.S's own fault handlers -- this needs to work even
+ * if vani's own generated code is in a state too corrupted to trust
+ * calling back into. */
+static void dhruva_oom_putc(char c) {
+    volatile unsigned int *uart_fr = (volatile unsigned int *)0x20201018;
+    volatile unsigned int *uart_dr = (volatile unsigned int *)0x20201000;
+    while ((*uart_fr) & 0x20) {
+        /* wait while TX FIFO full (FR bit 5) */
+    }
+    *uart_dr = (unsigned int)(unsigned char)c;
+}
+
+static void dhruva_oom_puts(const char *s) {
+    while (*s != '\0') {
+        dhruva_oom_putc(*s);
+        s = s + 1;
+    }
+}
+
+static void dhruva_oom_put_u64(unsigned long long v) {
+    char digits[24];
+    int n = 0;
+    if (v == 0) {
+        dhruva_oom_putc('0');
+        return;
+    }
+    while (v > 0) {
+        digits[n] = (char)('0' + (v % 10));
+        v = v / 10;
+        n = n + 1;
+    }
+    while (n > 0) {
+        n = n - 1;
+        dhruva_oom_putc(digits[n]);
+    }
+}
+
+static void dhruva_oom_fatal(unsigned long requested, unsigned long used) {
+    dhruva_oom_puts("\nFATAL: dhruva_alloc_bytes out of memory -- requested ");
+    dhruva_oom_put_u64((unsigned long long)requested);
+    dhruva_oom_puts(" bytes, ");
+    dhruva_oom_put_u64((unsigned long long)used);
+    dhruva_oom_puts(" of ");
+    dhruva_oom_put_u64((unsigned long long)DHRUVA_HEAP_BYTES);
+    dhruva_oom_puts(" already used. Halting -- heap_usage_self_test's own"
+                     " boot-time headroom check should have caught this"
+                     " before it ever reached here; if it fires here"
+                     " instead, some runtime code path is allocating far"
+                     " more than boot-time self-tests account for.\n");
+    while (1) {
+        /* halt -- there is no safe way to continue with a request this
+         * function could not satisfy */
+    }
+}
+
 void *dhruva_alloc_bytes(long n) {
     unsigned long need = (unsigned long)n;
     unsigned long saved_cpsr;
     __asm__ volatile ("mrs %0, cpsr\n\tcpsid i" : "=r"(saved_cpsr) :: "memory");
     unsigned long aligned_used = (dhruva_heap_used + 7UL) & ~7UL;
     if (aligned_used + need > DHRUVA_HEAP_BYTES) {
+        unsigned long used_at_failure = dhruva_heap_used;
         __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
-        return (void*)0; /* out of kernel heap -- caller must check for null */
+        dhruva_oom_fatal(need, used_at_failure);
+        /* unreachable -- dhruva_oom_fatal never returns */
     }
     unsigned char *p = dhruva_heap + aligned_used;
     dhruva_heap_used = aligned_used + need;
