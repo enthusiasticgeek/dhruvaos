@@ -147,21 +147,112 @@ multi-round item elsewhere in this backlog.
   from USB, multiple LUNs, etc.) would be new scope, not a remaining
   piece of this item.
 
-- **TCP retransmission + simultaneous open** — `[M-L, ~3-4 rounds]`
-  Today's TCP is "a real, useful, correctly-sequenced happy-path
-  connection lifecycle, not a spec-complete implementation" (the
-  code's own words) — no retransmission timers, no simultaneous-open/
-  simultaneous-close, and the advertised window is never consulted.
-  Retransmission needs an RTO mechanism that fits this project's
-  poll-don't-block design (comparing `scheduler_get_tick_count()`
-  deltas against a per-segment retry deadline, not a real async
-  timer) plus per-segment retry state. Fully QEMU-testable: packet
-  loss can be synthesized directly in a self-test (deliberately not
-  delivering a segment `tcp_conn_poll` would otherwise see, then
-  checking recovery) — no real network loss scenario or hardware
-  needed. Simultaneous-open/close is a smaller, more contained
-  addition to the existing state machine once retransmission's own
-  timing plumbing exists.
+- **Boot Dhruva itself from a USB drive** — `[not sized, not started —
+  feasibility note only, per explicit request to document this for
+  later rather than build it now]`
+  Two genuinely separate problems hide under this one request, and
+  they have very different answers:
+  1. *Loading Dhruva's own kernel image from USB instead of SD.* This
+     is the SoC's boot ROM's job, not Dhruva's own code at all — on
+     real hardware, BCM2835's boot ROM reads `bootcode.bin`/`start.elf`
+     from the SD card's FAT boot partition and hands control to the
+     kernel image named there, entirely before any of this project's
+     own code has run a single instruction. **The original Raspberry
+     Pi 1 Model B's boot ROM has no USB mass storage boot path at
+     all** — unlike later models (Pi 3B+ via a bootloader EEPROM
+     update, Pi 4/400/CM4 with native USB/NVMe boot support), Pi 1's
+     boot ROM can only ever load from the SD card slot. This is a hard
+     ceiling on the CURRENT hardware target, not a software gap — no
+     amount of work inside Dhruva itself can make the Pi 1's own boot
+     ROM do something it was never built to do. (This project's QEMU
+     testing loads the kernel directly via `-kernel`, bypassing the
+     real boot ROM path entirely, so it can't reveal this limitation —
+     it only shows up against real Pi 1 hardware, tying back to the
+     project's own planned hardware-in-loop phase.)
+  2. *Using a USB drive as Dhruva's own filesystem storage once
+     already running* (as opposed to loading the kernel from it). This
+     is the piece rounds 33-36 above already deliver the low-level
+     primitives for (`fs_block_read`/`fs_block_write` genuinely work
+     against USB mass storage) — what's still missing is selecting
+     that backend BEFORE `fs_init()` runs and validating the full
+     self-test/normal-operation battery against a freshly-attached,
+     unformatted USB device (the scope note on the USB mass storage
+     item above). This part is real, buildable software work, not
+     blocked by hardware — it's just not been asked for yet.
+  **ROI assessment for right now**: not worth doing. Problem 1 is
+  outright infeasible on the current Pi 1 target regardless of effort
+  spent, and only becomes possible by targeting different hardware
+  (Pi 3B+ or later, or the already-planned Pi 4/5 port in
+  `docs/PORTING.md`) or by building a separate small SD-resident
+  chain-loader stage that itself fetches the real kernel from USB — a
+  distinct bootloader project of its own, not an extension of anything
+  in this backlog. Problem 2 is feasible today but low-value in
+  isolation: this project's own boot flow always has a working SD
+  card path already, so "the OS's whole filesystem can also live on
+  USB" doesn't unlock anything new that mass-storage-as-a-second-
+  backend (already done) doesn't already demonstrate.
+  **Revisit this** if either becomes true: (a) the project's hardware
+  target moves to something with real USB boot ROM support (Pi 3B+/4/5
+  or a Compute Module), making problem 1 tractable without a
+  chain-loader; or (b) there's a concrete reason to want the FS's
+  primary storage to be USB rather than SD specifically (problem 2
+  alone), at which point it's a small, well-understood extension of
+  the existing `fs_block_dev` selector — pick it before `fs_init()`
+  runs instead of only inside `fs_block_dev_self_check`, and validate
+  the existing self-test battery against it.
+
+- **TCP retransmission + simultaneous open** — `[M-L, ~3-4 rounds —
+  DONE in one round (37); simultaneous-CLOSE and the advertised
+  window remain genuinely out of scope, see below]`
+  Today's TCP was "a real, useful, correctly-sequenced happy-path
+  connection lifecycle, not a spec-complete implementation" — no
+  retransmission timers, no simultaneous-open/simultaneous-close, and
+  the advertised window never consulted.
+  - Done (round 37): per-connection retransmission state
+    (`tcp_state.S`'s new `rtx_deadline`/`rtx_count`/`rtx_seq`/`rtx_len`
+    + a 64-byte-per-connection retransmit buffer) and
+    `tcp_conn_check_retransmit`, called from `tcp_conn_poll` on every
+    poll for both connection slots regardless of whether a frame was
+    even dequeued that call — the only way to ever notice a genuinely
+    lost segment, which produces no frame at all. Covers both SYN
+    retransmission (`tcp_conn_active_open` arms it, no payload
+    buffering needed) and data-segment retransmission
+    (`tcp_conn_send_data` buffers the exact bytes sent); cancelled on
+    progress (a matching SYN-ACK, or a pure ACK covering the buffered
+    data's own sequence range) via `tcp_conn_handle_segment`. RTO
+    fixed at 4 ticks (2 real seconds, `timer_ic_init`'s own 500ms
+    interval) with 3 retries before giving up. Live-verified with a
+    new `tcprtx` shell command — the actual RTO could never be
+    observed by a boot-time self-test (those run before
+    `timer_ic_init`/`start_multitasking`, so `scheduler_get_tick_
+    count()` never advances during one), so this needed to be a live
+    shell command like `tcpecho`/`udpecho`, not another self-test:
+    sends a real SYN, deliberately drops it (discovered live that
+    `task_e`'s own periodic `dhcp_client_poll` can occasionally beat
+    the test to the drop via the already-documented shared-queue
+    hazard — made the test robust to either path removing the frame,
+    since the outcome is identical either way), sleeps out the real
+    RTO via `task_sleep_ticks`, then confirms the handshake still
+    completes and `tcp_conn_get_rtx_count` shows at least one genuine
+    retry. Formalized into `phase4_milestone.py`, verified reliable
+    across 2 runs.
+  - Done (round 37): simultaneous open (RFC 793) — both sides calling
+    `active_open` land in SYN_SENT and each receives the peer's bare
+    SYN instead of a SYN-ACK. Handled by one new branch in
+    `tcp_conn_handle_segment` (bare SYN while in SYN_SENT → send
+    SYN+ACK, move to SYN_RCVD) that reuses the EXISTING SYN_RCVD→
+    ESTABLISHED transition unchanged — no other state-machine code
+    needed to change. Verified with a new boot-time self-test
+    (`tcp_conn_simultaneous_open_self_test`, no timing dependency
+    needed since this is purely about segment-ordering logic, not
+    timers) using the same hand-fed-frame "traffic cop" technique
+    `tcp_conn_self_test` already established.
+  - Explicitly NOT done, and not attempted this round: simultaneous
+    CLOSE (both sides sending FIN before seeing the peer's), and the
+    advertised window being consulted at all (still accepted, never
+    enforced). Neither was needed to satisfy "retransmission and
+    simultaneous open" as asked; flagged here rather than silently
+    left implicit, in case either matters for a future round.
 
 - **FS directory hierarchy + multi-block files + journaling
   hardening** — `[L, ~4-5 rounds]`
@@ -213,6 +304,149 @@ of any kind. NEON (Advanced SIMD) was introduced with ARMv7-A and
 needs a Cortex-A-class core; it becomes available "for free" (nothing
 to build) whenever the Pi 4/5 port (Cortex-A72/A76, both ARMv8-A)
 happens — see `docs/PORTING.md`. Nothing to do for it before then.
+
+## Security hardening roadmap (2026 landscape — documentation only, nothing started)
+
+Requested as a forward-looking list, not a commitment to build any of
+it soon. Dhruva has **zero cryptographic primitives anywhere in the
+codebase today** — no hashing, no symmetric cipher, no asymmetric
+crypto, nothing. Every item below except memory-protection hardening
+depends on that not being true anymore, so it's listed first as the
+real prerequisite everything else blocks on, not because it was asked
+for by name.
+
+- **Crypto primitives foundation** — `[L, ~3-5 rounds — the real
+  prerequisite for PKI/secure boot/media encryption below]`
+  A hash function (SHA-256 is the sane default: simple, no S-boxes/
+  lookup tables to get constant-time on hardware with no cache anyway
+  — see the AI-attack-hardening item below for why that lack of cache
+  is an accidental advantage here) and a symmetric cipher (ChaCha20
+  over AES: AES's standard software implementations lean on table
+  lookups that are a timing-side-channel risk on hardware WITH a
+  cache; ChaCha20 was designed for fast, naturally constant-time
+  software implementation without them, and ARMv6 has no AES
+  instruction extension to fall back on regardless). Needs vani to
+  actually support the bit-twiddling this requires efficiently
+  (rotates, XOR-heavy loops) — worth a small spike to confirm before
+  committing to the full build. Bignum/asymmetric primitives (ECC
+  point arithmetic, at minimum, for anything below needing real
+  signatures) are a separate, larger sub-effort on top of this.
+  Fully QEMU-testable via known-answer test vectors (NIST's own SHA-256
+  KATs, the ChaCha20 RFC 8439 test vectors) — no hardware or network
+  needed to verify a hash/cipher implementation is byte-correct.
+
+- **Packet filtering / iptables-equivalent** — `[M, ~2-3 rounds]`
+  A rule table (allow/deny by src/dst IP, port, protocol) with a hook
+  at each protocol's own `*_poll` entry point
+  (`icmp_poll`/`socket_udp_recv`/`tcp_conn_poll`), dropping a match
+  before it reaches the state machine. Doesn't need real crypto or
+  real off-box networking to build or verify the RULE-MATCHING logic
+  itself — synthetic crafted frames (the same technique `tcp_conn_
+  recv_bounds_self_test`/`netif_queue_contention_self_test` already
+  use) exercise it fully under QEMU. Real value is currently capped by
+  this project's own loopback-only netif (see the Dhruva Feature
+  Ledger's "known real-hardware-only gaps" — DHCP never actually binds,
+  `ping` only ever reaches itself) — a filter has nothing genuinely
+  hostile to filter against until real off-box traffic exists, but the
+  mechanism is honestly buildable and testable now regardless.
+
+- **PKI (Public Key Infrastructure)** — `[XL, several rounds beyond
+  the crypto foundation above]`
+  Real PKI means X.509 certificate parsing (a nontrivial ASN.1/DER
+  parser, a genuinely large and historically bug-prone piece of code
+  in any language) plus chain-of-trust validation against root CAs.
+  Depends entirely on the crypto primitives item above (signature
+  verification needs working asymmetric crypto first). A realistic
+  FIRST increment, if ever started, is raw public-key trust (pin a
+  known key, verify a signature against it directly) with no X.509/CA
+  chain at all — full X.509 is a separate, much larger step after
+  that, not a package deal.
+
+- **Media (at-rest) encryption** — `[M-L, ~2-3 rounds beyond the
+  crypto foundation]`
+  Encrypt FS blocks before `fs_block_write`/after `fs_block_read`
+  (the block-device abstraction rounds 33-36 built is the natural
+  integration point — a cipher becomes a transform in that same
+  pipeline, not a separate subsystem). Needs a key-management story
+  this hardware can't help with: BCM2835 has no TPM, no secure
+  element, no hardware key storage of any kind, so a key has to come
+  from somewhere software-only (a passphrase-derived key entered at
+  boot, most realistically) — that's a real design decision to make
+  up front, not a detail to defer.
+
+- **Secure boot** — `[not sized — hits the SAME hard hardware ceiling
+  as USB boot, see docs/TODO.md's own USB-boot feasibility note above]`
+  Real secure boot means a hardware-anchored, cryptographically
+  verified chain from an immutable root of trust through every stage
+  that runs before the OS itself does. **The original Raspberry Pi 1
+  Model B's boot ROM has no signature-verification capability at
+  all** — same hard ceiling as USB boot, and for the same underlying
+  reason (this SoC generation's boot ROM predates that class of
+  feature; later models added OTP-based signing in their own
+  bootloader/EEPROM updates). No amount of work inside Dhruva's own
+  code changes what the boot ROM itself is capable of verifying before
+  Dhruva ever gets to run. A real, achievable, SMALLER substitute that
+  doesn't need boot ROM cooperation: Dhruva verifying a signature over
+  something IT loads at runtime (a config file, an update payload)
+  before trusting it — genuinely useful, buildable on the crypto
+  foundation above, but a different and much smaller claim than
+  "secure boot" in the hardware-root-of-trust sense. Revisit the
+  hardware-rooted version only if the target ever moves to hardware
+  that actually supports it (Pi 4/5, which do have OTP-based secure
+  boot — see `docs/PORTING.md`).
+
+- **PQC (Post-Quantum Cryptography)** — `[XL+, genuinely disproportionate
+  to this project's current scope — recorded because asked for, not
+  recommended]`
+  NIST-standardized PQC (ML-KEM/Kyber, ML-DSA/Dilithium, SPHINCS+)
+  needs either lattice arithmetic (polynomial rings, number-theoretic
+  transforms) or hash-based signature trees — genuinely advanced
+  cryptographic engineering, a multi-month undertaking even in
+  well-resourced projects with existing reference implementations to
+  port from, let alone building it from scratch in vani on bare-metal
+  ARMv6. Worth being honest about the actual motivating threat model
+  too: PQC defends against "harvest now, decrypt later" attacks on
+  long-lived confidential traffic crossing real networks — this
+  project's own networking is still loopback-only/demo-scoped (per the
+  Dhruva Feature Ledger), so the threat PQC exists to counter doesn't
+  apply to anything Dhruva actually does yet. Not recommended before
+  the classical crypto foundation above exists AND real off-box
+  networking is a going concern — at that point, this is worth
+  revisiting as its own dedicated, multi-round research-heavy effort,
+  not a normal backlog item.
+
+- **Hardening against sophisticated/AI-accelerated attacks** — `[ongoing
+  discipline, not a discrete buildable item]`
+  "AI-sophistication" mostly means the SAME bug classes this project
+  already fights (buffer overreads, integer overflow, use of untrusted
+  lengths — the "reject, don't guess" pattern audited into nearly
+  every parse site so far) get found faster and more thoroughly by
+  automated fuzzing/exploit-generation, not that a qualitatively new
+  defense category is needed. Two concrete, honestly-scoped responses:
+  1. **Continue the existing audit discipline** (this backlog's own
+     established practice) rather than treating "AI attacks" as a
+     separate initiative — it's the same threat model at higher
+     volume, not a different one.
+  2. **Enable real memory protection** — `[L, several rounds, its own
+     real item]`: the MMU is currently OFF for this entire image (see
+     `context_switch.S`'s own comments on why, going back to round
+     16-18's memory-ordering work) — meaning there is no page-level
+     read/write/execute separation anywhere in Dhruva today; every
+     page is fully readable, writable, AND executable simultaneously.
+     Turning the MMU on with even basic W^X page permissions (code
+     pages executable-but-read-only, data/stack pages
+     writable-but-never-executable) would be a genuine, concrete
+     hardening step, independent of any "AI" framing — it closes off
+     an entire class of code-injection exploitation that currently has
+     no obstacle at all. This is arguably the single highest-value
+     item in this whole security section relative to its effort, and
+     doesn't depend on the crypto foundation above at all. One
+     accidental upside of this project's current MMU-off, cache-off
+     design worth noting: it also means NO cache-timing side-channel
+     surface exists today (there's no cache to leak through) — a
+     property worth explicitly preserving (e.g., picking ChaCha20 over
+     table-lookup-heavy AES above) rather than losing by accident once
+     the MMU/caching eventually does get enabled for the Pi 4/5 port.
 
 ## Hardware-in-loop testing (once a real Pi 1B is available)
 
