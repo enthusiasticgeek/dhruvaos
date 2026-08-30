@@ -591,16 +591,22 @@ for by name.
   has no TPM, no secure element, no hardware key storage of any kind),
   so a key has to come from somewhere software-only — a passphrase
   entered at boot (via the existing UART shell) is the most realistic
-  starting point, with a KDF (this project has no PBKDF2/Argon2 today —
-  a new, small addition) deriving the actual ChaCha20 key from it.
+  starting point, with a KDF deriving the actual ChaCha20 key from it
+  — PBKDF2-HMAC-SHA256, the SAME primitive the "Real authentication"
+  item above needs; build whichever of the two comes first and the
+  other reuses it, rather than two independent KDF implementations.
   Nonce management also needs a real answer (ChaCha20's 96-bit nonce
   must never repeat under the same key — a per-block counter derived
   from the block number itself, matching this project's own `dev`/
   block-number addressing already in `dharafs_block_read`/`_write`, is
   the natural choice, not a random nonce needing its own persistent
-  state). Lower priority than packet filtering above (no live-traffic
-  angle to demonstrate it against the way filtering now has), but
-  genuinely ready to start whenever picked up.
+  state). **Also needs Poly1305** (see the crypto-foundation gap noted
+  above) — raw ChaCha20 alone gives confidentiality with no integrity,
+  meaning a corrupted/tampered block would decrypt to silently wrong
+  data instead of being detected; not real security without it. Lower
+  priority than packet filtering above (no live-traffic angle to
+  demonstrate it against the way filtering now has), but genuinely
+  ready to start whenever picked up.
 
 - **Secure boot** — `[not sized — hits the SAME hard hardware ceiling
   as USB boot, see docs/TODO.md's own USB-boot feasibility note above]`
