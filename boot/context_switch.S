@@ -74,6 +74,28 @@ tick_count:
     .word 0
 current_task:
     .word 0
+context_switch_count:
+    .word 0             /* Round 53: total number of times scheduler_
+                         * pick_next actually changed current_task to a
+                         * DIFFERENT task -- not just how many times it
+                         * ran (which happens every tick regardless of
+                         * whether anything changed). A real,
+                         * workload-independent metric: this counts
+                         * genuine scheduling activity no matter what
+                         * the running tasks actually do, unlike a
+                         * deadline/budget model (which needs a real
+                         * timing-constrained task to mean anything --
+                         * see docs/TODO.md's own note on why that's
+                         * deferred). */
+prio_lock_count:
+    .word 0             /* Round 53: total number of dhruva_prio_lock
+                         * calls -- how many times any task entered a
+                         * ceiling-protected critical section. */
+irq_count:
+    .word 0             /* Round 53: total number of IRQs serviced
+                         * (both the 500ms timer tick and UART RX) --
+                         * incremented from kernel_main.vani's own
+                         * irq_dispatch, which runs on every one. */
 
 .section ".text"
 
@@ -133,6 +155,16 @@ spn_next:
     add r9, r9, #1
     b spn_loop
 spn_done:
+    cmp r8, r3                     /* did the picked task actually
+                                    * change from current? (r10/r11 are
+                                    * free scratch here -- unused by
+                                    * the rest of this function) */
+    beq spn_no_switch
+    ldr r10, =context_switch_count
+    ldr r11, [r10]
+    add r11, r11, #1
+    str r11, [r10]
+spn_no_switch:
     str r8, [r2]                   /* current_task = best index */
     ldr r6, =sp_table
     ldr r0, [r6, r8, lsl #2]      /* r0 = sp_table[best] */
@@ -222,6 +254,22 @@ task_sleep_ticks:
  * lock-state/switch is needed here. */
 .global dhruva_prio_lock
 dhruva_prio_lock:
+    // BUG (found live, round 53, via a genuinely corrupted UART byte
+    // stream under QEMU -- caught by power_yank.py itself failing to
+    // even decode the output, not a subtle test assertion): this used
+    // r4/r5 as scratch for the new counter increment. dhruva_prio_lock
+    // is called directly from vani-COMPILED C code (not just other
+    // hand-written asm in this file), and r4-r11 are CALLEE-SAVED
+    // under AAPCS -- the compiler is free to keep a live variable in
+    // r4 or r5 across this call, and clobbering them without saving/
+    // restoring silently corrupts whatever the caller had there. r1/r2
+    // below are safe (caller-saved scratch registers, and r2 is
+    // already reassigned by the pre-existing code right after, same
+    // pattern this function already used for r2/r3 before this fix).
+    ldr r1, =prio_lock_count
+    ldr r2, [r1]
+    add r2, r2, #1
+    str r2, [r1]
     ldr r2, =current_task
     ldr r3, [r2]
     ldr r2, =eff_prio_table
@@ -383,6 +431,33 @@ mem_barrier:
 .global scheduler_get_tick_count
 scheduler_get_tick_count:
     ldr r0, =tick_count
+    ldr r0, [r0]
+    bx lr
+
+.global context_switch_count_get
+context_switch_count_get:
+    ldr r0, =context_switch_count
+    ldr r0, [r0]
+    bx lr
+
+.global prio_lock_count_get
+prio_lock_count_get:
+    ldr r0, =prio_lock_count
+    ldr r0, [r0]
+    bx lr
+
+.global irq_count_increment
+irq_count_increment:
+    ldr r0, =irq_count
+    ldr r1, [r0]
+    add r1, r1, #1
+    str r1, [r0]
+    mov r0, r1
+    bx lr
+
+.global irq_count_get
+irq_count_get:
+    ldr r0, =irq_count
     ldr r0, [r0]
     bx lr
 

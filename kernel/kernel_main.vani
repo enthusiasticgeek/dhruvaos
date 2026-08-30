@@ -186,6 +186,15 @@ extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut
 extern "C" fn task_sleep_ticks(ticks: i64) -> i64;
 extern "C" fn dhruva_prio_lock(ceiling: i64) -> i64;
 extern "C" fn dhruva_prio_unlock(base_priority: i64) -> i64;
+// Round 53: real, workload-independent scheduler/interrupt event
+// counters (boot/context_switch.S) -- see docs/TODO.md's own note on
+// why these are built now while a deadline/priority-inversion model
+// is deliberately deferred until a real timing-constrained workload
+// exists to attach it to.
+extern "C" fn context_switch_count_get() -> i64;
+extern "C" fn prio_lock_count_get() -> i64;
+extern "C" fn irq_count_increment() -> i64;
+extern "C" fn irq_count_get() -> i64;
 // Phase 5: cpu_wfi/scheduler_ready_count -- context_switch.S.
 extern "C" fn cpu_wfi() -> i64;
 extern "C" fn scheduler_ready_count() -> i64;
@@ -3789,6 +3798,7 @@ fn dharafs_print_data(buf: mut ref i64, byte_len: i64) -> i64 {
 // this call, 0 otherwise, so irq_entry.S can pass that flag through to
 // scheduler_switch_from_irq and gate the tick_count increment on it.
 fn irq_dispatch() -> i64 {
+  let _ = irq_count_increment();
   let ic_pending1: i64 = 0x2000B204;
   let pending: u32 = mmio_read_u32(ic_pending1);
   let was_timer_tick: i64 = 0;
@@ -11286,6 +11296,21 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("  FS commits: ");
     let _ = uart_put_i64(dharafs_commit_count_get() as i64);
     let _ = uart_puts(" total (successful dharafs_block_write calls)\n");
+
+    // Round 53: real scheduler/interrupt activity counters -- see
+    // docs/TODO.md for why a deadline/priority-inversion model isn't
+    // here yet (needs a real timing-constrained workload to mean
+    // anything; these three don't, they're real regardless of what
+    // the running tasks actually do).
+    let _ = uart_puts("  context switches: ");
+    let _ = uart_put_i64(context_switch_count_get());
+    let _ = uart_puts(" total (scheduler_pick_next picked a DIFFERENT task)\n");
+    let _ = uart_puts("  IRQs serviced: ");
+    let _ = uart_put_i64(irq_count_get());
+    let _ = uart_puts(" total (timer tick + UART RX combined)\n");
+    let _ = uart_puts("  prio_lock calls: ");
+    let _ = uart_put_i64(prio_lock_count_get());
+    let _ = uart_puts(" total (ceiling-protected critical section entries)\n");
     return 0;
   }
 

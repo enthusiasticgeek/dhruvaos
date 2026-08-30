@@ -281,6 +281,10 @@ uint32_t ptr_to_u32(int64_t *p) { return (uint32_t)(uintptr_t)p; }
  * ================================================================== */
 
 int64_t mem_barrier(void) { return 0; }
+int64_t context_switch_count_get(void) { return 0; }
+int64_t prio_lock_count_get(void) { return 0; }
+int64_t irq_count_increment(void) { return 0; }
+int64_t irq_count_get(void) { return 0; }
 int64_t cpu_wfi(void) { return 0; }
 int64_t enable_irqs(void) { return 0; }
 int64_t dhruva_prio_lock(int64_t ceiling) { return ceiling; }
