@@ -82,6 +82,12 @@ fault_fiq:
 fault_data_abort:
     mrc p15, 0, r0, c6, c0, 0   /* DFAR: data fault address */
     mrc p15, 0, r1, c5, c0, 0   /* DFSR: data fault status */
+    /* Round 60 crash investigation: lr_abt (data abort convention) =
+     * address of the aborting instruction + 8 -- capture it as r2
+     * BEFORE the mode switch below, since lr is banked per-mode and
+     * this value would otherwise be gone the instant SVC mode's own
+     * lr_svc becomes current. */
+    sub r2, lr, #8
     cps #0x13                   /* SVC mode -- never returning, safe to
                                   * reuse whatever's on that stack */
     bl abort_report_data

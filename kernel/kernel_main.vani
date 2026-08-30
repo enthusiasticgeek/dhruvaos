@@ -236,6 +236,7 @@ extern "C" fn mem_barrier() -> i64;
 // scheduler_get_tick_count has the full story: DHCP's new lease-
 // renewal timer needs a read-only view of elapsed scheduler time.
 extern "C" fn scheduler_get_tick_count() -> u32;
+extern "C" fn current_task_get() -> u32;
 // TEST-ONLY -- see context_switch.S's own comment on
 // scheduler_set_tick_count_test_only.
 extern "C" fn scheduler_set_tick_count_test_only(value: u32) -> i64;
@@ -687,7 +688,7 @@ fn abort_fault_is_section_permission(status: u32) -> i64 {
 
 #[no_mangle]
 #[no_heap]
-fn abort_report_data(addr: u32, status: u32) -> i64 {
+fn abort_report_data(addr: u32, status: u32, fault_pc: u32) -> i64 {
   let _ = uart_puts("\nFATAL: Data Abort at address ");
   let _ = uart_put_hex32(addr);
   let _ = uart_puts(" status=");
@@ -695,6 +696,10 @@ fn abort_report_data(addr: u32, status: u32) -> i64 {
   if abort_fault_is_section_permission(status) == 1 {
     let _ = uart_puts(" (section permission fault)");
   }
+  let _ = uart_puts(" pc=");
+  let _ = uart_put_hex32(fault_pc);
+  let _ = uart_puts(" current_task=");
+  let _ = uart_put_hex32(current_task_get());
   let _ = uart_puts(" -- halting\n");
   return 0;
 }
@@ -15063,7 +15068,23 @@ fn kernel_main() -> i64 {
   // free slot" -- see task_table_init's own comment in
   // context_switch.S for the full story.
   let _ = task_table_init();
-  let custom_stack_bytes: u32 = 512 as u32;
+  // Round 60 crash investigation: was 512 bytes (matching this fn's own
+  // #[bounded_stack(bytes=512)] budget exactly, with zero headroom --
+  // unlike EVERY other task in this project, which all get generous
+  // multiples of their own verified worst case (task_a-d: 4096 bytes;
+  // task_e/f: 16384). Confirmed via a live crash (Data Abort, near-
+  // null/wild fault addresses, "current_task=6" i.e. this exact task)
+  // that reproduces far FASTER when this allocation is shrunk further
+  // (128 bytes crashes within ~60s vs. 512 bytes taking 150-550s) --
+  // direct empirical proof this is a real stack overflow, even though
+  // the static #[bounded_stack] checker's own (admittedly approximate,
+  // "conservative estimator, not an exact analysis" per its own docs)
+  // model reports only ~220 bytes of real worst-case usage for this
+  // function. Raised to match every other task's own established
+  // "verified minimum, plus real headroom" convention rather than
+  // trusting the bare static minimum -- see docs/TODO.md for the full
+  // investigation writeup.
+  let custom_stack_bytes: u32 = 4096 as u32;
   let custom_stack: mut ref i64 = dhruva_alloc_bytes(custom_stack_bytes as i64);
   let custom_task_id: u32 = task_create(task_custom_demo, custom_stack, custom_stack_bytes, 3 as u32);
   let _ = uart_puts("task_create: new task id=");
@@ -15075,10 +15096,12 @@ fn kernel_main() -> i64 {
   // context_switch.S, and task_mutex_demo_low/high's own comment
   // above). Two more dynamically-created tasks, same one-time-
   // allocation-per-task-stack pattern as task_custom_demo above.
-  let mutex_low_stack_bytes: u32 = 512 as u32;
+  // Round 60: same fix, same reasoning as custom_stack_bytes above --
+  // was 512 bytes with zero headroom, raised to match project convention.
+  let mutex_low_stack_bytes: u32 = 4096 as u32;
   let mutex_low_stack: mut ref i64 = dhruva_alloc_bytes(mutex_low_stack_bytes as i64);
   let mutex_low_task_id: u32 = task_create(task_mutex_demo_low, mutex_low_stack, mutex_low_stack_bytes, 2 as u32);
-  let mutex_high_stack_bytes: u32 = 512 as u32;
+  let mutex_high_stack_bytes: u32 = 4096 as u32;
   let mutex_high_stack: mut ref i64 = dhruva_alloc_bytes(mutex_high_stack_bytes as i64);
   let mutex_high_task_id: u32 = task_create(task_mutex_demo_high, mutex_high_stack, mutex_high_stack_bytes, 0 as u32);
   let _ = uart_puts("task_create: mutex demo task ids=");

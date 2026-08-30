@@ -285,6 +285,7 @@ int64_t context_switch_count_get(void) { return 0; }
 int64_t prio_lock_count_get(void) { return 0; }
 int64_t mutex_contention_count_get(void) { return 0; }
 int64_t mutex_wait_worst_ticks_get(void) { return 0; }
+uint32_t current_task_get(void) { return 0; }
 int64_t irq_count_increment(void) { return 0; }
 int64_t irq_count_get(void) { return 0; }
 int64_t cpu_wfi(void) { return 0; }

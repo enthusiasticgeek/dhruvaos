@@ -784,6 +784,17 @@ scheduler_get_tick_count:
     ldr r0, [r0]
     bx lr
 
+/* Round 60 crash investigation: diagnostic-only accessor, read from
+ * the Data Abort handler to report which task was running at fault
+ * time (a fault handler must never assume the corruption it's
+ * reporting hasn't also hit heap/stack state, but current_task is a
+ * plain, always-valid .bss word -- safe to read unconditionally). */
+.global current_task_get
+current_task_get:
+    ldr r0, =current_task
+    ldr r0, [r0]
+    bx lr
+
 .global context_switch_count_get
 context_switch_count_get:
     ldr r0, =context_switch_count

@@ -73,17 +73,22 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   10.0.2.2` genuinely stops getting replies once `fw add deny icmp
   10.0.2.2 any` is issued (zero leaks across repeated live attempts),
   and resumes after `fw flush`.
+- **A real, previously-undiscovered long-running crash, found and
+  fixed (round 60 follow-up)**: `task_custom_demo`/`task_mutex_demo_
+  low`/`task_mutex_demo_high` (rounds 54/55's dynamically-created demo
+  tasks) were each allocated exactly 512 bytes of stack — matching
+  their own compiler-verified `#[bounded_stack]` budget with zero
+  headroom, unlike every other task in this project. A genuine stack
+  overflow after several minutes of continuous scheduling, proven (not
+  just inferred) by deliberately shrinking the same stacks further and
+  watching the identical crash reproduce in ~60s instead of minutes.
+  Fixed by giving all three the same generous headroom (4096 bytes)
+  every other task already gets. Also surfaced a genuine vani-compiler
+  soundness gap (`#[bounded_stack]` silently charged 0 bytes for any
+  `extern "C"` callee), fixed upstream as BUG-233. See `TODO.md` for
+  the full investigation writeup.
 
 **Known, current limitations (not design goals — see `TODO.md`):**
-
-- **A newly-found, unrelated, NOT YET root-caused crash**: running the
-  system continuously for a few minutes (longer than this project's
-  existing regression battery ever holds one session) produces a
-  `FATAL: Data Abort at address 00000000 status=0000080D (section
-  permission fault)` — confirmed, via an isolation run with zero shell
-  commands sent, to come from rounds 54/55's own background mutex/
-  task-creation demo tasks alone, nothing network- or filter-related.
-  See `TODO.md` for full details and candidate next steps.
 
 - **6 fixed compile-time tasks, plus up to 10 dynamically-created
   ones (MAX_TASKS=16).** The original 6 slots (HIGH, MEDIUM, LOW — a

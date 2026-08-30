@@ -599,46 +599,63 @@ for by name.
   self-talk. Outgoing filtering (`netif_send_frame`) remains a natural,
   smaller follow-up, not in this round's scope.
 
-- **Long-running crash: Data Abort at a near-null address after a few
-  minutes of pure background activity** — `[found round 60, 2026-08-30,
-  NOT YET INVESTIGATED — high priority]`
-  While live-verifying packet filtering, QEMU runs longer than this
-  project's existing regression battery ever holds one continuous
-  session (`qemu_run.py` has a short fixed timeout, `phase4_milestone.py`
-  runs one fixed short command sequence, `power_yank.py` cuts power
-  deliberately rather than running continuously) — long enough for a
-  **previously-undiscovered crash** to surface:
-  ```
-  FATAL: Data Abort at address 00000000 status=0000080D (section permission fault) -- halting
-  ```
-  (a second run crashed the same way at address `00000005` instead —
-  the small, varying near-null address across runs is consistent with
-  a corrupted/wild pointer or return address, not a single fixed bad
-  constant).
+- **Long-running crash: Data Abort at a near-null/wild address after a
+  few minutes of pure background activity** — `[ROOT-CAUSED AND FIXED,
+  round 60 follow-up, 2026-08-30]`
+  Found while live-verifying packet filtering (QEMU runs longer than
+  this project's existing regression battery ever holds one continuous
+  session, long enough to surface a previously-undiscovered crash).
+  **Confirmed unrelated to packet filtering or networking** via an
+  isolation run with zero shell commands and, later, zero `usb-net`
+  device at all — reproduced identically either way, pointing squarely
+  at round 54/55's own `task_create`-based demo tasks (`task_custom_
+  demo`, `task_mutex_demo_low/high`).
 
-  **Confirmed unrelated to packet filtering or networking**: an
-  isolation run booting `dhruva.elf` with `usb-net` attached but with
-  *zero* shell commands ever sent — pure idle boot, letting only
-  rounds 54/55's own background mutex-demo/task-creation-demo tasks run
-  — reproduced the identical crash after roughly the same few minutes
-  of wall-clock time. This points at the mutex-contention demo tasks,
-  the dynamically-created `task_create` demo task, or their interaction
-  under the real scheduler, running for long enough — not anything
-  network- or filter-related.
+  **Root cause, confirmed empirically, not just by inspection**: these
+  three dynamically-created tasks were each allocated exactly 512
+  bytes of stack — matching their own `#[bounded_stack(bytes=512)]`
+  compiler-VERIFIED budget with **zero headroom**, unlike every other
+  task in this project (`task_a`-`d`: 4096 bytes; `task_e`/`f`: 16384
+  bytes — always a generous multiple of the real worst case, never the
+  bare verified minimum). A genuine stack overflow into adjacent
+  bump-allocated memory explains the observed symptoms exactly: small,
+  inconsistent fault addresses across runs (`0x0`, `0x5`, `0x28`,
+  `0x40`) consistent with corrupted small values, not one fixed bad
+  constant, and (once diagnostic instrumentation was added to print the
+  real faulting PC + `current_task`) one crash that clearly involved a
+  wild jump into unrelated valid code with a garbage register — exactly
+  what corrupted adjacent memory produces, not a single clean bad
+  pointer dereference.
 
-  Not yet root-caused. Worth investigating soon: this project's own
-  existing regression battery structurally cannot catch a bug that only
-  manifests after several minutes of continuous run time, meaning it
-  could just as easily be latent in a real long-running deployment.
-  Candidate first steps for a follow-up round: reproduce under GDB/QEMU
-  monitor to get a real backtrace at the fault; check whether any
-  demo-task's stack could be growing unboundedly (a `#[bounded_stack]`
-  budget is a *static* worst-case bound — it does not catch a genuine
-  runtime stack-depth OVERFLOW from unexpectedly deep/repeated real
-  recursion or an ISR nesting more than assumed); audit
-  `mutex_block_start_tick_table`/`eff_prio_table`/`mutex_owner_table`
-  and the round-54 `task_create` dynamic-slot bookkeeping for an index
-  that could walk out of bounds after enough churn cycles.
+  **Proven, not assumed**: deliberately shrinking these same stacks
+  further (128 bytes) reproduced the identical crash class in ~60
+  seconds instead of 150-550 — a controlled experiment showing "smaller
+  stack, faster failure," the clearest possible signature of a real
+  margin-dependent stack overflow, independent of what the static
+  checker itself reports.
+
+  **Fixed**: raised all three allocations to 4096 bytes (matching every
+  other task's own established, long-proven convention) rather than
+  trusting the bare statically-verified minimum. Confirmed clean over
+  a 550-second continuous soak (the same duration the original 512-byte
+  version had failed within, more than once) with the fix in place;
+  full regression battery (`phase4_milestone` 14/14, `heap_stress`,
+  `host_harness` 289/0, `power_yank` 70/70) all green afterward.
+
+  **A genuine vani-compiler soundness gap found along the way, filed
+  and fixed upstream (BUG-233)**: the `#[bounded_stack]` static checker
+  silently charged **0 bytes** for any `extern "C"` (hand-written
+  assembly) callee — meaning `dhruva_mutex_lock`/`task_sleep_ticks`'s
+  own real ~64-byte context-switch-frame cost was completely invisible
+  to their callers' own "verified" budgets. Confirmed this was NOT the
+  dominant cause of this specific crash (the checker's own honest
+  `uart_puts`/`uart_put_i64` chain already exceeded the extern-call
+  contribution regardless), but is a real, independent soundness gap
+  worth closing — fixed to charge the same conservative
+  `FRAME_OVERHEAD_BYTES` (32) every ordinary function's frame already
+  uses, strictly more conservative than before (can only raise an
+  estimate, never lower one), verified against the full vani-compiler
+  test suite with no regressions. Pushed to vani-compiler's `main`.
 
 - **PKI (Public Key Infrastructure)** — `[XL, several rounds beyond
   the crypto foundation above]`
