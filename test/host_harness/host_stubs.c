@@ -515,3 +515,38 @@ uint32_t usb_bt_set_intr_in_toggle(uint32_t v) { g_usb_bt_intr_in_toggle = v; re
 static uint32_t g_usb_wifi_kind;
 uint32_t usb_wifi_get_kind(void) { return g_usb_wifi_kind; }
 uint32_t usb_wifi_set_kind(uint32_t v) { g_usb_wifi_kind = v; return 0; }
+
+/* Round 60: fw_state.S -- packet filtering rule table, added proactively
+ * in the same round that introduced these extern fns. Mirrors boot/
+ * fw_state.S's own fixed-8-rule-array shape exactly. */
+static uint32_t g_fw_rule_count;
+static uint32_t g_fw_default_policy;
+static uint32_t g_fw_rule_proto[8];
+static uint32_t g_fw_rule_src_ip[8];
+static uint32_t g_fw_rule_src_ip_valid[8];
+static uint32_t g_fw_rule_dst_port[8];
+static uint32_t g_fw_rule_dst_port_valid[8];
+static uint32_t g_fw_rule_action[8];
+uint32_t fw_get_rule_count(void) { return g_fw_rule_count; }
+uint32_t fw_get_default_policy(void) { return g_fw_default_policy; }
+uint32_t fw_set_default_policy(uint32_t v) { g_fw_default_policy = v; return 0; }
+uint32_t fw_flush(void) { g_fw_rule_count = 0; return 0; }
+uint32_t fw_add_rule(uint32_t proto, uint32_t src_ip, uint32_t src_ip_valid,
+                      uint32_t dst_port, uint32_t dst_port_valid, uint32_t action) {
+  if (g_fw_rule_count >= 8) return 0xFFFFFFFFu;
+  uint32_t i = g_fw_rule_count;
+  g_fw_rule_proto[i] = proto;
+  g_fw_rule_src_ip[i] = src_ip;
+  g_fw_rule_src_ip_valid[i] = src_ip_valid;
+  g_fw_rule_dst_port[i] = dst_port;
+  g_fw_rule_dst_port_valid[i] = dst_port_valid;
+  g_fw_rule_action[i] = action;
+  g_fw_rule_count = i + 1;
+  return 0;
+}
+uint32_t fw_get_rule_proto(uint32_t index) { return g_fw_rule_proto[index]; }
+uint32_t fw_get_rule_src_ip(uint32_t index) { return g_fw_rule_src_ip[index]; }
+uint32_t fw_get_rule_src_ip_valid(uint32_t index) { return g_fw_rule_src_ip_valid[index]; }
+uint32_t fw_get_rule_dst_port(uint32_t index) { return g_fw_rule_dst_port[index]; }
+uint32_t fw_get_rule_dst_port_valid(uint32_t index) { return g_fw_rule_dst_port_valid[index]; }
+uint32_t fw_get_rule_action(uint32_t index) { return g_fw_rule_action[index]; }

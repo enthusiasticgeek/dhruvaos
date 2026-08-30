@@ -565,60 +565,80 @@ for by name.
      the line-fill IRQ handler a "currently reading a password, don't
      echo" mode before shipping this.
 
-- **Packet filtering / iptables-equivalent** — `[M, ~2-3 rounds — now
-  higher-value than when this was written; concrete design below,
-  ready to start]`
-  Originally scoped as "buildable but capped in value" by this
-  project's loopback-only netif — round 56 lifted that cap (a
-  live-verified CDC-ECM path now carries real off-box traffic: real
-  `ping` round trips, real DHCP exchanges over an actual USB link), so
-  a filter now has genuinely real traffic to act on, not just synthetic
-  self-talk.
+- **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
+  Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,
+  LAN9512, loopback), an 8-rule fixed array (`proto`/`src_ip`+valid/
+  `dst_port`+valid/`action`, first-match-wins, `default_policy`
+  fallback — `boot/fw_state.S`), `fw add/list/flush/default` shell
+  commands (factored into `shell_dispatch_fw` after a real, compiler-
+  enforced `#[bounded_stack]` budget failure on `task_f` — the original
+  inline version's local bindings pushed a pre-existing unrelated
+  worst-case call chain over budget). `filter_self_test()` gives
+  exhaustive synthetic coverage (default-alone, specific-rule-vs-
+  different-src_ip, proto specificity, first-match-wins ordering,
+  port-specific-rule-never-matches-ICMP, non-IPv4 passthrough) plus a
+  host-harness ASAN/UBSAN twin (`test_packet_filter` in `host_main.c`).
 
-  **Concrete design (scoped, not yet started):**
-  - **Single hook point, not three**: filter incoming traffic in
-    `netif_recv_frame` itself, right after a frame is dequeued/received
-    (before it's returned to ANY caller), rather than separately in
-    `icmp_poll`/`socket_udp_recv`/`tcp_conn_poll` as originally sketched
-    — the IP header (protocol, src/dst IP) is identical across all
-    three by the time it's parseable at all, and this project already
-    has the accessors needed (`ipv4_get_protocol`/`_src_ip`/`_dst_ip`,
-    `tcp_get_dst_port`/`udp_get_dst_port`) at fixed offsets (14 for the
-    IP header, 34 for the L4 header, matching every existing call site).
-    One hook point means one place to get right, not three kept in
-    sync. Outgoing filtering (`netif_send_frame`) is a natural, smaller
-    follow-up, not in this round's own scope.
-  - **Rule table**: a small fixed-size array (start with 8 rules,
-    matching this project's own "small fixed arrays, not dynamic
-    allocation" convention elsewhere — `MAX_MUTEXES`, `MAX_TASKS`,
-    `MAX_HOST_TCP_CONN`), each rule: `proto` (0=any/1=ICMP/6=TCP/
-    17=UDP), `src_ip`+`src_ip_valid` (0=wildcard), `dst_port`+
-    `dst_port_valid` (0=wildcard, TCP/UDP only — ICMP has none),
-    `action` (0=deny/1=allow). First-match-wins in array order (real
-    iptables semantics), falling through to a `default_policy` (start
-    with allow, matching this project's own currently-permissive
-    stance — nothing to protect against yet beyond what round 56's own
-    real traffic now provides).
-  - **Shell commands**: `fw add <allow|deny> <any|icmp|tcp|udp> <src_ip|any> <dst_port|any>`,
-    `fw list`, `fw flush`, `fw default <allow|deny>` — same
-    `shell_word_matches`-based dispatch style every other multi-word
-    command (`chmod`/`attr`/`log`) already uses.
-  - **Testing plan, two tiers**: (1) synthetic crafted frames fed
-    directly to the new `filter_check_frame` function (same technique
-    `tcp_conn_recv_bounds_self_test` already uses) for exhaustive
-    rule-matching coverage (wildcards, first-match-wins ordering,
-    default policy) — no real traffic needed for this tier; (2) a NEW
-    kind of live verification this project hasn't had before:
-    `fw add deny icmp 10.0.2.2 any` then a real `ping 10.0.2.2` over
-    the actual CDC-ECM link should genuinely fail (no reply), then
-    `fw flush` and the same `ping` should succeed again — a live
-    demonstration of a real security control acting on real external
-    traffic, not self-talk. Ping's own reply timeout handling already
-    exists (this project's own established loopback self-ping tests
-    already cover the "no reply" code path), so this needs no new
-    timeout-detection logic, just real traffic to exercise it against.
-  Priority-inversion instrumentation (below) is now done (round 59) —
-  this is a reasonable next candidate.
+  **Live-verified over the real CDC-ECM link**, with two honest
+  caveats found along the way, neither a packet-filtering bug:
+  1. The real USB bulk-OUT transmit occasionally fails transiently
+     under this build's now-heavy background scheduling load (rounds
+     54/55's mutex/task-creation demos) — a pre-existing category of
+     flakiness already noted above under round 56, not something this
+     round introduced or needs to fix; the live-verification script
+     sends each critical ping twice to not mistake one transient TX
+     failure for a filtering bug.
+  2. **Found a genuine, separate, unrelated crash** while running the
+     live test for long enough — see the new "Long-running crash"
+     entry immediately below.
+
+  Across two live runs: the deny rule never once let an ICMP reply
+  through (3 attempts total, zero leaks) and a real `reply from
+  10.0.2.2 seq=1` was observed after `fw flush` — real confirmation a
+  security control governs real off-box traffic, not just synthetic
+  self-talk. Outgoing filtering (`netif_send_frame`) remains a natural,
+  smaller follow-up, not in this round's scope.
+
+- **Long-running crash: Data Abort at a near-null address after a few
+  minutes of pure background activity** — `[found round 60, 2026-08-30,
+  NOT YET INVESTIGATED — high priority]`
+  While live-verifying packet filtering, QEMU runs longer than this
+  project's existing regression battery ever holds one continuous
+  session (`qemu_run.py` has a short fixed timeout, `phase4_milestone.py`
+  runs one fixed short command sequence, `power_yank.py` cuts power
+  deliberately rather than running continuously) — long enough for a
+  **previously-undiscovered crash** to surface:
+  ```
+  FATAL: Data Abort at address 00000000 status=0000080D (section permission fault) -- halting
+  ```
+  (a second run crashed the same way at address `00000005` instead —
+  the small, varying near-null address across runs is consistent with
+  a corrupted/wild pointer or return address, not a single fixed bad
+  constant).
+
+  **Confirmed unrelated to packet filtering or networking**: an
+  isolation run booting `dhruva.elf` with `usb-net` attached but with
+  *zero* shell commands ever sent — pure idle boot, letting only
+  rounds 54/55's own background mutex-demo/task-creation-demo tasks run
+  — reproduced the identical crash after roughly the same few minutes
+  of wall-clock time. This points at the mutex-contention demo tasks,
+  the dynamically-created `task_create` demo task, or their interaction
+  under the real scheduler, running for long enough — not anything
+  network- or filter-related.
+
+  Not yet root-caused. Worth investigating soon: this project's own
+  existing regression battery structurally cannot catch a bug that only
+  manifests after several minutes of continuous run time, meaning it
+  could just as easily be latent in a real long-running deployment.
+  Candidate first steps for a follow-up round: reproduce under GDB/QEMU
+  monitor to get a real backtrace at the fault; check whether any
+  demo-task's stack could be growing unboundedly (a `#[bounded_stack]`
+  budget is a *static* worst-case bound — it does not catch a genuine
+  runtime stack-depth OVERFLOW from unexpectedly deep/repeated real
+  recursion or an ISR nesting more than assumed); audit
+  `mutex_block_start_tick_table`/`eff_prio_table`/`mutex_owner_table`
+  and the round-54 `task_create` dynamic-slot bookkeeping for an index
+  that could walk out of bounds after enough churn cycles.
 
 - **PKI (Public Key Infrastructure)** — `[XL, several rounds beyond
   the crypto foundation above]`

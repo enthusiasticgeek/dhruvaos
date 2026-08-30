@@ -104,6 +104,8 @@ int64_t fn_dwc2_build_rtl_reg_read_setup(uint32_t reg_addr, uint32_t want_len);
 int64_t fn_dwc2_build_rtl_reg_write_setup(uint32_t reg_addr, uint32_t data_len);
 int64_t *dwc2_dma_scratch_get(void);
 int64_t dwc2_dma_scratch_set(int64_t *addr);
+uint32_t fn_filter_check_frame(int64_t *frame, int64_t frame_len);
+int64_t fn_filter_build_test_frame(int64_t *frame, uint32_t proto, uint32_t src_ip, uint32_t dst_port);
 
 /* ---- host_stubs.c helpers ---- */
 int64_t *dhruva_alloc_bytes(int64_t n);
@@ -116,6 +118,11 @@ uint32_t dharafs_state_set_block_dev(uint32_t dev);
 int64_t host_virtual_disk_read(int64_t block_num, int64_t *buf);
 int64_t host_virtual_disk_write(int64_t block_num, int64_t *buf);
 void host_virtual_disk_reset(void);
+uint32_t fw_get_rule_count(void);
+uint32_t fw_get_default_policy(void);
+uint32_t fw_set_default_policy(uint32_t value);
+uint32_t fw_flush(void);
+uint32_t fw_add_rule(uint32_t proto, uint32_t src_ip, uint32_t src_ip_valid, uint32_t dst_port, uint32_t dst_port_valid, uint32_t action);
 
 static int g_pass = 0, g_fail = 0;
 
@@ -1149,6 +1156,58 @@ static void test_rtl_reg_setup_framing(void) {
     CHECK(buf_read_byte(dma, 7) == 0x00, "rtl reg write setup: wLength LE byte1");
 }
 
+/* Round 60: independent host-side check of filter_check_frame's rule
+ * matching, in addition to (not a replacement for) kernel_main.vani's
+ * own filter_self_test() which runs on real target boot -- this one
+ * runs under ASAN/UBSAN, catching any OOB read into the synthetic
+ * frame buffer that a target-only run wouldn't surface. */
+static void test_packet_filter(void) {
+    uint32_t ip_a = 0x0A000001; /* 10.0.0.1 */
+    uint32_t ip_b = 0x0A000002; /* 10.0.0.2 */
+
+    fw_flush();
+    fw_set_default_policy(0);
+    int64_t *f1 = dhruva_alloc_bytes(64);
+    int64_t l1 = fn_filter_build_test_frame(f1, 6, ip_a, 80);
+    CHECK(fn_filter_check_frame(f1, l1) == 0, "fw: no rules -> default deny");
+
+    fw_set_default_policy(1);
+    fw_add_rule(6, ip_a, 1, 80, 1, 0); /* deny TCP from ip_a:80 */
+    int64_t *f2 = dhruva_alloc_bytes(64);
+    int64_t l2 = fn_filter_build_test_frame(f2, 6, ip_a, 80);
+    CHECK(fn_filter_check_frame(f2, l2) == 0, "fw: specific deny rule matches");
+    int64_t *f3 = dhruva_alloc_bytes(64);
+    int64_t l3 = fn_filter_build_test_frame(f3, 6, ip_b, 80);
+    CHECK(fn_filter_check_frame(f3, l3) == 1, "fw: different src_ip falls through to allow default");
+
+    int64_t *f4 = dhruva_alloc_bytes(64);
+    int64_t l4 = fn_filter_build_test_frame(f4, 17, ip_a, 80);
+    CHECK(fn_filter_check_frame(f4, l4) == 1, "fw: TCP rule does not match UDP on the same ip/port");
+
+    fw_flush();
+    fw_add_rule(0, 0, 0, 0, 0, 0);      /* deny everything */
+    fw_add_rule(6, 0, 0, 443, 1, 1);    /* allow TCP/443 -- shadowed */
+    int64_t *f5 = dhruva_alloc_bytes(64);
+    int64_t l5 = fn_filter_build_test_frame(f5, 6, ip_a, 443);
+    CHECK(fn_filter_check_frame(f5, l5) == 0, "fw: first-match-wins -- earlier wildcard deny shadows later specific allow");
+
+    fw_flush();
+    fw_add_rule(0, 0, 0, 80, 1, 0); /* deny port 80 */
+    fw_set_default_policy(1);
+    int64_t *f6 = dhruva_alloc_bytes(64);
+    int64_t l6 = fn_filter_build_test_frame(f6, 1, ip_a, 80); /* ICMP: portless */
+    CHECK(fn_filter_check_frame(f6, l6) == 1, "fw: port-specific rule never matches a portless protocol (ICMP)");
+
+    fw_set_default_policy(0);
+    int64_t *f7 = dhruva_alloc_bytes(64);
+    buf_write_byte(f7, 12, 0x08);
+    buf_write_byte(f7, 13, 0x06); /* ethertype: ARP, not IPv4 */
+    CHECK(fn_filter_check_frame(f7, 38) == 1, "fw: non-IPv4 traffic passes through regardless of policy/rules");
+
+    fw_flush();
+    fw_set_default_policy(0);
+}
+
 int main(void) {
     test_basic_round_trip();
     test_path_length_boundary();
@@ -1174,6 +1233,7 @@ int main(void) {
     test_lan9512_framing();
     test_hci_framing();
     test_rtl_reg_setup_framing();
+    test_packet_filter();
 
     printf("\n%d PASS, %d FAIL\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

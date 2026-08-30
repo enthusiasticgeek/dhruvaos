@@ -64,8 +64,26 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   actually being handed ownership), both in `diagnose`'s output —
   live-verified growing correctly (2 → 7 contentions, a stable 3-tick
   worst case) against the same deterministic demo.
+- **Packet filtering (round 60)**: a single hook in `netif_recv_frame`
+  (all three backends) checks an 8-rule fixed table
+  (`proto`/`src_ip`/`dst_port`/`action`, first-match-wins, a
+  `default_policy` fallback — `boot/fw_state.S`) before a frame is ever
+  handed to a caller. `fw add/list/flush/default` manage it from the
+  shell. Live-verified over the real CDC-ECM link: a real `ping
+  10.0.2.2` genuinely stops getting replies once `fw add deny icmp
+  10.0.2.2 any` is issued (zero leaks across repeated live attempts),
+  and resumes after `fw flush`.
 
 **Known, current limitations (not design goals — see `TODO.md`):**
+
+- **A newly-found, unrelated, NOT YET root-caused crash**: running the
+  system continuously for a few minutes (longer than this project's
+  existing regression battery ever holds one session) produces a
+  `FATAL: Data Abort at address 00000000 status=0000080D (section
+  permission fault)` — confirmed, via an isolation run with zero shell
+  commands sent, to come from rounds 54/55's own background mutex/
+  task-creation demo tasks alone, nothing network- or filter-related.
+  See `TODO.md` for full details and candidate next steps.
 
 - **6 fixed compile-time tasks, plus up to 10 dynamically-created
   ones (MAX_TASKS=16).** The original 6 slots (HIGH, MEDIUM, LOW — a

@@ -97,6 +97,8 @@ WHITELIST = [
     "hci_cmd_complete_status",
     "dwc2_build_rtl_reg_read_setup",
     "dwc2_build_rtl_reg_write_setup",
+    "filter_check_frame",
+    "filter_build_test_frame",
 ]
 
 

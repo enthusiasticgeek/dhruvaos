@@ -402,6 +402,24 @@ extern "C" fn usb_bt_set_intr_in_toggle(value: u32) -> u32;
 extern "C" fn usb_wifi_get_kind() -> u32;
 extern "C" fn usb_wifi_set_kind(value: u32) -> u32;
 
+// Round 60 (boot/fw_state.S): packet filtering rule table. proto: 0=any/
+// 1=ICMP/6=TCP/17=UDP (real IPv4 protocol numbers, matching ipv4_get_
+// protocol's own return value directly). fw_add_rule is the only write
+// path for a rule's 6 fields together (see its own comment); individual
+// getters read them back for filter_check_frame's matching loop and the
+// `fw list` shell command.
+extern "C" fn fw_get_rule_count() -> u32;
+extern "C" fn fw_get_default_policy() -> u32;
+extern "C" fn fw_set_default_policy(value: u32) -> u32;
+extern "C" fn fw_flush() -> u32;
+extern "C" fn fw_add_rule(proto: u32, src_ip: u32, src_ip_valid: u32, dst_port: u32, dst_port_valid: u32, action: u32) -> u32;
+extern "C" fn fw_get_rule_proto(index: u32) -> u32;
+extern "C" fn fw_get_rule_src_ip(index: u32) -> u32;
+extern "C" fn fw_get_rule_src_ip_valid(index: u32) -> u32;
+extern "C" fn fw_get_rule_dst_port(index: u32) -> u32;
+extern "C" fn fw_get_rule_dst_port_valid(index: u32) -> u32;
+extern "C" fn fw_get_rule_action(index: u32) -> u32;
+
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
 // addressing mode sdhost_init() discovers, across the vani-call-
 // boundary gap kernel_main.vani's own header explains -- no top-level
@@ -4253,6 +4271,66 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
   return 0;
 }
 
+// Round 60: packet filtering's own single hook point. Parses just
+// enough of a frame to match against the rule table -- EtherType
+// (bytes 12-13) to confirm this is even IPv4 (ARP and anything else
+// passes through untouched, nothing to filter on IP/port for it),
+// then reuses this project's own EXISTING accessors
+// (ipv4_get_protocol/_src_ip, tcp_get_dst_port/udp_get_dst_port,
+// already used identically by dhcp_client_poll and every TCP/UDP
+// receive path) rather than re-deriving byte offsets by hand. Called
+// from netif_recv_frame directly -- ONE hook point covers ICMP/TCP/UDP
+// uniformly instead of three separate hooks at each protocol's own
+// `*_poll` entry point (the originally-sketched design in docs/
+// TODO.md), since the IP header is identical across all three by the
+// time it's parseable at all.
+//
+// First-match-wins (real iptables semantics): the first rule whose
+// proto/src_ip/dst_port all match (a field's own "valid" bit 0 means
+// wildcard) decides the frame's fate; nothing matching falls through
+// to fw_get_default_policy(). A rule naming a specific dst_port can
+// never match a portless protocol (ICMP) -- has_port stays 0 for
+// anything that isn't TCP/UDP, and port_matches requires either a
+// wildcard rule or a genuine port to compare against.
+fn filter_check_frame(frame: mut ref i64, frame_len: i64) -> u32 {
+  if frame_len < 34 {
+    return 1 as u32; // too short to be a parseable IPv4 frame -- not
+                      // this filter's job to bounds-check, only to
+                      // filter what it can actually parse
+  }
+  if buf_read_u16_be(frame, 12) != (0x0800 as u32) {
+    return 1 as u32; // not IPv4 (e.g. ARP) -- nothing to filter on
+  }
+  let proto: u32 = ipv4_get_protocol(frame, 14);
+  let src_ip: u32 = ipv4_get_src_ip(frame, 14);
+  let dst_port: u32 = 0 as u32;
+  let has_port: u32 = 0 as u32;
+  if (proto == (6 as u32)) && (frame_len >= 38) {
+    dst_port = tcp_get_dst_port(frame, 34);
+    has_port = 1 as u32;
+  }
+  if (proto == (17 as u32)) && (frame_len >= 38) {
+    dst_port = udp_get_dst_port(frame, 34);
+    has_port = 1 as u32;
+  }
+
+  let count: u32 = fw_get_rule_count();
+  let i: u32 = 0 as u32;
+  while i < count {
+    let rule_proto: u32 = fw_get_rule_proto(i);
+    let proto_matches: u32 = if (rule_proto == (0 as u32)) || (rule_proto == proto) { 1 as u32 } else { 0 as u32 };
+    let rule_src_valid: u32 = fw_get_rule_src_ip_valid(i);
+    let src_matches: u32 = if (rule_src_valid == (0 as u32)) || (fw_get_rule_src_ip(i) == src_ip) { 1 as u32 } else { 0 as u32 };
+    let rule_port_valid: u32 = fw_get_rule_dst_port_valid(i);
+    let port_matches: u32 = if (rule_port_valid == (0 as u32)) || ((has_port == (1 as u32)) && (fw_get_rule_dst_port(i) == dst_port)) { 1 as u32 } else { 0 as u32 };
+    if (proto_matches == (1 as u32)) && (src_matches == (1 as u32)) && (port_matches == (1 as u32)) {
+      return fw_get_rule_action(i);
+    }
+    i = i + (1 as u32);
+  }
+  return fw_get_default_policy();
+}
+
 // Receives the oldest pending frame into out_buf, returning its
 // length, or -1 if nothing is queued OR the queued frame is larger
 // than max_len (see below).
@@ -4296,6 +4374,7 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
 // practice (as opposed to merely non-infinite) is exactly what this
 // round's live QEMU verification needs to confirm empirically, not
 // guess.
+
 fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   if usb_net_get_kind() == (1 as u32) {
     let mps: u32 = usb_net_get_bulk_in_mps();
@@ -4325,6 +4404,16 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
           done = 1;
         }
       }
+    }
+    // Round 60: packet filtering's own hook. A denied frame is simply
+    // dropped and reported as "nothing ready" this call -- no internal
+    // retry loop for another frame, since a real NIC delivers one frame
+    // at a time anyway (unlike the loopback queue below, which CAN have
+    // more queued, but returning -1 here just means the caller's own
+    // next poll dequeues whatever's next, same as any other "nothing
+    // ready" case already does).
+    if filter_check_frame(out_buf, total) == (0 as u32) {
+      return 0 - 1;
     }
     return total;
   }
@@ -4390,6 +4479,12 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
       let _ = buf_write_byte(out_buf, ri as u32, rb);
       ri = ri + 1;
     }
+    // Round 60: packet filtering's own hook -- see the CDC-ECM branch
+    // above for why a denied frame is just dropped/reported "nothing
+    // ready" rather than internally retrying for another one.
+    if filter_check_frame(out_buf, usable_len) == (0 as u32) {
+      return 0 - 1;
+    }
     return usable_len;
   }
   if netif_get_count() <= 0 {
@@ -4410,6 +4505,14 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
     i = i + 1;
   }
   let _ = netif_advance_tail();
+  // Round 60: packet filtering applies here too, for consistency --
+  // the tail already advanced above regardless of the verdict (this
+  // queued slot is consumed either way, matching how a real NIC would
+  // also have already delivered the frame off the wire by the time
+  // filtering happens).
+  if filter_check_frame(out_buf, frame_len) == (0 as u32) {
+    return 0 - 1;
+  }
   return frame_len;
 }
 
@@ -4510,6 +4613,102 @@ fn netif_self_test() -> i64 {
   }
 
   let _ = uart_puts("NETIF: loopback send/recv + empty/full edge cases");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round 60: builds a minimal synthetic IPv4 frame for filter_self_test
+// below -- just enough of the header for filter_check_frame's own
+// parsing (EtherType, protocol byte, src IP, dst port), matching the
+// same byte offsets ipv4_get_protocol/_src_ip and tcp_get_dst_port/
+// udp_get_dst_port already use (ip_offset=14, tcp/udp_offset=34).
+// Always returns 38 (>= the >=38 threshold filter_check_frame itself
+// requires before it will even look at a port), so this helper works
+// for TCP/UDP test frames uniformly; ICMP tests just ignore dst_port.
+fn filter_build_test_frame(frame: mut ref i64, proto: u32, src_ip: u32, dst_port: u32) -> i64 {
+  let _ = buf_write_u16_be(frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let _ = buf_write_byte(frame, 23 as u32, proto);    // ip_offset(14)+9
+  let _ = buf_write_u32_be(frame, 26, src_ip);        // ip_offset(14)+12
+  let _ = buf_write_u16_be(frame, 36, dst_port);      // tcp/udp_offset(34)+2
+  return 38;
+}
+
+// Round 60: self-test for filter_check_frame's rule-matching logic
+// against synthetic frames (no live traffic needed -- this is pure
+// logic over a fixed 8-rule table, exactly the kind of thing this
+// project already covers with synthetic self-tests elsewhere, e.g.
+// tcp_conn_recv_bounds_self_test). Saves/restores real global firewall
+// state (default policy + rule table) around itself so it doesn't
+// corrupt whatever runs after it in the boot sequence -- this is
+// shared mutable state, not a fresh fixture per test.
+fn filter_self_test() -> i64 {
+  let ok: i64 = 1;
+  let saved_policy: u32 = fw_get_default_policy();
+  let _ = fw_flush();
+
+  let ip_a: u32 = 0x0A000001 as u32; // 10.0.0.1
+  let ip_b: u32 = 0x0A000002 as u32; // 10.0.0.2
+
+  // 1. No rules at all: every frame falls through to the default
+  // policy. Set default to deny and confirm a TCP frame is denied.
+  let _ = fw_set_default_policy(0 as u32);
+  let f1: mut ref i64 = dhruva_alloc_bytes(64);
+  let l1: i64 = filter_build_test_frame(f1, 6 as u32, ip_a, 80 as u32);
+  if filter_check_frame(f1, l1) != (0 as u32) { ok = 0; }
+
+  // 2. A specific deny rule overrides a permissive default, but only
+  // for the src_ip it actually names -- a different src_ip must still
+  // fall through to the (now allow) default.
+  let _ = fw_set_default_policy(1 as u32);
+  let _ = fw_add_rule(6 as u32, ip_a, 1 as u32, 80 as u32, 1 as u32, 0 as u32);
+  let f2: mut ref i64 = dhruva_alloc_bytes(64);
+  let l2: i64 = filter_build_test_frame(f2, 6 as u32, ip_a, 80 as u32);
+  if filter_check_frame(f2, l2) != (0 as u32) { ok = 0; }
+  let f3: mut ref i64 = dhruva_alloc_bytes(64);
+  let l3: i64 = filter_build_test_frame(f3, 6 as u32, ip_b, 80 as u32);
+  if filter_check_frame(f3, l3) != (1 as u32) { ok = 0; }
+
+  // 3. Protocol specificity: the same rule (TCP, ip_a, port 80) must
+  // not match UDP traffic on the identical src_ip/port.
+  let f4: mut ref i64 = dhruva_alloc_bytes(64);
+  let l4: i64 = filter_build_test_frame(f4, 17 as u32, ip_a, 80 as u32);
+  if filter_check_frame(f4, l4) != (1 as u32) { ok = 0; }
+
+  // 4. First-match-wins: an earlier wildcard deny must shadow a later,
+  // more specific allow rule for traffic the wildcard also covers.
+  let _ = fw_flush();
+  let _ = fw_add_rule(0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32); // deny everything
+  let _ = fw_add_rule(6 as u32, 0 as u32, 0 as u32, 443 as u32, 1 as u32, 1 as u32); // allow TCP/443 (shadowed)
+  let f5: mut ref i64 = dhruva_alloc_bytes(64);
+  let l5: i64 = filter_build_test_frame(f5, 6 as u32, ip_a, 443 as u32);
+  if filter_check_frame(f5, l5) != (0 as u32) { ok = 0; }
+
+  // 5. A rule naming a specific dst_port must never match a portless
+  // protocol (ICMP) -- has_port stays 0 for it regardless of the
+  // rule's own port field, so it must fall through to the default.
+  let _ = fw_flush();
+  let _ = fw_add_rule(0 as u32, 0 as u32, 0 as u32, 80 as u32, 1 as u32, 0 as u32); // deny port 80
+  let _ = fw_set_default_policy(1 as u32);
+  let f6: mut ref i64 = dhruva_alloc_bytes(64);
+  let l6: i64 = filter_build_test_frame(f6, 1 as u32, ip_a, 80 as u32); // ICMP
+  if filter_check_frame(f6, l6) != (1 as u32) { ok = 0; }
+
+  // 6. Non-IPv4 traffic (e.g. ARP) passes through untouched regardless
+  // of policy or rules -- deny-everything default/rule still must not
+  // block it, since there's no IP/port to filter on in the first place.
+  let _ = fw_set_default_policy(0 as u32);
+  let f7: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = buf_write_u16_be(f7, 12, 0x0806 as u32); // ethertype: ARP
+  if filter_check_frame(f7, 38) != (1 as u32) { ok = 0; }
+
+  let _ = fw_flush();
+  let _ = fw_set_default_policy(saved_policy);
+
+  let _ = uart_puts("FW: packet filter rule matching (default/specific/proto/order/port/non-ip)");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -11939,6 +12138,160 @@ fn eval_self_test(expr: Str, expected: i64, expect_error: i64) -> i64 {
   return 0;
 }
 
+// Round 60: `fw add|list|flush|default`, factored out of shell_
+// dispatch itself (see its own call site's comment for why -- the
+// compiler's #[bounded_stack] check on task_f caught this needing to
+// be a separate function, not a design choice made up front).
+fn shell_dispatch_fw(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  if cmd_end >= line_len {
+    let _ = uart_puts("usage: fw <add|list|flush|default> ...\n");
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "flush") == 1 {
+    let _ = fw_flush();
+    let _ = uart_puts("ok\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "list") == 1 {
+    let _ = uart_puts("default policy: ");
+    let _ = uart_puts(if fw_get_default_policy() == (1 as u32) { "allow" } else { "deny" });
+    let _ = uart_puts("\n");
+    let count: u32 = fw_get_rule_count();
+    let fi: u32 = 0 as u32;
+    while fi < count {
+      let r_proto: u32 = fw_get_rule_proto(fi);
+      let r_action: u32 = fw_get_rule_action(fi);
+      let _ = uart_puts(if r_action == (1 as u32) { "allow " } else { "deny " });
+      let _ = uart_puts(if r_proto == (0 as u32) { "any" } else { if r_proto == (1 as u32) { "icmp" } else { if r_proto == (6 as u32) { "tcp" } else { "udp" } } });
+      let _ = uart_puts(" src=");
+      if fw_get_rule_src_ip_valid(fi) == (1 as u32) {
+        let _ = uart_put_ip(fw_get_rule_src_ip(fi));
+      } else {
+        let _ = uart_puts("any");
+      }
+      let _ = uart_puts(" dst_port=");
+      if fw_get_rule_dst_port_valid(fi) == (1 as u32) {
+        let _ = uart_put_i64(fw_get_rule_dst_port(fi) as i64);
+      } else {
+        let _ = uart_puts("any");
+      }
+      let _ = uart_puts("\n");
+      fi = fi + (1 as u32);
+    }
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "default") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: fw default <allow|deny>\n");
+      return 0;
+    }
+    let pol_start: i64 = sub_end + 1;
+    let pol_end: i64 = shell_find_space(line_buf, pol_start, line_len);
+    if shell_word_matches(line_buf, pol_start, pol_end, "allow") == 1 {
+      let _ = fw_set_default_policy(1 as u32);
+      let _ = uart_puts("ok\n");
+      return 0;
+    }
+    if shell_word_matches(line_buf, pol_start, pol_end, "deny") == 1 {
+      let _ = fw_set_default_policy(0 as u32);
+      let _ = uart_puts("ok\n");
+      return 0;
+    }
+    let _ = uart_puts("usage: fw default <allow|deny>\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "add") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: fw add <allow|deny> <any|icmp|tcp|udp> <src_ip|any> <dst_port|any>\n");
+      return 0;
+    }
+    let act_start: i64 = sub_end + 1;
+    let act_end: i64 = shell_find_space(line_buf, act_start, line_len);
+    let action: i64 = if shell_word_matches(line_buf, act_start, act_end, "allow") == 1 {
+      1
+    } else {
+      if shell_word_matches(line_buf, act_start, act_end, "deny") == 1 { 0 } else { 0 - 1 }
+    };
+    if (action == (0 - 1)) || (act_end >= line_len) {
+      let _ = uart_puts("usage: fw add <allow|deny> <any|icmp|tcp|udp> <src_ip|any> <dst_port|any>\n");
+      return 0;
+    }
+
+    let proto_start: i64 = act_end + 1;
+    let proto_end: i64 = shell_find_space(line_buf, proto_start, line_len);
+    let proto: i64 = if shell_word_matches(line_buf, proto_start, proto_end, "any") == 1 {
+      0
+    } else {
+      if shell_word_matches(line_buf, proto_start, proto_end, "icmp") == 1 {
+        1
+      } else {
+        if shell_word_matches(line_buf, proto_start, proto_end, "tcp") == 1 {
+          6
+        } else {
+          if shell_word_matches(line_buf, proto_start, proto_end, "udp") == 1 { 17 } else { 0 - 1 }
+        }
+      }
+    };
+    if (proto == (0 - 1)) || (proto_end >= line_len) {
+      let _ = uart_puts("usage: fw add <allow|deny> <any|icmp|tcp|udp> <src_ip|any> <dst_port|any>\n");
+      return 0;
+    }
+
+    let ip_start: i64 = proto_end + 1;
+    let ip_end: i64 = shell_find_space(line_buf, ip_start, line_len);
+    let src_ip: u32 = 0 as u32;
+    let src_ip_valid: u32 = 0 as u32;
+    if shell_word_matches(line_buf, ip_start, ip_end, "any") == 1 {
+      src_ip_valid = 0 as u32;
+    } else {
+      let parsed_ip: i64 = ip_parse_dotted_quad(line_buf, ip_start, ip_end);
+      if parsed_ip < 0 {
+        let _ = uart_puts("fw: invalid src IP\n");
+        return 0;
+      }
+      src_ip = parsed_ip as u32;
+      src_ip_valid = 1 as u32;
+    }
+    if ip_end >= line_len {
+      let _ = uart_puts("usage: fw add <allow|deny> <any|icmp|tcp|udp> <src_ip|any> <dst_port|any>\n");
+      return 0;
+    }
+
+    let port_start: i64 = ip_end + 1;
+    let port_end: i64 = shell_find_space(line_buf, port_start, line_len);
+    let dst_port: u32 = 0 as u32;
+    let dst_port_valid: u32 = 0 as u32;
+    if shell_word_matches(line_buf, port_start, port_end, "any") == 1 {
+      dst_port_valid = 0 as u32;
+    } else {
+      let parsed_port: i64 = shell_parse_decimal(line_buf, port_start, port_end);
+      if parsed_port < 0 {
+        let _ = uart_puts("fw: invalid dst port\n");
+        return 0;
+      }
+      dst_port = parsed_port as u32;
+      dst_port_valid = 1 as u32;
+    }
+
+    let add_status: u32 = fw_add_rule(proto as u32, src_ip, src_ip_valid, dst_port, dst_port_valid, action as u32);
+    if add_status == (0 as u32) {
+      let _ = uart_puts("ok\n");
+    } else {
+      let _ = uart_puts("fw: rule table full (max 8)\n");
+    }
+    return 0;
+  }
+
+  let _ = uart_puts("usage: fw <add|list|flush|default> ...\n");
+  return 0;
+}
+
 // Parses and runs exactly one already-complete shell line. Deliberately
 // NOT #[no_heap] (same reasoning as task_e's GC pass above): every
 // scratch buffer here is a fresh dhruva_alloc_bytes, and this task can
@@ -12572,6 +12925,17 @@ fn shell_dispatch() -> i64 {
       }
     }
     return 0;
+  }
+
+  // Round 60: packet filtering shell command family. Factored into its
+  // own function (not inlined here like `attr` above) specifically
+  // because inlining it pushed task_f's own #[bounded_stack] analysis
+  // over budget -- the compiler's own static worst-case-stack-depth
+  // check caught this at build time, not a runtime surprise. A
+  // separate function keeps this block's own locals out of shell_
+  // dispatch's frame entirely.
+  if shell_word_matches(line_buf, 0, cmd_end, "fw") == 1 {
+    return shell_dispatch_fw(line_buf, cmd_end, line_len);
   }
 
   if shell_word_matches(line_buf, 0, cmd_end, "eval") == 1 {
@@ -14578,9 +14942,19 @@ fn kernel_main() -> i64 {
   let _ = governor_self_test(5, 700);
   let _ = governor_replay_test();
 
+  // Round 60: packet filtering's own default policy -- .bss's own
+  // zero-init would otherwise leave fw_default_policy at 0 (deny),
+  // which would silently break every self-test below that calls
+  // netif_recv_frame (all of them go through filter_check_frame now)
+  // before a single `fw` rule has ever been added. Explicitly allow
+  // by default, matching this project's existing permissive stance
+  // (nothing to protect against until a rule is actually configured).
+  let _ = fw_set_default_policy(1 as u32);
+
   // Phase 6 verification: netif's own loopback implementation.
   let _ = netif_init();
   let _ = netif_self_test();
+  let _ = filter_self_test();
   let _ = arp_self_test();
   let _ = arp_resolve_self_test();
   let _ = ipv4_self_test();
