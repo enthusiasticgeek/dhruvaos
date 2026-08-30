@@ -1414,10 +1414,59 @@ fn dharafs_init() -> i64 {
     if (stored_checksum != computed_checksum) || (this_seq == (0 as u32)) {
       break;
     }
-    if this_seq > highest_seq {
-      highest_seq = this_seq;
+
+    let this_path_len: u32 = buf_read_u32(buf, 8 as u32);
+    if this_path_len == dharafs_tx_begin_sentinel() {
+      // Round 52: a transaction marker -- see dharafs_tx_begin_raw's
+      // own comment for why "are the next block_count blocks all
+      // present and checksum-valid" is a complete completion proof.
+      // buf's own contents (this_seq, block_count) are already
+      // captured into locals below before this loop starts reusing
+      // buf for each follow-up block's own read.
+      let block_count: i64 = buf_read_u32(buf, 44 as u32) as i64;
+      let tx_ok: i64 = 1;
+      let j: i64 = 1;
+      while j <= block_count {
+        let check_blk: i64 = blk + j;
+        if check_blk >= max_blk {
+          tx_ok = 0;
+        } else {
+          let rd2: i64 = dharafs_block_read(check_blk, buf);
+          if rd2 != 0 {
+            tx_ok = 0;
+          } else {
+            let sc2: u32 = buf_read_u32(buf, 0 as u32);
+            let cc2: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+            let seq2: u32 = buf_read_u32(buf, 4 as u32);
+            if (sc2 != cc2) || (seq2 == (0 as u32)) {
+              tx_ok = 0;
+            }
+          }
+        }
+        j = j + 1;
+      }
+      if tx_ok == 1 {
+        // Every block's seq is assigned sequentially (dharafs_state_
+        // set always advances by exactly the number of blocks just
+        // written), so the group's own highest seq is this_seq +
+        // block_count without needing to re-read each one.
+        highest_seq = this_seq + (block_count as u32);
+        blk = blk + 1 + block_count;
+      } else {
+        // Incomplete -- stop scanning HERE, before even counting the
+        // tx_begin record itself. Nothing after this point in the log
+        // can be trusted (a crash stops everything; no further real
+        // append could have happened after an incomplete transaction
+        // within this same boot), so this is also just where the scan
+        // would need to stop anyway, not an extra restriction.
+        break;
+      }
+    } else {
+      if this_seq > highest_seq {
+        highest_seq = this_seq;
+      }
+      blk = blk + 1;
     }
-    blk = blk + 1;
   }
   let _ = dharafs_state_set(blk as u32, highest_seq + (1 as u32));
   // log_start always resets to 1 on boot -- it's an in-RAM-only
@@ -2525,6 +2574,63 @@ fn dharafs_delete(path: Str) -> i64 {
 // not a clean atomic rename either -- a real dharafs_tx_begin/
 // dharafs_tx_commit wrapping both operations is the documented
 // follow-up in docs/TODO.md, deliberately out of scope here.
+// Round 52 (docs/TODO.md's own "dharafs_rename_raw + a real multi-file
+// transaction primitive" backlog item, increment 2 -- increment 1 was
+// dharafs_rename itself, round 47): a real multi-block atomicity
+// primitive, closing the "crash between the append and the delete
+// leaves both copies live" gap dharafs_rename_raw's own increment-1
+// comment flagged.
+//
+// Design: a TX_BEGIN record (path_len field set to the sentinel
+// below, data_len field repurposed to hold block_count) is appended
+// BEFORE the N blocks it covers. Deliberately no separate TX_COMMIT
+// record -- a crash can only ever happen either before all N
+// following blocks are written (incomplete) or after (complete), and
+// block numbers in this log are strictly increasing and never reused
+// within one boot session (dharafs_append_raw/dharafs_delete_raw
+// always target dharafs_state_get_next_block(), which only ever
+// grows), so "are blocks [tx_block+1, tx_block+block_count] all
+// present and checksum-valid" is itself a complete, sufficient proof
+// of completion -- nothing else could have produced valid records at
+// exactly those block numbers. dharafs_init's own recovery scan
+// (below) is the other half: an INCOMPLETE transaction found at the
+// tail of the log (the only place a crash could ever leave one) rolls
+// the append cursor back to the transaction's own starting block,
+// abandoning every half-written block after it -- old data intact,
+// new data simply never existed, same "old OR new, never mixed"
+// guarantee dharafs_append_raw's own single-record atomicity already
+// gives, now extended across multiple records.
+fn dharafs_tx_begin_sentinel() -> u32 {
+  return 0xFFFFFFF0 as u32; // distinct from the continuation marker
+                            // (0) and every real path_len (1-32)
+}
+
+fn dharafs_tx_begin_raw(block_count: i64) -> i64 {
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let next_block: u32 = dharafs_state_get_next_block();
+  let next_seq: u32 = dharafs_state_get_next_seq();
+  let _ = buf_write_u32(buf, 4 as u32, next_seq);
+  let _ = buf_write_u32(buf, 8 as u32, dharafs_tx_begin_sentinel());
+  let z: i64 = 0;
+  while z < 32 {
+    let _ = buf_write_byte(buf, (12 + z) as u32, 0 as u32);
+    z = z + 1;
+  }
+  let _ = buf_write_u32(buf, 44 as u32, block_count as u32); // repurposed as block_count
+  let _ = buf_write_u32(buf, 48 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 52 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 56 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 60 as u32, 0 as u32);
+  let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+  let _ = buf_write_u32(buf, 0 as u32, checksum);
+  let wr_status: i64 = dharafs_block_write(next_block as i64, buf);
+  if wr_status != 0 {
+    return 1;
+  }
+  let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+  return 0;
+}
+
 fn dharafs_rename_raw(old_path_buf: mut ref i64, old_path_len: i64, new_path_buf: mut ref i64, new_path_len: i64) -> i64 {
   if (old_path_len <= 0) || (old_path_len > 32) || (new_path_len <= 0) || (new_path_len > 32) {
     return 1;
@@ -2561,6 +2667,20 @@ fn dharafs_rename_raw(old_path_buf: mut ref i64, old_path_len: i64, new_path_buf
   let data_len: i64 = dharafs_read_raw(old_path_buf, old_path_len, data_buf);
   if data_len < 0 {
     return 0 - 1; // tombstone or corrupt -- nothing real to rename
+  }
+
+  // The append below may itself span multiple blocks for a large
+  // file (dharafs_append_raw's own multi-block path) -- the tx_begin
+  // marker's block_count only needs to cover the delete's own single
+  // tombstone block PLUS however many blocks the append consumes.
+  // dharafs_block_payload_cap() is the per-block data capacity; ceil-
+  // divide data_len by it the same way dharafs_append_raw's own
+  // multi-block path already computes num_chunks.
+  let cap: i64 = dharafs_block_payload_cap();
+  let append_block_count: i64 = if data_len <= cap { 1 } else { (data_len + cap - 1) / cap };
+  let tx_status: i64 = dharafs_tx_begin_raw(append_block_count + 1);
+  if tx_status != 0 {
+    return 1;
   }
 
   let append_status: i64 = dharafs_append_raw(new_path_buf, new_path_len, data_buf, data_len, owner_uid, owner_gid, mode);

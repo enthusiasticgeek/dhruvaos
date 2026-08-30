@@ -708,21 +708,42 @@ building blocks for a diagnostics command, not a green field.
 ### DharaFS
 
 - **`dharafs_rename` + a real multi-file transaction primitive** —
-  `[M, ~2 rounds]`
-  DharaFS has no rename today (`dharafs_chmod`/`dharafs_chown`/
-  `dharafs_delete` exist, rename doesn't) — and the brainstorm doc's
-  own motivating transaction example (`write "calibration.new"` →
-  `fsync` → `rename` to the real name, as one atomic unit) depends on
-  it. First increment: `dharafs_rename_raw` (append the existing
-  record's data under the new path, preserving owner/mode, then
-  tombstone the old path) — cheap given `dharafs_append_raw`/
-  `dharafs_read_raw`/`dharafs_delete_raw` already do the hard parts.
-  Second increment, the actual ask: a `dharafs_tx_begin`/
-  `dharafs_tx_commit` pair wrapping 2+ of these calls so a crash
-  mid-transaction leaves either the fully-old or fully-new state, not
-  a partial rename — needs real design work (e.g. a small pending-
-  transaction record type recovery can detect and roll forward/back on
-  next boot), not just an API wrapper around already-atomic single ops.
+  `[M, ~2 rounds — DONE, rounds 47 + 52]`
+  First increment (round 47): `dharafs_rename_raw` (read the existing
+  record, append it under the new path preserving owner/mode, tombstone
+  the old path) + shell `mv`.
+
+  Second increment (round 52): `dharafs_tx_begin_raw`, closing the "a
+  crash between the append and the delete leaves both copies live" gap
+  round 47's own comment flagged. Design: a TX_BEGIN marker record
+  (using the existing 512-byte record format's `path_len` field set to
+  a sentinel value outside the real 1-32 range, `data_len` repurposed
+  to hold a block count) is appended before the N blocks it covers —
+  deliberately no separate TX_COMMIT record, since block numbers in
+  this log are strictly increasing and never reused within one boot
+  session, so "are the next `block_count` blocks all present and
+  checksum-valid" is itself a complete completion proof; nothing else
+  could ever produce valid records at exactly those positions. On
+  recovery, `dharafs_init` finds an INCOMPLETE transaction only ever at
+  the very tail of the log (a crash stops everything, so nothing real
+  could have been appended after one) and rolls the append cursor back
+  to the transaction's own starting block, abandoning every half-
+  written block after it — old data intact, new data simply never
+  existed, extending the same "old OR new, never mixed" guarantee
+  single-record atomicity already gives across multiple records.
+  `dharafs_rename_raw` now wraps its own append+delete pair in exactly
+  this.
+
+  Verified with real simulated crashes, not just a normal-path test:
+  (1) crash immediately after tx_begin, before either write — old data
+  untouched, new path never created, future appends unaffected by the
+  abandoned block; (2) the harder case, crash after the append half
+  genuinely succeeds but before the delete — old data STILL fully
+  intact, new path still invisible (the half-completed write doesn't
+  leak through); (3) a genuinely completed transaction is correctly
+  recognized as such and NOT rolled back. 26 new host-harness tests,
+  215/215 PASS clean under ASAN/UBSAN. Live `mv` round trip unchanged,
+  full regression battery clean including `power_yank.py` 70/70.
 
 - **Stronger optional integrity hash for security-critical paths** —
   `[S, ~1 round — DONE, round 48]`

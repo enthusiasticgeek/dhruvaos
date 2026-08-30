@@ -48,6 +48,8 @@ int64_t fn_dharafs_read_raw(int64_t *path_buf, int64_t path_len, int64_t *out_bu
 int64_t fn_dharafs_read(const char *path, int64_t *out_buf);
 int64_t fn_dharafs_delete_raw(int64_t *path_buf, int64_t path_len);
 int64_t fn_dharafs_rename_raw(int64_t *old_path_buf, int64_t old_path_len, int64_t *new_path_buf, int64_t new_path_len);
+int64_t fn_dharafs_tx_begin_raw(int64_t block_count);
+uint32_t fn_dharafs_tx_begin_sentinel(void);
 int64_t fn_dharafs_rename_raw_checked(int64_t *old_path_buf, int64_t old_path_len, int64_t *new_path_buf, int64_t new_path_len, uint32_t req_uid, uint32_t req_gid);
 int64_t fn_dharafs_verified_companion_path_raw(int64_t *path_buf, int64_t path_len, int64_t *out_buf);
 int64_t fn_dharafs_log_rollover_threshold(void);
@@ -340,6 +342,88 @@ static void test_rename(void) {
     CHECK(fn_dharafs_append_raw(mine, 5, d3, 1, 42, 42, 0644) == 0, "rename_dest_perm: create /mine as uid 42");
     CHECK(fn_dharafs_append_raw(theirs, 7, d4, 1, 7, 7, 0644) == 0, "rename_dest_perm: create /theirs as uid 7 (world-readable, not world-writable)");
     CHECK(fn_dharafs_rename_raw_checked(mine, 5, theirs, 7, 42, 42) == -2, "rename_dest_perm: renaming onto someone else's file without write permission on it is denied");
+}
+
+/* ================= Rename transaction crash consistency (round 52) =================
+ * dharafs_rename_raw's own append+delete pair is now bracketed by a
+ * dharafs_tx_begin_raw marker (see its own comment for the on-disk
+ * design). These tests simulate a REAL crash at each point a genuine
+ * power failure could land -- not just "does a normal rename work"
+ * (test_rename already covers that), but "does an INTERRUPTED one
+ * recover to old-or-new, never a mixed state." */
+
+static void test_rename_transaction_crash_consistency(void) {
+    extern uint32_t dharafs_state_get_next_block(void);
+    extern uint32_t dharafs_state_get_next_seq(void);
+
+    /* Case 1: crash immediately after tx_begin, before either the
+     * append or the delete happens at all. */
+    reset_fs();
+    int64_t *old_path = mkbuf("/a", 2);
+    int64_t *new_path = mkbuf("/b", 2);
+    int64_t *data = mkbuf("original", 8);
+    CHECK(fn_dharafs_append_raw(old_path, 2, data, 8, 0, 0, 0644) == 0, "tx_crash1: create /a");
+    uint32_t tx_block = dharafs_state_get_next_block();
+    CHECK(fn_dharafs_tx_begin_raw(2) == 0, "tx_crash1: tx_begin succeeds");
+    /* Simulate the crash: re-run recovery right now, with NEITHER of
+     * the 2 promised follow-up blocks ever written. */
+    CHECK(fn_dharafs_init() == 0, "tx_crash1: recovery runs");
+    CHECK(dharafs_state_get_next_block() == tx_block, "tx_crash1: next_block rolled back to the tx_begin's own block, abandoning it");
+    int64_t *out = dhruva_alloc_bytes(8);
+    CHECK(fn_dharafs_read_raw(old_path, 2, out) == 8, "tx_crash1: old path is completely untouched");
+    CHECK(memcmp(out, "original", 8) == 0, "tx_crash1: old path content is unchanged");
+    CHECK(fn_dharafs_find_latest_block_raw(new_path, 2) == -1, "tx_crash1: new path was never created");
+    /* The abandoned tx_begin block gets silently overwritten by the
+     * next real append, exactly like any other reclaimed log-
+     * structured block -- prove it doesn't jam future writes. */
+    int64_t *data2 = mkbuf("still-works", 11);
+    CHECK(fn_dharafs_append_raw(mkbuf("/c", 2), 2, data2, 11, 0, 0, 0644) == 0, "tx_crash1: normal appends still work after an abandoned transaction");
+
+    /* Case 2: crash after the append half completes but before the
+     * delete -- the harder case, since one of the two promised blocks
+     * really was written successfully. */
+    reset_fs();
+    int64_t *old_path2 = mkbuf("/x", 2);
+    int64_t *new_path2 = mkbuf("/y", 2);
+    int64_t *data3 = mkbuf("keep-me", 7);
+    CHECK(fn_dharafs_append_raw(old_path2, 2, data3, 7, 0, 0, 0644) == 0, "tx_crash2: create /x");
+    uint32_t tx_block2 = dharafs_state_get_next_block();
+    CHECK(fn_dharafs_tx_begin_raw(2) == 0, "tx_crash2: tx_begin succeeds");
+    int64_t *data4 = mkbuf("moved", 5);
+    CHECK(fn_dharafs_append_raw(new_path2, 2, data4, 5, 0, 0, 0644) == 0, "tx_crash2: the append half succeeds (crash happens right after this)");
+    /* Deliberately skip the delete -- this IS the simulated crash. */
+    CHECK(fn_dharafs_init() == 0, "tx_crash2: recovery runs");
+    CHECK(dharafs_state_get_next_block() == tx_block2, "tx_crash2: next_block STILL rolls back to tx_begin, even though the append half genuinely succeeded");
+    int64_t *out2 = dhruva_alloc_bytes(7);
+    CHECK(fn_dharafs_read_raw(old_path2, 2, out2) == 7, "tx_crash2: old path is still fully intact (never touched)");
+    CHECK(memcmp(out2, "keep-me", 7) == 0, "tx_crash2: old path content unchanged");
+    CHECK(fn_dharafs_find_latest_block_raw(new_path2, 2) == -1, "tx_crash2: new path does NOT exist -- the half-completed append is invisible, not a partial/mixed state");
+
+    /* Case 3: the transaction actually completes -- recovery must
+     * recognize it as done and advance state past ALL of it, not
+     * treat a genuinely finished transaction as incomplete. */
+    reset_fs();
+    int64_t *old_path3 = mkbuf("/p", 2);
+    int64_t *new_path3 = mkbuf("/q", 2);
+    int64_t *data5 = mkbuf("payload", 7);
+    CHECK(fn_dharafs_append_raw(old_path3, 2, data5, 7, 0, 0, 0644) == 0, "tx_complete: create /p");
+    CHECK(fn_dharafs_rename_raw(old_path3, 2, new_path3, 2) == 0, "tx_complete: full rename via the real wrapper succeeds");
+    uint32_t next_block_before_recovery = dharafs_state_get_next_block();
+    uint32_t next_seq_before_recovery = dharafs_state_get_next_seq();
+    CHECK(fn_dharafs_init() == 0, "tx_complete: recovery runs after a genuinely completed transaction");
+    CHECK(dharafs_state_get_next_block() == next_block_before_recovery, "tx_complete: next_block is UNCHANGED by recovery (transaction recognized as complete, nothing rolled back)");
+    CHECK(dharafs_state_get_next_seq() == next_seq_before_recovery, "tx_complete: next_seq is also unchanged");
+    int64_t *out3 = dhruva_alloc_bytes(7);
+    CHECK(fn_dharafs_read_raw(new_path3, 2, out3) == 7, "tx_complete: new path readable after recovery");
+    CHECK(memcmp(out3, "payload", 7) == 0, "tx_complete: new path content correct after recovery");
+    CHECK(fn_dharafs_read_raw(old_path3, 2, out3) == -1, "tx_complete: old path still gone after recovery (tombstone recognized correctly)");
+
+    /* Sentinel sanity: confirm it's outside the valid path_len range
+     * (1-32) and distinct from the continuation marker (0), so no
+     * real path could ever collide with it. */
+    uint32_t sentinel = fn_dharafs_tx_begin_sentinel();
+    CHECK(sentinel > 32, "tx_sentinel: sentinel value is outside the valid path_len range");
+    CHECK(sentinel != 0, "tx_sentinel: sentinel is distinct from the continuation marker");
 }
 
 /* ================= Permission model boundaries ================= */
@@ -895,6 +979,7 @@ int main(void) {
     test_overwrite();
     test_delete();
     test_rename();
+    test_rename_transaction_crash_consistency();
     test_permission_boundaries();
     test_directory_hierarchy();
     test_dirlist_helpers();

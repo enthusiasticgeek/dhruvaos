@@ -43,6 +43,8 @@ WHITELIST = [
     "dharafs_delete_raw",
     "dharafs_delete",
     "dharafs_rename_raw",
+    "dharafs_tx_begin_raw",
+    "dharafs_tx_begin_sentinel",
     "dharafs_rename_raw_checked",
     "dharafs_verified_companion_path_raw",
     "dharafs_write_verified_raw",
