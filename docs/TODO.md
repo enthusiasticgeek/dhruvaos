@@ -1020,3 +1020,154 @@ ones.
   the realistic near-term version; true compile-time stripping would
   need a real build-flag mechanism this project doesn't have yet and
   shouldn't be built speculatively ahead of an actual need for it.
+
+## User-facing documentation + general-purpose RTOS gaps (2026-08-29)
+
+Prompted by a direct user question: is this a "true RTOS", does it
+have an API for a third party to add their own tasks, and is there a
+user manual — plus a follow-up asking for USB WiFi/BLE drivers on Pi 1
+(no onboard wireless exists on that board; the user's own call is USB
+dongles there, onboard chips once a newer Pi's port matures). Honest
+answers to the first three, verified against the actual code, not
+assumed: the scheduler core (fixed-priority preemption + priority-
+ceiling protocol + compiler-enforced `#[wcet(...)]`/`#[bounded_stack(
+...)]`) is genuinely real-time-grade — more rigorous than most small
+RTOS projects. But the task set is exactly 6 compile-time-hardcoded
+slots (`sp_table`/`eff_prio_table`/`sleep_until_table` in
+`boot/context_switch.S` are literal 6-word arrays; `start_multitasking`
+takes exactly 6 stack-pointer arguments) with no creation API; there is
+no user manual at all (`docs/` has only `TODO.md`/`PORTING.md`); and
+networking is loopback-only with zero real NIC/wireless hardware
+support of any kind.
+
+- **DhruvaOS user manual** (`docs/DHRUVAOS_MANUAL.md`) — `[M, ~1-2
+  rounds]`
+  Boot process, the scheduler/task model (including its current
+  6-task-fixed limitation, stated plainly rather than glossed over),
+  the interactive shell and all ~20 commands, the heap allocator's
+  never-free/OOM-fatal model, how to extend the kernel today (before
+  a real task API exists) and how that changes once one does, build/
+  run instructions. Written before the task-creation API below so it
+  can honestly describe the CURRENT state, then gets a real update
+  once that API lands rather than documenting something aspirational.
+
+- **DharaFS user manual** (`docs/DHARAFS_MANUAL.md`) — `[M, ~1 round]`
+  On-disk record format, the permission model (owner/group/other +
+  immutable/append-only/system attributes), rename+transaction
+  semantics, verified I/O (`writev`/`catv`), the append-only log API,
+  crash-consistency guarantees (and their actual limits — compaction's
+  own documented failure modes, the transaction primitive's own
+  "old-or-new, never mixed" scope), the block-device backend
+  abstraction, full `dharafs_*` API reference.
+
+- **General task-creation API** — `[M, ~2-3 rounds]`
+  Generalizes the current fixed 6-slot model
+  (`task_create(entry_fn, priority, stack_bytes) -> task_id`,
+  replacing the hardcoded `sp_table`/`eff_prio_table`/
+  `sleep_until_table` 6-word arrays in `boot/context_switch.S` with a
+  real, bounded-but-extensible table, plus generalizing
+  `start_multitasking`'s fixed 6-argument signature). Real design
+  question to settle first: a fixed MAX_TASKS compile-time bound (
+  simplest, matches this project's own static-allocation-everywhere
+  discipline) vs. anything more dynamic (not warranted — this project
+  has no heap-fragmentation tolerance for it and no forcing need).
+  Every existing self-test exercising the scheduler (priority
+  ceiling, preemption, `task_sleep_ticks`) needs to keep passing
+  unchanged against the generalized table — this is core scheduler
+  surgery, treat with the same care as round 53's own register bug.
+
+- **Real priority-inversion detection (a genuine blocking primitive)**
+  — `[M-L, ~2-3 rounds]`
+  Per the earlier analysis: the existing ceiling protocol prevents
+  inversion by construction, so there's nothing to detect from it. A
+  real blocking mutex/semaphore (an actual wait queue a lower-priority
+  holder can genuinely delay a higher-priority waiter behind) is a
+  second, different primitive alongside ceiling protocol, not a
+  replacement for it — ceiling protocol remains the right tool
+  whenever every critical section's ceiling is known statically.
+  Needs its own design: a mutex table (owner task, wait bitmask),
+  scheduler changes so a blocked task's effective priority can be
+  inherited from whoever it's waiting on, and instrumentation
+  (contention count, worst-case wait) once real blocking exists to
+  measure.
+
+- **Wired NIC driver: SMSC LAN9512 over USB** — `[M-L, ~3-4 rounds]`
+  The most tractable of the three driver asks. LAN9512 is the actual
+  USB-to-Ethernet bridge chip Pi 1-family boards use for their wired
+  port (already comment-referenced in `kernel_main.vani`'s own netif
+  header as the anticipated real backend); SMSC's datasheet is public
+  and Linux's `smsc95xx` driver is open source and usable as a
+  protocol reference. Reuses this project's own EXISTING DWC2
+  enumeration/control-transfer/bulk-transfer infrastructure directly
+  (same shape as the USB mass storage driver, rounds 33-36) — no new
+  USB-layer work needed, "just" LAN9512's own vendor register
+  protocol (bulk-wrapped raw Ethernet frames, a small vendor command
+  set for PHY/MAC setup) sitting where the existing loopback netif
+  queue currently sits. This is what finally lets `netif`/ARP/IPv4/
+  TCP/UDP/ICMP talk to a REAL second host instead of only ever
+  self-pinging over loopback — the single biggest real capability
+  unlock in this whole list, and lower-risk than either wireless item.
+
+- **BLE via USB dongle (Pi 1)** — `[L, several rounds — the HCI
+  transport itself is tractable; a full usable BLE stack on top is
+  its own multi-round effort, comparable to this project's existing
+  TCP/IP stack]`
+  Genuinely more tractable than WiFi for one concrete reason: USB
+  Bluetooth HCI is an OFFICIAL, STANDARDIZED USB class (interface
+  class `0xE0`/subclass `0x01`/protocol `0x01`), not vendor-specific —
+  enumeration recognizes it exactly like mass storage's own class-code
+  check already works (`dwc2_fetch_and_set_configuration`'s existing
+  `0x08`/`0x06`/`0x50` pattern, same shape, different constants). HCI
+  commands/events go over the existing control-transfer path
+  (`dwc2_control_in`/`_no_data`, already built); HCI ACL data goes over
+  bulk endpoints (already built for mass storage, same primitives).
+  That gets you a working HCI transport — genuinely buildable with
+  what already exists. What it does NOT get you: L2CAP, ATT, and GATT
+  (the actual protocol layers an application uses to scan/connect/
+  read/write BLE characteristics) are a SEPARATE stack sitting above
+  HCI, comparable in scope to this project's own ARP/IPv4/TCP/UDP/ICMP
+  stack — expect a similar number of rounds to reach the same maturity
+  level `tcpecho`/`udpecho` represent for TCP/IP today. Sequence: HCI
+  transport + reset/scan/connect first (a real, demonstrable milestone
+  on its own, matching this project's own "prove the mechanism with a
+  live loopback-equivalent test" discipline), GATT read/write after.
+
+- **WiFi via USB dongle (Pi 1)** — `[XL, high risk, not sized further
+  — the largest, riskiest item in this entire backlog]`
+  Unlike Bluetooth, there is NO standard USB class for WiFi network
+  adapters — every real chipset uses a vendor-specific protocol
+  (typically USB class `0xFF`), meaning "build a WiFi driver" really
+  means "pick one specific chipset and port its entire vendor
+  protocol," comparable in effort to porting a real Linux USB WiFi
+  driver (routinely thousands of lines even in Linux, which has actual
+  vendor cooperation this project doesn't). Concretely, a real WPA2
+  client additionally needs: (1) firmware blob loading (most chipsets,
+  including the common Realtek RTL8188CUS/RTL8192CU family, require
+  uploading a vendor firmware image over USB before the radio does
+  anything — closed-source blobs with no public protocol spec beyond
+  what Linux's own driver source reveals by example); (2) 802.11
+  MAC-layer state machine (association, authentication) on top of
+  whatever this project's netif layer already provides for Ethernet
+  framing; (3) **a real AES implementation** — WPA2's CCMP encryption
+  is AES-based, and this project deliberately chose ChaCha20 INSTEAD
+  of AES for round 44's own crypto foundation (see that round's
+  comment on why: ARMv6 has no AES instructions and constant-time
+  software AES needs a real S-box strategy) — meaning WiFi isn't just
+  a driver, it's also a new crypto primitive from scratch. Recommend:
+  build the wired NIC and BLE items above first (both reuse existing
+  infrastructure directly and deliver real capability sooner), revisit
+  WiFi's own scope with a fresh, dedicated sizing pass once those are
+  done and a specific chipset is chosen — don't commit rounds to this
+  one blind.
+
+- **Onboard WiFi/BLE for Pi 4/5** — `[not sized, explicitly deferred]`
+  The user's own call: onboard chips are the target once a newer Pi's
+  own port matures, not now. Blocked on the entire Pi 4/5 port
+  (ARMv8 MMU/GICv2-3/BCM2711 timer/vani AArch64 backend, see the
+  "Pi 4/5 port" section above) landing first, and even then inherits
+  everything the WiFi item above already flags (Broadcom's own
+  onboard combo chip has the SAME closed-firmware-blob problem the
+  USB dongle path has, arguably worse — less public documentation
+  exists for it than for common USB dongle chipsets, since Broadcom's
+  SDIO/UART wireless parts are notoriously under-documented even by
+  the standards of consumer WiFi silicon).
