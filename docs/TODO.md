@@ -436,20 +436,60 @@ for by name.
   currently just note this dependency rather than being blocked
   waiting on it).
 
-- **Packet filtering / iptables-equivalent** — `[M, ~2-3 rounds]`
-  A rule table (allow/deny by src/dst IP, port, protocol) with a hook
-  at each protocol's own `*_poll` entry point
-  (`icmp_poll`/`socket_udp_recv`/`tcp_conn_poll`), dropping a match
-  before it reaches the state machine. Doesn't need real crypto or
-  real off-box networking to build or verify the RULE-MATCHING logic
-  itself — synthetic crafted frames (the same technique `tcp_conn_
-  recv_bounds_self_test`/`netif_queue_contention_self_test` already
-  use) exercise it fully under QEMU. Real value is currently capped by
-  this project's own loopback-only netif (see the Dhruva Feature
-  Ledger's "known real-hardware-only gaps" — DHCP never actually binds,
-  `ping` only ever reaches itself) — a filter has nothing genuinely
-  hostile to filter against until real off-box traffic exists, but the
-  mechanism is honestly buildable and testable now regardless.
+- **Packet filtering / iptables-equivalent** — `[M, ~2-3 rounds — now
+  higher-value than when this was written; concrete design below,
+  ready to start]`
+  Originally scoped as "buildable but capped in value" by this
+  project's loopback-only netif — round 56 lifted that cap (a
+  live-verified CDC-ECM path now carries real off-box traffic: real
+  `ping` round trips, real DHCP exchanges over an actual USB link), so
+  a filter now has genuinely real traffic to act on, not just synthetic
+  self-talk.
+
+  **Concrete design (scoped, not yet started):**
+  - **Single hook point, not three**: filter incoming traffic in
+    `netif_recv_frame` itself, right after a frame is dequeued/received
+    (before it's returned to ANY caller), rather than separately in
+    `icmp_poll`/`socket_udp_recv`/`tcp_conn_poll` as originally sketched
+    — the IP header (protocol, src/dst IP) is identical across all
+    three by the time it's parseable at all, and this project already
+    has the accessors needed (`ipv4_get_protocol`/`_src_ip`/`_dst_ip`,
+    `tcp_get_dst_port`/`udp_get_dst_port`) at fixed offsets (14 for the
+    IP header, 34 for the L4 header, matching every existing call site).
+    One hook point means one place to get right, not three kept in
+    sync. Outgoing filtering (`netif_send_frame`) is a natural, smaller
+    follow-up, not in this round's own scope.
+  - **Rule table**: a small fixed-size array (start with 8 rules,
+    matching this project's own "small fixed arrays, not dynamic
+    allocation" convention elsewhere — `MAX_MUTEXES`, `MAX_TASKS`,
+    `MAX_HOST_TCP_CONN`), each rule: `proto` (0=any/1=ICMP/6=TCP/
+    17=UDP), `src_ip`+`src_ip_valid` (0=wildcard), `dst_port`+
+    `dst_port_valid` (0=wildcard, TCP/UDP only — ICMP has none),
+    `action` (0=deny/1=allow). First-match-wins in array order (real
+    iptables semantics), falling through to a `default_policy` (start
+    with allow, matching this project's own currently-permissive
+    stance — nothing to protect against yet beyond what round 56's own
+    real traffic now provides).
+  - **Shell commands**: `fw add <allow|deny> <any|icmp|tcp|udp> <src_ip|any> <dst_port|any>`,
+    `fw list`, `fw flush`, `fw default <allow|deny>` — same
+    `shell_word_matches`-based dispatch style every other multi-word
+    command (`chmod`/`attr`/`log`) already uses.
+  - **Testing plan, two tiers**: (1) synthetic crafted frames fed
+    directly to the new `filter_check_frame` function (same technique
+    `tcp_conn_recv_bounds_self_test` already uses) for exhaustive
+    rule-matching coverage (wildcards, first-match-wins ordering,
+    default policy) — no real traffic needed for this tier; (2) a NEW
+    kind of live verification this project hasn't had before:
+    `fw add deny icmp 10.0.2.2 any` then a real `ping 10.0.2.2` over
+    the actual CDC-ECM link should genuinely fail (no reply), then
+    `fw flush` and the same `ping` should succeed again — a live
+    demonstration of a real security control acting on real external
+    traffic, not self-talk. Ping's own reply timeout handling already
+    exists (this project's own established loopback self-ping tests
+    already cover the "no reply" code path), so this needs no new
+    timeout-detection logic, just real traffic to exercise it against.
+  Priority-inversion instrumentation (below) is now done (round 59) —
+  this is a reasonable next candidate.
 
 - **PKI (Public Key Infrastructure)** — `[XL, several rounds beyond
   the crypto foundation above]`
@@ -463,17 +503,32 @@ for by name.
   chain at all — full X.509 is a separate, much larger step after
   that, not a package deal.
 
-- **Media (at-rest) encryption** — `[M-L, ~2-3 rounds beyond the
-  crypto foundation]`
+- **Media (at-rest) encryption** — `[M-L, ~2-3 rounds — the crypto
+  foundation this was scoped behind is DONE (round 44's ChaCha20);
+  another concretely unblocked candidate]`
   Encrypt FS blocks before `dharafs_block_write`/after `dharafs_block_read`
   (the block-device abstraction rounds 33-36 built is the natural
   integration point — a cipher becomes a transform in that same
-  pipeline, not a separate subsystem). Needs a key-management story
-  this hardware can't help with: BCM2835 has no TPM, no secure
-  element, no hardware key storage of any kind, so a key has to come
-  from somewhere software-only (a passphrase-derived key entered at
-  boot, most realistically) — that's a real design decision to make
-  up front, not a detail to defer.
+  pipeline, not a separate subsystem). ChaCha20 (round 44,
+  `chacha20_encrypt`) is a perfectly real cipher choice for this —
+  unlike WPA2/WiFi (round 58's own note), at-rest encryption isn't a
+  standardized protocol demanding AES/CCMP specifically, so no new
+  crypto primitive is needed here at all, just wiring the existing one
+  in. Still needs a real design decision up front, not a detail to
+  defer: a key-management story this hardware can't help with (BCM2835
+  has no TPM, no secure element, no hardware key storage of any kind),
+  so a key has to come from somewhere software-only — a passphrase
+  entered at boot (via the existing UART shell) is the most realistic
+  starting point, with a KDF (this project has no PBKDF2/Argon2 today —
+  a new, small addition) deriving the actual ChaCha20 key from it.
+  Nonce management also needs a real answer (ChaCha20's 96-bit nonce
+  must never repeat under the same key — a per-block counter derived
+  from the block number itself, matching this project's own `dev`/
+  block-number addressing already in `dharafs_block_read`/`_write`, is
+  the natural choice, not a random nonce needing its own persistent
+  state). Lower priority than packet filtering above (no live-traffic
+  angle to demonstrate it against the way filtering now has), but
+  genuinely ready to start whenever picked up.
 
 - **Secure boot** — `[not sized — hits the SAME hard hardware ceiling
   as USB boot, see docs/TODO.md's own USB-boot feasibility note above]`
@@ -508,11 +563,15 @@ for by name.
   ARMv6. Worth being honest about the actual motivating threat model
   too: PQC defends against "harvest now, decrypt later" attacks on
   long-lived confidential traffic crossing real networks — this
-  project's own networking is still loopback-only/demo-scoped (per the
-  Dhruva Feature Ledger), so the threat PQC exists to counter doesn't
-  apply to anything Dhruva actually does yet. Not recommended before
-  the classical crypto foundation above exists AND real off-box
-  networking is a going concern — at that point, this is worth
+  project's networking is no longer purely loopback (round 56 added a
+  live-verified CDC-ECM path with real off-box traffic — real `ping`
+  round trips, real DHCP exchanges over an actual USB link), but it
+  still carries no confidential/encrypted traffic of any kind (no TLS,
+  no WPA2 — see the WiFi item's own AES gap), so the threat PQC exists
+  to counter STILL doesn't apply to anything Dhruva actually does. Not
+  recommended before the classical crypto foundation above exists AND
+  real confidential off-box traffic is a going concern — at that
+  point, this is worth
   revisiting as its own dedicated, multi-round research-heavy effort,
   not a normal backlog item.
 
@@ -916,30 +975,18 @@ ones.
   consequence for running late) gets added to this project — not
   before, and not against the demo tasks as a stand-in.
 
-- **Priority-inversion detection/logging** — `[not sized, not started
-  — structurally blocked, not just unscoped]`
-  This isn't merely undecided, it's currently impossible to build
-  meaningfully: the scheduler's ONLY synchronization primitive
-  (`dhruva_prio_lock`/`dhruva_prio_unlock`, priority-CEILING protocol)
-  *prevents* inversion by construction — a task boosts its own
-  priority to the ceiling before touching the shared resource, so no
-  lower-priority holder can ever be preempted by a higher-priority
-  waiter for it in the first place. There is no blocking, no wait
-  queue, and therefore no scheduling-visible signal for "detection" to
-  observe — contention under this protocol produces zero difference in
-  what a counter or a trace would show, by design. That's the
-  protocol working correctly, not a gap in the instrumentation.
-  **What would actually be needed**: a genuinely different, SECOND
-  synchronization primitive — a real blocking mutex/semaphore with an
-  actual wait queue, where a lower-priority holder really can delay a
-  higher-priority waiter and that delay is therefore observable. Only
-  worth building once a real workload needs blocking synchronization
-  that ceiling protocol doesn't already cover (ceiling protocol is the
-  right choice for any workload where every critical section's
-  priority ceiling is known statically in advance, which covers a
-  surprising amount of real embedded use — this item is genuinely
-  optional, not merely postponed, unless a future workload's own
-  locking pattern doesn't fit that shape).
+- **Priority-inversion detection/logging** — `[SUPERSEDED — see "Real
+  priority-inversion primitive (blocking mutex + inheritance)" further
+  below]`
+  This entry originally argued detection was structurally impossible
+  without a real blocking primitive, since the priority-CEILING
+  protocol (`dhruva_prio_lock`/`dhruva_prio_unlock`) prevents inversion
+  by construction and produces no scheduling-visible signal to detect.
+  That blocking primitive now exists (round 55,
+  `dhruva_mutex_lock`/`dhruva_mutex_unlock`) — this entry was left
+  stale for a day after that landed. See the other entry for what's
+  done and what instrumentation (contention count, worst-case wait)
+  remains.
 
 - **Fault injection framework** — `[M, ~1-2 rounds — allocation-failure
   half DONE, round 51; FS write latency/IRQ bursts/forced
@@ -1093,9 +1140,17 @@ support of any kind.
   holder's priority genuinely reads 0 (boosted from base 2) for the
   duration. No recursion support, no nested-mutex inheritance stacking
   — both deliberately out of scope for the single-mutex demo needed
-  here. **Remaining, not done**: contention-count/worst-case-wait
-  instrumentation now that real blocking exists to measure — small,
-  not yet scoped into its own round.
+  here. **Instrumentation DONE, round 59, 2026-08-30**:
+  `mutex_contention_count` (genuine blocks only, not every lock call —
+  `mutex_contention_count`/`_get` in `boot/context_switch.S`) and
+  `mutex_wait_worst_ticks` (longest observed gap between blocking and
+  actually being handed ownership, computed in `dhruva_mutex_unlock`
+  from a new per-task `mutex_block_start_tick_table` written by
+  `dhruva_mutex_lock` right before blocking), both surfaced in
+  `diagnose`. Live-verified against the same deterministic demo:
+  contention count grew monotonically across two `diagnose` calls
+  (2 → 7) while worst-case wait stabilized at a plausible steady-state
+  value (3 ticks, well within the demo's own 5-tick hold window).
 
 - **Wired NIC driver: CDC-ECM (DONE, round 56) + real SMSC LAN9512
   (spec-only, hardware-pending)** — `[M-L, ~3-4 rounds, mostly DONE]`

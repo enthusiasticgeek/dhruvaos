@@ -163,6 +163,46 @@ mutex_waiters_table:
                          * needed, unlike mutex_owner_table's 255
                          * sentinel. */
 
+/* Round 59: priority-inversion instrumentation -- the "remaining, not
+ * done" note on the blocking mutex's own docs/TODO.md entry. A real
+ * blocking primitive (round 55) is what FINALLY makes any of this
+ * observable at all (the priority-CEILING protocol prevents inversion
+ * by construction, producing no scheduling-visible signal to measure
+ * -- see that TODO.md entry's own history). */
+mutex_contention_count:
+    .word 0             /* total number of times dhruva_mutex_lock
+                         * actually had to block a caller (mutex already
+                         * held) -- NOT how many times it was called;
+                         * an uncontended lock/unlock pair increments
+                         * nothing here, matching context_switch_count's
+                         * own "count real events, not call volume"
+                         * convention (round 53). */
+mutex_wait_worst_ticks:
+    .word 0             /* the longest observed gap, in ticks, between
+                         * a task blocking in dhruva_mutex_lock and
+                         * dhruva_mutex_unlock actually handing it
+                         * ownership -- a real worst-case wait, not an
+                         * estimate. .bss's zero-init is the correct
+                         * "no contention observed yet" starting value
+                         * (a real wait is always >= 1 tick by the time
+                         * it's even measurable, since blocking and
+                         * resuming can't happen within the same tick
+                         * this driver can distinguish). */
+mutex_block_start_tick_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                        /* tick_count at the moment task[i] most
+                         * recently blocked in dhruva_mutex_lock --
+                         * parallel to sleep_until_table (MAX_TASKS=16
+                         * entries), read back by dhruva_mutex_unlock
+                         * when it hands ownership to task[i] to compute
+                         * how long it actually waited. Not meaningful
+                         * for a task that has never blocked (reads 0,
+                         * i.e. "tick 0" -- harmless, since this table is
+                         * only ever READ for a task dhruva_mutex_unlock
+                         * is actively waking from mutex_waiters_table,
+                         * which can only be set by dhruva_mutex_lock
+                         * having already written this entry first). */
+
 .section ".text"
 
 /* Shared "who runs next" policy: the lowest eff_prio_table value among
@@ -479,6 +519,22 @@ dml_contended:
     orr r8, r8, r9
     str r8, [r7, r0, lsl #2]
 
+    /* Round 59: priority-inversion instrumentation -- count this
+     * genuine block (not every lock call, only ones that actually had
+     * to wait), and record when it started so dhruva_mutex_unlock can
+     * compute how long it actually waited once it hands this task
+     * ownership. r0 (mutex_id) and r3 (owner index) are no longer
+     * needed past this point, so r1/r2 are free scratch here without
+     * disturbing anything the rest of this function still reads. */
+    ldr r1, =mutex_contention_count
+    ldr r2, [r1]
+    add r2, r2, #1
+    str r2, [r1]
+    ldr r1, =tick_count
+    ldr r2, [r1]
+    ldr r1, =mutex_block_start_tick_table
+    str r2, [r1, r5, lsl #2]
+
     /* Block: never ready via the ordinary tick comparison until
      * dhruva_mutex_unlock explicitly hands this task ownership. */
     ldr r7, =sleep_until_table
@@ -565,6 +621,20 @@ dmu_scan_done:
     ldr r5, =sleep_until_table
     mov r9, #0
     str r9, [r5, r7, lsl #2]         /* winner ready immediately */
+
+    /* Round 59: priority-inversion instrumentation -- compute how long
+     * the winner (r7) actually waited (tick_count now minus the tick
+     * it blocked at, recorded by dhruva_mutex_lock), and update the
+     * worst-case-wait counter if this is the longest yet observed. */
+    ldr r5, =mutex_block_start_tick_table
+    ldr r6, [r5, r7, lsl #2]
+    ldr r5, =tick_count
+    ldr r5, [r5]
+    sub r6, r5, r6                   /* r6 = wait_ticks */
+    ldr r5, =mutex_wait_worst_ticks
+    ldr r8, [r5]
+    cmp r6, r8
+    strgt r6, [r5]
 
 dmu_done:
     msr cpsr_c, r1
@@ -723,6 +793,18 @@ context_switch_count_get:
 .global prio_lock_count_get
 prio_lock_count_get:
     ldr r0, =prio_lock_count
+    ldr r0, [r0]
+    bx lr
+
+.global mutex_contention_count_get
+mutex_contention_count_get:
+    ldr r0, =mutex_contention_count
+    ldr r0, [r0]
+    bx lr
+
+.global mutex_wait_worst_ticks_get
+mutex_wait_worst_ticks_get:
+    ldr r0, =mutex_wait_worst_ticks
     ldr r0, [r0]
     bx lr
 

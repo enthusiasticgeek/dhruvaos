@@ -57,7 +57,13 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   `current_eff_prio()`. No recursion support and no nested-mutex
   inheritance stacking (unlock always restores the full base priority
   unconditionally) — both deliberately out of scope for the single-
-  mutex demo this needed, not oversights.
+  mutex demo this needed, not oversights. Round 59 added the
+  instrumentation this primitive's own existence finally makes
+  possible: `mutex contentions` (genuine blocks only, not every lock
+  call) and `mutex worst-case wait` (in ticks, from blocking to
+  actually being handed ownership), both in `diagnose`'s output —
+  live-verified growing correctly (2 → 7 contentions, a stable 3-tick
+  worst case) against the same deterministic demo.
 
 **Known, current limitations (not design goals — see `TODO.md`):**
 
@@ -208,7 +214,7 @@ via `-serial stdio`/`-nographic`). Type a command and press Enter.
 | `eval` | `eval <expr>` | Small arithmetic expression evaluator (`+ - * / ( )`), traps on overflow and division by zero. |
 | `id` | `id` | Shows the active uid/gid for the current shell session. |
 | `su` | `su <uid> <gid>` | Switches the active permission context. uid 0 is root (bypasses all permission checks) — there is no login/authentication of any kind, `su` is unconditional. |
-| `diagnose` | `diagnose` | One-shot health report: uptime ticks, scheduler ready count, heap usage (current == high-water mark, since the allocator never frees), CPU frequency + governor history, allocation count, FS commit count, context switch count, IRQ count, and `dhruva_prio_lock` call count. |
+| `diagnose` | `diagnose` | One-shot health report: uptime ticks, scheduler ready count, heap usage (current == high-water mark, since the allocator never frees), CPU frequency + governor history, allocation count, FS commit count, context switch count, IRQ count, `dhruva_prio_lock` call count, and (round 59) mutex contention count + worst-case wait ticks. |
 | `fault` | `fault alloc <n>` | **Deliberately triggers a real, unrecoverable OOM-fatal halt** after the Nth subsequent heap allocation, for testing the OOM path itself. There is no confirmation prompt and no way to undo it once armed — this is the intended behavior, not a bug. |
 
 Type anything unrecognized to see the full command list echoed back.

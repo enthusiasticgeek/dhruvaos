@@ -218,6 +218,13 @@ extern "C" fn context_switch_count_get() -> i64;
 extern "C" fn prio_lock_count_get() -> i64;
 extern "C" fn irq_count_increment() -> i64;
 extern "C" fn irq_count_get() -> i64;
+// Round 59: priority-inversion instrumentation, the "remaining, not
+// done" note on round 55's real blocking mutex. mutex_contention_count
+// counts genuine blocks (not every lock call); mutex_wait_worst_ticks
+// is the longest observed wait, in ticks, from blocking to actually
+// being handed ownership.
+extern "C" fn mutex_contention_count_get() -> i64;
+extern "C" fn mutex_wait_worst_ticks_get() -> i64;
 // Phase 5: cpu_wfi/scheduler_ready_count -- context_switch.S.
 extern "C" fn cpu_wfi() -> i64;
 extern "C" fn scheduler_ready_count() -> i64;
@@ -12916,6 +12923,20 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("  prio_lock calls: ");
     let _ = uart_put_i64(prio_lock_count_get());
     let _ = uart_puts(" total (ceiling-protected critical section entries)\n");
+
+    // Round 59: the "remaining, not done" note on round 55's real
+    // blocking mutex -- now that dhruva_mutex_lock/unlock give a
+    // genuine wait queue something CAN actually happen to measure
+    // (unlike the ceiling protocol above, ties into no scheduling-
+    // visible signal by construction). mutex_contention_count only
+    // counts genuine blocks, not every lock call (an uncontended
+    // acquire is not "inversion" of any kind -- nothing to log).
+    let _ = uart_puts("  mutex contentions: ");
+    let _ = uart_put_i64(mutex_contention_count_get());
+    let _ = uart_puts(" total (dhruva_mutex_lock calls that actually blocked)\n");
+    let _ = uart_puts("  mutex worst-case wait: ");
+    let _ = uart_put_i64(mutex_wait_worst_ticks_get());
+    let _ = uart_puts(" ticks\n");
     return 0;
   }
 
