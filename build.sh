@@ -96,6 +96,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/usb_bt_state.S" -o "${BUILD_DIR}/usb_bt_state.o"
 
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/usb_wifi_state.S" -o "${BUILD_DIR}/usb_wifi_state.o"
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
@@ -118,6 +121,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/usb_msd_state.o" \
   "${BUILD_DIR}/usb_net_state.o" \
   "${BUILD_DIR}/usb_bt_state.o" \
+  "${BUILD_DIR}/usb_wifi_state.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
   -lgcc \
   -o "${BUILD_DIR}/dhruva.elf"

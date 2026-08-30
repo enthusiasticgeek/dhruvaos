@@ -117,6 +117,31 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   1B hardware-in-loop testing. GATT/ATT/L2CAP (the layers an
   application actually uses to read/write BLE characteristics) don't
   exist yet — see `TODO.md`.
+- **USB WiFi (round 58) stops at enumeration + vendor register I/O,
+  by design.** Realtek RTL8188CU/RTL8192CU family dongles (VID
+  `0x0bda`, PID `0x8176`) are detected the same way LAN9512 is
+  (idVendor:idProduct, since this chipset's own USB interface is
+  entirely vendor-specific — class `0xFF`, no standard class to key
+  off the way CDC-ECM/Bluetooth HCI have). `rtl_reg_read8/16/32` and
+  `rtl_reg_write8/16/32` implement the chip's own vendor register
+  protocol (confirmed against Linux's `rtl8xxxu` driver — a different
+  wire format from LAN9512's own). `rtl8188cu_probe` runs on
+  enumeration and reads two registers as a structural demonstration,
+  then **stops**: every real USB WiFi chipset requires uploading a
+  proprietary firmware blob to an embedded MCU before the radio does
+  anything at all, and that blob isn't something this project can
+  derive from a public spec or fabricate — it comes from the
+  `linux-firmware` project, a legally separate, redistributable binary
+  collection under the vendor's own terms. This project fetched the
+  real firmware temporarily to verify the header-format claims in
+  `rtl8188cu_probe`'s own comment are accurate rather than copied
+  blind from driver source, then deleted it — never committed to this
+  repository, and never will be; see that comment for the exact URL
+  and verified byte-level details for whoever continues this with real
+  hardware. The 802.11 MAC-layer state machine and WPA2/AES (this
+  project's own crypto foundation deliberately chose ChaCha20 over AES
+  for ARMv6-specific reasons — see round 44) remain untouched, far
+  larger separate efforts — see `TODO.md`.
 
 ## 2. Boot process
 

@@ -100,6 +100,10 @@ uint32_t fn_hci_event_param_len(int64_t *event_buf);
 uint32_t fn_hci_event_is_command_complete(int64_t *event_buf);
 uint32_t fn_hci_cmd_complete_opcode(int64_t *event_buf);
 uint32_t fn_hci_cmd_complete_status(int64_t *event_buf);
+int64_t fn_dwc2_build_rtl_reg_read_setup(uint32_t reg_addr, uint32_t want_len);
+int64_t fn_dwc2_build_rtl_reg_write_setup(uint32_t reg_addr, uint32_t data_len);
+int64_t *dwc2_dma_scratch_get(void);
+int64_t dwc2_dma_scratch_set(int64_t *addr);
 
 /* ---- host_stubs.c helpers ---- */
 int64_t *dhruva_alloc_bytes(int64_t n);
@@ -1116,6 +1120,35 @@ static void test_hci_framing(void) {
     CHECK(fn_hci_cmd_complete_status(cc_event) == 0x00, "hci event: Command Complete status == success");
 }
 
+/* Round 58: RTL8188CU/RTL8192CU vendor register SETUP-packet encoding,
+ * checked against hand-computed bytes matching Linux's rtl8xxxu driver
+ * (REALTEK_USB_CMD_REQ=0x05, REALTEK_USB_READ=0xc0, REALTEK_USB_
+ * WRITE=0x40, register address in wValue, not wIndex -- see this
+ * project's own comment in kernel_main.vani for the full citation). */
+static void test_rtl_reg_setup_framing(void) {
+    int64_t *scratch = dhruva_alloc_bytes(8);
+    dwc2_dma_scratch_set(scratch);
+
+    fn_dwc2_build_rtl_reg_read_setup(0x0002, 2); /* REG_SYS_FUNC, u16 read */
+    int64_t *dma = dwc2_dma_scratch_get();
+    CHECK(buf_read_byte(dma, 0) == 0xC0, "rtl reg read setup: bmRequestType == 0xC0 (IN|VENDOR|DEVICE)");
+    CHECK(buf_read_byte(dma, 1) == 0x05, "rtl reg read setup: bRequest == 0x05 (REALTEK_USB_CMD_REQ)");
+    CHECK(buf_read_byte(dma, 2) == 0x02, "rtl reg read setup: wValue LE byte0 == register address low byte");
+    CHECK(buf_read_byte(dma, 3) == 0x00, "rtl reg read setup: wValue LE byte1");
+    CHECK(buf_read_byte(dma, 4) == 0x00, "rtl reg read setup: wIndex byte0 == 0 (unlike LAN9512, addr is NOT here)");
+    CHECK(buf_read_byte(dma, 5) == 0x00, "rtl reg read setup: wIndex byte1 == 0");
+    CHECK(buf_read_byte(dma, 6) == 0x02, "rtl reg read setup: wLength LE byte0 == 2 (u16 read)");
+    CHECK(buf_read_byte(dma, 7) == 0x00, "rtl reg read setup: wLength LE byte1");
+
+    fn_dwc2_build_rtl_reg_write_setup(0x0100, 4); /* MAC_CR-style register, u32 write */
+    CHECK(buf_read_byte(dma, 0) == 0x40, "rtl reg write setup: bmRequestType == 0x40 (OUT|VENDOR|DEVICE)");
+    CHECK(buf_read_byte(dma, 1) == 0x05, "rtl reg write setup: bRequest == 0x05");
+    CHECK(buf_read_byte(dma, 2) == 0x00, "rtl reg write setup: wValue LE byte0 == register address low byte");
+    CHECK(buf_read_byte(dma, 3) == 0x01, "rtl reg write setup: wValue LE byte1 == register address high byte");
+    CHECK(buf_read_byte(dma, 6) == 0x04, "rtl reg write setup: wLength LE byte0 == 4 (u32 write)");
+    CHECK(buf_read_byte(dma, 7) == 0x00, "rtl reg write setup: wLength LE byte1");
+}
+
 int main(void) {
     test_basic_round_trip();
     test_path_length_boundary();
@@ -1140,6 +1173,7 @@ int main(void) {
     test_bignum_boundaries();
     test_lan9512_framing();
     test_hci_framing();
+    test_rtl_reg_setup_framing();
 
     printf("\n%d PASS, %d FAIL\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

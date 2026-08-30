@@ -387,6 +387,14 @@ extern "C" fn usb_bt_set_intr_in_mps(value: u32) -> u32;
 extern "C" fn usb_bt_get_intr_in_toggle() -> u32;
 extern "C" fn usb_bt_set_intr_in_toggle(value: u32) -> u32;
 
+// Round 58 (boot/usb_wifi_state.S): USB WiFi (Realtek RTL8188CU/
+// RTL8192CU family) detection flag ONLY -- this round's scope stops at
+// enumeration + vendor register read/write, see rtl8188cu_probe's own
+// comment for exactly why and where. No endpoint state needed yet
+// (no data path exists).
+extern "C" fn usb_wifi_get_kind() -> u32;
+extern "C" fn usb_wifi_set_kind(value: u32) -> u32;
+
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
 // addressing mode sdhost_init() discovers, across the vani-call-
 // boundary gap kernel_main.vani's own header explains -- no top-level
@@ -8892,6 +8900,165 @@ fn lan9512_reg_write(devaddr: u32, mps: u32, reg_offset: u32, value: u32) -> i64
   return dwc2_control_out(devaddr, mps, val_buf, 4 as u32);
 }
 
+// Round 58: Realtek RTL8188CU/RTL8192CU family (USB WiFi, VID 0x0bda,
+// PID 0x8176 -- confirmed against Linux's rtl8xxxu driver's own device
+// table, `USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_REALTEK, 0x8176,
+// 0xff, 0xff, 0xff)`) vendor register read/write -- a DIFFERENT wire
+// protocol from LAN9512's own 0xA0/0xA1 scheme, confirmed directly
+// against rtl8xxxu's own rtl8xxxu_read8/16/32 and rtl8xxxu_write8/16/32
+// (drivers/net/wireless/realtek/rtl8xxxu/core.c): a single bRequest
+// (0x05, REALTEK_USB_CMD_REQ) for both directions, distinguished by
+// bmRequestType alone (0xC0 read / 0x40 write, i.e. USB_DIR_IN|
+// USB_TYPE_VENDOR|USB_RECIP_DEVICE vs USB_DIR_OUT|... -- same direction
+// encoding LAN9512 uses, just a different bRequest value and, unlike
+// LAN9512, the register address goes in wValue, not wIndex.
+//
+// This round's scope stops here deliberately -- see rtl8188cu_probe's
+// own comment below for exactly why (real, redistributable but
+// proprietary firmware blob required before the radio does anything;
+// this project fetched one temporarily to verify the header format
+// documented there, then deleted it per explicit instruction -- never
+// committed to this repository).
+fn dwc2_build_rtl_reg_read_setup(reg_addr: u32, want_len: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0xC0 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 0x05 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, reg_addr & (0xFF as u32));
+  let _ = buf_write_byte(dma, 3 as u32, (reg_addr >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 5 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 6 as u32, want_len & (0xFF as u32));
+  let _ = buf_write_byte(dma, 7 as u32, (want_len >> (8 as u32)) & (0xFF as u32));
+  return 0;
+}
+
+fn dwc2_build_rtl_reg_write_setup(reg_addr: u32, data_len: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0x40 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 0x05 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, reg_addr & (0xFF as u32));
+  let _ = buf_write_byte(dma, 3 as u32, (reg_addr >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 5 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 6 as u32, data_len & (0xFF as u32));
+  let _ = buf_write_byte(dma, 7 as u32, (data_len >> (8 as u32)) & (0xFF as u32));
+  return 0;
+}
+
+fn rtl_reg_read8(devaddr: u32, mps: u32, addr: u32) -> u32 {
+  let _ = dwc2_build_rtl_reg_read_setup(addr, 1 as u32);
+  let out_buf: mut ref i64 = dhruva_alloc_bytes(1);
+  let status: i64 = dwc2_control_in(devaddr, mps, 1 as u32, out_buf);
+  if status != 0 {
+    return 0xFFFFFFFF as u32;
+  }
+  return buf_read_byte(out_buf, 0 as u32);
+}
+
+fn rtl_reg_read16(devaddr: u32, mps: u32, addr: u32) -> u32 {
+  let _ = dwc2_build_rtl_reg_read_setup(addr, 2 as u32);
+  let out_buf: mut ref i64 = dhruva_alloc_bytes(2);
+  let status: i64 = dwc2_control_in(devaddr, mps, 2 as u32, out_buf);
+  if status != 0 {
+    return 0xFFFFFFFF as u32;
+  }
+  let b0: u32 = buf_read_byte(out_buf, 0 as u32);
+  let b1: u32 = buf_read_byte(out_buf, 1 as u32);
+  return b0 | (b1 << (8 as u32));
+}
+
+fn rtl_reg_read32(devaddr: u32, mps: u32, addr: u32) -> u32 {
+  let _ = dwc2_build_rtl_reg_read_setup(addr, 4 as u32);
+  let out_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let status: i64 = dwc2_control_in(devaddr, mps, 4 as u32, out_buf);
+  if status != 0 {
+    return 0xFFFFFFFF as u32;
+  }
+  let b0: u32 = buf_read_byte(out_buf, 0 as u32);
+  let b1: u32 = buf_read_byte(out_buf, 1 as u32);
+  let b2: u32 = buf_read_byte(out_buf, 2 as u32);
+  let b3: u32 = buf_read_byte(out_buf, 3 as u32);
+  return b0 | (b1 << (8 as u32)) | (b2 << (16 as u32)) | (b3 << (24 as u32));
+}
+
+fn rtl_reg_write8(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
+  let _ = dwc2_build_rtl_reg_write_setup(addr, 1 as u32);
+  let val_buf: mut ref i64 = dhruva_alloc_bytes(1);
+  let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
+  return dwc2_control_out(devaddr, mps, val_buf, 1 as u32);
+}
+
+fn rtl_reg_write16(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
+  let _ = dwc2_build_rtl_reg_write_setup(addr, 2 as u32);
+  let val_buf: mut ref i64 = dhruva_alloc_bytes(2);
+  let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
+  let _ = buf_write_byte(val_buf, 1 as u32, (value >> (8 as u32)) & (0xFF as u32));
+  return dwc2_control_out(devaddr, mps, val_buf, 2 as u32);
+}
+
+fn rtl_reg_write32(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
+  let _ = dwc2_build_rtl_reg_write_setup(addr, 4 as u32);
+  let val_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
+  let _ = buf_write_byte(val_buf, 1 as u32, (value >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(val_buf, 2 as u32, (value >> (16 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(val_buf, 3 as u32, (value >> (24 as u32)) & (0xFF as u32));
+  return dwc2_control_out(devaddr, mps, val_buf, 4 as u32);
+}
+
+// Round 58: USB WiFi bring-up STOPS here, deliberately, right after
+// enumeration + a structural register-read demonstration -- this is
+// NOT the same shape as lan9512_reset_and_init or hci_reset_and_scan,
+// which both go on to actually bring hardware up. Real Realtek USB
+// WiFi chips (RTL8188CU/RTL8192CU and effectively every other USB
+// WiFi chipset in existence) require uploading a PROPRIETARY firmware
+// BLOB to the chip's embedded 8051 MCU before the radio does anything
+// at all -- this is not a protocol this driver can implement from a
+// public specification the way LAN9512's register sequence or
+// Bluetooth's HCI transport were. Real Linux systems get this blob
+// from the `linux-firmware` project (a legally separate, redistribu-
+// table binary collection under Realtek's own terms), never by
+// deriving it from source.
+//
+// This project fetched the REAL firmware
+// (rtlwifi/rtl8192cufw_TMSC.bin, from
+// https://gitlab.com/kernel-firmware/linux-firmware -- the current
+// canonical linux-firmware mirror; also available via kernel.org's own
+// linux-firmware.git) TEMPORARILY, specifically to confirm this
+// comment's own claims about its structure are accurate rather than
+// copied from driver source without verification -- then DELETED it
+// immediately afterward. It was never committed to this repository and
+// never will be; this is a deliberate project-hygiene and licensing
+// boundary; not an oversight. Verified, for the record: the file is
+// 16126 bytes; its first 32 bytes are a `struct rtl8xxxu_firmware_
+// header` (signature, category, function, major/minor version,
+// BCD-encoded release month/date/hour/minute, ramcodesize, ...,
+// matching rtl8xxxu.h's own struct layout exactly); signature field
+// (bytes 0-1, little-endian) reads 0x88c1, matching the driver's own
+// documented "88C1: MP A-cut" case; the ramcodesize field (bytes
+// 12-13, little-endian) reads 0x3ede (16094), which is EXACTLY
+// file_size-32 -- confirming the header is really 32 bytes and the
+// field genuinely self-describes the payload length that follows it.
+//
+// Whoever continues this with real Pi 1B hardware needs to: (1) fetch
+// the same file from the same URL, (2) implement the actual MCU
+// firmware-download sequence (rtl8xxxu_download_firmware in core.c --
+// enable MCU download mode, write the payload in chunks via register
+// writes, verify a checksum, disable download mode), (3) only then
+// does any of the 802.11 MAC-layer/WPA2 work in TODO.md's own next
+// item become reachable at all.
+fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
+  let _ = usb_wifi_set_kind(1 as u32);
+  let iso_ctrl: u32 = rtl_reg_read16(devaddr, mps, 0x0000 as u32); // REG_SYS_ISO_CTRL
+  let sys_func: u32 = rtl_reg_read16(devaddr, mps, 0x0002 as u32); // REG_SYS_FUNC
+  let _ = uart_puts("USB: RTL8188CU/RTL8192CU family detected, REG_SYS_ISO_CTRL=");
+  let _ = uart_put_hex32(iso_ctrl);
+  let _ = uart_puts(" REG_SYS_FUNC=");
+  let _ = uart_put_hex32(sys_func);
+  let _ = uart_puts(" (register I/O only -- firmware upload NOT implemented, see this function's own comment)\n");
+  return 0;
+}
+
 // Register offsets/bit values below all named and valued exactly as
 // smsc95xx.h (Linux's real, in-tree LAN9512/95xx driver header). A
 // deliberately SIMPLIFIED subset of the reference driver's own reset()
@@ -10596,6 +10763,15 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   // match.
   let is_lan9512: u32 = if (d_id_vendor == (0x0424 as u32)) && ((d_id_product == (0xec00 as u32)) || (d_id_product == (0x9904 as u32))) { 1 as u32 } else { 0 as u32 };
 
+  // Round 58: USB WiFi (Realtek RTL8188CU/RTL8192CU family) detection
+  // by idVendor:idProduct, same shape as is_lan9512 above -- this
+  // chipset's own USB interface is entirely vendor-specific (class
+  // 0xFF), so there is no interface-class check to add to dwc2_fetch_
+  // and_set_configuration's descriptor walk the way CDC-ECM/Bluetooth
+  // HCI got one; detection happens here, independent of anything the
+  // config descriptor says, matching LAN9512's own reasoning.
+  let is_rtl8188cu: u32 = if (d_id_vendor == (0x0BDA as u32)) && (d_id_product == (0x8176 as u32)) { 1 as u32 } else { 0 as u32 };
+
   // Round 24 (WiFi dongle enumeration prep, 2026-08-28): every device
   // this driver enumerates -- LAN9512's own Ethernet function today,
   // a real WiFi dongle eventually -- needs to actually reach the
@@ -10607,6 +10783,12 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   let config_status: i64 = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 0 as u32, is_lan9512);
   if config_status != 0 {
     return config_status;
+  }
+  // Round 58: no config-descriptor walk needed for this device (see
+  // is_rtl8188cu's own comment) -- probe it directly now that it's
+  // configured.
+  if is_rtl8188cu == (1 as u32) {
+    let _ = rtl8188cu_probe(downstream_addr, dmps0);
   }
   // Round 56: index 0 might not be a configuration this driver knows
   // how to use at all (found live: QEMU's usb-net device's index 0 is

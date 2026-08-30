@@ -506,3 +506,10 @@ uint32_t usb_bt_get_intr_in_mps(void) { return g_usb_bt_intr_in_mps; }
 uint32_t usb_bt_set_intr_in_mps(uint32_t v) { g_usb_bt_intr_in_mps = v; return 0; }
 uint32_t usb_bt_get_intr_in_toggle(void) { return g_usb_bt_intr_in_toggle; }
 uint32_t usb_bt_set_intr_in_toggle(uint32_t v) { g_usb_bt_intr_in_toggle = v; return 0; }
+
+/* Round 58: usb_wifi_state.S -- added proactively in the same round
+ * that introduced these extern fns (see the round 56/57 lesson in
+ * this file's own history). */
+static uint32_t g_usb_wifi_kind;
+uint32_t usb_wifi_get_kind(void) { return g_usb_wifi_kind; }
+uint32_t usb_wifi_set_kind(uint32_t v) { g_usb_wifi_kind = v; return 0; }

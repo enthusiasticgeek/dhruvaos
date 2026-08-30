@@ -1167,33 +1167,50 @@ support of any kind.
   a similar number of rounds to reach the same maturity level
   `tcpecho`/`udpecho` represent for TCP/IP today.
 
-- **WiFi via USB dongle (Pi 1)** — `[XL, high risk, not sized further
-  — the largest, riskiest item in this entire backlog]`
-  Unlike Bluetooth, there is NO standard USB class for WiFi network
-  adapters — every real chipset uses a vendor-specific protocol
-  (typically USB class `0xFF`), meaning "build a WiFi driver" really
-  means "pick one specific chipset and port its entire vendor
-  protocol," comparable in effort to porting a real Linux USB WiFi
-  driver (routinely thousands of lines even in Linux, which has actual
-  vendor cooperation this project doesn't). Concretely, a real WPA2
-  client additionally needs: (1) firmware blob loading (most chipsets,
-  including the common Realtek RTL8188CUS/RTL8192CU family, require
-  uploading a vendor firmware image over USB before the radio does
-  anything — closed-source blobs with no public protocol spec beyond
-  what Linux's own driver source reveals by example); (2) 802.11
+- **WiFi via USB dongle (Pi 1): enumeration + vendor register I/O
+  (DONE, round 58) + everything else (not started, and structurally
+  blocked without a real firmware blob)** — `[XL, high risk, not sized
+  further beyond what round 58 delivered — still the largest, riskiest
+  item in this entire backlog]`
+  A specific chipset was chosen (Realtek RTL8188CU/RTL8192CU family,
+  VID `0x0bda`/PID `0x8176` — confirmed against Linux's `rtl8xxxu`
+  driver's own device table) rather than leaving this unscoped.
+  `rtl_reg_read8/16/32`/`rtl_reg_write8/16/32` implement the chip's own
+  vendor register protocol (bRequest=0x05 for both directions,
+  distinguished by bmRequestType 0xC0 read/0x40 write — a different
+  wire format from LAN9512's own 0xA0/0xA1 scheme, register address in
+  wValue not wIndex). `rtl8188cu_probe` runs on enumeration and reads
+  two registers as a structural demonstration, then deliberately stops.
+  **Firmware blob loading is a hard, structural stop, not a sizing
+  problem**: every real USB WiFi chipset requires uploading a
+  proprietary firmware image to an embedded MCU before the radio does
+  anything, and that blob is a real Realtek binary this project cannot
+  derive from a public spec or fabricate — it comes from the
+  `linux-firmware` project (a legally separate, redistributable binary
+  collection under the vendor's own terms), never from source. This
+  project fetched the real firmware (`rtlwifi/rtl8192cufw_TMSC.bin`,
+  from https://gitlab.com/kernel-firmware/linux-firmware, also on
+  kernel.org's own linux-firmware.git) TEMPORARILY to verify
+  `rtl8188cu_probe`'s own header-format documentation is accurate
+  (confirmed: 16126 bytes, 32-byte header matching `struct rtl8xxxu_
+  firmware_header` exactly, signature 0x88c1 matching the driver's own
+  documented case, ramcodesize field self-describing the payload length
+  exactly as `file_size - 32`) — then deleted it. Never committed to
+  this repository, and never will be; a deliberate project-hygiene and
+  licensing boundary, not an oversight.
+  **Remaining, not started, and genuinely blocked until real hardware +
+  a real firmware file are both available**: (1) the MCU firmware-
+  download sequence itself (`rtl8xxxu_download_firmware` in Linux's own
+  `core.c` — enable download mode, write the payload in chunks via
+  register writes, verify a checksum, disable download mode); (2) 802.11
   MAC-layer state machine (association, authentication) on top of
   whatever this project's netif layer already provides for Ethernet
   framing; (3) **a real AES implementation** — WPA2's CCMP encryption
   is AES-based, and this project deliberately chose ChaCha20 INSTEAD
-  of AES for round 44's own crypto foundation (see that round's
-  comment on why: ARMv6 has no AES instructions and constant-time
-  software AES needs a real S-box strategy) — meaning WiFi isn't just
-  a driver, it's also a new crypto primitive from scratch. Recommend:
-  build the wired NIC and BLE items above first (both reuse existing
-  infrastructure directly and deliver real capability sooner), revisit
-  WiFi's own scope with a fresh, dedicated sizing pass once those are
-  done and a specific chipset is chosen — don't commit rounds to this
-  one blind.
+  of AES for round 44's own crypto foundation (ARMv6 has no AES
+  instructions and constant-time software AES needs a real S-box
+  strategy) — meaning WiFi isn't just a driver, it's also a new crypto
+  primitive from scratch.
 
 - **Onboard WiFi/BLE for Pi 4/5** — `[not sized, explicitly deferred]`
   The user's own call: onboard chips are the target once a newer Pi's
