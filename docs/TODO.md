@@ -436,6 +436,78 @@ for by name.
   currently just note this dependency rather than being blocked
   waiting on it).
 
+  **Gap worth flagging now, found while scoping real authentication
+  below**: `chacha20_encrypt` is the raw stream cipher only — there is
+  no Poly1305 (or any MAC) wired to it anywhere in this codebase, so
+  nothing built on it today has real integrity/authentication, only
+  confidentiality. Fine for a throwaway demo; NOT fine for media-at-
+  rest encryption or anything else meant to resist real tampering — an
+  attacker who can modify ciphertext can flip corresponding plaintext
+  bits predictably with no detection. Add Poly1305 before shipping
+  ChaCha20 for anything that needs to resist an active adversary, not
+  just a passive one.
+
+- **Real authentication (password-protected `su` + `passwd`)** —
+  `[M, ~2-3 rounds, ready to start on the existing crypto foundation
+  — not yet begun, added 2026-08-30 per explicit request]`
+  Today there is genuinely no authentication anywhere in this project:
+  `dharafs_current_uid`/`_gid` (`boot/dharafs_state.S`) are plain
+  zero-initialized words, so the OS boots directly into an interactive
+  root shell (uid 0) with no login step, and `su <uid> <gid>` switches
+  identity completely unconditionally — no password check of any kind
+  (its own comment says so outright: built only so self-tests/
+  interactive testing could exercise permission enforcement, not as a
+  real security boundary). This is a genuinely new subsystem, not a
+  partially-built one.
+
+  **2026 guidance (NIST SP 800-63B, still current)**: no forced
+  character-class complexity rules, no periodic mandatory rotation
+  (both now considered counterproductive) — length matters more than
+  complexity (minimum ~8 characters, allow 64+), checked against a
+  small known-weak/common-password blocklist at set time (a few
+  hundred entries is meaningful for an embedded system, not a huge
+  dictionary), with failed `su`/`passwd` attempts rate-limited.
+  **Never store the password itself** — store a per-user salt + a KDF
+  output. This project has SHA-256 (round 41) but no HMAC and no
+  Argon2/PBKDF2 — the pragmatic choice is **HMAC-SHA256** (a small,
+  well-understood construction directly on the existing hash, RFC
+  2104) as the basis for **PBKDF2-HMAC-SHA256**, not a from-scratch
+  Argon2 port. Iteration count is a real, honest tradeoff to make
+  explicit, not quietly pick: current OWASP guidance for PBKDF2-
+  HMAC-SHA256 is 600,000+ iterations, but ARM1176JZF-S is a
+  ~700MHz-class embedded core — that many iterations at login time
+  could introduce a genuinely noticeable delay. Needs an actual
+  measurement (a spike, same discipline as every crypto primitive
+  above) before picking a real number, not a value copied from a
+  server-class guideline without checking it against this hardware.
+
+  **Real, open design forks to resolve before starting, not silently
+  assumed**:
+  1. **Scope: gate `su` only, or a full boot-time login?** Gating just
+     `su` (require a password to switch identity) is the smaller
+     change and leaves today's "boot straight into a root shell"
+     behavior intact — meaning root itself is still unauthenticated,
+     only switching AWAY from wherever you start is protected. A full
+     login flow (authenticate before any shell access at all) is a
+     materially bigger change to the boot sequence and shell task
+     itself. Pick one explicitly; don't half-do both.
+  2. **No salt randomness source exists.** This project's own DHCP
+     client already documents having no RNG (`scheduler_get_tick_
+     count()` stands in for an xid, explicitly not real randomness).
+     A password salt only needs to be unique, not secret, so a weaker
+     source (tick_count + heap allocation count + something else
+     cheaply available) may be an honestly-labeled "good enough for
+     this threat model" answer — but that's a judgment call to make
+     explicitly, not silently assume is fine.
+  3. **This shell has no way to hide typed input.** The UART RX IRQ
+     handler echoes every typed character back as it fills the line
+     buffer — there is no termios-style "echo off" mode. A password
+     typed at this shell today would appear in cleartext in the UART
+     stream itself, and in anything capturing that stream — a real,
+     honest limitation to either accept explicitly or fix by teaching
+     the line-fill IRQ handler a "currently reading a password, don't
+     echo" mode before shipping this.
+
 - **Packet filtering / iptables-equivalent** — `[M, ~2-3 rounds — now
   higher-value than when this was written; concrete design below,
   ready to start]`
