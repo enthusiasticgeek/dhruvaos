@@ -87,6 +87,9 @@ int64_t fn_bignum_mul_raw(int64_t *a, int64_t *b, int64_t *out, int64_t n);
 int64_t fn_bignum_cmp_raw(int64_t *a, int64_t *b, int64_t n);
 int64_t fn_bignum_limbs_equal(int64_t *a, int64_t *b, int64_t n);
 int64_t fn_bignum_set_limbs4(int64_t *buf, uint32_t l0, uint32_t l1, uint32_t l2, uint32_t l3);
+int64_t fn_lan9512_build_tx_header(int64_t *out_buf, uint32_t frame_len);
+uint32_t fn_lan9512_rx_status_has_error(uint32_t rx_status);
+uint32_t fn_lan9512_rx_status_frame_len(uint32_t rx_status);
 
 /* ---- host_stubs.c helpers ---- */
 int64_t *dhruva_alloc_bytes(int64_t n);
@@ -971,6 +974,55 @@ static void test_bignum_boundaries(void) {
     CHECK(fn_bignum_cmp_raw(a, a, 4) == 0, "bignum: a == a");
 }
 
+/* Round 56: LAN9512 TX/RX wire-framing math, checked against hand-
+ * computed byte layouts from smsc95xx.h's own register/bit
+ * definitions -- the part of the real LAN9512 backend that doesn't
+ * need actual chip I/O to verify (see lan9512_build_tx_header's own
+ * comment in kernel_main.vani for why the register-init sequence
+ * itself can't be covered here or under QEMU). */
+static void test_lan9512_framing(void) {
+    /* TX_CMD_A = frame_len | FIRST_SEG_(0x2000) | LAST_SEG_(0x1000);
+     * TX_CMD_B = frame_len. Both little-endian 32-bit words. */
+    int64_t *hdr = dhruva_alloc_bytes(8);
+    fn_lan9512_build_tx_header(hdr, 64);
+    CHECK(buf_read_byte(hdr, 0) == 0x40, "lan9512 tx header: TX_CMD_A byte0");
+    CHECK(buf_read_byte(hdr, 1) == 0x30, "lan9512 tx header: TX_CMD_A byte1 (FIRST_SEG_|LAST_SEG_|len)");
+    CHECK(buf_read_byte(hdr, 2) == 0x00, "lan9512 tx header: TX_CMD_A byte2");
+    CHECK(buf_read_byte(hdr, 3) == 0x00, "lan9512 tx header: TX_CMD_A byte3");
+    CHECK(buf_read_byte(hdr, 4) == 0x40, "lan9512 tx header: TX_CMD_B byte0 (== frame_len)");
+    CHECK(buf_read_byte(hdr, 5) == 0x00, "lan9512 tx header: TX_CMD_B byte1");
+    CHECK(buf_read_byte(hdr, 6) == 0x00, "lan9512 tx header: TX_CMD_B byte2");
+    CHECK(buf_read_byte(hdr, 7) == 0x00, "lan9512 tx header: TX_CMD_B byte3");
+
+    /* A larger, non-power-of-two length exercises more than just the
+     * low byte -- 590 = 0x24E, matching this project's own real
+     * live-captured DHCPOFFER frame size (see docs/TODO.md's own note
+     * on the pre-existing 512-byte netif cap this same frame exposed). */
+    int64_t *hdr2 = dhruva_alloc_bytes(8);
+    fn_lan9512_build_tx_header(hdr2, 590);
+    uint32_t cmd_a = (uint32_t)buf_read_byte(hdr2, 0) | ((uint32_t)buf_read_byte(hdr2, 1) << 8) |
+                     ((uint32_t)buf_read_byte(hdr2, 2) << 16) | ((uint32_t)buf_read_byte(hdr2, 3) << 24);
+    uint32_t cmd_b = (uint32_t)buf_read_byte(hdr2, 4) | ((uint32_t)buf_read_byte(hdr2, 5) << 8) |
+                     ((uint32_t)buf_read_byte(hdr2, 6) << 16) | ((uint32_t)buf_read_byte(hdr2, 7) << 24);
+    CHECK(cmd_a == (590u | 0x2000u | 0x1000u), "lan9512 tx header: TX_CMD_A for a 590-byte frame");
+    CHECK(cmd_b == 590u, "lan9512 tx header: TX_CMD_B for a 590-byte frame");
+
+    /* RX_STS_ES_ (error summary, bit 15) gates whether a received
+     * frame is trusted at all. */
+    CHECK(fn_lan9512_rx_status_has_error(0x00008000) == 1, "lan9512 rx status: RX_STS_ES_ set is detected");
+    CHECK(fn_lan9512_rx_status_has_error(0x00000000) == 0, "lan9512 rx status: no error bits is clean");
+    CHECK(fn_lan9512_rx_status_has_error(0xFFFF7FFFu) == 0, "lan9512 rx status: every OTHER bit set, ES_ clear, still clean");
+
+    /* RX_STS_FL_ (frame length, bits 29:16) -- a real 590-byte frame's
+     * status word, plus other real status bits (RX_STS_BF_=broadcast,
+     * RX_STS_CRC_) that must NOT leak into the extracted length. */
+    uint32_t rx_status_590 = (590u << 16) | 0x00002000u | 0x00000002u;
+    CHECK(fn_lan9512_rx_status_frame_len(rx_status_590) == 590u, "lan9512 rx status: 590-byte length extracted correctly, unaffected by other bits");
+    /* Max representable 14-bit length (0x3FFF). */
+    CHECK(fn_lan9512_rx_status_frame_len(0x3FFF0000u) == 0x3FFFu, "lan9512 rx status: max 14-bit length field (0x3FFF)");
+    CHECK(fn_lan9512_rx_status_frame_len(0x00000000u) == 0u, "lan9512 rx status: zero length");
+}
+
 int main(void) {
     test_basic_round_trip();
     test_path_length_boundary();
@@ -993,6 +1045,7 @@ int main(void) {
     test_sha256_boundaries();
     test_chacha20_boundaries();
     test_bignum_boundaries();
+    test_lan9512_framing();
 
     printf("\n%d PASS, %d FAIL\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

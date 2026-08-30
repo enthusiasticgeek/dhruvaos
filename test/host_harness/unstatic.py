@@ -82,6 +82,9 @@ WHITELIST = [
     "bignum_cmp_raw",
     "bignum_limbs_equal",
     "bignum_set_limbs4",
+    "lan9512_build_tx_header",
+    "lan9512_rx_status_has_error",
+    "lan9512_rx_status_frame_len",
 ]
 
 

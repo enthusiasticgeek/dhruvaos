@@ -305,6 +305,25 @@ int64_t start_multitasking(int64_t *sp_a, int64_t *sp_b, int64_t *sp_c, int64_t 
     return 0;
 }
 
+/* Round 54/55: task_create/task_table_init (general task-creation API)
+ * and dhruva_mutex_lock/unlock/current_eff_prio (blocking mutex +
+ * priority inheritance) -- never exercised by host_main.c's own call
+ * graph (this harness has no scheduler), same "dummy stub, never
+ * meaningfully called" category as dhruva_prio_lock/unlock above. Only
+ * needed so kernel_main (which does call these, unconditionally, at
+ * real boot) still LINKS as one translation unit -- these symbols
+ * being unresolved broke this harness's build the moment those rounds
+ * landed, undiscovered until round 56 next ran it for its own new
+ * tests. */
+uint32_t task_create(int64_t (*entry_fn)(void), int64_t *stack_base, uint32_t stack_bytes, uint32_t priority) {
+    (void)entry_fn; (void)stack_base; (void)stack_bytes; (void)priority;
+    return 0;
+}
+int64_t task_table_init(void) { return 0; }
+uint32_t dhruva_mutex_lock(uint32_t mutex_id) { (void)mutex_id; return 0; }
+uint32_t dhruva_mutex_unlock(uint32_t mutex_id) { (void)mutex_id; return 0; }
+uint32_t current_eff_prio(void) { return 0; }
+
 int64_t sdhost_drain_fifo_to_buffer(int64_t *buf, int64_t word_count) { (void)buf; (void)word_count; return 0; }
 int64_t sdhost_fill_fifo_from_buffer(int64_t *buf, int64_t word_count) { (void)buf; (void)word_count; return 0; }
 int64_t sd_state_get_is_sdhc(void) { return 0; }
@@ -430,3 +449,29 @@ uint32_t usb_msd_get_in_toggle(void) { return g_usb_msd_in_toggle; }
 uint32_t usb_msd_set_in_toggle(uint32_t v) { g_usb_msd_in_toggle = v; return 0; }
 uint32_t usb_msd_get_out_toggle(void) { return g_usb_msd_out_toggle; }
 uint32_t usb_msd_set_out_toggle(uint32_t v) { g_usb_msd_out_toggle = v; return 0; }
+
+/* Round 56: same shape as the usb_msd_* block above, for usb_net_
+ * state.S -- never exercised by host_main.c's own call graph (no USB
+ * here), needed only so kernel_main links. */
+static uint32_t g_usb_net_kind, g_usb_net_bulk_in_epaddr, g_usb_net_bulk_in_mps;
+static uint32_t g_usb_net_bulk_out_epaddr, g_usb_net_bulk_out_mps;
+static uint32_t g_usb_net_in_toggle, g_usb_net_out_toggle, g_usb_net_cdc_data_iface_num;
+static int64_t *g_usb_net_mac_scratch_ptr;
+uint32_t usb_net_get_kind(void) { return g_usb_net_kind; }
+uint32_t usb_net_set_kind(uint32_t v) { g_usb_net_kind = v; return 0; }
+uint32_t usb_net_get_bulk_in_epaddr(void) { return g_usb_net_bulk_in_epaddr; }
+uint32_t usb_net_set_bulk_in_epaddr(uint32_t v) { g_usb_net_bulk_in_epaddr = v; return 0; }
+uint32_t usb_net_get_bulk_in_mps(void) { return g_usb_net_bulk_in_mps; }
+uint32_t usb_net_set_bulk_in_mps(uint32_t v) { g_usb_net_bulk_in_mps = v; return 0; }
+uint32_t usb_net_get_bulk_out_epaddr(void) { return g_usb_net_bulk_out_epaddr; }
+uint32_t usb_net_set_bulk_out_epaddr(uint32_t v) { g_usb_net_bulk_out_epaddr = v; return 0; }
+uint32_t usb_net_get_bulk_out_mps(void) { return g_usb_net_bulk_out_mps; }
+uint32_t usb_net_set_bulk_out_mps(uint32_t v) { g_usb_net_bulk_out_mps = v; return 0; }
+uint32_t usb_net_get_in_toggle(void) { return g_usb_net_in_toggle; }
+uint32_t usb_net_set_in_toggle(uint32_t v) { g_usb_net_in_toggle = v; return 0; }
+uint32_t usb_net_get_out_toggle(void) { return g_usb_net_out_toggle; }
+uint32_t usb_net_set_out_toggle(uint32_t v) { g_usb_net_out_toggle = v; return 0; }
+uint32_t usb_net_get_cdc_data_iface_num(void) { return g_usb_net_cdc_data_iface_num; }
+uint32_t usb_net_set_cdc_data_iface_num(uint32_t v) { g_usb_net_cdc_data_iface_num = v; return 0; }
+int64_t *usb_net_get_mac_scratch_ptr(void) { return g_usb_net_mac_scratch_ptr; }
+int64_t usb_net_set_mac_scratch_ptr(int64_t *addr) { g_usb_net_mac_scratch_ptr = addr; return 0; }

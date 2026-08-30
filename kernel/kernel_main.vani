@@ -334,6 +334,31 @@ extern "C" fn usb_msd_set_in_toggle(value: u32) -> u32;
 extern "C" fn usb_msd_get_out_toggle() -> u32;
 extern "C" fn usb_msd_set_out_toggle(value: u32) -> u32;
 
+// Round 56 (boot/usb_net_state.S): same shape as usb_msd_state.S
+// above, a SEPARATE state module (not shared) so a mass-storage device
+// can never leave stale net_kind/endpoint state behind and vice versa.
+// net_kind: 0=none (loopback), 1=CDC-ECM (QEMU usb-net + real USB
+// Ethernet dongles), 2=real SMSC LAN9512 (spec-only, see its own
+// comment at the LAN9512 backend below).
+extern "C" fn usb_net_get_kind() -> u32;
+extern "C" fn usb_net_set_kind(value: u32) -> u32;
+extern "C" fn usb_net_get_bulk_in_epaddr() -> u32;
+extern "C" fn usb_net_set_bulk_in_epaddr(value: u32) -> u32;
+extern "C" fn usb_net_get_bulk_in_mps() -> u32;
+extern "C" fn usb_net_set_bulk_in_mps(value: u32) -> u32;
+extern "C" fn usb_net_get_bulk_out_epaddr() -> u32;
+extern "C" fn usb_net_set_bulk_out_epaddr(value: u32) -> u32;
+extern "C" fn usb_net_get_bulk_out_mps() -> u32;
+extern "C" fn usb_net_set_bulk_out_mps(value: u32) -> u32;
+extern "C" fn usb_net_get_in_toggle() -> u32;
+extern "C" fn usb_net_set_in_toggle(value: u32) -> u32;
+extern "C" fn usb_net_get_out_toggle() -> u32;
+extern "C" fn usb_net_set_out_toggle(value: u32) -> u32;
+extern "C" fn usb_net_get_cdc_data_iface_num() -> u32;
+extern "C" fn usb_net_set_cdc_data_iface_num(value: u32) -> u32;
+extern "C" fn usb_net_get_mac_scratch_ptr() -> mut ref i64;
+extern "C" fn usb_net_set_mac_scratch_ptr(addr: mut ref i64) -> i64;
+
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
 // addressing mode sdhost_init() discovers, across the vani-call-
 // boundary gap kernel_main.vani's own header explains -- no top-level
@@ -4041,8 +4066,29 @@ fn netif_get_mtu() -> i64 {
 // Loopback's own placeholder MAC: a locally-administered address (bit
 // 1 of the first octet set, per IEEE 802 convention for non-vendor
 // addresses) rather than a real vendor OUI, so it can never collide
-// with an actual NIC's burned-in address.
+// with an actual NIC's burned-in address. Round 56: when a CDC-ECM
+// device was enumerated AND its MAC string fetch succeeded (usb_net_
+// mac_scratch_ptr genuinely set, not just usb_net_kind==1 -- the fetch
+// can fail independently of detection itself succeeding), return the
+// device's OWN real MAC instead. LAN9512 falls through to this same
+// placeholder: this driver doesn't read the chip's EEPROM-programmed
+// MAC (no EEPROM read implemented), so it assigns this address to the
+// hardware via ADDRL/ADDRH instead (see the LAN9512 backend's own
+// comment) -- one consistent address either way, not a real vs. fake
+// mismatch.
 fn netif_get_mac(out_buf: mut ref i64) -> i64 {
+  if usb_net_get_kind() == (1 as u32) {
+    let mac_ptr: mut ref i64 = usb_net_get_mac_scratch_ptr();
+    if ptr_to_u32(mac_ptr) != (0 as u32) {
+      let mi: i64 = 0;
+      while mi < 6 {
+        let mb: u32 = buf_read_byte(mac_ptr, mi as u32);
+        let _ = buf_write_byte(out_buf, mi as u32, mb);
+        mi = mi + 1;
+      }
+      return 0;
+    }
+  }
   let _ = buf_write_byte(out_buf, 0 as u32, 0x02 as u32);
   let _ = buf_write_byte(out_buf, 1 as u32, 0 as u32);
   let _ = buf_write_byte(out_buf, 2 as u32, 0 as u32);
@@ -4057,11 +4103,97 @@ fn netif_get_mac(out_buf: mut ref i64) -> i64 {
 // (dropped, matching real best-effort networking behavior under
 // congestion -- nothing here can afford to block) or the frame is too
 // big for a slot.
+//
+// Round 56: dispatches to the real CDC-ECM bulk path when one was
+// enumerated (usb_net_get_kind()==1), falling through to the original
+// loopback queue otherwise (kind==0, or a real LAN9512 -- see its own
+// backend below for why it has a separate send path, not this one).
+// CDC-ECM's own TX framing (confirmed against QEMU's hw/usb/dev-
+// network.c usb_net_handle_dataout, the non-RNDIS branch): the raw
+// frame bytes, chunked into bulk_out_mps-sized OUT packets, with NO
+// vendor header of any kind (unlike the real LAN9512's own TX_CMD_A/B
+// wrapper) -- CDC-ECM is a standard class specifically because the
+// framing is just "the frame, on the wire." A frame whose total length
+// is an exact multiple of bulk_out_mps needs an explicit zero-length
+// packet afterward so the device knows the frame is complete instead
+// of waiting for more data that never comes (dwc2_net_bulk_out(...,
+// out_len=0) is exactly that ZLP, per its own comment).
 fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
-  if netif_get_count() >= 4 {
+  if frame_len > 512 {
     return 0 - 1;
   }
-  if frame_len > 512 {
+  if usb_net_get_kind() == (1 as u32) {
+    let mps: u32 = usb_net_get_bulk_out_mps();
+    let devaddr: u32 = dwc2_downstream_addr();
+    let chunk_buf: mut ref i64 = dhruva_alloc_bytes(64);
+    let sent: i64 = 0;
+    let frame_len_u: u32 = frame_len as u32;
+    while sent < frame_len {
+      let remaining: i64 = frame_len - sent;
+      let chunk_len: i64 = if (remaining as u32) > mps { mps as i64 } else { remaining };
+      let ci: i64 = 0;
+      while ci < chunk_len {
+        let b: u32 = buf_read_byte(buf, (sent + ci) as u32);
+        let _ = buf_write_byte(chunk_buf, ci as u32, b);
+        ci = ci + 1;
+      }
+      let out_status: i64 = dwc2_net_bulk_out(devaddr, mps, chunk_buf, chunk_len);
+      if out_status != 0 {
+        return 0 - 1;
+      }
+      sent = sent + chunk_len;
+    }
+    if (frame_len_u % mps) == (0 as u32) {
+      let _ = dwc2_net_bulk_out(devaddr, mps, chunk_buf, 0);
+    }
+    return 0;
+  }
+  // Round 56: real LAN9512 TX framing -- an 8-byte vendor header
+  // (TX_CMD_A/TX_CMD_B, little-endian, per smsc95xx.h) prepended before
+  // the raw frame bytes. TX_CMD_A: frame length | FIRST_SEG_ (0x2000)
+  // | LAST_SEG_ (0x1000) -- this driver never splits a frame across
+  // multiple TX_CMD_A segments, so both bits are always set together.
+  // TX_CMD_B: frame length again, no ADD_CRC_DIS_/DIS_PADDING_/
+  // CSUM_ENABLE bits set -- the chip computes its own CRC, auto-pads
+  // short frames, and this driver doesn't use TX checksum offload,
+  // matching Linux's own smsc95xx_tx_fixup non-checksum path. Unlike
+  // CDC-ECM, no ZLP terminator is needed: TX_CMD_B's own length field
+  // tells the chip exactly how many bytes to expect, so an exact-
+  // multiple-of-mps frame doesn't need a "frame is really done" signal
+  // the way CDC-ECM's short-packet convention does.
+  if usb_net_get_kind() == (2 as u32) {
+    let mps2: u32 = usb_net_get_bulk_out_mps();
+    let devaddr2: u32 = dwc2_downstream_addr();
+    let frame_len_u2: u32 = frame_len as u32;
+    let total_len: i64 = frame_len + 8;
+    let wrapped_buf: mut ref i64 = dhruva_alloc_bytes(520);
+    let _ = lan9512_build_tx_header(wrapped_buf, frame_len_u2);
+    let wi: i64 = 0;
+    while wi < frame_len {
+      let wb: u32 = buf_read_byte(buf, wi as u32);
+      let _ = buf_write_byte(wrapped_buf, (8 + wi) as u32, wb);
+      wi = wi + 1;
+    }
+    let chunk_buf2: mut ref i64 = dhruva_alloc_bytes(64);
+    let sent2: i64 = 0;
+    while sent2 < total_len {
+      let remaining2: i64 = total_len - sent2;
+      let chunk_len2: i64 = if (remaining2 as u32) > mps2 { mps2 as i64 } else { remaining2 };
+      let ci2: i64 = 0;
+      while ci2 < chunk_len2 {
+        let b2: u32 = buf_read_byte(wrapped_buf, (sent2 + ci2) as u32);
+        let _ = buf_write_byte(chunk_buf2, ci2 as u32, b2);
+        ci2 = ci2 + 1;
+      }
+      let out_status2: i64 = dwc2_net_bulk_out(devaddr2, mps2, chunk_buf2, chunk_len2);
+      if out_status2 != 0 {
+        return 0 - 1;
+      }
+      sent2 = sent2 + chunk_len2;
+    }
+    return 0;
+  }
+  if netif_get_count() >= 4 {
     return 0 - 1;
   }
   let qbuf: mut ref i64 = netif_get_queue_buf();
@@ -4098,7 +4230,125 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
 // dropped (dequeued, not left stuck blocking the queue forever) and
 // reported as -1, same "reject, don't guess/truncate" posture as
 // every other bounds check this project's networking layer uses.
+// Round 56: CDC-ECM RX dispatch. Reads bulk_in_mps-sized chunks in a
+// loop, accumulating into out_buf, until a SHORT packet (< mps) comes
+// back -- CDC-ECM's own short-packet-terminates-the-frame convention
+// (confirmed against QEMU's hw/usb/dev-network.c usb_net_handle_
+// datain, the non-RNDIS branch), mirroring netif_send_frame's own TX
+// side of the same convention. dwc2_net_bulk_in's own -1 return (NAK/
+// timeout/error, all indistinguishable at this driver's level) means
+// "nothing to receive right now" when it happens on the FIRST chunk of
+// a poll (the overwhelmingly common case -- most polls find nothing
+// waiting), which is the expected non-blocking "no frame ready" signal
+// every caller of netif_recv_frame already relies on for the loopback
+// path too.
+//
+// Timing caveat, flagged rather than silently assumed: dwc2_wait_
+// chan0_done's own 1,000,000-iteration poll bound means an empty RX
+// endpoint is NOT an instant "-1", it's bounded-but-not-fast -- this
+// project's other bulk/control transfers only ever poll while genuine
+// data is expected imminently, never as a repeated "is anything
+// there" check the way network RX polling fundamentally is. Whether
+// this makes every idle netif_recv_frame poll unacceptably slow in
+// practice (as opposed to merely non-infinite) is exactly what this
+// round's live QEMU verification needs to confirm empirically, not
+// guess.
 fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
+  if usb_net_get_kind() == (1 as u32) {
+    let mps: u32 = usb_net_get_bulk_in_mps();
+    let devaddr: u32 = dwc2_downstream_addr();
+    let chunk_buf: mut ref i64 = dhruva_alloc_bytes(64);
+    let total: i64 = 0;
+    let done: i64 = 0;
+    while done == 0 {
+      let got: i64 = dwc2_net_bulk_in(devaddr, mps, chunk_buf, mps as i64);
+      if got < 0 {
+        if total == 0 {
+          return 0 - 1;
+        }
+        done = 1;
+      } else {
+        if (total + got) > max_len {
+          return 0 - 1;
+        }
+        let ci: i64 = 0;
+        while ci < got {
+          let b: u32 = buf_read_byte(chunk_buf, ci as u32);
+          let _ = buf_write_byte(out_buf, (total + ci) as u32, b);
+          ci = ci + 1;
+        }
+        total = total + got;
+        if (got as u32) < mps {
+          done = 1;
+        }
+      }
+    }
+    return total;
+  }
+  // Round 56: real LAN9512 RX framing (per smsc95xx.h/smsc95xx.c's own
+  // rx_fixup): a 4-byte RX status word, then NET_IP_ALIGN (2) padding
+  // bytes (matching lan9512_reset_and_init's own HW_CFG.RXDOFF=2
+  // setup), then the frame data itself, which includes a 4-byte FCS
+  // this driver trims off the end -- RX_STS_FL_ (bits 29:16) is the
+  // reported length INCLUDING that FCS. RX_STS_ES_ (bit 15, error
+  // summary) sets the frame is dropped outright. Deliberately assumes
+  // exactly one frame per USB transfer (this driver never enables
+  // HW_CFG_MEF_/turbo mode, matching lan9512_reset_and_init's own
+  // simplification) -- a real multi-frame-per-transfer response would
+  // need the same loop rx_fixup itself uses, not implemented here.
+  if usb_net_get_kind() == (2 as u32) {
+    let mps3: u32 = usb_net_get_bulk_in_mps();
+    let devaddr3: u32 = dwc2_downstream_addr();
+    let chunk_buf3: mut ref i64 = dhruva_alloc_bytes(64);
+    let raw_buf: mut ref i64 = dhruva_alloc_bytes(520);
+    let raw_total: i64 = 0;
+    let done3: i64 = 0;
+    while done3 == 0 {
+      let got3: i64 = dwc2_net_bulk_in(devaddr3, mps3, chunk_buf3, mps3 as i64);
+      if got3 < 0 {
+        if raw_total == 0 {
+          return 0 - 1;
+        }
+        done3 = 1;
+      } else {
+        if (raw_total + got3) > (520 as i64) {
+          return 0 - 1;
+        }
+        let ci3: i64 = 0;
+        while ci3 < got3 {
+          let b3: u32 = buf_read_byte(chunk_buf3, ci3 as u32);
+          let _ = buf_write_byte(raw_buf, (raw_total + ci3) as u32, b3);
+          ci3 = ci3 + 1;
+        }
+        raw_total = raw_total + got3;
+        if (got3 as u32) < mps3 {
+          done3 = 1;
+        }
+      }
+    }
+    if raw_total < 6 {
+      return 0 - 1;
+    }
+    let rx_status: u32 = buf_read_u32_le(raw_buf, 0);
+    if lan9512_rx_status_has_error(rx_status) == (1 as u32) {
+      return 0 - 1; // RX_STS_ES_ (error summary) -- drop
+    }
+    let reported_len: u32 = lan9512_rx_status_frame_len(rx_status);
+    if (6 + (reported_len as i64)) > raw_total {
+      return 0 - 1;
+    }
+    let usable_len: i64 = (reported_len as i64) - 4; // drop trailing FCS
+    if (usable_len < 0) || (usable_len > max_len) {
+      return 0 - 1;
+    }
+    let ri: i64 = 0;
+    while ri < usable_len {
+      let rb: u32 = buf_read_byte(raw_buf, (6 + ri) as u32);
+      let _ = buf_write_byte(out_buf, ri as u32, rb);
+      ri = ri + 1;
+    }
+    return usable_len;
+  }
   if netif_get_count() <= 0 {
     return 0 - 1;
   }
@@ -8094,7 +8344,15 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   if mps == (0 as u32) {
     return 0 - 1;
   }
-  if want_len > (64 as u32) {
+  // Round 56: raised from 64 to 128, matching dwc2_dma_scratch's own
+  // real allocation size -- found live, not anticipated: CDC-ECM's
+  // full config descriptor (control iface + Union + Ethernet
+  // functional descriptors + interrupt endpoint + data iface at BOTH
+  // altsettings + 2 bulk endpoints) is 80 bytes, which the old 64-byte
+  // cap silently truncated mid-descriptor-chain, before ever reaching
+  // the data interface's own altsetting-1 bulk endpoints -- CDC-ECM
+  // detection succeeded but bulk endpoint capture silently failed.
+  if want_len > (128 as u32) {
     return 0 - 1;
   }
   let dma: mut ref i64 = dwc2_dma_scratch_get();
@@ -8218,6 +8476,68 @@ fn dwc2_control_no_data(devaddr: u32, mps: u32) -> i64 {
   return 0;
 }
 
+// Round 56: one complete control transfer with an OUT data stage --
+// SETUP, then out_len bytes sent host-to-device, then a zero-length
+// STATUS stage in the OPPOSITE direction (IN), mirroring dwc2_control_
+// in's own shape exactly but with the data stage's direction bit and
+// the buffer-copy direction both flipped. Needed for the real LAN9512
+// backend's WRITE_REGISTER vendor request (0xA0), which sends 4 bytes
+// host-to-device -- the first OUT-data-stage control transfer this
+// driver has ever needed (every existing one -- GET_DESCRIPTOR,
+// SET_ADDRESS/CONFIGURATION/INTERFACE -- either reads data back or has
+// none at all). Reuses dwc2_dma_scratch (same 128-byte cap as dwc2_
+// control_in) for the DATA stage buffer, safe to overwrite immediately
+// after the SETUP stage completes since the SETUP packet's own 8 bytes
+// are no longer needed by that point.
+fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i64 {
+  if mps == (0 as u32) {
+    return 0 - 1;
+  }
+  if out_len > (128 as u32) {
+    return 0 - 1;
+  }
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  let _ = mem_barrier();
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_setup(), 1 as u32, 8 as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
+  let setup_result: u32 = dwc2_wait_chan0_done();
+  if (setup_result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+
+  let i: i64 = 0;
+  let out_len_i: i64 = out_len as i64;
+  while i < out_len_i {
+    let b: u32 = buf_read_byte(buf, i as u32);
+    let _ = buf_write_byte(dma, i as u32, b);
+    i = i + 1;
+  }
+  let _ = mem_barrier();
+
+  let pktcnt: u32 = if out_len == (0 as u32) { 1 as u32 } else { (out_len + mps - (1 as u32)) / mps };
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), pktcnt, out_len));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
+  let data_result: u32 = dwc2_wait_chan0_done();
+  if (data_result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
+  let status_result: u32 = dwc2_wait_chan0_done();
+  if (status_result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  return 0;
+}
+
 // Generic SETUP packet builder -- every standard AND class-specific
 // request (GET_DESCRIPTOR, SET_ADDRESS, and the hub-class port
 // requests below) is just these five fields in the same 8-byte
@@ -8313,11 +8633,26 @@ fn dwc2_build_get_device_descriptor_setup(want_len: u32) -> i64 {
 // high byte is 2 (CONFIGURATION) instead of 1 (DEVICE) -- everything
 // else about a GET_DESCRIPTOR request is identical regardless of
 // which descriptor type is being asked for.
-fn dwc2_build_get_config_descriptor_setup(want_len: u32) -> i64 {
+// Round 56: config_index parameter added (was hardcoded to 0). A
+// device can declare MORE than one configuration (bNumConfigurations
+// in its device descriptor) -- found live, not anticipated in advance:
+// QEMU's own `usb-net` device declares its RNDIS config FIRST
+// (bConfigurationValue=2) and its plain CDC-ECM config SECOND
+// (bConfigurationValue=1) in its own descriptor array, so index 0
+// (the only index this function ever requested before this round)
+// returns RNDIS, not the CDC-ECM config this driver actually knows how
+// to drive -- confirmed live via a real QEMU boot with `-device
+// usb-net` attached, not guessed from the source alone (mass storage,
+// this project's only other real USB device so far, only ever
+// declares a single configuration, so this gap was invisible until a
+// genuinely multi-configuration device showed up). See dwc2_fetch_
+// and_set_configuration's own comment for how it now tries index 0
+// then index 1 rather than assuming index 0 is always the right one.
+fn dwc2_build_get_config_descriptor_setup(config_index: u32, want_len: u32) -> i64 {
   let dma: mut ref i64 = dwc2_dma_scratch_get();
   let _ = buf_write_byte(dma, 0 as u32, 0x80 as u32);
   let _ = buf_write_byte(dma, 1 as u32, 6 as u32);
-  let _ = buf_write_byte(dma, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, config_index & (0xFF as u32));
   let _ = buf_write_byte(dma, 3 as u32, 2 as u32);
   let _ = buf_write_byte(dma, 4 as u32, 0 as u32);
   let _ = buf_write_byte(dma, 5 as u32, 0 as u32);
@@ -8351,6 +8686,284 @@ fn dwc2_build_set_configuration_setup(config_value: u32) -> i64 {
   return 0;
 }
 
+// Round 56: bmRequestType=0x01 (host-to-device, standard, INTERFACE
+// recipient -- not 0x00/device, the distinction USB 2.0 spec chapter
+// 9.4.10 draws between SET_CONFIGURATION and SET_INTERFACE),
+// bRequest=0x0B (SET_INTERFACE), wValue=alt_setting, wIndex=iface_num,
+// wLength=0. CDC-ECM's own data interface defines alternate setting 0
+// with ZERO endpoints ("link inactive") and alternate setting 1 with
+// the real bulk IN/OUT pair -- confirmed directly against QEMU's own
+// hw/usb/dev-network.c descriptor tables before writing this, same
+// discipline as every other USB assumption in this file. A device
+// stays on altsetting 0 (no data flow at all) until this request
+// explicitly selects altsetting 1.
+fn dwc2_build_set_interface_setup(iface_num: u32, alt_setting: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0x01 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 0x0B as u32);
+  let _ = buf_write_byte(dma, 2 as u32, alt_setting & (0xFF as u32));
+  let _ = buf_write_byte(dma, 3 as u32, (alt_setting >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 4 as u32, iface_num & (0xFF as u32));
+  let _ = buf_write_byte(dma, 5 as u32, (iface_num >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 6 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
+  return 0;
+}
+
+// Round 56: GET_DESCRIPTOR(String, index=string_index), same shape as
+// dwc2_build_get_device_descriptor_setup but wValue's high byte is 3
+// (STRING) and low byte is the string index, with wIndex=langid.
+// Hardcodes langid 0x0409 (US English) rather than doing the full
+// spec-correct "fetch string index 0 for the device's supported langid
+// list first" dance: confirmed against QEMU's own hw/usb/desc.c
+// (usb_desc_string) that it ignores wIndex/langid entirely for any
+// non-zero string index, and real devices overwhelmingly accept 0x0409
+// for a plain-ASCII field like CDC-ECM's own MAC-address string
+// regardless of their actual supported langid list -- a simplification
+// flagged here, not silently assumed.
+fn dwc2_build_get_string_descriptor_setup(string_index: u32, want_len: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0x80 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 6 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, string_index & (0xFF as u32));
+  let _ = buf_write_byte(dma, 3 as u32, 3 as u32);
+  let _ = buf_write_byte(dma, 4 as u32, 0x09 as u32);
+  let _ = buf_write_byte(dma, 5 as u32, 0x04 as u32);
+  let _ = buf_write_byte(dma, 6 as u32, want_len & (0xFF as u32));
+  let _ = buf_write_byte(dma, 7 as u32, (want_len >> (8 as u32)) & (0xFF as u32));
+  return 0;
+}
+
+fn hex_ascii_to_nibble(c: u32) -> u32 {
+  if (c >= (0x30 as u32)) && (c <= (0x39 as u32)) {
+    return c - (0x30 as u32);
+  }
+  if (c >= (0x61 as u32)) && (c <= (0x66 as u32)) {
+    return (c - (0x61 as u32)) + (10 as u32);
+  }
+  if (c >= (0x41 as u32)) && (c <= (0x46 as u32)) {
+    return (c - (0x41 as u32)) + (10 as u32);
+  }
+  return 0 as u32;
+}
+
+// Round 56: CDC-ECM's own iMACAddress functional descriptor field
+// (USB CDC spec 1.2 §5.2.3.1) names a STRING descriptor holding the
+// MAC as 12 plain ASCII hex digits, no colons/separators (e.g.
+// "400102030405"). USB string descriptors are UTF-16LE
+// (bLength, bDescriptorType, then 2 bytes per character) -- since hex
+// digits are always ASCII, the low byte of each UTF-16 code unit IS
+// the character and the high byte is always 0, so this only reads the
+// low byte of each pair (byte offset 2 + i*2), skipping the 2-byte
+// header. Does not validate the high byte is actually 0 (a genuinely
+// non-ASCII MAC-string reply would be a spec-violating device; this
+// project's existing "reject clearly malformed input" posture doesn't
+// extend to defending against a compliant class of device sending
+// deliberately malformed class-specific string content here).
+fn cdc_parse_mac_string(buf: mut ref i64, out_mac: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    let hi_char: u32 = buf_read_byte(buf, ((2 as i64) + (i * 4)) as u32);
+    let lo_char: u32 = buf_read_byte(buf, ((2 as i64) + (i * 4) + 2) as u32);
+    let hi_nibble: u32 = hex_ascii_to_nibble(hi_char);
+    let lo_nibble: u32 = hex_ascii_to_nibble(lo_char);
+    let byte_val: u32 = (hi_nibble << (4 as u32)) | lo_nibble;
+    let _ = buf_write_byte(out_mac, i as u32, byte_val);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Round 56: the REAL SMSC LAN9512 backend -- the actual USB-to-
+// Ethernet bridge chip every Pi 1 Model B's onboard wired port uses
+// (BCM2835 has no native Ethernet MAC). Detected by idVendor:
+// idProduct (0x0424:0xec00 or 0x0424:0x9904 -- Microchip/SMSC's own
+// device table lists both as valid PIDs for this exact chip family
+// depending on EEPROM-strapped mode, confirmed against Linux's
+// smsc95xx.c `products[]` table), NOT by interface class/subclass like
+// CDC-ECM above -- this chip's Ethernet function is entirely vendor-
+// specific (no standard USB class exists for it), so dwc2_fetch_and_
+// set_configuration's descriptor walk captures ITS bulk endpoints
+// unconditionally (gated on is_lan9512, not any class check) rather
+// than needing its own functional-descriptor parsing the way CDC-ECM
+// did.
+//
+// IMPORTANT, stated plainly rather than left implicit: nothing below
+// this comment through the end of the LAN9512 backend has been (or
+// currently can be) LIVE-VERIFIED. QEMU's raspi1ap has no LAN9512
+// device model -- unlike CDC-ECM above (verified against QEMU's own
+// real `usb-net` device: real MAC fetch matching an independently-
+// specified value, real ping round trips, packet-capture-confirmed
+// real frames on the wire), this backend is written directly against
+// the public LAN9512/9514 datasheet and Linux's smsc95xx.c/.h
+// reference driver (register offsets, vendor request numbers, TX/RX
+// wire framing all cross-checked against that real, in-tree Linux
+// driver source before writing a single line here), but has only ever
+// been exercised via the vani-compiler's own type/borrow checker, not
+// against a real chip or its own protocol responses. Pending this
+// project's own planned Pi 1B hardware-in-loop testing (see project
+// TODO) before this can be called proven rather than "written to
+// spec." The TX_CMD_A/B and RX-status-word FRAMING MATH specifically
+// (the part that doesn't need real chip I/O to check) does get real
+// host-side test coverage -- see test/host_harness/'s own LAN9512
+// framing tests.
+//
+// USB_VENDOR_REQUEST_READ_REGISTER=0xA1 (device-to-host, vendor,
+// device), USB_VENDOR_REQUEST_WRITE_REGISTER=0xA0 (host-to-device,
+// vendor, device) -- both wValue=0, wIndex=register offset, wLength=4,
+// data=4-byte little-endian register value. Register offsets below
+// (ID_REV/HW_CFG/RX_CFG/TX_CFG/BURST_CAP/BULK_IN_DLY/INT_STS/
+// LED_GPIO_CFG/AFC_CFG/FLOW/VLAN1/INT_EP_CTL/MAC_CR/ADDRH/ADDRL) all
+// named exactly as smsc95xx.h names them, same reason this project's
+// other hardware-register code always keeps the vendor's own names.
+fn lan9512_reg_read(devaddr: u32, mps: u32, reg_offset: u32) -> u32 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0xC1 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 0xA1 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 4 as u32, reg_offset & (0xFF as u32));
+  let _ = buf_write_byte(dma, 5 as u32, (reg_offset >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 6 as u32, 4 as u32);
+  let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
+  let out_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let status: i64 = dwc2_control_in(devaddr, mps, 4 as u32, out_buf);
+  if status != 0 {
+    return 0xFFFFFFFF as u32; // sentinel: no real LAN9512 register
+                              // this driver reads is ever expected to
+                              // legitimately read back as all-ones
+  }
+  let b0: u32 = buf_read_byte(out_buf, 0 as u32);
+  let b1: u32 = buf_read_byte(out_buf, 1 as u32);
+  let b2: u32 = buf_read_byte(out_buf, 2 as u32);
+  let b3: u32 = buf_read_byte(out_buf, 3 as u32);
+  return b0 | (b1 << (8 as u32)) | (b2 << (16 as u32)) | (b3 << (24 as u32));
+}
+
+fn lan9512_reg_write(devaddr: u32, mps: u32, reg_offset: u32, value: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0x41 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 0xA0 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 4 as u32, reg_offset & (0xFF as u32));
+  let _ = buf_write_byte(dma, 5 as u32, (reg_offset >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 6 as u32, 4 as u32);
+  let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
+  let val_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
+  let _ = buf_write_byte(val_buf, 1 as u32, (value >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(val_buf, 2 as u32, (value >> (16 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(val_buf, 3 as u32, (value >> (24 as u32)) & (0xFF as u32));
+  // Same "SETUP already written into dwc2_dma_scratch by the caller"
+  // convention as every other control-transfer call site in this file
+  // -- the SETUP bytes written into `dma` above are what dwc2_control_
+  // out's own SETUP stage sends; val_buf here is only the DATA stage's
+  // OUT payload (dwc2_control_out reuses dma for that too, internally,
+  // once the SETUP stage itself has completed).
+  return dwc2_control_out(devaddr, mps, val_buf, 4 as u32);
+}
+
+// Register offsets/bit values below all named and valued exactly as
+// smsc95xx.h (Linux's real, in-tree LAN9512/95xx driver header). A
+// deliberately SIMPLIFIED subset of the reference driver's own reset()
+// -- enough to bring TX and RX up correctly, not every register the
+// reference driver also touches for LED behavior, checksum-offload
+// capability advertisement, or burst/turbo-mode tuning this driver
+// doesn't use (turbo/multi-frame-per-USB-packet mode specifically is
+// never enabled here, matching netif_recv_frame's own single-frame-
+// per-transfer assumption -- see its LAN9512 branch below).
+fn lan9512_reset_and_init(devaddr: u32, mps: u32) -> i64 {
+  // HW_CFG Lite Reset, then poll until the chip clears the bit itself
+  // (bounded, not `while true`, matching this project's own
+  // established hardware-poll discipline).
+  let _ = lan9512_reg_write(devaddr, mps, 0x14 as u32, 0x00000008 as u32);
+  let tries: i64 = 0;
+  let reset_done: i64 = 0;
+  while (tries < 1000) && (reset_done == 0) {
+    let hw_cfg: u32 = lan9512_reg_read(devaddr, mps, 0x14 as u32);
+    if (hw_cfg & (0x00000008 as u32)) == (0 as u32) {
+      reset_done = 1;
+    }
+    tries = tries + 1;
+  }
+  if reset_done == 0 {
+    let _ = uart_puts("USB: LAN9512 lite reset timed out\n");
+    return 0 - 1;
+  }
+
+  // Program the chip's MAC registers with this driver's own assigned
+  // address (ADDRL = bytes 0-3 little-endian, ADDRH = bytes 4-5 in the
+  // low 16 bits) -- no EEPROM read implemented, so this is always the
+  // SAME address netif_get_mac's own loopback fallback already uses,
+  // not the real hardware's burned-in one (see netif_get_mac's own
+  // comment for why that's a consistent choice, not a mismatch).
+  let mac_buf: mut ref i64 = dhruva_alloc_bytes(6);
+  let _ = netif_get_mac(mac_buf);
+  let m0: u32 = buf_read_byte(mac_buf, 0 as u32);
+  let m1: u32 = buf_read_byte(mac_buf, 1 as u32);
+  let m2: u32 = buf_read_byte(mac_buf, 2 as u32);
+  let m3: u32 = buf_read_byte(mac_buf, 3 as u32);
+  let m4: u32 = buf_read_byte(mac_buf, 4 as u32);
+  let m5: u32 = buf_read_byte(mac_buf, 5 as u32);
+  let addr_lo: u32 = m0 | (m1 << (8 as u32)) | (m2 << (16 as u32)) | (m3 << (24 as u32));
+  let addr_hi: u32 = m4 | (m5 << (8 as u32));
+  let _ = lan9512_reg_write(devaddr, mps, 0x108 as u32, addr_lo); // ADDRL
+  let _ = lan9512_reg_write(devaddr, mps, 0x104 as u32, addr_hi); // ADDRH
+
+  // RX data offset = 2 (NET_IP_ALIGN), so a received frame's IP header
+  // (14 bytes into the Ethernet payload) lands word-aligned -- HW_CFG
+  // bits [10:9], mask 0x00000600, matching smsc95xx.h's own HW_CFG_
+  // RXDOFF_ field exactly.
+  let hw_cfg2: u32 = lan9512_reg_read(devaddr, mps, 0x14 as u32);
+  let hw_cfg3: u32 = (hw_cfg2 & (0xFFFFF9FF as u32)) | ((2 as u32) << (9 as u32));
+  let _ = lan9512_reg_write(devaddr, mps, 0x14 as u32, hw_cfg3);
+
+  let _ = lan9512_reg_write(devaddr, mps, 0x08 as u32, 0xFFFFFFFF as u32); // INT_STS clear-all
+  let _ = lan9512_reg_write(devaddr, mps, 0x11C as u32, 0 as u32); // FLOW
+  let _ = lan9512_reg_write(devaddr, mps, 0x2C as u32, 0x00F830A1 as u32); // AFC_CFG default
+
+  // Enable TX: MAC_CR.TXEN_ then TX_CFG.TX_CFG_ON_.
+  let mac_cr: u32 = lan9512_reg_read(devaddr, mps, 0x100 as u32);
+  let mac_cr_tx: u32 = mac_cr | (0x00000008 as u32);
+  let _ = lan9512_reg_write(devaddr, mps, 0x100 as u32, mac_cr_tx);
+  let _ = lan9512_reg_write(devaddr, mps, 0x10 as u32, 0x00000004 as u32); // TX_CFG_ON_
+
+  // Enable RX: MAC_CR.RXEN_.
+  let mac_cr_rx: u32 = mac_cr_tx | (0x00000004 as u32);
+  let _ = lan9512_reg_write(devaddr, mps, 0x100 as u32, mac_cr_rx);
+
+  let _ = uart_puts("USB: LAN9512 reset+init complete (spec-only, not live-verified -- see its own comment)\n");
+  return 0;
+}
+
+// Round 56: the LAN9512 TX/RX wire-framing math, factored out into
+// pure functions (no MMIO, no USB, only buffer reads/writes and
+// arithmetic) specifically so test/host_harness/ can exercise them
+// directly against hand-computed expected byte layouts -- the part of
+// this backend that genuinely doesn't need real chip I/O to verify,
+// unlike lan9512_reset_and_init's own register sequence. netif_send_
+// frame/netif_recv_frame's LAN9512 branches call these rather than
+// duplicating this arithmetic inline.
+fn lan9512_build_tx_header(out_buf: mut ref i64, frame_len: u32) -> i64 {
+  let tx_cmd_a: u32 = frame_len | (0x00002000 as u32) | (0x00001000 as u32);
+  let tx_cmd_b: u32 = frame_len;
+  let _ = buf_write_u32_le(out_buf, 0, tx_cmd_a);
+  let _ = buf_write_u32_le(out_buf, 4, tx_cmd_b);
+  return 0;
+}
+
+fn lan9512_rx_status_has_error(rx_status: u32) -> u32 {
+  if (rx_status & (0x00008000 as u32)) != (0 as u32) {
+    return 1 as u32;
+  }
+  return 0 as u32;
+}
+
+fn lan9512_rx_status_frame_len(rx_status: u32) -> u32 {
+  return (rx_status >> (16 as u32)) & (0x3FFF as u32);
+}
+
 // Fetches the configuration descriptor (first its own fixed 9-byte
 // header to learn wTotalLength/bConfigurationValue -- the same
 // "short fetch to learn a length, then a full fetch" progressive
@@ -8369,9 +8982,16 @@ fn dwc2_build_set_configuration_setup(config_value: u32) -> i64 {
 // endpoint addresses/types into something a future bulk-transfer
 // driver would consume is real, separate work for whenever that
 // driver actually gets built.
-fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
+// Round 56: config_index parameter added -- see dwc2_build_get_config_
+// descriptor_setup's own comment for why (QEMU's usb-net device
+// exposes a config this driver can't use at index 0, and the one it
+// can use at index 1). Callers that only ever expect a single-
+// configuration device (the hub itself) always pass 0; dwc2_
+// enumerate_downstream retries with 1 if index 0 turned out to hold
+// neither a mass-storage nor CDC-ECM interface.
+fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, is_lan9512: u32) -> i64 {
   let cfg9: mut ref i64 = dhruva_alloc_bytes(9);
-  let _ = dwc2_build_get_config_descriptor_setup(9 as u32);
+  let _ = dwc2_build_get_config_descriptor_setup(config_index, 9 as u32);
   let status0: i64 = dwc2_control_in(devaddr, mps, 9 as u32, cfg9);
   if status0 != 0 {
     let _ = uart_puts("USB: GET_DESCRIPTOR(Configuration) short fetch failed\n");
@@ -8389,19 +9009,20 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
   let num_interfaces: u32 = buf_read_byte(cfg9, 4 as u32);
   let config_value: u32 = buf_read_byte(cfg9, 5 as u32);
 
-  // dwc2_control_in's own 64-byte cap (round 3 audit -- the DMA
-  // scratch buffer's real capacity) means a configuration whose
-  // wTotalLength exceeds it can only be read partially here. Grab as
-  // much as fits rather than failing outright -- everything counted
-  // below still reflects real descriptors, just possibly not all of
-  // them for an unusually large configuration (most simple devices,
-  // including every one this project can attach under QEMU, fit
-  // comfortably under 64 bytes).
-  let full_want_len: u32 = if total_length > (64 as u32) { 64 as u32 } else { total_length };
-  let truncated: i64 = if total_length > (64 as u32) { 1 } else { 0 };
+  // dwc2_control_in's own cap (round 3 audit -- the DMA scratch
+  // buffer's real capacity, raised 64->128 in round 56 for CDC-ECM's
+  // own 80-byte config descriptor, see its own comment) means a
+  // configuration whose wTotalLength exceeds that can only be read
+  // partially here. Grab as much as fits rather than failing outright
+  // -- everything counted below still reflects real descriptors, just
+  // possibly not all of them for an unusually large configuration
+  // (every device this project attaches under QEMU today, including
+  // CDC-ECM's own 80-byte one, fits comfortably under 128 bytes).
+  let full_want_len: u32 = if total_length > (128 as u32) { 128 as u32 } else { total_length };
+  let truncated: i64 = if total_length > (128 as u32) { 1 } else { 0 };
 
-  let cfgfull: mut ref i64 = dhruva_alloc_bytes(64);
-  let _ = dwc2_build_get_config_descriptor_setup(full_want_len);
+  let cfgfull: mut ref i64 = dhruva_alloc_bytes(128);
+  let _ = dwc2_build_get_config_descriptor_setup(config_index, full_want_len);
   let status1: i64 = dwc2_control_in(devaddr, mps, full_want_len, cfgfull);
   if status1 != 0 {
     let _ = uart_puts("USB: GET_DESCRIPTOR(Configuration) full fetch failed\n");
@@ -8434,12 +9055,47 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
   // device, and a non-mass-storage device (the hub itself, or a
   // usb-net gadget) must not retain a stale BOT flag/endpoints from
   // a previous call.
+  // Round 56: this same single-pass walk also detects a CDC-ECM
+  // Ethernet Networking Control Model interface (class 0x02/COMM,
+  // subclass 0x06) alongside the existing BOT detection -- QEMU's own
+  // `usb-net` device (non-RNDIS config) presents exactly this,
+  // confirmed against hw/usb/dev-network.c before writing this. Real
+  // standard USB Ethernet dongles use the same class. This is
+  // DIFFERENT from the real onboard SMSC LAN9512 (Pi 1's own wired
+  // port), which is entirely vendor-specific and detected separately
+  // by idVendor:idProduct at the DEVICE-descriptor level, before this
+  // function is even called -- see dwc2_enumerate_downstream's own
+  // comment on that.
+  //
+  // Tracking a CDC control interface's associated DATA interface
+  // needs two things this loop didn't track before: bInterfaceNumber/
+  // bAlternateSetting (CDC's data interface defines altsetting 0 with
+  // ZERO endpoints -- "link inactive" -- and altsetting 1 with the
+  // real bulk pair; SET_CONFIGURATION alone leaves every interface on
+  // altsetting 0, so the wrong one must never be mistaken for the
+  // active one), and the CS_INTERFACE Union Functional Descriptor
+  // (bDescriptorType 0x24, bDescriptorSubType 0x06) inside the control
+  // interface's own descriptor block, whose bSlaveInterface0 field
+  // names which OTHER interface number is the paired data interface --
+  // read while cur_iface_is_cdc_control is still true from having just
+  // seen that control interface, exactly the same "most recently seen
+  // INTERFACE descriptor" attribution BOT's own ENDPOINT handling
+  // already relies on. The CDC Ethernet Functional Descriptor
+  // (subtype 0x0F) is read the same way, for cdc_mac_string_index.
   let _ = usb_msd_set_bot(0 as u32);
+  let _ = usb_net_set_kind(0 as u32);
   let pos: i64 = 0;
   let iface_count: i64 = 0;
   let ep_count: i64 = 0;
   let cur_iface_is_bot: i64 = 0;
   let found_bot: i64 = 0;
+  let cur_iface_is_cdc_control: i64 = 0;
+  let cur_iface_num: i64 = 0 - 1;
+  let cur_iface_is_cdc_data_active: i64 = 0;
+  let cdc_data_iface_target: i64 = 0 - 1;
+  let cdc_mac_string_index: u32 = 0 as u32;
+  let found_cdc_control: i64 = 0;
+  let found_net_bulk_eps: i64 = 0;
   let full_want_len_i: i64 = full_want_len as i64;
   while pos < full_want_len_i {
     let dlen: u32 = buf_read_byte(cfgfull, pos as u32);
@@ -8453,14 +9109,36 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
         if dtype == (4 as u32) {
           iface_count = iface_count + 1;
           cur_iface_is_bot = 0;
+          cur_iface_is_cdc_control = 0;
+          cur_iface_is_cdc_data_active = 0;
           if (pos + 7) < full_want_len_i {
+            let inum: u32 = buf_read_byte(cfgfull, (pos + 2) as u32);
+            let ialt: u32 = buf_read_byte(cfgfull, (pos + 3) as u32);
             let iclass: u32 = buf_read_byte(cfgfull, (pos + 5) as u32);
             let isubclass: u32 = buf_read_byte(cfgfull, (pos + 6) as u32);
             let iproto: u32 = buf_read_byte(cfgfull, (pos + 7) as u32);
+            cur_iface_num = inum as i64;
             if (iclass == (0x08 as u32)) && (isubclass == (0x06 as u32)) && (iproto == (0x50 as u32)) {
               cur_iface_is_bot = 1;
               found_bot = 1;
             }
+            if (iclass == (0x02 as u32)) && (isubclass == (0x06 as u32)) {
+              cur_iface_is_cdc_control = 1;
+              found_cdc_control = 1;
+            }
+            if (iclass == (0x0A as u32)) && (cur_iface_num == cdc_data_iface_target) && ((ialt as i64) == 1) {
+              cur_iface_is_cdc_data_active = 1;
+            }
+          }
+        }
+        if dtype == (0x24 as u32) && (cur_iface_is_cdc_control == 1) && ((pos + 2) < full_want_len_i) {
+          let cs_subtype: u32 = buf_read_byte(cfgfull, (pos + 2) as u32);
+          if (cs_subtype == (0x06 as u32)) && ((pos + 4) < full_want_len_i) {
+            let slave_iface: u32 = buf_read_byte(cfgfull, (pos + 4) as u32);
+            cdc_data_iface_target = slave_iface as i64;
+          }
+          if (cs_subtype == (0x0F as u32)) && ((pos + 3) < full_want_len_i) {
+            cdc_mac_string_index = buf_read_byte(cfgfull, (pos + 3) as u32);
           }
         }
         if dtype == (5 as u32) {
@@ -8480,6 +9158,47 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
               } else {
                 let _ = usb_msd_set_bulk_out_epaddr(ep_addr);
                 let _ = usb_msd_set_bulk_out_mps(ep_mps);
+              }
+            }
+          }
+          if (cur_iface_is_cdc_data_active == 1) && ((pos + 5) < full_want_len_i) {
+            let net_ep_addr: u32 = buf_read_byte(cfgfull, (pos + 2) as u32);
+            let net_ep_attr: u32 = buf_read_byte(cfgfull, (pos + 3) as u32);
+            let net_ep_mps_lo: u32 = buf_read_byte(cfgfull, (pos + 4) as u32);
+            let net_ep_mps_hi: u32 = buf_read_byte(cfgfull, (pos + 5) as u32);
+            let net_ep_mps: u32 = net_ep_mps_lo | (net_ep_mps_hi << (8 as u32));
+            if (net_ep_attr & (0x03 as u32)) == (0x02 as u32) {
+              found_net_bulk_eps = 1;
+              if (net_ep_addr & (0x80 as u32)) != (0 as u32) {
+                let _ = usb_net_set_bulk_in_epaddr(net_ep_addr);
+                let _ = usb_net_set_bulk_in_mps(net_ep_mps);
+              } else {
+                let _ = usb_net_set_bulk_out_epaddr(net_ep_addr);
+                let _ = usb_net_set_bulk_out_mps(net_ep_mps);
+              }
+            }
+          }
+          // Round 56: LAN9512's Ethernet function is entirely vendor-
+          // specific (no standard class to gate on the way CDC-ECM's
+          // own class/subclass check does above) -- is_lan9512 was
+          // already determined by idVendor:idProduct before this
+          // function was even called (see dwc2_enumerate_downstream's
+          // own comment), so ANY bulk endpoint found anywhere in this
+          // device's configuration is captured unconditionally.
+          if (is_lan9512 == (1 as u32)) && ((pos + 5) < full_want_len_i) {
+            let lan_ep_addr: u32 = buf_read_byte(cfgfull, (pos + 2) as u32);
+            let lan_ep_attr: u32 = buf_read_byte(cfgfull, (pos + 3) as u32);
+            let lan_ep_mps_lo: u32 = buf_read_byte(cfgfull, (pos + 4) as u32);
+            let lan_ep_mps_hi: u32 = buf_read_byte(cfgfull, (pos + 5) as u32);
+            let lan_ep_mps: u32 = lan_ep_mps_lo | (lan_ep_mps_hi << (8 as u32));
+            if (lan_ep_attr & (0x03 as u32)) == (0x02 as u32) {
+              found_net_bulk_eps = 1; // reused below as "found something to publish"
+              if (lan_ep_addr & (0x80 as u32)) != (0 as u32) {
+                let _ = usb_net_set_bulk_in_epaddr(lan_ep_addr);
+                let _ = usb_net_set_bulk_in_mps(lan_ep_mps);
+              } else {
+                let _ = usb_net_set_bulk_out_epaddr(lan_ep_addr);
+                let _ = usb_net_set_bulk_out_mps(lan_ep_mps);
               }
             }
           }
@@ -8505,6 +9224,37 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
     let _ = uart_put_hex32(usb_msd_get_bulk_out_mps());
     let _ = uart_puts("\n");
   }
+  if (found_cdc_control == 1) && (found_net_bulk_eps == 1) {
+    let _ = usb_net_set_kind(1 as u32);
+    let _ = usb_net_set_cdc_data_iface_num((cdc_data_iface_target as u32));
+    let _ = usb_net_set_in_toggle(0 as u32);
+    let _ = usb_net_set_out_toggle(0 as u32);
+    let _ = uart_puts("USB: CDC-ECM interface detected, data_iface=");
+    let _ = uart_put_hex32(cdc_data_iface_target as u32);
+    let _ = uart_puts(" bulk_in_ep=");
+    let _ = uart_put_hex32(usb_net_get_bulk_in_epaddr());
+    let _ = uart_puts(" mps=");
+    let _ = uart_put_hex32(usb_net_get_bulk_in_mps());
+    let _ = uart_puts(" bulk_out_ep=");
+    let _ = uart_put_hex32(usb_net_get_bulk_out_epaddr());
+    let _ = uart_puts(" mps=");
+    let _ = uart_put_hex32(usb_net_get_bulk_out_mps());
+    let _ = uart_puts("\n");
+  }
+  if (is_lan9512 == (1 as u32)) && (found_net_bulk_eps == 1) {
+    let _ = usb_net_set_kind(2 as u32);
+    let _ = usb_net_set_in_toggle(0 as u32);
+    let _ = usb_net_set_out_toggle(0 as u32);
+    let _ = uart_puts("USB: LAN9512 Ethernet function detected, bulk_in_ep=");
+    let _ = uart_put_hex32(usb_net_get_bulk_in_epaddr());
+    let _ = uart_puts(" mps=");
+    let _ = uart_put_hex32(usb_net_get_bulk_in_mps());
+    let _ = uart_puts(" bulk_out_ep=");
+    let _ = uart_put_hex32(usb_net_get_bulk_out_epaddr());
+    let _ = uart_puts(" mps=");
+    let _ = uart_put_hex32(usb_net_get_bulk_out_mps());
+    let _ = uart_puts("\n");
+  }
 
   let _ = uart_puts("USB: config bConfigurationValue=");
   let _ = uart_put_hex32(config_value);
@@ -8526,6 +9276,49 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32) -> i64 {
   if set_status != 0 {
     let _ = uart_puts("USB: SET_CONFIGURATION failed\n");
     return 0 - 1;
+  }
+
+  // Round 56: CDC-ECM follow-up, only reachable once SET_CONFIGURATION
+  // itself has already succeeded above. SET_CONFIGURATION alone leaves
+  // every interface on altsetting 0 -- the data interface's bulk
+  // endpoints this driver just captured above are not actually live
+  // until SET_INTERFACE explicitly selects altsetting 1 (see dwc2_
+  // build_set_interface_setup's own comment).
+  if usb_net_get_kind() == (1 as u32) {
+    let _ = dwc2_build_set_interface_setup(cdc_data_iface_target as u32, 1 as u32);
+    let iface_status: i64 = dwc2_control_no_data(devaddr, mps);
+    if iface_status != 0 {
+      let _ = uart_puts("USB: CDC-ECM SET_INTERFACE(data, alt=1) failed\n");
+    }
+    if cdc_mac_string_index != (0 as u32) {
+      let mac_str_buf: mut ref i64 = dhruva_alloc_bytes(32);
+      let _ = dwc2_build_get_string_descriptor_setup(cdc_mac_string_index, 32 as u32);
+      let mac_str_status: i64 = dwc2_control_in(devaddr, mps, 32 as u32, mac_str_buf);
+      if mac_str_status == 0 {
+        let mac_buf: mut ref i64 = dhruva_alloc_bytes(6);
+        let _ = cdc_parse_mac_string(mac_str_buf, mac_buf);
+        let _ = usb_net_set_mac_scratch_ptr(mac_buf);
+        let _ = uart_puts("USB: CDC-ECM MAC=");
+        let mi: i64 = 0;
+        while mi < 6 {
+          let mb: u32 = buf_read_byte(mac_buf, mi as u32);
+          let _ = uart_put_hex_byte(mb);
+          if mi < 5 {
+            let _ = uart_puts(":");
+          }
+          mi = mi + 1;
+        }
+        let _ = uart_puts("\n");
+      } else {
+        let _ = uart_puts("USB: CDC-ECM MAC string fetch failed\n");
+      }
+    }
+  }
+  // Round 56: real LAN9512 follow-up -- see lan9512_reset_and_init's
+  // own comment for exactly what this does and does not do, and why
+  // it can't be live-verified under QEMU.
+  if usb_net_get_kind() == (2 as u32) {
+    let _ = lan9512_reset_and_init(devaddr, mps);
   }
   return 0;
 }
@@ -8639,6 +9432,122 @@ fn dwc2_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> 
   let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
   let _ = usb_msd_set_in_toggle(next_toggle);
   return want_len;
+}
+
+// Round 56: the network driver's own bulk OUT/IN, identical shape to
+// dwc2_bulk_out/dwc2_bulk_in above but referencing usb_net_state.S's
+// endpoint/toggle state instead of usb_msd_state.S's -- a deliberate,
+// small duplication rather than generalizing the mass-storage
+// functions to take endpoint/toggle parameters, so this new, less-
+// proven driver can never regress the already-working BOT code path
+// (see usb_net_state.S's own header comment for the same reasoning
+// applied to the state module). Reuses usb_bulk_data_scratch_get()'s
+// SAME DMA buffer as mass storage -- safe because a single enumerated
+// downstream device is always either mass-storage OR network, never
+// both, so there is no concurrent-use hazard.
+//
+// dwc2_net_bulk_out(..., out_len=0) doubles as a zero-length-packet
+// (ZLP) send: the pktcnt computation below already handles out_len==0
+// as exactly one zero-length packet, which is what CDC-ECM's TX
+// framing needs to explicitly terminate a frame whose length happens
+// to be an exact multiple of the endpoint's max packet size (see
+// netif_send_frame's own CDC-ECM branch for why).
+fn dwc2_net_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i64 {
+  if mps == (0 as u32) {
+    return 0 - 1;
+  }
+  if (out_len < 0) || (out_len > (512 as i64)) {
+    return 0 - 1;
+  }
+  let epaddr: u32 = usb_net_get_bulk_out_epaddr();
+  let epnum: u32 = epaddr & (0x0F as u32);
+  let dma: mut ref i64 = usb_bulk_data_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  let i: i64 = 0;
+  while i < out_len {
+    let b: u32 = buf_read_byte(buf, i as u32);
+    let _ = buf_write_byte(dma, i as u32, b);
+    i = i + 1;
+  }
+  let _ = mem_barrier();
+
+  let toggle: u32 = usb_net_get_out_toggle();
+  let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
+  let pktcnt: u32 = if out_len == 0 { 1 as u32 } else { ((out_len as u32) + mps - (1 as u32)) / mps };
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
+  let result: u32 = dwc2_wait_chan0_done();
+  if (result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  let _ = usb_net_set_out_toggle(next_toggle);
+  return 0;
+}
+
+// One bulk IN transfer (device -> host), <= 512 bytes. Unlike dwc2_
+// bulk_in (which always transfers exactly want_len bytes -- fine for
+// SCSI, which always knows the exact expected length up front),
+// network RX genuinely doesn't know the incoming frame's length ahead
+// of time. Callers pass the endpoint's own max packet size as want_len
+// and rely on the RETURNED length: a SHORT return (< mps) means "this
+// was the last/only packet of the frame" (CDC-ECM's own short-packet-
+// terminates-transfer convention, matching QEMU's usb-net emulation
+// exactly -- see netif_recv_frame's own comment). A transfer that
+// comes back empty (0 actual bytes moved, distinct from a 0-length
+// bulk IN request) signals "nothing waiting" to the caller via a
+// negative return, same as dwc2_bulk_in's own error convention.
+fn dwc2_net_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> i64 {
+  if mps == (0 as u32) {
+    return 0 - 1;
+  }
+  if (want_len < 0) || (want_len > (512 as i64)) {
+    return 0 - 1;
+  }
+  let epaddr: u32 = usb_net_get_bulk_in_epaddr();
+  let epnum: u32 = epaddr & (0x0F as u32);
+  let dma: mut ref i64 = usb_bulk_data_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  let toggle: u32 = usb_net_get_in_toggle();
+  let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
+  let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
+  let result: u32 = dwc2_wait_chan0_done();
+  if (result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  // dwc2_control_in never needed this (every control transfer it
+  // issues asks for an exact, already-known length and trusts
+  // XFERCOMPL alone) -- this is this driver's first genuine short-read
+  // case, confirmed against the real Linux dwc2 driver
+  // (drivers/usb/dwc2/hcd_intr.c, dwc2_hc_get_actual_xfer_length-style
+  // logic): on a clean XFERCOMPL (not a halted/errored transfer, which
+  // is a different, pktcnt-based calculation this driver doesn't need
+  // since it already returns -1 for that case above), HCTSIZ's
+  // xfersize field holds the REMAINING (not transferred) byte count,
+  // counting down from want_len as bytes actually moved over USB --
+  // read it back and subtract to recover the real short-packet length.
+  let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
+  let bytes_left: u32 = hctsiz_after & (0x7FFFF as u32);
+  let actual_len: i64 = want_len - (bytes_left as i64);
+  let i: i64 = 0;
+  while i < actual_len {
+    let b: u32 = buf_read_byte(dma, i as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  let _ = usb_net_set_in_toggle(next_toggle);
+  return actual_len;
 }
 
 // Bulk-Only Transport command/status framing (USB Mass Storage Class
@@ -9212,6 +10121,18 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   }
   let _ = uart_puts(" (PASS)\n");
 
+  // Round 56: SMSC LAN9512/9514's Ethernet function has no standard
+  // USB class to detect it by (unlike CDC-ECM) -- Microchip/SMSC's own
+  // device table (confirmed against Linux's smsc95xx.c `products[]`)
+  // lists both 0xec00 and 0x9904 as valid PIDs for this exact chip
+  // family, depending on EEPROM-strapped mode. Computed here, before
+  // configuration, and threaded through dwc2_fetch_and_set_
+  // configuration so its descriptor walk knows to capture this
+  // device's bulk endpoints unconditionally rather than gating on an
+  // interface class check that a vendor-specific device will never
+  // match.
+  let is_lan9512: u32 = if (d_id_vendor == (0x0424 as u32)) && ((d_id_product == (0xec00 as u32)) || (d_id_product == (0x9904 as u32))) { 1 as u32 } else { 0 as u32 };
+
   // Round 24 (WiFi dongle enumeration prep, 2026-08-28): every device
   // this driver enumerates -- LAN9512's own Ethernet function today,
   // a real WiFi dongle eventually -- needs to actually reach the
@@ -9220,9 +10141,25 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   // story; this is the downstream device's own configuration step,
   // the same one dwc2_probe_device0 does for whatever sits on the
   // root port.
-  let config_status: i64 = dwc2_fetch_and_set_configuration(downstream_addr, dmps0);
+  let config_status: i64 = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 0 as u32, is_lan9512);
   if config_status != 0 {
     return config_status;
+  }
+  // Round 56: index 0 might not be a configuration this driver knows
+  // how to use at all (found live: QEMU's usb-net device's index 0 is
+  // its RNDIS config, which this driver deliberately doesn't drive --
+  // see dwc2_build_get_config_descriptor_setup's own comment). Retry
+  // once with index 1 if nothing recognizable turned up. A device with
+  // only one configuration simply fails this second GET_DESCRIPTOR
+  // (there's no index 1 to return), which dwc2_fetch_and_set_
+  // configuration already reports as a plain failure -- harmless here,
+  // since config_retry_status is only consulted to decide whether to
+  // keep the classification results from THIS attempt, not to abort
+  // enumeration outright (index 0's own SET_CONFIGURATION, from the
+  // call above, already succeeded and left the device in a valid,
+  // if unrecognized, configured state).
+  if (usb_msd_get_bot() == (0 as u32)) && (usb_net_get_kind() == (0 as u32)) {
+    let _ = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 1 as u32, is_lan9512);
   }
   // Round 33: if that configuration step just found a mass-storage
   // (BOT) interface, prove the new bulk-transfer/BOT chain live right
@@ -9354,7 +10291,7 @@ fn dwc2_probe_device0() -> i64 {
   // enumeration work -- but per spec this is still the correct order
   // of operations, and a real hub is under no obligation to be as
   // forgiving as QEMU's model about it.
-  let config_status: i64 = dwc2_fetch_and_set_configuration(new_addr, mps0);
+  let config_status: i64 = dwc2_fetch_and_set_configuration(new_addr, mps0, 0 as u32, 0 as u32);
   if config_status != 0 {
     return 0 - 1;
   }
@@ -12772,7 +13709,7 @@ fn kernel_main() -> i64 {
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
   let _ = uart_digits_scratch_set(dhruva_alloc_bytes(24));
-  let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(64));
+  let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(128));
   let _ = usb_bulk_data_scratch_set(dhruva_alloc_bytes(512));
   let _ = tcp_empty_payload_scratch_set(dhruva_alloc_bytes(1));
   let _ = net_send_scratch_set(dhruva_alloc_bytes(512));

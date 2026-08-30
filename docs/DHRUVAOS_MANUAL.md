@@ -81,10 +81,24 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   the new blocking mutex yet** (contention count, worst-case wait) —
   the primitive itself exists and is live-verified (see above), but
   measuring it is not built yet. See `TODO.md`.
-- **Networking is loopback-only.** The full ARP/IPv4/ICMP/UDP/TCP
-  stack is functionally complete and self-consistent, but has never
-  been driven by real off-box traffic — there is no real NIC/wireless
-  driver of any kind today (also on the `TODO.md` roadmap).
+- **Networking has a real NIC path now (round 56), but with real
+  caveats.** `netif_send_frame`/`netif_recv_frame` dispatch to one of
+  three backends based on what USB device was enumerated: CDC-ECM (a
+  standard USB class QEMU's own `usb-net` device and real USB Ethernet
+  dongles both speak — **live-verified**: real ARP + `ping` round
+  trips to an external host over the actual USB link, a fetched MAC
+  matching an independently-specified value, QEMU packet-capture-
+  confirmed real frames on the wire), a real SMSC LAN9512 backend (the
+  actual chip every Pi 1 Model B's onboard wired port uses —
+  **written to spec, NOT live-verified**: no LAN9512 QEMU device model
+  exists, pending real Pi 1B hardware-in-loop testing), or the
+  original loopback queue (when neither is present). **Found via live
+  testing**: `dhcp_client_poll` (and likely other netif-layer callers)
+  pass a hardcoded `max_len=512` inherited from the loopback-era
+  design — a real external DHCPOFFER with several options routinely
+  exceeds that and gets silently dropped. Not yet fixed (needs
+  auditing every 512-sized buffer across netif/ARP/IPv4/UDP/TCP/DHCP
+  consistently, not a point fix) — see `TODO.md`.
 
 ## 2. Boot process
 

@@ -1097,22 +1097,42 @@ support of any kind.
   instrumentation now that real blocking exists to measure — small,
   not yet scoped into its own round.
 
-- **Wired NIC driver: SMSC LAN9512 over USB** — `[M-L, ~3-4 rounds]`
-  The most tractable of the three driver asks. LAN9512 is the actual
-  USB-to-Ethernet bridge chip Pi 1-family boards use for their wired
-  port (already comment-referenced in `kernel_main.vani`'s own netif
-  header as the anticipated real backend); SMSC's datasheet is public
-  and Linux's `smsc95xx` driver is open source and usable as a
-  protocol reference. Reuses this project's own EXISTING DWC2
-  enumeration/control-transfer/bulk-transfer infrastructure directly
-  (same shape as the USB mass storage driver, rounds 33-36) — no new
-  USB-layer work needed, "just" LAN9512's own vendor register
-  protocol (bulk-wrapped raw Ethernet frames, a small vendor command
-  set for PHY/MAC setup) sitting where the existing loopback netif
-  queue currently sits. This is what finally lets `netif`/ARP/IPv4/
-  TCP/UDP/ICMP talk to a REAL second host instead of only ever
-  self-pinging over loopback — the single biggest real capability
-  unlock in this whole list, and lower-risk than either wireless item.
+- **Wired NIC driver: CDC-ECM (DONE, round 56) + real SMSC LAN9512
+  (spec-only, hardware-pending)** — `[M-L, ~3-4 rounds, mostly DONE]`
+  QEMU's `raspi1ap` has no LAN9512 device model, so the real chip's
+  own vendor register protocol can't be live-verified under QEMU the
+  way every other round in this project has been. Split into two
+  layers to get both a real, live-verified data path NOW and the real
+  target chip's own protocol written to spec: a shared USB-bulk
+  transport (`dwc2_net_bulk_out/in`, `usb_net_state.S`), a CDC-ECM
+  backend (standard USB class QEMU's own `usb-net` device and real USB
+  Ethernet dongles both speak — LIVE-VERIFIED: real MAC fetched via
+  SET_INTERFACE + GET_DESCRIPTOR(String) exactly matches an
+  independently-specified QEMU `-device usb-net,mac=...` value; a real
+  `ping <slirp-gateway>`/`ping <other-slirp-host>` round trip over the
+  actual USB link, both replying correctly; QEMU packet capture
+  independently confirms real DHCPDISCOVER/OFFER frames crossing the
+  wire), and a real LAN9512 backend (VID 0x0424, PID 0xec00/0x9904;
+  vendor register read/write via USB requests 0xA1/0xA0; TX_CMD_A/B
+  and RX status word framing; written against the public datasheet +
+  Linux's `smsc95xx.c`/`.h` reference driver — **NOT live-verified**,
+  pending real Pi 1B hardware-in-loop testing).
+  **Found via live testing, not fixed in this round** (real,
+  pre-existing, in scope for a future round): `dhcp_client_poll` (and
+  likely other netif-layer callers) pass a hardcoded `max_len=512` to
+  `netif_recv_frame` — a loopback-era assumption from when this
+  project only ever talked to itself over a 512-byte queue slot. A
+  REAL DHCPOFFER from an external server (590 bytes, options included)
+  exceeds it and gets silently dropped (`netif_recv_frame`'s own
+  documented "frame bigger than caller's buffer" contract, working
+  exactly as designed — the CALLER's assumption is what's now wrong,
+  not this function). The CDC-ECM driver itself is unaffected and
+  proven correct independently (`ping`'s own frames are small enough
+  to stay under this cap) — this is a separate, pre-existing
+  networking-stack constant that only a genuine external NIC could
+  ever have exposed. Raising it needs auditing every 512-sized
+  buffer/cap across netif/ARP/IPv4/UDP/TCP/DHCP consistently, not a
+  point fix — deliberately scoped OUT of this round.
 
 - **BLE via USB dongle (Pi 1)** — `[L, several rounds — the HCI
   transport itself is tractable; a full usable BLE stack on top is
