@@ -51,25 +51,53 @@
  * suspended by the timer or by voluntarily sleeping.
  */
 
+/* MAX_TASKS = 16 (round 54's general task-creation API): indices
+ * 0-5 are the original fixed set (HIGH/MEDIUM/LOW/IDLE/GC/SHELL,
+ * unchanged); 6-15 are free slots task_create can hand out at
+ * runtime. eff_prio_table's own "255" sentinel marks a slot as
+ * genuinely unused (never created, or -- there is no task-deletion
+ * API yet -- see docs/TODO.md) rather than needing a separate
+ * task_count variable: 255 is outside every real priority value this
+ * scheduler has ever used (0-4 today), so an unused slot can never
+ * win scheduler_pick_next's own "lowest eff_prio wins" comparison
+ * against any real task, including idle (priority 4) -- verified by
+ * tracing the comparison logic, not assumed. scheduler_ready_count
+ * DOES need an explicit check against this sentinel (see its own
+ * comment below) since it doesn't otherwise consult eff_prio_table at
+ * all. start_multitasking seeds indices 6-15 to 255 explicitly --
+ * .bss's own zero-init would otherwise leave them at 0, which looks
+ * like a real, ready, HIGHEST-priority task and would crash the
+ * instant the scheduler ever tried to switch to that slot's
+ * uninitialized stack pointer before any real task_create() call. */
 .section ".bss"
 .align 4
 sp_table:
-    .word 0, 0, 0, 0, 0, 0  /* saved/current sp per task; index 3 =
-                          * idle, index 4 = GC/compaction (Phase 3
-                          * task #5), index 5 = shell (Phase 4) */
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  /* saved/
+                          * current sp per task; index 3 = idle, index
+                          * 4 = GC/compaction (Phase 3 task #5), index
+                          * 5 = shell (Phase 4), 6-15 = task_create's
+                          * own free slots */
 eff_prio_table:
-    .word 0, 0, 0, 0, 0, 0  /* effective (possibly ceiling-boosted)
-                          * priority; initialized to each task's true
-                          * priority by start_multitasking, since .bss
-                          * is merely zeroed at boot, not set to
-                          * {0,1,2,3,4,3} */
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  /* effective
+                          * (possibly ceiling-boosted) priority;
+                          * initialized to each fixed task's true
+                          * priority by start_multitasking (.bss is
+                          * merely zeroed at boot, not set to
+                          * {0,1,2,3,4,3,...}), and to the 255 "unused"
+                          * sentinel for indices 6-15 until task_create
+                          * populates one */
 sleep_until_table:
-    .word 0, 0, 0, 0, 0, 0  /* tick_count value at which a task becomes
-                          * ready again; 0 (the zeroed .bss default)
-                          * means "never slept, always ready" since
-                          * 0 <= any tick_count trivially holds -- true
-                          * of idle (index 3) forever, since it never
-                          * calls task_sleep_ticks */
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  /* tick_count
+                          * value at which a task becomes ready again;
+                          * 0 (the zeroed .bss default) means "never
+                          * slept, always ready" since 0 <= any
+                          * tick_count trivially holds -- true of idle
+                          * (index 3) forever, since it never calls
+                          * task_sleep_ticks, and harmless for an
+                          * unused slot 6-15 too (eff_prio's own 255
+                          * sentinel is what actually keeps
+                          * scheduler_pick_next from ever picking it,
+                          * regardless of this table's own value there) */
 tick_count:
     .word 0
 current_task:
@@ -137,7 +165,16 @@ scheduler_pick_next:
 
     mov r9, #0
 spn_loop:
-    cmp r9, #6                     /* 6 tasks now: HIGH, MEDIUM, LOW, IDLE, GC, SHELL */
+    cmp r9, #16                    /* MAX_TASKS (round 54) -- indices
+                                    * 6-15 are task_create's own free
+                                    * slots, eff_prio=255 until
+                                    * populated, which this loop's own
+                                    * existing `cmp r6,r7 / movlt`
+                                    * comparison already handles
+                                    * correctly with no other change
+                                    * needed (255 can never beat idle's
+                                    * real priority 4, verified by
+                                    * tracing this exact comparison) */
     bge spn_done
     cmp r9, r3
     beq spn_next                   /* current already accounted for above --
@@ -485,26 +522,37 @@ scheduler_set_tick_count_test_only:
     bx lr
 
 /* i64 scheduler_ready_count() -- Phase 5's run-queue-depth signal for
- * the governor: how many of the 6 tasks have sleep_until_table[i] <=
- * the current tick_count (i.e. are actually ready right now), not
+ * the governor: how many tasks have sleep_until_table[i] <= the
+ * current tick_count (i.e. are actually ready right now), not
  * counting idle (task_d, index 3, always ready by design -- see
  * scheduler_pick_next's own comment on why idle must always qualify;
  * counting it would make "ready_count" read as "at least 1" forever,
  * useless as a load signal). Pure read-only introspection, safe to
  * call from any context including an ISR: no state changes, no
- * scheduling decision made here. */
+ * scheduling decision made here.
+ *
+ * Round 54: widened to scan all MAX_TASKS=16 slots, and -- UNLIKE
+ * scheduler_pick_next, which never needed a fix for this -- this
+ * function must explicitly skip an unused slot (eff_prio_table[i] ==
+ * 255) too: it only ever looks at sleep_until_table, which an unused
+ * slot's own .bss zero-init leaves at 0 (== "always ready"), and
+ * would otherwise inflate the count with every never-created slot. */
 .global scheduler_ready_count
 scheduler_ready_count:
     ldr r1, =tick_count
     ldr r1, [r1]                   /* r1 = tick_count */
     ldr r2, =sleep_until_table
+    ldr r6, =eff_prio_table
     mov r3, #0                     /* r3 = count */
     mov r9, #0                     /* r9 = task index */
 srq_loop:
-    cmp r9, #6
+    cmp r9, #16                    /* MAX_TASKS */
     bge srq_done
     cmp r9, #3                     /* skip idle (index 3) -- see comment above */
     beq srq_next
+    ldr r5, [r6, r9, lsl #2]       /* eff_prio[i] */
+    cmp r5, #255
+    beq srq_next                   /* unused slot -- skip */
     ldr r4, [r2, r9, lsl #2]       /* sleep_until[i] */
     cmp r4, r1
     addle r3, r3, #1               /* ready if sleep_until[i] <= tick_count */
@@ -581,6 +629,143 @@ prepare_stack_common:
     str r1, [r0, #60]      /* lr = entry point */
     bx lr
 
+/* Round 54 -- general task-creation API. Verified BEFORE writing this
+ * that vani genuinely supports function pointers as real, first-class
+ * values through both backends (a throwaway spike compiled a `fn() ->
+ * i64` parameter all the way through vanic's LLVM path to a real ARM
+ * `blx r0` indirect call, not just the C backend) -- so unlike the
+ * existing task_a-f_init_stack functions above (each hardcoding its
+ * own entry point via `ldr r1, =task_X`), this takes the entry point
+ * as a genuine runtime argument and works for ANY vani function, not
+ * just the 6 built in at compile time.
+ *
+ * mut ref i64 task_generic_init_stack(fn() -> i64 entry_fn,
+ *                                       mut ref i64 stack_base,
+ *                                       u32 stack_bytes)
+ * entry_fn (a function pointer -- one register, no AAPCS i64-pairing
+ * concern) -> r0; stack_base -> r1; stack_bytes (u32, deliberately not
+ * i64, for the exact same reason -- see dharafs_buf.S's own file
+ * comment on why every parameter there is u32) -> r2. Rearranges into
+ * prepare_stack_common's own expected r0=stack_top/r1=entry_addr
+ * shape and tail-calls it. */
+.global task_generic_init_stack
+task_generic_init_stack:
+    add r1, r1, r2          /* r1 = stack_base + stack_bytes = stack top */
+    mov r3, r0               /* stash entry_fn (r0 is about to be
+                               * reused for prepare_stack_common's own
+                               * r0=stack_top convention) */
+    mov r0, r1               /* r0 = stack top */
+    mov r1, r3               /* r1 = entry point */
+    b prepare_stack_common
+
+/* void task_table_init()
+ * Seeds the 10 free slots (indices 6-15, task_create's own) of
+ * eff_prio_table with the "unused" sentinel (255) -- .bss's own
+ * zero-init would otherwise leave them at 0, which looks like a
+ * real, ready, HIGHEST-priority task and would crash the instant
+ * the scheduler ever tried to switch to that slot's uninitialized
+ * stack pointer before any real task_create() call.
+ *
+ * MUST be called exactly once, before the FIRST task_create() call
+ * and before start_multitasking (kernel_main.vani's boot sequence
+ * does both). This used to be inlined directly into
+ * start_multitasking, which is too late: kernel_main.vani calls
+ * task_create() during its own boot-time setup, before
+ * start_multitasking ever runs -- task_create's scan for the 255
+ * sentinel found nothing (slots still read .bss's zeroed 0) and
+ * always returned "no free slot" (0xFFFFFFFF), even though no slot
+ * was actually taken. A second version of this fix that instead
+ * left the seeding inside start_multitasking AND called it again
+ * here would have been worse: it would silently overwrite any task
+ * already created by a pre-start_multitasking task_create() call,
+ * wiping out a live task's table entry. Splitting this into its own
+ * one-shot function, called exactly once from kernel_main.vani
+ * before anything else touches eff_prio_table, avoids both bugs. */
+.global task_table_init
+task_table_init:
+    ldr r0, =eff_prio_table
+    mov r1, #255
+    mov r2, #6
+ttinit_loop:
+    cmp r2, #16
+    bge ttinit_done
+    str r1, [r0, r2, lsl #2]
+    add r2, r2, #1
+    b ttinit_loop
+ttinit_done:
+    bx lr
+
+/* u32 task_create(fn() -> i64 entry_fn, mut ref i64 stack_base,
+ *                  u32 stack_bytes, u32 priority)
+ * Finds a free slot (indices 6-15 -- 0-5 stay reserved for the fixed
+ * HIGH/MEDIUM/LOW/IDLE/GC/SHELL set), builds the new task's initial
+ * context via task_generic_init_stack above, and publishes it into
+ * the scheduler's own tables. Returns the new task's index, or
+ * 0xFFFFFFFF (u32 -1) if every slot is already taken.
+ *
+ * All four parameters are single registers (fn pointer, ref, and two
+ * u32s -- deliberately not i64, same AAPCS-pairing-avoidance reasoning
+ * as task_generic_init_stack above), so this is a completely ordinary
+ * r0-r3 call with no stack-spilled arguments to get wrong.
+ *
+ * Safe to call after start_multitasking (i.e. from a running task,
+ * not just at boot): the whole scan-and-publish sequence runs with
+ * IRQs masked, so a concurrent scheduler_pick_next (from a timer tick
+ * on any other core -- moot on this single-core target, but same
+ * discipline as every other shared-table mutation in this file) can
+ * never observe a half-published slot. */
+.global task_create
+task_create:
+    stmdb sp!, {r4-r9, lr}
+    mov r4, r0              /* entry_fn */
+    mov r5, r1              /* stack_base */
+    mov r6, r2              /* stack_bytes */
+    mov r7, r3              /* priority */
+
+    mrs r8, cpsr
+    cpsid i
+
+    ldr r0, =eff_prio_table
+    mov r9, #6               /* first free-slot candidate */
+tc_scan_loop:
+    cmp r9, #16              /* MAX_TASKS */
+    bge tc_no_slot
+    ldr r1, [r0, r9, lsl #2]
+    cmp r1, #255
+    beq tc_found_slot
+    add r9, r9, #1
+    b tc_scan_loop
+tc_no_slot:
+    msr cpsr_c, r8
+    mvn r0, #0                /* u32 -1 == 0xFFFFFFFF: no free slot */
+    ldmia sp!, {r4-r9, lr}
+    bx lr
+tc_found_slot:
+    mov r0, r4                /* entry_fn */
+    mov r1, r5                /* stack_base */
+    mov r2, r6                /* stack_bytes */
+    bl task_generic_init_stack
+    /* r0 = new task's initial sp; r9 is callee-saved across `bl` per
+     * AAPCS, so it still holds the free slot index found above */
+
+    ldr r1, =sp_table
+    str r0, [r1, r9, lsl #2]
+    ldr r1, =eff_prio_table
+    str r7, [r1, r9, lsl #2]
+    ldr r1, =sleep_until_table
+    mov r2, #0
+    str r2, [r1, r9, lsl #2]   /* explicitly ready immediately -- .bss
+                                * zero-init already gives this for a
+                                * never-before-used slot, but set it
+                                * explicitly rather than rely on that,
+                                * since there's no task-deletion API to
+                                * reason about reuse safety for yet */
+
+    msr cpsr_c, r8
+    mov r0, r9                 /* return the new task's slot index */
+    ldmia sp!, {r4-r9, lr}
+    bx lr
+
 /* i64 start_multitasking(mut ref i64 sp_a, mut ref i64 sp_b,
  *                          mut ref i64 sp_c, mut ref i64 sp_d,
  *                          mut ref i64 sp_e, mut ref i64 sp_f)
@@ -633,6 +818,14 @@ start_multitasking:
     mov r7, #4
     str r7, [r6, #12]        /* task 3 (IDLE) priority 4 -- worst,
                                * as always */
+
+    // Round 54: indices 6-15 (task_create's free slots) are NOT
+    // touched here -- task_table_init() (see its own comment above)
+    // already seeded them to the 255 "unused" sentinel, and must run
+    // before this function so that any task_create() call made
+    // during kernel_main.vani's own boot sequence (before
+    // start_multitasking) sees real free slots. Re-seeding here would
+    // clobber whatever task_create already published into a slot.
 
     ldr r6, =current_task
     mov r7, #0

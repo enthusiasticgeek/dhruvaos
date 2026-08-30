@@ -41,16 +41,19 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
 
 **Known, current limitations (not design goals — see `TODO.md`):**
 
-- **The task set is fixed at exactly 6 compile-time slots**: HIGH,
-  MEDIUM, LOW (a priority-ceiling demonstration), IDLE, GC
-  (`task_e`, DharaFS compaction), and SHELL (`task_f`, the
-  interactive console). There is **no runtime or build-time API for a
-  third party to add a task today** — doing so means directly editing
-  `kernel_main.vani` (a new `fn task_g()`), `boot/context_switch.S`
-  (widening `sp_table`/`eff_prio_table`/`sleep_until_table`, currently
-  hardcoded 6-word arrays), and the `start_multitasking` call site's
-  fixed 6-argument signature. A general `task_create()` API is on the
-  roadmap (`TODO.md`) but does not exist yet.
+- **6 fixed compile-time tasks, plus up to 10 dynamically-created
+  ones (MAX_TASKS=16).** The original 6 slots (HIGH, MEDIUM, LOW — a
+  priority-ceiling demonstration — IDLE, GC/`task_e`, and
+  SHELL/`task_f`) still exist unchanged at indices 0-5. Indices 6-15
+  are free slots handed out by `task_create(entry_fn, stack_base,
+  stack_bytes, priority) -> u32` (`boot/context_switch.S`), which
+  returns the new task's slot index, or `0xFFFFFFFF` if all 10 are
+  already taken. There is still no task-*deletion* API, so a slot is
+  never reclaimed once handed out. `task_table_init()` must run once,
+  before the first `task_create()` call and before
+  `start_multitasking` — `kernel_main.vani`'s boot sequence already
+  does this; a function passed to `task_create` as a value needs
+  `#[no_mangle]` (see §5).
 - **The timer tick is 500ms** — fine for this project's own demo and
   self-tests, far too coarse for most real control loops (a typical
   RTOS runs 1ms or tickless).
@@ -163,8 +166,8 @@ Type anything unrecognized to see the full command list echoed back.
 
 ## 5. Extending the kernel today
 
-Since there is no dynamic task-creation API yet (§1), extending
-DhruvaOS today means editing `kernel/kernel_main.vani` directly:
+Editing `kernel/kernel_main.vani` directly is still how you add most
+things:
 
 - **A new shell command**: add a new `if shell_word_matches(line_buf,
   0, cmd_end, "yourcommand") == 1 { ... return 0; }` block inside
@@ -175,9 +178,22 @@ DhruvaOS today means editing `kernel/kernel_main.vani` directly:
   function and call it from the boot sequence alongside the existing
   ~45. Report PASS/FAIL via `uart_puts`, matching the existing
   convention.
-- **A new task**: not currently possible without hand-editing the
-  fixed 6-slot scheduler tables in `boot/context_switch.S` — see
-  `TODO.md`'s "general task-creation API" item for the planned fix.
+- **A new task** (round 54): call `task_create(entry_fn, stack_base,
+  stack_bytes, priority) -> u32` — see §1. The entry function must be
+  declared `#[no_mangle]` (passing a function as a *value*, as opposed
+  to calling it directly, requires the compiler to resolve the exact
+  same symbol name at both the definition and the reference; a plain
+  vāṇी fn is mangled to `fn_<name>` at its definition, and — before a
+  real vani-compiler bug found and fixed alongside this feature — the
+  function-pointer-*value* reference kept the mangled name while
+  looking up a call kept the bare name, an LLVM/C-backend symbol
+  mismatch that failed to link. `#[no_mangle]` sidesteps this by
+  giving the function one stable bare name used consistently
+  everywhere). Give it its own `#[bounded_stack(bytes=N)]` bound like
+  any other task. Allocate its stack with a one-time
+  `dhruva_alloc_bytes` call, matching every fixed task's own stack
+  allocation. See `task_custom_demo` in `kernel_main.vani` for a
+  complete worked example.
 
 ## 6. Building and running
 

@@ -164,6 +164,17 @@ extern "C" fn task_d_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mu
 extern "C" fn task_e_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_f_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut ref i64, sp_d: mut ref i64, sp_e: mut ref i64, sp_f: mut ref i64) -> i64;
+// Round 54: general task-creation API -- generalizes the fixed 6-task
+// scheduler (boot/context_switch.S) to a real, callable API. Takes any
+// vani fn() -> i64 as a genuine runtime value (verified vani supports
+// this end to end through both backends before writing the assembly
+// side). Returns the new task's slot index, or 0xFFFFFFFF (u32 -1) if
+// all 10 free slots (indices 6-15) are already taken -- there is no
+// task-deletion API yet, so slots are never reclaimed.
+extern "C" fn task_create(entry_fn: fn() -> i64, stack_base: mut ref i64, stack_bytes: u32, priority: u32) -> u32;
+// Must be called exactly once, before the first task_create() call and
+// before start_multitasking -- see its own comment in context_switch.S.
+extern "C" fn task_table_init() -> i64;
 // task_a=HIGH(priority 0), task_b=MEDIUM(priority 1), task_c=LOW(priority 2),
 // task_d=IDLE(priority 3, always ready, never sleeps) -- the standard
 // RTOS answer to "what runs when nothing else is," and load-bearing
@@ -11641,6 +11652,23 @@ fn task_f() -> i64 {
   return 0;
 }
 
+// Round 54's own live demonstration of task_create: a genuinely
+// dynamically-created task, not one of the 6 built in at compile time
+// -- proves entry_fn (a real vani function passed as a value) actually
+// runs correctly when the scheduler switches to a slot task_create
+// populated at runtime, not just that the API compiles. Priority 3,
+// the same best-effort band GC/SHELL already share -- an ordinary new
+// task has no reason to outrank the existing hard-RT demo.
+#[no_mangle]
+#[bounded_stack(bytes=512)]
+fn task_custom_demo() -> i64 {
+  while true {
+    let _ = task_sleep_ticks(7);
+    let _ = uart_puts("CUSTOM: dynamically-created task running\n");
+  }
+  return 0;
+}
+
 // Round 41: SHA-256 (FIPS 180-4), the crypto-primitives-foundation
 // security-roadmap item's hash function half (see docs/TODO.md).
 // Chosen over any table-driven cipher for the same reason ChaCha20 (a
@@ -12975,6 +13003,27 @@ fn kernel_main() -> i64 {
   let sp_d: mut ref i64 = task_d_init_stack(stack_d, stack_bytes);
   let sp_e: mut ref i64 = task_e_init_stack(stack_e, stack_e_bytes);
   let sp_f: mut ref i64 = task_f_init_stack(stack_f, stack_f_bytes);
+
+  // Round 54: live demonstration of the new task_create API -- a
+  // genuinely dynamically-created 7th task, not one of the 6 built in
+  // at compile time. dhruva_alloc_bytes here is a one-time boot
+  // allocation (matches every other task's own stack allocation
+  // above), not a per-call pattern.
+  //
+  // task_table_init() MUST run before this first task_create() call
+  // (and before start_multitasking) -- it seeds eff_prio_table's
+  // free-slot sentinel (255) for indices 6-15, which .bss's own
+  // zero-init does not do. Calling task_create() before this ran
+  // found every slot reading 0 (not 255), so it always returned "no
+  // free slot" -- see task_table_init's own comment in
+  // context_switch.S for the full story.
+  let _ = task_table_init();
+  let custom_stack_bytes: u32 = 512 as u32;
+  let custom_stack: mut ref i64 = dhruva_alloc_bytes(custom_stack_bytes as i64);
+  let custom_task_id: u32 = task_create(task_custom_demo, custom_stack, custom_stack_bytes, 3 as u32);
+  let _ = uart_puts("task_create: new task id=");
+  let _ = uart_put_i64(custom_task_id as i64);
+  let _ = uart_puts("\n");
 
   let _ = uart_puts("PASS\n");
 
