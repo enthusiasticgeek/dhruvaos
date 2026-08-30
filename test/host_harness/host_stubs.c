@@ -142,6 +142,7 @@ SCRATCH_PTR(dharafs_verified_companion_scratch)
 SCRATCH_PTR(dharafs_verified_digest_a_scratch)
 SCRATCH_PTR(dharafs_verified_digest_b_scratch)
 SCRATCH_PTR(dharafs_appendonly_check_scratch)
+SCRATCH_PTR(dharafs_rename_new_path_scratch)
 
 /* ---- 1d. dharafs_state_* / dharafs_user_* -- real state, matching
  * boot/dharafs_state.S's semantics closely enough for host testing

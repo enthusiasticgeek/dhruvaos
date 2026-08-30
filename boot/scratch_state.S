@@ -331,6 +331,25 @@ dharafs_appendonly_check_scratch_addr:
                          * which the caller's NEW data already occupies
                          * -- aliasing the two would corrupt the very
                          * buffer being compared against. */
+dharafs_rename_new_path_scratch_addr:
+    .word 0             /* BUG FIX (found during a post-round-51 sweep
+                         * for the exact "dhruva_alloc_bytes on every
+                         * call" bug class this whole file exists to
+                         * prevent -- round 49's own audit already
+                         * caught one instance of this in round 48's
+                         * code; this is a second one, in round 47's):
+                         * dharafs_rename (Str wrapper) and the shell
+                         * `mv` command both allocated a fresh 32-byte
+                         * buffer via dhruva_alloc_bytes for the NEW
+                         * path on every single call -- `mv` is an
+                         * ordinary, repeatable shell command, so every
+                         * real rename permanently leaked 32 bytes.
+                         * dharafs_path_scratch (the one shared path
+                         * buffer) is already claimed by the OLD path
+                         * in both call sites, so this needs its own
+                         * slot, same reasoning as dharafs_dir_scratch's
+                         * own comment on why it can't just reuse
+                         * dharafs_path_scratch either. */
 
 .section ".text"
 
@@ -748,6 +767,20 @@ dharafs_appendonly_check_scratch_set:
 .global dharafs_appendonly_check_scratch_get
 dharafs_appendonly_check_scratch_get:
     ldr r0, =dharafs_appendonly_check_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_rename_new_path_scratch_set
+dharafs_rename_new_path_scratch_set:
+    ldr r1, =dharafs_rename_new_path_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_rename_new_path_scratch_get
+dharafs_rename_new_path_scratch_get:
+    ldr r0, =dharafs_rename_new_path_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
