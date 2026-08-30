@@ -99,6 +99,24 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   exceeds that and gets silently dropped. Not yet fixed (needs
   auditing every 512-sized buffer across netif/ARP/IPv4/UDP/TCP/DHCP
   consistently, not a point fix) — see `TODO.md`.
+- **A USB Bluetooth HCI transport exists (round 57), entirely
+  written to spec, NOT live-verified.** USB Bluetooth HCI is an
+  official, standardized USB class (0xE0/0x01/0x01), detected the same
+  way mass storage's own class check works. HCI commands go over the
+  control endpoint (`dwc2_hci_send_command`), events arrive via a
+  dedicated interrupt endpoint (`dwc2_hci_interrupt_in` — this
+  driver's first use of the interrupt transfer type), and ACL data
+  uses bulk endpoints, same primitives as the NIC driver. On
+  enumeration, `hci_reset_and_scan` sends HCI_Reset, then
+  LE_Set_Scan_Parameters, then LE_Set_Scan_Enable. Unlike CDC-ECM,
+  there is no QEMU stand-in at all: `usb-bt-dongle` (which implemented
+  exactly this transport) was deprecated in 2018 and removed from
+  modern QEMU, so nothing in this transport has ever received a real
+  HCI event. The packet building/parsing math is pure and has real
+  host-harness test coverage; the transport itself is pending real Pi
+  1B hardware-in-loop testing. GATT/ATT/L2CAP (the layers an
+  application actually uses to read/write BLE characteristics) don't
+  exist yet — see `TODO.md`.
 
 ## 2. Boot process
 

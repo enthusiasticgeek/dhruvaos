@@ -90,6 +90,16 @@ int64_t fn_bignum_set_limbs4(int64_t *buf, uint32_t l0, uint32_t l1, uint32_t l2
 int64_t fn_lan9512_build_tx_header(int64_t *out_buf, uint32_t frame_len);
 uint32_t fn_lan9512_rx_status_has_error(uint32_t rx_status);
 uint32_t fn_lan9512_rx_status_frame_len(uint32_t rx_status);
+uint32_t fn_hci_build_opcode(uint32_t ogf, uint32_t ocf);
+int64_t fn_hci_build_command(int64_t *out_buf, uint32_t opcode, int64_t *params_buf, uint32_t params_len);
+int64_t fn_hci_build_reset_command(int64_t *out_buf);
+int64_t fn_hci_build_le_set_scan_parameters_command(int64_t *out_buf, uint32_t scan_type, uint32_t scan_interval, uint32_t scan_window, uint32_t own_addr_type, uint32_t filter_policy);
+int64_t fn_hci_build_le_set_scan_enable_command(int64_t *out_buf, uint32_t scan_enable, uint32_t filter_duplicates);
+uint32_t fn_hci_event_code(int64_t *event_buf);
+uint32_t fn_hci_event_param_len(int64_t *event_buf);
+uint32_t fn_hci_event_is_command_complete(int64_t *event_buf);
+uint32_t fn_hci_cmd_complete_opcode(int64_t *event_buf);
+uint32_t fn_hci_cmd_complete_status(int64_t *event_buf);
 
 /* ---- host_stubs.c helpers ---- */
 int64_t *dhruva_alloc_bytes(int64_t n);
@@ -1023,6 +1033,89 @@ static void test_lan9512_framing(void) {
     CHECK(fn_lan9512_rx_status_frame_len(0x00000000u) == 0u, "lan9512 rx status: zero length");
 }
 
+/* Round 57: HCI command/event packet building/parsing, checked against
+ * hand-computed byte layouts from the Bluetooth Core Specification's
+ * own field definitions -- the part of the USB Bluetooth HCI backend
+ * that doesn't need actual hardware to verify (see hci_reset_and_
+ * scan's own comment in kernel_main.vani for why the transport itself
+ * can't be covered here or under QEMU). */
+static void test_hci_framing(void) {
+    /* Opcode = (OGF << 10) | OCF. */
+    CHECK(fn_hci_build_opcode(0x03, 0x0003) == 0x0C03, "hci opcode: HCI_Reset (OGF=0x03,OCF=0x0003) == 0x0C03");
+    CHECK(fn_hci_build_opcode(0x08, 0x000B) == 0x200B, "hci opcode: LE_Set_Scan_Parameters (OGF=0x08,OCF=0x000B) == 0x200B");
+    CHECK(fn_hci_build_opcode(0x08, 0x000C) == 0x200C, "hci opcode: LE_Set_Scan_Enable (OGF=0x08,OCF=0x000C) == 0x200C");
+
+    /* Generic command builder: opcode LE, param length, params verbatim. */
+    int64_t *params = dhruva_alloc_bytes(3);
+    buf_write_byte(params, 0, 0xAA);
+    buf_write_byte(params, 1, 0xBB);
+    buf_write_byte(params, 2, 0xCC);
+    int64_t *cmd = dhruva_alloc_bytes(6);
+    int64_t cmd_len = fn_hci_build_command(cmd, 0x1234, params, 3);
+    CHECK(cmd_len == 6, "hci build_command: total length == 3 (header) + 3 (params)");
+    CHECK(buf_read_byte(cmd, 0) == 0x34, "hci build_command: opcode LE byte0");
+    CHECK(buf_read_byte(cmd, 1) == 0x12, "hci build_command: opcode LE byte1");
+    CHECK(buf_read_byte(cmd, 2) == 0x03, "hci build_command: param length byte");
+    CHECK(buf_read_byte(cmd, 3) == 0xAA, "hci build_command: param 0 verbatim");
+    CHECK(buf_read_byte(cmd, 4) == 0xBB, "hci build_command: param 1 verbatim");
+    CHECK(buf_read_byte(cmd, 5) == 0xCC, "hci build_command: param 2 verbatim");
+
+    /* HCI_Reset: opcode 0x0C03, no params. */
+    int64_t *reset_cmd = dhruva_alloc_bytes(3);
+    int64_t reset_len = fn_hci_build_reset_command(reset_cmd);
+    CHECK(reset_len == 3, "hci reset: total length == 3 (no params)");
+    CHECK(buf_read_byte(reset_cmd, 0) == 0x03, "hci reset: opcode LE byte0");
+    CHECK(buf_read_byte(reset_cmd, 1) == 0x0C, "hci reset: opcode LE byte1");
+    CHECK(buf_read_byte(reset_cmd, 2) == 0x00, "hci reset: param length == 0");
+
+    /* LE_Set_Scan_Parameters: opcode 0x200B, 7 params. */
+    int64_t *scan_params_cmd = dhruva_alloc_bytes(10);
+    int64_t scan_params_len = fn_hci_build_le_set_scan_parameters_command(scan_params_cmd, 0x00, 0x0010, 0x0010, 0x00, 0x00);
+    CHECK(scan_params_len == 10, "hci scan params: total length == 3 (header) + 7 (params)");
+    CHECK(buf_read_byte(scan_params_cmd, 0) == 0x0B, "hci scan params: opcode LE byte0");
+    CHECK(buf_read_byte(scan_params_cmd, 1) == 0x20, "hci scan params: opcode LE byte1");
+    CHECK(buf_read_byte(scan_params_cmd, 2) == 0x07, "hci scan params: param length == 7");
+    CHECK(buf_read_byte(scan_params_cmd, 3) == 0x00, "hci scan params: scan_type");
+    CHECK(buf_read_byte(scan_params_cmd, 4) == 0x10, "hci scan params: interval LE byte0");
+    CHECK(buf_read_byte(scan_params_cmd, 5) == 0x00, "hci scan params: interval LE byte1");
+    CHECK(buf_read_byte(scan_params_cmd, 6) == 0x10, "hci scan params: window LE byte0");
+    CHECK(buf_read_byte(scan_params_cmd, 7) == 0x00, "hci scan params: window LE byte1");
+    CHECK(buf_read_byte(scan_params_cmd, 8) == 0x00, "hci scan params: own_addr_type");
+    CHECK(buf_read_byte(scan_params_cmd, 9) == 0x00, "hci scan params: filter_policy");
+
+    /* LE_Set_Scan_Enable: opcode 0x200C, 2 params. */
+    int64_t *scan_enable_cmd = dhruva_alloc_bytes(5);
+    int64_t scan_enable_len = fn_hci_build_le_set_scan_enable_command(scan_enable_cmd, 1, 0);
+    CHECK(scan_enable_len == 5, "hci scan enable: total length == 3 (header) + 2 (params)");
+    CHECK(buf_read_byte(scan_enable_cmd, 0) == 0x0C, "hci scan enable: opcode LE byte0");
+    CHECK(buf_read_byte(scan_enable_cmd, 1) == 0x20, "hci scan enable: opcode LE byte1");
+    CHECK(buf_read_byte(scan_enable_cmd, 2) == 0x02, "hci scan enable: param length == 2");
+    CHECK(buf_read_byte(scan_enable_cmd, 3) == 0x01, "hci scan enable: scan_enable");
+    CHECK(buf_read_byte(scan_enable_cmd, 4) == 0x00, "hci scan enable: filter_duplicates");
+
+    /* Event parsing: event_code (byte0), param_len (byte1). */
+    int64_t *disc_event = dhruva_alloc_bytes(2);
+    buf_write_byte(disc_event, 0, 0x05); /* Disconnection Complete */
+    buf_write_byte(disc_event, 1, 0x04);
+    CHECK(fn_hci_event_code(disc_event) == 0x05, "hci event: event_code extracted correctly");
+    CHECK(fn_hci_event_param_len(disc_event) == 0x04, "hci event: param_len extracted correctly");
+    CHECK(fn_hci_event_is_command_complete(disc_event) == 0, "hci event: Disconnection Complete is not Command Complete");
+
+    /* A real Command Complete event for HCI_Reset: event_code=0x0E,
+     * param_len=4, num_hci_command_packets=1, opcode=0x0C03 (LE),
+     * status=0x00. */
+    int64_t *cc_event = dhruva_alloc_bytes(6);
+    buf_write_byte(cc_event, 0, 0x0E);
+    buf_write_byte(cc_event, 1, 0x04);
+    buf_write_byte(cc_event, 2, 0x01);
+    buf_write_byte(cc_event, 3, 0x03);
+    buf_write_byte(cc_event, 4, 0x0C);
+    buf_write_byte(cc_event, 5, 0x00);
+    CHECK(fn_hci_event_is_command_complete(cc_event) == 1, "hci event: Command Complete recognized");
+    CHECK(fn_hci_cmd_complete_opcode(cc_event) == 0x0C03, "hci event: Command Complete opcode extracted (matches HCI_Reset)");
+    CHECK(fn_hci_cmd_complete_status(cc_event) == 0x00, "hci event: Command Complete status == success");
+}
+
 int main(void) {
     test_basic_round_trip();
     test_path_length_boundary();
@@ -1046,6 +1139,7 @@ int main(void) {
     test_chacha20_boundaries();
     test_bignum_boundaries();
     test_lan9512_framing();
+    test_hci_framing();
 
     printf("\n%d PASS, %d FAIL\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

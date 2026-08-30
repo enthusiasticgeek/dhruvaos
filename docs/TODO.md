@@ -1134,29 +1134,38 @@ support of any kind.
   buffer/cap across netif/ARP/IPv4/UDP/TCP/DHCP consistently, not a
   point fix — deliberately scoped OUT of this round.
 
-- **BLE via USB dongle (Pi 1)** — `[L, several rounds — the HCI
-  transport itself is tractable; a full usable BLE stack on top is
+- **BLE via USB dongle (Pi 1): HCI transport (DONE, round 57,
+  spec-only) + GATT/ATT/L2CAP (not started)** — `[L, several rounds —
+  the HCI transport itself is done; a full usable BLE stack on top is
   its own multi-round effort, comparable to this project's existing
   TCP/IP stack]`
-  Genuinely more tractable than WiFi for one concrete reason: USB
-  Bluetooth HCI is an OFFICIAL, STANDARDIZED USB class (interface
-  class `0xE0`/subclass `0x01`/protocol `0x01`), not vendor-specific —
-  enumeration recognizes it exactly like mass storage's own class-code
-  check already works (`dwc2_fetch_and_set_configuration`'s existing
-  `0x08`/`0x06`/`0x50` pattern, same shape, different constants). HCI
-  commands/events go over the existing control-transfer path
-  (`dwc2_control_in`/`_no_data`, already built); HCI ACL data goes over
-  bulk endpoints (already built for mass storage, same primitives).
-  That gets you a working HCI transport — genuinely buildable with
-  what already exists. What it does NOT get you: L2CAP, ATT, and GATT
-  (the actual protocol layers an application uses to scan/connect/
-  read/write BLE characteristics) are a SEPARATE stack sitting above
-  HCI, comparable in scope to this project's own ARP/IPv4/TCP/UDP/ICMP
-  stack — expect a similar number of rounds to reach the same maturity
-  level `tcpecho`/`udpecho` represent for TCP/IP today. Sequence: HCI
-  transport + reset/scan/connect first (a real, demonstrable milestone
-  on its own, matching this project's own "prove the mechanism with a
-  live loopback-equivalent test" discipline), GATT read/write after.
+  USB Bluetooth HCI is an OFFICIAL, STANDARDIZED USB class (interface
+  class `0xE0`/subclass `0x01`/protocol `0x01`) — `dwc2_fetch_and_
+  set_configuration`'s descriptor walk detects it exactly like mass
+  storage's own `0x08`/`0x06`/`0x50` check, capturing 3 endpoints
+  (bulk in/out for ACL data, interrupt-in for HCI events — this
+  project's first use of the interrupt transfer type,
+  `dwc2_hci_interrupt_in`). HCI commands go over the control endpoint
+  (`dwc2_hci_send_command`, bmRequestType=0x20/bRequest=0x00 per the
+  Bluetooth Core Spec's USB Transport Layer); `hci_reset_and_scan`
+  sends HCI_Reset -> LE_Set_Scan_Parameters -> LE_Set_Scan_Enable on
+  enumeration, checking each Command Complete event's own opcode and
+  status. Packet building/parsing (opcode encoding, command headers,
+  event parsing) is pure and has real host-harness test coverage.
+  **NOT live-verified**: unlike CDC-ECM (which had a real QEMU stand-in
+  device), QEMU's `usb-bt-dongle` — which implemented exactly this USB
+  HCI transport — was deprecated in 2018 and removed from modern QEMU
+  entirely; confirmed absent from this environment's own `qemu-system-
+  arm -device help`. This transport has never received a real HCI
+  event in response to anything it sends, pending real Pi 1B
+  hardware-in-loop testing with an actual USB Bluetooth dongle
+  attached — same honesty bar as the LAN9512 NIC backend.
+  **Remaining, not started**: L2CAP, ATT, and GATT (the actual protocol
+  layers an application uses to scan/connect/read/write BLE
+  characteristics) are a SEPARATE stack sitting above HCI, comparable
+  in scope to this project's own ARP/IPv4/TCP/UDP/ICMP stack — expect
+  a similar number of rounds to reach the same maturity level
+  `tcpecho`/`udpecho` represent for TCP/IP today.
 
 - **WiFi via USB dongle (Pi 1)** — `[XL, high risk, not sized further
   — the largest, riskiest item in this entire backlog]`

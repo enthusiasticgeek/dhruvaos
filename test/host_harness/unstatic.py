@@ -85,6 +85,16 @@ WHITELIST = [
     "lan9512_build_tx_header",
     "lan9512_rx_status_has_error",
     "lan9512_rx_status_frame_len",
+    "hci_build_opcode",
+    "hci_build_command",
+    "hci_build_reset_command",
+    "hci_build_le_set_scan_parameters_command",
+    "hci_build_le_set_scan_enable_command",
+    "hci_event_code",
+    "hci_event_param_len",
+    "hci_event_is_command_complete",
+    "hci_cmd_complete_opcode",
+    "hci_cmd_complete_status",
 ]
 
 

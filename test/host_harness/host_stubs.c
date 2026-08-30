@@ -475,3 +475,34 @@ uint32_t usb_net_get_cdc_data_iface_num(void) { return g_usb_net_cdc_data_iface_
 uint32_t usb_net_set_cdc_data_iface_num(uint32_t v) { g_usb_net_cdc_data_iface_num = v; return 0; }
 int64_t *usb_net_get_mac_scratch_ptr(void) { return g_usb_net_mac_scratch_ptr; }
 int64_t usb_net_set_mac_scratch_ptr(int64_t *addr) { g_usb_net_mac_scratch_ptr = addr; return 0; }
+
+/* Round 57: same shape as the usb_net_* block above, for usb_bt_
+ * state.S -- never exercised by host_main.c's own call graph (no USB
+ * here), needed only so kernel_main links. Added proactively in the
+ * SAME round that introduced these extern fns, per the lesson from
+ * round 56's own discovery that this harness silently stopped linking
+ * for two whole rounds when this step was skipped. */
+static uint32_t g_usb_bt_kind, g_usb_bt_bulk_in_epaddr, g_usb_bt_bulk_in_mps;
+static uint32_t g_usb_bt_bulk_out_epaddr, g_usb_bt_bulk_out_mps;
+static uint32_t g_usb_bt_bulk_in_toggle, g_usb_bt_bulk_out_toggle;
+static uint32_t g_usb_bt_intr_in_epaddr, g_usb_bt_intr_in_mps, g_usb_bt_intr_in_toggle;
+uint32_t usb_bt_get_kind(void) { return g_usb_bt_kind; }
+uint32_t usb_bt_set_kind(uint32_t v) { g_usb_bt_kind = v; return 0; }
+uint32_t usb_bt_get_bulk_in_epaddr(void) { return g_usb_bt_bulk_in_epaddr; }
+uint32_t usb_bt_set_bulk_in_epaddr(uint32_t v) { g_usb_bt_bulk_in_epaddr = v; return 0; }
+uint32_t usb_bt_get_bulk_in_mps(void) { return g_usb_bt_bulk_in_mps; }
+uint32_t usb_bt_set_bulk_in_mps(uint32_t v) { g_usb_bt_bulk_in_mps = v; return 0; }
+uint32_t usb_bt_get_bulk_out_epaddr(void) { return g_usb_bt_bulk_out_epaddr; }
+uint32_t usb_bt_set_bulk_out_epaddr(uint32_t v) { g_usb_bt_bulk_out_epaddr = v; return 0; }
+uint32_t usb_bt_get_bulk_out_mps(void) { return g_usb_bt_bulk_out_mps; }
+uint32_t usb_bt_set_bulk_out_mps(uint32_t v) { g_usb_bt_bulk_out_mps = v; return 0; }
+uint32_t usb_bt_get_bulk_in_toggle(void) { return g_usb_bt_bulk_in_toggle; }
+uint32_t usb_bt_set_bulk_in_toggle(uint32_t v) { g_usb_bt_bulk_in_toggle = v; return 0; }
+uint32_t usb_bt_get_bulk_out_toggle(void) { return g_usb_bt_bulk_out_toggle; }
+uint32_t usb_bt_set_bulk_out_toggle(uint32_t v) { g_usb_bt_bulk_out_toggle = v; return 0; }
+uint32_t usb_bt_get_intr_in_epaddr(void) { return g_usb_bt_intr_in_epaddr; }
+uint32_t usb_bt_set_intr_in_epaddr(uint32_t v) { g_usb_bt_intr_in_epaddr = v; return 0; }
+uint32_t usb_bt_get_intr_in_mps(void) { return g_usb_bt_intr_in_mps; }
+uint32_t usb_bt_set_intr_in_mps(uint32_t v) { g_usb_bt_intr_in_mps = v; return 0; }
+uint32_t usb_bt_get_intr_in_toggle(void) { return g_usb_bt_intr_in_toggle; }
+uint32_t usb_bt_set_intr_in_toggle(uint32_t v) { g_usb_bt_intr_in_toggle = v; return 0; }
