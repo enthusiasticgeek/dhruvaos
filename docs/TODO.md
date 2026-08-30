@@ -447,6 +447,63 @@ for by name.
   ChaCha20 for anything that needs to resist an active adversary, not
   just a passive one.
 
+- **AES** — `[L, genuinely harder than it sounds — not yet begun,
+  added 2026-08-30 per explicit request]`
+  Two real, independent reasons to want it despite round 44's own
+  deliberate ChaCha20-over-AES choice, both already implied elsewhere
+  in this roadmap but not spelled out until now: (1) WPA2's CCMP mode
+  (the WiFi item above) is AES-based by the standard itself, not a
+  free choice — no WPA2 client is possible without a real AES
+  implementation, full stop; (2) some TLS deployments and compliance
+  regimes (FIPS 140-2/3 in particular) mandate AES-GCM cipher suites
+  specifically, so a TLS client meant to interoperate broadly (the TLS
+  item below) can't rely on ChaCha20-Poly1305 alone even though TLS
+  1.3 itself permits it. **The real difficulty is NOT the algorithm
+  itself** (AES's substitution-permutation network is well-documented
+  and no harder to port than ChaCha20 was) **— it's doing it safely on
+  ARMv6.** This core has no AES-NI hardware acceleration, and a naive
+  table-based software AES (the obvious first implementation) leaks
+  its key through cache-timing side-channels — a well-documented,
+  practical attack class, not a theoretical one (this is exactly
+  round 44's own original reason for choosing ChaCha20 instead). A
+  safe implementation needs either a bitsliced/constant-time
+  formulation or a T-table approach with real cache-timing mitigations
+  (constant-time table lookups, or precomputed/cache-resident tables
+  with careful access patterns) — genuinely harder to get right than
+  the cipher's own math, and getting it wrong produces something worse
+  than not having AES at all (a false sense of security). Needs a real
+  spike specifically probing vani's own suitability for constant-time
+  bit manipulation at this level (same discipline round 41's SHA-256
+  entry used) before committing to a full build.
+
+- **TLS** — `[XL, several rounds — genuinely blocked on multiple
+  prerequisites above, not ready to start; added 2026-08-30 per
+  explicit request]`
+  A real TLS 1.3 client needs, at minimum: (1) asymmetric key exchange
+  (ECDHE) — blocked on the EC point arithmetic/modular reduction this
+  roadmap's own crypto-foundation entry already flags as not yet built
+  (needed for PKI too, not a new dependency); (2) an AEAD cipher —
+  either ChaCha20-Poly1305 (needs Poly1305 above, smaller lift) or
+  AES-GCM (needs the AES item above AND a GCM mode on top of it,
+  larger lift) — TLS 1.3 permits either, so this is a real, explicit
+  choice to make, not a default to assume; (3) certificate validation
+  — full X.509/ASN.1 DER parsing and CA chain-of-trust validation is
+  the PKI item below in its own right, a large, historically bug-prone
+  undertaking on its own. **A materially smaller, realistic first
+  target**: TLS 1.3 with raw public keys (RFC 7250) instead of X.509 —
+  pin a known server key directly, skip certificate parsing and CA
+  validation entirely. This turns "TLS" from "needs PKI" into "needs
+  ECDHE + an AEAD," a meaningfully smaller and more honest first
+  increment, matching this roadmap's own established pattern of
+  finding the smallest real version of a large ask (see PKI's own
+  "raw public-key trust" note below, which this reuses directly) —
+  full X.509-validated TLS is a separate, later step after that, not
+  a package deal. Even the smaller version needs the handshake state
+  machine itself built (comparable in scope to this project's own TCP
+  state machine, but for TLS's own record/handshake layer) — this is
+  genuinely not close to ready to start; sequence it after the crypto
+  prerequisites above exist.
+
 - **Real authentication (password-protected `su` + `passwd`)** —
   `[M, ~2-3 rounds, ready to start on the existing crypto foundation
   — not yet begun, added 2026-08-30 per explicit request]`
