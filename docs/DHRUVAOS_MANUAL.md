@@ -1,0 +1,212 @@
+# DhruvaOS User Manual
+
+DhruvaOS is a bare-metal, fixed-priority preemptive RTOS written in
+the vāṇी language, currently targeting the Raspberry Pi 1 family
+(BCM2835 / ARM1176JZF-S) under QEMU's `raspi1ap` machine model, with
+an early boot-only port started for Pi 4 (see `PORTING.md`).
+
+This manual describes what DhruvaOS actually does today, including
+its current limitations — it is written to be accurate, not
+aspirational. Where something is a known gap rather than a design
+choice, it says so explicitly, with a pointer to `TODO.md`.
+
+## 1. What kind of RTOS this is (and isn't) today
+
+**Real, load-bearing RTOS mechanisms:**
+
+- **Fixed-priority preemptive scheduling.** Tasks are ranked by a
+  static priority (lower number = higher priority); the scheduler
+  always runs the highest-priority *ready* task, preempting a
+  lower-priority one the instant a higher-priority task becomes ready
+  (via the timer tick or a voluntary wake).
+- **Priority-ceiling protocol** for mutual exclusion
+  (`dhruva_prio_lock(ceiling)` / `dhruva_prio_unlock(base_priority)`).
+  A task raises its own effective priority to the resource's ceiling
+  before touching it, and restores its base priority after — this
+  *prevents* priority inversion by construction (a lower-priority
+  holder can never be preempted by a task that would need the same
+  resource, because its effective priority is already at least as
+  high as anything that could contend for it). It does not use a
+  runtime lock/wait-queue at all; see `dhruva_prio_lock`'s own comment
+  in `boot/context_switch.S`.
+- **Compiler-enforced timing bounds.** The vāṇी compiler supports
+  `#[bounded_stack(bytes=N)]` (a hard build failure if the compiler's
+  own static worst-case stack depth for that function exceeds N) and
+  `#[wcet(cycles=N)]` (worst-case execution time bound, checked the
+  same way). Both are used throughout `kernel_main.vani`, including on
+  every task and on `irq_dispatch`. This is a real static-analysis
+  guarantee, not a runtime measurement or a comment-only convention.
+- **Hardware-timer-driven preemption**, not cooperative scheduling —
+  a task that never yields still gets preempted by the timer tick.
+
+**Known, current limitations (not design goals — see `TODO.md`):**
+
+- **The task set is fixed at exactly 6 compile-time slots**: HIGH,
+  MEDIUM, LOW (a priority-ceiling demonstration), IDLE, GC
+  (`task_e`, DharaFS compaction), and SHELL (`task_f`, the
+  interactive console). There is **no runtime or build-time API for a
+  third party to add a task today** — doing so means directly editing
+  `kernel_main.vani` (a new `fn task_g()`), `boot/context_switch.S`
+  (widening `sp_table`/`eff_prio_table`/`sleep_until_table`, currently
+  hardcoded 6-word arrays), and the `start_multitasking` call site's
+  fixed 6-argument signature. A general `task_create()` API is on the
+  roadmap (`TODO.md`) but does not exist yet.
+- **The timer tick is 500ms** — fine for this project's own demo and
+  self-tests, far too coarse for most real control loops (a typical
+  RTOS runs 1ms or tickless).
+- **No deadline/budget model or priority-inversion detection exist
+  yet.** The existing ceiling protocol prevents inversion rather than
+  detecting it, so there is nothing to "detect" without a genuinely
+  different, second synchronization primitive (a real blocking mutex)
+  — see `TODO.md` for why this is deliberately not built against the
+  current synthetic demo tasks.
+- **Networking is loopback-only.** The full ARP/IPv4/ICMP/UDP/TCP
+  stack is functionally complete and self-consistent, but has never
+  been driven by real off-box traffic — there is no real NIC/wireless
+  driver of any kind today (also on the `TODO.md` roadmap).
+
+## 2. Boot process
+
+1. `boot/rpi1/boot.S` — CPU reset entry, initial stack setup, BSS
+   zeroing, then jumps into vāṇी's `fn_main`.
+2. `boot/mmu_init.S` — sets up the ARMv6 short-descriptor MMU with
+   Normal/Device memory types and W^X enforcement (see round 38's own
+   history for why XN can't be fully hardware-verified under this
+   project's QEMU version).
+3. `kernel_main.vani`'s own `fn_main` runs the full boot-time self-test
+   battery (currently 45 self-tests spanning the FS layer, networking,
+   crypto, bignum arithmetic, the evaluator, and more), then:
+   - Initializes DharaFS (`dharafs_init` — scans the SD card's log for
+     the real append cursor and highest sequence number; see
+     `DHARAFS_MANUAL.md`).
+   - Allocates each task's stack and every persistent scratch buffer
+     (`dhruva_alloc_bytes` — see §4).
+   - Enables interrupts (`enable_irqs`) and calls `start_multitasking`,
+     which never returns — from this point on, everything runs as one
+     of the 6 scheduled tasks.
+
+A full self-test PASS/FAIL summary prints over UART before
+multitasking starts; a genuine self-test FAILURE or a hardware fault
+(`boot/rpi1/vectors.S`'s `fault_data_abort`/`fault_prefetch_abort`)
+halts with a diagnostic rather than continuing into a possibly-corrupt
+state.
+
+## 3. The shell (task_f)
+
+An interactive command line over the UART console (visible under QEMU
+via `-serial stdio`/`-nographic`). Type a command and press Enter.
+
+### Filesystem commands
+
+| Command | Usage | Notes |
+|---|---|---|
+| `ls` | `ls [prefix]` | Flat listing of every live path starting with `prefix` (or everything, if omitted). |
+| `cat` | `cat <path>` | Read and print a file's content, permission-checked as the current shell user. |
+| `catv` | `catv <path>` | Like `cat`, but also verifies a companion SHA-256 digest if one was written with `writev`. Reports `INTEGRITY FAILURE` if the digest doesn't match; a file with no digest reads normally (verification is opt-in per path). |
+| `write` | `write <path> <text>` | Create or overwrite a file. New files default to mode 0644, owned by the current shell user. |
+| `writev` | `writev <path> <text>` | Like `write`, but also stores a SHA-256 digest at a companion `<path>.sha256` file for later verification via `catv`. |
+| `rm` | `rm <path>` | Delete a file (write permission required). |
+| `mv` | `mv <old-path> <new-path>` | Rename, permission-checked on both sides. Atomic across a crash — see `DHARAFS_MANUAL.md`'s transaction section. |
+| `log` | `log <name> <text>` | Append-only log API: writes to `/logs/<name>-NNNN.log`, rolling over to a new numbered file automatically once the current one nears 3584 bytes. |
+| `chmod` | `chmod <path> <mode-decimal>` | e.g. `chmod /f 420` for `rw-r--r--` (420 = 0644 octal). Owner or root only. |
+| `chown` | `chown <path> <uid> <gid>` | Root only — even a file's own owner cannot give it away. |
+| `attr` | `attr <path>` or `attr <path> <immutable\|append\|system> <on\|off>` | Query or set the immutable/append-only/system attributes. A non-root owner can set either protective attribute but never clear it once set; only root can undo them. `system` has no enforcement of its own (informational). |
+
+### Networking commands (loopback-only — see §1)
+
+| Command | Usage | Notes |
+|---|---|---|
+| `ping` | `ping <a.b.c.d>` | ICMP echo. Only ever succeeds against `0.0.0.0`/self under QEMU — no real second host exists on the loopback-only netif. |
+| `ifconfig` | `ifconfig` | Shows the interface MAC and current DHCP client state. |
+| `netstat` | `netstat` | Dumps the ARP cache and both TCP connection slots' current state. |
+| `tcpecho` | `tcpecho <text>` | Full TCP three-way handshake + data + close round trip, self-talking over loopback. |
+| `udpecho` | `udpecho <text>` | UDP send/receive round trip, self-talking over loopback. |
+| `tcprtx` | `tcprtx` | Deliberately drops the first SYN and proves the real 2-second retransmission timer recovers the connection. |
+
+### System / diagnostic commands
+
+| Command | Usage | Notes |
+|---|---|---|
+| `eval` | `eval <expr>` | Small arithmetic expression evaluator (`+ - * / ( )`), traps on overflow and division by zero. |
+| `id` | `id` | Shows the active uid/gid for the current shell session. |
+| `su` | `su <uid> <gid>` | Switches the active permission context. uid 0 is root (bypasses all permission checks) — there is no login/authentication of any kind, `su` is unconditional. |
+| `diagnose` | `diagnose` | One-shot health report: uptime ticks, scheduler ready count, heap usage (current == high-water mark, since the allocator never frees), CPU frequency + governor history, allocation count, FS commit count, context switch count, IRQ count, and `dhruva_prio_lock` call count. |
+| `fault` | `fault alloc <n>` | **Deliberately triggers a real, unrecoverable OOM-fatal halt** after the Nth subsequent heap allocation, for testing the OOM path itself. There is no confirmation prompt and no way to undo it once armed — this is the intended behavior, not a bug. |
+
+Type anything unrecognized to see the full command list echoed back.
+
+## 4. Memory model
+
+- **`dhruva_alloc_bytes(n)`** is a 256KB bump allocator that **never
+  frees**. This is deliberate, not a bug: every real allocation in
+  this codebase is either a one-time boot-time scratch buffer or a
+  persistent, reused-forever buffer for a function that's called
+  repeatedly (see `feedback_dhruva_never_free_heap_pattern` in project
+  memory, or just: if you're adding a new function that will be called
+  more than once at runtime, give it a *persistent* scratch buffer —
+  allocated once at boot — rather than calling `dhruva_alloc_bytes`
+  inside the function body itself).
+- **Exhaustion is a clean, loud, whole-system halt**, not silent
+  corruption. `dhruva_alloc_bytes` prints a diagnostic (requested
+  size, bytes used, capacity) and halts with interrupts disabled — a
+  genuine stop, not just the calling task freezing. `heap_usage_self_
+  test` (part of the boot self-test battery) is the real, permanent
+  early-warning canary: it checks for at least 16KB of headroom after
+  every self-test allocation has already happened, specifically so a
+  future change that eats into that margin fails loudly at boot
+  instead of manifesting as an unexplained runtime halt later.
+- You can deliberately exercise the OOM-fatal path with `fault alloc
+  <n>` (see §3) rather than only via the host-side test harness's
+  synthetic constructions (`test/host_harness/`, which tests DharaFS
+  and crypto logic under ASAN/UBSAN as an ordinary host process — see
+  its own `README.md`).
+
+## 5. Extending the kernel today
+
+Since there is no dynamic task-creation API yet (§1), extending
+DhruvaOS today means editing `kernel/kernel_main.vani` directly:
+
+- **A new shell command**: add a new `if shell_word_matches(line_buf,
+  0, cmd_end, "yourcommand") == 1 { ... return 0; }` block inside
+  `shell_dispatch()`. Use a **persistent** scratch buffer (§4) for any
+  working memory the command needs, not `dhruva_alloc_bytes` directly,
+  if the command might reasonably be run more than once in a session.
+- **A new self-test**: add a `fn your_thing_self_test() -> i64`
+  function and call it from the boot sequence alongside the existing
+  ~45. Report PASS/FAIL via `uart_puts`, matching the existing
+  convention.
+- **A new task**: not currently possible without hand-editing the
+  fixed 6-slot scheduler tables in `boot/context_switch.S` — see
+  `TODO.md`'s "general task-creation API" item for the planned fix.
+
+## 6. Building and running
+
+```sh
+./build.sh                                   # produces build/dhruva.elf
+python3 test/qemu_run.py build/dhruva.elf    # quick boot smoke test (no SD image)
+python3 test/phase4_milestone.py build/dhruva.elf   # full live shell/network milestone, with a real SD image
+```
+
+For interactive use:
+
+```sh
+qemu-system-arm -M raspi1ap -kernel build/dhruva.elf -serial stdio -display none \
+    -drive file=<sd-image>,if=sd,format=raw,cache=writethrough
+```
+
+Regression battery (see `test/*.py`): `phase4_milestone.py` (live
+milestone), `heap_stress.py` (reboot-loop heap growth detection),
+`power_yank.py` (DharaFS crash-consistency sweep — also, incidentally,
+the most sensitive detector this project has for a corrupted UART byte
+stream, since it does a strict decode of the raw serial capture; see
+`feedback_aapcs_callee_saved_registers_asm` in project memory for why
+that matters). `test/host_harness/` runs DharaFS + crypto logic under
+ASAN/UBSAN as an ordinary host process — see its own `README.md`.
+
+## 7. See also
+
+- `docs/DHARAFS_MANUAL.md` — the filesystem, in full.
+- `docs/TODO.md` — the honest, currently-open backlog (task-creation
+  API, real NIC/BLE/WiFi drivers, priority-inversion detection, and
+  more), each item sized against what actually exists today.
+- `docs/PORTING.md` — the Pi 4/5 port's current state.
