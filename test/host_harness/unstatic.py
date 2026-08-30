@@ -61,6 +61,8 @@ WHITELIST = [
     "dharafs_is_valid_append_only_write",
     "dharafs_set_attr_raw",
     "dharafs_get_attr_raw",
+    "dharafs_chmod_checked",
+    "dharafs_chown_checked",
     "dharafs_dirlist_seen_contains",
     "dharafs_dirlist_segment_equals",
     "dharafs_list_dir_raw",

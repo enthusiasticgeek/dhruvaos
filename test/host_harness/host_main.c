@@ -63,6 +63,8 @@ int64_t fn_dharafs_mode_is_append_only(uint32_t mode);
 int64_t fn_dharafs_is_valid_append_only_write(int64_t *old_buf, int64_t old_len, int64_t *new_buf, int64_t new_len);
 int64_t fn_dharafs_set_attr_raw(int64_t *path_buf, int64_t path_len, uint32_t new_attr_bits, uint32_t req_uid, uint32_t req_gid);
 int64_t fn_dharafs_get_attr_raw(int64_t *path_buf, int64_t path_len);
+int64_t fn_dharafs_chmod_checked(int64_t *path_buf, int64_t path_len, uint32_t new_mode, uint32_t req_uid, uint32_t req_gid);
+int64_t fn_dharafs_chown_checked(int64_t *path_buf, int64_t path_len, uint32_t new_uid, uint32_t new_gid, uint32_t req_uid, uint32_t req_gid);
 int64_t fn_dharafs_write_verified_raw(int64_t *path_buf, int64_t path_len, int64_t *data_buf, int64_t data_len, uint32_t owner_uid, uint32_t owner_gid, uint32_t mode);
 int64_t fn_dharafs_write_verified_checked(int64_t *path_buf, int64_t path_len, int64_t *data_buf, int64_t data_len, uint32_t req_uid, uint32_t req_gid);
 int64_t fn_dharafs_read_verified_checked(int64_t *path_buf, int64_t path_len, int64_t *out_buf, uint32_t req_uid, uint32_t req_gid);
@@ -736,6 +738,48 @@ static void test_attributes(void) {
     CHECK(fn_dharafs_set_attr_raw(spath2, 8, 0, 5, 5) == 0, "attr_system2: non-root owner CAN clear system");
 }
 
+/* ================= chmod/chown permission checks (bug fix) ================= */
+
+static void test_chmod_chown_permissions(void) {
+    reset_fs();
+    int64_t *path = mkbuf("/owned42", 8);
+    int64_t *data = mkbuf("x", 1);
+    CHECK(fn_dharafs_append_raw(path, 8, data, 1, 42, 42, 0644) == 0, "chmod_perm: create /owned42 as uid 42");
+
+    /* chmod: owner may change mode; a non-owner, non-root may not. */
+    CHECK(fn_dharafs_chmod_checked(path, 8, 0600, 99, 99) == -2, "chmod_perm: non-owner chmod denied");
+    CHECK(fn_dharafs_chmod_checked(path, 8, 0600, 42, 42) == 0, "chmod_perm: owner chmod succeeds");
+    int64_t *meta = dhruva_alloc_bytes(12);
+    CHECK(fn_dharafs_stat_raw(path, 8, meta) == 0, "chmod_perm: stat after chmod succeeds");
+    CHECK(buf_read_u32(meta, 8) == 0600, "chmod_perm: mode actually changed to 0600");
+    /* root may always chmod, regardless of ownership. */
+    CHECK(fn_dharafs_chmod_checked(path, 8, 0644, 0, 0) == 0, "chmod_perm: root chmod succeeds regardless of ownership");
+    /* A third, unrelated uid (neither the real owner 42 nor root) is
+     * still denied, confirming the check is by real ownership, not
+     * just "not uid 99 from the earlier check". */
+    CHECK(fn_dharafs_chmod_checked(path, 8, 0644, 7, 7) == -2, "chmod_perm: a third unrelated uid is also denied");
+
+    /* chmod of a nonexistent path returns -1, not -2 or a crash. */
+    int64_t *missing = mkbuf("/nope", 5);
+    CHECK(fn_dharafs_chmod_checked(missing, 5, 0644, 0, 0) == -1, "chmod_perm: chmod of nonexistent path returns -1");
+
+    /* chown: ROOT ONLY -- even the owner may not chown their own file
+     * to someone else (real strict POSIX default, no owner exemption
+     * unlike chmod). */
+    reset_fs();
+    int64_t *path2 = mkbuf("/owned7", 7);
+    int64_t *data2 = mkbuf("y", 1);
+    CHECK(fn_dharafs_append_raw(path2, 7, data2, 1, 7, 7, 0644) == 0, "chown_perm: create /owned7 as uid 7");
+    CHECK(fn_dharafs_chown_checked(path2, 7, 99, 99, 7, 7) == -2, "chown_perm: owner (non-root) cannot chown their own file");
+    CHECK(fn_dharafs_chown_checked(path2, 7, 99, 99, 42, 42) == -2, "chown_perm: an unrelated non-root uid cannot chown either");
+    CHECK(fn_dharafs_chown_checked(path2, 7, 99, 99, 0, 0) == 0, "chown_perm: root CAN chown");
+    int64_t *meta2 = dhruva_alloc_bytes(12);
+    CHECK(fn_dharafs_stat_raw(path2, 7, meta2) == 0, "chown_perm: stat after chown succeeds");
+    CHECK(buf_read_u32(meta2, 0) == 99, "chown_perm: owner_uid actually changed to 99");
+    CHECK(buf_read_u32(meta2, 4) == 99, "chown_perm: owner_gid actually changed to 99");
+    CHECK(fn_dharafs_chown_checked(missing, 5, 1, 1, 0, 0) == -1, "chown_perm: chown of nonexistent path returns -1");
+}
+
 /* ================= Crypto / bignum smoke tests through the real
  * on-disk-adjacent entry points (byte-for-byte correctness matters
  * here just as much as for DharaFS, since these back the security-
@@ -849,6 +893,7 @@ int main(void) {
     test_verified_integrity();
     test_log_append();
     test_attributes();
+    test_chmod_chown_permissions();
     test_sha256_boundaries();
     test_chacha20_boundaries();
     test_bignum_boundaries();

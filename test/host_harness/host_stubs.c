@@ -143,6 +143,18 @@ SCRATCH_PTR(dharafs_verified_digest_a_scratch)
 SCRATCH_PTR(dharafs_verified_digest_b_scratch)
 SCRATCH_PTR(dharafs_appendonly_check_scratch)
 SCRATCH_PTR(dharafs_rename_new_path_scratch)
+SCRATCH_PTR(shell_my_mac_scratch)
+SCRATCH_PTR(shell_ping_dst_mac_scratch)
+SCRATCH_PTR(shell_ping_payload_scratch)
+SCRATCH_PTR(shell_ping_recv_payload_scratch)
+SCRATCH_PTR(shell_ping_recv_meta_scratch)
+SCRATCH_PTR(shell_tcpecho_payload_scratch)
+SCRATCH_PTR(shell_tcp_poll_scratch)
+SCRATCH_PTR(shell_tcpecho_recv_payload_scratch)
+SCRATCH_PTR(shell_udpecho_payload_scratch)
+SCRATCH_PTR(shell_udpecho_recv_payload_scratch)
+SCRATCH_PTR(shell_udpecho_recv_meta_scratch)
+SCRATCH_PTR(shell_tcprtx_drop_buf_scratch)
 
 /* ---- 1d. dharafs_state_* / dharafs_user_* -- real state, matching
  * boot/dharafs_state.S's semantics closely enough for host testing

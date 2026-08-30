@@ -83,6 +83,32 @@ extern "C" fn dharafs_appendonly_check_scratch_get() -> mut ref i64;
 // boot/scratch_state.S's own comment.
 extern "C" fn dharafs_rename_new_path_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_rename_new_path_scratch_get() -> mut ref i64;
+// BUG FIX: ping/ifconfig/tcpecho/udpecho/tcprtx's own persistent
+// scratch -- see boot/scratch_state.S's own comment.
+extern "C" fn shell_my_mac_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_my_mac_scratch_get() -> mut ref i64;
+extern "C" fn shell_ping_dst_mac_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_ping_dst_mac_scratch_get() -> mut ref i64;
+extern "C" fn shell_ping_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_ping_payload_scratch_get() -> mut ref i64;
+extern "C" fn shell_ping_recv_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_ping_recv_payload_scratch_get() -> mut ref i64;
+extern "C" fn shell_ping_recv_meta_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_ping_recv_meta_scratch_get() -> mut ref i64;
+extern "C" fn shell_tcpecho_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_tcpecho_payload_scratch_get() -> mut ref i64;
+extern "C" fn shell_tcp_poll_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_tcp_poll_scratch_get() -> mut ref i64;
+extern "C" fn shell_tcpecho_recv_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_tcpecho_recv_payload_scratch_get() -> mut ref i64;
+extern "C" fn shell_udpecho_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_udpecho_payload_scratch_get() -> mut ref i64;
+extern "C" fn shell_udpecho_recv_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_udpecho_recv_payload_scratch_get() -> mut ref i64;
+extern "C" fn shell_udpecho_recv_meta_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_udpecho_recv_meta_scratch_get() -> mut ref i64;
+extern "C" fn shell_tcprtx_drop_buf_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn shell_tcprtx_drop_buf_scratch_get() -> mut ref i64;
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn shell_line_scratch_get() -> mut ref i64;
 extern "C" fn eval_values_scratch_set(addr: mut ref i64) -> i64;
@@ -1847,6 +1873,61 @@ fn dharafs_chown(path: Str, uid: u32, gid: u32) -> i64 {
     i = i + 1;
   }
   return dharafs_append_raw(path_buf, path_len, data_buf, data_len, uid, gid, mode);
+}
+
+// BUG (found via a post-round-51 sweep, real security gap, not just a
+// heap-safety one): dharafs_chmod/dharafs_chown above have NO
+// permission check at all -- any uid could change any file's mode or
+// ownership. Both stay unchecked, trusted primitives, same "raw/Str-
+// level entry points are unchecked, a real _checked wrapper is the
+// enforcement boundary" architecture dharafs_write_raw_checked/
+// dharafs_delete_raw_checked/dharafs_rename_raw_checked already
+// establish for write/delete/rename -- these two are the same fix for
+// the one pair of mutating operations that never got it.
+//
+// chmod is owner-or-root, matching real POSIX chmod() semantics --
+// deliberately NOT governed by the rwx bits themselves (a file's own
+// write permission says nothing about who may change ITS permission
+// bits).
+fn dharafs_chmod_checked(path_buf: mut ref i64, path_len: i64, new_mode: u32, req_uid: u32, _req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  if (req_uid != owner_uid) && (req_uid != (0 as u32)) {
+    return 0 - 2;
+  }
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read_raw(path_buf, path_len, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, new_mode);
+}
+
+// chown is ROOT-ONLY, real strict POSIX default -- unlike chmod, even
+// the current owner may not unilaterally give a file away to someone
+// else or claim someone else's file, so there's no owner exemption
+// here the way chmod has one.
+fn dharafs_chown_checked(path_buf: mut ref i64, path_len: i64, new_uid: u32, new_gid: u32, req_uid: u32, _req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  if req_uid != (0 as u32) {
+    return 0 - 2;
+  }
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read_raw(path_buf, path_len, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, new_uid, new_gid, mode);
 }
 
 // Round 50: set/query the immutable/append-only/system attribute bits
@@ -10575,30 +10656,77 @@ fn shell_dispatch() -> i64 {
     }
     let path_buf: mut ref i64 = dharafs_path_scratch_get();
     let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
-    // dharafs_chmod itself takes a Str; the shell only has the path as raw
-    // bytes in path_buf -- dharafs_stat_raw/dharafs_read_raw/dharafs_append_raw all
-    // work on raw buffers directly, so this reimplements dharafs_chmod's
-    // own three-step "stat, read, re-append" shape against path_buf
-    // instead of round-tripping through a Str.
-    let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
-    let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
-    if stat_status != 0 {
-      let _ = uart_puts("(not found)\n");
-      return 0;
-    }
-    let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
-    let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
-    let data_buf: mut ref i64 = dharafs_data_scratch_get();
-    let data_len: i64 = dharafs_read_raw(path_buf, path_len, data_buf);
-    if data_len < 0 {
-      let _ = uart_puts("(not found)\n");
-      return 0;
-    }
-    let status: i64 = dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode as u32);
+    // BUG FIX: this used to reimplement dharafs_chmod's own "stat,
+    // read, re-append" shape directly against path_buf with NO
+    // permission check at all -- any uid could chmod any file. Now
+    // goes through dharafs_chmod_checked (owner-or-root), the real
+    // enforcement boundary, same as cat/rm/write/mv already do for
+    // their own operations.
+    let status: i64 = dharafs_chmod_checked(path_buf, path_len, mode as u32, dharafs_user_get_uid(), dharafs_user_get_gid());
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
-      let _ = uart_puts("error\n");
+      if status == (0 - 2) {
+        let _ = uart_puts("permission denied\n");
+      } else {
+        if status == (0 - 1) {
+          let _ = uart_puts("(not found)\n");
+        } else {
+          let _ = uart_puts("error\n");
+        }
+      }
+    }
+    return 0;
+  }
+
+  // BUG FIX: dharafs_chown existed but had no shell command and no
+  // permission check -- see dharafs_chown_checked's own comment (ROOT
+  // ONLY, no owner exemption, matching real strict POSIX chown()).
+  if shell_word_matches(line_buf, 0, cmd_end, "chown") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: chown <path> <uid> <gid>\n");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    if path_end >= line_len {
+      let _ = uart_puts("usage: chown <path> <uid> <gid>\n");
+      return 0;
+    }
+    let path_len: i64 = path_end - path_start;
+    if (path_len == 0) || (path_len > 32) {
+      let _ = uart_puts("usage: chown <path> <uid> <gid>\n");
+      return 0;
+    }
+    let uid_start: i64 = path_end + 1;
+    let uid_end: i64 = shell_find_space(line_buf, uid_start, line_len);
+    if uid_end >= line_len {
+      let _ = uart_puts("usage: chown <path> <uid> <gid>\n");
+      return 0;
+    }
+    let gid_start: i64 = uid_end + 1;
+    let gid_end: i64 = shell_find_space(line_buf, gid_start, line_len);
+    let new_uid: i64 = shell_parse_decimal(line_buf, uid_start, uid_end);
+    let new_gid: i64 = shell_parse_decimal(line_buf, gid_start, gid_end);
+    if (new_uid < 0) || (new_gid < 0) {
+      let _ = uart_puts("usage: chown <path> <uid> <gid> (both non-negative integers)\n");
+      return 0;
+    }
+    let path_buf: mut ref i64 = dharafs_path_scratch_get();
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    let status: i64 = dharafs_chown_checked(path_buf, path_len, new_uid as u32, new_gid as u32, dharafs_user_get_uid(), dharafs_user_get_gid());
+    if status == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      if status == (0 - 2) {
+        let _ = uart_puts("permission denied\n");
+      } else {
+        if status == (0 - 1) {
+          let _ = uart_puts("(not found)\n");
+        } else {
+          let _ = uart_puts("error\n");
+        }
+      }
     }
     return 0;
   }
@@ -10743,11 +10871,11 @@ fn shell_dispatch() -> i64 {
       return 0;
     }
     let dst_ip: u32 = dst_ip_parsed as u32;
-    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let my_mac: mut ref i64 = shell_my_mac_scratch_get();
     let _ = netif_get_mac(my_mac);
     let my_ip: u32 = dhcp_state_get_leased_ip();
 
-    let dst_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let dst_mac: mut ref i64 = shell_ping_dst_mac_scratch_get();
     let resolved: i64 = 0;
     if dst_ip == my_ip {
       // Pinging yourself never needs real ARP resolution -- same
@@ -10799,7 +10927,7 @@ fn shell_dispatch() -> i64 {
 
     let identifier: u32 = 0x0042 as u32;
     let seq: u32 = 1 as u32;
-    let payload: mut ref i64 = dhruva_alloc_bytes(4);
+    let payload: mut ref i64 = shell_ping_payload_scratch_get();
     let _ = buf_write_byte(payload, 0 as u32, 112 as u32); // "ping"
     let _ = buf_write_byte(payload, 1 as u32, 105 as u32);
     let _ = buf_write_byte(payload, 2 as u32, 110 as u32);
@@ -10819,8 +10947,8 @@ fn shell_dispatch() -> i64 {
     // own just-sent request on an earlier iteration of this same
     // loop, exactly like icmp_self_test's own two-poll pattern, just
     // generalized into a retry loop here instead of two fixed calls).
-    let recv_payload: mut ref i64 = dhruva_alloc_bytes(4);
-    let recv_meta: mut ref i64 = dhruva_alloc_bytes(8);
+    let recv_payload: mut ref i64 = shell_ping_recv_payload_scratch_get();
+    let recv_meta: mut ref i64 = shell_ping_recv_meta_scratch_get();
     let got_reply: i64 = 0;
     let poll_iter: i64 = 0;
     while (poll_iter < 20) && (got_reply == 0) {
@@ -10861,7 +10989,7 @@ fn shell_dispatch() -> i64 {
   // on that queue's concurrent-consumer hazard) and fully
   // deterministic to test.
   if shell_word_matches(line_buf, 0, cmd_end, "ifconfig") == 1 {
-    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let my_mac: mut ref i64 = shell_my_mac_scratch_get();
     let _ = netif_get_mac(my_mac);
     let _ = uart_puts("mac ");
     let mi: i64 = 0;
@@ -11097,10 +11225,10 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("error: text too long (max 64)\n");
       return 0;
     }
-    let payload: mut ref i64 = dhruva_alloc_bytes(64);
+    let payload: mut ref i64 = shell_tcpecho_payload_scratch_get();
     let _ = shell_copy_range(line_buf, text_start, line_len, payload);
 
-    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let my_mac: mut ref i64 = shell_my_mac_scratch_get();
     let _ = netif_get_mac(my_mac);
     let client_id: u32 = 0 as u32;
     let server_id: u32 = 1 as u32;
@@ -11120,7 +11248,7 @@ fn shell_dispatch() -> i64 {
     // is exactly 3 frames -- bounded well past that for margin, same
     // "bounded, not `while true`" discipline every poll loop in this
     // project already follows.
-    let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+    let scratch: mut ref i64 = shell_tcp_poll_scratch_get();
     let handshake_iter: i64 = 0;
     while (handshake_iter < 10) && ((tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established())) {
       let _ = tcp_conn_poll(my_mac, scratch, 512);
@@ -11140,7 +11268,7 @@ fn shell_dispatch() -> i64 {
     // Data + echo is exactly 2 frames (client's data segment, the
     // server's echoed reply) -- tcp_conn_poll's own auto-responder
     // (see its comment) is what actually sends the second one.
-    let recv_payload: mut ref i64 = dhruva_alloc_bytes(64);
+    let recv_payload: mut ref i64 = shell_tcpecho_recv_payload_scratch_get();
     let echoed: i64 = 0 - 1;
     let data_iter: i64 = 0;
     while (data_iter < 10) && (echoed < 0) {
@@ -11198,10 +11326,10 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("error: text too long (max 64)\n");
       return 0;
     }
-    let payload: mut ref i64 = dhruva_alloc_bytes(64);
+    let payload: mut ref i64 = shell_udpecho_payload_scratch_get();
     let _ = shell_copy_range(line_buf, text_start, line_len, payload);
 
-    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let my_mac: mut ref i64 = shell_my_mac_scratch_get();
     let _ = netif_get_mac(my_mac);
     let loop_ip: u32 = 0x7F000001 as u32; // 127.0.0.1
     let client_port: u32 = 54323 as u32;
@@ -11221,8 +11349,8 @@ fn shell_dispatch() -> i64 {
       return 0;
     }
 
-    let recv_payload: mut ref i64 = dhruva_alloc_bytes(64);
-    let recv_meta: mut ref i64 = dhruva_alloc_bytes(8);
+    let recv_payload: mut ref i64 = shell_udpecho_recv_payload_scratch_get();
+    let recv_meta: mut ref i64 = shell_udpecho_recv_meta_scratch_get();
     let echoed: i64 = 0 - 1;
     let poll_iter: i64 = 0;
     while (poll_iter < 10) && (echoed < 0) {
@@ -11269,7 +11397,7 @@ fn shell_dispatch() -> i64 {
   // other live TCP/UDP/ICMP command already uses, completing the
   // handshake despite the induced loss.
   if shell_word_matches(line_buf, 0, cmd_end, "tcprtx") == 1 {
-    let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    let my_mac: mut ref i64 = shell_my_mac_scratch_get();
     let _ = netif_get_mac(my_mac);
     let client_id: u32 = 0 as u32;
     let server_id: u32 = 1 as u32;
@@ -11296,12 +11424,12 @@ fn shell_dispatch() -> i64 {
     // genuinely gone -- exactly the condition this test needs -- so
     // this isn't treated as a failure, just two different paths to
     // the same real loss.
-    let drop_buf: mut ref i64 = dhruva_alloc_bytes(64);
+    let drop_buf: mut ref i64 = shell_tcprtx_drop_buf_scratch_get();
     let _ = netif_recv_frame(drop_buf, 64);
 
     let _ = task_sleep_ticks((tcp_rtx_timeout_ticks() + (1 as u32)) as i64);
 
-    let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+    let scratch: mut ref i64 = shell_tcp_poll_scratch_get();
     let handshake_iter: i64 = 0;
     while (handshake_iter < 10) && ((tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established())) {
       let _ = tcp_conn_poll(my_mac, scratch, 512);
@@ -11323,7 +11451,7 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  let _ = uart_puts("unknown command (try ls/cat/catv/rm/mv/write/writev/log/attr/eval/ping/ifconfig/netstat/diagnose/fault/tcpecho/udpecho/tcprtx)\n");
+  let _ = uart_puts("unknown command (try ls/cat/catv/rm/mv/write/writev/log/attr/chmod/chown/eval/ping/ifconfig/netstat/diagnose/fault/tcpecho/udpecho/tcprtx)\n");
   return 0;
 }
 
@@ -12363,6 +12491,18 @@ fn kernel_main() -> i64 {
   let _ = dharafs_verified_digest_b_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_appendonly_check_scratch_set(dhruva_alloc_bytes(4096));
   let _ = dharafs_rename_new_path_scratch_set(dhruva_alloc_bytes(32));
+  let _ = shell_my_mac_scratch_set(dhruva_alloc_bytes(8));
+  let _ = shell_ping_dst_mac_scratch_set(dhruva_alloc_bytes(8));
+  let _ = shell_ping_payload_scratch_set(dhruva_alloc_bytes(4));
+  let _ = shell_ping_recv_payload_scratch_set(dhruva_alloc_bytes(4));
+  let _ = shell_ping_recv_meta_scratch_set(dhruva_alloc_bytes(8));
+  let _ = shell_tcpecho_payload_scratch_set(dhruva_alloc_bytes(64));
+  let _ = shell_tcp_poll_scratch_set(dhruva_alloc_bytes(512));
+  let _ = shell_tcpecho_recv_payload_scratch_set(dhruva_alloc_bytes(64));
+  let _ = shell_udpecho_payload_scratch_set(dhruva_alloc_bytes(64));
+  let _ = shell_udpecho_recv_payload_scratch_set(dhruva_alloc_bytes(64));
+  let _ = shell_udpecho_recv_meta_scratch_set(dhruva_alloc_bytes(8));
+  let _ = shell_tcprtx_drop_buf_scratch_set(dhruva_alloc_bytes(64));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));

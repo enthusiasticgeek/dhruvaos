@@ -331,6 +331,57 @@ dharafs_appendonly_check_scratch_addr:
                          * which the caller's NEW data already occupies
                          * -- aliasing the two would corrupt the very
                          * buffer being compared against. */
+shell_my_mac_scratch_addr:
+    .word 0             /* BUG FIX (found via a post-round-51 sweep for
+                         * the "dhruva_alloc_bytes on every call" bug
+                         * class, same pattern as dharafs_rename_new_
+                         * path_scratch above): ping/ifconfig/tcpecho/
+                         * udpecho/tcprtx each allocated their OWN fresh
+                         * 8-byte "my_mac" buffer via netif_get_mac() on
+                         * every single call -- every one of these is an
+                         * ordinary, repeatable shell command. Shared
+                         * across all five (same reasoning dharafs_path_
+                         * scratch already uses across cat/rm/write/mv:
+                         * shell_dispatch only ever runs one command
+                         * block per call, so there's no aliasing hazard
+                         * between mutually-exclusive command paths). */
+shell_ping_dst_mac_scratch_addr:
+    .word 0             /* 8 bytes -- ping's own resolved-destination
+                         * MAC. */
+shell_ping_payload_scratch_addr:
+    .word 0             /* 4 bytes -- ping's own outgoing ICMP payload
+                         * ("ping" as 4 literal bytes). */
+shell_ping_recv_payload_scratch_addr:
+    .word 0             /* 4 bytes -- ping's own incoming ICMP reply
+                         * payload. */
+shell_ping_recv_meta_scratch_addr:
+    .word 0             /* 8 bytes -- ping's own icmp_poll metadata
+                         * (identifier/seq). */
+shell_tcpecho_payload_scratch_addr:
+    .word 0             /* 64 bytes -- tcpecho's own outgoing text. */
+shell_tcp_poll_scratch_addr:
+    .word 0             /* 512 bytes -- the generic throwaway buffer
+                         * tcp_conn_poll needs for handshake/close
+                         * frames whose content tcpecho/tcprtx don't
+                         * care about. Shared by both commands (same
+                         * generic role, mutually exclusive execution). */
+shell_tcpecho_recv_payload_scratch_addr:
+    .word 0             /* 64 bytes -- tcpecho's own echoed-back reply
+                         * payload. */
+shell_udpecho_payload_scratch_addr:
+    .word 0             /* 64 bytes -- udpecho's own outgoing text. */
+shell_udpecho_recv_payload_scratch_addr:
+    .word 0             /* 64 bytes -- udpecho's own received datagram
+                         * payload (both the initial send's own echo
+                         * check and the actual echo-back reuse this
+                         * same buffer sequentially within one call). */
+shell_udpecho_recv_meta_scratch_addr:
+    .word 0             /* 8 bytes -- udpecho's own socket_udp_recv
+                         * metadata (src/dst port). */
+shell_tcprtx_drop_buf_scratch_addr:
+    .word 0             /* 64 bytes -- tcprtx's own deliberately-
+                         * dropped-frame buffer (the simulated packet
+                         * loss this command exists to test). */
 dharafs_rename_new_path_scratch_addr:
     .word 0             /* BUG FIX (found during a post-round-51 sweep
                          * for the exact "dhruva_alloc_bytes on every
@@ -781,6 +832,174 @@ dharafs_rename_new_path_scratch_set:
 .global dharafs_rename_new_path_scratch_get
 dharafs_rename_new_path_scratch_get:
     ldr r0, =dharafs_rename_new_path_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_my_mac_scratch_set
+shell_my_mac_scratch_set:
+    ldr r1, =shell_my_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_my_mac_scratch_get
+shell_my_mac_scratch_get:
+    ldr r0, =shell_my_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_ping_dst_mac_scratch_set
+shell_ping_dst_mac_scratch_set:
+    ldr r1, =shell_ping_dst_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_ping_dst_mac_scratch_get
+shell_ping_dst_mac_scratch_get:
+    ldr r0, =shell_ping_dst_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_ping_payload_scratch_set
+shell_ping_payload_scratch_set:
+    ldr r1, =shell_ping_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_ping_payload_scratch_get
+shell_ping_payload_scratch_get:
+    ldr r0, =shell_ping_payload_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_ping_recv_payload_scratch_set
+shell_ping_recv_payload_scratch_set:
+    ldr r1, =shell_ping_recv_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_ping_recv_payload_scratch_get
+shell_ping_recv_payload_scratch_get:
+    ldr r0, =shell_ping_recv_payload_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_ping_recv_meta_scratch_set
+shell_ping_recv_meta_scratch_set:
+    ldr r1, =shell_ping_recv_meta_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_ping_recv_meta_scratch_get
+shell_ping_recv_meta_scratch_get:
+    ldr r0, =shell_ping_recv_meta_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_tcpecho_payload_scratch_set
+shell_tcpecho_payload_scratch_set:
+    ldr r1, =shell_tcpecho_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_tcpecho_payload_scratch_get
+shell_tcpecho_payload_scratch_get:
+    ldr r0, =shell_tcpecho_payload_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_tcp_poll_scratch_set
+shell_tcp_poll_scratch_set:
+    ldr r1, =shell_tcp_poll_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_tcp_poll_scratch_get
+shell_tcp_poll_scratch_get:
+    ldr r0, =shell_tcp_poll_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_tcpecho_recv_payload_scratch_set
+shell_tcpecho_recv_payload_scratch_set:
+    ldr r1, =shell_tcpecho_recv_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_tcpecho_recv_payload_scratch_get
+shell_tcpecho_recv_payload_scratch_get:
+    ldr r0, =shell_tcpecho_recv_payload_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_udpecho_payload_scratch_set
+shell_udpecho_payload_scratch_set:
+    ldr r1, =shell_udpecho_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_udpecho_payload_scratch_get
+shell_udpecho_payload_scratch_get:
+    ldr r0, =shell_udpecho_payload_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_udpecho_recv_payload_scratch_set
+shell_udpecho_recv_payload_scratch_set:
+    ldr r1, =shell_udpecho_recv_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_udpecho_recv_payload_scratch_get
+shell_udpecho_recv_payload_scratch_get:
+    ldr r0, =shell_udpecho_recv_payload_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_udpecho_recv_meta_scratch_set
+shell_udpecho_recv_meta_scratch_set:
+    ldr r1, =shell_udpecho_recv_meta_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_udpecho_recv_meta_scratch_get
+shell_udpecho_recv_meta_scratch_get:
+    ldr r0, =shell_udpecho_recv_meta_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_tcprtx_drop_buf_scratch_set
+shell_tcprtx_drop_buf_scratch_set:
+    ldr r1, =shell_tcprtx_drop_buf_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_tcprtx_drop_buf_scratch_get
+shell_tcprtx_drop_buf_scratch_get:
+    ldr r0, =shell_tcprtx_drop_buf_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
