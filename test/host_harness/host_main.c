@@ -129,6 +129,11 @@ extern int64_t dharafs_verified_companion_scratch_set(int64_t *addr);
 extern int64_t dharafs_verified_digest_a_scratch_set(int64_t *addr);
 extern int64_t dharafs_verified_digest_b_scratch_set(int64_t *addr);
 extern int64_t dharafs_appendonly_check_scratch_set(int64_t *addr);
+extern int64_t sha256_padded_scratch_set(int64_t *addr);
+extern int64_t sha256_h_scratch_set(int64_t *addr);
+extern int64_t sha256_k_scratch_set(int64_t *addr);
+extern int64_t sha256_w_scratch_set(int64_t *addr);
+extern int64_t fn_sha256_k_init(int64_t *k);
 
 static void reset_fs(void) {
     host_virtual_disk_reset();
@@ -152,6 +157,12 @@ static void reset_fs(void) {
     dharafs_verified_digest_a_scratch_set(dhruva_alloc_bytes(32));
     dharafs_verified_digest_b_scratch_set(dhruva_alloc_bytes(32));
     dharafs_appendonly_check_scratch_set(dhruva_alloc_bytes(4096));
+    sha256_padded_scratch_set(dhruva_alloc_bytes(4168));
+    sha256_h_scratch_set(dhruva_alloc_bytes(32));
+    int64_t *k_scratch = dhruva_alloc_bytes(256);
+    sha256_k_scratch_set(k_scratch);
+    fn_sha256_k_init(k_scratch);
+    sha256_w_scratch_set(dhruva_alloc_bytes(256));
     fn_dharafs_init();
 }
 

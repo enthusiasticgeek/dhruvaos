@@ -735,23 +735,19 @@ building blocks for a diagnostics command, not a green field.
   `dharafs_read_verified_checked` + shell `writev`/`catv`. Verified
   live, 110/110 host-harness PASS including a deliberate tamper test.
 
-  **Follow-up, not yet done**: `sha256_hash` itself still allocates its
-  own internal working buffers (padded message, H/K/W tables) fresh on
-  every call via `dhruva_alloc_bytes` — fine when its only caller was a
-  once-at-boot self-test (round 41), but `writev`/`catv` call it on
-  every real use, permanently costing up to ~4.7KB of heap per call
-  (a file near `dharafs_file_max_len()`). Bounded and safely handled
-  (round 45's OOM-fatal path halts cleanly rather than corrupting
-  memory if this ever exhausts the heap), not unbounded or silent —
-  but a real limitation: not suited to high-frequency verified I/O
-  within one boot session. Fixing it means giving `sha256_hash`
-  persistent scratch internally (same treatment round 48's own
-  companion-buffer bug already got, fixed before it shipped further —
-  see `boot/scratch_state.S`'s comment on `dharafs_verified_companion_
-  scratch`/`dharafs_verified_digest_a/b_scratch`), sized to the largest
-  real caller (`dharafs_file_max_len()` = 4096 bytes) — a genuine,
-  separate small round, not bundled into 48 to keep that round's own
-  crypto-correctness re-verification scope contained.
+  **Follow-up: DONE.** `sha256_hash` now uses persistent scratch
+  internally (`sha256_padded_scratch`/`_h_scratch`/`_k_scratch`/
+  `_w_scratch`, `boot/scratch_state.S`) sized to the worst case for the
+  largest real caller (`dharafs_file_max_len()` = 4096 bytes, giving a
+  4168-byte padded-message bound derived from the padding formula, not
+  guessed) instead of a fresh `dhruva_alloc_bytes` per call. The
+  round-constant K table is also now initialized once at boot instead
+  of recomputed (identically) every call. Crypto correctness
+  re-verified carefully given the stakes: all 3 NIST/FIPS-180-4 KAT
+  vectors still pass byte-exact, the host harness's own boundary tests
+  (which already call `sha256_hash` repeatedly with varying lengths in
+  one run) still pass 189/189 under ASAN/UBSAN, and a live `writev`/
+  `catv` round trip still verifies correctly end to end.
 
 - **Append-only log convenience API** (`dharafs_log_open`/`_append`/
   `_sync`, automatic rollover across numbered files) — `[M, ~1-2

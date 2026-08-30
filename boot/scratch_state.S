@@ -382,6 +382,36 @@ shell_tcprtx_drop_buf_scratch_addr:
     .word 0             /* 64 bytes -- tcprtx's own deliberately-
                          * dropped-frame buffer (the simulated packet
                          * loss this command exists to test). */
+sha256_padded_scratch_addr:
+    .word 0             /* BUG FIX (documented follow-up from round 48,
+                         * fixed now at the user's own request): sha256_
+                         * hash allocated its own padded-message buffer
+                         * fresh via dhruva_alloc_bytes on every call --
+                         * fine when its only caller was a once-at-boot
+                         * self-test (round 41), but round 48's writev/
+                         * catv call it on every real verified write/
+                         * read. Sized to the worst case for the
+                         * largest real caller: total_len = msg_len + 1
+                         * + zero_pad + 8, zero_pad in [0,63], msg_len
+                         * capped at dharafs_file_max_len() (4096) by
+                         * every real caller upstream (dharafs_append_
+                         * raw itself rejects anything larger before it
+                         * could ever reach here) -- 4096+1+63+8 = 4168. */
+sha256_h_scratch_addr:
+    .word 0             /* 32 bytes -- the running hash state (8 u32
+                         * words). */
+sha256_k_scratch_addr:
+    .word 0             /* 256 bytes -- the 64-entry round-constant
+                         * table, IDENTICAL on every call (sha256_
+                         * k_init always writes the same 64 constants)
+                         * -- computing it fresh into a fresh buffer
+                         * every call was doubly wasteful, not just a
+                         * heap-growth bug. */
+sha256_w_scratch_addr:
+    .word 0             /* 256 bytes -- the message schedule, fully
+                         * overwritten by sha256_compress at the start
+                         * of every block, so reusing this across calls
+                         * (and across blocks within one call) is safe. */
 dharafs_rename_new_path_scratch_addr:
     .word 0             /* BUG FIX (found during a post-round-51 sweep
                          * for the exact "dhruva_alloc_bytes on every
@@ -1000,6 +1030,62 @@ shell_tcprtx_drop_buf_scratch_set:
 .global shell_tcprtx_drop_buf_scratch_get
 shell_tcprtx_drop_buf_scratch_get:
     ldr r0, =shell_tcprtx_drop_buf_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global sha256_padded_scratch_set
+sha256_padded_scratch_set:
+    ldr r1, =sha256_padded_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global sha256_padded_scratch_get
+sha256_padded_scratch_get:
+    ldr r0, =sha256_padded_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global sha256_h_scratch_set
+sha256_h_scratch_set:
+    ldr r1, =sha256_h_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global sha256_h_scratch_get
+sha256_h_scratch_get:
+    ldr r0, =sha256_h_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global sha256_k_scratch_set
+sha256_k_scratch_set:
+    ldr r1, =sha256_k_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global sha256_k_scratch_get
+sha256_k_scratch_get:
+    ldr r0, =sha256_k_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global sha256_w_scratch_set
+sha256_w_scratch_set:
+    ldr r1, =sha256_w_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global sha256_w_scratch_get
+sha256_w_scratch_get:
+    ldr r0, =sha256_w_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

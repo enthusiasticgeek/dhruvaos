@@ -109,6 +109,16 @@ extern "C" fn shell_udpecho_recv_meta_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn shell_udpecho_recv_meta_scratch_get() -> mut ref i64;
 extern "C" fn shell_tcprtx_drop_buf_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn shell_tcprtx_drop_buf_scratch_get() -> mut ref i64;
+// BUG FIX: sha256_hash's own internal working buffers -- see
+// boot/scratch_state.S's own comment on the exact worst-case sizing.
+extern "C" fn sha256_padded_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn sha256_padded_scratch_get() -> mut ref i64;
+extern "C" fn sha256_h_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn sha256_h_scratch_get() -> mut ref i64;
+extern "C" fn sha256_k_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn sha256_k_scratch_get() -> mut ref i64;
+extern "C" fn sha256_w_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn sha256_w_scratch_get() -> mut ref i64;
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn shell_line_scratch_get() -> mut ref i64;
 extern "C" fn eval_values_scratch_set(addr: mut ref i64) -> i64;
@@ -11697,7 +11707,17 @@ fn sha256_hash(msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
   }
   let total_len: i64 = with_one + zero_pad + 8;
 
-  let padded: mut ref i64 = dhruva_alloc_bytes(total_len);
+  // BUG FIX (documented follow-up from round 48, fixed now): padded/
+  // h/k/w used to be freshly dhruva_alloc_bytes'd on every single
+  // call -- fine for a once-at-boot self-test (round 41), but real
+  // repeated use (writev/catv) permanently cost ~4.7KB of heap per
+  // call. All four are now persistent scratch (boot/scratch_state.S),
+  // sized to the worst case for the largest real caller
+  // (dharafs_file_max_len() = 4096) -- see that file's own comment for
+  // the exact bound derivation. k additionally no longer needs
+  // sha256_k_init on every call at all: the round-constant table is
+  // IDENTICAL every time, so it's initialized once at boot instead.
+  let padded: mut ref i64 = sha256_padded_scratch_get();
   let i: i64 = 0;
   while i < msg_len {
     let _ = buf_write_byte(padded, i as u32, buf_read_byte(msg, i as u32));
@@ -11713,11 +11733,10 @@ fn sha256_hash(msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
   let _ = sha256_write_be32(padded, total_len - 8, 0 as u32);
   let _ = sha256_write_be32(padded, total_len - 4, bit_len as u32);
 
-  let h: mut ref i64 = dhruva_alloc_bytes(32);
+  let h: mut ref i64 = sha256_h_scratch_get();
   let _ = sha256_h_init(h);
-  let k: mut ref i64 = dhruva_alloc_bytes(256);
-  let _ = sha256_k_init(k);
-  let w: mut ref i64 = dhruva_alloc_bytes(256);
+  let k: mut ref i64 = sha256_k_scratch_get();
+  let w: mut ref i64 = sha256_w_scratch_get();
 
   let num_blocks: i64 = total_len / 64;
   let blk: i64 = 0;
@@ -12503,6 +12522,11 @@ fn kernel_main() -> i64 {
   let _ = shell_udpecho_recv_payload_scratch_set(dhruva_alloc_bytes(64));
   let _ = shell_udpecho_recv_meta_scratch_set(dhruva_alloc_bytes(8));
   let _ = shell_tcprtx_drop_buf_scratch_set(dhruva_alloc_bytes(64));
+  let _ = sha256_padded_scratch_set(dhruva_alloc_bytes(4168));
+  let _ = sha256_h_scratch_set(dhruva_alloc_bytes(32));
+  let _ = sha256_k_scratch_set(dhruva_alloc_bytes(256));
+  let _ = sha256_w_scratch_set(dhruva_alloc_bytes(256));
+  let _ = sha256_k_init(sha256_k_scratch_get());
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));

@@ -70,6 +70,7 @@ WHITELIST = [
     "dharafs_file_max_len",
     "dharafs_default_mode",
     "sha256_hash",
+    "sha256_k_init",
     "sha256_bytes_equal",
     "chacha20_encrypt",
     "chacha20_bytes_equal",

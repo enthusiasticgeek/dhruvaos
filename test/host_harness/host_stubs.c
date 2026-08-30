@@ -155,6 +155,10 @@ SCRATCH_PTR(shell_udpecho_payload_scratch)
 SCRATCH_PTR(shell_udpecho_recv_payload_scratch)
 SCRATCH_PTR(shell_udpecho_recv_meta_scratch)
 SCRATCH_PTR(shell_tcprtx_drop_buf_scratch)
+SCRATCH_PTR(sha256_padded_scratch)
+SCRATCH_PTR(sha256_h_scratch)
+SCRATCH_PTR(sha256_k_scratch)
+SCRATCH_PTR(sha256_w_scratch)
 
 /* ---- 1d. dharafs_state_* / dharafs_user_* -- real state, matching
  * boot/dharafs_state.S's semantics closely enough for host testing
