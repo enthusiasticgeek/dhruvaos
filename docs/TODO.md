@@ -863,55 +863,83 @@ ones.
   subsection adds another row to the same report rather than needing
   its own new command.
 
-- **Self-observing kernel: event counters + ring buffer**
-  (`TASK_SWITCH`/`TASK_BLOCK`/`IRQ_ENTER`/`MUTEX_ACQUIRE`/`ALLOC`/
-  `FREE`/`IO_SUBMIT`/`FS_COMMIT` etc.) — `[M, ~2 rounds]`
-  Foundation for everything else in this subsection. Counters-only
-  first (cheap, bounded memory, matches this project's own
-  never-free-heap constraint — see
-  `feedback_dhruva_never_free_heap_pattern`); a real fixed-size ring
-  buffer of recent events (for "last N seconds" queries) is a second,
-  separable increment once counters alone prove useful. Needs a
-  concrete decision on where instrumentation hooks live (scheduler
-  context-switch path, `irq_dispatch`, `dhruva_alloc_bytes`/
-  `dhruva_prio_lock`/`dharafs_block_write` are the natural sites) and
-  what the fixed overhead budget is — this project has no
-  "instrumentation must cost < X% CPU" target set yet, worth deciding
-  explicitly before writing hooks that touch every context switch.
+- **Self-observing kernel: event counters** — `[M, ~2 rounds — counters
+  DONE, round 53; ring buffer not started]`
+  `context_switch_count` (scheduler_pick_next picked a genuinely
+  DIFFERENT task — `boot/context_switch.S`), `irq_count` (every real
+  IRQ, timer + UART RX — `kernel_main.vani`'s `irq_dispatch`), and
+  `prio_lock_count` (ceiling-protected critical section entries),
+  alongside round 51's `dhruva_alloc_count`/`dharafs_commit_count`, all
+  wired into `diagnose`. These are deliberately the ONLY instrumentation
+  built so far, and deliberately chosen for a specific reason: each one
+  is real and meaningful regardless of what the running tasks actually
+  do — a context switch, an IRQ, and a ceiling-protocol entry are real
+  scheduler/interrupt EVENTS whether the tasks involved are the current
+  synthetic LOW/MEDIUM/HIGH demo or a genuine future workload. That's
+  NOT true of the items below, which is exactly why they're still
+  deferred — see each one's own note on what's specifically missing.
 
-- **Per-task runtime histograms** (p50/p90/p99/max execution time,
-  context-switch counts) — `[M, ~1-2 rounds, depends on the event
-  counters above]`
-  Buildable directly on `scheduler_get_tick_count` timestamps taken at
-  each context switch. The demo tasks (LOW/MEDIUM/HIGH) are fixed
-  hardcoded loops today with no notion of "expected" runtime, so this
-  starts as pure observation (what actually happened) before any
-  deadline/budget concept (next item) can compare against an
-  expectation.
+  Found a real bug live while building this (not caught by code
+  review): a counter increment used AAPCS callee-saved registers
+  (r4/r5) as unsaved scratch in an assembly function called from
+  vani-compiled C, silently corrupting a live compiler value. See
+  `feedback_aapcs_callee_saved_registers_asm` — worth reading before
+  touching `boot/context_switch.S`/`boot/irq_entry.S` again.
 
-- **Per-task deadline/budget model + deadline-miss reporting** —
-  `[M-L, ~2-3 rounds]`
-  Needs a real design decision this project hasn't made yet: today's
-  demo tasks have no declared period/deadline/budget at all (unlike
-  `tcp_conn`'s own unrelated retransmission deadline field, which is
-  protocol timing, not a scheduling concept). Adding
-  `task.deadline`/`task.budget` fields and comparing actual runtime
-  against them is the real prerequisite for "why-late" queries and any
-  meaningful "deadline compliance %" health metric below.
+  A fixed-size ring buffer of recent events (for "last N seconds"
+  queries, not just running totals) is a real, separable next step —
+  not started. Needs a concrete decision on retention size and
+  overhead budget (this project has no "instrumentation must cost
+  < X% CPU" target set yet) before writing it.
 
-- **Priority-inversion detection/logging** — `[M, needs a design
-  choice, not started]`
-  The scheduler already implements priority-ceiling protocol for the
-  demo mutex (`dhruva_prio_lock`/`dhruva_prio_unlock`) — which
-  *prevents* inversion by construction rather than allowing it to
-  happen and detecting it after the fact. Real choice to make: (a)
-  instrument the ceiling boundary to count/log how close a call came to
-  a real inversion (a lower-priority holder blocking a higher-priority
-  waiter, bounded by the ceiling protocol's own guarantee), or (b)
-  actually implement a priority-inheritance mutex as an alternative
-  primitive where genuine inversion can occur and be measured for real.
-  Don't start building either without deciding which model this is
-  actually demonstrating.
+- **Per-task runtime histograms + a real deadline/budget model** —
+  `[M-L, ~3-4 rounds combined, not started — genuinely blocked on a
+  real workload, not just unscoped]`
+  This is the one place in this backlog where "build the mechanism
+  now, apply it later" doesn't work: a runtime histogram or a
+  deadline-miss count is only meaningful relative to something the
+  task's OWN code actually promises. The only tasks that exist today
+  (LOW/MEDIUM/HIGH, `kernel_main.vani`) are synthetic priority-ceiling-
+  protocol demonstrations with no real timing requirement of their
+  own — assigning them an invented "budget: 2ms" to have something to
+  report against would be fabricating a number, not observing one, and
+  actively misleading (a future reader of `diagnose`'s output has no
+  way to tell a real deadline from a made-up one). **Concrete plan for
+  when a real workload exists**: add `task_set_deadline(task_id,
+  period_ticks, deadline_ticks, budget_ticks)` (a small state table,
+  same shape as `eff_prio_table`/`sleep_until_table` in
+  `boot/context_switch.S`), have `scheduler_pick_next` timestamp actual
+  runtime per task using the already-real `tick_count`, and report
+  actual-vs-declared in `diagnose` plus a running miss count. Build
+  this the round a real timing-constrained task (a genuine sensor
+  poll loop, a real network deadline, anything with an actual
+  consequence for running late) gets added to this project — not
+  before, and not against the demo tasks as a stand-in.
+
+- **Priority-inversion detection/logging** — `[not sized, not started
+  — structurally blocked, not just unscoped]`
+  This isn't merely undecided, it's currently impossible to build
+  meaningfully: the scheduler's ONLY synchronization primitive
+  (`dhruva_prio_lock`/`dhruva_prio_unlock`, priority-CEILING protocol)
+  *prevents* inversion by construction — a task boosts its own
+  priority to the ceiling before touching the shared resource, so no
+  lower-priority holder can ever be preempted by a higher-priority
+  waiter for it in the first place. There is no blocking, no wait
+  queue, and therefore no scheduling-visible signal for "detection" to
+  observe — contention under this protocol produces zero difference in
+  what a counter or a trace would show, by design. That's the
+  protocol working correctly, not a gap in the instrumentation.
+  **What would actually be needed**: a genuinely different, SECOND
+  synchronization primitive — a real blocking mutex/semaphore with an
+  actual wait queue, where a lower-priority holder really can delay a
+  higher-priority waiter and that delay is therefore observable. Only
+  worth building once a real workload needs blocking synchronization
+  that ceiling protocol doesn't already cover (ceiling protocol is the
+  right choice for any workload where every critical section's
+  priority ceiling is known statically in advance, which covers a
+  surprising amount of real embedded use — this item is genuinely
+  optional, not merely postponed, unless a future workload's own
+  locking pattern doesn't fit that shape).
 
 - **Fault injection framework** — `[M, ~1-2 rounds — allocation-failure
   half DONE, round 51; FS write latency/IRQ bursts/forced
@@ -942,20 +970,22 @@ ones.
   and reasonably assumed "halted."
 
   Also added two simple, real event counters wired into `diagnose`
-  (`dhruva_alloc_count_get`, `dharafs_commit_count_get`) — genuinely
-  useful and cheap, but NOT the full "context switches, IRQ rate,
-  mutex acquisitions" list from the original brainstorm doc, which
-  needs touching the scheduler/interrupt assembly (materially larger
-  scope, still open, see the "self-observing kernel" item above).
+  (`dhruva_alloc_count_get`, `dharafs_commit_count_get`). The rest of
+  the "context switches, IRQ rate, mutex acquisitions" list from the
+  original brainstorm doc — which needed touching the scheduler/
+  interrupt assembly directly — is now DONE too, see the "self-
+  observing kernel" item above (round 53).
 
 - **"Why is my task late?" query + determinism-certificate report** —
-  `[L, depends on the deadline model + event ring buffer above, not
-  started]`
+  `[L, not started — blocked on the deadline model AND the event ring
+  buffer above, in that order]`
   The causal-chain explanation (blocked on mutex X for Y us, preempted
-  by IRQ Z for W us) needs both the event ring buffer (to reconstruct
-  what happened) and the deadline model (to know a task WAS late) as
-  prerequisites — genuinely the most sophisticated item in this list,
-  correctly last in the brainstorm doc's own ordering.
+  by IRQ Z for W us) needs the deadline model to know a task WAS late
+  in the first place, and the event ring buffer to reconstruct WHY —
+  genuinely the most sophisticated item in this list, correctly last
+  in the brainstorm doc's own ordering, and doubly blocked since the
+  deadline model itself waits on a real workload (see its own note
+  above). Don't start this before that exists.
 
 - **Incident/flight-recorder capture on watchdog reset** — `[L, not
   started, currently blocked on a real gap]`
@@ -967,16 +997,20 @@ ones.
   a real prerequisite this item depends on, not just missing
   instrumentation around an existing reset path.
 
-- **CI-integrated real-time regression thresholds** — `[M, depends on
-  the histograms above]`
+- **CI-integrated real-time regression thresholds** — `[M, not started
+  — blocked on the histogram work above, AND on accumulating real
+  baseline data]`
   Natural fit for this project's existing `test/*.py` convention (same
   shape as `heap_stress.py`/`power_yank.py`) — run under QEMU, compare
   scheduler-latency/context-switch histograms against a checked-in
   baseline, fail on regression past a threshold. Needs the histogram
-  work above first; QEMU's own timing won't match real hardware
-  absolute numbers, so any threshold would need to be QEMU-relative
-  (regression-detection against its own prior runs), not an absolute
-  real-time guarantee claim.
+  work above first (itself gated on a real workload, see that item's
+  own note); a single session's own counters aren't a "baseline" to
+  regress against — this needs several real runs' worth of data
+  accumulated first. QEMU's own timing won't match real hardware
+  absolute numbers either, so any threshold would need to be
+  QEMU-relative (regression-detection against its own prior runs), not
+  an absolute real-time guarantee claim.
 
 - **Production vs. developer profiling levels** — `[S-M, once
   something above exists to gate]`
