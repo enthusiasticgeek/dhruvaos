@@ -38,6 +38,26 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   guarantee, not a runtime measurement or a comment-only convention.
 - **Hardware-timer-driven preemption**, not cooperative scheduling —
   a task that never yields still gets preempted by the timer tick.
+- **A real blocking mutex with priority inheritance**
+  (`dhruva_mutex_lock(mutex_id)` / `dhruva_mutex_unlock(mutex_id)`,
+  round 55) — a second, different synchronization primitive alongside
+  priority-ceiling protocol, for the case where a critical section's
+  ceiling isn't known statically in advance. Unlike ceiling protocol,
+  this genuinely blocks: a lower-priority holder really can delay a
+  higher-priority waiter, and the waiter's own priority is temporarily
+  lent to the holder for exactly as long as it holds the mutex
+  (restored on unlock) to recover from that delay. Direct ownership
+  handoff on unlock — a waiting task never re-checks anything, it
+  already owns the mutex the moment it resumes. Live-verified over
+  QEMU: `task_mutex_demo_high` genuinely blocks in
+  `dhruva_mutex_lock` while `task_mutex_demo_low` holds it (a real,
+  multi-tick gap between "requesting" and "acquired" in the UART
+  trace), and `task_mutex_demo_low`'s own effective priority reads 0
+  (boosted from its base priority 2) for the duration, provable via
+  `current_eff_prio()`. No recursion support and no nested-mutex
+  inheritance stacking (unlock always restores the full base priority
+  unconditionally) — both deliberately out of scope for the single-
+  mutex demo this needed, not oversights.
 
 **Known, current limitations (not design goals — see `TODO.md`):**
 
@@ -57,12 +77,10 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
 - **The timer tick is 500ms** — fine for this project's own demo and
   self-tests, far too coarse for most real control loops (a typical
   RTOS runs 1ms or tickless).
-- **No deadline/budget model or priority-inversion detection exist
-  yet.** The existing ceiling protocol prevents inversion rather than
-  detecting it, so there is nothing to "detect" without a genuinely
-  different, second synchronization primitive (a real blocking mutex)
-  — see `TODO.md` for why this is deliberately not built against the
-  current synthetic demo tasks.
+- **No deadline/budget model, and no contention instrumentation for
+  the new blocking mutex yet** (contention count, worst-case wait) —
+  the primitive itself exists and is live-verified (see above), but
+  measuring it is not built yet. See `TODO.md`.
 - **Networking is loopback-only.** The full ARP/IPv4/ICMP/UDP/TCP
   stack is functionally complete and self-consistent, but has never
   been driven by real off-box traffic — there is no real NIC/wireless

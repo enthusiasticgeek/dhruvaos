@@ -125,6 +125,44 @@ irq_count:
                          * incremented from kernel_main.vani's own
                          * irq_dispatch, which runs on every one. */
 
+/* Round 55: a real, second synchronization primitive (dhruva_mutex_
+ * lock/unlock, below) alongside the existing priority-CEILING protocol
+ * (dhruva_prio_lock/unlock, above) -- a genuine blocking mutex with
+ * PRIORITY INHERITANCE, where a lower-priority holder really can delay
+ * a higher-priority waiter and that delay is recovered from dynamically
+ * (unlike ceiling protocol, which prevents the delay from ever
+ * happening by construction). See dhruva_mutex_lock's own comment. */
+base_prio_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  /* each task's
+                          * TRUE, uninherited priority. Needed because
+                          * inheritance can boost a task's eff_prio_
+                          * table entry on behalf of a waiter the
+                          * boosted task never itself knows about -- so
+                          * there must be a separate place to restore
+                          * from on unlock, unlike dhruva_prio_lock/
+                          * unlock's ceiling protocol, where the caller
+                          * always already knows its own base priority
+                          * statically and passes it back explicitly.
+                          * Populated by start_multitasking for the 6
+                          * fixed tasks and by task_create for dynamic
+                          * ones, exactly mirroring eff_prio_table's own
+                          * seeding. */
+.equ MAX_MUTEXES, 4
+mutex_owner_table:
+    .word 0, 0, 0, 0    /* owning task index per mutex, or 255
+                         * ("unlocked") -- task_table_init seeds this to
+                         * 255 for all MAX_MUTEXES slots before anything
+                         * can call dhruva_mutex_lock, same sentinel
+                         * convention as eff_prio_table's free-slot
+                         * marker. */
+mutex_waiters_table:
+    .word 0, 0, 0, 0    /* one bit per task index (0-15) currently
+                         * blocked in dhruva_mutex_lock on this mutex.
+                         * .bss's own zero-init is already the correct
+                         * "nobody waiting" default -- no seeding
+                         * needed, unlike mutex_owner_table's 255
+                         * sentinel. */
+
 .section ".text"
 
 /* Shared "who runs next" policy: the lowest eff_prio_table value among
@@ -327,6 +365,211 @@ dhruva_prio_unlock:
     str r0, [r2, r3, lsl #2]
     mov r0, #0
     mov r1, #0
+    bx lr
+
+/* u32 current_eff_prio() -- reads eff_prio_table[current_task]. Lets a
+ * task observe its OWN effective priority live (e.g. to prove a
+ * dhruva_mutex_lock inheritance boost actually happened), without
+ * needing to know its own task index. Only touches r0/r1 (caller-
+ * saved) -- no push/pop needed. */
+.global current_eff_prio
+current_eff_prio:
+    ldr r0, =current_task
+    ldr r0, [r0]
+    ldr r1, =eff_prio_table
+    ldr r0, [r1, r0, lsl #2]
+    bx lr
+
+/* u32 dhruva_mutex_lock(u32 mutex_id)
+ * Round 55: a real, SECOND synchronization primitive alongside the
+ * priority-CEILING protocol above (dhruva_prio_lock/unlock). Ceiling
+ * protocol prevents inversion by construction (no blocking, no wait
+ * queue -- see this file's header comment). This is the opposite shape
+ * on purpose: a genuine wait queue where a lower-priority holder really
+ * CAN delay a higher-priority waiter, with PRIORITY INHERITANCE
+ * (dynamic, not a static ceiling) recovering from that delay -- the
+ * waiter's own priority is temporarily lent to the holder for exactly
+ * as long as it holds the mutex, restored by dhruva_mutex_unlock.
+ * Ceiling protocol remains the right tool whenever every critical
+ * section's ceiling is known statically in advance; this is for the
+ * case where it isn't.
+ *
+ * Direct ownership handoff, not "wake and re-race": dhruva_mutex_unlock
+ * (below) picks exactly one waiter and publishes ownership to it BEFORE
+ * marking it ready, under the same IRQ-masked section as its own scan
+ * -- so a task resuming from the blocked path below never re-checks
+ * anything, it already owns the mutex the moment it runs again.
+ *
+ * Out of scope (both genuinely unneeded for this round's own demo, not
+ * oversights): recursion (locking a mutex you already hold deadlocks
+ * against yourself) and nested-mutex inheritance stacking (unlock
+ * restores the FULL base priority unconditionally, not "the next-
+ * highest ceiling still held").
+ *
+ * Register discipline -- this function has TWO differently-shaped
+ * exits: a normal `bx lr` return (mutex was free) and a full context
+ * switch away, resuming the caller much later via a saved frame (mutex
+ * contended) -- same two-shaped-exit pattern as task_sleep_ticks. The
+ * fast path only ever touches r0-r3 (caller-saved -- round 53's AAPCS
+ * lesson about r4-r11 doesn't apply to a path that never uses them).
+ * The blocked path saves the FULL r0-r12+lr context (same frame shape
+ * as task_sleep_ticks) as literally its first action, before touching
+ * r4-r11 as scratch -- whatever the ORIGINAL caller had in them is
+ * already safely captured in the frame, and gets restored verbatim
+ * whenever this task is eventually resumed, so no separate push/pop is
+ * needed for that path either. The one subtlety a plain copy of
+ * task_sleep_ticks wouldn't have: dhruva_mutex_lock has a real return
+ * VALUE (0 = success), unlike void task_sleep_ticks, so the frame's
+ * saved r0 slot is patched to 0 right after the save -- otherwise a
+ * resumed caller would see r0 = the original mutex_id argument instead
+ * of the return code. */
+.global dhruva_mutex_lock
+dhruva_mutex_lock:
+    mrs r1, cpsr
+    cpsid i
+
+    ldr r2, =mutex_owner_table
+    ldr r3, [r2, r0, lsl #2]
+    cmp r3, #255
+    bne dml_contended
+
+    ldr r3, =current_task
+    ldr r3, [r3]
+    str r3, [r2, r0, lsl #2]        /* owner = current_task */
+    msr cpsr_c, r1
+    mov r0, #0
+    bx lr
+
+dml_contended:
+    /* r0 = mutex_id, r3 = owner task index (both still live from
+     * above). Full context save FIRST -- see this function's own
+     * header comment. */
+    stmdb sp!, {r0-r12, lr}
+    mov r4, #0x13
+    mov r5, #0
+    stmdb sp!, {r4, r5}              /* spsr=0x13 (SVC, IRQs enabled on
+                                       * restore), pad */
+    mov r4, sp                       /* r4 = frame base */
+    mov r5, #0
+    str r5, [r4, #8]                 /* patch saved r0 -> 0 (this call's
+                                       * eventual return value once
+                                       * resumed, not the mutex_id arg
+                                       * still live in the r0 register
+                                       * below) */
+
+    ldr r5, =current_task
+    ldr r5, [r5]                     /* r5 = current_task index */
+    ldr r6, =sp_table
+    str r4, [r6, r5, lsl #2]         /* sp_table[current] = our frame */
+
+    /* Priority inheritance: only ever boosts, never lowers (a second,
+     * lower-priority waiter arriving after an earlier boost must not
+     * undo it). */
+    ldr r7, =eff_prio_table
+    ldr r8, [r7, r5, lsl #2]         /* current's own eff_prio */
+    ldr r9, [r7, r3, lsl #2]         /* owner's (r3) current eff_prio */
+    cmp r8, r9
+    strlt r8, [r7, r3, lsl #2]
+
+    /* Register as a waiter on mutex r0. */
+    ldr r7, =mutex_waiters_table
+    mov r9, #1
+    lsl r9, r9, r5
+    ldr r8, [r7, r0, lsl #2]
+    orr r8, r8, r9
+    str r8, [r7, r0, lsl #2]
+
+    /* Block: never ready via the ordinary tick comparison until
+     * dhruva_mutex_unlock explicitly hands this task ownership. */
+    ldr r7, =sleep_until_table
+    ldr r8, =0x7FFFFFFF
+    str r8, [r7, r5, lsl #2]
+
+    bl scheduler_pick_next            /* IRQs stay masked straight
+                                        * through the switch -- the
+                                        * resumed frame's own spsr=0x13
+                                        * re-enables them, same as
+                                        * scheduler_switch_from_irq's
+                                        * own tail-call, which never
+                                        * explicitly re-enables either */
+    mov sp, r0
+    ldmia sp!, {r0, r1}
+    msr spsr_cxsf, r0
+    ldmia sp!, {r0-r12, lr}
+    subs pc, lr, #0
+
+/* u32 dhruva_mutex_unlock(u32 mutex_id)
+ * Always returns normally (never suspends the caller) -- push/pop
+ * r4-r9 around the whole body per AAPCS (round 53's lesson: called
+ * directly from vani-compiled C, r4-r11 are callee-saved). */
+.global dhruva_mutex_unlock
+dhruva_mutex_unlock:
+    stmdb sp!, {r4-r9, lr}
+    mrs r1, cpsr
+    cpsid i
+
+    ldr r4, =current_task
+    ldr r4, [r4]                     /* r4 = current_task (outgoing owner) */
+
+    /* Restore the outgoing owner's own true priority unconditionally
+     * -- undoes any inheritance boost. No nested-mutex stacking (see
+     * dhruva_mutex_lock's own header comment). */
+    ldr r5, =base_prio_table
+    ldr r6, [r5, r4, lsl #2]
+    ldr r5, =eff_prio_table
+    str r6, [r5, r4, lsl #2]
+
+    ldr r2, =mutex_waiters_table
+    ldr r3, [r2, r0, lsl #2]
+    cmp r3, #0
+    bne dmu_has_waiters
+
+    ldr r5, =mutex_owner_table
+    mov r6, #255
+    str r6, [r5, r0, lsl #2]         /* owner = unlocked */
+    b dmu_done
+
+dmu_has_waiters:
+    /* Find the waiting task with the lowest (most urgent) BASE
+     * priority among the set bits -- a blocked waiter's own eff_prio
+     * entry is never itself boosted (only the OWNER's is, by whoever
+     * is waiting on it), so base_prio and eff_prio agree for every
+     * waiter; base_prio is used here purely for symmetry with the
+     * restore above, not because it differs in practice. */
+    ldr r5, =base_prio_table
+    mov r6, #255                     /* best prio so far */
+    mvn r7, #0                       /* best task index so far (0xFFFFFFFF) */
+    mov r8, #0
+dmu_scan:
+    cmp r8, #16
+    bge dmu_scan_done
+    mov r9, #1
+    lsl r9, r9, r8
+    tst r3, r9
+    beq dmu_scan_next
+    ldr r9, [r5, r8, lsl #2]
+    cmp r9, r6
+    movlt r6, r9
+    movlt r7, r8
+dmu_scan_next:
+    add r8, r8, #1
+    b dmu_scan
+dmu_scan_done:
+    mov r9, #1
+    lsl r9, r9, r7
+    bic r3, r3, r9
+    str r3, [r2, r0, lsl #2]         /* clear winner's waiter bit */
+
+    ldr r5, =mutex_owner_table
+    str r7, [r5, r0, lsl #2]         /* owner = winner */
+    ldr r5, =sleep_until_table
+    mov r9, #0
+    str r9, [r5, r7, lsl #2]         /* winner ready immediately */
+
+dmu_done:
+    msr cpsr_c, r1
+    mov r0, #0
+    ldmia sp!, {r4-r9, lr}
     bx lr
 
 /* Phase 5 task #1 -- i64 cpu_wfi(): halts instruction fetch until ANY
@@ -693,6 +936,17 @@ ttinit_loop:
     add r2, r2, #1
     b ttinit_loop
 ttinit_done:
+    // Round 55: also seed mutex_owner_table's MAX_MUTEXES slots to the
+    // same 255 "unlocked" sentinel -- r1 still holds 255 from above.
+    ldr r0, =mutex_owner_table
+    mov r2, #0
+ttinit_mutex_loop:
+    cmp r2, #MAX_MUTEXES
+    bge ttinit_mutex_done
+    str r1, [r0, r2, lsl #2]
+    add r2, r2, #1
+    b ttinit_mutex_loop
+ttinit_mutex_done:
     bx lr
 
 /* u32 task_create(fn() -> i64 entry_fn, mut ref i64 stack_base,
@@ -751,6 +1005,12 @@ tc_found_slot:
     ldr r1, =sp_table
     str r0, [r1, r9, lsl #2]
     ldr r1, =eff_prio_table
+    str r7, [r1, r9, lsl #2]
+    ldr r1, =base_prio_table   /* Round 55: mirror eff_prio_table's own
+                                * store exactly -- this is the task's
+                                * TRUE priority, restored by dhruva_
+                                * mutex_unlock after any inheritance
+                                * boost */
     str r7, [r1, r9, lsl #2]
     ldr r1, =sleep_until_table
     mov r2, #0
@@ -818,6 +1078,23 @@ start_multitasking:
     mov r7, #4
     str r7, [r6, #12]        /* task 3 (IDLE) priority 4 -- worst,
                                * as always */
+
+    // Round 55: mirror the exact same 6 stores into base_prio_table --
+    // each fixed task's TRUE priority, restored by dhruva_mutex_unlock
+    // after any inheritance boost (eff_prio_table's own value can be
+    // temporarily boosted; base_prio_table's never is).
+    ldr r6, =base_prio_table
+    mov r7, #0
+    str r7, [r6, #0]
+    mov r7, #1
+    str r7, [r6, #4]
+    mov r7, #2
+    str r7, [r6, #8]
+    mov r7, #3
+    str r7, [r6, #16]
+    str r7, [r6, #20]
+    mov r7, #4
+    str r7, [r6, #12]
 
     // Round 54: indices 6-15 (task_create's free slots) are NOT
     // touched here -- task_table_init() (see its own comment above)

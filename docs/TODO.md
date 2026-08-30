@@ -1076,20 +1076,26 @@ support of any kind.
   unchanged against the generalized table — this is core scheduler
   surgery, treat with the same care as round 53's own register bug.
 
-- **Real priority-inversion detection (a genuine blocking primitive)**
-  — `[M-L, ~2-3 rounds]`
-  Per the earlier analysis: the existing ceiling protocol prevents
-  inversion by construction, so there's nothing to detect from it. A
-  real blocking mutex/semaphore (an actual wait queue a lower-priority
-  holder can genuinely delay a higher-priority waiter behind) is a
-  second, different primitive alongside ceiling protocol, not a
-  replacement for it — ceiling protocol remains the right tool
-  whenever every critical section's ceiling is known statically.
-  Needs its own design: a mutex table (owner task, wait bitmask),
-  scheduler changes so a blocked task's effective priority can be
-  inherited from whoever it's waiting on, and instrumentation
-  (contention count, worst-case wait) once real blocking exists to
-  measure.
+- **Real priority-inversion primitive (blocking mutex + inheritance)**
+  — `[DONE, round 55, 2026-08-29]`
+  `dhruva_mutex_lock`/`dhruva_mutex_unlock` (`boot/context_switch.S`) —
+  a genuine wait queue (mutex_owner_table + mutex_waiters_table) where
+  a lower-priority holder really can delay a higher-priority waiter,
+  with dynamic priority inheritance (base_prio_table added alongside
+  eff_prio_table) recovering from that delay. Direct ownership handoff
+  on unlock, no spurious-wake re-check needed. Live-verified over QEMU
+  with a deterministic (not timing-coincidence) contention demo:
+  `task_mutex_demo_low` holds the mutex across a `task_sleep_ticks(5)`
+  call while `task_mutex_demo_high` polls every 2 ticks — by the
+  pigeonhole principle (2 < 5) contention is guaranteed every cycle,
+  not probabilistic. UART trace shows a real multi-tick gap between
+  "requesting" and "acquired", and `current_eff_prio()` proves the
+  holder's priority genuinely reads 0 (boosted from base 2) for the
+  duration. No recursion support, no nested-mutex inheritance stacking
+  — both deliberately out of scope for the single-mutex demo needed
+  here. **Remaining, not done**: contention-count/worst-case-wait
+  instrumentation now that real blocking exists to measure — small,
+  not yet scoped into its own round.
 
 - **Wired NIC driver: SMSC LAN9512 over USB** — `[M-L, ~3-4 rounds]`
   The most tractable of the three driver asks. LAN9512 is the actual

@@ -175,6 +175,18 @@ extern "C" fn task_create(entry_fn: fn() -> i64, stack_base: mut ref i64, stack_
 // Must be called exactly once, before the first task_create() call and
 // before start_multitasking -- see its own comment in context_switch.S.
 extern "C" fn task_table_init() -> i64;
+// Round 55: a real, second synchronization primitive alongside the
+// existing priority-CEILING protocol (dhruva_prio_lock/unlock, below) --
+// a genuine blocking mutex with priority inheritance. See
+// dhruva_mutex_lock's own comment in context_switch.S for the full
+// design (direct ownership handoff, no recursion, no nested-mutex
+// inheritance stacking -- all deliberate scope limits, not oversights).
+extern "C" fn dhruva_mutex_lock(mutex_id: u32) -> u32;
+extern "C" fn dhruva_mutex_unlock(mutex_id: u32) -> u32;
+// Reads eff_prio_table[current_task] -- lets a task observe its own
+// effective priority live, e.g. to prove a dhruva_mutex_lock inheritance
+// boost actually happened.
+extern "C" fn current_eff_prio() -> u32;
 // task_a=HIGH(priority 0), task_b=MEDIUM(priority 1), task_c=LOW(priority 2),
 // task_d=IDLE(priority 3, always ready, never sleeps) -- the standard
 // RTOS answer to "what runs when nothing else is," and load-bearing
@@ -11669,6 +11681,62 @@ fn task_custom_demo() -> i64 {
   return 0;
 }
 
+// Round 55's own live demonstration of dhruva_mutex_lock/unlock: two
+// more dynamically-created tasks (task_create again), sharing demo
+// mutex 0. task_mutex_demo_high runs at priority 0 (same band as the
+// real HIGH task) and genuinely BLOCKS in dhruva_mutex_lock whenever
+// task_mutex_demo_low (priority 2, same band as real LOW) already
+// holds it -- proven live by the UART trace showing a real gap between
+// "requesting" and "acquired", not an immediate acquire.
+//
+// Deterministic contention, not a timing coincidence: task_mutex_demo_
+// low holds the mutex ACROSS a task_sleep_ticks(5) call (simulating a
+// slow operation performed while holding the lock -- the mutex stays
+// "owned" the whole time it's asleep, exactly like a real blocking I/O
+// call made under a lock). task_mutex_demo_high requests the mutex
+// every 2 ticks. Since 2 < 5, by the pigeonhole principle at least one
+// of HIGH's periodic 2-tick-spaced attempts is GUARANTEED to land
+// inside any 5-tick hold window, regardless of phase -- so this isn't
+// probabilistic, it reproduces every single cycle. Without priority
+// inheritance, this is exactly classic priority inversion (a priority-2
+// holder delaying a priority-0 waiter for the full 5-tick hold). With
+// it, task_mutex_demo_low's own eff_prio genuinely reads 0 (via
+// current_eff_prio(), printed live right after waking, before release)
+// whenever HIGH did contend during the hold -- provable, not just
+// asserted.
+#[no_mangle]
+#[bounded_stack(bytes=512)]
+fn task_mutex_demo_low() -> i64 {
+  while true {
+    let _ = task_sleep_ticks(2);
+    let _ = uart_puts("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
+    let _ = dhruva_mutex_lock(0 as u32);
+    let _ = uart_puts("MUTEX-LOW: holding demo mutex, now sleeping 5 ticks while still holding it\n");
+    let _ = task_sleep_ticks(5);
+    let boosted: u32 = current_eff_prio();
+    let _ = uart_puts("MUTEX-LOW: woke up still holding demo mutex, eff_prio now=");
+    let _ = uart_put_i64(boosted as i64);
+    let _ = uart_puts("\n");
+    let _ = uart_puts("MUTEX-LOW: releasing demo mutex\n");
+    let _ = dhruva_mutex_unlock(0 as u32);
+  }
+  return 0;
+}
+
+#[no_mangle]
+#[bounded_stack(bytes=512)]
+fn task_mutex_demo_high() -> i64 {
+  while true {
+    let _ = task_sleep_ticks(2);
+    let _ = uart_puts("MUTEX-HIGH: requesting demo mutex\n");
+    let _ = dhruva_mutex_lock(0 as u32);
+    let _ = uart_puts("MUTEX-HIGH: acquired demo mutex\n");
+    let _ = dhruva_mutex_unlock(0 as u32);
+    let _ = uart_puts("MUTEX-HIGH: released demo mutex\n");
+  }
+  return 0;
+}
+
 // Round 41: SHA-256 (FIPS 180-4), the crypto-primitives-foundation
 // security-roadmap item's hash function half (see docs/TODO.md).
 // Chosen over any table-driven cipher for the same reason ChaCha20 (a
@@ -13023,6 +13091,23 @@ fn kernel_main() -> i64 {
   let custom_task_id: u32 = task_create(task_custom_demo, custom_stack, custom_stack_bytes, 3 as u32);
   let _ = uart_puts("task_create: new task id=");
   let _ = uart_put_i64(custom_task_id as i64);
+  let _ = uart_puts("\n");
+
+  // Round 55: live demonstration of the new dhruva_mutex_lock/unlock
+  // blocking-mutex-with-inheritance primitive (see its own comment in
+  // context_switch.S, and task_mutex_demo_low/high's own comment
+  // above). Two more dynamically-created tasks, same one-time-
+  // allocation-per-task-stack pattern as task_custom_demo above.
+  let mutex_low_stack_bytes: u32 = 512 as u32;
+  let mutex_low_stack: mut ref i64 = dhruva_alloc_bytes(mutex_low_stack_bytes as i64);
+  let mutex_low_task_id: u32 = task_create(task_mutex_demo_low, mutex_low_stack, mutex_low_stack_bytes, 2 as u32);
+  let mutex_high_stack_bytes: u32 = 512 as u32;
+  let mutex_high_stack: mut ref i64 = dhruva_alloc_bytes(mutex_high_stack_bytes as i64);
+  let mutex_high_task_id: u32 = task_create(task_mutex_demo_high, mutex_high_stack, mutex_high_stack_bytes, 0 as u32);
+  let _ = uart_puts("task_create: mutex demo task ids=");
+  let _ = uart_put_i64(mutex_low_task_id as i64);
+  let _ = uart_puts(",");
+  let _ = uart_put_i64(mutex_high_task_id as i64);
   let _ = uart_puts("\n");
 
   let _ = uart_puts("PASS\n");
