@@ -119,6 +119,26 @@ extern "C" fn sha256_k_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn sha256_k_scratch_get() -> mut ref i64;
 extern "C" fn sha256_w_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn sha256_w_scratch_get() -> mut ref i64;
+// Real authentication: HMAC-SHA256/PBKDF2-HMAC-SHA256 state + the
+// user credential table -- see boot/auth_state.S's own file comment.
+extern "C" fn auth_table_init() -> i64;
+extern "C" fn auth_get_uid(index: u32) -> u32;
+extern "C" fn auth_set_uid(index: u32, uid: u32) -> i64;
+extern "C" fn auth_salt_ptr(index: u32) -> mut ref i64;
+extern "C" fn auth_hash_ptr(index: u32) -> mut ref i64;
+extern "C" fn auth_get_fail_count(index: u32) -> u32;
+extern "C" fn auth_set_fail_count(index: u32, count: u32) -> i64;
+extern "C" fn auth_get_lockout_until(index: u32) -> u32;
+extern "C" fn auth_set_lockout_until(index: u32, tick: u32) -> i64;
+extern "C" fn auth_salt_nonce_next() -> u32;
+extern "C" fn hmac_key_block_ptr() -> mut ref i64;
+extern "C" fn hmac_msg_scratch_ptr() -> mut ref i64;
+extern "C" fn hmac_inner_hash_ptr() -> mut ref i64;
+extern "C" fn pbkdf2_u_ptr() -> mut ref i64;
+extern "C" fn pbkdf2_t_ptr() -> mut ref i64;
+extern "C" fn pbkdf2_salt_ctr_ptr() -> mut ref i64;
+extern "C" fn passwd_scratch_ptr() -> mut ref i64;
+extern "C" fn su_hash_scratch_ptr() -> mut ref i64;
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn shell_line_scratch_get() -> mut ref i64;
 extern "C" fn eval_values_scratch_set(addr: mut ref i64) -> i64;
@@ -12297,6 +12317,184 @@ fn shell_dispatch_fw(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 
   return 0;
 }
 
+// Real authentication: switch the active user/group context (round 42
+// behavior), now gated by a real password check whenever the target
+// uid has EVER had one set via `passwd` below -- see this function's
+// own call site in shell_dispatch for the full design rationale
+// (opt-in per-account protection, not a full boot-time login flow).
+// Factored into its own function for the same reason
+// shell_dispatch_fw was: task_f's own #[bounded_stack] budget is
+// shared with a pre-existing, unrelated deep call chain
+// (dharafs_rename_raw_checked -> ... -> dwc2_base), and this
+// function's own local bindings inlined directly into shell_dispatch
+// pushed that chain's worst case over budget.
+fn shell_dispatch_su(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  if cmd_end >= line_len {
+    let _ = uart_puts("usage: su <uid> <gid> [password]\n");
+    return 0;
+  }
+  let uid_start: i64 = cmd_end + 1;
+  let uid_end: i64 = shell_find_space(line_buf, uid_start, line_len);
+  if uid_end >= line_len {
+    let _ = uart_puts("usage: su <uid> <gid> [password]\n");
+    return 0;
+  }
+  let gid_start: i64 = uid_end + 1;
+  let gid_end: i64 = shell_find_space(line_buf, gid_start, line_len);
+  let uid: i64 = shell_parse_decimal(line_buf, uid_start, uid_end);
+  let gid: i64 = shell_parse_decimal(line_buf, gid_start, gid_end);
+  if (uid < 0) || (gid < 0) {
+    let _ = uart_puts("usage: su <uid> <gid> [password] (uid/gid non-negative integers)\n");
+    return 0;
+  }
+
+  let slot: i64 = auth_find_slot(uid as u32);
+  if slot >= (0 as i64) {
+    let now: u32 = scheduler_get_tick_count();
+    let lockout: u32 = auth_get_lockout_until(slot as u32);
+    if now < lockout {
+      let _ = uart_puts("su: account locked, try again later\n");
+      return 0;
+    }
+    if gid_end >= line_len {
+      let _ = uart_puts("su: password required\n");
+      return 0;
+    }
+    let pw_start: i64 = gid_end + 1;
+    let pw_end: i64 = shell_find_space(line_buf, pw_start, line_len);
+    let pw_len: i64 = pw_end - pw_start;
+    if pw_len == 0 {
+      let _ = uart_puts("su: password required\n");
+      return 0;
+    }
+    let pw_buf: mut ref i64 = passwd_scratch_ptr();
+    let _ = shell_copy_range(line_buf, pw_start, pw_end, pw_buf);
+
+    let salt_ptr: mut ref i64 = auth_salt_ptr(slot as u32);
+    let computed: mut ref i64 = su_hash_scratch_ptr();
+    // See pbkdf2_auth_iterations's own comment for why this is only
+    // 200 iterations -- a real, separate, not-yet-root-caused bug
+    // (not a deliberate security/usability tradeoff) currently caps
+    // how much synchronous computation task_f can run to completion
+    // here. (A priority-ceiling boost around this call was tried and
+    // measured NOT to reliably fix it -- the same stall reproduced
+    // either way -- so it was removed rather than left in as a
+    // false sense of mitigation.)
+    let _ = pbkdf2_hmac_sha256(pw_buf, pw_len, salt_ptr, 16, pbkdf2_auth_iterations(), computed);
+    let stored: mut ref i64 = auth_hash_ptr(slot as u32);
+    if hmac_sha256_bytes_equal(computed, stored, 32) == 0 {
+      let fails: u32 = auth_get_fail_count(slot as u32) + (1 as u32);
+      let _ = auth_set_fail_count(slot as u32, fails);
+      if fails >= auth_max_fail_attempts() {
+        let _ = auth_set_lockout_until(slot as u32, now + auth_lockout_ticks());
+        let _ = uart_puts("su: authentication failed, account locked\n");
+      } else {
+        let _ = uart_puts("su: authentication failed\n");
+      }
+      return 0;
+    }
+    let _ = auth_set_fail_count(slot as u32, 0 as u32);
+  }
+
+  let _ = dharafs_user_set(uid as u32, gid as u32);
+  let _ = uart_puts("ok\n");
+  return 0;
+}
+
+// Real authentication: set (or change) a uid's password. Only root
+// or the uid itself may do this -- a non-root, non-self caller gets
+// a plain permission-denied, matching this shell's existing
+// enforcement style elsewhere. The password is the single word
+// immediately after uid (no embedded spaces -- a real, accepted MVP
+// limitation, not a silent gap: see docs/TODO.md's own note on why
+// a full multi-turn "Enter password:" prompt was deliberately not
+// built this round). Never stores the password itself -- only a
+// fresh random-ish salt (see auth_salt_nonce_next's own comment on
+// why this project has no real RNG) and its PBKDF2-HMAC-SHA256
+// output. Factored into its own function for the same
+// #[bounded_stack] reason as shell_dispatch_su above.
+fn shell_dispatch_passwd(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  if cmd_end >= line_len {
+    let _ = uart_puts("usage: passwd <uid> <new_password>\n");
+    return 0;
+  }
+  let uid_start: i64 = cmd_end + 1;
+  let uid_end: i64 = shell_find_space(line_buf, uid_start, line_len);
+  if uid_end >= line_len {
+    let _ = uart_puts("usage: passwd <uid> <new_password>\n");
+    return 0;
+  }
+  let uid: i64 = shell_parse_decimal(line_buf, uid_start, uid_end);
+  if uid < 0 {
+    let _ = uart_puts("usage: passwd <uid> <new_password> (uid a non-negative integer)\n");
+    return 0;
+  }
+
+  let caller_uid: u32 = dharafs_user_get_uid();
+  if (caller_uid != (0 as u32)) && (caller_uid != (uid as u32)) {
+    let _ = uart_puts("passwd: permission denied\n");
+    return 0;
+  }
+
+  let pw_start: i64 = uid_end + 1;
+  let pw_end: i64 = shell_find_space(line_buf, pw_start, line_len);
+  let pw_len: i64 = pw_end - pw_start;
+  if pw_len == 0 {
+    let _ = uart_puts("usage: passwd <uid> <new_password>\n");
+    return 0;
+  }
+  if pw_len > 64 {
+    let _ = uart_puts("passwd: password too long (max 64 bytes)\n");
+    return 0;
+  }
+  let pw_buf: mut ref i64 = passwd_scratch_ptr();
+  let _ = shell_copy_range(line_buf, pw_start, pw_end, pw_buf);
+
+  if auth_is_weak_password(pw_buf, pw_len) == 1 {
+    let _ = uart_puts("passwd: password too weak (min 8 characters, not a common password)\n");
+    return 0;
+  }
+
+  let slot: i64 = auth_find_slot(uid as u32);
+  if slot < (0 as i64) {
+    slot = auth_find_free_slot();
+    if slot < (0 as i64) {
+      let _ = uart_puts("passwd: user table full\n");
+      return 0;
+    }
+    let _ = auth_set_uid(slot as u32, uid as u32);
+  }
+
+  // Salt only needs to be UNIQUE, not secret -- this project has no
+  // real randomness source anywhere (same honest limitation the DHCP
+  // client's own xid already documents). auth_salt_nonce_next()
+  // guarantees uniqueness across passwd calls even within the same
+  // tick; mixing in tick_count and uid gives every slot's salt a
+  // genuinely different value even if the nonce counter were ever
+  // reset, without claiming this is cryptographically secure
+  // randomness -- it explicitly is not.
+  let salt_ptr: mut ref i64 = auth_salt_ptr(slot as u32);
+  let nonce: u32 = auth_salt_nonce_next();
+  let tick: u32 = scheduler_get_tick_count();
+  let _ = buf_write_u32_be(salt_ptr, 0, nonce);
+  let _ = buf_write_u32_be(salt_ptr, 4, tick);
+  let _ = buf_write_u32_be(salt_ptr, 8, uid as u32);
+  let _ = buf_write_u32_be(salt_ptr, 12, nonce ^ tick);
+
+  let hash_ptr: mut ref i64 = auth_hash_ptr(slot as u32);
+  // See pbkdf2_auth_iterations's own comment for why this is only 200
+  // iterations -- a real, separate, not-yet-root-caused bug (not a
+  // deliberate security/usability tradeoff) currently caps how much
+  // synchronous computation task_f can run to completion here.
+  let _ = pbkdf2_hmac_sha256(pw_buf, pw_len, salt_ptr, 16, pbkdf2_auth_iterations(), hash_ptr);
+
+  let _ = auth_set_fail_count(slot as u32, 0 as u32);
+  let _ = auth_set_lockout_until(slot as u32, 0 as u32);
+
+  let _ = uart_puts("ok\n");
+  return 0;
+}
+
 // Parses and runs exactly one already-complete shell line. Deliberately
 // NOT #[no_heap] (same reasoning as task_e's GC pass above): every
 // scratch buffer here is a fresh dhruva_alloc_bytes, and this task can
@@ -12712,28 +12910,24 @@ fn shell_dispatch() -> i64 {
   // as someone other than root -- the only way to exercise real
   // enforcement from the live shell rather than just self-tests,
   // since there's no login flow to arrive as a non-root user through.
+  //
+  // Real authentication (added same round as passwd below): if the
+  // target uid has EVER had a password set via `passwd`, su now
+  // genuinely requires it -- checked against the stored PBKDF2-
+  // HMAC-SHA256 hash, with 3-strike per-account rate limiting. A uid
+  // that has NEVER had a password configured keeps today's original
+  // unconditional behavior unchanged -- an explicit, honest "opt-in
+  // protection per-account" design (see docs/TODO.md's own fork #1:
+  // gating su only, not a full boot-time login flow), not a silent
+  // behavior change that would break every self-test/script relying
+  // on su working with zero setup.
   if shell_word_matches(line_buf, 0, cmd_end, "su") == 1 {
-    if cmd_end >= line_len {
-      let _ = uart_puts("usage: su <uid> <gid>\n");
-      return 0;
-    }
-    let uid_start: i64 = cmd_end + 1;
-    let uid_end: i64 = shell_find_space(line_buf, uid_start, line_len);
-    if uid_end >= line_len {
-      let _ = uart_puts("usage: su <uid> <gid>\n");
-      return 0;
-    }
-    let gid_start: i64 = uid_end + 1;
-    let gid_end: i64 = shell_find_space(line_buf, gid_start, line_len);
-    let uid: i64 = shell_parse_decimal(line_buf, uid_start, uid_end);
-    let gid: i64 = shell_parse_decimal(line_buf, gid_start, gid_end);
-    if (uid < 0) || (gid < 0) {
-      let _ = uart_puts("usage: su <uid> <gid> (both non-negative integers)\n");
-      return 0;
-    }
-    let _ = dharafs_user_set(uid as u32, gid as u32);
-    let _ = uart_puts("ok\n");
-    return 0;
+    return shell_dispatch_su(line_buf, cmd_end, line_len);
+  }
+
+  // Real authentication: set (or change) a uid's password.
+  if shell_word_matches(line_buf, 0, cmd_end, "passwd") == 1 {
+    return shell_dispatch_passwd(line_buf, cmd_end, line_len);
   }
 
   // Round 42: change an existing file's permission bits. Mode is a
@@ -14118,6 +14312,367 @@ fn sha256_self_test() -> i64 {
   return 0;
 }
 
+// Reads `byte_count` bytes' worth of hex-ASCII pairs (2 chars per
+// byte, no separators) out of `hex` and writes the decoded bytes into
+// `dst` -- lets a known-answer test vector be written as one compact
+// string literal (vani string literals are valid `mut ref i64` byte
+// buffers, same as every `shell_word_matches(line_buf, ..., "ping")`
+// call already relies on) instead of one buf_write_byte call per byte
+// the way sha256_self_test's own vectors above were written before
+// this helper existed -- not retrofitted onto those to avoid
+// unrelated churn, but used for every KAT this round adds.
+fn write_hex_string(dst: mut ref i64, hex: Str, byte_count: i64) -> i64 {
+  let i: i64 = 0;
+  while i < byte_count {
+    let hi: u32 = hex_ascii_to_nibble(str_byte_at(hex, i * 2) as u32);
+    let lo: u32 = hex_ascii_to_nibble(str_byte_at(hex, (i * 2) + 1) as u32);
+    let _ = buf_write_byte(dst, i as u32, (hi << (4 as u32)) | lo);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Same "Str literal -> real mut ref i64 byte buffer" copy every
+// dharafs_append/_write path call already does for path/data
+// arguments -- needed here so plain string literals ("password",
+// "Hi There", ...) can be handed to hmac_sha256/pbkdf2_hmac_sha256,
+// which (like every other real crypto/network primitive in this
+// codebase) operate on raw buffers, not the Str type shell-parsing
+// code uses.
+fn str_copy_to_buf(s: Str, out: mut ref i64) -> i64 {
+  let n: i64 = str_len_bytes(s);
+  let i: i64 = 0;
+  while i < n {
+    let _ = buf_write_byte(out, i as u32, str_byte_at(s, i) as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Real authentication's own crypto layer: HMAC-SHA256 (RFC 2104) on
+// top of round 41's SHA-256, then PBKDF2-HMAC-SHA256 (RFC 8018) on top
+// of that -- the "pragmatic choice... not a from-scratch Argon2 port"
+// docs/TODO.md's own scoping note for this feature calls for.
+//
+// K' construction: keys longer than the 64-byte SHA-256 block size are
+// hashed down to 32 bytes first (then zero-padded to 64); shorter keys
+// are zero-padded directly -- both branches per RFC 2104 §2.
+//
+// msg_len is capped at 64 bytes by hmac_msg_scratch's own 128-byte size
+// (64-byte pad block + msg) -- comfortably covers every real caller
+// here (PBKDF2's own salt+4-byte-counter or bare 32-byte U values, and
+// any real password), so this rejects rather than silently overflows
+// scratch for anything larger, same "reject, don't guess" posture
+// every other bounds check in this codebase already uses.
+fn hmac_sha256(key: mut ref i64, key_len: i64, msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  if msg_len > 64 {
+    return 0 - 1;
+  }
+  let key_block: mut ref i64 = hmac_key_block_ptr();
+  let i: i64 = 0;
+  if key_len > 64 {
+    let _ = sha256_hash(key, key_len, key_block);
+    i = 32;
+  } else {
+    while i < key_len {
+      let _ = buf_write_byte(key_block, i as u32, buf_read_byte(key, i as u32));
+      i = i + 1;
+    }
+  }
+  while i < 64 {
+    let _ = buf_write_byte(key_block, i as u32, 0 as u32);
+    i = i + 1;
+  }
+
+  let msg_scratch: mut ref i64 = hmac_msg_scratch_ptr();
+  i = 0;
+  while i < 64 {
+    let kb: u32 = buf_read_byte(key_block, i as u32);
+    let _ = buf_write_byte(msg_scratch, i as u32, kb ^ (0x36 as u32));
+    i = i + 1;
+  }
+  i = 0;
+  while i < msg_len {
+    let _ = buf_write_byte(msg_scratch, (64 + i) as u32, buf_read_byte(msg, i as u32));
+    i = i + 1;
+  }
+  let inner_hash: mut ref i64 = hmac_inner_hash_ptr();
+  let _ = sha256_hash(msg_scratch, 64 + msg_len, inner_hash);
+
+  i = 0;
+  while i < 64 {
+    let kb2: u32 = buf_read_byte(key_block, i as u32);
+    let _ = buf_write_byte(msg_scratch, i as u32, kb2 ^ (0x5c as u32));
+    i = i + 1;
+  }
+  i = 0;
+  while i < 32 {
+    let _ = buf_write_byte(msg_scratch, (64 + i) as u32, buf_read_byte(inner_hash, i as u32));
+    i = i + 1;
+  }
+  let _ = sha256_hash(msg_scratch, 96, out);
+  return 0;
+}
+
+fn hmac_sha256_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if buf_read_byte(a, i as u32) != buf_read_byte(b, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// Two RFC 4231/general-purpose HMAC-SHA256 known-answer vectors,
+// independently verified against Python's own hmac/hashlib (not
+// hand-derived, not copied from memory alone) before writing this
+// test: a 20-byte all-0x0b key (RFC 4231 test case 1's own key shape)
+// with an 8-byte message exercises the "key already <= block size"
+// path; a 3-byte key with a 44-byte message exercises the same path
+// with a longer message (both stay under hmac_sha256's own 64-byte
+// msg_len cap). Neither exercises the "key > 64 bytes, hash it down
+// first" branch -- that path is exactly SHA-256's own already-proven
+// sha256_hash logic, re-verified indirectly by every other KAT in
+// this file, not a new untested code path of its own.
+fn hmac_sha256_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let key1: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = write_hex_string(key1, "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", 20);
+  let msg1: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = str_copy_to_buf("Hi There", msg1);
+  let out1: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = hmac_sha256(key1, 20, msg1, 8, out1);
+  let exp1: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = write_hex_string(exp1, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", 32);
+  if hmac_sha256_bytes_equal(out1, exp1, 32) == 0 { ok = 0; }
+
+  let key2: mut ref i64 = dhruva_alloc_bytes(3);
+  let _ = str_copy_to_buf("key", key2);
+  let msg2: mut ref i64 = dhruva_alloc_bytes(43);
+  let _ = str_copy_to_buf("The quick brown fox jumps over the lazy dog", msg2);
+  let out2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = hmac_sha256(key2, 3, msg2, 43, out2);
+  let exp2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = write_hex_string(exp2, "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8", 32);
+  if hmac_sha256_bytes_equal(out2, exp2, 32) == 0 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: HMAC-SHA256 vs 2 KATs (RFC-4231-shaped key, longer message)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// PBKDF2-HMAC-SHA256 (RFC 8018 §5.2), specialized to dkLen == hLen ==
+// 32 bytes (SHA-256's own output size) -- real authentication only
+// ever needs exactly one 32-byte derived key, never a longer one, so
+// this skips PBKDF2's general multi-block DK concatenation entirely:
+// with dkLen == hLen there is exactly one block, T_1, and DK == T_1.
+// T_1 = U_1 xor U_2 xor ... xor U_c, where U_1 = HMAC(password, salt ||
+// INT_32_BE(1)) and U_i = HMAC(password, U_{i-1}) for i > 1.
+//
+// salt_len is capped at 32 bytes by pbkdf2_salt_ctr_scratch's own
+// 36-byte size (32-byte salt + 4-byte block-index counter) --
+// comfortably covers this project's own 16-byte salts.
+fn pbkdf2_hmac_sha256(password: mut ref i64, password_len: i64, salt: mut ref i64, salt_len: i64, iterations: i64, out: mut ref i64) -> i64 {
+  if salt_len > 32 {
+    return 0 - 1;
+  }
+  let sc: mut ref i64 = pbkdf2_salt_ctr_ptr();
+  let i: i64 = 0;
+  while i < salt_len {
+    let _ = buf_write_byte(sc, i as u32, buf_read_byte(salt, i as u32));
+    i = i + 1;
+  }
+  let _ = buf_write_byte(sc, salt_len as u32, 0 as u32);
+  let _ = buf_write_byte(sc, (salt_len + 1) as u32, 0 as u32);
+  let _ = buf_write_byte(sc, (salt_len + 2) as u32, 0 as u32);
+  let _ = buf_write_byte(sc, (salt_len + 3) as u32, 1 as u32);
+
+  let u: mut ref i64 = pbkdf2_u_ptr();
+  let _ = hmac_sha256(password, password_len, sc, salt_len + 4, u);
+
+  let t: mut ref i64 = pbkdf2_t_ptr();
+  i = 0;
+  while i < 32 {
+    let _ = buf_write_byte(t, i as u32, buf_read_byte(u, i as u32));
+    i = i + 1;
+  }
+
+  let iter: i64 = 1;
+  while iter < iterations {
+    // Safe to alias msg==out==u here: hmac_sha256 fully copies msg into
+    // its own persistent scratch before it ever writes a single byte
+    // of `out` (see its own body -- the msg copy loop runs to
+    // completion, THEN sha256_hash writes into `out` only at its very
+    // end), so U_i overwriting the U_{i-1} it was computed from is not
+    // a read-after-write hazard.
+    let _ = hmac_sha256(password, password_len, u, 32, u);
+    let j: i64 = 0;
+    while j < 32 {
+      let tb: u32 = buf_read_byte(t, j as u32);
+      let ub: u32 = buf_read_byte(u, j as u32);
+      let _ = buf_write_byte(t, j as u32, tb ^ ub);
+      j = j + 1;
+    }
+    iter = iter + 1;
+  }
+
+  i = 0;
+  while i < 32 {
+    let _ = buf_write_byte(out, i as u32, buf_read_byte(t, i as u32));
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Three PBKDF2-HMAC-SHA256 known-answer vectors (independently
+// verified against Python's own hashlib.pbkdf2_hmac, not hand-derived)
+// -- iteration counts 1 and 2 exercise the "T = U1" and "T = U1 xor U2"
+// shapes directly; 4096 is a real, commonly-cited PBKDF2 vector at a
+// non-trivial iteration count, giving actual confidence the loop is
+// correct at scale, not just for the first couple of steps.
+fn pbkdf2_hmac_sha256_self_test() -> i64 {
+  let ok: i64 = 1;
+  let password: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = str_copy_to_buf("password", password);
+  let salt: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = str_copy_to_buf("salt", salt);
+
+  let out1: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = pbkdf2_hmac_sha256(password, 8, salt, 4, 1, out1);
+  let exp1: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = write_hex_string(exp1, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b", 32);
+  if hmac_sha256_bytes_equal(out1, exp1, 32) == 0 { ok = 0; }
+
+  let out2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = pbkdf2_hmac_sha256(password, 8, salt, 4, 2, out2);
+  let exp2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = write_hex_string(exp2, "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43", 32);
+  if hmac_sha256_bytes_equal(out2, exp2, 32) == 0 { ok = 0; }
+
+  let out3: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = pbkdf2_hmac_sha256(password, 8, salt, 4, 4096, out3);
+  let exp3: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = write_hex_string(exp3, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a", 32);
+  if hmac_sha256_bytes_equal(out3, exp3, 32) == 0 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: PBKDF2-HMAC-SHA256 vs 3 KATs (iterations=1,2,4096)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// PBKDF2-HMAC-SHA256 iteration count for real authentication.
+//
+// NOT set from a real security/timing budget -- set this low by a
+// genuine, separate, NOT-YET-ROOT-CAUSED bug found live while tuning
+// this value (see docs/TODO.md's own writeup): a long-running,
+// synchronous PBKDF2 loop invoked from the interactive shell
+// (task_f), once it survives enough timer ticks under the real
+// scheduler, reliably stops making progress permanently partway
+// through -- confirmed NOT to be simple scheduling starvation (an
+// independent per-iteration counter, not just the debug print
+// condition, stops advancing too; the identical loop body completes
+// correctly and quickly at boot, before multitasking starts). 200
+// iterations reliably completes in ~1 real second; 500 reliably
+// never completes at all in this exact live-shell context. This gap
+// (200 works, 500 hangs) was measured directly, not estimated.
+//
+// This is a REAL, serious limitation, not a security-vs-usability
+// tradeoff: 200 iterations is far below any real password-hashing
+// guidance (OWASP's current minimum is 600,000+ for PBKDF2-HMAC-
+// SHA256) and offers only token resistance to offline brute-forcing
+// of a stolen salt+hash. Raise this once the underlying scheduler/
+// context-switch bug is root-caused and fixed -- tracked as a
+// separate, high-priority item, not folded into this feature's own
+// scope.
+fn pbkdf2_auth_iterations() -> i64 {
+  return 200;
+}
+
+// Real authentication's own small helpers: find/allocate a user
+// table slot, compare a raw buffer against a Str (for the weak-
+// password blocklist), and the blocklist check itself.
+fn auth_find_slot(uid: u32) -> i64 {
+  let i: u32 = 0 as u32;
+  while i < (8 as u32) {
+    if auth_get_uid(i) == uid {
+      return i as i64;
+    }
+    i = i + (1 as u32);
+  }
+  return 0 - 1;
+}
+
+fn auth_find_free_slot() -> i64 {
+  let i: u32 = 0 as u32;
+  while i < (8 as u32) {
+    if auth_get_uid(i) == (0xFFFFFFFF as u32) {
+      return i as i64;
+    }
+    i = i + (1 as u32);
+  }
+  return 0 - 1;
+}
+
+fn buf_equals_str(buf: mut ref i64, buf_len: i64, s: Str) -> i64 {
+  let slen: i64 = str_len_bytes(s);
+  if buf_len != slen {
+    return 0;
+  }
+  let i: i64 = 0;
+  while i < slen {
+    if buf_read_byte(buf, i as u32) != (str_byte_at(s, i) as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// NIST SP 800-63B: length matters more than character-class
+// complexity (minimum 8 here), checked against a small known-weak
+// blocklist. A REPRESENTATIVE small sample (not the "few hundred
+// entries" the TODO's own scoping note suggests would be meaningful
+// for a real deployment) -- demonstrating the mechanism honestly
+// within this round's own scope, not claiming production-grade
+// coverage. Every entry is itself >= 8 characters so the length check
+// above doesn't make them redundant.
+fn auth_is_weak_password(pw: mut ref i64, pw_len: i64) -> i64 {
+  if pw_len < 8 {
+    return 1;
+  }
+  if buf_equals_str(pw, pw_len, "password") == 1 { return 1; }
+  if buf_equals_str(pw, pw_len, "12345678") == 1 { return 1; }
+  if buf_equals_str(pw, pw_len, "qwertyui") == 1 { return 1; }
+  if buf_equals_str(pw, pw_len, "letmein1") == 1 { return 1; }
+  if buf_equals_str(pw, pw_len, "changeme") == 1 { return 1; }
+  if buf_equals_str(pw, pw_len, "admin123") == 1 { return 1; }
+  if buf_equals_str(pw, pw_len, "welcome1") == 1 { return 1; }
+  if buf_equals_str(pw, pw_len, "iloveyou") == 1 { return 1; }
+  return 0;
+}
+
+// Failed-attempt rate limiting: 3 strikes locks the account for 20
+// ticks (10s at this project's 500ms tick). Per-slot, not global --
+// see boot/auth_state.S's own file comment on why a lockout on one
+// user must not also block a different user.
+fn auth_lockout_ticks() -> u32 {
+  return 20 as u32;
+}
+fn auth_max_fail_attempts() -> u32 {
+  return 3 as u32;
+}
+
 // Round 44: ChaCha20 (RFC 8439), the crypto-primitives-foundation
 // security-roadmap item's symmetric-cipher half (SHA-256, the hash
 // half, landed in round 41 -- see docs/TODO.md). Chosen over AES for
@@ -14981,6 +15536,11 @@ fn kernel_main() -> i64 {
   // Round 41: crypto primitives foundation, hash-function half.
   let _ = sha256_self_test();
 
+  // Real authentication: HMAC-SHA256/PBKDF2-HMAC-SHA256, built on
+  // round 41's SHA-256, ahead of everything su/passwd itself needs.
+  let _ = hmac_sha256_self_test();
+  let _ = pbkdf2_hmac_sha256_self_test();
+
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   let _ = chacha20_self_test();
 
@@ -15068,6 +15628,13 @@ fn kernel_main() -> i64 {
   // free slot" -- see task_table_init's own comment in
   // context_switch.S for the full story.
   let _ = task_table_init();
+
+  // Real authentication: seed the user-credential table's own
+  // "empty" sentinel before anything (passwd/su) can touch it --
+  // same "seed the sentinel first" discipline as task_table_init
+  // just above.
+  let _ = auth_table_init();
+
   // Round 60 crash investigation: was 512 bytes (matching this fn's own
   // #[bounded_stack(bytes=512)] budget exactly, with zero headroom --
   // unlike EVERY other task in this project, which all get generous

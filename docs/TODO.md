@@ -505,65 +505,127 @@ for by name.
   prerequisites above exist.
 
 - **Real authentication (password-protected `su` + `passwd`)** —
-  `[M, ~2-3 rounds, ready to start on the existing crypto foundation
-  — not yet begun, added 2026-08-30 per explicit request]`
-  Today there is genuinely no authentication anywhere in this project:
-  `dharafs_current_uid`/`_gid` (`boot/dharafs_state.S`) are plain
-  zero-initialized words, so the OS boots directly into an interactive
-  root shell (uid 0) with no login step, and `su <uid> <gid>` switches
-  identity completely unconditionally — no password check of any kind
-  (its own comment says so outright: built only so self-tests/
-  interactive testing could exercise permission enforcement, not as a
-  real security boundary). This is a genuinely new subsystem, not a
-  partially-built one.
+  `[DONE, round 61, 2026-08-30]`
+  `su <uid> <gid>` used to switch identity completely unconditionally
+  (its own comment said so outright: built only so self-tests could
+  exercise permission enforcement). Now genuinely gated: a `passwd
+  <uid> <new_password>` command stores a fresh salt + PBKDF2-HMAC-
+  SHA256 output (never the password itself) in a new 8-slot user
+  table (`boot/auth_state.S`); `su <uid> <gid> [password]` requires
+  and verifies it whenever the target uid has ever had one set.
 
-  **2026 guidance (NIST SP 800-63B, still current)**: no forced
-  character-class complexity rules, no periodic mandatory rotation
-  (both now considered counterproductive) — length matters more than
-  complexity (minimum ~8 characters, allow 64+), checked against a
-  small known-weak/common-password blocklist at set time (a few
-  hundred entries is meaningful for an embedded system, not a huge
-  dictionary), with failed `su`/`passwd` attempts rate-limited.
-  **Never store the password itself** — store a per-user salt + a KDF
-  output. This project has SHA-256 (round 41) but no HMAC and no
-  Argon2/PBKDF2 — the pragmatic choice is **HMAC-SHA256** (a small,
-  well-understood construction directly on the existing hash, RFC
-  2104) as the basis for **PBKDF2-HMAC-SHA256**, not a from-scratch
-  Argon2 port. Iteration count is a real, honest tradeoff to make
-  explicit, not quietly pick: current OWASP guidance for PBKDF2-
-  HMAC-SHA256 is 600,000+ iterations, but ARM1176JZF-S is a
-  ~700MHz-class embedded core — that many iterations at login time
-  could introduce a genuinely noticeable delay. Needs an actual
-  measurement (a spike, same discipline as every crypto primitive
-  above) before picking a real number, not a value copied from a
-  server-class guideline without checking it against this hardware.
+  **The 3 open design forks, resolved explicitly**:
+  1. **Scope: gate `su` only** (not a full boot-time login flow) — the
+     smaller change; root itself stays unauthenticated at boot, only
+     switching AWAY from wherever a session starts is protected. A uid
+     that has NEVER had a password configured keeps the exact original
+     unconditional behavior — deliberate backward compatibility, not
+     an oversight.
+  2. **Salt = a monotonic nonce (`auth_salt_nonce_next`) mixed with
+     `tick_count` and the uid itself** — honestly non-cryptographic
+     (same class of limitation as the DHCP client's own tick-based
+     xid), but salts only need to be unique, not secret, and this
+     guarantees uniqueness even across two `passwd` calls landing in
+     the same tick.
+  3. **Corrected, not just resolved**: the original scoping note's
+     premise — "the UART RX IRQ handler echoes every typed character
+     back" — was checked against the actual code while implementing
+     this and found to be **inaccurate**. `irq_dispatch`'s own UART-RX
+     branch only calls `shell_rx_push_char` (buffers the byte) and
+     never calls `uart_putc`/`uart_putc_nonblocking` at all; no
+     hardware UART loopback is configured either. **This shell does
+     not echo anything typed, for any command, today.** A typed
+     password is therefore not already leaking into the UART stream —
+     the real, still-open gap is the opposite one: normal typing gets
+     no visual feedback either. Not fixed here (out of scope for
+     authentication specifically); if a real echo feature is ever
+     added for usability, it will need its own password-mode
+     suppression at that point, not before.
 
-  **Real, open design forks to resolve before starting, not silently
-  assumed**:
-  1. **Scope: gate `su` only, or a full boot-time login?** Gating just
-     `su` (require a password to switch identity) is the smaller
-     change and leaves today's "boot straight into a root shell"
-     behavior intact — meaning root itself is still unauthenticated,
-     only switching AWAY from wherever you start is protected. A full
-     login flow (authenticate before any shell access at all) is a
-     materially bigger change to the boot sequence and shell task
-     itself. Pick one explicitly; don't half-do both.
-  2. **No salt randomness source exists.** This project's own DHCP
-     client already documents having no RNG (`scheduler_get_tick_
-     count()` stands in for an xid, explicitly not real randomness).
-     A password salt only needs to be unique, not secret, so a weaker
-     source (tick_count + heap allocation count + something else
-     cheaply available) may be an honestly-labeled "good enough for
-     this threat model" answer — but that's a judgment call to make
-     explicitly, not silently assume is fine.
-  3. **This shell has no way to hide typed input.** The UART RX IRQ
-     handler echoes every typed character back as it fills the line
-     buffer — there is no termios-style "echo off" mode. A password
-     typed at this shell today would appear in cleartext in the UART
-     stream itself, and in anything capturing that stream — a real,
-     honest limitation to either accept explicitly or fix by teaching
-     the line-fill IRQ handler a "currently reading a password, don't
-     echo" mode before shipping this.
+  **Cryptography**: `hmac_sha256`/`pbkdf2_hmac_sha256` (RFC 2104 /
+  RFC 8018, specialized to the dkLen==hLen==32 single-block case) are
+  new primitives built on round 41's SHA-256, each with on-target
+  KATs (`hmac_sha256_self_test`/`pbkdf2_hmac_sha256_self_test`,
+  independently verified against Python's `hmac`/`hashlib` before
+  writing either test) plus a host-harness ASAN/UBSAN twin
+  (`test_hmac_pbkdf2_boundaries`).
+
+  **A real, separate, NOT-YET-ROOT-CAUSED scheduler/context-switch bug
+  was found while tuning the iteration count** — see the new "Long-
+  running synchronous computation stalls permanently" entry
+  immediately below. Its practical consequence here: the PBKDF2
+  iteration count (`pbkdf2_auth_iterations`) had to be set to **200**,
+  measured directly to reliably complete in ~1s from the live shell —
+  far below any real password-hashing guidance (OWASP's current
+  minimum is 600,000+) and offering only token resistance to offline
+  brute-forcing of a stolen salt+hash. This is an honest, tracked
+  security gap, not a considered tradeoff — raise it once the
+  underlying bug is fixed.
+
+  **Also resolved along the way, not deferred**: failed-attempt rate
+  limiting (3 strikes locks an account for 20 ticks, confirmed live to
+  correctly reject even a CORRECT password while locked) and a small
+  representative weak-password blocklist (NIST SP 800-63B: length over
+  complexity, no forced rotation). `passwd` may only be run by root or
+  by the uid itself. Live-verified end to end: weak-password rejection,
+  password set, wrong-password rejection, correct-password acceptance,
+  an unconfigured uid's unconditional `su` preserved, 3-strike lockout,
+  lockout correctly blocking even the right password, and root setting
+  a different uid's password — all 14 checks in one live run matched
+  exactly.
+
+- **Long-running synchronous computation stalls permanently under the
+  real scheduler** — `[found round 61, 2026-08-30, NOT YET ROOT-
+  CAUSED — high priority]`
+  Found while tuning real authentication's own PBKDF2 iteration count.
+  A synchronous, non-yielding loop (no `task_sleep_ticks` calls) run
+  from the interactive shell (`task_f`), once it survives enough timer
+  ticks under the real post-`start_multitasking` scheduler, reliably
+  **stops making progress permanently partway through** — not merely
+  slowly, genuinely stuck: an independent, unconditional per-iteration
+  counter (not just a debug print's own condition) stopped advancing
+  too, and stayed flat across a 4-minute observation window with zero
+  further progress. The identical loop body completes correctly and
+  quickly when run at boot, before `start_multitasking` — single-
+  threaded, no interrupts enabled yet.
+
+  **Ruled out, not just suspected**: a priority-ceiling boost
+  (`dhruva_prio_lock(0)`/`dhruva_prio_unlock`) around the computation
+  was tried first (reasoning: `task_f`'s own priority 3 could starve it
+  behind more-frequently-ready higher-priority demo tasks) and
+  measured to make **no reliable difference** — the same stall
+  reproduced with or without it, ruling out simple priority starvation
+  as the root cause. The function's own parameters were also confirmed
+  correct at entry via direct instrumentation (`iterations`/
+  `password_len`/`salt_len` all printed exactly as passed) and stayed
+  correct — the bug is not argument corruption, nor is it the debug
+  print's own modulo condition (an independent, unconditional counter
+  incrementing every real loop iteration showed the same flat-lining).
+
+  Empirically bounded, not fully root-caused: 200 iterations of this
+  specific loop shape reliably completes in ~1 real second; 500
+  reliably never completes at all, confirmed across multiple runs.
+  Whatever triggers this appears to depend on cumulative time/tick
+  count survived by one continuously-running computation, not on the
+  exact operation being performed.
+
+  Candidate next steps for a dedicated follow-up round (not attempted
+  here — this needs its own focused investigation, not a side effect
+  of an unrelated feature's own time budget): reproduce with a GDB/
+  QEMU-monitor breakpoint once the stall is observed, to get a real
+  register/PC snapshot of exactly where `task_f` is stuck; audit
+  whether `sleep_until_table`/`eff_prio_table`/`current_task` can be
+  corrupted by an interaction between a long-held ceiling boost and
+  the mutex-inheritance demo's own eff_prio writes (rounds 55/59, the
+  first other consumer of a comparably long-running, heavily-preempted
+  computation); check whether AAPCS 64-bit (`i64`) local variables
+  held live across MANY repeated preemptions of the SAME function
+  activation are correctly preserved by this project's context-switch
+  frame (an untested case — no prior task in this codebase holds an
+  `i64` local across anywhere near this many ticks). This is a
+  genuine reliability concern beyond just authentication: ANY future
+  feature needing a long synchronous computation from a task will hit
+  the same wall.
 
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,

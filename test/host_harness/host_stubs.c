@@ -286,6 +286,47 @@ int64_t prio_lock_count_get(void) { return 0; }
 int64_t mutex_contention_count_get(void) { return 0; }
 int64_t mutex_wait_worst_ticks_get(void) { return 0; }
 uint32_t current_task_get(void) { return 0; }
+
+/* Round: real authentication (HMAC-SHA256/PBKDF2-HMAC-SHA256 scratch +
+ * the user credential table) -- boot/auth_state.S's own host-side
+ * mirror, same shape as fw_state.S's stub block above. */
+#define MAX_AUTH_USERS_HOST 8
+static uint32_t g_auth_uid[MAX_AUTH_USERS_HOST];
+static uint8_t g_auth_salt[MAX_AUTH_USERS_HOST][16] __attribute__((aligned(8)));
+static uint8_t g_auth_hash[MAX_AUTH_USERS_HOST][32] __attribute__((aligned(8)));
+static uint32_t g_auth_fail_count[MAX_AUTH_USERS_HOST];
+static uint32_t g_auth_lockout_until[MAX_AUTH_USERS_HOST];
+static uint32_t g_auth_salt_nonce;
+static uint8_t g_hmac_key_block[64] __attribute__((aligned(8)));
+static uint8_t g_hmac_msg_scratch[128] __attribute__((aligned(8)));
+static uint8_t g_hmac_inner_hash[32] __attribute__((aligned(8)));
+static uint8_t g_pbkdf2_u[32] __attribute__((aligned(8)));
+static uint8_t g_pbkdf2_t[32] __attribute__((aligned(8)));
+static uint8_t g_pbkdf2_salt_ctr[36] __attribute__((aligned(8)));
+static uint8_t g_passwd_scratch[64] __attribute__((aligned(8)));
+static uint8_t g_su_hash_scratch[32] __attribute__((aligned(8)));
+
+int64_t auth_table_init(void) {
+  for (int i = 0; i < MAX_AUTH_USERS_HOST; i++) g_auth_uid[i] = 0xFFFFFFFFu;
+  return 0;
+}
+uint32_t auth_get_uid(uint32_t index) { return g_auth_uid[index]; }
+int64_t auth_set_uid(uint32_t index, uint32_t uid) { g_auth_uid[index] = uid; return 0; }
+int64_t *auth_salt_ptr(uint32_t index) { return (int64_t *)g_auth_salt[index]; }
+int64_t *auth_hash_ptr(uint32_t index) { return (int64_t *)g_auth_hash[index]; }
+uint32_t auth_get_fail_count(uint32_t index) { return g_auth_fail_count[index]; }
+int64_t auth_set_fail_count(uint32_t index, uint32_t count) { g_auth_fail_count[index] = count; return 0; }
+uint32_t auth_get_lockout_until(uint32_t index) { return g_auth_lockout_until[index]; }
+int64_t auth_set_lockout_until(uint32_t index, uint32_t tick) { g_auth_lockout_until[index] = tick; return 0; }
+uint32_t auth_salt_nonce_next(void) { return ++g_auth_salt_nonce; }
+int64_t *hmac_key_block_ptr(void) { return (int64_t *)g_hmac_key_block; }
+int64_t *hmac_msg_scratch_ptr(void) { return (int64_t *)g_hmac_msg_scratch; }
+int64_t *hmac_inner_hash_ptr(void) { return (int64_t *)g_hmac_inner_hash; }
+int64_t *pbkdf2_u_ptr(void) { return (int64_t *)g_pbkdf2_u; }
+int64_t *pbkdf2_t_ptr(void) { return (int64_t *)g_pbkdf2_t; }
+int64_t *pbkdf2_salt_ctr_ptr(void) { return (int64_t *)g_pbkdf2_salt_ctr; }
+int64_t *passwd_scratch_ptr(void) { return (int64_t *)g_passwd_scratch; }
+int64_t *su_hash_scratch_ptr(void) { return (int64_t *)g_su_hash_scratch; }
 int64_t irq_count_increment(void) { return 0; }
 int64_t irq_count_get(void) { return 0; }
 int64_t cpu_wfi(void) { return 0; }

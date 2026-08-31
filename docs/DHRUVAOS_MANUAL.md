@@ -87,8 +87,31 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   soundness gap (`#[bounded_stack]` silently charged 0 bytes for any
   `extern "C"` callee), fixed upstream as BUG-233. See `TODO.md` for
   the full investigation writeup.
+- **Real authentication (round 61)**: `su <uid> <gid> [password]` and
+  a new `passwd <uid> <new_password>` command, backed by new
+  `hmac_sha256`/`pbkdf2_hmac_sha256` primitives (`boot/auth_state.S`
+  holds the salt+hash user table). A uid with no password ever set
+  keeps the original unconditional `su` behavior; once a password is
+  set, it's genuinely required and checked, with 3-strike lockout.
+  Live-verified end to end (weak-password rejection, correct/incorrect
+  password handling, lockout, an unconfigured account's unchanged
+  behavior). Corrected a stale claim from this feature's own original
+  scoping note: this shell does not actually echo any typed
+  characters today, for any command — checked directly against
+  `irq_dispatch`'s code, not assumed.
 
 **Known, current limitations (not design goals — see `TODO.md`):**
+- **A real, NOT-yet-root-caused bug: a long-running synchronous
+  computation on any task can stall permanently under the real
+  scheduler.** Found while tuning real authentication's own PBKDF2
+  iteration count — forced it down to 200 iterations (measured to
+  reliably complete; 500 reliably never completes). Confirmed NOT
+  simple priority starvation (a priority-ceiling boost made no
+  reliable difference) and NOT argument corruption (parameters
+  verified correct throughout). See `TODO.md` for the full
+  investigation and candidate next steps — this affects any future
+  feature needing sustained synchronous computation from a task, not
+  just authentication.
 
 - **6 fixed compile-time tasks, plus up to 10 dynamically-created
   ones (MAX_TASKS=16).** The original 6 slots (HIGH, MEDIUM, LOW — a
@@ -236,7 +259,8 @@ via `-serial stdio`/`-nographic`). Type a command and press Enter.
 |---|---|---|
 | `eval` | `eval <expr>` | Small arithmetic expression evaluator (`+ - * / ( )`), traps on overflow and division by zero. |
 | `id` | `id` | Shows the active uid/gid for the current shell session. |
-| `su` | `su <uid> <gid>` | Switches the active permission context. uid 0 is root (bypasses all permission checks) — there is no login/authentication of any kind, `su` is unconditional. |
+| `su` | `su <uid> <gid> [password]` | Switches the active permission context. uid 0 is root (bypasses all permission checks). Unconditional for a uid that has never had a password set (round 61); once `passwd` sets one, it's genuinely required and checked, with 3-strike lockout. |
+| `passwd` | `passwd <uid> <new_password>` | Sets/changes a uid's password (round 61) — root or the uid itself only. Stores a fresh salt + PBKDF2-HMAC-SHA256 output, never the password. Min 8 characters, checked against a small weak-password blocklist. |
 | `diagnose` | `diagnose` | One-shot health report: uptime ticks, scheduler ready count, heap usage (current == high-water mark, since the allocator never frees), CPU frequency + governor history, allocation count, FS commit count, context switch count, IRQ count, `dhruva_prio_lock` call count, and (round 59) mutex contention count + worst-case wait ticks. |
 | `fault` | `fault alloc <n>` | **Deliberately triggers a real, unrecoverable OOM-fatal halt** after the Nth subsequent heap allocation, for testing the OOM path itself. There is no confirmation prompt and no way to undo it once armed — this is the intended behavior, not a bug. |
 

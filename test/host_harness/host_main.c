@@ -79,6 +79,9 @@ int64_t fn_dharafs_file_max_len(void);
 uint32_t fn_dharafs_default_mode(void);
 int64_t fn_sha256_hash(int64_t *msg, int64_t msg_len, int64_t *out);
 int64_t fn_sha256_bytes_equal(int64_t *a, int64_t *b, int64_t n);
+int64_t fn_hmac_sha256(int64_t *key, int64_t key_len, int64_t *msg, int64_t msg_len, int64_t *out);
+int64_t fn_hmac_sha256_bytes_equal(int64_t *a, int64_t *b, int64_t n);
+int64_t fn_pbkdf2_hmac_sha256(int64_t *password, int64_t password_len, int64_t *salt, int64_t salt_len, int64_t iterations, int64_t *out);
 int64_t fn_chacha20_encrypt(int64_t *key, int64_t *nonce, uint32_t initial_counter, int64_t *in_buf, int64_t in_len, int64_t *state_buf, int64_t *working_buf, int64_t *keystream_buf, int64_t *out_buf);
 int64_t fn_chacha20_bytes_equal(int64_t *a, int64_t *b, int64_t n);
 uint32_t fn_bignum_add_raw(int64_t *a, int64_t *b, int64_t *out, int64_t n);
@@ -928,6 +931,52 @@ static void test_sha256_boundaries(void) {
     }
 }
 
+/* Real authentication's own crypto layer: HMAC-SHA256 (RFC 2104) and
+ * PBKDF2-HMAC-SHA256 (RFC 8018), same KATs as kernel_main.vani's own
+ * hmac_sha256_self_test/pbkdf2_hmac_sha256_self_test -- independently
+ * verified against Python's hmac/hashlib before either test was
+ * written, not hand-derived. Gives this new crypto code the same
+ * ASAN/UBSAN sanitizer coverage every other primitive here already
+ * gets, not just the on-target self-test. */
+static void test_hmac_pbkdf2_boundaries(void) {
+    /* RFC 4231 test case 1's own key shape: 20 bytes of 0x0b, "Hi There". */
+    static const unsigned char key1_bytes[20] = {
+        0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,
+        0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b};
+    int64_t *key1 = mkbuf((const char *)key1_bytes, 20);
+    int64_t *msg1 = mkbuf("Hi There", 8);
+    int64_t *out1 = dhruva_alloc_bytes(32);
+    fn_hmac_sha256(key1, 20, msg1, 8, out1);
+    static const unsigned char exp1_bytes[32] = {
+        0xb0,0x34,0x4c,0x61,0xd8,0xdb,0x38,0x53,0x5c,0xa8,0xaf,0xce,0xaf,0x0b,0xf1,0x2b,
+        0x88,0x1d,0xc2,0x00,0xc9,0x83,0x3d,0xa7,0x26,0xe9,0x37,0x6c,0x2e,0x32,0xcf,0xf7};
+    int64_t *exp1 = mkbuf((const char *)exp1_bytes, 32);
+    CHECK(fn_hmac_sha256_bytes_equal(out1, exp1, 32) == 1, "hmac-sha256: RFC-4231-shaped key vector matches");
+
+    /* PBKDF2-HMAC-SHA256("password","salt",1,32) -- verified against
+     * Python's hashlib.pbkdf2_hmac before writing this. */
+    int64_t *password = mkbuf("password", 8);
+    int64_t *salt = mkbuf("salt", 4);
+    int64_t *pout1 = dhruva_alloc_bytes(32);
+    fn_pbkdf2_hmac_sha256(password, 8, salt, 4, 1, pout1);
+    static const unsigned char pexp1_bytes[32] = {
+        0x12,0x0f,0xb6,0xcf,0xfc,0xf8,0xb3,0x2c,0x43,0xe7,0x22,0x52,0x56,0xc4,0xf8,0x37,
+        0xa8,0x65,0x48,0xc9,0x2c,0xcc,0x35,0x48,0x08,0x05,0x98,0x7c,0xb7,0x0b,0xe1,0x7b};
+    int64_t *pexp1 = mkbuf((const char *)pexp1_bytes, 32);
+    CHECK(fn_hmac_sha256_bytes_equal(pout1, pexp1, 32) == 1, "pbkdf2-hmac-sha256: iterations=1 KAT matches");
+
+    /* PBKDF2-HMAC-SHA256("password","salt",4096,32) -- a real,
+     * non-trivial iteration count, confirming the loop is correct at
+     * scale, not just for the first step. */
+    int64_t *pout2 = dhruva_alloc_bytes(32);
+    fn_pbkdf2_hmac_sha256(password, 8, salt, 4, 4096, pout2);
+    static const unsigned char pexp2_bytes[32] = {
+        0xc5,0xe4,0x78,0xd5,0x92,0x88,0xc8,0x41,0xaa,0x53,0x0d,0xb6,0x84,0x5c,0x4c,0x8d,
+        0x96,0x28,0x93,0xa0,0x01,0xce,0x4e,0x11,0xa4,0x96,0x38,0x73,0xaa,0x98,0x13,0x4a};
+    int64_t *pexp2 = mkbuf((const char *)pexp2_bytes, 32);
+    CHECK(fn_hmac_sha256_bytes_equal(pout2, pexp2, 32) == 1, "pbkdf2-hmac-sha256: iterations=4096 KAT matches");
+}
+
 static void test_chacha20_boundaries(void) {
     int64_t *key = dhruva_alloc_bytes(32);
     int64_t *nonce = dhruva_alloc_bytes(12);
@@ -1228,6 +1277,7 @@ int main(void) {
     test_attributes();
     test_chmod_chown_permissions();
     test_sha256_boundaries();
+    test_hmac_pbkdf2_boundaries();
     test_chacha20_boundaries();
     test_bignum_boundaries();
     test_lan9512_framing();
