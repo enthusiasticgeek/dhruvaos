@@ -80,6 +80,22 @@ fault_fiq:
 
 .global fault_data_abort
 fault_data_abort:
+    /* Round 62c crash investigation (task #154): r0-r3 are NOT banked
+     * in Abort mode -- they're still exactly the faulting instruction's
+     * own live operand registers at entry here -- but the two `mrc`
+     * reads below are about to overwrite r0/r1, and DFAR/DFSR/fault_pc
+     * need r0-r2 for abort_report_data's existing 3 args. Stash the
+     * ORIGINAL r0-r3 into r4-r7 first (never banked/touched by anything
+     * below until the explicit stack spill), so a faulting `str rD,
+     * [rN, rM]`-shaped instruction's actual base/offset register
+     * VALUES can be reported too, not just the fault address -- the
+     * open question this round is stuck on is exactly "was the base
+     * pointer really 0, or something else," which DFAR alone can't
+     * distinguish from e.g. a corrupted offset added to a valid base. */
+    mov r4, r0
+    mov r5, r1
+    mov r6, r2
+    mov r7, r3
     mrc p15, 0, r0, c6, c0, 0   /* DFAR: data fault address */
     mrc p15, 0, r1, c5, c0, 0   /* DFSR: data fault status */
     /* Round 60 crash investigation: lr_abt (data abort convention) =
@@ -88,8 +104,13 @@ fault_data_abort:
      * this value would otherwise be gone the instant SVC mode's own
      * lr_svc becomes current. */
     sub r2, lr, #8
+    mov r3, r4                  /* orig_r0 -> arg4 */
     cps #0x13                   /* SVC mode -- never returning, safe to
                                   * reuse whatever's on that stack */
+    sub sp, sp, #12
+    str r5, [sp, #0]            /* orig_r1 -> arg5 (stack) */
+    str r6, [sp, #4]            /* orig_r2 -> arg6 (stack) */
+    str r7, [sp, #8]            /* orig_r3 -> arg7 (stack) */
     bl abort_report_data
     b .
 

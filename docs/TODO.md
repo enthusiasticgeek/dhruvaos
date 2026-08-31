@@ -490,9 +490,9 @@ for by name.
   bit manipulation at this level (same discipline round 41's SHA-256
   entry used) before committing to a full build.
 
-- **TLS** — `[XL, several rounds — genuinely blocked on multiple
-  prerequisites above, not ready to start; added 2026-08-30 per
-  explicit request]`
+- **TLS** — `[XL, several rounds — SKIPPED FOR NOW, 2026-08-31, same
+  reason as AES: genuinely blocked on multiple prerequisites below,
+  none of which are being worked on right now]`
   A real TLS 1.3 client needs, at minimum: (1) asymmetric key exchange
   (ECDHE) — blocked on the EC point arithmetic/modular reduction this
   roadmap's own crypto-foundation entry already flags as not yet built
@@ -660,25 +660,98 @@ for by name.
   across every attempt so far (this is why `pbkdf2_auth_iterations()`
   still returns 200, not a stronger value).
 
-  Candidate next steps for a dedicated follow-up round: get a real,
-  *stopping* GDB breakpoint at the exact trap call site to recover a
-  backtrace (multiple attempts this round — post-hoc attach at various
-  delays, `-S` halted-start with a delayed command send, a pure GDB
-  command-file instead of Python — all had GDB accept the breakpoint
-  address without it ever actually firing; this is itself an
-  unexplained tooling gap worth resolving first). Once a real
-  backtrace is available: audit whether `sleep_until_table`/
-  `eff_prio_table`/`current_task` — or a spilled register holding
-  `sha256_rotr32`'s `n` argument — can be corrupted by an IRQ landing
-  mid-computation on `task_f`'s own SVC stack (this project's own
-  documented IRQ-frames-build-on-the-interrupted-task's-stack design,
-  already the root cause of two earlier task_f/task_e stack bumps);
-  check whether AAPCS 64-bit (`i64`) locals held live across MANY
-  repeated preemptions of the SAME function activation are correctly
-  preserved by this project's context-switch frame. This is a genuine
-  reliability concern beyond just authentication: ANY future feature
-  needing a long synchronous computation from a task will hit the same
-  wall.
+  **Round 62c (2026-08-31) follow-up investigation — deepened further,
+  still not fully root-caused.** Several concrete hypotheses were
+  checked directly against evidence (not just reasoned about) and
+  RULED OUT this round:
+  - **VFP/FPU register corruption** (ARM1176JZF-S has a real VFP unit,
+    and `kernel_main.vani` compiles through `llc` with no explicit
+    `-float-abi`/`-mattr` override) — checked the actual linked
+    `dhruva.elf` disassembly directly: zero VFP instructions anywhere
+    in the final binary. The only `f64`-using code is vani's own
+    dead statistics/formatting runtime helpers (`intent_f64_normal_
+    pdf`, `intent_f64_to_str`, etc., each already correctly `vpush`/
+    `vpop`-bracketed even if reachable), and `--gc-sections` strips
+    them entirely since nothing in this codebase's real boot path
+    calls them. `irq_entry.S` never saving VFP state is therefore
+    moot — nothing here ever puts a live value there.
+  - **Heap allocator race** — `dhruva_alloc_bytes` (`runtime_stubs.c`)
+    already disables IRQs (`cpsid i`/`msr cpsr_c`) around its entire
+    bump-pointer critical section (round 45 hardening); re-read
+    directly, confirmed correct.
+  - **A new AAPCS callee-saved-register violation** in this round's own
+    new hand-written asm (`media_crypto_state.S`, `fault_inject_
+    state.S`) — both re-read directly: neither touches r4-r11 at all,
+    only r0/r1, so round 53's callee-saved-register bug class does not
+    apply here.
+  - **Per-iteration-growing stack usage in PBKDF2 itself** —
+    `pbkdf2_hmac_sha256`'s loop re-uses fixed, persistent scratch
+    pointers (`pbkdf2_u_ptr`/`pbkdf2_t_ptr`) every iteration, no
+    recursion, no per-iteration `dhruva_alloc_bytes` or stack-growing
+    pattern — re-read directly, ruled out.
+
+  **New live evidence gathered this round**: `boot/rpi1/vectors.S`'s
+  `fault_data_abort` handler previously only reported DFAR/DFSR/PC/
+  `current_task` — by the time it reads those (the `mrc` reads
+  themselves clobber r0/r1), the ORIGINAL faulting instruction's own
+  operand registers were already gone. Fixed **permanently** (real,
+  useful diagnostic improvement, not reverted) by stashing r0-r3 into
+  r4-r7 before the `mrc` reads (Abort mode doesn't bank r0-r12, so
+  these are genuinely the interrupted instruction's live values), and
+  `abort_report_data` (`kernel_main.vani`) now prints all four plus
+  `context_switch_count`/`irq_count`. Live-reproduced the crash twice
+  with this in place (temporarily raising `pbkdf2_auth_iterations()`
+  to 1000 for the reproduction runs only, reverted after):
+  - Run 1: `pc=00008928` (`buf_write_u32`: `str r2,[r0,r1]`),
+    `addr=00000034`, `r0=00000000 r1=00000034` — base pointer read
+    back as EXACTLY NULL, offset (0x34 = a plausible SHA-256
+    message-schedule-array index×4) intact.
+  - Run 2: `pc=00008934` (`buf_read_u32`: `ldr r0,[r0,r1]`),
+    `addr=8AB40387`, `r0=8AB40337 r1=00000050` — base pointer read
+    back as **wild, uninitialized-looking garbage** (~2.3GB, nowhere
+    near this image's <2MB writable region — not a corrupted-but-
+    recognizable heap/stack address), offset (0x50, again a plausible
+    small array index×4) again intact. `ctxsw=174 irqs=42` at the
+    moment of this fault — plenty of real scheduling activity
+    happened first, not an immediate/early failure.
+
+  Both crashes independently land on the SAME accessor family
+  (`buf_read_u32`/`buf_write_u32`, `dharafs_buf.S`) with the SAME
+  pattern: the **base-pointer argument** specifically is what's
+  corrupted (once to exactly 0, once to unrelated garbage), while the
+  **offset argument survives intact** both times. `buf_read_u32`/
+  `buf_write_u32` themselves are single-instruction leaf functions
+  (re-confirmed: `ldr`/`str r_,[r0,r1]` then return, no r4-r11 usage)
+  — they cannot corrupt their own incoming r0, so whatever's happening
+  corrupts the CALLER's copy of the `w`/`h`/`k` scratch-buffer pointer
+  (`sha256_compress`'s own locals) between when it was last known-good
+  and this particular call, most likely via a spilled stack slot given
+  how many live values `sha256_compress`'s two 64-round loops carry
+  simultaneously (LLVM almost certainly can't keep all of `w`, `h`,
+  `k`, `a`-through-`hh`, and the round temporaries in registers at
+  once). This is genuine forward progress (a real, reproducible,
+  register-level signature, not just a symptom description) but still
+  NOT a full root cause — pinning the exact corrupting write would
+  need instruction-level tracing (a real, actually-stopping GDB
+  breakpoint or QEMU single-step/watchpoint on the specific stack
+  slot), which this round did not attempt again given the SAME GDB
+  breakpoint-acceptance-but-never-fires tooling gap round 61 already
+  hit and documented below was never itself resolved.
+
+  Candidate next steps for a dedicated follow-up round: first resolve
+  the GDB tooling gap itself (breakpoints are accepted but never fire
+  — try a plain `qemu-system-arm -s -S` + `gdb-multiarch` session by
+  hand instead of a scripted attach, since every scripted variant this
+  project has tried so far has failed the same unexplained way); once
+  breakpoints actually work, set a QEMU hardware watchpoint on
+  `sha256_compress`'s own stack-spilled `w`/`h` slot (address derivable
+  from the disassembly once the function's stack frame layout is
+  known) and let it run until the watchpoint fires on an unexpected
+  write — that would show definitively WHAT overwrites it and from
+  where, rather than continuing to infer from post-mortem register
+  dumps alone. This is a genuine reliability concern beyond just
+  authentication: ANY future feature needing a long synchronous
+  computation from a task will hit the same wall.
 
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,
@@ -773,7 +846,8 @@ for by name.
   test suite with no regressions. Pushed to vani-compiler's `main`.
 
 - **PKI (Public Key Infrastructure)** — `[XL, several rounds beyond
-  the crypto foundation above]`
+  the crypto foundation above — SKIPPED FOR NOW, 2026-08-31, same
+  EC-arithmetic blocker as TLS above]`
   Real PKI means X.509 certificate parsing (a nontrivial ASN.1/DER
   parser, a genuinely large and historically bug-prone piece of code
   in any language) plus chain-of-trust validation against root CAs.
@@ -877,8 +951,10 @@ for by name.
   check whether this is the SAME root cause as the task_f trap bug or
   a genuinely separate one once either gets a real backtrace.
 
-- **Secure boot** — `[not sized — hits the SAME hard hardware ceiling
-  as USB boot, see docs/TODO.md's own USB-boot feasibility note above]`
+- **Secure boot** — `[not sized — SKIPPED FOR NOW, 2026-08-31; the
+  hardware-rooted version hits a hard, permanent hardware ceiling
+  (below); the smaller runtime-signature-verification substitute hits
+  the SAME EC-arithmetic blocker as TLS/PKI above]`
   Real secure boot means a hardware-anchored, cryptographically
   verified chain from an immutable root of trust through every stage
   that runs before the OS itself does. **The original Raspberry Pi 1
@@ -1299,8 +1375,8 @@ ones.
   < X% CPU" target set yet) before writing it.
 
 - **Per-task runtime histograms + a real deadline/budget model** —
-  `[M-L, ~3-4 rounds combined, not started — genuinely blocked on a
-  real workload, not just unscoped]`
+  `[M-L, ~3-4 rounds combined — SKIPPED FOR NOW, 2026-08-31, genuinely
+  blocked on a real workload, not just unscoped]`
   This is the one place in this backlog where "build the mechanism
   now, apply it later" doesn't work: a runtime histogram or a
   deadline-miss count is only meaningful relative to something the
@@ -1420,8 +1496,8 @@ ones.
   before).
 
 - **"Why is my task late?" query + determinism-certificate report** —
-  `[L, not started — blocked on the deadline model AND the event ring
-  buffer above, in that order]`
+  `[L, not started — SKIPPED FOR NOW, 2026-08-31, blocked on the
+  deadline model AND the event ring buffer above, in that order]`
   The causal-chain explanation (blocked on mutex X for Y us, preempted
   by IRQ Z for W us) needs the deadline model to know a task WAS late
   in the first place, and the event ring buffer to reconstruct WHY —
@@ -1431,18 +1507,28 @@ ones.
   above). Don't start this before that exists.
 
 - **Incident/flight-recorder capture on watchdog reset** — `[L, not
-  started, currently blocked on a real gap]`
-  `watchdog_arm`/`watchdog_init`/`watchdog_kick` already exist
-  (Phase 2), but `watchdog_kick`'s own comment notes it is NOT
-  currently called anywhere in the scheduler loop — so today a real
-  hang would never actually trigger a watchdog reset to capture an
-  incident from. Wiring `watchdog_kick` into the real per-tick path is
-  a real prerequisite this item depends on, not just missing
-  instrumentation around an existing reset path.
+  started — SKIPPED FOR NOW, 2026-08-31, blocked on a PERMANENT
+  test-environment limitation, not just missing wiring]`
+  `watchdog_arm`/`watchdog_init`/`watchdog_kick` already exist (Phase
+  2), but are deliberately NOT wired into the real per-tick path.
+  Checked directly against `watchdog_arm`'s own comment before assuming
+  this was just an unwired convenience function: it's confirmed
+  EMPIRICALLY (tested at both a 2-second timeout and the maximum
+  possible 20-bit value) that QEMU's `raspi1ap` machine model does not
+  honor `PM_WDOG`'s timeout field at all — writing `PM_RSTC` with
+  `WRCFG=FULL_RESET` resets the emulated machine IMMEDIATELY regardless
+  of what's armed. Since this project tests exclusively via QEMU,
+  wiring `watchdog_kick` in would make the one and only test method
+  permanently unable to boot at all. This is a hardware-verification
+  gap in QEMU's own machine model, not a missing Dhruva feature —
+  revisit only if real Pi 1 hardware-in-the-loop testing (the user's
+  own stated eventual plan, see `project_dhruva_hardware_in_loop_plan`
+  in project memory) becomes available, since real hardware may honor
+  the timeout correctly where QEMU's emulation doesn't.
 
 - **CI-integrated real-time regression thresholds** — `[M, not started
-  — blocked on the histogram work above, AND on accumulating real
-  baseline data]`
+  — SKIPPED FOR NOW, 2026-08-31, blocked on the histogram work above,
+  AND on accumulating real baseline data]`
   Natural fit for this project's existing `test/*.py` convention (same
   shape as `heap_stress.py`/`power_yank.py`) — run under QEMU, compare
   scheduler-latency/context-switch histograms against a checked-in
@@ -1455,8 +1541,8 @@ ones.
   QEMU-relative (regression-detection against its own prior runs), not
   an absolute real-time guarantee claim.
 
-- **Production vs. developer profiling levels** — `[S-M, once
-  something above exists to gate]`
+- **Production vs. developer profiling levels** — `[S-M — SKIPPED FOR
+  NOW, 2026-08-31, once something above exists to gate]`
   This project has no compile-time feature-flag system today (one
   `kernel_main.vani`, compiled as a single unit) — a simple runtime
   on/off toggle per instrumentation tier (checked at each hook site) is

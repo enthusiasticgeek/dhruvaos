@@ -722,7 +722,7 @@ fn abort_fault_is_section_permission(status: u32) -> i64 {
 
 #[no_mangle]
 #[no_heap]
-fn abort_report_data(addr: u32, status: u32, fault_pc: u32) -> i64 {
+fn abort_report_data(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r1: u32, orig_r2: u32, orig_r3: u32) -> i64 {
   let _ = uart_puts("\nFATAL: Data Abort at address ");
   let _ = uart_put_hex32(addr);
   let _ = uart_puts(" status=");
@@ -734,6 +734,27 @@ fn abort_report_data(addr: u32, status: u32, fault_pc: u32) -> i64 {
   let _ = uart_put_hex32(fault_pc);
   let _ = uart_puts(" current_task=");
   let _ = uart_put_hex32(current_task_get());
+  // Round 62c (task #154): the faulting instruction's own r0-r3 at the
+  // moment of the abort -- for this codebase's overwhelmingly common
+  // `str rD, [rBASE, rOFFSET]`/`ldr ...` fault shape, r0 is very
+  // frequently the base pointer and r1 the byte offset (buf_write_u32/
+  // buf_read_byte/etc.'s own AAPCS argument order) -- seeing the ACTUAL
+  // register values (not just the computed fault address) is what can
+  // finally distinguish "the base pointer itself was zeroed" from "a
+  // corrupted offset was added to an otherwise-valid base," which this
+  // investigation has not yet been able to tell apart.
+  let _ = uart_puts(" r0=");
+  let _ = uart_put_hex32(orig_r0);
+  let _ = uart_puts(" r1=");
+  let _ = uart_put_hex32(orig_r1);
+  let _ = uart_puts(" r2=");
+  let _ = uart_put_hex32(orig_r2);
+  let _ = uart_puts(" r3=");
+  let _ = uart_put_hex32(orig_r3);
+  let _ = uart_puts(" ctxsw=");
+  let _ = uart_put_i64(context_switch_count_get());
+  let _ = uart_puts(" irqs=");
+  let _ = uart_put_i64(irq_count_get());
   let _ = uart_puts(" -- halting\n");
   return 0;
 }

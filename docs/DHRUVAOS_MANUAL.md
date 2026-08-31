@@ -129,10 +129,18 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   real experiment raising `task_f`'s stack 8x — NOT simply insufficient
   stack headroom either (the crash relocated to a higher iteration
   count instead of disappearing). Most likely a probabilistic,
-  IRQ-timing-dependent corruption of a live value. See `TODO.md` for
-  the full investigation and candidate next steps — this affects any
-  future feature needing sustained synchronous computation from a
-  task, not just authentication.
+  IRQ-timing-dependent corruption of a live value. A round-62c
+  follow-up extended `fault_data_abort` to report the faulting
+  instruction's own r0-r3 (a permanent diagnostic improvement) and
+  live-captured two crashes with it: both land on the same
+  `buf_read_u32`/`buf_write_u32` accessor pair, and both times
+  specifically the BASE-POINTER argument is corrupted (once to exactly
+  NULL, once to unrelated ~2.3GB garbage) while the offset argument
+  stays intact — a real, reproducible, register-level signature, but
+  still not a full root cause (needs instruction-level tracing to go
+  further). See `TODO.md` for the full investigation and candidate
+  next steps — this affects any future feature needing sustained
+  synchronous computation from a task, not just authentication.
 - **A second, separate, NOT-root-caused bug of the same broad class:
   even one extra real SD block read or write during boot
   intermittently (~20-30%) corrupts unrelated state, surfacing minutes
