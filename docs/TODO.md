@@ -738,20 +738,107 @@ for by name.
   breakpoint-acceptance-but-never-fires tooling gap round 61 already
   hit and documented below was never itself resolved.
 
-  Candidate next steps for a dedicated follow-up round: first resolve
-  the GDB tooling gap itself (breakpoints are accepted but never fire
-  — try a plain `qemu-system-arm -s -S` + `gdb-multiarch` session by
-  hand instead of a scripted attach, since every scripted variant this
-  project has tried so far has failed the same unexplained way); once
-  breakpoints actually work, set a QEMU hardware watchpoint on
-  `sha256_compress`'s own stack-spilled `w`/`h` slot (address derivable
-  from the disassembly once the function's stack frame layout is
-  known) and let it run until the watchpoint fires on an unexpected
-  write — that would show definitively WHAT overwrites it and from
-  where, rather than continuing to infer from post-mortem register
-  dumps alone. This is a genuine reliability concern beyond just
-  authentication: ANY future feature needing a long synchronous
-  computation from a task will hit the same wall.
+  **Round 62d (2026-08-31) same-day follow-up — GDB tooling gap
+  SOLVED, mechanism narrowed further, one strong but not-yet-proven
+  new lead.**
+
+  **The GDB "breakpoint accepted but never fires" gap (round 60/61) is
+  now understood and resolved.** Every prior attempt was a *post-hoc
+  attach* — connecting to an already-booted, already-running guest.
+  By that point round 38's own MMU/W^X hardening has already marked
+  `.text` read+execute-ONLY, so GDB's own memory write to plant a
+  software breakpoint opcode is silently denied — the command reports
+  success, but the byte is never actually patched into memory, so it
+  never fires. Fix: launch QEMU already halted (`-S`) and set
+  breakpoints (and `continue`) BEFORE the first instruction ever runs
+  — `.text` is still writable at that point, and once inserted the
+  breakpoint opcode is already baked into the instruction stream
+  regardless of what W^X does afterward. Verified directly: a plain
+  `break fn_sha256_compress` + `continue` from a `-S`-halted session
+  stopped cleanly. **Reusable technique for any future Dhruva GDB
+  session on this codebase.**
+
+  A software breakpoint on `buf_read_u32`/`buf_write_u32` themselves
+  (even conditional, e.g. `if $r0 == 0`) is USELESS in practice for
+  this bug — those functions are called from inside SHA-256's own
+  64-round compression loop, hundreds of thousands of times over a
+  1000-iteration PBKDF2 run, and each hit costs a full GDB
+  stop/evaluate/resume remote round trip. Under that overhead the
+  guest never got anywhere near its normal failure point within a
+  150s budget. **A much rarer, well-chosen breakpoint location is
+  required** — see below.
+
+  Re-derived `sha256_compress`'s own register discipline directly
+  from its disassembly (not assumed): `w` lives in **r8** and `k`
+  lives in **r11 (fp)** for the function's ENTIRE execution (loaded
+  once from the caller's stack-passed args at entry, never reloaded
+  or spilled again) — both AAPCS callee-saved, both correctly included
+  in `irq_entry.S`'s own `stmdb sp!, {r0-r12, lr}` save. Set a
+  **surgical** conditional breakpoint instead, at `irq_entry.S`'s own
+  final restore instruction (`ldmia sp!, {r0-r12, lr}`, the ONE place
+  every task resume — timer-tick-driven or not — passes through),
+  conditioned on `current_task == 5` (SHELL/task_f) AND the about-to-
+  be-restored r8/r11 stack slots already looking corrupted (0 or
+  implausibly large). This location is hit only ~dozens of times per
+  run (once per real timer tick while task_f happens to be current),
+  not hundreds of thousands — cheap enough to run at near-native
+  speed under GDB.
+
+  **Result: this breakpoint never fired across a full run that still
+  crashed with the exact same signature as before** (`buf_read_u32`,
+  wild-garbage base pointer, `ctxsw=174 irqs=42` — deterministically
+  IDENTICAL counts to an earlier independent, non-GDB session's own
+  crash, suggesting this bug is far more deterministic given a fixed
+  iteration count than "probabilistic IRQ timing" implied). This is a
+  real, meaningful negative result: **the corruption is never present
+  in ANY saved/restored IRQ context frame for task_f, at any point
+  before the crash** — ruling out "an interrupt's save/restore step
+  corrupts r8/r11" as the mechanism. Whatever corrupts these registers
+  does so WITHOUT ever going through a context-switch boundary at all,
+  which points toward either a genuine compiler-codegen defect in one
+  of the hot per-round helper callees, or corruption via a wild
+  pointer write from elsewhere entirely.
+
+  **New, suggestive but NOT yet proven lead**: noticed `"GC:
+  compaction pass"` (task_e's periodic, REAL-SD-I/O background
+  compaction) printed immediately before the FATAL line in every
+  crash captured this session, across independent runs. Round 62's
+  own separate SD-boot bug already proved real SD I/O has SOME
+  genuine memory-safety issue elsewhere in this codebase. Tested
+  directly: with `task_e`'s `dharafs_compact`/`dharafs_read` calls
+  temporarily disabled (task_e still runs and sleeps on schedule, just
+  skips the real I/O), `su` with 1000 PBKDF2 iterations completed
+  CLEANLY twice in a row (confirmed via an unambiguous, cursor-
+  anchored "ok" match, not a guess) with zero crashes. However, a
+  THIRD attempt under the same GC-disabled build also crashed — but
+  that attempt was confounded by the test harness itself retrying a
+  dropped `passwd` command multiple times in quick succession, which
+  may have caused genuine command-dispatch reentrancy on task_f (an
+  artifact of the test script, not necessarily the original bug's own
+  mechanism) — so this data point doesn't cleanly count against the
+  hypothesis, but doesn't confirm it either. **Net: 2 clean, 
+  unconfounded no-crash completions with GC's real SD I/O disabled,
+  0 clean crashes under that condition, vs. 3 independent crashes
+  with GC enabled across this session — suggestive of real SD I/O as
+  a shared root cause with round 62's own SD-boot bug, but the sample
+  size is too small and one run too confounded to call this proven.**
+
+  Candidate next steps for a dedicated follow-up round: (1) repeat the
+  GC-disabled vs. GC-enabled comparison several more times with a
+  cleaner test harness (no retries — treat a dropped command as a
+  discarded run, not a resend) to get a statistically meaningful
+  sample; (2) if the correlation holds, narrow further by disabling
+  ONLY `dharafs_compact` while keeping `dharafs_read`, and vice versa,
+  to isolate which specific SD operation is implicated; (3) use the
+  now-working `-S`-halted GDB technique with a watchpoint on whatever
+  specific buffer/pointer that operation touches, rather than
+  continuing to guess; (4) if SD I/O is confirmed as the shared
+  mechanism, revisit round 62's own SD-boot bug write-up together with
+  this one as likely the SAME root cause, not two separate bugs. This
+  is a genuine reliability concern beyond just authentication: ANY
+  future feature needing a long synchronous computation from a task,
+  or any code path sharing memory near an active SD operation, will
+  hit the same wall.
 
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,
@@ -929,6 +1016,13 @@ for by name.
   "IRQ lands at an unlucky moment corrupts live state" bug class as
   the still-open task_f runtime-trap investigation above, not a
   coincidence — both are real, serious, and NOT YET root-caused.
+  **Round 62d update**: this stopped being pure speculation —
+  disabling task_e's real SD I/O (`dharafs_compact`/`dharafs_read`)
+  made the task_f bug stop reproducing in 2/2 clean, unconfounded
+  test runs (see that entry's own round-62d writeup above for the
+  full evidence and its honest caveats — suggestive, not yet proven).
+  If confirmed by a larger sample, these two bugs are likely the SAME
+  root cause, not two separate ones.
 
   Because of this, media encryption's own on-target self-test
   deliberately verifies only the in-memory transform (safe, 100%
