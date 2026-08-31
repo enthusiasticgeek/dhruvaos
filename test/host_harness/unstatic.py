@@ -100,6 +100,9 @@ WHITELIST = [
     "hmac_sha256",
     "hmac_sha256_bytes_equal",
     "pbkdf2_hmac_sha256",
+    "dharafs_crypto_transform_block",
+    "dharafs_block_read",
+    "dharafs_block_write",
     "filter_check_frame",
     "filter_build_test_frame",
 ]

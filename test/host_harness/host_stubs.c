@@ -327,6 +327,23 @@ int64_t *pbkdf2_t_ptr(void) { return (int64_t *)g_pbkdf2_t; }
 int64_t *pbkdf2_salt_ctr_ptr(void) { return (int64_t *)g_pbkdf2_salt_ctr; }
 int64_t *passwd_scratch_ptr(void) { return (int64_t *)g_passwd_scratch; }
 int64_t *su_hash_scratch_ptr(void) { return (int64_t *)g_su_hash_scratch; }
+
+static uint32_t g_dharafs_crypto_enabled = 0;
+static uint8_t g_dharafs_crypto_key[32] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_nonce[12] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_state[64] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_working[64] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_keystream[512] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_scratch[512] __attribute__((aligned(8)));
+
+uint32_t dharafs_crypto_get_enabled(void) { return g_dharafs_crypto_enabled; }
+int64_t dharafs_crypto_set_enabled(uint32_t v) { g_dharafs_crypto_enabled = v; return 0; }
+int64_t *dharafs_crypto_key_ptr(void) { return (int64_t *)g_dharafs_crypto_key; }
+int64_t *dharafs_crypto_nonce_ptr(void) { return (int64_t *)g_dharafs_crypto_nonce; }
+int64_t *dharafs_crypto_state_ptr(void) { return (int64_t *)g_dharafs_crypto_state; }
+int64_t *dharafs_crypto_working_ptr(void) { return (int64_t *)g_dharafs_crypto_working; }
+int64_t *dharafs_crypto_keystream_ptr(void) { return (int64_t *)g_dharafs_crypto_keystream; }
+int64_t *dharafs_crypto_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_scratch; }
 int64_t irq_count_increment(void) { return 0; }
 int64_t irq_count_get(void) { return 0; }
 int64_t cpu_wfi(void) { return 0; }

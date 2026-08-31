@@ -770,38 +770,98 @@ for by name.
   chain at all — full X.509 is a separate, much larger step after
   that, not a package deal.
 
-- **Media (at-rest) encryption** — `[M-L, ~2-3 rounds — the crypto
-  foundation this was scoped behind is DONE (round 44's ChaCha20);
-  another concretely unblocked candidate]`
-  Encrypt FS blocks before `dharafs_block_write`/after `dharafs_block_read`
-  (the block-device abstraction rounds 33-36 built is the natural
-  integration point — a cipher becomes a transform in that same
-  pipeline, not a separate subsystem). ChaCha20 (round 44,
-  `chacha20_encrypt`) is a perfectly real cipher choice for this —
-  unlike WPA2/WiFi (round 58's own note), at-rest encryption isn't a
-  standardized protocol demanding AES/CCMP specifically, so no new
-  crypto primitive is needed here at all, just wiring the existing one
-  in. Still needs a real design decision up front, not a detail to
-  defer: a key-management story this hardware can't help with (BCM2835
-  has no TPM, no secure element, no hardware key storage of any kind),
-  so a key has to come from somewhere software-only — a passphrase
-  entered at boot (via the existing UART shell) is the most realistic
-  starting point, with a KDF deriving the actual ChaCha20 key from it
-  — PBKDF2-HMAC-SHA256, the SAME primitive the "Real authentication"
-  item above needs; build whichever of the two comes first and the
-  other reuses it, rather than two independent KDF implementations.
-  Nonce management also needs a real answer (ChaCha20's 96-bit nonce
-  must never repeat under the same key — a per-block counter derived
-  from the block number itself, matching this project's own `dev`/
-  block-number addressing already in `dharafs_block_read`/`_write`, is
-  the natural choice, not a random nonce needing its own persistent
-  state). **Also needs Poly1305** (see the crypto-foundation gap noted
-  above) — raw ChaCha20 alone gives confidentiality with no integrity,
-  meaning a corrupted/tampered block would decrypt to silently wrong
-  data instead of being detected; not real security without it. Lower
-  priority than packet filtering above (no live-traffic angle to
-  demonstrate it against the way filtering now has), but genuinely
-  ready to start whenever picked up.
+- **Media (at-rest) encryption** — `[DONE, round 62, 2026-08-31]`
+  DharaFS block encryption layered on round 44's existing ChaCha20
+  stream cipher (no new cipher primitive needed — matches this entry's
+  own original scoping note exactly: unlike WPA2/WiFi, at-rest
+  encryption isn't a standardized protocol demanding AES/CCMP
+  specifically). Key derived once at boot via PBKDF2-HMAC-SHA256 from
+  a fixed passphrase (a real, security-appropriate 10000 iterations —
+  safe here specifically because this runs single-threaded before
+  `start_multitasking`, outside the still-open task_f runtime-trap
+  bug's own observed conditions). Nonce = 12 bytes, all zero except
+  the low 4 holding `block_num` big-endian — unique per block under a
+  fixed key. Hooked in transparently at `dharafs_block_read`/
+  `dharafs_block_write` (renamed to `_raw` + a thin wrapper), the
+  single backend-agnostic choke point round 36's block-device
+  abstraction created — every higher FS layer (checksums, headers,
+  journaling, compaction, permissions) keeps operating on plaintext.
+  Off by default (`dharafs_crypto_enabled` starts at 0) — every
+  existing test keeps running against plaintext blocks unchanged,
+  matching round 36's own `dharafs_block_dev` toggle precedent.
+
+  **Honest, deliberate limitation, not an oversight**: because the
+  nonce is a pure function of `block_num`, overwriting the SAME block
+  twice under the SAME key reuses the SAME keystream — an attacker
+  holding two on-disk snapshots of that block can recover
+  `plaintext_old XOR plaintext_new` (the classic stream-cipher
+  "two-time pad" problem). This is exactly why real full-disk
+  encryption normally uses a wide-block tweakable mode (AES-XTS)
+  instead of a raw stream cipher. Still real, meaningful protection
+  against the simplest and most common threat model (a single
+  stolen/lost SD card, one point-in-time snapshot); the gap only
+  matters against an attacker who can compare multiple snapshots of
+  the same rewritten block over time. **Also still needs Poly1305**
+  for integrity (raw ChaCha20 alone gives confidentiality with no
+  tamper detection) — not attempted here, tracked as a natural
+  follow-up.
+
+  Verified three ways: an on-target self-test (pure in-memory
+  transform round trip — deliberately does NOT touch real SD I/O, see
+  the SD-timing bug entry directly below for why); a host-harness
+  ASAN/UBSAN twin (`test_media_crypto` in `host_main.c`, 8 checks,
+  including a real `dharafs_block_write`/`dharafs_block_read`
+  round trip against the host's in-memory virtual disk, and confirming
+  two different block numbers produce different ciphertext for the
+  same plaintext); and a one-time manual live QEMU verification with a
+  real attached SD image (write succeeds, on-disk bytes provably
+  differ from plaintext, decrypted readback exactly matches — not
+  committed as a permanent boot self-test, per the entry below).
+
+- **A real, serious, pre-existing, timing-dependent SD/boot-sequencing
+  bug** — `[found round 62, 2026-08-31, NOT root-caused — high
+  priority]`
+  Found live while building media encryption's own self-check: doing
+  even ONE extra real SD block read or write during boot — something
+  nothing in this codebase had ever done before this feature, since
+  every other boot-time SD self-test already existed before it —
+  intermittently (~20-30% across repeated live QEMU runs, both for an
+  extra read and for an extra write, tested separately) leaves some
+  later, unrelated state corrupted. Symptom: a genuine Data Abort
+  (NULL buffer, `str r3, [r0], #4` inside `sdhost_drain_fifo_to_buffer`
+  with `r0`=0) minutes later, deep inside `task_e`'s own background
+  DharaFS compaction (`current_task=4`) — not the extra I/O call
+  itself, which always completes and reports success. Confirmed via
+  bisection (10+ repeated live runs at each step) that this is
+  independent of media encryption's own crypto logic entirely: a
+  version of the self-check doing ZERO extra real SD I/O (pure
+  in-memory transform only) is 100% reliable across every run (16/16);
+  restoring even a single extra `sdhost_read_block` call reintroduces
+  the same ~20-30% failure rate. This is most likely the same broad
+  "IRQ lands at an unlucky moment corrupts live state" bug class as
+  the still-open task_f runtime-trap investigation above, not a
+  coincidence — both are real, serious, and NOT YET root-caused.
+
+  Because of this, media encryption's own on-target self-test
+  deliberately verifies only the in-memory transform (safe, 100%
+  reliable) rather than the real SD-integrated path, on every boot —
+  baking a ~20-30%-per-boot destabilization risk into a permanent
+  self-test would make the whole system less reliable for every user,
+  not just those who enable encryption. The real end-to-end
+  integration was instead verified via the host-harness ASAN/UBSAN
+  twin (a real host process, no IRQs, no hazard) and a one-time manual
+  live QEMU run with a real SD image attached (both confirmed correct
+  — see the media encryption entry above).
+
+  Candidate next steps: since this doesn't require the still-elusive
+  live GDB breakpoint the task_f investigation got stuck on (the
+  crash's own manifestation — a Data Abort with a real faulting PC, not
+  a silent `exit()` spin — should symbolize directly), start there;
+  bisect whether the trigger is specifically the extra SD *command*
+  itself (interrupt landing mid-transaction) versus merely the extra
+  wall-clock time it adds during boot's own IRQ-enabled window;
+  check whether this is the SAME root cause as the task_f trap bug or
+  a genuinely separate one once either gets a real backtrace.
 
 - **Secure boot** — `[not sized — hits the SAME hard hardware ceiling
   as USB boot, see docs/TODO.md's own USB-boot feasibility note above]`

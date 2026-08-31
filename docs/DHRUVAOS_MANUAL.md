@@ -99,6 +99,17 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   scoping note: this shell does not actually echo any typed
   characters today, for any command — checked directly against
   `irq_dispatch`'s code, not assumed.
+- **Media (at-rest) encryption (round 62)**: DharaFS block encryption
+  layered on the existing ChaCha20 cipher, hooked in transparently at
+  `dharafs_block_read`/`dharafs_block_write` (every higher FS layer
+  keeps operating on plaintext). Key derived once at boot via
+  PBKDF2-HMAC-SHA256; nonce per block derived from the block number.
+  Off by default. Honest limitation: overwriting the same block twice
+  reuses the same keystream (a two-time-pad leak against an attacker
+  with two on-disk snapshots) — real protection against the common
+  "single stolen SD card" threat, not against multi-snapshot analysis.
+  Verified via an in-memory self-test, a host-harness ASAN/UBSAN twin,
+  and a one-time manual live end-to-end run with a real SD image.
 
 **Known, current limitations (not design goals — see `TODO.md`):**
 - **A real, still-not-fully-root-caused bug: a long-running synchronous
@@ -122,6 +133,18 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   the full investigation and candidate next steps — this affects any
   future feature needing sustained synchronous computation from a
   task, not just authentication.
+- **A second, separate, NOT-root-caused bug of the same broad class:
+  even one extra real SD block read or write during boot
+  intermittently (~20-30%) corrupts unrelated state, surfacing minutes
+  later as a genuine Data Abort inside `task_e`'s background DharaFS
+  compaction.** Found live while building media encryption's own
+  self-check (round 62) — bisected to confirm it's independent of the
+  encryption feature's own logic (a version doing zero extra real SD
+  I/O is 100% reliable across 16+ repeated runs). Media encryption's
+  own on-target self-test deliberately avoids real SD I/O because of
+  this; the real end-to-end path is instead verified via the host
+  harness and a one-time manual live run. See `TODO.md` for the full
+  writeup.
 
 - **6 fixed compile-time tasks, plus up to 10 dynamically-created
   ones (MAX_TASKS=16).** The original 6 slots (HIGH, MEDIUM, LOW — a

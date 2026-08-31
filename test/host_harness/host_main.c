@@ -84,6 +84,12 @@ int64_t fn_hmac_sha256_bytes_equal(int64_t *a, int64_t *b, int64_t n);
 int64_t fn_pbkdf2_hmac_sha256(int64_t *password, int64_t password_len, int64_t *salt, int64_t salt_len, int64_t iterations, int64_t *out);
 int64_t fn_chacha20_encrypt(int64_t *key, int64_t *nonce, uint32_t initial_counter, int64_t *in_buf, int64_t in_len, int64_t *state_buf, int64_t *working_buf, int64_t *keystream_buf, int64_t *out_buf);
 int64_t fn_chacha20_bytes_equal(int64_t *a, int64_t *b, int64_t n);
+int64_t fn_dharafs_crypto_transform_block(int64_t block_num, int64_t *in_buf, int64_t *out_buf);
+int64_t fn_dharafs_block_read(int64_t block_num, int64_t *buf);
+int64_t fn_dharafs_block_write(int64_t block_num, int64_t *buf);
+uint32_t dharafs_crypto_get_enabled(void);
+int64_t dharafs_crypto_set_enabled(uint32_t v);
+int64_t *dharafs_crypto_key_ptr(void);
 uint32_t fn_bignum_add_raw(int64_t *a, int64_t *b, int64_t *out, int64_t n);
 uint32_t fn_bignum_sub_raw(int64_t *a, int64_t *b, int64_t *out, int64_t n);
 int64_t fn_bignum_mul_raw(int64_t *a, int64_t *b, int64_t *out, int64_t n);
@@ -977,6 +983,73 @@ static void test_hmac_pbkdf2_boundaries(void) {
     CHECK(fn_hmac_sha256_bytes_equal(pout2, pexp2, 32) == 1, "pbkdf2-hmac-sha256: iterations=4096 KAT matches");
 }
 
+/* Media (at-rest) encryption: the in-memory transform (encrypt !=
+ * plaintext, decrypt reproduces plaintext) plus the real
+ * dharafs_block_write/dharafs_block_read integration against the
+ * host-harness's own in-memory "SD card" (host_virtual_disk_*,
+ * block_dev==2 by default here) -- a safe, deterministic place to get
+ * real ASAN/UBSAN coverage of the SAME encrypt-then-store/fetch-then-
+ * decrypt path kernel_main.vani's own on-target self-check
+ * deliberately does NOT exercise on every boot (see its own comment:
+ * doing real SD I/O at boot was found, live, to intermittently
+ * corrupt unrelated state minutes later -- a separate, pre-existing
+ * bug, not a flaw in this transform). No such hazard exists in this
+ * host process (no IRQs, no real SD controller), so this is the right
+ * place to verify the real integration continuously. */
+static void test_media_crypto(void) {
+    int64_t *key = dharafs_crypto_key_ptr();
+    for (int i = 0; i < 32; i++) buf_write_byte(key, (uint32_t)i, (uint32_t)(i * 3 + 1));
+
+    int64_t *plaintext = dhruva_alloc_bytes(512);
+    for (int i = 0; i < 512; i++) buf_write_byte(plaintext, (uint32_t)i, (uint32_t)((i * 7 + 11) & 255));
+
+    int64_t *ciphertext = dhruva_alloc_bytes(512);
+    fn_dharafs_crypto_transform_block(42, plaintext, ciphertext);
+    CHECK(fn_chacha20_bytes_equal(ciphertext, plaintext, 512) == 0,
+          "media-crypto: transform is not the identity (real encryption happened)");
+
+    int64_t *decrypted = dhruva_alloc_bytes(512);
+    fn_dharafs_crypto_transform_block(42, ciphertext, decrypted);
+    CHECK(fn_chacha20_bytes_equal(decrypted, plaintext, 512) == 1,
+          "media-crypto: in-memory transform round trip reproduces plaintext");
+
+    /* Different block_num must derive a different nonce -- encrypting
+     * the SAME plaintext at a different block must not produce the
+     * same ciphertext (the whole point of a per-block nonce). */
+    int64_t *ciphertext_other_block = dhruva_alloc_bytes(512);
+    fn_dharafs_crypto_transform_block(43, plaintext, ciphertext_other_block);
+    CHECK(fn_chacha20_bytes_equal(ciphertext, ciphertext_other_block, 512) == 0,
+          "media-crypto: different block_num produces different ciphertext (per-block nonce)");
+
+    /* Real dharafs_block_write/dharafs_block_read integration against
+     * the host virtual disk -- proves the actual feature (not just
+     * the transform in isolation) works end-to-end. */
+    dharafs_crypto_set_enabled(1);
+    int64_t wr = fn_dharafs_block_write(100, plaintext);
+    CHECK(wr == 0, "media-crypto: dharafs_block_write with encryption enabled succeeds");
+
+    int64_t *raw = dhruva_alloc_bytes(512);
+    host_virtual_disk_read(100, raw);
+    CHECK(fn_chacha20_bytes_equal(raw, plaintext, 512) == 0,
+          "media-crypto: on-disk bytes differ from plaintext (real encryption at rest)");
+
+    int64_t *readback = dhruva_alloc_bytes(512);
+    int64_t rd = fn_dharafs_block_read(100, readback);
+    CHECK(rd == 0, "media-crypto: dharafs_block_read with encryption enabled succeeds");
+    CHECK(fn_chacha20_bytes_equal(readback, plaintext, 512) == 1,
+          "media-crypto: dharafs_block_read decrypts back to the original plaintext");
+    dharafs_crypto_set_enabled(0);
+
+    /* Encryption OFF (the default) must be a byte-for-byte passthrough
+     * -- the existing regression suite's own safety net. */
+    int64_t wr2 = fn_dharafs_block_write(101, plaintext);
+    CHECK(wr2 == 0, "media-crypto: dharafs_block_write with encryption disabled succeeds");
+    int64_t *raw2 = dhruva_alloc_bytes(512);
+    host_virtual_disk_read(101, raw2);
+    CHECK(fn_chacha20_bytes_equal(raw2, plaintext, 512) == 1,
+          "media-crypto: on-disk bytes match plaintext exactly when encryption is disabled");
+}
+
 static void test_chacha20_boundaries(void) {
     int64_t *key = dhruva_alloc_bytes(32);
     int64_t *nonce = dhruva_alloc_bytes(12);
@@ -1278,6 +1351,7 @@ int main(void) {
     test_chmod_chown_permissions();
     test_sha256_boundaries();
     test_hmac_pbkdf2_boundaries();
+    test_media_crypto();
     test_chacha20_boundaries();
     test_bignum_boundaries();
     test_lan9512_framing();
