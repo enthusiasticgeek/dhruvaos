@@ -147,6 +147,12 @@ extern "C" fn dharafs_crypto_state_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_working_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_keystream_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_scratch_ptr() -> mut ref i64;
+extern "C" fn fault_write_countdown_get() -> u32;
+extern "C" fn fault_write_countdown_set(v: u32) -> i64;
+extern "C" fn fault_irqburst_countdown_get() -> u32;
+extern "C" fn fault_irqburst_countdown_set(v: u32) -> i64;
+extern "C" fn fault_netdrop_countdown_get() -> u32;
+extern "C" fn fault_netdrop_countdown_set(v: u32) -> i64;
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn shell_line_scratch_get() -> mut ref i64;
 extern "C" fn eval_values_scratch_set(addr: mut ref i64) -> i64;
@@ -1328,6 +1334,13 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
 }
 
 fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
+  // Round 62 (fault injection): `fault write <n>` -- see
+  // fault_write_maybe_inject's own comment. Checked before touching
+  // any hardware register at all, so an injected failure has zero
+  // side effects on the real SD controller state.
+  if fault_write_maybe_inject() == (1 as u32) {
+    return 1;
+  }
   let sdhbct: i64 = 0x2020203C;
   let sdhblc: i64 = 0x20202050;
   let sdhsts: i64 = 0x20202020;
@@ -4002,6 +4015,18 @@ fn irq_dispatch() -> i64 {
     // comment) -- a single best-effort byte keeps ticks visible in
     // the log without reintroducing a blocking call to a hard-RT ISR.
     let _ = uart_putc_nonblocking(46);
+
+    // Round 62 (fault injection): `fault irqburst <n>` -- see
+    // fault_irqburst_take's own comment for exactly what this does
+    // and does NOT simulate. Jumps the clock forward by n EXTRA ticks
+    // before scheduler_switch_from_irq (called by our own caller,
+    // irq_entry.S) does its normal +1 -- net effect, this tick's
+    // tick_count advances by n+1 instead of 1.
+    let irqburst_extra: u32 = fault_irqburst_take();
+    if irqburst_extra > (0 as u32) {
+      let _ = scheduler_set_tick_count_test_only(scheduler_get_tick_count() + irqburst_extra);
+    }
+
     was_timer_tick = 1;
   }
 
@@ -4247,6 +4272,17 @@ fn netif_get_mac(out_buf: mut ref i64) -> i64 {
 fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
   if frame_len > 512 {
     return 0 - 1;
+  }
+  // Round 62 (fault injection): `fault netdrop <n>` -- see
+  // fault_netdrop_maybe_inject's own comment. Every outgoing frame
+  // (ARP/IPv4/ICMP/UDP/TCP) passes through this single choke point,
+  // so this one check covers all of them. Reports success (matching
+  // what a real dropped packet looks like to the sender, which never
+  // learns the frame didn't actually go out) while silently
+  // discarding it -- letting existing timeout/retransmission logic
+  // (round 37) be exercised on demand in a live session.
+  if fault_netdrop_maybe_inject() == (1 as u32) {
+    return 0;
   }
   if usb_net_get_kind() == (1 as u32) {
     let mps: u32 = usb_net_get_bulk_out_mps();
@@ -12535,6 +12571,73 @@ fn shell_dispatch_passwd(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> 
   return 0;
 }
 
+// Round 51/62: shell front end for every fault-injection type this
+// project has. `fault alloc <n>` (round 51) deliberately triggers the
+// SAME real, unrecoverable dhruva_alloc_bytes OOM-fatal halt a genuine
+// heap exhaustion would -- there is deliberately no confirmation
+// prompt and no way to disarm it once the countdown reaches zero,
+// matching round 45's own "no OOM, no surprises" mandate empirically
+// under QEMU. `fault write <n>` (round 62) forces the Nth subsequent
+// real SD write to fail without touching hardware. `fault irqburst
+// <n>` (round 62) jumps tick_count forward by n extra ticks on the
+// very next real timer tick -- a "slow ISR catching up" time warp, NOT
+// a simulation of n real, distinct preemption events (see
+// fault_irqburst_take's own comment for why that's a deliberate scope
+// limit). `fault netdrop <n>` (round 62) silently discards the next n
+// outgoing network frames while reporting success, exercising
+// existing TCP timeout/retransmission logic on demand.
+fn shell_dispatch_fault(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  let usage: Str = "usage: fault alloc|write|irqburst|netdrop <n>\n";
+  if cmd_end >= line_len {
+    let _ = uart_puts(usage);
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+  if sub_end >= line_len {
+    let _ = uart_puts(usage);
+    return 0;
+  }
+  let n_start: i64 = sub_end + 1;
+  let n_end: i64 = shell_find_space(line_buf, n_start, line_len);
+  let n: i64 = shell_parse_decimal(line_buf, n_start, n_end);
+  if n <= 0 {
+    let _ = uart_puts("usage: n must be a positive integer\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "alloc") == 1 {
+    let _ = dhruva_fault_inject_alloc_arm(n);
+    let _ = uart_puts("armed: will halt with a FATAL diagnostic after ");
+    let _ = uart_put_i64(n);
+    let _ = uart_puts(" more allocation(s).\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "write") == 1 {
+    let _ = fault_write_countdown_set(n as u32);
+    let _ = uart_puts("armed: the ");
+    let _ = uart_put_i64(n);
+    let _ = uart_puts("th subsequent SD write will fail.\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "irqburst") == 1 {
+    let _ = fault_irqburst_countdown_set(n as u32);
+    let _ = uart_puts("armed: the next timer tick will jump the clock forward by ");
+    let _ = uart_put_i64(n);
+    let _ = uart_puts(" extra tick(s).\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "netdrop") == 1 {
+    let _ = fault_netdrop_countdown_set(n as u32);
+    let _ = uart_puts("armed: the ");
+    let _ = uart_put_i64(n);
+    let _ = uart_puts("th subsequent outgoing network frame will be silently dropped.\n");
+    return 0;
+  }
+  let _ = uart_puts(usage);
+  return 0;
+}
+
 // Parses and runs exactly one already-complete shell line. Deliberately
 // NOT #[no_heap] (same reasoning as task_e's GC pass above): every
 // scratch buffer here is a fresh dhruva_alloc_bytes, and this task can
@@ -13543,43 +13646,12 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
-  // Round 51: deliberately triggers the SAME real, unrecoverable
-  // dhruva_alloc_bytes OOM-fatal halt (runtime_stubs.c) that a genuine
-  // heap exhaustion would -- see dhruva_fault_inject_alloc_arm's own
-  // comment. Arms a countdown; the Nth subsequent allocation anywhere
-  // in the system (not just future shell commands) halts. There is
-  // deliberately no confirmation prompt and no way to disarm it once
-  // the countdown reaches zero -- that IS the real failure mode this
-  // exists to exercise, matching round 45's own "no OOM, no
-  // surprises" mandate empirically under QEMU rather than only via
-  // the host harness's synthetic constructions.
+  // Round 51/62: fault injection. Factored into its own function (not
+  // inlined here) for the same reason shell_dispatch_fw/_su/_passwd
+  // already are -- task_f's own #[bounded_stack] budget, a real
+  // compiler-enforced check, not a style preference.
   if shell_word_matches(line_buf, 0, cmd_end, "fault") == 1 {
-    if cmd_end >= line_len {
-      let _ = uart_puts("usage: fault alloc <n>  (halts on the Nth allocation from now)\n");
-      return 0;
-    }
-    let sub_start: i64 = cmd_end + 1;
-    let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
-    if shell_word_matches(line_buf, sub_start, sub_end, "alloc") == 0 {
-      let _ = uart_puts("usage: fault alloc <n>  (halts on the Nth allocation from now)\n");
-      return 0;
-    }
-    if sub_end >= line_len {
-      let _ = uart_puts("usage: fault alloc <n>  (halts on the Nth allocation from now)\n");
-      return 0;
-    }
-    let n_start: i64 = sub_end + 1;
-    let n_end: i64 = shell_find_space(line_buf, n_start, line_len);
-    let n: i64 = shell_parse_decimal(line_buf, n_start, n_end);
-    if n <= 0 {
-      let _ = uart_puts("usage: fault alloc <n>  (n must be a positive integer)\n");
-      return 0;
-    }
-    let _ = dhruva_fault_inject_alloc_arm(n);
-    let _ = uart_puts("armed: will halt with a FATAL diagnostic after ");
-    let _ = uart_put_i64(n);
-    let _ = uart_puts(" more allocation(s).\n");
-    return 0;
+    return shell_dispatch_fault(line_buf, cmd_end, line_len);
   }
 
   // Round 29: gives the entire TCP connection API (round 22's own
@@ -15167,6 +15239,55 @@ fn dharafs_encryption_self_check() -> i64 {
     let _ = uart_puts(" (FAIL)\n");
   }
   return 0;
+}
+
+// Round 62 (fault-injection framework completion): checks and
+// decrements a fault-injection countdown, returning 1 exactly on the
+// call where it reaches 0 (the "inject now" signal), matching round
+// 51's own dhruva_fault_inject_alloc_arm contract. 0 (disarmed) always
+// returns 0. Shared shape for all three of write/irqburst/netdrop
+// below -- each has its own get/set pair (boot/fault_inject_state.S)
+// since vani has no way to pass "a reference to a specific global
+// counter" as an argument.
+fn fault_write_maybe_inject() -> u32 {
+  let c: u32 = fault_write_countdown_get();
+  if c == (0 as u32) {
+    return 0 as u32;
+  }
+  let c2: u32 = c - (1 as u32);
+  let _ = fault_write_countdown_set(c2);
+  if c2 == (0 as u32) {
+    return 1 as u32;
+  }
+  return 0 as u32;
+}
+
+// Different shape from the "Nth call" pattern above: irqburst has no
+// analogous "Nth tick" concept worth having (a burst is logically
+// "right now"), so `fault irqburst <n>` arms the burst SIZE directly,
+// takes effect on the very next real timer tick, and self-disarms.
+// Safe to read-then-clear in two steps rather than a single atomic
+// op: this is only ever called from irq_dispatch, and this single-
+// core system only ever runs one IRQ at a time.
+fn fault_irqburst_take() -> u32 {
+  let n: u32 = fault_irqburst_countdown_get();
+  if n > (0 as u32) {
+    let _ = fault_irqburst_countdown_set(0 as u32);
+  }
+  return n;
+}
+
+fn fault_netdrop_maybe_inject() -> u32 {
+  let c: u32 = fault_netdrop_countdown_get();
+  if c == (0 as u32) {
+    return 0 as u32;
+  }
+  let c2: u32 = c - (1 as u32);
+  let _ = fault_netdrop_countdown_set(c2);
+  if c2 == (0 as u32) {
+    return 1 as u32;
+  }
+  return 0 as u32;
 }
 
 // Round 44: bignum foundation, the crypto-primitives-foundation

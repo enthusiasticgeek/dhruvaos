@@ -90,6 +90,15 @@ int64_t fn_dharafs_block_write(int64_t block_num, int64_t *buf);
 uint32_t dharafs_crypto_get_enabled(void);
 int64_t dharafs_crypto_set_enabled(uint32_t v);
 int64_t *dharafs_crypto_key_ptr(void);
+uint32_t fn_fault_write_maybe_inject(void);
+uint32_t fn_fault_irqburst_take(void);
+uint32_t fn_fault_netdrop_maybe_inject(void);
+uint32_t fault_write_countdown_get(void);
+int64_t fault_write_countdown_set(uint32_t v);
+uint32_t fault_irqburst_countdown_get(void);
+int64_t fault_irqburst_countdown_set(uint32_t v);
+uint32_t fault_netdrop_countdown_get(void);
+int64_t fault_netdrop_countdown_set(uint32_t v);
 uint32_t fn_bignum_add_raw(int64_t *a, int64_t *b, int64_t *out, int64_t n);
 uint32_t fn_bignum_sub_raw(int64_t *a, int64_t *b, int64_t *out, int64_t n);
 int64_t fn_bignum_mul_raw(int64_t *a, int64_t *b, int64_t *out, int64_t n);
@@ -1050,6 +1059,44 @@ static void test_media_crypto(void) {
           "media-crypto: on-disk bytes match plaintext exactly when encryption is disabled");
 }
 
+/* Fault-injection framework completion (round 62): the "Nth call
+ * fails" countdown logic itself (fault_write_maybe_inject/
+ * fault_netdrop_maybe_inject) and the "take the armed burst size"
+ * logic (fault_irqburst_take) -- the actual NEW code this round adds,
+ * independent of the hardware-touching call sites (sdhost_write_block/
+ * netif_send_frame/irq_dispatch) that aren't meaningful to exercise on
+ * a host process. */
+static void test_fault_injection(void) {
+    /* Disarmed (0) is always a no-op. */
+    fault_write_countdown_set(0);
+    CHECK(fn_fault_write_maybe_inject() == 0, "fault-write: disarmed never injects");
+    CHECK(fn_fault_write_maybe_inject() == 0, "fault-write: disarmed stays disarmed");
+
+    /* Armed to 3: first two calls decrement without injecting, the
+     * third injects and leaves it disarmed afterward. */
+    fault_write_countdown_set(3);
+    CHECK(fn_fault_write_maybe_inject() == 0, "fault-write: 1st of 3 does not inject");
+    CHECK(fault_write_countdown_get() == 2, "fault-write: countdown decremented to 2");
+    CHECK(fn_fault_write_maybe_inject() == 0, "fault-write: 2nd of 3 does not inject");
+    CHECK(fn_fault_write_maybe_inject() == 1, "fault-write: 3rd of 3 injects");
+    CHECK(fault_write_countdown_get() == 0, "fault-write: auto-disarmed after injecting");
+    CHECK(fn_fault_write_maybe_inject() == 0, "fault-write: stays disarmed, no repeat injection");
+
+    /* Same shape for netdrop -- a separate, independent countdown. */
+    fault_netdrop_countdown_set(1);
+    CHECK(fn_fault_netdrop_maybe_inject() == 1, "fault-netdrop: armed to 1 injects on the 1st call");
+    CHECK(fault_netdrop_countdown_get() == 0, "fault-netdrop: auto-disarmed after injecting");
+
+    /* irqburst: take() returns the armed value once, then clears it --
+     * a "take", not a "peek". */
+    fault_irqburst_countdown_set(0);
+    CHECK(fn_fault_irqburst_take() == 0, "fault-irqburst: disarmed take() returns 0");
+    fault_irqburst_countdown_set(50);
+    CHECK(fn_fault_irqburst_take() == 50, "fault-irqburst: armed take() returns the burst size");
+    CHECK(fault_irqburst_countdown_get() == 0, "fault-irqburst: self-disarms after being taken");
+    CHECK(fn_fault_irqburst_take() == 0, "fault-irqburst: a second take() returns 0, not 50 again");
+}
+
 static void test_chacha20_boundaries(void) {
     int64_t *key = dhruva_alloc_bytes(32);
     int64_t *nonce = dhruva_alloc_bytes(12);
@@ -1352,6 +1399,7 @@ int main(void) {
     test_sha256_boundaries();
     test_hmac_pbkdf2_boundaries();
     test_media_crypto();
+    test_fault_injection();
     test_chacha20_boundaries();
     test_bignum_boundaries();
     test_lan9512_framing();

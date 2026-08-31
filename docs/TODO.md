@@ -447,9 +447,23 @@ for by name.
   ChaCha20 for anything that needs to resist an active adversary, not
   just a passive one.
 
-- **AES** — `[L, genuinely harder than it sounds — not yet begun,
-  added 2026-08-30 per explicit request]`
-  Two real, independent reasons to want it despite round 44's own
+- **AES** — `[L, genuinely harder than it sounds — SKIPPED FOR NOW,
+  2026-08-31, revisit if WPA2/WiFi or FIPS-grade TLS actually starts]`
+  Explicitly deferred, not abandoned: this item's own two reasons to
+  want AES (below) are both about OTHER, currently-inactive roadmap
+  items (WPA2's mandatory CCMP mode, and FIPS-constrained TLS
+  deployments) — neither is being worked on right now, so there is no
+  live consumer for AES at the moment. The one feature that WAS just
+  built and could plausibly have used it (media/at-rest encryption,
+  round 62) deliberately did NOT need it: ChaCha20 already covers that
+  use case per this project's own original design note (at-rest
+  encryption isn't a standardized protocol demanding AES/CCMP the way
+  WPA2 is). Building a safe, constant-time AES implementation is real,
+  non-trivial work (see the cache-timing discussion below) that would
+  sit unused until WPA2 or a compliance-constrained TLS client actually
+  gets picked up — better to defer it until one of those is real,
+  rather than build a primitive speculatively ahead of any actual
+  caller. Two real, independent reasons to want it despite round 44's own
   deliberate ChaCha20-over-AES choice, both already implied elsewhere
   in this roadmap but not spelled out until now: (1) WPA2's CCMP mode
   (the WiFi item above) is AES-based by the standard itself, not a
@@ -1321,9 +1335,7 @@ ones.
   done and what instrumentation (contention count, worst-case wait)
   remains.
 
-- **Fault injection framework** — `[M, ~1-2 rounds — allocation-failure
-  half DONE, round 51; FS write latency/IRQ bursts/forced
-  retransmission not started]`
+- **Fault injection framework** — `[DONE, round 62, 2026-08-31]`
   `dhruva_fault_inject_alloc_arm(after_n)` + shell `fault alloc <n>`:
   arms a countdown, and the Nth subsequent `dhruva_alloc_bytes` call
   fails via the real `dhruva_oom_fatal` halt regardless of whether
@@ -1355,6 +1367,57 @@ ones.
   original brainstorm doc — which needed touching the scheduler/
   interrupt assembly directly — is now DONE too, see the "self-
   observing kernel" item above (round 53).
+
+  **Round 62 completed the remaining three fault types** — `fault
+  write <n>`, `fault irqburst <n>`, `fault netdrop <n>` — following
+  the same "0 means disarmed, production unaffected" contract as
+  `alloc`, in a new `boot/fault_inject_state.S` (these three live in
+  vani, not `runtime_stubs.c`, since their injection points --
+  `sdhost_write_block`, `irq_dispatch`, `netif_send_frame` -- are vani
+  functions, not C). The shell front end was factored into its own
+  `shell_dispatch_fault` from the start (the same `#[bounded_stack]`
+  reason `shell_dispatch_fw`/`_su`/`_passwd` already were), rather than
+  inlining and discovering the same budget failure again.
+  - `fault write <n>`: forces the Nth subsequent real SD write to fail
+    (a real I/O error, no hardware touched) — exercises DharaFS's own
+    write-failure handling on demand. Live-verified: armed to 1, the
+    next `write` command reported `error`.
+  - `fault netdrop <n>`: silently discards the next n outgoing network
+    frames while reporting success to the sender — `netif_send_frame`
+    is the single choke point every outgoing frame (ARP/IPv4/ICMP/UDP/
+    TCP) already passes through, so one injection point covers all of
+    them. Live-verified: armed to 1, `ping 0.0.0.0` (normally `reply
+    from 0.0.0.0 seq=1`) instead reported `ping: no reply`.
+  - `fault irqburst <n>`: on the next real timer tick, jumps
+    `tick_count` forward by n EXTRA ticks via the existing
+    `scheduler_set_tick_count_test_only` test hook. Deliberately scoped
+    as a "clock time-warp" (simulating what a slow/blocked ISR
+    catching up on missed ticks looks like from the scheduler's own
+    point of view), NOT a simulation of n real, distinct context-
+    switch/preemption events firing in rapid succession — that would
+    need looping inside `scheduler_switch_from_irq`'s own AAPCS-
+    sensitive native asm (`context_switch.S`), exactly the class of
+    code round 53 already found a real, hard-to-spot callee-saved-
+    register bug in (see [[feedback_aapcs_callee_saved_registers_asm]]
+    in project memory) — not worth that risk for a test convenience.
+    Live-verified: armed to 50, `diagnose` showed `uptime_ticks`
+    jumping by ~59 over one real tick interval (base +9 real ticks
+    during the round trip + the 50 injected), and incidentally stress-
+    tested the mutex-wait tracker too (`mutex worst-case wait` jumped
+    from 3 to 53 ticks in the same step, a genuine, unplanned side
+    effect of a sudden clock jump while a task was mid-sleep holding
+    the demo mutex).
+
+  All three also get host-harness ASAN/UBSAN coverage
+  (`test_fault_injection` in `host_main.c`) of the actual new countdown
+  logic (the hardware-touching call sites themselves aren't meaningful
+  to exercise on a host process). Full regression battery green
+  (qemu_run, phase4_milestone, heap_stress, host_harness 315 PASS/0
+  FAIL). One `phase4_milestone.py` run during this work hit the
+  already-documented, pre-existing intermittent SD-boot bug (see the
+  entry above) — confirmed unrelated to this round's own changes (5/5
+  clean re-runs immediately after; same exact FATAL signature as
+  before).
 
 - **"Why is my task late?" query + determinism-certificate report** —
   `[L, not started — blocked on the deadline model AND the event ring

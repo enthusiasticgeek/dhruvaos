@@ -103,6 +103,9 @@ WHITELIST = [
     "dharafs_crypto_transform_block",
     "dharafs_block_read",
     "dharafs_block_write",
+    "fault_write_maybe_inject",
+    "fault_irqburst_take",
+    "fault_netdrop_maybe_inject",
     "filter_check_frame",
     "filter_build_test_frame",
 ]

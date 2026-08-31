@@ -344,6 +344,17 @@ int64_t *dharafs_crypto_state_ptr(void) { return (int64_t *)g_dharafs_crypto_sta
 int64_t *dharafs_crypto_working_ptr(void) { return (int64_t *)g_dharafs_crypto_working; }
 int64_t *dharafs_crypto_keystream_ptr(void) { return (int64_t *)g_dharafs_crypto_keystream; }
 int64_t *dharafs_crypto_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_scratch; }
+
+static uint32_t g_fault_write_countdown = 0;
+static uint32_t g_fault_irqburst_countdown = 0;
+static uint32_t g_fault_netdrop_countdown = 0;
+
+uint32_t fault_write_countdown_get(void) { return g_fault_write_countdown; }
+int64_t fault_write_countdown_set(uint32_t v) { g_fault_write_countdown = v; return 0; }
+uint32_t fault_irqburst_countdown_get(void) { return g_fault_irqburst_countdown; }
+int64_t fault_irqburst_countdown_set(uint32_t v) { g_fault_irqburst_countdown = v; return 0; }
+uint32_t fault_netdrop_countdown_get(void) { return g_fault_netdrop_countdown; }
+int64_t fault_netdrop_countdown_set(uint32_t v) { g_fault_netdrop_countdown = v; return 0; }
 int64_t irq_count_increment(void) { return 0; }
 int64_t irq_count_get(void) { return 0; }
 int64_t cpu_wfi(void) { return 0; }
