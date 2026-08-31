@@ -574,58 +574,97 @@ for by name.
   a different uid's password — all 14 checks in one live run matched
   exactly.
 
-- **Long-running synchronous computation stalls permanently under the
-  real scheduler** — `[found round 61, 2026-08-30, NOT YET ROOT-
-  CAUSED — high priority]`
+- **Long-running synchronous computation crashes into a silent runtime
+  trap under the real scheduler** — `[found round 61, investigated
+  further 2026-08-30, STILL NOT FULLY ROOT-CAUSED — high priority]`
   Found while tuning real authentication's own PBKDF2 iteration count.
   A synchronous, non-yielding loop (no `task_sleep_ticks` calls) run
   from the interactive shell (`task_f`), once it survives enough timer
   ticks under the real post-`start_multitasking` scheduler, reliably
-  **stops making progress permanently partway through** — not merely
-  slowly, genuinely stuck: an independent, unconditional per-iteration
-  counter (not just a debug print's own condition) stopped advancing
-  too, and stayed flat across a 4-minute observation window with zero
-  further progress. The identical loop body completes correctly and
-  quickly when run at boot, before `start_multitasking` — single-
-  threaded, no interrupts enabled yet.
+  **stops making progress permanently partway through**. The identical
+  loop body completes correctly and quickly when run at boot, before
+  `start_multitasking` — single-threaded, no interrupts enabled yet.
 
-  **Ruled out, not just suspected**: a priority-ceiling boost
-  (`dhruva_prio_lock(0)`/`dhruva_prio_unlock`) around the computation
-  was tried first (reasoning: `task_f`'s own priority 3 could starve it
-  behind more-frequently-ready higher-priority demo tasks) and
-  measured to make **no reliable difference** — the same stall
-  reproduced with or without it, ruling out simple priority starvation
-  as the root cause. The function's own parameters were also confirmed
-  correct at entry via direct instrumentation (`iterations`/
-  `password_len`/`salt_len` all printed exactly as passed) and stayed
-  correct — the bug is not argument corruption, nor is it the debug
-  print's own modulo condition (an independent, unconditional counter
-  incrementing every real loop iteration showed the same flat-lining).
+  **What "stalls permanently" actually turned out to mean** (found via
+  a real fix, not further guessing): `boot/rpi1/runtime_stubs.c`'s
+  `dprintf()` — the backing implementation vani's own compiler-inserted
+  runtime safety traps (`__intent_trap`: array-bounds check,
+  checked-arithmetic overflow, division by zero, shift-range, and
+  custom `assert "msg"` failures) call before `exit()` — was a total
+  no-op. This meant **every** occurrence of **any** compiler-inserted
+  trap anywhere in this codebase looked exactly like an unexplained
+  permanent freeze (the CPU silently spins forever in `exit()`'s own
+  `while(1){}`, with IRQs still enabled so every *other* task keeps
+  running normally the whole time) instead of a diagnosable panic with
+  a real message. `dprintf()` is now wired to real raw-MMIO UART output
+  (matching `dhruva_oom_puts`'s own "must work even from a
+  possibly-corrupted state" reasoning) and supports `%s`/`%d`/`%ld`/
+  `%lld` — the only specifier shapes vani's LLVM backend ever emits.
+  This is a genuine, permanent, project-wide diagnostics improvement,
+  independent of whatever specific bug triggers a trap next.
 
-  Empirically bounded, not fully root-caused: 200 iterations of this
-  specific loop shape reliably completes in ~1 real second; 500
-  reliably never completes at all, confirmed across multiple runs.
-  Whatever triggers this appears to depend on cumulative time/tick
-  count survived by one continuously-running computation, not on the
-  exact operation being performed.
+  With that fix in place, the actual panic text is now visible:
+  **`"shift amount out of range"`** fires (with `task_f`'s stock
+  16384-byte stack) once the PBKDF2 loop survives roughly 500+
+  iterations; at a higher iteration count (10000) a **Data Abort**
+  (section permission fault) was observed instead, faulting inside the
+  `buf_write_u32` family with an implausibly low target address —
+  consistent with a corrupted pointer or shift-amount argument, not a
+  logic error in the HMAC/PBKDF2/SHA-256 arithmetic itself (every
+  literal shift amount in `sha256_rotr32`'s callers, ChaCha20's
+  rotate, etc. is a compile-time constant in the 3–19 range; only
+  `sha256_rotr32`'s own `n` *parameter* is a genuine runtime value,
+  always passed a safe literal by every caller).
 
-  Candidate next steps for a dedicated follow-up round (not attempted
-  here — this needs its own focused investigation, not a side effect
-  of an unrelated feature's own time budget): reproduce with a GDB/
-  QEMU-monitor breakpoint once the stall is observed, to get a real
-  register/PC snapshot of exactly where `task_f` is stuck; audit
-  whether `sleep_until_table`/`eff_prio_table`/`current_task` can be
-  corrupted by an interaction between a long-held ceiling boost and
-  the mutex-inheritance demo's own eff_prio writes (rounds 55/59, the
-  first other consumer of a comparably long-running, heavily-preempted
-  computation); check whether AAPCS 64-bit (`i64`) local variables
-  held live across MANY repeated preemptions of the SAME function
-  activation are correctly preserved by this project's context-switch
-  frame (an untested case — no prior task in this codebase holds an
-  `i64` local across anywhere near this many ticks). This is a
-  genuine reliability concern beyond just authentication: ANY future
-  feature needing a long synchronous computation from a task will hit
-  the same wall.
+  **Ruled out, not just suspected**: simple priority starvation (a
+  `dhruva_prio_lock(0)` ceiling boost made no reliable difference);
+  argument corruption (`iterations`/`password_len`/`salt_len` all
+  verified correct at entry and stayed correct); a scheduler
+  malfunction (GDB-based `tick_count`/`current_task` logging over 30+
+  seconds proved the scheduler and timer IRQ keep working perfectly
+  normally — `task_f` legitimately keeps being `current_task` the
+  whole time, it just stops executing new instructions). **Also now
+  ruled out**: plain stack-overflow-with-insufficient-headroom as the
+  sole/complete root cause. `task_f`'s real stack was experimentally
+  raised from its stock 16384 bytes all the way to 131072 (8x) —
+  `passwd` at 5000 iterations then succeeded cleanly with zero crash,
+  but the exact same build crashed again (a genuine `FATAL`, confirmed
+  by this session's own `dprintf` fix, not just "still running") at
+  10000 iterations. A real, complete stack-depth fix would make the
+  crash disappear at some finite stack size, not relocate it to a
+  higher iteration count — so this is most likely a **probabilistic,
+  IRQ-timing-dependent corruption** of some live value (a spilled
+  shift-amount argument or scratch pointer), whose odds of occurring
+  rise with the number of timer ticks the computation survives, not a
+  fixed threshold tied to either iteration count or stack depth alone.
+  (Reverted the experimental 131072-byte stack back to the stock 16384
+  — it is not a proven fix and would otherwise permanently cost half
+  the system's 256KB heap for no confirmed benefit.)
+
+  Empirically bounded, not fully root-caused: 200 iterations reliably
+  completes in ~1 real second and is the only value measured safe
+  across every attempt so far (this is why `pbkdf2_auth_iterations()`
+  still returns 200, not a stronger value).
+
+  Candidate next steps for a dedicated follow-up round: get a real,
+  *stopping* GDB breakpoint at the exact trap call site to recover a
+  backtrace (multiple attempts this round — post-hoc attach at various
+  delays, `-S` halted-start with a delayed command send, a pure GDB
+  command-file instead of Python — all had GDB accept the breakpoint
+  address without it ever actually firing; this is itself an
+  unexplained tooling gap worth resolving first). Once a real
+  backtrace is available: audit whether `sleep_until_table`/
+  `eff_prio_table`/`current_task` — or a spilled register holding
+  `sha256_rotr32`'s `n` argument — can be corrupted by an IRQ landing
+  mid-computation on `task_f`'s own SVC stack (this project's own
+  documented IRQ-frames-build-on-the-interrupted-task's-stack design,
+  already the root cause of two earlier task_f/task_e stack bumps);
+  check whether AAPCS 64-bit (`i64`) locals held live across MANY
+  repeated preemptions of the SAME function activation are correctly
+  preserved by this project's context-switch frame. This is a genuine
+  reliability concern beyond just authentication: ANY future feature
+  needing a long synchronous computation from a task will hit the same
+  wall.
 
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,

@@ -14574,27 +14574,37 @@ fn pbkdf2_hmac_sha256_self_test() -> i64 {
 // PBKDF2-HMAC-SHA256 iteration count for real authentication.
 //
 // NOT set from a real security/timing budget -- set this low by a
-// genuine, separate, NOT-YET-ROOT-CAUSED bug found live while tuning
-// this value (see docs/TODO.md's own writeup): a long-running,
-// synchronous PBKDF2 loop invoked from the interactive shell
-// (task_f), once it survives enough timer ticks under the real
-// scheduler, reliably stops making progress permanently partway
-// through -- confirmed NOT to be simple scheduling starvation (an
-// independent per-iteration counter, not just the debug print
-// condition, stops advancing too; the identical loop body completes
-// correctly and quickly at boot, before multitasking starts). 200
-// iterations reliably completes in ~1 real second; 500 reliably
-// never completes at all in this exact live-shell context. This gap
-// (200 works, 500 hangs) was measured directly, not estimated.
+// genuine, separate, still-not-fully-root-caused bug found live while
+// tuning this value (see docs/TODO.md's own writeup, round 61 +
+// follow-up investigation). A long-running, synchronous PBKDF2 loop
+// invoked from the interactive shell (task_f), once it survives
+// enough timer ticks under the real scheduler, reliably crashes into
+// a compiler-inserted runtime trap (confirmed via a real fix to this
+// project's own dprintf() -- previously a silent no-op, so every
+// occurrence of this bug class looked like an unexplained permanent
+// freeze instead of a diagnosable panic). Observed traps: "shift
+// amount out of range" at 5000+ iterations with task_f's stock
+// 16384-byte stack, and a Data Abort inside the buf_write_u32 family
+// at 10000 iterations even after task_f's real stack was experimentally
+// raised all the way to 131072 bytes (8x stock) -- which RULES OUT
+// plain stack-overflow-with-insufficient-headroom as the (sole) root
+// cause: a real fix would have made the crash disappear at some
+// stack size, not just relocate it to a higher iteration count. The
+// most likely explanation left standing is a probabilistic,
+// IRQ-timing-dependent corruption of some live value (a spilled
+// shift-amount argument or scratch pointer) whose odds of occurring
+// rise with the number of timer ticks the computation survives, not
+// a fixed threshold tied to iteration count or stack depth alone.
+// 200 iterations is the only value measured safe across every attempt
+// so far; 500+ eventually crashes.
 //
 // This is a REAL, serious limitation, not a security-vs-usability
 // tradeoff: 200 iterations is far below any real password-hashing
 // guidance (OWASP's current minimum is 600,000+ for PBKDF2-HMAC-
 // SHA256) and offers only token resistance to offline brute-forcing
-// of a stolen salt+hash. Raise this once the underlying scheduler/
-// context-switch bug is root-caused and fixed -- tracked as a
-// separate, high-priority item, not folded into this feature's own
-// scope.
+// of a stolen salt+hash. Raise this once the underlying bug is fully
+// root-caused and fixed -- tracked as a separate, high-priority item,
+// not folded into this feature's own scope.
 fn pbkdf2_auth_iterations() -> i64 {
   return 200;
 }

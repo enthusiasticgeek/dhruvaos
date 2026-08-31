@@ -39,13 +39,100 @@ void *memcpy(void *dst, const void *src, size_t n) {
     return dst;
 }
 
+/* Raw MMIO UART output -- same PL011 register addresses/protocol as
+ * dhruva_oom_puts below. Declared here (ahead of their real
+ * definitions later in this file) so dprintf() can use them; this
+ * needs to work even if vani's own generated code is in a state too
+ * corrupted to trust calling back into (matches boot/rpi1/vectors.S's
+ * fault handlers and dhruva_oom_puts's own reasoning). */
+static void dhruva_dprintf_putc(char c) {
+    volatile unsigned int *uart_fr = (volatile unsigned int *)0x20201018;
+    volatile unsigned int *uart_dr = (volatile unsigned int *)0x20201000;
+    while ((*uart_fr) & 0x20) {
+        /* wait while TX FIFO full (FR bit 5) */
+    }
+    *uart_dr = (unsigned int)(unsigned char)c;
+}
+
+static void dhruva_dprintf_puts(const char *s) {
+    while (*s != '\0') {
+        dhruva_dprintf_putc(*s);
+        s = s + 1;
+    }
+}
+
+static void dhruva_dprintf_put_i64(long long v) {
+    char digits[24];
+    int n = 0;
+    unsigned long long uv;
+    if (v < 0) {
+        dhruva_dprintf_putc('-');
+        uv = (unsigned long long)(-v);
+    } else {
+        uv = (unsigned long long)v;
+    }
+    if (uv == 0) {
+        dhruva_dprintf_putc('0');
+        return;
+    }
+    while (uv > 0) {
+        digits[n] = (char)('0' + (uv % 10));
+        uv = uv / 10;
+        n = n + 1;
+    }
+    while (n > 0) {
+        n = n - 1;
+        dhruva_dprintf_putc(digits[n]);
+    }
+}
+
+/* BUG found via the round-61 "long-running computation stalls
+ * permanently" investigation (2026-08-30): this was previously a
+ * total no-op, so EVERY compiler-inserted runtime safety trap
+ * (__intent_trap -- array-bounds check, checked-arithmetic overflow,
+ * division by zero, shift-range, and custom `assert "msg"` failures;
+ * see vani-compiler's ssa_backend_llvm.rs) printed nothing at all
+ * before exit()'s own `while(1){}` halt loop, making every one of
+ * those traps look like an unexplained permanent freeze instead of a
+ * diagnosable panic. __intent_trap only ever calls
+ * `dprintf(2, <fixed message string, already newline-terminated>)`
+ * with zero variadic args; the one other real call site
+ * (`intent_assert_fail`, for a custom assert message) calls
+ * `dprintf(2, "assertion failed: %s\n", <msg ptr>)` -- exactly one
+ * `%s`. This handles both shapes (plus %d/%lld as cheap insurance for
+ * any future call site) without pulling in a hosted vsnprintf; it
+ * does not need to be a general-purpose printf. */
 int dprintf(int fd, const char *fmt, ...) {
     (void)fd;
-    (void)fmt;
-    /* Nothing routes this to the UART yet -- Phase 0's own uart_puts
-     * already covers real output, and nothing in Phase 0 should ever
-     * hit the bounds-check panic path this backs. Revisit once the
-     * panic handler (kernel/panic.vani, per the architecture doc) exists. */
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    while (*fmt != '\0') {
+        if (*fmt == '%' && *(fmt + 1) != '\0') {
+            fmt = fmt + 1;
+            if (*fmt == 's') {
+                const char *s = __builtin_va_arg(ap, const char *);
+                dhruva_dprintf_puts(s);
+            } else if (*fmt == 'd' || *fmt == 'l') {
+                /* Accept %d, %ld, %lld -- all read as a 64-bit value;
+                 * on this ABI va_arg for any integer type narrower
+                 * than the register width is still promoted/read as
+                 * a full word, and every real caller in this codebase
+                 * only ever passes i64/int64_t. */
+                while (*fmt == 'l') {
+                    fmt = fmt + 1;
+                }
+                long long v = __builtin_va_arg(ap, long long);
+                dhruva_dprintf_put_i64(v);
+            } else {
+                dhruva_dprintf_putc('%');
+                dhruva_dprintf_putc(*fmt);
+            }
+        } else {
+            dhruva_dprintf_putc(*fmt);
+        }
+        fmt = fmt + 1;
+    }
+    __builtin_va_end(ap);
     return 0;
 }
 

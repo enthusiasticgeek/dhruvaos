@@ -101,17 +101,27 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   `irq_dispatch`'s code, not assumed.
 
 **Known, current limitations (not design goals — see `TODO.md`):**
-- **A real, NOT-yet-root-caused bug: a long-running synchronous
-  computation on any task can stall permanently under the real
-  scheduler.** Found while tuning real authentication's own PBKDF2
-  iteration count — forced it down to 200 iterations (measured to
-  reliably complete; 500 reliably never completes). Confirmed NOT
-  simple priority starvation (a priority-ceiling boost made no
-  reliable difference) and NOT argument corruption (parameters
-  verified correct throughout). See `TODO.md` for the full
-  investigation and candidate next steps — this affects any future
-  feature needing sustained synchronous computation from a task, not
-  just authentication.
+- **A real, still-not-fully-root-caused bug: a long-running synchronous
+  computation on any task can crash into a silent runtime trap under
+  the real scheduler.** Found while tuning real authentication's own
+  PBKDF2 iteration count — forced it down to 200 iterations (measured
+  to reliably complete; 500+ eventually crashes). What "stall" turned
+  out to mean: `dprintf()` (the backing implementation of vani's
+  compiler-inserted bounds/overflow/shift-range trap path) was a total
+  no-op, so the CPU spinning forever in `exit()`'s halt loop looked
+  identical to a frozen scheduler — this is now fixed (`dprintf` prints
+  for real over UART), a permanent diagnostic improvement independent
+  of the underlying bug. With that fix, the real panic text is now
+  visible (`"shift amount out of range"`, and separately a Data Abort
+  at higher iteration counts). Confirmed NOT simple priority starvation,
+  NOT argument corruption, NOT a scheduler malfunction, and — via a
+  real experiment raising `task_f`'s stack 8x — NOT simply insufficient
+  stack headroom either (the crash relocated to a higher iteration
+  count instead of disappearing). Most likely a probabilistic,
+  IRQ-timing-dependent corruption of a live value. See `TODO.md` for
+  the full investigation and candidate next steps — this affects any
+  future feature needing sustained synchronous computation from a
+  task, not just authentication.
 
 - **6 fixed compile-time tasks, plus up to 10 dynamically-created
   ones (MAX_TASKS=16).** The original 6 slots (HIGH, MEDIUM, LOW — a
