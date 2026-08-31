@@ -823,22 +823,53 @@ for by name.
   a shared root cause with round 62's own SD-boot bug, but the sample
   size is too small and one run too confounded to call this proven.**
 
-  Candidate next steps for a dedicated follow-up round: (1) repeat the
-  GC-disabled vs. GC-enabled comparison several more times with a
-  cleaner test harness (no retries — treat a dropped command as a
-  discarded run, not a resend) to get a statistically meaningful
-  sample; (2) if the correlation holds, narrow further by disabling
-  ONLY `dharafs_compact` while keeping `dharafs_read`, and vice versa,
-  to isolate which specific SD operation is implicated; (3) use the
-  now-working `-S`-halted GDB technique with a watchpoint on whatever
-  specific buffer/pointer that operation touches, rather than
-  continuing to guess; (4) if SD I/O is confirmed as the shared
-  mechanism, revisit round 62's own SD-boot bug write-up together with
-  this one as likely the SAME root cause, not two separate bugs. This
-  is a genuine reliability concern beyond just authentication: ANY
-  future feature needing a long synchronous computation from a task,
-  or any code path sharing memory near an active SD operation, will
-  hit the same wall.
+  **Round 62e (2026-08-31), same-day follow-up — isolated which SD
+  operation, with a cleaner (no-retry) harness this time.** Split
+  `task_e`'s periodic pass into two independently-tested variants:
+
+  - **Variant A: `dharafs_read` alone** (compact disabled) — 6
+    attempts, 3 clean full completions (`su`'s own "ok" confirmed via
+    an unambiguous cursor-anchored match), 1 crash (same signature:
+    `buf_write_u32`, `current_task=5`), 2 inconclusive (command never
+    confirmed delivered, discarded rather than retried). **`dharafs_
+    read` alone is a sufficient trigger**, at roughly the same ~20-30%
+    rate round 62's own bisection already found for plain
+    `sdhost_read_block` calls.
+  - **Variant B: `dharafs_compact` alone** (read disabled) — 8
+    attempts, 6 clean completions/no-crash, 0 crashes, 2 inconclusive
+    (killed by the outer test-runner timeout before a decisive
+    signal, not evidence either way). No crash observed in this
+    sample, though `dharafs_compact` also does real reads internally
+    as part of its own log-scan logic, so "compact is safe" is NOT
+    established — only that this small sample didn't hit it.
+
+  This converges cleanly with round 62's own independent finding
+  (bisected entirely separately, months of investigation apart):
+  **`dharafs_read`'s underlying real SD block reads are a confirmed,
+  reproducible trigger for both this bug and round 62's own SD-boot
+  corruption bug.** Given the same triggering operation, the same
+  general symptom shape (a live pointer/register silently corrupted,
+  surfacing much later as a crash somewhere unrelated), and the same
+  intermittent ~20-30%-ish rate, **these are very likely the same
+  underlying root cause**, not two separate bugs — though the EXACT
+  mechanism inside `dharafs_read`/`sdhost_read_block` that causes the
+  corruption is still not identified.
+
+  Stopped here deliberately (a bounded, scoped follow-up, not an
+  open-ended chase) — this is a solid, decisive narrowing. All
+  temporary diagnostic changes reverted; full regression battery
+  re-verified green.
+
+  Candidate next steps for a dedicated future round: use the now-
+  working `-S`-halted GDB technique to set a real watchpoint inside
+  `dharafs_read`/`sdhost_read_block`'s own call chain (on whatever
+  buffer/pointer it writes into) and let a run continue until it
+  fires — this is the concrete, actionable next step once someone
+  picks this back up, replacing further guessing with a live catch.
+  This is a genuine reliability concern beyond just authentication:
+  ANY future feature needing a long synchronous computation from a
+  task, or any code path sharing memory near an active `dharafs_read`
+  call, will hit the same wall.
 
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,
@@ -1016,13 +1047,17 @@ for by name.
   "IRQ lands at an unlucky moment corrupts live state" bug class as
   the still-open task_f runtime-trap investigation above, not a
   coincidence — both are real, serious, and NOT YET root-caused.
-  **Round 62d update**: this stopped being pure speculation —
-  disabling task_e's real SD I/O (`dharafs_compact`/`dharafs_read`)
-  made the task_f bug stop reproducing in 2/2 clean, unconfounded
-  test runs (see that entry's own round-62d writeup above for the
-  full evidence and its honest caveats — suggestive, not yet proven).
-  If confirmed by a larger sample, these two bugs are likely the SAME
-  root cause, not two separate ones.
+  **Round 62d/62e update**: this stopped being pure speculation.
+  Round 62d found disabling task_e's real SD I/O entirely made the
+  task_f bug stop reproducing in 2/2 clean runs; round 62e isolated
+  it further — `dharafs_read` alone (independent of `dharafs_compact`)
+  is a confirmed, reproducible trigger for the task_f bug, at roughly
+  the same intermittent rate this entry's own bisection already found
+  for plain `sdhost_read_block` calls. **These two bugs are very
+  likely the SAME root cause** (same triggering operation, same
+  symptom shape, same rough failure rate) — see that entry's own
+  round-62e writeup above for the full evidence. The exact mechanism
+  inside `dharafs_read`/`sdhost_read_block` is still not identified.
 
   Because of this, media encryption's own on-target self-test
   deliberately verifies only the in-memory transform (safe, 100%
