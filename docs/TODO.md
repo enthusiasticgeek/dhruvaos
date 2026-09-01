@@ -1101,14 +1101,74 @@ for by name.
   first checking whether its own harness creates a fresh SD image per
   attempt.
 
-  No code changes this round (purely tooling/investigation); nothing
-  to revert. **Candidate next step, unchanged from round 63**: the
-  `Popen(stdin=PIPE)` + gated-watchpoint approach is now believed
-  sound and ready to run — it just needs a quieter host window (spot-
-  check `uptime`'s load average before starting; a fresh, `git status`-
-  clean `sd.img` per attempt is now built into the driver) to actually
-  reach the concurrent `su`/`passwd`-vs-`task_e` condition instead of
-  timing out mid-boot.
+  **Same-round follow-up (2026-09-01, later): the host quieted down and
+  the fix paid off — a live crash was actually caught, and the
+  watchpoint's own SILENCE is itself a real, direct negative result.**
+  Fixed the driver to truncate a fresh `sd.img` per attempt (per the
+  finding immediately above) and increased the per-command PBKDF2 wait
+  budget to 45 minutes (a clean run of 1000 iterations under this
+  fine-grained gated instrumentation genuinely costs that much — an
+  estimated ~8,000-12,000 GDB stop/evaluate/resume round-trips: entry,
+  the watchpoint's own harmless self-trip on `sha256_compress`'s
+  legitimate prologue write, and exit, per call). Relaunched during a
+  window where `uptime`'s load average had dropped to ~1-2 (down from
+  3-5 earlier in the round). Attempt 2's `passwd` command crashed after
+  only ~1.5 minutes of computation — the exact same signature every
+  prior round has captured: `FATAL: Data Abort at address 80000000
+  status=00000005 pc=00008920 current_task=00000005 r0=80000000
+  r1=00000000 r2=00000000 r3=00000000 ctxsw=239 irqs=64` (`pc=0x8920`
+  is `buf_read_byte`'s own `ldrb r0,[r0,r1]`; `r0`/base-pointer
+  corrupted to ~2GB garbage, `r1`/offset intact at 0 — identical shape
+  to round 62c's own two independent captures).
+
+  **Critically, the hardware watchpoint on `sha256_compress`'s own
+  saved-return-address stack slot never fired at all across this
+  entire run, including through the crash.** A hardware watchpoint
+  traps on EVERY write to its watched address by construction — there
+  is no way for it to silently miss one. Its total silence through a
+  run that DID crash is therefore a clean, direct (not inferred)
+  negative result: **the corruption is conclusively NOT caused by a
+  write to `sha256_compress`'s own return-address slot** — round 62f's
+  "stack-smash into a saved return address" hypothesis, at least for
+  THIS specific location, is now ruled out by hardware evidence, not
+  just by remaining unproven.
+
+  Also did a quick live post-crash inspection (QEMU/GDB were left
+  running, spinning harmlessly in `fault_data_abort`'s own halt loop,
+  so this cost nothing extra): confirmed `pc=0x8920` disassembles to
+  exactly `buf_read_byte`'s single `ldrb` instruction; GDB's own
+  backtrace can't unwind past the raw exception-vector entry (no CFI
+  there), and by the time of attach `fault_data_abort`'s own code had
+  already overwritten r8-r12 for its own purposes, so the ORIGINAL
+  crashing frame's `w`/`k`/`h` register contents were no longer
+  recoverable live — this needs a breakpoint planted BEFORE the abort
+  handler does its own work to be useful, not a look afterward.
+
+  All temporary diagnostic changes reverted (`pbkdf2_auth_iterations`
+  back to 200, confirmed via `git diff`); a stray core dump from the
+  investigation cleaned up; full regression re-verified (`qemu_run`
+  PASS after rebuild). Bug remains NOT root-caused, but the search
+  space just got meaningfully smaller.
+
+  **Candidate next steps for a future round, in priority order**:
+  (1) since the return-address-slot theory for `sha256_compress`
+  itself is now ruled out, the corrupting write must land somewhere
+  else — either a DIFFERENT stack slot in the same or a different
+  frame in the call chain (`sha256_hash`/`hmac_sha256`/`pbkdf2_
+  hmac_sha256`/`shell_dispatch_passwd`), or it isn't a stack-smash at
+  all and the earlier "compile-time-constant argument came back wrong"
+  evidence (round 62f) needs re-explaining under a different theory;
+  (2) a genuinely promising angle for the SAME live-crash-capture
+  setup used this round: rather than watching one candidate address,
+  add a SECOND gate breakpoint at `fault_data_abort`'s own entry (its
+  address is fixed/known) that, when hit, immediately dumps r8-r12
+  BEFORE the handler's own code can clobber them — this round's own
+  live inspection was too late for exactly that reason; (3) the
+  `Popen(stdin=PIPE)` + gated-watchpoint approach itself is proven
+  practical now (crash caught in ~1.5 minutes once the host was quiet
+  and a real corruption occurred) — future attempts should just spot-
+  check `uptime` first, since host load (not the technique) was this
+  round's only real time sink.
 
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,

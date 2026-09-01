@@ -148,7 +148,13 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   10x under live multitasking (~20-30% vs ~1/30). Round 63 then audited
   every function in the `sha256`/`hmac`/`pbkdf2`/`dharafs_buf.S`/
   `sdcard_state.S` call chain for a buffer-bounds violation or an AAPCS
-  callee-saved-register violation and found neither — still not a full
+  callee-saved-register violation and found neither. Round 64 caught a
+  live crash under a GDB hardware watchpoint on `sha256_compress`'s
+  own saved-return-address stack slot — the watchpoint never fired
+  across the whole run despite the crash, which is a real, direct
+  (not inferred) negative result: **the corruption is conclusively NOT
+  a write to that specific stack slot**, ruling out round 62f's
+  stack-smash theory for that location specifically. Still not a full
   root cause. See `TODO.md` for the complete investigation and
   candidate next steps — this affects any future feature needing
   sustained synchronous computation from a task, not just
