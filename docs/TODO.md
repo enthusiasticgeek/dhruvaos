@@ -1040,12 +1040,75 @@ for by name.
   back to 200, confirmed via `git diff` before rebuilding); full
   regression battery re-verified green (`qemu_run` PASS, `phase4_
   milestone` 14/14, `host_harness` 315/315 ASAN/UBSAN clean). Bug
-  remains NOT root-caused. **Candidate next step**: retry this same
-  now-validated watchpoint technique with a `Popen(stdin=PIPE)`-driven
-  `passwd`/`su` sent while task_e's background pass is live, which is
-  the actual high-probability condition — the boot-path-only runs this
-  round were a real but low-yield sample of the rare single-threaded
-  rate, not the concurrent one this bug most reliably reproduces under.
+  remains NOT root-caused.
+
+  **Round 64 (2026-09-01) follow-up — pursued round 63's own candidate
+  next step, blocked entirely by host-level resource contention, not
+  by anything in this project.** Redesigned the GDB script to GATE the
+  expensive `sha256_compress` entry/exit breakpoints (`disable`d at
+  creation, only `enable`d once a `shell_dispatch_passwd`/`shell_
+  dispatch_su` entry breakpoint fires), so boot's own self-tests and
+  `dharafs_crypto_key_init`'s 10000-iteration call run un-instrumented
+  — validated this design actually works (a live run cleared SHA-256/
+  HMAC/PBKDF2(4096-iter KAT)/ChaCha20 self-tests inside a 900s window,
+  visibly faster than round 63's fully-instrumented equivalent). Built
+  a small Python driver using `Popen(stdin=PIPE)` for the serial side
+  (per round 63's own actionable lesson), fixed a real bug found along
+  the way (the boot-readiness wait loop didn't distinguish "marker
+  found" from "timed out," so a premature timeout would blindly send
+  `passwd`/`su` into a guest whose shell didn't exist yet — always a
+  no-op, never a real attempt).
+
+  **Discovered the actual blocker**: this host runs a persistent,
+  intentional background service (`vani-localfuzz`'s own Ollama-served
+  local model, `~106%` CPU continuously, unrelated to this session —
+  see [[feedback_local_ml_model_sandboxing]]/[[reference_vani_localfuzz_autostart]]),
+  and load average on this 4-core box sat at 3-5 for this entire round
+  — confirmed NOT a rare spike (checked twice, ~20 minutes apart, both
+  times elevated). Two consecutive, fully-patient GDB-attached boot
+  attempts (15 minutes, then 40 minutes) each failed to even reach a
+  working shell — the second made LESS progress (22 lines) than the
+  first (67 lines) despite 2.7x more time budget, confirming genuine,
+  worsening host contention rather than a fixed, plannable overhead.
+  `qemu-system-arm` under `-s -S` GDB attachment appears to have some
+  real baseline slowdown even with breakpoints disabled (a native,
+  no-GDB boot with the identical real `-drive` image reaches the same
+  point in under 20s, confirmed via a fresh `phase4_milestone.py` run
+  scoring 14/14 in 96s total including its own 72s of deliberate
+  inter-command sleeps) — this compounds badly with real host
+  contention, since QEMU's TCG needs consistent, low-latency scheduling
+  to stay fast. **Not something to fix in this project** — it's an
+  external, load-dependent constraint on when live-GDB sessions here
+  are practical, not a code-level bug.
+
+  **One apparent lead ruled out as a self-inflicted test-harness
+  artifact, not a new finding**: the DharaFS permission-model self-test
+  (`dharafs_permissions_self_test`, line ~3710) printed `FAIL` instead
+  of its normal `PASS` in BOTH of the two attempts above, at the exact
+  same line. Investigated seriously since this looked like it could be
+  the corruption bug surfacing as a silent wrong-result rather than a
+  crash — a much more concerning failure mode. **Traced to a mundane
+  cause instead**: unlike `phase4_milestone.py` (which truncates a
+  fresh SD image every single run), this round's driver script reused
+  ONE `sd.img` path across attempts — so attempt 2 booted against
+  filesystem state already left behind by attempt 1's own run (in
+  particular, attempt 1's `dharafs_chmod("/perm/rootfile", 438)` step,
+  which the self-test itself performs as part of its own sequence,
+  permanently loosens that file's mode to world-writable on-disk,
+  making the SAME test's own "0o644 denies non-root write" assertion
+  fail on any later boot against that same image). Documented here so
+  a future round doesn't re-investigate this as a live lead without
+  first checking whether its own harness creates a fresh SD image per
+  attempt.
+
+  No code changes this round (purely tooling/investigation); nothing
+  to revert. **Candidate next step, unchanged from round 63**: the
+  `Popen(stdin=PIPE)` + gated-watchpoint approach is now believed
+  sound and ready to run — it just needs a quieter host window (spot-
+  check `uptime`'s load average before starting; a fresh, `git status`-
+  clean `sd.img` per attempt is now built into the driver) to actually
+  reach the concurrent `su`/`passwd`-vs-`task_e` condition instead of
+  timing out mid-boot.
 
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,
