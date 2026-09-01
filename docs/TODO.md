@@ -968,6 +968,85 @@ for by name.
   synchronous computation from a task, or any code path sharing memory
   near an active `dharafs_read` call, will hit the same wall.
 
+  **Round 63 (2026-08-31) follow-up — static audit found no smoking
+  gun; validated a live watchpoint technique but got blocked on a
+  session-local input-delivery tooling gap, not a guest regression.**
+  Per round 62f's candidate step (1): audited every function in the
+  `sha256`/`hmac`/`pbkdf2` call chain, plus `dharafs_buf.S`,
+  `auth_state.S`'s scratch accessors, and `sdcard_state.S`'s FIFO
+  transfer helpers, specifically for a fixed-size-buffer bounds
+  violation that could smash an adjacent saved return address.
+  Re-derived `sha256_compress`'s own freshly-built ARM disassembly
+  directly (not from an earlier build): its stack frame allocates 132
+  bytes and every local store/load offset used stays at or below 124 —
+  no overlap into the `push {r4-r11,lr}` save area above it. Every
+  hand-written asm helper in the chain either touches only r0-r3 (no
+  save/restore needed) or correctly brackets its one or two scratch
+  registers with `push`/`pop` (`sdhost_drain_fifo_to_buffer`/
+  `sdhost_fill_fifo_from_buffer`, `test_fill_pattern`,
+  `test_compare_buffers`) — no AAPCS callee-saved-register violation
+  anywhere in this specific call graph. `dharafs_sd_scratch` is exactly
+  512 bytes and the FIFO transfer writes exactly 128 words into it, an
+  exact fit. `password_len` (the one path that could reach `sha256_
+  hash`'s own 4096-byte-capped `padded` scratch through HMAC's
+  `key_len > 64` branch) is bounded by the shell's own line length in
+  every real caller, nowhere near that cap. **No buffer-bounds
+  violation found by static inspection** — candidate step (1) is now
+  believed exhausted without a code-level explanation.
+
+  Built and validated candidate step (2): a GDB hardware watchpoint on
+  `sha256_compress`'s own saved-`lr` stack slot (a fixed, deterministic
+  address given this project's own already-proven stack-address
+  determinism), armed only while a specific invocation is actually
+  live (enabled at the function's own prologue breakpoint, disabled at
+  its one epilogue) rather than left on permanently. This scoping
+  turned out to be necessary, not optional: a first, unscoped dry run
+  immediately "caught" a completely legitimate write from `sha256_
+  write_be32` to that same address — ordinary stack-slot reuse by a
+  later, unrelated function after `sha256_compress` had already
+  returned, not a bug. The scoped version is believed sound.
+
+  Ran BOTH of the boot-path's own single-threaded (interrupt-masked)
+  PBKDF2 computations through this instrumentation to completion —
+  the 4096-iteration self-test KAT and `dharafs_crypto_key_init`'s own
+  real 10000-iteration boot-time call (round 62's media-encryption
+  feature) — with **zero watchpoint hits across both**. Consistent
+  with, not a contradiction of, round 62f's own "rare, ~1/30" single-
+  threaded rate finding: two runs at that rate are unsurprising to
+  both come back clean.
+
+  **Blocked before reaching the higher-probability concurrent
+  condition** (`su`/`passwd` racing task_e's live background `dharafs_
+  read`/GC pass, round 62e/f's own ~20-30% trigger): driving the
+  interactive shell via `tmux send-keys` into the QEMU pty reliably
+  failed to deliver any command to task_f, across many attempts (plain
+  send, literal `\r`, char-by-char with per-character delay). **Not a
+  guest regression** — confirmed two ways: (1) QEMU's own `-nographic`
+  stdio multiplexer DID receive and correctly act on input over the
+  exact same channel (`Ctrl-A c` reliably toggled into/out of the QEMU
+  monitor, banner and all); (2) `test/phase4_milestone.py`, run
+  independently right after, drove the same shell perfectly end-to-end
+  (14/14 PASS) using its own proven method (`subprocess.Popen(stdin=
+  subprocess.PIPE)` + `write()`+`flush()`), not `tmux send-keys`/a pty.
+  **Actionable lesson for next time**: script any future interactive-
+  shell-plus-GDB session using `Popen(stdin=PIPE)` for the serial
+  side (GDB attaches separately over the `-s` TCP port regardless, so
+  the two don't conflict) — a pty-based `tmux send-keys` approach is
+  not reliable for this project's own QEMU/nographic setup, for a
+  reason not yet root-caused itself (out of scope for the auth-bug
+  investigation this round).
+
+  All temporary diagnostic changes reverted (`pbkdf2_auth_iterations`
+  back to 200, confirmed via `git diff` before rebuilding); full
+  regression battery re-verified green (`qemu_run` PASS, `phase4_
+  milestone` 14/14, `host_harness` 315/315 ASAN/UBSAN clean). Bug
+  remains NOT root-caused. **Candidate next step**: retry this same
+  now-validated watchpoint technique with a `Popen(stdin=PIPE)`-driven
+  `passwd`/`su` sent while task_e's background pass is live, which is
+  the actual high-probability condition — the boot-path-only runs this
+  round were a real but low-yield sample of the rare single-threaded
+  rate, not the concurrent one this bug most reliably reproduces under.
+
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,
   LAN9512, loopback), an 8-rule fixed array (`proto`/`src_ip`+valid/

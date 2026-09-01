@@ -128,19 +128,31 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   NOT argument corruption, NOT a scheduler malfunction, and — via a
   real experiment raising `task_f`'s stack 8x — NOT simply insufficient
   stack headroom either (the crash relocated to a higher iteration
-  count instead of disappearing). Most likely a probabilistic,
-  IRQ-timing-dependent corruption of a live value. A round-62c
-  follow-up extended `fault_data_abort` to report the faulting
-  instruction's own r0-r3 (a permanent diagnostic improvement) and
-  live-captured two crashes with it: both land on the same
-  `buf_read_u32`/`buf_write_u32` accessor pair, and both times
-  specifically the BASE-POINTER argument is corrupted (once to exactly
-  NULL, once to unrelated ~2.3GB garbage) while the offset argument
-  stays intact — a real, reproducible, register-level signature, but
-  still not a full root cause (needs instruction-level tracing to go
-  further). See `TODO.md` for the full investigation and candidate
-  next steps — this affects any future feature needing sustained
-  synchronous computation from a task, not just authentication.
+  count instead of disappearing). A round-62c follow-up extended
+  `fault_data_abort` to report the faulting instruction's own r0-r3
+  (a permanent diagnostic improvement) and live-captured two crashes
+  with it: both land on the same `buf_read_u32`/`buf_write_u32`
+  accessor pair, and both times specifically the BASE-POINTER argument
+  is corrupted (once to exactly NULL, once to unrelated ~2.3GB
+  garbage) while the offset argument stays intact. Rounds 62d-f then
+  corrected the original "probably IRQ-timing-dependent" working
+  hypothesis with real, direct evidence: a live GDB breakpoint proved
+  the corruption is NEVER present in any saved/restored IRQ context
+  frame (rules out interrupt save/restore as the mechanism), it
+  reproduces (rarely, ~1/30) even with interrupts fully masked and zero
+  concurrency, and it looks like genuine stack-smash/control-flow
+  corruption rather than one bad pointer (a compile-time-constant
+  checkpoint argument came back wrong too, immediately followed by a
+  Prefetch Abort at a wild PC). IRQ timing is confirmed NOT the root
+  mechanism, but does amplify whatever the true cause is by roughly
+  10x under live multitasking (~20-30% vs ~1/30). Round 63 then audited
+  every function in the `sha256`/`hmac`/`pbkdf2`/`dharafs_buf.S`/
+  `sdcard_state.S` call chain for a buffer-bounds violation or an AAPCS
+  callee-saved-register violation and found neither — still not a full
+  root cause. See `TODO.md` for the complete investigation and
+  candidate next steps — this affects any future feature needing
+  sustained synchronous computation from a task, not just
+  authentication.
 - **A second, separate, NOT-root-caused bug of the same broad class:
   even one extra real SD block read or write during boot
   intermittently (~20-30%) corrupts unrelated state, surfacing minutes
