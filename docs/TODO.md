@@ -860,16 +860,113 @@ for by name.
   temporary diagnostic changes reverted; full regression battery
   re-verified green.
 
-  Candidate next steps for a dedicated future round: use the now-
-  working `-S`-halted GDB technique to set a real watchpoint inside
-  `dharafs_read`/`sdhost_read_block`'s own call chain (on whatever
-  buffer/pointer it writes into) and let a run continue until it
-  fires — this is the concrete, actionable next step once someone
-  picks this back up, replacing further guessing with a live catch.
-  This is a genuine reliability concern beyond just authentication:
-  ANY future feature needing a long synchronous computation from a
-  task, or any code path sharing memory near an active `dharafs_read`
-  call, will hit the same wall.
+  **Round 62f (2026-08-31), same-day, escalated per explicit user
+  instruction ("resolving this is imperative") — deepened
+  substantially further, several real findings, still NOT fully
+  root-caused.**
+
+  Added cheap, always-on, silent-unless-bad checkpoints directly
+  inside `sha256_compress`'s own three loops (a new `sha256_compress_
+  check` helper called at every loop iteration, immediately adjacent
+  to each `buf_read_u32`/`buf_write_u32` call — closing the
+  window to nothing), reading `w`/`k`'s CURRENT register content via
+  a tiny new `ptr_raw_value` C helper (vani has no cast from `mut ref
+  i64` to `i64`, a deliberate no-raw-pointer-escape-hatch design
+  choice, so this was needed to inspect a reference's raw address
+  from vani code at all). Runs at full native speed, no GDB involved.
+
+  **Ruled out a stack leak/drift directly and conclusively**: added a
+  `get_sp_raw()` C helper and printed `sp` every 25 PBKDF2 iterations.
+  Across 500+ real iterations in a healthy run, `sp` was **byte-for-
+  byte IDENTICAL** every single time — zero drift. This rules out any
+  theory involving accumulating/leaking stack depth across PBKDF2
+  iterations.
+
+  **Live-caught the corruption again, multiple times, with checkpoints
+  immediately adjacent to the crash site** — and found something more
+  severe than previously understood: even a checkpoint sitting
+  literally one loop iteration's worth of pure-ALU code away from the
+  crashing call already sees corrupted values, AND — critically — the
+  corruption isn't limited to `w`/`k`. The checkpoint's OWN `tag`
+  argument (a compile-time-constant immediate, e.g. `mov r0, #3` —
+  something that cannot legitimately vary at all) and `i` (a plain
+  loop counter) both came back as wild, nonsensical 64-bit values on
+  every capture (e.g. `tag=7685137550204961520 i=4912982830340592507`).
+  Every one of these captures was immediately followed by a genuine
+  **Prefetch Abort at a wild PC** (e.g. `address 1C5B6A8A`), not
+  another Data Abort. **This is much more consistent with genuine
+  control-flow / stack-smash corruption (a corrupted return address or
+  computed branch target) than with a single mis-set pointer variable**
+  — a single-variable-corruption theory doesn't explain a compile-time
+  constant reading back wrong.
+
+  **A real, direct test of the ABI-argument-passing hypothesis this
+  finding initially suggested**: `sha256_compress_check`'s own
+  signature (`i64, ref, ref, i64` — a trailing stack-passed `i64`
+  after two single-register `ref` args) matches this project's own
+  historical AAPCS-gotcha pattern exactly (see `sdhost_drain_fifo_
+  to_buffer`'s own comment). Built a minimal, standalone, host-
+  compiled repro of the exact same argument shape (`vanic emit
+  --backend=llvm` + `llc -mtriple=armv6-none-eabi -mcpu=arm1176jzf-s`,
+  no QEMU/scheduler/timing involved at all) and inspected the raw
+  disassembly directly: **the compiler-generated code is correct** —
+  `w`/`k` (r2/r3) are properly saved into other registers before the
+  stack-passed `i` gets loaded into r2/r3, exactly as AAPCS requires.
+  This specific vani-compiler ABI hypothesis is RULED OUT by direct
+  evidence, not just re-reasoned about.
+
+  **A genuinely surprising, important negative-turned-nuanced result**:
+  reproduced the exact same corruption+Prefetch-Abort signature during
+  the **single-threaded, interrupt-free boot-time PBKDF2 self-test**
+  (confirmed via the crash's own captured `sp` value matching the boot
+  stack's address range, not any task's dedicated stack — and directly
+  confirmed by re-reading `kernel_main`'s own boot sequence: `enable_
+  irqs()` is **never called** anywhere in this codebase; the code's own
+  comment states interrupts stay masked for all of `kernel_main`'s
+  setup and only turn on once `start_multitasking` first resumes a
+  task). This single capture, on its own, would have completely ruled
+  out any IRQ/interrupt-timing-dependent theory. However, a follow-up
+  sweep of 30 fresh, otherwise-identical boots (with a real SD drive
+  attached, matching the crashing run's own conditions, each capturing
+  the FULL boot sequence including the self-test) found **zero**
+  further hits. **Net conclusion: the corruption can occur with zero
+  interrupts and zero concurrency involved at all, but at a much lower
+  rate (roughly 1-in-30-or-rarer) than during live multitasking
+  (~20-30%)**. This is a real, evidence-based correction to the
+  working hypothesis that has stood since round 61: IRQ/scheduler
+  timing is NOT the root mechanism (proven by the interrupt-free
+  capture), but it does dramatically amplify whatever the true
+  mechanism is — the amplification factor itself is now a real,
+  useful clue, not yet explained.
+
+  All temporary diagnostic changes (checkpoints, `ptr_raw_value`,
+  `get_sp_raw`, the 1000-iteration bump) reverted; `git diff` confirmed
+  clean before rebuilding; full regression battery re-verified green.
+
+  Candidate next steps for a dedicated future round, in priority
+  order: (1) given the corruption now looks like genuine stack-
+  smashing/control-flow corruption rather than a single bad pointer,
+  audit every function in the `sha256`/`hmac`/`pbkdf2` call chain (and
+  `dharafs_read`/`sdhost_read_block`, per round 62e's own finding) for
+  a genuine buffer-bounds violation — a fixed-size local buffer
+  written past its own bound would explain corrupting an adjacent
+  saved return address exactly this way, and hasn't been specifically
+  audited with THIS theory in mind yet; (2) use the now-working
+  `-S`-halted GDB technique with a **hardware watchpoint on the return
+  address slot** of whichever stack frame is suspected, rather than
+  register content (register watches require slow single-stepping;
+  return-address slots are genuine memory addresses QEMU can watch at
+  full speed); (3) since pure single-threaded reproduction is possible
+  but rare (~1/30), a MUCH larger single-threaded boot sweep (100+
+  boots) would help characterize whether ANY residual concurrency-like
+  variance still exists in that path (real QEMU/hardware timing
+  variance in the SD polling loop is one remaining candidate even with
+  interrupts masked) or whether it's genuinely a rare, input-
+  independent bug that would eventually be catchable via that route
+  alone, given enough attempts. This is a genuine reliability concern
+  beyond just authentication: ANY future feature needing a long
+  synchronous computation from a task, or any code path sharing memory
+  near an active `dharafs_read` call, will hit the same wall.
 
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,
