@@ -174,18 +174,26 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   complete investigation, including a reverted first attempt
   (interrupt-masking) that caused a serious unrelated performance
   regression.
-- **A second, separate, NOT-root-caused bug of the same broad class:
-  even one extra real SD block read or write during boot
-  intermittently (~20-30%) corrupts unrelated state, surfacing minutes
-  later as a genuine Data Abort inside `task_e`'s background DharaFS
-  compaction.** Found live while building media encryption's own
-  self-check (round 62) — bisected to confirm it's independent of the
-  encryption feature's own logic (a version doing zero extra real SD
-  I/O is 100% reliable across 16+ repeated runs). Media encryption's
-  own on-target self-test deliberately avoids real SD I/O because of
-  this; the real end-to-end path is instead verified via the host
-  harness and a one-time manual live run. See `TODO.md` for the full
-  writeup.
+- **FIXED (round 66, 2026-09-01) — a second, separate bug of the same
+  broad class: even one extra real SD block read or write during boot
+  could intermittently (~20-30%) corrupt unrelated state, surfacing
+  minutes later as a genuine Data Abort inside `task_e`'s background
+  DharaFS compaction.** Found live while building media encryption's
+  own self-check (round 62) — bisected to confirm it was independent
+  of the encryption feature's own logic (a version doing zero extra
+  real SD I/O was 100% reliable across 16+ repeated runs). Round 66
+  re-added the original trigger as a temporary diagnostic and ran 20
+  consecutive full boots watching for the delayed crash — zero
+  crashes, confirming this was fixed as a side effect of round 65's
+  task_f fix (specifically the general scheduler hardening in
+  `boot/context_switch.S`, not the SHA-256-specific part), exactly as
+  suspected since round 62d/62e first found the two bugs shared a
+  trigger and symptom shape. Media encryption's own on-target
+  self-test still deliberately avoids real SD I/O for now (a
+  conscious choice — see `TODO.md`'s own round-66 follow-up note on
+  reconsidering that); the real end-to-end path is verified via the
+  host harness and a one-time manual live run. See `TODO.md` for the
+  full writeup.
 
 - **6 fixed compile-time tasks, plus up to 10 dynamically-created
   ones (MAX_TASKS=16).** The original 6 slots (HIGH, MEDIUM, LOW — a

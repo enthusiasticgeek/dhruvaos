@@ -1407,8 +1407,8 @@ for by name.
   committed as a permanent boot self-test, per the entry below).
 
 - **A real, serious, pre-existing, timing-dependent SD/boot-sequencing
-  bug** — `[found round 62, 2026-08-31, NOT root-caused — high
-  priority]`
+  bug** — `[found round 62, 2026-08-31; FIXED round 65/66,
+  2026-09-01 — see round-66 update below]`
   Found live while building media encryption's own self-check: doing
   even ONE extra real SD block read or write during boot — something
   nothing in this codebase had ever done before this feature, since
@@ -1461,6 +1461,45 @@ for by name.
   wall-clock time it adds during boot's own IRQ-enabled window;
   check whether this is the SAME root cause as the task_f trap bug or
   a genuinely separate one once either gets a real backtrace.
+
+  **Round 66 (2026-09-01) update — FIXED, confirmed as a side effect
+  of round 65's task_f fix, exactly as this entry's own round-62d/62e
+  speculation predicted.** Re-added the original trigger as a temporary
+  diagnostic (one extra `sdhost_read_block` call inside
+  `dharafs_encryption_self_check`, matching round 62's own bisection)
+  and ran 20 consecutive full boots, watching up to 6 minutes each for
+  the delayed Data Abort inside `task_e`'s compaction — the same
+  reproduction shape round 62 originally used. **Zero crashes across
+  all 20 attempts.** Against the documented ~20-30% per-boot rate, 20
+  consecutive clean boots has roughly a 0.1-1% chance of happening by
+  luck if the bug were still present at its old rate — decisive.
+  Confirmed the repro setup itself was live and correct throughout (the
+  extra read always completed and reported success, matching this
+  entry's own original description, and `task_e`'s compaction was
+  visibly running in every serial log). None of round 65's fixes
+  targeted this code path directly (`scheduler_pick_next`'s r8-r11
+  save/restore and `task_sleep_ticks`'s interrupt masking are both
+  general scheduler hardening, not SD/DharaFS-specific, and the actual
+  SHA-256 fix — reloading scratch pointers fresh instead of holding
+  them live in a register — never touches `sdhost_read_block`/
+  `dharafs_compact` at all) — so this is strong indirect confirmation
+  that round 65's *scheduler*-level hardening (not the SHA-256-specific
+  fix) was the part that mattered for this second bug, consistent with
+  this entry's own long-standing "same root cause" theory. The
+  temporary diagnostic trigger was reverted after confirming the fix;
+  `dharafs_encryption_self_check` is back to its permanent, safe,
+  pure-in-memory-only form. Full regression battery re-verified green
+  after reverting: `qemu_run.py` PASS, `phase4_milestone.py` 14/14,
+  `host_harness` 315/315 under ASAN/UBSAN, `heap_stress.py` PASS.
+
+  **Open follow-up, not done this round**: `dharafs_encryption_self_
+  check` could now safely exercise the real SD-integrated path again
+  (write via `dharafs_block_write`, read back via `sdhost_read_block`/
+  `dharafs_block_read`) instead of staying pure-in-memory-only, now
+  that the hazard it was deliberately avoiding is fixed — left as a
+  deliberate choice for a future round rather than done automatically
+  here, since it changes what a permanent, every-boot self-test
+  verifies and that's a scope decision, not just a bug fix.
 
 - **Secure boot** — `[not sized — SKIPPED FOR NOW, 2026-08-31; the
   hardware-rooted version hits a hard, permanent hardware ceiling
