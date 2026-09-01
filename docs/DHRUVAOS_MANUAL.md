@@ -112,8 +112,8 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   and a one-time manual live end-to-end run with a real SD image.
 
 **Known, current limitations (not design goals — see `TODO.md`):**
-- **A real, still-not-fully-root-caused bug: a long-running synchronous
-  computation on any task can crash into a silent runtime trap under
+- **FIXED (round 65, 2026-09-01) — a long-running synchronous
+  computation on any task could crash into a silent runtime trap under
   the real scheduler.** Found while tuning real authentication's own
   PBKDF2 iteration count — forced it down to 200 iterations (measured
   to reliably complete; 500+ eventually crashes). What "stall" turned
@@ -154,11 +154,26 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   across the whole run despite the crash, which is a real, direct
   (not inferred) negative result: **the corruption is conclusively NOT
   a write to that specific stack slot**, ruling out round 62f's
-  stack-smash theory for that location specifically. Still not a full
-  root cause. See `TODO.md` for the complete investigation and
-  candidate next steps — this affects any future feature needing
-  sustained synchronous computation from a task, not just
-  authentication.
+  stack-smash theory for that location specifically. Round 65 switched
+  from GDB to QEMU TCG plugins (near-native-speed in-process register/
+  memory tracing) and bisected the corruption to `sha256_compress`
+  holding its `w` message-schedule pointer live in one register (r8)
+  across its whole ~64-round loop body — a wild memory write to the
+  scratch-pointer table was ruled out (a dedicated write-watch plugin
+  proved nothing writes there at runtime except the expected boot
+  init), and `irq_entry.S`'s own save/restore was manually re-derived
+  against the actual compiled bytes three times and found correct each
+  time, so no single corrupting instruction was ever pinned down.
+  Fixed defensively instead: `sha256_compress`/`sha256_h_init` no
+  longer hold `h`/`w`/`k` live in a register across the whole
+  function — they re-fetch each scratch pointer fresh via
+  `sha256_h/w/k_scratch_get()` at every point of use, closing the
+  whole class regardless of the exact mechanism. Verified with 100
+  consecutive `passwd`/`su` attempts, zero crashes (the prior build
+  crashed 3 times in as many verification runs). See `TODO.md` for the
+  complete investigation, including a reverted first attempt
+  (interrupt-masking) that caused a serious unrelated performance
+  regression.
 - **A second, separate, NOT-root-caused bug of the same broad class:
   even one extra real SD block read or write during boot
   intermittently (~20-30%) corrupts unrelated state, surfacing minutes

@@ -1170,6 +1170,89 @@ for by name.
   check `uptime` first, since host load (not the technique) was this
   round's only real time sink.
 
+  **Round 65 (2026-09-01) — FIXED, per the user's explicit "attempt
+  other techniques" instruction.** Switched investigative tooling from
+  GDB (proven slow/unreliable under this host's own background load in
+  every prior round) to QEMU TCG plugins (`qemu-plugin.h`, downloaded
+  since no dev package was installed) — near-native-speed in-process
+  register/memory tracing, 13-20s per clean attempt vs. GDB's 300s+
+  under load. Two defensive fixes already staged from a sub-round
+  before this one (`scheduler_pick_next` now saves/restores caller's
+  r8-r11; `task_sleep_ticks` now masks interrupts around its own
+  critical section, mirroring `dhruva_mutex_lock`'s existing pattern)
+  measurably helped but did not fully resolve the bug — a live crash
+  still hit on attempt 20 of a verification run.
+
+  That crash's own FATAL diagnostic showed `sha256_h_scratch_get()`
+  returning NULL into `sha256_h_init`. Retargeted a memory-write-watch
+  plugin at the exact `.bss` scratch-pointer table (`sha256_padded/h/
+  k/w_scratch_addr`) and proved nothing writes there at runtime except
+  the expected one-time boot init — ruling out a wild memory write
+  entirely (a real, hardware-backed negative result, same class of
+  evidence as round 64's own watchpoint silence). Bisected the
+  `sha256_hash` → `sha256_h_init` call chain with a register trace: r0
+  (the `h` pointer) was correct on all 60,060 traced calls right up
+  through a *different* crash, ruling out that specific chain too.
+
+  The real pattern: `fn_sha256_compress`'s own disassembly showed it
+  loads its `w` message-schedule pointer into **r8 exactly once at
+  function entry** and holds it live across its whole ~64-round loop
+  body (7 call sites, all via `mov r0,r8`, never reloaded) — confirmed
+  via `nm`/`objdump` on the actual built binary, not just source
+  reading. Grepped every r8 reference in the function's compiled
+  disassembly and found no other write/reuse anywhere in its body,
+  ruling out a compiler register-reuse bug internal to the function
+  itself. Traced every `buf_read_u32`/`buf_write_u32` call unfiltered
+  across a 24-million-call run to an actual crash: the fault was the
+  very first anomalous entry in the whole trace, no lead-up, consistent
+  with a single rare event (matches that run's own `irqs=8` total) —
+  not a periodic/structural bug. Added direct r8 tracing at
+  `irq_entry`'s own save point and restore point; manually re-derived
+  `irq_entry.S`'s save/relocate/restore byte layout by hand three
+  separate times against the actual compiled bytes (matched source
+  exactly every time) and found it internally self-consistent on every
+  pass — no single corrupting instruction was ever pinned down despite
+  this being the most thorough audit of that file across all 65
+  rounds.
+
+  **The fix actually applied is defensive, not a pinpointed
+  correction**: `sha256_compress` (and `sha256_h_init`, which has the
+  identical shape and was itself attempt 20's own crash site) no
+  longer take `h`/`w`/`k` as parameters held live in a register across
+  the whole function — they now call `sha256_h/w/k_scratch_get()`
+  fresh at every single point of use. Whatever the exact register-
+  corruption mechanism was, this closes the entire class: no scratch
+  pointer this code touches is ever more than a few instructions old
+  before its use, matching the reload-immediately-before-use pattern
+  the corruption could never be observed defeating in tens of millions
+  of traced calls.
+
+  **A first attempt at this fix used `disable_irqs()`/`enable_irqs()`
+  bracketing `sha256_compress` instead, and was reverted** — it stalled
+  the interactive `passwd`/`su` commands by 10-30x+ (a command that
+  normally completes in ~1-2s took 300s+ and still hadn't finished)
+  once multitasking was active, for reasons not fully diagnosed (ruled
+  out: per-call transition overhead, since widening the mask to cover
+  the whole PBKDF2 call instead of each compress call didn't help
+  either; the system was confirmed NOT deadlocked — other demo tasks
+  kept visibly running throughout). Worth remembering as a cautionary
+  data point if interrupt-masking is ever reconsidered as a fix
+  strategy here: it has a real, serious performance interaction with
+  this scheduler under active multitasking that this round did not get
+  to the bottom of.
+
+  **Verification**: 100 consecutive `passwd 0 <pw>` + `su 0 0 <pw>`
+  attempts (fresh SD image per attempt, ~1000-iteration diagnostic
+  PBKDF2 count), zero crashes — the prior build crashed at attempts 20,
+  22, and 23 across three separate runs, so this is decisive (roughly a
+  0.6% chance of this outcome if the true crash rate were still what it
+  was). Full regression battery re-verified green after the fix:
+  `qemu_run.py` PASS, `phase4_milestone.py` 14/14, `host_harness` 315
+  PASS/0 FAIL under ASAN/UBSAN, `heap_stress.py` PASS. Diagnostic PBKDF2
+  iteration count was already at its production value of 200 by this
+  point (confirmed via `git diff` before considering this closed).
+  Local-only commit, per this project's own push policy.
+
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,
   LAN9512, loopback), an 8-rule fixed array (`proto`/`src_ip`+valid/

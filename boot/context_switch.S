@@ -226,6 +226,33 @@ mutex_block_start_tick_table:
  * guarantees the scan always has at least one real, ready candidate to
  * fall back to instead. */
 scheduler_pick_next:
+    /* Round 65 hardening: this function freely uses r8-r11 as scratch
+     * below (tentative-best index, loop counter, context_switch_count
+     * bookkeeping) without ever saving/restoring them, on the theory
+     * that it's always safe -- whichever task is "live" in these
+     * registers at the call site has already had its full context
+     * (r0-r12) saved elsewhere (irq_entry.S's relocate step, or this
+     * same function's own sibling task_sleep_ticks/dhruva_mutex_unlock
+     * frame-building) before this ever runs, and gets it restored
+     * afterward regardless of what this function leaves in the live
+     * registers. That reasoning is still believed correct, but a live
+     * investigation (project memory: Dhruva round 65, the task_f
+     * runtime-trap bug) directly observed r8 -- which sha256_compress
+     * holds its own `w` message-schedule pointer in for its ENTIRE
+     * execution, per an earlier round's own finding -- change value
+     * across exactly this function's own entry/exit while a real IRQ
+     * fired mid-computation, immediately preceding (within 1-2
+     * instructions) a genuine wild-pointer Data Abort in the resumed
+     * task. Never proven to be THIS specific clobber causing that
+     * abort (the resumed task's own r8 read back correctly restored in
+     * the same trace), but this is the one concrete, reproducible
+     * anomaly found after extensive live tracing, sits exactly on the
+     * interrupt-affected call path, and costs nothing to harden
+     * defensively: explicitly preserve the caller's r8-r11 the same
+     * way this project's own scheduler_switch_from_irq (which tail-
+     * calls straight into this function) and irq_entry.S's own save/
+     * restore already treat every other register. */
+    push {r8, r9, r10, r11}
     ldr r0, =tick_count
     ldr r1, [r0]                  /* r1 = tick_count */
     ldr r2, =current_task
@@ -282,7 +309,13 @@ spn_done:
 spn_no_switch:
     str r8, [r2]                   /* current_task = best index */
     ldr r6, =sp_table
-    ldr r0, [r6, r8, lsl #2]      /* r0 = sp_table[best] */
+    ldr r0, [r6, r8, lsl #2]      /* r0 = sp_table[best] -- must read
+                                    * this before the pop below touches
+                                    * r8, but r0 itself is untouched by
+                                    * that pop either way */
+    pop {r8, r9, r10, r11}         /* restore the caller's own values,
+                                    * see this function's own entry
+                                    * comment */
     bx lr
 
 /* void *scheduler_switch_from_irq(void *current_sp, i64 was_timer_tick)
@@ -336,6 +369,28 @@ scheduler_switch_from_irq_skip_tick:
  * used, since no tick count in this design remotely approaches 2^32. */
 .global task_sleep_ticks
 task_sleep_ticks:
+    /* Round 65 hardening: unlike dhruva_mutex_lock's own blocked path
+     * (see its header comment -- explicit `cpsid i` before touching
+     * any shared scheduler state), this function never masked
+     * interrupts across its own multi-instruction critical section
+     * below (building this task's own switch-away frame, then writing
+     * sleep_until_table/sp_table for `current_task`). A real timer
+     * tick landing anywhere in that window drives irq_entry.S's own
+     * concurrent save/scheduler-switch path on the SAME stack, racing
+     * to write the SAME sp_table[current_task] entry this function is
+     * still in the middle of populating. Not proven to be the sole
+     * cause of the still-open task_f runtime-trap bug (project memory:
+     * Dhruva round 65), but it's a genuine, real race against
+     * concurrently-modified shared scheduler state with no mutual
+     * exclusion, exactly the class of bug this project's own
+     * dhruva_mutex_lock already guards against in its own analogous
+     * path -- masking here is free (this function always ends by
+     * switching away, never by a normal `bx lr` return, so there's no
+     * "restore the caller's original mask" step needed: the resumed
+     * task's own interrupt state is governed entirely by the spsr this
+     * function stages into its own saved frame below, not by the live
+     * cpsr at any point in this function). */
+    cpsid i
     stmdb sp!, {r0-r12, lr}        /* 14 words = 56 bytes */
     mov r2, #0x13
     mov r3, #0

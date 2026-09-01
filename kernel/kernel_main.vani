@@ -14129,15 +14129,21 @@ fn sha256_k_init(k: mut ref i64) -> i64 {
   return 0;
 }
 
-fn sha256_h_init(h: mut ref i64) -> i64 {
-  let _ = buf_write_u32(h, 0 as u32, 0x6a09e667 as u32);
-  let _ = buf_write_u32(h, 4 as u32, 0xbb67ae85 as u32);
-  let _ = buf_write_u32(h, 8 as u32, 0x3c6ef372 as u32);
-  let _ = buf_write_u32(h, 12 as u32, 0xa54ff53a as u32);
-  let _ = buf_write_u32(h, 16 as u32, 0x510e527f as u32);
-  let _ = buf_write_u32(h, 20 as u32, 0x9b05688c as u32);
-  let _ = buf_write_u32(h, 24 as u32, 0x1f83d9ab as u32);
-  let _ = buf_write_u32(h, 28 as u32, 0x5be0cd19 as u32);
+// Round 65 hardening: same fresh-reload treatment as sha256_compress's
+// own comment describes -- h is re-fetched via sha256_h_scratch_get()
+// at every write instead of held live in one register across all 8
+// calls, since h_init has the identical long-lived-scratch-pointer
+// shape (and was itself the exact call site attempt 20's crash hit,
+// project memory Dhruva round 65).
+fn sha256_h_init() -> i64 {
+  let _ = buf_write_u32(sha256_h_scratch_get(), 0 as u32, 0x6a09e667 as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 4 as u32, 0xbb67ae85 as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 8 as u32, 0x3c6ef372 as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 12 as u32, 0xa54ff53a as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 16 as u32, 0x510e527f as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 20 as u32, 0x9b05688c as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 24 as u32, 0x1f83d9ab as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 28 as u32, 0x5be0cd19 as u32);
   return 0;
 }
 
@@ -14168,42 +14174,64 @@ fn sha256_write_be32(buf: mut ref i64, off: i64, v: u32) -> i64 {
 // `msg`, folding it into the running state `h` (8 words / 32 bytes).
 // `w` is a 256-byte (64-word) message-schedule scratch buffer, `k` the
 // 64-word round-constant table from sha256_k_init.
-fn sha256_compress(h: mut ref i64, msg: mut ref i64, block_off: i64, w: mut ref i64, k: mut ref i64) -> i64 {
+// Round 65 hardening: h/w/k used to be plain parameters, each held live
+// in one register (r8/r9/etc.) across this whole ~64-round function --
+// live TCG-plugin tracing (project memory: Dhruva round 65) caught two
+// independent real crashes where exactly that pattern (a scratch
+// pointer held live across many calls) arrived at buf_read_u32/
+// buf_write_u32 corrupted, always mid-PBKDF2, always coincident with
+// interrupt delivery, with no single corrupting instruction pinned
+// down after three rounds of static+dynamic bisection (irq_entry.S's
+// own save/relocate/restore was re-derived by hand three times against
+// the actual compiled bytes and found internally correct every time).
+// An interrupt-masking fix was tried first and reverted: it stalled the
+// interactive `passwd`/`su` commands by 10-30x+ under active
+// multitasking for reasons not fully diagnosed either, an unacceptable
+// tradeoff. This fix instead removes the long-lived register as the
+// single point of failure: h/w/k are no longer function parameters
+// carried in a register across the whole loop body, they're re-fetched
+// fresh via sha256_h/w/k_scratch_get() (boot/scratch_state.S -- a
+// direct `.bss` global reload, already proven immune to any runtime
+// write via a dedicated memory-write watch this same round) at every
+// single point of use. Whatever the exact register-corruption
+// mechanism was, this closes the whole class: no pointer this function
+// touches is ever more than a few instructions old before its use.
+fn sha256_compress(msg: mut ref i64, block_off: i64) -> i64 {
   let i: i64 = 0;
   while i < 16 {
     let word: u32 = sha256_read_be32(msg, block_off + i * 4);
-    let _ = buf_write_u32(w, (i * 4) as u32, word);
+    let _ = buf_write_u32(sha256_w_scratch_get(), (i * 4) as u32, word);
     i = i + 1;
   }
   i = 16;
   while i < 64 {
-    let w15: u32 = buf_read_u32(w, ((i - 15) * 4) as u32);
-    let w2: u32 = buf_read_u32(w, ((i - 2) * 4) as u32);
-    let w16: u32 = buf_read_u32(w, ((i - 16) * 4) as u32);
-    let w7: u32 = buf_read_u32(w, ((i - 7) * 4) as u32);
+    let w15: u32 = buf_read_u32(sha256_w_scratch_get(), ((i - 15) * 4) as u32);
+    let w2: u32 = buf_read_u32(sha256_w_scratch_get(), ((i - 2) * 4) as u32);
+    let w16: u32 = buf_read_u32(sha256_w_scratch_get(), ((i - 16) * 4) as u32);
+    let w7: u32 = buf_read_u32(sha256_w_scratch_get(), ((i - 7) * 4) as u32);
     let s0: u32 = sha256_rotr32(w15, 7 as u32) ^ sha256_rotr32(w15, 18 as u32) ^ (w15 >> (3 as u32));
     let s1: u32 = sha256_rotr32(w2, 17 as u32) ^ sha256_rotr32(w2, 19 as u32) ^ (w2 >> (10 as u32));
     let wi: u32 = sha256_wrap_add32(sha256_wrap_add32(w16, s0), sha256_wrap_add32(w7, s1));
-    let _ = buf_write_u32(w, (i * 4) as u32, wi);
+    let _ = buf_write_u32(sha256_w_scratch_get(), (i * 4) as u32, wi);
     i = i + 1;
   }
 
-  let a: u32 = buf_read_u32(h, 0 as u32);
-  let b: u32 = buf_read_u32(h, 4 as u32);
-  let c: u32 = buf_read_u32(h, 8 as u32);
-  let d: u32 = buf_read_u32(h, 12 as u32);
-  let e: u32 = buf_read_u32(h, 16 as u32);
-  let f: u32 = buf_read_u32(h, 20 as u32);
-  let g: u32 = buf_read_u32(h, 24 as u32);
-  let hh: u32 = buf_read_u32(h, 28 as u32);
+  let a: u32 = buf_read_u32(sha256_h_scratch_get(), 0 as u32);
+  let b: u32 = buf_read_u32(sha256_h_scratch_get(), 4 as u32);
+  let c: u32 = buf_read_u32(sha256_h_scratch_get(), 8 as u32);
+  let d: u32 = buf_read_u32(sha256_h_scratch_get(), 12 as u32);
+  let e: u32 = buf_read_u32(sha256_h_scratch_get(), 16 as u32);
+  let f: u32 = buf_read_u32(sha256_h_scratch_get(), 20 as u32);
+  let g: u32 = buf_read_u32(sha256_h_scratch_get(), 24 as u32);
+  let hh: u32 = buf_read_u32(sha256_h_scratch_get(), 28 as u32);
   let ones: u32 = 4294967295 as u32;
 
   i = 0;
   while i < 64 {
     let bige1: u32 = sha256_rotr32(e, 6 as u32) ^ sha256_rotr32(e, 11 as u32) ^ sha256_rotr32(e, 25 as u32);
     let ch: u32 = (e & f) ^ ((e ^ ones) & g);
-    let kw: u32 = buf_read_u32(k, (i * 4) as u32);
-    let ww: u32 = buf_read_u32(w, (i * 4) as u32);
+    let kw: u32 = buf_read_u32(sha256_k_scratch_get(), (i * 4) as u32);
+    let ww: u32 = buf_read_u32(sha256_w_scratch_get(), (i * 4) as u32);
     let t1: u32 = sha256_wrap_add32(sha256_wrap_add32(hh, bige1), sha256_wrap_add32(ch, sha256_wrap_add32(kw, ww)));
     let bige0: u32 = sha256_rotr32(a, 2 as u32) ^ sha256_rotr32(a, 13 as u32) ^ sha256_rotr32(a, 22 as u32);
     let maj: u32 = (a & b) ^ (a & c) ^ (b & c);
@@ -14221,14 +14249,14 @@ fn sha256_compress(h: mut ref i64, msg: mut ref i64, block_off: i64, w: mut ref 
     i = i + 1;
   }
 
-  let _ = buf_write_u32(h, 0 as u32, sha256_wrap_add32(buf_read_u32(h, 0 as u32), a));
-  let _ = buf_write_u32(h, 4 as u32, sha256_wrap_add32(buf_read_u32(h, 4 as u32), b));
-  let _ = buf_write_u32(h, 8 as u32, sha256_wrap_add32(buf_read_u32(h, 8 as u32), c));
-  let _ = buf_write_u32(h, 12 as u32, sha256_wrap_add32(buf_read_u32(h, 12 as u32), d));
-  let _ = buf_write_u32(h, 16 as u32, sha256_wrap_add32(buf_read_u32(h, 16 as u32), e));
-  let _ = buf_write_u32(h, 20 as u32, sha256_wrap_add32(buf_read_u32(h, 20 as u32), f));
-  let _ = buf_write_u32(h, 24 as u32, sha256_wrap_add32(buf_read_u32(h, 24 as u32), g));
-  let _ = buf_write_u32(h, 28 as u32, sha256_wrap_add32(buf_read_u32(h, 28 as u32), hh));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 0 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 0 as u32), a));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 4 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 4 as u32), b));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 8 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 8 as u32), c));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 12 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 12 as u32), d));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 16 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 16 as u32), e));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 20 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 20 as u32), f));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 24 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 24 as u32), g));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 28 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 28 as u32), hh));
   return 0;
 }
 
@@ -14273,21 +14301,18 @@ fn sha256_hash(msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
   let _ = sha256_write_be32(padded, total_len - 8, 0 as u32);
   let _ = sha256_write_be32(padded, total_len - 4, bit_len as u32);
 
-  let h: mut ref i64 = sha256_h_scratch_get();
-  let _ = sha256_h_init(h);
-  let k: mut ref i64 = sha256_k_scratch_get();
-  let w: mut ref i64 = sha256_w_scratch_get();
+  let _ = sha256_h_init();
 
   let num_blocks: i64 = total_len / 64;
   let blk: i64 = 0;
   while blk < num_blocks {
-    let _ = sha256_compress(h, padded, blk * 64, w, k);
+    let _ = sha256_compress(padded, blk * 64);
     blk = blk + 1;
   }
 
   let j: i64 = 0;
   while j < 8 {
-    let word: u32 = buf_read_u32(h, (j * 4) as u32);
+    let word: u32 = buf_read_u32(sha256_h_scratch_get(), (j * 4) as u32);
     let _ = sha256_write_be32(out, j * 4, word);
     j = j + 1;
   }
