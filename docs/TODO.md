@@ -1509,18 +1509,49 @@ for by name.
   estimate, never lower one), verified against the full vani-compiler
   test suite with no regressions. Pushed to vani-compiler's `main`.
 
-- **PKI (Public Key Infrastructure)** — `[XL, several rounds beyond
-  the crypto foundation above — SKIPPED FOR NOW, 2026-08-31, same
-  EC-arithmetic blocker as TLS above]`
-  Real PKI means X.509 certificate parsing (a nontrivial ASN.1/DER
-  parser, a genuinely large and historically bug-prone piece of code
-  in any language) plus chain-of-trust validation against root CAs.
-  Depends entirely on the crypto primitives item above (signature
-  verification needs working asymmetric crypto first). A realistic
-  FIRST increment, if ever started, is raw public-key trust (pin a
-  known key, verify a signature against it directly) with no X.509/CA
-  chain at all — full X.509 is a separate, much larger step after
-  that, not a package deal.
+- **PKI (Public Key Infrastructure)** — raw public-key trust: `[DONE,
+  round 67, 2026-09-02]`; full X.509/CA chain: still `[XL, SKIPPED,
+  a separate, much larger step, not a package deal]`
+  The realistic FIRST increment this entry itself called for: pin a
+  known Ed25519 public key, verify a signature against it directly,
+  no X.509/ASN.1/CA-chain machinery at all. `boot/pki_state.S` +
+  `pki_init`/`pki_verify_raw`/`pki_verify_file_raw`/`pki_verify_file`
+  (`kernel/kernel_main.vani`), a new `verify <path>` shell command
+  alongside `cat`/`catv`. The pinned key is a COMPILE-TIME CONSTANT,
+  deliberately never runtime-settable through the shell or any other
+  API -- a trust anchor repinnable by whoever has shell access would
+  defeat the entire point (matches this project's own "smaller
+  substitute for secure boot" framing under the Secure Boot entry
+  below: Dhruva verifying something IT loads at runtime before
+  trusting it, the trust anchor itself provisioned once, not mutable).
+  Signature format: a companion `<path>.sig` file (64 bytes, the raw
+  Ed25519 signature) next to the file it covers -- same "companion
+  file, not a record-format change" pattern round 48's own SHA-256
+  digest feature (`<path>.sha256`) already established, reused
+  directly rather than inventing a third convention.
+
+  Verified via a real demo keypair (the PRIVATE key never appears
+  anywhere in this codebase, only the pinned public half -- matching
+  real trust-anchor provisioning practice) generated the same way
+  every other Curve25519-family test vector this round was: a
+  from-scratch Python script using the real `cryptography` library,
+  not typed from memory. 12 new host-harness checks (814→826 PASS
+  clean under ASAN/UBSAN): genuine-signature accept, tampered-content
+  reject, tampered-signature reject, a REAL end-to-end round trip
+  through actual DharaFS storage (write the file and its companion
+  `.sig`, verify, then overwrite the file's content and confirm the
+  now-stale signature is correctly rejected), missing-file and
+  missing-companion-`.sig` both a clean -1 (never a crash), and a
+  path-length boundary check (dharafs's own 32-byte path cap minus
+  the 4-byte `.sig` suffix leaves 28 usable characters for the
+  original path -- one more is rejected cleanly before ever touching
+  dharafs). Live-verified at boot on real ARM/QEMU. Caught and fixed
+  one real (non-algorithmic) issue along the way: the new `verify`
+  shell command's own call chain pushed `task_f`'s compiler-checked
+  `#[bounded_stack]` worst case to 4172 bytes, past its round-30
+  budget of 4096 -- raised to 6144 (this function's REAL allocated
+  stack is 16384 bytes, so this was always a static-checker
+  bookkeeping fix, never a genuine overflow risk).
 
 - **Media (at-rest) encryption** — `[DONE, round 62, 2026-08-31]`
   DharaFS block encryption layered on round 44's existing ChaCha20

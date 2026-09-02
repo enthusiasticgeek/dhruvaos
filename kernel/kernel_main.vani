@@ -171,6 +171,12 @@ extern "C" fn ed25519_sbz_set(addr: mut ref i64) -> i64;
 extern "C" fn ed25519_sbz_get() -> mut ref i64;
 extern "C" fn ed25519_sbt_set(addr: mut ref i64) -> i64;
 extern "C" fn ed25519_sbt_get() -> mut ref i64;
+extern "C" fn pki_pinned_key_set(addr: mut ref i64) -> i64;
+extern "C" fn pki_pinned_key_get() -> mut ref i64;
+extern "C" fn pki_sig_path_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn pki_sig_path_scratch_get() -> mut ref i64;
+extern "C" fn pki_sig_data_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn pki_sig_data_scratch_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -15662,6 +15668,43 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Round 67: PKI raw public-key trust -- checks <path> against a
+  // companion <path>.sig using the compile-time-pinned Ed25519 key
+  // (pki_init/boot/pki_state.S), not a per-file digest the writer
+  // controls (catv's own SHA-256 model above) -- the signature can
+  // only have been produced by whoever holds the matching PRIVATE
+  // key, which this shell has no access to and no way to create.
+  if shell_word_matches(line_buf, 0, cmd_end, "verify") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: verify <path>\n");
+      return 0;
+    }
+    let path_start: i64 = cmd_end + 1;
+    let path_end: i64 = shell_find_space(line_buf, path_start, line_len);
+    let path_len: i64 = path_end - path_start;
+    if path_len == 0 {
+      let _ = uart_puts("usage: verify <path>\n");
+      return 0;
+    }
+    if path_len > 32 {
+      let _ = uart_puts("error: path too long\n");
+      return 0;
+    }
+    let path_buf: mut ref i64 = dharafs_path_scratch_get();
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    let result: i64 = pki_verify_file_raw(path_buf, path_len);
+    if result == 1 {
+      let _ = uart_puts("VALID: signature verifies against the pinned key\n");
+    } else {
+      if result == 0 {
+        let _ = uart_puts("INVALID: signature does not verify\n");
+      } else {
+        let _ = uart_puts("error: file or companion .sig not found\n");
+      }
+    }
+    return 0;
+  }
+
   if shell_word_matches(line_buf, 0, cmd_end, "rm") == 1 {
     if cmd_end >= line_len {
       let _ = uart_puts("usage: rm <path>\n");
@@ -16834,8 +16877,19 @@ fn shell_dispatch() -> i64 {
 // its second occurrence). Raised to 4096, well past the reported
 // worst case, to leave headroom for future shell commands rather than
 // only barely clearing today's exact number.
+//
+// Round 67: the new `verify` shell command's own call chain (task_f
+// -> shell_dispatch -> pki_verify_file_raw -> ... -> ed25519_verify
+// -> point decompression's own modular-sqrt computation) reported a
+// new worst case of 4172 bytes, past the round-30 budget again --
+// same bug class, not a new one. Raised to 6144, comfortable headroom
+// above the reported number (this function's REAL allocated stack is
+// 16384 bytes -- task_f_init_stack's own stack_f_bytes below -- so
+// this annotation has never been anywhere near the actual physical
+// limit; it exists purely so the compiler's own static checker keeps
+// catching future growth here before it becomes a real problem).
 #[no_mangle]
-#[bounded_stack(bytes=4096)]
+#[bounded_stack(bytes=6144)]
 fn task_f() -> i64 {
   while true {
     let ready: u32 = shell_get_line_ready();
@@ -19577,6 +19631,255 @@ fn ed25519_self_test() -> i64 {
 }
 
 
+// Round 67: PKI raw public-key trust -- see boot/pki_state.S's own
+// header comment for the full scoping rationale (no X.509/CA chain,
+// a compile-time-pinned key never runtime-settable).
+fn pki_init() -> i64 {
+  let key: mut ref i64 = pki_pinned_key_get();
+  let _ = buf_write_byte(key, 0 as u32, 0xe7 as u32);
+  let _ = buf_write_byte(key, 1 as u32, 0x34 as u32);
+  let _ = buf_write_byte(key, 2 as u32, 0xea as u32);
+  let _ = buf_write_byte(key, 3 as u32, 0x6c as u32);
+  let _ = buf_write_byte(key, 4 as u32, 0x2b as u32);
+  let _ = buf_write_byte(key, 5 as u32, 0x62 as u32);
+  let _ = buf_write_byte(key, 6 as u32, 0x57 as u32);
+  let _ = buf_write_byte(key, 7 as u32, 0xde as u32);
+  let _ = buf_write_byte(key, 8 as u32, 0x72 as u32);
+  let _ = buf_write_byte(key, 9 as u32, 0x35 as u32);
+  let _ = buf_write_byte(key, 10 as u32, 0x5e as u32);
+  let _ = buf_write_byte(key, 11 as u32, 0x47 as u32);
+  let _ = buf_write_byte(key, 12 as u32, 0x2a as u32);
+  let _ = buf_write_byte(key, 13 as u32, 0xa0 as u32);
+  let _ = buf_write_byte(key, 14 as u32, 0x5a as u32);
+  let _ = buf_write_byte(key, 15 as u32, 0x4c as u32);
+  let _ = buf_write_byte(key, 16 as u32, 0x48 as u32);
+  let _ = buf_write_byte(key, 17 as u32, 0x7e as u32);
+  let _ = buf_write_byte(key, 18 as u32, 0x6b as u32);
+  let _ = buf_write_byte(key, 19 as u32, 0x46 as u32);
+  let _ = buf_write_byte(key, 20 as u32, 0x3c as u32);
+  let _ = buf_write_byte(key, 21 as u32, 0x02 as u32);
+  let _ = buf_write_byte(key, 22 as u32, 0x9e as u32);
+  let _ = buf_write_byte(key, 23 as u32, 0xd3 as u32);
+  let _ = buf_write_byte(key, 24 as u32, 0x06 as u32);
+  let _ = buf_write_byte(key, 25 as u32, 0xdf as u32);
+  let _ = buf_write_byte(key, 26 as u32, 0x2f as u32);
+  let _ = buf_write_byte(key, 27 as u32, 0x01 as u32);
+  let _ = buf_write_byte(key, 28 as u32, 0xb5 as u32);
+  let _ = buf_write_byte(key, 29 as u32, 0x63 as u32);
+  let _ = buf_write_byte(key, 30 as u32, 0x6b as u32);
+  let _ = buf_write_byte(key, 31 as u32, 0x58 as u32);
+  return 0;
+}
+
+fn pki_verify_raw(data: mut ref i64, data_len: i64, sig: mut ref i64) -> i64 {
+  return ed25519_verify(pki_pinned_key_get(), data, data_len, sig);
+}
+
+// Verifies the file at `path_buf` (already copied by the caller,
+// same convention as dharafs_find_latest_block_raw's own `path_buf`
+// parameters) against a companion signature file at `<path>.sig`.
+// Returns 1 (valid), 0 (signature present but doesn't verify), or -1
+// (path too long, file missing, or no companion .sig file / wrong
+// size -- "reject, don't guess" for every one of these, same posture
+// as the rest of this codebase's format/bounds checks).
+fn pki_verify_file_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  if (path_len <= 0) || (path_len > 32) {
+    return 0 - 1;
+  }
+  let suffix: Str = ".sig";
+  let suffix_len: i64 = str_len_bytes(suffix);
+  if (path_len + suffix_len) > 32 {
+    return 0 - 1;
+  }
+  let sig_path_buf: mut ref i64 = pki_sig_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(sig_path_buf, i as u32, buf_read_byte(path_buf, i as u32));
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < suffix_len {
+    let _ = buf_write_byte(sig_path_buf, (path_len + j) as u32, str_byte_at(suffix, j) as u32);
+    j = j + 1;
+  }
+  let sig_path_len: i64 = path_len + suffix_len;
+
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read_raw(path_buf, path_len, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+
+  let sig_buf: mut ref i64 = pki_sig_data_scratch_get();
+  let sig_len: i64 = dharafs_read_raw(sig_path_buf, sig_path_len, sig_buf);
+  if sig_len != 64 {
+    return 0 - 1;
+  }
+
+  return pki_verify_raw(data_buf, data_len, sig_buf);
+}
+
+fn pki_verify_file(path: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  if (path_len <= 0) || (path_len > 32) {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return pki_verify_file_raw(path_buf, path_len);
+}
+
+
+// Signed with the private key matching pki_init's own compile-time-
+// pinned public key -- generated once via the same verified Python
+// run as ed25519_self_test's own vector (see that function's header
+// comment for the full methodology), the PRIVATE key itself never
+// appears anywhere in this codebase, matching real trust-anchor
+// provisioning practice (only the public half is ever baked in).
+fn pki_self_test() -> i64 {
+  let ok: i64 = 1;
+  let _ = pki_init();
+
+  let msg_str: Str = "Dhruva PKI demo payload -- config or update content";
+  let msg_len: i64 = str_len_bytes(msg_str);
+  let msg: mut ref i64 = dhruva_alloc_bytes(msg_len);
+  let mi: i64 = 0;
+  while mi < msg_len {
+    let _ = buf_write_byte(msg, mi as u32, str_byte_at(msg_str, mi) as u32);
+    mi = mi + 1;
+  }
+
+  let sig: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = buf_write_byte(sig, 0 as u32, 0x51 as u32);
+  let _ = buf_write_byte(sig, 1 as u32, 0xfd as u32);
+  let _ = buf_write_byte(sig, 2 as u32, 0xcf as u32);
+  let _ = buf_write_byte(sig, 3 as u32, 0x0c as u32);
+  let _ = buf_write_byte(sig, 4 as u32, 0x1c as u32);
+  let _ = buf_write_byte(sig, 5 as u32, 0xf5 as u32);
+  let _ = buf_write_byte(sig, 6 as u32, 0x3c as u32);
+  let _ = buf_write_byte(sig, 7 as u32, 0x5d as u32);
+  let _ = buf_write_byte(sig, 8 as u32, 0x39 as u32);
+  let _ = buf_write_byte(sig, 9 as u32, 0x66 as u32);
+  let _ = buf_write_byte(sig, 10 as u32, 0x41 as u32);
+  let _ = buf_write_byte(sig, 11 as u32, 0x42 as u32);
+  let _ = buf_write_byte(sig, 12 as u32, 0x92 as u32);
+  let _ = buf_write_byte(sig, 13 as u32, 0x91 as u32);
+  let _ = buf_write_byte(sig, 14 as u32, 0x50 as u32);
+  let _ = buf_write_byte(sig, 15 as u32, 0xcb as u32);
+  let _ = buf_write_byte(sig, 16 as u32, 0xc7 as u32);
+  let _ = buf_write_byte(sig, 17 as u32, 0xa5 as u32);
+  let _ = buf_write_byte(sig, 18 as u32, 0x93 as u32);
+  let _ = buf_write_byte(sig, 19 as u32, 0x97 as u32);
+  let _ = buf_write_byte(sig, 20 as u32, 0x50 as u32);
+  let _ = buf_write_byte(sig, 21 as u32, 0xec as u32);
+  let _ = buf_write_byte(sig, 22 as u32, 0xa1 as u32);
+  let _ = buf_write_byte(sig, 23 as u32, 0xff as u32);
+  let _ = buf_write_byte(sig, 24 as u32, 0xd5 as u32);
+  let _ = buf_write_byte(sig, 25 as u32, 0x74 as u32);
+  let _ = buf_write_byte(sig, 26 as u32, 0x5b as u32);
+  let _ = buf_write_byte(sig, 27 as u32, 0x8c as u32);
+  let _ = buf_write_byte(sig, 28 as u32, 0x24 as u32);
+  let _ = buf_write_byte(sig, 29 as u32, 0x21 as u32);
+  let _ = buf_write_byte(sig, 30 as u32, 0xe2 as u32);
+  let _ = buf_write_byte(sig, 31 as u32, 0x7b as u32);
+  let _ = buf_write_byte(sig, 32 as u32, 0x92 as u32);
+  let _ = buf_write_byte(sig, 33 as u32, 0xd5 as u32);
+  let _ = buf_write_byte(sig, 34 as u32, 0x64 as u32);
+  let _ = buf_write_byte(sig, 35 as u32, 0x88 as u32);
+  let _ = buf_write_byte(sig, 36 as u32, 0xd3 as u32);
+  let _ = buf_write_byte(sig, 37 as u32, 0xc0 as u32);
+  let _ = buf_write_byte(sig, 38 as u32, 0x9c as u32);
+  let _ = buf_write_byte(sig, 39 as u32, 0x69 as u32);
+  let _ = buf_write_byte(sig, 40 as u32, 0x16 as u32);
+  let _ = buf_write_byte(sig, 41 as u32, 0x81 as u32);
+  let _ = buf_write_byte(sig, 42 as u32, 0xcb as u32);
+  let _ = buf_write_byte(sig, 43 as u32, 0x0f as u32);
+  let _ = buf_write_byte(sig, 44 as u32, 0x04 as u32);
+  let _ = buf_write_byte(sig, 45 as u32, 0x76 as u32);
+  let _ = buf_write_byte(sig, 46 as u32, 0x35 as u32);
+  let _ = buf_write_byte(sig, 47 as u32, 0x2b as u32);
+  let _ = buf_write_byte(sig, 48 as u32, 0x93 as u32);
+  let _ = buf_write_byte(sig, 49 as u32, 0xfa as u32);
+  let _ = buf_write_byte(sig, 50 as u32, 0x89 as u32);
+  let _ = buf_write_byte(sig, 51 as u32, 0x6d as u32);
+  let _ = buf_write_byte(sig, 52 as u32, 0xdb as u32);
+  let _ = buf_write_byte(sig, 53 as u32, 0x5a as u32);
+  let _ = buf_write_byte(sig, 54 as u32, 0x09 as u32);
+  let _ = buf_write_byte(sig, 55 as u32, 0xdf as u32);
+  let _ = buf_write_byte(sig, 56 as u32, 0xa6 as u32);
+  let _ = buf_write_byte(sig, 57 as u32, 0xd2 as u32);
+  let _ = buf_write_byte(sig, 58 as u32, 0xfe as u32);
+  let _ = buf_write_byte(sig, 59 as u32, 0x5f as u32);
+  let _ = buf_write_byte(sig, 60 as u32, 0x7d as u32);
+  let _ = buf_write_byte(sig, 61 as u32, 0x52 as u32);
+  let _ = buf_write_byte(sig, 62 as u32, 0x7f as u32);
+  let _ = buf_write_byte(sig, 63 as u32, 0x05 as u32);
+
+  if pki_verify_raw(msg, msg_len, sig) == 0 {
+    ok = 0; // a genuine signature from the matching private key must verify
+  }
+
+  let bad_msg: mut ref i64 = dhruva_alloc_bytes(msg_len);
+  let bi: i64 = 0;
+  while bi < msg_len {
+    let _ = buf_write_byte(bad_msg, bi as u32, buf_read_byte(msg, bi as u32));
+    bi = bi + 1;
+  }
+  let _ = buf_write_byte(bad_msg, 0 as u32, buf_read_byte(bad_msg, 0 as u32) ^ (1 as u32));
+  if pki_verify_raw(bad_msg, msg_len, sig) == 1 {
+    ok = 0; // tampered content must NOT verify against the same signature
+  }
+
+  // End-to-end file-based path: write the payload and its companion
+  // .sig, verify via the shell-facing pki_verify_file, then corrupt
+  // the on-disk content (not the in-memory msg buffer -- exercises
+  // the REAL dharafs_read_raw path, not just the raw in-memory check
+  // above) and confirm it's now correctly rejected.
+  let _ = dharafs_append("/pki/demo", "Dhruva PKI demo payload -- config or update content");
+  let sig_path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let sp_str: Str = "/pki/demo.sig";
+  let sp_len: i64 = str_len_bytes(sp_str);
+  let spi: i64 = 0;
+  while spi < sp_len {
+    let _ = buf_write_byte(sig_path_buf, spi as u32, str_byte_at(sp_str, spi) as u32);
+    spi = spi + 1;
+  }
+  let sig_data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let sdi: i64 = 0;
+  while sdi < 64 {
+    let _ = buf_write_byte(sig_data_buf, sdi as u32, buf_read_byte(sig, sdi as u32));
+    sdi = sdi + 1;
+  }
+  let _ = dharafs_append_raw(sig_path_buf, sp_len, sig_data_buf, 64, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
+
+  if pki_verify_file("/pki/demo") == 0 {
+    ok = 0; // real file + real companion .sig must verify end to end
+  }
+
+  let _ = dharafs_append("/pki/demo", "TAMPERED -- config or update content");
+  if pki_verify_file("/pki/demo") == 1 {
+    ok = 0; // corrupted on-disk content must NOT verify against the old signature
+  }
+
+  if pki_verify_file("/pki/nonexistent") != (0 - 1) {
+    ok = 0; // a missing file (and thus missing .sig) is a clean -1, not a crash or a false accept
+  }
+
+  let _ = uart_puts("CRYPTO: PKI raw public-key trust (pinned-key verify + real dharafs file round trip)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+
+
 
 // FIPS 180-4 / NIST-shaped known-answer checks against Python's own
 // trusted hashlib.sha512 (see this file's own header comment on
@@ -21360,6 +21663,10 @@ fn kernel_main() -> i64 {
   let _ = ed25519_scalar_sum_set(dhruva_alloc_bytes(80));
   let _ = ed25519_hash_input_set(dhruva_alloc_bytes(4192));
   let _ = ed25519_hash_out_set(dhruva_alloc_bytes(64));
+  let _ = pki_pinned_key_set(dhruva_alloc_bytes(32));
+  let _ = pki_sig_path_scratch_set(dhruva_alloc_bytes(40));
+  let _ = pki_sig_data_scratch_set(dhruva_alloc_bytes(64));
+  let _ = pki_init();
   let _ = ed25519_init();
   let _ = sha512_k_init(sha512_k_scratch_get());
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
@@ -21640,6 +21947,7 @@ fn kernel_main() -> i64 {
   let _ = x25519_self_test();
   let _ = sha512_self_test();
   let _ = ed25519_self_test();
+  let _ = pki_self_test();
 
   // Media (at-rest) encryption for DharaFS, layered on the ChaCha20
   // cipher above. Key derivation runs once here, single-threaded,

@@ -2147,6 +2147,74 @@ static void test_ed25519(void) {
     CHECK(fn_ed25519_verify(garbage_buf, msg_buf, msg_len, sig_out) == 0, "ed25519: verify cleanly rejects a malformed public key (no valid curve point)");
 }
 
+int64_t fn_pki_init(void);
+int64_t fn_pki_verify_raw(int64_t *data, int64_t data_len, int64_t *sig);
+int64_t fn_pki_verify_file_raw(int64_t *path_buf, int64_t path_len);
+int64_t fn_pki_verify_file(const char *path);
+int64_t pki_pinned_key_set(int64_t *addr);
+int64_t pki_sig_path_scratch_set(int64_t *addr);
+int64_t pki_sig_data_scratch_set(int64_t *addr);
+
+static void pki_init_scratch(void) {
+    pki_pinned_key_set(dhruva_alloc_bytes(32));
+    pki_sig_path_scratch_set(dhruva_alloc_bytes(40));
+    pki_sig_data_scratch_set(dhruva_alloc_bytes(64));
+    fn_pki_init();
+}
+
+static void test_pki(void) {
+    pki_init_scratch();
+
+    static const unsigned char sig_bytes[64] = {0x51, 0xfd, 0xcf, 0x0c, 0x1c, 0xf5, 0x3c, 0x5d, 0x39, 0x66, 0x41, 0x42, 0x92, 0x91, 0x50, 0xcb, 0xc7, 0xa5, 0x93, 0x97, 0x50, 0xec, 0xa1, 0xff, 0xd5, 0x74, 0x5b, 0x8c, 0x24, 0x21, 0xe2, 0x7b, 0x92, 0xd5, 0x64, 0x88, 0xd3, 0xc0, 0x9c, 0x69, 0x16, 0x81, 0xcb, 0x0f, 0x04, 0x76, 0x35, 0x2b, 0x93, 0xfa, 0x89, 0x6d, 0xdb, 0x5a, 0x09, 0xdf, 0xa6, 0xd2, 0xfe, 0x5f, 0x7d, 0x52, 0x7f, 0x05};
+    const char *msg_text = "Dhruva PKI demo payload -- config or update content";
+    int64_t msg_len = (int64_t)strlen(msg_text);
+    int64_t *msg_buf = mkbuf(msg_text, msg_len);
+    int64_t *sig_buf = mkbuf((const char *)sig_bytes, 64);
+
+    CHECK(fn_pki_verify_raw(msg_buf, msg_len, sig_buf) == 1, "pki: a genuine signature from the matching private key verifies against the pinned key");
+
+    unsigned char bad_msg[64];
+    memcpy(bad_msg, msg_text, (size_t)msg_len);
+    bad_msg[0] ^= 1;
+    int64_t *bad_msg_buf = mkbuf((const char *)bad_msg, msg_len);
+    CHECK(fn_pki_verify_raw(bad_msg_buf, msg_len, sig_buf) == 0, "pki: tampered content does not verify");
+
+    unsigned char bad_sig[64];
+    memcpy(bad_sig, sig_bytes, 64);
+    bad_sig[0] ^= 1;
+    int64_t *bad_sig_buf = mkbuf((const char *)bad_sig, 64);
+    CHECK(fn_pki_verify_raw(msg_buf, msg_len, bad_sig_buf) == 0, "pki: tampered signature does not verify");
+
+    /* Real end-to-end file-based path, through actual dharafs storage
+     * (host virtual disk), not just the raw in-memory check above. */
+    reset_fs();
+    CHECK(fn_dharafs_append("/pki/demo", msg_text) == 0, "pki: write demo payload file");
+    int64_t *sig_path_buf = mkbuf("/pki/demo.sig", 13);
+    int64_t *sig_data_buf = mkbuf((const char *)sig_bytes, 64);
+    CHECK(fn_dharafs_append_raw(sig_path_buf, 13, sig_data_buf, 64, 0, 0, 0644) == 0, "pki: write companion .sig file");
+    CHECK(fn_pki_verify_file("/pki/demo") == 1, "pki: real dharafs file + real companion .sig verifies end to end");
+
+    CHECK(fn_dharafs_append("/pki/demo", "TAMPERED content, different from the signed original") == 0, "pki: overwrite the file with different content");
+    CHECK(fn_pki_verify_file("/pki/demo") == 0, "pki: corrupted on-disk content no longer verifies against the old signature");
+
+    CHECK(fn_pki_verify_file("/pki/nonexistent") == -1, "pki: a missing file is a clean -1, not a crash or a false accept");
+
+    CHECK(fn_dharafs_append("/pki/nosig", "a file with no companion signature at all") == 0, "pki: write a file with no .sig");
+    CHECK(fn_pki_verify_file("/pki/nosig") == -1, "pki: a file with no companion .sig is a clean -1");
+
+    /* Path length boundary: dharafs's own 32-byte path cap, minus the
+     * 4-byte ".sig" suffix, leaves 28 usable characters for the
+     * ORIGINAL path -- one more than that must be rejected cleanly by
+     * pki_verify_file_raw itself (before ever touching dharafs),
+     * not silently truncated or overflowed. */
+    char long_path[40];
+    memset(long_path, 'a', 29);
+    long_path[0] = '/';
+    long_path[29] = 0;
+    int64_t *long_path_buf = mkbuf(long_path, 29);
+    CHECK(fn_pki_verify_file_raw(long_path_buf, 29) == -1, "pki: a path too long for its own .sig companion is rejected cleanly");
+}
+
 static void test_bignum_boundaries(void) {
     /* Multiply by zero. */
     int64_t *a = dhruva_alloc_bytes(16);
@@ -3155,6 +3223,7 @@ int main(void) {
     test_x25519();
     test_sha512_boundaries();
     test_ed25519();
+    test_pki();
     test_bignum_boundaries();
     test_lan9512_framing();
     test_hci_framing();
