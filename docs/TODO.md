@@ -2356,11 +2356,14 @@ support of any kind.
 - **BLE via USB dongle (Pi 1): HCI transport (DONE, round 57,
   spec-only) + connection establishment/ACL/L2CAP/core ATT (DONE,
   round 66, spec-only) + GATT discovery + client read/write-by-index
-  (DONE, round 66, spec-only) + GATT SERVER role (not started)** —
-  `[L, several rounds — a full GATT CLIENT stack is now built; a GATT
-  SERVER role (Dhruva exposing its own attributes rather than
-  discovering a peer's) is a separate, additional direction, not
-  attempted]`
+  (DONE, round 66, spec-only) + GATT SERVER role + 128-bit custom
+  UUIDs + notifications/indications + L2CAP Signaling (DONE, round 66,
+  spec-only)** — `[L, several rounds — DONE. User explicitly asked for
+  "full BLE stack implementation" including all of the above; both
+  GATT roles (client discovering a peer's attributes AND Dhruva
+  exposing its own), 128-bit custom UUID decoding, and the
+  notification/indication subscribe-and-receive path are now all
+  built]`
   USB Bluetooth HCI is an OFFICIAL, STANDARDIZED USB class (interface
   class `0xE0`/subclass `0x01`/protocol `0x01`) — `dwc2_fetch_and_
   set_configuration`'s descriptor walk detects it exactly like mass
@@ -2447,19 +2450,149 @@ support of any kind.
   fix from earlier the same round) — every accessor now takes at most
   2 arguments, each in exactly one register, nothing to get wrong.
 
-  **Deliberately NOT included**: a GATT SERVER role (Dhruva exposing
-  its own attributes for a real central to discover/read/write,
-  rather than discovering a peer's) is a separate, additional
-  direction with its own real design surface (an attribute database,
-  server-side request handling) — not attempted this round, the
-  CLIENT role only, matching `hci_build_le_create_connection_command`'s
-  own direction (Dhruva as the connecting central). 128-bit custom
-  UUIDs are also not decoded (every standard GATT service/
-  characteristic type is a 16-bit Bluetooth-SIG-assigned UUID, which
-  is what real embedded interop overwhelmingly needs) — a discovered
-  128-bit-UUID service/characteristic still gets its handle range
-  recorded correctly, just with `uuid16=0` as an explicit "not
-  decoded" sentinel rather than a wrong guess.
+  **Superseded by the same-day follow-up below**: this paragraph
+  originally scoped OUT a GATT SERVER role, 128-bit custom UUIDs, and
+  notifications/indications — the user then explicitly asked for all
+  three ("notifications too. i want all 3 things ... for full stack
+  ble"), and all three are now built; see the round writeup below for
+  what each one actually covers and what real, honestly-documented
+  simplifications remain within them.
+
+  **Round 66 (2026-09-01), same day, third follow-up — GATT SERVER
+  role + 128-bit custom UUIDs + notifications/indications + L2CAP
+  Signaling built.** User's own words: "notifications too. i want all
+  3 things in bullet points you listed above for full stack ble" —
+  the three items scoped out at the end of the GATT-discovery writeup
+  above.
+
+  **GATT SERVER role**: Dhruva can now expose its OWN
+  services/characteristics for something else to discover/read/write,
+  over a connection Dhruva itself still establishes as central (GATT
+  server role is independent of GAP central/peripheral role per spec
+  — this doesn't need peripheral/advertising HCI support, which this
+  project still doesn't have). New file `boot/gatt_server_state.S`: a
+  flat, handle-ordered attribute table (32 attributes max, matching
+  this project's own fixed-size-table discipline) where a "service" is
+  one attribute (type 0x2800) and each "characteristic" is two more (a
+  0x2803 declaration, then its own value entry) — this matches the
+  wire protocol directly rather than a higher-level model requiring
+  translation at dispatch time, and each attribute's own HANDLE is
+  simply its array index + 1, not stored separately. `gatt_server_add_
+  service`/`gatt_server_add_characteristic` (kernel_main.vani) build
+  the database up; `gatt_server_handle_request` dispatches Exchange
+  MTU, Read By Group Type (service discovery), Read By Type
+  (characteristic discovery), Read Request, and Write Request against
+  it, always answering with either the correct response or a real
+  Error Response (§3.4.1.1) — Write Request specifically checks a
+  per-attribute writable flag (from the characteristic's own Write
+  property bit) and rejects with Write Not Permitted rather than
+  silently accepting. `gatt_server_poll` wires the dispatch into
+  `gatt_att_recv`/`gatt_att_send`. `gatt_server_notify_value` lets a
+  caller push a Handle Value Notification for one of Dhruva's own
+  attributes on demand. **Scope, explicit**: the caller decides when to
+  notify — no CCCD exposed on Dhruva's own attribute table, no
+  per-connection subscription-state tracking on the server side (a
+  real additional direction, not attempted). Every accessor in `gatt_
+  server_state.S` takes at most 2 plain u32 arguments, same AAPCS-
+  gotcha avoidance as `gatt_state.S`'s own design (see that file's
+  header comment) — designed this way from the start this time, no bug
+  to catch. 39 new host-harness checks cover the attribute database
+  and ALL of `gatt_server_handle_request`'s own dispatch logic against
+  synthetic PDUs (pure logic, no MMIO) — `gatt_server_poll`/`gatt_
+  server_notify_value` themselves are not host-tested, same MMIO
+  boundary as every other orchestration function in this file.
+
+  **128-bit custom UUIDs**: `gatt_state.S` gained per-service/per-
+  characteristic `is_uuid128` flags plus byte-addressed 16-byte UUID
+  storage (same caller-computed-combined-index technique as `gatt_
+  server_state.S`'s own value bytes). `gatt_discover_primary_services`/
+  `gatt_discover_characteristics_for_service` now decode and store a
+  128-bit service/characteristic UUID in full instead of leaving the
+  `uuid16=0` "not decoded" sentinel from before. Added spec-complete
+  request-builder twins for a genuinely custom TYPE search (`att_
+  build_read_by_type_request_uuid128`/`_read_by_group_type_request_
+  uuid128`, §3.4.4.1/.9) and `att_find_information_response_get_
+  uuid128_at` for the discovery-RESPONSE side — none of these are
+  actually called by `gatt_discover_*` itself (which only ever
+  searches by the standard 16-bit Primary Service/Characteristic
+  Declaration TYPES; it's the discovered attribute's own VALUE that
+  can be 128-bit), but are real spec-legal primitives for a caller
+  with a genuinely custom type to search FOR. Also added `uuid128_
+  equal`, a byte-for-byte comparison helper. 21 new host-harness
+  checks.
+
+  **Notifications/indications**: the actual mechanism a server uses to
+  push a characteristic's value to a subscribed client without a Read
+  Request round trip (§3.4.7.1-3). Added Handle Value Notification
+  (0x1B)/Indication (0x1D)/Confirmation (0x1E) PDU builders/parsers
+  (Notification and Indication share one wire shape, only the opcode
+  and whether a Confirmation is required afterward differ — Indication
+  only, and it's not optional bookkeeping: a real server won't send
+  another Indication until the Confirmation arrives). On the CLIENT
+  side: `gatt_discover_descriptors_for_characteristic` (§4.7.1,
+  Find-Information-based, scoped specifically to locating the CCCD —
+  UUID 0x2902 — not a generic every-descriptor table this project has
+  no other use for yet) finds and records a characteristic's own CCCD
+  handle in a new `gatt_char_cccd_handle` table; `gatt_client_write_
+  cccd` subscribes/unsubscribes by writing the Notify/Indicate bits to
+  it; `gatt_client_poll_notifications` receives one Notification or
+  Indication (auto-sending the required Confirmation for the latter)
+  and records its own value handle in a new single-slot `gatt_last_
+  notify_handle` global (this project's driver model only ever has one
+  active BLE connection); `gatt_client_find_char_index_for_value_
+  handle` resolves that handle back to the discovery table's own index
+  convention, kept as an explicit separate step rather than folded
+  into the poll function's own signature. On the SERVER side: `gatt_
+  server_notify_value` (see GATT SERVER paragraph above).
+
+  **L2CAP Signaling**: fixed channel 0x0005, scoped specifically to
+  Connection Parameter Update Request/Response (§4.20-21) — the one
+  Signaling exchange a GAP CENTRAL is actually expected to field (a
+  connected peripheral asking to change the connection
+  interval/latency/timeout); every other Signaling command (connection-
+  oriented channel creation, disconnection, ...) is genuinely out of
+  scope. `l2cap_sig_send`/`_recv` mirror `gatt_att_send`/`_recv`'s own
+  shape, targeting the Signaling channel instead of ATT; `l2cap_sig_
+  poll` receives one command and auto-accepts a Connection Parameter
+  Update Request (matching many real central stacks' own default of
+  not second-guessing typical requested ranges). **Real limitation,
+  stated plainly**: a caller polling Signaling via `l2cap_sig_recv` and
+  ATT via `gatt_att_recv` on separate calls will silently drop
+  whichever type's packet arrives while polling for the other — this
+  project's BLE work has no frame queue/demux layer. Acceptable given
+  how this is actually used (a caller runs `l2cap_sig_poll` BETWEEN
+  discrete GATT operations, not concurrently with an in-flight
+  request), matching how a real peripheral's own Connection Parameter
+  Update Request timing works in practice (sent once, shortly after
+  connection, not mid-transaction). 38 new host-harness checks cover
+  notification/indication PDU building/parsing, L2CAP Signaling PDU
+  building/parsing, and every piece of the descriptor-discovery/
+  subscription path that doesn't itself touch MMIO — `gatt_discover_
+  descriptors_for_characteristic`/`gatt_client_write_cccd`/`gatt_
+  client_poll_notifications`/`l2cap_sig_send`/`_recv`/`_poll` reach
+  `gatt_att_send`/`_recv` or `dwc2_bt_bulk_*` and are not host-tested,
+  same established MMIO boundary.
+
+  Full regression battery green after all three: `qemu_run.py` (one
+  pre-existing, unrelated FAIL — the DharaFS real-SD-path self-check,
+  a known `qemu_run.py`-has-no-SD-drive harness limitation, not a
+  regression from this work), `phase4_milestone.py` 14/14,
+  `heap_stress.py`, `host_harness` 636/636 under ASAN/UBSAN (up from
+  538 before this follow-up — 98 new checks total across all three
+  pieces). Committed locally, no push (DhruvaOS commits stay local-
+  only per this project's own policy).
+
+  **What's still genuinely out of scope after this round**: GATT
+  server subscription-state tracking (a client's own CCCD write
+  against Dhruva's server isn't tracked — `gatt_server_notify_value`
+  always sends regardless of whether anyone subscribed); a generic
+  descriptor table (only the CCCD is ever discovered/recorded);
+  Signaling commands other than Connection Parameter Update; and, as
+  always, real Pi 1B hardware-in-loop verification — this entire BLE
+  stack remains spec-only, never having exchanged a real byte with
+  actual Bluetooth hardware (QEMU's own `usb-bt-dongle` was removed in
+  2018), same honesty bar as the rest of this project's USB peripheral
+  work.
 
   Same honesty bar as round 57's own HCI transport work and the
   LAN9512 NIC backend: **NOT live-verified** (QEMU's `usb-bt-dongle`

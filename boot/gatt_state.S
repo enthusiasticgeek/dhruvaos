@@ -35,6 +35,10 @@ gatt_service_end_handle:
     .space 32
 gatt_service_uuid16:
     .space 32
+gatt_service_is_uuid128:
+    .space 32   /* 0 = gatt_service_uuid16 is meaningful, 1 = gatt_service_uuid128 is */
+gatt_service_uuid128:
+    .space 128  /* 8 services * 16 bytes, byte-addressed */
 gatt_char_count:
     .word 0
 gatt_char_decl_handle:
@@ -47,6 +51,14 @@ gatt_char_uuid16:
     .space 128
 gatt_char_service_index:
     .space 128
+gatt_char_is_uuid128:
+    .space 128  /* 0 = gatt_char_uuid16 is meaningful, 1 = gatt_char_uuid128 is */
+gatt_char_uuid128:
+    .space 512  /* 32 characteristics * 16 bytes, byte-addressed */
+gatt_char_cccd_handle:
+    .space 128  /* 32 words -- 0 = no CCCD discovered for this characteristic */
+gatt_last_notify_handle:
+    .word 0     /* value handle of the most recent Notification/Indication received */
 
 .section ".text"
 
@@ -196,6 +208,114 @@ gatt_char_get_service_index_at:
 gatt_char_set_service_index_at:
     ldr r2, =gatt_char_service_index
     str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* Round 66 follow-up -- 128-bit custom UUID support. is_uuid128 flags
+ * (one per service/characteristic) plus byte-addressed 16-byte-per-
+ * entry UUID stores, same CALLER-COMPUTED combined-index technique as
+ * gatt_server_state.S's own value-byte accessors (index*16+byte_offset,
+ * multiplication done in vani, not here) -- keeps every accessor below
+ * at exactly 2 arguments, same reasoning as this file's own header
+ * comment. */
+
+.global gatt_service_get_is_uuid128_at
+gatt_service_get_is_uuid128_at:
+    ldr r1, =gatt_service_is_uuid128
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global gatt_service_set_is_uuid128_at
+gatt_service_set_is_uuid128_at:
+    ldr r2, =gatt_service_is_uuid128
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* i64 gatt_service_get_uuid128_byte(i64 combined_index) -- caller
+ * computes combined_index = service_index*16 + byte_offset. */
+.global gatt_service_get_uuid128_byte
+gatt_service_get_uuid128_byte:
+    ldr r1, =gatt_service_uuid128
+    ldrb r0, [r1, r0]
+    mov r1, #0
+    bx lr
+
+.global gatt_service_set_uuid128_byte
+gatt_service_set_uuid128_byte:
+    ldr r2, =gatt_service_uuid128
+    strb r1, [r2, r0]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global gatt_char_get_is_uuid128_at
+gatt_char_get_is_uuid128_at:
+    ldr r1, =gatt_char_is_uuid128
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global gatt_char_set_is_uuid128_at
+gatt_char_set_is_uuid128_at:
+    ldr r2, =gatt_char_is_uuid128
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* i64 gatt_char_get_uuid128_byte(i64 combined_index) -- caller
+ * computes combined_index = char_index*16 + byte_offset. */
+.global gatt_char_get_uuid128_byte
+gatt_char_get_uuid128_byte:
+    ldr r1, =gatt_char_uuid128
+    ldrb r0, [r1, r0]
+    mov r1, #0
+    bx lr
+
+.global gatt_char_set_uuid128_byte
+gatt_char_set_uuid128_byte:
+    ldr r2, =gatt_char_uuid128
+    strb r1, [r2, r0]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* Round 66 follow-up -- notifications/indications. gatt_char_cccd_
+ * handle is the standard 2-argument index/value accessor pattern;
+ * gatt_last_notify_handle is simpler still (one global word, no index
+ * at all) since only one BLE connection is ever active at a time in
+ * this project's own driver model. */
+
+.global gatt_char_get_cccd_handle_at
+gatt_char_get_cccd_handle_at:
+    ldr r1, =gatt_char_cccd_handle
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global gatt_char_set_cccd_handle_at
+gatt_char_set_cccd_handle_at:
+    ldr r2, =gatt_char_cccd_handle
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global gatt_last_notify_handle_get
+gatt_last_notify_handle_get:
+    ldr r0, =gatt_last_notify_handle
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global gatt_last_notify_handle_set
+gatt_last_notify_handle_set:
+    ldr r1, =gatt_last_notify_handle
+    str r0, [r1]
     mov r0, #0
     mov r1, #0
     bx lr

@@ -237,6 +237,60 @@ int64_t gatt_char_get_uuid16_at(uint32_t i);
 int64_t gatt_char_set_uuid16_at(uint32_t i, uint32_t v);
 int64_t gatt_char_get_service_index_at(uint32_t i);
 int64_t gatt_char_set_service_index_at(uint32_t i, uint32_t v);
+int64_t gatt_server_attr_get_count(void);
+int64_t gatt_server_attr_set_count(uint32_t count);
+int64_t gatt_server_attr_get_uuid16_at(uint32_t i);
+int64_t gatt_server_attr_set_uuid16_at(uint32_t i, uint32_t v);
+int64_t gatt_server_attr_get_value_len_at(uint32_t i);
+int64_t gatt_server_attr_set_value_len_at(uint32_t i, uint32_t v);
+int64_t gatt_server_attr_get_writable_at(uint32_t i);
+int64_t gatt_server_attr_set_writable_at(uint32_t i, uint32_t v);
+int64_t gatt_server_attr_get_value_byte(uint32_t combined_index);
+int64_t gatt_server_attr_set_value_byte(uint32_t combined_index, uint32_t v);
+int64_t fn_gatt_server_reset(void);
+int64_t fn_gatt_server_add_service(uint32_t uuid16);
+int64_t fn_gatt_server_add_characteristic(uint32_t properties, uint32_t char_uuid16, int64_t *initial_value, int64_t initial_value_len);
+int64_t fn_gatt_server_find_index_for_handle(uint32_t handle);
+int64_t fn_gatt_server_handle_request(int64_t *req, int64_t req_len, int64_t *out_rsp);
+int64_t gatt_service_get_is_uuid128_at(uint32_t i);
+int64_t gatt_service_set_is_uuid128_at(uint32_t i, uint32_t v);
+int64_t gatt_service_get_uuid128_byte(uint32_t combined_index);
+int64_t gatt_service_set_uuid128_byte(uint32_t combined_index, uint32_t v);
+int64_t gatt_char_get_is_uuid128_at(uint32_t i);
+int64_t gatt_char_set_is_uuid128_at(uint32_t i, uint32_t v);
+int64_t gatt_char_get_uuid128_byte(uint32_t combined_index);
+int64_t gatt_char_set_uuid128_byte(uint32_t combined_index, uint32_t v);
+int64_t fn_att_find_information_response_get_uuid128_at(int64_t *buf, int64_t index, int64_t *out_uuid128);
+int64_t fn_uuid128_equal(int64_t *a, int64_t *b);
+int64_t fn_att_build_read_by_type_request_uuid128(int64_t *out_buf, uint32_t starting_handle, uint32_t ending_handle, int64_t *attribute_type_uuid128);
+int64_t fn_att_build_read_by_group_type_request_uuid128(int64_t *out_buf, uint32_t starting_handle, uint32_t ending_handle, int64_t *group_type_uuid128);
+uint32_t fn_att_opcode_handle_value_notification(void);
+uint32_t fn_att_opcode_handle_value_indication(void);
+uint32_t fn_att_opcode_handle_value_confirmation(void);
+int64_t fn_att_build_handle_value_notification(int64_t *out_buf, uint32_t handle, int64_t *value, int64_t value_len);
+int64_t fn_att_build_handle_value_indication(int64_t *out_buf, uint32_t handle, int64_t *value, int64_t value_len);
+uint32_t fn_att_handle_value_get_handle(int64_t *buf);
+int64_t fn_att_handle_value_get_value(int64_t *buf, int64_t pdu_len, int64_t *out_value);
+int64_t fn_att_build_handle_value_confirmation(int64_t *out_buf);
+uint32_t fn_l2cap_sig_code_connection_parameter_update_request(void);
+uint32_t fn_l2cap_sig_code_connection_parameter_update_response(void);
+uint32_t fn_l2cap_conn_param_update_result_accepted(void);
+uint32_t fn_l2cap_conn_param_update_result_rejected(void);
+uint32_t fn_l2cap_sig_get_code(int64_t *buf);
+uint32_t fn_l2cap_sig_get_identifier(int64_t *buf);
+uint32_t fn_l2cap_sig_get_length(int64_t *buf);
+uint32_t fn_l2cap_conn_param_update_request_get_interval_min(int64_t *buf);
+uint32_t fn_l2cap_conn_param_update_request_get_interval_max(int64_t *buf);
+uint32_t fn_l2cap_conn_param_update_request_get_slave_latency(int64_t *buf);
+uint32_t fn_l2cap_conn_param_update_request_get_timeout_multiplier(int64_t *buf);
+int64_t fn_l2cap_build_conn_param_update_response(int64_t *out_buf, uint32_t identifier, uint32_t result);
+int64_t gatt_char_get_cccd_handle_at(uint32_t i);
+int64_t gatt_char_set_cccd_handle_at(uint32_t i, uint32_t v);
+int64_t gatt_last_notify_handle_get(void);
+int64_t gatt_last_notify_handle_set(uint32_t v);
+uint32_t fn_gatt_char_descriptor_range_end(int64_t char_index);
+int64_t fn_gatt_client_find_char_index_for_value_handle(uint32_t handle);
+uint32_t fn_gatt_client_last_notify_handle(void);
 int64_t fn_gatt_discover_reset(void);
 int64_t fn_buf_write_u16_le(int64_t *buf, int64_t offset, uint32_t value);
 uint32_t fn_buf_read_u16_le(int64_t *buf, int64_t offset);
@@ -1815,6 +1869,366 @@ static void test_gatt_state(void) {
     CHECK(gatt_char_get_count() == 0, "gatt discover_reset: char count cleared again");
 }
 
+/* Round 66 follow-up: GATT SERVER role -- attribute database
+ * construction (gatt_server_add_service/_add_characteristic) plus
+ * request dispatch (gatt_server_handle_request) against synthetic ATT
+ * request PDUs, entirely pure logic (no MMIO), safe to host-test in
+ * full unlike gatt_server_poll itself (reaches gatt_att_send/_recv,
+ * same real-hardware boundary as gatt_discover_ and gatt_att_send in
+ * test_gatt_state's own comment above -- gatt_server_poll is
+ * deliberately never called from here). Builds a small 2-service demo
+ * database (Battery Service + Device Information, matching real
+ * Bluetooth SIG-assigned services/characteristics) and dispatches one
+ * request of each handled type against it, plus two rejection paths
+ * (write to a non-writable value, an unresolvable handle) and one
+ * genuinely unsupported opcode. */
+static void test_gatt_server(void) {
+    fn_gatt_server_reset();
+    CHECK(gatt_server_attr_get_count() == 0, "gatt server: reset clears attribute count");
+
+    /* Service 1: Battery Service (0x180F) -> handle 1. */
+    int64_t svc1_handle = fn_gatt_server_add_service(0x180F);
+    CHECK(svc1_handle == 1, "gatt server: service 1 (Battery Service) gets handle 1");
+
+    /* Characteristic 1: Battery Level (0x2A19), Read|Notify (0x12),
+     * initial value = one byte (77%). Declaration at handle 2, value
+     * at handle 3. */
+    int64_t *batt_val = dhruva_alloc_bytes(1);
+    buf_write_byte(batt_val, 0, 77);
+    int64_t batt_value_handle = fn_gatt_server_add_characteristic(0x12, 0x2A19, batt_val, 1);
+    CHECK(batt_value_handle == 3, "gatt server: Battery Level value handle == 3 (decl=2, value=3)");
+
+    /* Service 2: Device Information (0x180A) -> handle 4. */
+    int64_t svc2_handle = fn_gatt_server_add_service(0x180A);
+    CHECK(svc2_handle == 4, "gatt server: service 2 (Device Information) gets handle 4");
+
+    /* Characteristic 2: Manufacturer Name String (0x2A29), Read|Write
+     * (0x0A), initial value = "AB". Declaration at handle 5, value at
+     * handle 6 -- the table's own last attribute. */
+    int64_t *mfg_val = dhruva_alloc_bytes(2);
+    buf_write_byte(mfg_val, 0, 'A');
+    buf_write_byte(mfg_val, 1, 'B');
+    int64_t mfg_value_handle = fn_gatt_server_add_characteristic(0x0A, 0x2A29, mfg_val, 2);
+    CHECK(mfg_value_handle == 6, "gatt server: Manufacturer Name value handle == 6 (decl=5, value=6)");
+    CHECK(gatt_server_attr_get_count() == 6, "gatt server: 6 attributes total (2 services + 2*2 characteristic entries)");
+
+    int64_t *req = dhruva_alloc_bytes(256);
+    int64_t *rsp = dhruva_alloc_bytes(256);
+
+    /* Exchange MTU -- server always answers with its own fixed 247. */
+    int64_t mtu_req_len = fn_att_build_exchange_mtu_request(req, 185);
+    int64_t mtu_rsp_len = fn_gatt_server_handle_request(req, mtu_req_len, rsp);
+    CHECK(fn_att_get_opcode(rsp) == fn_att_opcode_exchange_mtu_response(), "gatt server: exchange mtu -> response opcode");
+    CHECK(fn_att_exchange_mtu_response_get_mtu(rsp) == 247, "gatt server: exchange mtu -> server_rx_mtu == 247");
+    CHECK(mtu_rsp_len == 3, "gatt server: exchange mtu response length == 3");
+
+    /* Read By Group Type (Primary Service) -- discovers both services,
+     * each group's own end handle computed from the NEXT service's
+     * own start handle (or the table's own last handle for the last
+     * service). */
+    int64_t rbgt_req_len = fn_att_build_read_by_group_type_request_uuid16(req, 1, 0xFFFF, 0x2800);
+    int64_t rbgt_rsp_len = fn_gatt_server_handle_request(req, rbgt_req_len, rsp);
+    CHECK(fn_att_get_opcode(rsp) == fn_att_opcode_read_by_group_type_response(), "gatt server: read by group type -> response opcode");
+    CHECK(fn_att_read_by_group_type_response_count(rsp, rbgt_rsp_len) == 2, "gatt server: read by group type -> 2 services discovered");
+    CHECK(fn_att_read_by_group_type_response_get_start_handle_at(rsp, 0) == 1, "gatt server: service 1 start handle == 1");
+    CHECK(fn_att_read_by_group_type_response_get_end_handle_at(rsp, 0) == 3, "gatt server: service 1 end handle == 3 (right before service 2's own start)");
+    int64_t *svc0_val = dhruva_alloc_bytes(2);
+    fn_att_read_by_group_type_response_get_value_at(rsp, 0, svc0_val);
+    CHECK(fn_buf_read_u16_le(svc0_val, 0) == 0x180F, "gatt server: service 1 UUID == Battery Service");
+    CHECK(fn_att_read_by_group_type_response_get_start_handle_at(rsp, 1) == 4, "gatt server: service 2 start handle == 4");
+    CHECK(fn_att_read_by_group_type_response_get_end_handle_at(rsp, 1) == 6, "gatt server: service 2 end handle == 6 (table's own last attribute)");
+
+    /* Read By Type (Characteristic Declaration) within service 1's own
+     * range [1,3] -- discovers Battery Level's own declaration. */
+    int64_t rbt_req_len = fn_att_build_read_by_type_request_uuid16(req, 1, 3, 0x2803);
+    int64_t rbt_rsp_len = fn_gatt_server_handle_request(req, rbt_req_len, rsp);
+    CHECK(fn_att_get_opcode(rsp) == fn_att_opcode_read_by_type_response(), "gatt server: read by type -> response opcode");
+    CHECK(fn_att_read_by_type_response_count(rsp, rbt_rsp_len) == 1, "gatt server: read by type -> 1 characteristic in service 1");
+    CHECK(fn_att_read_by_type_response_get_handle_at(rsp, 0) == 2, "gatt server: Battery Level declaration handle == 2");
+    int64_t *char0_val = dhruva_alloc_bytes(5);
+    fn_att_read_by_type_response_get_value_at(rsp, 0, char0_val);
+    CHECK(buf_read_byte(char0_val, 0) == 0x12, "gatt server: Battery Level properties == 0x12 (Read|Notify)");
+    CHECK(fn_buf_read_u16_le(char0_val, 1) == 3, "gatt server: Battery Level value_handle == 3");
+    CHECK(fn_buf_read_u16_le(char0_val, 3) == 0x2A19, "gatt server: Battery Level UUID round trip");
+
+    /* Read Request on the Battery Level value itself. */
+    int64_t rd_req_len = fn_att_build_read_request(req, 3);
+    int64_t rd_rsp_len = fn_gatt_server_handle_request(req, rd_req_len, rsp);
+    CHECK(fn_att_get_opcode(rsp) == fn_att_opcode_read_response(), "gatt server: read battery level -> response opcode");
+    CHECK(rd_rsp_len == 2, "gatt server: read battery level -> response length == 1 (opcode) + 1 (value)");
+    CHECK(buf_read_byte(rsp, 1) == 77, "gatt server: read battery level -> value == 77");
+
+    /* Write Request on Battery Level -- rejected, no Write property bit. */
+    int64_t *bad_write_val = dhruva_alloc_bytes(1);
+    buf_write_byte(bad_write_val, 0, 50);
+    int64_t bad_wr_req_len = fn_att_build_write_request(req, 3, bad_write_val, 1);
+    int64_t bad_wr_rsp_len = fn_gatt_server_handle_request(req, bad_wr_req_len, rsp);
+    CHECK(fn_att_get_opcode(rsp) == fn_att_opcode_error_response(), "gatt server: write to read-only battery level -> error response");
+    CHECK(fn_att_error_request_opcode(rsp) == fn_att_opcode_write_request(), "gatt server: rejected write -> error names write request");
+    CHECK(fn_att_error_handle(rsp) == 3, "gatt server: rejected write -> error names handle 3");
+    CHECK(fn_att_error_code(rsp) == fn_att_error_write_not_permitted(), "gatt server: rejected write -> Write Not Permitted (0x03)");
+    CHECK(bad_wr_rsp_len == 5, "gatt server: error response length == 5");
+
+    /* Write Request on Manufacturer Name -- accepted (Write property
+     * bit set), then read back to confirm the value actually changed. */
+    int64_t *new_mfg_val = dhruva_alloc_bytes(2);
+    buf_write_byte(new_mfg_val, 0, 'X');
+    buf_write_byte(new_mfg_val, 1, 'Y');
+    int64_t wr_req_len = fn_att_build_write_request(req, 6, new_mfg_val, 2);
+    int64_t wr_rsp_len = fn_gatt_server_handle_request(req, wr_req_len, rsp);
+    CHECK(fn_att_get_opcode(rsp) == fn_att_opcode_write_response(), "gatt server: write manufacturer name -> write response");
+    CHECK(wr_rsp_len == 1, "gatt server: write response length == 1 (opcode only)");
+    int64_t rd2_req_len = fn_att_build_read_request(req, 6);
+    fn_gatt_server_handle_request(req, rd2_req_len, rsp);
+    CHECK(buf_read_byte(rsp, 1) == 'X', "gatt server: manufacturer name read-back byte 0 == 'X'");
+    CHECK(buf_read_byte(rsp, 2) == 'Y', "gatt server: manufacturer name read-back byte 1 == 'Y'");
+
+    /* Read Request on a handle that doesn't exist -> Invalid Handle. */
+    int64_t bad_rd_req_len = fn_att_build_read_request(req, 99);
+    fn_gatt_server_handle_request(req, bad_rd_req_len, rsp);
+    CHECK(fn_att_get_opcode(rsp) == fn_att_opcode_error_response(), "gatt server: read unresolvable handle -> error response");
+    CHECK(fn_att_error_code(rsp) == fn_att_error_invalid_handle(), "gatt server: read unresolvable handle -> Invalid Handle (0x01)");
+    CHECK(fn_att_error_handle(rsp) == 99, "gatt server: read unresolvable handle -> error names handle 99");
+
+    /* A genuinely unsupported opcode (Find Information, 0x04 --
+     * discovery-of-descriptors isn't dispatched by this server) ->
+     * Request Not Supported. */
+    buf_write_byte(req, 0, 0x04);
+    fn_gatt_server_handle_request(req, 5, rsp);
+    CHECK(fn_att_get_opcode(rsp) == fn_att_opcode_error_response(), "gatt server: unsupported opcode -> error response");
+    CHECK(fn_att_error_code(rsp) == fn_att_error_request_not_supported(), "gatt server: unsupported opcode -> Request Not Supported (0x06)");
+
+    fn_gatt_server_reset();
+}
+
+/* Round 66 follow-up: 128-bit custom UUID support -- request builders,
+ * the Find Information response's own 128-bit accessor, the byte-
+ * compare helper, and the gatt_state.S storage round trip. Deliberately
+ * does NOT call gatt_discover_primary_services/_characteristics_for_
+ * service themselves (reach MMIO, same boundary as test_gatt_state's
+ * own comment) -- instead pokes the table directly, exactly as that
+ * function's own 16-bit round-trip test already does, just exercising
+ * the new is_uuid128/uuid128 fields instead. */
+static void test_uuid128(void) {
+    /* A real 128-bit vendor UUID, byte 0 first (as it appears on the
+     * wire, little-endian like everything else in ATT). */
+    int64_t *uuid_a = dhruva_alloc_bytes(16);
+    int64_t *uuid_b = dhruva_alloc_bytes(16);
+    for (int i = 0; i < 16; i++) {
+        buf_write_byte(uuid_a, i, 0xA0 + i);
+        buf_write_byte(uuid_b, i, 0xA0 + i);
+    }
+    CHECK(fn_uuid128_equal(uuid_a, uuid_b) == 1, "uuid128_equal: identical UUIDs compare equal");
+    buf_write_byte(uuid_b, 15, 0xFF);
+    CHECK(fn_uuid128_equal(uuid_a, uuid_b) == 0, "uuid128_equal: a single differing byte compares unequal");
+    buf_write_byte(uuid_b, 15, 0xA0 + 15); /* restore */
+
+    /* Read By Type Request, 128-bit attribute type -- opcode + range +
+     * 16 raw UUID bytes, length 21. */
+    int64_t *rbt128_req = dhruva_alloc_bytes(21);
+    int64_t rbt128_len = fn_att_build_read_by_type_request_uuid128(rbt128_req, 0x0001, 0xFFFF, uuid_a);
+    CHECK(rbt128_len == 21, "read by type req (128-bit): length == 21");
+    CHECK(fn_att_get_opcode(rbt128_req) == fn_att_opcode_read_by_type_request(), "read by type req (128-bit): opcode");
+    CHECK(fn_buf_read_u16_le(rbt128_req, 1) == 0x0001, "read by type req (128-bit): starting_handle round trip");
+    CHECK(fn_buf_read_u16_le(rbt128_req, 3) == 0xFFFF, "read by type req (128-bit): ending_handle round trip");
+    int match = 1;
+    for (int i = 0; i < 16; i++) {
+        if (buf_read_byte(rbt128_req, 5 + i) != (uint32_t)(0xA0 + i)) match = 0;
+    }
+    CHECK(match, "read by type req (128-bit): all 16 UUID bytes round trip at offset 5");
+
+    /* Read By Group Type Request, 128-bit group type -- identical shape. */
+    int64_t *rbgt128_req = dhruva_alloc_bytes(21);
+    int64_t rbgt128_len = fn_att_build_read_by_group_type_request_uuid128(rbgt128_req, 0x0001, 0xFFFF, uuid_a);
+    CHECK(rbgt128_len == 21, "read by group type req (128-bit): length == 21");
+    CHECK(fn_att_get_opcode(rbgt128_req) == fn_att_opcode_read_by_group_type_request(), "read by group type req (128-bit): opcode");
+    match = 1;
+    for (int i = 0; i < 16; i++) {
+        if (buf_read_byte(rbgt128_req, 5 + i) != (uint32_t)(0xA0 + i)) match = 0;
+    }
+    CHECK(match, "read by group type req (128-bit): all 16 UUID bytes round trip at offset 5");
+
+    /* Find Information Response, format 2 (128-bit UUIDs): 2 entries,
+     * each (handle(2), uuid128(16)) = 18 bytes. */
+    int64_t *fi_rsp = dhruva_alloc_bytes(2 + 2 * 18);
+    buf_write_byte(fi_rsp, 0, 0x05);
+    buf_write_byte(fi_rsp, 1, 0x02); /* format = 128-bit UUIDs */
+    fn_buf_write_u16_le(fi_rsp, 2, 0x0020); /* entry 0 handle */
+    for (int i = 0; i < 16; i++) buf_write_byte(fi_rsp, 4 + i, 0xB0 + i);
+    fn_buf_write_u16_le(fi_rsp, 20, 0x0021); /* entry 1 handle */
+    for (int i = 0; i < 16; i++) buf_write_byte(fi_rsp, 22 + i, 0xC0 + i);
+    CHECK(fn_att_find_information_response_get_format(fi_rsp) == 2, "find info rsp (128-bit): format == 2");
+    CHECK(fn_att_find_information_entry_size(2) == 18, "find info: 128-bit entry size == 18");
+    int64_t fi_rsp_len = 2 + 2 * 18;
+    CHECK(fn_att_find_information_response_count(fi_rsp, fi_rsp_len) == 2, "find info rsp (128-bit): count == 2 entries");
+    CHECK(fn_att_find_information_response_get_handle_at(fi_rsp, 0) == 0x0020, "find info rsp (128-bit): entry 0 handle");
+    int64_t *got_uuid0 = dhruva_alloc_bytes(16);
+    fn_att_find_information_response_get_uuid128_at(fi_rsp, 0, got_uuid0);
+    match = 1;
+    for (int i = 0; i < 16; i++) {
+        if (buf_read_byte(got_uuid0, i) != (uint32_t)(0xB0 + i)) match = 0;
+    }
+    CHECK(match, "find info rsp (128-bit): entry 0 UUID bytes round trip");
+    CHECK(fn_att_find_information_response_get_handle_at(fi_rsp, 1) == 0x0021, "find info rsp (128-bit): entry 1 handle");
+    int64_t *got_uuid1 = dhruva_alloc_bytes(16);
+    fn_att_find_information_response_get_uuid128_at(fi_rsp, 1, got_uuid1);
+    CHECK(fn_uuid128_equal(got_uuid0, got_uuid1) == 0, "find info rsp (128-bit): entries 0 and 1 have different UUIDs");
+
+    /* gatt_state.S storage round trip, as if gatt_discover_primary_
+     * services had just recorded one custom-UUID service. */
+    fn_gatt_discover_reset();
+    gatt_service_set_start_handle_at(0, 0x0001);
+    gatt_service_set_end_handle_at(0, 0x0004);
+    gatt_service_set_uuid16_at(0, 0);
+    gatt_service_set_is_uuid128_at(0, 1);
+    for (int i = 0; i < 16; i++) gatt_service_set_uuid128_byte(0 * 16 + i, 0xD0 + i);
+    gatt_service_set_count(1);
+    CHECK(gatt_service_get_is_uuid128_at(0) == 1, "gatt service table: is_uuid128 flag round trip");
+    match = 1;
+    for (int i = 0; i < 16; i++) {
+        if (gatt_service_get_uuid128_byte(0 * 16 + i) != (uint32_t)(0xD0 + i)) match = 0;
+    }
+    CHECK(match, "gatt service table: uuid128 bytes round trip");
+
+    /* Same for the characteristic table, as if gatt_discover_
+     * characteristics_for_service had just recorded one custom-UUID
+     * characteristic within that service. */
+    gatt_char_set_decl_handle_at(0, 0x0002);
+    gatt_char_set_properties_at(0, 0x0A);
+    gatt_char_set_value_handle_at(0, 0x0003);
+    gatt_char_set_uuid16_at(0, 0);
+    gatt_char_set_is_uuid128_at(0, 1);
+    for (int i = 0; i < 16; i++) gatt_char_set_uuid128_byte(0 * 16 + i, 0xE0 + i);
+    gatt_char_set_service_index_at(0, 0);
+    gatt_char_set_count(1);
+    CHECK(gatt_char_get_is_uuid128_at(0) == 1, "gatt char table: is_uuid128 flag round trip");
+    match = 1;
+    for (int i = 0; i < 16; i++) {
+        if (gatt_char_get_uuid128_byte(0 * 16 + i) != (uint32_t)(0xE0 + i)) match = 0;
+    }
+    CHECK(match, "gatt char table: uuid128 bytes round trip");
+
+    fn_gatt_discover_reset();
+}
+
+/* Round 66 follow-up: notifications/indications (PDU builders/parsers,
+ * pure logic) + L2CAP Signaling (Connection Parameter Update
+ * Request/Response, pure logic) + the descriptor-discovery/
+ * subscription helper functions that don't themselves touch MMIO
+ * (gatt_char_descriptor_range_end, gatt_client_find_char_index_for_
+ * value_handle, the CCCD-handle table, the last-notify-handle slot).
+ * Deliberately does NOT call gatt_discover_descriptors_for_
+ * characteristic/gatt_client_write_cccd/gatt_client_poll_
+ * notifications/l2cap_sig_send/_recv/_poll/gatt_server_notify_value --
+ * all reach gatt_att_send/_recv or dwc2_bt_bulk_*, the same real-
+ * hardware MMIO boundary as every other orchestration function this
+ * project keeps out of host_harness. */
+static void test_notifications_and_l2cap_sig(void) {
+    CHECK(fn_att_opcode_handle_value_notification() == 0x1B, "att opcode: handle value notification == 0x1B");
+    CHECK(fn_att_opcode_handle_value_indication() == 0x1D, "att opcode: handle value indication == 0x1D");
+    CHECK(fn_att_opcode_handle_value_confirmation() == 0x1E, "att opcode: handle value confirmation == 0x1E");
+
+    /* Handle Value Notification: opcode + handle(2, LE) + value. */
+    int64_t *notify_val = dhruva_alloc_bytes(3);
+    buf_write_byte(notify_val, 0, 0x2A);
+    buf_write_byte(notify_val, 1, 0x2B);
+    buf_write_byte(notify_val, 2, 0x2C);
+    int64_t *notify_pdu = dhruva_alloc_bytes(6);
+    int64_t notify_len = fn_att_build_handle_value_notification(notify_pdu, 0x0010, notify_val, 3);
+    CHECK(notify_len == 6, "handle value notification: length == 3 (header) + 3 (value)");
+    CHECK(fn_att_get_opcode(notify_pdu) == fn_att_opcode_handle_value_notification(), "handle value notification: opcode");
+    CHECK(fn_att_handle_value_get_handle(notify_pdu) == 0x0010, "handle value notification: handle round trip");
+    int64_t *notify_out = dhruva_alloc_bytes(3);
+    int64_t notify_out_len = fn_att_handle_value_get_value(notify_pdu, notify_len, notify_out);
+    CHECK(notify_out_len == 3, "handle value notification: value length round trip");
+    CHECK(buf_read_byte(notify_out, 0) == 0x2A && buf_read_byte(notify_out, 1) == 0x2B && buf_read_byte(notify_out, 2) == 0x2C, "handle value notification: value bytes round trip");
+
+    /* Handle Value Indication: identical shape, different opcode. */
+    int64_t *indicate_pdu = dhruva_alloc_bytes(6);
+    int64_t indicate_len = fn_att_build_handle_value_indication(indicate_pdu, 0x0011, notify_val, 3);
+    CHECK(indicate_len == 6, "handle value indication: length == 6");
+    CHECK(fn_att_get_opcode(indicate_pdu) == fn_att_opcode_handle_value_indication(), "handle value indication: opcode");
+    CHECK(fn_att_handle_value_get_handle(indicate_pdu) == 0x0011, "handle value indication: handle round trip");
+
+    /* Handle Value Confirmation -- just the opcode, 1 byte. */
+    int64_t *confirm_pdu = dhruva_alloc_bytes(1);
+    int64_t confirm_len = fn_att_build_handle_value_confirmation(confirm_pdu);
+    CHECK(confirm_len == 1, "handle value confirmation: length == 1");
+    CHECK(fn_att_get_opcode(confirm_pdu) == fn_att_opcode_handle_value_confirmation(), "handle value confirmation: opcode");
+
+    /* L2CAP Signaling: Connection Parameter Update Request/Response
+     * codes and result constants. */
+    CHECK(fn_l2cap_sig_code_connection_parameter_update_request() == 0x12, "l2cap sig: conn param update request code == 0x12");
+    CHECK(fn_l2cap_sig_code_connection_parameter_update_response() == 0x13, "l2cap sig: conn param update response code == 0x13");
+    CHECK(fn_l2cap_conn_param_update_result_accepted() == 0x0000, "l2cap sig: result accepted == 0x0000");
+    CHECK(fn_l2cap_conn_param_update_result_rejected() == 0x0001, "l2cap sig: result rejected == 0x0001");
+
+    /* A synthetic Connection Parameter Update Request, hand-built as
+     * if received over the wire: [Code=0x12][Identifier][Length=8, LE]
+     * [Interval_Min][Interval_Max][Slave_Latency][Timeout_Multiplier]. */
+    int64_t *cpu_req = dhruva_alloc_bytes(12);
+    buf_write_byte(cpu_req, 0, 0x12);
+    buf_write_byte(cpu_req, 1, 0x07); /* identifier */
+    fn_buf_write_u16_le(cpu_req, 2, 8);
+    fn_buf_write_u16_le(cpu_req, 4, 0x0006);  /* interval_min */
+    fn_buf_write_u16_le(cpu_req, 6, 0x000C);  /* interval_max */
+    fn_buf_write_u16_le(cpu_req, 8, 0x0000);  /* slave_latency */
+    fn_buf_write_u16_le(cpu_req, 10, 0x0064); /* timeout_multiplier */
+    CHECK(fn_l2cap_sig_get_code(cpu_req) == 0x12, "l2cap sig: conn param update request code round trip");
+    CHECK(fn_l2cap_sig_get_identifier(cpu_req) == 0x07, "l2cap sig: identifier round trip");
+    CHECK(fn_l2cap_sig_get_length(cpu_req) == 8, "l2cap sig: length round trip");
+    CHECK(fn_l2cap_conn_param_update_request_get_interval_min(cpu_req) == 0x0006, "l2cap sig: interval_min round trip");
+    CHECK(fn_l2cap_conn_param_update_request_get_interval_max(cpu_req) == 0x000C, "l2cap sig: interval_max round trip");
+    CHECK(fn_l2cap_conn_param_update_request_get_slave_latency(cpu_req) == 0x0000, "l2cap sig: slave_latency round trip");
+    CHECK(fn_l2cap_conn_param_update_request_get_timeout_multiplier(cpu_req) == 0x0064, "l2cap sig: timeout_multiplier round trip");
+
+    /* Connection Parameter Update Response, built for the same
+     * identifier, Accepted. */
+    int64_t *cpu_rsp = dhruva_alloc_bytes(6);
+    int64_t cpu_rsp_len = fn_l2cap_build_conn_param_update_response(cpu_rsp, 0x07, fn_l2cap_conn_param_update_result_accepted());
+    CHECK(cpu_rsp_len == 6, "l2cap sig: conn param update response length == 6");
+    CHECK(fn_l2cap_sig_get_code(cpu_rsp) == 0x13, "l2cap sig: conn param update response code round trip");
+    CHECK(fn_l2cap_sig_get_identifier(cpu_rsp) == 0x07, "l2cap sig: conn param update response identifier matches request");
+    CHECK(fn_l2cap_sig_get_length(cpu_rsp) == 2, "l2cap sig: conn param update response length field == 2");
+    CHECK(fn_buf_read_u16_le(cpu_rsp, 4) == 0x0000, "l2cap sig: conn param update response result == Accepted");
+
+    /* gatt_char_descriptor_range_end -- two characteristics in the
+     * same service (char 0 ends right before char 1's own decl
+     * handle), then a third characteristic alone in a second service
+     * (ends at the service's own end handle, the table's own last
+     * attribute in this synthetic setup). */
+    fn_gatt_discover_reset();
+    gatt_service_set_start_handle_at(0, 0x0001);
+    gatt_service_set_end_handle_at(0, 0x0008);
+    gatt_service_set_count(1);
+    gatt_char_set_decl_handle_at(0, 0x0002);
+    gatt_char_set_value_handle_at(0, 0x0003);
+    gatt_char_set_service_index_at(0, 0);
+    gatt_char_set_decl_handle_at(1, 0x0005);
+    gatt_char_set_value_handle_at(1, 0x0006);
+    gatt_char_set_service_index_at(1, 0);
+    gatt_char_set_count(2);
+    CHECK(fn_gatt_char_descriptor_range_end(0) == 0x0004, "gatt char descriptor range: char 0 ends right before char 1's decl handle (0x0005-1)");
+    CHECK(fn_gatt_char_descriptor_range_end(1) == 0x0008, "gatt char descriptor range: last char in service ends at the service's own end handle");
+
+    /* gatt_client_find_char_index_for_value_handle -- table lookup by
+     * VALUE handle, matching how a Notification/Indication's own
+     * handle field needs to be resolved. */
+    CHECK(fn_gatt_client_find_char_index_for_value_handle(0x0003) == 0, "gatt client: find char index for value handle 0x0003 -> index 0");
+    CHECK(fn_gatt_client_find_char_index_for_value_handle(0x0006) == 1, "gatt client: find char index for value handle 0x0006 -> index 1");
+    CHECK(fn_gatt_client_find_char_index_for_value_handle(0x00FF) == -1, "gatt client: unknown value handle -> -1");
+
+    /* CCCD handle table + last-notify-handle slot round trips. */
+    CHECK(gatt_char_get_cccd_handle_at(0) == 0, "gatt char table: cccd handle starts at 0 (not discovered)");
+    gatt_char_set_cccd_handle_at(0, 0x0004);
+    CHECK(gatt_char_get_cccd_handle_at(0) == 0x0004, "gatt char table: cccd handle round trip");
+    gatt_last_notify_handle_set(0x0003);
+    CHECK(gatt_last_notify_handle_get() == 0x0003, "gatt last notify handle: native stub round trip");
+    CHECK(fn_gatt_client_last_notify_handle() == 0x0003, "gatt client: last_notify_handle wrapper round trip");
+
+    fn_gatt_discover_reset();
+}
+
 /* Round 66: diag_ring_state.S's wraparound math (via the native stub
  * added this round to fix a real host_harness link break the ring
  * buffer's own original commit introduced -- see host_stubs.c's own
@@ -1968,6 +2382,9 @@ int main(void) {
     test_ble_connection_and_att();
     test_att_discovery();
     test_gatt_state();
+    test_gatt_server();
+    test_uuid128();
+    test_notifications_and_l2cap_sig();
     test_diag_ring();
     test_rtl_reg_setup_framing();
     test_packet_filter();

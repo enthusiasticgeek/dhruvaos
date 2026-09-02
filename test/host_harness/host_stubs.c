@@ -511,6 +511,51 @@ int64_t gatt_char_set_uuid16_at(uint32_t i, uint32_t v) { g_gatt_char_uuid16[i %
 int64_t gatt_char_get_service_index_at(uint32_t i) { return g_gatt_char_service_index[i % 32]; }
 int64_t gatt_char_set_service_index_at(uint32_t i, uint32_t v) { g_gatt_char_service_index[i % 32] = v; return 0; }
 
+/* Round 66 follow-up: 128-bit custom UUID storage twins -- mirrors
+ * gatt_state.S's own follow-up section exactly (is_uuid128 flags plus
+ * byte-addressed 16-byte-per-entry stores). */
+static uint32_t g_gatt_service_is_uuid128[8], g_gatt_char_is_uuid128[32];
+static uint8_t g_gatt_service_uuid128[8 * 16], g_gatt_char_uuid128[32 * 16];
+int64_t gatt_service_get_is_uuid128_at(uint32_t i) { return g_gatt_service_is_uuid128[i % 8]; }
+int64_t gatt_service_set_is_uuid128_at(uint32_t i, uint32_t v) { g_gatt_service_is_uuid128[i % 8] = v; return 0; }
+int64_t gatt_service_get_uuid128_byte(uint32_t combined_index) { return g_gatt_service_uuid128[combined_index % (8 * 16)]; }
+int64_t gatt_service_set_uuid128_byte(uint32_t combined_index, uint32_t v) { g_gatt_service_uuid128[combined_index % (8 * 16)] = (uint8_t)v; return 0; }
+int64_t gatt_char_get_is_uuid128_at(uint32_t i) { return g_gatt_char_is_uuid128[i % 32]; }
+int64_t gatt_char_set_is_uuid128_at(uint32_t i, uint32_t v) { g_gatt_char_is_uuid128[i % 32] = v; return 0; }
+int64_t gatt_char_get_uuid128_byte(uint32_t combined_index) { return g_gatt_char_uuid128[combined_index % (32 * 16)]; }
+int64_t gatt_char_set_uuid128_byte(uint32_t combined_index, uint32_t v) { g_gatt_char_uuid128[combined_index % (32 * 16)] = (uint8_t)v; return 0; }
+
+/* Round 66 follow-up: notifications/indications -- CCCD handle per
+ * characteristic, plus the single most-recent-notification handle
+ * slot, mirroring gatt_state.S's own follow-up section. */
+static uint32_t g_gatt_char_cccd_handle[32];
+static int64_t g_gatt_last_notify_handle;
+int64_t gatt_char_get_cccd_handle_at(uint32_t i) { return g_gatt_char_cccd_handle[i % 32]; }
+int64_t gatt_char_set_cccd_handle_at(uint32_t i, uint32_t v) { g_gatt_char_cccd_handle[i % 32] = v; return 0; }
+int64_t gatt_last_notify_handle_get(void) { return g_gatt_last_notify_handle; }
+int64_t gatt_last_notify_handle_set(uint32_t v) { g_gatt_last_notify_handle = v; return 0; }
+
+/* Round 66 follow-up: gatt_server_state.S's own flat attribute
+ * database -- same genuinely-stateful native reimplementation
+ * approach as the gatt_service and gatt_char tables above, mirroring
+ * gatt_server_state.S's own field layout exactly (uuid16/value_len/
+ * writable per attribute, plus a byte-addressed value store sized
+ * 32 attrs times 20 bytes, matching that file's own gatt_server_max_
+ * value_len() constant). */
+static int64_t g_gatt_server_attr_count;
+static uint32_t g_gatt_server_attr_uuid16[32], g_gatt_server_attr_value_len[32], g_gatt_server_attr_writable[32];
+static uint8_t g_gatt_server_attr_value_bytes[32 * 20];
+int64_t gatt_server_attr_get_count(void) { return g_gatt_server_attr_count; }
+int64_t gatt_server_attr_set_count(uint32_t count) { g_gatt_server_attr_count = count; return 0; }
+int64_t gatt_server_attr_get_uuid16_at(uint32_t i) { return g_gatt_server_attr_uuid16[i % 32]; }
+int64_t gatt_server_attr_set_uuid16_at(uint32_t i, uint32_t v) { g_gatt_server_attr_uuid16[i % 32] = v; return 0; }
+int64_t gatt_server_attr_get_value_len_at(uint32_t i) { return g_gatt_server_attr_value_len[i % 32]; }
+int64_t gatt_server_attr_set_value_len_at(uint32_t i, uint32_t v) { g_gatt_server_attr_value_len[i % 32] = v; return 0; }
+int64_t gatt_server_attr_get_writable_at(uint32_t i) { return g_gatt_server_attr_writable[i % 32]; }
+int64_t gatt_server_attr_set_writable_at(uint32_t i, uint32_t v) { g_gatt_server_attr_writable[i % 32] = v; return 0; }
+int64_t gatt_server_attr_get_value_byte(uint32_t combined_index) { return g_gatt_server_attr_value_bytes[combined_index % (32 * 20)]; }
+int64_t gatt_server_attr_set_value_byte(uint32_t combined_index, uint32_t v) { g_gatt_server_attr_value_bytes[combined_index % (32 * 20)] = (uint8_t)v; return 0; }
+
 static uint32_t g_governor_last_mhz;
 static int64_t g_governor_history[4];
 int64_t governor_apply_freq_mhz(int64_t mhz) { g_governor_last_mhz = (uint32_t)mhz; return 0; }
