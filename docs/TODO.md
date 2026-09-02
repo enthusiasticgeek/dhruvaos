@@ -1492,14 +1492,31 @@ for by name.
   after reverting: `qemu_run.py` PASS, `phase4_milestone.py` 14/14,
   `host_harness` 315/315 under ASAN/UBSAN, `heap_stress.py` PASS.
 
-  **Open follow-up, not done this round**: `dharafs_encryption_self_
-  check` could now safely exercise the real SD-integrated path again
-  (write via `dharafs_block_write`, read back via `sdhost_read_block`/
-  `dharafs_block_read`) instead of staying pure-in-memory-only, now
-  that the hazard it was deliberately avoiding is fixed — left as a
-  deliberate choice for a future round rather than done automatically
-  here, since it changes what a permanent, every-boot self-test
-  verifies and that's a scope decision, not just a bug fix.
+  **Follow-up done, round 66 (2026-09-01, same day)**:
+  `dharafs_encryption_self_check` now also exercises the real SD-
+  integrated path — writes plaintext through `dharafs_block_write`
+  with encryption temporarily forced on, confirms the RAW on-disk
+  bytes (`dharafs_block_read_raw`) are genuinely different from
+  plaintext (not a silent no-op), then reads back through
+  `dharafs_block_read` (auto-decrypts) and confirms it reproduces the
+  original plaintext — the actual encrypt-on-write/decrypt-on-read
+  path a real file write exercises, not just the bare transform
+  function in isolation. Crypto-enabled state is saved/restored around
+  the check so a normal boot's own encryption setting (off, by
+  default) is unaffected afterward. The original pure in-memory
+  transform check is kept alongside it, not replaced.
+
+  Verified via `phase4_milestone.py` (which, unlike `qemu_run.py`,
+  attaches a real SD `-drive` — `qemu_run.py` has none at all, which
+  is also why this project's OWN pre-existing "SD: 8-block round-trip
+  sweep any_fail=1"/DharaFS FAILs only ever show up under that
+  specific harness, not a real regression) plus a dedicated 10-attempt
+  repeated-boot stability sweep (3-minute watch each, fresh SD image
+  per attempt) specifically because this now does real SD I/O on every
+  single boot — the exact trigger class round 65/66's fix addressed.
+  Zero crashes across all 10. Full regression battery green:
+  `phase4_milestone.py` 14/14, `host_harness` 315/315 ASAN/UBSAN,
+  `heap_stress.py`.
 
 - **Secure boot** — `[not sized — SKIPPED FOR NOW, 2026-08-31; the
   hardware-rooted version hits a hard, permanent hardware ceiling
@@ -1880,20 +1897,21 @@ existing subsystem the way most DharaFS items above are. Ordered
 cheapest-and-highest-leverage first; later items depend on earlier
 ones.
 
-- **`dhruva diagnose` shell command** — `[S, ~1 round — cheapest
-  possible first step]`
-  Nearly all of its inputs already exist as extern accessors:
-  `dhruva_heap_used_bytes`, `scheduler_ready_count`,
-  `scheduler_get_tick_count`, `governor_get_last_applied_mhz`/
-  `governor_history_get0..3`. This item is mostly "add a shell command
-  that formats what's already there into one readable report" plus a
-  couple of genuinely new counters (deadline misses, allocation
-  failures — the latter now meaningful since this session's round 45
-  gave `dhruva_alloc_bytes` a real, countable OOM-fatal path instead of
-  silent NULL). The single best first round of this whole section —
-  low effort, immediately useful, and every later item in this
-  subsection adds another row to the same report rather than needing
-  its own new command.
+- **`dhruva diagnose` shell command** — `[DONE — this entry was stale,
+  confirmed round 66, 2026-09-01]`
+  Already fully implemented, incrementally across rounds 51/53/59 (this
+  top-level entry was simply never marked done at the time). Live-
+  verified this round: a real `diagnose` command run reports
+  `uptime_ticks`, `scheduler ready` count, `heap` usage with a
+  percentage and high-water-mark note, `cpu freq` plus governor
+  history, `allocations`/`FS commits` counts, `context switches`/`IRQs
+  serviced`/`prio_lock calls` (round 53's event counters, genuinely
+  "wired into diagnose" as the section below already claimed), and
+  `mutex contentions`/`mutex worst-case wait` (round 59). Nothing left
+  to build here — see the "Self-observing kernel: event counters"
+  entry immediately below for the one genuinely separate piece (a
+  ring buffer of recent events, not yet started) and "Per-task runtime
+  histograms" for what's deliberately still skipped and why.
 
 - **Self-observing kernel: event counters** — `[M, ~2 rounds — counters
   DONE, round 53; ring buffer not started]`

@@ -15261,32 +15261,40 @@ fn dharafs_crypto_transform_block(block_num: i64, in_buf: mut ref i64, out_buf: 
   return 0;
 }
 
-// Deliberately a PURE IN-MEMORY round trip -- no dharafs_block_write,
-// no sdhost_read_block, no real SD access at all. An earlier version
-// of this self-check DID exercise the real SD path (write via
-// dharafs_block_write, read back via sdhost_read_block/
-// dharafs_block_read) and, in doing so, found a genuine, serious,
+// The in-memory transform round trip below was, for a long time, the
+// ONLY thing this self-check verified -- no dharafs_block_write, no
+// sdhost_read_block, no real SD access at all. An earlier version DID
+// exercise the real SD path (write via dharafs_block_write, read back
+// via dharafs_block_read) and, in doing so, found a genuine, serious,
 // PRE-EXISTING bug: doing even ONE extra real SD block read or write
-// during boot -- something nothing in this codebase had ever done
-// before, since every other boot-time SD self-test was already there
-// before this feature -- intermittently (~1 time in 4-5 across
-// repeated live runs) leaves some later, unrelated state corrupted,
-// surfacing minutes later as a genuine Data Abort (NULL buffer) deep
-// inside task_e's own background DharaFS compaction. This is NOT a
-// bug in this feature's own crypto logic (independently confirmed:
-// the in-memory transform round trip below is 100% reliable across
-// every run) -- it's a real, general, timing-dependent hazard in the
-// existing SD/boot-sequencing code, most likely the same broad "IRQ
-// lands at an unlucky moment" bug class as the still-open task_f
-// runtime-trap investigation (see docs/TODO.md). Baking a call that
-// carries a ~20%+ chance of destabilizing EVERY future boot into a
-// permanent self-test would make the whole system less reliable for
-// every user, not just those who enable media encryption -- so this
-// self-check verifies the actual NEW code (the transform) without
-// touching the pre-existing hazard, and the real SD-integrated
-// end-to-end path was instead verified manually, once, live (see the
-// commit message) rather than on every boot. Filed as its own
-// separate, high-priority TODO item pending real root-causing.
+// during boot intermittently (~20-30%) left some later, unrelated
+// state corrupted, surfacing minutes later as a genuine Data Abort
+// deep inside task_e's own background DharaFS compaction. NOT a bug
+// in this feature's own crypto logic (the in-memory transform round
+// trip was always 100% reliable) -- a real, general, timing-dependent
+// hazard in the existing SD/boot-sequencing code, the same "IRQ lands
+// at an unlucky moment" bug class as the task_f runtime-trap
+// investigation. Baking a call that carried a ~20-30% chance of
+// destabilizing EVERY future boot into a permanent self-test would
+// have made the whole system less reliable for every user, not just
+// those who enable media encryption -- so for a long time this self-
+// check verified only the transform, and the real SD-integrated path
+// was checked manually, once, live, rather than on every boot.
+//
+// ROUND 66 (2026-09-01): the hazard above is fixed (see docs/TODO.md
+// and project memory) -- round 65's task_f fix turned out to fix this
+// SD-corruption bug too, as a side effect, confirmed via 20/20 clean
+// repro boots against the exact trigger that used to fail ~20-30% of
+// the time. Real SD I/O restored below: writes plaintext through
+// dharafs_block_write with encryption temporarily forced on, confirms
+// the RAW on-disk bytes are genuinely ciphertext (not a silent no-op),
+// then reads back through dharafs_block_read (auto-decrypts) and
+// confirms it reproduces the original plaintext -- the actual
+// encrypt-on-write/decrypt-on-read path a real file write exercises,
+// not just the bare transform function in isolation. Crypto-enabled
+// state is saved and restored around this block so a normal boot's
+// OWN encryption setting (off, by default, today) is unaffected once
+// this self-check returns.
 fn dharafs_encryption_self_check() -> i64 {
   let ok: i64 = 1;
   let test_block: i64 = 3000;
@@ -15313,6 +15321,38 @@ fn dharafs_encryption_self_check() -> i64 {
 
   let _ = uart_puts("CRYPTO: DharaFS media encryption transform round trip (in-memory: ciphertext != plaintext, decrypt reproduces plaintext)");
   if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+
+  let sd_ok: i64 = 1;
+  let prev_enabled: u32 = dharafs_crypto_get_enabled();
+  let _ = dharafs_crypto_set_enabled(1 as u32);
+
+  let write_status: i64 = dharafs_block_write(test_block, plaintext);
+  if write_status != 0 {
+    sd_ok = 0;
+  }
+
+  let raw_readback: mut ref i64 = dhruva_alloc_bytes(512);
+  let raw_status: i64 = dharafs_block_read_raw(test_block, raw_readback);
+  if (raw_status != 0) || (chacha20_bytes_equal(raw_readback, plaintext, 512) == 1) {
+    // On-disk bytes came back readable, or came back identical to
+    // plaintext -- either way, real encryption-at-rest didn't happen.
+    sd_ok = 0;
+  }
+
+  let sd_readback: mut ref i64 = dhruva_alloc_bytes(512);
+  let read_status: i64 = dharafs_block_read(test_block, sd_readback);
+  if (read_status != 0) || (chacha20_bytes_equal(sd_readback, plaintext, 512) == 0) {
+    sd_ok = 0;
+  }
+
+  let _ = dharafs_crypto_set_enabled(prev_enabled);
+
+  let _ = uart_puts("CRYPTO: DharaFS media encryption real SD round trip (on-disk bytes != plaintext, dharafs_block_read reproduces plaintext)");
+  if sd_ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
     let _ = uart_puts(" (FAIL)\n");
