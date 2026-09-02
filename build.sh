@@ -141,6 +141,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/aead_hkdf_scratch.S" -o "${BUILD_DIR}/aead_hkdf_scratch.o"
 
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/keccak_scratch.S" -o "${BUILD_DIR}/keccak_scratch.o"
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
@@ -178,6 +181,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/ed25519_scratch.o" \
   "${BUILD_DIR}/pki_state.o" \
   "${BUILD_DIR}/aead_hkdf_scratch.o" \
+  "${BUILD_DIR}/keccak_scratch.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
   -lgcc \
   -o "${BUILD_DIR}/dhruva.elf"
