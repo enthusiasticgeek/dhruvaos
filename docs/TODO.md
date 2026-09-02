@@ -1775,29 +1775,26 @@ for by name.
   that actually supports it (Pi 4/5, which do have OTP-based secure
   boot — see `docs/PORTING.md`).
 
-- **PQC (Post-Quantum Cryptography)** — `[XL+, genuinely disproportionate
-  to this project's current scope — recorded because asked for, not
-  recommended]`
-  NIST-standardized PQC (ML-KEM/Kyber, ML-DSA/Dilithium, SPHINCS+)
-  needs either lattice arithmetic (polynomial rings, number-theoretic
-  transforms) or hash-based signature trees — genuinely advanced
-  cryptographic engineering, a multi-month undertaking even in
-  well-resourced projects with existing reference implementations to
-  port from, let alone building it from scratch in vani on bare-metal
-  ARMv6. Worth being honest about the actual motivating threat model
-  too: PQC defends against "harvest now, decrypt later" attacks on
-  long-lived confidential traffic crossing real networks — this
-  project's networking is no longer purely loopback (round 56 added a
-  live-verified CDC-ECM path with real off-box traffic — real `ping`
-  round trips, real DHCP exchanges over an actual USB link), but it
-  still carries no confidential/encrypted traffic of any kind (no TLS,
-  no WPA2 — see the WiFi item's own AES gap), so the threat PQC exists
-  to counter STILL doesn't apply to anything Dhruva actually does. Not
-  recommended before the classical crypto foundation above exists AND
-  real confidential off-box traffic is a going concern — at that
-  point, this is worth
-  revisiting as its own dedicated, multi-round research-heavy effort,
-  not a normal backlog item.
+- **PQC (Post-Quantum Cryptography)** — **DONE (round 67)**: ML-KEM-512
+  (FIPS 203), the NIST-standardized lattice-based KEM, implemented
+  from scratch in vani. Full algorithm: NTT-based polynomial ring
+  arithmetic over Z_3329[X]/(X^256+1), K-PKE (KeyGen/Encrypt/Decrypt),
+  and the ML-KEM wrapper (KeyGen_internal/Encaps_internal/
+  Decaps_internal) including implicit rejection against chosen-
+  ciphertext attacks. Built on round 67's own Keccak/SHA-3/SHAKE
+  primitives for G/H/J/PRF/XOF. Verified two ways: (1) a from-scratch
+  Python reference checked byte-exact against `kyber-py` (a real
+  third-party ML-KEM implementation) across every algorithm layer and
+  15 random trials before any vani code was written; (2) that same
+  Python reference's deterministic output embedded as a known-answer
+  vector in `test/host_harness` (ek/dk/ciphertext/shared-secret all
+  byte-exact, plus an implicit-rejection check on a corrupted
+  ciphertext), all passing under ASAN/UBSAN. A separate round-trip
+  self-test (keygen -> encaps -> decaps) runs live on real ARM under
+  QEMU at boot and passes. ML-DSA/Dilithium and SPHINCS+ (PQC
+  signatures, as opposed to this KEM) remain undone — not currently
+  motivated by anything Dhruva signs today (see the secure-boot item
+  above), and a separate, smaller effort than this KEM was.
 
 - **Hardening against sophisticated/AI-accelerated attacks** — `[ongoing
   discipline, not a discrete buildable item]`

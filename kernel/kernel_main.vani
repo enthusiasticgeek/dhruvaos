@@ -217,6 +217,80 @@ extern "C" fn keccak_pi_dest_set(addr: mut ref i64) -> i64;
 extern "C" fn keccak_pi_dest_get() -> mut ref i64;
 extern "C" fn keccak_pad_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn keccak_pad_scratch_get() -> mut ref i64;
+extern "C" fn mlkem_zetas_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_zetas_get() -> mut ref i64;
+extern "C" fn mlkem_gammas_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_gammas_get() -> mut ref i64;
+extern "C" fn mlkem_a00_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_a00_get() -> mut ref i64;
+extern "C" fn mlkem_a01_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_a01_get() -> mut ref i64;
+extern "C" fn mlkem_a10_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_a10_get() -> mut ref i64;
+extern "C" fn mlkem_a11_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_a11_get() -> mut ref i64;
+extern "C" fn mlkem_s0_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_s0_get() -> mut ref i64;
+extern "C" fn mlkem_s1_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_s1_get() -> mut ref i64;
+extern "C" fn mlkem_e0_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_e0_get() -> mut ref i64;
+extern "C" fn mlkem_e1_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_e1_get() -> mut ref i64;
+extern "C" fn mlkem_t0_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_t0_get() -> mut ref i64;
+extern "C" fn mlkem_t1_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_t1_get() -> mut ref i64;
+extern "C" fn mlkem_r0_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_r0_get() -> mut ref i64;
+extern "C" fn mlkem_r1_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_r1_get() -> mut ref i64;
+extern "C" fn mlkem_enc_e1_0_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_enc_e1_0_get() -> mut ref i64;
+extern "C" fn mlkem_enc_e1_1_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_enc_e1_1_get() -> mut ref i64;
+extern "C" fn mlkem_u0_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_u0_get() -> mut ref i64;
+extern "C" fn mlkem_u1_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_u1_get() -> mut ref i64;
+extern "C" fn mlkem_v_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_v_get() -> mut ref i64;
+extern "C" fn mlkem_mu_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_mu_get() -> mut ref i64;
+extern "C" fn mlkem_w_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_w_get() -> mut ref i64;
+extern "C" fn mlkem_e2_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_e2_get() -> mut ref i64;
+extern "C" fn mlkem_acc_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_acc_get() -> mut ref i64;
+extern "C" fn mlkem_tmp1_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_tmp1_get() -> mut ref i64;
+extern "C" fn mlkem_tmp2_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_tmp2_get() -> mut ref i64;
+extern "C" fn mlkem_rho_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_rho_get() -> mut ref i64;
+extern "C" fn mlkem_sigma_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_sigma_get() -> mut ref i64;
+extern "C" fn mlkem_prf_out_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_prf_out_get() -> mut ref i64;
+extern "C" fn mlkem_xof_out_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_xof_out_get() -> mut ref i64;
+extern "C" fn mlkem_h_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_h_buf_get() -> mut ref i64;
+extern "C" fn mlkem_z_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_z_buf_get() -> mut ref i64;
+extern "C" fn mlkem_mprime_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_mprime_buf_get() -> mut ref i64;
+extern "C" fn mlkem_kprime_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_kprime_buf_get() -> mut ref i64;
+extern "C" fn mlkem_rprime_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_rprime_buf_get() -> mut ref i64;
+extern "C" fn mlkem_kbar_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_kbar_buf_get() -> mut ref i64;
+extern "C" fn mlkem_ekpke_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_ekpke_buf_get() -> mut ref i64;
+extern "C" fn mlkem_cprime_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn mlkem_cprime_buf_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -21322,6 +21396,918 @@ fn keccak_self_test() -> i64 {
 // comment for the full methodology), the PRIVATE key itself never
 // appears anywhere in this codebase, matching real trust-anchor
 // provisioning practice (only the public half is ever baked in).
+fn mlkem_init() -> i64 {
+  let zetas: mut ref i64 = mlkem_zetas_get();
+  let _ = buf_write_u32(zetas, 0 as u32, 1 as u32);
+  let _ = buf_write_u32(zetas, 4 as u32, 1729 as u32);
+  let _ = buf_write_u32(zetas, 8 as u32, 2580 as u32);
+  let _ = buf_write_u32(zetas, 12 as u32, 3289 as u32);
+  let _ = buf_write_u32(zetas, 16 as u32, 2642 as u32);
+  let _ = buf_write_u32(zetas, 20 as u32, 630 as u32);
+  let _ = buf_write_u32(zetas, 24 as u32, 1897 as u32);
+  let _ = buf_write_u32(zetas, 28 as u32, 848 as u32);
+  let _ = buf_write_u32(zetas, 32 as u32, 1062 as u32);
+  let _ = buf_write_u32(zetas, 36 as u32, 1919 as u32);
+  let _ = buf_write_u32(zetas, 40 as u32, 193 as u32);
+  let _ = buf_write_u32(zetas, 44 as u32, 797 as u32);
+  let _ = buf_write_u32(zetas, 48 as u32, 2786 as u32);
+  let _ = buf_write_u32(zetas, 52 as u32, 3260 as u32);
+  let _ = buf_write_u32(zetas, 56 as u32, 569 as u32);
+  let _ = buf_write_u32(zetas, 60 as u32, 1746 as u32);
+  let _ = buf_write_u32(zetas, 64 as u32, 296 as u32);
+  let _ = buf_write_u32(zetas, 68 as u32, 2447 as u32);
+  let _ = buf_write_u32(zetas, 72 as u32, 1339 as u32);
+  let _ = buf_write_u32(zetas, 76 as u32, 1476 as u32);
+  let _ = buf_write_u32(zetas, 80 as u32, 3046 as u32);
+  let _ = buf_write_u32(zetas, 84 as u32, 56 as u32);
+  let _ = buf_write_u32(zetas, 88 as u32, 2240 as u32);
+  let _ = buf_write_u32(zetas, 92 as u32, 1333 as u32);
+  let _ = buf_write_u32(zetas, 96 as u32, 1426 as u32);
+  let _ = buf_write_u32(zetas, 100 as u32, 2094 as u32);
+  let _ = buf_write_u32(zetas, 104 as u32, 535 as u32);
+  let _ = buf_write_u32(zetas, 108 as u32, 2882 as u32);
+  let _ = buf_write_u32(zetas, 112 as u32, 2393 as u32);
+  let _ = buf_write_u32(zetas, 116 as u32, 2879 as u32);
+  let _ = buf_write_u32(zetas, 120 as u32, 1974 as u32);
+  let _ = buf_write_u32(zetas, 124 as u32, 821 as u32);
+  let _ = buf_write_u32(zetas, 128 as u32, 289 as u32);
+  let _ = buf_write_u32(zetas, 132 as u32, 331 as u32);
+  let _ = buf_write_u32(zetas, 136 as u32, 3253 as u32);
+  let _ = buf_write_u32(zetas, 140 as u32, 1756 as u32);
+  let _ = buf_write_u32(zetas, 144 as u32, 1197 as u32);
+  let _ = buf_write_u32(zetas, 148 as u32, 2304 as u32);
+  let _ = buf_write_u32(zetas, 152 as u32, 2277 as u32);
+  let _ = buf_write_u32(zetas, 156 as u32, 2055 as u32);
+  let _ = buf_write_u32(zetas, 160 as u32, 650 as u32);
+  let _ = buf_write_u32(zetas, 164 as u32, 1977 as u32);
+  let _ = buf_write_u32(zetas, 168 as u32, 2513 as u32);
+  let _ = buf_write_u32(zetas, 172 as u32, 632 as u32);
+  let _ = buf_write_u32(zetas, 176 as u32, 2865 as u32);
+  let _ = buf_write_u32(zetas, 180 as u32, 33 as u32);
+  let _ = buf_write_u32(zetas, 184 as u32, 1320 as u32);
+  let _ = buf_write_u32(zetas, 188 as u32, 1915 as u32);
+  let _ = buf_write_u32(zetas, 192 as u32, 2319 as u32);
+  let _ = buf_write_u32(zetas, 196 as u32, 1435 as u32);
+  let _ = buf_write_u32(zetas, 200 as u32, 807 as u32);
+  let _ = buf_write_u32(zetas, 204 as u32, 452 as u32);
+  let _ = buf_write_u32(zetas, 208 as u32, 1438 as u32);
+  let _ = buf_write_u32(zetas, 212 as u32, 2868 as u32);
+  let _ = buf_write_u32(zetas, 216 as u32, 1534 as u32);
+  let _ = buf_write_u32(zetas, 220 as u32, 2402 as u32);
+  let _ = buf_write_u32(zetas, 224 as u32, 2647 as u32);
+  let _ = buf_write_u32(zetas, 228 as u32, 2617 as u32);
+  let _ = buf_write_u32(zetas, 232 as u32, 1481 as u32);
+  let _ = buf_write_u32(zetas, 236 as u32, 648 as u32);
+  let _ = buf_write_u32(zetas, 240 as u32, 2474 as u32);
+  let _ = buf_write_u32(zetas, 244 as u32, 3110 as u32);
+  let _ = buf_write_u32(zetas, 248 as u32, 1227 as u32);
+  let _ = buf_write_u32(zetas, 252 as u32, 910 as u32);
+  let _ = buf_write_u32(zetas, 256 as u32, 17 as u32);
+  let _ = buf_write_u32(zetas, 260 as u32, 2761 as u32);
+  let _ = buf_write_u32(zetas, 264 as u32, 583 as u32);
+  let _ = buf_write_u32(zetas, 268 as u32, 2649 as u32);
+  let _ = buf_write_u32(zetas, 272 as u32, 1637 as u32);
+  let _ = buf_write_u32(zetas, 276 as u32, 723 as u32);
+  let _ = buf_write_u32(zetas, 280 as u32, 2288 as u32);
+  let _ = buf_write_u32(zetas, 284 as u32, 1100 as u32);
+  let _ = buf_write_u32(zetas, 288 as u32, 1409 as u32);
+  let _ = buf_write_u32(zetas, 292 as u32, 2662 as u32);
+  let _ = buf_write_u32(zetas, 296 as u32, 3281 as u32);
+  let _ = buf_write_u32(zetas, 300 as u32, 233 as u32);
+  let _ = buf_write_u32(zetas, 304 as u32, 756 as u32);
+  let _ = buf_write_u32(zetas, 308 as u32, 2156 as u32);
+  let _ = buf_write_u32(zetas, 312 as u32, 3015 as u32);
+  let _ = buf_write_u32(zetas, 316 as u32, 3050 as u32);
+  let _ = buf_write_u32(zetas, 320 as u32, 1703 as u32);
+  let _ = buf_write_u32(zetas, 324 as u32, 1651 as u32);
+  let _ = buf_write_u32(zetas, 328 as u32, 2789 as u32);
+  let _ = buf_write_u32(zetas, 332 as u32, 1789 as u32);
+  let _ = buf_write_u32(zetas, 336 as u32, 1847 as u32);
+  let _ = buf_write_u32(zetas, 340 as u32, 952 as u32);
+  let _ = buf_write_u32(zetas, 344 as u32, 1461 as u32);
+  let _ = buf_write_u32(zetas, 348 as u32, 2687 as u32);
+  let _ = buf_write_u32(zetas, 352 as u32, 939 as u32);
+  let _ = buf_write_u32(zetas, 356 as u32, 2308 as u32);
+  let _ = buf_write_u32(zetas, 360 as u32, 2437 as u32);
+  let _ = buf_write_u32(zetas, 364 as u32, 2388 as u32);
+  let _ = buf_write_u32(zetas, 368 as u32, 733 as u32);
+  let _ = buf_write_u32(zetas, 372 as u32, 2337 as u32);
+  let _ = buf_write_u32(zetas, 376 as u32, 268 as u32);
+  let _ = buf_write_u32(zetas, 380 as u32, 641 as u32);
+  let _ = buf_write_u32(zetas, 384 as u32, 1584 as u32);
+  let _ = buf_write_u32(zetas, 388 as u32, 2298 as u32);
+  let _ = buf_write_u32(zetas, 392 as u32, 2037 as u32);
+  let _ = buf_write_u32(zetas, 396 as u32, 3220 as u32);
+  let _ = buf_write_u32(zetas, 400 as u32, 375 as u32);
+  let _ = buf_write_u32(zetas, 404 as u32, 2549 as u32);
+  let _ = buf_write_u32(zetas, 408 as u32, 2090 as u32);
+  let _ = buf_write_u32(zetas, 412 as u32, 1645 as u32);
+  let _ = buf_write_u32(zetas, 416 as u32, 1063 as u32);
+  let _ = buf_write_u32(zetas, 420 as u32, 319 as u32);
+  let _ = buf_write_u32(zetas, 424 as u32, 2773 as u32);
+  let _ = buf_write_u32(zetas, 428 as u32, 757 as u32);
+  let _ = buf_write_u32(zetas, 432 as u32, 2099 as u32);
+  let _ = buf_write_u32(zetas, 436 as u32, 561 as u32);
+  let _ = buf_write_u32(zetas, 440 as u32, 2466 as u32);
+  let _ = buf_write_u32(zetas, 444 as u32, 2594 as u32);
+  let _ = buf_write_u32(zetas, 448 as u32, 2804 as u32);
+  let _ = buf_write_u32(zetas, 452 as u32, 1092 as u32);
+  let _ = buf_write_u32(zetas, 456 as u32, 403 as u32);
+  let _ = buf_write_u32(zetas, 460 as u32, 1026 as u32);
+  let _ = buf_write_u32(zetas, 464 as u32, 1143 as u32);
+  let _ = buf_write_u32(zetas, 468 as u32, 2150 as u32);
+  let _ = buf_write_u32(zetas, 472 as u32, 2775 as u32);
+  let _ = buf_write_u32(zetas, 476 as u32, 886 as u32);
+  let _ = buf_write_u32(zetas, 480 as u32, 1722 as u32);
+  let _ = buf_write_u32(zetas, 484 as u32, 1212 as u32);
+  let _ = buf_write_u32(zetas, 488 as u32, 1874 as u32);
+  let _ = buf_write_u32(zetas, 492 as u32, 1029 as u32);
+  let _ = buf_write_u32(zetas, 496 as u32, 2110 as u32);
+  let _ = buf_write_u32(zetas, 500 as u32, 2935 as u32);
+  let _ = buf_write_u32(zetas, 504 as u32, 885 as u32);
+  let _ = buf_write_u32(zetas, 508 as u32, 2154 as u32);
+  let gammas: mut ref i64 = mlkem_gammas_get();
+  let _ = buf_write_u32(gammas, 0 as u32, 17 as u32);
+  let _ = buf_write_u32(gammas, 4 as u32, 3312 as u32);
+  let _ = buf_write_u32(gammas, 8 as u32, 2761 as u32);
+  let _ = buf_write_u32(gammas, 12 as u32, 568 as u32);
+  let _ = buf_write_u32(gammas, 16 as u32, 583 as u32);
+  let _ = buf_write_u32(gammas, 20 as u32, 2746 as u32);
+  let _ = buf_write_u32(gammas, 24 as u32, 2649 as u32);
+  let _ = buf_write_u32(gammas, 28 as u32, 680 as u32);
+  let _ = buf_write_u32(gammas, 32 as u32, 1637 as u32);
+  let _ = buf_write_u32(gammas, 36 as u32, 1692 as u32);
+  let _ = buf_write_u32(gammas, 40 as u32, 723 as u32);
+  let _ = buf_write_u32(gammas, 44 as u32, 2606 as u32);
+  let _ = buf_write_u32(gammas, 48 as u32, 2288 as u32);
+  let _ = buf_write_u32(gammas, 52 as u32, 1041 as u32);
+  let _ = buf_write_u32(gammas, 56 as u32, 1100 as u32);
+  let _ = buf_write_u32(gammas, 60 as u32, 2229 as u32);
+  let _ = buf_write_u32(gammas, 64 as u32, 1409 as u32);
+  let _ = buf_write_u32(gammas, 68 as u32, 1920 as u32);
+  let _ = buf_write_u32(gammas, 72 as u32, 2662 as u32);
+  let _ = buf_write_u32(gammas, 76 as u32, 667 as u32);
+  let _ = buf_write_u32(gammas, 80 as u32, 3281 as u32);
+  let _ = buf_write_u32(gammas, 84 as u32, 48 as u32);
+  let _ = buf_write_u32(gammas, 88 as u32, 233 as u32);
+  let _ = buf_write_u32(gammas, 92 as u32, 3096 as u32);
+  let _ = buf_write_u32(gammas, 96 as u32, 756 as u32);
+  let _ = buf_write_u32(gammas, 100 as u32, 2573 as u32);
+  let _ = buf_write_u32(gammas, 104 as u32, 2156 as u32);
+  let _ = buf_write_u32(gammas, 108 as u32, 1173 as u32);
+  let _ = buf_write_u32(gammas, 112 as u32, 3015 as u32);
+  let _ = buf_write_u32(gammas, 116 as u32, 314 as u32);
+  let _ = buf_write_u32(gammas, 120 as u32, 3050 as u32);
+  let _ = buf_write_u32(gammas, 124 as u32, 279 as u32);
+  let _ = buf_write_u32(gammas, 128 as u32, 1703 as u32);
+  let _ = buf_write_u32(gammas, 132 as u32, 1626 as u32);
+  let _ = buf_write_u32(gammas, 136 as u32, 1651 as u32);
+  let _ = buf_write_u32(gammas, 140 as u32, 1678 as u32);
+  let _ = buf_write_u32(gammas, 144 as u32, 2789 as u32);
+  let _ = buf_write_u32(gammas, 148 as u32, 540 as u32);
+  let _ = buf_write_u32(gammas, 152 as u32, 1789 as u32);
+  let _ = buf_write_u32(gammas, 156 as u32, 1540 as u32);
+  let _ = buf_write_u32(gammas, 160 as u32, 1847 as u32);
+  let _ = buf_write_u32(gammas, 164 as u32, 1482 as u32);
+  let _ = buf_write_u32(gammas, 168 as u32, 952 as u32);
+  let _ = buf_write_u32(gammas, 172 as u32, 2377 as u32);
+  let _ = buf_write_u32(gammas, 176 as u32, 1461 as u32);
+  let _ = buf_write_u32(gammas, 180 as u32, 1868 as u32);
+  let _ = buf_write_u32(gammas, 184 as u32, 2687 as u32);
+  let _ = buf_write_u32(gammas, 188 as u32, 642 as u32);
+  let _ = buf_write_u32(gammas, 192 as u32, 939 as u32);
+  let _ = buf_write_u32(gammas, 196 as u32, 2390 as u32);
+  let _ = buf_write_u32(gammas, 200 as u32, 2308 as u32);
+  let _ = buf_write_u32(gammas, 204 as u32, 1021 as u32);
+  let _ = buf_write_u32(gammas, 208 as u32, 2437 as u32);
+  let _ = buf_write_u32(gammas, 212 as u32, 892 as u32);
+  let _ = buf_write_u32(gammas, 216 as u32, 2388 as u32);
+  let _ = buf_write_u32(gammas, 220 as u32, 941 as u32);
+  let _ = buf_write_u32(gammas, 224 as u32, 733 as u32);
+  let _ = buf_write_u32(gammas, 228 as u32, 2596 as u32);
+  let _ = buf_write_u32(gammas, 232 as u32, 2337 as u32);
+  let _ = buf_write_u32(gammas, 236 as u32, 992 as u32);
+  let _ = buf_write_u32(gammas, 240 as u32, 268 as u32);
+  let _ = buf_write_u32(gammas, 244 as u32, 3061 as u32);
+  let _ = buf_write_u32(gammas, 248 as u32, 641 as u32);
+  let _ = buf_write_u32(gammas, 252 as u32, 2688 as u32);
+  let _ = buf_write_u32(gammas, 256 as u32, 1584 as u32);
+  let _ = buf_write_u32(gammas, 260 as u32, 1745 as u32);
+  let _ = buf_write_u32(gammas, 264 as u32, 2298 as u32);
+  let _ = buf_write_u32(gammas, 268 as u32, 1031 as u32);
+  let _ = buf_write_u32(gammas, 272 as u32, 2037 as u32);
+  let _ = buf_write_u32(gammas, 276 as u32, 1292 as u32);
+  let _ = buf_write_u32(gammas, 280 as u32, 3220 as u32);
+  let _ = buf_write_u32(gammas, 284 as u32, 109 as u32);
+  let _ = buf_write_u32(gammas, 288 as u32, 375 as u32);
+  let _ = buf_write_u32(gammas, 292 as u32, 2954 as u32);
+  let _ = buf_write_u32(gammas, 296 as u32, 2549 as u32);
+  let _ = buf_write_u32(gammas, 300 as u32, 780 as u32);
+  let _ = buf_write_u32(gammas, 304 as u32, 2090 as u32);
+  let _ = buf_write_u32(gammas, 308 as u32, 1239 as u32);
+  let _ = buf_write_u32(gammas, 312 as u32, 1645 as u32);
+  let _ = buf_write_u32(gammas, 316 as u32, 1684 as u32);
+  let _ = buf_write_u32(gammas, 320 as u32, 1063 as u32);
+  let _ = buf_write_u32(gammas, 324 as u32, 2266 as u32);
+  let _ = buf_write_u32(gammas, 328 as u32, 319 as u32);
+  let _ = buf_write_u32(gammas, 332 as u32, 3010 as u32);
+  let _ = buf_write_u32(gammas, 336 as u32, 2773 as u32);
+  let _ = buf_write_u32(gammas, 340 as u32, 556 as u32);
+  let _ = buf_write_u32(gammas, 344 as u32, 757 as u32);
+  let _ = buf_write_u32(gammas, 348 as u32, 2572 as u32);
+  let _ = buf_write_u32(gammas, 352 as u32, 2099 as u32);
+  let _ = buf_write_u32(gammas, 356 as u32, 1230 as u32);
+  let _ = buf_write_u32(gammas, 360 as u32, 561 as u32);
+  let _ = buf_write_u32(gammas, 364 as u32, 2768 as u32);
+  let _ = buf_write_u32(gammas, 368 as u32, 2466 as u32);
+  let _ = buf_write_u32(gammas, 372 as u32, 863 as u32);
+  let _ = buf_write_u32(gammas, 376 as u32, 2594 as u32);
+  let _ = buf_write_u32(gammas, 380 as u32, 735 as u32);
+  let _ = buf_write_u32(gammas, 384 as u32, 2804 as u32);
+  let _ = buf_write_u32(gammas, 388 as u32, 525 as u32);
+  let _ = buf_write_u32(gammas, 392 as u32, 1092 as u32);
+  let _ = buf_write_u32(gammas, 396 as u32, 2237 as u32);
+  let _ = buf_write_u32(gammas, 400 as u32, 403 as u32);
+  let _ = buf_write_u32(gammas, 404 as u32, 2926 as u32);
+  let _ = buf_write_u32(gammas, 408 as u32, 1026 as u32);
+  let _ = buf_write_u32(gammas, 412 as u32, 2303 as u32);
+  let _ = buf_write_u32(gammas, 416 as u32, 1143 as u32);
+  let _ = buf_write_u32(gammas, 420 as u32, 2186 as u32);
+  let _ = buf_write_u32(gammas, 424 as u32, 2150 as u32);
+  let _ = buf_write_u32(gammas, 428 as u32, 1179 as u32);
+  let _ = buf_write_u32(gammas, 432 as u32, 2775 as u32);
+  let _ = buf_write_u32(gammas, 436 as u32, 554 as u32);
+  let _ = buf_write_u32(gammas, 440 as u32, 886 as u32);
+  let _ = buf_write_u32(gammas, 444 as u32, 2443 as u32);
+  let _ = buf_write_u32(gammas, 448 as u32, 1722 as u32);
+  let _ = buf_write_u32(gammas, 452 as u32, 1607 as u32);
+  let _ = buf_write_u32(gammas, 456 as u32, 1212 as u32);
+  let _ = buf_write_u32(gammas, 460 as u32, 2117 as u32);
+  let _ = buf_write_u32(gammas, 464 as u32, 1874 as u32);
+  let _ = buf_write_u32(gammas, 468 as u32, 1455 as u32);
+  let _ = buf_write_u32(gammas, 472 as u32, 1029 as u32);
+  let _ = buf_write_u32(gammas, 476 as u32, 2300 as u32);
+  let _ = buf_write_u32(gammas, 480 as u32, 2110 as u32);
+  let _ = buf_write_u32(gammas, 484 as u32, 1219 as u32);
+  let _ = buf_write_u32(gammas, 488 as u32, 2935 as u32);
+  let _ = buf_write_u32(gammas, 492 as u32, 394 as u32);
+  let _ = buf_write_u32(gammas, 496 as u32, 885 as u32);
+  let _ = buf_write_u32(gammas, 500 as u32, 2444 as u32);
+  let _ = buf_write_u32(gammas, 504 as u32, 2154 as u32);
+  let _ = buf_write_u32(gammas, 508 as u32, 1175 as u32);
+  return 0;
+}
+
+fn mlkem_buf_copy(src: mut ref i64, src_off: i64, dst: mut ref i64, dst_off: i64, n: i64) -> i64 {
+  let ci: i64 = 0;
+  while ci < n {
+    let cb: u32 = buf_read_byte(src, (src_off + ci) as u32);
+    let _ = buf_write_byte(dst, (dst_off + ci) as u32, cb);
+    ci = ci + 1;
+  }
+  return 0;
+}
+
+fn mlkem_poly_add(a: mut ref i64, b: mut ref i64, out: mut ref i64) -> i64 {
+  let pai: i64 = 0;
+  while pai < 256 {
+    let av: u32 = buf_read_u32(a, (pai * 4) as u32);
+    let bv: u32 = buf_read_u32(b, (pai * 4) as u32);
+    let _ = buf_write_u32(out, (pai * 4) as u32, (av + bv) % (3329 as u32));
+    pai = pai + 1;
+  }
+  return 0;
+}
+
+fn mlkem_poly_sub(a: mut ref i64, b: mut ref i64, out: mut ref i64) -> i64 {
+  let psi: i64 = 0;
+  while psi < 256 {
+    let av: u32 = buf_read_u32(a, (psi * 4) as u32);
+    let bv: u32 = buf_read_u32(b, (psi * 4) as u32);
+    let _ = buf_write_u32(out, (psi * 4) as u32, (av + (3329 as u32) - bv) % (3329 as u32));
+    psi = psi + 1;
+  }
+  return 0;
+}
+
+// FIPS 203 Algorithm 9 (NTT), in-place. zetas[k] = 17^bitrev7(k) mod q,
+// precomputed by mlkem_init from the exact same derivation verified
+// byte-exact against kyber-py's reference in the scratchpad Python spike.
+fn mlkem_ntt(f: mut ref i64) -> i64 {
+  let zetas: mut ref i64 = mlkem_zetas_get();
+  let ntt_k: i64 = 1;
+  let ntt_len: i64 = 128;
+  while ntt_len >= 2 {
+    let ntt_start: i64 = 0;
+    while ntt_start < 256 {
+      let zeta: u32 = buf_read_u32(zetas, (ntt_k * 4) as u32);
+      ntt_k = ntt_k + 1;
+      let ntt_j: i64 = ntt_start;
+      while ntt_j < ntt_start + ntt_len {
+        let fjl: u32 = buf_read_u32(f, ((ntt_j + ntt_len) * 4) as u32);
+        let t: u32 = (zeta * fjl) % (3329 as u32);
+        let fj: u32 = buf_read_u32(f, (ntt_j * 4) as u32);
+        let newjl: u32 = (fj + (3329 as u32) - t) % (3329 as u32);
+        let newj: u32 = (fj + t) % (3329 as u32);
+        let _ = buf_write_u32(f, ((ntt_j + ntt_len) * 4) as u32, newjl);
+        let _ = buf_write_u32(f, (ntt_j * 4) as u32, newj);
+        ntt_j = ntt_j + 1;
+      }
+      ntt_start = ntt_start + 2 * ntt_len;
+    }
+    ntt_len = ntt_len / 2;
+  }
+  return 0;
+}
+
+// FIPS 203 Algorithm 10 (NTT^-1), in-place; final pass scales by
+// 3303 = 128^-1 mod 3329.
+fn mlkem_ntt_inv(f: mut ref i64) -> i64 {
+  let zetas: mut ref i64 = mlkem_zetas_get();
+  let inv_k: i64 = 127;
+  let inv_len: i64 = 2;
+  while inv_len <= 128 {
+    let inv_start: i64 = 0;
+    while inv_start < 256 {
+      let zeta: u32 = buf_read_u32(zetas, (inv_k * 4) as u32);
+      inv_k = inv_k - 1;
+      let inv_j: i64 = inv_start;
+      while inv_j < inv_start + inv_len {
+        let t: u32 = buf_read_u32(f, (inv_j * 4) as u32);
+        let fjl: u32 = buf_read_u32(f, ((inv_j + inv_len) * 4) as u32);
+        let newj: u32 = (t + fjl) % (3329 as u32);
+        let diff: u32 = (fjl + (3329 as u32) - t) % (3329 as u32);
+        let newjl: u32 = (zeta * diff) % (3329 as u32);
+        let _ = buf_write_u32(f, (inv_j * 4) as u32, newj);
+        let _ = buf_write_u32(f, ((inv_j + inv_len) * 4) as u32, newjl);
+        inv_j = inv_j + 1;
+      }
+      inv_start = inv_start + 2 * inv_len;
+    }
+    inv_len = inv_len * 2;
+  }
+  let scale_i: i64 = 0;
+  while scale_i < 256 {
+    let x: u32 = buf_read_u32(f, (scale_i * 4) as u32);
+    let scaled: u32 = (x * (3303 as u32)) % (3329 as u32);
+    let _ = buf_write_u32(f, (scale_i * 4) as u32, scaled);
+    scale_i = scale_i + 1;
+  }
+  return 0;
+}
+
+// FIPS 203 Algorithm 11 (MultiplyNTTs), base-case multiplication of
+// degree-1 pairs mod (X^2 - gamma_i).
+fn mlkem_multiply_ntts(f: mut ref i64, g: mut ref i64, out: mut ref i64) -> i64 {
+  let gammas: mut ref i64 = mlkem_gammas_get();
+  let mi: i64 = 0;
+  while mi < 128 {
+    let a0: u32 = buf_read_u32(f, (2 * mi * 4) as u32);
+    let a1: u32 = buf_read_u32(f, ((2 * mi + 1) * 4) as u32);
+    let b0: u32 = buf_read_u32(g, (2 * mi * 4) as u32);
+    let b1: u32 = buf_read_u32(g, ((2 * mi + 1) * 4) as u32);
+    let gamma: u32 = buf_read_u32(gammas, (mi * 4) as u32);
+    let c0a: u32 = (a0 * b0) % (3329 as u32);
+    let c0b: u32 = (((a1 * b1) % (3329 as u32)) * gamma) % (3329 as u32);
+    let c0: u32 = (c0a + c0b) % (3329 as u32);
+    let c1a: u32 = (a0 * b1) % (3329 as u32);
+    let c1b: u32 = (a1 * b0) % (3329 as u32);
+    let c1: u32 = (c1a + c1b) % (3329 as u32);
+    let _ = buf_write_u32(out, (2 * mi * 4) as u32, c0);
+    let _ = buf_write_u32(out, ((2 * mi + 1) * 4) as u32, c1);
+    mi = mi + 1;
+  }
+  return 0;
+}
+
+// Generic FIPS 203 ByteEncode_d: packs 256 coefficients (each < mod_val)
+// into d-bit little-endian-bit-order fields, written starting at
+// out_offset. 256*d is always a multiple of 8 for d in {12,10,4,1}, so
+// there is never a leftover partial byte to flush.
+fn mlkem_byte_encode(poly: mut ref i64, d: i64, mod_val: u32, out: mut ref i64, out_offset: i64) -> i64 {
+  let be_bitbuf: u32 = 0 as u32;
+  let be_bitcount: i64 = 0;
+  let be_pos: i64 = out_offset;
+  let be_i: i64 = 0;
+  while be_i < 256 {
+    let coeff: u32 = buf_read_u32(poly, (be_i * 4) as u32) % mod_val;
+    be_bitbuf = be_bitbuf | (coeff << (be_bitcount as u32));
+    be_bitcount = be_bitcount + d;
+    while be_bitcount >= 8 {
+      let outbyte: u32 = be_bitbuf & (255 as u32);
+      let _ = buf_write_byte(out, be_pos as u32, outbyte);
+      be_pos = be_pos + 1;
+      be_bitbuf = be_bitbuf >> (8 as u32);
+      be_bitcount = be_bitcount - 8;
+    }
+    be_i = be_i + 1;
+  }
+  return 0;
+}
+
+// Generic FIPS 203 ByteDecode_d, reading from in_offset within `inbuf`.
+fn mlkem_byte_decode(inbuf: mut ref i64, in_offset: i64, d: i64, mod_val: u32, poly: mut ref i64) -> i64 {
+  let bd_bitbuf: u32 = 0 as u32;
+  let bd_bitcount: i64 = 0;
+  let bd_pos: i64 = in_offset;
+  let bd_mask: u32 = ((1 as u32) << (d as u32)) - (1 as u32);
+  let bd_i: i64 = 0;
+  while bd_i < 256 {
+    while bd_bitcount < d {
+      let inbyte: u32 = buf_read_byte(inbuf, bd_pos as u32);
+      bd_pos = bd_pos + 1;
+      bd_bitbuf = bd_bitbuf | (inbyte << (bd_bitcount as u32));
+      bd_bitcount = bd_bitcount + 8;
+    }
+    let coeff: u32 = (bd_bitbuf & bd_mask) % mod_val;
+    let _ = buf_write_u32(poly, (bd_i * 4) as u32, coeff);
+    bd_bitbuf = bd_bitbuf >> (d as u32);
+    bd_bitcount = bd_bitcount - d;
+    bd_i = bd_i + 1;
+  }
+  return 0;
+}
+
+fn mlkem_compress_poly(f: mut ref i64, d: i64, out: mut ref i64) -> i64 {
+  let cp_m: u32 = (1 as u32) << (d as u32);
+  let cp_i: i64 = 0;
+  while cp_i < 256 {
+    let x: u32 = buf_read_u32(f, (cp_i * 4) as u32);
+    let num: u32 = x * cp_m + (1664 as u32);
+    let q: u32 = num / (3329 as u32);
+    let c: u32 = q % cp_m;
+    let _ = buf_write_u32(out, (cp_i * 4) as u32, c);
+    cp_i = cp_i + 1;
+  }
+  return 0;
+}
+
+fn mlkem_decompress_poly(f: mut ref i64, d: i64, out: mut ref i64) -> i64 {
+  let dp_half: u32 = (1 as u32) << ((d - 1) as u32);
+  let dp_i: i64 = 0;
+  while dp_i < 256 {
+    let y: u32 = buf_read_u32(f, (dp_i * 4) as u32);
+    let num: u32 = y * (3329 as u32) + dp_half;
+    let val: u32 = num >> (d as u32);
+    let _ = buf_write_u32(out, (dp_i * 4) as u32, val);
+    dp_i = dp_i + 1;
+  }
+  return 0;
+}
+
+// mu = Decompress_1(BytesToBits(m)): each message bit maps directly to
+// 0 or 1665 (= Decompress(1,1)), so this folds bit-extraction and
+// decompression into one pass instead of building an intermediate bit array.
+fn mlkem_msg_to_poly(m: mut ref i64, out: mut ref i64) -> i64 {
+  let mp_i: i64 = 0;
+  while mp_i < 256 {
+    let byte_idx: i64 = mp_i / 8;
+    let bit_idx: i64 = mp_i % 8;
+    let byteval: u32 = buf_read_byte(m, byte_idx as u32);
+    let bit: u32 = (byteval >> (bit_idx as u32)) & (1 as u32);
+    let val: u32 = if bit == (1 as u32) { 1665 as u32 } else { 0 as u32 };
+    let _ = buf_write_u32(out, (mp_i * 4) as u32, val);
+    mp_i = mp_i + 1;
+  }
+  return 0;
+}
+
+// Reverse of mlkem_msg_to_poly: Compress_1 each coefficient to a bit,
+// packed LSB-first into 32 bytes.
+fn mlkem_poly_to_msg(w: mut ref i64, out: mut ref i64) -> i64 {
+  let zi: i64 = 0;
+  while zi < 32 {
+    let _ = buf_write_byte(out, zi as u32, 0 as u32);
+    zi = zi + 1;
+  }
+  let pm_j: i64 = 0;
+  while pm_j < 256 {
+    let x: u32 = buf_read_u32(w, (pm_j * 4) as u32);
+    let num: u32 = x * (2 as u32) + (1664 as u32);
+    let q: u32 = num / (3329 as u32);
+    let bit: u32 = q % (2 as u32);
+    if bit == (1 as u32) {
+      let byte_idx: i64 = pm_j / 8;
+      let bit_idx: i64 = pm_j % 8;
+      let cur: u32 = buf_read_byte(out, byte_idx as u32);
+      let _ = buf_write_byte(out, byte_idx as u32, cur | ((1 as u32) << (bit_idx as u32)));
+    }
+    pm_j = pm_j + 1;
+  }
+  return 0;
+}
+
+// PRF_eta(s, b) = SHAKE256(s || b, 64*eta). Uses mlkem_tmp1 purely as
+// transient concatenation scratch -- never held live across a call to
+// any other mlkem_* helper.
+fn mlkem_prf(eta: i64, s: mut ref i64, b: u32, out: mut ref i64) -> i64 {
+  let prf_tmp: mut ref i64 = mlkem_tmp1_get();
+  let _ = mlkem_buf_copy(s, 0, prf_tmp, 0, 32);
+  let _ = buf_write_byte(prf_tmp, 32 as u32, b);
+  let out_len: i64 = 64 * eta;
+  return shake256_squeeze(prf_tmp, 33, out, out_len);
+}
+
+// XOF(rho, i, j) = SHAKE128(rho || i || j, 840) -- 840 bytes is a
+// generous stream for 256-coefficient rejection sampling (see
+// mlkem_sample_ntt), matching the scratchpad Python spike.
+fn mlkem_xof(rho: mut ref i64, i_byte: u32, j_byte: u32, out: mut ref i64) -> i64 {
+  let xof_tmp: mut ref i64 = mlkem_tmp1_get();
+  let _ = mlkem_buf_copy(rho, 0, xof_tmp, 0, 32);
+  let _ = buf_write_byte(xof_tmp, 32 as u32, i_byte);
+  let _ = buf_write_byte(xof_tmp, 33 as u32, j_byte);
+  return shake128_squeeze(xof_tmp, 34, out, 840);
+}
+
+// FIPS 203 Algorithm 7 (SampleNTT): rejection-sample 12-bit values < q
+// from a byte stream, 3 bytes -> up to 2 candidates.
+fn mlkem_sample_ntt(stream: mut ref i64, out: mut ref i64) -> i64 {
+  let sn_count: i64 = 0;
+  let sn_pos: i64 = 0;
+  while sn_count < 256 {
+    let b0: u32 = buf_read_byte(stream, sn_pos as u32);
+    let b1: u32 = buf_read_byte(stream, (sn_pos + 1) as u32);
+    let b2: u32 = buf_read_byte(stream, (sn_pos + 2) as u32);
+    sn_pos = sn_pos + 3;
+    let d1: u32 = b0 | ((b1 & (15 as u32)) << (8 as u32));
+    let d2: u32 = (b1 >> (4 as u32)) | (b2 << (4 as u32));
+    if d1 < (3329 as u32) {
+      if sn_count < 256 {
+        let _ = buf_write_u32(out, (sn_count * 4) as u32, d1);
+        sn_count = sn_count + 1;
+      }
+    }
+    if d2 < (3329 as u32) {
+      if sn_count < 256 {
+        let _ = buf_write_u32(out, (sn_count * 4) as u32, d2);
+        sn_count = sn_count + 1;
+      }
+    }
+  }
+  return 0;
+}
+
+// FIPS 203 Algorithm 8 (SamplePolyCBD_eta) from a PRF output stream.
+fn mlkem_sample_poly_cbd(stream: mut ref i64, eta: i64, out: mut ref i64) -> i64 {
+  let cbd_i: i64 = 0;
+  while cbd_i < 256 {
+    let x: i64 = 0;
+    let xa: i64 = 0;
+    while xa < eta {
+      let xbitpos: i64 = 2 * cbd_i * eta + xa;
+      let xbyte_idx: i64 = xbitpos / 8;
+      let xbit_idx: i64 = xbitpos % 8;
+      let xbyteval: u32 = buf_read_byte(stream, xbyte_idx as u32);
+      let xbit: u32 = (xbyteval >> (xbit_idx as u32)) & (1 as u32);
+      x = x + (xbit as i64);
+      xa = xa + 1;
+    }
+    let y: i64 = 0;
+    let ya: i64 = 0;
+    while ya < eta {
+      let ybitpos: i64 = 2 * cbd_i * eta + eta + ya;
+      let ybyte_idx: i64 = ybitpos / 8;
+      let ybit_idx: i64 = ybitpos % 8;
+      let ybyteval: u32 = buf_read_byte(stream, ybyte_idx as u32);
+      let ybit: u32 = (ybyteval >> (ybit_idx as u32)) & (1 as u32);
+      y = y + (ybit as i64);
+      ya = ya + 1;
+    }
+    let diff: i64 = x - y;
+    let val: u32 = ((diff + 3329) % 3329) as u32;
+    let _ = buf_write_u32(out, (cbd_i * 4) as u32, val);
+    cbd_i = cbd_i + 1;
+  }
+  return 0;
+}
+
+// G(msg) = SHA3-512(msg), split into two 32-byte halves. Uses
+// mlkem_tmp2 purely as transient hash-output scratch.
+fn mlkem_g(msg: mut ref i64, msg_len: i64, out_a: mut ref i64, out_b: mut ref i64) -> i64 {
+  let g_full: mut ref i64 = mlkem_tmp2_get();
+  let _ = sha3_512_hash(msg, msg_len, g_full);
+  let ga_i: i64 = 0;
+  while ga_i < 32 {
+    let _ = buf_write_byte(out_a, ga_i as u32, buf_read_byte(g_full, ga_i as u32));
+    ga_i = ga_i + 1;
+  }
+  let gb_i: i64 = 0;
+  while gb_i < 32 {
+    let _ = buf_write_byte(out_b, gb_i as u32, buf_read_byte(g_full, (32 + gb_i) as u32));
+    gb_i = gb_i + 1;
+  }
+  return 0;
+}
+
+fn mlkem_h(msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  return sha3_256_hash(msg, msg_len, out);
+}
+
+fn mlkem_j(msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  return shake256_squeeze(msg, msg_len, out, 32);
+}
+
+// K=2 (fixed for ML-KEM-512) matrix generation: A_hat[i][j] =
+// SampleNTT(XOF(rho, j, i)), matching FIPS 203's generate_matrix with
+// transpose=False -- both K-PKE KeyGen and Encrypt call it this same
+// way, with Encrypt applying the transpose at USE time (reading
+// A_hat[j][i] instead of A_hat[i][j]) rather than at generation time.
+fn mlkem_generate_matrix(rho: mut ref i64) -> i64 {
+  let gm_xof: mut ref i64 = mlkem_xof_out_get();
+  let a00: mut ref i64 = mlkem_a00_get();
+  let a01: mut ref i64 = mlkem_a01_get();
+  let a10: mut ref i64 = mlkem_a10_get();
+  let a11: mut ref i64 = mlkem_a11_get();
+  let _ = mlkem_xof(rho, 0 as u32, 0 as u32, gm_xof);
+  let _ = mlkem_sample_ntt(gm_xof, a00);
+  let _ = mlkem_xof(rho, 1 as u32, 0 as u32, gm_xof);
+  let _ = mlkem_sample_ntt(gm_xof, a01);
+  let _ = mlkem_xof(rho, 0 as u32, 1 as u32, gm_xof);
+  let _ = mlkem_sample_ntt(gm_xof, a10);
+  let _ = mlkem_xof(rho, 1 as u32, 1 as u32, gm_xof);
+  let _ = mlkem_sample_ntt(gm_xof, a11);
+  return 0;
+}
+
+// FIPS 203 Algorithm 13 (K-PKE.KeyGen), K=2 explicitly unrolled.
+// out_ek: 800 bytes (t0||t1||rho). out_dk: dk_pke only, 768 bytes
+// (s_hat0||s_hat1) -- callers building a full ML-KEM dk pass a larger
+// buffer and this writes just its first 768 bytes.
+fn mlkem_k_pke_keygen(d: mut ref i64, out_ek: mut ref i64, out_dk: mut ref i64) -> i64 {
+  let kg_tmp: mut ref i64 = mlkem_tmp1_get();
+  let _ = mlkem_buf_copy(d, 0, kg_tmp, 0, 32);
+  let _ = buf_write_byte(kg_tmp, 32 as u32, 2 as u32);
+  let rho: mut ref i64 = mlkem_rho_get();
+  let sigma: mut ref i64 = mlkem_sigma_get();
+  let _ = mlkem_g(kg_tmp, 33, rho, sigma);
+
+  let _ = mlkem_generate_matrix(rho);
+  let a00: mut ref i64 = mlkem_a00_get();
+  let a01: mut ref i64 = mlkem_a01_get();
+  let a10: mut ref i64 = mlkem_a10_get();
+  let a11: mut ref i64 = mlkem_a11_get();
+
+  let prf_out: mut ref i64 = mlkem_prf_out_get();
+  let s0: mut ref i64 = mlkem_s0_get();
+  let s1: mut ref i64 = mlkem_s1_get();
+  let e0: mut ref i64 = mlkem_e0_get();
+  let e1: mut ref i64 = mlkem_e1_get();
+  let _ = mlkem_prf(3, sigma, 0 as u32, prf_out);
+  let _ = mlkem_sample_poly_cbd(prf_out, 3, s0);
+  let _ = mlkem_prf(3, sigma, 1 as u32, prf_out);
+  let _ = mlkem_sample_poly_cbd(prf_out, 3, s1);
+  let _ = mlkem_prf(3, sigma, 2 as u32, prf_out);
+  let _ = mlkem_sample_poly_cbd(prf_out, 3, e0);
+  let _ = mlkem_prf(3, sigma, 3 as u32, prf_out);
+  let _ = mlkem_sample_poly_cbd(prf_out, 3, e1);
+
+  let _ = mlkem_ntt(s0);
+  let _ = mlkem_ntt(s1);
+  let _ = mlkem_ntt(e0);
+  let _ = mlkem_ntt(e1);
+
+  let acc: mut ref i64 = mlkem_acc_get();
+  let w: mut ref i64 = mlkem_w_get();
+  let t0: mut ref i64 = mlkem_t0_get();
+  let t1: mut ref i64 = mlkem_t1_get();
+
+  let _ = mlkem_multiply_ntts(a00, s0, acc);
+  let _ = mlkem_multiply_ntts(a01, s1, w);
+  let _ = mlkem_poly_add(acc, w, acc);
+  let _ = mlkem_poly_add(acc, e0, t0);
+
+  let _ = mlkem_multiply_ntts(a10, s0, acc);
+  let _ = mlkem_multiply_ntts(a11, s1, w);
+  let _ = mlkem_poly_add(acc, w, acc);
+  let _ = mlkem_poly_add(acc, e1, t1);
+
+  let _ = mlkem_byte_encode(t0, 12, 3329 as u32, out_ek, 0);
+  let _ = mlkem_byte_encode(t1, 12, 3329 as u32, out_ek, 384);
+  let _ = mlkem_buf_copy(rho, 0, out_ek, 768, 32);
+  let _ = mlkem_byte_encode(s0, 12, 3329 as u32, out_dk, 0);
+  let _ = mlkem_byte_encode(s1, 12, 3329 as u32, out_dk, 384);
+  return 0;
+}
+
+// FIPS 203 Algorithm 14 (K-PKE.Encrypt), K=2 explicitly unrolled.
+// ek: 800 bytes. m, r_seed: 32 bytes each. out_c: 768 bytes (c1||c2).
+fn mlkem_k_pke_encrypt(ek: mut ref i64, m: mut ref i64, r_seed: mut ref i64, out_c: mut ref i64) -> i64 {
+  let t0: mut ref i64 = mlkem_t0_get();
+  let t1: mut ref i64 = mlkem_t1_get();
+  let rho: mut ref i64 = mlkem_rho_get();
+  let _ = mlkem_byte_decode(ek, 0, 12, 3329 as u32, t0);
+  let _ = mlkem_byte_decode(ek, 384, 12, 3329 as u32, t1);
+  let _ = mlkem_buf_copy(ek, 768, rho, 0, 32);
+
+  let _ = mlkem_generate_matrix(rho);
+  let a00: mut ref i64 = mlkem_a00_get();
+  let a01: mut ref i64 = mlkem_a01_get();
+  let a10: mut ref i64 = mlkem_a10_get();
+  let a11: mut ref i64 = mlkem_a11_get();
+
+  let prf_out: mut ref i64 = mlkem_prf_out_get();
+  let r0: mut ref i64 = mlkem_r0_get();
+  let r1: mut ref i64 = mlkem_r1_get();
+  let ee1_0: mut ref i64 = mlkem_enc_e1_0_get();
+  let ee1_1: mut ref i64 = mlkem_enc_e1_1_get();
+  let e2: mut ref i64 = mlkem_e2_get();
+  let _ = mlkem_prf(3, r_seed, 0 as u32, prf_out);
+  let _ = mlkem_sample_poly_cbd(prf_out, 3, r0);
+  let _ = mlkem_prf(3, r_seed, 1 as u32, prf_out);
+  let _ = mlkem_sample_poly_cbd(prf_out, 3, r1);
+  let _ = mlkem_prf(2, r_seed, 2 as u32, prf_out);
+  let _ = mlkem_sample_poly_cbd(prf_out, 2, ee1_0);
+  let _ = mlkem_prf(2, r_seed, 3 as u32, prf_out);
+  let _ = mlkem_sample_poly_cbd(prf_out, 2, ee1_1);
+  let _ = mlkem_prf(2, r_seed, 4 as u32, prf_out);
+  let _ = mlkem_sample_poly_cbd(prf_out, 2, e2);
+
+  let _ = mlkem_ntt(r0);
+  let _ = mlkem_ntt(r1);
+
+  let acc: mut ref i64 = mlkem_acc_get();
+  let w: mut ref i64 = mlkem_w_get();
+  let u0: mut ref i64 = mlkem_u0_get();
+  let u1: mut ref i64 = mlkem_u1_get();
+
+  let _ = mlkem_multiply_ntts(a00, r0, acc);
+  let _ = mlkem_multiply_ntts(a10, r1, w);
+  let _ = mlkem_poly_add(acc, w, acc);
+  let _ = mlkem_ntt_inv(acc);
+  let _ = mlkem_poly_add(acc, ee1_0, u0);
+
+  let _ = mlkem_multiply_ntts(a01, r0, acc);
+  let _ = mlkem_multiply_ntts(a11, r1, w);
+  let _ = mlkem_poly_add(acc, w, acc);
+  let _ = mlkem_ntt_inv(acc);
+  let _ = mlkem_poly_add(acc, ee1_1, u1);
+
+  let mu: mut ref i64 = mlkem_mu_get();
+  let _ = mlkem_msg_to_poly(m, mu);
+
+  let _ = mlkem_multiply_ntts(t0, r0, acc);
+  let _ = mlkem_multiply_ntts(t1, r1, w);
+  let _ = mlkem_poly_add(acc, w, acc);
+  let _ = mlkem_ntt_inv(acc);
+  let _ = mlkem_poly_add(acc, e2, acc);
+  let v: mut ref i64 = mlkem_v_get();
+  let _ = mlkem_poly_add(acc, mu, v);
+
+  let _ = mlkem_compress_poly(u0, 10, w);
+  let _ = mlkem_byte_encode(w, 10, 1024 as u32, out_c, 0);
+  let _ = mlkem_compress_poly(u1, 10, w);
+  let _ = mlkem_byte_encode(w, 10, 1024 as u32, out_c, 320);
+  let _ = mlkem_compress_poly(v, 4, w);
+  let _ = mlkem_byte_encode(w, 4, 16 as u32, out_c, 640);
+  return 0;
+}
+
+// FIPS 203 Algorithm 15 (K-PKE.Decrypt), K=2 explicitly unrolled.
+// dk: 768 bytes (dk_pke, or the first 768 bytes of a full ML-KEM dk).
+// c: 768 bytes. out_m: 32 bytes.
+fn mlkem_k_pke_decrypt(dk: mut ref i64, c: mut ref i64, out_m: mut ref i64) -> i64 {
+  let u0: mut ref i64 = mlkem_u0_get();
+  let u1: mut ref i64 = mlkem_u1_get();
+  let v: mut ref i64 = mlkem_v_get();
+  let w: mut ref i64 = mlkem_w_get();
+
+  let _ = mlkem_byte_decode(c, 0, 10, 1024 as u32, w);
+  let _ = mlkem_decompress_poly(w, 10, u0);
+  let _ = mlkem_byte_decode(c, 320, 10, 1024 as u32, w);
+  let _ = mlkem_decompress_poly(w, 10, u1);
+  let _ = mlkem_byte_decode(c, 640, 4, 16 as u32, w);
+  let _ = mlkem_decompress_poly(w, 4, v);
+
+  let s0: mut ref i64 = mlkem_s0_get();
+  let s1: mut ref i64 = mlkem_s1_get();
+  let _ = mlkem_byte_decode(dk, 0, 12, 3329 as u32, s0);
+  let _ = mlkem_byte_decode(dk, 384, 12, 3329 as u32, s1);
+
+  let _ = mlkem_ntt(u0);
+  let _ = mlkem_ntt(u1);
+
+  let acc: mut ref i64 = mlkem_acc_get();
+  let wacc: mut ref i64 = mlkem_e2_get();
+  let _ = mlkem_multiply_ntts(s0, u0, acc);
+  let _ = mlkem_multiply_ntts(s1, u1, wacc);
+  let _ = mlkem_poly_add(acc, wacc, acc);
+  let _ = mlkem_ntt_inv(acc);
+
+  let wfinal: mut ref i64 = mlkem_enc_e1_0_get();
+  let _ = mlkem_poly_sub(v, acc, wfinal);
+  let _ = mlkem_poly_to_msg(wfinal, out_m);
+  return 0;
+}
+
+// FIPS 203 Algorithm 16 (ML-KEM.KeyGen_internal). d, z: 32 bytes each.
+// out_ek: 800 bytes. out_dk: 1632 bytes (dk_pke||ek_pke||H(ek)||z).
+fn mlkem_keygen_internal(d: mut ref i64, z: mut ref i64, out_ek: mut ref i64, out_dk: mut ref i64) -> i64 {
+  let _ = mlkem_k_pke_keygen(d, out_ek, out_dk);
+  let h: mut ref i64 = mlkem_h_buf_get();
+  let _ = mlkem_h(out_ek, 800, h);
+  let _ = mlkem_buf_copy(out_ek, 0, out_dk, 768, 800);
+  let _ = mlkem_buf_copy(h, 0, out_dk, 1568, 32);
+  let _ = mlkem_buf_copy(z, 0, out_dk, 1600, 32);
+  return 0;
+}
+
+// FIPS 203 Algorithm 17 (ML-KEM.Encaps_internal). ek: 800 bytes.
+// m: 32 bytes. out_K: 32 bytes. out_c: 768 bytes.
+fn mlkem_encaps_internal(ek: mut ref i64, m: mut ref i64, out_k: mut ref i64, out_c: mut ref i64) -> i64 {
+  let h: mut ref i64 = mlkem_h_buf_get();
+  let _ = mlkem_h(ek, 800, h);
+  let cat: mut ref i64 = mlkem_tmp1_get();
+  let _ = mlkem_buf_copy(m, 0, cat, 0, 32);
+  let _ = mlkem_buf_copy(h, 0, cat, 32, 32);
+  let r: mut ref i64 = mlkem_rprime_buf_get();
+  let _ = mlkem_g(cat, 64, out_k, r);
+  let _ = mlkem_k_pke_encrypt(ek, m, r, out_c);
+  return 0;
+}
+
+// FIPS 203 Algorithm 18 (ML-KEM.Decaps_internal), including the
+// implicit-rejection substitution that resists chosen-ciphertext
+// attacks: on any ciphertext re-encryption mismatch, the returned key
+// is K_bar = J(z||c) instead of the (attacker-influenced) decrypted
+// key. dk: 1632 bytes. c: 768 bytes. out_K: 32 bytes.
+fn mlkem_decaps_internal(dk: mut ref i64, c: mut ref i64, out_k: mut ref i64) -> i64 {
+  let h: mut ref i64 = mlkem_h_buf_get();
+  let _ = mlkem_buf_copy(dk, 1568, h, 0, 32);
+  let z: mut ref i64 = mlkem_z_buf_get();
+  let _ = mlkem_buf_copy(dk, 1600, z, 0, 32);
+
+  let m_prime: mut ref i64 = mlkem_mprime_buf_get();
+  let _ = mlkem_k_pke_decrypt(dk, c, m_prime);
+
+  let cat1: mut ref i64 = mlkem_tmp1_get();
+  let _ = mlkem_buf_copy(m_prime, 0, cat1, 0, 32);
+  let _ = mlkem_buf_copy(h, 0, cat1, 32, 32);
+  let k_prime: mut ref i64 = mlkem_kprime_buf_get();
+  let r_prime: mut ref i64 = mlkem_rprime_buf_get();
+  let _ = mlkem_g(cat1, 64, k_prime, r_prime);
+
+  let cat2: mut ref i64 = mlkem_tmp1_get();
+  let _ = mlkem_buf_copy(z, 0, cat2, 0, 32);
+  let _ = mlkem_buf_copy(c, 0, cat2, 32, 768);
+  let k_bar: mut ref i64 = mlkem_kbar_buf_get();
+  let _ = mlkem_j(cat2, 800, k_bar);
+
+  let ek_pke: mut ref i64 = mlkem_ekpke_buf_get();
+  let _ = mlkem_buf_copy(dk, 768, ek_pke, 0, 800);
+  let c_prime: mut ref i64 = mlkem_cprime_buf_get();
+  let _ = mlkem_k_pke_encrypt(ek_pke, m_prime, r_prime, c_prime);
+
+  let eq: i64 = keccak_bytes_equal(c, c_prime, 768);
+  if eq == 1 {
+    let _ = mlkem_buf_copy(k_prime, 0, out_k, 0, 32);
+  } else {
+    let _ = mlkem_buf_copy(k_bar, 0, out_k, 0, 32);
+  }
+  return 0;
+}
+
+// Round-trip self-test: deterministic seed bytes (no external RNG in
+// this environment), keygen -> encaps -> decaps, assert the
+// decapsulated key matches the encapsulated one. This is an internal
+// consistency check for the ARM-compiled code (catches buffer sizing,
+// aliasing, and off-by-one bugs); the algorithm's byte-exact match
+// against FIPS 203 / kyber-py is separately verified in
+// test/host_harness against a real known-answer vector.
+fn mlkem_self_test() -> i64 {
+  let _ = mlkem_init();
+
+  let d: mut ref i64 = dhruva_alloc_bytes(32);
+  let z: mut ref i64 = dhruva_alloc_bytes(32);
+  let m: mut ref i64 = dhruva_alloc_bytes(32);
+  let seed_i: i64 = 0;
+  while seed_i < 32 {
+    let _ = buf_write_byte(d, seed_i as u32, (seed_i * 7 + 1) as u32);
+    let _ = buf_write_byte(z, seed_i as u32, (seed_i * 11 + 3) as u32);
+    let _ = buf_write_byte(m, seed_i as u32, (seed_i * 13 + 5) as u32);
+    seed_i = seed_i + 1;
+  }
+
+  let ek: mut ref i64 = dhruva_alloc_bytes(800);
+  let dk: mut ref i64 = dhruva_alloc_bytes(1632);
+  let _ = mlkem_keygen_internal(d, z, ek, dk);
+
+  let k1: mut ref i64 = dhruva_alloc_bytes(32);
+  let c: mut ref i64 = dhruva_alloc_bytes(768);
+  let _ = mlkem_encaps_internal(ek, m, k1, c);
+
+  let k2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = mlkem_decaps_internal(dk, c, k2);
+
+  let ok: i64 = keccak_bytes_equal(k1, k2, 32);
+  let _ = uart_puts("CRYPTO: ML-KEM-512 (FIPS 203) round-trip self-test");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return ok;
+}
+
 fn pki_self_test() -> i64 {
   let ok: i64 = 1;
   let _ = pki_init();
@@ -23271,6 +24257,44 @@ fn kernel_main() -> i64 {
   let _ = keccak_init();
   let _ = pki_init();
   let _ = ed25519_init();
+  let _ = mlkem_zetas_set(dhruva_alloc_bytes(512));
+  let _ = mlkem_gammas_set(dhruva_alloc_bytes(512));
+  let _ = mlkem_a00_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_a01_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_a10_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_a11_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_s0_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_s1_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_e0_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_e1_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_t0_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_t1_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_r0_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_r1_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_enc_e1_0_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_enc_e1_1_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_u0_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_u1_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_v_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_mu_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_w_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_e2_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_acc_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_tmp1_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_tmp2_set(dhruva_alloc_bytes(1024));
+  let _ = mlkem_rho_set(dhruva_alloc_bytes(32));
+  let _ = mlkem_sigma_set(dhruva_alloc_bytes(32));
+  let _ = mlkem_prf_out_set(dhruva_alloc_bytes(192));
+  let _ = mlkem_xof_out_set(dhruva_alloc_bytes(840));
+  let _ = mlkem_h_buf_set(dhruva_alloc_bytes(32));
+  let _ = mlkem_z_buf_set(dhruva_alloc_bytes(32));
+  let _ = mlkem_mprime_buf_set(dhruva_alloc_bytes(32));
+  let _ = mlkem_kprime_buf_set(dhruva_alloc_bytes(32));
+  let _ = mlkem_rprime_buf_set(dhruva_alloc_bytes(32));
+  let _ = mlkem_kbar_buf_set(dhruva_alloc_bytes(32));
+  let _ = mlkem_ekpke_buf_set(dhruva_alloc_bytes(800));
+  let _ = mlkem_cprime_buf_set(dhruva_alloc_bytes(768));
+  let _ = mlkem_init();
   let _ = sha512_k_init(sha512_k_scratch_get());
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
   let _ = x25519_x1_set(dhruva_alloc_bytes(32));
@@ -23554,6 +24578,7 @@ fn kernel_main() -> i64 {
   let _ = aes128_self_test();
   let _ = aead_hkdf_self_test();
   let _ = keccak_self_test();
+  let _ = mlkem_self_test();
 
   // Media (at-rest) encryption for DharaFS, layered on the ChaCha20
   // cipher above. Key derivation runs once here, single-threaded,
