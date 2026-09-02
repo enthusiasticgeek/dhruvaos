@@ -252,6 +252,35 @@ extern "C" fn context_switch_count_get() -> i64;
 extern "C" fn prio_lock_count_get() -> i64;
 extern "C" fn irq_count_increment() -> i64;
 extern "C" fn irq_count_get() -> i64;
+// Round 66: the ring-buffer half of this section's own "not yet
+// started" note -- see boot/diag_ring_state.S's own header comment for
+// why it samples the counters above once per tick instead of pushing
+// at each individual increment site (that would mean touching
+// context_switch.S's own scheduler_pick_next/dhruva_prio_lock, exactly
+// the fragile hand-written-asm area this project has already taken two
+// real, hard-to-diagnose bugs from).
+extern "C" fn diag_ring_push(tick: u32, ctxsw: u32, irqs: u32, priolock: u32) -> i64;
+extern "C" fn diag_ring_get_head() -> i64;
+extern "C" fn diag_ring_get_count() -> i64;
+extern "C" fn diag_ring_get_tick_at(physical_index: i64) -> i64;
+extern "C" fn diag_ring_get_ctxsw_at(physical_index: i64) -> i64;
+extern "C" fn diag_ring_get_irqs_at(physical_index: i64) -> i64;
+extern "C" fn diag_ring_get_priolock_at(physical_index: i64) -> i64;
+
+// Translates a LOGICAL sample index (0 = oldest available, count-1 =
+// newest) into the PHYSICAL array slot diag_ring_get_*_at needs --
+// deliberately done here in vani rather than in diag_ring_state.S
+// itself (see that file's own header comment): before the ring has
+// filled (count < 32), the oldest sample is always physical slot 0;
+// once full, the oldest sample is wherever `head` currently points
+// (about to be overwritten by the next push), and physical slots wrap
+// modulo 32 from there.
+fn diag_ring_physical_index(logical_index: i64) -> i64 {
+  let count: i64 = diag_ring_get_count();
+  let head: i64 = diag_ring_get_head();
+  let start: i64 = if count < 32 { 0 } else { head };
+  return (start + logical_index) % 32;
+}
 // Round 59: priority-inversion instrumentation, the "remaining, not
 // done" note on round 55's real blocking mutex. mutex_contention_count
 // counts genuine blocks (not every lock call); mutex_wait_worst_ticks
@@ -4135,6 +4164,26 @@ fn irq_dispatch() -> i64 {
     // level-triggered condition; this just clears any stale raw
     // status defensively, same pattern as the timer branch above.
     let _ = mmio_write_u32(uart_icr, 0x10 as u32);
+  }
+
+  // Round 66: sample the running counters into the history ring buffer
+  // once per REAL tick only (not every UART RX interrupt) -- ties
+  // "last N seconds" semantics to wall-clock ticks, not arbitrary IRQ
+  // frequency, and keeps this at the same ~500ms granularity as every
+  // other tick-driven thing in this project (the governor, sleep_
+  // until_table). scheduler_get_tick_count() is read fresh here rather
+  // than reusing anything already in scope -- this project's own tick
+  // advance happens in scheduler_switch_from_irq, called by our OWN
+  // caller (irq_entry.S) AFTER irq_dispatch returns, so the value at
+  // this exact point is still last tick's count, one behind what this
+  // sample will actually represent by the time anything reads it back.
+  // Not a bug worth chasing: the counters sampled alongside it
+  // (context_switch/irq/prio_lock) are already exactly "as of now,"
+  // and being one tick's worth of x-axis label behind them is a
+  // cosmetic granularity question, not a correctness one, for a
+  // "roughly what was activity like recently" query.
+  if was_timer_tick == 1 {
+    let _ = diag_ring_push(scheduler_get_tick_count(), context_switch_count_get() as u32, irq_count_get() as u32, prio_lock_count_get() as u32);
   }
   return was_timer_tick;
 }
@@ -13732,6 +13781,32 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("  mutex worst-case wait: ");
     let _ = uart_put_i64(mutex_wait_worst_ticks_get());
     let _ = uart_puts(" ticks\n");
+
+    // Round 66: recent history, oldest to newest -- one sample per
+    // real tick, up to the last 32 (~16 seconds at the 500ms tick
+    // period), answering "what was activity like recently" rather
+    // than just the running totals above. See diag_ring_state.S's own
+    // header comment for the full design (why this samples the
+    // existing counters instead of instrumenting their increment
+    // sites directly).
+    let hist_count: i64 = diag_ring_get_count();
+    let _ = uart_puts("  recent history (");
+    let _ = uart_put_i64(hist_count);
+    let _ = uart_puts(" of last 32 ticks, oldest first): tick/ctxsw/irqs/priolock\n");
+    let hi: i64 = 0;
+    while hi < hist_count {
+      let phys: i64 = diag_ring_physical_index(hi);
+      let _ = uart_puts("    ");
+      let _ = uart_put_i64(diag_ring_get_tick_at(phys));
+      let _ = uart_puts("/");
+      let _ = uart_put_i64(diag_ring_get_ctxsw_at(phys));
+      let _ = uart_puts("/");
+      let _ = uart_put_i64(diag_ring_get_irqs_at(phys));
+      let _ = uart_puts("/");
+      let _ = uart_put_i64(diag_ring_get_priolock_at(phys));
+      let _ = uart_puts("\n");
+      hi = hi + 1;
+    }
     return 0;
   }
 

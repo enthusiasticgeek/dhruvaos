@@ -1933,8 +1933,8 @@ ones.
   ring buffer of recent events, not yet started) and "Per-task runtime
   histograms" for what's deliberately still skipped and why.
 
-- **Self-observing kernel: event counters** — `[M, ~2 rounds — counters
-  DONE, round 53; ring buffer not started]`
+- **Self-observing kernel: event counters** — `[DONE — counters round
+  53, ring buffer round 66, 2026-09-01]`
   `context_switch_count` (scheduler_pick_next picked a genuinely
   DIFFERENT task — `boot/context_switch.S`), `irq_count` (every real
   IRQ, timer + UART RX — `kernel_main.vani`'s `irq_dispatch`), and
@@ -1956,11 +1956,46 @@ ones.
   `feedback_aapcs_callee_saved_registers_asm` — worth reading before
   touching `boot/context_switch.S`/`boot/irq_entry.S` again.
 
-  A fixed-size ring buffer of recent events (for "last N seconds"
-  queries, not just running totals) is a real, separable next step —
-  not started. Needs a concrete decision on retention size and
-  overhead budget (this project has no "instrumentation must cost
-  < X% CPU" target set yet) before writing it.
+  **Round 66: the ring buffer, the one genuinely separate remaining
+  piece, is now built.** Deliberately does NOT touch `boot/context_
+  switch.S` at all (`scheduler_pick_next`/`dhruva_prio_lock`, where
+  `context_switch_count`/`prio_lock_count` actually increment) — the
+  exact fragile hand-written-asm scheduler/interrupt path this project
+  has already taken two real, hard-to-diagnose bugs from (this same
+  AAPCS bug class above, and separately the round-65 task_f corruption
+  bug). Instead, a new `boot/diag_ring_state.S` samples the EXISTING
+  counters (via their own already-correct `*_get()` accessors) once
+  per REAL timer tick from `irq_dispatch` — already vani-level code
+  that already runs every tick, zero new touches to the fragile area.
+  Concrete answers to this entry's own "needs a decision" blocker: 32
+  slots (~16 seconds of history at the 500ms tick period), 512 bytes
+  of static `.bss` (four parallel u32 arrays), one sample per tick
+  (not per individual event) — negligible overhead, no numeric budget
+  needed since the cost is a handful of instructions once every
+  500ms. `diag_ring_push` takes four plain `u32` arguments
+  (specifically not `i64`, to keep every argument in exactly one AAPCS
+  register with no 64-bit pairing to get wrong) and explicitly saves/
+  restores the r4/r5 it uses as scratch — the exact fix for the bug
+  class this entry's own text warns about, applied directly this time
+  rather than just cited. `diagnose` now prints the ring's contents
+  (oldest to newest, tick/ctxsw/irqs/priolock per line) after its
+  existing running-total counters.
+
+  Verified live over QEMU in both boundary cases the wraparound math
+  actually needs to get right: under 32 ticks since boot (unwrapped,
+  oldest sample always physical slot 0) and past 32 ticks (wrapped,
+  oldest sample at wherever `head` currently points) — both produced
+  exactly the expected monotonically-increasing tick numbers and
+  non-decreasing counter values, capped at 32 rows once wrapped, never
+  exceeding it. Not host-harness tested: `diag_ring_state.S` is hand-
+  written ARM assembly like `netif_state.S`'s own accessors, which
+  also have no host-harness coverage for the same structural reason
+  (native x86 can't run ARM asm, and `context_switch_count_get`/
+  `irq_count_get` are only ever dummy-stubbed to 0 in `host_stubs.c`
+  precisely because scheduler/interrupt timing is meaningless on a
+  host that never takes a real interrupt) — the live QEMU verification
+  above is the real evidence here, not a gap. Full regression battery
+  green: `qemu_run.py`, `phase4_milestone.py` 14/14.
 
 - **Per-task runtime histograms + a real deadline/budget model** —
   `[M-L, ~3-4 rounds combined — SKIPPED FOR NOW, 2026-08-31, genuinely
