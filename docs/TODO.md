@@ -1987,15 +1987,32 @@ ones.
   oldest sample at wherever `head` currently points) — both produced
   exactly the expected monotonically-increasing tick numbers and
   non-decreasing counter values, capped at 32 rows once wrapped, never
-  exceeding it. Not host-harness tested: `diag_ring_state.S` is hand-
-  written ARM assembly like `netif_state.S`'s own accessors, which
-  also have no host-harness coverage for the same structural reason
-  (native x86 can't run ARM asm, and `context_switch_count_get`/
-  `irq_count_get` are only ever dummy-stubbed to 0 in `host_stubs.c`
-  precisely because scheduler/interrupt timing is meaningless on a
-  host that never takes a real interrupt) — the live QEMU verification
-  above is the real evidence here, not a gap. Full regression battery
-  green: `qemu_run.py`, `phase4_milestone.py` 14/14.
+  exceeding it.
+
+  **Correction, same day**: this entry originally claimed the ring
+  buffer couldn't be host-harness tested (hand-written ARM assembly,
+  native x86 can't run it) — true of `diag_ring_state.S` itself, but
+  wrong as a reason to skip coverage: `host_stubs.c` already has a
+  precedent for exactly this (`netif_get_head`/etc, genuinely stateful
+  native C reimplementations, not dummy stubs) that was overlooked at
+  first. Also caught a REAL bug this way: the original commit broke
+  `test/host_harness/build_and_run.sh` outright (a linker error,
+  `irq_dispatch` now unconditionally calling `diag_ring_push` with no
+  native implementation anywhere) — not caught at the time because
+  host_harness wasn't re-run after that specific change. Fixed by
+  adding a genuine stateful stub (`host_stubs.c`) mirroring the asm's
+  own ring/wraparound logic exactly, plus a dedicated test covering
+  both the unwrapped and wrapped cases instantly and repeatably instead
+  of only via a ~25-real-second live QEMU wait. Full regression battery
+  green: `qemu_run.py`, `phase4_milestone.py` 14/14, `host_harness`
+  (463/463 PASS under ASAN/UBSAN, up from the broken build).
+
+  **Lesson, worth remembering**: after ANY change touching a function
+  a hand-written `.S` file's own code calls (`irq_dispatch` here), run
+  `host_harness`'s own build, not just the QEMU regression battery —
+  the vani-generated C side links against real symbols and a missing
+  one is a hard build failure, not a subtle runtime issue that might
+  go unnoticed.
 
 - **Per-task runtime histograms + a real deadline/budget model** —
   `[M-L, ~3-4 rounds combined — SKIPPED FOR NOW, 2026-08-31, genuinely
@@ -2337,10 +2354,13 @@ support of any kind.
   heap, 139488 bytes free after boot, comfortably unaffected).
 
 - **BLE via USB dongle (Pi 1): HCI transport (DONE, round 57,
-  spec-only) + GATT/ATT/L2CAP (not started)** — `[L, several rounds —
-  the HCI transport itself is done; a full usable BLE stack on top is
-  its own multi-round effort, comparable to this project's existing
-  TCP/IP stack]`
+  spec-only) + connection establishment/ACL/L2CAP/core ATT (DONE,
+  round 66, spec-only) + GATT discovery (not started)** — `[L, several
+  rounds — a full usable BLE stack is a multi-round effort, comparable
+  to this project's existing TCP/IP stack; this round closed the
+  connection-establishment gap and built L2CAP + core ATT operations,
+  GATT's own discovery procedures are the next genuinely separate
+  increment]`
   USB Bluetooth HCI is an OFFICIAL, STANDARDIZED USB class (interface
   class `0xE0`/subclass `0x01`/protocol `0x01`) — `dwc2_fetch_and_
   set_configuration`'s descriptor walk detects it exactly like mass
@@ -2362,12 +2382,45 @@ support of any kind.
   event in response to anything it sends, pending real Pi 1B
   hardware-in-loop testing with an actual USB Bluetooth dongle
   attached — same honesty bar as the LAN9512 NIC backend.
-  **Remaining, not started**: L2CAP, ATT, and GATT (the actual protocol
-  layers an application uses to scan/connect/read/write BLE
-  characteristics) are a SEPARATE stack sitting above HCI, comparable
-  in scope to this project's own ARP/IPv4/TCP/UDP/ICMP stack — expect
-  a similar number of rounds to reach the same maturity level
-  `tcpecho`/`udpecho` represent for TCP/IP today.
+  **Round 66 (2026-09-01) — connection establishment + ACL/L2CAP/core
+  ATT built.** Scanning alone (round 57) never yields a connection
+  handle, and L2CAP/ATT/GATT all run over an established connection's
+  ACL data channel — a genuinely missing prerequisite this round found
+  and closed, not just "L2CAP itself." Added: `hci_build_le_create_
+  connection_command` (§7.8.12) + Command Status (§7.7.15, the async
+  "accepted, working on it" ack LE_Create_Connection answers with,
+  unlike this driver's other, synchronous commands) + LE Meta Event/LE
+  Connection Complete (§7.7.65/.1) parsing, to actually get a
+  connection handle; HCI ACL Data packet framing (§5.4.2, build/parse
+  the `[Handle:12|PB:2|BC:2][Length]` envelope every L2CAP packet
+  travels in — the raw bulk OUT/IN transport itself, `dwc2_bt_bulk_
+  out/in`, was ALREADY built round 57, just never used); L2CAP B-frame
+  framing (§3.1, Vol 3 Part A) with the LE ATT fixed channel ID
+  (0x0004); and ATT's own core operations (Vol 3 Part F) — Error
+  Response, Exchange MTU Request/Response, Read Request/Response,
+  Write Request/Response — enough for a real "connect, negotiate MTU,
+  read/write one already-known attribute handle" interaction end to
+  end. Also added `buf_write/read_u16_le` (every one of these layers
+  is little-endian throughout, and needed far more 16-bit fields than
+  the existing byte-at-a-time HCI command builders ever justified a
+  dedicated helper for individually).
+
+  **Deliberately NOT included**: GATT's own discovery procedures (Find
+  Information, Read By Type/Group Type — the operations that actually
+  enumerate services/characteristics rather than accessing a handle
+  already known ahead of time) are a genuinely separate, larger
+  increment, this project's own "don't build past what's actually
+  needed yet" discipline applied here too.
+
+  Same honesty bar as round 57's own HCI transport work and the
+  LAN9512 NIC backend: **NOT live-verified** (QEMU's `usb-bt-dongle`
+  was removed in 2018, same blocker round 57 already documented) —
+  written to spec and verified via 65 new host-harness tests (opcode/
+  length/field-round-trip checks for every PDU/event type built this
+  round, including a max-12-bit-handle boundary check on the ACL
+  header proving flags don't bleed into the handle field or vice
+  versa), pending real Pi 1B hardware-in-loop testing with an actual
+  BLE central/peripheral to talk to.
 
 - **WiFi via USB dongle (Pi 1): enumeration + vendor register I/O
   (DONE, round 58) + everything else (not started, and structurally

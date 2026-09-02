@@ -119,6 +119,59 @@ uint32_t fn_hci_event_param_len(int64_t *event_buf);
 uint32_t fn_hci_event_is_command_complete(int64_t *event_buf);
 uint32_t fn_hci_cmd_complete_opcode(int64_t *event_buf);
 uint32_t fn_hci_cmd_complete_status(int64_t *event_buf);
+int64_t fn_hci_build_le_create_connection_command(int64_t *out_buf, uint32_t scan_interval, uint32_t scan_window, uint32_t filter_policy, uint32_t peer_addr_type, int64_t *peer_addr, uint32_t own_addr_type, uint32_t conn_interval_min, uint32_t conn_interval_max, uint32_t conn_latency, uint32_t supervision_timeout);
+uint32_t fn_hci_event_is_command_status(int64_t *event_buf);
+uint32_t fn_hci_cmd_status_status(int64_t *event_buf);
+uint32_t fn_hci_cmd_status_opcode(int64_t *event_buf);
+uint32_t fn_hci_event_is_le_meta(int64_t *event_buf);
+uint32_t fn_hci_le_meta_subevent_code(int64_t *event_buf);
+uint32_t fn_hci_le_conn_complete_status(int64_t *event_buf);
+uint32_t fn_hci_le_conn_complete_handle(int64_t *event_buf);
+uint32_t fn_hci_le_conn_complete_role(int64_t *event_buf);
+uint32_t fn_hci_le_conn_complete_peer_addr_type(int64_t *event_buf);
+int64_t fn_hci_le_conn_complete_peer_addr(int64_t *event_buf, int64_t *out_addr);
+uint32_t fn_hci_acl_pb_flag_first(void);
+uint32_t fn_hci_acl_bc_flag_point_to_point(void);
+int64_t fn_hci_acl_build_header(int64_t *out_buf, uint32_t handle, uint32_t pb_flag, uint32_t bc_flag, uint32_t data_len);
+uint32_t fn_hci_acl_get_handle(int64_t *buf);
+uint32_t fn_hci_acl_get_pb_flag(int64_t *buf);
+uint32_t fn_hci_acl_get_data_len(int64_t *buf);
+uint32_t fn_l2cap_att_channel_id(void);
+uint32_t fn_l2cap_signaling_channel_id(void);
+int64_t fn_l2cap_build_header(int64_t *out_buf, uint32_t length, uint32_t channel_id);
+uint32_t fn_l2cap_get_length(int64_t *buf);
+uint32_t fn_l2cap_get_channel_id(int64_t *buf);
+uint32_t fn_att_opcode_error_response(void);
+uint32_t fn_att_opcode_exchange_mtu_request(void);
+uint32_t fn_att_opcode_exchange_mtu_response(void);
+uint32_t fn_att_opcode_read_request(void);
+uint32_t fn_att_opcode_read_response(void);
+uint32_t fn_att_opcode_write_request(void);
+uint32_t fn_att_opcode_write_response(void);
+uint32_t fn_att_get_opcode(int64_t *buf);
+int64_t fn_att_build_error_response(int64_t *out_buf, uint32_t request_opcode, uint32_t handle, uint32_t error_code);
+uint32_t fn_att_error_request_opcode(int64_t *buf);
+uint32_t fn_att_error_handle(int64_t *buf);
+uint32_t fn_att_error_code(int64_t *buf);
+int64_t fn_att_build_exchange_mtu_request(int64_t *out_buf, uint32_t client_rx_mtu);
+uint32_t fn_att_exchange_mtu_request_get_mtu(int64_t *buf);
+int64_t fn_att_build_exchange_mtu_response(int64_t *out_buf, uint32_t server_rx_mtu);
+uint32_t fn_att_exchange_mtu_response_get_mtu(int64_t *buf);
+int64_t fn_att_build_read_request(int64_t *out_buf, uint32_t handle);
+uint32_t fn_att_read_request_get_handle(int64_t *buf);
+int64_t fn_att_build_read_response(int64_t *out_buf, int64_t *value, int64_t value_len);
+int64_t fn_att_read_response_get_value(int64_t *buf, int64_t pdu_len, int64_t *out_value);
+int64_t fn_att_build_write_request(int64_t *out_buf, uint32_t handle, int64_t *value, int64_t value_len);
+uint32_t fn_att_write_request_get_handle(int64_t *buf);
+int64_t fn_att_write_request_get_value(int64_t *buf, int64_t pdu_len, int64_t *out_value);
+int64_t fn_att_build_write_response(int64_t *out_buf);
+int64_t fn_buf_write_u16_le(int64_t *buf, int64_t offset, uint32_t value);
+uint32_t fn_buf_read_u16_le(int64_t *buf, int64_t offset);
+int64_t diag_ring_push(uint32_t tick, uint32_t ctxsw, uint32_t irqs, uint32_t priolock);
+int64_t diag_ring_get_head(void);
+int64_t diag_ring_get_count(void);
+int64_t diag_ring_get_tick_at(int64_t i);
+int64_t fn_diag_ring_physical_index(int64_t logical_index);
 int64_t fn_dwc2_build_rtl_reg_read_setup(uint32_t reg_addr, uint32_t want_len);
 int64_t fn_dwc2_build_rtl_reg_write_setup(uint32_t reg_addr, uint32_t data_len);
 int64_t *dwc2_dma_scratch_get(void);
@@ -1361,6 +1414,196 @@ static void test_hci_framing(void) {
     CHECK(fn_hci_cmd_complete_status(cc_event) == 0x00, "hci event: Command Complete status == success");
 }
 
+/* Round 66: connection establishment + HCI ACL/L2CAP/ATT framing --
+ * the layers above HCI transport docs/TODO.md's own BLE entry called
+ * "not started". */
+static void test_ble_connection_and_att(void) {
+    /* 16-bit LE helpers, added this round. */
+    int64_t *le16 = dhruva_alloc_bytes(2);
+    fn_buf_write_u16_le(le16, 0, 0xBEEF);
+    CHECK(buf_read_byte(le16, 0) == 0xEF, "u16_le: low byte first");
+    CHECK(buf_read_byte(le16, 1) == 0xBE, "u16_le: high byte second");
+    CHECK(fn_buf_read_u16_le(le16, 0) == 0xBEEF, "u16_le: round trip");
+
+    /* LE_Create_Connection: opcode 0x200D, 25 params. */
+    int64_t *peer_addr = mkbuf("\x01\x02\x03\x04\x05\x06", 6);
+    int64_t *cc_cmd = dhruva_alloc_bytes(28);
+    int64_t cc_cmd_len = fn_hci_build_le_create_connection_command(cc_cmd, 0x0010, 0x0010, 0x00, 0x00, peer_addr, 0x00, 0x0018, 0x0028, 0x0000, 0x01F4);
+    CHECK(cc_cmd_len == 28, "le_create_connection: total length == 3 (header) + 25 (params)");
+    CHECK(buf_read_byte(cc_cmd, 0) == 0x0D, "le_create_connection: opcode LE byte0");
+    CHECK(buf_read_byte(cc_cmd, 1) == 0x20, "le_create_connection: opcode LE byte1");
+    CHECK(buf_read_byte(cc_cmd, 2) == 25, "le_create_connection: param length == 25");
+    CHECK(buf_read_byte(cc_cmd, 9) == 0x01, "le_create_connection: peer_addr byte0 verbatim");
+    CHECK(buf_read_byte(cc_cmd, 14) == 0x06, "le_create_connection: peer_addr byte5 verbatim");
+    CHECK(fn_buf_read_u16_le(cc_cmd, 16) == 0x0018, "le_create_connection: conn_interval_min LE round trip");
+    CHECK(fn_buf_read_u16_le(cc_cmd, 22) == 0x01F4, "le_create_connection: supervision_timeout LE round trip");
+
+    /* Command Status (0x0F): [Status][Num_Packets][Opcode LE]. */
+    int64_t *cs_event = dhruva_alloc_bytes(6);
+    buf_write_byte(cs_event, 0, 0x0F);
+    buf_write_byte(cs_event, 1, 4);
+    buf_write_byte(cs_event, 2, 0x00); /* status = success */
+    buf_write_byte(cs_event, 3, 0x01);
+    buf_write_byte(cs_event, 4, 0x0D);
+    buf_write_byte(cs_event, 5, 0x20);
+    CHECK(fn_hci_event_is_command_status(cs_event) == 1, "command status: recognized");
+    CHECK(fn_hci_cmd_status_status(cs_event) == 0, "command status: status == success");
+    CHECK(fn_hci_cmd_status_opcode(cs_event) == 0x200D, "command status: opcode matches LE_Create_Connection");
+
+    /* LE Meta Event (0x3E) / LE Connection Complete (subevent 0x01):
+     * [Status][Handle LE][Role][Peer_Addr_Type][Peer_Addr(6)]
+     * [Conn_Interval LE][Conn_Latency LE][Supervision_Timeout LE]
+     * [Master_Clock_Accuracy]. */
+    int64_t *lcc_event = dhruva_alloc_bytes(3 + 19);
+    buf_write_byte(lcc_event, 0, 0x3E);
+    buf_write_byte(lcc_event, 1, 19);
+    buf_write_byte(lcc_event, 2, 0x01); /* subevent: connection complete */
+    buf_write_byte(lcc_event, 3, 0x00); /* status = success */
+    buf_write_byte(lcc_event, 4, 0x40); /* handle LE lo */
+    buf_write_byte(lcc_event, 5, 0x00); /* handle LE hi */
+    buf_write_byte(lcc_event, 6, 0x00); /* role = master */
+    buf_write_byte(lcc_event, 7, 0x00); /* peer addr type = public */
+    for (int i = 0; i < 6; i++) buf_write_byte(lcc_event, 8 + i, 0xA0 + i);
+    CHECK(fn_hci_event_is_le_meta(lcc_event) == 1, "le meta: recognized");
+    CHECK(fn_hci_le_meta_subevent_code(lcc_event) == 0x01, "le meta: subevent is connection complete");
+    CHECK(fn_hci_le_conn_complete_status(lcc_event) == 0, "conn complete: status == success");
+    CHECK(fn_hci_le_conn_complete_handle(lcc_event) == 0x0040, "conn complete: handle LE round trip");
+    CHECK(fn_hci_le_conn_complete_role(lcc_event) == 0, "conn complete: role == master");
+    CHECK(fn_hci_le_conn_complete_peer_addr_type(lcc_event) == 0, "conn complete: peer addr type == public");
+    int64_t *peer_out = dhruva_alloc_bytes(6);
+    fn_hci_le_conn_complete_peer_addr(lcc_event, peer_out);
+    CHECK(buf_read_byte(peer_out, 0) == 0xA0, "conn complete: peer addr byte0");
+    CHECK(buf_read_byte(peer_out, 5) == 0xA5, "conn complete: peer addr byte5");
+
+    /* HCI ACL Data header: [Handle:12|PB:2|BC:2 LE][Data_Total_Len LE]. */
+    int64_t *acl_hdr = dhruva_alloc_bytes(4);
+    int64_t acl_hdr_len = fn_hci_acl_build_header(acl_hdr, 0x0040, fn_hci_acl_pb_flag_first(), fn_hci_acl_bc_flag_point_to_point(), 7);
+    CHECK(acl_hdr_len == 4, "acl header: length == 4");
+    CHECK(fn_hci_acl_get_handle(acl_hdr) == 0x0040, "acl header: handle round trip");
+    CHECK(fn_hci_acl_get_pb_flag(acl_hdr) == fn_hci_acl_pb_flag_first(), "acl header: pb_flag round trip");
+    CHECK(fn_hci_acl_get_data_len(acl_hdr) == 7, "acl header: data_len round trip");
+    /* Handle 0x0FFF is the max 12-bit value -- confirms flags don't leak
+     * into the handle field or vice versa. */
+    int64_t acl_hdr2_len = fn_hci_acl_build_header(acl_hdr, 0x0FFF, 0x1, 0x1, 0);
+    CHECK(acl_hdr2_len == 4, "acl header: max handle length == 4");
+    CHECK(fn_hci_acl_get_handle(acl_hdr) == 0x0FFF, "acl header: max handle (0xFFF) round trip, no bleed from flags");
+    CHECK(fn_hci_acl_get_pb_flag(acl_hdr) == 1, "acl header: pb_flag round trip with max handle");
+
+    /* L2CAP B-frame header: [Length LE][Channel_ID LE]. */
+    int64_t *l2cap_hdr = dhruva_alloc_bytes(4);
+    int64_t l2cap_hdr_len = fn_l2cap_build_header(l2cap_hdr, 3, fn_l2cap_att_channel_id());
+    CHECK(l2cap_hdr_len == 4, "l2cap header: length == 4");
+    CHECK(fn_l2cap_get_length(l2cap_hdr) == 3, "l2cap header: length field round trip");
+    CHECK(fn_l2cap_get_channel_id(l2cap_hdr) == 0x0004, "l2cap header: ATT channel ID (0x0004) round trip");
+    CHECK(fn_l2cap_signaling_channel_id() == 0x0005, "l2cap: signaling channel ID is 0x0005");
+
+    /* ATT opcodes match spec values directly. */
+    CHECK(fn_att_opcode_error_response() == 0x01, "att opcode: error response");
+    CHECK(fn_att_opcode_exchange_mtu_request() == 0x02, "att opcode: exchange mtu request");
+    CHECK(fn_att_opcode_exchange_mtu_response() == 0x03, "att opcode: exchange mtu response");
+    CHECK(fn_att_opcode_read_request() == 0x0A, "att opcode: read request");
+    CHECK(fn_att_opcode_read_response() == 0x0B, "att opcode: read response");
+    CHECK(fn_att_opcode_write_request() == 0x12, "att opcode: write request");
+    CHECK(fn_att_opcode_write_response() == 0x13, "att opcode: write response");
+
+    /* Error Response. */
+    int64_t *att_err = dhruva_alloc_bytes(5);
+    int64_t att_err_len = fn_att_build_error_response(att_err, fn_att_opcode_read_request(), 0x0012, 0x0A);
+    CHECK(att_err_len == 5, "att error: length == 5");
+    CHECK(fn_att_get_opcode(att_err) == fn_att_opcode_error_response(), "att error: opcode");
+    CHECK(fn_att_error_request_opcode(att_err) == fn_att_opcode_read_request(), "att error: request_opcode_in_error");
+    CHECK(fn_att_error_handle(att_err) == 0x0012, "att error: handle_in_error");
+    CHECK(fn_att_error_code(att_err) == 0x0A, "att error: error_code (0x0A == Attribute Not Found)");
+
+    /* Exchange MTU request/response. */
+    int64_t *mtu_req = dhruva_alloc_bytes(3);
+    int64_t mtu_req_len = fn_att_build_exchange_mtu_request(mtu_req, 185);
+    CHECK(mtu_req_len == 3, "att mtu req: length == 3");
+    CHECK(fn_att_get_opcode(mtu_req) == fn_att_opcode_exchange_mtu_request(), "att mtu req: opcode");
+    CHECK(fn_att_exchange_mtu_request_get_mtu(mtu_req) == 185, "att mtu req: mtu round trip");
+
+    int64_t *mtu_rsp = dhruva_alloc_bytes(3);
+    int64_t mtu_rsp_len = fn_att_build_exchange_mtu_response(mtu_rsp, 247);
+    CHECK(mtu_rsp_len == 3, "att mtu rsp: length == 3");
+    CHECK(fn_att_get_opcode(mtu_rsp) == fn_att_opcode_exchange_mtu_response(), "att mtu rsp: opcode");
+    CHECK(fn_att_exchange_mtu_response_get_mtu(mtu_rsp) == 247, "att mtu rsp: mtu round trip");
+
+    /* Read request/response. */
+    int64_t *read_req = dhruva_alloc_bytes(3);
+    int64_t read_req_len = fn_att_build_read_request(read_req, 0x002A);
+    CHECK(read_req_len == 3, "att read req: length == 3");
+    CHECK(fn_att_get_opcode(read_req) == fn_att_opcode_read_request(), "att read req: opcode");
+    CHECK(fn_att_read_request_get_handle(read_req) == 0x002A, "att read req: handle round trip");
+
+    int64_t *read_value = mkbuf("hi!", 3);
+    int64_t *read_rsp = dhruva_alloc_bytes(4);
+    int64_t read_rsp_len = fn_att_build_read_response(read_rsp, read_value, 3);
+    CHECK(read_rsp_len == 4, "att read rsp: length == 1 (opcode) + 3 (value)");
+    CHECK(fn_att_get_opcode(read_rsp) == fn_att_opcode_read_response(), "att read rsp: opcode");
+    int64_t *read_value_out = dhruva_alloc_bytes(3);
+    int64_t read_value_out_len = fn_att_read_response_get_value(read_rsp, read_rsp_len, read_value_out);
+    CHECK(read_value_out_len == 3, "att read rsp: extracted value length == 3");
+    CHECK(memcmp(read_value_out, "hi!", 3) == 0, "att read rsp: extracted value bytes match");
+
+    /* Write request/response. */
+    int64_t *write_value = mkbuf("ok", 2);
+    int64_t *write_req = dhruva_alloc_bytes(5);
+    int64_t write_req_len = fn_att_build_write_request(write_req, 0x002B, write_value, 2);
+    CHECK(write_req_len == 5, "att write req: length == 3 (header) + 2 (value)");
+    CHECK(fn_att_get_opcode(write_req) == fn_att_opcode_write_request(), "att write req: opcode");
+    CHECK(fn_att_write_request_get_handle(write_req) == 0x002B, "att write req: handle round trip");
+    int64_t *write_value_out = dhruva_alloc_bytes(2);
+    int64_t write_value_out_len = fn_att_write_request_get_value(write_req, write_req_len, write_value_out);
+    CHECK(write_value_out_len == 2, "att write req: extracted value length == 2");
+    CHECK(memcmp(write_value_out, "ok", 2) == 0, "att write req: extracted value bytes match");
+
+    int64_t *write_rsp = dhruva_alloc_bytes(1);
+    int64_t write_rsp_len = fn_att_build_write_response(write_rsp);
+    CHECK(write_rsp_len == 1, "att write rsp: length == 1 (opcode only)");
+    CHECK(fn_att_get_opcode(write_rsp) == fn_att_opcode_write_response(), "att write rsp: opcode");
+}
+
+/* Round 66: diag_ring_state.S's wraparound math (via the native stub
+ * added this round to fix a real host_harness link break the ring
+ * buffer's own original commit introduced -- see host_stubs.c's own
+ * comment). Only live-QEMU-verified before this (a ~25-real-second
+ * wait to accumulate 32+ ticks); this gives the same coverage
+ * instantly and repeatably. */
+static void test_diag_ring(void) {
+    int64_t start_count = diag_ring_get_count();
+
+    /* Unwrapped case: logical index N is always physical slot N when
+     * the ring hasn't filled yet. */
+    diag_ring_push(100, 1, 1, 0);
+    diag_ring_push(101, 2, 2, 1);
+    int64_t count_after_2 = diag_ring_get_count();
+    CHECK(count_after_2 == start_count + 2, "diag_ring: count advances by 2 after 2 pushes");
+    if (count_after_2 < 32) {
+        int64_t last_phys = fn_diag_ring_physical_index(count_after_2 - 1);
+        CHECK(diag_ring_get_tick_at(last_phys) == 101, "diag_ring: newest sample's tick is the last one pushed");
+    }
+
+    /* Wrapped case: push enough more to guarantee the ring has filled
+     * and wrapped at least once, regardless of how many samples
+     * existed before this test ran. */
+    for (int i = 0; i < 40; i++) {
+        diag_ring_push(200 + i, i, i, i);
+    }
+    CHECK(diag_ring_get_count() == 32, "diag_ring: count caps at 32 once the ring fills");
+    /* The newest sample (logical index 31, the last one pushed above)
+     * must be tick 239 (200 + 39), regardless of wraparound. */
+    int64_t newest_phys = fn_diag_ring_physical_index(31);
+    CHECK(diag_ring_get_tick_at(newest_phys) == 239, "diag_ring: newest logical sample after wraparound is the most recent push");
+    /* The oldest sample (logical index 0) must be exactly 31 ticks
+     * behind the newest one -- 32 consecutive pushes, one per tick,
+     * always span exactly 31 ticks end to end. */
+    int64_t oldest_phys = fn_diag_ring_physical_index(0);
+    CHECK(diag_ring_get_tick_at(oldest_phys) == 239 - 31, "diag_ring: oldest logical sample after wraparound is exactly 31 ticks behind the newest");
+    /* head now points at the slot the NEXT push will overwrite --
+     * physical_index(0) (the current oldest) must be exactly there. */
+    CHECK(oldest_phys == diag_ring_get_head(), "diag_ring: oldest sample's physical slot is where head currently points (about to be overwritten next)");
+}
+
 /* Round 58: RTL8188CU/RTL8192CU vendor register SETUP-packet encoding,
  * checked against hand-computed bytes matching Linux's rtl8xxxu driver
  * (REALTEK_USB_CMD_REQ=0x05, REALTEK_USB_READ=0xc0, REALTEK_USB_
@@ -1470,6 +1713,8 @@ int main(void) {
     test_bignum_boundaries();
     test_lan9512_framing();
     test_hci_framing();
+    test_ble_connection_and_att();
+    test_diag_ring();
     test_rtl_reg_setup_framing();
     test_packet_filter();
 

@@ -444,6 +444,33 @@ int64_t netif_set_slot_len(int64_t slot_index, int64_t value) { g_netif_slot_len
 int64_t *netif_get_queue_buf(void) { return g_netif_queue_buf; }
 int64_t netif_set_queue_buf(int64_t *buf) { g_netif_queue_buf = buf; return 0; }
 
+/* Round 66: diag_ring_state.S's own state, mirrored here so
+ * irq_dispatch (which now unconditionally calls diag_ring_push) links
+ * on the host -- same genuinely-stateful-not-dummy shape as
+ * g_netif_head/etc above, not the plain "return 0" this project uses
+ * for stubs where the real state genuinely can't mean anything on a
+ * host that never takes a real interrupt (context_switch_count_get/
+ * irq_count_get below). This one CAN mean something (the ring's own
+ * bookkeeping is pure logic, independent of the scheduler), so it's
+ * implemented for real. */
+static uint32_t g_diag_ring_tick[32], g_diag_ring_ctxsw[32], g_diag_ring_irqs[32], g_diag_ring_priolock[32];
+static int64_t g_diag_ring_head, g_diag_ring_count;
+int64_t diag_ring_push(uint32_t tick, uint32_t ctxsw, uint32_t irqs, uint32_t priolock) {
+    g_diag_ring_tick[g_diag_ring_head] = tick;
+    g_diag_ring_ctxsw[g_diag_ring_head] = ctxsw;
+    g_diag_ring_irqs[g_diag_ring_head] = irqs;
+    g_diag_ring_priolock[g_diag_ring_head] = priolock;
+    g_diag_ring_head = (g_diag_ring_head + 1) % 32;
+    if (g_diag_ring_count < 32) g_diag_ring_count++;
+    return 0;
+}
+int64_t diag_ring_get_head(void) { return g_diag_ring_head; }
+int64_t diag_ring_get_count(void) { return g_diag_ring_count; }
+int64_t diag_ring_get_tick_at(int64_t i) { return g_diag_ring_tick[i]; }
+int64_t diag_ring_get_ctxsw_at(int64_t i) { return g_diag_ring_ctxsw[i]; }
+int64_t diag_ring_get_irqs_at(int64_t i) { return g_diag_ring_irqs[i]; }
+int64_t diag_ring_get_priolock_at(int64_t i) { return g_diag_ring_priolock[i]; }
+
 static uint32_t g_governor_last_mhz;
 static int64_t g_governor_history[4];
 int64_t governor_apply_freq_mhz(int64_t mhz) { g_governor_last_mhz = (uint32_t)mhz; return 0; }

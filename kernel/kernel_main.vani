@@ -4263,6 +4263,28 @@ fn buf_read_u32_le(buf: mut ref i64, offset: i64) -> u32 {
   return b0 | (b1 << (8 as u32)) | (b2 << (16 as u32)) | (b3 << (24 as u32));
 }
 
+// 16-bit counterparts, added round 66 for BLE's own HCI ACL/L2CAP/ATT
+// framing -- every one of those layers is little-endian throughout
+// (Bluetooth Core Spec) and uses FAR more 16-bit fields (lengths,
+// channel IDs, connection handles, attribute handles, UUIDs) than the
+// existing HCI command builders above ever needed individually
+// (those write each field inline, byte by byte -- fine for one or two
+// 16-bit fields per function, real duplication once every field in an
+// entire protocol stack is 16-bit LE).
+fn buf_write_u16_le(buf: mut ref i64, offset: i64, value: u32) -> i64 {
+  let b0: u32 = value & (0xFF as u32);
+  let b1: u32 = (value >> (8 as u32)) & (0xFF as u32);
+  let _ = buf_write_byte(buf, offset as u32, b0);
+  let _ = buf_write_byte(buf, (offset + 1) as u32, b1);
+  return 0;
+}
+
+fn buf_read_u16_le(buf: mut ref i64, offset: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, offset as u32);
+  let b1: u32 = buf_read_byte(buf, (offset + 1) as u32);
+  return b0 | (b1 << (8 as u32));
+}
+
 // Phase 6: generic netif abstraction (DHRUVA_ARCHITECTURE.md §4's own
 // "get-go hook": "send/receive a raw frame, MTU, MAC address... just
 // an interface, no implementation. Both the LAN9512 wired path and
@@ -10339,6 +10361,233 @@ fn dwc2_bt_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) 
   return actual_len;
 }
 
+// Round 66: HCI ACL Data packet framing (Bluetooth Core Spec Vol 4
+// Part E §5.4.2) -- the envelope every L2CAP packet travels in over
+// the bulk OUT/IN endpoints above, once a connection handle exists
+// (hci_le_conn_complete_handle). [Handle:12 bits][PB_Flag:2 bits]
+// [BC_Flag:2 bits] packed into 2 bytes LE, then [Data_Total_Length:2
+// bytes LE], then the L2CAP payload. PB_Flag 0b10 ("first non-
+// automatically-flushable packet, complete L2CAP PDU") and BC_Flag
+// 0b00 (point-to-point, not broadcast -- BLE has no broadcast ACL)
+// are the only combination this driver's own single-L2CAP-packet-per-
+// ACL-packet design ever needs; PB_Flag 0b01 (packet continuation) is
+// for reassembling an L2CAP PDU split across multiple ACL packets,
+// not implemented here (every ATT PDU this round builds comfortably
+// fits in one ACL packet under any realistic LE ATT_MTU).
+fn hci_acl_pb_flag_first() -> u32 {
+  return 0x02 as u32;
+}
+
+fn hci_acl_bc_flag_point_to_point() -> u32 {
+  return 0x00 as u32;
+}
+
+fn hci_acl_build_header(out_buf: mut ref i64, handle: u32, pb_flag: u32, bc_flag: u32, data_len: u32) -> i64 {
+  let handle_and_flags: u32 = (handle & (0x0FFF as u32)) | ((pb_flag & (0x03 as u32)) << (12 as u32)) | ((bc_flag & (0x03 as u32)) << (14 as u32));
+  let _ = buf_write_u16_le(out_buf, 0, handle_and_flags);
+  let _ = buf_write_u16_le(out_buf, 2, data_len);
+  return 4;
+}
+
+fn hci_acl_get_handle(buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(buf, 0) & (0x0FFF as u32);
+}
+
+fn hci_acl_get_pb_flag(buf: mut ref i64) -> u32 {
+  return (buf_read_u16_le(buf, 0) >> (12 as u32)) & (0x03 as u32);
+}
+
+fn hci_acl_get_data_len(buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(buf, 2);
+}
+
+// L2CAP B-frame (Basic frame, Bluetooth Core Spec Vol 3 Part A §3.1)
+// -- carried as the payload of one ACL data packet above.
+// [Length:2 bytes LE][Channel_ID:2 bytes LE][payload]. Length covers
+// the payload only, not this 4-byte header itself. LE has a small,
+// fixed set of predefined channel IDs (§3.2 Table 3.2, "LE-U logical
+// link"); this round only needs the Attribute Protocol's own fixed
+// channel, but l2cap_signaling_channel_id is included alongside it
+// since any real connection setup (LE credit-based flow control,
+// connection parameter updates) runs over L2CAP Signaling, the next
+// genuinely separate piece above what this round builds.
+fn l2cap_att_channel_id() -> u32 {
+  return 0x0004 as u32;
+}
+
+fn l2cap_signaling_channel_id() -> u32 {
+  return 0x0005 as u32;
+}
+
+fn l2cap_build_header(out_buf: mut ref i64, length: u32, channel_id: u32) -> i64 {
+  let _ = buf_write_u16_le(out_buf, 0, length);
+  let _ = buf_write_u16_le(out_buf, 2, channel_id);
+  return 4;
+}
+
+fn l2cap_get_length(buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(buf, 0);
+}
+
+fn l2cap_get_channel_id(buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(buf, 2);
+}
+
+// Attribute Protocol (ATT, Bluetooth Core Spec Vol 3 Part F) -- the
+// generic read/write-by-handle protocol GATT (the next layer up,
+// still not started) builds services/characteristics semantics on top
+// of. Every PDU starts with a 1-byte Opcode; these are the core
+// operations a minimal "connect, negotiate MTU, read/write one known
+// attribute handle" interaction needs (§3.4.1-§3.4.3, §3.4.4.1-3,
+// §3.4.5.1-3) -- GATT's own discovery procedures (Find Information,
+// Read By Type/Group Type, needed to enumerate services/
+// characteristics rather than accessing a handle already known ahead
+// of time) are deliberately NOT included in this round, a genuinely
+// separate, larger increment (this project's own directory-hierarchy-
+// style "don't build past what's actually needed yet" discipline).
+fn att_opcode_error_response() -> u32 { return 0x01 as u32; }
+fn att_opcode_exchange_mtu_request() -> u32 { return 0x02 as u32; }
+fn att_opcode_exchange_mtu_response() -> u32 { return 0x03 as u32; }
+fn att_opcode_read_request() -> u32 { return 0x0A as u32; }
+fn att_opcode_read_response() -> u32 { return 0x0B as u32; }
+fn att_opcode_write_request() -> u32 { return 0x12 as u32; }
+fn att_opcode_write_response() -> u32 { return 0x13 as u32; }
+
+fn att_get_opcode(buf: mut ref i64) -> u32 {
+  return buf_read_byte(buf, 0 as u32);
+}
+
+// Error Response (§3.4.1.1): [Opcode=0x01][Request_Opcode_In_Error
+// (1)][Attribute_Handle_In_Error (2, LE)][Error_Code (1)] -- the
+// generic "that request failed" reply every other PDU type below can
+// draw instead of its own normal response.
+fn att_build_error_response(out_buf: mut ref i64, request_opcode: u32, handle: u32, error_code: u32) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_error_response());
+  let _ = buf_write_byte(out_buf, 1 as u32, request_opcode);
+  let _ = buf_write_u16_le(out_buf, 2, handle);
+  let _ = buf_write_byte(out_buf, 4 as u32, error_code);
+  return 5;
+}
+
+fn att_error_request_opcode(buf: mut ref i64) -> u32 {
+  return buf_read_byte(buf, 1 as u32);
+}
+
+fn att_error_handle(buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(buf, 2);
+}
+
+fn att_error_code(buf: mut ref i64) -> u32 {
+  return buf_read_byte(buf, 4 as u32);
+}
+
+// Exchange MTU Request/Response (§3.4.2.1-2): [Opcode][Client/Server_
+// Rx_MTU (2, LE)] -- the very first exchange over a fresh ATT bearer,
+// negotiating the larger of the two ends' own receive capability
+// (default LE ATT_MTU is 23 bytes absent this exchange).
+fn att_build_exchange_mtu_request(out_buf: mut ref i64, client_rx_mtu: u32) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_exchange_mtu_request());
+  let _ = buf_write_u16_le(out_buf, 1, client_rx_mtu);
+  return 3;
+}
+
+fn att_exchange_mtu_request_get_mtu(buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(buf, 1);
+}
+
+fn att_build_exchange_mtu_response(out_buf: mut ref i64, server_rx_mtu: u32) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_exchange_mtu_response());
+  let _ = buf_write_u16_le(out_buf, 1, server_rx_mtu);
+  return 3;
+}
+
+fn att_exchange_mtu_response_get_mtu(buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(buf, 1);
+}
+
+// Read Request/Response (§3.4.4.1-2): Request is [Opcode][Handle (2,
+// LE)]; Response is [Opcode][Value (variable, up to ATT_MTU-1 bytes)]
+// -- the value's own length is implicit (whatever the underlying L2CAP
+// PDU's own length said), not carried inside the ATT PDU itself.
+fn att_build_read_request(out_buf: mut ref i64, handle: u32) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_read_request());
+  let _ = buf_write_u16_le(out_buf, 1, handle);
+  return 3;
+}
+
+fn att_read_request_get_handle(buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(buf, 1);
+}
+
+fn att_build_read_response(out_buf: mut ref i64, value: mut ref i64, value_len: i64) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_read_response());
+  let i: i64 = 0;
+  while i < value_len {
+    let b: u32 = buf_read_byte(value, i as u32);
+    let _ = buf_write_byte(out_buf, (1 + i) as u32, b);
+    i = i + 1;
+  }
+  return 1 + value_len;
+}
+
+// Copies a Read Response PDU's own value portion (everything after
+// the 1-byte opcode) into out_value -- pdu_len is the WHOLE PDU's
+// length (as delivered by L2CAP), matching this project's own "caller
+// states its real buffer capacity, callee never guesses" posture
+// (netif_recv_frame's own established convention) rather than
+// re-deriving a length from something implicit.
+fn att_read_response_get_value(buf: mut ref i64, pdu_len: i64, out_value: mut ref i64) -> i64 {
+  let value_len: i64 = pdu_len - 1;
+  if value_len < 0 {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < value_len {
+    let b: u32 = buf_read_byte(buf, (1 + i) as u32);
+    let _ = buf_write_byte(out_value, i as u32, b);
+    i = i + 1;
+  }
+  return value_len;
+}
+
+// Write Request/Response (§3.4.5.1, §3.4.5.3): Request is [Opcode]
+// [Handle (2, LE)][Value (variable)]; Response is just [Opcode] alone
+// -- confirmation, no return data (that's Read's own job).
+fn att_build_write_request(out_buf: mut ref i64, handle: u32, value: mut ref i64, value_len: i64) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_write_request());
+  let _ = buf_write_u16_le(out_buf, 1, handle);
+  let i: i64 = 0;
+  while i < value_len {
+    let b: u32 = buf_read_byte(value, i as u32);
+    let _ = buf_write_byte(out_buf, (3 + i) as u32, b);
+    i = i + 1;
+  }
+  return 3 + value_len;
+}
+
+fn att_write_request_get_handle(buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(buf, 1);
+}
+
+fn att_write_request_get_value(buf: mut ref i64, pdu_len: i64, out_value: mut ref i64) -> i64 {
+  let value_len: i64 = pdu_len - 3;
+  if value_len < 0 {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < value_len {
+    let b: u32 = buf_read_byte(buf, (3 + i) as u32);
+    let _ = buf_write_byte(out_value, i as u32, b);
+    i = i + 1;
+  }
+  return value_len;
+}
+
+fn att_build_write_response(out_buf: mut ref i64) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_write_response());
+  return 1;
+}
+
 // Round 57: one INTERRUPT IN transfer -- this driver's first use of the
 // interrupt transfer type (bmAttributes==3), needed because USB
 // Bluetooth HCI delivers HCI EVENTS (Command Complete, Command Status,
@@ -10526,6 +10775,113 @@ fn hci_cmd_complete_opcode(event_buf: mut ref i64) -> u32 {
 
 fn hci_cmd_complete_status(event_buf: mut ref i64) -> u32 {
   return buf_read_byte(event_buf, 5 as u32);
+}
+
+// Round 66: connection establishment -- the prerequisite everything
+// above L2CAP (docs/TODO.md's own "not started" BLE item) actually
+// needs, and genuinely missing before this round despite the HCI
+// transport itself being done (round 57): scanning alone never yields
+// a connection handle, and L2CAP/ATT/GATT all run over an established
+// connection's ACL data channel. LE_Create_Connection (§7.8.12):
+// OGF=0x08, OCF=0x000D, 25 parameter bytes: LE_Scan_Interval (2, LE),
+// LE_Scan_Window (2, LE), Initiator_Filter_Policy (1), Peer_Address_
+// Type (1), Peer_Address (6), Own_Address_Type (1), Conn_Interval_Min
+// (2, LE), Conn_Interval_Max (2, LE), Conn_Latency (2, LE),
+// Supervision_Timeout (2, LE), Min/Max_CE_Length (2 each, LE).
+fn hci_build_le_create_connection_command(out_buf: mut ref i64, scan_interval: u32, scan_window: u32, filter_policy: u32, peer_addr_type: u32, peer_addr: mut ref i64, own_addr_type: u32, conn_interval_min: u32, conn_interval_max: u32, conn_latency: u32, supervision_timeout: u32) -> i64 {
+  let opcode: u32 = hci_build_opcode(0x08 as u32, 0x000D as u32);
+  let _ = buf_write_byte(out_buf, 0 as u32, opcode & (0xFF as u32));
+  let _ = buf_write_byte(out_buf, 1 as u32, (opcode >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(out_buf, 2 as u32, 25 as u32);
+  let _ = buf_write_u16_le(out_buf, 3, scan_interval);
+  let _ = buf_write_u16_le(out_buf, 5, scan_window);
+  let _ = buf_write_byte(out_buf, 7 as u32, filter_policy);
+  let _ = buf_write_byte(out_buf, 8 as u32, peer_addr_type);
+  let i: i64 = 0;
+  while i < 6 {
+    let b: u32 = buf_read_byte(peer_addr, i as u32);
+    let _ = buf_write_byte(out_buf, (9 + i) as u32, b);
+    i = i + 1;
+  }
+  let _ = buf_write_byte(out_buf, 15 as u32, own_addr_type);
+  let _ = buf_write_u16_le(out_buf, 16, conn_interval_min);
+  let _ = buf_write_u16_le(out_buf, 18, conn_interval_max);
+  let _ = buf_write_u16_le(out_buf, 20, conn_latency);
+  let _ = buf_write_u16_le(out_buf, 22, supervision_timeout);
+  let _ = buf_write_u16_le(out_buf, 24, 0 as u32); // Min_CE_Length -- no
+                                                     // preference
+  let _ = buf_write_u16_le(out_buf, 26, 0 as u32); // Max_CE_Length --
+                                                     // no preference
+  return 28;
+}
+
+// LE_Create_Connection is unusual among the commands this driver has
+// sent so far: the controller answers with Command Status (§7.7.15,
+// Event_Code=0x0F -- "accepted, working on it," NOT Command Complete)
+// immediately, then the REAL outcome arrives later, asynchronously, as
+// an LE Connection Complete event -- a genuine two-step protocol,
+// unlike HCI_Reset/LE_Set_Scan_*'s single synchronous round trip.
+fn hci_event_is_command_status(event_buf: mut ref i64) -> u32 {
+  if hci_event_code(event_buf) == (0x0F as u32) {
+    return 1 as u32;
+  }
+  return 0 as u32;
+}
+
+fn hci_cmd_status_status(event_buf: mut ref i64) -> u32 {
+  return buf_read_byte(event_buf, 2 as u32);
+}
+
+fn hci_cmd_status_opcode(event_buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(event_buf, 4);
+}
+
+// LE Meta Event (§7.7.65): Event_Code=0x3E, params =
+// [Subevent_Code (1)][Subevent parameters...]. Every LE-specific
+// asynchronous event (connection complete, advertising reports, etc.)
+// is a subevent of this one wrapper event, not its own top-level
+// event code -- checked separately from hci_event_is_command_complete/
+// _status above since this is neither of those shapes.
+fn hci_event_is_le_meta(event_buf: mut ref i64) -> u32 {
+  if hci_event_code(event_buf) == (0x3E as u32) {
+    return 1 as u32;
+  }
+  return 0 as u32;
+}
+
+fn hci_le_meta_subevent_code(event_buf: mut ref i64) -> u32 {
+  return buf_read_byte(event_buf, 2 as u32);
+}
+
+// LE Connection Complete (§7.7.65.1): Subevent_Code=0x01, params =
+// [Status (1)][Connection_Handle (2, LE)][Role (1)][Peer_Address_Type
+// (1)][Peer_Address (6)][Conn_Interval (2, LE)][Conn_Latency (2, LE)]
+// [Supervision_Timeout (2, LE)][Master_Clock_Accuracy (1)], all offset
+// by the 3-byte [Event_Code][Param_Len][Subevent_Code] header above.
+fn hci_le_conn_complete_status(event_buf: mut ref i64) -> u32 {
+  return buf_read_byte(event_buf, 3 as u32);
+}
+
+fn hci_le_conn_complete_handle(event_buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(event_buf, 4);
+}
+
+fn hci_le_conn_complete_role(event_buf: mut ref i64) -> u32 {
+  return buf_read_byte(event_buf, 6 as u32);
+}
+
+fn hci_le_conn_complete_peer_addr_type(event_buf: mut ref i64) -> u32 {
+  return buf_read_byte(event_buf, 7 as u32);
+}
+
+fn hci_le_conn_complete_peer_addr(event_buf: mut ref i64, out_addr: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    let b: u32 = buf_read_byte(event_buf, (8 + i) as u32);
+    let _ = buf_write_byte(out_addr, i as u32, b);
+    i = i + 1;
+  }
+  return 0;
 }
 
 // Round 57: sends one HCI command and polls the interrupt endpoint
