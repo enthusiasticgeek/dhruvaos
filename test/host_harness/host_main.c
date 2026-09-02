@@ -57,6 +57,7 @@ int64_t fn_dharafs_log_record_max_len(void);
 int64_t fn_dharafs_log_path_raw(int64_t *name_buf, int64_t name_len, uint32_t index, int64_t *out_buf);
 int64_t fn_dharafs_log_header_path_raw(int64_t *name_buf, int64_t name_len, int64_t *out_buf);
 int64_t fn_dharafs_log_append_raw(int64_t *name_buf, int64_t name_len, int64_t *record_buf, int64_t record_len, uint32_t owner_uid, uint32_t owner_gid, uint32_t mode);
+int64_t fn_dharafs_log_retention_count(void);
 uint32_t fn_dharafs_attr_immutable(void);
 uint32_t fn_dharafs_attr_append_only(void);
 uint32_t fn_dharafs_attr_system(void);
@@ -784,6 +785,70 @@ static void test_log_append(void) {
     CHECK(fn_dharafs_log_append_raw(name, 6, record_buf, 0, 0, 0, 0644) == 1, "log: empty record rejected");
 }
 
+/* ================= Log GC of old generations (round 66) ================= */
+
+static void test_log_gc(void) {
+    reset_fs();
+
+    int64_t retention = fn_dharafs_log_retention_count();
+    CHECK(retention == 5, "log_gc: retention_count() is 5");
+
+    int64_t *name = mkbuf("sensor", 6);
+    char record[400];
+    memset(record, 'x', 400);
+    int64_t *record_buf = mkbuf(record, 400);
+    int64_t *out = dhruva_alloc_bytes(4096);
+
+    /* Drive the log through 7 rollovers (index 1 -> 8): the very first
+     * append always rolls to index 1, then each subsequent rollover
+     * needs 8 accumulating appends (8*400=3200, under the 3584
+     * threshold) plus a 9th that pushes it over. */
+    CHECK(fn_dharafs_log_append_raw(name, 6, record_buf, 400, 0, 0, 0644) == 0, "log_gc: initial append rolls to index 1");
+    for (int gen = 0; gen < 7; gen++) {
+        for (int k = 0; k < 8; k++) {
+            CHECK(fn_dharafs_log_append_raw(name, 6, record_buf, 400, 0, 0, 0644) == 0, "log_gc: accumulating append succeeds");
+        }
+        CHECK(fn_dharafs_log_append_raw(name, 6, record_buf, 400, 0, 0, 0644) == 0, "log_gc: rollover-triggering append succeeds");
+    }
+
+    /* Now at index 8 (1 initial rollover + 7 more). Retention is 5, so
+     * generations 1-3 (8 - 5 = 3, everything at or below that) must be
+     * reclaimed; 4 through 8 (the current one) must still exist. */
+    for (int idx = 1; idx <= 3; idx++) {
+        int64_t *p = dhruva_alloc_bytes(32);
+        int64_t plen = fn_dharafs_log_path_raw(name, 6, idx, p);
+        int64_t rd = fn_dharafs_read_raw(p, plen, out);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "log_gc: generation %d was reclaimed (not readable)", idx);
+        CHECK(rd == -1, msg);
+    }
+    for (int idx = 4; idx <= 8; idx++) {
+        int64_t *p = dhruva_alloc_bytes(32);
+        int64_t plen = fn_dharafs_log_path_raw(name, 6, idx, p);
+        int64_t rd = fn_dharafs_read_raw(p, plen, out);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "log_gc: generation %d was kept (still readable)", idx);
+        CHECK(rd >= 0, msg);
+    }
+
+    /* Header still correctly tracks the current (8th) generation --
+     * GC reclaiming old files must never disturb where new appends go. */
+    int64_t *header_path = dhruva_alloc_bytes(32);
+    int64_t header_path_len = fn_dharafs_log_header_path_raw(name, 6, header_path);
+    int64_t *hdr_out = dhruva_alloc_bytes(8);
+    int64_t hdr_rd = fn_dharafs_read_raw(header_path, header_path_len, hdr_out);
+    CHECK(hdr_rd == 8, "log_gc: header file still exactly 8 bytes after GC");
+    CHECK(buf_read_u32(hdr_out, 0) == 8, "log_gc: header's current_index is still 8 after GC");
+
+    /* A different log name's own generations are untouched by this
+     * one's GC -- reclaiming is scoped per log name, not global. */
+    int64_t *other_name = mkbuf("other", 5);
+    CHECK(fn_dharafs_log_append_raw(other_name, 5, record_buf, 400, 0, 0, 0644) == 0, "log_gc: unrelated log name append succeeds");
+    int64_t *other_path = dhruva_alloc_bytes(32);
+    int64_t other_path_len = fn_dharafs_log_path_raw(other_name, 5, 1, other_path);
+    CHECK(fn_dharafs_read_raw(other_path, other_path_len, out) == 400, "log_gc: unrelated log name's own generation 1 is untouched");
+}
+
 /* ================= File attributes (round 50) ================= */
 
 static void test_attributes(void) {
@@ -1394,6 +1459,7 @@ int main(void) {
     test_self_referential_continuation_chain();
     test_verified_integrity();
     test_log_append();
+    test_log_gc();
     test_attributes();
     test_chmod_chown_permissions();
     test_sha256_boundaries();

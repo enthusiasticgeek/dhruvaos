@@ -1819,15 +1819,35 @@ building blocks for a diagnostics command, not a green field.
   one run) still pass 189/189 under ASAN/UBSAN, and a live `writev`/
   `catv` round trip still verifies correctly end to end.
 
-- **Append-only log convenience API** (`dharafs_log_open`/`_append`/
-  `_sync`, automatic rollover across numbered files) — `[M, ~1-2
-  rounds]`
-  The underlying primitives (append, checksum, chain-follow) already
-  support this; what's missing is the ergonomic layer for the
-  sensor-logging use case specifically (rollover to a new numbered
-  file at a size threshold, sequence numbers, GC of old rolled files).
-  A genuinely scoped, near-term-buildable win — no new on-disk format
-  needed, just new entry points over the existing one.
+- **Append-only log convenience API** (`dharafs_log_append`, automatic
+  rollover + GC across numbered files) — `[DONE: append/rollover from
+  round 49 (this entry's own text describing them as missing was
+  stale); GC added round 66, 2026-09-01]`
+  A log named `name` lives as numbered files `/logs/<name>-NNNN.log`
+  plus an `/logs/<name>.hdr` header (round 49), rolling over to a new
+  file automatically once the current one would exceed
+  `dharafs_log_rollover_threshold()` (3584 bytes) — already wired to
+  the shell `log` command and documented in `DHARAFS_MANUAL.md`. The
+  one genuinely missing piece this entry correctly identified was GC:
+  without it, every rollover left the previous file behind forever,
+  unbounded growth for a log meant to run indefinitely. Fixed by
+  reclaiming generation `N - dharafs_log_retention_count()` (5) once
+  generation N's rollover — file AND header — are both safely durable,
+  so a crash mid-rollover can never leave the header pointing at an
+  already-deleted generation. No handle-based `dharafs_log_open`/
+  `_sync` API was added — the existing stateless `dharafs_log_append(
+  name, line)` (re-resolves the current file per call) was judged
+  ergonomic enough already; a persistent handle would only be a
+  caching optimization, not a functional gap.
+
+  Verified with 77 new host-harness tests (392/392 PASS clean under
+  ASAN/UBSAN) driving a real log through 7 rollovers and confirming:
+  the correct 3 oldest generations are reclaimed, the 5 most recent
+  (including current) remain readable, the header still correctly
+  tracks the current generation after GC, and a second, unrelated log
+  name's own generations are completely untouched (GC is scoped per
+  name). Full regression battery green: `qemu_run.py`,
+  `phase4_milestone.py` 14/14, `heap_stress.py`.
 
 - **Immutable / append-only / system file attributes**
   (`DHARA_ATTR_IMMUTABLE`/`APPEND_ONLY`/`SYSTEM`) — `[S-M, ~1 round —

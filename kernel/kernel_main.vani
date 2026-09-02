@@ -3114,6 +3114,20 @@ fn dharafs_log_record_max_len() -> i64 {
               // the rollover-threshold math above stays exact.
 }
 
+// Round 66: how many numbered generations of one log to keep on disk
+// (current file plus this many prior ones) before dharafs_log_append_
+// raw's own rollover step starts reclaiming the oldest. Without this,
+// every rollover left the previous file behind forever -- fine for a
+// short-lived demo, a real permanent problem for the sensor-logging
+// use case this API exists for (bounded storage, indefinite runtime).
+// 5 is arbitrary but generous for the embedded file counts this
+// project targets (tens to low hundreds, not thousands) -- see the
+// directory-index TODO entry's own reasoning for why this project
+// doesn't scale-design ahead of a real need.
+fn dharafs_log_retention_count() -> i64 {
+  return 5;
+}
+
 // Writes exactly 4 ASCII decimal digits (zero-padded, 0000-9999) for
 // `index` starting at out_buf[offset).
 fn dharafs_log_write_index_digits(out_buf: mut ref i64, offset: i64, index: u32) -> i64 {
@@ -3233,7 +3247,28 @@ fn dharafs_log_append_raw(name_buf: mut ref i64, name_len: i64, record_buf: mut 
     }
     let _ = buf_write_u32(header_data, 0 as u32, new_index);
     let _ = buf_write_u32(header_data, 4 as u32, record_len as u32);
-    return dharafs_append_raw(header_buf, header_len, header_data, 8, owner_uid, owner_gid, mode);
+    let header_write_status: i64 = dharafs_append_raw(header_buf, header_len, header_data, 8, owner_uid, owner_gid, mode);
+
+    // Round 66: GC the oldest generation now that the new file AND its
+    // header are both safely durable -- reclaiming before the header
+    // commits would risk pointing at a deleted file if a crash landed
+    // between the two, the same "old OR new, never mixed" ordering
+    // discipline this project's own transaction primitive already
+    // established elsewhere. Best-effort: a delete failure here (e.g.
+    // the old generation was already gone) doesn't fail the append that
+    // already genuinely succeeded, so this function's own return value
+    // still reflects only the part the caller actually asked for.
+    if header_write_status == 0 {
+      let retention: i64 = dharafs_log_retention_count();
+      if (new_index as i64) > retention {
+        let old_index: u32 = new_index - (retention as u32);
+        let old_path_len: i64 = dharafs_log_path_raw(name_buf, name_len, old_index, log_path_buf);
+        if old_path_len > 0 {
+          let _ = dharafs_delete_raw(log_path_buf, old_path_len);
+        }
+      }
+    }
+    return header_write_status;
   }
 
   let log_path_len: i64 = dharafs_log_path_raw(name_buf, name_len, current_index, log_path_buf);

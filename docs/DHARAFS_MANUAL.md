@@ -186,6 +186,15 @@ current file size), tracked automatically:
 - Records are concatenated with **no separator** — if you need to
   distinguish individual entries later, include your own delimiter or
   fixed-width framing in what you log.
+- Old generations are reclaimed automatically: only the current file
+  plus the `dharafs_log_retention_count()` most recent prior ones
+  (5, keeping 5 generations total) are kept on disk — rolling over to
+  generation N deletes generation `N - 5` once it exists, so a log
+  that runs indefinitely (the sensor-logging use case this API exists
+  for) uses bounded storage rather than growing forever. Reclaiming
+  only happens after the new generation AND its header update are both
+  safely durable, so a crash mid-rollover can never leave the header
+  pointing at an already-deleted file.
 
 ## 8. Block-device backends
 

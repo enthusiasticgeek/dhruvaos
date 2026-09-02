@@ -52,6 +52,7 @@ WHITELIST = [
     "dharafs_read_verified_checked",
     "dharafs_log_rollover_threshold",
     "dharafs_log_record_max_len",
+    "dharafs_log_retention_count",
     "dharafs_log_path_raw",
     "dharafs_log_header_path_raw",
     "dharafs_log_append_raw",
