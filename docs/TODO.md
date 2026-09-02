@@ -659,33 +659,67 @@ for by name.
   surface area WPA2/FIPS-TLS would eventually need before either is
   actually being worked on.
 
-- **TLS** — `[XL, several rounds — SKIPPED FOR NOW, 2026-08-31, same
-  reason as AES: genuinely blocked on multiple prerequisites below,
-  none of which are being worked on right now]`
-  A real TLS 1.3 client needs, at minimum: (1) asymmetric key exchange
-  (ECDHE) — blocked on the EC point arithmetic/modular reduction this
-  roadmap's own crypto-foundation entry already flags as not yet built
-  (needed for PKI too, not a new dependency); (2) an AEAD cipher —
-  either ChaCha20-Poly1305 (needs Poly1305 above, smaller lift) or
-  AES-GCM (needs the AES item above AND a GCM mode on top of it,
-  larger lift) — TLS 1.3 permits either, so this is a real, explicit
-  choice to make, not a default to assume; (3) certificate validation
-  — full X.509/ASN.1 DER parsing and CA chain-of-trust validation is
-  the PKI item below in its own right, a large, historically bug-prone
-  undertaking on its own. **A materially smaller, realistic first
-  target**: TLS 1.3 with raw public keys (RFC 7250) instead of X.509 —
-  pin a known server key directly, skip certificate parsing and CA
-  validation entirely. This turns "TLS" from "needs PKI" into "needs
-  ECDHE + an AEAD," a meaningfully smaller and more honest first
-  increment, matching this roadmap's own established pattern of
-  finding the smallest real version of a large ask (see PKI's own
-  "raw public-key trust" note below, which this reuses directly) —
-  full X.509-validated TLS is a separate, later step after that, not
-  a package deal. Even the smaller version needs the handshake state
-  machine itself built (comparable in scope to this project's own TCP
-  state machine, but for TLS's own record/handshake layer) — this is
-  genuinely not close to ready to start; sequence it after the crypto
-  prerequisites above exist.
+- **TLS** — crypto prerequisites: `[DONE, round 67, 2026-09-02]`;
+  the handshake/record-layer state machine itself: still `[L,
+  genuinely not started, sequenced next if this is picked back up]`
+  Every crypto prerequisite this entry itself listed is now built:
+  ECDHE (X25519, this round's own EC-foundation work) and an AEAD
+  (ChaCha20-Poly1305, chosen over AES-GCM per this entry's own
+  reasoning -- smaller lift, Poly1305 already existed this round and
+  AES-GCM would have needed a whole extra mode-of-operation on top of
+  AES). Also built HKDF (RFC 5869) -- TLS 1.3's own key schedule is
+  entirely HKDF-Extract/-Expand chains deriving handshake and
+  application traffic secrets from the ECDHE shared secret and a
+  running transcript hash, so this is as much a "TLS prerequisite" as
+  the AEAD is, just not explicitly named in this entry's own original
+  list.
+
+  `chacha20_poly1305_encrypt`/`_decrypt` (RFC 8439 section 2.8) build
+  the one-time Poly1305 key via `chacha20_block` at counter 0, encrypt
+  via the existing `chacha20_encrypt` at counter 1, and MAC over
+  `aad || pad16(aad) || ciphertext || pad16(ciphertext) || len(aad)
+  || len(ciphertext)` per the RFC exactly; decrypt verifies the tag
+  (constant-time, `poly1305_verify_constant_time`) BEFORE ever
+  decrypting -- a tag mismatch leaves the output buffer untouched,
+  same "reject, don't guess" posture as every other integrity check
+  in this codebase. `hkdf_extract`/`hkdf_expand` are a genuinely
+  SEPARATE HMAC-SHA256 implementation from round 61's own
+  `hmac_sha256` (real authentication's proven, security-critical
+  primitive, capped at 64-byte messages for its own narrower need) --
+  HKDF-Expand's own per-round HMAC input can exceed that once `info`
+  is TLS-shaped, and widening an already-shipped auth primitive for
+  an unrelated caller was judged the wrong trade against a small
+  amount of duplicated HMAC structure.
+
+  Verified via a from-scratch Python port of both constructions,
+  checked against the real `cryptography` library before any vani
+  code was written: full AEAD (ciphertext AND tag) matches
+  ChaCha20Poly1305's own encrypt() across 20 random trials with
+  varying AAD/plaintext lengths (exercising the RFC's own pad16
+  boundary in both directions); HKDF matches the library's own HKDF
+  across 15 random trials including multi-block expansions past one
+  SHA-256 output. 40 new host-harness checks (834→874 PASS clean
+  under ASAN/UBSAN): 6 more AEAD trials (encrypt, decrypt round-trip,
+  AND tamper-rejection each) plus 5 more HKDF trials at varying output
+  lengths. One real bug caught by ASAN itself, not the algorithm: the
+  host-harness test's own scratch-buffer setup missed 3 of
+  `hkdf_hmac_sha256`'s internal buffers, causing a clean null-pointer
+  crash on the very first HKDF call -- fixed in the test harness, not
+  the implementation. Live-verified at boot on real ARM/QEMU, correct
+  on the first real build otherwise.
+
+  **Still not started, and genuinely large**: the handshake/record-
+  layer state machine itself (ClientHello/ServerHello construction and
+  parsing, the full key-schedule sequence across each handshake stage,
+  record framing/fragmentation, raw-public-key certificate message
+  handling per RFC 7250) -- comparable in scope to this project's own
+  TCP state machine, but for TLS's own layer. This entry's own
+  "materially smaller, realistic first target" (RFC 7250 raw public
+  keys instead of X.509) is still the right scoping if this gets
+  picked back up -- PKI's own raw-key-trust work this round is the
+  DhruvaOS-side half of that story (verifying signed payloads), not
+  the TLS-side half (a live server's own key exchanged over an actual
+  handshake).
 
 - **Real authentication (password-protected `su` + `passwd`)** —
   `[DONE, round 61, 2026-08-30]`

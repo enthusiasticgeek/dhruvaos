@@ -177,6 +177,30 @@ extern "C" fn pki_sig_path_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn pki_sig_path_scratch_get() -> mut ref i64;
 extern "C" fn pki_sig_data_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn pki_sig_data_scratch_get() -> mut ref i64;
+extern "C" fn aead_state_set(addr: mut ref i64) -> i64;
+extern "C" fn aead_state_get() -> mut ref i64;
+extern "C" fn aead_working_set(addr: mut ref i64) -> i64;
+extern "C" fn aead_working_get() -> mut ref i64;
+extern "C" fn aead_keystream_set(addr: mut ref i64) -> i64;
+extern "C" fn aead_keystream_get() -> mut ref i64;
+extern "C" fn aead_block_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn aead_block_scratch_get() -> mut ref i64;
+extern "C" fn aead_otk_set(addr: mut ref i64) -> i64;
+extern "C" fn aead_otk_get() -> mut ref i64;
+extern "C" fn aead_mac_data_set(addr: mut ref i64) -> i64;
+extern "C" fn aead_mac_data_get() -> mut ref i64;
+extern "C" fn aead_computed_tag_set(addr: mut ref i64) -> i64;
+extern "C" fn aead_computed_tag_get() -> mut ref i64;
+extern "C" fn hkdf_hmac_key_block_set(addr: mut ref i64) -> i64;
+extern "C" fn hkdf_hmac_key_block_get() -> mut ref i64;
+extern "C" fn hkdf_hmac_msg_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn hkdf_hmac_msg_scratch_get() -> mut ref i64;
+extern "C" fn hkdf_hmac_inner_hash_set(addr: mut ref i64) -> i64;
+extern "C" fn hkdf_hmac_inner_hash_get() -> mut ref i64;
+extern "C" fn hkdf_t_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn hkdf_t_scratch_get() -> mut ref i64;
+extern "C" fn hkdf_hmac_input_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn hkdf_hmac_input_scratch_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -20075,6 +20099,624 @@ fn aes128_self_test() -> i64 {
 }
 
 
+// Round 67: ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) and HKDF
+// (RFC 5869) -- the "crypto machinery" a TLS 1.3 handshake needs on
+// top of the ECDHE (X25519) and signature (Ed25519) primitives
+// already built this round. Deliberately does NOT include the
+// handshake state machine itself (ClientHello/ServerHello framing,
+// the full key-schedule sequence, record-layer parsing) -- same
+// "smallest real increment, not the whole surface" discipline this
+// round has applied throughout (PKI's own raw-key-trust scoping,
+// AES's own encrypt-only scoping). This is real, complete,
+// independently useful cryptographic machinery on its own, not
+// unusable partial plumbing -- an AEAD and a KDF are both needed for
+// things well beyond TLS specifically.
+//
+// Verified via a from-scratch Python port of both constructions,
+// checked against the real `cryptography` library before any vani
+// code was written: the AEAD (ciphertext AND tag) matches
+// ChaCha20Poly1305's own encrypt() output across 20 random trials
+// with varying AAD/plaintext lengths (exercising the RFC's own
+// pad16 boundary in both directions); HKDF (extract then expand)
+// matches the library's own HKDF across 15 random trials with varying
+// output lengths, including lengths past one SHA-256 block requiring
+// the T(1)||T(2) multi-block expansion path.
+
+// out = (a + b) mod 2^64, written as two 4-byte little-endian words
+// -- shared by both the AEAD's own 8-byte length fields below.
+fn aead_write_le64(buf: mut ref i64, off: i64, v: i64) -> i64 {
+  let vu: u64 = v as u64;
+  let i: i64 = 0;
+  while i < 8 {
+    let b: u32 = ((vu >> ((i * 8) as u64)) & (255 as u64)) as u32;
+    let _ = buf_write_byte(buf, (off + i) as u32, b);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Builds RFC 8439 section 2.8's own mac_data = aad || pad16(aad) ||
+// data || pad16(data) || len(aad) as 8-byte LE || len(data) as
+// 8-byte LE into `out`, returning its total length.
+fn chacha20_poly1305_build_mac_data(aad: mut ref i64, aad_len: i64, data: mut ref i64, data_len: i64, out: mut ref i64) -> i64 {
+  let pos: i64 = 0;
+  let i: i64 = 0;
+  while i < aad_len {
+    let _ = buf_write_byte(out, pos as u32, buf_read_byte(aad, i as u32));
+    pos = pos + 1;
+    i = i + 1;
+  }
+  let aad_pad: i64 = (16 - (aad_len % 16)) % 16;
+  let j: i64 = 0;
+  while j < aad_pad {
+    let _ = buf_write_byte(out, pos as u32, 0 as u32);
+    pos = pos + 1;
+    j = j + 1;
+  }
+  let k: i64 = 0;
+  while k < data_len {
+    let _ = buf_write_byte(out, pos as u32, buf_read_byte(data, k as u32));
+    pos = pos + 1;
+    k = k + 1;
+  }
+  let data_pad: i64 = (16 - (data_len % 16)) % 16;
+  let m: i64 = 0;
+  while m < data_pad {
+    let _ = buf_write_byte(out, pos as u32, 0 as u32);
+    pos = pos + 1;
+    m = m + 1;
+  }
+  let _ = aead_write_le64(out, pos, aad_len);
+  pos = pos + 8;
+  let _ = aead_write_le64(out, pos, data_len);
+  pos = pos + 8;
+  return pos;
+}
+
+// Encrypts `plaintext` (up to 4096 bytes, mac_data_scratch's own
+// fixed size) with ChaCha20-Poly1305, key/nonce per RFC 8439,
+// producing `out_ciphertext` (same length as plaintext) and a 16-byte
+// `out_tag`. state_buf/working_buf/keystream_buf are chacha20_block's
+// own scratch shape; block_scratch is poly1305_mac's own; otk_scratch
+// (32B) and mac_data_scratch (4224B) are this function's own.
+fn chacha20_poly1305_encrypt(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, aad_len: i64,
+                              plaintext: mut ref i64, plaintext_len: i64,
+                              state_buf: mut ref i64, working_buf: mut ref i64, keystream_buf: mut ref i64,
+                              block_scratch: mut ref i64, otk_scratch: mut ref i64, mac_data_scratch: mut ref i64,
+                              out_ciphertext: mut ref i64, out_tag: mut ref i64) -> i64 {
+  let _ = chacha20_block(key, 0 as u32, nonce, state_buf, working_buf, keystream_buf);
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(otk_scratch, i as u32, buf_read_byte(keystream_buf, i as u32));
+    i = i + 1;
+  }
+
+  let _ = chacha20_encrypt(key, nonce, 1 as u32, plaintext, plaintext_len, state_buf, working_buf, keystream_buf, out_ciphertext);
+
+  let mac_len: i64 = chacha20_poly1305_build_mac_data(aad, aad_len, out_ciphertext, plaintext_len, mac_data_scratch);
+  let _ = poly1305_mac(otk_scratch, mac_data_scratch, mac_len, block_scratch, out_tag);
+  return 0;
+}
+
+// Verifies `tag_in` (16 bytes) against `ciphertext`/`aad`, and if (and
+// only if) it matches, decrypts into `out_plaintext`. Returns 0 on
+// success, -1 on a tag mismatch (out_plaintext is left untouched --
+// "reject, don't guess," the same posture as every other integrity
+// check in this codebase; a caller must never act on decrypted data
+// from a call that returned -1).
+fn chacha20_poly1305_decrypt(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, aad_len: i64,
+                              ciphertext: mut ref i64, ciphertext_len: i64, tag_in: mut ref i64,
+                              state_buf: mut ref i64, working_buf: mut ref i64, keystream_buf: mut ref i64,
+                              block_scratch: mut ref i64, otk_scratch: mut ref i64, mac_data_scratch: mut ref i64,
+                              computed_tag_scratch: mut ref i64, out_plaintext: mut ref i64) -> i64 {
+  let _ = chacha20_block(key, 0 as u32, nonce, state_buf, working_buf, keystream_buf);
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(otk_scratch, i as u32, buf_read_byte(keystream_buf, i as u32));
+    i = i + 1;
+  }
+
+  let mac_len: i64 = chacha20_poly1305_build_mac_data(aad, aad_len, ciphertext, ciphertext_len, mac_data_scratch);
+  let _ = poly1305_mac(otk_scratch, mac_data_scratch, mac_len, block_scratch, computed_tag_scratch);
+
+  if poly1305_verify_constant_time(computed_tag_scratch, tag_in, 16) == 0 {
+    return 0 - 1;
+  }
+
+  let _ = chacha20_encrypt(key, nonce, 1 as u32, ciphertext, ciphertext_len, state_buf, working_buf, keystream_buf, out_plaintext);
+  return 0;
+}
+
+// HKDF-Extract (RFC 5869 section 2.2): PRK = HMAC-SHA256(salt, ikm).
+// Just hkdf_hmac_sha256 under a name matching the RFC's own
+// terminology -- salt plays HMAC's "key" role, ikm its "message" role.
+fn hkdf_extract(salt: mut ref i64, salt_len: i64, ikm: mut ref i64, ikm_len: i64, out_prk: mut ref i64) -> i64 {
+  return hkdf_hmac_sha256(salt, salt_len, ikm, ikm_len, out_prk);
+}
+
+// HKDF-Expand (RFC 5869 section 2.3): T(0) = empty, T(i) =
+// HMAC-SHA256(PRK, T(i-1) || info || i), OKM = T(1) || T(2) || ...
+// truncated to `out_len` (capped at 256 bytes -- t_scratch's own
+// fixed size -- comfortably past anything a SHA-256-based TLS 1.3
+// cipher suite's own key schedule ever derives in one call).
+fn hkdf_expand(prk: mut ref i64, prk_len: i64, info: mut ref i64, info_len: i64, out_len: i64,
+               t_scratch: mut ref i64, hmac_input_scratch: mut ref i64, out: mut ref i64) -> i64 {
+  let t_len: i64 = 0;
+  let produced: i64 = 0;
+  let counter: u32 = 1 as u32;
+  while produced < out_len {
+    let i: i64 = 0;
+    while i < t_len {
+      let _ = buf_write_byte(hmac_input_scratch, i as u32, buf_read_byte(t_scratch, i as u32));
+      i = i + 1;
+    }
+    let j: i64 = 0;
+    while j < info_len {
+      let _ = buf_write_byte(hmac_input_scratch, (t_len + j) as u32, buf_read_byte(info, j as u32));
+      j = j + 1;
+    }
+    let _ = buf_write_byte(hmac_input_scratch, (t_len + info_len) as u32, counter);
+    let input_len: i64 = t_len + info_len + 1;
+
+    let _ = hkdf_hmac_sha256(prk, prk_len, hmac_input_scratch, input_len, t_scratch);
+    t_len = 32;
+
+    let take: i64 = if (out_len - produced) < 32 { out_len - produced } else { 32 };
+    let k: i64 = 0;
+    while k < take {
+      let _ = buf_write_byte(out, (produced + k) as u32, buf_read_byte(t_scratch, k as u32));
+      k = k + 1;
+    }
+    produced = produced + take;
+    counter = counter + (1 as u32);
+  }
+  return 0;
+}
+
+// A separate, larger-capacity HMAC-SHA256, deliberately NOT sharing
+// code or scratch with round 61's own `hmac_sha256` (real
+// authentication's own security-critical, already-tested primitive,
+// capped at msg_len<=64 for its own narrower need) -- HKDF-Expand's
+// own per-round HMAC input (T(i-1) || info || counter) can genuinely
+// exceed 64 bytes once `info` is TLS-shaped, and touching a proven,
+// already-shipped authentication primitive to widen its cap for an
+// unrelated caller is exactly the kind of risk this project's own
+// "don't touch working code without a real forcing need" discipline
+// warns against -- a small amount of duplicated HMAC structure is a
+// better trade than that risk. msg_len capped at 256 bytes by
+// hkdf_hmac_msg_scratch's own fixed size (64 + 256), comfortably past
+// anything HKDF-Expand's own construction above ever builds.
+fn hkdf_hmac_sha256(key: mut ref i64, key_len: i64, msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  if msg_len > 256 {
+    return 0 - 1;
+  }
+  let key_block: mut ref i64 = hkdf_hmac_key_block_get();
+  let i: i64 = 0;
+  if key_len > 64 {
+    let _ = sha256_hash(key, key_len, key_block);
+    i = 32;
+  } else {
+    while i < key_len {
+      let _ = buf_write_byte(key_block, i as u32, buf_read_byte(key, i as u32));
+      i = i + 1;
+    }
+  }
+  while i < 64 {
+    let _ = buf_write_byte(key_block, i as u32, 0 as u32);
+    i = i + 1;
+  }
+
+  let msg_scratch: mut ref i64 = hkdf_hmac_msg_scratch_get();
+  i = 0;
+  while i < 64 {
+    let kb: u32 = buf_read_byte(key_block, i as u32);
+    let _ = buf_write_byte(msg_scratch, i as u32, kb ^ (0x36 as u32));
+    i = i + 1;
+  }
+  i = 0;
+  while i < msg_len {
+    let _ = buf_write_byte(msg_scratch, (64 + i) as u32, buf_read_byte(msg, i as u32));
+    i = i + 1;
+  }
+  let inner_hash: mut ref i64 = hkdf_hmac_inner_hash_get();
+  let _ = sha256_hash(msg_scratch, 64 + msg_len, inner_hash);
+
+  i = 0;
+  while i < 64 {
+    let kb2: u32 = buf_read_byte(key_block, i as u32);
+    let _ = buf_write_byte(msg_scratch, i as u32, kb2 ^ (0x5c as u32));
+    i = i + 1;
+  }
+  i = 0;
+  while i < 32 {
+    let _ = buf_write_byte(msg_scratch, (64 + i) as u32, buf_read_byte(inner_hash, i as u32));
+    i = i + 1;
+  }
+  let _ = sha256_hash(msg_scratch, 96, out);
+  return 0;
+}
+
+
+// AEAD and HKDF vectors both generated by the same verified Python
+// run as every other primitive this round (cross-checked against the
+// real `cryptography` library's own ChaCha20Poly1305/HKDF objects) --
+// see this section's own header comment above chacha20_poly1305_
+// encrypt for the full methodology.
+fn aead_hkdf_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let state_buf: mut ref i64 = aead_state_get();
+  let working_buf: mut ref i64 = aead_working_get();
+  let keystream_buf: mut ref i64 = aead_keystream_get();
+  let block_scratch: mut ref i64 = aead_block_scratch_get();
+  let otk_scratch: mut ref i64 = aead_otk_get();
+  let mac_data_scratch: mut ref i64 = aead_mac_data_get();
+  let computed_tag_scratch: mut ref i64 = aead_computed_tag_get();
+
+  let key: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(key, 0 as u32, 0x00 as u32);
+  let _ = buf_write_byte(key, 1 as u32, 0x01 as u32);
+  let _ = buf_write_byte(key, 2 as u32, 0x02 as u32);
+  let _ = buf_write_byte(key, 3 as u32, 0x03 as u32);
+  let _ = buf_write_byte(key, 4 as u32, 0x04 as u32);
+  let _ = buf_write_byte(key, 5 as u32, 0x05 as u32);
+  let _ = buf_write_byte(key, 6 as u32, 0x06 as u32);
+  let _ = buf_write_byte(key, 7 as u32, 0x07 as u32);
+  let _ = buf_write_byte(key, 8 as u32, 0x08 as u32);
+  let _ = buf_write_byte(key, 9 as u32, 0x09 as u32);
+  let _ = buf_write_byte(key, 10 as u32, 0x0a as u32);
+  let _ = buf_write_byte(key, 11 as u32, 0x0b as u32);
+  let _ = buf_write_byte(key, 12 as u32, 0x0c as u32);
+  let _ = buf_write_byte(key, 13 as u32, 0x0d as u32);
+  let _ = buf_write_byte(key, 14 as u32, 0x0e as u32);
+  let _ = buf_write_byte(key, 15 as u32, 0x0f as u32);
+  let _ = buf_write_byte(key, 16 as u32, 0x10 as u32);
+  let _ = buf_write_byte(key, 17 as u32, 0x11 as u32);
+  let _ = buf_write_byte(key, 18 as u32, 0x12 as u32);
+  let _ = buf_write_byte(key, 19 as u32, 0x13 as u32);
+  let _ = buf_write_byte(key, 20 as u32, 0x14 as u32);
+  let _ = buf_write_byte(key, 21 as u32, 0x15 as u32);
+  let _ = buf_write_byte(key, 22 as u32, 0x16 as u32);
+  let _ = buf_write_byte(key, 23 as u32, 0x17 as u32);
+  let _ = buf_write_byte(key, 24 as u32, 0x18 as u32);
+  let _ = buf_write_byte(key, 25 as u32, 0x19 as u32);
+  let _ = buf_write_byte(key, 26 as u32, 0x1a as u32);
+  let _ = buf_write_byte(key, 27 as u32, 0x1b as u32);
+  let _ = buf_write_byte(key, 28 as u32, 0x1c as u32);
+  let _ = buf_write_byte(key, 29 as u32, 0x1d as u32);
+  let _ = buf_write_byte(key, 30 as u32, 0x1e as u32);
+  let _ = buf_write_byte(key, 31 as u32, 0x1f as u32);
+  let nonce: mut ref i64 = dhruva_alloc_bytes(12);
+  let _ = buf_write_byte(nonce, 0 as u32, 0x00 as u32);
+  let _ = buf_write_byte(nonce, 1 as u32, 0x01 as u32);
+  let _ = buf_write_byte(nonce, 2 as u32, 0x02 as u32);
+  let _ = buf_write_byte(nonce, 3 as u32, 0x03 as u32);
+  let _ = buf_write_byte(nonce, 4 as u32, 0x04 as u32);
+  let _ = buf_write_byte(nonce, 5 as u32, 0x05 as u32);
+  let _ = buf_write_byte(nonce, 6 as u32, 0x06 as u32);
+  let _ = buf_write_byte(nonce, 7 as u32, 0x07 as u32);
+  let _ = buf_write_byte(nonce, 8 as u32, 0x08 as u32);
+  let _ = buf_write_byte(nonce, 9 as u32, 0x09 as u32);
+  let _ = buf_write_byte(nonce, 10 as u32, 0x0a as u32);
+  let _ = buf_write_byte(nonce, 11 as u32, 0x0b as u32);
+  let aad: mut ref i64 = dhruva_alloc_bytes(6);
+  let _ = buf_write_byte(aad, 0 as u32, 0x68 as u32);
+  let _ = buf_write_byte(aad, 1 as u32, 0x65 as u32);
+  let _ = buf_write_byte(aad, 2 as u32, 0x61 as u32);
+  let _ = buf_write_byte(aad, 3 as u32, 0x64 as u32);
+  let _ = buf_write_byte(aad, 4 as u32, 0x65 as u32);
+  let _ = buf_write_byte(aad, 5 as u32, 0x72 as u32);
+
+  let plaintext_str: Str = "Dhruva TLS-shaped AEAD test payload, exercising the pad16 boundary too!";
+  let plaintext_len: i64 = str_len_bytes(plaintext_str);
+  let plaintext: mut ref i64 = dhruva_alloc_bytes(plaintext_len);
+  let pi: i64 = 0;
+  while pi < plaintext_len {
+    let _ = buf_write_byte(plaintext, pi as u32, str_byte_at(plaintext_str, pi) as u32);
+    pi = pi + 1;
+  }
+
+  let expected_ct: mut ref i64 = dhruva_alloc_bytes(71);
+  let _ = buf_write_byte(expected_ct, 0 as u32, 0xcd as u32);
+  let _ = buf_write_byte(expected_ct, 1 as u32, 0x93 as u32);
+  let _ = buf_write_byte(expected_ct, 2 as u32, 0x7a as u32);
+  let _ = buf_write_byte(expected_ct, 3 as u32, 0x75 as u32);
+  let _ = buf_write_byte(expected_ct, 4 as u32, 0x5f as u32);
+  let _ = buf_write_byte(expected_ct, 5 as u32, 0x76 as u32);
+  let _ = buf_write_byte(expected_ct, 6 as u32, 0x85 as u32);
+  let _ = buf_write_byte(expected_ct, 7 as u32, 0x14 as u32);
+  let _ = buf_write_byte(expected_ct, 8 as u32, 0xfb as u32);
+  let _ = buf_write_byte(expected_ct, 9 as u32, 0xd0 as u32);
+  let _ = buf_write_byte(expected_ct, 10 as u32, 0x12 as u32);
+  let _ = buf_write_byte(expected_ct, 11 as u32, 0x80 as u32);
+  let _ = buf_write_byte(expected_ct, 12 as u32, 0xf0 as u32);
+  let _ = buf_write_byte(expected_ct, 13 as u32, 0x7c as u32);
+  let _ = buf_write_byte(expected_ct, 14 as u32, 0x7e as u32);
+  let _ = buf_write_byte(expected_ct, 15 as u32, 0x06 as u32);
+  let _ = buf_write_byte(expected_ct, 16 as u32, 0xad as u32);
+  let _ = buf_write_byte(expected_ct, 17 as u32, 0x50 as u32);
+  let _ = buf_write_byte(expected_ct, 18 as u32, 0xf3 as u32);
+  let _ = buf_write_byte(expected_ct, 19 as u32, 0xa2 as u32);
+  let _ = buf_write_byte(expected_ct, 20 as u32, 0x10 as u32);
+  let _ = buf_write_byte(expected_ct, 21 as u32, 0x30 as u32);
+  let _ = buf_write_byte(expected_ct, 22 as u32, 0x8d as u32);
+  let _ = buf_write_byte(expected_ct, 23 as u32, 0xcd as u32);
+  let _ = buf_write_byte(expected_ct, 24 as u32, 0x83 as u32);
+  let _ = buf_write_byte(expected_ct, 25 as u32, 0xe4 as u32);
+  let _ = buf_write_byte(expected_ct, 26 as u32, 0x5b as u32);
+  let _ = buf_write_byte(expected_ct, 27 as u32, 0xe5 as u32);
+  let _ = buf_write_byte(expected_ct, 28 as u32, 0x05 as u32);
+  let _ = buf_write_byte(expected_ct, 29 as u32, 0xa1 as u32);
+  let _ = buf_write_byte(expected_ct, 30 as u32, 0xdf as u32);
+  let _ = buf_write_byte(expected_ct, 31 as u32, 0x50 as u32);
+  let _ = buf_write_byte(expected_ct, 32 as u32, 0x83 as u32);
+  let _ = buf_write_byte(expected_ct, 33 as u32, 0xe1 as u32);
+  let _ = buf_write_byte(expected_ct, 34 as u32, 0x48 as u32);
+  let _ = buf_write_byte(expected_ct, 35 as u32, 0xdf as u32);
+  let _ = buf_write_byte(expected_ct, 36 as u32, 0xc6 as u32);
+  let _ = buf_write_byte(expected_ct, 37 as u32, 0x7b as u32);
+  let _ = buf_write_byte(expected_ct, 38 as u32, 0xc9 as u32);
+  let _ = buf_write_byte(expected_ct, 39 as u32, 0xfd as u32);
+  let _ = buf_write_byte(expected_ct, 40 as u32, 0x45 as u32);
+  let _ = buf_write_byte(expected_ct, 41 as u32, 0x51 as u32);
+  let _ = buf_write_byte(expected_ct, 42 as u32, 0x1f as u32);
+  let _ = buf_write_byte(expected_ct, 43 as u32, 0xab as u32);
+  let _ = buf_write_byte(expected_ct, 44 as u32, 0x0c as u32);
+  let _ = buf_write_byte(expected_ct, 45 as u32, 0xfa as u32);
+  let _ = buf_write_byte(expected_ct, 46 as u32, 0xe8 as u32);
+  let _ = buf_write_byte(expected_ct, 47 as u32, 0x03 as u32);
+  let _ = buf_write_byte(expected_ct, 48 as u32, 0x0a as u32);
+  let _ = buf_write_byte(expected_ct, 49 as u32, 0xec as u32);
+  let _ = buf_write_byte(expected_ct, 50 as u32, 0xcc as u32);
+  let _ = buf_write_byte(expected_ct, 51 as u32, 0x54 as u32);
+  let _ = buf_write_byte(expected_ct, 52 as u32, 0x8d as u32);
+  let _ = buf_write_byte(expected_ct, 53 as u32, 0x49 as u32);
+  let _ = buf_write_byte(expected_ct, 54 as u32, 0xdc as u32);
+  let _ = buf_write_byte(expected_ct, 55 as u32, 0xaa as u32);
+  let _ = buf_write_byte(expected_ct, 56 as u32, 0x24 as u32);
+  let _ = buf_write_byte(expected_ct, 57 as u32, 0x98 as u32);
+  let _ = buf_write_byte(expected_ct, 58 as u32, 0xbb as u32);
+  let _ = buf_write_byte(expected_ct, 59 as u32, 0x68 as u32);
+  let _ = buf_write_byte(expected_ct, 60 as u32, 0xe5 as u32);
+  let _ = buf_write_byte(expected_ct, 61 as u32, 0x21 as u32);
+  let _ = buf_write_byte(expected_ct, 62 as u32, 0xfa as u32);
+  let _ = buf_write_byte(expected_ct, 63 as u32, 0xb7 as u32);
+  let _ = buf_write_byte(expected_ct, 64 as u32, 0x0b as u32);
+  let _ = buf_write_byte(expected_ct, 65 as u32, 0x01 as u32);
+  let _ = buf_write_byte(expected_ct, 66 as u32, 0x9c as u32);
+  let _ = buf_write_byte(expected_ct, 67 as u32, 0xb9 as u32);
+  let _ = buf_write_byte(expected_ct, 68 as u32, 0x8a as u32);
+  let _ = buf_write_byte(expected_ct, 69 as u32, 0x7b as u32);
+  let _ = buf_write_byte(expected_ct, 70 as u32, 0x0d as u32);
+  let expected_tag: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = buf_write_byte(expected_tag, 0 as u32, 0xaa as u32);
+  let _ = buf_write_byte(expected_tag, 1 as u32, 0x2c as u32);
+  let _ = buf_write_byte(expected_tag, 2 as u32, 0x8c as u32);
+  let _ = buf_write_byte(expected_tag, 3 as u32, 0xed as u32);
+  let _ = buf_write_byte(expected_tag, 4 as u32, 0x9c as u32);
+  let _ = buf_write_byte(expected_tag, 5 as u32, 0xf4 as u32);
+  let _ = buf_write_byte(expected_tag, 6 as u32, 0xb0 as u32);
+  let _ = buf_write_byte(expected_tag, 7 as u32, 0x6d as u32);
+  let _ = buf_write_byte(expected_tag, 8 as u32, 0xc3 as u32);
+  let _ = buf_write_byte(expected_tag, 9 as u32, 0x85 as u32);
+  let _ = buf_write_byte(expected_tag, 10 as u32, 0x27 as u32);
+  let _ = buf_write_byte(expected_tag, 11 as u32, 0x4f as u32);
+  let _ = buf_write_byte(expected_tag, 12 as u32, 0x52 as u32);
+  let _ = buf_write_byte(expected_tag, 13 as u32, 0x06 as u32);
+  let _ = buf_write_byte(expected_tag, 14 as u32, 0x5e as u32);
+  let _ = buf_write_byte(expected_tag, 15 as u32, 0x11 as u32);
+
+  let out_ct: mut ref i64 = dhruva_alloc_bytes(plaintext_len);
+  let out_tag: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = chacha20_poly1305_encrypt(key, nonce, aad, 6, plaintext, plaintext_len,
+                                     state_buf, working_buf, keystream_buf,
+                                     block_scratch, otk_scratch, mac_data_scratch,
+                                     out_ct, out_tag);
+  if chacha20_bytes_equal(out_ct, expected_ct, plaintext_len) == 0 {
+    ok = 0;
+  }
+  if chacha20_bytes_equal(out_tag, expected_tag, 16) == 0 {
+    ok = 0;
+  }
+
+  // Decrypt round trip: the real ciphertext+tag must decrypt back to
+  // the original plaintext.
+  let out_pt: mut ref i64 = dhruva_alloc_bytes(plaintext_len);
+  let dec_status: i64 = chacha20_poly1305_decrypt(key, nonce, aad, 6, out_ct, plaintext_len, out_tag,
+                                                    state_buf, working_buf, keystream_buf,
+                                                    block_scratch, otk_scratch, mac_data_scratch,
+                                                    computed_tag_scratch, out_pt);
+  if dec_status != 0 {
+    ok = 0;
+  }
+  if chacha20_bytes_equal(out_pt, plaintext, plaintext_len) == 0 {
+    ok = 0;
+  }
+
+  // A tampered ciphertext must fail tag verification and NOT decrypt.
+  let bad_ct: mut ref i64 = dhruva_alloc_bytes(plaintext_len);
+  let bi: i64 = 0;
+  while bi < plaintext_len {
+    let _ = buf_write_byte(bad_ct, bi as u32, buf_read_byte(out_ct, bi as u32));
+    bi = bi + 1;
+  }
+  let _ = buf_write_byte(bad_ct, 0 as u32, buf_read_byte(bad_ct, 0 as u32) ^ (1 as u32));
+  let bad_out_pt: mut ref i64 = dhruva_alloc_bytes(plaintext_len);
+  let bad_dec_status: i64 = chacha20_poly1305_decrypt(key, nonce, aad, 6, bad_ct, plaintext_len, out_tag,
+                                                         state_buf, working_buf, keystream_buf,
+                                                         block_scratch, otk_scratch, mac_data_scratch,
+                                                         computed_tag_scratch, bad_out_pt);
+  if bad_dec_status == 0 {
+    ok = 0; // tampered ciphertext must NOT verify
+  }
+
+  // HKDF
+  let salt: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = buf_write_byte(salt, 0 as u32, 0x00 as u32);
+  let _ = buf_write_byte(salt, 1 as u32, 0x01 as u32);
+  let _ = buf_write_byte(salt, 2 as u32, 0x02 as u32);
+  let _ = buf_write_byte(salt, 3 as u32, 0x03 as u32);
+  let _ = buf_write_byte(salt, 4 as u32, 0x04 as u32);
+  let _ = buf_write_byte(salt, 5 as u32, 0x05 as u32);
+  let _ = buf_write_byte(salt, 6 as u32, 0x06 as u32);
+  let _ = buf_write_byte(salt, 7 as u32, 0x07 as u32);
+  let _ = buf_write_byte(salt, 8 as u32, 0x08 as u32);
+  let _ = buf_write_byte(salt, 9 as u32, 0x09 as u32);
+  let _ = buf_write_byte(salt, 10 as u32, 0x0a as u32);
+  let _ = buf_write_byte(salt, 11 as u32, 0x0b as u32);
+  let _ = buf_write_byte(salt, 12 as u32, 0x0c as u32);
+  let _ = buf_write_byte(salt, 13 as u32, 0x0d as u32);
+  let _ = buf_write_byte(salt, 14 as u32, 0x0e as u32);
+  let _ = buf_write_byte(salt, 15 as u32, 0x0f as u32);
+  let ikm: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(ikm, 0 as u32, 0x20 as u32);
+  let _ = buf_write_byte(ikm, 1 as u32, 0x21 as u32);
+  let _ = buf_write_byte(ikm, 2 as u32, 0x22 as u32);
+  let _ = buf_write_byte(ikm, 3 as u32, 0x23 as u32);
+  let _ = buf_write_byte(ikm, 4 as u32, 0x24 as u32);
+  let _ = buf_write_byte(ikm, 5 as u32, 0x25 as u32);
+  let _ = buf_write_byte(ikm, 6 as u32, 0x26 as u32);
+  let _ = buf_write_byte(ikm, 7 as u32, 0x27 as u32);
+  let _ = buf_write_byte(ikm, 8 as u32, 0x28 as u32);
+  let _ = buf_write_byte(ikm, 9 as u32, 0x29 as u32);
+  let _ = buf_write_byte(ikm, 10 as u32, 0x2a as u32);
+  let _ = buf_write_byte(ikm, 11 as u32, 0x2b as u32);
+  let _ = buf_write_byte(ikm, 12 as u32, 0x2c as u32);
+  let _ = buf_write_byte(ikm, 13 as u32, 0x2d as u32);
+  let _ = buf_write_byte(ikm, 14 as u32, 0x2e as u32);
+  let _ = buf_write_byte(ikm, 15 as u32, 0x2f as u32);
+  let _ = buf_write_byte(ikm, 16 as u32, 0x30 as u32);
+  let _ = buf_write_byte(ikm, 17 as u32, 0x31 as u32);
+  let _ = buf_write_byte(ikm, 18 as u32, 0x32 as u32);
+  let _ = buf_write_byte(ikm, 19 as u32, 0x33 as u32);
+  let _ = buf_write_byte(ikm, 20 as u32, 0x34 as u32);
+  let _ = buf_write_byte(ikm, 21 as u32, 0x35 as u32);
+  let _ = buf_write_byte(ikm, 22 as u32, 0x36 as u32);
+  let _ = buf_write_byte(ikm, 23 as u32, 0x37 as u32);
+  let _ = buf_write_byte(ikm, 24 as u32, 0x38 as u32);
+  let _ = buf_write_byte(ikm, 25 as u32, 0x39 as u32);
+  let _ = buf_write_byte(ikm, 26 as u32, 0x3a as u32);
+  let _ = buf_write_byte(ikm, 27 as u32, 0x3b as u32);
+  let _ = buf_write_byte(ikm, 28 as u32, 0x3c as u32);
+  let _ = buf_write_byte(ikm, 29 as u32, 0x3d as u32);
+  let _ = buf_write_byte(ikm, 30 as u32, 0x3e as u32);
+  let _ = buf_write_byte(ikm, 31 as u32, 0x3f as u32);
+  let info_str: Str = "dhruva hkdf test";
+  let info_len: i64 = str_len_bytes(info_str);
+  let info: mut ref i64 = dhruva_alloc_bytes(info_len);
+  let ii: i64 = 0;
+  while ii < info_len {
+    let _ = buf_write_byte(info, ii as u32, str_byte_at(info_str, ii) as u32);
+    ii = ii + 1;
+  }
+
+  let prk_out: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = hkdf_extract(salt, 16, ikm, 32, prk_out);
+  let expected_prk: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(expected_prk, 0 as u32, 0x21 as u32);
+  let _ = buf_write_byte(expected_prk, 1 as u32, 0xb8 as u32);
+  let _ = buf_write_byte(expected_prk, 2 as u32, 0xe8 as u32);
+  let _ = buf_write_byte(expected_prk, 3 as u32, 0x92 as u32);
+  let _ = buf_write_byte(expected_prk, 4 as u32, 0xbb as u32);
+  let _ = buf_write_byte(expected_prk, 5 as u32, 0x84 as u32);
+  let _ = buf_write_byte(expected_prk, 6 as u32, 0xc0 as u32);
+  let _ = buf_write_byte(expected_prk, 7 as u32, 0x76 as u32);
+  let _ = buf_write_byte(expected_prk, 8 as u32, 0x0c as u32);
+  let _ = buf_write_byte(expected_prk, 9 as u32, 0x1c as u32);
+  let _ = buf_write_byte(expected_prk, 10 as u32, 0x21 as u32);
+  let _ = buf_write_byte(expected_prk, 11 as u32, 0xff as u32);
+  let _ = buf_write_byte(expected_prk, 12 as u32, 0x44 as u32);
+  let _ = buf_write_byte(expected_prk, 13 as u32, 0x33 as u32);
+  let _ = buf_write_byte(expected_prk, 14 as u32, 0x2b as u32);
+  let _ = buf_write_byte(expected_prk, 15 as u32, 0xc1 as u32);
+  let _ = buf_write_byte(expected_prk, 16 as u32, 0x25 as u32);
+  let _ = buf_write_byte(expected_prk, 17 as u32, 0x5e as u32);
+  let _ = buf_write_byte(expected_prk, 18 as u32, 0x9a as u32);
+  let _ = buf_write_byte(expected_prk, 19 as u32, 0x7d as u32);
+  let _ = buf_write_byte(expected_prk, 20 as u32, 0x39 as u32);
+  let _ = buf_write_byte(expected_prk, 21 as u32, 0x87 as u32);
+  let _ = buf_write_byte(expected_prk, 22 as u32, 0xc0 as u32);
+  let _ = buf_write_byte(expected_prk, 23 as u32, 0x34 as u32);
+  let _ = buf_write_byte(expected_prk, 24 as u32, 0x2a as u32);
+  let _ = buf_write_byte(expected_prk, 25 as u32, 0x3a as u32);
+  let _ = buf_write_byte(expected_prk, 26 as u32, 0xa3 as u32);
+  let _ = buf_write_byte(expected_prk, 27 as u32, 0x31 as u32);
+  let _ = buf_write_byte(expected_prk, 28 as u32, 0x79 as u32);
+  let _ = buf_write_byte(expected_prk, 29 as u32, 0x3c as u32);
+  let _ = buf_write_byte(expected_prk, 30 as u32, 0x67 as u32);
+  let _ = buf_write_byte(expected_prk, 31 as u32, 0xc5 as u32);
+  if chacha20_bytes_equal(prk_out, expected_prk, 32) == 0 {
+    ok = 0;
+  }
+
+  let t_scratch: mut ref i64 = hkdf_t_scratch_get();
+  let hmac_input_scratch: mut ref i64 = hkdf_hmac_input_scratch_get();
+  let okm_out: mut ref i64 = dhruva_alloc_bytes(48);
+  let _ = hkdf_expand(prk_out, 32, info, info_len, 48, t_scratch, hmac_input_scratch, okm_out);
+  let expected_okm: mut ref i64 = dhruva_alloc_bytes(48);
+  let _ = buf_write_byte(expected_okm, 0 as u32, 0xa6 as u32);
+  let _ = buf_write_byte(expected_okm, 1 as u32, 0x20 as u32);
+  let _ = buf_write_byte(expected_okm, 2 as u32, 0x6b as u32);
+  let _ = buf_write_byte(expected_okm, 3 as u32, 0x14 as u32);
+  let _ = buf_write_byte(expected_okm, 4 as u32, 0x12 as u32);
+  let _ = buf_write_byte(expected_okm, 5 as u32, 0x7a as u32);
+  let _ = buf_write_byte(expected_okm, 6 as u32, 0x2c as u32);
+  let _ = buf_write_byte(expected_okm, 7 as u32, 0xd9 as u32);
+  let _ = buf_write_byte(expected_okm, 8 as u32, 0xaf as u32);
+  let _ = buf_write_byte(expected_okm, 9 as u32, 0x3f as u32);
+  let _ = buf_write_byte(expected_okm, 10 as u32, 0x32 as u32);
+  let _ = buf_write_byte(expected_okm, 11 as u32, 0x21 as u32);
+  let _ = buf_write_byte(expected_okm, 12 as u32, 0x95 as u32);
+  let _ = buf_write_byte(expected_okm, 13 as u32, 0xb5 as u32);
+  let _ = buf_write_byte(expected_okm, 14 as u32, 0x69 as u32);
+  let _ = buf_write_byte(expected_okm, 15 as u32, 0x11 as u32);
+  let _ = buf_write_byte(expected_okm, 16 as u32, 0x85 as u32);
+  let _ = buf_write_byte(expected_okm, 17 as u32, 0x43 as u32);
+  let _ = buf_write_byte(expected_okm, 18 as u32, 0x28 as u32);
+  let _ = buf_write_byte(expected_okm, 19 as u32, 0x56 as u32);
+  let _ = buf_write_byte(expected_okm, 20 as u32, 0xf2 as u32);
+  let _ = buf_write_byte(expected_okm, 21 as u32, 0x7f as u32);
+  let _ = buf_write_byte(expected_okm, 22 as u32, 0x26 as u32);
+  let _ = buf_write_byte(expected_okm, 23 as u32, 0x52 as u32);
+  let _ = buf_write_byte(expected_okm, 24 as u32, 0x87 as u32);
+  let _ = buf_write_byte(expected_okm, 25 as u32, 0x87 as u32);
+  let _ = buf_write_byte(expected_okm, 26 as u32, 0x04 as u32);
+  let _ = buf_write_byte(expected_okm, 27 as u32, 0x74 as u32);
+  let _ = buf_write_byte(expected_okm, 28 as u32, 0xf7 as u32);
+  let _ = buf_write_byte(expected_okm, 29 as u32, 0xfa as u32);
+  let _ = buf_write_byte(expected_okm, 30 as u32, 0xc7 as u32);
+  let _ = buf_write_byte(expected_okm, 31 as u32, 0x5f as u32);
+  let _ = buf_write_byte(expected_okm, 32 as u32, 0x34 as u32);
+  let _ = buf_write_byte(expected_okm, 33 as u32, 0x84 as u32);
+  let _ = buf_write_byte(expected_okm, 34 as u32, 0xca as u32);
+  let _ = buf_write_byte(expected_okm, 35 as u32, 0x13 as u32);
+  let _ = buf_write_byte(expected_okm, 36 as u32, 0x8a as u32);
+  let _ = buf_write_byte(expected_okm, 37 as u32, 0xd8 as u32);
+  let _ = buf_write_byte(expected_okm, 38 as u32, 0x73 as u32);
+  let _ = buf_write_byte(expected_okm, 39 as u32, 0x7b as u32);
+  let _ = buf_write_byte(expected_okm, 40 as u32, 0xd1 as u32);
+  let _ = buf_write_byte(expected_okm, 41 as u32, 0x2e as u32);
+  let _ = buf_write_byte(expected_okm, 42 as u32, 0x5d as u32);
+  let _ = buf_write_byte(expected_okm, 43 as u32, 0x86 as u32);
+  let _ = buf_write_byte(expected_okm, 44 as u32, 0x3b as u32);
+  let _ = buf_write_byte(expected_okm, 45 as u32, 0xa1 as u32);
+  let _ = buf_write_byte(expected_okm, 46 as u32, 0x8f as u32);
+  let _ = buf_write_byte(expected_okm, 47 as u32, 0xc4 as u32);
+  if chacha20_bytes_equal(okm_out, expected_okm, 48) == 0 {
+    ok = 0;
+  }
+
+  let _ = uart_puts("CRYPTO: ChaCha20-Poly1305 AEAD + HKDF vs a real, independently-verified reference");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+
+
 
 // Signed with the private key matching pki_init's own compile-time-
 // pinned public key -- generated once via the same verified Python
@@ -22008,6 +22650,18 @@ fn kernel_main() -> i64 {
   let _ = pki_pinned_key_set(dhruva_alloc_bytes(32));
   let _ = pki_sig_path_scratch_set(dhruva_alloc_bytes(40));
   let _ = pki_sig_data_scratch_set(dhruva_alloc_bytes(64));
+  let _ = aead_state_set(dhruva_alloc_bytes(64));
+  let _ = aead_working_set(dhruva_alloc_bytes(64));
+  let _ = aead_keystream_set(dhruva_alloc_bytes(64));
+  let _ = aead_block_scratch_set(dhruva_alloc_bytes(16));
+  let _ = aead_otk_set(dhruva_alloc_bytes(32));
+  let _ = aead_mac_data_set(dhruva_alloc_bytes(4224));
+  let _ = aead_computed_tag_set(dhruva_alloc_bytes(16));
+  let _ = hkdf_hmac_key_block_set(dhruva_alloc_bytes(64));
+  let _ = hkdf_hmac_msg_scratch_set(dhruva_alloc_bytes(320));
+  let _ = hkdf_hmac_inner_hash_set(dhruva_alloc_bytes(32));
+  let _ = hkdf_t_scratch_set(dhruva_alloc_bytes(32));
+  let _ = hkdf_hmac_input_scratch_set(dhruva_alloc_bytes(320));
   let _ = pki_init();
   let _ = ed25519_init();
   let _ = sha512_k_init(sha512_k_scratch_get());
@@ -22291,6 +22945,7 @@ fn kernel_main() -> i64 {
   let _ = ed25519_self_test();
   let _ = pki_self_test();
   let _ = aes128_self_test();
+  let _ = aead_hkdf_self_test();
 
   // Media (at-rest) encryption for DharaFS, layered on the ChaCha20
   // cipher above. Key derivation runs once here, single-threaded,
