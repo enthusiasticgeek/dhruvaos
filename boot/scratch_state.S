@@ -467,6 +467,29 @@ poly1305_block_scratch_addr:
     .word 0             /* 16 bytes -- poly1305_mac's own scratch for
                          * building the final zero-padded partial
                          * block, same one-allocation-at-boot pattern. */
+sha512_h_scratch_addr:
+    .word 0             /* 64 bytes -- SHA-512's 8 x 64-bit running
+                         * state words. Same round-65-hardening
+                         * reasoning as sha256_h/w/k_scratch (see
+                         * sha256_compress's own comment): always
+                         * re-fetched fresh via *_scratch_get() at
+                         * every point of use inside sha512_compress,
+                         * never held live in one register/local across
+                         * its whole 80-round loop body. */
+sha512_k_scratch_addr:
+    .word 0             /* 640 bytes -- the 80 round constants (8 bytes
+                         * each), initialized once at boot
+                         * (sha512_k_init) since they never change. */
+sha512_w_scratch_addr:
+    .word 0             /* 640 bytes -- the 80-word message schedule. */
+sha512_padded_scratch_addr:
+    .word 0             /* 4224 bytes -- sized to the worst case for a
+                         * 4096-byte message (this project's own
+                         * dharafs_file_max_len() bound, same ceiling
+                         * SHA-256's own padded scratch uses): with_one=
+                         * 4097, zero_pad=111, total_len=4097+111+16=
+                         * 4224 (SHA-512 uses a 128-byte block and a
+                         * 16-byte, not 8-byte, length trailer). */
 
 .section ".text"
 
@@ -1201,6 +1224,58 @@ poly1305_block_scratch_get:
  * value (DWC2's HCDMA(n)) rather than a typed pointer parameter some
  * extern "C" accessor stores on the vani side -- nothing to compute,
  * r0 already holds exactly what's wanted on entry. */
+.global sha512_h_scratch_set
+sha512_h_scratch_set:
+    ldr r1, =sha512_h_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global sha512_h_scratch_get
+sha512_h_scratch_get:
+    ldr r0, =sha512_h_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global sha512_k_scratch_set
+sha512_k_scratch_set:
+    ldr r1, =sha512_k_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global sha512_k_scratch_get
+sha512_k_scratch_get:
+    ldr r0, =sha512_k_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global sha512_w_scratch_set
+sha512_w_scratch_set:
+    ldr r1, =sha512_w_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global sha512_w_scratch_get
+sha512_w_scratch_get:
+    ldr r0, =sha512_w_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global sha512_padded_scratch_set
+sha512_padded_scratch_set:
+    ldr r1, =sha512_padded_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global sha512_padded_scratch_get
+sha512_padded_scratch_get:
+    ldr r0, =sha512_padded_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
 .global ptr_to_u32
 ptr_to_u32:
     bx lr

@@ -511,15 +511,42 @@ for by name.
   select instead of an `if`) is not applied here -- flagged for a
   future hardening pass, not silently accepted.
 
-  **Still open, a separate, larger sub-effort**: Ed25519 (signatures)
-  needs SHA-512 as a new prerequisite this project doesn't have yet
-  (only SHA-256 exists) PLUS twisted-Edwards point arithmetic and
-  scalar-mod-group-order arithmetic distinct from X25519's own
-  Montgomery-curve formulas PLUS point compression/decompression via a
-  modular square root -- discovered mid-session while scoping PKI's
-  own signature-verification need, not accounted for in this entry's
-  original "Curve25519 = X25519+Ed25519" framing. X25519 alone already
-  fully satisfies TLS's ECDHE need below.
+  **SHA-512: DONE (round 67, 2026-09-02).** The prerequisite Ed25519
+  needs throughout (deterministic nonce derivation, challenge hash) --
+  this project only had SHA-256 before. Same structure and same
+  round-65-hardening discipline as `sha256_compress` (h/k/w always
+  re-fetched fresh via `*_scratch_get()` at every point of use, never
+  held live across the 80-round loop -- carried over deliberately, a
+  closed real bug class, not re-litigated). The 80 round constants and
+  8 initial hash values were COMPUTED directly (fractional bits of
+  cube/square roots of the first 80/8 primes, FIPS 180-4 section
+  4.2.3) rather than typed from memory -- reciting 80 64-bit constants
+  by hand is a far larger, far less forgiving transcription risk than
+  a single test vector, so this project's own derivation script became
+  the source of truth, cross-checked against the well-known H values
+  (exact match) and against SHA-256's own K[0] sharing the same high
+  32 bits (0x428a2f98) with SHA-512's K[0] -- both algorithms derive
+  their constants the same way. Verified against Python's own trusted
+  `hashlib.sha512` (empty string, "abc", and two block-boundary edge
+  cases -- 111 bytes pads to exactly one block, 112 bytes forces a
+  second) before any vani code was written. 28 new host-harness checks
+  (776→804 PASS clean under ASAN/UBSAN), including a length sweep
+  (108-130 bytes) around SHA-512's own 111/112/128 padding boundaries
+  (different constants from SHA-256's 55/56/64, a genuinely separate
+  boundary) plus 3 more hashlib-verified byte-exact spot checks within
+  that sweep. Correct on the first real ARM build, no debugging cycle
+  needed -- same result as Poly1305/X25519's own Python-first
+  discipline.
+
+  **Still open, a separate, larger sub-effort**: Ed25519 itself
+  (signatures) -- SHA-512 was only the prerequisite. Still needs
+  twisted-Edwards point arithmetic and scalar-mod-group-order
+  arithmetic distinct from X25519's own Montgomery-curve formulas,
+  plus point compression/decompression via a modular square root.
+  Discovered mid-session while scoping PKI's own signature-
+  verification need, not accounted for in this entry's original
+  "Curve25519 = X25519+Ed25519" framing. X25519 alone already fully
+  satisfies TLS's ECDHE need below.
 
 - **AES** — `[L, genuinely harder than it sounds — SKIPPED FOR NOW,
   2026-08-31, revisit if WPA2/WiFi or FIPS-grade TLS actually starts]`

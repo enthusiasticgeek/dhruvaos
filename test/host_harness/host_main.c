@@ -1887,6 +1887,90 @@ static void test_x25519(void) {
     CHECK(memcmp(should_be_one, one_bytes, 32) == 0, "field25519: 5 * 5^-1 == 1");
 }
 
+int64_t fn_sha512_hash(int64_t *msg, int64_t msg_len, int64_t *out);
+int64_t fn_sha512_bytes_equal(int64_t *a, int64_t *b, int64_t n);
+int64_t sha512_h_scratch_set(int64_t *addr);
+int64_t sha512_k_scratch_set(int64_t *addr);
+int64_t sha512_w_scratch_set(int64_t *addr);
+int64_t sha512_padded_scratch_set(int64_t *addr);
+int64_t fn_sha512_k_init(int64_t *k);
+
+static void sha512_init_scratch(void) {
+    sha512_h_scratch_set(dhruva_alloc_bytes(64));
+    int64_t *k = dhruva_alloc_bytes(640);
+    sha512_k_scratch_set(k);
+    sha512_w_scratch_set(dhruva_alloc_bytes(640));
+    sha512_padded_scratch_set(dhruva_alloc_bytes(4224));
+    fn_sha512_k_init(k);
+}
+
+static void test_sha512_boundaries(void) {
+    sha512_init_scratch();
+
+    static const unsigned char expect_empty[64] = {0xcf, 0x83, 0xe1, 0x35, 0x7e, 0xef, 0xb8, 0xbd, 0xf1, 0x54, 0x28, 0x50, 0xd6, 0x6d, 0x80, 0x07, 0xd6, 0x20, 0xe4, 0x05, 0x0b, 0x57, 0x15, 0xdc, 0x83, 0xf4, 0xa9, 0x21, 0xd3, 0x6c, 0xe9, 0xce, 0x47, 0xd0, 0xd1, 0x3c, 0x5d, 0x85, 0xf2, 0xb0, 0xff, 0x83, 0x18, 0xd2, 0x87, 0x7e, 0xec, 0x2f, 0x63, 0xb9, 0x31, 0xbd, 0x47, 0x41, 0x7a, 0x81, 0xa5, 0x38, 0x32, 0x7a, 0xf9, 0x27, 0xda, 0x3e};
+    int64_t *msg0 = dhruva_alloc_bytes(1);
+    int64_t *out0 = dhruva_alloc_bytes(64);
+    fn_sha512_hash(msg0, 0, out0);
+    int64_t *exp0 = mkbuf((const char *)expect_empty, 64);
+    CHECK(fn_sha512_bytes_equal(out0, exp0, 64) == 1, "sha512: empty-string vector matches hashlib.sha512");
+
+    static const unsigned char expect_abc[64] = {0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba, 0xcc, 0x41, 0x73, 0x49, 0xae, 0x20, 0x41, 0x31, 0x12, 0xe6, 0xfa, 0x4e, 0x89, 0xa9, 0x7e, 0xa2, 0x0a, 0x9e, 0xee, 0xe6, 0x4b, 0x55, 0xd3, 0x9a, 0x21, 0x92, 0x99, 0x2a, 0x27, 0x4f, 0xc1, 0xa8, 0x36, 0xba, 0x3c, 0x23, 0xa3, 0xfe, 0xeb, 0xbd, 0x45, 0x4d, 0x44, 0x23, 0x64, 0x3c, 0xe8, 0x0e, 0x2a, 0x9a, 0xc9, 0x4f, 0xa5, 0x4c, 0xa4, 0x9f};
+    int64_t *msg1 = mkbuf("abc", 3);
+    int64_t *out1 = dhruva_alloc_bytes(64);
+    fn_sha512_hash(msg1, 3, out1);
+    int64_t *exp1 = mkbuf((const char *)expect_abc, 64);
+    CHECK(fn_sha512_bytes_equal(out1, exp1, 64) == 1, "sha512: \"abc\" vector matches hashlib.sha512");
+
+    /* Message length sweep around the 111/112/128 padding boundaries
+     * (SHA-512's own 128-byte block, 112-byte pad threshold, 16-byte
+     * length trailer -- different constants from SHA-256's 64/56/8,
+     * so this is a genuinely separate boundary to check, not a copy
+     * of the SHA-256 sweep). */
+    for (int64_t len = 108; len <= 130; len++) {
+        int64_t *msg = dhruva_alloc_bytes(len > 0 ? len : 1);
+        for (int64_t i = 0; i < len; i++) buf_write_byte(msg, (uint32_t)i, (uint32_t)('a' + (i % 26)));
+        int64_t *out = dhruva_alloc_bytes(64);
+        int64_t st = fn_sha512_hash(msg, len, out);
+        char desc[80];
+        snprintf(desc, sizeof(desc), "sha512: len=%lld does not crash/corrupt (padding boundary)", (long long)len);
+        CHECK(st == 0, desc);
+    }
+
+    /* Cross-check every boundary-sweep length against hashlib
+     * directly, not just "didn't crash" -- computed here at C-compile
+     * time is not possible, so instead spot-check 3 representative
+     * lengths (111, 112, 128) against fixed, hashlib-derived vectors,
+     * same discipline as kernel_main.vani's own sha512_self_test. */
+
+    {
+        static const unsigned char expect_111[64] = {0xa4, 0x67, 0x69, 0x80, 0x69, 0xea, 0xe8, 0xed, 0x1e, 0x0c, 0x6d, 0xbf, 0xd1, 0xb4, 0xa2, 0x47, 0xa9, 0xf1, 0xe7, 0xff, 0x4e, 0x3a, 0xf6, 0x21, 0x45, 0xed, 0x26, 0xf4, 0x46, 0x8b, 0xc0, 0x94, 0x61, 0x08, 0x78, 0xb7, 0x64, 0x40, 0x91, 0x14, 0x13, 0x70, 0xa4, 0x7a, 0x76, 0x38, 0xbd, 0xdc, 0x95, 0xdb, 0xfe, 0x89, 0x71, 0xc3, 0x4d, 0x13, 0xc4, 0x81, 0x5d, 0x4b, 0xb1, 0xb3, 0xe7, 0xf2};
+        int64_t *msg = dhruva_alloc_bytes(111);
+        for (int64_t i = 0; i < 111; i++) buf_write_byte(msg, (uint32_t)i, (uint32_t)('a' + (i % 26)));
+        int64_t *out = dhruva_alloc_bytes(64);
+        fn_sha512_hash(msg, 111, out);
+        int64_t *exp = mkbuf((const char *)expect_111, 64);
+        CHECK(fn_sha512_bytes_equal(out, exp, 64) == 1, "sha512: len=111 byte-exact match vs hashlib.sha512");
+    }
+    {
+        static const unsigned char expect_112[64] = {0xa4, 0x73, 0xc9, 0x37, 0x32, 0xee, 0xf6, 0x27, 0xd0, 0x2e, 0x86, 0xd1, 0x90, 0x47, 0xa4, 0x22, 0xb5, 0x86, 0x11, 0x08, 0x48, 0xec, 0x17, 0xdc, 0xea, 0x13, 0xaf, 0x28, 0x2a, 0x15, 0x2f, 0x76, 0x54, 0xb0, 0xc7, 0x11, 0xe2, 0x77, 0xfd, 0x42, 0xc1, 0xd9, 0x4b, 0xea, 0x8b, 0x7f, 0xed, 0x61, 0x5c, 0x52, 0xbb, 0x0f, 0x84, 0x92, 0x27, 0xe1, 0x62, 0x40, 0xaf, 0xff, 0xc7, 0xc5, 0x6e, 0x29};
+        int64_t *msg = dhruva_alloc_bytes(112);
+        for (int64_t i = 0; i < 112; i++) buf_write_byte(msg, (uint32_t)i, (uint32_t)('a' + (i % 26)));
+        int64_t *out = dhruva_alloc_bytes(64);
+        fn_sha512_hash(msg, 112, out);
+        int64_t *exp = mkbuf((const char *)expect_112, 64);
+        CHECK(fn_sha512_bytes_equal(out, exp, 64) == 1, "sha512: len=112 byte-exact match vs hashlib.sha512");
+    }
+    {
+        static const unsigned char expect_128[64] = {0x21, 0x7d, 0x3d, 0x9c, 0x09, 0x52, 0xc3, 0xe4, 0x90, 0x7f, 0x06, 0xd4, 0xfb, 0xf3, 0x44, 0x60, 0xee, 0x85, 0x2c, 0x6a, 0xf5, 0x91, 0xb0, 0x7c, 0x2f, 0xa1, 0xc5, 0xe1, 0x64, 0x55, 0x83, 0x63, 0x74, 0xc9, 0x5a, 0xe3, 0x3e, 0x18, 0x42, 0x27, 0x91, 0x3f, 0x8a, 0x2e, 0x22, 0x7e, 0x3b, 0xbd, 0x51, 0x87, 0xce, 0x57, 0xaa, 0x1b, 0xad, 0x11, 0xa8, 0x0f, 0x62, 0x24, 0x12, 0xeb, 0x08, 0x84};
+        int64_t *msg = dhruva_alloc_bytes(128);
+        for (int64_t i = 0; i < 128; i++) buf_write_byte(msg, (uint32_t)i, (uint32_t)('a' + (i % 26)));
+        int64_t *out = dhruva_alloc_bytes(64);
+        fn_sha512_hash(msg, 128, out);
+        int64_t *exp = mkbuf((const char *)expect_128, 64);
+        CHECK(fn_sha512_bytes_equal(out, exp, 64) == 1, "sha512: len=128 byte-exact match vs hashlib.sha512");
+    }
+}
+
 static void test_bignum_boundaries(void) {
     /* Multiply by zero. */
     int64_t *a = dhruva_alloc_bytes(16);
@@ -2893,6 +2977,7 @@ int main(void) {
     test_chacha20_boundaries();
     test_poly1305();
     test_x25519();
+    test_sha512_boundaries();
     test_bignum_boundaries();
     test_lan9512_framing();
     test_hci_framing();

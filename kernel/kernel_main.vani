@@ -57,6 +57,14 @@ extern "C" fn fsqueue_data_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn fsqueue_data_scratch_get() -> mut ref i64;
 extern "C" fn poly1305_block_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn poly1305_block_scratch_get() -> mut ref i64;
+extern "C" fn sha512_h_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn sha512_h_scratch_get() -> mut ref i64;
+extern "C" fn sha512_k_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn sha512_k_scratch_get() -> mut ref i64;
+extern "C" fn sha512_w_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn sha512_w_scratch_get() -> mut ref i64;
+extern "C" fn sha512_padded_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn sha512_padded_scratch_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -18041,6 +18049,634 @@ fn poly1305_verify_constant_time(a: mut ref i64, b: mut ref i64, n: i64) -> i64 
   return 0;
 }
 
+
+// Round 67: SHA-512 (FIPS 180-4) -- Ed25519 needs it throughout
+// (deterministic nonce derivation, challenge hash); this project only
+// had SHA-256 before now. Same structure and same round-65-hardening
+// discipline as sha256_compress's own comment describes (h/k/w always
+// re-fetched fresh via *_scratch_get() at every point of use, never
+// held live in one register/local across the whole round loop) --
+// carried over deliberately, not re-litigated, since that fix closed
+// a real, hard-to-diagnose class of register-corruption crashes.
+//
+// K/H constants computed directly (fractional bits of cube/square
+// roots of the first 80/8 primes, FIPS 180-4 section 4.2.3) rather
+// than typed from memory -- same "don't recite something a
+// transcription error could silently corrupt" discipline X25519's own
+// header comment explains, adapted here since 80 64-bit constants is
+// an even larger, even less forgiving set to recite by hand than a
+// single 32-byte test vector would be. Cross-checked two ways before
+// use: (1) the derivation script's own H[0..8) output matches the
+// well-known, independently-recalled SHA-512 initial hash values
+// exactly; (2) K[0] byte-for-byte matches SHA-256's own K[0] in its
+// high 32 bits (0x428a2f98), a well-known cross-check between the two
+// algorithms' shared derivation method. Verified end to end against
+// Python's own built-in `hashlib.sha512` (a trusted, always-available
+// standard-library implementation, not a hand-rolled or memorized
+// reference) before any of this was ported to vani.
+fn sha512_rotr64(x: u64, n: u64) -> u64 {
+  return (x >> n) | (x << ((64 as u64) - n));
+}
+
+fn sha512_read_u64(buf: mut ref i64, off: i64) -> u64 {
+  let hi: u32 = buf_read_u32(buf, off as u32);
+  let lo: u32 = buf_read_u32(buf, (off + 4) as u32);
+  return ((hi as u64) << (32 as u64)) | (lo as u64);
+}
+
+fn sha512_write_u64(buf: mut ref i64, off: i64, hi: u32, lo: u32) -> i64 {
+  let _ = buf_write_u32(buf, off as u32, hi);
+  let _ = buf_write_u32(buf, (off + 4) as u32, lo);
+  return 0;
+}
+
+fn sha512_write_u64_val(buf: mut ref i64, off: i64, v: u64) -> i64 {
+  let hi: u32 = (v >> (32 as u64)) as u32;
+  let lo: u32 = (v & (4294967295 as u64)) as u32;
+  let _ = sha512_write_u64(buf, off, hi, lo);
+  return 0;
+}
+
+fn sha512_read_be64(buf: mut ref i64, off: i64) -> u64 {
+  let b0: u64 = buf_read_byte(buf, off as u32) as u64;
+  let b1: u64 = buf_read_byte(buf, (off + 1) as u32) as u64;
+  let b2: u64 = buf_read_byte(buf, (off + 2) as u32) as u64;
+  let b3: u64 = buf_read_byte(buf, (off + 3) as u32) as u64;
+  let b4: u64 = buf_read_byte(buf, (off + 4) as u32) as u64;
+  let b5: u64 = buf_read_byte(buf, (off + 5) as u32) as u64;
+  let b6: u64 = buf_read_byte(buf, (off + 6) as u32) as u64;
+  let b7: u64 = buf_read_byte(buf, (off + 7) as u32) as u64;
+  return (b0 << (56 as u64)) | (b1 << (48 as u64)) | (b2 << (40 as u64)) | (b3 << (32 as u64))
+       | (b4 << (24 as u64)) | (b5 << (16 as u64)) | (b6 << (8 as u64)) | b7;
+}
+
+fn sha512_write_be64(buf: mut ref i64, off: i64, v: u64) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, ((v >> (56 as u64)) & (255 as u64)) as u32);
+  let _ = buf_write_byte(buf, (off + 1) as u32, ((v >> (48 as u64)) & (255 as u64)) as u32);
+  let _ = buf_write_byte(buf, (off + 2) as u32, ((v >> (40 as u64)) & (255 as u64)) as u32);
+  let _ = buf_write_byte(buf, (off + 3) as u32, ((v >> (32 as u64)) & (255 as u64)) as u32);
+  let _ = buf_write_byte(buf, (off + 4) as u32, ((v >> (24 as u64)) & (255 as u64)) as u32);
+  let _ = buf_write_byte(buf, (off + 5) as u32, ((v >> (16 as u64)) & (255 as u64)) as u32);
+  let _ = buf_write_byte(buf, (off + 6) as u32, ((v >> (8 as u64)) & (255 as u64)) as u32);
+  let _ = buf_write_byte(buf, (off + 7) as u32, (v & (255 as u64)) as u32);
+  return 0;
+}
+
+// 80 round constants (see this section's own header comment for how
+// these were derived and cross-checked).
+fn sha512_k_init(k: mut ref i64) -> i64 {
+  let _ = sha512_write_u64(k, 0 as i64, 0x428a2f98 as u32, 0xd728ae22 as u32);
+  let _ = sha512_write_u64(k, 8 as i64, 0x71374491 as u32, 0x23ef65cd as u32);
+  let _ = sha512_write_u64(k, 16 as i64, 0xb5c0fbcf as u32, 0xec4d3b2f as u32);
+  let _ = sha512_write_u64(k, 24 as i64, 0xe9b5dba5 as u32, 0x8189dbbc as u32);
+  let _ = sha512_write_u64(k, 32 as i64, 0x3956c25b as u32, 0xf348b538 as u32);
+  let _ = sha512_write_u64(k, 40 as i64, 0x59f111f1 as u32, 0xb605d019 as u32);
+  let _ = sha512_write_u64(k, 48 as i64, 0x923f82a4 as u32, 0xaf194f9b as u32);
+  let _ = sha512_write_u64(k, 56 as i64, 0xab1c5ed5 as u32, 0xda6d8118 as u32);
+  let _ = sha512_write_u64(k, 64 as i64, 0xd807aa98 as u32, 0xa3030242 as u32);
+  let _ = sha512_write_u64(k, 72 as i64, 0x12835b01 as u32, 0x45706fbe as u32);
+  let _ = sha512_write_u64(k, 80 as i64, 0x243185be as u32, 0x4ee4b28c as u32);
+  let _ = sha512_write_u64(k, 88 as i64, 0x550c7dc3 as u32, 0xd5ffb4e2 as u32);
+  let _ = sha512_write_u64(k, 96 as i64, 0x72be5d74 as u32, 0xf27b896f as u32);
+  let _ = sha512_write_u64(k, 104 as i64, 0x80deb1fe as u32, 0x3b1696b1 as u32);
+  let _ = sha512_write_u64(k, 112 as i64, 0x9bdc06a7 as u32, 0x25c71235 as u32);
+  let _ = sha512_write_u64(k, 120 as i64, 0xc19bf174 as u32, 0xcf692694 as u32);
+  let _ = sha512_write_u64(k, 128 as i64, 0xe49b69c1 as u32, 0x9ef14ad2 as u32);
+  let _ = sha512_write_u64(k, 136 as i64, 0xefbe4786 as u32, 0x384f25e3 as u32);
+  let _ = sha512_write_u64(k, 144 as i64, 0x0fc19dc6 as u32, 0x8b8cd5b5 as u32);
+  let _ = sha512_write_u64(k, 152 as i64, 0x240ca1cc as u32, 0x77ac9c65 as u32);
+  let _ = sha512_write_u64(k, 160 as i64, 0x2de92c6f as u32, 0x592b0275 as u32);
+  let _ = sha512_write_u64(k, 168 as i64, 0x4a7484aa as u32, 0x6ea6e483 as u32);
+  let _ = sha512_write_u64(k, 176 as i64, 0x5cb0a9dc as u32, 0xbd41fbd4 as u32);
+  let _ = sha512_write_u64(k, 184 as i64, 0x76f988da as u32, 0x831153b5 as u32);
+  let _ = sha512_write_u64(k, 192 as i64, 0x983e5152 as u32, 0xee66dfab as u32);
+  let _ = sha512_write_u64(k, 200 as i64, 0xa831c66d as u32, 0x2db43210 as u32);
+  let _ = sha512_write_u64(k, 208 as i64, 0xb00327c8 as u32, 0x98fb213f as u32);
+  let _ = sha512_write_u64(k, 216 as i64, 0xbf597fc7 as u32, 0xbeef0ee4 as u32);
+  let _ = sha512_write_u64(k, 224 as i64, 0xc6e00bf3 as u32, 0x3da88fc2 as u32);
+  let _ = sha512_write_u64(k, 232 as i64, 0xd5a79147 as u32, 0x930aa725 as u32);
+  let _ = sha512_write_u64(k, 240 as i64, 0x06ca6351 as u32, 0xe003826f as u32);
+  let _ = sha512_write_u64(k, 248 as i64, 0x14292967 as u32, 0x0a0e6e70 as u32);
+  let _ = sha512_write_u64(k, 256 as i64, 0x27b70a85 as u32, 0x46d22ffc as u32);
+  let _ = sha512_write_u64(k, 264 as i64, 0x2e1b2138 as u32, 0x5c26c926 as u32);
+  let _ = sha512_write_u64(k, 272 as i64, 0x4d2c6dfc as u32, 0x5ac42aed as u32);
+  let _ = sha512_write_u64(k, 280 as i64, 0x53380d13 as u32, 0x9d95b3df as u32);
+  let _ = sha512_write_u64(k, 288 as i64, 0x650a7354 as u32, 0x8baf63de as u32);
+  let _ = sha512_write_u64(k, 296 as i64, 0x766a0abb as u32, 0x3c77b2a8 as u32);
+  let _ = sha512_write_u64(k, 304 as i64, 0x81c2c92e as u32, 0x47edaee6 as u32);
+  let _ = sha512_write_u64(k, 312 as i64, 0x92722c85 as u32, 0x1482353b as u32);
+  let _ = sha512_write_u64(k, 320 as i64, 0xa2bfe8a1 as u32, 0x4cf10364 as u32);
+  let _ = sha512_write_u64(k, 328 as i64, 0xa81a664b as u32, 0xbc423001 as u32);
+  let _ = sha512_write_u64(k, 336 as i64, 0xc24b8b70 as u32, 0xd0f89791 as u32);
+  let _ = sha512_write_u64(k, 344 as i64, 0xc76c51a3 as u32, 0x0654be30 as u32);
+  let _ = sha512_write_u64(k, 352 as i64, 0xd192e819 as u32, 0xd6ef5218 as u32);
+  let _ = sha512_write_u64(k, 360 as i64, 0xd6990624 as u32, 0x5565a910 as u32);
+  let _ = sha512_write_u64(k, 368 as i64, 0xf40e3585 as u32, 0x5771202a as u32);
+  let _ = sha512_write_u64(k, 376 as i64, 0x106aa070 as u32, 0x32bbd1b8 as u32);
+  let _ = sha512_write_u64(k, 384 as i64, 0x19a4c116 as u32, 0xb8d2d0c8 as u32);
+  let _ = sha512_write_u64(k, 392 as i64, 0x1e376c08 as u32, 0x5141ab53 as u32);
+  let _ = sha512_write_u64(k, 400 as i64, 0x2748774c as u32, 0xdf8eeb99 as u32);
+  let _ = sha512_write_u64(k, 408 as i64, 0x34b0bcb5 as u32, 0xe19b48a8 as u32);
+  let _ = sha512_write_u64(k, 416 as i64, 0x391c0cb3 as u32, 0xc5c95a63 as u32);
+  let _ = sha512_write_u64(k, 424 as i64, 0x4ed8aa4a as u32, 0xe3418acb as u32);
+  let _ = sha512_write_u64(k, 432 as i64, 0x5b9cca4f as u32, 0x7763e373 as u32);
+  let _ = sha512_write_u64(k, 440 as i64, 0x682e6ff3 as u32, 0xd6b2b8a3 as u32);
+  let _ = sha512_write_u64(k, 448 as i64, 0x748f82ee as u32, 0x5defb2fc as u32);
+  let _ = sha512_write_u64(k, 456 as i64, 0x78a5636f as u32, 0x43172f60 as u32);
+  let _ = sha512_write_u64(k, 464 as i64, 0x84c87814 as u32, 0xa1f0ab72 as u32);
+  let _ = sha512_write_u64(k, 472 as i64, 0x8cc70208 as u32, 0x1a6439ec as u32);
+  let _ = sha512_write_u64(k, 480 as i64, 0x90befffa as u32, 0x23631e28 as u32);
+  let _ = sha512_write_u64(k, 488 as i64, 0xa4506ceb as u32, 0xde82bde9 as u32);
+  let _ = sha512_write_u64(k, 496 as i64, 0xbef9a3f7 as u32, 0xb2c67915 as u32);
+  let _ = sha512_write_u64(k, 504 as i64, 0xc67178f2 as u32, 0xe372532b as u32);
+  let _ = sha512_write_u64(k, 512 as i64, 0xca273ece as u32, 0xea26619c as u32);
+  let _ = sha512_write_u64(k, 520 as i64, 0xd186b8c7 as u32, 0x21c0c207 as u32);
+  let _ = sha512_write_u64(k, 528 as i64, 0xeada7dd6 as u32, 0xcde0eb1e as u32);
+  let _ = sha512_write_u64(k, 536 as i64, 0xf57d4f7f as u32, 0xee6ed178 as u32);
+  let _ = sha512_write_u64(k, 544 as i64, 0x06f067aa as u32, 0x72176fba as u32);
+  let _ = sha512_write_u64(k, 552 as i64, 0x0a637dc5 as u32, 0xa2c898a6 as u32);
+  let _ = sha512_write_u64(k, 560 as i64, 0x113f9804 as u32, 0xbef90dae as u32);
+  let _ = sha512_write_u64(k, 568 as i64, 0x1b710b35 as u32, 0x131c471b as u32);
+  let _ = sha512_write_u64(k, 576 as i64, 0x28db77f5 as u32, 0x23047d84 as u32);
+  let _ = sha512_write_u64(k, 584 as i64, 0x32caab7b as u32, 0x40c72493 as u32);
+  let _ = sha512_write_u64(k, 592 as i64, 0x3c9ebe0a as u32, 0x15c9bebc as u32);
+  let _ = sha512_write_u64(k, 600 as i64, 0x431d67c4 as u32, 0x9c100d4c as u32);
+  let _ = sha512_write_u64(k, 608 as i64, 0x4cc5d4be as u32, 0xcb3e42b6 as u32);
+  let _ = sha512_write_u64(k, 616 as i64, 0x597f299c as u32, 0xfc657e2a as u32);
+  let _ = sha512_write_u64(k, 624 as i64, 0x5fcb6fab as u32, 0x3ad6faec as u32);
+  let _ = sha512_write_u64(k, 632 as i64, 0x6c44198c as u32, 0x4a475817 as u32);
+  return 0;
+}
+
+// Round 65 hardening carried over from SHA-256's own h_init -- see
+// sha256_h_init's comment.
+fn sha512_h_init() -> i64 {
+  let _ = sha512_write_u64(sha512_h_scratch_get(), 0 as i64, 0x6a09e667 as u32, 0xf3bcc908 as u32);
+  let _ = sha512_write_u64(sha512_h_scratch_get(), 8 as i64, 0xbb67ae85 as u32, 0x84caa73b as u32);
+  let _ = sha512_write_u64(sha512_h_scratch_get(), 16 as i64, 0x3c6ef372 as u32, 0xfe94f82b as u32);
+  let _ = sha512_write_u64(sha512_h_scratch_get(), 24 as i64, 0xa54ff53a as u32, 0x5f1d36f1 as u32);
+  let _ = sha512_write_u64(sha512_h_scratch_get(), 32 as i64, 0x510e527f as u32, 0xade682d1 as u32);
+  let _ = sha512_write_u64(sha512_h_scratch_get(), 40 as i64, 0x9b05688c as u32, 0x2b3e6c1f as u32);
+  let _ = sha512_write_u64(sha512_h_scratch_get(), 48 as i64, 0x1f83d9ab as u32, 0xfb41bd6b as u32);
+  let _ = sha512_write_u64(sha512_h_scratch_get(), 56 as i64, 0x5be0cd19 as u32, 0x137e2179 as u32);
+  return 0;
+}
+
+// Process one 128-byte block starting at byte offset `block_off`
+// inside `msg`. Round-65 hardening: h/w/k are re-fetched fresh via
+// *_scratch_get() at every single point of use, never held in a
+// local across the whole 80-round loop -- see this section's own
+// header comment.
+fn sha512_compress(msg: mut ref i64, block_off: i64) -> i64 {
+  let i: i64 = 0;
+  while i < 16 {
+    let word: u64 = sha512_read_be64(msg, block_off + i * 8);
+    let _ = sha512_write_u64_val(sha512_w_scratch_get(), i * 8, word);
+    i = i + 1;
+  }
+  i = 16;
+  while i < 80 {
+    let w15: u64 = sha512_read_u64(sha512_w_scratch_get(), (i - 15) * 8);
+    let w2: u64 = sha512_read_u64(sha512_w_scratch_get(), (i - 2) * 8);
+    let w16: u64 = sha512_read_u64(sha512_w_scratch_get(), (i - 16) * 8);
+    let w7: u64 = sha512_read_u64(sha512_w_scratch_get(), (i - 7) * 8);
+    let s0: u64 = sha512_rotr64(w15, 1 as u64) ^ sha512_rotr64(w15, 8 as u64) ^ (w15 >> (7 as u64));
+    let s1: u64 = sha512_rotr64(w2, 19 as u64) ^ sha512_rotr64(w2, 61 as u64) ^ (w2 >> (6 as u64));
+    let wi: u64 = wrapping_add(wrapping_add(w16, s0), wrapping_add(w7, s1));
+    let _ = sha512_write_u64_val(sha512_w_scratch_get(), i * 8, wi);
+    i = i + 1;
+  }
+
+  let a: u64 = sha512_read_u64(sha512_h_scratch_get(), 0);
+  let b: u64 = sha512_read_u64(sha512_h_scratch_get(), 8);
+  let c: u64 = sha512_read_u64(sha512_h_scratch_get(), 16);
+  let d: u64 = sha512_read_u64(sha512_h_scratch_get(), 24);
+  let e: u64 = sha512_read_u64(sha512_h_scratch_get(), 32);
+  let f: u64 = sha512_read_u64(sha512_h_scratch_get(), 40);
+  let g: u64 = sha512_read_u64(sha512_h_scratch_get(), 48);
+  let hh: u64 = sha512_read_u64(sha512_h_scratch_get(), 56);
+  let ones: u64 = wrapping_sub(0 as u64, 1 as u64);
+
+  i = 0;
+  while i < 80 {
+    let bige1: u64 = sha512_rotr64(e, 14 as u64) ^ sha512_rotr64(e, 18 as u64) ^ sha512_rotr64(e, 41 as u64);
+    let ch: u64 = (e & f) ^ ((e ^ ones) & g);
+    let kw: u64 = sha512_read_u64(sha512_k_scratch_get(), i * 8);
+    let ww: u64 = sha512_read_u64(sha512_w_scratch_get(), i * 8);
+    let t1: u64 = wrapping_add(wrapping_add(hh, bige1), wrapping_add(ch, wrapping_add(kw, ww)));
+    let bige0: u64 = sha512_rotr64(a, 28 as u64) ^ sha512_rotr64(a, 34 as u64) ^ sha512_rotr64(a, 39 as u64);
+    let maj: u64 = (a & b) ^ (a & c) ^ (b & c);
+    let t2: u64 = wrapping_add(bige0, maj);
+
+    hh = g;
+    g = f;
+    f = e;
+    e = wrapping_add(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = wrapping_add(t1, t2);
+
+    i = i + 1;
+  }
+
+  let _ = sha512_write_u64_val(sha512_h_scratch_get(), 0, wrapping_add(sha512_read_u64(sha512_h_scratch_get(), 0), a));
+  let _ = sha512_write_u64_val(sha512_h_scratch_get(), 8, wrapping_add(sha512_read_u64(sha512_h_scratch_get(), 8), b));
+  let _ = sha512_write_u64_val(sha512_h_scratch_get(), 16, wrapping_add(sha512_read_u64(sha512_h_scratch_get(), 16), c));
+  let _ = sha512_write_u64_val(sha512_h_scratch_get(), 24, wrapping_add(sha512_read_u64(sha512_h_scratch_get(), 24), d));
+  let _ = sha512_write_u64_val(sha512_h_scratch_get(), 32, wrapping_add(sha512_read_u64(sha512_h_scratch_get(), 32), e));
+  let _ = sha512_write_u64_val(sha512_h_scratch_get(), 40, wrapping_add(sha512_read_u64(sha512_h_scratch_get(), 40), f));
+  let _ = sha512_write_u64_val(sha512_h_scratch_get(), 48, wrapping_add(sha512_read_u64(sha512_h_scratch_get(), 48), g));
+  let _ = sha512_write_u64_val(sha512_h_scratch_get(), 56, wrapping_add(sha512_read_u64(sha512_h_scratch_get(), 56), hh));
+  return 0;
+}
+
+// Hashes `msg_len` bytes at `msg` into the 64-byte buffer `out`.
+// FIPS 180-4 padding: a single 0x80 byte, zero bytes up to a
+// 112-mod-128 boundary, then the original bit-length as a big-endian
+// 16-byte (128-bit) integer -- this project's own messages never get
+// remotely close to needing the high 64 bits, so those are always
+// written as 0, matching SHA-256's own "always fits in the low half"
+// simplification one level up. msg_len is capped at 4096
+// (dharafs_file_max_len()) by sha512_padded_scratch's own fixed size,
+// same bound SHA-256's own padded scratch already established as
+// this project's realistic ceiling.
+fn sha512_hash(msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  let with_one: i64 = msg_len + 1;
+  let rem: i64 = with_one % 128;
+  let zero_pad: i64 = 0;
+  if rem <= 112 {
+    zero_pad = 112 - rem;
+  } else {
+    zero_pad = (128 - rem) + 112;
+  }
+  let total_len: i64 = with_one + zero_pad + 16;
+
+  let padded: mut ref i64 = sha512_padded_scratch_get();
+  let i: i64 = 0;
+  while i < msg_len {
+    let _ = buf_write_byte(padded, i as u32, buf_read_byte(msg, i as u32));
+    i = i + 1;
+  }
+  let _ = buf_write_byte(padded, msg_len as u32, 128 as u32);
+  i = msg_len + 1;
+  while i < (with_one + zero_pad) {
+    let _ = buf_write_byte(padded, i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let bit_len: u64 = (msg_len as u64) * (8 as u64);
+  let _ = sha512_write_be64(padded, total_len - 16, 0 as u64);
+  let _ = sha512_write_be64(padded, total_len - 8, bit_len);
+
+  let _ = sha512_h_init();
+
+  let num_blocks: i64 = total_len / 128;
+  let blk: i64 = 0;
+  while blk < num_blocks {
+    let _ = sha512_compress(padded, blk * 128);
+    blk = blk + 1;
+  }
+
+  let j: i64 = 0;
+  while j < 8 {
+    let word: u64 = sha512_read_u64(sha512_h_scratch_get(), j * 8);
+    let _ = sha512_write_be64(out, j * 8, word);
+    j = j + 1;
+  }
+  return 0;
+}
+
+fn sha512_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if buf_read_byte(a, i as u32) != buf_read_byte(b, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+
+// FIPS 180-4 / NIST-shaped known-answer checks against Python's own
+// trusted hashlib.sha512 (see this file's own header comment on
+// sha512_k_init for why that's the reference here, not a memorized
+// external vector): empty string, "abc", a 111-byte message (pads to
+// EXACTLY one block, the tightest boundary case), and a 112-byte
+// message (one byte more -- forces a second block).
+fn sha512_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let msg0: mut ref i64 = dhruva_alloc_bytes(1);
+  let out0: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = sha512_hash(msg0, 0, out0);
+  let exp0: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = buf_write_byte(exp0, 0 as u32, 0xcf as u32);
+  let _ = buf_write_byte(exp0, 1 as u32, 0x83 as u32);
+  let _ = buf_write_byte(exp0, 2 as u32, 0xe1 as u32);
+  let _ = buf_write_byte(exp0, 3 as u32, 0x35 as u32);
+  let _ = buf_write_byte(exp0, 4 as u32, 0x7e as u32);
+  let _ = buf_write_byte(exp0, 5 as u32, 0xef as u32);
+  let _ = buf_write_byte(exp0, 6 as u32, 0xb8 as u32);
+  let _ = buf_write_byte(exp0, 7 as u32, 0xbd as u32);
+  let _ = buf_write_byte(exp0, 8 as u32, 0xf1 as u32);
+  let _ = buf_write_byte(exp0, 9 as u32, 0x54 as u32);
+  let _ = buf_write_byte(exp0, 10 as u32, 0x28 as u32);
+  let _ = buf_write_byte(exp0, 11 as u32, 0x50 as u32);
+  let _ = buf_write_byte(exp0, 12 as u32, 0xd6 as u32);
+  let _ = buf_write_byte(exp0, 13 as u32, 0x6d as u32);
+  let _ = buf_write_byte(exp0, 14 as u32, 0x80 as u32);
+  let _ = buf_write_byte(exp0, 15 as u32, 0x07 as u32);
+  let _ = buf_write_byte(exp0, 16 as u32, 0xd6 as u32);
+  let _ = buf_write_byte(exp0, 17 as u32, 0x20 as u32);
+  let _ = buf_write_byte(exp0, 18 as u32, 0xe4 as u32);
+  let _ = buf_write_byte(exp0, 19 as u32, 0x05 as u32);
+  let _ = buf_write_byte(exp0, 20 as u32, 0x0b as u32);
+  let _ = buf_write_byte(exp0, 21 as u32, 0x57 as u32);
+  let _ = buf_write_byte(exp0, 22 as u32, 0x15 as u32);
+  let _ = buf_write_byte(exp0, 23 as u32, 0xdc as u32);
+  let _ = buf_write_byte(exp0, 24 as u32, 0x83 as u32);
+  let _ = buf_write_byte(exp0, 25 as u32, 0xf4 as u32);
+  let _ = buf_write_byte(exp0, 26 as u32, 0xa9 as u32);
+  let _ = buf_write_byte(exp0, 27 as u32, 0x21 as u32);
+  let _ = buf_write_byte(exp0, 28 as u32, 0xd3 as u32);
+  let _ = buf_write_byte(exp0, 29 as u32, 0x6c as u32);
+  let _ = buf_write_byte(exp0, 30 as u32, 0xe9 as u32);
+  let _ = buf_write_byte(exp0, 31 as u32, 0xce as u32);
+  let _ = buf_write_byte(exp0, 32 as u32, 0x47 as u32);
+  let _ = buf_write_byte(exp0, 33 as u32, 0xd0 as u32);
+  let _ = buf_write_byte(exp0, 34 as u32, 0xd1 as u32);
+  let _ = buf_write_byte(exp0, 35 as u32, 0x3c as u32);
+  let _ = buf_write_byte(exp0, 36 as u32, 0x5d as u32);
+  let _ = buf_write_byte(exp0, 37 as u32, 0x85 as u32);
+  let _ = buf_write_byte(exp0, 38 as u32, 0xf2 as u32);
+  let _ = buf_write_byte(exp0, 39 as u32, 0xb0 as u32);
+  let _ = buf_write_byte(exp0, 40 as u32, 0xff as u32);
+  let _ = buf_write_byte(exp0, 41 as u32, 0x83 as u32);
+  let _ = buf_write_byte(exp0, 42 as u32, 0x18 as u32);
+  let _ = buf_write_byte(exp0, 43 as u32, 0xd2 as u32);
+  let _ = buf_write_byte(exp0, 44 as u32, 0x87 as u32);
+  let _ = buf_write_byte(exp0, 45 as u32, 0x7e as u32);
+  let _ = buf_write_byte(exp0, 46 as u32, 0xec as u32);
+  let _ = buf_write_byte(exp0, 47 as u32, 0x2f as u32);
+  let _ = buf_write_byte(exp0, 48 as u32, 0x63 as u32);
+  let _ = buf_write_byte(exp0, 49 as u32, 0xb9 as u32);
+  let _ = buf_write_byte(exp0, 50 as u32, 0x31 as u32);
+  let _ = buf_write_byte(exp0, 51 as u32, 0xbd as u32);
+  let _ = buf_write_byte(exp0, 52 as u32, 0x47 as u32);
+  let _ = buf_write_byte(exp0, 53 as u32, 0x41 as u32);
+  let _ = buf_write_byte(exp0, 54 as u32, 0x7a as u32);
+  let _ = buf_write_byte(exp0, 55 as u32, 0x81 as u32);
+  let _ = buf_write_byte(exp0, 56 as u32, 0xa5 as u32);
+  let _ = buf_write_byte(exp0, 57 as u32, 0x38 as u32);
+  let _ = buf_write_byte(exp0, 58 as u32, 0x32 as u32);
+  let _ = buf_write_byte(exp0, 59 as u32, 0x7a as u32);
+  let _ = buf_write_byte(exp0, 60 as u32, 0xf9 as u32);
+  let _ = buf_write_byte(exp0, 61 as u32, 0x27 as u32);
+  let _ = buf_write_byte(exp0, 62 as u32, 0xda as u32);
+  let _ = buf_write_byte(exp0, 63 as u32, 0x3e as u32);
+  if sha512_bytes_equal(out0, exp0, 64) == 0 {
+    ok = 0;
+  }
+
+  let msg1: mut ref i64 = dhruva_alloc_bytes(3);
+  let _ = buf_write_byte(msg1, 0 as u32, 97 as u32); // 'a'
+  let _ = buf_write_byte(msg1, 1 as u32, 98 as u32); // 'b'
+  let _ = buf_write_byte(msg1, 2 as u32, 99 as u32); // 'c'
+  let out1: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = sha512_hash(msg1, 3, out1);
+  let exp1: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = buf_write_byte(exp1, 0 as u32, 0xdd as u32);
+  let _ = buf_write_byte(exp1, 1 as u32, 0xaf as u32);
+  let _ = buf_write_byte(exp1, 2 as u32, 0x35 as u32);
+  let _ = buf_write_byte(exp1, 3 as u32, 0xa1 as u32);
+  let _ = buf_write_byte(exp1, 4 as u32, 0x93 as u32);
+  let _ = buf_write_byte(exp1, 5 as u32, 0x61 as u32);
+  let _ = buf_write_byte(exp1, 6 as u32, 0x7a as u32);
+  let _ = buf_write_byte(exp1, 7 as u32, 0xba as u32);
+  let _ = buf_write_byte(exp1, 8 as u32, 0xcc as u32);
+  let _ = buf_write_byte(exp1, 9 as u32, 0x41 as u32);
+  let _ = buf_write_byte(exp1, 10 as u32, 0x73 as u32);
+  let _ = buf_write_byte(exp1, 11 as u32, 0x49 as u32);
+  let _ = buf_write_byte(exp1, 12 as u32, 0xae as u32);
+  let _ = buf_write_byte(exp1, 13 as u32, 0x20 as u32);
+  let _ = buf_write_byte(exp1, 14 as u32, 0x41 as u32);
+  let _ = buf_write_byte(exp1, 15 as u32, 0x31 as u32);
+  let _ = buf_write_byte(exp1, 16 as u32, 0x12 as u32);
+  let _ = buf_write_byte(exp1, 17 as u32, 0xe6 as u32);
+  let _ = buf_write_byte(exp1, 18 as u32, 0xfa as u32);
+  let _ = buf_write_byte(exp1, 19 as u32, 0x4e as u32);
+  let _ = buf_write_byte(exp1, 20 as u32, 0x89 as u32);
+  let _ = buf_write_byte(exp1, 21 as u32, 0xa9 as u32);
+  let _ = buf_write_byte(exp1, 22 as u32, 0x7e as u32);
+  let _ = buf_write_byte(exp1, 23 as u32, 0xa2 as u32);
+  let _ = buf_write_byte(exp1, 24 as u32, 0x0a as u32);
+  let _ = buf_write_byte(exp1, 25 as u32, 0x9e as u32);
+  let _ = buf_write_byte(exp1, 26 as u32, 0xee as u32);
+  let _ = buf_write_byte(exp1, 27 as u32, 0xe6 as u32);
+  let _ = buf_write_byte(exp1, 28 as u32, 0x4b as u32);
+  let _ = buf_write_byte(exp1, 29 as u32, 0x55 as u32);
+  let _ = buf_write_byte(exp1, 30 as u32, 0xd3 as u32);
+  let _ = buf_write_byte(exp1, 31 as u32, 0x9a as u32);
+  let _ = buf_write_byte(exp1, 32 as u32, 0x21 as u32);
+  let _ = buf_write_byte(exp1, 33 as u32, 0x92 as u32);
+  let _ = buf_write_byte(exp1, 34 as u32, 0x99 as u32);
+  let _ = buf_write_byte(exp1, 35 as u32, 0x2a as u32);
+  let _ = buf_write_byte(exp1, 36 as u32, 0x27 as u32);
+  let _ = buf_write_byte(exp1, 37 as u32, 0x4f as u32);
+  let _ = buf_write_byte(exp1, 38 as u32, 0xc1 as u32);
+  let _ = buf_write_byte(exp1, 39 as u32, 0xa8 as u32);
+  let _ = buf_write_byte(exp1, 40 as u32, 0x36 as u32);
+  let _ = buf_write_byte(exp1, 41 as u32, 0xba as u32);
+  let _ = buf_write_byte(exp1, 42 as u32, 0x3c as u32);
+  let _ = buf_write_byte(exp1, 43 as u32, 0x23 as u32);
+  let _ = buf_write_byte(exp1, 44 as u32, 0xa3 as u32);
+  let _ = buf_write_byte(exp1, 45 as u32, 0xfe as u32);
+  let _ = buf_write_byte(exp1, 46 as u32, 0xeb as u32);
+  let _ = buf_write_byte(exp1, 47 as u32, 0xbd as u32);
+  let _ = buf_write_byte(exp1, 48 as u32, 0x45 as u32);
+  let _ = buf_write_byte(exp1, 49 as u32, 0x4d as u32);
+  let _ = buf_write_byte(exp1, 50 as u32, 0x44 as u32);
+  let _ = buf_write_byte(exp1, 51 as u32, 0x23 as u32);
+  let _ = buf_write_byte(exp1, 52 as u32, 0x64 as u32);
+  let _ = buf_write_byte(exp1, 53 as u32, 0x3c as u32);
+  let _ = buf_write_byte(exp1, 54 as u32, 0xe8 as u32);
+  let _ = buf_write_byte(exp1, 55 as u32, 0x0e as u32);
+  let _ = buf_write_byte(exp1, 56 as u32, 0x2a as u32);
+  let _ = buf_write_byte(exp1, 57 as u32, 0x9a as u32);
+  let _ = buf_write_byte(exp1, 58 as u32, 0xc9 as u32);
+  let _ = buf_write_byte(exp1, 59 as u32, 0x4f as u32);
+  let _ = buf_write_byte(exp1, 60 as u32, 0xa5 as u32);
+  let _ = buf_write_byte(exp1, 61 as u32, 0x4c as u32);
+  let _ = buf_write_byte(exp1, 62 as u32, 0xa4 as u32);
+  let _ = buf_write_byte(exp1, 63 as u32, 0x9f as u32);
+  if sha512_bytes_equal(out1, exp1, 64) == 0 {
+    ok = 0;
+  }
+
+  let msg2: mut ref i64 = dhruva_alloc_bytes(111);
+  let i2: i64 = 0;
+  while i2 < 111 {
+    let _ = buf_write_byte(msg2, i2 as u32, 65 as u32); // 'A'
+    i2 = i2 + 1;
+  }
+  let out2: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = sha512_hash(msg2, 111, out2);
+  let exp2: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = buf_write_byte(exp2, 0 as u32, 0xec as u32);
+  let _ = buf_write_byte(exp2, 1 as u32, 0x9c as u32);
+  let _ = buf_write_byte(exp2, 2 as u32, 0x8a as u32);
+  let _ = buf_write_byte(exp2, 3 as u32, 0xc6 as u32);
+  let _ = buf_write_byte(exp2, 4 as u32, 0x88 as u32);
+  let _ = buf_write_byte(exp2, 5 as u32, 0xaf as u32);
+  let _ = buf_write_byte(exp2, 6 as u32, 0x41 as u32);
+  let _ = buf_write_byte(exp2, 7 as u32, 0x0e as u32);
+  let _ = buf_write_byte(exp2, 8 as u32, 0x33 as u32);
+  let _ = buf_write_byte(exp2, 9 as u32, 0x26 as u32);
+  let _ = buf_write_byte(exp2, 10 as u32, 0x4b as u32);
+  let _ = buf_write_byte(exp2, 11 as u32, 0xa6 as u32);
+  let _ = buf_write_byte(exp2, 12 as u32, 0x59 as u32);
+  let _ = buf_write_byte(exp2, 13 as u32, 0xdb as u32);
+  let _ = buf_write_byte(exp2, 14 as u32, 0xc7 as u32);
+  let _ = buf_write_byte(exp2, 15 as u32, 0xbb as u32);
+  let _ = buf_write_byte(exp2, 16 as u32, 0x65 as u32);
+  let _ = buf_write_byte(exp2, 17 as u32, 0x29 as u32);
+  let _ = buf_write_byte(exp2, 18 as u32, 0x71 as u32);
+  let _ = buf_write_byte(exp2, 19 as u32, 0x83 as u32);
+  let _ = buf_write_byte(exp2, 20 as u32, 0x16 as u32);
+  let _ = buf_write_byte(exp2, 21 as u32, 0x80 as u32);
+  let _ = buf_write_byte(exp2, 22 as u32, 0xea as u32);
+  let _ = buf_write_byte(exp2, 23 as u32, 0x20 as u32);
+  let _ = buf_write_byte(exp2, 24 as u32, 0x62 as u32);
+  let _ = buf_write_byte(exp2, 25 as u32, 0x57 as u32);
+  let _ = buf_write_byte(exp2, 26 as u32, 0x6d as u32);
+  let _ = buf_write_byte(exp2, 27 as u32, 0x39 as u32);
+  let _ = buf_write_byte(exp2, 28 as u32, 0x4d as u32);
+  let _ = buf_write_byte(exp2, 29 as u32, 0x29 as u32);
+  let _ = buf_write_byte(exp2, 30 as u32, 0x8f as u32);
+  let _ = buf_write_byte(exp2, 31 as u32, 0x58 as u32);
+  let _ = buf_write_byte(exp2, 32 as u32, 0xb3 as u32);
+  let _ = buf_write_byte(exp2, 33 as u32, 0xcc as u32);
+  let _ = buf_write_byte(exp2, 34 as u32, 0xd9 as u32);
+  let _ = buf_write_byte(exp2, 35 as u32, 0xa1 as u32);
+  let _ = buf_write_byte(exp2, 36 as u32, 0xf3 as u32);
+  let _ = buf_write_byte(exp2, 37 as u32, 0x9a as u32);
+  let _ = buf_write_byte(exp2, 38 as u32, 0x3b as u32);
+  let _ = buf_write_byte(exp2, 39 as u32, 0x40 as u32);
+  let _ = buf_write_byte(exp2, 40 as u32, 0xbc as u32);
+  let _ = buf_write_byte(exp2, 41 as u32, 0x6c as u32);
+  let _ = buf_write_byte(exp2, 42 as u32, 0x73 as u32);
+  let _ = buf_write_byte(exp2, 43 as u32, 0x60 as u32);
+  let _ = buf_write_byte(exp2, 44 as u32, 0x9c as u32);
+  let _ = buf_write_byte(exp2, 45 as u32, 0x97 as u32);
+  let _ = buf_write_byte(exp2, 46 as u32, 0x6f as u32);
+  let _ = buf_write_byte(exp2, 47 as u32, 0x71 as u32);
+  let _ = buf_write_byte(exp2, 48 as u32, 0x52 as u32);
+  let _ = buf_write_byte(exp2, 49 as u32, 0x4e as u32);
+  let _ = buf_write_byte(exp2, 50 as u32, 0xfc as u32);
+  let _ = buf_write_byte(exp2, 51 as u32, 0xd4 as u32);
+  let _ = buf_write_byte(exp2, 52 as u32, 0x5a as u32);
+  let _ = buf_write_byte(exp2, 53 as u32, 0xbb as u32);
+  let _ = buf_write_byte(exp2, 54 as u32, 0xf1 as u32);
+  let _ = buf_write_byte(exp2, 55 as u32, 0xa9 as u32);
+  let _ = buf_write_byte(exp2, 56 as u32, 0x8b as u32);
+  let _ = buf_write_byte(exp2, 57 as u32, 0x3f as u32);
+  let _ = buf_write_byte(exp2, 58 as u32, 0x15 as u32);
+  let _ = buf_write_byte(exp2, 59 as u32, 0xdc as u32);
+  let _ = buf_write_byte(exp2, 60 as u32, 0xcf as u32);
+  let _ = buf_write_byte(exp2, 61 as u32, 0x0b as u32);
+  let _ = buf_write_byte(exp2, 62 as u32, 0x0b as u32);
+  let _ = buf_write_byte(exp2, 63 as u32, 0x9f as u32);
+  if sha512_bytes_equal(out2, exp2, 64) == 0 {
+    ok = 0;
+  }
+
+  let msg3: mut ref i64 = dhruva_alloc_bytes(112);
+  let i3: i64 = 0;
+  while i3 < 112 {
+    let _ = buf_write_byte(msg3, i3 as u32, 66 as u32); // 'B'
+    i3 = i3 + 1;
+  }
+  let out3: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = sha512_hash(msg3, 112, out3);
+  let exp3: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = buf_write_byte(exp3, 0 as u32, 0xaa as u32);
+  let _ = buf_write_byte(exp3, 1 as u32, 0xb6 as u32);
+  let _ = buf_write_byte(exp3, 2 as u32, 0xad as u32);
+  let _ = buf_write_byte(exp3, 3 as u32, 0x76 as u32);
+  let _ = buf_write_byte(exp3, 4 as u32, 0x37 as u32);
+  let _ = buf_write_byte(exp3, 5 as u32, 0xf0 as u32);
+  let _ = buf_write_byte(exp3, 6 as u32, 0xf5 as u32);
+  let _ = buf_write_byte(exp3, 7 as u32, 0xef as u32);
+  let _ = buf_write_byte(exp3, 8 as u32, 0x58 as u32);
+  let _ = buf_write_byte(exp3, 9 as u32, 0x01 as u32);
+  let _ = buf_write_byte(exp3, 10 as u32, 0x08 as u32);
+  let _ = buf_write_byte(exp3, 11 as u32, 0xac as u32);
+  let _ = buf_write_byte(exp3, 12 as u32, 0x09 as u32);
+  let _ = buf_write_byte(exp3, 13 as u32, 0x5c as u32);
+  let _ = buf_write_byte(exp3, 14 as u32, 0xb3 as u32);
+  let _ = buf_write_byte(exp3, 15 as u32, 0x28 as u32);
+  let _ = buf_write_byte(exp3, 16 as u32, 0x4f as u32);
+  let _ = buf_write_byte(exp3, 17 as u32, 0xe2 as u32);
+  let _ = buf_write_byte(exp3, 18 as u32, 0x03 as u32);
+  let _ = buf_write_byte(exp3, 19 as u32, 0xf0 as u32);
+  let _ = buf_write_byte(exp3, 20 as u32, 0x33 as u32);
+  let _ = buf_write_byte(exp3, 21 as u32, 0xd8 as u32);
+  let _ = buf_write_byte(exp3, 22 as u32, 0x72 as u32);
+  let _ = buf_write_byte(exp3, 23 as u32, 0x45 as u32);
+  let _ = buf_write_byte(exp3, 24 as u32, 0x43 as u32);
+  let _ = buf_write_byte(exp3, 25 as u32, 0xab as u32);
+  let _ = buf_write_byte(exp3, 26 as u32, 0x16 as u32);
+  let _ = buf_write_byte(exp3, 27 as u32, 0x6c as u32);
+  let _ = buf_write_byte(exp3, 28 as u32, 0x54 as u32);
+  let _ = buf_write_byte(exp3, 29 as u32, 0x15 as u32);
+  let _ = buf_write_byte(exp3, 30 as u32, 0xec as u32);
+  let _ = buf_write_byte(exp3, 31 as u32, 0x73 as u32);
+  let _ = buf_write_byte(exp3, 32 as u32, 0x2e as u32);
+  let _ = buf_write_byte(exp3, 33 as u32, 0xcb as u32);
+  let _ = buf_write_byte(exp3, 34 as u32, 0xac as u32);
+  let _ = buf_write_byte(exp3, 35 as u32, 0x7f as u32);
+  let _ = buf_write_byte(exp3, 36 as u32, 0x48 as u32);
+  let _ = buf_write_byte(exp3, 37 as u32, 0xa9 as u32);
+  let _ = buf_write_byte(exp3, 38 as u32, 0xa7 as u32);
+  let _ = buf_write_byte(exp3, 39 as u32, 0x18 as u32);
+  let _ = buf_write_byte(exp3, 40 as u32, 0x56 as u32);
+  let _ = buf_write_byte(exp3, 41 as u32, 0x0c as u32);
+  let _ = buf_write_byte(exp3, 42 as u32, 0x8e as u32);
+  let _ = buf_write_byte(exp3, 43 as u32, 0x37 as u32);
+  let _ = buf_write_byte(exp3, 44 as u32, 0x84 as u32);
+  let _ = buf_write_byte(exp3, 45 as u32, 0x8d as u32);
+  let _ = buf_write_byte(exp3, 46 as u32, 0xce as u32);
+  let _ = buf_write_byte(exp3, 47 as u32, 0xe5 as u32);
+  let _ = buf_write_byte(exp3, 48 as u32, 0x96 as u32);
+  let _ = buf_write_byte(exp3, 49 as u32, 0xea as u32);
+  let _ = buf_write_byte(exp3, 50 as u32, 0xfb as u32);
+  let _ = buf_write_byte(exp3, 51 as u32, 0xc8 as u32);
+  let _ = buf_write_byte(exp3, 52 as u32, 0xa8 as u32);
+  let _ = buf_write_byte(exp3, 53 as u32, 0x3d as u32);
+  let _ = buf_write_byte(exp3, 54 as u32, 0x2c as u32);
+  let _ = buf_write_byte(exp3, 55 as u32, 0x8b as u32);
+  let _ = buf_write_byte(exp3, 56 as u32, 0x38 as u32);
+  let _ = buf_write_byte(exp3, 57 as u32, 0x41 as u32);
+  let _ = buf_write_byte(exp3, 58 as u32, 0xe5 as u32);
+  let _ = buf_write_byte(exp3, 59 as u32, 0xdd as u32);
+  let _ = buf_write_byte(exp3, 60 as u32, 0x60 as u32);
+  let _ = buf_write_byte(exp3, 61 as u32, 0xb1 as u32);
+  let _ = buf_write_byte(exp3, 62 as u32, 0x36 as u32);
+  let _ = buf_write_byte(exp3, 63 as u32, 0x2f as u32);
+  if sha512_bytes_equal(out3, exp3, 64) == 0 {
+    ok = 0;
+  }
+
+  let _ = uart_puts("CRYPTO: SHA-512 vs Python hashlib KATs (empty, \"abc\", 111-byte, 112-byte block-boundary)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Two checks: RFC 8439 section 2.3.2's own worked block-function
 // example (a real external oracle -- the exact 64-byte keystream a
 // correct implementation must produce for a fixed key/nonce/counter,
@@ -19425,6 +20061,11 @@ fn kernel_main() -> i64 {
   let _ = sha256_k_scratch_set(dhruva_alloc_bytes(256));
   let _ = sha256_w_scratch_set(dhruva_alloc_bytes(256));
   let _ = sha256_k_init(sha256_k_scratch_get());
+  let _ = sha512_h_scratch_set(dhruva_alloc_bytes(64));
+  let _ = sha512_k_scratch_set(dhruva_alloc_bytes(640));
+  let _ = sha512_w_scratch_set(dhruva_alloc_bytes(640));
+  let _ = sha512_padded_scratch_set(dhruva_alloc_bytes(4224));
+  let _ = sha512_k_init(sha512_k_scratch_get());
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
   let _ = x25519_x1_set(dhruva_alloc_bytes(32));
   let _ = x25519_x2_set(dhruva_alloc_bytes(32));
@@ -19701,6 +20342,7 @@ fn kernel_main() -> i64 {
   let _ = chacha20_self_test();
   let _ = poly1305_self_test();
   let _ = x25519_self_test();
+  let _ = sha512_self_test();
 
   // Media (at-rest) encryption for DharaFS, layered on the ChaCha20
   // cipher above. Key derivation runs once here, single-threaded,
