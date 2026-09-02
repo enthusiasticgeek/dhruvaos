@@ -1971,6 +1971,182 @@ static void test_sha512_boundaries(void) {
     }
 }
 
+int64_t fn_ed25519_secret_to_public(int64_t *secret, int64_t *out_pub);
+int64_t fn_ed25519_sign(int64_t *secret, int64_t *msg, int64_t msg_len, int64_t *out_sig);
+int64_t fn_ed25519_verify(int64_t *pubkey, int64_t *msg, int64_t msg_len, int64_t *sig);
+int64_t fn_ed25519_init(void);
+int64_t ed25519_d_set(int64_t *addr);
+int64_t ed25519_2d_set(int64_t *addr);
+int64_t ed25519_sqrt_m1_set(int64_t *addr);
+int64_t ed25519_l_set(int64_t *addr);
+int64_t ed25519_gx_set(int64_t *addr);
+int64_t ed25519_gy_set(int64_t *addr);
+int64_t ed25519_gz_set(int64_t *addr);
+int64_t ed25519_gt_set(int64_t *addr);
+int64_t ed25519_tmp1_set(int64_t *addr);
+int64_t ed25519_tmp2_set(int64_t *addr);
+int64_t ed25519_tmp3_set(int64_t *addr);
+int64_t ed25519_tmp4_set(int64_t *addr);
+int64_t ed25519_tmp5_set(int64_t *addr);
+int64_t ed25519_tmp6_set(int64_t *addr);
+int64_t ed25519_tmp7_set(int64_t *addr);
+int64_t ed25519_tmp8_set(int64_t *addr);
+int64_t ed25519_qx_set(int64_t *addr);
+int64_t ed25519_qy_set(int64_t *addr);
+int64_t ed25519_qz_set(int64_t *addr);
+int64_t ed25519_qt_set(int64_t *addr);
+int64_t ed25519_bx_set(int64_t *addr);
+int64_t ed25519_by_set(int64_t *addr);
+int64_t ed25519_bz_set(int64_t *addr);
+int64_t ed25519_bt_set(int64_t *addr);
+int64_t ed25519_scalar_remainder_set(int64_t *addr);
+int64_t ed25519_buf1_set(int64_t *addr);
+int64_t ed25519_buf2_set(int64_t *addr);
+int64_t ed25519_buf3_set(int64_t *addr);
+int64_t ed25519_buf4_set(int64_t *addr);
+int64_t ed25519_buf5_set(int64_t *addr);
+int64_t ed25519_buf6_set(int64_t *addr);
+int64_t ed25519_buf7_set(int64_t *addr);
+int64_t ed25519_buf8_set(int64_t *addr);
+int64_t ed25519_ax_set(int64_t *addr);
+int64_t ed25519_ay_set(int64_t *addr);
+int64_t ed25519_az_set(int64_t *addr);
+int64_t ed25519_at_set(int64_t *addr);
+int64_t ed25519_rx_set(int64_t *addr);
+int64_t ed25519_ry_set(int64_t *addr);
+int64_t ed25519_rz_set(int64_t *addr);
+int64_t ed25519_rt_set(int64_t *addr);
+int64_t ed25519_kax_set(int64_t *addr);
+int64_t ed25519_kay_set(int64_t *addr);
+int64_t ed25519_kaz_set(int64_t *addr);
+int64_t ed25519_kat_set(int64_t *addr);
+int64_t ed25519_sbx_set(int64_t *addr);
+int64_t ed25519_sby_set(int64_t *addr);
+int64_t ed25519_sbz_set(int64_t *addr);
+int64_t ed25519_sbt_set(int64_t *addr);
+int64_t ed25519_scalar_product_set(int64_t *addr);
+int64_t ed25519_scalar_sum_set(int64_t *addr);
+int64_t ed25519_hash_input_set(int64_t *addr);
+int64_t ed25519_hash_out_set(int64_t *addr);
+
+static void ed25519_init_scratch(void) {
+    ed25519_d_set(dhruva_alloc_bytes(32));
+    ed25519_2d_set(dhruva_alloc_bytes(32));
+    ed25519_sqrt_m1_set(dhruva_alloc_bytes(32));
+    ed25519_l_set(dhruva_alloc_bytes(32));
+    ed25519_gx_set(dhruva_alloc_bytes(32));
+    ed25519_gy_set(dhruva_alloc_bytes(32));
+    ed25519_gz_set(dhruva_alloc_bytes(32));
+    ed25519_gt_set(dhruva_alloc_bytes(32));
+    ed25519_tmp1_set(dhruva_alloc_bytes(32));
+    ed25519_tmp2_set(dhruva_alloc_bytes(32));
+    ed25519_tmp3_set(dhruva_alloc_bytes(32));
+    ed25519_tmp4_set(dhruva_alloc_bytes(32));
+    ed25519_tmp5_set(dhruva_alloc_bytes(32));
+    ed25519_tmp6_set(dhruva_alloc_bytes(32));
+    ed25519_tmp7_set(dhruva_alloc_bytes(32));
+    ed25519_tmp8_set(dhruva_alloc_bytes(32));
+    ed25519_qx_set(dhruva_alloc_bytes(32));
+    ed25519_qy_set(dhruva_alloc_bytes(32));
+    ed25519_qz_set(dhruva_alloc_bytes(32));
+    ed25519_qt_set(dhruva_alloc_bytes(32));
+    ed25519_bx_set(dhruva_alloc_bytes(32));
+    ed25519_by_set(dhruva_alloc_bytes(32));
+    ed25519_bz_set(dhruva_alloc_bytes(32));
+    ed25519_bt_set(dhruva_alloc_bytes(32));
+    ed25519_scalar_remainder_set(dhruva_alloc_bytes(32));
+    ed25519_buf1_set(dhruva_alloc_bytes(32));
+    ed25519_buf2_set(dhruva_alloc_bytes(32));
+    ed25519_buf3_set(dhruva_alloc_bytes(32));
+    ed25519_buf4_set(dhruva_alloc_bytes(32));
+    ed25519_buf5_set(dhruva_alloc_bytes(32));
+    ed25519_buf6_set(dhruva_alloc_bytes(32));
+    ed25519_buf7_set(dhruva_alloc_bytes(32));
+    ed25519_buf8_set(dhruva_alloc_bytes(32));
+    ed25519_ax_set(dhruva_alloc_bytes(32));
+    ed25519_ay_set(dhruva_alloc_bytes(32));
+    ed25519_az_set(dhruva_alloc_bytes(32));
+    ed25519_at_set(dhruva_alloc_bytes(32));
+    ed25519_rx_set(dhruva_alloc_bytes(32));
+    ed25519_ry_set(dhruva_alloc_bytes(32));
+    ed25519_rz_set(dhruva_alloc_bytes(32));
+    ed25519_rt_set(dhruva_alloc_bytes(32));
+    ed25519_kax_set(dhruva_alloc_bytes(32));
+    ed25519_kay_set(dhruva_alloc_bytes(32));
+    ed25519_kaz_set(dhruva_alloc_bytes(32));
+    ed25519_kat_set(dhruva_alloc_bytes(32));
+    ed25519_sbx_set(dhruva_alloc_bytes(32));
+    ed25519_sby_set(dhruva_alloc_bytes(32));
+    ed25519_sbz_set(dhruva_alloc_bytes(32));
+    ed25519_sbt_set(dhruva_alloc_bytes(32));
+    ed25519_scalar_product_set(dhruva_alloc_bytes(64));
+    ed25519_scalar_sum_set(dhruva_alloc_bytes(80));
+    ed25519_hash_input_set(dhruva_alloc_bytes(4192));
+    ed25519_hash_out_set(dhruva_alloc_bytes(64));
+    fn_ed25519_init();
+}
+
+static void test_ed25519(void) {
+    ed25519_init_scratch();
+
+    static const unsigned char seed[32] = {0x0b, 0x30, 0x55, 0x7a, 0x9f, 0xc4, 0xe9, 0x0e, 0x33, 0x58, 0x7d, 0xa2, 0xc7, 0xec, 0x11, 0x36, 0x5b, 0x80, 0xa5, 0xca, 0xef, 0x14, 0x39, 0x5e, 0x83, 0xa8, 0xcd, 0xf2, 0x17, 0x3c, 0x61, 0x86};
+    static const unsigned char expect_pub[32] = {0x24, 0xc3, 0xa4, 0x94, 0xfa, 0x22, 0x99, 0x62, 0x66, 0x44, 0xb9, 0x65, 0xa9, 0x13, 0x2d, 0xa7, 0x9c, 0xfe, 0x67, 0x15, 0x1f, 0xdc, 0x42, 0xde, 0x60, 0x0c, 0xf0, 0x90, 0x97, 0xdb, 0x82, 0x47};
+    static const unsigned char expect_sig[64] = {0xc0, 0xc0, 0x17, 0xa8, 0x09, 0x70, 0xcc, 0xc9, 0x62, 0x6e, 0xad, 0x73, 0x62, 0x47, 0x15, 0x21, 0x7f, 0x62, 0x04, 0x10, 0x73, 0xd9, 0xda, 0xe3, 0x02, 0x3e, 0xf5, 0xff, 0x3d, 0xe5, 0xe9, 0x85, 0xf3, 0x4f, 0xe0, 0x1d, 0xf2, 0x04, 0xf8, 0xa1, 0xd6, 0xe2, 0x22, 0x1b, 0x50, 0x6a, 0x64, 0x20, 0x5a, 0x53, 0x3d, 0xeb, 0x47, 0xd4, 0xb7, 0x06, 0x16, 0x4a, 0xbd, 0x3f, 0x3b, 0xf9, 0x55, 0x07};
+    const char *msg_text = "host_harness cross-check message, different from the kernel self-test's own vector";
+    int64_t msg_len = (int64_t)strlen(msg_text);
+
+    int64_t *seed_buf = mkbuf((const char *)seed, 32);
+    int64_t *msg_buf = mkbuf(msg_text, msg_len);
+    int64_t *pub_out = dhruva_alloc_bytes(32);
+    fn_ed25519_secret_to_public(seed_buf, pub_out);
+    CHECK(memcmp(pub_out, expect_pub, 32) == 0, "ed25519: public key matches independently-verified reference");
+
+    int64_t *sig_out = dhruva_alloc_bytes(64);
+    fn_ed25519_sign(seed_buf, msg_buf, msg_len, sig_out);
+    CHECK(memcmp(sig_out, expect_sig, 64) == 0, "ed25519: signature matches independently-verified reference byte-exact");
+
+    CHECK(fn_ed25519_verify(pub_out, msg_buf, msg_len, sig_out) == 1, "ed25519: verify accepts its own valid signature");
+
+    /* Tamper checks: every byte position in a 64-byte signature
+     * flipped one at a time would be excessive; spot-check the first
+     * byte of R, the last byte of R, the first byte of s, and the
+     * last byte of s -- covering both halves of the signature and
+     * both ends of each half. */
+    int tamper_positions[] = {0, 31, 32, 63};
+    for (int p = 0; p < 4; p++) {
+        unsigned char bad[64];
+        memcpy(bad, sig_out, 64);
+        bad[tamper_positions[p]] ^= 1;
+        int64_t *bad_buf = mkbuf((const char *)bad, 64);
+        char desc[80];
+        snprintf(desc, sizeof(desc), "ed25519: verify rejects signature tampered at byte %d", tamper_positions[p]);
+        CHECK(fn_ed25519_verify(pub_out, msg_buf, msg_len, bad_buf) == 0, desc);
+    }
+
+    unsigned char bad_msg[128];
+    memcpy(bad_msg, msg_text, (size_t)msg_len);
+    bad_msg[0] ^= 1;
+    int64_t *bad_msg_buf = mkbuf((const char *)bad_msg, msg_len);
+    CHECK(fn_ed25519_verify(pub_out, bad_msg_buf, msg_len, sig_out) == 0, "ed25519: verify rejects a tampered message");
+
+    /* A signature valid under one key must NOT verify under a
+     * different, unrelated key -- rules out a verify() that ignores
+     * the public key entirely. */
+    unsigned char seed3[32];
+    for (int i = 0; i < 32; i++) seed3[i] = (unsigned char)(i * 3 + 200);
+    int64_t *seed3_buf = mkbuf((const char *)seed3, 32);
+    int64_t *pub3_out = dhruva_alloc_bytes(32);
+    fn_ed25519_secret_to_public(seed3_buf, pub3_out);
+    CHECK(fn_ed25519_verify(pub3_out, msg_buf, msg_len, sig_out) == 0, "ed25519: verify rejects a valid signature under the WRONG public key");
+
+    /* A garbage 32-byte "public key" (not a real curve point) must be
+     * rejected cleanly by decompression, not crash. */
+    unsigned char garbage[32];
+    for (int i = 0; i < 32; i++) garbage[i] = 0xff;
+    int64_t *garbage_buf = mkbuf((const char *)garbage, 32);
+    CHECK(fn_ed25519_verify(garbage_buf, msg_buf, msg_len, sig_out) == 0, "ed25519: verify cleanly rejects a malformed public key (no valid curve point)");
+}
+
 static void test_bignum_boundaries(void) {
     /* Multiply by zero. */
     int64_t *a = dhruva_alloc_bytes(16);
@@ -2978,6 +3154,7 @@ int main(void) {
     test_poly1305();
     test_x25519();
     test_sha512_boundaries();
+    test_ed25519();
     test_bignum_boundaries();
     test_lan9512_framing();
     test_hci_framing();
