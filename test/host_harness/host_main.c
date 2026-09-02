@@ -305,6 +305,42 @@ int64_t *dwc2_dma_scratch_get(void);
 int64_t dwc2_dma_scratch_set(int64_t *addr);
 uint32_t fn_filter_check_frame(int64_t *frame, int64_t frame_len);
 int64_t fn_filter_build_test_frame(int64_t *frame, uint32_t proto, uint32_t src_ip, uint32_t dst_port);
+int64_t fn_dirindex_max_slots(void);
+int64_t fn_dirindex_max_path_bytes(void);
+int64_t fn_dharafs_dirindex_reset(void);
+uint32_t fn_dharafs_dirindex_hash(int64_t *buf, int64_t path_offset, int64_t path_len);
+int64_t fn_dharafs_dirindex_find_slot(int64_t *buf, int64_t path_offset, int64_t path_len, uint32_t h);
+int64_t fn_dharafs_dirindex_lookup_raw(int64_t *path_buf, int64_t path_len);
+int64_t fn_dharafs_dirindex_upsert_raw(int64_t *path_buf, int64_t path_len, int64_t block);
+int64_t dirindex_get_valid_at(uint32_t i);
+int64_t dirindex_set_valid_at(uint32_t i, uint32_t v);
+int64_t dirindex_get_block_at(uint32_t i);
+int64_t fn_fsqueue_max_slots(void);
+int64_t fn_fsqueue_max_data_bytes(void);
+int64_t fn_dharafs_queue_reset(void);
+int64_t fn_dharafs_queue_submit_write_raw(uint32_t priority, uint32_t task_id, int64_t *path_buf, int64_t path_len, int64_t *data_buf, int64_t data_len, uint32_t owner_uid, uint32_t owner_gid, uint32_t mode);
+int64_t fn_dharafs_queue_submit_delete_raw(uint32_t priority, uint32_t task_id, int64_t *path_buf, int64_t path_len);
+int64_t fn_dharafs_queue_submit(const char *path, const char *data);
+int64_t fn_dharafs_queue_pick_next(void);
+int64_t fn_dharafs_queue_dispatch_one(void);
+int64_t fn_dharafs_queue_pending_count(void);
+int64_t fsqueue_valid_get_at(uint32_t i);
+int64_t fsqueue_priority_get_at(uint32_t i);
+int64_t fsqueue_result_get_at(uint32_t i);
+int64_t fsqueue_path_scratch_set(int64_t *addr);
+int64_t fsqueue_data_scratch_set(int64_t *addr);
+int64_t fn_dharafs_read_from_block_raw(int64_t blk, int64_t *out_buf);
+int64_t fn_dharafs_find_block_as_of_raw(int64_t *path_buf, int64_t path_len, uint32_t max_seq);
+int64_t fn_snapshot_max_slots(void);
+int64_t fn_dharafs_snapshot_reset(void);
+int64_t fn_dharafs_snapshot_find_by_name_raw(int64_t *name_buf, int64_t name_len);
+int64_t fn_dharafs_snapshot_create_raw(int64_t *name_buf, int64_t name_len);
+int64_t fn_dharafs_snapshot_delete_raw(int64_t *name_buf, int64_t name_len);
+int64_t fn_dharafs_snapshot_pinned_seq_raw(int64_t *name_buf, int64_t name_len);
+int64_t fn_dharafs_snapshot_read_raw(int64_t *path_buf, int64_t path_len, int64_t *name_buf, int64_t name_len, int64_t *out_buf);
+int64_t fn_dharafs_snapshot_create(const char *name);
+int64_t fn_dharafs_snapshot_delete(const char *name);
+int64_t fn_dharafs_snapshot_read(const char *path, const char *name, int64_t *out_buf);
 
 /* ---- host_stubs.c helpers ---- */
 int64_t *dhruva_alloc_bytes(int64_t n);
@@ -388,6 +424,9 @@ static void reset_fs(void) {
     sha256_k_scratch_set(k_scratch);
     fn_sha256_k_init(k_scratch);
     sha256_w_scratch_set(dhruva_alloc_bytes(256));
+    fsqueue_path_scratch_set(dhruva_alloc_bytes(32));
+    fsqueue_data_scratch_set(dhruva_alloc_bytes(448));
+    fn_dharafs_queue_reset();
     fn_dharafs_init();
 }
 
@@ -705,6 +744,251 @@ static void test_directory_hierarchy(void) {
     int64_t *q_missing = mkbuf("nope", 4);
     int64_t r3 = fn_dharafs_list_dir_raw(dir, 7, q_missing, 4);
     CHECK(r3 == 0, "dirhier: classify('nope') under /config is NEITHER (0)");
+}
+
+/* ================= Hashed directory index ================= */
+
+static void test_dirindex(void) {
+    /* Unit-level: bypass dharafs entirely, drive the index directly. */
+    fn_dharafs_dirindex_reset();
+    int64_t *pa = mkbuf("/a", 2);
+    int64_t *pb = mkbuf("/b", 2);
+    int64_t *pc = mkbuf("/c", 2);
+    CHECK(fn_dharafs_dirindex_lookup_raw(pa, 2) == -1, "dirindex: miss on empty table");
+
+    fn_dharafs_dirindex_upsert_raw(pa, 2, 10);
+    CHECK(fn_dharafs_dirindex_lookup_raw(pa, 2) == 10, "dirindex: hit after insert");
+    CHECK(fn_dharafs_dirindex_lookup_raw(pb, 2) == -1, "dirindex: unrelated path still misses");
+
+    fn_dharafs_dirindex_upsert_raw(pb, 2, 11);
+    fn_dharafs_dirindex_upsert_raw(pc, 2, 12);
+    CHECK(fn_dharafs_dirindex_lookup_raw(pa, 2) == 10, "dirindex: /a unaffected by later inserts");
+    CHECK(fn_dharafs_dirindex_lookup_raw(pb, 2) == 11, "dirindex: /b correct");
+    CHECK(fn_dharafs_dirindex_lookup_raw(pc, 2) == 12, "dirindex: /c correct");
+
+    fn_dharafs_dirindex_upsert_raw(pa, 2, 20);
+    CHECK(fn_dharafs_dirindex_lookup_raw(pa, 2) == 20, "dirindex: re-upsert updates block in place");
+    CHECK(fn_dharafs_dirindex_lookup_raw(pb, 2) == 11, "dirindex: sibling entries untouched by /a's update");
+
+    /* Hash determinism -- same bytes, same offset, same result every time. */
+    uint32_t h1 = fn_dharafs_dirindex_hash(pa, 0, 2);
+    uint32_t h2 = fn_dharafs_dirindex_hash(pa, 0, 2);
+    CHECK(h1 == h2, "dirindex: hash is deterministic for identical input");
+    uint32_t hb = fn_dharafs_dirindex_hash(pb, 0, 2);
+    CHECK(h1 != hb, "dirindex: distinct 2-byte paths hash differently (no trivial collision)");
+
+    /* Bulk load past a realistic file count -- correctness contract is
+     * "every HIT is exactly right, a MISS is always safe (never a
+     * wrong answer)," not "every path fits." Exercises real open-
+     * addressing probing/collision handling, not just the 3-entry
+     * happy path above. */
+    fn_dharafs_dirindex_reset();
+    enum { N = 300 };
+    static char bulk_paths[N][16];
+    int64_t expected_block[N];
+    for (int i = 0; i < N; i++) {
+        snprintf(bulk_paths[i], sizeof(bulk_paths[i]), "/f%d", i);
+        expected_block[i] = 1000 + i;
+        int64_t *pb2 = mkbuf(bulk_paths[i], (int64_t)strlen(bulk_paths[i]));
+        fn_dharafs_dirindex_upsert_raw(pb2, (int64_t)strlen(bulk_paths[i]), expected_block[i]);
+    }
+    int found = 0;
+    int all_correct = 1;
+    for (int i = 0; i < N; i++) {
+        int64_t *pb2 = mkbuf(bulk_paths[i], (int64_t)strlen(bulk_paths[i]));
+        int64_t got = fn_dharafs_dirindex_lookup_raw(pb2, (int64_t)strlen(bulk_paths[i]));
+        if (got >= 0) {
+            found++;
+            if (got != expected_block[i]) all_correct = 0;
+        }
+    }
+    CHECK(all_correct == 1, "dirindex: every hit under bulk load (300 paths, 256 slots) is byte-exact correct, never wrong");
+    CHECK(found >= 200, "dirindex: bulk load fits a large majority of realistic-scale file counts (>=200/300 indexed)");
+    CHECK(found <= 256, "dirindex: table never reports more entries indexed than its own fixed 256-slot capacity");
+
+    /* Integration: real dharafs_append_raw/find_latest_block_raw path
+     * actually populates and uses the index, not just the fallback
+     * scan -- confirmed by reading the slot directly after a write. */
+    reset_fs();
+    CHECK(fn_dharafs_append("/idx/one", "hello") == 0, "dirindex: real append succeeds");
+    int64_t *p_one = mkbuf("/idx/one", 8);
+    int64_t via_index = fn_dharafs_dirindex_lookup_raw(p_one, 8);
+    CHECK(via_index >= 0, "dirindex: a real append_raw write is indexed (hit, not a miss)");
+    int64_t via_scan = fn_dharafs_find_latest_block_raw(p_one, 8);
+    CHECK(via_index == via_scan, "dirindex: fast-path index and linear-scan fallback agree exactly");
+
+    CHECK(fn_dharafs_append("/idx/one", "updated") == 0, "dirindex: overwrite succeeds");
+    int64_t via_index2 = fn_dharafs_dirindex_lookup_raw(p_one, 8);
+    CHECK(via_index2 == fn_dharafs_find_latest_block_raw(p_one, 8), "dirindex: index stays in sync after overwrite");
+    CHECK(via_index2 != via_index, "dirindex: overwrite actually advanced to a new block");
+
+    CHECK(fn_dharafs_delete("/idx/one") == 0, "dirindex: delete (tombstone) succeeds");
+    int64_t via_index3 = fn_dharafs_dirindex_lookup_raw(p_one, 8);
+    CHECK(via_index3 == fn_dharafs_find_latest_block_raw(p_one, 8), "dirindex: index stays in sync after delete's tombstone");
+    CHECK(fn_dharafs_read("/idx/one", g_data_scratch) == -1, "dirindex: deleted path still correctly reads as gone (tombstone semantics unaffected)");
+
+    /* Boot-time rebuild: dharafs_init's own scan must repopulate the
+     * index identically to what live writes already produced (this is
+     * the ONLY init path in this project -- there's no persisted
+     * on-disk index, so a fresh boot must re-derive it from the log). */
+    fn_dharafs_dirindex_reset();
+    fn_dharafs_init();
+    int64_t after_reinit = fn_dharafs_dirindex_lookup_raw(p_one, 8);
+    CHECK(after_reinit == via_index3, "dirindex: dharafs_init's scan rebuilds the exact same mapping a live boot already had");
+}
+
+/* ================= Priority-aware FS request queue ================= */
+
+static void test_fsqueue(void) {
+    reset_fs(); /* also resets the queue via fn_dharafs_queue_reset() */
+
+    CHECK(fn_dharafs_queue_pending_count() == 0, "fsqueue: empty after reset");
+    CHECK(fn_dharafs_queue_dispatch_one() == -1, "fsqueue: dispatch on empty queue returns -1");
+
+    /* Priority ordering: a LOW-priority (numerically high) write
+     * submitted first must still be dispatched AFTER a HIGH-priority
+     * (numerically low) one submitted later -- the whole point of the
+     * queue, not just FIFO. */
+    int64_t *p_low = mkbuf("/q/low", 6);
+    int64_t *d_low = mkbuf("low-data", 8);
+    int64_t slot_low = fn_dharafs_queue_submit_write_raw(2, 1, p_low, 6, d_low, 8, 0, 0, 0644);
+    CHECK(slot_low >= 0, "fsqueue: low-priority submit succeeds");
+
+    int64_t *p_high = mkbuf("/q/high", 7);
+    int64_t *d_high = mkbuf("hi", 2);
+    int64_t slot_high = fn_dharafs_queue_submit_write_raw(0, 2, p_high, 7, d_high, 2, 0, 0, 0644);
+    CHECK(slot_high >= 0, "fsqueue: high-priority submit succeeds");
+
+    CHECK(fn_dharafs_queue_pending_count() == 2, "fsqueue: 2 pending after 2 submits");
+    CHECK(fn_dharafs_queue_pick_next() == slot_high, "fsqueue: pick_next picks the higher-priority (lower number) entry first, regardless of submit order");
+
+    int64_t r1 = fn_dharafs_queue_dispatch_one();
+    CHECK(r1 == 0, "fsqueue: first dispatch (the high-priority one) succeeds");
+    CHECK(fn_dharafs_read("/q/high", g_data_scratch) == 2, "fsqueue: high-priority file is readable immediately after its dispatch");
+    CHECK(fn_dharafs_read("/q/low", g_data_scratch) == -1, "fsqueue: low-priority file NOT yet written -- still queued behind it");
+
+    int64_t r2 = fn_dharafs_queue_dispatch_one();
+    CHECK(r2 == 0, "fsqueue: second dispatch (the low-priority one) succeeds");
+    CHECK(fn_dharafs_read("/q/low", g_data_scratch) == 8, "fsqueue: low-priority file readable once its turn comes");
+    CHECK(fn_dharafs_queue_dispatch_one() == -1, "fsqueue: queue drained, dispatch returns -1 again");
+
+    /* FIFO tie-break among equal priorities. */
+    int64_t *pa = mkbuf("/q/tie_a", 8);
+    int64_t *pb = mkbuf("/q/tie_b", 8);
+    int64_t *td = mkbuf("t", 1);
+    int64_t slot_a = fn_dharafs_queue_submit_write_raw(1, 5, pa, 8, td, 1, 0, 0, 0644);
+    int64_t slot_b = fn_dharafs_queue_submit_write_raw(1, 5, pb, 8, td, 1, 0, 0, 0644);
+    CHECK(fn_dharafs_queue_pick_next() == slot_a, "fsqueue: equal priority -- earlier submission (FIFO) wins the tie");
+    fn_dharafs_queue_dispatch_one();
+    CHECK(fn_dharafs_queue_pick_next() == slot_b, "fsqueue: after draining the first tied entry, the second is next");
+    fn_dharafs_queue_dispatch_one();
+
+    /* Delete via the queue. */
+    CHECK(fn_dharafs_append("/q/todelete", "gone-soon") == 0, "fsqueue: real synchronous write for the delete test");
+    int64_t *p_del = mkbuf("/q/todelete", 11);
+    int64_t slot_del = fn_dharafs_queue_submit_delete_raw(0, 3, p_del, 11);
+    CHECK(slot_del >= 0, "fsqueue: delete submit succeeds");
+    CHECK(fn_dharafs_queue_dispatch_one() == 0, "fsqueue: queued delete dispatches successfully");
+    CHECK(fn_dharafs_read("/q/todelete", g_data_scratch) == -1, "fsqueue: file is gone after its queued delete is dispatched");
+
+    /* Oversized data rejected outright, queue untouched. */
+    int64_t before_count = fn_dharafs_queue_pending_count();
+    int64_t *p_big = mkbuf("/q/big", 6);
+    static int64_t big_data[64]; /* > 448 bytes worth of i64 slots, content irrelevant */
+    int64_t slot_big = fn_dharafs_queue_submit_write_raw(0, 1, p_big, 6, big_data, 500, 0, 0, 0644);
+    CHECK(slot_big == -1, "fsqueue: data_len > 448 (block payload cap) is rejected");
+    CHECK(fn_dharafs_queue_pending_count() == before_count, "fsqueue: a rejected submit doesn't consume a slot");
+
+    /* Queue-full behavior: fill all 8 slots, confirm the 9th is
+     * rejected cleanly (never a crash, never silently overwrites). */
+    fn_dharafs_queue_reset();
+    int64_t last_slot = -2;
+    for (int i = 0; i < 8; i++) {
+        char namebuf[16];
+        snprintf(namebuf, sizeof(namebuf), "/q/f%d", i);
+        int64_t *pf = mkbuf(namebuf, (int64_t)strlen(namebuf));
+        last_slot = fn_dharafs_queue_submit_write_raw(0, 1, pf, (int64_t)strlen(namebuf), td, 1, 0, 0, 0644);
+        CHECK(last_slot >= 0, "fsqueue: fill loop -- slot 0..7 all accepted");
+    }
+    CHECK(fn_dharafs_queue_pending_count() == 8, "fsqueue: queue reports exactly full (8/8) after filling every slot");
+    int64_t *p9 = mkbuf("/q/overflow", 11);
+    CHECK(fn_dharafs_queue_submit_write_raw(0, 1, p9, 11, td, 1, 0, 0, 0644) == -1, "fsqueue: 9th submit on a full 8-slot queue is rejected, not silently dropped or overwritten");
+    CHECK(fn_dharafs_queue_pending_count() == 8, "fsqueue: rejected 9th submit leaves the 8 real entries untouched");
+
+    /* Str convenience wrapper -- basic functional smoke test (host
+     * harness stubs current_eff_prio()/current_task_get() to a fixed
+     * 0, so priority tagging itself isn't exercised here, only that
+     * the wrapper correctly builds and submits a real request). */
+    fn_dharafs_queue_reset();
+    reset_fs();
+    CHECK(fn_dharafs_queue_submit("/q/wrapper", "via-wrapper") >= 0, "fsqueue: Str convenience wrapper submits successfully");
+    CHECK(fn_dharafs_queue_dispatch_one() == 0, "fsqueue: wrapper-submitted request dispatches successfully");
+    CHECK(fn_dharafs_read("/q/wrapper", g_data_scratch) == 11, "fsqueue: wrapper-submitted file readable after dispatch");
+}
+
+/* ================= DharaFS named snapshots ================= */
+
+static void test_snapshot(void) {
+    reset_fs(); /* fn_dharafs_init() inside also calls fn_dharafs_snapshot_reset() */
+
+    CHECK(fn_dharafs_append("/snap/a", "version1") == 0, "snapshot: write v1");
+    CHECK(fn_dharafs_snapshot_create("s1") >= 0, "snapshot: create s1 after v1");
+
+    CHECK(fn_dharafs_append("/snap/b", "born-after-s1") == 0, "snapshot: /snap/b written after s1, before s2");
+
+    CHECK(fn_dharafs_append("/snap/a", "version2!") == 0, "snapshot: overwrite to v2");
+    CHECK(fn_dharafs_snapshot_create("s2") >= 0, "snapshot: create s2 after v2 and after /snap/b");
+
+    CHECK(fn_dharafs_delete("/snap/a") == 0, "snapshot: delete /snap/a (current state)");
+    CHECK(fn_dharafs_read("/snap/a", g_data_scratch) == -1, "snapshot: /snap/a correctly gone in CURRENT state");
+
+    int64_t len_s1 = fn_dharafs_snapshot_read("/snap/a", "s1", g_data_scratch);
+    CHECK(len_s1 == 8, "snapshot: s1 still sees /snap/a with its v1 length, despite the later delete");
+    CHECK(memcmp(g_data_scratch, "version1", 8) == 0, "snapshot: s1's content is byte-exact v1");
+
+    int64_t len_s2 = fn_dharafs_snapshot_read("/snap/a", "s2", g_data_scratch);
+    CHECK(len_s2 == 9, "snapshot: s2 sees /snap/a with its v2 length");
+    CHECK(memcmp(g_data_scratch, "version2!", 9) == 0, "snapshot: s2's content is byte-exact v2, not v1");
+
+    CHECK(fn_dharafs_snapshot_read("/snap/b", "s1", g_data_scratch) == -1, "snapshot: s1 correctly does NOT see /snap/b (didn't exist yet as of s1)");
+    CHECK(fn_dharafs_snapshot_read("/snap/b", "s2", g_data_scratch) >= 0, "snapshot: s2 DOES see /snap/b (existed by then)");
+
+    CHECK(fn_dharafs_snapshot_read("/snap/a", "no-such-snapshot", g_data_scratch) == -1, "snapshot: unknown snapshot name returns -1, not a crash");
+
+    CHECK(fn_dharafs_snapshot_create("s1") == -1, "snapshot: duplicate name is rejected outright");
+    CHECK(fn_dharafs_snapshot_delete("s1") == 0, "snapshot: delete s1");
+    CHECK(fn_dharafs_snapshot_create("s1") >= 0, "snapshot: name is reusable once deleted");
+    CHECK(fn_dharafs_snapshot_read("/snap/a", "s1", g_data_scratch) == -1, "snapshot: the NEW s1 (created after the delete) correctly does NOT see the old v1 content");
+
+    /* The real point of this feature: a snapshot survives dharafs_compact
+     * reclaiming the block its own data physically lived in -- because
+     * compact only ever advances the in-RAM log_start optimization, it
+     * never erases bytes already on disk (see snapshot_state.S's own
+     * header comment). */
+    fn_dharafs_snapshot_delete("s1");
+    reset_fs();
+    CHECK(fn_dharafs_append("/snap/x", "old-value") == 0, "snapshot+compact: write old value");
+    CHECK(fn_dharafs_snapshot_create("before_overwrite") >= 0, "snapshot+compact: pin it");
+    CHECK(fn_dharafs_append("/snap/x", "new-value!") == 0, "snapshot+compact: overwrite");
+    CHECK(fn_dharafs_append("/snap/y", "filler1") == 0, "snapshot+compact: filler write 1 (compact needs >=4 blocks of headroom to do real work)");
+    CHECK(fn_dharafs_append("/snap/z", "filler2") == 0, "snapshot+compact: filler write 2");
+    int64_t *compact_buf = dhruva_alloc_bytes(512);
+    int64_t *compact_path_buf = dhruva_alloc_bytes(32);
+    int64_t *compact_data_buf = dhruva_alloc_bytes(4096);
+    fn_dharafs_compact(compact_buf, compact_path_buf, compact_data_buf);
+    CHECK(fn_dharafs_read("/snap/x", g_data_scratch) == 10, "snapshot+compact: current read of /snap/x still sees new-value! after compaction");
+    int64_t len_before = fn_dharafs_snapshot_read("/snap/x", "before_overwrite", g_data_scratch);
+    CHECK(len_before == 9, "snapshot+compact: the snapshot STILL sees the pre-overwrite old-value length after compact() ran and reclaimed that block from ordinary lookups");
+    CHECK(memcmp(g_data_scratch, "old-value", 9) == 0, "snapshot+compact: and the content is still byte-exact old-value");
+
+    /* Table-full behavior. */
+    fn_dharafs_snapshot_reset();
+    for (int i = 0; i < 8; i++) {
+        char namebuf[16];
+        snprintf(namebuf, sizeof(namebuf), "snap%d", i);
+        CHECK(fn_dharafs_snapshot_create(namebuf) >= 0, "snapshot: fill loop -- 0..7 all accepted");
+    }
+    CHECK(fn_dharafs_snapshot_create("snap_overflow") == -1, "snapshot: 9th create on a full 8-slot table is rejected cleanly");
 }
 
 /* ================= dirlist_seen_contains / segment_equals unit tests ================= */
@@ -2362,6 +2646,9 @@ int main(void) {
     test_rename_transaction_crash_consistency();
     test_permission_boundaries();
     test_directory_hierarchy();
+    test_dirindex();
+    test_fsqueue();
+    test_snapshot();
     test_dirlist_helpers();
     test_corrupted_checksum_skipped();
     test_oversized_data_len_field_rejected();

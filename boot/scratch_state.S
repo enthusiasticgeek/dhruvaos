@@ -452,6 +452,17 @@ gatt_recv_scratch_addr:
     .word 0             /* 256 bytes -- gatt_att_recv's own incoming
                          * buffer, same size/reasoning as gatt_send_
                          * scratch above. */
+fsqueue_path_scratch_addr:
+    .word 0             /* 32 bytes -- dharafs_queue_dispatch_one's own
+                         * copy of the queued request's path, decoded
+                         * from fsqueue_state.S's byte-addressed
+                         * storage before handing off to dharafs_
+                         * append_raw/dharafs_delete_raw, same
+                         * one-allocation-at-boot pattern as every
+                         * other FS scratch buffer above. */
+fsqueue_data_scratch_addr:
+    .word 0             /* 448 bytes -- same, for the queued write's
+                         * data payload (fsqueue_max_data_bytes()). */
 
 .section ".text"
 
@@ -1137,6 +1148,32 @@ gatt_recv_scratch_get:
     ldr r0, =gatt_recv_scratch_addr
     ldr r0, [r0]
     mov r1, #0
+    bx lr
+
+.global fsqueue_path_scratch_set
+fsqueue_path_scratch_set:
+    ldr r1, =fsqueue_path_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global fsqueue_path_scratch_get
+fsqueue_path_scratch_get:
+    ldr r0, =fsqueue_path_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global fsqueue_data_scratch_set
+fsqueue_data_scratch_set:
+    ldr r1, =fsqueue_data_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global fsqueue_data_scratch_get
+fsqueue_data_scratch_get:
+    ldr r0, =fsqueue_data_scratch_addr
+    ldr r0, [r0]
     bx lr
 
 /* u32 ptr_to_u32(mut ref i64 p) -- a pointer and a raw address integer

@@ -159,6 +159,8 @@ SCRATCH_PTR(sha256_padded_scratch)
 SCRATCH_PTR(sha256_h_scratch)
 SCRATCH_PTR(sha256_k_scratch)
 SCRATCH_PTR(sha256_w_scratch)
+SCRATCH_PTR(fsqueue_path_scratch)
+SCRATCH_PTR(fsqueue_data_scratch)
 
 /* ---- 1d. dharafs_state_* / dharafs_user_* -- real state, matching
  * boot/dharafs_state.S's semantics closely enough for host testing
@@ -555,6 +557,69 @@ int64_t gatt_server_attr_get_writable_at(uint32_t i) { return g_gatt_server_attr
 int64_t gatt_server_attr_set_writable_at(uint32_t i, uint32_t v) { g_gatt_server_attr_writable[i % 32] = v; return 0; }
 int64_t gatt_server_attr_get_value_byte(uint32_t combined_index) { return g_gatt_server_attr_value_bytes[combined_index % (32 * 20)]; }
 int64_t gatt_server_attr_set_value_byte(uint32_t combined_index, uint32_t v) { g_gatt_server_attr_value_bytes[combined_index % (32 * 20)] = (uint8_t)v; return 0; }
+
+/* DharaFS hashed directory index (boot/dirindex_state.S) -- native
+ * mirror of its 256-slot open-addressing table. */
+static uint32_t g_dirindex_valid[256], g_dirindex_hash[256], g_dirindex_pathlen[256], g_dirindex_block[256];
+static uint8_t g_dirindex_path_bytes[256 * 32];
+int64_t dirindex_get_valid_at(uint32_t i) { return g_dirindex_valid[i % 256]; }
+int64_t dirindex_set_valid_at(uint32_t i, uint32_t v) { g_dirindex_valid[i % 256] = v; return 0; }
+int64_t dirindex_get_hash_at(uint32_t i) { return g_dirindex_hash[i % 256]; }
+int64_t dirindex_set_hash_at(uint32_t i, uint32_t v) { g_dirindex_hash[i % 256] = v; return 0; }
+int64_t dirindex_get_pathlen_at(uint32_t i) { return g_dirindex_pathlen[i % 256]; }
+int64_t dirindex_set_pathlen_at(uint32_t i, uint32_t v) { g_dirindex_pathlen[i % 256] = v; return 0; }
+int64_t dirindex_get_block_at(uint32_t i) { return g_dirindex_block[i % 256]; }
+int64_t dirindex_set_block_at(uint32_t i, uint32_t v) { g_dirindex_block[i % 256] = v; return 0; }
+int64_t dirindex_get_path_byte(uint32_t combined_index) { return g_dirindex_path_bytes[combined_index % (256 * 32)]; }
+int64_t dirindex_set_path_byte(uint32_t combined_index, uint32_t v) { g_dirindex_path_bytes[combined_index % (256 * 32)] = (uint8_t)v; return 0; }
+
+/* Priority-aware FS request queue (boot/fsqueue_state.S) -- native
+ * mirror of its 8-slot table. */
+static uint32_t g_fsqueue_valid[8], g_fsqueue_priority[8], g_fsqueue_task_id[8], g_fsqueue_op_type[8];
+static uint32_t g_fsqueue_path_len[8], g_fsqueue_data_len[8], g_fsqueue_owner_uid[8], g_fsqueue_owner_gid[8];
+static uint32_t g_fsqueue_mode[8], g_fsqueue_seq[8], g_fsqueue_result[8], g_fsqueue_next_seq;
+static uint8_t g_fsqueue_path_bytes[8 * 32], g_fsqueue_data_bytes[8 * 448];
+int64_t fsqueue_valid_get_at(uint32_t i) { return g_fsqueue_valid[i % 8]; }
+int64_t fsqueue_valid_set_at(uint32_t i, uint32_t v) { g_fsqueue_valid[i % 8] = v; return 0; }
+int64_t fsqueue_priority_get_at(uint32_t i) { return g_fsqueue_priority[i % 8]; }
+int64_t fsqueue_priority_set_at(uint32_t i, uint32_t v) { g_fsqueue_priority[i % 8] = v; return 0; }
+int64_t fsqueue_task_id_get_at(uint32_t i) { return g_fsqueue_task_id[i % 8]; }
+int64_t fsqueue_task_id_set_at(uint32_t i, uint32_t v) { g_fsqueue_task_id[i % 8] = v; return 0; }
+int64_t fsqueue_op_type_get_at(uint32_t i) { return g_fsqueue_op_type[i % 8]; }
+int64_t fsqueue_op_type_set_at(uint32_t i, uint32_t v) { g_fsqueue_op_type[i % 8] = v; return 0; }
+int64_t fsqueue_path_len_get_at(uint32_t i) { return g_fsqueue_path_len[i % 8]; }
+int64_t fsqueue_path_len_set_at(uint32_t i, uint32_t v) { g_fsqueue_path_len[i % 8] = v; return 0; }
+int64_t fsqueue_data_len_get_at(uint32_t i) { return g_fsqueue_data_len[i % 8]; }
+int64_t fsqueue_data_len_set_at(uint32_t i, uint32_t v) { g_fsqueue_data_len[i % 8] = v; return 0; }
+int64_t fsqueue_owner_uid_get_at(uint32_t i) { return g_fsqueue_owner_uid[i % 8]; }
+int64_t fsqueue_owner_uid_set_at(uint32_t i, uint32_t v) { g_fsqueue_owner_uid[i % 8] = v; return 0; }
+int64_t fsqueue_owner_gid_get_at(uint32_t i) { return g_fsqueue_owner_gid[i % 8]; }
+int64_t fsqueue_owner_gid_set_at(uint32_t i, uint32_t v) { g_fsqueue_owner_gid[i % 8] = v; return 0; }
+int64_t fsqueue_mode_get_at(uint32_t i) { return g_fsqueue_mode[i % 8]; }
+int64_t fsqueue_mode_set_at(uint32_t i, uint32_t v) { g_fsqueue_mode[i % 8] = v; return 0; }
+int64_t fsqueue_seq_get_at(uint32_t i) { return g_fsqueue_seq[i % 8]; }
+int64_t fsqueue_seq_set_at(uint32_t i, uint32_t v) { g_fsqueue_seq[i % 8] = v; return 0; }
+int64_t fsqueue_result_get_at(uint32_t i) { return g_fsqueue_result[i % 8]; }
+int64_t fsqueue_result_set_at(uint32_t i, uint32_t v) { g_fsqueue_result[i % 8] = v; return 0; }
+int64_t fsqueue_next_seq_get(void) { return g_fsqueue_next_seq; }
+int64_t fsqueue_next_seq_set(uint32_t v) { g_fsqueue_next_seq = v; return 0; }
+int64_t fsqueue_get_path_byte(uint32_t combined_index) { return g_fsqueue_path_bytes[combined_index % (8 * 32)]; }
+int64_t fsqueue_set_path_byte(uint32_t combined_index, uint32_t v) { g_fsqueue_path_bytes[combined_index % (8 * 32)] = (uint8_t)v; return 0; }
+int64_t fsqueue_get_data_byte(uint32_t combined_index) { return g_fsqueue_data_bytes[combined_index % (8 * 448)]; }
+int64_t fsqueue_set_data_byte(uint32_t combined_index, uint32_t v) { g_fsqueue_data_bytes[combined_index % (8 * 448)] = (uint8_t)v; return 0; }
+
+/* DharaFS named snapshots (boot/snapshot_state.S) -- native mirror of
+ * its 8-slot table. */
+static uint32_t g_snapshot_valid[8], g_snapshot_pinned_seq[8], g_snapshot_name_len[8];
+static uint8_t g_snapshot_name_bytes[8 * 32];
+int64_t snapshot_valid_get_at(uint32_t i) { return g_snapshot_valid[i % 8]; }
+int64_t snapshot_valid_set_at(uint32_t i, uint32_t v) { g_snapshot_valid[i % 8] = v; return 0; }
+int64_t snapshot_pinned_seq_get_at(uint32_t i) { return g_snapshot_pinned_seq[i % 8]; }
+int64_t snapshot_pinned_seq_set_at(uint32_t i, uint32_t v) { g_snapshot_pinned_seq[i % 8] = v; return 0; }
+int64_t snapshot_name_len_get_at(uint32_t i) { return g_snapshot_name_len[i % 8]; }
+int64_t snapshot_name_len_set_at(uint32_t i, uint32_t v) { g_snapshot_name_len[i % 8] = v; return 0; }
+int64_t snapshot_get_name_byte(uint32_t combined_index) { return g_snapshot_name_bytes[combined_index % (8 * 32)]; }
+int64_t snapshot_set_name_byte(uint32_t combined_index, uint32_t v) { g_snapshot_name_bytes[combined_index % (8 * 32)] = (uint8_t)v; return 0; }
 
 static uint32_t g_governor_last_mhz;
 static int64_t g_governor_history[4];

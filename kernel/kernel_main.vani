@@ -51,6 +51,10 @@ extern "C" fn dharafs_stat_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_stat_scratch_get() -> mut ref i64;
 extern "C" fn dharafs_dir_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_dir_scratch_get() -> mut ref i64;
+extern "C" fn fsqueue_path_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn fsqueue_path_scratch_get() -> mut ref i64;
+extern "C" fn fsqueue_data_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn fsqueue_data_scratch_get() -> mut ref i64;
 // Round 49: dharafs_log_append_raw's own persistent scratch -- see
 // boot/scratch_state.S's own comment on each buffer's exact role.
 // Same "never dhruva_alloc_bytes on every call" discipline as every
@@ -594,6 +598,61 @@ extern "C" fn dharafs_state_get_next_block() -> u32;
 extern "C" fn dharafs_state_get_next_seq() -> u32;
 extern "C" fn dharafs_state_set_log_start(log_start: u32) -> u32;
 extern "C" fn dharafs_state_get_log_start() -> u32;
+// Hashed directory index (boot/dirindex_state.S) -- see that file's own
+// header comment. Pure RAM-only lookup accelerator for
+// dharafs_find_latest_block_raw, never a correctness authority by
+// itself (a miss always falls back to the original linear scan).
+extern "C" fn dirindex_get_valid_at(index: u32) -> i64;
+extern "C" fn dirindex_set_valid_at(index: u32, value: u32) -> i64;
+extern "C" fn dirindex_get_hash_at(index: u32) -> i64;
+extern "C" fn dirindex_set_hash_at(index: u32, value: u32) -> i64;
+extern "C" fn dirindex_get_pathlen_at(index: u32) -> i64;
+extern "C" fn dirindex_set_pathlen_at(index: u32, value: u32) -> i64;
+extern "C" fn dirindex_get_block_at(index: u32) -> i64;
+extern "C" fn dirindex_set_block_at(index: u32, value: u32) -> i64;
+extern "C" fn dirindex_get_path_byte(combined_index: u32) -> i64;
+extern "C" fn dirindex_set_path_byte(combined_index: u32, value: u32) -> i64;
+// Priority-aware FS request queue (boot/fsqueue_state.S) -- see that
+// file's own header comment. Opt-in: dharafs_queue_submit_write/
+// _delete alongside (not replacing) the existing synchronous calls.
+extern "C" fn fsqueue_valid_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_valid_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_priority_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_priority_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_task_id_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_task_id_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_op_type_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_op_type_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_path_len_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_path_len_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_data_len_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_data_len_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_owner_uid_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_owner_uid_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_owner_gid_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_owner_gid_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_mode_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_mode_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_seq_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_seq_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_result_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_result_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_next_seq_get() -> i64;
+extern "C" fn fsqueue_next_seq_set(value: u32) -> i64;
+extern "C" fn fsqueue_get_path_byte(combined_index: u32) -> i64;
+extern "C" fn fsqueue_set_path_byte(combined_index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_get_data_byte(combined_index: u32) -> i64;
+extern "C" fn fsqueue_set_data_byte(combined_index: u32, value: u32) -> i64;
+// DharaFS named snapshots (boot/snapshot_state.S) -- see that file's
+// own header comment for why this doesn't need to touch dharafs_compact.
+extern "C" fn snapshot_valid_get_at(index: u32) -> i64;
+extern "C" fn snapshot_valid_set_at(index: u32, value: u32) -> i64;
+extern "C" fn snapshot_pinned_seq_get_at(index: u32) -> i64;
+extern "C" fn snapshot_pinned_seq_set_at(index: u32, value: u32) -> i64;
+extern "C" fn snapshot_name_len_get_at(index: u32) -> i64;
+extern "C" fn snapshot_name_len_set_at(index: u32, value: u32) -> i64;
+extern "C" fn snapshot_get_name_byte(combined_index: u32) -> i64;
+extern "C" fn snapshot_set_name_byte(combined_index: u32, value: u32) -> i64;
 // Round 36: which block-device backend dharafs_block_read/dharafs_block_write
 // dispatch to -- see dharafs_state.S's own comment on dharafs_block_dev.
 extern "C" fn dharafs_state_set_block_dev(dev: u32) -> u32;
@@ -1697,7 +1756,131 @@ fn dharafs_check_permission(owner_uid: u32, owner_gid: u32, mode: u32, req_uid: 
   }
   return 0;
 }
+fn dirindex_max_slots() -> i64 { return 256; }
+fn dirindex_max_path_bytes() -> i64 { return 32; }
+
+fn dharafs_dirindex_reset() -> i64 {
+  let i: i64 = 0;
+  while i < dirindex_max_slots() {
+    let _ = dirindex_set_valid_at(i as u32, 0 as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// FNV-1a over path bytes read from `buf` starting at `path_offset` --
+// callers pass path_offset=0 for a bare path_buf (dharafs_append_raw's
+// own convention) or path_offset=12 to hash a path embedded directly
+// in a full 512-byte on-disk record (dharafs_init's own scan buffer),
+// so the index can be built/queried from either shape without a copy.
+fn dharafs_dirindex_hash(buf: mut ref i64, path_offset: i64, path_len: i64) -> u32 {
+  let hash: u32 = 2166136261 as u32;
+  let k: i64 = 0;
+  while k < path_len {
+    let b: u32 = buf_read_byte(buf, (path_offset + k) as u32);
+    hash = hash ^ b;
+    hash = wrapping_mul(hash, 16777619 as u32);
+    k = k + 1;
+  }
+  return hash;
+}
+
+fn dharafs_dirindex_path_matches(slot: i64, buf: mut ref i64, path_offset: i64, path_len: i64) -> i64 {
+  if dirindex_get_pathlen_at(slot as u32) != path_len {
+    return 0;
+  }
+  let k: i64 = 0;
+  let matches: i64 = 1;
+  while k < path_len {
+    let want: u32 = buf_read_byte(buf, (path_offset + k) as u32);
+    let got: u32 = dirindex_get_path_byte((slot * dirindex_max_path_bytes() + k) as u32) as u32;
+    if got != want {
+      matches = 0;
+    }
+    k = k + 1;
+  }
+  return matches;
+}
+
+// Standard open-addressing probe with no deletion (entries are only
+// ever added or have their block field updated, never removed --
+// see this file's own dirindex_state.S header comment for why that
+// keeps "hit an empty slot => not present" a safe stopping rule for
+// the whole table's lifetime). Returns the matching slot index, or -1
+// if the path isn't indexed yet.
+fn dharafs_dirindex_find_slot(buf: mut ref i64, path_offset: i64, path_len: i64, h: u32) -> i64 {
+  let start: i64 = (h % (dirindex_max_slots() as u32)) as i64;
+  let i: i64 = 0;
+  while i < dirindex_max_slots() {
+    let idx: i64 = (start + i) % dirindex_max_slots();
+    if dirindex_get_valid_at(idx as u32) == 0 {
+      return 0 - 1;
+    }
+    if (dirindex_get_hash_at(idx as u32) as u32) == h {
+      if dharafs_dirindex_path_matches(idx, buf, path_offset, path_len) == 1 {
+        return idx;
+      }
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+fn dharafs_dirindex_lookup_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  let h: u32 = dharafs_dirindex_hash(path_buf, 0, path_len);
+  let slot: i64 = dharafs_dirindex_find_slot(path_buf, 0, path_len, h);
+  if slot < 0 {
+    return 0 - 1;
+  }
+  return dirindex_get_block_at(slot as u32);
+}
+
+// Shared upsert core -- path_offset lets both dharafs_append_raw
+// (bare path_buf, offset 0) and dharafs_init's scan (path embedded in
+// a full record, offset 12) call the same logic. If the path is
+// already indexed, only its block field changes; block numbers only
+// ever increase within one boot (the log is append-only), so an
+// unconditional overwrite always reflects the latest write. If the
+// table is completely full (well beyond this project's realistic
+// file counts), the insert is silently skipped -- correctness is
+// unaffected, that one path just stays on dharafs_find_latest_block_raw's
+// linear-scan fallback instead of the fast path.
+fn dharafs_dirindex_upsert(buf: mut ref i64, path_offset: i64, path_len: i64, block: i64) -> i64 {
+  let h: u32 = dharafs_dirindex_hash(buf, path_offset, path_len);
+  let existing: i64 = dharafs_dirindex_find_slot(buf, path_offset, path_len, h);
+  if existing >= 0 {
+    let _ = dirindex_set_block_at(existing as u32, block as u32);
+    return 0;
+  }
+  let start: i64 = (h % (dirindex_max_slots() as u32)) as i64;
+  let i: i64 = 0;
+  while i < dirindex_max_slots() {
+    let idx: i64 = (start + i) % dirindex_max_slots();
+    if dirindex_get_valid_at(idx as u32) == 0 {
+      let _ = dirindex_set_valid_at(idx as u32, 1 as u32);
+      let _ = dirindex_set_hash_at(idx as u32, h);
+      let _ = dirindex_set_pathlen_at(idx as u32, path_len as u32);
+      let k: i64 = 0;
+      while k < path_len {
+        let b: u32 = buf_read_byte(buf, (path_offset + k) as u32);
+        let _ = dirindex_set_path_byte((idx * dirindex_max_path_bytes() + k) as u32, b);
+        k = k + 1;
+      }
+      let _ = dirindex_set_block_at(idx as u32, block as u32);
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 0 - 1; // table full -- see this fn's own doc comment above
+}
+
+fn dharafs_dirindex_upsert_raw(path_buf: mut ref i64, path_len: i64, block: i64) -> i64 {
+  return dharafs_dirindex_upsert(path_buf, 0, path_len, block);
+}
+
 fn dharafs_init() -> i64 {
+  let _ = dharafs_dirindex_reset();
+  let _ = dharafs_snapshot_reset();
   let buf: mut ref i64 = dhruva_alloc_bytes(512);
   let blk: i64 = 1;
   let max_blk: i64 = 2048; // 1MB log region for this v1 -- keeps a
@@ -1769,6 +1952,23 @@ fn dharafs_init() -> i64 {
         // written), so the group's own highest seq is this_seq +
         // block_count without needing to re-read each one.
         highest_seq = this_seq + (block_count as u32);
+        // Index every block this confirmed-complete transaction
+        // covers -- these are real file records too (e.g. dharafs_
+        // rename's own append+tombstone pair), just as eligible for
+        // the fast lookup path as any standalone record. Re-read
+        // rather than reuse buf from the verification loop above,
+        // since that loop only left the LAST checked block's bytes
+        // in buf, not every one of them.
+        let jj: i64 = 1;
+        while jj <= block_count {
+          let idx_blk: i64 = blk + jj;
+          let rd3: i64 = dharafs_block_read(idx_blk, buf);
+          if rd3 == 0 {
+            let plen3: u32 = buf_read_u32(buf, 8 as u32);
+            let _ = dharafs_dirindex_upsert(buf, 12, plen3 as i64, idx_blk);
+          }
+          jj = jj + 1;
+        }
         blk = blk + 1 + block_count;
       } else {
         // Incomplete -- stop scanning HERE, before even counting the
@@ -1783,6 +1983,7 @@ fn dharafs_init() -> i64 {
       if this_seq > highest_seq {
         highest_seq = this_seq;
       }
+      let _ = dharafs_dirindex_upsert(buf, 12, this_path_len as i64, blk);
       blk = blk + 1;
     }
   }
@@ -1856,6 +2057,7 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
     }
 
     let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+    let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, next_block as i64);
     return 0;
   }
 
@@ -1930,6 +2132,7 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
   }
 
   let _ = dharafs_state_set(base_block + (num_chunks as u32), base_seq + (num_chunks as u32));
+  let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, base_block as i64);
   return 0;
 }
 
@@ -2373,6 +2576,19 @@ fn dharafs_get_attr_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
 // from arbitrary bytes.  The block number of the newest valid record
 // matching the path at path_buf[0:path_len), or -1 if none exists.
 fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  // Fast path: the hashed directory index (boot/dirindex_state.S) is
+  // kept exactly in sync with every write that reaches this path
+  // (dharafs_append_raw/dharafs_delete_raw upsert on success,
+  // dharafs_init rebuilds it at boot) -- a HIT is always correct and
+  // returned directly, no scan needed. A MISS falls through to the
+  // exact same linear scan this function has always done (never a
+  // regression), which then self-heals the index below so the same
+  // path is fast on every subsequent lookup.
+  let cached_block: i64 = dharafs_dirindex_lookup_raw(path_buf, path_len);
+  if cached_block >= 0 {
+    return cached_block;
+  }
+
   let next_block: u32 = dharafs_state_get_next_block();
   let log_start: u32 = dharafs_state_get_log_start();
   let buf: mut ref i64 = dharafs_sd_scratch_get();
@@ -2412,6 +2628,12 @@ fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
     }
     blk = blk + 1;
   }
+  if best_block >= 0 {
+    // Self-heal: this path wasn't indexed yet (a table-full skip, or
+    // simply never written through a hook that upserts) -- now that
+    // the scan found it the honest way, index it so next time is fast.
+    let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, best_block);
+  }
   return best_block;
 }
 
@@ -2433,6 +2655,238 @@ fn dharafs_find_latest_block(path: Str) -> i64 {
     i = i + 1;
   }
   return dharafs_find_latest_block_raw(path_buf, path_len);
+}
+
+// Same scan as dharafs_find_latest_block_raw, but (a) constrained to
+// records with rec_seq <= max_seq (the "as of this snapshot" filter)
+// and (b) starting at block 1, not dharafs_state_get_log_start() --
+// see boot/snapshot_state.S's own header comment for why that's safe
+// and necessary: log_start hides old blocks from ORDINARY lookups
+// once compaction runs, but never actually erases them, and a
+// snapshot's whole point is to still be able to see what compaction
+// has since hidden. Deliberately does NOT consult the hashed
+// directory index (dirindex only ever tracks the single current
+// latest block per path, not historical versions) -- always a full
+// scan, which is fine for a cold, infrequent snapshot-query
+// operation, unlike the hot path dirindex accelerates.
+fn dharafs_find_block_as_of_raw(path_buf: mut ref i64, path_len: i64, max_seq: u32) -> i64 {
+  let next_block: u32 = dharafs_state_get_next_block();
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let best_block: i64 = 0 - 1;
+  let best_seq: u32 = 0 as u32;
+  let blk: i64 = 1;
+  while (blk as u32) < next_block {
+    let rd_status: i64 = dharafs_block_read(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) && (rec_seq <= max_seq) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        if (rec_path_len as i64) == path_len {
+          let matches: i64 = 1;
+          let k: i64 = 0;
+          while k < path_len {
+            let want: u32 = buf_read_byte(path_buf, k as u32);
+            let got: u32 = buf_read_byte(buf, (12 + k) as u32);
+            if got != want {
+              matches = 0;
+            }
+            k = k + 1;
+          }
+          if matches == 1 {
+            if rec_seq >= best_seq {
+              best_seq = rec_seq;
+              best_block = blk;
+            }
+          }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  return best_block;
+}
+
+fn snapshot_max_slots() -> i64 { return 8; }
+fn snapshot_max_name_bytes() -> i64 { return 32; }
+
+fn dharafs_snapshot_reset() -> i64 {
+  let i: i64 = 0;
+  while i < snapshot_max_slots() {
+    let _ = snapshot_valid_set_at(i as u32, 0 as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn dharafs_snapshot_find_by_name_raw(name_buf: mut ref i64, name_len: i64) -> i64 {
+  let i: i64 = 0;
+  while i < snapshot_max_slots() {
+    if snapshot_valid_get_at(i as u32) == 1 {
+      if snapshot_name_len_get_at(i as u32) == name_len {
+        let matches: i64 = 1;
+        let k: i64 = 0;
+        while k < name_len {
+          let want: u32 = buf_read_byte(name_buf, k as u32);
+          let got: u32 = snapshot_get_name_byte((i * snapshot_max_name_bytes() + k) as u32) as u32;
+          if got != want {
+            matches = 0;
+          }
+          k = k + 1;
+        }
+        if matches == 1 {
+          return i;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+// Pins `name` to the highest sequence number that genuinely exists
+// right now (dharafs_state_get_next_seq() - 1; 0 on a completely
+// empty filesystem, matching the "every real record's seq is >= 1"
+// convention already established elsewhere). Rejects a duplicate
+// name outright (reject, don't guess which one the caller meant) --
+// dharafs_snapshot_delete_raw first if the intent is to replace it.
+// Returns the slot index on success, -1 on a bad name / duplicate /
+// full table (8 slots).
+fn dharafs_snapshot_create_raw(name_buf: mut ref i64, name_len: i64) -> i64 {
+  if (name_len <= 0) || (name_len > snapshot_max_name_bytes()) {
+    return 0 - 1;
+  }
+  if dharafs_snapshot_find_by_name_raw(name_buf, name_len) >= 0 {
+    return 0 - 1;
+  }
+  let slot: i64 = 0 - 1;
+  let i: i64 = 0;
+  while i < snapshot_max_slots() {
+    if (slot < 0) && (snapshot_valid_get_at(i as u32) == 0) {
+      slot = i;
+    }
+    i = i + 1;
+  }
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let next_seq: u32 = dharafs_state_get_next_seq();
+  let pinned_seq: u32 = if next_seq > (0 as u32) { next_seq - (1 as u32) } else { 0 as u32 };
+  let _ = snapshot_pinned_seq_set_at(slot as u32, pinned_seq);
+  let _ = snapshot_name_len_set_at(slot as u32, name_len as u32);
+  let k: i64 = 0;
+  while k < name_len {
+    let b: u32 = buf_read_byte(name_buf, k as u32);
+    let _ = snapshot_set_name_byte((slot * snapshot_max_name_bytes() + k) as u32, b);
+    k = k + 1;
+  }
+  let _ = snapshot_valid_set_at(slot as u32, 1 as u32);
+  return slot;
+}
+
+fn dharafs_snapshot_delete_raw(name_buf: mut ref i64, name_len: i64) -> i64 {
+  let slot: i64 = dharafs_snapshot_find_by_name_raw(name_buf, name_len);
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let _ = snapshot_valid_set_at(slot as u32, 0 as u32);
+  return 0;
+}
+
+// -1 if `name` isn't a known snapshot, else its pinned sequence
+// number -- exposed mainly for introspection/tests; real callers
+// normally go straight through dharafs_snapshot_read_raw below.
+fn dharafs_snapshot_pinned_seq_raw(name_buf: mut ref i64, name_len: i64) -> i64 {
+  let slot: i64 = dharafs_snapshot_find_by_name_raw(name_buf, name_len);
+  if slot < 0 {
+    return 0 - 1;
+  }
+  return snapshot_pinned_seq_get_at(slot as u32);
+}
+
+// Reads `path`'s content exactly AS OF the moment `name` was created
+// -- -1 if the snapshot name is unknown, or if `path` had no live
+// (non-tombstoned) record for it at that moment (never written yet
+// by then, or already deleted by then -- both indistinguishable from
+// "doesn't exist as of this snapshot," same posture dharafs_read_raw
+// already takes for the current-time case). A later write or delete
+// to `path` after the snapshot was taken never changes what this
+// returns -- that's the entire point.
+fn dharafs_snapshot_read_raw(path_buf: mut ref i64, path_len: i64, name_buf: mut ref i64, name_len: i64, out_buf: mut ref i64) -> i64 {
+  let slot: i64 = dharafs_snapshot_find_by_name_raw(name_buf, name_len);
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let pinned_seq: u32 = snapshot_pinned_seq_get_at(slot as u32) as u32;
+  let blk: i64 = dharafs_find_block_as_of_raw(path_buf, path_len, pinned_seq);
+  if blk < 0 {
+    return 0 - 1;
+  }
+  return dharafs_read_from_block_raw(blk, out_buf);
+}
+
+// Str convenience wrappers, same relationship to the _raw functions
+// above as dharafs_append has to dharafs_append_raw.
+fn dharafs_snapshot_create(name: Str) -> i64 {
+  let name_len: i64 = str_len_bytes(name);
+  if (name_len <= 0) || (name_len > 32) {
+    return 0 - 1;
+  }
+  let name_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < name_len {
+    let _ = buf_write_byte(name_buf, i as u32, str_byte_at(name, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_snapshot_create_raw(name_buf, name_len);
+}
+
+fn dharafs_snapshot_delete(name: Str) -> i64 {
+  let name_len: i64 = str_len_bytes(name);
+  if (name_len <= 0) || (name_len > 32) {
+    return 0 - 1;
+  }
+  let name_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < name_len {
+    let _ = buf_write_byte(name_buf, i as u32, str_byte_at(name, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_snapshot_delete_raw(name_buf, name_len);
+}
+
+// Reads path's content as of snapshot `name` into out_buf, returning
+// the data length or -1 (see dharafs_snapshot_read_raw). Uses TWO
+// independent scratch buffers (path and name are both live at once
+// here, unlike every other Str wrapper in this file) -- dharafs_path_
+// scratch for path, dharafs_dir_scratch for name (borrowed: same
+// "stable across one whole call, no other concurrent user" reasoning
+// scratch_state.S's own header comment already established for it,
+// and this function never calls anything that itself uses dharafs_
+// dir_scratch).
+fn dharafs_snapshot_read(path: Str, name: Str, out_buf: mut ref i64) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  let name_len: i64 = str_len_bytes(name);
+  if (path_len <= 0) || (path_len > 32) {
+    return 0 - 1;
+  }
+  if (name_len <= 0) || (name_len > 32) {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  let name_buf: mut ref i64 = dharafs_dir_scratch_get();
+  let j: i64 = 0;
+  while j < name_len {
+    let _ = buf_write_byte(name_buf, j as u32, str_byte_at(name, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_snapshot_read_raw(path_buf, path_len, name_buf, name_len, out_buf);
 }
 
 // Task #5: garbage collection / log compaction, run periodically from
@@ -2695,6 +3149,19 @@ fn dharafs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) 
   if blk < 0 {
     return 0 - 1;
   }
+  return dharafs_read_from_block_raw(blk, out_buf);
+}
+
+// Extracted from dharafs_read_raw (round 66 follow-up, snapshots):
+// everything after "which block is this?" is resolved -- reads and
+// chain-follows the FULL logical record starting at a caller-supplied
+// block number, instead of always deriving it from dharafs_find_
+// latest_block_raw. dharafs_read_raw itself is now a thin wrapper
+// (unchanged behavior, verified against the full existing read/chain
+// test suite); dharafs_snapshot_read_raw is the other caller, handing
+// it a HISTORICAL block found via dharafs_find_block_as_of_raw
+// instead of the current latest.
+fn dharafs_read_from_block_raw(blk: i64, out_buf: mut ref i64) -> i64 {
   let tmp: mut ref i64 = dharafs_sd_scratch_get();
   let rd_status: i64 = dharafs_block_read(blk, tmp);
   if rd_status != 0 {
@@ -2860,6 +3327,250 @@ fn dharafs_delete_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
     return 1;
   }
   let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+  let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, next_block as i64);
+  return 0;
+}
+
+fn fsqueue_max_slots() -> i64 { return 8; }
+fn fsqueue_max_data_bytes() -> i64 { return 448; } // must match dharafs_block_payload_cap()
+fn fsqueue_max_path_bytes() -> i64 { return 32; }
+
+fn dharafs_queue_reset() -> i64 {
+  let i: i64 = 0;
+  while i < fsqueue_max_slots() {
+    let _ = fsqueue_valid_set_at(i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let _ = fsqueue_next_seq_set(0 as u32);
+  return 0;
+}
+
+fn dharafs_queue_find_free_slot() -> i64 {
+  let i: i64 = 0;
+  while i < fsqueue_max_slots() {
+    if fsqueue_valid_get_at(i as u32) == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+// Enqueues a write/append request tagged with `priority` (this
+// project's own "0 is highest" scheduler convention -- callers
+// normally pass current_eff_prio()) instead of running it inline.
+// Returns the slot index on success, -1 if the path/data is oversized
+// or the queue (8 slots) is full. A full queue is never silently
+// dropped for the caller -- -1 tells them to fall back to calling
+// dharafs_append_raw directly, exactly what every existing call site
+// still does.
+fn dharafs_queue_submit_write_raw(priority: u32, task_id: u32, path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
+  if (path_len <= 0) || (path_len > fsqueue_max_path_bytes()) {
+    return 0 - 1;
+  }
+  if (data_len < 0) || (data_len > fsqueue_max_data_bytes()) {
+    return 0 - 1;
+  }
+  let slot: i64 = dharafs_queue_find_free_slot();
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let seq: u32 = fsqueue_next_seq_get() as u32;
+  let _ = fsqueue_next_seq_set(seq + (1 as u32));
+  let _ = fsqueue_priority_set_at(slot as u32, priority);
+  let _ = fsqueue_task_id_set_at(slot as u32, task_id);
+  let _ = fsqueue_op_type_set_at(slot as u32, 1 as u32); // 1 = write/append
+  let _ = fsqueue_path_len_set_at(slot as u32, path_len as u32);
+  let _ = fsqueue_data_len_set_at(slot as u32, data_len as u32);
+  let _ = fsqueue_owner_uid_set_at(slot as u32, owner_uid);
+  let _ = fsqueue_owner_gid_set_at(slot as u32, owner_gid);
+  let _ = fsqueue_mode_set_at(slot as u32, mode);
+  let _ = fsqueue_seq_set_at(slot as u32, seq);
+  let _ = fsqueue_result_set_at(slot as u32, 2 as u32); // 2 = pending (not yet dispatched)
+  let k: i64 = 0;
+  while k < path_len {
+    let b: u32 = buf_read_byte(path_buf, k as u32);
+    let _ = fsqueue_set_path_byte((slot * fsqueue_max_path_bytes() + k) as u32, b);
+    k = k + 1;
+  }
+  let j: i64 = 0;
+  while j < data_len {
+    let b2: u32 = buf_read_byte(data_buf, j as u32);
+    let _ = fsqueue_set_data_byte((slot * fsqueue_max_data_bytes() + j) as u32, b2);
+    j = j + 1;
+  }
+  let _ = fsqueue_valid_set_at(slot as u32, 1 as u32);
+  return slot;
+}
+
+// Same as dharafs_queue_submit_write_raw, but for a delete (tombstone)
+// request -- mirrors dharafs_delete_raw's own argument shape.
+fn dharafs_queue_submit_delete_raw(priority: u32, task_id: u32, path_buf: mut ref i64, path_len: i64) -> i64 {
+  if (path_len <= 0) || (path_len > fsqueue_max_path_bytes()) {
+    return 0 - 1;
+  }
+  let slot: i64 = dharafs_queue_find_free_slot();
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let seq: u32 = fsqueue_next_seq_get() as u32;
+  let _ = fsqueue_next_seq_set(seq + (1 as u32));
+  let _ = fsqueue_priority_set_at(slot as u32, priority);
+  let _ = fsqueue_task_id_set_at(slot as u32, task_id);
+  let _ = fsqueue_op_type_set_at(slot as u32, 2 as u32); // 2 = delete
+  let _ = fsqueue_path_len_set_at(slot as u32, path_len as u32);
+  let _ = fsqueue_data_len_set_at(slot as u32, 0 as u32);
+  let _ = fsqueue_seq_set_at(slot as u32, seq);
+  let _ = fsqueue_result_set_at(slot as u32, 2 as u32);
+  let k: i64 = 0;
+  while k < path_len {
+    let b: u32 = buf_read_byte(path_buf, k as u32);
+    let _ = fsqueue_set_path_byte((slot * fsqueue_max_path_bytes() + k) as u32, b);
+    k = k + 1;
+  }
+  let _ = fsqueue_valid_set_at(slot as u32, 1 as u32);
+  return slot;
+}
+
+// Str convenience wrapper, same relationship to dharafs_queue_submit_
+// write_raw as dharafs_append has to dharafs_append_raw. Tags the
+// request with the CALLING task's own current_eff_prio()/
+// current_task_get() automatically -- the whole point of this queue
+// is "let the caller's real scheduling priority decide FS ordering,"
+// so the common case shouldn't require the caller to look those up
+// itself.
+fn dharafs_queue_submit(path: Str, data: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  let data_len: i64 = str_len_bytes(data);
+  if (path_len <= 0) || (path_len > 32) {
+    return 0 - 1;
+  }
+  if data_len > fsqueue_max_data_bytes() {
+    return 0 - 1;
+  }
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat(path, meta_buf);
+  let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { dharafs_user_get_uid() };
+  let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { dharafs_user_get_gid() };
+  let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { dharafs_default_mode() };
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let j: i64 = 0;
+  while j < data_len {
+    let _ = buf_write_byte(data_buf, j as u32, str_byte_at(data, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_queue_submit_write_raw(current_eff_prio(), current_task_get(), path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+// Scans every valid slot, returns the index of the one with the
+// numerically LOWEST priority (highest real priority, this project's
+// own scheduler convention), oldest submission (seq) breaking ties --
+// FIFO fairness among equal-priority requests rather than an
+// arbitrary/undefined tie order. -1 if the queue is empty.
+fn dharafs_queue_pick_next() -> i64 {
+  let best: i64 = 0 - 1;
+  let best_priority: u32 = 0 as u32;
+  let best_seq: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < fsqueue_max_slots() {
+    if fsqueue_valid_get_at(i as u32) == 1 {
+      let p: u32 = fsqueue_priority_get_at(i as u32) as u32;
+      let s: u32 = fsqueue_seq_get_at(i as u32) as u32;
+      let is_better: i64 = if best < 0 { 1 } else { if (p < best_priority) || ((p == best_priority) && (s < best_seq)) { 1 } else { 0 } };
+      if is_better == 1 {
+        best = i;
+        best_priority = p;
+        best_seq = s;
+      }
+    }
+    i = i + 1;
+  }
+  return best;
+}
+
+// Processes exactly the ONE highest-priority pending request (via
+// dharafs_queue_pick_next), through the exact same dharafs_append_raw/
+// dharafs_delete_raw every synchronous caller already uses -- same
+// crash-consistency guarantees, same dharafs_dirindex integration,
+// nothing queue-specific about the actual FS operation itself. Meant
+// to be called repeatedly by a dedicated background task (task_fsq)
+// until it returns -1 (queue drained). Returns the FS op's own result
+// (0 = success, 1 = failure) or -1 if the queue was already empty.
+fn dharafs_queue_dispatch_one() -> i64 {
+  let slot: i64 = dharafs_queue_pick_next();
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let op: u32 = fsqueue_op_type_get_at(slot as u32) as u32;
+  let path_len: i64 = fsqueue_path_len_get_at(slot as u32);
+  let path_buf: mut ref i64 = fsqueue_path_scratch_get();
+  let k: i64 = 0;
+  while k < path_len {
+    let b: u32 = fsqueue_get_path_byte((slot * fsqueue_max_path_bytes() + k) as u32) as u32;
+    let _ = buf_write_byte(path_buf, k as u32, b);
+    k = k + 1;
+  }
+  let result: i64 = 0 - 1;
+  if op == (2 as u32) {
+    result = dharafs_delete_raw(path_buf, path_len);
+  } else {
+    let data_len: i64 = fsqueue_data_len_get_at(slot as u32);
+    let data_buf: mut ref i64 = fsqueue_data_scratch_get();
+    let j: i64 = 0;
+    while j < data_len {
+      let b2: u32 = fsqueue_get_data_byte((slot * fsqueue_max_data_bytes() + j) as u32) as u32;
+      let _ = buf_write_byte(data_buf, j as u32, b2);
+      j = j + 1;
+    }
+    let owner_uid: u32 = fsqueue_owner_uid_get_at(slot as u32) as u32;
+    let owner_gid: u32 = fsqueue_owner_gid_get_at(slot as u32) as u32;
+    let mode: u32 = fsqueue_mode_get_at(slot as u32) as u32;
+    result = dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+  }
+  let _ = fsqueue_result_set_at(slot as u32, result as u32);
+  let _ = fsqueue_valid_set_at(slot as u32, 0 as u32);
+  return result;
+}
+
+fn dharafs_queue_pending_count() -> i64 {
+  let count: i64 = 0;
+  let i: i64 = 0;
+  while i < fsqueue_max_slots() {
+    if fsqueue_valid_get_at(i as u32) == 1 {
+      count = count + 1;
+    }
+    i = i + 1;
+  }
+  return count;
+}
+
+// Round 66 follow-up: dedicated background task draining the priority
+// queue above -- every existing dharafs_* call site is untouched, this
+// only serves callers that opt in via dharafs_queue_submit(_raw). Low
+// priority (task_gc's own priority tier), same "sleep, then do a
+// bounded burst of work" shape as task_e's compaction loop, drains
+// the ENTIRE queue each wake (not just one entry) so a burst of
+// submissions during one sleep interval doesn't pile up indefinitely.
+fn task_fsq() -> i64 {
+  while true {
+    let _ = task_sleep_ticks(5);
+    let drained: i64 = 0;
+    let keep_going: i64 = 1;
+    while (keep_going == 1) && (drained < fsqueue_max_slots()) {
+      let r: i64 = dharafs_queue_dispatch_one();
+      if r < 0 {
+        keep_going = 0;
+      } else {
+        drained = drained + 1;
+      }
+    }
+  }
   return 0;
 }
 
@@ -18088,6 +18799,19 @@ fn kernel_main() -> i64 {
   let _ = uart_put_i64(mutex_low_task_id as i64);
   let _ = uart_puts(",");
   let _ = uart_put_i64(mutex_high_task_id as i64);
+  let _ = uart_puts("\n");
+
+  // Priority-aware FS request queue's own dedicated drain task -- low
+  // priority (same tier as task_gc's compaction, tier 2), same
+  // dynamically-created-via-task_create pattern as the demo tasks
+  // just above. Entirely opt-in: nothing here changes any EXISTING
+  // synchronous dharafs_* call site.
+  let _ = dharafs_queue_reset();
+  let fsq_stack_bytes: u32 = 4096 as u32;
+  let fsq_stack: mut ref i64 = dhruva_alloc_bytes(fsq_stack_bytes as i64);
+  let fsq_task_id: u32 = task_create(task_fsq, fsq_stack, fsq_stack_bytes, 2 as u32);
+  let _ = uart_puts("task_create: fsqueue dispatcher task id=");
+  let _ = uart_put_i64(fsq_task_id as i64);
   let _ = uart_puts("\n");
 
   let _ = uart_puts("PASS\n");

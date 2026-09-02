@@ -1869,44 +1869,91 @@ building blocks for a diagnostics command, not a green field.
   12 designed scenarios correct) and via 36 new host-harness tests
   (173/173 PASS clean under ASAN/UBSAN).
 
-- **Priority/deadline-aware FS request queue** — `[M, ~2 rounds —
-  shared dependency with the scheduler-side observability work below]`
-  Every `dharafs_*` call today runs synchronously inline in whatever
-  task called it — there's no separate FS request queue for a
-  higher-priority task's I/O to preempt/precede a lower-priority one's.
-  Real version needs a queue + the calling task's own priority
-  (already tracked by the scheduler) as sort key. Lower priority than
-  the items above — no current workload in this project actually
-  contends on FS access across priority levels yet, so this is
-  speculative until one does (per this project's own "don't design for
-  hypothetical requirements" discipline).
+- **Priority/deadline-aware FS request queue** — `[DONE, round 67,
+  2026-09-02]`
+  `boot/fsqueue_state.S` (8 fixed slots) + `dharafs_queue_submit_write_raw`/
+  `_submit_delete_raw`/`_submit` (Str convenience wrapper, auto-tags
+  the calling task's own `current_eff_prio()`/`current_task_get()`) +
+  `dharafs_queue_dispatch_one` (always picks the numerically LOWEST
+  priority value -- this project's own "0 is highest" convention --
+  oldest submission first among ties) + a dedicated background task
+  (`task_fsq`, priority tier 2, same tier as `task_gc`'s compaction,
+  drains the whole queue every wake). Every EXISTING synchronous
+  `dharafs_*` call site is completely unchanged -- purely additive/
+  opt-in, exactly the scoping this entry originally called for.
+  Queued writes are capped at `dharafs_block_payload_cap()` (448
+  bytes, single-block only); a full queue or oversized write is
+  rejected cleanly (caller falls back to a direct synchronous call).
+  34 new host-harness checks (659→693 PASS, clean under ASAN/UBSAN),
+  including explicit priority-inversion-shaped ordering tests (a
+  low-priority submit made FIRST is dispatched AFTER a high-priority
+  one submitted later) and FIFO tie-break verification. Live-verified:
+  `task_create: fsqueue dispatcher task id=9` prints at boot,
+  `heap_stress.py` clean with the new background task running
+  continuously, `phase4_milestone.py` 14/14.
 
-- **Snapshots / versioned rollback** — `[L, several rounds, not
-  started]`
-  DharaFS is already log-structured with a full append history until
-  `dharafs_compact` reclaims it — a "snapshot" is conceptually "pin
-  sequence range N..M so compaction can't reclaim it, plus a query API
-  to read a specific historical sequence." Real complexity is in
-  `dharafs_compact`'s reclaim logic needing to respect pins it doesn't
-  know about today. Defer until a concrete use case needs it (the
-  brainstorm doc's own example — config rollback after a failed
-  update — is exactly what the transaction primitive above already
-  handles for the *single* "did the last write fully commit" case;
-  snapshots only add value for "roll back further than the last
-  write," a materially bigger ask).
+- **Snapshots / versioned rollback** — `[DONE, round 67, 2026-09-02]`
+  Turned out NOT to need `dharafs_compact` reclaim-logic changes at
+  all, once actually re-examined against the real code: `dharafs_
+  compact`'s "reclaim" is an IN-RAM-ONLY optimization (advancing
+  `log_start`, which unconditionally resets to 1 on the next
+  `dharafs_init`/boot) that hides old blocks from ordinary lookups
+  without ever erasing their bytes -- `next_block` only ever grows,
+  nothing in this v1's design reuses or overwrites a block number
+  within one boot session. So a "snapshot" doesn't need to pin/protect
+  anything from reclaim; it only needs to remember a sequence number
+  to query against later. `boot/snapshot_state.S` (8 named slots) +
+  `dharafs_snapshot_create(name)` (pins `next_seq - 1`, the highest
+  seq that genuinely existed at that moment) + `dharafs_snapshot_read(
+  path, name, buf)` (finds the highest-seq record for `path` with
+  `seq <= pinned_seq`, scanning from block 1 -- not `log_start` --
+  the one deliberate place in this codebase that looks past what
+  `log_start` currently hides) + `dharafs_snapshot_delete(name)`.
+  `dharafs_read_raw` was refactored (behavior-preserving, re-verified
+  against the full existing test suite before adding anything new) to
+  extract `dharafs_read_from_block_raw`, shared by both the ordinary
+  current-state read path and the new snapshot read path, avoiding a
+  second copy of the chain-following logic. 35 new host-harness
+  checks (693→728 PASS, clean under ASAN/UBSAN) including the load-
+  bearing one: create a snapshot, overwrite the file, run a REAL
+  `dharafs_compact()` pass that reclaims the old block from ordinary
+  lookups, and confirm the snapshot still reads the pre-overwrite
+  content byte-exact -- proving the no-compact-changes-needed design
+  claim against actual compaction, not just against an un-compacted
+  log. Scope, explicit: filesystem-wide snapshots (one pin covers
+  every path), not per-file/per-directory; no snapshot-aware
+  `dharafs_list`; bounded by the same 2048-block/1MB v1 log region
+  cap every other DharaFS feature already has.
 
-- **Hashed directory index, wear/erase statistics, capability tokens
-  beyond uid/gid/mode** — not started, explicitly deferred. Directory
-  lookup is already bounded by `dharafs_init`'s own 2048-block scan
-  ceiling and this project's realistic embedded file counts (tens to
-  low hundreds, not millions) — a hash index is solving a scaling
-  problem this project doesn't have yet. Wear/erase stats need a real
-  flash-aware backend (EMMC2/NAND) to mean anything; both current
-  backends (SDHOST, USB mass storage) don't expose that information at
-  this layer. Capability tokens are a genuine security-model expansion
-  beyond uid/gid/mode, sized similarly to (and worth designing
-  alongside, if ever started) the security roadmap's PKI item above —
-  not scoped further here.
+- **Hashed directory index** — `[DONE, round 67, 2026-09-02]`
+  `boot/dirindex_state.S`: a 256-slot open-addressed (linear probing,
+  no deletion) RAM-only path-hash -> latest-block table, FNV-1a hash,
+  built by `dharafs_init`'s own boot-time scan and kept in sync by
+  `dharafs_append_raw`/`dharafs_delete_raw` on every successful write
+  (every path-mutating operation in this codebase funnels through one
+  of those two). `dharafs_find_latest_block_raw` tries the index
+  first (O(1) probe) and only falls through to the original full
+  linear scan on a miss, which then self-heals the index for next
+  time -- a HIT is always correct by construction, a MISS is always
+  safe (identical behavior to before this change, never a regression,
+  including graceful degradation if the table's realistic-scale 256
+  slots ever genuinely fill). 23 new host-harness checks (636→659
+  PASS clean under ASAN/UBSAN), including a 300-path bulk-load test
+  whose real correctness contract is "every hit is byte-exact,
+  regardless of collisions" rather than "every path fits." Live-
+  verified over a real SD image via `phase4_milestone.py` (write/
+  read/list all still correct through the accelerated path).
+  Wear/erase statistics and capability tokens beyond uid/gid/mode
+  remain explicitly OUT of scope, same reasoning as before: no
+  current backend (SDHOST, USB mass storage) exposes wear/erase
+  information at this layer at all, and capability tokens are a
+  separate, PKI-sized security-model expansion, not a hash-index
+  side effect.
+
+- **General task-creation API** — see the entry near the bottom of
+  this file ("User-facing documentation + general-purpose RTOS gaps")
+  -- confirmed DONE since round 54, this entry's own "not started"
+  framing above (now corrected there) was simply stale.
 
 ### DhruvaOS observability ("Darshana")
 
@@ -2229,21 +2276,20 @@ support of any kind.
   "old-or-new, never mixed" scope), the block-device backend
   abstraction, full `dharafs_*` API reference.
 
-- **General task-creation API** — `[M, ~2-3 rounds]`
-  Generalizes the current fixed 6-slot model
-  (`task_create(entry_fn, priority, stack_bytes) -> task_id`,
-  replacing the hardcoded `sp_table`/`eff_prio_table`/
-  `sleep_until_table` 6-word arrays in `boot/context_switch.S` with a
-  real, bounded-but-extensible table, plus generalizing
-  `start_multitasking`'s fixed 6-argument signature). Real design
-  question to settle first: a fixed MAX_TASKS compile-time bound (
-  simplest, matches this project's own static-allocation-everywhere
-  discipline) vs. anything more dynamic (not warranted — this project
-  has no heap-fragmentation tolerance for it and no forcing need).
-  Every existing self-test exercising the scheduler (priority
-  ceiling, preemption, `task_sleep_ticks`) needs to keep passing
-  unchanged against the generalized table — this is core scheduler
-  surgery, treat with the same care as round 53's own register bug.
+- **General task-creation API** — `[DONE, round 54 -- this entry's own
+  "not started" framing was stale, caught 2026-09-02 while auditing
+  Tier 1 for remaining work]`
+  `task_create(entry_fn, stack_base, stack_bytes, priority) -> task_id`
+  (`boot/context_switch.S`) replaced the old hardcoded 6-word `sp_table`/
+  `eff_prio_table`/`sleep_until_table` arrays with a real
+  `MAX_TASKS=16` bounded table (fixed compile-time bound, as this
+  entry's own reasoning below recommended — no dynamic allocation, no
+  heap-fragmentation exposure). Round 54/55 also built `task_create`-
+  based demo tasks (`task_custom_*`) proving it works end to end, not
+  just compiling. `start_multitasking` no longer takes a fixed
+  argument list either. Every existing scheduler self-test (priority
+  ceiling, preemption, `task_sleep_ticks`) still passes against the
+  generalized table.
 
 - **Real priority-inversion primitive (blocking mutex + inheritance)**
   — `[DONE, round 55, 2026-08-29]`
