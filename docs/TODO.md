@@ -611,48 +611,53 @@ for by name.
   property. Flagged for a future hardening pass, not silently
   accepted.
 
-- **AES** — `[L, genuinely harder than it sounds — SKIPPED FOR NOW,
-  2026-08-31, revisit if WPA2/WiFi or FIPS-grade TLS actually starts]`
-  Explicitly deferred, not abandoned: this item's own two reasons to
-  want AES (below) are both about OTHER, currently-inactive roadmap
-  items (WPA2's mandatory CCMP mode, and FIPS-constrained TLS
-  deployments) — neither is being worked on right now, so there is no
-  live consumer for AES at the moment. The one feature that WAS just
-  built and could plausibly have used it (media/at-rest encryption,
-  round 62) deliberately did NOT need it: ChaCha20 already covers that
-  use case per this project's own original design note (at-rest
-  encryption isn't a standardized protocol demanding AES/CCMP the way
-  WPA2 is). Building a safe, constant-time AES implementation is real,
-  non-trivial work (see the cache-timing discussion below) that would
-  sit unused until WPA2 or a compliance-constrained TLS client actually
-  gets picked up — better to defer it until one of those is real,
-  rather than build a primitive speculatively ahead of any actual
-  caller. Two real, independent reasons to want it despite round 44's own
-  deliberate ChaCha20-over-AES choice, both already implied elsewhere
-  in this roadmap but not spelled out until now: (1) WPA2's CCMP mode
-  (the WiFi item above) is AES-based by the standard itself, not a
-  free choice — no WPA2 client is possible without a real AES
-  implementation, full stop; (2) some TLS deployments and compliance
-  regimes (FIPS 140-2/3 in particular) mandate AES-GCM cipher suites
-  specifically, so a TLS client meant to interoperate broadly (the TLS
-  item below) can't rely on ChaCha20-Poly1305 alone even though TLS
-  1.3 itself permits it. **The real difficulty is NOT the algorithm
-  itself** (AES's substitution-permutation network is well-documented
-  and no harder to port than ChaCha20 was) **— it's doing it safely on
-  ARMv6.** This core has no AES-NI hardware acceleration, and a naive
-  table-based software AES (the obvious first implementation) leaks
-  its key through cache-timing side-channels — a well-documented,
-  practical attack class, not a theoretical one (this is exactly
-  round 44's own original reason for choosing ChaCha20 instead). A
-  safe implementation needs either a bitsliced/constant-time
-  formulation or a T-table approach with real cache-timing mitigations
-  (constant-time table lookups, or precomputed/cache-resident tables
-  with careful access patterns) — genuinely harder to get right than
-  the cipher's own math, and getting it wrong produces something worse
-  than not having AES at all (a false sense of security). Needs a real
-  spike specifically probing vani's own suitability for constant-time
-  bit manipulation at this level (same discipline round 41's SHA-256
-  entry used) before committing to a full build.
+- **AES** — `[DONE, round 67, 2026-09-02 -- spiked exactly as this
+  entry's own closing note called for, then built for real once the
+  spike answered the suitability question]`
+  The spike question this entry itself posed -- is vani's own bitwise
+  arithmetic suitable for genuinely constant-time AES -- is answered
+  YES, with real code to show for it, not just a feasibility note.
+  **No lookup tables anywhere** (the real difficulty this entry always
+  correctly identified: not the algorithm, doing it safely on ARMv6
+  with no AES-NI and real cache-timing risk from a naive table-based
+  S-box): the S-box is computed on the fly via constant-time GF(2^8)
+  field inversion (x^254 = x^-1 in the 255-element multiplicative
+  group, via the exact same fixed-exponent square-and-multiply
+  technique `field25519_invert`/`ed25519_sqrt_candidate` already use,
+  just over GF(2^8) instead of GF(2^255-19)) plus the standard fixed
+  affine transform. GF(2^8) multiplication itself is branchless (a
+  mask-based conditional reduction, same technique X25519's own cswap
+  and Poly1305's own g/h select already established) rather than the
+  classic "if high bit set, XOR the reduction polynomial" formulation,
+  which branches on secret-shaped data.
+
+  **Verification**: a from-scratch Python port of this exact
+  construction, checked three ways before any vani code was written --
+  the official FIPS-197 Appendix B test vector, byte-exact; 20 random
+  trials against the real `cryptography` library's own AES-128-ECB
+  encryptor, byte-exact on all of them; and a full 256-entry S-box
+  cross-check against a SEPARATE, independent brute-force GF(2^8)
+  inversion (a genuinely different multiplication implementation),
+  confirming the constant-time construction isn't subtly wrong in a
+  way the FIPS vector alone wouldn't happen to catch. 8 new
+  host-harness checks (826→834 PASS clean under ASAN/UBSAN): the same
+  full 256-entry S-box cross-check re-run under ASAN/UBSAN, the FIPS
+  vector, 5 more random-trial vectors against the real library, and an
+  avalanche-effect sanity check (one flipped plaintext bit changes a
+  large number of output bits -- rules out a degenerate
+  implementation where e.g. only the first round actually did
+  anything). Live-verified against the FIPS-197 vector on real
+  ARM/QEMU at boot, correct on the first real build.
+
+  **Scope, explicit, matching this entry's own "spike first" framing
+  and its own honest "no live consumer yet" note**: AES-128 ENCRYPT
+  only. No decrypt (needs the inverse S-box and inverse MixColumns,
+  real additional work with no caller needing it yet), no AES-192/256,
+  no mode of operation or AEAD construction (CTR/GCM) on top -- this
+  proves the constant-time approach works and leaves a real, usable,
+  verified primitive behind, without speculatively building the full
+  surface area WPA2/FIPS-TLS would eventually need before either is
+  actually being worked on.
 
 - **TLS** — `[XL, several rounds — SKIPPED FOR NOW, 2026-08-31, same
   reason as AES: genuinely blocked on multiple prerequisites below,

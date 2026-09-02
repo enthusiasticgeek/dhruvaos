@@ -19734,6 +19734,348 @@ fn pki_verify_file(path: Str) -> i64 {
 }
 
 
+// Round 67: AES-128, spiked and built per docs/TODO.md's own explicit
+// warning -- "the real difficulty is NOT the algorithm itself... it's
+// doing it safely on ARMv6" (no AES-NI, and a naive table-based S-box
+// leaks the key through cache-timing side channels, a well-documented
+// practical attack class). This implementation deliberately has NO
+// lookup tables anywhere: the S-box is computed on the fly via
+// constant-time GF(2^8) field inversion (Fermat: x^254 = x^-1 in the
+// 255-element multiplicative group, via fixed-exponent square-and-
+// multiply -- the same pattern field25519_invert/ed25519_sqrt_
+// candidate already use, just over GF(2^8) instead of GF(2^255-19))
+// plus the standard fixed affine transform. GF(2^8) multiplication
+// itself is branchless (a mask-based conditional reduction, same
+// technique X25519's own cswap and Poly1305's own g/h select already
+// established) rather than the classic "if high bit set, XOR the
+// reduction polynomial" formulation, which branches on secret-shaped
+// data.
+//
+// Scope, explicit: AES-128 ENCRYPT only (no decrypt, no key sizes
+// beyond 128-bit, no mode of operation/AEAD on top) -- matches this
+// entry's own "spike first" framing and the roadmap's own note that
+// there is still no live consumer (WPA2/FIPS-TLS aren't being built
+// right now). This proves the real question the spike existed to
+// answer -- yes, vani's own bitwise u32 operations are suitable for
+// genuinely constant-time AES -- and leaves a real, usable, verified
+// primitive behind rather than a throwaway experiment.
+//
+// Verification: a from-scratch Python port of this EXACT algorithm
+// (same GF(2^8) construction, same S-box-via-inversion approach)
+// checked two ways before any vani code was written: the official
+// FIPS-197 Appendix B test vector, byte-exact; and 20 random trials
+// against the real `cryptography` library's own AES-128-ECB
+// encryptor, byte-exact on all of them. A SEPARATE, independent
+// brute-force GF(2^8) inversion (a different multiplication
+// implementation entirely) cross-checked the full 256-entry S-box
+// against the constant-time construction, confirming the "clever"
+// version isn't subtly wrong in a way the FIPS vector alone wouldn't
+// catch.
+
+// out = a*b in GF(2^8) (AES's own field, reduction polynomial
+// x^8+x^4+x^3+x+1, 0x11B). Branchless: no conditional whose direction
+// depends on either operand's actual value.
+fn gf256_mul(a: u32, b: u32) -> u32 {
+  let result: u32 = 0 as u32;
+  let av: u32 = a;
+  let i: i64 = 0;
+  while i < 8 {
+    let bit: u32 = (b >> (i as u32)) & (1 as u32);
+    let mask: u32 = wrapping_sub(0 as u32, bit) & (255 as u32);
+    result = result ^ (av & mask);
+    let hibit: u32 = (av >> (7 as u32)) & (1 as u32);
+    let hmask: u32 = wrapping_sub(0 as u32, hibit) & (255 as u32);
+    av = ((av << (1 as u32)) ^ ((27 as u32) & hmask)) & (255 as u32);
+    i = i + 1;
+  }
+  return result;
+}
+
+// x^254 mod (GF(2^8) field) == x^-1 for x != 0 (0 maps to 0, matching
+// the standard AES convention -- the affine step below is what turns
+// this into the real S-box, including its own fixed point at 0).
+fn gf256_inv(x: u32) -> u32 {
+  let result: u32 = 1 as u32;
+  let base: u32 = x;
+  // 254 = 0b11111110 -- a fixed, known-at-compile-time constant, so
+  // its bits are read directly via shift/mask rather than staged
+  // through a scratch buffer (which this function, called for every
+  // single S-box evaluation throughout key expansion and every round,
+  // would otherwise need to allocate freshly on every call -- exactly
+  // the per-call dhruva_alloc_bytes bug class this project's own
+  // scratch_state.S header comment documents fixing elsewhere).
+  let exponent: u32 = 254 as u32;
+  let i: i64 = 0;
+  while i < 8 {
+    if ((exponent >> (i as u32)) & (1 as u32)) == (1 as u32) {
+      result = gf256_mul(result, base);
+    }
+    base = gf256_mul(base, base);
+    i = i + 1;
+  }
+  return result;
+}
+
+fn aes_rotl8(x: u32, n: u32) -> u32 {
+  return ((x << n) | (x >> ((8 as u32) - n))) & (255 as u32);
+}
+
+fn aes_sbox(x: u32) -> u32 {
+  let inv: u32 = gf256_inv(x);
+  let s: u32 = inv;
+  s = s ^ aes_rotl8(inv, 1 as u32);
+  s = s ^ aes_rotl8(inv, 2 as u32);
+  s = s ^ aes_rotl8(inv, 3 as u32);
+  s = s ^ aes_rotl8(inv, 4 as u32);
+  s = s ^ (0x63 as u32);
+  return s & (255 as u32);
+}
+
+// Expands a 16-byte AES-128 key into 176 bytes (44 4-byte words) of
+// round keys, written to `w_out`.
+fn aes128_key_expansion(key: mut ref i64, w_out: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 16 {
+    let _ = buf_write_byte(w_out, i as u32, buf_read_byte(key, i as u32));
+    i = i + 1;
+  }
+  let rcon: u32 = 1 as u32;
+  let wi: i64 = 4;
+  while wi < 44 {
+    let t0: u32 = buf_read_byte(w_out, ((wi - 1) * 4 + 0) as u32);
+    let t1: u32 = buf_read_byte(w_out, ((wi - 1) * 4 + 1) as u32);
+    let t2: u32 = buf_read_byte(w_out, ((wi - 1) * 4 + 2) as u32);
+    let t3: u32 = buf_read_byte(w_out, ((wi - 1) * 4 + 3) as u32);
+    if (wi % 4) == 0 {
+      // RotWord + SubWord + Rcon
+      let r0: u32 = aes_sbox(t1);
+      let r1: u32 = aes_sbox(t2);
+      let r2: u32 = aes_sbox(t3);
+      let r3: u32 = aes_sbox(t0);
+      t0 = r0 ^ rcon;
+      t1 = r1;
+      t2 = r2;
+      t3 = r3;
+      rcon = gf256_mul(rcon, 2 as u32);
+    }
+    let p0: u32 = buf_read_byte(w_out, ((wi - 4) * 4 + 0) as u32);
+    let p1: u32 = buf_read_byte(w_out, ((wi - 4) * 4 + 1) as u32);
+    let p2: u32 = buf_read_byte(w_out, ((wi - 4) * 4 + 2) as u32);
+    let p3: u32 = buf_read_byte(w_out, ((wi - 4) * 4 + 3) as u32);
+    let _ = buf_write_byte(w_out, (wi * 4 + 0) as u32, p0 ^ t0);
+    let _ = buf_write_byte(w_out, (wi * 4 + 1) as u32, p1 ^ t1);
+    let _ = buf_write_byte(w_out, (wi * 4 + 2) as u32, p2 ^ t2);
+    let _ = buf_write_byte(w_out, (wi * 4 + 3) as u32, p3 ^ t3);
+    wi = wi + 1;
+  }
+  return 0;
+}
+
+// state[r + 4*c] ^= w[(round*4+c)*4 + r] for r,c in 0..4 -- AddRoundKey.
+fn aes_add_round_key(state: mut ref i64, w: mut ref i64, round: i64) -> i64 {
+  let c: i64 = 0;
+  while c < 4 {
+    let r: i64 = 0;
+    while r < 4 {
+      let sv: u32 = buf_read_byte(state, (r + 4 * c) as u32);
+      let wv: u32 = buf_read_byte(w, ((round * 4 + c) * 4 + r) as u32);
+      let _ = buf_write_byte(state, (r + 4 * c) as u32, sv ^ wv);
+      r = r + 1;
+    }
+    c = c + 1;
+  }
+  return 0;
+}
+
+fn aes_sub_bytes(state: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 16 {
+    let v: u32 = buf_read_byte(state, i as u32);
+    let _ = buf_write_byte(state, i as u32, aes_sbox(v));
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Row r (0..4) shifted left by r positions, within each row's own 4
+// column-major-strided bytes. Uses a small 4-byte temp per row (not
+// the whole 16-byte state) since each row is independent.
+fn aes_shift_rows(state: mut ref i64, temp: mut ref i64) -> i64 {
+  let r: i64 = 1;
+  while r < 4 {
+    let c: i64 = 0;
+    while c < 4 {
+      let src_c: i64 = (c + r) % 4;
+      let _ = buf_write_byte(temp, c as u32, buf_read_byte(state, (r + 4 * src_c) as u32));
+      c = c + 1;
+    }
+    let c2: i64 = 0;
+    while c2 < 4 {
+      let _ = buf_write_byte(state, (r + 4 * c2) as u32, buf_read_byte(temp, c2 as u32));
+      c2 = c2 + 1;
+    }
+    r = r + 1;
+  }
+  return 0;
+}
+
+fn aes_mix_columns(state: mut ref i64) -> i64 {
+  let c: i64 = 0;
+  while c < 4 {
+    let a0: u32 = buf_read_byte(state, (0 + 4 * c) as u32);
+    let a1: u32 = buf_read_byte(state, (1 + 4 * c) as u32);
+    let a2: u32 = buf_read_byte(state, (2 + 4 * c) as u32);
+    let a3: u32 = buf_read_byte(state, (3 + 4 * c) as u32);
+    let two: u32 = 2 as u32;
+    let three: u32 = 3 as u32;
+    let n0: u32 = gf256_mul(a0, two) ^ gf256_mul(a1, three) ^ a2 ^ a3;
+    let n1: u32 = a0 ^ gf256_mul(a1, two) ^ gf256_mul(a2, three) ^ a3;
+    let n2: u32 = a0 ^ a1 ^ gf256_mul(a2, two) ^ gf256_mul(a3, three);
+    let n3: u32 = gf256_mul(a0, three) ^ a1 ^ a2 ^ gf256_mul(a3, two);
+    let _ = buf_write_byte(state, (0 + 4 * c) as u32, n0);
+    let _ = buf_write_byte(state, (1 + 4 * c) as u32, n1);
+    let _ = buf_write_byte(state, (2 + 4 * c) as u32, n2);
+    let _ = buf_write_byte(state, (3 + 4 * c) as u32, n3);
+    c = c + 1;
+  }
+  return 0;
+}
+
+// One-shot AES-128 single-block ECB encrypt: expands the key fresh
+// each call (a caller encrypting many blocks under the same key
+// should expand once and reuse -- not built as a separate entry point
+// here, no real caller needs it yet; see this section's own header
+// comment on scope). `key`/`block`/`out` are 16 bytes each; `w_scratch`
+// is a caller-supplied 176-byte buffer for the expanded round keys;
+// `state_scratch`/`temp_scratch` are caller-supplied 16-byte and
+// 4-byte working buffers respectively.
+fn aes128_encrypt_block(key: mut ref i64, block: mut ref i64, out: mut ref i64,
+                         w_scratch: mut ref i64, state_scratch: mut ref i64, temp_scratch: mut ref i64) -> i64 {
+  let _ = aes128_key_expansion(key, w_scratch);
+  let i: i64 = 0;
+  while i < 16 {
+    let _ = buf_write_byte(state_scratch, i as u32, buf_read_byte(block, i as u32));
+    i = i + 1;
+  }
+  let _ = aes_add_round_key(state_scratch, w_scratch, 0);
+  let rnd: i64 = 1;
+  while rnd < 10 {
+    let _ = aes_sub_bytes(state_scratch);
+    let _ = aes_shift_rows(state_scratch, temp_scratch);
+    let _ = aes_mix_columns(state_scratch);
+    let _ = aes_add_round_key(state_scratch, w_scratch, rnd);
+    rnd = rnd + 1;
+  }
+  let _ = aes_sub_bytes(state_scratch);
+  let _ = aes_shift_rows(state_scratch, temp_scratch);
+  let _ = aes_add_round_key(state_scratch, w_scratch, 10);
+  let j: i64 = 0;
+  while j < 16 {
+    let _ = buf_write_byte(out, j as u32, buf_read_byte(state_scratch, j as u32));
+    j = j + 1;
+  }
+  return 0;
+}
+
+
+// FIPS-197 Appendix B's own worked example, plus a cross-check that a
+// different key produces a different ciphertext for the same
+// plaintext (the actual security property, not just "runs") -- same
+// verification discipline as every other primitive this round,
+// generated by the exact Python spike that verified this GF(2^8)
+// construction before any of it was ported (see this section's own
+// header comment above aes128_encrypt_block).
+fn aes128_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let w_scratch: mut ref i64 = dhruva_alloc_bytes(176);
+  let state_scratch: mut ref i64 = dhruva_alloc_bytes(16);
+  let temp_scratch: mut ref i64 = dhruva_alloc_bytes(4);
+
+  let key0: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = buf_write_byte(key0, 0 as u32, 0x00 as u32);
+  let _ = buf_write_byte(key0, 1 as u32, 0x01 as u32);
+  let _ = buf_write_byte(key0, 2 as u32, 0x02 as u32);
+  let _ = buf_write_byte(key0, 3 as u32, 0x03 as u32);
+  let _ = buf_write_byte(key0, 4 as u32, 0x04 as u32);
+  let _ = buf_write_byte(key0, 5 as u32, 0x05 as u32);
+  let _ = buf_write_byte(key0, 6 as u32, 0x06 as u32);
+  let _ = buf_write_byte(key0, 7 as u32, 0x07 as u32);
+  let _ = buf_write_byte(key0, 8 as u32, 0x08 as u32);
+  let _ = buf_write_byte(key0, 9 as u32, 0x09 as u32);
+  let _ = buf_write_byte(key0, 10 as u32, 0x0a as u32);
+  let _ = buf_write_byte(key0, 11 as u32, 0x0b as u32);
+  let _ = buf_write_byte(key0, 12 as u32, 0x0c as u32);
+  let _ = buf_write_byte(key0, 13 as u32, 0x0d as u32);
+  let _ = buf_write_byte(key0, 14 as u32, 0x0e as u32);
+  let _ = buf_write_byte(key0, 15 as u32, 0x0f as u32);
+
+  let pt0: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = buf_write_byte(pt0, 0 as u32, 0x00 as u32);
+  let _ = buf_write_byte(pt0, 1 as u32, 0x11 as u32);
+  let _ = buf_write_byte(pt0, 2 as u32, 0x22 as u32);
+  let _ = buf_write_byte(pt0, 3 as u32, 0x33 as u32);
+  let _ = buf_write_byte(pt0, 4 as u32, 0x44 as u32);
+  let _ = buf_write_byte(pt0, 5 as u32, 0x55 as u32);
+  let _ = buf_write_byte(pt0, 6 as u32, 0x66 as u32);
+  let _ = buf_write_byte(pt0, 7 as u32, 0x77 as u32);
+  let _ = buf_write_byte(pt0, 8 as u32, 0x88 as u32);
+  let _ = buf_write_byte(pt0, 9 as u32, 0x99 as u32);
+  let _ = buf_write_byte(pt0, 10 as u32, 0xaa as u32);
+  let _ = buf_write_byte(pt0, 11 as u32, 0xbb as u32);
+  let _ = buf_write_byte(pt0, 12 as u32, 0xcc as u32);
+  let _ = buf_write_byte(pt0, 13 as u32, 0xdd as u32);
+  let _ = buf_write_byte(pt0, 14 as u32, 0xee as u32);
+  let _ = buf_write_byte(pt0, 15 as u32, 0xff as u32);
+
+  let out0: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = aes128_encrypt_block(key0, pt0, out0, w_scratch, state_scratch, temp_scratch);
+
+  let expected0: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = buf_write_byte(expected0, 0 as u32, 0x69 as u32);
+  let _ = buf_write_byte(expected0, 1 as u32, 0xc4 as u32);
+  let _ = buf_write_byte(expected0, 2 as u32, 0xe0 as u32);
+  let _ = buf_write_byte(expected0, 3 as u32, 0xd8 as u32);
+  let _ = buf_write_byte(expected0, 4 as u32, 0x6a as u32);
+  let _ = buf_write_byte(expected0, 5 as u32, 0x7b as u32);
+  let _ = buf_write_byte(expected0, 6 as u32, 0x04 as u32);
+  let _ = buf_write_byte(expected0, 7 as u32, 0x30 as u32);
+  let _ = buf_write_byte(expected0, 8 as u32, 0xd8 as u32);
+  let _ = buf_write_byte(expected0, 9 as u32, 0xcd as u32);
+  let _ = buf_write_byte(expected0, 10 as u32, 0xb7 as u32);
+  let _ = buf_write_byte(expected0, 11 as u32, 0x80 as u32);
+  let _ = buf_write_byte(expected0, 12 as u32, 0x70 as u32);
+  let _ = buf_write_byte(expected0, 13 as u32, 0xb4 as u32);
+  let _ = buf_write_byte(expected0, 14 as u32, 0xc5 as u32);
+  let _ = buf_write_byte(expected0, 15 as u32, 0x5a as u32);
+
+  if chacha20_bytes_equal(out0, expected0, 16) == 0 {
+    ok = 0;
+  }
+
+  let key1: mut ref i64 = dhruva_alloc_bytes(16);
+  let ki: i64 = 0;
+  while ki < 16 {
+    let _ = buf_write_byte(key1, ki as u32, buf_read_byte(key0, ki as u32) ^ (1 as u32));
+    ki = ki + 1;
+  }
+  let out1: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = aes128_encrypt_block(key1, pt0, out1, w_scratch, state_scratch, temp_scratch);
+  if chacha20_bytes_equal(out0, out1, 16) == 1 {
+    ok = 0; // a single flipped key bit produced the SAME ciphertext -- broken
+  }
+
+  let _ = uart_puts("CRYPTO: AES-128 (constant-time, table-free S-box) vs FIPS-197 Appendix B");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+
+
 // Signed with the private key matching pki_init's own compile-time-
 // pinned public key -- generated once via the same verified Python
 // run as ed25519_self_test's own vector (see that function's header
@@ -21948,6 +22290,7 @@ fn kernel_main() -> i64 {
   let _ = sha512_self_test();
   let _ = ed25519_self_test();
   let _ = pki_self_test();
+  let _ = aes128_self_test();
 
   // Media (at-rest) encryption for DharaFS, layered on the ChaCha20
   // cipher above. Key derivation runs once here, single-threaded,
