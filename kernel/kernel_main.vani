@@ -83,6 +83,45 @@ extern "C" fn dharafs_appendonly_check_scratch_get() -> mut ref i64;
 // boot/scratch_state.S's own comment.
 extern "C" fn dharafs_rename_new_path_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_rename_new_path_scratch_get() -> mut ref i64;
+// Round 66: gatt_att_send/_recv's own outgoing/incoming ACL+L2CAP+ATT
+// PDU buffers -- see boot/scratch_state.S's own comment.
+extern "C" fn gatt_send_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn gatt_send_scratch_get() -> mut ref i64;
+extern "C" fn gatt_recv_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn gatt_recv_scratch_get() -> mut ref i64;
+// Round 66: GATT's own discovered-services/characteristics tables --
+// see boot/gatt_state.S's own header comment for the full design (why
+// every accessor is single-field, at most 2 args). Every index/value
+// parameter here is deliberately u32, not i64 -- this project's own
+// well-documented AAPCS gotcha (a `mut ref i64`/single-register value
+// before an i64 forces the i64 to an even-aligned register pair,
+// shifting where a naively-assumed "next argument" actually lands;
+// see context_switch_state.S's own task_sleep_ticks comment) means two
+// i64 PARAMETERS in a row would place the second one in r2:r3, not r1
+// as this file's own two-argument asm accessors (index in r0, value in
+// r1, nothing more) actually expect. u32 sidesteps the whole class:
+// each stays in exactly one register, matching diag_ring_push's own
+// same fix for the identical reason.
+extern "C" fn gatt_service_get_count() -> i64;
+extern "C" fn gatt_service_set_count(count: u32) -> i64;
+extern "C" fn gatt_service_get_start_handle_at(index: u32) -> i64;
+extern "C" fn gatt_service_set_start_handle_at(index: u32, value: u32) -> i64;
+extern "C" fn gatt_service_get_end_handle_at(index: u32) -> i64;
+extern "C" fn gatt_service_set_end_handle_at(index: u32, value: u32) -> i64;
+extern "C" fn gatt_service_get_uuid16_at(index: u32) -> i64;
+extern "C" fn gatt_service_set_uuid16_at(index: u32, value: u32) -> i64;
+extern "C" fn gatt_char_get_count() -> i64;
+extern "C" fn gatt_char_set_count(count: u32) -> i64;
+extern "C" fn gatt_char_get_decl_handle_at(index: u32) -> i64;
+extern "C" fn gatt_char_set_decl_handle_at(index: u32, value: u32) -> i64;
+extern "C" fn gatt_char_get_properties_at(index: u32) -> i64;
+extern "C" fn gatt_char_set_properties_at(index: u32, value: u32) -> i64;
+extern "C" fn gatt_char_get_value_handle_at(index: u32) -> i64;
+extern "C" fn gatt_char_set_value_handle_at(index: u32, value: u32) -> i64;
+extern "C" fn gatt_char_get_uuid16_at(index: u32) -> i64;
+extern "C" fn gatt_char_set_uuid16_at(index: u32, value: u32) -> i64;
+extern "C" fn gatt_char_get_service_index_at(index: u32) -> i64;
+extern "C" fn gatt_char_set_service_index_at(index: u32, value: u32) -> i64;
 // BUG FIX: ping/ifconfig/tcpecho/udpecho/tcprtx's own persistent
 // scratch -- see boot/scratch_state.S's own comment.
 extern "C" fn shell_my_mac_scratch_set(addr: mut ref i64) -> i64;
@@ -10588,6 +10627,525 @@ fn att_build_write_response(out_buf: mut ref i64) -> i64 {
   return 1;
 }
 
+// Round 66 follow-up: ATT error codes (§3.4.1.1, Table 3.4) worth
+// naming -- Attribute_Not_Found (0x0A) specifically is how every
+// discovery procedure below recognizes "no more results" (a real
+// Error Response, not a distinct "done" signal of its own kind --
+// GATT discovery is defined entirely in terms of repeating an ATT
+// request with a narrowing handle range until this exact error comes
+// back, per §4.3.1/§4.6.1/§4.6.8's own procedure text).
+fn att_error_invalid_handle() -> u32 { return 0x01 as u32; }
+fn att_error_read_not_permitted() -> u32 { return 0x02 as u32; }
+fn att_error_write_not_permitted() -> u32 { return 0x03 as u32; }
+fn att_error_invalid_pdu() -> u32 { return 0x04 as u32; }
+fn att_error_insufficient_authentication() -> u32 { return 0x05 as u32; }
+fn att_error_request_not_supported() -> u32 { return 0x06 as u32; }
+fn att_error_invalid_offset() -> u32 { return 0x07 as u32; }
+fn att_error_insufficient_authorization() -> u32 { return 0x08 as u32; }
+fn att_error_prepare_queue_full() -> u32 { return 0x09 as u32; }
+fn att_error_attribute_not_found() -> u32 { return 0x0A as u32; }
+fn att_error_attribute_not_long() -> u32 { return 0x0B as u32; }
+fn att_error_insufficient_encryption_key_size() -> u32 { return 0x0C as u32; }
+fn att_error_invalid_attribute_value_length() -> u32 { return 0x0D as u32; }
+fn att_error_unlikely_error() -> u32 { return 0x0E as u32; }
+fn att_error_insufficient_encryption() -> u32 { return 0x0F as u32; }
+fn att_error_unsupported_group_type() -> u32 { return 0x10 as u32; }
+fn att_error_insufficient_resources() -> u32 { return 0x11 as u32; }
+
+// Round 66 follow-up: GATT discovery's own PDUs (§3.4.3 Find
+// Information, §3.4.4.3 Read By Type, §3.4.4.9 Read By Group Type) --
+// the actual operations GATT's service/characteristic discovery is
+// built on top of (kernel_main.vani's own gatt_discover_* functions,
+// below). Attribute_Type/Group_Type in every request here is always a
+// 16-bit Bluetooth-SIG-assigned UUID (Primary/Secondary Service,
+// Characteristic Declaration, ...) -- every standard GATT service and
+// characteristic type is one of these; 128-bit custom UUIDs are a
+// real spec option this round deliberately doesn't implement (see
+// docs/TODO.md's own note on why), matching the "attribute type" side
+// specifically. Find Information's own response CAN report either
+// 16-bit or 128-bit UUIDs for the DISCOVERED attribute (its `Format`
+// byte) -- parsed generically below via that field rather than
+// assumed, even though this round's own callers (GATT descriptor
+// discovery) only ever need the 16-bit case.
+
+// Find Information Request (§3.4.3.1): [Opcode][Starting_Handle (2,
+// LE)][Ending_Handle (2, LE)].
+fn att_build_find_information_request(out_buf: mut ref i64, starting_handle: u32, ending_handle: u32) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_find_information_request());
+  let _ = buf_write_u16_le(out_buf, 1, starting_handle);
+  let _ = buf_write_u16_le(out_buf, 3, ending_handle);
+  return 5;
+}
+
+fn att_opcode_find_information_request() -> u32 { return 0x04 as u32; }
+fn att_opcode_find_information_response() -> u32 { return 0x05 as u32; }
+
+// Find Information Response (§3.4.3.2): [Opcode][Format (1, 0x01=16-
+// bit UUIDs/0x02=128-bit UUIDs)][Information Data: repeating (Handle
+// (2, LE), UUID (2 or 16 bytes)) pairs, as many as fit under ATT_MTU].
+fn att_find_information_response_get_format(buf: mut ref i64) -> u32 {
+  return buf_read_byte(buf, 1 as u32);
+}
+
+fn att_find_information_entry_size(format: u32) -> i64 {
+  if format == (1 as u32) { return 4; } // 2 (handle) + 2 (16-bit UUID)
+  return 18; // 2 (handle) + 16 (128-bit UUID)
+}
+
+fn att_find_information_response_count(buf: mut ref i64, pdu_len: i64) -> i64 {
+  let format: u32 = att_find_information_response_get_format(buf);
+  let entry_size: i64 = att_find_information_entry_size(format);
+  return (pdu_len - 2) / entry_size;
+}
+
+fn att_find_information_response_get_handle_at(buf: mut ref i64, index: i64) -> u32 {
+  let format: u32 = att_find_information_response_get_format(buf);
+  let entry_size: i64 = att_find_information_entry_size(format);
+  return buf_read_u16_le(buf, 2 + (index * entry_size));
+}
+
+// Only meaningful when the response's own format is 1 (16-bit UUIDs)
+// -- caller's own job to check att_find_information_response_get_
+// format first, same "don't guess, the caller already knows enough to
+// ask correctly" posture as every other accessor in this file.
+fn att_find_information_response_get_uuid16_at(buf: mut ref i64, index: i64) -> u32 {
+  return buf_read_u16_le(buf, 2 + (index * 4) + 2);
+}
+
+// Read By Type Request (§3.4.4.1): [Opcode][Starting_Handle (2, LE)]
+// [Ending_Handle (2, LE)][Attribute_Type (2, LE, 16-bit UUID)].
+fn att_opcode_read_by_type_request() -> u32 { return 0x08 as u32; }
+fn att_opcode_read_by_type_response() -> u32 { return 0x09 as u32; }
+
+fn att_build_read_by_type_request_uuid16(out_buf: mut ref i64, starting_handle: u32, ending_handle: u32, attribute_type_uuid16: u32) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_read_by_type_request());
+  let _ = buf_write_u16_le(out_buf, 1, starting_handle);
+  let _ = buf_write_u16_le(out_buf, 3, ending_handle);
+  let _ = buf_write_u16_le(out_buf, 5, attribute_type_uuid16);
+  return 7;
+}
+
+// Read By Type Response (§3.4.4.2): [Opcode][Length (1, size of each
+// handle-value pair, i.e. 2 + value size)][Attribute Data List:
+// repeating (Handle (2, LE), Value (Length-2 bytes)) pairs].
+fn att_read_by_type_response_get_entry_len(buf: mut ref i64) -> u32 {
+  return buf_read_byte(buf, 1 as u32);
+}
+
+fn att_read_by_type_response_count(buf: mut ref i64, pdu_len: i64) -> i64 {
+  let entry_len: i64 = att_read_by_type_response_get_entry_len(buf) as i64;
+  if entry_len <= 0 { return 0; }
+  return (pdu_len - 2) / entry_len;
+}
+
+fn att_read_by_type_response_get_handle_at(buf: mut ref i64, index: i64) -> u32 {
+  let entry_len: i64 = att_read_by_type_response_get_entry_len(buf) as i64;
+  return buf_read_u16_le(buf, 2 + (index * entry_len));
+}
+
+fn att_read_by_type_response_get_value_len(buf: mut ref i64) -> i64 {
+  return (att_read_by_type_response_get_entry_len(buf) as i64) - 2;
+}
+
+fn att_read_by_type_response_get_value_at(buf: mut ref i64, index: i64, out_value: mut ref i64) -> i64 {
+  let entry_len: i64 = att_read_by_type_response_get_entry_len(buf) as i64;
+  let value_len: i64 = entry_len - 2;
+  let base: i64 = 2 + (index * entry_len) + 2;
+  let i: i64 = 0;
+  while i < value_len {
+    let b: u32 = buf_read_byte(buf, (base + i) as u32);
+    let _ = buf_write_byte(out_value, i as u32, b);
+    i = i + 1;
+  }
+  return value_len;
+}
+
+// Read By Group Type Request (§3.4.4.9): identical shape to Read By
+// Type Request above (only the semantics of what's being searched for
+// differ -- grouping attribute TYPES, like Primary Service, rather
+// than any attribute type), so it reuses the same 16-bit-UUID-only
+// request encoding.
+fn att_opcode_read_by_group_type_request() -> u32 { return 0x10 as u32; }
+fn att_opcode_read_by_group_type_response() -> u32 { return 0x11 as u32; }
+
+fn att_build_read_by_group_type_request_uuid16(out_buf: mut ref i64, starting_handle: u32, ending_handle: u32, group_type_uuid16: u32) -> i64 {
+  let _ = buf_write_byte(out_buf, 0 as u32, att_opcode_read_by_group_type_request());
+  let _ = buf_write_u16_le(out_buf, 1, starting_handle);
+  let _ = buf_write_u16_le(out_buf, 3, ending_handle);
+  let _ = buf_write_u16_le(out_buf, 5, group_type_uuid16);
+  return 7;
+}
+
+// Read By Group Type Response (§3.4.4.10): [Opcode][Length (1, size of
+// each group, i.e. 4 + value size)][Attribute Data List: repeating
+// (Attribute_Handle (2, LE), End_Group_Handle (2, LE), Value
+// (Length-4 bytes)) groups] -- e.g. one group per discovered service,
+// value = the service's own UUID, Attribute_Handle/End_Group_Handle =
+// the service's whole attribute-handle range (its declaration handle
+// through its last characteristic/descriptor before the next
+// service).
+fn att_read_by_group_type_response_get_entry_len(buf: mut ref i64) -> u32 {
+  return buf_read_byte(buf, 1 as u32);
+}
+
+fn att_read_by_group_type_response_count(buf: mut ref i64, pdu_len: i64) -> i64 {
+  let entry_len: i64 = att_read_by_group_type_response_get_entry_len(buf) as i64;
+  if entry_len <= 0 { return 0; }
+  return (pdu_len - 2) / entry_len;
+}
+
+fn att_read_by_group_type_response_get_start_handle_at(buf: mut ref i64, index: i64) -> u32 {
+  let entry_len: i64 = att_read_by_group_type_response_get_entry_len(buf) as i64;
+  return buf_read_u16_le(buf, 2 + (index * entry_len));
+}
+
+fn att_read_by_group_type_response_get_end_handle_at(buf: mut ref i64, index: i64) -> u32 {
+  let entry_len: i64 = att_read_by_group_type_response_get_entry_len(buf) as i64;
+  return buf_read_u16_le(buf, 2 + (index * entry_len) + 2);
+}
+
+fn att_read_by_group_type_response_get_value_len(buf: mut ref i64) -> i64 {
+  return (att_read_by_group_type_response_get_entry_len(buf) as i64) - 4;
+}
+
+fn att_read_by_group_type_response_get_value_at(buf: mut ref i64, index: i64, out_value: mut ref i64) -> i64 {
+  let entry_len: i64 = att_read_by_group_type_response_get_entry_len(buf) as i64;
+  let value_len: i64 = entry_len - 4;
+  let base: i64 = 2 + (index * entry_len) + 4;
+  let i: i64 = 0;
+  while i < value_len {
+    let b: u32 = buf_read_byte(buf, (base + i) as u32);
+    let _ = buf_write_byte(out_value, i as u32, b);
+    i = i + 1;
+  }
+  return value_len;
+}
+
+// GATT (Generic Attribute Profile, Bluetooth Core Spec Vol 3 Part G) --
+// the semantic layer this project's own ATT operations above exist to
+// serve: services and characteristics are just conventionally-typed
+// attributes (Primary Service = attribute type 0x2800, Characteristic
+// Declaration = 0x2803, ...), discovered via ATT's own Read By Group
+// Type/Read By Type procedures rather than any GATT-specific PDU of
+// their own -- GATT defines the PROCEDURE (§4.3.1's own "Discover All
+// Primary Services", §4.6.1's "Discover All Characteristics of a
+// Service"), not new wire format. This round builds the CLIENT role
+// only (Dhruva as the connecting central, per hci_build_le_create_
+// connection_command's own direction) -- a GATT SERVER role (Dhruva
+// exposing its own attributes for something else to discover) is a
+// separate, additional direction, not attempted here.
+fn gatt_uuid_primary_service() -> u32 { return 0x2800 as u32; }
+fn gatt_uuid_secondary_service() -> u32 { return 0x2801 as u32; }
+fn gatt_uuid_include() -> u32 { return 0x2802 as u32; }
+fn gatt_uuid_characteristic() -> u32 { return 0x2803 as u32; }
+fn gatt_uuid_char_extended_properties() -> u32 { return 0x2900 as u32; }
+fn gatt_uuid_char_user_description() -> u32 { return 0x2901 as u32; }
+fn gatt_uuid_client_char_configuration() -> u32 { return 0x2902 as u32; }
+fn gatt_uuid_server_char_configuration() -> u32 { return 0x2903 as u32; }
+fn gatt_uuid_char_presentation_format() -> u32 { return 0x2904 as u32; }
+fn gatt_uuid_char_aggregate_format() -> u32 { return 0x2905 as u32; }
+
+// Wraps one ATT PDU in its L2CAP B-frame (fixed ATT channel) and HCI
+// ACL Data envelope, then sends it over the already-established
+// connection's bulk OUT endpoint. gatt_send_scratch is reused across
+// every call (never a fresh dhruva_alloc_bytes) since this is the
+// actual per-request send path, not a one-time setup call -- same
+// "repeatable real caller needs persistent scratch" reasoning as
+// net_send_scratch's own comment. hci_acl_build_header is reused
+// directly (the ACL header genuinely belongs at this buffer's own
+// offset 0); the L2CAP header's own 2 fields are written inline at
+// offset 4 instead of via l2cap_build_header, which assumes offset 0
+// and has no way to target a sub-region of an existing buffer (vani
+// has no pointer arithmetic to hand it a "buf + 4" view).
+fn gatt_att_send(devaddr: u32, mps: u32, conn_handle: u32, att_pdu: mut ref i64, att_pdu_len: i64) -> i64 {
+  let buf: mut ref i64 = gatt_send_scratch_get();
+  let l2cap_total_len: u32 = (4 + att_pdu_len) as u32;
+  let _ = hci_acl_build_header(buf, conn_handle, hci_acl_pb_flag_first(), hci_acl_bc_flag_point_to_point(), l2cap_total_len);
+  let _ = buf_write_u16_le(buf, 4, att_pdu_len as u32);
+  let _ = buf_write_u16_le(buf, 6, l2cap_att_channel_id());
+  let i: i64 = 0;
+  while i < att_pdu_len {
+    let b: u32 = buf_read_byte(att_pdu, i as u32);
+    let _ = buf_write_byte(buf, (8 + i) as u32, b);
+    i = i + 1;
+  }
+  return dwc2_bt_bulk_out(devaddr, mps, buf, 8 + att_pdu_len);
+}
+
+// Receives one ACL data packet, unwraps its L2CAP B-frame, and copies
+// the ATT PDU it carries into out_att_pdu -- the receive-side twin of
+// gatt_att_send above. Deliberately assumes the whole L2CAP PDU always
+// fits in a single ACL packet (this round's own ATT operations never
+// build anything close to a real LE data-length-extension packet's own
+// size), matching how netif_recv_frame's own LAN9512 branch documents
+// the identical "one frame per transfer" simplification. A non-ATT
+// channel ID (L2CAP Signaling, SMP, ...) or a declared length exceeding
+// what was actually delivered is rejected outright -- same "reject,
+// don't guess" posture as every other wire-format boundary check in
+// this project.
+fn gatt_att_recv(devaddr: u32, mps: u32, out_att_pdu: mut ref i64) -> i64 {
+  let buf: mut ref i64 = gatt_recv_scratch_get();
+  let recv_len: i64 = dwc2_bt_bulk_in(devaddr, mps, buf, mps as i64);
+  if recv_len < 8 {
+    return 0 - 1; // too short to hold ACL header (4) + L2CAP header (4), or nothing was waiting
+  }
+  let channel_id: u32 = buf_read_u16_le(buf, 6);
+  if channel_id != l2cap_att_channel_id() {
+    return 0 - 1; // not ATT (Signaling/SMP -- out of scope this round)
+  }
+  let att_pdu_len: i64 = buf_read_u16_le(buf, 4) as i64;
+  if (8 + att_pdu_len) > recv_len {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < att_pdu_len {
+    let b: u32 = buf_read_byte(buf, (8 + i) as u32);
+    let _ = buf_write_byte(out_att_pdu, i as u32, b);
+    i = i + 1;
+  }
+  return att_pdu_len;
+}
+
+// Clears both discovery tables -- called once at the start of a fresh
+// connection's own discovery phase (a stale previous connection's
+// services/characteristics must never leak into a new one's results).
+fn gatt_discover_reset() -> i64 {
+  let _ = gatt_service_set_count(0 as u32);
+  let _ = gatt_char_set_count(0 as u32);
+  return 0;
+}
+
+// Discover All Primary Services (§4.3.1): repeats Read By Group Type
+// (group type = Primary Service) with a narrowing starting handle
+// until an Attribute Not Found error signals "nothing left to
+// discover" -- the standard GATT discovery procedure shape every
+// other discovery function below also follows. Returns the number of
+// services discovered (capped at gatt_state.S's own 8-service table),
+// or -1 on a real transport/protocol error (not on the normal
+// Attribute-Not-Found end condition, which is success, not failure).
+fn gatt_discover_primary_services(devaddr: u32, mps: u32, conn_handle: u32) -> i64 {
+  let req: mut ref i64 = dhruva_alloc_bytes(7);
+  let rsp: mut ref i64 = dhruva_alloc_bytes(256);
+  let value: mut ref i64 = dhruva_alloc_bytes(16);
+  let starting_handle: u32 = 1 as u32;
+  let done: i64 = 0;
+  while done == 0 {
+    let req_len: i64 = att_build_read_by_group_type_request_uuid16(req, starting_handle, 0xFFFF as u32, gatt_uuid_primary_service());
+    let send_status: i64 = gatt_att_send(devaddr, mps, conn_handle, req, req_len);
+    if send_status != 0 {
+      return 0 - 1;
+    }
+    let rsp_len: i64 = gatt_att_recv(devaddr, mps, rsp);
+    if rsp_len < 0 {
+      return 0 - 1;
+    }
+    let opcode: u32 = att_get_opcode(rsp);
+    if opcode == att_opcode_error_response() {
+      if att_error_code(rsp) == att_error_attribute_not_found() {
+        done = 1;
+      } else {
+        return 0 - 1;
+      }
+    } else {
+      if opcode != att_opcode_read_by_group_type_response() {
+        return 0 - 1;
+      }
+      let count: i64 = att_read_by_group_type_response_count(rsp, rsp_len);
+      if count <= 0 {
+        done = 1;
+      } else {
+        let i: i64 = 0;
+        while i < count {
+          let start_h: u32 = att_read_by_group_type_response_get_start_handle_at(rsp, i);
+          let end_h: u32 = att_read_by_group_type_response_get_end_handle_at(rsp, i);
+          let val_len: i64 = att_read_by_group_type_response_get_value_at(rsp, i, value);
+          // 128-bit service UUIDs (val_len==16) are a real spec option
+          // this round doesn't decode -- the service's own handle
+          // RANGE is still recorded (characteristic discovery within
+          // it still works), just with uuid16=0 as an explicit "not a
+          // 16-bit UUID, not decoded" sentinel rather than a wrong
+          // guess.
+          let uuid16: u32 = if val_len == 2 { buf_read_u16_le(value, 0) } else { 0 as u32 };
+          let svc_index: i64 = gatt_service_get_count();
+          if svc_index < 8 {
+            let _ = gatt_service_set_start_handle_at(svc_index as u32, start_h);
+            let _ = gatt_service_set_end_handle_at(svc_index as u32, end_h);
+            let _ = gatt_service_set_uuid16_at(svc_index as u32, uuid16);
+            let _ = gatt_service_set_count((svc_index + 1) as u32);
+          }
+          i = i + 1;
+        }
+        let last_end_h: u32 = att_read_by_group_type_response_get_end_handle_at(rsp, count - 1);
+        if last_end_h == (0xFFFF as u32) {
+          done = 1;
+        } else {
+          starting_handle = last_end_h + (1 as u32);
+        }
+      }
+    }
+  }
+  return gatt_service_get_count();
+}
+
+// Discover All Characteristics of a Service (§4.6.1): Read By Type
+// (attribute type = Characteristic Declaration) within one already-
+// discovered service's own handle range, same repeat-until-Attribute-
+// Not-Found shape as service discovery above. A Characteristic
+// Declaration's own value is [Properties (1)][Value_Handle (2, LE)]
+// [Characteristic_UUID (2 or 16 bytes)] -- this round only decodes the
+// 16-bit-UUID case, matching gatt_discover_primary_services' own
+// scoping. Returns the number of characteristics discovered for THIS
+// service (not the running total across all services), or -1 on a
+// real error.
+fn gatt_discover_characteristics_for_service(devaddr: u32, mps: u32, conn_handle: u32, service_index: i64) -> i64 {
+  let start_h: u32 = gatt_service_get_start_handle_at(service_index as u32) as u32;
+  let end_h: u32 = gatt_service_get_end_handle_at(service_index as u32) as u32;
+  let req: mut ref i64 = dhruva_alloc_bytes(7);
+  let rsp: mut ref i64 = dhruva_alloc_bytes(256);
+  let value: mut ref i64 = dhruva_alloc_bytes(19);
+  let starting_handle: u32 = start_h;
+  let done: i64 = 0;
+  let found_this_service: i64 = 0;
+  while done == 0 {
+    let req_len: i64 = att_build_read_by_type_request_uuid16(req, starting_handle, end_h, gatt_uuid_characteristic());
+    let send_status: i64 = gatt_att_send(devaddr, mps, conn_handle, req, req_len);
+    if send_status != 0 {
+      return 0 - 1;
+    }
+    let rsp_len: i64 = gatt_att_recv(devaddr, mps, rsp);
+    if rsp_len < 0 {
+      return 0 - 1;
+    }
+    let opcode: u32 = att_get_opcode(rsp);
+    if opcode == att_opcode_error_response() {
+      if att_error_code(rsp) == att_error_attribute_not_found() {
+        done = 1;
+      } else {
+        return 0 - 1;
+      }
+    } else {
+      if opcode != att_opcode_read_by_type_response() {
+        return 0 - 1;
+      }
+      let count: i64 = att_read_by_type_response_count(rsp, rsp_len);
+      if count <= 0 {
+        done = 1;
+      } else {
+        let i: i64 = 0;
+        let last_decl_h: u32 = starting_handle;
+        while i < count {
+          let decl_h: u32 = att_read_by_type_response_get_handle_at(rsp, i);
+          let val_len: i64 = att_read_by_type_response_get_value_at(rsp, i, value);
+          if val_len >= 5 {
+            let properties: u32 = buf_read_byte(value, 0 as u32);
+            let value_h: u32 = buf_read_u16_le(value, 1);
+            let uuid16: u32 = if val_len == 5 { buf_read_u16_le(value, 3) } else { 0 as u32 };
+            let char_index: i64 = gatt_char_get_count();
+            if char_index < 32 {
+              let _ = gatt_char_set_decl_handle_at(char_index as u32, decl_h);
+              let _ = gatt_char_set_properties_at(char_index as u32, properties);
+              let _ = gatt_char_set_value_handle_at(char_index as u32, value_h);
+              let _ = gatt_char_set_uuid16_at(char_index as u32, uuid16);
+              let _ = gatt_char_set_service_index_at(char_index as u32, service_index as u32);
+              let _ = gatt_char_set_count((char_index + 1) as u32);
+              found_this_service = found_this_service + 1;
+            }
+          }
+          last_decl_h = decl_h;
+          i = i + 1;
+        }
+        if (last_decl_h >= end_h) || (last_decl_h == (0xFFFF as u32)) {
+          done = 1;
+        } else {
+          starting_handle = last_decl_h + (1 as u32);
+        }
+      }
+    }
+  }
+  return found_this_service;
+}
+
+// Orchestrates the full discovery phase for a freshly-established
+// connection: reset both tables, discover every primary service, then
+// discover every characteristic within each one. Returns the total
+// characteristic count across all services, or -1 on a real error
+// from either sub-procedure -- a caller wanting per-service detail
+// should call gatt_discover_primary_services/_characteristics_for_
+// service directly instead, this is the "just get everything" entry
+// point.
+fn gatt_discover_all(devaddr: u32, mps: u32, conn_handle: u32) -> i64 {
+  let _ = gatt_discover_reset();
+  let service_count: i64 = gatt_discover_primary_services(devaddr, mps, conn_handle);
+  if service_count < 0 {
+    return 0 - 1;
+  }
+  let s: i64 = 0;
+  while s < service_count {
+    let char_status: i64 = gatt_discover_characteristics_for_service(devaddr, mps, conn_handle, s);
+    if char_status < 0 {
+      return 0 - 1;
+    }
+    s = s + 1;
+  }
+  return gatt_char_get_count();
+}
+
+// Reads one already-discovered characteristic's own value, by index
+// into gatt_char_*'s own table (not a raw ATT handle -- the caller
+// works in terms of what gatt_discover_all/_characteristics_for_
+// service already found, not protocol-level handles directly).
+// Returns the value's own length (copied into out_value), or -1 on a
+// real transport/protocol error or an unexpected response PDU.
+fn gatt_read_characteristic_value(devaddr: u32, mps: u32, conn_handle: u32, char_index: i64, out_value: mut ref i64) -> i64 {
+  let value_handle: u32 = gatt_char_get_value_handle_at(char_index as u32) as u32;
+  let req: mut ref i64 = dhruva_alloc_bytes(3);
+  let req_len: i64 = att_build_read_request(req, value_handle);
+  let send_status: i64 = gatt_att_send(devaddr, mps, conn_handle, req, req_len);
+  if send_status != 0 {
+    return 0 - 1;
+  }
+  let rsp: mut ref i64 = dhruva_alloc_bytes(256);
+  let rsp_len: i64 = gatt_att_recv(devaddr, mps, rsp);
+  if rsp_len < 0 {
+    return 0 - 1;
+  }
+  let opcode: u32 = att_get_opcode(rsp);
+  if opcode != att_opcode_read_response() {
+    return 0 - 1;
+  }
+  return att_read_response_get_value(rsp, rsp_len, out_value);
+}
+
+// Writes one already-discovered characteristic's own value, same
+// index-into-the-discovery-table convention as the read path above.
+// value must be <= 253 bytes (256-byte scratch minus the 3-byte ATT
+// Write Request header) -- comfortably above any real default LE
+// ATT_MTU's own payload capacity (20 bytes), rejected outright rather
+// than silently truncated if a caller ever passed something absurd.
+// Returns 0 on a confirmed Write Response, or -1 on a real error.
+fn gatt_write_characteristic_value(devaddr: u32, mps: u32, conn_handle: u32, char_index: i64, value: mut ref i64, value_len: i64) -> i64 {
+  if value_len > 253 {
+    return 0 - 1;
+  }
+  let value_handle: u32 = gatt_char_get_value_handle_at(char_index as u32) as u32;
+  let req: mut ref i64 = dhruva_alloc_bytes(256);
+  let req_len: i64 = att_build_write_request(req, value_handle, value, value_len);
+  let send_status: i64 = gatt_att_send(devaddr, mps, conn_handle, req, req_len);
+  if send_status != 0 {
+    return 0 - 1;
+  }
+  let rsp: mut ref i64 = dhruva_alloc_bytes(256);
+  let rsp_len: i64 = gatt_att_recv(devaddr, mps, rsp);
+  if rsp_len < 0 {
+    return 0 - 1;
+  }
+  let opcode: u32 = att_get_opcode(rsp);
+  if opcode != att_opcode_write_response() {
+    return 0 - 1;
+  }
+  return 0;
+}
+
 // Round 57: one INTERRUPT IN transfer -- this driver's first use of the
 // interrupt transfer type (bmAttributes==3), needed because USB
 // Bluetooth HCI delivers HCI EVENTS (Command Complete, Command Status,
@@ -16172,6 +16730,8 @@ fn kernel_main() -> i64 {
   let _ = dharafs_verified_digest_b_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_appendonly_check_scratch_set(dhruva_alloc_bytes(4096));
   let _ = dharafs_rename_new_path_scratch_set(dhruva_alloc_bytes(32));
+  let _ = gatt_send_scratch_set(dhruva_alloc_bytes(256));
+  let _ = gatt_recv_scratch_set(dhruva_alloc_bytes(256));
   let _ = shell_my_mac_scratch_set(dhruva_alloc_bytes(8));
   let _ = shell_ping_dst_mac_scratch_set(dhruva_alloc_bytes(8));
   let _ = shell_ping_payload_scratch_set(dhruva_alloc_bytes(4));

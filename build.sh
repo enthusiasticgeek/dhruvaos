@@ -114,6 +114,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/diag_ring_state.S" -o "${BUILD_DIR}/diag_ring_state.o"
 
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/gatt_state.S" -o "${BUILD_DIR}/gatt_state.o"
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
@@ -142,6 +145,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/media_crypto_state.o" \
   "${BUILD_DIR}/fault_inject_state.o" \
   "${BUILD_DIR}/diag_ring_state.o" \
+  "${BUILD_DIR}/gatt_state.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
   -lgcc \
   -o "${BUILD_DIR}/dhruva.elf"

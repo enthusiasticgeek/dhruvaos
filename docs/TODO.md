@@ -2355,12 +2355,12 @@ support of any kind.
 
 - **BLE via USB dongle (Pi 1): HCI transport (DONE, round 57,
   spec-only) + connection establishment/ACL/L2CAP/core ATT (DONE,
-  round 66, spec-only) + GATT discovery (not started)** — `[L, several
-  rounds — a full usable BLE stack is a multi-round effort, comparable
-  to this project's existing TCP/IP stack; this round closed the
-  connection-establishment gap and built L2CAP + core ATT operations,
-  GATT's own discovery procedures are the next genuinely separate
-  increment]`
+  round 66, spec-only) + GATT discovery + client read/write-by-index
+  (DONE, round 66, spec-only) + GATT SERVER role (not started)** —
+  `[L, several rounds — a full GATT CLIENT stack is now built; a GATT
+  SERVER role (Dhruva exposing its own attributes rather than
+  discovering a peer's) is a separate, additional direction, not
+  attempted]`
   USB Bluetooth HCI is an OFFICIAL, STANDARDIZED USB class (interface
   class `0xE0`/subclass `0x01`/protocol `0x01`) — `dwc2_fetch_and_
   set_configuration`'s descriptor walk detects it exactly like mass
@@ -2405,22 +2405,81 @@ support of any kind.
   the existing byte-at-a-time HCI command builders ever justified a
   dedicated helper for individually).
 
-  **Deliberately NOT included**: GATT's own discovery procedures (Find
-  Information, Read By Type/Group Type — the operations that actually
-  enumerate services/characteristics rather than accessing a handle
-  already known ahead of time) are a genuinely separate, larger
-  increment, this project's own "don't build past what's actually
-  needed yet" discipline applied here too.
+  **Round 66 (2026-09-01), same day — GATT discovery + client read/
+  write built**, user explicitly asked to continue toward "a full BLE
+  stack" after the connection/ACL/L2CAP/core-ATT increment above.
+  Added the ATT discovery PDUs GATT's own procedures are built on top
+  of (Find Information §3.4.3, Read By Type §3.4.4.1-2, Read By Group
+  Type §3.4.4.9-10 — GATT defines the PROCEDURE, not new wire format:
+  a "service" is just an attribute of type 0x2800 discovered via Read
+  By Group Type, a "characteristic" an attribute of type 0x2803
+  discovered via Read By Type within a service's own handle range),
+  plus all 17 standard ATT error codes (`att_error_attribute_not_
+  found` specifically is how every discovery loop recognizes "no more
+  results" — a real Error Response, not a distinct signal).
+
+  GATT's own semantic layer sits on top: `gatt_discover_primary_
+  services` (§4.3.1, repeats Read By Group Type with a narrowing
+  starting handle until Attribute Not Found) and `gatt_discover_
+  characteristics_for_service` (§4.6.1, same shape via Read By Type
+  within one service's range) populate a new fixed-size discovery
+  table (`boot/gatt_state.S` — 8 services/32 characteristics, matching
+  this project's own established "fixed-size, no dynamic allocation
+  for control structures" discipline, MAX_TASKS/ARP-cache/TCP-slots
+  style). `gatt_discover_all` orchestrates both. `gatt_read_
+  characteristic_value`/`gatt_write_characteristic_value` then work in
+  terms of a DISCOVERED characteristic's own table INDEX, not a raw
+  ATT handle — the actual client-usable surface: discover once, then
+  read/write by index. `gatt_att_send`/`gatt_att_recv` wrap one ATT
+  PDU in its L2CAP+ACL envelope and move it over the connection's own
+  bulk endpoints (`dwc2_bt_bulk_out/in`, already built round 57).
+
+  **Real AAPCS bug caught and fixed before it ever shipped**, not just
+  avoided by luck: `gatt_state.S`'s own accessors were first written
+  with vani-side `i64` index/value parameters. This project's own
+  well-documented AAPCS gotcha (a preceding i64 argument needs an
+  even-aligned register pair) means two i64 PARAMETERS in a row
+  actually place the second one in r2:r3, not r1 as the asm (which
+  reads `index` from r0, `value` from r1, nothing more) assumed —
+  caught by re-deriving the calling convention by hand before ever
+  building, not discovered live. Fixed by declaring every index/value
+  parameter `u32` instead (matching `diag_ring_push`'s own identical
+  fix from earlier the same round) — every accessor now takes at most
+  2 arguments, each in exactly one register, nothing to get wrong.
+
+  **Deliberately NOT included**: a GATT SERVER role (Dhruva exposing
+  its own attributes for a real central to discover/read/write,
+  rather than discovering a peer's) is a separate, additional
+  direction with its own real design surface (an attribute database,
+  server-side request handling) — not attempted this round, the
+  CLIENT role only, matching `hci_build_le_create_connection_command`'s
+  own direction (Dhruva as the connecting central). 128-bit custom
+  UUIDs are also not decoded (every standard GATT service/
+  characteristic type is a 16-bit Bluetooth-SIG-assigned UUID, which
+  is what real embedded interop overwhelmingly needs) — a discovered
+  128-bit-UUID service/characteristic still gets its handle range
+  recorded correctly, just with `uuid16=0` as an explicit "not
+  decoded" sentinel rather than a wrong guess.
 
   Same honesty bar as round 57's own HCI transport work and the
   LAN9512 NIC backend: **NOT live-verified** (QEMU's `usb-bt-dongle`
   was removed in 2018, same blocker round 57 already documented) —
-  written to spec and verified via 65 new host-harness tests (opcode/
-  length/field-round-trip checks for every PDU/event type built this
-  round, including a max-12-bit-handle boundary check on the ACL
-  header proving flags don't bleed into the handle field or vice
-  versa), pending real Pi 1B hardware-in-loop testing with an actual
-  BLE central/peripheral to talk to.
+  written to spec and verified via 65 (connection/ACL/L2CAP/core ATT)
+  + 51 (discovery PDUs) + 24 (GATT UUID constants/table round trips) =
+  140 total new host-harness tests across this round's two BLE
+  increments. GATT's
+  own orchestration functions (`gatt_discover_*`/`gatt_att_send`/
+  `gatt_read/write_characteristic_value`) are deliberately NOT called
+  from any host-harness test — confirmed by reading the generated C
+  directly that `mmio_read_u32`/`mmio_write_u32` compile to raw
+  `*(volatile uint32_t*)addr` dereferences of real Raspberry Pi
+  peripheral addresses, so calling anything that reaches them on a
+  native x86 host would segfault the whole test suite, not just fail
+  cleanly — the same reason `hci_send_command_and_wait_complete`/
+  `hci_reset_and_scan` were never directly host-tested either, only
+  their own pure packet-building/parsing pieces. Pending real Pi 1B
+  hardware-in-loop testing with an actual BLE central/peripheral to
+  talk to.
 
 - **WiFi via USB dongle (Pi 1): enumeration + vendor register I/O
   (DONE, round 58) + everything else (not started, and structurally

@@ -165,6 +165,79 @@ int64_t fn_att_build_write_request(int64_t *out_buf, uint32_t handle, int64_t *v
 uint32_t fn_att_write_request_get_handle(int64_t *buf);
 int64_t fn_att_write_request_get_value(int64_t *buf, int64_t pdu_len, int64_t *out_value);
 int64_t fn_att_build_write_response(int64_t *out_buf);
+uint32_t fn_att_error_invalid_handle(void);
+uint32_t fn_att_error_read_not_permitted(void);
+uint32_t fn_att_error_write_not_permitted(void);
+uint32_t fn_att_error_invalid_pdu(void);
+uint32_t fn_att_error_insufficient_authentication(void);
+uint32_t fn_att_error_request_not_supported(void);
+uint32_t fn_att_error_invalid_offset(void);
+uint32_t fn_att_error_insufficient_authorization(void);
+uint32_t fn_att_error_prepare_queue_full(void);
+uint32_t fn_att_error_attribute_not_found(void);
+uint32_t fn_att_error_attribute_not_long(void);
+uint32_t fn_att_error_insufficient_encryption_key_size(void);
+uint32_t fn_att_error_invalid_attribute_value_length(void);
+uint32_t fn_att_error_unlikely_error(void);
+uint32_t fn_att_error_insufficient_encryption(void);
+uint32_t fn_att_error_unsupported_group_type(void);
+uint32_t fn_att_error_insufficient_resources(void);
+uint32_t fn_att_opcode_find_information_request(void);
+uint32_t fn_att_opcode_find_information_response(void);
+int64_t fn_att_build_find_information_request(int64_t *out_buf, uint32_t starting_handle, uint32_t ending_handle);
+uint32_t fn_att_find_information_response_get_format(int64_t *buf);
+int64_t fn_att_find_information_entry_size(uint32_t format);
+int64_t fn_att_find_information_response_count(int64_t *buf, int64_t pdu_len);
+uint32_t fn_att_find_information_response_get_handle_at(int64_t *buf, int64_t index);
+uint32_t fn_att_find_information_response_get_uuid16_at(int64_t *buf, int64_t index);
+uint32_t fn_att_opcode_read_by_type_request(void);
+uint32_t fn_att_opcode_read_by_type_response(void);
+int64_t fn_att_build_read_by_type_request_uuid16(int64_t *out_buf, uint32_t starting_handle, uint32_t ending_handle, uint32_t attribute_type_uuid16);
+uint32_t fn_att_read_by_type_response_get_entry_len(int64_t *buf);
+int64_t fn_att_read_by_type_response_count(int64_t *buf, int64_t pdu_len);
+uint32_t fn_att_read_by_type_response_get_handle_at(int64_t *buf, int64_t index);
+int64_t fn_att_read_by_type_response_get_value_len(int64_t *buf);
+int64_t fn_att_read_by_type_response_get_value_at(int64_t *buf, int64_t index, int64_t *out_value);
+uint32_t fn_att_opcode_read_by_group_type_request(void);
+uint32_t fn_att_opcode_read_by_group_type_response(void);
+int64_t fn_att_build_read_by_group_type_request_uuid16(int64_t *out_buf, uint32_t starting_handle, uint32_t ending_handle, uint32_t group_type_uuid16);
+uint32_t fn_att_read_by_group_type_response_get_entry_len(int64_t *buf);
+int64_t fn_att_read_by_group_type_response_count(int64_t *buf, int64_t pdu_len);
+uint32_t fn_att_read_by_group_type_response_get_start_handle_at(int64_t *buf, int64_t index);
+uint32_t fn_att_read_by_group_type_response_get_end_handle_at(int64_t *buf, int64_t index);
+int64_t fn_att_read_by_group_type_response_get_value_len(int64_t *buf);
+int64_t fn_att_read_by_group_type_response_get_value_at(int64_t *buf, int64_t index, int64_t *out_value);
+uint32_t fn_gatt_uuid_primary_service(void);
+uint32_t fn_gatt_uuid_secondary_service(void);
+uint32_t fn_gatt_uuid_include(void);
+uint32_t fn_gatt_uuid_characteristic(void);
+uint32_t fn_gatt_uuid_char_extended_properties(void);
+uint32_t fn_gatt_uuid_char_user_description(void);
+uint32_t fn_gatt_uuid_client_char_configuration(void);
+uint32_t fn_gatt_uuid_server_char_configuration(void);
+uint32_t fn_gatt_uuid_char_presentation_format(void);
+uint32_t fn_gatt_uuid_char_aggregate_format(void);
+int64_t gatt_service_get_count(void);
+int64_t gatt_service_set_count(uint32_t count);
+int64_t gatt_service_get_start_handle_at(uint32_t i);
+int64_t gatt_service_set_start_handle_at(uint32_t i, uint32_t v);
+int64_t gatt_service_get_end_handle_at(uint32_t i);
+int64_t gatt_service_set_end_handle_at(uint32_t i, uint32_t v);
+int64_t gatt_service_get_uuid16_at(uint32_t i);
+int64_t gatt_service_set_uuid16_at(uint32_t i, uint32_t v);
+int64_t gatt_char_get_count(void);
+int64_t gatt_char_set_count(uint32_t count);
+int64_t gatt_char_get_decl_handle_at(uint32_t i);
+int64_t gatt_char_set_decl_handle_at(uint32_t i, uint32_t v);
+int64_t gatt_char_get_properties_at(uint32_t i);
+int64_t gatt_char_set_properties_at(uint32_t i, uint32_t v);
+int64_t gatt_char_get_value_handle_at(uint32_t i);
+int64_t gatt_char_set_value_handle_at(uint32_t i, uint32_t v);
+int64_t gatt_char_get_uuid16_at(uint32_t i);
+int64_t gatt_char_set_uuid16_at(uint32_t i, uint32_t v);
+int64_t gatt_char_get_service_index_at(uint32_t i);
+int64_t gatt_char_set_service_index_at(uint32_t i, uint32_t v);
+int64_t fn_gatt_discover_reset(void);
 int64_t fn_buf_write_u16_le(int64_t *buf, int64_t offset, uint32_t value);
 uint32_t fn_buf_read_u16_le(int64_t *buf, int64_t offset);
 int64_t diag_ring_push(uint32_t tick, uint32_t ctxsw, uint32_t irqs, uint32_t priolock);
@@ -1563,6 +1636,185 @@ static void test_ble_connection_and_att(void) {
     CHECK(fn_att_get_opcode(write_rsp) == fn_att_opcode_write_response(), "att write rsp: opcode");
 }
 
+/* Round 66 follow-up: ATT discovery PDUs (Find Information, Read By
+ * Type, Read By Group Type) -- GATT discovery's own building blocks. */
+static void test_att_discovery(void) {
+    /* Error codes match spec values. */
+    CHECK(fn_att_error_attribute_not_found() == 0x0A, "att error: attribute not found == 0x0A");
+    CHECK(fn_att_error_invalid_handle() == 0x01, "att error: invalid handle == 0x01");
+    CHECK(fn_att_error_unsupported_group_type() == 0x10, "att error: unsupported group type == 0x10");
+    CHECK(fn_att_error_insufficient_resources() == 0x11, "att error: insufficient resources == 0x11");
+
+    /* Find Information Request: opcode 0x04, starting/ending handle LE. */
+    int64_t *fi_req = dhruva_alloc_bytes(5);
+    int64_t fi_req_len = fn_att_build_find_information_request(fi_req, 0x0001, 0xFFFF);
+    CHECK(fi_req_len == 5, "find info req: length == 5");
+    CHECK(fn_att_get_opcode(fi_req) == fn_att_opcode_find_information_request(), "find info req: opcode");
+    CHECK(fn_att_opcode_find_information_request() == 0x04, "find info: request opcode == 0x04");
+    CHECK(fn_att_opcode_find_information_response() == 0x05, "find info: response opcode == 0x05");
+    CHECK(fn_buf_read_u16_le(fi_req, 1) == 0x0001, "find info req: starting_handle round trip");
+    CHECK(fn_buf_read_u16_le(fi_req, 3) == 0xFFFF, "find info req: ending_handle round trip");
+
+    /* Find Information Response, format 1 (16-bit UUIDs): 3 handle/UUID
+     * pairs, e.g. discovering 3 descriptors. */
+    int64_t *fi_rsp = dhruva_alloc_bytes(2 + 3 * 4);
+    buf_write_byte(fi_rsp, 0, 0x05);
+    buf_write_byte(fi_rsp, 1, 0x01); /* format = 16-bit UUIDs */
+    fn_buf_write_u16_le(fi_rsp, 2, 0x0010);  /* handle 0x10 */
+    fn_buf_write_u16_le(fi_rsp, 4, 0x2902);  /* CCCD UUID */
+    fn_buf_write_u16_le(fi_rsp, 6, 0x0011);  /* handle 0x11 */
+    fn_buf_write_u16_le(fi_rsp, 8, 0x2901);  /* Characteristic User Description UUID */
+    fn_buf_write_u16_le(fi_rsp, 10, 0x0012); /* handle 0x12 */
+    fn_buf_write_u16_le(fi_rsp, 12, 0x2904); /* Characteristic Presentation Format UUID */
+    int64_t fi_rsp_len = 2 + 3 * 4;
+    CHECK(fn_att_find_information_response_get_format(fi_rsp) == 1, "find info rsp: format == 1 (16-bit)");
+    CHECK(fn_att_find_information_entry_size(1) == 4, "find info: 16-bit entry size == 4");
+    CHECK(fn_att_find_information_entry_size(2) == 18, "find info: 128-bit entry size == 18");
+    CHECK(fn_att_find_information_response_count(fi_rsp, fi_rsp_len) == 3, "find info rsp: count == 3 entries");
+    CHECK(fn_att_find_information_response_get_handle_at(fi_rsp, 0) == 0x0010, "find info rsp: entry 0 handle");
+    CHECK(fn_att_find_information_response_get_uuid16_at(fi_rsp, 0) == 0x2902, "find info rsp: entry 0 UUID (CCCD)");
+    CHECK(fn_att_find_information_response_get_handle_at(fi_rsp, 1) == 0x0011, "find info rsp: entry 1 handle");
+    CHECK(fn_att_find_information_response_get_uuid16_at(fi_rsp, 1) == 0x2901, "find info rsp: entry 1 UUID");
+    CHECK(fn_att_find_information_response_get_handle_at(fi_rsp, 2) == 0x0012, "find info rsp: entry 2 handle");
+    CHECK(fn_att_find_information_response_get_uuid16_at(fi_rsp, 2) == 0x2904, "find info rsp: entry 2 UUID");
+
+    /* Read By Type Request: opcode 0x08, range + 16-bit attribute type. */
+    int64_t *rbt_req = dhruva_alloc_bytes(7);
+    int64_t rbt_req_len = fn_att_build_read_by_type_request_uuid16(rbt_req, 0x0001, 0xFFFF, 0x2803);
+    CHECK(rbt_req_len == 7, "read by type req: length == 7");
+    CHECK(fn_att_get_opcode(rbt_req) == fn_att_opcode_read_by_type_request(), "read by type req: opcode");
+    CHECK(fn_att_opcode_read_by_type_request() == 0x08, "read by type: request opcode == 0x08");
+    CHECK(fn_att_opcode_read_by_type_response() == 0x09, "read by type: response opcode == 0x09");
+    CHECK(fn_buf_read_u16_le(rbt_req, 5) == 0x2803, "read by type req: attribute_type (Characteristic Declaration) round trip");
+
+    /* Read By Type Response: 2 characteristic declarations, each entry
+     * = handle(2) + value(5: properties(1)+value_handle(2)+uuid16(2)). */
+    int64_t *rbt_rsp = dhruva_alloc_bytes(2 + 2 * 7);
+    buf_write_byte(rbt_rsp, 0, 0x09);
+    buf_write_byte(rbt_rsp, 1, 7); /* entry_len = 2 (handle) + 5 (value) */
+    fn_buf_write_u16_le(rbt_rsp, 2, 0x0003);  /* char decl handle */
+    buf_write_byte(rbt_rsp, 4, 0x0A);          /* properties: read */
+    fn_buf_write_u16_le(rbt_rsp, 5, 0x0004);  /* value handle */
+    fn_buf_write_u16_le(rbt_rsp, 7, 0xFEED);  /* char UUID (fictitious) */
+    fn_buf_write_u16_le(rbt_rsp, 9, 0x0005);  /* char decl handle 2 */
+    buf_write_byte(rbt_rsp, 11, 0x02);         /* properties: write */
+    fn_buf_write_u16_le(rbt_rsp, 12, 0x0006); /* value handle 2 */
+    fn_buf_write_u16_le(rbt_rsp, 14, 0xBEEF); /* char UUID 2 */
+    int64_t rbt_rsp_len = 2 + 2 * 7;
+    CHECK(fn_att_read_by_type_response_get_entry_len(rbt_rsp) == 7, "read by type rsp: entry_len == 7");
+    CHECK(fn_att_read_by_type_response_count(rbt_rsp, rbt_rsp_len) == 2, "read by type rsp: count == 2 entries");
+    CHECK(fn_att_read_by_type_response_get_handle_at(rbt_rsp, 0) == 0x0003, "read by type rsp: entry 0 handle");
+    CHECK(fn_att_read_by_type_response_get_value_len(rbt_rsp) == 5, "read by type rsp: value_len == 5");
+    int64_t *rbt_val0 = dhruva_alloc_bytes(5);
+    int64_t rbt_val0_len = fn_att_read_by_type_response_get_value_at(rbt_rsp, 0, rbt_val0);
+    CHECK(rbt_val0_len == 5, "read by type rsp: entry 0 value length == 5");
+    CHECK(buf_read_byte(rbt_val0, 0) == 0x0A, "read by type rsp: entry 0 properties");
+    CHECK(fn_buf_read_u16_le(rbt_val0, 1) == 0x0004, "read by type rsp: entry 0 value_handle");
+    CHECK(fn_buf_read_u16_le(rbt_val0, 3) == 0xFEED, "read by type rsp: entry 0 char UUID");
+    CHECK(fn_att_read_by_type_response_get_handle_at(rbt_rsp, 1) == 0x0005, "read by type rsp: entry 1 handle");
+    int64_t *rbt_val1 = dhruva_alloc_bytes(5);
+    fn_att_read_by_type_response_get_value_at(rbt_rsp, 1, rbt_val1);
+    CHECK(buf_read_byte(rbt_val1, 0) == 0x02, "read by type rsp: entry 1 properties");
+    CHECK(fn_buf_read_u16_le(rbt_val1, 1) == 0x0006, "read by type rsp: entry 1 value_handle");
+    CHECK(fn_buf_read_u16_le(rbt_val1, 3) == 0xBEEF, "read by type rsp: entry 1 char UUID");
+
+    /* Read By Group Type Request: opcode 0x10, same shape as Read By Type. */
+    int64_t *rbgt_req = dhruva_alloc_bytes(7);
+    int64_t rbgt_req_len = fn_att_build_read_by_group_type_request_uuid16(rbgt_req, 0x0001, 0xFFFF, 0x2800);
+    CHECK(rbgt_req_len == 7, "read by group type req: length == 7");
+    CHECK(fn_att_get_opcode(rbgt_req) == fn_att_opcode_read_by_group_type_request(), "read by group type req: opcode");
+    CHECK(fn_att_opcode_read_by_group_type_request() == 0x10, "read by group type: request opcode == 0x10");
+    CHECK(fn_att_opcode_read_by_group_type_response() == 0x11, "read by group type: response opcode == 0x11");
+    CHECK(fn_buf_read_u16_le(rbgt_req, 5) == 0x2800, "read by group type req: group_type (Primary Service) round trip");
+
+    /* Read By Group Type Response: 2 services, each entry = start(2) +
+     * end(2) + value(2: a 16-bit service UUID). */
+    int64_t *rbgt_rsp = dhruva_alloc_bytes(2 + 2 * 6);
+    buf_write_byte(rbgt_rsp, 0, 0x11);
+    buf_write_byte(rbgt_rsp, 1, 6); /* entry_len = 4 (handles) + 2 (value) */
+    fn_buf_write_u16_le(rbgt_rsp, 2, 0x0001);  /* service 1 start handle */
+    fn_buf_write_u16_le(rbgt_rsp, 4, 0x0005);  /* service 1 end handle */
+    fn_buf_write_u16_le(rbgt_rsp, 6, 0x180F);  /* Battery Service UUID */
+    fn_buf_write_u16_le(rbgt_rsp, 8, 0x0006);  /* service 2 start handle */
+    fn_buf_write_u16_le(rbgt_rsp, 10, 0x000C); /* service 2 end handle */
+    fn_buf_write_u16_le(rbgt_rsp, 12, 0x180D); /* Heart Rate Service UUID */
+    int64_t rbgt_rsp_len = 2 + 2 * 6;
+    CHECK(fn_att_read_by_group_type_response_get_entry_len(rbgt_rsp) == 6, "read by group type rsp: entry_len == 6");
+    CHECK(fn_att_read_by_group_type_response_count(rbgt_rsp, rbgt_rsp_len) == 2, "read by group type rsp: count == 2 groups");
+    CHECK(fn_att_read_by_group_type_response_get_start_handle_at(rbgt_rsp, 0) == 0x0001, "read by group type rsp: group 0 start handle");
+    CHECK(fn_att_read_by_group_type_response_get_end_handle_at(rbgt_rsp, 0) == 0x0005, "read by group type rsp: group 0 end handle");
+    CHECK(fn_att_read_by_group_type_response_get_value_len(rbgt_rsp) == 2, "read by group type rsp: value_len == 2");
+    int64_t *rbgt_val0 = dhruva_alloc_bytes(2);
+    fn_att_read_by_group_type_response_get_value_at(rbgt_rsp, 0, rbgt_val0);
+    CHECK(fn_buf_read_u16_le(rbgt_val0, 0) == 0x180F, "read by group type rsp: group 0 service UUID (Battery Service)");
+    CHECK(fn_att_read_by_group_type_response_get_start_handle_at(rbgt_rsp, 1) == 0x0006, "read by group type rsp: group 1 start handle");
+    CHECK(fn_att_read_by_group_type_response_get_end_handle_at(rbgt_rsp, 1) == 0x000C, "read by group type rsp: group 1 end handle");
+    int64_t *rbgt_val1 = dhruva_alloc_bytes(2);
+    fn_att_read_by_group_type_response_get_value_at(rbgt_rsp, 1, rbgt_val1);
+    CHECK(fn_buf_read_u16_le(rbgt_val1, 0) == 0x180D, "read by group type rsp: group 1 service UUID (Heart Rate Service)");
+}
+
+/* Round 66: GATT's own UUID constants and discovered-services/
+ * characteristics tables. Deliberately does NOT call gatt_att_send/
+ * gatt_att_recv/gatt_discover_* -- those reach mmio_read_u32/
+ * mmio_write_u32, which compile to raw `*(volatile uint32_t*)addr`
+ * dereferences of real Raspberry Pi peripheral addresses (confirmed
+ * by reading kernel_gen_patched.c directly); calling them on the host
+ * would segfault, the same reason hci_send_command_and_wait_complete/
+ * hci_reset_and_scan aren't directly host-tested either -- only their
+ * pure packet-building/parsing pieces are, matching this project's
+ * own established scope for anything that ultimately touches real
+ * hardware registers. */
+static void test_gatt_state(void) {
+    CHECK(fn_gatt_uuid_primary_service() == 0x2800, "gatt uuid: primary service");
+    CHECK(fn_gatt_uuid_secondary_service() == 0x2801, "gatt uuid: secondary service");
+    CHECK(fn_gatt_uuid_include() == 0x2802, "gatt uuid: include");
+    CHECK(fn_gatt_uuid_characteristic() == 0x2803, "gatt uuid: characteristic declaration");
+    CHECK(fn_gatt_uuid_char_extended_properties() == 0x2900, "gatt uuid: char extended properties");
+    CHECK(fn_gatt_uuid_char_user_description() == 0x2901, "gatt uuid: char user description");
+    CHECK(fn_gatt_uuid_client_char_configuration() == 0x2902, "gatt uuid: client char configuration (CCCD)");
+    CHECK(fn_gatt_uuid_server_char_configuration() == 0x2903, "gatt uuid: server char configuration");
+    CHECK(fn_gatt_uuid_char_presentation_format() == 0x2904, "gatt uuid: char presentation format");
+    CHECK(fn_gatt_uuid_char_aggregate_format() == 0x2905, "gatt uuid: char aggregate format");
+
+    fn_gatt_discover_reset();
+    CHECK(gatt_service_get_count() == 0, "gatt discover_reset: service count cleared");
+    CHECK(gatt_char_get_count() == 0, "gatt discover_reset: char count cleared");
+
+    /* Service table round trip -- as if gatt_discover_primary_services
+     * had just recorded one discovered Battery Service. */
+    gatt_service_set_start_handle_at(0, 0x0001);
+    gatt_service_set_end_handle_at(0, 0x0005);
+    gatt_service_set_uuid16_at(0, 0x180F);
+    gatt_service_set_count(1);
+    CHECK(gatt_service_get_count() == 1, "gatt service table: count round trip");
+    CHECK(gatt_service_get_start_handle_at(0) == 0x0001, "gatt service table: start handle round trip");
+    CHECK(gatt_service_get_end_handle_at(0) == 0x0005, "gatt service table: end handle round trip");
+    CHECK(gatt_service_get_uuid16_at(0) == 0x180F, "gatt service table: uuid16 round trip");
+
+    /* Characteristic table round trip, with a back-reference to the
+     * service above -- as if gatt_discover_characteristics_for_
+     * service had just recorded one characteristic within it. */
+    gatt_char_set_decl_handle_at(0, 0x0002);
+    gatt_char_set_properties_at(0, 0x0A);
+    gatt_char_set_value_handle_at(0, 0x0003);
+    gatt_char_set_uuid16_at(0, 0x2A19);
+    gatt_char_set_service_index_at(0, 0);
+    gatt_char_set_count(1);
+    CHECK(gatt_char_get_count() == 1, "gatt char table: count round trip");
+    CHECK(gatt_char_get_decl_handle_at(0) == 0x0002, "gatt char table: decl handle round trip");
+    CHECK(gatt_char_get_properties_at(0) == 0x0A, "gatt char table: properties round trip");
+    CHECK(gatt_char_get_value_handle_at(0) == 0x0003, "gatt char table: value handle round trip");
+    CHECK(gatt_char_get_uuid16_at(0) == 0x2A19, "gatt char table: uuid16 round trip (Battery Level)");
+    CHECK(gatt_char_get_service_index_at(0) == 0, "gatt char table: service_index back-reference round trip");
+
+    /* gatt_discover_reset clears both tables again, confirming a
+     * fresh connection's discovery never sees a prior one's leftovers. */
+    fn_gatt_discover_reset();
+    CHECK(gatt_service_get_count() == 0, "gatt discover_reset: service count cleared again");
+    CHECK(gatt_char_get_count() == 0, "gatt discover_reset: char count cleared again");
+}
+
 /* Round 66: diag_ring_state.S's wraparound math (via the native stub
  * added this round to fix a real host_harness link break the ring
  * buffer's own original commit introduced -- see host_stubs.c's own
@@ -1714,6 +1966,8 @@ int main(void) {
     test_lan9512_framing();
     test_hci_framing();
     test_ble_connection_and_att();
+    test_att_discovery();
+    test_gatt_state();
     test_diag_ring();
     test_rtl_reg_setup_framing();
     test_packet_filter();

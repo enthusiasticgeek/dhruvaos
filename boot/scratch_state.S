@@ -439,6 +439,19 @@ dharafs_rename_new_path_scratch_addr:
                          * slot, same reasoning as dharafs_dir_scratch's
                          * own comment on why it can't just reuse
                          * dharafs_path_scratch either. */
+gatt_send_scratch_addr:
+    .word 0             /* 256 bytes -- gatt_att_send's own outgoing
+                         * ACL(4)+L2CAP(4)+ATT PDU buffer (round 66).
+                         * 256 comfortably covers any ATT PDU this
+                         * round's own operations build (max real size
+                         * is Read By Group Type's request/response at
+                         * 7-ish bytes plus a handful of discovered
+                         * entries, nowhere near a real ATT_MTU's own
+                         * upper bound of 247) with headroom to spare. */
+gatt_recv_scratch_addr:
+    .word 0             /* 256 bytes -- gatt_att_recv's own incoming
+                         * buffer, same size/reasoning as gatt_send_
+                         * scratch above. */
 
 .section ".text"
 
@@ -1094,6 +1107,34 @@ sha256_w_scratch_set:
 .global sha256_w_scratch_get
 sha256_w_scratch_get:
     ldr r0, =sha256_w_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global gatt_send_scratch_set
+gatt_send_scratch_set:
+    ldr r1, =gatt_send_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global gatt_send_scratch_get
+gatt_send_scratch_get:
+    ldr r0, =gatt_send_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global gatt_recv_scratch_set
+gatt_recv_scratch_set:
+    ldr r1, =gatt_recv_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global gatt_recv_scratch_get
+gatt_recv_scratch_get:
+    ldr r0, =gatt_recv_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

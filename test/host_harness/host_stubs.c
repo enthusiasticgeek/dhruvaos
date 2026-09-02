@@ -471,6 +471,46 @@ int64_t diag_ring_get_ctxsw_at(int64_t i) { return g_diag_ring_ctxsw[i]; }
 int64_t diag_ring_get_irqs_at(int64_t i) { return g_diag_ring_irqs[i]; }
 int64_t diag_ring_get_priolock_at(int64_t i) { return g_diag_ring_priolock[i]; }
 
+/* Round 66: scratch_state.S's own gatt_send/recv_scratch pointer
+ * slots -- same shape as every other *_scratch_set/get pair in this
+ * file (just a stored pointer, not real ring/table state). */
+static int64_t *g_gatt_send_scratch = 0;
+static int64_t *g_gatt_recv_scratch = 0;
+int64_t gatt_send_scratch_set(int64_t *addr) { g_gatt_send_scratch = addr; return 0; }
+int64_t *gatt_send_scratch_get(void) { return g_gatt_send_scratch; }
+int64_t gatt_recv_scratch_set(int64_t *addr) { g_gatt_recv_scratch = addr; return 0; }
+int64_t *gatt_recv_scratch_get(void) { return g_gatt_recv_scratch; }
+
+/* Round 66: gatt_state.S's own discovered-services/characteristics
+ * tables -- genuinely stateful native reimplementation (matching
+ * g_netif_head/etc's own precedent above), not a dummy stub, since
+ * this state is pure logic independent of the real scheduler/USB
+ * hardware and worth actually testing on the host. */
+static int64_t g_gatt_service_count;
+static uint32_t g_gatt_service_start_handle[8], g_gatt_service_end_handle[8], g_gatt_service_uuid16[8];
+static int64_t g_gatt_char_count;
+static uint32_t g_gatt_char_decl_handle[32], g_gatt_char_properties[32], g_gatt_char_value_handle[32], g_gatt_char_uuid16[32], g_gatt_char_service_index[32];
+int64_t gatt_service_get_count(void) { return g_gatt_service_count; }
+int64_t gatt_service_set_count(uint32_t count) { g_gatt_service_count = count; return 0; }
+int64_t gatt_service_get_start_handle_at(uint32_t i) { return g_gatt_service_start_handle[i % 8]; }
+int64_t gatt_service_set_start_handle_at(uint32_t i, uint32_t v) { g_gatt_service_start_handle[i % 8] = v; return 0; }
+int64_t gatt_service_get_end_handle_at(uint32_t i) { return g_gatt_service_end_handle[i % 8]; }
+int64_t gatt_service_set_end_handle_at(uint32_t i, uint32_t v) { g_gatt_service_end_handle[i % 8] = v; return 0; }
+int64_t gatt_service_get_uuid16_at(uint32_t i) { return g_gatt_service_uuid16[i % 8]; }
+int64_t gatt_service_set_uuid16_at(uint32_t i, uint32_t v) { g_gatt_service_uuid16[i % 8] = v; return 0; }
+int64_t gatt_char_get_count(void) { return g_gatt_char_count; }
+int64_t gatt_char_set_count(uint32_t count) { g_gatt_char_count = count; return 0; }
+int64_t gatt_char_get_decl_handle_at(uint32_t i) { return g_gatt_char_decl_handle[i % 32]; }
+int64_t gatt_char_set_decl_handle_at(uint32_t i, uint32_t v) { g_gatt_char_decl_handle[i % 32] = v; return 0; }
+int64_t gatt_char_get_properties_at(uint32_t i) { return g_gatt_char_properties[i % 32]; }
+int64_t gatt_char_set_properties_at(uint32_t i, uint32_t v) { g_gatt_char_properties[i % 32] = v; return 0; }
+int64_t gatt_char_get_value_handle_at(uint32_t i) { return g_gatt_char_value_handle[i % 32]; }
+int64_t gatt_char_set_value_handle_at(uint32_t i, uint32_t v) { g_gatt_char_value_handle[i % 32] = v; return 0; }
+int64_t gatt_char_get_uuid16_at(uint32_t i) { return g_gatt_char_uuid16[i % 32]; }
+int64_t gatt_char_set_uuid16_at(uint32_t i, uint32_t v) { g_gatt_char_uuid16[i % 32] = v; return 0; }
+int64_t gatt_char_get_service_index_at(uint32_t i) { return g_gatt_char_service_index[i % 32]; }
+int64_t gatt_char_set_service_index_at(uint32_t i, uint32_t v) { g_gatt_char_service_index[i % 32] = v; return 0; }
+
 static uint32_t g_governor_last_mhz;
 static int64_t g_governor_history[4];
 int64_t governor_apply_freq_mhz(int64_t mhz) { g_governor_last_mhz = (uint32_t)mhz; return 0; }
