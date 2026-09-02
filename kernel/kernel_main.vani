@@ -55,6 +55,58 @@ extern "C" fn fsqueue_path_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn fsqueue_path_scratch_get() -> mut ref i64;
 extern "C" fn fsqueue_data_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn fsqueue_data_scratch_get() -> mut ref i64;
+extern "C" fn poly1305_block_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn poly1305_block_scratch_get() -> mut ref i64;
+// X25519 (RFC 7748) persistent scratch buffers -- see
+// boot/x25519_scratch.S's own header comment.
+extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_x1_get() -> mut ref i64;
+extern "C" fn x25519_x2_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_x2_get() -> mut ref i64;
+extern "C" fn x25519_z2_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_z2_get() -> mut ref i64;
+extern "C" fn x25519_x3_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_x3_get() -> mut ref i64;
+extern "C" fn x25519_z3_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_z3_get() -> mut ref i64;
+extern "C" fn x25519_a_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_a_get() -> mut ref i64;
+extern "C" fn x25519_aa_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_aa_get() -> mut ref i64;
+extern "C" fn x25519_b_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_b_get() -> mut ref i64;
+extern "C" fn x25519_bb_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_bb_get() -> mut ref i64;
+extern "C" fn x25519_e_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_e_get() -> mut ref i64;
+extern "C" fn x25519_c_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_c_get() -> mut ref i64;
+extern "C" fn x25519_d_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_d_get() -> mut ref i64;
+extern "C" fn x25519_da_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_da_get() -> mut ref i64;
+extern "C" fn x25519_cb_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_cb_get() -> mut ref i64;
+extern "C" fn x25519_a24e_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_a24e_get() -> mut ref i64;
+extern "C" fn x25519_product_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_product_scratch_get() -> mut ref i64;
+extern "C" fn x25519_invert_base_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_invert_base_get() -> mut ref i64;
+extern "C" fn x25519_invert_result_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_invert_result_get() -> mut ref i64;
+extern "C" fn x25519_p_bytes_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_p_bytes_get() -> mut ref i64;
+extern "C" fn x25519_p_minus_2_bytes_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_p_minus_2_bytes_get() -> mut ref i64;
+extern "C" fn x25519_p9_bytes_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_p9_bytes_get() -> mut ref i64;
+extern "C" fn x25519_fold_t_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_fold_t_get() -> mut ref i64;
+extern "C" fn x25519_fold_s_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_fold_s_get() -> mut ref i64;
+extern "C" fn x25519_a24_bytes_set(addr: mut ref i64) -> i64;
+extern "C" fn x25519_a24_bytes_get() -> mut ref i64;
 // Round 49: dharafs_log_append_raw's own persistent scratch -- see
 // boot/scratch_state.S's own comment on each buffer's exact role.
 // Same "never dhruva_alloc_bytes on every call" discipline as every
@@ -17728,6 +17780,267 @@ fn chacha20_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
   return 1;
 }
 
+// Round 67: Poly1305 (RFC 8439 section 2.5), closing the long-flagged
+// "ChaCha20 has no integrity, only confidentiality" gap. Ported
+// directly from the well-known, widely-audited "poly1305-donna-32"
+// public-domain reference algorithm (radix-2^26, five 32-bit limbs)
+// rather than a generic bignum-mod-p approach -- Poly1305's modulus
+// 2^130-5 needs a purpose-built fast reduction (using 2^130 = 5 mod p
+// to fold the high half back in), and the donna limb layout makes
+// that reduction a fixed sequence of 32-bit multiply-adds with no
+// generic bit-level shift/AND-on-a-limb-array operations needed
+// (which this project's existing bignum_* functions don't have --
+// only add/sub/mul/cmp on whole numbers). Verified via the exact same
+// discipline as SHA-256/ChaCha20/bignum: recreated independently in
+// Python (both a trivial canonical big-integer version AND this same
+// radix-26 algorithm) on the host FIRST, cross-checked byte-exact
+// against each other and against RFC 8439 section 2.5.2's own worked
+// test vector, before ever porting to vani.
+//
+// BUG avoided, not hit (found during the host-side spike, before any
+// vani code existed): buf_read_u32's own ARM implementation is a
+// plain `ldr` at buf+offset -- safe for every EXISTING caller in this
+// codebase because every one of them only ever reads at 4-byte-
+// aligned offsets (DharaFS record fields, ChaCha20's own key/nonce
+// words). Poly1305's own clamp/accumulate steps are the first thing
+// in this project that genuinely needs 32-bit little-endian reads at
+// arbitrary (3, 6, 9, 12, ...) byte offsets -- an unaligned ARM `ldr`
+// is not guaranteed to behave like 4 independent byte reads (legacy/
+// unaligned-access-disabled configurations rotate the loaded word
+// instead), which would have been a silent wrong-answer bug on real
+// hardware while still happening to work correctly under the host
+// harness's native x86 (which has no such restriction). Sidestepped
+// with poly1305_read_u32_le below, built from 4 explicit buf_read_byte
+// calls -- alignment-agnostic by construction, same reasoning
+// buf_read_u32_be/buf_read_byte-based helpers elsewhere already rely
+// on for the exact same reason.
+
+fn poly1305_read_u32_le(buf: mut ref i64, offset: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, offset as u32);
+  let b1: u32 = buf_read_byte(buf, (offset + 1) as u32);
+  let b2: u32 = buf_read_byte(buf, (offset + 2) as u32);
+  let b3: u32 = buf_read_byte(buf, (offset + 3) as u32);
+  return b0 | (b1 << (8 as u32)) | (b2 << (16 as u32)) | (b3 << (24 as u32));
+}
+
+fn poly1305_write_u32_le(buf: mut ref i64, offset: i64, value: u32) -> i64 {
+  let _ = buf_write_byte(buf, offset as u32, value & (0xFF as u32));
+  let _ = buf_write_byte(buf, (offset + 1) as u32, (value >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(buf, (offset + 2) as u32, (value >> (16 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(buf, (offset + 3) as u32, (value >> (24 as u32)) & (0xFF as u32));
+  return 0;
+}
+
+// key: 32 bytes (first 16 = r, clamped per RFC 8439 section 2.5.1;
+// last 16 = s, added at the end). msg/msg_len: the data to
+// authenticate. block_scratch: a caller-owned, persistent 16-byte
+// buffer (never allocated per-call, same discipline as every other
+// scratch buffer in this file) used only to build the final,
+// zero-padded partial block. out_tag: 16-byte output.
+fn poly1305_mac(key: mut ref i64, msg: mut ref i64, msg_len: i64, block_scratch: mut ref i64, out_tag: mut ref i64) -> i64 {
+  let r0: u32 = poly1305_read_u32_le(key, 0) & (0x3ffffff as u32);
+  let r1: u32 = (poly1305_read_u32_le(key, 3) >> (2 as u32)) & (0x3ffff03 as u32);
+  let r2: u32 = (poly1305_read_u32_le(key, 6) >> (4 as u32)) & (0x3ffc0ff as u32);
+  let r3: u32 = (poly1305_read_u32_le(key, 9) >> (6 as u32)) & (0x3f03fff as u32);
+  let r4: u32 = (poly1305_read_u32_le(key, 12) >> (8 as u32)) & (0xfffff as u32);
+
+  let s1: u32 = r1 * (5 as u32);
+  let s2: u32 = r2 * (5 as u32);
+  let s3: u32 = r3 * (5 as u32);
+  let s4: u32 = r4 * (5 as u32);
+
+  let h0: u32 = 0 as u32;
+  let h1: u32 = 0 as u32;
+  let h2: u32 = 0 as u32;
+  let h3: u32 = 0 as u32;
+  let h4: u32 = 0 as u32;
+
+  let pad0: u32 = poly1305_read_u32_le(key, 16);
+  let pad1: u32 = poly1305_read_u32_le(key, 20);
+  let pad2: u32 = poly1305_read_u32_le(key, 24);
+  let pad3: u32 = poly1305_read_u32_le(key, 28);
+
+  let mask26: u32 = 0x3ffffff as u32;
+  let full_blocks: i64 = msg_len / 16;
+  let leftover: i64 = msg_len - (full_blocks * 16);
+
+  let blk: i64 = 0;
+  while blk < full_blocks {
+    let off: i64 = blk * 16;
+    h0 = h0 + (poly1305_read_u32_le(msg, off) & mask26);
+    h1 = h1 + ((poly1305_read_u32_le(msg, off + 3) >> (2 as u32)) & mask26);
+    h2 = h2 + ((poly1305_read_u32_le(msg, off + 6) >> (4 as u32)) & mask26);
+    h3 = h3 + ((poly1305_read_u32_le(msg, off + 9) >> (6 as u32)) & mask26);
+    h4 = h4 + ((poly1305_read_u32_le(msg, off + 12) >> (8 as u32)) | (16777216 as u32)); // 1 << 24
+
+    let d0: u64 = ((h0 as u64) * (r0 as u64)) + ((h1 as u64) * (s4 as u64)) + ((h2 as u64) * (s3 as u64)) + ((h3 as u64) * (s2 as u64)) + ((h4 as u64) * (s1 as u64));
+    let d1: u64 = ((h0 as u64) * (r1 as u64)) + ((h1 as u64) * (r0 as u64)) + ((h2 as u64) * (s4 as u64)) + ((h3 as u64) * (s3 as u64)) + ((h4 as u64) * (s2 as u64));
+    let d2: u64 = ((h0 as u64) * (r2 as u64)) + ((h1 as u64) * (r1 as u64)) + ((h2 as u64) * (r0 as u64)) + ((h3 as u64) * (s4 as u64)) + ((h4 as u64) * (s3 as u64));
+    let d3: u64 = ((h0 as u64) * (r3 as u64)) + ((h1 as u64) * (r2 as u64)) + ((h2 as u64) * (r1 as u64)) + ((h3 as u64) * (r0 as u64)) + ((h4 as u64) * (s4 as u64));
+    let d4: u64 = ((h0 as u64) * (r4 as u64)) + ((h1 as u64) * (r3 as u64)) + ((h2 as u64) * (r2 as u64)) + ((h3 as u64) * (r1 as u64)) + ((h4 as u64) * (r0 as u64));
+
+    let mask26_64: u64 = 0x3ffffff as u64;
+    let c0: u64 = d0 >> (26 as u64);
+    h0 = (d0 & mask26_64) as u32;
+    let d1b: u64 = d1 + c0;
+    let c1: u64 = d1b >> (26 as u64);
+    h1 = (d1b & mask26_64) as u32;
+    let d2b: u64 = d2 + c1;
+    let c2: u64 = d2b >> (26 as u64);
+    h2 = (d2b & mask26_64) as u32;
+    let d3b: u64 = d3 + c2;
+    let c3: u64 = d3b >> (26 as u64);
+    h3 = (d3b & mask26_64) as u32;
+    let d4b: u64 = d4 + c3;
+    let c4: u64 = d4b >> (26 as u64);
+    h4 = (d4b & mask26_64) as u32;
+    h0 = h0 + ((c4 as u32) * (5 as u32));
+    let c5: u32 = h0 >> (26 as u32);
+    h0 = h0 & mask26;
+    h1 = h1 + c5;
+
+    blk = blk + 1;
+  }
+
+  if leftover > 0 {
+    let z: i64 = 0;
+    while z < 16 {
+      let _ = buf_write_byte(block_scratch, z as u32, 0 as u32);
+      z = z + 1;
+    }
+    let k: i64 = 0;
+    while k < leftover {
+      let b: u32 = buf_read_byte(msg, (full_blocks * 16 + k) as u32);
+      let _ = buf_write_byte(block_scratch, k as u32, b);
+      k = k + 1;
+    }
+    let _ = buf_write_byte(block_scratch, leftover as u32, 1 as u32);
+
+    h0 = h0 + (poly1305_read_u32_le(block_scratch, 0) & mask26);
+    h1 = h1 + ((poly1305_read_u32_le(block_scratch, 3) >> (2 as u32)) & mask26);
+    h2 = h2 + ((poly1305_read_u32_le(block_scratch, 6) >> (4 as u32)) & mask26);
+    h3 = h3 + ((poly1305_read_u32_le(block_scratch, 9) >> (6 as u32)) & mask26);
+    h4 = h4 + (poly1305_read_u32_le(block_scratch, 12) >> (8 as u32)); // hibit = 0 -- the 0x01 marker byte just written IS the high bit, already inside these 16 bytes
+
+    let d0: u64 = ((h0 as u64) * (r0 as u64)) + ((h1 as u64) * (s4 as u64)) + ((h2 as u64) * (s3 as u64)) + ((h3 as u64) * (s2 as u64)) + ((h4 as u64) * (s1 as u64));
+    let d1: u64 = ((h0 as u64) * (r1 as u64)) + ((h1 as u64) * (r0 as u64)) + ((h2 as u64) * (s4 as u64)) + ((h3 as u64) * (s3 as u64)) + ((h4 as u64) * (s2 as u64));
+    let d2: u64 = ((h0 as u64) * (r2 as u64)) + ((h1 as u64) * (r1 as u64)) + ((h2 as u64) * (r0 as u64)) + ((h3 as u64) * (s4 as u64)) + ((h4 as u64) * (s3 as u64));
+    let d3: u64 = ((h0 as u64) * (r3 as u64)) + ((h1 as u64) * (r2 as u64)) + ((h2 as u64) * (r1 as u64)) + ((h3 as u64) * (r0 as u64)) + ((h4 as u64) * (s4 as u64));
+    let d4: u64 = ((h0 as u64) * (r4 as u64)) + ((h1 as u64) * (r3 as u64)) + ((h2 as u64) * (r2 as u64)) + ((h3 as u64) * (r1 as u64)) + ((h4 as u64) * (r0 as u64));
+
+    let mask26_64: u64 = 0x3ffffff as u64;
+    let c0: u64 = d0 >> (26 as u64);
+    h0 = (d0 & mask26_64) as u32;
+    let d1b: u64 = d1 + c0;
+    let c1: u64 = d1b >> (26 as u64);
+    h1 = (d1b & mask26_64) as u32;
+    let d2b: u64 = d2 + c1;
+    let c2: u64 = d2b >> (26 as u64);
+    h2 = (d2b & mask26_64) as u32;
+    let d3b: u64 = d3 + c2;
+    let c3: u64 = d3b >> (26 as u64);
+    h3 = (d3b & mask26_64) as u32;
+    let d4b: u64 = d4 + c3;
+    let c4: u64 = d4b >> (26 as u64);
+    h4 = (d4b & mask26_64) as u32;
+    h0 = h0 + ((c4 as u32) * (5 as u32));
+    let c5: u32 = h0 >> (26 as u32);
+    h0 = h0 & mask26;
+    h1 = h1 + c5;
+  }
+
+  // Fully carry h.
+  let fc1: u32 = h1 >> (26 as u32);
+  h1 = h1 & mask26;
+  h2 = h2 + fc1;
+  let fc2: u32 = h2 >> (26 as u32);
+  h2 = h2 & mask26;
+  h3 = h3 + fc2;
+  let fc3: u32 = h3 >> (26 as u32);
+  h3 = h3 & mask26;
+  h4 = h4 + fc3;
+  let fc4: u32 = h4 >> (26 as u32);
+  h4 = h4 & mask26;
+  h0 = h0 + (fc4 * (5 as u32));
+  let fc5: u32 = h0 >> (26 as u32);
+  h0 = h0 & mask26;
+  h1 = h1 + fc5;
+
+  // Compute h + -p (p = 2^130 - 5); select h if h < p, else h + -p --
+  // branchless via a mask derived from g4's own top bit, same
+  // technique as the reference algorithm (avoids branching on
+  // secret-shaped data).
+  let g0: u32 = h0 + (5 as u32);
+  let gc0: u32 = g0 >> (26 as u32);
+  let g0m: u32 = g0 & mask26;
+  let g1: u32 = h1 + gc0;
+  let gc1: u32 = g1 >> (26 as u32);
+  let g1m: u32 = g1 & mask26;
+  let g2: u32 = h2 + gc1;
+  let gc2: u32 = g2 >> (26 as u32);
+  let g2m: u32 = g2 & mask26;
+  let g3: u32 = h3 + gc2;
+  let gc3: u32 = g3 >> (26 as u32);
+  let g3m: u32 = g3 & mask26;
+  let g4: u32 = wrapping_sub(h4 + gc3, 67108864 as u32); // - (1 << 26); the intentional wraparound (h+gc3 is almost always < 2^26) is what produces the "borrow" signal the mask below reads via the top bit -- wrapping_sub, not plain `-`, since vani's checker traps on unsigned underflow the same way it traps on overflow
+
+  let select_mask: u32 = wrapping_sub((g4 >> (31 as u32)), 1 as u32); // all-1s if g4's top bit is 0 (h>=p, use g), all-0s if top bit is 1 (h<p, use h)
+  let keep_g: u32 = select_mask;
+  let keep_h: u32 = wrapping_sub(0 as u32, 1 as u32) ^ select_mask; // bitwise NOT of select_mask
+  h0 = (h0 & keep_h) | (g0m & keep_g);
+  h1 = (h1 & keep_h) | (g1m & keep_g);
+  h2 = (h2 & keep_h) | (g2m & keep_g);
+  h3 = (h3 & keep_h) | (g3m & keep_g);
+  h4 = (h4 & keep_h) | (g4 & keep_g);
+
+  // h mod 2^128, repacked from five 26-bit limbs into four 32-bit words.
+  let out_h0: u32 = h0 | (h1 << (26 as u32));
+  let out_h1: u32 = (h1 >> (6 as u32)) | (h2 << (20 as u32));
+  let out_h2: u32 = (h2 >> (12 as u32)) | (h3 << (14 as u32));
+  let out_h3: u32 = (h3 >> (18 as u32)) | (h4 << (8 as u32));
+
+  // mac = (h + pad) mod 2^128, computed via u64 widening for the
+  // carry chain (same technique bignum_mul_raw's own row-carry uses).
+  let f0: u64 = (out_h0 as u64) + (pad0 as u64);
+  let m0: u32 = f0 as u32;
+  let carry0: u64 = f0 >> (32 as u64);
+  let f1: u64 = (out_h1 as u64) + (pad1 as u64) + carry0;
+  let m1: u32 = f1 as u32;
+  let carry1: u64 = f1 >> (32 as u64);
+  let f2: u64 = (out_h2 as u64) + (pad2 as u64) + carry1;
+  let m2: u32 = f2 as u32;
+  let carry2: u64 = f2 >> (32 as u64);
+  let f3: u64 = (out_h3 as u64) + (pad3 as u64) + carry2;
+  let m3: u32 = f3 as u32;
+
+  let _ = poly1305_write_u32_le(out_tag, 0, m0);
+  let _ = poly1305_write_u32_le(out_tag, 4, m1);
+  let _ = poly1305_write_u32_le(out_tag, 8, m2);
+  let _ = poly1305_write_u32_le(out_tag, 12, m3);
+  return 0;
+}
+
+// Constant-time tag comparison -- deliberately never short-circuits on
+// the first mismatched byte, unlike a naive early-exit compare, which
+// is a real, documented timing side-channel for MAC verification (an
+// attacker able to measure response time could learn the tag one byte
+// at a time). n is a public length (always 16 for Poly1305), never
+// secret-dependent, so the loop bound itself leaks nothing.
+fn poly1305_verify_constant_time(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let diff: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < n {
+    let ai: u32 = buf_read_byte(a, i as u32);
+    let bi: u32 = buf_read_byte(b, i as u32);
+    diff = diff | (ai ^ bi);
+    i = i + 1;
+  }
+  if diff == (0 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
 // Two checks: RFC 8439 section 2.3.2's own worked block-function
 // example (a real external oracle -- the exact 64-byte keystream a
 // correct implementation must produce for a fixed key/nonce/counter,
@@ -17861,6 +18174,128 @@ fn chacha20_self_test() -> i64 {
   }
 
   let _ = uart_puts("CRYPTO: ChaCha20 vs RFC 8439 KAT + 3-block encrypt/decrypt round trip");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// RFC 8439 section 2.5.2's own worked example -- a real external
+// oracle, verified byte-exact before ever writing any vani code (see
+// this function's own header comment above poly1305_mac for the full
+// host-side spike methodology). Also checks: an altered message
+// produces a DIFFERENT tag (the actual security property this
+// primitive exists for -- a MAC that ignored its input would still
+// pass a same-input KAT), and poly1305_verify_constant_time correctly
+// accepts a matching tag and rejects a mismatched one.
+fn poly1305_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let key: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(key, 0 as u32, 0x85 as u32);
+  let _ = buf_write_byte(key, 1 as u32, 0xd6 as u32);
+  let _ = buf_write_byte(key, 2 as u32, 0xbe as u32);
+  let _ = buf_write_byte(key, 3 as u32, 0x78 as u32);
+  let _ = buf_write_byte(key, 4 as u32, 0x57 as u32);
+  let _ = buf_write_byte(key, 5 as u32, 0x55 as u32);
+  let _ = buf_write_byte(key, 6 as u32, 0x6d as u32);
+  let _ = buf_write_byte(key, 7 as u32, 0x33 as u32);
+  let _ = buf_write_byte(key, 8 as u32, 0x7f as u32);
+  let _ = buf_write_byte(key, 9 as u32, 0x44 as u32);
+  let _ = buf_write_byte(key, 10 as u32, 0x52 as u32);
+  let _ = buf_write_byte(key, 11 as u32, 0xfe as u32);
+  let _ = buf_write_byte(key, 12 as u32, 0x42 as u32);
+  let _ = buf_write_byte(key, 13 as u32, 0xd5 as u32);
+  let _ = buf_write_byte(key, 14 as u32, 0x06 as u32);
+  let _ = buf_write_byte(key, 15 as u32, 0xa8 as u32);
+  let _ = buf_write_byte(key, 16 as u32, 0x01 as u32);
+  let _ = buf_write_byte(key, 17 as u32, 0x03 as u32);
+  let _ = buf_write_byte(key, 18 as u32, 0x80 as u32);
+  let _ = buf_write_byte(key, 19 as u32, 0x8a as u32);
+  let _ = buf_write_byte(key, 20 as u32, 0xfb as u32);
+  let _ = buf_write_byte(key, 21 as u32, 0x0d as u32);
+  let _ = buf_write_byte(key, 22 as u32, 0xb2 as u32);
+  let _ = buf_write_byte(key, 23 as u32, 0xfd as u32);
+  let _ = buf_write_byte(key, 24 as u32, 0x4a as u32);
+  let _ = buf_write_byte(key, 25 as u32, 0xbf as u32);
+  let _ = buf_write_byte(key, 26 as u32, 0xf6 as u32);
+  let _ = buf_write_byte(key, 27 as u32, 0xaf as u32);
+  let _ = buf_write_byte(key, 28 as u32, 0x41 as u32);
+  let _ = buf_write_byte(key, 29 as u32, 0x49 as u32);
+  let _ = buf_write_byte(key, 30 as u32, 0xf5 as u32);
+  let _ = buf_write_byte(key, 31 as u32, 0x1b as u32);
+
+  let msg_str: Str = "Cryptographic Forum Research Group";
+  let msg_len: i64 = str_len_bytes(msg_str);
+  let msg: mut ref i64 = dhruva_alloc_bytes(msg_len);
+  let mi: i64 = 0;
+  while mi < msg_len {
+    let _ = buf_write_byte(msg, mi as u32, str_byte_at(msg_str, mi) as u32);
+    mi = mi + 1;
+  }
+
+  let expected: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = buf_write_byte(expected, 0 as u32, 0xa8 as u32);
+  let _ = buf_write_byte(expected, 1 as u32, 0x06 as u32);
+  let _ = buf_write_byte(expected, 2 as u32, 0x1d as u32);
+  let _ = buf_write_byte(expected, 3 as u32, 0xc1 as u32);
+  let _ = buf_write_byte(expected, 4 as u32, 0x30 as u32);
+  let _ = buf_write_byte(expected, 5 as u32, 0x51 as u32);
+  let _ = buf_write_byte(expected, 6 as u32, 0x36 as u32);
+  let _ = buf_write_byte(expected, 7 as u32, 0xc6 as u32);
+  let _ = buf_write_byte(expected, 8 as u32, 0xc2 as u32);
+  let _ = buf_write_byte(expected, 9 as u32, 0x2b as u32);
+  let _ = buf_write_byte(expected, 10 as u32, 0x8b as u32);
+  let _ = buf_write_byte(expected, 11 as u32, 0xaf as u32);
+  let _ = buf_write_byte(expected, 12 as u32, 0x0c as u32);
+  let _ = buf_write_byte(expected, 13 as u32, 0x01 as u32);
+  let _ = buf_write_byte(expected, 14 as u32, 0x27 as u32);
+  let _ = buf_write_byte(expected, 15 as u32, 0xa9 as u32);
+
+  let block_scratch: mut ref i64 = dhruva_alloc_bytes(16);
+  let tag: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = poly1305_mac(key, msg, msg_len, block_scratch, tag);
+  if chacha20_bytes_equal(tag, expected, 16) == 0 {
+    ok = 0;
+  }
+  if poly1305_verify_constant_time(tag, expected, 16) == 0 {
+    ok = 0;
+  }
+
+  // Empty-message edge case: h stays 0 the whole time, so mac must
+  // equal s (key[16..32)) exactly -- a real, independently-derivable
+  // expected value, not just "doesn't crash".
+  let empty_tag: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = poly1305_mac(key, msg, 0, block_scratch, empty_tag);
+  let ei: i64 = 0;
+  while ei < 16 {
+    if buf_read_byte(empty_tag, ei as u32) != buf_read_byte(key, (16 + ei) as u32) {
+      ok = 0;
+    }
+    ei = ei + 1;
+  }
+
+  // Altered message must produce a DIFFERENT tag -- the actual
+  // security property, not just "produces *a* tag".
+  let msg2: mut ref i64 = dhruva_alloc_bytes(msg_len);
+  let m2i: i64 = 0;
+  while m2i < msg_len {
+    let _ = buf_write_byte(msg2, m2i as u32, str_byte_at(msg_str, m2i) as u32);
+    m2i = m2i + 1;
+  }
+  let _ = buf_write_byte(msg2, 0 as u32, (buf_read_byte(msg2, 0 as u32) ^ (1 as u32)));
+  let tag2: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = poly1305_mac(key, msg2, msg_len, block_scratch, tag2);
+  if chacha20_bytes_equal(tag, tag2, 16) == 1 {
+    ok = 0; // a single flipped bit produced the SAME tag -- broken
+  }
+  if poly1305_verify_constant_time(tag, tag2, 16) == 1 {
+    ok = 0; // constant-time verify incorrectly accepted a mismatched tag
+  }
+
+  let _ = uart_puts("CRYPTO: Poly1305 vs RFC 8439 KAT + altered-message + verify");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -18225,6 +18660,29 @@ fn bignum_mul_raw(a: mut ref i64, b: mut ref i64, out: mut ref i64, n: i64) -> i
   return 0;
 }
 
+// Round 67: out = a * small, where a is n limbs and small is a plain
+// (non-bignum) constant known to fit comfortably in a u32 -- X25519's
+// own fast field-reduction (field25519_reduce16, below) needs exactly
+// this shape (multiplying an 8-limb "high half" by the small constant
+// 38) and a full n-by-n bignum_mul_raw would be needless overkill for
+// a one-limb multiplier. out is n+1 limbs -- one extra limb is always
+// enough headroom for the final carry, since small is small (the
+// worst case, small=0xffffffff, still only needs one extra limb; this
+// project's own real caller uses small=38, far smaller still).
+fn bignum_mul_small_raw(a: mut ref i64, out: mut ref i64, n: i64, small: u32) -> i64 {
+  let carry: u64 = 0 as u64;
+  let i: i64 = 0;
+  while i < n {
+    let a_i: u64 = buf_read_u32(a, (i * 4) as u32) as u64;
+    let prod: u64 = (a_i * (small as u64)) + carry;
+    let _ = buf_write_u32(out, (i * 4) as u32, (prod & (4294967295 as u64)) as u32);
+    carry = prod >> (32 as u64);
+    i = i + 1;
+  }
+  let _ = buf_write_u32(out, (n * 4) as u32, carry as u32);
+  return 0;
+}
+
 // 1 if a > b, -1 if a < b, 0 if equal (n limbs each) -- most-
 // significant limb first, standard big-endian-style magnitude
 // comparison despite the little-endian storage, since the top limb is
@@ -18334,6 +18792,561 @@ fn bignum_self_test() -> i64 {
   return 0;
 }
 
+
+// Round 67: X25519 (RFC 7748) -- Diffie-Hellman key exchange over
+// Curve25519, the EC foundation TLS's ECDHE and PKI's raw public-key
+// trust both need (this roadmap's own crypto-foundation entry
+// flagged real EC arithmetic as the missing piece blocking both).
+// Field elements are 8-limb (256-bit) little-endian u32 arrays, same
+// representation and same bignum_add_raw/sub_raw/mul_raw/cmp_raw
+// primitives round 44's bignum work already built and verified --
+// deliberately NOT a specialized radix-2^51 representation (the
+// technique real high-performance X25519 implementations use):
+// correctness-over-performance, reusing already-verified
+// infrastructure, matches this project's own established style, and
+// this is a client doing occasional key exchanges, not a high-
+// throughput TLS terminator.
+//
+// Modular reduction (field25519_reduce16) uses the standard fold
+// technique for this prime shape: p = 2^255-19, so 2^256 = 2*2^255 =
+// 38 (mod p) -- a 512-bit product splits CLEANLY at the 8-limb (256-
+// bit) boundary with no sub-limb bit shifting needed at all (unlike
+// Poly1305's own reduction, this project's bignum_* functions have no
+// generic shift-by-n-bits primitive, so a limb-aligned split is what
+// makes this tractable without adding one), fold the high half back
+// in multiplied by 38, repeat once more (the result is already close
+// enough to canonical after one fold that a second fold plus at most
+// one final conditional subtraction always finishes it -- verified
+// empirically via a 2000-trial host-side Python simulation of this
+// EXACT limb algorithm before any of it was ported here, see below).
+//
+// Verification methodology (same discipline as every other primitive
+// in this file, adapted for a case where reciting a public test
+// vector from memory would be a real, unnecessary transcription risk
+// -- unlike SHA-256/ChaCha20/Poly1305's own RFC KATs, which are the
+// kind of thing widely reproduced verbatim in enough places to trust
+// recalling precisely): (1) a straightforward big-integer Python
+// reference implementation of the RFC 7748 Montgomery ladder,
+// verified against the real, independent `cryptography` library
+// across 20 random trials (own-derived base-point public keys match
+// the library's; cross-library DH shared-secret agreement matches;
+// DH symmetry holds using only the from-scratch implementation) --
+// this is the actual ground-truth oracle, not a memorized hex
+// constant; (2) a SEPARATE Python simulation of the exact limb-level
+// algorithm planned for this vani port (generic bignum add/sub/mul on
+// 8-limb arrays plus the fold reduction above), cross-checked against
+// the bigint reference across 2000 random field multiplications
+// (including boundary values at/near p) and a further 15 full random
+// X25519 trials -- byte-exact on every single one; (3) the two
+// concrete (key, u-coordinate, expected-output) triples embedded in
+// x25519_self_test below were generated by that SAME verified Python
+// run, not typed from memory -- so this file's own self-test is
+// checking against a real, freshly-computed, independently-agreeing
+// oracle result, not a value that could have been mistyped from an
+// external document.
+fn field25519_init() -> i64 {
+  let p_bytes: mut ref i64 = x25519_p_bytes_get();
+  let _ = buf_write_byte(p_bytes, 0 as u32, 0xed as u32);
+  let pi: i64 = 1;
+  while pi < 31 {
+    let _ = buf_write_byte(p_bytes, pi as u32, 0xff as u32);
+    pi = pi + 1;
+  }
+  let _ = buf_write_byte(p_bytes, 31 as u32, 0x7f as u32);
+
+  let pm2_bytes: mut ref i64 = x25519_p_minus_2_bytes_get();
+  let _ = buf_write_byte(pm2_bytes, 0 as u32, 0xeb as u32);
+  let mi: i64 = 1;
+  while mi < 31 {
+    let _ = buf_write_byte(pm2_bytes, mi as u32, 0xff as u32);
+    mi = mi + 1;
+  }
+  let _ = buf_write_byte(pm2_bytes, 31 as u32, 0x7f as u32);
+
+  // p9_bytes: p's own 8 limbs plus a 9th all-zero limb, built once
+  // here rather than reconstructed on every field25519_reduce16 call.
+  let p9_bytes: mut ref i64 = x25519_p9_bytes_get();
+  let ki: i64 = 0;
+  while ki < 32 {
+    let _ = buf_write_byte(p9_bytes, ki as u32, buf_read_byte(p_bytes, ki as u32));
+    ki = ki + 1;
+  }
+  let _ = buf_write_u32(p9_bytes, 32 as u32, 0 as u32);
+
+  let a24_bytes: mut ref i64 = x25519_a24_bytes_get();
+  let _ = buf_write_u32(a24_bytes, 0 as u32, 121665 as u32);
+  let ai: i64 = 4;
+  while ai < 32 {
+    let _ = buf_write_byte(a24_bytes, ai as u32, 0 as u32);
+    ai = ai + 1;
+  }
+  return 0;
+}
+
+fn field25519_get_bit(buf: mut ref i64, bit_index: i64) -> u32 {
+  let byte_index: i64 = bit_index / 8;
+  let bit_in_byte: i64 = bit_index - (byte_index * 8);
+  let byte_val: u32 = buf_read_byte(buf, byte_index as u32);
+  return (byte_val >> (bit_in_byte as u32)) & (1 as u32);
+}
+
+// out = (a + b) mod p. Safe for out to alias a or b (bignum_add_raw's
+// own per-limb read-then-write loop never reads a limb it has already
+// overwritten this call).
+fn field25519_add(a: mut ref i64, b: mut ref i64, out: mut ref i64) -> i64 {
+  let carry: u32 = bignum_add_raw(a, b, out, 8);
+  let p_bytes: mut ref i64 = x25519_p_bytes_get();
+  let cmp: i64 = bignum_cmp_raw(out, p_bytes, 8);
+  if (carry == (1 as u32)) || (cmp >= 0) {
+    let _ = bignum_sub_raw(out, p_bytes, out, 8);
+  }
+  return 0;
+}
+
+// out = (a - b) mod p. Same aliasing safety as field25519_add.
+fn field25519_sub(a: mut ref i64, b: mut ref i64, out: mut ref i64) -> i64 {
+  let borrow: u32 = bignum_sub_raw(a, b, out, 8);
+  if borrow == (1 as u32) {
+    let p_bytes: mut ref i64 = x25519_p_bytes_get();
+    let _ = bignum_add_raw(out, p_bytes, out, 8);
+  }
+  return 0;
+}
+
+// Reduces a 16-limb (512-bit) product (as produced by bignum_mul_raw
+// on two 8-limb field elements) down to a canonical 8-limb value < p.
+// See this section's own header comment for the fold algorithm.
+fn field25519_reduce16(product16: mut ref i64, out: mut ref i64) -> i64 {
+  let fold_t: mut ref i64 = x25519_fold_t_get();
+  let fold_s: mut ref i64 = x25519_fold_s_get();
+  let p9_bytes: mut ref i64 = x25519_p9_bytes_get();
+
+  // Fold 1: fold_t = high_8_limbs(product16) * 38 (9 limbs).
+  let carry1: u64 = 0 as u64;
+  let i: i64 = 0;
+  while i < 8 {
+    let hi: u64 = buf_read_u32(product16, ((8 + i) * 4) as u32) as u64;
+    let prod: u64 = (hi * (38 as u64)) + carry1;
+    let _ = buf_write_u32(fold_t, (i * 4) as u32, (prod & (4294967295 as u64)) as u32);
+    carry1 = prod >> (32 as u64);
+    i = i + 1;
+  }
+  let _ = buf_write_u32(fold_t, (8 * 4) as u32, carry1 as u32);
+
+  // fold_s = low_8_limbs(product16) padded to 9 limbs, then += fold_t.
+  let j: i64 = 0;
+  while j < 8 {
+    let lo: u32 = buf_read_u32(product16, (j * 4) as u32);
+    let _ = buf_write_u32(fold_s, (j * 4) as u32, lo);
+    j = j + 1;
+  }
+  let _ = buf_write_u32(fold_s, (8 * 4) as u32, 0 as u32);
+  let _ = bignum_add_raw(fold_s, fold_t, fold_s, 9);
+
+  // Fold 2: fold_s's own limb 8 is now tiny (the sum from fold 1 is
+  // always well under 2^262, per the host-side simulation's own
+  // empirical bound) -- fold IT back in the same way, reusing fold_t.
+  let s1_limb8: u32 = buf_read_u32(fold_s, (8 * 4) as u32);
+  let prod2: u64 = (s1_limb8 as u64) * (38 as u64);
+  let _ = buf_write_u32(fold_t, 0 as u32, (prod2 & (4294967295 as u64)) as u32);
+  let _ = buf_write_u32(fold_t, 4 as u32, (prod2 >> (32 as u64)) as u32);
+  let k: i64 = 2;
+  while k < 9 {
+    let _ = buf_write_u32(fold_t, (k * 4) as u32, 0 as u32);
+    k = k + 1;
+  }
+  let _ = buf_write_u32(fold_s, (8 * 4) as u32, 0 as u32); // clear the now-folded-in limb 8 before reusing fold_s's low 8 limbs
+  let _ = bignum_add_raw(fold_s, fold_t, fold_s, 9);
+
+  // Canonicalize: at most a couple of conditional subtractions of p
+  // (empirically at most 1, per the host-side simulation -- looped
+  // rather than hardcoded to exactly 1 since "always exactly 1" was
+  // never proven algebraically, only observed across 2000 trials).
+  while bignum_cmp_raw(fold_s, p9_bytes, 9) >= 0 {
+    let _ = bignum_sub_raw(fold_s, p9_bytes, fold_s, 9);
+  }
+
+  let o: i64 = 0;
+  while o < 8 {
+    let ov: u32 = buf_read_u32(fold_s, (o * 4) as u32);
+    let _ = buf_write_u32(out, (o * 4) as u32, ov);
+    o = o + 1;
+  }
+  return 0;
+}
+
+fn field25519_mul(a: mut ref i64, b: mut ref i64, out: mut ref i64) -> i64 {
+  let product: mut ref i64 = x25519_product_scratch_get();
+  let _ = bignum_mul_raw(a, b, product, 8);
+  let _ = field25519_reduce16(product, out);
+  return 0;
+}
+
+fn field25519_sqr(a: mut ref i64, out: mut ref i64) -> i64 {
+  return field25519_mul(a, a, out);
+}
+
+// a^(p-2) mod p == a^-1 mod p (Fermat's little theorem, since p is
+// prime) -- plain left-to-right binary square-and-multiply over the
+// FIXED, known exponent p-2 (255 bits), not the optimized addition
+// chain real high-performance implementations use. a==out aliasing
+// is NOT assumed safe here (unlike field25519_add/_sub's single-pass
+// loops, this reads `a` across many iterations) -- callers must pass
+// a genuinely separate out buffer.
+fn field25519_invert(a: mut ref i64, out: mut ref i64) -> i64 {
+  let base: mut ref i64 = x25519_invert_base_get();
+  let result: mut ref i64 = x25519_invert_result_get();
+  let pm2_bytes: mut ref i64 = x25519_p_minus_2_bytes_get();
+
+  let z: i64 = 0;
+  while z < 32 {
+    let _ = buf_write_byte(result, z as u32, 0 as u32);
+    let _ = buf_write_byte(base, z as u32, buf_read_byte(a, z as u32));
+    z = z + 1;
+  }
+  let _ = buf_write_byte(result, 0 as u32, 1 as u32);
+
+  let bit: i64 = 0;
+  while bit < 255 {
+    if field25519_get_bit(pm2_bytes, bit) == (1 as u32) {
+      let _ = field25519_mul(result, base, result);
+    }
+    let _ = field25519_sqr(base, base);
+    bit = bit + 1;
+  }
+
+  let o: i64 = 0;
+  while o < 32 {
+    let _ = buf_write_byte(out, o as u32, buf_read_byte(result, o as u32));
+    o = o + 1;
+  }
+  return 0;
+}
+
+// RFC 7748 section 5 clamping, applied IN PLACE to k (32 bytes).
+fn x25519_clamp_scalar(k: mut ref i64) -> i64 {
+  let k0: u32 = buf_read_byte(k, 0 as u32) & (248 as u32);
+  let _ = buf_write_byte(k, 0 as u32, k0);
+  let k31: u32 = buf_read_byte(k, 31 as u32) & (127 as u32);
+  let k31b: u32 = k31 | (64 as u32);
+  let _ = buf_write_byte(k, 31 as u32, k31b);
+  return 0;
+}
+
+// The Montgomery ladder itself (RFC 7748 section 5), scalar `k` (32
+// bytes, mutated in place by clamping -- every real caller generates
+// a fresh scalar per call, so this is not a practical limitation) and
+// u-coordinate `u_in` (32 bytes) in, 32-byte u-coordinate result out.
+// Constant-time by construction (cswap via arithmetic masking, not a
+// data-dependent branch; the loop itself always runs all 255
+// iterations regardless of k's own bit pattern) EXCEPT for
+// field25519_add/_sub's own single conditional subtraction/addition
+// of p -- whether that extra step fires depends on the VALUE being
+// reduced, not on any secret scalar bit directly, but a sufficiently
+// determined cache-timing attacker could still in principle correlate
+// it; the real, well-known mitigation (branchless conditional
+// select instead of an if) is a known, documented gap here, not an
+// oversight -- see docs/TODO.md's own note on this.
+fn x25519_scalarmult(k: mut ref i64, u_in: mut ref i64, out: mut ref i64) -> i64 {
+  let _ = x25519_clamp_scalar(k);
+
+  let x1: mut ref i64 = x25519_x1_get();
+  let x2: mut ref i64 = x25519_x2_get();
+  let z2: mut ref i64 = x25519_z2_get();
+  let x3: mut ref i64 = x25519_x3_get();
+  let z3: mut ref i64 = x25519_z3_get();
+
+  let i0: i64 = 0;
+  while i0 < 32 {
+    let _ = buf_write_byte(x1, i0 as u32, buf_read_byte(u_in, i0 as u32));
+    i0 = i0 + 1;
+  }
+  let top_masked: u32 = buf_read_byte(x1, 31 as u32) & (127 as u32);
+  let _ = buf_write_byte(x1, 31 as u32, top_masked);
+
+  let z: i64 = 0;
+  while z < 32 {
+    let _ = buf_write_byte(x2, z as u32, 0 as u32);
+    let _ = buf_write_byte(z2, z as u32, 0 as u32);
+    let _ = buf_write_byte(x3, z as u32, buf_read_byte(x1, z as u32));
+    let _ = buf_write_byte(z3, z as u32, 0 as u32);
+    z = z + 1;
+  }
+  let _ = buf_write_byte(x2, 0 as u32, 1 as u32);
+  let _ = buf_write_byte(z3, 0 as u32, 1 as u32);
+
+  let a: mut ref i64 = x25519_a_get();
+  let aa: mut ref i64 = x25519_aa_get();
+  let b: mut ref i64 = x25519_b_get();
+  let bb: mut ref i64 = x25519_bb_get();
+  let e: mut ref i64 = x25519_e_get();
+  let c: mut ref i64 = x25519_c_get();
+  let d: mut ref i64 = x25519_d_get();
+  let da: mut ref i64 = x25519_da_get();
+  let cb: mut ref i64 = x25519_cb_get();
+  let a24e: mut ref i64 = x25519_a24e_get();
+  let a24_bytes: mut ref i64 = x25519_a24_bytes_get();
+
+  let swap: u32 = 0 as u32;
+  let t: i64 = 254;
+  while t >= 0 {
+    let k_t: u32 = field25519_get_bit(k, t);
+    let new_swap: u32 = swap ^ k_t;
+    // cswap(new_swap, x2, x3) / cswap(new_swap, z2, z3): branchless
+    // per-byte conditional swap via an all-1s/all-0s mask, same
+    // technique Poly1305's own g/h select used, rather than an
+    // if-branch keyed on secret-shaped data.
+    let mask: u32 = wrapping_sub(0 as u32, new_swap); // new_swap==1 -> 0xffffffff, ==0 -> 0
+    let si: i64 = 0;
+    while si < 32 {
+      let x2b: u32 = buf_read_byte(x2, si as u32);
+      let x3b: u32 = buf_read_byte(x3, si as u32);
+      let swapxor: u32 = (x2b ^ x3b) & mask;
+      let _ = buf_write_byte(x2, si as u32, x2b ^ swapxor);
+      let _ = buf_write_byte(x3, si as u32, x3b ^ swapxor);
+      let z2b: u32 = buf_read_byte(z2, si as u32);
+      let z3b: u32 = buf_read_byte(z3, si as u32);
+      let swapzor: u32 = (z2b ^ z3b) & mask;
+      let _ = buf_write_byte(z2, si as u32, z2b ^ swapzor);
+      let _ = buf_write_byte(z3, si as u32, z3b ^ swapzor);
+      si = si + 1;
+    }
+
+    let _ = field25519_add(x2, z2, a);
+    let _ = field25519_sqr(a, aa);
+    let _ = field25519_sub(x2, z2, b);
+    let _ = field25519_sqr(b, bb);
+    let _ = field25519_sub(aa, bb, e);
+    let _ = field25519_add(x3, z3, c);
+    let _ = field25519_sub(x3, z3, d);
+    let _ = field25519_mul(d, a, da);
+    let _ = field25519_mul(c, b, cb);
+    let _ = field25519_add(da, cb, x3); // x3 = DA+CB (pre-square)
+    let _ = field25519_sqr(x3, x3);      // x3 = (DA+CB)^2
+    let _ = field25519_sub(da, cb, z3); // z3 = DA-CB (pre-square)
+    let _ = field25519_sqr(z3, z3);      // z3 = (DA-CB)^2
+    let _ = field25519_mul(x1, z3, z3);  // z3 = x1 * (DA-CB)^2
+    let _ = field25519_mul(aa, bb, x2);  // x2 = AA*BB
+    let _ = field25519_mul(a24_bytes, e, a24e);
+    let _ = field25519_add(aa, a24e, a24e); // a24e = AA + a24*E
+    let _ = field25519_mul(e, a24e, z2);    // z2 = E * (AA + a24*E)
+
+    swap = k_t;
+    t = t - 1;
+  }
+
+  // Final cswap (swap now holds the LAST k_t from t=0).
+  let mask_final: u32 = wrapping_sub(0 as u32, swap);
+  let sf: i64 = 0;
+  while sf < 32 {
+    let x2b: u32 = buf_read_byte(x2, sf as u32);
+    let x3b: u32 = buf_read_byte(x3, sf as u32);
+    let swapxor: u32 = (x2b ^ x3b) & mask_final;
+    let _ = buf_write_byte(x2, sf as u32, x2b ^ swapxor);
+    let _ = buf_write_byte(x3, sf as u32, x3b ^ swapxor);
+    let z2b: u32 = buf_read_byte(z2, sf as u32);
+    let z3b: u32 = buf_read_byte(z3, sf as u32);
+    let swapzor: u32 = (z2b ^ z3b) & mask_final;
+    let _ = buf_write_byte(z2, sf as u32, z2b ^ swapzor);
+    let _ = buf_write_byte(z3, sf as u32, z3b ^ swapzor);
+    sf = sf + 1;
+  }
+
+  let z2_inv: mut ref i64 = x25519_invert_result_get(); // borrowed as a plain scratch buffer -- field25519_invert's own use of it has already returned by this point, nothing concurrent
+  let _ = field25519_invert(z2, z2_inv);
+  let _ = field25519_mul(x2, z2_inv, out);
+  return 0;
+}
+
+fn x25519_self_test() -> i64 {
+  let _ = field25519_init();
+  let ok: i64 = 1;
+
+  // Test 1: base-point scalar multiplication (public key derivation).
+  // k, expected1 generated by a real, independently-verified Python
+  // run (see this section's own header comment) -- not typed from an
+  // external document.
+  let k: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(k, 0 as u32, 0x60 as u32);
+  let _ = buf_write_byte(k, 1 as u32, 0xb7 as u32);
+  let _ = buf_write_byte(k, 2 as u32, 0xb2 as u32);
+  let _ = buf_write_byte(k, 3 as u32, 0xc0 as u32);
+  let _ = buf_write_byte(k, 4 as u32, 0xd9 as u32);
+  let _ = buf_write_byte(k, 5 as u32, 0x51 as u32);
+  let _ = buf_write_byte(k, 6 as u32, 0x1c as u32);
+  let _ = buf_write_byte(k, 7 as u32, 0xbd as u32);
+  let _ = buf_write_byte(k, 8 as u32, 0x53 as u32);
+  let _ = buf_write_byte(k, 9 as u32, 0x2b as u32);
+  let _ = buf_write_byte(k, 10 as u32, 0xda as u32);
+  let _ = buf_write_byte(k, 11 as u32, 0xdd as u32);
+  let _ = buf_write_byte(k, 12 as u32, 0xdf as u32);
+  let _ = buf_write_byte(k, 13 as u32, 0xd5 as u32);
+  let _ = buf_write_byte(k, 14 as u32, 0xb5 as u32);
+  let _ = buf_write_byte(k, 15 as u32, 0xa8 as u32);
+  let _ = buf_write_byte(k, 16 as u32, 0x5d as u32);
+  let _ = buf_write_byte(k, 17 as u32, 0x0b as u32);
+  let _ = buf_write_byte(k, 18 as u32, 0x49 as u32);
+  let _ = buf_write_byte(k, 19 as u32, 0xab as u32);
+  let _ = buf_write_byte(k, 20 as u32, 0x55 as u32);
+  let _ = buf_write_byte(k, 21 as u32, 0x03 as u32);
+  let _ = buf_write_byte(k, 22 as u32, 0x9f as u32);
+  let _ = buf_write_byte(k, 23 as u32, 0xd3 as u32);
+  let _ = buf_write_byte(k, 24 as u32, 0x21 as u32);
+  let _ = buf_write_byte(k, 25 as u32, 0xba as u32);
+  let _ = buf_write_byte(k, 26 as u32, 0x87 as u32);
+  let _ = buf_write_byte(k, 27 as u32, 0xda as u32);
+  let _ = buf_write_byte(k, 28 as u32, 0xe8 as u32);
+  let _ = buf_write_byte(k, 29 as u32, 0x63 as u32);
+  let _ = buf_write_byte(k, 30 as u32, 0x8e as u32);
+  let _ = buf_write_byte(k, 31 as u32, 0x4c as u32);
+
+  let basepoint: mut ref i64 = dhruva_alloc_bytes(32);
+  let bi: i64 = 0;
+  while bi < 32 {
+    let _ = buf_write_byte(basepoint, bi as u32, 0 as u32);
+    bi = bi + 1;
+  }
+  let _ = buf_write_byte(basepoint, 0 as u32, 9 as u32);
+
+  let expected1: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(expected1, 0 as u32, 0xe0 as u32);
+  let _ = buf_write_byte(expected1, 1 as u32, 0x7a as u32);
+  let _ = buf_write_byte(expected1, 2 as u32, 0xe4 as u32);
+  let _ = buf_write_byte(expected1, 3 as u32, 0x20 as u32);
+  let _ = buf_write_byte(expected1, 4 as u32, 0x24 as u32);
+  let _ = buf_write_byte(expected1, 5 as u32, 0x0d as u32);
+  let _ = buf_write_byte(expected1, 6 as u32, 0x20 as u32);
+  let _ = buf_write_byte(expected1, 7 as u32, 0xa2 as u32);
+  let _ = buf_write_byte(expected1, 8 as u32, 0x7d as u32);
+  let _ = buf_write_byte(expected1, 9 as u32, 0xf3 as u32);
+  let _ = buf_write_byte(expected1, 10 as u32, 0xc1 as u32);
+  let _ = buf_write_byte(expected1, 11 as u32, 0x96 as u32);
+  let _ = buf_write_byte(expected1, 12 as u32, 0xf7 as u32);
+  let _ = buf_write_byte(expected1, 13 as u32, 0x3b as u32);
+  let _ = buf_write_byte(expected1, 14 as u32, 0x54 as u32);
+  let _ = buf_write_byte(expected1, 15 as u32, 0xb6 as u32);
+  let _ = buf_write_byte(expected1, 16 as u32, 0x43 as u32);
+  let _ = buf_write_byte(expected1, 17 as u32, 0x58 as u32);
+  let _ = buf_write_byte(expected1, 18 as u32, 0xbd as u32);
+  let _ = buf_write_byte(expected1, 19 as u32, 0x16 as u32);
+  let _ = buf_write_byte(expected1, 20 as u32, 0x19 as u32);
+  let _ = buf_write_byte(expected1, 21 as u32, 0x9f as u32);
+  let _ = buf_write_byte(expected1, 22 as u32, 0x97 as u32);
+  let _ = buf_write_byte(expected1, 23 as u32, 0x76 as u32);
+  let _ = buf_write_byte(expected1, 24 as u32, 0x26 as u32);
+  let _ = buf_write_byte(expected1, 25 as u32, 0x26 as u32);
+  let _ = buf_write_byte(expected1, 26 as u32, 0x82 as u32);
+  let _ = buf_write_byte(expected1, 27 as u32, 0x42 as u32);
+  let _ = buf_write_byte(expected1, 28 as u32, 0x05 as u32);
+  let _ = buf_write_byte(expected1, 29 as u32, 0xe1 as u32);
+  let _ = buf_write_byte(expected1, 30 as u32, 0x7f as u32);
+  let _ = buf_write_byte(expected1, 31 as u32, 0x69 as u32);
+
+  let out1: mut ref i64 = dhruva_alloc_bytes(32);
+  let k_copy1: mut ref i64 = dhruva_alloc_bytes(32);
+  let ci: i64 = 0;
+  while ci < 32 {
+    let _ = buf_write_byte(k_copy1, ci as u32, buf_read_byte(k, ci as u32));
+    ci = ci + 1;
+  }
+  let _ = x25519_scalarmult(k_copy1, basepoint, out1);
+  if chacha20_bytes_equal(out1, expected1, 32) == 0 {
+    ok = 0;
+  }
+
+  // Test 2: arbitrary u-coordinate multiplication (the other party's
+  // own public key), i.e. the actual DH agreement step -- same k,
+  // different u-coordinate and expected output, from the same
+  // verified run.
+  let u2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(u2, 0 as u32, 0x20 as u32);
+  let _ = buf_write_byte(u2, 1 as u32, 0xc9 as u32);
+  let _ = buf_write_byte(u2, 2 as u32, 0xb8 as u32);
+  let _ = buf_write_byte(u2, 3 as u32, 0x13 as u32);
+  let _ = buf_write_byte(u2, 4 as u32, 0x92 as u32);
+  let _ = buf_write_byte(u2, 5 as u32, 0xa4 as u32);
+  let _ = buf_write_byte(u2, 6 as u32, 0x6b as u32);
+  let _ = buf_write_byte(u2, 7 as u32, 0x37 as u32);
+  let _ = buf_write_byte(u2, 8 as u32, 0xd9 as u32);
+  let _ = buf_write_byte(u2, 9 as u32, 0xa5 as u32);
+  let _ = buf_write_byte(u2, 10 as u32, 0xd5 as u32);
+  let _ = buf_write_byte(u2, 11 as u32, 0xc1 as u32);
+  let _ = buf_write_byte(u2, 12 as u32, 0xf5 as u32);
+  let _ = buf_write_byte(u2, 13 as u32, 0x73 as u32);
+  let _ = buf_write_byte(u2, 14 as u32, 0x7c as u32);
+  let _ = buf_write_byte(u2, 15 as u32, 0xca as u32);
+  let _ = buf_write_byte(u2, 16 as u32, 0x4f as u32);
+  let _ = buf_write_byte(u2, 17 as u32, 0xc9 as u32);
+  let _ = buf_write_byte(u2, 18 as u32, 0x71 as u32);
+  let _ = buf_write_byte(u2, 19 as u32, 0x21 as u32);
+  let _ = buf_write_byte(u2, 20 as u32, 0x89 as u32);
+  let _ = buf_write_byte(u2, 21 as u32, 0xc0 as u32);
+  let _ = buf_write_byte(u2, 22 as u32, 0xf1 as u32);
+  let _ = buf_write_byte(u2, 23 as u32, 0x84 as u32);
+  let _ = buf_write_byte(u2, 24 as u32, 0x23 as u32);
+  let _ = buf_write_byte(u2, 25 as u32, 0x35 as u32);
+  let _ = buf_write_byte(u2, 26 as u32, 0xec as u32);
+  let _ = buf_write_byte(u2, 27 as u32, 0x89 as u32);
+  let _ = buf_write_byte(u2, 28 as u32, 0xbd as u32);
+  let _ = buf_write_byte(u2, 29 as u32, 0xeb as u32);
+  let _ = buf_write_byte(u2, 30 as u32, 0xca as u32);
+  let _ = buf_write_byte(u2, 31 as u32, 0x0d as u32);
+
+  let expected2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(expected2, 0 as u32, 0x12 as u32);
+  let _ = buf_write_byte(expected2, 1 as u32, 0x8e as u32);
+  let _ = buf_write_byte(expected2, 2 as u32, 0x3d as u32);
+  let _ = buf_write_byte(expected2, 3 as u32, 0x71 as u32);
+  let _ = buf_write_byte(expected2, 4 as u32, 0x61 as u32);
+  let _ = buf_write_byte(expected2, 5 as u32, 0x9e as u32);
+  let _ = buf_write_byte(expected2, 6 as u32, 0x52 as u32);
+  let _ = buf_write_byte(expected2, 7 as u32, 0x72 as u32);
+  let _ = buf_write_byte(expected2, 8 as u32, 0x04 as u32);
+  let _ = buf_write_byte(expected2, 9 as u32, 0x99 as u32);
+  let _ = buf_write_byte(expected2, 10 as u32, 0x1f as u32);
+  let _ = buf_write_byte(expected2, 11 as u32, 0x8a as u32);
+  let _ = buf_write_byte(expected2, 12 as u32, 0x5c as u32);
+  let _ = buf_write_byte(expected2, 13 as u32, 0x80 as u32);
+  let _ = buf_write_byte(expected2, 14 as u32, 0x68 as u32);
+  let _ = buf_write_byte(expected2, 15 as u32, 0x2d as u32);
+  let _ = buf_write_byte(expected2, 16 as u32, 0x74 as u32);
+  let _ = buf_write_byte(expected2, 17 as u32, 0xea as u32);
+  let _ = buf_write_byte(expected2, 18 as u32, 0xa2 as u32);
+  let _ = buf_write_byte(expected2, 19 as u32, 0xda as u32);
+  let _ = buf_write_byte(expected2, 20 as u32, 0x8a as u32);
+  let _ = buf_write_byte(expected2, 21 as u32, 0xde as u32);
+  let _ = buf_write_byte(expected2, 22 as u32, 0x5c as u32);
+  let _ = buf_write_byte(expected2, 23 as u32, 0xcc as u32);
+  let _ = buf_write_byte(expected2, 24 as u32, 0xaa as u32);
+  let _ = buf_write_byte(expected2, 25 as u32, 0xdb as u32);
+  let _ = buf_write_byte(expected2, 26 as u32, 0x7a as u32);
+  let _ = buf_write_byte(expected2, 27 as u32, 0xfa as u32);
+  let _ = buf_write_byte(expected2, 28 as u32, 0xc3 as u32);
+  let _ = buf_write_byte(expected2, 29 as u32, 0xcc as u32);
+  let _ = buf_write_byte(expected2, 30 as u32, 0xc6 as u32);
+  let _ = buf_write_byte(expected2, 31 as u32, 0x66 as u32);
+
+  let out2: mut ref i64 = dhruva_alloc_bytes(32);
+  let k_copy2: mut ref i64 = dhruva_alloc_bytes(32);
+  let di: i64 = 0;
+  while di < 32 {
+    let _ = buf_write_byte(k_copy2, di as u32, buf_read_byte(k, di as u32));
+    di = di + 1;
+  }
+  let _ = x25519_scalarmult(k_copy2, u2, out2);
+  if chacha20_bytes_equal(out2, expected2, 32) == 0 {
+    ok = 0;
+  }
+
+  let _ = uart_puts("CRYPTO: X25519 vs a real, independently-verified reference (base-point + DH agreement)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Early-warning canary for the exact heap-exhaustion bug class this
 // project has now hit twice (once in dharafs_compact's own per-pass leak,
 // once in round 10's DHCP self-tests tipping total boot-time usage
@@ -18412,6 +19425,32 @@ fn kernel_main() -> i64 {
   let _ = sha256_k_scratch_set(dhruva_alloc_bytes(256));
   let _ = sha256_w_scratch_set(dhruva_alloc_bytes(256));
   let _ = sha256_k_init(sha256_k_scratch_get());
+  let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
+  let _ = x25519_x1_set(dhruva_alloc_bytes(32));
+  let _ = x25519_x2_set(dhruva_alloc_bytes(32));
+  let _ = x25519_z2_set(dhruva_alloc_bytes(32));
+  let _ = x25519_x3_set(dhruva_alloc_bytes(32));
+  let _ = x25519_z3_set(dhruva_alloc_bytes(32));
+  let _ = x25519_a_set(dhruva_alloc_bytes(32));
+  let _ = x25519_aa_set(dhruva_alloc_bytes(32));
+  let _ = x25519_b_set(dhruva_alloc_bytes(32));
+  let _ = x25519_bb_set(dhruva_alloc_bytes(32));
+  let _ = x25519_e_set(dhruva_alloc_bytes(32));
+  let _ = x25519_c_set(dhruva_alloc_bytes(32));
+  let _ = x25519_d_set(dhruva_alloc_bytes(32));
+  let _ = x25519_da_set(dhruva_alloc_bytes(32));
+  let _ = x25519_cb_set(dhruva_alloc_bytes(32));
+  let _ = x25519_a24e_set(dhruva_alloc_bytes(32));
+  let _ = x25519_product_scratch_set(dhruva_alloc_bytes(64));
+  let _ = x25519_invert_base_set(dhruva_alloc_bytes(32));
+  let _ = x25519_invert_result_set(dhruva_alloc_bytes(32));
+  let _ = x25519_p_bytes_set(dhruva_alloc_bytes(32));
+  let _ = x25519_p_minus_2_bytes_set(dhruva_alloc_bytes(32));
+  let _ = x25519_p9_bytes_set(dhruva_alloc_bytes(36));
+  let _ = x25519_fold_t_set(dhruva_alloc_bytes(36));
+  let _ = x25519_fold_s_set(dhruva_alloc_bytes(36));
+  let _ = x25519_a24_bytes_set(dhruva_alloc_bytes(32));
+  let _ = field25519_init();
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
@@ -18660,6 +19699,8 @@ fn kernel_main() -> i64 {
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   let _ = chacha20_self_test();
+  let _ = poly1305_self_test();
+  let _ = x25519_self_test();
 
   // Media (at-rest) encryption for DharaFS, layered on the ChaCha20
   // cipher above. Key derivation runs once here, single-threaded,

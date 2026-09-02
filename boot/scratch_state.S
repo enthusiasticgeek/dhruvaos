@@ -463,6 +463,10 @@ fsqueue_path_scratch_addr:
 fsqueue_data_scratch_addr:
     .word 0             /* 448 bytes -- same, for the queued write's
                          * data payload (fsqueue_max_data_bytes()). */
+poly1305_block_scratch_addr:
+    .word 0             /* 16 bytes -- poly1305_mac's own scratch for
+                         * building the final zero-padded partial
+                         * block, same one-allocation-at-boot pattern. */
 
 .section ".text"
 
@@ -1173,6 +1177,19 @@ fsqueue_data_scratch_set:
 .global fsqueue_data_scratch_get
 fsqueue_data_scratch_get:
     ldr r0, =fsqueue_data_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global poly1305_block_scratch_set
+poly1305_block_scratch_set:
+    ldr r1, =poly1305_block_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global poly1305_block_scratch_get
+poly1305_block_scratch_get:
+    ldr r0, =poly1305_block_scratch_addr
     ldr r0, [r0]
     bx lr
 

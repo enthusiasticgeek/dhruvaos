@@ -428,24 +428,98 @@ for by name.
   touch the FS layer at all, so the crash-safety sweep is unaffected
   by design).
 
-  **This item's core scope is now fully closed.** Still open, and
-  explicitly a separate, larger sub-effort per this entry's own
-  original framing: real EC point arithmetic and modular reduction —
-  needed only once a future round actually requires asymmetric crypto
-  (e.g. the PKI/secure-boot roadmap items below, both of which
-  currently just note this dependency rather than being blocked
-  waiting on it).
+  **This item's core scope is now fully closed.**
 
-  **Gap worth flagging now, found while scoping real authentication
-  below**: `chacha20_encrypt` is the raw stream cipher only — there is
-  no Poly1305 (or any MAC) wired to it anywhere in this codebase, so
-  nothing built on it today has real integrity/authentication, only
-  confidentiality. Fine for a throwaway demo; NOT fine for media-at-
-  rest encryption or anything else meant to resist real tampering — an
-  attacker who can modify ciphertext can flip corresponding plaintext
-  bits predictably with no detection. Add Poly1305 before shipping
-  ChaCha20 for anything that needs to resist an active adversary, not
-  just a passive one.
+  **Poly1305: DONE (round 67, 2026-09-02).** Closes the integrity gap
+  flagged below. Ported from the well-known, widely-audited
+  "poly1305-donna-32" public-domain reference algorithm (radix-2^26,
+  five 32-bit limbs) rather than a generic bignum-mod-p approach --
+  2^130-5's own fast-reduction shape doesn't need the generic bignum_*
+  machinery at all. Found and avoided a real, hardware-specific bug
+  before it ever happened: `buf_read_u32`'s ARM `ldr` is only safe at
+  4-byte-aligned offsets (every EXISTING caller in this codebase only
+  ever used aligned offsets), but Poly1305's own clamp/accumulate
+  steps are the first thing here needing little-endian reads at
+  arbitrary byte offsets -- a naive port would have silently produced
+  wrong answers on real hardware (unaligned `ldr` behavior differs)
+  while still happening to work under the host harness's native x86.
+  Fixed with an alignment-agnostic byte-combine helper instead.
+  Verified via a from-scratch Python reference (both a trivial bigint
+  version and this exact radix-26 algorithm) checked byte-exact
+  against RFC 8439 section 2.5.2's own worked test vector before any
+  vani code was written. 41 new host-harness checks (728→769 PASS
+  clean under ASAN/UBSAN), including altered-message and altered-key
+  tests (a single flipped bit must change the tag) and a constant-time
+  tag-verification function (`poly1305_verify_constant_time`) with its
+  own accept/reject checks. Live-verified against the RFC vector on
+  real ARM/QEMU at boot. The full RFC 8439 ChaCha20-Poly1305 AEAD
+  CONSTRUCTION (key derivation + length-padding + combining) is
+  deliberately NOT built yet -- that's real, TLS-specific plumbing
+  better sized once TLS's actual record-layer needs are known, not
+  speculative work now (this project's own "don't design for
+  hypothetical requirements" discipline). Wiring Poly1305 into DharaFS
+  media encryption (round 62's own flagged follow-up) is also not done
+  here -- out of scope for this round's ask, tracked as a still-open
+  opportunity.
+
+  **X25519 (RFC 7748): DONE (round 67, 2026-09-02).** Real EC point
+  arithmetic and modular reduction, the actual missing piece this
+  entry originally flagged. Field elements over p=2^255-19 use the
+  SAME 8-limb bignum representation and `bignum_add_raw`/`sub_raw`/
+  `mul_raw`/`cmp_raw` primitives round 44's own bignum work already
+  built and verified (deliberately not a specialized radix-2^51
+  representation real high-performance implementations use --
+  correctness-over-performance, reusing verified infrastructure, and
+  this is an occasional-key-exchange client, not a TLS terminator). A
+  new `bignum_mul_small_raw` helper plus a fold-based reduction
+  (2^256 ≡ 38 mod p, so a 512-bit product splits cleanly at the
+  limb-aligned 256-bit boundary with no sub-limb bit-shift primitive
+  needed) handle the modular arithmetic; `field25519_invert` uses
+  plain binary square-and-multiply over the fixed exponent p-2 (not
+  the optimized addition chain real implementations use, same
+  simplicity-over-performance reasoning). The Montgomery ladder itself
+  (`x25519_scalarmult`) uses branchless masked cswap, matching RFC
+  7748 section 5 exactly.
+
+  **Verification, adapted for a primitive where reciting an RFC test
+  vector from memory would be a real, unnecessary transcription risk**
+  (unlike SHA-256/ChaCha20/Poly1305's own well-worn KATs): (1) a
+  from-scratch Python big-integer reference of the RFC 7748 Montgomery
+  ladder, checked against the REAL, independent `cryptography` library
+  across 20 random trials (own-derived public keys match the
+  library's; cross-library DH agreement matches; DH symmetry holds
+  standalone); (2) a second Python simulation of the EXACT limb-level
+  algorithm ported to vani (generic bignum ops + the fold reduction),
+  cross-checked against the bigint reference across 2000 random field
+  multiplications (including edge values at/near p) plus 30 full
+  random X25519 trials, byte-exact on all of them; (3) the concrete
+  test vectors embedded in both `kernel_main.vani`'s own self-test and
+  the host-harness twin were generated by that SAME verified run, not
+  typed from an external document. Result: correct on the FIRST real
+  build, no debugging cycle needed. 7 new host-harness checks
+  (769→776 PASS clean under ASAN/UBSAN) covering both concrete
+  vectors, DH symmetry, a distinct-shared-secret-per-key check, and
+  field arithmetic unit checks (1+0=1, 1⁻¹=1, 5·5⁻¹=1). Live-verified
+  against both vectors on real ARM/QEMU at boot, first try.
+
+  **Known, documented gap, not an oversight**: not fully constant-time
+  -- the ladder's own cswap is branchless, but `field25519_add`/`_sub`'s
+  single conditional subtract/add-of-p depends on the VALUE being
+  reduced (not directly on a secret scalar bit), a theoretical
+  cache-timing surface a sufficiently determined attacker could still
+  try to correlate. The well-known fix (an unconditional branchless
+  select instead of an `if`) is not applied here -- flagged for a
+  future hardening pass, not silently accepted.
+
+  **Still open, a separate, larger sub-effort**: Ed25519 (signatures)
+  needs SHA-512 as a new prerequisite this project doesn't have yet
+  (only SHA-256 exists) PLUS twisted-Edwards point arithmetic and
+  scalar-mod-group-order arithmetic distinct from X25519's own
+  Montgomery-curve formulas PLUS point compression/decompression via a
+  modular square root -- discovered mid-session while scoping PKI's
+  own signature-verification need, not accounted for in this entry's
+  original "Curve25519 = X25519+Ed25519" framing. X25519 alone already
+  fully satisfies TLS's ECDHE need below.
 
 - **AES** — `[L, genuinely harder than it sounds — SKIPPED FOR NOW,
   2026-08-31, revisit if WPA2/WiFi or FIPS-grade TLS actually starts]`

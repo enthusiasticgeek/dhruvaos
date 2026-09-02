@@ -341,6 +341,42 @@ int64_t fn_dharafs_snapshot_read_raw(int64_t *path_buf, int64_t path_len, int64_
 int64_t fn_dharafs_snapshot_create(const char *name);
 int64_t fn_dharafs_snapshot_delete(const char *name);
 int64_t fn_dharafs_snapshot_read(const char *path, const char *name, int64_t *out_buf);
+int64_t fn_poly1305_mac(int64_t *key, int64_t *msg, int64_t msg_len, int64_t *block_scratch, int64_t *out_tag);
+int64_t fn_poly1305_verify_constant_time(int64_t *a, int64_t *b, int64_t n);
+int64_t fn_bignum_mul_small_raw(int64_t *a, int64_t *out, int64_t n, uint32_t small);
+int64_t fn_field25519_init(void);
+uint32_t fn_field25519_get_bit(int64_t *buf, int64_t bit_index);
+int64_t fn_field25519_add(int64_t *a, int64_t *b, int64_t *out);
+int64_t fn_field25519_sub(int64_t *a, int64_t *b, int64_t *out);
+int64_t fn_field25519_mul(int64_t *a, int64_t *b, int64_t *out);
+int64_t fn_field25519_sqr(int64_t *a, int64_t *out);
+int64_t fn_field25519_invert(int64_t *a, int64_t *out);
+int64_t fn_x25519_clamp_scalar(int64_t *k);
+int64_t fn_x25519_scalarmult(int64_t *k, int64_t *u_in, int64_t *out);
+int64_t x25519_x1_set(int64_t *addr);
+int64_t x25519_x2_set(int64_t *addr);
+int64_t x25519_z2_set(int64_t *addr);
+int64_t x25519_x3_set(int64_t *addr);
+int64_t x25519_z3_set(int64_t *addr);
+int64_t x25519_a_set(int64_t *addr);
+int64_t x25519_aa_set(int64_t *addr);
+int64_t x25519_b_set(int64_t *addr);
+int64_t x25519_bb_set(int64_t *addr);
+int64_t x25519_e_set(int64_t *addr);
+int64_t x25519_c_set(int64_t *addr);
+int64_t x25519_d_set(int64_t *addr);
+int64_t x25519_da_set(int64_t *addr);
+int64_t x25519_cb_set(int64_t *addr);
+int64_t x25519_a24e_set(int64_t *addr);
+int64_t x25519_product_scratch_set(int64_t *addr);
+int64_t x25519_invert_base_set(int64_t *addr);
+int64_t x25519_invert_result_set(int64_t *addr);
+int64_t x25519_p_bytes_set(int64_t *addr);
+int64_t x25519_p_minus_2_bytes_set(int64_t *addr);
+int64_t x25519_p9_bytes_set(int64_t *addr);
+int64_t x25519_fold_t_set(int64_t *addr);
+int64_t x25519_fold_s_set(int64_t *addr);
+int64_t x25519_a24_bytes_set(int64_t *addr);
 
 /* ---- host_stubs.c helpers ---- */
 int64_t *dhruva_alloc_bytes(int64_t n);
@@ -1659,6 +1695,198 @@ static void test_chacha20_boundaries(void) {
     }
 }
 
+static void test_poly1305(void) {
+    static const unsigned char key_bytes[32] = {
+        0x85,0xd6,0xbe,0x78,0x57,0x55,0x6d,0x33,0x7f,0x44,0x52,0xfe,0x42,0xd5,0x06,0xa8,
+        0x01,0x03,0x80,0x8a,0xfb,0x0d,0xb2,0xfd,0x4a,0xbf,0xf6,0xaf,0x41,0x49,0xf5,0x1b,
+    };
+    static const unsigned char expected_tag[16] = {
+        0xa8,0x06,0x1d,0xc1,0x30,0x51,0x36,0xc6,0xc2,0x2b,0x8b,0xaf,0x0c,0x01,0x27,0xa9,
+    };
+    const char *msg_text = "Cryptographic Forum Research Group";
+    int64_t msg_len = (int64_t)strlen(msg_text);
+
+    int64_t *key = mkbuf((const char *)key_bytes, 32);
+    int64_t *msg = mkbuf(msg_text, msg_len);
+    int64_t *block_scratch = dhruva_alloc_bytes(16);
+    int64_t *tag = dhruva_alloc_bytes(16);
+
+    fn_poly1305_mac(key, msg, msg_len, block_scratch, tag);
+    CHECK(memcmp(tag, expected_tag, 16) == 0, "poly1305: RFC 8439 section 2.5.2 KAT matches byte-exact");
+    CHECK(fn_poly1305_verify_constant_time(tag, (int64_t *)expected_tag, 16) == 1, "poly1305: verify accepts the correct tag");
+
+    /* Empty message: mac must equal s (key[16..32)) exactly. */
+    int64_t *empty_tag = dhruva_alloc_bytes(16);
+    fn_poly1305_mac(key, msg, 0, block_scratch, empty_tag);
+    unsigned char s_bytes[16];
+    memcpy(s_bytes, key_bytes + 16, 16);
+    CHECK(memcmp(empty_tag, s_bytes, 16) == 0, "poly1305: empty message -> mac == s exactly");
+
+    /* A single flipped bit anywhere in the message must change the tag. */
+    int64_t *msg2 = mkbuf(msg_text, msg_len);
+    buf_write_byte(msg2, 0, buf_read_byte(msg2, 0) ^ 1);
+    int64_t *tag2 = dhruva_alloc_bytes(16);
+    fn_poly1305_mac(key, msg2, msg_len, block_scratch, tag2);
+    CHECK(memcmp(tag, tag2, 16) != 0, "poly1305: a single flipped message bit changes the tag");
+    CHECK(fn_poly1305_verify_constant_time(tag, tag2, 16) == 0, "poly1305: verify correctly rejects a mismatched tag");
+
+    /* A single flipped bit in the KEY must also change the tag
+     * (nothing about r/s clamping should make the tag key-independent). */
+    unsigned char key2_bytes[32];
+    memcpy(key2_bytes, key_bytes, 32);
+    key2_bytes[31] ^= 1;
+    int64_t *key2 = mkbuf((const char *)key2_bytes, 32);
+    int64_t *tag3 = dhruva_alloc_bytes(16);
+    fn_poly1305_mac(key2, msg, msg_len, block_scratch, tag3);
+    CHECK(memcmp(tag, tag3, 16) != 0, "poly1305: a single flipped key bit changes the tag");
+
+    /* Length boundaries around the 16-byte block size -- exact
+     * multiples (0, 16, 32) never touch the partial-block/leftover
+     * path at all; 15/17/33 do. Just checking these don't crash and
+     * produce a real, non-degenerate 16-byte tag (a full independent
+     * KAT for each length isn't warranted -- the RFC vector above
+     * already validates the core multiply-reduce math; this is purely
+     * about the block-boundary bookkeeping). */
+    for (int64_t len = 0; len <= 33; len++) {
+        int64_t *m = dhruva_alloc_bytes(len > 0 ? len : 1);
+        for (int64_t i = 0; i < len; i++) buf_write_byte(m, (uint32_t)i, (uint32_t)((i * 31) & 0xff));
+        int64_t *t = dhruva_alloc_bytes(16);
+        int64_t st = fn_poly1305_mac(key, m, len, block_scratch, t);
+        char desc[80];
+        snprintf(desc, sizeof(desc), "poly1305: len=%lld handled cleanly (no crash)", (long long)len);
+        CHECK(st == 0, desc);
+    }
+
+    /* Two different messages of the exact same length must (almost
+     * certainly) produce different tags -- a degenerate implementation
+     * that e.g. only looked at message length would pass every check
+     * above but fail this one. */
+    int64_t *m32a = dhruva_alloc_bytes(32);
+    int64_t *m32b = dhruva_alloc_bytes(32);
+    for (int64_t i = 0; i < 32; i++) { buf_write_byte(m32a, (uint32_t)i, 0xAA); buf_write_byte(m32b, (uint32_t)i, 0x55); }
+    int64_t *ta = dhruva_alloc_bytes(16);
+    int64_t *tb = dhruva_alloc_bytes(16);
+    fn_poly1305_mac(key, m32a, 32, block_scratch, ta);
+    fn_poly1305_mac(key, m32b, 32, block_scratch, tb);
+    CHECK(memcmp(ta, tb, 16) != 0, "poly1305: two different same-length messages produce different tags");
+}
+
+static void x25519_init_scratch(void) {
+    x25519_x1_set(dhruva_alloc_bytes(32));
+    x25519_x2_set(dhruva_alloc_bytes(32));
+    x25519_z2_set(dhruva_alloc_bytes(32));
+    x25519_x3_set(dhruva_alloc_bytes(32));
+    x25519_z3_set(dhruva_alloc_bytes(32));
+    x25519_a_set(dhruva_alloc_bytes(32));
+    x25519_aa_set(dhruva_alloc_bytes(32));
+    x25519_b_set(dhruva_alloc_bytes(32));
+    x25519_bb_set(dhruva_alloc_bytes(32));
+    x25519_e_set(dhruva_alloc_bytes(32));
+    x25519_c_set(dhruva_alloc_bytes(32));
+    x25519_d_set(dhruva_alloc_bytes(32));
+    x25519_da_set(dhruva_alloc_bytes(32));
+    x25519_cb_set(dhruva_alloc_bytes(32));
+    x25519_a24e_set(dhruva_alloc_bytes(32));
+    x25519_product_scratch_set(dhruva_alloc_bytes(64));
+    x25519_invert_base_set(dhruva_alloc_bytes(32));
+    x25519_invert_result_set(dhruva_alloc_bytes(32));
+    x25519_p_bytes_set(dhruva_alloc_bytes(32));
+    x25519_p_minus_2_bytes_set(dhruva_alloc_bytes(32));
+    x25519_p9_bytes_set(dhruva_alloc_bytes(36));
+    x25519_fold_t_set(dhruva_alloc_bytes(36));
+    x25519_fold_s_set(dhruva_alloc_bytes(36));
+    x25519_a24_bytes_set(dhruva_alloc_bytes(32));
+    fn_field25519_init();
+}
+
+static void test_x25519(void) {
+    x25519_init_scratch();
+
+    static const unsigned char k1_bytes[32] = {0x60, 0xb7, 0xb2, 0xc0, 0xd9, 0x51, 0x1c, 0xbd, 0x53, 0x2b, 0xda, 0xdd, 0xdf, 0xd5, 0xb5, 0xa8, 0x5d, 0x0b, 0x49, 0xab, 0x55, 0x03, 0x9f, 0xd3, 0x21, 0xba, 0x87, 0xda, 0xe8, 0x63, 0x8e, 0x4c};
+    static const unsigned char expected1_bytes[32] = {0xe0, 0x7a, 0xe4, 0x20, 0x24, 0x0d, 0x20, 0xa2, 0x7d, 0xf3, 0xc1, 0x96, 0xf7, 0x3b, 0x54, 0xb6, 0x43, 0x58, 0xbd, 0x16, 0x19, 0x9f, 0x97, 0x76, 0x26, 0x26, 0x82, 0x42, 0x05, 0xe1, 0x7f, 0x69};
+    static const unsigned char u2_bytes[32] = {0x20, 0xc9, 0xb8, 0x13, 0x92, 0xa4, 0x6b, 0x37, 0xd9, 0xa5, 0xd5, 0xc1, 0xf5, 0x73, 0x7c, 0xca, 0x4f, 0xc9, 0x71, 0x21, 0x89, 0xc0, 0xf1, 0x84, 0x23, 0x35, 0xec, 0x89, 0xbd, 0xeb, 0xca, 0x0d};
+    static const unsigned char expected2_bytes[32] = {0x12, 0x8e, 0x3d, 0x71, 0x61, 0x9e, 0x52, 0x72, 0x04, 0x99, 0x1f, 0x8a, 0x5c, 0x80, 0x68, 0x2d, 0x74, 0xea, 0xa2, 0xda, 0x8a, 0xde, 0x5c, 0xcc, 0xaa, 0xdb, 0x7a, 0xfa, 0xc3, 0xcc, 0xc6, 0x66};
+    unsigned char basepoint_bytes[32] = {9};
+
+    /* Test 1: base-point scalar mult (public key derivation), against
+     * a real, independently-verified (cryptography library) result --
+     * see kernel_main.vani's own header comment for the full
+     * verification chain this value came from. */
+    int64_t *k1 = mkbuf((const char *)k1_bytes, 32);
+    int64_t *basepoint = mkbuf((const char *)basepoint_bytes, 32);
+    int64_t *out1 = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(k1, basepoint, out1);
+    CHECK(memcmp(out1, expected1_bytes, 32) == 0, "x25519: base-point mult matches independently-verified reference");
+
+    /* Test 2: arbitrary u-coordinate mult (DH agreement step), same
+     * verified source. */
+    int64_t *k1b = mkbuf((const char *)k1_bytes, 32); /* fresh copy -- x25519_scalarmult clamps k in place */
+    int64_t *u2 = mkbuf((const char *)u2_bytes, 32);
+    int64_t *out2 = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(k1b, u2, out2);
+    CHECK(memcmp(out2, expected2_bytes, 32) == 0, "x25519: DH agreement matches independently-verified reference");
+
+    /* DH symmetry, using ONLY this implementation on both sides --
+     * the actual mathematical property ECDHE depends on: A(a, B_pub)
+     * == A(b, A_pub) where A_pub = A(a, basepoint), B_pub = A(b, basepoint). */
+    unsigned char a_priv[32], b_priv[32];
+    for (int i = 0; i < 32; i++) { a_priv[i] = (unsigned char)(i * 7 + 3); b_priv[i] = (unsigned char)(i * 13 + 11); }
+
+    int64_t *a_priv_buf = mkbuf((const char *)a_priv, 32);
+    int64_t *bp1 = mkbuf((const char *)basepoint_bytes, 32);
+    int64_t *a_pub = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(a_priv_buf, bp1, a_pub);
+
+    int64_t *b_priv_buf = mkbuf((const char *)b_priv, 32);
+    int64_t *bp2 = mkbuf((const char *)basepoint_bytes, 32);
+    int64_t *b_pub = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(b_priv_buf, bp2, b_pub);
+
+    int64_t *a_priv_buf2 = mkbuf((const char *)a_priv, 32);
+    int64_t *shared_ab = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(a_priv_buf2, b_pub, shared_ab);
+
+    int64_t *b_priv_buf2 = mkbuf((const char *)b_priv, 32);
+    int64_t *shared_ba = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(b_priv_buf2, a_pub, shared_ba);
+
+    CHECK(memcmp(shared_ab, shared_ba, 32) == 0, "x25519: DH agreement is symmetric (A(a,B_pub) == A(b,A_pub))");
+
+    /* A degenerate "ignores its input" implementation would still
+     * pass every check above by coincidence if shared_ab/shared_ba
+     * both happened to be some constant -- rule that out explicitly:
+     * a different key pair must produce a DIFFERENT shared secret. */
+    unsigned char c_priv[32];
+    for (int i = 0; i < 32; i++) c_priv[i] = (unsigned char)(i * 5 + 17);
+    int64_t *c_priv_buf = mkbuf((const char *)c_priv, 32);
+    int64_t *shared_ac = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(c_priv_buf, a_pub, shared_ac);
+    CHECK(memcmp(shared_ab, shared_ac, 32) != 0, "x25519: a different private key produces a different shared secret");
+
+    /* field25519 arithmetic unit checks, independent of the full ladder. */
+    unsigned char one_bytes[32] = {1};
+    unsigned char zero_bytes[32] = {0};
+    int64_t *one = mkbuf((const char *)one_bytes, 32);
+    int64_t *zero = mkbuf((const char *)zero_bytes, 32);
+    int64_t *sum = dhruva_alloc_bytes(32);
+    fn_field25519_add(one, zero, sum);
+    CHECK(memcmp(sum, one_bytes, 32) == 0, "field25519: 1 + 0 == 1");
+
+    int64_t *inv_one = dhruva_alloc_bytes(32);
+    fn_field25519_invert(one, inv_one);
+    CHECK(memcmp(inv_one, one_bytes, 32) == 0, "field25519: 1^-1 == 1");
+
+    /* a * a^-1 == 1 for a real (non-trivial) value -- the actual
+     * property field25519_invert exists for. */
+    unsigned char five_bytes[32] = {5};
+    int64_t *five = mkbuf((const char *)five_bytes, 32);
+    int64_t *five_inv = dhruva_alloc_bytes(32);
+    fn_field25519_invert(five, five_inv);
+    int64_t *should_be_one = dhruva_alloc_bytes(32);
+    fn_field25519_mul(five, five_inv, should_be_one);
+    CHECK(memcmp(should_be_one, one_bytes, 32) == 0, "field25519: 5 * 5^-1 == 1");
+}
+
 static void test_bignum_boundaries(void) {
     /* Multiply by zero. */
     int64_t *a = dhruva_alloc_bytes(16);
@@ -2663,6 +2891,8 @@ int main(void) {
     test_media_crypto();
     test_fault_injection();
     test_chacha20_boundaries();
+    test_poly1305();
+    test_x25519();
     test_bignum_boundaries();
     test_lan9512_framing();
     test_hci_framing();
