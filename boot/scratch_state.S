@@ -126,7 +126,10 @@ tcp_empty_payload_scratch_addr:
                          * boot" shape as the FS-layer bug this file
                          * was created to fix. */
 net_send_scratch_addr:
-    .word 0             /* 512 bytes: the one Ethernet+IP(+UDP/TCP)
+    .word 0             /* netif_frame_slot_size() bytes (1514 as of
+                         * round 66, was a hardcoded 512 -- see
+                         * kernel_main.vani's own netif_frame_slot_size
+                         * comment for the full fix): the one Ethernet+IP(+UDP/TCP)
                          * frame buffer ipv4_send/udp_send/
                          * tcp_send_segment each build their outgoing
                          * frame into. Found via the SAME audit as
@@ -162,7 +165,8 @@ net_send_scratch_addr:
                          * before wiring any task up to send network
                          * traffic. */
 net_recv_scratch_addr:
-    .word 0             /* 512 bytes: socket_udp_recv's own internal
+    .word 0             /* netif_frame_slot_size() bytes (1514 as of
+                         * round 66, was a hardcoded 512): socket_udp_recv's own internal
                          * received-frame buffer -- same bug, same
                          * fix. A future TCP-level socket_tcp_recv
                          * equivalent would need the same treatment;
@@ -228,7 +232,11 @@ dhcp_payload_scratch_addr:
                          * (message type + requested-IP + server-ID +
                          * end) comfortably fits. */
 dhcp_frame_scratch_addr:
-    .word 0             /* 512 bytes: dhcp_client_poll's own received-
+    .word 0             /* netif_frame_slot_size() bytes (1514 as of
+                         * round 66, was a hardcoded 512 -- see docs/
+                         * TODO.md's own bug entry: a real DHCPOFFER
+                         * with many options exceeded the old 512 and
+                         * was silently dropped): dhcp_client_poll's own received-
                          * frame buffer, same shape as net_recv_scratch
                          * above but kept separate (not shared with
                          * socket_udp_recv) since nothing has verified

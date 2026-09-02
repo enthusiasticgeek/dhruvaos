@@ -20,21 +20,21 @@
  * small ring-queue bookkeeping (head/tail/count, per-slot lengths)
  * need a persistent home outside vani's call-stack-only world.
  *
- * 4 slots, 512 bytes each: generous for anything this phase's ARP/
- * IPv4/UDP/TCP self-tests send (a real Ethernet MTU is 1500 bytes
- * payload -- deliberately not matched here, since nothing this
- * project can actually test end-to-end under QEMU needs a full-size
- * frame; a real hardware netif implementation later would need its
- * own, larger buffers). An explicit count (not just comparing head
- * and tail) is what tells "empty" and "full" apart unambiguously,
- * since with only 4 slots head could otherwise equal tail in either
- * case. */
+ * 4 slots, netif_frame_slot_size() bytes each (kernel_main.vani) --
+ * 1514 bytes as of round 66 (a real 1500-byte Ethernet MTU plus the
+ * 14-byte header), previously a hardcoded 512 that silently dropped
+ * real-world frames like a multi-option DHCPOFFER (see docs/TODO.md's
+ * own bug entry and netif_frame_slot_size's own comment for the full
+ * fix). An explicit count (not just comparing head and tail) is what
+ * tells "empty" and "full" apart unambiguously, since with only 4
+ * slots head could otherwise equal tail in either case. */
 
 .section ".bss"
 .align 4
 netif_queue_buf_addr:
-    .word 0            /* address of the 2048-byte (4*512) frame
-                         * storage buffer, set once at boot */
+    .word 0            /* address of the 4*netif_frame_slot_size()
+                         * (6056 bytes as of round 66) frame storage
+                         * buffer, set once at boot */
 netif_queue_len:
     .word 0, 0, 0, 0    /* per-slot frame length; only meaningful for
                          * slots between tail and head */

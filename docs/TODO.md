@@ -2204,22 +2204,64 @@ support of any kind.
   and RX status word framing; written against the public datasheet +
   Linux's `smsc95xx.c`/`.h` reference driver — **NOT live-verified**,
   pending real Pi 1B hardware-in-loop testing).
-  **Found via live testing, not fixed in this round** (real,
-  pre-existing, in scope for a future round): `dhcp_client_poll` (and
-  likely other netif-layer callers) pass a hardcoded `max_len=512` to
+  **FIXED, round 66 (2026-09-01)**: `dhcp_client_poll` (and likely
+  other netif-layer callers) passed a hardcoded `max_len=512` to
   `netif_recv_frame` — a loopback-era assumption from when this
   project only ever talked to itself over a 512-byte queue slot. A
   REAL DHCPOFFER from an external server (590 bytes, options included)
-  exceeds it and gets silently dropped (`netif_recv_frame`'s own
+  exceeded it and got silently dropped (`netif_recv_frame`'s own
   documented "frame bigger than caller's buffer" contract, working
-  exactly as designed — the CALLER's assumption is what's now wrong,
-  not this function). The CDC-ECM driver itself is unaffected and
+  exactly as designed — the CALLER's assumption was what was wrong,
+  not this function). The CDC-ECM driver itself was unaffected and
   proven correct independently (`ping`'s own frames are small enough
-  to stay under this cap) — this is a separate, pre-existing
+  to stay under this cap) — this was a separate, pre-existing
   networking-stack constant that only a genuine external NIC could
-  ever have exposed. Raising it needs auditing every 512-sized
-  buffer/cap across netif/ARP/IPv4/UDP/TCP/DHCP consistently, not a
-  point fix — deliberately scoped OUT of this round.
+  ever have exposed.
+
+  Fixed by auditing every 512-sized buffer/cap across netif/ARP/IPv4/
+  UDP/TCP/DHCP as this entry itself specified, not a point fix: added
+  a single shared `netif_frame_slot_size()` accessor (1514 bytes — a
+  real 1500-byte Ethernet MTU plus the 14-byte header, matching
+  `netif_get_mtu()`'s own long-standing "a real hardware netif
+  implementation later would need its own, larger buffers and report
+  the real 1500 here instead" comment) and replaced every hardcoded
+  `512` literal that fed it — `netif_init`'s ring-buffer allocation,
+  `netif_send_frame`'s cap check AND its own loopback slot-address
+  arithmetic (`head * 512`), `net_send_scratch`/`net_recv_scratch`/
+  `dhcp_frame_scratch`'s own allocations, and `icmp_poll`/`socket_udp_
+  recv`/`tcp_conn_poll`/`dhcp_client_poll`'s own `netif_recv_frame`
+  calls. Self-test-local buffers (DHCP/TCP self-tests' own synthetic
+  frames, already well under the old 512) were deliberately left
+  untouched.
+
+  **Caught a real regression during this fix, not just applied it
+  blind**: raising `netif_get_mtu()` alone, without raising `net_send_
+  scratch`'s own allocation in lockstep, would have reintroduced a
+  genuine heap buffer overflow — `ipv4_send`/`udp_send`/`tcp_send_
+  segment` write directly into that scratch buffer up to `netif_get_
+  mtu()`'s own bound with no independent bounds check of their own,
+  confirmed by reading their bodies directly. Also caught, via the
+  full self-test suite (not assumed safe): a **second, separate**
+  hardcoded `tail * 512` in `netif_recv_frame`'s own loopback branch
+  that mirrored `netif_send_frame`'s `head * 512` slot-address
+  computation — fixing only the send side left the ring buffer's read
+  and write offsets misaligned for every slot past index 0, which
+  broke ARP/ICMP/UDP/TCP/DHCP's own live round-trip self-tests outright
+  (the single-frame `NETIF: loopback send/recv` test itself still
+  passed, coincidentally, since slot 0's address is `0 * anything = 0`
+  either way) until found and fixed too. `dhcp_payload_scratch`
+  (separate from `dhcp_frame_scratch`) was checked and confirmed to
+  NOT need raising — it only ever holds a DHCP request THIS client
+  builds itself (small, predictable, self-determined size), never the
+  incoming server response.
+
+  Verified: full regression battery green after the fix, including a
+  first (broken) attempt that failed ARP/ICMP/UDP/TCP/DHCP's own live
+  round-trip self-tests outright before the second bug above was
+  found — `qemu_run.py`, `phase4_milestone.py` 14/14, `host_harness`
+  315/315 under ASAN/UBSAN (confirms no buffer overflow from the size
+  increase), `heap_stress.py`. Heap headroom cost: ~7KB (262144-byte
+  heap, 139488 bytes free after boot, comfortably unaffected).
 
 - **BLE via USB dongle (Pi 1): HCI transport (DONE, round 57,
   spec-only) + GATT/ATT/L2CAP (not started)** — `[L, several rounds —

@@ -4203,36 +4203,66 @@ fn buf_read_u32_le(buf: mut ref i64, offset: i64) -> u32 {
 // the WiFi dongle) will need later, so ARP/IPv4 above this get written
 // hardware-realistic from the start, not as a loopback-only shortcut.
 fn netif_init() -> i64 {
-  let buf: mut ref i64 = dhruva_alloc_bytes(2048);
+  let buf: mut ref i64 = dhruva_alloc_bytes(4 * netif_frame_slot_size());
   let _ = netif_set_queue_buf(buf);
   return 0;
 }
 
-// Payload MTU: the 512-byte slot (netif_state.S) minus the 14-byte
-// Ethernet header -- deliberately not a real 1500-byte Ethernet MTU,
-// since nothing this project can test end-to-end under QEMU (no real
-// NIC emulated) needs a full-size frame. A real hardware netif
-// implementation later would need its own, larger buffers and report
-// the real 1500 here instead.
+// Round 66 fix: the whole-frame slot size (Ethernet header + payload),
+// now a real 1500-byte-MTU-sized 1514 bytes -- a single shared
+// accessor every buffer/cap derived from frame size must call, the
+// same discipline netif_get_mtu() below already established for the
+// send-path payload bound. Previously a bare 512 (deliberately
+// smaller than a real Ethernet MTU, since nothing this project could
+// test end-to-end under QEMU needed a full-size frame) was hand-
+// copied as a literal at every netif_recv_frame call site instead of
+// derived from one place -- exactly the "loopback-era assumption"
+// docs/TODO.md's own bug entry describes: a real DHCPOFFER (590
+// bytes, options included) exceeds 512 and got silently dropped by
+// dhcp_client_poll specifically, though every 512-sized receive
+// buffer/cap in this file shared the same latent limit. Fixed by
+// introducing this accessor and updating every send- and receive-side
+// site that used to hardcode 512 to call it instead (netif_init's
+// ring-buffer allocation and netif_send_frame's slot arithmetic/cap
+// in this same file; net_send_scratch/net_recv_scratch/dhcp_frame_
+// scratch's own allocations; and icmp_poll/socket_udp_recv/tcp_conn_
+// poll/dhcp_client_poll's own netif_recv_frame calls) -- raising
+// netif_get_mtu() alone, without raising net_send_scratch's own
+// allocation in lockstep, would have reintroduced a real heap buffer
+// overflow instead (ipv4_send/udp_send/tcp_send_segment write
+// directly into that scratch buffer up to netif_get_mtu()'s own bound
+// with no independent bounds check of their own -- confirmed by
+// reading their bodies directly, not assumed). Self-test-local
+// buffers (DHCP/TCP self-tests' own synthetic frames, all well under
+// the old 512 already) were deliberately left untouched -- they
+// construct their own bounded test data and don't exercise this path.
+fn netif_frame_slot_size() -> i64 {
+  return 1514;
+}
+
+// Payload MTU: netif_frame_slot_size() minus the 14-byte Ethernet
+// header -- a real 1500-byte Ethernet MTU as of round 66 (previously
+// 498, deliberately smaller -- see netif_frame_slot_size's own comment
+// for the full round-66 fix).
 //
 // RE-AUDITED (round 20, 2026-08-28), no drift found: ipv4_send/
 // udp_send/tcp_send_segment (round 11 fix) still derive their bounds
 // from this function alone, still boundary-exact (max payload always
-// produces exactly a 512-byte frame, matching netif_send_frame's own
-// cutoff with zero slack), and no new hardcoded literal duplicating
-// this value has crept back in anywhere since. Receive-side callers
-// (socket_udp_recv, tcp_conn_handle_segment, dhcp_client_poll) take
-// the caller's real buffer capacity as a required parameter rather
-// than re-deriving a number, so they were never exposed to this
-// class of drift in the first place -- confirmed every call site's
-// allocation still matches what it passes. Also checked dhcp_find_
-// option_byte/u32's own TLV parsing (untouched by round 11, since
-// that round's scope was send-path bounds only): already correctly
-// bounds-checks every option read against `end` before dereferencing,
-// including the malicious-opt_len case, so no over-read is possible
-// even from a hostile DHCP reply.
+// produces exactly a full-slot-sized frame, matching netif_send_
+// frame's own cutoff with zero slack), and no new hardcoded literal
+// duplicating this value has crept back in anywhere since. Receive-
+// side callers (socket_udp_recv, tcp_conn_handle_segment, dhcp_
+// client_poll) take the caller's real buffer capacity as a required
+// parameter rather than re-deriving a number, so they were never
+// exposed to this class of drift in the first place -- confirmed
+// every call site's allocation still matches what it passes. Also
+// checked dhcp_find_option_byte/u32's own TLV parsing (untouched by
+// round 11, since that round's scope was send-path bounds only):
+// already correctly bounds-checks every option read against `end`
+// before dereferencing, including the malicious-opt_len case, so no
+// over-read is possible even from a hostile DHCP reply.
 fn netif_get_mtu() -> i64 {
-  return 498;
+  return netif_frame_slot_size() - 14;
 }
 
 // Loopback's own placeholder MAC: a locally-administered address (bit
@@ -4291,7 +4321,7 @@ fn netif_get_mac(out_buf: mut ref i64) -> i64 {
 // of waiting for more data that never comes (dwc2_net_bulk_out(...,
 // out_len=0) is exactly that ZLP, per its own comment).
 fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
-  if frame_len > 512 {
+  if frame_len > netif_frame_slot_size() {
     return 0 - 1;
   }
   // Round 62 (fault injection): `fault netdrop <n>` -- see
@@ -4381,7 +4411,7 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
   }
   let qbuf: mut ref i64 = netif_get_queue_buf();
   let head: i64 = netif_get_head();
-  let base: i64 = head * 512;
+  let base: i64 = head * netif_frame_slot_size();
   let i: i64 = 0;
   while i < frame_len {
     let b: u32 = buf_read_byte(buf, i as u32);
@@ -4614,7 +4644,7 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   }
   let qbuf: mut ref i64 = netif_get_queue_buf();
   let tail: i64 = netif_get_tail();
-  let base: i64 = tail * 512;
+  let base: i64 = tail * netif_frame_slot_size();
   let frame_len: i64 = netif_get_slot_len(tail);
   if frame_len > max_len {
     let _ = netif_advance_tail();
@@ -5343,12 +5373,13 @@ fn ipv4_verify_checksum(frame: mut ref i64, ip_offset: i64) -> i64 {
 // not just from a boot self-test.
 // BUG (round 9 audit, 2026-08-27): payload_len used to feed straight
 // into the copy loop below with no check against net_send_scratch's
-// real 512-byte capacity -- netif_send_frame's own `frame_len > 512`
-// check runs AFTER this function has already built (and, for an
-// oversized payload_len, already overrun) the frame in net_send_
-// scratch, so it catches the problem one step too late to actually
-// prevent it. Every caller today passes a small, trusted payload_len,
-// so not live-hit, but this is the send-side twin of the exact bug
+// real capacity (netif_frame_slot_size() bytes, round 66; originally
+// a hardcoded 512) -- netif_send_frame's own `frame_len > netif_
+// frame_slot_size()` check runs AFTER this function has already built
+// (and, for an oversized payload_len, already overrun) the frame in
+// net_send_scratch, so it catches the problem one step too late to
+// actually prevent it. Every caller today passes a small, trusted
+// payload_len, so not live-hit, but this is the send-side twin of the exact bug
 // round 1 already fixed on the receive side (socket_udp_recv/
 // tcp_conn_handle_segment trusting a length without checking
 // destination capacity) -- worth closing before any future socket-API
@@ -5724,7 +5755,7 @@ fn icmp_ping_start(my_mac: mut ref i64, dst_mac: mut ref i64, src_ip: u32, dst_i
 //     tolerance every other live receive path in this project has.
 fn icmp_poll(my_mac: mut ref i64, my_ip: u32, out_payload: mut ref i64, max_payload_len: i64, out_meta: mut ref i64) -> i64 {
   let frame: mut ref i64 = net_recv_scratch_get();
-  let frame_len: i64 = netif_recv_frame(frame, 512);
+  let frame_len: i64 = netif_recv_frame(frame, netif_frame_slot_size());
   if frame_len < 0 {
     return 0 - 1;
   }
@@ -5988,7 +6019,8 @@ fn udp_get_length(frame: mut ref i64, udp_offset: i64) -> u32 {
 // BUG (round 9 audit, 2026-08-27): same send-side missing-bounds-check
 // shape as ipv4_send's own fix above, one layer higher -- payload_len
 // fed udp_build's copy loop with nothing checking it against net_send_
-// scratch's real 512-byte capacity first.
+// scratch's real capacity (netif_frame_slot_size() bytes, round 66;
+// originally a hardcoded 512) first.
 //
 // BUG (round 11 audit, 2026-08-27): same "derive from netif_get_mtu(),
 // don't hardcode a number that merely matches it today" fix as
@@ -6067,7 +6099,7 @@ fn socket_udp_send(my_mac: mut ref i64, local_ip: u32, remote_ip: u32, local_por
 // comment on the identical fix for the send side.
 fn socket_udp_recv(out_payload: mut ref i64, out_meta: mut ref i64, max_payload_len: i64) -> i64 {
   let frame: mut ref i64 = net_recv_scratch_get();
-  let frame_len: i64 = netif_recv_frame(frame, 512);
+  let frame_len: i64 = netif_recv_frame(frame, netif_frame_slot_size());
   if frame_len < 0 {
     return 0 - 1;
   }
@@ -6499,7 +6531,8 @@ fn tcp_verify_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, tcp_offset:
 // BUG (round 9 audit, 2026-08-27): same send-side missing-bounds-check
 // shape as ipv4_send/udp_send's own fixes -- payload_len fed tcp_build_
 // header's copy loop with nothing checking it against net_send_
-// scratch's real 512-byte capacity first.
+// scratch's real capacity (netif_frame_slot_size() bytes, round 66;
+// originally a hardcoded 512) first.
 //
 // BUG (round 11 audit, 2026-08-27): same "derive from netif_get_mtu(),
 // don't hardcode a number that merely matches it today" fix as
@@ -7047,7 +7080,7 @@ fn tcp_conn_poll(my_mac: mut ref i64, out_payload: mut ref i64, max_payload_len:
   let _ = tcp_conn_check_retransmit(1 as u32, my_mac, my_mac);
 
   let frame: mut ref i64 = net_recv_scratch_get();
-  let frame_len: i64 = netif_recv_frame(frame, 512);
+  let frame_len: i64 = netif_recv_frame(frame, netif_frame_slot_size());
   if frame_len < 0 {
     return 0 - 1;
   }
@@ -7618,7 +7651,7 @@ fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
   }
 
   let frame: mut ref i64 = dhcp_frame_scratch_get();
-  let frame_len: i64 = netif_recv_frame(frame, 512);
+  let frame_len: i64 = netif_recv_frame(frame, netif_frame_slot_size());
   if frame_len < 0 {
     return 0 - 1;
   }
@@ -15657,14 +15690,14 @@ fn kernel_main() -> i64 {
   let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(128));
   let _ = usb_bulk_data_scratch_set(dhruva_alloc_bytes(512));
   let _ = tcp_empty_payload_scratch_set(dhruva_alloc_bytes(1));
-  let _ = net_send_scratch_set(dhruva_alloc_bytes(512));
-  let _ = net_recv_scratch_set(dhruva_alloc_bytes(512));
+  let _ = net_send_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
+  let _ = net_recv_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
   let _ = udp_send_arp_scratch_set(dhruva_alloc_bytes(6));
   let _ = arp_resolve_scratch_set(dhruva_alloc_bytes(64));
   let _ = dhcp_server_mac_scratch_set(dhruva_alloc_bytes(6));
   let _ = arp_resolve_mac_scratch_set(dhruva_alloc_bytes(6));
   let _ = dhcp_payload_scratch_set(dhruva_alloc_bytes(300));
-  let _ = dhcp_frame_scratch_set(dhruva_alloc_bytes(512));
+  let _ = dhcp_frame_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
   let _ = dhcp_bcast_mac_scratch_set(dhruva_alloc_bytes(8));
 
   let _ = sdhost_cmd_timed_out_self_test();
