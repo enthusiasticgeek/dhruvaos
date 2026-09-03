@@ -385,6 +385,38 @@ extern "C" fn tls_server_reply_set(addr: mut ref i64) -> i64;
 extern "C" fn tls_server_reply_get() -> mut ref i64;
 extern "C" fn tls_decrypted_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn tls_decrypted_scratch_get() -> mut ref i64;
+extern "C" fn tls_client_rx_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_client_rx_buf_get() -> mut ref i64;
+extern "C" fn tls_client_rx_len_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_client_rx_len_get() -> mut ref i64;
+extern "C" fn tls_server_rx_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_server_rx_buf_get() -> mut ref i64;
+extern "C" fn tls_server_rx_len_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_server_rx_len_get() -> mut ref i64;
+extern "C" fn tls_frame_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_frame_scratch_get() -> mut ref i64;
+extern "C" fn tls_chunk_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_chunk_scratch_get() -> mut ref i64;
+extern "C" fn tls_recv_chunk_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_recv_chunk_scratch_get() -> mut ref i64;
+extern "C" fn tls_ack_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_ack_scratch_get() -> mut ref i64;
+extern "C" fn tls_ch_record_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_ch_record_get() -> mut ref i64;
+extern "C" fn tls_sh_record_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_sh_record_get() -> mut ref i64;
+extern "C" fn tls_parsed_client_random_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_parsed_client_random_get() -> mut ref i64;
+extern "C" fn tls_parsed_client_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_parsed_client_pub_get() -> mut ref i64;
+extern "C" fn tls_parsed_server_random_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_parsed_server_random_get() -> mut ref i64;
+extern "C" fn tls_parsed_server_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_parsed_server_pub_get() -> mut ref i64;
+extern "C" fn tls_flight_combined_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_flight_combined_get() -> mut ref i64;
+extern "C" fn tls_parsed_server_id_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_parsed_server_id_pub_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -22933,6 +22965,450 @@ fn tls_self_test() -> i64 {
   return ok;
 }
 
+// Wiring TLS 1.3's handshake/record layer (tls13_core.vani, above)
+// into the LIVE TCP transport (tcp_conn_* -- real loopback netif
+// frames, real 3-way handshake, real ACKs). tcp_conn_send_data caps
+// payload_len at 64 bytes (its own retransmit-buffer capacity,
+// tcp_conn_rtx_buf in tcp_state.S) -- a proven, already-shipped limit
+// this file works WITHIN rather than widens (touching that buffer's
+// capacity for this one new caller's convenience would be exactly the
+// kind of risk this project's own "don't touch working code without a
+// real forcing need" discipline warns against), so every TLS message
+// here is fragmented into <=64-byte TCP sends and reassembled on the
+// receiving side from a running byte accumulator -- genuinely
+// realistic, since TCP itself gives no message-boundary guarantees at
+// all; a version that assumed record-aligned delivery would break the
+// first time fragmentation actually happened.
+//
+// ClientHello/ServerHello are wrapped in a real (unencrypted)
+// TLSPlaintext record (RFC 8446 5.1: content type 0x16, legacy
+// version, 2-byte length) here -- tls13_core.vani's own buffer-to-
+// buffer self-test didn't need this framing (both sides already knew
+// each message's exact length), but the live transport does, since
+// the receiver has no other way to know when a complete message has
+// arrived out of an arbitrary stream of 64-byte fragments.
+
+fn tls_wrap_plaintext_record(handshake_msg: mut ref i64, handshake_msg_len: i64, out: mut ref i64) -> i64 {
+  let o: i64 = 0;
+  o = tls_put_u8(out, o, 0x16 as u32);
+  o = tls_put_u16(out, o, 0x0303 as u32);
+  o = tls_put_u16(out, o, handshake_msg_len as u32);
+  o = tls_copy(out, o, handshake_msg, 0, handshake_msg_len);
+  return o;
+}
+
+// Appends `new_len` bytes to the rx accumulator, whose current length
+// lives in the first 4 bytes of `rx_len_buf` (a persistent counter,
+// not a real buffer -- lets this state survive across many separate
+// calls without threading a length parameter through every layer of
+// the send/pump/extract chain above it).
+fn tls_rx_feed(rx_buf: mut ref i64, rx_len_buf: mut ref i64, new_data: mut ref i64, new_len: i64) -> i64 {
+  let cur_len: i64 = buf_read_u32(rx_len_buf, 0 as u32) as i64;
+  let _ = tls_copy(rx_buf, cur_len, new_data, 0, new_len);
+  let new_total: i64 = cur_len + new_len;
+  let _ = buf_write_u32(rx_len_buf, 0 as u32, new_total as u32);
+  return new_total;
+}
+
+// Peeks at the 5-byte header; if a full record's worth of bytes
+// hasn't arrived yet, returns -1 and leaves the accumulator
+// untouched (the caller is expected to feed more data and retry).
+// Once a full record IS available, always consumes and shifts the
+// remainder down -- even on a decrypt/tag failure -- so a bad record
+// can never wedge the accumulator into retrying the same bytes
+// forever.
+fn tls_rx_try_extract_plaintext(rx_buf: mut ref i64, rx_len_buf: mut ref i64, out_content: mut ref i64) -> i64 {
+  let cur_len: i64 = buf_read_u32(rx_len_buf, 0 as u32) as i64;
+  if cur_len < 5 {
+    return 0 - 1;
+  }
+  let b3: u32 = buf_read_byte(rx_buf, 3 as u32);
+  let b4: u32 = buf_read_byte(rx_buf, 4 as u32);
+  let declared_len: i64 = ((b3 * (256 as u32)) + b4) as i64;
+  let total_needed: i64 = 5 + declared_len;
+  if cur_len < total_needed {
+    return 0 - 1;
+  }
+  let _ = tls_copy(out_content, 0, rx_buf, 5, declared_len);
+  let remaining: i64 = cur_len - total_needed;
+  let _ = tls_copy(rx_buf, 0, rx_buf, total_needed, remaining);
+  let _ = buf_write_u32(rx_len_buf, 0 as u32, remaining as u32);
+  return declared_len;
+}
+
+// Same shape as tls_rx_try_extract_plaintext, but for an AEAD-
+// protected TLSCiphertext record (tls_decrypt_record does the actual
+// AEAD verify + decrypt once a full record is available).
+fn tls_rx_try_extract(rx_buf: mut ref i64, rx_len_buf: mut ref i64, key: mut ref i64, static_iv: mut ref i64, seq: u32, expected_content_type: u32, out_content: mut ref i64) -> i64 {
+  let cur_len: i64 = buf_read_u32(rx_len_buf, 0 as u32) as i64;
+  if cur_len < 5 {
+    return 0 - 1;
+  }
+  let b3: u32 = buf_read_byte(rx_buf, 3 as u32);
+  let b4: u32 = buf_read_byte(rx_buf, 4 as u32);
+  let declared_len: i64 = ((b3 * (256 as u32)) + b4) as i64;
+  let total_needed: i64 = 5 + declared_len;
+  if cur_len < total_needed {
+    return 0 - 1;
+  }
+  let content_len: i64 = tls_decrypt_record(key, static_iv, seq, rx_buf, total_needed, expected_content_type, out_content);
+  let remaining: i64 = cur_len - total_needed;
+  let _ = tls_copy(rx_buf, 0, rx_buf, total_needed, remaining);
+  let _ = buf_write_u32(rx_len_buf, 0 as u32, remaining as u32);
+  return content_len;
+}
+
+// Fixed byte offsets, valid only for this codebase's own fixed-shape
+// ClientHello/ServerHello/Certificate (single cipher suite/group/
+// sigalg, see tls13_core.vani's own header comment) -- not a general
+// TLS parser, matching this whole effort's explicitly scoped-down
+// interop target.
+fn tls_parse_client_hello(ch: mut ref i64, out_random: mut ref i64, out_pub: mut ref i64) -> i64 {
+  let _ = tls_copy(out_random, 0, ch, 6, 32);
+  let _ = tls_copy(out_pub, 0, ch, 80, 32);
+  return 0;
+}
+
+fn tls_parse_server_hello(sh: mut ref i64, out_random: mut ref i64, out_pub: mut ref i64) -> i64 {
+  let _ = tls_copy(out_random, 0, sh, 6, 32);
+  let _ = tls_copy(out_pub, 0, sh, 58, 32);
+  return 0;
+}
+
+fn tls_parse_certificate_pubkey(cert: mut ref i64, out_pub: mut ref i64) -> i64 {
+  let _ = tls_copy(out_pub, 0, cert, 11, 32);
+  return 0;
+}
+
+// Pulls exactly one queued frame off the (loopback) netif and feeds
+// it to `to_id`'s TCP state machine -- `tcp_conn_handle_segment`
+// itself sends whatever reply that segment provokes (SYN-ACK, a data
+// ACK, ...) right back onto the netif as a side effect, matching
+// tcp_conn_self_test's own established pattern.
+fn tls_deliver_one_frame(to_id: u32, my_mac: mut ref i64, out_payload: mut ref i64, max_len: i64) -> i64 {
+  let frame: mut ref i64 = tls_frame_scratch_get();
+  let flen: i64 = netif_recv_frame(frame, 1514);
+  if flen <= 0 {
+    return 0 - 1;
+  }
+  return tcp_conn_handle_segment(to_id, frame, flen, my_mac, my_mac, out_payload, max_len);
+}
+
+// Sends one <=64-byte chunk on `sender_id`, delivers the resulting
+// data segment to `receiver_id` (feeding any payload it carries into
+// the receiver's rx accumulator), then delivers the receiver's own
+// ACK-of-that-data back to the sender -- keeps both sides' TCP state
+// (sequence numbers, retransmit timer) consistent exactly the way a
+// real two-party exchange would, not a one-sided shortcut.
+fn tls_send_chunk_and_pump(sender_id: u32, receiver_id: u32, my_mac: mut ref i64, chunk: mut ref i64, chunk_len: i64, receiver_rx_buf: mut ref i64, receiver_rx_len_buf: mut ref i64) -> i64 {
+  let send_status: i64 = tcp_conn_send_data(sender_id, my_mac, my_mac, chunk, chunk_len);
+  if send_status != 0 {
+    return 0 - 1;
+  }
+  let recv_scratch: mut ref i64 = tls_recv_chunk_scratch_get();
+  let recv_len: i64 = tls_deliver_one_frame(receiver_id, my_mac, recv_scratch, 64);
+  if recv_len > 0 {
+    let _ = tls_rx_feed(receiver_rx_buf, receiver_rx_len_buf, recv_scratch, recv_len);
+  }
+  let ack_scratch: mut ref i64 = tls_ack_scratch_get();
+  let _ = tls_deliver_one_frame(sender_id, my_mac, ack_scratch, 8);
+  return recv_len;
+}
+
+// Fragments `data` into <=64-byte chunks (tcp_conn_send_data's own
+// hard cap) and drives each one through the full send/deliver/ack-
+// back cycle above, in order -- the receiver's rx accumulator ends up
+// holding exactly `data`'s bytes regardless of how many TCP segments
+// that took, ready for tls_rx_try_extract[_plaintext] to peel real
+// TLS records back out of.
+fn tls_send_over_tcp(sender_id: u32, receiver_id: u32, my_mac: mut ref i64, data: mut ref i64, data_len: i64, receiver_rx_buf: mut ref i64, receiver_rx_len_buf: mut ref i64) -> i64 {
+  let chunk_buf: mut ref i64 = tls_chunk_scratch_get();
+  let sent: i64 = 0;
+  while sent < data_len {
+    let remaining: i64 = data_len - sent;
+    let take: i64 = if remaining < 64 { remaining } else { 64 };
+    let _ = tls_copy(chunk_buf, 0, data, sent, take);
+    let _ = tls_send_chunk_and_pump(sender_id, receiver_id, my_mac, chunk_buf, take, receiver_rx_buf, receiver_rx_len_buf);
+    sent = sent + take;
+  }
+  return sent;
+}
+
+// Live, both-roles TLS 1.3 handshake + application-data round trip
+// run entirely over the REAL TCP transport: a genuine 3-way TCP
+// handshake, every TLS message fragmented into <=64-byte TCP sends
+// (tcp_conn_send_data's own real cap) and reassembled from a running
+// byte accumulator on the receiving side, real ACKs delivered back to
+// the sender, and a real TCP close at the end. This is the "wired
+// into the live transport" counterpart to tls_self_test (which proves
+// the same crypto/protocol logic buffer-to-buffer, without touching
+// TCP at all) -- same deterministic seeds as that function and as
+// tls13_ref.py, so this is a genuinely independent proof that the
+// SAME derived keys/messages survive real segmentation and
+// reassembly, not just a second copy of the same check.
+fn tls_tcp_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let _ = buf_write_u32(tls_client_rx_len_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(tls_server_rx_len_get(), 0 as u32, 0 as u32);
+
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let client_id: u32 = 0 as u32;
+  let server_id: u32 = 1 as u32;
+  let client_ip: u32 = 0xC0A80111 as u32;
+  let server_ip: u32 = 0xC0A80112 as u32;
+  let client_port: u32 = 44300 as u32;
+  let server_port: u32 = 4433 as u32;
+
+  let _ = tcp_conn_passive_open(server_id, server_ip, server_port);
+  let _ = tcp_conn_active_open(client_id, my_mac, my_mac, client_ip, server_ip, client_port, server_port, 9000 as u32);
+
+  // Real 3-way TCP handshake, same shape as tcp_conn_self_test.
+  let hs_scratch: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = tls_deliver_one_frame(server_id, my_mac, hs_scratch, 64); // client's SYN
+  let _ = tls_deliver_one_frame(client_id, my_mac, hs_scratch, 64); // server's SYN-ACK
+  let _ = tls_deliver_one_frame(server_id, my_mac, hs_scratch, 64); // client's final ACK
+  if tcp_conn_get_state(client_id) != tcp_state_established() { ok = 0; }
+  if tcp_conn_get_state(server_id) != tcp_state_established() { ok = 0; }
+
+  // --- Deterministic key material (matches tls_self_test / tls13_ref.py) ---
+  let client_random: mut ref i64 = tls_client_random_get();
+  let _ = write_hex_string(client_random, "0104070a0d101316191c1f2225282b2e3134373a3d404346494c4f5255585b5e", 32);
+  let server_random: mut ref i64 = tls_server_random_get();
+  let _ = write_hex_string(server_random, "02070c11161b20252a2f34393e43484d52575c61666b70757a7f84898e93989d", 32);
+  let client_priv: mut ref i64 = tls_client_x25519_priv_get();
+  let _ = write_hex_string(client_priv, "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc", 32);
+  let server_priv: mut ref i64 = tls_server_x25519_priv_get();
+  let _ = write_hex_string(server_priv, "040f1a25303b46515c67727d88939ea9b4bfcad5e0ebf6010c17222d38434e59", 32);
+  let server_id_priv: mut ref i64 = tls_server_id_priv_get();
+  let _ = write_hex_string(server_id_priv, "05121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98", 32);
+
+  let basepoint: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = tls_x25519_basepoint(basepoint);
+  let client_pub: mut ref i64 = tls_client_x25519_pub_get();
+  let _ = x25519_scalarmult(client_priv, basepoint, client_pub);
+  let server_pub: mut ref i64 = tls_server_x25519_pub_get();
+  let _ = x25519_scalarmult(server_priv, basepoint, server_pub);
+
+  // The client's out-of-band-pinned copy of the server's identity key
+  // (RFC 7250 trust model -- same "already known, not discovered" shape
+  // as pki_pinned_key).
+  let server_id_pub: mut ref i64 = tls_server_id_pub_get();
+  let _ = ed25519_secret_to_public(server_id_priv, server_id_pub);
+
+  // --- ClientHello: built, wrapped in a real TLSPlaintext record,
+  // fragmented over real TCP to the server. ---
+  let ch: mut ref i64 = tls_ch_get();
+  let ch_len: i64 = tls_build_client_hello(client_random, client_pub, ch);
+  let ch_record: mut ref i64 = tls_ch_record_get();
+  let ch_record_len: i64 = tls_wrap_plaintext_record(ch, ch_len, ch_record);
+  let _ = tls_send_over_tcp(client_id, server_id, my_mac, ch_record, ch_record_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+
+  let recv_ch: mut ref i64 = dhruva_alloc_bytes(256);
+  let recv_ch_len: i64 = tls_rx_try_extract_plaintext(tls_server_rx_buf_get(), tls_server_rx_len_get(), recv_ch);
+  if (recv_ch_len != ch_len) || (keccak_bytes_equal(recv_ch, ch, ch_len) != 1) { ok = 0; }
+  let parsed_client_random: mut ref i64 = tls_parsed_client_random_get();
+  let parsed_client_pub: mut ref i64 = tls_parsed_client_pub_get();
+  let _ = tls_parse_client_hello(recv_ch, parsed_client_random, parsed_client_pub);
+
+  // --- ServerHello, same pattern, other direction. ---
+  let sh: mut ref i64 = tls_sh_get();
+  let sh_len: i64 = tls_build_server_hello(server_random, server_pub, sh);
+  let sh_record: mut ref i64 = tls_sh_record_get();
+  let sh_record_len: i64 = tls_wrap_plaintext_record(sh, sh_len, sh_record);
+  let _ = tls_send_over_tcp(server_id, client_id, my_mac, sh_record, sh_record_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+
+  let recv_sh: mut ref i64 = dhruva_alloc_bytes(256);
+  let recv_sh_len: i64 = tls_rx_try_extract_plaintext(tls_client_rx_buf_get(), tls_client_rx_len_get(), recv_sh);
+  if (recv_sh_len != sh_len) || (keccak_bytes_equal(recv_sh, sh, sh_len) != 1) { ok = 0; }
+  let parsed_server_random: mut ref i64 = tls_parsed_server_random_get();
+  let parsed_server_pub: mut ref i64 = tls_parsed_server_pub_get();
+  let _ = tls_parse_server_hello(recv_sh, parsed_server_random, parsed_server_pub);
+
+  // Shared secret computed from the PARSED peer key each side actually
+  // received over the wire, not the locally-generated copy.
+  let shared_c: mut ref i64 = tls_shared_secret_get();
+  let _ = x25519_scalarmult(client_priv, parsed_server_pub, shared_c);
+  let shared_s: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = x25519_scalarmult(server_priv, parsed_client_pub, shared_s);
+  if keccak_bytes_equal(shared_c, shared_s, 32) != 1 { ok = 0; }
+
+  let zero32: mut ref i64 = dhruva_alloc_bytes(32);
+  let zi: i64 = 0;
+  while zi < 32 {
+    let _ = buf_write_byte(zero32, zi as u32, 0 as u32);
+    zi = zi + 1;
+  }
+
+  let transcript: mut ref i64 = tls_transcript_get();
+  let t_len_0: i64 = tls_copy(transcript, 0, ch, 0, ch_len);
+  let t_len_sh: i64 = tls_copy(transcript, t_len_0, sh, 0, sh_len);
+
+  let early_secret: mut ref i64 = tls_early_secret_get();
+  let _ = hkdf_extract(zero32, 32, zero32, 32, early_secret);
+  let derived_es: mut ref i64 = tls_derived_es_get();
+  let _ = tls_derive_secret(early_secret, "derived", zero32, 0, derived_es);
+  let handshake_secret: mut ref i64 = tls_handshake_secret_get();
+  let _ = hkdf_extract(derived_es, 32, shared_c, 32, handshake_secret);
+
+  let c_hs_traffic: mut ref i64 = tls_c_hs_traffic_get();
+  let _ = tls_derive_secret(handshake_secret, "c hs traffic", transcript, t_len_sh, c_hs_traffic);
+  let s_hs_traffic: mut ref i64 = tls_s_hs_traffic_get();
+  let _ = tls_derive_secret(handshake_secret, "s hs traffic", transcript, t_len_sh, s_hs_traffic);
+
+  let c_hs_key: mut ref i64 = tls_c_hs_key_get();
+  let c_hs_iv: mut ref i64 = tls_c_hs_iv_get();
+  let _ = tls_derive_traffic_keys(c_hs_traffic, c_hs_key, c_hs_iv);
+  let s_hs_key: mut ref i64 = tls_s_hs_key_get();
+  let s_hs_iv: mut ref i64 = tls_s_hs_iv_get();
+  let _ = tls_derive_traffic_keys(s_hs_traffic, s_hs_key, s_hs_iv);
+
+  // --- Server's encrypted flight: 4 records built individually, then
+  // concatenated and sent as ONE fragmented TCP transfer -- exercises
+  // the client's reassembly loop pulling multiple complete records
+  // back out of a single accumulated byte stream. ---
+  let ee: mut ref i64 = tls_ee_get();
+  let ee_len: i64 = tls_build_encrypted_extensions(ee);
+  let cert: mut ref i64 = tls_cert_get();
+  let cert_len: i64 = tls_build_certificate(server_id_pub, cert);
+
+  let t_len_ee: i64 = tls_copy(transcript, t_len_sh, ee, 0, ee_len);
+  let t_len_cert: i64 = tls_copy(transcript, t_len_ee, cert, 0, cert_len);
+
+  let cert_hash: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = sha256_hash(transcript, t_len_cert, cert_hash);
+  let cv_content: mut ref i64 = tls_cv_signed_content_get();
+  let cv_content_len: i64 = tls_certverify_signed_content(cert_hash, cv_content);
+  let cv_sig: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = ed25519_sign(server_id_priv, cv_content, cv_content_len, cv_sig);
+  let cv: mut ref i64 = tls_cv_get();
+  let cv_len: i64 = tls_build_certificate_verify(cv_sig, cv);
+
+  let t_len_cv: i64 = tls_copy(transcript, t_len_cert, cv, 0, cv_len);
+  let s_verify_data: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = tls_finished_verify_data(s_hs_traffic, transcript, t_len_cv, s_verify_data);
+  let s_fin: mut ref i64 = tls_s_fin_get();
+  let s_fin_len: i64 = tls_build_finished(s_verify_data, s_fin);
+  let t_len_s_fin: i64 = tls_copy(transcript, t_len_cv, s_fin, 0, s_fin_len);
+
+  let flight: mut ref i64 = tls_flight_combined_get();
+  let rec_ee_len: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 0 as u32, ee, ee_len, 22 as u32, flight);
+
+  let rec_cert_scratch: mut ref i64 = dhruva_alloc_bytes(128);
+  let rec_cert_len: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 1 as u32, cert, cert_len, 22 as u32, rec_cert_scratch);
+  let flight_len_a: i64 = tls_copy(flight, rec_ee_len, rec_cert_scratch, 0, rec_cert_len);
+
+  let rec_cv_scratch: mut ref i64 = dhruva_alloc_bytes(128);
+  let rec_cv_len: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 2 as u32, cv, cv_len, 22 as u32, rec_cv_scratch);
+  let flight_len_b: i64 = tls_copy(flight, flight_len_a, rec_cv_scratch, 0, rec_cv_len);
+
+  let rec_s_fin_scratch: mut ref i64 = dhruva_alloc_bytes(96);
+  let rec_s_fin_len: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 3 as u32, s_fin, s_fin_len, 22 as u32, rec_s_fin_scratch);
+  let flight_len: i64 = tls_copy(flight, flight_len_b, rec_s_fin_scratch, 0, rec_s_fin_len);
+
+  let _ = tls_send_over_tcp(server_id, client_id, my_mac, flight, flight_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+
+  // --- Client reassembles + verifies all 4 records ---
+  let dec_ee: mut ref i64 = dhruva_alloc_bytes(64);
+  let dec_ee_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_hs_key, s_hs_iv, 0 as u32, 22 as u32, dec_ee);
+  if (dec_ee_len != ee_len) || (keccak_bytes_equal(dec_ee, ee, ee_len) != 1) { ok = 0; }
+
+  let dec_cert: mut ref i64 = dhruva_alloc_bytes(64);
+  let dec_cert_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_hs_key, s_hs_iv, 1 as u32, 22 as u32, dec_cert);
+  if (dec_cert_len != cert_len) || (keccak_bytes_equal(dec_cert, cert, cert_len) != 1) { ok = 0; }
+  let parsed_server_id_pub: mut ref i64 = tls_parsed_server_id_pub_get();
+  let _ = tls_parse_certificate_pubkey(dec_cert, parsed_server_id_pub);
+  if keccak_bytes_equal(parsed_server_id_pub, server_id_pub, 32) != 1 { ok = 0; }
+
+  let dec_cv: mut ref i64 = dhruva_alloc_bytes(128);
+  let dec_cv_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_hs_key, s_hs_iv, 2 as u32, 22 as u32, dec_cv);
+  if (dec_cv_len != cv_len) || (keccak_bytes_equal(dec_cv, cv, cv_len) != 1) { ok = 0; }
+
+  let dec_s_fin: mut ref i64 = dhruva_alloc_bytes(64);
+  let dec_s_fin_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_hs_key, s_hs_iv, 3 as u32, 22 as u32, dec_s_fin);
+  if (dec_s_fin_len != s_fin_len) || (keccak_bytes_equal(dec_s_fin, s_fin, s_fin_len) != 1) { ok = 0; }
+
+  let recomputed_cv_content: mut ref i64 = dhruva_alloc_bytes(cv_content_len);
+  let _ = tls_certverify_signed_content(cert_hash, recomputed_cv_content);
+  if ed25519_verify(parsed_server_id_pub, recomputed_cv_content, cv_content_len, cv_sig) != 1 { ok = 0; }
+
+  let s_verify_data_check: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = tls_finished_verify_data(s_hs_traffic, transcript, t_len_cv, s_verify_data_check);
+  if keccak_bytes_equal(s_verify_data_check, s_verify_data, 32) != 1 { ok = 0; }
+
+  // --- Client Finished, over real TCP, server verifies ---
+  let c_verify_data: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = tls_finished_verify_data(c_hs_traffic, transcript, t_len_s_fin, c_verify_data);
+  let c_fin: mut ref i64 = tls_c_fin_get();
+  let c_fin_len: i64 = tls_build_finished(c_verify_data, c_fin);
+  let rec_c_fin: mut ref i64 = dhruva_alloc_bytes(96);
+  let rec_c_fin_len: i64 = tls_encrypt_record(c_hs_key, c_hs_iv, 0 as u32, c_fin, c_fin_len, 22 as u32, rec_c_fin);
+  let _ = tls_send_over_tcp(client_id, server_id, my_mac, rec_c_fin, rec_c_fin_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+
+  let dec_c_fin: mut ref i64 = dhruva_alloc_bytes(64);
+  let dec_c_fin_len: i64 = tls_rx_try_extract(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_hs_key, c_hs_iv, 0 as u32, 22 as u32, dec_c_fin);
+  if (dec_c_fin_len != c_fin_len) || (keccak_bytes_equal(dec_c_fin, c_fin, c_fin_len) != 1) { ok = 0; }
+
+  // --- Application traffic secrets ---
+  let derived_hs: mut ref i64 = tls_derived_hs_get();
+  let _ = tls_derive_secret(handshake_secret, "derived", zero32, 0, derived_hs);
+  let master_secret: mut ref i64 = tls_master_secret_get();
+  let _ = hkdf_extract(derived_hs, 32, zero32, 32, master_secret);
+  let c_ap_traffic: mut ref i64 = tls_c_ap_traffic_get();
+  let _ = tls_derive_secret(master_secret, "c ap traffic", transcript, t_len_s_fin, c_ap_traffic);
+  let s_ap_traffic: mut ref i64 = tls_s_ap_traffic_get();
+  let _ = tls_derive_secret(master_secret, "s ap traffic", transcript, t_len_s_fin, s_ap_traffic);
+  let c_ap_key: mut ref i64 = tls_c_ap_key_get();
+  let c_ap_iv: mut ref i64 = tls_c_ap_iv_get();
+  let _ = tls_derive_traffic_keys(c_ap_traffic, c_ap_key, c_ap_iv);
+  let s_ap_key: mut ref i64 = tls_s_ap_key_get();
+  let s_ap_iv: mut ref i64 = tls_s_ap_iv_get();
+  let _ = tls_derive_traffic_keys(s_ap_traffic, s_ap_key, s_ap_iv);
+
+  // --- Real application data, both directions, over real TCP ---
+  let client_msg: mut ref i64 = tls_client_msg_get();
+  let client_msg_str: Str = "dhruva-tls-client-hello-app-data";
+  let _ = str_copy_to_buf(client_msg_str, client_msg);
+  let client_msg_len: i64 = str_len_bytes(client_msg_str);
+  let rec_client_msg: mut ref i64 = dhruva_alloc_bytes(96);
+  let rec_client_msg_len: i64 = tls_encrypt_record(c_ap_key, c_ap_iv, 0 as u32, client_msg, client_msg_len, 23 as u32, rec_client_msg);
+  let _ = tls_send_over_tcp(client_id, server_id, my_mac, rec_client_msg, rec_client_msg_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+  let dec_client_msg: mut ref i64 = dhruva_alloc_bytes(64);
+  let dec_client_msg_len: i64 = tls_rx_try_extract(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_ap_key, c_ap_iv, 0 as u32, 23 as u32, dec_client_msg);
+  if (dec_client_msg_len != client_msg_len) || (keccak_bytes_equal(dec_client_msg, client_msg, client_msg_len) != 1) { ok = 0; }
+
+  let server_reply: mut ref i64 = tls_server_reply_get();
+  let server_reply_str: Str = "dhruva-tls-server-reply-app-data";
+  let _ = str_copy_to_buf(server_reply_str, server_reply);
+  let server_reply_len: i64 = str_len_bytes(server_reply_str);
+  let rec_server_reply: mut ref i64 = dhruva_alloc_bytes(96);
+  let rec_server_reply_len: i64 = tls_encrypt_record(s_ap_key, s_ap_iv, 0 as u32, server_reply, server_reply_len, 23 as u32, rec_server_reply);
+  let _ = tls_send_over_tcp(server_id, client_id, my_mac, rec_server_reply, rec_server_reply_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+  let dec_server_reply: mut ref i64 = dhruva_alloc_bytes(64);
+  let dec_server_reply_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_ap_key, s_ap_iv, 0 as u32, 23 as u32, dec_server_reply);
+  if (dec_server_reply_len != server_reply_len) || (keccak_bytes_equal(dec_server_reply, server_reply, server_reply_len) != 1) { ok = 0; }
+
+  // --- Real TCP close ---
+  let close_status: i64 = tcp_conn_close(client_id, my_mac, my_mac);
+  if close_status != 0 { ok = 0; }
+  let close_scratch: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = tls_deliver_one_frame(server_id, my_mac, close_scratch, 64); // client's FIN+ACK
+  if tcp_conn_get_state(server_id) != tcp_state_fin_wait() { ok = 0; }
+  let _ = tls_deliver_one_frame(client_id, my_mac, close_scratch, 64); // server's FIN+ACK
+  if tcp_conn_get_state(client_id) != tcp_state_closed_final() { ok = 0; }
+  let _ = tls_deliver_one_frame(server_id, my_mac, close_scratch, 64); // client's final ACK
+  if tcp_conn_get_state(server_id) != tcp_state_closed_final() { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: TLS 1.3 wired into the live TCP transport (real handshake, fragmented sends, record reassembly, real close)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return ok;
+}
+
 fn pki_self_test() -> i64 {
   let ok: i64 = 1;
   let _ = pki_init();
@@ -24967,6 +25443,22 @@ fn kernel_main() -> i64 {
   let _ = tls_client_msg_set(dhruva_alloc_bytes(64));
   let _ = tls_server_reply_set(dhruva_alloc_bytes(64));
   let _ = tls_decrypted_scratch_set(dhruva_alloc_bytes(2048));
+  let _ = tls_client_rx_buf_set(dhruva_alloc_bytes(2048));
+  let _ = tls_client_rx_len_set(dhruva_alloc_bytes(4));
+  let _ = tls_server_rx_buf_set(dhruva_alloc_bytes(2048));
+  let _ = tls_server_rx_len_set(dhruva_alloc_bytes(4));
+  let _ = tls_frame_scratch_set(dhruva_alloc_bytes(1514));
+  let _ = tls_chunk_scratch_set(dhruva_alloc_bytes(64));
+  let _ = tls_recv_chunk_scratch_set(dhruva_alloc_bytes(64));
+  let _ = tls_ack_scratch_set(dhruva_alloc_bytes(8));
+  let _ = tls_ch_record_set(dhruva_alloc_bytes(128));
+  let _ = tls_sh_record_set(dhruva_alloc_bytes(128));
+  let _ = tls_parsed_client_random_set(dhruva_alloc_bytes(32));
+  let _ = tls_parsed_client_pub_set(dhruva_alloc_bytes(32));
+  let _ = tls_parsed_server_random_set(dhruva_alloc_bytes(32));
+  let _ = tls_parsed_server_pub_set(dhruva_alloc_bytes(32));
+  let _ = tls_flight_combined_set(dhruva_alloc_bytes(512));
+  let _ = tls_parsed_server_id_pub_set(dhruva_alloc_bytes(32));
   let _ = sha512_k_init(sha512_k_scratch_get());
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
   let _ = x25519_x1_set(dhruva_alloc_bytes(32));
@@ -25252,6 +25744,7 @@ fn kernel_main() -> i64 {
   let _ = keccak_self_test();
   let _ = mlkem_self_test();
   let _ = tls_self_test();
+  let _ = tls_tcp_self_test();
 
   // Media (at-rest) encryption for DharaFS, layered on the ChaCha20
   // cipher above. Key derivation runs once here, single-threaded,

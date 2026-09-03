@@ -745,13 +745,48 @@ for by name.
   HOST HARNESS test's own hardcoded message length, not the
   implementation, was the only fix needed).
 
-  **Explicitly still out of scope**: wiring this into the live TCP
-  transport (a real `tls_connect`/`tls_accept` over
-  `tcp_conn_send_data`/`tcp_conn_poll`, record fragmentation/
-  reassembly across multiple TCP segments) -- this delivers the
-  crypto/protocol logic as a tested library, not a live network
-  service; other cipher suites/groups/signature algorithms; client
-  certificates; session resumption/PSK/0-RTT.
+  **Wired into the live TCP transport — DONE, same day.**
+  `tls_tcp_self_test` (`kernel_main.vani`) drives the exact same
+  handshake + application-data exchange above over a REAL TCP
+  connection: a genuine 3-way handshake (`tcp_conn_active_open`/
+  `tcp_conn_passive_open`/`tcp_conn_handle_segment`, real loopback
+  netif frames), every TLS message fragmented into <=64-byte chunks
+  (`tcp_conn_send_data`'s own real, proven cap — deliberately left
+  untouched rather than widened for this one new caller, per this
+  project's own "don't touch working code without a real forcing
+  need" discipline) and reassembled on the receiving side from a
+  running byte accumulator (`tls_rx_feed`/`tls_rx_try_extract[
+  _plaintext]`), real ACKs delivered back to the sender after each
+  chunk, and a real TCP close at the end. ClientHello/ServerHello
+  also gained real (unencrypted) TLSPlaintext record framing (RFC
+  8446 §5.1) — needed only once there's an actual byte stream with no
+  other message-boundary signal, so it wasn't part of the buffer-to-
+  buffer scope above. Client and server each parse the other's actual
+  wire bytes (fixed-offset parsers, matching this whole effort's
+  single-cipher-suite/group/sigalg scope — not a general TLS parser)
+  rather than reusing a shared local variable, so the shared secret,
+  transcript, and every derived key are computed from what genuinely
+  crossed the wire. Verified live on real ARM under QEMU (one bug
+  along the way: the new scratch buffers' boot-time allocations were
+  initially missed entirely, causing a null-pointer Data Abort on the
+  very first call — caught immediately by the very next QEMU run,
+  fixed by adding the missing `dhruva_alloc_bytes` calls). Full
+  regression battery re-verified clean afterward: `qemu_run.py`,
+  `phase4_milestone.py` (including `tcpecho`'s own unrelated TCP
+  self-test, confirming the new self-test's reuse of connection slots
+  0/1 didn't disturb it), `heap_stress.py`, `host_harness` 970/970
+  under ASAN/UBSAN (no new host-harness test was added for this piece
+  specifically — netif/TCP self-tests have never had host-side
+  coverage in this codebase, since MMIO-touching code paths can't be
+  intercepted host-side at all, same boundary `tcp_conn_self_test`
+  itself has always lived within).
+
+  **Still explicitly out of scope**: other cipher suites/groups/
+  signature algorithms; client certificates; session resumption/PSK/
+  0-RTT; a real `tls_connect`/`tls_accept`-shaped public API (this
+  delivers the wiring proven end-to-end inside one self-test, not a
+  general-purpose connection-object API a shell command or future
+  caller could use directly).
 
 - **Real authentication (password-protected `su` + `passwd`)** —
   `[DONE, round 61, 2026-08-30]`

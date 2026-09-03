@@ -63,6 +63,22 @@ tls_rec_buf_addr:              .word 0
 tls_client_msg_addr:           .word 0
 tls_server_reply_addr:         .word 0
 tls_decrypted_scratch_addr:    .word 0
+tls_client_rx_buf_addr:        .word 0
+tls_client_rx_len_addr:        .word 0
+tls_server_rx_buf_addr:        .word 0
+tls_server_rx_len_addr:        .word 0
+tls_frame_scratch_addr:        .word 0
+tls_chunk_scratch_addr:        .word 0
+tls_recv_chunk_scratch_addr:   .word 0
+tls_ack_scratch_addr:          .word 0
+tls_ch_record_addr:            .word 0
+tls_sh_record_addr:            .word 0
+tls_parsed_client_random_addr: .word 0
+tls_parsed_client_pub_addr:    .word 0
+tls_parsed_server_random_addr: .word 0
+tls_parsed_server_pub_addr:    .word 0
+tls_flight_combined_addr:      .word 0
+tls_parsed_server_id_pub_addr: .word 0
 
 .section ".text"
 
@@ -128,3 +144,19 @@ TLS_SCRATCH_PAIR tls_rec_buf
 TLS_SCRATCH_PAIR tls_client_msg
 TLS_SCRATCH_PAIR tls_server_reply
 TLS_SCRATCH_PAIR tls_decrypted_scratch
+TLS_SCRATCH_PAIR tls_client_rx_buf
+TLS_SCRATCH_PAIR tls_client_rx_len
+TLS_SCRATCH_PAIR tls_server_rx_buf
+TLS_SCRATCH_PAIR tls_server_rx_len
+TLS_SCRATCH_PAIR tls_frame_scratch
+TLS_SCRATCH_PAIR tls_chunk_scratch
+TLS_SCRATCH_PAIR tls_recv_chunk_scratch
+TLS_SCRATCH_PAIR tls_ack_scratch
+TLS_SCRATCH_PAIR tls_ch_record
+TLS_SCRATCH_PAIR tls_sh_record
+TLS_SCRATCH_PAIR tls_parsed_client_random
+TLS_SCRATCH_PAIR tls_parsed_client_pub
+TLS_SCRATCH_PAIR tls_parsed_server_random
+TLS_SCRATCH_PAIR tls_parsed_server_pub
+TLS_SCRATCH_PAIR tls_flight_combined
+TLS_SCRATCH_PAIR tls_parsed_server_id_pub
