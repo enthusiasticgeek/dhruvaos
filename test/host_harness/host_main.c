@@ -3199,6 +3199,334 @@ static void test_mlkem(void) {
     CHECK(memcmp(K3, mlkem_kat_K, 32) != 0, "mlkem: decaps_internal on a corrupted ciphertext does not leak the real key (implicit rejection)");
 }
 
+static const unsigned char tls_kat_ch[112] = {0x01, 0x00, 0x00, 0x6c, 0x03, 0x03, 0x01, 0x04, 0x07, 0x0a, 0x0d, 0x10, 0x13, 0x16, 0x19, 0x1c, 0x1f, 0x22, 0x25, 0x28, 0x2b, 0x2e, 0x31, 0x34, 0x37, 0x3a, 0x3d, 0x40, 0x43, 0x46, 0x49, 0x4c, 0x4f, 0x52, 0x55, 0x58, 0x5b, 0x5e, 0x00, 0x00, 0x02, 0x13, 0x03, 0x01, 0x00, 0x00, 0x41, 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d, 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x08, 0x07, 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20, 0xbb, 0x50, 0xff, 0x9e, 0x82, 0xa5, 0x74, 0xcf, 0xbf, 0x82, 0x0e, 0x97, 0xf6, 0x0f, 0xb9, 0xc1, 0x43, 0xec, 0x74, 0x15, 0xcf, 0x51, 0x4f, 0x8c, 0xfd, 0x98, 0xef, 0xf5, 0x9e, 0x05, 0x96, 0x14};
+static const unsigned char tls_kat_sh[90] = {0x02, 0x00, 0x00, 0x56, 0x03, 0x03, 0x02, 0x07, 0x0c, 0x11, 0x16, 0x1b, 0x20, 0x25, 0x2a, 0x2f, 0x34, 0x39, 0x3e, 0x43, 0x48, 0x4d, 0x52, 0x57, 0x5c, 0x61, 0x66, 0x6b, 0x70, 0x75, 0x7a, 0x7f, 0x84, 0x89, 0x8e, 0x93, 0x98, 0x9d, 0x00, 0x13, 0x03, 0x00, 0x00, 0x2e, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20, 0xc0, 0xf4, 0x79, 0xce, 0x53, 0xa4, 0x6b, 0xa9, 0x69, 0x66, 0x82, 0x46, 0x94, 0xe8, 0x23, 0x65, 0x3e, 0x2a, 0x46, 0x99, 0x9a, 0xb8, 0xdd, 0x69, 0x69, 0xcb, 0x1b, 0x6d, 0xae, 0x6a, 0x18, 0x11};
+static const unsigned char tls_kat_early_secret[32] = {0x33, 0xad, 0x0a, 0x1c, 0x60, 0x7e, 0xc0, 0x3b, 0x09, 0xe6, 0xcd, 0x98, 0x93, 0x68, 0x0c, 0xe2, 0x10, 0xad, 0xf3, 0x00, 0xaa, 0x1f, 0x26, 0x60, 0xe1, 0xb2, 0x2e, 0x10, 0xf1, 0x70, 0xf9, 0x2a};
+static const unsigned char tls_kat_handshake_secret[32] = {0x1c, 0x3b, 0x8e, 0x1f, 0x8e, 0x08, 0x52, 0x83, 0x97, 0x49, 0x09, 0xba, 0x1b, 0xed, 0xb5, 0x25, 0x57, 0x03, 0x19, 0x62, 0x17, 0x69, 0xd3, 0xbe, 0xd3, 0xf4, 0xf5, 0x59, 0x71, 0x44, 0xd3, 0x77};
+static const unsigned char tls_kat_c_hs_traffic[32] = {0x4f, 0xd0, 0xff, 0x59, 0x8e, 0xa7, 0x53, 0xce, 0x35, 0xf1, 0x97, 0x42, 0xbf, 0xea, 0xb8, 0x62, 0x11, 0x1b, 0x01, 0xa3, 0xb3, 0xb4, 0x63, 0xaa, 0x64, 0x6c, 0xb9, 0xbb, 0xf1, 0xb2, 0x0c, 0x64};
+static const unsigned char tls_kat_s_hs_traffic[32] = {0x7e, 0xa6, 0x4d, 0x98, 0x4c, 0x92, 0x4e, 0x25, 0x03, 0xa4, 0xc0, 0x4d, 0x69, 0x58, 0xa6, 0xce, 0x51, 0x45, 0x8e, 0xf7, 0x02, 0xc4, 0x5c, 0xa0, 0x2b, 0xfb, 0xe7, 0xab, 0x15, 0x46, 0xe0, 0xcc};
+static const unsigned char tls_kat_c_hs_key[32] = {0x8c, 0x42, 0xde, 0xd7, 0xa5, 0x9d, 0xe9, 0x11, 0x99, 0xb5, 0xcd, 0x73, 0x5a, 0xba, 0x64, 0x11, 0xdf, 0x11, 0x17, 0x3b, 0xe6, 0x1b, 0xeb, 0x9d, 0xf2, 0x3e, 0xc1, 0x96, 0xdb, 0x1d, 0x94, 0x95};
+static const unsigned char tls_kat_c_hs_iv[12] = {0x57, 0x88, 0x87, 0x0f, 0x19, 0xeb, 0xd4, 0x7a, 0xbe, 0x5b, 0xe0, 0xa2};
+static const unsigned char tls_kat_s_hs_key[32] = {0xc2, 0x41, 0xdf, 0x7f, 0xb0, 0x11, 0xdc, 0x65, 0x80, 0x9f, 0xb5, 0xc2, 0xb3, 0x8a, 0xd3, 0xa4, 0x26, 0x46, 0xc3, 0xf4, 0x92, 0xf2, 0x07, 0xbb, 0xe1, 0xb0, 0x3b, 0x27, 0x28, 0xdb, 0x03, 0xa9};
+static const unsigned char tls_kat_s_hs_iv[12] = {0xe1, 0x45, 0xcb, 0x82, 0x70, 0x6a, 0x01, 0xef, 0x6c, 0x3a, 0x03, 0x1a};
+static const unsigned char tls_kat_master_secret[32] = {0xf0, 0x4e, 0x9c, 0x53, 0x09, 0x41, 0x3b, 0xd5, 0xab, 0x31, 0x16, 0xe9, 0x3f, 0xea, 0x7b, 0x29, 0xa9, 0xb3, 0xc3, 0x0e, 0xac, 0x15, 0xb1, 0xb8, 0x8d, 0x16, 0xdf, 0xfc, 0xff, 0xa5, 0x64, 0x99};
+static const unsigned char tls_kat_c_ap_traffic[32] = {0x4e, 0x3f, 0xee, 0x4b, 0x40, 0x76, 0x4b, 0x83, 0x84, 0xa2, 0x92, 0xd9, 0xde, 0x9f, 0x74, 0xbf, 0x28, 0x85, 0x14, 0x85, 0x72, 0x72, 0xd8, 0x05, 0xb8, 0xfb, 0xf9, 0x9b, 0x99, 0xbc, 0xd0, 0x48};
+static const unsigned char tls_kat_s_ap_traffic[32] = {0xd8, 0xd1, 0xff, 0xb7, 0x89, 0xfa, 0xe0, 0xee, 0xa7, 0x99, 0xf2, 0x36, 0x2c, 0xdd, 0x27, 0xed, 0xf8, 0x06, 0x83, 0x41, 0x46, 0xe9, 0xca, 0x06, 0x2c, 0x72, 0xad, 0x62, 0xfe, 0x22, 0x3d, 0x25};
+static const unsigned char tls_kat_c_ap_key[32] = {0x69, 0x47, 0x55, 0xb6, 0xe6, 0x95, 0xa6, 0xa9, 0x50, 0xb7, 0x0b, 0x2a, 0x39, 0x8d, 0xc1, 0x5b, 0x6c, 0x34, 0xe7, 0x4b, 0xf3, 0xb0, 0x09, 0x9e, 0x02, 0x0f, 0xf1, 0xda, 0x9c, 0xd3, 0x6e, 0x0f};
+static const unsigned char tls_kat_c_ap_iv[12] = {0xbf, 0x8c, 0xb9, 0xd6, 0x6a, 0x37, 0x80, 0xd1, 0xd4, 0x57, 0x84, 0xf8};
+static const unsigned char tls_kat_s_ap_key[32] = {0xad, 0x00, 0xa6, 0x9d, 0x64, 0xf8, 0x2f, 0xa7, 0x6d, 0x77, 0xe1, 0xec, 0x80, 0xd5, 0xc3, 0x1e, 0xcd, 0xbd, 0xe9, 0x57, 0xea, 0x4d, 0xd3, 0x37, 0xf8, 0xa1, 0x42, 0xc4, 0x4a, 0x02, 0x9e, 0x4a};
+static const unsigned char tls_kat_s_ap_iv[12] = {0x34, 0x52, 0xfa, 0x08, 0xdc, 0xba, 0xe3, 0xb9, 0x62, 0xad, 0x77, 0x46};
+static const unsigned char tls_kat_server_id_pub[32] = {0x09, 0xeb, 0x9d, 0x25, 0xe5, 0xef, 0xfe, 0x56, 0xfa, 0x68, 0xed, 0xa8, 0xd6, 0x4b, 0x1e, 0xc4, 0x2f, 0xd5, 0x87, 0x0e, 0x5a, 0x8b, 0xa8, 0x58, 0x96, 0xa9, 0xa1, 0x76, 0xf1, 0x27, 0x5c, 0xce};
+static const unsigned char tls_kat_ee[6] = {0x08, 0x00, 0x00, 0x02, 0x00, 0x00};
+static const unsigned char tls_kat_cert[45] = {0x0b, 0x00, 0x00, 0x29, 0x00, 0x00, 0x00, 0x25, 0x00, 0x00, 0x20, 0x09, 0xeb, 0x9d, 0x25, 0xe5, 0xef, 0xfe, 0x56, 0xfa, 0x68, 0xed, 0xa8, 0xd6, 0x4b, 0x1e, 0xc4, 0x2f, 0xd5, 0x87, 0x0e, 0x5a, 0x8b, 0xa8, 0x58, 0x96, 0xa9, 0xa1, 0x76, 0xf1, 0x27, 0x5c, 0xce, 0x00, 0x00};
+static const unsigned char tls_kat_cv[72] = {0x0f, 0x00, 0x00, 0x44, 0x08, 0x07, 0x00, 0x40, 0xb7, 0x0d, 0x8c, 0xba, 0x55, 0xa2, 0x04, 0x6b, 0x7c, 0xdb, 0xc0, 0x88, 0x6f, 0x27, 0x31, 0xd1, 0x96, 0x1b, 0x56, 0xa4, 0xee, 0x45, 0xd8, 0x3f, 0xad, 0x15, 0xed, 0x1a, 0xf7, 0x3f, 0x3d, 0xc8, 0x1b, 0xf3, 0x39, 0x91, 0xd7, 0x02, 0xff, 0x7c, 0x9d, 0x41, 0xb0, 0x52, 0x49, 0x58, 0x36, 0x9f, 0xd9, 0x42, 0xe2, 0xbb, 0xec, 0x3d, 0x27, 0xd1, 0x8a, 0x95, 0xc8, 0x93, 0x60, 0x67, 0x5e, 0x0e};
+static const unsigned char tls_kat_s_fin[36] = {0x14, 0x00, 0x00, 0x20, 0x2c, 0x32, 0x15, 0x0f, 0x8d, 0x49, 0x88, 0xa4, 0x6e, 0xa5, 0xf1, 0xb9, 0xf9, 0x12, 0x31, 0xa9, 0xa7, 0xc0, 0x2f, 0x4c, 0xa1, 0x18, 0xa4, 0x14, 0xe2, 0x17, 0x32, 0xdf, 0x0c, 0xf9, 0x1b, 0x27};
+static const unsigned char tls_kat_c_fin[36] = {0x14, 0x00, 0x00, 0x20, 0x54, 0x41, 0x41, 0x07, 0x33, 0x43, 0xa1, 0x9d, 0x69, 0x62, 0x87, 0xb8, 0xe1, 0x36, 0x67, 0x2e, 0x60, 0xc7, 0x66, 0xcc, 0x31, 0xbf, 0x28, 0xd0, 0xd1, 0xb2, 0xdb, 0x61, 0x73, 0x2b, 0x09, 0x98};
+static const unsigned char tls_kat_rec_ee[28] = {0x17, 0x03, 0x03, 0x00, 0x17, 0x51, 0x3d, 0x4a, 0x17, 0xe4, 0xe4, 0x35, 0xe5, 0x28, 0xfb, 0xcd, 0x40, 0x94, 0x32, 0x81, 0xa0, 0x28, 0x5b, 0x1e, 0x68, 0xc6, 0xfb, 0x4f};
+static const unsigned char tls_kat_rec_cert[67] = {0x17, 0x03, 0x03, 0x00, 0x3e, 0x91, 0x7c, 0x0d, 0xc7, 0xbe, 0x22, 0x10, 0x47, 0xa1, 0xc7, 0x5c, 0x36, 0x30, 0xcd, 0x93, 0x2a, 0x1d, 0x6f, 0xe1, 0xfe, 0x09, 0xcf, 0xc7, 0x21, 0xf5, 0xba, 0x92, 0x33, 0x2b, 0xd6, 0xf4, 0x4b, 0xda, 0x4f, 0xc7, 0xff, 0x83, 0x64, 0xe0, 0x83, 0xf4, 0xf0, 0x74, 0x0c, 0x26, 0x1c, 0x41, 0x5a, 0x2f, 0x30, 0x98, 0xc6, 0xd5, 0xbd, 0x46, 0x6d, 0x67, 0xea, 0x97, 0x02, 0xea, 0x33};
+static const unsigned char tls_kat_rec_cv[94] = {0x17, 0x03, 0x03, 0x00, 0x59, 0x5a, 0x5f, 0xe1, 0x9e, 0x69, 0xc0, 0x97, 0x2e, 0x89, 0xb0, 0xa7, 0x92, 0x2e, 0xed, 0x25, 0xab, 0xe7, 0xae, 0x01, 0x82, 0x31, 0x04, 0xa1, 0x68, 0x63, 0xaf, 0x5b, 0x0e, 0x80, 0x93, 0x59, 0xec, 0xc6, 0x1e, 0xe1, 0xd8, 0x7a, 0xdb, 0x59, 0x0a, 0xaf, 0xf7, 0x2a, 0xc8, 0x35, 0xda, 0x17, 0xde, 0xf4, 0x9c, 0x25, 0x23, 0x57, 0x4d, 0x0f, 0x56, 0xac, 0xd7, 0x2e, 0xfe, 0x0f, 0x3a, 0xc2, 0x37, 0x87, 0x66, 0x7c, 0x91, 0x69, 0xa4, 0xad, 0x48, 0x19, 0x57, 0x89, 0x8e, 0x03, 0x60, 0x5f, 0x9e, 0x53, 0x72, 0x7c, 0xea, 0x4d, 0x8e, 0xa6, 0x1e, 0xd2};
+static const unsigned char tls_kat_rec_s_fin[58] = {0x17, 0x03, 0x03, 0x00, 0x35, 0xbb, 0x96, 0x82, 0x1d, 0x48, 0x2f, 0x87, 0x8a, 0x3b, 0x2e, 0xcf, 0x6c, 0xa1, 0x1d, 0xd3, 0x17, 0x6d, 0xac, 0xac, 0x02, 0x93, 0xa2, 0x0f, 0x82, 0xb3, 0x01, 0xbe, 0x0f, 0xae, 0x10, 0x1b, 0x40, 0x74, 0xa2, 0x59, 0x69, 0x9d, 0x55, 0x71, 0x7b, 0xdd, 0x87, 0x1e, 0x69, 0x7d, 0x15, 0x98, 0x75, 0x36, 0xe7, 0xc3, 0x8a, 0xe5};
+static const unsigned char tls_kat_rec_c_fin[58] = {0x17, 0x03, 0x03, 0x00, 0x35, 0x2b, 0xcc, 0x9d, 0x49, 0x7f, 0xe4, 0x65, 0x26, 0xc5, 0x14, 0xb2, 0xfe, 0x20, 0x79, 0xa6, 0x8e, 0xc1, 0xb6, 0x93, 0xb0, 0xe2, 0xb0, 0xdd, 0x7d, 0xb0, 0xde, 0x58, 0xf4, 0xf2, 0x9a, 0x02, 0xe7, 0xb5, 0x89, 0x55, 0xfd, 0xca, 0x4a, 0x32, 0x52, 0x75, 0x45, 0x45, 0x41, 0x7f, 0x8d, 0xaf, 0xb5, 0x17, 0x77, 0x51, 0xe7, 0x8f};
+static const unsigned char tls_kat_rec_client_msg[54] = {0x17, 0x03, 0x03, 0x00, 0x31, 0x9b, 0xe4, 0x8c, 0x21, 0x6f, 0x73, 0xad, 0x46, 0x7b, 0xd5, 0xe6, 0x10, 0xf4, 0x1a, 0x54, 0xfb, 0x38, 0x9b, 0xde, 0x59, 0x1a, 0xb1, 0x11, 0x1f, 0x9d, 0x61, 0xd1, 0x03, 0xf0, 0x9a, 0x07, 0x9e, 0x33, 0xdd, 0x20, 0x4f, 0x03, 0x1f, 0xf3, 0x39, 0x97, 0x1d, 0xcf, 0xdd, 0x89, 0x3c, 0xbe, 0xca, 0x96};
+static const unsigned char tls_kat_rec_server_reply[54] = {0x17, 0x03, 0x03, 0x00, 0x31, 0x0c, 0x41, 0x4d, 0xe9, 0xa2, 0x6c, 0x55, 0x2b, 0xb8, 0xac, 0x3a, 0xa6, 0x9d, 0x5b, 0x56, 0xb8, 0x66, 0x96, 0xf8, 0xe0, 0xe8, 0xdf, 0x84, 0xda, 0x51, 0xe6, 0x03, 0xf3, 0x76, 0xad, 0xa6, 0x21, 0x25, 0xaf, 0x30, 0x0b, 0xb4, 0xfa, 0xc8, 0xdc, 0xee, 0x57, 0x53, 0x3a, 0x1d, 0x32, 0x4c, 0x0b, 0x3b};
+
+
+int64_t fn_tls_x25519_basepoint(int64_t *out);
+int64_t fn_tls_build_client_hello(int64_t *client_random, int64_t *client_pub, int64_t *out);
+int64_t fn_tls_build_server_hello(int64_t *server_random, int64_t *server_pub, int64_t *out);
+int64_t fn_tls_build_encrypted_extensions(int64_t *out);
+int64_t fn_tls_build_certificate(int64_t *raw_pubkey, int64_t *out);
+int64_t fn_tls_build_certificate_verify(int64_t *sig, int64_t *out);
+int64_t fn_tls_build_finished(int64_t *verify_data, int64_t *out);
+int64_t fn_tls_certverify_signed_content(int64_t *transcript_hash, int64_t *out);
+int64_t fn_tls_hkdf_expand_label(int64_t *secret, const char *label, int64_t *context, int64_t context_len, int64_t length, int64_t *out);
+int64_t fn_tls_derive_secret(int64_t *secret, const char *label, int64_t *transcript, int64_t transcript_len, int64_t *out);
+int64_t fn_tls_derive_traffic_keys(int64_t *secret, int64_t *out_key, int64_t *out_iv);
+int64_t fn_tls_finished_verify_data(int64_t *traffic_secret, int64_t *transcript, int64_t transcript_len, int64_t *out);
+int64_t fn_tls_encrypt_record(int64_t *key, int64_t *static_iv, int64_t seq, int64_t *content, int64_t content_len, int64_t content_type, int64_t *out_record);
+int64_t fn_tls_decrypt_record(int64_t *key, int64_t *static_iv, int64_t seq, int64_t *rec_data, int64_t record_len, int64_t expected_content_type, int64_t *out_content);
+int64_t fn_tls_copy(int64_t *dst, int64_t dst_off, int64_t *src, int64_t src_off, int64_t n);
+
+int64_t tls_client_random_set(int64_t *addr);
+int64_t tls_server_random_set(int64_t *addr);
+int64_t tls_client_x25519_priv_set(int64_t *addr);
+int64_t tls_client_x25519_pub_set(int64_t *addr);
+int64_t tls_server_x25519_priv_set(int64_t *addr);
+int64_t tls_server_x25519_pub_set(int64_t *addr);
+int64_t tls_shared_secret_set(int64_t *addr);
+int64_t tls_server_id_priv_set(int64_t *addr);
+int64_t tls_server_id_pub_set(int64_t *addr);
+int64_t tls_early_secret_set(int64_t *addr);
+int64_t tls_derived_es_set(int64_t *addr);
+int64_t tls_handshake_secret_set(int64_t *addr);
+int64_t tls_c_hs_traffic_set(int64_t *addr);
+int64_t tls_s_hs_traffic_set(int64_t *addr);
+int64_t tls_c_hs_key_set(int64_t *addr);
+int64_t tls_c_hs_iv_set(int64_t *addr);
+int64_t tls_s_hs_key_set(int64_t *addr);
+int64_t tls_s_hs_iv_set(int64_t *addr);
+int64_t tls_derived_hs_set(int64_t *addr);
+int64_t tls_master_secret_set(int64_t *addr);
+int64_t tls_c_ap_traffic_set(int64_t *addr);
+int64_t tls_s_ap_traffic_set(int64_t *addr);
+int64_t tls_c_ap_key_set(int64_t *addr);
+int64_t tls_c_ap_iv_set(int64_t *addr);
+int64_t tls_s_ap_key_set(int64_t *addr);
+int64_t tls_s_ap_iv_set(int64_t *addr);
+int64_t tls_transcript_set(int64_t *addr);
+int64_t tls_ch_set(int64_t *addr);
+int64_t tls_sh_set(int64_t *addr);
+int64_t tls_ee_set(int64_t *addr);
+int64_t tls_cert_set(int64_t *addr);
+int64_t tls_cv_set(int64_t *addr);
+int64_t tls_s_fin_set(int64_t *addr);
+int64_t tls_c_fin_set(int64_t *addr);
+int64_t tls_hash_scratch_set(int64_t *addr);
+int64_t tls_hkdf_label_scratch_set(int64_t *addr);
+int64_t tls_cv_signed_content_set(int64_t *addr);
+int64_t tls_finished_key_scratch_set(int64_t *addr);
+int64_t tls_record_scratch_set(int64_t *addr);
+int64_t tls_record_aad_set(int64_t *addr);
+int64_t tls_record_nonce_set(int64_t *addr);
+int64_t tls_content_scratch_set(int64_t *addr);
+int64_t tls_tag_in_set(int64_t *addr);
+int64_t tls_rec_buf_set(int64_t *addr);
+int64_t tls_client_msg_set(int64_t *addr);
+int64_t tls_server_reply_set(int64_t *addr);
+int64_t tls_decrypted_scratch_set(int64_t *addr);
+
+static void tls_init_scratch(void) {
+    tls_client_random_set(dhruva_alloc_bytes(32));
+    tls_server_random_set(dhruva_alloc_bytes(32));
+    tls_client_x25519_priv_set(dhruva_alloc_bytes(32));
+    tls_client_x25519_pub_set(dhruva_alloc_bytes(32));
+    tls_server_x25519_priv_set(dhruva_alloc_bytes(32));
+    tls_server_x25519_pub_set(dhruva_alloc_bytes(32));
+    tls_shared_secret_set(dhruva_alloc_bytes(32));
+    tls_server_id_priv_set(dhruva_alloc_bytes(32));
+    tls_server_id_pub_set(dhruva_alloc_bytes(32));
+    tls_early_secret_set(dhruva_alloc_bytes(32));
+    tls_derived_es_set(dhruva_alloc_bytes(32));
+    tls_handshake_secret_set(dhruva_alloc_bytes(32));
+    tls_c_hs_traffic_set(dhruva_alloc_bytes(32));
+    tls_s_hs_traffic_set(dhruva_alloc_bytes(32));
+    tls_c_hs_key_set(dhruva_alloc_bytes(32));
+    tls_c_hs_iv_set(dhruva_alloc_bytes(12));
+    tls_s_hs_key_set(dhruva_alloc_bytes(32));
+    tls_s_hs_iv_set(dhruva_alloc_bytes(12));
+    tls_derived_hs_set(dhruva_alloc_bytes(32));
+    tls_master_secret_set(dhruva_alloc_bytes(32));
+    tls_c_ap_traffic_set(dhruva_alloc_bytes(32));
+    tls_s_ap_traffic_set(dhruva_alloc_bytes(32));
+    tls_c_ap_key_set(dhruva_alloc_bytes(32));
+    tls_c_ap_iv_set(dhruva_alloc_bytes(12));
+    tls_s_ap_key_set(dhruva_alloc_bytes(32));
+    tls_s_ap_iv_set(dhruva_alloc_bytes(12));
+    tls_transcript_set(dhruva_alloc_bytes(2048));
+    tls_ch_set(dhruva_alloc_bytes(256));
+    tls_sh_set(dhruva_alloc_bytes(256));
+    tls_ee_set(dhruva_alloc_bytes(16));
+    tls_cert_set(dhruva_alloc_bytes(64));
+    tls_cv_set(dhruva_alloc_bytes(128));
+    tls_s_fin_set(dhruva_alloc_bytes(64));
+    tls_c_fin_set(dhruva_alloc_bytes(64));
+    tls_hash_scratch_set(dhruva_alloc_bytes(32));
+    tls_hkdf_label_scratch_set(dhruva_alloc_bytes(128));
+    tls_cv_signed_content_set(dhruva_alloc_bytes(160));
+    tls_finished_key_scratch_set(dhruva_alloc_bytes(32));
+    tls_record_scratch_set(dhruva_alloc_bytes(2048));
+    tls_record_aad_set(dhruva_alloc_bytes(16));
+    tls_record_nonce_set(dhruva_alloc_bytes(16));
+    tls_content_scratch_set(dhruva_alloc_bytes(2048));
+    tls_tag_in_set(dhruva_alloc_bytes(16));
+    tls_rec_buf_set(dhruva_alloc_bytes(2048));
+    tls_client_msg_set(dhruva_alloc_bytes(64));
+    tls_server_reply_set(dhruva_alloc_bytes(64));
+    tls_decrypted_scratch_set(dhruva_alloc_bytes(2048));
+    int64_t *s, *w, *ks, *bs, *otk, *md, *ct, *ts, *hi;
+    aead_hkdf_init_scratch(&s, &w, &ks, &bs, &otk, &md, &ct, &ts, &hi);
+}
+
+/* TLS 1.3 (RFC 8446), scoped to TLS_CHACHA20_POLY1305_SHA256 / x25519 /
+ * ed25519 / RFC 7250 raw public keys -- byte-exact KAT against
+ * tls13_ref.py, itself verified against the `cryptography` library's
+ * own X25519/Ed25519/ChaCha20Poly1305 primitives (see that file's own
+ * header comment). This checks the LIBRARY functions directly
+ * (message builders, key schedule, record layer); the live both-
+ * roles handshake + app-data round trip runs as tls_self_test in
+ * kernel_main.vani's own boot sequence on real ARM under QEMU. */
+static void test_tls13(void) {
+    tls_init_scratch();
+
+    static const unsigned char client_random_b[32] = {0x01,0x04,0x07,0x0a,0x0d,0x10,0x13,0x16,0x19,0x1c,0x1f,0x22,0x25,0x28,0x2b,0x2e,0x31,0x34,0x37,0x3a,0x3d,0x40,0x43,0x46,0x49,0x4c,0x4f,0x52,0x55,0x58,0x5b,0x5e};
+    static const unsigned char server_random_b[32] = {0x02,0x07,0x0c,0x11,0x16,0x1b,0x20,0x25,0x2a,0x2f,0x34,0x39,0x3e,0x43,0x48,0x4d,0x52,0x57,0x5c,0x61,0x66,0x6b,0x70,0x75,0x7a,0x7f,0x84,0x89,0x8e,0x93,0x98,0x9d};
+    static const unsigned char client_eph_b[32] = {0x03,0x0a,0x11,0x18,0x1f,0x26,0x2d,0x34,0x3b,0x42,0x49,0x50,0x57,0x5e,0x65,0x6c,0x73,0x7a,0x81,0x88,0x8f,0x96,0x9d,0xa4,0xab,0xb2,0xb9,0xc0,0xc7,0xce,0xd5,0xdc};
+    static const unsigned char server_eph_b[32] = {0x04,0x0f,0x1a,0x25,0x30,0x3b,0x46,0x51,0x5c,0x67,0x72,0x7d,0x88,0x93,0x9e,0xa9,0xb4,0xbf,0xca,0xd5,0xe0,0xeb,0xf6,0x01,0x0c,0x17,0x22,0x2d,0x38,0x43,0x4e,0x59};
+    static const unsigned char server_id_b[32] = {0x05,0x12,0x1f,0x2c,0x39,0x46,0x53,0x60,0x6d,0x7a,0x87,0x94,0xa1,0xae,0xbb,0xc8,0xd5,0xe2,0xef,0xfc,0x09,0x16,0x23,0x30,0x3d,0x4a,0x57,0x64,0x71,0x7e,0x8b,0x98};
+
+    int64_t *client_random = mkbuf((const char *)client_random_b, 32);
+    int64_t *server_random = mkbuf((const char *)server_random_b, 32);
+    int64_t *client_priv = mkbuf((const char *)client_eph_b, 32);
+    int64_t *server_priv = mkbuf((const char *)server_eph_b, 32);
+    int64_t *server_id_priv = mkbuf((const char *)server_id_b, 32);
+
+    int64_t *basepoint = dhruva_alloc_bytes(32);
+    fn_tls_x25519_basepoint(basepoint);
+    int64_t *client_pub = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(client_priv, basepoint, client_pub);
+    int64_t *server_pub = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(server_priv, basepoint, server_pub);
+    int64_t *shared_secret = dhruva_alloc_bytes(32);
+    fn_x25519_scalarmult(client_priv, server_pub, shared_secret);
+
+    int64_t *server_id_pub = dhruva_alloc_bytes(32);
+    fn_ed25519_secret_to_public(server_id_priv, server_id_pub);
+    CHECK(memcmp(server_id_pub, tls_kat_server_id_pub, 32) == 0, "tls13: server identity pubkey matches reference");
+
+    int64_t *ch = dhruva_alloc_bytes(256);
+    int64_t ch_len = fn_tls_build_client_hello(client_random, client_pub, ch);
+    CHECK(ch_len == 112 && memcmp(ch, tls_kat_ch, 112) == 0, "tls13: ClientHello matches reference byte-exact");
+
+    int64_t *sh = dhruva_alloc_bytes(256);
+    int64_t sh_len = fn_tls_build_server_hello(server_random, server_pub, sh);
+    CHECK(sh_len == 90 && memcmp(sh, tls_kat_sh, 90) == 0, "tls13: ServerHello matches reference byte-exact");
+
+    int64_t *transcript = dhruva_alloc_bytes(2048);
+    int64_t t0 = fn_tls_copy(transcript, 0, ch, 0, ch_len);
+    int64_t t_sh = fn_tls_copy(transcript, t0, sh, 0, sh_len);
+
+    static const unsigned char zero32[32] = {0};
+    int64_t *zero32_buf = mkbuf((const char *)zero32, 32);
+
+    int64_t *early_secret = dhruva_alloc_bytes(32);
+    fn_hkdf_extract(zero32_buf, 32, zero32_buf, 32, early_secret);
+    CHECK(memcmp(early_secret, tls_kat_early_secret, 32) == 0, "tls13: early_secret matches reference");
+
+    int64_t *derived_es = dhruva_alloc_bytes(32);
+    fn_tls_derive_secret(early_secret, "derived", zero32_buf, 0, derived_es);
+    int64_t *handshake_secret = dhruva_alloc_bytes(32);
+    fn_hkdf_extract(derived_es, 32, shared_secret, 32, handshake_secret);
+    CHECK(memcmp(handshake_secret, tls_kat_handshake_secret, 32) == 0, "tls13: handshake_secret matches reference");
+
+    int64_t *c_hs_traffic = dhruva_alloc_bytes(32);
+    fn_tls_derive_secret(handshake_secret, "c hs traffic", transcript, t_sh, c_hs_traffic);
+    CHECK(memcmp(c_hs_traffic, tls_kat_c_hs_traffic, 32) == 0, "tls13: client handshake traffic secret matches reference");
+    int64_t *s_hs_traffic = dhruva_alloc_bytes(32);
+    fn_tls_derive_secret(handshake_secret, "s hs traffic", transcript, t_sh, s_hs_traffic);
+    CHECK(memcmp(s_hs_traffic, tls_kat_s_hs_traffic, 32) == 0, "tls13: server handshake traffic secret matches reference");
+
+    int64_t *c_hs_key = dhruva_alloc_bytes(32);
+    int64_t *c_hs_iv = dhruva_alloc_bytes(12);
+    fn_tls_derive_traffic_keys(c_hs_traffic, c_hs_key, c_hs_iv);
+    CHECK(memcmp(c_hs_key, tls_kat_c_hs_key, 32) == 0, "tls13: client handshake key matches reference");
+    CHECK(memcmp(c_hs_iv, tls_kat_c_hs_iv, 12) == 0, "tls13: client handshake iv matches reference");
+    int64_t *s_hs_key = dhruva_alloc_bytes(32);
+    int64_t *s_hs_iv = dhruva_alloc_bytes(12);
+    fn_tls_derive_traffic_keys(s_hs_traffic, s_hs_key, s_hs_iv);
+    CHECK(memcmp(s_hs_key, tls_kat_s_hs_key, 32) == 0, "tls13: server handshake key matches reference");
+    CHECK(memcmp(s_hs_iv, tls_kat_s_hs_iv, 12) == 0, "tls13: server handshake iv matches reference");
+
+    int64_t *ee = dhruva_alloc_bytes(16);
+    int64_t ee_len = fn_tls_build_encrypted_extensions(ee);
+    CHECK(ee_len == 6 && memcmp(ee, tls_kat_ee, 6) == 0, "tls13: EncryptedExtensions matches reference");
+    int64_t *cert = dhruva_alloc_bytes(64);
+    int64_t cert_len = fn_tls_build_certificate(server_id_pub, cert);
+    CHECK(cert_len == 45 && memcmp(cert, tls_kat_cert, 45) == 0, "tls13: Certificate (raw pubkey) matches reference");
+
+    int64_t t_ee = fn_tls_copy(transcript, t_sh, ee, 0, ee_len);
+    int64_t t_cert = fn_tls_copy(transcript, t_ee, cert, 0, cert_len);
+
+    int64_t *cert_hash = dhruva_alloc_bytes(32);
+    fn_sha256_hash(transcript, t_cert, cert_hash);
+    int64_t *cv_content = dhruva_alloc_bytes(160);
+    int64_t cv_content_len = fn_tls_certverify_signed_content(cert_hash, cv_content);
+    int64_t *cv_sig = dhruva_alloc_bytes(64);
+    fn_ed25519_sign(server_id_priv, cv_content, cv_content_len, cv_sig);
+    int64_t *cv = dhruva_alloc_bytes(128);
+    int64_t cv_len = fn_tls_build_certificate_verify(cv_sig, cv);
+    CHECK(cv_len == 72 && memcmp(cv, tls_kat_cv, 72) == 0, "tls13: CertificateVerify matches reference (signature included -- confirms Ed25519 determinism)");
+
+    int64_t t_cv = fn_tls_copy(transcript, t_cert, cv, 0, cv_len);
+    int64_t *s_verify_data = dhruva_alloc_bytes(32);
+    fn_tls_finished_verify_data(s_hs_traffic, transcript, t_cv, s_verify_data);
+    int64_t *s_fin = dhruva_alloc_bytes(64);
+    int64_t s_fin_len = fn_tls_build_finished(s_verify_data, s_fin);
+    CHECK(s_fin_len == 36 && memcmp(s_fin, tls_kat_s_fin, 36) == 0, "tls13: server Finished matches reference");
+
+    int64_t t_s_fin = fn_tls_copy(transcript, t_cv, s_fin, 0, s_fin_len);
+    int64_t *c_verify_data = dhruva_alloc_bytes(32);
+    fn_tls_finished_verify_data(c_hs_traffic, transcript, t_s_fin, c_verify_data);
+    int64_t *c_fin = dhruva_alloc_bytes(64);
+    int64_t c_fin_len = fn_tls_build_finished(c_verify_data, c_fin);
+    CHECK(c_fin_len == 36 && memcmp(c_fin, tls_kat_c_fin, 36) == 0, "tls13: client Finished matches reference");
+
+    int64_t *rec_ee = dhruva_alloc_bytes(64);
+    int64_t rec_ee_len = fn_tls_encrypt_record(s_hs_key, s_hs_iv, 0, ee, ee_len, 22, rec_ee);
+    CHECK(rec_ee_len == 28 && memcmp(rec_ee, tls_kat_rec_ee, 28) == 0, "tls13: encrypted EncryptedExtensions record matches reference");
+    int64_t *rec_cert = dhruva_alloc_bytes(128);
+    int64_t rec_cert_len = fn_tls_encrypt_record(s_hs_key, s_hs_iv, 1, cert, cert_len, 22, rec_cert);
+    CHECK(rec_cert_len == 67 && memcmp(rec_cert, tls_kat_rec_cert, 67) == 0, "tls13: encrypted Certificate record matches reference");
+    int64_t *rec_cv = dhruva_alloc_bytes(128);
+    int64_t rec_cv_len = fn_tls_encrypt_record(s_hs_key, s_hs_iv, 2, cv, cv_len, 22, rec_cv);
+    CHECK(rec_cv_len == 94 && memcmp(rec_cv, tls_kat_rec_cv, 94) == 0, "tls13: encrypted CertificateVerify record matches reference");
+    int64_t *rec_s_fin = dhruva_alloc_bytes(96);
+    int64_t rec_s_fin_len = fn_tls_encrypt_record(s_hs_key, s_hs_iv, 3, s_fin, s_fin_len, 22, rec_s_fin);
+    CHECK(rec_s_fin_len == 58 && memcmp(rec_s_fin, tls_kat_rec_s_fin, 58) == 0, "tls13: encrypted server Finished record matches reference");
+    int64_t *rec_c_fin = dhruva_alloc_bytes(96);
+    int64_t rec_c_fin_len = fn_tls_encrypt_record(c_hs_key, c_hs_iv, 0, c_fin, c_fin_len, 22, rec_c_fin);
+    CHECK(rec_c_fin_len == 58 && memcmp(rec_c_fin, tls_kat_rec_c_fin, 58) == 0, "tls13: encrypted client Finished record matches reference");
+
+    /* Decrypt-side + tamper-rejection check (encrypt side is already
+     * covered byte-exact above; this exercises the AEAD verify path). */
+    int64_t *dec_ee = dhruva_alloc_bytes(64);
+    int64_t dec_ee_len = fn_tls_decrypt_record(s_hs_key, s_hs_iv, 0, rec_ee, rec_ee_len, 22, dec_ee);
+    CHECK(dec_ee_len == ee_len && memcmp(dec_ee, ee, ee_len) == 0, "tls13: decrypt_record recovers EncryptedExtensions");
+    unsigned char saved = ((unsigned char *) rec_ee)[5];
+    ((unsigned char *) rec_ee)[5] = saved ^ 0xff;
+    int64_t tamper_rc = fn_tls_decrypt_record(s_hs_key, s_hs_iv, 0, rec_ee, rec_ee_len, 22, dec_ee);
+    CHECK(tamper_rc < 0, "tls13: decrypt_record rejects a tampered record");
+
+    int64_t *derived_hs = dhruva_alloc_bytes(32);
+    fn_tls_derive_secret(handshake_secret, "derived", zero32_buf, 0, derived_hs);
+    int64_t *master_secret = dhruva_alloc_bytes(32);
+    fn_hkdf_extract(derived_hs, 32, zero32_buf, 32, master_secret);
+    CHECK(memcmp(master_secret, tls_kat_master_secret, 32) == 0, "tls13: master_secret matches reference");
+
+    int64_t *c_ap_traffic = dhruva_alloc_bytes(32);
+    fn_tls_derive_secret(master_secret, "c ap traffic", transcript, t_s_fin, c_ap_traffic);
+    CHECK(memcmp(c_ap_traffic, tls_kat_c_ap_traffic, 32) == 0, "tls13: client application traffic secret matches reference");
+    int64_t *s_ap_traffic = dhruva_alloc_bytes(32);
+    fn_tls_derive_secret(master_secret, "s ap traffic", transcript, t_s_fin, s_ap_traffic);
+    CHECK(memcmp(s_ap_traffic, tls_kat_s_ap_traffic, 32) == 0, "tls13: server application traffic secret matches reference");
+
+    int64_t *c_ap_key = dhruva_alloc_bytes(32);
+    int64_t *c_ap_iv = dhruva_alloc_bytes(12);
+    fn_tls_derive_traffic_keys(c_ap_traffic, c_ap_key, c_ap_iv);
+    CHECK(memcmp(c_ap_key, tls_kat_c_ap_key, 32) == 0, "tls13: client application key matches reference");
+    CHECK(memcmp(c_ap_iv, tls_kat_c_ap_iv, 12) == 0, "tls13: client application iv matches reference");
+    int64_t *s_ap_key = dhruva_alloc_bytes(32);
+    int64_t *s_ap_iv = dhruva_alloc_bytes(12);
+    fn_tls_derive_traffic_keys(s_ap_traffic, s_ap_key, s_ap_iv);
+    CHECK(memcmp(s_ap_key, tls_kat_s_ap_key, 32) == 0, "tls13: server application key matches reference");
+    CHECK(memcmp(s_ap_iv, tls_kat_s_ap_iv, 12) == 0, "tls13: server application iv matches reference");
+
+    static const unsigned char client_msg_b[] = "dhruva-tls-client-hello-app-data";
+    static const unsigned char server_reply_b[] = "dhruva-tls-server-reply-app-data";
+    int64_t *client_msg = mkbuf((const char *)client_msg_b, 32);
+    int64_t *server_reply = mkbuf((const char *)server_reply_b, 32);
+
+    int64_t *rec_client_msg = dhruva_alloc_bytes(96);
+    int64_t rec_client_msg_len = fn_tls_encrypt_record(c_ap_key, c_ap_iv, 0, client_msg, 32, 23, rec_client_msg);
+    CHECK(rec_client_msg_len == 54 && memcmp(rec_client_msg, tls_kat_rec_client_msg, 54) == 0, "tls13: encrypted client application data record matches reference");
+    int64_t *rec_server_reply = dhruva_alloc_bytes(96);
+    int64_t rec_server_reply_len = fn_tls_encrypt_record(s_ap_key, s_ap_iv, 0, server_reply, 32, 23, rec_server_reply);
+    CHECK(rec_server_reply_len == 54 && memcmp(rec_server_reply, tls_kat_rec_server_reply, 54) == 0, "tls13: encrypted server application data record matches reference");
+
+    int64_t *dec_client_msg = dhruva_alloc_bytes(96);
+    int64_t dec_client_msg_len = fn_tls_decrypt_record(c_ap_key, c_ap_iv, 0, rec_client_msg, rec_client_msg_len, 23, dec_client_msg);
+    CHECK(dec_client_msg_len == 32 && memcmp(dec_client_msg, client_msg_b, 32) == 0, "tls13: decrypt_record recovers client application data");
+}
+
 
 /* Round 56: LAN9512 TX/RX wire-framing math, checked against hand-
  * computed byte layouts from smsc95xx.h's own register/bit
@@ -4179,6 +4507,7 @@ int main(void) {
     test_aead_hkdf();
     test_keccak();
     test_mlkem();
+    test_tls13();
     test_bignum_boundaries();
     test_lan9512_framing();
     test_hci_framing();

@@ -291,6 +291,100 @@ extern "C" fn mlkem_ekpke_buf_set(addr: mut ref i64) -> i64;
 extern "C" fn mlkem_ekpke_buf_get() -> mut ref i64;
 extern "C" fn mlkem_cprime_buf_set(addr: mut ref i64) -> i64;
 extern "C" fn mlkem_cprime_buf_get() -> mut ref i64;
+extern "C" fn tls_client_random_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_client_random_get() -> mut ref i64;
+extern "C" fn tls_server_random_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_server_random_get() -> mut ref i64;
+extern "C" fn tls_client_x25519_priv_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_client_x25519_priv_get() -> mut ref i64;
+extern "C" fn tls_client_x25519_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_client_x25519_pub_get() -> mut ref i64;
+extern "C" fn tls_server_x25519_priv_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_server_x25519_priv_get() -> mut ref i64;
+extern "C" fn tls_server_x25519_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_server_x25519_pub_get() -> mut ref i64;
+extern "C" fn tls_shared_secret_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_shared_secret_get() -> mut ref i64;
+extern "C" fn tls_server_id_priv_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_server_id_priv_get() -> mut ref i64;
+extern "C" fn tls_server_id_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_server_id_pub_get() -> mut ref i64;
+extern "C" fn tls_early_secret_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_early_secret_get() -> mut ref i64;
+extern "C" fn tls_derived_es_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_derived_es_get() -> mut ref i64;
+extern "C" fn tls_handshake_secret_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_handshake_secret_get() -> mut ref i64;
+extern "C" fn tls_c_hs_traffic_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_c_hs_traffic_get() -> mut ref i64;
+extern "C" fn tls_s_hs_traffic_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_s_hs_traffic_get() -> mut ref i64;
+extern "C" fn tls_c_hs_key_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_c_hs_key_get() -> mut ref i64;
+extern "C" fn tls_c_hs_iv_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_c_hs_iv_get() -> mut ref i64;
+extern "C" fn tls_s_hs_key_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_s_hs_key_get() -> mut ref i64;
+extern "C" fn tls_s_hs_iv_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_s_hs_iv_get() -> mut ref i64;
+extern "C" fn tls_derived_hs_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_derived_hs_get() -> mut ref i64;
+extern "C" fn tls_master_secret_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_master_secret_get() -> mut ref i64;
+extern "C" fn tls_c_ap_traffic_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_c_ap_traffic_get() -> mut ref i64;
+extern "C" fn tls_s_ap_traffic_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_s_ap_traffic_get() -> mut ref i64;
+extern "C" fn tls_c_ap_key_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_c_ap_key_get() -> mut ref i64;
+extern "C" fn tls_c_ap_iv_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_c_ap_iv_get() -> mut ref i64;
+extern "C" fn tls_s_ap_key_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_s_ap_key_get() -> mut ref i64;
+extern "C" fn tls_s_ap_iv_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_s_ap_iv_get() -> mut ref i64;
+extern "C" fn tls_transcript_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_transcript_get() -> mut ref i64;
+extern "C" fn tls_ch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_ch_get() -> mut ref i64;
+extern "C" fn tls_sh_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_sh_get() -> mut ref i64;
+extern "C" fn tls_ee_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_ee_get() -> mut ref i64;
+extern "C" fn tls_cert_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_cert_get() -> mut ref i64;
+extern "C" fn tls_cv_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_cv_get() -> mut ref i64;
+extern "C" fn tls_s_fin_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_s_fin_get() -> mut ref i64;
+extern "C" fn tls_c_fin_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_c_fin_get() -> mut ref i64;
+extern "C" fn tls_hash_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_hash_scratch_get() -> mut ref i64;
+extern "C" fn tls_hkdf_label_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_hkdf_label_scratch_get() -> mut ref i64;
+extern "C" fn tls_cv_signed_content_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_cv_signed_content_get() -> mut ref i64;
+extern "C" fn tls_finished_key_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_finished_key_scratch_get() -> mut ref i64;
+extern "C" fn tls_record_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_record_scratch_get() -> mut ref i64;
+extern "C" fn tls_record_aad_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_record_aad_get() -> mut ref i64;
+extern "C" fn tls_record_nonce_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_record_nonce_get() -> mut ref i64;
+extern "C" fn tls_content_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_content_scratch_get() -> mut ref i64;
+extern "C" fn tls_tag_in_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_tag_in_get() -> mut ref i64;
+extern "C" fn tls_rec_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_rec_buf_get() -> mut ref i64;
+extern "C" fn tls_client_msg_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_client_msg_get() -> mut ref i64;
+extern "C" fn tls_server_reply_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_server_reply_get() -> mut ref i64;
+extern "C" fn tls_decrypted_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_decrypted_scratch_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -22308,6 +22402,537 @@ fn mlkem_self_test() -> i64 {
   return ok;
 }
 
+// Scoped-down TLS 1.3 (RFC 8446) handshake + record layer:
+// TLS_CHACHA20_POLY1305_SHA256 cipher suite only, x25519 key exchange
+// only, ed25519 signatures only, RFC 7250 raw public keys
+// (server-authenticated only, no client cert, no session
+// resumption/PSK/0-RTT/renegotiation). Verified against a from-
+// scratch Python reference (tls13_ref.py) that itself checks byte-
+// exact against the `cryptography` library's own X25519/Ed25519/
+// ChaCha20Poly1305 primitives -- same discipline as every other
+// primitive this round. Message shapes here are all FIXED size given
+// this scope (single cipher suite/group/sigalg, no variable-length
+// extensions), so lengths below are literal constants derived by
+// hand from the wire format, not computed dynamically.
+
+fn tls_copy(dst: mut ref i64, dst_off: i64, src: mut ref i64, src_off: i64, n: i64) -> i64 {
+  let ci: i64 = 0;
+  while ci < n {
+    let _ = buf_write_byte(dst, (dst_off + ci) as u32, buf_read_byte(src, (src_off + ci) as u32));
+    ci = ci + 1;
+  }
+  return dst_off + n;
+}
+
+fn tls_put_u8(buf: mut ref i64, off: i64, v: u32) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, v & (255 as u32));
+  return off + 1;
+}
+
+fn tls_put_u16(buf: mut ref i64, off: i64, v: u32) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, (v >> (8 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 1) as u32, v & (255 as u32));
+  return off + 2;
+}
+
+fn tls_put_u24(buf: mut ref i64, off: i64, v: i64) -> i64 {
+  let vu: u32 = v as u32;
+  let _ = buf_write_byte(buf, off as u32, (vu >> (16 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 1) as u32, (vu >> (8 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 2) as u32, vu & (255 as u32));
+  return off + 3;
+}
+
+fn tls_x25519_basepoint(out: mut ref i64) -> i64 {
+  let bi: i64 = 0;
+  while bi < 32 {
+    let _ = buf_write_byte(out, bi as u32, 0 as u32);
+    bi = bi + 1;
+  }
+  let _ = buf_write_byte(out, 0 as u32, 9 as u32);
+  return 0;
+}
+
+// --- Handshake message builders (RFC 8446 4.1.2/4.1.3/4.3.1/4.3.2/4.4.4) ---
+// Wire layout and byte counts are documented in this round's own
+// tls13_ref.py, which builds the identical structure and was used to
+// derive every literal length constant below.
+
+fn tls_build_client_hello(client_random: mut ref i64, client_pub: mut ref i64, out: mut ref i64) -> i64 {
+  let o: i64 = 0;
+  o = tls_put_u8(out, o, 1 as u32);
+  o = tls_put_u24(out, o, 108);
+  o = tls_put_u16(out, o, 0x0303 as u32);
+  o = tls_copy(out, o, client_random, 0, 32);
+  o = tls_put_u8(out, o, 0 as u32);
+  o = tls_put_u16(out, o, 2 as u32);
+  o = tls_put_u16(out, o, 0x1303 as u32);
+  o = tls_put_u8(out, o, 1 as u32);
+  o = tls_put_u8(out, o, 0 as u32);
+  o = tls_put_u16(out, o, 65 as u32);
+  o = tls_put_u16(out, o, 43 as u32);
+  o = tls_put_u16(out, o, 3 as u32);
+  o = tls_put_u8(out, o, 2 as u32);
+  o = tls_put_u16(out, o, 0x0304 as u32);
+  o = tls_put_u16(out, o, 10 as u32);
+  o = tls_put_u16(out, o, 4 as u32);
+  o = tls_put_u16(out, o, 2 as u32);
+  o = tls_put_u16(out, o, 0x001D as u32);
+  o = tls_put_u16(out, o, 13 as u32);
+  o = tls_put_u16(out, o, 4 as u32);
+  o = tls_put_u16(out, o, 2 as u32);
+  o = tls_put_u16(out, o, 0x0807 as u32);
+  o = tls_put_u16(out, o, 51 as u32);
+  o = tls_put_u16(out, o, 38 as u32);
+  o = tls_put_u16(out, o, 36 as u32);
+  o = tls_put_u16(out, o, 0x001D as u32);
+  o = tls_put_u16(out, o, 32 as u32);
+  o = tls_copy(out, o, client_pub, 0, 32);
+  return o;
+}
+
+fn tls_build_server_hello(server_random: mut ref i64, server_pub: mut ref i64, out: mut ref i64) -> i64 {
+  let o: i64 = 0;
+  o = tls_put_u8(out, o, 2 as u32);
+  o = tls_put_u24(out, o, 86);
+  o = tls_put_u16(out, o, 0x0303 as u32);
+  o = tls_copy(out, o, server_random, 0, 32);
+  o = tls_put_u8(out, o, 0 as u32);
+  o = tls_put_u16(out, o, 0x1303 as u32);
+  o = tls_put_u8(out, o, 0 as u32);
+  o = tls_put_u16(out, o, 46 as u32);
+  o = tls_put_u16(out, o, 43 as u32);
+  o = tls_put_u16(out, o, 2 as u32);
+  o = tls_put_u16(out, o, 0x0304 as u32);
+  o = tls_put_u16(out, o, 51 as u32);
+  o = tls_put_u16(out, o, 36 as u32);
+  o = tls_put_u16(out, o, 0x001D as u32);
+  o = tls_put_u16(out, o, 32 as u32);
+  o = tls_copy(out, o, server_pub, 0, 32);
+  return o;
+}
+
+fn tls_build_encrypted_extensions(out: mut ref i64) -> i64 {
+  let o: i64 = 0;
+  o = tls_put_u8(out, o, 8 as u32);
+  o = tls_put_u24(out, o, 2);
+  o = tls_put_u16(out, o, 0 as u32);
+  return o;
+}
+
+fn tls_build_certificate(raw_pubkey: mut ref i64, out: mut ref i64) -> i64 {
+  let o: i64 = 0;
+  o = tls_put_u8(out, o, 11 as u32);
+  o = tls_put_u24(out, o, 41);
+  o = tls_put_u8(out, o, 0 as u32);
+  o = tls_put_u24(out, o, 37);
+  o = tls_put_u24(out, o, 32);
+  o = tls_copy(out, o, raw_pubkey, 0, 32);
+  o = tls_put_u16(out, o, 0 as u32);
+  return o;
+}
+
+fn tls_build_certificate_verify(sig: mut ref i64, out: mut ref i64) -> i64 {
+  let o: i64 = 0;
+  o = tls_put_u8(out, o, 15 as u32);
+  o = tls_put_u24(out, o, 68);
+  o = tls_put_u16(out, o, 0x0807 as u32);
+  o = tls_put_u16(out, o, 64 as u32);
+  o = tls_copy(out, o, sig, 0, 64);
+  return o;
+}
+
+fn tls_build_finished(verify_data: mut ref i64, out: mut ref i64) -> i64 {
+  let o: i64 = 0;
+  o = tls_put_u8(out, o, 20 as u32);
+  o = tls_put_u24(out, o, 32);
+  o = tls_copy(out, o, verify_data, 0, 32);
+  return o;
+}
+
+// RFC 8446 4.4.3: 64 spaces || context string || 0x00 || transcript hash.
+fn tls_certverify_signed_content(transcript_hash: mut ref i64, out: mut ref i64) -> i64 {
+  let o: i64 = 0;
+  let pad_i: i64 = 0;
+  while pad_i < 64 {
+    let _ = buf_write_byte(out, o as u32, 0x20 as u32);
+    o = o + 1;
+    pad_i = pad_i + 1;
+  }
+  let ctx: Str = "TLS 1.3, server CertificateVerify";
+  let ctx_len: i64 = str_len_bytes(ctx);
+  let ctx_i: i64 = 0;
+  while ctx_i < ctx_len {
+    let _ = buf_write_byte(out, (o + ctx_i) as u32, str_byte_at(ctx, ctx_i) as u32);
+    ctx_i = ctx_i + 1;
+  }
+  o = o + ctx_len;
+  o = tls_put_u8(out, o, 0 as u32);
+  o = tls_copy(out, o, transcript_hash, 0, 32);
+  return o;
+}
+
+// --- Key schedule (RFC 8446 7.1) ---
+
+// HKDF-Expand-Label(Secret, Label, Context, Length). `label` excludes
+// the "tls13 " prefix (added here); `context` is `context_len` raw
+// bytes (already-hashed transcript, or empty for "key"/"iv"/
+// "finished" derivations).
+fn tls_hkdf_expand_label(secret: mut ref i64, label: Str, context: mut ref i64, context_len: i64, length: i64, out: mut ref i64) -> i64 {
+  let hl: mut ref i64 = tls_hkdf_label_scratch_get();
+  let o: i64 = 0;
+  o = tls_put_u16(hl, o, length as u32);
+  let prefix: Str = "tls13 ";
+  let prefix_len: i64 = str_len_bytes(prefix);
+  let label_len: i64 = str_len_bytes(label);
+  let full_label_len: i64 = prefix_len + label_len;
+  o = tls_put_u8(hl, o, full_label_len as u32);
+  let pfx_i: i64 = 0;
+  while pfx_i < prefix_len {
+    let _ = buf_write_byte(hl, (o + pfx_i) as u32, str_byte_at(prefix, pfx_i) as u32);
+    pfx_i = pfx_i + 1;
+  }
+  o = o + prefix_len;
+  let lbl_i: i64 = 0;
+  while lbl_i < label_len {
+    let _ = buf_write_byte(hl, (o + lbl_i) as u32, str_byte_at(label, lbl_i) as u32);
+    lbl_i = lbl_i + 1;
+  }
+  o = o + label_len;
+  o = tls_put_u8(hl, o, context_len as u32);
+  o = tls_copy(hl, o, context, 0, context_len);
+
+  let t_scratch: mut ref i64 = hkdf_t_scratch_get();
+  let hmac_input_scratch: mut ref i64 = hkdf_hmac_input_scratch_get();
+  return hkdf_expand(secret, 32, hl, o, length, t_scratch, hmac_input_scratch, out);
+}
+
+// Derive-Secret(Secret, Label, Messages) = HKDF-Expand-Label(Secret,
+// Label, Transcript-Hash(Messages), Hash.length).
+fn tls_derive_secret(secret: mut ref i64, label: Str, transcript: mut ref i64, transcript_len: i64, out: mut ref i64) -> i64 {
+  let th: mut ref i64 = tls_hash_scratch_get();
+  let _ = sha256_hash(transcript, transcript_len, th);
+  return tls_hkdf_expand_label(secret, label, th, 32, 32, out);
+}
+
+fn tls_derive_traffic_keys(secret: mut ref i64, out_key: mut ref i64, out_iv: mut ref i64) -> i64 {
+  let dummy: mut ref i64 = tls_hash_scratch_get();
+  let _ = tls_hkdf_expand_label(secret, "key", dummy, 0, 32, out_key);
+  let _ = tls_hkdf_expand_label(secret, "iv", dummy, 0, 12, out_iv);
+  return 0;
+}
+
+// finished_key = HKDF-Expand-Label(BaseKey, "finished", "", 32);
+// verify_data = HMAC(finished_key, Transcript-Hash(Messages)).
+fn tls_finished_verify_data(traffic_secret: mut ref i64, transcript: mut ref i64, transcript_len: i64, out: mut ref i64) -> i64 {
+  let fk: mut ref i64 = tls_finished_key_scratch_get();
+  let dummy: mut ref i64 = tls_hash_scratch_get();
+  let _ = tls_hkdf_expand_label(traffic_secret, "finished", dummy, 0, 32, fk);
+  let th: mut ref i64 = tls_hash_scratch_get();
+  let _ = sha256_hash(transcript, transcript_len, th);
+  return hmac_sha256(fk, 32, th, 32, out);
+}
+
+// --- Record layer (RFC 8446 5.2/5.3) ---
+
+// nonce = static_iv XOR (seq_num, big-endian, zero-padded to 12
+// bytes) -- since seq never exceeds a handful of records here, only
+// the low 4 bytes of the 12-byte padded form are ever nonzero.
+fn tls_record_nonce(static_iv: mut ref i64, seq: u32, out_nonce: mut ref i64) -> i64 {
+  let _ = tls_copy(out_nonce, 0, static_iv, 0, 8);
+  let b3: u32 = (seq >> (24 as u32)) & (255 as u32);
+  let b2: u32 = (seq >> (16 as u32)) & (255 as u32);
+  let b1: u32 = (seq >> (8 as u32)) & (255 as u32);
+  let b0: u32 = seq & (255 as u32);
+  let iv8: u32 = buf_read_byte(static_iv, 8 as u32);
+  let iv9: u32 = buf_read_byte(static_iv, 9 as u32);
+  let iv10: u32 = buf_read_byte(static_iv, 10 as u32);
+  let iv11: u32 = buf_read_byte(static_iv, 11 as u32);
+  let _ = buf_write_byte(out_nonce, 8 as u32, iv8 ^ b3);
+  let _ = buf_write_byte(out_nonce, 9 as u32, iv9 ^ b2);
+  let _ = buf_write_byte(out_nonce, 10 as u32, iv10 ^ b1);
+  let _ = buf_write_byte(out_nonce, 11 as u32, iv11 ^ b0);
+  return 0;
+}
+
+// TLSInnerPlaintext = content || real_content_type (no padding);
+// AAD = the 5-byte TLSCiphertext header (opaque_type=0x17,
+// legacy_record_version=0x0303, length). Returns the total record
+// length (5-byte header + ciphertext + 16-byte tag) written to
+// `out_record`.
+fn tls_encrypt_record(key: mut ref i64, static_iv: mut ref i64, seq: u32, content: mut ref i64, content_len: i64, content_type: u32, out_record: mut ref i64) -> i64 {
+  let inner: mut ref i64 = tls_content_scratch_get();
+  let _ = tls_copy(inner, 0, content, 0, content_len);
+  let _ = buf_write_byte(inner, content_len as u32, content_type);
+  let inner_len: i64 = content_len + 1;
+
+  let aad: mut ref i64 = tls_record_aad_get();
+  let record_len_field: i64 = inner_len + 16;
+  let _ = buf_write_byte(aad, 0 as u32, 0x17 as u32);
+  let _ = buf_write_byte(aad, 1 as u32, 0x03 as u32);
+  let _ = buf_write_byte(aad, 2 as u32, 0x03 as u32);
+  let _ = buf_write_byte(aad, 3 as u32, ((record_len_field / 256) as u32) & (255 as u32));
+  let _ = buf_write_byte(aad, 4 as u32, (record_len_field as u32) & (255 as u32));
+
+  let nonce: mut ref i64 = tls_record_nonce_get();
+  let _ = tls_record_nonce(static_iv, seq, nonce);
+
+  let _ = tls_copy(out_record, 0, aad, 0, 5);
+
+  let ct_out: mut ref i64 = tls_record_scratch_get();
+  let tag_out: mut ref i64 = tls_tag_in_get();
+  let _ = chacha20_poly1305_encrypt(key, nonce, aad, 5, inner, inner_len,
+            aead_state_get(), aead_working_get(), aead_keystream_get(),
+            aead_block_scratch_get(), aead_otk_get(), aead_mac_data_get(),
+            ct_out, tag_out);
+  let _ = tls_copy(out_record, 5, ct_out, 0, inner_len);
+  let _ = tls_copy(out_record, 5 + inner_len, tag_out, 0, 16);
+  return 5 + inner_len + 16;
+}
+
+// Decrypts `record` (record_len bytes) and verifies its inner content
+// type equals `expected_content_type` -- "reject, don't guess" for a
+// type mismatch, same posture as every other integrity check in this
+// codebase. Returns content_len on success, -1 on tag failure, wrong
+// type, or a malformed (too-short) record.
+fn tls_decrypt_record(key: mut ref i64, static_iv: mut ref i64, seq: u32, rec_data: mut ref i64, record_len: i64, expected_content_type: u32, out_content: mut ref i64) -> i64 {
+  let ct_len: i64 = record_len - 5 - 16;
+  if ct_len < 0 {
+    return 0 - 1;
+  }
+  let header: mut ref i64 = tls_record_aad_get();
+  let _ = tls_copy(header, 0, rec_data, 0, 5);
+  let ct_scratch: mut ref i64 = tls_record_scratch_get();
+  let _ = tls_copy(ct_scratch, 0, rec_data, 5, ct_len);
+  let tag_in: mut ref i64 = tls_tag_in_get();
+  let _ = tls_copy(tag_in, 0, rec_data, 5 + ct_len, 16);
+
+  let nonce: mut ref i64 = tls_record_nonce_get();
+  let _ = tls_record_nonce(static_iv, seq, nonce);
+
+  let inner: mut ref i64 = tls_content_scratch_get();
+  let rc: i64 = chacha20_poly1305_decrypt(key, nonce, header, 5, ct_scratch, ct_len, tag_in,
+            aead_state_get(), aead_working_get(), aead_keystream_get(),
+            aead_block_scratch_get(), aead_otk_get(), aead_mac_data_get(),
+            aead_computed_tag_get(), inner);
+  if rc != 0 {
+    return 0 - 1;
+  }
+  let content_len: i64 = ct_len - 1;
+  let content_type: u32 = buf_read_byte(inner, content_len as u32);
+  if content_type != expected_content_type {
+    return 0 - 1;
+  }
+  let _ = tls_copy(out_content, 0, inner, 0, content_len);
+  return content_len;
+}
+
+// Live, both-roles TLS 1.3 handshake + application-data round trip
+// (scoped per this round's own header comment: TLS_CHACHA20_
+// POLY1305_SHA256 / x25519 / ed25519 / RFC 7250 raw public keys).
+// Deterministic seeds (no RNG in this environment) chosen to exactly
+// match tls13_ref.py's own __main__ block, so this is verifiable
+// end-to-end against that Python reference -- the byte-exact KAT
+// itself lives in test/host_harness (key-schedule secrets + every
+// record), this function proves the same logic also runs correctly
+// as real, live, both-directions protocol execution on real ARM
+// under QEMU (client and server roles both executed here, since this
+// is a self-test of the crypto/protocol logic, not of the live TCP
+// transport integration -- see docs/TODO.md for that follow-on scope).
+fn tls_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let zero32: mut ref i64 = dhruva_alloc_bytes(32);
+  let zi: i64 = 0;
+  while zi < 32 {
+    let _ = buf_write_byte(zero32, zi as u32, 0 as u32);
+    zi = zi + 1;
+  }
+
+  let client_random: mut ref i64 = tls_client_random_get();
+  let _ = write_hex_string(client_random, "0104070a0d101316191c1f2225282b2e3134373a3d404346494c4f5255585b5e", 32);
+  let server_random: mut ref i64 = tls_server_random_get();
+  let _ = write_hex_string(server_random, "02070c11161b20252a2f34393e43484d52575c61666b70757a7f84898e93989d", 32);
+  let client_priv: mut ref i64 = tls_client_x25519_priv_get();
+  let _ = write_hex_string(client_priv, "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc", 32);
+  let server_priv: mut ref i64 = tls_server_x25519_priv_get();
+  let _ = write_hex_string(server_priv, "040f1a25303b46515c67727d88939ea9b4bfcad5e0ebf6010c17222d38434e59", 32);
+  let server_id_priv: mut ref i64 = tls_server_id_priv_get();
+  let _ = write_hex_string(server_id_priv, "05121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98", 32);
+
+  let basepoint: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = tls_x25519_basepoint(basepoint);
+
+  let client_pub: mut ref i64 = tls_client_x25519_pub_get();
+  let _ = x25519_scalarmult(client_priv, basepoint, client_pub);
+  let server_pub: mut ref i64 = tls_server_x25519_pub_get();
+  let _ = x25519_scalarmult(server_priv, basepoint, server_pub);
+
+  let shared_c: mut ref i64 = tls_shared_secret_get();
+  let _ = x25519_scalarmult(client_priv, server_pub, shared_c);
+  let shared_s: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = x25519_scalarmult(server_priv, client_pub, shared_s);
+  if keccak_bytes_equal(shared_c, shared_s, 32) != 1 { ok = 0; }
+
+  let server_id_pub: mut ref i64 = tls_server_id_pub_get();
+  let _ = ed25519_secret_to_public(server_id_priv, server_id_pub);
+
+  // --- ClientHello / ServerHello ---
+  let ch: mut ref i64 = tls_ch_get();
+  let ch_len: i64 = tls_build_client_hello(client_random, client_pub, ch);
+  let sh: mut ref i64 = tls_sh_get();
+  let sh_len: i64 = tls_build_server_hello(server_random, server_pub, sh);
+
+  let transcript: mut ref i64 = tls_transcript_get();
+  let t_len_0: i64 = tls_copy(transcript, 0, ch, 0, ch_len);
+  let t_len_sh: i64 = tls_copy(transcript, t_len_0, sh, 0, sh_len);
+
+  // --- Key schedule through handshake traffic secrets ---
+  let early_secret: mut ref i64 = tls_early_secret_get();
+  let _ = hkdf_extract(zero32, 32, zero32, 32, early_secret);
+  let derived_es: mut ref i64 = tls_derived_es_get();
+  let _ = tls_derive_secret(early_secret, "derived", zero32, 0, derived_es);
+  let handshake_secret: mut ref i64 = tls_handshake_secret_get();
+  let _ = hkdf_extract(derived_es, 32, shared_c, 32, handshake_secret);
+
+  let c_hs_traffic: mut ref i64 = tls_c_hs_traffic_get();
+  let _ = tls_derive_secret(handshake_secret, "c hs traffic", transcript, t_len_sh, c_hs_traffic);
+  let s_hs_traffic: mut ref i64 = tls_s_hs_traffic_get();
+  let _ = tls_derive_secret(handshake_secret, "s hs traffic", transcript, t_len_sh, s_hs_traffic);
+
+  let c_hs_key: mut ref i64 = tls_c_hs_key_get();
+  let c_hs_iv: mut ref i64 = tls_c_hs_iv_get();
+  let _ = tls_derive_traffic_keys(c_hs_traffic, c_hs_key, c_hs_iv);
+  let s_hs_key: mut ref i64 = tls_s_hs_key_get();
+  let s_hs_iv: mut ref i64 = tls_s_hs_iv_get();
+  let _ = tls_derive_traffic_keys(s_hs_traffic, s_hs_key, s_hs_iv);
+
+  // --- Server's encrypted flight: EncryptedExtensions, Certificate,
+  // CertificateVerify, Finished ---
+  let ee: mut ref i64 = tls_ee_get();
+  let ee_len: i64 = tls_build_encrypted_extensions(ee);
+  let cert: mut ref i64 = tls_cert_get();
+  let cert_len: i64 = tls_build_certificate(server_id_pub, cert);
+
+  let t_len_ee: i64 = tls_copy(transcript, t_len_sh, ee, 0, ee_len);
+  let t_len_cert: i64 = tls_copy(transcript, t_len_ee, cert, 0, cert_len);
+
+  let cert_transcript_hash: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = sha256_hash(transcript, t_len_cert, cert_transcript_hash);
+  let cv_content: mut ref i64 = tls_cv_signed_content_get();
+  let cv_content_len: i64 = tls_certverify_signed_content(cert_transcript_hash, cv_content);
+  let cv_sig: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = ed25519_sign(server_id_priv, cv_content, cv_content_len, cv_sig);
+  let cv: mut ref i64 = tls_cv_get();
+  let cv_len: i64 = tls_build_certificate_verify(cv_sig, cv);
+
+  let t_len_cv: i64 = tls_copy(transcript, t_len_cert, cv, 0, cv_len);
+  let s_verify_data: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = tls_finished_verify_data(s_hs_traffic, transcript, t_len_cv, s_verify_data);
+  let s_fin: mut ref i64 = tls_s_fin_get();
+  let s_fin_len: i64 = tls_build_finished(s_verify_data, s_fin);
+  let t_len_s_fin: i64 = tls_copy(transcript, t_len_cv, s_fin, 0, s_fin_len);
+
+  // --- Server encrypts, client decrypts + checks each message ---
+  let rec_buf: mut ref i64 = tls_rec_buf_get();
+  let dec_buf: mut ref i64 = tls_decrypted_scratch_get();
+
+  let rec_len_ee: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 0 as u32, ee, ee_len, 22 as u32, rec_buf);
+  let dec_len_ee: i64 = tls_decrypt_record(s_hs_key, s_hs_iv, 0 as u32, rec_buf, rec_len_ee, 22 as u32, dec_buf);
+  if (dec_len_ee != ee_len) || (keccak_bytes_equal(dec_buf, ee, ee_len) != 1) { ok = 0; }
+
+  let rec_len_cert: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 1 as u32, cert, cert_len, 22 as u32, rec_buf);
+  let dec_len_cert: i64 = tls_decrypt_record(s_hs_key, s_hs_iv, 1 as u32, rec_buf, rec_len_cert, 22 as u32, dec_buf);
+  if (dec_len_cert != cert_len) || (keccak_bytes_equal(dec_buf, cert, cert_len) != 1) { ok = 0; }
+
+  let rec_len_cv: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 2 as u32, cv, cv_len, 22 as u32, rec_buf);
+  let dec_len_cv: i64 = tls_decrypt_record(s_hs_key, s_hs_iv, 2 as u32, rec_buf, rec_len_cv, 22 as u32, dec_buf);
+  if (dec_len_cv != cv_len) || (keccak_bytes_equal(dec_buf, cv, cv_len) != 1) { ok = 0; }
+
+  let rec_len_s_fin: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 3 as u32, s_fin, s_fin_len, 22 as u32, rec_buf);
+  let dec_len_s_fin: i64 = tls_decrypt_record(s_hs_key, s_hs_iv, 3 as u32, rec_buf, rec_len_s_fin, 22 as u32, dec_buf);
+  if (dec_len_s_fin != s_fin_len) || (keccak_bytes_equal(dec_buf, s_fin, s_fin_len) != 1) { ok = 0; }
+
+  // Tamper check: a corrupted handshake record must fail to decrypt.
+  let saved_byte: u32 = buf_read_byte(rec_buf, 5 as u32);
+  let _ = buf_write_byte(rec_buf, 5 as u32, saved_byte ^ (0xff as u32));
+  let tamper_rc: i64 = tls_decrypt_record(s_hs_key, s_hs_iv, 3 as u32, rec_buf, rec_len_s_fin, 22 as u32, dec_buf);
+  if tamper_rc >= 0 { ok = 0; }
+
+  // --- Client verifies CertificateVerify against the (self-test-
+  // known) server identity public key -- RFC 7250 pinned-key trust,
+  // same model as pki_verify_raw. ---
+  let recomputed_cv_content: mut ref i64 = dhruva_alloc_bytes(cv_content_len);
+  let _ = tls_certverify_signed_content(cert_transcript_hash, recomputed_cv_content);
+  if ed25519_verify(server_id_pub, recomputed_cv_content, cv_content_len, cv_sig) != 1 { ok = 0; }
+
+  // --- Client verifies server Finished ---
+  let s_verify_data_check: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = tls_finished_verify_data(s_hs_traffic, transcript, t_len_cv, s_verify_data_check);
+  if keccak_bytes_equal(s_verify_data_check, s_verify_data, 32) != 1 { ok = 0; }
+
+  // --- Client Finished ---
+  let c_verify_data: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = tls_finished_verify_data(c_hs_traffic, transcript, t_len_s_fin, c_verify_data);
+  let c_fin: mut ref i64 = tls_c_fin_get();
+  let c_fin_len: i64 = tls_build_finished(c_verify_data, c_fin);
+
+  let rec_len_c_fin: i64 = tls_encrypt_record(c_hs_key, c_hs_iv, 0 as u32, c_fin, c_fin_len, 22 as u32, rec_buf);
+  let dec_len_c_fin: i64 = tls_decrypt_record(c_hs_key, c_hs_iv, 0 as u32, rec_buf, rec_len_c_fin, 22 as u32, dec_buf);
+  if (dec_len_c_fin != c_fin_len) || (keccak_bytes_equal(dec_buf, c_fin, c_fin_len) != 1) { ok = 0; }
+
+  let c_verify_data_check: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = tls_finished_verify_data(c_hs_traffic, transcript, t_len_s_fin, c_verify_data_check);
+  if keccak_bytes_equal(c_verify_data_check, c_verify_data, 32) != 1 { ok = 0; }
+
+  // --- Application traffic secrets (Master Secret derived from the
+  // SAME Handshake Secret, transcript through server Finished only --
+  // client Finished is never part of this derivation per RFC 8446). ---
+  let derived_hs: mut ref i64 = tls_derived_hs_get();
+  let _ = tls_derive_secret(handshake_secret, "derived", zero32, 0, derived_hs);
+  let master_secret: mut ref i64 = tls_master_secret_get();
+  let _ = hkdf_extract(derived_hs, 32, zero32, 32, master_secret);
+
+  let c_ap_traffic: mut ref i64 = tls_c_ap_traffic_get();
+  let _ = tls_derive_secret(master_secret, "c ap traffic", transcript, t_len_s_fin, c_ap_traffic);
+  let s_ap_traffic: mut ref i64 = tls_s_ap_traffic_get();
+  let _ = tls_derive_secret(master_secret, "s ap traffic", transcript, t_len_s_fin, s_ap_traffic);
+
+  let c_ap_key: mut ref i64 = tls_c_ap_key_get();
+  let c_ap_iv: mut ref i64 = tls_c_ap_iv_get();
+  let _ = tls_derive_traffic_keys(c_ap_traffic, c_ap_key, c_ap_iv);
+  let s_ap_key: mut ref i64 = tls_s_ap_key_get();
+  let s_ap_iv: mut ref i64 = tls_s_ap_iv_get();
+  let _ = tls_derive_traffic_keys(s_ap_traffic, s_ap_key, s_ap_iv);
+
+  // --- Application data round trip, both directions ---
+  let client_msg: mut ref i64 = tls_client_msg_get();
+  let client_msg_str: Str = "dhruva-tls-client-hello-app-data";
+  let _ = str_copy_to_buf(client_msg_str, client_msg);
+  let client_msg_len: i64 = str_len_bytes(client_msg_str);
+
+  let server_reply: mut ref i64 = tls_server_reply_get();
+  let server_reply_str: Str = "dhruva-tls-server-reply-app-data";
+  let _ = str_copy_to_buf(server_reply_str, server_reply);
+  let server_reply_len: i64 = str_len_bytes(server_reply_str);
+
+  let rec_len_c_msg: i64 = tls_encrypt_record(c_ap_key, c_ap_iv, 0 as u32, client_msg, client_msg_len, 23 as u32, rec_buf);
+  let dec_len_c_msg: i64 = tls_decrypt_record(c_ap_key, c_ap_iv, 0 as u32, rec_buf, rec_len_c_msg, 23 as u32, dec_buf);
+  if (dec_len_c_msg != client_msg_len) || (keccak_bytes_equal(dec_buf, client_msg, client_msg_len) != 1) { ok = 0; }
+
+  let rec_len_s_reply: i64 = tls_encrypt_record(s_ap_key, s_ap_iv, 0 as u32, server_reply, server_reply_len, 23 as u32, rec_buf);
+  let dec_len_s_reply: i64 = tls_decrypt_record(s_ap_key, s_ap_iv, 0 as u32, rec_buf, rec_len_s_reply, 23 as u32, dec_buf);
+  if (dec_len_s_reply != server_reply_len) || (keccak_bytes_equal(dec_buf, server_reply, server_reply_len) != 1) { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: TLS 1.3 (TLS_CHACHA20_POLY1305_SHA256, x25519, RFC 7250 raw pubkeys) live handshake + app data round trip");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return ok;
+}
+
 fn pki_self_test() -> i64 {
   let ok: i64 = 1;
   let _ = pki_init();
@@ -24295,6 +24920,53 @@ fn kernel_main() -> i64 {
   let _ = mlkem_ekpke_buf_set(dhruva_alloc_bytes(800));
   let _ = mlkem_cprime_buf_set(dhruva_alloc_bytes(768));
   let _ = mlkem_init();
+  let _ = tls_client_random_set(dhruva_alloc_bytes(32));
+  let _ = tls_server_random_set(dhruva_alloc_bytes(32));
+  let _ = tls_client_x25519_priv_set(dhruva_alloc_bytes(32));
+  let _ = tls_client_x25519_pub_set(dhruva_alloc_bytes(32));
+  let _ = tls_server_x25519_priv_set(dhruva_alloc_bytes(32));
+  let _ = tls_server_x25519_pub_set(dhruva_alloc_bytes(32));
+  let _ = tls_shared_secret_set(dhruva_alloc_bytes(32));
+  let _ = tls_server_id_priv_set(dhruva_alloc_bytes(32));
+  let _ = tls_server_id_pub_set(dhruva_alloc_bytes(32));
+  let _ = tls_early_secret_set(dhruva_alloc_bytes(32));
+  let _ = tls_derived_es_set(dhruva_alloc_bytes(32));
+  let _ = tls_handshake_secret_set(dhruva_alloc_bytes(32));
+  let _ = tls_c_hs_traffic_set(dhruva_alloc_bytes(32));
+  let _ = tls_s_hs_traffic_set(dhruva_alloc_bytes(32));
+  let _ = tls_c_hs_key_set(dhruva_alloc_bytes(32));
+  let _ = tls_c_hs_iv_set(dhruva_alloc_bytes(12));
+  let _ = tls_s_hs_key_set(dhruva_alloc_bytes(32));
+  let _ = tls_s_hs_iv_set(dhruva_alloc_bytes(12));
+  let _ = tls_derived_hs_set(dhruva_alloc_bytes(32));
+  let _ = tls_master_secret_set(dhruva_alloc_bytes(32));
+  let _ = tls_c_ap_traffic_set(dhruva_alloc_bytes(32));
+  let _ = tls_s_ap_traffic_set(dhruva_alloc_bytes(32));
+  let _ = tls_c_ap_key_set(dhruva_alloc_bytes(32));
+  let _ = tls_c_ap_iv_set(dhruva_alloc_bytes(12));
+  let _ = tls_s_ap_key_set(dhruva_alloc_bytes(32));
+  let _ = tls_s_ap_iv_set(dhruva_alloc_bytes(12));
+  let _ = tls_transcript_set(dhruva_alloc_bytes(2048));
+  let _ = tls_ch_set(dhruva_alloc_bytes(256));
+  let _ = tls_sh_set(dhruva_alloc_bytes(256));
+  let _ = tls_ee_set(dhruva_alloc_bytes(16));
+  let _ = tls_cert_set(dhruva_alloc_bytes(64));
+  let _ = tls_cv_set(dhruva_alloc_bytes(128));
+  let _ = tls_s_fin_set(dhruva_alloc_bytes(64));
+  let _ = tls_c_fin_set(dhruva_alloc_bytes(64));
+  let _ = tls_hash_scratch_set(dhruva_alloc_bytes(32));
+  let _ = tls_hkdf_label_scratch_set(dhruva_alloc_bytes(128));
+  let _ = tls_cv_signed_content_set(dhruva_alloc_bytes(160));
+  let _ = tls_finished_key_scratch_set(dhruva_alloc_bytes(32));
+  let _ = tls_record_scratch_set(dhruva_alloc_bytes(2048));
+  let _ = tls_record_aad_set(dhruva_alloc_bytes(16));
+  let _ = tls_record_nonce_set(dhruva_alloc_bytes(16));
+  let _ = tls_content_scratch_set(dhruva_alloc_bytes(2048));
+  let _ = tls_tag_in_set(dhruva_alloc_bytes(16));
+  let _ = tls_rec_buf_set(dhruva_alloc_bytes(2048));
+  let _ = tls_client_msg_set(dhruva_alloc_bytes(64));
+  let _ = tls_server_reply_set(dhruva_alloc_bytes(64));
+  let _ = tls_decrypted_scratch_set(dhruva_alloc_bytes(2048));
   let _ = sha512_k_init(sha512_k_scratch_get());
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
   let _ = x25519_x1_set(dhruva_alloc_bytes(32));
@@ -24579,6 +25251,7 @@ fn kernel_main() -> i64 {
   let _ = aead_hkdf_self_test();
   let _ = keccak_self_test();
   let _ = mlkem_self_test();
+  let _ = tls_self_test();
 
   // Media (at-rest) encryption for DharaFS, layered on the ChaCha20
   // cipher above. Key derivation runs once here, single-threaded,

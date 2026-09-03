@@ -659,9 +659,9 @@ for by name.
   surface area WPA2/FIPS-TLS would eventually need before either is
   actually being worked on.
 
-- **TLS** — crypto prerequisites: `[DONE, round 67, 2026-09-02]`;
-  the handshake/record-layer state machine itself: still `[L,
-  genuinely not started, sequenced next if this is picked back up]`
+- **TLS** — `[DONE, round 67, 2026-09-02]` -- crypto prerequisites AND
+  the handshake/record-layer state machine, scoped to a single cipher
+  suite/group/signature algorithm (see below).
   Every crypto prerequisite this entry itself listed is now built:
   ECDHE (X25519, this round's own EC-foundation work) and an AEAD
   (ChaCha20-Poly1305, chosen over AES-GCM per this entry's own
@@ -708,18 +708,50 @@ for by name.
   the implementation. Live-verified at boot on real ARM/QEMU, correct
   on the first real build otherwise.
 
-  **Still not started, and genuinely large**: the handshake/record-
-  layer state machine itself (ClientHello/ServerHello construction and
-  parsing, the full key-schedule sequence across each handshake stage,
-  record framing/fragmentation, raw-public-key certificate message
-  handling per RFC 7250) -- comparable in scope to this project's own
-  TCP state machine, but for TLS's own layer. This entry's own
-  "materially smaller, realistic first target" (RFC 7250 raw public
-  keys instead of X.509) is still the right scoping if this gets
-  picked back up -- PKI's own raw-key-trust work this round is the
-  DhruvaOS-side half of that story (verifying signed payloads), not
-  the TLS-side half (a live server's own key exchanged over an actual
-  handshake).
+  **Handshake/record-layer state machine — DONE, same day.** Scoped to
+  exactly one cipher suite (TLS_CHACHA20_POLY1305_SHA256), one key-
+  exchange group (x25519), one signature algorithm (ed25519), and RFC
+  7250 raw public keys (server-authenticated only, no client cert, no
+  session resumption/PSK/0-RTT/renegotiation) -- this entry's own
+  "materially smaller, realistic first target" framing, taken all the
+  way through. Real RFC 8446 wire format throughout: ClientHello/
+  ServerHello construction (§4.1.2/4.1.3, with real
+  supported_versions/supported_groups/signature_algorithms/key_share
+  extensions), the full §7.1 key schedule (Early/Handshake/Master
+  Secret via HKDF-Extract chains, HKDF-Expand-Label, Derive-Secret),
+  the encrypted server flight (EncryptedExtensions, Certificate
+  carrying a bare RFC 7250 raw public key instead of an X.509 chain,
+  CertificateVerify per §4.4.3, Finished per §4.4.4), client Finished,
+  and application traffic secret derivation -- then real record-layer
+  AEAD (§5.2/5.3: per-record nonce = static IV XOR sequence number,
+  AAD = the 5-byte TLSCiphertext header) built directly on this
+  round's own ChaCha20-Poly1305/HKDF/SHA-256/X25519/Ed25519
+  primitives, no new crypto invented for this layer.
+
+  Verified two ways, same discipline as every other primitive this
+  round: (1) a from-scratch Python reference (`tls13_ref.py`) built
+  the identical message flow, itself checked against the
+  `cryptography` library's own X25519/Ed25519/ChaCha20Poly1305
+  primitives as trusted building blocks -- both roles (client and
+  server) fully simulated, CertificateVerify signature verifies,
+  both Finished MACs verify, application data round-trips in both
+  directions; (2) that reference's exact deterministic output (every
+  key-schedule secret, every handshake message, every encrypted
+  record) embedded as a host_harness KAT, 970/970 checks passing
+  under ASAN/UBSAN including a tampered-record rejection check. A
+  live, both-roles handshake + application-data round trip
+  (`tls_self_test`) also runs at boot on real ARM under QEMU and
+  passes -- correct on the first real build (one off-by-one in the
+  HOST HARNESS test's own hardcoded message length, not the
+  implementation, was the only fix needed).
+
+  **Explicitly still out of scope**: wiring this into the live TCP
+  transport (a real `tls_connect`/`tls_accept` over
+  `tcp_conn_send_data`/`tcp_conn_poll`, record fragmentation/
+  reassembly across multiple TCP segments) -- this delivers the
+  crypto/protocol logic as a tested library, not a live network
+  service; other cipher suites/groups/signature algorithms; client
+  certificates; session resumption/PSK/0-RTT.
 
 - **Real authentication (password-protected `su` + `passwd`)** —
   `[DONE, round 61, 2026-08-30]`
