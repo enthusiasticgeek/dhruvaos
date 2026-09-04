@@ -110,8 +110,41 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   "single stolen SD card" threat, not against multi-snapshot analysis.
   Verified via an in-memory self-test, a host-harness ASAN/UBSAN twin,
   and a one-time manual live end-to-end run with a real SD image.
-
-**Known, current limitations (not design goals — see `TODO.md`):**
+- **A full TLS 1.3 + broader crypto/security suite (round 67, all
+  same day, 2026-09-02).** Built out from scratch, each primitive
+  verified against a real independent reference (Python + the
+  `cryptography` library, or a third-party implementation) before any
+  vāṇी code was written: Poly1305, X25519 (RFC 7748), SHA-512,
+  Ed25519 (RFC 8032) — completing the Curve25519 EC foundation both
+  for key exchange and signatures — then a compile-time-pinned-key PKI
+  substitute (`verify <path>`, see §3), AES-128 (constant-time,
+  table-free S-box — deliberately built despite this project's earlier
+  ChaCha20-over-AES choice, since TLS's own standard cipher suites
+  expect it available), ChaCha20-Poly1305 AEAD + HKDF (TLS's actual
+  key-schedule/record-layer primitives), Keccak-f[1600]/SHA-3/SHAKE,
+  and — by explicit request, overriding this backlog's own earlier
+  "not recommended yet" scoping call — a full ML-KEM-512 (FIPS 203)
+  post-quantum KEM, byte-exact against the third-party `kyber-py`
+  reference. All of that fed into a real RFC 8446 TLS 1.3 handshake +
+  record-layer state machine (`TLS_CHACHA20_POLY1305_SHA256`, X25519,
+  RFC 7250 raw public keys — no X.509), wired into the live TCP
+  transport (a real three-way handshake, every message fragmented
+  through `tcp_conn_send_data`'s own real 64-byte cap and reassembled
+  on the other end). Try it: `tlsecho <text>` (§3) runs a complete
+  live `tls_connect`/`tls_accept` handshake and encrypted echo, both
+  roles, over loopback. See `TODO.md` round 67 for the full,
+  primitive-by-primitive verification writeup — every one of these
+  landed correct on its first real ARM build.
+- **A full BLE stack (rounds 57/66)**: HCI transport (written to spec,
+  pending real-hardware verification — no QEMU BLE device model
+  exists), then, on top of that, real GATT client discovery
+  (service/characteristic enumeration) and read/write, a full GATT
+  SERVER role with its own attribute database, 128-bit custom UUID
+  decoding, notifications/indications, and L2CAP Connection Parameter
+  Update signaling. No shell commands expose this yet — it's an
+  internal API surface (`boot/gatt_state.S`/`boot/gatt_server_state.S`)
+  a future round would need to wire into the shell to actually drive
+  interactively.
 - **FIXED (round 65, 2026-09-01) — a long-running synchronous
   computation on any task could crash into a silent runtime trap under
   the real scheduler.** Found while tuning real authentication's own
@@ -194,6 +227,41 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   reconsidering that); the real end-to-end path is verified via the
   host harness and a one-time manual live run. See `TODO.md` for the
   full writeup.
+- **ROOT-CAUSED AND FIXED (round 68, 2026-09-04) — the actual
+  mechanism behind round 65/66's own "still not fully root-caused"
+  corruption class, found while chasing a new, unrelated `tlsecho`
+  crash.** `irq_entry.S`'s saved task-context frame used a single word
+  to hold both "the value to restore into r14" and "the address to
+  resume execution at" — the same value for a *voluntary* switch
+  (`task_sleep_ticks`/`dhruva_mutex_lock`), but genuinely different
+  values for an *interrupt*-driven one. The interrupted task's real
+  r14 was never actually saved anywhere for that path — it got
+  silently overwritten by `irq_dispatch`/`scheduler_switch_from_irq`'s
+  own calls before the task resumed. A task resumed while executing
+  one of this project's ~300 hand-written two-instruction `bx lr`
+  accessor leaves (every `boot/*_state.S` `*_get`/`*_set`, `buf_read_
+  u32`/`buf_write_u32` among them) would come back with `r14 == pc`:
+  the single load/store re-executes fine, then `bx lr` jumps back into
+  its own entry instead of returning, repeatedly treating whatever it
+  just read as a new pointer until it dereferences something unmapped
+  — a real hardware Data Abort whose "wild" address is just wherever
+  that chase happened to end. Fixed by giving the saved frame a 17th
+  word so the true return address and the resume point are restored
+  independently (ARM's standard `ldmia {...,lr,pc}^` exception-return
+  idiom) across all four save/restore sites. A 190-boot black-box
+  sweep plus a direct re-run of round 63's own scoped hardware-
+  watchpoint check (56,708 `sha256_compress` calls, 1.1B+ memory
+  stores, zero hits) both found nothing — round 62f's separate
+  zero-interrupt PBKDF2 corruption is believed resolved as a side
+  effect of round 65's own fix, though not independently re-verified
+  with dedicated instrumentation. With the underlying bug fixed,
+  `passwd`/`su`'s PBKDF2 iteration count was raised from 200 to a real
+  20,000 (~13s interactively on this hardware — a measured, deliberate
+  tradeoff, not the old bug's own ceiling; see `TODO.md` for the full
+  timing data and reasoning). Also added a permanent per-task
+  stack-overflow canary (`boot/stack_canary.S`) as independent
+  hardening alongside the actual fix, not a replacement for it. See
+  `TODO.md` round 68 for the complete mechanism writeup.
 
 - **6 fixed compile-time tasks, plus up to 10 dynamically-created
   ones (MAX_TASKS=16).** The original 6 slots (HIGH, MEDIUM, LOW — a
@@ -211,6 +279,16 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
 - **The timer tick is 500ms** — fine for this project's own demo and
   self-tests, far too coarse for most real control loops (a typical
   RTOS runs 1ms or tickless).
+- **A real hardware watchdog exists (`watchdog_arm`/`_init`/`_kick`,
+  targeting the real BCM2835 PM peripheral) but is deliberately NOT
+  wired into the live boot/scheduler path.** Confirmed empirically:
+  QEMU's `raspi1ap` model doesn't honor `PM_WDOG`'s configured timeout
+  at all — writing `PM_RSTC` with a full-reset config resets the
+  emulated machine immediately regardless of what's armed, which would
+  make this project's only test method permanently unable to boot.
+  Revisit once real Pi 1B hardware-in-the-loop testing is available
+  (see `docs/HARDWARE_IN_LOOP.md`) — real hardware may honor the
+  timeout correctly where QEMU's emulation doesn't.
 - **No deadline/budget model, and no contention instrumentation for
   the new blocking mutex yet** (contention count, worst-case wait) —
   the primitive itself exists and is live-verified (see above), but
@@ -334,6 +412,8 @@ via `-serial stdio`/`-nographic`). Type a command and press Enter.
 | `tcpecho` | `tcpecho <text>` | Full TCP three-way handshake + data + close round trip, self-talking over loopback. |
 | `udpecho` | `udpecho <text>` | UDP send/receive round trip, self-talking over loopback. |
 | `tcprtx` | `tcprtx` | Deliberately drops the first SYN and proves the real 2-second retransmission timer recovers the connection. |
+| `tlsecho` | `tlsecho <text>` | Full TLS 1.3 handshake (`tls_connect`/`tls_accept`, both roles) + AEAD-encrypted echo, self-talking over loopback (round 67). |
+| `fw` | `fw add\|list\|flush\|default ...` | Packet filtering (round 60, see §1) — manage the 8-rule table from the shell. |
 
 ### System / diagnostic commands
 
@@ -342,7 +422,8 @@ via `-serial stdio`/`-nographic`). Type a command and press Enter.
 | `eval` | `eval <expr>` | Small arithmetic expression evaluator (`+ - * / ( )`), traps on overflow and division by zero. |
 | `id` | `id` | Shows the active uid/gid for the current shell session. |
 | `su` | `su <uid> <gid> [password]` | Switches the active permission context. uid 0 is root (bypasses all permission checks). Unconditional for a uid that has never had a password set (round 61); once `passwd` sets one, it's genuinely required and checked, with 3-strike lockout. |
-| `passwd` | `passwd <uid> <new_password>` | Sets/changes a uid's password (round 61) — root or the uid itself only. Stores a fresh salt + PBKDF2-HMAC-SHA256 output, never the password. Min 8 characters, checked against a small weak-password blocklist. |
+| `passwd` | `passwd <uid> <new_password>` | Sets/changes a uid's password (round 61) — root or the uid itself only. Stores a fresh salt + PBKDF2-HMAC-SHA256 output, never the password. Min 8 characters, checked against a small weak-password blocklist. 20,000 PBKDF2 iterations as of round 68 (~13s), up from the original bug-limited 200. |
+| `verify` | `verify <path>` | Verifies `<path>` against a companion `<path>.sig` (a raw 64-byte Ed25519 signature) using a compile-time-pinned public key (round 67) — the "smaller substitute" for secure boot this project's own hardware ceiling rules out (see §1/`TODO.md`). |
 | `diagnose` | `diagnose` | One-shot health report: uptime ticks, scheduler ready count, heap usage (current == high-water mark, since the allocator never frees), CPU frequency + governor history, allocation count, FS commit count, context switch count, IRQ count, `dhruva_prio_lock` call count, mutex contention count + worst-case wait ticks (round 59), and (round 66) up to the last 32 ticks (~16s) of recent history — tick/context-switch/IRQ/prio-lock-count as of each real timer tick, oldest first, for a "what was activity like recently" view alongside the running totals above. |
 | `fault` | `fault alloc\|write\|irqburst\|netdrop <n>` | Fault injection (round 51 + round 62). `alloc <n>`: triggers a real, unrecoverable OOM-fatal halt after the Nth heap allocation — no confirmation, no undo, by design. `write <n>`: the Nth subsequent real SD write fails (a real I/O error, no hardware touched). `irqburst <n>`: the next timer tick jumps the clock forward by n extra ticks (a time-warp, not a real preemption-burst simulation — see `TODO.md`). `netdrop <n>`: the next n outgoing network frames are silently dropped while still reporting success, exercising TCP retransmission on demand. |
 
@@ -436,3 +517,6 @@ ASAN/UBSAN as an ordinary host process — see its own `README.md`.
   API, real NIC/BLE/WiFi drivers, priority-inversion detection, and
   more), each item sized against what actually exists today.
 - `docs/PORTING.md` — the Pi 4/5 port's current state.
+- `docs/HARDWARE_IN_LOOP.md` — connecting and testing against a real
+  Pi 1 Model B + SD card, on top of (not instead of) this project's
+  QEMU-based regression battery.

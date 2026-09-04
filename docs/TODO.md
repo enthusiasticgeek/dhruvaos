@@ -2128,10 +2128,11 @@ for by name.
   `phase4_milestone.py` 14/14, `host_harness` 315/315 ASAN/UBSAN,
   `heap_stress.py`.
 
-- **Secure boot** — `[not sized — SKIPPED FOR NOW, 2026-08-31; the
-  hardware-rooted version hits a hard, permanent hardware ceiling
-  (below); the smaller runtime-signature-verification substitute hits
-  the SAME EC-arithmetic blocker as TLS/PKI above]`
+- **Secure boot** — `[not sized — hardware-rooted version PERMANENTLY
+  SKIPPED (hard hardware ceiling, below); the smaller runtime-
+  signature-verification substitute this entry called for is actually
+  DONE, round 67 — this entry's own cross-reference was stale, caught
+  and fixed round 68, 2026-09-04]`
   Real secure boot means a hardware-anchored, cryptographically
   verified chain from an immutable root of trust through every stage
   that runs before the OS itself does. **The original Raspberry Pi 1
@@ -2141,15 +2142,21 @@ for by name.
   feature; later models added OTP-based signing in their own
   bootloader/EEPROM updates). No amount of work inside Dhruva's own
   code changes what the boot ROM itself is capable of verifying before
-  Dhruva ever gets to run. A real, achievable, SMALLER substitute that
-  doesn't need boot ROM cooperation: Dhruva verifying a signature over
-  something IT loads at runtime (a config file, an update payload)
-  before trusting it — genuinely useful, buildable on the crypto
-  foundation above, but a different and much smaller claim than
-  "secure boot" in the hardware-root-of-trust sense. Revisit the
-  hardware-rooted version only if the target ever moves to hardware
-  that actually supports it (Pi 4/5, which do have OTP-based secure
-  boot — see `docs/PORTING.md`).
+  Dhruva ever gets to run. This permanent limitation is why the
+  hardware-rooted version stays skipped — revisit only if the target
+  ever moves to hardware that actually supports it (Pi 4/5, which do
+  have OTP-based secure boot — see `docs/PORTING.md`).
+
+  **The smaller substitute is done**: "Dhruva verifying a signature
+  over something IT loads at runtime before trusting it" is exactly
+  the PKI raw-public-key-trust feature (see that entry above) — a
+  compile-time-pinned Ed25519 key, a `verify <path>` shell command, a
+  companion `<path>.sig` file convention, and a real end-to-end
+  DharaFS round trip, all live-verified on real ARM/QEMU. Built on the
+  crypto foundation this entry itself pointed to. Not the hardware-
+  root-of-trust claim "secure boot" usually means, but the genuinely
+  achievable substitute this entry called for — already exists, this
+  entry just never got updated to say so.
 
 - **PQC (Post-Quantum Cryptography)** — **DONE (round 67)**: ML-KEM-512
   (FIPS 203), the NIST-standardized lattice-based KEM, implemented
@@ -2267,12 +2274,33 @@ what QEMU's fidelity genuinely can't reach: real USB device timing/
 quirks (the mass storage driver above, and anything in the "known
 real-hardware-only gaps" section of the Dhruva Feature Ledger —
 governor wattage, memory-ordering barriers, the real LAN9512's
-hub port-2 behavior), and any future storage backend's real-media
-behavior. When a real Pi 1B is connected, treat it as an additional
-verification pass on top of the existing QEMU battery, not a
-replacement for it — everything QEMU can already catch should still
-be caught in QEMU first, keeping the fast local loop as the default
-and hardware-in-loop as the final confirmation pass.
+hub port-2 behavior — note, round 68, 2026-09-04: that referenced
+"Dhruva Feature Ledger" document no longer exists in this repo, so
+this list is the only surviving detail on those three specific
+items), and any future storage backend's real-media behavior. When a
+real Pi 1B is connected, treat it as an additional verification pass
+on top of the existing QEMU battery, not a replacement for it —
+everything QEMU can already catch should still be caught in QEMU
+first, keeping the fast local loop as the default and hardware-in-loop
+as the final confirmation pass.
+
+**Round 68 (2026-09-04): concrete step-by-step instructions now
+exist** — `docs/HARDWARE_IN_LOOP.md`. Required hardware, wiring, a
+verification checklist matching the "known real-hardware-only gaps"
+list above, and two details a generic Raspberry Pi tutorial would get
+wrong for THIS specific kernel: (1) `uart_init()`'s own comment
+admits its baud-rate divisor is calculated assuming a 3MHz UART
+reference clock that real Pi firmware does not guarantee by
+default — needs `init_uart_clock=3000000` in `config.txt` or the
+console prints garbage, not silence; (2) DharaFS
+(`dharafs_init`/`sdhost_card_addr`) writes raw blocks 1-2048 (~1MB)
+from the very front of the SD card with zero partition-table
+awareness — a naive "format the whole card as FAT32" setup would let
+the boot partition and DharaFS silently corrupt each other; the FAT32
+boot partition needs to start well clear of that region (recommended:
+sector 16384 / 8MiB, comfortable margin beyond the 1MB ceiling).
+Written directly from this project's own source, not assumed from
+generic Pi documentation.
 
 ## Pi 4/5 port — now started (round 40 research, round 43 boot skeleton)
 
@@ -2864,7 +2892,11 @@ networking is loopback-only with zero real NIC/wireless hardware
 support of any kind.
 
 - **DhruvaOS user manual** (`docs/DHRUVAOS_MANUAL.md`) — `[M, ~1-2
-  rounds]`
+  rounds — WRITTEN (438 lines, Sep 2), header status tag was stale
+  (caught round 68, 2026-09-04); needs an update pass for round 67's
+  later same-day crypto batch (AES/TLS/PKI/PQC/media encryption) and
+  round 68 (scheduler fix, stack canary, PBKDF2 iteration count), see
+  that round's own tracking]`
   Boot process, the scheduler/task model (including its current
   6-task-fixed limitation, stated plainly rather than glossed over),
   the interactive shell and all ~20 commands, the heap allocator's
@@ -2874,7 +2906,10 @@ support of any kind.
   can honestly describe the CURRENT state, then gets a real update
   once that API lands rather than documenting something aspirational.
 
-- **DharaFS user manual** (`docs/DHARAFS_MANUAL.md`) — `[M, ~1 round]`
+- **DharaFS user manual** (`docs/DHARAFS_MANUAL.md`) — `[M, ~1 round —
+  WRITTEN (264 lines, Sep 2), header status tag was stale (caught
+  round 68, 2026-09-04); check needed for round 67's snapshots/
+  hashed-directory-index/priority-queue coverage]`
   On-disk record format, the permission model (owner/group/other +
   immutable/append-only/system attributes), rename+transaction
   semantics, verified I/O (`writev`/`catv`), the append-only log API,

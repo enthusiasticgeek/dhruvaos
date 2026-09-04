@@ -207,6 +207,22 @@ current file size), tracked automatically:
 | 1 | USB mass storage (DWC2 + bulk-only transport), proven as a genuine second backend through the same abstraction. |
 | 2 | `host_virtual_disk_read`/`write` — an in-memory array, used **only** by `test/host_harness/` (the host-side ASAN/UBSAN test driver) to exercise DharaFS's real logic without touching real hardware. Dead code on real hardware; production `runtime_stubs.c` always fails this path if somehow reached. |
 
+**Media (at-rest) encryption (round 62)** applies orthogonally to
+which backend above is selected — a ChaCha20 transform hooked
+directly into `dharafs_block_read`/`dharafs_block_write` (renamed to
+`_raw` + a thin wrapper), so every higher layer in this manual
+(records, multi-block files, transactions, snapshots, the directory
+index) keeps operating on plaintext with zero awareness it's on.
+**Off by default** (`dharafs_crypto_get_enabled()` starts at 0). Key
+derived once at boot via PBKDF2-HMAC-SHA256 from a fixed passphrase;
+nonce per block is a pure function of the block number. Honest,
+deliberate limitation: overwriting the same block twice under the
+same key reuses the same keystream (a two-time-pad leak against an
+attacker holding two on-disk snapshots) — real protection against the
+common single-stolen-SD-card threat, not multi-snapshot analysis.
+Integrity (Poly1305, built round 67) is not yet wired into this path
+— see `TODO.md`.
+
 ## 9. Recovery (what happens at boot)
 
 `dharafs_init` scans blocks 1 through 2048 (a bounded 1MB log region
@@ -222,7 +238,78 @@ cursor back to before it; `log_start` (compaction's own optimization
 of how much of the log still needs scanning) always resets to block 1
 on boot.
 
-## 10. API reference (raw/checked/Str layering)
+## 10. Hashed directory index (round 67)
+
+`boot/dirindex_state.S`: a 256-slot open-addressed (linear probing, no
+deletion) RAM-only hash table mapping path → latest block number,
+FNV-1a hash. Built once by `dharafs_init`'s own boot-time scan and
+kept in sync afterward by `dharafs_append_raw`/`dharafs_delete_raw` on
+every successful write — every path-mutating operation in this
+codebase funnels through one of those two, so there's no separate
+"remember to update the index" call site to miss.
+`dharafs_find_latest_block_raw` tries the index first (an O(1) probe)
+and only falls through to the original full linear scan on a miss,
+which then self-heals the index for next time. A hit is always
+correct by construction; a miss is always safe — identical behavior
+to before this feature existed, including graceful degradation if the
+table's 256 slots ever genuinely fill (falls back to the linear scan
+for everything beyond that, same as if the index didn't exist at
+all). Pure performance optimization — nothing about the on-disk
+format or the recovery semantics in §9 changed.
+
+## 11. Snapshots / versioned rollback (round 67)
+
+A filesystem-wide point-in-time view, added without needing any
+change to `dharafs_compact`'s own reclaim logic: compaction's
+"reclaim" is an in-RAM-only optimization (advancing `log_start`,
+which unconditionally resets to block 1 on the next boot) that hides
+old blocks from *ordinary* lookups without ever erasing their bytes —
+nothing in this v1 design reuses or overwrites a block number within
+one boot session. So a snapshot doesn't need to pin or protect
+anything from reclaim; it only needs to remember a sequence number to
+query against later.
+
+- `dharafs_snapshot_create(name)` — pins `next_seq - 1` (the highest
+  sequence number that genuinely existed at that moment) under `name`
+  (`boot/snapshot_state.S`, 8 named slots).
+- `dharafs_snapshot_read(path, name, buf)` — finds the highest-
+  sequence record for `path` with `seq <= ` the pinned sequence,
+  scanning from block 1 (**not** `log_start`) — the one deliberate
+  place in this codebase that looks past what `log_start` currently
+  hides.
+- `dharafs_snapshot_delete(name)`.
+
+**Scope, explicit**: filesystem-wide (one pin covers every path), not
+per-file/per-directory; no snapshot-aware `dharafs_list`; bounded by
+the same 2048-block/1MB v1 log region cap every other DharaFS feature
+already has. Verified against a real, non-trivial case: create a
+snapshot, overwrite the file, run an actual `dharafs_compact()` pass
+that reclaims the old block from ordinary lookups, confirm the
+snapshot still reads the pre-overwrite content byte-exact — proving
+this works against real compaction, not just an un-compacted log.
+
+## 12. Priority-aware FS request queue (round 67)
+
+An opt-in, asynchronous alternative to the synchronous `dharafs_*`
+calls used everywhere else in this manual — every existing call site
+is completely unchanged; this is purely additive.
+
+- `dharafs_queue_submit_write_raw`/`_submit_delete_raw`/`_submit` (a
+  `Str` convenience wrapper) enqueue a request into 8 fixed slots
+  (`boot/fsqueue_state.S`), auto-tagging the calling task's own
+  `current_eff_prio()`/`current_task_get()`.
+- `dharafs_queue_dispatch_one` always picks the numerically LOWEST
+  priority value present (this project's own "0 is highest"
+  convention), oldest submission first among ties.
+- A dedicated background task (`task_fsq`, priority tier 2 — the same
+  tier as `task_gc`'s compaction) drains the whole queue every time it
+  wakes.
+- Queued writes are capped at `dharafs_block_payload_cap()` (448
+  bytes, single-block only); a full queue or an oversized write is
+  rejected cleanly and the caller falls back to a direct synchronous
+  call — never a silent drop.
+
+## 13. API reference (raw/checked/Str layering)
 
 DharaFS follows one consistent layering, top to bottom:
 
@@ -251,14 +338,23 @@ Core functions: `dharafs_init`, `dharafs_append_raw`/`_checked`/
 `dharafs_log_append_raw`/`dharafs_log_append`, `dharafs_compact`
 (GC — reclaims blocks whose every record has a newer copy beyond
 `log_start`), `dharafs_tx_begin_raw` (the transaction primitive, §5).
+Round 67 additions: `dharafs_snapshot_create`/`_read`/`_delete` (§11),
+`dharafs_queue_submit_write_raw`/`_submit_delete_raw`/`_submit`/
+`_dispatch_one` (§12) — the hashed directory index (§10) has no public
+API of its own, it's an internal acceleration
+`dharafs_find_latest_block_raw` already uses transparently.
 
-## 11. See also
+## 14. See also
 
 - `docs/DHRUVAOS_MANUAL.md` — the shell commands that front most of
   this API, the scheduler, and the overall system.
 - `docs/TODO.md` — open DharaFS-adjacent backlog (a general multi-op
-  transaction API beyond rename, snapshots, capability tokens, a
-  hashed directory index — the last two explicitly recommended
-  against building without a real forcing need).
+  transaction API beyond rename; capability tokens beyond uid/gid/
+  mode; wear/erase statistics — no current backend exposes that
+  information at this layer at all).
+- `docs/HARDWARE_IN_LOOP.md` — connecting a real Pi 1B + SD card;
+  includes a critical note on SD partition layout, since this
+  filesystem writes raw blocks 1-2048 (~1MB) from the very front of
+  the device with zero partition-table awareness.
 - `test/host_harness/README.md` — the host-side ASAN/UBSAN test
   driver for this filesystem's own logic.
