@@ -263,7 +263,9 @@ multi-round item elsewhere in this backlog.
     left implicit, in case either matters for a future round.
 
 - **FS directory hierarchy + multi-block files + journaling
-  hardening** — `[L, ~4-5 rounds]`
+  hardening** — `[L, ~4-5 rounds — DONE, rounds 39 + 42; this header's
+  own status tag was stale, caught and fixed round 68, 2026-09-04 —
+  see the body below, which already documented both halves as done]`
   Today's FS is "flat, append-only, checksummed log" — paths are
   opaque strings (`ls` does prefix filtering, not real directory
   listing).
@@ -368,8 +370,13 @@ depends on that not being true anymore, so it's listed first as the
 real prerequisite everything else blocks on, not because it was asked
 for by name.
 
-- **Crypto primitives foundation** — `[L, ~3-5 rounds — the real
-  prerequisite for PKI/secure boot/media encryption below]`
+- **Crypto primitives foundation** — `[L, ~3-5 rounds — DONE across
+  rounds 41/44/67 (SHA-256, ChaCha20, bignum, Poly1305, X25519,
+  SHA-512, Ed25519 — see AES/TLS/PKI/media-encryption entries below
+  for what's built on top); this header's own status tag was stale
+  despite the body below already saying "this item's core scope is
+  now fully closed" partway through — caught and fixed round 68,
+  2026-09-04]`
 
   **SHA-256: DONE (round 41).** Full FIPS 180-4 implementation
   (`sha256_hash`/`sha256_compress` + supporting K-table/message-
