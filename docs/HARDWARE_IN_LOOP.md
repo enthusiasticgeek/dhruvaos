@@ -12,12 +12,20 @@ copied from a generic Raspberry Pi tutorial. Two details below
 tutorial would get wrong for THIS specific kernel — read those before
 doing anything else.
 
+**Confirmed target hardware (2026-09-04)**: a real Raspberry Pi 1
+Model B, **revision 2.0, 512MB RAM** (the 26-pin-header board, GPU
+firmware/BCM2835 identical to revision 1.0 — the only hardware change
+between revisions is the I2C ID pins, GPIO0/1 → GPIO2/3 plus the added
+P5 header, neither of which this project's UART wiring in §3 touches).
+Everything below applies to it as written.
+
 ## 1. What you need
 
 - A real Raspberry Pi 1 Model B (BCM2835, the board `raspi1ap` in
   QEMU emulates — **not** a B+, Zero, or Pi 2/3/4/5; those need a
   different boot firmware set and, for anything past Pi 1, a
-  different SoC this project doesn't target).
+  different SoC this project doesn't target). Revision 1.0 or 2.0
+  both work identically for everything in this document.
 - A microSD card (SDSC or SDHC both work — `sd_state_get_is_sdhc()`
   in `kernel/kernel_main.vani` handles both addressing modes). A
   small, reputable card (2-8GB) is plenty; this project's own log
