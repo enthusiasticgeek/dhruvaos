@@ -59,6 +59,19 @@ int64_t dhruva_fault_inject_alloc_arm(int64_t after_n) {
     return 0;
 }
 
+/* ---- 1a2. Round 68: stack overflow canary (boot/stack_canary.S).
+ * Purely a scheduler/interrupt-path safety net with no logic this
+ * host harness can meaningfully exercise (there is no scheduler here)
+ * -- a harmless no-op stub, same posture as any other MMIO-touching
+ * function this harness can't reach (see this file's own header
+ * comment). */
+int64_t stack_canary_set_base(uint32_t index, int64_t *base) {
+    (void)index;
+    (void)base;
+    return 0;
+}
+uint32_t stack_canary_check_all(void) { return 0; }
+
 /* ---- 1b. Raw buffer accessors -- byte-for-byte match of
  * boot/dharafs_buf.S's ARM assembly (buf is treated as a plain byte
  * pointer, offset is a plain byte offset, no bounds checking here
@@ -283,6 +296,24 @@ SCRATCH_PTR(tls_parsed_server_random)
 SCRATCH_PTR(tls_parsed_server_pub)
 SCRATCH_PTR(tls_flight_combined)
 SCRATCH_PTR(tls_parsed_server_id_pub)
+/* Round 68: these 13 were added to boot/tls13_scratch.S in a later
+ * sub-round than when this file's own TLS coverage above was written,
+ * and never backfilled here -- a pre-existing host_harness build gap
+ * (undefined references at link time), not something this round's own
+ * scheduler fix touched. Same SCRATCH_PTR shape as everything above. */
+SCRATCH_PTR(tls_client_phase)
+SCRATCH_PTR(tls_server_phase)
+SCRATCH_PTR(tls_cert_hash)
+SCRATCH_PTR(tls_cv_sig)
+SCRATCH_PTR(tls_s_verify_data)
+SCRATCH_PTR(tls_c_verify_data)
+SCRATCH_PTR(tls_basepoint)
+SCRATCH_PTR(tls_zero32)
+SCRATCH_PTR(tls_transcript_len)
+SCRATCH_PTR(tls_t_len_sh)
+SCRATCH_PTR(tls_t_len_cert)
+SCRATCH_PTR(tls_t_len_cv)
+SCRATCH_PTR(tls_t_len_s_fin)
 SCRATCH_PTR(ed25519_d)
 SCRATCH_PTR(ed25519_2d)
 SCRATCH_PTR(ed25519_sqrt_m1)

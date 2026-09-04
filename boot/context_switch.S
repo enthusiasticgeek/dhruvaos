@@ -378,23 +378,65 @@ task_sleep_ticks:
      * tick landing anywhere in that window drives irq_entry.S's own
      * concurrent save/scheduler-switch path on the SAME stack, racing
      * to write the SAME sp_table[current_task] entry this function is
-     * still in the middle of populating. Not proven to be the sole
-     * cause of the still-open task_f runtime-trap bug (project memory:
-     * Dhruva round 65), but it's a genuine, real race against
-     * concurrently-modified shared scheduler state with no mutual
-     * exclusion, exactly the class of bug this project's own
-     * dhruva_mutex_lock already guards against in its own analogous
-     * path -- masking here is free (this function always ends by
-     * switching away, never by a normal `bx lr` return, so there's no
-     * "restore the caller's original mask" step needed: the resumed
-     * task's own interrupt state is governed entirely by the spsr this
-     * function stages into its own saved frame below, not by the live
-     * cpsr at any point in this function). */
+     * still in the middle of populating. At the time this was written,
+     * not proven to be the sole cause of the (then-)still-open task_f
+     * runtime-trap bug (project memory: Dhruva round 65) -- but it was
+     * a genuine, real race against concurrently-modified shared
+     * scheduler state with no mutual exclusion, exactly the class of
+     * bug this project's own dhruva_mutex_lock already guards against
+     * in its own analogous path -- masking here is free (this function
+     * always ends by switching away, never by a normal `bx lr` return,
+     * so there's no "restore the caller's original mask" step needed:
+     * the resumed task's own interrupt state is governed entirely by
+     * the spsr this function stages into its own saved frame below,
+     * not by the live cpsr at any point in this function).
+     *
+     * Round 68: the actual mechanism behind the INTERRUPT-DRIVEN
+     * portion of that bug class is now understood and fixed -- see
+     * irq_entry.S's own header comment (the saved frame's "lr" slot
+     * used to conflate the interrupted task's true r14 with the resume
+     * PC; any hand-written bare `bx lr` leaf -- ~300 of them project-
+     * wide, every `boot/*_state.S` accessor -- interrupted mid-body
+     * would resume with r14==pc and self-loop until it dereferenced
+     * something unmapped). This masking stays in place regardless --
+     * still a real, independent race worth closing on its own -- but
+     * is very likely no longer load-bearing for the specific crash
+     * class this comment originally described. Round 62f's own
+     * separate finding that the SHA-256/PBKDF2 corruption could also
+     * occur with ZERO interrupts (single-threaded boot, before enable_
+     * irqs() ever runs) is NOT explained by the round-68 fix -- that
+     * narrower mystery, if it's still reproducible, remains genuinely
+     * open. */
     cpsid i
-    stmdb sp!, {r0-r12, lr}        /* 14 words = 56 bytes */
+    /* Round 68: explicit 17-word (68-byte) frame -- spsr, pad, r0-r12,
+     * true_lr, resume_pc -- replacing the old 16-word stmdb-built one.
+     * See irq_entry.S's own header comment for the full "why" (the old
+     * single "lr" slot conflated true_lr and resume_pc, harmless for a
+     * VOLUNTARY switch like this one -- where they're legitimately the
+     * SAME value, "whoever called task_sleep_ticks" -- but fatal for
+     * irq_entry.S's involuntary path). Kept explicit `str` rather than
+     * `stmdb` so the true_lr/resume_pc duplication is easy to see is
+     * deliberate, not an oversight. */
+    sub sp, sp, #68
+    str r0, [sp, #8]
+    str r1, [sp, #12]
+    str r2, [sp, #16]
+    str r3, [sp, #20]
+    str r4, [sp, #24]
+    str r5, [sp, #28]
+    str r6, [sp, #32]
+    str r7, [sp, #36]
+    str r8, [sp, #40]
+    str r9, [sp, #44]
+    str r10, [sp, #48]
+    str r11, [sp, #52]
+    str r12, [sp, #56]
+    str lr, [sp, #60]               /* true_lr (== resume point here) */
+    str lr, [sp, #64]               /* resume_pc, same value duplicated */
     mov r2, #0x13
+    str r2, [sp, #0]                 /* spsr */
     mov r3, #0
-    stmdb sp!, {r2, r3}             /* spsr=0x13, pad -- 8 bytes, 64 total */
+    str r3, [sp, #4]                 /* pad */
 
     mov r4, sp                      /* r4 = this context's sp */
     ldr r5, =current_task
@@ -403,8 +445,9 @@ task_sleep_ticks:
     ldr r8, [r7]
     add r8, r8, r0                  /* wake_time = tick_count + ticks;
                                      * r0 is still the original arg --
-                                     * stmdb only reads registers, it
-                                     * never modifies the source list */
+                                     * untouched by the explicit stores
+                                     * above, same as stmdb's own
+                                     * read-only-source-list behavior */
     ldr r9, =sleep_until_table
     str r8, [r9, r6, lsl #2]
 
@@ -415,8 +458,9 @@ task_sleep_ticks:
     mov sp, r0
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
-    ldmia sp!, {r0-r12, lr}
-    subs pc, lr, #0
+    ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
+                                     * comment for why {lr,pc}^ replaces
+                                     * the old {lr} + subs pc,lr,#0 */
 
 /* i64 dhruva_prio_lock(i64 ceiling) -- boosts the calling task's effective
  * priority to `ceiling`. i64 dhruva_prio_unlock(i64 base_priority) --
@@ -538,12 +582,31 @@ dhruva_mutex_lock:
 dml_contended:
     /* r0 = mutex_id, r3 = owner task index (both still live from
      * above). Full context save FIRST -- see this function's own
-     * header comment. */
-    stmdb sp!, {r0-r12, lr}
+     * header comment. Round 68: explicit 17-word (68-byte) frame --
+     * see task_sleep_ticks's own comment for the full "why" (true_lr
+     * vs resume_pc split, harmless duplication for a voluntary switch
+     * like this one). */
+    sub sp, sp, #68
+    str r0, [sp, #8]
+    str r1, [sp, #12]
+    str r2, [sp, #16]
+    str r3, [sp, #20]
+    str r4, [sp, #24]
+    str r5, [sp, #28]
+    str r6, [sp, #32]
+    str r7, [sp, #36]
+    str r8, [sp, #40]
+    str r9, [sp, #44]
+    str r10, [sp, #48]
+    str r11, [sp, #52]
+    str r12, [sp, #56]
+    str lr, [sp, #60]                /* true_lr (== resume point here) */
+    str lr, [sp, #64]                /* resume_pc, same value duplicated */
     mov r4, #0x13
+    str r4, [sp, #0]                  /* spsr=0x13 (SVC, IRQs enabled on
+                                       * restore) */
     mov r5, #0
-    stmdb sp!, {r4, r5}              /* spsr=0x13 (SVC, IRQs enabled on
-                                       * restore), pad */
+    str r5, [sp, #4]                  /* pad */
     mov r4, sp                       /* r4 = frame base */
     mov r5, #0
     str r5, [r4, #8]                 /* patch saved r0 -> 0 (this call's
@@ -606,8 +669,9 @@ dml_contended:
     mov sp, r0
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
-    ldmia sp!, {r0-r12, lr}
-    subs pc, lr, #0
+    ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
+                                     * comment for why {lr,pc}^ replaces
+                                     * the old {lr} + subs pc,lr,#0 */
 
 /* u32 dhruva_mutex_unlock(u32 mutex_id)
  * Always returns normally (never suspends the caller) -- push/pop
@@ -999,7 +1063,15 @@ task_f_init_stack:
     b prepare_stack_common
 
 prepare_stack_common:
-    sub r0, r0, #64
+    /* Round 68: explicit 17-word (68-byte) frame -- see irq_entry.S's
+     * own header comment for the full "why" (true_lr vs resume_pc
+     * split). A freshly-launched task has no meaningful "true_lr" of
+     * its own yet (it never legitimately returns to anything via a
+     * live r14), but the slot must still exist so the shared restore
+     * code's fixed-size ldm reads a consistent layout -- entry point
+     * duplicated into both words, same harmless pattern task_sleep_
+     * ticks/dhruva_mutex_lock use for their own voluntary switches. */
+    sub r0, r0, #68
     mov r2, #0x13
     str r2, [r0, #0]       /* spsr */
     mov r2, #0
@@ -1017,7 +1089,8 @@ prepare_stack_common:
     str r2, [r0, #48]      /* r10 */
     str r2, [r0, #52]      /* r11 */
     str r2, [r0, #56]      /* r12 */
-    str r1, [r0, #60]      /* lr = entry point */
+    str r1, [r0, #60]      /* true_lr = entry point */
+    str r1, [r0, #64]      /* resume_pc = entry point */
     bx lr
 
 /* Round 54 -- general task-creation API. Verified BEFORE writing this
@@ -1259,5 +1332,6 @@ start_multitasking:
     mov sp, r0
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
-    ldmia sp!, {r0-r12, lr}
-    subs pc, lr, #0
+    ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
+                                     * comment for why {lr,pc}^ replaces
+                                     * the old {lr} + subs pc,lr,#0 */

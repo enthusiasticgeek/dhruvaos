@@ -107,10 +107,27 @@ fault_data_abort:
     mov r3, r4                  /* orig_r0 -> arg4 */
     cps #0x13                   /* SVC mode -- never returning, safe to
                                   * reuse whatever's on that stack */
-    sub sp, sp, #12
+    /* Round 68: lr is banked per-mode, so the instant we're in SVC
+     * mode, "lr" transparently means lr_svc -- whatever the SVC-mode
+     * code (i.e. the faulting function's own caller) last set it to
+     * via its own `bl`, completely untouched by taking this exception
+     * (that only ever affects lr_abt, a physically different
+     * register). For every crash this investigation has actually
+     * hit, the fault happens on buf_read_u32/buf_write_u32's own
+     * FIRST instruction (a 2-instruction leaf: `ldr r0,[r0,r1]; bx
+     * lr`) -- so lr_svc here is exactly that function's own return
+     * address, i.e. the real call site that invoked it with a bad
+     * pointer, addr2line-able like any other address. r8 is safe
+     * scratch (unused anywhere else in this handler, not yet spilled
+     * to the stack below). Captured here, before `bl
+     * abort_report_data` below overwrites lr with ITS OWN return
+     * address. */
+    mov r8, lr
+    sub sp, sp, #16
     str r5, [sp, #0]            /* orig_r1 -> arg5 (stack) */
     str r6, [sp, #4]            /* orig_r2 -> arg6 (stack) */
     str r7, [sp, #8]            /* orig_r3 -> arg7 (stack) */
+    str r8, [sp, #12]           /* orig_lr -> arg8 (stack) */
     bl abort_report_data
     b .
 

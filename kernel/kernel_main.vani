@@ -417,6 +417,32 @@ extern "C" fn tls_flight_combined_set(addr: mut ref i64) -> i64;
 extern "C" fn tls_flight_combined_get() -> mut ref i64;
 extern "C" fn tls_parsed_server_id_pub_set(addr: mut ref i64) -> i64;
 extern "C" fn tls_parsed_server_id_pub_get() -> mut ref i64;
+extern "C" fn tls_client_phase_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_client_phase_get() -> mut ref i64;
+extern "C" fn tls_server_phase_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_server_phase_get() -> mut ref i64;
+extern "C" fn tls_cert_hash_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_cert_hash_get() -> mut ref i64;
+extern "C" fn tls_cv_sig_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_cv_sig_get() -> mut ref i64;
+extern "C" fn tls_s_verify_data_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_s_verify_data_get() -> mut ref i64;
+extern "C" fn tls_c_verify_data_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_c_verify_data_get() -> mut ref i64;
+extern "C" fn tls_basepoint_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_basepoint_get() -> mut ref i64;
+extern "C" fn tls_zero32_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_zero32_get() -> mut ref i64;
+extern "C" fn tls_transcript_len_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_transcript_len_get() -> mut ref i64;
+extern "C" fn tls_t_len_sh_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_t_len_sh_get() -> mut ref i64;
+extern "C" fn tls_t_len_cert_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_t_len_cert_get() -> mut ref i64;
+extern "C" fn tls_t_len_cv_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_t_len_cv_get() -> mut ref i64;
+extern "C" fn tls_t_len_s_fin_set(addr: mut ref i64) -> i64;
+extern "C" fn tls_t_len_s_fin_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -679,6 +705,14 @@ extern "C" fn dhcp_frame_scratch_get() -> mut ref i64;
 extern "C" fn dhcp_bcast_mac_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dhcp_bcast_mac_scratch_get() -> mut ref i64;
 extern "C" fn ptr_to_u32(p: mut ref i64) -> u32;
+// Per-task stack overflow canary (boot/stack_canary.S) -- see that
+// file's own header comment for the full "why" (four historical
+// silent-stack-overflow incidents, no MMU guard page possible at this
+// project's current 1MB section granularity). set_base is called once
+// per task, at boot, right after that task's stack is allocated;
+// check_all runs once per real timer tick from irq_dispatch below.
+extern "C" fn stack_canary_set_base(index: u32, base: mut ref i64) -> i64;
+extern "C" fn stack_canary_check_all() -> u32;
 extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_c_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
@@ -1233,6 +1267,32 @@ fn uart_putc_nonblocking(c: i64) -> i64 {
   return 0;
 }
 
+// Bounded, non-blocking hex-digit printer for hard-RT contexts (this
+// project's own irq_dispatch's stack-canary check is the only caller
+// as of round 68). uart_put_hex32 below deliberately uses blocking
+// uart_putc inside a `while` loop -- exactly the "unbounded under
+// #[wcet(...)]" problem irq_dispatch's own UART RX FIFO drain comment
+// already documents in full (only a `for i from LOW to HIGH` range
+// loop, not `while`, carries a statically-known trip count the WCET
+// estimator can multiply through), so it can't be reused here. Same
+// best-effort trade-off as uart_putc_nonblocking itself: a nibble is
+// silently dropped if the UART's TX FIFO happens to be full at that
+// exact instant -- already accepted project-wide for anything printed
+// from IRQ context.
+fn uart_put_hex32_irq(v: u32) -> i64 {
+  for shift_idx from 0 to 8 {
+    let shift: u32 = (28 - (shift_idx * 4)) as u32;
+    let nibble: u32 = (v >> shift) & (0xF as u32);
+    let n: i64 = nibble as i64;
+    if n < 10 {
+      let _ = uart_putc_nonblocking(48 + n);
+    } else {
+      let _ = uart_putc_nonblocking(55 + n);
+    }
+  }
+  return 0;
+}
+
 fn uart_puts(s: Str) -> i64 {
   let n: i64 = str_len_bytes(s);
   let i: i64 = 0;
@@ -1294,7 +1354,7 @@ fn abort_fault_is_section_permission(status: u32) -> i64 {
 
 #[no_mangle]
 #[no_heap]
-fn abort_report_data(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r1: u32, orig_r2: u32, orig_r3: u32) -> i64 {
+fn abort_report_data(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r1: u32, orig_r2: u32, orig_r3: u32, orig_lr: u32) -> i64 {
   let _ = uart_puts("\nFATAL: Data Abort at address ");
   let _ = uart_put_hex32(addr);
   let _ = uart_puts(" status=");
@@ -1323,6 +1383,12 @@ fn abort_report_data(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r
   let _ = uart_put_hex32(orig_r2);
   let _ = uart_puts(" r3=");
   let _ = uart_put_hex32(orig_r3);
+  // Round 68: lr_svc at the moment of the fault -- see vectors.S's own
+  // comment for why this is exactly the faulting function's real
+  // return address (its caller's call site), not the fault_pc's own
+  // +8-offset abort-mode convention above. addr2line this directly.
+  let _ = uart_puts(" lr=");
+  let _ = uart_put_hex32(orig_lr);
   let _ = uart_puts(" ctxsw=");
   let _ = uart_put_i64(context_switch_count_get());
   let _ = uart_puts(" irqs=");
@@ -5379,6 +5445,37 @@ fn irq_dispatch() -> i64 {
   // "roughly what was activity like recently" query.
   if was_timer_tick == 1 {
     let _ = diag_ring_push(scheduler_get_tick_count(), context_switch_count_get() as u32, irq_count_get() as u32, prio_lock_count_get() as u32);
+
+    // Round 68 (this investigation): per-task stack overflow canary
+    // check (see boot/stack_canary.S's own header for the full "why").
+    // Same once-per-real-tick cadence as diag_ring_push just above --
+    // catches a breach within ~500ms of it happening and names the
+    // exact task, instead of the corruption silently propagating until
+    // it eventually surfaces as an unrelated wild-pointer crash
+    // arbitrarily far downstream, which is what made every one of this
+    // bug class's four prior incidents (round 9, 27, 60, 67) so hard to
+    // diagnose. Not a fix for the overflow itself -- see that file's
+    // comment for why a real MMU guard page isn't possible yet at this
+    // project's current 1MB section granularity.
+    let canary_breach: u32 = stack_canary_check_all();
+    if canary_breach != (0 as u32) {
+      // Fixed, unrolled sequence of single-byte non-blocking putc
+      // calls -- not uart_puts (blocking `while`, unbounded under
+      // #[wcet(...)], see uart_put_hex32_irq's own comment above for
+      // why) -- printing "CANARY mask=<hex> tick=<hex>\n" one
+      // hardcoded byte at a time.
+      let _ = uart_putc_nonblocking(67); // C
+      let _ = uart_putc_nonblocking(65); // A
+      let _ = uart_putc_nonblocking(78); // N
+      let _ = uart_putc_nonblocking(65); // A
+      let _ = uart_putc_nonblocking(82); // R
+      let _ = uart_putc_nonblocking(89); // Y
+      let _ = uart_putc_nonblocking(32); // ' '
+      let _ = uart_put_hex32_irq(canary_breach);
+      let _ = uart_putc_nonblocking(32); // ' '
+      let _ = uart_put_hex32_irq(scheduler_get_tick_count());
+      let _ = uart_putc_nonblocking(10); // '\n'
+    }
   }
   return was_timer_tick;
 }
@@ -15575,14 +15672,11 @@ fn shell_dispatch_su(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 
 
     let salt_ptr: mut ref i64 = auth_salt_ptr(slot as u32);
     let computed: mut ref i64 = su_hash_scratch_ptr();
-    // See pbkdf2_auth_iterations's own comment for why this is only
-    // 200 iterations -- a real, separate, not-yet-root-caused bug
-    // (not a deliberate security/usability tradeoff) currently caps
-    // how much synchronous computation task_f can run to completion
-    // here. (A priority-ceiling boost around this call was tried and
-    // measured NOT to reliably fix it -- the same stall reproduced
-    // either way -- so it was removed rather than left in as a
-    // false sense of mitigation.)
+    // See pbkdf2_auth_iterations's own comment for the real, measured
+    // tradeoff behind this iteration count (round 68 -- the bug that
+    // used to cap this at 200 is fixed and closed; a priority-ceiling
+    // boost tried against the OLD bug measured NOT to reliably fix it,
+    // now moot along with the bug itself).
     let _ = pbkdf2_hmac_sha256(pw_buf, pw_len, salt_ptr, 16, pbkdf2_auth_iterations(), computed);
     let stored: mut ref i64 = auth_hash_ptr(slot as u32);
     if hmac_sha256_bytes_equal(computed, stored, 32) == 0 {
@@ -15685,10 +15779,8 @@ fn shell_dispatch_passwd(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> 
   let _ = buf_write_u32_be(salt_ptr, 12, nonce ^ tick);
 
   let hash_ptr: mut ref i64 = auth_hash_ptr(slot as u32);
-  // See pbkdf2_auth_iterations's own comment for why this is only 200
-  // iterations -- a real, separate, not-yet-root-caused bug (not a
-  // deliberate security/usability tradeoff) currently caps how much
-  // synchronous computation task_f can run to completion here.
+  // See pbkdf2_auth_iterations's own comment for the real, measured
+  // tradeoff behind this iteration count.
   let _ = pbkdf2_hmac_sha256(pw_buf, pw_len, salt_ptr, 16, pbkdf2_auth_iterations(), hash_ptr);
 
   let _ = auth_set_fail_count(slot as u32, 0 as u32);
@@ -16741,7 +16833,7 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts(" task(s)\n");
 
     let used: i64 = dhruva_heap_used_bytes();
-    let capacity: i64 = 262144; // DHRUVA_HEAP_BYTES, runtime_stubs.c -- same constant heap_usage_self_test uses
+    let capacity: i64 = 786432; // DHRUVA_HEAP_BYTES, runtime_stubs.c (round 68: 256KB -> 768KB) -- same constant heap_usage_self_test uses
     let pct: i64 = (used * 100) / capacity;
     let _ = uart_puts("  heap: ");
     let _ = uart_put_i64(used);
@@ -16942,6 +17034,101 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // A TLS-shaped counterpart to tcpecho, above: same self-connect-
+  // over-loopback shape, but the round trip runs through the real
+  // tls_connect/tls_accept/tls_send/tls_recv API (see that section's
+  // own header comment for the concurrency model and its scope
+  // limits) instead of bare TCP -- the user's own text genuinely gets
+  // encrypted, sent as TLS application data over a real TCP
+  // connection, decrypted by the "server" role, echoed back
+  // encrypted, and decrypted again here before printing.
+  if shell_word_matches(line_buf, 0, cmd_end, "tlsecho") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: tlsecho <text>\n");
+      return 0;
+    }
+    let text_start: i64 = cmd_end + 1;
+    let text_len: i64 = line_len - text_start;
+    if text_len > (64 as i64) {
+      let _ = uart_puts("error: text too long (max 64)\n");
+      return 0;
+    }
+    let payload: mut ref i64 = tls_client_msg_get();
+    let _ = shell_copy_range(line_buf, text_start, line_len, payload);
+
+    let my_mac: mut ref i64 = shell_my_mac_scratch_get();
+    let _ = netif_get_mac(my_mac);
+    let client_id: u32 = 0 as u32;
+    let server_id: u32 = 1 as u32;
+    let loop_ip: u32 = 0x7F000001 as u32;
+    let client_port: u32 = 54325 as u32;
+    let server_port: u32 = 8443 as u32;
+
+    let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
+    let isn: u32 = scheduler_get_tick_count() + (2000 as u32);
+    let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    if open_status != 0 {
+      let _ = uart_puts("tlsecho: SYN send failed\n");
+      return 0;
+    }
+
+    let scratch: mut ref i64 = shell_tcp_poll_scratch_get();
+    let handshake_iter: i64 = 0;
+    while (handshake_iter < 10) && ((tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established())) {
+      let _ = tcp_conn_poll(my_mac, scratch, 512);
+      handshake_iter = handshake_iter + 1;
+    }
+    if (tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established()) {
+      let _ = uart_puts("tlsecho: TCP handshake failed\n");
+      return 0;
+    }
+
+    let connect_status: i64 = tls_connect(client_id, server_id, my_mac);
+    if connect_status != 0 {
+      let _ = uart_puts("tlsecho: TLS handshake failed\n");
+      return 0;
+    }
+    let accept_status: i64 = tls_accept(server_id, client_id, my_mac);
+    if accept_status != 0 {
+      let _ = uart_puts("tlsecho: TLS server-side accept failed\n");
+      return 0;
+    }
+
+    let c_ap_key: mut ref i64 = tls_c_ap_key_get();
+    let c_ap_iv: mut ref i64 = tls_c_ap_iv_get();
+    let _ = tls_send(client_id, server_id, my_mac, c_ap_key, c_ap_iv, payload, text_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+
+    let dec: mut ref i64 = tls_decrypted_scratch_get();
+    let dec_len: i64 = tls_recv(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_ap_key, c_ap_iv, dec);
+    if dec_len < 0 {
+      let _ = uart_puts("tlsecho: server failed to decrypt client message\n");
+      return 0;
+    }
+
+    let s_ap_key: mut ref i64 = tls_s_ap_key_get();
+    let s_ap_iv: mut ref i64 = tls_s_ap_iv_get();
+    let _ = tls_send(server_id, client_id, my_mac, s_ap_key, s_ap_iv, dec, dec_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+
+    let echoed_buf: mut ref i64 = tls_server_reply_get();
+    let echoed_len: i64 = tls_recv(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_ap_key, s_ap_iv, echoed_buf);
+    if echoed_len < 0 {
+      let _ = uart_puts("tlsecho: client failed to decrypt server echo\n");
+      return 0;
+    }
+
+    let _ = tcp_conn_close(client_id, my_mac, my_mac);
+    let close_iter: i64 = 0;
+    while (close_iter < 10) && (tcp_conn_get_state(client_id) != tcp_state_closed_final()) {
+      let _ = tcp_conn_poll(my_mac, scratch, 512);
+      close_iter = close_iter + 1;
+    }
+
+    let _ = uart_puts("tlsecho: echoed over real TLS 1.3 \"");
+    let _ = dharafs_print_data(echoed_buf, echoed_len);
+    let _ = uart_puts("\"\n");
+    return 0;
+  }
+
   // Round 30: the last major "correct, never used live" gap the
   // feature ledger flagged -- socket_udp_send/socket_udp_recv (Phase
   // 6's own socket-style API, see socket_udp_send's comment) had run
@@ -17122,14 +17309,32 @@ fn shell_dispatch() -> i64 {
 // -> shell_dispatch -> pki_verify_file_raw -> ... -> ed25519_verify
 // -> point decompression's own modular-sqrt computation) reported a
 // new worst case of 4172 bytes, past the round-30 budget again --
-// same bug class, not a new one. Raised to 6144, comfortable headroom
-// above the reported number (this function's REAL allocated stack is
-// 16384 bytes -- task_f_init_stack's own stack_f_bytes below -- so
-// this annotation has never been anywhere near the actual physical
-// limit; it exists purely so the compiler's own static checker keeps
-// catching future growth here before it becomes a real problem).
+// same bug class, not a new one. Raised to 6144 at the time.
+//
+// Round 67, same day: `tlsecho`'s own call chain (task_f ->
+// shell_dispatch -> tls_connect -> tls_service -> [either
+// tls_server_process_client_hello or tls_client_try_process_flight]
+// -> ... -> tcp_send_segment -> netif_send_frame -> dwc2_net_bulk_out
+// -> ...) is deep enough that a REAL Data Abort (wild pointer values
+// in the fault registers, not a null/near-null address -- the
+// signature of actual stack corruption, not a caught-early guard-page
+// hit) reproduced live under QEMU even though this checker reported
+// only 5064 bytes worst-case for it -- comfortably UNDER the 6144
+// budget in effect at the time. This is the SAME "checker is a
+// conservative estimator, not an exact analysis, and has
+// underestimated a real overflow before" bug class round 60's own
+// task_custom_demo investigation already documented (see that
+// function's own comment below) -- not a new discovery, but the
+// second time it's bitten a real caller. Since the checker's own
+// number can't be trusted as a ceiling, the fix here is two-part:
+// task_f's own REAL allocated stack (task_f_init_stack's own
+// stack_f_bytes below) doubled from 16384 to 32768 bytes -- trivially
+// affordable on any real target this project runs on -- and this
+// annotation raised to 12288, real headroom both above the reported
+// 5064 AND with margin left in the doubled real allocation for
+// whatever the checker is still failing to see.
 #[no_mangle]
-#[bounded_stack(bytes=6144)]
+#[bounded_stack(bytes=12288)]
 fn task_f() -> i64 {
   while true {
     let ready: u32 = shell_get_line_ready();
@@ -17911,40 +18116,50 @@ fn pbkdf2_hmac_sha256_self_test() -> i64 {
 
 // PBKDF2-HMAC-SHA256 iteration count for real authentication.
 //
-// NOT set from a real security/timing budget -- set this low by a
-// genuine, separate, still-not-fully-root-caused bug found live while
-// tuning this value (see docs/TODO.md's own writeup, round 61 +
-// follow-up investigation). A long-running, synchronous PBKDF2 loop
-// invoked from the interactive shell (task_f), once it survives
-// enough timer ticks under the real scheduler, reliably crashes into
-// a compiler-inserted runtime trap (confirmed via a real fix to this
-// project's own dprintf() -- previously a silent no-op, so every
-// occurrence of this bug class looked like an unexplained permanent
-// freeze instead of a diagnosable panic). Observed traps: "shift
-// amount out of range" at 5000+ iterations with task_f's stock
-// 16384-byte stack, and a Data Abort inside the buf_write_u32 family
-// at 10000 iterations even after task_f's real stack was experimentally
-// raised all the way to 131072 bytes (8x stock) -- which RULES OUT
-// plain stack-overflow-with-insufficient-headroom as the (sole) root
-// cause: a real fix would have made the crash disappear at some
-// stack size, not just relocate it to a higher iteration count. The
-// most likely explanation left standing is a probabilistic,
-// IRQ-timing-dependent corruption of some live value (a spilled
-// shift-amount argument or scratch pointer) whose odds of occurring
-// rise with the number of timer ticks the computation survives, not
-// a fixed threshold tied to iteration count or stack depth alone.
-// 200 iterations is the only value measured safe across every attempt
-// so far; 500+ eventually crashes.
+// Round 68 (2026-09-04): raised 200 -> 20000, now that the bug that
+// used to force 200 is fixed (root-caused: irq_entry.S's saved-lr/
+// resume-pc conflation, see that file's own header comment and this
+// round's docs/TODO.md writeup) and closed (verified two independent
+// ways: a 190-boot black-box reproduction sweep, and a direct re-run
+// of round 63's own scoped hardware-watchpoint check -- 56,708
+// sha256_compress calls, zero hits). 200 was never a security/
+// usability tradeoff -- it was the ceiling that bug left standing.
 //
-// This is a REAL, serious limitation, not a security-vs-usability
-// tradeoff: 200 iterations is far below any real password-hashing
-// guidance (OWASP's current minimum is 600,000+ for PBKDF2-HMAC-
-// SHA256) and offers only token resistance to offline brute-forcing
-// of a stolen salt+hash. Raise this once the underlying bug is fully
-// root-caused and fixed -- tracked as a separate, high-priority item,
-// not folded into this feature's own scope.
+// 20000 IS a genuine, deliberate tradeoff, chosen from real measured
+// numbers on this exact target (arm1176jzf-s under QEMU's raspi1ap,
+// no hardware SHA acceleration), not copied from guidance written for
+// different hardware. OWASP's current PBKDF2-HMAC-SHA256 minimum
+// (600,000+) was measured directly on this build and would cost
+// several minutes per `passwd`/`su` call -- not a usable interactive
+// command at any plausible real-hardware speedup from this QEMU
+// timing. Measured live (steady-state `su`, i.e. NOT including the
+// one-time cost of the shell itself finishing boot):
+//   200      ~0.95s  (the old, bug-limited value)
+//   10,000   ~6.5s   (already proven safe -- this exact count is what
+//                      dharafs_crypto_key_init runs every single boot,
+//                      single-threaded, media-encryption key derivation)
+//   20,000   ~12.8s  (THIS value)
+//   100,000  ~60.3s  (also tested clean, zero crashes -- confirms the
+//                      round-68 fix holds under sustained, non-yielding
+//                      synchronous computation, not just short bursts --
+//                      rejected purely on interactive-latency grounds)
+// Throughput converges to a clean, predictable ~1550-1650 iterations/
+// sec once fixed per-command overhead (shell dispatch latency, task_f's
+// own poll granularity) is amortized -- confirmed via three separate
+// measured points, not assumed linear from one.
+//
+// 20,000 is a real, historically-recognized "strong" PBKDF2 iteration
+// count (matches NIST SP 800-132's long-cited minimum recommendation,
+// and was standard industry practice for years before OWASP's 2023
+// escalation to 600,000) -- a 100x improvement over the old 200, at a
+// latency (~13s) for a rare, deliberate, security-sensitive operation
+// (changing or verifying a password) that doesn't read as "the device
+// hung." Not the theoretical maximum available (100,000 tested clean
+// too, for anyone revisiting this tradeoff later with a higher latency
+// budget), but a real, defensible, measured choice for THIS hardware,
+// not an aspirational number this target can't actually deliver.
 fn pbkdf2_auth_iterations() -> i64 {
-  return 200;
+  return 20000;
 }
 
 // Real authentication's own small helpers: find/allocate a user
@@ -23409,6 +23624,444 @@ fn tls_tcp_self_test() -> i64 {
   return ok;
 }
 
+// A genuinely reusable tls_connect/tls_accept API, callable more than
+// once (e.g. from an interactive shell command), unlike
+// tls_tcp_self_test's own one-shot inlined orchestration above. Same
+// scope as everywhere else in this file (TLS_CHACHA20_POLY1305_SHA256
+// / x25519 / ed25519 / RFC 7250 raw public keys, connection slots 0
+// (client) and 1 (server) only, one application-data message per
+// direction per connection).
+//
+// Concurrency model: this project's own task scheduler (task_create,
+// dhruva_mutex_lock/unlock) is real but not POSIX -- no dynamic
+// thread spawning, and its small fixed set of task slots is already
+// committed to existing boot-time system tasks. Rather than pull in
+// real task-based concurrency for what is fundamentally a same-
+// machine loopback connection either way, tls_connect and tls_accept
+// both drive the SAME shared step function (tls_service) -- whichever
+// side has pending work advances, inline, on every call -- exactly
+// the pattern tcp_conn_poll itself already uses for its own client/
+// server auto-echo (see that function's own comment). Because sends
+// on this loopback transport deliver synchronously (tls_send_over_tcp
+// doesn't return until the peer has received and ACKed), a single
+// tls_service() call typically advances BOTH sides to completion in
+// one shot; the bounded retry loop below exists for correctness (and
+// would matter on a less synchronous transport), not because it's
+// expected to spin here.
+//
+// Buffer-reuse note: several intermediate values below (the
+// transcript-through-certificate hash, the CertificateVerify signed
+// content) are computed once by whichever side gets there first and
+// read directly by the other side, rather than independently
+// recomputed -- legitimate here because client and server share one
+// process's memory (there is no "the client's own belief" distinct
+// from "the server's own belief" of the transcript to keep separate).
+// The actual cryptographic checks (ed25519_verify, the Finished MAC
+// comparison) still run for real against bytes extracted from the
+// wire, which is the property that matters.
+
+fn tls_transport_init() -> i64 {
+  let zero32: mut ref i64 = tls_zero32_get();
+  let zi: i64 = 0;
+  while zi < 32 {
+    let _ = buf_write_byte(zero32, zi as u32, 0 as u32);
+    zi = zi + 1;
+  }
+  return 0;
+}
+
+fn tls_transcript_append(data: mut ref i64, data_len: i64) -> i64 {
+  let transcript: mut ref i64 = tls_transcript_get();
+  let len_buf: mut ref i64 = tls_transcript_len_get();
+  let cur: i64 = buf_read_u32(len_buf, 0 as u32) as i64;
+  let new_len: i64 = tls_copy(transcript, cur, data, 0, data_len);
+  let _ = buf_write_u32(len_buf, 0 as u32, new_len as u32);
+  return new_len;
+}
+
+fn tls_derive_handshake_keys() -> i64 {
+  let zero32: mut ref i64 = tls_zero32_get();
+  let early_secret: mut ref i64 = tls_early_secret_get();
+  let _ = hkdf_extract(zero32, 32, zero32, 32, early_secret);
+  let derived_es: mut ref i64 = tls_derived_es_get();
+  let _ = tls_derive_secret(early_secret, "derived", zero32, 0, derived_es);
+  let handshake_secret: mut ref i64 = tls_handshake_secret_get();
+  let _ = hkdf_extract(derived_es, 32, tls_shared_secret_get(), 32, handshake_secret);
+
+  let transcript: mut ref i64 = tls_transcript_get();
+  let t_len_sh: i64 = buf_read_u32(tls_t_len_sh_get(), 0 as u32) as i64;
+  let c_hs_traffic: mut ref i64 = tls_c_hs_traffic_get();
+  let _ = tls_derive_secret(handshake_secret, "c hs traffic", transcript, t_len_sh, c_hs_traffic);
+  let s_hs_traffic: mut ref i64 = tls_s_hs_traffic_get();
+  let _ = tls_derive_secret(handshake_secret, "s hs traffic", transcript, t_len_sh, s_hs_traffic);
+
+  let c_hs_key: mut ref i64 = tls_c_hs_key_get();
+  let c_hs_iv: mut ref i64 = tls_c_hs_iv_get();
+  let _ = tls_derive_traffic_keys(c_hs_traffic, c_hs_key, c_hs_iv);
+  let s_hs_key: mut ref i64 = tls_s_hs_key_get();
+  let s_hs_iv: mut ref i64 = tls_s_hs_iv_get();
+  let _ = tls_derive_traffic_keys(s_hs_traffic, s_hs_key, s_hs_iv);
+  return 0;
+}
+
+fn tls_derive_app_keys() -> i64 {
+  let zero32: mut ref i64 = tls_zero32_get();
+  let handshake_secret: mut ref i64 = tls_handshake_secret_get();
+  let derived_hs: mut ref i64 = tls_derived_hs_get();
+  let _ = tls_derive_secret(handshake_secret, "derived", zero32, 0, derived_hs);
+  let master_secret: mut ref i64 = tls_master_secret_get();
+  let _ = hkdf_extract(derived_hs, 32, zero32, 32, master_secret);
+
+  let transcript: mut ref i64 = tls_transcript_get();
+  let t_len_s_fin: i64 = buf_read_u32(tls_t_len_s_fin_get(), 0 as u32) as i64;
+  let c_ap_traffic: mut ref i64 = tls_c_ap_traffic_get();
+  let _ = tls_derive_secret(master_secret, "c ap traffic", transcript, t_len_s_fin, c_ap_traffic);
+  let s_ap_traffic: mut ref i64 = tls_s_ap_traffic_get();
+  let _ = tls_derive_secret(master_secret, "s ap traffic", transcript, t_len_s_fin, s_ap_traffic);
+
+  let c_ap_key: mut ref i64 = tls_c_ap_key_get();
+  let c_ap_iv: mut ref i64 = tls_c_ap_iv_get();
+  let _ = tls_derive_traffic_keys(c_ap_traffic, c_ap_key, c_ap_iv);
+  let s_ap_key: mut ref i64 = tls_s_ap_key_get();
+  let s_ap_iv: mut ref i64 = tls_s_ap_iv_get();
+  let _ = tls_derive_traffic_keys(s_ap_traffic, s_ap_key, s_ap_iv);
+  return 0;
+}
+
+// Server's whole reaction to a freshly-received ClientHello: its own
+// ephemeral/identity keys, the shared secret, ServerHello, the full
+// key schedule through handshake traffic keys, and the entire
+// encrypted flight (EncryptedExtensions/Certificate/CertificateVerify/
+// Finished), sent as one fragmented transfer.
+fn tls_server_process_client_hello(recv_ch: mut ref i64, recv_ch_len: i64, my_mac: mut ref i64, client_id: u32, server_id: u32) -> i64 {
+  let parsed_client_random: mut ref i64 = tls_parsed_client_random_get();
+  let parsed_client_pub: mut ref i64 = tls_parsed_client_pub_get();
+  let _ = tls_parse_client_hello(recv_ch, parsed_client_random, parsed_client_pub);
+
+  let server_random: mut ref i64 = tls_server_random_get();
+  let _ = write_hex_string(server_random, "02070c11161b20252a2f34393e43484d52575c61666b70757a7f84898e93989d", 32);
+  let server_priv: mut ref i64 = tls_server_x25519_priv_get();
+  let _ = write_hex_string(server_priv, "040f1a25303b46515c67727d88939ea9b4bfcad5e0ebf6010c17222d38434e59", 32);
+  let server_id_priv: mut ref i64 = tls_server_id_priv_get();
+  let _ = write_hex_string(server_id_priv, "05121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98", 32);
+
+  let basepoint: mut ref i64 = tls_basepoint_get();
+  let _ = tls_x25519_basepoint(basepoint);
+  let server_pub: mut ref i64 = tls_server_x25519_pub_get();
+  let _ = x25519_scalarmult(server_priv, basepoint, server_pub);
+  let shared: mut ref i64 = tls_shared_secret_get();
+  let _ = x25519_scalarmult(server_priv, parsed_client_pub, shared);
+
+  let server_id_pub: mut ref i64 = tls_server_id_pub_get();
+  let _ = ed25519_secret_to_public(server_id_priv, server_id_pub);
+
+  let sh: mut ref i64 = tls_sh_get();
+  let sh_len: i64 = tls_build_server_hello(server_random, server_pub, sh);
+  let sh_record: mut ref i64 = tls_sh_record_get();
+  let sh_record_len: i64 = tls_wrap_plaintext_record(sh, sh_len, sh_record);
+  let _ = tls_send_over_tcp(server_id, client_id, my_mac, sh_record, sh_record_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+
+  let _ = tls_transcript_append(recv_ch, recv_ch_len);
+  let t_len_sh: i64 = tls_transcript_append(sh, sh_len);
+  let _ = buf_write_u32(tls_t_len_sh_get(), 0 as u32, t_len_sh as u32);
+
+  let _ = tls_derive_handshake_keys();
+
+  let ee: mut ref i64 = tls_ee_get();
+  let ee_len: i64 = tls_build_encrypted_extensions(ee);
+  let cert: mut ref i64 = tls_cert_get();
+  let cert_len: i64 = tls_build_certificate(server_id_pub, cert);
+  let _ = tls_transcript_append(ee, ee_len);
+  let t_len_cert: i64 = tls_transcript_append(cert, cert_len);
+  let _ = buf_write_u32(tls_t_len_cert_get(), 0 as u32, t_len_cert as u32);
+
+  let transcript: mut ref i64 = tls_transcript_get();
+  let cert_hash: mut ref i64 = tls_cert_hash_get();
+  let _ = sha256_hash(transcript, t_len_cert, cert_hash);
+  let cv_content: mut ref i64 = tls_cv_signed_content_get();
+  let cv_content_len: i64 = tls_certverify_signed_content(cert_hash, cv_content);
+  let cv_sig: mut ref i64 = tls_cv_sig_get();
+  let _ = ed25519_sign(server_id_priv, cv_content, cv_content_len, cv_sig);
+  let cv: mut ref i64 = tls_cv_get();
+  let cv_len: i64 = tls_build_certificate_verify(cv_sig, cv);
+  let t_len_cv: i64 = tls_transcript_append(cv, cv_len);
+  let _ = buf_write_u32(tls_t_len_cv_get(), 0 as u32, t_len_cv as u32);
+
+  let s_hs_traffic: mut ref i64 = tls_s_hs_traffic_get();
+  let s_verify_data: mut ref i64 = tls_s_verify_data_get();
+  let _ = tls_finished_verify_data(s_hs_traffic, transcript, t_len_cv, s_verify_data);
+  let s_fin: mut ref i64 = tls_s_fin_get();
+  let s_fin_len: i64 = tls_build_finished(s_verify_data, s_fin);
+  let t_len_s_fin: i64 = tls_transcript_append(s_fin, s_fin_len);
+  let _ = buf_write_u32(tls_t_len_s_fin_get(), 0 as u32, t_len_s_fin as u32);
+
+  let s_hs_key: mut ref i64 = tls_s_hs_key_get();
+  let s_hs_iv: mut ref i64 = tls_s_hs_iv_get();
+  let flight: mut ref i64 = tls_flight_combined_get();
+  let rec_ee_len: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 0 as u32, ee, ee_len, 22 as u32, flight);
+  let rec_scratch: mut ref i64 = tls_rec_buf_get();
+  let rec_cert_len: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 1 as u32, cert, cert_len, 22 as u32, rec_scratch);
+  let flight_len_a: i64 = tls_copy(flight, rec_ee_len, rec_scratch, 0, rec_cert_len);
+  let rec_cv_len: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 2 as u32, cv, cv_len, 22 as u32, rec_scratch);
+  let flight_len_b: i64 = tls_copy(flight, flight_len_a, rec_scratch, 0, rec_cv_len);
+  let rec_s_fin_len: i64 = tls_encrypt_record(s_hs_key, s_hs_iv, 3 as u32, s_fin, s_fin_len, 22 as u32, rec_scratch);
+  let flight_len: i64 = tls_copy(flight, flight_len_b, rec_scratch, 0, rec_s_fin_len);
+
+  let _ = tls_send_over_tcp(server_id, client_id, my_mac, flight, flight_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+  return 0;
+}
+
+// Client's whole reaction once ServerHello + the encrypted flight are
+// available in its rx accumulator: parses ServerHello, decrypts and
+// checks all 4 flight records (pinned-key check on Certificate,
+// CertificateVerify signature check, server Finished MAC check),
+// then builds, sends, and derives app keys after client Finished.
+// Returns 1 (done, success), 0 (not enough data yet -- retry later),
+// or -1 (done, verification failed). Assumes ServerHello and the
+// whole flight arrive together, true on this synchronous loopback
+// transport (see this section's own header comment) -- a genuinely
+// asynchronous transport would need per-record phase tracking this
+// doesn't have.
+fn tls_client_try_process_flight(my_mac: mut ref i64, client_id: u32, server_id: u32) -> i64 {
+  let recv_sh: mut ref i64 = tls_decrypted_scratch_get();
+  let recv_sh_len: i64 = tls_rx_try_extract_plaintext(tls_client_rx_buf_get(), tls_client_rx_len_get(), recv_sh);
+  if recv_sh_len < 0 {
+    return 0;
+  }
+  let parsed_server_random: mut ref i64 = tls_parsed_server_random_get();
+  let parsed_server_pub: mut ref i64 = tls_parsed_server_pub_get();
+  let _ = tls_parse_server_hello(recv_sh, parsed_server_random, parsed_server_pub);
+
+  let s_hs_key: mut ref i64 = tls_s_hs_key_get();
+  let s_hs_iv: mut ref i64 = tls_s_hs_iv_get();
+  let dec: mut ref i64 = tls_decrypted_scratch_get();
+
+  let ee_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_hs_key, s_hs_iv, 0 as u32, 22 as u32, dec);
+  if ee_len < 0 {
+    return 0;
+  }
+
+  let cert_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_hs_key, s_hs_iv, 1 as u32, 22 as u32, dec);
+  if cert_len < 0 {
+    return 0;
+  }
+  let parsed_server_id_pub: mut ref i64 = tls_parsed_server_id_pub_get();
+  let _ = tls_parse_certificate_pubkey(dec, parsed_server_id_pub);
+  let pin_ok: i64 = keccak_bytes_equal(parsed_server_id_pub, tls_server_id_pub_get(), 32);
+
+  let cv_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_hs_key, s_hs_iv, 2 as u32, 22 as u32, dec);
+  if cv_len < 0 {
+    return 0;
+  }
+  let recv_sig: mut ref i64 = tls_cv_sig_get();
+  let _ = tls_copy(recv_sig, 0, dec, 8, 64);
+  let cv_content: mut ref i64 = tls_cv_signed_content_get();
+  let verify_ok: i64 = ed25519_verify(parsed_server_id_pub, cv_content, 130, recv_sig);
+
+  let s_fin_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_hs_key, s_hs_iv, 3 as u32, 22 as u32, dec);
+  if s_fin_len < 0 {
+    return 0;
+  }
+  let s_hs_traffic: mut ref i64 = tls_s_hs_traffic_get();
+  let t_len_cv: i64 = buf_read_u32(tls_t_len_cv_get(), 0 as u32) as i64;
+  let transcript: mut ref i64 = tls_transcript_get();
+  let recomputed_s_verify: mut ref i64 = tls_s_verify_data_get();
+  let _ = tls_finished_verify_data(s_hs_traffic, transcript, t_len_cv, recomputed_s_verify);
+  let s_fin_ok: i64 = 1;
+  let svi: i64 = 0;
+  while svi < 32 {
+    if buf_read_byte(dec, (4 + svi) as u32) != buf_read_byte(recomputed_s_verify, svi as u32) {
+      s_fin_ok = 0;
+    }
+    svi = svi + 1;
+  }
+
+  if (pin_ok != 1) || (verify_ok != 1) || (s_fin_ok != 1) {
+    return 0 - 1;
+  }
+
+  let c_hs_traffic: mut ref i64 = tls_c_hs_traffic_get();
+  let t_len_s_fin: i64 = buf_read_u32(tls_t_len_s_fin_get(), 0 as u32) as i64;
+  let c_verify_data: mut ref i64 = tls_c_verify_data_get();
+  let _ = tls_finished_verify_data(c_hs_traffic, transcript, t_len_s_fin, c_verify_data);
+  let c_fin: mut ref i64 = tls_c_fin_get();
+  let c_fin_len: i64 = tls_build_finished(c_verify_data, c_fin);
+  let c_hs_key: mut ref i64 = tls_c_hs_key_get();
+  let c_hs_iv: mut ref i64 = tls_c_hs_iv_get();
+  let rec_buf: mut ref i64 = tls_rec_buf_get();
+  let rec_c_fin_len: i64 = tls_encrypt_record(c_hs_key, c_hs_iv, 0 as u32, c_fin, c_fin_len, 22 as u32, rec_buf);
+  let _ = tls_send_over_tcp(client_id, server_id, my_mac, rec_buf, rec_c_fin_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+
+  let _ = tls_derive_app_keys();
+  return 1;
+}
+
+// The shared step: advances whichever role has pending work. See
+// this section's own header comment for why this replaces separate
+// independently-blocking client/server implementations.
+fn tls_service(my_mac: mut ref i64) -> i64 {
+  let client_id: u32 = 0 as u32;
+  let server_id: u32 = 1 as u32;
+
+  let frame: mut ref i64 = tls_frame_scratch_get();
+  let flen: i64 = netif_recv_frame(frame, 1514);
+  if flen > 0 {
+    if buf_read_u16_be(frame, 12) == (0x0800 as u32) {
+      if ipv4_get_protocol(frame, 14) == (6 as u32) {
+        let dst_port: u32 = tcp_get_dst_port(frame, 34);
+        let target: u32 = client_id;
+        let matched: i64 = 0;
+        if dst_port == tcp_conn_get_local_port(client_id) {
+          target = client_id;
+          matched = 1;
+        }
+        if dst_port == tcp_conn_get_local_port(server_id) {
+          target = server_id;
+          matched = 1;
+        }
+        if matched == 1 {
+          let scratch: mut ref i64 = tls_recv_chunk_scratch_get();
+          let n: i64 = tcp_conn_handle_segment(target, frame, flen, my_mac, my_mac, scratch, 64);
+          if n > 0 {
+            if target == client_id {
+              let _ = tls_rx_feed(tls_client_rx_buf_get(), tls_client_rx_len_get(), scratch, n);
+            } else {
+              let _ = tls_rx_feed(tls_server_rx_buf_get(), tls_server_rx_len_get(), scratch, n);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if buf_read_u32(tls_server_phase_get(), 0 as u32) == (0 as u32) {
+    let recv_ch: mut ref i64 = tls_decrypted_scratch_get();
+    let recv_ch_len: i64 = tls_rx_try_extract_plaintext(tls_server_rx_buf_get(), tls_server_rx_len_get(), recv_ch);
+    if recv_ch_len > 0 {
+      let _ = tls_server_process_client_hello(recv_ch, recv_ch_len, my_mac, client_id, server_id);
+      let _ = buf_write_u32(tls_server_phase_get(), 0 as u32, 1 as u32);
+    }
+  }
+
+  if buf_read_u32(tls_client_phase_get(), 0 as u32) == (1 as u32) {
+    let result: i64 = tls_client_try_process_flight(my_mac, client_id, server_id);
+    if result == 1 {
+      let _ = buf_write_u32(tls_client_phase_get(), 0 as u32, 2 as u32);
+    }
+    if result == (0 - 1) {
+      let _ = buf_write_u32(tls_client_phase_get(), 0 as u32, 3 as u32);
+    }
+  }
+
+  if buf_read_u32(tls_server_phase_get(), 0 as u32) == (1 as u32) {
+    let dec: mut ref i64 = tls_decrypted_scratch_get();
+    let c_hs_key: mut ref i64 = tls_c_hs_key_get();
+    let c_hs_iv: mut ref i64 = tls_c_hs_iv_get();
+    let c_fin_len: i64 = tls_rx_try_extract(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_hs_key, c_hs_iv, 0 as u32, 22 as u32, dec);
+    if c_fin_len >= 0 {
+      let c_hs_traffic: mut ref i64 = tls_c_hs_traffic_get();
+      let t_len_s_fin: i64 = buf_read_u32(tls_t_len_s_fin_get(), 0 as u32) as i64;
+      let transcript: mut ref i64 = tls_transcript_get();
+      let recomputed_c_verify: mut ref i64 = tls_c_verify_data_get();
+      let _ = tls_finished_verify_data(c_hs_traffic, transcript, t_len_s_fin, recomputed_c_verify);
+      let c_fin_ok: i64 = 1;
+      let cvi: i64 = 0;
+      while cvi < 32 {
+        if buf_read_byte(dec, (4 + cvi) as u32) != buf_read_byte(recomputed_c_verify, cvi as u32) {
+          c_fin_ok = 0;
+        }
+        cvi = cvi + 1;
+      }
+      if c_fin_ok == 1 {
+        let _ = buf_write_u32(tls_server_phase_get(), 0 as u32, 2 as u32);
+      } else {
+        let _ = buf_write_u32(tls_server_phase_get(), 0 as u32, 3 as u32);
+      }
+    }
+  }
+
+  return 0;
+}
+
+// Initiates a fresh TLS 1.3 connection on `client_id` to `server_id`
+// (both already-ESTABLISHED TCP connections -- see this section's own
+// header comment on connection slots), blocking (bounded retries)
+// until the handshake either completes or fails. Resets all
+// connection-scoped state first, so a repeated call (e.g. a shell
+// command invoked again) starts genuinely fresh.
+fn tls_connect(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  let _ = tls_transport_init();
+  let _ = buf_write_u32(tls_client_phase_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(tls_server_phase_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(tls_client_rx_len_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(tls_server_rx_len_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(tls_transcript_len_get(), 0 as u32, 0 as u32);
+
+  let client_random: mut ref i64 = tls_client_random_get();
+  let _ = write_hex_string(client_random, "0104070a0d101316191c1f2225282b2e3134373a3d404346494c4f5255585b5e", 32);
+  let client_priv: mut ref i64 = tls_client_x25519_priv_get();
+  let _ = write_hex_string(client_priv, "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc", 32);
+  let basepoint: mut ref i64 = tls_basepoint_get();
+  let _ = tls_x25519_basepoint(basepoint);
+  let client_pub: mut ref i64 = tls_client_x25519_pub_get();
+  let _ = x25519_scalarmult(client_priv, basepoint, client_pub);
+
+  let ch: mut ref i64 = tls_ch_get();
+  let ch_len: i64 = tls_build_client_hello(client_random, client_pub, ch);
+  let ch_record: mut ref i64 = tls_ch_record_get();
+  let ch_record_len: i64 = tls_wrap_plaintext_record(ch, ch_len, ch_record);
+  let _ = tls_send_over_tcp(client_id, server_id, my_mac, ch_record, ch_record_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+  let _ = buf_write_u32(tls_client_phase_get(), 0 as u32, 1 as u32);
+
+  let iter: i64 = 0;
+  while (iter < 10) && (buf_read_u32(tls_client_phase_get(), 0 as u32) == (1 as u32)) {
+    let _ = tls_service(my_mac);
+    iter = iter + 1;
+  }
+  if buf_read_u32(tls_client_phase_get(), 0 as u32) != (2 as u32) {
+    return 0 - 1;
+  }
+  return 0;
+}
+
+// Completes the server side of whatever handshake is in progress
+// (initiated by a peer's own tls_connect), blocking (bounded
+// retries) until done or failed. On this synchronous loopback
+// transport, tls_connect's own bounded retries already drive the
+// server to completion as a side effect of tls_service servicing
+// both roles -- calling tls_accept afterward is a real, correctly-
+// defined status check (not skipped just because it'd usually be a
+// fast no-op here), and is the entry point a listening context would
+// use on its own if it were driven independently.
+fn tls_accept(_server_id: u32, _client_id: u32, my_mac: mut ref i64) -> i64 {
+  let iter: i64 = 0;
+  while (iter < 10) && (buf_read_u32(tls_server_phase_get(), 0 as u32) < (2 as u32)) {
+    let _ = tls_service(my_mac);
+    iter = iter + 1;
+  }
+  if buf_read_u32(tls_server_phase_get(), 0 as u32) != (2 as u32) {
+    return 0 - 1;
+  }
+  return 0;
+}
+
+// Encrypts and sends one application-data message (one per direction
+// per connection -- see this section's own header comment).
+fn tls_send(sender_id: u32, receiver_id: u32, my_mac: mut ref i64, key: mut ref i64, iv: mut ref i64, plaintext: mut ref i64, plaintext_len: i64, receiver_rx_buf: mut ref i64, receiver_rx_len_buf: mut ref i64) -> i64 {
+  let rec_buf: mut ref i64 = tls_rec_buf_get();
+  let rec_len: i64 = tls_encrypt_record(key, iv, 0 as u32, plaintext, plaintext_len, 23 as u32, rec_buf);
+  let _ = tls_send_over_tcp(sender_id, receiver_id, my_mac, rec_buf, rec_len, receiver_rx_buf, receiver_rx_len_buf);
+  return 0;
+}
+
+// Decrypts one application-data message already delivered into
+// `rx_buf`/`rx_len_buf` by a prior tls_send. Returns the plaintext
+// length, or -1 if nothing (complete) is there yet or the AEAD tag
+// doesn't verify.
+fn tls_recv(rx_buf: mut ref i64, rx_len_buf: mut ref i64, key: mut ref i64, iv: mut ref i64, out_content: mut ref i64) -> i64 {
+  return tls_rx_try_extract(rx_buf, rx_len_buf, key, iv, 0 as u32, 23 as u32, out_content);
+}
+
 fn pki_self_test() -> i64 {
   let ok: i64 = 1;
   let _ = pki_init();
@@ -25214,7 +25867,7 @@ fn x25519_self_test() -> i64 {
 // (or worse, nothing) happens to notice.
 fn heap_usage_self_test() -> i64 {
   let used: i64 = dhruva_heap_used_bytes();
-  let capacity: i64 = 262144; // DHRUVA_HEAP_BYTES, runtime_stubs.c
+  let capacity: i64 = 786432; // DHRUVA_HEAP_BYTES, runtime_stubs.c (round 68: 256KB -> 768KB)
   let headroom: i64 = capacity - used;
   let min_headroom: i64 = 16384; // generous margin for future rounds
   let _ = uart_puts("HEAP: used=");
@@ -25459,6 +26112,19 @@ fn kernel_main() -> i64 {
   let _ = tls_parsed_server_pub_set(dhruva_alloc_bytes(32));
   let _ = tls_flight_combined_set(dhruva_alloc_bytes(512));
   let _ = tls_parsed_server_id_pub_set(dhruva_alloc_bytes(32));
+  let _ = tls_client_phase_set(dhruva_alloc_bytes(4));
+  let _ = tls_server_phase_set(dhruva_alloc_bytes(4));
+  let _ = tls_cert_hash_set(dhruva_alloc_bytes(32));
+  let _ = tls_cv_sig_set(dhruva_alloc_bytes(64));
+  let _ = tls_s_verify_data_set(dhruva_alloc_bytes(32));
+  let _ = tls_c_verify_data_set(dhruva_alloc_bytes(32));
+  let _ = tls_basepoint_set(dhruva_alloc_bytes(32));
+  let _ = tls_zero32_set(dhruva_alloc_bytes(32));
+  let _ = tls_transcript_len_set(dhruva_alloc_bytes(4));
+  let _ = tls_t_len_sh_set(dhruva_alloc_bytes(4));
+  let _ = tls_t_len_cert_set(dhruva_alloc_bytes(4));
+  let _ = tls_t_len_cv_set(dhruva_alloc_bytes(4));
+  let _ = tls_t_len_s_fin_set(dhruva_alloc_bytes(4));
   let _ = sha512_k_init(sha512_k_scratch_get());
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
   let _ = x25519_x1_set(dhruva_alloc_bytes(32));
@@ -25771,9 +26437,13 @@ fn kernel_main() -> i64 {
 
   let stack_bytes: i64 = 4096;
   let stack_a: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let _ = stack_canary_set_base(0 as u32, stack_a);
   let stack_b: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let _ = stack_canary_set_base(1 as u32, stack_b);
   let stack_c: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let _ = stack_canary_set_base(2 as u32, stack_c);
   let stack_d: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let _ = stack_canary_set_base(3 as u32, stack_d);
   // BUG (round 4 audit, 2026-08-27): task_e was still allocated the
   // same stock 4096 bytes every non-FS task gets, even though this
   // very file's own task_f comment right below already names task_e
@@ -25793,8 +26463,15 @@ fn kernel_main() -> i64 {
   // the whole time. Given the task_f fix, matched here rather than
   // bisected down to something merely plausible: same task, same class
   // of call chain, same fix.
+  // EXPERIMENT (2026-09-03, range-check crash investigation) REVERTED:
+  // briefly raised to 32768 while chasing a live crash misattributed
+  // to task_e -- start_multitasking's own sp_table layout is 0-indexed
+  // (task 0=a=HIGH ... task 4=e=GC, task 5=f=SHELL), so "current_task=5"
+  // in that crash report was actually task_f (SHELL/tlsecho), not
+  // task_e. Back to the original, still-justified 16384.
   let stack_e_bytes: i64 = 16384;
   let stack_e: mut ref i64 = dhruva_alloc_bytes(stack_e_bytes);
+  let _ = stack_canary_set_base(4 as u32, stack_e);
   // BUG (task #9, found via the same event-driven interactive test):
   // task_f's real stack was originally the same 4096 bytes every other
   // task gets, matching its #[bounded_stack(bytes=2048)] claim with
@@ -25814,8 +26491,37 @@ fn kernel_main() -> i64 {
   // 16384 (4x) and watching the exact same hang disappear -- kept at
   // that confirmed-safe value rather than bisected down to something
   // merely plausible.
-  let stack_f_bytes: i64 = 16384;
+  // Round 68 (this investigation): raised twice more, 32768 -> 65536
+  // -> 262144. Code-reading (not GDB) found the real root cause class:
+  // this project's #[bounded_stack] checker is a documented
+  // "conservative estimator, not an exact analysis" that has now
+  // underestimated a real worst case FIVE separate times (task_f round
+  // 9, task_e round 27, task_custom_demo round 60, task_f/tlsecho
+  // round 67, and again at 65536 bytes earlier THIS round) -- every
+  // prior fix was an empirical size bump with no guarantee the new
+  // number was actually enough, since the checker's own gap (doesn't
+  // add the preempting ISR's own worst-case usage on top of a task's
+  // deepest call chain -- see task_f's round-9 comment above) was
+  // never closed. The 65536-byte attempt earlier this round still
+  // crashed -- deterministically, on the FIRST interactive tlsecho
+  // invocation, no interrupt-timing luck needed at all, which is a
+  // stronger signal than any prior incident that this call chain's own
+  // true worst case (both TLS roles, X25519, bignum, all in one
+  // synchronous chain) is genuinely large, not just occasionally
+  // pushed over by a badly-timed ISR. 262144 is 4x that failed
+  // attempt, and DHRUVA_HEAP_BYTES (runtime_stubs.c) was raised
+  // 256KB->768KB in the same round specifically to give this room
+  // without re-tripping heap_usage_self_test's own headroom check --
+  // stack_canary_set_base below (see boot/stack_canary.S) is the
+  // structural half of this fix regardless of whether this number
+  // turns out to be the last one needed: it can't prevent an overflow,
+  // but it makes the NEXT one detectable within one tick and by name,
+  // instead of manifesting as an unrelated wild-pointer crash
+  // arbitrarily far downstream the way every one of these incidents
+  // did before it existed.
+  let stack_f_bytes: i64 = 262144;
   let stack_f: mut ref i64 = dhruva_alloc_bytes(stack_f_bytes);
+  let _ = stack_canary_set_base(5 as u32, stack_f);
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
   let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
@@ -25862,6 +26568,7 @@ fn kernel_main() -> i64 {
   // investigation writeup.
   let custom_stack_bytes: u32 = 4096 as u32;
   let custom_stack: mut ref i64 = dhruva_alloc_bytes(custom_stack_bytes as i64);
+  let _ = stack_canary_set_base(6 as u32, custom_stack);
   let custom_task_id: u32 = task_create(task_custom_demo, custom_stack, custom_stack_bytes, 3 as u32);
   let _ = uart_puts("task_create: new task id=");
   let _ = uart_put_i64(custom_task_id as i64);
@@ -25876,9 +26583,11 @@ fn kernel_main() -> i64 {
   // was 512 bytes with zero headroom, raised to match project convention.
   let mutex_low_stack_bytes: u32 = 4096 as u32;
   let mutex_low_stack: mut ref i64 = dhruva_alloc_bytes(mutex_low_stack_bytes as i64);
+  let _ = stack_canary_set_base(7 as u32, mutex_low_stack);
   let mutex_low_task_id: u32 = task_create(task_mutex_demo_low, mutex_low_stack, mutex_low_stack_bytes, 2 as u32);
   let mutex_high_stack_bytes: u32 = 4096 as u32;
   let mutex_high_stack: mut ref i64 = dhruva_alloc_bytes(mutex_high_stack_bytes as i64);
+  let _ = stack_canary_set_base(8 as u32, mutex_high_stack);
   let mutex_high_task_id: u32 = task_create(task_mutex_demo_high, mutex_high_stack, mutex_high_stack_bytes, 0 as u32);
   let _ = uart_puts("task_create: mutex demo task ids=");
   let _ = uart_put_i64(mutex_low_task_id as i64);
@@ -25894,6 +26603,7 @@ fn kernel_main() -> i64 {
   let _ = dharafs_queue_reset();
   let fsq_stack_bytes: u32 = 4096 as u32;
   let fsq_stack: mut ref i64 = dhruva_alloc_bytes(fsq_stack_bytes as i64);
+  let _ = stack_canary_set_base(9 as u32, fsq_stack);
   let fsq_task_id: u32 = task_create(task_fsq, fsq_stack, fsq_stack_bytes, 2 as u32);
   let _ = uart_puts("task_create: fsqueue dispatcher task id=");
   let _ = uart_put_i64(fsq_task_id as i64);

@@ -846,6 +846,32 @@ for by name.
   security gap, not a considered tradeoff — raise it once the
   underlying bug is fixed.
 
+  **CLOSED, round 68 (2026-09-04)**: the underlying bug is fixed (see
+  that round's own entry below) — raised 200 → **20,000**, a real,
+  deliberate tradeoff chosen from live-measured numbers on this exact
+  target, not copied from guidance written for different hardware.
+  OWASP's current 600,000 was measured directly on this build too and
+  would cost several minutes per `passwd`/`su` call, not a usable
+  interactive command at any plausible real-hardware speedup from this
+  QEMU timing. Three real measured points (steady-state `su`, not
+  counting the one-time cost of the shell finishing boot): 10,000
+  iterations ~6.5s (already proven safe daily — the exact count `dharafs_
+  crypto_key_init` runs every boot), 20,000 ~12.8s (the chosen value,
+  per explicit user direction to favor strong security without
+  sacrificing interactive performance), 100,000 ~60.3s (also tested
+  clean, zero crashes, confirming the round-68 fix holds under
+  sustained non-yielding computation too — rejected purely on latency
+  grounds, not correctness). 20,000 matches NIST SP 800-132's
+  long-cited minimum recommendation and was standard industry practice
+  for years before OWASP's 2023 escalation — a real, historically-
+  defensible "strong" value, not an arbitrary number. Verified: full
+  regression battery green (`qemu_run` self-test, `phase4_milestone.py`
+  15/15, `heap_stress.py` PASS, `power_yank.py` 70/70, `host_harness`
+  970/0 ASAN/UBSAN), plus direct functional checks at the new value —
+  `passwd` sets a password, `su` with the wrong password is correctly
+  rejected, `su` with the correct password is correctly accepted, all
+  live over the real interactive shell.
+
   **Also resolved along the way, not deferred**: failed-attempt rate
   limiting (3 strikes locks an account for 20 ticks, confirmed live to
   correctly reject even a CORRECT password while locked) and a small
@@ -859,8 +885,14 @@ for by name.
   exactly.
 
 - **Long-running synchronous computation crashes into a silent runtime
-  trap under the real scheduler** — `[found round 61, investigated
-  further 2026-08-30, STILL NOT FULLY ROOT-CAUSED — high priority]`
+  trap under the real scheduler** — `[found round 61; INTERRUPT-DRIVEN
+  mechanism ROOT-CAUSED AND FIXED round 68, 2026-09-04; round 62f's
+  separate zero-interrupt occurrence CLOSED, BELIEVED RESOLVED same
+  day, as a side effect of round 65's own sha256_compress fix -- a
+  190-boot black-box reproduction sweep plus a direct re-run of round
+  63's own scoped hardware-watchpoint check (56,708 sha256_compress
+  calls, 1.1B+ memory stores, zero hits) both found nothing -- see
+  round 68's own entry below for the full writeup]`
   Found while tuning real authentication's own PBKDF2 iteration count.
   A synchronous, non-yielding loop (no `task_sleep_ticks` calls) run
   from the interactive shell (`task_f`), once it survives enough timer
@@ -1522,6 +1554,276 @@ for by name.
   iteration count was already at its production value of 200 by this
   point (confirmed via `git diff` before considering this closed).
   Local-only commit, per this project's own push policy.
+
+- **`tlsecho` (task_f) real Data Abort, deterministic, first attempt,
+  every time — the interrupt-driven mechanism behind the whole
+  "long-running synchronous computation crashes into a silent runtime
+  trap" saga above, finally root-caused** — `[ROOT-CAUSED AND FIXED,
+  round 68, 2026-09-04]`
+
+  User-reported concern going in: not a TLS-specific bug, a generic
+  pattern that "will keep showing again and again" — confirmed correct.
+  Investigated code-first (not GDB) per explicit instruction, tried
+  three rounds of empirical stack/heap bumps first (matching this
+  project's own established, previously-successful pattern for this
+  bug class — round 9/27/60/67 in the rounds index) — `stack_f_bytes`
+  32768 → 65536 → 262144 (8x), `DHRUVA_HEAP_BYTES` 256KB → 768KB (also
+  fixed a real, independent regression this uncovered: the earlier
+  256KB heap left only 8888 bytes of headroom after the first bump,
+  already short of `heap_usage_self_test`'s own `>= 16384` requirement)
+  — plus a new permanent structural safeguard, a per-task stack-overflow
+  canary (`boot/stack_canary.S`, checked once per real tick from `irq_
+  dispatch`). **None of this fixed it.** The crash still reproduced
+  deterministically on the very first `tlsecho` invocation after every
+  single one of these increases — the clearest possible signal that
+  "not enough stack" was never the real explanation, only a
+  contributing factor to some of this bug class's other historical
+  incidents.
+
+  Extended `boot/rpi1/vectors.S`'s `fault_data_abort` handler to also
+  capture `lr_svc` at the moment of the fault (previous captures only
+  had `r0-r3`/`pc`/fault address) — banked-register-aware: right after
+  `cps #0x13` switches to SVC mode, "lr" transparently means `lr_svc`,
+  the interrupted code's own live link register, completely untouched
+  by taking the exception. For a 2-instruction leaf like `buf_read_u32`
+  (`ldr r0,[r0,r1]; bx lr`, no stack frame), this is exactly the
+  faulting call's own return address — a real, permanent diagnostic
+  improvement (kept, not reverted), and the single piece of evidence
+  that actually broke the case: `lr == pc == buf_read_u32`'s own entry
+  address, every time.
+
+  **The actual mechanism**: `irq_entry.S`'s saved-context frame used
+  ONE word to serve two different purposes — "the value to restore into
+  r14" and "the address to resume execution at." For a VOLUNTARY switch
+  (`task_sleep_ticks`, `dhruva_mutex_lock`) these are legitimately the
+  same value (the switching function's own return address). For an
+  INTERRUPT-driven switch they are not: the interrupted task's TRUE
+  `lr_svc` was never saved anywhere at all — it just sat in the
+  physical register, banked and untouched, right up until `bl irq_
+  dispatch`/`bl scheduler_switch_from_irq` (real calls, executed in SVC
+  mode after the `cps #0x13` switch) silently overwrote it with their
+  own return addresses. At restore, `ldmia sp!, {r0-r12, lr}` followed
+  by `subs pc, lr, #0` used that one clobbered-then-repurposed slot as
+  both the new r14 AND the jump target, so after resuming, `r14` always
+  equals `pc`, regardless of what the interrupted code's real return
+  address should have been.
+
+  This is invisible for the overwhelming majority of this codebase:
+  every ordinary vani-compiled function has a `push {fp,lr}`/`pop
+  {fp,pc}` prologue/epilogue, saving `lr` to ITS OWN stack frame at
+  entry, independent of the live register. It is fatal specifically for
+  this project's ~300 hand-written, bare two/three-instruction `boot/*_
+  state.S` accessor leaves (`*_get`/`*_set`, `buf_read_u32`/`buf_write_
+  u32` among them — grepped and confirmed the actual count directly,
+  not estimated) that rely on the live `r14` surviving a preemption. If
+  a timer/UART interrupt lands exactly inside one of these, it resumes
+  with `r14 == pc`: the single `ldr`/`str` re-executes correctly, then
+  `bx lr` jumps back into its OWN entry instead of returning — and for
+  `buf_read_u32` specifically, repeatedly executes `r0 = *(u32*)(r0 +
+  r1)` (r1/the offset argument never changes) until it dereferences
+  something unmapped. The "wild-looking" fault address every prior
+  capture in this saga puzzled over (this round's own and round 62's
+  `sha256_compress` captures alike) is simply wherever that chase
+  happened to end up — not corruption in the traditional sense at all.
+  Explains every observed symptom at once: the offset argument always
+  survives intact (round 62's own repeated observation) because `r1`
+  is never touched by this loop; only the base pointer looks "corrupted
+  in place"; it always lands on one of these bare leaves specifically;
+  and it explains why round 62d's own targeted breakpoint (conditioned
+  on `r8`/`r11` already looking wrong INSIDE the saved frame) never
+  fired — it was checking the wrong field. The frame's `r8`/`r11` slots
+  were never the corrupted ones; its `lr` slot was.
+
+  **Fix**: grew the saved-context frame from 16 words (64 bytes) to 17
+  (68 bytes) — `spsr, pad, r0-r12, true_lr, resume_pc` — storing the
+  interrupted task's real `lr_svc` and the resume PC as two independent
+  words instead of one conflated slot, and replaced the manual `ldmia
+  {r0-r12,lr}` + `subs pc,lr,#0` restore with ARM's standard `ldmia
+  {r0-r12,lr,pc}^` exception-return idiom (loads r14 and pc
+  independently, still restores CPSR from SPSR atomically via the caret
+  suffix). Touched all four save/restore sites that share this frame
+  shape for consistency: `irq_entry.S` (the actual bug), plus `task_
+  sleep_ticks`/`dhruva_mutex_lock`/`prepare_stack_common`+`start_
+  multitasking` in `context_switch.S` (voluntary/initial-launch paths,
+  where true_lr and resume_pc are the same value, just stored twice
+  now instead of once).
+
+  **Verification**: official `phase4_milestone.py` 15/15 (`tlsecho`
+  passing for the first time ever in this suite), `heap_stress.py`
+  PASS, `power_yank.py` 70/70, `host_harness` 970/0 under ASAN/UBSAN
+  (also fixed a real but unrelated, pre-existing host-harness build gap
+  found along the way — 13 TLS scratch accessors added to `boot/tls13_
+  scratch.S` in a later sub-round than `test/host_harness/host_stubs.c`
+  was last updated, plus this round's own new `stack_canary_*` stub, 5+
+  undefined references), plain boot self-test clean, and an extended
+  20-iteration `tlsecho` stress run: 20/20 passed, every single one on
+  the first attempt, zero `FATAL`/`CANARY`. The stack/heap/canary
+  hardening from earlier in this round stays in place as real,
+  independent defense-in-depth (not made pointless by this fix — the
+  `#[bounded_stack]` checker's own documented unsoundness for this call
+  chain is real regardless), not reverted.
+
+  **Scope, stated precisely**: this fixes the INTERRUPT-DRIVEN
+  corruption mechanism, which explains every capture from this specific
+  investigation (this round's and, very plausibly given the matching
+  symptom shape, several of round 61-65's own `sha256_compress`
+  captures too). It does **not** explain round 62f's own separate
+  finding that the SHA-256/PBKDF2 corruption was once reproduced with
+  **zero interrupts** (single-threaded boot, before `enable_irqs()` is
+  ever called) — that occurrence cannot be this mechanism by
+  construction (no interrupt, no resume-frame involved at all), so if
+  it's still genuinely reproducible, a separate, narrower bug remains
+  open. Attempting to reproduce it directly is this round's own
+  immediate next step (see below) rather than assuming it's now moot.
+
+  **Reproduction attempt (same day)**: added a temporary single-
+  threaded, pre-`enable_irqs()` call running `pbkdf2_hmac_sha256` at
+  the same 1000-iteration diagnostic count round 62f itself used, then
+  booted 40 completely fresh QEMU instances against it (no shared
+  state between runs), checking each for either a clean completion
+  marker or any `FATAL`. **40/40 completed cleanly, 0 FATAL, 0
+  incomplete/hung runs.** Combined with today's own incidental
+  evidence — `power_yank.py`'s 70 fresh boots plus every other
+  regression run this round, each of which also executes `pbkdf2_
+  hmac_sha256_self_test()`'s own 4096-iteration KAT single-threaded —
+  that's on the order of 110+ clean single-threaded PBKDF2 boots today
+  with zero reproductions. **This does not confirm the bug is gone**:
+  round 62f's own estimate was "roughly 1-in-30-or-rarer" from a
+  single observed hit plus a 30-run follow-up sweep that ALSO found
+  zero further hits — meaning the true rate could plausibly be
+  considerably rarer than 1-in-30, and 40 (or even 110) more clean
+  runs is not statistically decisive against a rare-enough event. Kept
+  honest rather than declared closed: **still genuinely open**: not
+  reproduced today, not proven absent, true occurrence rate still
+  unknown. A future session with a larger budget (several hundred+
+  fresh boots, or reviving round 65's own QEMU-TCG-plugin tracing
+  technique -- near-native speed, proven far more practical than GDB
+  for this class of high-call-count investigation -- rather than boot-
+  count brute force) would be the natural next escalation if this is
+  still considered worth pursuing. Temporary diagnostic call reverted
+  after this attempt; `git diff`-equivalent (`build.sh` clean rebuild)
+  confirmed before moving on.
+
+  **Escalation, same day: revived round 65's own QEMU TCG-plugin
+  technique and a much larger boot count, per explicit user request.**
+  `qemu-plugin.h` for the installed QEMU version (10.0.11; fetched the
+  ABI-compatible `v10.0.0` tag's copy, no local dev package installed
+  — same situation round 65 itself hit) pulled directly from upstream
+  QEMU's own repo. Wrote a small, general-purpose "flight recorder"
+  plugin (not committed to this repo — a standalone investigation
+  tool, matching this project's own "temporary diagnostics don't
+  belong in the tree" discipline): hooks every translated block's
+  `vcpu_mem_cb` for stores only, keeping a bounded 4096-entry ring
+  buffer of `(instruction PC, store address, value, size)`, and
+  registers an `insn_exec` callback at two fixed trigger PCs
+  (`fault_data_abort`=`0x44`, `fault_prefetch_abort`=`0x88`, this
+  build's own addresses, confirmed via `nm`) that dumps the full ring
+  buffer plus every CPU register the instant either is reached —
+  catching the corrupting write itself, not just "a crash happened."
+  Verified fast and correct on a sanity boot before scaling up (reaches
+  full post-`start_multitasking` multitasking activity in ~15-20s with
+  the plugin attached, consistent with round 65's own "13-20s per
+  attempt, near-native speed" figure — no `tail`-buffering false start
+  this time, direct-to-file output used throughout).
+
+  Ran **150 additional fresh, plugin-instrumented single-threaded
+  boots** (batched 6-wide for throughput, 25s cap each — comfortably
+  past both the 4096-iteration self-test KAT and the real 10000-
+  iteration `dharafs_crypto_key_init` call every single boot already
+  exercises). **150/150 clean — zero trigger hits, zero `FATAL`,
+  confirmed by grepping every one of the 150 output files
+  independently, not just trusting the script's own tally.**
+
+  **Combined with the earlier 40-boot sweep, that's 190 total fresh
+  single-threaded boots today with zero reproductions.** This sample
+  is large enough to say something quantitative, not just "still
+  didn't see it": if round 62f's own "roughly 1-in-30" rate estimate
+  were still accurate, the probability of 190 consecutive clean runs
+  is `(29/30)^190` ≈ **0.16%** — meaning either the true rate was
+  always considerably rarer than that estimate (built from a single
+  observed hit, not a measured rate), or, more likely given the
+  evidence: **round 65's own fix — changing `sha256_compress`/`sha256_
+  h_init` to reload `h`/`w`/`k` fresh at every point of use instead of
+  holding them live across the whole function — incidentally closed
+  this zero-interrupt case too, even though round 65's own 100-attempt
+  verification only explicitly covered the interactive-multitasking
+  case at the time.** Not proven (190 clean runs is strong evidence,
+  not a mathematical proof of absence for a rare-enough event), but
+  this is now the best-supported working theory, and the honest thing
+  to do is downgrade this entry's own status rather than leave it
+  reading as urgent/high-priority when the evidence no longer supports
+  that framing.
+
+  **Status update**: downgrading from "genuinely open, high priority"
+  to **"believed resolved as a side effect of round 65's own fix, not
+  independently re-verified with dedicated instrumentation — worth a
+  cheap confirming check (e.g. round 63's own scoped hardware-
+  watchpoint technique, one more time, now specifically against a
+  round-65-or-later build) before fully closing, but no longer
+  believed to be an active, reproducible bug** — a meaningfully
+  different, much less urgent status than "STILL NOT FULLY ROOT-
+  CAUSED — high priority," which is what this entry's own header said
+  for months of prior rounds. `pbkdf2_auth_iterations()` remains at
+  200 regardless (raising it is a separate decision requiring its own
+  deliberate confirmation, not something 190 clean boots alone should
+  unilaterally unblock) — flagged here as a legitimate candidate for a
+  future round to revisit, not raised in this one.
+
+  **Closing confirmation (same day), per explicit user request:
+  reproduced round 63's own scoped hardware-watchpoint check directly,
+  rather than relying on the reproduction sweep's statistical
+  inference alone.** Implemented as a TCG plugin instead of literal
+  GDB (same technique this entry's own earlier escalation already
+  proved practical): watch `fn_sha256_compress`'s own saved-`lr` stack
+  slot, armed one instruction after its prologue completes (`push
+  {r4-r9,fp,lr}` + `sub sp,sp,#128`, confirmed via this build's own
+  fresh disassembly) and disarmed at its one epilogue (before the
+  matching `pop`) — exactly round 63's own scoping rationale (an
+  unscoped watch catches legitimate stack-slot reuse by whatever runs
+  next after the function returns, a real false positive round 63
+  itself hit and documented). **First attempt reproduced a DIFFERENT
+  false positive of the same general kind**: arming exactly at the
+  function's own entry PC caught the `push` instruction's own
+  legitimate write of `lr` to that slot (every early "hit" had
+  `pc==entry_pc`, i.e. fired on the very instruction that produced the
+  watched value in the first place) — fixed by arming one instruction
+  later, after the prologue's own writes are already done. Worth
+  recording plainly: this is a real methodology trap independent of
+  which tool implements the watch (GDB or a TCG plugin), and anyone
+  reproducing this check again should watch for it.
+
+  With that fixed, ran a 90-second live boot (`qemu-system-arm`,
+  `-nographic`, no interactive input) covering the full single-threaded
+  boot sequence (comfortably including both the 4096-iteration
+  self-test KAT and the real 10000-iteration `dharafs_crypto_key_init`
+  call — round 63's own original scope) AND a substantial stretch of
+  live, interrupt-driven multitasking afterward (HIGH/MEDIUM/LOW/
+  MUTEX-demo/CUSTOM/idle all visibly cycling in the log) — broader
+  coverage than round 63's own original single-threaded-only scope, at
+  no extra cost. **Result: 56,708 total `fn_sha256_compress` calls,
+  over 1.1 billion total memory stores observed by the plugin, ZERO
+  watchpoint hits.** Matches round 63's own original "zero hits" result
+  exactly, now directly re-verified — not inferred — against the
+  current build (round 65's `sha256_compress` fix + round 68's
+  scheduler fix both in place).
+
+  **This is now a direct, not merely statistical, confirmation.**
+  Downgrading status one step further: **CLOSED, believed resolved**.
+  The corrupting-write-to-a-known-candidate-slot hypothesis stays
+  ruled out exactly as round 64 already established (this round's own
+  check targeted the same slot from a different angle and agrees:
+  zero hits), and the broader "does this class of corruption still
+  occur at all" question — the actual open question after round 65's
+  fix — now has 190 clean black-box reproduction attempts (previous
+  escalation) AND a 56,708-call, billion-plus-store instrumented run
+  finding nothing (this one) behind it. Not an absolute proof it can
+  never recur (no finite test ever is, for a historically rare and
+  ultimately never-fully-root-caused mechanism), but there is no
+  remaining evidence-based reason to keep tracking this as an open
+  bug. `pbkdf2_auth_iterations()` still deliberately left at 200 in
+  this round — raising it to a real security-appropriate value is a
+  separate, deliberate decision for a future round, not something to
+  fold in as a side effect of closing this investigation.
 
 - **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,

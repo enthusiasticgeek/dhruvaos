@@ -185,7 +185,15 @@ void exit(int code) {
  * heap_usage_self_test for the permanent early-warning check this
  * fix added so a future round hits a loud, graded self-test failure
  * instead of a silent, hard-to-diagnose reboot loop. */
-#define DHRUVA_HEAP_BYTES (256 * 1024)
+/* Round 68: 256KB -> 768KB. task_f's real stack (kernel_main.vani's
+ * own stack_f_bytes, carved out of this same heap) had to grow past
+ * what the old 256KB budget could accommodate with any real headroom
+ * left -- see kernel_main.vani's own comment at stack_f_bytes for the
+ * full "why". Comfortably affordable: this whole heap lives inside
+ * mmu_init.S's one 1MB read-write section (0x00100000-0x001FFFFF)
+ * alongside a handful of small .bss globals -- 768KB leaves ~256KB of
+ * that section for everything else, nowhere close to the boundary. */
+#define DHRUVA_HEAP_BYTES (768 * 1024)
 static unsigned char dhruva_heap[DHRUVA_HEAP_BYTES];
 static unsigned long dhruva_heap_used = 0;
 /* Round 51: total number of dhruva_alloc_bytes calls so far (distinct

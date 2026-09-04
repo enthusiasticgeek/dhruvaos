@@ -79,6 +79,19 @@ tls_parsed_server_random_addr: .word 0
 tls_parsed_server_pub_addr:    .word 0
 tls_flight_combined_addr:      .word 0
 tls_parsed_server_id_pub_addr: .word 0
+tls_client_phase_addr:         .word 0
+tls_server_phase_addr:         .word 0
+tls_cert_hash_addr:            .word 0
+tls_cv_sig_addr:                .word 0
+tls_s_verify_data_addr:        .word 0
+tls_c_verify_data_addr:        .word 0
+tls_basepoint_addr:            .word 0
+tls_zero32_addr:               .word 0
+tls_transcript_len_addr:       .word 0
+tls_t_len_sh_addr:             .word 0
+tls_t_len_cert_addr:           .word 0
+tls_t_len_cv_addr:             .word 0
+tls_t_len_s_fin_addr:          .word 0
 
 .section ".text"
 
@@ -160,3 +173,16 @@ TLS_SCRATCH_PAIR tls_parsed_server_random
 TLS_SCRATCH_PAIR tls_parsed_server_pub
 TLS_SCRATCH_PAIR tls_flight_combined
 TLS_SCRATCH_PAIR tls_parsed_server_id_pub
+TLS_SCRATCH_PAIR tls_client_phase
+TLS_SCRATCH_PAIR tls_server_phase
+TLS_SCRATCH_PAIR tls_cert_hash
+TLS_SCRATCH_PAIR tls_cv_sig
+TLS_SCRATCH_PAIR tls_s_verify_data
+TLS_SCRATCH_PAIR tls_c_verify_data
+TLS_SCRATCH_PAIR tls_basepoint
+TLS_SCRATCH_PAIR tls_zero32
+TLS_SCRATCH_PAIR tls_transcript_len
+TLS_SCRATCH_PAIR tls_t_len_sh
+TLS_SCRATCH_PAIR tls_t_len_cert
+TLS_SCRATCH_PAIR tls_t_len_cv
+TLS_SCRATCH_PAIR tls_t_len_s_fin

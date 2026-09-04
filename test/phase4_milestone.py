@@ -125,6 +125,19 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     # the window before the next command is sent.
     send("tcprtx")
     time.sleep(SETTLE_S + 4)
+    # Round 67: tlsecho gives the reusable tls_connect/tls_accept/
+    # tls_send/tls_recv API (kernel_main.vani, TLS 1.3 handshake +
+    # record layer built earlier this round) the same "don't leave a
+    # new command's verification ephemeral" treatment as every prior
+    # round's own new command. Placed AFTER tcprtx deliberately: it
+    # reuses the same connection slots 0/1 tcprtx just left in
+    # whatever state its own retransmission recovery left them in
+    # (nothing after tcprtx checks that), and tlsecho's own
+    # tcp_conn_active_open/passive_open calls reset that state fresh
+    # regardless -- same reasoning tcprtx's own comment gives for why
+    # IT runs after netstat.
+    send("tlsecho hello-tls")
+    time.sleep(SETTLE_S)
     # "ls" last, deliberately: every other command in this sequence has
     # a LATER command's own settle time to absorb any scheduling slack,
     # but the last command has only the trailing sleep below to work
@@ -155,6 +168,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         ("netstat shows the ARP entry udpecho inserted", "127.0.0.1 -> 02:00:00:00:00:01"),
         ("netstat shows tcpecho's client connection closed", "conn 0 state=CLOSED_FINAL local=127.0.0.1:54322 remote=127.0.0.1:7777"),
         ("tcprtx recovers a real simulated SYN loss via retransmission", "recovered from simulated SYN loss via retransmission"),
+        ("tlsecho completes a live tls_connect/tls_accept handshake + encrypted echo", 'tlsecho: echoed over real TLS 1.3 "hello-tls"'),
         ("ls shows /milestone/note", "  /milestone/note"),
     ]
 
