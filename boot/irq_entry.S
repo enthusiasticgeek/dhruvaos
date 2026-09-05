@@ -226,4 +226,6 @@ irq_relocate_loop:
 .global enable_irqs
 enable_irqs:
     cpsie i
+    mov r0, #0
+    mov r1, #0
     bx lr

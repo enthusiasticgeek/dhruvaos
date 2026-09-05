@@ -50,10 +50,41 @@ fb_mbox_buf_ptr:
     ldr r0, =fb_mbox_buf
     bx lr
 
+/* BUG (round 71 audit, 2026-09-05): fb_base_get/fb_size_get/fb_pitch_
+ * get are declared `-> i64` in kernel_main.vani, which under AAPCS
+ * means a genuine 64-bit return value split across the r0:r1
+ * register PAIR (r0=low 32 bits, r1=high 32 bits) -- these functions
+ * only ever set r0, leaving r1 as whatever garbage happened to be
+ * left over from an earlier call. Harmless for a caller that only
+ * ever uses the return value as a plain address (r0 alone is
+ * correct there) -- but fb_self_check's own last_x computation
+ * (`fb_pitch_get() / 4`) treats the return value as a REAL signed
+ * 64-bit quantity, and the compiler-generated 64-bit division
+ * correctly assumes r1 holds real data per the ABI contract it was
+ * promised. Garbage in r1 corrupted that division's result,
+ * producing a wildly wrong last_x (still correct in its low ~10
+ * bits, which is what made this look so much like a narrow, obscure
+ * bug rather than the fairly ordinary ABI-contract violation it
+ * actually is) that fb_fill_pixel's own bounds check then correctly
+ * (and silently) rejected as out-of-range, so the far-corner pixel
+ * write never happened at all.
+ *
+ * Found via GDB against the real failing build (not guessed): traced
+ * bad values all the way back through fb_fill_pixel's own received
+ * arguments to this exact division, then to fb_pitch_get's own
+ * incomplete i64 return. Originally misdiagnosed one level too
+ * shallow as a vani/LLVM compiler bug (a `let`-bound intermediate
+ * happened to reuse a register that coincidentally still held zero,
+ * masking the same underlying garbage-r1 bug rather than fixing it)
+ * -- retracted once GDB actually proved the real cause. Fixed by
+ * explicitly zeroing r1 in all three getters below: these values are
+ * always non-negative 32-bit quantities, so zero-extension is always
+ * the correct 64-bit representation. */
 .global fb_base_get
 fb_base_get:
     ldr r0, =fb_base_val
     ldr r0, [r0]
+    mov r1, #0
     bx lr
 
 .global fb_base_set
@@ -66,6 +97,7 @@ fb_base_set:
 fb_size_get:
     ldr r0, =fb_size_val
     ldr r0, [r0]
+    mov r1, #0
     bx lr
 
 .global fb_size_set
@@ -78,6 +110,7 @@ fb_size_set:
 fb_pitch_get:
     ldr r0, =fb_pitch_val
     ldr r0, [r0]
+    mov r1, #0
     bx lr
 
 .global fb_pitch_set
@@ -96,7 +129,27 @@ fb_pitch_set:
  * (boot/governor_state.S) -- same registers, same bounded-poll
  * constant, same barrier-before-first-peripheral-write reasoning
  * (context_switch.S's mem_barrier comment) -- just parameterized on
- * the buffer address instead of building one particular tag inline. */
+ * the buffer address instead of building one particular tag inline.
+ *
+ * BUG (round 71 audit, 2026-09-05): this function is declared `-> i64`
+ * in kernel_main.vani (genuine 64-bit AAPCS return, r0:r1 pair), but
+ * all three of its original exit paths only ever set r0, leaving r1
+ * as garbage -- despite this function's own header comment claiming
+ * to be a direct generalization of governor_apply_freq_mhz, which
+ * gets this right (explicit `mov r1, #0` on every one of its own
+ * three exit paths). Found via the same GDB-traced investigation that
+ * found the identical bug in this file's fb_base_get/_size_get/
+ * _pitch_get (see their own shared comment for the full story) --
+ * swept here too once the bug CLASS was identified, not just the one
+ * instance that happened to be actively causing a visible failure.
+ * fb_init's own `if status != 0 { return status; }` check on this
+ * function's return value could have spuriously treated a real
+ * success (r0=0) as a failure whenever leftover r1 garbage made the
+ * full 64-bit value non-zero -- not proven to have actually fired
+ * (fb_init passed in every test run so far), but a real, confirmed
+ * ABI violation regardless, fixed the same way: explicit `mov r1, #0`
+ * on every exit path, matching governor_apply_freq_mhz's own
+ * already-correct convention this function was supposed to copy. */
 .global mbox_property_call
 mbox_property_call:
     stmdb sp!, {r4-r9, lr}
@@ -122,6 +175,7 @@ mpc_wait_write:
     cmp r0, r5
     blt mpc_wait_write
     mov r0, #1
+    mov r1, #0
     ldmia sp!, {r4-r9, lr}
     bx lr
 
@@ -143,6 +197,7 @@ mpc_read_not_ready:
     cmp r0, r5
     blt mpc_wait_read
     mov r0, #1
+    mov r1, #0
     ldmia sp!, {r4-r9, lr}
     bx lr
 
@@ -152,5 +207,6 @@ mpc_got_response:
     cmp r2, r3
     moveq r0, #0
     movne r0, #1
+    mov r1, #0
     ldmia sp!, {r4-r9, lr}
     bx lr

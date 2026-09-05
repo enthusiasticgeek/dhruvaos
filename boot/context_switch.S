@@ -914,28 +914,48 @@ current_task_get:
     ldr r0, [r0]
     bx lr
 
+/* BUG (round 71 audit, 2026-09-05): all five *_get functions below
+ * are declared `-> i64` in kernel_main.vani (genuine 64-bit AAPCS
+ * return, r0:r1 pair) but only ever set r0 -- found while chasing
+ * down a real corrupted-value bug in an unrelated new feature
+ * (boot/fb_state.S's own accessors had the identical bug; see that
+ * file's own comment for the full root-cause story) and then swept
+ * for here too, this codebase's own established discipline after
+ * finding one instance of a bug class. Each of these feeds `diagnose`
+ * `uart_put_i64` directly -- garbage in r1 could have been silently
+ * printing wrong (huge or negative) counter values in `diagnose`'s
+ * own output this whole time, masked whenever leftover r1 happened
+ * to already be zero. The diag_ring_push call sites for these same
+ * three counters were never at risk (they truncate `as u32`, which
+ * only ever reads r0). Fixed by explicitly zeroing r1: every one of
+ * these counters is a genuine non-negative 32-bit count, so
+ * zero-extension is always the correct 64-bit value. */
 .global context_switch_count_get
 context_switch_count_get:
     ldr r0, =context_switch_count
     ldr r0, [r0]
+    mov r1, #0
     bx lr
 
 .global prio_lock_count_get
 prio_lock_count_get:
     ldr r0, =prio_lock_count
     ldr r0, [r0]
+    mov r1, #0
     bx lr
 
 .global mutex_contention_count_get
 mutex_contention_count_get:
     ldr r0, =mutex_contention_count
     ldr r0, [r0]
+    mov r1, #0
     bx lr
 
 .global mutex_wait_worst_ticks_get
 mutex_wait_worst_ticks_get:
     ldr r0, =mutex_wait_worst_ticks
     ldr r0, [r0]
+    mov r1, #0
     bx lr
 
 .global irq_count_increment
@@ -951,6 +971,7 @@ irq_count_increment:
 irq_count_get:
     ldr r0, =irq_count
     ldr r0, [r0]
+    mov r1, #0
     bx lr
 
 /* TEST-ONLY (round 22, dhcp_renewal_self_test -- not part of any

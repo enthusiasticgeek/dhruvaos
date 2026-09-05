@@ -1547,31 +1547,39 @@ fn fb_self_check() -> i64 {
   // passed the whole time regardless). Two corners, two different
   // colors, so a wrong pitch/stride calculation that happened to work
   // for (0,0) couldn't hide behind it.
-  // BUG (round 71 audit, 2026-09-05): found live, reproducibly, while
-  // writing this exact check -- `if mmio_read_u32(addr) != (const as
-  // u32) { ... }` (the function call used directly as the comparison's
-  // LHS) miscompiled and failed 2/2 runs; binding the SAME call's
-  // result to a named `let` first and comparing THAT instead passed
-  // 2/2 runs, identical logic otherwise. This points to a real vani
-  // compiler code-generation bug in how a direct extern "C" call
-  // result is used inline inside an `if` comparison -- not a bug in
-  // this driver's own address/value arithmetic (already independently
-  // confirmed correct via the interactive shell round trip). Worked
-  // around here by always binding to a `let` first; see project
-  // memory for the wider sweep this finding prompted.
+  // This exact check (writing then reading back a real pixel) is what
+  // actually caught the round-71 bug below -- initially misdiagnosed
+  // one level too shallow as a vani/LLVM compiler bug (an `if
+  // mmio_read_u32(addr) != const` comparison seemed to miscompile,
+  // reproducibly, depending on unrelated code shape nearby). GDB
+  // against the real failing build proved otherwise: fb_pitch_get/
+  // fb_base_get/fb_size_get (boot/fb_state.S) are declared `-> i64`
+  // here but their assembly only ever set r0, leaving the AAPCS
+  // 64-bit return's high word (r1) as leftover garbage from whatever
+  // call happened before. `last_x = fb_pitch_get() / 4 - 1` performs
+  // genuine 64-bit division, correctly trusting r1 per the ABI
+  // contract -- garbage there corrupted the result into a huge
+  // positive number, which fb_fill_pixel's own bounds check then
+  // correctly (and silently) rejected, so the far-corner pixel write
+  // never happened. Different code shapes nearby just changed which
+  // stale value happened to be sitting in r1, which is why the
+  // symptom looked tied to "let vs. inline" rather than to its real
+  // cause. Fixed at the source (boot/fb_state.S now explicitly zeros
+  // r1 in all three getters); no workaround needed here once the real
+  // bug was found. See project memory for the fuller writeup and the
+  // sweep this prompted across the rest of the codebase for the same
+  // bug class.
   let pix_ok: i64 = 1;
   let _ = fb_fill_pixel(0, 0, 0x00112233 as u32);
   let corner_addr: i64 = fb_base_get();
-  let corner_readback: u32 = mmio_read_u32(corner_addr);
-  if corner_readback != (0x00112233 as u32) {
+  if mmio_read_u32(corner_addr) != (0x00112233 as u32) {
     pix_ok = 0;
   }
   let last_x: i64 = (fb_pitch_get() / 4) - 1;
   let last_y: i64 = 479;
   let _ = fb_fill_pixel(last_x, last_y, 0x00445566 as u32);
   let far_addr: i64 = fb_base_get() + (last_y * fb_pitch_get()) + (last_x * 4);
-  let far_readback: u32 = mmio_read_u32(far_addr);
-  if far_readback != (0x00445566 as u32) {
+  if mmio_read_u32(far_addr) != (0x00445566 as u32) {
     pix_ok = 0;
   }
 

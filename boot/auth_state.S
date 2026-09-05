@@ -96,6 +96,7 @@ auth_set_uid:
     ldr r2, =auth_uid_table
     str r1, [r2, r0, lsl #2]
     mov r0, #0
+    mov r1, #0
     bx lr
 
 .global auth_salt_ptr
@@ -123,6 +124,7 @@ auth_set_fail_count:
     ldr r2, =auth_fail_count_table
     str r1, [r2, r0, lsl #2]
     mov r0, #0
+    mov r1, #0
     bx lr
 
 .global auth_get_lockout_until
@@ -136,6 +138,7 @@ auth_set_lockout_until:
     ldr r2, =auth_lockout_until_table
     str r1, [r2, r0, lsl #2]
     mov r0, #0
+    mov r1, #0
     bx lr
 
 /* u32 auth_salt_nonce_next() -- returns a fresh, monotonically

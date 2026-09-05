@@ -72,6 +72,7 @@ stack_canary_set_base:
     ldr r2, =CANARY_SENTINEL
     str r2, [r1]
     mov r0, #0
+    mov r1, #0
     bx lr
 
 /* u32 stack_canary_check_all() -- returns a bitmask, one bit per task
