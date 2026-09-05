@@ -24,6 +24,13 @@ shell_line_ready:
                      * to consume it. New input is dropped (not
                      * buffered) while this is 1, rather than risk
                      * corrupting a line the shell hasn't read yet. */
+shell_echo_state:
+    .word 0         /* Round 72: input-echo state machine (see
+                     * kernel_main.vani's shell_echo_advance) --
+                     * tracks a partial match against "su " / "passwd "
+                     * so their password argument can be typed without
+                     * echoing it back. Reset to 0 at the start of
+                     * every line. */
 
 .section ".text"
 
@@ -92,6 +99,19 @@ shell_get_line_ready:
 shell_get_line_byte:
     ldr r1, =shell_line_buf
     ldrb r0, [r1, r0]
+    bx lr
+
+.global shell_get_echo_state
+shell_get_echo_state:
+    ldr r0, =shell_echo_state
+    ldr r0, [r0]
+    bx lr
+
+.global shell_set_echo_state
+shell_set_echo_state:
+    ldr r1, =shell_echo_state
+    str r0, [r1]
+    mov r0, #0
     bx lr
 
 /* u32 shell_clear_line() -- call once the shell loop has finished

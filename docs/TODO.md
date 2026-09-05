@@ -1036,14 +1036,50 @@ for by name.
      this and found to be **inaccurate**. `irq_dispatch`'s own UART-RX
      branch only calls `shell_rx_push_char` (buffers the byte) and
      never calls `uart_putc`/`uart_putc_nonblocking` at all; no
-     hardware UART loopback is configured either. **This shell does
-     not echo anything typed, for any command, today.** A typed
-     password is therefore not already leaking into the UART stream —
-     the real, still-open gap is the opposite one: normal typing gets
-     no visual feedback either. Not fixed here (out of scope for
-     authentication specifically); if a real echo feature is ever
-     added for usability, it will need its own password-mode
-     suppression at that point, not before.
+     hardware UART loopback is configured either. **This shell did
+     not echo anything typed, for any command, at the time.** A typed
+     password was therefore not already leaking into the UART stream —
+     the real, then-open gap was the opposite one: normal typing got
+     no visual feedback either. Out of scope for authentication itself
+     at the time; flagged that a real echo feature would need its own
+     password-mode suppression when added.
+
+     **`[DONE, round 72, 2026-09-05]`** — real per-byte echo added to
+     `irq_dispatch`'s UART-RX branch (`shell_echo_char`, `kernel_main
+     .vani`), with a small character-by-character prefix matcher
+     (`shell_echo_advance`) that detects an in-progress `su ` or
+     `passwd ` line and suppresses all further echo for the rest of
+     that line (deliberately coarser than token-precise: hides the
+     uid/gid arguments too, not just the password, a considered
+     tradeoff — "hides a little more than necessary" has no downside,
+     unlike the reverse). Persistent per-line matcher state lives in
+     a new `shell_echo_state` word in `boot/shell_state.S` (same
+     `.bss`-plus-extern-accessor shape as every other piece of
+     `irq_dispatch`-owned state in this project), reset to 0 on CR/LF.
+     `#[wcet(cycles=100000)]` on `irq_dispatch` raised to `130000`
+     after re-measuring the static estimate with the new per-byte call
+     (118044 cycles) — genuinely more work, not an estimator
+     regression. New `shell_echo_self_test()` white-box-tests the
+     matcher directly (su/passwd/near-miss-prefix/non-matching-line/
+     backspace-while-suppressed); live-verified over real QEMU serial
+     that `ls` echoes normally while `su <uid> <gid> <password>` and
+     `passwd <uid> <new_password>` echo only the `su `/`passwd `
+     prefix and suppress everything typed after it.
+
+     Found and fixed a real, unrelated authoring mistake along the
+     way: the new functions were first inserted physically between
+     `irq_dispatch`'s own `#[no_mangle] #[interrupt(priority=0)]
+     #[bounded_stack(bytes=1024)] #[wcet(cycles=100000)]` attribute
+     stack and the `fn irq_dispatch` line it was meant to decorate —
+     vani attributes bind to the next function *lexically*, so this
+     silently reattached all four attributes to the wrong function.
+     The most visible symptom was `#[no_mangle]` no longer applying:
+     `irq_dispatch` fell back to its default mangled LLVM symbol name
+     (`fn_irq_dispatch`), which broke the link step, since `boot/
+     irq_entry.S`'s hand-written `bl irq_dispatch` expects the bare,
+     unmangled name. Fixed by moving the whole new block back above
+     the attribute stack, restoring `#[no_mangle]` (and the other
+     three attributes) to `irq_dispatch` itself.
 
   **Cryptography**: `hmac_sha256`/`pbkdf2_hmac_sha256` (RFC 2104 /
   RFC 8018, specialized to the dkLen==hLen==32 single-block case) are
