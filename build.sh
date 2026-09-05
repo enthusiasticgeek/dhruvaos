@@ -153,6 +153,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/stack_canary.S" -o "${BUILD_DIR}/stack_canary.o"
 
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/dharafs_crypto2_state.S" -o "${BUILD_DIR}/dharafs_crypto2_state.o"
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
@@ -194,6 +197,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/mlkem_scratch.o" \
   "${BUILD_DIR}/tls13_scratch.o" \
   "${BUILD_DIR}/stack_canary.o" \
+  "${BUILD_DIR}/dharafs_crypto2_state.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
   -lgcc \
   -o "${BUILD_DIR}/dhruva.elf"

@@ -207,21 +207,54 @@ current file size), tracked automatically:
 | 1 | USB mass storage (DWC2 + bulk-only transport), proven as a genuine second backend through the same abstraction. |
 | 2 | `host_virtual_disk_read`/`write` — an in-memory array, used **only** by `test/host_harness/` (the host-side ASAN/UBSAN test driver) to exercise DharaFS's real logic without touching real hardware. Dead code on real hardware; production `runtime_stubs.c` always fails this path if somehow reached. |
 
-**Media (at-rest) encryption (round 62)** applies orthogonally to
-which backend above is selected — a ChaCha20 transform hooked
+**Media (at-rest) encryption (round 62, AEAD upgrade round 69)**
+applies orthogonally to which backend above is selected — hooked
 directly into `dharafs_block_read`/`dharafs_block_write` (renamed to
 `_raw` + a thin wrapper), so every higher layer in this manual
 (records, multi-block files, transactions, snapshots, the directory
 index) keeps operating on plaintext with zero awareness it's on.
-**Off by default** (`dharafs_crypto_get_enabled()` starts at 0). Key
-derived once at boot via PBKDF2-HMAC-SHA256 from a fixed passphrase;
-nonce per block is a pure function of the block number. Honest,
-deliberate limitation: overwriting the same block twice under the
-same key reuses the same keystream (a two-time-pad leak against an
-attacker holding two on-disk snapshots) — real protection against the
-common single-stolen-SD-card threat, not multi-snapshot analysis.
-Integrity (Poly1305, built round 67) is not yet wired into this path
-— see `TODO.md`.
+**Off by default** (`dharafs_crypto_get_enabled()` starts at 0); toggle
+live from the shell with `crypto on|off|status` — no reboot needed,
+since encryption lives entirely at this one choke point. Key derived
+once at boot via PBKDF2-HMAC-SHA256 from a fixed passphrase.
+
+Round 69 replaced the original plain-ChaCha20 transform with real
+ChaCha20-Poly1305 AEAD (`dharafs_crypto_encrypt_block`/
+`decrypt_block`), fixing both weaknesses the original design honestly
+documented:
+
+- **Tamper detection**: every encrypted block now carries a 16-byte
+  Poly1305 tag (AAD = the block number, binding the tag to that exact
+  block so a valid tag+ciphertext pair can't be silently moved to a
+  different block). `dharafs_block_read` fails CLOSED — returns a
+  non-zero status, buffer left untouched — on any tag mismatch,
+  whether from real corruption or deliberate tampering, rather than
+  handing back "decrypted" garbage as if it were trustworthy.
+- **Two-time-pad fix**: the nonce is no longer a pure function of the
+  block number. A dedicated per-block metadata region (16 packed
+  32-byte entries per 512-byte sector, starting at block 4000, well
+  clear of the log region above and the pre-existing self-check's own
+  `test_block=3000`) stores a monotonically increasing write-counter
+  per block; the nonce is `block_num || write_counter || 0`, so
+  overwriting the same block now always produces different
+  ciphertext. A counter of 0 (no metadata entry, or a foreign/garbage
+  sector whose magic marker doesn't match) means "this block was never
+  AEAD-protected" — the read path falls through to plain passthrough
+  for it, so pre-existing plaintext (from before encryption was turned
+  on, or written while it was off) is never misread as ciphertext.
+- Uses **dedicated** scratch buffers
+  (`boot/dharafs_crypto2_state.S`), separate from TLS 1.3's own AEAD
+  scratch, even though both call the same `chacha20_poly1305_encrypt`/
+  `decrypt` primitive — this project's single-core, preemptible
+  scheduler means a DharaFS block read/write (reachable from any task,
+  including background compaction) could interrupt a `tlsecho` task
+  mid-AEAD-computation; sharing one scratch set between the two would
+  let one clobber the other's in-progress state.
+
+`dharafs_encryption_self_check` (runs every boot) now exercises the
+AEAD round trip, the two-time-pad fix, tamper rejection, and the real
+SD-integrated encrypt-on-write/decrypt-on-read path, all under the
+`CRYPTO: DharaFS ...` UART lines.
 
 ## 9. Recovery (what happens at boot)
 
@@ -342,7 +375,12 @@ Round 67 additions: `dharafs_snapshot_create`/`_read`/`_delete` (§11),
 `dharafs_queue_submit_write_raw`/`_submit_delete_raw`/`_submit`/
 `_dispatch_one` (§12) — the hashed directory index (§10) has no public
 API of its own, it's an internal acceleration
-`dharafs_find_latest_block_raw` already uses transparently.
+`dharafs_find_latest_block_raw` already uses transparently. Round 69
+additions (media-encryption AEAD upgrade, §8): `dharafs_crypto_
+encrypt_block`/`_decrypt_block` (the AEAD choke point `dharafs_
+block_write`/`_read` call internally), `dharafs_crypto_meta_
+sector_for`/`_offset_for`/`_read_counter`/`_read_tag`/`_write_entry`
+(the per-block write-counter+tag metadata region).
 
 ## 14. See also
 

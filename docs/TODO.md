@@ -1968,7 +1968,7 @@ for by name.
   stack is 16384 bytes, so this was always a static-checker
   bookkeeping fix, never a genuine overflow risk).
 
-- **Media (at-rest) encryption** — `[DONE, round 62, 2026-08-31]`
+- **Media (at-rest) encryption** — `[DONE, round 62, 2026-08-31; AEAD/tamper-detection/two-time-pad upgrade DONE round 69, 2026-09-04]`
   DharaFS block encryption layered on round 44's existing ChaCha20
   stream cipher (no new cipher primitive needed — matches this entry's
   own original scoping note exactly: unlike WPA2/WiFi, at-rest
@@ -2016,6 +2016,75 @@ for by name.
   differ from plaintext, decrypted readback exactly matches — not
   committed as a permanent boot self-test, per the entry below).
 
+  **ROUND 69 UPDATE (2026-09-04): both honest limitations above are
+  now fixed.** User-directed follow-up ("ensure tamper detection and
+  fix weakness") replaced the plain-ChaCha20 transform with real
+  ChaCha20-Poly1305 AEAD (`dharafs_crypto_encrypt_block`/
+  `_decrypt_block`, in `kernel/kernel_main.vani`, using round 67's
+  own already-verified `chacha20_poly1305_encrypt`/`_decrypt`):
+
+  - **Tamper detection**: every block now carries a 16-byte Poly1305
+    tag (AAD = block number, so a valid tag+ciphertext pair can't be
+    silently moved to a different block). `dharafs_block_read` fails
+    CLOSED (non-zero status, buffer untouched) on any mismatch —
+    real corruption or deliberate tampering alike — rather than ever
+    handing back unverified bytes as if they were trustworthy
+    plaintext.
+  - **Two-time-pad fix**: a new dedicated per-block metadata region
+    (`boot/dharafs_crypto2_state.S` for its own AEAD scratch;
+    16 packed 32-byte entries — 4-byte write-counter, 4-byte magic
+    marker, 16-byte tag, 8 reserved — per 512-byte sector, starting at
+    block 4000, clear of the log region (blocks 1-2048) and the
+    self-check's own `test_block=3000`) tracks a monotonically
+    increasing write-counter per block. New nonce = `block_num (4B) ||
+    write_counter (4B) || 0 (4B)`, so the SAME block written twice now
+    always gets a DIFFERENT nonce, closing the classic stream-cipher
+    "two-time pad" leak. A counter of 0 (no entry yet, or a foreign/
+    garbage sector whose magic marker doesn't match) means "never
+    AEAD-protected" — read falls through to plain passthrough for it,
+    so genuine pre-existing plaintext (written before encryption was
+    turned on, or while it was off) is never misread as ciphertext.
+  - Dedicated scratch buffers (`dharafs_crypto_block_scratch_ptr` and
+    6 siblings), deliberately NOT shared with TLS 1.3's own AEAD
+    scratch (`boot/aead_hkdf_scratch.S`) even though both call the
+    same underlying primitive — this project's single-core,
+    preemptible scheduler means a DharaFS block read/write (reachable
+    from ANY task, including background compaction) could preempt a
+    `tlsecho` task mid-AEAD-computation; sharing scratch would let one
+    clobber the other's in-progress state, the exact "shared mutable
+    state across preemptible tasks" hazard class this session's own
+    round-68 scheduler-bug investigation centered on.
+  - New `crypto on|off|status` shell command — live toggle, no reboot
+    needed (`kernel_main.vani`'s `shell_dispatch_crypto`).
+  - `dharafs_encryption_self_check` rewritten to verify all of the
+    above on every boot, not just the original transform round trip:
+    an AEAD round trip, an explicit two-time-pad-fixed check (encrypt
+    the same block twice, confirm different ciphertext, confirm both
+    still decrypt correctly), an explicit tamper-rejection check (flip
+    one ciphertext bit, confirm `-1`), and the real SD-integrated path
+    (write, confirm on-disk bytes are ciphertext, read back correctly,
+    then corrupt the raw on-disk block directly and confirm
+    `dharafs_block_read` — the actual path every FS read uses — fails
+    closed instead of returning garbage). All four print as their own
+    `CRYPTO: DharaFS ...` PASS/FAIL lines. Verified PASS on real
+    ARM/QEMU with a real 64MB SD image (`test/phase4_milestone.py`;
+    `test/qemu_run.py` has no SD `-drive` at all, so these necessarily
+    show FAIL there — a known harness limitation, not a real failure,
+    see the entry below). `test_media_crypto` in `test/host_harness/
+    host_main.c` extended to match (now also covers the two-time-pad
+    fix and both tamper-rejection cases) — 975/975 PASS clean under
+    ASAN/UBSAN (up from 970).
+  - Caught and fixed one real (non-algorithmic) issue along the way,
+    same class as several previous rounds: the deeper AEAD call chain
+    reachable from `task_e`'s own `dharafs_compact` (now
+    `-> dharafs_block_read -> dharafs_crypto_decrypt_block ->
+    chacha20_poly1305_decrypt -> poly1305_mac`) pushed the compiler's
+    own static `#[bounded_stack]` check past its budget (2052 bytes
+    needed vs. 2048 available) — caught at compile time, not left as a
+    real-hardware-only risk. Raised to 4096 (this task's REAL
+    allocated stack is already 16384 bytes, so this was a static-
+    checker bookkeeping fix, never a genuine overflow risk).
+
 - **A real, serious, pre-existing, timing-dependent SD/boot-sequencing
   bug** — `[found round 62, 2026-08-31; FIXED round 65/66,
   2026-09-01 — see round-66 update below]`
@@ -2052,7 +2121,7 @@ for by name.
   inside `dharafs_read`/`sdhost_read_block` is still not identified.
 
   Because of this, media encryption's own on-target self-test
-  deliberately verifies only the in-memory transform (safe, 100%
+  deliberately verified only the in-memory transform (safe, 100%
   reliable) rather than the real SD-integrated path, on every boot —
   baking a ~20-30%-per-boot destabilization risk into a permanent
   self-test would make the whole system less reliable for every user,
@@ -2060,7 +2129,12 @@ for by name.
   integration was instead verified via the host-harness ASAN/UBSAN
   twin (a real host process, no IRQs, no hazard) and a one-time manual
   live QEMU run with a real SD image attached (both confirmed correct
-  — see the media encryption entry above).
+  — see the media encryption entry above). **Since this SD-timing bug
+  itself was fixed (round 65/66, immediately above), the real
+  SD-integrated path was restored to the permanent on-target
+  self-test** (round 66), and round 69's AEAD upgrade extended it
+  further still (two-time-pad and tamper-detection checks) — see the
+  media encryption entry's own round-69 update above.
 
   Candidate next steps: since this doesn't require the still-elusive
   live GDB breakpoint the task_f investigation got stuck on (the

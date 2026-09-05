@@ -661,6 +661,18 @@ extern "C" fn dharafs_crypto_state_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_working_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_keystream_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_scratch_ptr() -> mut ref i64;
+// Round 69: dedicated AEAD + per-block-metadata scratch, see
+// boot/dharafs_crypto2_state.S's own header comment for why this is
+// deliberately separate from TLS's own AEAD scratch. Fixed static
+// buffers (matching media_crypto_state.S's own style), so only a
+// getter is needed -- no boot-time _set(dhruva_alloc_bytes(...)) call.
+extern "C" fn dharafs_crypto_block_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_otk_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_mac_data_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_computed_tag_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_tag_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_aad_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_meta_sector_scratch_ptr() -> mut ref i64;
 extern "C" fn fault_write_countdown_get() -> u32;
 extern "C" fn fault_write_countdown_set(v: u32) -> i64;
 extern "C" fn fault_irqburst_countdown_get() -> u32;
@@ -2068,15 +2080,18 @@ fn dharafs_block_write_raw(block_num: i64, buf: mut ref i64) -> i64 {
 }
 
 // Media (at-rest) encryption's own choke point (see the full design
-// comment above dharafs_crypto_derive_nonce, near the ChaCha20 crypto
-// section): transparently encrypts/decrypts through the *_raw
-// functions above when dharafs_crypto_enabled is on, using
+// comment above dharafs_crypto_encrypt_block, near the ChaCha20-
+// Poly1305 AEAD section): transparently encrypts/decrypts through the
+// *_raw functions above when dharafs_crypto_enabled is on, using
 // dharafs_crypto_scratch_ptr() to hold the raw ciphertext -- distinct
-// from the buffers dharafs_crypto_transform_block itself uses
-// internally (key/nonce/state/working/keystream), so no aliasing.
-// Passthrough, byte-for-byte unchanged, when encryption is off
-// (the default) -- every existing test keeps working exactly as
-// before.
+// from the buffers dharafs_crypto_encrypt_block/decrypt_block use
+// internally, so no aliasing. Passthrough, byte-for-byte unchanged,
+// when encryption is off (the default) -- every existing test keeps
+// working exactly as before. Round 69: dharafs_block_read now fails
+// CLOSED (returns -1, buf left untouched) on a tamper/corruption
+// detection from decrypt_block -- callers already treat any non-zero
+// status as a read failure, so this is a plain extension of the
+// existing error contract, not a new one.
 fn dharafs_block_read(block_num: i64, buf: mut ref i64) -> i64 {
   if dharafs_crypto_get_enabled() == (1 as u32) {
     let scratch: mut ref i64 = dharafs_crypto_scratch_ptr();
@@ -2084,8 +2099,7 @@ fn dharafs_block_read(block_num: i64, buf: mut ref i64) -> i64 {
     if status != 0 {
       return status;
     }
-    let _ = dharafs_crypto_transform_block(block_num, scratch, buf);
-    return 0;
+    return dharafs_crypto_decrypt_block(block_num, scratch, buf);
   }
   return dharafs_block_read_raw(block_num, buf);
 }
@@ -2093,7 +2107,7 @@ fn dharafs_block_read(block_num: i64, buf: mut ref i64) -> i64 {
 fn dharafs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
   if dharafs_crypto_get_enabled() == (1 as u32) {
     let scratch: mut ref i64 = dharafs_crypto_scratch_ptr();
-    let _ = dharafs_crypto_transform_block(block_num, buf, scratch);
+    let _ = dharafs_crypto_encrypt_block(block_num, buf, scratch);
     return dharafs_block_write_raw(block_num, scratch);
   }
   return dharafs_block_write_raw(block_num, buf);
@@ -14909,8 +14923,18 @@ fn task_d() -> i64 {
 // way an unchecked stack depth normally would be. Raised to 2048 --
 // matching task_f's own already-established bound -- for headroom,
 // not just the bare minimum.
+// BUG (round 69 audit): the same class of thing happened again --
+// DharaFS media encryption's round-69 AEAD upgrade means
+// dharafs_compact's own dharafs_block_read can now reach all the way
+// down through dharafs_crypto_decrypt_block -> chacha20_poly1305_
+// decrypt -> poly1305_mac, a materially deeper chain than the old
+// plain-ChaCha20 transform it replaced; the compiler's own static
+// analysis caught this at compile time (2052 bytes needed, budget was
+// 2048), not silently left as a real-hardware-only risk. Raised to
+// 4096 for real headroom against the next addition to this same
+// chain, not just the bare 4 bytes actually needed today.
 #[no_mangle]
-#[bounded_stack(bytes=2048)]
+#[bounded_stack(bytes=4096)]
 fn task_e() -> i64 {
   let gc_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
@@ -15857,6 +15881,48 @@ fn shell_dispatch_fault(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i
   return 0;
 }
 
+// Round 69: runtime toggle for DharaFS media (at-rest) encryption,
+// wired straight to dharafs_crypto_get_enabled/set_enabled -- the
+// same pair the self-check above already flips internally, now
+// exposed to a real user. `on`/`off` take effect immediately for
+// every subsequent dharafs_block_read/write (no reboot, no re-mount
+// step needed, since encryption lives entirely in that one choke
+// point). Turning this on mid-session does NOT retroactively encrypt
+// blocks already on disk -- they keep their existing write-counter
+// (0 if never protected) and are read back as plaintext until next
+// written, exactly the same graceful legacy-passthrough behavior
+// documented above dharafs_crypto_decrypt_block.
+fn shell_dispatch_crypto(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  let usage: Str = "usage: crypto on|off|status\n";
+  if cmd_end >= line_len {
+    let _ = uart_puts(usage);
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "on") == 1 {
+    let _ = dharafs_crypto_set_enabled(1 as u32);
+    let _ = uart_puts("DharaFS media encryption: ON (AEAD, tamper-detected)\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "off") == 1 {
+    let _ = dharafs_crypto_set_enabled(0 as u32);
+    let _ = uart_puts("DharaFS media encryption: OFF\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "status") == 1 {
+    if dharafs_crypto_get_enabled() == (1 as u32) {
+      let _ = uart_puts("DharaFS media encryption: ON (AEAD, tamper-detected)\n");
+    } else {
+      let _ = uart_puts("DharaFS media encryption: OFF\n");
+    }
+    return 0;
+  }
+  let _ = uart_puts(usage);
+  return 0;
+}
+
 // Parses and runs exactly one already-complete shell line. Deliberately
 // NOT #[no_heap] (same reasoning as task_e's GC pass above): every
 // scratch buffer here is a fresh dhruva_alloc_bytes, and this task can
@@ -16534,6 +16600,10 @@ fn shell_dispatch() -> i64 {
   // dispatch's frame entirely.
   if shell_word_matches(line_buf, 0, cmd_end, "fw") == 1 {
     return shell_dispatch_fw(line_buf, cmd_end, line_len);
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "crypto") == 1 {
+    return shell_dispatch_crypto(line_buf, cmd_end, line_len);
   }
 
   if shell_word_matches(line_buf, 0, cmd_end, "eval") == 1 {
@@ -24797,36 +24867,115 @@ fn poly1305_self_test() -> i64 {
 // journaling, compaction, permissions) keeps operating on plaintext;
 // only the physical bytes that actually reach storage are ciphertext.
 //
-// Nonce = 12 bytes, all zero except the low 4 bytes holding block_num
-// (big-endian) -- unique per block under a fixed key, matching a
-// classic sector-tweak scheme. HONEST, DELIBERATE LIMITATION (not an
-// oversight): because the nonce is a pure function of block_num, not
-// a fresh value per WRITE, overwriting the SAME block twice under the
-// SAME key reuses the SAME keystream -- an attacker holding two
-// on-disk snapshots of that block can recover plaintext_old XOR
-// plaintext_new (the classic stream-cipher "two-time pad" problem).
-// This is exactly why real full-disk encryption normally uses a wide-
-// block tweakable mode (AES-XTS) instead of a raw stream cipher; a
-// full fix (a fresh random nonce stored per block, or a proper
-// tweakable-cipher construction) is future work, not attempted here.
-// This still provides real, meaningful protection against the
-// simplest and most common threat model (a single stolen/lost SD
-// card, one point-in-time snapshot) -- the gap only matters against an
-// attacker who can compare multiple snapshots of the same rewritten
-// block over time.
+// ROUND 69 UPDATE: the two-time-pad weakness described just below is
+// FIXED, and this feature now has real tamper detection, both via the
+// per-block metadata region introduced here. The original honest-
+// limitation writeup is kept (next paragraph) as the historical
+// record of exactly what was wrong and why, per this project's own
+// documentation discipline -- see dharafs_crypto_encrypt_block/
+// decrypt_block below for the actual current scheme.
+//
+// ORIGINAL (round 62) design: nonce = 12 bytes, all zero except the
+// low 4 bytes holding block_num (big-endian) -- unique per block
+// under a fixed key, matching a classic sector-tweak scheme. HONEST,
+// DELIBERATE LIMITATION (not an oversight): because the nonce was a
+// pure function of block_num, not a fresh value per WRITE, overwriting
+// the SAME block twice under the SAME key reused the SAME keystream --
+// an attacker holding two on-disk snapshots of that block could
+// recover plaintext_old XOR plaintext_new (the classic stream-cipher
+// "two-time pad" problem). There was also no MAC/tag anywhere, so a
+// bit-flipped or swapped on-disk block decrypted "successfully" into
+// silent garbage instead of being detected.
 //
 // Off by default (dharafs_crypto_enabled starts at 0): every existing
 // test (phase4_milestone.py, heap_stress.py, power_yank.py, the host
 // harness) keeps running against plaintext blocks completely
 // unchanged unless something explicitly turns this on -- matching
-// round 36's own dharafs_block_dev toggle precedent (flipped only by
-// a dedicated self-check, never by a real FS operation).
-fn dharafs_crypto_derive_nonce(block_num: i64) -> i64 {
-  let nonce: mut ref i64 = dharafs_crypto_nonce_ptr();
-  let _ = buf_write_u32_be(nonce, 0, 0 as u32);
-  let _ = buf_write_u32_be(nonce, 4, 0 as u32);
-  let _ = buf_write_u32_be(nonce, 8, block_num as u32);
+// round 36's own dharafs_block_dev toggle precedent.
+
+// Per-block AEAD metadata (write-counter + Poly1305 tag): fixes both
+// weaknesses above at once. A dedicated region starting at block 4000
+// (clear of DharaFS's own log region, blocks 1-2048, and the pre-
+// existing self-check's own test_block=3000), 16 fixed 32-byte
+// entries packed per 512-byte sector -- one entry per tracked data
+// block: 4-byte write-counter (big-endian) + 4-byte magic ("DHAC",
+// distinguishes a real entry from an uninitialized/garbage sector on
+// a fresh or foreign SD card) + 16-byte tag + 8 reserved bytes. A
+// missing/absent-magic entry means "this block has never been AEAD-
+// protected" (predates encryption being turned on, or was written
+// while it was off) -- the read path falls through to plain
+// passthrough for it rather than rejecting genuine, pre-existing
+// plaintext. This metadata is itself stored in the clear (it holds no
+// secret, only a public counter and a MAC tag) -- keeping it
+// unencrypted avoids a chicken-and-egg dependency on itself.
+fn dharafs_crypto_meta_sector_for(block_num: i64) -> i64 {
+  return 4000 + (block_num / 16);
+}
+
+fn dharafs_crypto_meta_offset_for(block_num: i64) -> i64 {
+  return (block_num % 16) * 32;
+}
+
+// Returns the block's current write-counter, or 0 if this block has
+// never been AEAD-protected (no entry, or a garbage/foreign sector
+// whose magic doesn't match).
+fn dharafs_crypto_meta_read_counter(block_num: i64) -> i64 {
+  let sector: mut ref i64 = dharafs_crypto_meta_sector_scratch_ptr();
+  let status: i64 = dharafs_block_read_raw(dharafs_crypto_meta_sector_for(block_num), sector);
+  if status != 0 {
+    return 0;
+  }
+  let off: i64 = dharafs_crypto_meta_offset_for(block_num);
+  let magic: u32 = buf_read_u32_be(sector, off + 4);
+  if magic != (0x44484143 as u32) {
+    return 0;
+  }
+  return buf_read_u32_be(sector, off) as i64;
+}
+
+// Reads the block's stored tag into out_tag (16 bytes). Only
+// meaningful when dharafs_crypto_meta_read_counter(block_num) != 0 --
+// callers must check that first.
+fn dharafs_crypto_meta_read_tag(block_num: i64, out_tag: mut ref i64) -> i64 {
+  let sector: mut ref i64 = dharafs_crypto_meta_sector_scratch_ptr();
+  let status: i64 = dharafs_block_read_raw(dharafs_crypto_meta_sector_for(block_num), sector);
+  if status != 0 {
+    return status;
+  }
+  let off: i64 = dharafs_crypto_meta_offset_for(block_num);
+  let i: i64 = 0;
+  while i < 16 {
+    let _ = buf_write_byte(out_tag, i as u32, buf_read_byte(sector, (off + 8 + i) as u32));
+    i = i + 1;
+  }
   return 0;
+}
+
+// Read-modify-write: updates one 32-byte entry within its 512-byte
+// metadata sector, leaving the other 15 entries in that sector
+// untouched. Zeroes the sector first on its very first use (read
+// failure) rather than writing a new entry through uninitialized
+// storage that would corrupt the other 15 slots.
+fn dharafs_crypto_meta_write_entry(block_num: i64, counter: i64, tag: mut ref i64) -> i64 {
+  let sector: mut ref i64 = dharafs_crypto_meta_sector_scratch_ptr();
+  let sector_num: i64 = dharafs_crypto_meta_sector_for(block_num);
+  let read_status: i64 = dharafs_block_read_raw(sector_num, sector);
+  if read_status != 0 {
+    let z: i64 = 0;
+    while z < 512 {
+      let _ = buf_write_byte(sector, z as u32, 0 as u32);
+      z = z + 1;
+    }
+  }
+  let off: i64 = dharafs_crypto_meta_offset_for(block_num);
+  let _ = buf_write_u32_be(sector, off, counter as u32);
+  let _ = buf_write_u32_be(sector, off + 4, 0x44484143 as u32);
+  let i: i64 = 0;
+  while i < 16 {
+    let _ = buf_write_byte(sector, (off + 8 + i) as u32, buf_read_byte(tag, i as u32));
+    i = i + 1;
+  }
+  return dharafs_block_write_raw(sector_num, sector);
 }
 
 // Derives the 32-byte media-encryption key via PBKDF2-HMAC-SHA256 from
@@ -24850,54 +24999,128 @@ fn dharafs_crypto_key_init() -> i64 {
   return 0;
 }
 
-// ChaCha20 is its own inverse (a stream cipher: ciphertext = plaintext
-// XOR keystream, and XOR-ing twice with the same keystream is the
-// identity) -- one function transparently serves both directions.
-fn dharafs_crypto_transform_block(block_num: i64, in_buf: mut ref i64, out_buf: mut ref i64) -> i64 {
-  let _ = dharafs_crypto_derive_nonce(block_num);
-  let key: mut ref i64 = dharafs_crypto_key_ptr();
+// Encrypts one 512-byte block for on-disk storage with ChaCha20-
+// Poly1305 AEAD. Nonce = block_num (4 bytes, BE) || per-block write-
+// counter (4 bytes, BE, read from and re-persisted to the metadata
+// region, incremented on every call) || 4 zero bytes -- unlike the
+// original scheme, the SAME block written twice now gets a DIFFERENT
+// nonce each time (the counter always advances), closing the two-
+// time-pad weakness documented above. AAD = block_num (8 bytes, BE,
+// zero-padded) -- binds the tag to this specific block number, so an
+// attacker can't undetectably move a valid ciphertext+tag pair from
+// one block to another. Persists the new counter and tag to the
+// metadata region as part of this same call; a caller never touches
+// metadata directly.
+fn dharafs_crypto_encrypt_block(block_num: i64, plaintext: mut ref i64, out_ciphertext: mut ref i64) -> i64 {
+  let counter: i64 = dharafs_crypto_meta_read_counter(block_num) + 1;
+
   let nonce: mut ref i64 = dharafs_crypto_nonce_ptr();
+  let _ = buf_write_u32_be(nonce, 0, block_num as u32);
+  let _ = buf_write_u32_be(nonce, 4, counter as u32);
+  let _ = buf_write_u32_be(nonce, 8, 0 as u32);
+
+  let aad: mut ref i64 = dharafs_crypto_aad_scratch_ptr();
+  let _ = buf_write_u32_be(aad, 0, 0 as u32);
+  let _ = buf_write_u32_be(aad, 4, block_num as u32);
+
+  let key: mut ref i64 = dharafs_crypto_key_ptr();
   let state_buf: mut ref i64 = dharafs_crypto_state_ptr();
   let working_buf: mut ref i64 = dharafs_crypto_working_ptr();
   let keystream_buf: mut ref i64 = dharafs_crypto_keystream_ptr();
-  let _ = chacha20_encrypt(key, nonce, 0 as u32, in_buf, 512, state_buf, working_buf, keystream_buf, out_buf);
-  return 0;
+  let block_scratch: mut ref i64 = dharafs_crypto_block_scratch_ptr();
+  let otk_scratch: mut ref i64 = dharafs_crypto_otk_scratch_ptr();
+  let mac_data_scratch: mut ref i64 = dharafs_crypto_mac_data_scratch_ptr();
+  let tag: mut ref i64 = dharafs_crypto_tag_scratch_ptr();
+
+  let _ = chacha20_poly1305_encrypt(key, nonce, aad, 8, plaintext, 512,
+                                     state_buf, working_buf, keystream_buf,
+                                     block_scratch, otk_scratch, mac_data_scratch,
+                                     out_ciphertext, tag);
+
+  return dharafs_crypto_meta_write_entry(block_num, counter, tag);
 }
 
-// The in-memory transform round trip below was, for a long time, the
-// ONLY thing this self-check verified -- no dharafs_block_write, no
-// sdhost_read_block, no real SD access at all. An earlier version DID
-// exercise the real SD path (write via dharafs_block_write, read back
-// via dharafs_block_read) and, in doing so, found a genuine, serious,
-// PRE-EXISTING bug: doing even ONE extra real SD block read or write
-// during boot intermittently (~20-30%) left some later, unrelated
-// state corrupted, surfacing minutes later as a genuine Data Abort
-// deep inside task_e's own background DharaFS compaction. NOT a bug
-// in this feature's own crypto logic (the in-memory transform round
-// trip was always 100% reliable) -- a real, general, timing-dependent
-// hazard in the existing SD/boot-sequencing code, the same "IRQ lands
-// at an unlucky moment" bug class as the task_f runtime-trap
-// investigation. Baking a call that carried a ~20-30% chance of
-// destabilizing EVERY future boot into a permanent self-test would
-// have made the whole system less reliable for every user, not just
-// those who enable media encryption -- so for a long time this self-
-// check verified only the transform, and the real SD-integrated path
-// was checked manually, once, live, rather than on every boot.
+// Decrypts one 512-byte on-disk block. Fails CLOSED: returns -1 (and
+// leaves out_plaintext untouched) on ANY tag mismatch, whether from
+// real corruption or deliberate tampering -- "reject, don't guess,"
+// matching chacha20_poly1305_decrypt's own posture and this
+// codebase's other integrity checks. A write-counter of 0 (no
+// metadata entry, or a garbage/foreign sector) is a deliberate,
+// honest exception, not a failure: it means this block was never
+// AEAD-protected (predates encryption being enabled, or was written
+// while it was off), so there is no tag to check, and the bytes are
+// passed through unchanged as plaintext -- matching dharafs_block_
+// read/write's own pre-existing "encryption off" passthrough for the
+// not-yet-encrypted portion of a disk.
+fn dharafs_crypto_decrypt_block(block_num: i64, ciphertext: mut ref i64, out_plaintext: mut ref i64) -> i64 {
+  let counter: i64 = dharafs_crypto_meta_read_counter(block_num);
+  if counter == 0 {
+    let i: i64 = 0;
+    while i < 512 {
+      let _ = buf_write_byte(out_plaintext, i as u32, buf_read_byte(ciphertext, i as u32));
+      i = i + 1;
+    }
+    return 0;
+  }
+
+  let tag: mut ref i64 = dharafs_crypto_tag_scratch_ptr();
+  let meta_status: i64 = dharafs_crypto_meta_read_tag(block_num, tag);
+  if meta_status != 0 {
+    return 0 - 1;
+  }
+
+  let nonce: mut ref i64 = dharafs_crypto_nonce_ptr();
+  let _ = buf_write_u32_be(nonce, 0, block_num as u32);
+  let _ = buf_write_u32_be(nonce, 4, counter as u32);
+  let _ = buf_write_u32_be(nonce, 8, 0 as u32);
+
+  let aad: mut ref i64 = dharafs_crypto_aad_scratch_ptr();
+  let _ = buf_write_u32_be(aad, 0, 0 as u32);
+  let _ = buf_write_u32_be(aad, 4, block_num as u32);
+
+  let key: mut ref i64 = dharafs_crypto_key_ptr();
+  let state_buf: mut ref i64 = dharafs_crypto_state_ptr();
+  let working_buf: mut ref i64 = dharafs_crypto_working_ptr();
+  let keystream_buf: mut ref i64 = dharafs_crypto_keystream_ptr();
+  let block_scratch: mut ref i64 = dharafs_crypto_block_scratch_ptr();
+  let otk_scratch: mut ref i64 = dharafs_crypto_otk_scratch_ptr();
+  let mac_data_scratch: mut ref i64 = dharafs_crypto_mac_data_scratch_ptr();
+  let computed_tag: mut ref i64 = dharafs_crypto_computed_tag_scratch_ptr();
+
+  return chacha20_poly1305_decrypt(key, nonce, aad, 8, ciphertext, 512, tag,
+                                    state_buf, working_buf, keystream_buf,
+                                    block_scratch, otk_scratch, mac_data_scratch,
+                                    computed_tag, out_plaintext);
+}
+
+// An earlier version of this self-check only exercised the bare
+// transform in memory -- no dharafs_block_write, no sdhost_read_block,
+// no real SD access at all -- because an even earlier attempt to
+// exercise the real SD path found a genuine, serious, PRE-EXISTING
+// bug: doing even ONE extra real SD block read or write during boot
+// intermittently (~20-30%) left some later, unrelated state
+// corrupted, surfacing minutes later as a genuine Data Abort deep
+// inside task_e's own background DharaFS compaction. NOT a bug in
+// this feature's own crypto logic -- a real, general, timing-
+// dependent hazard in the existing SD/boot-sequencing code, the same
+// "IRQ lands at an unlucky moment" bug class as the task_f runtime-
+// trap investigation.
 //
-// ROUND 66 (2026-09-01): the hazard above is fixed (see docs/TODO.md
-// and project memory) -- round 65's task_f fix turned out to fix this
-// SD-corruption bug too, as a side effect, confirmed via 20/20 clean
-// repro boots against the exact trigger that used to fail ~20-30% of
-// the time. Real SD I/O restored below: writes plaintext through
-// dharafs_block_write with encryption temporarily forced on, confirms
-// the RAW on-disk bytes are genuinely ciphertext (not a silent no-op),
-// then reads back through dharafs_block_read (auto-decrypts) and
-// confirms it reproduces the original plaintext -- the actual
-// encrypt-on-write/decrypt-on-read path a real file write exercises,
-// not just the bare transform function in isolation. Crypto-enabled
-// state is saved and restored around this block so a normal boot's
-// OWN encryption setting (off, by default, today) is unaffected once
-// this self-check returns.
+// ROUND 66 (2026-09-01): the hazard above is fixed (round 65's task_f
+// fix turned out to fix this SD-corruption bug too, as a side effect,
+// confirmed via 20/20 clean repro boots), so the real SD path is
+// exercised on every boot below rather than only checked manually.
+//
+// ROUND 69 (2026-09-04): rewritten for the AEAD upgrade -- covers (1)
+// a basic encrypt/decrypt round trip, (2) the two-time-pad fix
+// (writing the SAME block twice now produces two DIFFERENT
+// ciphertexts, because the per-block counter advances), (3) tamper
+// detection (a corrupted on-disk block/tag is REJECTED, not silently
+// "decrypted" into garbage), and (4) the real, backend-integrated SD
+// round trip via dharafs_block_write/dharafs_block_read. Crypto-
+// enabled state is saved and restored around all of this so a normal
+// boot's OWN encryption setting (off, by default, today) is
+// unaffected once this self-check returns.
 fn dharafs_encryption_self_check() -> i64 {
   let ok: i64 = 1;
   let test_block: i64 = 3000;
@@ -24909,21 +25132,62 @@ fn dharafs_encryption_self_check() -> i64 {
   }
 
   let ciphertext: mut ref i64 = dhruva_alloc_bytes(512);
-  let _ = dharafs_crypto_transform_block(test_block, plaintext, ciphertext);
+  let _ = dharafs_crypto_encrypt_block(test_block, plaintext, ciphertext);
   if chacha20_bytes_equal(ciphertext, plaintext, 512) == 1 {
-    // Transform is the identity on this input -- encryption did NOT
-    // actually happen; this would be a real bug, not a pass.
+    // AEAD encrypt is the identity on this input -- encryption did
+    // NOT actually happen; this would be a real bug, not a pass.
     ok = 0;
   }
 
   let decrypted: mut ref i64 = dhruva_alloc_bytes(512);
-  let _ = dharafs_crypto_transform_block(test_block, ciphertext, decrypted);
-  if chacha20_bytes_equal(decrypted, plaintext, 512) == 0 {
+  let decrypt_status: i64 = dharafs_crypto_decrypt_block(test_block, ciphertext, decrypted);
+  if (decrypt_status != 0) || (chacha20_bytes_equal(decrypted, plaintext, 512) == 0) {
     ok = 0;
   }
 
-  let _ = uart_puts("CRYPTO: DharaFS media encryption transform round trip (in-memory: ciphertext != plaintext, decrypt reproduces plaintext)");
+  let _ = uart_puts("CRYPTO: DharaFS AEAD encrypt/decrypt round trip (in-memory: ciphertext != plaintext, decrypt reproduces plaintext)");
   if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+
+  // Two-time-pad fix: encrypt the SAME plaintext into the SAME block
+  // a second time. Under the old scheme (nonce = f(block_num) only)
+  // this would reproduce the exact same ciphertext; the per-block
+  // write-counter now in the nonce must make it differ.
+  let ciphertext2: mut ref i64 = dhruva_alloc_bytes(512);
+  let _ = dharafs_crypto_encrypt_block(test_block, plaintext, ciphertext2);
+  let two_time_pad_fixed: i64 = if chacha20_bytes_equal(ciphertext, ciphertext2, 512) == 0 { 1 } else { 0 };
+  let decrypted2: mut ref i64 = dhruva_alloc_bytes(512);
+  let decrypt2_status: i64 = dharafs_crypto_decrypt_block(test_block, ciphertext2, decrypted2);
+  if (decrypt2_status != 0) || (chacha20_bytes_equal(decrypted2, plaintext, 512) == 0) {
+    two_time_pad_fixed = 0;
+  }
+
+  let _ = uart_puts("CRYPTO: DharaFS two-time-pad fix (same block written twice yields different ciphertext, both still decrypt correctly)");
+  if two_time_pad_fixed == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+
+  // Tamper detection: flip one bit in the ciphertext and confirm
+  // decrypt_block fails CLOSED (-1), never returning corrupted bytes
+  // as if they were trustworthy plaintext.
+  let tampered: mut ref i64 = dhruva_alloc_bytes(512);
+  let t: i64 = 0;
+  while t < 512 {
+    let _ = buf_write_byte(tampered, t as u32, buf_read_byte(ciphertext2, t as u32));
+    t = t + 1;
+  }
+  let _ = buf_write_byte(tampered, 0 as u32, (buf_read_byte(tampered, 0 as u32) ^ (1 as u32)) & (255 as u32));
+  let tampered_out: mut ref i64 = dhruva_alloc_bytes(512);
+  let tamper_status: i64 = dharafs_crypto_decrypt_block(test_block, tampered, tampered_out);
+  let tamper_ok: i64 = if tamper_status != 0 { 1 } else { 0 };
+
+  let _ = uart_puts("CRYPTO: DharaFS tamper detection (corrupted ciphertext is rejected, not silently decrypted)");
+  if tamper_ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
     let _ = uart_puts(" (FAIL)\n");
@@ -24952,9 +25216,27 @@ fn dharafs_encryption_self_check() -> i64 {
     sd_ok = 0;
   }
 
+  // Corrupt the real on-disk block directly (bypassing the crypto
+  // layer, as a real bit-flip or tampering attempt would) and confirm
+  // dharafs_block_read -- the actual path every FS read uses --
+  // fails closed instead of handing back garbage as if it were valid.
+  let on_disk_corrupt: mut ref i64 = dhruva_alloc_bytes(512);
+  let c: i64 = 0;
+  while c < 512 {
+    let _ = buf_write_byte(on_disk_corrupt, c as u32, buf_read_byte(raw_readback, c as u32));
+    c = c + 1;
+  }
+  let _ = buf_write_byte(on_disk_corrupt, 0 as u32, (buf_read_byte(on_disk_corrupt, 0 as u32) ^ (1 as u32)) & (255 as u32));
+  let _ = dharafs_block_write_raw(test_block, on_disk_corrupt);
+  let corrupt_readback: mut ref i64 = dhruva_alloc_bytes(512);
+  let corrupt_read_status: i64 = dharafs_block_read(test_block, corrupt_readback);
+  if corrupt_read_status == 0 {
+    sd_ok = 0;
+  }
+
   let _ = dharafs_crypto_set_enabled(prev_enabled);
 
-  let _ = uart_puts("CRYPTO: DharaFS media encryption real SD round trip (on-disk bytes != plaintext, dharafs_block_read reproduces plaintext)");
+  let _ = uart_puts("CRYPTO: DharaFS media encryption real SD round trip (on-disk bytes != plaintext, decrypt reproduces plaintext, corrupted on-disk block is rejected)");
   if sd_ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {

@@ -99,17 +99,30 @@ choice, it says so explicitly, with a pointer to `TODO.md`.
   scoping note: this shell does not actually echo any typed
   characters today, for any command — checked directly against
   `irq_dispatch`'s code, not assumed.
-- **Media (at-rest) encryption (round 62)**: DharaFS block encryption
-  layered on the existing ChaCha20 cipher, hooked in transparently at
+- **Media (at-rest) encryption (round 62, AEAD upgrade round 69)**:
+  DharaFS block encryption hooked in transparently at
   `dharafs_block_read`/`dharafs_block_write` (every higher FS layer
   keeps operating on plaintext). Key derived once at boot via
-  PBKDF2-HMAC-SHA256; nonce per block derived from the block number.
-  Off by default. Honest limitation: overwriting the same block twice
-  reuses the same keystream (a two-time-pad leak against an attacker
-  with two on-disk snapshots) — real protection against the common
-  "single stolen SD card" threat, not against multi-snapshot analysis.
-  Verified via an in-memory self-test, a host-harness ASAN/UBSAN twin,
-  and a one-time manual live end-to-end run with a real SD image.
+  PBKDF2-HMAC-SHA256. Off by default; toggle live with `crypto
+  on|off|status` (§3), no reboot needed. FIXED (round 69,
+  2026-09-04): now real ChaCha20-Poly1305 AEAD, not a bare stream
+  cipher — every block carries a Poly1305 tag (AAD = block number),
+  and `dharafs_block_read` fails closed on any mismatch instead of
+  returning corrupted bytes as if they were valid. The original
+  two-time-pad weakness (nonce = pure function of block number, so
+  overwriting the same block twice reused the same keystream) is also
+  fixed: a dedicated per-block metadata region (blocks 4000+, clear of
+  the log region) tracks a monotonically increasing write-counter per
+  block, folded into the nonce, so the same block written twice now
+  always produces different ciphertext. Uses dedicated AEAD scratch
+  buffers, separate from TLS 1.3's own, to avoid a reentrancy hazard
+  (DharaFS I/O is reachable from any task and could preempt a
+  `tlsecho` task's own in-progress AEAD computation). Verified via an
+  in-memory AEAD round trip, an explicit two-time-pad-fixed check, an
+  explicit tamper-rejection check, a host-harness ASAN/UBSAN twin of
+  all of the above, and a real SD-image end-to-end run — all on every
+  boot now (`CRYPTO: DharaFS ...` lines), not just a one-time manual
+  check.
 - **A full TLS 1.3 + broader crypto/security suite (round 67, all
   same day, 2026-09-02).** Built out from scratch, each primitive
   verified against a real independent reference (Python + the
@@ -424,6 +437,7 @@ via `-serial stdio`/`-nographic`). Type a command and press Enter.
 | `su` | `su <uid> <gid> [password]` | Switches the active permission context. uid 0 is root (bypasses all permission checks). Unconditional for a uid that has never had a password set (round 61); once `passwd` sets one, it's genuinely required and checked, with 3-strike lockout. |
 | `passwd` | `passwd <uid> <new_password>` | Sets/changes a uid's password (round 61) — root or the uid itself only. Stores a fresh salt + PBKDF2-HMAC-SHA256 output, never the password. Min 8 characters, checked against a small weak-password blocklist. 20,000 PBKDF2 iterations as of round 68 (~13s), up from the original bug-limited 200. |
 | `verify` | `verify <path>` | Verifies `<path>` against a companion `<path>.sig` (a raw 64-byte Ed25519 signature) using a compile-time-pinned public key (round 67) — the "smaller substitute" for secure boot this project's own hardware ceiling rules out (see §1/`TODO.md`). |
+| `crypto` | `crypto on\|off\|status` | Toggles DharaFS media (at-rest) encryption live, no reboot needed (round 69). AEAD (ChaCha20-Poly1305) with real tamper detection and a per-block write-counter closing the original two-time-pad weakness — see `DHARAFS_MANUAL.md` §8. |
 | `diagnose` | `diagnose` | One-shot health report: uptime ticks, scheduler ready count, heap usage (current == high-water mark, since the allocator never frees), CPU frequency + governor history, allocation count, FS commit count, context switch count, IRQ count, `dhruva_prio_lock` call count, mutex contention count + worst-case wait ticks (round 59), and (round 66) up to the last 32 ticks (~16s) of recent history — tick/context-switch/IRQ/prio-lock-count as of each real timer tick, oldest first, for a "what was activity like recently" view alongside the running totals above. |
 | `fault` | `fault alloc\|write\|irqburst\|netdrop <n>` | Fault injection (round 51 + round 62). `alloc <n>`: triggers a real, unrecoverable OOM-fatal halt after the Nth heap allocation — no confirmation, no undo, by design. `write <n>`: the Nth subsequent real SD write fails (a real I/O error, no hardware touched). `irqburst <n>`: the next timer tick jumps the clock forward by n extra ticks (a time-warp, not a real preemption-burst simulation — see `TODO.md`). `netdrop <n>`: the next n outgoing network frames are silently dropped while still reporting success, exercising TCP retransmission on demand. |
 

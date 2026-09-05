@@ -444,15 +444,23 @@ uint32_t dharafs_commit_count_increment(void) { g_commit_count += 1; return g_co
 uint32_t dharafs_commit_count_get(void) { return g_commit_count; }
 
 /* ---- 1e. host_virtual_disk_read/write -- the in-memory "SD card"
- * dharafs_block_read/dharafs_block_write's dev==2 branch calls. Sized
- * to dharafs_init's own max_blk=2048 recovery-scan bound (kernel_main.
- * vani) so an out-of-range block_num is a genuine test bug (caught by
- * the bounds check below, which aborts loudly rather than silently
- * corrupting adjacent memory -- the harness's OWN safety net, not a
- * standin for the real kernel's; the real kernel's own MMIO-backed
- * SDHOST/USB backends have their own hardware-level range limits). */
+ * dharafs_block_read/dharafs_block_write's dev==2 branch calls.
+ * Originally sized to dharafs_init's own max_blk=2048 recovery-scan
+ * bound (kernel_main.vani) so an out-of-range block_num was a genuine
+ * test bug, caught by the bounds check below rather than silently
+ * corrupting adjacent memory. Round 69: DharaFS media encryption's new
+ * per-block AEAD metadata region lives at block 4000+ (one 32-byte
+ * entry per tracked data block, 16 packed per 512-byte sector -- see
+ * dharafs_crypto_meta_sector_for in kernel_main.vani), so this needs
+ * to cover at least 4000 + 2048/16 = 4128 blocks to test the full
+ * 0..2047 data-block range end to end; raised with margin. This bound
+ * remains the harness's OWN safety net, not a standin for the real
+ * kernel's -- the real kernel's own MMIO-backed SDHOST/USB backends
+ * have their own hardware-level range limits (and a real/QEMU SD
+ * image is comfortably larger, see test/phase4_milestone.py's 64MB
+ * image). */
 
-#define HOST_DISK_BLOCKS 2048
+#define HOST_DISK_BLOCKS 4224
 #define HOST_DISK_BLOCK_BYTES 512
 static unsigned char g_virtual_disk[HOST_DISK_BLOCKS * HOST_DISK_BLOCK_BYTES];
 
@@ -582,6 +590,26 @@ int64_t *dharafs_crypto_state_ptr(void) { return (int64_t *)g_dharafs_crypto_sta
 int64_t *dharafs_crypto_working_ptr(void) { return (int64_t *)g_dharafs_crypto_working; }
 int64_t *dharafs_crypto_keystream_ptr(void) { return (int64_t *)g_dharafs_crypto_keystream; }
 int64_t *dharafs_crypto_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_scratch; }
+
+/* Round 69: dedicated scratch for DharaFS's own AEAD + per-block
+ * metadata, matching boot/dharafs_crypto2_state.S's fixed static
+ * buffers (see that file's own header comment for why this is
+ * separate from aead_state/aead_working/etc above). */
+static uint8_t g_dharafs_crypto_block_scratch[16] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_otk_scratch[32] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_mac_data_scratch[576] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_computed_tag_scratch[16] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_tag_scratch[16] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_aad_scratch[8] __attribute__((aligned(8)));
+static uint8_t g_dharafs_crypto_meta_sector_scratch[512] __attribute__((aligned(8)));
+
+int64_t *dharafs_crypto_block_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_block_scratch; }
+int64_t *dharafs_crypto_otk_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_otk_scratch; }
+int64_t *dharafs_crypto_mac_data_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_mac_data_scratch; }
+int64_t *dharafs_crypto_computed_tag_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_computed_tag_scratch; }
+int64_t *dharafs_crypto_tag_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_tag_scratch; }
+int64_t *dharafs_crypto_aad_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_aad_scratch; }
+int64_t *dharafs_crypto_meta_sector_scratch_ptr(void) { return (int64_t *)g_dharafs_crypto_meta_sector_scratch; }
 
 static uint32_t g_fault_write_countdown = 0;
 static uint32_t g_fault_irqburst_countdown = 0;

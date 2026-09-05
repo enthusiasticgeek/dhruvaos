@@ -85,7 +85,8 @@ int64_t fn_hmac_sha256_bytes_equal(int64_t *a, int64_t *b, int64_t n);
 int64_t fn_pbkdf2_hmac_sha256(int64_t *password, int64_t password_len, int64_t *salt, int64_t salt_len, int64_t iterations, int64_t *out);
 int64_t fn_chacha20_encrypt(int64_t *key, int64_t *nonce, uint32_t initial_counter, int64_t *in_buf, int64_t in_len, int64_t *state_buf, int64_t *working_buf, int64_t *keystream_buf, int64_t *out_buf);
 int64_t fn_chacha20_bytes_equal(int64_t *a, int64_t *b, int64_t n);
-int64_t fn_dharafs_crypto_transform_block(int64_t block_num, int64_t *in_buf, int64_t *out_buf);
+int64_t fn_dharafs_crypto_encrypt_block(int64_t block_num, int64_t *plaintext, int64_t *out_ciphertext);
+int64_t fn_dharafs_crypto_decrypt_block(int64_t block_num, int64_t *ciphertext, int64_t *out_plaintext);
 int64_t fn_dharafs_block_read(int64_t block_num, int64_t *buf);
 int64_t fn_dharafs_block_write(int64_t block_num, int64_t *buf);
 uint32_t dharafs_crypto_get_enabled(void);
@@ -1557,19 +1558,20 @@ static void test_hmac_pbkdf2_boundaries(void) {
     CHECK(fn_hmac_sha256_bytes_equal(pout2, pexp2, 32) == 1, "pbkdf2-hmac-sha256: iterations=4096 KAT matches");
 }
 
-/* Media (at-rest) encryption: the in-memory transform (encrypt !=
- * plaintext, decrypt reproduces plaintext) plus the real
+/* Media (at-rest) encryption: the in-memory AEAD encrypt/decrypt round
+ * trip, the two-time-pad fix, tamper detection, plus the real
  * dharafs_block_write/dharafs_block_read integration against the
  * host-harness's own in-memory "SD card" (host_virtual_disk_*,
  * block_dev==2 by default here) -- a safe, deterministic place to get
  * real ASAN/UBSAN coverage of the SAME encrypt-then-store/fetch-then-
  * decrypt path kernel_main.vani's own on-target self-check
- * deliberately does NOT exercise on every boot (see its own comment:
- * doing real SD I/O at boot was found, live, to intermittently
- * corrupt unrelated state minutes later -- a separate, pre-existing
- * bug, not a flaw in this transform). No such hazard exists in this
- * host process (no IRQs, no real SD controller), so this is the right
- * place to verify the real integration continuously. */
+ * deliberately does NOT exercise the real-SD variant of on every boot
+ * (see its own comment: doing real SD I/O at boot was found, live, to
+ * intermittently corrupt unrelated state minutes later -- a separate,
+ * pre-existing bug, not a flaw in this crypto, and since fixed). No
+ * such hazard exists in this host process (no IRQs, no real SD
+ * controller), so this is the right place to verify the real
+ * integration continuously. */
 static void test_media_crypto(void) {
     int64_t *key = dharafs_crypto_key_ptr();
     for (int i = 0; i < 32; i++) buf_write_byte(key, (uint32_t)i, (uint32_t)(i * 3 + 1));
@@ -1578,26 +1580,48 @@ static void test_media_crypto(void) {
     for (int i = 0; i < 512; i++) buf_write_byte(plaintext, (uint32_t)i, (uint32_t)((i * 7 + 11) & 255));
 
     int64_t *ciphertext = dhruva_alloc_bytes(512);
-    fn_dharafs_crypto_transform_block(42, plaintext, ciphertext);
+    fn_dharafs_crypto_encrypt_block(42, plaintext, ciphertext);
     CHECK(fn_chacha20_bytes_equal(ciphertext, plaintext, 512) == 0,
-          "media-crypto: transform is not the identity (real encryption happened)");
+          "media-crypto: AEAD encrypt is not the identity (real encryption happened)");
 
     int64_t *decrypted = dhruva_alloc_bytes(512);
-    fn_dharafs_crypto_transform_block(42, ciphertext, decrypted);
+    int64_t dec1 = fn_dharafs_crypto_decrypt_block(42, ciphertext, decrypted);
+    CHECK(dec1 == 0, "media-crypto: AEAD decrypt of an untampered block succeeds");
     CHECK(fn_chacha20_bytes_equal(decrypted, plaintext, 512) == 1,
-          "media-crypto: in-memory transform round trip reproduces plaintext");
+          "media-crypto: in-memory AEAD round trip reproduces plaintext");
 
     /* Different block_num must derive a different nonce -- encrypting
      * the SAME plaintext at a different block must not produce the
      * same ciphertext (the whole point of a per-block nonce). */
     int64_t *ciphertext_other_block = dhruva_alloc_bytes(512);
-    fn_dharafs_crypto_transform_block(43, plaintext, ciphertext_other_block);
+    fn_dharafs_crypto_encrypt_block(43, plaintext, ciphertext_other_block);
     CHECK(fn_chacha20_bytes_equal(ciphertext, ciphertext_other_block, 512) == 0,
           "media-crypto: different block_num produces different ciphertext (per-block nonce)");
 
+    /* Two-time-pad fix: re-encrypting the SAME block a second time
+     * must NOT reproduce the same ciphertext -- the per-block write
+     * counter in the nonce must advance. */
+    int64_t *ciphertext_rewrite = dhruva_alloc_bytes(512);
+    fn_dharafs_crypto_encrypt_block(42, plaintext, ciphertext_rewrite);
+    CHECK(fn_chacha20_bytes_equal(ciphertext, ciphertext_rewrite, 512) == 0,
+          "media-crypto: re-encrypting the same block yields different ciphertext (two-time-pad fixed)");
+    int64_t *decrypted_rewrite = dhruva_alloc_bytes(512);
+    int64_t dec2 = fn_dharafs_crypto_decrypt_block(42, ciphertext_rewrite, decrypted_rewrite);
+    CHECK(dec2 == 0 && fn_chacha20_bytes_equal(decrypted_rewrite, plaintext, 512) == 1,
+          "media-crypto: the re-encrypted block still decrypts correctly");
+
+    /* Tamper detection: a single flipped bit in the ciphertext must
+     * be rejected, not silently decrypted into garbage. */
+    int64_t *tampered = dhruva_alloc_bytes(512);
+    for (int i = 0; i < 512; i++) buf_write_byte(tampered, (uint32_t)i, buf_read_byte(ciphertext_rewrite, (uint32_t)i));
+    buf_write_byte(tampered, 0, buf_read_byte(tampered, 0) ^ 1);
+    int64_t *tampered_out = dhruva_alloc_bytes(512);
+    int64_t tamper_status = fn_dharafs_crypto_decrypt_block(42, tampered, tampered_out);
+    CHECK(tamper_status != 0, "media-crypto: tampered ciphertext is rejected (fails closed)");
+
     /* Real dharafs_block_write/dharafs_block_read integration against
      * the host virtual disk -- proves the actual feature (not just
-     * the transform in isolation) works end-to-end. */
+     * the AEAD functions in isolation) works end-to-end. */
     dharafs_crypto_set_enabled(1);
     int64_t wr = fn_dharafs_block_write(100, plaintext);
     CHECK(wr == 0, "media-crypto: dharafs_block_write with encryption enabled succeeds");
@@ -1612,6 +1636,17 @@ static void test_media_crypto(void) {
     CHECK(rd == 0, "media-crypto: dharafs_block_read with encryption enabled succeeds");
     CHECK(fn_chacha20_bytes_equal(readback, plaintext, 512) == 1,
           "media-crypto: dharafs_block_read decrypts back to the original plaintext");
+
+    /* Corrupt the real on-disk block directly and confirm the actual
+     * dharafs_block_read path -- not just decrypt_block in isolation
+     * -- fails closed instead of returning corrupted "plaintext". */
+    int64_t *raw_corrupt = dhruva_alloc_bytes(512);
+    for (int i = 0; i < 512; i++) buf_write_byte(raw_corrupt, (uint32_t)i, buf_read_byte(raw, (uint32_t)i));
+    buf_write_byte(raw_corrupt, 0, buf_read_byte(raw_corrupt, 0) ^ 1);
+    host_virtual_disk_write(100, raw_corrupt);
+    int64_t *corrupt_readback = dhruva_alloc_bytes(512);
+    int64_t corrupt_rd = fn_dharafs_block_read(100, corrupt_readback);
+    CHECK(corrupt_rd != 0, "media-crypto: dharafs_block_read rejects a corrupted on-disk block");
     dharafs_crypto_set_enabled(0);
 
     /* Encryption OFF (the default) must be a byte-for-byte passthrough
