@@ -28,6 +28,12 @@
  * print -- the first real interrupt-driven code on this port. MMU and
  * the vani kernel port remain not-yet-started; see docs/TODO.md's own
  * "Remaining scope for a real Pi 4 boot" list.
+ *
+ * ROUND 73 UPDATE: ARMv8-A MMU bring-up (boot/rpi4/mmu_init.S) added
+ * below, right after this file's own new .bss-clear loop and before
+ * kmain_rpi4 -- see that file's own header comment for the full
+ * identity-map + permission design. The vani kernel port remains
+ * not-yet-started.
  */
 
 .section ".text.boot"
@@ -103,6 +109,30 @@ el1_entry:
     ldr x0, =_stack_top
     mov sp, x0
 
+    /* Round 73: clear .bss before anything relies on it being zeroed
+     * -- boot/rpi4/mmu_init.S's three page tables (16KB total) now
+     * live in .bss, and their "invalid, fault on any access" encoding
+     * for every unfilled entry IS the zero value, exactly the same
+     * dependency boot/rpi1/boot.S's own clear_bss has on boot/
+     * mmu_init.S's ARMv6 table. QEMU's own RAM happens to start
+     * zeroed, which is why current_el_scratch/irq_tick_count (this
+     * port's only .bss users before this round) never surfaced this
+     * gap -- but relying on that implicitly, now that a real page
+     * table's correctness depends on it, is exactly the kind of
+     * assumption this project's own audits keep finding broken
+     * elsewhere. Must run BEFORE mmu_init_rpi4 below, or the zero
+     * fill would wipe out every descriptor it just wrote. */
+    ldr x0, =__bss_start
+    ldr x1, =__bss_end
+clear_bss_rpi4:
+    cmp x0, x1
+    b.ge clear_bss_rpi4_done
+    str xzr, [x0], #8
+    b clear_bss_rpi4
+clear_bss_rpi4_done:
+
+    bl mmu_init_rpi4
+
     bl kmain_rpi4
 
     /* Round 70: GIC + generic-timer bring-up (boot/rpi4/gic_timer.S) --
@@ -137,7 +167,12 @@ kmain_rpi4:
     mrs x2, CurrentEL
     lsr x2, x2, #2
     add x2, x2, #'0'
-    adr x0, current_el_scratch
+    /* adrp+add, not adr -- round 73's new 2MB ALIGN before .data (see
+     * link.ld's own comment) pushed .bss more than adr's +-1MB range
+     * away from .text.boot; adrp's page-relative +-4GB range still
+     * reaches it. */
+    adrp x0, current_el_scratch
+    add x0, x0, :lo12:current_el_scratch
     strb w2, [x0]
     bl uart_puts_rpi4_el
 
@@ -182,7 +217,8 @@ uart_puts_rpi4:
 .global uart_puts_rpi4_el
 uart_puts_rpi4_el:
     stp x29, x30, [sp, #-16]!
-    adr x1, current_el_scratch
+    adrp x1, current_el_scratch     /* adrp+add, see kmain_rpi4's own comment above */
+    add x1, x1, :lo12:current_el_scratch
     bl uart_puts_rpi4
     adr x1, newline_msg
     bl uart_puts_rpi4

@@ -41,10 +41,13 @@ mkdir -p "${BUILD_DIR}"
 "${CC}" -c -mgeneral-regs-only -ffreestanding \
   "${ROOT}/boot/rpi4/gic_timer.S" -o "${BUILD_DIR}/rpi4_gic_timer.o"
 
+"${CC}" -c -mgeneral-regs-only -ffreestanding \
+  "${ROOT}/boot/rpi4/mmu_init.S" -o "${BUILD_DIR}/rpi4_mmu_init.o"
+
 "${CC}" -nostdlib -ffreestanding -static \
   -Wl,-T,"${ROOT}/boot/rpi4/link.ld" \
   "${BUILD_DIR}/rpi4_boot.o" "${BUILD_DIR}/rpi4_vectors.o" \
-  "${BUILD_DIR}/rpi4_gic_timer.o" \
+  "${BUILD_DIR}/rpi4_gic_timer.o" "${BUILD_DIR}/rpi4_mmu_init.o" \
   -o "${BUILD_DIR}/dhruva_rpi4.elf"
 
 echo "Built ${BUILD_DIR}/dhruva_rpi4.elf"

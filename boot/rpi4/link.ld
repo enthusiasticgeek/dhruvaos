@@ -28,7 +28,17 @@ SECTIONS
     .text : { *(.text*) }
     .rodata : { *(.rodata*) }
 
-    . = ALIGN(16);
+    /* Round 73: 2MB ALIGN, not just 16 -- boot/rpi4/mmu_init.S's
+     * identity map uses 2MB block descriptors (this format's finest
+     * granularity without a 3rd-level 4KB-page table this kernel
+     * doesn't need yet), and gives the .text.boot/.vectors/.text/
+     * .rodata block above read+execute-never-write permissions while
+     * everything from here on is read+write-never-execute. Without
+     * this, .data could land in the SAME 2MB block as code, forcing
+     * one permission set on both -- exactly the problem boot/
+     * mmu_init.S's own 1MB ALIGN before .data already solves for the
+     * ARMv6 target, just at this format's 2MB granularity instead. */
+    . = ALIGN(0x200000);
     .data : { *(.data*) }
 
     . = ALIGN(16);

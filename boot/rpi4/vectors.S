@@ -202,7 +202,10 @@ aarch64_irq_handler:
     cmp w19, #IRQ_TIMER_INTID
     b.ne irq_eoi                  /* not our timer: EOI it and move on */
 
-    adr x0, irq_tick_count
+    /* adrp+add, not adr -- see boot/rpi4/boot.S's own comment on why
+     * round 73's 2MB pre-.data ALIGN pushed .bss out of adr's range. */
+    adrp x0, irq_tick_count
+    add x0, x0, :lo12:irq_tick_count
     ldr w2, [x0]
     add w2, w2, #1
     str w2, [x0]

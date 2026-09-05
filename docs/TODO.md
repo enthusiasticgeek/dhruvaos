@@ -2783,8 +2783,53 @@ section.
 Remaining scope for a real Pi 4 boot, now precisely identified rather
 than assumed:
 
-- ARMv8-A MMU (TTBR0_EL1/TCR_EL1, radically different from ARMv6's
-  short-descriptor 1MB sections used in `boot/mmu_init.S`).
+- ~~ARMv8-A MMU (TTBR0_EL1/TCR_EL1, radically different from ARMv6's
+  short-descriptor 1MB sections used in `boot/mmu_init.S`).~~
+  **`[DONE, round 73, 2026-09-05]`** — `boot/rpi4/mmu_init.S`: a
+  3-level (L1/L2, 4KB-granule) identity map, pure block descriptors
+  (no L3 4KB pages needed), covering the low 4GB: PA 0x00000000-
+  0x3FFFFFFF and 0x40000000-0x7FFFFFFF as this machine's real 2GB of
+  RAM (confirmed live via QMP's `query-memory-size-summary`, not
+  assumed), 0xC0000000-0xFFFFFFFF as Device-nGnRnE (covers the PL011
+  UART and GICv2 with wide margin), and PA 0x80000000-0xBFFFFFFF left
+  genuinely unmapped/faulting (neither RAM nor a used peripheral).
+  Same W^X split round 38 established for the Pi 1 target — the one
+  2MB block holding all of `.text.boot`/`.vectors`/`.text`/`.rodata`
+  is read+execute, never write; everything else is read+write, never
+  execute — via a new 2MB `ALIGN` before `.data` in `link.ld` (this
+  format's finer 2MB block granularity standing in for the ARMv6
+  side's 1MB sections). Carries forward that file's own deliberate
+  cache-off design (`SCTLR_EL1.C`/`.I` left clear) unchanged.
+
+  Found and fixed two real, small bugs building this: (1) `boot/
+  rpi4/boot.S` had never actually cleared `.bss` before this round
+  (QEMU's own RAM happening to start zeroed had silently papered
+  over it for the two tiny `.bss` users that existed before this
+  round's 16KB of page tables) — added a real clear loop, run before
+  `mmu_init_rpi4`, matching `boot/rpi1/boot.S`'s own established
+  ordering; (2) the new 2MB pre-`.data` alignment pushed `.bss` more
+  than 1MB from `.text.boot`, breaking the three existing `adr`
+  instructions targeting it (`R_AARCH64_ADR_PREL_LO21` relocation
+  truncated) — switched those to `adrp`+`add :lo12:`.
+
+  Live-verified both halves of W^X, not just "didn't crash": a
+  temporary (not committed) deliberate write to `_start` faulted
+  with `ESR_EL1=0x9600004E` (EC=0x25 Data Abort same-EL, DFSC=0x0E
+  permission fault level 2, WnR=1) and `FAR_EL1` exactly matching
+  `_start`'s address; a second temporary probe writing a real NOP
+  encoding into a `.bss` scratch word and branching to it faulted
+  with `ESR_EL1=0x8600000E` (EC=0x21 Instruction Abort same-EL,
+  IFSC=0x0E permission fault level 2) at exactly the scratch address
+  — proving PXN/UXN blocks the fetch itself, not merely that
+  execution eventually hits an unrelated undefined instruction.
+  Notably, THIS target's real ARMv8-A (Cortex-A72) QEMU model
+  genuinely enforces execute-never, unlike the confirmed QEMU/
+  ARM1176 emulation gap on the Pi 1 side (`boot/mmu_init.S`'s own
+  "KNOWN LIMITATION" section) — a real, useful contrast, not assumed
+  symmetric between the two targets. `test/rpi4_boot_smoke.py` and
+  `test/rpi4_timer_smoke.py` both still pass unmodified with the MMU
+  live, confirming no regression to the existing EL-drop/UART/GIC/
+  timer/IRQ chain.
 - Porting `kernel_main.vani` itself (or a fresh AArch64-native rewrite
   of its boot-facing pieces) to this target — round 43's/70's kernel
   is deliberately hand-written assembly only, no vani-compiled code
