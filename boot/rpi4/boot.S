@@ -17,11 +17,17 @@
  * correct, nothing more. No MMU, no vani-compiled kernel code yet (a
  * real vani kernel_main.vani port to AArch64 needs its own dedicated
  * round -- this round is the prerequisite that makes that possible at
- * all), no GIC, no timer. Every claim below about *why* a register
- * write matters is verified live in round 43's own build+boot test
+ * all). Every claim below about *why* a register write matters is
+ * verified live in round 43's own build+boot test
  * (test/rpi4_boot_smoke.py), not merely asserted from documentation --
  * matching this project's own established discipline (see round 38's
  * MMU work and round 40's own spike for the precedent).
+ *
+ * ROUND 70 UPDATE: GIC + generic-timer bring-up (boot/rpi4/
+ * gic_timer.S) added below, after kmain_rpi4's own one-shot boot
+ * print -- the first real interrupt-driven code on this port. MMU and
+ * the vani kernel port remain not-yet-started; see docs/TODO.md's own
+ * "Remaining scope for a real Pi 4 boot" list.
  */
 
 .section ".text.boot"
@@ -99,9 +105,19 @@ el1_entry:
 
     bl kmain_rpi4
 
-done:
-    wfe
-    b done
+    /* Round 70: GIC + generic-timer bring-up (boot/rpi4/gic_timer.S) --
+     * the first real interrupt-driven code on this port. Enable the
+     * distributor/CPU-interface/timer-PPI and arm the first tick
+     * BEFORE unmasking IRQ at the PSTATE level, so there's no window
+     * where an already-pending, not-yet-unmasked interrupt could fire
+     * against half-initialized GIC state. */
+    bl gic_timer_init
+    msr daifclr, #2         /* unmask IRQ only; FIQ/SError/Debug stay masked */
+    isb
+
+heartbeat_loop:
+    wfi
+    b heartbeat_loop
 
 /* Round 43 v1 "kernel": prove the boot+EL-drop+vector-install chain
  * is genuinely correct by printing a real message and the actual

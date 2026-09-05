@@ -2416,19 +2416,56 @@ development (`uart_puts_rpi4_el` clobbered its own return address via
 two un-saved nested calls) — fixed before the round closed. Full
 details: `docs/PORTING.md`'s "Round 43" section.
 
+**Round 70 (2026-09-04): GICv2 + ARM generic timer — DONE.** New
+`boot/rpi4/gic_timer.S` (`gic_timer_init`/`_rearm`/`_disable`) plus a
+real `aarch64_irq_handler` in `boot/rpi4/vectors.S`, replacing the
+"Current EL, SPx, IRQ" vector's old diagnostic-only dead end with the
+first genuinely interrupt-driven code on this port. GICD/GICC base
+addresses (`0xFF841000`/`0xFF842000`) derived by reading QEMU's own
+`hw/arm/bcm2838.c` device model source, not guessed from a datasheet
+— same discipline round 40's own PL011-address spike established;
+these also happen to match real BCM2711 hardware's documented GIC-400
+addresses. The timer targeted is the standard ARMv8-A architected
+generic timer (not a BCM-specific peripheral), wired by `bcm2838.c` to
+GIC PPI 14 = architected INTID 30; `CNTFRQ_EL0` is read live rather
+than assumed (measured ~62.5MHz under this QEMU machine, not the
+1GHz default QEMU uses absent a board override — confirms why "read
+it live" was the right call). Live-verified via a new
+`test/rpi4_timer_smoke.py`: a bounded 5-tick heartbeat, each tick a
+real GIC-acknowledged-and-EOI'd interrupt, reproduced consistently
+across repeated runs, with round 43's own `rpi4_boot_smoke.py`
+confirmed still green (no regression).
+
+Caught two real issues before/during verification, not glossed over:
+(1) `uart_put_hex64_rpi4` used three AAPCS64 callee-saved registers as
+unsaved scratch — harmless while every prior caller immediately
+halted afterward, unsafe for a handler that must resume the
+interrupted context correctly; fixed by properly saving/restoring
+them, the same register-clobber bug class this project has hit before
+on the ARM32 side, this time on AArch64. (2) an apparent 4th-to-5th
+tick "double-fire" (both prints arriving within ~1ms after three
+clean ~500ms gaps) was investigated with a temporary debug build
+printing the raw hardware counter (`CNTPCT_EL0`) rather than trusted
+or dismissed on sight — the counter deltas were consistently correct
+across every tick pair, confirming this was a QEMU stdio/pty
+output-buffering artifact right before the final halt message
+flushed, not a real firmware timing bug. `aarch64_irq_handler` itself
+saves/restores all 31 general-purpose registers around its body
+(not just the ones it uses), since an interrupt can land anywhere,
+including mid-sequence in code holding a live value in any
+callee-saved register. Full details: `docs/PORTING.md`'s "Round 70"
+section.
+
 Remaining scope for a real Pi 4 boot, now precisely identified rather
 than assumed:
 
 - ARMv8-A MMU (TTBR0_EL1/TCR_EL1, radically different from ARMv6's
   short-descriptor 1MB sections used in `boot/mmu_init.S`).
-- GICv2/GICv3 interrupt controller (replaces BCM2835's simple
-  interrupt controller — `timer_ic_init` and everything built on it).
-- BCM2711 generic ARM timer at new peripheral addresses (same timer
-  core the scheduler already assumes, different base).
 - Porting `kernel_main.vani` itself (or a fresh AArch64-native rewrite
-  of its boot-facing pieces) to this target — round 43's kernel is
-  deliberately hand-written assembly only, no vani-compiled code yet.
-- Only after all of the above: EMMC2 (storage) and XHCI (USB) drivers
+  of its boot-facing pieces) to this target — round 43's/70's kernel
+  is deliberately hand-written assembly only, no vani-compiled code
+  yet.
+- Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
 
@@ -2966,11 +3003,12 @@ networking is loopback-only with zero real NIC/wireless hardware
 support of any kind.
 
 - **DhruvaOS user manual** (`docs/DHRUVAOS_MANUAL.md`) — `[M, ~1-2
-  rounds — WRITTEN (438 lines, Sep 2), header status tag was stale
-  (caught round 68, 2026-09-04); needs an update pass for round 67's
-  later same-day crypto batch (AES/TLS/PKI/PQC/media encryption) and
-  round 68 (scheduler fix, stack canary, PBKDF2 iteration count), see
-  that round's own tracking]`
+  rounds — WRITTEN (536 lines as of round 69, 2026-09-04); update
+  passes done for round 67's later same-day crypto batch (AES/TLS/
+  PKI/PQC/media encryption), round 68 (scheduler fix, stack canary,
+  PBKDF2 iteration count), and round 69 (crypto command, AEAD/tamper-
+  detection/two-time-pad fix) -- kept current alongside the code each
+  round, not left to drift]`
   Boot process, the scheduler/task model (including its current
   6-task-fixed limitation, stated plainly rather than glossed over),
   the interactive shell and all ~20 commands, the heap allocator's
@@ -2981,9 +3019,10 @@ support of any kind.
   once that API lands rather than documenting something aspirational.
 
 - **DharaFS user manual** (`docs/DHARAFS_MANUAL.md`) — `[M, ~1 round —
-  WRITTEN (264 lines, Sep 2), header status tag was stale (caught
-  round 68, 2026-09-04); check needed for round 67's snapshots/
-  hashed-directory-index/priority-queue coverage]`
+  WRITTEN (398 lines as of round 69, 2026-09-04); covers round 67's
+  snapshots/hashed-directory-index/priority-queue additions and round
+  69's AEAD/tamper-detection/two-time-pad media-encryption upgrade --
+  kept current alongside the code each round, not left to drift]`
   On-disk record format, the permission model (owner/group/other +
   immutable/append-only/system attributes), rename+transaction
   semantics, verified I/O (`writev`/`catv`), the append-only log API,

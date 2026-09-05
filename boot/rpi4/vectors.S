@@ -55,8 +55,11 @@ vector_table:
     mov x0, #4
     b aarch64_fault_common
 .align 7
-    mov x0, #5
-    b aarch64_fault_common
+    /* Round 70: this is now a REAL interrupt vector, not a diagnostic
+     * dead end -- see aarch64_irq_handler below. Every OTHER vector in
+     * this table still deliberately goes to aarch64_fault_common
+     * (halt + report), since nothing else is expected to fire yet. */
+    b aarch64_irq_handler
 .align 7
     mov x0, #6
     b aarch64_fault_common
@@ -133,12 +136,140 @@ fault_halt:
     wfe
     b fault_halt
 
+.equ IRQ_GICC_BASE, 0xFF842000
+.equ IRQ_GICC_IAR, 0x00C
+.equ IRQ_GICC_EOIR, 0x010
+.equ IRQ_TIMER_INTID, 30
+.equ IRQ_SPURIOUS_INTID, 1023
+.equ IRQ_HALT_AFTER_TICKS, 5
+
+/* Round 70: the real IRQ handler boot/rpi4/gic_timer.S's timer
+ * targets. UNLIKE aarch64_fault_common (which halts and never
+ * returns), this handler RESUMES the interrupted context via `eret`
+ * -- so it saves and restores ALL 31 general-purpose registers
+ * up front, not just the handful it happens to use itself. An
+ * interrupt can land anywhere, including mid-sequence in code
+ * holding a live value in a callee-saved register across many
+ * instructions; only a full save makes it safe to freely use any
+ * register (and to call other functions) inside this handler without
+ * auditing every one of them against whatever the interrupted code
+ * might have been doing. ELR_EL1/SPSR_EL1 themselves are left alone
+ * (never written here), so `eret` naturally resumes at the correct
+ * PC with the correct PSTATE -- unlike x0-x30, hardware already
+ * banked those automatically on exception entry.
+ *
+ * Verification note: the first live run of this handler showed the
+ * 4th and 5th printed "tick=" lines apparently arriving within ~1ms
+ * of each other, wall-clock, after ticks 1-3 had each shown a clean
+ * ~500ms gap -- looked exactly like a double-fire bug right before
+ * halting. Investigated properly rather than dismissed OR trusted
+ * blindly: a temporary debug build printed CNTPCT_EL0 (the raw
+ * hardware counter) at every tick, and the counter DELTA between
+ * every consecutive pair -- including 4th-to-5th -- was consistently
+ * ~31.25M ticks apart, matching CNTFRQ_EL0/2 exactly. The apparent
+ * "instant" 5th print was a QEMU stdio/pty output-buffering artifact
+ * right before the final halt message flushed, not a real firmware
+ * timing bug. Confirming against the actual hardware counter, not
+ * just wall-clock print arrival time, is what actually settled this.
+ */
+.global aarch64_irq_handler
+aarch64_irq_handler:
+    sub sp, sp, #256
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]
+
+    ldr x0, =IRQ_GICC_BASE
+    ldr w1, [x0, #IRQ_GICC_IAR]
+    and w19, w1, #0x3FF          /* INTID is bits[9:0] of GICC_IAR */
+
+    cmp w19, #IRQ_SPURIOUS_INTID
+    b.eq irq_restore              /* spurious: no EOI, nothing to do */
+
+    cmp w19, #IRQ_TIMER_INTID
+    b.ne irq_eoi                  /* not our timer: EOI it and move on */
+
+    adr x0, irq_tick_count
+    ldr w2, [x0]
+    add w2, w2, #1
+    str w2, [x0]
+
+    adr x1, irq_timer_msg
+    bl uart_puts_rpi4
+    mov x0, x2
+    bl uart_put_hex64_rpi4
+
+    cmp w2, #IRQ_HALT_AFTER_TICKS
+    b.lt irq_rearm
+
+    bl gic_timer_disable
+    adr x1, irq_halt_msg
+    bl uart_puts_rpi4
+    b irq_eoi
+
+irq_rearm:
+    bl gic_timer_rearm
+
+irq_eoi:
+    ldr x0, =IRQ_GICC_BASE
+    str w19, [x0, #IRQ_GICC_EOIR]
+
+irq_restore:
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    add sp, sp, #256
+    eret
+
 /* x0 = value to print as 16 hex digits, most-significant nibble
  * first -- the AArch64 twin of boot/rpi1's own uart_put_hex32, sized
- * for a 64-bit register instead of a 32-bit one. */
+ * for a 64-bit register instead of a 32-bit one.
+ *
+ * BUG (round 70 audit): x23/x24/x25 are AAPCS64 CALLEE-SAVED registers
+ * (x19-x28), used here as scratch with no save/restore. Harmless as
+ * long as every caller immediately halted afterward (aarch64_fault_
+ * common's own diagnostic path, kmain_rpi4's one-shot boot print) --
+ * but round 70's real, RESUMING IRQ handler (aarch64_irq_handler,
+ * below) needs to call this from the middle of live execution it
+ * must return to correctly, where a caller's own live x23-x25 values
+ * would otherwise be silently corrupted. Found and fixed before ever
+ * wiring that call in, not discovered live -- the same AAPCS
+ * callee-saved-register-clobber bug CLASS this project has already
+ * hit more than once on the ARM32 side (a hand-written asm function
+ * using a callee-saved register as unsaved scratch), just on the
+ * AArch64 side and a different specific register set this time. */
 .global uart_put_hex64_rpi4
 uart_put_hex64_rpi4:
-    stp x29, x30, [sp, #-16]!
+    sub sp, sp, #48
+    stp x29, x30, [sp, #0]
+    stp x23, x24, [sp, #16]
+    str x25, [sp, #32]
     mov x23, x0
     mov x24, #60
     ldr x25, =0xFE201000
@@ -158,7 +289,10 @@ poll_tx:
     strb w0, [x25]
     subs x24, x24, #4
     b.ge 1b
-    ldp x29, x30, [sp], #16
+    ldr x25, [sp, #32]
+    ldp x23, x24, [sp, #16]
+    ldp x29, x30, [sp, #0]
+    add sp, sp, #48
     ret
 
 .section ".rodata"
@@ -170,4 +304,14 @@ fault_msg_elr:
     .asciz " ELR_EL1="
 fault_msg_far:
     .asciz " FAR_EL1="
+irq_timer_msg:
+    .asciz "\nDHRUVA RPI4: real timer IRQ handled, tick="
+irq_halt_msg:
+    .asciz "\nDHRUVA RPI4: 5 real timer IRQs handled, halting\n"
+.align 4
+
+.section ".bss"
+.align 4
+irq_tick_count:
+    .word 0
 .align 4

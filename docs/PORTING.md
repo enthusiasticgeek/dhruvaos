@@ -187,6 +187,69 @@ their Pi 1 SDHOST/DWC2 counterparts, and — the largest remaining
 unknown — porting `kernel_main.vani` itself (or a fresh AArch64-native
 rewrite of its boot-facing pieces) to this target at all.
 
+### Round 70: GICv2 + ARM generic timer, first real interrupt-driven code
+
+New `boot/rpi4/gic_timer.S` (`gic_timer_init`/`_rearm`/`_disable`) plus
+a real `aarch64_irq_handler` added to `boot/rpi4/vectors.S`, replacing
+the "Current EL, SPx, IRQ" vector's old diagnostic-only dead end.
+
+**GICD_BASE (`0xFF841000`)/GICC_BASE (`0xFF842000`) are not guessed
+from a datasheet** — derived by reading QEMU 10.0.0's own
+`hw/arm/bcm2838.c` (the device model `-M raspi4b` actually
+instantiates): `ctrl_base` (`0xff800000`) + `BCM2838_GIC_BASE`
+(`0x40000`) + the distributor/CPU-interface offsets (`0x1000`/`0x2000`).
+These happen to match real BCM2711 hardware's own documented GIC-400
+addresses too (Linux's `bcm2711.dtsi`), consistent with round 40's own
+finding that this machine mirrors real hardware's peripheral map
+rather than using placeholder addresses the way QEMU's generic `virt`
+board does. Also confirmed from that same source: `bcm2838.c` never
+sets the GIC's `has-security-extensions` property (default false), so
+it runs in a single security state — `GICD_CTLR`/`GICC_CTLR` bit 0 is
+a plain enable, no secure/non-secure register-view split to handle.
+
+The timer itself is **not** a BCM-specific peripheral the way Pi 1's
+System Timer is — it's the standard ARMv8-A architected generic timer
+(`CNTP_TVAL_EL0`/`CNTP_CTL_EL0`/`CNTFRQ_EL0`), identical on every real
+ARMv8 core. `bcm2838.c` wires the CPU's Non-secure EL1 physical timer
+output to GIC PPI 14 → architected INTID 30 (PPI/SGI INTIDs = 16 +
+PPI number) — `aarch64_irq_handler` checks for exactly that INTID, not
+a hardcoded guess. `CNTFRQ_EL0` is read live at init time rather than
+assumed (measured live under this QEMU machine at ~62.5MHz, not the
+1GHz default QEMU's own `target/arm/cpu.c` uses absent a board-specific
+override — exactly the kind of thing that would have been a silent
+wrong-cadence bug had it been hardcoded from generic ARMv8 documentation
+instead of read from the actual register).
+
+Live-verified: a bounded 5-tick heartbeat (`test/rpi4_timer_smoke.py`)
+prints one line per real, GIC-delivered, EOI'd timer interrupt, then
+disables the timer and halts cleanly — reproduced consistently across
+repeated runs. A genuine investigation, not a hand-wave, went into one
+surprising observation along the way: the 4th and 5th ticks initially
+*looked* like they fired within ~1ms of each other (after three clean
+~500ms gaps), which would have meant a real double-fire bug right
+before halting. A temporary debug build printed the raw hardware
+counter (`CNTPCT_EL0`) at every tick instead of trusting wall-clock
+print-arrival timing, and the counter deltas — including 4th-to-5th —
+were all consistently ~31.25M ticks apart (matching `CNTFRQ_EL0`/2
+exactly); the apparent instant reprint was a QEMU stdio/pty
+output-buffering artifact right before the final halt message
+flushed, not a firmware bug. Also caught and fixed, before ever
+wiring the new call path in (not discovered live): `uart_put_hex64_rpi4`
+used three AAPCS64 callee-saved registers (`x23`-`x25`) as unsaved
+scratch — harmless while every caller immediately halted afterward,
+but unsafe for round 70's own handler, which must resume the
+interrupted context correctly. `aarch64_irq_handler` itself saves and
+restores all 31 general-purpose registers around its body (not just
+the ones it uses) precisely because an interrupt can land anywhere,
+including mid-sequence in code holding a live value in any
+callee-saved register.
+
+Remaining scope, updated: ARMv8-A MMU and porting `kernel_main.vani`
+itself (or a fresh AArch64-native rewrite of its boot-facing pieces)
+are the two largest pieces left before EMMC2/XHCI can even be
+considered; see `docs/TODO.md`'s own Pi 4/5 port entry for the
+up-to-date list.
+
 QEMU's `raspi1ap` machine model remains Pi-1-only; there is still no
 QEMU target for Pi 5.
 
