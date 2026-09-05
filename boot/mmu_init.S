@@ -222,6 +222,48 @@ mmu_init_periph_loop:
     cmp r6, #528
     blt mmu_init_periph_loop
 
+    /* ROUND 71 FIX (2026-09-05): sections 448-511 (0x1C000000-
+     * 0x1FFFFFFF, 64MB) -- VideoCore ("GPU") RAM, where the HDMI
+     * framebuffer round 71 added actually lives. Found live, the hard
+     * way: `fb fill` (a plain write to the address the mailbox's own
+     * FRAMEBUFFER_ALLOCATE response reported) took a genuine Data
+     * Abort (Translation fault) the first time anything in this
+     * project ever touched that address range -- this MMU table
+     * (round 38) only ever mapped ARM-side RAM (section 0-1) and the
+     * peripheral block (512-527); everything else was deliberately
+     * left unmapped-therefore-faulting, which is exactly correct
+     * EXCEPT that round 38 predates round 71's own framebuffer work
+     * by many rounds and had no reason to know this region would ever
+     * matter. Confirmed via QEMU's own hw/arm/bcm2835_peripherals.c
+     * source (not guessed): `vcram_base = ram_size - vcram_size`
+     * with `vcram_size` defaulting to 0x4000000 (64MB,
+     * hw/display/bcm2835_fb.c's DEFAULT_VCRAM_SIZE) -- for this
+     * machine's actual 512MB total RAM (independently confirmed via
+     * the live-observed framebuffer base address itself,
+     * 0x1C100000 = vcram_base 0x1C000000 + BCM2835_FB_OFFSET
+     * 0x00100000, working the arithmetic backward), that places VC
+     * RAM at exactly 0x1C000000-0x1FFFFFFF. This also matches the
+     * real hardware target's own confirmed 512MB (Pi 1B rev 2) with a
+     * default 64MB GPU memory split. Real DRAM the GPU also uses, not
+     * a device register -- Normal Non-cacheable (same memory type as
+     * the ARM-side RAM sections above), read+write, execute-never,
+     * same AP=01/APX=0 encoding as section 1. Honest limitation: this
+     * assumes the confirmed default 64MB VC RAM split; a real Pi's
+     * `config.txt` `gpu_mem=` setting configured larger would move
+     * data outside this mapped range back into faulting territory --
+     * not attempted here since 64MB is this project's own confirmed
+     * default on both QEMU and the real target hardware. */
+    mov r6, #448
+    ldr r7, =0x1C000000
+mmu_init_vcram_loop:
+    ldr r5, =0x00001412
+    orr r5, r5, r7
+    str r5, [r4, r6, lsl #2]
+    add r7, r7, #0x00100000
+    add r6, r6, #1
+    cmp r6, #512
+    blt mmu_init_vcram_loop
+
     /* Invalidate the entire TLB (both I and D) before this table is
      * ever consulted. A cold boot's TLB should already hold nothing
      * valid -- but relying on that rather than saying so explicitly is

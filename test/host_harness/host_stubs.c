@@ -890,6 +890,24 @@ static int64_t g_governor_history[4];
 int64_t governor_apply_freq_mhz(int64_t mhz) { g_governor_last_mhz = (uint32_t)mhz; return 0; }
 int64_t governor_get_last_applied_mhz(void) { return g_governor_last_mhz; }
 int64_t governor_set_last_applied_mhz(int64_t mhz) { g_governor_last_mhz = (uint32_t)mhz; return 0; }
+
+/* Round 71: HDMI framebuffer (boot/fb_state.S). No host-side test
+ * exercises this feature's own MMIO-backed mailbox protocol (same
+ * reasoning as every other real-hardware-peripheral function this
+ * file stubs only for linkage) -- fb_self_check/fb_init are compiled
+ * as part of the whole kernel_main.vani unit but never invoked by
+ * host_main.c's own test driver, so these stubs only need to exist
+ * and link, not behave meaningfully. */
+static uint8_t g_fb_mbox_buf[128] __attribute__((aligned(16)));
+static uint32_t g_fb_base, g_fb_size, g_fb_pitch;
+int64_t *fb_mbox_buf_ptr(void) { return (int64_t *)g_fb_mbox_buf; }
+int64_t fb_base_get(void) { return g_fb_base; }
+int64_t fb_base_set(int64_t v) { g_fb_base = (uint32_t)v; return 0; }
+int64_t fb_size_get(void) { return g_fb_size; }
+int64_t fb_size_set(int64_t v) { g_fb_size = (uint32_t)v; return 0; }
+int64_t fb_pitch_get(void) { return g_fb_pitch; }
+int64_t fb_pitch_set(int64_t v) { g_fb_pitch = (uint32_t)v; return 0; }
+int64_t mbox_property_call(int64_t *buf) { (void)buf; return 1; }
 int64_t governor_history_push(int64_t new_sample) {
     g_governor_history[0] = g_governor_history[1];
     g_governor_history[1] = g_governor_history[2];

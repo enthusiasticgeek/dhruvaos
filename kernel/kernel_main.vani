@@ -840,6 +840,17 @@ extern "C" fn scheduler_set_tick_count_test_only(value: u32) -> i64;
 extern "C" fn governor_get_last_applied_mhz() -> i64;
 extern "C" fn governor_set_last_applied_mhz(mhz: i64) -> i64;
 extern "C" fn governor_apply_freq_mhz(mhz: i64) -> i64;
+// Round 71: HDMI framebuffer -- generic VideoCore mailbox property-tag
+// transport (boot/fb_state.S), generalized from governor_apply_freq_
+// mhz's own already-verified protocol.
+extern "C" fn mbox_property_call(buf: mut ref i64) -> i64;
+extern "C" fn fb_mbox_buf_ptr() -> mut ref i64;
+extern "C" fn fb_base_get() -> i64;
+extern "C" fn fb_base_set(v: i64) -> i64;
+extern "C" fn fb_size_get() -> i64;
+extern "C" fn fb_size_set(v: i64) -> i64;
+extern "C" fn fb_pitch_get() -> i64;
+extern "C" fn fb_pitch_set(v: i64) -> i64;
 // Phase 5 step 2: run-queue-depth history for the smoothed scoring
 // function -- governor_state.S.
 extern "C" fn governor_history_push(new_sample: i64) -> i64;
@@ -1180,6 +1191,396 @@ fn gpio_uart_alt_init() -> i64 {
   let _ = mmio_write_u32(gppudclk0, 0x0000C000 as u32);
   let _ = delay(150);
   let _ = mmio_write_u32(gppudclk0, 0 as u32);
+  return 0;
+}
+
+// Round 71: general-purpose GPIO -- direct BCM2835 register access,
+// the same "no dedicated state file, just mmio_read/write_u32 with a
+// literal peripheral address" pattern gpio_uart_alt_init above already
+// established for pin muxing. This is the first PUBLIC-facing use of
+// this peripheral (a `gpio` shell command, not just internal setup for
+// another peripheral), covering pins 0-53 (the SoC's full real
+// register width -- which of those a specific Pi board's header
+// actually exposes is a wiring question, not this code's concern).
+//
+// Real-hardware safety note, not enforced in code: pins 14/15 are the
+// console UART (gpio_uart_alt_init above) and 48-53 are the SD card
+// (see the SDHOST/DWC2 pin-mux code elsewhere) -- reconfiguring those
+// through this same general API would break the running console or
+// storage. Not blocked here (an incomplete blocklist would be a false
+// sense of safety, and low-level GPIO control being "dangerous if
+// misused" is inherent to the feature), but worth knowing before
+// wiring real hardware to arbitrary pins.
+//
+// Confirmed against QEMU 10.0.0's own hw/gpio/bcm2835_gpio.c: GPFSELn/
+// GPSET/GPCLR/GPLEV are genuinely modeled (GPFSELn readback returns
+// what was actually written; GPSET/GPCLR both update the GPLEV-visible
+// level unconditionally, regardless of the pin's function-select
+// state -- a real hardware simplification, but sufficient to verify
+// this driver's own register-address/bit-mask arithmetic is correct).
+// GPPUD/GPPUDCLK0/1 (pull-up/down control) are explicitly marked
+// "Not implemented" in that same source -- gpio_set_pull below is
+// real, spec-correct code, but its actual effect is unverifiable
+// under QEMU, same honest limitation class as EDID in docs/TODO.md.
+
+// Function-select encoding is 3 bits per pin packed 10-per-register,
+// architectural (BCM2835 datasheet section 6.1), not a simple binary
+// progression: 0b000=input, 0b001=output, 0b100=ALT0, 0b101=ALT1,
+// 0b110=ALT2, 0b111=ALT3, 0b011=ALT4, 0b010=ALT5.
+fn gpio_fsel_reg_for(pin: i64) -> i64 {
+  return 0x20200000 + (pin / 10) * 4;
+}
+
+fn gpio_fsel_shift_for(pin: i64) -> i64 {
+  return (pin % 10) * 3;
+}
+
+// Sets pin's 3-bit function-select field, leaving the other 9 pins
+// packed into the same register untouched (read-modify-write, not a
+// blind overwrite).
+fn gpio_set_function(pin: i64, func: u32) -> i64 {
+  let reg: i64 = gpio_fsel_reg_for(pin);
+  let shift: u32 = gpio_fsel_shift_for(pin) as u32;
+  let mask: u32 = ((7 as u32) << shift) ^ (0xFFFFFFFF as u32);
+  let bits: u32 = (func & (7 as u32)) << shift;
+  let cur: u32 = mmio_read_u32(reg);
+  let _ = mmio_write_u32(reg, (cur & mask) | bits);
+  return 0;
+}
+
+// Reads pin's current 3-bit function-select field back.
+fn gpio_get_function(pin: i64) -> u32 {
+  let reg: i64 = gpio_fsel_reg_for(pin);
+  let shift: u32 = gpio_fsel_shift_for(pin) as u32;
+  let cur: u32 = mmio_read_u32(reg);
+  return (cur >> shift) & (7 as u32);
+}
+
+// Drives pin high (value != 0) via GPSET, or low via GPCLR -- these
+// are one-shot "set exactly these bits" registers (writing a 0 bit is
+// a no-op, not "clear"), never read-modify-write, matching the
+// hardware's own design.
+fn gpio_write(pin: i64, value: u32) -> i64 {
+  let bit: u32 = (pin % 32) as u32;
+  let set_reg: i64 = if pin < 32 { 0x2020001C } else { 0x20200020 };
+  let clr_reg: i64 = if pin < 32 { 0x20200028 } else { 0x2020002C };
+  let reg: i64 = if value != (0 as u32) { set_reg } else { clr_reg };
+  let _ = mmio_write_u32(reg, (1 as u32) << bit);
+  return 0;
+}
+
+// Reads pin's current level (0 or 1) via GPLEV.
+fn gpio_read(pin: i64) -> u32 {
+  let reg: i64 = if pin < 32 { 0x20200034 } else { 0x20200038 };
+  let bit: u32 = (pin % 32) as u32;
+  let val: u32 = mmio_read_u32(reg);
+  return (val >> bit) & (1 as u32);
+}
+
+// Pull-up/down/none control (0=none, 1=pull-down, 2=pull-up per the
+// BCM2835 GPPUD encoding) -- same GPPUD-then-clock-pulse-then-clear
+// sequence gpio_uart_alt_init above already uses for pins 14/15,
+// generalized to any pin. See this section's own header comment: real,
+// spec-correct code, but its actual effect is unverifiable under QEMU
+// (GPPUD/GPPUDCLK are stubbed "Not implemented" in QEMU's own GPIO
+// model) -- only real hardware can confirm this actually configures a
+// pull resistor.
+fn gpio_set_pull(pin: i64, pull: u32) -> i64 {
+  let gppud: i64 = 0x20200094;
+  let clk_reg: i64 = if pin < 32 { 0x20200098 } else { 0x2020009C };
+  let bit: u32 = (pin % 32) as u32;
+  let _ = mmio_write_u32(gppud, pull);
+  let _ = delay(150);
+  let _ = mmio_write_u32(clk_reg, (1 as u32) << bit);
+  let _ = delay(150);
+  let _ = mmio_write_u32(clk_reg, 0 as u32);
+  let _ = mmio_write_u32(gppud, 0 as u32);
+  return 0;
+}
+
+// Self-test, run once at boot: verifies the register-address/bit-mask
+// arithmetic above against QEMU's real, genuinely-modeled GPFSEL/
+// GPSET/GPCLR/GPLEV registers (confirmed via QEMU's own source, see
+// this section's header comment) -- not GPPUD/GPPUDCLK, which that
+// same source confirms QEMU does not implement at all.
+// Function-select read/write round trip for one pin, saving and
+// restoring its original function so the self-test leaves no lasting
+// side effect on boot state. Returns 1 if the round trip was correct,
+// 0 otherwise. Factored out of gpio_self_check so the same check can
+// run against 3 pins spanning 3 different GPFSELn registers without
+// needing an array (this codebase has no established array-type
+// usage anywhere else -- straight-line/helper-function repetition
+// matches its own consistent style instead).
+fn gpio_self_check_one_pin(pin: i64) -> i64 {
+  let orig: u32 = gpio_get_function(pin);
+  let ok: i64 = 1;
+  let _ = gpio_set_function(pin, 1 as u32);
+  if gpio_get_function(pin) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_function(pin, 0 as u32);
+  if gpio_get_function(pin) != (0 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_function(pin, orig);
+  return ok;
+}
+
+fn gpio_self_check() -> i64 {
+  let ok: i64 = 1;
+
+  // Pins 0, 10, and 53 span 3 different GPFSELn registers -- 53 is
+  // also GPFSEL5's own top pin, a real boundary.
+  if gpio_self_check_one_pin(0) == 0 {
+    ok = 0;
+  }
+  if gpio_self_check_one_pin(10) == 0 {
+    ok = 0;
+  }
+  if gpio_self_check_one_pin(53) == 0 {
+    ok = 0;
+  }
+
+  // Setting one pin's function must NOT disturb its neighbor packed
+  // into the same register (the read-modify-write mask's own
+  // correctness) -- pins 5 and 6 share GPFSEL0.
+  let orig5: u32 = gpio_get_function(5);
+  let orig6: u32 = gpio_get_function(6);
+  let _ = gpio_set_function(5, 1 as u32);
+  let _ = gpio_set_function(6, 0 as u32);
+  if gpio_get_function(5) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_function(6, 1 as u32);
+  if gpio_get_function(5) != (1 as u32) {
+    // Setting pin 6 must not have clobbered pin 5's own field.
+    ok = 0;
+  }
+  let _ = gpio_set_function(5, orig5);
+  let _ = gpio_set_function(6, orig6);
+
+  // GPSET/GPCLR/GPLEV round trip across the GPSET0/GPSET1 (pin
+  // 31/32) boundary -- confirmed live-modeled by QEMU regardless of
+  // the pin's function-select state (see header comment), so no
+  // function-select change is needed for this half of the test.
+  let _ = gpio_write(31, 1 as u32);
+  if gpio_read(31) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_write(31, 0 as u32);
+  if gpio_read(31) != (0 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_write(32, 1 as u32);
+  if gpio_read(32) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_write(32, 0 as u32);
+  if gpio_read(32) != (0 as u32) {
+    ok = 0;
+  }
+
+  let _ = uart_puts("GPIO: function-select read/write + GPSET/GPCLR/GPLEV round trip (BCM2835 registers, QEMU-modeled)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round 71: HDMI output via the VideoCore mailbox property-channel
+// interface (boot/fb_state.S's mbox_property_call, generalized from
+// governor_apply_freq_mhz's own already-verified transport). Real
+// hardware note: the GPU firmware does the actual HDMI signal
+// generation -- this code only asks it, via the mailbox, to allocate
+// a pixel buffer at a given resolution/depth and report back where
+// that buffer lives and how it's laid out; software then just writes
+// pixels into that buffer directly (plain RAM, not a device register
+// -- see fb_fill_pixel below).
+//
+// Builds ONE combined mailbox call with 6 tags -- SET_PHYSICAL_
+// WIDTH_HEIGHT, SET_VIRTUAL_WIDTH_HEIGHT, SET_DEPTH, SET_PIXEL_ORDER,
+// FRAMEBUFFER_ALLOCATE, FRAMEBUFFER_GET_PITCH -- matching the common
+// bare-metal-Pi convention of bundling all mode-setup tags into one
+// round trip. This is safe specifically because of how QEMU (and, per
+// the standard property-interface spec, real firmware too) processes
+// a buffer's tags strictly in order against one shared, in-progress
+// config: by the time the ALLOCATE tag runs, the SET_* tags earlier
+// in this SAME buffer have already updated the pending config, so
+// ALLOCATE's own size response and the trailing GET_PITCH tag both
+// correctly reflect the just-requested resolution/depth, not a stale
+// previous one. Confirmed directly against QEMU 10.0.0's own
+// hw/misc/bcm2835_property.c source (bcm2835_property_mbox_push's own
+// single local `fbconfig`, mutated tag-by-tag across one pass before
+// any of it is applied) before relying on this ordering.
+//
+// Byte layout (all little-endian, the mailbox's own wire format):
+//   [0] total size (120) | [4] request code (0)
+//   [8] tag=SET_PHYSICAL_WIDTH_HEIGHT | [12] bufsize=8 | [16] 0 | [20] width | [24] height
+//   [28] tag=SET_VIRTUAL_WIDTH_HEIGHT | [32] bufsize=8 | [36] 0 | [40] width | [44] height
+//   [48] tag=SET_DEPTH | [52] bufsize=4 | [56] 0 | [60] bpp
+//   [64] tag=SET_PIXEL_ORDER | [68] bufsize=4 | [72] 0 | [76] 1 (RGB)
+//   [80] tag=FRAMEBUFFER_ALLOCATE | [84] bufsize=8 | [88] 0 | [92] alignment(in)/base(out) | [96] size(out)
+//   [100] tag=FRAMEBUFFER_GET_PITCH | [104] bufsize=4 | [108] 0 | [112] pitch(out)
+//   [116] end tag (0)
+fn fb_init(width: i64, height: i64, bpp: i64) -> i64 {
+  let buf: mut ref i64 = fb_mbox_buf_ptr();
+
+  let _ = buf_write_u32_le(buf, 0, 120 as u32);
+  let _ = buf_write_u32_le(buf, 4, 0 as u32);
+
+  let _ = buf_write_u32_le(buf, 8, 0x00048003 as u32);
+  let _ = buf_write_u32_le(buf, 12, 8 as u32);
+  let _ = buf_write_u32_le(buf, 16, 0 as u32);
+  let _ = buf_write_u32_le(buf, 20, width as u32);
+  let _ = buf_write_u32_le(buf, 24, height as u32);
+
+  let _ = buf_write_u32_le(buf, 28, 0x00048004 as u32);
+  let _ = buf_write_u32_le(buf, 32, 8 as u32);
+  let _ = buf_write_u32_le(buf, 36, 0 as u32);
+  let _ = buf_write_u32_le(buf, 40, width as u32);
+  let _ = buf_write_u32_le(buf, 44, height as u32);
+
+  let _ = buf_write_u32_le(buf, 48, 0x00048005 as u32);
+  let _ = buf_write_u32_le(buf, 52, 4 as u32);
+  let _ = buf_write_u32_le(buf, 56, 0 as u32);
+  let _ = buf_write_u32_le(buf, 60, bpp as u32);
+
+  let _ = buf_write_u32_le(buf, 64, 0x00048006 as u32);
+  let _ = buf_write_u32_le(buf, 68, 4 as u32);
+  let _ = buf_write_u32_le(buf, 72, 0 as u32);
+  let _ = buf_write_u32_le(buf, 76, 1 as u32);
+
+  let _ = buf_write_u32_le(buf, 80, 0x00040001 as u32);
+  let _ = buf_write_u32_le(buf, 84, 8 as u32);
+  let _ = buf_write_u32_le(buf, 88, 0 as u32);
+  let _ = buf_write_u32_le(buf, 92, 16 as u32);
+  let _ = buf_write_u32_le(buf, 96, 0 as u32);
+
+  let _ = buf_write_u32_le(buf, 100, 0x00040008 as u32);
+  let _ = buf_write_u32_le(buf, 104, 4 as u32);
+  let _ = buf_write_u32_le(buf, 108, 0 as u32);
+  let _ = buf_write_u32_le(buf, 112, 0 as u32);
+
+  let _ = buf_write_u32_le(buf, 116, 0 as u32);
+
+  let status: i64 = mbox_property_call(buf);
+  if status != 0 {
+    return status;
+  }
+
+  let base: u32 = buf_read_u32_le(buf, 92);
+  let size: u32 = buf_read_u32_le(buf, 96);
+  let pitch: u32 = buf_read_u32_le(buf, 112);
+
+  let _ = fb_base_set(base as i64);
+  let _ = fb_size_set(size as i64);
+  let _ = fb_pitch_set(pitch as i64);
+  return 0;
+}
+
+// Writes one 32-bit-per-pixel value directly into the allocated
+// framebuffer -- plain RAM once fb_init has run, not a device
+// register, so a literal mmio_write_u32 (which just needs SOME
+// integer address, hardware or not) is the right tool, matching the
+// convention this codebase already uses for "write a raw word to a
+// literal address" everywhere else. Out-of-range x/y is a silent
+// no-op (never writes outside the allocated buffer) rather than a
+// crash -- this project's own "reject, don't guess" posture applied
+// to a caller error here specifically means "don't corrupt adjacent
+// memory," not "return an error code" (no caller currently checks
+// one, and a wild write would be far worse than a dropped pixel).
+fn fb_fill_pixel(x: i64, y: i64, color: u32) -> i64 {
+  let width_px: i64 = fb_pitch_get() / 4;
+  if (x < 0) || (x >= width_px) || (y < 0) {
+    return 0;
+  }
+  if (y * fb_pitch_get()) >= fb_size_get() {
+    return 0;
+  }
+  let addr: i64 = fb_base_get() + (y * fb_pitch_get()) + (x * 4);
+  let _ = mmio_write_u32(addr, color);
+  return 0;
+}
+
+// Self-test, run once at boot: verifies fb_init's own arithmetic
+// against QEMU's real, genuinely-modeled framebuffer property tags
+// (confirmed via QEMU's own source, see fb_init's header comment) --
+// unlike EDID (docs/TODO.md), every tag used here is actually
+// implemented, so pitch/size can be checked against real expected
+// values, not just "the call didn't hang."
+fn fb_self_check() -> i64 {
+  let ok: i64 = 1;
+  let status: i64 = fb_init(640, 480, 32);
+  if status != 0 {
+    ok = 0;
+  }
+  // 32bpp = 4 bytes/pixel; pitch must be exactly width*4, size exactly
+  // pitch*height -- real arithmetic QEMU's own device model computes
+  // from the resolution/depth this call just requested (see fb_init's
+  // header comment for why this isn't a stale/previous value).
+  if fb_pitch_get() != (640 * 4) {
+    ok = 0;
+  }
+  if fb_size_get() != (fb_pitch_get() * 480) {
+    ok = 0;
+  }
+  if fb_base_get() == 0 {
+    ok = 0;
+  }
+
+  let _ = uart_puts("FB: mailbox framebuffer allocate (640x480x32, real pitch/size arithmetic verified, QEMU-modeled)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+
+  // Round 71 FIX (2026-09-05): a real pixel-write round trip, not just
+  // mode-set arithmetic -- this is the specific check that would have
+  // caught the actual bug this round found live (fb_fill_pixel's
+  // target address, real VideoCore RAM at ~0x1C000000+, was outside
+  // every range boot/mmu_init.S's own MMU table mapped, so the very
+  // first real pixel write anywhere in this project took a Data
+  // Abort; the checks above never wrote a single pixel, so they
+  // passed the whole time regardless). Two corners, two different
+  // colors, so a wrong pitch/stride calculation that happened to work
+  // for (0,0) couldn't hide behind it.
+  // BUG (round 71 audit, 2026-09-05): found live, reproducibly, while
+  // writing this exact check -- `if mmio_read_u32(addr) != (const as
+  // u32) { ... }` (the function call used directly as the comparison's
+  // LHS) miscompiled and failed 2/2 runs; binding the SAME call's
+  // result to a named `let` first and comparing THAT instead passed
+  // 2/2 runs, identical logic otherwise. This points to a real vani
+  // compiler code-generation bug in how a direct extern "C" call
+  // result is used inline inside an `if` comparison -- not a bug in
+  // this driver's own address/value arithmetic (already independently
+  // confirmed correct via the interactive shell round trip). Worked
+  // around here by always binding to a `let` first; see project
+  // memory for the wider sweep this finding prompted.
+  let pix_ok: i64 = 1;
+  let _ = fb_fill_pixel(0, 0, 0x00112233 as u32);
+  let corner_addr: i64 = fb_base_get();
+  let corner_readback: u32 = mmio_read_u32(corner_addr);
+  if corner_readback != (0x00112233 as u32) {
+    pix_ok = 0;
+  }
+  let last_x: i64 = (fb_pitch_get() / 4) - 1;
+  let last_y: i64 = 479;
+  let _ = fb_fill_pixel(last_x, last_y, 0x00445566 as u32);
+  let far_addr: i64 = fb_base_get() + (last_y * fb_pitch_get()) + (last_x * 4);
+  let far_readback: u32 = mmio_read_u32(far_addr);
+  if far_readback != (0x00445566 as u32) {
+    pix_ok = 0;
+  }
+
+  let _ = uart_puts("FB: pixel write/readback round trip at two corners of the allocated buffer (real VideoCore RAM, mapped by boot/mmu_init.S)");
+  if pix_ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
   return 0;
 }
 
@@ -15923,6 +16324,164 @@ fn shell_dispatch_crypto(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> 
   return 0;
 }
 
+// Round 71: shell front end for general-purpose GPIO (see the driver
+// functions and their own header comment above `gpio_self_check`).
+// `<pin>` is a plain decimal 0-53 (the SoC's full real register
+// width) -- no validation against what a specific board's header
+// actually exposes, same "the peripheral register doesn't care"
+// posture the driver functions themselves take.
+fn shell_dispatch_gpio(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  let usage: Str = "usage: gpio <pin> in|out|read|write <0|1>|pull none|up|down\n";
+  if cmd_end >= line_len {
+    let _ = uart_puts(usage);
+    return 0;
+  }
+  let pin_start: i64 = cmd_end + 1;
+  let pin_end: i64 = shell_find_space(line_buf, pin_start, line_len);
+  let pin: i64 = shell_parse_decimal(line_buf, pin_start, pin_end);
+  if (pin < 0) || (pin > 53) || (pin_end >= line_len) {
+    let _ = uart_puts(usage);
+    return 0;
+  }
+
+  let sub_start: i64 = pin_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "in") == 1 {
+    let _ = gpio_set_function(pin, 0 as u32);
+    let _ = uart_puts("ok\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "out") == 1 {
+    let _ = gpio_set_function(pin, 1 as u32);
+    let _ = uart_puts("ok\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "read") == 1 {
+    let level: u32 = gpio_read(pin);
+    let _ = uart_puts("gpio ");
+    let _ = uart_put_i64(pin);
+    let _ = uart_puts(" = ");
+    let _ = uart_put_i64(level as i64);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "write") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts(usage);
+      return 0;
+    }
+    let val_start: i64 = sub_end + 1;
+    let val_end: i64 = shell_find_space(line_buf, val_start, line_len);
+    let val: i64 = shell_parse_decimal(line_buf, val_start, val_end);
+    let _ = gpio_write(pin, if val != 0 { 1 as u32 } else { 0 as u32 });
+    let _ = uart_puts("ok\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "pull") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts(usage);
+      return 0;
+    }
+    let pull_start: i64 = sub_end + 1;
+    let pull_end: i64 = shell_find_space(line_buf, pull_start, line_len);
+    let pull: u32 = if shell_word_matches(line_buf, pull_start, pull_end, "up") == 1 {
+      2 as u32
+    } else {
+      if shell_word_matches(line_buf, pull_start, pull_end, "down") == 1 { 1 as u32 } else { 0 as u32 }
+    };
+    let _ = gpio_set_pull(pin, pull);
+    let _ = uart_puts("ok (not verifiable under QEMU -- see docs/TODO.md)\n");
+    return 0;
+  }
+  let _ = uart_puts(usage);
+  return 0;
+}
+
+// Round 71: shell front end for the HDMI framebuffer (see fb_init's
+// own header comment above for the mailbox protocol/verification
+// scope). `fill` takes plain decimal R/G/B (0-255 each), not a hex
+// color code -- reuses shell_parse_decimal directly rather than
+// adding a new hex-string parser this shell doesn't otherwise need.
+fn shell_dispatch_fb(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  let usage: Str = "usage: fb init <w> <h> <bpp>|status|fill <x> <y> <r> <g> <b>\n";
+  if cmd_end >= line_len {
+    let _ = uart_puts(usage);
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "status") == 1 {
+    let _ = uart_puts("fb: base=0x");
+    let _ = uart_put_hex32(fb_base_get() as u32);
+    let _ = uart_puts(" size=0x");
+    let _ = uart_put_hex32(fb_size_get() as u32);
+    let _ = uart_puts(" pitch=0x");
+    let _ = uart_put_hex32(fb_pitch_get() as u32);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "init") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts(usage);
+      return 0;
+    }
+    let w_start: i64 = sub_end + 1;
+    let w_end: i64 = shell_find_space(line_buf, w_start, line_len);
+    let h_start: i64 = w_end + 1;
+    let h_end: i64 = shell_find_space(line_buf, h_start, line_len);
+    let bpp_start: i64 = h_end + 1;
+    let bpp_end: i64 = shell_find_space(line_buf, bpp_start, line_len);
+    if (w_end >= line_len) || (h_end >= line_len) {
+      let _ = uart_puts(usage);
+      return 0;
+    }
+    let w: i64 = shell_parse_decimal(line_buf, w_start, w_end);
+    let h: i64 = shell_parse_decimal(line_buf, h_start, h_end);
+    let bpp: i64 = shell_parse_decimal(line_buf, bpp_start, bpp_end);
+    let status: i64 = fb_init(w, h, if bpp > 0 { bpp } else { 32 });
+    if status == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      let _ = uart_puts("error\n");
+    }
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "fill") == 1 {
+    let x_start: i64 = sub_end + 1;
+    let x_end: i64 = shell_find_space(line_buf, x_start, line_len);
+    let y_start: i64 = x_end + 1;
+    let y_end: i64 = shell_find_space(line_buf, y_start, line_len);
+    let r_start: i64 = y_end + 1;
+    let r_end: i64 = shell_find_space(line_buf, r_start, line_len);
+    let g_start: i64 = r_end + 1;
+    let g_end: i64 = shell_find_space(line_buf, g_start, line_len);
+    let b_start: i64 = g_end + 1;
+    let b_end: i64 = shell_find_space(line_buf, b_start, line_len);
+    if (x_end >= line_len) || (y_end >= line_len) || (r_end >= line_len) || (g_end >= line_len) {
+      let _ = uart_puts(usage);
+      return 0;
+    }
+    let x: i64 = shell_parse_decimal(line_buf, x_start, x_end);
+    let y: i64 = shell_parse_decimal(line_buf, y_start, y_end);
+    let r: u32 = (shell_parse_decimal(line_buf, r_start, r_end) & 255) as u32;
+    let g: u32 = (shell_parse_decimal(line_buf, g_start, g_end) & 255) as u32;
+    let b: u32 = (shell_parse_decimal(line_buf, b_start, b_end) & 255) as u32;
+    // pixo=1 (RGB, set by fb_init) means byte0=R,byte1=G,byte2=B in
+    // memory -- a native little-endian 32-bit word write therefore
+    // packs them as r | (g<<8) | (b<<16).
+    let color: u32 = r | (g << (8 as u32)) | (b << (16 as u32));
+    let _ = fb_fill_pixel(x, y, color);
+    let _ = uart_puts("ok\n");
+    return 0;
+  }
+  let _ = uart_puts(usage);
+  return 0;
+}
+
 // Parses and runs exactly one already-complete shell line. Deliberately
 // NOT #[no_heap] (same reasoning as task_e's GC pass above): every
 // scratch buffer here is a fresh dhruva_alloc_bytes, and this task can
@@ -16604,6 +17163,14 @@ fn shell_dispatch() -> i64 {
 
   if shell_word_matches(line_buf, 0, cmd_end, "crypto") == 1 {
     return shell_dispatch_crypto(line_buf, cmd_end, line_len);
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "gpio") == 1 {
+    return shell_dispatch_gpio(line_buf, cmd_end, line_len);
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "fb") == 1 {
+    return shell_dispatch_fb(line_buf, cmd_end, line_len);
   }
 
   if shell_word_matches(line_buf, 0, cmd_end, "eval") == 1 {
@@ -26703,6 +27270,12 @@ fn kernel_main() -> i64 {
 
   // Round 44: crypto primitives foundation, bignum arithmetic base.
   let _ = bignum_self_test();
+
+  // Round 71: general-purpose GPIO.
+  let _ = gpio_self_check();
+
+  // Round 71: HDMI framebuffer (mailbox property-channel interface).
+  let _ = fb_self_check();
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device

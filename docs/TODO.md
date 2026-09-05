@@ -326,6 +326,78 @@ multi-round item elsewhere in this backlog.
 
   This TODO item is now **fully closed** — both halves done.
 
+## New peripherals: GPIO, HDMI/framebuffer + EDID, USB HID (2026-09-04)
+
+User request, recorded before any of it is built. All three are
+genuinely new peripheral categories for this project — not extensions
+of an existing driver the way most items above are.
+
+- **GPIO (general-purpose I/O)** — `[S-M, not started]`
+  Digital read/write of individual pins (`GPFSEL`/`GPSET`/`GPCLR`/
+  `GPLEV` registers, BCM2835 peripheral base `0x20200000`), at minimum;
+  pull-up/down control and edge-detect/interrupt-on-change would be a
+  natural follow-up once basic read/write exists. **Fully QEMU-
+  testable**: confirmed by reading QEMU 10.0.0's own
+  `hw/arm/bcm2835_peripherals.c` — `raspi1ap` instantiates a real
+  `TYPE_BCM2835_GPIO` device (also the SD-card-detect mux for SDHOST/
+  SDHCI switching, unrelated to this feature) at the standard offset,
+  so a live round-trip self-test (set an output pin, read it back;
+  toggle and confirm) is possible the same way every other peripheral
+  in this project has been verified, no real hardware required first.
+  Would unlock the classic "blink an LED" / read a button hardware-
+  in-loop demo once a real Pi 1B is connected, on top of whatever
+  software use GPIO gets before then.
+
+- **HDMI output / framebuffer + EDID** — `[M-L, not started]`
+  Two genuinely separate pieces, same shape as the USB-boot feasibility
+  note elsewhere in this backlog:
+  1. *Framebuffer output itself* (set a video mode, get a pixel
+     buffer address back, write pixels into it): driven through the
+     VideoCore mailbox property-channel interface this project has
+     zero code for today (a new peripheral entirely, distinct from
+     every UART/SD/USB/network peripheral built so far). **Partially
+     QEMU-testable**: confirmed by reading QEMU 10.0.0's own
+     `hw/display/bcm2835_fb.c` — `raspi1ap` does instantiate a real
+     `TYPE_BCM2835_FB` framebuffer device wired to the mailbox, so the
+     property-tag protocol and pixel-buffer read/write path can be
+     built and regression-tested under QEMU the normal way. No real
+     HDMI signal exists to visually confirm under QEMU, obviously —
+     that half needs real hardware (or a screenshot/framebuffer-dump
+     capability QEMU may or may not expose for this device, not yet
+     checked).
+  2. *EDID query* (asking the connected monitor what modes it
+     supports, rather than hardcoding one): **confirmed NOT
+     QEMU-testable** — checked QEMU 10.0.0's own
+     `hw/misc/bcm2835_property.c` mailbox-tag dispatch directly; it has
+     no case for any EDID-related request tag at all. Code to issue
+     the EDID mailbox call could still be written speculatively, but
+     its actual behavior (real monitor's real EDID block) can only
+     ever be verified against a real Pi 1B with a real HDMI display
+     attached — a genuine hardware-in-loop item, not a QEMU gap to
+     work around.
+
+- **USB HID class (keyboard/mouse)** — `[M, not started]`
+  This project's existing DWC2 (USB 2.0 host) driver already supports
+  three device classes on real Pi 1 hardware — mass storage (rounds
+  33-36), CDC-ECM/LAN9512 networking (round 56), and Bluetooth HCI
+  (round 57+) — but not USB HID, the standard class real keyboards/
+  mice/gamepads use. Would need: HID descriptor parsing (report
+  descriptors, not just the device/config/interface descriptors
+  `dwc2_fetch_and_set_configuration` already walks), interrupt-IN
+  polling (this project's second use of the interrupt transfer type
+  after the BLE HCI driver's own `dwc2_hci_interrupt_in`, see round
+  57), and report parsing for at least a boot-protocol keyboard/mouse
+  (the simple, fixed-layout HID subclass most BIOS/bootloader-style
+  code targets, before general HID report-descriptor parsing). QEMU's
+  `usb-kbd`/`usb-mouse` emulated devices exist and are a real, live
+  QEMU target for this — same "attach a real-shaped QEMU device,
+  verify against it" pattern CDC-ECM's own `usb-net` device already
+  proved out for networking.
+  **USB 3.x**: this project's real Pi 1 hardware target has no USB 3
+  controller at all (DWC2 is 2.0-only) — USB 3.x support is already
+  tracked separately under the Pi 4/5 port's own XHCI entry above
+  (`VL805`/`RP1`), not a Pi 1 item; no new entry needed here.
+
 ## General DMA controller (not scoped — recommendation only, round 35)
 
 User asked about a general "DMA interface for faster stuff" while
