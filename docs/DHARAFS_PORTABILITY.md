@@ -1,8 +1,8 @@
 # DharaFS portability: extracting it for use by other kernels
 
-Scoped out on request (2026-09-05); **Tier 1 is now built, standalone, and
-verified**, in its own repository: `~/source/dharafs` (Apache 2.0, kosh
-package `dharafs`). This document is the feasibility/effort analysis that
+Scoped out on request (2026-09-05); **Tier 1 and Tier 2 are now both built,
+standalone, and verified**, in their own repository: `~/source/dharafs`
+(Apache 2.0, kosh package `dharafs`). This document is the feasibility/effort analysis that
 extraction was based on — every number below comes from grepping
 `kernel/kernel_main.vani` directly, not estimated — updated in place where
 the real extraction found the original analysis imprecise (see "Tier 1,
@@ -111,10 +111,34 @@ own integration, not to anything in DharaFS itself.
   them. Verified via a real standalone round trip (init/append/read/
   overwrite/rename/delete against an in-memory disk), clean under
   ASAN/UBSAN. No crypto, no scheduler dependency at all.
-- **Tier 2 — add verified I/O + media encryption:** bring in the
-  crypto-primitive calls and their own scratch accessors, replacing
-  Tier 1's stubbable encryption hook with real algorithm calls. Still
-  zero scheduler dependency. Not yet built.
+- **Tier 2 — DONE, `~/source/dharafs`:** real ChaCha20-Poly1305 AEAD
+  media encryption (`src/media_crypto.vani`, ported from this
+  project's own round 69) and SHA-256-verified companion-file I/O
+  (`src/verified_io.vani`, ported from round 48), plus the SHA-256/
+  HMAC-SHA256/PBKDF2-HMAC-SHA256/ChaCha20/Poly1305 primitives they
+  need (`src/crypto.vani`, ported from rounds 41/67). Architected as
+  composable add-ons rather than a monolithic addition to Tier 1's own
+  `src/lib.vani`: `src/core.vani` (the actual FS logic, factored out of
+  Tier 1's file unchanged) never declares the media-encryption hook
+  itself, so four entry points build from the same shared core —
+  `lib.vani` (Tier 1, hook stays a consumer-provided extern),
+  `lib_encrypted.vani` (+ real encryption only), `lib_verified.vani`
+  (+ verified I/O only), `lib_tier2.vani` (both). Key management is
+  loosely coupled too: unlike this project's own hardcoded passphrase
+  (an honest, still-true limitation — no hardware key store here
+  either), the package's own `dharafs_crypto_key_init` takes
+  passphrase/salt/iterations as real parameters, and fails closed
+  (rather than using an all-zero key) if a consumer enables encryption
+  without ever calling it. Verified via known-answer tests against
+  Python's `hashlib`/`hmac` (SHA-256/HMAC/PBKDF2) and the real
+  `cryptography` library (ChaCha20-Poly1305 AEAD, including tag- and
+  ciphertext-tamper rejection), a full media-encryption round trip
+  (two-time-pad fix + tamper detection) at both the raw-block and
+  whole-file API levels, a verified-I/O round trip with tamper
+  detection, and a combined encryption+verified-I/O composition test —
+  all four entry points ASAN/UBSAN-clean, with Tier 1's own test
+  re-verified unaffected by the core.vani/lib.vani split this required.
+  Still zero scheduler dependency.
 - **Tier 3 — add the priority-aware FS queue:** the 7 `dharafs_queue_*`
   functions plus the 2 scheduler-primitive calls
   (`current_eff_prio`/`current_task_get`). Requires the target kernel
