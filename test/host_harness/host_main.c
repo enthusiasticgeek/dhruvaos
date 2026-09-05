@@ -137,6 +137,11 @@ int64_t fn_hci_acl_build_header(int64_t *out_buf, uint32_t handle, uint32_t pb_f
 uint32_t fn_hci_acl_get_handle(int64_t *buf);
 uint32_t fn_hci_acl_get_pb_flag(int64_t *buf);
 uint32_t fn_hci_acl_get_data_len(int64_t *buf);
+uint32_t fn_hid_kbd_report_get_modifiers(int64_t *report);
+uint32_t fn_hid_kbd_report_get_keycode(int64_t *report, uint32_t slot);
+uint32_t fn_hid_mouse_report_get_buttons(int64_t *report);
+int64_t fn_hid_mouse_report_get_dx(int64_t *report);
+int64_t fn_hid_mouse_report_get_dy(int64_t *report);
 uint32_t fn_l2cap_att_channel_id(void);
 uint32_t fn_l2cap_signaling_channel_id(void);
 int64_t fn_l2cap_build_header(int64_t *out_buf, uint32_t length, uint32_t channel_id);
@@ -473,6 +478,51 @@ static int64_t *mkbuf(const char *bytes, int64_t len) {
         buf_write_byte(b, (uint32_t)i, (uint32_t)(unsigned char)bytes[i]);
     }
     return b;
+}
+
+/* Round 71: USB HID boot-protocol report decoders -- pure parsing, no
+ * MMIO, exactly the kind of logic this host harness is for. Keyboard:
+ * byte0=modifiers, bytes2-7=up to 6 keycodes. Mouse: byte0=buttons,
+ * byte1=dx, byte2=dy, both SIGNED 8-bit -- the negative-displacement
+ * cases below are what actually exercise hid_mouse_report_get_dx/dy's
+ * own sign-extension logic, not just the positive/zero cases a
+ * shallower test might stop at. */
+static void test_hid_reports(void) {
+    unsigned char kbd1[8] = {0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00};
+    int64_t *k1 = mkbuf((const char *)kbd1, 8);
+    CHECK(fn_hid_kbd_report_get_modifiers(k1) == 0, "hid kbd: no modifiers");
+    CHECK(fn_hid_kbd_report_get_keycode(k1, 0) == 0x04, "hid kbd: keycode[0] == 0x04 ('a')");
+    CHECK(fn_hid_kbd_report_get_keycode(k1, 1) == 0, "hid kbd: keycode[1] empty");
+    CHECK(fn_hid_kbd_report_get_keycode(k1, 5) == 0, "hid kbd: keycode[5] empty");
+    CHECK(fn_hid_kbd_report_get_keycode(k1, 6) == 0, "hid kbd: out-of-range slot returns 0, not garbage");
+
+    unsigned char kbd2[8] = {0x02, 0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00};
+    int64_t *k2 = mkbuf((const char *)kbd2, 8);
+    CHECK(fn_hid_kbd_report_get_modifiers(k2) == 0x02, "hid kbd: LShift modifier bit");
+    CHECK(fn_hid_kbd_report_get_keycode(k2, 0) == 0x04, "hid kbd: keycode[0] == 0x04 ('a') with shift held");
+    CHECK(fn_hid_kbd_report_get_keycode(k2, 1) == 0x05, "hid kbd: keycode[1] == 0x05 ('b') two keys at once");
+
+    unsigned char released[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int64_t *kr = mkbuf((const char *)released, 8);
+    CHECK(fn_hid_kbd_report_get_keycode(kr, 0) == 0, "hid kbd: all-zero report (key released)");
+
+    unsigned char mouse1[3] = {0x01, 5, 0xFB}; /* buttons=left, dx=+5, dy=-5 */
+    int64_t *m1 = mkbuf((const char *)mouse1, 3);
+    CHECK(fn_hid_mouse_report_get_buttons(m1) == 0x01, "hid mouse: left button bit");
+    CHECK(fn_hid_mouse_report_get_dx(m1) == 5, "hid mouse: dx=+5 (positive, no sign extension needed)");
+    CHECK(fn_hid_mouse_report_get_dy(m1) == -5, "hid mouse: dy=-5 (0xFB correctly sign-extended)");
+
+    unsigned char mouse2[3] = {0x00, 0x80, 0x7F}; /* dx=-128 (min), dy=+127 (max) */
+    int64_t *m2 = mkbuf((const char *)mouse2, 3);
+    CHECK(fn_hid_mouse_report_get_buttons(m2) == 0, "hid mouse: no buttons");
+    CHECK(fn_hid_mouse_report_get_dx(m2) == -128, "hid mouse: dx=-128 (signed 8-bit minimum)");
+    CHECK(fn_hid_mouse_report_get_dy(m2) == 127, "hid mouse: dy=+127 (signed 8-bit maximum)");
+
+    unsigned char mouse3[3] = {0x06, 0, 0}; /* right+middle buttons, no motion */
+    int64_t *m3 = mkbuf((const char *)mouse3, 3);
+    CHECK(fn_hid_mouse_report_get_buttons(m3) == 0x06, "hid mouse: right+middle buttons, no motion");
+    CHECK(fn_hid_mouse_report_get_dx(m3) == 0, "hid mouse: dx=0");
+    CHECK(fn_hid_mouse_report_get_dy(m3) == 0, "hid mouse: dy=0");
 }
 
 /* ================= DharaFS: basic round trip ================= */
@@ -4532,6 +4582,7 @@ int main(void) {
     test_hmac_pbkdf2_boundaries();
     test_media_crypto();
     test_fault_injection();
+    test_hid_reports();
     test_chacha20_boundaries();
     test_poly1305();
     test_x25519();

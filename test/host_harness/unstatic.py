@@ -406,6 +406,11 @@ WHITELIST = [
     "fault_netdrop_maybe_inject",
     "filter_check_frame",
     "filter_build_test_frame",
+    "hid_kbd_report_get_modifiers",
+    "hid_kbd_report_get_keycode",
+    "hid_mouse_report_get_buttons",
+    "hid_mouse_report_get_dx",
+    "hid_mouse_report_get_dy",
 ]
 
 

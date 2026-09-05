@@ -1038,6 +1038,17 @@ uint32_t usb_bt_set_intr_in_mps(uint32_t v) { g_usb_bt_intr_in_mps = v; return 0
 uint32_t usb_bt_get_intr_in_toggle(void) { return g_usb_bt_intr_in_toggle; }
 uint32_t usb_bt_set_intr_in_toggle(uint32_t v) { g_usb_bt_intr_in_toggle = v; return 0; }
 
+/* Round 71: usb_hid_state.S -- same shape as usb_bt_state.S above. */
+static uint32_t g_usb_hid_kind, g_usb_hid_intr_in_epaddr, g_usb_hid_intr_in_mps, g_usb_hid_intr_in_toggle;
+uint32_t usb_hid_get_kind(void) { return g_usb_hid_kind; }
+uint32_t usb_hid_set_kind(uint32_t v) { g_usb_hid_kind = v; return 0; }
+uint32_t usb_hid_get_intr_in_epaddr(void) { return g_usb_hid_intr_in_epaddr; }
+uint32_t usb_hid_set_intr_in_epaddr(uint32_t v) { g_usb_hid_intr_in_epaddr = v; return 0; }
+uint32_t usb_hid_get_intr_in_mps(void) { return g_usb_hid_intr_in_mps; }
+uint32_t usb_hid_set_intr_in_mps(uint32_t v) { g_usb_hid_intr_in_mps = v; return 0; }
+uint32_t usb_hid_get_intr_in_toggle(void) { return g_usb_hid_intr_in_toggle; }
+uint32_t usb_hid_set_intr_in_toggle(uint32_t v) { g_usb_hid_intr_in_toggle = v; return 0; }
+
 /* Round 58: usb_wifi_state.S -- added proactively in the same round
  * that introduced these extern fns (see the round 56/57 lesson in
  * this file's own history). */

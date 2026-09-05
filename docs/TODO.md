@@ -332,39 +332,73 @@ User request, recorded before any of it is built. All three are
 genuinely new peripheral categories for this project — not extensions
 of an existing driver the way most items above are.
 
-- **GPIO (general-purpose I/O)** — `[S-M, not started]`
+- **GPIO (general-purpose I/O)** — `[S-M, DONE round 71, 2026-09-05]`
   Digital read/write of individual pins (`GPFSEL`/`GPSET`/`GPCLR`/
-  `GPLEV` registers, BCM2835 peripheral base `0x20200000`), at minimum;
-  pull-up/down control and edge-detect/interrupt-on-change would be a
-  natural follow-up once basic read/write exists. **Fully QEMU-
-  testable**: confirmed by reading QEMU 10.0.0's own
-  `hw/arm/bcm2835_peripherals.c` — `raspi1ap` instantiates a real
-  `TYPE_BCM2835_GPIO` device (also the SD-card-detect mux for SDHOST/
-  SDHCI switching, unrelated to this feature) at the standard offset,
-  so a live round-trip self-test (set an output pin, read it back;
-  toggle and confirm) is possible the same way every other peripheral
-  in this project has been verified, no real hardware required first.
-  Would unlock the classic "blink an LED" / read a button hardware-
-  in-loop demo once a real Pi 1B is connected, on top of whatever
-  software use GPIO gets before then.
+  `GPLEV` registers, BCM2835 peripheral base `0x20200000`) plus
+  pull-up/down control. Pure vani code (`gpio_set_function`/
+  `_get_function`/`_write`/`_read`/`_set_pull` in `kernel_main.vani`),
+  no new assembly — reused the existing `mmio_read_u32`/`mmio_write_u32`
+  builtins the same way `gpio_uart_alt_init` already does for UART pin
+  muxing. Confirmed against QEMU 10.0.0's own `hw/gpio/bcm2835_gpio.c`
+  before writing anything: GPFSEL/GPSET/GPCLR/GPLEV are genuinely
+  modeled (GPSET/GPCLR update the GPLEV-visible level unconditionally
+  regardless of function-select state — a real hardware simplification,
+  but enough to verify this driver's own register-address/bit-mask
+  arithmetic); GPPUD/GPPUDCLK are explicitly "Not implemented" in that
+  same source, so `gpio_set_pull` is real, spec-correct code but its
+  actual effect is unverifiable under QEMU (same honesty class as EDID
+  below — only real hardware can confirm a pull resistor actually
+  engages). New `gpio <pin> in|out|read|write <0|1>|pull none|up|down`
+  shell command, live-verified interactively (9 commands, every one
+  behaved exactly as designed). Self-check verifies function-select
+  read/write round-trip across 3 different GPFSELn registers plus a
+  register-boundary non-interference check, and GPSET/GPCLR/GPLEV
+  round-trip across the GPSET0/GPSET1 (pin 31/32) boundary. Would
+  unlock the classic "blink an LED" / read a button hardware-in-loop
+  demo once a real Pi 1B is connected.
 
-- **HDMI output / framebuffer + EDID** — `[M-L, not started]`
+- **HDMI output / framebuffer** — `[M-L, framebuffer half DONE round
+  71, 2026-09-05; EDID remains real-hardware-only, see below]`
   Two genuinely separate pieces, same shape as the USB-boot feasibility
   note elsewhere in this backlog:
-  1. *Framebuffer output itself* (set a video mode, get a pixel
-     buffer address back, write pixels into it): driven through the
-     VideoCore mailbox property-channel interface this project has
-     zero code for today (a new peripheral entirely, distinct from
-     every UART/SD/USB/network peripheral built so far). **Partially
-     QEMU-testable**: confirmed by reading QEMU 10.0.0's own
-     `hw/display/bcm2835_fb.c` — `raspi1ap` does instantiate a real
-     `TYPE_BCM2835_FB` framebuffer device wired to the mailbox, so the
-     property-tag protocol and pixel-buffer read/write path can be
-     built and regression-tested under QEMU the normal way. No real
-     HDMI signal exists to visually confirm under QEMU, obviously —
-     that half needs real hardware (or a screenshot/framebuffer-dump
-     capability QEMU may or may not expose for this device, not yet
-     checked).
+  1. *Framebuffer output itself* — **DONE.** New `boot/fb_state.S`
+     generalizes `governor_state.S`'s own already-verified mailbox
+     transport into `mbox_property_call(buf)`, taking an
+     already-built buffer instead of hardcoding one tag, so
+     `fb_init(width, height, bpp)` (`kernel_main.vani`) can bundle
+     SET_PHYSICAL/VIRTUAL_WIDTH_HEIGHT, SET_DEPTH, SET_PIXEL_ORDER,
+     FRAMEBUFFER_ALLOCATE, and FRAMEBUFFER_GET_PITCH into ONE
+     round trip. Confirmed against QEMU 10.0.0's own
+     `hw/misc/bcm2835_property.c` that every one of these tags is
+     genuinely implemented (unlike governor's own NYI clock-rate
+     tag), so this gets real round-trip verification — actual
+     pitch/size arithmetic computed from the just-requested
+     resolution/depth, not just "the call didn't hang." New `fb
+     init <w> <h> <bpp>|status|fill <x> <y> <r> <g> <b>` shell
+     command. Self-check covers both mode-set arithmetic AND an
+     actual pixel write+readback round trip at two corners of the
+     allocated buffer (added specifically because the first
+     self-check version only checked arithmetic and would never
+     have caught the real bug below).
+
+     **Two real bugs found and fixed along the way**: (1) a genuine
+     Data Abort — round 38's MMU table (`boot/mmu_init.S`) never
+     mapped VideoCore RAM (~0x1C000000-0x1FFFFFFF, where the
+     framebuffer actually lives), only ARM-side RAM and the
+     peripheral block; root-caused via QEMU's own
+     `hw/arm/bcm2835_peripherals.c` source and fixed by extending
+     `mmu_init.S`'s existing section-mapping loop to also cover
+     sections 448-511 as Normal-non-cacheable read-write XN. (2) a
+     real AAPCS ABI violation — `fb_base_get`/`fb_size_get`/
+     `fb_pitch_get` are declared `-> i64` but only ever set r0, never
+     r1 (the required high word), corrupting a real 64-bit division
+     in the pixel self-check; initially misdiagnosed one level too
+     shallow as a vani/LLVM compiler bug before GDB against the
+     actual failing build found the real cause. Swept the whole
+     codebase afterward for the same bug class and fixed 5 more
+     genuine instances in `boot/context_switch.S` (feeding
+     `diagnose`'s own counter output directly) plus a few low-priority
+     latent ones. See project memory for the full writeup.
   2. *EDID query* (asking the connected monitor what modes it
      supports, rather than hardcoding one): **confirmed NOT
      QEMU-testable** — checked QEMU 10.0.0's own
@@ -374,29 +408,55 @@ of an existing driver the way most items above are.
      its actual behavior (real monitor's real EDID block) can only
      ever be verified against a real Pi 1B with a real HDMI display
      attached — a genuine hardware-in-loop item, not a QEMU gap to
-     work around.
+     work around. Still not started.
 
-- **USB HID class (keyboard/mouse)** — `[M, not started]`
-  This project's existing DWC2 (USB 2.0 host) driver already supports
+- **USB HID class (keyboard/mouse)** — `[M, DONE round 71, 2026-09-05]`
+  This project's existing DWC2 (USB 2.0 host) driver already supported
   three device classes on real Pi 1 hardware — mass storage (rounds
   33-36), CDC-ECM/LAN9512 networking (round 56), and Bluetooth HCI
-  (round 57+) — but not USB HID, the standard class real keyboards/
-  mice/gamepads use. Would need: HID descriptor parsing (report
-  descriptors, not just the device/config/interface descriptors
-  `dwc2_fetch_and_set_configuration` already walks), interrupt-IN
-  polling (this project's second use of the interrupt transfer type
-  after the BLE HCI driver's own `dwc2_hci_interrupt_in`, see round
-  57), and report parsing for at least a boot-protocol keyboard/mouse
-  (the simple, fixed-layout HID subclass most BIOS/bootloader-style
-  code targets, before general HID report-descriptor parsing). QEMU's
-  `usb-kbd`/`usb-mouse` emulated devices exist and are a real, live
-  QEMU target for this — same "attach a real-shaped QEMU device,
-  verify against it" pattern CDC-ECM's own `usb-net` device already
-  proved out for networking.
+  (round 57+) — now a fourth: USB HID boot-protocol keyboard/mouse
+  (interface class 0x03, subclass 0x01 "boot interface subclass",
+  protocol 0x01 keyboard / 0x02 mouse, per HID1.11 Appendix B).
+  Detection added to `dwc2_fetch_and_set_configuration`'s existing
+  single-pass descriptor walk (same attribution style BOT/CDC/BT
+  already use), a new `dwc2_hid_interrupt_in` (this project's second
+  use of the interrupt transfer type, direct sibling of round 57's own
+  `dwc2_hci_interrupt_in`, new `boot/usb_hid_state.S` for its
+  endpoint/toggle state), an explicit `SET_PROTOCOL(boot)` class
+  request sent unconditionally after `SET_CONFIGURATION` (HID1.11
+  §7.2.5, forcing Boot Protocol regardless of a device's power-on
+  default), and boot-protocol report decoders for the fixed,
+  spec-defined 8-byte keyboard / 3-byte mouse report layouts. New `hid
+  poll|status` shell command.
+
+  **Live-verified against real QEMU devices, not just spec-read** —
+  matching CDC-ECM's own "attach a real-shaped QEMU device, verify
+  against it" precedent, and going further than Bluetooth HCI's own
+  verification ceiling (BT's own USB transport could never be
+  live-tested at all, `usb-bt-dongle` having been removed from QEMU):
+  `-device usb-kbd` and `-device usb-mouse` both enumerate correctly
+  (keyboard: intr_in_ep=0x81 mps=8; mouse: intr_in_ep=0x81 mps=4,
+  matching each boot report's own fixed size exactly), AND a real
+  keypress injected via QEMU's monitor (`sendkey a`) was received and
+  correctly decoded end to end via the `hid poll` shell command
+  (`keys=04`, the real USB HID Usage ID for 'a'), with correct
+  press/release report alternation across 5 repeated injections.
+  Report-decoder logic (modifier bits, up to 6 simultaneous keycodes,
+  signed 8-bit mouse dx/dy including the -128/+127 boundary values)
+  also covered by 18 new host-harness checks, 993/993 PASS clean
+  under ASAN/UBSAN.
+
+  **Not implemented, explicit scope boundary**: interrupt-OUT for
+  keyboard LED state (Num/Caps/Scroll Lock) — this driver is
+  read-only, matching this project's own "build what's needed, not
+  speculative extras" discipline; no continuous background polling
+  task for reports (an on-demand shell command is lower-risk, nothing
+  new touching the scheduler, matching BT's own precedent of only
+  ever polling synchronously from within a specific command flow).
   **USB 3.x**: this project's real Pi 1 hardware target has no USB 3
   controller at all (DWC2 is 2.0-only) — USB 3.x support is already
   tracked separately under the Pi 4/5 port's own XHCI entry above
-  (`VL805`/`RP1`), not a Pi 1 item; no new entry needed here.
+  (`VL805`/`RP1`), not a Pi 1 item.
 
 ## General DMA controller (not scoped — recommendation only, round 35)
 

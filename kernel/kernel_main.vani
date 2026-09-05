@@ -1003,6 +1003,18 @@ extern "C" fn usb_bt_set_intr_in_mps(value: u32) -> u32;
 extern "C" fn usb_bt_get_intr_in_toggle() -> u32;
 extern "C" fn usb_bt_set_intr_in_toggle(value: u32) -> u32;
 
+// Round 71: USB HID (keyboard/mouse), boot/usb_hid_state.S -- same
+// shape as usb_bt_state.S above, one interrupt-IN endpoint only (this
+// driver is read-only, no LED-output support).
+extern "C" fn usb_hid_get_kind() -> u32;
+extern "C" fn usb_hid_set_kind(value: u32) -> u32;
+extern "C" fn usb_hid_get_intr_in_epaddr() -> u32;
+extern "C" fn usb_hid_set_intr_in_epaddr(value: u32) -> u32;
+extern "C" fn usb_hid_get_intr_in_mps() -> u32;
+extern "C" fn usb_hid_set_intr_in_mps(value: u32) -> u32;
+extern "C" fn usb_hid_get_intr_in_toggle() -> u32;
+extern "C" fn usb_hid_set_intr_in_toggle(value: u32) -> u32;
+
 // Round 58 (boot/usb_wifi_state.S): USB WiFi (Realtek RTL8188CU/
 // RTL8192CU family) detection flag ONLY -- this round's scope stops at
 // enumeration + vendor register read/write, see rtl8188cu_probe's own
@@ -10928,6 +10940,29 @@ fn dwc2_build_set_interface_setup(iface_num: u32, alt_setting: u32) -> i64 {
   return 0;
 }
 
+// Round 71: HID class-specific SET_PROTOCOL request (HID1.11 section
+// 7.2.5) -- bmRequestType=0x21 (host-to-device, class, interface,
+// distinct from SET_INTERFACE's plain 0x01 standard-request type
+// above), bRequest=0x0B, wValue=protocol (0=boot, 1=report),
+// wIndex=iface_num, wLength=0. Sent unconditionally to force Boot
+// Protocol regardless of whatever protocol a device happens to power
+// up in -- this driver only ever decodes the fixed, spec-defined
+// 8-byte keyboard / 3-byte mouse boot report layouts (see
+// hid_kbd_report_get_modifiers/hid_mouse_report_get_dx etc. below),
+// never a device-specific Report Protocol descriptor.
+fn dwc2_build_hid_set_protocol_setup(iface_num: u32, protocol: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0x21 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 0x0B as u32);
+  let _ = buf_write_byte(dma, 2 as u32, protocol & (0xFF as u32));
+  let _ = buf_write_byte(dma, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 4 as u32, iface_num & (0xFF as u32));
+  let _ = buf_write_byte(dma, 5 as u32, (iface_num >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 6 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
+  return 0;
+}
+
 // Round 56: GET_DESCRIPTOR(String, index=string_index), same shape as
 // dwc2_build_get_device_descriptor_setup but wValue's high byte is 3
 // (STRING) and low byte is the string index, with wIndex=langid.
@@ -11485,6 +11520,19 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
   let found_bt: i64 = 0;
   let found_bt_bulk_eps: i64 = 0;
   let found_bt_intr_ep: i64 = 0;
+  // Round 71: USB HID boot-protocol keyboard/mouse (interface class
+  // 0x03, subclass 0x01 "boot interface subclass", protocol 0x01
+  // keyboard / 0x02 mouse -- HID1.11 Appendix B). cur_iface_hid_kind
+  // carries which of the two the MOST RECENTLY seen INTERFACE
+  // descriptor was (0 if neither), same attribution style BOT/CDC/BT
+  // already use for their own single-purpose flags -- a plain int
+  // here instead of a second bool since keyboard and mouse need
+  // exactly the same endpoint handling, just a different final kind.
+  let cur_iface_hid_kind: i64 = 0;
+  let found_hid_kind: i64 = 0;
+  let found_hid_intr_ep: i64 = 0;
+  let hid_iface_num: i64 = 0 - 1;
+  let _ = usb_hid_set_kind(0 as u32);
   let full_want_len_i: i64 = full_want_len as i64;
   while pos < full_want_len_i {
     let dlen: u32 = buf_read_byte(cfgfull, pos as u32);
@@ -11501,6 +11549,7 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
           cur_iface_is_cdc_control = 0;
           cur_iface_is_cdc_data_active = 0;
           cur_iface_is_bt = 0;
+          cur_iface_hid_kind = 0;
           if (pos + 7) < full_want_len_i {
             let inum: u32 = buf_read_byte(cfgfull, (pos + 2) as u32);
             let ialt: u32 = buf_read_byte(cfgfull, (pos + 3) as u32);
@@ -11522,6 +11571,18 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
             if (iclass == (0xE0 as u32)) && (isubclass == (0x01 as u32)) && (iproto == (0x01 as u32)) {
               cur_iface_is_bt = 1;
               found_bt = 1;
+            }
+            if (iclass == (0x03 as u32)) && (isubclass == (0x01 as u32)) {
+              if iproto == (0x01 as u32) {
+                cur_iface_hid_kind = 1; // keyboard
+                found_hid_kind = 1;
+                hid_iface_num = cur_iface_num;
+              }
+              if iproto == (0x02 as u32) {
+                cur_iface_hid_kind = 2; // mouse
+                found_hid_kind = 2;
+                hid_iface_num = cur_iface_num;
+              }
             }
           }
         }
@@ -11623,6 +11684,24 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
               let _ = usb_bt_set_intr_in_mps(bt_ep_mps);
             }
           }
+          // Round 71: USB HID's own interrupt-IN report endpoint --
+          // same bmAttributes==3 (interrupt)/direction-bit check BT's
+          // own intr_in above already uses. A boot-protocol keyboard/
+          // mouse needs exactly this one endpoint for this driver's
+          // read-only scope (see boot/usb_hid_state.S's own header
+          // comment on why interrupt-OUT/LEDs are out of scope).
+          if (cur_iface_hid_kind != 0) && ((pos + 5) < full_want_len_i) {
+            let hid_ep_addr: u32 = buf_read_byte(cfgfull, (pos + 2) as u32);
+            let hid_ep_attr: u32 = buf_read_byte(cfgfull, (pos + 3) as u32);
+            let hid_ep_mps_lo: u32 = buf_read_byte(cfgfull, (pos + 4) as u32);
+            let hid_ep_mps_hi: u32 = buf_read_byte(cfgfull, (pos + 5) as u32);
+            let hid_ep_mps: u32 = hid_ep_mps_lo | (hid_ep_mps_hi << (8 as u32));
+            if ((hid_ep_attr & (0x03 as u32)) == (0x03 as u32)) && ((hid_ep_addr & (0x80 as u32)) != (0 as u32)) {
+              found_hid_intr_ep = 1;
+              let _ = usb_hid_set_intr_in_epaddr(hid_ep_addr);
+              let _ = usb_hid_set_intr_in_mps(hid_ep_mps);
+            }
+          }
         }
         pos = pos + (dlen as i64);
       }
@@ -11695,6 +11774,21 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
     let _ = uart_put_hex32(usb_bt_get_intr_in_mps());
     let _ = uart_puts("\n");
   }
+  if (found_hid_kind != 0) && (found_hid_intr_ep == 1) {
+    let _ = usb_hid_set_kind(found_hid_kind as u32);
+    let _ = usb_hid_set_intr_in_toggle(0 as u32);
+    let _ = uart_puts("USB: HID ");
+    if found_hid_kind == 1 {
+      let _ = uart_puts("keyboard");
+    } else {
+      let _ = uart_puts("mouse");
+    }
+    let _ = uart_puts(" (boot protocol) interface detected, intr_in_ep=");
+    let _ = uart_put_hex32(usb_hid_get_intr_in_epaddr());
+    let _ = uart_puts(" mps=");
+    let _ = uart_put_hex32(usb_hid_get_intr_in_mps());
+    let _ = uart_puts("\n");
+  }
 
   let _ = uart_puts("USB: config bConfigurationValue=");
   let _ = uart_put_hex32(config_value);
@@ -11765,6 +11859,17 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
   // it can't be live-verified under QEMU either.
   if usb_bt_get_kind() == (1 as u32) {
     let _ = hci_reset_and_scan(devaddr, mps);
+  }
+  // Round 71: USB HID follow-up -- force Boot Protocol explicitly
+  // (see dwc2_build_hid_set_protocol_setup's own comment on why),
+  // only reachable once SET_CONFIGURATION itself has already
+  // succeeded above, matching CDC-ECM's/BT's own follow-up ordering.
+  if usb_hid_get_kind() != (0 as u32) {
+    let _ = dwc2_build_hid_set_protocol_setup(hid_iface_num as u32, 0 as u32);
+    let hid_proto_status: i64 = dwc2_control_no_data(devaddr, mps);
+    if hid_proto_status != 0 {
+      let _ = uart_puts("USB: HID SET_PROTOCOL(boot) failed\n");
+    }
   }
   return 0;
 }
@@ -13795,6 +13900,89 @@ fn dwc2_hci_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len:
   let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
   let _ = usb_bt_set_intr_in_toggle(next_toggle);
   return actual_len;
+}
+
+// Round 71: USB HID's own interrupt-IN transfer -- identical shape to
+// dwc2_hci_interrupt_in above (same DWC2 channel-programming
+// mechanism, same short-packet/HCTSIZ-readback technique for the
+// returned length, since a HID input report's own length also isn't
+// known in advance -- a keyboard boot report is always 8 bytes but a
+// mouse boot report can be 3 or 4 depending on whether the device adds
+// a wheel byte). A separate function rather than a shared one
+// parameterized on which *_get_intr_in_* accessors to call, matching
+// this codebase's own established "one function per feature" style
+// (BOT/CDC-ECM/LAN9512/BT already each have their own bulk-transfer
+// functions rather than a shared parameterized one).
+fn dwc2_hid_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> i64 {
+  if mps == (0 as u32) {
+    return 0 - 1;
+  }
+  if (want_len < 0) || (want_len > (512 as i64)) {
+    return 0 - 1;
+  }
+  let epaddr: u32 = usb_hid_get_intr_in_epaddr();
+  let epnum: u32 = epaddr & (0x0F as u32);
+  let dma: mut ref i64 = usb_bulk_data_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  let toggle: u32 = usb_hid_get_intr_in_toggle();
+  let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
+  let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 3 as u32, 1 as u32, epnum, mps));
+  let result: u32 = dwc2_wait_chan0_done();
+  if (result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
+  let bytes_left: u32 = hctsiz_after & (0x7FFFF as u32);
+  let actual_len: i64 = want_len - (bytes_left as i64);
+  let i: i64 = 0;
+  while i < actual_len {
+    let b: u32 = buf_read_byte(dma, i as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  let _ = usb_hid_set_intr_in_toggle(next_toggle);
+  return actual_len;
+}
+
+// Boot-protocol report decoders (HID1.11 Appendix B) -- pure, MMIO-
+// free parsing, host-harness-testable with synthetic bytes. Keyboard:
+// byte0=modifier bitmask (bit0=LCtrl..bit7=RGUI), byte1=reserved,
+// bytes2-7=up to 6 simultaneously pressed keycodes (0=no key, 1=
+// rollover error -- per USB HID Usage Tables, not decoded further
+// here). Mouse: byte0=button bitmask (bit0=left/bit1=right/
+// bit2=middle), byte1=X displacement, byte2=Y displacement, both
+// SIGNED 8-bit (a real mouse reports relative motion, negative values
+// are a real and common case, not a caller error).
+fn hid_kbd_report_get_modifiers(report: mut ref i64) -> u32 {
+  return buf_read_byte(report, 0 as u32);
+}
+
+fn hid_kbd_report_get_keycode(report: mut ref i64, slot: u32) -> u32 {
+  if slot >= (6 as u32) {
+    return 0 as u32;
+  }
+  return buf_read_byte(report, 2 as u32 + slot);
+}
+
+fn hid_mouse_report_get_buttons(report: mut ref i64) -> u32 {
+  return buf_read_byte(report, 0 as u32);
+}
+
+fn hid_mouse_report_get_dx(report: mut ref i64) -> i64 {
+  let raw: u32 = buf_read_byte(report, 1 as u32);
+  return if raw >= (128 as u32) { (raw as i64) - 256 } else { raw as i64 };
+}
+
+fn hid_mouse_report_get_dy(report: mut ref i64) -> i64 {
+  let raw: u32 = buf_read_byte(report, 2 as u32);
+  return if raw >= (128 as u32) { (raw as i64) - 256 } else { raw as i64 };
 }
 
 // Round 57: bmRequestType=0x20 (host-to-device, CLASS, device),
@@ -16490,6 +16678,94 @@ fn shell_dispatch_fb(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 
   return 0;
 }
 
+// Round 71: shell front end for USB HID (keyboard/mouse) -- one
+// bounded interrupt-IN poll per `hid poll` invocation (a handful of
+// tries, same "never hang on hardware/a device that just isn't
+// talking" bound this project's other interrupt-poll call sites
+// already use, e.g. hci_send_command_and_wait_complete's own 20-try
+// loop), decoding and printing whatever boot-protocol report comes
+// back based on usb_hid_get_kind(). No continuous background polling
+// task -- an on-demand shell command is lower-risk (nothing new
+// touching the scheduler) and matches this project's own existing
+// precedent for interrupt-transfer polling (BT's own HCI event
+// polling is also only ever invoked synchronously from within a
+// specific command flow, never from a periodic background task).
+fn shell_dispatch_hid(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  let usage: Str = "usage: hid poll|status\n";
+  if cmd_end >= line_len {
+    let _ = uart_puts(usage);
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "status") == 1 {
+    let kind: u32 = usb_hid_get_kind();
+    if kind == (0 as u32) {
+      let _ = uart_puts("hid: no device detected\n");
+    } else {
+      let _ = uart_puts("hid: ");
+      if kind == (1 as u32) {
+        let _ = uart_puts("keyboard");
+      } else {
+        let _ = uart_puts("mouse");
+      }
+      let _ = uart_puts(" (boot protocol), intr_in_ep=");
+      let _ = uart_put_hex32(usb_hid_get_intr_in_epaddr());
+      let _ = uart_puts(" mps=");
+      let _ = uart_put_hex32(usb_hid_get_intr_in_mps());
+      let _ = uart_puts("\n");
+    }
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "poll") == 1 {
+    let kind: u32 = usb_hid_get_kind();
+    if kind == (0 as u32) {
+      let _ = uart_puts("hid: no device detected\n");
+      return 0;
+    }
+    let mps: u32 = usb_hid_get_intr_in_mps();
+    let report: mut ref i64 = dhruva_alloc_bytes(8);
+    let tries: i64 = 0;
+    let got_len: i64 = 0 - 1;
+    while (tries < 20) && (got_len < 0) {
+      got_len = dwc2_hid_interrupt_in(dwc2_downstream_addr(), mps, report, mps as i64);
+      tries = tries + 1;
+    }
+    if got_len < 0 {
+      let _ = uart_puts("hid: no report received (timed out)\n");
+      return 0;
+    }
+    if kind == (1 as u32) {
+      let _ = uart_puts("hid keyboard: modifiers=0x");
+      let _ = uart_put_hex_byte(hid_kbd_report_get_modifiers(report));
+      let _ = uart_puts(" keys=");
+      let s: i64 = 0;
+      while s < 6 {
+        let kc: u32 = hid_kbd_report_get_keycode(report, s as u32);
+        if kc != (0 as u32) {
+          let _ = uart_put_hex_byte(kc);
+          let _ = uart_puts(" ");
+        }
+        s = s + 1;
+      }
+      let _ = uart_puts("\n");
+    } else {
+      let _ = uart_puts("hid mouse: buttons=0x");
+      let _ = uart_put_hex_byte(hid_mouse_report_get_buttons(report));
+      let _ = uart_puts(" dx=");
+      let _ = uart_put_i64(hid_mouse_report_get_dx(report));
+      let _ = uart_puts(" dy=");
+      let _ = uart_put_i64(hid_mouse_report_get_dy(report));
+      let _ = uart_puts("\n");
+    }
+    return 0;
+  }
+  let _ = uart_puts(usage);
+  return 0;
+}
+
 // Parses and runs exactly one already-complete shell line. Deliberately
 // NOT #[no_heap] (same reasoning as task_e's GC pass above): every
 // scratch buffer here is a fresh dhruva_alloc_bytes, and this task can
@@ -17179,6 +17455,10 @@ fn shell_dispatch() -> i64 {
 
   if shell_word_matches(line_buf, 0, cmd_end, "fb") == 1 {
     return shell_dispatch_fb(line_buf, cmd_end, line_len);
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "hid") == 1 {
+    return shell_dispatch_hid(line_buf, cmd_end, line_len);
   }
 
   if shell_word_matches(line_buf, 0, cmd_end, "eval") == 1 {
