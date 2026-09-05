@@ -458,6 +458,26 @@ of an existing driver the way most items above are.
   tracked separately under the Pi 4/5 port's own XHCI entry above
   (`VL805`/`RP1`), not a Pi 1 item.
 
+## DharaFS as a standalone library for other kernels (scoped, round 71, not built)
+
+User asked whether DharaFS could be decoupled from DhruvaOS for reuse
+elsewhere without sacrificing correctness or performance. Full
+analysis in `docs/DHARAFS_PORTABILITY.md`, based on actually grepping
+`kernel_main.vani`'s real dependency surface rather than guessing:
+**yes, and `test/host_harness` already proves the hard part** (the FS
+logic compiles and runs correctly as portable C, no ARM/QEMU/scheduler
+dependency). Of DharaFS's 104 functions' 135 external calls, 53 (39%)
+belong to three optional additive features (dirindex/fsqueue/
+snapshots) that can be cut for a minimal port with zero scheduler
+dependency; the real shim surface for a minimal "Tier 1" port is
+block I/O (2 functions), one allocator function, and logging (3
+functions), plus mechanical one-line scratch accessors already proven
+portable by `host_harness`'s own stub file. Packaging mechanism:
+vani-compiler's already-shipped kosh package/namespace system, not a
+new file-splitting scheme. Not started — no second consumer exists
+yet to build against, matching this project's own "don't design for
+hypothetical requirements" discipline.
+
 ## General DMA controller (not scoped — recommendation only, round 35)
 
 User asked about a general "DMA interface for faster stuff" while

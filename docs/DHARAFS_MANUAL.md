@@ -396,3 +396,6 @@ sector_for`/`_offset_for`/`_read_counter`/`_read_tag`/`_write_entry`
   the device with zero partition-table awareness.
 - `test/host_harness/README.md` — the host-side ASAN/UBSAN test
   driver for this filesystem's own logic.
+- `docs/DHARAFS_PORTABILITY.md` — scoping analysis for extracting this
+  filesystem as a standalone kosh package other kernels could depend
+  on, independent of DhruvaOS's own scheduler/allocator/hardware.
