@@ -100,23 +100,54 @@
  * bypass; APX/AP combine into a 3-bit value whose case 5 (APX=1,AP=01,
  * the code section's own encoding) yields read-only and case 1
  * (APX=0,AP=01, data's encoding) yields read-write, both matching
- * what this round's own write-protection test already proved live;
- * and critically, `if (*prot && !xn) *prot |= PAGE_EXEC` means a
- * section with xn=1 should never gain PAGE_EXEC at all, regardless of
- * AP/APX -- an instruction fetch should then fail the immediately-
- * following `*prot & (1 << access_type)` check and fault. Every
- * documented step of that logic agrees with this table's own intent.
- * That the CURRENTLY INSTALLED QEMU (10.0.11, five-plus years newer)
- * still did not enforce it, despite an older version's own source
- * confirming the logic should, now points more specifically at a
- * QEMU version-specific behavior difference than at a bug in this
- * table -- though without 10.0.11's own source to diff against
- * directly, that remains a strong inference, not a proven fact.
- * Flagged in docs/TODO.md as a tracked follow-up -- real Pi 1B
- * hardware (once connected, see the project's own hardware-in-loop
- * plan) would definitively settle whether this is QEMU-specific or a
- * genuine remaining bug, since real silicon's behavior is the actual
- * ground truth either way. */
+ * what this round's own write-protection test already proved live.
+ * `get_phys_addr_v6` extracts `xn` from the descriptor correctly and
+ * passes it into a separate helper, `get_S1prot`, to decide the final
+ * protection bits.
+ *
+ * ROUND 70 UPDATE (2026-09-04): fully root-caused, no longer a
+ * "strong inference" -- fetched QEMU's actual source for both the
+ * OLD (4.2.0, tag v4.2.0) and CURRENTLY INSTALLED (10.0.11, tag
+ * v10.0.0 used as the closest matching public tag) versions directly
+ * from github.com/qemu/qemu and read `get_S1prot` in full in both.
+ * The exact same logic exists in BOTH, unchanged across more than six
+ * years of QEMU history:
+ *
+ *     } else if (arm_feature(env, ARM_FEATURE_V7)) {
+ *         ... (the real XN-combining logic, several lines) ...
+ *     } else {
+ *         xn = wxn = 0;
+ *     }
+ *
+ * i.e. for any AArch32 core WITHOUT `ARM_FEATURE_V7` set, QEMU's own
+ * `get_S1prot` unconditionally DISCARDS whatever `xn` value the
+ * caller extracted from the page table, before it ever reaches the
+ * final `if (xn || ...) return prot_rw;` decision that would grant or
+ * withhold PAGE_EXEC. And `arm1176_initfn` (the exact CPU model
+ * `raspi1ap` uses) -- checked in both `target/arm/cpu.c` (v4.2.0) and
+ * `target/arm/tcg/cpu32.c` (v10.0.0) -- sets `ARM_FEATURE_V6K`/
+ * `VAPA`/`EL3`/etc. but NEVER `ARM_FEATURE_V7`, confirming this
+ * override fires for this exact core in both versions.
+ *
+ * Conclusion: this is not a version-specific regression and not a bug
+ * in this file's own encoding -- it's a QEMU TCG emulation scope
+ * decision, consistent since at least 2019, that XN enforcement for
+ * pre-ARMv7 32-bit cores (ARMv6 and earlier, including ARM1176JZF-S)
+ * is simply not modeled. The earlier round's own investigation
+ * correctly traced the XN-bit extraction and the AP/APX encoding
+ * (both genuinely correct, and the AP/APX half is independently
+ * proven by this file's own live write-protection test) but didn't
+ * trace one level further into `get_S1prot`'s own separate
+ * architecture-version gate, which is what actually discards it.
+ *
+ * This is now a confirmed QEMU emulation gap, not an open question --
+ * but it's still worth confirming against real Pi 1B hardware (once
+ * connected, see the project's own hardware-in-loop plan) once that's
+ * available, since a real ARM1176 core's XN enforcement is the actual
+ * feature this project cares about, not QEMU's emulation of it; the
+ * XN bits are kept set in this table regardless, since they're free
+ * on real hardware if it does enforce them, and harmless on QEMU
+ * either way. */
 
 .section ".bss"
 .align 14   /* 16KB alignment -- TTBR0's own base-address field

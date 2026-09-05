@@ -286,10 +286,19 @@ real fidelity gaps:
   get characterized at all, not just re-confirmed.
 - **The MMU's XN (execute-never) enforcement** — `boot/mmu_init.S`'s
   own header comment documents that write-protection (W^X's other
-  half) was live-verified under QEMU, but XN enforcement specifically
-  could **not** be confirmed working under this project's QEMU
-  version despite real, repeated testing — flagged there as a genuine
-  open question real hardware could settle either way.
+  half) was live-verified under QEMU, but a deliberate XN-enforcement
+  test never faulted under QEMU. Round 70 (2026-09-04) confirmed why,
+  by reading QEMU's own source directly (both the currently-installed
+  version and the older one an earlier round had partial access to):
+  QEMU's ARM emulation unconditionally discards the XN bit for any
+  32-bit core without `ARM_FEATURE_V7` (ARMv6 and earlier, including
+  ARM1176JZF-S — this project's exact CPU model), consistently across
+  at least six years of QEMU history. **Not an open question anymore
+  — this is a confirmed QEMU emulation scope limitation, not a bug in
+  this project's own MMU table.** Still worth confirming on real
+  hardware once connected, not to settle whether it's QEMU-specific
+  (it is), but because real ARM1176 silicon's own enforcement is the
+  actual feature this project cares about.
 
 ## 7. See also
 

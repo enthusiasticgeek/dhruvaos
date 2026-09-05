@@ -2266,8 +2266,10 @@ for by name.
      separate initiative — it's the same threat model at higher
      volume, not a different one.
   2. **Enable real memory protection** — `[L — DONE (round 38) for the
-     write-protection half; execute-protection is a tracked known
-     limitation, see below]`
+     write-protection half; execute-protection is CORRECTLY CONFIGURED
+     in this project's own MMU table but not verifiable under QEMU
+     (confirmed round 70, 2026-09-04, to be a QEMU emulation scope
+     limitation, not a Dhruva bug — see below), pending real hardware]`
      The MMU is now on (`boot/mmu_init.S`), identity-mapped, with the
      code section (vectors/.text.boot/.text/.rodata) marked read+
      execute but genuinely never writable, and data/heap/stack/
@@ -2312,19 +2314,41 @@ for by name.
        fetch permission check and fault. Every step of that older
        source's own logic agrees with this table's intent — yet the
        currently-installed, five-plus-years-newer QEMU still didn't
-       enforce it. This now points more specifically at a **QEMU
-       version-specific behavior difference** than at a bug in this
-       table's own encoding, though without 10.0.11's own source to
-       diff against directly, that remains a strong inference, not a
-       proven fact. The `XN` bits are kept set anyway — free if real
-       hardware (or a different QEMU version) enforces them correctly,
-       harmless if this specific installed QEMU doesn't.
+       enforce it.
+
+       **ROUND 70 UPDATE (2026-09-04): fully root-caused, no longer a
+       "strong inference."** Fetched QEMU's actual source for BOTH the
+       old (4.2.0) and currently-installed (10.0.11, via the closest
+       matching public tag v10.0.0) versions directly from
+       `github.com/qemu/qemu` and read the real `get_S1prot` function
+       in full in both — not just `get_phys_addr_v6`, which is where
+       the round-38 investigation above stopped. The exact same logic
+       exists UNCHANGED in both, six-plus years apart:
+       `} else if (arm_feature(env, ARM_FEATURE_V7)) { ... } else { xn
+       = wxn = 0; }` — for any AArch32 core WITHOUT `ARM_FEATURE_V7`,
+       QEMU unconditionally discards whatever `xn` the caller extracted
+       from the page table before it ever reaches the decision that
+       would grant or withhold `PAGE_EXEC`. `arm1176_initfn` (the exact
+       CPU model `raspi1ap` uses) — checked in both `target/arm/cpu.c`
+       (v4.2.0) and `target/arm/tcg/cpu32.c` (v10.0.0) — sets
+       `ARM_FEATURE_V6K`/`VAPA`/`EL3`/etc. but never `ARM_FEATURE_V7`,
+       confirming this override fires for this exact core in both
+       versions. **Conclusion: this is not a version regression and not
+       a bug in this project's own MMU table — it's a QEMU TCG
+       emulation scope decision, consistent since at least 2019, that
+       XN enforcement for pre-ARMv7 32-bit cores (ARMv6 and earlier,
+       including ARM1176JZF-S) simply isn't modeled.** The earlier
+       round's own investigation correctly traced the XN-bit extraction
+       and the AP/APX encoding (both genuinely correct) but didn't
+       trace one level further into `get_S1prot`'s own separate
+       architecture-version gate, which is what actually discards it.
+       The `XN` bits are kept set anyway — free if real hardware
+       enforces them correctly, harmless on QEMU either way.
        **Revisit once a real Pi 1B is connected** (see the
-       hardware-in-loop section below) — testing the identical
-       deliberate-execute probe against real silicon would
-       definitively settle this either way, since real hardware's
-       behavior is the actual ground truth regardless of which QEMU
-       version's source agrees with the table.
+       hardware-in-loop section below) — not to settle whether this is
+       QEMU-specific (that's now confirmed), but because a real
+       ARM1176 core's own XN enforcement is the actual feature this
+       project cares about, independent of what any emulator does.
      - New abort-mode diagnostics (`vectors.S`'s `fault_data_abort`/
        `fault_prefetch_abort`, previously both a silent infinite loop
        with zero output) were a real prerequisite built first, not
