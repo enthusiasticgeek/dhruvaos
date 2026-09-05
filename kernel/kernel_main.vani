@@ -6161,6 +6161,16 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
   if frame_len > netif_frame_slot_size() {
     return 0 - 1;
   }
+  // Round 72: packet filtering's egress half -- the SAME single choke
+  // point every outgoing frame (ARP/IPv4/ICMP/UDP/TCP) already passes
+  // through, mirroring netif_recv_frame's own three ingress hook
+  // points. A denied frame is silently dropped and reported as success
+  // -- deliberately the SAME "the sender never learns" shape
+  // fault_netdrop_maybe_inject immediately below already established
+  // for this exact function, not a new convention.
+  if filter_check_frame(buf, frame_len, 1 as u32) == (0 as u32) {
+    return 0;
+  }
   // Round 62 (fault injection): `fault netdrop <n>` -- see
   // fault_netdrop_maybe_inject's own comment. Every outgoing frame
   // (ARP/IPv4/ICMP/UDP/TCP) passes through this single choke point,
@@ -6281,7 +6291,40 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
 // never match a portless protocol (ICMP) -- has_port stays 0 for
 // anything that isn't TCP/UDP, and port_matches requires either a
 // wildcard rule or a genuine port to compare against.
-fn filter_check_frame(frame: mut ref i64, frame_len: i64) -> u32 {
+//
+// Round 72: `is_outgoing` lets the SAME rule table filter both
+// directions, called from netif_send_frame as well as
+// netif_recv_frame's own three call sites below -- this project has
+// one rule table, not separate INPUT/OUTPUT chains, so a rule's own
+// `src_ip` field is really "the OTHER party's IP" regardless of which
+// direction the frame is travelling: for an inbound frame that's
+// genuinely the IP header's source field, but for an OUTBOUND frame
+// (where the header's own source field is always OUR OWN address)
+// it's the destination field instead. Matches the intuitive meaning
+// a `fw add ... <ip>` rule actually has to whoever configures it --
+// "block traffic involving this address" -- not a strict src-only
+// reading that would make outgoing filtering silently unable to ever
+// match anything.
+// is_outgoing is `u32`, matching this file's own established
+// convention for flag/boolean parameters (a `u32` is always exactly
+// one AAPCS register, nothing to miscount).
+//
+// CORRECTION (round 72, 2026-09-05): an earlier version of this
+// comment blamed the parameter SHAPE here (mut ref i64 + i64 + i64)
+// for an intermittent-garbage symptom seen while writing
+// filter_outgoing_self_test, and initially "fixed" it by making this
+// parameter u32 -- which didn't actually fix anything (confirmed:
+// switching back to i64 reproduces identically). The real cause,
+// found via LLVM IR + ARM disassembly comparison of a working vs.
+// broken build, was `fw_add_rule` (boot/fw_state.S) clobbering
+// r4/r5/r6 -- AAPCS callee-saved registers -- without saving them,
+// silently corrupting a live value in the CALLER (this function's own
+// caller, filter_outgoing_self_test) that happened to be allocated to
+// one of those same registers. Fixed there (see that function's own
+// updated header comment), not here -- this file's own logic was
+// never wrong. Kept as u32 anyway since it's a real, if unrelated,
+// improvement matching this codebase's own convention.
+fn filter_check_frame(frame: mut ref i64, frame_len: i64, is_outgoing: u32) -> u32 {
   if frame_len < 34 {
     return 1 as u32; // too short to be a parseable IPv4 frame -- not
                       // this filter's job to bounds-check, only to
@@ -6291,7 +6334,7 @@ fn filter_check_frame(frame: mut ref i64, frame_len: i64) -> u32 {
     return 1 as u32; // not IPv4 (e.g. ARP) -- nothing to filter on
   }
   let proto: u32 = ipv4_get_protocol(frame, 14);
-  let src_ip: u32 = ipv4_get_src_ip(frame, 14);
+  let src_ip: u32 = if is_outgoing == (1 as u32) { ipv4_get_dst_ip(frame, 14) } else { ipv4_get_src_ip(frame, 14) };
   let dst_port: u32 = 0 as u32;
   let has_port: u32 = 0 as u32;
   if (proto == (6 as u32)) && (frame_len >= 38) {
@@ -6401,7 +6444,7 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
     // more queued, but returning -1 here just means the caller's own
     // next poll dequeues whatever's next, same as any other "nothing
     // ready" case already does).
-    if filter_check_frame(out_buf, total) == (0 as u32) {
+    if filter_check_frame(out_buf, total, 0 as u32) == (0 as u32) {
       return 0 - 1;
     }
     return total;
@@ -6471,7 +6514,7 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
     // Round 60: packet filtering's own hook -- see the CDC-ECM branch
     // above for why a denied frame is just dropped/reported "nothing
     // ready" rather than internally retrying for another one.
-    if filter_check_frame(out_buf, usable_len) == (0 as u32) {
+    if filter_check_frame(out_buf, usable_len, 0 as u32) == (0 as u32) {
       return 0 - 1;
     }
     return usable_len;
@@ -6499,7 +6542,7 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   // queued slot is consumed either way, matching how a real NIC would
   // also have already delivered the frame off the wire by the time
   // filtering happens).
-  if filter_check_frame(out_buf, frame_len) == (0 as u32) {
+  if filter_check_frame(out_buf, frame_len, 0 as u32) == (0 as u32) {
     return 0 - 1;
   }
   return frame_len;
@@ -6647,7 +6690,7 @@ fn filter_self_test() -> i64 {
   let _ = fw_set_default_policy(0 as u32);
   let f1: mut ref i64 = dhruva_alloc_bytes(64);
   let l1: i64 = filter_build_test_frame(f1, 6 as u32, ip_a, 80 as u32);
-  if filter_check_frame(f1, l1) != (0 as u32) { ok = 0; }
+  if filter_check_frame(f1, l1, 0 as u32) != (0 as u32) { ok = 0; }
 
   // 2. A specific deny rule overrides a permissive default, but only
   // for the src_ip it actually names -- a different src_ip must still
@@ -6656,16 +6699,16 @@ fn filter_self_test() -> i64 {
   let _ = fw_add_rule(6 as u32, ip_a, 1 as u32, 80 as u32, 1 as u32, 0 as u32);
   let f2: mut ref i64 = dhruva_alloc_bytes(64);
   let l2: i64 = filter_build_test_frame(f2, 6 as u32, ip_a, 80 as u32);
-  if filter_check_frame(f2, l2) != (0 as u32) { ok = 0; }
+  if filter_check_frame(f2, l2, 0 as u32) != (0 as u32) { ok = 0; }
   let f3: mut ref i64 = dhruva_alloc_bytes(64);
   let l3: i64 = filter_build_test_frame(f3, 6 as u32, ip_b, 80 as u32);
-  if filter_check_frame(f3, l3) != (1 as u32) { ok = 0; }
+  if filter_check_frame(f3, l3, 0 as u32) != (1 as u32) { ok = 0; }
 
   // 3. Protocol specificity: the same rule (TCP, ip_a, port 80) must
   // not match UDP traffic on the identical src_ip/port.
   let f4: mut ref i64 = dhruva_alloc_bytes(64);
   let l4: i64 = filter_build_test_frame(f4, 17 as u32, ip_a, 80 as u32);
-  if filter_check_frame(f4, l4) != (1 as u32) { ok = 0; }
+  if filter_check_frame(f4, l4, 0 as u32) != (1 as u32) { ok = 0; }
 
   // 4. First-match-wins: an earlier wildcard deny must shadow a later,
   // more specific allow rule for traffic the wildcard also covers.
@@ -6674,7 +6717,7 @@ fn filter_self_test() -> i64 {
   let _ = fw_add_rule(6 as u32, 0 as u32, 0 as u32, 443 as u32, 1 as u32, 1 as u32); // allow TCP/443 (shadowed)
   let f5: mut ref i64 = dhruva_alloc_bytes(64);
   let l5: i64 = filter_build_test_frame(f5, 6 as u32, ip_a, 443 as u32);
-  if filter_check_frame(f5, l5) != (0 as u32) { ok = 0; }
+  if filter_check_frame(f5, l5, 0 as u32) != (0 as u32) { ok = 0; }
 
   // 5. A rule naming a specific dst_port must never match a portless
   // protocol (ICMP) -- has_port stays 0 for it regardless of the
@@ -6684,7 +6727,7 @@ fn filter_self_test() -> i64 {
   let _ = fw_set_default_policy(1 as u32);
   let f6: mut ref i64 = dhruva_alloc_bytes(64);
   let l6: i64 = filter_build_test_frame(f6, 1 as u32, ip_a, 80 as u32); // ICMP
-  if filter_check_frame(f6, l6) != (1 as u32) { ok = 0; }
+  if filter_check_frame(f6, l6, 0 as u32) != (1 as u32) { ok = 0; }
 
   // 6. Non-IPv4 traffic (e.g. ARP) passes through untouched regardless
   // of policy or rules -- deny-everything default/rule still must not
@@ -6692,12 +6735,85 @@ fn filter_self_test() -> i64 {
   let _ = fw_set_default_policy(0 as u32);
   let f7: mut ref i64 = dhruva_alloc_bytes(64);
   let _ = buf_write_u16_be(f7, 12, 0x0806 as u32); // ethertype: ARP
-  if filter_check_frame(f7, 38) != (1 as u32) { ok = 0; }
+  if filter_check_frame(f7, 38, 0 as u32) != (1 as u32) { ok = 0; }
 
   let _ = fw_flush();
   let _ = fw_set_default_policy(saved_policy);
 
   let _ = uart_puts("FW: packet filter rule matching (default/specific/proto/order/port/non-ip)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round 72: same shape as filter_build_test_frame, but writes the
+// given IP into the DESTINATION field (ip_offset+16) instead of the
+// source field -- for building synthetic OUTGOING test frames, where
+// the "other party" a rule should match is the destination, not the
+// (for an outgoing frame, always-our-own) source.
+fn filter_build_test_frame_dst(frame: mut ref i64, proto: u32, dst_ip: u32, dst_port: u32) -> i64 {
+  let _ = buf_write_u16_be(frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let _ = buf_write_byte(frame, 23 as u32, proto);    // ip_offset(14)+9
+  let _ = buf_write_u32_be(frame, 30, dst_ip);        // ip_offset(14)+16
+  let _ = buf_write_u16_be(frame, 36, dst_port);      // tcp/udp_offset(34)+2
+  return 38;
+}
+
+// Round 72: outgoing packet filtering -- both filter_check_frame's own
+// directional logic (a rule's src_ip field means "the other party,"
+// so it must match an outgoing frame's DESTINATION, not its own
+// always-self source field) and the real netif_send_frame integration
+// (a denied frame must never reach the loopback queue at all, while
+// reporting success -- the sender never learns, same convention
+// fault_netdrop_maybe_inject already established for this exact
+// function).
+fn filter_outgoing_self_test() -> i64 {
+  let ok: i64 = 1;
+  let saved_policy: u32 = fw_get_default_policy();
+  let _ = fw_flush();
+
+  let ip_a: u32 = 0x0A000003 as u32; // 10.0.0.3
+  let ip_b: u32 = 0x0A000004 as u32; // 10.0.0.4
+
+  // 1. A rule naming ip_a must match an OUTGOING frame whose
+  // DESTINATION is ip_a, even though that same frame's own literal
+  // source-IP field (never written here, reads as 0) would never
+  // match it.
+  let _ = fw_set_default_policy(1 as u32);
+  let _ = fw_add_rule(6 as u32, ip_a, 1 as u32, 80 as u32, 1 as u32, 0 as u32); // deny TCP/80 to ip_a
+  let f1: mut ref i64 = dhruva_alloc_bytes(64);
+  let l1: i64 = filter_build_test_frame_dst(f1, 6 as u32, ip_a, 80 as u32);
+  if filter_check_frame(f1, l1, 1 as u32) != (0 as u32) { ok = 0; }
+  // The SAME frame checked as INCOMING must NOT match -- confirms
+  // is_outgoing genuinely switches which field is consulted, not a
+  // no-op flag.
+  if filter_check_frame(f1, l1, 0 as u32) != (1 as u32) { ok = 0; }
+  // A different destination still falls through to the (allow) default.
+  let f2: mut ref i64 = dhruva_alloc_bytes(64);
+  let l2: i64 = filter_build_test_frame_dst(f2, 6 as u32, ip_b, 80 as u32);
+  if filter_check_frame(f2, l2, 1 as u32) != (1 as u32) { ok = 0; }
+
+  // 2. Real integration: netif_send_frame must actually drop a
+  // filtered outgoing frame (never queued) while still queuing a
+  // non-denied one normally.
+  let before_count: i64 = netif_get_count();
+  let send_denied: i64 = netif_send_frame(f1, l1);
+  if send_denied != 0 { ok = 0; }
+  if netif_get_count() != before_count { ok = 0; } // never queued
+
+  let send_allowed: i64 = netif_send_frame(f2, l2);
+  if send_allowed != 0 { ok = 0; }
+  if netif_get_count() != (before_count + 1) { ok = 0; } // queued normally
+  let drain: mut ref i64 = dhruva_alloc_bytes(64);
+  let _ = netif_recv_frame(drain, 64); // don't leave it queued for a later test
+
+  let _ = fw_flush();
+  let _ = fw_set_default_policy(saved_policy);
+
+  let _ = uart_puts("FW: outgoing packet filtering (netif_send_frame egress hook, directional src/dst semantics)");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -27749,6 +27865,7 @@ fn kernel_main() -> i64 {
   let _ = netif_init();
   let _ = netif_self_test();
   let _ = filter_self_test();
+  let _ = filter_outgoing_self_test();
   let _ = arp_self_test();
   let _ = arp_resolve_self_test();
   let _ = ipv4_self_test();

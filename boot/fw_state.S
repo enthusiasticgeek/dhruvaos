@@ -86,16 +86,41 @@ fw_flush:
 /* u32 fw_add_rule(proto, src_ip, src_ip_valid, dst_port, dst_port_
  * valid, action) -- 6 args, so AAPCS spills the last two (dst_port_
  * valid, action) onto the stack (r0-r3 hold the first four). Returns
- * 0 on success, 0xFFFFFFFF if the table is already full (8 rules). */
+ * 0 on success, 0xFFFFFFFF if the table is already full (8 rules).
+ *
+ * BUG FIX (found round 72, 2026-09-05, via a real live symptom -- a
+ * caller's own live local values went silently wrong immediately
+ * after calling this function, first suspected as a vani-compiler
+ * codegen bug and disassembled to rule that out before finding the
+ * real cause here): storing 6 fields needs more than the 4 scratch
+ * registers (r0-r3) AAPCS actually grants a callee -- this function
+ * used r4/r5/r6 as extra scratch (holding the 2 stack-loaded args
+ * plus a repeatedly-reloaded table-field-address register) WITHOUT
+ * saving/restoring them, silently clobbering whatever the CALLER had
+ * live in those same registers. r4-r11 are callee-saved per AAPCS;
+ * any hand-written asm function that touches them must push/pop them,
+ * exactly like every OTHER hand-written function in this codebase
+ * that legitimately needs more than 4 registers already does (see
+ * e.g. fn_filter_build_test_frame_dst's own compiler-generated `push
+ * {r4, r5, r11, lr}` / `pop {r4, r5, r11, pc}"). Same bug CLASS as
+ * this project's own previously-documented AAPCS-callee-saved-
+ * register incidents (project memory:
+ * feedback_aapcs_callee_saved_registers_asm) -- a new instance, not a
+ * regression of an old one; every OTHER function in this file only
+ * ever used r0-r3 already and needed no such fix. Pushing 3 registers
+ * (12 bytes) shifts the caller's own stack-passed arguments down by
+ * 12 bytes too -- the two `ldr ..., [sp, #N]` offsets below account
+ * for that explicitly. */
 .global fw_add_rule
 fw_add_rule:
+    push {r4, r5, r6}
     ldr r12, =fw_rule_count
     ldr r12, [r12]
     cmp r12, #8
     bge fw_add_rule_full
 
-    ldr r4, [sp, #0]           /* dst_port_valid (5th arg, stack) */
-    ldr r5, [sp, #4]           /* action (6th arg, stack) */
+    ldr r4, [sp, #12]          /* dst_port_valid (5th arg, stack -- +12 for the 3 pushed registers above) */
+    ldr r5, [sp, #16]          /* action (6th arg, stack -- +12 likewise) */
 
     ldr r6, =fw_rule_proto
     str r0, [r6, r12, lsl #2]
@@ -114,10 +139,12 @@ fw_add_rule:
     ldr r6, =fw_rule_count
     str r12, [r6]
 
+    pop {r4, r5, r6}
     mov r0, #0
     mov r1, #0
     bx lr
 fw_add_rule_full:
+    pop {r4, r5, r6}
     mvn r0, #0
     mov r1, #0
     bx lr

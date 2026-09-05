@@ -2044,7 +2044,8 @@ for by name.
   separate, deliberate decision for a future round, not something to
   fold in as a side effect of closing this investigation.
 
-- **Packet filtering / iptables-equivalent** — `[DONE, round 60]`
+- **Packet filtering / iptables-equivalent (incoming DONE round 60;
+  outgoing DONE round 72, 2026-09-05)**
   Single hook point in `netif_recv_frame` (all three backends: CDC-ECM,
   LAN9512, loopback), an 8-rule fixed array (`proto`/`src_ip`+valid/
   `dst_port`+valid/`action`, first-match-wins, `default_policy`
@@ -2075,8 +2076,59 @@ for by name.
   through (3 attempts total, zero leaks) and a real `reply from
   10.0.2.2 seq=1` was observed after `fw flush` — real confirmation a
   security control governs real off-box traffic, not just synthetic
-  self-talk. Outgoing filtering (`netif_send_frame`) remains a natural,
-  smaller follow-up, not in this round's scope.
+  self-talk.
+
+  **Outgoing filtering: DONE (round 72, 2026-09-05).** `filter_check_frame`
+  gained a third parameter, `is_outgoing`, so the SAME rule table and
+  first-match-wins logic filters both directions -- a rule's `src_ip`
+  field means "the other party" regardless of direction: for an inbound
+  frame that's genuinely the IP header's own source field, but for an
+  outbound frame (whose header source is always this host's own
+  address) it's the destination field instead, matching what a `fw add
+  ... <ip>` rule intuitively means to whoever configures it. Hooked in
+  at `netif_send_frame`'s own single choke point (every outgoing
+  ARP/IPv4/ICMP/UDP/TCP frame already passes through it, mirroring
+  `netif_recv_frame`'s three ingress hooks) -- a denied frame is
+  silently dropped and reported as success, the same "the sender never
+  learns" convention `fault_netdrop_maybe_inject` already established
+  for this exact function. New `filter_outgoing_self_test` covers both
+  the directional field-selection logic and the real `netif_send_frame`
+  integration (a denied frame never reaches the loopback queue at all;
+  a non-denied one queues normally). Live-verified over the real
+  interactive shell: `fw add deny icmp 0.0.0.0 any` then `ping
+  0.0.0.0` genuinely suppresses the reply (`ping: no reply`), and `fw
+  flush` genuinely restores it -- the same live-verification bar
+  round 60's own incoming half already met.
+
+  **Found and fixed a real, pre-existing bug along the way, not
+  introduced by this round**: `fw_add_rule` (`boot/fw_state.S`) used
+  `r4`/`r5`/`r6` as scratch registers (to hold 2 stack-loaded args plus
+  a repeatedly-reloaded table-field-address register) without saving
+  them -- a genuine AAPCS callee-saved-register violation, silently
+  corrupting whatever a CALLER had live in those same registers. Never
+  triggered before because no earlier caller's own register allocation
+  happened to collide; `filter_outgoing_self_test` was the first to
+  expose it. Initially looked exactly like a vani-compiler codegen bug
+  (a literal `u32` argument read as garbage, inconsistently across
+  otherwise-identical call sites) -- ruled that out properly via direct
+  LLVM IR inspection (clean) and ARM disassembly comparison of a
+  working vs. broken build (found the real `fw_add_rule` clobber) before
+  concluding it wasn't vani-compiler's fault, rather than accepting a
+  workaround without knowing why. Fixed with `push {r4,r5,r6}` / `pop
+  {r4,r5,r6}` around the existing body (shifting the two stack-argument
+  offsets down by 12 bytes to account for it) -- exactly the same bug
+  CLASS as this project's own prior AAPCS-callee-saved-register
+  incidents (rounds 53/55/62c/70), a new instance in a function an
+  earlier sweep never reached. Full detail and the bisection method
+  used: project memory `reference_vani_fw_add_rule_misdiagnosis_2026_09_05`;
+  the general methodology is now a persistent, reusable skill at
+  `~/.claude/skills/vani-compiler-bug-bisection/SKILL.md`. Verified: 5/5
+  clean boot-self-test runs (previously 3/3 deterministic failures with
+  the pre-fix binary), `phase4_milestone.py` 15/15, `heap_stress.py`,
+  `power_yank.py` 70/70, plus the live shell round trip above both
+  before and after the fix (confirming the real production feature was
+  correct throughout -- only the new self-test's own narrow register
+  allocation had ever exposed the pre-existing asm bug).
 
 - **Long-running crash: Data Abort at a near-null/wild address after a
   few minutes of pure background activity** — `[ROOT-CAUSED AND FIXED,
