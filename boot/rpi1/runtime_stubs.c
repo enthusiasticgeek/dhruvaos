@@ -427,6 +427,77 @@ void *dhruva_alloc_bytes(long n) {
     return (void*)p;
 }
 
+/* Round 76 -- per-task stack guard pages (docs/RTOS_GAP_ANALYSIS.md's
+ * "No per-task memory or stack protection" gap, directly motivated by
+ * a real stack overflow this project found: a 512-byte task stack
+ * silently corrupted adjacent heap memory and crashed somewhere else,
+ * minutes later, with a misleading fault address, rather than
+ * faulting at the moment of overflow -- see boot/mmu_init.S's own
+ * mmu_l2_table_data comment for the full page-table-granularity
+ * design this builds on).
+ *
+ * Same bump-allocator shape as dhruva_alloc_bytes above, but: rounds
+ * the CURRENT position up to the next real 4KB page boundary (using
+ * the ABSOLUTE address, dhruva_heap's own base + offset -- the static
+ * array itself has no guaranteed alignment from the linker, so
+ * aligning the offset alone would not reliably land on a real page
+ * boundary), reserves one FULL page there as a guard (never returned
+ * to the caller, and never written to -- deliberately left exactly as
+ * boot.S's own clear_bss left it, since it's about to become
+ * inaccessible anyway), then allocates the actual requested stack
+ * bytes immediately after. mmu_guard_page_install (boot/mmu_init.S)
+ * marks that one page invalid in the live page table before this
+ * function returns, so a downward-growing stack overflowing past its
+ * own allocation takes a real, immediate Data Abort at the exact
+ * moment of overflow instead of silently corrupting whatever
+ * allocation happened to come next.
+ *
+ * Deliberately a SEPARATE function from dhruva_alloc_bytes, not a
+ * flag on it: only task stacks get this treatment (218+ other call
+ * sites across kernel_main.vani allocate ordinary scratch buffers,
+ * where a guard page per allocation would burn 4KB-per-call worth of
+ * heap for no real benefit -- a scratch buffer overrunning its own
+ * bounds is a very different, and differently-caught, class of bug
+ * than a task's entire call stack overflowing). Costs up to one wasted
+ * page (4095 bytes) of alignment padding plus one full guard page
+ * (4096 bytes) per call -- affordable at this project's own 768KB
+ * heap scale for the handful of task stacks actually allocated (6
+ * fixed + a few dynamic), not something every one of the hundreds of
+ * small scratch allocations should pay. */
+extern void mmu_guard_page_install(unsigned long addr);
+
+void *dhruva_alloc_stack_guarded(long n) {
+    unsigned long need = (unsigned long)n;
+    unsigned long saved_cpsr;
+    __asm__ volatile ("mrs %0, cpsr\n\tcpsid i" : "=r"(saved_cpsr) :: "memory");
+
+    unsigned long base = (unsigned long)dhruva_heap;
+    unsigned long cur_abs = base + dhruva_heap_used;
+    unsigned long aligned_abs = (cur_abs + 4095UL) & ~4095UL;
+    unsigned long guard_offset = aligned_abs - base;
+    unsigned long usable_offset = guard_offset + 4096UL;
+
+    if (usable_offset + need > DHRUVA_HEAP_BYTES) {
+        unsigned long used_at_failure = dhruva_heap_used;
+        dhruva_oom_fatal(need, used_at_failure, 0);
+        /* unreachable -- dhruva_oom_fatal never returns */
+    }
+    unsigned char *guard_ptr = dhruva_heap + guard_offset;
+    unsigned char *usable_ptr = dhruva_heap + usable_offset;
+    dhruva_heap_used = usable_offset + need;
+    dhruva_alloc_count = dhruva_alloc_count + 1;
+    __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
+
+    mmu_guard_page_install((unsigned long)guard_ptr);
+
+    unsigned long i = 0;
+    while (i < need) {
+        usable_ptr[i] = 0;
+        i = i + 1;
+    }
+    return (void*)usable_ptr;
+}
+
 /* Backs kernel_main.vani's heap_usage_self_test -- a permanent
  * early-warning canary added by the same round-10 fix that resized
  * this heap, so a future round eating back into the new headroom

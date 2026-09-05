@@ -30,6 +30,12 @@ intent "Dhruva Phase 0-2 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model 
 // address here removes the entire "which register is this actually in"
 // risk class the earlier plain-i64 version had to work around by hand.
 extern "C" fn dhruva_alloc_bytes(n: i64) -> mut ref i64;
+// Round 76: per-task stack guard pages (docs/RTOS_GAP_ANALYSIS.md's
+// "No per-task memory or stack protection" gap) -- see boot/rpi1/
+// runtime_stubs.c's own comment for the full design. Used ONLY for
+// the 10 real task-stack allocations below, never for ordinary
+// scratch buffers.
+extern "C" fn dhruva_alloc_stack_guarded(n: i64) -> mut ref i64;
 extern "C" fn dhruva_heap_used_bytes() -> i64;
 // Round 51: total dhruva_alloc_bytes call count (distinct from bytes
 // used above) + fault-injection arming -- see runtime_stubs.c's own
@@ -28190,13 +28196,13 @@ fn kernel_main() -> i64 {
   let _ = uart_rx_irq_init();
 
   let stack_bytes: i64 = 4096;
-  let stack_a: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_a: mut ref i64 = dhruva_alloc_stack_guarded(stack_bytes);
   let _ = stack_canary_set_base(0 as u32, stack_a);
-  let stack_b: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_b: mut ref i64 = dhruva_alloc_stack_guarded(stack_bytes);
   let _ = stack_canary_set_base(1 as u32, stack_b);
-  let stack_c: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_c: mut ref i64 = dhruva_alloc_stack_guarded(stack_bytes);
   let _ = stack_canary_set_base(2 as u32, stack_c);
-  let stack_d: mut ref i64 = dhruva_alloc_bytes(stack_bytes);
+  let stack_d: mut ref i64 = dhruva_alloc_stack_guarded(stack_bytes);
   let _ = stack_canary_set_base(3 as u32, stack_d);
   // BUG (round 4 audit, 2026-08-27): task_e was still allocated the
   // same stock 4096 bytes every non-FS task gets, even though this
@@ -28224,7 +28230,7 @@ fn kernel_main() -> i64 {
   // in that crash report was actually task_f (SHELL/tlsecho), not
   // task_e. Back to the original, still-justified 16384.
   let stack_e_bytes: i64 = 16384;
-  let stack_e: mut ref i64 = dhruva_alloc_bytes(stack_e_bytes);
+  let stack_e: mut ref i64 = dhruva_alloc_stack_guarded(stack_e_bytes);
   let _ = stack_canary_set_base(4 as u32, stack_e);
   // BUG (task #9, found via the same event-driven interactive test):
   // task_f's real stack was originally the same 4096 bytes every other
@@ -28274,7 +28280,7 @@ fn kernel_main() -> i64 {
   // arbitrarily far downstream the way every one of these incidents
   // did before it existed.
   let stack_f_bytes: i64 = 262144;
-  let stack_f: mut ref i64 = dhruva_alloc_bytes(stack_f_bytes);
+  let stack_f: mut ref i64 = dhruva_alloc_stack_guarded(stack_f_bytes);
   let _ = stack_canary_set_base(5 as u32, stack_f);
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
@@ -28321,7 +28327,7 @@ fn kernel_main() -> i64 {
   // trusting the bare static minimum -- see docs/TODO.md for the full
   // investigation writeup.
   let custom_stack_bytes: u32 = 4096 as u32;
-  let custom_stack: mut ref i64 = dhruva_alloc_bytes(custom_stack_bytes as i64);
+  let custom_stack: mut ref i64 = dhruva_alloc_stack_guarded(custom_stack_bytes as i64);
   let _ = stack_canary_set_base(6 as u32, custom_stack);
   let custom_task_id: u32 = task_create(task_custom_demo, custom_stack, custom_stack_bytes, 3 as u32);
   let _ = uart_puts("task_create: new task id=");
@@ -28336,11 +28342,11 @@ fn kernel_main() -> i64 {
   // Round 60: same fix, same reasoning as custom_stack_bytes above --
   // was 512 bytes with zero headroom, raised to match project convention.
   let mutex_low_stack_bytes: u32 = 4096 as u32;
-  let mutex_low_stack: mut ref i64 = dhruva_alloc_bytes(mutex_low_stack_bytes as i64);
+  let mutex_low_stack: mut ref i64 = dhruva_alloc_stack_guarded(mutex_low_stack_bytes as i64);
   let _ = stack_canary_set_base(7 as u32, mutex_low_stack);
   let mutex_low_task_id: u32 = task_create(task_mutex_demo_low, mutex_low_stack, mutex_low_stack_bytes, 2 as u32);
   let mutex_high_stack_bytes: u32 = 4096 as u32;
-  let mutex_high_stack: mut ref i64 = dhruva_alloc_bytes(mutex_high_stack_bytes as i64);
+  let mutex_high_stack: mut ref i64 = dhruva_alloc_stack_guarded(mutex_high_stack_bytes as i64);
   let _ = stack_canary_set_base(8 as u32, mutex_high_stack);
   let mutex_high_task_id: u32 = task_create(task_mutex_demo_high, mutex_high_stack, mutex_high_stack_bytes, 0 as u32);
   let _ = uart_puts("task_create: mutex demo task ids=");
@@ -28356,7 +28362,7 @@ fn kernel_main() -> i64 {
   // synchronous dharafs_* call site.
   let _ = dharafs_queue_reset();
   let fsq_stack_bytes: u32 = 4096 as u32;
-  let fsq_stack: mut ref i64 = dhruva_alloc_bytes(fsq_stack_bytes as i64);
+  let fsq_stack: mut ref i64 = dhruva_alloc_stack_guarded(fsq_stack_bytes as i64);
   let _ = stack_canary_set_base(9 as u32, fsq_stack);
   let fsq_task_id: u32 = task_create(task_fsq, fsq_stack, fsq_stack_bytes, 2 as u32);
   let _ = uart_puts("task_create: fsqueue dispatcher task id=");

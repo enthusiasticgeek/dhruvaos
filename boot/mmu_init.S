@@ -164,6 +164,35 @@ mmu_page_table:
                     * is unmapped and faults immediately rather than
                     * silently doing something wrong. */
 
+/* Round 76 -- per-task stack guard pages (docs/RTOS_GAP_ANALYSIS.md's
+ * "No per-task memory or stack protection" gap, directly motivated by
+ * a real stack overflow this project found: a 512-byte task stack
+ * silently corrupted adjacent heap memory and crashed somewhere else,
+ * minutes later, with a misleading fault address, rather than faulting
+ * at the moment of overflow). Section 1 (0x00100000-0x001FFFFF, this
+ * table's own second entry below) covers .data/.bss/the heap/every
+ * task stack -- but a 1MB SECTION descriptor is one uniform permission
+ * for the whole megabyte, no finer boundary expressible (this file's
+ * own original comment already flagged this as "out of this round's
+ * scope" back at round 38). This second-level ("coarse") page table
+ * gives that ONE section 4KB ("small page") granularity instead --
+ * 256 entries x 4 bytes, ARMv6's own coarse-table size for exactly a
+ * 1MB region -- so `dhruva_alloc_stack_guarded` (boot/rpi1/
+ * runtime_stubs.c) can install one no-access guard page directly
+ * before each task's own stack, entirely at runtime, well after this
+ * table is first built (task stacks don't even exist yet at boot-time
+ * mmu_init -- they're carved from the heap much later, during
+ * kernel_main's task_create calls). Every entry defaults to the exact
+ * same RW/XN small-page permissions Section 1's own descriptor already
+ * used (see mmu_init's own loop below) -- nothing about this section's
+ * behavior changes until a guard page is explicitly installed. */
+.align 10   /* 1KB alignment -- an ARMv6 coarse (L2) page table's own
+             * base-address field requires bits[9:0] zero. */
+.global mmu_l2_table_data
+mmu_l2_table_data:
+    .space 1024   /* 256 x 4-byte small-page descriptors, exactly
+                   * covering Section 1's own 1MB (256 x 4KB). */
+
 .section ".text"
 
 .global mmu_init
@@ -191,15 +220,44 @@ mmu_init:
     /* Section 1 (0x00100000-0x001FFFFF): .data/.bss (includes the
      * 256KB heap)/task stacks/.ARM.exidx+extab -- link.ld's own new
      * 1MB ALIGN before .data guarantees all of this starts exactly at
-     * this boundary. Read+write, never execute: APX=0,AP=01 (0x400)
-     * -- "privileged read-write, unprivileged no access" -- same
-     * AP=01 choice as the code section above, for the same reason
-     * (privileged-only access is all this kernel ever needs). Same
-     * Normal Non-cacheable memory type as code (0x1000), XN=1 (0x10). */
-    ldr r5, =0x00100000
-    ldr r6, =0x00001412
-    orr r5, r5, r6
+     * this boundary. Round 76: now a PAGE TABLE (coarse) descriptor,
+     * not a plain section descriptor -- see mmu_l2_table_data's own
+     * comment above for why (per-task stack guard pages need 4KB
+     * granularity a 1MB section can't express). L1 "page table"
+     * format: bits[31:10] = L2 table base, bits[8:5] = domain (0,
+     * matching every other entry in this table), bits[1:0] = 0b01
+     * (coarse page table type). Populated below with one uniform
+     * small-page descriptor per entry, matching Section 1's OLD
+     * section-level permissions exactly (read+write, never execute,
+     * Normal Non-cacheable) -- nothing about this section's actual
+     * behavior changes here; only its granularity does. */
+    ldr r5, =mmu_l2_table_data
+    orr r5, r5, #1
     str r5, [r4, #4]
+
+    /* Populate all 256 small-page entries. Small-page descriptor
+     * format (DIFFERENT bit layout from the section format above --
+     * XN lives at bit[0] here, not bit[4]): bits[31:12] = page base,
+     * bits[8:6] = TEX (001 = Normal Non-cacheable, matching every
+     * other mapping in this table), bits[5:4] = AP (01 = privileged
+     * read-write, same AP=01 choice as every section above), bit[9] =
+     * APX (0), bits[1:0] = 0b11 (small page, WITH bit[0]=XN=1 folded
+     * into the type field -- 0b10 would mean small page, XN=0,
+     * executable; this project's data/heap/stack region must never be
+     * executable, same reasoning as section 1's own original XN=1).
+     * Value per entry (excluding page base) = TEX(0x40) | AP(0x10) |
+     * type+XN(0x3) = 0x53. */
+    ldr r6, =mmu_l2_table_data
+    ldr r7, =0x00100000    /* first page's physical base */
+    mov r5, #0
+mmu_init_l2_data_loop:
+    ldr r0, =0x53
+    orr r0, r0, r7
+    str r0, [r6, r5, lsl #2]
+    add r7, r7, #0x1000
+    add r5, r5, #1
+    cmp r5, #256
+    blt mmu_init_l2_data_loop
 
     /* Sections 512-527 (0x20000000-0x20FFFFFF, 16MB): every BCM2835
      * peripheral this project uses falls inside this one block with
@@ -305,4 +363,42 @@ mmu_init_vcram_loop:
     mcr p15, 0, r5, c1, c0, 0
 
     ldmia sp!, {r4-r7, lr}
+    bx lr
+
+/* i64 mmu_guard_page_install(mut ref i64 addr) -- round 76, the
+ * runtime half of the per-task stack guard mechanism (see mmu_l2_
+ * table_data's own comment above for the full design). Called from
+ * dhruva_alloc_stack_guarded (boot/rpi1/runtime_stubs.c) once per task
+ * stack, well after boot -- unlike everything else in this file, this
+ * genuinely MODIFIES the live page table at runtime rather than only
+ * building it once at boot, since task stacks don't exist yet when
+ * mmu_init itself runs.
+ *
+ * addr MUST be a 4KB-page-aligned address inside Section 1's own
+ * 0x00100000-0x001FFFFF range -- dhruva_alloc_stack_guarded's own
+ * bump-and-align logic is what guarantees this; this function does
+ * not (and architecturally cannot cheaply) re-verify the range itself,
+ * matching this project's own convention of trusting an internal,
+ * single-caller contract rather than re-deriving invariants centrally
+ * available data already guarantees.
+ *
+ * Zeroing the small-page descriptor gives bits[1:0]=00, "invalid,
+ * fault on any access" -- the identical convention this whole page
+ * table already uses for anything unmapped. A single-entry TLB
+ * invalidate (TLBIMVA, not a full-TLB flush) is sufficient and cheap
+ * even though this runs many times during boot (once per task stack)
+ * -- only the one page being newly guarded could possibly have a
+ * stale, now-wrong TLB entry from its previous (valid, RW) mapping. */
+.global mmu_guard_page_install
+mmu_guard_page_install:
+    sub r1, r0, #0x00100000
+    lsr r1, r1, #12
+    ldr r2, =mmu_l2_table_data
+    mov r3, #0
+    str r3, [r2, r1, lsl #2]
+
+    mcr p15, 0, r0, c8, c7, 1   /* TLBIMVA: invalidate this one page's
+                                 * TLB entry by MVA (r0 still holds the
+                                 * page-aligned address unchanged) */
+    mov r0, #0
     bx lr

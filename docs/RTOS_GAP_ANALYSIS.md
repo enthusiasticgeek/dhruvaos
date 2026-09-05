@@ -83,7 +83,7 @@ doesn't yet attempt.
 
 ## 3. Memory / fault isolation gaps (the largest one)
 
-- **No per-task memory or stack protection.** Every task shares one flat
+- ~~**No per-task memory or stack protection.** Every task shares one flat
   address space with no MPU/MMU-enforced boundary around its own stack.
   This is not theoretical: **this exact session found a real stack overflow
   in a 512-byte task stack (`task_custom_demo`/`task_mutex_demo_low/high`,
@@ -98,7 +98,28 @@ doesn't yet attempt.
   is already enabled and in active use here for W^X (round 38) — extending
   the existing page tables to add one no-access guard page per task stack
   is a concrete, buildable next step, not blocked on new hardware or a new
-  subsystem.
+  subsystem.~~ **`[DONE, round 76, 2026-09-05]`** — the 1MB section
+  covering `.data`/`.bss`/the heap/every task stack was converted from a
+  flat section descriptor to a genuine second-level (coarse) page table
+  (`boot/mmu_init.S`'s new `mmu_l2_table_data`, 256 x 4KB small-page
+  descriptors) — ARMv6's short-descriptor format offers no finer boundary
+  than a full 1MB section otherwise. A new `dhruva_alloc_stack_guarded`
+  (`boot/rpi1/runtime_stubs.c`), used only for the 10 real task-stack
+  allocations (not the hundreds of ordinary scratch-buffer calls), rounds
+  up to the next real page boundary, reserves one full 4KB guard page,
+  then allocates the actual stack immediately after — `mmu_guard_page_
+  install` (`boot/mmu_init.S`) zeroes that one page's descriptor in the
+  LIVE table at runtime (task stacks don't exist yet when `mmu_init`
+  itself builds the table at boot) and invalidates just that page's TLB
+  entry. Live-verified, not just written: a temporary (not committed)
+  probe wrote 16 bytes below a fresh guarded allocation and took a real
+  Data Abort — `status=0x807` (page-level translation fault, the
+  zeroed/invalid descriptor doing its job) at exactly the guard page's
+  own address, not a distant or wandering fault the way the original
+  motivating bug's own crash was. Full regression battery
+  (`phase4_milestone.py`, `heap_stress.py`, `power_yank.py`) clean,
+  heap headroom still ~290KB despite the new per-stack guard-page
+  overhead.
 - **No fault containment between tasks.** A bug in one task can freely
   corrupt another task's state or global kernel memory; there is no
   hardware boundary a task's own bug is contained by.
@@ -199,9 +220,10 @@ doesn't yet attempt.
    an unknown one.
 
 **Phase B — medium, builds on what already exists:**
-4. Per-task stack guard pages via the existing MMU (directly motivated by
+4. ~~Per-task stack guard pages via the existing MMU (directly motivated by
    this session's own real stack-overflow bug) — the single highest-value
-   fault-isolation improvement available without new hardware.
+   fault-isolation improvement available without new hardware.~~
+   `[DONE, round 76]` — see "Memory / fault isolation gaps" above.
 5. Bound `dharafs_compact`'s per-call work (resumable, N-blocks-per-call).
 6. Runtime deadline-miss counters, feeding the already-planned per-task
    histogram/deadline-model TODO item.
