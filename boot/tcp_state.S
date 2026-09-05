@@ -65,6 +65,20 @@ tcp_conn_rtx_len:
     .word 0, 0           /* 0 = the pending retransmission is a bare
                           * SYN (no payload); > 0 = a data segment,
                           * this many bytes of tcp_conn_rtx_buf */
+tcp_conn_remote_window:
+    .word 0, 0           /* Round 72: the peer's own last-advertised
+                          * receive window (bytes), captured from every
+                          * incoming segment's window field and
+                          * consulted by tcp_conn_send_data before
+                          * sending -- see kernel_main.vani's own
+                          * comment on why this was previously "accepted,
+                          * never enforced." tcp_conn_active_open/
+                          * _passive_open reset this to 65535 (this
+                          * project's own default advertised window,
+                          * matching tcp_send_segment's own hardcoded
+                          * value) so a connection has a sane assumption
+                          * before the first real segment tells it
+                          * otherwise. */
 
 .section ".bss"
 .align 4
@@ -219,6 +233,19 @@ tcp_conn_get_rtx_len:
 .global tcp_conn_set_rtx_len
 tcp_conn_set_rtx_len:
     ldr r2, =tcp_conn_rtx_len
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    bx lr
+
+.global tcp_conn_get_remote_window
+tcp_conn_get_remote_window:
+    ldr r1, =tcp_conn_remote_window
+    ldr r0, [r1, r0, lsl #2]
+    bx lr
+
+.global tcp_conn_set_remote_window
+tcp_conn_set_remote_window:
+    ldr r2, =tcp_conn_remote_window
     str r1, [r2, r0, lsl #2]
     mov r0, #0
     bx lr

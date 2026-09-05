@@ -209,9 +209,10 @@ multi-round item elsewhere in this backlog.
   runs instead of only inside `dharafs_block_dev_self_check`, and validate
   the existing self-test battery against it.
 
-- **TCP retransmission + simultaneous open** — `[M-L, ~3-4 rounds —
-  DONE in one round (37); simultaneous-CLOSE and the advertised
-  window remain genuinely out of scope, see below]`
+- **TCP retransmission + simultaneous open + simultaneous close +
+  advertised-window enforcement** — `[M-L, ~3-4 rounds — retransmission
+  and simultaneous open DONE round 37; simultaneous close and window
+  enforcement DONE round 72, 2026-09-05, see below]`
   Today's TCP was "a real, useful, correctly-sequenced happy-path
   connection lifecycle, not a spec-complete implementation" — no
   retransmission timers, no simultaneous-open/simultaneous-close, and
@@ -255,12 +256,64 @@ multi-round item elsewhere in this backlog.
     needed since this is purely about segment-ordering logic, not
     timers) using the same hand-fed-frame "traffic cop" technique
     `tcp_conn_self_test` already established.
-  - Explicitly NOT done, and not attempted this round: simultaneous
-    CLOSE (both sides sending FIN before seeing the peer's), and the
-    advertised window being consulted at all (still accepted, never
-    enforced). Neither was needed to satisfy "retransmission and
-    simultaneous open" as asked; flagged here rather than silently
-    left implicit, in case either matters for a future round.
+  - Not attempted in round 37: simultaneous CLOSE (both sides sending
+    FIN before seeing the peer's), and the advertised window being
+    consulted at all (still accepted, never enforced). Neither was
+    needed to satisfy "retransmission and simultaneous open" as asked;
+    flagged there rather than silently left implicit.
+  - **Done (round 72, 2026-09-05): simultaneous close.** The existing
+    FIN_WAIT branch used to treat ANY ack while in that state as proof
+    the peer had acknowledged OUR FIN specifically -- correct for the
+    normal one-sided-close case (the peer was ESTABLISHED, saw our
+    FIN, and its response necessarily acknowledges it), but wrong for
+    the genuinely simultaneous case: if the peer independently called
+    `tcp_conn_close` before ever seeing ours, its own FIN+ACK segment
+    acknowledges only whatever it last knew from us, not our FIN.
+    Fixed with an explicit `our_fin_acked` check (`seg_ack` must equal
+    our own `local_seq`, which `tcp_conn_close` already advanced past
+    our FIN's sequence number) and a new RFC 793 CLOSING state
+    (`tcp_state_closing()`) for the case where it doesn't -- reached
+    when the peer's FIN arrives before it has acknowledged ours, ACKs
+    the peer's FIN immediately, then waits in CLOSING specifically for
+    the peer's own separate ACK of ours before reaching CLOSED_FINAL.
+    Verified with a new boot-time self-test
+    (`tcp_conn_simultaneous_close_self_test`), hand-tracing the exact
+    seq/ack numbers before writing it (to confirm both sides genuinely
+    land in CLOSING, not straight to CLOSED_FINAL, which would have
+    silently meant the new check wasn't actually being exercised) --
+    same hand-fed-frame "traffic cop" technique every other TCP
+    self-test here already uses.
+  - **Done (round 72, 2026-09-05): advertised-window enforcement.**
+    New `tcp_get_window` parser and `tcp_conn_remote_window` per-
+    connection state (`boot/tcp_state.S`), captured unconditionally
+    from every incoming segment by `tcp_conn_handle_segment` (before
+    any state branch, so every code path benefits uniformly) and
+    consulted by `tcp_conn_send_data`, which now refuses (reject,
+    don't guess -- same posture as every other bounds check in this
+    networking layer) to send more than the peer's own last-advertised
+    window rather than sending anyway and hoping the peer buffers it.
+    `tcp_conn_active_open`/`_passive_open` reset it to 65535 (this
+    project's own default advertised window) so a connection has a
+    sane assumption before the first real segment says otherwise.
+    Deliberately NOT built: zero-window probing/persist-timer retry --
+    a real window of 0 simply means every send is refused until a
+    later incoming segment reopens it, a real, honest scope boundary
+    (matching this networking layer's own established "don't build
+    speculative extra" discipline), not silently ignored. Verified
+    with a new white-box boot-time self-test
+    (`tcp_conn_window_enforcement_self_test`, same shape as
+    `tcp_conn_recv_bounds_self_test`'s own synthetic-segment
+    technique): a synthetic segment advertising a small window causes
+    an over-sized send to be rejected and an exactly-sized one to
+    succeed, and a later synthetic segment reopening the window is
+    also honored (not just the first value ever captured).
+    Full regression battery green after both: `qemu_run.py` (both new
+    self-tests PASS; the pre-existing DharaFS/SD FAILs are the
+    already-documented `qemu_run.py`-has-no-SD-drive harness
+    limitation, confirmed unrelated by `phase4_milestone.py`'s own
+    real-SD-drive run passing 15/15 immediately after, including a
+    live `tcpecho`/`tcprtx` round trip), `heap_stress.py`,
+    `power_yank.py`.
 
 - **FS directory hierarchy + multi-block files + journaling
   hardening** — `[L, ~4-5 rounds — DONE, rounds 39 + 42; this header's
