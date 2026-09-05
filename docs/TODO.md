@@ -458,25 +458,34 @@ of an existing driver the way most items above are.
   tracked separately under the Pi 4/5 port's own XHCI entry above
   (`VL805`/`RP1`), not a Pi 1 item.
 
-## DharaFS as a standalone library for other kernels (scoped, round 71, not built)
+## DharaFS as a standalone library for other kernels — DONE, 2026-09-05
 
-User asked whether DharaFS could be decoupled from DhruvaOS for reuse
-elsewhere without sacrificing correctness or performance. Full
-analysis in `docs/DHARAFS_PORTABILITY.md`, based on actually grepping
+Scoped round 71 (see below for the original scoping), then actually
+built the same day: a new standalone repo, `~/source/dharafs` (Apache
+2.0, kosh package `dharafs`), with all three tiers complete and
+verified — core FS, real ChaCha20-Poly1305 AEAD media encryption +
+SHA-256-verified I/O, and the priority-aware FS request queue, each
+its own composable entry point (`lib.vani`/`lib_encrypted.vani`/
+`lib_verified.vani`/`lib_queued.vani`/`lib_tier2.vani`/`lib_tier3.vani`).
+Full detail in `docs/DHARAFS_PORTABILITY.md` (updated in place across
+all three tiers) and the new repo's own `README.md`. DhruvaOS's own
+`kernel_main.vani` was deliberately left untouched throughout —
+migrating it to actually consume the new package via `[deps]` is a
+separate, not-yet-requested step, not a remaining piece of the
+extraction itself.
+
+Original scoping (round 71, for reference): User asked whether DharaFS
+could be decoupled from DhruvaOS for reuse elsewhere without
+sacrificing correctness or performance. Based on actually grepping
 `kernel_main.vani`'s real dependency surface rather than guessing:
-**yes, and `test/host_harness` already proves the hard part** (the FS
+**yes, and `test/host_harness` already proved the hard part** (the FS
 logic compiles and runs correctly as portable C, no ARM/QEMU/scheduler
-dependency). Of DharaFS's 104 functions' 135 external calls, 53 (39%)
-belong to three optional additive features (dirindex/fsqueue/
-snapshots) that can be cut for a minimal port with zero scheduler
-dependency; the real shim surface for a minimal "Tier 1" port is
-block I/O (2 functions), one allocator function, and logging (3
-functions), plus mechanical one-line scratch accessors already proven
-portable by `host_harness`'s own stub file. Packaging mechanism:
-vani-compiler's already-shipped kosh package/namespace system, not a
-new file-splitting scheme. Not started — no second consumer exists
-yet to build against, matching this project's own "don't design for
-hypothetical requirements" discipline.
+dependency). The real extraction later found this scoping note's own
+"53 functions/39% belong to three optional additive features" claim
+imprecise — dirindex/snapshot turned out safer to keep than to cut
+(a provably-safe fallback), only the FS request queue was genuinely
+separable — see `docs/DHARAFS_PORTABILITY.md`'s own corrected
+dependency table.
 
 ## General DMA controller (not scoped — recommendation only, round 35)
 
@@ -612,14 +621,12 @@ for by name.
   tag-verification function (`poly1305_verify_constant_time`) with its
   own accept/reject checks. Live-verified against the RFC vector on
   real ARM/QEMU at boot. The full RFC 8439 ChaCha20-Poly1305 AEAD
-  CONSTRUCTION (key derivation + length-padding + combining) is
-  deliberately NOT built yet -- that's real, TLS-specific plumbing
-  better sized once TLS's actual record-layer needs are known, not
-  speculative work now (this project's own "don't design for
-  hypothetical requirements" discipline). Wiring Poly1305 into DharaFS
-  media encryption (round 62's own flagged follow-up) is also not done
-  here -- out of scope for this round's ask, tracked as a still-open
-  opportunity.
+  CONSTRUCTION (key derivation + length-padding + combining) was, at
+  the time this entry was written, deliberately not built yet -- see
+  the TLS entry below for that (DONE later this same round). Wiring
+  Poly1305 into DharaFS media encryption (round 62's own flagged
+  follow-up) is also DONE -- see the media-encryption entry below
+  (round 69's AEAD/tamper-detection/two-time-pad upgrade).
 
   **X25519 (RFC 7748): DONE (round 67, 2026-09-02).** Real EC point
   arithmetic and modular reduction, the actual missing piece this
