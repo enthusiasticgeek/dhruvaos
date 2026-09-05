@@ -1,6 +1,6 @@
 # DharaFS portability: extracting it for use by other kernels
 
-Scoped out on request (2026-09-05); **Tier 1 and Tier 2 are now both built,
+Scoped out on request (2026-09-05); **Tiers 1, 2, and 3 are now all built,
 standalone, and verified**, in their own repository: `~/source/dharafs`
 (Apache 2.0, kosh package `dharafs`). This document is the feasibility/effort analysis that
 extraction was based on — every number below comes from grepping
@@ -139,10 +139,29 @@ own integration, not to anything in DharaFS itself.
   all four entry points ASAN/UBSAN-clean, with Tier 1's own test
   re-verified unaffected by the core.vani/lib.vani split this required.
   Still zero scheduler dependency.
-- **Tier 3 — add the priority-aware FS queue:** the 7 `dharafs_queue_*`
-  functions plus the 2 scheduler-primitive calls
-  (`current_eff_prio`/`current_task_get`). Requires the target kernel
-  to expose an equivalent scheduler API. Not yet built.
+- **Tier 3 — DONE, `~/source/dharafs`:** the priority-aware FS request
+  queue (8 `dharafs_queue_*` functions, `src/fsqueue.vani`, ported from
+  this project's own `kernel_main.vani`/`boot/fsqueue_state.S`). Of
+  those 8, only `dharafs_queue_submit` (the `Str` convenience wrapper)
+  has an actual scheduler dependency — `current_eff_prio`/
+  `current_task_get`, tagging each request with the calling task's
+  real priority; every other function takes priority/task_id as
+  explicit parameters and has zero scheduler dependency, confirmed by
+  a dedicated test exercising all of them (priority ordering with FIFO
+  tie-breaking checked against the live filesystem, full-queue and
+  oversized-request rejection, delete-via-queue) without needing a
+  real scheduler for almost any of it. `fsqueue.vani` `use`s
+  `core.vani` directly (not `lib.vani`), the same composable-entry-
+  point pattern Tier 2 established — two new entry points,
+  `lib_queued.vani` (queue only) and `lib_tier3.vani` (queue +
+  encryption + verified I/O, the full matrix), each with its own
+  matching runtime file. A composition test confirms all three
+  additions link and run together with zero conflict, including one
+  real cross-feature check: a write dispatched through the queue is
+  transparently encrypted at rest, exactly like a direct
+  `dharafs_append` call. All entry points and tests re-verified
+  passing, including under ASAN/UBSAN. This closes the DharaFS
+  extraction's own scoped roadmap — Tiers 1 through 3 are all done.
 
 ## What this plan deliberately does not do
 
