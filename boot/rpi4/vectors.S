@@ -141,7 +141,10 @@ fault_halt:
 .equ IRQ_GICC_EOIR, 0x010
 .equ IRQ_TIMER_INTID, 30
 .equ IRQ_SPURIOUS_INTID, 1023
-.equ IRQ_HALT_AFTER_TICKS, 5
+/* IRQ_HALT_AFTER_TICKS (was 5) moved into kernel_main_rpi4.vani's own
+ * rpi4_handle_timer_irq (round 75) along with the rest of the tick-
+ * counting/message/halt-vs-rearm decision this constant used to gate
+ * inline here. */
 
 /* Round 70: the real IRQ handler boot/rpi4/gic_timer.S's timer
  * targets. UNLIKE aarch64_fault_common (which halts and never
@@ -171,6 +174,18 @@ fault_halt:
  * right before the final halt message flushed, not a real firmware
  * timing bug. Confirming against the actual hardware counter, not
  * just wall-clock print arrival time, is what actually settled this.
+ *
+ * ROUND 75 UPDATE: the tick-counting/message/halt-vs-rearm decision
+ * that used to run inline here (right after the INTID dispatch below)
+ * is now real vani-compiled code (kernel_main_rpi4.vani's own
+ * rpi4_handle_timer_irq) -- the second concrete increment of porting
+ * kernel_main.vani's boot-facing pieces to this target (round 74 did
+ * the first, a one-shot boot-time proof; this is the first vani code
+ * on this port to run from a genuinely repeated, interrupt-driven call
+ * site). The full x0-x30 save/restore this handler already needed
+ * regardless (see above) is exactly what makes that call site safe
+ * with zero extra register-preservation work -- see that function's
+ * own comment in kernel_main_rpi4.vani for the full reasoning.
  */
 .global aarch64_irq_handler
 aarch64_irq_handler:
@@ -202,29 +217,15 @@ aarch64_irq_handler:
     cmp w19, #IRQ_TIMER_INTID
     b.ne irq_eoi                  /* not our timer: EOI it and move on */
 
-    /* adrp+add, not adr -- see boot/rpi4/boot.S's own comment on why
-     * round 73's 2MB pre-.data ALIGN pushed .bss out of adr's range. */
-    adrp x0, irq_tick_count
-    add x0, x0, :lo12:irq_tick_count
-    ldr w2, [x0]
-    add w2, w2, #1
-    str w2, [x0]
-
-    adr x1, irq_timer_msg
-    bl uart_puts_rpi4
-    mov x0, x2
-    bl uart_put_hex64_rpi4
-
-    cmp w2, #IRQ_HALT_AFTER_TICKS
-    b.lt irq_rearm
-
-    bl gic_timer_disable
-    adr x1, irq_halt_msg
-    bl uart_puts_rpi4
-    b irq_eoi
-
-irq_rearm:
-    bl gic_timer_rearm
+    /* Round 75: the tick-counting/message/halt-vs-rearm decision that
+     * used to live here inline is now real vani-compiled code
+     * (kernel_main_rpi4.vani's own rpi4_handle_timer_irq) -- safe to
+     * call with zero extra register-preservation work on this side,
+     * since every one of x0-x30 is already unconditionally saved above
+     * (this handler must do that regardless, to resume the interrupted
+     * context via `eret` below) -- see that function's own comment for
+     * the full reasoning. */
+    bl rpi4_handle_timer_irq
 
 irq_eoi:
     ldr x0, =IRQ_GICC_BASE
@@ -249,6 +250,27 @@ irq_restore:
     ldr x30, [sp, #240]
     add sp, sp, #256
     eret
+
+/* i64 rpi4_timer_tick_count_increment(void) -- round 75, the one
+ * piece of this file's own timer-tick logic that stayed in hand-
+ * written assembly once the rest (message printing, the halt-vs-
+ * rearm decision) moved into real vani code (kernel_main_rpi4.vani's
+ * own rpi4_handle_timer_irq) -- vani has no top-level global-variable
+ * mechanism, so irq_tick_count still needs a .bss-plus-extern-accessor
+ * home here, the exact same shape every persistent-state file on the
+ * Pi 1 side already uses (e.g. boot/context_switch.S's irq_count).
+ * Increments THEN returns the new value, matching the old inline
+ * assembly's own `add w2,w2,#1` before using w2 -- so a first real
+ * tick reads back as 1, not 0. */
+.global rpi4_timer_tick_count_increment
+rpi4_timer_tick_count_increment:
+    adrp x0, irq_tick_count
+    add x0, x0, :lo12:irq_tick_count
+    ldr w1, [x0]
+    add w1, w1, #1
+    str w1, [x0]
+    mov x0, x1
+    ret
 
 /* x0 = value to print as 16 hex digits, most-significant nibble
  * first -- the AArch64 twin of boot/rpi1's own uart_put_hex32, sized
@@ -307,10 +329,6 @@ fault_msg_elr:
     .asciz " ELR_EL1="
 fault_msg_far:
     .asciz " FAR_EL1="
-irq_timer_msg:
-    .asciz "\nDHRUVA RPI4: real timer IRQ handled, tick="
-irq_halt_msg:
-    .asciz "\nDHRUVA RPI4: 5 real timer IRQs handled, halting\n"
 .align 4
 
 .section ".bss"

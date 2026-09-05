@@ -2901,6 +2901,44 @@ than assumed:
   string. `test/rpi4_boot_smoke.py`/`test/rpi4_timer_smoke.py` both
   still pass unmodified, confirming no regression to the existing
   EL-drop/UART/GIC/timer/IRQ/MMU chain.
+
+  **ROUND 75 UPDATE, 2026-09-05** (still `[PARTIAL]` -- the full
+  28000+-line port remains its own multi-round effort): ported the
+  SECOND piece of this target's boot-facing logic to real vani code --
+  `boot/rpi4/vectors.S`'s `aarch64_irq_handler` used to do its own
+  tick-counting/message-printing/halt-vs-rearm decision entirely
+  inline in hand-written assembly; that logic now lives in `kernel/
+  kernel_main_rpi4.vani`'s `rpi4_handle_timer_irq`, called via a plain
+  `bl` from the timer-INTID branch. Round 74 proved the toolchain with
+  a one-shot boot-time computation; this proves the same pipeline
+  works from a genuinely repeated, interrupt-driven call site -- the
+  first vani code on this port to run more than once, mirroring how Pi
+  1's own `irq_dispatch` became this whole project's original seed.
+
+  Safe with ZERO extra register-preservation work at this call site,
+  unlike the AAPCS callee-saved-register hazard this project keeps
+  re-finding elsewhere (ARM32's r4-r7, round 75's own `scheduler_pick_
+  next`): `aarch64_irq_handler` already unconditionally saves the FULL
+  x0-x30 register file before this call, since it must to resume the
+  interrupted context via `eret` regardless -- whatever the vani code
+  clobbers is already backed up. New `rpi4_timer_tick_count_increment`
+  (`boot/rpi4/vectors.S`) is the one piece that stayed in hand-written
+  assembly (vani has no top-level global-variable mechanism, so the
+  tick counter still needs a `.bss`-plus-extern-accessor home, the
+  same shape every persistent-state file on the Pi 1 side already
+  uses). Removed the now-dead inline assembly, `irq_timer_msg`/
+  `irq_halt_msg` strings, and `IRQ_HALT_AFTER_TICKS` constant.
+  Deliberately left this new vani function untagged
+  (no `#[interrupt]`/`#[wcet]`/`#[bounded_stack]`) -- establishing a
+  real WCET/interrupt-safety story for this brand-new target is its
+  own separate future increment, not needed to prove basic
+  interrupt-context correctness here.
+
+  `test/rpi4_vani_smoke.py` widened to also check for exactly 5 real
+  tick prints plus the halt message (proving the vani code ran
+  correctly on every one of the 5 real timer interrupts, not just
+  once); `test/rpi4_boot_smoke.py`/`test/rpi4_timer_smoke.py` both
+  still pass unmodified.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

@@ -168,6 +168,58 @@ fn kmain_rpi4_vani() -> i64 {
   return 0;
 }
 
+// Round 75 -- the second concrete increment of "port kernel_main.vani
+// (or its boot-facing pieces) to Pi 4/5" (docs/TODO.md, marked
+// [PARTIAL, round 74] until now): real vani-compiled code now runs on
+// EVERY timer tick, not just once at boot. Round 74 proved the
+// toolchain with a one-shot, boot-time-only computation; this proves
+// the same pipeline works from a genuinely repeated, interrupt-driven
+// call site too -- the natural next step, mirroring how Pi 1's own
+// irq_dispatch was this whole project's original seed.
+//
+// Called from boot/rpi4/vectors.S's aarch64_irq_handler via a plain
+// `bl rpi4_handle_timer_irq`, found by this fn's own #[no_mangle]
+// bare name -- same convention kmain_rpi4_vani above and Pi 1's
+// irq_dispatch/kernel_main already use. Safe to call ANY AArch64 C-ABI
+// function here with zero extra register-preservation work on this
+// side: aarch64_irq_handler already unconditionally saves the FULL
+// x0-x30 register file (it must, since it resumes the interrupted
+// context via `eret`) before ever branching here, so whatever this
+// function or anything it calls clobbers is already backed up and
+// restored on the way out regardless -- unlike Pi 1's own irq_dispatch
+// call site (which only saves what a normal AAPCS32 call needs,
+// relying on irq_dispatch's own #[interrupt] tag to enforce safe
+// behavior), there is no equivalent AAPCS-boundary hazard to get
+// wrong here (see [[feedback_aapcs_callee_saved_registers_asm]] for
+// why that class of bug keeps recurring elsewhere in this project --
+// this call site is a structurally different, safer shape).
+//
+// Deliberately untagged ((no #[interrupt]/#[wcet]/#[bounded_stack])),
+// matching kmain_rpi4_vani's own precedent above -- establishing a
+// real WCET/interrupt-safety story for this brand-new target is its
+// own separate future increment, not needed to prove basic
+// interrupt-context correctness here. Also deliberately does NOT use
+// #[bounded(N)] recursion anywhere in its own call chain (see uart_
+// put_u64_rpi4_vani_digits's own comment on why that specific
+// attribute is unsafe on this target today).
+extern "C" fn gic_timer_rearm() -> i64;
+extern "C" fn gic_timer_disable() -> i64;
+extern "C" fn rpi4_timer_tick_count_increment() -> i64;
+
+#[no_mangle]
+fn rpi4_handle_timer_irq() -> i64 {
+  let tick: i64 = rpi4_timer_tick_count_increment();
+  let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: real timer IRQ handled, tick=");
+  let _ = uart_put_i64_rpi4_vani(tick);
+  if tick >= 5 {
+    let _ = gic_timer_disable();
+    let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: 5 real timer IRQs handled, halting\n");
+  } else {
+    let _ = gic_timer_rearm();
+  }
+  return 0;
+}
+
 fn main() -> i64 {
   return 0;
 }
