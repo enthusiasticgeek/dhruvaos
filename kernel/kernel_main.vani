@@ -1091,6 +1091,12 @@ extern "C" fn dharafs_state_get_next_block() -> u32;
 extern "C" fn dharafs_state_get_next_seq() -> u32;
 extern "C" fn dharafs_state_set_log_start(log_start: u32) -> u32;
 extern "C" fn dharafs_state_get_log_start() -> u32;
+// Round 77: dharafs_compact's own resumable-pass state -- see that
+// function's own comment.
+extern "C" fn dharafs_compact_set_resume_block(block: u32) -> u32;
+extern "C" fn dharafs_compact_get_resume_block() -> u32;
+extern "C" fn dharafs_compact_set_failed(failed: u32) -> u32;
+extern "C" fn dharafs_compact_get_failed() -> u32;
 // Hashed directory index (boot/dirindex_state.S) -- see that file's own
 // header comment. Pure RAM-only lookup accelerator for
 // dharafs_find_latest_block_raw, never a correctness authority by
@@ -3820,7 +3826,11 @@ fn dharafs_snapshot_read(path: Str, name: Str, out_buf: mut ref i64) -> i64 {
 // Task #5: garbage collection / log compaction, run periodically from
 // a dedicated low-priority background task (task_gc), never on the
 // hard-RT path. Scans the current live region [log_start, next_block)
-// once; any record that ISN'T the latest for its path (dharafs_find_latest_
+// -- round 77: across as many resumed calls as it takes, at most
+// dharafs_compact_blocks_per_call() blocks of real work each call, see
+// this function's own "Round 77" comment below for the full resumable
+// design; a short region still finishes in one call exactly as before.
+// Any record that ISN'T the latest for its path (dharafs_find_latest_
 // block_raw returns some OTHER block) is dead -- superseded by a
 // later write already in the log. Every record that IS still live
 // gets re-appended (through the exact same crash-safe dharafs_append_raw
@@ -3869,15 +3879,73 @@ fn dharafs_snapshot_read(path: Str, name: Str, out_buf: mut ref i64) -> i64 {
 // existing gc_buf; kernel_main's own one-off self-test call does the
 // same) makes this function's heap footprint bounded regardless of
 // how many times it runs.
+//
+// Round 77: the per-call block budget for dharafs_compact's own
+// resumable scan (see that function's own comment) -- a named
+// constant rather than a bare literal so the bound is self-documenting
+// at every call site that might reason about it (e.g. a future WCET
+// annotation). 8 blocks of real SD I/O per call, chosen the same way
+// this function's own pre-existing "not worth it below 4 blocks"
+// threshold was: small enough that even several tick's worth of
+// compaction work stays a bounded, short slice of task_e's own 20-tick
+// period, large enough that a typical pass (this project's own
+// exercised scale: tens of blocks between passes) still finishes in a
+// small handful of calls, not dozens.
+fn dharafs_compact_blocks_per_call() -> i64 {
+  return 8;
+}
+
 fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) -> i64 {
   let log_start: u32 = dharafs_state_get_log_start();
   let old_next_block: u32 = dharafs_state_get_next_block();
 
   // Not worth the SD traffic on a short log -- stay genuinely
-  // low-cost when there's nothing meaningful to reclaim yet.
-  if (old_next_block - log_start) < (4 as u32) {
-    return 0;
+  // low-cost when there's nothing meaningful to reclaim yet. Only
+  // checked when NOT already resuming a partial pass -- see the
+  // resume-cursor logic just below for why a resumed pass must run
+  // even if this specific check would otherwise skip it.
+  let resume_block: u32 = dharafs_compact_get_resume_block();
+  if resume_block == (0 as u32) {
+    if (old_next_block - log_start) < (4 as u32) {
+      return 0;
+    }
   }
+
+  // Round 77: docs/RTOS_GAP_ANALYSIS.md's own "dharafs_compact() has
+  // unbounded worst-case cost" gap -- this used to scan every block
+  // from log_start to next_block in ONE call, a real SD I/O operation
+  // per block, with cost scaling however much log had accumulated
+  // since the last pass. task_e calls this every 20 ticks
+  // unconditionally, so an unbounded single pass directly undermines
+  // any WCET claim for whatever else is scheduled around it.
+  //
+  // Now resumable and bounded to DHARAFS_COMPACT_BLOCKS_PER_CALL
+  // blocks of real work per call: resume_block (0 = no partial pass in
+  // progress, start fresh from log_start; block 0 is reserved and
+  // never a real scan target, see dharafs_next_block's own comment,
+  // so it's a safe sentinel) picks up exactly where a prior call's own
+  // budget ran out. old_next_block itself is re-read fresh (above)
+  // every call, including resumed ones -- it only ever grows (real
+  // writes keep advancing it), so a resumed pass simply covers
+  // slightly more ground by the time it finishes, never less; the
+  // underlying carry-forward logic is naturally safe to interrupt and
+  // resume this way, since it re-checks "is THIS block still the
+  // CURRENT latest copy" every time rather than working off a
+  // once-computed table -- a block already carried forward by an
+  // earlier partial call is simply found no-longer-latest (its new
+  // copy lives past old_next_block) and skipped harmlessly if
+  // re-scanned.
+  //
+  // dharafs_compact_failed is the STICKY equivalent of the local
+  // all_ok below, persisted ACROSS resumed calls (unlike all_ok
+  // itself, which only lives for one call's own partial scan) --
+  // reset to 0 only when a genuinely fresh pass starts (resume_block
+  // was 0), so a failure from an old, already-finished pass can never
+  // leak into blocking a new one from advancing log_start.
+  if resume_block == (0 as u32) {
+    let _ = dharafs_compact_set_failed(0 as u32);
+  }
+  let start_blk: u32 = if resume_block == (0 as u32) { log_start } else { resume_block };
 
   // BUG (round 7 audit, 2026-08-27): every carry-forward write below
   // used to discard its own return status (`let _ = dharafs_append_raw(...)`
@@ -3898,9 +3966,10 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
   // advancing log_start if the whole pass was clean; a single failure
   // leaves log_start where it was, so the old (still valid) copies stay
   // reachable and the next compaction pass gets another chance.
-  let all_ok: i64 = 1;
-  let blk: i64 = log_start as i64;
-  while (blk as u32) < old_next_block {
+  let all_ok: i64 = if dharafs_compact_get_failed() == (0 as u32) { 1 } else { 0 };
+  let blk: i64 = start_blk as i64;
+  let scanned: i64 = 0;
+  while ((blk as u32) < old_next_block) && (scanned < dharafs_compact_blocks_per_call()) {
     let rd_status: i64 = dharafs_block_read(blk, buf);
     if rd_status == 0 {
       let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
@@ -4000,16 +4069,109 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
       }
     }
     blk = blk + 1;
+    scanned = scanned + 1;
   }
 
-  // Everything before old_next_block now has an equivalent live copy
-  // at or beyond it (or was already dead) -- safe to stop scanning.
-  // Only true if every carry-forward above actually succeeded (see
-  // this function's own header comment) -- a failed one leaves its
-  // only copy in the region about to be abandoned, so log_start must
-  // stay put in that case rather than orphan it.
-  if all_ok == 1 {
-    let _ = dharafs_state_set_log_start(old_next_block);
+  if all_ok == 0 {
+    let _ = dharafs_compact_set_failed(1 as u32);
+  }
+
+  if (blk as u32) >= old_next_block {
+    // The whole [log_start, old_next_block) range has now been
+    // scanned -- possibly across several resumed calls. Everything
+    // before old_next_block now has an equivalent live copy at or
+    // beyond it (or was already dead) -- safe to stop scanning. Only
+    // true if every carry-forward across the WHOLE pass actually
+    // succeeded (dharafs_compact_failed, not just this one call's own
+    // all_ok) -- a single failure anywhere in the pass leaves its only
+    // copy in the region about to be abandoned, so log_start must stay
+    // put in that case rather than orphan it. Either way, the pass is
+    // now genuinely done: reset both persisted fields so the next
+    // dharafs_compact call starts a fresh pass rather than "resuming"
+    // a finished one.
+    if all_ok == 1 {
+      let _ = dharafs_state_set_log_start(old_next_block);
+    }
+    let _ = dharafs_compact_set_resume_block(0 as u32);
+    let _ = dharafs_compact_set_failed(0 as u32);
+  } else {
+    // Hit this call's own block budget before reaching old_next_block
+    // -- remember exactly where to pick up next time. log_start does
+    // NOT move yet; dharafs_compact_failed already persisted above if
+    // this call found a problem, so a later call's own success can't
+    // paper over it.
+    let _ = dharafs_compact_set_resume_block(blk as u32);
+  }
+  return 0;
+}
+
+// Round 77: live proof that dharafs_compact's own per-call budget is
+// genuinely enforced -- not just that the code type-checks. Writes the
+// SAME path 20 times (each dharafs_append call to an already-written
+// path leaves the PREVIOUS record dead the instant a newer one
+// supersedes it, per this whole log's own "latest wins" design -- see
+// dharafs_compact's own header comment), guaranteeing a compaction
+// range of at least 20 blocks, comfortably past
+// dharafs_compact_blocks_per_call()'s own budget of 8.
+fn dharafs_compact_resumable_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let writes: i64 = 0;
+  while writes < 20 {
+    let _ = dharafs_append("/compacttest/file", "x");
+    writes = writes + 1;
+  }
+  let target_next_block: u32 = dharafs_state_get_next_block();
+
+  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let data_buf: mut ref i64 = dhruva_alloc_bytes(4096);
+
+  // First call: with >= 20 blocks of range and an 8-block budget, this
+  // must NOT finish the whole pass in one call.
+  let _ = dharafs_compact(buf, path_buf, data_buf);
+  if dharafs_compact_get_resume_block() == (0 as u32) {
+    ok = 0; // finished in one call -- the budget isn't actually enforced
+  }
+  if dharafs_state_get_log_start() == target_next_block {
+    ok = 0; // log_start shouldn't have reached the final target yet
+  }
+
+  // Keep calling until the pass genuinely finishes (resume cursor
+  // returns to 0), bounded generously so a real non-progress bug fails
+  // this self-test instead of hanging boot forever.
+  let calls: i64 = 1;
+  while (dharafs_compact_get_resume_block() != (0 as u32)) && (calls < 10) {
+    let _ = dharafs_compact(buf, path_buf, data_buf);
+    calls = calls + 1;
+  }
+  if dharafs_compact_get_resume_block() != (0 as u32) {
+    ok = 0; // never finished within a generous call budget
+  }
+  if calls <= 1 {
+    ok = 0; // sanity: this whole test is meaningless if it somehow
+            // only took the one call already checked above
+  }
+
+  // Data must still be correct after a multi-call compaction pass --
+  // the whole point is bounding cost, never losing or corrupting data
+  // along the way.
+  let read_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let read_len: i64 = dharafs_read("/compacttest/file", read_buf);
+  if read_len != 1 {
+    ok = 0;
+  } else {
+    let c: u32 = buf_read_byte(read_buf, 0 as u32);
+    if c != (120 as u32) { // 'x'
+      ok = 0;
+    }
+  }
+
+  let _ = uart_puts("DharaFS: dharafs_compact resumes across multiple bounded calls for a log larger than its per-call budget");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
   }
   return 0;
 }
@@ -28057,6 +28219,9 @@ fn kernel_main() -> i64 {
   // Round 39: multi-block files + journaling hardening.
   let _ = dharafs_multiblock_self_test();
   let _ = dharafs_multiblock_crash_consistency_self_test();
+
+  // Round 77: dharafs_compact's own resumable, per-call-bounded pass.
+  let _ = dharafs_compact_resumable_self_test();
 
   // Round 42: directory hierarchy + owner/group/other rwx permissions.
   let _ = dharafs_permissions_self_test();

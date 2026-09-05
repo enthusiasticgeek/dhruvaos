@@ -75,6 +75,33 @@ dharafs_commit_count:
                      * (dharafs_block_write) via dharafs_commit_count_
                      * increment below, not automatically -- this file
                      * has no way to hook the write call itself. */
+dharafs_compact_resume_block:
+    .word 0        /* Round 77: docs/RTOS_GAP_ANALYSIS.md's own
+                     * "dharafs_compact() has unbounded worst-case
+                     * cost" gap -- its main scan loop used to run from
+                     * log_start all the way to next_block in ONE call,
+                     * a real SD I/O operation per block, cost scaling
+                     * with however much log has accumulated since the
+                     * last pass. This is the resume cursor that makes
+                     * it bounded-per-call instead: 0 means "no partial
+                     * pass in progress, start fresh from log_start"
+                     * (block 0 is reserved/never a real scan target,
+                     * see dharafs_next_block's own comment, so it's a
+                     * safe sentinel); any other value is the next
+                     * block a PRIOR call didn't get to yet within its
+                     * own per-call block budget. */
+dharafs_compact_failed:
+    .word 0        /* Round 77: sticky "did any carry-forward fail
+                     * during the pass currently in progress" flag --
+                     * must persist ACROSS resumed calls (unlike the
+                     * local `all_ok` a single call's own scan uses),
+                     * since a failure in an early partial call must
+                     * still correctly block log_start from advancing
+                     * once the whole range finally finishes scanning,
+                     * potentially many calls later. Reset to 0 only
+                     * when a genuinely FRESH pass starts (resume
+                     * cursor was 0), so an old pass's failure can
+                     * never leak into a new one. */
 
 .section ".text"
 
@@ -109,6 +136,32 @@ dharafs_state_set_log_start:
 .global dharafs_state_get_log_start
 dharafs_state_get_log_start:
     ldr r0, =dharafs_log_start
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_compact_set_resume_block
+dharafs_compact_set_resume_block:
+    ldr r1, =dharafs_compact_resume_block
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_compact_get_resume_block
+dharafs_compact_get_resume_block:
+    ldr r0, =dharafs_compact_resume_block
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_compact_set_failed
+dharafs_compact_set_failed:
+    ldr r1, =dharafs_compact_failed
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_compact_get_failed
+dharafs_compact_get_failed:
+    ldr r0, =dharafs_compact_failed
     ldr r0, [r0]
     bx lr
 

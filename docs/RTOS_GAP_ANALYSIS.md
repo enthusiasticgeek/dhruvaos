@@ -148,7 +148,7 @@ doesn't yet attempt.
 
 ## 5. DharaFS-specific gaps
 
-- **`dharafs_compact()` has unbounded worst-case cost.** Its own main loop
+- ~~**`dharafs_compact()` has unbounded worst-case cost.** Its own main loop
   runs `while blk < old_next_block { dharafs_block_read(...); ... }` —
   confirmed by reading the function directly — meaning its cost scales
   with however much log has accumulated since the last compaction, with a
@@ -158,7 +158,29 @@ doesn't yet attempt.
   is scheduled to run around it. The natural fix is to make compaction
   **resumable and per-call-bounded** (compact at most N blocks per
   invocation, picking up where the last call left off) rather than one
-  unbounded pass.
+  unbounded pass.~~ **`[DONE, round 77, 2026-09-05]`** — added two
+  persisted fields (`dharafs_compact_resume_block`/`_failed`,
+  `boot/dharafs_state.S`) so a pass can span multiple calls: each call
+  now scans at most `dharafs_compact_blocks_per_call()` (8) blocks,
+  remembering exactly where to resume next time if it doesn't reach
+  `next_block`. The underlying carry-forward logic needed no change to
+  support this safely — it already re-derives "is this block still the
+  current latest copy" fresh every time rather than working off a
+  once-computed table, so a block already carried forward by an earlier
+  partial call is simply found no-longer-latest and skipped harmlessly
+  if a later call ever rescans it. The sticky `_failed` flag (distinct
+  from the existing local `all_ok` a single call's own scan already
+  used) carries a failure forward across resumed calls, so `log_start`
+  still correctly refuses to advance even if the failure happened many
+  calls before the pass finally finishes scanning the whole range.
+  Live-verified with a new self-test (`dharafs_compact_resumable_
+  self_test`): writes the same path 20 times (each write leaves the
+  previous record dead, guaranteeing a >20-block range, well past the
+  8-block budget), confirms the first call does NOT finish the pass
+  and `log_start` does NOT yet reach its final target, keeps calling
+  until it genuinely does, then confirms the file's own data is still
+  byte-correct afterward. Full regression battery (`phase4_milestone
+  .py`, `heap_stress.py`, `power_yank.py`) clean.
 - ~~**No concurrency lock protecting DharaFS's own shared state.** Both
   `task_e` (the periodic GC/compact pass) and `task_f` (the interactive
   shell's read/write/rm/etc.) call into DharaFS, and nothing prevents a
@@ -224,7 +246,8 @@ doesn't yet attempt.
    this session's own real stack-overflow bug) — the single highest-value
    fault-isolation improvement available without new hardware.~~
    `[DONE, round 76]` — see "Memory / fault isolation gaps" above.
-5. Bound `dharafs_compact`'s per-call work (resumable, N-blocks-per-call).
+5. ~~Bound `dharafs_compact`'s per-call work (resumable, N-blocks-per-call).~~
+   `[DONE, round 77]` — see "DharaFS-specific gaps" above.
 6. Runtime deadline-miss counters, feeding the already-planned per-task
    histogram/deadline-model TODO item.
 
