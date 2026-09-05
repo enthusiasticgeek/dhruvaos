@@ -123,6 +123,24 @@ screen /dev/ttyUSB0 115200
 
 ## 4. Preparing the SD card
 
+**A helper script (`flash_sd_card.sh`, repo root) automates §4.2-§4.4
+below** — partitioning at the safe offset, formatting, building
+`kernel.img`, writing `config.txt`, and copying everything onto the
+card — once you have the firmware files from §4.1:
+
+```sh
+./flash_sd_card.sh /dev/sdX /path/to/firmware/dir
+```
+
+It requires the device path explicitly (never auto-detects), prints
+`lsblk` output and requires you to type the device path back plus a
+separate `YES` before touching anything, since a wrong-device mistake
+here is real, hard-to-reverse data loss. Read §4.2-§4.4 below at least
+once anyway, even if you use the script — knowing *why* the partition
+offset and `config.txt` setting matter is what lets you diagnose a
+first-boot failure instead of just re-running a script that already
+worked correctly on the wrong assumption.
+
 ### 4.1 Get the Pi 1 boot firmware
 
 The Pi's own GPU boot ROM needs three firmware files it loads before
