@@ -1,0 +1,173 @@
+// Dhruva round 74 -- first real vani-compiled code on the Pi 4/5
+// (AArch64) port. Deliberately NOT a port of kernel_main.vani (28000+
+// lines, written entirely against ARM32/BCM2835 addresses and this
+// project's Pi 1 hand-written asm ABI) -- that is genuinely its own
+// multi-round effort, exactly as docs/TODO.md's own "Remaining scope
+// for a real Pi 4 boot" list already says. This is round 43's own
+// "smallest possible proof" philosophy applied to the OTHER half of
+// this port's remaining gap: prove the vani-toolchain-to-AArch64
+// pipeline itself is genuinely correct end to end, nothing more.
+//
+// Confirmed this round, live, before writing this file: vani's own
+// LLVM backend emits ordinary, target-generic LLVM IR (no ARM32-
+// specific assumptions baked in) -- `vanic emit --backend=llvm` on a
+// trivial two-function program, then `llc -mtriple=aarch64-none-elf`,
+// produced correct, real AArch64 machine code on the first attempt,
+// using the exact same "vanic emits IR, llc lowers it" pipeline
+// build.sh already established for the Pi 1/ARMv6 target. No changes
+// to vani-compiler itself were needed.
+//
+// Every builtin this file uses (`mmio_read_u32`/`mmio_write_u32`/
+// `mmio_write_u8`) is a genuine, target-independent vani-compiler
+// intrinsic (raw volatile load/store on a pointer -- see
+// ssa_backend_llvm.rs's own handling of these three names), the exact
+// same ones kernel_main.vani's own uart_putc/uart_puts already use for
+// the Pi 1 target. This file needs ZERO `extern "C" fn` declarations
+// and zero hand-written-asm helpers of its own -- the only assembly-
+// side dependency at all is `#[no_mangle]` on kmain_rpi4_vani below,
+// so boot/rpi4/boot.S's own `bl kmain_rpi4_vani` can find it by its
+// bare, unmangled name, exactly the same convention this project's
+// Pi 1 side already uses for irq_dispatch/kernel_main.
+//
+// PL011 UART base is 0xFE201000 here, NOT kernel_main.vani's
+// 0x20201000 -- BCM2711's own low-peripheral-mode address (confirmed
+// live in round 40's own spike, already load-bearing in boot/rpi4/
+// boot.S's uart_puts_rpi4), a different SoC generation from the Pi 1's
+// BCM2835. Same PL011 register protocol otherwise (UARTDR at +0x00,
+// UARTFR at +0x18, TXFF at bit 5).
+
+fn uart_putc_rpi4_vani(c: i64) -> i64 {
+  let uart_fr: i64 = 0xFE201018;
+  let uart_dr: i64 = 0xFE201000;
+  while true {
+    let fr: u32 = mmio_read_u32(uart_fr);
+    if (fr & (0x20 as u32)) == (0 as u32) {
+      break;
+    }
+  }
+  let _ = mmio_write_u8(uart_dr, c as u8);
+  return 0;
+}
+
+fn uart_puts_rpi4_vani(s: Str) -> i64 {
+  let n: i64 = str_len_bytes(s);
+  let i: i64 = 0;
+  while i < n {
+    let b: i64 = str_byte_at(s, i);
+    let _ = uart_putc_rpi4_vani(b);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Iterative high-order-digit-first printer -- deliberately avoids
+// needing any scratch buffer (and therefore any extern "C" allocator
+// like kernel_main.vani's own dhruva_alloc_bytes), keeping this
+// file's only non-builtin dependency at exactly zero, per this file's
+// own header comment.
+//
+// FOUND LIVE, this round: an earlier version of this function used
+// recursion under a `#[bounded(20)]` annotation instead. That
+// compiled and type-checked cleanly, but faulted the very first time
+// it actually ran (a real Data Abort, permission fault, at FAR_EL1
+// near address 0x10) -- root-caused via the emitted LLVM IR
+// (`vanic emit --backend=llvm`): `#[bounded(N)]`'s recursion-depth
+// counter is an LLVM `thread_local global i32`, and this freestanding
+// target has never initialized TPIDR_EL0 (no thread pointer at all --
+// nothing in boot/rpi4/boot.S sets one up, matching every other
+// hand-written bring-up file in this project, which have never needed
+// one). `llc`'s local-exec TLS lowering resolves the access relative
+// to that unset (effectively zero) thread pointer, landing near
+// address 0 -- exactly matching the observed fault address. This is
+// the first place in the ENTIRE DhruvaOS codebase `#[bounded(N)]`
+// (recursion-depth, distinct from kernel_main.vani's many
+// `#[bounded_stack(bytes=N)]` stack-size budgets) was ever actually
+// exercised at runtime -- a genuinely latent gap in vani's bare-metal/
+// no-TLS-runtime target support, not something either existing target
+// happened to already work around. Not fixed in vani-compiler itself
+// this round (would need either compiler support for a non-TLS
+// depth-counter mode on freestanding targets, or this project
+// initializing a real TPIDR_EL0-backed TLS block -- out of scope for
+// this round's own goal of proving the toolchain, not extending it);
+// routed around here by simply not using recursion, and noted in
+// docs/TODO.md / project memory for any future vani-on-bare-metal
+// work that reaches for `#[bounded(N)]`.
+fn uart_put_u64_rpi4_vani_digits(v: i64) -> i64 {
+  let power: i64 = 1;
+  while (power * 10) <= v {
+    power = power * 10;
+  }
+  let remaining: i64 = v;
+  while power >= 1 {
+    let d: i64 = remaining / power;
+    let _ = uart_putc_rpi4_vani(48 + d);
+    remaining = remaining - (d * power);
+    power = power / 10;
+  }
+  return 0;
+}
+
+fn uart_put_i64_rpi4_vani(v: i64) -> i64 {
+  if v == 0 {
+    return uart_putc_rpi4_vani(48);
+  }
+  if v < 0 {
+    let _ = uart_putc_rpi4_vani(45); // '-'
+    return uart_put_u64_rpi4_vani_digits(0 - v);
+  }
+  return uart_put_u64_rpi4_vani_digits(v);
+}
+
+// Real computation, not a placeholder: sum(1..100)==5050 (Gauss's own
+// check on a genuine loop, exactly the kind of thing a from-scratch
+// port most needs to prove -- that loops/comparisons/arithmetic all
+// compile and execute correctly on real AArch64 codegen, not just
+// that a function can be called at all), plus one integer division
+// (AArch64 has a hardware SDIV, unlike ARMv6 -- this needs no libgcc
+// helper the way kernel_main.vani's own Phase 4 task #10 division
+// needed __aeabi_ldivmod on the Pi 1 side).
+fn rpi4_vani_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let total: i64 = 0;
+  let i: i64 = 1;
+  while i <= 100 {
+    total = total + i;
+    i = i + 1;
+  }
+  if total != 5050 {
+    ok = 0;
+  }
+
+  let quotient: i64 = 100000 / 7;
+  let remainder: i64 = 100000 - (quotient * 7);
+  if (quotient != 14285) || (remainder != 5) {
+    ok = 0;
+  }
+
+  let _ = uart_puts_rpi4_vani("DHRUVA RPI4: vani-compiled code self-test (sum 1..100 + division)");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  let _ = uart_puts_rpi4_vani("DHRUVA RPI4: sum=");
+  let _ = uart_put_i64_rpi4_vani(total);
+  let _ = uart_puts_rpi4_vani(" quotient=");
+  let _ = uart_put_i64_rpi4_vani(quotient);
+  let _ = uart_puts_rpi4_vani(" remainder=");
+  let _ = uart_put_i64_rpi4_vani(remainder);
+  let _ = uart_puts_rpi4_vani("\n");
+  return 0;
+}
+
+#[no_mangle]
+fn kmain_rpi4_vani() -> i64 {
+  let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
+  let _ = rpi4_vani_self_test();
+  return 0;
+}
+
+fn main() -> i64 {
+  return 0;
+}

@@ -135,6 +135,15 @@ clear_bss_rpi4_done:
 
     bl kmain_rpi4
 
+    /* Round 74: first vani-compiled code on this port -- see kernel/
+     * kernel_main_rpi4.vani's own header comment for the full design
+     * (a deliberately small, self-contained proof of the toolchain,
+     * not a port of kernel_main.vani itself). Called by its bare,
+     * unmangled name via that file's own #[no_mangle], the same
+     * convention this project's Pi 1 side already uses for
+     * irq_dispatch/kernel_main. */
+    bl kmain_rpi4_vani
+
     /* Round 70: GIC + generic-timer bring-up (boot/rpi4/gic_timer.S) --
      * the first real interrupt-driven code on this port. Enable the
      * distributor/CPU-interface/timer-PPI and arm the first tick

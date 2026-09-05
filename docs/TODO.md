@@ -2830,10 +2830,77 @@ than assumed:
   `test/rpi4_timer_smoke.py` both still pass unmodified with the MMU
   live, confirming no regression to the existing EL-drop/UART/GIC/
   timer/IRQ chain.
-- Porting `kernel_main.vani` itself (or a fresh AArch64-native rewrite
-  of its boot-facing pieces) to this target — round 43's/70's kernel
-  is deliberately hand-written assembly only, no vani-compiled code
-  yet.
+- ~~Porting `kernel_main.vani` itself (or a fresh AArch64-native
+  rewrite of its boot-facing pieces) to this target — round 43's/70's
+  kernel is deliberately hand-written assembly only, no vani-compiled
+  code yet.~~ **`[PARTIAL, round 74, 2026-09-05]`** — the toolchain
+  half is done and live-verified; the 28000+-line
+  `kernel_main.vani` port itself is not (still its own multi-round
+  effort, exactly as this list already said).
+
+  Confirmed live, before writing any new code: vani's own LLVM
+  backend emits ordinary, target-generic IR with no ARM32-specific
+  assumptions baked in -- a trivial two-function program, `vanic emit
+  --backend=llvm` then `llc -mtriple=aarch64-none-elf`, produced
+  correct AArch64 machine code on the first attempt, via the exact
+  same "vanic emits IR, llc lowers it" pipeline `build.sh` already
+  uses for the Pi 1/ARMv6 target. No changes to vani-compiler itself
+  needed.
+
+  New `kernel/kernel_main_rpi4.vani` (self-contained, zero `extern
+  "C" fn` dependencies -- every builtin it uses, `mmio_read_u32`/
+  `mmio_write_u32`/`mmio_write_u8`/`str_len_bytes`/`str_byte_at`, is a
+  genuine target-independent compiler intrinsic) does a real
+  computation (`sum(1..100)==5050`, `100000/7==14285 r5` -- AArch64's
+  hardware `SDIV` needs no `__aeabi_ldivmod`-style libgcc helper the
+  way the Pi 1/ARMv6 side's division does) and prints the result over
+  the PL011 UART at BCM2711's own base (0xFE201000). Called from
+  `boot/rpi4/boot.S` via `bl kmain_rpi4_vani`, found by its bare,
+  unmangled name through that file's own `#[no_mangle]` -- the same
+  convention the Pi 1 side already uses for `irq_dispatch`/
+  `kernel_main`. New `boot/rpi4/runtime_stubs_rpi4.c` (the AArch64
+  twin of `boot/rpi1/runtime_stubs.c`, minus the libgcc-divide-helper
+  concern) supplies `strlen`/`dprintf`/`exit`/`memcpy` -- vani's
+  generated runtime-support code unconditionally assumes a hosted
+  libc provides these regardless of target or whether the program
+  itself calls them. `-function-sections`/`-data-sections` +
+  `--gc-sections` (added to `build_rpi4.sh`) prune vani's own
+  always-emitted builtin-runtime library down to what's actually
+  reachable, exactly as `build.sh`'s own comment already documents
+  for the ARMv6 side.
+
+  Found and fixed a real bug live, the same "verify against the
+  actual code" discipline this project always uses: an earlier
+  version of this file's digit-printer used recursion under a
+  `#[bounded(20)]` annotation. That type-checked and compiled cleanly
+  but faulted on its very first real call (Data Abort, permission
+  fault, `FAR_EL1` near address `0x10`) -- root-caused via the
+  emitted LLVM IR: `#[bounded(N)]`'s recursion-depth counter is an
+  LLVM `thread_local global i32`, and this freestanding target has
+  never initialized `TPIDR_EL0` (no thread pointer at all anywhere in
+  this project's boot code, on either target). `llc`'s local-exec TLS
+  lowering resolves the access relative to that unset thread pointer,
+  landing near address 0 -- matching the fault exactly. This is the
+  first place in the ENTIRE DhruvaOS codebase this specific
+  recursion-depth `#[bounded(N)]` (distinct from `kernel_main.vani`'s
+  many `#[bounded_stack(bytes=N)]` stack-SIZE budgets, which are
+  unaffected) was ever actually exercised at runtime -- a genuinely
+  latent gap in vani's bare-metal/no-TLS-runtime target support, not
+  something either existing target happened to already work around.
+  Not fixed in vani-compiler itself this round (would need either
+  compiler support for a non-TLS depth-counter mode on freestanding
+  targets, or this project initializing a real TPIDR_EL0-backed TLS
+  block -- both out of scope for this round's own goal of proving the
+  toolchain, not extending it); routed around by using a plain
+  iterative digit-printer instead. **Any future vani-on-bare-metal
+  code should avoid `#[bounded(N)]` (recursion-depth) until this is
+  addressed** -- `#[bounded_stack(bytes=N)]` is unaffected.
+
+  New `test/rpi4_vani_smoke.py` checks the exact computed values
+  (`sum=5050 quotient=14285 remainder=5`), not just a PASS-looking
+  string. `test/rpi4_boot_smoke.py`/`test/rpi4_timer_smoke.py` both
+  still pass unmodified, confirming no regression to the existing
+  EL-drop/UART/GIC/timer/IRQ/MMU chain.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

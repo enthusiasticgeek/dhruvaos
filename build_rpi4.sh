@@ -5,14 +5,23 @@
 #
 # Deliberately a SEPARATE script from build.sh, not a flag on it: this
 # targets a completely different instruction set (AArch64 vs. this
-# project's exclusively-ARM32-until-now Pi 1 target), a different
-# cross-compiler triple, and -- for now -- pure hand-written assembly
-# with no vani-compiled kernel code at all (see boot/rpi4/boot.S's own
-# header comment for why that's this round's deliberate v1 scope, not
-# an oversight). Merging the two build paths into one script would
-# buy nothing but a pile of target-specific conditionals; keeping them
-# separate mirrors how cleanly the two targets' actual toolchains
-# don't share anything below the shell script calling them.
+# project's exclusively-ARM32-until-now Pi 1 target) and a different
+# cross-compiler triple. Merging the two build paths into one script
+# would buy nothing but a pile of target-specific conditionals;
+# keeping them separate mirrors how cleanly the two targets' actual
+# toolchains don't share anything below the shell script calling them.
+#
+# ROUND 74 UPDATE: first vani-compiled kernel piece on this port
+# (kernel/kernel_main_rpi4.vani) -- same `vanic emit --backend=llvm`
+# + `llc -mtriple=` + runtime-stub-object pipeline build.sh's own
+# comment already documents for the Pi 1/ARMv6 target, just with an
+# aarch64 triple and a smaller stub set (no libgcc divide helper
+# needed -- AArch64 has hardware SDIV/UDIV). `-function-sections`/
+# `-data-sections` + `--gc-sections` are load-bearing here for the
+# exact same reason build.sh's own comment documents: vani's LLVM
+# emission always includes its entire builtin-runtime helper library
+# regardless of whether the program actually calls any of it, and
+# only per-symbol sections let the linker prune by real reachability.
 #
 # Toolchain note: no dedicated aarch64-none-elf-gcc is installed on
 # this machine, but aarch64-linux-gnu-gcc (already installed, ordinarily
@@ -29,6 +38,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${ROOT}/build"
 CC="${AARCH64_CC:-aarch64-linux-gnu-gcc}"
+VANIC="${VANIC:-/home/virgo/source/vani-compiler/target/release/vanic}"
+TRIPLE="aarch64-none-elf"
 
 mkdir -p "${BUILD_DIR}"
 
@@ -44,10 +55,22 @@ mkdir -p "${BUILD_DIR}"
 "${CC}" -c -mgeneral-regs-only -ffreestanding \
   "${ROOT}/boot/rpi4/mmu_init.S" -o "${BUILD_DIR}/rpi4_mmu_init.o"
 
+"${CC}" -c -nostdlib -ffreestanding \
+  "${ROOT}/boot/rpi4/runtime_stubs_rpi4.c" -o "${BUILD_DIR}/rpi4_runtime_stubs.o"
+
+"${VANIC}" emit "${ROOT}/kernel/kernel_main_rpi4.vani" --backend=llvm \
+  -o "${BUILD_DIR}/kernel_main_rpi4.ll"
+
+llc -mtriple="${TRIPLE}" -filetype=obj \
+  -function-sections -data-sections \
+  "${BUILD_DIR}/kernel_main_rpi4.ll" -o "${BUILD_DIR}/kernel_main_rpi4.o"
+
 "${CC}" -nostdlib -ffreestanding -static \
+  -Wl,--gc-sections \
   -Wl,-T,"${ROOT}/boot/rpi4/link.ld" \
   "${BUILD_DIR}/rpi4_boot.o" "${BUILD_DIR}/rpi4_vectors.o" \
   "${BUILD_DIR}/rpi4_gic_timer.o" "${BUILD_DIR}/rpi4_mmu_init.o" \
+  "${BUILD_DIR}/kernel_main_rpi4.o" "${BUILD_DIR}/rpi4_runtime_stubs.o" \
   -o "${BUILD_DIR}/dhruva_rpi4.elf"
 
 echo "Built ${BUILD_DIR}/dhruva_rpi4.elf"
