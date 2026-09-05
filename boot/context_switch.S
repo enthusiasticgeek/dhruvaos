@@ -124,6 +124,21 @@ irq_count:
                          * (both the 500ms timer tick and UART RX) --
                          * incremented from kernel_main.vani's own
                          * irq_dispatch, which runs on every one. */
+rr_last_picked:
+    .word 0             /* Round 75: round-robin cursor for fairness
+                         * among equal-priority ready tasks -- see
+                         * scheduler_pick_next's own updated header
+                         * comment. The index most recently chosen by
+                         * the NEW (non-ceiling-protected) tie-breaking
+                         * path; the next tie starts its scan just past
+                         * this index, so repeated ties rotate through
+                         * every ready contender instead of always
+                         * landing on the same one. .bss's zero-init
+                         * start is harmless -- worst case, the very
+                         * first tie ever broken starts its scan at
+                         * index 1 instead of some other arbitrary
+                         * index, no different in kind from any other
+                         * starting point. */
 
 /* Round 55: a real, second synchronization primitive (dhruva_mutex_
  * lock/unlock, below) alongside the existing priority-CEILING protocol
@@ -206,25 +221,81 @@ mutex_block_start_tick_table:
 .section ".text"
 
 /* Shared "who runs next" policy: the lowest eff_prio_table value among
- * tasks whose sleep_until_table <= tick_count (i.e. ready), ties
- * favoring whichever task is already current_task. Returns r0 = the
- * chosen task's sp and updates current_task -- does not touch the
- * stack itself (the caller has already saved everything that matters
- * before reaching here), so this is safe to freely clobber r0-r9 in.
+ * tasks whose sleep_until_table <= tick_count (i.e. ready). Returns
+ * r0 = the chosen task's sp and updates current_task -- does not touch
+ * the stack itself (the caller has already saved everything that
+ * matters before reaching here), so this is safe to freely clobber
+ * r0-r9 (and now r12) in.
  *
  * Task 3 is a dedicated idle task (priority 3, worse than every real
  * task, never sleeps) -- the standard RTOS answer to "what runs when
- * nothing else is ready," and load-bearing here for a subtler reason
- * than usual: this function seeds its "best so far" with the CURRENT
- * task regardless of whether it's actually ready (so a genuinely tied,
- * ready incumbent is correctly preferred without special-casing the
- * comparison operator). Found the hard way: without an always-ready
- * fallback candidate, that seed choice means "nobody else happens to
- * be ready right now" silently re-selects a task that just called
- * task_sleep_ticks to stop running -- its own sleep request completely
- * ignored, looping it forever instead of ever truly yielding. Idle
- * guarantees the scan always has at least one real, ready candidate to
- * fall back to instead. */
+ * nothing else is ready," and load-bearing for a subtler reason too:
+ * it guarantees the scan below always has at least one real, ready
+ * candidate to fall back to, so "nobody else happens to be ready right
+ * now" can never silently re-select a task that just called task_
+ * sleep_ticks to stop running (its own sleep request would otherwise
+ * be completely ignored, looping it forever instead of ever truly
+ * yielding -- found the hard way, an early Phase 2 bug).
+ *
+ * ROUND 75 UPDATE: this used to unconditionally favor whichever task
+ * was already current_task on any tie (docs/RTOS_GAP_ANALYSIS.md's own
+ * "No fairness among equal-priority ready tasks" gap -- two always-
+ * ready tasks at the same priority, e.g. indices 2 and 5, meant index
+ * 2 won forever and 5 could starve indefinitely, confirmed by reading
+ * the old `cmp r6,r7 / movlt r7,r6 / movlt r8,r9` comparison directly).
+ * Now rotates fairly among genuine ties via rr_last_picked -- BUT ONLY
+ * when doing so is actually safe. It is NOT safe unconditionally: this
+ * project's priority-CEILING protocol (dhruva_prio_lock/unlock, above)
+ * depends specifically on ties favoring the incumbent whenever that
+ * incumbent is the one currently holding a ceiling-boosted lock --
+ * that is the entire mechanism by which a correctly-ceiling-assigned
+ * mutex holder can never be preempted by a task arriving at the same
+ * (boosted) effective priority (see this file's own top-of-file
+ * comment on dhruva_prio_lock/unlock). Round-robin-ing that exact tie
+ * would silently reintroduce the race the protocol exists to prevent.
+ *
+ * So: if current_task is ready AND currently boosted (eff_prio_table
+ * < base_prio_table for it -- i.e. it holds a ceiling-protected lock
+ * right now), this function falls back to the OLD "ties favor the
+ * incumbent" algorithm, completely unchanged, for that one decision.
+ * Otherwise (current not ready, or ready but at its own true
+ * priority), it uses the NEW round-robin-aware algorithm. Known,
+ * accepted limitation: this only special-cases a BOOSTED CURRENT task,
+ * not a hypothetical boosted NON-current task -- true of every mutex
+ * this project exercises today (a task is only ever boosted while it
+ * is the one actually running), but worth re-checking if a future
+ * round (docs/TODO.md's DharaFS-concurrency item) ever has two
+ * independent ceiling-protected critical sections active concurrently
+ * on different tasks.
+ *
+ * NOT self-tested directly (round 75): a white-box test calling this
+ * function against controlled table state (via a `.global` escape
+ * hatch + TEST-ONLY setters, all since removed) was attempted and
+ * abandoned after finding a real, unresolved bug it triggered live --
+ * this function freely clobbers r4-r7 as scratch without saving them,
+ * safe for its actual callers below (both hand-written assembly in
+ * this same file, which already account for it) but a genuine AAPCS
+ * violation the instant anything following the standard C ABI (vani's
+ * own generated code, which treats r4-r7 as callee-saved) calls it
+ * directly -- corrupting live local state elsewhere with no fault at
+ * the point of corruption. A wrapper saving/restoring r4-r11 around
+ * the call fixed THAT bug specifically (confirmed via disassembly:
+ * push/pop pairing was correctly balanced), but a second, deeper crash
+ * remained (a real Data Abort inside the wrapper's own return path,
+ * SP found jumping ~200KB to a wild, unmapped address for reasons not
+ * fully root-caused despite extensive live tracing) that didn't
+ * reproduce even with the wrapper fix in place. Given the actual
+ * algorithm change above was already independently verified via full
+ * live regression (phase4_milestone.py's own MUTEX-LOW/HIGH ceiling-
+ * protocol demo trace, byte-for-byte unchanged from before this
+ * round, plus correct task_create() slot ordering), shipping a
+ * self-test that could crash the system was judged worse than having
+ * no automated self-test for this specific property at all. If a
+ * future round wants to add one, calling scheduler_pick_next (or any
+ * wrapper around it) from vani-compiled code is the first suspect if
+ * it reproduces this same failure mode again -- do not assume a
+ * simple r4-r11 save/restore wrapper alone is sufficient without
+ * re-verifying live under QEMU first. */
 scheduler_pick_next:
     /* Round 65 hardening: this function freely uses r8-r11 as scratch
      * below (tentative-best index, loop counter, context_switch_count
@@ -260,12 +331,31 @@ scheduler_pick_next:
     ldr r4, =eff_prio_table
     ldr r5, =sleep_until_table
 
+    /* Round 75 gate: is current_task ready right now, AND currently
+     * boosted (holding a ceiling-protected lock)? If so, this decision
+     * MUST use the old "ties favor the incumbent" algorithm -- see
+     * this function's own header comment for why round-robin here
+     * would be a real correctness regression, not just a style choice. */
     ldr r6, [r5, r3, lsl #2]      /* sleep_until[current] */
     cmp r6, r1
-    ldrle r7, [r4, r3, lsl #2]    /* ready -> seed with its eff_prio */
-    movgt r7, #255                 /* not ready -> sentinel; idle (below)
-                                    * always beats this if current isn't
-                                    * actually ready */
+    bgt spn_new_algorithm          /* current not ready -> no protection
+                                    * needed, use the fair algorithm */
+    ldr r6, [r4, r3, lsl #2]      /* eff_prio[current] */
+    ldr r12, =base_prio_table
+    ldr r7, [r12, r3, lsl #2]     /* base_prio[current] */
+    cmp r6, r7
+    bge spn_new_algorithm          /* eff_prio >= base_prio -> not
+                                    * boosted, use the fair algorithm */
+
+spn_old_algorithm:
+    /* Unchanged from before round 75: ties favor the incumbent
+     * unconditionally. Only reached when current_task is ready AND
+     * boosted, so r7 is always current's own (boosted) eff_prio here
+     * -- re-seed explicitly rather than relying on the gate above
+     * having left the right value in r7 (it did, but re-reading is
+     * cheap and keeps this block self-contained/independently
+     * readable). */
+    ldr r7, [r4, r3, lsl #2]       /* seed = eff_prio[current] */
     mov r8, r3                     /* tentative best index = current */
 
     mov r9, #0
@@ -280,12 +370,10 @@ spn_loop:
                                     * needed (255 can never beat idle's
                                     * real priority 4, verified by
                                     * tracing this exact comparison) */
-    bge spn_done
+    bge spn_finish
     cmp r9, r3
     beq spn_next                   /* current already accounted for above --
-                                    * skip so it can't out-tie itself and
-                                    * so a not-ready current can't be
-                                    * mistaken for a fresh, ready candidate */
+                                    * skip so it can't out-tie itself */
     ldr r6, [r5, r9, lsl #2]      /* sleep_until[i] */
     cmp r6, r1
     bgt spn_next                   /* not ready -> skip */
@@ -296,7 +384,68 @@ spn_loop:
 spn_next:
     add r9, r9, #1
     b spn_loop
-spn_done:
+
+spn_new_algorithm:
+    /* Round 75: fair (round-robin) tie-breaking, safe here because
+     * current_task is either not ready or not boosted (gated above).
+     * Pass 1 -- find the lowest eff_prio among ALL ready tasks
+     * (including current, which competes on equal footing with
+     * everyone else in this path). Idle (index 3, priority 4, never
+     * sleeps) guarantees r7 always ends up <= 4, never the empty-scan
+     * sentinel. */
+    mov r7, #255                    /* min eff_prio found so far */
+    mov r9, #0
+spn_p1_loop:
+    cmp r9, #16
+    bge spn_p1_done
+    ldr r6, [r5, r9, lsl #2]       /* sleep_until[i] */
+    cmp r6, r1
+    bgt spn_p1_next                 /* not ready -> skip */
+    ldr r6, [r4, r9, lsl #2]       /* eff_prio[i] */
+    cmp r6, r7
+    movlt r7, r6
+spn_p1_next:
+    add r9, r9, #1
+    b spn_p1_loop
+spn_p1_done:
+    /* Pass 2 -- among ready tasks tied at r7 (the min just found),
+     * pick whichever comes first when scanning circularly starting
+     * just AFTER rr_last_picked, so repeated ties rotate through every
+     * tied contender in turn instead of always landing on the same
+     * index. r9 here is an OFFSET (1..16) from rr_last_picked, not a
+     * raw task index -- `and r6,r6,#15` folds it back into 0-15 (valid
+     * since MAX_TASKS=16 is a power of 2). */
+    ldr r10, =rr_last_picked
+    ldr r11, [r10]                  /* r11 = last picked index */
+    mov r9, #1
+spn_p2_loop:
+    add r6, r11, r9
+    and r6, r6, #15                 /* r6 = candidate index */
+    ldr r0, [r5, r6, lsl #2]       /* sleep_until[candidate] */
+    cmp r0, r1
+    bgt spn_p2_next                 /* not ready -> skip */
+    ldr r0, [r4, r6, lsl #2]       /* eff_prio[candidate] */
+    cmp r0, r7
+    bne spn_p2_next                 /* not at the min priority -> skip */
+    mov r8, r6                      /* found this tick's pick */
+    b spn_p2_found
+spn_p2_next:
+    add r9, r9, #1
+    cmp r9, #16
+    ble spn_p2_loop
+    mov r8, #3                      /* unreachable in practice -- idle
+                                    * (index 3) is always ready and
+                                    * always <= min_prio, so pass 2
+                                    * always finds a match within 16
+                                    * steps; fall back to idle
+                                    * explicitly rather than leaving r8
+                                    * undefined if this is ever reached
+                                    * anyway. */
+spn_p2_found:
+    str r8, [r10]                   /* rr_last_picked = this pick, so
+                                    * the NEXT tie starts past it */
+
+spn_finish:
     cmp r8, r3                     /* did the picked task actually
                                     * change from current? (r10/r11 are
                                     * free scratch here -- unused by
@@ -974,6 +1123,8 @@ irq_count_get:
     mov r1, #0
     bx lr
 
+
+
 /* TEST-ONLY (round 22, dhcp_renewal_self_test -- not part of any
  * live path): directly sets tick_count, so a boot self-test can
  * stage "N seconds have elapsed since the lease was granted" without
@@ -1314,9 +1465,11 @@ start_multitasking:
                                * task, above idle */
     str r7, [r6, #20]        /* task 5 (SHELL) priority 3 too -- same
                                * best-effort band as GC; ties between
-                               * them favor whichever is incumbent,
-                               * fine since both are normally sleeping
-                               * and rarely contend at the same instant */
+                               * them rotate fairly (round 75) rather
+                               * than always favoring one, though in
+                               * practice both are normally sleeping
+                               * and rarely contend at the same instant
+                               * anyway */
     mov r7, #4
     str r7, [r6, #12]        /* task 3 (IDLE) priority 4 -- worst,
                                * as always */

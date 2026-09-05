@@ -756,14 +756,16 @@ extern "C" fn dhruva_mutex_unlock(mutex_id: u32) -> u32;
 // boost actually happened.
 extern "C" fn current_eff_prio() -> u32;
 // task_a=HIGH(priority 0), task_b=MEDIUM(priority 1), task_c=LOW(priority 2),
-// task_d=IDLE(priority 3, always ready, never sleeps) -- the standard
-// RTOS answer to "what runs when nothing else is," and load-bearing
-// here specifically: without it, scheduler_pick_next's "seed with the
-// current task regardless of readiness" fallback (needed so a tied,
-// ready incumbent is preferred without special-casing the comparison)
-// could silently re-select a task that just called task_sleep_ticks to
-// stop running, ignoring its own sleep request entirely. Idle
-// guarantees there's always a genuinely ready task to fall back to.
+// task_d=IDLE (priority 4, moved up from 3 back in Phase 3 to make
+// room for GC -- always ready, never sleeps) -- the standard RTOS
+// answer to "what runs when nothing else is," and load-bearing for a
+// subtler reason too: it guarantees scheduler_pick_next's scan always
+// has at least one genuinely ready task to fall back to, so "nobody
+// else happens to be ready" can never silently re-select a task that
+// just called task_sleep_ticks to stop running, ignoring its own
+// sleep request entirely (see boot/context_switch.S's own header
+// comment on scheduler_pick_next for the full, current tie-
+// breaking policy, including round 75's fairness fix).
 // task_sleep_ticks/dhruva_prio_lock/dhruva_prio_unlock are boot/context_switch.S's
 // scheduler primitives -- see that file for why dhruva_prio_lock/unlock need
 // no lock-state of their own (the Immediate Priority Ceiling Protocol's

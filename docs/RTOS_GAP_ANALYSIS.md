@@ -14,7 +14,7 @@ doesn't yet attempt.
 
 ## 1. Scheduling gaps
 
-- **No fairness among equal-priority ready tasks.** `scheduler_pick_next`
+- ~~**No fairness among equal-priority ready tasks.** `scheduler_pick_next`
   (`boot/context_switch.S`) scans task slots and keeps the *first* candidate
   found whose priority beats the running best via a strict `<` comparison —
   a later-found task at the *same* priority never displaces it. Confirmed by
@@ -22,7 +22,30 @@ doesn't yet attempt.
   Concretely: if task index 2 and task index 5 both sit at priority 2 and
   are both always ready, index 2 wins forever — index 5 can starve
   indefinitely. A true RTOS scheduler needs round-robin (or FIFO) rotation
-  among tasks tied at the same priority, not "lowest index always wins."
+  among tasks tied at the same priority, not "lowest index always wins."~~
+  **`[DONE, round 75, 2026-09-05]`** — `scheduler_pick_next` now branches
+  on whether `current_task` is ready AND currently boosted (holding a
+  ceiling-protected lock, `eff_prio_table < base_prio_table`): if so, the
+  OLD "ties favor the incumbent" algorithm runs completely unchanged —
+  this is load-bearing for the priority-ceiling protocol's own safety
+  (a boosted holder must never be preempted by a tie, or the whole point
+  of the ceiling is defeated) — otherwise a new two-pass algorithm runs:
+  find the minimum `eff_prio` among all ready tasks, then pick whichever
+  tied candidate comes first scanning circularly from just past a new
+  `rr_last_picked` cursor, so repeated ties genuinely rotate through
+  every contender instead of always landing on the same one. Verified via
+  full live regression (`phase4_milestone.py`'s own MUTEX-LOW/HIGH
+  ceiling-protocol demo trace unchanged from before this round — HIGH
+  still never preempts a boosted LOW mid-critical-section — plus correct
+  `task_create()` slot ordering, `heap_stress.py`, `power_yank.py`).
+
+  A white-box self-test calling `scheduler_pick_next` directly against
+  controlled table state was attempted and abandoned after it triggered a
+  real, only partially root-caused crash (see `boot/context_switch.S`'s
+  own comment on `scheduler_pick_next`, right above the function, for the
+  full incident and warning for any future attempt) — the algorithm fix
+  itself was independently verified via the live regression above instead,
+  judged safer than shipping a self-test that could crash the system.
 - **500ms tick granularity.** Documented by the project itself as "fine for
   this project's own demo... far too coarse for most real control loops."
   Real RTOS work typically wants 1ms ticks or a tickless (timer-per-deadline)
@@ -146,8 +169,9 @@ doesn't yet attempt.
 ## Suggested phasing (cheapest/highest-value first, not a commitment)
 
 **Phase A — cheap, mechanical, no new subsystem:**
-1. Fix `scheduler_pick_next`'s tie-breaking to rotate fairly among
-   equal-priority ready tasks instead of always favoring the lowest index.
+1. ~~Fix `scheduler_pick_next`'s tie-breaking to rotate fairly among
+   equal-priority ready tasks instead of always favoring the lowest
+   index.~~ `[DONE, round 75]` — see item 1 above.
 2. Wrap DharaFS's own shared-state mutations in the existing
    `dhruva_prio_lock`/`_unlock` ceiling protocol, closing the concurrency
    hazard described above.
