@@ -1,9 +1,14 @@
 # DharaFS portability: extracting it for use by other kernels
 
-Scoped out on request (2026-09-05), not yet built. This is a feasibility
-and effort analysis grounded in this codebase's actual dependency
-structure — every number below comes from grepping `kernel/kernel_main.vani`
-directly, not estimated.
+Scoped out on request (2026-09-05); **Tier 1 is now built, standalone, and
+verified**, in its own repository: `~/source/dharafs` (Apache 2.0, kosh
+package `dharafs`). This document is the feasibility/effort analysis that
+extraction was based on — every number below comes from grepping
+`kernel/kernel_main.vani` directly, not estimated — updated in place where
+the real extraction found the original analysis imprecise (see "Tier 1,
+corrected" below). DhruvaOS's own `kernel/kernel_main.vani` has NOT been
+migrated to consume the new package — that's a deliberate, separate,
+not-yet-requested next step; this codebase's own DharaFS code is untouched.
 
 ## Bottom line
 
@@ -28,7 +33,7 @@ distinct external identifiers, which fall into six groups:
 |---|---|---|
 | Block-device read/write | 9 | **Yes — the one real seam.** `dharafs_state_get_block_dev`/`_set` plus 3 backend implementations (SDHOST/USB-MSD/host-virtual-disk) and one address helper. A consumer needs exactly a `read_block(n) -> status` / `write_block(n, buf) -> status` pair; DhruvaOS's own 3-way backend dispatch is convenience, not a requirement. |
 | DharaFS's own scratch/state accessors | 39 | **Mechanical, not risky.** All are `get`/`set` one-liners backing scratch buffers — a workaround for vani not having persistent top-level state holding buffer pointers. Trivially reimplementable as one-line C statics (this is *exactly* what `test/host_harness/host_stubs.c` already does for all of them). |
-| dirindex/fsqueue/snapshot state | 53 | **Optional — cut for a minimal port.** Same accessor pattern as above, but every one of these 53 identifiers belongs to three *additive, opt-in* features (hashed directory index, priority-aware FS queue, snapshots) that the manual itself documents as never touching the core synchronous `dharafs_*` call sites. Dropping all three removes 39% of the total external surface. |
+| dirindex/fsqueue/snapshot state | 53 | **Corrected during extraction — only fsqueue is actually cuttable.** A precise brace-matching dependency pass (the original scan's "next top-level `fn`" boundary heuristic over-attributed trailing comment blocks to the wrong function) found dirindex and snapshot are woven directly into core functions (`dharafs_append_raw`, `dharafs_delete_raw`, `dharafs_find_latest_block_raw`, `dharafs_init`) — but with a provably-safe fallback (a dirindex miss just means the same linear log scan the code always did), making them **safer to include than to surgically remove**. Only the 7 `dharafs_queue_*` functions have a genuine hard dependency (scheduler primitives) and are cleanly separable. The extracted package therefore ships dirindex + snapshot and omits only fsqueue. |
 | Allocator/string/buffer utilities | 12 | **One real dependency (`dhruva_alloc_bytes`), the rest is pure logic.** `buf_read/write_byte`, `str_len_bytes`, `wrapping_mul`, etc. have zero OS coupling and can be copied verbatim. Only the allocator itself needs a real shim — see "Correctness and performance" below for why DhruvaOS's own allocator specifically must **not** be copied along with it. |
 | Crypto primitives | 8 | **Pure algorithms, already independently verified.** ChaCha20-Poly1305, SHA-256, PBKDF2 — the exact same functions this project's own TLS 1.3 stack uses, checked byte-exact against real reference implementations before ever being trusted here. Only needed if the media-encryption/verified-I/O features come along. |
 | Scheduler/task primitives | 2 | **Optional — only the FS queue uses them.** `current_eff_prio`/`current_task_get`. Disappears entirely if the priority-queue feature is cut. |
@@ -90,21 +95,30 @@ own integration, not to anything in DharaFS itself.
   a working proof that DharaFS's core logic compiles and runs
   correctly as portable C, decoupled from ARM/QEMU/the scheduler.
   Nothing to build here, just worth knowing it already exists.
-- **Tier 1 — core FS as a kosh package (smallest real scope):**
-  package `dharafs_init`/`_append`/`_read`/`_delete`/`_rename`/`_stat`/
-  permissions/attributes/append-only-log, cut dirindex/fsqueue/
-  snapshot entirely. Shim surface: block I/O (2 functions), allocator
-  (1), logging (3), ~15-20 scratch accessors for the core state this
-  tier keeps. No crypto, no scheduler dependency at all.
-- **Tier 2 — add verified I/O + media encryption:** bring in the 8
-  crypto-primitive calls and their own scratch accessors. Still zero
-  scheduler dependency.
-- **Tier 3 — add hashed directory index, snapshots, priority-aware FS
-  queue:** the remaining 53 dirindex/fsqueue/snapshot identifiers plus
-  the 2 scheduler-primitive calls. Requires the target kernel to
-  expose an equivalent of `current_eff_prio`/`current_task_get`, or
-  this tier's own priority-queue feature specifically gets left behind
-  while the rest of Tier 3 still works.
+- **Tier 1 — DONE, `~/source/dharafs`, corrected scope:** 90 core
+  `dharafs_*` functions — `dharafs_init`/`_append`/`_read`/`_delete`/
+  `_rename`/`_stat`/permissions/attributes/append-only-log, **plus**
+  the hashed directory index and snapshots (see corrected dependency
+  table above — these turned out safer to keep than to cut). Cuts
+  fsqueue (7 functions, genuine scheduler dependency) and the
+  SHA-256-verified-companion-file / AEAD-metadata crypto-tier
+  functions (6 functions with zero remaining callers once cut, plus
+  their 2 thin public wrappers). Shim surface: 9 real externs — block
+  I/O (2), allocator (1), logging (3), an optional stubbable
+  media-encryption hook (3) — plus ~80 mechanical scratch/dirindex/
+  snapshot accessors, all provided by a bundled portable C runtime
+  (`runtime/dharafs_runtime.c`) so most consumers never reimplement
+  them. Verified via a real standalone round trip (init/append/read/
+  overwrite/rename/delete against an in-memory disk), clean under
+  ASAN/UBSAN. No crypto, no scheduler dependency at all.
+- **Tier 2 — add verified I/O + media encryption:** bring in the
+  crypto-primitive calls and their own scratch accessors, replacing
+  Tier 1's stubbable encryption hook with real algorithm calls. Still
+  zero scheduler dependency. Not yet built.
+- **Tier 3 — add the priority-aware FS queue:** the 7 `dharafs_queue_*`
+  functions plus the 2 scheduler-primitive calls
+  (`current_eff_prio`/`current_task_get`). Requires the target kernel
+  to expose an equivalent scheduler API. Not yet built.
 
 ## What this plan deliberately does not do
 
@@ -115,13 +129,16 @@ If a real second consumer shows up, build exactly the shim it needs;
 until then this document is the answer to "is it feasible," not a
 commitment to build Tier 1-3 speculatively.
 
-## Open question, not yet checked
+## Open question — checked
 
 Whether vani has grown genuine persistent top-level state (removing
-the need for the 39+53 scratch-accessor `.S`/C one-liners entirely) is
-worth a quick check against the current vani-compiler before starting
-Tier 1 — if so, that whole accessor layer could be deleted rather than
-ported, in both DhruvaOS and the new package.
+the need for the scratch-accessor `.S`/C one-liners entirely) was
+checked directly (`static counter: i64 = 0;` at top level) against the
+current vani-compiler before starting Tier 1: still a hard parse error
+("expected 'use', 'intent', 'struct', or 'fn'"). The scratch-accessor
+pattern remains a real, permanent necessity, not a stale workaround —
+it's exactly what `runtime/dharafs_runtime.c` implements for the new
+package.
 
 ## See also
 
