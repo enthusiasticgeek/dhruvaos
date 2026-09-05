@@ -4482,6 +4482,18 @@ fn dharafs_queue_pending_count() -> i64 {
 fn task_fsq() -> i64 {
   while true {
     let _ = task_sleep_ticks(5);
+    // Round 76: matches task_e/task_f's own dhruva_prio_lock(2) around
+    // their DharaFS-touching code (see task_e's own comment for the
+    // full "No concurrency lock protecting DharaFS's own shared state"
+    // rationale). task_fsq's own real priority (2) is already the
+    // highest of the three real DharaFS-calling tasks, so a LOWER-
+    // priority task_e/task_f can never actually preempt it mid-drain
+    // under plain fixed-priority scheduling even without this lock --
+    // included anyway for symmetry with the other two call sites and
+    // as a defensive guard against any future task added at priority
+    // 0 or 1 that also touches DharaFS, not because this exact 3-task
+    // scenario strictly requires it on this side.
+    let _ = dhruva_prio_lock(2);
     let drained: i64 = 0;
     let keep_going: i64 = 1;
     while (keep_going == 1) && (drained < fsqueue_max_slots()) {
@@ -4492,6 +4504,7 @@ fn task_fsq() -> i64 {
         drained = drained + 1;
       }
     }
+    let _ = dhruva_prio_unlock(2);
   }
   return 0;
 }
@@ -16089,11 +16102,41 @@ fn task_e() -> i64 {
   let _ = netif_get_mac(dhcp_my_mac);
   while true {
     let _ = task_sleep_ticks(20);
+    // Round 76: docs/RTOS_GAP_ANALYSIS.md's own "No concurrency lock
+    // protecting DharaFS's own shared state" gap -- task_e (this
+    // task) and task_f (the shell) both call into DharaFS with
+    // nothing preventing a timer-tick preemption from interrupting
+    // one task's FS operation mid-update and resuming a DIFFERENT
+    // task's own FS call before the first finishes. Ceiling=2 (not
+    // this task's own priority, 3): task_fsq (the FS request queue
+    // dispatcher, round 67) also calls into DharaFS at priority 2,
+    // numerically higher than task_e/task_f's shared priority 3 --
+    // the ceiling must cover the HIGHEST priority of any real
+    // contender, or task_fsq could still preempt this critical
+    // section (see task_fsq's own matching lock below, and
+    // shell_dispatch's call site in task_f, for the other two
+    // contenders this same ceiling protects against).
+    let _ = dhruva_prio_lock(2);
+    // Live proof the boost genuinely happened, not just that the call
+    // compiles -- current_eff_prio() is the same real accessor task_c's
+    // own long-established dhruva_prio_lock demo already uses to prove
+    // its own boost live. Printed once per pass (every 20 ticks), not
+    // removed after verification, since it costs nothing ongoing and
+    // gives any future round real evidence this lock is actually
+    // engaging, not silently a no-op if e.g. a future refactor ever
+    // reordered these calls relative to the DharaFS work they guard.
+    let _ = uart_puts("GC: entering DharaFS critical section, eff_prio=");
+    let _ = uart_put_hex32(current_eff_prio());
+    let _ = uart_puts("\n");
     let _ = dharafs_compact(compact_buf, compact_path_buf, compact_data_buf);
     let gc_mode_len: i64 = dharafs_read("/config/mode", gc_buf);
     let _ = uart_puts("GC: compaction pass, /config/mode = \"");
     let _ = dharafs_print_data(gc_buf, gc_mode_len);
     let _ = uart_puts("\"\n");
+    let _ = dhruva_prio_unlock(3);
+    let _ = uart_puts("GC: left DharaFS critical section, eff_prio=");
+    let _ = uart_put_hex32(current_eff_prio());
+    let _ = uart_puts("\n");
     let _ = dhcp_client_poll(dhcp_my_mac);
   }
   return 0;
@@ -18815,7 +18858,20 @@ fn task_f() -> i64 {
     if ready == (0 as u32) {
       let _ = task_sleep_ticks(2);
     } else {
+      // Round 76: shell_dispatch handles every command, most of which
+      // touch DharaFS's shared state (ls/cat/write/rm/mkdir/stat/...)
+      // -- ceiling=2 matches task_e's own DharaFS-critical-section lock
+      // and task_fsq's, see task_e's own comment on why 2 (task_fsq's
+      // real priority), not 3 (task_f/task_e's own shared priority).
+      // Wrapping the WHOLE dispatch, not just the FS-touching commands
+      // individually, is deliberate: simpler and provably correct
+      // (impossible to miss a future command that touches DharaFS),
+      // at the cost of briefly locking during non-FS commands too
+      // (eval/ping/ifconfig/...) -- negligible, since the lock is held
+      // only for this one command's own short duration either way.
+      let _ = dhruva_prio_lock(2);
       let _ = shell_dispatch();
+      let _ = dhruva_prio_unlock(3);
       let _ = shell_clear_line();
     }
   }

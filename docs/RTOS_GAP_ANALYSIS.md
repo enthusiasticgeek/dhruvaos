@@ -138,7 +138,7 @@ doesn't yet attempt.
   **resumable and per-call-bounded** (compact at most N blocks per
   invocation, picking up where the last call left off) rather than one
   unbounded pass.
-- **No concurrency lock protecting DharaFS's own shared state.** Both
+- ~~**No concurrency lock protecting DharaFS's own shared state.** Both
   `task_e` (the periodic GC/compact pass) and `task_f` (the interactive
   shell's read/write/rm/etc.) call into DharaFS, and nothing prevents a
   timer-tick preemption from interrupting one task's FS operation mid-update
@@ -148,7 +148,25 @@ doesn't yet attempt.
   contention hazard reproduced as documented") — no analogous protection or
   even a documented-and-accepted-risk self-test exists yet for DharaFS. The
   existing priority-ceiling primitive (`dhruva_prio_lock`/`_unlock`) is
-  already the right tool for this and would be cheap to apply here.
+  already the right tool for this and would be cheap to apply here.~~
+  **`[DONE, round 76, 2026-09-05]`** — a real THIRD contender was found
+  while implementing this: `task_fsq` (the FS request queue dispatcher,
+  round 67) also calls into DharaFS, at priority 2 — numerically higher
+  than `task_e`/`task_f`'s shared priority 3. Wrapped all three call
+  sites (`task_e`'s per-pass compact+read block, `task_f`'s single
+  `shell_dispatch()` call — covering every shell command, not just the
+  FS-touching ones, deliberately, so no future command can be missed —
+  and `task_fsq`'s own drain loop) in `dhruva_prio_lock(2)`/
+  `dhruva_prio_unlock(<caller's own true priority>)`, ceiling 2 being
+  the highest real priority among the three, not either 3-priority
+  task's own band. Live-verified, not just written: `task_e` now prints
+  `current_eff_prio()` on entry/exit of its own critical section,
+  confirmed live at `eff_prio=2` inside and `eff_prio=3` immediately
+  after (`test/phase4_milestone.py`'s own captured boot log). Full
+  regression battery (`phase4_milestone.py`, `heap_stress.py`,
+  `power_yank.py`) clean, including the pre-existing MUTEX-LOW/HIGH
+  ceiling-protocol demo (round 75's own scheduler-fairness fix) still
+  behaving identically alongside this new lock usage.
 - **No priority- or deadline-aware I/O ordering** (already an open,
   correctly-scoped `docs/TODO.md` item — "Priority/deadline-aware FS request
   queue"). Today, FS operations run in strict call order: a low-priority
@@ -172,9 +190,10 @@ doesn't yet attempt.
 1. ~~Fix `scheduler_pick_next`'s tie-breaking to rotate fairly among
    equal-priority ready tasks instead of always favoring the lowest
    index.~~ `[DONE, round 75]` — see item 1 above.
-2. Wrap DharaFS's own shared-state mutations in the existing
+2. ~~Wrap DharaFS's own shared-state mutations in the existing
    `dhruva_prio_lock`/`_unlock` ceiling protocol, closing the concurrency
-   hazard described above.
+   hazard described above.~~ `[DONE, round 76]` — see "DharaFS-specific
+   gaps" above.
 3. Document (and self-test, matching the netif precedent) whichever of the
    above isn't fixed outright, so it's a tracked, accepted risk rather than
    an unknown one.
