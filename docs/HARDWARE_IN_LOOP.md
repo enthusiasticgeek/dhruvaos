@@ -33,11 +33,14 @@ Everything below applies to it as written.
 - An SD card reader for this PC (to write the card from here, then
   move it to the Pi).
 - **A 3.3V USB-to-TTL-serial (UART) adapter.** This is how you'll see
-  any output at all — this project has no HDMI/framebuffer code
-  whatsoever, it is UART-console-only by design (matches
-  `-nographic`/`-serial stdio` under QEMU). **Must be 3.3V logic
-  level, not 5V** — see the safety warning in §3.1; a 5V adapter can
-  permanently damage the Pi's GPIO.
+  boot output and interact with the shell — the interactive console
+  itself is UART-only by design (matches `-nographic`/`-serial stdio`
+  under QEMU). Round 71 added a real HDMI framebuffer driver (the `fb`
+  shell command), but it's a raw pixel-buffer write path, not a text
+  console — the UART remains the only way to type commands or read
+  their output either way. **Must be 3.3V logic level, not 5V** — see
+  the safety warning in §3.1; a 5V adapter can permanently damage the
+  Pi's GPIO.
 - 3 male-to-female jumper wires (TX, RX, GND).
 - A separate 5V/microUSB power supply for the Pi (the USB-serial
   adapter's own 5V line is not a reliable way to power the whole
@@ -47,6 +50,17 @@ Everything below applies to it as written.
   `DHRUVAOS_MANUAL.md` §1 already documents as write-to-spec
   (CDC-ECM, the real SMSC LAN9512 onboard port, USB Bluetooth HCI,
   Realtek RTL8188CU/RTL8192CU).
+- Optional, only if you want to exercise round 71's new peripherals:
+  an HDMI cable + monitor (to actually SEE the framebuffer's pixel
+  writes — QEMU can verify the mailbox protocol and pixel-buffer
+  arithmetic but has no way to show you a real picture), a USB
+  keyboard/mouse (already live-verified under QEMU's own `usb-kbd`/
+  `usb-mouse` devices, including a real decoded keypress — real
+  hardware mainly confirms genuine device timing/quirks here, not
+  unverified logic), and/or an LED+resistor or pushbutton wired to a
+  free GPIO pin (`gpio` shell command) if you want to exercise pull-up/
+  down control specifically, which QEMU's own GPIO model doesn't
+  implement at all (see §6).
 
 ## 2. Safety notes (read before connecting anything)
 
@@ -169,6 +183,16 @@ region, DharaFS writing there will corrupt the boot partition (and
 vice versa) — silently, since neither side has any idea the other
 exists.
 
+Round 69's media-encryption AEAD upgrade also added a second raw
+region, blocks **4000 onward** (~128 blocks, one 32-byte metadata
+entry per tracked data block — `dharafs_crypto_meta_sector_for` in
+`kernel_main.vani`), only ever touched once `crypto on` is actually
+run. Still comfortably inside the same 8MiB margin §4.2 recommends
+below (block 4128 vs. the partition starting at block 16384) — no
+change to the recommended offset, just worth knowing this second
+region exists if you're ever auditing what physical blocks this
+project's own code can legitimately touch.
+
 **The fix is the same convention standard Raspberry Pi OS images
 already use, which is not a coincidence** — create a real MBR
 partition table with the FAT32 boot partition starting well clear of
@@ -207,8 +231,11 @@ disable_splash=1
 ```
 
 (`init_uart_clock` is the critical one — see §3.2. `enable_uart=1` and
-`disable_splash=1` are harmless, standard hygiene; this project has no
-HDMI/display code to disable.)
+`disable_splash=1` are harmless, standard hygiene — `disable_splash`
+only suppresses the GPU firmware's own rainbow-screen splash before
+this kernel ever runs; it has no effect on round 71's own framebuffer
+driver, which doesn't touch the display until the `fb init` shell
+command is actually run.)
 
 ### 4.4 Building and copying the kernel image
 
@@ -299,6 +326,39 @@ real fidelity gaps:
   hardware once connected, not to settle whether it's QEMU-specific
   (it is), but because real ARM1176 silicon's own enforcement is the
   actual feature this project cares about.
+- **GPIO pull-up/down control** (`gpio <pin> pull none|up|down`,
+  round 71) — confirmed directly from QEMU 10.0.0's own
+  `hw/gpio/bcm2835_gpio.c` source that GPPUD/GPPUDCLK are stubbed
+  "Not implemented" there; this is real, spec-correct code whose
+  actual effect (does a pull resistor genuinely engage?) has never
+  been confirmed against anything. A pushbutton wired to a spare GPIO
+  pin is the concrete test: `gpio <pin> in`, `gpio <pin> pull up`,
+  then `gpio <pin> read` should read 1 with the button open and 0
+  when pressed to ground.
+- **A real picture on a real HDMI display** (`fb init`/`fb fill`,
+  round 71) — the mailbox property-tag protocol and pixel-buffer
+  arithmetic are already live-verified under QEMU (real pitch/size
+  computed from the requested resolution, a real pixel write+readback
+  round trip), but QEMU has no way to render an actual image; this is
+  the one part of that feature only real hardware can show you at all.
+  `fb init 640 480 32` then a few `fb fill <x> <y> <r> <g> <b>` calls
+  should produce visibly colored pixels in the top-left region of a
+  connected monitor.
+- **EDID query** (asking a connected monitor what modes it actually
+  supports) — confirmed NOT implemented in QEMU's own
+  `hw/misc/bcm2835_property.c` at all (no case for any EDID-related
+  mailbox tag), and not yet built in this project either (see
+  `docs/TODO.md`'s own HDMI entry) — real hardware would be required
+  for this from the very first line of code, not just for final
+  confirmation.
+- **Real USB keyboard/mouse device timing/quirks** (`hid poll`/
+  `status`, round 71) — already live-verified further than most other
+  USB features here: QEMU's own `usb-kbd`/`usb-mouse` devices
+  enumerate correctly and a real injected keypress was received and
+  correctly decoded end-to-end. Real hardware mainly confirms genuine
+  device-specific timing/quirks at this point, same lower-priority
+  role USB mass storage's own real-device testing already has above,
+  not unverified core logic.
 
 ## 7. See also
 
