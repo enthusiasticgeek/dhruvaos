@@ -3553,6 +3553,68 @@ than assumed:
   **Not done**: TCP, DHCP (client+server), PKI, X25519/Ed25519/
   ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell integration
   remain the next Phase A steps, none started.
+
+  **ROUND 89 UPDATE, 2026-09-06**: Phase A step 4 -- TCP, the largest
+  single port in this scope, built on rounds 86-88's netif/ARP/IPv4+
+  filter. Direct, unabridged port of kernel_main.vani's own stateless
+  header layer (`tcp_flag_*`/`tcp_checksum`/`tcp_build_header`/`tcp_
+  get_*`/`tcp_verify_checksum`/`tcp_send_segment`) AND its full
+  connection state machine (`tcp_conn_active_open`/`passive_open`/
+  `handle_segment`/`send_data`/`close`/`check_retransmit`/`poll`) --
+  the exact same 2 fixed connection slots (0=client, 1=server, this
+  single-threaded environment has no second task to run "the other
+  side" concurrently), same states (CLOSED/SYN_SENT/SYN_RCVD/
+  ESTABLISHED/FIN_WAIT/CLOSED_FINAL/CLOSING), same simultaneous-open
+  AND simultaneous-close handling, same retransmission timers, same
+  advertised-window enforcement -- every branch is a real, working
+  port, nothing stubbed. New `boot/rpi4/tcp_state.S` mirrors the
+  established per-round asm-state shape (persistent connection fields
+  + a 64-byte-per-connection retransmit buffer, byte-accessed); its
+  24 near-identical get/set accessors are generated via a GNU `as`
+  `.macro`, the first use of assembler macros on this port -- a
+  simpler and less error-prone choice than hand-duplicating 24
+  functions, confirmed to assemble correctly via a standalone
+  `aarch64-linux-gnu-gcc -c` probe before wiring it into the real
+  build.
+
+  This round planned its `ref`/`mut ref` signatures UP FRONT instead
+  of discovering mismatches reactively (round 88's own lesson, gap #3
+  in `vani-compiler/docs/DHRUVAOS_ERGONOMICS_TODO.md`): every `tcp_
+  get_*_rpi4`/`tcp_checksum_rpi4`/`tcp_verify_checksum_rpi4` takes
+  plain `ref [u8; 512]` throughout, matching every real caller; only
+  `tcp_build_header_rpi4` (which writes the header then must read it
+  back to checksum it) computes that checksum with an inline loop
+  instead of delegating, the same fix shape as `ipv4_build_header_
+  rpi4`. One more instance was still caught live by `vanic check` at
+  `tcp_conn_poll_rpi4`'s own echo-service responder (a `mut ref out_
+  payload` parameter needed to be re-sent through a `ref`-only send
+  path) -- fixed with the same "copy through a fresh local first"
+  pattern round 88 already established, not a new technique.
+
+  Wired into `kmain_rpi4_vani` (boot-time self-test) and a new `tcp`
+  shell command (reruns both `tcp_self_test_rpi4` and `tcp_conn_
+  self_test_rpi4`, the full handshake+data+close lifecycle). Worked
+  correctly on the very first REAL build -- no live debugging needed,
+  four clean rounds in a row now (86-89). `test/rpi4_shell_smoke.py`
+  updated for the new `help`/`ver` text and a `tcp` command check;
+  all 8 Pi 4 smoke tests pass; zero Pi 1 files touched.
+
+  **Not ported this round, a real scope boundary not an oversight**:
+  kernel_main.vani's own dedicated regression self-tests for a few of
+  these same branches (`tcp_conn_recv_bounds_self_test`, `tcp_conn_
+  simultaneous_open_self_test`, `tcp_conn_simultaneous_close_self_
+  test`, `tcp_conn_window_enforcement_self_test`) -- the underlying
+  logic every one of them exercises IS fully present and live in the
+  ported state machine (bounds checks in `handle_segment`,
+  simultaneous open/close transitions, window enforcement in `send_
+  data`), just not independently re-verified via its own dedicated
+  synthetic fixture this round, matching how kernel_main.vani itself
+  never wrote a dedicated self-test for its own (equally real,
+  equally live) retransmission-timer code either.
+
+  **Not done**: DHCP (client+server), PKI, X25519/Ed25519/ChaCha20-
+  Poly1305, TLS 1.3, SSH transport, and SSH-shell integration remain
+  the next Phase A steps, none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

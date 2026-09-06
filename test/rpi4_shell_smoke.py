@@ -11,7 +11,9 @@ comment has that design). Round 87 added an `arp` command rerunning
 both ARP self-tests (boot/rpi4/arp_state.S's own header comment has
 that design). Round 88 added `ip` (IPv4 header build/parse self-test)
 and `filter` (packet filter self-tests, boot/rpi4/filter_state.S's
-own header comment has that design).
+own header comment has that design). Round 89 added `tcp` (the TCP
+header layer self-test plus a full connection-lifecycle self-test,
+boot/rpi4/tcp_state.S's own header comment has that design).
 
 Drives real commands over QEMU's stdio UART (help, ver, test, echo)
 and checks each one's real response, using phase4_milestone.py's own
@@ -65,6 +67,8 @@ def run(elf_path: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[int, str]:
         time.sleep(CMD_WAIT_S)
         send("filter")
         time.sleep(CMD_WAIT_S)
+        send("tcp")
+        time.sleep(CMD_WAIT_S)
         out, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, out.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
@@ -87,8 +91,8 @@ def main() -> int:
     print(output, end="")
 
     checks = {
-        "help lists commands": "commands: help, ver, test, sha256, netif, arp, ip, filter, echo <text>" in output,
-        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 88 minimal shell + crypto + netif + arp + ip + filter" in output,
+        "help lists commands": "commands: help, ver, test, sha256, netif, arp, ip, filter, tcp, echo <text>" in output,
+        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 89 minimal shell + crypto + netif + arp + ip + filter + tcp" in output,
         "echo echoes real argument text": "hello dhruva" in output,
         "unknown command reported": "unknown command (try 'help')" in output,
         "test reruns the real self-test": "sum=5050 quotient=14285 remainder=5" in output,
@@ -109,15 +113,19 @@ def main() -> int:
             output.count("FW: packet filter rule matching (default/specific/proto/order/port/non-ip) (PASS)") >= 2
             and output.count("FW: outgoing packet filtering (netif_send_frame egress hook, directional src/dst semantics) (PASS)") >= 2
         ),
+        "tcp reruns both TCP self-tests": (
+            output.count("TCP: header build/send/recv + checksum verify (SYN) (PASS)") >= 2
+            and output.count("TCP: connection lifecycle (handshake + data + close) (PASS)") >= 2
+        ),
         "no fault": "FAULT" not in output,
     }
     ok = all(checks.values())
 
     if ok:
-        print(f"\n[rpi4_shell_smoke.py] PASS -- all 10 real shell commands (help, "
-              f"ver, echo, an unknown command, test, sha256, netif, arp, ip, filter) "
-              f"got their correct real responses over a live QEMU stdio UART session.",
-              file=sys.stderr)
+        print(f"\n[rpi4_shell_smoke.py] PASS -- all 11 real shell commands (help, "
+              f"ver, echo, an unknown command, test, sha256, netif, arp, ip, filter, "
+              f"tcp) got their correct real responses over a live QEMU stdio UART "
+              f"session.", file=sys.stderr)
         return 0
     failed = [name for name, passed in checks.items() if not passed]
     print(f"\n[rpi4_shell_smoke.py] FAIL -- failed checks: {failed!r}",

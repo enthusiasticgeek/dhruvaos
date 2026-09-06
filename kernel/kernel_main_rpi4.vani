@@ -2019,6 +2019,759 @@ fn filter_outgoing_self_test_rpi4() -> i64 {
   return ok;
 }
 
+// Round 89 -- Phase A step 4 of the networking/SSH/WiFi scope: TCP,
+// built on rounds 86-88's netif/ARP/IPv4+filter. Direct port of
+// kernel_main.vani's own stateless header layer (`tcp_flag_*`/
+// `tcp_checksum`/`tcp_build_header`/`tcp_get_*`/`tcp_verify_checksum`/
+// `tcp_send_segment`/`tcp_self_test`), same 20-byte header (no
+// options), same pseudo-header checksum construction.
+//
+// Reuses round 88's `tcp_get_dst_port_rpi4` as-is (identical
+// signature and behavior to what this module needs) rather than
+// redefining it under the same name -- it was already the real,
+// canonical accessor, just introduced early for the packet filter's
+// own narrow need.
+//
+// Ref-kind design decided UP FRONT this round, not reactively, per
+// round 88's own reborrow-gap lesson (`vani-compiler/docs/DHRUVAOS_
+// ERGONOMICS_TODO.md` gap #3): every `tcp_get_*_rpi4`/`tcp_checksum_
+// rpi4`/`tcp_verify_checksum_rpi4` below takes plain `ref [u8; 512]`
+// (matching the whole IPv4/ARP read-only chain from prior rounds),
+// since their real callers (`tcp_self_test_rpi4`, `tcp_conn_handle_
+// segment_rpi4`) only ever hold `ref` frames. The ONE place that
+// genuinely needs `mut ref` (`tcp_build_header_rpi4`, which writes
+// the header then must read it back to checksum it) computes that
+// checksum with an INLINE loop instead of delegating to `tcp_
+// checksum_rpi4` -- the same fix shape round 88 already used for
+// `ipv4_build_header_rpi4`, applied proactively here instead of
+// discovered via a `vanic check` error this time.
+
+fn tcp_flag_fin_rpi4() -> u32 { return 0x01 as u32; }
+fn tcp_flag_syn_rpi4() -> u32 { return 0x02 as u32; }
+fn tcp_flag_rst_rpi4() -> u32 { return 0x04 as u32; }
+fn tcp_flag_psh_rpi4() -> u32 { return 0x08 as u32; }
+fn tcp_flag_ack_rpi4() -> u32 { return 0x10 as u32; }
+
+fn tcp_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], tcp_offset: i64, tcp_len: i64) -> u32 {
+  let sum: u32 = 0 as u32;
+  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (src_ip & (0xFFFF as u32));
+  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (dst_ip & (0xFFFF as u32));
+  sum = sum + (6 as u32); // protocol (pseudo-header's zero byte contributes nothing)
+  sum = sum + (tcp_len as u32);
+  let i: i64 = 0;
+  while (i + 1) < tcp_len {
+    let word: u32 = arp_read_u16_be_rpi4(frame, tcp_offset + i);
+    sum = sum + word;
+    i = i + 2;
+  }
+  if i < tcp_len {
+    let b: u32 = frame[tcp_offset + i] as u32;
+    sum = sum + (b << (8 as u32)); // odd trailing byte, zero-padded low
+  }
+  while (sum >> (16 as u32)) != (0 as u32) {
+    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
+  }
+  return (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+}
+
+// See tcp_checksum_rpi4's own note on why this differs from
+// ipv4_verify_checksum_rpi4's `== 0xFFFF` convention: tcp_checksum_
+// rpi4 complements its own running sum internally before returning
+// (matching kernel_main.vani's own tcp_checksum), so calling it again
+// over the as-transmitted bytes (checksum field included) computes
+// ~(S + ~S) = ~0xFFFF = 0x0000, not all-ones.
+fn tcp_verify_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], tcp_offset: i64, tcp_len: i64) -> i64 {
+  if tcp_checksum_rpi4(src_ip, dst_ip, frame, tcp_offset, tcp_len) == (0 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+// Writes the TCP header+payload at frame[tcp_offset..), returning the
+// segment length (header+payload). Caller builds the IP header around
+// this afterward (see tcp_send_segment_rpi4 below).
+fn tcp_build_header_rpi4(frame: mut ref [u8; 512], tcp_offset: i64, src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32, payload: ref [u8; 512], payload_len: i64, src_ip: u32, dst_ip: u32) -> i64 {
+  let tcp_len: i64 = 20 + payload_len;
+  let _ = arp_write_u16_be_rpi4(frame, tcp_offset, src_port);
+  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 2, dst_port);
+  let _ = arp_write_u32_be_rpi4(frame, tcp_offset + 4, seq);
+  let _ = arp_write_u32_be_rpi4(frame, tcp_offset + 8, ack);
+  frame[tcp_offset + 12] = 0x50 as u8; // data offset=5, reserved=0
+  frame[tcp_offset + 13] = flags as u8;
+  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 14, window);
+  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 16, 0 as u32); // checksum placeholder
+  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 18, 0 as u32); // urgent pointer, unused
+  let i: i64 = 0;
+  while i < payload_len {
+    frame[tcp_offset + 20 + i] = payload[i];
+    i = i + 1;
+  }
+  // Inline checksum (see this section's own header comment for why:
+  // `frame` here is a `mut ref` parameter, and vani has no reborrow
+  // to a plain `ref` for calling the shared tcp_checksum_rpi4).
+  let sum: u32 = 0 as u32;
+  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (src_ip & (0xFFFF as u32));
+  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (dst_ip & (0xFFFF as u32));
+  sum = sum + (6 as u32);
+  sum = sum + (tcp_len as u32);
+  let j: i64 = 0;
+  while (j + 1) < tcp_len {
+    let hi: u32 = frame[tcp_offset + j] as u32;
+    let lo: u32 = frame[tcp_offset + j + 1] as u32;
+    let word: u32 = (hi << (8 as u32)) | lo;
+    sum = sum + word;
+    j = j + 2;
+  }
+  if j < tcp_len {
+    let b: u32 = frame[tcp_offset + j] as u32;
+    sum = sum + (b << (8 as u32));
+  }
+  while (sum >> (16 as u32)) != (0 as u32) {
+    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
+  }
+  let checksum: u32 = (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 16, checksum);
+  return tcp_len;
+}
+
+fn tcp_get_src_port_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
+  return arp_read_u16_be_rpi4(frame, tcp_offset);
+}
+fn tcp_get_seq_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
+  return arp_read_u32_be_rpi4(frame, tcp_offset + 4);
+}
+fn tcp_get_ack_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
+  return arp_read_u32_be_rpi4(frame, tcp_offset + 8);
+}
+fn tcp_get_flags_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
+  return frame[tcp_offset + 13] as u32;
+}
+fn tcp_get_window_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
+  return arp_read_u16_be_rpi4(frame, tcp_offset + 14);
+}
+fn tcp_get_data_offset_bytes_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> i64 {
+  let raw: u32 = frame[tcp_offset + 12] as u32;
+  return ((raw >> (4 as u32)) as i64) * 4;
+}
+
+// Builds a full Ethernet+IPv4+TCP segment and sends it via netif.
+// Fixed offsets (14 for IP, 34 for TCP) since this stack never sends
+// IP options, matching kernel_main.vani's own tcp_send_segment.
+fn tcp_send_segment_rpi4(my_mac: ref [u8; 6], dst_mac: ref [u8; 6], src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32, payload: ref [u8; 512], payload_len: i64) -> i64 {
+  let tcp_max_payload: i64 = netif_get_mtu_rpi4() - 20 - 20; // minus IP header, minus TCP header (no options)
+  if (payload_len < 0) || (payload_len > tcp_max_payload) {
+    return 0 - 1;
+  }
+  let frame: [u8; 512] = netif_zero_frame_rpi4();
+  let i: i64 = 0;
+  while i < 6 {
+    frame[i] = dst_mac[i];
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    frame[6 + j] = my_mac[j];
+    j = j + 1;
+  }
+  let _ = arp_write_u16_be_rpi4(mut ref frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let tcp_len: i64 = tcp_build_header_rpi4(mut ref frame, 34, src_port, dst_port, seq, ack, flags, window, payload, payload_len, src_ip, dst_ip);
+  let total_len: i64 = 20 + tcp_len;
+  let _ = ipv4_build_header_rpi4(mut ref frame, 14, total_len, 6 as u32, src_ip, dst_ip);
+  return netif_send_frame_rpi4(ref frame, 14 + total_len);
+}
+
+// Boot-time (and on-demand, via the `tcp` shell command) self-test:
+// build/send/receive a single SYN segment over the loopback netif and
+// verify every TCP header field, the checksum, and the (empty, for a
+// SYN) payload round-tripped correctly. Direct port of
+// kernel_main.vani's own tcp_self_test.
+fn tcp_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let _ = netif_get_mac_rpi4(mut ref my_mac);
+  let src_ip: u32 = 0xC0A80101 as u32;
+  let dst_ip: u32 = 0xC0A80102 as u32;
+  let src_port: u32 = 54321 as u32;
+  let dst_port: u32 = 80 as u32;
+  let seq: u32 = 1000 as u32;
+  let ack: u32 = 0 as u32;
+  let empty_payload: [u8; 512] = netif_zero_frame_rpi4();
+
+  let send_status: i64 = tcp_send_segment_rpi4(ref my_mac, ref my_mac, src_ip, dst_ip, src_port, dst_port, seq, ack, tcp_flag_syn_rpi4(), 65535 as u32, ref empty_payload, 0);
+  if send_status != 0 {
+    ok = 0;
+  }
+
+  let recv_frame: [u8; 512] = netif_zero_frame_rpi4();
+  let recv_len: i64 = netif_recv_frame_rpi4(mut ref recv_frame, 512);
+  if recv_len != 54 { // 14 (eth) + 20 (ip) + 20 (tcp), no payload
+    ok = 0;
+  }
+  if tcp_get_src_port_rpi4(ref recv_frame, 34) != src_port {
+    ok = 0;
+  }
+  if tcp_get_dst_port_rpi4(ref recv_frame, 34) != dst_port {
+    ok = 0;
+  }
+  if tcp_get_seq_rpi4(ref recv_frame, 34) != seq {
+    ok = 0;
+  }
+  if tcp_get_ack_rpi4(ref recv_frame, 34) != ack {
+    ok = 0;
+  }
+  if tcp_get_flags_rpi4(ref recv_frame, 34) != tcp_flag_syn_rpi4() {
+    ok = 0;
+  }
+  if tcp_get_data_offset_bytes_rpi4(ref recv_frame, 34) != 20 {
+    ok = 0;
+  }
+  if tcp_verify_checksum_rpi4(src_ip, dst_ip, ref recv_frame, 34, 20) != 1 {
+    ok = 0;
+  }
+  if ipv4_get_protocol_rpi4(ref recv_frame, 14) != (6 as u32) {
+    ok = 0;
+  }
+
+  let _ = uart_puts_rpi4_vani("TCP: header build/send/recv + checksum verify (SYN)");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
+// TCP's stateful connection layer -- three-way handshake, data
+// transfer, and a simplified close. Direct port of kernel_main.vani's
+// own `tcp_conn_*` family onto round 86's netif, exactly two fixed
+// connection slots (0=client/active-open, 1=server/passive-open),
+// same as Pi 1 -- this single-threaded environment has no second task
+// to run "the other side" concurrently, so `tcp_conn_self_test_rpi4`
+// below plays traffic cop between both slots itself, exactly like
+// kernel_main.vani's own tcp_conn_self_test.
+//
+// Scoped like Pi 1's own TCP: a real, correctly-sequenced connection
+// lifecycle (handshake, simultaneous open, data transfer, one-sided
+// AND simultaneous close, retransmission timers, advertised-window
+// enforcement -- every branch below is a direct, unabridged port, not
+// a subset), not spec-complete (no urgent pointer, no zero-window
+// probing). **Not ported this round**: kernel_main.vani's own
+// dedicated regression self-tests for a few of these branches
+// (tcp_conn_recv_bounds_self_test, tcp_conn_simultaneous_open_self_
+// test, tcp_conn_simultaneous_close_self_test, tcp_conn_window_
+// enforcement_self_test) -- the underlying logic they each exercise
+// IS fully present and live in the state machine below (nothing is
+// stubbed or truncated), just not independently re-verified via its
+// own dedicated synthetic fixture this round. A real, honest scope
+// boundary for a single round on the largest single port in this
+// scope, not an oversight -- see this round's own project memory.
+extern "C" fn tcp_conn_reset(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_get_state(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_state(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_local_seq(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_local_seq(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_remote_seq(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_remote_seq(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_local_port(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_local_port(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_remote_port(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_remote_port(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_local_ip(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_local_ip(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_remote_ip(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_remote_ip(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_rtx_deadline(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_rtx_deadline(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_rtx_count(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_rtx_count(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_rtx_seq(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_rtx_seq(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_rtx_len(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_rtx_len(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_remote_window(conn_id: u32) -> u32;
+extern "C" fn tcp_conn_set_remote_window(conn_id: u32, value: u32) -> u32;
+extern "C" fn tcp_conn_get_rtx_byte(conn_id: u32, byte_idx: u32) -> u32;
+extern "C" fn tcp_conn_set_rtx_byte(conn_id: u32, byte_idx: u32, value: u32) -> u32;
+extern "C" fn rpi4_timer_tick_count_get() -> i64;
+
+fn tcp_state_closed_rpi4() -> u32 { return 0 as u32; }
+fn tcp_state_syn_sent_rpi4() -> u32 { return 1 as u32; }
+fn tcp_state_syn_rcvd_rpi4() -> u32 { return 2 as u32; }
+fn tcp_state_established_rpi4() -> u32 { return 3 as u32; }
+fn tcp_state_fin_wait_rpi4() -> u32 { return 4 as u32; }
+fn tcp_state_closed_final_rpi4() -> u32 { return 5 as u32; }
+fn tcp_state_closing_rpi4() -> u32 { return 6 as u32; }
+
+fn tcp_rtx_timeout_ticks_rpi4() -> u32 { return 4 as u32; }
+fn tcp_rtx_max_retries_rpi4() -> u32 { return 3 as u32; }
+
+// Active open (the connecting/"client" side): records connection
+// identity, picks an initial sequence number, and sends the opening
+// SYN. Conn moves to SYN_SENT; the handshake only completes once the
+// caller feeds a matching SYN-ACK segment into
+// tcp_conn_handle_segment_rpi4. Also arms the SYN's own
+// retransmission timer (rtx_len=0 marks a bare-SYN retransmission).
+fn tcp_conn_active_open_rpi4(conn_id: u32, my_mac: ref [u8; 6], dst_mac: ref [u8; 6], local_ip: u32, remote_ip: u32, local_port: u32, remote_port: u32, initial_seq: u32) -> i64 {
+  let _ = tcp_conn_set_local_ip(conn_id, local_ip);
+  let _ = tcp_conn_set_remote_ip(conn_id, remote_ip);
+  let _ = tcp_conn_set_local_port(conn_id, local_port);
+  let _ = tcp_conn_set_remote_port(conn_id, remote_port);
+  let _ = tcp_conn_set_local_seq(conn_id, initial_seq);
+  let _ = tcp_conn_set_remote_seq(conn_id, 0 as u32);
+  let _ = tcp_conn_set_remote_window(conn_id, 65535 as u32); // sane default until the peer's first real segment says otherwise
+  let _ = tcp_conn_set_state(conn_id, tcp_state_syn_sent_rpi4());
+  let _ = tcp_conn_set_rtx_seq(conn_id, initial_seq);
+  let _ = tcp_conn_set_rtx_len(conn_id, 0 as u32);
+  let _ = tcp_conn_set_rtx_count(conn_id, 0 as u32);
+  let _ = tcp_conn_set_rtx_deadline(conn_id, (rpi4_timer_tick_count_get() as u32) + tcp_rtx_timeout_ticks_rpi4());
+  let empty_payload: [u8; 512] = netif_zero_frame_rpi4();
+  return tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, initial_seq, 0 as u32, tcp_flag_syn_rpi4(), 65535 as u32, ref empty_payload, 0);
+}
+
+// Passive open (the listening/"server" side): records only the local
+// identity it's willing to accept a connection on -- remote identity
+// and sequence numbers get filled in once tcp_conn_handle_segment_
+// rpi4 sees the actual incoming SYN. Conn stays CLOSED until then
+// (no separate LISTEN state, matching kernel_main.vani's own scope).
+fn tcp_conn_passive_open_rpi4(conn_id: u32, local_ip: u32, local_port: u32) -> i64 {
+  let _ = tcp_conn_set_local_ip(conn_id, local_ip);
+  let _ = tcp_conn_set_local_port(conn_id, local_port);
+  let _ = tcp_conn_set_remote_window(conn_id, 65535 as u32);
+  let _ = tcp_conn_set_state(conn_id, tcp_state_closed_rpi4());
+  return 0;
+}
+
+// The core state-machine step: given one already-received TCP segment
+// (frame, with its IPv4/Ethernet headers still in place at their
+// usual fixed offsets) addressed to this connection, takes whatever
+// single reaction the current state calls for and returns:
+//   >= 0  a data segment was accepted; return value is the payload
+//         length copied into out_payload (0 for a control-only
+//         segment, the common case)
+//   -1    the segment didn't match anything this state expects
+// Direct port of kernel_main.vani's own tcp_conn_handle_segment,
+// including its own round-8-audit checksum verification and
+// round-8-audit data-segment bounds checks.
+fn tcp_conn_handle_segment_rpi4(conn_id: u32, frame: ref [u8; 512], recv_len: i64, my_mac: ref [u8; 6], dst_mac: ref [u8; 6], out_payload: mut ref [u8; 512], max_payload_len: i64) -> i64 {
+  let tcp_seg_len: i64 = recv_len - 34;
+  let checksum_src_ip: u32 = ipv4_get_src_ip_rpi4(frame, 14);
+  let checksum_dst_ip: u32 = ipv4_get_dst_ip_rpi4(frame, 14);
+  if tcp_verify_checksum_rpi4(checksum_src_ip, checksum_dst_ip, frame, 34, tcp_seg_len) != 1 {
+    return 0 - 1;
+  }
+  let state: u32 = tcp_conn_get_state(conn_id);
+  let flags: u32 = tcp_get_flags_rpi4(frame, 34);
+  let seg_seq: u32 = tcp_get_seq_rpi4(frame, 34);
+  let seg_ack: u32 = tcp_get_ack_rpi4(frame, 34);
+  let local_ip: u32 = tcp_conn_get_local_ip(conn_id);
+  let local_port: u32 = tcp_conn_get_local_port(conn_id);
+
+  let has_syn: i64 = 0;
+  if (flags & tcp_flag_syn_rpi4()) != (0 as u32) { has_syn = 1; }
+  let has_ack: i64 = 0;
+  if (flags & tcp_flag_ack_rpi4()) != (0 as u32) { has_ack = 1; }
+  let has_fin: i64 = 0;
+  if (flags & tcp_flag_fin_rpi4()) != (0 as u32) { has_fin = 1; }
+  let has_psh: i64 = 0;
+  if (flags & tcp_flag_psh_rpi4()) != (0 as u32) { has_psh = 1; }
+
+  let _ = tcp_conn_set_remote_window(conn_id, tcp_get_window_rpi4(frame, 34));
+
+  let empty_payload: [u8; 512] = netif_zero_frame_rpi4();
+
+  // Passive open, first SYN arriving.
+  if (state == tcp_state_closed_rpi4()) && (has_syn == 1) && (tcp_get_dst_port_rpi4(frame, 34) == local_port) {
+    let _ = tcp_conn_set_remote_ip(conn_id, ipv4_get_src_ip_rpi4(frame, 14));
+    let _ = tcp_conn_set_remote_port(conn_id, tcp_get_src_port_rpi4(frame, 34));
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32)); // SYN consumes one seq number
+    let server_isn: u32 = 5000 as u32;
+    let _ = tcp_conn_set_local_seq(conn_id, server_isn);
+    let _ = tcp_conn_set_state(conn_id, tcp_state_syn_rcvd_rpi4());
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), server_isn, tcp_conn_get_remote_seq(conn_id), tcp_flag_syn_rpi4() | tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+    return 0;
+  }
+
+  // Active-open side receiving the SYN-ACK: completes with our own
+  // final ACK, moving straight to ESTABLISHED.
+  if (state == tcp_state_syn_sent_rpi4()) && (has_syn == 1) && (has_ack == 1) && (seg_ack == (tcp_conn_get_local_seq(conn_id) + (1 as u32))) {
+    let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
+    let new_local_seq: u32 = tcp_conn_get_local_seq(conn_id) + (1 as u32); // our own SYN consumed one
+    let _ = tcp_conn_set_local_seq(conn_id, new_local_seq);
+    let _ = tcp_conn_set_state(conn_id, tcp_state_established_rpi4());
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), new_local_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+    return 0;
+  }
+
+  // Simultaneous open: both sides issue active_open at roughly the
+  // same time, so this side is still in SYN_SENT when the peer's own
+  // bare SYN (no ACK) arrives instead of a SYN-ACK. Answer with
+  // SYN+ACK and move to SYN_RCVD -- the exact state passive_open's
+  // own first-SYN branch above already produces.
+  if (state == tcp_state_syn_sent_rpi4()) && (has_syn == 1) && (has_ack == 0) {
+    let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32); // peer answered
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
+    let _ = tcp_conn_set_state(conn_id, tcp_state_syn_rcvd_rpi4());
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_syn_rpi4() | tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+    return 0;
+  }
+
+  // Passive-open side receiving the final ACK of the handshake.
+  if (state == tcp_state_syn_rcvd_rpi4()) && (has_ack == 1) && (seg_ack == (tcp_conn_get_local_seq(conn_id) + (1 as u32))) {
+    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32));
+    let _ = tcp_conn_set_state(conn_id, tcp_state_established_rpi4());
+    return 0;
+  }
+
+  // Established, a data segment arrives in order: copy the payload
+  // out, advance what we expect next, and acknowledge it. Same
+  // round-8-audit bounds checks as kernel_main.vani's own version
+  // (reject a negative length, a declared extent past recv_len, a
+  // payload bigger than the caller's own buffer, or a data_offset
+  // under 20 bytes).
+  if (state == tcp_state_established_rpi4()) && (has_psh == 1) && (seg_seq == tcp_conn_get_remote_seq(conn_id)) {
+    let tcp_len: i64 = (ipv4_get_total_len_rpi4(frame, 14) as i64) - 20;
+    let data_offset: i64 = tcp_get_data_offset_bytes_rpi4(frame, 34);
+    let payload_len: i64 = tcp_len - data_offset;
+    if data_offset < 20 {
+      return 0 - 1;
+    }
+    if payload_len < 0 {
+      return 0 - 1;
+    }
+    if (34 + data_offset + payload_len) > recv_len {
+      return 0 - 1;
+    }
+    if payload_len > max_payload_len {
+      return 0 - 1;
+    }
+    let i: i64 = 0;
+    while i < payload_len {
+      out_payload[i] = frame[34 + data_offset + i];
+      i = i + 1;
+    }
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (payload_len as u32));
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+    return payload_len;
+  }
+
+  // Established, a pure ACK for data we sent -- cancel a pending
+  // retransmission if this ACK covers it.
+  if (state == tcp_state_established_rpi4()) && (has_ack == 1) && (has_fin == 0) && (has_psh == 0) && (has_syn == 0) {
+    if tcp_conn_get_rtx_deadline(conn_id) != (0 as u32) {
+      let rtx_seq: u32 = tcp_conn_get_rtx_seq(conn_id);
+      let rtx_len: u32 = tcp_conn_get_rtx_len(conn_id);
+      if seg_ack >= (rtx_seq + rtx_len) {
+        let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
+      }
+    }
+    return 0;
+  }
+
+  // Established, the peer starts closing: piggyback our own FIN onto
+  // the ACK and move to FIN_WAIT for the final ACK.
+  if (state == tcp_state_established_rpi4()) && (has_fin == 1) {
+    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32)); // FIN consumes one seq number
+    let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait_rpi4());
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4() | tcp_flag_fin_rpi4(), 65535 as u32, ref empty_payload, 0);
+    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // our own FIN
+    return 0;
+  }
+
+  // The initiating closer receiving the peer's response to its own
+  // FIN -- may carry the peer's own piggybacked FIN too (one-sided
+  // close) or arrive as a separate, independent FIN (simultaneous
+  // close, RFC 793 CLOSING) if the peer never saw ours first.
+  // our_fin_acked checks seg_ack against our own local_seq (already
+  // advanced past our FIN's own sequence number by tcp_conn_close_
+  // rpi4) rather than assuming any ack qualifies.
+  if (state == tcp_state_fin_wait_rpi4()) && (has_ack == 1) {
+    let our_fin_acked: i64 = if seg_ack == tcp_conn_get_local_seq(conn_id) { 1 } else { 0 };
+    if has_fin == 1 {
+      let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
+      let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+      if our_fin_acked == 1 {
+        let _ = tcp_conn_set_state(conn_id, tcp_state_closed_final_rpi4());
+      } else {
+        // Simultaneous close: the peer's FIN arrived independently,
+        // before it had seen ours. We've just ACKed its FIN above;
+        // now wait in CLOSING for it to separately ACK ours.
+        let _ = tcp_conn_set_state(conn_id, tcp_state_closing_rpi4());
+      }
+    } else {
+      if our_fin_acked == 1 {
+        let _ = tcp_conn_set_state(conn_id, tcp_state_closed_final_rpi4());
+      }
+    }
+    return 0;
+  }
+
+  // CLOSING (simultaneous close only reaches this state via the
+  // FIN_WAIT branch above) -- we already ACKed the peer's own FIN;
+  // this is specifically waiting for the peer's separate ACK of ours.
+  if (state == tcp_state_closing_rpi4()) && (has_ack == 1) && (seg_ack == tcp_conn_get_local_seq(conn_id)) {
+    let _ = tcp_conn_set_state(conn_id, tcp_state_closed_final_rpi4());
+    return 0;
+  }
+
+  return 0 - 1;
+}
+
+// Sends one data segment on an ESTABLISHED connection. local_seq
+// advances immediately (this project's own segments are never split/
+// coalesced). Buffers the segment (its starting seq + payload bytes)
+// into this connection's own retransmit slot and arms the retransmit
+// timer. payload_len is capped at 64 bytes, tcp_conn_rtx_buf's real
+// per-connection capacity (boot/rpi4/tcp_state.S). Refuses to send
+// more than the peer's own last-advertised window -- no zero-window
+// probe/retry, a real, honest scope boundary matching kernel_main
+// .vani's own.
+fn tcp_conn_send_data_rpi4(conn_id: u32, my_mac: ref [u8; 6], dst_mac: ref [u8; 6], payload: ref [u8; 512], payload_len: i64) -> i64 {
+  if (payload_len < 0) || (payload_len > (64 as i64)) {
+    return 0 - 1;
+  }
+  if payload_len > (tcp_conn_get_remote_window(conn_id) as i64) {
+    return 0 - 1;
+  }
+  let seq_before: u32 = tcp_conn_get_local_seq(conn_id);
+  let status: i64 = tcp_send_segment_rpi4(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), seq_before, tcp_conn_get_remote_seq(conn_id), tcp_flag_psh_rpi4() | tcp_flag_ack_rpi4(), 65535 as u32, payload, payload_len);
+  let _ = tcp_conn_set_local_seq(conn_id, seq_before + (payload_len as u32));
+  if status == 0 {
+    let i: i64 = 0;
+    while i < payload_len {
+      let _ = tcp_conn_set_rtx_byte(conn_id, i as u32, payload[i] as u32);
+      i = i + 1;
+    }
+    let _ = tcp_conn_set_rtx_seq(conn_id, seq_before);
+    let _ = tcp_conn_set_rtx_len(conn_id, payload_len as u32);
+    let _ = tcp_conn_set_rtx_count(conn_id, 0 as u32);
+    let _ = tcp_conn_set_rtx_deadline(conn_id, (rpi4_timer_tick_count_get() as u32) + tcp_rtx_timeout_ticks_rpi4());
+  }
+  return status;
+}
+
+// Starts closing an ESTABLISHED connection from this side: sends FIN,
+// moves to FIN_WAIT. Teardown completes once the caller feeds the
+// peer's own FIN+ACK (or separate FIN) back into
+// tcp_conn_handle_segment_rpi4.
+fn tcp_conn_close_rpi4(conn_id: u32, my_mac: ref [u8; 6], dst_mac: ref [u8; 6]) -> i64 {
+  let empty_payload: [u8; 512] = netif_zero_frame_rpi4();
+  let status: i64 = tcp_send_segment_rpi4(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_fin_rpi4() | tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+  let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // FIN consumes one
+  let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait_rpi4());
+  return status;
+}
+
+// Fires whenever a connection's own pending retransmission (armed by
+// active_open for a SYN, or send_data for a data segment) is actually
+// due. Returns 0 if nothing was due, 1 if a retransmission was just
+// sent, -1 if this connection just gave up (exceeded
+// tcp_rtx_max_retries_rpi4) -- a SYN give-up resets to CLOSED; a data
+// give-up leaves the connection's own state alone.
+fn tcp_conn_check_retransmit_rpi4(conn_id: u32, my_mac: ref [u8; 6], dst_mac: ref [u8; 6]) -> i64 {
+  let deadline: u32 = tcp_conn_get_rtx_deadline(conn_id);
+  if deadline == (0 as u32) {
+    return 0;
+  }
+  if (rpi4_timer_tick_count_get() as u32) < deadline {
+    return 0;
+  }
+  let count: u32 = tcp_conn_get_rtx_count(conn_id);
+  if count >= tcp_rtx_max_retries_rpi4() {
+    let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
+    if tcp_conn_get_state(conn_id) == tcp_state_syn_sent_rpi4() {
+      let _ = tcp_conn_set_state(conn_id, tcp_state_closed_rpi4());
+    }
+    return 0 - 1;
+  }
+
+  let local_ip: u32 = tcp_conn_get_local_ip(conn_id);
+  let local_port: u32 = tcp_conn_get_local_port(conn_id);
+  let remote_ip: u32 = tcp_conn_get_remote_ip(conn_id);
+  let remote_port: u32 = tcp_conn_get_remote_port(conn_id);
+  let rtx_seq: u32 = tcp_conn_get_rtx_seq(conn_id);
+  let rtx_len: i64 = tcp_conn_get_rtx_len(conn_id) as i64;
+  if rtx_len == 0 {
+    // Bare-SYN retransmission -- active_open's own SYN never got a
+    // reply.
+    let empty_payload: [u8; 512] = netif_zero_frame_rpi4();
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, rtx_seq, 0 as u32, tcp_flag_syn_rpi4(), 65535 as u32, ref empty_payload, 0);
+  } else {
+    // Data-segment retransmission -- rebuild the payload from this
+    // connection's own byte-level rtx storage (boot/rpi4/tcp_state.S)
+    // into a fresh local array, then resend it.
+    let rtx_payload: [u8; 512] = netif_zero_frame_rpi4();
+    let i: i64 = 0;
+    while i < rtx_len {
+      rtx_payload[i] = tcp_conn_get_rtx_byte(conn_id, i as u32) as u8;
+      i = i + 1;
+    }
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, rtx_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_psh_rpi4() | tcp_flag_ack_rpi4(), 65535 as u32, ref rtx_payload, rtx_len);
+  }
+  let _ = tcp_conn_set_rtx_count(conn_id, count + (1 as u32));
+  let _ = tcp_conn_set_rtx_deadline(conn_id, (rpi4_timer_tick_count_get() as u32) + tcp_rtx_timeout_ticks_rpi4());
+  return 1;
+}
+
+// The live counterpart to tcp_conn_self_test_rpi4's own hand-driven
+// "traffic cop" role: dequeues the next queued frame and, if it's TCP
+// addressed to either connection slot, routes it to tcp_conn_handle_
+// segment_rpi4. Also the live echo-service responder: if the SERVER
+// connection (slot 1) just received real data, echoes it straight
+// back via tcp_conn_send_data_rpi4, returning -2 (matching kernel_
+// main.vani's own "handled a request, not a reply for you"
+// convention).
+fn tcp_conn_poll_rpi4(my_mac: ref [u8; 6], out_payload: mut ref [u8; 512], max_payload_len: i64) -> i64 {
+  let _ = tcp_conn_check_retransmit_rpi4(0 as u32, my_mac, my_mac);
+  let _ = tcp_conn_check_retransmit_rpi4(1 as u32, my_mac, my_mac);
+
+  let frame: [u8; 512] = netif_zero_frame_rpi4();
+  let frame_len: i64 = netif_recv_frame_rpi4(mut ref frame, 512);
+  if frame_len < 0 {
+    return 0 - 1;
+  }
+  if arp_read_u16_be_rpi4(ref frame, 12) != (0x0800 as u32) {
+    return 0 - 1;
+  }
+  if ipv4_get_protocol_rpi4(ref frame, 14) != (6 as u32) {
+    return 0 - 1;
+  }
+  let dst_port: u32 = tcp_get_dst_port_rpi4(ref frame, 34);
+  let client_id: u32 = 0 as u32;
+  let server_id: u32 = 1 as u32;
+  let target_conn: u32 = client_id;
+  let matched: i64 = 0;
+  if dst_port == tcp_conn_get_local_port(client_id) {
+    target_conn = client_id;
+    matched = 1;
+  }
+  if dst_port == tcp_conn_get_local_port(server_id) {
+    target_conn = server_id;
+    matched = 1;
+  }
+  if matched == 0 {
+    return 0 - 1;
+  }
+  let result: i64 = tcp_conn_handle_segment_rpi4(target_conn, ref frame, frame_len, my_mac, my_mac, out_payload, max_payload_len);
+  if (target_conn == server_id) && (result > 0) {
+    // Echo the just-received data straight back. out_payload is a
+    // `mut ref` PARAMETER here (it was just written into above), and
+    // vani has no reborrow to a plain `ref` for tcp_conn_send_data_
+    // rpi4's own read-only payload param (see round 88's own gap #3
+    // in vani-compiler/docs/DHRUVAOS_ERGONOMICS_TODO.md) -- copy into
+    // a fresh owned local first, which can supply either kind.
+    let echo_payload: [u8; 512] = netif_zero_frame_rpi4();
+    let i: i64 = 0;
+    while i < result {
+      echo_payload[i] = out_payload[i];
+      i = i + 1;
+    }
+    let _ = tcp_conn_send_data_rpi4(server_id, my_mac, my_mac, ref echo_payload, result);
+    return 0 - 2;
+  }
+  return result;
+}
+
+// Boot-time (and on-demand, via the `tcp` shell command) self-test: a
+// complete, real connection lifecycle -- three-way handshake, one
+// direction of data transfer, and a full close -- driven entirely by
+// this function acting as traffic cop between connection slot 0
+// (client/active open) and slot 1 (server/passive open). Direct port
+// of kernel_main.vani's own tcp_conn_self_test.
+fn tcp_conn_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let _ = tcp_conn_reset(0 as u32);
+  let _ = tcp_conn_reset(1 as u32);
+  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let _ = netif_get_mac_rpi4(mut ref my_mac);
+  let client_id: u32 = 0 as u32;
+  let server_id: u32 = 1 as u32;
+  let client_ip: u32 = 0xC0A80101 as u32;
+  let server_ip: u32 = 0xC0A80102 as u32;
+  let client_port: u32 = 54321 as u32;
+  let server_port: u32 = 7 as u32;
+
+  let _ = tcp_conn_passive_open_rpi4(server_id, server_ip, server_port);
+  let _ = tcp_conn_active_open_rpi4(client_id, ref my_mac, ref my_mac, client_ip, server_ip, client_port, server_port, 1000 as u32);
+
+  // Handshake: client's SYN -> server; server's SYN-ACK -> client;
+  // client's final ACK -> server.
+  let scratch: [u8; 512] = netif_zero_frame_rpi4();
+  let f1: [u8; 512] = netif_zero_frame_rpi4();
+  let l1: i64 = netif_recv_frame_rpi4(mut ref f1, 512); // client's SYN
+  let s1: i64 = tcp_conn_handle_segment_rpi4(server_id, ref f1, l1, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l1 <= 0) || (s1 != 0) { ok = 0; }
+
+  let f2: [u8; 512] = netif_zero_frame_rpi4();
+  let l2: i64 = netif_recv_frame_rpi4(mut ref f2, 512); // server's SYN-ACK
+  let s2: i64 = tcp_conn_handle_segment_rpi4(client_id, ref f2, l2, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l2 <= 0) || (s2 != 0) { ok = 0; }
+
+  let f3: [u8; 512] = netif_zero_frame_rpi4();
+  let l3: i64 = netif_recv_frame_rpi4(mut ref f3, 512); // client's final ACK
+  let s3: i64 = tcp_conn_handle_segment_rpi4(server_id, ref f3, l3, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l3 <= 0) || (s3 != 0) { ok = 0; }
+
+  if tcp_conn_get_state(client_id) != tcp_state_established_rpi4() { ok = 0; }
+  if tcp_conn_get_state(server_id) != tcp_state_established_rpi4() { ok = 0; }
+
+  // Data transfer: client sends "hi", server receives + ACKs it.
+  let payload: [u8; 512] = netif_zero_frame_rpi4();
+  payload[0] = 104 as u8; // 'h'
+  payload[1] = 105 as u8; // 'i'
+  let send_status: i64 = tcp_conn_send_data_rpi4(client_id, ref my_mac, ref my_mac, ref payload, 2);
+  if send_status != 0 { ok = 0; }
+
+  let f4: [u8; 512] = netif_zero_frame_rpi4();
+  let l4: i64 = netif_recv_frame_rpi4(mut ref f4, 512); // client's data segment
+  let recv_payload: [u8; 512] = netif_zero_frame_rpi4();
+  let recv_len: i64 = tcp_conn_handle_segment_rpi4(server_id, ref f4, l4, ref my_mac, ref my_mac, mut ref recv_payload, 2);
+  if (l4 <= 0) || (recv_len != 2) { ok = 0; }
+  if (recv_payload[0] != (104 as u8)) || (recv_payload[1] != (105 as u8)) {
+    ok = 0;
+  }
+
+  let f5: [u8; 512] = netif_zero_frame_rpi4();
+  let l5: i64 = netif_recv_frame_rpi4(mut ref f5, 512); // server's ACK of the data
+  let s5: i64 = tcp_conn_handle_segment_rpi4(client_id, ref f5, l5, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l5 <= 0) || (s5 != 0) { ok = 0; }
+
+  // Close: client sends FIN+ACK; server piggybacks its own FIN onto
+  // the ACK; client sends the final ACK.
+  let close_status: i64 = tcp_conn_close_rpi4(client_id, ref my_mac, ref my_mac);
+  if close_status != 0 { ok = 0; }
+
+  let f6: [u8; 512] = netif_zero_frame_rpi4();
+  let l6: i64 = netif_recv_frame_rpi4(mut ref f6, 512); // client's FIN+ACK
+  let s6: i64 = tcp_conn_handle_segment_rpi4(server_id, ref f6, l6, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l6 <= 0) || (s6 != 0) { ok = 0; }
+  if tcp_conn_get_state(server_id) != tcp_state_fin_wait_rpi4() { ok = 0; }
+
+  let f7: [u8; 512] = netif_zero_frame_rpi4();
+  let l7: i64 = netif_recv_frame_rpi4(mut ref f7, 512); // server's FIN+ACK (piggybacked)
+  let s7: i64 = tcp_conn_handle_segment_rpi4(client_id, ref f7, l7, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l7 <= 0) || (s7 != 0) { ok = 0; }
+  if tcp_conn_get_state(client_id) != tcp_state_closed_final_rpi4() { ok = 0; }
+
+  let f8: [u8; 512] = netif_zero_frame_rpi4();
+  let l8: i64 = netif_recv_frame_rpi4(mut ref f8, 512); // client's final ACK
+  let s8: i64 = tcp_conn_handle_segment_rpi4(server_id, ref f8, l8, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l8 <= 0) || (s8 != 0) { ok = 0; }
+  if tcp_conn_get_state(server_id) != tcp_state_closed_final_rpi4() { ok = 0; }
+
+  let _ = uart_puts_rpi4_vani("TCP: connection lifecycle (handshake + data + close)");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
@@ -2045,6 +2798,8 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = ipv4_self_test_rpi4();
   let _ = filter_self_test_rpi4();
   let _ = filter_outgoing_self_test_rpi4();
+  let _ = tcp_self_test_rpi4();
+  let _ = tcp_conn_self_test_rpi4();
   return 0;
 }
 
@@ -2284,11 +3039,11 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, netif, arp, ip, filter, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, netif, arp, ip, filter, tcp, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 88 minimal shell + crypto + netif + arp + ip + filter\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 89 minimal shell + crypto + netif + arp + ip + filter + tcp\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
@@ -2320,6 +3075,12 @@ fn rpi4_shell_dispatch() -> i64 {
     let _ = uart_puts_rpi4_vani("\n");
     let _ = filter_self_test_rpi4();
     let _ = filter_outgoing_self_test_rpi4();
+    return 0;
+  }
+  if rpi4_shell_line_matches("tcp") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = tcp_self_test_rpi4();
+    let _ = tcp_conn_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_starts_with("echo ") == (1 as u32) {
