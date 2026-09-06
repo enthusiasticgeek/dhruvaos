@@ -156,6 +156,16 @@ clear_bss_rpi4_done:
 
 heartbeat_loop:
     wfi
+    /* Round 79: fires exactly once, on the exact wfi wakeup where the
+     * preemption demo's tick-5 switch resumes boot's own saved
+     * context -- every OTHER wfi wakeup during that demo resumes
+     * task_a/task_b directly instead (their own eret targets, not
+     * this instruction), so control genuinely never reaches this line
+     * until then. See kernel_main_rpi4.vani's own rpi4_heartbeat_tick
+     * and boot/rpi4/preempt_switch.S's header comment for the full
+     * reasoning. Harmless on every wfi wakeup after that too (a
+     * one-shot flag, checked and no-op once already printed). */
+    bl rpi4_heartbeat_tick
     b heartbeat_loop
 
 /* Round 43 v1 "kernel": prove the boot+EL-drop+vector-install chain

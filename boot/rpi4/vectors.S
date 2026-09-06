@@ -198,7 +198,12 @@ fault_halt:
  */
 .global aarch64_irq_handler
 aarch64_irq_handler:
-    sub sp, sp, #256
+    /* Round 79: grew from 256 to 272 bytes to also hold ELR_EL1/
+     * SPSR_EL1 -- see boot/rpi4/preempt_switch.S's own header comment
+     * for why a handler that might resume a DIFFERENT context than
+     * the one it interrupted needs these explicitly saved per-frame,
+     * not left as ambient hardware state. */
+    sub sp, sp, #272
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
@@ -215,6 +220,9 @@ aarch64_irq_handler:
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
+    mrs x0, elr_el1
+    mrs x1, spsr_el1
+    stp x0, x1, [sp, #248]
 
     ldr x0, =IRQ_GICC_BASE
     ldr w1, [x0, #IRQ_GICC_IAR]
@@ -243,8 +251,23 @@ irq_timer:
      * since every one of x0-x30 is already unconditionally saved above
      * (this handler must do that regardless, to resume the interrupted
      * context via `eret` below) -- see that function's own comment for
-     * the full reasoning. */
+     * the full reasoning.
+     *
+     * Round 79: that call now returns a real signal (x0 = force_boot:
+     * 1 on the halting tick, 0 otherwise), fed straight into
+     * rpi4_preempt_switch (boot/rpi4/preempt_switch.S) along with the
+     * CURRENT frame pointer -- it saves the current frame into
+     * whichever task the scheduler thinks is running, decides who's
+     * next, and returns THAT task's saved sp, which may genuinely
+     * differ from the one we entered with. `mov sp, x0` here is the
+     * entire "switch" from this handler's own perspective -- the
+     * shared irq_restore epilogue below does the rest, uniformly,
+     * whether or not an actual switch happened. */
     bl rpi4_handle_timer_irq
+    mov x1, x0
+    mov x0, sp
+    bl rpi4_preempt_switch
+    mov sp, x0
     b irq_eoi
 
 irq_uart0:
@@ -259,6 +282,17 @@ irq_eoi:
     str w19, [x0, #IRQ_GICC_EOIR]
 
 irq_restore:
+    /* Round 79: restore ELR_EL1/SPSR_EL1 from THIS frame (whichever
+     * one sp now points at -- possibly a different task's, if the
+     * timer branch just switched) before touching x0/x1 for real.
+     * Unconditional, even for spurious/UART0 (which never switch):
+     * putting back the exact same value they already hold is a
+     * no-op, and a shared, uniform epilogue is far less error-prone
+     * than special-casing "did a switch happen" here. */
+    ldp x0, x1, [sp, #248]
+    msr elr_el1, x0
+    msr spsr_el1, x1
+
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
     ldp x4, x5, [sp, #32]
@@ -275,7 +309,7 @@ irq_restore:
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
     ldr x30, [sp, #240]
-    add sp, sp, #256
+    add sp, sp, #272
     eret
 
 /* i64 rpi4_timer_tick_count_increment(void) -- round 75, the one

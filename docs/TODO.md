@@ -3066,6 +3066,72 @@ than assumed:
   integrated with the timer IRQ -- this round only proves the
   underlying stack-swap primitive works, deliberately scoped apart
   from that much larger, riskier next step.
+
+  **ROUND 79 UPDATE, 2026-09-06** (still `[PARTIAL]` -- the full
+  28000+-line port remains its own multi-round effort): took that
+  "next step" -- interrupt-driven preemption, built on round 78's
+  proven stack-swap result but via a genuinely different mechanism
+  (an `eret`-based restore of a FULL x0-x30 frame, not a `ret`-based
+  swap of just the AAPCS64 callee-saved registers). User's own
+  explicit direction after being shown the size/risk jump: "jump
+  straight to interrupt-driven preemption" rather than building a
+  general task table first.
+
+  **The core new correctness requirement, found and handled
+  correctly the first time** (unlike round 77's GIC bug): `eret`
+  resumes execution using ELR_EL1/SPSR_EL1, neither part of the
+  general register file `aarch64_irq_handler` already saved. As long
+  as a handler always resumes the SAME context it interrupted (true
+  through round 78), these can be left as ambient hardware state --
+  the instant a handler might resume a DIFFERENT task, they must
+  become part of each task's own saved frame instead (grown from 256
+  to 272 bytes), or a resumed task resumes at the wrong PC. This is
+  the AArch64-shaped version of the exact lesson Pi 1's own
+  `boot/irq_entry.S` learned the hard way in ARM32 terms for its own
+  true-lr-vs-resume-pc conflation bug (see that file's own header
+  comment) -- recognized and designed around UP FRONT this time,
+  rather than discovered via a live bug. SPSR_EL1's actual value
+  (`0x60000345`) was still captured live via a temporary debug probe
+  inside `aarch64_irq_handler` rather than hand-derived from the ARM
+  ARM, matching this project's own "confirm against reality, don't
+  compute from spec alone" discipline.
+
+  One real bug did occur, from an unrelated cause: the first build
+  produced 400KB+ of output, because QEMU's TCG emulation runs the
+  two (deliberately non-yielding, timer-only-preempted) print loops
+  far faster than real time allows between ~500ms ticks. Fixed with a
+  plain busy-wait between prints -- not a real sleep primitive (none
+  exists at this scope), just enough to keep the demo's own output
+  legible.
+
+  New `boot/rpi4/preempt_switch.S`: `current_task`/`pt_sp_table`
+  (index 0=task_a, 1=task_b, 2=boot) track state; `preempt_init`
+  builds both tasks' fake interrupt-shaped frames and seeds
+  `current_task=2` (NOT `.bss`'s own zero default, which would
+  wrongly mean task_a); `rpi4_preempt_switch` does the actual
+  save-current/decide-next/return-next-sp work, called from
+  `vectors.S`'s widened `irq_timer` branch. Boot's own frame needs no
+  special bootstrap call at all -- the general "always save current
+  before deciding next" logic naturally captures it as a side effect
+  of the very first tick, exactly like every later tick captures
+  whichever task was running.
+
+  Live-verified: tick 1 switches boot->task_a, tick 2 task_a->task_b,
+  tick 3 task_b->task_a, tick 4 task_a->task_b, tick 5 force-switches
+  back to boot -- and `kernel_main_rpi4.vani`'s new
+  `rpi4_heartbeat_tick` (called from `boot.S`'s own `heartbeat_loop`,
+  fires exactly once, only reachable at all once boot's context is
+  genuinely resumed) prints `"boot context resumed after preemption
+  demo (PASS)"` confirming it. New `test/rpi4_preempt_smoke.py`
+  checks the exact per-tick alternation pattern (not just "both
+  letters appeared somewhere") plus that resume message, live-
+  verified reliable across repeated runs. All 5 pre-existing Pi 4
+  smoke tests (`boot`/`timer`/`vani`/`uart_rx`/`task_switch`) still
+  pass unmodified; zero Pi 1 files touched.
+
+  **Still not started**: priorities, more than 2 tasks, and any
+  voluntary sleep/mutex primitive -- this round proves preemption
+  itself works, not a general scheduler policy on top of it.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

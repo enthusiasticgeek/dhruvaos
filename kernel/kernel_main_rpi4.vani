@@ -593,6 +593,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = rpi4_uart_rx_irq_init();
   let _ = uart_puts_rpi4_vani("DHRUVA RPI4: UART0 RX interrupt armed, echoing input\n");
   let _ = task_switch_self_test();
+  let _ = preempt_init();
   return 0;
 }
 
@@ -635,6 +636,11 @@ extern "C" fn gic_timer_disable() -> i64;
 extern "C" fn rpi4_timer_tick_count_increment() -> i64;
 
 #[no_mangle]
+// Round 79: return value is now a real signal, not always 0 --
+// boot/rpi4/vectors.S's irq_timer branch passes it straight to
+// rpi4_preempt_switch as `force_boot` (1 = this was the halting
+// tick, switch back to the boot context and stay there; 0 = keep
+// alternating between the two preemptible tasks).
 fn rpi4_handle_timer_irq() -> i64 {
   let tick: i64 = rpi4_timer_tick_count_increment();
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: real timer IRQ handled, tick=");
@@ -642,8 +648,88 @@ fn rpi4_handle_timer_irq() -> i64 {
   if tick >= 5 {
     let _ = gic_timer_disable();
     let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: 5 real timer IRQs handled, halting\n");
+    return 1;
   } else {
     let _ = gic_timer_rearm();
+    return 0;
+  }
+}
+
+// Round 79 -- interrupt-driven preemption, built directly on top of
+// round 78's proven "two stacks can be swapped between correctly"
+// primitive, but now via a genuinely different mechanism:
+// boot/rpi4/preempt_switch.S's own header comment has the full
+// design (why the frame format, the fake-frame construction, and the
+// switch itself all had to change from round 78's cooperative,
+// `ret`-based shape to an interrupt/`eret`-based one). NOT the real
+// scheduler (no priorities, no more than 2 tasks, no voluntary
+// sleep/mutex primitives) -- proves the timer can genuinely preempt
+// and resume a DIFFERENT task's saved context, the one piece round 78
+// deliberately left unproven.
+extern "C" fn preempt_init() -> i64;
+extern "C" fn heartbeat_already_printed() -> i64;
+
+// Pure busy-wait between prints -- not a real sleep/yield primitive
+// (none exists at this scope), just enough to keep each task's
+// per-tick output legible. Without it, QEMU's TCG emulation runs
+// these trivial loops so many times per ~500ms real-time tick that a
+// single slice produces hundreds of thousands of characters (found
+// live: an early version of this demo printed 400KB+ of output
+// before this was added) -- not wrong, just impractically chatty for
+// a demo whose entire point is showing the alternation, not stress-
+// testing UART throughput.
+fn preempt_delay() -> i64 {
+  let i: i64 = 0;
+  while i < 2000000 {
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Neither entry function ever explicitly yields -- unlike round 78's
+// task_a_vani_entry/task_b_vani_entry, these rely ENTIRELY on the
+// timer to preempt them. Each just spins printing its own letter
+// forever; how many characters print per ~500ms slice is inherently
+// timing-dependent (a real preemptive switch, unlike round 78's
+// exact "ABABA", doesn't produce a clean deterministic count) --
+// what's checkable is that both letters appear, interleaved, and
+// that the whole demo ends cleanly (see rpi4_heartbeat_tick below).
+#[no_mangle]
+fn preempt_task_a_entry() -> i64 {
+  while true {
+    let _ = uart_putc_rpi4_vani(65); // 'A'
+    let _ = preempt_delay();
+  }
+  return 0;
+}
+
+#[no_mangle]
+fn preempt_task_b_entry() -> i64 {
+  while true {
+    let _ = uart_putc_rpi4_vani(66); // 'B'
+    let _ = preempt_delay();
+  }
+  return 0;
+}
+
+// Called from boot.S's own heartbeat_loop, right after every `wfi`
+// wakeup. During ticks 1-4, this instruction never actually executes
+// -- rpi4_preempt_switch's `eret` on those ticks resumes task_a/
+// task_b directly, not boot's own saved context, so control never
+// returns here. It runs exactly once: when tick 5's force_boot=1
+// switches back to boot's own saved frame, which -- since boot was
+// interrupted mid-`wfi` -- resumes precisely at the instruction right
+// after that `wfi`, landing here. The one-shot flag is what makes
+// this a genuinely different, checkable signal from "the demo didn't
+// crash": explicit, printed evidence that boot's own context was
+// correctly preserved through the ENTIRE preemption demo (saved once
+// on tick 1, never touched again, then correctly restored on tick 5)
+// and not merely abandoned in favor of task_a/task_b.
+#[no_mangle]
+fn rpi4_heartbeat_tick() -> i64 {
+  let already: i64 = heartbeat_already_printed();
+  if already == 0 {
+    let _ = uart_puts_rpi4_vani("DHRUVA RPI4: boot context resumed after preemption demo (PASS)\n");
   }
   return 0;
 }
