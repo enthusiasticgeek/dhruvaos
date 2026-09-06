@@ -3655,6 +3655,64 @@ than assumed:
   **Not done**: DHCP (client+server), PKI, X25519/Ed25519/ChaCha20-
   Poly1305, TLS 1.3, SSH transport, and SSH-shell integration remain
   the next Phase A steps, none started.
+
+  **ROUND 91 UPDATE, 2026-09-06**: DHCP **client** (the server is
+  split out as its own, separate, not-yet-started follow-up round per
+  the user's own request -- this scope's original step 6 lumped both
+  together). Direct, unabridged port of kernel_main.vani's own DHCP
+  client family onto round 90's UDP: the same 240-byte fixed BOOTP
+  header + magic cookie, the same bounded (max 64 iterations) options
+  scan, and the same client state machine (INIT -> SELECTING ->
+  REQUESTING -> BOUND, plus RFC 2131 s4.4's full post-BOUND lease
+  lifecycle -- RENEWING at T1, REBINDING at T2, re-acquisition on NAK
+  or final expiry). New `boot/rpi4/dhcp_state.S` holds a single scalar
+  instance (7 fields, no table -- this port has exactly one DHCP
+  client), using the same GNU `as` `.macro` technique round 89
+  introduced.
+
+  **A real, live LLVM-backend bug hit and fixed this round** (not
+  caught by `vanic check`, only by the actual `emit --backend=llvm` +
+  `llc` pipeline `build_rpi4.sh` runs): `dhcp_client_check_lease_
+  rpi4`'s own T1 (renew) and T2 (rebind) branches are sibling `if`
+  blocks that both declared a local named `payload` (plus several
+  other repeated names) -- a known, previously-documented vani
+  codegen quirk (project memory `feedback_vani_llvm_local_name_
+  collision`): reusing a local name across two non-overlapping blocks
+  of one function can crash `llc` with "multiple definition of local
+  value named 'payload.addr'", even though the type checker accepts
+  the code fine and the two blocks never execute together. Fixed by
+  giving every local in the T2 branch a distinct `rebind_`-prefixed
+  name instead of reusing the T1 branch's names. Not a new discovery
+  -- a known, already-documented pattern recurring in new code, this
+  time in DHCP rather than vani-signal's FFT (where it was first
+  found).
+
+  Wired into `kmain_rpi4_vani` and a new `dhcp` shell command
+  (reruns the full DISCOVER->OFFER->REQUEST->ACK->BOUND cycle against
+  two manually-built synthetic server replies, same "no real second
+  host in this loopback-only environment" reasoning ARP/TCP's own
+  self-tests already establish). `test/rpi4_shell_smoke.py` updated
+  for the new `help`/`ver` text and a `dhcp` command check; all 8
+  Pi 4 smoke tests pass; zero Pi 1 files touched.
+
+  **Not ported this round, a real scope boundary**: kernel_main
+  .vani's own `dhcp_renewal_self_test` (backdates lease_start_tick to
+  drive the T1/T2/expiry thresholds) and `dhcp_nak_self_test`. Their
+  underlying logic (the full lease-lifecycle state machine in `dhcp_
+  client_check_lease_rpi4`, and the NAK-resets-to-INIT branch in
+  `dhcp_client_poll_rpi4`) IS fully present and live, just not
+  independently re-verified via a dedicated fixture. Additionally,
+  and specific to this port: `rpi4_timer_tick_count_get()` only
+  advances once `boot.S` reaches its own later `wfi` loop, AFTER
+  `kmain_rpi4_vani`'s entire self-test sequence already runs
+  synchronously to completion (confirmed by this port's own boot log
+  ordering) -- a lease-threshold self-test genuinely can't be staged
+  as a synchronous boot-time call the way `dhcp_self_test_rpi4` is,
+  unlike Pi 1's own environment.
+
+  **Not done**: DHCP server, static-IP configuration, PKI, X25519/
+  Ed25519/ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell
+  integration remain the next Phase A steps, none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
