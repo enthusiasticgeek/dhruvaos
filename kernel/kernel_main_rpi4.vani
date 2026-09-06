@@ -725,6 +725,16 @@ fn rpi4_handle_timer_irq() -> i64 {
 // deliberately left unproven.
 extern "C" fn preempt_init() -> i64;
 extern "C" fn heartbeat_already_printed() -> i64;
+// Round 82: a real time-based voluntary sleep, the prerequisite
+// priorities would need anyway (round 81's own generic voluntary
+// switch could hand off to an EXPLICIT target, but pure round robin
+// plus priorities would just mean the highest-priority task never
+// gives up the CPU -- a task needs a way to remove ITSELF from
+// rotation for a while first). preempt_sleep_ticks marks the caller
+// not-ready in pt_sleep_until and picks the next READY task
+// dynamically -- see boot/rpi4/preempt_switch.S's own comment for
+// the full design.
+extern "C" fn preempt_sleep_ticks(n: i64) -> i64;
 
 // Pure busy-wait between prints -- not a real sleep/yield primitive
 // (none exists at this scope), just enough to keep each task's
@@ -743,19 +753,23 @@ fn preempt_delay() -> i64 {
   return 0;
 }
 
-// Neither entry function ever explicitly yields -- unlike round 78's
-// task_a_vani_entry/task_b_vani_entry, these rely ENTIRELY on the
-// timer to preempt them. Each just spins printing its own letter
-// forever; how many characters print per ~500ms slice is inherently
-// timing-dependent (a real preemptive switch, unlike round 78's
-// exact "ABABA", doesn't produce a clean deterministic count) --
-// what's checkable is that both letters appear, interleaved, and
-// that the whole demo ends cleanly (see rpi4_heartbeat_tick below).
+// task_b/task_c never explicitly yield -- exactly like round 79/80's
+// original design, relying ENTIRELY on the timer to preempt them.
+// task_a is different as of round 82: it voluntarily sleeps for 2
+// real ticks after each print instead of busy-waiting, demonstrating
+// voluntary sleep and involuntary preemption coexisting in the SAME
+// live demo (not just each proven in its own isolated self-test).
+// How many characters task_b/task_c print per ~500ms slice is
+// inherently timing-dependent (a real preemptive switch doesn't
+// produce a clean deterministic count) -- what's checkable is that
+// all three letters appear, task_a specifically appears only once
+// per turn (since it always sleeps right after printing), and that
+// the whole demo ends cleanly (see rpi4_heartbeat_tick below).
 #[no_mangle]
 fn preempt_task_a_entry() -> i64 {
   while true {
     let _ = uart_putc_rpi4_vani(65); // 'A'
-    let _ = preempt_delay();
+    let _ = preempt_sleep_ticks(2);
   }
   return 0;
 }

@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""Dhruva round 79/80: interrupt-driven preemption on the Pi 4/5 port
--- boot/rpi4/preempt_switch.S's own header comment has the full
+"""Dhruva round 79/80/82: interrupt-driven preemption on the Pi 4/5
+port -- boot/rpi4/preempt_switch.S's own header comment has the full
 design. Unlike round 78's cooperative task_switch (a voluntary,
-`ret`-based swap), this is driven entirely by the real timer: tasks
-that never yield are genuinely preempted by aarch64_irq_handler and
+`ret`-based swap), this is driven by the real timer: task_b/task_c
+never yield and are genuinely preempted by aarch64_irq_handler,
 resumed via `eret`, including correctly restoring ELR_EL1/SPSR_EL1
-per task (the one thing round 78 never needed to handle). Round 80
-generalized round 79's hardcoded 2-task toggle into real NUM_TASKS-way
-(3) round robin.
+per task. Round 80 generalized round 79's hardcoded 2-task toggle
+into real NUM_TASKS-way (3) round robin. Round 82 made task_a
+genuinely sleep for 2 real ticks after each print (preempt_sleep_
+ticks) instead of busy-waiting -- so unlike task_b/task_c, task_a
+now appears exactly once per turn, then goes quiet for the next tick
+while it's asleep, waking up again on the tick after that.
 
 Checks three things, each independently meaningful:
-1. All three of 'A'/'B'/'C' appear, one per tick, on ticks 1-4 (real
-   preemption happened across multiple DIFFERENT tasks, not just one
-   running forever).
-2. The exact tick-by-tick round-robin pattern (task_a, task_b,
-   task_c, task_a again -- confirming the wraparound back to task 0
-   works, not just "both/all letters appear somewhere").
+1. task_a appears exactly once on ticks 1 and 3 (voluntarily sleeping
+   through tick 2, waking again by tick 3 -- exactly n=2 ticks after
+   falling asleep at tick 1), and never on ticks 2/4 (still asleep or
+   not yet due).
+2. task_b only ever appears on odd ticks (right after task_a's own
+   single print+immediate voluntary yield within that same tick's
+   slice) and task_c only ever appears on even ticks (once task_a is
+   asleep and out of the rotation) -- confirming the round-robin
+   scan genuinely skips a sleeping task rather than getting stuck or
+   corrupting the rotation.
 3. "boot context resumed after preemption demo (PASS)" prints AFTER
    the halt message -- this can only happen if boot's own saved
    context (captured once, on tick 1, and never touched again until
@@ -66,23 +73,30 @@ def main() -> int:
     # next "DHRUVA RPI4:" line -- tick 5 has none (halts immediately).
     ticks = re.findall(r"tick=(\d)([ABC]*)\n", output)
     tick_letters = {int(n): letters for n, letters in ticks}
-    expected_letter = {1: "A", 2: "B", 3: "C", 4: "A"}
-    alternation_ok = all(
-        tick_letters.get(n, "").startswith(letter) and set(tick_letters.get(n, "")) == {letter}
-        for n, letter in expected_letter.items()
-    )
+
+    def check(n: int) -> bool:
+        letters = tick_letters.get(n, "")
+        if n in (1, 3):
+            # Exactly one 'A' (task_a waking, printing once, then
+            # immediately voluntarily yielding to task_b within the
+            # same slice), followed only by 'B's for the rest.
+            return letters.startswith("A") and letters.count("A") == 1 and set(letters[1:]) <= {"B"}
+        # Even ticks: task_a is asleep, so only task_c ever appears.
+        return len(letters) > 0 and set(letters) == {"C"}
+
+    pattern_ok = all(check(n) for n in (1, 2, 3, 4))
     has_fault = "FAULT" in output
-    ok = alternation_ok and EXPECT_HALT in output and EXPECT_RESUMED in output and not has_fault
+    ok = pattern_ok and EXPECT_HALT in output and EXPECT_RESUMED in output and not has_fault
 
     if ok:
-        print(f"\n[rpi4_preempt_smoke.py] PASS -- ticks 1-4 round-robined "
-              f"task_a/task_b/task_c exactly as expected (A,B,C,A -- confirming "
-              f"the wraparound back to task_a), the timer disabled cleanly on "
-              f"tick 5, and boot's own context resumed correctly afterward.",
-              file=sys.stderr)
+        print(f"\n[rpi4_preempt_smoke.py] PASS -- task_a slept through tick 2 "
+              f"and correctly woke by tick 3 exactly as expected, task_b/task_c "
+              f"round-robined via pure timer preemption on the ticks task_a was "
+              f"asleep for, the timer disabled cleanly on tick 5, and boot's own "
+              f"context resumed correctly afterward.", file=sys.stderr)
         return 0
     print(f"\n[rpi4_preempt_smoke.py] FAIL -- tick_letters={tick_letters!r}, "
-          f"alternation_ok={alternation_ok}, halt={EXPECT_HALT in output}, "
+          f"pattern_ok={pattern_ok}, halt={EXPECT_HALT in output}, "
           f"resumed={EXPECT_RESUMED in output}, fault={has_fault}.", file=sys.stderr)
     return 1
 

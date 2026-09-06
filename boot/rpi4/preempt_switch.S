@@ -73,6 +73,14 @@ current_task: .word 0
 .align 4
 pt_sp_table: .quad 0, 0, 0, 0
 .align 4
+/* Round 82 -- tick count each real task becomes ready again at (see
+ * preempt_sleep_ticks's own comment). 0 (.bss's own default) means
+ * "always ready" -- a task never woken up early reads back as ready
+ * at tick 0, before the timer has ever fired, which is correct.
+ * Boot's own slot (index NUM_TASKS) never sleeps and is never
+ * consulted here. */
+pt_sleep_until: .quad 0, 0, 0
+.align 4
 pt_a_stack: .space 1024
 pt_a_stack_top:
 pt_b_stack: .space 1024
@@ -153,13 +161,29 @@ preempt_init:
  * names, THEN decides the next slot: force_boot=1 always goes to
  * PT_BOOT_INDEX and stays there permanently (nothing ever
  * un-disables the timer, so no interrupt will ever call this again
- * after); otherwise advances 0->1->2->0->... (round robin), with
- * "was boot" also going to 0 -- the one-time transition into the
- * demo, reached implicitly rather than via an explicit start call.
- * Returns the next slot's saved sp, which the caller loads into sp
- * before restoring ELR_EL1/SPSR_EL1/x0-x30 and `eret`-ing into it. */
+ * after); otherwise advances 0->1->2->0->... (round robin) SKIPPING
+ * any task whose pt_sleep_until (round 82) hasn't been reached yet by
+ * the real tick count -- see preempt_sleep_ticks's own comment for
+ * how a task gets there. "Was boot" also starts the scan at task 0 --
+ * the one-time transition into the demo, reached implicitly rather
+ * than via an explicit start call. Returns the next slot's saved sp,
+ * which the caller loads into sp before restoring ELR_EL1/SPSR_EL1/
+ * x0-x30 and `eret`-ing into it.
+ *
+ * Calls rpi4_timer_tick_count_get (a real function call, not just a
+ * register read) partway through, which needs x0/x1 (this function's
+ * own arguments) preserved across it -- done via the stack, not a
+ * callee-saved register, since every one of x19-x28 is about to be
+ * unconditionally saved into the frame below anyway and there's no
+ * reason to also route through one of them first. */
 .global rpi4_preempt_switch
 rpi4_preempt_switch:
+    stp x29, x30, [sp, #-32]!
+    stp x0, x1, [sp, #16]
+    bl rpi4_timer_tick_count_get
+    mov x6, x0                      /* x6 = current tick, survives as scratch */
+    ldp x0, x1, [sp, #16]
+
     adrp x2, current_task
     add x2, x2, :lo12:current_task
     ldr w3, [x2]
@@ -171,22 +195,166 @@ rpi4_preempt_switch:
 
     cbnz x1, .Lpt_force_boot
     cmp w3, #PT_BOOT_INDEX
-    b.eq .Lpt_from_boot            /* was boot -> start at task 0 */
-    add w3, w3, #1
-    cmp w3, #NUM_TASKS
-    b.ne .Lpt_store_next           /* no wrap needed */
-    mov w3, #0                     /* wrapped past the last task */
-    b .Lpt_store_next
+    b.eq .Lpt_from_boot            /* was boot -> start the scan at task 0 */
+    b .Lpt_advance
 .Lpt_from_boot:
     mov w3, #0
-    b .Lpt_store_next
+    b .Lpt_check_ready
 .Lpt_force_boot:
     mov w3, #PT_BOOT_INDEX
+    b .Lpt_store_next
+
+    /* Bounded round-robin scan for a READY task, starting one past
+     * the current one -- at most NUM_TASKS attempts, so even a (never
+     * actually reachable in this demo, since task_b/task_c never
+     * sleep) all-asleep case can't hang; it just falls through to
+     * whatever w3 ended up as once the bound is hit. */
+.Lpt_advance:
+    mov w7, #0                     /* attempt counter */
+.Lpt_advance_loop:
+    add w3, w3, #1
+    cmp w3, #NUM_TASKS
+    b.ne .Lpt_check_ready
+    mov w3, #0
+.Lpt_check_ready:
+    adrp x8, pt_sleep_until
+    add x8, x8, :lo12:pt_sleep_until
+    sxtw x9, w3
+    lsl x9, x9, #3
+    ldr x10, [x8, x9]
+    cmp x10, x6
+    b.le .Lpt_store_next           /* pt_sleep_until[w3] <= now -> ready */
+    add w7, w7, #1
+    cmp w7, #NUM_TASKS
+    b.lt .Lpt_advance_loop
+    /* bound hit -- use w3 as-is rather than loop forever */
+
 .Lpt_store_next:
     str w3, [x2]
     lsl x5, x3, #3
     ldr x0, [x4, x5]
+    ldp x29, x30, [sp], #32
     ret
+
+/* i64 preempt_sleep_ticks(i64 n) -- voluntarily gives up the CPU
+ * until at least n real timer ticks have elapsed, marking the
+ * CALLING task not-ready in pt_sleep_until in the meantime. Reuses
+ * the exact same frame-building shape as preempt_generic_switch (a
+ * genuine voluntary switch, round 81) and rpi4_preempt_switch's own
+ * bounded ready-task scan above -- this is the union of the two:
+ * voluntary AND schedule-policy-aware, rather than switching to one
+ * fixed, caller-specified target. Never considers PT_BOOT_INDEX (a
+ * voluntary sleep only ever hands off to another real task; force-
+ * switching to boot is the timer demo's own halting condition, not
+ * this primitive's concern).
+ *
+ * `n`'s own true value is safely captured in the frame at [sp,#0]
+ * (the first thing this function does) before anything -- including
+ * the nested call to rpi4_timer_tick_count_get, which would otherwise
+ * clobber x0 -- has a chance to touch it; reloaded from there once
+ * it's needed, rather than juggling it through a register across the
+ * call.
+ *
+ * Real bug found and fixed here: this function (unlike rpi4_preempt_
+ * switch, which only ever runs from INSIDE aarch64_irq_handler, where
+ * IRQ is already hardware-masked for the duration) is called
+ * VOLUNTARILY from ordinary task code running with IRQ unmasked
+ * (every task's own SPSR_EL1 has the I bit clear) -- so a REAL timer
+ * tick can fire partway through this function's own critical section
+ * (between saving the current frame and finishing the "pick next"
+ * update), and that tick's own rpi4_preempt_switch would then save
+ * the INTERRUPTED-mid-switch sp (garbage, not a clean frame) into
+ * current_task's slot, clobbering the frame this function just built.
+ * Found live: task_a spammed hundreds of thousands of 'A's without
+ * ever sleeping, then crashed with an Instruction Abort from a LOWER
+ * EL (ELR_EL1=0, FAR_EL1=0) -- `eret` had somehow been reached with a
+ * corrupted SPSR_EL1. `msr daifset, #2` (mask IRQ) as literally the
+ * first instruction closes the window; `eret`'s own SPSR_EL1 restore
+ * naturally re-unmasks it for whichever task ends up resumed, so no
+ * explicit unmask is needed anywhere in this function. */
+.global preempt_sleep_ticks
+preempt_sleep_ticks:
+    msr daifset, #2
+    sub sp, sp, #PT_FRAME_SIZE
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]
+    mov x2, x30
+    movz x3, #0x0345
+    movk x3, #0x6000, lsl #16
+    stp x2, x3, [sp, #PT_ELR_OFF]
+
+    /* Every original register is now durably saved -- safe to freely
+     * clobber anything (including calling another function) from
+     * here on. */
+    bl rpi4_timer_tick_count_get
+    mov x6, x0                      /* x6 = current tick */
+
+    ldr x1, [sp, #0]                /* x1 = n (this frame's own saved x0) */
+    add x1, x1, x6                  /* x1 = wake tick */
+
+    adrp x2, current_task
+    add x2, x2, :lo12:current_task
+    ldr w3, [x2]                    /* w3 = current (sleeping) task index */
+
+    adrp x7, pt_sleep_until
+    add x7, x7, :lo12:pt_sleep_until
+    sxtw x9, w3
+    lsl x9, x9, #3
+    str x1, [x7, x9]                /* pt_sleep_until[current] = wake tick */
+
+    adrp x4, pt_sp_table
+    add x4, x4, :lo12:pt_sp_table
+    mov x0, sp
+    str x0, [x4, x9]                /* pt_sp_table[current] = this frame */
+
+    mov w5, w3
+    mov w12, #0                     /* attempt counter */
+.Lps_advance_loop:
+    add w5, w5, #1
+    cmp w5, #NUM_TASKS
+    b.ne .Lps_check_ready
+    mov w5, #0
+.Lps_check_ready:
+    sxtw x10, w5
+    lsl x10, x10, #3
+    ldr x11, [x7, x10]
+    cmp x11, x6
+    b.le .Lps_found
+    add w12, w12, #1
+    cmp w12, #NUM_TASKS
+    b.lt .Lps_advance_loop
+    /* bound hit -- use w5 as-is rather than loop forever */
+
+.Lps_found:
+    /* Real bug found and fixed here: an earlier version of this
+     * function omitted `mov sp, x0` before branching to irq_restore
+     * (which restores from whatever `sp` CURRENTLY is, expecting the
+     * caller to have already pointed it at the right frame -- see
+     * preempt_generic_switch's own tail, which does this correctly).
+     * Without it, current_task's value in memory advanced correctly
+     * on every call (str w5,[x2] still ran), but sp itself never
+     * moved off task_a's own frame, so irq_restore kept restoring
+     * task_a again regardless -- found live via a temporary debug
+     * print showing current_task cycling 0,1,2,2,2... while the UART
+     * output showed only 'A' ever printing, never 'B'/'C'. */
+    str w5, [x2]
+    ldr x0, [x4, x10]
+    mov sp, x0
+    b irq_restore
 
 /* i64 heartbeat_already_printed(void) -- returns the OLD value of a
  * one-shot flag, then sets it to 1. Lets boot.S's own heartbeat_loop
@@ -235,9 +403,24 @@ heartbeat_already_printed:
  * repurposed to compute *save_slot/*load_slot. Resume PC (ELR_EL1)
  * is this call's own return address (x30 at entry) -- exactly what
  * `ret` would have used, had this been round 78's cooperative
- * version instead. */
+ * version instead.
+ *
+ * Round 82 correction: masks IRQ (`msr daifset, #2`) as the first
+ * instruction, same reasoning as preempt_sleep_ticks's own comment --
+ * this function is called from ordinary, IRQ-unmasked task code, so a
+ * real timer tick landing partway through its own critical section
+ * (between saving the caller's frame and finishing the switch) could
+ * corrupt shared state exactly like the live bug that comment
+ * describes. Round 81's own self-test never triggered this (it runs
+ * to completion before preempt_init/the timer demo even starts, so
+ * no real tick was ever concurrent with it) -- fixed here defensively
+ * once round 82 exposed the same class of bug in a sibling function,
+ * per this project's own "verify a bug class across every affected
+ * site" discipline. `eret`'s own SPSR_EL1 restore naturally
+ * re-unmasks IRQ for whichever context ends up resumed. */
 .global preempt_generic_switch
 preempt_generic_switch:
+    msr daifset, #2
     sub sp, sp, #PT_FRAME_SIZE
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]

@@ -3200,6 +3200,62 @@ than assumed:
   voluntary sleep (e.g. "yield for N ticks") -- this round proves
   arbitrary voluntary switching works, not a sleep/wake scheduling
   policy on top of it.
+
+  **ROUND 82 UPDATE, 2026-09-06**: closed that exact gap -- a real
+  time-based voluntary sleep, `preempt_sleep_ticks(n)`. Task_a now
+  voluntarily sleeps for 2 real ticks after each print instead of
+  busy-waiting, demonstrating voluntary sleep and involuntary
+  preemption coexisting in the same live demo (task_b/task_c
+  unchanged, still purely timer-preempted). `rpi4_preempt_switch`'s
+  own round-robin scan generalized to skip any task whose new
+  `pt_sleep_until` (one `.bss` slot per real task) hasn't been
+  reached by the real tick count yet, bounded to `NUM_TASKS` attempts
+  so an (unreachable in this demo) all-asleep case can't hang. New
+  `rpi4_timer_tick_count_get` (non-incrementing, unlike the existing
+  increment-on-read accessor) lets both the sleep primitive and the
+  scan read "what tick is it" without disturbing the real count.
+
+  **Two real bugs found and fixed, not just one**:
+  1. A genuine reentrancy race: `preempt_sleep_ticks` (unlike
+     `rpi4_preempt_switch`, which only ever runs from inside
+     `aarch64_irq_handler` with IRQ already hardware-masked) is
+     called VOLUNTARILY from ordinary task code running with IRQ
+     unmasked -- so a real timer tick could fire partway through its
+     own critical section and corrupt the frame being built. Found
+     live: task_a spammed hundreds of thousands of 'A's, then crashed
+     with an Instruction Abort from a lower EL (`ELR_EL1=0`,
+     `FAR_EL1=0`) -- `eret` had been reached with a corrupted
+     `SPSR_EL1`. Fixed with `msr daifset, #2` as the first instruction
+     (unmasking happens naturally via whichever task's own SPSR_EL1
+     `eret` restores); applied to round 81's `preempt_generic_switch`
+     too, defensively, once this bug class was found in a sibling
+     function, per this project's own "verify across every affected
+     site" discipline -- that one was never actually triggered (its
+     own self-test runs to completion before the timer demo even
+     starts), but has the identical exposure.
+  2. After the race fix, task_a *still* never actually switched away
+     -- `current_task`'s value in memory correctly advanced
+     (confirmed via a temporary debug print), but execution kept
+     resuming task_a regardless. Root cause: `preempt_sleep_ticks`
+     branched to the shared `irq_restore` epilogue without first
+     doing `mov sp, x0` -- `irq_restore` restores from whatever `sp`
+     CURRENTLY is, expecting the caller to have already pointed it at
+     the target frame (exactly like `preempt_generic_switch`'s own
+     tail already does correctly). Without it, `sp` never left
+     task_a's own frame, so the "restore" kept resuming task_a every
+     time regardless of which task `current_task` said was next.
+
+  Live-verified: task_a prints once at tick 1, sleeps through tick 2
+  (only task_c appears), wakes and prints again by tick 3 (exactly 2
+  ticks later, as slept), sleeps through tick 4 -- confirmed reliable
+  across repeated runs. `test/rpi4_preempt_smoke.py` updated for the
+  new pattern (task_a exactly once per wake, task_b/task_c round-
+  robining via pure timer preemption on the ticks task_a is asleep
+  for). All 5 pre-existing Pi 4 smoke tests pass unmodified; zero
+  Pi 1 files touched.
+
+  **Still not started**: priorities -- all 3 tasks are still
+  equal-weight, just some (task_a) voluntarily sleep and some don't.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

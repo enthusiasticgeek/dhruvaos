@@ -342,6 +342,21 @@ rpi4_timer_tick_count_increment:
     mov x0, x1
     ret
 
+/* i64 rpi4_timer_tick_count_get(void) -- round 82: a plain,
+ * non-incrementing read of the same counter, for
+ * boot/rpi4/preempt_switch.S's own voluntary-sleep primitive (needs
+ * "what tick is it right now" to compute a wake tick and to check
+ * whether a sleeping task's wake tick has arrived yet -- neither of
+ * those should ALSO advance the real tick count, which only
+ * rpi4_handle_timer_irq's own call above is allowed to do). */
+.global rpi4_timer_tick_count_get
+rpi4_timer_tick_count_get:
+    adrp x0, irq_tick_count
+    add x0, x0, :lo12:irq_tick_count
+    ldr w1, [x0]
+    mov x0, x1
+    ret
+
 /* x0 = value to print as 16 hex digits, most-significant nibble
  * first -- the AArch64 twin of boot/rpi1's own uart_put_hex32, sized
  * for a 64-bit register instead of a 32-bit one.
