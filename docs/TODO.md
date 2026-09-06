@@ -3157,6 +3157,49 @@ than assumed:
 
   **Still not started**: priorities (all 3 tasks are still equal-
   weight round robin) and any voluntary sleep/mutex primitive.
+
+  **ROUND 81 UPDATE, 2026-09-06**: closed the "voluntary sleep/mutex
+  primitive" gap's own prerequisite -- a genuine VOLUNTARY switch,
+  through the exact same eret-based interrupt-shaped frame rounds
+  79/80 use for timer-driven preemption, proving the two are
+  interoperable through ONE shared mechanism rather than two
+  disconnected ones. Different from round 78's own cooperative
+  `task_switch` in exactly the way that round's own header comment
+  already anticipated it would eventually need to be: that one saves/
+  restores only the AAPCS64 callee-saved registers and resumes via
+  `ret`; `preempt_generic_switch` (new, `boot/rpi4/preempt_switch.S`)
+  builds the FULL 272-byte frame (x0-x30 + ELR_EL1/SPSR_EL1) and
+  resumes via `eret`, sharing `vectors.S`'s own `irq_restore` epilogue
+  (now exported) rather than duplicating it -- ANY slot, whether
+  populated by a genuine timer interrupt or by this function, resumes
+  identically.
+
+  Relies on a property not previously exercised in this project:
+  `eret` doesn't require the CPU to currently be handling a real
+  hardware exception -- it only reads ELR_EL1/SPSR_EL1 and acts on
+  them, so setting them from ordinary code and executing `eret` is a
+  legitimate way to "return" into a different context. Worked
+  correctly on the very first build, no debugging needed -- the
+  design was worked out on paper (matching round 79's own "anticipate
+  before writing code" approach) rather than discovered via a live
+  bug.
+
+  Bounded, self-contained self-test (`preempt_yield_self_test`),
+  isolated from the timer-driven demo's own state entirely (separate
+  `yv_sp_table`, not `pt_sp_table`) -- same shape as round 78's own
+  "ABABA": task_x yields to task_y 3 times then yields back to the
+  calling self-test on its 3rd round instead (task_y always yields
+  straight back to task_x, never independently stopping). Printed
+  "XYXYX (PASS)" -- live-verified reliable across repeated runs,
+  alongside confirming the existing timer-driven 3-task demo runs
+  completely unaffected afterward. New `test/rpi4_yield_smoke.py`;
+  all 5 pre-existing Pi 4 smoke tests still pass unmodified; zero
+  Pi 1 files touched.
+
+  **Still not started**: priorities and an actual TIME-based
+  voluntary sleep (e.g. "yield for N ticks") -- this round proves
+  arbitrary voluntary switching works, not a sleep/wake scheduling
+  policy on top of it.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

@@ -585,6 +585,62 @@ fn task_switch_self_test() -> i64 {
   return 0;
 }
 
+// Round 81 -- a genuine VOLUNTARY switch through the exact same
+// eret-based interrupt-shaped frame rounds 79/80 use for timer-driven
+// preemption (boot/rpi4/preempt_switch.S's own preempt_generic_switch
+// comment has the full design) -- proves voluntary and involuntary
+// switching are interoperable through one shared mechanism, not two
+// disconnected ones. Bounded and self-contained, same shape as round
+// 78's own "ABABA" proof: task_x yields to task_y 3 times, then on
+// its 3rd round yields back to the driver (this self-test) instead,
+// ending the demo. task_y never independently decides to stop,
+// always yields straight back to task_x -- same asymmetric-driver
+// pattern round 78's task_a/task_b already established.
+extern "C" fn preempt_generic_switch(save_slot: mut ref i64, load_slot: mut ref i64) -> i64;
+extern "C" fn yv_init() -> i64;
+extern "C" fn yv_x_sp_addr() -> mut ref i64;
+extern "C" fn yv_y_sp_addr() -> mut ref i64;
+extern "C" fn yv_driver_sp_addr() -> mut ref i64;
+
+#[no_mangle]
+fn preempt_yield_task_x_entry() -> i64 {
+  let i: i64 = 0;
+  while i < 3 {
+    let _ = uart_puts_rpi4_vani("X");
+    i = i + 1;
+    let x_sp: mut ref i64 = yv_x_sp_addr();
+    if i >= 3 {
+      let driver_sp: mut ref i64 = yv_driver_sp_addr();
+      let _ = preempt_generic_switch(x_sp, driver_sp);
+    } else {
+      let y_sp: mut ref i64 = yv_y_sp_addr();
+      let _ = preempt_generic_switch(x_sp, y_sp);
+    }
+  }
+  return 0;
+}
+
+#[no_mangle]
+fn preempt_yield_task_y_entry() -> i64 {
+  while true {
+    let _ = uart_puts_rpi4_vani("Y");
+    let y_sp: mut ref i64 = yv_y_sp_addr();
+    let x_sp: mut ref i64 = yv_x_sp_addr();
+    let _ = preempt_generic_switch(y_sp, x_sp);
+  }
+  return 0;
+}
+
+fn preempt_yield_self_test() -> i64 {
+  let _ = yv_init();
+  let _ = uart_puts_rpi4_vani("DHRUVA RPI4: voluntary-yield (eret-based) self-test: ");
+  let driver_sp: mut ref i64 = yv_driver_sp_addr();
+  let x_sp: mut ref i64 = yv_x_sp_addr();
+  let _ = preempt_generic_switch(driver_sp, x_sp);
+  let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  return 0;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
@@ -593,6 +649,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = rpi4_uart_rx_irq_init();
   let _ = uart_puts_rpi4_vani("DHRUVA RPI4: UART0 RX interrupt armed, echoing input\n");
   let _ = task_switch_self_test();
+  let _ = preempt_yield_self_test();
   let _ = preempt_init();
   return 0;
 }

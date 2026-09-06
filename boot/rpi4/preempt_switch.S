@@ -81,6 +81,18 @@ pt_c_stack: .space 1024
 pt_c_stack_top:
 .align 4
 heartbeat_printed: .word 0
+.align 4
+/* Round 81 -- voluntary-yield self-test's own dedicated slots,
+ * completely separate from pt_sp_table/current_task above (this
+ * self-test runs once, standalone, and never touches the timer-
+ * driven demo's own state). Index 0=task_x, 1=task_y, 2=the calling
+ * (driver) context. */
+yv_sp_table: .quad 0, 0, 0
+.align 4
+yv_x_stack: .space 1024
+yv_x_stack_top:
+yv_y_stack: .space 1024
+yv_y_stack_top:
 
 .section ".text"
 
@@ -193,4 +205,116 @@ heartbeat_already_printed:
     mov w2, #1
     str w2, [x0]
     mov x0, x1
+    ret
+
+/* Round 81 -- a genuine VOLUNTARY switch, through the exact same
+ * eret-based frame shape rounds 79/80 use for involuntary
+ * (timer-driven) preemption -- proves the two are interoperable, not
+ * two disconnected mechanisms. Different from round 78's own
+ * cooperative task_switch in exactly the way that round's own header
+ * comment already anticipated it would need to be for this: that one
+ * saved/restored only the AAPCS64 callee-saved registers and resumed
+ * via `ret`; this one builds a FULL 272-byte interrupt-shaped frame
+ * (all of x0-x30 plus ELR_EL1/SPSR_EL1) and resumes via `eret`, so
+ * ANY of these slots -- whether populated by a genuine timer
+ * interrupt or by this function -- can be resumed by the exact same
+ * shared vectors.S `irq_restore` code.
+ *
+ * `eret` does not require the CPU to currently be handling a real
+ * hardware exception -- it only reads ELR_EL1/SPSR_EL1 and acts on
+ * them, so setting them from ordinary code and then executing `eret`
+ * is a legitimate, if unusual-looking, way to "return" into a
+ * different context. This is the first time this project relies on
+ * that specific property.
+ *
+ * i64 preempt_generic_switch(uint64_t *save_slot, uint64_t *load_slot)
+ * x0/x1 are only READ by the register-save block below (stp writes
+ * memory, never touches the source registers) -- their true values
+ * land safely in the new frame at [sp,#0] before anything reuses x0/
+ * x1 as scratch, so nothing here is lost by the time they're
+ * repurposed to compute *save_slot/*load_slot. Resume PC (ELR_EL1)
+ * is this call's own return address (x30 at entry) -- exactly what
+ * `ret` would have used, had this been round 78's cooperative
+ * version instead. */
+.global preempt_generic_switch
+preempt_generic_switch:
+    sub sp, sp, #PT_FRAME_SIZE
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]
+    mov x2, x30
+    movz x3, #0x0345
+    movk x3, #0x6000, lsl #16
+    stp x2, x3, [sp, #PT_ELR_OFF]
+
+    mov x2, sp
+    str x2, [x0]                   /* *save_slot = this frame's sp */
+    ldr x0, [x1]                   /* x0 = *load_slot */
+    mov sp, x0
+    b irq_restore                  /* shared with vectors.S -- restores
+                                     * ELR_EL1/SPSR_EL1/x0-x30 from
+                                     * whatever frame sp now points at,
+                                     * then `eret`. */
+
+/* i64 yv_init(void) -- builds task_x's and task_y's fake
+ * interrupt-shaped frames for the voluntary-yield self-test. Called
+ * once from kernel_main_rpi4.vani's own preempt_yield_self_test,
+ * completely independent of preempt_init/pt_sp_table above. */
+.global yv_init
+yv_init:
+    stp x29, x30, [sp, #-16]!
+
+    movz x2, #0x0345
+    movk x2, #0x6000, lsl #16
+    adrp x3, yv_sp_table
+    add x3, x3, :lo12:yv_sp_table
+
+    ldr x0, =yv_x_stack_top
+    sub x0, x0, #PT_FRAME_SIZE
+    adr x1, preempt_yield_task_x_entry
+    str x1, [x0, #PT_ELR_OFF]
+    str x2, [x0, #PT_SPSR_OFF]
+    str x0, [x3, #0]
+
+    ldr x0, =yv_y_stack_top
+    sub x0, x0, #PT_FRAME_SIZE
+    adr x1, preempt_yield_task_y_entry
+    str x1, [x0, #PT_ELR_OFF]
+    str x2, [x0, #PT_SPSR_OFF]
+    str x0, [x3, #8]
+
+    ldp x29, x30, [sp], #16
+    ret
+
+.global yv_x_sp_addr
+yv_x_sp_addr:
+    adrp x0, yv_sp_table
+    add x0, x0, :lo12:yv_sp_table
+    ret
+
+.global yv_y_sp_addr
+yv_y_sp_addr:
+    adrp x0, yv_sp_table
+    add x0, x0, :lo12:yv_sp_table
+    add x0, x0, #8
+    ret
+
+.global yv_driver_sp_addr
+yv_driver_sp_addr:
+    adrp x0, yv_sp_table
+    add x0, x0, :lo12:yv_sp_table
+    add x0, x0, #16
     ret

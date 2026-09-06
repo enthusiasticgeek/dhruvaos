@@ -281,6 +281,15 @@ irq_eoi:
     ldr x0, =IRQ_GICC_BASE
     str w19, [x0, #IRQ_GICC_EOIR]
 
+/* Round 81: exported so boot/rpi4/preempt_switch.S's own
+ * preempt_generic_switch can share this exact restore+eret sequence
+ * for a VOLUNTARY switch too, instead of duplicating it -- a
+ * voluntary yield builds the identical 272-byte frame shape an
+ * interrupt does (see that function's own comment for why this
+ * works: `eret` only needs valid ELR_EL1/SPSR_EL1 at the moment it
+ * executes, regardless of whether the CPU arrived via a real
+ * hardware exception or via ordinary code that set them manually). */
+.global irq_restore
 irq_restore:
     /* Round 79: restore ELR_EL1/SPSR_EL1 from THIS frame (whichever
      * one sp now points at -- possibly a different task's, if the
