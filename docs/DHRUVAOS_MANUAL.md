@@ -513,7 +513,7 @@ things:
   remember to run. Add your const to the existing block, tag it, then
   reference it from a local `let reg: i64 = YOUR_CONST;` at each call
   site exactly like the existing ones. The `rpi-mmio` kosh package
-  (`~/source/rpi-mmio`, not yet published to a registry) carries the
+  (`~/source/vani-rpi-mmio`, not yet published to a registry) carries the
   same BCM2835/BCM2711 constants as a reusable dependency for any
   *other* project, but this kernel's own two files still declare
   their own copies directly (no dependency needed for code that
