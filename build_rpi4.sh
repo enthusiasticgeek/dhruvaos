@@ -61,6 +61,9 @@ mkdir -p "${BUILD_DIR}"
 "${CC}" -c -mgeneral-regs-only -ffreestanding \
   "${ROOT}/boot/rpi4/preempt_switch.S" -o "${BUILD_DIR}/rpi4_preempt_switch.o"
 
+"${CC}" -c -mgeneral-regs-only -ffreestanding \
+  "${ROOT}/boot/rpi4/shell_state.S" -o "${BUILD_DIR}/rpi4_shell_state.o"
+
 "${CC}" -c -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi4/runtime_stubs_rpi4.c" -o "${BUILD_DIR}/rpi4_runtime_stubs.o"
 
@@ -77,6 +80,7 @@ llc -mtriple="${TRIPLE}" -filetype=obj \
   "${BUILD_DIR}/rpi4_boot.o" "${BUILD_DIR}/rpi4_vectors.o" \
   "${BUILD_DIR}/rpi4_gic_timer.o" "${BUILD_DIR}/rpi4_mmu_init.o" \
   "${BUILD_DIR}/rpi4_task_switch.o" "${BUILD_DIR}/rpi4_preempt_switch.o" \
+  "${BUILD_DIR}/rpi4_shell_state.o" \
   "${BUILD_DIR}/kernel_main_rpi4.o" "${BUILD_DIR}/rpi4_runtime_stubs.o" \
   -o "${BUILD_DIR}/dhruva_rpi4.elf"
 

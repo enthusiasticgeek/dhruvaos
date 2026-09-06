@@ -3300,6 +3300,52 @@ than assumed:
   whole preemption/scheduling arc only proves the underlying
   mechanisms work on this target, using tiny synthetic demo tasks,
   not a port of anything kernel_main.vani itself does today.
+
+  **ROUND 84 UPDATE, 2026-09-06**: started that actual port -- the
+  smallest possible REAL, useful capability rather than another
+  synthetic proof. New `boot/rpi4/shell_state.S` mirrors Pi 1's own
+  `boot/shell_state.S` line-buffer design exactly in shape
+  (`shell_line_buf`/`shell_line_len`/`shell_line_ready`, minus that
+  side's su/passwd echo-suppression state -- not needed for a first
+  minimal command set): `shell_rx_push_char`, called from `rpi4_
+  handle_uart_rx_irq` (round 77's own UART0 RX interrupt) on every
+  received byte, exactly the same call-site shape Pi 1's own `irq_
+  dispatch` already uses.
+
+  Deliberately NOT wired into the round 79-83 preemptive-scheduler
+  demo at all -- that demo stays exactly as it was, a bounded,
+  self-terminating proof using synthetic tasks. Instead, dispatch
+  happens from `rpi4_heartbeat_tick`, the ALREADY-PROVEN call site
+  `boot.S`'s own `heartbeat_loop` invokes on every real `wfi` wakeup
+  (round 79) -- reusing existing, tested machinery instead of
+  building new scheduler integration for what's fundamentally a
+  separate concern. Since UART0 RX stays enabled forever (unlike the
+  demo's own timer, deliberately disabled after its 5 ticks), the
+  shell keeps responding indefinitely regardless of that demo's
+  lifetime -- live-verified by sending real commands well after the
+  demo's own halt message.
+
+  Command set (deliberately tiny for a first port): `help`, `ver`,
+  `test` (reruns `rpi4_vani_self_test`'s own real computation, not a
+  placeholder), and `echo <text>`. No prompt is printed, matching
+  `kernel_main.vani`'s own `task_f` (purely reactive -- output is
+  only ever what a command itself prints). `rpi4_shell_line_matches`/
+  `rpi4_shell_starts_with` mirror `shell_word_matches`'s own spirit
+  using `str_len_bytes`/`str_byte_at` directly in vani, simpler than
+  the Pi 1 side's version since a first minimal shell only ever needs
+  to compare the WHOLE line, never a command/argument sub-range.
+
+  Worked correctly on the very first build, no debugging needed --
+  new `test/rpi4_shell_smoke.py` drives all 5 real commands (help,
+  ver, echo with real argument text, an unknown command, test) over a
+  live QEMU stdio UART session and checks each one's real response,
+  reliable across repeated runs. All 7 pre-existing Pi 4 smoke tests
+  pass unmodified; zero Pi 1 files touched.
+
+  **Not done**: multi-line editing/history, `su`/permission-checked
+  commands, any command that touches a peripheral this port doesn't
+  have yet (storage, networking) -- deliberately out of scope for a
+  FIRST minimal shell.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

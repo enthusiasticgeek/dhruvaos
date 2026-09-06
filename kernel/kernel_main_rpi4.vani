@@ -492,14 +492,15 @@ fn rpi4_uart_rx_irq_init() -> i64 {
 }
 
 // Drains the RX FIFO (bounded loop, matching kernel_main.vani's own
-// irq_dispatch UART branch shape) and echoes each byte straight back
-// out -- deliberately NOT a line-buffered shell yet (this port has no
-// task/scheduler infrastructure for one to live in), just proof that
-// input genuinely arrives and can be acted on from real vani code.
-// Clears the PL011's own RXIC status once after draining (draining
-// itself de-asserts the level-triggered condition; this is a
-// defensive clear of any stale raw status, same pattern kernel_main.
-// vani's own irq_dispatch already uses).
+// irq_dispatch UART branch shape), echoes each byte straight back out
+// (unconditionally -- no su/passwd suppression at this minimal
+// scope), and pushes it into the shell's own line buffer
+// (boot/rpi4/shell_state.S's shell_rx_push_char -- round 84). Clears
+// the PL011's own RXIC status once after draining (draining itself
+// de-asserts the level-triggered condition; this is a defensive
+// clear of any stale raw status, same pattern kernel_main.vani's own
+// irq_dispatch already uses).
+extern "C" fn shell_rx_push_char(c: u32) -> u32;
 #[no_mangle]
 fn rpi4_handle_uart_rx_irq() -> i64 {
   for i from 0 to 128 {
@@ -507,6 +508,7 @@ fn rpi4_handle_uart_rx_irq() -> i64 {
     if (fr & (0x10 as u32)) == (0 as u32) {
       let c: u32 = mmio_read_u32(UART_DR_RPI4) & (0xFF as u32);
       let _ = uart_putc_rpi4_vani(c as i64);
+      let _ = shell_rx_push_char(c);
     }
   }
   let _ = mmio_write_u32(UART_ICR_RPI4, 0x10 as u32);
@@ -821,6 +823,101 @@ fn rpi4_heartbeat_tick() -> i64 {
   let already: i64 = heartbeat_already_printed();
   if already == 0 {
     let _ = uart_puts_rpi4_vani("DHRUVA RPI4: boot context resumed after preemption demo (PASS)\n");
+  }
+  let ready: u32 = shell_get_line_ready();
+  if ready != (0 as u32) {
+    let _ = rpi4_shell_dispatch();
+    let _ = shell_clear_line();
+  }
+  return 0;
+}
+
+// Round 84 -- the smallest possible interactive shell on the Pi 4/5
+// port (boot/rpi4/shell_state.S's own header comment has the full
+// design). Deliberately reuses rpi4_heartbeat_tick's ALREADY-PROVEN
+// once-per-wfi-wakeup call site above rather than any new scheduler
+// integration -- UART0 RX stays enabled forever (round 77), so this
+// keeps working indefinitely regardless of the round 79-83 demo's own
+// bounded lifetime.
+extern "C" fn shell_get_line_len() -> u32;
+extern "C" fn shell_get_line_ready() -> u32;
+extern "C" fn shell_get_line_byte(offset: u32) -> u32;
+extern "C" fn shell_clear_line() -> u32;
+
+// Whole-line exact match against a known command -- length AND every
+// byte must agree, matching kernel_main.vani's own shell_word_matches
+// in spirit (that one also handles a start/end sub-range for
+// splitting a command from its arguments; this minimal version only
+// ever needs to compare the WHOLE line, so it's simpler).
+fn rpi4_shell_line_matches(word: Str) -> u32 {
+  let linelen: u32 = shell_get_line_len();
+  let wlen: i64 = str_len_bytes(word);
+  if (linelen as i64) != wlen {
+    return 0 as u32;
+  }
+  let i: i64 = 0;
+  while i < wlen {
+    let a: u32 = shell_get_line_byte(i as u32);
+    let b: i64 = str_byte_at(word, i);
+    if (a as i64) != b {
+      return 0 as u32;
+    }
+    i = i + 1;
+  }
+  return 1 as u32;
+}
+
+fn rpi4_shell_starts_with(prefix: Str) -> u32 {
+  let linelen: u32 = shell_get_line_len();
+  let plen: i64 = str_len_bytes(prefix);
+  if (linelen as i64) < plen {
+    return 0 as u32;
+  }
+  let i: i64 = 0;
+  while i < plen {
+    let a: u32 = shell_get_line_byte(i as u32);
+    let b: i64 = str_byte_at(prefix, i);
+    if (a as i64) != b {
+      return 0 as u32;
+    }
+    i = i + 1;
+  }
+  return 1 as u32;
+}
+
+// Deliberately tiny command set for a first, minimal shell: help,
+// ver, test (reuses rpi4_vani_self_test's own real computation --
+// not a placeholder), and echo <text>. No prompt is printed (matches
+// kernel_main.vani's own task_f, which is purely reactive) -- output
+// is only ever what a command itself prints.
+fn rpi4_shell_dispatch() -> i64 {
+  if rpi4_shell_line_matches("help") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, echo <text>\n");
+    return 0;
+  }
+  if rpi4_shell_line_matches("ver") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 84 minimal shell\n");
+    return 0;
+  }
+  if rpi4_shell_line_matches("test") == (1 as u32) {
+    let _ = rpi4_vani_self_test();
+    return 0;
+  }
+  if rpi4_shell_starts_with("echo ") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let linelen: u32 = shell_get_line_len();
+    let i: i64 = 5;
+    while (i as u32) < linelen {
+      let c: u32 = shell_get_line_byte(i as u32);
+      let _ = uart_putc_rpi4_vani(c as i64);
+      i = i + 1;
+    }
+    let _ = uart_puts_rpi4_vani("\n");
+    return 0;
+  }
+  let linelen2: u32 = shell_get_line_len();
+  if linelen2 > (0 as u32) {
+    let _ = uart_puts_rpi4_vani("\nunknown command (try 'help')\n");
   }
   return 0;
 }
