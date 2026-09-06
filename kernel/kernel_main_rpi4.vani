@@ -513,6 +513,78 @@ fn rpi4_handle_uart_rx_irq() -> i64 {
   return 0;
 }
 
+// Round 78 -- the smallest possible proof of an ARMv8-A context
+// switch (boot/rpi4/task_switch.S's own header comment has the full
+// design). Deliberately cooperative (voluntary-yield), not
+// interrupt-driven -- proves the "two independent stacks can be
+// swapped between correctly" primitive on its own, separate from the
+// already-delicate timer-IRQ path, before any real (preemptive,
+// priority-based) scheduler attempts to build on top of it. NOT a
+// port of kernel_main.vani's own scheduler -- that stays its own
+// separate, much larger future increment.
+extern "C" fn task_switch(save_to: mut ref i64, load_from: mut ref i64) -> i64;
+extern "C" fn task_a_stack_init() -> i64;
+extern "C" fn task_b_stack_init() -> i64;
+extern "C" fn task_a_sp_addr() -> mut ref i64;
+extern "C" fn task_b_sp_addr() -> mut ref i64;
+extern "C" fn boot_sp_addr() -> mut ref i64;
+extern "C" fn switch_count_increment() -> i64;
+
+// Must never actually `ret` -- the fake frame task_a_stack_init built
+// has no real caller below it, so the only way out is another
+// task_switch call. Prints "A", then either yields to task_b (rounds
+// 1-2) or switches straight back to the boot context (round 3),
+// ending the demo -- task_b never needs its own termination logic
+// this way, it always just yields back to A.
+#[no_mangle]
+fn task_a_vani_entry() -> i64 {
+  while true {
+    let _ = uart_puts_rpi4_vani("A");
+    let count: i64 = switch_count_increment();
+    let a_sp: mut ref i64 = task_a_sp_addr();
+    if count >= 3 {
+      let boot_sp: mut ref i64 = boot_sp_addr();
+      let _ = task_switch(a_sp, boot_sp);
+    } else {
+      let b_sp: mut ref i64 = task_b_sp_addr();
+      let _ = task_switch(a_sp, b_sp);
+    }
+  }
+  return 0;
+}
+
+#[no_mangle]
+fn task_b_vani_entry() -> i64 {
+  while true {
+    let _ = uart_puts_rpi4_vani("B");
+    let a_sp: mut ref i64 = task_a_sp_addr();
+    let b_sp: mut ref i64 = task_b_sp_addr();
+    let _ = task_switch(b_sp, a_sp);
+  }
+  return 0;
+}
+
+// Builds both tasks' initial stacks, then switches from the boot
+// context into task_a. Execution resumes at the line right after
+// that call ONLY once task_a's 3rd round switches back to boot_sp --
+// which cannot happen unless every switch in the whole A/B/A/B/A
+// chain (5 switches total between the two tasks, plus this call and
+// the final return, 7 in all) landed correctly, since a broken switch
+// crashes or hangs rather than resuming at the wrong place with
+// merely wrong output. The printed "ABABA" sequence is the same
+// proof from the data side: exactly 3 A's and 2 B's, strictly
+// alternating.
+fn task_switch_self_test() -> i64 {
+  let _ = task_a_stack_init();
+  let _ = task_b_stack_init();
+  let _ = uart_puts_rpi4_vani("DHRUVA RPI4: task-switch self-test: ");
+  let boot_sp: mut ref i64 = boot_sp_addr();
+  let a_sp: mut ref i64 = task_a_sp_addr();
+  let _ = task_switch(boot_sp, a_sp);
+  let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  return 0;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
@@ -520,6 +592,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = gpio_self_check_rpi4();
   let _ = rpi4_uart_rx_irq_init();
   let _ = uart_puts_rpi4_vani("DHRUVA RPI4: UART0 RX interrupt armed, echoing input\n");
+  let _ = task_switch_self_test();
   return 0;
 }
 

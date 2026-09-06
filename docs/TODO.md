@@ -3018,6 +3018,54 @@ than assumed:
   QEMU's stdio UART and confirms it comes back echoed, live-verified
   reliable across repeated runs. `test/rpi4_boot_smoke.py`/
   `rpi4_timer_smoke.py`/`rpi4_vani_smoke.py` all still pass unmodified.
+
+  **ROUND 78 UPDATE, 2026-09-06** (still `[PARTIAL]` -- the full
+  28000+-line port remains its own multi-round effort): the smallest
+  possible proof of an ARMv8-A context switch -- new
+  `boot/rpi4/task_switch.S`, a cooperative (voluntary-yield) swap
+  between two static 1KB stacks, deliberately NOT the real
+  interrupt-driven scheduler (no preemption, no priorities, no
+  timer-IRQ integration) -- proves the one genuinely new
+  AArch64-specific primitive any real scheduler on this target would
+  need first, kept separate from the already-delicate timer-IRQ path
+  rather than extending it directly. `task_switch(save_to,
+  load_from)` saves/restores AAPCS64's callee-saved registers
+  (x19-x28, x29/fp, x30/lr) across a raw SP swap -- the classic
+  fiber/coroutine technique. `task_a_stack_init`/`task_b_stack_init`
+  each build a fake saved-frame on their own stack so the first
+  switch into a task lands directly at its vani entry function.
+
+  **Real bug found and fixed**: the first attempt put the entry
+  address at the fake frame's `+80` offset, matching where it
+  intuitively "looked like" x30/LR should live -- but `task_switch`'s
+  own `stp x29, x30, [sp, #80]` puts x29 at +80 and x30 at +88 (a
+  `stp` of two registers stores the first at the low address, second
+  8 bytes higher). Caught immediately, not silently: the very first
+  boot hit a real fault (`DHRUVA RPI4 FAULT: ... ELR_EL1=0
+  FAR_EL1=0`) -- x30 read back as 0 from the never-written +88 slot,
+  so `ret` branched to address 0 and instruction fetch there aborted.
+  Fixed by writing the entry address to +88 instead.
+
+  `kernel_main_rpi4.vani`'s `task_switch_self_test` drives a bounded,
+  self-terminating demo: task_a prints "A" and yields to task_b twice,
+  then switches back to boot instead of task_b on its 3rd round;
+  task_b always yields straight back to task_a, never independently
+  deciding to stop. Printed sequence: "ABABA" (3 A's, 2 B's, strictly
+  alternating), followed by "(PASS)" -- which can only ever print if
+  boot's own context genuinely resumed at the correct point after all
+  6 switches in the chain (boot->A->B->A->B->A->boot) landed
+  correctly; a broken switch crashes or hangs rather than resuming at
+  the wrong place with merely wrong output, so this is proof from both
+  the data side (exact sequence) and the control-flow side (reaching
+  "PASS" at all). New `test/rpi4_task_switch_smoke.py`, live-verified
+  reliable across repeated runs; `rpi4_boot_smoke.py`/
+  `rpi4_timer_smoke.py`/`rpi4_vani_smoke.py`/`rpi4_uart_rx_smoke.py`
+  all still pass unmodified.
+
+  **Not started**: a real (preemptive, priority-based) scheduler
+  integrated with the timer IRQ -- this round only proves the
+  underlying stack-swap primitive works, deliberately scoped apart
+  from that much larger, riskier next step.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
