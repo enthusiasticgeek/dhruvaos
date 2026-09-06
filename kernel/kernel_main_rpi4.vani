@@ -774,11 +774,19 @@ fn preempt_task_a_entry() -> i64 {
   return 0;
 }
 
+// Round 83: task_b also sleeps now (1 tick, shorter than task_a's 2)
+// instead of busy-waiting -- gives task_c (the only task that never
+// sleeps, priority NUM_TASKS-1/lowest, effectively this demo's idle
+// task) genuine gaps to run in, rather than task_b (priority 1,
+// always ready) permanently starving it out. See boot/rpi4/
+// preempt_switch.S's own header comment for why task index doubles
+// as priority (lower index = higher priority) instead of a separate
+// priority table.
 #[no_mangle]
 fn preempt_task_b_entry() -> i64 {
   while true {
     let _ = uart_putc_rpi4_vani(66); // 'B'
-    let _ = preempt_delay();
+    let _ = preempt_sleep_ticks(1);
   }
   return 0;
 }

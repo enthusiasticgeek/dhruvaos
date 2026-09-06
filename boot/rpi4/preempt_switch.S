@@ -62,6 +62,25 @@
  * later saves any task's own frame on every subsequent tick. No
  * special one-time "bootstrap the first switch" code exists anywhere
  * in this file; the general case already covers it.
+ *
+ * Round 83 -- fixed-priority scheduling, closing the "still no
+ * priorities" gap round 80's own comment above flagged. Task index
+ * doubles as its own priority (lower index = higher priority,
+ * task_a=0 highest ... task_c=NUM_TASKS-1 lowest/idle-like) rather
+ * than a separate priority table -- both rpi4_preempt_switch and
+ * preempt_sleep_ticks's own "pick next" logic changed from a
+ * round-robin scan (advance from current+1) to a priority scan
+ * (always restart from index 0, first READY task wins). task_b also
+ * gained its own voluntary sleep this round (1 tick, shorter than
+ * task_a's 2) specifically so task_c -- priority NUM_TASKS-1, this
+ * demo's closest thing to an idle task, and the only one that never
+ * sleeps -- gets genuine gaps to run in; without task_b also
+ * sleeping, it would permanently starve task_c out (always ready,
+ * always outranking it), a real and correctly-documented consequence
+ * of naive fixed-priority scheduling with no round-robin among
+ * equal/lower priorities and no aging -- not a bug, but worth being
+ * honest about rather than hiding by making every task sleep enough
+ * to never actually demonstrate it.
  */
 .section ".bss"
 .align 4
@@ -194,29 +213,21 @@ rpi4_preempt_switch:
     str x0, [x4, x5]
 
     cbnz x1, .Lpt_force_boot
-    cmp w3, #PT_BOOT_INDEX
-    b.eq .Lpt_from_boot            /* was boot -> start the scan at task 0 */
-    b .Lpt_advance
-.Lpt_from_boot:
-    mov w3, #0
-    b .Lpt_check_ready
-.Lpt_force_boot:
-    mov w3, #PT_BOOT_INDEX
-    b .Lpt_store_next
 
-    /* Bounded round-robin scan for a READY task, starting one past
-     * the current one -- at most NUM_TASKS attempts, so even a (never
-     * actually reachable in this demo, since task_b/task_c never
-     * sleep) all-asleep case can't hang; it just falls through to
-     * whatever w3 ended up as once the bound is hit. */
-.Lpt_advance:
-    mov w7, #0                     /* attempt counter */
-.Lpt_advance_loop:
-    add w3, w3, #1
-    cmp w3, #NUM_TASKS
-    b.ne .Lpt_check_ready
+    /* Round 83 -- fixed-priority scheduling instead of round robin:
+     * task index doubles as its own priority (lower index = higher
+     * priority, task_a=0 highest ... task_c=NUM_TASKS-1 lowest), so
+     * "pick the highest-priority READY task" is just "scan indices
+     * 0..NUM_TASKS-1 in order, first ready one wins" -- always
+     * starting the scan fresh at 0 regardless of what was current,
+     * not advancing from current+1 the way round robin did. This
+     * also makes the old "was boot -> start at task 0" special case
+     * unnecessary: a fresh-from-0 scan already naturally picks task_a
+     * whenever it's ready, which is always true the first time
+     * (nothing has slept yet), so boot falls straight into the same
+     * general path as every later decision. */
     mov w3, #0
-.Lpt_check_ready:
+.Lpt_scan_loop:
     adrp x8, pt_sleep_until
     add x8, x8, :lo12:pt_sleep_until
     sxtw x9, w3
@@ -224,10 +235,17 @@ rpi4_preempt_switch:
     ldr x10, [x8, x9]
     cmp x10, x6
     b.le .Lpt_store_next           /* pt_sleep_until[w3] <= now -> ready */
-    add w7, w7, #1
-    cmp w7, #NUM_TASKS
-    b.lt .Lpt_advance_loop
-    /* bound hit -- use w3 as-is rather than loop forever */
+    add w3, w3, #1
+    cmp w3, #NUM_TASKS
+    b.lt .Lpt_scan_loop
+    /* bound hit (never reachable in this demo -- task_c never sleeps,
+     * so it's always eligible) -- fall back to task 0 rather than
+     * use an out-of-range index. */
+    mov w3, #0
+    b .Lpt_store_next
+
+.Lpt_force_boot:
+    mov w3, #PT_BOOT_INDEX
 
 .Lpt_store_next:
     str w3, [x2]
@@ -321,23 +339,24 @@ preempt_sleep_ticks:
     mov x0, sp
     str x0, [x4, x9]                /* pt_sp_table[current] = this frame */
 
-    mov w5, w3
-    mov w12, #0                     /* attempt counter */
-.Lps_advance_loop:
-    add w5, w5, #1
-    cmp w5, #NUM_TASKS
-    b.ne .Lps_check_ready
+    /* Round 83 -- same fixed-priority scan as rpi4_preempt_switch's
+     * own (task index doubles as priority, lower = higher): always
+     * starts fresh at 0, not from current+1, so a real switch away
+     * from a sleeping task genuinely goes to the highest-priority
+     * READY task, not just "the next one in line." */
     mov w5, #0
-.Lps_check_ready:
+.Lps_scan_loop:
     sxtw x10, w5
     lsl x10, x10, #3
     ldr x11, [x7, x10]
     cmp x11, x6
-    b.le .Lps_found
-    add w12, w12, #1
-    cmp w12, #NUM_TASKS
-    b.lt .Lps_advance_loop
-    /* bound hit -- use w5 as-is rather than loop forever */
+    b.le .Lps_found                /* pt_sleep_until[w5] <= now -> ready */
+    add w5, w5, #1
+    cmp w5, #NUM_TASKS
+    b.lt .Lps_scan_loop
+    /* bound hit (never reachable -- at least one other real task
+     * never sleeps in this demo) -- fall back to task 0. */
+    mov w5, #0
 
 .Lps_found:
     /* Real bug found and fixed here: an earlier version of this

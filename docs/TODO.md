@@ -3256,6 +3256,50 @@ than assumed:
 
   **Still not started**: priorities -- all 3 tasks are still
   equal-weight, just some (task_a) voluntarily sleep and some don't.
+
+  **ROUND 83 UPDATE, 2026-09-06**: closed that exact gap -- real
+  FIXED-PRIORITY scheduling, not just round robin with sleeps bolted
+  on. Task index doubles as its own priority (lower index = higher
+  priority: task_a=highest, task_c=lowest/idle-like) instead of a
+  separate priority table -- both `rpi4_preempt_switch` and
+  `preempt_sleep_ticks`'s own "pick next" scan changed from
+  round-robin (advance from current+1) to a priority scan (always
+  restart from index 0, first READY task wins), which also made the
+  old "was boot -> start at task 0" special case unnecessary: a
+  fresh-from-0 scan already naturally picks task_a whenever it's
+  ready, which is always true the first time.
+
+  Task_b also gained its own voluntary sleep this round (1 tick,
+  shorter than task_a's 2) specifically so task_c -- priority
+  NUM_TASKS-1, this demo's closest thing to an idle task, and the
+  only one that never sleeps -- gets genuine gaps to run in. Without
+  task_b also sleeping, it would permanently starve task_c out
+  (always ready, always outranking it) -- a real and deliberately
+  undocumented-away consequence of naive fixed-priority scheduling
+  with no round-robin among equal/lower priorities and no aging, not
+  a bug to hide by making every task sleep enough to never actually
+  demonstrate it.
+
+  Worked correctly on the very first build, no debugging needed at
+  all (unlike round 82's own two bugs) -- the design followed
+  directly and safely from round 82's already-correct sleep/wake
+  machinery; only the SELECTION policy changed. Live-verified: exact
+  `A?BC*` shape per tick (task_a only on ticks 1/3, task_b exactly
+  once at the start of every tick's own run, task_c filling
+  everything else), reliable across repeated runs.
+  `test/rpi4_preempt_smoke.py` updated for the new pattern. All 5
+  pre-existing Pi 4 smoke tests pass unmodified; zero Pi 1 files
+  touched.
+
+  This closes every gap this backlog entry originally opened with
+  (round 79: preemption itself; round 80: more than 2 tasks; round
+  81: voluntary switching; round 82: time-based sleep; round 83:
+  priorities). **Not done**: the 28000+-line port of kernel_main.
+  vani's own actual logic (filesystem, shell, networking, crypto,
+  USB) remains its own separate, much larger future effort -- this
+  whole preemption/scheduling arc only proves the underlying
+  mechanisms work on this target, using tiny synthetic demo tasks,
+  not a port of anything kernel_main.vani itself does today.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

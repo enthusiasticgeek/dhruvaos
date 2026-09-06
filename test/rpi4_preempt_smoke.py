@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
-"""Dhruva round 79/80/82: interrupt-driven preemption on the Pi 4/5
-port -- boot/rpi4/preempt_switch.S's own header comment has the full
-design. Unlike round 78's cooperative task_switch (a voluntary,
-`ret`-based swap), this is driven by the real timer: task_b/task_c
-never yield and are genuinely preempted by aarch64_irq_handler,
-resumed via `eret`, including correctly restoring ELR_EL1/SPSR_EL1
-per task. Round 80 generalized round 79's hardcoded 2-task toggle
-into real NUM_TASKS-way (3) round robin. Round 82 made task_a
-genuinely sleep for 2 real ticks after each print (preempt_sleep_
-ticks) instead of busy-waiting -- so unlike task_b/task_c, task_a
-now appears exactly once per turn, then goes quiet for the next tick
-while it's asleep, waking up again on the tick after that.
+"""Dhruva round 79/80/82/83: interrupt-driven preemption on the Pi
+4/5 port -- boot/rpi4/preempt_switch.S's own header comment has the
+full design. Round 83 changed task selection from round-robin to
+real FIXED-PRIORITY scheduling: task index doubles as its own
+priority (task_a=highest, task_c=lowest/idle-like), and the "pick
+next" scan always restarts from index 0 rather than advancing from
+current+1, so the highest-priority READY task always wins. task_a
+sleeps 2 ticks after each print, task_b sleeps 1, task_c never sleeps
+(this demo's closest thing to an idle task) -- deliberately NOT
+balanced further, so task_c only ever gets to run in the genuine gaps
+left by task_a/task_b both being asleep, a real and honest
+consequence of naive fixed-priority scheduling.
 
 Checks three things, each independently meaningful:
-1. task_a appears exactly once on ticks 1 and 3 (voluntarily sleeping
-   through tick 2, waking again by tick 3 -- exactly n=2 ticks after
-   falling asleep at tick 1), and never on ticks 2/4 (still asleep or
-   not yet due).
-2. task_b only ever appears on odd ticks (right after task_a's own
-   single print+immediate voluntary yield within that same tick's
-   slice) and task_c only ever appears on even ticks (once task_a is
-   asleep and out of the rotation) -- confirming the round-robin
-   scan genuinely skips a sleeping task rather than getting stuck or
-   corrupting the rotation.
+1. task_a appears exactly once on ticks 1 and 3 (asleep on 2 and 4,
+   waking exactly n=2 ticks after each sleep).
+2. task_b appears exactly once at the START of every tick's own
+   letter run (immediately outranking task_c the instant it wakes,
+   even mid-tick), with task_c filling every remaining gap -- proving
+   the scan is genuinely priority-based (task_b, priority 1, always
+   preempts task_c, priority 2, the moment it's ready) not just
+   round-robin with sleeps bolted on.
 3. "boot context resumed after preemption demo (PASS)" prints AFTER
    the halt message -- this can only happen if boot's own saved
    context (captured once, on tick 1, and never touched again until
@@ -76,24 +74,38 @@ def main() -> int:
 
     def check(n: int) -> bool:
         letters = tick_letters.get(n, "")
-        if n in (1, 3):
-            # Exactly one 'A' (task_a waking, printing once, then
-            # immediately voluntarily yielding to task_b within the
-            # same slice), followed only by 'B's for the rest.
-            return letters.startswith("A") and letters.count("A") == 1 and set(letters[1:]) <= {"B"}
-        # Even ticks: task_a is asleep, so only task_c ever appears.
-        return len(letters) > 0 and set(letters) == {"C"}
+        if not letters:
+            return False
+        expect_a = n in (1, 3)
+        # Expected shape: an optional single 'A' (only on ticks 1/3),
+        # then exactly one 'B', then 'C' filling the rest -- task_c
+        # never sleeps, so it's always what's left running once both
+        # higher-priority tasks have gone back to sleep.
+        rest = letters
+        if expect_a:
+            if not rest.startswith("A"):
+                return False
+            rest = rest[1:]
+            if rest.startswith("A"):
+                return False  # task_a must appear exactly once
+        else:
+            if rest.startswith("A"):
+                return False  # task_a must be asleep on even ticks
+        if not rest.startswith("B"):
+            return False
+        rest = rest[1:]
+        return set(rest) == {"C"} if rest else True
 
     pattern_ok = all(check(n) for n in (1, 2, 3, 4))
     has_fault = "FAULT" in output
     ok = pattern_ok and EXPECT_HALT in output and EXPECT_RESUMED in output and not has_fault
 
     if ok:
-        print(f"\n[rpi4_preempt_smoke.py] PASS -- task_a slept through tick 2 "
-              f"and correctly woke by tick 3 exactly as expected, task_b/task_c "
-              f"round-robined via pure timer preemption on the ticks task_a was "
-              f"asleep for, the timer disabled cleanly on tick 5, and boot's own "
-              f"context resumed correctly afterward.", file=sys.stderr)
+        print(f"\n[rpi4_preempt_smoke.py] PASS -- task_a slept through ticks 2/4 "
+              f"and woke exactly on schedule (ticks 1/3), task_b preempted "
+              f"task_c the instant it was ready on every tick, task_c filled "
+              f"every remaining gap, the timer disabled cleanly on tick 5, and "
+              f"boot's own context resumed correctly afterward.", file=sys.stderr)
         return 0
     print(f"\n[rpi4_preempt_smoke.py] FAIL -- tick_letters={tick_letters!r}, "
           f"pattern_ok={pattern_ok}, halt={EXPECT_HALT in output}, "
