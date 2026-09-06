@@ -3615,6 +3615,46 @@ than assumed:
   **Not done**: DHCP (client+server), PKI, X25519/Ed25519/ChaCha20-
   Poly1305, TLS 1.3, SSH transport, and SSH-shell integration remain
   the next Phase A steps, none started.
+
+  **ROUND 90 UPDATE, 2026-09-06**: UDP -- a real, previously-
+  unaccounted-for prerequisite for DHCP, discovered while reading
+  kernel_main.vani's own DHCP code to scope that round: DHCP is built
+  directly on `udp_send`, not raw IP. This scope's own original
+  ordering (see project memory `project_dhruva_networking_ssh_wifi_
+  scope_2026_09_06.md`) never listed a UDP step at all, silently
+  skipping the layer DHCP actually sits on -- corrected there now,
+  inserted as its own step before DHCP.
+
+  Direct port of kernel_main.vani's own stateless `udp_*` header layer
+  plus its `socket_udp_send`/`socket_udp_recv` minimal socket-style
+  API (DHRUVA_ARCHITECTURE.md §4 -- one implicit socket, no per-port
+  binding table, matching Pi 1's own honest scope). UDP is genuinely
+  stateless -- no new `boot/rpi4/*.S` file needed at all, unlike every
+  other round in this arc. Reused round 88's `udp_get_dst_port_rpi4`
+  as-is. Same ref-planning discipline as rounds 89: every `udp_get_*_
+  rpi4`/checksum helper takes plain `ref`, only `udp_build_rpi4`
+  computes its checksum inline (same fix shape as `ipv4_build_header_
+  rpi4`/`tcp_build_header_rpi4`) -- planned up front, `vanic check`
+  found zero reborrow issues this round.
+
+  Wired into `kmain_rpi4_vani` and a new `udp` shell command. Worked
+  correctly on the very first REAL build -- five clean rounds in a
+  row now (86-90). `test/rpi4_shell_smoke.py` updated for the new
+  `help`/`ver` text and a `udp` command check; all 8 Pi 4 smoke tests
+  pass; zero Pi 1 files touched.
+
+  **Not ported this round**: kernel_main.vani's own 3 dedicated
+  regression self-tests (`udp_send_unresolved_self_test`, `udp_recv_
+  bounds_self_test`, `udp_checksum_reject_self_test`) -- the
+  underlying logic (ARP-resolution requirement, bounds checks,
+  checksum verification) is fully live in `socket_udp_send_rpi4`/
+  `socket_udp_recv_rpi4`, just not independently re-verified via each
+  one's own dedicated fixture this round, same scope-boundary
+  reasoning as round 89's own TCP note.
+
+  **Not done**: DHCP (client+server), PKI, X25519/Ed25519/ChaCha20-
+  Poly1305, TLS 1.3, SSH transport, and SSH-shell integration remain
+  the next Phase A steps, none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

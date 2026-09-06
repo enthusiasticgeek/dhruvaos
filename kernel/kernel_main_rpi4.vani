@@ -2772,6 +2772,287 @@ fn tcp_conn_self_test_rpi4() -> i64 {
   return ok;
 }
 
+// Round 90 -- UDP, a real prerequisite for DHCP discovered while
+// reading kernel_main.vani's own DHCP code to scope that round: DHCP
+// is built directly on `udp_send`, not raw IP -- a genuine missing
+// step this scope's own original ordering didn't account for (it
+// only listed netif/ARP/IP+filter/TCP/DHCP, silently skipping the UDP
+// layer DHCP actually sits on). Inserted here, corrected in
+// project_dhruva_networking_ssh_wifi_scope_2026_09_06.md, before
+// DHCP is attempted.
+//
+// Direct port of kernel_main.vani's own stateless `udp_*` header
+// layer plus its minimal `socket_udp_send`/`socket_udp_recv` API
+// (DHRUVA_ARCHITECTURE.md §4's "small socket-style API," exactly one
+// implicit socket, no per-port binding/filtering table -- the same
+// honest scope Pi 1 itself accepted). No persistent state needed at
+// all (unlike TCP's connection table) -- UDP is genuinely stateless,
+// so this needs no new `boot/rpi4/*.S` file.
+//
+// Same ref-planning discipline as round 89: every `udp_get_*_rpi4`/
+// `udp_checksum_rpi4`/`udp_verify_checksum_rpi4` takes plain `ref
+// [u8; 512]`; only `udp_build_rpi4` (write then must read back to
+// checksum) computes its checksum inline instead of delegating.
+// Reuses round 88's `udp_get_dst_port_rpi4` as-is (identical
+// signature to what this module needs).
+
+fn udp_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], udp_offset: i64, udp_len: i64) -> u32 {
+  let sum: u32 = 0 as u32;
+  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (src_ip & (0xFFFF as u32));
+  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (dst_ip & (0xFFFF as u32));
+  sum = sum + (17 as u32); // protocol (pseudo-header's zero byte contributes nothing)
+  sum = sum + (udp_len as u32);
+  let i: i64 = 0;
+  while (i + 1) < udp_len {
+    let word: u32 = arp_read_u16_be_rpi4(frame, udp_offset + i);
+    sum = sum + word;
+    i = i + 2;
+  }
+  if i < udp_len {
+    let b: u32 = frame[udp_offset + i] as u32;
+    sum = sum + (b << (8 as u32)); // odd trailing byte, zero-padded low
+  }
+  while (sum >> (16 as u32)) != (0 as u32) {
+    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
+  }
+  let result: u32 = (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+  if result == (0 as u32) {
+    return 0xFFFF as u32; // RFC 768: transmit all-ones, never a literal 0
+  }
+  return result;
+}
+
+// See kernel_main.vani's own udp_verify_checksum comment for why the
+// verify criterion is `== 0xFFFF`, not `== 0` (matching ipv4's own
+// convention, unlike TCP's) -- udp_checksum_rpi4's own RFC-768
+// zero-substitution rule maps a valid as-transmitted datagram's
+// re-summed result to 0xFFFF, not 0.
+fn udp_verify_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], udp_offset: i64, udp_len: i64) -> i64 {
+  if udp_checksum_rpi4(src_ip, dst_ip, frame, udp_offset, udp_len) == (0xFFFF as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+fn udp_build_rpi4(frame: mut ref [u8; 512], udp_offset: i64, src_port: u32, dst_port: u32, payload: ref [u8; 512], payload_len: i64, src_ip: u32, dst_ip: u32) -> i64 {
+  let udp_len: i64 = 8 + payload_len;
+  let _ = arp_write_u16_be_rpi4(frame, udp_offset, src_port);
+  let _ = arp_write_u16_be_rpi4(frame, udp_offset + 2, dst_port);
+  let _ = arp_write_u16_be_rpi4(frame, udp_offset + 4, udp_len as u32);
+  let _ = arp_write_u16_be_rpi4(frame, udp_offset + 6, 0 as u32); // checksum placeholder
+  let i: i64 = 0;
+  while i < payload_len {
+    frame[udp_offset + 8 + i] = payload[i];
+    i = i + 1;
+  }
+  // Inline checksum -- same reborrow-avoidance reason as
+  // tcp_build_header_rpi4/ipv4_build_header_rpi4's own comments.
+  let sum: u32 = 0 as u32;
+  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (src_ip & (0xFFFF as u32));
+  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (dst_ip & (0xFFFF as u32));
+  sum = sum + (17 as u32);
+  sum = sum + (udp_len as u32);
+  let j: i64 = 0;
+  while (j + 1) < udp_len {
+    let hi: u32 = frame[udp_offset + j] as u32;
+    let lo: u32 = frame[udp_offset + j + 1] as u32;
+    let word: u32 = (hi << (8 as u32)) | lo;
+    sum = sum + word;
+    j = j + 2;
+  }
+  if j < udp_len {
+    let b: u32 = frame[udp_offset + j] as u32;
+    sum = sum + (b << (8 as u32));
+  }
+  while (sum >> (16 as u32)) != (0 as u32) {
+    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
+  }
+  let checksum: u32 = (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+  if checksum == (0 as u32) {
+    checksum = 0xFFFF as u32;
+  }
+  let _ = arp_write_u16_be_rpi4(frame, udp_offset + 6, checksum);
+  return udp_len;
+}
+
+fn udp_get_src_port_rpi4(frame: ref [u8; 512], udp_offset: i64) -> u32 {
+  return arp_read_u16_be_rpi4(frame, udp_offset);
+}
+fn udp_get_length_rpi4(frame: ref [u8; 512], udp_offset: i64) -> u32 {
+  return arp_read_u16_be_rpi4(frame, udp_offset + 4);
+}
+
+// Builds and sends a full Ethernet+IPv4+UDP frame. Fixed offsets (14
+// for IP, 34 for UDP), matching kernel_main.vani's own udp_send.
+fn udp_send_rpi4(my_mac: ref [u8; 6], dst_mac: ref [u8; 6], src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32, payload: ref [u8; 512], payload_len: i64) -> i64 {
+  let udp_max_payload: i64 = netif_get_mtu_rpi4() - 20 - 8; // minus IP header, minus UDP header
+  if (payload_len < 0) || (payload_len > udp_max_payload) {
+    return 0 - 1;
+  }
+  let frame: [u8; 512] = netif_zero_frame_rpi4();
+  let i: i64 = 0;
+  while i < 6 {
+    frame[i] = dst_mac[i];
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    frame[6 + j] = my_mac[j];
+    j = j + 1;
+  }
+  let _ = arp_write_u16_be_rpi4(mut ref frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let udp_len: i64 = udp_build_rpi4(mut ref frame, 34, src_port, dst_port, payload, payload_len, src_ip, dst_ip);
+  let total_len: i64 = 20 + udp_len;
+  let _ = ipv4_build_header_rpi4(mut ref frame, 14, total_len, 17 as u32, src_ip, dst_ip);
+  return netif_send_frame_rpi4(ref frame, 14 + total_len);
+}
+
+// Phase 6's "small socket-style API": a thin wrapper hiding the raw
+// Ethernet/IP/UDP plumbing above. Requires remote_ip to already be
+// ARP-resolved (a cache hit) before sending -- a cache miss is a
+// real, honest failure (-1, "no route to host"), matching
+// kernel_main.vani's own round-21 fix (never silently substitute a
+// MAC that's certain to be wrong for any real off-loopback
+// destination).
+fn socket_udp_send_rpi4(my_mac: ref [u8; 6], local_ip: u32, remote_ip: u32, local_port: u32, remote_port: u32, payload: ref [u8; 512], payload_len: i64) -> i64 {
+  let dst_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  if arp_cache_lookup_rpi4(remote_ip, mut ref dst_mac) != 1 {
+    return 0 - 1;
+  }
+  return udp_send_rpi4(my_mac, ref dst_mac, local_ip, remote_ip, local_port, remote_port, payload, payload_len);
+}
+
+// Receives the next queued frame; if it's UDP, copies its payload
+// into out_payload and writes [src_ip(4, BE)][src_port(2, BE)][dst_
+// port(2, BE)] into out_meta (8 bytes), returning the payload length.
+// Returns -1 if nothing is queued, the frame isn't UDP, or the
+// segment fails the same three-fold bounds/checksum guard
+// kernel_main.vani's own round-8/round-21 audits already established
+// (reject a negative length, a declared extent past what netif
+// actually received, a payload bigger than the caller's own buffer,
+// or a failed checksum -- never silently truncate).
+fn socket_udp_recv_rpi4(out_payload: mut ref [u8; 512], out_meta: mut ref [u8; 8], max_payload_len: i64) -> i64 {
+  let frame: [u8; 512] = netif_zero_frame_rpi4();
+  let frame_len: i64 = netif_recv_frame_rpi4(mut ref frame, 512);
+  if frame_len < 0 {
+    return 0 - 1;
+  }
+  if arp_read_u16_be_rpi4(ref frame, 12) != (0x0800 as u32) {
+    return 0 - 1;
+  }
+  if ipv4_get_protocol_rpi4(ref frame, 14) != (17 as u32) {
+    return 0 - 1;
+  }
+  let udp_len: u32 = udp_get_length_rpi4(ref frame, 34);
+  let payload_len: i64 = (udp_len as i64) - 8;
+  if payload_len < 0 {
+    return 0 - 1;
+  }
+  if (34 + (udp_len as i64)) > frame_len {
+    return 0 - 1;
+  }
+  if payload_len > max_payload_len {
+    return 0 - 1;
+  }
+  let src_ip_for_checksum: u32 = ipv4_get_src_ip_rpi4(ref frame, 14);
+  let dst_ip_for_checksum: u32 = ipv4_get_dst_ip_rpi4(ref frame, 14);
+  if udp_verify_checksum_rpi4(src_ip_for_checksum, dst_ip_for_checksum, ref frame, 34, udp_len as i64) != 1 {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < payload_len {
+    out_payload[i] = frame[42 + i]; // 14 + 20 + 8
+    i = i + 1;
+  }
+  let src_ip: u32 = ipv4_get_src_ip_rpi4(ref frame, 14);
+  let src_port: u32 = udp_get_src_port_rpi4(ref frame, 34);
+  let dst_port: u32 = udp_get_dst_port_rpi4(ref frame, 34);
+  out_meta[0] = ((src_ip >> (24 as u32)) & (255 as u32)) as u8;
+  out_meta[1] = ((src_ip >> (16 as u32)) & (255 as u32)) as u8;
+  out_meta[2] = ((src_ip >> (8 as u32)) & (255 as u32)) as u8;
+  out_meta[3] = (src_ip & (255 as u32)) as u8;
+  out_meta[4] = ((src_port >> (8 as u32)) & (255 as u32)) as u8;
+  out_meta[5] = (src_port & (255 as u32)) as u8;
+  out_meta[6] = ((dst_port >> (8 as u32)) & (255 as u32)) as u8;
+  out_meta[7] = (dst_port & (255 as u32)) as u8;
+  return payload_len;
+}
+
+// Boot-time (and on-demand, via the `udp` shell command) self-test:
+// send a UDP datagram over the loopback netif, receive it back
+// through the socket API, and verify the payload, port/address
+// metadata, and the empty-queue case afterward. Direct port of
+// kernel_main.vani's own udp_self_test. Depends on ARP's own cache
+// already being initialized this boot (round 87's arp_self_test_
+// rpi4/arp_resolve_self_test_rpi4 already ran by this point in
+// kmain_rpi4_vani).
+fn udp_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let _ = netif_get_mac_rpi4(mut ref my_mac);
+  let local_ip: u32 = 0xC0A80101 as u32;
+  let remote_ip: u32 = 0xC0A80102 as u32;
+  let local_port: u32 = 12345 as u32;
+  let remote_port: u32 = 7 as u32;
+
+  let payload: [u8; 512] = netif_zero_frame_rpi4();
+  payload[0] = 104 as u8; // "hello"
+  payload[1] = 101 as u8;
+  payload[2] = 108 as u8;
+  payload[3] = 108 as u8;
+  payload[4] = 111 as u8;
+
+  let _ = arp_cache_insert_rpi4(remote_ip, ref my_mac);
+  let send_status: i64 = socket_udp_send_rpi4(ref my_mac, local_ip, remote_ip, local_port, remote_port, ref payload, 5);
+  if send_status != 0 {
+    ok = 0;
+  }
+
+  let recv_payload: [u8; 512] = netif_zero_frame_rpi4();
+  let recv_meta: [u8; 8] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let recv_len: i64 = socket_udp_recv_rpi4(mut ref recv_payload, mut ref recv_meta, 512);
+  if recv_len != 5 {
+    ok = 0;
+  }
+  let i: i64 = 0;
+  while i < 5 {
+    if payload[i] != recv_payload[i] {
+      ok = 0;
+    }
+    i = i + 1;
+  }
+
+  let got_src_ip: u32 = ((recv_meta[0] as u32) << (24 as u32)) | ((recv_meta[1] as u32) << (16 as u32)) | ((recv_meta[2] as u32) << (8 as u32)) | (recv_meta[3] as u32);
+  let got_src_port: u32 = ((recv_meta[4] as u32) << (8 as u32)) | (recv_meta[5] as u32);
+  let got_dst_port: u32 = ((recv_meta[6] as u32) << (8 as u32)) | (recv_meta[7] as u32);
+  if got_src_ip != local_ip {
+    ok = 0;
+  }
+  if got_src_port != local_port {
+    ok = 0;
+  }
+  if got_dst_port != remote_port {
+    ok = 0;
+  }
+
+  let empty_status: i64 = socket_udp_recv_rpi4(mut ref recv_payload, mut ref recv_meta, 512);
+  if empty_status != (0 - 1) {
+    ok = 0;
+  }
+
+  let _ = uart_puts_rpi4_vani("UDP: socket send/recv over loopback + checksum");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
@@ -2800,6 +3081,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = filter_outgoing_self_test_rpi4();
   let _ = tcp_self_test_rpi4();
   let _ = tcp_conn_self_test_rpi4();
+  let _ = udp_self_test_rpi4();
   return 0;
 }
 
@@ -3039,11 +3321,11 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, netif, arp, ip, filter, tcp, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, netif, arp, ip, filter, tcp, udp, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 89 minimal shell + crypto + netif + arp + ip + filter + tcp\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 90 minimal shell + crypto + netif + arp + ip + filter + tcp + udp\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
@@ -3081,6 +3363,11 @@ fn rpi4_shell_dispatch() -> i64 {
     let _ = uart_puts_rpi4_vani("\n");
     let _ = tcp_self_test_rpi4();
     let _ = tcp_conn_self_test_rpi4();
+    return 0;
+  }
+  if rpi4_shell_line_matches("udp") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = udp_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_starts_with("echo ") == (1 as u32) {
