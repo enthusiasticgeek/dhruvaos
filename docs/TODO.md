@@ -3454,6 +3454,47 @@ than assumed:
   transport, and SSH-shell integration -- none started. A real NIC
   driver and WiFi STA/AP are Phase B, genuinely hardware-only, not
   started and not scoped further than the scope memory already covers.
+
+  **ROUND 87 UPDATE, 2026-09-06**: Phase A step 2 -- ARP (RFC 826),
+  built on round 86's netif. Direct port of kernel_main.vani's own
+  `arp_build_request`/`arp_build_reply`/`arp_get_*`/`arp_cache_lookup`
+  /`arp_cache_insert`/`arp_resolve_start`/`arp_resolve_poll`, same
+  42-byte frame layout and same 8-entry round-robin cache semantics
+  (update-in-place if already cached, append while there's room,
+  round-robin overwrite once full). New `boot/rpi4/arp_state.S`
+  mirrors `netif_state.S`'s persistent-state-in-asm shape for the
+  cache (count/next_slot/8 IPs/8 MACs), with per-byte accessors
+  replacing kernel_main.vani's own raw-pointer-into-a-heap-buffer
+  approach -- the lookup/insert ALGORITHM itself stays in vani,
+  unchanged in shape from the Pi 1 side, only the low-level storage
+  access differs.
+
+  Two small `arp_write/read_u16/u32_be_rpi4` helpers replace
+  kernel_main.vani's own `buf_write/read_u16/u32_be` builtins (this
+  port has no equivalent builtin over fixed-array buffers yet).
+  `netif_zero_frame_rpi4` (round 86) supplies every scratch frame
+  needed -- no new zero-literal gap hit this round.
+
+  Wired into `kmain_rpi4_vani` (boot-time self-test, both
+  `arp_self_test_rpi4` and `arp_resolve_self_test_rpi4`) and a new
+  `arp` shell command (reruns both). Worked correctly on the very
+  first build, no live debugging needed. `test/rpi4_shell_smoke.py`
+  updated for the new `help`/`ver` text and an `arp` command check;
+  all 8 Pi 4 smoke tests pass; zero Pi 1 files touched.
+
+  Also logged two real vani-language ergonomics gaps found during
+  round 86 (no array-repeat literal syntax, `let` always requiring a
+  full initializer) to a new dedicated, discoverable list in the
+  vani-compiler repo itself
+  (`vani-compiler/docs/DHRUVAOS_ERGONOMICS_TODO.md`, linked from its
+  root `TODO.md`) per the user's own request -- distinct from this
+  project's own `docs/TODO.md`, kept there so it survives independent
+  of DhruvaOS-session memory and is easy for compiler work to find.
+
+  **Not done**: a real IP header module, the packet filter, TCP, DHCP
+  (client+server), PKI, X25519/Ed25519/ChaCha20-Poly1305, TLS 1.3, SSH
+  transport, and SSH-shell integration remain the next Phase A steps,
+  none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

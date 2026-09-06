@@ -1233,6 +1233,364 @@ fn netif_self_test_rpi4() -> i64 {
   return ok;
 }
 
+// Round 87 -- Phase A step 2 of the networking/SSH/WiFi scope: ARP
+// (RFC 826), built on round 86's netif. Field layout, exactly
+// kernel_main.vani's own (offsets within the full 42-byte frame,
+// after netif's own 14-byte dst/src/ethertype header):
+//   14-15 hwtype(1=Ethernet)  16-17 ptype(0x0800=IPv4)
+//   18 hwlen(6)  19 plen(4)  20-21 op(1=request,2=reply)
+//   22-27 sender_mac  28-31 sender_ip
+//   32-37 target_mac  38-41 target_ip
+// A loopback link doesn't need real address resolution (no separate
+// "other host" on the wire), but the packet format and cache logic
+// are real and directly testable without one -- same reasoning
+// kernel_main.vani's own ARP comment already gives.
+//
+// The cache itself lives in boot/rpi4/arp_state.S (its own header
+// comment has the full design); the lookup/insert ALGORITHM below is
+// a direct port of kernel_main.vani's own arp_cache_lookup/insert,
+// just calling per-byte accessors instead of that side's raw-pointer-
+// into-a-heap-buffer.
+
+extern "C" fn arp_cache_reset() -> u32;
+extern "C" fn arp_cache_get_count() -> u32;
+extern "C" fn arp_cache_set_count(count: u32) -> u32;
+extern "C" fn arp_cache_get_next_slot() -> u32;
+extern "C" fn arp_cache_set_next_slot(slot: u32) -> u32;
+extern "C" fn arp_cache_get_ip(index: u32) -> u32;
+extern "C" fn arp_cache_set_ip(index: u32, value: u32) -> u32;
+extern "C" fn arp_cache_get_mac_byte(index: u32, byte_idx: u32) -> u32;
+extern "C" fn arp_cache_set_mac_byte(index: u32, byte_idx: u32, value: u32) -> u32;
+
+fn arp_write_u16_be_rpi4(buf: mut ref [u8; 512], off: i64, v: u32) -> i64 {
+  buf[off] = ((v >> (8 as u32)) & (255 as u32)) as u8;
+  buf[off + 1] = (v & (255 as u32)) as u8;
+  return 0;
+}
+
+fn arp_write_u32_be_rpi4(buf: mut ref [u8; 512], off: i64, v: u32) -> i64 {
+  buf[off] = ((v >> (24 as u32)) & (255 as u32)) as u8;
+  buf[off + 1] = ((v >> (16 as u32)) & (255 as u32)) as u8;
+  buf[off + 2] = ((v >> (8 as u32)) & (255 as u32)) as u8;
+  buf[off + 3] = (v & (255 as u32)) as u8;
+  return 0;
+}
+
+fn arp_read_u16_be_rpi4(buf: ref [u8; 512], off: i64) -> u32 {
+  let b0: u32 = buf[off] as u32;
+  let b1: u32 = buf[off + 1] as u32;
+  return (b0 << (8 as u32)) | b1;
+}
+
+fn arp_read_u32_be_rpi4(buf: ref [u8; 512], off: i64) -> u32 {
+  let b0: u32 = buf[off] as u32;
+  let b1: u32 = buf[off + 1] as u32;
+  let b2: u32 = buf[off + 2] as u32;
+  let b3: u32 = buf[off + 3] as u32;
+  return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+fn arp_build_request_rpi4(out_frame: mut ref [u8; 512], my_mac: ref [u8; 6], my_ip: u32, target_ip: u32) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    out_frame[i] = 0xFF as u8; // dst: broadcast
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    out_frame[6 + j] = my_mac[j];
+    j = j + 1;
+  }
+  let _ = arp_write_u16_be_rpi4(out_frame, 12, 0x0806 as u32); // ethertype: ARP
+  let _ = arp_write_u16_be_rpi4(out_frame, 14, 1 as u32);      // hwtype: Ethernet
+  let _ = arp_write_u16_be_rpi4(out_frame, 16, 0x0800 as u32); // ptype: IPv4
+  out_frame[18] = 6 as u8;
+  out_frame[19] = 4 as u8;
+  let _ = arp_write_u16_be_rpi4(out_frame, 20, 1 as u32); // op: request
+  let k: i64 = 0;
+  while k < 6 {
+    out_frame[22 + k] = my_mac[k]; // sender mac
+    k = k + 1;
+  }
+  let _ = arp_write_u32_be_rpi4(out_frame, 28, my_ip);
+  let m: i64 = 0;
+  while m < 6 {
+    out_frame[32 + m] = 0 as u8; // target mac: unknown
+    m = m + 1;
+  }
+  let _ = arp_write_u32_be_rpi4(out_frame, 38, target_ip);
+  return 42;
+}
+
+fn arp_build_reply_rpi4(out_frame: mut ref [u8; 512], my_mac: ref [u8; 6], my_ip: u32, requester_mac: ref [u8; 6], requester_ip: u32) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    out_frame[i] = requester_mac[i]; // dst: the requester
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    out_frame[6 + j] = my_mac[j];
+    j = j + 1;
+  }
+  let _ = arp_write_u16_be_rpi4(out_frame, 12, 0x0806 as u32);
+  let _ = arp_write_u16_be_rpi4(out_frame, 14, 1 as u32);
+  let _ = arp_write_u16_be_rpi4(out_frame, 16, 0x0800 as u32);
+  out_frame[18] = 6 as u8;
+  out_frame[19] = 4 as u8;
+  let _ = arp_write_u16_be_rpi4(out_frame, 20, 2 as u32); // op: reply
+  let k: i64 = 0;
+  while k < 6 {
+    out_frame[22 + k] = my_mac[k]; // sender: us
+    k = k + 1;
+  }
+  let _ = arp_write_u32_be_rpi4(out_frame, 28, my_ip);
+  let m: i64 = 0;
+  while m < 6 {
+    out_frame[32 + m] = requester_mac[m]; // target: the requester
+    m = m + 1;
+  }
+  let _ = arp_write_u32_be_rpi4(out_frame, 38, requester_ip);
+  return 42;
+}
+
+fn arp_get_ethertype_rpi4(frame: ref [u8; 512]) -> u32 {
+  return arp_read_u16_be_rpi4(frame, 12);
+}
+
+fn arp_is_arp_frame_rpi4(frame: ref [u8; 512]) -> i64 {
+  if arp_get_ethertype_rpi4(frame) == (0x0806 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+fn arp_get_operation_rpi4(frame: ref [u8; 512]) -> u32 {
+  return arp_read_u16_be_rpi4(frame, 20);
+}
+
+fn arp_get_sender_ip_rpi4(frame: ref [u8; 512]) -> u32 {
+  return arp_read_u32_be_rpi4(frame, 28);
+}
+
+fn arp_get_target_ip_rpi4(frame: ref [u8; 512]) -> u32 {
+  return arp_read_u32_be_rpi4(frame, 38);
+}
+
+fn arp_get_sender_mac_rpi4(frame: ref [u8; 512], out_mac: mut ref [u8; 6]) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    out_mac[i] = frame[22 + i];
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Looks up ip in the cache; if found, copies its MAC into out_mac and
+// returns 1; if not found, returns 0 (out_mac left untouched). Direct
+// port of kernel_main.vani's own arp_cache_lookup.
+fn arp_cache_lookup_rpi4(ip: u32, out_mac: mut ref [u8; 6]) -> i64 {
+  let count: u32 = arp_cache_get_count();
+  let i: u32 = 0 as u32;
+  while i < count {
+    if arp_cache_get_ip(i) == ip {
+      let j: i64 = 0;
+      while j < 6 {
+        let b: u32 = arp_cache_get_mac_byte(i, j as u32);
+        out_mac[j] = b as u8;
+        j = j + 1;
+      }
+      return 1;
+    }
+    i = i + (1 as u32);
+  }
+  return 0;
+}
+
+// Inserts/updates an IP -> MAC mapping. Updates in place if the IP is
+// already cached; otherwise appends while there's room (8 slots), or
+// overwrites the oldest entry round-robin once full -- direct port of
+// kernel_main.vani's own arp_cache_insert (a demo-scoped cache, not a
+// production one with real aging/timeouts).
+fn arp_cache_insert_rpi4(ip: u32, mac: ref [u8; 6]) -> i64 {
+  let count: u32 = arp_cache_get_count();
+  let i: u32 = 0 as u32;
+  while i < count {
+    if arp_cache_get_ip(i) == ip {
+      let j: i64 = 0;
+      while j < 6 {
+        let _ = arp_cache_set_mac_byte(i, j as u32, mac[j] as u32);
+        j = j + 1;
+      }
+      return 0;
+    }
+    i = i + (1 as u32);
+  }
+  let slot: u32 = 0 as u32;
+  if count < (8 as u32) {
+    slot = count;
+    let _ = arp_cache_set_count(count + (1 as u32));
+  } else {
+    slot = arp_cache_get_next_slot();
+    let next: u32 = (slot + (1 as u32)) & (7 as u32);
+    let _ = arp_cache_set_next_slot(next);
+  }
+  let _ = arp_cache_set_ip(slot, ip);
+  let k: i64 = 0;
+  while k < 6 {
+    let _ = arp_cache_set_mac_byte(slot, k as u32, mac[k] as u32);
+    k = k + 1;
+  }
+  return 0;
+}
+
+// Boot-time self-test: build+parse a request and a reply (round-
+// tripping every field), then exercise the cache (insert, lookup,
+// lookup-miss, and update-in-place) -- direct port of
+// kernel_main.vani's own arp_self_test.
+fn arp_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let _ = arp_cache_reset();
+  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let _ = netif_get_mac_rpi4(mut ref my_mac);
+  let my_ip: u32 = 0xC0A80101 as u32;     // 192.168.1.1
+  let target_ip: u32 = 0xC0A80102 as u32; // 192.168.1.2
+
+  let req_frame: [u8; 512] = netif_zero_frame_rpi4();
+  let req_len: i64 = arp_build_request_rpi4(mut ref req_frame, ref my_mac, my_ip, target_ip);
+  if req_len != 42 { ok = 0; }
+  if arp_is_arp_frame_rpi4(ref req_frame) != 1 { ok = 0; }
+  if arp_get_operation_rpi4(ref req_frame) != (1 as u32) { ok = 0; }
+  if arp_get_sender_ip_rpi4(ref req_frame) != my_ip { ok = 0; }
+  if arp_get_target_ip_rpi4(ref req_frame) != target_ip { ok = 0; }
+  let req_sender_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let _ = arp_get_sender_mac_rpi4(ref req_frame, mut ref req_sender_mac);
+  let si: i64 = 0;
+  while si < 6 {
+    if req_sender_mac[si] != my_mac[si] { ok = 0; }
+    si = si + 1;
+  }
+
+  let peer_mac: [u8; 6] = [0x02 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0x02 as u8];
+  let reply_frame: [u8; 512] = netif_zero_frame_rpi4();
+  let reply_len: i64 = arp_build_reply_rpi4(mut ref reply_frame, ref peer_mac, target_ip, ref my_mac, my_ip);
+  if reply_len != 42 { ok = 0; }
+  if arp_get_operation_rpi4(ref reply_frame) != (2 as u32) { ok = 0; }
+  if arp_get_sender_ip_rpi4(ref reply_frame) != target_ip { ok = 0; }
+  if arp_get_target_ip_rpi4(ref reply_frame) != my_ip { ok = 0; }
+
+  // Cache exercise: miss, insert, hit, update-in-place.
+  let miss_out: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  if arp_cache_lookup_rpi4(target_ip, mut ref miss_out) != 0 { ok = 0; }
+
+  let _ = arp_cache_insert_rpi4(target_ip, ref peer_mac);
+  let hit_out: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  if arp_cache_lookup_rpi4(target_ip, mut ref hit_out) != 1 { ok = 0; }
+  if hit_out[5] != (0x02 as u8) { ok = 0; }
+
+  let updated_mac: [u8; 6] = [0x02 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0x09 as u8];
+  let _ = arp_cache_insert_rpi4(target_ip, ref updated_mac);
+  let updated_out: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  if arp_cache_lookup_rpi4(target_ip, mut ref updated_out) != 1 { ok = 0; }
+  if updated_out[5] != (0x09 as u8) { ok = 0; }
+  if arp_cache_get_count() != (1 as u32) { ok = 0; } // update-in-place, not a 2nd entry
+
+  let _ = uart_puts_rpi4_vani("ARP: build/parse round trip + cache insert/lookup/update");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
+fn arp_resolve_start_rpi4(my_mac: ref [u8; 6], my_ip: u32, target_ip: u32) -> i64 {
+  let req_frame: [u8; 512] = netif_zero_frame_rpi4();
+  let req_len: i64 = arp_build_request_rpi4(mut ref req_frame, my_mac, my_ip, target_ip);
+  return netif_send_frame_rpi4(ref req_frame, req_len);
+}
+
+// Dequeues the next queued frame and checks whether it's an ARP
+// reply resolving target_ip -- if so, caches it and returns 1.
+// Returns 0 otherwise (nothing queued, not ARP, not a reply, or a
+// different address) -- same "not every queued frame is mine, drop
+// it and move on" tolerance kernel_main.vani's own arp_resolve_poll
+// already documents.
+fn arp_resolve_poll_rpi4(target_ip: u32) -> i64 {
+  let frame: [u8; 512] = netif_zero_frame_rpi4();
+  let frame_len: i64 = netif_recv_frame_rpi4(mut ref frame, 512);
+  if frame_len < 0 {
+    return 0;
+  }
+  if arp_is_arp_frame_rpi4(ref frame) != 1 {
+    return 0;
+  }
+  if arp_get_operation_rpi4(ref frame) != (2 as u32) {
+    return 0;
+  }
+  if arp_get_sender_ip_rpi4(ref frame) != target_ip {
+    return 0;
+  }
+  let sender_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let _ = arp_get_sender_mac_rpi4(ref frame, mut ref sender_mac);
+  let _ = arp_cache_insert_rpi4(target_ip, ref sender_mac);
+  return 1;
+}
+
+// Boot-time self-test: no real second host exists in this loopback-
+// only environment, so this drains the request arp_resolve_start_
+// rpi4 queues on the real netif and sanity-checks it, then manually
+// builds a synthetic reply exactly as a real peer would and queues it
+// via the real netif, proving arp_resolve_poll_rpi4 picks it up and
+// updates the cache correctly -- plus the "nothing arrived yet" case.
+// Direct port of kernel_main.vani's own arp_resolve_self_test.
+fn arp_resolve_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let _ = netif_get_mac_rpi4(mut ref my_mac);
+  let my_ip: u32 = 0xC0A80101 as u32;
+  let target_ip: u32 = 0xC0A80105 as u32; // .5, not touched by arp_self_test_rpi4
+
+  let none_yet: i64 = arp_resolve_poll_rpi4(target_ip);
+  if none_yet != 0 {
+    ok = 0;
+  }
+
+  let start_status: i64 = arp_resolve_start_rpi4(ref my_mac, my_ip, target_ip);
+  if start_status != 0 {
+    ok = 0;
+  }
+
+  let req_check: [u8; 512] = netif_zero_frame_rpi4();
+  let req_check_len: i64 = netif_recv_frame_rpi4(mut ref req_check, 512);
+  if req_check_len < 0 { ok = 0; }
+  if arp_is_arp_frame_rpi4(ref req_check) != 1 { ok = 0; }
+  if arp_get_operation_rpi4(ref req_check) != (1 as u32) { ok = 0; }
+  if arp_get_target_ip_rpi4(ref req_check) != target_ip { ok = 0; }
+
+  // A peer (192.168.1.5) replying to our request.
+  let peer_mac: [u8; 6] = [0x02 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0x05 as u8];
+  let reply_frame: [u8; 512] = netif_zero_frame_rpi4();
+  let reply_len: i64 = arp_build_reply_rpi4(mut ref reply_frame, ref peer_mac, target_ip, ref my_mac, my_ip);
+  let send_status: i64 = netif_send_frame_rpi4(ref reply_frame, reply_len);
+  if send_status != 0 { ok = 0; }
+
+  let resolved: i64 = arp_resolve_poll_rpi4(target_ip);
+  if resolved != 1 { ok = 0; }
+  let looked_up: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let found: i64 = arp_cache_lookup_rpi4(target_ip, mut ref looked_up);
+  if found != 1 { ok = 0; }
+  if looked_up[5] != (0x05 as u8) { ok = 0; }
+
+  let _ = uart_puts_rpi4_vani("ARP: arp_resolve_start/poll live round trip");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
@@ -1245,6 +1603,8 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = preempt_init();
   let _ = sha256_self_test_rpi4();
   let _ = netif_self_test_rpi4();
+  let _ = arp_self_test_rpi4();
+  let _ = arp_resolve_self_test_rpi4();
   return 0;
 }
 
@@ -1484,11 +1844,11 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, netif, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, netif, arp, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 86 minimal shell + crypto + netif\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 87 minimal shell + crypto + netif + arp\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
@@ -1503,6 +1863,12 @@ fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("netif") == (1 as u32) {
     let _ = uart_puts_rpi4_vani("\n");
     let _ = netif_self_test_rpi4();
+    return 0;
+  }
+  if rpi4_shell_line_matches("arp") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = arp_self_test_rpi4();
+    let _ = arp_resolve_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_starts_with("echo ") == (1 as u32) {
