@@ -3495,6 +3495,64 @@ than assumed:
   (client+server), PKI, X25519/Ed25519/ChaCha20-Poly1305, TLS 1.3, SSH
   transport, and SSH-shell integration remain the next Phase A steps,
   none started.
+
+  **ROUND 88 UPDATE, 2026-09-06**: Phase A step 3 -- a real shared
+  IPv4 header module + the packet filter, both built on rounds 86-87.
+  Correction to this scope's own earlier assumption: kernel_main.vani
+  DOES already have a real, shared `ipv4_*` module (TCP calls it
+  directly for header construction) -- only DHCP/raw UDP build their
+  own IP framing inline. Direct, unabridged port of `ipv4_checksum`/
+  `ipv4_build_header`/`ipv4_get_*`/`ipv4_verify_checksum`/`ipv4_send`
+  and `filter_check_frame`/`fw_add_rule`/`filter_self_test`/
+  `filter_outgoing_self_test`, same 20-byte header (no IP options)
+  and same 8-slot first-match-wins rule table. New `boot/rpi4/
+  filter_state.S` mirrors `arp_state.S`'s shape; AAPCS64's 8 argument
+  registers make `filter_add_rule` (6 args) simpler than Pi 1's own
+  ARM32 `fw_add_rule`, which needed 2 stack-spilled args and, in a
+  real round-72 bug, extra unsaved scratch registers -- neither
+  hazard exists here. `filter_check_frame_rpi4` is wired into BOTH
+  `netif_send_frame_rpi4` (egress) and `netif_recv_frame_rpi4`
+  (ingress), the same single-choke-point design as Pi 1.
+
+  Two tiny stub accessors (`tcp_get_dst_port_rpi4`/`udp_get_dst_
+  port_rpi4`, a 2-byte fixed-offset read each) give the filter its
+  dst_port matching without needing full TCP/UDP modules yet (neither
+  exists on this port -- TCP is Phase A step 4).
+
+  Real design snag hit and fixed at compile time, not live: vani has
+  no reborrow from a `mut ref T` parameter to a plain `ref T` (a
+  `mut ref` value can't be passed anywhere a `ref` is wanted, even
+  though it's a strictly MORE permissive access -- confirmed via a
+  standalone probe and logged as a 3rd entry in `vani-compiler/docs/
+  DHRUVAOS_ERGONOMICS_TODO.md`). Hit twice: (1) `ipv4_build_header_
+  rpi4` holds `frame` as `mut ref` and needed to read it back for the
+  checksum -- fixed by inlining the read instead of delegating to a
+  `ref`-only helper, and standardizing `ipv4_checksum_rpi4`/`ipv4_
+  verify_checksum_rpi4` on `mut ref`; (2) `netif_recv_frame_rpi4`'s
+  own `out` parameter (`mut ref`) couldn't be handed to the (correctly
+  read-only) filter hook -- fixed by reading into a fresh local array
+  first, filtering that, and only copying into `out` if the filter
+  allows it (one extra 512-byte copy per receive call). Neither is a
+  vani-compiler BUG (the type system caught something structurally
+  real -- you can't manufacture read access to something you don't
+  actually have handed to you at that reference kind), just a real
+  ergonomics gap in how much of that has to be worked around by hand.
+
+  Wired into `kmain_rpi4_vani` (boot-time self-test -- `filter_set_
+  default_policy(1)` explicitly BEFORE `netif_self_test_rpi4`, same
+  ordering fix kernel_main.vani's own boot sequence needed, for the
+  identical reason: `.bss` zero-init default-denies everything until
+  set otherwise, which would break every earlier self-test that
+  touches netif) and two new shell commands, `ip` and `filter`.
+  Worked correctly on the very first REAL build (after the reborrow
+  fixes above, caught by `vanic check` before ever reaching QEMU) --
+  no live debugging needed. `test/rpi4_shell_smoke.py` updated for
+  the new `help`/`ver` text and `ip`/`filter` command checks; all 8
+  Pi 4 smoke tests pass; zero Pi 1 files touched.
+
+  **Not done**: TCP, DHCP (client+server), PKI, X25519/Ed25519/
+  ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell integration
+  remain the next Phase A steps, none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
