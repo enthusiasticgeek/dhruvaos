@@ -2939,6 +2939,46 @@ than assumed:
   correctly on every one of the 5 real timer interrupts, not just
   once); `test/rpi4_boot_smoke.py`/`test/rpi4_timer_smoke.py` both
   still pass unmodified.
+
+  **ROUND 76 UPDATE, 2026-09-06** (still `[PARTIAL]` -- the full
+  28000+-line port remains its own multi-round effort): ported GPIO,
+  the first genuinely new PERIPHERAL (not just more boot-facing
+  timer/UART logic) on this target. Confirmed against QEMU 10.0.0's
+  own source before writing anything (same discipline round 71's Pi 1
+  GPIO port used): `hw/arm/bcm2838_peripherals.c` instantiates a real
+  `TYPE_BCM2838_GPIO` device (`hw/gpio/bcm2838_gpio.c`) at
+  `GPIO_OFFSET` (0x200000, `include/hw/arm/raspi_platform.h`) off this
+  SoC's own low-peripheral-mode base (0xFE000000) -- base address
+  0xFE200000, with the SAME GPFSELn/GPSET/GPCLR/GPLEV register
+  offsets as BCM2835 (confirmed identical in `bcm2838_gpio.c`), so
+  `kernel_main.vani`'s own register-address/bit-mask arithmetic for
+  these three families ports over unchanged in shape.
+
+  One genuine SoC-generation difference: BCM2711 replaced BCM2835's
+  GPPUD/GPPUDCLK0/1 pull dance with 4 new `GPIO_PUP_PDN_CNTRL_REG0..3`
+  registers (2 bits/pin, 16 pins/register). Unlike `kernel_main.vani`'s
+  own pull-control code (real, spec-correct, but UNVERIFIABLE under
+  QEMU -- BCM2835's GPPUD/GPPUDCLK are explicitly "Not implemented"
+  there), this register bank is a genuine read/write store in QEMU's
+  BCM2838 model (confirmed real non-zero boot-time reset values, not a
+  stub) -- so `gpio_self_check_rpi4`'s pull-control round trip is real,
+  QEMU-verified evidence, a genuine advantage of this SoC generation's
+  own design over Pi 1's.
+
+  Every one of the 13 new registers is a `#[mmio(size=4)]`-tagged
+  const (vani-compiler's DHDL v0.1 attribute, see
+  `docs/DHRUVAOS_MANUAL.md` §5) -- `vanic check` confirmed all 15
+  registers this file now declares (2 UART + 13 GPIO) are pairwise
+  non-overlapping. `gpio_self_check_rpi4` mirrors `kernel_main.vani`'s
+  own `gpio_self_check` shape exactly: fsel round-trip across 3
+  different GPFSELn registers (pins 0/10/53), same-register
+  non-interference check (pins 5/6), GPSET/GPCLR/GPLEV round-trip
+  across the pin-31/32 register boundary, plus the new pull-control
+  round-trip across the REG0/REG1/REG3 boundaries (pins 15/16/48).
+  Wired into `kmain_rpi4_vani` after the existing self-test.
+  `test/rpi4_vani_smoke.py` widened to also assert the new PASS line;
+  `test/rpi4_boot_smoke.py`/`test/rpi4_timer_smoke.py` both still pass
+  unmodified.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

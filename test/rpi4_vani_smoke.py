@@ -14,6 +14,14 @@ once at boot, the way round 74's own kmain_rpi4_vani proof was) --
 checking for 5 distinct tick prints plus the halt message proves vani
 code keeps executing correctly across repeated, interrupt-driven
 invocations, not just a single one-shot boot-time call.
+
+Round 76 widened this again to cover gpio_self_check_rpi4 -- the
+first Pi 4/5 kernel-port increment past the toolchain-proof/timer-IRQ
+pair, live-verifying GPFSELn/GPSET/GPCLR/GPLEV register-address/
+bit-mask arithmetic plus BCM2711's own PUP_PDN_CNTRL pull-control
+registers (genuinely QEMU-modeled, unlike kernel_main.vani's own
+BCM2835 GPPUD/GPPUDCLK equivalent) against QEMU's real BCM2838 GPIO
+device model.
 """
 
 import argparse
@@ -25,6 +33,10 @@ MACHINE = "raspi4b"
 DEFAULT_TIMEOUT_S = 8
 EXPECT_PASS = "vani-compiled code self-test (sum 1..100 + division) (PASS)"
 EXPECT_VALUES = "sum=5050 quotient=14285 remainder=5"
+EXPECT_GPIO_PASS = (
+    "GPIO function-select + GPSET/GPCLR/GPLEV + pull-control round trip "
+    "(BCM2711 registers, QEMU-modeled) (PASS)"
+)
 EXPECT_TICK_COUNT = 5
 EXPECT_HALT = "5 real timer IRQs handled, halting"
 
@@ -69,18 +81,20 @@ def main() -> int:
     ok = (
         EXPECT_PASS in output
         and EXPECT_VALUES in output
+        and EXPECT_GPIO_PASS in output
         and tick_count == EXPECT_TICK_COUNT
         and EXPECT_HALT in output
     )
     if ok:
         print(f"\n[rpi4_vani_smoke.py] PASS -- boot-time vani self-test PASSed "
-              f"with the exact correct computed values, and the interrupt-driven "
-              f"vani code (rpi4_handle_timer_irq) ran correctly on all "
+              f"with the exact correct computed values, gpio_self_check_rpi4 "
+              f"PASSed, and the interrupt-driven vani code "
+              f"(rpi4_handle_timer_irq) ran correctly on all "
               f"{EXPECT_TICK_COUNT} real timer ticks then halted.", file=sys.stderr)
         return 0
     print(f"\n[rpi4_vani_smoke.py] FAIL -- expected {EXPECT_PASS!r}, "
-          f"{EXPECT_VALUES!r}, {EXPECT_TICK_COUNT} tick prints (saw "
-          f"{tick_count}), and {EXPECT_HALT!r}.", file=sys.stderr)
+          f"{EXPECT_VALUES!r}, {EXPECT_GPIO_PASS!r}, {EXPECT_TICK_COUNT} tick "
+          f"prints (saw {tick_count}), and {EXPECT_HALT!r}.", file=sys.stderr)
     return 1
 
 

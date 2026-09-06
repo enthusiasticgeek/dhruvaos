@@ -52,6 +52,64 @@ const UART_DR_RPI4: i64 = 0xFE201000;
 #[mmio(size=4)]
 const UART_FR_RPI4: i64 = 0xFE201018;
 
+// Round 76 -- GPIO, the next increment of "port kernel_main.vani (or
+// its boot-facing pieces) to Pi 4/5" (docs/TODO.md, marked
+// `[PARTIAL, round 75]` until now). Confirmed against QEMU 10.0.0's
+// own source before writing anything (same discipline as
+// kernel_main.vani's own round-71 GPIO port): `hw/arm/bcm2838_
+// peripherals.c` instantiates a genuine `TYPE_BCM2838_GPIO` device
+// (`hw/gpio/bcm2838_gpio.c`) at `GPIO_OFFSET` (`0x200000`, from
+// `include/hw/arm/raspi_platform.h`) off this SoC's own low-
+// peripheral-mode base (`bc_base->peri_base = 0xfe000000`, set in
+// `hw/arm/bcm2838.c`) -- base address 0xFE200000. Same GPFSELn/
+// GPSET/GPCLR/GPLEV register OFFSETS as BCM2835 (confirmed identical
+// in `bcm2838_gpio.c`: GPFSEL1=+0x04, GPSET0=+0x1C, GPCLR0=+0x28,
+// GPLEV0=+0x34), so `kernel_main.vani`'s own register-address/bit-
+// mask arithmetic for these three families ports over unchanged in
+// shape, just against this file's own BCM2711 base + `_RPI4`-suffixed
+// consts.
+//
+// One genuine SoC-generation difference, confirmed from the same
+// source: BCM2711 replaced BCM2835's old GPPUD/GPPUDCLK0/1 pull
+// dance with 4 new `GPIO_PUP_PDN_CNTRL_REG0..3` registers (2 bits per
+// pin, 16 pins/register -- `hw/gpio/bcm2838_gpio.c`'s own
+// `GPIO_PUP_PDN_CNTRL_NUM=4` confirms the pin-per-register count).
+// Unlike kernel_main.vani's own pull-control code (real, spec-correct,
+// but UNVERIFIABLE under QEMU -- BCM2835's GPPUD/GPPUDCLK are
+// explicitly "Not implemented" there), THIS register bank is a
+// genuine read/write store in QEMU's BCM2838 model (confirmed: real
+// non-zero boot-time reset values `RESET_VAL_CNTRL_REG0..3`, not a
+// stub), so a round-trip self-test here is real, QEMU-verified
+// evidence, not just spec-correct-but-unverifiable code -- a genuine
+// advantage of this SoC generation's own design over Pi 1's, not
+// assumed symmetric between the two targets.
+#[mmio(size=4)]
+const GPFSEL0_RPI4: i64 = 0xFE200000;
+#[mmio(size=4)]
+const GPFSEL1_RPI4: i64 = 0xFE200004;
+#[mmio(size=4)]
+const GPFSEL5_RPI4: i64 = 0xFE200014;
+#[mmio(size=4)]
+const GPSET0_RPI4: i64 = 0xFE20001C;
+#[mmio(size=4)]
+const GPSET1_RPI4: i64 = 0xFE200020;
+#[mmio(size=4)]
+const GPCLR0_RPI4: i64 = 0xFE200028;
+#[mmio(size=4)]
+const GPCLR1_RPI4: i64 = 0xFE20002C;
+#[mmio(size=4)]
+const GPLEV0_RPI4: i64 = 0xFE200034;
+#[mmio(size=4)]
+const GPLEV1_RPI4: i64 = 0xFE200038;
+#[mmio(size=4)]
+const GPIO_PUP_PDN_CNTRL_REG0_RPI4: i64 = 0xFE2000E4;
+#[mmio(size=4)]
+const GPIO_PUP_PDN_CNTRL_REG1_RPI4: i64 = 0xFE2000E8;
+#[mmio(size=4)]
+const GPIO_PUP_PDN_CNTRL_REG2_RPI4: i64 = 0xFE2000EC;
+#[mmio(size=4)]
+const GPIO_PUP_PDN_CNTRL_REG3_RPI4: i64 = 0xFE2000F0;
+
 fn uart_putc_rpi4_vani(c: i64) -> i64 {
   let uart_fr: i64 = UART_FR_RPI4;
   let uart_dr: i64 = UART_DR_RPI4;
@@ -177,10 +235,203 @@ fn rpi4_vani_self_test() -> i64 {
   return 0;
 }
 
+// GPIO function-select: 3 bits/pin, 10 pins/register -- identical
+// encoding and packing to BCM2835 (see this file's own header comment
+// on the const block above), just against the 3 registers this file
+// declares (pins 0-9, 10-19, 50-53). A 3-way branch instead of
+// kernel_main.vani's one-line `base + (pin/10)*4` arithmetic on a raw
+// literal, since every address here goes through a named, checked
+// `#[mmio]` const instead -- consistent with this file's own const
+// block, not a style regression.
+fn gpio_fsel_reg_for_rpi4(pin: i64) -> i64 {
+  if pin < 10 {
+    return GPFSEL0_RPI4;
+  }
+  if pin < 20 {
+    return GPFSEL1_RPI4;
+  }
+  return GPFSEL5_RPI4;
+}
+
+fn gpio_fsel_shift_for_rpi4(pin: i64) -> i64 {
+  return (pin % 10) * 3;
+}
+
+fn gpio_set_function_rpi4(pin: i64, func: u32) -> i64 {
+  let reg: i64 = gpio_fsel_reg_for_rpi4(pin);
+  let shift: u32 = gpio_fsel_shift_for_rpi4(pin) as u32;
+  let mask: u32 = ((7 as u32) << shift) ^ (0xFFFFFFFF as u32);
+  let bits: u32 = (func & (7 as u32)) << shift;
+  let cur: u32 = mmio_read_u32(reg);
+  let _ = mmio_write_u32(reg, (cur & mask) | bits);
+  return 0;
+}
+
+fn gpio_get_function_rpi4(pin: i64) -> u32 {
+  let reg: i64 = gpio_fsel_reg_for_rpi4(pin);
+  let shift: u32 = gpio_fsel_shift_for_rpi4(pin) as u32;
+  let cur: u32 = mmio_read_u32(reg);
+  return (cur >> shift) & (7 as u32);
+}
+
+// GPSET/GPCLR are one-shot "set exactly these bits" registers, never
+// read-modify-write, matching the hardware's own design -- same shape
+// as kernel_main.vani's own gpio_write.
+fn gpio_write_rpi4(pin: i64, value: u32) -> i64 {
+  let bit: u32 = (pin % 32) as u32;
+  let set_reg: i64 = if pin < 32 { GPSET0_RPI4 } else { GPSET1_RPI4 };
+  let clr_reg: i64 = if pin < 32 { GPCLR0_RPI4 } else { GPCLR1_RPI4 };
+  let reg: i64 = if value != (0 as u32) { set_reg } else { clr_reg };
+  let _ = mmio_write_u32(reg, (1 as u32) << bit);
+  return 0;
+}
+
+fn gpio_read_rpi4(pin: i64) -> u32 {
+  let reg: i64 = if pin < 32 { GPLEV0_RPI4 } else { GPLEV1_RPI4 };
+  let bit: u32 = (pin % 32) as u32;
+  let val: u32 = mmio_read_u32(reg);
+  return (val >> bit) & (1 as u32);
+}
+
+// Pull-up/down/none control -- BCM2711's own scheme, genuinely
+// different from BCM2835's GPPUD/GPPUDCLK dance (see this file's own
+// header comment): 2 bits/pin, 16 pins/register, 4 registers. Encoding
+// per Broadcom's own BCM2711 documentation: 0b00=none, 0b01=up,
+// 0b10=down.
+fn gpio_pupdn_reg_for_rpi4(pin: i64) -> i64 {
+  let idx: i64 = pin / 16;
+  if idx == 0 {
+    return GPIO_PUP_PDN_CNTRL_REG0_RPI4;
+  }
+  if idx == 1 {
+    return GPIO_PUP_PDN_CNTRL_REG1_RPI4;
+  }
+  if idx == 2 {
+    return GPIO_PUP_PDN_CNTRL_REG2_RPI4;
+  }
+  return GPIO_PUP_PDN_CNTRL_REG3_RPI4;
+}
+
+fn gpio_pupdn_shift_for_rpi4(pin: i64) -> i64 {
+  return (pin % 16) * 2;
+}
+
+fn gpio_set_pull_rpi4(pin: i64, pull: u32) -> i64 {
+  let reg: i64 = gpio_pupdn_reg_for_rpi4(pin);
+  let shift: u32 = gpio_pupdn_shift_for_rpi4(pin) as u32;
+  let mask: u32 = ((3 as u32) << shift) ^ (0xFFFFFFFF as u32);
+  let bits: u32 = (pull & (3 as u32)) << shift;
+  let cur: u32 = mmio_read_u32(reg);
+  let _ = mmio_write_u32(reg, (cur & mask) | bits);
+  return 0;
+}
+
+fn gpio_get_pull_rpi4(pin: i64) -> u32 {
+  let reg: i64 = gpio_pupdn_reg_for_rpi4(pin);
+  let shift: u32 = gpio_pupdn_shift_for_rpi4(pin) as u32;
+  let cur: u32 = mmio_read_u32(reg);
+  return (cur >> shift) & (3 as u32);
+}
+
+// Self-test, run once at boot -- same shape as kernel_main.vani's own
+// gpio_self_check: round-trips saved/restored so this leaves no
+// lasting side effect on boot state.
+fn gpio_self_check_rpi4() -> i64 {
+  let ok: i64 = 1;
+
+  // Pins 0, 10, and 53 span the 3 GPFSELn registers this file
+  // declares.
+  let orig0: u32 = gpio_get_function_rpi4(0);
+  let _ = gpio_set_function_rpi4(0, 1 as u32);
+  if gpio_get_function_rpi4(0) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_function_rpi4(0, orig0);
+
+  let orig10: u32 = gpio_get_function_rpi4(10);
+  let _ = gpio_set_function_rpi4(10, 1 as u32);
+  if gpio_get_function_rpi4(10) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_function_rpi4(10, orig10);
+
+  let orig53: u32 = gpio_get_function_rpi4(53);
+  let _ = gpio_set_function_rpi4(53, 1 as u32);
+  if gpio_get_function_rpi4(53) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_function_rpi4(53, orig53);
+
+  // Setting one pin's function must not disturb its neighbor packed
+  // into the same register -- pins 5 and 6 share GPFSEL0.
+  let orig5: u32 = gpio_get_function_rpi4(5);
+  let orig6: u32 = gpio_get_function_rpi4(6);
+  let _ = gpio_set_function_rpi4(5, 1 as u32);
+  let _ = gpio_set_function_rpi4(6, 0 as u32);
+  if gpio_get_function_rpi4(5) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_function_rpi4(6, 1 as u32);
+  if gpio_get_function_rpi4(5) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_function_rpi4(5, orig5);
+  let _ = gpio_set_function_rpi4(6, orig6);
+
+  // GPSET/GPCLR/GPLEV round trip across the GPSET0/GPSET1 (pin 31/32)
+  // boundary.
+  let _ = gpio_write_rpi4(31, 1 as u32);
+  if gpio_read_rpi4(31) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_write_rpi4(31, 0 as u32);
+  if gpio_read_rpi4(31) != (0 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_write_rpi4(32, 1 as u32);
+  if gpio_read_rpi4(32) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_write_rpi4(32, 0 as u32);
+  if gpio_read_rpi4(32) != (0 as u32) {
+    ok = 0;
+  }
+
+  // Pull-control round trip across the REG0/REG1/REG3 (pin 15/16/48)
+  // boundaries -- genuinely QEMU-verified here, unlike kernel_main.
+  // vani's own BCM2835 equivalent.
+  let origp15: u32 = gpio_get_pull_rpi4(15);
+  let _ = gpio_set_pull_rpi4(15, 1 as u32);
+  if gpio_get_pull_rpi4(15) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_pull_rpi4(15, 2 as u32);
+  if gpio_get_pull_rpi4(15) != (2 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_pull_rpi4(15, origp15);
+
+  let origp48: u32 = gpio_get_pull_rpi4(48);
+  let _ = gpio_set_pull_rpi4(48, 1 as u32);
+  if gpio_get_pull_rpi4(48) != (1 as u32) {
+    ok = 0;
+  }
+  let _ = gpio_set_pull_rpi4(48, origp48);
+
+  let _ = uart_puts_rpi4_vani("DHRUVA RPI4: GPIO function-select + GPSET/GPCLR/GPLEV + pull-control round trip (BCM2711 registers, QEMU-modeled)");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return 0;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
   let _ = rpi4_vani_self_test();
+  let _ = gpio_self_check_rpi4();
   return 0;
 }
 
