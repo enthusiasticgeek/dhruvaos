@@ -3132,6 +3132,31 @@ than assumed:
   **Still not started**: priorities, more than 2 tasks, and any
   voluntary sleep/mutex primitive -- this round proves preemption
   itself works, not a general scheduler policy on top of it.
+
+  **ROUND 80 UPDATE, 2026-09-06** (still `[PARTIAL]`): generalized
+  round 79's hardcoded 2-task toggle into real NUM_TASKS-way (3) round
+  robin -- the natural next increment mirroring Pi 1's own historical
+  arc (2-task round robin -> N fixed-priority tasks -> priority
+  ceiling protocol -> general task-creation API). `current_task`/
+  `pt_sp_table` generalized from 3 fixed slots (A/B/boot) to
+  `NUM_TASKS+1` (3 tasks + boot); the switch decision generalized from
+  a single toggle bit to `(current+1) mod NUM_TASKS`, with wraparound
+  back to task 0 confirmed live (task_c correctly hands off to task_a
+  again, not stuck or corrupted). New `preempt_task_c_entry`
+  (`kernel_main_rpi4.vani`), same non-yielding/timer-only-preempted
+  shape as the other two. Zero changes to the frame format or the
+  core save/restore mechanism itself -- this was purely a policy
+  generalization on top of round 79's already-correct primitive.
+
+  Live-verified: boot->A(tick1)->B(tick2)->C(tick3)->A(tick4,
+  wrapped)->boot(tick5, forced) -- exactly the expected round-robin
+  sequence including the wraparound. `test/rpi4_preempt_smoke.py`
+  updated for the 3-task pattern, reliable across repeated runs. All
+  5 pre-existing Pi 4 smoke tests still pass unmodified; zero Pi 1
+  files touched.
+
+  **Still not started**: priorities (all 3 tasks are still equal-
+  weight round robin) and any voluntary sleep/mutex primitive.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

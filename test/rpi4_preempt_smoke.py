@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Dhruva round 79: interrupt-driven preemption on the Pi 4/5 port --
-boot/rpi4/preempt_switch.S's own header comment has the full design.
-Unlike round 78's cooperative task_switch (a voluntary, `ret`-based
-swap), this is driven entirely by the real timer: two tasks that never
-yield are genuinely preempted by aarch64_irq_handler and resumed via
-`eret`, including correctly restoring ELR_EL1/SPSR_EL1 per task (the
-one thing round 78 never needed to handle).
+"""Dhruva round 79/80: interrupt-driven preemption on the Pi 4/5 port
+-- boot/rpi4/preempt_switch.S's own header comment has the full
+design. Unlike round 78's cooperative task_switch (a voluntary,
+`ret`-based swap), this is driven entirely by the real timer: tasks
+that never yield are genuinely preempted by aarch64_irq_handler and
+resumed via `eret`, including correctly restoring ELR_EL1/SPSR_EL1
+per task (the one thing round 78 never needed to handle). Round 80
+generalized round 79's hardcoded 2-task toggle into real NUM_TASKS-way
+(3) round robin.
 
 Checks three things, each independently meaningful:
-1. Both 'A' and 'B' appear, in alternating ticks (real preemption
-   happened between two DIFFERENT tasks, not just one running
-   forever).
-2. The exact tick-by-tick alternation pattern (task_a on odd ticks,
-   task_b on even ticks) -- not just "both letters appear somewhere."
+1. All three of 'A'/'B'/'C' appear, one per tick, on ticks 1-4 (real
+   preemption happened across multiple DIFFERENT tasks, not just one
+   running forever).
+2. The exact tick-by-tick round-robin pattern (task_a, task_b,
+   task_c, task_a again -- confirming the wraparound back to task 0
+   works, not just "both/all letters appear somewhere").
 3. "boot context resumed after preemption demo (PASS)" prints AFTER
    the halt message -- this can only happen if boot's own saved
    context (captured once, on tick 1, and never touched again until
-   tick 5's forced switch) was preserved correctly through the WHOLE
-   demo and correctly resumed at the end; a broken save/restore
-   crashes or hangs rather than reaching this line with the wrong
-   ELR_EL1/SPSR_EL1.
+   the final tick's forced switch) was preserved correctly through
+   the WHOLE demo and correctly resumed at the end; a broken
+   save/restore crashes or hangs rather than reaching this line with
+   the wrong ELR_EL1/SPSR_EL1.
 """
 
 import re
@@ -61,9 +64,9 @@ def main() -> int:
 
     # Pull the letters printed right after each "tick=N" up to the
     # next "DHRUVA RPI4:" line -- tick 5 has none (halts immediately).
-    ticks = re.findall(r"tick=(\d)([AB]*)\n", output)
+    ticks = re.findall(r"tick=(\d)([ABC]*)\n", output)
     tick_letters = {int(n): letters for n, letters in ticks}
-    expected_letter = {1: "A", 2: "B", 3: "A", 4: "B"}
+    expected_letter = {1: "A", 2: "B", 3: "C", 4: "A"}
     alternation_ok = all(
         tick_letters.get(n, "").startswith(letter) and set(tick_letters.get(n, "")) == {letter}
         for n, letter in expected_letter.items()
@@ -72,9 +75,11 @@ def main() -> int:
     ok = alternation_ok and EXPECT_HALT in output and EXPECT_RESUMED in output and not has_fault
 
     if ok:
-        print(f"\n[rpi4_preempt_smoke.py] PASS -- ticks 1-4 alternated task_a/task_b "
-              f"exactly as expected (A,B,A,B), the timer disabled cleanly on tick 5, "
-              f"and boot's own context resumed correctly afterward.", file=sys.stderr)
+        print(f"\n[rpi4_preempt_smoke.py] PASS -- ticks 1-4 round-robined "
+              f"task_a/task_b/task_c exactly as expected (A,B,C,A -- confirming "
+              f"the wraparound back to task_a), the timer disabled cleanly on "
+              f"tick 5, and boot's own context resumed correctly afterward.",
+              file=sys.stderr)
         return 0
     print(f"\n[rpi4_preempt_smoke.py] FAIL -- tick_letters={tick_letters!r}, "
           f"alternation_ok={alternation_ok}, halt={EXPECT_HALT in output}, "

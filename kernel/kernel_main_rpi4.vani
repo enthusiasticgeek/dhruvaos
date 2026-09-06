@@ -712,6 +712,18 @@ fn preempt_task_b_entry() -> i64 {
   return 0;
 }
 
+// Round 80: third task, generalizing round 79's hardcoded A<->B
+// toggle into real NUM_TASKS-way round robin (boot/rpi4/preempt_
+// switch.S's own header comment has the full design).
+#[no_mangle]
+fn preempt_task_c_entry() -> i64 {
+  while true {
+    let _ = uart_putc_rpi4_vani(67); // 'C'
+    let _ = preempt_delay();
+  }
+  return 0;
+}
+
 // Called from boot.S's own heartbeat_loop, right after every `wfi`
 // wakeup. During ticks 1-4, this instruction never actually executes
 // -- rpi4_preempt_switch's `eret` on those ticks resumes task_a/

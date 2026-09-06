@@ -31,45 +31,54 @@
  * cross-context resumption becomes possible.)
  *
  * SPSR_EL1's value (0x60000345) is NOT hand-derived from the ARM ARM
- * -- it was captured LIVE from a real timer interrupt during this
- * round's own investigation (a temporary debug print inside aarch64_
+ * -- it was captured LIVE from a real timer interrupt during round
+ * 79's own investigation (a temporary debug print inside aarch64_
  * irq_handler, since ELR_EL1/SPSR_EL1 are only meaningful while an
  * exception is live, removed once captured): M[3:0]=0b0101 (EL1h,
  * matching boot.S's own EL3->EL1 drop target), DAIF=0b1101 (D/A/F
  * masked, I unmasked -- exactly matching boot.S's `msr daifclr, #2`,
- * which clears only the I bit). Used verbatim for both fake frames so
+ * which clears only the I bit). Used verbatim for every fake frame so
  * a freshly "resumed" task starts with interrupts enabled the same
  * way any genuinely-running task already does -- otherwise it could
  * never itself be preempted again.
  *
- * current_task / pt_sp_table: index 0=task_a, 1=task_b, 2=boot.
- * preempt_init seeds current_task=2 (boot) -- not .bss's own zero
- * default, which would incorrectly mean "task_a" and cause the FIRST
- * real switch to save boot's own interrupted frame into task_a's slot
- * (clobbering its carefully-built fake frame) instead of boot's own.
- * boot's slot is populated implicitly, not by an explicit init call:
- * the very first timer tick's own rpi4_preempt_switch call saves
- * whatever boot's real sp happened to be (deep inside its own `wfi`
- * spin) into pt_sp_table[2] as a natural side effect of "always save
+ * Round 80 -- generalized from round 79's hardcoded 2-task toggle to
+ * NUM_TASKS-way round robin (3 tasks: task_a/b/c), the natural next
+ * increment mirroring Pi 1's own historical arc (2-task round robin
+ * -> N fixed-priority tasks -> priority ceiling protocol -> general
+ * task-creation API) -- still no priorities, still exactly the same
+ * proven switch mechanism, just a modulo counter instead of a single
+ * toggle bit. current_task / pt_sp_table: index 0..NUM_TASKS-1 are
+ * the real tasks, index NUM_TASKS is boot. preempt_init seeds
+ * current_task=NUM_TASKS (boot) -- not .bss's own zero default, which
+ * would incorrectly mean "task_a" and cause the FIRST real switch to
+ * save boot's own interrupted frame into task_a's slot (clobbering
+ * its carefully-built fake frame) instead of boot's own. boot's slot
+ * is populated implicitly, not by an explicit init call: the very
+ * first timer tick's own rpi4_preempt_switch call saves whatever
+ * boot's real sp happened to be (deep inside its own `wfi` spin) into
+ * pt_sp_table[NUM_TASKS] as a natural side effect of "always save
  * current before deciding next" -- exactly the same mechanism that
- * later saves task_a's or task_b's own frame on every subsequent
- * tick. No special one-time "bootstrap the first switch" code exists
- * anywhere in this file; the general case already covers it.
+ * later saves any task's own frame on every subsequent tick. No
+ * special one-time "bootstrap the first switch" code exists anywhere
+ * in this file; the general case already covers it.
  */
 .section ".bss"
 .align 4
 /* Starts at 0 (.bss's own zero default -- a nonzero initializer isn't
- * allowed in .bss) but preempt_init explicitly overwrites this to 2
- * (boot) before returning, well before the timer is ever armed, so
- * the "really 0 until then" window is never observable. */
+ * allowed in .bss) but preempt_init explicitly overwrites this to
+ * NUM_TASKS (boot) before returning, well before the timer is ever
+ * armed, so the "really 0 until then" window is never observable. */
 current_task: .word 0
 .align 4
-pt_sp_table: .quad 0, 0, 0
+pt_sp_table: .quad 0, 0, 0, 0
 .align 4
 pt_a_stack: .space 1024
 pt_a_stack_top:
 pt_b_stack: .space 1024
 pt_b_stack_top:
+pt_c_stack: .space 1024
+pt_c_stack_top:
 .align 4
 heartbeat_printed: .word 0
 
@@ -78,24 +87,27 @@ heartbeat_printed: .word 0
 .equ PT_FRAME_SIZE, 272
 .equ PT_ELR_OFF, 248
 .equ PT_SPSR_OFF, 256
+.equ NUM_TASKS, 3
+.equ PT_BOOT_INDEX, 3
 
-/* i64 preempt_init(void) -- builds both tasks' fake interrupt-shaped
- * frames and seeds current_task=2 (boot). Called once from
+/* i64 preempt_init(void) -- builds all NUM_TASKS fake interrupt-shaped
+ * frames and seeds current_task=PT_BOOT_INDEX. Called once from
  * kernel_main_rpi4.vani's own kmain_rpi4_vani, before boot.S ever
  * arms the timer. */
 .global preempt_init
 preempt_init:
     stp x29, x30, [sp, #-16]!
 
+    movz x2, #0x0345
+    movk x2, #0x6000, lsl #16
+    adrp x3, pt_sp_table
+    add x3, x3, :lo12:pt_sp_table
+
     ldr x0, =pt_a_stack_top
     sub x0, x0, #PT_FRAME_SIZE
     adr x1, preempt_task_a_entry
     str x1, [x0, #PT_ELR_OFF]
-    movz x2, #0x0345
-    movk x2, #0x6000, lsl #16
     str x2, [x0, #PT_SPSR_OFF]
-    adrp x3, pt_sp_table
-    add x3, x3, :lo12:pt_sp_table
     str x0, [x3, #0]
 
     ldr x0, =pt_b_stack_top
@@ -105,7 +117,14 @@ preempt_init:
     str x2, [x0, #PT_SPSR_OFF]
     str x0, [x3, #8]
 
-    mov w4, #2
+    ldr x0, =pt_c_stack_top
+    sub x0, x0, #PT_FRAME_SIZE
+    adr x1, preempt_task_c_entry
+    str x1, [x0, #PT_ELR_OFF]
+    str x2, [x0, #PT_SPSR_OFF]
+    str x0, [x3, #16]
+
+    mov w4, #PT_BOOT_INDEX
     adrp x5, current_task
     add x5, x5, :lo12:current_task
     str w4, [x5]
@@ -119,15 +138,14 @@ preempt_init:
  * halt-vs-rearm decision -- force_boot is that decision's own return
  * value (1 on the halting tick, 0 otherwise), not computed here.
  * Always saves current_sp into whichever slot current_task currently
- * names, THEN decides the next slot: force_boot=1 always goes to 2
- * (boot) and stays there permanently (nothing ever un-disables the
- * timer, so no interrupt will ever call this again after); otherwise
- * toggles 0<->1 (A<->B), with "was boot" (2) also going to 0 -- the
- * one-time transition into the demo, exactly like round 78's own
- * boot-context concept, just reached implicitly instead of via an
- * explicit start call. Returns the next slot's saved sp, which the
- * caller loads into sp before restoring ELR_EL1/SPSR_EL1/x0-x30 and
- * `eret`-ing into it. */
+ * names, THEN decides the next slot: force_boot=1 always goes to
+ * PT_BOOT_INDEX and stays there permanently (nothing ever
+ * un-disables the timer, so no interrupt will ever call this again
+ * after); otherwise advances 0->1->2->0->... (round robin), with
+ * "was boot" also going to 0 -- the one-time transition into the
+ * demo, reached implicitly rather than via an explicit start call.
+ * Returns the next slot's saved sp, which the caller loads into sp
+ * before restoring ELR_EL1/SPSR_EL1/x0-x30 and `eret`-ing into it. */
 .global rpi4_preempt_switch
 rpi4_preempt_switch:
     adrp x2, current_task
@@ -140,15 +158,18 @@ rpi4_preempt_switch:
     str x0, [x4, x5]
 
     cbnz x1, .Lpt_force_boot
-    cmp w3, #0
-    b.eq .Lpt_go_b
-    mov w3, #0                     /* was B(1) or boot(2) -> A */
+    cmp w3, #PT_BOOT_INDEX
+    b.eq .Lpt_from_boot            /* was boot -> start at task 0 */
+    add w3, w3, #1
+    cmp w3, #NUM_TASKS
+    b.ne .Lpt_store_next           /* no wrap needed */
+    mov w3, #0                     /* wrapped past the last task */
     b .Lpt_store_next
-.Lpt_go_b:
-    mov w3, #1
+.Lpt_from_boot:
+    mov w3, #0
     b .Lpt_store_next
 .Lpt_force_boot:
-    mov w3, #2
+    mov w3, #PT_BOOT_INDEX
 .Lpt_store_next:
     str w3, [x2]
     lsl x5, x3, #3
@@ -160,9 +181,9 @@ rpi4_preempt_switch:
  * (called every wfi wakeup, of which there are many over this
  * kernel's lifetime) print a "boot genuinely resumed" message exactly
  * once, the first (and only) time control actually reaches that point
- * again after the preemption demo's tick-5 switch back to boot --
- * see kernel_main_rpi4.vani's own rpi4_heartbeat_tick for the full
- * reasoning on why this is a real, checkable signal and not just
+ * again after the preemption demo's final tick switches back to
+ * boot -- see kernel_main_rpi4.vani's own rpi4_heartbeat_tick for the
+ * full reasoning on why this is a real, checkable signal and not just
  * "didn't crash." */
 .global heartbeat_already_printed
 heartbeat_already_printed:
