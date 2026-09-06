@@ -17,16 +17,44 @@ intent "Dhruva Phase 0-2 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model 
 // from the checked const instead of a bare hex literal.
 //
 // GPIO (base 0x20200000)
+// Round 76 follow-up, 2026-09-06: gpio_fsel_reg_for/gpio_write/
+// gpio_read/gpio_set_pull (below) computed their addresses via raw
+// arithmetic/inline literals instead of these consts, a real gap in
+// the port above -- found while using this exact GPIO code as the
+// Pi 4/5 GPIO port's own template. Closed by adding every register
+// those 4 functions touch (GPFSEL0/2/3, GPSET0/1, GPCLR0/1, GPLEV0/1,
+// GPPUDCLK1) and rewriting them to reference named consts, matching
+// gpio_uart_alt_init's own (already-correct) style.
+#[mmio(size=4)]
+const GPFSEL0: i64 = 0x20200000;
 #[mmio(size=4)]
 const GPFSEL1: i64 = 0x20200004;
+#[mmio(size=4)]
+const GPFSEL2: i64 = 0x20200008;
+#[mmio(size=4)]
+const GPFSEL3: i64 = 0x2020000C;
 #[mmio(size=4)]
 const GPFSEL4: i64 = 0x20200010;
 #[mmio(size=4)]
 const GPFSEL5: i64 = 0x20200014;
 #[mmio(size=4)]
+const GPSET0: i64 = 0x2020001C;
+#[mmio(size=4)]
+const GPSET1: i64 = 0x20200020;
+#[mmio(size=4)]
+const GPCLR0: i64 = 0x20200028;
+#[mmio(size=4)]
+const GPCLR1: i64 = 0x2020002C;
+#[mmio(size=4)]
+const GPLEV0: i64 = 0x20200034;
+#[mmio(size=4)]
+const GPLEV1: i64 = 0x20200038;
+#[mmio(size=4)]
 const GPPUD: i64 = 0x20200094;
 #[mmio(size=4)]
 const GPPUDCLK0: i64 = 0x20200098;
+#[mmio(size=4)]
+const GPPUDCLK1: i64 = 0x2020009C;
 // UART0 / PL011 (base 0x20201000)
 #[mmio(size=4)]
 const UART_DR: i64 = 0x20201000;
@@ -1348,8 +1376,27 @@ fn gpio_uart_alt_init() -> i64 {
 // architectural (BCM2835 datasheet section 6.1), not a simple binary
 // progression: 0b000=input, 0b001=output, 0b100=ALT0, 0b101=ALT1,
 // 0b110=ALT2, 0b111=ALT3, 0b011=ALT4, 0b010=ALT5.
+// Round 76 follow-up: was `return 0x20200000 + (pin / 10) * 4;` --
+// one elegant line, but a raw literal the mmio overlap checker never
+// saw. A 6-way branch over the named consts instead, so every
+// address this function can ever return is checked.
 fn gpio_fsel_reg_for(pin: i64) -> i64 {
-  return 0x20200000 + (pin / 10) * 4;
+  if pin < 10 {
+    return GPFSEL0;
+  }
+  if pin < 20 {
+    return GPFSEL1;
+  }
+  if pin < 30 {
+    return GPFSEL2;
+  }
+  if pin < 40 {
+    return GPFSEL3;
+  }
+  if pin < 50 {
+    return GPFSEL4;
+  }
+  return GPFSEL5;
 }
 
 fn gpio_fsel_shift_for(pin: i64) -> i64 {
@@ -1383,8 +1430,8 @@ fn gpio_get_function(pin: i64) -> u32 {
 // hardware's own design.
 fn gpio_write(pin: i64, value: u32) -> i64 {
   let bit: u32 = (pin % 32) as u32;
-  let set_reg: i64 = if pin < 32 { 0x2020001C } else { 0x20200020 };
-  let clr_reg: i64 = if pin < 32 { 0x20200028 } else { 0x2020002C };
+  let set_reg: i64 = if pin < 32 { GPSET0 } else { GPSET1 };
+  let clr_reg: i64 = if pin < 32 { GPCLR0 } else { GPCLR1 };
   let reg: i64 = if value != (0 as u32) { set_reg } else { clr_reg };
   let _ = mmio_write_u32(reg, (1 as u32) << bit);
   return 0;
@@ -1392,7 +1439,7 @@ fn gpio_write(pin: i64, value: u32) -> i64 {
 
 // Reads pin's current level (0 or 1) via GPLEV.
 fn gpio_read(pin: i64) -> u32 {
-  let reg: i64 = if pin < 32 { 0x20200034 } else { 0x20200038 };
+  let reg: i64 = if pin < 32 { GPLEV0 } else { GPLEV1 };
   let bit: u32 = (pin % 32) as u32;
   let val: u32 = mmio_read_u32(reg);
   return (val >> bit) & (1 as u32);
@@ -1408,7 +1455,7 @@ fn gpio_read(pin: i64) -> u32 {
 // pull resistor.
 fn gpio_set_pull(pin: i64, pull: u32) -> i64 {
   let gppud: i64 = GPPUD;
-  let clk_reg: i64 = if pin < 32 { 0x20200098 } else { 0x2020009C };
+  let clk_reg: i64 = if pin < 32 { GPPUDCLK0 } else { GPPUDCLK1 };
   let bit: u32 = (pin % 32) as u32;
   let _ = mmio_write_u32(gppud, pull);
   let _ = delay(150);
