@@ -141,6 +141,15 @@ fault_halt:
 .equ IRQ_GICC_EOIR, 0x010
 .equ IRQ_TIMER_INTID, 30
 .equ IRQ_SPURIOUS_INTID, 1023
+/* Round 77: UART0 RX. NOT guessed -- fetched QEMU 10.0.0's own
+ * hw/arm/bcm2838_peripherals.h directly, which defines
+ * GIC_SPI_INTERRUPT_UART0 as 121 (an SPI *index*, not an INTID
+ * directly -- GICv2's own convention: SPI index N maps to INTID
+ * N+32, PPIs/SGIs occupying 0-31 first). 32 + 121 = 153. Confirmed
+ * this is the same convention round 70's own PPI-to-INTID derivation
+ * used for the timer (PPI 14 -> INTID 30 = 16+14) -- SPIs offset by
+ * 32 instead of PPIs' 16, per the GICv2 spec's own INTID layout. */
+.equ IRQ_UART0_INTID, 153
 /* IRQ_HALT_AFTER_TICKS (was 5) moved into kernel_main_rpi4.vani's own
  * rpi4_handle_timer_irq (round 75) along with the rest of the tick-
  * counting/message/halt-vs-rearm decision this constant used to gate
@@ -215,8 +224,18 @@ aarch64_irq_handler:
     b.eq irq_restore              /* spurious: no EOI, nothing to do */
 
     cmp w19, #IRQ_TIMER_INTID
-    b.ne irq_eoi                  /* not our timer: EOI it and move on */
+    b.eq irq_timer
 
+    /* Round 77: UART0 RX (see IRQ_UART0_INTID's own comment below for
+     * how this INTID was derived). Same dispatch shape as the timer
+     * branch -- anything that isn't one of our two known sources just
+     * falls through to a plain EOI. */
+    cmp w19, #IRQ_UART0_INTID
+    b.eq irq_uart0
+
+    b irq_eoi                     /* unknown source: EOI it and move on */
+
+irq_timer:
     /* Round 75: the tick-counting/message/halt-vs-rearm decision that
      * used to live here inline is now real vani-compiled code
      * (kernel_main_rpi4.vani's own rpi4_handle_timer_irq) -- safe to
@@ -226,6 +245,14 @@ aarch64_irq_handler:
      * context via `eret` below) -- see that function's own comment for
      * the full reasoning. */
     bl rpi4_handle_timer_irq
+    b irq_eoi
+
+irq_uart0:
+    /* Round 77: RX-FIFO drain + echo, real vani code from the start
+     * (kernel_main_rpi4.vani's own rpi4_handle_uart_rx_irq) -- same
+     * zero-extra-register-preservation safety as the timer call site
+     * above, for the same reason. */
+    bl rpi4_handle_uart_rx_irq
 
 irq_eoi:
     ldr x0, =IRQ_GICC_BASE

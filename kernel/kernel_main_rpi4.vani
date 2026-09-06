@@ -51,6 +51,31 @@
 const UART_DR_RPI4: i64 = 0xFE201000;
 #[mmio(size=4)]
 const UART_FR_RPI4: i64 = 0xFE201018;
+// Round 77: UART0 RX interrupt (see boot/rpi4/vectors.S's own
+// IRQ_UART0_INTID comment for the GIC-side derivation). PL011
+// register offsets are the standard ARM PrimeCell layout, already
+// load-bearing for TX above -- IMSC at +0x38, ICR at +0x44, same as
+// kernel_main.vani's own BCM2835 UART0 (different base, same
+// peripheral IP block).
+#[mmio(size=4)]
+const UART_IMSC_RPI4: i64 = 0xFE201038;
+#[mmio(size=4)]
+const UART_ICR_RPI4: i64 = 0xFE201044;
+// GIC distributor registers needed to route INTID 153 (UART0 RX) to
+// CPU0 -- see rpi4_uart_rx_irq_init's own comment for why an SPI
+// (unlike the timer's PPI, already enabled in boot/rpi4/gic_timer.S)
+// needs both of these, and in this order. GICD_BASE is 0xFF841000
+// (same source-derivation as boot/rpi4/gic_timer.S's own GICD_BASE/
+// GICC_BASE constants -- see that file's header comment).
+// GICD_ISENABLER4 = GICD_BASE + 0x100 + 4*4 (INTID 153 falls in the
+// 4th 32-IRQ group: 153/32=4, bit 153%32=25).
+#[mmio(size=4)]
+const GICD_ISENABLER4_RPI4: i64 = 0xFF841110;
+// GICD_ITARGETSR is one byte per IRQ starting at GICD_BASE+0x800;
+// this word covers IRQs 152-155, so only byte 1 (IRQ 153) is
+// nonzero: 0x00000100 = CPU0's target bit (0x01) in that byte.
+#[mmio(size=4)]
+const GICD_ITARGETSR_UART0_RPI4: i64 = 0xFF841898;
 
 // Round 76 -- GPIO, the next increment of "port kernel_main.vani (or
 // its boot-facing pieces) to Pi 4/5" (docs/TODO.md, marked
@@ -427,11 +452,74 @@ fn gpio_self_check_rpi4() -> i64 {
   return 0;
 }
 
+// Round 77 -- UART0 RX, the first bidirectional I/O on this port
+// (everything before this was output-only). Three one-time setup
+// steps, order matters for the last two:
+//
+// 1. Unmask the PL011's own RX interrupt (RXIM, bit 4 of IMSC).
+//    Deliberately does NOT write UART_CR (unlike kernel_main.vani's
+//    own uart_init) -- confirmed against QEMU 10.0.0's own hw/char/
+//    pl011.c that this model's pl011_can_receive "effectively
+//    keep[s] the UART continuously enabled regardless of the enable
+//    bits" (its own comment, verbatim), so TX already works
+//    unconditionally on this port (uart_putc_rpi4_vani never writes
+//    CR either) and RX will too.
+//
+// 2. Set GICD_ITARGETSR so INTID 153 routes to CPU0. UNLIKE the
+//    timer's PPI (INTID 30, enabled in boot/rpi4/gic_timer.S's own
+//    gic_timer_init with no targeting needed -- PPIs are inherently
+//    per-CPU by GIC design), an SPI has no implicit target at all.
+//
+// 3. THEN set GICD_ISENABLER4 bit 25 (153 mod 32) to actually enable
+//    it. This order is load-bearing, not stylistic: confirmed by
+//    reading QEMU 10.0.0's own hw/intc/arm_gic.c dist_writeb handler
+//    for the Interrupt Set-Enable register -- for an SPI, it computes
+//    the per-CPU enable mask from GIC_DIST_TARGET(irq) AT THE MOMENT
+//    ISENABLER is written, not dynamically later. Enabling before
+//    targeting captures a target of zero CPUs, and the interrupt
+//    silently never becomes deliverable to any CPU even though
+//    GICD_ISENABLER itself correctly reads back as "enabled" --
+//    found exactly this way: a temporary polling probe (bypassing
+//    the interrupt path entirely) proved real bytes sent over stdin
+//    genuinely reached the PL011's RX FIFO while the interrupt never
+//    fired, which is what led to reading arm_gic.c's own source
+//    rather than guessing further.
+fn rpi4_uart_rx_irq_init() -> i64 {
+  let _ = mmio_write_u32(UART_IMSC_RPI4, 0x10 as u32);
+  let _ = mmio_write_u32(GICD_ITARGETSR_UART0_RPI4, 0x00000100 as u32);
+  let _ = mmio_write_u32(GICD_ISENABLER4_RPI4, (1 as u32) << (25 as u32));
+  return 0;
+}
+
+// Drains the RX FIFO (bounded loop, matching kernel_main.vani's own
+// irq_dispatch UART branch shape) and echoes each byte straight back
+// out -- deliberately NOT a line-buffered shell yet (this port has no
+// task/scheduler infrastructure for one to live in), just proof that
+// input genuinely arrives and can be acted on from real vani code.
+// Clears the PL011's own RXIC status once after draining (draining
+// itself de-asserts the level-triggered condition; this is a
+// defensive clear of any stale raw status, same pattern kernel_main.
+// vani's own irq_dispatch already uses).
+#[no_mangle]
+fn rpi4_handle_uart_rx_irq() -> i64 {
+  for i from 0 to 128 {
+    let fr: u32 = mmio_read_u32(UART_FR_RPI4);
+    if (fr & (0x10 as u32)) == (0 as u32) {
+      let c: u32 = mmio_read_u32(UART_DR_RPI4) & (0xFF as u32);
+      let _ = uart_putc_rpi4_vani(c as i64);
+    }
+  }
+  let _ = mmio_write_u32(UART_ICR_RPI4, 0x10 as u32);
+  return 0;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
   let _ = rpi4_vani_self_test();
   let _ = gpio_self_check_rpi4();
+  let _ = rpi4_uart_rx_irq_init();
+  let _ = uart_puts_rpi4_vani("DHRUVA RPI4: UART0 RX interrupt armed, echoing input\n");
   return 0;
 }
 

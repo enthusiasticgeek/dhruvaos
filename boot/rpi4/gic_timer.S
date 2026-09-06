@@ -53,12 +53,30 @@
 
 /* Enables the GIC distributor + this CPU's interface, enables INTID
  * 30 (the timer PPI) specifically, sets the priority mask to accept
- * every priority (0xFF -- this v1 kernel has exactly one interrupt
- * source, priority filtering has nothing to do yet), then arms the
- * timer for a CNTFRQ_EL0/2-tick period (~500ms, matching this
- * project's own Pi 1 tick cadence in kernel_main.vani) and enables
- * it. Deliberately does NOT unmask IRQ at the PSTATE level itself --
- * that's boot.S's own call, once it's actually ready to field one. */
+ * every priority (0xFF -- this kernel's interrupt sources are all
+ * fielded at the same priority, priority filtering has nothing to do
+ * yet), then arms the timer for a CNTFRQ_EL0/2-tick period (~500ms,
+ * matching this project's own Pi 1 tick cadence in kernel_main.vani)
+ * and enables it. Deliberately does NOT unmask IRQ at the PSTATE
+ * level itself -- that's boot.S's own call, once it's actually ready
+ * to field one.
+ *
+ * Round 77: UART0 RX (INTID 153) is enabled from vani code instead
+ * (kernel_main_rpi4.vani's own rpi4_uart_rx_irq_init), not here --
+ * unlike the timer's PPI, an SPI also needs GICD_ITARGETSR set (which
+ * CPU(s) it's routed to; PPIs are inherently per-CPU already and
+ * need no such thing) BEFORE its ISENABLER bit is set, or QEMU's own
+ * arm_gic.c computes the per-CPU enable mask from whatever target was
+ * configured AT ENABLE TIME (0 by default, i.e. no CPU) and the
+ * interrupt never becomes deliverable even though it looks "enabled"
+ * -- confirmed empirically (a round-trip echo test sent real bytes
+ * over stdin that a temporary polling probe proved genuinely reached
+ * the PL011's RX FIFO, but the interrupt path never fired, tracing
+ * back to this exact gap) before reading arm_gic.c's own dist_writeb
+ * handler to find why. Both registers are ordinary MMIO, so vani code
+ * can set them directly via mmio_write_u32 with no new assembly
+ * needed -- see that function's own comment for the two writes and
+ * their order. */
 .global gic_timer_init
 gic_timer_init:
     stp x29, x30, [sp, #-16]!

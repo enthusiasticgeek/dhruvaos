@@ -2979,6 +2979,45 @@ than assumed:
   `test/rpi4_vani_smoke.py` widened to also assert the new PASS line;
   `test/rpi4_boot_smoke.py`/`test/rpi4_timer_smoke.py` both still pass
   unmodified.
+
+  **ROUND 77 UPDATE, 2026-09-06** (still `[PARTIAL]` -- the full
+  28000+-line port remains its own multi-round effort): ported UART0
+  RX, this port's first bidirectional I/O (everything before this was
+  output-only). INTID 153 derived the same way round 70/76's own
+  INTIDs were -- fetched QEMU 10.0.0's `hw/arm/bcm2838_peripherals.h`
+  directly: `GIC_SPI_INTERRUPT_UART0 = 121` (an SPI *index*), +32 per
+  GICv2's own INTID layout (SPIs start at 32; confirmed against
+  `hw/intc/arm_gic.c`'s own `gic_set_irq`) = 153.
+  `boot/rpi4/vectors.S`'s `aarch64_irq_handler` widened from a 2-way
+  (spurious/timer) to a 3-way dispatch.
+
+  **Real bug found and fixed, not just a port**: an SPI (unlike the
+  timer's PPI) needs `GICD_ITARGETSR` set (which CPU it's routed to)
+  *before* its `GICD_ISENABLER` bit -- PPIs are inherently per-CPU by
+  GIC design and need no such thing, an asymmetry this round's first
+  attempt missed entirely. Found live: a temporary polling probe
+  (bypassing the interrupt path) proved real bytes sent over QEMU's
+  stdio UART genuinely reached the PL011's RX FIFO while the
+  interrupt itself never fired -- reading `arm_gic.c`'s own
+  `dist_writeb` handler for the Interrupt Set-Enable register showed
+  it computes the per-CPU enable mask from `GIC_DIST_TARGET(irq)` AT
+  THE MOMENT `ISENABLER` is written, not dynamically later, so
+  enabling before targeting silently captures a target of zero CPUs.
+  Fixed by reordering `kernel_main_rpi4.vani`'s own
+  `rpi4_uart_rx_irq_init` (target, then enable); both registers are
+  ordinary MMIO, so this needed zero new hand-written assembly, only
+  vani code (`mmio_write_u32` against `#[mmio(size=4)]`-tagged
+  consts, DHDL v0.1) -- an earlier attempt at this same fix,
+  extending `boot/rpi4/gic_timer.S`'s assembly instead, was reverted
+  once the vani-only fix confirmed asm was never actually necessary
+  here, matching this project's own growing preference for vani code
+  over hand-written asm wherever a peripheral is ordinary MMIO.
+
+  New `test/rpi4_uart_rx_smoke.py` (this port's first test to send
+  input, not just check output) sends a short probe string over
+  QEMU's stdio UART and confirms it comes back echoed, live-verified
+  reliable across repeated runs. `test/rpi4_boot_smoke.py`/
+  `rpi4_timer_smoke.py`/`rpi4_vani_smoke.py` all still pass unmodified.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
