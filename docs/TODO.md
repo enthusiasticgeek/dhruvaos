@@ -3405,6 +3405,55 @@ than assumed:
   Ed25519/X25519 (all present on the Pi 1 side) remain unported --
   this round's scope was proving the fixed-array-based, zero-heap
   design works at all, with the smallest useful primitive.
+
+  **ROUND 86 UPDATE, 2026-09-06**: Phase A step 1 of the networking/
+  SSH/WiFi scope (see project memory `project_dhruva_networking_ssh_
+  wifi_scope_2026_09_06.md`) -- a loopback-only netif abstraction, no
+  real NIC yet. Confirmed freshly this round: QEMU's `raspi4b` machine
+  has NO network device model at all (`-device help` lists no genet/
+  bcm ethernet part, `-M raspi4b,help` exposes no NIC option) -- the
+  same situation kernel_main.vani's own Pi 1 LAN9512/CDC-ECM backends
+  are already in (no QEMU device model either), so this port's netif
+  layer is protocol logic verified via synthetic frames, same as Pi
+  1's, with a real hardware backend deferred as its own separate,
+  genuinely hardware-only future item.
+
+  New `boot/rpi4/netif_state.S` mirrors round 84's `shell_state.S`
+  precedent: persistent mutable state (a 4-slot ring buffer + staging
+  area) lives in asm with byte-at-a-time accessors, since vani on this
+  port only ever holds transient/local state, never a value that must
+  survive across separate top-level calls. `netif_send_frame_rpi4`/
+  `netif_recv_frame_rpi4`/`netif_get_mac_rpi4` in `kernel_main_rpi4.
+  vani` wrap those accessors with the same Ethernet-framing shape and
+  empty/full-queue edge-case handling as kernel_main.vani's own
+  `netif_send_frame`/`netif_recv_frame`.
+
+  Frame slot size is 512 bytes, not kernel_main.vani's current 1514
+  (real Ethernet MTU) -- deliberately: that Pi 1 side itself started
+  at exactly 512 before round 66 raised it once a real DHCPOFFER
+  actually needed more, and nothing in this round's self-test needs
+  more than 16 bytes. Also a real vani-language constraint discovered
+  this round: vani has no array-repeat literal syntax (`[0; N]`) and
+  `let` always requires a full initializer expression, so a fixed-size
+  local array needs either a fully hand-enumerated literal or a helper
+  function returning one -- confirmed via a standalone probe
+  (`vanic check`) before writing the real port. 512 elements is a far
+  more tractable one-time literal (`netif_zero_frame_rpi4`) than 1514
+  would have been; raise it the same way Pi 1's own `netif_frame_slot_
+  size()` was raised, once a real later round's payload needs it.
+
+  Wired into `kmain_rpi4_vani` (boot-time self-test) and a new `netif`
+  shell command (same pattern as `sha256`/`test`). Worked correctly on
+  the very first build, no live debugging needed. `test/rpi4_shell_
+  smoke.py` updated for the new `help`/`ver` text and a `netif`
+  command check; all 8 Pi 4 smoke tests pass; zero Pi 1 files touched.
+
+  **Not done** (all explicitly later Phase A steps, per the scope
+  memory): ARP, a real IP header module, the packet filter, TCP, DHCP
+  (client+server), PKI, X25519/Ed25519/ChaCha20-Poly1305, TLS 1.3, SSH
+  transport, and SSH-shell integration -- none started. A real NIC
+  driver and WiFi STA/AP are Phase B, genuinely hardware-only, not
+  started and not scoped further than the scope memory already covers.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

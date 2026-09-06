@@ -998,6 +998,241 @@ fn sha256_self_test_rpi4() -> i64 {
   return ok;
 }
 
+// Round 86 -- Phase A step 1 of the networking/SSH/WiFi scope (see
+// project memory project_dhruva_networking_ssh_wifi_scope_2026_09_06
+// .md): the smallest useful netif abstraction on this port. Loopback/
+// synthetic frames only -- deliberately NOT a real GENET or USB/XHCI
+// NIC driver, mirroring how even kernel_main.vani's own Pi 1 side
+// verifies its netif layer purely via synthetic frames (its real
+// LAN9512/CDC-ECM backends have no QEMU device model either, per
+// docs/TODO.md's own Tier 3 list) -- confirmed freshly this round
+// that QEMU's raspi4b machine has no network device model at all, so
+// a real backend has no QEMU verification path regardless of how this
+// is designed. The queue itself lives in boot/rpi4/netif_state.S
+// (its own header comment has the full ring-buffer design), the same
+// "persistent state lives in a small asm accessor file, vani only
+// ever holds transient/local state" shape round 84's shell_state.S
+// already established on this port.
+// 512, not kernel_main.vani's own current 1514-byte real-Ethernet-MTU
+// sizing, deliberately -- that Pi 1 side itself started at exactly
+// this same 512 ("deliberately smaller than a real Ethernet MTU,
+// since nothing this project could test end-to-end under QEMU needed
+// a full-size frame", round 66's own comment) and was only raised
+// once a real DHCPOFFER actually needed more. Nothing in this round's
+// self-test needs more than 16 bytes -- raise this the same way Pi
+// 1's netif_frame_slot_size() was raised, once a real later round's
+// payload actually needs it, not speculatively now. Also a practical
+// vani-language constraint: vani has no array-repeat literal syntax
+// (`[0; N]`) and `let` requires a full initializer, so a fixed-size
+// local array needs either a fully hand-enumerated literal or a
+// helper returning one (netif_zero_frame_rpi4 below) -- 512 elements
+// is a far more tractable one-time literal than 1514.
+const NETIF_SLOT_SIZE_RPI4: i64 = 512;
+
+extern "C" fn netif_state_reset() -> u32;
+extern "C" fn netif_state_count() -> u32;
+extern "C" fn netif_state_stage_byte(offset: u32, value: u32) -> u32;
+extern "C" fn netif_state_commit_send(frame_len: u32) -> i64;
+extern "C" fn netif_state_recv_len() -> i64;
+extern "C" fn netif_state_recv_byte(offset: u32) -> u32;
+extern "C" fn netif_state_recv_advance() -> u32;
+
+fn netif_get_mtu_rpi4() -> i64 {
+  return NETIF_SLOT_SIZE_RPI4 - 14;
+}
+
+// See NETIF_SLOT_SIZE_RPI4's own comment above for why this helper
+// exists at all (vani has no array-repeat literal, so this is the
+// one and only place a 512-byte zero literal is hand-enumerated).
+fn netif_zero_frame_rpi4() -> [u8; 512] {
+  return [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+}
+
+// Loopback's own placeholder MAC -- a locally-administered address
+// (bit 1 of the first octet set, IEEE 802 convention for non-vendor
+// addresses), the exact same address kernel_main.vani's own
+// netif_get_mac falls back to when no real hardware backend was
+// enumerated. No real backend exists on this port at all yet, so
+// this is the only address this function will ever return.
+fn netif_get_mac_rpi4(out: mut ref [u8; 6]) -> i64 {
+  out[0] = 0x02 as u8;
+  out[1] = 0x00 as u8;
+  out[2] = 0x00 as u8;
+  out[3] = 0x00 as u8;
+  out[4] = 0x00 as u8;
+  out[5] = 0x01 as u8;
+  return 0;
+}
+
+// Sends a raw frame (frame[0..frame_len)) by staging it byte-by-byte
+// then committing it as a whole. Returns 0 on success, -1 if the
+// frame is too big for a slot or the queue's 4 slots are already
+// full (dropped, matching real best-effort networking behavior under
+// congestion -- same semantics as kernel_main.vani's own
+// netif_send_frame).
+fn netif_send_frame_rpi4(frame: ref [u8; 512], frame_len: i64) -> i64 {
+  if frame_len > NETIF_SLOT_SIZE_RPI4 {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < frame_len {
+    let b: u32 = frame[i] as u32;
+    let _ = netif_state_stage_byte(i as u32, b);
+    i = i + 1;
+  }
+  return netif_state_commit_send(frame_len as u32);
+}
+
+// Receives the next queued frame into out[0..max_len). Returns the
+// frame's real length, or -1 if the queue is empty OR the frame is
+// bigger than the caller's buffer (dropped either way -- a frame too
+// big to fit is still consumed off the queue, matching
+// kernel_main.vani's own netif_recv_frame oversized-frame handling,
+// not left stuck blocking every later poll).
+fn netif_recv_frame_rpi4(out: mut ref [u8; 512], max_len: i64) -> i64 {
+  let frame_len: i64 = netif_state_recv_len();
+  if frame_len < 0 {
+    return 0 - 1;
+  }
+  if frame_len > max_len {
+    let _ = netif_state_recv_advance();
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < frame_len {
+    let b: u32 = netif_state_recv_byte(i as u32);
+    out[i] = b as u8;
+    i = i + 1;
+  }
+  let _ = netif_state_recv_advance();
+  return frame_len;
+}
+
+// Boot-time (and on-demand, via the `netif` shell command) self-test:
+// builds a tiny synthetic Ethernet frame (broadcast destination, our
+// own loopback MAC as source, ethertype 0x0800 = IPv4, payload "hi"),
+// sends it, receives it back, and checks every field round-tripped
+// correctly -- plus the empty-queue and full-queue (4 real slots)
+// edge cases, the same shape kernel_main.vani's own netif_self_test
+// already established.
+fn netif_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let _ = netif_state_reset();
+
+  let empty_buf: [u8; 512] = netif_zero_frame_rpi4();
+  let empty_len: i64 = netif_recv_frame_rpi4(mut ref empty_buf, 512);
+  if empty_len != (0 - 1) {
+    ok = 0;
+  }
+
+  let frame: [u8; 512] = netif_zero_frame_rpi4();
+  let mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let _ = netif_get_mac_rpi4(mut ref mac);
+  let i: i64 = 0;
+  while i < 6 {
+    frame[i] = 0xFF as u8; // dst: broadcast
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 6 {
+    frame[6 + j] = mac[j]; // src: our own MAC
+    j = j + 1;
+  }
+  frame[12] = 0x08 as u8; // ethertype hi (IPv4)
+  frame[13] = 0x00 as u8; // ethertype lo
+  frame[14] = 104 as u8;  // 'h'
+  frame[15] = 105 as u8;  // 'i'
+
+  let send_status: i64 = netif_send_frame_rpi4(ref frame, 16);
+  if send_status != 0 {
+    ok = 0;
+  }
+
+  let recv_buf: [u8; 512] = netif_zero_frame_rpi4();
+  let recv_len: i64 = netif_recv_frame_rpi4(mut ref recv_buf, 512);
+  if recv_len != 16 {
+    ok = 0;
+  }
+  if (recv_buf[12] != (0x08 as u8)) || (recv_buf[13] != (0x00 as u8)) {
+    ok = 0;
+  }
+  if (recv_buf[14] != (104 as u8)) || (recv_buf[15] != (105 as u8)) {
+    ok = 0;
+  }
+
+  // Queue-full: 4 slots total, all empty after the drain above -- send
+  // 4 more then a 5th, which must be dropped.
+  let k: i64 = 0;
+  while k < 4 {
+    let _ = netif_send_frame_rpi4(ref frame, 16);
+    k = k + 1;
+  }
+  let overflow_status: i64 = netif_send_frame_rpi4(ref frame, 16);
+  if overflow_status != (0 - 1) {
+    ok = 0;
+  }
+  // Drain the 4 real frames so this self-test doesn't leave stale
+  // frames behind for a later on-demand `netif` shell-command rerun.
+  let m: i64 = 0;
+  while m < 4 {
+    let drain_buf: [u8; 512] = netif_zero_frame_rpi4();
+    let _ = netif_recv_frame_rpi4(mut ref drain_buf, 512);
+    m = m + 1;
+  }
+
+  let _ = uart_puts_rpi4_vani("NET: loopback netif send/recv + empty/full queue edge cases");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
@@ -1009,6 +1244,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = preempt_yield_self_test();
   let _ = preempt_init();
   let _ = sha256_self_test_rpi4();
+  let _ = netif_self_test_rpi4();
   return 0;
 }
 
@@ -1248,11 +1484,11 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, netif, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 85 minimal shell + crypto\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 86 minimal shell + crypto + netif\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
@@ -1262,6 +1498,11 @@ fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("sha256") == (1 as u32) {
     let _ = uart_puts_rpi4_vani("\n");
     let _ = sha256_self_test_rpi4();
+    return 0;
+  }
+  if rpi4_shell_line_matches("netif") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = netif_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_starts_with("echo ") == (1 as u32) {

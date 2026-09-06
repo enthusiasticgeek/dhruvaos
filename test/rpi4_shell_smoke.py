@@ -5,7 +5,9 @@ full design. Reuses UART0 RX (round 77) and the already-proven
 once-per-wfi-wakeup rpi4_heartbeat_tick call site (round 79), NOT the
 round 79-83 preemptive-scheduler demo, which stays exactly as it was
 -- a bounded, self-terminating proof independent of this real,
-permanent capability.
+permanent capability. Round 86 added a `netif` command rerunning the
+loopback netif self-test (boot/rpi4/netif_state.S's own header
+comment has that design).
 
 Drives real commands over QEMU's stdio UART (help, ver, test, echo)
 and checks each one's real response, using phase4_milestone.py's own
@@ -51,6 +53,8 @@ def run(elf_path: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[int, str]:
         time.sleep(CMD_WAIT_S)
         send("sha256")
         time.sleep(CMD_WAIT_S)
+        send("netif")
+        time.sleep(CMD_WAIT_S)
         out, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, out.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
@@ -73,22 +77,25 @@ def main() -> int:
     print(output, end="")
 
     checks = {
-        "help lists commands": "commands: help, ver, test, sha256, echo <text>" in output,
-        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 85 minimal shell + crypto" in output,
+        "help lists commands": "commands: help, ver, test, sha256, netif, echo <text>" in output,
+        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 86 minimal shell + crypto + netif" in output,
         "echo echoes real argument text": "hello dhruva" in output,
         "unknown command reported": "unknown command (try 'help')" in output,
         "test reruns the real self-test": "sum=5050 quotient=14285 remainder=5" in output,
         "sha256 reruns the crypto self-test": output.count(
             'CRYPTO: SHA-256 vs 3 NIST/FIPS-180-4 KATs (empty, "abc", 2-block) (PASS)'
         ) >= 2,
+        "netif reruns the loopback self-test": output.count(
+            "NET: loopback netif send/recv + empty/full queue edge cases (PASS)"
+        ) >= 2,
         "no fault": "FAULT" not in output,
     }
     ok = all(checks.values())
 
     if ok:
-        print(f"\n[rpi4_shell_smoke.py] PASS -- all 6 real shell commands (help, "
-              f"ver, echo, an unknown command, test, sha256) got their correct "
-              f"real responses over a live QEMU stdio UART session.", file=sys.stderr)
+        print(f"\n[rpi4_shell_smoke.py] PASS -- all 7 real shell commands (help, "
+              f"ver, echo, an unknown command, test, sha256, netif) got their "
+              f"correct real responses over a live QEMU stdio UART session.", file=sys.stderr)
         return 0
     failed = [name for name, passed in checks.items() if not passed]
     print(f"\n[rpi4_shell_smoke.py] FAIL -- failed checks: {failed!r}",
