@@ -35,10 +35,26 @@
 // boot.S's uart_puts_rpi4), a different SoC generation from the Pi 1's
 // BCM2835. Same PL011 register protocol otherwise (UARTDR at +0x00,
 // UARTFR at +0x18, TXFF at bit 5).
+//
+// DHDL v0.1 MVP (see ~/dhruvaos-device-tree.md / kernel_main.vani's
+// own BCM2835 register-map block for the same treatment on the Pi 1
+// side): `#[mmio(size=N)]` lets `vanic check` verify these don't
+// overlap each other -- only 2 registers on this file's own BCM2711
+// slice today, but a real check either way, not just a rename.
+// `_RPI4` suffix (matching this file's own `_rpi4_vani` fn-naming
+// convention) distinguishes these from kernel_main.vani's same-named
+// BCM2835 constants -- different physical addresses, different SoC,
+// a genuinely separate compilation unit (build_rpi4.sh never combines
+// the two files), so there's no name collision to worry about, only
+// a readability one this naming avoids.
+#[mmio(size=4)]
+const UART_DR_RPI4: i64 = 0xFE201000;
+#[mmio(size=4)]
+const UART_FR_RPI4: i64 = 0xFE201018;
 
 fn uart_putc_rpi4_vani(c: i64) -> i64 {
-  let uart_fr: i64 = 0xFE201018;
-  let uart_dr: i64 = 0xFE201000;
+  let uart_fr: i64 = UART_FR_RPI4;
+  let uart_dr: i64 = UART_DR_RPI4;
   while true {
     let fr: u32 = mmio_read_u32(uart_fr);
     if (fr & (0x20 as u32)) == (0 as u32) {
