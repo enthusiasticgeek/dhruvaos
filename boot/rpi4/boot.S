@@ -131,6 +131,23 @@ clear_bss_rpi4:
     b clear_bss_rpi4
 clear_bss_rpi4_done:
 
+    /* Round 85: enable FP/SIMD access at EL1 (CPACR_EL1.FPEN = 0b11,
+     * bits 21:20) before any code that could touch it runs. LLVM's
+     * AArch64 backend freely uses NEON registers for ordinary array/
+     * struct copies and initialization even in code with no float
+     * types anywhere -- confirmed live: kernel/kernel_main_rpi4.vani's
+     * new SHA-256 self-test, the first code on this port working with
+     * arrays bigger than a handful of words, faulted immediately with
+     * ESR_EL1 EC=0x07 ("trapped SIMD/FP access") the moment it ran,
+     * because CPACR_EL1 was left at its EL3-drop reset value of 0 --
+     * FP/SIMD traps to EL1 by default there. Every bare-metal AArch64
+     * kernel needs this exact same one-time enablement; there simply
+     * was no code on this port before now that happened to trigger
+     * vectorized codegen. */
+    mov x0, #0x300000
+    msr cpacr_el1, x0
+    isb
+
     bl mmu_init_rpi4
 
     bl kmain_rpi4

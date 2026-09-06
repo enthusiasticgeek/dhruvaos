@@ -643,6 +643,361 @@ fn preempt_yield_self_test() -> i64 {
   return 0;
 }
 
+// Round 85 -- self-contained crypto: SHA-256, the first cryptographic
+// primitive on this port (per the user's own stated sequence after
+// round 84's shell: "start the minimal interactive shell. then self
+// contained crypto"). Deliberately NOT a line-for-line port of
+// kernel_main.vani's own sha256_* family: that implementation reads
+// and writes through `mut ref i64` buffers via buf_read_u32/
+// buf_write_u32 and sha256_*_scratch_get/set (boot/dharafs_buf.S +
+// boot/scratch_state.S, hand-written ARM32 asm) plus dhruva_alloc_
+// bytes (a heap allocator) -- machinery that exists there ONLY to fix
+// a real Pi 1 bug class (a long-lived scratch pointer held live in a
+// register across many calls got corrupted by interrupt delivery
+// under that port's older interrupt scheme; see sha256_compress's own
+// "Round 65 hardening" comment on the Pi 1 side). This port has
+// neither problem: kernel_main_rpi4.vani has zero heap allocator and
+// zero `extern "C"` declarations by design (see this file's own
+// header comment), and vani's `[T; N]` fixed arrays are genuine Copy
+// stack values with compiler-inserted bounds checks on both the C and
+// LLVM backends -- confirmed correct via a standalone probe (`ref`/
+// `mut ref [u32; N]` and `[u8; N]` params, plain array-literal locals)
+// before writing any of this. So plain fixed-array function
+// parameters replace every one of that side's buffer-accessor calls,
+// with no persistent-scratch-across-calls indirection needed at all.
+//
+// Same FIPS 180-4 algorithm and the identical wraparound-add
+// technique (sha256_wrap_add32 widens to i64, masks to the low 32
+// bits, truncates back to u32) as kernel_main.vani's own version --
+// vani's native u32 `+` traps on overflow on every target (confirmed
+// here too, not assumed), and SHA-256's compression function depends
+// completely on mod-2^32 wraparound, so this helper is unavoidable
+// and architecture-independent.
+//
+// Fixed at a 256-byte (4-block / up to 247-byte message) padded
+// buffer, not kernel_main.vani's dynamically-sized one -- enough for
+// this round's own 3 FIPS/NIST KATs (0, 3, and 56 input bytes) with
+// headroom, and a real fixed bound is a better fit for a bare-metal
+// kernel with no heap regardless. Hashing something longer is out of
+// scope for this round, the same kind of explicit scope line round
+// 84's own shell drew for multi-line editing/history.
+const SHA256_BUF_SIZE_RPI4: i64 = 256;
+
+fn sha256_wrap_add32_rpi4(a: u32, b: u32) -> u32 {
+  let wide: i64 = (a as i64) + (b as i64);
+  return (wide & 4294967295) as u32;
+}
+
+fn sha256_rotr32_rpi4(x: u32, n: u32) -> u32 {
+  return (x >> n) | (x << ((32 as u32) - n));
+}
+
+// Message bytes are big-endian 32-bit words per FIPS 180-4; the
+// padded buffer's own storage order is irrelevant here since every
+// access goes through these two explicit big-endian packing helpers,
+// never a raw word read/write.
+fn sha256_read_be32_rpi4(buf: mut ref [u8; 256], off: i64) -> u32 {
+  let b0: u32 = buf[off] as u32;
+  let b1: u32 = buf[off + 1] as u32;
+  let b2: u32 = buf[off + 2] as u32;
+  let b3: u32 = buf[off + 3] as u32;
+  return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+fn sha256_write_be32_pad_rpi4(buf: mut ref [u8; 256], off: i64, v: u32) -> i64 {
+  buf[off] = ((v >> (24 as u32)) & (255 as u32)) as u8;
+  buf[off + 1] = ((v >> (16 as u32)) & (255 as u32)) as u8;
+  buf[off + 2] = ((v >> (8 as u32)) & (255 as u32)) as u8;
+  buf[off + 3] = (v & (255 as u32)) as u8;
+  return 0;
+}
+
+fn sha256_write_be32_out_rpi4(buf: mut ref [u8; 32], off: i64, v: u32) -> i64 {
+  buf[off] = ((v >> (24 as u32)) & (255 as u32)) as u8;
+  buf[off + 1] = ((v >> (16 as u32)) & (255 as u32)) as u8;
+  buf[off + 2] = ((v >> (8 as u32)) & (255 as u32)) as u8;
+  buf[off + 3] = (v & (255 as u32)) as u8;
+  return 0;
+}
+
+// Process one 64-byte block starting at byte offset `block_off`
+// inside `msg`, folding it into the running state `h` (8 words / 32
+// bytes) using the 64 round constants `k`. `w`, the 64-word message
+// schedule, is a plain local array here -- unlike the Pi 1 side there
+// is no long-lived-register-scratch-pointer hazard to design around,
+// so it never needs to leave this function or survive across calls.
+fn sha256_compress_rpi4(msg: mut ref [u8; 256], block_off: i64, h: mut ref [u32; 8], k: ref [u32; 64]) -> i64 {
+  let w: [u32; 64] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let i: i64 = 0;
+  while i < 16 {
+    w[i] = sha256_read_be32_rpi4(msg, block_off + i * 4);
+    i = i + 1;
+  }
+  i = 16;
+  while i < 64 {
+    let w15: u32 = w[i - 15];
+    let w2: u32 = w[i - 2];
+    let w16: u32 = w[i - 16];
+    let w7: u32 = w[i - 7];
+    let s0: u32 = sha256_rotr32_rpi4(w15, 7 as u32) ^ sha256_rotr32_rpi4(w15, 18 as u32) ^ (w15 >> (3 as u32));
+    let s1: u32 = sha256_rotr32_rpi4(w2, 17 as u32) ^ sha256_rotr32_rpi4(w2, 19 as u32) ^ (w2 >> (10 as u32));
+    w[i] = sha256_wrap_add32_rpi4(sha256_wrap_add32_rpi4(w16, s0), sha256_wrap_add32_rpi4(w7, s1));
+    i = i + 1;
+  }
+
+  let a: u32 = h[0];
+  let b: u32 = h[1];
+  let c: u32 = h[2];
+  let d: u32 = h[3];
+  let e: u32 = h[4];
+  let f: u32 = h[5];
+  let g: u32 = h[6];
+  let hh: u32 = h[7];
+  let ones: u32 = 4294967295 as u32;
+
+  i = 0;
+  while i < 64 {
+    let bige1: u32 = sha256_rotr32_rpi4(e, 6 as u32) ^ sha256_rotr32_rpi4(e, 11 as u32) ^ sha256_rotr32_rpi4(e, 25 as u32);
+    let ch: u32 = (e & f) ^ ((e ^ ones) & g);
+    let kw: u32 = k[i];
+    let ww: u32 = w[i];
+    let t1: u32 = sha256_wrap_add32_rpi4(sha256_wrap_add32_rpi4(hh, bige1), sha256_wrap_add32_rpi4(ch, sha256_wrap_add32_rpi4(kw, ww)));
+    let bige0: u32 = sha256_rotr32_rpi4(a, 2 as u32) ^ sha256_rotr32_rpi4(a, 13 as u32) ^ sha256_rotr32_rpi4(a, 22 as u32);
+    let maj: u32 = (a & b) ^ (a & c) ^ (b & c);
+    let t2: u32 = sha256_wrap_add32_rpi4(bige0, maj);
+
+    hh = g;
+    g = f;
+    f = e;
+    e = sha256_wrap_add32_rpi4(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = sha256_wrap_add32_rpi4(t1, t2);
+
+    i = i + 1;
+  }
+
+  h[0] = sha256_wrap_add32_rpi4(h[0], a);
+  h[1] = sha256_wrap_add32_rpi4(h[1], b);
+  h[2] = sha256_wrap_add32_rpi4(h[2], c);
+  h[3] = sha256_wrap_add32_rpi4(h[3], d);
+  h[4] = sha256_wrap_add32_rpi4(h[4], e);
+  h[5] = sha256_wrap_add32_rpi4(h[5], f);
+  h[6] = sha256_wrap_add32_rpi4(h[6], g);
+  h[7] = sha256_wrap_add32_rpi4(h[7], hh);
+  return 0;
+}
+
+// Hashes `msg_len` bytes already written at the front of `msg` (0 <=
+// msg_len <= 247) into the 32-byte digest `out` (FIPS 180-4 padding:
+// a single 0x80 byte, zero bytes up to a 56-mod-64 boundary, then the
+// original bit-length as a big-endian 8-byte integer). `msg` is
+// padded in place, mirroring kernel_main.vani's own single-buffer
+// design.
+fn sha256_hash_rpi4(msg: mut ref [u8; 256], msg_len: i64, out: mut ref [u8; 32]) -> i64 {
+  let with_one: i64 = msg_len + 1;
+  let rem: i64 = with_one % 64;
+  let zero_pad: i64 = 0;
+  if rem <= 56 {
+    zero_pad = 56 - rem;
+  } else {
+    zero_pad = (64 - rem) + 56;
+  }
+  let total_len: i64 = with_one + zero_pad + 8;
+
+  msg[msg_len] = 128 as u8;
+  let i: i64 = msg_len + 1;
+  while i < (with_one + zero_pad) {
+    msg[i] = 0 as u8;
+    i = i + 1;
+  }
+  let bit_len: i64 = msg_len * 8;
+  let _ = sha256_write_be32_pad_rpi4(msg, total_len - 8, 0 as u32);
+  let _ = sha256_write_be32_pad_rpi4(msg, total_len - 4, bit_len as u32);
+
+  let h: [u32; 8] = [0x6a09e667 as u32, 0xbb67ae85 as u32, 0x3c6ef372 as u32, 0xa54ff53a as u32,
+                      0x510e527f as u32, 0x9b05688c as u32, 0x1f83d9ab as u32, 0x5be0cd19 as u32];
+  let k: [u32; 64] = [
+    0x428a2f98 as u32, 0x71374491 as u32, 0xb5c0fbcf as u32, 0xe9b5dba5 as u32,
+    0x3956c25b as u32, 0x59f111f1 as u32, 0x923f82a4 as u32, 0xab1c5ed5 as u32,
+    0xd807aa98 as u32, 0x12835b01 as u32, 0x243185be as u32, 0x550c7dc3 as u32,
+    0x72be5d74 as u32, 0x80deb1fe as u32, 0x9bdc06a7 as u32, 0xc19bf174 as u32,
+    0xe49b69c1 as u32, 0xefbe4786 as u32, 0x0fc19dc6 as u32, 0x240ca1cc as u32,
+    0x2de92c6f as u32, 0x4a7484aa as u32, 0x5cb0a9dc as u32, 0x76f988da as u32,
+    0x983e5152 as u32, 0xa831c66d as u32, 0xb00327c8 as u32, 0xbf597fc7 as u32,
+    0xc6e00bf3 as u32, 0xd5a79147 as u32, 0x06ca6351 as u32, 0x14292967 as u32,
+    0x27b70a85 as u32, 0x2e1b2138 as u32, 0x4d2c6dfc as u32, 0x53380d13 as u32,
+    0x650a7354 as u32, 0x766a0abb as u32, 0x81c2c92e as u32, 0x92722c85 as u32,
+    0xa2bfe8a1 as u32, 0xa81a664b as u32, 0xc24b8b70 as u32, 0xc76c51a3 as u32,
+    0xd192e819 as u32, 0xd6990624 as u32, 0xf40e3585 as u32, 0x106aa070 as u32,
+    0x19a4c116 as u32, 0x1e376c08 as u32, 0x2748774c as u32, 0x34b0bcb5 as u32,
+    0x391c0cb3 as u32, 0x4ed8aa4a as u32, 0x5b9cca4f as u32, 0x682e6ff3 as u32,
+    0x748f82ee as u32, 0x78a5636f as u32, 0x84c87814 as u32, 0x8cc70208 as u32,
+    0x90befffa as u32, 0xa4506ceb as u32, 0xbef9a3f7 as u32, 0xc67178f2 as u32
+  ];
+
+  let num_blocks: i64 = total_len / 64;
+  let blk: i64 = 0;
+  while blk < num_blocks {
+    let _ = sha256_compress_rpi4(msg, blk * 64, mut ref h, ref k);
+    blk = blk + 1;
+  }
+
+  let j: i64 = 0;
+  while j < 8 {
+    let _ = sha256_write_be32_out_rpi4(out, j * 4, h[j]);
+    j = j + 1;
+  }
+  return 0;
+}
+
+fn sha256_digest_equal_rpi4(a: ref [u8; 32], b: ref [u8; 32]) -> i64 {
+  let i: i64 = 0;
+  while i < 32 {
+    if a[i] != b[i] {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// Three FIPS 180-4 / NIST known-answer vectors -- the empty string,
+// the "abc" worked example from the spec itself, and a 56-byte
+// message whose padding lands exactly on a second 64-byte block --
+// the same three kernel_main.vani's own sha256_self_test uses, same
+// expected digests, byte for byte.
+fn sha256_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+
+  let msg0: [u8; 256] = [
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let out0: [u8; 32] = [
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let _ = sha256_hash_rpi4(mut ref msg0, 0, mut ref out0);
+  let exp0: [u8; 32] = [
+    0xe3 as u8, 0xb0 as u8, 0xc4 as u8, 0x42 as u8, 0x98 as u8, 0xfc as u8, 0x1c as u8, 0x14 as u8, 0x9a as u8, 0xfb as u8, 0xf4 as u8, 0xc8 as u8,
+    0x99 as u8, 0x6f as u8, 0xb9 as u8, 0x24 as u8, 0x27 as u8, 0xae as u8, 0x41 as u8, 0xe4 as u8, 0x64 as u8, 0x9b as u8, 0x93 as u8, 0x4c as u8,
+    0xa4 as u8, 0x95 as u8, 0x99 as u8, 0x1b as u8, 0x78 as u8, 0x52 as u8, 0xb8 as u8, 0x55 as u8
+  ];
+  if sha256_digest_equal_rpi4(ref out0, ref exp0) == 0 { ok = 0; }
+
+  let msg1: [u8; 256] = [
+    0x61 as u8, 0x62 as u8, 0x63 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let out1: [u8; 32] = [
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let _ = sha256_hash_rpi4(mut ref msg1, 3, mut ref out1);
+  let exp1: [u8; 32] = [
+    0xba as u8, 0x78 as u8, 0x16 as u8, 0xbf as u8, 0x8f as u8, 0x01 as u8, 0xcf as u8, 0xea as u8, 0x41 as u8, 0x41 as u8, 0x40 as u8, 0xde as u8,
+    0x5d as u8, 0xae as u8, 0x22 as u8, 0x23 as u8, 0xb0 as u8, 0x03 as u8, 0x61 as u8, 0xa3 as u8, 0x96 as u8, 0x17 as u8, 0x7a as u8, 0x9c as u8,
+    0xb4 as u8, 0x10 as u8, 0xff as u8, 0x61 as u8, 0xf2 as u8, 0x00 as u8, 0x15 as u8, 0xad as u8
+  ];
+  if sha256_digest_equal_rpi4(ref out1, ref exp1) == 0 { ok = 0; }
+
+  let msg2: [u8; 256] = [
+    0x61 as u8, 0x62 as u8, 0x63 as u8, 0x64 as u8, 0x62 as u8, 0x63 as u8, 0x64 as u8, 0x65 as u8, 0x63 as u8, 0x64 as u8, 0x65 as u8, 0x66 as u8,
+    0x64 as u8, 0x65 as u8, 0x66 as u8, 0x67 as u8, 0x65 as u8, 0x66 as u8, 0x67 as u8, 0x68 as u8, 0x66 as u8, 0x67 as u8, 0x68 as u8, 0x69 as u8,
+    0x67 as u8, 0x68 as u8, 0x69 as u8, 0x6a as u8, 0x68 as u8, 0x69 as u8, 0x6a as u8, 0x6b as u8, 0x69 as u8, 0x6a as u8, 0x6b as u8, 0x6c as u8,
+    0x6a as u8, 0x6b as u8, 0x6c as u8, 0x6d as u8, 0x6b as u8, 0x6c as u8, 0x6d as u8, 0x6e as u8, 0x6c as u8, 0x6d as u8, 0x6e as u8, 0x6f as u8,
+    0x6d as u8, 0x6e as u8, 0x6f as u8, 0x70 as u8, 0x6e as u8, 0x6f as u8, 0x70 as u8, 0x71 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let out2: [u8; 32] = [
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let _ = sha256_hash_rpi4(mut ref msg2, 56, mut ref out2);
+  let exp2: [u8; 32] = [
+    0x24 as u8, 0x8d as u8, 0x6a as u8, 0x61 as u8, 0xd2 as u8, 0x06 as u8, 0x38 as u8, 0xb8 as u8, 0xe5 as u8, 0xc0 as u8, 0x26 as u8, 0x93 as u8,
+    0x0c as u8, 0x3e as u8, 0x60 as u8, 0x39 as u8, 0xa3 as u8, 0x3c as u8, 0xe4 as u8, 0x59 as u8, 0x64 as u8, 0xff as u8, 0x21 as u8, 0x67 as u8,
+    0xf6 as u8, 0xec as u8, 0xed as u8, 0xd4 as u8, 0x19 as u8, 0xdb as u8, 0x06 as u8, 0xc1 as u8
+  ];
+  if sha256_digest_equal_rpi4(ref out2, ref exp2) == 0 { ok = 0; }
+
+  let _ = uart_puts_rpi4_vani("CRYPTO: SHA-256 vs 3 NIST/FIPS-180-4 KATs (empty, \"abc\", 2-block)");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
@@ -653,6 +1008,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = task_switch_self_test();
   let _ = preempt_yield_self_test();
   let _ = preempt_init();
+  let _ = sha256_self_test_rpi4();
   return 0;
 }
 
@@ -892,15 +1248,20 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 84 minimal shell\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 85 minimal shell + crypto\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
     let _ = rpi4_vani_self_test();
+    return 0;
+  }
+  if rpi4_shell_line_matches("sha256") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = sha256_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_starts_with("echo ") == (1 as u32) {

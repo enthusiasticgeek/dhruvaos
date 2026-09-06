@@ -3346,6 +3346,65 @@ than assumed:
   commands, any command that touches a peripheral this port doesn't
   have yet (storage, networking) -- deliberately out of scope for a
   FIRST minimal shell.
+
+  **ROUND 85 UPDATE, 2026-09-06**: self-contained crypto -- SHA-256,
+  the first cryptographic primitive on this port, per the user's own
+  stated sequence after round 84's shell ("start the minimal
+  interactive shell. then self contained crypto"). Deliberately NOT a
+  line-for-line port of kernel_main.vani's own sha256_* family: that
+  implementation reads/writes through `mut ref i64` buffers via
+  buf_read_u32/buf_write_u32 and sha256_*_scratch_get/set
+  (hand-written ARM32 asm in boot/dharafs_buf.S + boot/scratch_
+  state.S) plus dhruva_alloc_bytes (a heap allocator) -- machinery
+  that exists there ONLY to fix a real Pi 1 bug class (a long-lived
+  scratch pointer held live in a register across many calls got
+  corrupted by interrupt delivery under that port's older interrupt
+  scheme; see sha256_compress's own "Round 65 hardening" comment on
+  the Pi 1 side). This port has neither problem: kernel_main_rpi4.
+  vani has zero heap allocator and zero `extern "C"` declarations by
+  design, and vani's `[T; N]` fixed arrays are genuine Copy stack
+  values with compiler-inserted bounds checks on both the C and LLVM
+  backends -- confirmed via a standalone probe (`ref`/`mut ref
+  [u32; N]` and `[u8; N]` params, plain array-literal locals, and that
+  vani's native u32 `+` still traps on overflow on this target too)
+  before writing any of the real port. So plain fixed-array function
+  parameters replace every one of that side's buffer-accessor calls,
+  with no persistent-scratch-across-calls indirection needed at all.
+  Same FIPS 180-4 algorithm and the identical sha256_wrap_add32
+  widen-to-i64/mask/truncate technique as the Pi 1 side (architecture-
+  independent, still required since native u32 wraparound isn't
+  available on any target). Fixed at a 256-byte (4-block, up to
+  247-byte message) padded buffer rather than a dynamically-sized one
+  -- enough for this round's own 3 KATs with headroom; hashing
+  something longer is out of scope for this round.
+
+  A real bug found and fixed live, the first one on this port since
+  round 82: the very first build faulted immediately on entry to the
+  self-test with `ESR_EL1 EC=0x07` ("trapped SIMD/FP access"). Root
+  cause: LLVM's AArch64 backend freely uses NEON registers for
+  ordinary array/struct copies and initialization even in code with
+  no float types anywhere (the new 256-byte/64-word array locals were
+  the first code on this port to trigger it), and `boot/rpi4/boot.S`
+  never set `CPACR_EL1.FPEN` -- FP/SIMD traps to EL1 by default at its
+  EL3-drop reset value of 0. Fixed with the standard one-time bare-
+  metal enablement (`mov x0, #0x300000; msr cpacr_el1, x0; isb`) added
+  right after `clear_bss_rpi4_done`, before `mmu_init_rpi4` -- every
+  AArch64 kernel needs this same step; there was simply no prior code
+  on this port that happened to trigger vectorized codegen.
+
+  Wired into `kmain_rpi4_vani` (boot-time self-test) and a new `sha256`
+  shell command (reruns it on demand, same pattern as `test`). Live-
+  verified: all 3 FIPS-180-4/NIST KATs (empty string, "abc", and the
+  56-byte 2-block vector) pass with the exact expected digests, byte
+  for byte, matching kernel_main.vani's own sha256_self_test vectors.
+  `test/rpi4_shell_smoke.py` updated for the new `help`/`ver` text and
+  a `sha256` command check; all 8 Pi 4 smoke tests pass; zero Pi 1
+  files touched.
+
+  **Not done**: SHA-512, HMAC-SHA256, PBKDF2, ChaCha20-Poly1305,
+  Ed25519/X25519 (all present on the Pi 1 side) remain unported --
+  this round's scope was proving the fixed-array-based, zero-heap
+  design works at all, with the smallest useful primitive.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
