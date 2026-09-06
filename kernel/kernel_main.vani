@@ -1,6 +1,94 @@
 // श्री।
 intent "Dhruva Phase 0-2 -- bare-metal boot + UART hello on BCM2835 (Pi 1 Model B / QEMU raspi1ap), fixed-priority preemptive scheduling across three tasks plus a minimal Immediate Priority Ceiling Protocol mutex demonstrating bounded (not unbounded) priority inversion. Entered from boot/rpi1/boot.S's _start after the stack pointer is set up and BSS is cleared.";
 
+// BCM2835 (Pi 1 Model B / QEMU raspi1ap) MMIO register map. Every
+// address below used to be a `let name: i64 = 0x...;` re-declared
+// locally in each function that touched it (up to 3x for the busiest
+// registers) -- ordinary copy-pasted literals with no cross-check
+// that two different peripherals hadn't been given overlapping
+// addresses. Ported to vani-compiler's DHDL v0.1 `#[mmio(size=N)]`
+// MVP (see ~/dhruvaos-device-tree.md / the "DHDL v0.1" design
+// artifact): each register is its own tagged const, and `vanic
+// check` now verifies at compile time that none of these 32
+// addresses overlap another's `[base, base+size)` range -- a real
+// check that didn't exist before, not just a style cleanup. Every
+// call site below still declares its own local `let` (unchanged
+// variable names, unchanged function bodies) but now assigns it
+// from the checked const instead of a bare hex literal.
+//
+// GPIO (base 0x20200000)
+#[mmio(size=4)]
+const GPFSEL1: i64 = 0x20200004;
+#[mmio(size=4)]
+const GPFSEL4: i64 = 0x20200010;
+#[mmio(size=4)]
+const GPFSEL5: i64 = 0x20200014;
+#[mmio(size=4)]
+const GPPUD: i64 = 0x20200094;
+#[mmio(size=4)]
+const GPPUDCLK0: i64 = 0x20200098;
+// UART0 / PL011 (base 0x20201000)
+#[mmio(size=4)]
+const UART_DR: i64 = 0x20201000;
+#[mmio(size=4)]
+const UART_FR: i64 = 0x20201018;
+#[mmio(size=4)]
+const UART_IBRD: i64 = 0x20201024;
+#[mmio(size=4)]
+const UART_FBRD: i64 = 0x20201028;
+#[mmio(size=4)]
+const UART_LCRH: i64 = 0x2020102C;
+#[mmio(size=4)]
+const UART_CR: i64 = 0x20201030;
+#[mmio(size=4)]
+const UART_IMSC: i64 = 0x20201038;
+#[mmio(size=4)]
+const UART_ICR: i64 = 0x20201044;
+// System Timer (base 0x20003000)
+#[mmio(size=4)]
+const TIMER_CS: i64 = 0x20003000;
+#[mmio(size=4)]
+const TIMER_CLO: i64 = 0x20003004;
+#[mmio(size=4)]
+const TIMER_C1: i64 = 0x20003010;
+// Interrupt controller (base 0x2000B000)
+#[mmio(size=4)]
+const IC_PENDING1: i64 = 0x2000B204;
+#[mmio(size=4)]
+const IC_PENDING2: i64 = 0x2000B208;
+#[mmio(size=4)]
+const IC_ENABLE1: i64 = 0x2000B210;
+#[mmio(size=4)]
+const IC_ENABLE2: i64 = 0x2000B214;
+// Power management / watchdog (base 0x20100000)
+#[mmio(size=4)]
+const PM_RSTC: i64 = 0x2010001C;
+#[mmio(size=4)]
+const PM_WDOG: i64 = 0x20100024;
+// SD host controller (base 0x20202000)
+#[mmio(size=4)]
+const SDCMD: i64 = 0x20202000;
+#[mmio(size=4)]
+const SDARG: i64 = 0x20202004;
+#[mmio(size=4)]
+const SDTOUT: i64 = 0x20202008;
+#[mmio(size=4)]
+const SDCDIV: i64 = 0x2020200C;
+#[mmio(size=4)]
+const SDRSP0: i64 = 0x20202010;
+#[mmio(size=4)]
+const SDHSTS: i64 = 0x20202020;
+#[mmio(size=4)]
+const SDVDD: i64 = 0x20202030;
+#[mmio(size=4)]
+const SDEDM: i64 = 0x20202034;
+#[mmio(size=4)]
+const SDHCFG: i64 = 0x20202038;
+#[mmio(size=4)]
+const SDHBCT: i64 = 0x2020203C;
+#[mmio(size=4)]
+const SDHBLC: i64 = 0x20202050;
+
 // Context-switch mechanics (boot/context_switch.S) and the tiny amount
 // of raw memory allocation they need (boot/rpi1/runtime_stubs.c) are
 // necessarily outside vani: a task-to-task context switch needs to save/
@@ -1207,9 +1295,9 @@ fn delay(count: i64) -> i64 {
 // right from the start means this same code works unmodified when this
 // boots on the real Model B, not just under QEMU.
 fn gpio_uart_alt_init() -> i64 {
-  let gpfsel1: i64 = 0x20200004;
-  let gppud: i64 = 0x20200094;
-  let gppudclk0: i64 = 0x20200098;
+  let gpfsel1: i64 = GPFSEL1;
+  let gppud: i64 = GPPUD;
+  let gppudclk0: i64 = GPPUDCLK0;
 
   let ra: u32 = mmio_read_u32(gpfsel1);
   // Clear bits 12-17 (pin14 + pin15 function-select fields), then set
@@ -1319,7 +1407,7 @@ fn gpio_read(pin: i64) -> u32 {
 // model) -- only real hardware can confirm this actually configures a
 // pull resistor.
 fn gpio_set_pull(pin: i64, pull: u32) -> i64 {
-  let gppud: i64 = 0x20200094;
+  let gppud: i64 = GPPUD;
   let clk_reg: i64 = if pin < 32 { 0x20200098 } else { 0x2020009C };
   let bit: u32 = (pin % 32) as u32;
   let _ = mmio_write_u32(gppud, pull);
@@ -1646,11 +1734,11 @@ fn uart_init() -> i64 {
   // is: TCG never reorders anything.
   let _ = mem_barrier();
 
-  let uart_cr: i64 = 0x20201030;
-  let uart_icr: i64 = 0x20201044;
-  let uart_ibrd: i64 = 0x20201024;
-  let uart_fbrd: i64 = 0x20201028;
-  let uart_lcrh: i64 = 0x2020102C;
+  let uart_cr: i64 = UART_CR;
+  let uart_icr: i64 = UART_ICR;
+  let uart_ibrd: i64 = UART_IBRD;
+  let uart_fbrd: i64 = UART_FBRD;
+  let uart_lcrh: i64 = UART_LCRH;
 
   let _ = mmio_write_u32(uart_cr, 0 as u32);
   let _ = mmio_write_u32(uart_icr, 0x7FF as u32);
@@ -1675,13 +1763,13 @@ fn uart_init() -> i64 {
 // already load-bearing elsewhere in this file (uart_icr at the same
 // 0x44 offset used here, from uart_init/the existing TX path).
 fn uart_rx_irq_init() -> i64 {
-  let uart_imsc: i64 = 0x20201038;
+  let uart_imsc: i64 = UART_IMSC;
   // RXIM (bit 4): interrupt whenever the RX FIFO is above its trigger
   // level -- left at the PL011 default (1/8 full), close enough to
   // "every keystroke" for interactive typing at human speed.
   let _ = mmio_write_u32(uart_imsc, 0x10 as u32);
 
-  let ic_enable2: i64 = 0x2000B214;
+  let ic_enable2: i64 = IC_ENABLE2;
   // GPU IRQ 57 (UART0) is bit 25 of the controller's second
   // enable/pending register group (IRQs 32-63).
   let _ = mmio_write_u32(ic_enable2, 0x02000000 as u32);
@@ -1689,8 +1777,8 @@ fn uart_rx_irq_init() -> i64 {
 }
 
 fn uart_putc(c: i64) -> i64 {
-  let uart_fr: i64 = 0x20201018;
-  let uart_dr: i64 = 0x20201000;
+  let uart_fr: i64 = UART_FR;
+  let uart_dr: i64 = UART_DR;
   // Wait while the TX FIFO is full (FR bit 5).
   while true {
     let fr: u32 = mmio_read_u32(uart_fr);
@@ -1712,8 +1800,8 @@ fn uart_putc(c: i64) -> i64 {
 // progress can never afford to block on a shared peripheral no matter
 // how unlikely the wait would be in practice.
 fn uart_putc_nonblocking(c: i64) -> i64 {
-  let uart_fr: i64 = 0x20201018;
-  let uart_dr: i64 = 0x20201000;
+  let uart_fr: i64 = UART_FR;
+  let uart_dr: i64 = UART_DR;
   let fr: u32 = mmio_read_u32(uart_fr);
   if (fr & (0x20 as u32)) == (0 as u32) {
     let _ = mmio_write_u8(uart_dr, c as u8);
@@ -1966,10 +2054,10 @@ fn uart_put_i64(v: i64) -> i64 {
 extern "C" fn enable_irqs() -> i64;
 
 fn timer_ic_init() -> i64 {
-  let timer_cs: i64 = 0x20003000;
-  let timer_clo: i64 = 0x20003004;
-  let timer_c1: i64 = 0x20003010;
-  let ic_enable1: i64 = 0x2000B210;
+  let timer_cs: i64 = TIMER_CS;
+  let timer_clo: i64 = TIMER_CLO;
+  let timer_c1: i64 = TIMER_C1;
+  let ic_enable1: i64 = IC_ENABLE1;
 
   // Arm the first compare match 500ms out (500000 us @ 1MHz).
   let now: u32 = mmio_read_u32(timer_clo);
@@ -2041,8 +2129,8 @@ fn timer_ic_init() -> i64 {
 // against accidental writes.
 fn watchdog_arm(timeout_ticks: u32) -> i64 {
   let pm_password: u32 = 0x5A000000 as u32;
-  let pm_rstc: i64 = 0x2010001C;
-  let pm_wdog: i64 = 0x20100024;
+  let pm_rstc: i64 = PM_RSTC;
+  let pm_wdog: i64 = PM_WDOG;
   let wrcfg_clr: u32 = 0xFFFFFFCF as u32;
   let wrcfg_full_reset: u32 = 0x00000020 as u32;
 
@@ -2089,8 +2177,8 @@ fn watchdog_kick() -> i64 {
 // machine isn't done enough yet to annotate meaningfully; that lands
 // once the driver is complete, not incrementally per bring-up step.
 fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
-  let sdarg: i64 = 0x20202004;
-  let sdcmd: i64 = 0x20202000;
+  let sdarg: i64 = SDARG;
+  let sdcmd: i64 = SDCMD;
   let sdcmd_new_flag: u32 = 0x8000 as u32;
   let _ = mmio_write_u32(sdarg, arg);
   let _ = mmio_write_u32(sdcmd, sdcmd_new_flag | cmd_and_flags);
@@ -2185,8 +2273,8 @@ fn sdhost_cmd_timed_out_self_test() -> i64 {
 // re-reading the emulator source directly (not guessing from another
 // peripheral's pin group) is what caught the mismatch.
 fn gpio_sdhost_alt_init() -> i64 {
-  let gpfsel4: i64 = 0x20200010;
-  let gpfsel5: i64 = 0x20200014;
+  let gpfsel4: i64 = GPFSEL4;
+  let gpfsel5: i64 = GPFSEL5;
 
   // Pins 48 (bits 24-26) and 49 (bits 27-29) live in GPFSEL4.
   let r4: u32 = mmio_read_u32(gpfsel4);
@@ -2220,14 +2308,14 @@ fn sdhost_init() -> i64 {
   // way, just intermittently instead of always, on real hardware.
   let _ = mem_barrier();
 
-  let sdvdd: i64 = 0x20202030;
-  let sdcdiv: i64 = 0x2020200C;
-  let sdtout: i64 = 0x20202008;
-  let sdhcfg: i64 = 0x20202038;
-  let sdhbct: i64 = 0x2020203C;
-  let sdhblc: i64 = 0x20202050;
-  let sdhsts: i64 = 0x20202020;
-  let sdedm: i64 = 0x20202034;
+  let sdvdd: i64 = SDVDD;
+  let sdcdiv: i64 = SDCDIV;
+  let sdtout: i64 = SDTOUT;
+  let sdhcfg: i64 = SDHCFG;
+  let sdhbct: i64 = SDHBCT;
+  let sdhblc: i64 = SDHBLC;
+  let sdhsts: i64 = SDHSTS;
+  let sdedm: i64 = SDEDM;
 
   // Power off, then back on -- a clean, known starting FSM state
   // rather than trusting whatever QEMU's reset default happens to be.
@@ -2251,7 +2339,7 @@ fn sdhost_init() -> i64 {
   let sdcmd_no_response: u32 = 0x400 as u32;
   let sdcmd_long_response: u32 = 0x200 as u32;
   let sdcmd_busywait: u32 = 0x800 as u32;
-  let sdrsp0: i64 = 0x20202010;
+  let sdrsp0: i64 = SDRSP0;
 
   // CMD0: GO_IDLE_STATE. No response expected.
   let cmd0_status: u32 = sdhost_cmd(sdcmd_no_response, 0 as u32);
@@ -2424,9 +2512,9 @@ fn sdhost_card_addr(block_num: i64) -> u32 {
 // up before the command ever completed, a failure regardless of what
 // SDHSTS shows.
 fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
-  let sdhbct: i64 = 0x2020203C;
-  let sdhblc: i64 = 0x20202050;
-  let sdhsts: i64 = 0x20202020;
+  let sdhbct: i64 = SDHBCT;
+  let sdhblc: i64 = SDHBLC;
+  let sdhsts: i64 = SDHSTS;
   let sdcmd_read: u32 = 0x40 as u32;
   let sdcmd_new_flag: u32 = 0x8000 as u32;
 
@@ -2454,9 +2542,9 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   if fault_write_maybe_inject() == (1 as u32) {
     return 1;
   }
-  let sdhbct: i64 = 0x2020203C;
-  let sdhblc: i64 = 0x20202050;
-  let sdhsts: i64 = 0x20202020;
+  let sdhbct: i64 = SDHBCT;
+  let sdhblc: i64 = SDHBLC;
+  let sdhsts: i64 = SDHSTS;
   let sdcmd_write: u32 = 0x80 as u32;
   let sdcmd_new_flag: u32 = 0x8000 as u32;
 
@@ -6138,13 +6226,13 @@ fn shell_echo_self_test() -> i64 {
 // scheduler_switch_from_irq and gate the tick_count increment on it.
 fn irq_dispatch() -> i64 {
   let _ = irq_count_increment();
-  let ic_pending1: i64 = 0x2000B204;
+  let ic_pending1: i64 = IC_PENDING1;
   let pending: u32 = mmio_read_u32(ic_pending1);
   let was_timer_tick: i64 = 0;
   if (pending & (2 as u32)) != (0 as u32) {
-    let timer_cs: i64 = 0x20003000;
-    let timer_clo: i64 = 0x20003004;
-    let timer_c1: i64 = 0x20003010;
+    let timer_cs: i64 = TIMER_CS;
+    let timer_clo: i64 = TIMER_CLO;
+    let timer_c1: i64 = TIMER_C1;
 
     // Acknowledge channel 1's match (write-1-to-clear) and reschedule
     // the next one 500ms out, before doing anything else -- if the
@@ -6182,12 +6270,12 @@ fn irq_dispatch() -> i64 {
     was_timer_tick = 1;
   }
 
-  let ic_pending2: i64 = 0x2000B208;
+  let ic_pending2: i64 = IC_PENDING2;
   let pending2: u32 = mmio_read_u32(ic_pending2);
   if (pending2 & (0x02000000 as u32)) != (0 as u32) {
-    let uart_fr: i64 = 0x20201018;
-    let uart_dr: i64 = 0x20201000;
-    let uart_icr: i64 = 0x20201044;
+    let uart_fr: i64 = UART_FR;
+    let uart_dr: i64 = UART_DR;
+    let uart_icr: i64 = UART_ICR;
     // Drain the RX FIFO for up to 128 iterations -- shell_line_buf's
     // own capacity (shell_state.S), not the PL011's real 16-byte
     // hardware FIFO depth. A `while` loop here, even one with a
