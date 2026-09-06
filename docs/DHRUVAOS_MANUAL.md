@@ -502,6 +502,22 @@ things:
   `dhruva_alloc_bytes` call, matching every fixed task's own stack
   allocation. See `task_custom_demo` in `kernel_main.vani` for a
   complete worked example.
+- **A new MMIO peripheral register**: don't add a bare hex-literal
+  `let reg: i64 = 0x...;` inside the function that needs it — every
+  register `kernel_main.vani`/`kernel_main_rpi4.vani` already touch
+  is declared once, near the top of the file, as a
+  `#[mmio(size=N)]`-tagged top-level `const` (vani-compiler's DHDL
+  v0.1 attribute). `vanic check` then verifies at compile time that
+  the new address doesn't overlap any existing region — a real,
+  automatic check, not a comment or a convention someone has to
+  remember to run. Add your const to the existing block, tag it, then
+  reference it from a local `let reg: i64 = YOUR_CONST;` at each call
+  site exactly like the existing ones. The `rpi-mmio` kosh package
+  (`~/source/rpi-mmio`, not yet published to a registry) carries the
+  same BCM2835/BCM2711 constants as a reusable dependency for any
+  *other* project, but this kernel's own two files still declare
+  their own copies directly (no dependency needed for code that
+  already lives in this repo).
 
 ## 6. Building and running
 
