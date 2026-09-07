@@ -4601,6 +4601,65 @@ than assumed:
   (state/seq/ack/ports/ips/rtx-tracking), genuinely the biggest
   design step of the whole effort. After that, round 103 (scheduler
   scoping) and round 104 (X.509 fork) per the user's own stated order.
+
+  **ROUND 106f UPDATE, 2026-09-07**: TCP added to `vani-netstack`
+  (v0.6.0, pushed) -- the header codec/checksum only, closing the
+  networking-generification effort. TCP's 20-byte header (options
+  never sent, data offset always 5) gets the SAME standalone-buffer
+  codec IPv4's own header got; its checksum spans the whole segment
+  (header+payload, genuinely variable length like UDP's own scope)
+  so it streams. A real, non-trivial finding here: TCP's own running-
+  sum accumulation is IDENTICAL to UDP's -- both RFC 768/793 define
+  the same 16-bit one's-complement pseudo-header-plus-segment sum,
+  only the protocol number (6 vs 17) and the final step differ (TCP
+  has no RFC-768 zero-substitution, so a valid segment sums to 0, not
+  UDP's 0xFFFF) -- so `netstack_udp_checksum_update` (the accumulator
+  itself, already fully protocol-agnostic) is reused AS-IS for TCP,
+  with only new `netstack_tcp_checksum_init`/`finalize` variants for
+  the parts that actually differ. Avoided writing a byte-for-byte
+  duplicate `netstack_tcp_checksum_update` for zero behavioral gain.
+
+  The connection STATE MACHINE (SYN/ACK/FIN handling, retransmission,
+  the actual ~15-field `TcpConn` state this round's own "Next" note
+  above anticipated) was deliberately NOT migrated -- it's real
+  network I/O orchestration (sending ACKs/retransmits mid-decision,
+  touching each board's own persistent per-connection extern state),
+  the same class of thing `arp_resolve_start`/`poll` and DHCP's own
+  client/server poll functions already stayed unmigrated for
+  throughout this whole effort. Splitting decision logic cleanly from
+  I/O would be a genuine architecture redesign of both boards' TCP
+  state machines, not an extraction of already-duplicate pure
+  algorithm -- correctly out of scope for this effort's own pattern.
+
+  Verified on both boards: `vanic check`/`build.sh`/`build_rpi4.sh`
+  all passed. Pi 4/5: `rpi4_shell_smoke.py` zero `(FAIL)`, both
+  `TCP: ...` lines (header build/checksum, full connection lifecycle)
+  `(PASS)`. Pi 1: `phase4_milestone.py`'s full battery zero `(FAIL)`
+  -- ALL 6 of Pi 1's own TCP self-tests pass, including simultaneous
+  open/close and peer-window-enforcement edge cases, PLUS the
+  battery's own real `tcpecho`/`tcprtx`/`tlsecho` traffic all routes
+  through the migrated header codec and streaming checksum on every
+  single segment -- the strongest, broadest verification of any
+  migration in this entire effort.
+
+  **THE NETWORKING-GENERIFICATION EFFORT IS NOW CLOSED.** Packet
+  filter (106a), ARP (106b), IPv4 (106c), UDP (106d), DHCP (106e),
+  and TCP (106f) all now share one `vani-netstack` kosh-package
+  implementation across Pi 1 and Pi 4/5, matching what Phase 1 crypto
+  generification (rounds 98-102) already achieved for every crypto
+  primitive. Combined with crypto, this closes the user's own original
+  "make some packages generic so whatever you have pi4 is on pi1 too"
+  request for BOTH the crypto and networking layers -- everything
+  duplicated between the two boards at the protocol/algorithm level
+  (as opposed to genuine hardware register access) now lives in a
+  shared, hardware-agnostic package a future non-RPi board could
+  consume too, per the user's own stated multi-board-portability
+  goal. One concrete follow-on opportunity flagged but not scheduled:
+  giving Pi 1 a real DHCP server (round 106e's own note -- the message
+  algorithm already exists, only netif/socket glue would be new work).
+  Next: round 103 (scheduler policy-vs-mechanism scoping) and round
+  104 (X.509/mTLS/HTTPS/MQTT fork decision), per the user's own
+  explicitly stated order.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

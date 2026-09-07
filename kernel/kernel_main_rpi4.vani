@@ -1770,42 +1770,39 @@ fn filter_outgoing_self_test_rpi4() -> i64 {
 // `ipv4_build_header_rpi4`, applied proactively here instead of
 // discovered via a `vanic check` error this time.
 
-fn tcp_flag_fin_rpi4() -> u32 { return 0x01 as u32; }
-fn tcp_flag_syn_rpi4() -> u32 { return 0x02 as u32; }
-fn tcp_flag_rst_rpi4() -> u32 { return 0x04 as u32; }
-fn tcp_flag_psh_rpi4() -> u32 { return 0x08 as u32; }
-fn tcp_flag_ack_rpi4() -> u32 { return 0x10 as u32; }
+// Round 106f: TCP's own header codec/checksum ALGORITHM now lives in
+// the shared `netstack` package (`netstack_tcp_*`/`UdpChecksumCtx`
+// reused), confirmed a direct port of this file's own former body.
+// TCP's checksum spans the whole segment (header+payload, genuinely
+// variable length like UDP's own scope) so it streams; the 20-byte
+// header itself is fixed, so it gets its own standalone codec
+// matching IPv4's own precedent. Same `mut ref`->`ref` no-reborrow
+// limitation as every prior round's own header codecs -- each
+// function inlines its own header-window extraction.
+fn tcp_flag_fin_rpi4() -> u32 { return netstack_tcp_flag_fin(); }
+fn tcp_flag_syn_rpi4() -> u32 { return netstack_tcp_flag_syn(); }
+fn tcp_flag_rst_rpi4() -> u32 { return netstack_tcp_flag_rst(); }
+fn tcp_flag_psh_rpi4() -> u32 { return netstack_tcp_flag_psh(); }
+fn tcp_flag_ack_rpi4() -> u32 { return netstack_tcp_flag_ack(); }
 
 fn tcp_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], tcp_offset: i64, tcp_len: i64) -> u32 {
-  let sum: u32 = 0 as u32;
-  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (src_ip & (0xFFFF as u32));
-  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (dst_ip & (0xFFFF as u32));
-  sum = sum + (6 as u32); // protocol (pseudo-header's zero byte contributes nothing)
-  sum = sum + (tcp_len as u32);
-  let i: i64 = 0;
-  while (i + 1) < tcp_len {
-    let word: u32 = arp_read_u16_be_rpi4(frame, tcp_offset + i);
-    sum = sum + word;
-    i = i + 2;
+  let ctx: UdpChecksumCtx = netstack_tcp_checksum_init(src_ip, dst_ip, tcp_len);
+  let pos: i64 = 0;
+  while pos < tcp_len {
+    let remaining: i64 = tcp_len - pos;
+    let take: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = netstack_zero256_bytes();
+    let i: i64 = 0;
+    while i < take {
+      chunk[i] = frame[tcp_offset + pos + i];
+      i = i + 1;
+    }
+    ctx = netstack_udp_checksum_update(ctx, ref chunk, take);
+    pos = pos + take;
   }
-  if i < tcp_len {
-    let b: u32 = frame[tcp_offset + i] as u32;
-    sum = sum + (b << (8 as u32)); // odd trailing byte, zero-padded low
-  }
-  while (sum >> (16 as u32)) != (0 as u32) {
-    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
-  }
-  return (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+  return netstack_tcp_checksum_finalize(ref ctx);
 }
 
-// See tcp_checksum_rpi4's own note on why this differs from
-// ipv4_verify_checksum_rpi4's `== 0xFFFF` convention: tcp_checksum_
-// rpi4 complements its own running sum internally before returning
-// (matching kernel_main.vani's own tcp_checksum), so calling it again
-// over the as-transmitted bytes (checksum field included) computes
-// ~(S + ~S) = ~0xFFFF = 0x0000, not all-ones.
 fn tcp_verify_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], tcp_offset: i64, tcp_len: i64) -> i64 {
   if tcp_checksum_rpi4(src_ip, dst_ip, frame, tcp_offset, tcp_len) == (0 as u32) {
     return 1;
@@ -1813,73 +1810,94 @@ fn tcp_verify_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], tcp_
   return 0;
 }
 
-// Writes the TCP header+payload at frame[tcp_offset..), returning the
-// segment length (header+payload). Caller builds the IP header around
-// this afterward (see tcp_send_segment_rpi4 below).
 fn tcp_build_header_rpi4(frame: mut ref [u8; 512], tcp_offset: i64, src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32, payload: ref [u8; 512], payload_len: i64, src_ip: u32, dst_ip: u32) -> i64 {
   let tcp_len: i64 = 20 + payload_len;
-  let _ = arp_write_u16_be_rpi4(frame, tcp_offset, src_port);
-  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 2, dst_port);
-  let _ = arp_write_u32_be_rpi4(frame, tcp_offset + 4, seq);
-  let _ = arp_write_u32_be_rpi4(frame, tcp_offset + 8, ack);
-  frame[tcp_offset + 12] = 0x50 as u8; // data offset=5, reserved=0
-  frame[tcp_offset + 13] = flags as u8;
-  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 14, window);
-  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 16, 0 as u32); // checksum placeholder
-  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 18, 0 as u32); // urgent pointer, unused
-  let i: i64 = 0;
-  while i < payload_len {
-    frame[tcp_offset + 20 + i] = payload[i];
-    i = i + 1;
+  let hdr: [u8; 20] = netstack_tcp_header_only(src_port, dst_port, seq, ack, flags, window);
+  let hi: i64 = 0;
+  while hi < 20 {
+    frame[tcp_offset + hi] = hdr[hi];
+    hi = hi + 1;
   }
-  // Inline checksum (see this section's own header comment for why:
-  // `frame` here is a `mut ref` parameter, and vani has no reborrow
-  // to a plain `ref` for calling the shared tcp_checksum_rpi4).
-  let sum: u32 = 0 as u32;
-  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (src_ip & (0xFFFF as u32));
-  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (dst_ip & (0xFFFF as u32));
-  sum = sum + (6 as u32);
-  sum = sum + (tcp_len as u32);
   let j: i64 = 0;
-  while (j + 1) < tcp_len {
-    let hi: u32 = frame[tcp_offset + j] as u32;
-    let lo: u32 = frame[tcp_offset + j + 1] as u32;
-    let word: u32 = (hi << (8 as u32)) | lo;
-    sum = sum + word;
-    j = j + 2;
+  while j < payload_len {
+    frame[tcp_offset + 20 + j] = payload[j];
+    j = j + 1;
   }
-  if j < tcp_len {
-    let b: u32 = frame[tcp_offset + j] as u32;
-    sum = sum + (b << (8 as u32));
+
+  let ctx: UdpChecksumCtx = netstack_tcp_checksum_init(src_ip, dst_ip, tcp_len);
+  let pos: i64 = 0;
+  while pos < tcp_len {
+    let remaining: i64 = tcp_len - pos;
+    let take: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = netstack_zero256_bytes();
+    let k: i64 = 0;
+    while k < take {
+      chunk[k] = frame[tcp_offset + pos + k];
+      k = k + 1;
+    }
+    ctx = netstack_udp_checksum_update(ctx, ref chunk, take);
+    pos = pos + take;
   }
-  while (sum >> (16 as u32)) != (0 as u32) {
-    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
-  }
-  let checksum: u32 = (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
-  let _ = arp_write_u16_be_rpi4(frame, tcp_offset + 16, checksum);
+  let checksum: u32 = netstack_tcp_checksum_finalize(ref ctx);
+  let checksum_bytes: [u8; 2] = netstack_tcp_encode_checksum(checksum);
+  frame[tcp_offset + 16] = checksum_bytes[0];
+  frame[tcp_offset + 17] = checksum_bytes[1];
   return tcp_len;
 }
 
 fn tcp_get_src_port_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
-  return arp_read_u16_be_rpi4(frame, tcp_offset);
+  let hdr: [u8; 20] = [
+    frame[tcp_offset], frame[tcp_offset + 1], frame[tcp_offset + 2], frame[tcp_offset + 3], frame[tcp_offset + 4],
+    frame[tcp_offset + 5], frame[tcp_offset + 6], frame[tcp_offset + 7], frame[tcp_offset + 8], frame[tcp_offset + 9],
+    frame[tcp_offset + 10], frame[tcp_offset + 11], frame[tcp_offset + 12], frame[tcp_offset + 13], frame[tcp_offset + 14],
+    frame[tcp_offset + 15], frame[tcp_offset + 16], frame[tcp_offset + 17], frame[tcp_offset + 18], frame[tcp_offset + 19]
+  ];
+  return netstack_tcp_get_src_port(ref hdr);
 }
 fn tcp_get_seq_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
-  return arp_read_u32_be_rpi4(frame, tcp_offset + 4);
+  let hdr: [u8; 20] = [
+    frame[tcp_offset], frame[tcp_offset + 1], frame[tcp_offset + 2], frame[tcp_offset + 3], frame[tcp_offset + 4],
+    frame[tcp_offset + 5], frame[tcp_offset + 6], frame[tcp_offset + 7], frame[tcp_offset + 8], frame[tcp_offset + 9],
+    frame[tcp_offset + 10], frame[tcp_offset + 11], frame[tcp_offset + 12], frame[tcp_offset + 13], frame[tcp_offset + 14],
+    frame[tcp_offset + 15], frame[tcp_offset + 16], frame[tcp_offset + 17], frame[tcp_offset + 18], frame[tcp_offset + 19]
+  ];
+  return netstack_tcp_get_seq(ref hdr);
 }
 fn tcp_get_ack_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
-  return arp_read_u32_be_rpi4(frame, tcp_offset + 8);
+  let hdr: [u8; 20] = [
+    frame[tcp_offset], frame[tcp_offset + 1], frame[tcp_offset + 2], frame[tcp_offset + 3], frame[tcp_offset + 4],
+    frame[tcp_offset + 5], frame[tcp_offset + 6], frame[tcp_offset + 7], frame[tcp_offset + 8], frame[tcp_offset + 9],
+    frame[tcp_offset + 10], frame[tcp_offset + 11], frame[tcp_offset + 12], frame[tcp_offset + 13], frame[tcp_offset + 14],
+    frame[tcp_offset + 15], frame[tcp_offset + 16], frame[tcp_offset + 17], frame[tcp_offset + 18], frame[tcp_offset + 19]
+  ];
+  return netstack_tcp_get_ack(ref hdr);
 }
 fn tcp_get_flags_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
-  return frame[tcp_offset + 13] as u32;
+  let hdr: [u8; 20] = [
+    frame[tcp_offset], frame[tcp_offset + 1], frame[tcp_offset + 2], frame[tcp_offset + 3], frame[tcp_offset + 4],
+    frame[tcp_offset + 5], frame[tcp_offset + 6], frame[tcp_offset + 7], frame[tcp_offset + 8], frame[tcp_offset + 9],
+    frame[tcp_offset + 10], frame[tcp_offset + 11], frame[tcp_offset + 12], frame[tcp_offset + 13], frame[tcp_offset + 14],
+    frame[tcp_offset + 15], frame[tcp_offset + 16], frame[tcp_offset + 17], frame[tcp_offset + 18], frame[tcp_offset + 19]
+  ];
+  return netstack_tcp_get_flags(ref hdr);
 }
 fn tcp_get_window_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
-  return arp_read_u16_be_rpi4(frame, tcp_offset + 14);
+  let hdr: [u8; 20] = [
+    frame[tcp_offset], frame[tcp_offset + 1], frame[tcp_offset + 2], frame[tcp_offset + 3], frame[tcp_offset + 4],
+    frame[tcp_offset + 5], frame[tcp_offset + 6], frame[tcp_offset + 7], frame[tcp_offset + 8], frame[tcp_offset + 9],
+    frame[tcp_offset + 10], frame[tcp_offset + 11], frame[tcp_offset + 12], frame[tcp_offset + 13], frame[tcp_offset + 14],
+    frame[tcp_offset + 15], frame[tcp_offset + 16], frame[tcp_offset + 17], frame[tcp_offset + 18], frame[tcp_offset + 19]
+  ];
+  return netstack_tcp_get_window(ref hdr);
 }
 fn tcp_get_data_offset_bytes_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> i64 {
-  let raw: u32 = frame[tcp_offset + 12] as u32;
-  return ((raw >> (4 as u32)) as i64) * 4;
+  let hdr: [u8; 20] = [
+    frame[tcp_offset], frame[tcp_offset + 1], frame[tcp_offset + 2], frame[tcp_offset + 3], frame[tcp_offset + 4],
+    frame[tcp_offset + 5], frame[tcp_offset + 6], frame[tcp_offset + 7], frame[tcp_offset + 8], frame[tcp_offset + 9],
+    frame[tcp_offset + 10], frame[tcp_offset + 11], frame[tcp_offset + 12], frame[tcp_offset + 13], frame[tcp_offset + 14],
+    frame[tcp_offset + 15], frame[tcp_offset + 16], frame[tcp_offset + 17], frame[tcp_offset + 18], frame[tcp_offset + 19]
+  ];
+  return netstack_tcp_get_data_offset_bytes(ref hdr);
 }
 
 // Builds a full Ethernet+IPv4+TCP segment and sends it via netif.

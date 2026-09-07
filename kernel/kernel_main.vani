@@ -8912,52 +8912,57 @@ fn udp_checksum_reject_self_test() -> i64 {
 // see udp_checksum's own comment for why the pseudo-header matters,
 // same reasoning applies verbatim here.
 
-fn tcp_flag_fin() -> u32 { return 0x01 as u32; }
-fn tcp_flag_syn() -> u32 { return 0x02 as u32; }
-fn tcp_flag_rst() -> u32 { return 0x04 as u32; }
-fn tcp_flag_psh() -> u32 { return 0x08 as u32; }
-fn tcp_flag_ack() -> u32 { return 0x10 as u32; }
+fn tcp_flag_fin() -> u32 { return netstack_tcp_flag_fin(); }
+fn tcp_flag_syn() -> u32 { return netstack_tcp_flag_syn(); }
+fn tcp_flag_rst() -> u32 { return netstack_tcp_flag_rst(); }
+fn tcp_flag_psh() -> u32 { return netstack_tcp_flag_psh(); }
+fn tcp_flag_ack() -> u32 { return netstack_tcp_flag_ack(); }
 
-fn tcp_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, tcp_offset: i64, tcp_len: i64) -> u32 {
-  let sum: u32 = 0 as u32;
-  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (src_ip & (0xFFFF as u32));
-  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (dst_ip & (0xFFFF as u32));
-  sum = sum + (6 as u32); // protocol (pseudo-header's zero byte contributes nothing)
-  sum = sum + (tcp_len as u32);
+// Round 106f: TCP's own header codec/checksum ALGORITHM now lives in
+// the shared `netstack` package (`netstack_tcp_*`/`UdpChecksumCtx`
+// reused, no separate TCP-specific accumulator needed -- the running
+// sum itself is identical between UDP and TCP, only the pseudo-
+// header seed and final zero-substitution step differ). TCP's
+// checksum spans the whole segment (header+payload), genuinely
+// unbounded on this file's own heap frames, so it streams in
+// <=256-byte chunks; the 20-byte header itself is fixed, so it uses
+// a standalone codec matching IPv4's own precedent.
+fn tcp_header_extract(frame: mut ref i64, tcp_offset: i64) -> [u8; 20] {
+  let hdr: [u8; 20] = netstack_zero20_bytes();
   let i: i64 = 0;
-  while (i + 1) < tcp_len {
-    let word: u32 = buf_read_u16_be(frame, tcp_offset + i);
-    sum = sum + word;
-    i = i + 2;
+  while i < 20 {
+    hdr[i] = buf_read_byte(frame, (tcp_offset + i) as u32) as u8;
+    i = i + 1;
   }
-  if i < tcp_len {
-    let b: u32 = buf_read_byte(frame, (tcp_offset + i) as u32);
-    sum = sum + (b << (8 as u32)); // odd trailing byte, zero-padded low
-  }
-  while (sum >> (16 as u32)) != (0 as u32) {
-    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
-  }
-  return (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+  return hdr;
 }
 
-// Writes the TCP header+payload at frame[tcp_offset..), returning the
-// segment length (header+payload). Caller builds the IP header around
-// this afterward (see tcp_send_segment below), same split as UDP's
-// own udp_build/udp_send for the same reason (a self-test can exercise
-// header construction alone without a full send/recv round trip).
+fn tcp_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, tcp_offset: i64, tcp_len: i64) -> u32 {
+  let ctx: UdpChecksumCtx = netstack_tcp_checksum_init(src_ip, dst_ip, tcp_len);
+  let pos: i64 = 0;
+  while pos < tcp_len {
+    let remaining: i64 = tcp_len - pos;
+    let take: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = netstack_zero256_bytes();
+    let i: i64 = 0;
+    while i < take {
+      chunk[i] = buf_read_byte(frame, (tcp_offset + pos + i) as u32) as u8;
+      i = i + 1;
+    }
+    ctx = netstack_udp_checksum_update(ctx, ref chunk, take);
+    pos = pos + take;
+  }
+  return netstack_tcp_checksum_finalize(ref ctx);
+}
+
 fn tcp_build_header(frame: mut ref i64, tcp_offset: i64, src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32, payload: mut ref i64, payload_len: i64, src_ip: u32, dst_ip: u32) -> i64 {
   let tcp_len: i64 = 20 + payload_len;
-  let _ = buf_write_u16_be(frame, tcp_offset, src_port);
-  let _ = buf_write_u16_be(frame, tcp_offset + 2, dst_port);
-  let _ = buf_write_u32_be(frame, tcp_offset + 4, seq);
-  let _ = buf_write_u32_be(frame, tcp_offset + 8, ack);
-  let _ = buf_write_byte(frame, (tcp_offset + 12) as u32, 0x50 as u32); // data offset=5, reserved=0
-  let _ = buf_write_byte(frame, (tcp_offset + 13) as u32, flags);
-  let _ = buf_write_u16_be(frame, tcp_offset + 14, window);
-  let _ = buf_write_u16_be(frame, tcp_offset + 16, 0 as u32); // checksum placeholder
-  let _ = buf_write_u16_be(frame, tcp_offset + 18, 0 as u32); // urgent pointer, unused
+  let hdr: [u8; 20] = netstack_tcp_header_only(src_port, dst_port, seq, ack, flags, window);
+  let hi: i64 = 0;
+  while hi < 20 {
+    let _ = buf_write_byte(frame, (tcp_offset + hi) as u32, hdr[hi] as u32);
+    hi = hi + 1;
+  }
   let i: i64 = 0;
   while i < payload_len {
     let b: u32 = buf_read_byte(payload, i as u32);
@@ -8970,26 +8975,32 @@ fn tcp_build_header(frame: mut ref i64, tcp_offset: i64, src_port: u32, dst_port
 }
 
 fn tcp_get_src_port(frame: mut ref i64, tcp_offset: i64) -> u32 {
-  return buf_read_u16_be(frame, tcp_offset);
+  let hdr: [u8; 20] = tcp_header_extract(frame, tcp_offset);
+  return netstack_tcp_get_src_port(ref hdr);
 }
 fn tcp_get_dst_port(frame: mut ref i64, tcp_offset: i64) -> u32 {
-  return buf_read_u16_be(frame, tcp_offset + 2);
+  let hdr: [u8; 20] = tcp_header_extract(frame, tcp_offset);
+  return netstack_tcp_get_dst_port(ref hdr);
 }
 fn tcp_get_seq(frame: mut ref i64, tcp_offset: i64) -> u32 {
-  return buf_read_u32_be(frame, tcp_offset + 4);
+  let hdr: [u8; 20] = tcp_header_extract(frame, tcp_offset);
+  return netstack_tcp_get_seq(ref hdr);
 }
 fn tcp_get_ack(frame: mut ref i64, tcp_offset: i64) -> u32 {
-  return buf_read_u32_be(frame, tcp_offset + 8);
+  let hdr: [u8; 20] = tcp_header_extract(frame, tcp_offset);
+  return netstack_tcp_get_ack(ref hdr);
 }
 fn tcp_get_flags(frame: mut ref i64, tcp_offset: i64) -> u32 {
-  return buf_read_byte(frame, (tcp_offset + 13) as u32);
+  let hdr: [u8; 20] = tcp_header_extract(frame, tcp_offset);
+  return netstack_tcp_get_flags(ref hdr);
 }
 fn tcp_get_window(frame: mut ref i64, tcp_offset: i64) -> u32 {
-  return buf_read_u16_be(frame, tcp_offset + 14);
+  let hdr: [u8; 20] = tcp_header_extract(frame, tcp_offset);
+  return netstack_tcp_get_window(ref hdr);
 }
 fn tcp_get_data_offset_bytes(frame: mut ref i64, tcp_offset: i64) -> i64 {
-  let raw: u32 = buf_read_byte(frame, (tcp_offset + 12) as u32);
-  return ((raw >> (4 as u32)) as i64) * 4;
+  let hdr: [u8; 20] = tcp_header_extract(frame, tcp_offset);
+  return netstack_tcp_get_data_offset_bytes(ref hdr);
 }
 
 // A correctly-checksummed segment's bytes, summed again as

@@ -1389,3 +1389,198 @@ fn netstack_dhcp_self_test() -> i64 {
 
   return ok;
 }
+
+// ---------------------------------------------------------------
+// TCP (RFC 793) -- header build/parse (fixed 20 bytes, no options,
+// same shape as IPv4's own header) plus a genuine streaming checksum
+// (spans the whole segment, header+payload, exactly like UDP's own
+// checksum scope -- Pi 1's real TCP payloads run to ~1460 bytes,
+// Pi 4/5's loopback-only netif only ~458).
+//
+// The checksum's own running-sum accumulation is IDENTICAL between
+// UDP and TCP (RFC 793/768 both define the same 16-bit one's-
+// complement pseudo-header-plus-segment sum) -- only the pseudo-
+// header's protocol number (6 vs 17) and the FINAL step differ (TCP
+// has no RFC-768 "never transmit 0, send 0xFFFF" substitution, so a
+// valid TCP segment's own re-summed result is 0, not UDP's 0xFFFF).
+// `netstack_tcp_checksum_init`/`finalize` below are TCP's own
+// pseudo-header seed and final-step variants; `netstack_udp_
+// checksum_update` (the running-sum accumulator itself) is reused
+// AS-IS for TCP too -- it has no protocol-specific logic inside it
+// at all, so writing a byte-for-byte duplicate `netstack_tcp_
+// checksum_update` would be pure duplication for zero behavioral
+// difference (the same reasoning Pi 4/5's own round-87 comment gives
+// for reusing `arp_read/write_u16/u32_be_rpi4` as generic buffer
+// accessors under an `arp_` name that's otherwise a naming
+// artifact).
+//
+// The 20-byte header itself IS fixed-size (TCP options are never
+// sent by this stack -- data offset is always 5), so it gets the
+// SAME standalone-buffer codec IPv4's own 20-byte header got, kept
+// entirely separate from the checksum's own streaming scope.
+//
+// The actual connection STATE MACHINE (SYN/ACK/FIN handling,
+// retransmission) stays entirely board-specific, unmigrated -- it's
+// real network I/O orchestration (sending ACKs/retransmits mid-
+// decision, touching each board's own persistent per-connection
+// extern state), the same class of thing `arp_resolve_start`/`poll`
+// and DHCP's own client/server poll functions already stayed put for.
+// ---------------------------------------------------------------
+
+fn netstack_tcp_flag_fin() -> u32 { return 0x01 as u32; }
+fn netstack_tcp_flag_syn() -> u32 { return 0x02 as u32; }
+fn netstack_tcp_flag_rst() -> u32 { return 0x04 as u32; }
+fn netstack_tcp_flag_psh() -> u32 { return 0x08 as u32; }
+fn netstack_tcp_flag_ack() -> u32 { return 0x10 as u32; }
+
+// Seeds the running sum with TCP's own IPv4 pseudo-header (RFC 793):
+// src_ip + dst_ip + protocol(6, TCP) + tcp_len (header+payload).
+fn netstack_tcp_checksum_init(src_ip: u32, dst_ip: u32, tcp_len: i64) -> UdpChecksumCtx {
+  let sum: u32 = 0 as u32;
+  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (src_ip & (0xFFFF as u32));
+  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (dst_ip & (0xFFFF as u32));
+  sum = sum + (6 as u32);
+  sum = sum + (tcp_len as u32);
+  return UdpChecksumCtx { sum: sum, carry_byte: 0 as u8, has_carry: 0 };
+}
+
+// Folds any pending odd trailing byte in and reduces to 16 bits --
+// NO zero-substitution (unlike `netstack_udp_checksum_finalize`), so
+// a valid, as-transmitted segment (checksum field included) re-sums
+// to exactly 0, matching `netstack_tcp_verify_checksum`-equivalent
+// callers' own `== 0` convention (NOT IPv4/UDP's own `== 0xFFFF`).
+fn netstack_tcp_checksum_finalize(ctx: ref UdpChecksumCtx) -> u32 {
+  let sum: u32 = ctx.sum;
+  if ctx.has_carry == 1 {
+    sum = sum + ((ctx.carry_byte as u32) << (8 as u32));
+  }
+  while (sum >> (16 as u32)) != (0 as u32) {
+    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
+  }
+  return (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+}
+
+fn netstack_tcp_header_only(src_port: u32, dst_port: u32, seq: u32, ack: u32, flags: u32, window: u32) -> [u8; 20] {
+  let hdr: [u8; 20] = netstack_zero20_bytes();
+  hdr[0] = ((src_port >> (8 as u32)) & (255 as u32)) as u8;
+  hdr[1] = (src_port & (255 as u32)) as u8;
+  hdr[2] = ((dst_port >> (8 as u32)) & (255 as u32)) as u8;
+  hdr[3] = (dst_port & (255 as u32)) as u8;
+  hdr[4] = ((seq >> (24 as u32)) & (255 as u32)) as u8;
+  hdr[5] = ((seq >> (16 as u32)) & (255 as u32)) as u8;
+  hdr[6] = ((seq >> (8 as u32)) & (255 as u32)) as u8;
+  hdr[7] = (seq & (255 as u32)) as u8;
+  hdr[8] = ((ack >> (24 as u32)) & (255 as u32)) as u8;
+  hdr[9] = ((ack >> (16 as u32)) & (255 as u32)) as u8;
+  hdr[10] = ((ack >> (8 as u32)) & (255 as u32)) as u8;
+  hdr[11] = (ack & (255 as u32)) as u8;
+  hdr[12] = 0x50 as u8; // data offset=5, reserved=0 -- options never sent
+  hdr[13] = flags as u8;
+  hdr[14] = ((window >> (8 as u32)) & (255 as u32)) as u8;
+  hdr[15] = (window & (255 as u32)) as u8;
+  hdr[16] = 0 as u8; // checksum placeholder -- caller fills this in
+  hdr[17] = 0 as u8; // after streaming the checksum separately
+  hdr[18] = 0 as u8; // urgent pointer, unused
+  hdr[19] = 0 as u8;
+  return hdr;
+}
+
+fn netstack_tcp_get_src_port(hdr: ref [u8; 20]) -> u32 {
+  return ((hdr[0] as u32) << (8 as u32)) | (hdr[1] as u32);
+}
+fn netstack_tcp_get_dst_port(hdr: ref [u8; 20]) -> u32 {
+  return ((hdr[2] as u32) << (8 as u32)) | (hdr[3] as u32);
+}
+fn netstack_tcp_get_seq(hdr: ref [u8; 20]) -> u32 {
+  return ((hdr[4] as u32) << (24 as u32)) | ((hdr[5] as u32) << (16 as u32)) | ((hdr[6] as u32) << (8 as u32)) | (hdr[7] as u32);
+}
+fn netstack_tcp_get_ack(hdr: ref [u8; 20]) -> u32 {
+  return ((hdr[8] as u32) << (24 as u32)) | ((hdr[9] as u32) << (16 as u32)) | ((hdr[10] as u32) << (8 as u32)) | (hdr[11] as u32);
+}
+fn netstack_tcp_get_flags(hdr: ref [u8; 20]) -> u32 {
+  return hdr[13] as u32;
+}
+fn netstack_tcp_get_window(hdr: ref [u8; 20]) -> u32 {
+  return ((hdr[14] as u32) << (8 as u32)) | (hdr[15] as u32);
+}
+fn netstack_tcp_get_data_offset_bytes(hdr: ref [u8; 20]) -> i64 {
+  let raw: u32 = hdr[12] as u32;
+  return ((raw >> (4 as u32)) as i64) * 4;
+}
+fn netstack_tcp_encode_checksum(checksum: u32) -> [u8; 2] {
+  return [((checksum >> (8 as u32)) & (255 as u32)) as u8, (checksum & (255 as u32)) as u8];
+}
+
+// Direct port of both boards' own `tcp_self_test`/`tcp_self_test_
+// rpi4`'s own header-codec-and-checksum-only subset: build a SYN
+// segment's header, stream its checksum, verify a round trip folds
+// to 0, then confirm a single flipped payload bit breaks that.
+// Connection-level send/recv/state-machine stays in each kernel's
+// own self-test.
+fn netstack_tcp_self_test() -> i64 {
+  let ok: i64 = 1;
+  let src_ip: u32 = 0xC0A80101 as u32;
+  let dst_ip: u32 = 0xC0A80102 as u32;
+  let src_port: u32 = 54321 as u32;
+  let dst_port: u32 = 80 as u32;
+  let seq: u32 = 1000 as u32;
+  let ack: u32 = 0 as u32;
+  let flags: u32 = netstack_tcp_flag_syn();
+  let window: u32 = 65535 as u32;
+  let payload_len: i64 = 0;
+  let tcp_len: i64 = 20 + payload_len;
+
+  let hdr: [u8; 20] = netstack_tcp_header_only(src_port, dst_port, seq, ack, flags, window);
+  if netstack_tcp_get_src_port(ref hdr) != src_port { ok = 0; }
+  if netstack_tcp_get_dst_port(ref hdr) != dst_port { ok = 0; }
+  if netstack_tcp_get_seq(ref hdr) != seq { ok = 0; }
+  if netstack_tcp_get_ack(ref hdr) != ack { ok = 0; }
+  if netstack_tcp_get_flags(ref hdr) != flags { ok = 0; }
+  if netstack_tcp_get_window(ref hdr) != window { ok = 0; }
+  if netstack_tcp_get_data_offset_bytes(ref hdr) != 20 { ok = 0; }
+
+  let ctx0: UdpChecksumCtx = netstack_tcp_checksum_init(src_ip, dst_ip, tcp_len);
+  let hdr_chunk: [u8; 256] = netstack_zero256_bytes();
+  let hi: i64 = 0;
+  while hi < 20 {
+    hdr_chunk[hi] = hdr[hi];
+    hi = hi + 1;
+  }
+  let ctx1: UdpChecksumCtx = netstack_udp_checksum_update(ctx0, ref hdr_chunk, 20);
+  let checksum: u32 = netstack_tcp_checksum_finalize(ref ctx1);
+  let checksum_bytes: [u8; 2] = netstack_tcp_encode_checksum(checksum);
+
+  // Verify: re-stream the full as-transmitted header (real checksum
+  // filled in) and confirm it folds to 0.
+  let full_hdr: [u8; 20] = [
+    hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9],
+    hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15], checksum_bytes[0], checksum_bytes[1], hdr[18], hdr[19]
+  ];
+  let full_hdr_chunk: [u8; 256] = netstack_zero256_bytes();
+  let fi: i64 = 0;
+  while fi < 20 {
+    full_hdr_chunk[fi] = full_hdr[fi];
+    fi = fi + 1;
+  }
+  let vctx0: UdpChecksumCtx = netstack_tcp_checksum_init(src_ip, dst_ip, tcp_len);
+  let vctx1: UdpChecksumCtx = netstack_udp_checksum_update(vctx0, ref full_hdr_chunk, 20);
+  let verify_result: u32 = netstack_tcp_checksum_finalize(ref vctx1);
+  if verify_result != (0 as u32) { ok = 0; }
+
+  // A tampered header (flipped ack bit) must fail to re-sum to 0.
+  let bad_hdr_chunk: [u8; 256] = netstack_zero256_bytes();
+  let bi: i64 = 0;
+  while bi < 20 {
+    bad_hdr_chunk[bi] = full_hdr_chunk[bi];
+    bi = bi + 1;
+  }
+  bad_hdr_chunk[8] = bad_hdr_chunk[8] ^ (1 as u8);
+  let bctx0: UdpChecksumCtx = netstack_tcp_checksum_init(src_ip, dst_ip, tcp_len);
+  let bctx1: UdpChecksumCtx = netstack_udp_checksum_update(bctx0, ref bad_hdr_chunk, 20);
+  let bad_result: u32 = netstack_tcp_checksum_finalize(ref bctx1);
+  if bad_result == (0 as u32) { ok = 0; } // must NOT verify
+
+  return ok;
+}
