@@ -4660,6 +4660,44 @@ than assumed:
   Next: round 103 (scheduler policy-vs-mechanism scoping) and round
   104 (X.509/mTLS/HTTPS/MQTT fork decision), per the user's own
   explicitly stated order.
+
+  **ROUND 103 UPDATE, 2026-09-07 (scoping only, no code changes)**:
+  read both boards' scheduler implementations end-to-end. The gap is
+  much starker than "Pi 1 has more features" -- Pi 4/5's own
+  `boot/rpi4/task_switch.S` (127 lines) is a hardcoded 2-task
+  (`task_a`/`task_b` by name) round-robin toy with no priority field,
+  no mutex, no sleep/wake, no dynamic task creation at all; Pi 1's own
+  `boot/context_switch.S` (1511 lines) has a real N-task (16-slot)
+  priority scheduler with a genuinely sophisticated two-branch
+  `scheduler_pick_next` algorithm (ties favor the incumbent when
+  priority-boosted/holding a ceiling-protected lock, fair round-robin
+  otherwise), a full priority-ceiling mutex protocol (`dhruva_prio_
+  lock`/`unlock`, `dhruva_mutex_lock`/`unlock`), sleep/wake, and
+  defensive hardening from a real historical bug (round 65's own r8-
+  clobber investigation).
+
+  Unlike every crypto/networking migration this year, there is NO
+  pre-existing vani-side algorithm to extract here -- the scheduling
+  decision logic exists ONLY as hand-written, architecture-specific
+  assembly (ARM32 AAPCS32 on Pi 1, ARM64 AAPCS64 on Pi 4/5), directly
+  manipulating fixed tables via raw register loads/stores. "Generifying"
+  this would mean DESIGNING NEW shared vani scheduling logic from
+  scratch (mirroring Pi 1's own more-complete algorithm, since it's
+  the proven one) and rewriting both boards' context-switch entry
+  points to call into it -- novel engineering against the single most
+  safety-critical subsystem in the OS, not extraction of already-
+  equivalent code. A scheduler bug corrupts stacks or livelocks the
+  whole system in ways that only manifest under real concurrent load
+  (this project's own round-65 incident is a direct, on-the-record
+  example), unlike a bounded, visible networking/crypto bug.
+
+  **Recommendation, not yet acted on**: this needs an explicit user
+  decision on the risk/value tradeoff before any implementation --
+  Pi 4/5's scheduler currently has no real users depending on richer
+  behavior yet, so the case for taking on this risk now (vs. later,
+  vs. never) is a real judgment call, not an engineering question this
+  round can resolve alone. Full writeup: [[project_dhruva_round103_
+  scheduler_scoping_2026_09_07]]. No code changes made.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
