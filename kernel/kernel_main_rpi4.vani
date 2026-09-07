@@ -1341,64 +1341,91 @@ fn arp_resolve_self_test_rpi4() -> i64 {
 // local can supply either kind at its own call site). Delegating to
 // arp_read_u16_be_rpi4 (which takes `ref`) would hit the exact same
 // mismatch one level down, so the read is inlined here instead.
+// Round 106c: the header codec's own real ALGORITHM (checksum/build/
+// parse) now lives in the shared `netstack` package (`netstack_ipv4_
+// *`), confirmed a direct port of this file's own former body before
+// extraction. Unlike `filter`/`arp` (which took the caller's real
+// frame buffer directly), the package operates on a standalone
+// `[u8;20]` header window instead -- so every one of these functions
+// copies its own `ip_offset..ip_offset+20` slice out of `frame` (into
+// the package), and (for `build_header`) back in, rather than passing
+// `frame` itself through.
+// No shared extraction helper here (unlike a first draft) -- vani
+// has no reborrow from a `mut ref T` parameter to a plain `ref T`
+// (the exact limitation this file's own pre-migration `ipv4_
+// checksum_rpi4` header comment already documented), so a helper
+// taking `ref [u8;512]` can't be called from a function that only
+// holds `frame` as `mut ref`. Each function below inlines its own
+// 20-byte extraction instead, matching that same pre-existing
+// reasoning.
 fn ipv4_checksum_rpi4(frame: mut ref [u8; 512], ip_offset: i64) -> u32 {
-  let sum: u32 = 0 as u32;
-  let i: i64 = 0;
-  while i < 20 {
-    let hi: u32 = frame[ip_offset + i] as u32;
-    let lo: u32 = frame[ip_offset + i + 1] as u32;
-    let word: u32 = (hi << (8 as u32)) | lo;
-    sum = sum + word;
-    i = i + 2;
-  }
-  while (sum >> (16 as u32)) != (0 as u32) {
-    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
-  }
-  return sum & (0xFFFF as u32);
+  let hdr: [u8; 20] = [
+    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
+    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
+    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
+    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
+  ];
+  return netstack_ipv4_checksum(ref hdr);
 }
 
 fn ipv4_build_header_rpi4(frame: mut ref [u8; 512], ip_offset: i64, total_len: i64, protocol: u32, src_ip: u32, dst_ip: u32) -> i64 {
-  frame[ip_offset] = 0x45 as u8; // version 4, IHL 5
-  frame[ip_offset + 1] = 0 as u8;
-  let _ = arp_write_u16_be_rpi4(frame, ip_offset + 2, total_len as u32);
-  let _ = arp_write_u16_be_rpi4(frame, ip_offset + 4, 0 as u32);
-  let _ = arp_write_u16_be_rpi4(frame, ip_offset + 6, 0 as u32);
-  frame[ip_offset + 8] = 64 as u8; // TTL
-  frame[ip_offset + 9] = protocol as u8;
-  let _ = arp_write_u16_be_rpi4(frame, ip_offset + 10, 0 as u32); // checksum placeholder
-  let _ = arp_write_u32_be_rpi4(frame, ip_offset + 12, src_ip);
-  let _ = arp_write_u32_be_rpi4(frame, ip_offset + 16, dst_ip);
-  // One's complement of the sum, computed with the checksum field
-  // itself still zero -- standard IPv4 checksum construction.
-  let checksum: u32 = (ipv4_checksum_rpi4(frame, ip_offset) ^ (0xFFFF as u32)) & (0xFFFF as u32);
-  let _ = arp_write_u16_be_rpi4(frame, ip_offset + 10, checksum);
+  let hdr: [u8; 20] = netstack_ipv4_build_header(total_len, protocol, src_ip, dst_ip);
+  let i: i64 = 0;
+  while i < 20 {
+    frame[ip_offset + i] = hdr[i];
+    i = i + 1;
+  }
   return 20;
 }
 
 fn ipv4_get_total_len_rpi4(frame: ref [u8; 512], ip_offset: i64) -> u32 {
-  return arp_read_u16_be_rpi4(frame, ip_offset + 2);
+  let hdr: [u8; 20] = [
+    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
+    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
+    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
+    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
+  ];
+  return netstack_ipv4_get_total_len(ref hdr);
 }
 
 fn ipv4_get_protocol_rpi4(frame: ref [u8; 512], ip_offset: i64) -> u32 {
-  return frame[ip_offset + 9] as u32;
+  let hdr: [u8; 20] = [
+    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
+    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
+    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
+    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
+  ];
+  return netstack_ipv4_get_protocol(ref hdr);
 }
 
 fn ipv4_get_src_ip_rpi4(frame: ref [u8; 512], ip_offset: i64) -> u32 {
-  return arp_read_u32_be_rpi4(frame, ip_offset + 12);
+  let hdr: [u8; 20] = [
+    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
+    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
+    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
+    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
+  ];
+  return netstack_ipv4_get_src_ip(ref hdr);
 }
 
 fn ipv4_get_dst_ip_rpi4(frame: ref [u8; 512], ip_offset: i64) -> u32 {
-  return arp_read_u32_be_rpi4(frame, ip_offset + 16);
+  let hdr: [u8; 20] = [
+    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
+    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
+    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
+    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
+  ];
+  return netstack_ipv4_get_dst_ip(ref hdr);
 }
 
-// A correctly-checksummed header sums (as transmitted, checksum field
-// included) to all-ones -- avoids needing to zero the field out again
-// to re-check it.
 fn ipv4_verify_checksum_rpi4(frame: mut ref [u8; 512], ip_offset: i64) -> i64 {
-  if ipv4_checksum_rpi4(frame, ip_offset) == (0xFFFF as u32) {
-    return 1;
-  }
-  return 0;
+  let hdr: [u8; 20] = [
+    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
+    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
+    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
+    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
+  ];
+  return netstack_ipv4_verify_checksum(ref hdr);
 }
 
 // Builds a full Ethernet+IPv4 frame around payload[0..payload_len)

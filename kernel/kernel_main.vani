@@ -7778,59 +7778,58 @@ fn arp_resolve_self_test() -> i64 {
 //   8 TTL   9 protocol (1=ICMP, 6=TCP, 17=UDP)
 //   10-11 header checksum   12-15 source IP   16-19 destination IP
 
-fn ipv4_checksum(frame: mut ref i64, ip_offset: i64) -> u32 {
-  let sum: u32 = 0 as u32;
+// Round 106c: the header codec's own real ALGORITHM now lives in the
+// shared `netstack` package (`netstack_ipv4_*`), operating on a
+// standalone `[u8;20]` header window rather than an offset within
+// this file's own unbounded heap frame buffer (real frames up to
+// 1514 bytes) -- see that package's own header comment for why. Each
+// function here copies its own 20-byte slice out of `frame` (via
+// `buf_read_byte`) and, for `build_header`, back in.
+fn ipv4_header_extract(frame: mut ref i64, ip_offset: i64) -> [u8; 20] {
+  let hdr: [u8; 20] = netstack_zero20_bytes();
   let i: i64 = 0;
   while i < 20 {
-    let word: u32 = buf_read_u16_be(frame, ip_offset + i);
-    sum = sum + word;
-    i = i + 2;
+    hdr[i] = buf_read_byte(frame, (ip_offset + i) as u32) as u8;
+    i = i + 1;
   }
-  while (sum >> (16 as u32)) != (0 as u32) {
-    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
-  }
-  return sum & (0xFFFF as u32);
+  return hdr;
+}
+
+fn ipv4_checksum(frame: mut ref i64, ip_offset: i64) -> u32 {
+  let hdr: [u8; 20] = ipv4_header_extract(frame, ip_offset);
+  return netstack_ipv4_checksum(ref hdr);
 }
 
 fn ipv4_build_header(frame: mut ref i64, ip_offset: i64, total_len: i64, protocol: u32, src_ip: u32, dst_ip: u32) -> i64 {
-  let _ = buf_write_byte(frame, ip_offset as u32, 0x45 as u32); // version 4, IHL 5
-  let _ = buf_write_byte(frame, (ip_offset + 1) as u32, 0 as u32);
-  let _ = buf_write_u16_be(frame, ip_offset + 2, total_len as u32);
-  let _ = buf_write_u16_be(frame, ip_offset + 4, 0 as u32);
-  let _ = buf_write_u16_be(frame, ip_offset + 6, 0 as u32);
-  let _ = buf_write_byte(frame, (ip_offset + 8) as u32, 64 as u32); // TTL
-  let _ = buf_write_byte(frame, (ip_offset + 9) as u32, protocol);
-  let _ = buf_write_u16_be(frame, ip_offset + 10, 0 as u32); // checksum placeholder
-  let _ = buf_write_u32_be(frame, ip_offset + 12, src_ip);
-  let _ = buf_write_u32_be(frame, ip_offset + 16, dst_ip);
-  // One's complement of the sum, computed with the checksum field
-  // itself still zero -- standard IPv4 checksum construction.
-  let checksum: u32 = (ipv4_checksum(frame, ip_offset) ^ (0xFFFF as u32)) & (0xFFFF as u32);
-  let _ = buf_write_u16_be(frame, ip_offset + 10, checksum);
+  let hdr: [u8; 20] = netstack_ipv4_build_header(total_len, protocol, src_ip, dst_ip);
+  let i: i64 = 0;
+  while i < 20 {
+    let _ = buf_write_byte(frame, (ip_offset + i) as u32, hdr[i] as u32);
+    i = i + 1;
+  }
   return 20;
 }
 
 fn ipv4_get_total_len(frame: mut ref i64, ip_offset: i64) -> u32 {
-  return buf_read_u16_be(frame, ip_offset + 2);
+  let hdr: [u8; 20] = ipv4_header_extract(frame, ip_offset);
+  return netstack_ipv4_get_total_len(ref hdr);
 }
 fn ipv4_get_protocol(frame: mut ref i64, ip_offset: i64) -> u32 {
-  return buf_read_byte(frame, (ip_offset + 9) as u32);
+  let hdr: [u8; 20] = ipv4_header_extract(frame, ip_offset);
+  return netstack_ipv4_get_protocol(ref hdr);
 }
 fn ipv4_get_src_ip(frame: mut ref i64, ip_offset: i64) -> u32 {
-  return buf_read_u32_be(frame, ip_offset + 12);
+  let hdr: [u8; 20] = ipv4_header_extract(frame, ip_offset);
+  return netstack_ipv4_get_src_ip(ref hdr);
 }
 fn ipv4_get_dst_ip(frame: mut ref i64, ip_offset: i64) -> u32 {
-  return buf_read_u32_be(frame, ip_offset + 16);
+  let hdr: [u8; 20] = ipv4_header_extract(frame, ip_offset);
+  return netstack_ipv4_get_dst_ip(ref hdr);
 }
 
-// A correctly-checksummed header sums (as transmitted, checksum field
-// included) to all-ones -- the standard IPv4 checksum verification
-// trick, avoiding needing to zero the field out again to re-check it.
 fn ipv4_verify_checksum(frame: mut ref i64, ip_offset: i64) -> i64 {
-  if ipv4_checksum(frame, ip_offset) == (0xFFFF as u32) {
-    return 1;
-  }
-  return 0;
+  let hdr: [u8; 20] = ipv4_header_extract(frame, ip_offset);
+  return netstack_ipv4_verify_checksum(ref hdr);
 }
 
 // Builds a full Ethernet+IPv4 frame around payload[0..payload_len) and

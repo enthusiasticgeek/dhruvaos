@@ -4472,6 +4472,49 @@ than assumed:
 
   **Next**: IPv4 (mostly stateless -- header build/checksum, no
   cache/table of its own) is next, round 106c.
+
+  **ROUND 106c UPDATE, 2026-09-07**: IPv4 added to `vani-netstack`
+  (v0.3.0, pushed) -- header build/checksum/parse only, RFC 791
+  section 3.1, no options/fragmentation, same as both boards' own
+  original scope. Deliberately designed around a STANDALONE `[u8;20]`
+  header buffer rather than an offset within the caller's own frame
+  (what both boards' pre-migration code did) -- confirmed via a real
+  gap check before writing the package (per this round's own "check
+  real max size" discipline): Pi 1's real frames run to 1514 bytes,
+  Pi 4/5's own only to 512, and a header codec has no reason to
+  depend on either number since it only ever touches its own 20
+  bytes. Avoids the exact "package's fixed array cap too small for a
+  real board" class of problem `curve25519`'s own Ed25519 `msg` cap
+  hit in round 100, by construction rather than by picking a big
+  enough number. Each board's adapter copies its own `ip_offset..
+  ip_offset+20` window in/out of the package; the real frame-level
+  send path (`ipv4_send`/`ipv4_send_rpi4`, which DOES depend on frame
+  size) stays entirely board-specific, unmigrated -- same posture as
+  ARP's own `arp_resolve_start`/`poll`.
+
+  Hit the SAME `mut ref` -> `ref` no-reborrow limitation this file's
+  own pre-migration `ipv4_checksum_rpi4` header comment already
+  documented (round 88) -- a shared 20-byte-extraction helper taking
+  `ref [u8;512]` can't be called from a function holding `frame` as
+  `mut ref` only. Confirmed via a standalone probe, then fixed the
+  same way the original code already did: each Pi 4/5 function
+  inlines its own extraction rather than delegating to a shared
+  helper (Pi 1's own heap-pointer adapter needed no such workaround,
+  since `mut ref i64` has no ref/mut-ref variance to navigate).
+
+  Verified on both boards: `vanic check`/`build.sh`/`build_rpi4.sh`
+  all passed. Pi 4/5: `rpi4_shell_smoke.py` zero `(FAIL)`, `IPV4: ...`
+  `(PASS)` (boot + on-demand). Pi 1: `phase4_milestone.py`'s full
+  battery zero `(FAIL)` -- every one of its own TCP/UDP/TLS checks
+  (`tcpecho`/`udpecho`/`tcprtx`/`tlsecho`) routes real traffic through
+  the migrated `ipv4_build_header`/`get_*`/`verify_checksum` on every
+  packet, the strongest production-path exercise of any migration in
+  this networking effort so far.
+
+  **Next**: UDP (round 106d) is genuinely stateless (no cache/table
+  at all, simpler than IPv4 even) -- likely the fastest remaining
+  piece. DHCP client+server (multi-field state machines) after that,
+  TCP last (largest, ~15-field connection struct).
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
