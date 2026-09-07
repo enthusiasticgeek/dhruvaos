@@ -101,6 +101,14 @@ http_req_scratch_addr:         .word 0  /* Round 108: 512 bytes -- the
 http_resp_scratch_addr:        .word 0  /* Round 108: 512 bytes --
                                           * httpecho's own HTTP
                                           * response build buffer. */
+mqtt_pkt_scratch_addr:         .word 0  /* Round 109: 512 bytes --
+                                          * mqttecho's own single
+                                          * packet-build buffer, reused
+                                          * sequentially across
+                                          * CONNECT/SUBSCRIBE/PUBLISH/
+                                          * PINGREQ/DISCONNECT (each
+                                          * exchange fully completes
+                                          * before the next begins). */
 
 .section ".text"
 
@@ -197,3 +205,4 @@ TLS_SCRATCH_PAIR tls_t_len_cv
 TLS_SCRATCH_PAIR tls_t_len_s_fin
 TLS_SCRATCH_PAIR http_req_scratch
 TLS_SCRATCH_PAIR http_resp_scratch
+TLS_SCRATCH_PAIR mqtt_pkt_scratch

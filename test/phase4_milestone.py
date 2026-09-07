@@ -146,6 +146,14 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     # of whatever tlsecho left behind).
     send("httpecho hello-http")
     time.sleep(SETTLE_S)
+    # Round 109: mqttecho -- the new `mqtt` kosh package's own
+    # CONNECT/SUBSCRIBE/PUBLISH(QoS1)/PINGREQ/DISCONNECT build+parse,
+    # layered on tlsecho/httpecho's own proven real TLS 1.3 + real TCP
+    # transport (same both-roles-in-one-instance shape, same reasoning
+    # for running after httpecho: fresh tcp_conn_active_open/passive_
+    # open calls reset connection-slot state regardless).
+    send("mqttecho hello-mqtt")
+    time.sleep(SETTLE_S)
     # "ls" last, deliberately: every other command in this sequence has
     # a LATER command's own settle time to absorb any scheduling slack,
     # but the last command has only the trailing sleep below to work
@@ -178,6 +186,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         ("tcprtx recovers a real simulated SYN loss via retransmission", "recovered from simulated SYN loss via retransmission"),
         ("tlsecho completes a live tls_connect/tls_accept handshake + encrypted echo", 'tlsecho: echoed over real TLS 1.3 "hello-tls"'),
         ("httpecho completes a live HTTP/1.1 POST/response round trip over TLS 1.3", 'httpecho: POST /echo -> 200 OK, body "hello-http"'),
+        ("mqttecho completes a live CONNECT/SUBSCRIBE/PUBLISH(QoS1)/PINGREQ/DISCONNECT round trip over TLS 1.3", 'mqttecho: CONNECT->CONNACK, SUBSCRIBE(QoS1)->SUBACK, PUBLISH(QoS1) "hello-mqtt"'),
         ("ls shows /milestone/note", "  /milestone/note"),
     ]
 

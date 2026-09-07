@@ -1,0 +1,581 @@
+// mqtt v0.2.0 -- minimal MQTT v3.1.1 (OASIS mqtt-v3.1.1) build+parse,
+// pure vani, hardware-agnostic and heap-free.
+//
+// Scoped down deliberately, matching this project's own established
+// "honest scope boundary" discipline (TLS's own single-ciphersuite
+// scope, DHCP's own no-relay-agent scope, http's own no-chunked-
+// encoding scope): CONNECT/CONNACK, PUBLISH/SUBSCRIBE/SUBACK at QoS
+// 0/1/2 (PUBACK for QoS 1; the full PUBREC/PUBREL/PUBCOMP 4-way
+// handshake for QoS 2), PINGREQ/PINGRESP, DISCONNECT. No retained
+// messages, no Will message, no username/password authentication, no
+// UNSUBSCRIBE. This package is a pure wire-format codec only --
+// packet-identifier ALLOCATION, retransmission-on-timeout, and
+// duplicate-detection are policy decisions left to the caller (the
+// same mechanism/policy split this project's own TCP retransmit logic
+// already draws: `tcp_conn_check_retransmit_rpi4` lives in the KERNEL
+// file, not in the shared `netstack` package).
+//
+// Operates on a standalone `[u8;512]` buffer, the SAME bounded-
+// message design choice DHCP/http's own modules made: every MQTT
+// packet this package builds is small (a CONNECT with a short client
+// ID, a PUBLISH with a small payload) -- unlike TCP/UDP's own
+// genuinely-unbounded payload scope.
+//
+// Transport-agnostic: no TLS/socket concept at all, matching every
+// other package in this project's own crypto/networking
+// generification effort. Pairs with an existing TLS 1.3 stack (MQTT
+// over TLS, the common "MQTTS" deployment) or plain TCP.
+
+fn mqtt_zero512_bytes() -> [u8; 512] {
+  let out: [u8; 512] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  return out;
+}
+
+fn mqtt_packet_type_connect() -> i64 { return 1; }
+fn mqtt_packet_type_connack() -> i64 { return 2; }
+fn mqtt_packet_type_publish() -> i64 { return 3; }
+fn mqtt_packet_type_puback() -> i64 { return 4; }
+fn mqtt_packet_type_pubrec() -> i64 { return 5; }
+fn mqtt_packet_type_pubrel() -> i64 { return 6; }
+fn mqtt_packet_type_pubcomp() -> i64 { return 7; }
+fn mqtt_packet_type_subscribe() -> i64 { return 8; }
+fn mqtt_packet_type_suback() -> i64 { return 9; }
+fn mqtt_packet_type_pingreq() -> i64 { return 12; }
+fn mqtt_packet_type_pingresp() -> i64 { return 13; }
+fn mqtt_packet_type_disconnect() -> i64 { return 14; }
+
+fn mqtt_connack_accepted() -> i64 { return 0; }
+fn mqtt_connack_refused_protocol_version() -> i64 { return 1; }
+fn mqtt_connack_refused_identifier_rejected() -> i64 { return 2; }
+
+// ---------------------------------------------------------------
+// Wire-format primitives: a 2-byte big-endian "remaining length" is
+// NOT how MQTT itself encodes length (MQTT's own variable-length
+// scheme below is genuinely different from every other protocol in
+// this project's own generification effort), and MQTT strings are
+// length-PREFIXED (2-byte big-endian length + raw UTF-8 bytes, no
+// null terminator).
+// ---------------------------------------------------------------
+
+fn mqtt_write_u16(buf: mut ref [u8; 512], pos: i64, value: i64) -> i64 {
+  buf[pos] = ((value >> 8) & 255) as u8;
+  buf[pos + 1] = (value & 255) as u8;
+  return pos + 2;
+}
+
+fn mqtt_read_u16(buf: ref [u8; 512], pos: i64) -> i64 {
+  let hi: i64 = buf[pos] as i64;
+  let lo: i64 = buf[pos + 1] as i64;
+  return (hi << 8) | lo;
+}
+
+fn mqtt_write_string(buf: mut ref [u8; 512], pos: i64, s: Str) -> i64 {
+  let str_len: i64 = str_len_bytes(s);
+  let next: i64 = mqtt_write_u16(buf, pos, str_len);
+  let i: i64 = 0;
+  while i < str_len {
+    buf[next + i] = str_byte_at(s, i) as u8;
+    i = i + 1;
+  }
+  return next + str_len;
+}
+
+struct MqttSpan { start: i64, span_len: i64 }
+
+fn mqtt_read_string_span(buf: ref [u8; 512], pos: i64) -> MqttSpan {
+  let str_len: i64 = mqtt_read_u16(buf, pos);
+  return MqttSpan { start: pos + 2, span_len: str_len };
+}
+
+// MQTT's own "remaining length" variable-length encoding (section
+// 2.2.3): 7 bits of value per byte, MSB=1 means "more bytes follow,"
+// up to 4 bytes total (max encodable value 268,435,455 -- this
+// package's own 512-byte buffer cap means a single byte, 0-127,
+// covers every real message this package ever builds, but the real
+// multi-byte decode is implemented anyway for correctness against any
+// peer that might send a larger one).
+fn mqtt_encode_remaining_length(buf: mut ref [u8; 512], pos: i64, value: i64) -> i64 {
+  let remaining: i64 = value;
+  let p: i64 = pos;
+  let continue_loop: i64 = 1;
+  while continue_loop == 1 {
+    let digit: i64 = remaining % 128;
+    remaining = remaining / 128;
+    if remaining > 0 {
+      buf[p] = (digit | 128) as u8;
+    } else {
+      buf[p] = digit as u8;
+      continue_loop = 0;
+    }
+    p = p + 1;
+  }
+  return p;
+}
+
+struct MqttRemLenResult { value: i64, next_pos: i64 }
+
+fn mqtt_decode_remaining_length(buf: ref [u8; 512], pos: i64) -> MqttRemLenResult {
+  let multiplier: i64 = 1;
+  let value: i64 = 0;
+  let p: i64 = pos;
+  let iter: i64 = 0;
+  let continue_loop: i64 = 1;
+  while (continue_loop == 1) && (iter < 4) {
+    let digit: i64 = buf[p] as i64;
+    value = value + ((digit & 127) * multiplier);
+    multiplier = multiplier * 128;
+    p = p + 1;
+    if (digit & 128) == 0 {
+      continue_loop = 0;
+    }
+    iter = iter + 1;
+  }
+  if continue_loop == 1 {
+    return MqttRemLenResult { value: 0 - 1, next_pos: 0 - 1 }; // malformed -- 4 bytes with no terminator
+  }
+  return MqttRemLenResult { value: value, next_pos: p };
+}
+
+struct MqttFixedHeader { packet_type: i64, flags: i64, remaining_length: i64, variable_header_start: i64 }
+
+fn mqtt_parse_fixed_header(buf: ref [u8; 512]) -> MqttFixedHeader {
+  let byte0: i64 = buf[0] as i64;
+  let packet_type: i64 = (byte0 >> 4) & 15;
+  let flags: i64 = byte0 & 15;
+  let rl: MqttRemLenResult = mqtt_decode_remaining_length(buf, 1);
+  return MqttFixedHeader { packet_type: packet_type, flags: flags, remaining_length: rl.value, variable_header_start: rl.next_pos };
+}
+
+// ---------------------------------------------------------------
+// CONNECT / CONNACK
+// ---------------------------------------------------------------
+
+// Builds a CONNECT packet: protocol name "MQTT", level 4 (v3.1.1),
+// connect flags = 0x02 (Clean Session set, no Will/username/
+// password -- this package's own scope), keep-alive, and the client
+// ID (this package's own scope excludes Will/username/password
+// payload fields entirely, matching the connect flags above).
+fn mqtt_build_connect(buf: mut ref [u8; 512], client_id: Str, keep_alive: i64) -> i64 {
+  let var_payload: [u8; 512] = mqtt_zero512_bytes();
+  let pos: i64 = 0;
+  pos = mqtt_write_string(mut ref var_payload, pos, "MQTT");
+  var_payload[pos] = 4 as u8; // protocol level: MQTT v3.1.1
+  pos = pos + 1;
+  var_payload[pos] = 0x02 as u8; // connect flags: Clean Session
+  pos = pos + 1;
+  pos = mqtt_write_u16(mut ref var_payload, pos, keep_alive);
+  pos = mqtt_write_string(mut ref var_payload, pos, client_id);
+
+  buf[0] = ((mqtt_packet_type_connect() << 4) & 255) as u8;
+  let header_end: i64 = mqtt_encode_remaining_length(buf, 1, pos);
+  let i: i64 = 0;
+  while i < pos {
+    buf[header_end + i] = var_payload[i];
+    i = i + 1;
+  }
+  return header_end + pos;
+}
+
+struct MqttConnectResult { ok: i64, client_id: MqttSpan, keep_alive: i64 }
+
+fn mqtt_parse_connect(buf: ref [u8; 512], variable_header_start: i64) -> MqttConnectResult {
+  let name_span: MqttSpan = mqtt_read_string_span(buf, variable_header_start);
+  if name_span.span_len != 4 {
+    return MqttConnectResult { ok: 0, client_id: MqttSpan { start: 0, span_len: 0 }, keep_alive: 0 };
+  }
+  let ni: i64 = 0;
+  let name_ok: i64 = 1;
+  while ni < 4 {
+    if buf[name_span.start + ni] != (str_byte_at("MQTT", ni) as u8) {
+      name_ok = 0;
+    }
+    ni = ni + 1;
+  }
+  if name_ok == 0 {
+    return MqttConnectResult { ok: 0, client_id: MqttSpan { start: 0, span_len: 0 }, keep_alive: 0 };
+  }
+  let level_pos: i64 = name_span.start + name_span.span_len;
+  if buf[level_pos] != (4 as u8) {
+    return MqttConnectResult { ok: 0, client_id: MqttSpan { start: 0, span_len: 0 }, keep_alive: 0 };
+  }
+  let flags_pos: i64 = level_pos + 1;
+  let keep_alive_pos: i64 = flags_pos + 1;
+  let keep_alive: i64 = mqtt_read_u16(buf, keep_alive_pos);
+  let client_id_span: MqttSpan = mqtt_read_string_span(buf, keep_alive_pos + 2);
+  return MqttConnectResult { ok: 1, client_id: client_id_span, keep_alive: keep_alive };
+}
+
+fn mqtt_build_connack(buf: mut ref [u8; 512], session_present: i64, return_code: i64) -> i64 {
+  buf[0] = ((mqtt_packet_type_connack() << 4) & 255) as u8;
+  let header_end: i64 = mqtt_encode_remaining_length(buf, 1, 2);
+  buf[header_end] = (session_present & 1) as u8;
+  buf[header_end + 1] = return_code as u8;
+  return header_end + 2;
+}
+
+struct MqttConnackResult { session_present: i64, return_code: i64 }
+
+fn mqtt_parse_connack(buf: ref [u8; 512], variable_header_start: i64) -> MqttConnackResult {
+  let flags: i64 = buf[variable_header_start] as i64;
+  let return_code: i64 = buf[variable_header_start + 1] as i64;
+  return MqttConnackResult { session_present: flags & 1, return_code: return_code };
+}
+
+// ---------------------------------------------------------------
+// PUBLISH at QoS 0, 1, or 2, SUBSCRIBE, SUBACK
+// ---------------------------------------------------------------
+
+// PUBLISH's own fixed-header flags byte (section 3.3.1): bit 3 = DUP,
+// bits 2-1 = QoS, bit 0 = RETAIN. QoS 0 carries no packet identifier
+// at all (fire-and-forget); QoS 1/2 both do.
+fn mqtt_publish_flags_byte(qos: i64, dup_flag: i64, retain_flag: i64) -> i64 {
+  return ((dup_flag & 1) << 3) | ((qos & 3) << 1) | (retain_flag & 1);
+}
+
+fn mqtt_publish_qos_from_flags(flags: i64) -> i64 { return (flags >> 1) & 3; }
+fn mqtt_publish_dup_from_flags(flags: i64) -> i64 { return (flags >> 3) & 1; }
+fn mqtt_publish_retain_from_flags(flags: i64) -> i64 { return flags & 1; }
+
+// `packet_id` is ignored for QoS 0 (pass any value, e.g. 0 -- the
+// spec forbids QoS 0 PUBLISH from carrying one at all, so this
+// function simply never writes it). The caller appends `payload_len`
+// payload bytes immediately after the returned total length
+// themselves (matching http_build_request's own body-append
+// convention).
+fn mqtt_build_publish(buf: mut ref [u8; 512], topic: Str, qos: i64, packet_id: i64, dup_flag: i64, retain_flag: i64, payload_len: i64) -> i64 {
+  let topic_len: i64 = str_len_bytes(topic);
+  let has_packet_id: i64 = if qos > 0 { 1 } else { 0 };
+  let remaining: i64 = 2 + topic_len + (has_packet_id * 2) + payload_len;
+  buf[0] = ((mqtt_packet_type_publish() << 4) | mqtt_publish_flags_byte(qos, dup_flag, retain_flag)) as u8;
+  let header_end: i64 = mqtt_encode_remaining_length(buf, 1, remaining);
+  let after_topic: i64 = mqtt_write_string(buf, header_end, topic);
+  if has_packet_id == 1 {
+    return mqtt_write_u16(buf, after_topic, packet_id);
+  }
+  return after_topic;
+}
+
+struct MqttPublishResult { topic: MqttSpan, packet_id: i64, payload_start: i64, payload_len: i64 }
+
+// `qos` must be the value already extracted from this packet's own
+// fixed-header flags byte (`mqtt_publish_qos_from_flags`) -- PUBLISH
+// is the one packet type in this package whose variable-header shape
+// depends on a fixed-header field, so the caller threads it through
+// rather than this function re-deriving it from a raw flags byte.
+fn mqtt_parse_publish(buf: ref [u8; 512], variable_header_start: i64, remaining_length: i64, fixed_header_end: i64, qos: i64) -> MqttPublishResult {
+  let topic_span: MqttSpan = mqtt_read_string_span(buf, variable_header_start);
+  let after_topic: i64 = topic_span.start + topic_span.span_len;
+  let packet_id: i64 = 0 - 1;
+  let payload_start: i64 = after_topic;
+  if qos > 0 {
+    packet_id = mqtt_read_u16(buf, after_topic);
+    payload_start = after_topic + 2;
+  }
+  let payload_len: i64 = (fixed_header_end + remaining_length) - payload_start;
+  return MqttPublishResult { topic: topic_span, packet_id: packet_id, payload_start: payload_start, payload_len: payload_len };
+}
+
+// ---------------------------------------------------------------
+// PUBACK (QoS 1 acknowledgment) and the QoS 2 PUBREC/PUBREL/PUBCOMP
+// 4-way handshake -- all four share the identical wire shape (2-byte
+// fixed header with remaining length 2, plus a 2-byte packet
+// identifier); only PUBREL requires the reserved flags nibble 0010
+// (section 3.6.1, same reserved-bits requirement SUBSCRIBE's own
+// fixed header has).
+// ---------------------------------------------------------------
+
+fn mqtt_build_puback(buf: mut ref [u8; 512], packet_id: i64) -> i64 {
+  buf[0] = ((mqtt_packet_type_puback() << 4) & 255) as u8;
+  let header_end: i64 = mqtt_encode_remaining_length(buf, 1, 2);
+  return mqtt_write_u16(buf, header_end, packet_id);
+}
+
+fn mqtt_parse_puback(buf: ref [u8; 512], variable_header_start: i64) -> i64 {
+  return mqtt_read_u16(buf, variable_header_start);
+}
+
+fn mqtt_build_pubrec(buf: mut ref [u8; 512], packet_id: i64) -> i64 {
+  buf[0] = ((mqtt_packet_type_pubrec() << 4) & 255) as u8;
+  let header_end: i64 = mqtt_encode_remaining_length(buf, 1, 2);
+  return mqtt_write_u16(buf, header_end, packet_id);
+}
+
+fn mqtt_parse_pubrec(buf: ref [u8; 512], variable_header_start: i64) -> i64 {
+  return mqtt_read_u16(buf, variable_header_start);
+}
+
+fn mqtt_build_pubrel(buf: mut ref [u8; 512], packet_id: i64) -> i64 {
+  buf[0] = (((mqtt_packet_type_pubrel() << 4) | 2) & 255) as u8; // flags=0010, required by spec
+  let header_end: i64 = mqtt_encode_remaining_length(buf, 1, 2);
+  return mqtt_write_u16(buf, header_end, packet_id);
+}
+
+fn mqtt_parse_pubrel(buf: ref [u8; 512], variable_header_start: i64) -> i64 {
+  return mqtt_read_u16(buf, variable_header_start);
+}
+
+fn mqtt_build_pubcomp(buf: mut ref [u8; 512], packet_id: i64) -> i64 {
+  buf[0] = ((mqtt_packet_type_pubcomp() << 4) & 255) as u8;
+  let header_end: i64 = mqtt_encode_remaining_length(buf, 1, 2);
+  return mqtt_write_u16(buf, header_end, packet_id);
+}
+
+fn mqtt_parse_pubcomp(buf: ref [u8; 512], variable_header_start: i64) -> i64 {
+  return mqtt_read_u16(buf, variable_header_start);
+}
+
+// One topic filter, QoS byte follows (this package's own scope: a
+// single filter per SUBSCRIBE, not the multi-filter list the real
+// spec allows).
+fn mqtt_build_subscribe(buf: mut ref [u8; 512], packet_id: i64, topic_filter: Str, qos: i64) -> i64 {
+  let topic_len: i64 = str_len_bytes(topic_filter);
+  let remaining: i64 = 2 + 2 + topic_len + 1;
+  buf[0] = (((mqtt_packet_type_subscribe() << 4) | 2) & 255) as u8; // flags=0010, required by spec for SUBSCRIBE
+  let header_end: i64 = mqtt_encode_remaining_length(buf, 1, remaining);
+  let pos: i64 = mqtt_write_u16(buf, header_end, packet_id);
+  let after_topic: i64 = mqtt_write_string(buf, pos, topic_filter);
+  buf[after_topic] = qos as u8;
+  return after_topic + 1;
+}
+
+struct MqttSubscribeResult { packet_id: i64, topic: MqttSpan, qos: i64 }
+
+fn mqtt_parse_subscribe(buf: ref [u8; 512], variable_header_start: i64) -> MqttSubscribeResult {
+  let packet_id: i64 = mqtt_read_u16(buf, variable_header_start);
+  let topic_span: MqttSpan = mqtt_read_string_span(buf, variable_header_start + 2);
+  let qos: i64 = buf[topic_span.start + topic_span.span_len] as i64;
+  return MqttSubscribeResult { packet_id: packet_id, topic: topic_span, qos: qos };
+}
+
+// One granted-QoS byte (this package's own scope: matching
+// `mqtt_build_subscribe`'s own single-filter scope).
+fn mqtt_build_suback(buf: mut ref [u8; 512], packet_id: i64, granted_qos: i64) -> i64 {
+  buf[0] = ((mqtt_packet_type_suback() << 4) & 255) as u8;
+  let header_end: i64 = mqtt_encode_remaining_length(buf, 1, 3);
+  let pos: i64 = mqtt_write_u16(buf, header_end, packet_id);
+  buf[pos] = granted_qos as u8;
+  return pos + 1;
+}
+
+struct MqttSubackResult { packet_id: i64, granted_qos: i64 }
+
+fn mqtt_parse_suback(buf: ref [u8; 512], variable_header_start: i64) -> MqttSubackResult {
+  let packet_id: i64 = mqtt_read_u16(buf, variable_header_start);
+  let granted_qos: i64 = buf[variable_header_start + 2] as i64;
+  return MqttSubackResult { packet_id: packet_id, granted_qos: granted_qos };
+}
+
+// ---------------------------------------------------------------
+// PINGREQ / PINGRESP / DISCONNECT -- fixed header only, remaining
+// length always 0.
+// ---------------------------------------------------------------
+
+fn mqtt_build_pingreq(buf: mut ref [u8; 512]) -> i64 {
+  buf[0] = ((mqtt_packet_type_pingreq() << 4) & 255) as u8;
+  buf[1] = 0 as u8;
+  return 2;
+}
+
+fn mqtt_build_pingresp(buf: mut ref [u8; 512]) -> i64 {
+  buf[0] = ((mqtt_packet_type_pingresp() << 4) & 255) as u8;
+  buf[1] = 0 as u8;
+  return 2;
+}
+
+fn mqtt_build_disconnect(buf: mut ref [u8; 512]) -> i64 {
+  buf[0] = ((mqtt_packet_type_disconnect() << 4) & 255) as u8;
+  buf[1] = 0 as u8;
+  return 2;
+}
+
+// Direct build+parse round trip for every packet type this package
+// covers -- no transport, no broker/client role distinction, just the
+// wire-format codec (a real broker/client integration test then
+// layers real TCP/TLS transport on top, the same relationship http's
+// own self-test has to httpecho).
+fn mqtt_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  // CONNECT / CONNACK.
+  let connect_buf: [u8; 512] = mqtt_zero512_bytes();
+  let connect_len: i64 = mqtt_build_connect(mut ref connect_buf, "dhruva-01", 60);
+  let connect_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref connect_buf);
+  if connect_fh.packet_type != mqtt_packet_type_connect() { ok = 0; }
+  if (connect_fh.variable_header_start + connect_fh.remaining_length) != connect_len { ok = 0; }
+  let connect_parsed: MqttConnectResult = mqtt_parse_connect(ref connect_buf, connect_fh.variable_header_start);
+  if connect_parsed.ok != 1 { ok = 0; }
+  if connect_parsed.keep_alive != 60 { ok = 0; }
+  if connect_parsed.client_id.span_len != 9 { ok = 0; } // "dhruva-01"
+  let cidi: i64 = 0;
+  while cidi < 9 {
+    if connect_buf[connect_parsed.client_id.start + cidi] != (str_byte_at("dhruva-01", cidi) as u8) { ok = 0; }
+    cidi = cidi + 1;
+  }
+
+  let connack_buf: [u8; 512] = mqtt_zero512_bytes();
+  let connack_len: i64 = mqtt_build_connack(mut ref connack_buf, 0, mqtt_connack_accepted());
+  let connack_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref connack_buf);
+  if connack_fh.packet_type != mqtt_packet_type_connack() { ok = 0; }
+  if connack_len != 4 { ok = 0; } // 2-byte fixed header + 2-byte variable header
+  let connack_parsed: MqttConnackResult = mqtt_parse_connack(ref connack_buf, connack_fh.variable_header_start);
+  if connack_parsed.session_present != 0 { ok = 0; }
+  if connack_parsed.return_code != mqtt_connack_accepted() { ok = 0; }
+
+  // PUBLISH at QoS 0 (no packet identifier) with a body.
+  let publish_buf: [u8; 512] = mqtt_zero512_bytes();
+  let publish_header_len: i64 = mqtt_build_publish(mut ref publish_buf, "dhruva/status", 0, 0, 0, 0, 5);
+  let payload_str: Str = "hello";
+  let pli: i64 = 0;
+  while pli < 5 {
+    publish_buf[publish_header_len + pli] = str_byte_at(payload_str, pli) as u8;
+    pli = pli + 1;
+  }
+  let publish_total_len: i64 = publish_header_len + 5;
+  let publish_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref publish_buf);
+  if publish_fh.packet_type != mqtt_packet_type_publish() { ok = 0; }
+  if mqtt_publish_qos_from_flags(publish_fh.flags) != 0 { ok = 0; }
+  let publish_parsed: MqttPublishResult = mqtt_parse_publish(ref publish_buf, publish_fh.variable_header_start, publish_fh.remaining_length, publish_fh.variable_header_start, 0);
+  if publish_parsed.topic.span_len != 13 { ok = 0; } // "dhruva/status"
+  if publish_parsed.packet_id != (0 - 1) { ok = 0; } // QoS 0 -- no packet identifier
+  if publish_parsed.payload_len != 5 { ok = 0; }
+  if (publish_parsed.payload_start + publish_parsed.payload_len) != publish_total_len { ok = 0; }
+  let pbi: i64 = 0;
+  while pbi < 5 {
+    if publish_buf[publish_parsed.payload_start + pbi] != (str_byte_at(payload_str, pbi) as u8) { ok = 0; }
+    pbi = pbi + 1;
+  }
+
+  // PUBLISH at QoS 1: carries a packet identifier, acknowledged by a
+  // single PUBACK.
+  let pub1_buf: [u8; 512] = mqtt_zero512_bytes();
+  let pub1_header_len: i64 = mqtt_build_publish(mut ref pub1_buf, "dhruva/status", 1, 77, 0, 0, 3);
+  let pub1_payload: Str = "abc";
+  let p1i: i64 = 0;
+  while p1i < 3 {
+    pub1_buf[pub1_header_len + p1i] = str_byte_at(pub1_payload, p1i) as u8;
+    p1i = p1i + 1;
+  }
+  let pub1_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref pub1_buf);
+  if mqtt_publish_qos_from_flags(pub1_fh.flags) != 1 { ok = 0; }
+  let pub1_parsed: MqttPublishResult = mqtt_parse_publish(ref pub1_buf, pub1_fh.variable_header_start, pub1_fh.remaining_length, pub1_fh.variable_header_start, 1);
+  if pub1_parsed.packet_id != 77 { ok = 0; }
+  if pub1_parsed.payload_len != 3 { ok = 0; }
+
+  let puback_buf: [u8; 512] = mqtt_zero512_bytes();
+  let puback_len: i64 = mqtt_build_puback(mut ref puback_buf, 77);
+  if puback_len != 4 { ok = 0; } // 2-byte fixed header + 2-byte packet ID
+  let puback_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref puback_buf);
+  if puback_fh.packet_type != mqtt_packet_type_puback() { ok = 0; }
+  if mqtt_parse_puback(ref puback_buf, puback_fh.variable_header_start) != 77 { ok = 0; }
+
+  // PUBLISH at QoS 2: the full PUBREC/PUBREL/PUBCOMP 4-way handshake.
+  let pub2_buf: [u8; 512] = mqtt_zero512_bytes();
+  let _pub2_header_len: i64 = mqtt_build_publish(mut ref pub2_buf, "dhruva/status", 2, 88, 0, 0, 0);
+  let pub2_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref pub2_buf);
+  if mqtt_publish_qos_from_flags(pub2_fh.flags) != 2 { ok = 0; }
+  let pub2_parsed: MqttPublishResult = mqtt_parse_publish(ref pub2_buf, pub2_fh.variable_header_start, pub2_fh.remaining_length, pub2_fh.variable_header_start, 2);
+  if pub2_parsed.packet_id != 88 { ok = 0; }
+  if pub2_parsed.payload_len != 0 { ok = 0; }
+
+  let pubrec_buf: [u8; 512] = mqtt_zero512_bytes();
+  let _ = mqtt_build_pubrec(mut ref pubrec_buf, 88);
+  let pubrec_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref pubrec_buf);
+  if pubrec_fh.packet_type != mqtt_packet_type_pubrec() { ok = 0; }
+  if mqtt_parse_pubrec(ref pubrec_buf, pubrec_fh.variable_header_start) != 88 { ok = 0; }
+
+  let pubrel_buf: [u8; 512] = mqtt_zero512_bytes();
+  let _ = mqtt_build_pubrel(mut ref pubrel_buf, 88);
+  let pubrel_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref pubrel_buf);
+  if pubrel_fh.packet_type != mqtt_packet_type_pubrel() { ok = 0; }
+  if pubrel_fh.flags != 2 { ok = 0; } // reserved bits, required by spec
+  if mqtt_parse_pubrel(ref pubrel_buf, pubrel_fh.variable_header_start) != 88 { ok = 0; }
+
+  let pubcomp_buf: [u8; 512] = mqtt_zero512_bytes();
+  let _ = mqtt_build_pubcomp(mut ref pubcomp_buf, 88);
+  let pubcomp_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref pubcomp_buf);
+  if pubcomp_fh.packet_type != mqtt_packet_type_pubcomp() { ok = 0; }
+  if mqtt_parse_pubcomp(ref pubcomp_buf, pubcomp_fh.variable_header_start) != 88 { ok = 0; }
+
+  // SUBSCRIBE / SUBACK.
+  let sub_buf: [u8; 512] = mqtt_zero512_bytes();
+  let sub_len: i64 = mqtt_build_subscribe(mut ref sub_buf, 42, "dhruva/status", 0);
+  let sub_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref sub_buf);
+  if sub_fh.packet_type != mqtt_packet_type_subscribe() { ok = 0; }
+  if (sub_fh.variable_header_start + sub_fh.remaining_length) != sub_len { ok = 0; }
+  let sub_parsed: MqttSubscribeResult = mqtt_parse_subscribe(ref sub_buf, sub_fh.variable_header_start);
+  if sub_parsed.packet_id != 42 { ok = 0; }
+  if sub_parsed.qos != 0 { ok = 0; }
+  if sub_parsed.topic.span_len != 13 { ok = 0; }
+
+  let suback_buf: [u8; 512] = mqtt_zero512_bytes();
+  let suback_len: i64 = mqtt_build_suback(mut ref suback_buf, 42, 0);
+  if suback_len != 5 { ok = 0; } // 2-byte fixed header + 2-byte packet ID + 1-byte QoS
+  let suback_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref suback_buf);
+  let suback_parsed: MqttSubackResult = mqtt_parse_suback(ref suback_buf, suback_fh.variable_header_start);
+  if suback_parsed.packet_id != 42 { ok = 0; }
+  if suback_parsed.granted_qos != 0 { ok = 0; }
+
+  // PINGREQ / PINGRESP / DISCONNECT.
+  let ping_buf: [u8; 512] = mqtt_zero512_bytes();
+  let ping_len: i64 = mqtt_build_pingreq(mut ref ping_buf);
+  if ping_len != 2 { ok = 0; }
+  let ping_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref ping_buf);
+  if ping_fh.packet_type != mqtt_packet_type_pingreq() { ok = 0; }
+  if ping_fh.remaining_length != 0 { ok = 0; }
+
+  let pong_buf: [u8; 512] = mqtt_zero512_bytes();
+  let _ = mqtt_build_pingresp(mut ref pong_buf);
+  let pong_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref pong_buf);
+  if pong_fh.packet_type != mqtt_packet_type_pingresp() { ok = 0; }
+
+  let disc_buf: [u8; 512] = mqtt_zero512_bytes();
+  let _ = mqtt_build_disconnect(mut ref disc_buf);
+  let disc_fh: MqttFixedHeader = mqtt_parse_fixed_header(ref disc_buf);
+  if disc_fh.packet_type != mqtt_packet_type_disconnect() { ok = 0; }
+
+  // Remaining-length multi-byte encode/decode round trip (a PUBLISH
+  // payload of 200 bytes needs a 2-byte remaining-length field --
+  // exercises the ">= 128" continuation-bit path this package's own
+  // other self-test cases, all under 128 bytes, never touch).
+  let big_buf: [u8; 512] = mqtt_zero512_bytes();
+  let enc_end: i64 = mqtt_encode_remaining_length(mut ref big_buf, 0, 200);
+  if enc_end != 2 { ok = 0; } // 200 needs exactly 2 remaining-length bytes
+  let dec: MqttRemLenResult = mqtt_decode_remaining_length(ref big_buf, 0);
+  if dec.value != 200 { ok = 0; }
+  if dec.next_pos != 2 { ok = 0; }
+
+  return ok;
+}

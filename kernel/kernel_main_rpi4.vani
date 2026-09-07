@@ -1552,6 +1552,10 @@ extern "C" fn filter_get_rule_action(index: u32) -> u32;
 // function's only job is reading the real board state into a
 // `FilterConfig` and handing it to the package.
 use "../vendor/netstack/src/lib.vani";
+// Round 109: MQTT over plain TCP (Pi 4/5 has no TLS at all -- round
+// 108's own finding) -- zero name collisions confirmed via grep
+// first, same check performed before every prior vendored package.
+use "../vendor/mqtt/src/lib.vani";
 
 fn tcp_get_dst_port_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
   return arp_read_u16_be_rpi4(frame, tcp_offset + 2);
@@ -2506,6 +2510,162 @@ fn tcp_conn_self_test_rpi4() -> i64 {
   if tcp_conn_get_state(server_id) != tcp_state_closed_final_rpi4() { ok = 0; }
 
   let _ = uart_puts_rpi4_vani("TCP: connection lifecycle (handshake + data + close)");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
+// Round 109: MQTT over plain TCP -- Pi 4/5 has no TLS at all (round
+// 108's own finding), so unlike Pi 1's own `mqttecho` (MQTT over real
+// TLS 1.3), this pairs the same `mqtt` kosh package directly with
+// plain TCP, the typical unencrypted embedded-broker deployment.
+// Sends one application-data segment and drains BOTH frames it
+// produces on the wire: the data segment itself (handled by the
+// receiver, which auto-ACKs per tcp_conn_handle_segment_rpi4's own
+// established-data branch) and that ACK (handled by the sender, which
+// just cancels its own pending retransmit) -- otherwise the next send
+// would find a stale ACK sitting first in the loopback frame queue
+// instead of real data.
+fn mqtt_send_and_drain_rpi4(sender_id: u32, receiver_id: u32, my_mac: ref [u8; 6], payload: ref [u8; 512], payload_len: i64, out_payload: mut ref [u8; 512]) -> i64 {
+  let _ = tcp_conn_send_data_rpi4(sender_id, my_mac, my_mac, payload, payload_len);
+  let data_frame: [u8; 512] = netif_zero_frame_rpi4();
+  let data_frame_len: i64 = netif_recv_frame_rpi4(mut ref data_frame, 512);
+  let recv_len: i64 = tcp_conn_handle_segment_rpi4(receiver_id, ref data_frame, data_frame_len, my_mac, my_mac, out_payload, 512);
+  let ack_frame: [u8; 512] = netif_zero_frame_rpi4();
+  let ack_frame_len: i64 = netif_recv_frame_rpi4(mut ref ack_frame, 512);
+  let ack_scratch: [u8; 512] = netif_zero_frame_rpi4();
+  let _ = tcp_conn_handle_segment_rpi4(sender_id, ref ack_frame, ack_frame_len, my_mac, my_mac, mut ref ack_scratch, 512);
+  return recv_len;
+}
+
+// Boot-time (and on-demand, via the `mqtt` shell command) self-test:
+// a full MQTT v3.1.1 QoS 1 lifecycle -- CONNECT/CONNACK, SUBSCRIBE/
+// SUBACK, PUBLISH/PUBACK, PINGREQ/PINGRESP, DISCONNECT -- driven over
+// a real hand-shaken plain-TCP connection between connection slot 0
+// (client) and slot 1 (server), same both-roles-in-one-instance shape
+// as tcp_conn_self_test_rpi4's own handshake+data+close lifecycle.
+fn mqtt_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let _ = tcp_conn_reset(0 as u32);
+  let _ = tcp_conn_reset(1 as u32);
+  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let _ = netif_get_mac_rpi4(mut ref my_mac);
+  let client_id: u32 = 0 as u32;
+  let server_id: u32 = 1 as u32;
+  let client_ip: u32 = 0xC0A80101 as u32;
+  let server_ip: u32 = 0xC0A80102 as u32;
+  let client_port: u32 = 54329 as u32;
+  let server_port: u32 = 1883 as u32; // MQTT's own conventional plain-TCP port
+
+  let _ = tcp_conn_passive_open_rpi4(server_id, server_ip, server_port);
+  let _ = tcp_conn_active_open_rpi4(client_id, ref my_mac, ref my_mac, client_ip, server_ip, client_port, server_port, 6000 as u32);
+
+  // Three-way handshake, hand-driven exactly like tcp_conn_self_test_
+  // rpi4's own.
+  let scratch: [u8; 512] = netif_zero_frame_rpi4();
+  let f1: [u8; 512] = netif_zero_frame_rpi4();
+  let l1: i64 = netif_recv_frame_rpi4(mut ref f1, 512); // client's SYN
+  let s1: i64 = tcp_conn_handle_segment_rpi4(server_id, ref f1, l1, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l1 <= 0) || (s1 != 0) { ok = 0; }
+  let f2: [u8; 512] = netif_zero_frame_rpi4();
+  let l2: i64 = netif_recv_frame_rpi4(mut ref f2, 512); // server's SYN-ACK
+  let s2: i64 = tcp_conn_handle_segment_rpi4(client_id, ref f2, l2, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l2 <= 0) || (s2 != 0) { ok = 0; }
+  let f3: [u8; 512] = netif_zero_frame_rpi4();
+  let l3: i64 = netif_recv_frame_rpi4(mut ref f3, 512); // client's final ACK
+  let s3: i64 = tcp_conn_handle_segment_rpi4(server_id, ref f3, l3, ref my_mac, ref my_mac, mut ref scratch, 512);
+  if (l3 <= 0) || (s3 != 0) { ok = 0; }
+  if tcp_conn_get_state(client_id) != tcp_state_established_rpi4() { ok = 0; }
+  if tcp_conn_get_state(server_id) != tcp_state_established_rpi4() { ok = 0; }
+
+  // A single build buffer and a single receive buffer, reused across
+  // all five exchanges below -- same stack-economy reasoning as Pi 1's
+  // own mqttecho.
+  let pkt: [u8; 512] = mqtt_zero512_bytes();
+  let out: [u8; 512] = netif_zero_frame_rpi4();
+
+  // --- CONNECT / CONNACK. ---
+  let plen: i64 = mqtt_build_connect(mut ref pkt, "dhruva-mqtt-rpi4", 60);
+  let recv_len: i64 = mqtt_send_and_drain_rpi4(client_id, server_id, ref my_mac, ref pkt, plen, mut ref out);
+  if recv_len != plen { ok = 0; }
+  let fh: MqttFixedHeader = mqtt_parse_fixed_header(ref out);
+  if fh.packet_type != mqtt_packet_type_connect() { ok = 0; }
+  if mqtt_parse_connect(ref out, fh.variable_header_start).ok != 1 { ok = 0; }
+
+  plen = mqtt_build_connack(mut ref pkt, 0, mqtt_connack_accepted());
+  recv_len = mqtt_send_and_drain_rpi4(server_id, client_id, ref my_mac, ref pkt, plen, mut ref out);
+  if recv_len != plen { ok = 0; }
+  fh = mqtt_parse_fixed_header(ref out);
+  let connack_parsed: MqttConnackResult = mqtt_parse_connack(ref out, fh.variable_header_start);
+  if connack_parsed.return_code != mqtt_connack_accepted() { ok = 0; }
+
+  // --- SUBSCRIBE / SUBACK (QoS 1). ---
+  plen = mqtt_build_subscribe(mut ref pkt, 1, "dhruva/status", 1);
+  recv_len = mqtt_send_and_drain_rpi4(client_id, server_id, ref my_mac, ref pkt, plen, mut ref out);
+  if recv_len != plen { ok = 0; }
+  fh = mqtt_parse_fixed_header(ref out);
+  let sub_parsed: MqttSubscribeResult = mqtt_parse_subscribe(ref out, fh.variable_header_start);
+  if (sub_parsed.packet_id != 1) || (sub_parsed.qos != 1) { ok = 0; }
+
+  plen = mqtt_build_suback(mut ref pkt, sub_parsed.packet_id, sub_parsed.qos);
+  recv_len = mqtt_send_and_drain_rpi4(server_id, client_id, ref my_mac, ref pkt, plen, mut ref out);
+  if recv_len != plen { ok = 0; }
+  fh = mqtt_parse_fixed_header(ref out);
+  let suback_parsed: MqttSubackResult = mqtt_parse_suback(ref out, fh.variable_header_start);
+  if (suback_parsed.packet_id != 1) || (suback_parsed.granted_qos != 1) { ok = 0; }
+
+  // --- PUBLISH (QoS 1) / PUBACK. ---
+  let publish_text: Str = "hello-mqtt-rpi4";
+  let publish_text_len: i64 = str_len_bytes(publish_text);
+  let pub_header_len: i64 = mqtt_build_publish(mut ref pkt, "dhruva/status", 1, 2, 0, 0, publish_text_len);
+  let cpi: i64 = 0;
+  while cpi < publish_text_len {
+    pkt[pub_header_len + cpi] = str_byte_at(publish_text, cpi) as u8;
+    cpi = cpi + 1;
+  }
+  plen = pub_header_len + publish_text_len;
+  recv_len = mqtt_send_and_drain_rpi4(client_id, server_id, ref my_mac, ref pkt, plen, mut ref out);
+  if recv_len != plen { ok = 0; }
+  fh = mqtt_parse_fixed_header(ref out);
+  if fh.packet_type != mqtt_packet_type_publish() { ok = 0; }
+  let pub_parsed: MqttPublishResult = mqtt_parse_publish(ref out, fh.variable_header_start, fh.remaining_length, fh.variable_header_start, mqtt_publish_qos_from_flags(fh.flags));
+  if pub_parsed.payload_len != publish_text_len { ok = 0; }
+  cpi = 0;
+  while cpi < publish_text_len {
+    if out[pub_parsed.payload_start + cpi] != (str_byte_at(publish_text, cpi) as u8) { ok = 0; }
+    cpi = cpi + 1;
+  }
+
+  plen = mqtt_build_puback(mut ref pkt, pub_parsed.packet_id);
+  recv_len = mqtt_send_and_drain_rpi4(server_id, client_id, ref my_mac, ref pkt, plen, mut ref out);
+  if recv_len != plen { ok = 0; }
+  fh = mqtt_parse_fixed_header(ref out);
+  if mqtt_parse_puback(ref out, fh.variable_header_start) != pub_parsed.packet_id { ok = 0; }
+
+  // --- PINGREQ / PINGRESP. ---
+  plen = mqtt_build_pingreq(mut ref pkt);
+  recv_len = mqtt_send_and_drain_rpi4(client_id, server_id, ref my_mac, ref pkt, plen, mut ref out);
+  if recv_len != plen { ok = 0; }
+  fh = mqtt_parse_fixed_header(ref out);
+  if fh.packet_type != mqtt_packet_type_pingreq() { ok = 0; }
+
+  plen = mqtt_build_pingresp(mut ref pkt);
+  recv_len = mqtt_send_and_drain_rpi4(server_id, client_id, ref my_mac, ref pkt, plen, mut ref out);
+  if recv_len != plen { ok = 0; }
+  fh = mqtt_parse_fixed_header(ref out);
+  if fh.packet_type != mqtt_packet_type_pingresp() { ok = 0; }
+
+  // --- DISCONNECT (client-initiated, no reply expected per spec). ---
+  plen = mqtt_build_disconnect(mut ref pkt);
+  recv_len = mqtt_send_and_drain_rpi4(client_id, server_id, ref my_mac, ref pkt, plen, mut ref out);
+  if recv_len != plen { ok = 0; }
+  fh = mqtt_parse_fixed_header(ref out);
+  if fh.packet_type != mqtt_packet_type_disconnect() { ok = 0; }
+
+  let _ = uart_puts_rpi4_vani("MQTT over plain TCP: CONNECT->CONNACK, SUBSCRIBE(QoS1)->SUBACK, PUBLISH(QoS1)->PUBACK, PINGREQ->PINGRESP, DISCONNECT");
   if ok == 1 {
     let _ = uart_puts_rpi4_vani(" (PASS)\n");
   } else {
@@ -3800,6 +3960,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = dhcp_self_test_rpi4();
   let _ = dhcp_server_self_test_rpi4();
   let _ = netconfig_self_test_rpi4();
+  let _ = mqtt_self_test_rpi4();
   return 0;
 }
 
@@ -4039,11 +4200,11 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, sha512, x25519, ed25519, pki, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, sha512, x25519, ed25519, pki, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 97 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 109 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
@@ -4121,6 +4282,11 @@ fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("netcfg") == (1 as u32) {
     let _ = uart_puts_rpi4_vani("\n");
     let _ = netconfig_self_test_rpi4();
+    return 0;
+  }
+  if rpi4_shell_line_matches("mqtt") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = mqtt_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_starts_with("echo ") == (1 as u32) {

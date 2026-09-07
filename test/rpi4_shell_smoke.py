@@ -122,6 +122,8 @@ def run(elf_path: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[int, str]:
         time.sleep(CMD_WAIT_S)
         send("netcfg")
         time.sleep(CMD_WAIT_S)
+        send("mqtt")
+        time.sleep(CMD_WAIT_S)
         out, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, out.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
@@ -144,8 +146,8 @@ def main() -> int:
     print(output, end="")
 
     checks = {
-        "help lists commands": "commands: help, ver, test, sha256, sha512, x25519, ed25519, pki, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, echo <text>" in output,
-        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 97 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg" in output,
+        "help lists commands": "commands: help, ver, test, sha256, sha512, x25519, ed25519, pki, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>" in output,
+        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 109 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt" in output,
         "echo echoes real argument text": "hello dhruva" in output,
         "unknown command reported": "unknown command (try 'help')" in output,
         "test reruns the real self-test": "sum=5050 quotient=14285 remainder=5" in output,
@@ -194,15 +196,19 @@ def main() -> int:
         "netcfg reruns the static IP config self-test": output.count(
             "NETCFG: static IP config + unconfigured/invalid rejection + DHCP-path setter (PASS)"
         ) >= 2,
+        "mqtt reruns the MQTT-over-plain-TCP self-test": output.count(
+            "MQTT over plain TCP: CONNECT->CONNACK, SUBSCRIBE(QoS1)->SUBACK, PUBLISH(QoS1)->PUBACK, PINGREQ->PINGRESP, DISCONNECT (PASS)"
+        ) >= 2,
         "no fault": "FAULT" not in output,
     }
     ok = all(checks.values())
 
     if ok:
-        print(f"\n[rpi4_shell_smoke.py] PASS -- all 19 real shell commands (help, "
+        print(f"\n[rpi4_shell_smoke.py] PASS -- all 20 real shell commands (help, "
               f"ver, echo, an unknown command, test, sha256, sha512, x25519, "
-              f"ed25519, pki, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg) "
-              f"got their correct real responses over a live QEMU stdio UART session.", file=sys.stderr)
+              f"ed25519, pki, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, "
+              f"mqtt) got their correct real responses over a live QEMU stdio UART "
+              f"session.", file=sys.stderr)
         return 0
     failed = [name for name, passed in checks.items() if not passed]
     print(f"\n[rpi4_shell_smoke.py] FAIL -- failed checks: {failed!r}",

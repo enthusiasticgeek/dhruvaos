@@ -4820,6 +4820,80 @@ than assumed:
   its first live run, proving the package's own build/parse functions
   round-trip correctly over a GENUINE encrypted transport (not just
   the package's own buffer-to-buffer self-test).
+
+  **ROUND 109 UPDATE, 2026-09-07**: MQTT added -- a new, minimal,
+  hardware-agnostic `mqtt` kosh package (`~/source/vani-mqtt`, v0.2.0)
+  implementing MQTT v3.1.1's CONNECT/CONNACK, PUBLISH/SUBSCRIBE/SUBACK,
+  PINGREQ/PINGRESP, and DISCONNECT. Initially scoped QoS 0 only (per
+  round 105's own follow-on sequencing); the user then explicitly
+  asked for BOTH TLS and plain-TCP transport, and separately for QoS
+  0/1/2 all available -- both requests changed the package and its
+  integration mid-round. QoS 1 (PUBACK) and the full QoS 2 four-way
+  handshake (PUBREC/PUBREL/PUBCOMP) were added to the package (v0.1.0
+  -> v0.2.0): PUBLISH gained an optional packet identifier and
+  generalized DUP/QoS/RETAIN flags. Packet-identifier allocation and
+  retry/dup-detection are deliberately left to the caller -- the same
+  mechanism/policy split this project's own TCP retransmit logic
+  already draws (`tcp_conn_check_retransmit_rpi4` lives in the kernel
+  file, not the shared `netstack` package).
+
+  Wired into BOTH boards, each over the transport that board actually
+  has:
+  - **Pi 1** (`kernel_main.vani`): a new `mqttecho <text>` shell
+    command layered on the existing real TLS 1.3 + TCP stack (mirrors
+    `httpecho`'s own both-roles-in-one-instance shape), exercising the
+    full QoS 1 CONNECT->CONNACK, SUBSCRIBE->SUBACK, PUBLISH->PUBACK,
+    PINGREQ->PINGRESP, DISCONNECT lifecycle -- the user's own typed
+    text is the live PUBLISH payload, round-tripped through real
+    encryption both ways.
+  - **Pi 4/5** (`kernel_main_rpi4.vani`): a new `mqtt` shell command
+    (self-test style, matching `tcp`/`udp`/`dhcp`'s own bare-command
+    convention) running the same QoS 1 lifecycle over PLAIN TCP --
+    confirmed (again, same finding as round 108) that Pi 4/5 has no
+    TLS at all, so this is the only MQTT path that board can offer
+    without a full TLS 1.3 port first. Hand-drives the loopback frame
+    queue exactly like `tcp_conn_self_test_rpi4`'s own handshake+data+
+    close lifecycle; a new `mqtt_send_and_drain_rpi4` helper drains
+    BOTH frames a one-directional send produces (the data segment
+    itself, auto-ACKed by the receiver) to keep the manual "traffic
+    cop" frame queue from seeing stale ACKs where it expects new data.
+
+  A real, load-bearing constraint hit and fixed on Pi 1: adding
+  `mqttecho`'s own per-exchange packet buffers pushed `task_f`'s own
+  `#[bounded_stack(bytes=12288)]` worst-case stack budget from ~11.5KB
+  to 21020 bytes -- NOT the round-108 RAM-mapping ceiling (a different
+  constraint: total image footprint vs. one task's own worst-case call-
+  chain stack depth). Root-caused by realizing vani's stack-bound
+  checker counts EVERY distinct `[u8;512]` array `let`-declared
+  anywhere in `shell_dispatch` (one giant function housing every shell
+  command as sibling `if` branches) toward that one function's own
+  frame size, regardless of branch -- 18 per-exchange packet buffers
+  (2 per exchange x 9 exchanges) cost 9216 bytes on their own. Fixed
+  by collapsing to a SINGLE reused `[u8;512]` buffer for both building
+  outgoing packets and receiving incoming ones (safe since each
+  exchange fully completes -- build -> send -> receive -> parse --
+  before the next begins, and the one value that must outlive a later
+  reuse, the PUBLISH payload, gets snapshotted into a heap scratch
+  buffer immediately after parsing); confirmed empirically that
+  consolidating same-typed scalar/struct locals via reassignment
+  (`fh = mqtt_parse_fixed_header(...)` instead of redeclaring per step)
+  had ZERO measurable effect on the reported budget, meaning this
+  checker's model is dominated by array byte-width specifically, not
+  variable count -- worth remembering for any future task worried
+  about this same budget. Final inline-a-single-field-access trim
+  (`mqtt_parse_connect(...).ok` instead of a named intermediate) closed
+  the last 4 bytes.
+
+  Verified on both boards: Pi 1's `vanic check`/`build.sh` clean,
+  `phase4_milestone.py` zero `(FAIL)` with the new `mqttecho hello-
+  mqtt` step passing on its first live run (footprint still `0x2c9ea8`
+  bytes, comfortably inside round 108's 10MB mapped ceiling). Pi 4/5's
+  `vanic check`/`build_rpi4.sh` clean (no bounded_stack budget exists
+  there at all), `rpi4_boot_smoke.py` shows the new boot-time `mqtt`
+  self-test passing on its first live run, and `rpi4_shell_smoke.py`
+  (extended to 20 commands) confirms the live `mqtt` shell command
+  re-invocation also passes -- zero regressions on either board's own
+  full pre-existing self-test suite.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

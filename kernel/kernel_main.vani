@@ -569,6 +569,8 @@ extern "C" fn http_req_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn http_req_scratch_get() -> mut ref i64;
 extern "C" fn http_resp_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn http_resp_scratch_get() -> mut ref i64;
+extern "C" fn mqtt_pkt_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn mqtt_pkt_scratch_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -6888,6 +6890,10 @@ use "../vendor/netstack/src/lib.vani";
 // shell command below. No name collisions confirmed via grep before
 // vendoring.
 use "../vendor/http/src/lib.vani";
+// Round 109: MQTT -- zero name collisions confirmed via grep first
+// (same check performed before every prior vendored package this
+// project has pulled in).
+use "../vendor/mqtt/src/lib.vani";
 
 fn filter_config_from_state() -> FilterConfig {
   let count: u32 = fw_get_rule_count();
@@ -18031,6 +18037,55 @@ fn shell_dispatch_hid(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64
   return 0;
 }
 
+// Round 109: mqttecho's own bridge between the mqtt package's typed
+// `[u8;512]` buffers and this kernel's raw heap-pointer scratch
+// buffers (`mut ref i64` + buf_read_byte/buf_write_byte) -- the same
+// copy-loop httpecho's own req/resp handling does inline, factored
+// out here since mqttecho repeats it across five separate packet
+// exchanges (CONNECT, SUBSCRIBE, PUBLISH, PINGREQ, DISCONNECT)
+// instead of just one.
+fn mqtt_copy_local_to_scratch(local_buf: ref [u8; 512], scratch: mut ref i64, byte_len: i64) -> i64 {
+  let i: i64 = 0;
+  while i < byte_len {
+    let _ = buf_write_byte(scratch, i as u32, local_buf[i] as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn mqtt_copy_scratch_to_local(scratch: mut ref i64, local_buf: mut ref [u8; 512], byte_len: i64) -> i64 {
+  let i: i64 = 0;
+  while i < byte_len {
+    local_buf[i] = buf_read_byte(scratch, i as u32) as u8;
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Copies an already-built MQTT packet into the persistent mqtt_pkt_
+// scratch buffer and sends it over an established TLS 1.3 connection.
+// mqttecho's own single per-exchange send step, factored out since it
+// repeats identically across all five packet exchanges.
+fn mqtt_send_packet(sender_id: u32, receiver_id: u32, my_mac: mut ref i64, key: mut ref i64, iv: mut ref i64, local_buf: ref [u8; 512], pkt_len: i64, receiver_rx_buf: mut ref i64, receiver_rx_len_buf: mut ref i64) -> i64 {
+  let _ = mqtt_copy_local_to_scratch(local_buf, mqtt_pkt_scratch_get(), pkt_len);
+  return tls_send(sender_id, receiver_id, my_mac, key, iv, mqtt_pkt_scratch_get(), pkt_len, receiver_rx_buf, receiver_rx_len_buf);
+}
+
+// Decrypts one already-received TLS record into `decrypt_scratch` and
+// copies the whole decrypted packet into `out_local`, ready for the
+// caller's own mqtt_parse_fixed_header/mqtt_parse_* calls. Returns the
+// decrypted packet's total length, or a negative value on decrypt
+// failure (the caller checks this exactly like tls_recv's own raw
+// return value).
+fn mqtt_recv_packet(rx_buf: mut ref i64, rx_len_buf: mut ref i64, key: mut ref i64, iv: mut ref i64, decrypt_scratch: mut ref i64, out_local: mut ref [u8; 512]) -> i64 {
+  let dec_len: i64 = tls_recv(rx_buf, rx_len_buf, key, iv, decrypt_scratch);
+  if dec_len < 0 {
+    return dec_len;
+  }
+  let _ = mqtt_copy_scratch_to_local(decrypt_scratch, out_local, dec_len);
+  return dec_len;
+}
+
 // Parses and runs exactly one already-complete shell line. Deliberately
 // NOT #[no_heap] (same reasoning as task_e's GC pass above): every
 // scratch buffer here is a fresh dhruva_alloc_bytes, and this task can
@@ -19503,6 +19558,247 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("httpecho: POST /echo -> 200 OK, body \"");
     let _ = dharafs_print_data(echoed_body, resp_content_length);
     let _ = uart_puts("\"\n");
+    return 0;
+  }
+
+  // Round 109: MQTT over TLS -- the `mqtt` kosh package's own
+  // CONNECT/SUBSCRIBE/PUBLISH(QoS 1)/PINGREQ/DISCONNECT build+parse
+  // layered on tlsecho/httpecho's own proven real TLS 1.3 + real TCP
+  // transport, same both-roles-in-one-instance shape. Exercises the
+  // full QoS 1 PUBACK acknowledgment path (not just QoS 0) since a
+  // live acked publish is a stronger proof than a fire-and-forget one.
+  // A plain-TCP (no TLS) MQTT path is covered separately on Pi 4/5 --
+  // see kernel_main_rpi4.vani's own `mqtt` shell command -- since Pi
+  // 4/5 has no TLS at all (round 108's own finding).
+  // Round 109: MQTT over TLS -- the `mqtt` kosh package's own
+  // CONNECT/SUBSCRIBE/PUBLISH(QoS 1)/PINGREQ/DISCONNECT build+parse
+  // layered on tlsecho/httpecho's own proven real TLS 1.3 + real TCP
+  // transport, same both-roles-in-one-instance shape. Exercises the
+  // full QoS 1 PUBACK acknowledgment path (not just QoS 0) since a
+  // live acked publish is a stronger proof than a fire-and-forget one.
+  // A plain-TCP (no TLS) MQTT path is covered separately on Pi 4/5 --
+  // see kernel_main_rpi4.vani's own `mqtt` shell command -- since Pi
+  // 4/5 has no TLS at all (round 108's own finding).
+  if shell_word_matches(line_buf, 0, cmd_end, "mqttecho") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: mqttecho <text>\n");
+      return 0;
+    }
+    let text_start: i64 = cmd_end + 1;
+    let text_len: i64 = line_len - text_start;
+    if text_len > (64 as i64) {
+      let _ = uart_puts("error: text too long (max 64)\n");
+      return 0;
+    }
+    let body_scratch: mut ref i64 = tls_client_msg_get();
+    let _ = shell_copy_range(line_buf, text_start, line_len, body_scratch);
+
+    let my_mac: mut ref i64 = shell_my_mac_scratch_get();
+    let _ = netif_get_mac(my_mac);
+    let client_id: u32 = 0 as u32;
+    let server_id: u32 = 1 as u32;
+    let loop_ip: u32 = 0x7F000001 as u32;
+    let client_port: u32 = 54327 as u32;
+    let server_port: u32 = 8445 as u32;
+
+    let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
+    let isn: u32 = scheduler_get_tick_count() + (4000 as u32);
+    let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    if open_status != 0 {
+      let _ = uart_puts("mqttecho: SYN send failed\n");
+      return 0;
+    }
+
+    let scratch: mut ref i64 = shell_tcp_poll_scratch_get();
+    let handshake_iter: i64 = 0;
+    while (handshake_iter < 10) && ((tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established())) {
+      let _ = tcp_conn_poll(my_mac, scratch, 512);
+      handshake_iter = handshake_iter + 1;
+    }
+    if (tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established()) {
+      let _ = uart_puts("mqttecho: TCP handshake failed\n");
+      return 0;
+    }
+
+    let connect_status: i64 = tls_connect(client_id, server_id, my_mac);
+    if connect_status != 0 {
+      let _ = uart_puts("mqttecho: TLS handshake failed\n");
+      return 0;
+    }
+    let accept_status: i64 = tls_accept(server_id, client_id, my_mac);
+    if accept_status != 0 {
+      let _ = uart_puts("mqttecho: TLS server-side accept failed\n");
+      return 0;
+    }
+
+    let c_ap_key: mut ref i64 = tls_c_ap_key_get();
+    let c_ap_iv: mut ref i64 = tls_c_ap_iv_get();
+    let s_ap_key: mut ref i64 = tls_s_ap_key_get();
+    let s_ap_iv: mut ref i64 = tls_s_ap_iv_get();
+
+    // A single build buffer and a single receive buffer, reused
+    // across all five exchanges below (CONNECT, SUBSCRIBE, PUBLISH,
+    // PINGREQ, DISCONNECT) -- each exchange fully completes (build ->
+    // send -> receive -> parse) before the next begins. A fresh pair
+    // of [u8;512] locals per exchange (18 total) previously blew
+    // task_f's own #[bounded_stack] budget, since every branch's
+    // locals in this one big shell_dispatch function are all counted
+    // together toward its worst-case frame size.
+    let pkt: [u8; 512] = mqtt_zero512_bytes();
+
+    // --- CONNECT / CONNACK. ---
+    let send_len: i64 = mqtt_build_connect(mut ref pkt, "dhruva-mqtt-01", 60);
+    let _ = mqtt_send_packet(client_id, server_id, my_mac, c_ap_key, c_ap_iv, ref pkt, send_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+    let recv_len: i64 = mqtt_recv_packet(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_ap_key, c_ap_iv, tls_decrypted_scratch_get(), mut ref pkt);
+    if recv_len < 0 {
+      let _ = uart_puts("mqttecho: server failed to decrypt CONNECT\n");
+      return 0;
+    }
+    let fh: MqttFixedHeader = mqtt_parse_fixed_header(ref pkt);
+    if fh.packet_type != mqtt_packet_type_connect() {
+      let _ = uart_puts("mqttecho: server saw an unexpected packet type for CONNECT\n");
+      return 0;
+    }
+    if mqtt_parse_connect(ref pkt, fh.variable_header_start).ok != 1 {
+      let _ = uart_puts("mqttecho: server failed to parse CONNECT\n");
+      return 0;
+    }
+
+    send_len = mqtt_build_connack(mut ref pkt, 0, mqtt_connack_accepted());
+    let _ = mqtt_send_packet(server_id, client_id, my_mac, s_ap_key, s_ap_iv, ref pkt, send_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+    recv_len = mqtt_recv_packet(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_ap_key, s_ap_iv, tls_server_reply_get(), mut ref pkt);
+    if recv_len < 0 {
+      let _ = uart_puts("mqttecho: client failed to decrypt CONNACK\n");
+      return 0;
+    }
+    fh = mqtt_parse_fixed_header(ref pkt);
+    let connack_parsed: MqttConnackResult = mqtt_parse_connack(ref pkt, fh.variable_header_start);
+    if connack_parsed.return_code != mqtt_connack_accepted() {
+      let _ = uart_puts("mqttecho: client saw CONNECT refused\n");
+      return 0;
+    }
+
+    // --- SUBSCRIBE / SUBACK (QoS 1). ---
+    send_len = mqtt_build_subscribe(mut ref pkt, 1, "dhruva/status", 1);
+    let _ = mqtt_send_packet(client_id, server_id, my_mac, c_ap_key, c_ap_iv, ref pkt, send_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+    recv_len = mqtt_recv_packet(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_ap_key, c_ap_iv, tls_decrypted_scratch_get(), mut ref pkt);
+    if recv_len < 0 {
+      let _ = uart_puts("mqttecho: server failed to decrypt SUBSCRIBE\n");
+      return 0;
+    }
+    fh = mqtt_parse_fixed_header(ref pkt);
+    let sub_parsed: MqttSubscribeResult = mqtt_parse_subscribe(ref pkt, fh.variable_header_start);
+
+    send_len = mqtt_build_suback(mut ref pkt, sub_parsed.packet_id, sub_parsed.qos);
+    let _ = mqtt_send_packet(server_id, client_id, my_mac, s_ap_key, s_ap_iv, ref pkt, send_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+    recv_len = mqtt_recv_packet(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_ap_key, s_ap_iv, tls_server_reply_get(), mut ref pkt);
+    if recv_len < 0 {
+      let _ = uart_puts("mqttecho: client failed to decrypt SUBACK\n");
+      return 0;
+    }
+    fh = mqtt_parse_fixed_header(ref pkt);
+    let suback_parsed: MqttSubackResult = mqtt_parse_suback(ref pkt, fh.variable_header_start);
+    if (suback_parsed.packet_id != 1) || (suback_parsed.granted_qos != 1) {
+      let _ = uart_puts("mqttecho: client saw an unexpected SUBACK\n");
+      return 0;
+    }
+
+    // --- PUBLISH (QoS 1) / PUBACK -- the user's own <text> is the payload. ---
+    let pub_header_len: i64 = mqtt_build_publish(mut ref pkt, "dhruva/status", 1, 2, 0, 0, text_len);
+    let cpi: i64 = 0;
+    while cpi < text_len {
+      pkt[pub_header_len + cpi] = buf_read_byte(body_scratch, cpi as u32) as u8;
+      cpi = cpi + 1;
+    }
+    let _ = mqtt_send_packet(client_id, server_id, my_mac, c_ap_key, c_ap_iv, ref pkt, pub_header_len + text_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+    recv_len = mqtt_recv_packet(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_ap_key, c_ap_iv, tls_decrypted_scratch_get(), mut ref pkt);
+    if recv_len < 0 {
+      let _ = uart_puts("mqttecho: server failed to decrypt PUBLISH\n");
+      return 0;
+    }
+    fh = mqtt_parse_fixed_header(ref pkt);
+    if fh.packet_type != mqtt_packet_type_publish() {
+      let _ = uart_puts("mqttecho: server saw an unexpected packet type for PUBLISH\n");
+      return 0;
+    }
+    let pub_parsed: MqttPublishResult = mqtt_parse_publish(ref pkt, fh.variable_header_start, fh.remaining_length, fh.variable_header_start, mqtt_publish_qos_from_flags(fh.flags));
+
+    // Snapshot the echoed payload into body_scratch (its own original
+    // content -- the user's typed text -- was already fully copied
+    // into pkt above and is no longer needed) before pkt
+    // gets overwritten by the PUBACK/PINGREQ/PINGRESP/DISCONNECT
+    // receives below.
+    let echoed_len: i64 = pub_parsed.payload_len;
+    cpi = 0;
+    while cpi < echoed_len {
+      let _ = buf_write_byte(body_scratch, cpi as u32, pkt[pub_parsed.payload_start + cpi] as u32);
+      cpi = cpi + 1;
+    }
+
+    send_len = mqtt_build_puback(mut ref pkt, pub_parsed.packet_id);
+    let _ = mqtt_send_packet(server_id, client_id, my_mac, s_ap_key, s_ap_iv, ref pkt, send_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+    recv_len = mqtt_recv_packet(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_ap_key, s_ap_iv, tls_server_reply_get(), mut ref pkt);
+    if recv_len < 0 {
+      let _ = uart_puts("mqttecho: client failed to decrypt PUBACK\n");
+      return 0;
+    }
+    fh = mqtt_parse_fixed_header(ref pkt);
+    if mqtt_parse_puback(ref pkt, fh.variable_header_start) != pub_parsed.packet_id {
+      let _ = uart_puts("mqttecho: client saw a PUBACK packet-id mismatch\n");
+      return 0;
+    }
+
+    // --- PINGREQ / PINGRESP. ---
+    send_len = mqtt_build_pingreq(mut ref pkt);
+    let _ = mqtt_send_packet(client_id, server_id, my_mac, c_ap_key, c_ap_iv, ref pkt, send_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+    recv_len = mqtt_recv_packet(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_ap_key, c_ap_iv, tls_decrypted_scratch_get(), mut ref pkt);
+    if recv_len < 0 {
+      let _ = uart_puts("mqttecho: server failed to decrypt PINGREQ\n");
+      return 0;
+    }
+    fh = mqtt_parse_fixed_header(ref pkt);
+    if fh.packet_type != mqtt_packet_type_pingreq() {
+      let _ = uart_puts("mqttecho: server saw an unexpected packet type for PINGREQ\n");
+      return 0;
+    }
+
+    send_len = mqtt_build_pingresp(mut ref pkt);
+    let _ = mqtt_send_packet(server_id, client_id, my_mac, s_ap_key, s_ap_iv, ref pkt, send_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+    recv_len = mqtt_recv_packet(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_ap_key, s_ap_iv, tls_server_reply_get(), mut ref pkt);
+    if recv_len < 0 {
+      let _ = uart_puts("mqttecho: client failed to decrypt PINGRESP\n");
+      return 0;
+    }
+    fh = mqtt_parse_fixed_header(ref pkt);
+    if fh.packet_type != mqtt_packet_type_pingresp() {
+      let _ = uart_puts("mqttecho: client saw an unexpected packet type for PINGRESP\n");
+      return 0;
+    }
+
+    // --- DISCONNECT (client-initiated, no reply expected per spec). ---
+    send_len = mqtt_build_disconnect(mut ref pkt);
+    let _ = mqtt_send_packet(client_id, server_id, my_mac, c_ap_key, c_ap_iv, ref pkt, send_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+    recv_len = mqtt_recv_packet(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_ap_key, c_ap_iv, tls_decrypted_scratch_get(), mut ref pkt);
+    if recv_len < 0 {
+      let _ = uart_puts("mqttecho: server failed to decrypt DISCONNECT\n");
+      return 0;
+    }
+    fh = mqtt_parse_fixed_header(ref pkt);
+    if fh.packet_type != mqtt_packet_type_disconnect() {
+      let _ = uart_puts("mqttecho: server saw an unexpected packet type for DISCONNECT\n");
+      return 0;
+    }
+
+    let _ = tcp_conn_close(client_id, my_mac, my_mac);
+    let close_iter: i64 = 0;
+    while (close_iter < 10) && (tcp_conn_get_state(client_id) != tcp_state_closed_final()) {
+      let _ = tcp_conn_poll(my_mac, scratch, 512);
+      close_iter = close_iter + 1;
+    }
+
+    let _ = uart_puts("mqttecho: CONNECT->CONNACK, SUBSCRIBE(QoS1)->SUBACK, PUBLISH(QoS1) \"");
+    let _ = dharafs_print_data(body_scratch, echoed_len);
+    let _ = uart_puts("\" -> PUBACK, PINGREQ->PINGRESP, DISCONNECT (all over real TLS 1.3)\n");
     return 0;
   }
 
@@ -26368,6 +26664,7 @@ fn kernel_main() -> i64 {
   let _ = tls_t_len_s_fin_set(dhruva_alloc_bytes(4));
   let _ = http_req_scratch_set(dhruva_alloc_bytes(512));
   let _ = http_resp_scratch_set(dhruva_alloc_bytes(512));
+  let _ = mqtt_pkt_scratch_set(dhruva_alloc_bytes(512));
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
