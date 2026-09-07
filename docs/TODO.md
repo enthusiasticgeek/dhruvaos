@@ -3807,6 +3807,47 @@ than assumed:
   parsing on both client and server), PKI, X25519/Ed25519/ChaCha20-
   Poly1305, TLS 1.3, SSH transport, and SSH-shell integration remain
   the next Phase A steps, none started.
+
+  **ROUND 94 UPDATE, 2026-09-06**: SHA-512 (FIPS 180-4) -- the first
+  step of the SHA-512 -> field25519/X25519 -> Ed25519 -> PKI crypto
+  chain, after discovering while scoping "PKI" (step 7) that `pki_
+  verify_raw` is a one-line wrapper around `ed25519_verify`, and
+  Ed25519 doesn't exist on this port at all (round 85 only did SHA-
+  256). The user's own direction: "do the full chain now."
+
+  Direct port of kernel_main.vani's own `sha512_*` algorithm (same K/H
+  constants, same 80-round compression), but genuinely simpler than
+  Pi 1's own version: Pi 1 is ARM32, where a `u64` doesn't fit in one
+  register, so that side's `sha512_read_u64`/`write_u64`/`write_u64_
+  val` exist purely to assemble/disassemble a `u64` from two 32-bit
+  halves. AArch64 has real 64-bit registers -- this port's `u64` is a
+  single value, no hi/lo split needed, so that entire accessor layer
+  is skipped, matching round 85's own `[T; N]` fixed-array
+  simplification one level up.
+
+  Confirmed via a standalone `vanic run` probe before writing any real
+  code that vani's `wrapping_add`/`wrapping_sub` builtins work
+  correctly for `u64` (`wrapping_add(u64::MAX, 1) == 0`), and used
+  them directly for all mod-2^64 arithmetic -- NOT round 85's own
+  manual widen-to-`i64`-and-mask trick (`sha256_wrap_add32_rpi4`).
+  This isn't a style inconsistency: kernel_main.vani's OWN `sha512_
+  compress` already uses these exact builtins directly (added to vani
+  the same round as Pi 1's own SHA-512/Ed25519 work), while its OLDER
+  `sha256_compress` predates that builtin and still uses the manual
+  widen trick round 85 faithfully carried forward -- each SHA variant
+  here matches its own Pi 1 counterpart's actual historical style.
+
+  4 FIPS-180-4 KATs ported (empty string, "abc", a 111-byte message,
+  and a genuine 2-block 112-byte message), same vectors and expected
+  digests as kernel_main.vani's own `sha512_self_test` (independently
+  verified there against Python's own `hashlib.sha512`). Wired into
+  `kmain_rpi4_vani` and a new `sha512` shell command. Worked correctly
+  on the very first REAL build -- no live debugging needed. All 8
+  Pi 4 smoke tests pass; zero Pi 1 files touched.
+
+  **Not done**: field25519/X25519, Ed25519, PKI's own thin wrapper,
+  ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell integration
+  remain the next steps in this chain, none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
