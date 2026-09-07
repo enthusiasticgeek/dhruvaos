@@ -1,0 +1,65 @@
+// Host-runnable validation for crypto_hash's core-only (no one-shot
+// wrappers, no self-tests) subset. Run with:
+//   vanic run test/host_core_test.vani
+//   vanic run test/host_core_test.vani --backend=c
+//
+// Deliberately drives the SAME "abc" KAT src/lib.vani's own
+// sha256_self_test/sha512_self_test already cover, but entirely
+// through the streaming primitives this file actually exposes --
+// proves core.vani alone (no lib.vani) is sufficient to compute a
+// real, correct digest, not just that it parses.
+
+use "../src/core.vani";
+
+fn main() -> i64 {
+  let chunk: [u8; 256] = [
+    0x61 as u8, 0x62 as u8, 0x63 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+
+  let ctx: Sha256Ctx = sha256_init();
+  let ctx2: Sha256Ctx = sha256_update(ref ctx, mut ref chunk, 3);
+  let digest: [u8; 32] = sha256_finalize(ref ctx2);
+  let expected: [u8; 32] = [
+    0xba as u8, 0x78 as u8, 0x16 as u8, 0xbf as u8, 0x8f as u8, 0x01 as u8, 0xcf as u8, 0xea as u8, 0x41 as u8, 0x41 as u8, 0x40 as u8, 0xde as u8,
+    0x5d as u8, 0xae as u8, 0x22 as u8, 0x23 as u8, 0xb0 as u8, 0x03 as u8, 0x61 as u8, 0xa3 as u8, 0x96 as u8, 0x17 as u8, 0x7a as u8, 0x9c as u8,
+    0xb4 as u8, 0x10 as u8, 0xff as u8, 0x61 as u8, 0xf2 as u8, 0x00 as u8, 0x15 as u8, 0xad as u8
+  ];
+  let i: i64 = 0;
+  while i < 32 {
+    assert digest[i] == expected[i];
+    i = i + 1;
+  }
+
+  let sctx: Sha512Ctx = sha512_init();
+  let sctx2: Sha512Ctx = sha512_update(ref sctx, mut ref chunk, 3);
+  let sdigest: [u8; 64] = sha512_finalize(ref sctx2);
+  let sexpected: [u8; 64] = [
+    0xdd as u8, 0xaf as u8, 0x35 as u8, 0xa1 as u8, 0x93 as u8, 0x61 as u8, 0x7a as u8, 0xba as u8, 0xcc as u8, 0x41 as u8, 0x73 as u8, 0x49 as u8, 0xae as u8, 0x20 as u8, 0x41 as u8, 0x31 as u8,
+    0x12 as u8, 0xe6 as u8, 0xfa as u8, 0x4e as u8, 0x89 as u8, 0xa9 as u8, 0x7e as u8, 0xa2 as u8, 0x0a as u8, 0x9e as u8, 0xee as u8, 0xe6 as u8, 0x4b as u8, 0x55 as u8, 0xd3 as u8, 0x9a as u8,
+    0x21 as u8, 0x92 as u8, 0x99 as u8, 0x2a as u8, 0x27 as u8, 0x4f as u8, 0xc1 as u8, 0xa8 as u8, 0x36 as u8, 0xba as u8, 0x3c as u8, 0x23 as u8, 0xa3 as u8, 0xfe as u8, 0xeb as u8, 0xbd as u8,
+    0x45 as u8, 0x4d as u8, 0x44 as u8, 0x23 as u8, 0x64 as u8, 0x3c as u8, 0xe8 as u8, 0x0e as u8, 0x2a as u8, 0x9a as u8, 0xc9 as u8, 0x4f as u8, 0xa5 as u8, 0x4c as u8, 0xa4 as u8, 0x9f as u8
+  ];
+  let si: i64 = 0;
+  while si < 64 {
+    assert sdigest[si] == sexpected[si];
+    si = si + 1;
+  }
+
+  print "crypto_hash core: SHA-256 + SHA-512 streaming (no one-shot/self-test) PASS";
+  return 0;
+}

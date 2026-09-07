@@ -4091,6 +4091,69 @@ than assumed:
   mutex parity gap (Pi 4/5 is missing a feature Pi 1 already has),
   and the X.509/mTLS/HTTPS/MQTT chain above are all separately scoped,
   unstarted future work.
+
+  **ROUND 99 UPDATE, 2026-09-07**: Pi 1 SHA-256/512 migrated to the
+  `crypto_hash` kosh package (Phase 1 pilot of the generification
+  plan). Real complication found before writing any code: the
+  package's one-shot `sha256_hash`/`sha512_hash` cap the message at
+  what fits a 256-byte scratch buffer, but Pi 1's own `sha256_hash`
+  is called on genuinely unbounded input -- whole DharaFS file
+  contents (verified-write digests) and the full TLS 1.3 handshake
+  transcript (easily 500-2000+ bytes). A naive swap would have
+  silently truncated both. Fixed by adding a real streaming API to
+  `vani-crypto-hash` first (`Sha256Ctx`/`Sha512Ctx` +
+  `init`/`update`/`finalize`, v0.2.0) -- the running hash state is
+  always just 8 words plus one block of carry, regardless of total
+  message length; `update` takes up to 256 bytes per call, looped by
+  the caller for longer messages. Verified against 4 KATs per
+  algorithm (including a non-block-aligned multi-call split to
+  exercise the carry-buffer path, and a 500-byte message across 3
+  uneven calls cross-checked against an independent Python `hashlib`
+  reference) before touching Pi 1 at all.
+
+  Found a second real complication once actually wiring Pi 1 in: the
+  package's OWN function names (`sha256_hash`, `sha256_self_test`,
+  etc.) collide directly with Pi 1's own pre-existing functions of
+  the identical name -- `use`'s flat-namespace workaround for BUG-234
+  means both can't coexist in one file. Split `vani-crypto-hash` into
+  `src/core.vani` (streaming primitives only, no one-shot wrappers or
+  self-tests -- what a consumer with a naming conflict needs) and the
+  original `src/lib.vani` (the full API, for consumers like
+  `curve25519` with no conflict) to resolve this cleanly.
+
+  Deleted Pi 1's own ~300-line hand-rolled SHA-256/512 (originally
+  round 41/67, hardened round 65 against a real ARM32 long-lived-
+  scratch-pointer register-corruption bug -- that history stays
+  preserved in `vani-crypto-hash`'s own git log) and replaced
+  `sha256_hash`/`sha512_hash` with thin adapters: copy the caller's
+  heap buffer into the package's `[u8; 256]` stream chunks (looping
+  as needed, so there's still no length cap), feed them through
+  `update`, copy the digest back. `sha256_bytes_equal`/
+  `sha512_bytes_equal` (generic byte comparators, no algorithm
+  dependency) and all 17 existing call sites (DharaFS, HMAC, PBKDF2,
+  TLS transcript hashing, Ed25519) needed ZERO changes -- same
+  adapter signature as the functions they replaced. Also removed 5
+  now-dead persistent-scratch boot-time allocations
+  (`sha256_padded/h/k/w_scratch`, `sha512_h/k/w/padded_scratch`,
+  `boot/scratch_state.S`) that nothing calls anymore.
+
+  Verified live under QEMU, not just `vanic check`: every one of the
+  15 `CRYPTO: ...` self-test lines Pi 1 prints at boot show `(PASS)`,
+  including the two call sites that actually motivated the streaming
+  redesign -- `PKI raw public-key trust (pinned-key verify + real
+  dharafs file round trip) (PASS)` and `TLS 1.3 ... live handshake +
+  app data round trip (PASS)`. `test/phase4_milestone.py`'s broader
+  regression battery passes except 2 checks (`eval 6*7 == 42`,
+  `ping 0.0.0.0` self-ping) that are demonstrably unrelated --
+  different, untouched code region (`eval`'s shell dispatch is ~2600
+  lines away from anything touched this round) and non-deterministic
+  (`ping` passed on an immediate rerun) -- confirmed pre-existing,
+  not a regression from this round.
+
+  **Next**: SHA-256/512 is the pilot; ChaCha20/Poly1305, X25519/
+  Ed25519, and PKI still have their own separate Pi 1 implementations
+  duplicating `vani-curve25519`/`vani-pki` and would need the same
+  treatment to close the generification gap fully -- not started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
