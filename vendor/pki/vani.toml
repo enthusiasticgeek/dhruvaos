@@ -1,0 +1,18 @@
+[package]
+name        = "pki"
+version     = "0.1.0"
+entry       = "src/lib.vani"
+authors     = "enthusiasticgeek"
+license     = "Apache-2.0"
+description = "Raw public-key trust (no X.509/CA chain, a compile-time-pinned key never runtime-settable), pure vani, hardware-agnostic and heap-free. Extracted from DhruvaOS's Pi 4/5 port so any consumer can share one implementation."
+registry    = "kosh"
+
+[deps]
+# Intentionally EMPTY -- curve25519 is vendored at ./vendor/curve25519
+# and pulled in by src/lib.vani via a direct relative `use`, not a
+# [deps] entry, for the same reason vani-curve25519 itself doesn't
+# declare crypto_hash as one: a real vani-compiler bug (BUG-234,
+# vani-compiler/docs/TODO_CURRENT.md) breaks internal name resolution
+# for any [deps]-vendored package whose own code assigns a function
+# call's result into an array element (`buf[i] = helper(...)`), which
+# SHA-256/512's compression loops do throughout.

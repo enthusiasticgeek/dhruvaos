@@ -4019,6 +4019,78 @@ than assumed:
   (signature verification is a shared primitive) but is not itself
   X.509/mTLS/HTTPS/MQTT -- each of those is unstarted, separately-
   scoped future work, not an extension of this round.
+
+  **ROUND 98 UPDATE, 2026-09-06/07**: crypto generification -- the
+  SHA-256/512, field25519/X25519/Ed25519, and raw-key PKI code rounds
+  85 and 94-97 wrote as this file's own inline `_rpi4`-suffixed
+  functions moved OUT entirely into three standalone, hardware-
+  agnostic kosh packages, per the user's explicit direction ("i wanted
+  you to make some packages generic so whatever you have pi4 is on
+  pi1 too... hardware agnostic or atleast hardware configurable yet
+  generic"): `vani-crypto-hash` (SHA-256/512), `vani-curve25519`
+  (field25519/X25519/Ed25519, depends on crypto_hash), `vani-pki`
+  (raw-key trust, depends on curve25519) -- each its own GitHub repo,
+  Apache-2.0, vendored here at `vendor/crypto_hash`/`vendor/curve25519`/
+  `vendor/pki`. Pure mechanical extraction, zero algorithm changes --
+  every self-test reuses the exact same vectors as before.
+
+  Key design decision made BEFORE extracting: which of the two
+  existing API styles (Pi 1's heap-based `mut ref i64` buffers, or
+  this port's heap-free fixed-array/return-by-value style) should be
+  the canonical shared one. Chose the heap-free style, since
+  `kernel_main_rpi4.vani` has zero heap allocator by design -- a
+  heap-required package would silently exclude this port and any
+  future no-heap board, while a heap-free package runs on anything.
+  Pi 1 migrating to consume these packages (not the reverse) is
+  future work, not done this round.
+
+  Found and worked around a REAL vani-compiler bug discovered while
+  wiring the packages together as real dependencies (not just each
+  package's own standalone self-test, which never exercises this):
+  `buf[i] = helper(...);` (index-assignment with a function-call RHS)
+  fails to resolve `helper` whenever the enclosing code lives inside
+  a named scope (`module {}`, or a `[deps]`-vendored Kosh package) --
+  even though the identical call resolves fine in a `let` binding or
+  at plain top level. SHA-256/512's own compression loops use exactly
+  this pattern throughout, so real `[deps]`-based package consumption
+  broke immediately. Filed upstream as BUG-234 (vani-compiler's own
+  `docs/TODO_CURRENT.md`; a second, unrelated C-backend bug found
+  along the way -- struct literals with an array field initialized
+  from a local variable emit a raw pointer instead of a copy -- filed
+  as BUG-235; doesn't affect this project, which only ever builds
+  with `--backend=llvm`). Workaround: none of the three packages
+  declare each other as `vani.toml` `[deps]` entries at all; each
+  vendors its dependency's source directly and pulls it in via a
+  plain relative `use` statement instead, landing everything in one
+  flat namespace with no named-scope wrapper for the bug to trip on.
+  This port's own `vendor/` tree deliberately flattens all three
+  packages to ONE copy each (not each package's own independently-
+  vendored nested copy) to avoid duplicate-symbol errors, since a
+  `use`'d file has no namespace isolation to prevent that.
+
+  The 5 `_rpi4`-suffixed self-test functions
+  (`sha256_self_test_rpi4`/etc.) are now thin wrappers: call the
+  package's own unqualified self-test, print the exact same UART
+  message every prior round already printed. Boot sequence and shell
+  dispatch needed ZERO changes as a result. `kernel_main_rpi4.vani`
+  shrank from 6321 to 4277 lines (the ~2140-line inline crypto block
+  replaced by 3 `use` statements + 5 thin wrappers).
+
+  One real, non-functional side effect: `test/rpi4_vani_smoke.py` and
+  `test/rpi4_timer_smoke.py` both needed `DEFAULT_TIMEOUT_S` bumped
+  from 8 to 20 -- the code-layout change from extraction shifted real
+  QEMU TCG boot timing enough that the boot sequence + 5-tick
+  preemption demo no longer reliably finished inside the old 8s
+  window (confirmed via manual reruns with a longer timeout that
+  nothing is actually broken, purely a margin issue, same class of
+  fix round 96 already needed for `rpi4_shell_smoke.py`). All 8 Pi 4
+  smoke tests pass after the recalibration; zero Pi 1 files touched.
+
+  **Not done**: Pi 1 migration to consume these same packages (Phase
+  1 of the generification plan), the scheduler/priority-ceiling-
+  mutex parity gap (Pi 4/5 is missing a feature Pi 1 already has),
+  and the X.509/mTLS/HTTPS/MQTT chain above are all separately scoped,
+  unstarted future work.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

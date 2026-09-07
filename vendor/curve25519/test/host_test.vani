@@ -1,0 +1,12 @@
+// Host-runnable validation for curve25519. Run with:
+//   vanic run test/host_test.vani
+//   vanic run test/host_test.vani --backend=c
+
+use "../src/lib.vani";
+
+fn main() -> i64 {
+  assert x25519_self_test() == 1;
+  assert ed25519_self_test() == 1;
+  print "curve25519: X25519 + Ed25519 self-tests PASS";
+  return 0;
+}

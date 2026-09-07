@@ -22,6 +22,13 @@ bit-mask arithmetic plus BCM2711's own PUP_PDN_CNTRL pull-control
 registers (genuinely QEMU-modeled, unlike kernel_main.vani's own
 BCM2835 GPPUD/GPPUDCLK equivalent) against QEMU's real BCM2838 GPIO
 device model.
+
+Round 98 bumped DEFAULT_TIMEOUT_S from 8 to 20 for the same reason
+test/rpi4_timer_smoke.py's own header comment gives: extracting the
+crypto code into standalone kosh packages shifted real QEMU TCG boot
+timing enough that the boot sequence + 5-tick preemption demo no
+longer reliably finished inside the old 8s window -- a margin issue,
+not a regression (confirmed via a manual --timeout 20 rerun).
 """
 
 import argparse
@@ -30,7 +37,7 @@ import sys
 
 QEMU_BIN = "qemu-system-aarch64"
 MACHINE = "raspi4b"
-DEFAULT_TIMEOUT_S = 8
+DEFAULT_TIMEOUT_S = 20
 EXPECT_PASS = "vani-compiled code self-test (sum 1..100 + division) (PASS)"
 EXPECT_VALUES = "sum=5050 quotient=14285 remainder=5"
 EXPECT_GPIO_PASS = (

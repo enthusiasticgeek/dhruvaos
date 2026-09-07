@@ -1,0 +1,15 @@
+// Host-runnable validation for crypto_hash. Run with:
+//   vanic run test/host_test.vani
+//   vanic run test/host_test.vani --backend=c
+//
+// A real `fn main()` here runs the strict whole-program checker over
+// the whole library, not just a syntax check.
+
+use "../src/lib.vani";
+
+fn main() -> i64 {
+  assert sha256_self_test() == 1;
+  assert sha512_self_test() == 1;
+  print "crypto_hash: SHA-256 + SHA-512 self-tests PASS";
+  return 0;
+}

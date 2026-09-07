@@ -1,0 +1,12 @@
+[package]
+name        = "crypto_hash"
+version     = "0.1.0"
+entry       = "src/lib.vani"
+authors     = "enthusiasticgeek"
+license     = "Apache-2.0"
+description = "SHA-256 and SHA-512 (FIPS 180-4), pure vani, hardware-agnostic and heap-free -- fixed-size array parameters, no allocator, no extern \"C\" dependency. Extracted from DhruvaOS's Pi 4/5 port so any consumer can share one implementation."
+registry    = "kosh"
+
+[deps]
+# No external deps -- built entirely on vani builtins (wrapping_add/
+# wrapping_sub, fixed [T; N] arrays, u8/u32/u64 arithmetic).

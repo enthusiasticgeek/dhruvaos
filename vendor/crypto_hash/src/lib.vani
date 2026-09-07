@@ -1,0 +1,740 @@
+// crypto-hash v0.1.0 -- SHA-256 and SHA-512 (FIPS 180-4), pure vani,
+// hardware-agnostic and heap-free.
+//
+// Every function takes plain fixed-size arrays (`[u8; 256]` scratch,
+// `[u8; 32]`/`[u8; 64]` digests) and returns by value or writes
+// through a `mut ref` array parameter -- no heap allocator, no
+// `extern "C"` declarations, no persistent cross-call scratch state.
+// This runs unmodified on any vani target, with or without a heap:
+// originally written for DhruvaOS's Pi 4/5 (AArch64, no heap
+// allocator by design) and extracted here so any consumer -- Pi 1,
+// Pi 4/5, or a future board -- can share one implementation instead
+// of maintaining a parallel hand-port. See this package's README.md
+// for the full extraction history and rationale.
+//
+// SHA-256's `sha256_wrap_add32` helper (widen to i64, mask to 32
+// bits, truncate back) exists because vani's native `u32` `+` traps
+// on overflow on every target, and SHA-256's compression function
+// depends completely on mod-2^32 wraparound. SHA-512 instead uses
+// vani's `wrapping_add`/`wrapping_sub` builtins directly (added to
+// the compiler after SHA-256 was first written) -- both are
+// equally architecture-independent, just from two different points
+// in the builtin's own history.
+//
+// Fixed at a 256-byte padded scratch buffer (4 blocks / up to
+// 247-byte SHA-256 messages, 111-byte SHA-512 messages before a
+// second 128-byte block is needed) -- a real fixed bound suits a
+// heap-free, often bare-metal consumer better than an unbounded one.
+// Hashing something longer is out of scope for v0.1.0.
+const SHA256_BUF_SIZE: i64 = 256;
+
+fn sha256_wrap_add32(a: u32, b: u32) -> u32 {
+  let wide: i64 = (a as i64) + (b as i64);
+  return (wide & 4294967295) as u32;
+}
+
+fn sha256_rotr32(x: u32, n: u32) -> u32 {
+  return (x >> n) | (x << ((32 as u32) - n));
+}
+
+// Message bytes are big-endian 32-bit words per FIPS 180-4; the
+// padded buffer's own storage order is irrelevant here since every
+// access goes through these two explicit big-endian packing helpers,
+// never a raw word read/write.
+fn sha256_read_be32(buf: mut ref [u8; 256], off: i64) -> u32 {
+  let b0: u32 = buf[off] as u32;
+  let b1: u32 = buf[off + 1] as u32;
+  let b2: u32 = buf[off + 2] as u32;
+  let b3: u32 = buf[off + 3] as u32;
+  return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+fn sha256_write_be32_pad(buf: mut ref [u8; 256], off: i64, v: u32) -> i64 {
+  buf[off] = ((v >> (24 as u32)) & (255 as u32)) as u8;
+  buf[off + 1] = ((v >> (16 as u32)) & (255 as u32)) as u8;
+  buf[off + 2] = ((v >> (8 as u32)) & (255 as u32)) as u8;
+  buf[off + 3] = (v & (255 as u32)) as u8;
+  return 0;
+}
+
+fn sha256_write_be32_out(buf: mut ref [u8; 32], off: i64, v: u32) -> i64 {
+  buf[off] = ((v >> (24 as u32)) & (255 as u32)) as u8;
+  buf[off + 1] = ((v >> (16 as u32)) & (255 as u32)) as u8;
+  buf[off + 2] = ((v >> (8 as u32)) & (255 as u32)) as u8;
+  buf[off + 3] = (v & (255 as u32)) as u8;
+  return 0;
+}
+
+// Process one 64-byte block starting at byte offset `block_off`
+// inside `msg`, folding it into the running state `h` (8 words / 32
+// bytes) using the 64 round constants `k`. `w`, the 64-word message
+// schedule, is a plain local array here -- unlike the Pi 1 side there
+// is no long-lived-register-scratch-pointer hazard to design around,
+// so it never needs to leave this function or survive across calls.
+fn sha256_compress(msg: mut ref [u8; 256], block_off: i64, h: mut ref [u32; 8], k: ref [u32; 64]) -> i64 {
+  let w: [u32; 64] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let i: i64 = 0;
+  while i < 16 {
+    w[i] = sha256_read_be32(msg, block_off + i * 4);
+    i = i + 1;
+  }
+  i = 16;
+  while i < 64 {
+    let w15: u32 = w[i - 15];
+    let w2: u32 = w[i - 2];
+    let w16: u32 = w[i - 16];
+    let w7: u32 = w[i - 7];
+    let s0: u32 = sha256_rotr32(w15, 7 as u32) ^ sha256_rotr32(w15, 18 as u32) ^ (w15 >> (3 as u32));
+    let s1: u32 = sha256_rotr32(w2, 17 as u32) ^ sha256_rotr32(w2, 19 as u32) ^ (w2 >> (10 as u32));
+    w[i] = sha256_wrap_add32(sha256_wrap_add32(w16, s0), sha256_wrap_add32(w7, s1));
+    i = i + 1;
+  }
+
+  let a: u32 = h[0];
+  let b: u32 = h[1];
+  let c: u32 = h[2];
+  let d: u32 = h[3];
+  let e: u32 = h[4];
+  let f: u32 = h[5];
+  let g: u32 = h[6];
+  let hh: u32 = h[7];
+  let ones: u32 = 4294967295 as u32;
+
+  i = 0;
+  while i < 64 {
+    let bige1: u32 = sha256_rotr32(e, 6 as u32) ^ sha256_rotr32(e, 11 as u32) ^ sha256_rotr32(e, 25 as u32);
+    let ch: u32 = (e & f) ^ ((e ^ ones) & g);
+    let kw: u32 = k[i];
+    let ww: u32 = w[i];
+    let t1: u32 = sha256_wrap_add32(sha256_wrap_add32(hh, bige1), sha256_wrap_add32(ch, sha256_wrap_add32(kw, ww)));
+    let bige0: u32 = sha256_rotr32(a, 2 as u32) ^ sha256_rotr32(a, 13 as u32) ^ sha256_rotr32(a, 22 as u32);
+    let maj: u32 = (a & b) ^ (a & c) ^ (b & c);
+    let t2: u32 = sha256_wrap_add32(bige0, maj);
+
+    hh = g;
+    g = f;
+    f = e;
+    e = sha256_wrap_add32(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = sha256_wrap_add32(t1, t2);
+
+    i = i + 1;
+  }
+
+  h[0] = sha256_wrap_add32(h[0], a);
+  h[1] = sha256_wrap_add32(h[1], b);
+  h[2] = sha256_wrap_add32(h[2], c);
+  h[3] = sha256_wrap_add32(h[3], d);
+  h[4] = sha256_wrap_add32(h[4], e);
+  h[5] = sha256_wrap_add32(h[5], f);
+  h[6] = sha256_wrap_add32(h[6], g);
+  h[7] = sha256_wrap_add32(h[7], hh);
+  return 0;
+}
+
+// Hashes `msg_len` bytes already written at the front of `msg` (0 <=
+// msg_len <= 247) into the 32-byte digest `out` (FIPS 180-4 padding:
+// a single 0x80 byte, zero bytes up to a 56-mod-64 boundary, then the
+// original bit-length as a big-endian 8-byte integer). `msg` is
+// padded in place, mirroring kernel_main.vani's own single-buffer
+// design.
+fn sha256_hash(msg: mut ref [u8; 256], msg_len: i64, out: mut ref [u8; 32]) -> i64 {
+  let with_one: i64 = msg_len + 1;
+  let rem: i64 = with_one % 64;
+  let zero_pad: i64 = 0;
+  if rem <= 56 {
+    zero_pad = 56 - rem;
+  } else {
+    zero_pad = (64 - rem) + 56;
+  }
+  let total_len: i64 = with_one + zero_pad + 8;
+
+  msg[msg_len] = 128 as u8;
+  let i: i64 = msg_len + 1;
+  while i < (with_one + zero_pad) {
+    msg[i] = 0 as u8;
+    i = i + 1;
+  }
+  let bit_len: i64 = msg_len * 8;
+  let _ = sha256_write_be32_pad(msg, total_len - 8, 0 as u32);
+  let _ = sha256_write_be32_pad(msg, total_len - 4, bit_len as u32);
+
+  let h: [u32; 8] = [0x6a09e667 as u32, 0xbb67ae85 as u32, 0x3c6ef372 as u32, 0xa54ff53a as u32,
+                      0x510e527f as u32, 0x9b05688c as u32, 0x1f83d9ab as u32, 0x5be0cd19 as u32];
+  let k: [u32; 64] = [
+    0x428a2f98 as u32, 0x71374491 as u32, 0xb5c0fbcf as u32, 0xe9b5dba5 as u32,
+    0x3956c25b as u32, 0x59f111f1 as u32, 0x923f82a4 as u32, 0xab1c5ed5 as u32,
+    0xd807aa98 as u32, 0x12835b01 as u32, 0x243185be as u32, 0x550c7dc3 as u32,
+    0x72be5d74 as u32, 0x80deb1fe as u32, 0x9bdc06a7 as u32, 0xc19bf174 as u32,
+    0xe49b69c1 as u32, 0xefbe4786 as u32, 0x0fc19dc6 as u32, 0x240ca1cc as u32,
+    0x2de92c6f as u32, 0x4a7484aa as u32, 0x5cb0a9dc as u32, 0x76f988da as u32,
+    0x983e5152 as u32, 0xa831c66d as u32, 0xb00327c8 as u32, 0xbf597fc7 as u32,
+    0xc6e00bf3 as u32, 0xd5a79147 as u32, 0x06ca6351 as u32, 0x14292967 as u32,
+    0x27b70a85 as u32, 0x2e1b2138 as u32, 0x4d2c6dfc as u32, 0x53380d13 as u32,
+    0x650a7354 as u32, 0x766a0abb as u32, 0x81c2c92e as u32, 0x92722c85 as u32,
+    0xa2bfe8a1 as u32, 0xa81a664b as u32, 0xc24b8b70 as u32, 0xc76c51a3 as u32,
+    0xd192e819 as u32, 0xd6990624 as u32, 0xf40e3585 as u32, 0x106aa070 as u32,
+    0x19a4c116 as u32, 0x1e376c08 as u32, 0x2748774c as u32, 0x34b0bcb5 as u32,
+    0x391c0cb3 as u32, 0x4ed8aa4a as u32, 0x5b9cca4f as u32, 0x682e6ff3 as u32,
+    0x748f82ee as u32, 0x78a5636f as u32, 0x84c87814 as u32, 0x8cc70208 as u32,
+    0x90befffa as u32, 0xa4506ceb as u32, 0xbef9a3f7 as u32, 0xc67178f2 as u32
+  ];
+
+  let num_blocks: i64 = total_len / 64;
+  let blk: i64 = 0;
+  while blk < num_blocks {
+    let _ = sha256_compress(msg, blk * 64, mut ref h, ref k);
+    blk = blk + 1;
+  }
+
+  let j: i64 = 0;
+  while j < 8 {
+    let _ = sha256_write_be32_out(out, j * 4, h[j]);
+    j = j + 1;
+  }
+  return 0;
+}
+
+fn sha256_digest_equal(a: ref [u8; 32], b: ref [u8; 32]) -> i64 {
+  let i: i64 = 0;
+  while i < 32 {
+    if a[i] != b[i] {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// Three FIPS 180-4 / NIST known-answer vectors -- the empty string,
+// the "abc" worked example from the spec itself, and a 56-byte
+// message whose padding lands exactly on a second 64-byte block --
+// the same three kernel_main.vani's own sha256_self_test uses, same
+// expected digests, byte for byte.
+fn sha256_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let msg0: [u8; 256] = [
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let out0: [u8; 32] = [
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let _ = sha256_hash(mut ref msg0, 0, mut ref out0);
+  let exp0: [u8; 32] = [
+    0xe3 as u8, 0xb0 as u8, 0xc4 as u8, 0x42 as u8, 0x98 as u8, 0xfc as u8, 0x1c as u8, 0x14 as u8, 0x9a as u8, 0xfb as u8, 0xf4 as u8, 0xc8 as u8,
+    0x99 as u8, 0x6f as u8, 0xb9 as u8, 0x24 as u8, 0x27 as u8, 0xae as u8, 0x41 as u8, 0xe4 as u8, 0x64 as u8, 0x9b as u8, 0x93 as u8, 0x4c as u8,
+    0xa4 as u8, 0x95 as u8, 0x99 as u8, 0x1b as u8, 0x78 as u8, 0x52 as u8, 0xb8 as u8, 0x55 as u8
+  ];
+  if sha256_digest_equal(ref out0, ref exp0) == 0 { ok = 0; }
+
+  let msg1: [u8; 256] = [
+    0x61 as u8, 0x62 as u8, 0x63 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let out1: [u8; 32] = [
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let _ = sha256_hash(mut ref msg1, 3, mut ref out1);
+  let exp1: [u8; 32] = [
+    0xba as u8, 0x78 as u8, 0x16 as u8, 0xbf as u8, 0x8f as u8, 0x01 as u8, 0xcf as u8, 0xea as u8, 0x41 as u8, 0x41 as u8, 0x40 as u8, 0xde as u8,
+    0x5d as u8, 0xae as u8, 0x22 as u8, 0x23 as u8, 0xb0 as u8, 0x03 as u8, 0x61 as u8, 0xa3 as u8, 0x96 as u8, 0x17 as u8, 0x7a as u8, 0x9c as u8,
+    0xb4 as u8, 0x10 as u8, 0xff as u8, 0x61 as u8, 0xf2 as u8, 0x00 as u8, 0x15 as u8, 0xad as u8
+  ];
+  if sha256_digest_equal(ref out1, ref exp1) == 0 { ok = 0; }
+
+  let msg2: [u8; 256] = [
+    0x61 as u8, 0x62 as u8, 0x63 as u8, 0x64 as u8, 0x62 as u8, 0x63 as u8, 0x64 as u8, 0x65 as u8, 0x63 as u8, 0x64 as u8, 0x65 as u8, 0x66 as u8,
+    0x64 as u8, 0x65 as u8, 0x66 as u8, 0x67 as u8, 0x65 as u8, 0x66 as u8, 0x67 as u8, 0x68 as u8, 0x66 as u8, 0x67 as u8, 0x68 as u8, 0x69 as u8,
+    0x67 as u8, 0x68 as u8, 0x69 as u8, 0x6a as u8, 0x68 as u8, 0x69 as u8, 0x6a as u8, 0x6b as u8, 0x69 as u8, 0x6a as u8, 0x6b as u8, 0x6c as u8,
+    0x6a as u8, 0x6b as u8, 0x6c as u8, 0x6d as u8, 0x6b as u8, 0x6c as u8, 0x6d as u8, 0x6e as u8, 0x6c as u8, 0x6d as u8, 0x6e as u8, 0x6f as u8,
+    0x6d as u8, 0x6e as u8, 0x6f as u8, 0x70 as u8, 0x6e as u8, 0x6f as u8, 0x70 as u8, 0x71 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let out2: [u8; 32] = [
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let _ = sha256_hash(mut ref msg2, 56, mut ref out2);
+  let exp2: [u8; 32] = [
+    0x24 as u8, 0x8d as u8, 0x6a as u8, 0x61 as u8, 0xd2 as u8, 0x06 as u8, 0x38 as u8, 0xb8 as u8, 0xe5 as u8, 0xc0 as u8, 0x26 as u8, 0x93 as u8,
+    0x0c as u8, 0x3e as u8, 0x60 as u8, 0x39 as u8, 0xa3 as u8, 0x3c as u8, 0xe4 as u8, 0x59 as u8, 0x64 as u8, 0xff as u8, 0x21 as u8, 0x67 as u8,
+    0xf6 as u8, 0xec as u8, 0xed as u8, 0xd4 as u8, 0x19 as u8, 0xdb as u8, 0x06 as u8, 0xc1 as u8
+  ];
+  if sha256_digest_equal(ref out2, ref exp2) == 0 { ok = 0; }
+
+  return ok;
+}
+
+// SHA-512 (FIPS 180-4). Same shape as SHA-256 above (fixed-array
+// params, heap-free) but uses vani's `wrapping_add`/`wrapping_sub`
+// builtins directly for mod-2^64 arithmetic instead of SHA-256's
+// widen-and-mask helper -- AArch64/x86-64/most 64-bit targets have a
+// real 64-bit register, so `u64` is a genuine single value needing no
+// hi/lo split, and the `wrapping_*` builtins handle the required
+// wraparound directly.
+fn sha512_rotr64(x: u64, n: u64) -> u64 {
+  return (x >> n) | (x << ((64 as u64) - n));
+}
+
+fn sha512_read_be64(buf: mut ref [u8; 256], off: i64) -> u64 {
+  let b0: u64 = buf[off] as u64;
+  let b1: u64 = buf[off + 1] as u64;
+  let b2: u64 = buf[off + 2] as u64;
+  let b3: u64 = buf[off + 3] as u64;
+  let b4: u64 = buf[off + 4] as u64;
+  let b5: u64 = buf[off + 5] as u64;
+  let b6: u64 = buf[off + 6] as u64;
+  let b7: u64 = buf[off + 7] as u64;
+  return (b0 << (56 as u64)) | (b1 << (48 as u64)) | (b2 << (40 as u64)) | (b3 << (32 as u64)) | (b4 << (24 as u64)) | (b5 << (16 as u64)) | (b6 << (8 as u64)) | b7;
+}
+
+fn sha512_write_be64_pad(buf: mut ref [u8; 256], off: i64, v: u64) -> i64 {
+  buf[off] = ((v >> (56 as u64)) & (255 as u64)) as u8;
+  buf[off + 1] = ((v >> (48 as u64)) & (255 as u64)) as u8;
+  buf[off + 2] = ((v >> (40 as u64)) & (255 as u64)) as u8;
+  buf[off + 3] = ((v >> (32 as u64)) & (255 as u64)) as u8;
+  buf[off + 4] = ((v >> (24 as u64)) & (255 as u64)) as u8;
+  buf[off + 5] = ((v >> (16 as u64)) & (255 as u64)) as u8;
+  buf[off + 6] = ((v >> (8 as u64)) & (255 as u64)) as u8;
+  buf[off + 7] = (v & (255 as u64)) as u8;
+  return 0;
+}
+
+fn sha512_write_be64_out(buf: mut ref [u8; 64], off: i64, v: u64) -> i64 {
+  buf[off] = ((v >> (56 as u64)) & (255 as u64)) as u8;
+  buf[off + 1] = ((v >> (48 as u64)) & (255 as u64)) as u8;
+  buf[off + 2] = ((v >> (40 as u64)) & (255 as u64)) as u8;
+  buf[off + 3] = ((v >> (32 as u64)) & (255 as u64)) as u8;
+  buf[off + 4] = ((v >> (24 as u64)) & (255 as u64)) as u8;
+  buf[off + 5] = ((v >> (16 as u64)) & (255 as u64)) as u8;
+  buf[off + 6] = ((v >> (8 as u64)) & (255 as u64)) as u8;
+  buf[off + 7] = (v & (255 as u64)) as u8;
+  return 0;
+}
+
+// Process one 128-byte block starting at byte offset `block_off`
+// inside `msg`, folding it into the running state `h` (8 words / 64
+// bytes) using the 80 round constants `k`. `w`, the 80-word message
+// schedule, is a plain local array (matching sha256_compress's
+// own `w` precedent) -- no persistent-scratch-across-calls
+// indirection needed on this port.
+fn sha512_compress(msg: mut ref [u8; 256], block_off: i64, h: mut ref [u64; 8], k: ref [u64; 80]) -> i64 {
+  let w: [u64; 80] = [
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64
+  ];
+  let i: i64 = 0;
+  while i < 16 {
+    w[i] = sha512_read_be64(msg, block_off + i * 8);
+    i = i + 1;
+  }
+  i = 16;
+  while i < 80 {
+    let w15: u64 = w[i - 15];
+    let w2: u64 = w[i - 2];
+    let w16: u64 = w[i - 16];
+    let w7: u64 = w[i - 7];
+    let s0: u64 = sha512_rotr64(w15, 1 as u64) ^ sha512_rotr64(w15, 8 as u64) ^ (w15 >> (7 as u64));
+    let s1: u64 = sha512_rotr64(w2, 19 as u64) ^ sha512_rotr64(w2, 61 as u64) ^ (w2 >> (6 as u64));
+    w[i] = wrapping_add(wrapping_add(w16, s0), wrapping_add(w7, s1));
+    i = i + 1;
+  }
+
+  let a: u64 = h[0];
+  let b: u64 = h[1];
+  let c: u64 = h[2];
+  let d: u64 = h[3];
+  let e: u64 = h[4];
+  let f: u64 = h[5];
+  let g: u64 = h[6];
+  let hh: u64 = h[7];
+  let ones: u64 = wrapping_sub(0 as u64, 1 as u64);
+
+  i = 0;
+  while i < 80 {
+    let bige1: u64 = sha512_rotr64(e, 14 as u64) ^ sha512_rotr64(e, 18 as u64) ^ sha512_rotr64(e, 41 as u64);
+    let ch: u64 = (e & f) ^ ((e ^ ones) & g);
+    let kw: u64 = k[i];
+    let ww: u64 = w[i];
+    let t1: u64 = wrapping_add(wrapping_add(hh, bige1), wrapping_add(ch, wrapping_add(kw, ww)));
+    let bige0: u64 = sha512_rotr64(a, 28 as u64) ^ sha512_rotr64(a, 34 as u64) ^ sha512_rotr64(a, 39 as u64);
+    let maj: u64 = (a & b) ^ (a & c) ^ (b & c);
+    let t2: u64 = wrapping_add(bige0, maj);
+
+    hh = g;
+    g = f;
+    f = e;
+    e = wrapping_add(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = wrapping_add(t1, t2);
+
+    i = i + 1;
+  }
+
+  h[0] = wrapping_add(h[0], a);
+  h[1] = wrapping_add(h[1], b);
+  h[2] = wrapping_add(h[2], c);
+  h[3] = wrapping_add(h[3], d);
+  h[4] = wrapping_add(h[4], e);
+  h[5] = wrapping_add(h[5], f);
+  h[6] = wrapping_add(h[6], g);
+  h[7] = wrapping_add(h[7], hh);
+  return 0;
+}
+
+// Hashes `msg_len` bytes at `msg` into the 64-byte buffer `out`.
+// FIPS 180-4 padding: a single 0x80 byte, zero bytes up to a
+// 112-mod-128 boundary, then the original bit-length as a big-endian
+// 16-byte (128-bit) integer -- messages on this port never get
+// remotely close to needing the high 64 bits, so those are always
+// written as 0, matching SHA-256's own "always fits in the low half"
+// simplification. Fixed at a 256-byte (2-block, up to 239-byte
+// message) buffer, matching round 85's own sizing discipline --
+// enough for this round's own KATs (including a genuine 2-block
+// message) with headroom.
+fn sha512_hash(msg: mut ref [u8; 256], msg_len: i64, out: mut ref [u8; 64]) -> i64 {
+  let with_one: i64 = msg_len + 1;
+  let rem: i64 = with_one % 128;
+  let zero_pad: i64 = 0;
+  if rem <= 112 {
+    zero_pad = 112 - rem;
+  } else {
+    zero_pad = (128 - rem) + 112;
+  }
+  let total_len: i64 = with_one + zero_pad + 16;
+
+  msg[msg_len] = 128 as u8;
+  let i: i64 = msg_len + 1;
+  while i < (with_one + zero_pad) {
+    msg[i] = 0 as u8;
+    i = i + 1;
+  }
+  let bit_len: u64 = (msg_len as u64) * (8 as u64);
+  let _ = sha512_write_be64_pad(msg, total_len - 16, 0 as u64);
+  let _ = sha512_write_be64_pad(msg, total_len - 8, bit_len);
+
+  let h: [u64; 8] = [
+    0x6a09e667f3bcc908 as u64, 0xbb67ae8584caa73b as u64, 0x3c6ef372fe94f82b as u64, 0xa54ff53a5f1d36f1 as u64,
+    0x510e527fade682d1 as u64, 0x9b05688c2b3e6c1f as u64, 0x1f83d9abfb41bd6b as u64, 0x5be0cd19137e2179 as u64
+  ];
+  let k: [u64; 80] = [
+    0x428a2f98d728ae22 as u64, 0x7137449123ef65cd as u64, 0xb5c0fbcfec4d3b2f as u64, 0xe9b5dba58189dbbc as u64,
+    0x3956c25bf348b538 as u64, 0x59f111f1b605d019 as u64, 0x923f82a4af194f9b as u64, 0xab1c5ed5da6d8118 as u64,
+    0xd807aa98a3030242 as u64, 0x12835b0145706fbe as u64, 0x243185be4ee4b28c as u64, 0x550c7dc3d5ffb4e2 as u64,
+    0x72be5d74f27b896f as u64, 0x80deb1fe3b1696b1 as u64, 0x9bdc06a725c71235 as u64, 0xc19bf174cf692694 as u64,
+    0xe49b69c19ef14ad2 as u64, 0xefbe4786384f25e3 as u64, 0x0fc19dc68b8cd5b5 as u64, 0x240ca1cc77ac9c65 as u64,
+    0x2de92c6f592b0275 as u64, 0x4a7484aa6ea6e483 as u64, 0x5cb0a9dcbd41fbd4 as u64, 0x76f988da831153b5 as u64,
+    0x983e5152ee66dfab as u64, 0xa831c66d2db43210 as u64, 0xb00327c898fb213f as u64, 0xbf597fc7beef0ee4 as u64,
+    0xc6e00bf33da88fc2 as u64, 0xd5a79147930aa725 as u64, 0x06ca6351e003826f as u64, 0x142929670a0e6e70 as u64,
+    0x27b70a8546d22ffc as u64, 0x2e1b21385c26c926 as u64, 0x4d2c6dfc5ac42aed as u64, 0x53380d139d95b3df as u64,
+    0x650a73548baf63de as u64, 0x766a0abb3c77b2a8 as u64, 0x81c2c92e47edaee6 as u64, 0x92722c851482353b as u64,
+    0xa2bfe8a14cf10364 as u64, 0xa81a664bbc423001 as u64, 0xc24b8b70d0f89791 as u64, 0xc76c51a30654be30 as u64,
+    0xd192e819d6ef5218 as u64, 0xd69906245565a910 as u64, 0xf40e35855771202a as u64, 0x106aa07032bbd1b8 as u64,
+    0x19a4c116b8d2d0c8 as u64, 0x1e376c085141ab53 as u64, 0x2748774cdf8eeb99 as u64, 0x34b0bcb5e19b48a8 as u64,
+    0x391c0cb3c5c95a63 as u64, 0x4ed8aa4ae3418acb as u64, 0x5b9cca4f7763e373 as u64, 0x682e6ff3d6b2b8a3 as u64,
+    0x748f82ee5defb2fc as u64, 0x78a5636f43172f60 as u64, 0x84c87814a1f0ab72 as u64, 0x8cc702081a6439ec as u64,
+    0x90befffa23631e28 as u64, 0xa4506cebde82bde9 as u64, 0xbef9a3f7b2c67915 as u64, 0xc67178f2e372532b as u64,
+    0xca273eceea26619c as u64, 0xd186b8c721c0c207 as u64, 0xeada7dd6cde0eb1e as u64, 0xf57d4f7fee6ed178 as u64,
+    0x06f067aa72176fba as u64, 0x0a637dc5a2c898a6 as u64, 0x113f9804bef90dae as u64, 0x1b710b35131c471b as u64,
+    0x28db77f523047d84 as u64, 0x32caab7b40c72493 as u64, 0x3c9ebe0a15c9bebc as u64, 0x431d67c49c100d4c as u64,
+    0x4cc5d4becb3e42b6 as u64, 0x597f299cfc657e2a as u64, 0x5fcb6fab3ad6faec as u64, 0x6c44198c4a475817 as u64
+  ];
+
+  let num_blocks: i64 = total_len / 128;
+  let blk: i64 = 0;
+  while blk < num_blocks {
+    let _ = sha512_compress(msg, blk * 128, mut ref h, ref k);
+    blk = blk + 1;
+  }
+
+  let j: i64 = 0;
+  while j < 8 {
+    let _ = sha512_write_be64_out(out, j * 8, h[j]);
+    j = j + 1;
+  }
+  return 0;
+}
+
+fn sha512_digest_equal(a: ref [u8; 64], b: ref [u8; 64]) -> i64 {
+  let i: i64 = 0;
+  while i < 64 {
+    if a[i] != b[i] {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// Four FIPS 180-4 known-answer vectors -- empty string, "abc", a
+// 111-byte message (pads to exactly 1 block), and a 112-byte message
+// (a genuine 2-block test: 112+1=113 bytes pushes past the 112-mod-128
+// boundary). Same vectors and same expected digests, byte for byte,
+// as kernel_main.vani's own sha512_self_test (independently verified
+// there against Python's own `hashlib.sha512`).
+fn sha512_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let msg0: [u8; 256] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let out0: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let _ = sha512_hash(mut ref msg0, 0, mut ref out0);
+  let exp0: [u8; 64] = [
+    0xcf as u8, 0x83 as u8, 0xe1 as u8, 0x35 as u8, 0x7e as u8, 0xef as u8, 0xb8 as u8, 0xbd as u8, 0xf1 as u8, 0x54 as u8, 0x28 as u8, 0x50 as u8, 0xd6 as u8, 0x6d as u8, 0x80 as u8, 0x07 as u8,
+    0xd6 as u8, 0x20 as u8, 0xe4 as u8, 0x05 as u8, 0x0b as u8, 0x57 as u8, 0x15 as u8, 0xdc as u8, 0x83 as u8, 0xf4 as u8, 0xa9 as u8, 0x21 as u8, 0xd3 as u8, 0x6c as u8, 0xe9 as u8, 0xce as u8,
+    0x47 as u8, 0xd0 as u8, 0xd1 as u8, 0x3c as u8, 0x5d as u8, 0x85 as u8, 0xf2 as u8, 0xb0 as u8, 0xff as u8, 0x83 as u8, 0x18 as u8, 0xd2 as u8, 0x87 as u8, 0x7e as u8, 0xec as u8, 0x2f as u8,
+    0x63 as u8, 0xb9 as u8, 0x31 as u8, 0xbd as u8, 0x47 as u8, 0x41 as u8, 0x7a as u8, 0x81 as u8, 0xa5 as u8, 0x38 as u8, 0x32 as u8, 0x7a as u8, 0xf9 as u8, 0x27 as u8, 0xda as u8, 0x3e as u8
+  ];
+  if sha512_digest_equal(ref out0, ref exp0) == 0 { ok = 0; }
+
+  let msg1: [u8; 256] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  msg1[0] = 97 as u8; // 'a'
+  msg1[1] = 98 as u8; // 'b'
+  msg1[2] = 99 as u8; // 'c'
+  let out1: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let _ = sha512_hash(mut ref msg1, 3, mut ref out1);
+  let exp1: [u8; 64] = [
+    0xdd as u8, 0xaf as u8, 0x35 as u8, 0xa1 as u8, 0x93 as u8, 0x61 as u8, 0x7a as u8, 0xba as u8, 0xcc as u8, 0x41 as u8, 0x73 as u8, 0x49 as u8, 0xae as u8, 0x20 as u8, 0x41 as u8, 0x31 as u8,
+    0x12 as u8, 0xe6 as u8, 0xfa as u8, 0x4e as u8, 0x89 as u8, 0xa9 as u8, 0x7e as u8, 0xa2 as u8, 0x0a as u8, 0x9e as u8, 0xee as u8, 0xe6 as u8, 0x4b as u8, 0x55 as u8, 0xd3 as u8, 0x9a as u8,
+    0x21 as u8, 0x92 as u8, 0x99 as u8, 0x2a as u8, 0x27 as u8, 0x4f as u8, 0xc1 as u8, 0xa8 as u8, 0x36 as u8, 0xba as u8, 0x3c as u8, 0x23 as u8, 0xa3 as u8, 0xfe as u8, 0xeb as u8, 0xbd as u8,
+    0x45 as u8, 0x4d as u8, 0x44 as u8, 0x23 as u8, 0x64 as u8, 0x3c as u8, 0xe8 as u8, 0x0e as u8, 0x2a as u8, 0x9a as u8, 0xc9 as u8, 0x4f as u8, 0xa5 as u8, 0x4c as u8, 0xa4 as u8, 0x9f as u8
+  ];
+  if sha512_digest_equal(ref out1, ref exp1) == 0 { ok = 0; }
+
+  let msg2: [u8; 256] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let i2: i64 = 0;
+  while i2 < 111 {
+    msg2[i2] = 65 as u8; // 'A'
+    i2 = i2 + 1;
+  }
+  let out2: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let _ = sha512_hash(mut ref msg2, 111, mut ref out2);
+  let exp2: [u8; 64] = [
+    0xec as u8, 0x9c as u8, 0x8a as u8, 0xc6 as u8, 0x88 as u8, 0xaf as u8, 0x41 as u8, 0x0e as u8, 0x33 as u8, 0x26 as u8, 0x4b as u8, 0xa6 as u8, 0x59 as u8, 0xdb as u8, 0xc7 as u8, 0xbb as u8,
+    0x65 as u8, 0x29 as u8, 0x71 as u8, 0x83 as u8, 0x16 as u8, 0x80 as u8, 0xea as u8, 0x20 as u8, 0x62 as u8, 0x57 as u8, 0x6d as u8, 0x39 as u8, 0x4d as u8, 0x29 as u8, 0x8f as u8, 0x58 as u8,
+    0xb3 as u8, 0xcc as u8, 0xd9 as u8, 0xa1 as u8, 0xf3 as u8, 0x9a as u8, 0x3b as u8, 0x40 as u8, 0xbc as u8, 0x6c as u8, 0x73 as u8, 0x60 as u8, 0x9c as u8, 0x97 as u8, 0x6f as u8, 0x71 as u8,
+    0x52 as u8, 0x4e as u8, 0xfc as u8, 0xd4 as u8, 0x5a as u8, 0xbb as u8, 0xf1 as u8, 0xa9 as u8, 0x8b as u8, 0x3f as u8, 0x15 as u8, 0xdc as u8, 0xcf as u8, 0x0b as u8, 0x0b as u8, 0x9f as u8
+  ];
+  if sha512_digest_equal(ref out2, ref exp2) == 0 { ok = 0; }
+
+  let msg3: [u8; 256] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let i3: i64 = 0;
+  while i3 < 112 {
+    msg3[i3] = 66 as u8; // 'B'
+    i3 = i3 + 1;
+  }
+  let out3: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let _ = sha512_hash(mut ref msg3, 112, mut ref out3);
+  let exp3: [u8; 64] = [
+    0xaa as u8, 0xb6 as u8, 0xad as u8, 0x76 as u8, 0x37 as u8, 0xf0 as u8, 0xf5 as u8, 0xef as u8, 0x58 as u8, 0x01 as u8, 0x08 as u8, 0xac as u8, 0x09 as u8, 0x5c as u8, 0xb3 as u8, 0x28 as u8,
+    0x4f as u8, 0xe2 as u8, 0x03 as u8, 0xf0 as u8, 0x33 as u8, 0xd8 as u8, 0x72 as u8, 0x45 as u8, 0x43 as u8, 0xab as u8, 0x16 as u8, 0x6c as u8, 0x54 as u8, 0x15 as u8, 0xec as u8, 0x73 as u8,
+    0x2e as u8, 0xcb as u8, 0xac as u8, 0x7f as u8, 0x48 as u8, 0xa9 as u8, 0xa7 as u8, 0x18 as u8, 0x56 as u8, 0x0c as u8, 0x8e as u8, 0x37 as u8, 0x84 as u8, 0x8d as u8, 0xce as u8, 0xe5 as u8,
+    0x96 as u8, 0xea as u8, 0xfb as u8, 0xc8 as u8, 0xa8 as u8, 0x3d as u8, 0x2c as u8, 0x8b as u8, 0x38 as u8, 0x41 as u8, 0xe5 as u8, 0xdd as u8, 0x60 as u8, 0xb1 as u8, 0x36 as u8, 0x2f as u8
+  ];
+  if sha512_digest_equal(ref out3, ref exp3) == 0 { ok = 0; }
+
+  return ok;
+}

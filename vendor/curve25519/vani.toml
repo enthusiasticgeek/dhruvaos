@@ -1,0 +1,24 @@
+[package]
+name        = "curve25519"
+version     = "0.1.0"
+entry       = "src/lib.vani"
+authors     = "enthusiasticgeek"
+license     = "Apache-2.0"
+description = "field25519 (GF(2^255-19)), X25519 (RFC 7748), and Ed25519 (RFC 8032), pure vani, hardware-agnostic and heap-free. Extracted from DhruvaOS's Pi 4/5 port so any consumer can share one implementation."
+registry    = "kosh"
+
+[deps]
+# Intentionally EMPTY, not just undeclared: crypto_hash is vendored at
+# ./vendor/crypto_hash and pulled in by src/lib.vani via a direct
+# relative `use`, deliberately NOT declared as a [deps] entry here --
+# merely declaring a [deps] entry makes the compiler wrap that
+# dependency's functions under an implicit namespace requiring
+# `crypto_hash::` qualification at every call site INCLUDING inside
+# crypto_hash's own file (a real vani-compiler bug: index-assignment
+# statements with a function-call RHS, e.g. `buf[i] = helper(...)`,
+# fail to resolve the callee inside any named scope -- a `module {}`
+# block or a `[deps]`-vendored package -- even though the identical
+# call resolves fine in a `let` binding or at plain top level; SHA-
+# 256/512's own compression loops use that pattern throughout). Flat
+# `use`-based inclusion with NO [deps] entry sidesteps the bug
+# entirely. Filed upstream; see vani-compiler/docs/TODO_CURRENT.md.

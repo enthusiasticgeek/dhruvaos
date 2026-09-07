@@ -1,0 +1,87 @@
+// pki v0.1.0 -- raw public-key trust (no X.509/CA chain), pure vani,
+// hardware-agnostic and heap-free. Depends on curve25519 for
+// ed25519_verify -- vendored at ./vendor/curve25519 (itself vendoring
+// crypto_hash at ./vendor/curve25519/vendor/crypto_hash) and pulled
+// in below via a direct relative `use`, not vani.toml [deps]
+// resolution -- see vani-curve25519's own vani.toml for why (a real
+// vani-compiler bug, BUG-234 in vani-compiler/docs/TODO_CURRENT.md).
+use "../../curve25519/src/lib.vani";
+
+// Round 97 -- step 4 of 4, the LAST link in the SHA-512 ->
+// field25519/X25519 -> Ed25519 -> PKI crypto chain (rounds 94-96 did
+// the first three). Raw public-key trust only -- no X.509/CA chain,
+// a compile-time-pinned key never runtime-settable, matching Pi 1's
+// own deliberately thin scope (see kernel_main.vani's own pki_init
+// header comment). `pki_verify_raw` really is exactly the
+// one-line wrapper around `ed25519_verify` that started this
+// whole chain (discovering that one line is what led to porting
+// SHA-512/X25519/Ed25519 in the first place, back when this round was
+// still "start step 7, PKI").
+//
+// Pi 1's file-based `pki_verify_file`/`pki_verify_file_raw` (verify a
+// DharaFS file against a companion `<path>.sig`) are deliberately NOT
+// ported here -- DharaFS isn't wired into this port at all (see this
+// arc's own scope memory), and there's no file-signing use case on
+// this port without it. Only the raw in-memory path is ported, same
+// scope boundary already applied to Ed25519's own `msg` cap.
+//
+// Verification reuses kernel_main.vani's own already-independently-
+// verified pinned key/message/signature (see that file's own
+// pki_self_test) -- same key, same message, same signature -> the
+// same genuine-signature-verifies and tampered-content-rejected
+// checks, minus the file-based end-to-end leg DharaFS would require.
+
+fn pki_pinned_key() -> [u8; 32] {
+  return [
+    0xe7 as u8, 0x34 as u8, 0xea as u8, 0x6c as u8, 0x2b as u8, 0x62 as u8, 0x57 as u8, 0xde as u8,
+    0x72 as u8, 0x35 as u8, 0x5e as u8, 0x47 as u8, 0x2a as u8, 0xa0 as u8, 0x5a as u8, 0x4c as u8,
+    0x48 as u8, 0x7e as u8, 0x6b as u8, 0x46 as u8, 0x3c as u8, 0x02 as u8, 0x9e as u8, 0xd3 as u8,
+    0x06 as u8, 0xdf as u8, 0x2f as u8, 0x01 as u8, 0xb5 as u8, 0x63 as u8, 0x6b as u8, 0x58 as u8
+  ];
+}
+
+fn pki_verify_raw(data: ref [u8; 64], data_len: i64, sig: ref [u8; 64]) -> i64 {
+  let key: [u8; 32] = pki_pinned_key();
+  return ed25519_verify(ref key, data, data_len, sig);
+}
+
+fn pki_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let msg_str: Str = "Dhruva PKI demo payload -- config or update content";
+  let msg_len: i64 = str_len_bytes(msg_str);
+  let msg: [u8; 64] = ed25519_zero64_bytes();
+  let mi: i64 = 0;
+  while mi < msg_len {
+    msg[mi] = str_byte_at(msg_str, mi) as u8;
+    mi = mi + 1;
+  }
+
+  let sig: [u8; 64] = [
+    0x51 as u8, 0xfd as u8, 0xcf as u8, 0x0c as u8, 0x1c as u8, 0xf5 as u8, 0x3c as u8, 0x5d as u8,
+    0x39 as u8, 0x66 as u8, 0x41 as u8, 0x42 as u8, 0x92 as u8, 0x91 as u8, 0x50 as u8, 0xcb as u8,
+    0xc7 as u8, 0xa5 as u8, 0x93 as u8, 0x97 as u8, 0x50 as u8, 0xec as u8, 0xa1 as u8, 0xff as u8,
+    0xd5 as u8, 0x74 as u8, 0x5b as u8, 0x8c as u8, 0x24 as u8, 0x21 as u8, 0xe2 as u8, 0x7b as u8,
+    0x92 as u8, 0xd5 as u8, 0x64 as u8, 0x88 as u8, 0xd3 as u8, 0xc0 as u8, 0x9c as u8, 0x69 as u8,
+    0x16 as u8, 0x81 as u8, 0xcb as u8, 0x0f as u8, 0x04 as u8, 0x76 as u8, 0x35 as u8, 0x2b as u8,
+    0x93 as u8, 0xfa as u8, 0x89 as u8, 0x6d as u8, 0xdb as u8, 0x5a as u8, 0x09 as u8, 0xdf as u8,
+    0xa6 as u8, 0xd2 as u8, 0xfe as u8, 0x5f as u8, 0x7d as u8, 0x52 as u8, 0x7f as u8, 0x05 as u8
+  ];
+
+  if pki_verify_raw(ref msg, msg_len, ref sig) == 0 {
+    ok = 0; // a genuine signature from the matching private key must verify
+  }
+
+  let bad_msg: [u8; 64] = ed25519_zero64_bytes();
+  let bi: i64 = 0;
+  while bi < msg_len {
+    bad_msg[bi] = msg[bi];
+    bi = bi + 1;
+  }
+  bad_msg[0] = ((bad_msg[0] as u32) ^ (1 as u32)) as u8;
+  if pki_verify_raw(ref bad_msg, msg_len, ref sig) == 1 {
+    ok = 0; // tampered content must NOT verify against the same signature
+  }
+
+  return ok;
+}

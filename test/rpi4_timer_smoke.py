@@ -12,6 +12,15 @@ final "halting" line. A broken GIC/timer init (wrong INTID, GICD/GICC
 never enabled, IRQ never unmasked at the PSTATE level, a handler that
 doesn't EOI and stalls the GIC) would show zero "tick=" lines rather
 than five, or would hang without ever reaching the halting line.
+
+Round 98 bumped DEFAULT_TIMEOUT_S from 8 to 20: extracting the SHA-
+256/512/curve25519/Ed25519/PKI crypto code into standalone kosh
+packages (vendor/crypto_hash, vendor/curve25519, vendor/pki, pulled
+in via `use`) shifted real QEMU TCG boot timing enough that the boot
+sequence + 5-tick preemption demo no longer reliably finished inside
+the old 8s window on this machine -- confirmed via a manual --timeout
+20 rerun that the boot sequence itself is unchanged and correct, this
+was purely a margin issue, not a regression.
 """
 
 import argparse
@@ -20,7 +29,7 @@ import sys
 
 QEMU_BIN = "qemu-system-aarch64"
 MACHINE = "raspi4b"
-DEFAULT_TIMEOUT_S = 8
+DEFAULT_TIMEOUT_S = 20
 EXPECT_HALT = "5 real timer IRQs handled, halting"
 EXPECT_TICK_COUNT = 5
 

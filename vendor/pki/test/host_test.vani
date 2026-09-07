@@ -1,0 +1,11 @@
+// Host-runnable validation for pki. Run with:
+//   vanic run test/host_test.vani
+//   vanic run test/host_test.vani --backend=c
+
+use "../src/lib.vani";
+
+fn main() -> i64 {
+  assert pki_self_test() == 1;
+  print "pki: raw public-key trust self-test PASS";
+  return 0;
+}
