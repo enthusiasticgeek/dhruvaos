@@ -4698,6 +4698,43 @@ than assumed:
   vs. never) is a real judgment call, not an engineering question this
   round can resolve alone. Full writeup: [[project_dhruva_round103_
   scheduler_scoping_2026_09_07]]. No code changes made.
+
+  **ROUND 104 UPDATE, 2026-09-07 (scoping only, no code changes)**:
+  confirmed zero X.509/ASN.1/certificate-chain machinery exists
+  anywhere in this codebase -- current PKI (`vani-pki`, 3 functions)
+  is a pinned-raw-public-key model only (RFC 7250: the verifier
+  already knows the exact expected key, never discovers/validates a
+  chain); current TLS is a deliberately fixed single-ciphersuite scope
+  (`TLS_CHACHA20_POLY1305_SHA256`/x25519/Ed25519, no session
+  resumption/PSK/0-RTT).
+
+  The user's own "X.509/mTLS/HTTPS/MQTT" framing is actually 4
+  separable pieces of very different size: (1) X.509 itself --
+  foundational and BY FAR the largest (ASN.1/DER parser + certificate
+  structure parsing + chain validation + trust store + hostname/SAN
+  checks), realistically comparable in scope to the entire SHA-512->
+  X25519->Ed25519->PKI crypto chain (rounds 94-97) on its own; (2)
+  mTLS -- needs X.509 PLUS extending the existing server-only TLS
+  handshake to a real client-cert flow; (3) HTTPS -- needs a brand-
+  new HTTP/1.1 parser (nothing HTTP-shaped exists today) but does
+  NOT strictly need X.509 if staying within the pinned-key model
+  (can run over the EXISTING TLS 1.3 stack for any closed/embedded
+  scenario); (4) MQTT -- needs its own new packet-format module,
+  also independent of X.509 unless mTLS-authenticated MQTT is
+  specifically wanted.
+
+  The real fork: does DhruvaOS need to interoperate with the standard
+  CA-based TLS/PKI ecosystem (a real browser, a public cloud IoT
+  broker) -- if yes, X.509 is mandatory and its own large multi-round
+  effort; if DhruvaOS's real use cases are closed/embedded (matching
+  every trust model this project has built so far -- ARP's cache,
+  DHCP's lease table, TLS/PKI's own pinned-key design), HTTPS and
+  MQTT can each be built as new protocol layers directly on the
+  EXISTING, already-proven TLS 1.3 stack with NO X.509 work at all --
+  a dramatically smaller and faster path to the same practical
+  device-level outcome. Full writeup: [[project_dhruva_round104_
+  x509_scoping_2026_09_07]]. No code changes made -- awaiting user
+  direction on which fork to take.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
