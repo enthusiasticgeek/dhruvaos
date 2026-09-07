@@ -3974,6 +3974,51 @@ than assumed:
   chain) remains -- explicitly still to come per "go through all steps
   1-4." ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell
   integration remain further out, none started.
+
+  **ROUND 97 UPDATE, 2026-09-06**: PKI -- step 4 of 4, the LAST link
+  in the SHA-512 -> field25519/X25519 -> Ed25519 -> PKI crypto chain.
+  Raw public-key trust only -- no X.509/CA chain, a compile-time-
+  pinned key never runtime-settable, matching Pi 1's own deliberately
+  thin scope (`pki_verify_raw` really is exactly the one-line wrapper
+  around `ed25519_verify` that started this whole chain back when this
+  round was still "start step 7, PKI"). `pki_verify_file`/`pki_verify_
+  file_raw` (verify a DharaFS file against a companion `<path>.sig`)
+  deliberately NOT ported -- DharaFS isn't wired into this port at
+  all, and there's no file-signing use case here without it; only the
+  raw in-memory path exists. Verification reuses kernel_main.vani's
+  own already-independently-verified pinned key/message/signature
+  (same genuine-signature-verifies and tampered-content-rejected
+  checks kernel_main.vani's own `pki_self_test` runs, minus the file-
+  based end-to-end leg DharaFS would require). No new vani-compiler
+  gaps found; no new `boot/rpi4/*.S` state file needed (the pinned key
+  is a plain constant function, no persistent state at all). Wired
+  into `kmain_rpi4_vani` and a new `pki` shell command. Worked
+  correctly on the very first `vanic check` and the very first
+  `./build_rpi4.sh` -- zero live debugging needed. All 8 Pi 4 smoke
+  tests pass (19 real shell commands now); zero Pi 1 files touched.
+
+  **This closes the whole SHA-512 -> field25519/X25519 -> Ed25519 ->
+  PKI crypto chain (rounds 94-97)** -- the user's "do the full chain
+  now" / "go through all steps 1-4" instruction is now fully
+  satisfied. **Not done, and explicitly out of THIS chain's scope**:
+  X.509 certificate parsing/chains/rootCA validation, mTLS, and the
+  application-layer protocols that would sit on top (HTTPS, MQTT) --
+  none of these exist anywhere in kernel_main.vani either (confirmed:
+  Pi 1's own PKI is raw-key-only, same as this port). Getting there
+  needs, in dependency order: (1) ChaCha20-Poly1305 (AEAD, needed by
+  TLS 1.3's record layer) -- not started; (2) TLS 1.3 itself (`tls_*`
+  port -- handshake builders + HKDF + AEAD record layer already exist
+  on Pi 1, itself raw-key/PSK-oriented, NOT X.509 -- Pi 1 has no X.509
+  parser either) -- not started; (3) a genuine NEW component, X.509
+  DER parsing + certificate-chain validation + a root CA trust store,
+  which would need to be designed from scratch for either OS (no Pi 1
+  precedent at all) before real HTTPS/mTLS interop with off-the-shelf
+  clients/servers is possible; (4) MQTT (a simple framed protocol over
+  TCP, or over TLS for MQTTS) -- also entirely new, no precedent. Raw-
+  key PKI (this round) is a real, useful building block for those
+  (signature verification is a shared primitive) but is not itself
+  X.509/mTLS/HTTPS/MQTT -- each of those is unstarted, separately-
+  scoped future work, not an extension of this round.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
