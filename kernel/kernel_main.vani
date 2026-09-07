@@ -6833,43 +6833,62 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
 // updated header comment), not here -- this file's own logic was
 // never wrong. Kept as u32 anyway since it's a real, if unrelated,
 // improvement matching this codebase's own convention.
-fn filter_check_frame(frame: mut ref i64, frame_len: i64, is_outgoing: u32) -> u32 {
-  if frame_len < 34 {
-    return 1 as u32; // too short to be a parseable IPv4 frame -- not
-                      // this filter's job to bounds-check, only to
-                      // filter what it can actually parse
-  }
-  if buf_read_u16_be(frame, 12) != (0x0800 as u32) {
-    return 1 as u32; // not IPv4 (e.g. ARP) -- nothing to filter on
-  }
-  let proto: u32 = ipv4_get_protocol(frame, 14);
-  let src_ip: u32 = if is_outgoing == (1 as u32) { ipv4_get_dst_ip(frame, 14) } else { ipv4_get_src_ip(frame, 14) };
-  let dst_port: u32 = 0 as u32;
-  let has_port: u32 = 0 as u32;
-  if (proto == (6 as u32)) && (frame_len >= 38) {
-    dst_port = tcp_get_dst_port(frame, 34);
-    has_port = 1 as u32;
-  }
-  if (proto == (17 as u32)) && (frame_len >= 38) {
-    dst_port = udp_get_dst_port(frame, 34);
-    has_port = 1 as u32;
-  }
+// Round 106a: the packet filter's own real rule-matching ALGORITHM
+// now lives in the shared `netstack` kosh package (`netstack_filter_
+// check_frame`), confirmed byte-for-byte identical to Pi 4/5's own
+// `filter_check_frame_rpi4` before extraction. This file's own rule
+// TABLE storage (`boot/fw_state.S`, the `fw_*` extern accessors
+// above) is untouched. Unlike Pi 4/5's own adapter (which already
+// used fixed `[u8;512]` arrays), this file's `frame` parameter is a
+// heap `mut ref i64` pointer of unbounded length (real Ethernet
+// frames up to 1514 bytes) -- but the filter itself only ever reads
+// header fields within the first 38 bytes regardless of overall
+// frame length, so copying up to 512 bytes (the package's own array
+// cap, comfortable headroom over the 38 bytes actually read) into a
+// local stack array before calling the package is exact, not a
+// truncation risk.
+use "../vendor/netstack/src/lib.vani";
 
+fn filter_config_from_state() -> FilterConfig {
   let count: u32 = fw_get_rule_count();
+  let proto: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let src_ip: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let src_ip_valid: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let dst_port: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let dst_port_valid: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let action: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
   let i: u32 = 0 as u32;
   while i < count {
-    let rule_proto: u32 = fw_get_rule_proto(i);
-    let proto_matches: u32 = if (rule_proto == (0 as u32)) || (rule_proto == proto) { 1 as u32 } else { 0 as u32 };
-    let rule_src_valid: u32 = fw_get_rule_src_ip_valid(i);
-    let src_matches: u32 = if (rule_src_valid == (0 as u32)) || (fw_get_rule_src_ip(i) == src_ip) { 1 as u32 } else { 0 as u32 };
-    let rule_port_valid: u32 = fw_get_rule_dst_port_valid(i);
-    let port_matches: u32 = if (rule_port_valid == (0 as u32)) || ((has_port == (1 as u32)) && (fw_get_rule_dst_port(i) == dst_port)) { 1 as u32 } else { 0 as u32 };
-    if (proto_matches == (1 as u32)) && (src_matches == (1 as u32)) && (port_matches == (1 as u32)) {
-      return fw_get_rule_action(i);
-    }
+    proto[i] = fw_get_rule_proto(i);
+    src_ip[i] = fw_get_rule_src_ip(i);
+    src_ip_valid[i] = fw_get_rule_src_ip_valid(i);
+    dst_port[i] = fw_get_rule_dst_port(i);
+    dst_port_valid[i] = fw_get_rule_dst_port_valid(i);
+    action[i] = fw_get_rule_action(i);
     i = i + (1 as u32);
   }
-  return fw_get_default_policy();
+  return FilterConfig {
+    rule_count: count as i64,
+    default_policy: fw_get_default_policy(),
+    proto: proto,
+    src_ip: src_ip,
+    src_ip_valid: src_ip_valid,
+    dst_port: dst_port,
+    dst_port_valid: dst_port_valid,
+    action: action
+  };
+}
+
+fn filter_check_frame(frame: mut ref i64, frame_len: i64, is_outgoing: u32) -> u32 {
+  let cfg: FilterConfig = filter_config_from_state();
+  let copy_len: i64 = if frame_len < 512 { frame_len } else { 512 };
+  let local_frame: [u8; 512] = netstack_zero_frame();
+  let i: i64 = 0;
+  while i < copy_len {
+    local_frame[i] = buf_read_byte(frame, i as u32) as u8;
+    i = i + 1;
+  }
+  return netstack_filter_check_frame(ref local_frame, frame_len, is_outgoing, ref cfg);
 }
 
 // Receives the oldest pending frame into out_buf, returning its

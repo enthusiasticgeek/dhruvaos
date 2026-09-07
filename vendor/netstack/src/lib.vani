@@ -1,0 +1,347 @@
+// netstack v0.1.0 -- hardware-agnostic network protocol stack, pure
+// vani, heap-free. v0.1.0 covers the packet filter only; ARP, IPv4,
+// UDP, TCP, and DHCP (client + server) are planned additions in the
+// same package (kept as ONE bundled package rather than several
+// separate ones, deliberately -- IPv4/UDP/TCP/DHCP have real
+// interdependencies (DHCP needs UDP needs IPv4), and splitting them
+// into separately-vendored packages would need [deps]-style cross-
+// package `use` the way vani-curve25519/vani-pki needed for
+// vani-crypto-hash -- avoidable complexity here since it's all one
+// cohesive stack, matching how a single real-world netstack crate
+// like smoltcp covers the same scope in one crate rather than many).
+//
+// Extracted from DhruvaOS's Pi 1 (`kernel_main.vani`, `fw_*`-prefixed)
+// and Pi 4/5 (`kernel_main_rpi4.vani`, `filter_*_rpi4`-suffixed)
+// kernels -- confirmed byte-for-byte identical algorithms on both
+// sides before porting (the only difference was buffer-access style:
+// `buf_read_u16_be` heap-pointer reads on Pi 1 vs plain array
+// indexing on Pi 4/5).
+//
+// Design principle, extending the Sha256Ctx/Poly1305Ctx precedent
+// from vani-crypto-hash/vani-chacha20-poly1305 to LONG-LIVED protocol
+// state (a filter's rule table persists across the whole boot
+// session, not just one function call): `FilterConfig` is a plain
+// value-type struct, threaded through by value, with NO extern
+// accessors or persistent storage inside this package at all. Both
+// DhruvaOS kernels already keep their OWN persistent rule-table
+// storage (`boot/fw_state.S` on Pi 1, `boot/rpi4/filter_state.S` on
+// Pi 4/5 -- both pre-existing, unchanged by this package) behind a
+// small set of extern accessors; a consumer's own thin adapter reads
+// its board's current state into a `FilterConfig`, calls this
+// package's pure functions, and writes the result back. This is the
+// SAME shape every stateful kosh package in this project uses, just
+// applied to a rule table instead of a hash/MAC accumulator -- proves
+// the pattern scales before the bigger ARP-cache/TCP-connection/
+// DHCP-lease-table state structs planned for later versions.
+
+// 8 rule slots, matching BOTH existing boards' own fixed capacity
+// (`boot/fw_state.S`/`boot/rpi4/filter_state.S`, "8-slot fixed
+// array" by original design, not a limit this package introduces).
+struct FilterConfig {
+  rule_count: i64,
+  default_policy: u32,
+  proto: [u32; 8],
+  src_ip: [u32; 8],
+  src_ip_valid: [u32; 8],
+  dst_port: [u32; 8],
+  dst_port_valid: [u32; 8],
+  action: [u32; 8]
+}
+
+struct FilterAddResult { cfg: FilterConfig, ok: i64 }
+
+fn netstack_filter_empty() -> FilterConfig {
+  return FilterConfig {
+    rule_count: 0,
+    default_policy: 0 as u32,
+    proto: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
+    src_ip: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
+    src_ip_valid: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
+    dst_port: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
+    dst_port_valid: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
+    action: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32]
+  };
+}
+
+// Appends a rule (first-match-wins order, matching both boards' own
+// semantics). Returns `ok: 0` on success, `ok: -1` if the table is
+// already full (8 rules) -- same convention as the original `fw_add_
+// rule`/`filter_add_rule` extern accessors this replaces.
+fn netstack_filter_add_rule(cfg_in: FilterConfig, proto: u32, src_ip: u32, src_ip_valid: u32, dst_port: u32, dst_port_valid: u32, action: u32) -> FilterAddResult {
+  let cfg: FilterConfig = cfg_in;
+  if cfg.rule_count >= 8 {
+    return FilterAddResult { cfg: cfg, ok: 0 - 1 };
+  }
+  let slot: i64 = cfg.rule_count;
+  // vani has no `struct_var.array_field[index] = value` lvalue form
+  // (confirmed via a standalone probe -- reading `f.vals[i]` works,
+  // assigning through it does not), so each array field is copied out
+  // to a local, mutated there, and the whole struct rebuilt via a
+  // fresh literal -- same pattern crypto_hash's own `sha256_update`
+  // already uses for its `ctx.h`/`ctx.carry` fields.
+  let proto_arr: [u32; 8] = [cfg.proto[0], cfg.proto[1], cfg.proto[2], cfg.proto[3], cfg.proto[4], cfg.proto[5], cfg.proto[6], cfg.proto[7]];
+  let src_ip_arr: [u32; 8] = [cfg.src_ip[0], cfg.src_ip[1], cfg.src_ip[2], cfg.src_ip[3], cfg.src_ip[4], cfg.src_ip[5], cfg.src_ip[6], cfg.src_ip[7]];
+  let src_ip_valid_arr: [u32; 8] = [cfg.src_ip_valid[0], cfg.src_ip_valid[1], cfg.src_ip_valid[2], cfg.src_ip_valid[3], cfg.src_ip_valid[4], cfg.src_ip_valid[5], cfg.src_ip_valid[6], cfg.src_ip_valid[7]];
+  let dst_port_arr: [u32; 8] = [cfg.dst_port[0], cfg.dst_port[1], cfg.dst_port[2], cfg.dst_port[3], cfg.dst_port[4], cfg.dst_port[5], cfg.dst_port[6], cfg.dst_port[7]];
+  let dst_port_valid_arr: [u32; 8] = [cfg.dst_port_valid[0], cfg.dst_port_valid[1], cfg.dst_port_valid[2], cfg.dst_port_valid[3], cfg.dst_port_valid[4], cfg.dst_port_valid[5], cfg.dst_port_valid[6], cfg.dst_port_valid[7]];
+  let action_arr: [u32; 8] = [cfg.action[0], cfg.action[1], cfg.action[2], cfg.action[3], cfg.action[4], cfg.action[5], cfg.action[6], cfg.action[7]];
+
+  proto_arr[slot] = proto;
+  src_ip_arr[slot] = src_ip;
+  src_ip_valid_arr[slot] = src_ip_valid;
+  dst_port_arr[slot] = dst_port;
+  dst_port_valid_arr[slot] = dst_port_valid;
+  action_arr[slot] = action;
+
+  let new_cfg: FilterConfig = FilterConfig {
+    rule_count: slot + 1,
+    default_policy: cfg.default_policy,
+    proto: proto_arr,
+    src_ip: src_ip_arr,
+    src_ip_valid: src_ip_valid_arr,
+    dst_port: dst_port_arr,
+    dst_port_valid: dst_port_valid_arr,
+    action: action_arr
+  };
+  return FilterAddResult { cfg: new_cfg, ok: 0 };
+}
+
+fn netstack_filter_flush(cfg_in: FilterConfig) -> FilterConfig {
+  let cfg: FilterConfig = cfg_in;
+  cfg.rule_count = 0;
+  return cfg;
+}
+
+fn netstack_filter_set_default_policy(cfg_in: FilterConfig, policy: u32) -> FilterConfig {
+  let cfg: FilterConfig = cfg_in;
+  cfg.default_policy = policy;
+  return cfg;
+}
+
+// Read-only frame-field helpers, scoped to exactly what the filter
+// itself needs (ethertype, IPv4 protocol/src/dst, TCP/UDP dst_port)
+// -- deliberately NOT the full IPv4/TCP/UDP modules planned for a
+// later package version, matching the exact reasoning Pi 4/5's own
+// `tcp_get_dst_port_rpi4`/`udp_get_dst_port_rpi4` already documented
+// ("deliberately tiny stub accessors, not full protocol modules...
+// the filter only ever needs the 2-byte dst_port field").
+fn netstack_read_u16_be(buf: ref [u8; 512], off: i64) -> u32 {
+  let b0: u32 = buf[off] as u32;
+  let b1: u32 = buf[off + 1] as u32;
+  return (b0 << (8 as u32)) | b1;
+}
+
+fn netstack_read_u32_be(buf: ref [u8; 512], off: i64) -> u32 {
+  let b0: u32 = buf[off] as u32;
+  let b1: u32 = buf[off + 1] as u32;
+  let b2: u32 = buf[off + 2] as u32;
+  let b3: u32 = buf[off + 3] as u32;
+  return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+// Checks one frame (Ethernet header at offset 0, IPv4 header at
+// offset 14 when present) against `cfg`'s rule table, first-match-
+// wins, falling through to `cfg.default_policy`. `is_outgoing`
+// flips which IP field plays the rule's own "src_ip" role: a rule's
+// `src_ip` field always means "the other party," so for an OUTGOING
+// frame that's the frame's own DESTINATION IP, not its (usually
+// unset) source IP. Non-IPv4 frames (e.g. ARP) and frames too short
+// to parse always return 1 (allow) -- not this filter's job to
+// bounds-check or filter what it can't parse.
+fn netstack_filter_check_frame(frame: ref [u8; 512], frame_len: i64, is_outgoing: u32, cfg: ref FilterConfig) -> u32 {
+  if frame_len < 34 {
+    return 1 as u32;
+  }
+  if netstack_read_u16_be(frame, 12) != (0x0800 as u32) {
+    return 1 as u32;
+  }
+  let proto: u32 = frame[14 + 9] as u32;
+  let src_ip: u32 = if is_outgoing == (1 as u32) { netstack_read_u32_be(frame, 14 + 16) } else { netstack_read_u32_be(frame, 14 + 12) };
+  let dst_port: u32 = 0 as u32;
+  let has_port: u32 = 0 as u32;
+  if (proto == (6 as u32)) && (frame_len >= 38) {
+    dst_port = netstack_read_u16_be(frame, 34 + 2);
+    has_port = 1 as u32;
+  }
+  if (proto == (17 as u32)) && (frame_len >= 38) {
+    dst_port = netstack_read_u16_be(frame, 34 + 2);
+    has_port = 1 as u32;
+  }
+
+  let count: i64 = cfg.rule_count;
+  let i: i64 = 0;
+  while i < count {
+    let rule_proto: u32 = cfg.proto[i];
+    let proto_matches: u32 = if (rule_proto == (0 as u32)) || (rule_proto == proto) { 1 as u32 } else { 0 as u32 };
+    let rule_src_valid: u32 = cfg.src_ip_valid[i];
+    let src_matches: u32 = if (rule_src_valid == (0 as u32)) || (cfg.src_ip[i] == src_ip) { 1 as u32 } else { 0 as u32 };
+    let rule_port_valid: u32 = cfg.dst_port_valid[i];
+    let port_matches: u32 = if (rule_port_valid == (0 as u32)) || ((has_port == (1 as u32)) && (cfg.dst_port[i] == dst_port)) { 1 as u32 } else { 0 as u32 };
+    if (proto_matches == (1 as u32)) && (src_matches == (1 as u32)) && (port_matches == (1 as u32)) {
+      return cfg.action[i];
+    }
+    i = i + 1;
+  }
+  return cfg.default_policy;
+}
+
+fn netstack_filter_build_test_frame(frame: mut ref [u8; 512], proto: u32, src_ip: u32, dst_port: u32) -> i64 {
+  let hi: u32 = (0x0800 as u32 >> (8 as u32)) & (255 as u32);
+  let lo: u32 = 0x0800 as u32 & (255 as u32);
+  frame[12] = hi as u8;
+  frame[13] = lo as u8;
+  frame[23] = proto as u8; // ip_offset(14)+9
+  frame[26] = ((src_ip >> (24 as u32)) & (255 as u32)) as u8;
+  frame[27] = ((src_ip >> (16 as u32)) & (255 as u32)) as u8;
+  frame[28] = ((src_ip >> (8 as u32)) & (255 as u32)) as u8;
+  frame[29] = (src_ip & (255 as u32)) as u8;
+  frame[36] = ((dst_port >> (8 as u32)) & (255 as u32)) as u8; // tcp/udp_offset(34)+2
+  frame[37] = (dst_port & (255 as u32)) as u8;
+  return 38;
+}
+
+fn netstack_filter_build_test_frame_dst(frame: mut ref [u8; 512], proto: u32, dst_ip: u32, dst_port: u32) -> i64 {
+  frame[12] = 0x08 as u8;
+  frame[13] = 0x00 as u8;
+  frame[23] = proto as u8;
+  frame[30] = ((dst_ip >> (24 as u32)) & (255 as u32)) as u8; // ip_offset(14)+16
+  frame[31] = ((dst_ip >> (16 as u32)) & (255 as u32)) as u8;
+  frame[32] = ((dst_ip >> (8 as u32)) & (255 as u32)) as u8;
+  frame[33] = (dst_ip & (255 as u32)) as u8;
+  frame[36] = ((dst_port >> (8 as u32)) & (255 as u32)) as u8;
+  frame[37] = (dst_port & (255 as u32)) as u8;
+  return 38;
+}
+
+fn netstack_zero_frame() -> [u8; 512] {
+  let a: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let out: [u8; 512] = [
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63]
+  ];
+  return out;
+}
+
+
+// Direct port of both boards' own `filter_self_test`/`filter_self_
+// test_rpi4` (6 scenarios: no-rule default, specific-deny-overrides-
+// allow, protocol specificity, first-match-wins ordering, portless-
+// protocol never matches a port rule, non-IPv4 passthrough) plus
+// scenario 1 of `filter_outgoing_self_test`/`_rpi4` (directional
+// src/dst semantics for outgoing frames -- the real netif egress-hook
+// integration itself, scenario 2 of that test, is inherently board-
+// specific and stays in each kernel's own self-test).
+fn netstack_filter_self_test() -> i64 {
+  let ok: i64 = 1;
+  let ip_a: u32 = 0x0A000001 as u32; // 10.0.0.1
+  let ip_b: u32 = 0x0A000002 as u32; // 10.0.0.2
+
+  // 1. No rules at all: falls through to the default policy.
+  let cfg0: FilterConfig = netstack_filter_empty();
+  let cfg1: FilterConfig = netstack_filter_set_default_policy(cfg0, 0 as u32);
+  let f1: [u8; 512] = netstack_zero_frame();
+  let l1: i64 = netstack_filter_build_test_frame(mut ref f1, 6 as u32, ip_a, 80 as u32);
+  if netstack_filter_check_frame(ref f1, l1, 0 as u32, ref cfg1) != (0 as u32) { ok = 0; }
+
+  // 2. A specific deny rule overrides a permissive default, but only
+  // for the src_ip it actually names.
+  let cfg2: FilterConfig = netstack_filter_set_default_policy(cfg1, 1 as u32);
+  let add2: FilterAddResult = netstack_filter_add_rule(cfg2, 6 as u32, ip_a, 1 as u32, 80 as u32, 1 as u32, 0 as u32);
+  let cfg3: FilterConfig = add2.cfg;
+  let f2: [u8; 512] = netstack_zero_frame();
+  let l2: i64 = netstack_filter_build_test_frame(mut ref f2, 6 as u32, ip_a, 80 as u32);
+  if netstack_filter_check_frame(ref f2, l2, 0 as u32, ref cfg3) != (0 as u32) { ok = 0; }
+  let f3: [u8; 512] = netstack_zero_frame();
+  let l3: i64 = netstack_filter_build_test_frame(mut ref f3, 6 as u32, ip_b, 80 as u32);
+  if netstack_filter_check_frame(ref f3, l3, 0 as u32, ref cfg3) != (1 as u32) { ok = 0; }
+
+  // 3. Protocol specificity: the same rule must not match UDP traffic
+  // on the identical src_ip/port.
+  let f4: [u8; 512] = netstack_zero_frame();
+  let l4: i64 = netstack_filter_build_test_frame(mut ref f4, 17 as u32, ip_a, 80 as u32);
+  if netstack_filter_check_frame(ref f4, l4, 0 as u32, ref cfg3) != (1 as u32) { ok = 0; }
+
+  // 4. First-match-wins: an earlier wildcard deny must shadow a later,
+  // more specific allow rule.
+  let cfg4: FilterConfig = netstack_filter_flush(cfg3);
+  let add4a: FilterAddResult = netstack_filter_add_rule(cfg4, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32); // deny everything
+  let add4b: FilterAddResult = netstack_filter_add_rule(add4a.cfg, 6 as u32, 0 as u32, 0 as u32, 443 as u32, 1 as u32, 1 as u32); // allow TCP/443 (shadowed)
+  let cfg5: FilterConfig = add4b.cfg;
+  let f5: [u8; 512] = netstack_zero_frame();
+  let l5: i64 = netstack_filter_build_test_frame(mut ref f5, 6 as u32, ip_a, 443 as u32);
+  if netstack_filter_check_frame(ref f5, l5, 0 as u32, ref cfg5) != (0 as u32) { ok = 0; }
+
+  // 5. A rule naming a specific dst_port must never match a portless
+  // protocol (ICMP).
+  let cfg6: FilterConfig = netstack_filter_flush(cfg5);
+  let add6: FilterAddResult = netstack_filter_add_rule(cfg6, 0 as u32, 0 as u32, 0 as u32, 80 as u32, 1 as u32, 0 as u32); // deny port 80
+  let cfg7: FilterConfig = netstack_filter_set_default_policy(add6.cfg, 1 as u32);
+  let f6: [u8; 512] = netstack_zero_frame();
+  let l6: i64 = netstack_filter_build_test_frame(mut ref f6, 1 as u32, ip_a, 80 as u32); // ICMP
+  if netstack_filter_check_frame(ref f6, l6, 0 as u32, ref cfg7) != (1 as u32) { ok = 0; }
+
+  // 6. Non-IPv4 traffic (e.g. ARP) passes through untouched regardless
+  // of policy or rules.
+  let cfg8: FilterConfig = netstack_filter_set_default_policy(cfg7, 0 as u32);
+  let f7: [u8; 512] = netstack_zero_frame();
+  f7[12] = 0x08 as u8;
+  f7[13] = 0x06 as u8; // ethertype: ARP
+  if netstack_filter_check_frame(ref f7, 38, 0 as u32, ref cfg8) != (1 as u32) { ok = 0; }
+
+  // 7. Directional src/dst semantics: a rule naming ip_a must match an
+  // OUTGOING frame whose DESTINATION is ip_a, not its (usually unset)
+  // literal source-IP field -- and the identical frame checked as
+  // INCOMING must NOT match.
+  let cfg9: FilterConfig = netstack_filter_flush(cfg8);
+  let cfg10: FilterConfig = netstack_filter_set_default_policy(cfg9, 1 as u32);
+  let add10: FilterAddResult = netstack_filter_add_rule(cfg10, 6 as u32, ip_a, 1 as u32, 80 as u32, 1 as u32, 0 as u32); // deny TCP/80 to ip_a
+  let cfg11: FilterConfig = add10.cfg;
+  let f8: [u8; 512] = netstack_zero_frame();
+  let l8: i64 = netstack_filter_build_test_frame_dst(mut ref f8, 6 as u32, ip_a, 80 as u32);
+  if netstack_filter_check_frame(ref f8, l8, 1 as u32, ref cfg11) != (0 as u32) { ok = 0; }
+  if netstack_filter_check_frame(ref f8, l8, 0 as u32, ref cfg11) != (1 as u32) { ok = 0; }
+  let f9: [u8; 512] = netstack_zero_frame();
+  let l9: i64 = netstack_filter_build_test_frame_dst(mut ref f9, 6 as u32, ip_b, 80 as u32);
+  if netstack_filter_check_frame(ref f9, l9, 1 as u32, ref cfg11) != (1 as u32) { ok = 0; }
+
+  return ok;
+}

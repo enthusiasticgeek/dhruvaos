@@ -1567,6 +1567,20 @@ extern "C" fn filter_get_rule_dst_port(index: u32) -> u32;
 extern "C" fn filter_get_rule_dst_port_valid(index: u32) -> u32;
 extern "C" fn filter_get_rule_action(index: u32) -> u32;
 
+// Round 106a: the packet filter's own real rule-matching ALGORITHM
+// (this file's own former `filter_check_frame_rpi4` body) now lives
+// in the shared `netstack` kosh package (`netstack_filter_check_
+// frame`), confirmed byte-for-byte identical to kernel_main.vani's
+// own `filter_check_frame` before extraction. This file's own rule
+// TABLE storage (`boot/rpi4/filter_state.S`, the extern accessors
+// just above) is untouched -- the package has no persistent state of
+// its own (a `FilterConfig` value-type struct threaded through pure
+// functions instead, extending the Sha256Ctx/Poly1305Ctx precedent
+// from the crypto packages to long-lived protocol state), so this
+// function's only job is reading the real board state into a
+// `FilterConfig` and handing it to the package.
+use "../vendor/netstack/src/lib.vani";
+
 fn tcp_get_dst_port_rpi4(frame: ref [u8; 512], tcp_offset: i64) -> u32 {
   return arp_read_u16_be_rpi4(frame, tcp_offset + 2);
 }
@@ -1575,43 +1589,39 @@ fn udp_get_dst_port_rpi4(frame: ref [u8; 512], udp_offset: i64) -> u32 {
   return arp_read_u16_be_rpi4(frame, udp_offset + 2);
 }
 
-fn filter_check_frame_rpi4(frame: ref [u8; 512], frame_len: i64, is_outgoing: u32) -> u32 {
-  if frame_len < 34 {
-    return 1 as u32; // too short to be a parseable IPv4 frame -- not
-                      // this filter's job to bounds-check, only to
-                      // filter what it can actually parse
-  }
-  if arp_read_u16_be_rpi4(frame, 12) != (0x0800 as u32) {
-    return 1 as u32; // not IPv4 (e.g. ARP) -- nothing to filter on
-  }
-  let proto: u32 = ipv4_get_protocol_rpi4(frame, 14);
-  let src_ip: u32 = if is_outgoing == (1 as u32) { ipv4_get_dst_ip_rpi4(frame, 14) } else { ipv4_get_src_ip_rpi4(frame, 14) };
-  let dst_port: u32 = 0 as u32;
-  let has_port: u32 = 0 as u32;
-  if (proto == (6 as u32)) && (frame_len >= 38) {
-    dst_port = tcp_get_dst_port_rpi4(frame, 34);
-    has_port = 1 as u32;
-  }
-  if (proto == (17 as u32)) && (frame_len >= 38) {
-    dst_port = udp_get_dst_port_rpi4(frame, 34);
-    has_port = 1 as u32;
-  }
-
+fn filter_config_from_state_rpi4() -> FilterConfig {
   let count: u32 = filter_get_rule_count();
+  let proto: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let src_ip: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let src_ip_valid: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let dst_port: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let dst_port_valid: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let action: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
   let i: u32 = 0 as u32;
   while i < count {
-    let rule_proto: u32 = filter_get_rule_proto(i);
-    let proto_matches: u32 = if (rule_proto == (0 as u32)) || (rule_proto == proto) { 1 as u32 } else { 0 as u32 };
-    let rule_src_valid: u32 = filter_get_rule_src_ip_valid(i);
-    let src_matches: u32 = if (rule_src_valid == (0 as u32)) || (filter_get_rule_src_ip(i) == src_ip) { 1 as u32 } else { 0 as u32 };
-    let rule_port_valid: u32 = filter_get_rule_dst_port_valid(i);
-    let port_matches: u32 = if (rule_port_valid == (0 as u32)) || ((has_port == (1 as u32)) && (filter_get_rule_dst_port(i) == dst_port)) { 1 as u32 } else { 0 as u32 };
-    if (proto_matches == (1 as u32)) && (src_matches == (1 as u32)) && (port_matches == (1 as u32)) {
-      return filter_get_rule_action(i);
-    }
+    proto[i] = filter_get_rule_proto(i);
+    src_ip[i] = filter_get_rule_src_ip(i);
+    src_ip_valid[i] = filter_get_rule_src_ip_valid(i);
+    dst_port[i] = filter_get_rule_dst_port(i);
+    dst_port_valid[i] = filter_get_rule_dst_port_valid(i);
+    action[i] = filter_get_rule_action(i);
     i = i + (1 as u32);
   }
-  return filter_get_default_policy();
+  return FilterConfig {
+    rule_count: count as i64,
+    default_policy: filter_get_default_policy(),
+    proto: proto,
+    src_ip: src_ip,
+    src_ip_valid: src_ip_valid,
+    dst_port: dst_port,
+    dst_port_valid: dst_port_valid,
+    action: action
+  };
+}
+
+fn filter_check_frame_rpi4(frame: ref [u8; 512], frame_len: i64, is_outgoing: u32) -> u32 {
+  let cfg: FilterConfig = filter_config_from_state_rpi4();
+  return netstack_filter_check_frame(frame, frame_len, is_outgoing, ref cfg);
 }
 
 fn filter_build_test_frame_rpi4(frame: mut ref [u8; 512], proto: u32, src_ip: u32, dst_port: u32) -> i64 {

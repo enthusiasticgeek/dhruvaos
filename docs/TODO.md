@@ -4378,6 +4378,69 @@ than assumed:
   premise from [[project_dhruva_generic_crypto_packages_x509_scope_2026_09_06]]),
   and the X.509/mTLS/HTTPS/MQTT fork (real X.509 vs. Pi 1's already-
   built raw-public-key TLS 1.3) -- both still open, not started.
+
+  **ROUND 105 UPDATE, 2026-09-07**: user asked to identify OTHER
+  hardware-agnostic generification candidates beyond crypto, for
+  future multi-board vendor independence. Audit found ~100+ functions
+  across ARP/IPv4/TCP/UDP/DHCP(client+server)/packet-filter are pure
+  protocol logic with zero hardware register access, duplicated
+  near-verbatim between `kernel_main.vani` and `kernel_main_rpi4.vani`
+  -- confirmed via direct body comparison (`ipv4_checksum` vs `ipv4_
+  checksum_rpi4`: identical algorithm, only buffer-access style
+  differs), same low-risk shape as every crypto primitive already
+  migrated. Two-way benefit: Pi 4/5 has a real DHCP SERVER Pi 1 lacks;
+  Pi 1 has 9 networking self-tests vs Pi 4/5's 5. Scheduler mechanism
+  is genuinely arch-specific (can't share); GPIO/UART are genuinely
+  per-SoC different (a DHDL-level interface-standardization
+  opportunity, not shared-implementation). Full writeup: [[project_
+  dhruva_hardware_agnostic_audit_2026_09_07]].
+
+  **ROUND 106a UPDATE, 2026-09-07**: pilot extraction proving the
+  pattern -- new `vani-netstack` kosh package (`~/source/vani-
+  netstack`, pushed), v0.1.0: the packet filter only. `FilterConfig`
+  is a plain value-type struct (8-slot rule table, matching both
+  boards' own existing `boot/fw_state.S`/`boot/rpi4/filter_state.S`
+  capacity) threaded through pure functions -- no persistent extern
+  state inside the package at all, extending the Sha256Ctx/
+  Poly1305Ctx precedent from the crypto packages to long-lived
+  protocol state for the first time. Each board keeps its own
+  existing extern-accessor-backed rule storage untouched and gets a
+  thin adapter that reads current state into a `FilterConfig`, calls
+  the package, and (for the read-only `check_frame` path) returns the
+  result directly -- `filter_add_rule`/`flush`/`set_default_policy`
+  needed no changes at all since they were already thin 1-line extern
+  pass-throughs, not real duplicated logic.
+
+  Real vani-language constraint hit and worked around: `struct_var.
+  array_field[index] = value` is not a valid lvalue (confirmed via a
+  standalone probe -- reading through it works, assigning does not),
+  so `netstack_filter_add_rule` copies each array field to a local,
+  mutates the local, and rebuilds the struct via a fresh literal --
+  same pattern `crypto_hash`'s own `sha256_update` already uses for
+  `ctx.h`/`ctx.carry`.
+
+  Pi 1's own adapter needed one more step Pi 4/5's didn't: Pi 1's
+  `filter_check_frame` takes a heap `mut ref i64` pointer of
+  unbounded length (real Ethernet frames up to 1514 bytes), while the
+  package's own `netstack_filter_check_frame` takes a fixed `ref
+  [u8;512]` array -- resolved by copying up to 512 bytes (comfortable
+  headroom over the 38 bytes the filter actually ever reads,
+  regardless of overall frame length) into a local stack array before
+  calling the package, preserving Pi 1's exact original function
+  signature so zero external call sites needed changes.
+
+  Verified on BOTH boards: `vanic check`/`build.sh`/`build_rpi4.sh`
+  all passed first try. Pi 4/5: full `rpi4_shell_smoke.py` battery
+  (19 shell commands incl. both boot-time and on-demand `filter`
+  self-tests) shows zero `(FAIL)` lines. Pi 1: `phase4_milestone.py`'s
+  full 15-check regression battery passes with zero `(FAIL)` lines in
+  the authoritative harness, both `FW: ...` self-test lines `(PASS)`.
+
+  **Next**: ARP (8-slot cache, similar shape to the filter's rule
+  table) is the next-smallest subsystem -- planned as round 106b.
+  IPv4/UDP (mostly stateless) after that, then DHCP client+server
+  (multi-field state machines), TCP last (largest, ~15-field
+  connection struct). Not started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
