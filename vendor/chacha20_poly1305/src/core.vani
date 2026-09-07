@@ -1,0 +1,801 @@
+// chacha20-poly1305's own core.vani -- the SAME primitives/one-shot
+// convenience layer `src/lib.vani` has, MINUS its 3 self-test
+// functions (chacha20_self_test/poly1305_self_test/chacha20_poly1305_
+// self_test). For a consumer whose own code already defines a
+// function of one of those exact names -- e.g. DhruvaOS's Pi 1
+// kernel, which has its own pre-existing chacha20_self_test/
+// poly1305_self_test -- and would otherwise collide when `use`-ing
+// this package, matching the identical core.vani/lib.vani split
+// vani-crypto-hash (round 99) and vani-curve25519 (round 100) each
+// needed for the same reason. Kept in sync with lib.vani by
+// construction (a line-range subset, not a separately maintained
+// implementation).
+
+// chacha20-poly1305 v0.1.0 -- ChaCha20 (RFC 8439 section 2.3/2.4) and
+// Poly1305 (RFC 8439 section 2.5), plus the ChaCha20-Poly1305 AEAD
+// construction (RFC 8439 section 2.8), pure vani, hardware-agnostic
+// and heap-free.
+//
+// Extracted from DhruvaOS's Pi 1 kernel (round 44's own ChaCha20 +
+// later rounds' Poly1305/AEAD/TLS work) -- the only crypto primitive
+// in this project's roadmap that existed on Pi 1 with NO Pi 4/5-side
+// counterpart to extract from (unlike crypto_hash/curve25519/pki,
+// which all started as Pi 4/5 code moved outward). REDESIGNED around
+// the same two vani-language facts crypto_hash/curve25519's own
+// header comments document (heap-free by-value convention; the
+// aliasing XOR rule), plus a THIRD one specific to this package:
+//
+// 3. `let` requires a full initializer and there is no `[expr; N]`
+//    array-repeat literal (see vani-compiler/docs/
+//    DHRUVAOS_ERGONOMICS_TODO.md items #1/#2) -- confirmed as a real,
+//    already-hit constraint by curve25519's own Ed25519 `msg` cap
+//    (raised only to 512 bytes in round 100, "chosen specifically
+//    because of this gap," not higher). Rather than pick a single
+//    large fixed array cap for ChaCha20/Poly1305's own genuinely
+//    variable-length real use (Pi 1's TLS records currently run up
+//    to 2048 bytes; DharaFS-shaped future users could need more),
+//    this package's PRIMARY api is a true streaming design with NO
+//    hand-typed literal anywhere near message-length size:
+//
+//    - `chacha20_xor_chunk` processes one caller-supplied chunk (up
+//      to 64 bytes) against one keystream block; ChaCha20's own
+//      block-independent CTR-mode construction (RFC 8439 section
+//      2.4) means the caller can loop this over an arbitrarily long
+//      message just by incrementing the block counter each call --
+//      no accumulating state needed at all, unlike a hash.
+//    - `Poly1305Ctx`/`poly1305_init`/`update`/`finalize` mirror
+//      crypto_hash's own Sha256Ctx/Sha512Ctx streaming design exactly
+//      (same carry-buffer-for-a-partial-block technique), since
+//      Poly1305's polynomial evaluation genuinely does need
+//      accumulating state across the whole message, unlike ChaCha20.
+//
+//    A smaller CAPPED one-shot convenience layer (chacha20_encrypt/
+//    poly1305_mac/chacha20_poly1305_encrypt/decrypt, all bounded at
+//    512 bytes -- the same practical ceiling curve25519's Ed25519
+//    `msg` settled on) sits on top of the streaming primitives, for
+//    simple/small callers and this file's own self-tests. A future
+//    consumer with a longer message (Pi 1's own real TLS records,
+//    round 102) is expected to call the streaming primitives
+//    directly against its own heap buffer in a chunked loop, exactly
+//    like crypto_hash's own `sha256_hash` heap adapter in DhruvaOS's
+//    `kernel_main.vani` already does (`ctx = sha256_update(ref ctx,
+//    mut ref chunk, chunk_n);` inside a `while offset < msg_len`
+//    loop) -- this package's design is deliberately built to make
+//    that same adapter shape apply here too, verified by construction
+//    since `chacha20_poly1305_encrypt`/`poly1305_mac` below are
+//    themselves ALREADY written on top of the streaming primitives
+//    with a fixed cap, not a separate one-shot implementation.
+//
+// Every KAT below (RFC 8439 section 2.3.2's ChaCha20 block vector,
+// section 2.5.2's Poly1305 vector, and a DhruvaOS-original AEAD
+// vector) was independently re-verified against the real
+// `cryptography` Python library's `ChaCha20`/`Poly1305`/
+// `ChaCha20Poly1305` primitives before being ported here -- not just
+// copied from Pi 1's own already-passing self-test unverified.
+
+struct WordBytesLE { b0: u8, b1: u8, b2: u8, b3: u8 }
+
+fn cp_word_le(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
+  return (b0 as u32) | ((b1 as u32) << (8 as u32)) | ((b2 as u32) << (16 as u32)) | ((b3 as u32) << (24 as u32));
+}
+
+fn cp_word_to_bytes_le(w: u32) -> WordBytesLE {
+  return WordBytesLE {
+    b0: (w & (255 as u32)) as u8,
+    b1: ((w >> (8 as u32)) & (255 as u32)) as u8,
+    b2: ((w >> (16 as u32)) & (255 as u32)) as u8,
+    b3: ((w >> (24 as u32)) & (255 as u32)) as u8
+  };
+}
+
+fn cp_zero16_bytes() -> [u8; 16] {
+  return [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+}
+
+fn cp_zero32_bytes() -> [u8; 32] {
+  return [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+}
+
+fn cp_zero64_bytes() -> [u8; 64] {
+  return [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+}
+
+fn cp_zero256_bytes() -> [u8; 256] {
+  return [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+}
+
+fn cp_zero512_bytes() -> [u8; 512] {
+  let a: [u8; 256] = cp_zero256_bytes();
+  let out: [u8; 512] = [
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[64], a[65], a[66], a[67], a[68], a[69], a[70], a[71], a[72], a[73], a[74], a[75], a[76], a[77], a[78], a[79],
+    a[80], a[81], a[82], a[83], a[84], a[85], a[86], a[87], a[88], a[89], a[90], a[91], a[92], a[93], a[94], a[95],
+    a[96], a[97], a[98], a[99], a[100], a[101], a[102], a[103], a[104], a[105], a[106], a[107], a[108], a[109], a[110], a[111],
+    a[112], a[113], a[114], a[115], a[116], a[117], a[118], a[119], a[120], a[121], a[122], a[123], a[124], a[125], a[126], a[127],
+    a[128], a[129], a[130], a[131], a[132], a[133], a[134], a[135], a[136], a[137], a[138], a[139], a[140], a[141], a[142], a[143],
+    a[144], a[145], a[146], a[147], a[148], a[149], a[150], a[151], a[152], a[153], a[154], a[155], a[156], a[157], a[158], a[159],
+    a[160], a[161], a[162], a[163], a[164], a[165], a[166], a[167], a[168], a[169], a[170], a[171], a[172], a[173], a[174], a[175],
+    a[176], a[177], a[178], a[179], a[180], a[181], a[182], a[183], a[184], a[185], a[186], a[187], a[188], a[189], a[190], a[191],
+    a[192], a[193], a[194], a[195], a[196], a[197], a[198], a[199], a[200], a[201], a[202], a[203], a[204], a[205], a[206], a[207],
+    a[208], a[209], a[210], a[211], a[212], a[213], a[214], a[215], a[216], a[217], a[218], a[219], a[220], a[221], a[222], a[223],
+    a[224], a[225], a[226], a[227], a[228], a[229], a[230], a[231], a[232], a[233], a[234], a[235], a[236], a[237], a[238], a[239],
+    a[240], a[241], a[242], a[243], a[244], a[245], a[246], a[247], a[248], a[249], a[250], a[251], a[252], a[253], a[254], a[255],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[64], a[65], a[66], a[67], a[68], a[69], a[70], a[71], a[72], a[73], a[74], a[75], a[76], a[77], a[78], a[79],
+    a[80], a[81], a[82], a[83], a[84], a[85], a[86], a[87], a[88], a[89], a[90], a[91], a[92], a[93], a[94], a[95],
+    a[96], a[97], a[98], a[99], a[100], a[101], a[102], a[103], a[104], a[105], a[106], a[107], a[108], a[109], a[110], a[111],
+    a[112], a[113], a[114], a[115], a[116], a[117], a[118], a[119], a[120], a[121], a[122], a[123], a[124], a[125], a[126], a[127],
+    a[128], a[129], a[130], a[131], a[132], a[133], a[134], a[135], a[136], a[137], a[138], a[139], a[140], a[141], a[142], a[143],
+    a[144], a[145], a[146], a[147], a[148], a[149], a[150], a[151], a[152], a[153], a[154], a[155], a[156], a[157], a[158], a[159],
+    a[160], a[161], a[162], a[163], a[164], a[165], a[166], a[167], a[168], a[169], a[170], a[171], a[172], a[173], a[174], a[175],
+    a[176], a[177], a[178], a[179], a[180], a[181], a[182], a[183], a[184], a[185], a[186], a[187], a[188], a[189], a[190], a[191],
+    a[192], a[193], a[194], a[195], a[196], a[197], a[198], a[199], a[200], a[201], a[202], a[203], a[204], a[205], a[206], a[207],
+    a[208], a[209], a[210], a[211], a[212], a[213], a[214], a[215], a[216], a[217], a[218], a[219], a[220], a[221], a[222], a[223],
+    a[224], a[225], a[226], a[227], a[228], a[229], a[230], a[231], a[232], a[233], a[234], a[235], a[236], a[237], a[238], a[239],
+    a[240], a[241], a[242], a[243], a[244], a[245], a[246], a[247], a[248], a[249], a[250], a[251], a[252], a[253], a[254], a[255]
+  ];
+  return out;
+}
+
+fn cp_extract32(src: ref [u8; 64]) -> [u8; 32] {
+  let out: [u8; 32] = cp_zero32_bytes();
+  let i: i64 = 0;
+  while i < 32 {
+    out[i] = src[i];
+    i = i + 1;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------
+// ChaCha20 (RFC 8439 section 2.3/2.4). Key/nonce bytes are read
+// little-endian directly, matching ChaCha20's own wire format (no
+// byte-order shuffling needed, unlike SHA's big-endian message/
+// digest boundaries -- verified against RFC 8439 section 2.3.2's own
+// worked example, see `chacha20_self_test`).
+// ---------------------------------------------------------------
+
+fn cp_rotl32(x: u32, n: u32) -> u32 {
+  return (x << n) | (x >> ((32 as u32) - n));
+}
+
+fn cp_quarter_round(state: mut ref [u32; 16], a: i64, b: i64, c: i64, d: i64) -> i64 {
+  let av: u32 = state[a];
+  let bv: u32 = state[b];
+  let cv: u32 = state[c];
+  let dv: u32 = state[d];
+
+  av = wrapping_add(av, bv);
+  dv = dv ^ av;
+  dv = cp_rotl32(dv, 16 as u32);
+
+  cv = wrapping_add(cv, dv);
+  bv = bv ^ cv;
+  bv = cp_rotl32(bv, 12 as u32);
+
+  av = wrapping_add(av, bv);
+  dv = dv ^ av;
+  dv = cp_rotl32(dv, 8 as u32);
+
+  cv = wrapping_add(cv, dv);
+  bv = bv ^ cv;
+  bv = cp_rotl32(bv, 7 as u32);
+
+  state[a] = av;
+  state[b] = bv;
+  state[c] = cv;
+  state[d] = dv;
+  return 0;
+}
+
+// Produces one 64-byte keystream block. `nonce` is 12 bytes (RFC
+// 8439's IETF variant: 96-bit nonce, 32-bit counter).
+fn chacha20_block(key: ref [u8; 32], counter: u32, nonce: ref [u8; 12]) -> [u8; 64] {
+  let state: [u32; 16] = [
+    0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+    0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32
+  ];
+  state[0] = 0x61707865 as u32;
+  state[1] = 0x3320646e as u32;
+  state[2] = 0x79622d32 as u32;
+  state[3] = 0x6b206574 as u32;
+
+  state[4] = cp_word_le(key[0], key[1], key[2], key[3]);
+  state[5] = cp_word_le(key[4], key[5], key[6], key[7]);
+  state[6] = cp_word_le(key[8], key[9], key[10], key[11]);
+  state[7] = cp_word_le(key[12], key[13], key[14], key[15]);
+  state[8] = cp_word_le(key[16], key[17], key[18], key[19]);
+  state[9] = cp_word_le(key[20], key[21], key[22], key[23]);
+  state[10] = cp_word_le(key[24], key[25], key[26], key[27]);
+  state[11] = cp_word_le(key[28], key[29], key[30], key[31]);
+
+  state[12] = counter;
+
+  state[13] = cp_word_le(nonce[0], nonce[1], nonce[2], nonce[3]);
+  state[14] = cp_word_le(nonce[4], nonce[5], nonce[6], nonce[7]);
+  state[15] = cp_word_le(nonce[8], nonce[9], nonce[10], nonce[11]);
+
+  let working: [u32; 16] = [
+    0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+    0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32
+  ];
+  let wi: i64 = 0;
+  while wi < 16 {
+    working[wi] = state[wi];
+    wi = wi + 1;
+  }
+
+  let round: i64 = 0;
+  while round < 10 {
+    let _ = cp_quarter_round(mut ref working, 0, 4, 8, 12);
+    let _ = cp_quarter_round(mut ref working, 1, 5, 9, 13);
+    let _ = cp_quarter_round(mut ref working, 2, 6, 10, 14);
+    let _ = cp_quarter_round(mut ref working, 3, 7, 11, 15);
+    let _ = cp_quarter_round(mut ref working, 0, 5, 10, 15);
+    let _ = cp_quarter_round(mut ref working, 1, 6, 11, 12);
+    let _ = cp_quarter_round(mut ref working, 2, 7, 8, 13);
+    let _ = cp_quarter_round(mut ref working, 3, 4, 9, 14);
+    round = round + 1;
+  }
+
+  let out: [u8; 64] = cp_zero64_bytes();
+  let m: i64 = 0;
+  while m < 16 {
+    let sum: u32 = wrapping_add(working[m], state[m]);
+    let wb: WordBytesLE = cp_word_to_bytes_le(sum);
+    out[m * 4] = wb.b0;
+    out[m * 4 + 1] = wb.b1;
+    out[m * 4 + 2] = wb.b2;
+    out[m * 4 + 3] = wb.b3;
+    m = m + 1;
+  }
+  return out;
+}
+
+// The primary streaming primitive: XORs up to 64 bytes of `chunk`
+// against one keystream block. `counter` is THIS block's own counter
+// value -- the caller increments it by 1 across successive calls
+// (RFC 8439's own convention: 1 for the first block in the AEAD
+// construction, since block 0 is reserved for the Poly1305 one-time
+// key). Blocks are independent (no state threaded between calls),
+// so a message of any length can be processed by looping this over
+// 64-byte chunks with no cap at all -- see this file's own header
+// comment for why this is the primitive DhruvaOS's real TLS adapter
+// (round 102) is expected to call directly, not `chacha20_encrypt`.
+fn chacha20_xor_chunk(key: ref [u8; 32], nonce: ref [u8; 12], counter: u32, chunk: ref [u8; 64], chunk_len: i64) -> [u8; 64] {
+  let ks: [u8; 64] = chacha20_block(key, counter, nonce);
+  let out: [u8; 64] = cp_zero64_bytes();
+  let i: i64 = 0;
+  while i < chunk_len {
+    out[i] = chunk[i] ^ ks[i];
+    i = i + 1;
+  }
+  return out;
+}
+
+// One-shot convenience wrapper, capped at 512 bytes -- see this
+// file's own header comment for why (no `[expr; N]` array-repeat
+// literal in the language yet, so a larger cap means a larger
+// hand-typed zero-literal). Encrypts (or, identically, decrypts --
+// ChaCha20 is a symmetric XOR stream cipher) `data_len` bytes.
+fn chacha20_encrypt(key: ref [u8; 32], nonce: ref [u8; 12], initial_counter: u32, data: ref [u8; 512], data_len: i64) -> [u8; 512] {
+  let out: [u8; 512] = cp_zero512_bytes();
+  let counter: u32 = initial_counter;
+  let offset: i64 = 0;
+  while offset < data_len {
+    let remaining: i64 = data_len - offset;
+    let this_block: i64 = if remaining < 64 { remaining } else { 64 };
+    let chunk: [u8; 64] = cp_zero64_bytes();
+    let i: i64 = 0;
+    while i < this_block {
+      chunk[i] = data[offset + i];
+      i = i + 1;
+    }
+    let ks_out: [u8; 64] = chacha20_xor_chunk(key, nonce, counter, ref chunk, this_block);
+    let j: i64 = 0;
+    while j < this_block {
+      out[offset + j] = ks_out[j];
+      j = j + 1;
+    }
+    offset = offset + 64;
+    counter = wrapping_add(counter, 1 as u32);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------
+// Poly1305 (RFC 8439 section 2.5). `Poly1305Ctx` stores the raw
+// 32-byte key (not the derived r/s/pad limbs) and re-derives them on
+// each block -- a deliberate simplicity-over-cycles tradeoff (a few
+// extra word-reads-and-masks per 16-byte block, negligible next to
+// the block's own 25 multiplications) that keeps the context struct
+// small and avoids threading 13 extra scalar fields through every
+// `update` call.
+// ---------------------------------------------------------------
+
+struct Poly1305Ctx { key: [u8; 32], h0: u32, h1: u32, h2: u32, h3: u32, h4: u32, carry: [u8; 16], carry_len: i64 }
+struct Poly1305HState { h0: u32, h1: u32, h2: u32, h3: u32, h4: u32 }
+struct RVals { r0: u32, r1: u32, r2: u32, r3: u32, r4: u32 }
+struct PadVals { pad0: u32, pad1: u32, pad2: u32, pad3: u32 }
+
+fn cp_poly_derive_r(key: ref [u8; 32]) -> RVals {
+  let w0: u32 = cp_word_le(key[0], key[1], key[2], key[3]);
+  let w3: u32 = cp_word_le(key[3], key[4], key[5], key[6]);
+  let w6: u32 = cp_word_le(key[6], key[7], key[8], key[9]);
+  let w9: u32 = cp_word_le(key[9], key[10], key[11], key[12]);
+  let w12: u32 = cp_word_le(key[12], key[13], key[14], key[15]);
+  return RVals {
+    r0: w0 & (0x3ffffff as u32),
+    r1: (w3 >> (2 as u32)) & (0x3ffff03 as u32),
+    r2: (w6 >> (4 as u32)) & (0x3ffc0ff as u32),
+    r3: (w9 >> (6 as u32)) & (0x3f03fff as u32),
+    r4: (w12 >> (8 as u32)) & (0xfffff as u32)
+  };
+}
+
+fn cp_poly_derive_pad(key: ref [u8; 32]) -> PadVals {
+  return PadVals {
+    pad0: cp_word_le(key[16], key[17], key[18], key[19]),
+    pad1: cp_word_le(key[20], key[21], key[22], key[23]),
+    pad2: cp_word_le(key[24], key[25], key[26], key[27]),
+    pad3: cp_word_le(key[28], key[29], key[30], key[31])
+  };
+}
+
+// One 16-byte-block step of Poly1305's polynomial evaluation.
+// `hibit` is `1 << 24` for a genuine full 16-byte message block, or
+// `0` for the final short block (whose own top bit is instead
+// supplied by an explicit 0x01 marker byte already written into
+// `blk` by the caller -- see `poly1305_finalize`).
+fn cp_poly_process_block(key: ref [u8; 32], h0_in: u32, h1_in: u32, h2_in: u32, h3_in: u32, h4_in: u32, blk: ref [u8; 16], hibit: u32) -> Poly1305HState {
+  let rv: RVals = cp_poly_derive_r(key);
+  let r0: u32 = rv.r0;
+  let r1: u32 = rv.r1;
+  let r2: u32 = rv.r2;
+  let r3: u32 = rv.r3;
+  let r4: u32 = rv.r4;
+  let s1: u32 = r1 * (5 as u32);
+  let s2: u32 = r2 * (5 as u32);
+  let s3: u32 = r3 * (5 as u32);
+  let s4: u32 = r4 * (5 as u32);
+
+  let mask26: u32 = 0x3ffffff as u32;
+  let h0: u32 = h0_in + (cp_word_le(blk[0], blk[1], blk[2], blk[3]) & mask26);
+  let h1: u32 = h1_in + ((cp_word_le(blk[3], blk[4], blk[5], blk[6]) >> (2 as u32)) & mask26);
+  let h2: u32 = h2_in + ((cp_word_le(blk[6], blk[7], blk[8], blk[9]) >> (4 as u32)) & mask26);
+  let h3: u32 = h3_in + ((cp_word_le(blk[9], blk[10], blk[11], blk[12]) >> (6 as u32)) & mask26);
+  let h4: u32 = h4_in + ((cp_word_le(blk[12], blk[13], blk[14], blk[15]) >> (8 as u32)) | hibit);
+
+  let d0: u64 = ((h0 as u64) * (r0 as u64)) + ((h1 as u64) * (s4 as u64)) + ((h2 as u64) * (s3 as u64)) + ((h3 as u64) * (s2 as u64)) + ((h4 as u64) * (s1 as u64));
+  let d1: u64 = ((h0 as u64) * (r1 as u64)) + ((h1 as u64) * (r0 as u64)) + ((h2 as u64) * (s4 as u64)) + ((h3 as u64) * (s3 as u64)) + ((h4 as u64) * (s2 as u64));
+  let d2: u64 = ((h0 as u64) * (r2 as u64)) + ((h1 as u64) * (r1 as u64)) + ((h2 as u64) * (r0 as u64)) + ((h3 as u64) * (s4 as u64)) + ((h4 as u64) * (s3 as u64));
+  let d3: u64 = ((h0 as u64) * (r3 as u64)) + ((h1 as u64) * (r2 as u64)) + ((h2 as u64) * (r1 as u64)) + ((h3 as u64) * (r0 as u64)) + ((h4 as u64) * (s4 as u64));
+  let d4: u64 = ((h0 as u64) * (r4 as u64)) + ((h1 as u64) * (r3 as u64)) + ((h2 as u64) * (r2 as u64)) + ((h3 as u64) * (r1 as u64)) + ((h4 as u64) * (r0 as u64));
+
+  let mask26_64: u64 = 0x3ffffff as u64;
+  let c0: u64 = d0 >> (26 as u64);
+  let h0b: u32 = (d0 & mask26_64) as u32;
+  let d1b: u64 = d1 + c0;
+  let c1: u64 = d1b >> (26 as u64);
+  let h1b: u32 = (d1b & mask26_64) as u32;
+  let d2b: u64 = d2 + c1;
+  let c2: u64 = d2b >> (26 as u64);
+  let h2b: u32 = (d2b & mask26_64) as u32;
+  let d3b: u64 = d3 + c2;
+  let c3: u64 = d3b >> (26 as u64);
+  let h3b: u32 = (d3b & mask26_64) as u32;
+  let d4b: u64 = d4 + c3;
+  let c4: u64 = d4b >> (26 as u64);
+  let h4b: u32 = (d4b & mask26_64) as u32;
+  let h0c: u32 = h0b + ((c4 as u32) * (5 as u32));
+  let c5: u32 = h0c >> (26 as u32);
+  let h0d: u32 = h0c & mask26;
+  let h1c: u32 = h1b + c5;
+
+  return Poly1305HState { h0: h0d, h1: h1c, h2: h2b, h3: h3b, h4: h4b };
+}
+
+fn poly1305_init(key: ref [u8; 32]) -> Poly1305Ctx {
+  let k: [u8; 32] = [
+    key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+    key[8], key[9], key[10], key[11], key[12], key[13], key[14], key[15],
+    key[16], key[17], key[18], key[19], key[20], key[21], key[22], key[23],
+    key[24], key[25], key[26], key[27], key[28], key[29], key[30], key[31]
+  ];
+  return Poly1305Ctx {
+    key: k, h0: 0 as u32, h1: 0 as u32, h2: 0 as u32, h3: 0 as u32, h4: 0 as u32,
+    carry: cp_zero16_bytes(), carry_len: 0
+  };
+}
+
+// Feeds `chunk_len` bytes (0 <= chunk_len <= 256) into the MAC. Call
+// as many times as needed for however long the real message is --
+// order and chunk boundaries don't matter to the result, only the
+// total byte sequence across all calls does (same convention as
+// crypto_hash's own `sha256_update`).
+fn poly1305_update(ctx: ref Poly1305Ctx, chunk: ref [u8; 256], chunk_len: i64) -> Poly1305Ctx {
+  let key: [u8; 32] = [
+    ctx.key[0], ctx.key[1], ctx.key[2], ctx.key[3], ctx.key[4], ctx.key[5], ctx.key[6], ctx.key[7],
+    ctx.key[8], ctx.key[9], ctx.key[10], ctx.key[11], ctx.key[12], ctx.key[13], ctx.key[14], ctx.key[15],
+    ctx.key[16], ctx.key[17], ctx.key[18], ctx.key[19], ctx.key[20], ctx.key[21], ctx.key[22], ctx.key[23],
+    ctx.key[24], ctx.key[25], ctx.key[26], ctx.key[27], ctx.key[28], ctx.key[29], ctx.key[30], ctx.key[31]
+  ];
+  let h0: u32 = ctx.h0;
+  let h1: u32 = ctx.h1;
+  let h2: u32 = ctx.h2;
+  let h3: u32 = ctx.h3;
+  let h4: u32 = ctx.h4;
+  let carry: [u8; 16] = cp_zero16_bytes();
+  let ci: i64 = 0;
+  while ci < 16 {
+    carry[ci] = ctx.carry[ci];
+    ci = ci + 1;
+  }
+  let carry_len: i64 = ctx.carry_len;
+  let pos: i64 = 0;
+
+  if carry_len > 0 {
+    while carry_len < 16 && pos < chunk_len {
+      carry[carry_len] = chunk[pos];
+      carry_len = carry_len + 1;
+      pos = pos + 1;
+    }
+    if carry_len == 16 {
+      let hs: Poly1305HState = cp_poly_process_block(ref key, h0, h1, h2, h3, h4, ref carry, 16777216 as u32);
+      h0 = hs.h0;
+      h1 = hs.h1;
+      h2 = hs.h2;
+      h3 = hs.h3;
+      h4 = hs.h4;
+      carry_len = 0;
+    } else {
+      return Poly1305Ctx { key: key, h0: h0, h1: h1, h2: h2, h3: h3, h4: h4, carry: carry, carry_len: carry_len };
+    }
+  }
+
+  while (chunk_len - pos) >= 16 {
+    let blk: [u8; 16] = cp_zero16_bytes();
+    let bi: i64 = 0;
+    while bi < 16 {
+      blk[bi] = chunk[pos + bi];
+      bi = bi + 1;
+    }
+    let hs: Poly1305HState = cp_poly_process_block(ref key, h0, h1, h2, h3, h4, ref blk, 16777216 as u32);
+    h0 = hs.h0;
+    h1 = hs.h1;
+    h2 = hs.h2;
+    h3 = hs.h3;
+    h4 = hs.h4;
+    pos = pos + 16;
+  }
+
+  let rem: i64 = chunk_len - pos;
+  let ri: i64 = 0;
+  while ri < rem {
+    carry[ri] = chunk[pos + ri];
+    ri = ri + 1;
+  }
+  carry_len = rem;
+
+  return Poly1305Ctx { key: key, h0: h0, h1: h1, h2: h2, h3: h3, h4: h4, carry: carry, carry_len: carry_len };
+}
+
+fn poly1305_finalize(ctx: ref Poly1305Ctx) -> [u8; 16] {
+  let key: [u8; 32] = [
+    ctx.key[0], ctx.key[1], ctx.key[2], ctx.key[3], ctx.key[4], ctx.key[5], ctx.key[6], ctx.key[7],
+    ctx.key[8], ctx.key[9], ctx.key[10], ctx.key[11], ctx.key[12], ctx.key[13], ctx.key[14], ctx.key[15],
+    ctx.key[16], ctx.key[17], ctx.key[18], ctx.key[19], ctx.key[20], ctx.key[21], ctx.key[22], ctx.key[23],
+    ctx.key[24], ctx.key[25], ctx.key[26], ctx.key[27], ctx.key[28], ctx.key[29], ctx.key[30], ctx.key[31]
+  ];
+  let h0: u32 = ctx.h0;
+  let h1: u32 = ctx.h1;
+  let h2: u32 = ctx.h2;
+  let h3: u32 = ctx.h3;
+  let h4: u32 = ctx.h4;
+
+  if ctx.carry_len > 0 {
+    let blk: [u8; 16] = cp_zero16_bytes();
+    let k: i64 = 0;
+    while k < ctx.carry_len {
+      blk[k] = ctx.carry[k];
+      k = k + 1;
+    }
+    blk[ctx.carry_len] = 1 as u8;
+    let hs: Poly1305HState = cp_poly_process_block(ref key, h0, h1, h2, h3, h4, ref blk, 0 as u32);
+    h0 = hs.h0;
+    h1 = hs.h1;
+    h2 = hs.h2;
+    h3 = hs.h3;
+    h4 = hs.h4;
+  }
+
+  // Fully carry h.
+  let mask26: u32 = 0x3ffffff as u32;
+  let fc1: u32 = h1 >> (26 as u32);
+  h1 = h1 & mask26;
+  h2 = h2 + fc1;
+  let fc2: u32 = h2 >> (26 as u32);
+  h2 = h2 & mask26;
+  h3 = h3 + fc2;
+  let fc3: u32 = h3 >> (26 as u32);
+  h3 = h3 & mask26;
+  h4 = h4 + fc3;
+  let fc4: u32 = h4 >> (26 as u32);
+  h4 = h4 & mask26;
+  h0 = h0 + (fc4 * (5 as u32));
+  let fc5: u32 = h0 >> (26 as u32);
+  h0 = h0 & mask26;
+  h1 = h1 + fc5;
+
+  // Compute h + -p (p = 2^130 - 5); select h if h < p, else h + -p --
+  // branchless via a mask derived from g4's own top bit, same
+  // technique as the reference algorithm.
+  let g0: u32 = h0 + (5 as u32);
+  let gc0: u32 = g0 >> (26 as u32);
+  let g0m: u32 = g0 & mask26;
+  let g1: u32 = h1 + gc0;
+  let gc1: u32 = g1 >> (26 as u32);
+  let g1m: u32 = g1 & mask26;
+  let g2: u32 = h2 + gc1;
+  let gc2: u32 = g2 >> (26 as u32);
+  let g2m: u32 = g2 & mask26;
+  let g3: u32 = h3 + gc2;
+  let gc3: u32 = g3 >> (26 as u32);
+  let g3m: u32 = g3 & mask26;
+  let g4: u32 = wrapping_sub(h4 + gc3, 67108864 as u32);
+
+  let select_mask: u32 = wrapping_sub((g4 >> (31 as u32)), 1 as u32);
+  let keep_g: u32 = select_mask;
+  let keep_h: u32 = wrapping_sub(0 as u32, 1 as u32) ^ select_mask;
+  h0 = (h0 & keep_h) | (g0m & keep_g);
+  h1 = (h1 & keep_h) | (g1m & keep_g);
+  h2 = (h2 & keep_h) | (g2m & keep_g);
+  h3 = (h3 & keep_h) | (g3m & keep_g);
+  h4 = (h4 & keep_h) | (g4 & keep_g);
+
+  // h mod 2^128, repacked from five 26-bit limbs into four 32-bit words.
+  let out_h0: u32 = h0 | (h1 << (26 as u32));
+  let out_h1: u32 = (h1 >> (6 as u32)) | (h2 << (20 as u32));
+  let out_h2: u32 = (h2 >> (12 as u32)) | (h3 << (14 as u32));
+  let out_h3: u32 = (h3 >> (18 as u32)) | (h4 << (8 as u32));
+
+  // mac = (h + pad) mod 2^128.
+  let pv: PadVals = cp_poly_derive_pad(ref key);
+  let f0: u64 = (out_h0 as u64) + (pv.pad0 as u64);
+  let m0: u32 = f0 as u32;
+  let carry0: u64 = f0 >> (32 as u64);
+  let f1: u64 = (out_h1 as u64) + (pv.pad1 as u64) + carry0;
+  let m1: u32 = f1 as u32;
+  let carry1: u64 = f1 >> (32 as u64);
+  let f2: u64 = (out_h2 as u64) + (pv.pad2 as u64) + carry1;
+  let m2: u32 = f2 as u32;
+  let carry2: u64 = f2 >> (32 as u64);
+  let f3: u64 = (out_h3 as u64) + (pv.pad3 as u64) + carry2;
+  let m3: u32 = f3 as u32;
+
+  let out: [u8; 16] = cp_zero16_bytes();
+  let wb0: WordBytesLE = cp_word_to_bytes_le(m0);
+  out[0] = wb0.b0;
+  out[1] = wb0.b1;
+  out[2] = wb0.b2;
+  out[3] = wb0.b3;
+  let wb1: WordBytesLE = cp_word_to_bytes_le(m1);
+  out[4] = wb1.b0;
+  out[5] = wb1.b1;
+  out[6] = wb1.b2;
+  out[7] = wb1.b3;
+  let wb2: WordBytesLE = cp_word_to_bytes_le(m2);
+  out[8] = wb2.b0;
+  out[9] = wb2.b1;
+  out[10] = wb2.b2;
+  out[11] = wb2.b3;
+  let wb3: WordBytesLE = cp_word_to_bytes_le(m3);
+  out[12] = wb3.b0;
+  out[13] = wb3.b1;
+  out[14] = wb3.b2;
+  out[15] = wb3.b3;
+  return out;
+}
+
+// One-shot convenience wrapper, capped at 512 bytes (same reasoning
+// as `chacha20_encrypt`'s own cap above).
+fn poly1305_mac(key: ref [u8; 32], msg: ref [u8; 512], msg_len: i64) -> [u8; 16] {
+  let ctx: Poly1305Ctx = poly1305_init(key);
+  let pos: i64 = 0;
+  while pos < msg_len {
+    let remaining: i64 = msg_len - pos;
+    let take: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = cp_zero256_bytes();
+    let i: i64 = 0;
+    while i < take {
+      chunk[i] = msg[pos + i];
+      i = i + 1;
+    }
+    ctx = poly1305_update(ref ctx, ref chunk, take);
+    pos = pos + take;
+  }
+  return poly1305_finalize(ref ctx);
+}
+
+// Constant-time tag comparison -- deliberately never short-circuits
+// on the first mismatched byte (a documented timing side-channel for
+// MAC verification). `n` (16, always) is a public length, never
+// secret-dependent, so the fixed loop bound itself leaks nothing.
+fn poly1305_verify_constant_time(a: ref [u8; 16], b: ref [u8; 16]) -> i64 {
+  let diff: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < 16 {
+    diff = diff | ((a[i] as u32) ^ (b[i] as u32));
+    i = i + 1;
+  }
+  return if diff == (0 as u32) { 1 } else { 0 };
+}
+
+// ---------------------------------------------------------------
+// ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8). One-shot, capped at
+// 512 bytes of plaintext/ciphertext and 64 bytes of AAD (both well
+// above every real caller found in DhruvaOS's own Pi 1 kernel: TLS
+// record AAD is a fixed 5 bytes, and this package's own `aad_len`
+// parameter stays generic rather than hardcoding that).  Built
+// directly on the streaming Poly1305 primitives above -- this IS the
+// template a caller with a longer message (round 102's own Pi 1 TLS
+// adapter) should follow directly against its own heap buffer,
+// substituting `cp_feed_padded_data`'s 256-byte chunking loop for
+// its own equivalent over an unbounded length.
+// ---------------------------------------------------------------
+
+struct AeadEncryptResult { ciphertext: [u8; 512], tag: [u8; 16] }
+struct AeadDecryptResult { ok: i64, plaintext: [u8; 512] }
+
+fn cp_len_trailer(aad_len: i64, data_len: i64) -> [u8; 16] {
+  let out: [u8; 16] = cp_zero16_bytes();
+  let av: u64 = aad_len as u64;
+  let dv: u64 = data_len as u64;
+  let i: i64 = 0;
+  while i < 8 {
+    out[i] = ((av >> ((i * 8) as u64)) & (255 as u64)) as u8;
+    i = i + 1;
+  }
+  i = 0;
+  while i < 8 {
+    out[8 + i] = ((dv >> ((i * 8) as u64)) & (255 as u64)) as u8;
+    i = i + 1;
+  }
+  return out;
+}
+
+// Feeds `aad_len` bytes of AAD into the MAC, then zero-pads to the
+// next 16-byte boundary (RFC 8439 section 2.8's own `pad16`).
+fn cp_feed_padded_aad(ctx_in: Poly1305Ctx, aad: ref [u8; 64], aad_len: i64) -> Poly1305Ctx {
+  let ctx: Poly1305Ctx = ctx_in;
+  let chunk: [u8; 256] = cp_zero256_bytes();
+  let i: i64 = 0;
+  while i < aad_len {
+    chunk[i] = aad[i];
+    i = i + 1;
+  }
+  let pad_len: i64 = (16 - (aad_len % 16)) % 16;
+  let total: i64 = aad_len + pad_len;
+  ctx = poly1305_update(ref ctx, ref chunk, total);
+  return ctx;
+}
+
+// Feeds `data_len` bytes of ciphertext (or plaintext, on the encrypt
+// side before encryption -- never used that way here, only
+// ciphertext ever goes through the MAC per RFC 8439) into the MAC in
+// <=256-byte chunks, then zero-pads to the next 16-byte boundary.
+fn cp_feed_padded_data(ctx_in: Poly1305Ctx, data: ref [u8; 512], data_len: i64) -> Poly1305Ctx {
+  let ctx: Poly1305Ctx = ctx_in;
+  let pos: i64 = 0;
+  while pos < data_len {
+    let remaining: i64 = data_len - pos;
+    let take: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = cp_zero256_bytes();
+    let i: i64 = 0;
+    while i < take {
+      chunk[i] = data[pos + i];
+      i = i + 1;
+    }
+    ctx = poly1305_update(ref ctx, ref chunk, take);
+    pos = pos + take;
+  }
+  let pad_len: i64 = (16 - (data_len % 16)) % 16;
+  if pad_len > 0 {
+    let padchunk: [u8; 256] = cp_zero256_bytes();
+    ctx = poly1305_update(ref ctx, ref padchunk, pad_len);
+  }
+  return ctx;
+}
+
+fn chacha20_poly1305_encrypt(key: ref [u8; 32], nonce: ref [u8; 12], aad: ref [u8; 64], aad_len: i64, plaintext: ref [u8; 512], plaintext_len: i64) -> AeadEncryptResult {
+  let block0: [u8; 64] = chacha20_block(key, 0 as u32, nonce);
+  let otk: [u8; 32] = cp_extract32(ref block0);
+  let ciphertext: [u8; 512] = chacha20_encrypt(key, nonce, 1 as u32, plaintext, plaintext_len);
+
+  let ctx0: Poly1305Ctx = poly1305_init(ref otk);
+  let ctx1: Poly1305Ctx = cp_feed_padded_aad(ctx0, aad, aad_len);
+  let ctx2: Poly1305Ctx = cp_feed_padded_data(ctx1, ref ciphertext, plaintext_len);
+  let trailer: [u8; 16] = cp_len_trailer(aad_len, plaintext_len);
+  let trailer_chunk: [u8; 256] = cp_zero256_bytes();
+  let ti: i64 = 0;
+  while ti < 16 {
+    trailer_chunk[ti] = trailer[ti];
+    ti = ti + 1;
+  }
+  let ctx3: Poly1305Ctx = poly1305_update(ref ctx2, ref trailer_chunk, 16);
+  let tag: [u8; 16] = poly1305_finalize(ref ctx3);
+
+  return AeadEncryptResult { ciphertext: ciphertext, tag: tag };
+}
+
+// Verifies `tag_in` against `ciphertext`/`aad`, and if (and only if)
+// it matches, decrypts. Returns `ok: 0` (plaintext left as zeros) on
+// a tag mismatch -- "reject, don't guess," never act on decrypted
+// data from a call that returned `ok: 0`.
+fn chacha20_poly1305_decrypt(key: ref [u8; 32], nonce: ref [u8; 12], aad: ref [u8; 64], aad_len: i64, ciphertext: ref [u8; 512], ciphertext_len: i64, tag_in: ref [u8; 16]) -> AeadDecryptResult {
+  let block0: [u8; 64] = chacha20_block(key, 0 as u32, nonce);
+  let otk: [u8; 32] = cp_extract32(ref block0);
+
+  let ctx0: Poly1305Ctx = poly1305_init(ref otk);
+  let ctx1: Poly1305Ctx = cp_feed_padded_aad(ctx0, aad, aad_len);
+  let ctx2: Poly1305Ctx = cp_feed_padded_data(ctx1, ciphertext, ciphertext_len);
+  let trailer: [u8; 16] = cp_len_trailer(aad_len, ciphertext_len);
+  let trailer_chunk: [u8; 256] = cp_zero256_bytes();
+  let ti: i64 = 0;
+  while ti < 16 {
+    trailer_chunk[ti] = trailer[ti];
+    ti = ti + 1;
+  }
+  let ctx3: Poly1305Ctx = poly1305_update(ref ctx2, ref trailer_chunk, 16);
+  let computed_tag: [u8; 16] = poly1305_finalize(ref ctx3);
+
+  if poly1305_verify_constant_time(ref computed_tag, tag_in) == 0 {
+    return AeadDecryptResult { ok: 0, plaintext: cp_zero512_bytes() };
+  }
+
+  let plaintext: [u8; 512] = chacha20_encrypt(key, nonce, 1 as u32, ciphertext, ciphertext_len);
+  return AeadDecryptResult { ok: 1, plaintext: plaintext };
+}

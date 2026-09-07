@@ -4299,6 +4299,85 @@ than assumed:
   encrypt`/`decrypt`, `poly1305_mac`), using the package's own
   streaming primitives directly (not the capped one-shot layer) since
   Pi 1's real TLS records already exceed 512 bytes. Not started.
+
+  **ROUND 102 UPDATE, 2026-09-07**: Pi 1 ChaCha20/Poly1305/AEAD
+  migrated to the `chacha20_poly1305` package -- third and final
+  Phase 1 migration, closing the crypto generification effort for
+  every primitive that had duplicate Pi 1/package implementations
+  ([[project_dhruva_generic_crypto_packages_x509_scope_2026_09_06]]
+  scope).
+
+  Added a `core.vani` split to the package itself first (matching the
+  `crypto_hash`/`curve25519` precedent) -- Pi 1's own pre-existing
+  `chacha20_self_test`/`poly1305_self_test` collide with the
+  package's identically-named self-tests, same class of problem as
+  every prior round. Pushed as v0.2.0.
+
+  Deleted Pi 1's own `chacha20_rotl32`/`quarter_round`/`block`, the
+  old scratch-based `chacha20_encrypt`, `poly1305_read_u32_le`/
+  `write_u32_le`/`mac`, `poly1305_verify_constant_time`, and
+  `chacha20_poly1305_build_mac_data`/`encrypt`/`decrypt` (~450 lines,
+  rounds 44/67 originally) -- all internal-only or fully superseded.
+  `chacha20_bytes_equal` kept untouched (generic byte comparator, no
+  algorithm dependency, same reasoning as `sha256_bytes_equal`).
+
+  Unlike rounds 99-100's `_heap` adapters (which called the package's
+  own capped one-shot convenience functions), `chacha20_poly1305_
+  encrypt_heap`/`decrypt_heap` call the package's STREAMING
+  primitives directly (`chacha20_xor_chunk`, `Poly1305Ctx`/`init`/
+  `update`/`finalize`, `cp_feed_padded_aad`, `cp_len_trailer`) --
+  confirmed necessary before writing any adapter code: Pi 1's real
+  TLS records (`tls_encrypt_record`/`decrypt_record`, up to 2048
+  bytes) and DharaFS's own 512-byte at-rest block encryption
+  (`dharafs_crypto_encrypt_block`/`decrypt_block`, a second real
+  production caller found via call-site audit, not just TLS) both
+  need more than the package's 512-byte one-shot cap in general (the
+  DharaFS case happens to land exactly at the cap, but the streaming
+  adapter handles both uniformly rather than special-casing). The new
+  adapters also DROP the old scratch-buffer parameters entirely
+  (`state_buf`/`working_buf`/`keystream_buf`/`block_scratch`/
+  `otk_scratch`/`mac_data_scratch`/`computed_tag_scratch`) since the
+  package's own local arrays replace them -- a real signature
+  simplification, not just a rename, at both real callers plus 2
+  self-tests (`aead_hkdf_self_test`, the DharaFS crypto self-test).
+  Removed the now-dead `aead_*_set` boot-time scratch allocations
+  (~4.4KB heap); `dharafs_crypto_*_ptr` accessors were NOT touched --
+  confirmed via grep that `dharafs_crypto_keystream_ptr()` is still
+  used elsewhere as general scratch, unrelated to this migration.
+
+  `chacha20_self_test`/`poly1305_self_test` keep their ORIGINAL names
+  (no collision once using `core.vani`) and their exact original KAT
+  vectors, rewritten to build fixed arrays and call the package's own
+  `chacha20_block`/`chacha20_encrypt`/`poly1305_mac`/`poly1305_
+  verify_constant_time` directly (both self-test messages comfortably
+  fit the package's 512-byte one-shot cap, so no streaming needed
+  there).
+
+  Verified: `vanic check` and `./build.sh` both passed first try (net
+  -415 lines). Live QEMU boot shows all 21 `CRYPTO: ...` self-test
+  lines `(PASS)`, including the AEAD/HKDF and full TLS 1.3 handshake
+  lines that exercise the new production adapters end-to-end.
+  `test/phase4_milestone.py`'s full regression battery (15 checks
+  incl. `tlsecho`, a live `tls_connect`/`tls_accept` handshake +
+  encrypted echo over real TCP -- the actual production path through
+  `tls_encrypt_record`/`decrypt_record`) passes with zero `(FAIL)`
+  lines in the authoritative harness. A raw ad-hoc `qemu_run.py`
+  capture briefly showed 5 DharaFS checks as `(FAIL)` -- same timing-
+  artifact class documented in round 100's own writeup, confirmed by
+  checking `phase4_milestone.py`'s own full log, which shows the
+  identical 5 lines `(PASS)`.
+
+  This closes the crypto generification effort's Phase 1 (SHA-256/512
+  round 99, X25519/Ed25519/PKI round 100, ChaCha20/Poly1305/AEAD round
+  102) -- every crypto primitive Pi 1 and Pi 4/5 both need now shares
+  ONE implementation via kosh packages, per the user's own original
+  "make some packages generic so whatever you have pi4 is on pi1 too"
+  request. Remaining open items from that same request's broader scope
+  (not part of THIS effort): scheduler/priority-ceiling-mutex parity
+  (Pi 1 already has MORE scheduler features than Pi 4, corrected
+  premise from [[project_dhruva_generic_crypto_packages_x509_scope_2026_09_06]]),
+  and the X.509/mTLS/HTTPS/MQTT fork (real X.509 vs. Pi 1's already-
+  built raw-public-key TLS 1.3) -- both still open, not started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
