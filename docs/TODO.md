@@ -3848,6 +3848,63 @@ than assumed:
   **Not done**: field25519/X25519, Ed25519, PKI's own thin wrapper,
   ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell integration
   remain the next steps in this chain, none started.
+
+  **ROUND 95 UPDATE, 2026-09-06**: field25519 + X25519 -- step 2 of the
+  crypto chain (SHA-512 -> field25519/X25519 -> Ed25519 -> PKI), per
+  the user's own "start step 2, X25519" then "go through all steps
+  1-4" (continue through Ed25519 and PKI without stopping for
+  per-step confirmation).
+
+  GF(2^255-19) field arithmetic (add/sub/mul/sqr/invert) plus the full
+  RFC 7748 Montgomery ladder, redesigned around field elements as
+  `[u32; 8]` limb arrays (not Pi 1's untyped 32-byte heap buffer with
+  byte-wise/u32-limb dual accessors) -- eliminates almost all of Pi
+  1's byte-level shimming. Three width-specific bignum families
+  (`bignum_*8_rpi4`, `bignum_*9_rpi4` for the reduce16 fold scratch,
+  `bignum_mul8_rpi4` producing a 16-limb product) replace Pi 1's
+  genuinely `n`-parameterized runtime-limb-count versions, since
+  vani's fixed arrays bake their size into the type. cswap in the
+  ladder operates at u32-limb granularity (8 iterations per swap)
+  instead of Pi 1's byte granularity (32 iterations) -- functionally
+  identical, fewer/wider operations.
+
+  Mid-implementation, hit three previously-unknown vani-compiler
+  constraints that don't appear in Pi 1's ARM32 out-parameter-style
+  code at all: (1) the aliasing XOR rule -- a `mut ref` borrow of a
+  variable cannot coexist with any other borrow of that same variable
+  in one call (correct, expected borrow-checker behavior, not a gap);
+  (2) `ref`/`mut ref` can only borrow a named variable or struct
+  field, never a function-call temporary directly (`ref
+  x25519_p_rpi4()` is illegal -- must bind to a named local first);
+  (3) a real, previously-undocumented gap -- `[T; N]` arrays are
+  MOVE-only on plain `let`/`=` binding, not Copy, and have no
+  `.clone()` method, contradicting an earlier assumption on this port
+  (round 85's own memory note) that `[T; N]` locals are "genuine Copy
+  stack values." That claim only holds for passing an array by `ref`/
+  `mut ref` at a call site -- not for value-binding. Logged as entry
+  #4 in `vani-compiler/docs/DHRUVAOS_ERGONOMICS_TODO.md` (vani-
+  compiler commit `d8755df9`).
+
+  Resolved all three at once by redesigning every field25519/bignum
+  function to **return its result by value** instead of Pi 1's
+  out-parameter convention -- an owned local can always supply either
+  `ref` or `mut ref` at its own call site, and `x = f(ref x)` (read
+  via `ref`, then reassign from the call's own return after the
+  borrow ends) works correctly. Where a genuine duplicate (not a
+  borrow) was needed, used an explicit element-by-element copy loop
+  instead of `let y = x;`.
+
+  2 real DH test vectors ported (base-point derivation, arbitrary-u
+  key agreement), byte-identical to kernel_main.vani's own `x25519_
+  self_test`. Wired into `kmain_rpi4_vani` and a new `x25519` shell
+  command. No new `boot/rpi4/*.S` state file needed (everything fits
+  as plain vani locals within one call chain, same as SHA-512). All 8
+  Pi 4 smoke tests pass; zero Pi 1 files touched.
+
+  **Not done**: Ed25519 (sign/verify, step 3) and PKI's own thin
+  wrapper (step 4) remain -- both explicitly still to come per "go
+  through all steps 1-4." ChaCha20-Poly1305, TLS 1.3, SSH transport,
+  and SSH-shell integration remain further out, none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

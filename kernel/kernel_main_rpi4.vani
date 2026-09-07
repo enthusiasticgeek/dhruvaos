@@ -1431,6 +1431,591 @@ fn sha512_self_test_rpi4() -> i64 {
   return ok;
 }
 
+// Round 95 -- field25519 (GF(2^255-19) field arithmetic) + X25519
+// (RFC 7748), step 2 of the SHA-512 -> field25519/X25519 -> Ed25519 ->
+// PKI crypto chain the user asked to complete in full. Direct port of
+// kernel_main.vani's own `field25519_*`/`bignum_*`/`x25519_*`, but
+// REDESIGNED around two real vani-language facts discovered live
+// while planning this round (not reactively mid-build, this time
+// caught by two standalone `vanic check` probes before writing any
+// real code):
+//
+// 1. Field elements here are plain `[u32; 8]` LIMB arrays (little-
+//    endian, limb 0 = least-significant 32 bits), not `[u8; 32]` byte
+//    buffers needing manual limb extraction. Pi 1's own `buf_read_
+//    u32`/`buf_write_u32` are raw same-endianness pointer loads/
+//    stores (confirmed by reading `boot/dharafs_buf.S` directly --
+//    plain `ldr`/`str`, no byte-order shuffling) over an untyped heap
+//    buffer ALSO accessed byte-wise elsewhere (`field25519_get_bit`,
+//    clamping, the Montgomery ladder's own cswap) -- one buffer, two
+//    views, because Pi 1's buffers are untyped bytes. This port's
+//    arrays are genuinely typed, so representing field elements as
+//    `[u32; 8]` directly (not a byte array to be reinterpreted) makes
+//    every limb access plain indexing -- no read/write-u32 shim layer
+//    at all, and bit-extraction/clamping become simpler u32 masking
+//    (see `x25519_get_bit_rpi4`/`x25519_clamp_scalar_rpi4` below)
+//    rather than Pi 1's own byte-level bit-twiddling.
+//
+// 2. Every `field25519_*`/`bignum_*` function here returns its result
+//    BY VALUE instead of Pi 1's out-parameter convention. Pi 1's own
+//    bignum routines are explicitly documented as "safe for out to
+//    alias a or b" -- but vani enforces a REAL aliasing rule (an XOR
+//    rule: many shared `ref` borrows or one `mut ref` borrow of the
+//    same variable, never both in one call), confirmed via a
+//    standalone probe: `f(ref x, ref y, mut ref x)` is a compile
+//    error ("a mut ref borrow cannot coexist with another use of the
+//    same variable"). Porting Pi 1's own alias-safe design literally
+//    would not compile. Returning by value sidesteps this AND the
+//    round 88-94 mut-ref/ref reborrow gap simultaneously, since a
+//    plain owned local can always supply either `ref` or `mut ref` at
+//    its own call site -- confirmed via a third probe that `x = f(ref
+//    x)` (read `x`, then reassign it from the same call's result)
+//    works correctly, which is exactly the pattern every ladder step
+//    below relies on. No new persistent asm state needed anywhere in
+//    this round -- every intermediate value (the Montgomery ladder's
+//    X1/X2/Z2/X3/Z3/A/AA/B/BB/E/C/D/DA/CB, the fold-reduction scratch)
+//    fits within ONE call chain as plain locals, matching how round
+//    85's SHA-256 already dropped Pi 1's own heap+scratch machinery.
+//
+// Modular reduction (`field25519_reduce16_rpi4`) uses the identical
+// fold algorithm kernel_main.vani's own `field25519_reduce16` does
+// (p = 2^255-19, so 2^256 = 38 mod p -- a 512-bit product splits
+// cleanly at the 8-limb boundary, fold the high half back in
+// multiplied by 38, twice, then canonicalize) -- unchanged math, only
+// the by-value/limb-array mechanics differ.
+
+fn fe_zero_rpi4() -> [u32; 8] {
+  return [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+}
+fn fe9_zero_rpi4() -> [u32; 9] {
+  return [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+}
+fn fe16_zero_rpi4() -> [u32; 16] {
+  return [
+    0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+    0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32
+  ];
+}
+
+// p = 2^255 - 19.
+fn x25519_p_rpi4() -> [u32; 8] {
+  return [0xFFFFFFED as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0x7FFFFFFF as u32];
+}
+// p, zero-extended to 9 limbs, for field25519_reduce16_rpi4's own
+// 9-limb canonicalization compare/subtract.
+fn x25519_p9_rpi4() -> [u32; 9] {
+  return [0xFFFFFFED as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0x7FFFFFFF as u32, 0 as u32];
+}
+// p - 2, the fixed exponent field25519_invert_rpi4's own Fermat's-
+// little-theorem square-and-multiply raises a value to.
+fn x25519_pm2_rpi4() -> [u32; 8] {
+  return [0xFFFFFFEB as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0x7FFFFFFF as u32];
+}
+// The Montgomery-curve constant a24 = (486662-2)/4 = 121665.
+fn x25519_a24_rpi4() -> [u32; 8] {
+  return [121665 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+}
+
+// out = (a + b), 8 limbs, wraparound mod 2^256 discarded (matching
+// kernel_main.vani's own bignum_add_raw's carry-out, which every real
+// caller here only ever uses in a context where the operands are
+// already-reduced field elements -- a+b < 2p < 2^256 always, so this
+// wraparound never actually fires for valid field elements; kept as
+// plain wrapping arithmetic rather than reporting/checking a carry
+// that's provably always 0 in practice, the same kind of proven-safe
+// simplification round 88's own IP checksum work already applied).
+fn bignum_add8_rpi4(a: ref [u32; 8], b: ref [u32; 8]) -> [u32; 8] {
+  let out: [u32; 8] = fe_zero_rpi4();
+  let carry: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < 8 {
+    let av: u32 = a[i];
+    let bv: u32 = b[i];
+    let sum1: u32 = wrapping_add(av, bv);
+    let carry1: u32 = if sum1 < av { 1 as u32 } else { 0 as u32 };
+    let sum2: u32 = wrapping_add(sum1, carry);
+    let carry2: u32 = if sum2 < sum1 { 1 as u32 } else { 0 as u32 };
+    out[i] = sum2;
+    carry = carry1 | carry2;
+    i = i + 1;
+  }
+  return out;
+}
+
+// out = (a - b), 8 limbs, wraparound (2^256's-complement) kept as-is
+// when b > a -- field25519_sub_rpi4's own p-correction step relies on
+// this exact wrapped value (see its own comment for the modular-
+// arithmetic identity that makes wrapped_diff + p == (a-b+p) mod
+// 2^256 exactly, with no actual 256-bit overflow, whenever a<b<p).
+fn bignum_sub8_rpi4(a: ref [u32; 8], b: ref [u32; 8]) -> [u32; 8] {
+  let out: [u32; 8] = fe_zero_rpi4();
+  let borrow: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < 8 {
+    let av: u32 = a[i];
+    let bv: u32 = b[i];
+    let diff1: u32 = wrapping_sub(av, bv);
+    let borrow1: u32 = if av < bv { 1 as u32 } else { 0 as u32 };
+    let diff2: u32 = wrapping_sub(diff1, borrow);
+    let borrow2: u32 = if diff1 < borrow { 1 as u32 } else { 0 as u32 };
+    out[i] = diff2;
+    borrow = borrow1 | borrow2;
+    i = i + 1;
+  }
+  return out;
+}
+
+// 1 if a>b, -1 if a<b, 0 if equal (8 limbs, most-significant limb
+// decides first).
+fn bignum_cmp8_rpi4(a: ref [u32; 8], b: ref [u32; 8]) -> i64 {
+  let i: i64 = 7;
+  while i >= 0 {
+    let av: u32 = a[i];
+    let bv: u32 = b[i];
+    if av > bv {
+      return 1;
+    }
+    if av < bv {
+      return 0 - 1;
+    }
+    i = i - 1;
+  }
+  return 0;
+}
+
+// out = a * b, 8x8 limbs in, 16 limbs out -- a full-width product
+// always fits exactly, no overflow to report. Schoolbook (O(n^2)):
+// every u32*u32 partial product fits in u64 without overflowing, and
+// accumulating it with the existing output limb and an incoming
+// carry still can't exceed u64::MAX (worst case sums to exactly
+// 2^64-1) -- same construction and same proof kernel_main.vani's own
+// bignum_mul_raw comment already gives.
+fn bignum_mul8_rpi4(a: ref [u32; 8], b: ref [u32; 8]) -> [u32; 16] {
+  let out: [u32; 16] = fe16_zero_rpi4();
+  let i: i64 = 0;
+  while i < 8 {
+    let a_i: u64 = a[i] as u64;
+    let carry: u64 = 0 as u64;
+    let j: i64 = 0;
+    while j < 8 {
+      let b_j: u64 = b[j] as u64;
+      let existing: u64 = out[i + j] as u64;
+      let sum: u64 = existing + (a_i * b_j) + carry;
+      out[i + j] = (sum & (4294967295 as u64)) as u32;
+      carry = sum >> (32 as u64);
+      j = j + 1;
+    }
+    // The row's final carry can itself ripple through more than one
+    // output limb -- keeps propagating until it genuinely dies out.
+    let pos: i64 = i + 8;
+    let c: u64 = carry;
+    while c > (0 as u64) {
+      let existing2: u64 = out[pos] as u64;
+      let sum2: u64 = existing2 + c;
+      out[pos] = (sum2 & (4294967295 as u64)) as u32;
+      c = sum2 >> (32 as u64);
+      pos = pos + 1;
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn bignum_add9_rpi4(a: ref [u32; 9], b: ref [u32; 9]) -> [u32; 9] {
+  let out: [u32; 9] = fe9_zero_rpi4();
+  let carry: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < 9 {
+    let av: u32 = a[i];
+    let bv: u32 = b[i];
+    let sum1: u32 = wrapping_add(av, bv);
+    let carry1: u32 = if sum1 < av { 1 as u32 } else { 0 as u32 };
+    let sum2: u32 = wrapping_add(sum1, carry);
+    let carry2: u32 = if sum2 < sum1 { 1 as u32 } else { 0 as u32 };
+    out[i] = sum2;
+    carry = carry1 | carry2;
+    i = i + 1;
+  }
+  return out;
+}
+
+fn bignum_sub9_rpi4(a: ref [u32; 9], b: ref [u32; 9]) -> [u32; 9] {
+  let out: [u32; 9] = fe9_zero_rpi4();
+  let borrow: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < 9 {
+    let av: u32 = a[i];
+    let bv: u32 = b[i];
+    let diff1: u32 = wrapping_sub(av, bv);
+    let borrow1: u32 = if av < bv { 1 as u32 } else { 0 as u32 };
+    let diff2: u32 = wrapping_sub(diff1, borrow);
+    let borrow2: u32 = if diff1 < borrow { 1 as u32 } else { 0 as u32 };
+    out[i] = diff2;
+    borrow = borrow1 | borrow2;
+    i = i + 1;
+  }
+  return out;
+}
+
+fn bignum_cmp9_rpi4(a: ref [u32; 9], b: ref [u32; 9]) -> i64 {
+  let i: i64 = 8;
+  while i >= 0 {
+    let av: u32 = a[i];
+    let bv: u32 = b[i];
+    if av > bv {
+      return 1;
+    }
+    if av < bv {
+      return 0 - 1;
+    }
+    i = i - 1;
+  }
+  return 0;
+}
+
+// Reduces a 16-limb (512-bit) product down to a canonical 8-limb
+// value < p. See this section's own header comment for the fold
+// algorithm (unchanged from kernel_main.vani's own field25519_
+// reduce16 -- only the by-value/limb mechanics differ).
+fn field25519_reduce16_rpi4(product16: ref [u32; 16]) -> [u32; 8] {
+  // Fold 1: fold_t = high_8_limbs(product16) * 38 (9 limbs).
+  let fold_t: [u32; 9] = fe9_zero_rpi4();
+  let carry1: u64 = 0 as u64;
+  let i: i64 = 0;
+  while i < 8 {
+    let hi: u64 = product16[8 + i] as u64;
+    let prod: u64 = (hi * (38 as u64)) + carry1;
+    fold_t[i] = (prod & (4294967295 as u64)) as u32;
+    carry1 = prod >> (32 as u64);
+    i = i + 1;
+  }
+  fold_t[8] = carry1 as u32;
+
+  // fold_lo = low_8_limbs(product16) padded to 9 limbs, then += fold_t.
+  let fold_lo: [u32; 9] = fe9_zero_rpi4();
+  let j: i64 = 0;
+  while j < 8 {
+    fold_lo[j] = product16[j];
+    j = j + 1;
+  }
+  let fold_sum1: [u32; 9] = bignum_add9_rpi4(ref fold_lo, ref fold_t);
+
+  // Fold 2: fold_sum1's own limb 8 is now tiny -- fold it back in the
+  // same way.
+  let s1_limb8: u32 = fold_sum1[8];
+  let prod2: u64 = (s1_limb8 as u64) * (38 as u64);
+  let fold_t2: [u32; 9] = fe9_zero_rpi4();
+  fold_t2[0] = (prod2 & (4294967295 as u64)) as u32;
+  fold_t2[1] = (prod2 >> (32 as u64)) as u32;
+  let fold_lo2: [u32; 9] = fold_sum1;
+  fold_lo2[8] = 0 as u32; // clear the now-folded-in limb 8
+  let fold_sum2: [u32; 9] = bignum_add9_rpi4(ref fold_lo2, ref fold_t2);
+
+  // Canonicalize: at most a couple of conditional subtractions of p
+  // (empirically at most 1, matching kernel_main.vani's own comment).
+  let result9: [u32; 9] = fold_sum2;
+  let p9_const: [u32; 9] = x25519_p9_rpi4();
+  while bignum_cmp9_rpi4(ref result9, ref p9_const) >= 0 {
+    result9 = bignum_sub9_rpi4(ref result9, ref p9_const);
+  }
+
+  let out: [u32; 8] = fe_zero_rpi4();
+  let o: i64 = 0;
+  while o < 8 {
+    out[o] = result9[o];
+    o = o + 1;
+  }
+  return out;
+}
+
+// out = (a + b) mod p.
+fn field25519_add_rpi4(a: ref [u32; 8], b: ref [u32; 8]) -> [u32; 8] {
+  let sum: [u32; 8] = bignum_add8_rpi4(a, b);
+  let p_const: [u32; 8] = x25519_p_rpi4();
+  if bignum_cmp8_rpi4(ref sum, ref p_const) >= 0 {
+    return bignum_sub8_rpi4(ref sum, ref p_const);
+  }
+  return sum;
+}
+
+// out = (a - b) mod p. If a<b, `bignum_sub8_rpi4` already returns the
+// wrapped (2^256's-complement) value; adding p to THAT (itself
+// computed as a plain wrapping 8-limb add) yields exactly (a-b+p) mod
+// 2^256 with no genuine 256-bit overflow, since a-b+p is already in
+// (0,p) -- see this file's own header comment for the full identity.
+fn field25519_sub_rpi4(a: ref [u32; 8], b: ref [u32; 8]) -> [u32; 8] {
+  if bignum_cmp8_rpi4(a, b) < 0 {
+    let diff: [u32; 8] = bignum_sub8_rpi4(a, b);
+    let p_const: [u32; 8] = x25519_p_rpi4();
+    return bignum_add8_rpi4(ref diff, ref p_const);
+  }
+  return bignum_sub8_rpi4(a, b);
+}
+
+fn field25519_mul_rpi4(a: ref [u32; 8], b: ref [u32; 8]) -> [u32; 8] {
+  let product: [u32; 16] = bignum_mul8_rpi4(a, b);
+  return field25519_reduce16_rpi4(ref product);
+}
+
+fn field25519_sqr_rpi4(a: ref [u32; 8]) -> [u32; 8] {
+  return field25519_mul_rpi4(a, a);
+}
+
+fn x25519_get_bit_rpi4(buf: ref [u32; 8], bit_index: i64) -> u32 {
+  let limb_idx: i64 = bit_index / 32;
+  let bit_in_limb: u32 = (bit_index - (limb_idx * 32)) as u32;
+  return (buf[limb_idx] >> bit_in_limb) & (1 as u32);
+}
+
+// a^(p-2) mod p == a^-1 mod p (Fermat's little theorem, p prime) --
+// plain left-to-right binary square-and-multiply over the fixed,
+// known exponent p-2 (255 bits), matching kernel_main.vani's own
+// field25519_invert exactly (not the optimized addition chain real
+// high-performance implementations use).
+fn field25519_invert_rpi4(a: ref [u32; 8]) -> [u32; 8] {
+  let base: [u32; 8] = fe_zero_rpi4();
+  let bi: i64 = 0;
+  while bi < 8 {
+    base[bi] = a[bi];
+    bi = bi + 1;
+  }
+  let result: [u32; 8] = fe_zero_rpi4();
+  result[0] = 1 as u32;
+  let pm2: [u32; 8] = x25519_pm2_rpi4();
+
+  let bit: i64 = 0;
+  while bit < 255 {
+    if x25519_get_bit_rpi4(ref pm2, bit) == (1 as u32) {
+      result = field25519_mul_rpi4(ref result, ref base);
+    }
+    base = field25519_sqr_rpi4(ref base);
+    bit = bit + 1;
+  }
+  return result;
+}
+
+// RFC 7748 section 5 clamping, returned as a NEW value (not applied
+// in place, unlike kernel_main.vani's own x25519_clamp_scalar --
+// every real caller here already holds its own owned copy of k, so
+// there's no in-place-mutation need this port's by-value convention
+// can't already satisfy more simply).
+fn x25519_clamp_scalar_rpi4(k: ref [u32; 8]) -> [u32; 8] {
+  let out: [u32; 8] = fe_zero_rpi4();
+  let i: i64 = 0;
+  while i < 8 {
+    out[i] = k[i];
+    i = i + 1;
+  }
+  out[0] = out[0] & (0xFFFFFFF8 as u32); // clear the low 3 bits of byte 0
+  out[7] = (out[7] & (0x7FFFFFFF as u32)) | (0x40000000 as u32); // clear bit 255, set bit 254
+  return out;
+}
+
+fn fe_from_bytes_le_rpi4(bytes: ref [u8; 32]) -> [u32; 8] {
+  let out: [u32; 8] = fe_zero_rpi4();
+  let i: i64 = 0;
+  while i < 8 {
+    let b0: u32 = bytes[i * 4] as u32;
+    let b1: u32 = bytes[i * 4 + 1] as u32;
+    let b2: u32 = bytes[i * 4 + 2] as u32;
+    let b3: u32 = bytes[i * 4 + 3] as u32;
+    out[i] = b0 | (b1 << (8 as u32)) | (b2 << (16 as u32)) | (b3 << (24 as u32));
+    i = i + 1;
+  }
+  return out;
+}
+
+fn fe_to_bytes_le_rpi4(limbs: ref [u32; 8]) -> [u8; 32] {
+  let out: [u8; 32] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let i: i64 = 0;
+  while i < 8 {
+    let v: u32 = limbs[i];
+    out[i * 4] = (v & (255 as u32)) as u8;
+    out[i * 4 + 1] = ((v >> (8 as u32)) & (255 as u32)) as u8;
+    out[i * 4 + 2] = ((v >> (16 as u32)) & (255 as u32)) as u8;
+    out[i * 4 + 3] = ((v >> (24 as u32)) & (255 as u32)) as u8;
+    i = i + 1;
+  }
+  return out;
+}
+
+// The Montgomery ladder itself (RFC 7748 section 5). Constant-time by
+// construction (cswap via arithmetic masking at LIMB granularity --
+// simpler and wider than kernel_main.vani's own per-BYTE masking,
+// since this port's x1/x2/z2/x3/z3 are `[u32; 8]` limb arrays, not
+// byte buffers -- the loop itself always runs all 255 iterations
+// regardless of k's own bit pattern) EXCEPT for field25519_add_rpi4/
+// _sub_rpi4's own single conditional subtraction/addition of p, same
+// documented, non-oversight gap kernel_main.vani's own comment
+// already flags (docs/TODO.md has the note).
+fn x25519_scalarmult_rpi4(k_bytes: ref [u8; 32], u_in_bytes: ref [u8; 32]) -> [u8; 32] {
+  let k_raw: [u32; 8] = fe_from_bytes_le_rpi4(k_bytes);
+  let k: [u32; 8] = x25519_clamp_scalar_rpi4(ref k_raw);
+
+  let x1: [u32; 8] = fe_from_bytes_le_rpi4(u_in_bytes);
+  x1[7] = x1[7] & (0x7FFFFFFF as u32); // RFC 7748: mask the top bit of the u-coordinate
+
+  let x2: [u32; 8] = fe_zero_rpi4();
+  x2[0] = 1 as u32; // X2 = 1
+  let z2: [u32; 8] = fe_zero_rpi4(); // Z2 = 0
+  // X3 = U -- an explicit element-by-element copy, not `let x3 = x1;`:
+  // vani's fixed arrays are move-only on assignment (confirmed via a
+  // standalone probe: `let y = x;` followed by any later use of `x`
+  // is a compile error, "cannot borrow 'x' after it was moved" --
+  // there is also no `.clone()` method available for array types in
+  // v1), unlike this port's earlier, incorrect assumption (carried
+  // over from round 85's "genuine Copy stack values" framing, which
+  // held for PASSING an array by `ref`/`mut ref`, not for byval
+  // move-vs-copy on a plain `let`/`=`) -- `x1` is still needed later
+  // in this same function (`z3 = field25519_mul_rpi4(ref x1, ...)`),
+  // so it must stay owned by its own binding.
+  let x3: [u32; 8] = fe_zero_rpi4();
+  let x3i: i64 = 0;
+  while x3i < 8 {
+    x3[x3i] = x1[x3i];
+    x3i = x3i + 1;
+  }
+  let z3: [u32; 8] = fe_zero_rpi4();
+  z3[0] = 1 as u32; // Z3 = 1
+
+  let swap: u32 = 0 as u32;
+  let t: i64 = 254;
+  while t >= 0 {
+    let k_t: u32 = x25519_get_bit_rpi4(ref k, t);
+    let new_swap: u32 = swap ^ k_t;
+    let mask: u32 = wrapping_sub(0 as u32, new_swap); // new_swap==1 -> 0xffffffff, ==0 -> 0
+    let si: i64 = 0;
+    while si < 8 {
+      let x2w: u32 = x2[si];
+      let x3w: u32 = x3[si];
+      let swapxor: u32 = (x2w ^ x3w) & mask;
+      x2[si] = x2w ^ swapxor;
+      x3[si] = x3w ^ swapxor;
+      let z2w: u32 = z2[si];
+      let z3w: u32 = z3[si];
+      let swapzor: u32 = (z2w ^ z3w) & mask;
+      z2[si] = z2w ^ swapzor;
+      z3[si] = z3w ^ swapzor;
+      si = si + 1;
+    }
+
+    let a: [u32; 8] = field25519_add_rpi4(ref x2, ref z2);
+    let aa: [u32; 8] = field25519_sqr_rpi4(ref a);
+    let b: [u32; 8] = field25519_sub_rpi4(ref x2, ref z2);
+    let bb: [u32; 8] = field25519_sqr_rpi4(ref b);
+    let e: [u32; 8] = field25519_sub_rpi4(ref aa, ref bb);
+    let c: [u32; 8] = field25519_add_rpi4(ref x3, ref z3);
+    let d: [u32; 8] = field25519_sub_rpi4(ref x3, ref z3);
+    let da: [u32; 8] = field25519_mul_rpi4(ref d, ref a);
+    let cb: [u32; 8] = field25519_mul_rpi4(ref c, ref b);
+    let da_plus_cb: [u32; 8] = field25519_add_rpi4(ref da, ref cb);
+    x3 = field25519_sqr_rpi4(ref da_plus_cb); // x3 = (DA+CB)^2
+    let da_minus_cb: [u32; 8] = field25519_sub_rpi4(ref da, ref cb);
+    z3 = field25519_sqr_rpi4(ref da_minus_cb); // z3 = (DA-CB)^2
+    z3 = field25519_mul_rpi4(ref x1, ref z3);  // z3 = x1 * (DA-CB)^2
+    x2 = field25519_mul_rpi4(ref aa, ref bb);  // x2 = AA*BB
+    let a24_const: [u32; 8] = x25519_a24_rpi4();
+    let a24e: [u32; 8] = field25519_mul_rpi4(ref a24_const, ref e);
+    let aa_plus_a24e: [u32; 8] = field25519_add_rpi4(ref aa, ref a24e);
+    z2 = field25519_mul_rpi4(ref e, ref aa_plus_a24e); // z2 = E*(AA+a24*E)
+
+    swap = k_t;
+    t = t - 1;
+  }
+
+  // Final cswap (swap now holds the LAST k_t from t=0).
+  let mask_final: u32 = wrapping_sub(0 as u32, swap);
+  let sf: i64 = 0;
+  while sf < 8 {
+    let x2w2: u32 = x2[sf];
+    let x3w2: u32 = x3[sf];
+    let swapxor2: u32 = (x2w2 ^ x3w2) & mask_final;
+    x2[sf] = x2w2 ^ swapxor2;
+    x3[sf] = x3w2 ^ swapxor2;
+    let z2w2: u32 = z2[sf];
+    let z3w2: u32 = z3[sf];
+    let swapzor2: u32 = (z2w2 ^ z3w2) & mask_final;
+    z2[sf] = z2w2 ^ swapzor2;
+    z3[sf] = z3w2 ^ swapzor2;
+    sf = sf + 1;
+  }
+
+  let z2_inv: [u32; 8] = field25519_invert_rpi4(ref z2);
+  let result: [u32; 8] = field25519_mul_rpi4(ref x2, ref z2_inv);
+  return fe_to_bytes_le_rpi4(ref result);
+}
+
+// Two real (k, u-coordinate, expected-output) triples, byte-identical
+// to kernel_main.vani's own x25519_self_test -- that side's own header
+// comment documents the full verification methodology (a from-scratch
+// Python RFC 7748 reference checked against the real `cryptography`
+// library across 20 random trials, then a separate Python simulation
+// of this EXACT limb-level algorithm cross-checked against that
+// reference across 2000 field multiplications and 15 full X25519
+// trials). Not re-derived here -- reusing that already-verified
+// ground truth directly, same as SHA-256/SHA-512's own KATs reuse
+// FIPS's.
+fn x25519_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+
+  let test1_k: [u8; 32] = [
+    0x60 as u8, 0xb7 as u8, 0xb2 as u8, 0xc0 as u8, 0xd9 as u8, 0x51 as u8, 0x1c as u8, 0xbd as u8,
+    0x53 as u8, 0x2b as u8, 0xda as u8, 0xdd as u8, 0xdf as u8, 0xd5 as u8, 0xb5 as u8, 0xa8 as u8,
+    0x5d as u8, 0x0b as u8, 0x49 as u8, 0xab as u8, 0x55 as u8, 0x03 as u8, 0x9f as u8, 0xd3 as u8,
+    0x21 as u8, 0xba as u8, 0x87 as u8, 0xda as u8, 0xe8 as u8, 0x63 as u8, 0x8e as u8, 0x4c as u8
+  ];
+  let test1_basepoint: [u8; 32] = [
+    9 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let test1_expected: [u8; 32] = [
+    0xe0 as u8, 0x7a as u8, 0xe4 as u8, 0x20 as u8, 0x24 as u8, 0x0d as u8, 0x20 as u8, 0xa2 as u8,
+    0x7d as u8, 0xf3 as u8, 0xc1 as u8, 0x96 as u8, 0xf7 as u8, 0x3b as u8, 0x54 as u8, 0xb6 as u8,
+    0x43 as u8, 0x58 as u8, 0xbd as u8, 0x16 as u8, 0x19 as u8, 0x9f as u8, 0x97 as u8, 0x76 as u8,
+    0x26 as u8, 0x26 as u8, 0x82 as u8, 0x42 as u8, 0x05 as u8, 0xe1 as u8, 0x7f as u8, 0x69 as u8
+  ];
+  let test1_out: [u8; 32] = x25519_scalarmult_rpi4(ref test1_k, ref test1_basepoint);
+  let test1_i: i64 = 0;
+  while test1_i < 32 {
+    if test1_out[test1_i] != test1_expected[test1_i] { ok = 0; }
+    test1_i = test1_i + 1;
+  }
+
+  let test2_u: [u8; 32] = [
+    0x20 as u8, 0xc9 as u8, 0xb8 as u8, 0x13 as u8, 0x92 as u8, 0xa4 as u8, 0x6b as u8, 0x37 as u8,
+    0xd9 as u8, 0xa5 as u8, 0xd5 as u8, 0xc1 as u8, 0xf5 as u8, 0x73 as u8, 0x7c as u8, 0xca as u8,
+    0x4f as u8, 0xc9 as u8, 0x71 as u8, 0x21 as u8, 0x89 as u8, 0xc0 as u8, 0xf1 as u8, 0x84 as u8,
+    0x23 as u8, 0x35 as u8, 0xec as u8, 0x89 as u8, 0xbd as u8, 0xeb as u8, 0xca as u8, 0x0d as u8
+  ];
+  let test2_expected: [u8; 32] = [
+    0x12 as u8, 0x8e as u8, 0x3d as u8, 0x71 as u8, 0x61 as u8, 0x9e as u8, 0x52 as u8, 0x72 as u8,
+    0x04 as u8, 0x99 as u8, 0x1f as u8, 0x8a as u8, 0x5c as u8, 0x80 as u8, 0x68 as u8, 0x2d as u8,
+    0x74 as u8, 0xea as u8, 0xa2 as u8, 0xda as u8, 0x8a as u8, 0xde as u8, 0x5c as u8, 0xcc as u8,
+    0xaa as u8, 0xdb as u8, 0x7a as u8, 0xfa as u8, 0xc3 as u8, 0xcc as u8, 0xc6 as u8, 0x66 as u8
+  ];
+  let test2_out: [u8; 32] = x25519_scalarmult_rpi4(ref test1_k, ref test2_u);
+  let test2_i: i64 = 0;
+  while test2_i < 32 {
+    if test2_out[test2_i] != test2_expected[test2_i] { ok = 0; }
+    test2_i = test2_i + 1;
+  }
+
+  let _ = uart_puts_rpi4_vani("CRYPTO: X25519 vs kernel_main.vani's own verified reference (base-point + DH agreement)");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
 // Round 86 -- Phase A step 1 of the networking/SSH/WiFi scope (see
 // project memory project_dhruva_networking_ssh_wifi_scope_2026_09_06
 // .md): the smallest useful netif abstraction on this port. Loopback/
@@ -4597,6 +5182,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = preempt_init();
   let _ = sha256_self_test_rpi4();
   let _ = sha512_self_test_rpi4();
+  let _ = x25519_self_test_rpi4();
   // Round 88: packet filtering's own default policy -- .bss's own
   // zero-init would otherwise leave it at 0 (deny), which would
   // silently break every self-test below that touches netif (all of
@@ -4857,11 +5443,11 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, sha512, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, sha512, x25519, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 94 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 95 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
@@ -4876,6 +5462,11 @@ fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("sha512") == (1 as u32) {
     let _ = uart_puts_rpi4_vani("\n");
     let _ = sha512_self_test_rpi4();
+    return 0;
+  }
+  if rpi4_shell_line_matches("x25519") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = x25519_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_line_matches("netif") == (1 as u32) {
