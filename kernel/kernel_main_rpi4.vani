@@ -4030,6 +4030,128 @@ fn dhcp_server_self_test_rpi4() -> i64 {
   return ok;
 }
 
+// Round 93 -- static IP configuration, the DHCP-alternative path from
+// the user's own original networking vision. Brand-new design, no
+// kernel_main.vani precedent (Pi 1's own DHCP was always the only way
+// this project ever acquired an address). New `boot/rpi4/netconfig_
+// state.S` holds a single scalar network configuration (ip/netmask/
+// gateway/source), same shape as round 91's DHCP client state.
+//
+// `netconfig_apply_from_dhcp_rpi4` is a generic setter any acquisition
+// path can call -- written and self-tested here, but deliberately
+// NOT wired into round 91's `dhcp_client_poll_rpi4` this round. Doing
+// that live would need that function to also parse DHCP options 1
+// (subnet mask) and 3 (router) from the ACK, which it doesn't today,
+// and round 92's own DHCP server would need to start sending them
+// too -- a real, small, well-scoped follow-up, not done here so this
+// round stays focused on the actually-requested capability (a genuine
+// static-IP alternative to running the DHCP handshake at all).
+//
+// Sibling-if/multi-block locals below use distinct names throughout,
+// same proactive discipline round 92 already applied against
+// [[feedback_vani_llvm_local_name_collision]].
+
+fn netconfig_source_none_rpi4() -> u32 { return 0 as u32; }
+fn netconfig_source_static_rpi4() -> u32 { return 1 as u32; }
+fn netconfig_source_dhcp_rpi4() -> u32 { return 2 as u32; }
+
+extern "C" fn netconfig_get_ip() -> u32;
+extern "C" fn netconfig_set_ip(value: u32) -> u32;
+extern "C" fn netconfig_get_netmask() -> u32;
+extern "C" fn netconfig_set_netmask(value: u32) -> u32;
+extern "C" fn netconfig_get_gateway() -> u32;
+extern "C" fn netconfig_set_gateway(value: u32) -> u32;
+extern "C" fn netconfig_get_source() -> u32;
+extern "C" fn netconfig_set_source(value: u32) -> u32;
+extern "C" fn netconfig_reset() -> u32;
+
+fn netconfig_is_configured_rpi4() -> i64 {
+  if netconfig_get_source() != netconfig_source_none_rpi4() {
+    return 1;
+  }
+  return 0;
+}
+
+// Configures this device's network identity directly, bypassing DHCP
+// entirely -- the actual "static IP" capability the user asked for.
+// Rejects 0.0.0.0 and 255.255.255.255 for the address itself (never
+// real values here, matching arp_cache's own "0 means unused"
+// convention and the broadcast address's own reserved meaning
+// elsewhere in this project) -- netmask/gateway are NOT validated
+// against the address (e.g. gateway-outside-subnet), a real, honest
+// scope boundary: this project's own IP/TCP/UDP layers never consult
+// netmask/gateway for a routing decision today, so there is nothing
+// downstream yet that a stricter check would actually protect.
+fn netconfig_set_static_rpi4(ip: u32, netmask: u32, gateway: u32) -> i64 {
+  if (ip == (0 as u32)) || (ip == (0xFFFFFFFF as u32)) {
+    return 0 - 1;
+  }
+  let _ = netconfig_set_ip(ip);
+  let _ = netconfig_set_netmask(netmask);
+  let _ = netconfig_set_gateway(gateway);
+  let _ = netconfig_set_source(netconfig_source_static_rpi4());
+  return 0;
+}
+
+// Generic acquisition-path setter -- see this section's own header
+// comment for why DHCP doesn't call this live yet.
+fn netconfig_apply_from_dhcp_rpi4(ip: u32, netmask: u32, gateway: u32) -> i64 {
+  let _ = netconfig_set_ip(ip);
+  let _ = netconfig_set_netmask(netmask);
+  let _ = netconfig_set_gateway(gateway);
+  let _ = netconfig_set_source(netconfig_source_dhcp_rpi4());
+  return 0;
+}
+
+// Boot-time (and on-demand, via the `netcfg` shell command) self-test:
+// starts unconfigured, sets a static config and verifies every field
+// + is_configured, rejects an invalid address (0.0.0.0), resets back
+// to unconfigured, then proves the generic DHCP-facing path also
+// works correctly (source tracking in particular) even though nothing
+// calls it live yet.
+fn netconfig_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let _ = netconfig_reset();
+
+  if netconfig_is_configured_rpi4() != 0 { ok = 0; }
+
+  let static_ip: u32 = 0xC0A80164 as u32;    // 192.168.1.100
+  let static_netmask: u32 = 0xFFFFFF00 as u32; // 255.255.255.0
+  let static_gateway: u32 = 0xC0A80101 as u32; // 192.168.1.1
+  let static_status: i64 = netconfig_set_static_rpi4(static_ip, static_netmask, static_gateway);
+  if static_status != 0 { ok = 0; }
+  if netconfig_is_configured_rpi4() != 1 { ok = 0; }
+  if netconfig_get_ip() != static_ip { ok = 0; }
+  if netconfig_get_netmask() != static_netmask { ok = 0; }
+  if netconfig_get_gateway() != static_gateway { ok = 0; }
+  if netconfig_get_source() != netconfig_source_static_rpi4() { ok = 0; }
+
+  let invalid_status: i64 = netconfig_set_static_rpi4(0 as u32, static_netmask, static_gateway);
+  if invalid_status != (0 - 1) { ok = 0; }
+  // Rejected -- the earlier valid static config must be untouched.
+  if netconfig_get_ip() != static_ip { ok = 0; }
+
+  let _ = netconfig_reset();
+  if netconfig_is_configured_rpi4() != 0 { ok = 0; }
+  if netconfig_get_ip() != (0 as u32) { ok = 0; }
+
+  let dhcp_ip: u32 = 0x0A00000A as u32;      // 10.0.0.10
+  let dhcp_netmask: u32 = 0xFFFFFF00 as u32; // 255.255.255.0
+  let dhcp_gateway: u32 = 0x0A000001 as u32; // 10.0.0.1
+  let _ = netconfig_apply_from_dhcp_rpi4(dhcp_ip, dhcp_netmask, dhcp_gateway);
+  if netconfig_is_configured_rpi4() != 1 { ok = 0; }
+  if netconfig_get_ip() != dhcp_ip { ok = 0; }
+  if netconfig_get_source() != netconfig_source_dhcp_rpi4() { ok = 0; }
+
+  let _ = uart_puts_rpi4_vani("NETCFG: static IP config + unconfigured/invalid rejection + DHCP-path setter");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
 #[no_mangle]
 fn kmain_rpi4_vani() -> i64 {
   let _ = uart_puts_rpi4_vani("\nDHRUVA RPI4: first vani-compiled code running on real AArch64 codegen\n");
@@ -4061,6 +4183,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = udp_self_test_rpi4();
   let _ = dhcp_self_test_rpi4();
   let _ = dhcp_server_self_test_rpi4();
+  let _ = netconfig_self_test_rpi4();
   return 0;
 }
 
@@ -4300,11 +4423,11 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 92 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 93 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
@@ -4357,6 +4480,11 @@ fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("dhcps") == (1 as u32) {
     let _ = uart_puts_rpi4_vani("\n");
     let _ = dhcp_server_self_test_rpi4();
+    return 0;
+  }
+  if rpi4_shell_line_matches("netcfg") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = netconfig_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_starts_with("echo ") == (1 as u32) {

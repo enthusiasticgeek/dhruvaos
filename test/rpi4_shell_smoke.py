@@ -20,7 +20,9 @@ state, so no new boot/rpi4/*.S file was needed). Round 91 added `dhcp`
 boot/rpi4/dhcp_state.S's own header comment has that design). Round
 92 added `dhcps` (the DHCP SERVER self-test -- brand-new design, no
 kernel_main.vani precedent -- boot/rpi4/dhcp_server_state.S's own
-header comment has that design).
+header comment has that design). Round 93 added `netcfg` (static IP
+configuration, the DHCP-alternative path -- brand-new design,
+boot/rpi4/netconfig_state.S's own header comment has that design).
 
 Drives real commands over QEMU's stdio UART (help, ver, test, echo)
 and checks each one's real response, using phase4_milestone.py's own
@@ -82,6 +84,8 @@ def run(elf_path: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[int, str]:
         time.sleep(CMD_WAIT_S)
         send("dhcps")
         time.sleep(CMD_WAIT_S)
+        send("netcfg")
+        time.sleep(CMD_WAIT_S)
         out, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, out.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
@@ -104,8 +108,8 @@ def main() -> int:
     print(output, end="")
 
     checks = {
-        "help lists commands": "commands: help, ver, test, sha256, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, echo <text>" in output,
-        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 92 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps" in output,
+        "help lists commands": "commands: help, ver, test, sha256, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, echo <text>" in output,
+        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 93 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg" in output,
         "echo echoes real argument text": "hello dhruva" in output,
         "unknown command reported": "unknown command (try 'help')" in output,
         "test reruns the real self-test": "sum=5050 quotient=14285 remainder=5" in output,
@@ -139,15 +143,18 @@ def main() -> int:
         "dhcps reruns the DHCP server self-test": output.count(
             "DHCPS: server DISCOVER->OFFER, REQUEST->ACK, unknown-MAC REQUEST->NAK (PASS)"
         ) >= 2,
+        "netcfg reruns the static IP config self-test": output.count(
+            "NETCFG: static IP config + unconfigured/invalid rejection + DHCP-path setter (PASS)"
+        ) >= 2,
         "no fault": "FAULT" not in output,
     }
     ok = all(checks.values())
 
     if ok:
-        print(f"\n[rpi4_shell_smoke.py] PASS -- all 14 real shell commands (help, "
+        print(f"\n[rpi4_shell_smoke.py] PASS -- all 15 real shell commands (help, "
               f"ver, echo, an unknown command, test, sha256, netif, arp, ip, filter, "
-              f"tcp, udp, dhcp, dhcps) got their correct real responses over a live "
-              f"QEMU stdio UART session.", file=sys.stderr)
+              f"tcp, udp, dhcp, dhcps, netcfg) got their correct real responses over "
+              f"a live QEMU stdio UART session.", file=sys.stderr)
         return 0
     failed = [name for name, passed in checks.items() if not passed]
     print(f"\n[rpi4_shell_smoke.py] FAIL -- failed checks: {failed!r}",

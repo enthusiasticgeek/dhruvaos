@@ -3767,6 +3767,46 @@ than assumed:
   the user's own original vision also asked for), PKI, X25519/
   Ed25519/ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell
   integration remain the next Phase A steps, none started.
+
+  **ROUND 93 UPDATE, 2026-09-06**: static IP configuration -- the
+  DHCP-alternative path from the user's own original networking
+  vision ("it should work dhcp/static ip as well as..."). Brand-new
+  design, no kernel_main.vani precedent (Pi 1's own DHCP was always
+  the only way this project ever acquired an address). New
+  `boot/rpi4/netconfig_state.S` holds a single scalar network
+  configuration (ip/netmask/gateway/source, source tracking whether
+  STATIC or DHCP populated it, or NONE if genuinely unconfigured) --
+  same single-instance shape as round 91's DHCP client state.
+
+  `netconfig_set_static_rpi4` is the actual requested capability:
+  configures the device's network identity directly, bypassing DHCP
+  entirely, rejecting 0.0.0.0/255.255.255.255 for the address itself
+  (netmask/gateway aren't validated against the address -- this
+  project's own IP/TCP/UDP layers never consult either for a routing
+  decision today, so a stricter check would have nothing downstream
+  to actually protect). `netconfig_apply_from_dhcp_rpi4` is a generic
+  acquisition-path setter, written and self-tested here but
+  DELIBERATELY NOT wired into round 91's `dhcp_client_poll_rpi4` this
+  round -- that would need the client to also parse DHCP options 1
+  (subnet mask) and 3 (router) from the ACK (it only parses 50/51/54
+  today) and round 92's own server to start sending them, a real,
+  small, well-scoped follow-up kept out of this round so it stayed
+  focused on the actually-requested static-IP capability.
+
+  Wired into `kmain_rpi4_vani` and a new `netcfg` shell command
+  (exercises static config + field verification, invalid-address
+  rejection, reset-to-unconfigured, and the DHCP-facing setter). Every
+  sibling-block local used a distinct name from the first draft, the
+  same proactive discipline round 92 already applied against
+  [[feedback_vani_llvm_local_name_collision]] -- worked correctly on
+  the very first REAL build, no live debugging needed at all this
+  round either. All 8 Pi 4 smoke tests pass; zero Pi 1 files touched
+  (all new code, same as round 92).
+
+  **Not done**: live DHCP-to-netconfig wiring (needs DHCP options 1/3
+  parsing on both client and server), PKI, X25519/Ed25519/ChaCha20-
+  Poly1305, TLS 1.3, SSH transport, and SSH-shell integration remain
+  the next Phase A steps, none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
