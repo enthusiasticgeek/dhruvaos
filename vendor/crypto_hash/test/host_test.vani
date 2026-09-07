@@ -10,6 +10,8 @@ use "../src/lib.vani";
 fn main() -> i64 {
   assert sha256_self_test() == 1;
   assert sha512_self_test() == 1;
+  assert sha256_streaming_self_test() == 1;
+  assert sha512_streaming_self_test() == 1;
   print "crypto_hash: SHA-256 + SHA-512 self-tests PASS";
   return 0;
 }

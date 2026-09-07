@@ -28,6 +28,32 @@
 // Hashing something longer is out of scope for v0.1.0.
 const SHA256_BUF_SIZE: i64 = 256;
 
+// `[T; N]` arrays are move-only on plain `let`/`=` binding (no Copy,
+// no `.clone()`), so a single zero-filled local can't be reused
+// across several `let` bindings -- this returns a fresh one each
+// call instead. Used throughout the self-tests below wherever a
+// scratch `[u8; 256]` chunk buffer is needed.
+fn zero256_bytes() -> [u8; 256] {
+  return [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+}
+
 fn sha256_wrap_add32(a: u32, b: u32) -> u32 {
   let wide: i64 = (a as i64) + (b as i64);
   return (wide & 4294967295) as u32;
@@ -333,6 +359,362 @@ fn sha256_self_test() -> i64 {
     0xf6 as u8, 0xec as u8, 0xed as u8, 0xd4 as u8, 0x19 as u8, 0xdb as u8, 0x06 as u8, 0xc1 as u8
   ];
   if sha256_digest_equal(ref out2, ref exp2) == 0 { ok = 0; }
+
+  return ok;
+}
+
+// v0.2.0 -- streaming SHA-256: `sha256_hash` above (and its SHA-512
+// counterpart) cap the total message at what fits in one 256-byte
+// scratch buffer (247 bytes after padding) -- fine for this port's
+// own small self-tests, but genuinely wrong for a consumer hashing
+// unbounded data (a whole file's contents, an accumulating TLS
+// handshake transcript). `Sha256Ctx`/`sha256_init`/`sha256_update`/
+// `sha256_finalize` remove that cap entirely: the running hash state
+// is always just 8 words plus one 64-byte block of carry, regardless
+// of how many total bytes are ever fed through. `sha256_hash` itself
+// is UNCHANGED and still the right choice for a message that already
+// fits in one buffer -- streaming is strictly additional capability,
+// not a replacement.
+//
+// `sha256_update`'s own `chunk` parameter is up to 256 bytes per
+// call (matching this file's existing scratch-buffer convention) --
+// call it repeatedly for a longer message, each call feeding the
+// next chunk from the caller's own (possibly much larger) buffer.
+// Internally: any carried-over partial block from the previous call
+// is topped up and compressed first if it reaches a full 64 bytes;
+// then every full 64-byte block already inside `chunk` is compressed
+// directly (via the existing `sha256_compress`, reusing its own
+// `block_off`-indexed read path -- no extra copy needed for whole
+// blocks); the trailing remainder (0-63 bytes) becomes the new carry.
+// `chunk` is declared `mut ref` only because `sha256_compress` needs
+// that ref kind to match its own caller in `sha256_hash` above --
+// `sha256_update` itself never writes through it.
+struct Sha256Ctx { h: [u32; 8], carry: [u8; 64], carry_len: i64, total_len: u64 }
+
+fn sha256_round_constants() -> [u32; 64] {
+  return [
+    0x428a2f98 as u32, 0x71374491 as u32, 0xb5c0fbcf as u32, 0xe9b5dba5 as u32,
+    0x3956c25b as u32, 0x59f111f1 as u32, 0x923f82a4 as u32, 0xab1c5ed5 as u32,
+    0xd807aa98 as u32, 0x12835b01 as u32, 0x243185be as u32, 0x550c7dc3 as u32,
+    0x72be5d74 as u32, 0x80deb1fe as u32, 0x9bdc06a7 as u32, 0xc19bf174 as u32,
+    0xe49b69c1 as u32, 0xefbe4786 as u32, 0x0fc19dc6 as u32, 0x240ca1cc as u32,
+    0x2de92c6f as u32, 0x4a7484aa as u32, 0x5cb0a9dc as u32, 0x76f988da as u32,
+    0x983e5152 as u32, 0xa831c66d as u32, 0xb00327c8 as u32, 0xbf597fc7 as u32,
+    0xc6e00bf3 as u32, 0xd5a79147 as u32, 0x06ca6351 as u32, 0x14292967 as u32,
+    0x27b70a85 as u32, 0x2e1b2138 as u32, 0x4d2c6dfc as u32, 0x53380d13 as u32,
+    0x650a7354 as u32, 0x766a0abb as u32, 0x81c2c92e as u32, 0x92722c85 as u32,
+    0xa2bfe8a1 as u32, 0xa81a664b as u32, 0xc24b8b70 as u32, 0xc76c51a3 as u32,
+    0xd192e819 as u32, 0xd6990624 as u32, 0xf40e3585 as u32, 0x106aa070 as u32,
+    0x19a4c116 as u32, 0x1e376c08 as u32, 0x2748774c as u32, 0x34b0bcb5 as u32,
+    0x391c0cb3 as u32, 0x4ed8aa4a as u32, 0x5b9cca4f as u32, 0x682e6ff3 as u32,
+    0x748f82ee as u32, 0x78a5636f as u32, 0x84c87814 as u32, 0x8cc70208 as u32,
+    0x90befffa as u32, 0xa4506ceb as u32, 0xbef9a3f7 as u32, 0xc67178f2 as u32
+  ];
+}
+
+// Same compression round as `sha256_compress` above, operating on a
+// dedicated 64-byte (one-block) buffer at a fixed offset of 0 instead
+// of an offset into a 256-byte scratch buffer -- `sha256_update`'s
+// own carry buffer is exactly one block, never more, so it needs its
+// own 64-byte-typed sibling rather than reusing `sha256_compress`
+// against a differently-sized array type.
+fn sha256_compress64(block: mut ref [u8; 64], h: mut ref [u32; 8], k: ref [u32; 64]) -> i64 {
+  let w: [u32; 64] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
+                       0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let i: i64 = 0;
+  while i < 16 {
+    let b0: u32 = block[i * 4] as u32;
+    let b1: u32 = block[i * 4 + 1] as u32;
+    let b2: u32 = block[i * 4 + 2] as u32;
+    let b3: u32 = block[i * 4 + 3] as u32;
+    w[i] = (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+    i = i + 1;
+  }
+  i = 16;
+  while i < 64 {
+    let w15: u32 = w[i - 15];
+    let w2: u32 = w[i - 2];
+    let w16: u32 = w[i - 16];
+    let w7: u32 = w[i - 7];
+    let s0: u32 = sha256_rotr32(w15, 7 as u32) ^ sha256_rotr32(w15, 18 as u32) ^ (w15 >> (3 as u32));
+    let s1: u32 = sha256_rotr32(w2, 17 as u32) ^ sha256_rotr32(w2, 19 as u32) ^ (w2 >> (10 as u32));
+    w[i] = sha256_wrap_add32(sha256_wrap_add32(w16, s0), sha256_wrap_add32(w7, s1));
+    i = i + 1;
+  }
+
+  let a: u32 = h[0];
+  let b: u32 = h[1];
+  let c: u32 = h[2];
+  let d: u32 = h[3];
+  let e: u32 = h[4];
+  let f: u32 = h[5];
+  let g: u32 = h[6];
+  let hh: u32 = h[7];
+  let ones: u32 = 4294967295 as u32;
+
+  i = 0;
+  while i < 64 {
+    let bige1: u32 = sha256_rotr32(e, 6 as u32) ^ sha256_rotr32(e, 11 as u32) ^ sha256_rotr32(e, 25 as u32);
+    let ch: u32 = (e & f) ^ ((e ^ ones) & g);
+    let kw: u32 = k[i];
+    let ww: u32 = w[i];
+    let t1: u32 = sha256_wrap_add32(sha256_wrap_add32(hh, bige1), sha256_wrap_add32(ch, sha256_wrap_add32(kw, ww)));
+    let bige0: u32 = sha256_rotr32(a, 2 as u32) ^ sha256_rotr32(a, 13 as u32) ^ sha256_rotr32(a, 22 as u32);
+    let maj: u32 = (a & b) ^ (a & c) ^ (b & c);
+    let t2: u32 = sha256_wrap_add32(bige0, maj);
+
+    hh = g;
+    g = f;
+    f = e;
+    e = sha256_wrap_add32(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = sha256_wrap_add32(t1, t2);
+
+    i = i + 1;
+  }
+
+  h[0] = sha256_wrap_add32(h[0], a);
+  h[1] = sha256_wrap_add32(h[1], b);
+  h[2] = sha256_wrap_add32(h[2], c);
+  h[3] = sha256_wrap_add32(h[3], d);
+  h[4] = sha256_wrap_add32(h[4], e);
+  h[5] = sha256_wrap_add32(h[5], f);
+  h[6] = sha256_wrap_add32(h[6], g);
+  h[7] = sha256_wrap_add32(h[7], hh);
+  return 0;
+}
+
+fn sha256_init() -> Sha256Ctx {
+  let h0: [u32; 8] = [0x6a09e667 as u32, 0xbb67ae85 as u32, 0x3c6ef372 as u32, 0xa54ff53a as u32,
+                       0x510e527f as u32, 0x9b05688c as u32, 0x1f83d9ab as u32, 0x5be0cd19 as u32];
+  let carry0: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  return Sha256Ctx { h: h0, carry: carry0, carry_len: 0, total_len: 0 as u64 };
+}
+
+// Feeds `len` bytes (0 <= len <= 256) from `chunk` into the hasher.
+// Call as many times as needed for however long the real message is;
+// order and chunk boundaries don't matter to the result, only the
+// total byte sequence across all calls does.
+fn sha256_update(ctx: ref Sha256Ctx, chunk: mut ref [u8; 256], chunk_len: i64) -> Sha256Ctx {
+  let h: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let hi: i64 = 0;
+  while hi < 8 { h[hi] = ctx.h[hi]; hi = hi + 1; }
+
+  let carry: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let ci: i64 = 0;
+  while ci < 64 { carry[ci] = ctx.carry[ci]; ci = ci + 1; }
+  let carry_len: i64 = ctx.carry_len;
+  let k: [u32; 64] = sha256_round_constants();
+  let pos: i64 = 0;
+
+  if carry_len > 0 {
+    while carry_len < 64 && pos < chunk_len {
+      carry[carry_len] = chunk[pos];
+      carry_len = carry_len + 1;
+      pos = pos + 1;
+    }
+    if carry_len == 64 {
+      let _ = sha256_compress64(mut ref carry, mut ref h, ref k);
+      carry_len = 0;
+    } else {
+      let total_len_early: u64 = wrapping_add(ctx.total_len, chunk_len as u64);
+      return Sha256Ctx { h: h, carry: carry, carry_len: carry_len, total_len: total_len_early };
+    }
+  }
+
+  while (chunk_len - pos) >= 64 {
+    let _ = sha256_compress(chunk, pos, mut ref h, ref k);
+    pos = pos + 64;
+  }
+
+  let rem: i64 = chunk_len - pos;
+  let ri: i64 = 0;
+  while ri < rem {
+    carry[ri] = chunk[pos + ri];
+    ri = ri + 1;
+  }
+  carry_len = rem;
+
+  let total_len: u64 = wrapping_add(ctx.total_len, chunk_len as u64);
+  return Sha256Ctx { h: h, carry: carry, carry_len: carry_len, total_len: total_len };
+}
+
+// Applies FIPS 180-4 padding to whatever's left in the carry buffer
+// (a single 0x80 byte, zero bytes, then the total bit-length as a
+// big-endian 8-byte integer -- spilling into a second final block if
+// the carry is already past byte 55) and returns the 32-byte digest.
+fn sha256_finalize(ctx: ref Sha256Ctx) -> [u8; 32] {
+  let h: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let hi: i64 = 0;
+  while hi < 8 { h[hi] = ctx.h[hi]; hi = hi + 1; }
+
+  let carry: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let ci: i64 = 0;
+  while ci < 64 { carry[ci] = ctx.carry[ci]; ci = ci + 1; }
+  let carry_len: i64 = ctx.carry_len;
+  let k: [u32; 64] = sha256_round_constants();
+
+  carry[carry_len] = 128 as u8;
+  let p: i64 = carry_len + 1;
+  if p > 56 {
+    while p < 64 { carry[p] = 0 as u8; p = p + 1; }
+    let _ = sha256_compress64(mut ref carry, mut ref h, ref k);
+    let zi: i64 = 0;
+    while zi < 64 { carry[zi] = 0 as u8; zi = zi + 1; }
+    p = 0;
+  }
+  while p < 56 { carry[p] = 0 as u8; p = p + 1; }
+
+  let bit_len: u64 = ctx.total_len << (3 as u64);
+  carry[56] = ((bit_len >> (56 as u64)) & (255 as u64)) as u8;
+  carry[57] = ((bit_len >> (48 as u64)) & (255 as u64)) as u8;
+  carry[58] = ((bit_len >> (40 as u64)) & (255 as u64)) as u8;
+  carry[59] = ((bit_len >> (32 as u64)) & (255 as u64)) as u8;
+  carry[60] = ((bit_len >> (24 as u64)) & (255 as u64)) as u8;
+  carry[61] = ((bit_len >> (16 as u64)) & (255 as u64)) as u8;
+  carry[62] = ((bit_len >> (8 as u64)) & (255 as u64)) as u8;
+  carry[63] = (bit_len & (255 as u64)) as u8;
+
+  let _ = sha256_compress64(mut ref carry, mut ref h, ref k);
+
+  let out: [u8; 32] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let j: i64 = 0;
+  while j < 8 {
+    let v: u32 = h[j];
+    out[j * 4] = ((v >> (24 as u32)) & (255 as u32)) as u8;
+    out[j * 4 + 1] = ((v >> (16 as u32)) & (255 as u32)) as u8;
+    out[j * 4 + 2] = ((v >> (8 as u32)) & (255 as u32)) as u8;
+    out[j * 4 + 3] = (v & (255 as u32)) as u8;
+    j = j + 1;
+  }
+  return out;
+}
+
+// Same 3 KATs as `sha256_self_test`, run through init/update/finalize
+// instead of the one-shot `sha256_hash`, PLUS a 4th case a one-shot
+// call structurally cannot express at all: a 500-byte message (over
+// the 247-byte one-shot cap) fed across THREE separate `update` calls
+// of uneven, non-block-aligned sizes (200 + 200 + 100), proving both
+// "no total-length cap" and "correct carry handling across arbitrary
+// call boundaries," not just "correct for one lucky chunking."
+fn sha256_streaming_self_test() -> i64 {
+  let ok: i64 = 1;
+
+
+  // KAT 1: empty string.
+  let ctx0: Sha256Ctx = sha256_init();
+  let out0: [u8; 32] = sha256_finalize(ref ctx0);
+  let exp0: [u8; 32] = [
+    0xe3 as u8, 0xb0 as u8, 0xc4 as u8, 0x42 as u8, 0x98 as u8, 0xfc as u8, 0x1c as u8, 0x14 as u8, 0x9a as u8, 0xfb as u8, 0xf4 as u8, 0xc8 as u8,
+    0x99 as u8, 0x6f as u8, 0xb9 as u8, 0x24 as u8, 0x27 as u8, 0xae as u8, 0x41 as u8, 0xe4 as u8, 0x64 as u8, 0x9b as u8, 0x93 as u8, 0x4c as u8,
+    0xa4 as u8, 0x95 as u8, 0x99 as u8, 0x1b as u8, 0x78 as u8, 0x52 as u8, 0xb8 as u8, 0x55 as u8
+  ];
+  if sha256_digest_equal(ref out0, ref exp0) == 0 { ok = 0; }
+
+  // KAT 2: "abc".
+  let msg1: [u8; 256] = zero256_bytes();
+  msg1[0] = 0x61 as u8;
+  msg1[1] = 0x62 as u8;
+  msg1[2] = 0x63 as u8;
+  let ctx1: Sha256Ctx = sha256_init();
+  let ctx1b: Sha256Ctx = sha256_update(ref ctx1, mut ref msg1, 3);
+  let out1: [u8; 32] = sha256_finalize(ref ctx1b);
+  let exp1: [u8; 32] = [
+    0xba as u8, 0x78 as u8, 0x16 as u8, 0xbf as u8, 0x8f as u8, 0x01 as u8, 0xcf as u8, 0xea as u8, 0x41 as u8, 0x41 as u8, 0x40 as u8, 0xde as u8,
+    0x5d as u8, 0xae as u8, 0x22 as u8, 0x23 as u8, 0xb0 as u8, 0x03 as u8, 0x61 as u8, 0xa3 as u8, 0x96 as u8, 0x17 as u8, 0x7a as u8, 0x9c as u8,
+    0xb4 as u8, 0x10 as u8, 0xff as u8, 0x61 as u8, 0xf2 as u8, 0x00 as u8, 0x15 as u8, 0xad as u8
+  ];
+  if sha256_digest_equal(ref out1, ref exp1) == 0 { ok = 0; }
+
+  // KAT 3: the 56-byte second-block message, fed in TWO update calls
+  // (32 + 24 bytes) that don't align to a 64-byte block boundary, to
+  // also exercise the carry-buffer path (not just the whole-blocks-
+  // in-one-call path KAT 2 alone would leave untested).
+  let msg2: [u8; 256] = zero256_bytes();
+  msg2[0] = 0x61 as u8; msg2[1] = 0x62 as u8; msg2[2] = 0x63 as u8; msg2[3] = 0x64 as u8;
+  msg2[4] = 0x62 as u8; msg2[5] = 0x63 as u8; msg2[6] = 0x64 as u8; msg2[7] = 0x65 as u8;
+  msg2[8] = 0x63 as u8; msg2[9] = 0x64 as u8; msg2[10] = 0x65 as u8; msg2[11] = 0x66 as u8;
+  msg2[12] = 0x64 as u8; msg2[13] = 0x65 as u8; msg2[14] = 0x66 as u8; msg2[15] = 0x67 as u8;
+  msg2[16] = 0x65 as u8; msg2[17] = 0x66 as u8; msg2[18] = 0x67 as u8; msg2[19] = 0x68 as u8;
+  msg2[20] = 0x66 as u8; msg2[21] = 0x67 as u8; msg2[22] = 0x68 as u8; msg2[23] = 0x69 as u8;
+  msg2[24] = 0x67 as u8; msg2[25] = 0x68 as u8; msg2[26] = 0x69 as u8; msg2[27] = 0x6a as u8;
+  msg2[28] = 0x68 as u8; msg2[29] = 0x69 as u8; msg2[30] = 0x6a as u8; msg2[31] = 0x6b as u8;
+  msg2[32] = 0x69 as u8; msg2[33] = 0x6a as u8; msg2[34] = 0x6b as u8; msg2[35] = 0x6c as u8;
+  msg2[36] = 0x6a as u8; msg2[37] = 0x6b as u8; msg2[38] = 0x6c as u8; msg2[39] = 0x6d as u8;
+  msg2[40] = 0x6b as u8; msg2[41] = 0x6c as u8; msg2[42] = 0x6d as u8; msg2[43] = 0x6e as u8;
+  msg2[44] = 0x6c as u8; msg2[45] = 0x6d as u8; msg2[46] = 0x6e as u8; msg2[47] = 0x6f as u8;
+  msg2[48] = 0x6d as u8; msg2[49] = 0x6e as u8; msg2[50] = 0x6f as u8; msg2[51] = 0x70 as u8;
+  msg2[52] = 0x6e as u8; msg2[53] = 0x6f as u8; msg2[54] = 0x70 as u8; msg2[55] = 0x71 as u8;
+  let msg2_part2: [u8; 256] = zero256_bytes();
+  let mvi: i64 = 0;
+  while mvi < 24 { msg2_part2[mvi] = msg2[32 + mvi]; mvi = mvi + 1; }
+  let ctx2: Sha256Ctx = sha256_init();
+  let ctx2b: Sha256Ctx = sha256_update(ref ctx2, mut ref msg2, 32);
+  let ctx2c: Sha256Ctx = sha256_update(ref ctx2b, mut ref msg2_part2, 24);
+  let out2: [u8; 32] = sha256_finalize(ref ctx2c);
+  let exp2: [u8; 32] = [
+    0x24 as u8, 0x8d as u8, 0x6a as u8, 0x61 as u8, 0xd2 as u8, 0x06 as u8, 0x38 as u8, 0xb8 as u8, 0xe5 as u8, 0xc0 as u8, 0x26 as u8, 0x93 as u8,
+    0x0c as u8, 0x3e as u8, 0x60 as u8, 0x39 as u8, 0xa3 as u8, 0x3c as u8, 0xe4 as u8, 0x59 as u8, 0x64 as u8, 0xff as u8, 0x21 as u8, 0x67 as u8,
+    0xf6 as u8, 0xec as u8, 0xed as u8, 0xd4 as u8, 0x19 as u8, 0xdb as u8, 0x06 as u8, 0xc1 as u8
+  ];
+  if sha256_digest_equal(ref out2, ref exp2) == 0 { ok = 0; }
+
+  // KAT 4: cross-check against the one-shot sha256_hash for a
+  // 500-byte message (well over the one-shot 247-byte cap, so this
+  // ALSO proves the one-shot function couldn't have handled it),
+  // fed through streaming in 3 uneven chunks (200 + 200 + 100). The
+  // expected digest is derived from an independent reference (Python
+  // hashlib.sha256 over 500 bytes of the repeating pattern
+  // 0,1,2,...,255,0,1,...,243), not from this same code, so this is
+  // a genuine correctness check, not a self-consistency tautology.
+  let big1: [u8; 256] = zero256_bytes();
+  let big2: [u8; 256] = zero256_bytes();
+  let big3: [u8; 256] = zero256_bytes();
+  let bi: i64 = 0;
+  while bi < 200 { big1[bi] = (bi & 255) as u8; bi = bi + 1; }
+  bi = 0;
+  while bi < 200 { big2[bi] = ((bi + 200) & 255) as u8; bi = bi + 1; }
+  bi = 0;
+  while bi < 100 { big3[bi] = ((bi + 400) & 255) as u8; bi = bi + 1; }
+  let ctx3: Sha256Ctx = sha256_init();
+  let ctx3b: Sha256Ctx = sha256_update(ref ctx3, mut ref big1, 200);
+  let ctx3c: Sha256Ctx = sha256_update(ref ctx3b, mut ref big2, 200);
+  let ctx3d: Sha256Ctx = sha256_update(ref ctx3c, mut ref big3, 100);
+  let out3: [u8; 32] = sha256_finalize(ref ctx3d);
+  let exp3: [u8; 32] = [
+    0x6a as u8, 0x25 as u8, 0x9d as u8, 0xa4 as u8, 0xda as u8, 0xcd as u8, 0xfb as u8, 0x0f as u8, 0x51 as u8, 0x36 as u8, 0x96 as u8, 0x49 as u8,
+    0xcb as u8, 0xf8 as u8, 0x86 as u8, 0x4d as u8, 0x8e as u8, 0x2d as u8, 0x67 as u8, 0x54 as u8, 0x62 as u8, 0xc8 as u8, 0x62 as u8, 0x5a as u8,
+    0x70 as u8, 0x33 as u8, 0x4b as u8, 0xfc as u8, 0x2c as u8, 0x50 as u8, 0xd1 as u8, 0xaf as u8
+  ];
+  if sha256_digest_equal(ref out3, ref exp3) == 0 { ok = 0; }
 
   return ok;
 }
@@ -735,6 +1117,355 @@ fn sha512_self_test() -> i64 {
     0x96 as u8, 0xea as u8, 0xfb as u8, 0xc8 as u8, 0xa8 as u8, 0x3d as u8, 0x2c as u8, 0x8b as u8, 0x38 as u8, 0x41 as u8, 0xe5 as u8, 0xdd as u8, 0x60 as u8, 0xb1 as u8, 0x36 as u8, 0x2f as u8
   ];
   if sha512_digest_equal(ref out3, ref exp3) == 0 { ok = 0; }
+
+  return ok;
+}
+
+// v0.2.0 -- streaming SHA-512, same rationale/shape as SHA-256's own
+// streaming addition above: `sha512_hash` caps the message at what
+// fits in its 256-byte scratch buffer; `Sha512Ctx`/`sha512_init`/
+// `sha512_update`/`sha512_finalize` remove that cap entirely. See
+// SHA-256's own streaming header comment for the full design
+// rationale (carry-buffer top-up, then whole blocks straight from
+// `chunk`, then a new tail carry) -- identical here, just at the
+// 128-byte block size SHA-512 itself uses instead of 64.
+struct Sha512Ctx { h: [u64; 8], carry: [u8; 128], carry_len: i64, total_len: u64 }
+
+fn sha512_round_constants() -> [u64; 80] {
+  return [
+    0x428a2f98d728ae22 as u64, 0x7137449123ef65cd as u64, 0xb5c0fbcfec4d3b2f as u64, 0xe9b5dba58189dbbc as u64,
+    0x3956c25bf348b538 as u64, 0x59f111f1b605d019 as u64, 0x923f82a4af194f9b as u64, 0xab1c5ed5da6d8118 as u64,
+    0xd807aa98a3030242 as u64, 0x12835b0145706fbe as u64, 0x243185be4ee4b28c as u64, 0x550c7dc3d5ffb4e2 as u64,
+    0x72be5d74f27b896f as u64, 0x80deb1fe3b1696b1 as u64, 0x9bdc06a725c71235 as u64, 0xc19bf174cf692694 as u64,
+    0xe49b69c19ef14ad2 as u64, 0xefbe4786384f25e3 as u64, 0x0fc19dc68b8cd5b5 as u64, 0x240ca1cc77ac9c65 as u64,
+    0x2de92c6f592b0275 as u64, 0x4a7484aa6ea6e483 as u64, 0x5cb0a9dcbd41fbd4 as u64, 0x76f988da831153b5 as u64,
+    0x983e5152ee66dfab as u64, 0xa831c66d2db43210 as u64, 0xb00327c898fb213f as u64, 0xbf597fc7beef0ee4 as u64,
+    0xc6e00bf33da88fc2 as u64, 0xd5a79147930aa725 as u64, 0x06ca6351e003826f as u64, 0x142929670a0e6e70 as u64,
+    0x27b70a8546d22ffc as u64, 0x2e1b21385c26c926 as u64, 0x4d2c6dfc5ac42aed as u64, 0x53380d139d95b3df as u64,
+    0x650a73548baf63de as u64, 0x766a0abb3c77b2a8 as u64, 0x81c2c92e47edaee6 as u64, 0x92722c851482353b as u64,
+    0xa2bfe8a14cf10364 as u64, 0xa81a664bbc423001 as u64, 0xc24b8b70d0f89791 as u64, 0xc76c51a30654be30 as u64,
+    0xd192e819d6ef5218 as u64, 0xd69906245565a910 as u64, 0xf40e35855771202a as u64, 0x106aa07032bbd1b8 as u64,
+    0x19a4c116b8d2d0c8 as u64, 0x1e376c085141ab53 as u64, 0x2748774cdf8eeb99 as u64, 0x34b0bcb5e19b48a8 as u64,
+    0x391c0cb3c5c95a63 as u64, 0x4ed8aa4ae3418acb as u64, 0x5b9cca4f7763e373 as u64, 0x682e6ff3d6b2b8a3 as u64,
+    0x748f82ee5defb2fc as u64, 0x78a5636f43172f60 as u64, 0x84c87814a1f0ab72 as u64, 0x8cc702081a6439ec as u64,
+    0x90befffa23631e28 as u64, 0xa4506cebde82bde9 as u64, 0xbef9a3f7b2c67915 as u64, 0xc67178f2e372532b as u64,
+    0xca273eceea26619c as u64, 0xd186b8c721c0c207 as u64, 0xeada7dd6cde0eb1e as u64, 0xf57d4f7fee6ed178 as u64,
+    0x06f067aa72176fba as u64, 0x0a637dc5a2c898a6 as u64, 0x113f9804bef90dae as u64, 0x1b710b35131c471b as u64,
+    0x28db77f523047d84 as u64, 0x32caab7b40c72493 as u64, 0x3c9ebe0a15c9bebc as u64, 0x431d67c49c100d4c as u64,
+    0x4cc5d4becb3e42b6 as u64, 0x597f299cfc657e2a as u64, 0x5fcb6fab3ad6faec as u64, 0x6c44198c4a475817 as u64
+  ];
+}
+
+// Same compression round as `sha512_compress` above, operating on a
+// dedicated 128-byte (one-block) buffer at a fixed offset of 0.
+fn sha512_compress128(block: mut ref [u8; 128], h: mut ref [u64; 8], k: ref [u64; 80]) -> i64 {
+  let w: [u64; 80] = [
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64,
+    0 as u64, 0 as u64, 0 as u64, 0 as u64
+  ];
+  let i: i64 = 0;
+  while i < 16 {
+    let b0: u64 = block[i * 8] as u64;
+    let b1: u64 = block[i * 8 + 1] as u64;
+    let b2: u64 = block[i * 8 + 2] as u64;
+    let b3: u64 = block[i * 8 + 3] as u64;
+    let b4: u64 = block[i * 8 + 4] as u64;
+    let b5: u64 = block[i * 8 + 5] as u64;
+    let b6: u64 = block[i * 8 + 6] as u64;
+    let b7: u64 = block[i * 8 + 7] as u64;
+    w[i] = (b0 << (56 as u64)) | (b1 << (48 as u64)) | (b2 << (40 as u64)) | (b3 << (32 as u64)) | (b4 << (24 as u64)) | (b5 << (16 as u64)) | (b6 << (8 as u64)) | b7;
+    i = i + 1;
+  }
+  i = 16;
+  while i < 80 {
+    let w15: u64 = w[i - 15];
+    let w2: u64 = w[i - 2];
+    let w16: u64 = w[i - 16];
+    let w7: u64 = w[i - 7];
+    let s0: u64 = sha512_rotr64(w15, 1 as u64) ^ sha512_rotr64(w15, 8 as u64) ^ (w15 >> (7 as u64));
+    let s1: u64 = sha512_rotr64(w2, 19 as u64) ^ sha512_rotr64(w2, 61 as u64) ^ (w2 >> (6 as u64));
+    w[i] = wrapping_add(wrapping_add(w16, s0), wrapping_add(w7, s1));
+    i = i + 1;
+  }
+
+  let a: u64 = h[0];
+  let b: u64 = h[1];
+  let c: u64 = h[2];
+  let d: u64 = h[3];
+  let e: u64 = h[4];
+  let f: u64 = h[5];
+  let g: u64 = h[6];
+  let hh: u64 = h[7];
+  let ones: u64 = wrapping_sub(0 as u64, 1 as u64);
+
+  i = 0;
+  while i < 80 {
+    let bige1: u64 = sha512_rotr64(e, 14 as u64) ^ sha512_rotr64(e, 18 as u64) ^ sha512_rotr64(e, 41 as u64);
+    let ch: u64 = (e & f) ^ ((e ^ ones) & g);
+    let kw: u64 = k[i];
+    let ww: u64 = w[i];
+    let t1: u64 = wrapping_add(wrapping_add(hh, bige1), wrapping_add(ch, wrapping_add(kw, ww)));
+    let bige0: u64 = sha512_rotr64(a, 28 as u64) ^ sha512_rotr64(a, 34 as u64) ^ sha512_rotr64(a, 39 as u64);
+    let maj: u64 = (a & b) ^ (a & c) ^ (b & c);
+    let t2: u64 = wrapping_add(bige0, maj);
+
+    hh = g;
+    g = f;
+    f = e;
+    e = wrapping_add(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = wrapping_add(t1, t2);
+
+    i = i + 1;
+  }
+
+  h[0] = wrapping_add(h[0], a);
+  h[1] = wrapping_add(h[1], b);
+  h[2] = wrapping_add(h[2], c);
+  h[3] = wrapping_add(h[3], d);
+  h[4] = wrapping_add(h[4], e);
+  h[5] = wrapping_add(h[5], f);
+  h[6] = wrapping_add(h[6], g);
+  h[7] = wrapping_add(h[7], hh);
+  return 0;
+}
+
+fn sha512_init() -> Sha512Ctx {
+  let h0: [u64; 8] = [
+    0x6a09e667f3bcc908 as u64, 0xbb67ae8584caa73b as u64, 0x3c6ef372fe94f82b as u64, 0xa54ff53a5f1d36f1 as u64,
+    0x510e527fade682d1 as u64, 0x9b05688c2b3e6c1f as u64, 0x1f83d9abfb41bd6b as u64, 0x5be0cd19137e2179 as u64
+  ];
+  let carry0: [u8; 128] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  return Sha512Ctx { h: h0, carry: carry0, carry_len: 0, total_len: 0 as u64 };
+}
+
+// Feeds `len` bytes (0 <= len <= 256) from `chunk` into the hasher.
+fn sha512_update(ctx: ref Sha512Ctx, chunk: mut ref [u8; 256], chunk_len: i64) -> Sha512Ctx {
+  let h: [u64; 8] = [0 as u64, 0 as u64, 0 as u64, 0 as u64, 0 as u64, 0 as u64, 0 as u64, 0 as u64];
+  let hi: i64 = 0;
+  while hi < 8 { h[hi] = ctx.h[hi]; hi = hi + 1; }
+
+  let carry: [u8; 128] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let ci: i64 = 0;
+  while ci < 128 { carry[ci] = ctx.carry[ci]; ci = ci + 1; }
+  let carry_len: i64 = ctx.carry_len;
+  let k: [u64; 80] = sha512_round_constants();
+  let pos: i64 = 0;
+
+  if carry_len > 0 {
+    while carry_len < 128 && pos < chunk_len {
+      carry[carry_len] = chunk[pos];
+      carry_len = carry_len + 1;
+      pos = pos + 1;
+    }
+    if carry_len == 128 {
+      let _ = sha512_compress128(mut ref carry, mut ref h, ref k);
+      carry_len = 0;
+    } else {
+      let total_len_early: u64 = wrapping_add(ctx.total_len, chunk_len as u64);
+      return Sha512Ctx { h: h, carry: carry, carry_len: carry_len, total_len: total_len_early };
+    }
+  }
+
+  while (chunk_len - pos) >= 128 {
+    let _ = sha512_compress(chunk, pos, mut ref h, ref k);
+    pos = pos + 128;
+  }
+
+  let rem: i64 = chunk_len - pos;
+  let ri: i64 = 0;
+  while ri < rem {
+    carry[ri] = chunk[pos + ri];
+    ri = ri + 1;
+  }
+  carry_len = rem;
+
+  let total_len: u64 = wrapping_add(ctx.total_len, chunk_len as u64);
+  return Sha512Ctx { h: h, carry: carry, carry_len: carry_len, total_len: total_len };
+}
+
+// Applies FIPS 180-4 padding (high 8 bytes of the 128-bit length
+// field hardcoded to 0, matching `sha512_hash`'s own convention --
+// sufficient for any realistic message on this port) and returns the
+// 64-byte digest.
+fn sha512_finalize(ctx: ref Sha512Ctx) -> [u8; 64] {
+  let h: [u64; 8] = [0 as u64, 0 as u64, 0 as u64, 0 as u64, 0 as u64, 0 as u64, 0 as u64, 0 as u64];
+  let hi: i64 = 0;
+  while hi < 8 { h[hi] = ctx.h[hi]; hi = hi + 1; }
+
+  let carry: [u8; 128] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let ci: i64 = 0;
+  while ci < 128 { carry[ci] = ctx.carry[ci]; ci = ci + 1; }
+  let carry_len: i64 = ctx.carry_len;
+  let k: [u64; 80] = sha512_round_constants();
+
+  carry[carry_len] = 128 as u8;
+  let p: i64 = carry_len + 1;
+  if p > 112 {
+    while p < 128 { carry[p] = 0 as u8; p = p + 1; }
+    let _ = sha512_compress128(mut ref carry, mut ref h, ref k);
+    let zi: i64 = 0;
+    while zi < 128 { carry[zi] = 0 as u8; zi = zi + 1; }
+    p = 0;
+  }
+  while p < 120 { carry[p] = 0 as u8; p = p + 1; }
+
+  // High 8 bytes of the 128-bit length field: always 0 (see header
+  // comment). Low 8 bytes: total bit length.
+  carry[120] = 0 as u8;
+  carry[121] = 0 as u8;
+  carry[122] = 0 as u8;
+  carry[123] = 0 as u8;
+  carry[124] = 0 as u8;
+  carry[125] = 0 as u8;
+  carry[126] = 0 as u8;
+  carry[127] = 0 as u8;
+  let bit_len: u64 = ctx.total_len << (3 as u64);
+  carry[120] = ((bit_len >> (56 as u64)) & (255 as u64)) as u8;
+  carry[121] = ((bit_len >> (48 as u64)) & (255 as u64)) as u8;
+  carry[122] = ((bit_len >> (40 as u64)) & (255 as u64)) as u8;
+  carry[123] = ((bit_len >> (32 as u64)) & (255 as u64)) as u8;
+  carry[124] = ((bit_len >> (24 as u64)) & (255 as u64)) as u8;
+  carry[125] = ((bit_len >> (16 as u64)) & (255 as u64)) as u8;
+  carry[126] = ((bit_len >> (8 as u64)) & (255 as u64)) as u8;
+  carry[127] = (bit_len & (255 as u64)) as u8;
+
+  let _ = sha512_compress128(mut ref carry, mut ref h, ref k);
+
+  let out: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let j: i64 = 0;
+  while j < 8 {
+    let v: u64 = h[j];
+    out[j * 8] = ((v >> (56 as u64)) & (255 as u64)) as u8;
+    out[j * 8 + 1] = ((v >> (48 as u64)) & (255 as u64)) as u8;
+    out[j * 8 + 2] = ((v >> (40 as u64)) & (255 as u64)) as u8;
+    out[j * 8 + 3] = ((v >> (32 as u64)) & (255 as u64)) as u8;
+    out[j * 8 + 4] = ((v >> (24 as u64)) & (255 as u64)) as u8;
+    out[j * 8 + 5] = ((v >> (16 as u64)) & (255 as u64)) as u8;
+    out[j * 8 + 6] = ((v >> (8 as u64)) & (255 as u64)) as u8;
+    out[j * 8 + 7] = (v & (255 as u64)) as u8;
+    j = j + 1;
+  }
+  return out;
+}
+
+// Same discipline as SHA-256's own streaming self-test: the empty-
+// string KAT via init/finalize, "abc" via one update, then a 500-byte
+// message (over the one-shot 111-byte cap) fed across 3 uneven
+// update calls (200+200+100), cross-checked against an independent
+// Python hashlib.sha512 reference over the same 500-byte pattern
+// (repeating 0..255).
+fn sha512_streaming_self_test() -> i64 {
+  let ok: i64 = 1;
+
+
+  // KAT 1: empty string.
+  let ctx0: Sha512Ctx = sha512_init();
+  let out0: [u8; 64] = sha512_finalize(ref ctx0);
+  let exp0: [u8; 64] = [
+    0xcf as u8, 0x83 as u8, 0xe1 as u8, 0x35 as u8, 0x7e as u8, 0xef as u8, 0xb8 as u8, 0xbd as u8, 0xf1 as u8, 0x54 as u8, 0x28 as u8, 0x50 as u8, 0xd6 as u8, 0x6d as u8, 0x80 as u8, 0x07 as u8,
+    0xd6 as u8, 0x20 as u8, 0xe4 as u8, 0x05 as u8, 0x0b as u8, 0x57 as u8, 0x15 as u8, 0xdc as u8, 0x83 as u8, 0xf4 as u8, 0xa9 as u8, 0x21 as u8, 0xd3 as u8, 0x6c as u8, 0xe9 as u8, 0xce as u8,
+    0x47 as u8, 0xd0 as u8, 0xd1 as u8, 0x3c as u8, 0x5d as u8, 0x85 as u8, 0xf2 as u8, 0xb0 as u8, 0xff as u8, 0x83 as u8, 0x18 as u8, 0xd2 as u8, 0x87 as u8, 0x7e as u8, 0xec as u8, 0x2f as u8,
+    0x63 as u8, 0xb9 as u8, 0x31 as u8, 0xbd as u8, 0x47 as u8, 0x41 as u8, 0x7a as u8, 0x81 as u8, 0xa5 as u8, 0x38 as u8, 0x32 as u8, 0x7a as u8, 0xf9 as u8, 0x27 as u8, 0xda as u8, 0x3e as u8
+  ];
+  if sha512_digest_equal(ref out0, ref exp0) == 0 { ok = 0; }
+
+  // KAT 2: "abc".
+  let msg1: [u8; 256] = zero256_bytes();
+  msg1[0] = 0x61 as u8;
+  msg1[1] = 0x62 as u8;
+  msg1[2] = 0x63 as u8;
+  let ctx1: Sha512Ctx = sha512_init();
+  let ctx1b: Sha512Ctx = sha512_update(ref ctx1, mut ref msg1, 3);
+  let out1: [u8; 64] = sha512_finalize(ref ctx1b);
+  let exp1: [u8; 64] = [
+    0xdd as u8, 0xaf as u8, 0x35 as u8, 0xa1 as u8, 0x93 as u8, 0x61 as u8, 0x7a as u8, 0xba as u8, 0xcc as u8, 0x41 as u8, 0x73 as u8, 0x49 as u8, 0xae as u8, 0x20 as u8, 0x41 as u8, 0x31 as u8,
+    0x12 as u8, 0xe6 as u8, 0xfa as u8, 0x4e as u8, 0x89 as u8, 0xa9 as u8, 0x7e as u8, 0xa2 as u8, 0x0a as u8, 0x9e as u8, 0xee as u8, 0xe6 as u8, 0x4b as u8, 0x55 as u8, 0xd3 as u8, 0x9a as u8,
+    0x21 as u8, 0x92 as u8, 0x99 as u8, 0x2a as u8, 0x27 as u8, 0x4f as u8, 0xc1 as u8, 0xa8 as u8, 0x36 as u8, 0xba as u8, 0x3c as u8, 0x23 as u8, 0xa3 as u8, 0xfe as u8, 0xeb as u8, 0xbd as u8,
+    0x45 as u8, 0x4d as u8, 0x44 as u8, 0x23 as u8, 0x64 as u8, 0x3c as u8, 0xe8 as u8, 0x0e as u8, 0x2a as u8, 0x9a as u8, 0xc9 as u8, 0x4f as u8, 0xa5 as u8, 0x4c as u8, 0xa4 as u8, 0x9f as u8
+  ];
+  if sha512_digest_equal(ref out1, ref exp1) == 0 { ok = 0; }
+
+  // KAT 3: 500-byte message (over the one-shot 111-byte cap), fed
+  // across 3 uneven update calls (200+200+100), cross-checked
+  // against an independent Python hashlib.sha512 reference.
+  let big1: [u8; 256] = zero256_bytes();
+  let big2: [u8; 256] = zero256_bytes();
+  let big3: [u8; 256] = zero256_bytes();
+  let bi: i64 = 0;
+  while bi < 200 { big1[bi] = (bi & 255) as u8; bi = bi + 1; }
+  bi = 0;
+  while bi < 200 { big2[bi] = ((bi + 200) & 255) as u8; bi = bi + 1; }
+  bi = 0;
+  while bi < 100 { big3[bi] = ((bi + 400) & 255) as u8; bi = bi + 1; }
+  let ctx2: Sha512Ctx = sha512_init();
+  let ctx2b: Sha512Ctx = sha512_update(ref ctx2, mut ref big1, 200);
+  let ctx2c: Sha512Ctx = sha512_update(ref ctx2b, mut ref big2, 200);
+  let ctx2d: Sha512Ctx = sha512_update(ref ctx2c, mut ref big3, 100);
+  let out2: [u8; 64] = sha512_finalize(ref ctx2d);
+  let exp2: [u8; 64] = [
+    0xf8 as u8, 0xd1 as u8, 0xc9 as u8, 0x17 as u8, 0xda as u8, 0x2e as u8, 0x66 as u8, 0xbe as u8, 0x92 as u8, 0x02 as u8, 0x2d as u8, 0x6a as u8, 0x49 as u8, 0xec as u8, 0xee as u8, 0x0f as u8,
+    0x0d as u8, 0x89 as u8, 0x7c as u8, 0x6d as u8, 0x97 as u8, 0x92 as u8, 0x7a as u8, 0xdc as u8, 0x65 as u8, 0x4c as u8, 0x73 as u8, 0xd7 as u8, 0x35 as u8, 0xdc as u8, 0xa4 as u8, 0x20 as u8,
+    0xdd as u8, 0x80 as u8, 0x8b as u8, 0xe0 as u8, 0x67 as u8, 0x94 as u8, 0xf5 as u8, 0x14 as u8, 0xd5 as u8, 0xa8 as u8, 0x8f as u8, 0xa2 as u8, 0xe2 as u8, 0x4c as u8, 0x0c as u8, 0x0f as u8,
+    0x08 as u8, 0x17 as u8, 0xc9 as u8, 0x5a as u8, 0xd4 as u8, 0x48 as u8, 0x37 as u8, 0x1b as u8, 0x4c as u8, 0xd6 as u8, 0xa8 as u8, 0xcb as u8, 0x6a as u8, 0xa6 as u8, 0x56 as u8, 0xb3 as u8
+  ];
+  if sha512_digest_equal(ref out2, ref exp2) == 0 { ok = 0; }
 
   return ok;
 }
