@@ -20341,916 +20341,102 @@ fn sha512_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
   return 1;
 }
 
-fn ed25519_init() -> i64 {
-  let d_buf: mut ref i64 = ed25519_d_get();
-  let _ = buf_write_byte(d_buf, 0 as u32, 0xa3 as u32);
-  let _ = buf_write_byte(d_buf, 1 as u32, 0x78 as u32);
-  let _ = buf_write_byte(d_buf, 2 as u32, 0x59 as u32);
-  let _ = buf_write_byte(d_buf, 3 as u32, 0x13 as u32);
-  let _ = buf_write_byte(d_buf, 4 as u32, 0xca as u32);
-  let _ = buf_write_byte(d_buf, 5 as u32, 0x4d as u32);
-  let _ = buf_write_byte(d_buf, 6 as u32, 0xeb as u32);
-  let _ = buf_write_byte(d_buf, 7 as u32, 0x75 as u32);
-  let _ = buf_write_byte(d_buf, 8 as u32, 0xab as u32);
-  let _ = buf_write_byte(d_buf, 9 as u32, 0xd8 as u32);
-  let _ = buf_write_byte(d_buf, 10 as u32, 0x41 as u32);
-  let _ = buf_write_byte(d_buf, 11 as u32, 0x41 as u32);
-  let _ = buf_write_byte(d_buf, 12 as u32, 0x4d as u32);
-  let _ = buf_write_byte(d_buf, 13 as u32, 0x0a as u32);
-  let _ = buf_write_byte(d_buf, 14 as u32, 0x70 as u32);
-  let _ = buf_write_byte(d_buf, 15 as u32, 0x00 as u32);
-  let _ = buf_write_byte(d_buf, 16 as u32, 0x98 as u32);
-  let _ = buf_write_byte(d_buf, 17 as u32, 0xe8 as u32);
-  let _ = buf_write_byte(d_buf, 18 as u32, 0x79 as u32);
-  let _ = buf_write_byte(d_buf, 19 as u32, 0x77 as u32);
-  let _ = buf_write_byte(d_buf, 20 as u32, 0x79 as u32);
-  let _ = buf_write_byte(d_buf, 21 as u32, 0x40 as u32);
-  let _ = buf_write_byte(d_buf, 22 as u32, 0xc7 as u32);
-  let _ = buf_write_byte(d_buf, 23 as u32, 0x8c as u32);
-  let _ = buf_write_byte(d_buf, 24 as u32, 0x73 as u32);
-  let _ = buf_write_byte(d_buf, 25 as u32, 0xfe as u32);
-  let _ = buf_write_byte(d_buf, 26 as u32, 0x6f as u32);
-  let _ = buf_write_byte(d_buf, 27 as u32, 0x2b as u32);
-  let _ = buf_write_byte(d_buf, 28 as u32, 0xee as u32);
-  let _ = buf_write_byte(d_buf, 29 as u32, 0x6c as u32);
-  let _ = buf_write_byte(d_buf, 30 as u32, 0x03 as u32);
-  let _ = buf_write_byte(d_buf, 31 as u32, 0x52 as u32);
-  let d2_buf: mut ref i64 = ed25519_2d_get();
-  let _ = buf_write_byte(d2_buf, 0 as u32, 0x59 as u32);
-  let _ = buf_write_byte(d2_buf, 1 as u32, 0xf1 as u32);
-  let _ = buf_write_byte(d2_buf, 2 as u32, 0xb2 as u32);
-  let _ = buf_write_byte(d2_buf, 3 as u32, 0x26 as u32);
-  let _ = buf_write_byte(d2_buf, 4 as u32, 0x94 as u32);
-  let _ = buf_write_byte(d2_buf, 5 as u32, 0x9b as u32);
-  let _ = buf_write_byte(d2_buf, 6 as u32, 0xd6 as u32);
-  let _ = buf_write_byte(d2_buf, 7 as u32, 0xeb as u32);
-  let _ = buf_write_byte(d2_buf, 8 as u32, 0x56 as u32);
-  let _ = buf_write_byte(d2_buf, 9 as u32, 0xb1 as u32);
-  let _ = buf_write_byte(d2_buf, 10 as u32, 0x83 as u32);
-  let _ = buf_write_byte(d2_buf, 11 as u32, 0x82 as u32);
-  let _ = buf_write_byte(d2_buf, 12 as u32, 0x9a as u32);
-  let _ = buf_write_byte(d2_buf, 13 as u32, 0x14 as u32);
-  let _ = buf_write_byte(d2_buf, 14 as u32, 0xe0 as u32);
-  let _ = buf_write_byte(d2_buf, 15 as u32, 0x00 as u32);
-  let _ = buf_write_byte(d2_buf, 16 as u32, 0x30 as u32);
-  let _ = buf_write_byte(d2_buf, 17 as u32, 0xd1 as u32);
-  let _ = buf_write_byte(d2_buf, 18 as u32, 0xf3 as u32);
-  let _ = buf_write_byte(d2_buf, 19 as u32, 0xee as u32);
-  let _ = buf_write_byte(d2_buf, 20 as u32, 0xf2 as u32);
-  let _ = buf_write_byte(d2_buf, 21 as u32, 0x80 as u32);
-  let _ = buf_write_byte(d2_buf, 22 as u32, 0x8e as u32);
-  let _ = buf_write_byte(d2_buf, 23 as u32, 0x19 as u32);
-  let _ = buf_write_byte(d2_buf, 24 as u32, 0xe7 as u32);
-  let _ = buf_write_byte(d2_buf, 25 as u32, 0xfc as u32);
-  let _ = buf_write_byte(d2_buf, 26 as u32, 0xdf as u32);
-  let _ = buf_write_byte(d2_buf, 27 as u32, 0x56 as u32);
-  let _ = buf_write_byte(d2_buf, 28 as u32, 0xdc as u32);
-  let _ = buf_write_byte(d2_buf, 29 as u32, 0xd9 as u32);
-  let _ = buf_write_byte(d2_buf, 30 as u32, 0x06 as u32);
-  let _ = buf_write_byte(d2_buf, 31 as u32, 0x24 as u32);
-  let sm1_buf: mut ref i64 = ed25519_sqrt_m1_get();
-  let _ = buf_write_byte(sm1_buf, 0 as u32, 0xb0 as u32);
-  let _ = buf_write_byte(sm1_buf, 1 as u32, 0xa0 as u32);
-  let _ = buf_write_byte(sm1_buf, 2 as u32, 0x0e as u32);
-  let _ = buf_write_byte(sm1_buf, 3 as u32, 0x4a as u32);
-  let _ = buf_write_byte(sm1_buf, 4 as u32, 0x27 as u32);
-  let _ = buf_write_byte(sm1_buf, 5 as u32, 0x1b as u32);
-  let _ = buf_write_byte(sm1_buf, 6 as u32, 0xee as u32);
-  let _ = buf_write_byte(sm1_buf, 7 as u32, 0xc4 as u32);
-  let _ = buf_write_byte(sm1_buf, 8 as u32, 0x78 as u32);
-  let _ = buf_write_byte(sm1_buf, 9 as u32, 0xe4 as u32);
-  let _ = buf_write_byte(sm1_buf, 10 as u32, 0x2f as u32);
-  let _ = buf_write_byte(sm1_buf, 11 as u32, 0xad as u32);
-  let _ = buf_write_byte(sm1_buf, 12 as u32, 0x06 as u32);
-  let _ = buf_write_byte(sm1_buf, 13 as u32, 0x18 as u32);
-  let _ = buf_write_byte(sm1_buf, 14 as u32, 0x43 as u32);
-  let _ = buf_write_byte(sm1_buf, 15 as u32, 0x2f as u32);
-  let _ = buf_write_byte(sm1_buf, 16 as u32, 0xa7 as u32);
-  let _ = buf_write_byte(sm1_buf, 17 as u32, 0xd7 as u32);
-  let _ = buf_write_byte(sm1_buf, 18 as u32, 0xfb as u32);
-  let _ = buf_write_byte(sm1_buf, 19 as u32, 0x3d as u32);
-  let _ = buf_write_byte(sm1_buf, 20 as u32, 0x99 as u32);
-  let _ = buf_write_byte(sm1_buf, 21 as u32, 0x00 as u32);
-  let _ = buf_write_byte(sm1_buf, 22 as u32, 0x4d as u32);
-  let _ = buf_write_byte(sm1_buf, 23 as u32, 0x2b as u32);
-  let _ = buf_write_byte(sm1_buf, 24 as u32, 0x0b as u32);
-  let _ = buf_write_byte(sm1_buf, 25 as u32, 0xdf as u32);
-  let _ = buf_write_byte(sm1_buf, 26 as u32, 0xc1 as u32);
-  let _ = buf_write_byte(sm1_buf, 27 as u32, 0x4f as u32);
-  let _ = buf_write_byte(sm1_buf, 28 as u32, 0x80 as u32);
-  let _ = buf_write_byte(sm1_buf, 29 as u32, 0x24 as u32);
-  let _ = buf_write_byte(sm1_buf, 30 as u32, 0x83 as u32);
-  let _ = buf_write_byte(sm1_buf, 31 as u32, 0x2b as u32);
-  let l_buf: mut ref i64 = ed25519_l_get();
-  let _ = buf_write_byte(l_buf, 0 as u32, 0xed as u32);
-  let _ = buf_write_byte(l_buf, 1 as u32, 0xd3 as u32);
-  let _ = buf_write_byte(l_buf, 2 as u32, 0xf5 as u32);
-  let _ = buf_write_byte(l_buf, 3 as u32, 0x5c as u32);
-  let _ = buf_write_byte(l_buf, 4 as u32, 0x1a as u32);
-  let _ = buf_write_byte(l_buf, 5 as u32, 0x63 as u32);
-  let _ = buf_write_byte(l_buf, 6 as u32, 0x12 as u32);
-  let _ = buf_write_byte(l_buf, 7 as u32, 0x58 as u32);
-  let _ = buf_write_byte(l_buf, 8 as u32, 0xd6 as u32);
-  let _ = buf_write_byte(l_buf, 9 as u32, 0x9c as u32);
-  let _ = buf_write_byte(l_buf, 10 as u32, 0xf7 as u32);
-  let _ = buf_write_byte(l_buf, 11 as u32, 0xa2 as u32);
-  let _ = buf_write_byte(l_buf, 12 as u32, 0xde as u32);
-  let _ = buf_write_byte(l_buf, 13 as u32, 0xf9 as u32);
-  let _ = buf_write_byte(l_buf, 14 as u32, 0xde as u32);
-  let _ = buf_write_byte(l_buf, 15 as u32, 0x14 as u32);
-  let _ = buf_write_byte(l_buf, 16 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 17 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 18 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 19 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 20 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 21 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 22 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 23 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 24 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 25 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 26 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 27 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 28 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 29 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 30 as u32, 0x00 as u32);
-  let _ = buf_write_byte(l_buf, 31 as u32, 0x10 as u32);
-  let gx_buf: mut ref i64 = ed25519_gx_get();
-  let _ = buf_write_byte(gx_buf, 0 as u32, 0x1a as u32);
-  let _ = buf_write_byte(gx_buf, 1 as u32, 0xd5 as u32);
-  let _ = buf_write_byte(gx_buf, 2 as u32, 0x25 as u32);
-  let _ = buf_write_byte(gx_buf, 3 as u32, 0x8f as u32);
-  let _ = buf_write_byte(gx_buf, 4 as u32, 0x60 as u32);
-  let _ = buf_write_byte(gx_buf, 5 as u32, 0x2d as u32);
-  let _ = buf_write_byte(gx_buf, 6 as u32, 0x56 as u32);
-  let _ = buf_write_byte(gx_buf, 7 as u32, 0xc9 as u32);
-  let _ = buf_write_byte(gx_buf, 8 as u32, 0xb2 as u32);
-  let _ = buf_write_byte(gx_buf, 9 as u32, 0xa7 as u32);
-  let _ = buf_write_byte(gx_buf, 10 as u32, 0x25 as u32);
-  let _ = buf_write_byte(gx_buf, 11 as u32, 0x95 as u32);
-  let _ = buf_write_byte(gx_buf, 12 as u32, 0x60 as u32);
-  let _ = buf_write_byte(gx_buf, 13 as u32, 0xc7 as u32);
-  let _ = buf_write_byte(gx_buf, 14 as u32, 0x2c as u32);
-  let _ = buf_write_byte(gx_buf, 15 as u32, 0x69 as u32);
-  let _ = buf_write_byte(gx_buf, 16 as u32, 0x5c as u32);
-  let _ = buf_write_byte(gx_buf, 17 as u32, 0xdc as u32);
-  let _ = buf_write_byte(gx_buf, 18 as u32, 0xd6 as u32);
-  let _ = buf_write_byte(gx_buf, 19 as u32, 0xfd as u32);
-  let _ = buf_write_byte(gx_buf, 20 as u32, 0x31 as u32);
-  let _ = buf_write_byte(gx_buf, 21 as u32, 0xe2 as u32);
-  let _ = buf_write_byte(gx_buf, 22 as u32, 0xa4 as u32);
-  let _ = buf_write_byte(gx_buf, 23 as u32, 0xc0 as u32);
-  let _ = buf_write_byte(gx_buf, 24 as u32, 0xfe as u32);
-  let _ = buf_write_byte(gx_buf, 25 as u32, 0x53 as u32);
-  let _ = buf_write_byte(gx_buf, 26 as u32, 0x6e as u32);
-  let _ = buf_write_byte(gx_buf, 27 as u32, 0xcd as u32);
-  let _ = buf_write_byte(gx_buf, 28 as u32, 0xd3 as u32);
-  let _ = buf_write_byte(gx_buf, 29 as u32, 0x36 as u32);
-  let _ = buf_write_byte(gx_buf, 30 as u32, 0x69 as u32);
-  let _ = buf_write_byte(gx_buf, 31 as u32, 0x21 as u32);
-  let gy_buf: mut ref i64 = ed25519_gy_get();
-  let _ = buf_write_byte(gy_buf, 0 as u32, 0x58 as u32);
-  let _ = buf_write_byte(gy_buf, 1 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 2 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 3 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 4 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 5 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 6 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 7 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 8 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 9 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 10 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 11 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 12 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 13 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 14 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 15 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 16 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 17 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 18 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 19 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 20 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 21 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 22 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 23 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 24 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 25 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 26 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 27 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 28 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 29 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 30 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gy_buf, 31 as u32, 0x66 as u32);
-  let gz_buf: mut ref i64 = ed25519_gz_get();
-  let _ = buf_write_byte(gz_buf, 0 as u32, 0x01 as u32);
-  let _ = buf_write_byte(gz_buf, 1 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 2 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 3 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 4 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 5 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 6 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 7 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 8 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 9 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 10 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 11 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 12 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 13 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 14 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 15 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 16 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 17 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 18 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 19 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 20 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 21 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 22 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 23 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 24 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 25 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 26 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 27 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 28 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 29 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 30 as u32, 0x00 as u32);
-  let _ = buf_write_byte(gz_buf, 31 as u32, 0x00 as u32);
-  let gt_buf: mut ref i64 = ed25519_gt_get();
-  let _ = buf_write_byte(gt_buf, 0 as u32, 0xa3 as u32);
-  let _ = buf_write_byte(gt_buf, 1 as u32, 0xdd as u32);
-  let _ = buf_write_byte(gt_buf, 2 as u32, 0xb7 as u32);
-  let _ = buf_write_byte(gt_buf, 3 as u32, 0xa5 as u32);
-  let _ = buf_write_byte(gt_buf, 4 as u32, 0xb3 as u32);
-  let _ = buf_write_byte(gt_buf, 5 as u32, 0x8a as u32);
-  let _ = buf_write_byte(gt_buf, 6 as u32, 0xde as u32);
-  let _ = buf_write_byte(gt_buf, 7 as u32, 0x6d as u32);
-  let _ = buf_write_byte(gt_buf, 8 as u32, 0xf5 as u32);
-  let _ = buf_write_byte(gt_buf, 9 as u32, 0x52 as u32);
-  let _ = buf_write_byte(gt_buf, 10 as u32, 0x51 as u32);
-  let _ = buf_write_byte(gt_buf, 11 as u32, 0x77 as u32);
-  let _ = buf_write_byte(gt_buf, 12 as u32, 0x80 as u32);
-  let _ = buf_write_byte(gt_buf, 13 as u32, 0x9f as u32);
-  let _ = buf_write_byte(gt_buf, 14 as u32, 0xf0 as u32);
-  let _ = buf_write_byte(gt_buf, 15 as u32, 0x20 as u32);
-  let _ = buf_write_byte(gt_buf, 16 as u32, 0x7d as u32);
-  let _ = buf_write_byte(gt_buf, 17 as u32, 0xe3 as u32);
-  let _ = buf_write_byte(gt_buf, 18 as u32, 0xab as u32);
-  let _ = buf_write_byte(gt_buf, 19 as u32, 0x64 as u32);
-  let _ = buf_write_byte(gt_buf, 20 as u32, 0x8e as u32);
-  let _ = buf_write_byte(gt_buf, 21 as u32, 0x4e as u32);
-  let _ = buf_write_byte(gt_buf, 22 as u32, 0xea as u32);
-  let _ = buf_write_byte(gt_buf, 23 as u32, 0x66 as u32);
-  let _ = buf_write_byte(gt_buf, 24 as u32, 0x65 as u32);
-  let _ = buf_write_byte(gt_buf, 25 as u32, 0x76 as u32);
-  let _ = buf_write_byte(gt_buf, 26 as u32, 0x8b as u32);
-  let _ = buf_write_byte(gt_buf, 27 as u32, 0xd7 as u32);
-  let _ = buf_write_byte(gt_buf, 28 as u32, 0x0f as u32);
-  let _ = buf_write_byte(gt_buf, 29 as u32, 0x5f as u32);
-  let _ = buf_write_byte(gt_buf, 30 as u32, 0x87 as u32);
-  let _ = buf_write_byte(gt_buf, 31 as u32, 0x67 as u32);
-  return 0;
-}
-
-
-// Round 67: Ed25519 (RFC 8032) -- EdDSA signatures over Curve25519 in
-// twisted-Edwards form, the piece PKI's own raw-public-key-trust
-// increment needs (X25519 is pure Diffie-Hellman, not a signature
-// scheme -- no way around needing this too). Reuses X25519's own
-// field25519_add/_sub/_mul/_sqr/_invert directly (same p=2^255-19,
-// same 8-limb representation) -- the ONLY new field-level piece is
-// the modular square root point decompression needs.
+// Round 100 -- Ed25519 migrated to the shared `curve25519` kosh
+// package (see project memory project_dhruva_round100_pi1_curve25519_
+// migration and project_dhruva_generic_crypto_packages_x509_scope).
+// Deleted this file's own ~700-line hand-rolled point-arithmetic
+// implementation (ed25519_get_bit_lsb_first/msb_first, scalar_mod_l_
+// raw, scalar_add_mod_l, scalar_mul_mod_l, point_add, point_mul,
+// point_equal, sqrt_candidate, point_compress, recover_x,
+// point_decompress, secret_expand -- all internal-only, zero external
+// callers) -- see kernel_main.vani's own git history if that
+// algorithm-level detail is ever needed again, it isn't lost, just
+// not duplicated here anymore. `ed25519_init` (the persistent d/2d/
+// sqrt_m1/L/G constant setup) is gone too -- the package's own
+// constants are compile-time literals, no init step at all.
 //
-// Points use extended twisted-Edwards coordinates (X,Y,Z,T; x=X/Z,
-// y=Y/Z, T=XY/Z) and the standard "add-2008-hwcd-3" complete addition
-// formula (Hisil/Wong/Carter/Dawson 2008) -- UNIFIED for both point
-// addition and point doubling (P+P), so the scalar-multiplication
-// ladder below never needs a separate doubling formula or any
-// same-point special-casing. Verified safe for IN-PLACE use (output
-// buffers aliased with an input point, e.g. accumulating Q += B or
-// doubling B += B) via a dedicated host-side Python simulation using
-// real mutable buffers (not immutable tuples) before any of this was
-// ported -- the formula's own read-everything-before-writing-anything
-// structure (A/B/C/D computed from P/Q first, X3/Y3/Z3/T3 written
-// only after) makes this safe by construction, confirmed empirically
-// across 50 random scalar-multiplication trials.
+// Kept as `_heap`-suffixed adapters (bridging this file's heap-
+// pointer `mut ref i64` callers to the package's fixed-array API) --
+// NOT reusing the original names directly, because `use`'s flat
+// namespace (the BUG-234 workaround, same as round 99's SHA
+// migration) would collide with the package's own identically-named
+// `ed25519_secret_to_public`/`sign`/`verify`. Every external caller
+// (PKI's own pki_verify_raw, 3 TLS server-identity blocks) updated to
+// the new names -- see those call sites' own diffs. `ed25519_self_
+// test` itself keeps its ORIGINAL name unchanged -- `core.vani` (the
+// primitives-only variant this file `use`s, see below) deliberately
+// excludes its own same-named self-test, so there's no collision.
 //
-// Scalar arithmetic mod L (the group order, 2^252+27742317777372353535851937790883648493)
-// is NOT the same fold trick field25519_reduce16 uses for p=2^255-19
-// -- L's own "non-power-of-2" remainder isn't small the way p's `19`
-// is, so folding would need multiplying by a ~124-bit number, not a
-// tiny constant. Uses genuine bit-by-bit binary long division instead
-// (shift the running remainder left 1 bit, OR in the next input bit
-// MSB-first, conditionally subtract L) -- simpler to get right than a
-// fold for an awkward modulus, and fast enough for a signing/
-// verification operation that happens rarely, not in a hot loop.
-//
-// Verification methodology, same discipline as X25519/SHA-512: (1) a
-// from-scratch Python bigint reference of the full RFC 8032 algorithm
-// (key generation, sign, verify, point compression/decompression via
-// modular sqrt), checked against the real `cryptography` library
-// across 10 random trials -- own-derived public keys match, FULL
-// SIGNATURES match byte-for-byte (confirming the deterministic nonce
-// derivation matches exactly, not just "produces *a* valid
-// signature"), self-verification passes, tampered signatures/messages
-// are correctly rejected; (2) a SECOND Python simulation of the exact
-// limb-level algorithm ported to vani (the same field25519_* calls,
-// the same bit-by-bit scalar reduction), cross-checked against the
-// bigint reference across 8 more full sign/verify/tamper trials,
-// PLUS a dedicated 50-trial check of the in-place-aliasing pattern
-// described above using real mutable buffers; (3) the concrete
-// values embedded in kernel_main.vani's own self-test and the
-// host-harness twin were generated by that same verified run.
+// The package's own `ed25519_sign`/`verify` cap `msg` at 512 bytes
+// (a practical stack-buffer size; hashing itself has no length cap,
+// it streams -- see curve25519's own `ed25519_hash_2block_msg`).
+// Comfortably covers every real caller here (TLS 1.3's own
+// CertificateVerify signed-content is a fixed 130 bytes) with
+// generous headroom, well under this file's own OLD 4096-byte
+// theoretical ceiling that no real caller ever approached.
+use "../vendor/curve25519/src/core.vani";
 
-// LSB-first bit `bit_index` of a byte buffer, reusing field25519's
-// own helper directly (identical logic, not curve-specific despite
-// the name -- kept as one shared implementation rather than a
-// pointless duplicate).
-fn ed25519_get_bit_lsb_first(buf: mut ref i64, bit_index: i64) -> u32 {
-  return field25519_get_bit(buf, bit_index);
-}
-
-// MSB-first bit `bit_index_from_msb` of a byte buffer whose total
-// length is `total_bits` bits -- scalar_mod_l's own reduction needs
-// to process a hash output from its most-significant bit down.
-fn ed25519_get_bit_msb_first(buf: mut ref i64, total_bits: i64, bit_index_from_msb: i64) -> u32 {
-  let bit_from_lsb: i64 = total_bits - 1 - bit_index_from_msb;
-  return field25519_get_bit(buf, bit_from_lsb);
-}
-
-// Reduces an arbitrary-length little-endian byte buffer `input`
-// (`input_len_bytes` long) modulo L, writing the canonical 32-byte
-// result to `out`. See this section's own header comment for why
-// this is bit-by-bit long division, not a fold.
-fn ed25519_scalar_mod_l_raw(input: mut ref i64, input_len_bytes: i64, out: mut ref i64) -> i64 {
-  let remainder: mut ref i64 = ed25519_scalar_remainder_get();
-  let l_buf: mut ref i64 = ed25519_l_get();
-  let z: i64 = 0;
-  while z < 8 {
-    let _ = buf_write_u32(remainder, (z * 4) as u32, 0 as u32);
-    z = z + 1;
-  }
-  let total_bits: i64 = input_len_bytes * 8;
-  let i: i64 = 0;
-  while i < total_bits {
-    let _ = bignum_shl1_raw(remainder, remainder, 8);
-    let bit: u32 = ed25519_get_bit_msb_first(input, total_bits, i);
-    if bit == (1 as u32) {
-      let low: u32 = buf_read_u32(remainder, 0 as u32);
-      let _ = buf_write_u32(remainder, 0 as u32, low | (1 as u32));
-    }
-    if bignum_cmp_raw(remainder, l_buf, 8) >= 0 {
-      let _ = bignum_sub_raw(remainder, l_buf, remainder, 8);
-    }
-    i = i + 1;
-  }
-  let o: i64 = 0;
-  while o < 8 {
-    let ov: u32 = buf_read_u32(remainder, (o * 4) as u32);
-    let _ = buf_write_u32(out, (o * 4) as u32, ov);
-    o = o + 1;
-  }
-  return 0;
-}
-
-// (x + y) mod L, for x, y already < L.
-fn ed25519_scalar_add_mod_l(x: mut ref i64, y: mut ref i64, out: mut ref i64) -> i64 {
-  let l_buf: mut ref i64 = ed25519_l_get();
-  let carry: u32 = bignum_add_raw(x, y, out, 8);
-  let cmp: i64 = bignum_cmp_raw(out, l_buf, 8);
-  if (carry == (1 as u32)) || (cmp >= 0) {
-    let _ = bignum_sub_raw(out, l_buf, out, 8);
-  }
-  return 0;
-}
-
-// (k * a) mod L -- k, a need not themselves be < L (Ed25519's own
-// clamped secret scalar `a` can be up to just under 2^255, genuinely
-// larger than L); the wide product is computed first, THEN reduced.
-fn ed25519_scalar_mul_mod_l(k: mut ref i64, a: mut ref i64, out: mut ref i64) -> i64 {
-  let product: mut ref i64 = ed25519_scalar_product_get();
-  let _ = bignum_mul_raw(k, a, product, 8);
-  let _ = ed25519_scalar_mod_l_raw(product, 64, out);
-  return 0;
-}
-
-// Unified twisted-Edwards point addition (also point doubling, when
-// P and Q are the same point) -- see this section's own header
-// comment for the formula's provenance and its verified in-place-
-// aliasing safety (out buffers may equal P's or Q's own buffers).
-fn ed25519_point_add(px: mut ref i64, py: mut ref i64, pz: mut ref i64, pt: mut ref i64,
-                      qx: mut ref i64, qy: mut ref i64, qz: mut ref i64, qt: mut ref i64,
-                      outx: mut ref i64, outy: mut ref i64, outz: mut ref i64, outt: mut ref i64) -> i64 {
-  let t1: mut ref i64 = ed25519_tmp1_get();
-  let t2: mut ref i64 = ed25519_tmp2_get();
-  let t3: mut ref i64 = ed25519_tmp3_get();
-  let t4: mut ref i64 = ed25519_tmp4_get();
-  let t5: mut ref i64 = ed25519_tmp5_get();
-  let t6: mut ref i64 = ed25519_tmp6_get();
-  let t7: mut ref i64 = ed25519_tmp7_get();
-  let t8: mut ref i64 = ed25519_tmp8_get();
-
-  let _ = field25519_sub(py, px, t1);
-  let _ = field25519_sub(qy, qx, t2);
-  let _ = field25519_mul(t1, t2, t1); // t1 = A = (Py-Px)*(Qy-Qx)
-
-  let _ = field25519_add(py, px, t2);
-  let _ = field25519_add(qy, qx, t3);
-  let _ = field25519_mul(t2, t3, t2); // t2 = B = (Py+Px)*(Qy+Qx)
-
-  let _ = field25519_mul(pt, ed25519_2d_get(), t3);
-  let _ = field25519_mul(t3, qt, t3); // t3 = C = Pt*2d*Qt
-
-  let _ = field25519_add(pz, pz, t4);
-  let _ = field25519_mul(t4, qz, t4); // t4 = D = 2*Pz*Qz
-
-  let _ = field25519_sub(t2, t1, t5); // t5 = E = B-A
-  let _ = field25519_sub(t4, t3, t6); // t6 = F = D-C
-  let _ = field25519_add(t4, t3, t7); // t7 = G = D+C
-  let _ = field25519_add(t2, t1, t8); // t8 = H = B+A
-
-  let _ = field25519_mul(t5, t6, outx); // X3 = E*F
-  let _ = field25519_mul(t7, t8, outy); // Y3 = G*H
-  let _ = field25519_mul(t5, t8, outt); // T3 = E*H
-  let _ = field25519_mul(t6, t7, outz); // Z3 = F*G
-  return 0;
-}
-
-// [scalar]P, scalar a 32-byte little-endian integer (any value, not
-// required to be < L -- e.g. Ed25519's own clamped secret scalar
-// isn't). Result left in the persistent ed25519_qx/qy/qz/qt
-// accumulator (caller reads those directly, same "named persistent
-// output buffer" convention as X25519's own scratch design) --
-// P itself (px/py/pz/pt) is untouched, copied into the persistent
-// bx/by/bz/bt "doubling base" first.
-fn ed25519_point_mul(scalar: mut ref i64, px: mut ref i64, py: mut ref i64, pz: mut ref i64, pt: mut ref i64) -> i64 {
-  let qx: mut ref i64 = ed25519_qx_get();
-  let qy: mut ref i64 = ed25519_qy_get();
-  let qz: mut ref i64 = ed25519_qz_get();
-  let qt: mut ref i64 = ed25519_qt_get();
-  let bx: mut ref i64 = ed25519_bx_get();
-  let by: mut ref i64 = ed25519_by_get();
-  let bz: mut ref i64 = ed25519_bz_get();
-  let bt: mut ref i64 = ed25519_bt_get();
-
-  // Identity element: (0, 1, 1, 0).
-  let z: i64 = 0;
-  while z < 32 {
-    let _ = buf_write_byte(qx, z as u32, 0 as u32);
-    let _ = buf_write_byte(qy, z as u32, 0 as u32);
-    let _ = buf_write_byte(qz, z as u32, 0 as u32);
-    let _ = buf_write_byte(qt, z as u32, 0 as u32);
-    let _ = buf_write_byte(bx, z as u32, buf_read_byte(px, z as u32));
-    let _ = buf_write_byte(by, z as u32, buf_read_byte(py, z as u32));
-    let _ = buf_write_byte(bz, z as u32, buf_read_byte(pz, z as u32));
-    let _ = buf_write_byte(bt, z as u32, buf_read_byte(pt, z as u32));
-    z = z + 1;
-  }
-  let _ = buf_write_byte(qy, 0 as u32, 1 as u32);
-  let _ = buf_write_byte(qz, 0 as u32, 1 as u32);
-
-  let i: i64 = 0;
-  while i < 256 {
-    let bit: u32 = ed25519_get_bit_lsb_first(scalar, i);
-    if bit == (1 as u32) {
-      let _ = ed25519_point_add(qx, qy, qz, qt, bx, by, bz, bt, qx, qy, qz, qt);
-    }
-    let _ = ed25519_point_add(bx, by, bz, bt, bx, by, bz, bt, bx, by, bz, bt);
-    i = i + 1;
-  }
-  return 0;
-}
-
-// True iff P == Q as projective points ((X1*Z2 == X2*Z1) and
-// (Y1*Z2 == Y2*Z1) mod p) -- comparing raw coordinates directly would
-// be wrong since the same affine point has infinitely many valid
-// (X,Y,Z,T) representations.
-fn ed25519_point_equal(px: mut ref i64, py: mut ref i64, pz: mut ref i64, _pt: mut ref i64,
-                        qx: mut ref i64, qy: mut ref i64, qz: mut ref i64, _qt: mut ref i64) -> i64 {
-  let lhs: mut ref i64 = ed25519_tmp1_get();
-  let rhs: mut ref i64 = ed25519_tmp2_get();
-  let _ = field25519_mul(px, qz, lhs);
-  let _ = field25519_mul(qx, pz, rhs);
-  let mismatch1: i64 = if bignum_cmp_raw(lhs, rhs, 8) != 0 { 1 } else { 0 };
-  let _ = field25519_mul(py, qz, lhs);
-  let _ = field25519_mul(qy, pz, rhs);
-  let mismatch2: i64 = if bignum_cmp_raw(lhs, rhs, 8) != 0 { 1 } else { 0 };
-  if (mismatch1 == 1) || (mismatch2 == 1) {
-    return 0;
-  }
-  return 1;
-}
-
-// x = (x2)^((p+3)/8) mod p -- the standard Ed25519/RFC 8032 candidate
-// square root (valid because p ≡ 5 mod 8). Plain binary square-and-
-// multiply over the fixed exponent, same style as field25519_invert's
-// own fixed-exponent (p-2) computation -- (p+3)/8's exact bit pattern
-// is derived from p itself at call time (p_bytes is already a
-// persistent constant), not a separately hardcoded literal, so there
-// is no separate exponent constant to keep in sync with p.
-fn ed25519_sqrt_candidate(x2: mut ref i64, out: mut ref i64) -> i64 {
-  // exponent = (p+3)/8. p ends in ...fd (0xed+3=0xf0? no -- computed
-  // once via bignum ops below rather than asserted, to avoid a second
-  // hand-derived constant): exponent_bytes = (p_bytes + 3) / 8.
-  // Division by 8 is a 3-bit right shift; since (p+3) is exactly
-  // divisible by 8 for this specific p (p = 2^255-19, p mod 8 == 5,
-  // so p+3 mod 8 == 0), this is exact, not a truncation.
-  let p_bytes: mut ref i64 = x25519_p_bytes_get();
-  let p_plus_3: mut ref i64 = ed25519_tmp1_get();
-  let three: mut ref i64 = ed25519_tmp2_get();
-  let zi: i64 = 0;
-  while zi < 32 {
-    let _ = buf_write_byte(three, zi as u32, 0 as u32);
-    zi = zi + 1;
-  }
-  let _ = buf_write_byte(three, 0 as u32, 3 as u32);
-  let _ = bignum_add_raw(p_bytes, three, p_plus_3, 8);
-  // >> 3 (divide by 8): three single-bit right shifts, MSB-limb-first
-  // ripple (mirrors bignum_shl1_raw's own ripple, just rightward).
-  let exponent: mut ref i64 = ed25519_tmp3_get();
-  let si: i64 = 0;
-  while si < 3 {
-    let carry: u32 = 0 as u32;
-    let li: i64 = 7;
-    while li >= 0 {
-      let v: u32 = buf_read_u32(p_plus_3, (li * 4) as u32);
-      let new_carry: u32 = v & (1 as u32);
-      let shifted: u32 = (v >> (1 as u32)) | (carry << (31 as u32));
-      let _ = buf_write_u32(exponent, (li * 4) as u32, shifted);
-      carry = new_carry;
-      li = li - 1;
-    }
-    let ci: i64 = 0;
-    while ci < 8 {
-      let _ = buf_write_u32(p_plus_3, (ci * 4) as u32, buf_read_u32(exponent, (ci * 4) as u32));
-      ci = ci + 1;
-    }
-    si = si + 1;
-  }
-  // exponent now holds (p+3)/8, in p_plus_3/exponent (same buffer,
-  // copied back each pass). Binary square-and-multiply, MSB first
-  // this time (order doesn't matter for correctness, matches this
-  // function's own natural top-down derivation above).
-  let result: mut ref i64 = ed25519_tmp4_get();
-  let base: mut ref i64 = ed25519_tmp5_get();
-  let zj: i64 = 0;
-  while zj < 32 {
-    let _ = buf_write_byte(result, zj as u32, 0 as u32);
-    let _ = buf_write_byte(base, zj as u32, buf_read_byte(x2, zj as u32));
-    zj = zj + 1;
-  }
-  let _ = buf_write_byte(result, 0 as u32, 1 as u32);
-  let bit_i: i64 = 0;
-  while bit_i < 255 {
-    if ed25519_get_bit_lsb_first(exponent, bit_i) == (1 as u32) {
-      let _ = field25519_mul(result, base, result);
-    }
-    let _ = field25519_sqr(base, base);
-    bit_i = bit_i + 1;
-  }
-  let ok: i64 = 0;
-  while ok < 32 {
-    let _ = buf_write_byte(out, ok as u32, buf_read_byte(result, ok as u32));
-    ok = ok + 1;
-  }
-  return 0;
-}
-
-fn ed25519_point_compress(px: mut ref i64, py: mut ref i64, pz: mut ref i64, _pt: mut ref i64, out: mut ref i64) -> i64 {
-  let zinv: mut ref i64 = ed25519_tmp1_get();
-  let x: mut ref i64 = ed25519_tmp2_get();
-  let y: mut ref i64 = ed25519_tmp3_get();
-  let _ = field25519_invert(pz, zinv);
-  let _ = field25519_mul(px, zinv, x);
-  let _ = field25519_mul(py, zinv, y);
+fn ed25519_secret_to_public_heap(secret: mut ref i64, out_pub: mut ref i64) -> i64 {
+  let secret_arr: [u8; 32] = ed25519_zero32_bytes();
   let i: i64 = 0;
   while i < 32 {
-    let _ = buf_write_byte(out, i as u32, buf_read_byte(y, i as u32));
+    secret_arr[i] = buf_read_byte(secret, i as u32) as u8;
     i = i + 1;
   }
-  let xbit: u32 = buf_read_byte(x, 0 as u32) & (1 as u32);
-  let top: u32 = buf_read_byte(out, 31 as u32) & (127 as u32);
-  let newtop: u32 = top | (xbit << (7 as u32));
-  let _ = buf_write_byte(out, 31 as u32, newtop);
-  return 0;
-}
-
-// Recovers x from y and a target parity bit `sign`, per RFC 8032
-// section 5.1.3. Returns 1 and writes out_x on success, 0 (out_x
-// left untouched) if y is out of range or no valid x exists --
-// "reject, don't guess," same posture as the rest of this codebase's
-// bounds/format checks.
-fn ed25519_recover_x(y: mut ref i64, sign: u32, out_x: mut ref i64) -> i64 {
-  let p_bytes: mut ref i64 = x25519_p_bytes_get();
-  if bignum_cmp_raw(y, p_bytes, 8) >= 0 {
-    return 0;
-  }
-
-  let y2: mut ref i64 = ed25519_tmp1_get();
-  let _ = field25519_sqr(y, y2);
-
-  let one: mut ref i64 = ed25519_tmp2_get();
-  let oi: i64 = 0;
-  while oi < 32 {
-    let _ = buf_write_byte(one, oi as u32, 0 as u32);
-    oi = oi + 1;
-  }
-  let _ = buf_write_byte(one, 0 as u32, 1 as u32);
-
-  let num: mut ref i64 = ed25519_tmp3_get();
-  let _ = field25519_sub(y2, one, num); // num = y^2 - 1
-
-  let dy2: mut ref i64 = ed25519_tmp4_get();
-  let _ = field25519_mul(ed25519_d_get(), y2, dy2); // dy2 = d*y^2 (y2/tmp1 dead after this)
-
-  let den: mut ref i64 = ed25519_tmp5_get();
-  let _ = field25519_add(dy2, one, den); // den = d*y^2 + 1 (dy2/tmp4, one/tmp2 dead after this)
-
-  let deninv: mut ref i64 = ed25519_tmp1_get(); // reuse tmp1 -- y2 is dead
-  let _ = field25519_invert(den, deninv);
-
-  let x2: mut ref i64 = ed25519_tmp6_get();
-  let _ = field25519_mul(num, deninv, x2); // x2 = num/den (num/tmp3, deninv/tmp1, den/tmp5 all dead after this)
-
-  let is_zero: i64 = 1;
-  let zci: i64 = 0;
-  while zci < 32 {
-    if buf_read_byte(x2, zci as u32) != (0 as u32) {
-      is_zero = 0;
-    }
-    zci = zci + 1;
-  }
-  if is_zero == 1 {
-    if sign == (1 as u32) {
-      return 0;
-    }
-    let zoi: i64 = 0;
-    while zoi < 32 {
-      let _ = buf_write_byte(out_x, zoi as u32, 0 as u32);
-      zoi = zoi + 1;
-    }
-    return 1;
-  }
-
-  let candidate: mut ref i64 = ed25519_tmp7_get();
-  let _ = ed25519_sqrt_candidate(x2, candidate);
-
-  let check: mut ref i64 = ed25519_tmp8_get();
-  let _ = field25519_sqr(candidate, check);
-  if bignum_cmp_raw(check, x2, 8) != 0 {
-    let _ = field25519_mul(candidate, ed25519_sqrt_m1_get(), candidate);
-    let _ = field25519_sqr(candidate, check);
-    if bignum_cmp_raw(check, x2, 8) != 0 {
-      return 0;
-    }
-  }
-
-  let cand_parity: u32 = buf_read_byte(candidate, 0 as u32) & (1 as u32);
-  if cand_parity != sign {
-    let _ = field25519_sub(p_bytes, candidate, candidate);
-  }
-
-  let ci: i64 = 0;
-  while ci < 32 {
-    let _ = buf_write_byte(out_x, ci as u32, buf_read_byte(candidate, ci as u32));
-    ci = ci + 1;
-  }
-  return 1;
-}
-
-// Decompresses a 32-byte encoded point into (outx,outy,outz,outt).
-// Returns 1 on success, 0 on a malformed/invalid encoding.
-fn ed25519_point_decompress(s: mut ref i64, outx: mut ref i64, outy: mut ref i64, outz: mut ref i64, outt: mut ref i64) -> i64 {
-  let sign: u32 = (buf_read_byte(s, 31 as u32) >> (7 as u32)) & (1 as u32);
-  let i: i64 = 0;
-  while i < 32 {
-    let _ = buf_write_byte(outy, i as u32, buf_read_byte(s, i as u32));
-    i = i + 1;
-  }
-  let top_masked: u32 = buf_read_byte(outy, 31 as u32) & (127 as u32);
-  let _ = buf_write_byte(outy, 31 as u32, top_masked);
-
-  let ok: i64 = ed25519_recover_x(outy, sign, outx);
-  if ok == 0 {
-    return 0;
-  }
-  let zi: i64 = 0;
-  while zi < 32 {
-    let _ = buf_write_byte(outz, zi as u32, 0 as u32);
-    zi = zi + 1;
-  }
-  let _ = buf_write_byte(outz, 0 as u32, 1 as u32);
-  let _ = field25519_mul(outx, outy, outt);
-  return 1;
-}
-
-// SHA-512(secret) split into a clamped scalar `out_a` (RFC 8032
-// section 5.1.5 clamping: clear the low 3 bits, clear bit 255, set
-// bit 254) and a `out_prefix` used only to derive the per-message
-// nonce below.
-fn ed25519_secret_expand(secret: mut ref i64, out_a: mut ref i64, out_prefix: mut ref i64) -> i64 {
-  let hash_out: mut ref i64 = ed25519_hash_out_get();
-  let _ = sha512_hash(secret, 32, hash_out);
-  let i: i64 = 0;
-  while i < 32 {
-    let _ = buf_write_byte(out_a, i as u32, buf_read_byte(hash_out, i as u32));
-    i = i + 1;
-  }
-  let a0: u32 = buf_read_byte(out_a, 0 as u32) & (248 as u32);
-  let _ = buf_write_byte(out_a, 0 as u32, a0);
-  let a31: u32 = (buf_read_byte(out_a, 31 as u32) & (127 as u32)) | (64 as u32);
-  let _ = buf_write_byte(out_a, 31 as u32, a31);
+  let pub_arr: [u8; 32] = ed25519_secret_to_public(ref secret_arr);
   let j: i64 = 0;
   while j < 32 {
-    let _ = buf_write_byte(out_prefix, j as u32, buf_read_byte(hash_out, (32 + j) as u32));
+    let _ = buf_write_byte(out_pub, j as u32, pub_arr[j] as u32);
     j = j + 1;
   }
   return 0;
 }
 
-fn ed25519_secret_to_public(secret: mut ref i64, out_pub: mut ref i64) -> i64 {
-  let a: mut ref i64 = ed25519_buf1_get();
-  let prefix: mut ref i64 = ed25519_buf2_get();
-  let _ = ed25519_secret_expand(secret, a, prefix);
-  let _ = ed25519_point_mul(a, ed25519_gx_get(), ed25519_gy_get(), ed25519_gz_get(), ed25519_gt_get());
-  let _ = ed25519_point_compress(ed25519_qx_get(), ed25519_qy_get(), ed25519_qz_get(), ed25519_qt_get(), out_pub);
-  return 0;
-}
-
-// RFC 8032 section 5.1.6. out_sig is 64 bytes (Rs || s). msg_len is
-// capped at 4096 (this project's own dharafs_file_max_len() bound,
-// same ceiling SHA-256/SHA-512's own scratch already established) by
-// ed25519_hash_input's fixed size.
-fn ed25519_sign(secret: mut ref i64, msg: mut ref i64, msg_len: i64, out_sig: mut ref i64) -> i64 {
-  let a: mut ref i64 = ed25519_buf1_get();
-  let prefix: mut ref i64 = ed25519_buf2_get();
-  let _ = ed25519_secret_expand(secret, a, prefix);
-
-  let gx: mut ref i64 = ed25519_gx_get();
-  let gy: mut ref i64 = ed25519_gy_get();
-  let gz: mut ref i64 = ed25519_gz_get();
-  let gt: mut ref i64 = ed25519_gt_get();
-
-  let apub: mut ref i64 = ed25519_buf3_get();
-  let _ = ed25519_point_mul(a, gx, gy, gz, gt);
-  let _ = ed25519_point_compress(ed25519_qx_get(), ed25519_qy_get(), ed25519_qz_get(), ed25519_qt_get(), apub);
-
-  let hash_input: mut ref i64 = ed25519_hash_input_get();
-  let hi: i64 = 0;
-  while hi < 32 {
-    let _ = buf_write_byte(hash_input, hi as u32, buf_read_byte(prefix, hi as u32));
-    hi = hi + 1;
+fn ed25519_sign_heap(secret: mut ref i64, msg: mut ref i64, msg_len: i64, out_sig: mut ref i64) -> i64 {
+  let secret_arr: [u8; 32] = ed25519_zero32_bytes();
+  let i: i64 = 0;
+  while i < 32 {
+    secret_arr[i] = buf_read_byte(secret, i as u32) as u8;
+    i = i + 1;
   }
-  let hj: i64 = 0;
-  while hj < msg_len {
-    let _ = buf_write_byte(hash_input, (32 + hj) as u32, buf_read_byte(msg, hj as u32));
-    hj = hj + 1;
+  let msg_arr: [u8; 512] = ed25519_zero512_bytes();
+  let mi: i64 = 0;
+  while mi < msg_len {
+    msg_arr[mi] = buf_read_byte(msg, mi as u32) as u8;
+    mi = mi + 1;
   }
-  let hash_out: mut ref i64 = ed25519_hash_out_get();
-  let _ = sha512_hash(hash_input, 32 + msg_len, hash_out);
-  let r: mut ref i64 = ed25519_buf4_get();
-  let _ = ed25519_scalar_mod_l_raw(hash_out, 64, r);
-
-  let _ = ed25519_point_mul(r, gx, gy, gz, gt);
-  let rs: mut ref i64 = ed25519_buf5_get();
-  let _ = ed25519_point_compress(ed25519_qx_get(), ed25519_qy_get(), ed25519_qz_get(), ed25519_qt_get(), rs);
-
-  let hi2: i64 = 0;
-  while hi2 < 32 {
-    let _ = buf_write_byte(hash_input, hi2 as u32, buf_read_byte(rs, hi2 as u32));
-    hi2 = hi2 + 1;
-  }
-  let hi3: i64 = 0;
-  while hi3 < 32 {
-    let _ = buf_write_byte(hash_input, (32 + hi3) as u32, buf_read_byte(apub, hi3 as u32));
-    hi3 = hi3 + 1;
-  }
-  let hi4: i64 = 0;
-  while hi4 < msg_len {
-    let _ = buf_write_byte(hash_input, (64 + hi4) as u32, buf_read_byte(msg, hi4 as u32));
-    hi4 = hi4 + 1;
-  }
-  let _ = sha512_hash(hash_input, 64 + msg_len, hash_out);
-  let k: mut ref i64 = ed25519_buf6_get();
-  let _ = ed25519_scalar_mod_l_raw(hash_out, 64, k);
-
-  let ka: mut ref i64 = ed25519_buf7_get();
-  let _ = ed25519_scalar_mul_mod_l(k, a, ka);
-  let s: mut ref i64 = ed25519_buf8_get();
-  let _ = ed25519_scalar_add_mod_l(r, ka, s);
-
-  let oi: i64 = 0;
-  while oi < 32 {
-    let _ = buf_write_byte(out_sig, oi as u32, buf_read_byte(rs, oi as u32));
-    oi = oi + 1;
-  }
-  let oj: i64 = 0;
-  while oj < 32 {
-    let _ = buf_write_byte(out_sig, (32 + oj) as u32, buf_read_byte(s, oj as u32));
-    oj = oj + 1;
+  let sig_arr: [u8; 64] = ed25519_sign(ref secret_arr, ref msg_arr, msg_len);
+  let j: i64 = 0;
+  while j < 64 {
+    let _ = buf_write_byte(out_sig, j as u32, sig_arr[j] as u32);
+    j = j + 1;
   }
   return 0;
 }
 
-// RFC 8032 section 5.1.7. Returns 1 if `sig` (64 bytes) is a valid
-// Ed25519 signature over `msg` by `public` (32 bytes), 0 otherwise --
-// covers every rejection path explicitly (malformed public key,
-// malformed R, s >= L) rather than letting any of them fall through
-// to an ambiguous result.
-fn ed25519_verify(pubkey: mut ref i64, msg: mut ref i64, msg_len: i64, sig: mut ref i64) -> i64 {
-  let ax: mut ref i64 = ed25519_ax_get();
-  let ay: mut ref i64 = ed25519_ay_get();
-  let az: mut ref i64 = ed25519_az_get();
-  let at: mut ref i64 = ed25519_at_get();
-  let dec_a_ok: i64 = ed25519_point_decompress(pubkey, ax, ay, az, at);
-  if dec_a_ok == 0 {
-    return 0;
+fn ed25519_verify_heap(pubkey: mut ref i64, msg: mut ref i64, msg_len: i64, sig: mut ref i64) -> i64 {
+  let pubkey_arr: [u8; 32] = ed25519_zero32_bytes();
+  let i: i64 = 0;
+  while i < 32 {
+    pubkey_arr[i] = buf_read_byte(pubkey, i as u32) as u8;
+    i = i + 1;
   }
-
-  let rs: mut ref i64 = ed25519_buf1_get();
-  let ri: i64 = 0;
-  while ri < 32 {
-    let _ = buf_write_byte(rs, ri as u32, buf_read_byte(sig, ri as u32));
-    ri = ri + 1;
+  let msg_arr: [u8; 512] = ed25519_zero512_bytes();
+  let mi: i64 = 0;
+  while mi < msg_len {
+    msg_arr[mi] = buf_read_byte(msg, mi as u32) as u8;
+    mi = mi + 1;
   }
-  let rx: mut ref i64 = ed25519_rx_get();
-  let ry: mut ref i64 = ed25519_ry_get();
-  let rz: mut ref i64 = ed25519_rz_get();
-  let rt: mut ref i64 = ed25519_rt_get();
-  let dec_r_ok: i64 = ed25519_point_decompress(rs, rx, ry, rz, rt);
-  if dec_r_ok == 0 {
-    return 0;
-  }
-
-  let s: mut ref i64 = ed25519_buf2_get();
+  let sig_arr: [u8; 64] = ed25519_zero64_bytes();
   let si: i64 = 0;
-  while si < 32 {
-    let _ = buf_write_byte(s, si as u32, buf_read_byte(sig, (32 + si) as u32));
+  while si < 64 {
+    sig_arr[si] = buf_read_byte(sig, si as u32) as u8;
     si = si + 1;
   }
-  let l_buf: mut ref i64 = ed25519_l_get();
-  if bignum_cmp_raw(s, l_buf, 8) >= 0 {
-    return 0;
-  }
-
-  let hash_input: mut ref i64 = ed25519_hash_input_get();
-  let hi: i64 = 0;
-  while hi < 32 {
-    let _ = buf_write_byte(hash_input, hi as u32, buf_read_byte(rs, hi as u32));
-    hi = hi + 1;
-  }
-  let hj: i64 = 0;
-  while hj < 32 {
-    let _ = buf_write_byte(hash_input, (32 + hj) as u32, buf_read_byte(pubkey, hj as u32));
-    hj = hj + 1;
-  }
-  let hk: i64 = 0;
-  while hk < msg_len {
-    let _ = buf_write_byte(hash_input, (64 + hk) as u32, buf_read_byte(msg, hk as u32));
-    hk = hk + 1;
-  }
-  let hash_out: mut ref i64 = ed25519_hash_out_get();
-  let _ = sha512_hash(hash_input, 64 + msg_len, hash_out);
-  let k: mut ref i64 = ed25519_buf3_get();
-  let _ = ed25519_scalar_mod_l_raw(hash_out, 64, k);
-
-  let gx: mut ref i64 = ed25519_gx_get();
-  let gy: mut ref i64 = ed25519_gy_get();
-  let gz: mut ref i64 = ed25519_gz_get();
-  let gt: mut ref i64 = ed25519_gt_get();
-
-  let _ = ed25519_point_mul(s, gx, gy, gz, gt);
-  let sbx: mut ref i64 = ed25519_sbx_get();
-  let sby: mut ref i64 = ed25519_sby_get();
-  let sbz: mut ref i64 = ed25519_sbz_get();
-  let sbt: mut ref i64 = ed25519_sbt_get();
-  let ci: i64 = 0;
-  while ci < 32 {
-    let _ = buf_write_byte(sbx, ci as u32, buf_read_byte(ed25519_qx_get(), ci as u32));
-    let _ = buf_write_byte(sby, ci as u32, buf_read_byte(ed25519_qy_get(), ci as u32));
-    let _ = buf_write_byte(sbz, ci as u32, buf_read_byte(ed25519_qz_get(), ci as u32));
-    let _ = buf_write_byte(sbt, ci as u32, buf_read_byte(ed25519_qt_get(), ci as u32));
-    ci = ci + 1;
-  }
-
-  let _ = ed25519_point_mul(k, ax, ay, az, at);
-  let kax: mut ref i64 = ed25519_kax_get();
-  let kay: mut ref i64 = ed25519_kay_get();
-  let kaz: mut ref i64 = ed25519_kaz_get();
-  let kat: mut ref i64 = ed25519_kat_get();
-  let di: i64 = 0;
-  while di < 32 {
-    let _ = buf_write_byte(kax, di as u32, buf_read_byte(ed25519_qx_get(), di as u32));
-    let _ = buf_write_byte(kay, di as u32, buf_read_byte(ed25519_qy_get(), di as u32));
-    let _ = buf_write_byte(kaz, di as u32, buf_read_byte(ed25519_qz_get(), di as u32));
-    let _ = buf_write_byte(kat, di as u32, buf_read_byte(ed25519_qt_get(), di as u32));
-    di = di + 1;
-  }
-
-  let _ = ed25519_point_add(kax, kay, kaz, kat, rx, ry, rz, rt, kax, kay, kaz, kat);
-
-  return ed25519_point_equal(sbx, sby, sbz, sbt, kax, kay, kaz, kat);
+  return ed25519_verify(ref pubkey_arr, ref msg_arr, msg_len, ref sig_arr);
 }
 
-
-// RFC 8032-shaped known-answer check against a real, independently-
+// RFC 8032-shaped known-answer check reusing a real, independently-
 // verified (cryptography library) run -- same discipline as X25519's
 // own self-test, for the same reason (a 32/64-byte value is exactly
 // the kind of thing a memorized transcription could silently corrupt
@@ -21405,18 +20591,18 @@ fn ed25519_self_test() -> i64 {
   let _ = buf_write_byte(expected_sig, 63 as u32, 0x01 as u32);
 
   let pub_out: mut ref i64 = dhruva_alloc_bytes(32);
-  let _ = ed25519_secret_to_public(seed, pub_out);
+  let _ = ed25519_secret_to_public_heap(seed, pub_out);
   if chacha20_bytes_equal(pub_out, expected_pub, 32) == 0 {
     ok = 0;
   }
 
   let sig_out: mut ref i64 = dhruva_alloc_bytes(64);
-  let _ = ed25519_sign(seed, msg, msg_len, sig_out);
+  let _ = ed25519_sign_heap(seed, msg, msg_len, sig_out);
   if chacha20_bytes_equal(sig_out, expected_sig, 64) == 0 {
     ok = 0;
   }
 
-  if ed25519_verify(pub_out, msg, msg_len, sig_out) == 0 {
+  if ed25519_verify_heap(pub_out, msg, msg_len, sig_out) == 0 {
     ok = 0; // must accept its own valid signature
   }
 
@@ -21430,7 +20616,7 @@ fn ed25519_self_test() -> i64 {
     bi = bi + 1;
   }
   let _ = buf_write_byte(bad_sig, 0 as u32, buf_read_byte(bad_sig, 0 as u32) ^ (1 as u32));
-  if ed25519_verify(pub_out, msg, msg_len, bad_sig) == 1 {
+  if ed25519_verify_heap(pub_out, msg, msg_len, bad_sig) == 1 {
     ok = 0;
   }
 
@@ -21441,7 +20627,7 @@ fn ed25519_self_test() -> i64 {
     ci = ci + 1;
   }
   let _ = buf_write_byte(bad_msg, 0 as u32, buf_read_byte(bad_msg, 0 as u32) ^ (1 as u32));
-  if ed25519_verify(pub_out, bad_msg, msg_len, sig_out) == 1 {
+  if ed25519_verify_heap(pub_out, bad_msg, msg_len, sig_out) == 1 {
     ok = 0;
   }
 
@@ -21496,7 +20682,7 @@ fn pki_init() -> i64 {
 }
 
 fn pki_verify_raw(data: mut ref i64, data_len: i64, sig: mut ref i64) -> i64 {
-  return ed25519_verify(pki_pinned_key_get(), data, data_len, sig);
+  return ed25519_verify_heap(pki_pinned_key_get(), data, data_len, sig);
 }
 
 // Verifies the file at `path_buf` (already copied by the caller,
@@ -24380,18 +23566,18 @@ fn tls_self_test() -> i64 {
   let _ = tls_x25519_basepoint(basepoint);
 
   let client_pub: mut ref i64 = tls_client_x25519_pub_get();
-  let _ = x25519_scalarmult(client_priv, basepoint, client_pub);
+  let _ = x25519_scalarmult_heap(client_priv, basepoint, client_pub);
   let server_pub: mut ref i64 = tls_server_x25519_pub_get();
-  let _ = x25519_scalarmult(server_priv, basepoint, server_pub);
+  let _ = x25519_scalarmult_heap(server_priv, basepoint, server_pub);
 
   let shared_c: mut ref i64 = tls_shared_secret_get();
-  let _ = x25519_scalarmult(client_priv, server_pub, shared_c);
+  let _ = x25519_scalarmult_heap(client_priv, server_pub, shared_c);
   let shared_s: mut ref i64 = dhruva_alloc_bytes(32);
-  let _ = x25519_scalarmult(server_priv, client_pub, shared_s);
+  let _ = x25519_scalarmult_heap(server_priv, client_pub, shared_s);
   if keccak_bytes_equal(shared_c, shared_s, 32) != 1 { ok = 0; }
 
   let server_id_pub: mut ref i64 = tls_server_id_pub_get();
-  let _ = ed25519_secret_to_public(server_id_priv, server_id_pub);
+  let _ = ed25519_secret_to_public_heap(server_id_priv, server_id_pub);
 
   // --- ClientHello / ServerHello ---
   let ch: mut ref i64 = tls_ch_get();
@@ -24438,7 +23624,7 @@ fn tls_self_test() -> i64 {
   let cv_content: mut ref i64 = tls_cv_signed_content_get();
   let cv_content_len: i64 = tls_certverify_signed_content(cert_transcript_hash, cv_content);
   let cv_sig: mut ref i64 = dhruva_alloc_bytes(64);
-  let _ = ed25519_sign(server_id_priv, cv_content, cv_content_len, cv_sig);
+  let _ = ed25519_sign_heap(server_id_priv, cv_content, cv_content_len, cv_sig);
   let cv: mut ref i64 = tls_cv_get();
   let cv_len: i64 = tls_build_certificate_verify(cv_sig, cv);
 
@@ -24480,7 +23666,7 @@ fn tls_self_test() -> i64 {
   // same model as pki_verify_raw. ---
   let recomputed_cv_content: mut ref i64 = dhruva_alloc_bytes(cv_content_len);
   let _ = tls_certverify_signed_content(cert_transcript_hash, recomputed_cv_content);
-  if ed25519_verify(server_id_pub, recomputed_cv_content, cv_content_len, cv_sig) != 1 { ok = 0; }
+  if ed25519_verify_heap(server_id_pub, recomputed_cv_content, cv_content_len, cv_sig) != 1 { ok = 0; }
 
   // --- Client verifies server Finished ---
   let s_verify_data_check: mut ref i64 = dhruva_alloc_bytes(32);
@@ -24771,15 +23957,15 @@ fn tls_tcp_self_test() -> i64 {
   let basepoint: mut ref i64 = dhruva_alloc_bytes(32);
   let _ = tls_x25519_basepoint(basepoint);
   let client_pub: mut ref i64 = tls_client_x25519_pub_get();
-  let _ = x25519_scalarmult(client_priv, basepoint, client_pub);
+  let _ = x25519_scalarmult_heap(client_priv, basepoint, client_pub);
   let server_pub: mut ref i64 = tls_server_x25519_pub_get();
-  let _ = x25519_scalarmult(server_priv, basepoint, server_pub);
+  let _ = x25519_scalarmult_heap(server_priv, basepoint, server_pub);
 
   // The client's out-of-band-pinned copy of the server's identity key
   // (RFC 7250 trust model -- same "already known, not discovered" shape
   // as pki_pinned_key).
   let server_id_pub: mut ref i64 = tls_server_id_pub_get();
-  let _ = ed25519_secret_to_public(server_id_priv, server_id_pub);
+  let _ = ed25519_secret_to_public_heap(server_id_priv, server_id_pub);
 
   // --- ClientHello: built, wrapped in a real TLSPlaintext record,
   // fragmented over real TCP to the server. ---
@@ -24813,9 +23999,9 @@ fn tls_tcp_self_test() -> i64 {
   // Shared secret computed from the PARSED peer key each side actually
   // received over the wire, not the locally-generated copy.
   let shared_c: mut ref i64 = tls_shared_secret_get();
-  let _ = x25519_scalarmult(client_priv, parsed_server_pub, shared_c);
+  let _ = x25519_scalarmult_heap(client_priv, parsed_server_pub, shared_c);
   let shared_s: mut ref i64 = dhruva_alloc_bytes(32);
-  let _ = x25519_scalarmult(server_priv, parsed_client_pub, shared_s);
+  let _ = x25519_scalarmult_heap(server_priv, parsed_client_pub, shared_s);
   if keccak_bytes_equal(shared_c, shared_s, 32) != 1 { ok = 0; }
 
   let zero32: mut ref i64 = dhruva_alloc_bytes(32);
@@ -24865,7 +24051,7 @@ fn tls_tcp_self_test() -> i64 {
   let cv_content: mut ref i64 = tls_cv_signed_content_get();
   let cv_content_len: i64 = tls_certverify_signed_content(cert_hash, cv_content);
   let cv_sig: mut ref i64 = dhruva_alloc_bytes(64);
-  let _ = ed25519_sign(server_id_priv, cv_content, cv_content_len, cv_sig);
+  let _ = ed25519_sign_heap(server_id_priv, cv_content, cv_content_len, cv_sig);
   let cv: mut ref i64 = tls_cv_get();
   let cv_len: i64 = tls_build_certificate_verify(cv_sig, cv);
 
@@ -24915,7 +24101,7 @@ fn tls_tcp_self_test() -> i64 {
 
   let recomputed_cv_content: mut ref i64 = dhruva_alloc_bytes(cv_content_len);
   let _ = tls_certverify_signed_content(cert_hash, recomputed_cv_content);
-  if ed25519_verify(parsed_server_id_pub, recomputed_cv_content, cv_content_len, cv_sig) != 1 { ok = 0; }
+  if ed25519_verify_heap(parsed_server_id_pub, recomputed_cv_content, cv_content_len, cv_sig) != 1 { ok = 0; }
 
   let s_verify_data_check: mut ref i64 = dhruva_alloc_bytes(32);
   let _ = tls_finished_verify_data(s_hs_traffic, transcript, t_len_cv, s_verify_data_check);
@@ -25117,12 +24303,12 @@ fn tls_server_process_client_hello(recv_ch: mut ref i64, recv_ch_len: i64, my_ma
   let basepoint: mut ref i64 = tls_basepoint_get();
   let _ = tls_x25519_basepoint(basepoint);
   let server_pub: mut ref i64 = tls_server_x25519_pub_get();
-  let _ = x25519_scalarmult(server_priv, basepoint, server_pub);
+  let _ = x25519_scalarmult_heap(server_priv, basepoint, server_pub);
   let shared: mut ref i64 = tls_shared_secret_get();
-  let _ = x25519_scalarmult(server_priv, parsed_client_pub, shared);
+  let _ = x25519_scalarmult_heap(server_priv, parsed_client_pub, shared);
 
   let server_id_pub: mut ref i64 = tls_server_id_pub_get();
-  let _ = ed25519_secret_to_public(server_id_priv, server_id_pub);
+  let _ = ed25519_secret_to_public_heap(server_id_priv, server_id_pub);
 
   let sh: mut ref i64 = tls_sh_get();
   let sh_len: i64 = tls_build_server_hello(server_random, server_pub, sh);
@@ -25150,7 +24336,7 @@ fn tls_server_process_client_hello(recv_ch: mut ref i64, recv_ch_len: i64, my_ma
   let cv_content: mut ref i64 = tls_cv_signed_content_get();
   let cv_content_len: i64 = tls_certverify_signed_content(cert_hash, cv_content);
   let cv_sig: mut ref i64 = tls_cv_sig_get();
-  let _ = ed25519_sign(server_id_priv, cv_content, cv_content_len, cv_sig);
+  let _ = ed25519_sign_heap(server_id_priv, cv_content, cv_content_len, cv_sig);
   let cv: mut ref i64 = tls_cv_get();
   let cv_len: i64 = tls_build_certificate_verify(cv_sig, cv);
   let t_len_cv: i64 = tls_transcript_append(cv, cv_len);
@@ -25225,7 +24411,7 @@ fn tls_client_try_process_flight(my_mac: mut ref i64, client_id: u32, server_id:
   let recv_sig: mut ref i64 = tls_cv_sig_get();
   let _ = tls_copy(recv_sig, 0, dec, 8, 64);
   let cv_content: mut ref i64 = tls_cv_signed_content_get();
-  let verify_ok: i64 = ed25519_verify(parsed_server_id_pub, cv_content, 130, recv_sig);
+  let verify_ok: i64 = ed25519_verify_heap(parsed_server_id_pub, cv_content, 130, recv_sig);
 
   let s_fin_len: i64 = tls_rx_try_extract(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_hs_key, s_hs_iv, 3 as u32, 22 as u32, dec);
   if s_fin_len < 0 {
@@ -25373,7 +24559,7 @@ fn tls_connect(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
   let basepoint: mut ref i64 = tls_basepoint_get();
   let _ = tls_x25519_basepoint(basepoint);
   let client_pub: mut ref i64 = tls_client_x25519_pub_get();
-  let _ = x25519_scalarmult(client_priv, basepoint, client_pub);
+  let _ = x25519_scalarmult_heap(client_priv, basepoint, client_pub);
 
   let ch: mut ref i64 = tls_ch_get();
   let ch_len: i64 = tls_build_client_hello(client_random, client_pub, ch);
@@ -26593,657 +25779,48 @@ fn fault_netdrop_maybe_inject() -> u32 {
   return 0 as u32;
 }
 
-// Round 44: bignum foundation, the crypto-primitives-foundation
-// security-roadmap item's third and final piece (SHA-256 and ChaCha20
-// landed in rounds 41/44 above -- see docs/TODO.md). "Bignum/
-// asymmetric primitives (ECC point arithmetic, at minimum...) are a
-// separate, larger sub-effort on top of" the hash/cipher work, per
-// that same roadmap entry -- this round builds the arithmetic
-// FOUNDATION (add/sub/mul/compare on arbitrary-width unsigned
-// integers), deliberately not attempting modular reduction or actual
-// EC point arithmetic yet, matching this whole project's own
-// established pattern of landing one real, complete, verified slice
-// of a multi-round item at a time (e.g. USB mass storage's four
-// rounds, or SHA-256 landing before ChaCha20 within this very item).
+// Round 100 -- X25519 (and the bignum/field25519 foundation it and
+// Ed25519 both used) migrated to the shared `curve25519` kosh
+// package -- same migration as Ed25519 above, same reasoning. Deleted
+// this file's own bignum foundation (bignum_add_raw/sub_raw/mul_raw/
+// mul_small_raw/shl1_raw/cmp_raw/limbs_equal/set_limbs4/self_test)
+// and field25519 arithmetic (field25519_init/get_bit/add/sub/
+// reduce16/mul/sqr/invert) and x25519_clamp_scalar -- all internal-
+// only, zero external callers, all now living in `curve25519/src/
+// core.vani` instead (already `use`d above, for Ed25519 -- one `use`
+// covers both, since they're one package).
 //
-// Representation: little-endian limbs (limb 0 = least-significant 32
-// bits) in a plain byte buffer, same raw-buffer convention as every
-// other module in this file. No fixed width is baked into the
-// functions themselves -- `n` (limb count) is a parameter throughout,
-// so the same code serves whatever width a future round's modular-
-// arithmetic/ECC work actually needs (256-bit/8-limb is the likely
-// target for a common curve like P-256, but nothing here assumes it).
-//
-// Every operation below was verified against ground truth computed
-// independently in Python (arbitrary-precision arithmetic the host
-// language already gets right) via a standalone spike before being
-// ported into the kernel -- not derived from the vani implementation
-// itself, which would only prove internal consistency, not
-// correctness.
-
-// out = a + b (n limbs each), returns the carry out of the top limb
-// (0 or 1) -- the caller's job to detect true overflow of the
-// intended bit-width, same convention hardware ADC/carry-flag
-// semantics use. Classic ripple-carry: each limb's own wraparound add
-// (via round 42's wrapping_add) can itself carry, and adding the
-// incoming carry can ALSO carry a second time -- at most one of the
-// two ever fires for a given limb (adding a 0-or-1 carry to an
-// already-wrapped sum can't wrap twice), so ORing both flags is exact,
-// not merely an approximation.
-fn bignum_add_raw(a: mut ref i64, b: mut ref i64, out: mut ref i64, n: i64) -> u32 {
-  let carry: u32 = 0 as u32;
+// `x25519_scalarmult` kept as a `_heap`-suffixed adapter (11 external
+// TLS 1.3 call sites updated to the new name -- see those call
+// sites' own diffs), same collision reasoning as Ed25519's own
+// adapters above. `x25519_self_test` keeps its ORIGINAL name --
+// `core.vani` excludes its own same-named self-test, so no collision.
+fn x25519_scalarmult_heap(k: mut ref i64, u_in: mut ref i64, out: mut ref i64) -> i64 {
+  let k_arr: [u8; 32] = ed25519_zero32_bytes();
   let i: i64 = 0;
-  while i < n {
-    let av: u32 = buf_read_u32(a, (i * 4) as u32);
-    let bv: u32 = buf_read_u32(b, (i * 4) as u32);
-    let sum1: u32 = wrapping_add(av, bv);
-    let carry1: u32 = if sum1 < av { 1 as u32 } else { 0 as u32 };
-    let sum2: u32 = wrapping_add(sum1, carry);
-    let carry2: u32 = if sum2 < sum1 { 1 as u32 } else { 0 as u32 };
-    let _ = buf_write_u32(out, (i * 4) as u32, sum2);
-    carry = carry1 | carry2;
+  while i < 32 {
+    k_arr[i] = buf_read_byte(k, i as u32) as u8;
     i = i + 1;
   }
-  return carry;
-}
-
-// out = a - b (n limbs each), returns the borrow out of the top limb
-// (0 = a >= b, 1 = the true result is negative and `out` holds the
-// 2^(32n)'s-complement wraparound instead) -- same ripple-borrow
-// shape as bignum_add_raw's ripple-carry, mirrored: a limb borrows
-// when the minuend is smaller than the subtrahend, and subtracting an
-// incoming borrow can borrow a second time under the identical "at
-// most one of the two ever fires" reasoning.
-fn bignum_sub_raw(a: mut ref i64, b: mut ref i64, out: mut ref i64, n: i64) -> u32 {
-  let borrow: u32 = 0 as u32;
-  let i: i64 = 0;
-  while i < n {
-    let av: u32 = buf_read_u32(a, (i * 4) as u32);
-    let bv: u32 = buf_read_u32(b, (i * 4) as u32);
-    let diff1: u32 = wrapping_sub(av, bv);
-    let borrow1: u32 = if av < bv { 1 as u32 } else { 0 as u32 };
-    let diff2: u32 = wrapping_sub(diff1, borrow);
-    let borrow2: u32 = if diff1 < borrow { 1 as u32 } else { 0 as u32 };
-    let _ = buf_write_u32(out, (i * 4) as u32, diff2);
-    borrow = borrow1 | borrow2;
-    i = i + 1;
+  let u_arr: [u8; 32] = ed25519_zero32_bytes();
+  let ui: i64 = 0;
+  while ui < 32 {
+    u_arr[ui] = buf_read_byte(u_in, ui as u32) as u8;
+    ui = ui + 1;
   }
-  return borrow;
-}
-
-// out = a * b, where a/b are n limbs each and out is 2n limbs -- a
-// full-width product always fits in twice the input width, so unlike
-// add/sub there's no carry-out to report; the result is exact.
-// Schoolbook (O(n^2)) multiplication: every u32*u32 partial product
-// fits in 64 bits WITHOUT overflowing u64 (max (2^32-1)^2 is a few
-// bits under 2^64), and accumulating that product with the existing
-// output limb and an incoming carry (each up to 2^32-1) still can't
-// exceed u64::MAX -- verified by construction, not just assumed: the
-// worst case sums to exactly 2^64-1, still in range. This is exactly
-// why the multiply is done in u64 (widening the operands up first)
-// rather than reusing round 42's wrapping_mul, which stays within
-// u32 and would truncate the high half of every partial product.
-fn bignum_mul_raw(a: mut ref i64, b: mut ref i64, out: mut ref i64, n: i64) -> i64 {
-  let total: i64 = 2 * n;
-  let z: i64 = 0;
-  while z < total {
-    let _ = buf_write_u32(out, (z * 4) as u32, 0 as u32);
-    z = z + 1;
-  }
-  let i: i64 = 0;
-  while i < n {
-    let a_i: u64 = buf_read_u32(a, (i * 4) as u32) as u64;
-    let carry: u64 = 0 as u64;
-    let j: i64 = 0;
-    while j < n {
-      let b_j: u64 = buf_read_u32(b, (j * 4) as u32) as u64;
-      let existing: u64 = buf_read_u32(out, ((i + j) * 4) as u32) as u64;
-      let sum: u64 = existing + (a_i * b_j) + carry;
-      let _ = buf_write_u32(out, ((i + j) * 4) as u32, (sum & (4294967295 as u64)) as u32);
-      carry = sum >> (32 as u64);
-      j = j + 1;
-    }
-    // The row's final carry can itself ripple through more than one
-    // output limb (rare, but not impossible -- e.g. when several
-    // preceding rows already left near-saturated limbs behind), so
-    // this keeps propagating until it genuinely dies out rather than
-    // assuming one limb is always enough.
-    let pos: i64 = i + n;
-    let c: u64 = carry;
-    while c > (0 as u64) {
-      let existing2: u64 = buf_read_u32(out, (pos * 4) as u32) as u64;
-      let sum2: u64 = existing2 + c;
-      let _ = buf_write_u32(out, (pos * 4) as u32, (sum2 & (4294967295 as u64)) as u32);
-      c = sum2 >> (32 as u64);
-      pos = pos + 1;
-    }
-    i = i + 1;
-  }
-  return 0;
-}
-
-// Round 67: out = a * small, where a is n limbs and small is a plain
-// (non-bignum) constant known to fit comfortably in a u32 -- X25519's
-// own fast field-reduction (field25519_reduce16, below) needs exactly
-// this shape (multiplying an 8-limb "high half" by the small constant
-// 38) and a full n-by-n bignum_mul_raw would be needless overkill for
-// a one-limb multiplier. out is n+1 limbs -- one extra limb is always
-// enough headroom for the final carry, since small is small (the
-// worst case, small=0xffffffff, still only needs one extra limb; this
-// project's own real caller uses small=38, far smaller still).
-fn bignum_mul_small_raw(a: mut ref i64, out: mut ref i64, n: i64, small: u32) -> i64 {
-  let carry: u64 = 0 as u64;
-  let i: i64 = 0;
-  while i < n {
-    let a_i: u64 = buf_read_u32(a, (i * 4) as u32) as u64;
-    let prod: u64 = (a_i * (small as u64)) + carry;
-    let _ = buf_write_u32(out, (i * 4) as u32, (prod & (4294967295 as u64)) as u32);
-    carry = prod >> (32 as u64);
-    i = i + 1;
-  }
-  let _ = buf_write_u32(out, (n * 4) as u32, carry as u32);
-  return 0;
-}
-
-// Round 67: out = a << 1 (n limbs), returns the bit shifted out of
-// the very top limb (always 0 for every real caller in this file --
-// Ed25519's own scalar-mod-L reduction, the only user, keeps its
-// remainder strictly < L, which comfortably fits in 8 limbs with
-// headroom to spare -- but the return value is still reported
-// honestly rather than assumed, same "don't silently trust an
-// invariant a caller could violate" posture as the rest of this
-// codebase's bignum work).
-fn bignum_shl1_raw(a: mut ref i64, out: mut ref i64, n: i64) -> u32 {
-  let carry: u32 = 0 as u32;
-  let i: i64 = 0;
-  while i < n {
-    let v: u32 = buf_read_u32(a, (i * 4) as u32);
-    let new_carry: u32 = v >> (31 as u32);
-    let shifted: u32 = (v << (1 as u32)) | carry;
-    let _ = buf_write_u32(out, (i * 4) as u32, shifted);
-    carry = new_carry;
-    i = i + 1;
-  }
-  return carry;
-}
-
-// 1 if a > b, -1 if a < b, 0 if equal (n limbs each) -- most-
-// significant limb first, standard big-endian-style magnitude
-// comparison despite the little-endian storage, since the top limb is
-// what actually decides magnitude first.
-fn bignum_cmp_raw(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
-  let i: i64 = n - 1;
-  while i >= 0 {
-    let av: u32 = buf_read_u32(a, (i * 4) as u32);
-    let bv: u32 = buf_read_u32(b, (i * 4) as u32);
-    if av > bv {
-      return 1;
-    }
-    if av < bv {
-      return 0 - 1;
-    }
-    i = i - 1;
-  }
-  return 0;
-}
-
-fn bignum_limbs_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
-  let i: i64 = 0;
-  while i < n {
-    if buf_read_u32(a, (i * 4) as u32) != buf_read_u32(b, (i * 4) as u32) {
-      return 0;
-    }
-    i = i + 1;
-  }
-  return 1;
-}
-
-fn bignum_set_limbs4(buf: mut ref i64, l0: u32, l1: u32, l2: u32, l3: u32) -> i64 {
-  let _ = buf_write_u32(buf, 0 as u32, l0);
-  let _ = buf_write_u32(buf, 4 as u32, l1);
-  let _ = buf_write_u32(buf, 8 as u32, l2);
-  let _ = buf_write_u32(buf, 12 as u32, l3);
-  return 0;
-}
-
-// Verified against ground truth computed independently in Python
-// (arbitrary-precision arithmetic the host language already gets
-// right, not derived from this implementation) before being ported
-// in: a = 0xdeadbeefcafebabe1234567890abcdef, b =
-// 0x0123456789abcdeffedcba9876543210 (128-bit, 4 limbs each).
-fn bignum_self_test() -> i64 {
-  let ok: i64 = 1;
-  let a: mut ref i64 = dhruva_alloc_bytes(16);
-  let b: mut ref i64 = dhruva_alloc_bytes(16);
-  let _ = bignum_set_limbs4(a, 0x90abcdef as u32, 0x12345678 as u32, 0xcafebabe as u32, 0xdeadbeef as u32);
-  let _ = bignum_set_limbs4(b, 0x76543210 as u32, 0xfedcba98 as u32, 0x89abcdef as u32, 0x01234567 as u32);
-
-  let add_expected: mut ref i64 = dhruva_alloc_bytes(16);
-  let _ = bignum_set_limbs4(add_expected, 0x06ffffff as u32, 0x11111111 as u32, 0x54aa88ae as u32, 0xdfd10457 as u32);
-  let add_out: mut ref i64 = dhruva_alloc_bytes(16);
-  let add_carry: u32 = bignum_add_raw(a, b, add_out, 4);
-  if bignum_limbs_equal(add_out, add_expected, 4) == 0 {
-    ok = 0;
-  }
-  if add_carry != (0 as u32) {
-    ok = 0;
-  }
-
-  let sub_expected: mut ref i64 = dhruva_alloc_bytes(16);
-  let _ = bignum_set_limbs4(sub_expected, 0x1a579bdf as u32, 0x13579be0 as u32, 0x4152ecce as u32, 0xdd8a7988 as u32);
-  let sub_out: mut ref i64 = dhruva_alloc_bytes(16);
-  let sub_borrow: u32 = bignum_sub_raw(a, b, sub_out, 4);
-  if bignum_limbs_equal(sub_out, sub_expected, 4) == 0 {
-    ok = 0;
-  }
-  if sub_borrow != (0 as u32) {
-    ok = 0;
-  }
-
-  let mul_expected: mut ref i64 = dhruva_alloc_bytes(32);
-  let _ = buf_write_u32(mul_expected, 0 as u32, 0x55618cf0 as u32);
-  let _ = buf_write_u32(mul_expected, 4 as u32, 0x236d88fe as u32);
-  let _ = buf_write_u32(mul_expected, 8 as u32, 0x32274443 as u32);
-  let _ = buf_write_u32(mul_expected, 12 as u32, 0x7f1977af as u32);
-  let _ = buf_write_u32(mul_expected, 16 as u32, 0x89c48eae as u32);
-  let _ = buf_write_u32(mul_expected, 20 as u32, 0x5c7ba373 as u32);
-  let _ = buf_write_u32(mul_expected, 24 as u32, 0xeeb2a01e as u32);
-  let _ = buf_write_u32(mul_expected, 28 as u32, 0x00fd5bde as u32);
-  let mul_out: mut ref i64 = dhruva_alloc_bytes(32);
-  let _ = bignum_mul_raw(a, b, mul_out, 4);
-  if bignum_limbs_equal(mul_out, mul_expected, 8) == 0 {
-    ok = 0;
-  }
-
-  // a > b (both are known, fixed constants above -- confirmed by
-  // inspection, not just trusting the comparison it's testing).
-  if bignum_cmp_raw(a, b, 4) != 1 {
-    ok = 0;
-  }
-  if bignum_cmp_raw(b, a, 4) != (0 - 1) {
-    ok = 0;
-  }
-  if bignum_cmp_raw(a, a, 4) != 0 {
-    ok = 0;
-  }
-
-  let _ = uart_puts("CRYPTO: bignum add/sub/mul/cmp vs independently-computed 128-bit ground truth");
-  if ok == 1 {
-    let _ = uart_puts(" (PASS)\n");
-  } else {
-    let _ = uart_puts(" (FAIL)\n");
-  }
-  return 0;
-}
-
-
-// Round 67: X25519 (RFC 7748) -- Diffie-Hellman key exchange over
-// Curve25519, the EC foundation TLS's ECDHE and PKI's raw public-key
-// trust both need (this roadmap's own crypto-foundation entry
-// flagged real EC arithmetic as the missing piece blocking both).
-// Field elements are 8-limb (256-bit) little-endian u32 arrays, same
-// representation and same bignum_add_raw/sub_raw/mul_raw/cmp_raw
-// primitives round 44's bignum work already built and verified --
-// deliberately NOT a specialized radix-2^51 representation (the
-// technique real high-performance X25519 implementations use):
-// correctness-over-performance, reusing already-verified
-// infrastructure, matches this project's own established style, and
-// this is a client doing occasional key exchanges, not a high-
-// throughput TLS terminator.
-//
-// Modular reduction (field25519_reduce16) uses the standard fold
-// technique for this prime shape: p = 2^255-19, so 2^256 = 2*2^255 =
-// 38 (mod p) -- a 512-bit product splits CLEANLY at the 8-limb (256-
-// bit) boundary with no sub-limb bit shifting needed at all (unlike
-// Poly1305's own reduction, this project's bignum_* functions have no
-// generic shift-by-n-bits primitive, so a limb-aligned split is what
-// makes this tractable without adding one), fold the high half back
-// in multiplied by 38, repeat once more (the result is already close
-// enough to canonical after one fold that a second fold plus at most
-// one final conditional subtraction always finishes it -- verified
-// empirically via a 2000-trial host-side Python simulation of this
-// EXACT limb algorithm before any of it was ported here, see below).
-//
-// Verification methodology (same discipline as every other primitive
-// in this file, adapted for a case where reciting a public test
-// vector from memory would be a real, unnecessary transcription risk
-// -- unlike SHA-256/ChaCha20/Poly1305's own RFC KATs, which are the
-// kind of thing widely reproduced verbatim in enough places to trust
-// recalling precisely): (1) a straightforward big-integer Python
-// reference implementation of the RFC 7748 Montgomery ladder,
-// verified against the real, independent `cryptography` library
-// across 20 random trials (own-derived base-point public keys match
-// the library's; cross-library DH shared-secret agreement matches;
-// DH symmetry holds using only the from-scratch implementation) --
-// this is the actual ground-truth oracle, not a memorized hex
-// constant; (2) a SEPARATE Python simulation of the exact limb-level
-// algorithm planned for this vani port (generic bignum add/sub/mul on
-// 8-limb arrays plus the fold reduction above), cross-checked against
-// the bigint reference across 2000 random field multiplications
-// (including boundary values at/near p) and a further 15 full random
-// X25519 trials -- byte-exact on every single one; (3) the two
-// concrete (key, u-coordinate, expected-output) triples embedded in
-// x25519_self_test below were generated by that SAME verified Python
-// run, not typed from memory -- so this file's own self-test is
-// checking against a real, freshly-computed, independently-agreeing
-// oracle result, not a value that could have been mistyped from an
-// external document.
-fn field25519_init() -> i64 {
-  let p_bytes: mut ref i64 = x25519_p_bytes_get();
-  let _ = buf_write_byte(p_bytes, 0 as u32, 0xed as u32);
-  let pi: i64 = 1;
-  while pi < 31 {
-    let _ = buf_write_byte(p_bytes, pi as u32, 0xff as u32);
-    pi = pi + 1;
-  }
-  let _ = buf_write_byte(p_bytes, 31 as u32, 0x7f as u32);
-
-  let pm2_bytes: mut ref i64 = x25519_p_minus_2_bytes_get();
-  let _ = buf_write_byte(pm2_bytes, 0 as u32, 0xeb as u32);
-  let mi: i64 = 1;
-  while mi < 31 {
-    let _ = buf_write_byte(pm2_bytes, mi as u32, 0xff as u32);
-    mi = mi + 1;
-  }
-  let _ = buf_write_byte(pm2_bytes, 31 as u32, 0x7f as u32);
-
-  // p9_bytes: p's own 8 limbs plus a 9th all-zero limb, built once
-  // here rather than reconstructed on every field25519_reduce16 call.
-  let p9_bytes: mut ref i64 = x25519_p9_bytes_get();
-  let ki: i64 = 0;
-  while ki < 32 {
-    let _ = buf_write_byte(p9_bytes, ki as u32, buf_read_byte(p_bytes, ki as u32));
-    ki = ki + 1;
-  }
-  let _ = buf_write_u32(p9_bytes, 32 as u32, 0 as u32);
-
-  let a24_bytes: mut ref i64 = x25519_a24_bytes_get();
-  let _ = buf_write_u32(a24_bytes, 0 as u32, 121665 as u32);
-  let ai: i64 = 4;
-  while ai < 32 {
-    let _ = buf_write_byte(a24_bytes, ai as u32, 0 as u32);
-    ai = ai + 1;
-  }
-  return 0;
-}
-
-fn field25519_get_bit(buf: mut ref i64, bit_index: i64) -> u32 {
-  let byte_index: i64 = bit_index / 8;
-  let bit_in_byte: i64 = bit_index - (byte_index * 8);
-  let byte_val: u32 = buf_read_byte(buf, byte_index as u32);
-  return (byte_val >> (bit_in_byte as u32)) & (1 as u32);
-}
-
-// out = (a + b) mod p. Safe for out to alias a or b (bignum_add_raw's
-// own per-limb read-then-write loop never reads a limb it has already
-// overwritten this call).
-fn field25519_add(a: mut ref i64, b: mut ref i64, out: mut ref i64) -> i64 {
-  let carry: u32 = bignum_add_raw(a, b, out, 8);
-  let p_bytes: mut ref i64 = x25519_p_bytes_get();
-  let cmp: i64 = bignum_cmp_raw(out, p_bytes, 8);
-  if (carry == (1 as u32)) || (cmp >= 0) {
-    let _ = bignum_sub_raw(out, p_bytes, out, 8);
-  }
-  return 0;
-}
-
-// out = (a - b) mod p. Same aliasing safety as field25519_add.
-fn field25519_sub(a: mut ref i64, b: mut ref i64, out: mut ref i64) -> i64 {
-  let borrow: u32 = bignum_sub_raw(a, b, out, 8);
-  if borrow == (1 as u32) {
-    let p_bytes: mut ref i64 = x25519_p_bytes_get();
-    let _ = bignum_add_raw(out, p_bytes, out, 8);
-  }
-  return 0;
-}
-
-// Reduces a 16-limb (512-bit) product (as produced by bignum_mul_raw
-// on two 8-limb field elements) down to a canonical 8-limb value < p.
-// See this section's own header comment for the fold algorithm.
-fn field25519_reduce16(product16: mut ref i64, out: mut ref i64) -> i64 {
-  let fold_t: mut ref i64 = x25519_fold_t_get();
-  let fold_s: mut ref i64 = x25519_fold_s_get();
-  let p9_bytes: mut ref i64 = x25519_p9_bytes_get();
-
-  // Fold 1: fold_t = high_8_limbs(product16) * 38 (9 limbs).
-  let carry1: u64 = 0 as u64;
-  let i: i64 = 0;
-  while i < 8 {
-    let hi: u64 = buf_read_u32(product16, ((8 + i) * 4) as u32) as u64;
-    let prod: u64 = (hi * (38 as u64)) + carry1;
-    let _ = buf_write_u32(fold_t, (i * 4) as u32, (prod & (4294967295 as u64)) as u32);
-    carry1 = prod >> (32 as u64);
-    i = i + 1;
-  }
-  let _ = buf_write_u32(fold_t, (8 * 4) as u32, carry1 as u32);
-
-  // fold_s = low_8_limbs(product16) padded to 9 limbs, then += fold_t.
+  let out_arr: [u8; 32] = x25519_scalarmult(ref k_arr, ref u_arr);
   let j: i64 = 0;
-  while j < 8 {
-    let lo: u32 = buf_read_u32(product16, (j * 4) as u32);
-    let _ = buf_write_u32(fold_s, (j * 4) as u32, lo);
+  while j < 32 {
+    let _ = buf_write_byte(out, j as u32, out_arr[j] as u32);
     j = j + 1;
   }
-  let _ = buf_write_u32(fold_s, (8 * 4) as u32, 0 as u32);
-  let _ = bignum_add_raw(fold_s, fold_t, fold_s, 9);
-
-  // Fold 2: fold_s's own limb 8 is now tiny (the sum from fold 1 is
-  // always well under 2^262, per the host-side simulation's own
-  // empirical bound) -- fold IT back in the same way, reusing fold_t.
-  let s1_limb8: u32 = buf_read_u32(fold_s, (8 * 4) as u32);
-  let prod2: u64 = (s1_limb8 as u64) * (38 as u64);
-  let _ = buf_write_u32(fold_t, 0 as u32, (prod2 & (4294967295 as u64)) as u32);
-  let _ = buf_write_u32(fold_t, 4 as u32, (prod2 >> (32 as u64)) as u32);
-  let k: i64 = 2;
-  while k < 9 {
-    let _ = buf_write_u32(fold_t, (k * 4) as u32, 0 as u32);
-    k = k + 1;
-  }
-  let _ = buf_write_u32(fold_s, (8 * 4) as u32, 0 as u32); // clear the now-folded-in limb 8 before reusing fold_s's low 8 limbs
-  let _ = bignum_add_raw(fold_s, fold_t, fold_s, 9);
-
-  // Canonicalize: at most a couple of conditional subtractions of p
-  // (empirically at most 1, per the host-side simulation -- looped
-  // rather than hardcoded to exactly 1 since "always exactly 1" was
-  // never proven algebraically, only observed across 2000 trials).
-  while bignum_cmp_raw(fold_s, p9_bytes, 9) >= 0 {
-    let _ = bignum_sub_raw(fold_s, p9_bytes, fold_s, 9);
-  }
-
-  let o: i64 = 0;
-  while o < 8 {
-    let ov: u32 = buf_read_u32(fold_s, (o * 4) as u32);
-    let _ = buf_write_u32(out, (o * 4) as u32, ov);
-    o = o + 1;
-  }
   return 0;
 }
 
-fn field25519_mul(a: mut ref i64, b: mut ref i64, out: mut ref i64) -> i64 {
-  let product: mut ref i64 = x25519_product_scratch_get();
-  let _ = bignum_mul_raw(a, b, product, 8);
-  let _ = field25519_reduce16(product, out);
-  return 0;
-}
-
-fn field25519_sqr(a: mut ref i64, out: mut ref i64) -> i64 {
-  return field25519_mul(a, a, out);
-}
-
-// a^(p-2) mod p == a^-1 mod p (Fermat's little theorem, since p is
-// prime) -- plain left-to-right binary square-and-multiply over the
-// FIXED, known exponent p-2 (255 bits), not the optimized addition
-// chain real high-performance implementations use. a==out aliasing
-// is NOT assumed safe here (unlike field25519_add/_sub's single-pass
-// loops, this reads `a` across many iterations) -- callers must pass
-// a genuinely separate out buffer.
-fn field25519_invert(a: mut ref i64, out: mut ref i64) -> i64 {
-  let base: mut ref i64 = x25519_invert_base_get();
-  let result: mut ref i64 = x25519_invert_result_get();
-  let pm2_bytes: mut ref i64 = x25519_p_minus_2_bytes_get();
-
-  let z: i64 = 0;
-  while z < 32 {
-    let _ = buf_write_byte(result, z as u32, 0 as u32);
-    let _ = buf_write_byte(base, z as u32, buf_read_byte(a, z as u32));
-    z = z + 1;
-  }
-  let _ = buf_write_byte(result, 0 as u32, 1 as u32);
-
-  let bit: i64 = 0;
-  while bit < 255 {
-    if field25519_get_bit(pm2_bytes, bit) == (1 as u32) {
-      let _ = field25519_mul(result, base, result);
-    }
-    let _ = field25519_sqr(base, base);
-    bit = bit + 1;
-  }
-
-  let o: i64 = 0;
-  while o < 32 {
-    let _ = buf_write_byte(out, o as u32, buf_read_byte(result, o as u32));
-    o = o + 1;
-  }
-  return 0;
-}
-
-// RFC 7748 section 5 clamping, applied IN PLACE to k (32 bytes).
-fn x25519_clamp_scalar(k: mut ref i64) -> i64 {
-  let k0: u32 = buf_read_byte(k, 0 as u32) & (248 as u32);
-  let _ = buf_write_byte(k, 0 as u32, k0);
-  let k31: u32 = buf_read_byte(k, 31 as u32) & (127 as u32);
-  let k31b: u32 = k31 | (64 as u32);
-  let _ = buf_write_byte(k, 31 as u32, k31b);
-  return 0;
-}
-
-// The Montgomery ladder itself (RFC 7748 section 5), scalar `k` (32
-// bytes, mutated in place by clamping -- every real caller generates
-// a fresh scalar per call, so this is not a practical limitation) and
-// u-coordinate `u_in` (32 bytes) in, 32-byte u-coordinate result out.
-// Constant-time by construction (cswap via arithmetic masking, not a
-// data-dependent branch; the loop itself always runs all 255
-// iterations regardless of k's own bit pattern) EXCEPT for
-// field25519_add/_sub's own single conditional subtraction/addition
-// of p -- whether that extra step fires depends on the VALUE being
-// reduced, not on any secret scalar bit directly, but a sufficiently
-// determined cache-timing attacker could still in principle correlate
-// it; the real, well-known mitigation (branchless conditional
-// select instead of an if) is a known, documented gap here, not an
-// oversight -- see docs/TODO.md's own note on this.
-fn x25519_scalarmult(k: mut ref i64, u_in: mut ref i64, out: mut ref i64) -> i64 {
-  let _ = x25519_clamp_scalar(k);
-
-  let x1: mut ref i64 = x25519_x1_get();
-  let x2: mut ref i64 = x25519_x2_get();
-  let z2: mut ref i64 = x25519_z2_get();
-  let x3: mut ref i64 = x25519_x3_get();
-  let z3: mut ref i64 = x25519_z3_get();
-
-  let i0: i64 = 0;
-  while i0 < 32 {
-    let _ = buf_write_byte(x1, i0 as u32, buf_read_byte(u_in, i0 as u32));
-    i0 = i0 + 1;
-  }
-  let top_masked: u32 = buf_read_byte(x1, 31 as u32) & (127 as u32);
-  let _ = buf_write_byte(x1, 31 as u32, top_masked);
-
-  let z: i64 = 0;
-  while z < 32 {
-    let _ = buf_write_byte(x2, z as u32, 0 as u32);
-    let _ = buf_write_byte(z2, z as u32, 0 as u32);
-    let _ = buf_write_byte(x3, z as u32, buf_read_byte(x1, z as u32));
-    let _ = buf_write_byte(z3, z as u32, 0 as u32);
-    z = z + 1;
-  }
-  let _ = buf_write_byte(x2, 0 as u32, 1 as u32);
-  let _ = buf_write_byte(z3, 0 as u32, 1 as u32);
-
-  let a: mut ref i64 = x25519_a_get();
-  let aa: mut ref i64 = x25519_aa_get();
-  let b: mut ref i64 = x25519_b_get();
-  let bb: mut ref i64 = x25519_bb_get();
-  let e: mut ref i64 = x25519_e_get();
-  let c: mut ref i64 = x25519_c_get();
-  let d: mut ref i64 = x25519_d_get();
-  let da: mut ref i64 = x25519_da_get();
-  let cb: mut ref i64 = x25519_cb_get();
-  let a24e: mut ref i64 = x25519_a24e_get();
-  let a24_bytes: mut ref i64 = x25519_a24_bytes_get();
-
-  let swap: u32 = 0 as u32;
-  let t: i64 = 254;
-  while t >= 0 {
-    let k_t: u32 = field25519_get_bit(k, t);
-    let new_swap: u32 = swap ^ k_t;
-    // cswap(new_swap, x2, x3) / cswap(new_swap, z2, z3): branchless
-    // per-byte conditional swap via an all-1s/all-0s mask, same
-    // technique Poly1305's own g/h select used, rather than an
-    // if-branch keyed on secret-shaped data.
-    let mask: u32 = wrapping_sub(0 as u32, new_swap); // new_swap==1 -> 0xffffffff, ==0 -> 0
-    let si: i64 = 0;
-    while si < 32 {
-      let x2b: u32 = buf_read_byte(x2, si as u32);
-      let x3b: u32 = buf_read_byte(x3, si as u32);
-      let swapxor: u32 = (x2b ^ x3b) & mask;
-      let _ = buf_write_byte(x2, si as u32, x2b ^ swapxor);
-      let _ = buf_write_byte(x3, si as u32, x3b ^ swapxor);
-      let z2b: u32 = buf_read_byte(z2, si as u32);
-      let z3b: u32 = buf_read_byte(z3, si as u32);
-      let swapzor: u32 = (z2b ^ z3b) & mask;
-      let _ = buf_write_byte(z2, si as u32, z2b ^ swapzor);
-      let _ = buf_write_byte(z3, si as u32, z3b ^ swapzor);
-      si = si + 1;
-    }
-
-    let _ = field25519_add(x2, z2, a);
-    let _ = field25519_sqr(a, aa);
-    let _ = field25519_sub(x2, z2, b);
-    let _ = field25519_sqr(b, bb);
-    let _ = field25519_sub(aa, bb, e);
-    let _ = field25519_add(x3, z3, c);
-    let _ = field25519_sub(x3, z3, d);
-    let _ = field25519_mul(d, a, da);
-    let _ = field25519_mul(c, b, cb);
-    let _ = field25519_add(da, cb, x3); // x3 = DA+CB (pre-square)
-    let _ = field25519_sqr(x3, x3);      // x3 = (DA+CB)^2
-    let _ = field25519_sub(da, cb, z3); // z3 = DA-CB (pre-square)
-    let _ = field25519_sqr(z3, z3);      // z3 = (DA-CB)^2
-    let _ = field25519_mul(x1, z3, z3);  // z3 = x1 * (DA-CB)^2
-    let _ = field25519_mul(aa, bb, x2);  // x2 = AA*BB
-    let _ = field25519_mul(a24_bytes, e, a24e);
-    let _ = field25519_add(aa, a24e, a24e); // a24e = AA + a24*E
-    let _ = field25519_mul(e, a24e, z2);    // z2 = E * (AA + a24*E)
-
-    swap = k_t;
-    t = t - 1;
-  }
-
-  // Final cswap (swap now holds the LAST k_t from t=0).
-  let mask_final: u32 = wrapping_sub(0 as u32, swap);
-  let sf: i64 = 0;
-  while sf < 32 {
-    let x2b: u32 = buf_read_byte(x2, sf as u32);
-    let x3b: u32 = buf_read_byte(x3, sf as u32);
-    let swapxor: u32 = (x2b ^ x3b) & mask_final;
-    let _ = buf_write_byte(x2, sf as u32, x2b ^ swapxor);
-    let _ = buf_write_byte(x3, sf as u32, x3b ^ swapxor);
-    let z2b: u32 = buf_read_byte(z2, sf as u32);
-    let z3b: u32 = buf_read_byte(z3, sf as u32);
-    let swapzor: u32 = (z2b ^ z3b) & mask_final;
-    let _ = buf_write_byte(z2, sf as u32, z2b ^ swapzor);
-    let _ = buf_write_byte(z3, sf as u32, z3b ^ swapzor);
-    sf = sf + 1;
-  }
-
-  let z2_inv: mut ref i64 = x25519_invert_result_get(); // borrowed as a plain scratch buffer -- field25519_invert's own use of it has already returned by this point, nothing concurrent
-  let _ = field25519_invert(z2, z2_inv);
-  let _ = field25519_mul(x2, z2_inv, out);
-  return 0;
-}
-
+// RFC 7748-shaped known-answer check against a real, independently-
+// verified (cryptography library) run -- same discipline as Ed25519's
+// own self-test.
 fn x25519_self_test() -> i64 {
-  let _ = field25519_init();
   let ok: i64 = 1;
 
   // Test 1: base-point scalar multiplication (public key derivation).
@@ -27333,7 +25910,7 @@ fn x25519_self_test() -> i64 {
     let _ = buf_write_byte(k_copy1, ci as u32, buf_read_byte(k, ci as u32));
     ci = ci + 1;
   }
-  let _ = x25519_scalarmult(k_copy1, basepoint, out1);
+  let _ = x25519_scalarmult_heap(k_copy1, basepoint, out1);
   if chacha20_bytes_equal(out1, expected1, 32) == 0 {
     ok = 0;
   }
@@ -27417,7 +25994,7 @@ fn x25519_self_test() -> i64 {
     let _ = buf_write_byte(k_copy2, di as u32, buf_read_byte(k, di as u32));
     di = di + 1;
   }
-  let _ = x25519_scalarmult(k_copy2, u2, out2);
+  let _ = x25519_scalarmult_heap(k_copy2, u2, out2);
   if chacha20_bytes_equal(out2, expected2, 32) == 0 {
     ok = 0;
   }
@@ -27508,59 +26085,6 @@ fn kernel_main() -> i64 {
   // scratch, and both sha256_k_init/sha512_k_init boot-time
   // allocations removed -- SHA-256/512 now use the crypto_hash
   // package's stack-based streaming API, no persistent scratch needed.
-  let _ = ed25519_d_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_2d_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_sqrt_m1_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_l_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_gx_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_gy_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_gz_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_gt_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_tmp1_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_tmp2_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_tmp3_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_tmp4_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_tmp5_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_tmp6_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_tmp7_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_tmp8_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_qx_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_qy_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_qz_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_qt_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_bx_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_by_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_bz_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_bt_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_scalar_remainder_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_buf1_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_buf2_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_buf3_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_buf4_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_buf5_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_buf6_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_buf7_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_buf8_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_ax_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_ay_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_az_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_at_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_rx_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_ry_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_rz_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_rt_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_kax_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_kay_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_kaz_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_kat_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_sbx_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_sby_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_sbz_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_sbt_set(dhruva_alloc_bytes(32));
-  let _ = ed25519_scalar_product_set(dhruva_alloc_bytes(64));
-  let _ = ed25519_scalar_sum_set(dhruva_alloc_bytes(80));
-  let _ = ed25519_hash_input_set(dhruva_alloc_bytes(4192));
-  let _ = ed25519_hash_out_set(dhruva_alloc_bytes(64));
   let _ = pki_pinned_key_set(dhruva_alloc_bytes(32));
   let _ = pki_sig_path_scratch_set(dhruva_alloc_bytes(40));
   let _ = pki_sig_data_scratch_set(dhruva_alloc_bytes(64));
@@ -27586,7 +26110,6 @@ fn kernel_main() -> i64 {
   let _ = keccak_pad_scratch_set(dhruva_alloc_bytes(896));
   let _ = keccak_init();
   let _ = pki_init();
-  let _ = ed25519_init();
   let _ = mlkem_zetas_set(dhruva_alloc_bytes(512));
   let _ = mlkem_gammas_set(dhruva_alloc_bytes(512));
   let _ = mlkem_a00_set(dhruva_alloc_bytes(1024));
@@ -27702,31 +26225,6 @@ fn kernel_main() -> i64 {
   let _ = tls_t_len_cv_set(dhruva_alloc_bytes(4));
   let _ = tls_t_len_s_fin_set(dhruva_alloc_bytes(4));
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
-  let _ = x25519_x1_set(dhruva_alloc_bytes(32));
-  let _ = x25519_x2_set(dhruva_alloc_bytes(32));
-  let _ = x25519_z2_set(dhruva_alloc_bytes(32));
-  let _ = x25519_x3_set(dhruva_alloc_bytes(32));
-  let _ = x25519_z3_set(dhruva_alloc_bytes(32));
-  let _ = x25519_a_set(dhruva_alloc_bytes(32));
-  let _ = x25519_aa_set(dhruva_alloc_bytes(32));
-  let _ = x25519_b_set(dhruva_alloc_bytes(32));
-  let _ = x25519_bb_set(dhruva_alloc_bytes(32));
-  let _ = x25519_e_set(dhruva_alloc_bytes(32));
-  let _ = x25519_c_set(dhruva_alloc_bytes(32));
-  let _ = x25519_d_set(dhruva_alloc_bytes(32));
-  let _ = x25519_da_set(dhruva_alloc_bytes(32));
-  let _ = x25519_cb_set(dhruva_alloc_bytes(32));
-  let _ = x25519_a24e_set(dhruva_alloc_bytes(32));
-  let _ = x25519_product_scratch_set(dhruva_alloc_bytes(64));
-  let _ = x25519_invert_base_set(dhruva_alloc_bytes(32));
-  let _ = x25519_invert_result_set(dhruva_alloc_bytes(32));
-  let _ = x25519_p_bytes_set(dhruva_alloc_bytes(32));
-  let _ = x25519_p_minus_2_bytes_set(dhruva_alloc_bytes(32));
-  let _ = x25519_p9_bytes_set(dhruva_alloc_bytes(36));
-  let _ = x25519_fold_t_set(dhruva_alloc_bytes(36));
-  let _ = x25519_fold_s_set(dhruva_alloc_bytes(36));
-  let _ = x25519_a24_bytes_set(dhruva_alloc_bytes(32));
-  let _ = field25519_init();
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
@@ -28003,8 +26501,11 @@ fn kernel_main() -> i64 {
   let _ = dharafs_crypto_key_init();
   let _ = dharafs_encryption_self_check();
 
-  // Round 44: crypto primitives foundation, bignum arithmetic base.
-  let _ = bignum_self_test();
+  // Round 44's own bignum arithmetic base (bignum_add_raw/sub_raw/
+  // mul_raw/etc, and its own bignum_self_test) was deleted round 100
+  // -- migrated to the crypto_hash/curve25519 packages' own 8-limb
+  // bignum functions instead, exercised indirectly by the X25519/
+  // Ed25519 self-tests below rather than a standalone bignum check.
 
   // Round 71: general-purpose GPIO.
   let _ = gpio_self_check();

@@ -23,7 +23,10 @@ use "../../curve25519/src/lib.vani";
 // ported here -- DharaFS isn't wired into this port at all (see this
 // arc's own scope memory), and there's no file-signing use case on
 // this port without it. Only the raw in-memory path is ported, same
-// scope boundary already applied to Ed25519's own `msg` cap.
+// 512-byte `msg`/`data` cap curve25519's own `ed25519_verify` uses
+// (a practical stack-buffer size, not an algorithmic limit -- see
+// that package's own `ed25519_hash_2block_msg` for why hashing itself
+// has no length cap at all).
 //
 // Verification reuses kernel_main.vani's own already-independently-
 // verified pinned key/message/signature (see that file's own
@@ -40,7 +43,7 @@ fn pki_pinned_key() -> [u8; 32] {
   ];
 }
 
-fn pki_verify_raw(data: ref [u8; 64], data_len: i64, sig: ref [u8; 64]) -> i64 {
+fn pki_verify_raw(data: ref [u8; 512], data_len: i64, sig: ref [u8; 64]) -> i64 {
   let key: [u8; 32] = pki_pinned_key();
   return ed25519_verify(ref key, data, data_len, sig);
 }
@@ -50,7 +53,7 @@ fn pki_self_test() -> i64 {
 
   let msg_str: Str = "Dhruva PKI demo payload -- config or update content";
   let msg_len: i64 = str_len_bytes(msg_str);
-  let msg: [u8; 64] = ed25519_zero64_bytes();
+  let msg: [u8; 512] = ed25519_zero512_bytes();
   let mi: i64 = 0;
   while mi < msg_len {
     msg[mi] = str_byte_at(msg_str, mi) as u8;
@@ -72,7 +75,7 @@ fn pki_self_test() -> i64 {
     ok = 0; // a genuine signature from the matching private key must verify
   }
 
-  let bad_msg: [u8; 64] = ed25519_zero64_bytes();
+  let bad_msg: [u8; 512] = ed25519_zero512_bytes();
   let bi: i64 = 0;
   while bi < msg_len {
     bad_msg[bi] = msg[bi];

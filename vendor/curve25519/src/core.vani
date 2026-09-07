@@ -1,20 +1,40 @@
-// curve25519 v0.1.0 -- field25519 (GF(2^255-19) field arithmetic),
-// X25519 (RFC 7748 Diffie-Hellman), and Ed25519 (RFC 8032 EdDSA
-// sign/verify), pure vani, hardware-agnostic and heap-free. Depends
-// on crypto_hash for SHA-512 (Ed25519's deterministic nonce
-// derivation and challenge hash) -- vendored at ./vendor/crypto_hash
-// and pulled in below via a direct relative `use`, not vani.toml
-// [deps] resolution: a real vani-compiler bug (index-assignment
-// statements with a function-call RHS fail to resolve the callee
-// inside any named scope -- a `module {}` block or a `[deps]`-
-// vendored package -- even though the identical call resolves fine
-// in a `let` binding or at plain top level) breaks [deps]-based
-// package consumption for any package whose internal helpers are
-// called via `buf[i] = helper(...)`, which SHA-256/512's own
-// compression loops do throughout. Flat `use`-based inclusion (no
-// named-scope wrapper at all) sidesteps the bug entirely. Filed
-// upstream; see vani-compiler/docs/TODO_CURRENT.md.
-use "../../crypto_hash/src/lib.vani";
+// curve25519 CORE v0.2.0 -- field25519 (GF(2^255-19) field
+// arithmetic), X25519 (RFC 7748 Diffie-Hellman), and Ed25519 (RFC
+// 8032 EdDSA sign/verify) -- primitives ONLY, no `x25519_self_test`/
+// `ed25519_self_test`. Does NOT include either self-test for the
+// SAME reason `crypto_hash/src/core.vani` excludes its own one-shot
+// wrappers: a consumer with a pre-existing function literally named
+// `x25519_self_test`/`ed25519_self_test` (e.g. DhruvaOS's Pi 1
+// kernel, which has its own of that exact name already) can't `use`
+// the full `src/lib.vani` without a name collision -- see that file's
+// own header comment for the general story. This file's own
+// dependency on crypto_hash is ALSO core-only (`./vendor/crypto_hash/
+// src/core.vani`, not `lib.vani`) for the identical reason one level
+// down: `ed25519_secret_expand` uses streaming `sha512_init`/
+// `update`/`finalize` instead of the one-shot `sha512_hash`
+// specifically so this file never needs anything beyond
+// crypto_hash's own primitives-only core.
+//
+// Pulled in via a direct relative `use`, not vani.toml [deps]
+// resolution: a real vani-compiler bug (index-assignment statements
+// with a function-call RHS fail to resolve the callee inside any
+// named scope -- a `module {}` block or a `[deps]`-vendored package
+// -- even though the identical call resolves fine in a `let` binding
+// or at plain top level) breaks [deps]-based package consumption for
+// any package whose internal helpers are called via
+// `buf[i] = helper(...)`, which SHA-256/512's own compression loops
+// do throughout. Flat `use`-based inclusion (no named-scope wrapper
+// at all) sidesteps the bug entirely. Filed upstream; see
+// vani-compiler/docs/TODO_CURRENT.md, BUG-234.
+//
+// Kept in sync with `src/lib.vani` by construction (this file's
+// content is a subset extracted from that one, not a separate
+// implementation) -- if you change an algorithm here, mirror the
+// change there too, and vice versa. A consumer with no naming
+// conflict (DhruvaOS's Pi 4/5 port, the `pki` package) should keep
+// using the full `src/lib.vani` -- there's no reason to prefer this
+// file unless a real name collision forces it.
+use "../../crypto_hash/src/core.vani";
 //
 // Extracted from DhruvaOS's Pi 4/5 port (originally a direct port of
 // that project's Pi 1 kernel's own `field25519_*`/`bignum_*`/
@@ -543,55 +563,6 @@ fn x25519_scalarmult(k_bytes: ref [u8; 32], u_in_bytes: ref [u8; 32]) -> [u8; 32
 // trials). Not re-derived here -- reusing that already-verified
 // ground truth directly, same as SHA-256/SHA-512's own KATs reuse
 // FIPS's.
-fn x25519_self_test() -> i64 {
-  let ok: i64 = 1;
-
-  let test1_k: [u8; 32] = [
-    0x60 as u8, 0xb7 as u8, 0xb2 as u8, 0xc0 as u8, 0xd9 as u8, 0x51 as u8, 0x1c as u8, 0xbd as u8,
-    0x53 as u8, 0x2b as u8, 0xda as u8, 0xdd as u8, 0xdf as u8, 0xd5 as u8, 0xb5 as u8, 0xa8 as u8,
-    0x5d as u8, 0x0b as u8, 0x49 as u8, 0xab as u8, 0x55 as u8, 0x03 as u8, 0x9f as u8, 0xd3 as u8,
-    0x21 as u8, 0xba as u8, 0x87 as u8, 0xda as u8, 0xe8 as u8, 0x63 as u8, 0x8e as u8, 0x4c as u8
-  ];
-  let test1_basepoint: [u8; 32] = [
-    9 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
-  let test1_expected: [u8; 32] = [
-    0xe0 as u8, 0x7a as u8, 0xe4 as u8, 0x20 as u8, 0x24 as u8, 0x0d as u8, 0x20 as u8, 0xa2 as u8,
-    0x7d as u8, 0xf3 as u8, 0xc1 as u8, 0x96 as u8, 0xf7 as u8, 0x3b as u8, 0x54 as u8, 0xb6 as u8,
-    0x43 as u8, 0x58 as u8, 0xbd as u8, 0x16 as u8, 0x19 as u8, 0x9f as u8, 0x97 as u8, 0x76 as u8,
-    0x26 as u8, 0x26 as u8, 0x82 as u8, 0x42 as u8, 0x05 as u8, 0xe1 as u8, 0x7f as u8, 0x69 as u8
-  ];
-  let test1_out: [u8; 32] = x25519_scalarmult(ref test1_k, ref test1_basepoint);
-  let test1_i: i64 = 0;
-  while test1_i < 32 {
-    if test1_out[test1_i] != test1_expected[test1_i] { ok = 0; }
-    test1_i = test1_i + 1;
-  }
-
-  let test2_u: [u8; 32] = [
-    0x20 as u8, 0xc9 as u8, 0xb8 as u8, 0x13 as u8, 0x92 as u8, 0xa4 as u8, 0x6b as u8, 0x37 as u8,
-    0xd9 as u8, 0xa5 as u8, 0xd5 as u8, 0xc1 as u8, 0xf5 as u8, 0x73 as u8, 0x7c as u8, 0xca as u8,
-    0x4f as u8, 0xc9 as u8, 0x71 as u8, 0x21 as u8, 0x89 as u8, 0xc0 as u8, 0xf1 as u8, 0x84 as u8,
-    0x23 as u8, 0x35 as u8, 0xec as u8, 0x89 as u8, 0xbd as u8, 0xeb as u8, 0xca as u8, 0x0d as u8
-  ];
-  let test2_expected: [u8; 32] = [
-    0x12 as u8, 0x8e as u8, 0x3d as u8, 0x71 as u8, 0x61 as u8, 0x9e as u8, 0x52 as u8, 0x72 as u8,
-    0x04 as u8, 0x99 as u8, 0x1f as u8, 0x8a as u8, 0x5c as u8, 0x80 as u8, 0x68 as u8, 0x2d as u8,
-    0x74 as u8, 0xea as u8, 0xa2 as u8, 0xda as u8, 0x8a as u8, 0xde as u8, 0x5c as u8, 0xcc as u8,
-    0xaa as u8, 0xdb as u8, 0x7a as u8, 0xfa as u8, 0xc3 as u8, 0xcc as u8, 0xc6 as u8, 0x66 as u8
-  ];
-  let test2_out: [u8; 32] = x25519_scalarmult(ref test1_k, ref test2_u);
-  let test2_i: i64 = 0;
-  while test2_i < 32 {
-    if test2_out[test2_i] != test2_expected[test2_i] { ok = 0; }
-    test2_i = test2_i + 1;
-  }
-
-  return ok;
-}
 
 // Ed25519 (RFC 8032) -- EdDSA signatures over Curve25519 in
 // twisted-Edwards form, reusing field25519_add/_sub/_mul/_sqr/_invert
@@ -1229,119 +1200,3 @@ fn ed25519_verify(pubkey: ref [u8; 32], msg: ref [u8; 512], msg_len: i64, sig: r
 
   return ed25519_point_equal(ref sb, ref rhs);
 }
-
-// RFC 8032-shaped known-answer check reusing kernel_main.vani's own
-// already-independently-verified seed/message/expected-pubkey/
-// expected-signature (see this section's header comment for the full
-// provenance) -- same algorithm, same constants -> byte-identical
-// expected output. Covers pubkey derivation, signing, self-
-// verification, AND both tamper-rejection paths (flipped signature
-// bit, flipped message bit) -- the actual security property, not just
-// "produces something."
-fn ed25519_self_test() -> i64 {
-  let ok: i64 = 1;
-
-  let seed: [u8; 32] = [
-    0x00 as u8, 0x01 as u8, 0x02 as u8, 0x03 as u8, 0x04 as u8, 0x05 as u8, 0x06 as u8, 0x07 as u8,
-    0x08 as u8, 0x09 as u8, 0x0a as u8, 0x0b as u8, 0x0c as u8, 0x0d as u8, 0x0e as u8, 0x0f as u8,
-    0x10 as u8, 0x11 as u8, 0x12 as u8, 0x13 as u8, 0x14 as u8, 0x15 as u8, 0x16 as u8, 0x17 as u8,
-    0x18 as u8, 0x19 as u8, 0x1a as u8, 0x1b as u8, 0x1c as u8, 0x1d as u8, 0x1e as u8, 0x1f as u8
-  ];
-
-  let msg_str: Str = "Dhruva Ed25519 test message";
-  let msg_len: i64 = str_len_bytes(msg_str);
-  let msg: [u8; 512] = ed25519_zero512_bytes();
-  let mi: i64 = 0;
-  while mi < msg_len {
-    msg[mi] = str_byte_at(msg_str, mi) as u8;
-    mi = mi + 1;
-  }
-
-  let expected_pub: [u8; 32] = [
-    0x03 as u8, 0xa1 as u8, 0x07 as u8, 0xbf as u8, 0xf3 as u8, 0xce as u8, 0x10 as u8, 0xbe as u8,
-    0x1d as u8, 0x70 as u8, 0xdd as u8, 0x18 as u8, 0xe7 as u8, 0x4b as u8, 0xc0 as u8, 0x99 as u8,
-    0x67 as u8, 0xe4 as u8, 0xd6 as u8, 0x30 as u8, 0x9b as u8, 0xa5 as u8, 0x0d as u8, 0x5f as u8,
-    0x1d as u8, 0xdc as u8, 0x86 as u8, 0x64 as u8, 0x12 as u8, 0x55 as u8, 0x31 as u8, 0xb8 as u8
-  ];
-  let expected_sig: [u8; 64] = [
-    0xbb as u8, 0x89 as u8, 0x59 as u8, 0x11 as u8, 0x1f as u8, 0xc8 as u8, 0x7b as u8, 0xf9 as u8,
-    0x3c as u8, 0x54 as u8, 0xde as u8, 0x30 as u8, 0xfc as u8, 0x11 as u8, 0xf0 as u8, 0x09 as u8,
-    0x7d as u8, 0x8c as u8, 0xf7 as u8, 0x58 as u8, 0x64 as u8, 0xa2 as u8, 0x7c as u8, 0xb7 as u8,
-    0x6c as u8, 0x5a as u8, 0x97 as u8, 0x24 as u8, 0x50 as u8, 0x4d as u8, 0x70 as u8, 0x80 as u8,
-    0xe4 as u8, 0x72 as u8, 0xf9 as u8, 0x86 as u8, 0x71 as u8, 0x16 as u8, 0x1d as u8, 0xb0 as u8,
-    0x08 as u8, 0x60 as u8, 0xe8 as u8, 0x78 as u8, 0x85 as u8, 0x79 as u8, 0xa0 as u8, 0x63 as u8,
-    0xa1 as u8, 0x2a as u8, 0x1a as u8, 0xb1 as u8, 0x7a as u8, 0x3e as u8, 0x3f as u8, 0xc7 as u8,
-    0x08 as u8, 0xb9 as u8, 0x77 as u8, 0xae as u8, 0xd5 as u8, 0xf1 as u8, 0x02 as u8, 0x01 as u8
-  ];
-
-  let pub_out: [u8; 32] = ed25519_secret_to_public(ref seed);
-  if sha256_digest_equal(ref pub_out, ref expected_pub) == 0 {
-    ok = 0;
-  }
-
-  let sig_out: [u8; 64] = ed25519_sign(ref seed, ref msg, msg_len);
-  if sha512_digest_equal(ref sig_out, ref expected_sig) == 0 {
-    ok = 0;
-  }
-
-  if ed25519_verify(ref pub_out, ref msg, msg_len, ref sig_out) == 0 {
-    ok = 0; // must accept its own valid signature
-  }
-
-  let bad_sig: [u8; 64] = ed25519_zero64_bytes();
-  let bi: i64 = 0;
-  while bi < 64 {
-    bad_sig[bi] = sig_out[bi];
-    bi = bi + 1;
-  }
-  bad_sig[0] = ((bad_sig[0] as u32) ^ (1 as u32)) as u8;
-  if ed25519_verify(ref pub_out, ref msg, msg_len, ref bad_sig) == 1 {
-    ok = 0;
-  }
-
-  let bad_msg: [u8; 512] = ed25519_zero512_bytes();
-  let ci: i64 = 0;
-  while ci < msg_len {
-    bad_msg[ci] = msg[ci];
-    ci = ci + 1;
-  }
-  bad_msg[0] = ((bad_msg[0] as u32) ^ (1 as u32)) as u8;
-  if ed25519_verify(ref pub_out, ref bad_msg, msg_len, ref sig_out) == 1 {
-    ok = 0;
-  }
-
-  // A 130-byte message (over the OLD 64-byte cap this API had before
-  // moving to streaming SHA-512 internally -- see ed25519_hash_2block
-  // _msg's own header comment) -- proves the real motivating case
-  // (TLS 1.3's own CertificateVerify signed-content, ~130 bytes)
-  // works, not just that small messages still do. Same seed as above
-  // (so the expected pubkey is already verified); message and
-  // signature independently generated via the real `cryptography`
-  // Python library, not derived from this same vani code.
-  let big_msg: [u8; 512] = ed25519_zero512_bytes();
-  let bmi: i64 = 0;
-  while bmi < 130 {
-    big_msg[bmi] = (((bmi * 7 + 3) as u32) & (255 as u32)) as u8;
-    bmi = bmi + 1;
-  }
-  let big_sig: [u8; 64] = ed25519_sign(ref seed, ref big_msg, 130);
-  let expected_big_sig: [u8; 64] = [
-    0x7d as u8, 0xe1 as u8, 0x57 as u8, 0x85 as u8, 0x78 as u8, 0x88 as u8, 0x38 as u8, 0x6f as u8,
-    0x02 as u8, 0x43 as u8, 0xfe as u8, 0x47 as u8, 0xaa as u8, 0xef as u8, 0x5b as u8, 0xdb as u8,
-    0x6a as u8, 0x39 as u8, 0xef as u8, 0x07 as u8, 0xc5 as u8, 0x32 as u8, 0xe5 as u8, 0x5e as u8,
-    0x5b as u8, 0x23 as u8, 0xda as u8, 0xdf as u8, 0xa0 as u8, 0x71 as u8, 0xb0 as u8, 0xf3 as u8,
-    0xfc as u8, 0x90 as u8, 0xe4 as u8, 0xa5 as u8, 0x22 as u8, 0xa4 as u8, 0xd9 as u8, 0x5e as u8,
-    0xd4 as u8, 0x89 as u8, 0xf4 as u8, 0x5d as u8, 0x1a as u8, 0x3c as u8, 0xc6 as u8, 0x5e as u8,
-    0xcd as u8, 0x9c as u8, 0x3b as u8, 0x26 as u8, 0xec as u8, 0x17 as u8, 0x02 as u8, 0x54 as u8,
-    0xe1 as u8, 0xca as u8, 0xe5 as u8, 0x57 as u8, 0xe6 as u8, 0xb3 as u8, 0x30 as u8, 0x05 as u8
-  ];
-  if sha512_digest_equal(ref big_sig, ref expected_big_sig) == 0 {
-    ok = 0;
-  }
-  if ed25519_verify(ref pub_out, ref big_msg, 130, ref big_sig) == 0 {
-    ok = 0;
-  }
-
-  return ok;
-}
-

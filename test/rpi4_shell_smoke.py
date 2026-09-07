@@ -45,7 +45,7 @@ import time
 
 QEMU_BIN = "qemu-system-aarch64"
 MACHINE = "raspi4b"
-DEFAULT_TIMEOUT_S = 25
+DEFAULT_TIMEOUT_S = 40
 # Round 96 added ed25519_self_test_rpi4 to the boot sequence AND as a
 # shell command -- Ed25519's own double-and-add point-multiplication
 # ladder does far more field arithmetic per bit than X25519's single
@@ -58,8 +58,18 @@ DEFAULT_TIMEOUT_S = 25
 # window (all boot self-tests + the 5-tick preemption demo); CMD_WAIT_S
 # bumped from 1 to comfortably exceed ed25519's own ~2s per-command
 # runtime so the next command isn't sent while it's still computing.
+#
+# Round 100 (Pi1 X25519/Ed25519 migration) added a 130-byte KAT to
+# curve25519's own ed25519_self_test (proving the streaming-SHA-512
+# redesign that removed the old 64-byte msg cap actually works) --
+# confirmed via a direct timestamped probe this pushed the shell's
+# own `ed25519` command to ~2.9s, right at the edge of the old 3s
+# CMD_WAIT_S margin (and the intermittent `pki` failures this exposed
+# traced to exactly that: the next command's keystrokes landing while
+# ed25519_self_test was still running, getting lost rather than
+# dispatched). Bumped CMD_WAIT_S to 5 for solid headroom.
 SETTLE_S = 7
-CMD_WAIT_S = 3
+CMD_WAIT_S = 5
 
 
 def run(elf_path: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[int, str]:

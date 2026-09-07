@@ -4154,6 +4154,77 @@ than assumed:
   Ed25519, and PKI still have their own separate Pi 1 implementations
   duplicating `vani-curve25519`/`vani-pki` and would need the same
   treatment to close the generification gap fully -- not started.
+
+  **ROUND 100 UPDATE, 2026-09-07**: Pi 1 X25519/Ed25519/PKI migrated
+  to the shared `curve25519`/`pki` kosh packages -- second Phase 1
+  migration, same shape as round 99's SHA-256/512 pilot but larger
+  (bignum foundation + field25519 + X25519 + Ed25519, ~30 functions,
+  ~1300 lines deleted).
+
+  Found a real gap before touching Pi 1: `curve25519`'s own
+  `ed25519_sign`/`verify` capped `msg` at 64 bytes, but Pi 1's real
+  callers (TLS 1.3's own CertificateVerify signed-content, a fixed
+  130 bytes) exceed that. Fixed the package itself first -- rewrote
+  the internal r=H(prefix||msg) and k=H(R||A||msg) hashing to use
+  streaming SHA-512 (`sha512_init`/`update`/`finalize`) instead of the
+  one-shot `sha512_hash`, removing the hashing-side cap entirely, then
+  raised the public `msg` array bound to 512 bytes (comfortable
+  headroom, not an algorithmic limit anymore). Verified with a new
+  130-byte KAT cross-checked against the real `cryptography` Python
+  library, added to `curve25519`'s own self-test.
+
+  Found a second real problem specific to this migration: unlike
+  SHA-256/512 (where crypto_hash's own name collisions were the only
+  issue), `curve25519`'s FULL API also defines `x25519_self_test`/
+  `ed25519_self_test` -- both ALSO collide with Pi 1's own pre-
+  existing functions of those names. Fixed by giving `curve25519` the
+  same core.vani/lib.vani split round 99 gave `crypto_hash`:
+  `core.vani` has every primitive (field25519/X25519/Ed25519) minus
+  both self-tests, and ALSO switched `ed25519_secret_expand`'s own
+  32-byte secret-hash from the one-shot `sha512_hash` to streaming, so
+  `curve25519/core.vani` itself only ever needs `crypto_hash/
+  core.vani` -- no transitive collision two levels down either.
+
+  Deleted Pi 1's own bignum foundation (`bignum_add_raw`/`sub_raw`/
+  `mul_raw`/etc + its own `bignum_self_test`), field25519 arithmetic,
+  and Ed25519 point arithmetic (~1300 lines total, rounds 44/67
+  originally) -- all internal-only, zero external callers. Kept
+  `x25519_scalarmult`/`ed25519_secret_to_public`/`sign`/`verify` as
+  `_heap`-suffixed adapters (name collision with the package's own
+  functions, same reasoning as round 99's SHA adapters) -- 21 external
+  call sites (11 TLS `x25519_scalarmult`, 3 `secret_to_public`, 3
+  `sign`, 4 `verify` incl. PKI's own `pki_verify_raw`) renamed to
+  match. `x25519_self_test`/`ed25519_self_test` themselves keep their
+  ORIGINAL names (no collision once using `core.vani`), rewritten to
+  call the new `_heap` adapters with their own existing KAT vectors
+  unchanged. Removed ~100 lines of now-dead boot-time persistent-
+  scratch allocations (`ed25519_*_set`/`x25519_*_set`, ~5.5KB heap)
+  and the `ed25519_init`/`field25519_init`/`bignum_self_test` boot
+  calls that initialized them.
+
+  One test-harness timing recalibration needed on the Pi 4/5 side
+  (`test/rpi4_shell_smoke.py`'s own `CMD_WAIT_S`, 3->5): `curve25519`'s
+  new 130-byte Ed25519 KAT pushed the shell's own `ed25519` command to
+  ~2.9s, right at the edge of the old margin -- confirmed via a direct
+  timestamped probe, not a functional regression.
+
+  Verified live under QEMU on BOTH ports: Pi 4/5's own 8 smoke tests
+  (19 shell commands) all pass after the timing recalibration; Pi 1
+  boots with all 19 real `CRYPTO: ...` self-test lines showing
+  `(PASS)` and `test/phase4_milestone.py`'s full regression battery
+  (100+ checks across networking/DharaFS/scheduler/crypto) passes with
+  zero `(FAIL)` lines in the authoritative harness run (a raw ad-hoc
+  boot capture briefly suggested 4 DharaFS AEAD tests had regressed --
+  traced to a timing artifact in that quick diagnostic script itself,
+  not a real failure; confirmed pre-existing by testing round 99's own
+  unmodified baseline, which shows the identical apparent failure
+  under the same raw-capture method).
+
+  **Next**: ChaCha20/Poly1305 is the only piece left duplicating a Pi
+  4/5-side package -- except Pi 4/5 doesn't have ChaCha20-Poly1305 at
+  all yet, so that migration needs a brand-new package extraction
+  first, not just a Pi-1-consumes-existing-package pass like rounds
+  99-100.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
