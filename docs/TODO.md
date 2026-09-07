@@ -4551,6 +4551,56 @@ than assumed:
   multi-field STATE MACHINE in this effort (beyond a simple cache/
   table), a bigger design step than filter/ARP/IPv4/UDP. TCP last
   (largest, ~15-field connection struct).
+
+  **ROUND 106e UPDATE, 2026-09-07**: DHCP added to `vani-netstack`
+  (v0.5.0, pushed) -- BOOTP fixed-header build/parse, message-type
+  constants, options 50/51/53/54 scan (byte and u32 forms), the
+  client's own DISCOVER/REQUEST/RENEW-REQUEST builders, and the
+  server's own OFFER/ACK/NAK builders plus its 4-slot lease-table
+  lookup (`DhcpLeaseTable`, extending `ArpCache`'s own value-type-
+  state design). Every real DHCP message here is small and fixed-size
+  (256 bytes max) -- unlike UDP's own variable-length payload, so
+  this module uses a standalone `[u8;512]` buffer + `dhcp_offset`,
+  matching the filter/ARP precedent rather than IPv4/UDP's own
+  offset-independent/streaming designs, confirmed correct by checking
+  the real max message size FIRST (per this effort's own recurring
+  discipline) rather than assuming streaming was needed just because
+  DHCP "feels" like a bigger protocol.
+
+  Pi 1 has NEVER had a DHCP server (confirmed again this round via
+  grep -- zero `dhcp_server_*` functions exist there) -- the server-
+  side builders/lease-table have no Pi 1 code to migrate FROM, so
+  they were extracted directly from Pi 4/5's own implementation and
+  wired only into Pi 4/5 this round. This positions a FUTURE round to
+  give Pi 1 a real DHCP server by writing only the netif/socket
+  integration glue (`handle_discover`/`handle_request`/`poll`/
+  `send_reply`, plus the lease-table's own persistent storage, a new
+  `boot/dhcp_server_state.S`) -- the actual message-format algorithm
+  already exists and is already proven correct, unlike every other
+  migration in this effort which only had to UNIFY code that already
+  worked on both sides.
+
+  Client FSM-state constants (`dhcp_state_init`/`selecting`/etc, both
+  boards) deliberately NOT migrated -- pure per-role bookkeeping, not
+  message-format algorithm, same "don't migrate everything just
+  because it has the same name" judgment call filter's own `add_
+  rule`/`flush` needed in round 106a.
+
+  Verified on both boards: `vanic check`/`build.sh`/`build_rpi4.sh`
+  all passed. Pi 4/5: `rpi4_shell_smoke.py` zero `(FAIL)`, both
+  `DHCP: ...`/`DHCPS: ...` lines `(PASS)` (boot + on-demand `dhcp`/
+  `dhcps` commands). Pi 1: `phase4_milestone.py`'s full battery zero
+  `(FAIL)` -- all 3 of Pi 1's own DHCP self-tests pass, including the
+  more complex lease-RENEWAL (BOUND->RENEWING unicast->REBINDING
+  broadcast->refresh/expiry) and NAK-handling (client resets to INIT)
+  scenarios, not just the basic DISCOVER->OFFER->REQUEST->ACK->BOUND
+  happy path.
+
+  **Next**: TCP (round 106f) -- the largest and last piece of the
+  networking-generification effort, a ~15-field connection struct
+  (state/seq/ack/ports/ips/rtx-tracking), genuinely the biggest
+  design step of the whole effort. After that, round 103 (scheduler
+  scoping) and round 104 (X.509 fork) per the user's own stated order.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

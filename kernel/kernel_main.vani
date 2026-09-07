@@ -10117,6 +10117,32 @@ fn dhcp_server_port() -> u32 { return 67 as u32; }
 // see e.g. dharafs_compact's own copy loops), needed here for chaddr's
 // padding and the sname/file fields every message carries but this
 // client never uses.
+// Round 106e: DHCP's own message build/parse ALGORITHM now lives in
+// the shared `netstack` package (`netstack_dhcp_*`), operating on a
+// standalone `[u8;512]` buffer + `dhcp_offset` -- every real DHCP
+// message here is small and fixed-size (256 bytes max), comfortably
+// within that cap regardless of this file's own much larger real
+// heap frame buffers. Each function below copies its own message
+// window into (and, for builders, back out of) a local `[u8;512]`.
+fn dhcp_copy_msg_to_local(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64) -> [u8; 512] {
+  let local: [u8; 512] = netstack_zero_frame();
+  let i: i64 = 0;
+  while i < dhcp_len {
+    local[dhcp_offset + i] = buf_read_byte(buf, (dhcp_offset + i) as u32) as u8;
+    i = i + 1;
+  }
+  return local;
+}
+
+fn dhcp_copy_msg_from_local(local: ref [u8; 512], buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64) -> i64 {
+  let i: i64 = 0;
+  while i < dhcp_len {
+    let _ = buf_write_byte(buf, (dhcp_offset + i) as u32, local[dhcp_offset + i] as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
 fn dhcp_zero_range(buf: mut ref i64, offset: i64, count: i64) -> i64 {
   let i: i64 = 0;
   while i < count {
@@ -10126,189 +10152,75 @@ fn dhcp_zero_range(buf: mut ref i64, offset: i64, count: i64) -> i64 {
   return 0;
 }
 
-// Writes the 240-byte fixed BOOTP header + magic cookie every DHCP
-// message shares, at buf[dhcp_offset..). Shared by both the client's
-// own DISCOVER/REQUEST builders (op=BOOTREQUEST, yiaddr/siaddr=0) and
-// the self-test's synthetic OFFER/ACK builders (op=BOOTREPLY,
-// yiaddr/siaddr set) -- one function, not duplicated per message type,
-// since the only real difference between them is which fields are
-// zero. Returns 240, the offset where type-specific options begin.
+fn dhcp_mac_to_local(mac: mut ref i64) -> [u8; 6] {
+  return [
+    buf_read_byte(mac, 0 as u32) as u8, buf_read_byte(mac, 1 as u32) as u8, buf_read_byte(mac, 2 as u32) as u8,
+    buf_read_byte(mac, 3 as u32) as u8, buf_read_byte(mac, 4 as u32) as u8, buf_read_byte(mac, 5 as u32) as u8
+  ];
+}
+
 fn dhcp_build_fixed_header(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, op: u32, ciaddr: u32, yiaddr: u32, siaddr: u32) -> i64 {
-  let _ = buf_write_byte(buf, dhcp_offset as u32, op);
-  let _ = buf_write_byte(buf, (dhcp_offset + 1) as u32, dhcp_htype_ethernet());
-  let _ = buf_write_byte(buf, (dhcp_offset + 2) as u32, dhcp_hlen_ethernet());
-  let _ = buf_write_byte(buf, (dhcp_offset + 3) as u32, 0 as u32); // hops
-  let _ = buf_write_u32_be(buf, dhcp_offset + 4, xid);
-  let _ = buf_write_u16_be(buf, dhcp_offset + 8, 0 as u32); // secs
-  let _ = buf_write_u16_be(buf, dhcp_offset + 10, 0x8000 as u32); // flags: broadcast
-  let _ = buf_write_u32_be(buf, dhcp_offset + 12, ciaddr);
-  let _ = buf_write_u32_be(buf, dhcp_offset + 16, yiaddr);
-  let _ = buf_write_u32_be(buf, dhcp_offset + 20, siaddr);
-  let _ = buf_write_u32_be(buf, dhcp_offset + 24, 0 as u32); // giaddr: no relay agent
-  let i: i64 = 0;
-  while i < 6 {
-    let mb: u32 = buf_read_byte(mac, i as u32);
-    let _ = buf_write_byte(buf, (dhcp_offset + 28 + i) as u32, mb);
-    i = i + 1;
-  }
-  let _ = dhcp_zero_range(buf, dhcp_offset + 34, 10); // chaddr padding (16 - 6)
-  let _ = dhcp_zero_range(buf, dhcp_offset + 44, 64); // sname
-  let _ = dhcp_zero_range(buf, dhcp_offset + 108, 128); // file
-  let _ = buf_write_byte(buf, (dhcp_offset + 236) as u32, 99 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 237) as u32, 130 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 238) as u32, 83 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 239) as u32, 99 as u32);
-  return 240;
+  let mac_arr: [u8; 6] = dhcp_mac_to_local(mac);
+  let local: [u8; 512] = netstack_zero_frame();
+  let msg_len: i64 = netstack_dhcp_build_fixed_header(mut ref local, dhcp_offset, ref mac_arr, xid, op, ciaddr, yiaddr, siaddr);
+  let _ = dhcp_copy_msg_from_local(ref local, buf, dhcp_offset, msg_len);
+  return msg_len;
 }
 
 fn dhcp_build_discover(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32) -> i64 {
-  let _ = dhcp_build_fixed_header(buf, dhcp_offset, mac, xid, dhcp_op_bootrequest(), 0 as u32, 0 as u32, 0 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 240) as u32, 53 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 241) as u32, 1 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 242) as u32, dhcp_msgtype_discover());
-  let _ = buf_write_byte(buf, (dhcp_offset + 243) as u32, 255 as u32); // End
-  return 244;
+  let mac_arr: [u8; 6] = dhcp_mac_to_local(mac);
+  let local: [u8; 512] = netstack_zero_frame();
+  let msg_len: i64 = netstack_dhcp_build_discover(mut ref local, dhcp_offset, ref mac_arr, xid);
+  let _ = dhcp_copy_msg_from_local(ref local, buf, dhcp_offset, msg_len);
+  return msg_len;
 }
 
-// RFC 2131 s4.3.2: the REQUEST following an OFFER echoes the offered
-// address back via option 50 and names which server it's accepting
-// via option 54 -- required so every OTHER server that also offered
-// (this client only ever sees one, but a real network can have many)
-// knows this client picked someone else and its own offer expired.
 fn dhcp_build_request(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, requested_ip: u32, server_ip: u32) -> i64 {
-  let _ = dhcp_build_fixed_header(buf, dhcp_offset, mac, xid, dhcp_op_bootrequest(), 0 as u32, 0 as u32, 0 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 240) as u32, 53 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 241) as u32, 1 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 242) as u32, dhcp_msgtype_request());
-  let _ = buf_write_byte(buf, (dhcp_offset + 243) as u32, 50 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 244) as u32, 4 as u32);
-  let _ = buf_write_u32_be(buf, dhcp_offset + 245, requested_ip);
-  let _ = buf_write_byte(buf, (dhcp_offset + 249) as u32, 54 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 250) as u32, 4 as u32);
-  let _ = buf_write_u32_be(buf, dhcp_offset + 251, server_ip);
-  let _ = buf_write_byte(buf, (dhcp_offset + 255) as u32, 255 as u32); // End
-  return 256;
+  let mac_arr: [u8; 6] = dhcp_mac_to_local(mac);
+  let local: [u8; 512] = netstack_zero_frame();
+  let msg_len: i64 = netstack_dhcp_build_request(mut ref local, dhcp_offset, ref mac_arr, xid, requested_ip, server_ip);
+  let _ = dhcp_copy_msg_from_local(ref local, buf, dhcp_offset, msg_len);
+  return msg_len;
 }
 
-// RFC 2131 s4.3.2: the RENEWING/REBINDING REQUEST is a different
-// shape from dhcp_build_request's own SELECTING-time broadcast --
-// ciaddr is set to the client's own already-leased address (not 0,
-// since the client already has an address it's asking to keep), and
-// neither option 50 (Requested IP) nor option 54 (Server Identifier)
-// are included: ciaddr already conveys the address, and there's no
-// "other server" to disambiguate from since this message either goes
-// unicast directly to the one server that granted the lease
-// (RENEWING) or broadcast with the client fully expecting only its
-// own lessor to recognize and renew it (REBINDING). Whether it goes
-// out unicast or broadcast is entirely the caller's choice of dst_mac/
-// dst_ip -- this builder only knows how to shape the message itself.
 fn dhcp_build_renew_request(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, ciaddr: u32) -> i64 {
-  let _ = dhcp_build_fixed_header(buf, dhcp_offset, mac, xid, dhcp_op_bootrequest(), ciaddr, 0 as u32, 0 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 240) as u32, 53 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 241) as u32, 1 as u32);
-  let _ = buf_write_byte(buf, (dhcp_offset + 242) as u32, dhcp_msgtype_request());
-  let _ = buf_write_byte(buf, (dhcp_offset + 243) as u32, 255 as u32); // End
-  return 244;
+  let mac_arr: [u8; 6] = dhcp_mac_to_local(mac);
+  let local: [u8; 512] = netstack_zero_frame();
+  let msg_len: i64 = netstack_dhcp_build_renew_request(mut ref local, dhcp_offset, ref mac_arr, xid, ciaddr);
+  let _ = dhcp_copy_msg_from_local(ref local, buf, dhcp_offset, msg_len);
+  return msg_len;
 }
 
 fn dhcp_get_op(buf: mut ref i64, dhcp_offset: i64) -> u32 {
-  return buf_read_byte(buf, dhcp_offset as u32);
+  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 1);
+  return netstack_dhcp_get_op(ref local, dhcp_offset);
 }
 fn dhcp_get_xid(buf: mut ref i64, dhcp_offset: i64) -> u32 {
-  return buf_read_u32_be(buf, dhcp_offset + 4);
+  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 8);
+  return netstack_dhcp_get_xid(ref local, dhcp_offset);
 }
 fn dhcp_get_yiaddr(buf: mut ref i64, dhcp_offset: i64) -> u32 {
-  return buf_read_u32_be(buf, dhcp_offset + 16);
+  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 20);
+  return netstack_dhcp_get_yiaddr(ref local, dhcp_offset);
 }
-
-// Round 22: needed to verify dhcp_build_renew_request's own ciaddr
-// field from a self-test -- nothing needed to READ this field before
-// this round, since ciaddr was always 0 in every message this client
-// built until now.
 fn dhcp_get_ciaddr(buf: mut ref i64, dhcp_offset: i64) -> u32 {
-  return buf_read_u32_be(buf, dhcp_offset + 12);
+  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 16);
+  return netstack_dhcp_get_ciaddr(ref local, dhcp_offset);
 }
 
 fn dhcp_verify_magic_cookie(buf: mut ref i64, dhcp_offset: i64) -> i64 {
-  let c0: u32 = buf_read_byte(buf, (dhcp_offset + 236) as u32);
-  let c1: u32 = buf_read_byte(buf, (dhcp_offset + 237) as u32);
-  let c2: u32 = buf_read_byte(buf, (dhcp_offset + 238) as u32);
-  let c3: u32 = buf_read_byte(buf, (dhcp_offset + 239) as u32);
-  if (c0 == (99 as u32)) && (c1 == (130 as u32)) && (c2 == (83 as u32)) && (c3 == (99 as u32)) {
-    return 1;
-  }
-  return 0;
+  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 240);
+  return netstack_dhcp_verify_magic_cookie(ref local, dhcp_offset);
 }
 
-// Scans buf[dhcp_offset+240 .. dhcp_offset+dhcp_len) for `want_code`'s
-// single-byte value (option 53, DHCP Message Type). Bounded (max 64
-// options), same "capped, not `while true`" posture as every other
-// poll/scan loop in this codebase -- a malformed or hostile options
-// list with a bad length byte can't spin this forever, and every
-// length read is checked against `end` before being trusted as a skip
-// distance. Returns -1 if not found, the option is malformed (wrong
-// length or truncated), or the scan runs off the end without hitting
-// End (255) first.
 fn dhcp_find_option_byte(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64, want_code: u32) -> i64 {
-  let pos: i64 = dhcp_offset + 240;
-  let end: i64 = dhcp_offset + dhcp_len;
-  let iter: i64 = 0;
-  while (pos < end) && (iter < 64) {
-    let code: u32 = buf_read_byte(buf, pos as u32);
-    if code == (255 as u32) {
-      return 0 - 1;
-    }
-    if code == (0 as u32) {
-      pos = pos + 1;
-    } else {
-      if (pos + 1) >= end {
-        return 0 - 1;
-      }
-      let opt_len: u32 = buf_read_byte(buf, (pos + 1) as u32);
-      if code == want_code {
-        if (opt_len != (1 as u32)) || ((pos + 2) >= end) {
-          return 0 - 1;
-        }
-        return buf_read_byte(buf, (pos + 2) as u32) as i64;
-      }
-      pos = pos + 2 + (opt_len as i64);
-    }
-    iter = iter + 1;
-  }
-  return 0 - 1;
+  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, dhcp_len);
+  return netstack_dhcp_find_option_byte(ref local, dhcp_offset, dhcp_len, want_code);
 }
 
-// Same shape as dhcp_find_option_byte, for a 4-byte option value
-// (50=Requested IP, 54=Server Identifier). Returns 0 if not found --
-// 0.0.0.0 is never a real address to find here, matching arp_cache's
-// own "0 means unused" convention.
 fn dhcp_find_option_u32(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64, want_code: u32) -> u32 {
-  let pos: i64 = dhcp_offset + 240;
-  let end: i64 = dhcp_offset + dhcp_len;
-  let iter: i64 = 0;
-  while (pos < end) && (iter < 64) {
-    let code: u32 = buf_read_byte(buf, pos as u32);
-    if code == (255 as u32) {
-      return 0 as u32;
-    }
-    if code == (0 as u32) {
-      pos = pos + 1;
-    } else {
-      if (pos + 1) >= end {
-        return 0 as u32;
-      }
-      let opt_len: u32 = buf_read_byte(buf, (pos + 1) as u32);
-      if code == want_code {
-        if (opt_len != (4 as u32)) || ((pos + 2 + 4) > end) {
-          return 0 as u32;
-        }
-        return buf_read_u32_be(buf, pos + 2);
-      }
-      pos = pos + 2 + (opt_len as i64);
-    }
-    iter = iter + 1;
-  }
-  return 0 as u32;
+  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, dhcp_len);
+  return netstack_dhcp_find_option_u32(ref local, dhcp_offset, dhcp_len, want_code);
 }
 
 fn dhcp_broadcast_mac(out_mac: mut ref i64) -> i64 {
