@@ -4441,6 +4441,37 @@ than assumed:
   IPv4/UDP (mostly stateless) after that, then DHCP client+server
   (multi-field state machines), TCP last (largest, ~15-field
   connection struct). Not started.
+
+  **ROUND 106b UPDATE, 2026-09-07**: ARP added to `vani-netstack`
+  (v0.2.0, pushed) -- `ArpCache` (8-slot, MAC bytes flattened to
+  `[u8;48]` matching both boards' own existing accessor shape) plus
+  build/parse (`netstack_arp_build_request`/`build_reply`/`get_
+  ethertype`/`is_arp_frame`/`get_operation`/`get_sender_ip`/`get_
+  target_ip`/`get_sender_mac`), same value-type-state pattern as
+  `FilterConfig`. Both boards' own rule-table storage (`boot/arp_
+  state.S` on Pi 1 -- a heap-pointer MAC buffer, `boot/rpi4/arp_
+  state.S` on Pi 4/5 -- byte-indexed accessors, a real storage-
+  mechanism divide unchanged by this migration) untouched; only the
+  cache lookup/insert algorithm and the frame build/parse functions
+  moved. `arp_resolve_start`/`poll` (the real `netif_send_frame`/
+  `recv_frame` integration) stay board-specific, unchanged -- true
+  hardware glue, not duplicated logic.
+
+  Real vani-language limit hit again (`len` is a reserved keyword,
+  can't be used as a variable name -- previously known from round 84,
+  rediscovered live here as "expected identifier" pointing at the
+  token after `let len:`, fixed by renaming to `built_len`).
+
+  Verified on both boards: `vanic check`/`build.sh`/`build_rpi4.sh`
+  all passed. Pi 4/5: `rpi4_shell_smoke.py` zero `(FAIL)`, both
+  `ARP: ...` lines `(PASS)` (boot-time and on-demand `arp` command).
+  Pi 1: `phase4_milestone.py`'s full battery zero `(FAIL)` -- notably
+  `netstat shows the ARP entry udpecho inserted` directly exercises
+  the new `arp_cache_insert` path in real production traffic, not
+  just the self-test. Both `ARP: ...` self-test lines `(PASS)`.
+
+  **Next**: IPv4 (mostly stateless -- header build/checksum, no
+  cache/table of its own) is next, round 106c.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

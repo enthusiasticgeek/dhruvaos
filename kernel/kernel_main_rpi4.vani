@@ -1065,156 +1065,101 @@ fn arp_read_u32_be_rpi4(buf: ref [u8; 512], off: i64) -> u32 {
   return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
 }
 
+// Round 106b: ARP's own build/parse ALGORITHM now lives in the
+// shared `netstack` package (`netstack_arp_*`), confirmed a direct
+// port of this file's own former body before extraction. Thin
+// pass-throughs kept under their original names since they're used
+// throughout this file's own IPv4/ARP integration -- `arp_write_
+// u16_be_rpi4`/`arp_read_u32_be_rpi4`/etc. stay untouched (IPv4/TCP/
+// UDP/DHCP haven't migrated yet and still depend on them directly).
 fn arp_build_request_rpi4(out_frame: mut ref [u8; 512], my_mac: ref [u8; 6], my_ip: u32, target_ip: u32) -> i64 {
-  let i: i64 = 0;
-  while i < 6 {
-    out_frame[i] = 0xFF as u8; // dst: broadcast
-    i = i + 1;
-  }
-  let j: i64 = 0;
-  while j < 6 {
-    out_frame[6 + j] = my_mac[j];
-    j = j + 1;
-  }
-  let _ = arp_write_u16_be_rpi4(out_frame, 12, 0x0806 as u32); // ethertype: ARP
-  let _ = arp_write_u16_be_rpi4(out_frame, 14, 1 as u32);      // hwtype: Ethernet
-  let _ = arp_write_u16_be_rpi4(out_frame, 16, 0x0800 as u32); // ptype: IPv4
-  out_frame[18] = 6 as u8;
-  out_frame[19] = 4 as u8;
-  let _ = arp_write_u16_be_rpi4(out_frame, 20, 1 as u32); // op: request
-  let k: i64 = 0;
-  while k < 6 {
-    out_frame[22 + k] = my_mac[k]; // sender mac
-    k = k + 1;
-  }
-  let _ = arp_write_u32_be_rpi4(out_frame, 28, my_ip);
-  let m: i64 = 0;
-  while m < 6 {
-    out_frame[32 + m] = 0 as u8; // target mac: unknown
-    m = m + 1;
-  }
-  let _ = arp_write_u32_be_rpi4(out_frame, 38, target_ip);
-  return 42;
+  return netstack_arp_build_request(out_frame, my_mac, my_ip, target_ip);
 }
 
 fn arp_build_reply_rpi4(out_frame: mut ref [u8; 512], my_mac: ref [u8; 6], my_ip: u32, requester_mac: ref [u8; 6], requester_ip: u32) -> i64 {
-  let i: i64 = 0;
-  while i < 6 {
-    out_frame[i] = requester_mac[i]; // dst: the requester
-    i = i + 1;
-  }
-  let j: i64 = 0;
-  while j < 6 {
-    out_frame[6 + j] = my_mac[j];
-    j = j + 1;
-  }
-  let _ = arp_write_u16_be_rpi4(out_frame, 12, 0x0806 as u32);
-  let _ = arp_write_u16_be_rpi4(out_frame, 14, 1 as u32);
-  let _ = arp_write_u16_be_rpi4(out_frame, 16, 0x0800 as u32);
-  out_frame[18] = 6 as u8;
-  out_frame[19] = 4 as u8;
-  let _ = arp_write_u16_be_rpi4(out_frame, 20, 2 as u32); // op: reply
-  let k: i64 = 0;
-  while k < 6 {
-    out_frame[22 + k] = my_mac[k]; // sender: us
-    k = k + 1;
-  }
-  let _ = arp_write_u32_be_rpi4(out_frame, 28, my_ip);
-  let m: i64 = 0;
-  while m < 6 {
-    out_frame[32 + m] = requester_mac[m]; // target: the requester
-    m = m + 1;
-  }
-  let _ = arp_write_u32_be_rpi4(out_frame, 38, requester_ip);
-  return 42;
+  return netstack_arp_build_reply(out_frame, my_mac, my_ip, requester_mac, requester_ip);
 }
 
 fn arp_get_ethertype_rpi4(frame: ref [u8; 512]) -> u32 {
-  return arp_read_u16_be_rpi4(frame, 12);
+  return netstack_arp_get_ethertype(frame);
 }
 
 fn arp_is_arp_frame_rpi4(frame: ref [u8; 512]) -> i64 {
-  if arp_get_ethertype_rpi4(frame) == (0x0806 as u32) {
-    return 1;
-  }
-  return 0;
+  return netstack_arp_is_arp_frame(frame);
 }
 
 fn arp_get_operation_rpi4(frame: ref [u8; 512]) -> u32 {
-  return arp_read_u16_be_rpi4(frame, 20);
+  return netstack_arp_get_operation(frame);
 }
 
 fn arp_get_sender_ip_rpi4(frame: ref [u8; 512]) -> u32 {
-  return arp_read_u32_be_rpi4(frame, 28);
+  return netstack_arp_get_sender_ip(frame);
 }
 
 fn arp_get_target_ip_rpi4(frame: ref [u8; 512]) -> u32 {
-  return arp_read_u32_be_rpi4(frame, 38);
+  return netstack_arp_get_target_ip(frame);
 }
 
 fn arp_get_sender_mac_rpi4(frame: ref [u8; 512], out_mac: mut ref [u8; 6]) -> i64 {
-  let i: i64 = 0;
-  while i < 6 {
-    out_mac[i] = frame[22 + i];
-    i = i + 1;
-  }
-  return 0;
+  return netstack_arp_get_sender_mac(frame, out_mac);
 }
 
-// Looks up ip in the cache; if found, copies its MAC into out_mac and
-// returns 1; if not found, returns 0 (out_mac left untouched). Direct
-// port of kernel_main.vani's own arp_cache_lookup.
+// Round 106b: the cache's own lookup/insert ALGORITHM now lives in
+// the shared `netstack` package (`ArpCache`/`netstack_arp_cache_
+// lookup`/`insert`) -- a value-type struct with no persistent state
+// of its own, matching `FilterConfig`'s own design. This file's rule
+// TABLE storage (`boot/rpi4/arp_state.S`, the extern accessors above)
+// is untouched; these two functions' only job is round-tripping that
+// real state through an `ArpCache`.
+fn arp_cache_from_state_rpi4() -> ArpCache {
+  let count: u32 = arp_cache_get_count();
+  let ip: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let mac_bytes: [u8; 48] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let i: u32 = 0 as u32;
+  while i < count {
+    ip[i as i64] = arp_cache_get_ip(i);
+    let j: u32 = 0 as u32;
+    while j < (6 as u32) {
+      mac_bytes[(i * (6 as u32) + j) as i64] = arp_cache_get_mac_byte(i, j) as u8;
+      j = j + (1 as u32);
+    }
+    i = i + (1 as u32);
+  }
+  return ArpCache { count: count as i64, next_slot: arp_cache_get_next_slot() as i64, ip: ip, mac_bytes: mac_bytes };
+}
+
 fn arp_cache_lookup_rpi4(ip: u32, out_mac: mut ref [u8; 6]) -> i64 {
-  let count: u32 = arp_cache_get_count();
-  let i: u32 = 0 as u32;
-  while i < count {
-    if arp_cache_get_ip(i) == ip {
-      let j: i64 = 0;
-      while j < 6 {
-        let b: u32 = arp_cache_get_mac_byte(i, j as u32);
-        out_mac[j] = b as u8;
-        j = j + 1;
-      }
-      return 1;
+  let cache: ArpCache = arp_cache_from_state_rpi4();
+  let result: ArpLookupResult = netstack_arp_cache_lookup(ref cache, ip);
+  if result.found == 1 {
+    let i: i64 = 0;
+    while i < 6 {
+      out_mac[i] = result.mac[i];
+      i = i + 1;
     }
-    i = i + (1 as u32);
   }
-  return 0;
+  return result.found;
 }
 
-// Inserts/updates an IP -> MAC mapping. Updates in place if the IP is
-// already cached; otherwise appends while there's room (8 slots), or
-// overwrites the oldest entry round-robin once full -- direct port of
-// kernel_main.vani's own arp_cache_insert (a demo-scoped cache, not a
-// production one with real aging/timeouts).
 fn arp_cache_insert_rpi4(ip: u32, mac: ref [u8; 6]) -> i64 {
-  let count: u32 = arp_cache_get_count();
-  let i: u32 = 0 as u32;
-  while i < count {
-    if arp_cache_get_ip(i) == ip {
-      let j: i64 = 0;
-      while j < 6 {
-        let _ = arp_cache_set_mac_byte(i, j as u32, mac[j] as u32);
-        j = j + 1;
-      }
-      return 0;
+  let cache: ArpCache = arp_cache_from_state_rpi4();
+  let new_cache: ArpCache = netstack_arp_cache_insert(cache, ip, mac);
+  let _ = arp_cache_set_count(new_cache.count as u32);
+  let _ = arp_cache_set_next_slot(new_cache.next_slot as u32);
+  let i: i64 = 0;
+  while i < new_cache.count {
+    let _ = arp_cache_set_ip(i as u32, new_cache.ip[i]);
+    let j: i64 = 0;
+    while j < 6 {
+      let _ = arp_cache_set_mac_byte(i as u32, j as u32, new_cache.mac_bytes[i * 6 + j] as u32);
+      j = j + 1;
     }
-    i = i + (1 as u32);
-  }
-  let slot: u32 = 0 as u32;
-  if count < (8 as u32) {
-    slot = count;
-    let _ = arp_cache_set_count(count + (1 as u32));
-  } else {
-    slot = arp_cache_get_next_slot();
-    let next: u32 = (slot + (1 as u32)) & (7 as u32);
-    let _ = arp_cache_set_next_slot(next);
-  }
-  let _ = arp_cache_set_ip(slot, ip);
-  let k: i64 = 0;
-  while k < 6 {
-    let _ = arp_cache_set_mac_byte(slot, k as u32, mac[k] as u32);
-    k = k + 1;
+    i = i + 1;
   }
   return 0;
 }
