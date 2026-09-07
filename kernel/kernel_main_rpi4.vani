@@ -2520,39 +2520,34 @@ fn tcp_conn_self_test_rpi4() -> i64 {
 // Reuses round 88's `udp_get_dst_port_rpi4` as-is (identical
 // signature to what this module needs).
 
+// Round 106d: UDP's own checksum/header-codec ALGORITHM now lives in
+// the shared `netstack` package (`netstack_udp_*`/`UdpChecksumCtx`),
+// confirmed a direct port of this file's own former body before
+// extraction. Unlike IPv4's own fixed 20-byte header, UDP's checksum
+// spans the WHOLE datagram (header+payload, genuinely variable
+// length) -- the package streams it (`UdpChecksumCtx`/`update`/
+// `finalize`, mirroring `chacha20_poly1305`'s own `Poly1305Ctx`) with
+// no length cap, so each function here loops its own real `udp_len`
+// through the package in <=256-byte chunks rather than passing the
+// whole frame through.
 fn udp_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], udp_offset: i64, udp_len: i64) -> u32 {
-  let sum: u32 = 0 as u32;
-  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (src_ip & (0xFFFF as u32));
-  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (dst_ip & (0xFFFF as u32));
-  sum = sum + (17 as u32); // protocol (pseudo-header's zero byte contributes nothing)
-  sum = sum + (udp_len as u32);
-  let i: i64 = 0;
-  while (i + 1) < udp_len {
-    let word: u32 = arp_read_u16_be_rpi4(frame, udp_offset + i);
-    sum = sum + word;
-    i = i + 2;
+  let ctx: UdpChecksumCtx = netstack_udp_checksum_init(src_ip, dst_ip, udp_len);
+  let pos: i64 = 0;
+  while pos < udp_len {
+    let remaining: i64 = udp_len - pos;
+    let take: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = netstack_zero256_bytes();
+    let i: i64 = 0;
+    while i < take {
+      chunk[i] = frame[udp_offset + pos + i];
+      i = i + 1;
+    }
+    ctx = netstack_udp_checksum_update(ctx, ref chunk, take);
+    pos = pos + take;
   }
-  if i < udp_len {
-    let b: u32 = frame[udp_offset + i] as u32;
-    sum = sum + (b << (8 as u32)); // odd trailing byte, zero-padded low
-  }
-  while (sum >> (16 as u32)) != (0 as u32) {
-    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
-  }
-  let result: u32 = (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
-  if result == (0 as u32) {
-    return 0xFFFF as u32; // RFC 768: transmit all-ones, never a literal 0
-  }
-  return result;
+  return netstack_udp_checksum_finalize(ref ctx);
 }
 
-// See kernel_main.vani's own udp_verify_checksum comment for why the
-// verify criterion is `== 0xFFFF`, not `== 0` (matching ipv4's own
-// convention, unlike TCP's) -- udp_checksum_rpi4's own RFC-768
-// zero-substitution rule maps a valid as-transmitted datagram's
-// re-summed result to 0xFFFF, not 0.
 fn udp_verify_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], udp_offset: i64, udp_len: i64) -> i64 {
   if udp_checksum_rpi4(src_ip, dst_ip, frame, udp_offset, udp_len) == (0xFFFF as u32) {
     return 1;
@@ -2562,52 +2557,52 @@ fn udp_verify_checksum_rpi4(src_ip: u32, dst_ip: u32, frame: ref [u8; 512], udp_
 
 fn udp_build_rpi4(frame: mut ref [u8; 512], udp_offset: i64, src_port: u32, dst_port: u32, payload: ref [u8; 512], payload_len: i64, src_ip: u32, dst_ip: u32) -> i64 {
   let udp_len: i64 = 8 + payload_len;
-  let _ = arp_write_u16_be_rpi4(frame, udp_offset, src_port);
-  let _ = arp_write_u16_be_rpi4(frame, udp_offset + 2, dst_port);
-  let _ = arp_write_u16_be_rpi4(frame, udp_offset + 4, udp_len as u32);
-  let _ = arp_write_u16_be_rpi4(frame, udp_offset + 6, 0 as u32); // checksum placeholder
-  let i: i64 = 0;
-  while i < payload_len {
-    frame[udp_offset + 8 + i] = payload[i];
-    i = i + 1;
+  let hdr: [u8; 8] = netstack_udp_header_only(src_port, dst_port, udp_len);
+  let hi: i64 = 0;
+  while hi < 8 {
+    frame[udp_offset + hi] = hdr[hi];
+    hi = hi + 1;
   }
-  // Inline checksum -- same reborrow-avoidance reason as
-  // tcp_build_header_rpi4/ipv4_build_header_rpi4's own comments.
-  let sum: u32 = 0 as u32;
-  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (src_ip & (0xFFFF as u32));
-  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (dst_ip & (0xFFFF as u32));
-  sum = sum + (17 as u32);
-  sum = sum + (udp_len as u32);
   let j: i64 = 0;
-  while (j + 1) < udp_len {
-    let hi: u32 = frame[udp_offset + j] as u32;
-    let lo: u32 = frame[udp_offset + j + 1] as u32;
-    let word: u32 = (hi << (8 as u32)) | lo;
-    sum = sum + word;
-    j = j + 2;
+  while j < payload_len {
+    frame[udp_offset + 8 + j] = payload[j];
+    j = j + 1;
   }
-  if j < udp_len {
-    let b: u32 = frame[udp_offset + j] as u32;
-    sum = sum + (b << (8 as u32));
+
+  let ctx: UdpChecksumCtx = netstack_udp_checksum_init(src_ip, dst_ip, udp_len);
+  let pos: i64 = 0;
+  while pos < udp_len {
+    let remaining: i64 = udp_len - pos;
+    let take: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = netstack_zero256_bytes();
+    let k: i64 = 0;
+    while k < take {
+      chunk[k] = frame[udp_offset + pos + k];
+      k = k + 1;
+    }
+    ctx = netstack_udp_checksum_update(ctx, ref chunk, take);
+    pos = pos + take;
   }
-  while (sum >> (16 as u32)) != (0 as u32) {
-    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
-  }
-  let checksum: u32 = (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
-  if checksum == (0 as u32) {
-    checksum = 0xFFFF as u32;
-  }
-  let _ = arp_write_u16_be_rpi4(frame, udp_offset + 6, checksum);
+  let checksum: u32 = netstack_udp_checksum_finalize(ref ctx);
+  let checksum_bytes: [u8; 2] = netstack_udp_encode_checksum(checksum);
+  frame[udp_offset + 6] = checksum_bytes[0];
+  frame[udp_offset + 7] = checksum_bytes[1];
   return udp_len;
 }
 
 fn udp_get_src_port_rpi4(frame: ref [u8; 512], udp_offset: i64) -> u32 {
-  return arp_read_u16_be_rpi4(frame, udp_offset);
+  let hdr: [u8; 8] = [
+    frame[udp_offset], frame[udp_offset + 1], frame[udp_offset + 2], frame[udp_offset + 3],
+    frame[udp_offset + 4], frame[udp_offset + 5], frame[udp_offset + 6], frame[udp_offset + 7]
+  ];
+  return netstack_udp_get_src_port(ref hdr);
 }
 fn udp_get_length_rpi4(frame: ref [u8; 512], udp_offset: i64) -> u32 {
-  return arp_read_u16_be_rpi4(frame, udp_offset + 4);
+  let hdr: [u8; 8] = [
+    frame[udp_offset], frame[udp_offset + 1], frame[udp_offset + 2], frame[udp_offset + 3],
+    frame[udp_offset + 4], frame[udp_offset + 5], frame[udp_offset + 6], frame[udp_offset + 7]
+  ];
+  return netstack_udp_get_length(ref hdr);
 }
 
 // Builds and sends a full Ethernet+IPv4+UDP frame. Fixed offsets (14

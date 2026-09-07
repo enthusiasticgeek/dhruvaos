@@ -4515,6 +4515,42 @@ than assumed:
   at all, simpler than IPv4 even) -- likely the fastest remaining
   piece. DHCP client+server (multi-field state machines) after that,
   TCP last (largest, ~15-field connection struct).
+
+  **ROUND 106d UPDATE, 2026-09-07**: UDP added to `vani-netstack`
+  (v0.4.0, pushed). Unlike IPv4's own fixed 20-byte header, UDP's
+  checksum spans the WHOLE datagram (header+payload) -- genuinely
+  variable length (Pi 1's real payloads run to ~1472 bytes, Pi 4/5's
+  loopback-only netif only ~470), so this module streams
+  (`UdpChecksumCtx`/`init`/`update`/`finalize`, mirroring `chacha20_
+  poly1305`'s own `Poly1305Ctx` running-sum-plus-carry-byte design)
+  rather than committing to a package-side array cap sized to either
+  board -- the SAME design principle IPv4's own header codec used
+  (round 106c), extended properly to genuinely-variable-length data
+  the way `crypto_hash`/`chacha20_poly1305` themselves already had to.
+  The 8-byte UDP header itself IS small and fixed, so it gets its own
+  standalone `[u8;8]` codec (`netstack_udp_header_only`/getters),
+  matching IPv4's own header-codec precedent for the part of UDP that
+  actually is fixed-size.
+
+  Both boards' `udp_checksum`/`_rpi4` and `udp_build`/`_rpi4` now loop
+  their own real `udp_len` through the package in <=256-byte chunks;
+  `udp_verify_checksum`/`_rpi4` (already a 1-line delegate to
+  `udp_checksum`) needed no changes. `udp_get_src_port`/`dst_port`/
+  `length` (both variants) extract their own 8-byte header window and
+  call the package's getters.
+
+  Verified on both boards: `vanic check`/`build.sh`/`build_rpi4.sh`
+  all passed. Pi 4/5: `rpi4_shell_smoke.py` zero `(FAIL)`, `UDP: ...`
+  `(PASS)` (boot + on-demand). Pi 1: `phase4_milestone.py`'s full
+  battery zero `(FAIL)` -- all 4 of Pi 1's own UDP self-tests pass,
+  including the checksum-rejection edge case (`recv rejects a
+  datagram with a corrupted checksum`), a real integrity check on the
+  new streaming implementation, not just a happy-path round trip.
+
+  **Next**: DHCP client+server (round 106e) -- the first genuinely
+  multi-field STATE MACHINE in this effort (beyond a simple cache/
+  table), a bigger design step than filter/ARP/IPv4/UDP. TCP last
+  (largest, ~15-field connection struct).
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

@@ -8395,32 +8395,30 @@ fn icmp_self_test() -> i64 {
 // the wire (0 means "no checksum was computed" by convention) --
 // RFC 768 requires transmitting 0xFFFF instead in that case.
 
+// Round 106d: UDP's own checksum/header-codec ALGORITHM now lives in
+// the shared `netstack` package (`netstack_udp_*`/`UdpChecksumCtx`),
+// streaming rather than assuming a bounded frame -- Pi 1's own real
+// UDP payloads run up to ~1472 bytes (netif_get_mtu() minus IP/UDP
+// headers), well past any small fixed array the package could
+// otherwise commit to. See `vani-netstack`'s own header comment for
+// the full reasoning (mirrors `chacha20_poly1305`'s own streaming
+// `Poly1305Ctx`).
 fn udp_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, udp_offset: i64, udp_len: i64) -> u32 {
-  let sum: u32 = 0 as u32;
-  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (src_ip & (0xFFFF as u32));
-  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
-  sum = sum + (dst_ip & (0xFFFF as u32));
-  sum = sum + (17 as u32); // protocol (the pseudo-header's zero byte contributes nothing)
-  sum = sum + (udp_len as u32);
-  let i: i64 = 0;
-  while (i + 1) < udp_len {
-    let word: u32 = buf_read_u16_be(frame, udp_offset + i);
-    sum = sum + word;
-    i = i + 2;
+  let ctx: UdpChecksumCtx = netstack_udp_checksum_init(src_ip, dst_ip, udp_len);
+  let pos: i64 = 0;
+  while pos < udp_len {
+    let remaining: i64 = udp_len - pos;
+    let take: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = netstack_zero256_bytes();
+    let i: i64 = 0;
+    while i < take {
+      chunk[i] = buf_read_byte(frame, (udp_offset + pos + i) as u32) as u8;
+      i = i + 1;
+    }
+    ctx = netstack_udp_checksum_update(ctx, ref chunk, take);
+    pos = pos + take;
   }
-  if i < udp_len {
-    let b: u32 = buf_read_byte(frame, (udp_offset + i) as u32);
-    sum = sum + (b << (8 as u32)); // odd trailing byte, zero-padded low
-  }
-  while (sum >> (16 as u32)) != (0 as u32) {
-    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
-  }
-  let result: u32 = (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
-  if result == (0 as u32) {
-    return 0xFFFF as u32; // RFC 768: transmit all-ones, never a literal 0
-  }
-  return result;
+  return netstack_udp_checksum_finalize(ref ctx);
 }
 
 // BUG (round 8 audit, 2026-08-27): no udp_verify_checksum existed at
@@ -8457,10 +8455,12 @@ fn udp_verify_checksum(src_ip: u32, dst_ip: u32, frame: mut ref i64, udp_offset:
 // full send/recv round trip too.
 fn udp_build(frame: mut ref i64, udp_offset: i64, src_port: u32, dst_port: u32, payload: mut ref i64, payload_len: i64, src_ip: u32, dst_ip: u32) -> i64 {
   let udp_len: i64 = 8 + payload_len;
-  let _ = buf_write_u16_be(frame, udp_offset, src_port);
-  let _ = buf_write_u16_be(frame, udp_offset + 2, dst_port);
-  let _ = buf_write_u16_be(frame, udp_offset + 4, udp_len as u32);
-  let _ = buf_write_u16_be(frame, udp_offset + 6, 0 as u32); // checksum placeholder
+  let hdr: [u8; 8] = netstack_udp_header_only(src_port, dst_port, udp_len);
+  let hi: i64 = 0;
+  while hi < 8 {
+    let _ = buf_write_byte(frame, (udp_offset + hi) as u32, hdr[hi] as u32);
+    hi = hi + 1;
+  }
   let i: i64 = 0;
   while i < payload_len {
     let b: u32 = buf_read_byte(payload, i as u32);
@@ -8473,13 +8473,31 @@ fn udp_build(frame: mut ref i64, udp_offset: i64, src_port: u32, dst_port: u32, 
 }
 
 fn udp_get_src_port(frame: mut ref i64, udp_offset: i64) -> u32 {
-  return buf_read_u16_be(frame, udp_offset);
+  let hdr: [u8; 8] = [
+    buf_read_byte(frame, udp_offset as u32) as u8, buf_read_byte(frame, (udp_offset + 1) as u32) as u8,
+    buf_read_byte(frame, (udp_offset + 2) as u32) as u8, buf_read_byte(frame, (udp_offset + 3) as u32) as u8,
+    buf_read_byte(frame, (udp_offset + 4) as u32) as u8, buf_read_byte(frame, (udp_offset + 5) as u32) as u8,
+    buf_read_byte(frame, (udp_offset + 6) as u32) as u8, buf_read_byte(frame, (udp_offset + 7) as u32) as u8
+  ];
+  return netstack_udp_get_src_port(ref hdr);
 }
 fn udp_get_dst_port(frame: mut ref i64, udp_offset: i64) -> u32 {
-  return buf_read_u16_be(frame, udp_offset + 2);
+  let hdr: [u8; 8] = [
+    buf_read_byte(frame, udp_offset as u32) as u8, buf_read_byte(frame, (udp_offset + 1) as u32) as u8,
+    buf_read_byte(frame, (udp_offset + 2) as u32) as u8, buf_read_byte(frame, (udp_offset + 3) as u32) as u8,
+    buf_read_byte(frame, (udp_offset + 4) as u32) as u8, buf_read_byte(frame, (udp_offset + 5) as u32) as u8,
+    buf_read_byte(frame, (udp_offset + 6) as u32) as u8, buf_read_byte(frame, (udp_offset + 7) as u32) as u8
+  ];
+  return netstack_udp_get_dst_port(ref hdr);
 }
 fn udp_get_length(frame: mut ref i64, udp_offset: i64) -> u32 {
-  return buf_read_u16_be(frame, udp_offset + 4);
+  let hdr: [u8; 8] = [
+    buf_read_byte(frame, udp_offset as u32) as u8, buf_read_byte(frame, (udp_offset + 1) as u32) as u8,
+    buf_read_byte(frame, (udp_offset + 2) as u32) as u8, buf_read_byte(frame, (udp_offset + 3) as u32) as u8,
+    buf_read_byte(frame, (udp_offset + 4) as u32) as u8, buf_read_byte(frame, (udp_offset + 5) as u32) as u8,
+    buf_read_byte(frame, (udp_offset + 6) as u32) as u8, buf_read_byte(frame, (udp_offset + 7) as u32) as u8
+  ];
+  return netstack_udp_get_length(ref hdr);
 }
 
 // Builds and sends a full Ethernet+IPv4+UDP frame. Offsets are fixed

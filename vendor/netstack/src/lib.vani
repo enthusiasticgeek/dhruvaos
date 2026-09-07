@@ -757,3 +757,237 @@ fn netstack_ipv4_self_test() -> i64 {
 
   return ok;
 }
+
+// ---------------------------------------------------------------
+// UDP (RFC 768). Unlike the filter/ARP (fixed 8-slot state) and
+// IPv4 (fixed 20-byte header), UDP's own checksum covers the WHOLE
+// datagram -- header plus payload, genuinely variable length (up to
+// a board's own real MTU: Pi 1's own real frames allow up to ~1472
+// bytes of UDP payload, Pi 4/5's loopback-only netif only ~470).
+// Rather than pick a package-side array cap sized to either number
+// (repeating the exact class of problem `curve25519`'s own Ed25519
+// `msg` cap hit before its round-100 streaming rewrite), this module
+// uses a genuine streaming checksum -- `UdpChecksumCtx`/`init`/
+// `update`/`finalize` -- mirroring `chacha20_poly1305`'s own
+// `Poly1305Ctx` design exactly (same running-sum-plus-one-pending-
+// byte-of-carry technique, since UDP's checksum is also a 16-bit
+// one's-complement running sum over 16-bit words with an odd
+// trailing byte needing special handling, just simpler arithmetic
+// than Poly1305's own modular polynomial). No cap anywhere in this
+// module -- a caller streams a datagram of any length through
+// `update` in <=256-byte chunks.
+//
+// The 8-byte UDP header itself (src_port/dst_port/length/checksum)
+// IS small and fixed, so `netstack_udp_header_only`/getters DO use a
+// standalone `[u8;8]` buffer, matching IPv4's own header-codec
+// precedent -- only the checksum (which spans the payload too) needs
+// to stream.
+// ---------------------------------------------------------------
+
+struct UdpChecksumCtx { sum: u32, carry_byte: u8, has_carry: i64 }
+
+fn netstack_zero256_bytes() -> [u8; 256] {
+  let a: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let out: [u8; 256] = [
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63]
+  ];
+  return out;
+}
+
+fn netstack_udp_header_only(src_port: u32, dst_port: u32, udp_len: i64) -> [u8; 8] {
+  let hdr: [u8; 8] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  hdr[0] = ((src_port >> (8 as u32)) & (255 as u32)) as u8;
+  hdr[1] = (src_port & (255 as u32)) as u8;
+  hdr[2] = ((dst_port >> (8 as u32)) & (255 as u32)) as u8;
+  hdr[3] = (dst_port & (255 as u32)) as u8;
+  hdr[4] = ((udp_len as u32 >> (8 as u32)) & (255 as u32)) as u8;
+  hdr[5] = (udp_len as u32 & (255 as u32)) as u8;
+  hdr[6] = 0 as u8; // checksum placeholder -- caller fills this in
+  hdr[7] = 0 as u8; // after streaming the checksum separately
+  return hdr;
+}
+
+fn netstack_udp_get_src_port(hdr: ref [u8; 8]) -> u32 {
+  return ((hdr[0] as u32) << (8 as u32)) | (hdr[1] as u32);
+}
+
+fn netstack_udp_get_dst_port(hdr: ref [u8; 8]) -> u32 {
+  return ((hdr[2] as u32) << (8 as u32)) | (hdr[3] as u32);
+}
+
+fn netstack_udp_get_length(hdr: ref [u8; 8]) -> u32 {
+  return ((hdr[4] as u32) << (8 as u32)) | (hdr[5] as u32);
+}
+
+fn netstack_udp_encode_checksum(checksum: u32) -> [u8; 2] {
+  return [((checksum >> (8 as u32)) & (255 as u32)) as u8, (checksum & (255 as u32)) as u8];
+}
+
+// Seeds the running sum with the IPv4 pseudo-header (RFC 768):
+// src_ip + dst_ip + protocol(17, UDP) + udp_len (header+payload).
+fn netstack_udp_checksum_init(src_ip: u32, dst_ip: u32, udp_len: i64) -> UdpChecksumCtx {
+  let sum: u32 = 0 as u32;
+  sum = sum + ((src_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (src_ip & (0xFFFF as u32));
+  sum = sum + ((dst_ip >> (16 as u32)) & (0xFFFF as u32));
+  sum = sum + (dst_ip & (0xFFFF as u32));
+  sum = sum + (17 as u32);
+  sum = sum + (udp_len as u32);
+  return UdpChecksumCtx { sum: sum, carry_byte: 0 as u8, has_carry: 0 };
+}
+
+// Feeds `chunk_len` bytes (0 <= chunk_len <= 256) of the ACTUAL
+// datagram (8-byte header, as-transmitted checksum field included,
+// then payload) into the running sum. Call as many times as needed
+// -- chunk boundaries don't matter to the result, only the total
+// byte sequence across all calls does (same convention as
+// crypto_hash's own `sha256_update`). A trailing odd byte from one
+// call correctly carries over and pairs with the next call's first
+// byte.
+fn netstack_udp_checksum_update(ctx_in: UdpChecksumCtx, chunk: ref [u8; 256], chunk_len: i64) -> UdpChecksumCtx {
+  let sum: u32 = ctx_in.sum;
+  let has_carry: i64 = ctx_in.has_carry;
+  let carry_byte: u8 = ctx_in.carry_byte;
+  let i: i64 = 0;
+  if (has_carry == 1) && (chunk_len > 0) {
+    let hi: u32 = carry_byte as u32;
+    let lo: u32 = chunk[0] as u32;
+    sum = sum + ((hi << (8 as u32)) | lo);
+    has_carry = 0;
+    i = 1;
+  }
+  while (i + 1) < chunk_len {
+    let hi2: u32 = chunk[i] as u32;
+    let lo2: u32 = chunk[i + 1] as u32;
+    sum = sum + ((hi2 << (8 as u32)) | lo2);
+    i = i + 2;
+  }
+  if i < chunk_len {
+    carry_byte = chunk[i];
+    has_carry = 1;
+  }
+  return UdpChecksumCtx { sum: sum, carry_byte: carry_byte, has_carry: has_carry };
+}
+
+// Folds any pending odd trailing byte in, reduces to 16 bits, and
+// applies RFC 768's own "never transmit a literal 0, send 0xFFFF
+// instead" substitution -- so a valid, as-transmitted datagram
+// (checksum field included) always re-sums to exactly 0xFFFF, never
+// 0, matching `netstack_ipv4_verify_checksum`'s own convention (NOT
+// the same criterion TCP's own checksum uses).
+fn netstack_udp_checksum_finalize(ctx: ref UdpChecksumCtx) -> u32 {
+  let sum: u32 = ctx.sum;
+  if ctx.has_carry == 1 {
+    sum = sum + ((ctx.carry_byte as u32) << (8 as u32));
+  }
+  while (sum >> (16 as u32)) != (0 as u32) {
+    sum = (sum & (0xFFFF as u32)) + (sum >> (16 as u32));
+  }
+  let result: u32 = (sum ^ (0xFFFF as u32)) & (0xFFFF as u32);
+  if result == (0 as u32) {
+    return 0xFFFF as u32;
+  }
+  return result;
+}
+
+// Direct port of both boards' own `udp_self_test`/`udp_self_test_
+// rpi4`'s own header-codec-and-checksum-only subset: build a small
+// datagram (8-byte header + tiny payload), stream its checksum,
+// verify it re-sums to 0xFFFF, then confirm a single flipped payload
+// bit breaks that. Frame-level send/recv (this package has no
+// netif/frame concept) stays in each kernel's own self-test.
+fn netstack_udp_self_test() -> i64 {
+  let ok: i64 = 1;
+  let src_ip: u32 = 0xC0A80101 as u32;
+  let dst_ip: u32 = 0xC0A80102 as u32;
+  let src_port: u32 = 12345 as u32;
+  let dst_port: u32 = 53 as u32;
+
+  let payload: [u8; 4] = [104 as u8, 105 as u8, 33 as u8, 33 as u8]; // "hi!!"
+  let payload_len: i64 = 4;
+  let udp_len: i64 = 8 + payload_len;
+
+  let hdr: [u8; 8] = netstack_udp_header_only(src_port, dst_port, udp_len);
+  if netstack_udp_get_src_port(ref hdr) != src_port { ok = 0; }
+  if netstack_udp_get_dst_port(ref hdr) != dst_port { ok = 0; }
+  if netstack_udp_get_length(ref hdr) != (udp_len as u32) { ok = 0; }
+
+  // Stream header (checksum field still 0) + payload through the
+  // checksum, in two separate `update` calls -- exercises the
+  // cross-call carry path too (8-byte header is even, so no carry
+  // actually crosses here, but the 2-call shape itself is the point:
+  // proves chunk boundaries don't have to align to anything).
+  let ctx0: UdpChecksumCtx = netstack_udp_checksum_init(src_ip, dst_ip, udp_len);
+  let hdr_chunk: [u8; 256] = netstack_zero256_bytes();
+  let hi: i64 = 0;
+  while hi < 8 {
+    hdr_chunk[hi] = hdr[hi];
+    hi = hi + 1;
+  }
+  let ctx1: UdpChecksumCtx = netstack_udp_checksum_update(ctx0, ref hdr_chunk, 8);
+  let payload_chunk: [u8; 256] = netstack_zero256_bytes();
+  let pi: i64 = 0;
+  while pi < payload_len {
+    payload_chunk[pi] = payload[pi];
+    pi = pi + 1;
+  }
+  let ctx2: UdpChecksumCtx = netstack_udp_checksum_update(ctx1, ref payload_chunk, payload_len);
+  let checksum: u32 = netstack_udp_checksum_finalize(ref ctx2);
+  let checksum_bytes: [u8; 2] = netstack_udp_encode_checksum(checksum);
+
+  // Verify: re-stream the FULL as-transmitted datagram (header now
+  // with its real checksum filled in) and confirm it folds to
+  // 0xFFFF.
+  let full_hdr: [u8; 8] = [hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], checksum_bytes[0], checksum_bytes[1]];
+  let vctx0: UdpChecksumCtx = netstack_udp_checksum_init(src_ip, dst_ip, udp_len);
+  let full_hdr_chunk: [u8; 256] = netstack_zero256_bytes();
+  let fi: i64 = 0;
+  while fi < 8 {
+    full_hdr_chunk[fi] = full_hdr[fi];
+    fi = fi + 1;
+  }
+  let vctx1: UdpChecksumCtx = netstack_udp_checksum_update(vctx0, ref full_hdr_chunk, 8);
+  let vctx2: UdpChecksumCtx = netstack_udp_checksum_update(vctx1, ref payload_chunk, payload_len);
+  let verify_result: u32 = netstack_udp_checksum_finalize(ref vctx2);
+  if verify_result != (0xFFFF as u32) { ok = 0; }
+
+  // A tampered payload must fail to re-sum to 0xFFFF.
+  let bad_payload_chunk: [u8; 256] = netstack_zero256_bytes();
+  let bi: i64 = 0;
+  while bi < payload_len {
+    bad_payload_chunk[bi] = payload_chunk[bi];
+    bi = bi + 1;
+  }
+  bad_payload_chunk[0] = bad_payload_chunk[0] ^ (1 as u8);
+  let bctx0: UdpChecksumCtx = netstack_udp_checksum_init(src_ip, dst_ip, udp_len);
+  let bctx1: UdpChecksumCtx = netstack_udp_checksum_update(bctx0, ref full_hdr_chunk, 8);
+  let bctx2: UdpChecksumCtx = netstack_udp_checksum_update(bctx1, ref bad_payload_chunk, payload_len);
+  let bad_result: u32 = netstack_udp_checksum_finalize(ref bctx2);
+  if bad_result == (0xFFFF as u32) { ok = 0; } // must NOT verify
+
+  return ok;
+}
