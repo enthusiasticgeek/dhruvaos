@@ -2016,6 +2016,689 @@ fn x25519_self_test_rpi4() -> i64 {
   return ok;
 }
 
+// Round 96 -- step 3 of 4 in the SHA-512 -> field25519/X25519 ->
+// Ed25519 -> PKI crypto chain (round 94 did SHA-512, round 95 did
+// field25519/X25519). EdDSA signatures (RFC 8032) over Curve25519 in
+// twisted-Edwards form, reusing round 95's field25519_add/_sub/_mul/
+// _sqr/_invert_rpi4 directly (same p, same 8-limb [u32;8]
+// representation) -- the only new field-level piece Ed25519 itself
+// needs is the modular square root point decompression requires.
+//
+// Points use extended twisted-Edwards coordinates (X,Y,Z,T; x=X/Z,
+// y=Y/Z, T=XY/Z) via a new Ed25519PointRpi4 struct (Pi 1 has no
+// structs at all -- this port's first use of one -- 4 separate
+// [u32;8] fields, deliberately FLAT, not nested, because a `ref`/
+// `mut ref` borrow can reach exactly one level of field access
+// ("ref t.field" works, "ref t.field.field2" does not -- confirmed
+// via a standalone probe before writing any of this). Result structs
+// below (recover-x, decompress) are flattened for the same reason.
+// The same "add-2008-hwcd-3" complete/unified addition formula
+// kernel_main.vani's own comment documents (Hisil/Wong/Carter/Dawson
+// 2008) handles doubling too, so the scalar-mult ladder never needs a
+// separate doubling path -- confirmed safe to call with the same
+// owned local passed as both point arguments (`ed25519_point_add_
+// rpi4(ref b, ref b)`), matching round 95's own confirmed-legal
+// same-`ref`-twice pattern (`field25519_sqr_rpi4` calling `field25519
+// _mul_rpi4(a, a)`).
+//
+// Scalar arithmetic mod L (the group order) is genuine bit-by-bit
+// binary long division, same as kernel_main.vani's own -- L's
+// non-power-of-2 remainder isn't small the way p's `19` is, so
+// field25519_reduce16_rpi4's fold trick doesn't apply here.
+//
+// One genuine simplification over Pi 1's own ed25519_sqrt_candidate:
+// Pi 1 derives the exponent (p+3)/8 at RUNTIME via bignum add+shift
+// from p itself (a correctness safeguard against a second hand-
+// derived constant drifting out of sync). This port's field25519
+// module already fixes p as a compile-time constant with no
+// alternate representation to drift against, so (p+3)/8 = 2^252-2 is
+// simply precomputed once (`ed25519_pm2_over8_rpi4`) -- one fewer
+// runtime bignum-shift loop, same fixed 255-bit exponent either way.
+//
+// Verification: same discipline as SHA-512/X25519 -- the self-test
+// below reuses kernel_main.vani's OWN already-independently-verified
+// seed/message/expected-pubkey/expected-signature (see that file's
+// own ed25519_self_test header comment for the full provenance: a
+// from-scratch Python bigint reference checked against the real
+// `cryptography` library, then a second Python simulation of the
+// exact limb-level algorithm). Same algorithm, same constants, same
+// seed, same message -> byte-identical expected output, not a
+// separately-derived vector.
+
+struct Ed25519PointRpi4 { x: [u32; 8], y: [u32; 8], z: [u32; 8], t: [u32; 8] }
+struct Ed25519RecoverXResultRpi4 { ok: i64, x: [u32; 8] }
+struct Ed25519DecompressResultRpi4 { ok: i64, x: [u32; 8], y: [u32; 8], z: [u32; 8], t: [u32; 8] }
+struct Ed25519ExpandResultRpi4 { a: [u32; 8], prefix: [u8; 32] }
+
+// Edwards curve parameter d = -121665/121666 mod p.
+fn ed25519_d_rpi4() -> [u32; 8] {
+  return [0x135978A3 as u32, 0x75EB4DCA as u32, 0x4141D8AB as u32, 0x00700A4D as u32, 0x7779E898 as u32, 0x8CC74079 as u32, 0x2B6FFE73 as u32, 0x52036CEE as u32];
+}
+fn ed25519_2d_rpi4() -> [u32; 8] {
+  return [0x26B2F159 as u32, 0xEBD69B94 as u32, 0x8283B156 as u32, 0x00E0149A as u32, 0xEEF3D130 as u32, 0x198E80F2 as u32, 0x56DFFCE7 as u32, 0x2406D9DC as u32];
+}
+// A square root of -1 mod p, used by ed25519_recover_x_rpi4 to try
+// the second of the two candidate square roots when the first fails.
+fn ed25519_sqrt_m1_rpi4() -> [u32; 8] {
+  return [0x4A0EA0B0 as u32, 0xC4EE1B27 as u32, 0xAD2FE478 as u32, 0x2F431806 as u32, 0x3DFBD7A7 as u32, 0x2B4D0099 as u32, 0x4FC1DF0B as u32, 0x2B832480 as u32];
+}
+// L, the order of the base point's subgroup: 2^252 + 27742317777372353535851937790883648493.
+fn ed25519_l_rpi4() -> [u32; 8] {
+  return [0x5CF5D3ED as u32, 0x5812631A as u32, 0xA2F79CD6 as u32, 0x14DEF9DE as u32, 0x00000000 as u32, 0x00000000 as u32, 0x00000000 as u32, 0x10000000 as u32];
+}
+// (p+3)/8 = 2^252 - 2 -- see this section's header comment for why
+// this is a compile-time constant here, not derived at runtime.
+fn ed25519_pm2_over8_rpi4() -> [u32; 8] {
+  return [0xFFFFFFFE as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0xFFFFFFFF as u32, 0x0FFFFFFF as u32];
+}
+fn fe_one_rpi4() -> [u32; 8] {
+  let out: [u32; 8] = fe_zero_rpi4();
+  out[0] = 1 as u32;
+  return out;
+}
+fn fe_copy_rpi4(a: ref [u32; 8]) -> [u32; 8] {
+  let out: [u32; 8] = fe_zero_rpi4();
+  let i: i64 = 0;
+  while i < 8 {
+    out[i] = a[i];
+    i = i + 1;
+  }
+  return out;
+}
+fn ed25519_identity_point_rpi4() -> Ed25519PointRpi4 {
+  return Ed25519PointRpi4 { x: fe_zero_rpi4(), y: fe_one_rpi4(), z: fe_one_rpi4(), t: fe_zero_rpi4() };
+}
+// The standard base point G, in extended coordinates (Z=1, T=X*Y).
+fn ed25519_base_point_rpi4() -> Ed25519PointRpi4 {
+  let gx: [u32; 8] = [0x8F25D51A as u32, 0xC9562D60 as u32, 0x9525A7B2 as u32, 0x692CC760 as u32, 0xFDD6DC5C as u32, 0xC0A4E231 as u32, 0xCD6E53FE as u32, 0x216936D3 as u32];
+  let gy: [u32; 8] = [0x66666658 as u32, 0x66666666 as u32, 0x66666666 as u32, 0x66666666 as u32, 0x66666666 as u32, 0x66666666 as u32, 0x66666666 as u32, 0x66666666 as u32];
+  let gz: [u32; 8] = fe_one_rpi4();
+  let gt: [u32; 8] = [0xA5B7DDA3 as u32, 0x6DDE8AB3 as u32, 0x775152F5 as u32, 0x20F09F80 as u32, 0x64ABE37D as u32, 0x66EA4E8E as u32, 0xD78B7665 as u32, 0x67875F0F as u32];
+  return Ed25519PointRpi4 { x: gx, y: gy, z: gz, t: gt };
+}
+
+fn ed25519_zero32_bytes_rpi4() -> [u8; 32] {
+  return [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+}
+fn ed25519_zero64_bytes_rpi4() -> [u8; 64] {
+  return [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+}
+fn ed25519_zero256_bytes_rpi4() -> [u8; 256] {
+  let a: [u8; 64] = ed25519_zero64_bytes_rpi4();
+  let out: [u8; 256] = [
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63]
+  ];
+  return out;
+}
+
+// out = (a << 1), 8 limbs -- the final carry-out is always 0 in every
+// real caller here (the scalar reduction below only ever shifts a
+// running remainder that's already < L < 2^253, so doubling it never
+// exceeds 2^254, well inside 256 bits) -- same "provably always 0"
+// simplification round 95's own bignum_add8_rpi4/sub8_rpi4 already
+// apply for the same reason.
+fn bignum_shl1_8_rpi4(a: ref [u32; 8]) -> [u32; 8] {
+  let out: [u32; 8] = fe_zero_rpi4();
+  let carry: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < 8 {
+    let v: u32 = a[i];
+    let new_carry: u32 = v >> (31 as u32);
+    let shifted: u32 = (v << (1 as u32)) | carry;
+    out[i] = shifted;
+    carry = new_carry;
+    i = i + 1;
+  }
+  return out;
+}
+
+// A 64-byte little-endian byte buffer (a SHA-512 digest) reinterpreted
+// as 16 u32 limbs -- feeds ed25519_scalar_mod_l_rpi4's own reduction.
+fn bytes64_to_limbs16_le_rpi4(bytes: ref [u8; 64]) -> [u32; 16] {
+  let out: [u32; 16] = fe16_zero_rpi4();
+  let i: i64 = 0;
+  while i < 16 {
+    let b0: u32 = bytes[i * 4] as u32;
+    let b1: u32 = bytes[i * 4 + 1] as u32;
+    let b2: u32 = bytes[i * 4 + 2] as u32;
+    let b3: u32 = bytes[i * 4 + 3] as u32;
+    out[i] = b0 | (b1 << (8 as u32)) | (b2 << (16 as u32)) | (b3 << (24 as u32));
+    i = i + 1;
+  }
+  return out;
+}
+
+// MSB-first bit `bit_index_from_msb` of a 512-bit (16-limb) value --
+// ed25519_scalar_mod_l_rpi4's own long division needs to process its
+// input from the most-significant bit down.
+fn ed25519_get_bit_msb_first_limbs16_rpi4(buf: ref [u32; 16], bit_index_from_msb: i64) -> u32 {
+  let bit_from_lsb: i64 = 511 - bit_index_from_msb;
+  let limb_idx: i64 = bit_from_lsb / 32;
+  let bit_in_limb: u32 = (bit_from_lsb - (limb_idx * 32)) as u32;
+  return (buf[limb_idx] >> bit_in_limb) & (1 as u32);
+}
+
+// Reduces an arbitrary 512-bit value modulo L via genuine bit-by-bit
+// long division (shift the running remainder left 1 bit, OR in the
+// next input bit MSB-first, conditionally subtract L) -- see this
+// section's own header comment for why L's own modulus doesn't admit
+// field25519_reduce16_rpi4's fold trick. Used both to reduce a raw
+// SHA-512 digest (via bytes64_to_limbs16_le_rpi4 first) and to reduce
+// a wide k*a product (bignum_mul8_rpi4's own 16-limb output).
+fn ed25519_scalar_mod_l_rpi4(input16: ref [u32; 16]) -> [u32; 8] {
+  let remainder: [u32; 8] = fe_zero_rpi4();
+  let l_const: [u32; 8] = ed25519_l_rpi4();
+  let i: i64 = 0;
+  while i < 512 {
+    remainder = bignum_shl1_8_rpi4(ref remainder);
+    let bit: u32 = ed25519_get_bit_msb_first_limbs16_rpi4(input16, i);
+    if bit == (1 as u32) {
+      remainder[0] = remainder[0] | (1 as u32);
+    }
+    if bignum_cmp8_rpi4(ref remainder, ref l_const) >= 0 {
+      remainder = bignum_sub8_rpi4(ref remainder, ref l_const);
+    }
+    i = i + 1;
+  }
+  return remainder;
+}
+
+// (x + y) mod L, for x, y already < L -- bignum_add8_rpi4's own
+// discarded carry is provably 0 here too (x+y < 2L < 2^254).
+fn ed25519_scalar_add_mod_l_rpi4(x: ref [u32; 8], y: ref [u32; 8]) -> [u32; 8] {
+  let sum: [u32; 8] = bignum_add8_rpi4(x, y);
+  let l_const: [u32; 8] = ed25519_l_rpi4();
+  if bignum_cmp8_rpi4(ref sum, ref l_const) >= 0 {
+    sum = bignum_sub8_rpi4(ref sum, ref l_const);
+  }
+  return sum;
+}
+
+// (k * a) mod L -- k, a need not themselves be < L (Ed25519's own
+// clamped secret scalar `a` can be up to just under 2^255, genuinely
+// larger than L); the wide product is computed first, THEN reduced.
+fn ed25519_scalar_mul_mod_l_rpi4(k: ref [u32; 8], a: ref [u32; 8]) -> [u32; 8] {
+  let product16: [u32; 16] = bignum_mul8_rpi4(k, a);
+  return ed25519_scalar_mod_l_rpi4(ref product16);
+}
+
+// Unified twisted-Edwards point addition (also point doubling, when P
+// and Q are the same point/variable) -- add-2008-hwcd-3 formula. Every
+// intermediate is bound to its own named local (never `ref`-ed
+// straight off a call result -- round 95's own confirmed restriction)
+// so this reads as a flat sequence of field ops, same shape as
+// kernel_main.vani's own version, just without its 8 named persistent
+// scratch buffers (ed25519_tmp1_get..tmp8_get) -- owned locals plus
+// the return-by-value convention make those unnecessary here.
+fn ed25519_point_add_rpi4(p: ref Ed25519PointRpi4, q: ref Ed25519PointRpi4) -> Ed25519PointRpi4 {
+  let py_minus_px: [u32; 8] = field25519_sub_rpi4(ref p.y, ref p.x);
+  let qy_minus_qx: [u32; 8] = field25519_sub_rpi4(ref q.y, ref q.x);
+  let a_val: [u32; 8] = field25519_mul_rpi4(ref py_minus_px, ref qy_minus_qx);
+
+  let py_plus_px: [u32; 8] = field25519_add_rpi4(ref p.y, ref p.x);
+  let qy_plus_qx: [u32; 8] = field25519_add_rpi4(ref q.y, ref q.x);
+  let b_val: [u32; 8] = field25519_mul_rpi4(ref py_plus_px, ref qy_plus_qx);
+
+  let two_d: [u32; 8] = ed25519_2d_rpi4();
+  let pt_2d: [u32; 8] = field25519_mul_rpi4(ref p.t, ref two_d);
+  let c_val: [u32; 8] = field25519_mul_rpi4(ref pt_2d, ref q.t);
+
+  let pz_plus_pz: [u32; 8] = field25519_add_rpi4(ref p.z, ref p.z);
+  let d_val: [u32; 8] = field25519_mul_rpi4(ref pz_plus_pz, ref q.z);
+
+  let e_val: [u32; 8] = field25519_sub_rpi4(ref b_val, ref a_val);
+  let f_val: [u32; 8] = field25519_sub_rpi4(ref d_val, ref c_val);
+  let g_val: [u32; 8] = field25519_add_rpi4(ref d_val, ref c_val);
+  let h_val: [u32; 8] = field25519_add_rpi4(ref b_val, ref a_val);
+
+  let out_x: [u32; 8] = field25519_mul_rpi4(ref e_val, ref f_val);
+  let out_y: [u32; 8] = field25519_mul_rpi4(ref g_val, ref h_val);
+  let out_t: [u32; 8] = field25519_mul_rpi4(ref e_val, ref h_val);
+  let out_z: [u32; 8] = field25519_mul_rpi4(ref f_val, ref g_val);
+  return Ed25519PointRpi4 { x: out_x, y: out_y, z: out_z, t: out_t };
+}
+
+// [scalar]P, scalar a 256-bit little-endian integer (any value, not
+// required to be < L -- e.g. Ed25519's own clamped secret scalar
+// isn't). Plain LSB-first double-and-add; `ed25519_point_add_rpi4(ref
+// b, ref b)` doubling passes the same owned local as both arguments,
+// confirmed legal (see this section's own header comment).
+fn ed25519_point_mul_rpi4(scalar: ref [u32; 8], p: ref Ed25519PointRpi4) -> Ed25519PointRpi4 {
+  let q: Ed25519PointRpi4 = ed25519_identity_point_rpi4();
+  let b: Ed25519PointRpi4 = Ed25519PointRpi4 { x: fe_copy_rpi4(ref p.x), y: fe_copy_rpi4(ref p.y), z: fe_copy_rpi4(ref p.z), t: fe_copy_rpi4(ref p.t) };
+  let i: i64 = 0;
+  while i < 256 {
+    let bit: u32 = x25519_get_bit_rpi4(scalar, i);
+    if bit == (1 as u32) {
+      q = ed25519_point_add_rpi4(ref q, ref b);
+    }
+    b = ed25519_point_add_rpi4(ref b, ref b);
+    i = i + 1;
+  }
+  return q;
+}
+
+// True iff P == Q as projective points ((X1*Z2 == X2*Z1) and
+// (Y1*Z2 == Y2*Z1) mod p) -- comparing raw coordinates directly would
+// be wrong since the same affine point has infinitely many valid
+// (X,Y,Z,T) representations.
+fn ed25519_point_equal_rpi4(p: ref Ed25519PointRpi4, q: ref Ed25519PointRpi4) -> i64 {
+  let lhs1: [u32; 8] = field25519_mul_rpi4(ref p.x, ref q.z);
+  let rhs1: [u32; 8] = field25519_mul_rpi4(ref q.x, ref p.z);
+  if bignum_cmp8_rpi4(ref lhs1, ref rhs1) != 0 {
+    return 0;
+  }
+  let lhs2: [u32; 8] = field25519_mul_rpi4(ref p.y, ref q.z);
+  let rhs2: [u32; 8] = field25519_mul_rpi4(ref q.y, ref p.z);
+  if bignum_cmp8_rpi4(ref lhs2, ref rhs2) != 0 {
+    return 0;
+  }
+  return 1;
+}
+
+// x = (x2)^((p+3)/8) mod p -- the standard Ed25519/RFC 8032 candidate
+// square root (valid because p = 5 mod 8). Plain left-to-right binary
+// square-and-multiply over the fixed, precomputed exponent (see this
+// section's own header comment for why it's a constant here, not
+// derived at runtime the way kernel_main.vani's own version does).
+fn ed25519_sqrt_candidate_rpi4(x2: ref [u32; 8]) -> [u32; 8] {
+  let exponent: [u32; 8] = ed25519_pm2_over8_rpi4();
+  let result: [u32; 8] = fe_one_rpi4();
+  let base: [u32; 8] = fe_copy_rpi4(x2);
+  let bit_i: i64 = 0;
+  while bit_i < 255 {
+    if x25519_get_bit_rpi4(ref exponent, bit_i) == (1 as u32) {
+      result = field25519_mul_rpi4(ref result, ref base);
+    }
+    base = field25519_sqr_rpi4(ref base);
+    bit_i = bit_i + 1;
+  }
+  return result;
+}
+
+// Recovers x from y and a target parity bit `sign`, per RFC 8032
+// section 5.1.3. `ok` is 0 (with `x` left as all-zero) if y is out of
+// range or no valid x exists -- "reject, don't guess," same posture
+// as the rest of this codebase's bounds/format checks.
+fn ed25519_recover_x_rpi4(y: ref [u32; 8], sign: u32) -> Ed25519RecoverXResultRpi4 {
+  let p_const: [u32; 8] = x25519_p_rpi4();
+  if bignum_cmp8_rpi4(y, ref p_const) >= 0 {
+    return Ed25519RecoverXResultRpi4 { ok: 0, x: fe_zero_rpi4() };
+  }
+
+  let y2: [u32; 8] = field25519_sqr_rpi4(y);
+  let one_val: [u32; 8] = fe_one_rpi4();
+  let num: [u32; 8] = field25519_sub_rpi4(ref y2, ref one_val); // num = y^2 - 1
+  let d_const: [u32; 8] = ed25519_d_rpi4();
+  let dy2: [u32; 8] = field25519_mul_rpi4(ref d_const, ref y2); // dy2 = d*y^2
+  let den: [u32; 8] = field25519_add_rpi4(ref dy2, ref one_val); // den = d*y^2 + 1
+  let deninv: [u32; 8] = field25519_invert_rpi4(ref den);
+  let x2: [u32; 8] = field25519_mul_rpi4(ref num, ref deninv); // x2 = num/den
+
+  let is_zero: i64 = 1;
+  let zci: i64 = 0;
+  while zci < 8 {
+    if x2[zci] != (0 as u32) {
+      is_zero = 0;
+    }
+    zci = zci + 1;
+  }
+  if is_zero == 1 {
+    if sign == (1 as u32) {
+      return Ed25519RecoverXResultRpi4 { ok: 0, x: fe_zero_rpi4() };
+    }
+    return Ed25519RecoverXResultRpi4 { ok: 1, x: fe_zero_rpi4() };
+  }
+
+  let candidate: [u32; 8] = ed25519_sqrt_candidate_rpi4(ref x2);
+  let check: [u32; 8] = field25519_sqr_rpi4(ref candidate);
+  if bignum_cmp8_rpi4(ref check, ref x2) != 0 {
+    let sqrt_m1_const: [u32; 8] = ed25519_sqrt_m1_rpi4();
+    candidate = field25519_mul_rpi4(ref candidate, ref sqrt_m1_const);
+    check = field25519_sqr_rpi4(ref candidate);
+    if bignum_cmp8_rpi4(ref check, ref x2) != 0 {
+      return Ed25519RecoverXResultRpi4 { ok: 0, x: fe_zero_rpi4() };
+    }
+  }
+
+  let cand_parity: u32 = candidate[0] & (1 as u32);
+  if cand_parity != sign {
+    candidate = field25519_sub_rpi4(ref p_const, ref candidate);
+  }
+  return Ed25519RecoverXResultRpi4 { ok: 1, x: candidate };
+}
+
+fn ed25519_point_compress_rpi4(p: ref Ed25519PointRpi4) -> [u8; 32] {
+  let zinv: [u32; 8] = field25519_invert_rpi4(ref p.z);
+  let x: [u32; 8] = field25519_mul_rpi4(ref p.x, ref zinv);
+  let y: [u32; 8] = field25519_mul_rpi4(ref p.y, ref zinv);
+  let out: [u8; 32] = fe_to_bytes_le_rpi4(ref y);
+  let xbit: u32 = x[0] & (1 as u32);
+  let top: u32 = (out[31] as u32) & (127 as u32);
+  let newtop: u32 = top | (xbit << (7 as u32));
+  out[31] = newtop as u8;
+  return out;
+}
+
+// Decompresses a 32-byte encoded point. `ok` is 0 (with x/y/z/t left
+// as all-zero) on a malformed/invalid encoding.
+fn ed25519_point_decompress_rpi4(s: ref [u8; 32]) -> Ed25519DecompressResultRpi4 {
+  let sign: u32 = ((s[31] as u32) >> (7 as u32)) & (1 as u32);
+  let y_bytes: [u8; 32] = ed25519_zero32_bytes_rpi4();
+  let i: i64 = 0;
+  while i < 32 {
+    y_bytes[i] = s[i];
+    i = i + 1;
+  }
+  let top_masked: u32 = (y_bytes[31] as u32) & (127 as u32);
+  y_bytes[31] = top_masked as u8;
+  let y: [u32; 8] = fe_from_bytes_le_rpi4(ref y_bytes);
+
+  let rec: Ed25519RecoverXResultRpi4 = ed25519_recover_x_rpi4(ref y, sign);
+  if rec.ok == 0 {
+    return Ed25519DecompressResultRpi4 { ok: 0, x: fe_zero_rpi4(), y: fe_zero_rpi4(), z: fe_zero_rpi4(), t: fe_zero_rpi4() };
+  }
+  let z_val: [u32; 8] = fe_one_rpi4();
+  let t_val: [u32; 8] = field25519_mul_rpi4(ref rec.x, ref y);
+  return Ed25519DecompressResultRpi4 { ok: 1, x: rec.x, y: y, z: z_val, t: t_val };
+}
+
+// SHA-512(secret) split into a clamped scalar `a` (RFC 8032 section
+// 5.1.5 clamping: clear the low 3 bits, clear bit 255, set bit 254)
+// and a `prefix` used only to derive the per-message nonce below.
+fn ed25519_secret_expand_rpi4(secret: ref [u8; 32]) -> Ed25519ExpandResultRpi4 {
+  let scratch: [u8; 256] = ed25519_zero256_bytes_rpi4();
+  let i: i64 = 0;
+  while i < 32 {
+    scratch[i] = secret[i];
+    i = i + 1;
+  }
+  let hash_out: [u8; 64] = ed25519_zero64_bytes_rpi4();
+  let _ = sha512_hash_rpi4(mut ref scratch, 32, mut ref hash_out);
+
+  let a_bytes: [u8; 32] = ed25519_zero32_bytes_rpi4();
+  let j: i64 = 0;
+  while j < 32 {
+    a_bytes[j] = hash_out[j];
+    j = j + 1;
+  }
+  let a0: u32 = (a_bytes[0] as u32) & (248 as u32);
+  a_bytes[0] = a0 as u8;
+  let a31: u32 = ((a_bytes[31] as u32) & (127 as u32)) | (64 as u32);
+  a_bytes[31] = a31 as u8;
+  let a_scalar: [u32; 8] = fe_from_bytes_le_rpi4(ref a_bytes);
+
+  let prefix: [u8; 32] = ed25519_zero32_bytes_rpi4();
+  let k: i64 = 0;
+  while k < 32 {
+    prefix[k] = hash_out[32 + k];
+    k = k + 1;
+  }
+  return Ed25519ExpandResultRpi4 { a: a_scalar, prefix: prefix };
+}
+
+fn ed25519_secret_to_public_rpi4(secret: ref [u8; 32]) -> [u8; 32] {
+  let expanded: Ed25519ExpandResultRpi4 = ed25519_secret_expand_rpi4(secret);
+  let g: Ed25519PointRpi4 = ed25519_base_point_rpi4();
+  let apoint: Ed25519PointRpi4 = ed25519_point_mul_rpi4(ref expanded.a, ref g);
+  return ed25519_point_compress_rpi4(ref apoint);
+}
+
+// RFC 8032 section 5.1.6. `out_sig` is 64 bytes (R || s). `msg` is
+// capped at 64 bytes on this port (this round's own self-test message
+// is well under that; no file-signing facility exists on this port at
+// all -- DharaFS isn't wired in here, see this arc's own scope memory)
+// -- comfortably fits both hash inputs (prefix||msg and R||A||msg, at
+// most 128 bytes total) inside sha512_hash_rpi4's 256-byte scratch.
+fn ed25519_sign_rpi4(secret: ref [u8; 32], msg: ref [u8; 64], msg_len: i64) -> [u8; 64] {
+  let expanded: Ed25519ExpandResultRpi4 = ed25519_secret_expand_rpi4(secret);
+  let g: Ed25519PointRpi4 = ed25519_base_point_rpi4();
+  let apoint: Ed25519PointRpi4 = ed25519_point_mul_rpi4(ref expanded.a, ref g);
+  let apub: [u8; 32] = ed25519_point_compress_rpi4(ref apoint);
+
+  // r = H(prefix || msg) mod L
+  let hash_input1: [u8; 256] = ed25519_zero256_bytes_rpi4();
+  let hi: i64 = 0;
+  while hi < 32 {
+    hash_input1[hi] = expanded.prefix[hi];
+    hi = hi + 1;
+  }
+  let hj: i64 = 0;
+  while hj < msg_len {
+    hash_input1[32 + hj] = msg[hj];
+    hj = hj + 1;
+  }
+  let hash_out1: [u8; 64] = ed25519_zero64_bytes_rpi4();
+  let _ = sha512_hash_rpi4(mut ref hash_input1, 32 + msg_len, mut ref hash_out1);
+  let hash_out1_limbs: [u32; 16] = bytes64_to_limbs16_le_rpi4(ref hash_out1);
+  let r: [u32; 8] = ed25519_scalar_mod_l_rpi4(ref hash_out1_limbs);
+
+  let rpoint: Ed25519PointRpi4 = ed25519_point_mul_rpi4(ref r, ref g);
+  let rs: [u8; 32] = ed25519_point_compress_rpi4(ref rpoint);
+
+  // k = H(R || A || msg) mod L
+  let hash_input2: [u8; 256] = ed25519_zero256_bytes_rpi4();
+  let hi2: i64 = 0;
+  while hi2 < 32 {
+    hash_input2[hi2] = rs[hi2];
+    hi2 = hi2 + 1;
+  }
+  let hi3: i64 = 0;
+  while hi3 < 32 {
+    hash_input2[32 + hi3] = apub[hi3];
+    hi3 = hi3 + 1;
+  }
+  let hi4: i64 = 0;
+  while hi4 < msg_len {
+    hash_input2[64 + hi4] = msg[hi4];
+    hi4 = hi4 + 1;
+  }
+  let hash_out2: [u8; 64] = ed25519_zero64_bytes_rpi4();
+  let _ = sha512_hash_rpi4(mut ref hash_input2, 64 + msg_len, mut ref hash_out2);
+  let hash_out2_limbs: [u32; 16] = bytes64_to_limbs16_le_rpi4(ref hash_out2);
+  let k: [u32; 8] = ed25519_scalar_mod_l_rpi4(ref hash_out2_limbs);
+
+  let ka: [u32; 8] = ed25519_scalar_mul_mod_l_rpi4(ref k, ref expanded.a);
+  let s: [u32; 8] = ed25519_scalar_add_mod_l_rpi4(ref r, ref ka);
+  let s_bytes: [u8; 32] = fe_to_bytes_le_rpi4(ref s);
+
+  let out_sig: [u8; 64] = ed25519_zero64_bytes_rpi4();
+  let oi: i64 = 0;
+  while oi < 32 {
+    out_sig[oi] = rs[oi];
+    oi = oi + 1;
+  }
+  let oj: i64 = 0;
+  while oj < 32 {
+    out_sig[32 + oj] = s_bytes[oj];
+    oj = oj + 1;
+  }
+  return out_sig;
+}
+
+// RFC 8032 section 5.1.7. Returns 1 if `sig` (64 bytes) is a valid
+// Ed25519 signature over `msg` by `pubkey` (32 bytes), 0 otherwise --
+// covers every rejection path explicitly (malformed public key,
+// malformed R, s >= L) rather than letting any fall through to an
+// ambiguous result.
+fn ed25519_verify_rpi4(pubkey: ref [u8; 32], msg: ref [u8; 64], msg_len: i64, sig: ref [u8; 64]) -> i64 {
+  let dec_a: Ed25519DecompressResultRpi4 = ed25519_point_decompress_rpi4(pubkey);
+  if dec_a.ok == 0 {
+    return 0;
+  }
+  let apoint: Ed25519PointRpi4 = Ed25519PointRpi4 { x: dec_a.x, y: dec_a.y, z: dec_a.z, t: dec_a.t };
+
+  let rs: [u8; 32] = ed25519_zero32_bytes_rpi4();
+  let ri: i64 = 0;
+  while ri < 32 {
+    rs[ri] = sig[ri];
+    ri = ri + 1;
+  }
+  let dec_r: Ed25519DecompressResultRpi4 = ed25519_point_decompress_rpi4(ref rs);
+  if dec_r.ok == 0 {
+    return 0;
+  }
+  let rpoint: Ed25519PointRpi4 = Ed25519PointRpi4 { x: dec_r.x, y: dec_r.y, z: dec_r.z, t: dec_r.t };
+
+  let s_bytes: [u8; 32] = ed25519_zero32_bytes_rpi4();
+  let si: i64 = 0;
+  while si < 32 {
+    s_bytes[si] = sig[32 + si];
+    si = si + 1;
+  }
+  let s: [u32; 8] = fe_from_bytes_le_rpi4(ref s_bytes);
+  let l_const: [u32; 8] = ed25519_l_rpi4();
+  if bignum_cmp8_rpi4(ref s, ref l_const) >= 0 {
+    return 0;
+  }
+
+  let hash_input: [u8; 256] = ed25519_zero256_bytes_rpi4();
+  let hi: i64 = 0;
+  while hi < 32 {
+    hash_input[hi] = rs[hi];
+    hi = hi + 1;
+  }
+  let hj: i64 = 0;
+  while hj < 32 {
+    hash_input[32 + hj] = pubkey[hj];
+    hj = hj + 1;
+  }
+  let hk: i64 = 0;
+  while hk < msg_len {
+    hash_input[64 + hk] = msg[hk];
+    hk = hk + 1;
+  }
+  let hash_out: [u8; 64] = ed25519_zero64_bytes_rpi4();
+  let _ = sha512_hash_rpi4(mut ref hash_input, 64 + msg_len, mut ref hash_out);
+  let hash_out_limbs: [u32; 16] = bytes64_to_limbs16_le_rpi4(ref hash_out);
+  let k: [u32; 8] = ed25519_scalar_mod_l_rpi4(ref hash_out_limbs);
+
+  let g: Ed25519PointRpi4 = ed25519_base_point_rpi4();
+  let sb: Ed25519PointRpi4 = ed25519_point_mul_rpi4(ref s, ref g);
+  let ka_point: Ed25519PointRpi4 = ed25519_point_mul_rpi4(ref k, ref apoint);
+  let rhs: Ed25519PointRpi4 = ed25519_point_add_rpi4(ref ka_point, ref rpoint);
+
+  return ed25519_point_equal_rpi4(ref sb, ref rhs);
+}
+
+// RFC 8032-shaped known-answer check reusing kernel_main.vani's own
+// already-independently-verified seed/message/expected-pubkey/
+// expected-signature (see this section's header comment for the full
+// provenance) -- same algorithm, same constants -> byte-identical
+// expected output. Covers pubkey derivation, signing, self-
+// verification, AND both tamper-rejection paths (flipped signature
+// bit, flipped message bit) -- the actual security property, not just
+// "produces something."
+fn ed25519_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+
+  let seed: [u8; 32] = [
+    0x00 as u8, 0x01 as u8, 0x02 as u8, 0x03 as u8, 0x04 as u8, 0x05 as u8, 0x06 as u8, 0x07 as u8,
+    0x08 as u8, 0x09 as u8, 0x0a as u8, 0x0b as u8, 0x0c as u8, 0x0d as u8, 0x0e as u8, 0x0f as u8,
+    0x10 as u8, 0x11 as u8, 0x12 as u8, 0x13 as u8, 0x14 as u8, 0x15 as u8, 0x16 as u8, 0x17 as u8,
+    0x18 as u8, 0x19 as u8, 0x1a as u8, 0x1b as u8, 0x1c as u8, 0x1d as u8, 0x1e as u8, 0x1f as u8
+  ];
+
+  let msg_str: Str = "Dhruva Ed25519 test message";
+  let msg_len: i64 = str_len_bytes(msg_str);
+  let msg: [u8; 64] = ed25519_zero64_bytes_rpi4();
+  let mi: i64 = 0;
+  while mi < msg_len {
+    msg[mi] = str_byte_at(msg_str, mi) as u8;
+    mi = mi + 1;
+  }
+
+  let expected_pub: [u8; 32] = [
+    0x03 as u8, 0xa1 as u8, 0x07 as u8, 0xbf as u8, 0xf3 as u8, 0xce as u8, 0x10 as u8, 0xbe as u8,
+    0x1d as u8, 0x70 as u8, 0xdd as u8, 0x18 as u8, 0xe7 as u8, 0x4b as u8, 0xc0 as u8, 0x99 as u8,
+    0x67 as u8, 0xe4 as u8, 0xd6 as u8, 0x30 as u8, 0x9b as u8, 0xa5 as u8, 0x0d as u8, 0x5f as u8,
+    0x1d as u8, 0xdc as u8, 0x86 as u8, 0x64 as u8, 0x12 as u8, 0x55 as u8, 0x31 as u8, 0xb8 as u8
+  ];
+  let expected_sig: [u8; 64] = [
+    0xbb as u8, 0x89 as u8, 0x59 as u8, 0x11 as u8, 0x1f as u8, 0xc8 as u8, 0x7b as u8, 0xf9 as u8,
+    0x3c as u8, 0x54 as u8, 0xde as u8, 0x30 as u8, 0xfc as u8, 0x11 as u8, 0xf0 as u8, 0x09 as u8,
+    0x7d as u8, 0x8c as u8, 0xf7 as u8, 0x58 as u8, 0x64 as u8, 0xa2 as u8, 0x7c as u8, 0xb7 as u8,
+    0x6c as u8, 0x5a as u8, 0x97 as u8, 0x24 as u8, 0x50 as u8, 0x4d as u8, 0x70 as u8, 0x80 as u8,
+    0xe4 as u8, 0x72 as u8, 0xf9 as u8, 0x86 as u8, 0x71 as u8, 0x16 as u8, 0x1d as u8, 0xb0 as u8,
+    0x08 as u8, 0x60 as u8, 0xe8 as u8, 0x78 as u8, 0x85 as u8, 0x79 as u8, 0xa0 as u8, 0x63 as u8,
+    0xa1 as u8, 0x2a as u8, 0x1a as u8, 0xb1 as u8, 0x7a as u8, 0x3e as u8, 0x3f as u8, 0xc7 as u8,
+    0x08 as u8, 0xb9 as u8, 0x77 as u8, 0xae as u8, 0xd5 as u8, 0xf1 as u8, 0x02 as u8, 0x01 as u8
+  ];
+
+  let pub_out: [u8; 32] = ed25519_secret_to_public_rpi4(ref seed);
+  if sha256_digest_equal_rpi4(ref pub_out, ref expected_pub) == 0 {
+    ok = 0;
+  }
+
+  let sig_out: [u8; 64] = ed25519_sign_rpi4(ref seed, ref msg, msg_len);
+  if sha512_digest_equal_rpi4(ref sig_out, ref expected_sig) == 0 {
+    ok = 0;
+  }
+
+  if ed25519_verify_rpi4(ref pub_out, ref msg, msg_len, ref sig_out) == 0 {
+    ok = 0; // must accept its own valid signature
+  }
+
+  let bad_sig: [u8; 64] = ed25519_zero64_bytes_rpi4();
+  let bi: i64 = 0;
+  while bi < 64 {
+    bad_sig[bi] = sig_out[bi];
+    bi = bi + 1;
+  }
+  bad_sig[0] = ((bad_sig[0] as u32) ^ (1 as u32)) as u8;
+  if ed25519_verify_rpi4(ref pub_out, ref msg, msg_len, ref bad_sig) == 1 {
+    ok = 0;
+  }
+
+  let bad_msg: [u8; 64] = ed25519_zero64_bytes_rpi4();
+  let ci: i64 = 0;
+  while ci < msg_len {
+    bad_msg[ci] = msg[ci];
+    ci = ci + 1;
+  }
+  bad_msg[0] = ((bad_msg[0] as u32) ^ (1 as u32)) as u8;
+  if ed25519_verify_rpi4(ref pub_out, ref bad_msg, msg_len, ref sig_out) == 1 {
+    ok = 0;
+  }
+
+  let _ = uart_puts_rpi4_vani("CRYPTO: Ed25519 vs kernel_main.vani's own verified reference (pubkey+sign+verify+tamper)");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
 // Round 86 -- Phase A step 1 of the networking/SSH/WiFi scope (see
 // project memory project_dhruva_networking_ssh_wifi_scope_2026_09_06
 // .md): the smallest useful netif abstraction on this port. Loopback/
@@ -5183,6 +5866,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = sha256_self_test_rpi4();
   let _ = sha512_self_test_rpi4();
   let _ = x25519_self_test_rpi4();
+  let _ = ed25519_self_test_rpi4();
   // Round 88: packet filtering's own default policy -- .bss's own
   // zero-init would otherwise leave it at 0 (deny), which would
   // silently break every self-test below that touches netif (all of
@@ -5443,11 +6127,11 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, sha512, x25519, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, sha512, x25519, ed25519, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 95 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 96 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
@@ -5467,6 +6151,11 @@ fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("x25519") == (1 as u32) {
     let _ = uart_puts_rpi4_vani("\n");
     let _ = x25519_self_test_rpi4();
+    return 0;
+  }
+  if rpi4_shell_line_matches("ed25519") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = ed25519_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_line_matches("netif") == (1 as u32) {

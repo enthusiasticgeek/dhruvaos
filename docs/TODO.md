@@ -3905,6 +3905,75 @@ than assumed:
   wrapper (step 4) remain -- both explicitly still to come per "go
   through all steps 1-4." ChaCha20-Poly1305, TLS 1.3, SSH transport,
   and SSH-shell integration remain further out, none started.
+
+  **ROUND 96 UPDATE, 2026-09-06**: Ed25519 -- step 3 of the crypto
+  chain, per the user's own "go through all steps 1-4" (Ed25519 and
+  PKI, without stopping for per-step confirmation after X25519).
+
+  EdDSA sign/verify (RFC 8032) over the twisted-Edwards form of
+  Curve25519, reusing round 95's `field25519_*` directly (same p,
+  same `[u32; 8]` limb representation) -- the only new field-level
+  piece is the modular square root point decompression needs. Points
+  use extended coordinates (X,Y,Z,T) via a new `Ed25519PointRpi4`
+  struct -- this port's FIRST use of a struct at all (Pi 1's version
+  is fully procedural with named persistent scratch buffers instead).
+  Deliberately kept FLAT (4 sibling `[u32; 8]` fields, no nesting):
+  confirmed via a standalone probe that `ref`/`mut ref` can reach
+  exactly one level of field access (`ref t.field` works, `ref
+  t.field.field2` does not), so a nested `Ed25519PointRpi4` field
+  inside a result struct would have blocked passing it straight into
+  `field25519_*` calls. The unified add-2008-hwcd-3 formula
+  (Hisil/Wong/Carter/Dawson 2008) handles doubling too, so the
+  scalar-mult ladder never needs a separate doubling path -- confirmed
+  legal to call with the same owned local as both point arguments
+  (`ed25519_point_add_rpi4(ref b, ref b)`), matching round 95's own
+  confirmed same-`ref`-twice pattern.
+
+  Scalar arithmetic mod L (the group order) is genuine bit-by-bit
+  binary long division, like kernel_main.vani's own -- L's own
+  remainder isn't small like p's `19`, so round 95's fold trick
+  doesn't apply. One genuine simplification over Pi 1's version: Pi 1
+  derives the square-root exponent `(p+3)/8` at RUNTIME via bignum
+  add+shift (a safeguard against a second hand-derived constant
+  drifting out of sync with p); this port's field25519 module already
+  fixes p as a compile-time constant with nothing to drift against, so
+  `(p+3)/8 = 2^252-2` is simply precomputed once instead.
+
+  Verification reuses kernel_main.vani's own already-independently-
+  verified seed/message/expected-pubkey/expected-signature -- same
+  algorithm, same constants, same seed and message, so byte-identical
+  expected output rather than a separately-derived vector. Covers
+  pubkey derivation, signing, self-verification, AND both tamper-
+  rejection paths (flipped signature bit, flipped message bit).
+
+  One real test-harness recalibration needed, NOT a functional bug:
+  Ed25519's own point-multiplication ladder does far more field
+  arithmetic per bit than X25519's (a full 8-field-mul point_add,
+  called twice per bit, across up to 4-5 full 256-bit scalar mults for
+  pubkey+sign+verify combined), and under QEMU TCG emulation this
+  measurably costs ~2 real wall-clock seconds per self-test run
+  (confirmed via a direct timestamped boot probe) -- pushing total
+  boot-to-shell-ready time to ~5.7s and making the shell's own
+  `ed25519` command noticeably slower than any prior command.
+  `test/rpi4_shell_smoke.py`'s fixed `SETTLE_S`/`CMD_WAIT_S` delays
+  (3s/1s, calibrated for the pre-Ed25519 boot sequence) were too short
+  for this -- commands sent at the old fixed offsets landed on top of
+  still-running self-tests and were lost, failing 2 checks on the
+  first real run. Fixed by bumping `SETTLE_S` to 7s and `CMD_WAIT_S`
+  to 3s (both comfortably clear the measured ~5.7s/~2s real costs);
+  the underlying Ed25519 implementation itself was correct on the very
+  first `vanic check` and the very first `./build_rpi4.sh` -- this was
+  purely a test-timing gap the new self-test's real cost exposed.
+
+  No new `boot/rpi4/*.S` state file needed (same as SHA-512/X25519 --
+  everything fits as plain vani locals/struct values within one call
+  chain). Wired into `kmain_rpi4_vani` and a new `ed25519` shell
+  command. All 8 Pi 4 smoke tests pass; zero Pi 1 files touched.
+
+  **Not done**: PKI's own thin wrapper (step 4, the last link in this
+  chain) remains -- explicitly still to come per "go through all steps
+  1-4." ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell
+  integration remain further out, none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
