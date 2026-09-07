@@ -79,6 +79,9 @@ mkdir -p "${BUILD_DIR}"
 "${CC}" -c -mgeneral-regs-only -ffreestanding \
   "${ROOT}/boot/rpi4/dhcp_state.S" -o "${BUILD_DIR}/rpi4_dhcp_state.o"
 
+"${CC}" -c -mgeneral-regs-only -ffreestanding \
+  "${ROOT}/boot/rpi4/dhcp_server_state.S" -o "${BUILD_DIR}/rpi4_dhcp_server_state.o"
+
 "${CC}" -c -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi4/runtime_stubs_rpi4.c" -o "${BUILD_DIR}/rpi4_runtime_stubs.o"
 
@@ -98,6 +101,7 @@ llc -mtriple="${TRIPLE}" -filetype=obj \
   "${BUILD_DIR}/rpi4_shell_state.o" "${BUILD_DIR}/rpi4_netif_state.o" \
   "${BUILD_DIR}/rpi4_arp_state.o" "${BUILD_DIR}/rpi4_filter_state.o" \
   "${BUILD_DIR}/rpi4_tcp_state.o" "${BUILD_DIR}/rpi4_dhcp_state.o" \
+  "${BUILD_DIR}/rpi4_dhcp_server_state.o" \
   "${BUILD_DIR}/kernel_main_rpi4.o" "${BUILD_DIR}/rpi4_runtime_stubs.o" \
   -o "${BUILD_DIR}/dhruva_rpi4.elf"
 

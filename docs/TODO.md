@@ -3713,6 +3713,60 @@ than assumed:
   **Not done**: DHCP server, static-IP configuration, PKI, X25519/
   Ed25519/ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell
   integration remain the next Phase A steps, none started.
+
+  **ROUND 92 UPDATE, 2026-09-06**: DHCP **server** -- brand-new
+  design, no kernel_main.vani precedent at all (Pi 1 never built one).
+  Scoped first in a dedicated pass (`project_dhruva_dhcp_server_
+  scope_2026_09_06.md` memory), then implemented per that scope
+  exactly. A separate persistent-state file from round 91's client
+  (`boot/rpi4/dhcp_server_state.S`): a 4-slot fixed lease table
+  (mac/leased_ip/xid/state/lease_start_tick per slot, matching this
+  project's own established "small fixed arrays" convention -- ARP's
+  8-slot cache, TCP's 2-slot connection table, the filter's 8-slot
+  rule table) plus server-wide config (server_ip/pool_base_ip/
+  pool_size/lease_time) set once via `dhcp_server_init_rpi4`.
+
+  Handles DHCPDISCOVER -> DHCPOFFER (re-offering an existing lease for
+  a known MAC, or allocating the next free pool slot) and DHCPREQUEST
+  -> DHCPACK/DHCPNAK (ACK only if the requested address, or ciaddr for
+  a renewal, matches what this server actually has on record for that
+  MAC; NAK otherwise, including for a MAC this server never saw a
+  DISCOVER from). Reuses round 91's `dhcp_build_fixed_header_rpi4`
+  directly for every reply.
+
+  **The concrete payoff of shipping the client first**: this round's
+  own self-test needed to play "fake client" with no real second host
+  -- rather than hand-building synthetic DISCOVER/REQUEST messages the
+  way round 91's client self-test had to hand-build synthetic OFFER/
+  ACK replies (no server code existed yet to reuse at that point),
+  this round's self-test calls round 91's OWN `dhcp_build_discover_
+  rpi4`/`dhcp_build_request_rpi4` UNCHANGED to synthesize realistic
+  client traffic. Exercises three real paths: DISCOVER->OFFER, a
+  matching REQUEST->ACK, and a REQUEST from a MAC that never
+  DISCOVERed->NAK.
+
+  Applied round 91's own lesson proactively this time (not reactively
+  after a build failure): every sibling-`if`-block local below was
+  given a distinct, block-specific name from the start (`discover_*`/
+  `request_*`, etc.) specifically to avoid
+  [[feedback_vani_llvm_local_name_collision]] recurring a third time
+  -- and it worked, `build_rpi4.sh` succeeded on the first real build,
+  no LLVM codegen fix needed this round.
+
+  Wired into `kmain_rpi4_vani` and a new `dhcps` shell command. All 8
+  Pi 4 smoke tests pass; zero Pi 1 files touched (there was nothing
+  to touch -- this is all new code).
+
+  **Not done, real scope boundaries** (see the scope memory for the
+  full list): DHCPDECLINE/RELEASE/INFORM, lease expiry/GC (a BOUND
+  lease stays bound forever -- also can't be tested synchronously
+  here for the same timer-advancement reason round 91's own renewal
+  self-test was skipped), relay-agent (giaddr) support, conflict
+  detection, dynamic pool reconfiguration, and any admin CLI beyond a
+  self-test rerun. Static-IP configuration (the DHCP-alternative path
+  the user's own original vision also asked for), PKI, X25519/
+  Ed25519/ChaCha20-Poly1305, TLS 1.3, SSH transport, and SSH-shell
+  integration remain the next Phase A steps, none started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
