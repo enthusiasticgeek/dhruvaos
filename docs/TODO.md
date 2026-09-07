@@ -4225,6 +4225,80 @@ than assumed:
   all yet, so that migration needs a brand-new package extraction
   first, not just a Pi-1-consumes-existing-package pass like rounds
   99-100.
+
+  **ROUND 101 UPDATE, 2026-09-07**: new `chacha20_poly1305` kosh
+  package built from scratch (`~/source/vani-chacha20-poly1305`,
+  pushed) -- the only crypto primitive in this roadmap with no Pi
+  4/5-side counterpart to extract from, unlike rounds 98-100's own
+  packages.
+
+  Audited Pi 1's real call sites BEFORE designing the package (same
+  discipline round 100's own "Next" section called for): `chacha20_
+  poly1305_encrypt`/`decrypt`'s own header comment already documented
+  a 4096-byte fixed cap (`mac_data_scratch`'s own size), and the real
+  production call sites (`tls_encrypt_record`/`tls_decrypt_record`)
+  are bounded by `tls_content_scratch`'s own 2048-byte allocation --
+  AAD is always a small fixed constant (5/6/8 bytes across every real
+  and test call site). Conclusion: unlike SHA-256/512 and Ed25519
+  (rounds 99-100), ChaCha20-Poly1305 does NOT need a from-scratch
+  streaming redesign to avoid a length cap -- Pi 1's own existing
+  design was already capped.
+
+  Chose to build genuine streaming primitives anyway, for a different
+  reason found while designing: vani still has no `[expr; N]` array-
+  repeat literal (`vani-compiler/docs/DHRUVAOS_ERGONOMICS_TODO.md`
+  #1/#2, the same gap that shaped `curve25519`'s own 512-byte Ed25519
+  cap in round 100) -- a heap-free package representing a 2048+-byte
+  message as one fixed array would need a multi-thousand-element
+  hand-typed zero-literal. ChaCha20's own CTR-mode construction (RFC
+  8439 section 2.4) makes this easy to route around: blocks are
+  independent, so `chacha20_xor_chunk` processes one 64-byte chunk
+  against one keystream block with no state threaded between calls at
+  all -- a caller loops it over any length just by incrementing the
+  counter. Poly1305 DOES need genuine accumulating state (a running
+  polynomial evaluation), so `Poly1305Ctx`/`poly1305_init`/`update`/
+  `finalize` mirror `crypto_hash`'s own `Sha256Ctx` streaming design
+  exactly (same carry-buffer-for-a-partial-block technique) --
+  `Poly1305Ctx` stores the raw 32-byte key and re-derives the r/s/pad
+  limbs per block rather than threading 13 extra scalar fields through
+  every `update` call, a deliberate simplicity-over-cycles tradeoff.
+
+  A smaller one-shot convenience layer (`chacha20_encrypt`/
+  `poly1305_mac`/`chacha20_poly1305_encrypt`/`decrypt`, capped at 512
+  bytes -- the same ceiling `curve25519`'s own Ed25519 `msg` settled
+  on) sits on top of the streaming primitives, built directly on them
+  (not a separate implementation) so it doubles as a working template
+  for round 102's own Pi 1 adapter, matching the shape `crypto_hash`'s
+  own `sha256_hash` heap adapter in `kernel_main.vani` already uses
+  (`ctx = sha256_update(ref ctx, mut ref chunk, chunk_n);` inside a
+  `while offset < msg_len` loop).
+
+  Every KAT (RFC 8439 section 2.3.2's ChaCha20 block vector, section
+  2.5.2's Poly1305 vector, and a DhruvaOS-original AEAD vector already
+  used by Pi 1's own self-test) independently re-verified against the
+  real `cryptography` Python library before porting -- not trusted
+  just because Pi 1's own copy already passes in production. `vanic
+  check`/`vanic run test/host_test.vani` both pass first try (all 3
+  self-tests PASS); `--backend=c` hits the known, already-filed
+  BUG-235 (struct literal with an array field emits a raw pointer on
+  the C backend) -- confirmed `curve25519` hits the identical error
+  class on `--backend=c` too, so this is pre-existing and non-blocking
+  for DhruvaOS (LLVM backend only), not a new bug in this package.
+
+  Also swept every DhruvaOS-extracted kosh package (`crypto_hash`,
+  `curve25519`, `pki`, `chacha20_poly1305`, DharaFS, `rpi-mmio`) for
+  license consistency per an explicit user check: all six already
+  declare Apache-2.0 in `vani.toml` with matching `LICENSE`/`NOTICE`
+  files. The unrelated math/ML kosh packages (`vani-tensor`, `vani-
+  ml`, etc. -- a separate, pre-existing roadmap) are MIT by design and
+  were left untouched.
+
+  **Next**: round 102 -- delete Pi 1's own `chacha20_*`/`poly1305_*`
+  implementation and wire in `_heap`-suffixed adapters at the ~20
+  external call sites (TLS record encryption, `chacha20_poly1305_
+  encrypt`/`decrypt`, `poly1305_mac`), using the package's own
+  streaming primitives directly (not the capped one-shot layer) since
+  Pi 1's real TLS records already exceed 512 bytes. Not started.
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.
