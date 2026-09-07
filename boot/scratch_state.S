@@ -255,6 +255,38 @@ dhcp_bcast_mac_scratch_addr:
                          * no way to write a byte-buffer literal
                          * directly; still just one persistent buffer,
                          * not a fresh allocation per call. */
+dhcp_server_client_mac_scratch_addr:
+    .word 0             /* Round 107: 6 bytes -- the DHCP SERVER's own
+                         * holding spot for whichever client's MAC it's
+                         * currently processing (extracted from the
+                         * incoming frame's own Ethernet source
+                         * address/chaddr field), used across handle_
+                         * discover/handle_request/build_offer_ack/
+                         * build_nak/send_reply within one poll call.
+                         * Deliberately NOT dhcp_server_mac_scratch
+                         * above -- that buffer holds a different thing
+                         * entirely (the CLIENT role's own record of
+                         * the SERVER's MAC, learned from an ACK) --
+                         * reusing it here would be the same borrowed-
+                         * name hidden-coupling mistake arp_resolve_
+                         * mac_scratch's own comment above already
+                         * warns against. */
+dhcp_server_payload_scratch_addr:
+    .word 0             /* Round 107: 300 bytes, same size/reasoning as
+                         * dhcp_payload_scratch above -- the DHCP
+                         * SERVER's own OFFER/ACK/NAK message build
+                         * buffer. Kept separate from the CLIENT's own
+                         * dhcp_payload_scratch even though nothing
+                         * calls both roles concurrently today, matching
+                         * boot/dhcp_server_state.S's own header comment
+                         * ("client and server are independent roles
+                         * this project may eventually run
+                         * simultaneously"). */
+dhcp_server_frame_scratch_addr:
+    .word 0             /* Round 107: netif_frame_slot_size() bytes,
+                         * same size/reasoning as dhcp_frame_scratch
+                         * above -- the DHCP SERVER's own received-frame
+                         * buffer, kept separate from the client's. */
 usb_bulk_data_scratch_addr:
     .word 0             /* Round 35: 512 bytes -- dwc2_bulk_out/
                          * dwc2_bulk_in's own DMA buffer, separate from
@@ -767,6 +799,48 @@ dhcp_bcast_mac_scratch_set:
 .global dhcp_bcast_mac_scratch_get
 dhcp_bcast_mac_scratch_get:
     ldr r0, =dhcp_bcast_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dhcp_server_client_mac_scratch_set
+dhcp_server_client_mac_scratch_set:
+    ldr r1, =dhcp_server_client_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_server_client_mac_scratch_get
+dhcp_server_client_mac_scratch_get:
+    ldr r0, =dhcp_server_client_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dhcp_server_payload_scratch_set
+dhcp_server_payload_scratch_set:
+    ldr r1, =dhcp_server_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_server_payload_scratch_get
+dhcp_server_payload_scratch_get:
+    ldr r0, =dhcp_server_payload_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dhcp_server_frame_scratch_set
+dhcp_server_frame_scratch_set:
+    ldr r1, =dhcp_server_frame_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_server_frame_scratch_get
+dhcp_server_frame_scratch_get:
+    ldr r0, =dhcp_server_frame_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

@@ -4735,6 +4735,48 @@ than assumed:
   device-level outcome. Full writeup: [[project_dhruva_round104_
   x509_scoping_2026_09_07]]. No code changes made -- awaiting user
   direction on which fork to take.
+
+  **ROUND 107 UPDATE, 2026-09-07**: Pi 1 given a real DHCP server --
+  the concrete follow-on flagged in round 106e's own memo. The
+  message-format ALGORITHM (build_offer_ack/build_nak, the lease-
+  table lookup) already lived in the shared `netstack` package,
+  proven correct on Pi 4/5 -- this round's own new work was purely
+  the netif/socket integration glue (`dhcp_server_init/handle_
+  discover/handle_request/poll/send_reply`, direct ports of Pi 4/5's
+  own round-92 functions to this file's heap `mut ref i64` style) and
+  a brand-new `boot/dhcp_server_state.S` (ARM32 persistent lease-
+  table storage, ported from Pi 4/5's own ARM64 version).
+
+  Caught and fixed a real design error before it shipped: the new
+  server code's own draft reused `dhcp_server_mac_scratch` (an
+  EXISTING buffer whose real purpose is the CLIENT role's own record
+  of the DHCP SERVER's MAC, learned from an ACK) to hold the SERVER
+  role's own view of a CLIENT's MAC -- same name, opposite meaning.
+  Added a dedicated `dhcp_server_client_mac_scratch` instead,
+  matching this project's own explicit "one buffer, one purpose"
+  discipline (`arp_resolve_mac_scratch`'s own comment already warns
+  against exactly this borrowed-name mistake).
+
+  The new ARM32 asm (`dhcp_server_state.S`) deliberately avoids `MUL`
+  entirely for its own 6-byte-per-slot MAC indexing (index*6 computed
+  via shift+add instead) rather than relying on ARMv6 having relaxed
+  MUL's historical Rd/Rm-overlap restriction -- confirmed via
+  disassembly that the emitted code uses only ADD/LSL, no MUL, and
+  only r0-r3 as scratch throughout (matching [[feedback_aapcs_
+  callee_saved_registers_asm]]'s own r0-r3-only discipline -- a real,
+  4-times-recurring bug class in this project when asm functions
+  touch r4-r11 without saving/restoring them).
+
+  Verified: `vanic check`/`build.sh` both passed first try.
+  `phase4_milestone.py`'s full battery zero `(FAIL)` -- the brand-new
+  `DHCPS: server DISCOVER->OFFER, REQUEST->ACK, unknown-MAC REQUEST->
+  NAK` self-test passes on its FIRST live run, and every pre-existing
+  networking self-test (filter/ARP/IPv4/UDP/TCP/DHCP client) still
+  passes with zero regressions. No shell command added (`dhcps` on
+  Pi 4/5 is really just an on-demand rerun of its own self-test, and
+  Pi 1's own shell has no equivalent "rerun a self-test" convention
+  for any of its other networking self-tests either -- this one runs
+  at boot only, matching Pi 1's own established pattern).
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

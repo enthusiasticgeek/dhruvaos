@@ -1057,6 +1057,34 @@ extern "C" fn dhcp_state_set_lease_time(value: u32) -> u32;
 extern "C" fn dhcp_state_get_lease_start_tick() -> u32;
 extern "C" fn dhcp_state_set_lease_start_tick(value: u32) -> u32;
 
+// Round 107 (boot/dhcp_server_state.S): DHCP SERVER persistent state
+// -- Pi 1 never had a server before this round; the accessor shape
+// is a direct port of Pi 4/5's own round-92 design (see that file's
+// own header comment). The message-format algorithm consuming this
+// state already lives in the shared `netstack` package (round 106e).
+extern "C" fn dhcp_server_set_config(server_ip: u32, pool_base_ip: u32, pool_size: u32, lease_time: u32) -> u32;
+extern "C" fn dhcp_server_get_server_ip() -> u32;
+extern "C" fn dhcp_server_get_pool_base_ip() -> u32;
+extern "C" fn dhcp_server_get_pool_size() -> u32;
+extern "C" fn dhcp_server_get_lease_time() -> u32;
+extern "C" fn dhcp_server_reset() -> u32;
+extern "C" fn dhcp_server_get_lease_state(index: u32) -> u32;
+extern "C" fn dhcp_server_set_lease_state(index: u32, value: u32) -> u32;
+extern "C" fn dhcp_server_get_lease_ip(index: u32) -> u32;
+extern "C" fn dhcp_server_set_lease_ip(index: u32, value: u32) -> u32;
+extern "C" fn dhcp_server_get_lease_xid(index: u32) -> u32;
+extern "C" fn dhcp_server_set_lease_xid(index: u32, value: u32) -> u32;
+extern "C" fn dhcp_server_get_lease_start_tick(index: u32) -> u32;
+extern "C" fn dhcp_server_set_lease_start_tick(index: u32, value: u32) -> u32;
+extern "C" fn dhcp_server_get_lease_mac_byte(index: u32, byte_idx: u32) -> u32;
+extern "C" fn dhcp_server_set_lease_mac_byte(index: u32, byte_idx: u32, value: u32) -> u32;
+extern "C" fn dhcp_server_frame_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dhcp_server_frame_scratch_get() -> mut ref i64;
+extern "C" fn dhcp_server_client_mac_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dhcp_server_client_mac_scratch_get() -> mut ref i64;
+extern "C" fn dhcp_server_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dhcp_server_payload_scratch_get() -> mut ref i64;
+
 // Round 33 (boot/usb_msd_state.S): USB mass-storage (Bulk-Only
 // Transport) bring-up state -- same vani-call-boundary gap as every
 // other stateful layer in this file, see that file's own header
@@ -10928,6 +10956,388 @@ fn dhcp_nak_self_test() -> i64 {
   if dhcp_state_get_client_state() != dhcp_state_init() { ok = 0; }
 
   let _ = uart_puts("DHCP: client resets to INIT on a DHCPNAK");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round 107 -- DHCP SERVER. Pi 1 never had one before this round (a
+// real, honest gap the round-105 audit found: Pi 4/5's own round-92
+// server was never ported here). The message-format ALGORITHM this
+// depends on (build_offer_ack/build_nak, the lease-table lookup)
+// already lives in the shared `netstack` kosh package (round 106e),
+// proven correct on Pi 4/5 -- only this file's own netif/socket
+// integration glue and boot/dhcp_server_state.S's own persistent
+// storage are genuinely new. Direct port of Pi 4/5's own
+// dhcp_server_init_rpi4/handle_discover_rpi4/handle_request_rpi4/
+// poll_rpi4/send_reply_rpi4, translated from that port's `[u8;512]`
+// array style to this file's own heap `mut ref i64` style -- same
+// `_heap`-adapter shape every migration in this project's own crypto/
+// networking generification effort already used.
+
+fn dhcp_lease_state_free() -> u32 { return netstack_dhcp_lease_state_free(); }
+fn dhcp_lease_state_offered() -> u32 { return netstack_dhcp_lease_state_offered(); }
+fn dhcp_lease_state_bound() -> u32 { return netstack_dhcp_lease_state_bound(); }
+
+fn dhcp_server_init(server_ip: u32, pool_base_ip: u32, pool_size: u32, lease_time: u32) -> i64 {
+  let _ = dhcp_server_reset();
+  let _ = dhcp_server_set_config(server_ip, pool_base_ip, pool_size, lease_time);
+  return 0;
+}
+
+fn dhcp_lease_table_from_state() -> DhcpLeaseTable {
+  let state: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let ip: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let xid: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let start_tick: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let mac_bytes: [u8; 24] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let i: u32 = 0 as u32;
+  while i < (4 as u32) {
+    state[i as i64] = dhcp_server_get_lease_state(i);
+    ip[i as i64] = dhcp_server_get_lease_ip(i);
+    xid[i as i64] = dhcp_server_get_lease_xid(i);
+    start_tick[i as i64] = dhcp_server_get_lease_start_tick(i);
+    let j: u32 = 0 as u32;
+    while j < (6 as u32) {
+      mac_bytes[(i * (6 as u32) + j) as i64] = dhcp_server_get_lease_mac_byte(i, j) as u8;
+      j = j + (1 as u32);
+    }
+    i = i + (1 as u32);
+  }
+  return DhcpLeaseTable { state: state, ip: ip, xid: xid, start_tick: start_tick, mac_bytes: mac_bytes };
+}
+
+fn dhcp_server_find_lease_by_mac(mac: mut ref i64) -> i64 {
+  let mac_arr: [u8; 6] = [
+    buf_read_byte(mac, 0 as u32) as u8, buf_read_byte(mac, 1 as u32) as u8, buf_read_byte(mac, 2 as u32) as u8,
+    buf_read_byte(mac, 3 as u32) as u8, buf_read_byte(mac, 4 as u32) as u8, buf_read_byte(mac, 5 as u32) as u8
+  ];
+  let table: DhcpLeaseTable = dhcp_lease_table_from_state();
+  let result: DhcpLeaseFindResult = netstack_dhcp_find_lease_by_mac(ref table, ref mac_arr);
+  return result.index;
+}
+
+fn dhcp_server_find_free_slot() -> i64 {
+  let table: DhcpLeaseTable = dhcp_lease_table_from_state();
+  return netstack_dhcp_find_free_slot(ref table);
+}
+
+fn dhcp_server_build_offer_ack(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, msg_type: u32, yiaddr: u32, server_ip: u32, lease_time: u32) -> i64 {
+  let mac_arr: [u8; 6] = [
+    buf_read_byte(mac, 0 as u32) as u8, buf_read_byte(mac, 1 as u32) as u8, buf_read_byte(mac, 2 as u32) as u8,
+    buf_read_byte(mac, 3 as u32) as u8, buf_read_byte(mac, 4 as u32) as u8, buf_read_byte(mac, 5 as u32) as u8
+  ];
+  let local: [u8; 512] = netstack_zero_frame();
+  let msg_len: i64 = netstack_dhcp_server_build_offer_ack(mut ref local, dhcp_offset, ref mac_arr, xid, msg_type, yiaddr, server_ip, lease_time);
+  let i: i64 = 0;
+  while i < msg_len {
+    let _ = buf_write_byte(buf, (dhcp_offset + i) as u32, local[dhcp_offset + i] as u32);
+    i = i + 1;
+  }
+  return msg_len;
+}
+
+fn dhcp_server_build_nak(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, server_ip: u32) -> i64 {
+  let mac_arr: [u8; 6] = [
+    buf_read_byte(mac, 0 as u32) as u8, buf_read_byte(mac, 1 as u32) as u8, buf_read_byte(mac, 2 as u32) as u8,
+    buf_read_byte(mac, 3 as u32) as u8, buf_read_byte(mac, 4 as u32) as u8, buf_read_byte(mac, 5 as u32) as u8
+  ];
+  let local: [u8; 512] = netstack_zero_frame();
+  let msg_len: i64 = netstack_dhcp_server_build_nak(mut ref local, dhcp_offset, ref mac_arr, xid, server_ip);
+  let i: i64 = 0;
+  while i < msg_len {
+    let _ = buf_write_byte(buf, (dhcp_offset + i) as u32, local[dhcp_offset + i] as u32);
+    i = i + 1;
+  }
+  return msg_len;
+}
+
+fn dhcp_server_send_reply(my_mac: mut ref i64, server_ip: u32, payload: mut ref i64, payload_len: i64) -> i64 {
+  let bcast_mac: mut ref i64 = dhcp_bcast_mac_scratch_get();
+  let _ = dhcp_broadcast_mac(bcast_mac);
+  let bcast_ip: u32 = 0xFFFFFFFF as u32;
+  return udp_send(my_mac, bcast_mac, server_ip, bcast_ip, dhcp_server_port(), dhcp_client_port(), payload, payload_len);
+}
+
+// DISCOVER: reuse an existing lease for this MAC if one exists
+// (re-offering the same address, matching real DHCP server behavior
+// for a client that DISCOVERs again before completing the handshake),
+// otherwise allocate the next free pool slot. Pool exhaustion (no
+// free slot) is silently ignored -- a real, honest scope boundary
+// matching this project's own established "table full -> no room,
+// not a crash" posture elsewhere (the packet filter's own 8-rule
+// table, ARP's round-robin cache).
+fn dhcp_server_handle_discover(frame: mut ref i64, my_mac: mut ref i64) -> i64 {
+  let dhcp_offset: i64 = 42;
+  let xid: u32 = dhcp_get_xid(frame, dhcp_offset);
+  let client_mac: mut ref i64 = dhcp_server_client_mac_scratch_get();
+  let dmi: i64 = 0;
+  while dmi < 6 {
+    let mb: u32 = buf_read_byte(frame, (dhcp_offset + 28 + dmi) as u32);
+    let _ = buf_write_byte(client_mac, dmi as u32, mb);
+    dmi = dmi + 1;
+  }
+
+  let existing_slot: i64 = dhcp_server_find_lease_by_mac(client_mac);
+  let slot: i64 = existing_slot;
+  if slot < 0 {
+    slot = dhcp_server_find_free_slot();
+    if slot < 0 {
+      return 0; // pool exhausted
+    }
+    let pool_base: u32 = dhcp_server_get_pool_base_ip();
+    let alloc_ip: u32 = pool_base + (slot as u32);
+    let _ = dhcp_server_set_lease_ip(slot as u32, alloc_ip);
+    let dmj: i64 = 0;
+    while dmj < 6 {
+      let mb2: u32 = buf_read_byte(client_mac, dmj as u32);
+      let _ = dhcp_server_set_lease_mac_byte(slot as u32, dmj as u32, mb2);
+      dmj = dmj + 1;
+    }
+  }
+  let _ = dhcp_server_set_lease_state(slot as u32, dhcp_lease_state_offered());
+  let _ = dhcp_server_set_lease_xid(slot as u32, xid);
+
+  let server_ip: u32 = dhcp_server_get_server_ip();
+  let lease_time: u32 = dhcp_server_get_lease_time();
+  let offered_ip: u32 = dhcp_server_get_lease_ip(slot as u32);
+  let discover_reply: mut ref i64 = dhcp_server_payload_scratch_get();
+  let discover_reply_len: i64 = dhcp_server_build_offer_ack(discover_reply, 0, client_mac, xid, dhcp_msgtype_offer(), offered_ip, server_ip, lease_time);
+  let _ = dhcp_server_send_reply(my_mac, server_ip, discover_reply, discover_reply_len);
+  return 1;
+}
+
+// REQUEST: ACK only if this MAC already has a lease (from a prior
+// DISCOVER) AND the requested address (option 50, or ciaddr for a
+// renewal) matches what THIS server actually has on record for it --
+// otherwise NAK. An unknown MAC (never DISCOVERed) always NAKs.
+fn dhcp_server_handle_request(frame: mut ref i64, dhcp_len: i64, my_mac: mut ref i64) -> i64 {
+  let dhcp_offset: i64 = 42;
+  let xid: u32 = dhcp_get_xid(frame, dhcp_offset);
+  let client_mac: mut ref i64 = dhcp_server_client_mac_scratch_get();
+  let rmi: i64 = 0;
+  while rmi < 6 {
+    let mb: u32 = buf_read_byte(frame, (dhcp_offset + 28 + rmi) as u32);
+    let _ = buf_write_byte(client_mac, rmi as u32, mb);
+    rmi = rmi + 1;
+  }
+
+  let requested_ip_opt: u32 = dhcp_find_option_u32(frame, dhcp_offset, dhcp_len, 50 as u32);
+  let ciaddr: u32 = dhcp_get_ciaddr(frame, dhcp_offset);
+  let want_ip: u32 = if requested_ip_opt != (0 as u32) { requested_ip_opt } else { ciaddr };
+
+  let server_ip: u32 = dhcp_server_get_server_ip();
+  let slot: i64 = dhcp_server_find_lease_by_mac(client_mac);
+  let ok_to_ack: i64 = if (slot >= 0) && (dhcp_server_get_lease_ip(slot as u32) == want_ip) { 1 } else { 0 };
+
+  let request_reply: mut ref i64 = dhcp_server_payload_scratch_get();
+  if ok_to_ack == 1 {
+    let _ = dhcp_server_set_lease_state(slot as u32, dhcp_lease_state_bound());
+    let _ = dhcp_server_set_lease_xid(slot as u32, xid);
+    let lease_time: u32 = dhcp_server_get_lease_time();
+    let ack_reply_len: i64 = dhcp_server_build_offer_ack(request_reply, 0, client_mac, xid, dhcp_msgtype_ack(), want_ip, server_ip, lease_time);
+    let _ = dhcp_server_send_reply(my_mac, server_ip, request_reply, ack_reply_len);
+  } else {
+    let nak_reply_len: i64 = dhcp_server_build_nak(request_reply, 0, client_mac, xid, server_ip);
+    let _ = dhcp_server_send_reply(my_mac, server_ip, request_reply, nak_reply_len);
+  }
+  return 1;
+}
+
+// Dequeues the next queued frame and, if it's a DHCP client message
+// (dst_port 67, valid magic cookie, op=BOOTREQUEST) addressed to this
+// server, dispatches by message type. Same round-8/round-22-style
+// checksum/bounds guard as this file's own dhcp_client_poll.
+fn dhcp_server_poll(my_mac: mut ref i64) -> i64 {
+  let frame: mut ref i64 = dhcp_server_frame_scratch_get();
+  let frame_len: i64 = netif_recv_frame(frame, netif_frame_slot_size());
+  if frame_len < 0 {
+    return 0 - 1;
+  }
+  if buf_read_u16_be(frame, 12) != (0x0800 as u32) {
+    return 0;
+  }
+  if ipv4_get_protocol(frame, 14) != (17 as u32) {
+    return 0;
+  }
+  if udp_get_dst_port(frame, 34) != dhcp_server_port() {
+    return 0;
+  }
+  let udp_len: u32 = udp_get_length(frame, 34);
+  let dhcp_len: i64 = (udp_len as i64) - 8;
+  if dhcp_len < 240 {
+    return 0;
+  }
+  if (34 + (udp_len as i64)) > frame_len {
+    return 0;
+  }
+  let src_ip: u32 = ipv4_get_src_ip(frame, 14);
+  let dst_ip: u32 = ipv4_get_dst_ip(frame, 14);
+  if udp_verify_checksum(src_ip, dst_ip, frame, 34, udp_len as i64) != 1 {
+    return 0;
+  }
+  let dhcp_offset: i64 = 42;
+  if dhcp_verify_magic_cookie(frame, dhcp_offset) != 1 {
+    return 0;
+  }
+  if dhcp_get_op(frame, dhcp_offset) != dhcp_op_bootrequest() {
+    return 0;
+  }
+  let msg_type: i64 = dhcp_find_option_byte(frame, dhcp_offset, dhcp_len, 53 as u32);
+  if msg_type == (dhcp_msgtype_discover() as i64) {
+    return dhcp_server_handle_discover(frame, my_mac);
+  }
+  if msg_type == (dhcp_msgtype_request() as i64) {
+    return dhcp_server_handle_request(frame, dhcp_len, my_mac);
+  }
+  return 0;
+}
+
+// Boot-time self-test: no real DHCP client exists in this loopback-
+// only environment, so this plays "fake client" using this file's own
+// dhcp_build_discover/dhcp_build_request builders (they already
+// produce exactly the wire format a real client sends) wrapped in a
+// manually-built Ethernet+IP+UDP frame, exercising DISCOVER->OFFER, a
+// matching REQUEST->ACK, and an unknown-MAC REQUEST->NAK -- direct
+// port of Pi 4/5's own dhcp_server_self_test_rpi4.
+fn dhcp_server_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let server_ip: u32 = 0x0A000001 as u32;    // 10.0.0.1
+  let pool_base_ip: u32 = 0x0A00000A as u32; // 10.0.0.10
+  let _ = dhcp_server_init(server_ip, pool_base_ip, 4 as u32, 3600 as u32);
+
+  let no_ip: u32 = 0 as u32;
+  let bcast_ip: u32 = 0xFFFFFFFF as u32;
+  let fake_client_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = buf_write_byte(fake_client_mac, 0 as u32, 0x02 as u32);
+  let _ = buf_write_byte(fake_client_mac, 1 as u32, 0 as u32);
+  let _ = buf_write_byte(fake_client_mac, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(fake_client_mac, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(fake_client_mac, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(fake_client_mac, 5 as u32, 0x42 as u32);
+  let xid: u32 = 0xABCD1234 as u32;
+
+  // --- DISCOVER -> OFFER ---
+  let discover_msg: mut ref i64 = dhruva_alloc_bytes(300);
+  let discover_dhcp_len: i64 = dhcp_build_discover(discover_msg, 0, fake_client_mac, xid);
+  let discover_frame: mut ref i64 = dhruva_alloc_bytes(400);
+  let dfi: i64 = 0;
+  while dfi < 6 {
+    let _ = buf_write_byte(discover_frame, dfi as u32, 0xFF as u32); // dst: broadcast
+    dfi = dfi + 1;
+  }
+  let dfj: i64 = 0;
+  while dfj < 6 {
+    let mb: u32 = buf_read_byte(fake_client_mac, dfj as u32);
+    let _ = buf_write_byte(discover_frame, (6 + dfj) as u32, mb); // src: fake client
+    dfj = dfj + 1;
+  }
+  let _ = buf_write_u16_be(discover_frame, 12, 0x0800 as u32);
+  let discover_udp_len: i64 = udp_build(discover_frame, 34, dhcp_client_port(), dhcp_server_port(), discover_msg, discover_dhcp_len, no_ip, bcast_ip);
+  let discover_total_len: i64 = 20 + discover_udp_len;
+  let _ = ipv4_build_header(discover_frame, 14, discover_total_len, 17 as u32, no_ip, bcast_ip);
+  let discover_frame_len: i64 = 14 + discover_total_len;
+  let send1: i64 = netif_send_frame(discover_frame, discover_frame_len);
+  if send1 != 0 { ok = 0; }
+
+  let poll1: i64 = dhcp_server_poll(my_mac);
+  if poll1 != 1 { ok = 0; }
+
+  let slot_after_discover: i64 = dhcp_server_find_lease_by_mac(fake_client_mac);
+  if slot_after_discover < 0 { ok = 0; }
+  if dhcp_server_get_lease_state(slot_after_discover as u32) != dhcp_lease_state_offered() { ok = 0; }
+  let offered_ip: u32 = dhcp_server_get_lease_ip(slot_after_discover as u32);
+  if offered_ip != pool_base_ip { ok = 0; } // first free slot -> pool_base + 0
+
+  let offer_recv: mut ref i64 = dhruva_alloc_bytes(400);
+  let offer_recv_len: i64 = netif_recv_frame(offer_recv, 400);
+  if offer_recv_len < 240 { ok = 0; }
+  if dhcp_find_option_byte(offer_recv, 42, offer_recv_len - 42, 53 as u32) != (dhcp_msgtype_offer() as i64) { ok = 0; }
+  if dhcp_get_yiaddr(offer_recv, 42) != offered_ip { ok = 0; }
+  if dhcp_find_option_u32(offer_recv, 42, offer_recv_len - 42, 54 as u32) != server_ip { ok = 0; }
+
+  // --- matching REQUEST -> ACK ---
+  let request_msg: mut ref i64 = dhruva_alloc_bytes(300);
+  let request_dhcp_len: i64 = dhcp_build_request(request_msg, 0, fake_client_mac, xid, offered_ip, server_ip);
+  let request_frame: mut ref i64 = dhruva_alloc_bytes(400);
+  let rfi: i64 = 0;
+  while rfi < 6 {
+    let _ = buf_write_byte(request_frame, rfi as u32, 0xFF as u32);
+    rfi = rfi + 1;
+  }
+  let rfj: i64 = 0;
+  while rfj < 6 {
+    let mb2: u32 = buf_read_byte(fake_client_mac, rfj as u32);
+    let _ = buf_write_byte(request_frame, (6 + rfj) as u32, mb2);
+    rfj = rfj + 1;
+  }
+  let _ = buf_write_u16_be(request_frame, 12, 0x0800 as u32);
+  let request_udp_len: i64 = udp_build(request_frame, 34, dhcp_client_port(), dhcp_server_port(), request_msg, request_dhcp_len, no_ip, bcast_ip);
+  let request_total_len: i64 = 20 + request_udp_len;
+  let _ = ipv4_build_header(request_frame, 14, request_total_len, 17 as u32, no_ip, bcast_ip);
+  let request_frame_len: i64 = 14 + request_total_len;
+  let send2: i64 = netif_send_frame(request_frame, request_frame_len);
+  if send2 != 0 { ok = 0; }
+
+  let poll2: i64 = dhcp_server_poll(my_mac);
+  if poll2 != 1 { ok = 0; }
+  if dhcp_server_get_lease_state(slot_after_discover as u32) != dhcp_lease_state_bound() { ok = 0; }
+
+  let ack_recv: mut ref i64 = dhruva_alloc_bytes(400);
+  let ack_recv_len: i64 = netif_recv_frame(ack_recv, 400);
+  if ack_recv_len < 240 { ok = 0; }
+  if dhcp_find_option_byte(ack_recv, 42, ack_recv_len - 42, 53 as u32) != (dhcp_msgtype_ack() as i64) { ok = 0; }
+  if dhcp_get_yiaddr(ack_recv, 42) != offered_ip { ok = 0; }
+
+  // --- unknown-MAC REQUEST -> NAK ---
+  let stranger_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = buf_write_byte(stranger_mac, 0 as u32, 0x02 as u32);
+  let _ = buf_write_byte(stranger_mac, 1 as u32, 0 as u32);
+  let _ = buf_write_byte(stranger_mac, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(stranger_mac, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(stranger_mac, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(stranger_mac, 5 as u32, 0x99 as u32);
+  let stranger_xid: u32 = 0x55667788 as u32;
+  let stranger_msg: mut ref i64 = dhruva_alloc_bytes(300);
+  let stranger_dhcp_len: i64 = dhcp_build_request(stranger_msg, 0, stranger_mac, stranger_xid, pool_base_ip, server_ip);
+  let stranger_frame: mut ref i64 = dhruva_alloc_bytes(400);
+  let sfi: i64 = 0;
+  while sfi < 6 {
+    let _ = buf_write_byte(stranger_frame, sfi as u32, 0xFF as u32);
+    sfi = sfi + 1;
+  }
+  let sfj: i64 = 0;
+  while sfj < 6 {
+    let mb3: u32 = buf_read_byte(stranger_mac, sfj as u32);
+    let _ = buf_write_byte(stranger_frame, (6 + sfj) as u32, mb3);
+    sfj = sfj + 1;
+  }
+  let _ = buf_write_u16_be(stranger_frame, 12, 0x0800 as u32);
+  let stranger_udp_len: i64 = udp_build(stranger_frame, 34, dhcp_client_port(), dhcp_server_port(), stranger_msg, stranger_dhcp_len, no_ip, bcast_ip);
+  let stranger_total_len: i64 = 20 + stranger_udp_len;
+  let _ = ipv4_build_header(stranger_frame, 14, stranger_total_len, 17 as u32, no_ip, bcast_ip);
+  let stranger_frame_len: i64 = 14 + stranger_total_len;
+  let send3: i64 = netif_send_frame(stranger_frame, stranger_frame_len);
+  if send3 != 0 { ok = 0; }
+
+  let poll3: i64 = dhcp_server_poll(my_mac);
+  if poll3 != 1 { ok = 0; }
+  if dhcp_server_get_lease_state(slot_after_discover as u32) != dhcp_lease_state_bound() { ok = 0; } // stranger's lease untouched
+
+  let nak_recv: mut ref i64 = dhruva_alloc_bytes(400);
+  let nak_recv_len: i64 = netif_recv_frame(nak_recv, 400);
+  if nak_recv_len < 240 { ok = 0; }
+  if dhcp_find_option_byte(nak_recv, 42, nak_recv_len - 42, 53 as u32) != (dhcp_msgtype_nak() as i64) { ok = 0; }
+
+  let _ = uart_puts("DHCPS: server DISCOVER->OFFER, REQUEST->ACK, unknown-MAC REQUEST->NAK");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -25775,6 +26185,9 @@ fn kernel_main() -> i64 {
   let _ = dhcp_payload_scratch_set(dhruva_alloc_bytes(300));
   let _ = dhcp_frame_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
   let _ = dhcp_bcast_mac_scratch_set(dhruva_alloc_bytes(8));
+  let _ = dhcp_server_payload_scratch_set(dhruva_alloc_bytes(300));
+  let _ = dhcp_server_frame_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
+  let _ = dhcp_server_client_mac_scratch_set(dhruva_alloc_bytes(6));
 
   let _ = sdhost_cmd_timed_out_self_test();
 
@@ -26004,6 +26417,7 @@ fn kernel_main() -> i64 {
   let _ = dhcp_self_test();
   let _ = dhcp_renewal_self_test();
   let _ = dhcp_nak_self_test();
+  let _ = dhcp_server_self_test();
   let _ = netif_queue_contention_self_test();
 
   // Round 41: crypto primitives foundation, hash-function half.

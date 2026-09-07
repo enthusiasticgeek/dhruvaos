@@ -88,6 +88,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/dhcp_state.S" -o "${BUILD_DIR}/dhcp_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/dhcp_server_state.S" -o "${BUILD_DIR}/dhcp_server_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/usb_msd_state.S" -o "${BUILD_DIR}/usb_msd_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -181,6 +184,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/governor_state.o" "${BUILD_DIR}/netif_state.o" \
   "${BUILD_DIR}/arp_state.o" "${BUILD_DIR}/scratch_state.o" \
   "${BUILD_DIR}/tcp_state.o" "${BUILD_DIR}/dhcp_state.o" \
+  "${BUILD_DIR}/dhcp_server_state.o" \
   "${BUILD_DIR}/usb_msd_state.o" \
   "${BUILD_DIR}/usb_net_state.o" \
   "${BUILD_DIR}/usb_bt_state.o" \
