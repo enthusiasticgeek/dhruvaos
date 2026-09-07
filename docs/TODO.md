@@ -4777,6 +4777,49 @@ than assumed:
   Pi 1's own shell has no equivalent "rerun a self-test" convention
   for any of its other networking self-tests either -- this one runs
   at boot only, matching Pi 1's own established pattern).
+
+  **ROUND 108 UPDATE, 2026-09-07**: HTTPS added -- a new, minimal,
+  hardware-agnostic `http` kosh package (`~/source/vani-http`, GET/
+  POST + headers + Content-Length body framing, no chunked transfer-
+  encoding -- an honest scope boundary matching TLS's own single-
+  ciphersuite scope and DHCP's own no-relay-agent scope) layered
+  directly on Pi 1's existing TLS 1.3 stack via a new `httpecho` shell
+  command (mirroring `tlsecho`'s own both-roles-in-one-instance
+  shape: a real POST /echo request, encrypted and sent over real TCP,
+  decrypted/parsed/re-encoded into a real 200 OK response on the
+  "server" side, decrypted and parsed again on the client side).
+  **Confirmed Pi 4/5 has no TLS implementation at all yet** (only the
+  crypto PRIMITIVES were ever ported there, rounds 94-98) -- so this
+  round's own HTTPS work is Pi 1-only; Pi 4/5 would need a full TLS
+  1.3 port first (a undertaking of similar scope to the original
+  rounds 94-97 crypto-chain work) before HTTPS could land there too.
+
+  A real, load-bearing infrastructure bug found and fixed along the
+  way: this project's own ARM-side RAM mapping (`boot/mmu_init.S`)
+  has mapped only 2MB (sections 0-1) since round 38 -- and this
+  round's own new code (the `http` package + `httpecho`) pushed the
+  linked image's total footprint (code+data+bss+768KB heap+task
+  stacks) past that ceiling for the FIRST time, moving the heap's own
+  base address into genuinely unmapped memory and crashing with a
+  Data Abort at exactly address 0x00200000 on every single boot.
+  Root-caused by comparing `nm --size-sort -S` output between the
+  round-107 baseline (`__bss_end` = 0x1c9e98, safely under 2MB) and
+  the broken build (`__bss_end` = 0x2c9ea8, ~941KB over) -- confirmed
+  by finding `dhruva_heap`'s own linked base address (0x209e9c)
+  already past 0x00200000. Fixed the same way ROUND 71 already fixed
+  an analogous "ran out of mapped space" problem for GPU RAM: mapped
+  8 more 1MB sections (2-9, extending ARM RAM to 10MB total) as plain
+  read-write/never-execute sections, giving ~7MB of real headroom
+  over the current ~2.94MB footprint -- room for MQTT (round 109) and
+  beyond without hitting this ceiling again soon. Verified via
+  `phase4_milestone.py` (zero regressions) AND `heap_stress.py`'s own
+  dedicated heap-exhaustion regression check (still PASS).
+
+  Verified: `vanic check`/`build.sh` both pass. `phase4_milestone.py`'s
+  full battery zero `(FAIL)` -- the new `httpecho` self-test passes on
+  its first live run, proving the package's own build/parse functions
+  round-trip correctly over a GENUINE encrypted transport (not just
+  the package's own buffer-to-buffer self-test).
 - Only after both of the above: EMMC2 (storage) and XHCI (USB) drivers
   from scratch — both already flagged above as substantially larger
   than their Pi 1 SDHOST/DWC2 counterparts.

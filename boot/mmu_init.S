@@ -259,6 +259,44 @@ mmu_init_l2_data_loop:
     cmp r5, #256
     blt mmu_init_l2_data_loop
 
+    /* ROUND 108 FIX (2026-09-07): sections 2-9 (0x00200000-0x009FFFFF,
+     * 8MB) -- ARM-side RAM headroom beyond the original 2MB (sections
+     * 0-1) this project shipped with since round 38. Found live: this
+     * project's own image (code + .data/.bss/768KB heap/task stacks,
+     * all packed into sections 0-1 by link.ld's own contiguous layout)
+     * grew past that original 2MB ceiling for the first time this
+     * round (adding the `http` kosh package + the `httpecho` shell
+     * command pushed __bss_end from 0x1c9e98 to 0x2c9ea8, i.e. the
+     * 768KB heap's own base address landed PAST 0x00200000) --
+     * confirmed via a real Data Abort at exactly address 0x00200000
+     * (a translation fault: that section was never mapped at all, not
+     * a permission fault), then confirmed the theory directly via
+     * `nm --size-sort -S` showing `dhruva_heap`'s own linked base
+     * address already past the boundary. Same fix shape as ROUND 71's
+     * own GPU-RAM mapping extension just below (this project's own
+     * established precedent for "ran out of mapped space, so map
+     * more" rather than trying to shrink the image back under an
+     * artificially tight ceiling that has no relationship to this
+     * machine's real 512MB of RAM). Plain section descriptors (not a
+     * coarse page table like section 1) since no per-task stack guard
+     * page has ever needed 4KB granularity outside section 1 itself.
+     * Same read+write/never-execute/Normal-Non-cacheable encoding as
+     * section 1's own ORIGINAL (pre-page-table) descriptor: TEX=001
+     * (0x1000) | AP=01 (0x400) | XN=1 (0x10) | section type (0x2) =
+     * 0x1412 -- APX left at 0 (not read-only) since this is
+     * writable data/heap/stack space, matching every RAM section's
+     * own AP=01 (not the read-only APX=1/AP=01 code section uses). */
+    mov r6, #2
+    ldr r7, =0x00200000
+mmu_init_ram_ext_loop:
+    ldr r5, =0x00001412
+    orr r5, r5, r7
+    str r5, [r4, r6, lsl #2]
+    add r7, r7, #0x00100000
+    add r6, r6, #1
+    cmp r6, #10
+    blt mmu_init_ram_ext_loop
+
     /* Sections 512-527 (0x20000000-0x20FFFFFF, 16MB): every BCM2835
      * peripheral this project uses falls inside this one block with
      * wide margin -- confirmed by grepping every 0x20...... literal

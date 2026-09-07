@@ -1,0 +1,426 @@
+// http v0.1.0 -- minimal HTTP/1.1 (RFC 7230/7231) request/response
+// build+parse, pure vani, hardware-agnostic and heap-free.
+//
+// Scoped down deliberately, matching this project's own established
+// "honest scope boundary" discipline elsewhere (TLS's own single-
+// ciphersuite scope, DHCP's own no-relay-agent scope): GET/POST
+// methods, a request line + headers + optional Content-Length-framed
+// body, no chunked transfer-encoding, no multi-value/folded headers,
+// no HTTP/1.0 or HTTP/2. This covers the large majority of simple
+// request/response exchanges (a device serving or consuming a small
+// JSON/text payload) without the real complexity chunked encoding
+// and full RFC 7230 header-folding compliance would add.
+//
+// Operates on a standalone `[u8;512]` buffer, the SAME bounded-
+// message design choice DHCP's own module made (vani-netstack round
+// 106e) rather than a streaming design: an HTTP header BLOCK
+// (request/status line + headers, before any body) has no protocol-
+// mandated minimum size the way a raw byte-stream payload does, and
+// this package's own scope explicitly excludes unbounded header
+// blocks. A body, once Content-Length is known, is the CALLER's own
+// concern to copy/stream (this package only computes where it starts
+// and how long it should be) -- exactly the same header/payload
+// split IPv4's own 20-byte codec made from its own variable-length
+// payload.
+//
+// Transport-agnostic: this package has no TLS/socket concept at all.
+// A consumer pairs it with an existing TLS 1.3 stack for HTTPS
+// (writing the built request/response bytes through that stack's own
+// send function, reading received bytes to parse) or plain TCP for
+// unencrypted HTTP -- the same "this package doesn't know about the
+// board it's running on" posture every other package in this
+// project's crypto/networking generification effort already takes.
+
+fn http_zero512_bytes() -> [u8; 512] {
+  let a: [u8; 64] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let out: [u8; 512] = [
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63],
+    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+    a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
+    a[32], a[33], a[34], a[35], a[36], a[37], a[38], a[39], a[40], a[41], a[42], a[43], a[44], a[45], a[46], a[47],
+    a[48], a[49], a[50], a[51], a[52], a[53], a[54], a[55], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63]
+  ];
+  return out;
+}
+
+
+fn http_write_str(buf: mut ref [u8; 512], pos: i64, s: Str) -> i64 {
+  let span_len: i64 = str_len_bytes(s);
+  let i: i64 = 0;
+  while i < span_len {
+    buf[pos + i] = str_byte_at(s, i) as u8;
+    i = i + 1;
+  }
+  return pos + span_len;
+}
+
+fn http_write_decimal(buf: mut ref [u8; 512], pos: i64, value: i64) -> i64 {
+  if value == 0 {
+    buf[pos] = 48 as u8; // '0'
+    return pos + 1;
+  }
+  let digits: [u8; 20] = [
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
+  ];
+  let n: i64 = value;
+  let count: i64 = 0;
+  while n > 0 {
+    digits[count] = ((n % 10) + 48) as u8;
+    n = n / 10;
+    count = count + 1;
+  }
+  let i: i64 = 0;
+  while i < count {
+    buf[pos + i] = digits[count - 1 - i];
+    i = i + 1;
+  }
+  return pos + count;
+}
+
+fn http_write_crlf(buf: mut ref [u8; 512], pos: i64) -> i64 {
+  buf[pos] = 13 as u8; // '\r'
+  buf[pos + 1] = 10 as u8; // '\n'
+  return pos + 2;
+}
+
+// Builds "METHOD PATH HTTP/1.1\r\nHost: HOST\r\nContent-Length: N\r\n\r\n"
+// at buf[0..). The caller appends `body_len` body bytes immediately
+// after the returned header length themselves (this package has no
+// concept of the body's own content, only its declared length).
+fn http_build_request(buf: mut ref [u8; 512], method: Str, path: Str, host: Str, body_len: i64) -> i64 {
+  let pos: i64 = 0;
+  pos = http_write_str(buf, pos, method);
+  buf[pos] = 32 as u8; // ' '
+  pos = pos + 1;
+  pos = http_write_str(buf, pos, path);
+  buf[pos] = 32 as u8;
+  pos = pos + 1;
+  pos = http_write_str(buf, pos, "HTTP/1.1");
+  pos = http_write_crlf(buf, pos);
+  pos = http_write_str(buf, pos, "Host: ");
+  pos = http_write_str(buf, pos, host);
+  pos = http_write_crlf(buf, pos);
+  pos = http_write_str(buf, pos, "Content-Length: ");
+  pos = http_write_decimal(buf, pos, body_len);
+  pos = http_write_crlf(buf, pos);
+  pos = http_write_crlf(buf, pos);
+  return pos;
+}
+
+// Builds "HTTP/1.1 CODE REASON\r\nContent-Type: TYPE\r\nContent-Length:
+// N\r\n\r\n" at buf[0..). Same body-append convention as
+// `http_build_request`.
+fn http_build_response(buf: mut ref [u8; 512], status_code: i64, reason: Str, content_type: Str, body_len: i64) -> i64 {
+  let pos: i64 = 0;
+  pos = http_write_str(buf, pos, "HTTP/1.1 ");
+  pos = http_write_decimal(buf, pos, status_code);
+  buf[pos] = 32 as u8;
+  pos = pos + 1;
+  pos = http_write_str(buf, pos, reason);
+  pos = http_write_crlf(buf, pos);
+  pos = http_write_str(buf, pos, "Content-Type: ");
+  pos = http_write_str(buf, pos, content_type);
+  pos = http_write_crlf(buf, pos);
+  pos = http_write_str(buf, pos, "Content-Length: ");
+  pos = http_write_decimal(buf, pos, body_len);
+  pos = http_write_crlf(buf, pos);
+  pos = http_write_crlf(buf, pos);
+  return pos;
+}
+
+// ---------------------------------------------------------------
+// Parsing. All results are (start, span_len) offsets into the CALLER's
+// own buffer, matching DHCP's own option-scanning convention
+// (`netstack_dhcp_find_option_byte`'s own precedent) -- no copying,
+// no dynamic strings.
+// ---------------------------------------------------------------
+
+struct HttpSpanResult { found: i64, start: i64, span_len: i64 }
+
+// Finds the next occurrence of a single byte at or after `start_pos`,
+// within [0, limit). Bounded (max 512 iterations, matching this
+// buffer's own real cap) -- a malformed/adversarial buffer with no
+// terminator can't spin this forever.
+fn http_find_byte(buf: ref [u8; 512], start_pos: i64, limit: i64, target: u8) -> i64 {
+  let i: i64 = start_pos;
+  let iter: i64 = 0;
+  while (i < limit) && (iter < 512) {
+    if buf[i] == target {
+      return i;
+    }
+    i = i + 1;
+    iter = iter + 1;
+  }
+  return 0 - 1;
+}
+
+struct HttpRequestLine { ok: i64, method_start: i64, method_len: i64, path_start: i64, path_len: i64, header_start: i64 }
+
+// Parses "METHOD PATH VERSION\r\n" at the start of buf, returning
+// offsets for method/path and where the header block begins (right
+// after this line's own trailing CRLF). `ok: 0` if the line is
+// malformed (missing a space, no CRLF found within `buf_len`) or the
+// version isn't exactly "HTTP/1.1" (this package's own scope
+// boundary -- no HTTP/1.0 or HTTP/2).
+fn http_parse_request_line(buf: ref [u8; 512], buf_len: i64) -> HttpRequestLine {
+  let sp1: i64 = http_find_byte(buf, 0, buf_len, 32 as u8);
+  if sp1 < 0 {
+    return HttpRequestLine { ok: 0, method_start: 0, method_len: 0, path_start: 0, path_len: 0, header_start: 0 };
+  }
+  let sp2: i64 = http_find_byte(buf, sp1 + 1, buf_len, 32 as u8);
+  if sp2 < 0 {
+    return HttpRequestLine { ok: 0, method_start: 0, method_len: 0, path_start: 0, path_len: 0, header_start: 0 };
+  }
+  let cr: i64 = http_find_byte(buf, sp2 + 1, buf_len, 13 as u8);
+  if (cr < 0) || ((cr + 1) >= buf_len) || (buf[cr + 1] != (10 as u8)) {
+    return HttpRequestLine { ok: 0, method_start: 0, method_len: 0, path_start: 0, path_len: 0, header_start: 0 };
+  }
+  let version_len: i64 = cr - (sp2 + 1);
+  if version_len != 8 {
+    return HttpRequestLine { ok: 0, method_start: 0, method_len: 0, path_start: 0, path_len: 0, header_start: 0 };
+  }
+  let vi: i64 = 0;
+  let version_ok: i64 = 1;
+  while vi < 8 {
+    if buf[sp2 + 1 + vi] != (str_byte_at("HTTP/1.1", vi) as u8) {
+      version_ok = 0;
+    }
+    vi = vi + 1;
+  }
+  if version_ok == 0 {
+    return HttpRequestLine { ok: 0, method_start: 0, method_len: 0, path_start: 0, path_len: 0, header_start: 0 };
+  }
+  return HttpRequestLine { ok: 1, method_start: 0, method_len: sp1, path_start: sp1 + 1, path_len: sp2 - (sp1 + 1), header_start: cr + 2 };
+}
+
+fn http_method_is(buf: ref [u8; 512], method_start: i64, method_len: i64, want: Str) -> i64 {
+  let wlen: i64 = str_len_bytes(want);
+  if method_len != wlen {
+    return 0;
+  }
+  let i: i64 = 0;
+  while i < wlen {
+    if buf[method_start + i] != (str_byte_at(want, i) as u8) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// Finds the end of the header block (the blank line CRLF CRLF)
+// starting the scan at `header_start`. Returns the offset of the
+// body's own first byte (right after the blank line), or -1 if no
+// blank line is found within `buf_len` (a malformed or truncated
+// message -- reject, don't guess, matching this project's own
+// posture everywhere else).
+fn http_find_body_start(buf: ref [u8; 512], header_start: i64, buf_len: i64) -> i64 {
+  let pos: i64 = header_start;
+  let iter: i64 = 0;
+  while ((pos + 1) < buf_len) && (iter < 64) {
+    if (buf[pos] == (13 as u8)) && (buf[pos + 1] == (10 as u8)) {
+      return pos + 2;
+    }
+    let next_line: i64 = http_find_byte(buf, pos, buf_len, 10 as u8);
+    if next_line < 0 {
+      return 0 - 1;
+    }
+    pos = next_line + 1;
+    iter = iter + 1;
+  }
+  return 0 - 1;
+}
+
+// Case-insensitive search for a header named `name` within
+// [header_start, header_block_end) -- RFC 7230 section 3.2 requires
+// header field names to be matched case-insensitively. Returns the
+// (start, span_len) span of the header's own VALUE (leading spaces after
+// the colon skipped, trailing CRLF excluded), or `found: 0` if not
+// present. Bounded scan (max 64 header lines).
+fn http_find_header_value(buf: ref [u8; 512], header_start: i64, header_block_end: i64, name: Str) -> HttpSpanResult {
+  let name_len: i64 = str_len_bytes(name);
+  let pos: i64 = header_start;
+  let iter: i64 = 0;
+  while (pos < header_block_end) && (iter < 64) {
+    let line_end_cr: i64 = http_find_byte(buf, pos, header_block_end, 13 as u8);
+    if line_end_cr < 0 {
+      return HttpSpanResult { found: 0, start: 0, span_len: 0 };
+    }
+    let colon: i64 = http_find_byte(buf, pos, line_end_cr, 58 as u8); // ':'
+    if colon >= 0 {
+      let field_name_len: i64 = colon - pos;
+      if field_name_len == name_len {
+        let matches: i64 = 1;
+        let ci: i64 = 0;
+        while ci < name_len {
+          let a: u32 = buf[pos + ci] as u32;
+          let b: u32 = str_byte_at(name, ci) as u32;
+          // ASCII-only case-fold: uppercase A-Z (65-90) has a
+          // trailing bit difference of 32 from lowercase a-z
+          // (97-122) -- fold both sides to lowercase before compare.
+          let a_lower: u32 = if (a >= (65 as u32)) && (a <= (90 as u32)) { a + (32 as u32) } else { a };
+          let b_lower: u32 = if (b >= (65 as u32)) && (b <= (90 as u32)) { b + (32 as u32) } else { b };
+          if a_lower != b_lower {
+            matches = 0;
+          }
+          ci = ci + 1;
+        }
+        if matches == 1 {
+          let value_start: i64 = colon + 1;
+          while (value_start < line_end_cr) && (buf[value_start] == (32 as u8)) {
+            value_start = value_start + 1;
+          }
+          return HttpSpanResult { found: 1, start: value_start, span_len: line_end_cr - value_start };
+        }
+      }
+    }
+    pos = line_end_cr + 2; // skip this line's own CRLF
+    iter = iter + 1;
+  }
+  return HttpSpanResult { found: 0, start: 0, span_len: 0 };
+}
+
+// Parses a decimal (digits only, no sign) span into an i64. Returns
+// -1 if the span is empty or contains a non-digit -- reject, don't
+// guess, same posture as every other parser in this package.
+fn http_parse_decimal_span(buf: ref [u8; 512], start: i64, span_len: i64) -> i64 {
+  if span_len <= 0 {
+    return 0 - 1;
+  }
+  let value: i64 = 0;
+  let i: i64 = 0;
+  while i < span_len {
+    let b: u32 = buf[start + i] as u32;
+    if (b < (48 as u32)) || (b > (57 as u32)) {
+      return 0 - 1;
+    }
+    value = (value * 10) + ((b - (48 as u32)) as i64);
+    i = i + 1;
+  }
+  return value;
+}
+
+// Convenience wrapper: find + parse the Content-Length header.
+// Returns 0 if absent (RFC 7230's own default for a request with no
+// body), -1 if present but malformed.
+fn http_get_content_length(buf: ref [u8; 512], header_start: i64, header_block_end: i64) -> i64 {
+  let span: HttpSpanResult = http_find_header_value(buf, header_start, header_block_end, "Content-Length");
+  if span.found == 0 {
+    return 0;
+  }
+  return http_parse_decimal_span(buf, span.start, span.span_len);
+}
+
+// Direct build+parse round trip for both a GET (no body) and a POST
+// (with a Content-Length body) request, plus a response -- the
+// header-codec-only subset a real httpecho integration test then
+// layers real TLS/TCP transport on top of (this package has no
+// transport concept at all).
+fn http_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  // GET request.
+  let req: [u8; 512] = http_zero512_bytes();
+  let req_len: i64 = http_build_request(mut ref req, "GET", "/status", "dhruva.local", 0);
+  let line: HttpRequestLine = http_parse_request_line(ref req, req_len);
+  if line.ok != 1 { ok = 0; }
+  if http_method_is(ref req, line.method_start, line.method_len, "GET") != 1 { ok = 0; }
+  if http_method_is(ref req, line.method_start, line.method_len, "POST") == 1 { ok = 0; }
+  if line.path_len != 7 { ok = 0; } // "/status"
+
+  let body_start: i64 = http_find_body_start(ref req, line.header_start, req_len);
+  if body_start != req_len { ok = 0; } // no body -- body starts right at EOF here
+  let host_span: HttpSpanResult = http_find_header_value(ref req, line.header_start, body_start, "Host");
+  if host_span.found != 1 { ok = 0; }
+  if host_span.span_len != 12 { ok = 0; } // "dhruva.local"
+  // Case-insensitive lookup must also find it under a different case.
+  let host_span_ci: HttpSpanResult = http_find_header_value(ref req, line.header_start, body_start, "hOsT");
+  if host_span_ci.found != 1 { ok = 0; }
+  let cl: i64 = http_get_content_length(ref req, line.header_start, body_start);
+  if cl != 0 { ok = 0; }
+
+  // POST request with a body.
+  let post_req: [u8; 512] = http_zero512_bytes();
+  let post_body: Str = "{\"x\":1}";
+  let post_body_len: i64 = str_len_bytes(post_body);
+  let post_header_len: i64 = http_build_request(mut ref post_req, "POST", "/config", "dhruva.local", post_body_len);
+  let bi: i64 = 0;
+  while bi < post_body_len {
+    post_req[post_header_len + bi] = str_byte_at(post_body, bi) as u8;
+    bi = bi + 1;
+  }
+  let post_total_len: i64 = post_header_len + post_body_len;
+  let post_line: HttpRequestLine = http_parse_request_line(ref post_req, post_total_len);
+  if post_line.ok != 1 { ok = 0; }
+  if http_method_is(ref post_req, post_line.method_start, post_line.method_len, "POST") != 1 { ok = 0; }
+  let post_body_start: i64 = http_find_body_start(ref post_req, post_line.header_start, post_total_len);
+  if post_body_start != post_header_len { ok = 0; }
+  let post_cl: i64 = http_get_content_length(ref post_req, post_line.header_start, post_body_start);
+  if post_cl != post_body_len { ok = 0; }
+  // The body bytes themselves round-trip correctly.
+  let bci: i64 = 0;
+  while bci < post_body_len {
+    if post_req[post_body_start + bci] != (str_byte_at(post_body, bci) as u8) { ok = 0; }
+    bci = bci + 1;
+  }
+
+  // Response.
+  let resp: [u8; 512] = http_zero512_bytes();
+  let resp_body: Str = "ok";
+  let resp_body_len: i64 = str_len_bytes(resp_body);
+  let resp_header_len: i64 = http_build_response(mut ref resp, 200, "OK", "text/plain", resp_body_len);
+  let ri: i64 = 0;
+  while ri < resp_body_len {
+    resp[resp_header_len + ri] = str_byte_at(resp_body, ri) as u8;
+    ri = ri + 1;
+  }
+  // A response's own status line has no method/path -- just confirm
+  // the header block parses to the right body offset/length via the
+  // same header-scanning primitives (status-line parsing itself is a
+  // simple fixed prefix, not tested via http_parse_request_line).
+  let resp_cr: i64 = http_find_byte(ref resp, 0, resp_header_len + resp_body_len, 13 as u8);
+  if resp_cr < 0 { ok = 0; }
+  let resp_body_start: i64 = http_find_body_start(ref resp, resp_cr + 2, resp_header_len + resp_body_len);
+  if resp_body_start != resp_header_len { ok = 0; }
+  let resp_cl: i64 = http_get_content_length(ref resp, resp_cr + 2, resp_body_start);
+  if resp_cl != resp_body_len { ok = 0; }
+
+  return ok;
+}

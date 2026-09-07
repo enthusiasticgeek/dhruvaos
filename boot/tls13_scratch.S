@@ -92,6 +92,15 @@ tls_t_len_sh_addr:             .word 0
 tls_t_len_cert_addr:           .word 0
 tls_t_len_cv_addr:             .word 0
 tls_t_len_s_fin_addr:          .word 0
+http_req_scratch_addr:         .word 0  /* Round 108: 512 bytes -- the
+                                          * httpecho shell command's own
+                                          * HTTP request build buffer,
+                                          * paired with the http kosh
+                                          * package's own [u8;512]
+                                          * bounded-message design. */
+http_resp_scratch_addr:        .word 0  /* Round 108: 512 bytes --
+                                          * httpecho's own HTTP
+                                          * response build buffer. */
 
 .section ".text"
 
@@ -186,3 +195,5 @@ TLS_SCRATCH_PAIR tls_t_len_sh
 TLS_SCRATCH_PAIR tls_t_len_cert
 TLS_SCRATCH_PAIR tls_t_len_cv
 TLS_SCRATCH_PAIR tls_t_len_s_fin
+TLS_SCRATCH_PAIR http_req_scratch
+TLS_SCRATCH_PAIR http_resp_scratch

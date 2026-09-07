@@ -565,6 +565,10 @@ extern "C" fn tls_t_len_cv_set(addr: mut ref i64) -> i64;
 extern "C" fn tls_t_len_cv_get() -> mut ref i64;
 extern "C" fn tls_t_len_s_fin_set(addr: mut ref i64) -> i64;
 extern "C" fn tls_t_len_s_fin_get() -> mut ref i64;
+extern "C" fn http_req_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn http_req_scratch_get() -> mut ref i64;
+extern "C" fn http_resp_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn http_resp_scratch_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -6876,6 +6880,14 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
 // local stack array before calling the package is exact, not a
 // truncation risk.
 use "../vendor/netstack/src/lib.vani";
+
+// Round 108: minimal HTTP/1.1 request/response build+parse (GET/POST,
+// headers, Content-Length body framing), pure protocol logic with no
+// hardware/transport dependency at all -- pairs with this file's own
+// existing TLS 1.3 stack (`tls_send`/`tls_recv`) for the `httpecho`
+// shell command below. No name collisions confirmed via grep before
+// vendoring.
+use "../vendor/http/src/lib.vani";
 
 fn filter_config_from_state() -> FilterConfig {
   let count: u32 = fw_get_rule_count();
@@ -19308,6 +19320,192 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Round 108: HTTPS -- the `http` kosh package's own request/response
+  // build+parse layered directly on top of tlsecho's own proven real
+  // TLS 1.3 + real TCP transport, same both-roles-in-one-instance
+  // shape. Client builds a real POST /echo request (body = the user's
+  // typed text), sends it encrypted; "server" decrypts, parses the
+  // request line + Content-Length + body, and builds a real 200 OK
+  // response echoing that body back; client decrypts and parses THAT,
+  // printing the echoed body -- proves the package's own build/parse
+  // functions round-trip correctly over a genuine encrypted transport,
+  // not just the package's own buffer-to-buffer self-test.
+  if shell_word_matches(line_buf, 0, cmd_end, "httpecho") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: httpecho <text>\n");
+      return 0;
+    }
+    let text_start: i64 = cmd_end + 1;
+    let text_len: i64 = line_len - text_start;
+    if text_len > (64 as i64) {
+      let _ = uart_puts("error: text too long (max 64)\n");
+      return 0;
+    }
+    let body_scratch: mut ref i64 = tls_client_msg_get();
+    let _ = shell_copy_range(line_buf, text_start, line_len, body_scratch);
+
+    let my_mac: mut ref i64 = shell_my_mac_scratch_get();
+    let _ = netif_get_mac(my_mac);
+    let client_id: u32 = 0 as u32;
+    let server_id: u32 = 1 as u32;
+    let loop_ip: u32 = 0x7F000001 as u32;
+    let client_port: u32 = 54326 as u32;
+    let server_port: u32 = 8444 as u32;
+
+    let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
+    let isn: u32 = scheduler_get_tick_count() + (3000 as u32);
+    let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    if open_status != 0 {
+      let _ = uart_puts("httpecho: SYN send failed\n");
+      return 0;
+    }
+
+    let scratch: mut ref i64 = shell_tcp_poll_scratch_get();
+    let handshake_iter: i64 = 0;
+    while (handshake_iter < 10) && ((tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established())) {
+      let _ = tcp_conn_poll(my_mac, scratch, 512);
+      handshake_iter = handshake_iter + 1;
+    }
+    if (tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established()) {
+      let _ = uart_puts("httpecho: TCP handshake failed\n");
+      return 0;
+    }
+
+    let connect_status: i64 = tls_connect(client_id, server_id, my_mac);
+    if connect_status != 0 {
+      let _ = uart_puts("httpecho: TLS handshake failed\n");
+      return 0;
+    }
+    let accept_status: i64 = tls_accept(server_id, client_id, my_mac);
+    if accept_status != 0 {
+      let _ = uart_puts("httpecho: TLS server-side accept failed\n");
+      return 0;
+    }
+
+    // --- Client builds and sends a real POST /echo request. ---
+    let req_local: [u8; 512] = http_zero512_bytes();
+    let req_header_len: i64 = http_build_request(mut ref req_local, "POST", "/echo", "dhruva.local", text_len);
+    let req_scratch: mut ref i64 = http_req_scratch_get();
+    let hi: i64 = 0;
+    while hi < req_header_len {
+      let _ = buf_write_byte(req_scratch, hi as u32, req_local[hi] as u32);
+      hi = hi + 1;
+    }
+    let bi: i64 = 0;
+    while bi < text_len {
+      let b: u32 = buf_read_byte(body_scratch, bi as u32);
+      let _ = buf_write_byte(req_scratch, (req_header_len + bi) as u32, b);
+      bi = bi + 1;
+    }
+    let req_total_len: i64 = req_header_len + text_len;
+
+    let c_ap_key: mut ref i64 = tls_c_ap_key_get();
+    let c_ap_iv: mut ref i64 = tls_c_ap_iv_get();
+    let _ = tls_send(client_id, server_id, my_mac, c_ap_key, c_ap_iv, req_scratch, req_total_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+
+    // --- "Server" decrypts, parses, and builds a real response. ---
+    let recv_req: mut ref i64 = tls_decrypted_scratch_get();
+    let recv_req_len: i64 = tls_recv(tls_server_rx_buf_get(), tls_server_rx_len_get(), c_ap_key, c_ap_iv, recv_req);
+    if recv_req_len < 0 {
+      let _ = uart_puts("httpecho: server failed to decrypt client request\n");
+      return 0;
+    }
+    let recv_req_local: [u8; 512] = http_zero512_bytes();
+    let rri: i64 = 0;
+    while rri < recv_req_len {
+      recv_req_local[rri] = buf_read_byte(recv_req, rri as u32) as u8;
+      rri = rri + 1;
+    }
+    let req_line: HttpRequestLine = http_parse_request_line(ref recv_req_local, recv_req_len);
+    if req_line.ok != 1 {
+      let _ = uart_puts("httpecho: server failed to parse request line\n");
+      return 0;
+    }
+    if http_method_is(ref recv_req_local, req_line.method_start, req_line.method_len, "POST") != 1 {
+      let _ = uart_puts("httpecho: server saw an unexpected method\n");
+      return 0;
+    }
+    let req_body_start: i64 = http_find_body_start(ref recv_req_local, req_line.header_start, recv_req_len);
+    if req_body_start < 0 {
+      let _ = uart_puts("httpecho: server failed to find request body\n");
+      return 0;
+    }
+    let req_content_length: i64 = http_get_content_length(ref recv_req_local, req_line.header_start, req_body_start);
+    if req_content_length != (recv_req_len - req_body_start) {
+      let _ = uart_puts("httpecho: server saw a Content-Length mismatch\n");
+      return 0;
+    }
+
+    let resp_local: [u8; 512] = http_zero512_bytes();
+    let resp_header_len: i64 = http_build_response(mut ref resp_local, 200, "OK", "text/plain", req_content_length);
+    let resp_scratch: mut ref i64 = http_resp_scratch_get();
+    let shi: i64 = 0;
+    while shi < resp_header_len {
+      let _ = buf_write_byte(resp_scratch, shi as u32, resp_local[shi] as u32);
+      shi = shi + 1;
+    }
+    let sbi: i64 = 0;
+    while sbi < req_content_length {
+      let b2: u32 = buf_read_byte(recv_req, (req_body_start + sbi) as u32);
+      let _ = buf_write_byte(resp_scratch, (resp_header_len + sbi) as u32, b2);
+      sbi = sbi + 1;
+    }
+    let resp_total_len: i64 = resp_header_len + req_content_length;
+
+    let s_ap_key: mut ref i64 = tls_s_ap_key_get();
+    let s_ap_iv: mut ref i64 = tls_s_ap_iv_get();
+    let _ = tls_send(server_id, client_id, my_mac, s_ap_key, s_ap_iv, resp_scratch, resp_total_len, tls_client_rx_buf_get(), tls_client_rx_len_get());
+
+    // --- Client decrypts and parses the response. ---
+    let recv_resp: mut ref i64 = tls_server_reply_get();
+    let recv_resp_len: i64 = tls_recv(tls_client_rx_buf_get(), tls_client_rx_len_get(), s_ap_key, s_ap_iv, recv_resp);
+    if recv_resp_len < 0 {
+      let _ = uart_puts("httpecho: client failed to decrypt server response\n");
+      return 0;
+    }
+    let recv_resp_local: [u8; 512] = http_zero512_bytes();
+    let rpi: i64 = 0;
+    while rpi < recv_resp_len {
+      recv_resp_local[rpi] = buf_read_byte(recv_resp, rpi as u32) as u8;
+      rpi = rpi + 1;
+    }
+    let status_cr: i64 = http_find_byte(ref recv_resp_local, 0, recv_resp_len, 13 as u8);
+    if status_cr < 0 {
+      let _ = uart_puts("httpecho: client failed to find response status line\n");
+      return 0;
+    }
+    let resp_body_start: i64 = http_find_body_start(ref recv_resp_local, status_cr + 2, recv_resp_len);
+    if resp_body_start < 0 {
+      let _ = uart_puts("httpecho: client failed to find response body\n");
+      return 0;
+    }
+    let resp_content_length: i64 = http_get_content_length(ref recv_resp_local, status_cr + 2, resp_body_start);
+    if resp_content_length != (recv_resp_len - resp_body_start) {
+      let _ = uart_puts("httpecho: client saw a response Content-Length mismatch\n");
+      return 0;
+    }
+
+    let _ = tcp_conn_close(client_id, my_mac, my_mac);
+    let close_iter2: i64 = 0;
+    while (close_iter2 < 10) && (tcp_conn_get_state(client_id) != tcp_state_closed_final()) {
+      let _ = tcp_conn_poll(my_mac, scratch, 512);
+      close_iter2 = close_iter2 + 1;
+    }
+
+    let echoed_body: mut ref i64 = tls_client_msg_get();
+    let ebi: i64 = 0;
+    while ebi < resp_content_length {
+      let eb: u32 = buf_read_byte(recv_resp, (resp_body_start + ebi) as u32);
+      let _ = buf_write_byte(echoed_body, ebi as u32, eb);
+      ebi = ebi + 1;
+    }
+
+    let _ = uart_puts("httpecho: POST /echo -> 200 OK, body \"");
+    let _ = dharafs_print_data(echoed_body, resp_content_length);
+    let _ = uart_puts("\"\n");
+    return 0;
+  }
+
   // Round 30: the last major "correct, never used live" gap the
   // feature ledger flagged -- socket_udp_send/socket_udp_recv (Phase
   // 6's own socket-style API, see socket_udp_send's comment) had run
@@ -26168,6 +26366,8 @@ fn kernel_main() -> i64 {
   let _ = tls_t_len_cert_set(dhruva_alloc_bytes(4));
   let _ = tls_t_len_cv_set(dhruva_alloc_bytes(4));
   let _ = tls_t_len_s_fin_set(dhruva_alloc_bytes(4));
+  let _ = http_req_scratch_set(dhruva_alloc_bytes(512));
+  let _ = http_resp_scratch_set(dhruva_alloc_bytes(512));
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));

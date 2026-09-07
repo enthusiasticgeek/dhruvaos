@@ -138,6 +138,14 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     # IT runs after netstat.
     send("tlsecho hello-tls")
     time.sleep(SETTLE_S)
+    # Round 108: httpecho -- the new `http` kosh package's own request/
+    # response build+parse, layered on tlsecho's own proven real TLS
+    # 1.3 + real TCP transport (same both-roles-in-one-instance shape,
+    # same reasoning for running after tlsecho: fresh tcp_conn_active_
+    # open/passive_open calls reset connection-slot state regardless
+    # of whatever tlsecho left behind).
+    send("httpecho hello-http")
+    time.sleep(SETTLE_S)
     # "ls" last, deliberately: every other command in this sequence has
     # a LATER command's own settle time to absorb any scheduling slack,
     # but the last command has only the trailing sleep below to work
@@ -169,6 +177,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         ("netstat shows tcpecho's client connection closed", "conn 0 state=CLOSED_FINAL local=127.0.0.1:54322 remote=127.0.0.1:7777"),
         ("tcprtx recovers a real simulated SYN loss via retransmission", "recovered from simulated SYN loss via retransmission"),
         ("tlsecho completes a live tls_connect/tls_accept handshake + encrypted echo", 'tlsecho: echoed over real TLS 1.3 "hello-tls"'),
+        ("httpecho completes a live HTTP/1.1 POST/response round trip over TLS 1.3", 'httpecho: POST /echo -> 200 OK, body "hello-http"'),
         ("ls shows /milestone/note", "  /milestone/note"),
     ]
 
