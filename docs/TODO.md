@@ -2700,6 +2700,41 @@ sector 16384 / 8MiB, comfortable margin beyond the 1MB ceiling).
 Written directly from this project's own source, not assumed from
 generic Pi documentation.
 
+**2026-09-10 UPDATE: a real Pi 1B + 64GB SD card are now physically on
+hand.** The SD card is flashed and ready — `./flash_sd_card.sh
+/dev/sdb <firmware-dir>` completed successfully: single FAT32
+partition starting at sector 16384 (confirmed via `lsblk`: one `sdb1`
+partition, no leftover second partition), `bootcode.bin`/`start.elf`/
+`fixup.dat` (the correct non-suffixed Pi 1/Zero-generation files,
+sourced from the card's own prior Raspberry Pi OS boot partition
+before it was wiped) + `config.txt` (with `init_uart_clock=3000000`)
++ `kernel.img` (objcopy'd from a fresh `./build.sh` of `build/
+dhruva.elf`) all written to the card's root.
+
+**STILL OPEN — first real boot has NOT happened yet.** Blocked purely
+on physical access (the user was away from the hardware when the card
+was flashed), not on anything code- or doc-related. Remaining steps,
+all physical, from `docs/HARDWARE_IN_LOOP.md` §3 onward:
+1. Insert the flashed card into the powered-off Pi 1B.
+2. Wire the UART adapter: Pi GPIO14 (pin 8, TXD) → adapter RX; Pi
+   GPIO15 (pin 10, RXD) → adapter TX; Pi GND (pin 6) → adapter GND.
+   3.3V logic only — do NOT connect the adapter's own 5V/3.3V power
+   pin to the Pi; power the Pi from its own separate microUSB supply.
+3. Connect the adapter to this PC, identify its device node (`ls /dev/
+   ttyUSB* /dev/ttyACM*`), open a 115200-8N1 terminal (`screen`/
+   `picocom`/`minicom`), power on the Pi, and confirm the same boot
+   self-test sequence QEMU already shows (`PASS`, then live
+   multitasking output). If nothing appears, check `init_uart_clock`
+   first (§3.2); if garbage appears instead of text, that's also the
+   UART-clock issue, not a wiring problem.
+
+Once first boot is confirmed, this project's own `docs/HARDWARE_IN_LOOP
+.md` §6 checklist (USB mass storage timing, the real LAN9512, USB
+Bluetooth HCI, USB WiFi enumeration, the real hardware watchdog,
+memory-ordering barriers, MMU XN enforcement, GPIO pull-up/down, a
+real HDMI picture, EDID query, real USB keyboard/mouse timing) is the
+actual verification list — not a re-run of what QEMU already covers.
+
 ## Pi 4/5 port — now started (round 40 research, round 43 boot skeleton)
 
 **Round 40 correction**: `docs/PORTING.md` previously claimed no QEMU
