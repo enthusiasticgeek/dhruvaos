@@ -1,0 +1,937 @@
+// ssh v0.1.0 -- SSH-2.0 transport + userauth + connection protocol,
+// pure vani, hardware-agnostic. Algorithm set is intentionally fixed
+// to exactly one choice per slot (no negotiation among alternatives):
+// curve25519-sha256 KEX, ssh-ed25519 host key, chacha20-poly1305@
+// openssh.com cipher both directions (which also means no separate
+// MAC -- the AEAD cipher provides integrity), publickey userauth
+// only (no passwords).
+//
+// Every function here takes `mut ref i64` heap-pointer parameters
+// (this project's established calling convention for buffers that
+// must scale with real content -- SSH packets, unlike TLS's, are not
+// meaningfully size-bounded at the protocol layer), paired with the
+// `buf_read_byte`/`buf_write_byte` byte accessors. A consumer
+// vendoring this package already provides both (DhruvaOS's Pi 1:
+// boot/dharafs_buf.S; Pi 4/5: boot/rpi4/runtime_stubs_rpi4.c's C
+// port).
+//
+// Every wire-format detail below (exchange hash construction, key
+// derivation, chacha20-poly1305@openssh.com packet framing, padding
+// alignment rules) was verified against a real, unmodified OpenSSH
+// 10.0 client -- not just RFC text -- via a from-scratch Python
+// reference implementation built specifically to nail down exact byte
+// layout before writing this file. See DhruvaOS project memory for
+// the full verification history (3 real protocol bugs found and
+// fixed against the real client: a missing outer string-wrap on the
+// host-key blob in the exchange hash, and two DIFFERENT padding-
+// alignment formulas for the unencrypted vs. AEAD/chacha packet-
+// framing phases).
+// buf_write_byte/buf_read_byte: NOT declared here -- Pi 1's own
+// kernel_main.vani already declares both and a duplicate declaration
+// is a compile error (vani resolves names globally).
+
+// DhruvaOS-side note: sibling-vendor-path dedup, same pattern as
+// vendor/tls13/src/core.vani's own header comment explains.
+use "../../crypto_hash/src/core.vani";
+use "../../curve25519/src/core.vani";
+use "../../chacha20_poly1305/src/core.vani";
+
+// --- Wire-format helpers (RFC 4251 section 5) ---
+
+fn ssh_write_u8(buf: mut ref i64, off: i64, v: u32) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, v & (255 as u32));
+  return off + 1;
+}
+
+fn ssh_write_u32(buf: mut ref i64, off: i64, v: u32) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, (v >> (24 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 1) as u32, (v >> (16 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 2) as u32, (v >> (8 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 3) as u32, v & (255 as u32));
+  return off + 4;
+}
+
+fn ssh_read_u32(buf: mut ref i64, off: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, off as u32);
+  let b1: u32 = buf_read_byte(buf, (off + 1) as u32);
+  let b2: u32 = buf_read_byte(buf, (off + 2) as u32);
+  let b3: u32 = buf_read_byte(buf, (off + 3) as u32);
+  return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+fn ssh_copy(dst: mut ref i64, dst_off: i64, src: mut ref i64, src_off: i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    let _ = buf_write_byte(dst, (dst_off + i) as u32, buf_read_byte(src, (src_off + i) as u32));
+    i = i + 1;
+  }
+  return dst_off + n;
+}
+
+// Writes an SSH "string" (uint32 length + raw bytes) copying `n` bytes
+// from `src` (heap ptr) into `buf` at `off`.
+fn ssh_write_string_heap_off(buf: mut ref i64, off: i64, src: mut ref i64, src_off: i64, n: i64) -> i64 {
+  let o: i64 = ssh_write_u32(buf, off, n as u32);
+  return ssh_copy(buf, o, src, src_off, n);
+}
+
+fn ssh_write_string_heap(buf: mut ref i64, off: i64, src: mut ref i64, n: i64) -> i64 {
+  return ssh_write_string_heap_off(buf, off, src, 0, n);
+}
+
+// Writes an SSH "string" whose content is itself already fully
+// composed inside `buf` at `[content_off, content_off+n)` -- used to
+// wrap an already-built sub-structure (e.g. a host-key blob) in an
+// outer length prefix without a separate copy, by shifting it one
+// `ssh_write_u32` call's worth of bytes. Not used currently (every
+// caller below builds pieces in scratch and copies once); kept for
+// symmetry/documentation of the wire format's own nesting shape.
+
+// mpint (RFC 4251 5.2): strips leading zero bytes from a big-endian
+// unsigned integer; if the first remaining byte's high bit is set,
+// prepends one 0x00 byte (so the value reads as non-negative). Reads
+// `n` raw bytes from `src` at `src_off`, writes the mpint-encoded
+// (length-prefixed) form to `buf` at `off`.
+fn ssh_write_mpint_heap(buf: mut ref i64, off: i64, src: mut ref i64, src_off: i64, n: i64) -> i64 {
+  let start: i64 = 0;
+  while (start < n) && (buf_read_byte(src, (src_off + start) as u32) == (0 as u32)) {
+    start = start + 1;
+  }
+  let stripped_len: i64 = n - start;
+  let needs_pad: i64 = 0;
+  if stripped_len > 0 {
+    let first: u32 = buf_read_byte(src, (src_off + start) as u32);
+    if (first & (128 as u32)) != (0 as u32) {
+      needs_pad = 1;
+    }
+  }
+  let mpint_len: i64 = stripped_len + needs_pad;
+  let o: i64 = ssh_write_u32(buf, off, mpint_len as u32);
+  if needs_pad == 1 {
+    o = ssh_write_u8(buf, o, 0 as u32);
+  }
+  return ssh_copy(buf, o, src, src_off + start, stripped_len);
+}
+
+// --- SHA-256, streaming (unbounded length, mirrors vani-tls13's own
+// tls_hash_transcript_heap) ---
+
+fn ssh_sha256_stream_update(ctx_in: Sha256Ctx, data: mut ref i64, data_off: i64, data_len: i64) -> Sha256Ctx {
+  let ctx: Sha256Ctx = ctx_in;
+  let offset: i64 = 0;
+  while offset < data_len {
+    let remaining: i64 = data_len - offset;
+    let chunk_n: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = [0 as u8; 256];
+    let i: i64 = 0;
+    while i < chunk_n {
+      chunk[i] = buf_read_byte(data, (data_off + offset + i) as u32) as u8;
+      i = i + 1;
+    }
+    ctx = sha256_update(ref ctx, mut ref chunk, chunk_n);
+    offset = offset + chunk_n;
+  }
+  return ctx;
+}
+
+fn ssh_sha256_stream_update_u32(ctx_in: Sha256Ctx, v: u32) -> Sha256Ctx {
+  let buf4: [u8; 256] = [0 as u8; 256];
+  buf4[0] = ((v >> (24 as u32)) & (255 as u32)) as u8;
+  buf4[1] = ((v >> (16 as u32)) & (255 as u32)) as u8;
+  buf4[2] = ((v >> (8 as u32)) & (255 as u32)) as u8;
+  buf4[3] = (v & (255 as u32)) as u8;
+  return sha256_update(ref ctx_in, mut ref buf4, 4);
+}
+
+// Streams a length-prefixed "string" (uint32 len + `n` bytes from
+// `data` at `data_off`) into the hash context.
+fn ssh_sha256_stream_string(ctx_in: Sha256Ctx, data: mut ref i64, data_off: i64, n: i64) -> Sha256Ctx {
+  let ctx: Sha256Ctx = ssh_sha256_stream_update_u32(ctx_in, n as u32);
+  return ssh_sha256_stream_update(ctx, data, data_off, n);
+}
+
+// mpint version: strips leading zeros / adds sign-pad byte the same
+// way ssh_write_mpint_heap does, but streams straight into a hash
+// context instead of writing to a buffer.
+fn ssh_sha256_stream_mpint(ctx_in: Sha256Ctx, src: mut ref i64, src_off: i64, n: i64) -> Sha256Ctx {
+  let start: i64 = 0;
+  while (start < n) && (buf_read_byte(src, (src_off + start) as u32) == (0 as u32)) {
+    start = start + 1;
+  }
+  let stripped_len: i64 = n - start;
+  let needs_pad: i64 = 0;
+  if stripped_len > 0 {
+    let first: u32 = buf_read_byte(src, (src_off + start) as u32);
+    if (first & (128 as u32)) != (0 as u32) {
+      needs_pad = 1;
+    }
+  }
+  let mpint_len: i64 = stripped_len + needs_pad;
+  let ctx: Sha256Ctx = ssh_sha256_stream_update_u32(ctx_in, mpint_len as u32);
+  if needs_pad == 1 {
+    let zero_chunk: [u8; 256] = [0 as u8; 256];
+    ctx = sha256_update(ref ctx, mut ref zero_chunk, 1);
+  }
+  return ssh_sha256_stream_update(ctx, src, src_off + start, stripped_len);
+}
+
+// Exchange hash H = SHA256(string(V_C) || string(V_S) || string(I_C)
+// || string(I_S) || string(K_S) || string(Q_C) || string(Q_S) ||
+// mpint(K)) -- RFC 8731 / OpenSSH's own kexgen.c kex_gen_hash, byte-
+// for-byte, confirmed against real OpenSSH source (not RFC text
+// alone). Every input is a heap pointer + explicit length since none
+// of these (especially I_C, a real client's full KEXINIT payload
+// with its own long algorithm-name lists) fit a bounded array.
+fn ssh_kex_hash(
+  vc: mut ref i64, vc_len: i64,
+  vs: mut ref i64, vs_len: i64,
+  ic: mut ref i64, ic_len: i64,
+  is_: mut ref i64, is_len: i64,
+  ks: mut ref i64, ks_len: i64,
+  qc32: mut ref i64,
+  qs32: mut ref i64,
+  k_shared32: mut ref i64,
+  out32: mut ref i64
+) -> i64 {
+  let ctx: Sha256Ctx = sha256_init();
+  ctx = ssh_sha256_stream_string(ctx, vc, 0, vc_len);
+  ctx = ssh_sha256_stream_string(ctx, vs, 0, vs_len);
+  ctx = ssh_sha256_stream_string(ctx, ic, 0, ic_len);
+  ctx = ssh_sha256_stream_string(ctx, is_, 0, is_len);
+  ctx = ssh_sha256_stream_string(ctx, ks, 0, ks_len);
+  ctx = ssh_sha256_stream_string(ctx, qc32, 0, 32);
+  ctx = ssh_sha256_stream_string(ctx, qs32, 0, 32);
+  ctx = ssh_sha256_stream_mpint(ctx, k_shared32, 0, 32);
+  let digest: [u8; 32] = sha256_finalize(ref ctx);
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(out32, i as u32, digest[i] as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// RFC 4253 7.2 key derivation: K1 = HASH(K || H || letter ||
+// session_id); Kn = HASH(K || H || K1..Kn-1); Key = K1||K2||...,
+// truncated to `need_bytes`. `k_shared32`/`h32`/`session_id32` are
+// all fixed 32-byte heap buffers (K as raw bytes here, NOT mpint --
+// matches derive_key's own `ssh_digest_update_buffer(hashctx,
+// shared_secret)`, which hashes the SAME mpint-ENCODED bytes used in
+// the exchange hash, but since K is always exactly 32 bytes with a
+// consistent sign-bit distribution this package always mpint-encodes
+// it identically both places -- done inline here via ssh_sha256_
+// stream_mpint for exact parity with ssh_kex_hash above).
+fn ssh_derive_key(k_shared32: mut ref i64, h32: mut ref i64, letter: u32, session_id32: mut ref i64, out: mut ref i64, need_bytes: i64) -> i64 {
+  let ctx0: Sha256Ctx = sha256_init();
+  let ctx1: Sha256Ctx = ssh_sha256_stream_mpint(ctx0, k_shared32, 0, 32);
+  let ctx2: Sha256Ctx = ssh_sha256_stream_update(ctx1, h32, 0, 32);
+  let letter_chunk: [u8; 256] = [0 as u8; 256];
+  letter_chunk[0] = (letter & (255 as u32)) as u8;
+  let ctx3: Sha256Ctx = sha256_update(ref ctx2, mut ref letter_chunk, 1);
+  let ctx4: Sha256Ctx = ssh_sha256_stream_update(ctx3, session_id32, 0, 32);
+  let k1: [u8; 32] = sha256_finalize(ref ctx4);
+
+  let have: i64 = 0;
+  let wi: i64 = 0;
+  while (have < need_bytes) && (wi < 32) {
+    let _ = buf_write_byte(out, have as u32, k1[wi] as u32);
+    have = have + 1;
+    wi = wi + 1;
+  }
+
+  let prev: [u8; 32] = k1;
+  while have < need_bytes {
+    let ctxa0: Sha256Ctx = sha256_init();
+    let ctxa1: Sha256Ctx = ssh_sha256_stream_mpint(ctxa0, k_shared32, 0, 32);
+    let ctxa2: Sha256Ctx = ssh_sha256_stream_update(ctxa1, h32, 0, 32);
+    let prev_chunk: [u8; 256] = [0 as u8; 256];
+    let pi: i64 = 0;
+    while pi < 32 {
+      prev_chunk[pi] = prev[pi];
+      pi = pi + 1;
+    }
+    let ctxa3: Sha256Ctx = sha256_update(ref ctxa2, mut ref prev_chunk, 32);
+    let kn: [u8; 32] = sha256_finalize(ref ctxa3);
+    let ki: i64 = 0;
+    while (have < need_bytes) && (ki < 32) {
+      let _ = buf_write_byte(out, have as u32, kn[ki] as u32);
+      have = have + 1;
+      ki = ki + 1;
+    }
+    prev = kn;
+  }
+  return 0;
+}
+
+// --- chacha20-poly1305@openssh.com packet cipher (RFC-less; OpenSSH's
+// own protocol extension, PROTOCOL text + cipher-chachapoly.c). Two
+// independent Bernstein-ChaCha20 instances keyed from one 64-byte
+// derived key: main_key = key64[0:32] (payload encryption + Poly1305
+// one-time key generation), header_key = key64[32:64] (4-byte packet-
+// length field encryption). Nonce for BOTH is the 8-byte big-endian
+// packet sequence number; main_key's payload encryption starts at
+// block counter 1 (block 0 is reserved for the Poly1305 key). ---
+
+fn ssh_seq_to_nonce8(seqnr: u32) -> [u8; 8] {
+  let out: [u8; 8] = [0 as u8; 8];
+  out[0] = 0 as u8; out[1] = 0 as u8; out[2] = 0 as u8; out[3] = 0 as u8;
+  out[4] = ((seqnr >> (24 as u32)) & (255 as u32)) as u8;
+  out[5] = ((seqnr >> (16 as u32)) & (255 as u32)) as u8;
+  out[6] = ((seqnr >> (8 as u32)) & (255 as u32)) as u8;
+  out[7] = (seqnr & (255 as u32)) as u8;
+  return out;
+}
+
+fn ssh_poly1305_key(main_key32: ref [u8; 32], seqnr: u32) -> [u8; 32] {
+  let nonce8: [u8; 8] = ssh_seq_to_nonce8(seqnr);
+  let counter0: [u8; 8] = [0 as u8; 8];
+  let block: [u8; 64] = chacha20_block_legacy(main_key32, ref nonce8, ref counter0);
+  let out: [u8; 32] = [0 as u8; 32];
+  let i: i64 = 0;
+  while i < 32 {
+    out[i] = block[i];
+    i = i + 1;
+  }
+  return out;
+}
+
+// En/decrypts exactly 4 bytes at `data[off..off+4)` in place (heap
+// pointer) using header_key -- XOR stream cipher, so encrypt and
+// decrypt are the same operation. Used for the packet-length field.
+fn ssh_chacha_length_xor(header_key32: ref [u8; 32], seqnr: u32, data: mut ref i64, off: i64) -> i64 {
+  let nonce8: [u8; 8] = ssh_seq_to_nonce8(seqnr);
+  let counter0: [u8; 8] = [0 as u8; 8];
+  let ks: [u8; 64] = chacha20_block_legacy(header_key32, ref nonce8, ref counter0);
+  let i: i64 = 0;
+  while i < 4 {
+    let b: u32 = buf_read_byte(data, (off + i) as u32);
+    let _ = buf_write_byte(data, (off + i) as u32, b ^ (ks[i] as u32));
+    i = i + 1;
+  }
+  return 0;
+}
+
+// En/decrypts `len` bytes at `data[off..off+len)` in place using
+// main_key, block counter starting at 1 (RFC-less OpenSSH convention:
+// block 0 is reserved for the Poly1305 one-time key above). XOR
+// stream cipher, so this is used for both directions.
+fn ssh_chacha_payload_xor(main_key32: ref [u8; 32], seqnr: u32, data: mut ref i64, off: i64, span_len: i64) -> i64 {
+  let nonce8: [u8; 8] = ssh_seq_to_nonce8(seqnr);
+  let counter: [u8; 8] = [1 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let offset: i64 = 0;
+  while offset < span_len {
+    let remaining: i64 = span_len - offset;
+    let this_block: i64 = if remaining < 64 { remaining } else { 64 };
+    let chunk: [u8; 64] = [0 as u8; 64];
+    let ci: i64 = 0;
+    while ci < this_block {
+      chunk[ci] = buf_read_byte(data, (off + offset + ci) as u32) as u8;
+      ci = ci + 1;
+    }
+    let ks: [u8; 64] = chacha20_block_legacy(main_key32, ref nonce8, ref counter);
+    let cj: i64 = 0;
+    while cj < this_block {
+      let _ = buf_write_byte(data, (off + offset + cj) as u32, (chunk[cj] as u32) ^ (ks[cj] as u32));
+      cj = cj + 1;
+    }
+    counter = chacha20_legacy_counter_increment(ref counter);
+    offset = offset + 64;
+  }
+  return 0;
+}
+
+// Poly1305 tag over `len` bytes at `data[0..len)` (heap pointer,
+// always starts at offset 0 for our own use -- the tag input is
+// always the packet's own [enc_len(4) || enc_body] prefix, built
+// contiguously). Streams through the vendored package's own
+// poly1305_init/update/finalize (256-byte chunk API) -- the MAC
+// algorithm itself doesn't depend on which ChaCha20 construction
+// generated the one-time key, only ssh_poly1305_key above does.
+fn ssh_poly1305_tag(poly_key32: ref [u8; 32], data: mut ref i64, span_len: i64) -> [u8; 16] {
+  let ctx0: Poly1305Ctx = poly1305_init(poly_key32);
+  let ctx: Poly1305Ctx = ctx0;
+  let offset: i64 = 0;
+  while offset < span_len {
+    let remaining: i64 = span_len - offset;
+    let take: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = [0 as u8; 256];
+    let i: i64 = 0;
+    while i < take {
+      chunk[i] = buf_read_byte(data, (offset + i) as u32) as u8;
+      i = i + 1;
+    }
+    ctx = poly1305_update(ref ctx, ref chunk, take);
+    offset = offset + take;
+  }
+  return poly1305_finalize(ref ctx);
+}
+
+// --- Message builders (RFC 4253/4252/4254) ---
+//
+// Every builder writes its OWN leading SSH message-type byte (matching
+// vani-tls13's own tls_build_client_hello/etc. convention) -- the
+// caller gets a complete message payload ready for packet framing,
+// not a bare structure needing an external type-byte prefix.
+
+fn ssh_write_str_literal(buf: mut ref i64, off: i64, s: Str) -> i64 {
+  let n: i64 = str_len_bytes(s);
+  let o: i64 = ssh_write_u32(buf, off, n as u32);
+  let i: i64 = 0;
+  while i < n {
+    let _ = buf_write_byte(buf, (o + i) as u32, str_byte_at(s, i) as u32);
+    i = i + 1;
+  }
+  return o + n;
+}
+
+fn ssh_write_bytes_literal_as_string(buf: mut ref i64, off: i64, s: Str) -> i64 {
+  // Writes `s`'s raw bytes with NO length prefix -- used for the
+  // fixed comma-joined algorithm-name-list bodies below, where the
+  // 4-byte length is written separately via ssh_write_u32 first
+  // (mirrors RFC 4251's own name-list = uint32 + comma-joined ASCII).
+  let n: i64 = str_len_bytes(s);
+  let i: i64 = 0;
+  while i < n {
+    let _ = buf_write_byte(buf, (off + i) as u32, str_byte_at(s, i) as u32);
+    i = i + 1;
+  }
+  return off + n;
+}
+
+fn ssh_write_namelist_literal(buf: mut ref i64, off: i64, s: Str) -> i64 {
+  let n: i64 = str_len_bytes(s);
+  let o: i64 = ssh_write_u32(buf, off, n as u32);
+  return ssh_write_bytes_literal_as_string(buf, o, s);
+}
+
+// SSH2_MSG_KEXINIT (20). `cookie16` is a caller-supplied 16-byte
+// random heap buffer (board-specific RNG access, not this package's
+// concern). Fixed algorithm proposal, one choice per slot -- see this
+// file's own header comment.
+fn ssh_build_kexinit(out: mut ref i64, cookie16: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 20 as u32);
+  o = ssh_copy(out, o, cookie16, 0, 16);
+  o = ssh_write_namelist_literal(out, o, "curve25519-sha256");
+  o = ssh_write_namelist_literal(out, o, "ssh-ed25519");
+  o = ssh_write_namelist_literal(out, o, "chacha20-poly1305@openssh.com");
+  o = ssh_write_namelist_literal(out, o, "chacha20-poly1305@openssh.com");
+  o = ssh_write_namelist_literal(out, o, "hmac-sha2-256");
+  o = ssh_write_namelist_literal(out, o, "hmac-sha2-256");
+  o = ssh_write_namelist_literal(out, o, "none");
+  o = ssh_write_namelist_literal(out, o, "none");
+  o = ssh_write_namelist_literal(out, o, "");
+  o = ssh_write_namelist_literal(out, o, "");
+  o = ssh_write_u8(out, o, 0 as u32); // first_kex_packet_follows
+  o = ssh_write_u32(out, o, 0 as u32); // reserved
+  return o;
+}
+
+// Host-key blob (RFC 4253 6.6): string("ssh-ed25519") + string(pubkey).
+// This is K_S both in the exchange hash (wrapped in one more outer
+// string there, see ssh_kex_hash above) and in the ECDH_REPLY message.
+fn ssh_build_ed25519_hostkey_blob(pubkey32: ref [u8; 32], out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_namelist_literal(out, 0, "ssh-ed25519");
+  o = ssh_write_u32(out, o, 32 as u32);
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(out, (o + i) as u32, pubkey32[i] as u32);
+    i = i + 1;
+  }
+  return o + 32;
+}
+
+// Signature blob (RFC 4253 6.6): string("ssh-ed25519") + string(raw
+// 64-byte signature).
+fn ssh_build_ed25519_sigblob(sig64: ref [u8; 64], out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_namelist_literal(out, 0, "ssh-ed25519");
+  o = ssh_write_u32(out, o, 64 as u32);
+  let i: i64 = 0;
+  while i < 64 {
+    let _ = buf_write_byte(out, (o + i) as u32, sig64[i] as u32);
+    i = i + 1;
+  }
+  return o + 64;
+}
+
+// SSH2_MSG_KEX_ECDH_REPLY (31): K_S (string) + Q_S (string) + sig
+// (string, itself containing the algname+rawsig sigblob structure).
+// `hostkey_blob`/`sigblob` are heap pointers to already-built
+// sub-structures (ssh_build_ed25519_hostkey_blob/_sigblob's own
+// output), copied in with their own outer length-prefix wrap here.
+fn ssh_build_ecdh_reply(hostkey_blob: mut ref i64, hostkey_blob_len: i64, q_s32: ref [u8; 32], sigblob: mut ref i64, sigblob_len: i64, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 31 as u32);
+  o = ssh_write_string_heap(out, o, hostkey_blob, hostkey_blob_len);
+  o = ssh_write_u32(out, o, 32 as u32);
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(out, (o + i) as u32, q_s32[i] as u32);
+    i = i + 1;
+  }
+  o = o + 32;
+  return ssh_write_string_heap(out, o, sigblob, sigblob_len);
+}
+
+// SSH2_MSG_NEWKEYS (21) -- fixed 1-byte message, no payload.
+fn ssh_build_newkeys(out: mut ref i64) -> i64 {
+  return ssh_write_u8(out, 0, 21 as u32);
+}
+
+// SSH2_MSG_SERVICE_ACCEPT (6): string(service_name), copied straight
+// back from the client's own SERVICE_REQUEST.
+fn ssh_build_service_accept(svc_name: mut ref i64, svc_name_len: i64, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 6 as u32);
+  return ssh_write_string_heap(out, o, svc_name, svc_name_len);
+}
+
+// SSH2_MSG_USERAUTH_PK_OK (60): string(pubkey_algorithm) +
+// string(pubkey_blob) -- tells the client this key is acceptable, it
+// will retry the same request WITH a signature attached.
+fn ssh_build_userauth_pk_ok(alg: mut ref i64, alg_len: i64, keyblob: mut ref i64, keyblob_len: i64, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 60 as u32);
+  o = ssh_write_string_heap(out, o, alg, alg_len);
+  return ssh_write_string_heap(out, o, keyblob, keyblob_len);
+}
+
+// SSH2_MSG_USERAUTH_FAILURE (51): name-list(methods that can
+// continue) + boolean(partial success). Fixed to advertise only
+// "publickey" (our only supported method) and partial_success=false.
+fn ssh_build_userauth_failure(out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 51 as u32);
+  o = ssh_write_namelist_literal(out, o, "publickey");
+  return ssh_write_u8(out, o, 0 as u32);
+}
+
+// SSH2_MSG_USERAUTH_SUCCESS (52) -- fixed 1-byte message.
+fn ssh_build_userauth_success(out: mut ref i64) -> i64 {
+  return ssh_write_u8(out, 0, 52 as u32);
+}
+
+// SSH2_MSG_CHANNEL_OPEN_CONFIRMATION (91): recipient_channel (the
+// client's own sender id, echoed back) + sender_channel (our local id
+// -- this package's own board-side caller picks it) + initial_window
+// + max_packet_size.
+fn ssh_build_channel_open_confirmation(peer_chan: u32, local_chan: u32, window: u32, max_packet: u32, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 91 as u32);
+  o = ssh_write_u32(out, o, peer_chan);
+  o = ssh_write_u32(out, o, local_chan);
+  o = ssh_write_u32(out, o, window);
+  return ssh_write_u32(out, o, max_packet);
+}
+
+// SSH2_MSG_CHANNEL_OPEN_FAILURE (92): recipient_channel + reason_code
+// + description (string) + language (empty string).
+fn ssh_build_channel_open_failure(peer_chan: u32, reason_code: u32, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 92 as u32);
+  o = ssh_write_u32(out, o, peer_chan);
+  o = ssh_write_u32(out, o, reason_code);
+  o = ssh_write_namelist_literal(out, o, "");
+  return ssh_write_namelist_literal(out, o, "");
+}
+
+// SSH2_MSG_CHANNEL_DATA (94): recipient_channel + string(data).
+fn ssh_build_channel_data(peer_chan: u32, data: mut ref i64, data_off: i64, data_len: i64, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 94 as u32);
+  o = ssh_write_u32(out, o, peer_chan);
+  return ssh_write_string_heap_off(out, o, data, data_off, data_len);
+}
+
+// SSH2_MSG_CHANNEL_EOF (96) / SSH2_MSG_CHANNEL_CLOSE (97) /
+// SSH2_MSG_CHANNEL_SUCCESS (99) / SSH2_MSG_CHANNEL_FAILURE (100):
+// all just recipient_channel, differing only in message type.
+fn ssh_build_channel_simple(msg_type: u32, peer_chan: u32, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, msg_type);
+  return ssh_write_u32(out, o, peer_chan);
+}
+
+// SSH2_MSG_CHANNEL_WINDOW_ADJUST (93): recipient_channel +
+// bytes_to_add.
+fn ssh_build_channel_window_adjust(peer_chan: u32, bytes_to_add: u32, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 93 as u32);
+  o = ssh_write_u32(out, o, peer_chan);
+  return ssh_write_u32(out, o, bytes_to_add);
+}
+
+// --- Message parsers (operate on an already-decrypted plaintext
+// payload buffer -- packet receive/decrypt itself is the board-
+// specific transport layer's own job, matching vani-tls13's own
+// mechanism/policy split). ---
+
+struct SshUserauthPubkeyRequest {
+  ok: i64,           // 1 = parsed a well-formed publickey request, 0 = not (wrong method, or parse error)
+  has_sig: i64,       // 1 = this is the real signed request, 0 = the "query" probe (no signature yet)
+  alg_off: i64, alg_len: i64,
+  keyblob_off: i64, keyblob_len: i64,
+  sig_off: i64, sig_len: i64,        // only meaningful if has_sig == 1
+  signed_data_end_off: i64            // offset where the signed portion of `payload` ends (i.e. right before the signature string) -- see ssh_build_userauth_signed_data below
+}
+
+// Parses SSH2_MSG_USERAUTH_REQUEST (50): string(user) + string(service)
+// + string(method) + [publickey-specific fields]. Returns an all-zero
+// (ok=0) result for any other method -- caller should respond with
+// SSH2_MSG_USERAUTH_FAILURE in that case.
+fn ssh_parse_userauth_pubkey_request(payload: mut ref i64, _payload_len: i64) -> SshUserauthPubkeyRequest {
+  let bad: SshUserauthPubkeyRequest = SshUserauthPubkeyRequest { ok: 0, has_sig: 0, alg_off: 0, alg_len: 0, keyblob_off: 0, keyblob_len: 0, sig_off: 0, sig_len: 0, signed_data_end_off: 0 };
+  let off: i64 = 1; // skip msg type byte
+  let ulen: i64 = ssh_read_u32(payload, off) as i64;
+  off = off + 4 + ulen;
+  let slen: i64 = ssh_read_u32(payload, off) as i64;
+  off = off + 4 + slen;
+  let mlen: i64 = ssh_read_u32(payload, off) as i64;
+  let method_off: i64 = off + 4;
+  off = method_off + mlen;
+  if mlen != 9 { return bad; } // "publickey" is 9 bytes; anything else can't match
+  let is_pubkey: i64 = 1;
+  let mi: i64 = 0;
+  let expect: [u8; 9] = [112 as u8, 117 as u8, 98 as u8, 108 as u8, 105 as u8, 99 as u8, 107 as u8, 101 as u8, 121 as u8]; // "publickey"
+  while mi < 9 {
+    if buf_read_byte(payload, (method_off + mi) as u32) != (expect[mi] as u32) { is_pubkey = 0; }
+    mi = mi + 1;
+  }
+  if is_pubkey != 1 { return bad; }
+
+  let has_sig: u32 = buf_read_byte(payload, off as u32);
+  off = off + 1;
+  let alg_len: i64 = ssh_read_u32(payload, off) as i64;
+  let alg_off: i64 = off + 4;
+  off = alg_off + alg_len;
+  let keyblob_len: i64 = ssh_read_u32(payload, off) as i64;
+  let keyblob_off: i64 = off + 4;
+  off = keyblob_off + keyblob_len;
+
+  if has_sig == (0 as u32) {
+    return SshUserauthPubkeyRequest { ok: 1, has_sig: 0, alg_off: alg_off, alg_len: alg_len, keyblob_off: keyblob_off, keyblob_len: keyblob_len, sig_off: 0, sig_len: 0, signed_data_end_off: off };
+  }
+  let sig_len: i64 = ssh_read_u32(payload, off) as i64;
+  let sig_off: i64 = off + 4;
+  return SshUserauthPubkeyRequest { ok: 1, has_sig: 1, alg_off: alg_off, alg_len: alg_len, keyblob_off: keyblob_off, keyblob_len: keyblob_len, sig_off: sig_off, sig_len: sig_len, signed_data_end_off: off };
+}
+
+// Builds the "signed data" a publickey userauth signature covers
+// (RFC 4252 7): string(session_id) || payload[0 .. signed_data_end_off).
+// Returns the total length written to `out`.
+fn ssh_build_userauth_signed_data(session_id32: mut ref i64, payload: mut ref i64, signed_data_end_off: i64, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_string_heap(out, 0, session_id32, 32);
+  return ssh_copy(out, o, payload, 0, signed_data_end_off);
+}
+
+struct SshChannelOpen {
+  type_off: i64, type_len: i64,
+  peer_chan: u32,
+  init_window: u32,
+  max_packet: u32
+}
+
+// Parses SSH2_MSG_CHANNEL_OPEN (90): string(channel_type) +
+// uint32(sender_channel) + uint32(initial_window_size) +
+// uint32(maximum_packet_size).
+fn ssh_parse_channel_open(payload: mut ref i64) -> SshChannelOpen {
+  let off: i64 = 1;
+  let tlen: i64 = ssh_read_u32(payload, off) as i64;
+  let toff: i64 = off + 4;
+  off = toff + tlen;
+  let peer_chan: u32 = ssh_read_u32(payload, off);
+  off = off + 4;
+  let init_window: u32 = ssh_read_u32(payload, off);
+  off = off + 4;
+  let max_packet: u32 = ssh_read_u32(payload, off);
+  return SshChannelOpen { type_off: toff, type_len: tlen, peer_chan: peer_chan, init_window: init_window, max_packet: max_packet };
+}
+
+struct SshChannelRequest {
+  chan: u32,
+  type_off: i64, type_len: i64,
+  want_reply: i64
+}
+
+// Parses SSH2_MSG_CHANNEL_REQUEST (98): uint32(recipient_channel) +
+// string(request_type) + boolean(want_reply) [+ type-specific data,
+// not parsed here -- the board-side caller reads it directly at the
+// returned offset if it cares, e.g. "exec"'s own trailing command
+// string].
+fn ssh_parse_channel_request(payload: mut ref i64) -> SshChannelRequest {
+  let off: i64 = 1;
+  let chan: u32 = ssh_read_u32(payload, off);
+  off = off + 4;
+  let tlen: i64 = ssh_read_u32(payload, off) as i64;
+  let toff: i64 = off + 4;
+  off = toff + tlen;
+  let want_reply: u32 = buf_read_byte(payload, off as u32);
+  return SshChannelRequest { chan: chan, type_off: toff, type_len: tlen, want_reply: want_reply as i64 };
+}
+
+struct SshChannelData {
+  chan: u32,
+  data_off: i64, data_len: i64
+}
+
+// Parses SSH2_MSG_CHANNEL_DATA (94): uint32(recipient_channel) +
+// string(data).
+fn ssh_parse_channel_data(payload: mut ref i64) -> SshChannelData {
+  let off: i64 = 1;
+  let chan: u32 = ssh_read_u32(payload, off);
+  off = off + 4;
+  let dlen: i64 = ssh_read_u32(payload, off) as i64;
+  let doff: i64 = off + 4;
+  return SshChannelData { chan: chan, data_off: doff, data_len: dlen };
+}
+
+// --- Packet framing (RFC 4253 6 / OpenSSH packet.c). Two DIFFERENT
+// padding-alignment targets depending on phase -- see this file's own
+// header comment. block_size=8, min_pad=4 (fixed, matching this
+// package's fixed algorithm set: neither "none" nor chacha20-
+// poly1305@openssh.com needs a larger block size). Padding bytes are
+// zero-filled (not random) -- functionally equivalent since they're
+// discarded by every real receiver (authenticated-but-unused in the
+// AEAD phase, genuinely unauthenticated in the plaintext phase), and
+// this keeps this package's own output deterministic. ---
+
+// Unencrypted phase (KEXINIT/ECDH_INIT/ECDH_REPLY/NEWKEYS): target
+// (4 + packet_length) % 8 == 0 -- the 4-byte length field counts
+// toward alignment even though nothing is actually encrypted yet.
+fn ssh_build_raw_packet(payload: mut ref i64, payload_len: i64, out: mut ref i64) -> i64 {
+  let block_size: i64 = 8;
+  let min_pad: i64 = 4;
+  let content_len: i64 = 1 + payload_len;
+  let mod_val: i64 = (4 + content_len) % block_size;
+  let pad_len: i64 = block_size - mod_val;
+  if pad_len < min_pad {
+    pad_len = pad_len + block_size;
+  }
+  let packet_length: i64 = content_len + pad_len;
+  let o: i64 = ssh_write_u32(out, 0, packet_length as u32);
+  o = ssh_write_u8(out, o, pad_len as u32);
+  o = ssh_copy(out, o, payload, 0, payload_len);
+  let pi: i64 = 0;
+  while pi < pad_len {
+    let _ = buf_write_byte(out, (o + pi) as u32, 0 as u32);
+    pi = pi + 1;
+  }
+  return 4 + packet_length;
+}
+
+// Given a complete raw packet already sitting at `buf[0..)` (caller
+// already knows its total length via ssh_read_u32(buf,0)+4, e.g. from
+// an rx accumulator that waited for enough bytes), strips the
+// padding-length byte and trailing padding, copying just the payload
+// to `out_payload`.
+fn ssh_extract_raw_payload(buf: mut ref i64, out_payload: mut ref i64) -> i64 {
+  let packet_length: i64 = ssh_read_u32(buf, 0) as i64;
+  let pad_len: i64 = buf_read_byte(buf, 4 as u32) as i64;
+  let payload_len: i64 = packet_length - 1 - pad_len;
+  let _ = ssh_copy(out_payload, 0, buf, 5, payload_len);
+  return payload_len;
+}
+
+// AEAD phase (post-NEWKEYS): target packet_length % 8 == 0 -- the
+// length field is encrypted separately by header_key and does NOT
+// count toward alignment.
+fn ssh_build_enc_packet(main_key32: ref [u8; 32], header_key32: ref [u8; 32], seqnr: u32, payload: mut ref i64, payload_len: i64, out: mut ref i64) -> i64 {
+  let block_size: i64 = 8;
+  let min_pad: i64 = 4;
+  let content_len: i64 = 1 + payload_len;
+  let mod_val: i64 = content_len % block_size;
+  let pad_len: i64 = block_size - mod_val;
+  if pad_len < min_pad {
+    pad_len = pad_len + block_size;
+  }
+  let packet_length: i64 = content_len + pad_len;
+  let o: i64 = ssh_write_u32(out, 0, packet_length as u32);
+  o = ssh_write_u8(out, o, pad_len as u32);
+  o = ssh_copy(out, o, payload, 0, payload_len);
+  let pi: i64 = 0;
+  while pi < pad_len {
+    let _ = buf_write_byte(out, (o + pi) as u32, 0 as u32);
+    pi = pi + 1;
+  }
+  let total_before_mac: i64 = 4 + packet_length;
+  let _ = ssh_chacha_length_xor(header_key32, seqnr, out, 0);
+  let _ = ssh_chacha_payload_xor(main_key32, seqnr, out, 4, packet_length);
+  let poly_key: [u8; 32] = ssh_poly1305_key(main_key32, seqnr);
+  let tag: [u8; 16] = ssh_poly1305_tag(ref poly_key, out, total_before_mac);
+  let ti: i64 = 0;
+  while ti < 16 {
+    let _ = buf_write_byte(out, (total_before_mac + ti) as u32, tag[ti] as u32);
+    ti = ti + 1;
+  }
+  return total_before_mac + 16;
+}
+
+// Non-mutating peek at the encrypted 4-byte length field -- an rx
+// accumulator needs to learn `packet_length` (to know how many more
+// bytes to wait for) before it has the full packet in hand to safely
+// run ssh_decrypt_enc_packet's own in-place decrypt.
+fn ssh_peek_enc_length(header_key32: ref [u8; 32], seqnr: u32, buf: mut ref i64) -> i64 {
+  let nonce8: [u8; 8] = ssh_seq_to_nonce8(seqnr);
+  let counter0: [u8; 8] = [0 as u8; 8];
+  let ks: [u8; 64] = chacha20_block_legacy(header_key32, ref nonce8, ref counter0);
+  let b0: u32 = buf_read_byte(buf, 0 as u32) ^ (ks[0] as u32);
+  let b1: u32 = buf_read_byte(buf, 1 as u32) ^ (ks[1] as u32);
+  let b2: u32 = buf_read_byte(buf, 2 as u32) ^ (ks[2] as u32);
+  let b3: u32 = buf_read_byte(buf, 3 as u32) ^ (ks[3] as u32);
+  return ((b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3) as i64;
+}
+
+// Given a complete encrypted packet (`total_len` = 4 + packet_length +
+// 16, already known via ssh_peek_enc_length plus waiting for enough
+// bytes) sitting at `buf[0..total_len)`, verifies the Poly1305 tag
+// (computed over the wire ciphertext -- length field AND payload,
+// still encrypted, exactly as OpenSSH's own chachapoly_crypt does),
+// then decrypts length and payload+padding in place and strips
+// padding to `out_payload`. Returns -1 on tag mismatch (out_payload
+// untouched).
+fn ssh_decrypt_enc_packet(main_key32: ref [u8; 32], header_key32: ref [u8; 32], seqnr: u32, buf: mut ref i64, total_len: i64, out_payload: mut ref i64) -> i64 {
+  let mac_off: i64 = total_len - 16;
+  let poly_key: [u8; 32] = ssh_poly1305_key(main_key32, seqnr);
+  let expected_tag: [u8; 16] = ssh_poly1305_tag(ref poly_key, buf, mac_off);
+  let ok: i64 = 1;
+  let i: i64 = 0;
+  while i < 16 {
+    if buf_read_byte(buf, (mac_off + i) as u32) != (expected_tag[i] as u32) {
+      ok = 0;
+    }
+    i = i + 1;
+  }
+  if ok != 1 {
+    return 0 - 1;
+  }
+  let _ = ssh_chacha_length_xor(header_key32, seqnr, buf, 0);
+  let packet_length: i64 = ssh_read_u32(buf, 0) as i64;
+  let _ = ssh_chacha_payload_xor(main_key32, seqnr, buf, 4, packet_length);
+  let pad_len: i64 = buf_read_byte(buf, 4 as u32) as i64;
+  let payload_len: i64 = packet_length - 1 - pad_len;
+  let _ = ssh_copy(out_payload, 0, buf, 5, payload_len);
+  return payload_len;
+}
+
+// --- Client-role message builders/parsers -- needed for a live, both-
+// roles-in-one-process verification loop (mirroring vani-tls13's own
+// tls_connect/tls_accept precedent), since this package's fixed
+// algorithm set means KEXINIT/NEWKEYS/SERVICE_ACCEPT/PK_OK/etc. above
+// are ALREADY identical wire structures for both roles and don't need
+// a separate "client" version. Only the messages a client uniquely
+// originates are new here. ---
+
+// SSH2_MSG_KEXDH_INIT (30): string(Q_C).
+fn ssh_build_ecdh_init(qc32: ref [u8; 32], out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 30 as u32);
+  o = ssh_write_u32(out, o, 32 as u32);
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(out, (o + i) as u32, qc32[i] as u32);
+    i = i + 1;
+  }
+  return o + 32;
+}
+
+struct SshEcdhReply {
+  ks_off: i64, ks_len: i64,
+  qs_off: i64,
+  sigblob_off: i64, sigblob_len: i64
+}
+
+// Parses SSH2_MSG_KEX_ECDH_REPLY (31): string(K_S) + string(Q_S) +
+// string(sigblob).
+fn ssh_parse_ecdh_reply(payload: mut ref i64) -> SshEcdhReply {
+  let off: i64 = 1;
+  let kslen: i64 = ssh_read_u32(payload, off) as i64;
+  let ksoff: i64 = off + 4;
+  off = ksoff + kslen;
+  off = off + 4; // Q_S's own length prefix, always 32
+  let qsoff: i64 = off;
+  off = off + 32;
+  let sigbloblen: i64 = ssh_read_u32(payload, off) as i64;
+  let sigbloboff: i64 = off + 4;
+  return SshEcdhReply { ks_off: ksoff, ks_len: kslen, qs_off: qsoff, sigblob_off: sigbloboff, sigblob_len: sigbloblen };
+}
+
+struct SshEd25519Blob {
+  // Offset of the raw 32-byte pubkey within a host-key blob, or the
+  // raw 64-byte signature within a sigblob -- both are
+  // string("ssh-ed25519") + string(raw value), same shape.
+  value_off: i64
+}
+
+fn ssh_parse_ed25519_blob(blob: mut ref i64) -> SshEd25519Blob {
+  let alglen: i64 = ssh_read_u32(blob, 0) as i64;
+  let off: i64 = 4 + alglen;
+  return SshEd25519Blob { value_off: off + 4 };
+}
+
+// SSH2_MSG_SERVICE_REQUEST (5): string("ssh-userauth") -- this
+// package's only supported next service.
+fn ssh_build_service_request(out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 5 as u32);
+  return ssh_write_str_literal(out, o, "ssh-userauth");
+}
+
+// SSH2_MSG_USERAUTH_REQUEST (50), publickey "query" probe (RFC 4252
+// 7): has_sig=false. Client sends this first to check the server will
+// accept this key before bothering to sign anything.
+fn ssh_build_userauth_pubkey_query(user: Str, keyblob: mut ref i64, keyblob_len: i64, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 50 as u32);
+  o = ssh_write_str_literal(out, o, user);
+  o = ssh_write_str_literal(out, o, "ssh-connection");
+  o = ssh_write_str_literal(out, o, "publickey");
+  o = ssh_write_u8(out, o, 0 as u32);
+  o = ssh_write_str_literal(out, o, "ssh-ed25519");
+  return ssh_write_string_heap(out, o, keyblob, keyblob_len);
+}
+
+// The has_sig=true request's own content UP TO (not including) the
+// signature string -- RFC 4252 7's signed data is exactly `string
+// session_id` prepended to THIS (via ssh_build_userauth_signed_data
+// below), not to the has_sig=false query shape above: the boolean
+// byte itself differs (0x01 here vs 0x00 there) and IS part of what
+// gets signed, so a client must build its to-be-signed content from
+// this shape, never the query one, even though the two are otherwise
+// identical up through the keyblob.
+fn ssh_build_userauth_pubkey_presig(user: Str, keyblob: mut ref i64, keyblob_len: i64, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 50 as u32);
+  o = ssh_write_str_literal(out, o, user);
+  o = ssh_write_str_literal(out, o, "ssh-connection");
+  o = ssh_write_str_literal(out, o, "publickey");
+  o = ssh_write_u8(out, o, 1 as u32);
+  o = ssh_write_str_literal(out, o, "ssh-ed25519");
+  return ssh_write_string_heap(out, o, keyblob, keyblob_len);
+}
+
+// Same, has_sig=true -- the real, signed request.
+fn ssh_build_userauth_pubkey_signed(user: Str, keyblob: mut ref i64, keyblob_len: i64, sigblob: mut ref i64, sigblob_len: i64, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_build_userauth_pubkey_presig(user, keyblob, keyblob_len, out);
+  return ssh_write_string_heap(out, o, sigblob, sigblob_len);
+}
+
+// SSH2_MSG_CHANNEL_OPEN (90), type "session": string("session") +
+// uint32(sender_channel) + uint32(initial_window) + uint32(max_packet).
+fn ssh_build_channel_open_session(local_chan: u32, window: u32, max_packet: u32, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 90 as u32);
+  o = ssh_write_str_literal(out, o, "session");
+  o = ssh_write_u32(out, o, local_chan);
+  o = ssh_write_u32(out, o, window);
+  return ssh_write_u32(out, o, max_packet);
+}
+
+struct SshChannelOpenConfirmation {
+  peer_chan: u32,   // the client's own local channel id, echoed back
+  sender_chan: u32, // the server's local channel id -- use this as peer_chan in subsequent client->server messages
+  window: u32,
+  max_packet: u32
+}
+
+fn ssh_parse_channel_open_confirmation(payload: mut ref i64) -> SshChannelOpenConfirmation {
+  let peer_chan: u32 = ssh_read_u32(payload, 1);
+  let sender_chan: u32 = ssh_read_u32(payload, 5);
+  let window: u32 = ssh_read_u32(payload, 9);
+  let max_packet: u32 = ssh_read_u32(payload, 13);
+  return SshChannelOpenConfirmation { peer_chan: peer_chan, sender_chan: sender_chan, window: window, max_packet: max_packet };
+}
+
+// SSH2_MSG_CHANNEL_REQUEST (98), type "exec": uint32(recipient_channel)
+// + string("exec") + boolean(want_reply) + string(command).
+fn ssh_build_channel_request_exec(peer_chan: u32, cmd: mut ref i64, cmd_len: i64, want_reply: u32, out: mut ref i64) -> i64 {
+  let o: i64 = ssh_write_u8(out, 0, 98 as u32);
+  o = ssh_write_u32(out, o, peer_chan);
+  o = ssh_write_str_literal(out, o, "exec");
+  o = ssh_write_u8(out, o, want_reply);
+  return ssh_write_string_heap(out, o, cmd, cmd_len);
+}

@@ -184,6 +184,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/tls13_scratch.S" -o "${BUILD_DIR}/tls13_scratch.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/ssh_scratch.S" -o "${BUILD_DIR}/ssh_scratch.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/stack_canary.S" -o "${BUILD_DIR}/stack_canary.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -234,6 +237,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/keccak_scratch.o" \
   "${BUILD_DIR}/mlkem_scratch.o" \
   "${BUILD_DIR}/tls13_scratch.o" \
+  "${BUILD_DIR}/ssh_scratch.o" \
   "${BUILD_DIR}/stack_canary.o" \
   "${BUILD_DIR}/dharafs_crypto2_state.o" \
   "${BUILD_DIR}/fb_state.o" \

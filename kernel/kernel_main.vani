@@ -571,6 +571,104 @@ extern "C" fn http_resp_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn http_resp_scratch_get() -> mut ref i64;
 extern "C" fn mqtt_pkt_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn mqtt_pkt_scratch_get() -> mut ref i64;
+// Round 180: SSH-2.0 server persistent scratch -- see
+// boot/ssh_scratch.S's own header comment.
+extern "C" fn ssh_v_c_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_v_c_get() -> mut ref i64;
+extern "C" fn ssh_v_s_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_v_s_get() -> mut ref i64;
+extern "C" fn ssh_v_c_len_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_v_c_len_get() -> mut ref i64;
+extern "C" fn ssh_v_s_len_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_v_s_len_get() -> mut ref i64;
+extern "C" fn ssh_client_kexinit_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_kexinit_get() -> mut ref i64;
+extern "C" fn ssh_client_kexinit_len_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_kexinit_len_get() -> mut ref i64;
+extern "C" fn ssh_server_kexinit_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_server_kexinit_get() -> mut ref i64;
+extern "C" fn ssh_server_kexinit_len_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_server_kexinit_len_get() -> mut ref i64;
+extern "C" fn ssh_cookie16_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_cookie16_get() -> mut ref i64;
+extern "C" fn ssh_client_x25519_priv_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_x25519_priv_get() -> mut ref i64;
+extern "C" fn ssh_client_x25519_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_x25519_pub_get() -> mut ref i64;
+extern "C" fn ssh_server_x25519_priv_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_server_x25519_priv_get() -> mut ref i64;
+extern "C" fn ssh_server_x25519_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_server_x25519_pub_get() -> mut ref i64;
+extern "C" fn ssh_shared_secret_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_shared_secret_get() -> mut ref i64;
+extern "C" fn ssh_host_priv_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_host_priv_get() -> mut ref i64;
+extern "C" fn ssh_host_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_host_pub_get() -> mut ref i64;
+extern "C" fn ssh_client_id_priv_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_id_priv_get() -> mut ref i64;
+extern "C" fn ssh_client_id_pub_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_id_pub_get() -> mut ref i64;
+extern "C" fn ssh_exchange_hash_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_exchange_hash_get() -> mut ref i64;
+extern "C" fn ssh_session_id_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_session_id_get() -> mut ref i64;
+extern "C" fn ssh_c2s_key64_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_c2s_key64_get() -> mut ref i64;
+extern "C" fn ssh_s2c_key64_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_s2c_key64_get() -> mut ref i64;
+extern "C" fn ssh_hostkey_blob_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_hostkey_blob_get() -> mut ref i64;
+extern "C" fn ssh_sigblob_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_sigblob_get() -> mut ref i64;
+extern "C" fn ssh_client_keyblob_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_keyblob_get() -> mut ref i64;
+extern "C" fn ssh_client_sigblob_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_sigblob_get() -> mut ref i64;
+extern "C" fn ssh_userauth_signed_data_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_userauth_signed_data_get() -> mut ref i64;
+extern "C" fn ssh_payload_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_payload_buf_get() -> mut ref i64;
+extern "C" fn ssh_payload_buf2_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_payload_buf2_get() -> mut ref i64;
+extern "C" fn ssh_packet_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_packet_buf_get() -> mut ref i64;
+extern "C" fn ssh_packet_buf2_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_packet_buf2_get() -> mut ref i64;
+extern "C" fn ssh_decrypted_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_decrypted_scratch_get() -> mut ref i64;
+extern "C" fn ssh_client_rx_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_rx_buf_get() -> mut ref i64;
+extern "C" fn ssh_client_rx_len_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_rx_len_get() -> mut ref i64;
+extern "C" fn ssh_server_rx_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_server_rx_buf_get() -> mut ref i64;
+extern "C" fn ssh_server_rx_len_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_server_rx_len_get() -> mut ref i64;
+extern "C" fn ssh_frame_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_frame_scratch_get() -> mut ref i64;
+extern "C" fn ssh_chunk_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_chunk_scratch_get() -> mut ref i64;
+extern "C" fn ssh_recv_chunk_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_recv_chunk_scratch_get() -> mut ref i64;
+extern "C" fn ssh_ack_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_ack_scratch_get() -> mut ref i64;
+extern "C" fn ssh_client_seq_out_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_seq_out_get() -> mut ref i64;
+extern "C" fn ssh_client_seq_in_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_seq_in_get() -> mut ref i64;
+extern "C" fn ssh_server_seq_out_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_server_seq_out_get() -> mut ref i64;
+extern "C" fn ssh_server_seq_in_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_server_seq_in_get() -> mut ref i64;
+extern "C" fn ssh_client_phase_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_client_phase_get() -> mut ref i64;
+extern "C" fn ssh_server_phase_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_server_phase_get() -> mut ref i64;
+extern "C" fn ssh_exec_cmd_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_exec_cmd_get() -> mut ref i64;
+extern "C" fn ssh_channel_data_buf_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_channel_data_buf_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -19367,6 +19465,16 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Round 180: SSH-2.0 server -- full handshake (curve25519-sha256
+  // KEX, ssh-ed25519 host key, chacha20-poly1305@openssh.com),
+  // publickey userauth, and a session channel running one "exec",
+  // both roles over real TCP loopback (same both-roles-in-one-
+  // instance shape as tlsecho above). See ssh_run_self_test's own
+  // header comment for the negative-return-code -> failing-step map.
+  if shell_word_matches(line_buf, 0, cmd_end, "sshtest") == 1 {
+    return ssh_shell_test_cmd();
+  }
+
   // Round 108: HTTPS -- the `http` kosh package's own request/response
   // build+parse layered directly on top of tlsecho's own proven real
   // TLS 1.3 + real TCP transport, same both-roles-in-one-instance
@@ -20840,6 +20948,11 @@ use "../vendor/curve25519/src/core.vani";
 // Uses core.vani (not lib.vani) deps -- see that package's own
 // vendor/tls13/src/core.vani header comment for why.
 use "../vendor/tls13/src/core.vani";
+// Round 180: SSH-2.0 server, extracted into the shared vani-ssh kosh
+// package (same heap-pointer calling convention, same core.vani-deps
+// pattern as tls13 above -- no duplicate buf_read_byte/buf_write_byte
+// declaration since this file already declares both).
+use "../vendor/ssh/src/core.vani";
 
 fn ed25519_secret_to_public_heap(secret: mut ref i64, out_pub: mut ref i64) -> i64 {
   let secret_arr: [u8; 32] = ed25519_zero32_bytes();
@@ -24867,6 +24980,847 @@ fn tls_recv(rx_buf: mut ref i64, rx_len_buf: mut ref i64, key: mut ref i64, iv: 
   return tls_rx_try_extract(rx_buf, rx_len_buf, key, iv, 0 as u32, 23 as u32, out_content);
 }
 
+// --- Round 180: SSH-2.0 server kernel wiring. Reuses vani-ssh's own
+// pure protocol/crypto math (vendor/ssh/src/core.vani) for everything
+// wire-format-shaped; this section is transport glue only (TCP pump,
+// rx accumulator, sequence-number bookkeeping), the same split TLS
+// 1.3's own wiring above already established. `ssh_run_self_test`
+// drives BOTH roles over one real loopback TCP connection, mirroring
+// tls_connect/tls_accept/tlsecho's own precedent -- but as one linear
+// script rather than an incremental phase-polled service loop, since
+// (unlike TLS's asynchronous-feeling client/server split) there's no
+// need here to interleave two independently-reacting state machines:
+// every send synchronously delivers via ssh_send_over_tcp's own pump,
+// so the very next call can immediately process what arrived. The
+// per-message SERVER-side logic (ECDH_INIT processing, userauth
+// verification, channel handling) is the real, reusable code a future
+// TCP listener would call for genuine external client interop; the
+// "client" steps are a fixed-identity self-test driver only.
+
+fn ssh_load32_off(src: mut ref i64, off: i64) -> [u8; 32] {
+  let out: [u8; 32] = [0 as u8; 32];
+  let i: i64 = 0;
+  while i < 32 {
+    out[i] = buf_read_byte(src, (off + i) as u32) as u8;
+    i = i + 1;
+  }
+  return out;
+}
+
+fn ssh_load32(src: mut ref i64) -> [u8; 32] {
+  return ssh_load32_off(src, 0);
+}
+
+fn ssh_load64(src: mut ref i64) -> [u8; 64] {
+  let out: [u8; 64] = [0 as u8; 64];
+  let i: i64 = 0;
+  while i < 64 {
+    out[i] = buf_read_byte(src, i as u32) as u8;
+    i = i + 1;
+  }
+  return out;
+}
+
+fn ssh_seq_take(counter: mut ref i64) -> u32 {
+  let v: u32 = buf_read_u32(counter, 0 as u32);
+  let _ = buf_write_u32(counter, 0 as u32, v + (1 as u32));
+  return v;
+}
+
+fn ssh_rx_feed(rx_buf: mut ref i64, rx_len_buf: mut ref i64, new_data: mut ref i64, new_len: i64) -> i64 {
+  let cur_len: i64 = buf_read_u32(rx_len_buf, 0 as u32) as i64;
+  let _ = ssh_copy(rx_buf, cur_len, new_data, 0, new_len);
+  let new_total: i64 = cur_len + new_len;
+  let _ = buf_write_u32(rx_len_buf, 0 as u32, new_total as u32);
+  return new_total;
+}
+
+fn ssh_deliver_one_frame(to_id: u32, my_mac: mut ref i64, out_payload: mut ref i64, max_len: i64) -> i64 {
+  let frame: mut ref i64 = ssh_frame_scratch_get();
+  let flen: i64 = netif_recv_frame(frame, 1514);
+  if flen <= 0 {
+    return 0 - 1;
+  }
+  return tcp_conn_handle_segment(to_id, frame, flen, my_mac, my_mac, out_payload, max_len);
+}
+
+fn ssh_send_chunk_and_pump(sender_id: u32, receiver_id: u32, my_mac: mut ref i64, chunk: mut ref i64, chunk_len: i64, receiver_rx_buf: mut ref i64, receiver_rx_len_buf: mut ref i64) -> i64 {
+  let send_status: i64 = tcp_conn_send_data(sender_id, my_mac, my_mac, chunk, chunk_len);
+  if send_status != 0 {
+    return 0 - 1;
+  }
+  let recv_scratch: mut ref i64 = ssh_recv_chunk_scratch_get();
+  let recv_len: i64 = ssh_deliver_one_frame(receiver_id, my_mac, recv_scratch, 64);
+  if recv_len > 0 {
+    let _ = ssh_rx_feed(receiver_rx_buf, receiver_rx_len_buf, recv_scratch, recv_len);
+  }
+  let ack_scratch: mut ref i64 = ssh_ack_scratch_get();
+  let _ = ssh_deliver_one_frame(sender_id, my_mac, ack_scratch, 8);
+  return recv_len;
+}
+
+fn ssh_send_over_tcp(sender_id: u32, receiver_id: u32, my_mac: mut ref i64, data: mut ref i64, data_len: i64, receiver_rx_buf: mut ref i64, receiver_rx_len_buf: mut ref i64) -> i64 {
+  let chunk_buf: mut ref i64 = ssh_chunk_scratch_get();
+  let sent: i64 = 0;
+  while sent < data_len {
+    let remaining: i64 = data_len - sent;
+    let take: i64 = if remaining < 64 { remaining } else { 64 };
+    let _ = ssh_copy(chunk_buf, 0, data, sent, take);
+    let _ = ssh_send_chunk_and_pump(sender_id, receiver_id, my_mac, chunk_buf, take, receiver_rx_buf, receiver_rx_len_buf);
+    sent = sent + take;
+  }
+  return sent;
+}
+
+// Scans the rx accumulator for a CRLF-terminated version line (RFC
+// 4253 4.2 -- the one part of the protocol that isn't length-prefixed
+// binary framing). Returns the line's length (CR/LF excluded,
+// matching what the exchange hash wants) or -1 if not enough data has
+// arrived yet.
+fn ssh_extract_version_line(rx_buf: mut ref i64, rx_len_buf: mut ref i64, out_line: mut ref i64) -> i64 {
+  let cur_len: i64 = buf_read_u32(rx_len_buf, 0 as u32) as i64;
+  let i: i64 = 0;
+  let found: i64 = 0 - 1;
+  while (i < (cur_len - 1)) && (found < 0) {
+    if (buf_read_byte(rx_buf, i as u32) == (13 as u32)) && (buf_read_byte(rx_buf, (i + 1) as u32) == (10 as u32)) {
+      found = i;
+    }
+    i = i + 1;
+  }
+  if found < 0 {
+    return 0 - 1;
+  }
+  let _ = ssh_copy(out_line, 0, rx_buf, 0, found);
+  let total_needed: i64 = found + 2;
+  let remaining: i64 = cur_len - total_needed;
+  let _ = ssh_copy(rx_buf, 0, rx_buf, total_needed, remaining);
+  let _ = buf_write_u32(rx_len_buf, 0 as u32, remaining as u32);
+  return found;
+}
+
+fn ssh_rx_try_extract_raw(rx_buf: mut ref i64, rx_len_buf: mut ref i64, out_payload: mut ref i64) -> i64 {
+  let cur_len: i64 = buf_read_u32(rx_len_buf, 0 as u32) as i64;
+  if cur_len < 4 {
+    return 0 - 1;
+  }
+  let packet_length: i64 = ssh_read_u32(rx_buf, 0) as i64;
+  let total_needed: i64 = 4 + packet_length;
+  if cur_len < total_needed {
+    return 0 - 1;
+  }
+  let payload_len: i64 = ssh_extract_raw_payload(rx_buf, out_payload);
+  let remaining: i64 = cur_len - total_needed;
+  let _ = ssh_copy(rx_buf, 0, rx_buf, total_needed, remaining);
+  let _ = buf_write_u32(rx_len_buf, 0 as u32, remaining as u32);
+  return payload_len;
+}
+
+fn ssh_rx_try_extract_enc(rx_buf: mut ref i64, rx_len_buf: mut ref i64, main_key32: ref [u8; 32], header_key32: ref [u8; 32], seqnr: u32, out_payload: mut ref i64) -> i64 {
+  let cur_len: i64 = buf_read_u32(rx_len_buf, 0 as u32) as i64;
+  if cur_len < 4 {
+    return 0 - 1;
+  }
+  let packet_length: i64 = ssh_peek_enc_length(header_key32, seqnr, rx_buf);
+  let total_needed: i64 = 4 + packet_length + 16;
+  if cur_len < total_needed {
+    return 0 - 1;
+  }
+  let payload_len: i64 = ssh_decrypt_enc_packet(main_key32, header_key32, seqnr, rx_buf, total_needed, out_payload);
+  let remaining: i64 = cur_len - total_needed;
+  let _ = ssh_copy(rx_buf, 0, rx_buf, total_needed, remaining);
+  let _ = buf_write_u32(rx_len_buf, 0 as u32, remaining as u32);
+  return payload_len;
+}
+
+fn ssh_wait_extract_raw(rx_buf: mut ref i64, rx_len_buf: mut ref i64, my_mac: mut ref i64, deliver_to_id: u32, out_payload: mut ref i64) -> i64 {
+  let iter: i64 = 0;
+  let r: i64 = 0 - 1;
+  while (iter < 20) && (r < 0) {
+    r = ssh_rx_try_extract_raw(rx_buf, rx_len_buf, out_payload);
+    if r < 0 {
+      let recv_scratch: mut ref i64 = ssh_recv_chunk_scratch_get();
+      let recv_len: i64 = ssh_deliver_one_frame(deliver_to_id, my_mac, recv_scratch, 64);
+      if recv_len > 0 {
+        let _ = ssh_rx_feed(rx_buf, rx_len_buf, recv_scratch, recv_len);
+      }
+    }
+    iter = iter + 1;
+  }
+  return r;
+}
+
+fn ssh_wait_extract_enc(rx_buf: mut ref i64, rx_len_buf: mut ref i64, my_mac: mut ref i64, deliver_to_id: u32, main_key32: ref [u8; 32], header_key32: ref [u8; 32], seqnr: u32, out_payload: mut ref i64) -> i64 {
+  let iter: i64 = 0;
+  let r: i64 = 0 - 1;
+  while (iter < 20) && (r < 0) {
+    r = ssh_rx_try_extract_enc(rx_buf, rx_len_buf, main_key32, header_key32, seqnr, out_payload);
+    if r < 0 {
+      let recv_scratch: mut ref i64 = ssh_recv_chunk_scratch_get();
+      let recv_len: i64 = ssh_deliver_one_frame(deliver_to_id, my_mac, recv_scratch, 64);
+      if recv_len > 0 {
+        let _ = ssh_rx_feed(rx_buf, rx_len_buf, recv_scratch, recv_len);
+      }
+    }
+    iter = iter + 1;
+  }
+  return r;
+}
+
+// The handshake+auth+channel flow is split into 4 sequential phase
+// functions (rather than one giant function) purely to keep each
+// one's own stack frame small enough for the build-time bounded-stack
+// gate -- a single function holding all of this flow's locals at
+// once pushed the worst-case chain through ed25519_sign_heap's own
+// (sha512-compression-sized) frame over budget. Cross-phase state
+// that isn't already scratch-resident (v_c/v_s/kexinit lengths) is
+// stashed in the ssh_v_c_len/ssh_v_s_len/ssh_*_kexinit_len scratch
+// words declared alongside their buffers.
+fn ssh_test_phase1_kexinit(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  let _ = buf_write_u32(ssh_client_seq_out_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(ssh_client_seq_in_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(ssh_server_seq_out_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(ssh_server_seq_in_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(ssh_client_rx_len_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(ssh_server_rx_len_get(), 0 as u32, 0 as u32);
+
+  let host_priv: mut ref i64 = ssh_host_priv_get();
+  let _ = write_hex_string(host_priv, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", 32);
+  let host_pub: mut ref i64 = ssh_host_pub_get();
+  let _ = ed25519_secret_to_public_heap(host_priv, host_pub);
+
+  let client_id_priv: mut ref i64 = ssh_client_id_priv_get();
+  let _ = write_hex_string(client_id_priv, "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", 32);
+  let client_id_pub: mut ref i64 = ssh_client_id_pub_get();
+  let _ = ed25519_secret_to_public_heap(client_id_priv, client_id_pub);
+
+  let server_x_priv: mut ref i64 = ssh_server_x25519_priv_get();
+  let _ = write_hex_string(server_x_priv, "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f", 32);
+  let client_x_priv: mut ref i64 = ssh_client_x25519_priv_get();
+  let _ = write_hex_string(client_x_priv, "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f", 32);
+  let cookie16: mut ref i64 = ssh_cookie16_get();
+  let _ = write_hex_string(cookie16, "808182838485868788898a8b8c8d8e8f", 16);
+
+  let basepoint: mut ref i64 = tls_basepoint_get();
+  let _ = tls_x25519_basepoint_heap(basepoint);
+  let server_x_pub: mut ref i64 = ssh_server_x25519_pub_get();
+  let _ = x25519_scalarmult_heap(server_x_priv, basepoint, server_x_pub);
+  let client_x_pub: mut ref i64 = ssh_client_x25519_pub_get();
+  let _ = x25519_scalarmult_heap(client_x_priv, basepoint, client_x_pub);
+
+  let v_s: mut ref i64 = ssh_v_s_get();
+  let _ = str_copy_to_buf("SSH-2.0-DhruvaOS_1.0", v_s);
+  let v_s_len: i64 = str_len_bytes("SSH-2.0-DhruvaOS_1.0");
+  let v_c: mut ref i64 = ssh_v_c_get();
+  let _ = str_copy_to_buf("SSH-2.0-DhruvaClient_1.0", v_c);
+  let v_c_len: i64 = str_len_bytes("SSH-2.0-DhruvaClient_1.0");
+
+  let crlf_buf: mut ref i64 = ssh_payload_buf_get();
+  let _ = ssh_copy(crlf_buf, 0, v_s, 0, v_s_len);
+  let _ = buf_write_byte(crlf_buf, v_s_len as u32, 13 as u32);
+  let _ = buf_write_byte(crlf_buf, (v_s_len + 1) as u32, 10 as u32);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, crlf_buf, v_s_len + 2, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+
+  let _ = ssh_copy(crlf_buf, 0, v_c, 0, v_c_len);
+  let _ = buf_write_byte(crlf_buf, v_c_len as u32, 13 as u32);
+  let _ = buf_write_byte(crlf_buf, (v_c_len + 1) as u32, 10 as u32);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, crlf_buf, v_c_len + 2, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+
+  // Server extracts the client's version line genuinely off the wire
+  // (a real external client's version isn't known in advance, even
+  // though our own fixed test driver already knows what it sent).
+  let recv_v_c: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_v_c_len: i64 = ssh_extract_version_line(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), recv_v_c);
+  if recv_v_c_len < 0 { return 0 - 1; }
+  let _ = ssh_copy(v_c, 0, recv_v_c, 0, recv_v_c_len);
+  let _ = buf_write_u32(ssh_v_c_len_get(), 0 as u32, recv_v_c_len as u32);
+
+  let recv_v_s: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_v_s_len: i64 = ssh_extract_version_line(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), recv_v_s);
+  if recv_v_s_len < 0 { return 0 - 2; }
+  let _ = ssh_copy(v_s, 0, recv_v_s, 0, recv_v_s_len);
+  let _ = buf_write_u32(ssh_v_s_len_get(), 0 as u32, recv_v_s_len as u32);
+
+  // --- KEXINIT exchange (RFC 4253 7.1) ---
+  let server_kexinit: mut ref i64 = ssh_server_kexinit_get();
+  let server_kexinit_len: i64 = ssh_build_kexinit(server_kexinit, cookie16);
+  let _ = buf_write_u32(ssh_server_kexinit_len_get(), 0 as u32, server_kexinit_len as u32);
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+  let raw_len: i64 = ssh_build_raw_packet(server_kexinit, server_kexinit_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, raw_len, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+  let _ = ssh_seq_take(ssh_server_seq_out_get());
+
+  let client_kexinit: mut ref i64 = ssh_client_kexinit_get();
+  let client_kexinit_len: i64 = ssh_build_kexinit(client_kexinit, cookie16);
+  let _ = buf_write_u32(ssh_client_kexinit_len_get(), 0 as u32, client_kexinit_len as u32);
+  raw_len = ssh_build_raw_packet(client_kexinit, client_kexinit_len, packet_buf);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, packet_buf, raw_len, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+  let _ = ssh_seq_take(ssh_client_seq_out_get());
+
+  let recv_kexinit: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_kexinit_len: i64 = ssh_wait_extract_raw(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), my_mac, server_id, recv_kexinit);
+  if recv_kexinit_len < 0 { return 0 - 3; }
+  if buf_read_byte(recv_kexinit, 0 as u32) != (20 as u32) { return 0 - 4; }
+  let _ = ssh_seq_take(ssh_server_seq_in_get());
+
+  let recv_s_kexinit: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_s_kexinit_len: i64 = ssh_wait_extract_raw(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, recv_s_kexinit);
+  if recv_s_kexinit_len < 0 { return 0 - 5; }
+  if buf_read_byte(recv_s_kexinit, 0 as u32) != (20 as u32) { return 0 - 6; }
+  let _ = ssh_seq_take(ssh_client_seq_in_get());
+
+  return 0;
+}
+
+// ECDH_INIT/ECDH_REPLY/NEWKEYS + RFC 4253 7.2 key derivation.
+fn ssh_test_phase2a_ecdh_and_reply(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  let host_priv: mut ref i64 = ssh_host_priv_get();
+  let host_pub: mut ref i64 = ssh_host_pub_get();
+  let server_x_priv: mut ref i64 = ssh_server_x25519_priv_get();
+  let server_x_pub: mut ref i64 = ssh_server_x25519_pub_get();
+  let client_x_pub: mut ref i64 = ssh_client_x25519_pub_get();
+  let v_c: mut ref i64 = ssh_v_c_get();
+  let v_s: mut ref i64 = ssh_v_s_get();
+  let v_c_len: i64 = buf_read_u32(ssh_v_c_len_get(), 0 as u32) as i64;
+  let v_s_len: i64 = buf_read_u32(ssh_v_s_len_get(), 0 as u32) as i64;
+  let client_kexinit: mut ref i64 = ssh_client_kexinit_get();
+  let server_kexinit: mut ref i64 = ssh_server_kexinit_get();
+  let client_kexinit_len: i64 = buf_read_u32(ssh_client_kexinit_len_get(), 0 as u32) as i64;
+  let server_kexinit_len: i64 = buf_read_u32(ssh_server_kexinit_len_get(), 0 as u32) as i64;
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+
+  let ecdh_init_payload: mut ref i64 = ssh_payload_buf_get();
+  let client_x_pub_arr: [u8; 32] = ssh_load32(client_x_pub);
+  let ecdh_init_len: i64 = ssh_build_ecdh_init(ref client_x_pub_arr, ecdh_init_payload);
+  let raw_len: i64 = ssh_build_raw_packet(ecdh_init_payload, ecdh_init_len, packet_buf);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, packet_buf, raw_len, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+  let _ = ssh_seq_take(ssh_client_seq_out_get());
+
+  let recv_ecdh_init: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_ecdh_init_len: i64 = ssh_wait_extract_raw(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), my_mac, server_id, recv_ecdh_init);
+  if recv_ecdh_init_len < 0 { return 0 - 7; }
+  if buf_read_byte(recv_ecdh_init, 0 as u32) != (30 as u32) { return 0 - 8; }
+  let _ = ssh_seq_take(ssh_server_seq_in_get());
+  let _ = ssh_copy(client_x_pub, 0, recv_ecdh_init, 5, 32);
+
+  let shared_secret: mut ref i64 = ssh_shared_secret_get();
+  let _ = x25519_scalarmult_heap(server_x_priv, client_x_pub, shared_secret);
+
+  let hostkey_blob: mut ref i64 = ssh_hostkey_blob_get();
+  let host_pub_arr: [u8; 32] = ssh_load32(host_pub);
+  let hostkey_blob_len: i64 = ssh_build_ed25519_hostkey_blob(ref host_pub_arr, hostkey_blob);
+  let exchange_hash: mut ref i64 = ssh_exchange_hash_get();
+  let _ = ssh_kex_hash(v_c, v_c_len, v_s, v_s_len, client_kexinit, client_kexinit_len, server_kexinit, server_kexinit_len, hostkey_blob, hostkey_blob_len, client_x_pub, server_x_pub, shared_secret, exchange_hash);
+  let session_id: mut ref i64 = ssh_session_id_get();
+  let _ = ssh_copy(session_id, 0, exchange_hash, 0, 32);
+
+  let sig_heap: mut ref i64 = ssh_payload_buf2_get();
+  let _ = ed25519_sign_heap(host_priv, exchange_hash, 32, sig_heap);
+  let sig_arr: [u8; 64] = ssh_load64(sig_heap);
+  let sigblob: mut ref i64 = ssh_sigblob_get();
+  let sigblob_len: i64 = ssh_build_ed25519_sigblob(ref sig_arr, sigblob);
+
+  let ecdh_reply_payload: mut ref i64 = ssh_payload_buf_get();
+  let server_x_pub_arr: [u8; 32] = ssh_load32(server_x_pub);
+  let ecdh_reply_len: i64 = ssh_build_ecdh_reply(hostkey_blob, hostkey_blob_len, ref server_x_pub_arr, sigblob, sigblob_len, ecdh_reply_payload);
+  raw_len = ssh_build_raw_packet(ecdh_reply_payload, ecdh_reply_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, raw_len, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+  let _ = ssh_seq_take(ssh_server_seq_out_get());
+
+  let newkeys_payload: mut ref i64 = ssh_payload_buf_get();
+  let newkeys_len: i64 = ssh_build_newkeys(newkeys_payload);
+  raw_len = ssh_build_raw_packet(newkeys_payload, newkeys_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, raw_len, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+  let _ = ssh_seq_take(ssh_server_seq_out_get());
+
+  return 0;
+}
+
+// Client processes ECDH_REPLY: verifies the host key signature over
+// an INDEPENDENTLY recomputed exchange hash (not just trusting the
+// server's own H) -- a genuine correctness check of this package's
+// own ssh_kex_hash, not merely a decrypt-succeeded check. Host-key
+// pinning/TOFU policy (like TLS's own pinned-key check) is future
+// work -- only the signature itself is verified here. Then sends the
+// client's own NEWKEYS and derives both directions' session keys.
+fn ssh_test_phase2b_verify_and_newkeys(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  let host_pub: mut ref i64 = ssh_host_pub_get();
+  let client_x_priv: mut ref i64 = ssh_client_x25519_priv_get();
+  let client_x_pub: mut ref i64 = ssh_client_x25519_pub_get();
+  let server_x_pub: mut ref i64 = ssh_server_x25519_pub_get();
+  let v_c: mut ref i64 = ssh_v_c_get();
+  let v_s: mut ref i64 = ssh_v_s_get();
+  let v_c_len: i64 = buf_read_u32(ssh_v_c_len_get(), 0 as u32) as i64;
+  let v_s_len: i64 = buf_read_u32(ssh_v_s_len_get(), 0 as u32) as i64;
+  let client_kexinit: mut ref i64 = ssh_client_kexinit_get();
+  let server_kexinit: mut ref i64 = ssh_server_kexinit_get();
+  let client_kexinit_len: i64 = buf_read_u32(ssh_client_kexinit_len_get(), 0 as u32) as i64;
+  let server_kexinit_len: i64 = buf_read_u32(ssh_server_kexinit_len_get(), 0 as u32) as i64;
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+  let exchange_hash: mut ref i64 = ssh_exchange_hash_get();
+  let session_id: mut ref i64 = ssh_session_id_get();
+  let shared_secret: mut ref i64 = ssh_shared_secret_get();
+
+  let recv_ecdh_reply: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_ecdh_reply_len: i64 = ssh_wait_extract_raw(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, recv_ecdh_reply);
+  if recv_ecdh_reply_len < 0 { return 0 - 9; }
+  if buf_read_byte(recv_ecdh_reply, 0 as u32) != (31 as u32) { return 0 - 10; }
+  let _ = ssh_seq_take(ssh_client_seq_in_get());
+
+  let ecdh_reply_fields: SshEcdhReply = ssh_parse_ecdh_reply(recv_ecdh_reply);
+  let recv_hostkey_blob: mut ref i64 = ssh_hostkey_blob_get();
+  let _ = ssh_copy(recv_hostkey_blob, 0, recv_ecdh_reply, ecdh_reply_fields.ks_off, ecdh_reply_fields.ks_len);
+  let hostkey_field: SshEd25519Blob = ssh_parse_ed25519_blob(recv_hostkey_blob);
+  let _ = ssh_copy(host_pub, 0, recv_hostkey_blob, hostkey_field.value_off, 32);
+
+  let recv_sigblob: mut ref i64 = ssh_sigblob_get();
+  let _ = ssh_copy(recv_sigblob, 0, recv_ecdh_reply, ecdh_reply_fields.sigblob_off, ecdh_reply_fields.sigblob_len);
+  let sig_field: SshEd25519Blob = ssh_parse_ed25519_blob(recv_sigblob);
+  let recv_sig64: mut ref i64 = ssh_payload_buf2_get();
+  let _ = ssh_copy(recv_sig64, 0, recv_sigblob, sig_field.value_off, 64);
+
+  let _ = ssh_copy(server_x_pub, 0, recv_ecdh_reply, ecdh_reply_fields.qs_off, 32);
+  let client_shared: mut ref i64 = ssh_shared_secret_get();
+  let _ = x25519_scalarmult_heap(client_x_priv, server_x_pub, client_shared);
+
+  let client_h: mut ref i64 = ssh_payload_buf_get();
+  let _ = ssh_kex_hash(v_c, v_c_len, v_s, v_s_len, client_kexinit, client_kexinit_len, server_kexinit, server_kexinit_len, recv_hostkey_blob, ecdh_reply_fields.ks_len, client_x_pub, server_x_pub, client_shared, client_h);
+  let h_match: i64 = 1;
+  let hi: i64 = 0;
+  while hi < 32 {
+    if buf_read_byte(client_h, hi as u32) != buf_read_byte(exchange_hash, hi as u32) { h_match = 0; }
+    hi = hi + 1;
+  }
+  if h_match != 1 { return 0 - 11; }
+
+  let sig_ok: i64 = ed25519_verify_heap(host_pub, exchange_hash, 32, recv_sig64);
+  if sig_ok != 1 { return 0 - 12; }
+  let _ = ssh_copy(session_id, 0, exchange_hash, 0, 32);
+
+  let recv_newkeys: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_newkeys_len: i64 = ssh_wait_extract_raw(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, recv_newkeys);
+  if recv_newkeys_len < 0 { return 0 - 13; }
+  if buf_read_byte(recv_newkeys, 0 as u32) != (21 as u32) { return 0 - 14; }
+  let _ = ssh_seq_take(ssh_client_seq_in_get());
+
+  let client_newkeys_payload: mut ref i64 = ssh_payload_buf_get();
+  let client_newkeys_len: i64 = ssh_build_newkeys(client_newkeys_payload);
+  let raw_len: i64 = ssh_build_raw_packet(client_newkeys_payload, client_newkeys_len, packet_buf);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, packet_buf, raw_len, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+  let _ = ssh_seq_take(ssh_client_seq_out_get());
+
+  let recv_c_newkeys: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_c_newkeys_len: i64 = ssh_wait_extract_raw(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), my_mac, server_id, recv_c_newkeys);
+  if recv_c_newkeys_len < 0 { return 0 - 15; }
+  if buf_read_byte(recv_c_newkeys, 0 as u32) != (21 as u32) { return 0 - 16; }
+  let _ = ssh_seq_take(ssh_server_seq_in_get());
+
+  // RFC 4253 7.2: letter 'C' (67) = enc key client->server (our
+  // c2s_key64: server decrypts with it, client encrypts with it);
+  // letter 'D' (68) = enc key server->client (s2c_key64). Each 64-byte
+  // block splits main_key[0:32]/header_key[32:64] per chacha20-
+  // poly1305@openssh.com's own key schedule.
+  let c2s_key64: mut ref i64 = ssh_c2s_key64_get();
+  let _ = ssh_derive_key(shared_secret, exchange_hash, 67 as u32, session_id, c2s_key64, 64);
+  let s2c_key64: mut ref i64 = ssh_s2c_key64_get();
+  let _ = ssh_derive_key(shared_secret, exchange_hash, 68 as u32, session_id, s2c_key64, 64);
+
+  return 0;
+}
+
+// SERVICE_REQUEST/ACCEPT, then publickey userauth's query probe
+// (split from the signed-request half below purely to keep each
+// phase's own stack frame small -- see ssh_test_phase1_kexinit's own
+// header comment on why this whole flow is split into phases).
+fn ssh_test_phase3a_service_and_query(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  let c2s_key64: mut ref i64 = ssh_c2s_key64_get();
+  let s2c_key64: mut ref i64 = ssh_s2c_key64_get();
+  let c2s_main: [u8; 32] = ssh_load32(c2s_key64);
+  let c2s_header: [u8; 32] = ssh_load32_off(c2s_key64, 32);
+  let s2c_main: [u8; 32] = ssh_load32(s2c_key64);
+  let s2c_header: [u8; 32] = ssh_load32_off(s2c_key64, 32);
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+  let client_id_pub: mut ref i64 = ssh_client_id_pub_get();
+
+  let svc_req_payload: mut ref i64 = ssh_payload_buf_get();
+  let svc_req_len: i64 = ssh_build_service_request(svc_req_payload);
+  let out_seq1: u32 = ssh_seq_take(ssh_client_seq_out_get());
+  let enc_len1: i64 = ssh_build_enc_packet(ref c2s_main, ref c2s_header, out_seq1, svc_req_payload, svc_req_len, packet_buf);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, packet_buf, enc_len1, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+
+  let in_seq1: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_svc_req: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_svc_req_len: i64 = ssh_wait_extract_enc(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), my_mac, server_id, ref c2s_main, ref c2s_header, in_seq1, recv_svc_req);
+  if recv_svc_req_len < 0 { return 0 - 17; }
+  if buf_read_byte(recv_svc_req, 0 as u32) != (5 as u32) { return 0 - 18; }
+
+  let svc_name_len: i64 = ssh_read_u32(recv_svc_req, 1) as i64;
+  let svc_name_buf: mut ref i64 = ssh_hostkey_blob_get();
+  let _ = ssh_copy(svc_name_buf, 0, recv_svc_req, 5, svc_name_len);
+  let svc_accept_payload: mut ref i64 = ssh_payload_buf_get();
+  let svc_accept_len: i64 = ssh_build_service_accept(svc_name_buf, svc_name_len, svc_accept_payload);
+  let out_seq2: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len2: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq2, svc_accept_payload, svc_accept_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, enc_len2, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+
+  let in_seq2: u32 = ssh_seq_take(ssh_client_seq_in_get());
+  let recv_svc_accept: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_svc_accept_len: i64 = ssh_wait_extract_enc(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, ref s2c_main, ref s2c_header, in_seq2, recv_svc_accept);
+  if recv_svc_accept_len < 0 { return 0 - 19; }
+  if buf_read_byte(recv_svc_accept, 0 as u32) != (6 as u32) { return 0 - 20; }
+
+  let client_keyblob: mut ref i64 = ssh_client_keyblob_get();
+  let client_id_pub_arr: [u8; 32] = ssh_load32(client_id_pub);
+  let client_keyblob_len: i64 = ssh_build_ed25519_hostkey_blob(ref client_id_pub_arr, client_keyblob);
+
+  let query_payload: mut ref i64 = ssh_payload_buf_get();
+  let query_len: i64 = ssh_build_userauth_pubkey_query("root", client_keyblob, client_keyblob_len, query_payload);
+  let out_seq3: u32 = ssh_seq_take(ssh_client_seq_out_get());
+  let enc_len3: i64 = ssh_build_enc_packet(ref c2s_main, ref c2s_header, out_seq3, query_payload, query_len, packet_buf);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, packet_buf, enc_len3, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+
+  let in_seq3: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_query: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_query_len: i64 = ssh_wait_extract_enc(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), my_mac, server_id, ref c2s_main, ref c2s_header, in_seq3, recv_query);
+  if recv_query_len < 0 { return 0 - 21; }
+  let query_fields: SshUserauthPubkeyRequest = ssh_parse_userauth_pubkey_request(recv_query, recv_query_len);
+  if query_fields.ok != 1 { return 0 - 22; }
+  if query_fields.has_sig != 0 { return 0 - 23; }
+
+  let pk_ok_alg_buf: mut ref i64 = ssh_hostkey_blob_get();
+  let _ = ssh_copy(pk_ok_alg_buf, 0, recv_query, query_fields.alg_off, query_fields.alg_len);
+  let pk_ok_keyblob_buf: mut ref i64 = ssh_sigblob_get();
+  let _ = ssh_copy(pk_ok_keyblob_buf, 0, recv_query, query_fields.keyblob_off, query_fields.keyblob_len);
+  let pk_ok_payload: mut ref i64 = ssh_payload_buf_get();
+  let pk_ok_len: i64 = ssh_build_userauth_pk_ok(pk_ok_alg_buf, query_fields.alg_len, pk_ok_keyblob_buf, query_fields.keyblob_len, pk_ok_payload);
+  let out_seq4: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len4: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq4, pk_ok_payload, pk_ok_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, enc_len4, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+
+  let in_seq4: u32 = ssh_seq_take(ssh_client_seq_in_get());
+  let recv_pk_ok: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_pk_ok_len: i64 = ssh_wait_extract_enc(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, ref s2c_main, ref s2c_header, in_seq4, recv_pk_ok);
+  if recv_pk_ok_len < 0 { return 0 - 24; }
+  if buf_read_byte(recv_pk_ok, 0 as u32) != (60 as u32) { return 0 - 25; }
+
+  return 0;
+}
+
+// The real signed userauth request, then the connection layer's own
+// prerequisite (SUCCESS reply). `client_keyblob` is rebuilt fresh
+// here (cheap, deterministic given the fixed test identity) rather
+// than threaded across the phase boundary via scratch.
+fn ssh_test_phase3b_signed_auth(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  let c2s_key64: mut ref i64 = ssh_c2s_key64_get();
+  let c2s_main: [u8; 32] = ssh_load32(c2s_key64);
+  let c2s_header: [u8; 32] = ssh_load32_off(c2s_key64, 32);
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+  let session_id: mut ref i64 = ssh_session_id_get();
+  let client_id_priv: mut ref i64 = ssh_client_id_priv_get();
+  let client_id_pub: mut ref i64 = ssh_client_id_pub_get();
+
+  let client_keyblob: mut ref i64 = ssh_client_keyblob_get();
+  let client_id_pub_arr: [u8; 32] = ssh_load32(client_id_pub);
+  let client_keyblob_len: i64 = ssh_build_ed25519_hostkey_blob(ref client_id_pub_arr, client_keyblob);
+
+  let to_sign_payload: mut ref i64 = ssh_payload_buf_get();
+  let to_sign_len: i64 = ssh_build_userauth_pubkey_presig("root", client_keyblob, client_keyblob_len, to_sign_payload);
+  let signed_data: mut ref i64 = ssh_userauth_signed_data_get();
+  let signed_data_len: i64 = ssh_build_userauth_signed_data(session_id, to_sign_payload, to_sign_len, signed_data);
+  let client_sig_heap: mut ref i64 = ssh_payload_buf2_get();
+  let _ = ed25519_sign_heap(client_id_priv, signed_data, signed_data_len, client_sig_heap);
+  let client_sig_arr: [u8; 64] = ssh_load64(client_sig_heap);
+  let client_sigblob: mut ref i64 = ssh_client_sigblob_get();
+  let client_sigblob_len: i64 = ssh_build_ed25519_sigblob(ref client_sig_arr, client_sigblob);
+
+  let signed_req_payload: mut ref i64 = ssh_payload_buf_get();
+  let signed_req_len: i64 = ssh_build_userauth_pubkey_signed("root", client_keyblob, client_keyblob_len, client_sigblob, client_sigblob_len, signed_req_payload);
+  let out_seq5: u32 = ssh_seq_take(ssh_client_seq_out_get());
+  let enc_len5: i64 = ssh_build_enc_packet(ref c2s_main, ref c2s_header, out_seq5, signed_req_payload, signed_req_len, packet_buf);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, packet_buf, enc_len5, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+
+  return 0;
+}
+
+// Server verifies the signed userauth request just sent by phase3b
+// above and replies SUCCESS/FAILURE; client reads the result. Split
+// out purely to keep phase3b's own frame (which contains the
+// ed25519_sign_heap call) small -- see ssh_test_phase1_kexinit's own
+// header comment.
+fn ssh_test_phase3c_verify_and_result(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  let c2s_key64: mut ref i64 = ssh_c2s_key64_get();
+  let s2c_key64: mut ref i64 = ssh_s2c_key64_get();
+  let c2s_main: [u8; 32] = ssh_load32(c2s_key64);
+  let c2s_header: [u8; 32] = ssh_load32_off(c2s_key64, 32);
+  let s2c_main: [u8; 32] = ssh_load32(s2c_key64);
+  let s2c_header: [u8; 32] = ssh_load32_off(s2c_key64, 32);
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+  let session_id: mut ref i64 = ssh_session_id_get();
+
+  let in_seq5: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_signed: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_signed_len: i64 = ssh_wait_extract_enc(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), my_mac, server_id, ref c2s_main, ref c2s_header, in_seq5, recv_signed);
+  if recv_signed_len < 0 { return 0 - 26; }
+  let signed_fields: SshUserauthPubkeyRequest = ssh_parse_userauth_pubkey_request(recv_signed, recv_signed_len);
+  if signed_fields.ok != 1 { return 0 - 27; }
+  if signed_fields.has_sig != 1 { return 0 - 28; }
+
+  let server_signed_data: mut ref i64 = ssh_userauth_signed_data_get();
+  let server_signed_data_len: i64 = ssh_build_userauth_signed_data(session_id, recv_signed, signed_fields.signed_data_end_off, server_signed_data);
+  let recv_client_keyblob: mut ref i64 = ssh_hostkey_blob_get();
+  let _ = ssh_copy(recv_client_keyblob, 0, recv_signed, signed_fields.keyblob_off, signed_fields.keyblob_len);
+  let recv_keyblob_field: SshEd25519Blob = ssh_parse_ed25519_blob(recv_client_keyblob);
+  let recv_client_pub: mut ref i64 = ssh_sigblob_get();
+  let _ = ssh_copy(recv_client_pub, 0, recv_client_keyblob, recv_keyblob_field.value_off, 32);
+  let recv_sig_blob2: mut ref i64 = ssh_client_sigblob_get();
+  let _ = ssh_copy(recv_sig_blob2, 0, recv_signed, signed_fields.sig_off, signed_fields.sig_len);
+  let recv_sig_field2: SshEd25519Blob = ssh_parse_ed25519_blob(recv_sig_blob2);
+  let recv_client_sig: mut ref i64 = ssh_payload_buf2_get();
+  let _ = ssh_copy(recv_client_sig, 0, recv_sig_blob2, recv_sig_field2.value_off, 64);
+
+  let auth_sig_ok: i64 = ed25519_verify_heap(recv_client_pub, server_signed_data, server_signed_data_len, recv_client_sig);
+  let userauth_ok_payload: mut ref i64 = ssh_payload_buf_get();
+  let userauth_reply_len: i64 = 0;
+  if auth_sig_ok == 1 {
+    userauth_reply_len = ssh_build_userauth_success(userauth_ok_payload);
+  } else {
+    userauth_reply_len = ssh_build_userauth_failure(userauth_ok_payload);
+  }
+  let out_seq6: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len6: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq6, userauth_ok_payload, userauth_reply_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, enc_len6, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+  if auth_sig_ok != 1 { return 0 - 29; }
+
+  let in_seq6: u32 = ssh_seq_take(ssh_client_seq_in_get());
+  let recv_auth_result: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_auth_result_len: i64 = ssh_wait_extract_enc(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, ref s2c_main, ref s2c_header, in_seq6, recv_auth_result);
+  if recv_auth_result_len < 0 { return 0 - 30; }
+  if buf_read_byte(recv_auth_result, 0 as u32) != (52 as u32) { return 0 - 31; }
+
+  return 0;
+}
+
+// Connection layer: open a session channel, run one "exec" request
+// end to end (CHANNEL_SUCCESS + a fixed CHANNEL_DATA reply + EOF +
+// CLOSE both ways). A real deployment would wire the command through
+// the shell's own dispatcher instead of a fixed reply -- deferred,
+// noted as a follow-up (this round proves the crypto/framing/channel
+// plumbing, not shell integration).
+fn ssh_test_phase4_channel(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  let c2s_key64: mut ref i64 = ssh_c2s_key64_get();
+  let s2c_key64: mut ref i64 = ssh_s2c_key64_get();
+  let c2s_main: [u8; 32] = ssh_load32(c2s_key64);
+  let c2s_header: [u8; 32] = ssh_load32_off(c2s_key64, 32);
+  let s2c_main: [u8; 32] = ssh_load32(s2c_key64);
+  let s2c_header: [u8; 32] = ssh_load32_off(s2c_key64, 32);
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+
+  let chan_open_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_open_len: i64 = ssh_build_channel_open_session(0 as u32, 65536 as u32, 32768 as u32, chan_open_payload);
+  let out_seq7: u32 = ssh_seq_take(ssh_client_seq_out_get());
+  let enc_len7: i64 = ssh_build_enc_packet(ref c2s_main, ref c2s_header, out_seq7, chan_open_payload, chan_open_len, packet_buf);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, packet_buf, enc_len7, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+
+  let in_seq7: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_chan_open: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_chan_open_len: i64 = ssh_wait_extract_enc(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), my_mac, server_id, ref c2s_main, ref c2s_header, in_seq7, recv_chan_open);
+  if recv_chan_open_len < 0 { return 0 - 32; }
+  let chan_open_fields: SshChannelOpen = ssh_parse_channel_open(recv_chan_open);
+
+  let server_local_chan: u32 = 0 as u32;
+  let chan_confirm_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_confirm_len: i64 = ssh_build_channel_open_confirmation(chan_open_fields.peer_chan, server_local_chan, 65536 as u32, 32768 as u32, chan_confirm_payload);
+  let out_seq8: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len8: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq8, chan_confirm_payload, chan_confirm_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, enc_len8, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+
+  let in_seq8: u32 = ssh_seq_take(ssh_client_seq_in_get());
+  let recv_confirm: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_confirm_len: i64 = ssh_wait_extract_enc(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, ref s2c_main, ref s2c_header, in_seq8, recv_confirm);
+  if recv_confirm_len < 0 { return 0 - 33; }
+  if buf_read_byte(recv_confirm, 0 as u32) != (91 as u32) { return 0 - 34; }
+  let confirm_fields: SshChannelOpenConfirmation = ssh_parse_channel_open_confirmation(recv_confirm);
+  let client_peer_chan: u32 = confirm_fields.sender_chan;
+
+  let exec_cmd: mut ref i64 = ssh_exec_cmd_get();
+  let _ = str_copy_to_buf("echo dhruvaos-ssh-ok", exec_cmd);
+  let exec_cmd_len: i64 = str_len_bytes("echo dhruvaos-ssh-ok");
+  let chan_req_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_req_len: i64 = ssh_build_channel_request_exec(client_peer_chan, exec_cmd, exec_cmd_len, 1 as u32, chan_req_payload);
+  let out_seq9: u32 = ssh_seq_take(ssh_client_seq_out_get());
+  let enc_len9: i64 = ssh_build_enc_packet(ref c2s_main, ref c2s_header, out_seq9, chan_req_payload, chan_req_len, packet_buf);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, packet_buf, enc_len9, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+
+  let in_seq9: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_chan_req: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_chan_req_len: i64 = ssh_wait_extract_enc(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), my_mac, server_id, ref c2s_main, ref c2s_header, in_seq9, recv_chan_req);
+  if recv_chan_req_len < 0 { return 0 - 35; }
+  let chan_req_fields: SshChannelRequest = ssh_parse_channel_request(recv_chan_req);
+  let expect_exec: [u8; 4] = [101 as u8, 120 as u8, 101 as u8, 99 as u8];
+  let is_exec: i64 = 1;
+  let ci: i64 = 0;
+  while ci < 4 {
+    if buf_read_byte(recv_chan_req, (chan_req_fields.type_off + ci) as u32) != (expect_exec[ci] as u32) { is_exec = 0; }
+    ci = ci + 1;
+  }
+  if is_exec != 1 { return 0 - 36; }
+
+  let chan_success_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_success_len: i64 = ssh_build_channel_simple(99 as u32, chan_open_fields.peer_chan, chan_success_payload);
+  let out_seq10: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len10: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq10, chan_success_payload, chan_success_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, enc_len10, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+
+  let channel_reply: mut ref i64 = ssh_channel_data_buf_get();
+  let _ = str_copy_to_buf("hello from dhruvaos ssh\n", channel_reply);
+  let channel_reply_len: i64 = str_len_bytes("hello from dhruvaos ssh\n");
+  let chan_data_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_data_len: i64 = ssh_build_channel_data(chan_open_fields.peer_chan, channel_reply, 0, channel_reply_len, chan_data_payload);
+  let out_seq11: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len11: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq11, chan_data_payload, chan_data_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, enc_len11, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+
+  let chan_eof_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_eof_len: i64 = ssh_build_channel_simple(96 as u32, chan_open_fields.peer_chan, chan_eof_payload);
+  let out_seq12: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len12: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq12, chan_eof_payload, chan_eof_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, enc_len12, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+
+  let chan_close_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_close_len: i64 = ssh_build_channel_simple(97 as u32, chan_open_fields.peer_chan, chan_close_payload);
+  let out_seq13: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len13: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq13, chan_close_payload, chan_close_len, packet_buf);
+  let _ = ssh_send_over_tcp(server_id, client_id, my_mac, packet_buf, enc_len13, ssh_client_rx_buf_get(), ssh_client_rx_len_get());
+
+  let in_seq10: u32 = ssh_seq_take(ssh_client_seq_in_get());
+  let recv_success: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_success_len: i64 = ssh_wait_extract_enc(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, ref s2c_main, ref s2c_header, in_seq10, recv_success);
+  if recv_success_len < 0 { return 0 - 37; }
+  if buf_read_byte(recv_success, 0 as u32) != (99 as u32) { return 0 - 38; }
+
+  let in_seq11: u32 = ssh_seq_take(ssh_client_seq_in_get());
+  let recv_data: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_data_len: i64 = ssh_wait_extract_enc(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, ref s2c_main, ref s2c_header, in_seq11, recv_data);
+  if recv_data_len < 0 { return 0 - 39; }
+  if buf_read_byte(recv_data, 0 as u32) != (94 as u32) { return 0 - 40; }
+  let data_fields: SshChannelData = ssh_parse_channel_data(recv_data);
+  if data_fields.data_len != channel_reply_len { return 0 - 41; }
+  let di: i64 = 0;
+  let data_ok: i64 = 1;
+  while di < data_fields.data_len {
+    if buf_read_byte(recv_data, (data_fields.data_off + di) as u32) != buf_read_byte(channel_reply, di as u32) { data_ok = 0; }
+    di = di + 1;
+  }
+  if data_ok != 1 { return 0 - 42; }
+
+  let in_seq12: u32 = ssh_seq_take(ssh_client_seq_in_get());
+  let recv_eof: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_eof_len: i64 = ssh_wait_extract_enc(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, ref s2c_main, ref s2c_header, in_seq12, recv_eof);
+  if recv_eof_len < 0 { return 0 - 43; }
+  if buf_read_byte(recv_eof, 0 as u32) != (96 as u32) { return 0 - 44; }
+
+  let in_seq13: u32 = ssh_seq_take(ssh_client_seq_in_get());
+  let recv_close: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_close_len: i64 = ssh_wait_extract_enc(ssh_client_rx_buf_get(), ssh_client_rx_len_get(), my_mac, client_id, ref s2c_main, ref s2c_header, in_seq13, recv_close);
+  if recv_close_len < 0 { return 0 - 45; }
+  if buf_read_byte(recv_close, 0 as u32) != (97 as u32) { return 0 - 46; }
+
+  let client_close_payload: mut ref i64 = ssh_payload_buf_get();
+  let client_close_len: i64 = ssh_build_channel_simple(97 as u32, client_peer_chan, client_close_payload);
+  let out_seq14: u32 = ssh_seq_take(ssh_client_seq_out_get());
+  let enc_len14: i64 = ssh_build_enc_packet(ref c2s_main, ref c2s_header, out_seq14, client_close_payload, client_close_len, packet_buf);
+  let _ = ssh_send_over_tcp(client_id, server_id, my_mac, packet_buf, enc_len14, ssh_server_rx_buf_get(), ssh_server_rx_len_get());
+
+  let in_seq14: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_client_close: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_client_close_len: i64 = ssh_wait_extract_enc(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), my_mac, server_id, ref c2s_main, ref c2s_header, in_seq14, recv_client_close);
+  if recv_client_close_len < 0 { return 0 - 47; }
+  if buf_read_byte(recv_client_close, 0 as u32) != (97 as u32) { return 0 - 48; }
+
+  return 0;
+}
+
+// Full SSH-2.0 handshake (curve25519-sha256 KEX, ssh-ed25519 host key
+// signature, RFC 4253 7.2 key derivation), NEWKEYS, SERVICE_REQUEST/
+// ACCEPT, publickey userauth, and a session channel running one
+// "exec" request end to end -- both roles in one process over
+// `client_id`/`server_id`'s real (already-ESTABLISHED) TCP
+// connection. Fixed test identities throughout (self-test
+// determinism, matching tls_connect's own fixed client_random/priv
+// hex constants) -- a real deployment would generate and persist the
+// host key once, and a real external client brings its own identity
+// instead of the fixed "client_id_priv" here. Returns 0 on full
+// success, or a distinct negative code identifying which phase/step
+// failed (see ssh_test_phase1_kexinit/phase2_kex/phase3_auth/
+// phase4_channel's own return-code sites).
+fn ssh_run_self_test(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  let r1: i64 = ssh_test_phase1_kexinit(client_id, server_id, my_mac);
+  if r1 != 0 { return r1; }
+  let r2a: i64 = ssh_test_phase2a_ecdh_and_reply(client_id, server_id, my_mac);
+  if r2a != 0 { return r2a; }
+  let r2b: i64 = ssh_test_phase2b_verify_and_newkeys(client_id, server_id, my_mac);
+  if r2b != 0 { return r2b; }
+  let r3a: i64 = ssh_test_phase3a_service_and_query(client_id, server_id, my_mac);
+  if r3a != 0 { return r3a; }
+  let r3b: i64 = ssh_test_phase3b_signed_auth(client_id, server_id, my_mac);
+  if r3b != 0 { return r3b; }
+  let r3c: i64 = ssh_test_phase3c_verify_and_result(client_id, server_id, my_mac);
+  if r3c != 0 { return r3c; }
+  let r4: i64 = ssh_test_phase4_channel(client_id, server_id, my_mac);
+  if r4 != 0 { return r4; }
+  return 0;
+}
+
+// `sshtest` shell command's own body, factored out of shell_dispatch
+// itself so its locals don't add to that (already near its stack-
+// depth budget) function's own frame -- see ssh_test_phase1_kexinit's
+// own header comment on this whole effort's phase-splitting rationale.
+fn ssh_shell_test_cmd() -> i64 {
+  let my_mac: mut ref i64 = shell_my_mac_scratch_get();
+  let _ = netif_get_mac(my_mac);
+  let client_id: u32 = 0 as u32;
+  let server_id: u32 = 1 as u32;
+  let loop_ip: u32 = 0x7F000001 as u32;
+  let client_port: u32 = 54326 as u32;
+  let server_port: u32 = 22 as u32;
+
+  let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
+  let isn: u32 = scheduler_get_tick_count() + (3000 as u32);
+  let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+  if open_status != 0 {
+    let _ = uart_puts("sshtest: SYN send failed\n");
+    return 0;
+  }
+
+  let scratch: mut ref i64 = shell_tcp_poll_scratch_get();
+  let handshake_iter: i64 = 0;
+  while (handshake_iter < 10) && ((tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established())) {
+    let _ = tcp_conn_poll(my_mac, scratch, 512);
+    handshake_iter = handshake_iter + 1;
+  }
+  if (tcp_conn_get_state(client_id) != tcp_state_established()) || (tcp_conn_get_state(server_id) != tcp_state_established()) {
+    let _ = uart_puts("sshtest: TCP handshake failed\n");
+    return 0;
+  }
+
+  let result: i64 = ssh_run_self_test(client_id, server_id, my_mac);
+
+  let _ = tcp_conn_close(client_id, my_mac, my_mac);
+  let close_iter: i64 = 0;
+  while (close_iter < 10) && (tcp_conn_get_state(client_id) != tcp_state_closed_final()) {
+    let _ = tcp_conn_poll(my_mac, scratch, 512);
+    close_iter = close_iter + 1;
+  }
+
+  if result == 0 {
+    let _ = uart_puts("sshtest: full SSH-2.0 handshake + pubkey auth + exec channel OK\n");
+  } else {
+    let _ = uart_puts("sshtest: FAILED, code=");
+    let _ = uart_put_i64(result);
+    let _ = uart_puts("\n");
+  }
+  return 0;
+}
+
 fn pki_self_test() -> i64 {
   let ok: i64 = 1;
   let _ = pki_init();
@@ -26369,6 +27323,54 @@ fn kernel_main() -> i64 {
   let _ = http_req_scratch_set(dhruva_alloc_bytes(512));
   let _ = http_resp_scratch_set(dhruva_alloc_bytes(512));
   let _ = mqtt_pkt_scratch_set(dhruva_alloc_bytes(512));
+  let _ = ssh_v_c_set(dhruva_alloc_bytes(64));
+  let _ = ssh_v_s_set(dhruva_alloc_bytes(64));
+  let _ = ssh_v_c_len_set(dhruva_alloc_bytes(4));
+  let _ = ssh_v_s_len_set(dhruva_alloc_bytes(4));
+  let _ = ssh_client_kexinit_set(dhruva_alloc_bytes(256));
+  let _ = ssh_client_kexinit_len_set(dhruva_alloc_bytes(4));
+  let _ = ssh_server_kexinit_set(dhruva_alloc_bytes(256));
+  let _ = ssh_server_kexinit_len_set(dhruva_alloc_bytes(4));
+  let _ = ssh_cookie16_set(dhruva_alloc_bytes(16));
+  let _ = ssh_client_x25519_priv_set(dhruva_alloc_bytes(32));
+  let _ = ssh_client_x25519_pub_set(dhruva_alloc_bytes(32));
+  let _ = ssh_server_x25519_priv_set(dhruva_alloc_bytes(32));
+  let _ = ssh_server_x25519_pub_set(dhruva_alloc_bytes(32));
+  let _ = ssh_shared_secret_set(dhruva_alloc_bytes(32));
+  let _ = ssh_host_priv_set(dhruva_alloc_bytes(32));
+  let _ = ssh_host_pub_set(dhruva_alloc_bytes(32));
+  let _ = ssh_client_id_priv_set(dhruva_alloc_bytes(32));
+  let _ = ssh_client_id_pub_set(dhruva_alloc_bytes(32));
+  let _ = ssh_exchange_hash_set(dhruva_alloc_bytes(32));
+  let _ = ssh_session_id_set(dhruva_alloc_bytes(32));
+  let _ = ssh_c2s_key64_set(dhruva_alloc_bytes(64));
+  let _ = ssh_s2c_key64_set(dhruva_alloc_bytes(64));
+  let _ = ssh_hostkey_blob_set(dhruva_alloc_bytes(64));
+  let _ = ssh_sigblob_set(dhruva_alloc_bytes(96));
+  let _ = ssh_client_keyblob_set(dhruva_alloc_bytes(64));
+  let _ = ssh_client_sigblob_set(dhruva_alloc_bytes(96));
+  let _ = ssh_userauth_signed_data_set(dhruva_alloc_bytes(256));
+  let _ = ssh_payload_buf_set(dhruva_alloc_bytes(512));
+  let _ = ssh_payload_buf2_set(dhruva_alloc_bytes(512));
+  let _ = ssh_packet_buf_set(dhruva_alloc_bytes(576));
+  let _ = ssh_packet_buf2_set(dhruva_alloc_bytes(576));
+  let _ = ssh_decrypted_scratch_set(dhruva_alloc_bytes(512));
+  let _ = ssh_client_rx_buf_set(dhruva_alloc_bytes(2048));
+  let _ = ssh_client_rx_len_set(dhruva_alloc_bytes(4));
+  let _ = ssh_server_rx_buf_set(dhruva_alloc_bytes(2048));
+  let _ = ssh_server_rx_len_set(dhruva_alloc_bytes(4));
+  let _ = ssh_frame_scratch_set(dhruva_alloc_bytes(1514));
+  let _ = ssh_chunk_scratch_set(dhruva_alloc_bytes(64));
+  let _ = ssh_recv_chunk_scratch_set(dhruva_alloc_bytes(64));
+  let _ = ssh_ack_scratch_set(dhruva_alloc_bytes(8));
+  let _ = ssh_client_seq_out_set(dhruva_alloc_bytes(4));
+  let _ = ssh_client_seq_in_set(dhruva_alloc_bytes(4));
+  let _ = ssh_server_seq_out_set(dhruva_alloc_bytes(4));
+  let _ = ssh_server_seq_in_set(dhruva_alloc_bytes(4));
+  let _ = ssh_client_phase_set(dhruva_alloc_bytes(4));
+  let _ = ssh_server_phase_set(dhruva_alloc_bytes(4));
+  let _ = ssh_exec_cmd_set(dhruva_alloc_bytes(64));
+  let _ = ssh_channel_data_buf_set(dhruva_alloc_bytes(512));
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));

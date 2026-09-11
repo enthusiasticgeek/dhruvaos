@@ -756,3 +756,114 @@ fn chacha20_poly1305_decrypt(key: ref [u8; 32], nonce: ref [u8; 12], aad: ref [u
   let plaintext: [u8; 512] = chacha20_encrypt(key, nonce, 1 as u32, ciphertext, ciphertext_len);
   return AeadDecryptResult { ok: 1, plaintext: plaintext };
 }
+
+// --- Bernstein-original ChaCha20 (64-bit nonce + 64-bit block counter) ---
+//
+// A SECOND block-cipher construction alongside chacha20_block above,
+// added for SSH's chacha20-poly1305@openssh.com cipher (RFC-less,
+// OpenSSH's own protocol extension) -- confirmed against OpenSSH's own
+// cipher-chachapoly.c source (chacha_ivsetup(ctx, iv[8], counter[8])),
+// not the RFC 8439/IETF variant chacha20_block above implements (96-
+// bit nonce + 32-bit counter). Same 20-round quarter-round core
+// (cp_quarter_round), only the initial state's word 12-15 layout
+// differs: Bernstein's original splits those 4 words as [counter_lo,
+// counter_hi, nonce_lo, nonce_hi] (64-bit counter then 64-bit nonce,
+// both little-endian) instead of RFC 8439's [counter(32-bit),
+// nonce(96-bit, 3 words)]. Not usable interchangeably with chacha20_
+// block's own output for the same key/counter/nonce values -- these
+// are two distinct, standards-different constructions that happen to
+// share the same round function.
+fn chacha20_block_legacy(key: ref [u8; 32], nonce8: ref [u8; 8], counter8: ref [u8; 8]) -> [u8; 64] {
+  let state: [u32; 16] = [0 as u32; 16];
+  state[0] = 0x61707865 as u32;
+  state[1] = 0x3320646e as u32;
+  state[2] = 0x79622d32 as u32;
+  state[3] = 0x6b206574 as u32;
+
+  state[4] = cp_word_le(key[0], key[1], key[2], key[3]);
+  state[5] = cp_word_le(key[4], key[5], key[6], key[7]);
+  state[6] = cp_word_le(key[8], key[9], key[10], key[11]);
+  state[7] = cp_word_le(key[12], key[13], key[14], key[15]);
+  state[8] = cp_word_le(key[16], key[17], key[18], key[19]);
+  state[9] = cp_word_le(key[20], key[21], key[22], key[23]);
+  state[10] = cp_word_le(key[24], key[25], key[26], key[27]);
+  state[11] = cp_word_le(key[28], key[29], key[30], key[31]);
+
+  state[12] = cp_word_le(counter8[0], counter8[1], counter8[2], counter8[3]);
+  state[13] = cp_word_le(counter8[4], counter8[5], counter8[6], counter8[7]);
+  state[14] = cp_word_le(nonce8[0], nonce8[1], nonce8[2], nonce8[3]);
+  state[15] = cp_word_le(nonce8[4], nonce8[5], nonce8[6], nonce8[7]);
+
+  let working: [u32; 16] = [0 as u32; 16];
+  let wi: i64 = 0;
+  while wi < 16 {
+    working[wi] = state[wi];
+    wi = wi + 1;
+  }
+
+  let round: i64 = 0;
+  while round < 10 {
+    let _ = cp_quarter_round(mut ref working, 0, 4, 8, 12);
+    let _ = cp_quarter_round(mut ref working, 1, 5, 9, 13);
+    let _ = cp_quarter_round(mut ref working, 2, 6, 10, 14);
+    let _ = cp_quarter_round(mut ref working, 3, 7, 11, 15);
+    let _ = cp_quarter_round(mut ref working, 0, 5, 10, 15);
+    let _ = cp_quarter_round(mut ref working, 1, 6, 11, 12);
+    let _ = cp_quarter_round(mut ref working, 2, 7, 8, 13);
+    let _ = cp_quarter_round(mut ref working, 3, 4, 9, 14);
+    round = round + 1;
+  }
+
+  let out: [u8; 64] = cp_zero64_bytes();
+  let m: i64 = 0;
+  while m < 16 {
+    let sum: u32 = wrapping_add(working[m], state[m]);
+    let wb: WordBytesLE = cp_word_to_bytes_le(sum);
+    out[m * 4] = wb.b0;
+    out[m * 4 + 1] = wb.b1;
+    out[m * 4 + 2] = wb.b2;
+    out[m * 4 + 3] = wb.b3;
+    m = m + 1;
+  }
+  return out;
+}
+
+// counter8 is read as a little-endian 64-bit integer and incremented
+// by the caller between successive blocks (matching cipher-chachapoly
+// .c's own chacha_encrypt_bytes loop, which increments its internal
+// counter by 1 per 64-byte block automatically -- but this package's
+// own convention, matching chacha20_xor_chunk above, hands the
+// counter back to the caller explicitly rather than threading hidden
+// state through repeated calls).
+fn chacha20_legacy_xor_chunk(key: ref [u8; 32], nonce8: ref [u8; 8], counter8: ref [u8; 8], chunk: ref [u8; 64], chunk_len: i64) -> [u8; 64] {
+  let ks: [u8; 64] = chacha20_block_legacy(key, nonce8, counter8);
+  let out: [u8; 64] = cp_zero64_bytes();
+  let i: i64 = 0;
+  while i < chunk_len {
+    out[i] = chunk[i] ^ ks[i];
+    i = i + 1;
+  }
+  return out;
+}
+
+// Increments an 8-byte little-endian counter by 1 (with carry) --
+// counter8 in the functions above is read/written as a plain byte
+// array, not a native integer type, so this is the counterpart to
+// manual increment between successive chacha20_legacy_xor_chunk calls.
+fn chacha20_legacy_counter_increment(counter8: ref [u8; 8]) -> [u8; 8] {
+  let out: [u8; 8] = [0 as u8; 8];
+  let i: i64 = 0;
+  while i < 8 {
+    out[i] = counter8[i];
+    i = i + 1;
+  }
+  let carry: u32 = 1 as u32;
+  let j: i64 = 0;
+  while j < 8 {
+    let sum: u32 = (out[j] as u32) + carry;
+    out[j] = (sum & (255 as u32)) as u8;
+    carry = sum >> (8 as u32);
+    j = j + 1;
+  }
+  return out;
+}
