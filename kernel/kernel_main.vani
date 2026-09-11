@@ -10274,8 +10274,13 @@ fn dhcp_server_port() -> u32 { return 67 as u32; }
 // within that cap regardless of this file's own much larger real
 // heap frame buffers. Each function below copies its own message
 // window into (and, for builders, back out of) a local `[u8;512]`.
-fn dhcp_copy_msg_to_local(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64) -> [u8; 512] {
-  let local: [u8; 512] = netstack_zero_frame();
+// Round (task #181): [u8;1024], matching vani-netstack's own DHCP-
+// specific bound (netstack_zero_dhcp_frame) -- a real DHCP server's
+// OFFER/ACK routinely exceeds the [u8;512] every other netstack
+// message uses. See vani-netstack's own commit history for the full
+// real-DHCP-server discovery/fix.
+fn dhcp_copy_msg_to_local(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64) -> [u8; 1024] {
+  let local: [u8; 1024] = netstack_zero_dhcp_frame();
   let i: i64 = 0;
   while i < dhcp_len {
     local[dhcp_offset + i] = buf_read_byte(buf, (dhcp_offset + i) as u32) as u8;
@@ -10284,7 +10289,7 @@ fn dhcp_copy_msg_to_local(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64) -> 
   return local;
 }
 
-fn dhcp_copy_msg_from_local(local: ref [u8; 512], buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64) -> i64 {
+fn dhcp_copy_msg_from_local(local: ref [u8; 1024], buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64) -> i64 {
   let i: i64 = 0;
   while i < dhcp_len {
     let _ = buf_write_byte(buf, (dhcp_offset + i) as u32, local[dhcp_offset + i] as u32);
@@ -10311,7 +10316,7 @@ fn dhcp_mac_to_local(mac: mut ref i64) -> [u8; 6] {
 
 fn dhcp_build_fixed_header(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, op: u32, ciaddr: u32, yiaddr: u32, siaddr: u32) -> i64 {
   let mac_arr: [u8; 6] = dhcp_mac_to_local(mac);
-  let local: [u8; 512] = netstack_zero_frame();
+  let local: [u8; 1024] = netstack_zero_dhcp_frame();
   let msg_len: i64 = netstack_dhcp_build_fixed_header(mut ref local, dhcp_offset, ref mac_arr, xid, op, ciaddr, yiaddr, siaddr);
   let _ = dhcp_copy_msg_from_local(ref local, buf, dhcp_offset, msg_len);
   return msg_len;
@@ -10319,7 +10324,7 @@ fn dhcp_build_fixed_header(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64,
 
 fn dhcp_build_discover(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32) -> i64 {
   let mac_arr: [u8; 6] = dhcp_mac_to_local(mac);
-  let local: [u8; 512] = netstack_zero_frame();
+  let local: [u8; 1024] = netstack_zero_dhcp_frame();
   let msg_len: i64 = netstack_dhcp_build_discover(mut ref local, dhcp_offset, ref mac_arr, xid);
   let _ = dhcp_copy_msg_from_local(ref local, buf, dhcp_offset, msg_len);
   return msg_len;
@@ -10327,7 +10332,7 @@ fn dhcp_build_discover(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid
 
 fn dhcp_build_request(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, requested_ip: u32, server_ip: u32) -> i64 {
   let mac_arr: [u8; 6] = dhcp_mac_to_local(mac);
-  let local: [u8; 512] = netstack_zero_frame();
+  let local: [u8; 1024] = netstack_zero_dhcp_frame();
   let msg_len: i64 = netstack_dhcp_build_request(mut ref local, dhcp_offset, ref mac_arr, xid, requested_ip, server_ip);
   let _ = dhcp_copy_msg_from_local(ref local, buf, dhcp_offset, msg_len);
   return msg_len;
@@ -10335,42 +10340,51 @@ fn dhcp_build_request(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid:
 
 fn dhcp_build_renew_request(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, xid: u32, ciaddr: u32) -> i64 {
   let mac_arr: [u8; 6] = dhcp_mac_to_local(mac);
-  let local: [u8; 512] = netstack_zero_frame();
+  let local: [u8; 1024] = netstack_zero_dhcp_frame();
   let msg_len: i64 = netstack_dhcp_build_renew_request(mut ref local, dhcp_offset, ref mac_arr, xid, ciaddr);
   let _ = dhcp_copy_msg_from_local(ref local, buf, dhcp_offset, msg_len);
   return msg_len;
 }
 
 fn dhcp_get_op(buf: mut ref i64, dhcp_offset: i64) -> u32 {
-  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 1);
+  let local: [u8; 1024] = dhcp_copy_msg_to_local(buf, dhcp_offset, 1);
   return netstack_dhcp_get_op(ref local, dhcp_offset);
 }
 fn dhcp_get_xid(buf: mut ref i64, dhcp_offset: i64) -> u32 {
-  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 8);
+  let local: [u8; 1024] = dhcp_copy_msg_to_local(buf, dhcp_offset, 8);
   return netstack_dhcp_get_xid(ref local, dhcp_offset);
 }
 fn dhcp_get_yiaddr(buf: mut ref i64, dhcp_offset: i64) -> u32 {
-  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 20);
+  let local: [u8; 1024] = dhcp_copy_msg_to_local(buf, dhcp_offset, 20);
   return netstack_dhcp_get_yiaddr(ref local, dhcp_offset);
 }
 fn dhcp_get_ciaddr(buf: mut ref i64, dhcp_offset: i64) -> u32 {
-  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 16);
+  let local: [u8; 1024] = dhcp_copy_msg_to_local(buf, dhcp_offset, 16);
   return netstack_dhcp_get_ciaddr(ref local, dhcp_offset);
 }
 
 fn dhcp_verify_magic_cookie(buf: mut ref i64, dhcp_offset: i64) -> i64 {
-  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, 240);
+  let local: [u8; 1024] = dhcp_copy_msg_to_local(buf, dhcp_offset, 240);
   return netstack_dhcp_verify_magic_cookie(ref local, dhcp_offset);
 }
 
+// dhcp_len comes from a real, untrusted-until-validated peer's own
+// UDP length field (dhcp_client_poll already rejects dhcp_len < 240
+// before calling here, but does NOT cap it against this [u8;1024]
+// local's own 1024-dhcp_offset headroom) -- clamp defensively so a
+// malformed/hostile oversized length can't overrun dhcp_copy_msg_to_
+// local's own copy loop the way the real (legitimate, just larger-
+// than-512) OFFER that motivated this whole fix originally did.
 fn dhcp_find_option_byte(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64, want_code: u32) -> i64 {
-  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, dhcp_len);
-  return netstack_dhcp_find_option_byte(ref local, dhcp_offset, dhcp_len, want_code);
+  let capped_len: i64 = if (dhcp_offset + dhcp_len) > 1024 { 1024 - dhcp_offset } else { dhcp_len };
+  let local: [u8; 1024] = dhcp_copy_msg_to_local(buf, dhcp_offset, capped_len);
+  return netstack_dhcp_find_option_byte(ref local, dhcp_offset, capped_len, want_code);
 }
 
 fn dhcp_find_option_u32(buf: mut ref i64, dhcp_offset: i64, dhcp_len: i64, want_code: u32) -> u32 {
-  let local: [u8; 512] = dhcp_copy_msg_to_local(buf, dhcp_offset, dhcp_len);
-  return netstack_dhcp_find_option_u32(ref local, dhcp_offset, dhcp_len, want_code);
+  let capped_len: i64 = if (dhcp_offset + dhcp_len) > 1024 { 1024 - dhcp_offset } else { dhcp_len };
+  let local: [u8; 1024] = dhcp_copy_msg_to_local(buf, dhcp_offset, capped_len);
+  return netstack_dhcp_find_option_u32(ref local, dhcp_offset, capped_len, want_code);
 }
 
 fn dhcp_broadcast_mac(out_mac: mut ref i64) -> i64 {
@@ -11141,7 +11155,7 @@ fn dhcp_server_build_offer_ack(buf: mut ref i64, dhcp_offset: i64, mac: mut ref 
     buf_read_byte(mac, 0 as u32) as u8, buf_read_byte(mac, 1 as u32) as u8, buf_read_byte(mac, 2 as u32) as u8,
     buf_read_byte(mac, 3 as u32) as u8, buf_read_byte(mac, 4 as u32) as u8, buf_read_byte(mac, 5 as u32) as u8
   ];
-  let local: [u8; 512] = netstack_zero_frame();
+  let local: [u8; 1024] = netstack_zero_dhcp_frame();
   let msg_len: i64 = netstack_dhcp_server_build_offer_ack(mut ref local, dhcp_offset, ref mac_arr, xid, msg_type, yiaddr, server_ip, lease_time);
   let i: i64 = 0;
   while i < msg_len {
@@ -11156,7 +11170,7 @@ fn dhcp_server_build_nak(buf: mut ref i64, dhcp_offset: i64, mac: mut ref i64, x
     buf_read_byte(mac, 0 as u32) as u8, buf_read_byte(mac, 1 as u32) as u8, buf_read_byte(mac, 2 as u32) as u8,
     buf_read_byte(mac, 3 as u32) as u8, buf_read_byte(mac, 4 as u32) as u8, buf_read_byte(mac, 5 as u32) as u8
   ];
-  let local: [u8; 512] = netstack_zero_frame();
+  let local: [u8; 1024] = netstack_zero_dhcp_frame();
   let msg_len: i64 = netstack_dhcp_server_build_nak(mut ref local, dhcp_offset, ref mac_arr, xid, server_ip);
   let i: i64 = 0;
   while i < msg_len {
@@ -16861,8 +16875,15 @@ fn task_d() -> i64 {
 // 2048), not silently left as a real-hardware-only risk. Raised to
 // 4096 for real headroom against the next addition to this same
 // chain, not just the bare 4 bytes actually needed today.
+// BUG (task #181 audit): dhcp_client_poll's own dhcp_find_option_byte/
+// dhcp_find_option_u32 chain (dhcp_copy_msg_to_local -> netstack_
+// zero_dhcp_frame) grew from a [u8;512] to a [u8;1024] local (a real
+// DHCP server's OFFER/ACK needs that headroom -- see vani-netstack's
+// own commit history), pushing this task's worst-case chain to 4700
+// bytes, past the 4096 budget. Raised to 6144, again for real headroom
+// against the next addition, not the bare ~600 bytes actually needed.
 #[no_mangle]
-#[bounded_stack(bytes=4096)]
+#[bounded_stack(bytes=6144)]
 fn task_e() -> i64 {
   let gc_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);

@@ -3050,49 +3050,107 @@ extern "C" fn dhcp_state_set_lease_start_tick(value: u32) -> u32;
 // Round 106e: DHCP's own message build/parse ALGORITHM now lives in
 // the shared `netstack` package (`netstack_dhcp_*`), confirmed a
 // direct port of this file's own former body before extraction.
+//
+// Task #181: netstack_dhcp_* moved to a [u8;1024] bound (a real DHCP
+// server's OFFER/ACK exceeds [u8;512] -- see vani-netstack's own
+// commit history). This port's own frame/payload buffers stay
+// [u8;512] throughout (touching that would mean widening netif's own
+// receive path and every OTHER protocol sharing it -- out of scope
+// here); these wrappers copy to/from a local [u8;1024] purely to
+// satisfy netstack's new signature, so Pi 4/5's own real-message
+// ceiling is UNCHANGED at 512 bytes. That means this port's own real-
+// network DHCP interop, if ever exercised (never tested to date, same
+// as Pi 1 before task #181), likely still has task #181's original
+// bug -- not fixed here, since it needs the same "widen every frame
+// buffer along the whole receive path" scope Pi 1's own fix took, and
+// nothing establishes Pi 4/5 needs that yet (no real QEMU networking
+// test exists for this port either).
+fn dhcp_widen_512_to_1024(buf: ref [u8; 512]) -> [u8; 1024] {
+  let out: [u8; 1024] = netstack_zero_dhcp_frame();
+  let i: i64 = 0;
+  while i < 512 {
+    out[i] = buf[i];
+    i = i + 1;
+  }
+  return out;
+}
+
+fn dhcp_narrow_1024_into_512(wide: ref [u8; 1024], out: mut ref [u8; 512]) -> i64 {
+  let i: i64 = 0;
+  while i < 512 {
+    out[i] = wide[i];
+    i = i + 1;
+  }
+  return 0;
+}
+
 fn dhcp_zero_range_rpi4(buf: mut ref [u8; 512], offset: i64, count: i64) -> i64 {
-  return netstack_dhcp_zero_range(buf, offset, count);
+  let i: i64 = 0;
+  while i < count {
+    buf[offset + i] = 0 as u8;
+    i = i + 1;
+  }
+  return 0;
 }
 
 fn dhcp_build_fixed_header_rpi4(buf: mut ref [u8; 512], dhcp_offset: i64, mac: ref [u8; 6], xid: u32, op: u32, ciaddr: u32, yiaddr: u32, siaddr: u32) -> i64 {
-  return netstack_dhcp_build_fixed_header(buf, dhcp_offset, mac, xid, op, ciaddr, yiaddr, siaddr);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  let msg_len: i64 = netstack_dhcp_build_fixed_header(mut ref wide, dhcp_offset, mac, xid, op, ciaddr, yiaddr, siaddr);
+  let _ = dhcp_narrow_1024_into_512(ref wide, buf);
+  return msg_len;
 }
 
 fn dhcp_build_discover_rpi4(buf: mut ref [u8; 512], dhcp_offset: i64, mac: ref [u8; 6], xid: u32) -> i64 {
-  return netstack_dhcp_build_discover(buf, dhcp_offset, mac, xid);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  let msg_len: i64 = netstack_dhcp_build_discover(mut ref wide, dhcp_offset, mac, xid);
+  let _ = dhcp_narrow_1024_into_512(ref wide, buf);
+  return msg_len;
 }
 
 fn dhcp_build_request_rpi4(buf: mut ref [u8; 512], dhcp_offset: i64, mac: ref [u8; 6], xid: u32, requested_ip: u32, server_ip: u32) -> i64 {
-  return netstack_dhcp_build_request(buf, dhcp_offset, mac, xid, requested_ip, server_ip);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  let msg_len: i64 = netstack_dhcp_build_request(mut ref wide, dhcp_offset, mac, xid, requested_ip, server_ip);
+  let _ = dhcp_narrow_1024_into_512(ref wide, buf);
+  return msg_len;
 }
 
 fn dhcp_build_renew_request_rpi4(buf: mut ref [u8; 512], dhcp_offset: i64, mac: ref [u8; 6], xid: u32, ciaddr: u32) -> i64 {
-  return netstack_dhcp_build_renew_request(buf, dhcp_offset, mac, xid, ciaddr);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  let msg_len: i64 = netstack_dhcp_build_renew_request(mut ref wide, dhcp_offset, mac, xid, ciaddr);
+  let _ = dhcp_narrow_1024_into_512(ref wide, buf);
+  return msg_len;
 }
 
 fn dhcp_get_op_rpi4(buf: ref [u8; 512], dhcp_offset: i64) -> u32 {
-  return netstack_dhcp_get_op(buf, dhcp_offset);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  return netstack_dhcp_get_op(ref wide, dhcp_offset);
 }
 fn dhcp_get_xid_rpi4(buf: ref [u8; 512], dhcp_offset: i64) -> u32 {
-  return netstack_dhcp_get_xid(buf, dhcp_offset);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  return netstack_dhcp_get_xid(ref wide, dhcp_offset);
 }
 fn dhcp_get_yiaddr_rpi4(buf: ref [u8; 512], dhcp_offset: i64) -> u32 {
-  return netstack_dhcp_get_yiaddr(buf, dhcp_offset);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  return netstack_dhcp_get_yiaddr(ref wide, dhcp_offset);
 }
 fn dhcp_get_ciaddr_rpi4(buf: ref [u8; 512], dhcp_offset: i64) -> u32 {
-  return netstack_dhcp_get_ciaddr(buf, dhcp_offset);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  return netstack_dhcp_get_ciaddr(ref wide, dhcp_offset);
 }
 
 fn dhcp_verify_magic_cookie_rpi4(buf: ref [u8; 512], dhcp_offset: i64) -> i64 {
-  return netstack_dhcp_verify_magic_cookie(buf, dhcp_offset);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  return netstack_dhcp_verify_magic_cookie(ref wide, dhcp_offset);
 }
 
 fn dhcp_find_option_byte_rpi4(buf: ref [u8; 512], dhcp_offset: i64, dhcp_len: i64, want_code: u32) -> i64 {
-  return netstack_dhcp_find_option_byte(buf, dhcp_offset, dhcp_len, want_code);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  return netstack_dhcp_find_option_byte(ref wide, dhcp_offset, dhcp_len, want_code);
 }
 
 fn dhcp_find_option_u32_rpi4(buf: ref [u8; 512], dhcp_offset: i64, dhcp_len: i64, want_code: u32) -> u32 {
-  return netstack_dhcp_find_option_u32(buf, dhcp_offset, dhcp_len, want_code);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  return netstack_dhcp_find_option_u32(ref wide, dhcp_offset, dhcp_len, want_code);
 }
 
 fn dhcp_broadcast_mac_rpi4(out_mac: mut ref [u8; 6]) -> i64 {
@@ -3530,11 +3588,17 @@ fn dhcp_server_find_free_slot_rpi4() -> i64 {
 }
 
 fn dhcp_server_build_offer_ack_rpi4(buf: mut ref [u8; 512], dhcp_offset: i64, mac: ref [u8; 6], xid: u32, msg_type: u32, yiaddr: u32, server_ip: u32, lease_time: u32) -> i64 {
-  return netstack_dhcp_server_build_offer_ack(buf, dhcp_offset, mac, xid, msg_type, yiaddr, server_ip, lease_time);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  let msg_len: i64 = netstack_dhcp_server_build_offer_ack(mut ref wide, dhcp_offset, mac, xid, msg_type, yiaddr, server_ip, lease_time);
+  let _ = dhcp_narrow_1024_into_512(ref wide, buf);
+  return msg_len;
 }
 
 fn dhcp_server_build_nak_rpi4(buf: mut ref [u8; 512], dhcp_offset: i64, mac: ref [u8; 6], xid: u32, server_ip: u32) -> i64 {
-  return netstack_dhcp_server_build_nak(buf, dhcp_offset, mac, xid, server_ip);
+  let wide: [u8; 1024] = dhcp_widen_512_to_1024(buf);
+  let msg_len: i64 = netstack_dhcp_server_build_nak(mut ref wide, dhcp_offset, mac, xid, server_ip);
+  let _ = dhcp_narrow_1024_into_512(ref wide, buf);
+  return msg_len;
 }
 
 // Every server reply is broadcast -- this client (round 91) always
