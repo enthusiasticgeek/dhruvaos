@@ -65,6 +65,7 @@ ssh_client_phase_addr:          .word 0
 ssh_server_phase_addr:          .word 0
 ssh_exec_cmd_addr:              .word 0
 ssh_channel_data_buf_addr:      .word 0
+ssh_dst_mac_addr:               .word 0
 
 .section ".text"
 
@@ -131,3 +132,4 @@ SSH_SCRATCH_PAIR ssh_client_phase
 SSH_SCRATCH_PAIR ssh_server_phase
 SSH_SCRATCH_PAIR ssh_exec_cmd
 SSH_SCRATCH_PAIR ssh_channel_data_buf
+SSH_SCRATCH_PAIR ssh_dst_mac

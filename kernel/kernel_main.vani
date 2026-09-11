@@ -669,6 +669,8 @@ extern "C" fn ssh_exec_cmd_set(addr: mut ref i64) -> i64;
 extern "C" fn ssh_exec_cmd_get() -> mut ref i64;
 extern "C" fn ssh_channel_data_buf_set(addr: mut ref i64) -> i64;
 extern "C" fn ssh_channel_data_buf_get() -> mut ref i64;
+extern "C" fn ssh_dst_mac_set(addr: mut ref i64) -> i64;
+extern "C" fn ssh_dst_mac_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
@@ -12308,6 +12310,50 @@ fn dwc2_build_hid_set_protocol_setup(iface_num: u32, protocol: u32) -> i64 {
   return 0;
 }
 
+// Round 182 (task #182 real-interop investigation): CDC-ECM's own
+// class-specific SET_ETHERNET_PACKET_FILTER request (USB CDC120 spec
+// table 46/62) -- bmRequestType=0x21 (host-to-device, class,
+// interface, same shape as HID's SET_PROTOCOL above), bRequest=0x43,
+// wValue=filter bitmap, wIndex=iface_num, wLength=0. This driver never
+// sent it at all before this round; per spec a CDC-ECM device is not
+// REQUIRED to deliver any packets until it's sent at least once, so
+// this is a genuine, worthwhile spec-compliance fix (kept regardless
+// of the finding below, since it may matter on real hardware even
+// though it didn't on QEMU's own emulation). filter bitmap bit 2
+// (0x04) = PACKET_TYPE_DIRECTED (unicast addressed to us), bit 3
+// (0x08) = PACKET_TYPE_BROADCAST -- 0x0C requests both, matching what
+// every real Ethernet-over-USB driver needs at minimum.
+//
+// NOTE: sending this (with 0x0C, and separately tried with
+// PACKET_TYPE_PROMISCUOUS/0x01 added too) did NOT fix task #182's own
+// real finding: a genuine unicast frame addressed directly to Pi 1's
+// own MAC (a real SSH client's SYN, confirmed via a live packet
+// capture to have arrived at the virtual NIC) never reaches
+// dwc2_net_bulk_in's own successful path at all -- direct instrument-
+// ation of every single bulk-in transaction during a live test showed
+// ONLY DHCP's own broadcast traffic ever produces a non-NAK result;
+// zero unicast bytes were ever observed, with or without this filter
+// request. The root cause is deeper than this driver's own CDC-ECM
+// init sequence -- likely something in QEMU's own usb-net device
+// model that this investigation didn't have visibility into (reading
+// its own hw/usb/dev-network.c source directly, or testing against
+// real Pi 1B hardware instead of QEMU, are the two most promising next
+// steps -- see project memory for the full investigation).
+fn dwc2_build_cdc_set_ethernet_packet_filter_setup(iface_num: u32, filter_bitmap: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 0x21 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 0x43 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, filter_bitmap & (0xFF as u32));
+  let _ = buf_write_byte(dma, 3 as u32, (filter_bitmap >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 4 as u32, iface_num & (0xFF as u32));
+  let _ = buf_write_byte(dma, 5 as u32, (iface_num >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(dma, 6 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
+  return 0;
+}
+
+fn cdc_ecm_packet_filter_directed_broadcast() -> u32 { return 0x0C as u32; }
+
 // Round 56: GET_DESCRIPTOR(String, index=string_index), same shape as
 // dwc2_build_get_device_descriptor_setup but wValue's high byte is 3
 // (STRING) and low byte is the string index, with wIndex=langid.
@@ -12850,6 +12896,7 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
   let cur_iface_num: i64 = 0 - 1;
   let cur_iface_is_cdc_data_active: i64 = 0;
   let cdc_data_iface_target: i64 = 0 - 1;
+  let cdc_comm_iface_target: i64 = 0 - 1;
   let cdc_mac_string_index: u32 = 0 as u32;
   let found_cdc_control: i64 = 0;
   let found_net_bulk_eps: i64 = 0;
@@ -12909,6 +12956,7 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
             if (iclass == (0x02 as u32)) && (isubclass == (0x06 as u32)) {
               cur_iface_is_cdc_control = 1;
               found_cdc_control = 1;
+              cdc_comm_iface_target = cur_iface_num;
             }
             if (iclass == (0x0A as u32)) && (cur_iface_num == cdc_data_iface_target) && ((ialt as i64) == 1) {
               cur_iface_is_cdc_data_active = 1;
@@ -13168,6 +13216,23 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
     let iface_status: i64 = dwc2_control_no_data(devaddr, mps);
     if iface_status != 0 {
       let _ = uart_puts("USB: CDC-ECM SET_INTERFACE(data, alt=1) failed\n");
+    }
+    // Round 182 (task #182): without this, a real CDC-ECM device is
+    // not required to deliver ANY packets, and evidently QEMU's own
+    // usb-net emulation's default filter state let broadcast through
+    // (every prior real-network test only ever used DHCP's own
+    // broadcast OFFER) but silently dropped a real, directly-addressed
+    // unicast frame at the device level -- see dwc2_build_cdc_set_
+    // ethernet_packet_filter_setup's own header comment for the full
+    // finding. Targets the COMMUNICATION interface (cdc_comm_iface_
+    // target), not the data interface -- CDC-ECM class-specific
+    // requests go to the interface carrying the class descriptors,
+    // per USB CDC spec, confirmed distinct from cdc_data_iface_target
+    // above.
+    let _ = dwc2_build_cdc_set_ethernet_packet_filter_setup(cdc_comm_iface_target as u32, cdc_ecm_packet_filter_directed_broadcast());
+    let filter_status: i64 = dwc2_control_no_data(devaddr, mps);
+    if filter_status != 0 {
+      let _ = uart_puts("USB: CDC-ECM SET_ETHERNET_PACKET_FILTER failed\n");
     }
     if cdc_mac_string_index != (0 as u32) {
       let mac_str_buf: mut ref i64 = dhruva_alloc_bytes(32);
@@ -16928,6 +16993,24 @@ fn task_e() -> i64 {
     let _ = uart_puts("GC: left DharaFS critical section, eff_prio=");
     let _ = uart_put_hex32(current_eff_prio());
     let _ = uart_puts("\n");
+    // Round 182 investigation note: this project's own documented
+    // shared-netif-queue hazard (netif_queue_contention_self_test) was
+    // briefly suspected as the cause of a real external SSH client's
+    // SYN never being seen by `sshd`'s own accept loop -- a
+    // dhruva_prio_lock(2)/unlock(3) pair was added here to serialize
+    // this call against sshd's own netif_recv_frame calls, matching
+    // the DharaFS lock's own ceiling=2/base=3 convention just above.
+    // REVERTED: it didn't fix the real finding (the SYN never reaches
+    // dwc2_net_bulk_in at all, confirmed via direct instrumentation --
+    // a QEMU-usb-net-emulation-level issue, not a software queue race,
+    // see task #182's own memory for the full investigation), and it
+    // introduced a real regression of its own (task_e's priority boost
+    // during this call disrupted `sshtest`'s own un-slept, tightly-
+    // bounded loopback TCP handshake loop whenever real -netdev/usb-
+    // net was also attached). If the queue-contention hazard ever
+    // becomes the CONFIRMED cause of a real symptom, revisit this with
+    // more care around self-test timing sensitivity, not a blanket
+    // lock reintroduction.
     let _ = dhcp_client_poll(dhcp_my_mac);
   }
   return 0;
@@ -19494,6 +19577,15 @@ fn shell_dispatch() -> i64 {
   // header comment for the negative-return-code -> failing-step map.
   if shell_word_matches(line_buf, 0, cmd_end, "sshtest") == 1 {
     return ssh_shell_test_cmd();
+  }
+
+  // Round 182: real external SSH server -- listens on Pi 1's real
+  // DHCP-assigned IP, port 22, waits (with real wall-clock patience)
+  // for a genuine external `ssh` client (e.g. via QEMU hostfwd), and
+  // drives sshtest's own proven protocol math against that client's
+  // real, unpredictable bytes instead of a synthetic self-test peer.
+  if shell_word_matches(line_buf, 0, cmd_end, "sshd") == 1 {
+    return ssh_real_server_cmd();
   }
 
   // Round 108: HTTPS -- the `http` kosh package's own request/response
@@ -25842,6 +25934,560 @@ fn ssh_shell_test_cmd() -> i64 {
   return 0;
 }
 
+// --- Real external SSH server (task #182): a genuine listener over
+// Pi 1's real DHCP-assigned IP/port 22, driving the SAME proven
+// protocol math against an actual external OpenSSH client's
+// unpredictable bytes (real ephemeral X25519 key, real client
+// identity key, real implementation quirks) instead of the self-
+// test's synthetic both-roles-in-one-process pattern above. Real
+// network round trips take real, unpredictable wall-clock time (task
+// scheduling, QEMU slirp NAT, the external ssh process's own timing)
+// -- every wait loop below polls up to 200 times with a real
+// task_sleep_ticks(1) yield (~1800 ticks at 2/sec if every attempt
+// misses, ~15 minutes of real headroom) between empty attempts,
+// nothing like the self-test's own tiny "iter<20, no sleep" loops
+// which only ever needed to observe a same-process, synchronous
+// delivery.
+//
+// Unlike the self-test, this real client's own MAC is NOT known in
+// advance -- QEMU's slirp NAT presents every hostfwd'd connection as
+// if from its own gateway (confirmed via the DHCP OFFER's own capture
+// in task #181: src_mac 52:55:0a:00:02:02), learned here the same way
+// dhcp_client_poll's own ACK-handling branch learns the DHCP server's
+// MAC for free from a real received frame, rather than a live ARP
+// round trip this scope doesn't need.
+//
+// Reuses ssh_scratch.S's own "server" fields (server_rx_buf/_len,
+// server_seq_out/_in) for this real connection's own state -- the
+// self-test and a real listener never run concurrently in this
+// single-threaded-per-shell-command model, so no new scratch is
+// needed.
+
+// Round 182 investigation: a real external SSH client's SYN never
+// reaches this loop at all (confirmed via direct instrumentation of
+// the underlying USB bulk-IN transaction -- only DHCP's own broadcast
+// traffic ever produces a non-NAK result; zero unicast bytes were
+// ever observed here). This project's own documented shared-netif-
+// queue hazard (netif_queue_contention_self_test) was investigated as
+// a possible cause and ruled out -- a dhruva_prio_lock(2)/unlock(3)
+// pair around every netif_recv_frame call here was tried and reverted
+// (it didn't fix the real symptom, and introduced its own regression:
+// task_e's priority boost during its own locked dhcp_client_poll call
+// disrupted `sshtest`'s own un-slept, tightly-bounded loopback TCP
+// handshake loop whenever real -netdev/usb-net was also attached).
+// The real blocker is upstream of this driver entirely -- likely
+// something in QEMU's own usb-net device model -- see task #182's own
+// memory for the full investigation and suggested next steps.
+fn ssh_real_accept(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
+  let leased_ip: u32 = dhcp_state_get_leased_ip();
+  let _ = tcp_conn_passive_open(conn_id, leased_ip, 22 as u32);
+  let iter: i64 = 0;
+  while (iter < 200) && (tcp_conn_get_state(conn_id) != tcp_state_established()) {
+    let frame: mut ref i64 = ssh_frame_scratch_get();
+    let flen: i64 = netif_recv_frame(frame, 1514);
+    if flen > 0 {
+      let is_relevant: i64 = 0;
+      if buf_read_u16_be(frame, 12) == (0x0800 as u32) {
+        if ipv4_get_protocol(frame, 14) == (6 as u32) {
+          if tcp_get_dst_port(frame, 34) == (22 as u32) {
+            is_relevant = 1;
+          }
+        }
+      }
+      if is_relevant == 1 {
+        let mi: i64 = 0;
+        while mi < 6 {
+          let mb: u32 = buf_read_byte(frame, (6 + mi) as u32);
+          let _ = buf_write_byte(dst_mac, mi as u32, mb);
+          mi = mi + 1;
+        }
+        let discard: mut ref i64 = ssh_recv_chunk_scratch_get();
+        let _ = tcp_conn_handle_segment(conn_id, frame, flen, my_mac, dst_mac, discard, 64);
+      }
+    } else {
+      let _ = task_sleep_ticks(4);
+    }
+    iter = iter + 1;
+  }
+  if tcp_conn_get_state(conn_id) != tcp_state_established() {
+    return 0 - 1;
+  }
+  return 0;
+}
+
+fn ssh_real_deliver_one_frame(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, out_payload: mut ref i64, max_len: i64) -> i64 {
+  let frame: mut ref i64 = ssh_frame_scratch_get();
+  let flen: i64 = netif_recv_frame(frame, 1514);
+  if flen <= 0 {
+    return 0 - 1;
+  }
+  return tcp_conn_handle_segment(conn_id, frame, flen, my_mac, dst_mac, out_payload, max_len);
+}
+
+fn ssh_real_send_over_tcp(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, data: mut ref i64, data_len: i64) -> i64 {
+  let chunk_buf: mut ref i64 = ssh_chunk_scratch_get();
+  let sent: i64 = 0;
+  while sent < data_len {
+    let remaining: i64 = data_len - sent;
+    let take: i64 = if remaining < 64 { remaining } else { 64 };
+    let _ = ssh_copy(chunk_buf, 0, data, sent, take);
+    let _ = tcp_conn_send_data(conn_id, my_mac, dst_mac, chunk_buf, take);
+    sent = sent + take;
+  }
+  return sent;
+}
+
+fn ssh_real_wait_extract_raw(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, out_payload: mut ref i64) -> i64 {
+  let iter: i64 = 0;
+  let r: i64 = 0 - 1;
+  while (iter < 200) && (r < 0) {
+    r = ssh_rx_try_extract_raw(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), out_payload);
+    if r < 0 {
+      let recv_scratch: mut ref i64 = ssh_recv_chunk_scratch_get();
+      let recv_len: i64 = ssh_real_deliver_one_frame(conn_id, my_mac, dst_mac, recv_scratch, 64);
+      if recv_len > 0 {
+        let _ = ssh_rx_feed(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), recv_scratch, recv_len);
+      } else {
+        let _ = task_sleep_ticks(4);
+      }
+    }
+    iter = iter + 1;
+  }
+  return r;
+}
+
+fn ssh_real_wait_extract_enc(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, main_key32: ref [u8; 32], header_key32: ref [u8; 32], seqnr: u32, out_payload: mut ref i64) -> i64 {
+  let iter: i64 = 0;
+  let r: i64 = 0 - 1;
+  while (iter < 200) && (r < 0) {
+    r = ssh_rx_try_extract_enc(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), main_key32, header_key32, seqnr, out_payload);
+    if r < 0 {
+      let recv_scratch: mut ref i64 = ssh_recv_chunk_scratch_get();
+      let recv_len: i64 = ssh_real_deliver_one_frame(conn_id, my_mac, dst_mac, recv_scratch, 64);
+      if recv_len > 0 {
+        let _ = ssh_rx_feed(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), recv_scratch, recv_len);
+      } else {
+        let _ = task_sleep_ticks(4);
+      }
+    }
+    iter = iter + 1;
+  }
+  return r;
+}
+
+// Server-only halves of the self-test's phase1/2a/2b/3a/3b/4 above,
+// adapted to wait for a REAL, unpredictable external client's bytes
+// (real ephemeral X25519 key, real client identity key) instead of a
+// synthetic peer this same process also drives. Split into the same
+// phase boundaries for the same reason (the build-time #[bounded_
+// stack] gate) -- see ssh_test_phase1_kexinit's own header comment.
+fn ssh_real_phase1_version_kexinit(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
+  let _ = buf_write_u32(ssh_server_seq_out_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(ssh_server_seq_in_get(), 0 as u32, 0 as u32);
+  let _ = buf_write_u32(ssh_server_rx_len_get(), 0 as u32, 0 as u32);
+
+  let host_priv: mut ref i64 = ssh_host_priv_get();
+  let _ = write_hex_string(host_priv, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", 32);
+  let host_pub: mut ref i64 = ssh_host_pub_get();
+  let _ = ed25519_secret_to_public_heap(host_priv, host_pub);
+
+  let server_x_priv: mut ref i64 = ssh_server_x25519_priv_get();
+  let _ = write_hex_string(server_x_priv, "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f", 32);
+  let cookie16: mut ref i64 = ssh_cookie16_get();
+  let _ = write_hex_string(cookie16, "808182838485868788898a8b8c8d8e8f", 16);
+
+  let basepoint: mut ref i64 = tls_basepoint_get();
+  let _ = tls_x25519_basepoint_heap(basepoint);
+  let server_x_pub: mut ref i64 = ssh_server_x25519_pub_get();
+  let _ = x25519_scalarmult_heap(server_x_priv, basepoint, server_x_pub);
+
+  let v_s: mut ref i64 = ssh_v_s_get();
+  let _ = str_copy_to_buf("SSH-2.0-DhruvaOS_1.0", v_s);
+  let v_s_len: i64 = str_len_bytes("SSH-2.0-DhruvaOS_1.0");
+  let _ = buf_write_u32(ssh_v_s_len_get(), 0 as u32, v_s_len as u32);
+
+  let crlf_buf: mut ref i64 = ssh_payload_buf_get();
+  let _ = ssh_copy(crlf_buf, 0, v_s, 0, v_s_len);
+  let _ = buf_write_byte(crlf_buf, v_s_len as u32, 13 as u32);
+  let _ = buf_write_byte(crlf_buf, (v_s_len + 1) as u32, 10 as u32);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, crlf_buf, v_s_len + 2);
+
+  let recv_v_c: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_v_c_len: i64 = 0 - 1;
+  let vc_iter: i64 = 0;
+  while (vc_iter < 200) && (recv_v_c_len < 0) {
+    recv_v_c_len = ssh_extract_version_line(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), recv_v_c);
+    if recv_v_c_len < 0 {
+      let recv_scratch: mut ref i64 = ssh_recv_chunk_scratch_get();
+      let recv_len: i64 = ssh_real_deliver_one_frame(conn_id, my_mac, dst_mac, recv_scratch, 64);
+      if recv_len > 0 {
+        let _ = ssh_rx_feed(ssh_server_rx_buf_get(), ssh_server_rx_len_get(), recv_scratch, recv_len);
+      } else {
+        let _ = task_sleep_ticks(4);
+      }
+    }
+    vc_iter = vc_iter + 1;
+  }
+  if recv_v_c_len < 0 { return 0 - 1; }
+  let v_c: mut ref i64 = ssh_v_c_get();
+  let _ = ssh_copy(v_c, 0, recv_v_c, 0, recv_v_c_len);
+  let _ = buf_write_u32(ssh_v_c_len_get(), 0 as u32, recv_v_c_len as u32);
+
+  let server_kexinit: mut ref i64 = ssh_server_kexinit_get();
+  let server_kexinit_len: i64 = ssh_build_kexinit(server_kexinit, cookie16);
+  let _ = buf_write_u32(ssh_server_kexinit_len_get(), 0 as u32, server_kexinit_len as u32);
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+  let raw_len: i64 = ssh_build_raw_packet(server_kexinit, server_kexinit_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, raw_len);
+  let _ = ssh_seq_take(ssh_server_seq_out_get());
+
+  let recv_kexinit: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_kexinit_len: i64 = ssh_real_wait_extract_raw(conn_id, my_mac, dst_mac, recv_kexinit);
+  if recv_kexinit_len < 0 { return 0 - 2; }
+  if buf_read_byte(recv_kexinit, 0 as u32) != (20 as u32) { return 0 - 3; }
+  let _ = ssh_seq_take(ssh_server_seq_in_get());
+  let client_kexinit: mut ref i64 = ssh_client_kexinit_get();
+  let _ = ssh_copy(client_kexinit, 0, recv_kexinit, 0, recv_kexinit_len);
+  let _ = buf_write_u32(ssh_client_kexinit_len_get(), 0 as u32, recv_kexinit_len as u32);
+
+  return 0;
+}
+
+fn ssh_real_phase2a_ecdh_and_reply(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
+  let host_priv: mut ref i64 = ssh_host_priv_get();
+  let host_pub: mut ref i64 = ssh_host_pub_get();
+  let server_x_priv: mut ref i64 = ssh_server_x25519_priv_get();
+  let server_x_pub: mut ref i64 = ssh_server_x25519_pub_get();
+  let client_x_pub: mut ref i64 = ssh_client_x25519_pub_get();
+  let v_c: mut ref i64 = ssh_v_c_get();
+  let v_s: mut ref i64 = ssh_v_s_get();
+  let v_c_len: i64 = buf_read_u32(ssh_v_c_len_get(), 0 as u32) as i64;
+  let v_s_len: i64 = buf_read_u32(ssh_v_s_len_get(), 0 as u32) as i64;
+  let client_kexinit: mut ref i64 = ssh_client_kexinit_get();
+  let server_kexinit: mut ref i64 = ssh_server_kexinit_get();
+  let client_kexinit_len: i64 = buf_read_u32(ssh_client_kexinit_len_get(), 0 as u32) as i64;
+  let server_kexinit_len: i64 = buf_read_u32(ssh_server_kexinit_len_get(), 0 as u32) as i64;
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+
+  let recv_ecdh_init: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_ecdh_init_len: i64 = ssh_real_wait_extract_raw(conn_id, my_mac, dst_mac, recv_ecdh_init);
+  if recv_ecdh_init_len < 0 { return 0 - 1; }
+  if buf_read_byte(recv_ecdh_init, 0 as u32) != (30 as u32) { return 0 - 2; }
+  let _ = ssh_seq_take(ssh_server_seq_in_get());
+  let _ = ssh_copy(client_x_pub, 0, recv_ecdh_init, 5, 32);
+
+  let shared_secret: mut ref i64 = ssh_shared_secret_get();
+  let _ = x25519_scalarmult_heap(server_x_priv, client_x_pub, shared_secret);
+
+  let hostkey_blob: mut ref i64 = ssh_hostkey_blob_get();
+  let host_pub_arr: [u8; 32] = ssh_load32(host_pub);
+  let hostkey_blob_len: i64 = ssh_build_ed25519_hostkey_blob(ref host_pub_arr, hostkey_blob);
+  let exchange_hash: mut ref i64 = ssh_exchange_hash_get();
+  let _ = ssh_kex_hash(v_c, v_c_len, v_s, v_s_len, client_kexinit, client_kexinit_len, server_kexinit, server_kexinit_len, hostkey_blob, hostkey_blob_len, client_x_pub, server_x_pub, shared_secret, exchange_hash);
+  let session_id: mut ref i64 = ssh_session_id_get();
+  let _ = ssh_copy(session_id, 0, exchange_hash, 0, 32);
+
+  let sig_heap: mut ref i64 = ssh_payload_buf2_get();
+  let _ = ed25519_sign_heap(host_priv, exchange_hash, 32, sig_heap);
+  let sig_arr: [u8; 64] = ssh_load64(sig_heap);
+  let sigblob: mut ref i64 = ssh_sigblob_get();
+  let sigblob_len: i64 = ssh_build_ed25519_sigblob(ref sig_arr, sigblob);
+
+  let ecdh_reply_payload: mut ref i64 = ssh_payload_buf_get();
+  let server_x_pub_arr: [u8; 32] = ssh_load32(server_x_pub);
+  let ecdh_reply_len: i64 = ssh_build_ecdh_reply(hostkey_blob, hostkey_blob_len, ref server_x_pub_arr, sigblob, sigblob_len, ecdh_reply_payload);
+  let raw_len: i64 = ssh_build_raw_packet(ecdh_reply_payload, ecdh_reply_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, raw_len);
+  let _ = ssh_seq_take(ssh_server_seq_out_get());
+
+  let newkeys_payload: mut ref i64 = ssh_payload_buf_get();
+  let newkeys_len: i64 = ssh_build_newkeys(newkeys_payload);
+  raw_len = ssh_build_raw_packet(newkeys_payload, newkeys_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, raw_len);
+  let _ = ssh_seq_take(ssh_server_seq_out_get());
+
+  return 0;
+}
+
+fn ssh_real_phase2b_newkeys_and_derive(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
+  let shared_secret: mut ref i64 = ssh_shared_secret_get();
+  let exchange_hash: mut ref i64 = ssh_exchange_hash_get();
+  let session_id: mut ref i64 = ssh_session_id_get();
+
+  let recv_newkeys: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_newkeys_len: i64 = ssh_real_wait_extract_raw(conn_id, my_mac, dst_mac, recv_newkeys);
+  if recv_newkeys_len < 0 { return 0 - 1; }
+  if buf_read_byte(recv_newkeys, 0 as u32) != (21 as u32) { return 0 - 2; }
+  let _ = ssh_seq_take(ssh_server_seq_in_get());
+
+  let c2s_key64: mut ref i64 = ssh_c2s_key64_get();
+  let _ = ssh_derive_key(shared_secret, exchange_hash, 67 as u32, session_id, c2s_key64, 64);
+  let s2c_key64: mut ref i64 = ssh_s2c_key64_get();
+  let _ = ssh_derive_key(shared_secret, exchange_hash, 68 as u32, session_id, s2c_key64, 64);
+
+  return 0;
+}
+
+fn ssh_real_phase3a_service_and_query(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
+  let c2s_key64: mut ref i64 = ssh_c2s_key64_get();
+  let s2c_key64: mut ref i64 = ssh_s2c_key64_get();
+  let c2s_main: [u8; 32] = ssh_load32(c2s_key64);
+  let c2s_header: [u8; 32] = ssh_load32_off(c2s_key64, 32);
+  let s2c_main: [u8; 32] = ssh_load32(s2c_key64);
+  let s2c_header: [u8; 32] = ssh_load32_off(s2c_key64, 32);
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+
+  let in_seq1: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_svc_req: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_svc_req_len: i64 = ssh_real_wait_extract_enc(conn_id, my_mac, dst_mac, ref c2s_main, ref c2s_header, in_seq1, recv_svc_req);
+  if recv_svc_req_len < 0 { return 0 - 1; }
+  if buf_read_byte(recv_svc_req, 0 as u32) != (5 as u32) { return 0 - 2; }
+
+  let svc_name_len: i64 = ssh_read_u32(recv_svc_req, 1) as i64;
+  let svc_name_buf: mut ref i64 = ssh_hostkey_blob_get();
+  let _ = ssh_copy(svc_name_buf, 0, recv_svc_req, 5, svc_name_len);
+  let svc_accept_payload: mut ref i64 = ssh_payload_buf_get();
+  let svc_accept_len: i64 = ssh_build_service_accept(svc_name_buf, svc_name_len, svc_accept_payload);
+  let out_seq2: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len2: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq2, svc_accept_payload, svc_accept_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len2);
+
+  let in_seq2: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_query: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_query_len: i64 = ssh_real_wait_extract_enc(conn_id, my_mac, dst_mac, ref c2s_main, ref c2s_header, in_seq2, recv_query);
+  if recv_query_len < 0 { return 0 - 3; }
+  let query_fields: SshUserauthPubkeyRequest = ssh_parse_userauth_pubkey_request(recv_query, recv_query_len);
+  if query_fields.ok != 1 { return 0 - 4; }
+  if query_fields.has_sig != 0 { return 0 - 5; }
+
+  let pk_ok_alg_buf: mut ref i64 = ssh_hostkey_blob_get();
+  let _ = ssh_copy(pk_ok_alg_buf, 0, recv_query, query_fields.alg_off, query_fields.alg_len);
+  let pk_ok_keyblob_buf: mut ref i64 = ssh_sigblob_get();
+  let _ = ssh_copy(pk_ok_keyblob_buf, 0, recv_query, query_fields.keyblob_off, query_fields.keyblob_len);
+  let pk_ok_payload: mut ref i64 = ssh_payload_buf_get();
+  let pk_ok_len: i64 = ssh_build_userauth_pk_ok(pk_ok_alg_buf, query_fields.alg_len, pk_ok_keyblob_buf, query_fields.keyblob_len, pk_ok_payload);
+  let out_seq3: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len3: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq3, pk_ok_payload, pk_ok_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len3);
+
+  return 0;
+}
+
+fn ssh_real_phase3b_verify_signed(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
+  let c2s_key64: mut ref i64 = ssh_c2s_key64_get();
+  let s2c_key64: mut ref i64 = ssh_s2c_key64_get();
+  let c2s_main: [u8; 32] = ssh_load32(c2s_key64);
+  let c2s_header: [u8; 32] = ssh_load32_off(c2s_key64, 32);
+  let s2c_main: [u8; 32] = ssh_load32(s2c_key64);
+  let s2c_header: [u8; 32] = ssh_load32_off(s2c_key64, 32);
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+  let session_id: mut ref i64 = ssh_session_id_get();
+
+  let in_seq3: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_signed: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_signed_len: i64 = ssh_real_wait_extract_enc(conn_id, my_mac, dst_mac, ref c2s_main, ref c2s_header, in_seq3, recv_signed);
+  if recv_signed_len < 0 { return 0 - 1; }
+  let signed_fields: SshUserauthPubkeyRequest = ssh_parse_userauth_pubkey_request(recv_signed, recv_signed_len);
+  if signed_fields.ok != 1 { return 0 - 2; }
+  if signed_fields.has_sig != 1 { return 0 - 3; }
+
+  let server_signed_data: mut ref i64 = ssh_userauth_signed_data_get();
+  let server_signed_data_len: i64 = ssh_build_userauth_signed_data(session_id, recv_signed, signed_fields.signed_data_end_off, server_signed_data);
+  let recv_client_keyblob: mut ref i64 = ssh_hostkey_blob_get();
+  let _ = ssh_copy(recv_client_keyblob, 0, recv_signed, signed_fields.keyblob_off, signed_fields.keyblob_len);
+  let recv_keyblob_field: SshEd25519Blob = ssh_parse_ed25519_blob(recv_client_keyblob);
+  let recv_client_pub: mut ref i64 = ssh_sigblob_get();
+  let _ = ssh_copy(recv_client_pub, 0, recv_client_keyblob, recv_keyblob_field.value_off, 32);
+  let recv_sig_blob2: mut ref i64 = ssh_client_sigblob_get();
+  let _ = ssh_copy(recv_sig_blob2, 0, recv_signed, signed_fields.sig_off, signed_fields.sig_len);
+  let recv_sig_field2: SshEd25519Blob = ssh_parse_ed25519_blob(recv_sig_blob2);
+  let recv_client_sig: mut ref i64 = ssh_payload_buf2_get();
+  let _ = ssh_copy(recv_client_sig, 0, recv_sig_blob2, recv_sig_field2.value_off, 64);
+
+  let auth_sig_ok: i64 = ed25519_verify_heap(recv_client_pub, server_signed_data, server_signed_data_len, recv_client_sig);
+  let userauth_ok_payload: mut ref i64 = ssh_payload_buf_get();
+  let userauth_reply_len: i64 = 0;
+  if auth_sig_ok == 1 {
+    userauth_reply_len = ssh_build_userauth_success(userauth_ok_payload);
+  } else {
+    userauth_reply_len = ssh_build_userauth_failure(userauth_ok_payload);
+  }
+  let out_seq4: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len4: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq4, userauth_ok_payload, userauth_reply_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len4);
+  if auth_sig_ok != 1 { return 0 - 4; }
+
+  return 0;
+}
+
+fn ssh_real_phase4_channel(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
+  let c2s_key64: mut ref i64 = ssh_c2s_key64_get();
+  let s2c_key64: mut ref i64 = ssh_s2c_key64_get();
+  let c2s_main: [u8; 32] = ssh_load32(c2s_key64);
+  let c2s_header: [u8; 32] = ssh_load32_off(c2s_key64, 32);
+  let s2c_main: [u8; 32] = ssh_load32(s2c_key64);
+  let s2c_header: [u8; 32] = ssh_load32_off(s2c_key64, 32);
+  let packet_buf: mut ref i64 = ssh_packet_buf_get();
+
+  let in_seq5: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_chan_open: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_chan_open_len: i64 = ssh_real_wait_extract_enc(conn_id, my_mac, dst_mac, ref c2s_main, ref c2s_header, in_seq5, recv_chan_open);
+  if recv_chan_open_len < 0 { return 0 - 1; }
+  let chan_open_fields: SshChannelOpen = ssh_parse_channel_open(recv_chan_open);
+
+  let server_local_chan: u32 = 0 as u32;
+  let chan_confirm_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_confirm_len: i64 = ssh_build_channel_open_confirmation(chan_open_fields.peer_chan, server_local_chan, 65536 as u32, 32768 as u32, chan_confirm_payload);
+  let out_seq6: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len6: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq6, chan_confirm_payload, chan_confirm_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len6);
+
+  let in_seq6: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_chan_req: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_chan_req_len: i64 = ssh_real_wait_extract_enc(conn_id, my_mac, dst_mac, ref c2s_main, ref c2s_header, in_seq6, recv_chan_req);
+  if recv_chan_req_len < 0 { return 0 - 2; }
+  let chan_req_fields: SshChannelRequest = ssh_parse_channel_request(recv_chan_req);
+  let expect_exec: [u8; 4] = [101 as u8, 120 as u8, 101 as u8, 99 as u8];
+  let is_exec: i64 = 1;
+  let ci: i64 = 0;
+  while ci < 4 {
+    if buf_read_byte(recv_chan_req, (chan_req_fields.type_off + ci) as u32) != (expect_exec[ci] as u32) { is_exec = 0; }
+    ci = ci + 1;
+  }
+
+  if is_exec != 1 {
+    let chan_fail_payload: mut ref i64 = ssh_payload_buf_get();
+    let chan_fail_len: i64 = ssh_build_channel_simple(100 as u32, chan_open_fields.peer_chan, chan_fail_payload);
+    let out_seq_fail: u32 = ssh_seq_take(ssh_server_seq_out_get());
+    let enc_len_fail: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq_fail, chan_fail_payload, chan_fail_len, packet_buf);
+    let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len_fail);
+    return 0 - 3;
+  }
+
+  let chan_success_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_success_len: i64 = ssh_build_channel_simple(99 as u32, chan_open_fields.peer_chan, chan_success_payload);
+  let out_seq7: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len7: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq7, chan_success_payload, chan_success_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len7);
+
+  let channel_reply: mut ref i64 = ssh_channel_data_buf_get();
+  let _ = str_copy_to_buf("hello from a REAL dhruvaos ssh server\n", channel_reply);
+  let channel_reply_len: i64 = str_len_bytes("hello from a REAL dhruvaos ssh server\n");
+  let chan_data_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_data_len: i64 = ssh_build_channel_data(chan_open_fields.peer_chan, channel_reply, 0, channel_reply_len, chan_data_payload);
+  let out_seq8: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len8: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq8, chan_data_payload, chan_data_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len8);
+
+  let chan_eof_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_eof_len: i64 = ssh_build_channel_simple(96 as u32, chan_open_fields.peer_chan, chan_eof_payload);
+  let out_seq9: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len9: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq9, chan_eof_payload, chan_eof_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len9);
+
+  let chan_close_payload: mut ref i64 = ssh_payload_buf_get();
+  let chan_close_len: i64 = ssh_build_channel_simple(97 as u32, chan_open_fields.peer_chan, chan_close_payload);
+  let out_seq10: u32 = ssh_seq_take(ssh_server_seq_out_get());
+  let enc_len10: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq10, chan_close_payload, chan_close_len, packet_buf);
+  let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len10);
+
+  let in_seq7: u32 = ssh_seq_take(ssh_server_seq_in_get());
+  let recv_close: mut ref i64 = ssh_decrypted_scratch_get();
+  let recv_close_len: i64 = ssh_real_wait_extract_enc(conn_id, my_mac, dst_mac, ref c2s_main, ref c2s_header, in_seq7, recv_close);
+  if recv_close_len < 0 { return 0 - 4; }
+
+  return 0;
+}
+
+// Orchestrator: accepts one real connection, drives it through the
+// full protocol, closes. `conn_id` reuses `sshtest`'s own "server"
+// slot 1 -- only 2 TCP connection slots exist project-wide
+// (boot/tcp_state.S), and `sshtest`/`sshd` are never run concurrently
+// in this single-shell-command-at-a-time model.
+fn ssh_real_server_session(conn_id: u32, my_mac: mut ref i64) -> i64 {
+  let dst_mac: mut ref i64 = ssh_dst_mac_get();
+  let accept_status: i64 = ssh_real_accept(conn_id, my_mac, dst_mac);
+  if accept_status != 0 {
+    let _ = uart_puts("sshd: no real TCP connection accepted (timed out)\n");
+    return 0 - 1;
+  }
+  let _ = uart_puts("sshd: real TCP connection established, starting SSH handshake\n");
+
+  let r1: i64 = ssh_real_phase1_version_kexinit(conn_id, my_mac, dst_mac);
+  if r1 != 0 {
+    let _ = uart_puts("sshd: phase1 (version/kexinit) failed, code=");
+    let _ = uart_put_i64(r1);
+    let _ = uart_puts("\n");
+    return r1;
+  }
+
+  let r2a: i64 = ssh_real_phase2a_ecdh_and_reply(conn_id, my_mac, dst_mac);
+  if r2a != 0 {
+    let _ = uart_puts("sshd: phase2a (ecdh) failed, code=");
+    let _ = uart_put_i64(r2a);
+    let _ = uart_puts("\n");
+    return r2a;
+  }
+
+  let r2b: i64 = ssh_real_phase2b_newkeys_and_derive(conn_id, my_mac, dst_mac);
+  if r2b != 0 {
+    let _ = uart_puts("sshd: phase2b (newkeys) failed, code=");
+    let _ = uart_put_i64(r2b);
+    let _ = uart_puts("\n");
+    return r2b;
+  }
+
+  let r3a: i64 = ssh_real_phase3a_service_and_query(conn_id, my_mac, dst_mac);
+  if r3a != 0 {
+    let _ = uart_puts("sshd: phase3a (service/query) failed, code=");
+    let _ = uart_put_i64(r3a);
+    let _ = uart_puts("\n");
+    return r3a;
+  }
+
+  let r3b: i64 = ssh_real_phase3b_verify_signed(conn_id, my_mac, dst_mac);
+  if r3b != 0 {
+    let _ = uart_puts("sshd: phase3b (verify) failed, code=");
+    let _ = uart_put_i64(r3b);
+    let _ = uart_puts("\n");
+    return r3b;
+  }
+
+  let r4: i64 = ssh_real_phase4_channel(conn_id, my_mac, dst_mac);
+  if r4 != 0 {
+    let _ = uart_puts("sshd: phase4 (channel) failed, code=");
+    let _ = uart_put_i64(r4);
+    let _ = uart_puts("\n");
+    return r4;
+  }
+
+  let _ = uart_puts("sshd: full real SSH session completed OK\n");
+  return 0;
+}
+
+fn ssh_real_server_cmd() -> i64 {
+  let my_mac: mut ref i64 = shell_my_mac_scratch_get();
+  let _ = netif_get_mac(my_mac);
+  let conn_id: u32 = 1 as u32;
+  let result: i64 = ssh_real_server_session(conn_id, my_mac);
+
+  let _ = tcp_conn_close(conn_id, my_mac, ssh_dst_mac_get());
+  let close_iter: i64 = 0;
+  while (close_iter < 50) && (tcp_conn_get_state(conn_id) != tcp_state_closed_final()) {
+    let frame: mut ref i64 = ssh_frame_scratch_get();
+    let flen: i64 = netif_recv_frame(frame, 1514);
+    if flen > 0 {
+      let discard: mut ref i64 = ssh_recv_chunk_scratch_get();
+      let _ = tcp_conn_handle_segment(conn_id, frame, flen, my_mac, ssh_dst_mac_get(), discard, 64);
+    } else {
+      let _ = task_sleep_ticks(4);
+    }
+    close_iter = close_iter + 1;
+  }
+
+  return result;
+}
+
 fn pki_self_test() -> i64 {
   let ok: i64 = 1;
   let _ = pki_init();
@@ -27392,6 +28038,7 @@ fn kernel_main() -> i64 {
   let _ = ssh_server_phase_set(dhruva_alloc_bytes(4));
   let _ = ssh_exec_cmd_set(dhruva_alloc_bytes(64));
   let _ = ssh_channel_data_buf_set(dhruva_alloc_bytes(512));
+  let _ = ssh_dst_mac_set(dhruva_alloc_bytes(6));
   let _ = poly1305_block_scratch_set(dhruva_alloc_bytes(16));
   let _ = shell_line_scratch_set(dhruva_alloc_bytes(128));
   let _ = eval_values_scratch_set(dhruva_alloc_bytes(128));
