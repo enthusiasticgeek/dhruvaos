@@ -6897,12 +6897,12 @@ use "../vendor/mqtt/src/lib.vani";
 
 fn filter_config_from_state() -> FilterConfig {
   let count: u32 = fw_get_rule_count();
-  let proto: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let src_ip: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let src_ip_valid: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let dst_port: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let dst_port_valid: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let action: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let proto: [u32; 8] = [0 as u32; 8];
+  let src_ip: [u32; 8] = [0 as u32; 8];
+  let src_ip_valid: [u32; 8] = [0 as u32; 8];
+  let dst_port: [u32; 8] = [0 as u32; 8];
+  let dst_port_valid: [u32; 8] = [0 as u32; 8];
+  let action: [u32; 8] = [0 as u32; 8];
   let i: u32 = 0 as u32;
   while i < count {
     proto[i] = fw_get_rule_proto(i);
@@ -7491,7 +7491,7 @@ fn arp_get_target_ip(frame: mut ref i64) -> u32 {
 
 fn arp_get_sender_mac(frame: mut ref i64, out_mac: mut ref i64) -> i64 {
   let local: [u8; 512] = arp_copy_frame_to_local(frame);
-  let mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let mac: [u8; 6] = [0 as u8; 6];
   let _ = netstack_arp_get_sender_mac(ref local, mut ref mac);
   let i: i64 = 0;
   while i < 6 {
@@ -7509,13 +7509,8 @@ fn arp_cache_init() -> i64 {
 
 fn arp_cache_from_state() -> ArpCache {
   let count: u32 = arp_cache_get_count();
-  let ip: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let mac_bytes: [u8; 48] = [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  let ip: [u32; 8] = [0 as u32; 8];
+  let mac_bytes: [u8; 48] = [0 as u8; 48];
   let macs: mut ref i64 = arp_cache_get_macs_buf();
   let i: u32 = 0 as u32;
   while i < count {
@@ -11007,14 +11002,11 @@ fn dhcp_server_init(server_ip: u32, pool_base_ip: u32, pool_size: u32, lease_tim
 }
 
 fn dhcp_lease_table_from_state() -> DhcpLeaseTable {
-  let state: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let ip: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let xid: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let start_tick: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let mac_bytes: [u8; 24] = [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  let state: [u32; 4] = [0 as u32; 4];
+  let ip: [u32; 4] = [0 as u32; 4];
+  let xid: [u32; 4] = [0 as u32; 4];
+  let start_tick: [u32; 4] = [0 as u32; 4];
+  let mac_bytes: [u8; 24] = [0 as u8; 24];
   let i: u32 = 0 as u32;
   while i < (4 as u32) {
     state[i as i64] = dhcp_server_get_lease_state(i);

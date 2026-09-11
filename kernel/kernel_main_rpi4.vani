@@ -810,51 +810,7 @@ fn netif_get_mtu_rpi4() -> i64 {
 // exists at all (vani has no array-repeat literal, so this is the
 // one and only place a 512-byte zero literal is hand-enumerated).
 fn netif_zero_frame_rpi4() -> [u8; 512] {
-  return [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  return [0 as u8; 512];
 }
 
 // Loopback's own placeholder MAC -- a locally-administered address
@@ -917,20 +873,10 @@ fn netif_recv_frame_rpi4(out: mut ref [u8; 512], max_len: i64) -> i64 {
     let _ = netif_state_recv_advance();
     return 0 - 1;
   }
-  // Round 88: read into a local, owned array first rather than `out`
-  // directly -- vani has no reborrow from `mut ref T` to `ref T` (a
-  // `mut ref` parameter can't be passed where a plain `ref` is wanted,
-  // confirmed via a standalone `vanic check` probe: "must be
-  // assignable to ref [u8; 512], got mut ref [u8; 512]"), and
-  // filter_check_frame_rpi4 below only ever reads, so it takes `ref`.
-  // An owned local can be passed either way, so it's the one shape
-  // that satisfies both this function's `mut ref out` write and the
-  // filter's `ref` read.
-  let local: [u8; 512] = netif_zero_frame_rpi4();
   let i: i64 = 0;
   while i < frame_len {
     let b: u32 = netif_state_recv_byte(i as u32);
-    local[i] = b as u8;
+    out[i] = b as u8;
     i = i + 1;
   }
   let _ = netif_state_recv_advance();
@@ -938,14 +884,16 @@ fn netif_recv_frame_rpi4(out: mut ref [u8; 512], max_len: i64) -> i64 {
   // above regardless of the verdict (matching how a real NIC would
   // also have already delivered the frame off the wire by the time
   // filtering happens) -- a denied frame is simply dropped and
-  // reported as "nothing ready" this call.
-  if filter_check_frame_rpi4(ref local, frame_len, 0 as u32) == (0 as u32) {
+  // reported as "nothing ready" this call. Passes `out` (a `mut ref`
+  // in hand) directly where the read-only filter wants `ref` -- a
+  // reborrow at a direct call-argument position, which the vani-
+  // compiler gap #3 fix (2026-09-10) now allows; this used to need an
+  // owned `local` scratch copy + a second copy back into `out`
+  // afterward purely to satisfy the type checker (see vani-compiler/
+  // docs/DHRUVAOS_ERGONOMICS_TODO.md gap #3's own "workaround shipped"
+  // shape 2 for the removed version of this function).
+  if filter_check_frame_rpi4(out, frame_len, 0 as u32) == (0 as u32) {
     return 0 - 1;
-  }
-  let j: i64 = 0;
-  while j < frame_len {
-    out[j] = local[j];
-    j = j + 1;
   }
   return frame_len;
 }
@@ -968,7 +916,7 @@ fn netif_self_test_rpi4() -> i64 {
   }
 
   let frame: [u8; 512] = netif_zero_frame_rpi4();
-  let mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref mac);
   let i: i64 = 0;
   while i < 6 {
@@ -1136,13 +1084,8 @@ fn arp_get_sender_mac_rpi4(frame: ref [u8; 512], out_mac: mut ref [u8; 6]) -> i6
 // real state through an `ArpCache`.
 fn arp_cache_from_state_rpi4() -> ArpCache {
   let count: u32 = arp_cache_get_count();
-  let ip: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let mac_bytes: [u8; 48] = [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  let ip: [u32; 8] = [0 as u32; 8];
+  let mac_bytes: [u8; 48] = [0 as u8; 48];
   let i: u32 = 0 as u32;
   while i < count {
     ip[i as i64] = arp_cache_get_ip(i);
@@ -1194,7 +1137,7 @@ fn arp_cache_insert_rpi4(ip: u32, mac: ref [u8; 6]) -> i64 {
 fn arp_self_test_rpi4() -> i64 {
   let ok: i64 = 1;
   let _ = arp_cache_reset();
-  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let my_mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref my_mac);
   let my_ip: u32 = 0xC0A80101 as u32;     // 192.168.1.1
   let target_ip: u32 = 0xC0A80102 as u32; // 192.168.1.2
@@ -1206,7 +1149,7 @@ fn arp_self_test_rpi4() -> i64 {
   if arp_get_operation_rpi4(ref req_frame) != (1 as u32) { ok = 0; }
   if arp_get_sender_ip_rpi4(ref req_frame) != my_ip { ok = 0; }
   if arp_get_target_ip_rpi4(ref req_frame) != target_ip { ok = 0; }
-  let req_sender_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let req_sender_mac: [u8; 6] = [0 as u8; 6];
   let _ = arp_get_sender_mac_rpi4(ref req_frame, mut ref req_sender_mac);
   let si: i64 = 0;
   while si < 6 {
@@ -1223,17 +1166,17 @@ fn arp_self_test_rpi4() -> i64 {
   if arp_get_target_ip_rpi4(ref reply_frame) != my_ip { ok = 0; }
 
   // Cache exercise: miss, insert, hit, update-in-place.
-  let miss_out: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let miss_out: [u8; 6] = [0 as u8; 6];
   if arp_cache_lookup_rpi4(target_ip, mut ref miss_out) != 0 { ok = 0; }
 
   let _ = arp_cache_insert_rpi4(target_ip, ref peer_mac);
-  let hit_out: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let hit_out: [u8; 6] = [0 as u8; 6];
   if arp_cache_lookup_rpi4(target_ip, mut ref hit_out) != 1 { ok = 0; }
   if hit_out[5] != (0x02 as u8) { ok = 0; }
 
   let updated_mac: [u8; 6] = [0x02 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0x09 as u8];
   let _ = arp_cache_insert_rpi4(target_ip, ref updated_mac);
-  let updated_out: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let updated_out: [u8; 6] = [0 as u8; 6];
   if arp_cache_lookup_rpi4(target_ip, mut ref updated_out) != 1 { ok = 0; }
   if updated_out[5] != (0x09 as u8) { ok = 0; }
   if arp_cache_get_count() != (1 as u32) { ok = 0; } // update-in-place, not a 2nd entry
@@ -1274,7 +1217,7 @@ fn arp_resolve_poll_rpi4(target_ip: u32) -> i64 {
   if arp_get_sender_ip_rpi4(ref frame) != target_ip {
     return 0;
   }
-  let sender_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let sender_mac: [u8; 6] = [0 as u8; 6];
   let _ = arp_get_sender_mac_rpi4(ref frame, mut ref sender_mac);
   let _ = arp_cache_insert_rpi4(target_ip, ref sender_mac);
   return 1;
@@ -1289,7 +1232,7 @@ fn arp_resolve_poll_rpi4(target_ip: u32) -> i64 {
 // Direct port of kernel_main.vani's own arp_resolve_self_test.
 fn arp_resolve_self_test_rpi4() -> i64 {
   let ok: i64 = 1;
-  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let my_mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref my_mac);
   let my_ip: u32 = 0xC0A80101 as u32;
   let target_ip: u32 = 0xC0A80105 as u32; // .5, not touched by arp_self_test_rpi4
@@ -1320,7 +1263,7 @@ fn arp_resolve_self_test_rpi4() -> i64 {
 
   let resolved: i64 = arp_resolve_poll_rpi4(target_ip);
   if resolved != 1 { ok = 0; }
-  let looked_up: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let looked_up: [u8; 6] = [0 as u8; 6];
   let found: i64 = arp_cache_lookup_rpi4(target_ip, mut ref looked_up);
   if found != 1 { ok = 0; }
   if looked_up[5] != (0x05 as u8) { ok = 0; }
@@ -1354,16 +1297,6 @@ fn arp_resolve_self_test_rpi4() -> i64 {
 // identical pair of helpers under an `ipv4_` name would be pure
 // duplication for zero behavioral difference).
 
-// Takes `mut ref`, not `ref`, and reads bytes directly by index
-// rather than delegating to arp_read_u16_be_rpi4 -- its only caller,
-// ipv4_build_header_rpi4, holds `frame` as a `mut ref` PARAMETER (it
-// just wrote the header fields this function needs to sum), and vani
-// has no reborrow from `mut ref T` to `ref T` (confirmed via a
-// standalone `vanic check` probe -- an already-wrapped `mut ref`
-// value can't be passed where a plain `ref` is wanted, only an owned
-// local can supply either kind at its own call site). Delegating to
-// arp_read_u16_be_rpi4 (which takes `ref`) would hit the exact same
-// mismatch one level down, so the read is inlined here instead.
 // Round 106c: the header codec's own real ALGORITHM (checksum/build/
 // parse) now lives in the shared `netstack` package (`netstack_ipv4_
 // *`), confirmed a direct port of this file's own former body before
@@ -1373,22 +1306,22 @@ fn arp_resolve_self_test_rpi4() -> i64 {
 // copies its own `ip_offset..ip_offset+20` slice out of `frame` (into
 // the package), and (for `build_header`) back in, rather than passing
 // `frame` itself through.
-// No shared extraction helper here (unlike a first draft) -- vani
-// has no reborrow from a `mut ref T` parameter to a plain `ref T`
-// (the exact limitation this file's own pre-migration `ipv4_
-// checksum_rpi4` header comment already documented), so a helper
-// taking `ref [u8;512]` can't be called from a function that only
-// holds `frame` as `mut ref`. Each function below inlines its own
-// 20-byte extraction instead, matching that same pre-existing
-// reasoning.
-fn ipv4_checksum_rpi4(frame: mut ref [u8; 512], ip_offset: i64) -> u32 {
-  let hdr: [u8; 20] = [
+// Round 171: one shared extraction helper, `ref`-typed -- a first
+// draft duplicated this same 20-element slice in every function below
+// because vani had no reborrow from a `mut ref T` parameter to a
+// plain `ref T` (a helper taking `ref [u8;512]` couldn't be called
+// from a function that only held `frame` as `mut ref`, e.g. `ipv4_
+// verify_checksum_rpi4` below). The vani-compiler gap #3 fix
+// (2026-09-10, call-argument reborrow) removed that constraint --
+// `ipv4_verify_checksum_rpi4` passes its own `mut ref frame` straight
+// through to this `ref`-taking helper now.
+fn ipv4_extract_header_rpi4(frame: ref [u8; 512], ip_offset: i64) -> [u8; 20] {
+  return [
     frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
     frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
     frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
     frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
   ];
-  return netstack_ipv4_checksum(ref hdr);
 }
 
 fn ipv4_build_header_rpi4(frame: mut ref [u8; 512], ip_offset: i64, total_len: i64, protocol: u32, src_ip: u32, dst_ip: u32) -> i64 {
@@ -1402,52 +1335,27 @@ fn ipv4_build_header_rpi4(frame: mut ref [u8; 512], ip_offset: i64, total_len: i
 }
 
 fn ipv4_get_total_len_rpi4(frame: ref [u8; 512], ip_offset: i64) -> u32 {
-  let hdr: [u8; 20] = [
-    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
-    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
-    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
-    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
-  ];
+  let hdr: [u8; 20] = ipv4_extract_header_rpi4(frame, ip_offset);
   return netstack_ipv4_get_total_len(ref hdr);
 }
 
 fn ipv4_get_protocol_rpi4(frame: ref [u8; 512], ip_offset: i64) -> u32 {
-  let hdr: [u8; 20] = [
-    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
-    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
-    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
-    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
-  ];
+  let hdr: [u8; 20] = ipv4_extract_header_rpi4(frame, ip_offset);
   return netstack_ipv4_get_protocol(ref hdr);
 }
 
 fn ipv4_get_src_ip_rpi4(frame: ref [u8; 512], ip_offset: i64) -> u32 {
-  let hdr: [u8; 20] = [
-    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
-    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
-    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
-    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
-  ];
+  let hdr: [u8; 20] = ipv4_extract_header_rpi4(frame, ip_offset);
   return netstack_ipv4_get_src_ip(ref hdr);
 }
 
 fn ipv4_get_dst_ip_rpi4(frame: ref [u8; 512], ip_offset: i64) -> u32 {
-  let hdr: [u8; 20] = [
-    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
-    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
-    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
-    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
-  ];
+  let hdr: [u8; 20] = ipv4_extract_header_rpi4(frame, ip_offset);
   return netstack_ipv4_get_dst_ip(ref hdr);
 }
 
 fn ipv4_verify_checksum_rpi4(frame: mut ref [u8; 512], ip_offset: i64) -> i64 {
-  let hdr: [u8; 20] = [
-    frame[ip_offset], frame[ip_offset + 1], frame[ip_offset + 2], frame[ip_offset + 3], frame[ip_offset + 4],
-    frame[ip_offset + 5], frame[ip_offset + 6], frame[ip_offset + 7], frame[ip_offset + 8], frame[ip_offset + 9],
-    frame[ip_offset + 10], frame[ip_offset + 11], frame[ip_offset + 12], frame[ip_offset + 13], frame[ip_offset + 14],
-    frame[ip_offset + 15], frame[ip_offset + 16], frame[ip_offset + 17], frame[ip_offset + 18], frame[ip_offset + 19]
-  ];
+  let hdr: [u8; 20] = ipv4_extract_header_rpi4(frame, ip_offset);
   return netstack_ipv4_verify_checksum(ref hdr);
 }
 
@@ -1493,7 +1401,7 @@ fn ipv4_send_rpi4(my_mac: ref [u8; 6], dst_mac: ref [u8; 6], src_ip: u32, dst_ip
 // ipv4_self_test.
 fn ipv4_self_test_rpi4() -> i64 {
   let ok: i64 = 1;
-  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let my_mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref my_mac);
   let src_ip: u32 = 0xC0A80101 as u32;
   let dst_ip: u32 = 0xC0A80102 as u32;
@@ -1590,12 +1498,12 @@ fn udp_get_dst_port_rpi4(frame: ref [u8; 512], udp_offset: i64) -> u32 {
 
 fn filter_config_from_state_rpi4() -> FilterConfig {
   let count: u32 = filter_get_rule_count();
-  let proto: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let src_ip: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let src_ip_valid: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let dst_port: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let dst_port_valid: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let action: [u32; 8] = [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  let proto: [u32; 8] = [0 as u32; 8];
+  let src_ip: [u32; 8] = [0 as u32; 8];
+  let src_ip_valid: [u32; 8] = [0 as u32; 8];
+  let dst_port: [u32; 8] = [0 as u32; 8];
+  let dst_port_valid: [u32; 8] = [0 as u32; 8];
+  let action: [u32; 8] = [0 as u32; 8];
   let i: u32 = 0 as u32;
   while i < count {
     proto[i] = filter_get_rule_proto(i);
@@ -1960,7 +1868,7 @@ fn tcp_send_segment_rpi4(my_mac: ref [u8; 6], dst_mac: ref [u8; 6], src_ip: u32,
 // kernel_main.vani's own tcp_self_test.
 fn tcp_self_test_rpi4() -> i64 {
   let ok: i64 = 1;
-  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let my_mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref my_mac);
   let src_ip: u32 = 0xC0A80101 as u32;
   let dst_ip: u32 = 0xC0A80102 as u32;
@@ -2455,7 +2363,7 @@ fn tcp_conn_self_test_rpi4() -> i64 {
   let ok: i64 = 1;
   let _ = tcp_conn_reset(0 as u32);
   let _ = tcp_conn_reset(1 as u32);
-  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let my_mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref my_mac);
   let client_id: u32 = 0 as u32;
   let server_id: u32 = 1 as u32;
@@ -2574,7 +2482,7 @@ fn mqtt_self_test_rpi4() -> i64 {
   let ok: i64 = 1;
   let _ = tcp_conn_reset(0 as u32);
   let _ = tcp_conn_reset(1 as u32);
-  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let my_mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref my_mac);
   let client_id: u32 = 0 as u32;
   let server_id: u32 = 1 as u32;
@@ -2839,7 +2747,7 @@ fn udp_send_rpi4(my_mac: ref [u8; 6], dst_mac: ref [u8; 6], src_ip: u32, dst_ip:
 // MAC that's certain to be wrong for any real off-loopback
 // destination).
 fn socket_udp_send_rpi4(my_mac: ref [u8; 6], local_ip: u32, remote_ip: u32, local_port: u32, remote_port: u32, payload: ref [u8; 512], payload_len: i64) -> i64 {
-  let dst_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let dst_mac: [u8; 6] = [0 as u8; 6];
   if arp_cache_lookup_rpi4(remote_ip, mut ref dst_mac) != 1 {
     return 0 - 1;
   }
@@ -2912,7 +2820,7 @@ fn socket_udp_recv_rpi4(out_payload: mut ref [u8; 512], out_meta: mut ref [u8; 8
 // kmain_rpi4_vani).
 fn udp_self_test_rpi4() -> i64 {
   let ok: i64 = 1;
-  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let my_mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref my_mac);
   let local_ip: u32 = 0xC0A80101 as u32;
   let remote_ip: u32 = 0xC0A80102 as u32;
@@ -2933,7 +2841,7 @@ fn udp_self_test_rpi4() -> i64 {
   }
 
   let recv_payload: [u8; 512] = netif_zero_frame_rpi4();
-  let recv_meta: [u8; 8] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let recv_meta: [u8; 8] = [0 as u8; 8];
   let recv_len: i64 = socket_udp_recv_rpi4(mut ref recv_payload, mut ref recv_meta, 512);
   if recv_len != 5 {
     ok = 0;
@@ -3131,7 +3039,7 @@ fn dhcp_client_start_rpi4(my_mac: ref [u8; 6], xid: u32) -> i64 {
 
   let payload: [u8; 512] = netif_zero_frame_rpi4();
   let payload_len: i64 = dhcp_build_discover_rpi4(mut ref payload, 0, my_mac, xid);
-  let bcast_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let bcast_mac: [u8; 6] = [0 as u8; 6];
   let _ = dhcp_broadcast_mac_rpi4(mut ref bcast_mac);
   let no_ip: u32 = 0 as u32;
   let bcast_ip: u32 = 0xFFFFFFFF as u32;
@@ -3201,7 +3109,7 @@ fn dhcp_client_poll_rpi4(my_mac: ref [u8; 6]) -> i64 {
     let payload: [u8; 512] = netif_zero_frame_rpi4();
     let xid: u32 = dhcp_state_get_xid();
     let payload_len: i64 = dhcp_build_request_rpi4(mut ref payload, 0, my_mac, xid, offered_ip, server_ip);
-    let bcast_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+    let bcast_mac: [u8; 6] = [0 as u8; 6];
     let _ = dhcp_broadcast_mac_rpi4(mut ref bcast_mac);
     let no_ip: u32 = 0 as u32;
     let bcast_ip: u32 = 0xFFFFFFFF as u32;
@@ -3228,7 +3136,7 @@ fn dhcp_client_poll_rpi4(my_mac: ref [u8; 6]) -> i64 {
 
     // Learn the server's MAC for free from this ACK's own Ethernet
     // source address, for a later unicast renewal REQUEST.
-    let server_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+    let server_mac: [u8; 6] = [0 as u8; 6];
     let mi: i64 = 0;
     while mi < 6 {
       server_mac[mi] = frame[6 + mi];
@@ -3292,7 +3200,7 @@ fn dhcp_client_check_lease_rpi4(my_mac: ref [u8; 6]) -> i64 {
   // own build and fixed by this renaming, not a new discovery.
   if (client_state == dhcp_state_bound_rpi4()) && (elapsed_ticks >= t1_ticks) {
     let server_ip: u32 = dhcp_state_get_server_ip();
-    let renew_dst_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+    let renew_dst_mac: [u8; 6] = [0 as u8; 6];
     if arp_cache_lookup_rpi4(server_ip, mut ref renew_dst_mac) == 1 {
       let renew_payload: [u8; 512] = netif_zero_frame_rpi4();
       let renew_xid: u32 = dhcp_state_get_xid();
@@ -3309,7 +3217,7 @@ fn dhcp_client_check_lease_rpi4(my_mac: ref [u8; 6]) -> i64 {
     let rebind_xid: u32 = dhcp_state_get_xid();
     let rebind_leased_ip: u32 = dhcp_state_get_leased_ip();
     let rebind_payload_len: i64 = dhcp_build_renew_request_rpi4(mut ref rebind_payload, 0, my_mac, rebind_xid, rebind_leased_ip);
-    let rebind_bcast_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+    let rebind_bcast_mac: [u8; 6] = [0 as u8; 6];
     let _ = dhcp_broadcast_mac_rpi4(mut ref rebind_bcast_mac);
     let rebind_bcast_ip: u32 = 0xFFFFFFFF as u32;
     let _ = udp_send_rpi4(my_mac, ref rebind_bcast_mac, rebind_leased_ip, rebind_bcast_ip, dhcp_client_port_rpi4(), dhcp_server_port_rpi4(), ref rebind_payload, rebind_payload_len);
@@ -3337,7 +3245,7 @@ fn dhcp_client_check_lease_rpi4(my_mac: ref [u8; 6]) -> i64 {
 // Direct port of kernel_main.vani's own dhcp_self_test.
 fn dhcp_self_test_rpi4() -> i64 {
   let ok: i64 = 1;
-  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let my_mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref my_mac);
   let xid: u32 = 0x12345678 as u32;
   let offered_ip: u32 = 0xC0A80164 as u32; // 192.168.1.100
@@ -3510,14 +3418,11 @@ fn dhcp_server_init_rpi4(server_ip: u32, pool_base_ip: u32, pool_size: u32, leas
 // its own -- this file's own lease TABLE storage (`boot/rpi4/dhcp_
 // server_state.S`, the extern accessors above) is untouched.
 fn dhcp_lease_table_from_state_rpi4() -> DhcpLeaseTable {
-  let state: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let ip: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let xid: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let start_tick: [u32; 4] = [0 as u32, 0 as u32, 0 as u32, 0 as u32];
-  let mac_bytes: [u8; 24] = [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  let state: [u32; 4] = [0 as u32; 4];
+  let ip: [u32; 4] = [0 as u32; 4];
+  let xid: [u32; 4] = [0 as u32; 4];
+  let start_tick: [u32; 4] = [0 as u32; 4];
+  let mac_bytes: [u8; 24] = [0 as u8; 24];
   let i: u32 = 0 as u32;
   while i < (4 as u32) {
     state[i as i64] = dhcp_server_get_lease_state(i);
@@ -3574,7 +3479,7 @@ fn dhcp_server_send_reply_rpi4(my_mac: ref [u8; 6], server_ip: u32, payload: ref
 fn dhcp_server_handle_discover_rpi4(frame: ref [u8; 512], my_mac: ref [u8; 6]) -> i64 {
   let dhcp_offset: i64 = 42;
   let xid: u32 = dhcp_get_xid_rpi4(frame, dhcp_offset);
-  let client_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let client_mac: [u8; 6] = [0 as u8; 6];
   let dmi: i64 = 0;
   while dmi < 6 {
     client_mac[dmi] = frame[dhcp_offset + 28 + dmi];
@@ -3616,7 +3521,7 @@ fn dhcp_server_handle_discover_rpi4(frame: ref [u8; 512], my_mac: ref [u8; 6]) -
 fn dhcp_server_handle_request_rpi4(frame: ref [u8; 512], dhcp_len: i64, my_mac: ref [u8; 6]) -> i64 {
   let dhcp_offset: i64 = 42;
   let xid: u32 = dhcp_get_xid_rpi4(frame, dhcp_offset);
-  let client_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let client_mac: [u8; 6] = [0 as u8; 6];
   let rmi: i64 = 0;
   while rmi < 6 {
     client_mac[rmi] = frame[dhcp_offset + 28 + rmi];
@@ -3703,7 +3608,7 @@ fn dhcp_server_poll_rpi4(my_mac: ref [u8; 6]) -> i64 {
 // a matching REQUEST->ACK, and an unknown-MAC REQUEST->NAK.
 fn dhcp_server_self_test_rpi4() -> i64 {
   let ok: i64 = 1;
-  let my_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let my_mac: [u8; 6] = [0 as u8; 6];
   let _ = netif_get_mac_rpi4(mut ref my_mac);
   let server_ip: u32 = 0x0A000001 as u32;    // 10.0.0.1
   let pool_base_ip: u32 = 0x0A00000A as u32; // 10.0.0.10

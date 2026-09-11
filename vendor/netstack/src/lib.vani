@@ -54,12 +54,12 @@ fn netstack_filter_empty() -> FilterConfig {
   return FilterConfig {
     rule_count: 0,
     default_policy: 0 as u32,
-    proto: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    src_ip: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    src_ip_valid: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    dst_port: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    dst_port_valid: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    action: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32]
+    proto: [0 as u32; 8],
+    src_ip: [0 as u32; 8],
+    src_ip_valid: [0 as u32; 8],
+    dst_port: [0 as u32; 8],
+    dst_port_valid: [0 as u32; 8],
+    action: [0 as u32; 8]
   };
 }
 
@@ -228,16 +228,7 @@ fn netstack_filter_build_test_frame_dst(frame: mut ref [u8; 512], proto: u32, ds
 }
 
 fn netstack_zero_frame() -> [u8; 512] {
-  let a: [u8; 64] = [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  let a: [u8; 64] = [0 as u8; 64];
   let out: [u8; 512] = [
     a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
     a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
@@ -387,13 +378,8 @@ fn netstack_arp_cache_empty() -> ArpCache {
   return ArpCache {
     count: 0,
     next_slot: 0,
-    ip: [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    mac_bytes: [
-      0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-      0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-      0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-      0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-    ]
+    ip: [0 as u32; 8],
+    mac_bytes: [0 as u8; 48]
   };
 }
 
@@ -411,7 +397,7 @@ fn netstack_arp_cache_lookup(cache: ref ArpCache, ip: u32) -> ArpLookupResult {
     }
     i = i + 1;
   }
-  return ArpLookupResult { found: 0, mac: [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8] };
+  return ArpLookupResult { found: 0, mac: [0 as u8; 6] };
 }
 
 // Inserts/updates an IP -> MAC mapping. Updates in place if the IP is
@@ -580,7 +566,7 @@ fn netstack_arp_self_test() -> i64 {
   if netstack_arp_get_operation(ref req_frame) != (1 as u32) { ok = 0; }
   if netstack_arp_get_sender_ip(ref req_frame) != my_ip { ok = 0; }
   if netstack_arp_get_target_ip(ref req_frame) != target_ip { ok = 0; }
-  let req_sender_mac: [u8; 6] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let req_sender_mac: [u8; 6] = [0 as u8; 6];
   let _ = netstack_arp_get_sender_mac(ref req_frame, mut ref req_sender_mac);
   let si: i64 = 0;
   while si < 6 {
@@ -647,10 +633,7 @@ fn netstack_arp_self_test() -> i64 {
 // ---------------------------------------------------------------
 
 fn netstack_zero20_bytes() -> [u8; 20] {
-  return [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  return [0 as u8; 20];
 }
 
 // Internet checksum (RFC 791 section 3.1/RFC 1071): one's-complement
@@ -787,16 +770,7 @@ fn netstack_ipv4_self_test() -> i64 {
 struct UdpChecksumCtx { sum: u32, carry_byte: u8, has_carry: i64 }
 
 fn netstack_zero256_bytes() -> [u8; 256] {
-  let a: [u8; 64] = [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  let a: [u8; 64] = [0 as u8; 64];
   let out: [u8; 256] = [
     a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
     a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31],
@@ -819,7 +793,7 @@ fn netstack_zero256_bytes() -> [u8; 256] {
 }
 
 fn netstack_udp_header_only(src_port: u32, dst_port: u32, udp_len: i64) -> [u8; 8] {
-  let hdr: [u8; 8] = [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8];
+  let hdr: [u8; 8] = [0 as u8; 8];
   hdr[0] = ((src_port >> (8 as u32)) & (255 as u32)) as u8;
   hdr[1] = (src_port & (255 as u32)) as u8;
   hdr[2] = ((dst_port >> (8 as u32)) & (255 as u32)) as u8;
@@ -1251,14 +1225,11 @@ struct DhcpLeaseFindResult { found: i64, index: i64 }
 
 fn netstack_dhcp_lease_table_empty() -> DhcpLeaseTable {
   return DhcpLeaseTable {
-    state: [0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    ip: [0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    xid: [0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    start_tick: [0 as u32, 0 as u32, 0 as u32, 0 as u32],
-    mac_bytes: [
-      0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-      0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-    ]
+    state: [0 as u32; 4],
+    ip: [0 as u32; 4],
+    xid: [0 as u32; 4],
+    start_tick: [0 as u32; 4],
+    mac_bytes: [0 as u8; 24]
   };
 }
 

@@ -88,16 +88,13 @@ use "../../crypto_hash/src/core.vani";
 // the by-value/limb-array mechanics differ.
 
 fn fe_zero() -> [u32; 8] {
-  return [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  return [0 as u32; 8];
 }
 fn fe9_zero() -> [u32; 9] {
-  return [0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32];
+  return [0 as u32; 9];
 }
 fn fe16_zero() -> [u32; 16] {
-  return [
-    0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32,
-    0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32
-  ];
+  return [0 as u32; 16];
 }
 
 // p = 2^255 - 19.
@@ -429,12 +426,7 @@ fn fe_from_bytes_le(bytes: ref [u8; 32]) -> [u32; 8] {
 }
 
 fn fe_to_bytes_le(limbs: ref [u32; 8]) -> [u8; 32] {
-  let out: [u8; 32] = [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  let out: [u8; 32] = [0 as u8; 32];
   let i: i64 = 0;
   while i < 8 {
     let v: u32 = limbs[i];
@@ -658,24 +650,10 @@ fn ed25519_base_point() -> Ed25519Point {
 }
 
 fn ed25519_zero32_bytes() -> [u8; 32] {
-  return [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  return [0 as u8; 32];
 }
 fn ed25519_zero64_bytes() -> [u8; 64] {
-  return [
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
-    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8
-  ];
+  return [0 as u8; 64];
 }
 fn ed25519_zero512_bytes() -> [u8; 512] {
   let a: [u8; 256] = ed25519_zero256_bytes();
