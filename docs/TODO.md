@@ -2830,6 +2830,41 @@ thorough verification isn't worth the risk right now. Tracked
 separately as task #174, scoped but not started (same "pause for a
 risk/value read" treatment as round 103's scheduler generification).
 
+**ROUND 176 UPDATE, 2026-09-11 (DONE)**: build-time `vanic stack-depth`
+gate, added directly because round 166's own overflow went undetected
+until a live boot corrupted memory even though `vanic stack-depth`
+existed the whole time — it was only ever run by hand, after the fact.
+`build_rpi4.sh` now gates `kmain_rpi4_vani` at 56KB (of the real 64KB
+stack); `build.sh` gates `kernel_main` at 14KB (of 16KB). Pi 1's 4
+dynamically-created task stacks (`task_create`, each a real 4096-byte
+guarded allocation) aren't gated by default — `kernel_main.vani`'s
+~27K lines make each `stack-depth` pass take ~40s, and 5 entries would
+add minutes per build — documented as a manual check instead of
+silently skipped.
+
+**ROUND 179 UPDATE, 2026-09-11 (DONE, Phase 1)**: Pi 4/5 heap
+allocator, ported from Pi 1's own `dhruva_alloc_bytes` design
+(`boot/rpi1/runtime_stubs.c`) into `boot/rpi4/runtime_stubs_rpi4.c` —
+a 768KB static-array bump allocator, 8-byte aligned, halts via
+`dhruva_oom_fatal_rpi4` on exhaustion rather than returning null. Only
+real porting difference: AArch64's DAIF register (`msr daifset`/
+`daif`) stands in for ARM32's CPSR/`cpsid` critical-section dance.
+Directly motivated by the 512-byte buffer cap visible throughout this
+board's own code (round 166's TLS records, well under Pi 1's real
+2048-byte size) — removing that ceiling is also the prerequisite for
+migrating Pi 1's TLS implementation onto the shared `vani-tls13`
+package (task #174, previously blocked on exactly this API mismatch).
+`heap_alloc_self_test_rpi4` exercises the allocator directly (two
+allocations, distinct byte patterns, verifies no overlap) since
+nothing else calls it yet, unlike Pi 1 where hundreds of existing call
+sites do; `heap_usage_self_test_rpi4` mirrors Pi 1's own headroom
+report. Both wired into boot and a new `heap` shell command. Guard-
+page protection (Pi 1's `dhruva_alloc_stack_guarded`, MMU page
+invalidation on overflow) is explicitly NOT part of this phase — Pi
+4/5's MMU (`boot/rpi4/mmu_init.S`) only has 2MB block descriptors so
+far, no 4KB page-table level to install a guard into; that's real new
+MMU capability, tracked separately as task #178.
+
 **Round 40 correction**: `docs/PORTING.md` previously claimed no QEMU
 target exists for Pi 4/5 at all. Verified false for Pi 4 — QEMU's
 64-bit `qemu-system-aarch64` binary (already installed, separate from
