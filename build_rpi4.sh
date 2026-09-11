@@ -43,6 +43,19 @@ TRIPLE="aarch64-none-elf"
 
 mkdir -p "${BUILD_DIR}"
 
+# Round 176: static stack-budget gate, added after round 166's boot-
+# stack overflow (27032 bytes needed vs. a 16KB budget) went
+# undetected until a live QEMU boot corrupted unrelated memory --
+# `vanic stack-depth` existed the whole time but was only ever run by
+# hand, after the fact, while debugging. 57344 (56KB) is boot/rpi4/
+# link.ld's own 64KB (0x10000) stack minus an 8KB margin -- catches
+# any future deep call chain at build time, before it ever reaches
+# QEMU or real hardware. Bump both this number and link.ld's own
+# allocation together if a real budget increase is ever needed; don't
+# just raise one to silence the other.
+"${VANIC}" stack-depth "${ROOT}/kernel/kernel_main_rpi4.vani" \
+  --entry=kmain_rpi4_vani --max=57344
+
 "${CC}" -c -mgeneral-regs-only -ffreestanding \
   "${ROOT}/boot/rpi4/boot.S" -o "${BUILD_DIR}/rpi4_boot.o"
 

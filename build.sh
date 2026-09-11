@@ -42,6 +42,33 @@ TRIPLE="armv6-none-eabi"
 
 mkdir -p "${BUILD_DIR}"
 
+# Round 176: static stack-budget gate, added after round 166's Pi 4/5
+# boot-stack overflow (27032 bytes needed vs. a 16KB budget) went
+# undetected until a live QEMU boot corrupted unrelated memory --
+# `vanic stack-depth` existed the whole time but was only ever run by
+# hand, after the fact, while debugging. 14336 (14KB) is boot/rpi1/
+# link.ld's own 16KB (0x4000) boot stack minus a 2KB margin (smaller
+# absolute margin than Pi 4/5's -- this board's own real headroom is
+# already comfortable at ~7.9KB measured, and 16KB total leaves less
+# room for a large margin to begin with). Bump both this number and
+# link.ld's own allocation together if a real budget increase is ever
+# needed; don't just raise one to silence the other. Covers the boot-
+# time call chain reachable from kernel_main -- the same class of bug
+# round 166 hit. Pi 1's dynamically-created tasks (task_create, each
+# with its own real, MMU-guard-page-protected 4096-byte stack via
+# dhruva_alloc_stack_guarded -- see that function's own comment in
+# boot/rpi1/runtime_stubs.c) each deserve their own gate too, but
+# kernel_main.vani's real size (~27K lines) makes one `stack-depth`
+# pass here take ~40s -- gating all 4 dynamic tasks (task_custom_demo/
+# task_mutex_demo_low/task_mutex_demo_high/task_fsq) plus the 6 fixed
+# built-in ones (task_a..task_f) would add several minutes to every
+# single build. Deliberately left as a documented gap rather than
+# silently skipped -- run manually before any round that adds real
+# depth to one of those task bodies:
+#   vanic stack-depth kernel/kernel_main.vani --entry=<task_fn> --max=3584 (dynamic tasks, 4096-byte stack minus margin)
+"${VANIC}" stack-depth "${ROOT}/kernel/kernel_main.vani" \
+  --entry=kernel_main --max=14336
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/rpi1/boot.S" -o "${BUILD_DIR}/boot.o"
 
