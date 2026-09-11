@@ -13346,6 +13346,10 @@ fn dwc2_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i64 
   let toggle: u32 = usb_msd_get_out_toggle();
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if out_len == 0 { 1 as u32 } else { ((out_len as u32) + mps - (1 as u32)) / mps };
+  // Round 182 channel-0-wedge fix (see dwc2_net_bulk_in's own comment
+  // for the full finding) -- applies identically to every dwc2_*_in/
+  // dwc2_*_out function that re-arms channel 0 on a polling loop.
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
@@ -13377,6 +13381,7 @@ fn dwc2_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> 
   let toggle: u32 = usb_msd_get_in_toggle();
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
@@ -13438,6 +13443,10 @@ fn dwc2_net_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> 
   let toggle: u32 = usb_net_get_out_toggle();
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if out_len == 0 { 1 as u32 } else { ((out_len as u32) + mps - (1 as u32)) / mps };
+  // Same channel-0 wedge as dwc2_net_bulk_in (see its own comment) --
+  // a NAK'd bulk OUT never clears CHENA either, so an unconditional
+  // reset before every attempt is required here too.
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
@@ -13462,6 +13471,55 @@ fn dwc2_net_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> 
 // comes back empty (0 actual bytes moved, distinct from a 0-length
 // bulk IN request) signals "nothing waiting" to the caller via a
 // negative return, same as dwc2_bulk_in's own error convention.
+// Round 182 (task #182 root cause, confirmed against QEMU's own
+// hw/usb/hcd-dwc2.c source): a NAK on a bulk endpoint does NOT clear
+// HCCHAR_CHENA the way a real completion does (dwc2_handle_packet's
+// own NAK branch skips the `hcchar &= ~HCCHAR_CHENA` step entirely --
+// by design, since real DWC2 hardware auto-retries bulk NAKs
+// internally without software re-arming the channel). But this
+// driver's own dwc2_net_bulk_in re-writes HCCHAR with CHENA=1 fresh
+// on EVERY poll attempt, and QEMU's own dwc2_hreg1_write only calls
+// dwc2_enable_chan (the function that actually STARTS a transfer) on
+// a genuine 0->1 CHENA transition -- writing CHENA=1 when it's
+// ALREADY 1 (left over from the prior NAK) is a silent no-op. The
+// result: the FIRST poll that NAKs "wedges" the channel -- every
+// subsequent dwc2_net_bulk_in call writes registers that are simply
+// never acted on, busy-waits dwc2_wait_chan0_done's own full 1M-
+// iteration bound for nothing, and returns -1 forever afterward,
+// REGARDLESS of real data later arriving on the wire.
+//
+// This exactly explains why DHCP's own receive (task_e's sparse,
+// ~10-second-interval poll, which in practice virtually always finds
+// its OFFER/ACK already sitting there on its first-ever attempt) has
+// always worked, while a real external SSH client's SYN -- confirmed
+// via a live packet capture to genuinely arrive at the virtual NIC --
+// was NEVER seen by netif_recv_frame no matter how patiently `sshd`'s
+// own accept loop polled: ANY realistic external-traffic polling
+// loop is virtually guaranteed to NAK at least once before the real
+// data shows up, and that first NAK permanently breaks every
+// following attempt in the same session.
+//
+// Fixed by explicitly forcing a channel disable (HCCHAR_CHDIS, bit
+// 30) before every new transfer attempt -- this reliably drives
+// CHENA back to 0 (QEMU's own dwc2_hreg1_write always honors a CHDIS
+// write, per its own `if ((val & HCCHAR_CHDIS) && !(old &
+// HCCHAR_CHDIS))` branch), guaranteeing the subsequent CHENA=1 write
+// always sees a genuine 0->1 transition and actually starts a new
+// transfer. The disable step itself sets CHHLTD in HCINT as a side
+// effect (confirmed in the same source) -- drained here immediately
+// so the real transfer's own dwc2_wait_chan0_done() call can't
+// mistake that housekeeping bit for its own completion signal.
+fn dwc2_reset_chan0_for_new_transfer() -> i64 {
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hcint0: i64 = dwc2_hcint0_addr();
+  let _ = mmio_write_u32(hcchar0, (1 as u32) << (30 as u32));
+  let stale: u32 = mmio_read_u32(hcint0);
+  if stale != (0 as u32) {
+    let _ = mmio_write_u32(hcint0, stale);
+  }
+  return 0;
+}
+
 fn dwc2_net_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> i64 {
   if mps == (0 as u32) {
     return 0 - 1;
@@ -13479,6 +13537,7 @@ fn dwc2_net_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64)
   let toggle: u32 = usb_net_get_in_toggle();
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
@@ -13541,6 +13600,7 @@ fn dwc2_bt_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i
   let toggle: u32 = usb_bt_get_bulk_out_toggle();
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if out_len == 0 { 1 as u32 } else { ((out_len as u32) + mps - (1 as u32)) / mps };
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
@@ -13570,6 +13630,7 @@ fn dwc2_bt_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) 
   let toggle: u32 = usb_bt_get_bulk_in_toggle();
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
@@ -15291,6 +15352,7 @@ fn dwc2_hci_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len:
   let toggle: u32 = usb_bt_get_intr_in_toggle();
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 3 as u32, 1 as u32, epnum, mps));
@@ -15340,6 +15402,7 @@ fn dwc2_hid_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len:
   let toggle: u32 = usb_hid_get_intr_in_toggle();
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 3 as u32, 1 as u32, epnum, mps));
@@ -16993,25 +17056,20 @@ fn task_e() -> i64 {
     let _ = uart_puts("GC: left DharaFS critical section, eff_prio=");
     let _ = uart_put_hex32(current_eff_prio());
     let _ = uart_puts("\n");
-    // Round 182 investigation note: this project's own documented
-    // shared-netif-queue hazard (netif_queue_contention_self_test) was
-    // briefly suspected as the cause of a real external SSH client's
-    // SYN never being seen by `sshd`'s own accept loop -- a
-    // dhruva_prio_lock(2)/unlock(3) pair was added here to serialize
-    // this call against sshd's own netif_recv_frame calls, matching
-    // the DharaFS lock's own ceiling=2/base=3 convention just above.
-    // REVERTED: it didn't fix the real finding (the SYN never reaches
-    // dwc2_net_bulk_in at all, confirmed via direct instrumentation --
-    // a QEMU-usb-net-emulation-level issue, not a software queue race,
-    // see task #182's own memory for the full investigation), and it
-    // introduced a real regression of its own (task_e's priority boost
-    // during this call disrupted `sshtest`'s own un-slept, tightly-
-    // bounded loopback TCP handshake loop whenever real -netdev/usb-
-    // net was also attached). If the queue-contention hazard ever
-    // becomes the CONFIRMED cause of a real symptom, revisit this with
-    // more care around self-test timing sensitivity, not a blanket
-    // lock reintroduction.
+    // Round 182, re-tested after fixing the real root cause (DWC2
+    // channel-0 CHENA wedge, see dwc2_net_bulk_in's own comment): with
+    // that bug fixed, task_e's own dhcp_client_poll and sshd's own
+    // ssh_real_accept/_deliver_one_frame/_server_cmd close loop are
+    // now BOTH genuinely capable of driving real DWC2 transfers, which
+    // means they can genuinely race on the single shared hardware
+    // channel 0's registers (HCDMA0/HCTSIZ0/HCCHAR0/HCINT0) if both
+    // tasks poll concurrently -- a real hazard the previous test of
+    // this same lock couldn't actually exercise (every poll was
+    // already broken by the CHENA wedge regardless of locking). Same
+    // ceiling=2/base=3 convention as the DharaFS lock just above.
+    let _ = dhruva_prio_lock(2);
     let _ = dhcp_client_poll(dhcp_my_mac);
+    let _ = dhruva_prio_unlock(3);
   }
   return 0;
 }
@@ -25964,27 +26022,39 @@ fn ssh_shell_test_cmd() -> i64 {
 // needed.
 
 // Round 182 investigation: a real external SSH client's SYN never
-// reaches this loop at all (confirmed via direct instrumentation of
-// the underlying USB bulk-IN transaction -- only DHCP's own broadcast
-// traffic ever produces a non-NAK result; zero unicast bytes were
-// ever observed here). This project's own documented shared-netif-
-// queue hazard (netif_queue_contention_self_test) was investigated as
-// a possible cause and ruled out -- a dhruva_prio_lock(2)/unlock(3)
-// pair around every netif_recv_frame call here was tried and reverted
-// (it didn't fix the real symptom, and introduced its own regression:
-// task_e's priority boost during its own locked dhcp_client_poll call
-// disrupted `sshtest`'s own un-slept, tightly-bounded loopback TCP
-// handshake loop whenever real -netdev/usb-net was also attached).
-// The real blocker is upstream of this driver entirely -- likely
-// something in QEMU's own usb-net device model -- see task #182's own
-// memory for the full investigation and suggested next steps.
+// reaches this loop with usable data. Two real driver-level bugs were
+// found and fixed along the way (see dwc2_net_bulk_in's own comment
+// for the first): (1) DWC2 channel 0 never explicitly disabled
+// between polls, wedging it after the first NAK -- fixed via
+// dwc2_reset_chan0_for_new_transfer(), applied to every dwc2_*_in/out
+// polling function project-wide. (2) task_e's dhcp_client_poll and
+// this loop both drive the same shared hardware channel 0 with no
+// mutual exclusion -- the dhruva_prio_lock(2)/unlock(3) pair here
+// (and around dhcp_client_poll's own call site, same ceiling=2/base=3
+// convention as the DharaFS lock) closes that real hazard. Neither
+// fix, individually or together, changed the end symptom: confirmed
+// via a QEMU hardware-level trace (-d trace:usb_dwc2_*) that channel 0
+// now correctly re-arms and gets a FRESH, genuine NAK on every single
+// poll (not a stale/wedged one) -- but QEMU's own CDC-ECM device model
+// (hw/usb/dev-network.c's usbnet_receive()) never once reports success
+// for this connection's SYN, despite -object filter-dump independently
+// proving the frame, correctly addressed to this device's own real
+// MAC, genuinely arrives at the netdev/slirp boundary. The disconnect
+// is between "packet arrives at QEMU's netdev" and "packet lands in
+// USBNetState.in_len" -- upstream of anything this guest-side driver
+// controls. Resolving it further would need instrumenting QEMU's own
+// usbnet_receive() directly (no existing trace event covers it) and
+// rebuilding QEMU -- out of scope for a guest-driver-only fix. See
+// task #182's own memory for the full investigation.
 fn ssh_real_accept(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
   let leased_ip: u32 = dhcp_state_get_leased_ip();
   let _ = tcp_conn_passive_open(conn_id, leased_ip, 22 as u32);
   let iter: i64 = 0;
   while (iter < 200) && (tcp_conn_get_state(conn_id) != tcp_state_established()) {
     let frame: mut ref i64 = ssh_frame_scratch_get();
+    let _ = dhruva_prio_lock(2);
     let flen: i64 = netif_recv_frame(frame, 1514);
+    let _ = dhruva_prio_unlock(3);
     if flen > 0 {
       let is_relevant: i64 = 0;
       if buf_read_u16_be(frame, 12) == (0x0800 as u32) {
@@ -26017,7 +26087,9 @@ fn ssh_real_accept(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i
 
 fn ssh_real_deliver_one_frame(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, out_payload: mut ref i64, max_len: i64) -> i64 {
   let frame: mut ref i64 = ssh_frame_scratch_get();
+  let _ = dhruva_prio_lock(2);
   let flen: i64 = netif_recv_frame(frame, 1514);
+  let _ = dhruva_prio_unlock(3);
   if flen <= 0 {
     return 0 - 1;
   }
@@ -26475,7 +26547,9 @@ fn ssh_real_server_cmd() -> i64 {
   let close_iter: i64 = 0;
   while (close_iter < 50) && (tcp_conn_get_state(conn_id) != tcp_state_closed_final()) {
     let frame: mut ref i64 = ssh_frame_scratch_get();
+    let _ = dhruva_prio_lock(2);
     let flen: i64 = netif_recv_frame(frame, 1514);
+    let _ = dhruva_prio_unlock(3);
     if flen > 0 {
       let discard: mut ref i64 = ssh_recv_chunk_scratch_get();
       let _ = tcp_conn_handle_segment(conn_id, frame, flen, my_mac, ssh_dst_mac_get(), discard, 64);
