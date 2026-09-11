@@ -604,6 +604,16 @@ extern "C" fn yv_x_sp_addr() -> mut ref i64;
 extern "C" fn yv_y_sp_addr() -> mut ref i64;
 extern "C" fn yv_driver_sp_addr() -> mut ref i64;
 
+// Round 179: heap allocator (Phase 1 -- bump allocator, no stack-
+// guard-page variant yet, see runtime_stubs_rpi4.c's own comment).
+// Ported from kernel_main.vani's own identically-shaped dhruva_alloc_
+// bytes/dhruva_heap_used_bytes/dhruva_alloc_count_get extern block.
+extern "C" fn dhruva_alloc_bytes_rpi4(n: i64) -> mut ref i64;
+extern "C" fn dhruva_heap_used_bytes_rpi4() -> i64;
+extern "C" fn dhruva_alloc_count_get_rpi4() -> i64;
+extern "C" fn buf_write_byte(buf: mut ref i64, offset: u32, value: u32) -> u32;
+extern "C" fn buf_read_byte(buf: mut ref i64, offset: u32) -> u32;
+
 #[no_mangle]
 fn preempt_yield_task_x_entry() -> i64 {
   let i: i64 = 0;
@@ -691,6 +701,72 @@ use "../vendor/pki/src/lib.vani";
 // header comment on why its `use` paths point one level up instead of
 // nesting its own copy).
 use "../vendor/tls13/src/lib.vani";
+
+// Round 179: nothing else calls dhruva_alloc_bytes_rpi4 yet (Phase 1
+// deliberately doesn't wire the allocator into any real buffer --
+// see its own header comment), unlike Pi 1 where hundreds of existing
+// call sites already exercise dhruva_alloc_bytes implicitly. Without
+// a real consumer, heap_usage_self_test_rpi4's own "(PASS)" would
+// only prove the allocator LINKS, not that it actually allocates
+// correctly -- so this exercises it directly: two separate
+// allocations, each written with a distinct byte pattern and read
+// back, confirming neither overlaps the other nor corrupts it.
+fn heap_alloc_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let count_before: i64 = dhruva_alloc_count_get_rpi4();
+  let used_before: i64 = dhruva_heap_used_bytes_rpi4();
+
+  let a: mut ref i64 = dhruva_alloc_bytes_rpi4(64);
+  let b: mut ref i64 = dhruva_alloc_bytes_rpi4(64);
+
+  let i: u32 = 0 as u32;
+  while i < (64 as u32) {
+    let _ = buf_write_byte(a, i, 0xAB as u32);
+    let _ = buf_write_byte(b, i, 0xCD as u32);
+    i = i + (1 as u32);
+  }
+
+  i = 0 as u32;
+  while i < (64 as u32) {
+    if buf_read_byte(a, i) != (0xAB as u32) { ok = 0; }
+    if buf_read_byte(b, i) != (0xCD as u32) { ok = 0; }
+    i = i + (1 as u32);
+  }
+
+  if dhruva_alloc_count_get_rpi4() != (count_before + 2) { ok = 0; }
+  if dhruva_heap_used_bytes_rpi4() != (used_before + 128) { ok = 0; }
+
+  let _ = uart_puts_rpi4_vani("HEAP: dhruva_alloc_bytes_rpi4 two-allocation write/read + no-overlap check");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
+// Mirrors kernel_main.vani's own heap_usage_self_test byte-for-byte
+// (same capacity constant meaning, same headroom margin) -- see
+// runtime_stubs_rpi4.c's own dhruva_alloc_bytes_rpi4 comment for the
+// allocator this reports on.
+fn heap_usage_self_test_rpi4() -> i64 {
+  let used: i64 = dhruva_heap_used_bytes_rpi4();
+  let capacity: i64 = 786432; // DHRUVA_HEAP_BYTES_RPI4, runtime_stubs_rpi4.c
+  let headroom: i64 = capacity - used;
+  let min_headroom: i64 = 16384; // generous margin for future rounds
+  let _ = uart_puts_rpi4_vani("HEAP: used=");
+  let _ = uart_put_i64_rpi4_vani(used);
+  let _ = uart_puts_rpi4_vani(" capacity=");
+  let _ = uart_put_i64_rpi4_vani(capacity);
+  let _ = uart_puts_rpi4_vani(" headroom=");
+  let _ = uart_put_i64_rpi4_vani(headroom);
+  if headroom >= min_headroom {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL, expect headroom >= 16384)\n");
+  }
+  return 0;
+}
 
 fn sha256_self_test_rpi4() -> i64 {
   let ok: i64 = sha256_self_test();
@@ -3862,6 +3938,8 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = task_switch_self_test();
   let _ = preempt_yield_self_test();
   let _ = preempt_init();
+  let _ = heap_alloc_self_test_rpi4();
+  let _ = heap_usage_self_test_rpi4();
   let _ = sha256_self_test_rpi4();
   let _ = sha512_self_test_rpi4();
   let _ = x25519_self_test_rpi4();
@@ -4129,15 +4207,21 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, sha512, x25519, ed25519, pki, tls, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, heap, sha256, sha512, x25519, ed25519, pki, tls, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 166 minimal shell + crypto + tls1.3 + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 179 minimal shell + crypto + tls1.3 + heap + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {
     let _ = rpi4_vani_self_test();
+    return 0;
+  }
+  if rpi4_shell_line_matches("heap") == (1 as u32) {
+    let _ = uart_puts_rpi4_vani("\n");
+    let _ = heap_alloc_self_test_rpi4();
+    let _ = heap_usage_self_test_rpi4();
     return 0;
   }
   if rpi4_shell_line_matches("sha256") == (1 as u32) {

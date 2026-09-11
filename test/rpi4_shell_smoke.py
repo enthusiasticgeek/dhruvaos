@@ -97,6 +97,8 @@ def run(elf_path: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[int, str]:
         time.sleep(CMD_WAIT_S)
         send("test")
         time.sleep(CMD_WAIT_S)
+        send("heap")
+        time.sleep(CMD_WAIT_S)
         send("sha256")
         time.sleep(CMD_WAIT_S)
         send("sha512")
@@ -151,11 +153,15 @@ def main() -> int:
     print(output, end="")
 
     checks = {
-        "help lists commands": "commands: help, ver, test, sha256, sha512, x25519, ed25519, pki, tls, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>" in output,
-        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 166 minimal shell + crypto + tls1.3 + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt" in output,
+        "help lists commands": "commands: help, ver, test, heap, sha256, sha512, x25519, ed25519, pki, tls, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>" in output,
+        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 179 minimal shell + crypto + tls1.3 + heap + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt" in output,
         "echo echoes real argument text": "hello dhruva" in output,
         "unknown command reported": "unknown command (try 'help')" in output,
         "test reruns the real self-test": "sum=5050 quotient=14285 remainder=5" in output,
+        "heap reruns the allocator correctness self-test": output.count(
+            "HEAP: dhruva_alloc_bytes_rpi4 two-allocation write/read + no-overlap check (PASS)"
+        ) >= 2,
+        "heap reruns the headroom self-test": output.count("HEAP: used=") >= 2,
         "sha256 reruns the crypto self-test": output.count(
             'CRYPTO: SHA-256 vs 3 NIST/FIPS-180-4 KATs (empty, "abc", 2-block) (PASS)'
         ) >= 2,
@@ -212,8 +218,8 @@ def main() -> int:
     ok = all(checks.values())
 
     if ok:
-        print(f"\n[rpi4_shell_smoke.py] PASS -- all 21 real shell commands (help, "
-              f"ver, echo, an unknown command, test, sha256, sha512, x25519, "
+        print(f"\n[rpi4_shell_smoke.py] PASS -- all 22 real shell commands (help, "
+              f"ver, echo, an unknown command, test, heap, sha256, sha512, x25519, "
               f"ed25519, pki, tls, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, "
               f"netcfg, mqtt) got their correct real responses over a live QEMU "
               f"stdio UART session.", file=sys.stderr)

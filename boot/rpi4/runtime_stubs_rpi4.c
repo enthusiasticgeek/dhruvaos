@@ -9,12 +9,13 @@
  * panic path calls dprintf()+exit()) -- see build_rpi4.sh's own
  * comment for the full "why", identical to build.sh's Pi 1 rationale.
  *
- * Deliberately smaller than boot/rpi1/runtime_stubs.c: no libgcc
+ * Smaller than boot/rpi1/runtime_stubs.c in one respect: no libgcc
  * divide helper needed (AArch64 has a hardware SDIV/UDIV, unlike
- * ARMv6), and no heap allocator / OOM path yet (kernel_main_rpi4.vani
- * has no dhruva_alloc_bytes call at all -- see that file's own header
- * comment on keeping this round's scope to exactly proving the
- * toolchain, nothing more).
+ * ARMv6). Round 179 added a heap allocator (dhruva_alloc_bytes_rpi4
+ * and friends, below) ported from that same file's own design -- see
+ * that section's own comment for the one real AArch64-vs-ARM32
+ * porting difference (DAIF vs. CPSR for the critical section) and why
+ * this board didn't have one until now.
  */
 
 typedef unsigned long size_t;
@@ -127,4 +128,97 @@ void exit(int code) {
     while (1) {
         /* halt -- there is no OS to return to */
     }
+}
+
+/* Round 179: heap allocator, ported from boot/rpi1/runtime_stubs.c's
+ * own dhruva_alloc_bytes -- a plain bump allocator (no free) over a
+ * static backing array, 8-byte-aligned, halting on exhaustion rather
+ * than returning null (matching that file's own reasoning: every
+ * caller in this codebase assumes allocation cannot fail, so a null
+ * return would just move the crash to a less diagnosable spot).
+ * Motivated directly by round 166's 512-byte-array-cap style: without
+ * a heap, every buffer on this board has to be a fixed-size [T; N]
+ * sized for the worst case up front (TLS's own 512-byte cap, well
+ * under Pi 1's real 2048-byte record size, is exactly this
+ * constraint) -- a heap removes that ceiling.
+ *
+ * Only real porting difference from the ARM32 original: AArch64 has
+ * no CPSR/`cpsid`. The DAIF register's bit 1 (0x2) is the IRQ mask,
+ * set with `msr daifset, #2` and restored by writing the whole
+ * register back with `msr daif, %0` -- same "always leave interrupts
+ * exactly as this function found them" critical-section shape, just
+ * AArch64's own instructions for it. No stack-guard-page variant yet
+ * (Pi 1's dhruva_alloc_stack_guarded) -- this board's MMU
+ * (boot/rpi4/mmu_init.S) only has 2MB block descriptors so far, no
+ * 4KB page-table level to install a guard page into; tracked
+ * separately (task #178) as a real new MMU capability, not just a
+ * port of this function. */
+#define DHRUVA_HEAP_BYTES_RPI4 (768 * 1024)
+static unsigned char dhruva_heap_rpi4[DHRUVA_HEAP_BYTES_RPI4];
+static unsigned long dhruva_heap_used_rpi4 = 0;
+static unsigned long dhruva_alloc_count_rpi4 = 0;
+
+static void dhruva_oom_fatal_rpi4(unsigned long requested, unsigned long used) {
+    __asm__ volatile ("msr daifset, #2" ::: "memory");
+    dhruva_dprintf_puts_rpi4("\nFATAL: dhruva_alloc_bytes out of memory -- requested ");
+    dhruva_dprintf_put_i64_rpi4((long long)requested);
+    dhruva_dprintf_puts_rpi4(" bytes, ");
+    dhruva_dprintf_put_i64_rpi4((long long)used);
+    dhruva_dprintf_puts_rpi4(" of ");
+    dhruva_dprintf_put_i64_rpi4((long long)DHRUVA_HEAP_BYTES_RPI4);
+    dhruva_dprintf_puts_rpi4(" already used. Halting -- heap_usage_self_test_rpi4's own"
+                              " boot-time headroom check should have caught this before"
+                              " it ever reached here.\n");
+    while (1) {
+        /* halt -- there is no safe way to continue with a request this
+         * function could not satisfy */
+    }
+}
+
+long long dhruva_alloc_count_get_rpi4(void) {
+    return (long long)dhruva_alloc_count_rpi4;
+}
+
+long long dhruva_heap_used_bytes_rpi4(void) {
+    return (long long)dhruva_heap_used_rpi4;
+}
+
+/* Round 179: raw byte read/write through a heap pointer, the AArch64
+ * twin of boot/dharafs_buf.S's own buf_read_byte/buf_write_byte
+ * (ARM32 assembly, `strb`/`ldrb`) -- trivial enough to write directly
+ * in C here rather than a new AArch64 assembly file, same as this
+ * file's own memcpy/strlen stubs above. `buf` is a raw pointer
+ * (vani's `mut ref i64` calling convention for heap-pointer-style
+ * APIs, matching kernel_main.vani's own dhruva_alloc_bytes callers).
+ */
+unsigned int buf_write_byte(unsigned char *buf, unsigned int offset, unsigned int value) {
+    buf[offset] = (unsigned char)value;
+    return 0;
+}
+
+unsigned int buf_read_byte(unsigned char *buf, unsigned int offset) {
+    return (unsigned int)buf[offset];
+}
+
+void *dhruva_alloc_bytes_rpi4(long n) {
+    unsigned long need = (unsigned long)n;
+    unsigned long saved_daif;
+    __asm__ volatile ("mrs %0, daif\n\tmsr daifset, #2" : "=r"(saved_daif) :: "memory");
+
+    unsigned long aligned_used = (dhruva_heap_used_rpi4 + 7UL) & ~7UL;
+    if (aligned_used + need > DHRUVA_HEAP_BYTES_RPI4) {
+        unsigned long used_at_failure = dhruva_heap_used_rpi4;
+        dhruva_oom_fatal_rpi4(need, used_at_failure);
+        /* unreachable -- dhruva_oom_fatal_rpi4 never returns */
+    }
+    unsigned char *p = dhruva_heap_rpi4 + aligned_used;
+    dhruva_heap_used_rpi4 = aligned_used + need;
+    dhruva_alloc_count_rpi4 = dhruva_alloc_count_rpi4 + 1;
+    __asm__ volatile ("msr daif, %0" :: "r"(saved_daif) : "memory");
+    unsigned long i = 0;
+    while (i < need) {
+        p[i] = 0;
+        i = i + 1;
+    }
+    return (void*)p;
 }
