@@ -2809,26 +2809,35 @@ crypto self-test's own `_rpi4` wrapper convention). Full
 `rpi4_boot_smoke.py` and `rpi4_shell_smoke.py` both pass after the
 swap, TLS 1.3 self-test included.
 
-**Pi 1 migration NOT done — real API mismatch found, not a simple
-swap**: Pi 1's own `kernel_main.vani` has a mature, real-hardware-
-proven TLS 1.3 implementation, but it uses a fundamentally different
-calling convention than `vani-tls13`'s current API. Pi 1's records go
-up to 2048 bytes, held in heap scratch (`dhruva_alloc_bytes(2048)`)
-and accessed through `mut ref i64` pointer parameters + `buf_read_
-byte`/`buf_write_byte` — not `vani-tls13`'s fixed `[u8; 512]`-array
-style, which was extracted from Pi 4/5's smaller, simpler
-implementation and caps out well under Pi 1's real message sizes. A
-`use`-statement swap won't work here. Options for a future round:
-extend `vani-tls13` with a second, heap-pointer-based API surface
-(mirroring how `chacha20_poly1305`/`curve25519` already ship both a
-capped array-based convenience layer AND an uncapped streaming layer
-that Pi 1's own `_heap` adapters build on), or a different bridging
-approach. Deliberately NOT attempted in this round — Pi 1's SD card is
-physically flashed and awaiting its first real hardware boot test
-(task #163); a redesign-level change to its working kernel without
-thorough verification isn't worth the risk right now. Tracked
-separately as task #174, scoped but not started (same "pause for a
-risk/value read" treatment as round 103's scheduler generification).
+**ROUND 174 UPDATE, 2026-09-11 (DONE)**: Pi 1 migration completed.
+The original blocker was real — Pi 1's own `kernel_main.vani` has a
+mature, real-hardware-proven TLS 1.3 implementation using a
+fundamentally different calling convention than `vani-tls13`'s
+original array-based API: records up to 2048 bytes, held in heap
+scratch and accessed through `mut ref i64` pointer parameters + `buf_
+read_byte`/`buf_write_byte`, not the fixed `[u8; 512]`-array style
+extracted from Pi 4/5's smaller implementation. Round 179's new Pi 4/5
+heap allocator (below) removed the reason vani-tls13 was array-only in
+the first place, unblocking a proper fix: added a second, heap-pointer
+API surface to `vani-tls13` itself (`src/lib.vani`'s new `_heap`-
+suffixed functions), using out-param calling convention matching Pi
+1's own original functions exactly (`tls_derive_secret_heap`/`tls_
+finished_verify_data_heap`/`tls_derive_traffic_keys_heap`/`tls_
+encrypt_record_heap`/`tls_decrypt_record_heap` all write into an `out`
+pointer and return a status, not return-by-value) — this made Pi 1's
+actual migration a pure rename at every one of its ~130 call sites,
+not a semantic rewrite. Also added `src/core.vani` (matching crypto_
+hash/curve25519/chacha20_poly1305's own core/lib split) since Pi 1's
+board-side code already defines names — `sha256_self_test`, `x25519_
+self_test`, etc. — that collide with `lib.vani`'s own vendored
+self-tests. Removed ~330 lines of Pi 1's own duplicated pure-logic
+layer; the stateful transport/session layer (`tls_service`/`tls_
+connect`/`tls_accept`/`tls_send`/`tls_recv`) stays board-specific, per
+the established mechanism/policy split. Verified via `vanic check`,
+the `vanic stack-depth` gate (unchanged budget), and a full
+`phase4_milestone.py` pass including `tlsecho`/`httpecho`/`mqttecho`
+exercising the migrated code live. Both DhruvaOS boards now genuinely
+share one TLS 1.3 implementation.
 
 **ROUND 176 UPDATE, 2026-09-11 (DONE)**: build-time `vanic stack-depth`
 gate, added directly because round 166's own overflow went undetected
