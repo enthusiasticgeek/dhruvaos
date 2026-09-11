@@ -611,8 +611,11 @@ extern "C" fn yv_driver_sp_addr() -> mut ref i64;
 extern "C" fn dhruva_alloc_bytes_rpi4(n: i64) -> mut ref i64;
 extern "C" fn dhruva_heap_used_bytes_rpi4() -> i64;
 extern "C" fn dhruva_alloc_count_get_rpi4() -> i64;
-extern "C" fn buf_write_byte(buf: mut ref i64, offset: u32, value: u32) -> u32;
-extern "C" fn buf_read_byte(buf: mut ref i64, offset: u32) -> u32;
+// buf_write_byte/buf_read_byte: NOT declared here -- round 174 added
+// them to vani-tls13's own heap-pointer API (vendor/tls13/src/
+// lib.vani), transitively `use`d below, and a duplicate declaration
+// here is a compile error (vani resolves names globally). Implemented
+// for this board in runtime_stubs_rpi4.c's own C port (round 179).
 
 #[no_mangle]
 fn preempt_yield_task_x_entry() -> i64 {
