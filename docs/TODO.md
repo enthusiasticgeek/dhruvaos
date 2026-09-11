@@ -2796,13 +2796,39 @@ There was never a vani-compiler bug. Re-run `vanic stack-depth`
 against any future round that adds a deep new call chain, rather than
 discovering the ceiling via a live corruption bug again.
 
-**Still open**: per the standing policy above, extract this pure-logic
-TLS 1.3 layer into a new `vani-tls13` shared kosh package instead of
-leaving it duplicated inside `kernel_main_rpi4.vani` — and migrate
-Pi 1's own original TLS implementation to consume the same package
-too, closing the duplication rather than creating a third copy of a
-pattern already unified for crypto (rounds 98-102) and networking
-(rounds 106a-106f). Tracked as task #172.
+**ROUND 172 UPDATE, 2026-09-10 (DONE, Pi 4/5 side)**: per the standing
+policy above, extracted this pure-logic TLS 1.3 layer into a new
+[`vani-tls13`](https://github.com/enthusiasticgeek/vani-tls13) shared
+kosh package (Apache-2.0, matches crypto_hash/curve25519/chacha20_
+poly1305/pki's own naming convention) instead of leaving it duplicated
+inside `kernel_main_rpi4.vani`. `tls13_self_test()` passes on the host
+LLVM JIT; vendored into DhruvaOS at `vendor/tls13/`, replacing 807
+lines of duplicated code in `kernel_main_rpi4.vani` with a `use`
+statement plus a 12-line board-specific wrapper (matching every other
+crypto self-test's own `_rpi4` wrapper convention). Full
+`rpi4_boot_smoke.py` and `rpi4_shell_smoke.py` both pass after the
+swap, TLS 1.3 self-test included.
+
+**Pi 1 migration NOT done — real API mismatch found, not a simple
+swap**: Pi 1's own `kernel_main.vani` has a mature, real-hardware-
+proven TLS 1.3 implementation, but it uses a fundamentally different
+calling convention than `vani-tls13`'s current API. Pi 1's records go
+up to 2048 bytes, held in heap scratch (`dhruva_alloc_bytes(2048)`)
+and accessed through `mut ref i64` pointer parameters + `buf_read_
+byte`/`buf_write_byte` — not `vani-tls13`'s fixed `[u8; 512]`-array
+style, which was extracted from Pi 4/5's smaller, simpler
+implementation and caps out well under Pi 1's real message sizes. A
+`use`-statement swap won't work here. Options for a future round:
+extend `vani-tls13` with a second, heap-pointer-based API surface
+(mirroring how `chacha20_poly1305`/`curve25519` already ship both a
+capped array-based convenience layer AND an uncapped streaming layer
+that Pi 1's own `_heap` adapters build on), or a different bridging
+approach. Deliberately NOT attempted in this round — Pi 1's SD card is
+physically flashed and awaiting its first real hardware boot test
+(task #163); a redesign-level change to its working kernel without
+thorough verification isn't worth the risk right now. Tracked
+separately as task #174, scoped but not started (same "pause for a
+risk/value read" treatment as round 103's scheduler generification).
 
 **Round 40 correction**: `docs/PORTING.md` previously claimed no QEMU
 target exists for Pi 4/5 at all. Verified false for Pi 4 — QEMU's
