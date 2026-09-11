@@ -27,8 +27,11 @@ Round 94 added `sha512` (the first step of the SHA-512 ->
 field25519/X25519 -> Ed25519 -> PKI crypto chain). Round 95 added
 `x25519` (field25519 field arithmetic + X25519 Diffie-Hellman, step 2
 of that chain). Round 96 added `ed25519` (EdDSA sign/verify, step 3
-of that chain). Round 97 added `pki` (raw public-key trust, the LAST
-link of that chain -- a one-line wrapper around `ed25519_verify_rpi4`).
+of that chain). Round 97 added `pki` (raw public-key trust, step 4 of
+that chain -- a one-line wrapper around `ed25519_verify_rpi4`). Round
+166 added `tls` (a full TLS 1.3 handshake + app-data round trip over
+the shared chacha20_poly1305/x25519/ed25519/pki chain, RFC 7250 raw
+public keys -- the chain's own final consumer).
 
 Drives real commands over QEMU's stdio UART (help, ver, test, echo)
 and checks each one's real response, using phase4_milestone.py's own
@@ -104,6 +107,8 @@ def run(elf_path: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[int, str]:
         time.sleep(CMD_WAIT_S)
         send("pki")
         time.sleep(CMD_WAIT_S)
+        send("tls")
+        time.sleep(CMD_WAIT_S)
         send("netif")
         time.sleep(CMD_WAIT_S)
         send("arp")
@@ -146,8 +151,8 @@ def main() -> int:
     print(output, end="")
 
     checks = {
-        "help lists commands": "commands: help, ver, test, sha256, sha512, x25519, ed25519, pki, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>" in output,
-        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 109 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt" in output,
+        "help lists commands": "commands: help, ver, test, sha256, sha512, x25519, ed25519, pki, tls, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>" in output,
+        "ver prints identity": "Dhruva OS -- Pi 4/5 port, round 166 minimal shell + crypto + tls1.3 + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt" in output,
         "echo echoes real argument text": "hello dhruva" in output,
         "unknown command reported": "unknown command (try 'help')" in output,
         "test reruns the real self-test": "sum=5050 quotient=14285 remainder=5" in output,
@@ -165,6 +170,9 @@ def main() -> int:
         ) >= 2,
         "pki reruns the crypto self-test": output.count(
             "CRYPTO: PKI raw public-key trust vs kernel_main.vani's own verified reference (genuine sig + tamper reject) (PASS)"
+        ) >= 2,
+        "tls reruns the TLS 1.3 self-test": output.count(
+            "CRYPTO: TLS 1.3 (TLS_CHACHA20_POLY1305_SHA256, x25519, RFC 7250 raw pubkeys) live handshake + app data round trip (PASS)"
         ) >= 2,
         "netif reruns the loopback self-test": output.count(
             "NET: loopback netif send/recv + empty/full queue edge cases (PASS)"
@@ -204,11 +212,11 @@ def main() -> int:
     ok = all(checks.values())
 
     if ok:
-        print(f"\n[rpi4_shell_smoke.py] PASS -- all 20 real shell commands (help, "
+        print(f"\n[rpi4_shell_smoke.py] PASS -- all 21 real shell commands (help, "
               f"ver, echo, an unknown command, test, sha256, sha512, x25519, "
-              f"ed25519, pki, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, "
-              f"mqtt) got their correct real responses over a live QEMU stdio UART "
-              f"session.", file=sys.stderr)
+              f"ed25519, pki, tls, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, "
+              f"netcfg, mqtt) got their correct real responses over a live QEMU "
+              f"stdio UART session.", file=sys.stderr)
         return 0
     failed = [name for name, passed in checks.items() if not passed]
     print(f"\n[rpi4_shell_smoke.py] FAIL -- failed checks: {failed!r}",

@@ -1100,16 +1100,16 @@ fn tls_hkdf_expand_label_rpi4(secret: ref [u8; 32], label: Str, context: ref [u8
 // Hand-unrolled into up to 4 distinctly-named Sha256Ctx bindings
 // (ctx0 -> ctx1 -> ctx2 -> ctx3 -> ctx4) rather than a loop that
 // reassigns a single `ctx` variable to itself (`ctx = sha256_update
-// (ref ctx, ...)`) -- deliberately avoiding that self-reassignment-
-// in-a-loop shape after it was found to corrupt unrelated memory on
-// this board (round 166: a live boot regression where enabling this
-// function broke tcp_conn_self_test_rpi4 much later in the same boot
-// sequence, root-caused to this exact pattern -- crypto_hash's own
-// `sha256_streaming_self_test` never does `ctxN = sha256_update(ref
-// ctxN, ...)`, only ever chaining into a FRESH name per step, and
-// matching that shape here fixed it). 4 chunks of 256 bytes covers
-// every real transcript this file ever builds (max ~400 bytes through
-// server Finished) with comfortable headroom up to 1024.
+// (ref ctx, ...)`), matching crypto_hash's own `sha256_streaming_
+// self_test` shape, which never does `ctxN = sha256_update(ref ctxN,
+// ...)` either. (Round 166 tried this as a fix for a live boot
+// regression and it did NOT change the outcome -- the actual root
+// cause was a boot-stack overflow, see boot/rpi4/link.ld's own
+// comment -- but the fresh-name-per-step shape is kept anyway since
+// it matches the package's established convention.) 4 chunks of 256
+// bytes covers every real transcript this file ever builds (max ~400
+// bytes through server Finished) with comfortable headroom up to
+// 1024.
 fn tls_hash_transcript_rpi4(transcript: ref [u8; 1024], transcript_len: i64) -> [u8; 32] {
   let ctx0: Sha256Ctx = sha256_init();
   let chunk0: [u8; 256] = [0 as u8; 256];
@@ -4750,21 +4750,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = x25519_self_test_rpi4();
   let _ = ed25519_self_test_rpi4();
   let _ = pki_self_test_rpi4();
-  // BLOCKED (round 166, 2026-09-10): tls_self_test_rpi4() is fully
-  // written and passes on the host LLVM JIT, but is disabled here
-  // pending a real AArch64-codegen bug in the shared chacha20_
-  // poly1305 package -- isolated to a SINGLE minimal encrypt+decrypt
-  // round trip with a short (<64-byte) plaintext, which corrupts
-  // unrelated memory (TCP/UDP/DHCP break, eventually a real fault)
-  // specifically when cross-compiled to AArch64 and run under real
-  // QEMU. Pi 1 (ARM32) has used this exact package correctly in
-  // production all session, including for genuinely short messages,
-  // so this is NOT a logic bug in the package's own vani source --
-  // something about AArch64 instruction selection/register
-  // allocation for this code path is the suspect. See project memory
-  // project_dhruva_round166_tls13_scoping_and_bug_2026_09_10.md for
-  // the full bisection trail. Re-enable once root-caused and fixed.
-  // let _ = tls_self_test_rpi4();
+  let _ = tls_self_test_rpi4();
   // Round 88: packet filtering's own default policy -- .bss's own
   // zero-init would otherwise leave it at 0 (deny), which would
   // silently break every self-test below that touches netif (all of
@@ -5026,11 +5012,11 @@ fn rpi4_shell_starts_with(prefix: Str) -> u32 {
 // is only ever what a command itself prints.
 fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("help") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, sha512, x25519, ed25519, pki, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>\n");
+    let _ = uart_puts_rpi4_vani("\ncommands: help, ver, test, sha256, sha512, x25519, ed25519, pki, tls, netif, arp, ip, filter, tcp, udp, dhcp, dhcps, netcfg, mqtt, echo <text>\n");
     return 0;
   }
   if rpi4_shell_line_matches("ver") == (1 as u32) {
-    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 109 minimal shell + crypto + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt\n");
+    let _ = uart_puts_rpi4_vani("\nDhruva OS -- Pi 4/5 port, round 166 minimal shell + crypto + tls1.3 + netif + arp + ip + filter + tcp + udp + dhcp + dhcps + netcfg + mqtt\n");
     return 0;
   }
   if rpi4_shell_line_matches("test") == (1 as u32) {

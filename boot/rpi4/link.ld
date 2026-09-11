@@ -46,16 +46,33 @@ SECTIONS
     .bss : { *(.bss*) *(COMMON) }
     __bss_end = .;
 
-    /* 16KB boot stack for EL1, growing down from _stack_top -- same
-     * size class as boot/rpi1/link.ld's own main task stack. No
-     * separate IRQ/Abort-mode stacks yet (AArch64 has no banked-per-
-     * mode SP the way ARM32 does -- SP_EL1 is the only stack pointer
-     * this v1 kernel needs, since it runs entirely at EL1 with
-     * interrupts masked; a future round enabling real interrupts
-     * will need to decide whether EL1 exceptions share this stack or
-     * get their own, once there's an actual handler that does
-     * meaningful work instead of just reporting and halting). */
+    /* 64KB boot stack for EL1, growing down from _stack_top -- bumped
+     * from the original 16KB (round 43/74's own size class, matching
+     * boot/rpi1/link.ld's own main task stack) after round 166 found
+     * a real, vani-compiler-`stack-depth`-CONFIRMED overflow: the
+     * real call chain kmain_rpi4_vani -> tls_self_test_rpi4 ->
+     * tls_decrypt_record_rpi4 -> chacha20_poly1305_decrypt ->
+     * chacha20_encrypt -> cp_zero512_bytes -> cp_zero256_bytes needs
+     * 27032 bytes -- 10648 bytes OVER the old 16KB budget, silently
+     * corrupting whatever memory sits past the stack's own bottom
+     * (this board's own boot stack has no guard page). `vanic
+     * stack-depth kernel/kernel_main_rpi4.vani --entry=kmain_rpi4_vani
+     * --max=<N>` is the tool that found this -- re-run it after any
+     * future round adds a deep new call chain, rather than
+     * discovering the ceiling via a live corruption bug again. Same
+     * "map/allocate more, don't shrink working code to fit an
+     * arbitrary old limit" philosophy as round 71's GPU-RAM fix and
+     * round 108's own ARM-RAM-mapping fix on the Pi 1 side -- Pi 4/5's
+     * own 2GB of real RAM (already generously mapped by mmu_init.S)
+     * makes a 4x stack bump costless. No separate IRQ/Abort-mode
+     * stacks yet (AArch64 has no banked-per-mode SP the way ARM32
+     * does -- SP_EL1 is the only stack pointer this v1 kernel needs,
+     * since it runs entirely at EL1 with interrupts masked; a future
+     * round enabling real interrupts will need to decide whether EL1
+     * exceptions share this stack or get their own, once there's an
+     * actual handler that does meaningful work instead of just
+     * reporting and halting). */
     . = ALIGN(16);
-    . = . + 0x4000;
+    . = . + 0x10000;
     _stack_top = .;
 }

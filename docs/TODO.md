@@ -2748,49 +2748,61 @@ own TLS logic directly into `kernel_main_rpi4.vani` — pure protocol
 logic with zero hardware dependency, already calling nothing but other
 shared packages — before this policy was made explicit mid-round).
 
-**ROUND 166 UPDATE, 2026-09-10 (IN PROGRESS, not yet complete)**: TLS
-1.3 port to Pi 4/5. A faithful, byte-for-byte port of kernel_main
-.vani's own TLS 1.3 implementation (wire-format helpers, handshake
-message builders, HKDF/HMAC key schedule, AEAD record layer, transcript
-hashing — all pure logic, calling only the already-shared crypto_hash/
-curve25519/chacha20_poly1305 packages) was written and its self-test
-verified correct on the host LLVM JIT. **Two things still open before
-this round is done:**
-1. **Per the standing policy above**: extract this pure-logic layer
-   into a new `vani-tls13` shared kosh package instead of leaving it
-   duplicated inside `kernel_main_rpi4.vani` — and migrate Pi 1's own
-   original TLS implementation to consume the same package too,
-   closing the duplication rather than creating a third copy of a
-   pattern already unified for crypto (rounds 98-102) and networking
-   (rounds 106a-106f).
-2. **A real vani-compiler AArch64 codegen bug, ROOT-CAUSED (not yet
-   fixed)**: isolated to a SINGLE minimal `chacha20_poly1305_encrypt`+
-   `chacha20_poly1305_decrypt` round trip with a plaintext under ~64
-   bytes (ChaCha20's own block size) — no TLS wrapper code needed to
-   reproduce it at all, just two direct calls to the shared package's
-   own exported functions. This corrupts unrelated memory badly enough
-   to fail later self-tests (TCP connection lifecycle/UDP/DHCP) and
-   eventually produce a real fault, ONLY when cross-compiled to
-   AArch64 (Pi 4/5) and run under real QEMU — the exact same vani
-   source is correct on the host LLVM JIT (x86-64) AND on Pi 1's own
-   real ARM32 hardware (which has used this exact package correctly in
-   production all session, including for genuinely short messages via
-   `tlsecho`/`httpecho`/`mqttecho`). Since the SOURCE is identical and
-   two of three architectures are correct, this is a bug in how
-   `vani-compiler`'s `backend_llvm.rs` generates AArch64 machine code
-   for a short-plaintext/final-partial-block code path — not a logic
-   bug in the package, not a DhruvaOS bug. NOT yet root-caused inside
-   vani-compiler itself (would need AArch64 disassembly comparison
-   against the equivalent ARM32/x86-64 output) — that's separate,
-   security-sensitive compiler work in a different repo. **Real gap
-   this exposed in this project's own "verify on host first" workflow**:
-   `vanic run` JITs to the HOST architecture, completely different
-   codegen from AArch64 cross-compilation — a bug specific to AArch64
-   codegen is invisible to host-only testing. `tls_self_test_rpi4()`'s
-   boot-time call is disabled (with an explanatory comment) until this
-   is fixed; the rest of the Pi 4/5 boot sequence is unaffected and
-   fully clean. May also affect any OTHER future Pi 4/5 code calling
-   `chacha20_poly1305_encrypt`/`decrypt` with a short plaintext.
+**ROUND 166 UPDATE, 2026-09-10 (DONE)**: TLS 1.3 port to Pi 4/5. A
+faithful, byte-for-byte port of kernel_main.vani's own TLS 1.3
+implementation (wire-format helpers, handshake message builders,
+HKDF/HMAC key schedule, AEAD record layer, transcript hashing — all
+pure logic, calling only the already-shared crypto_hash/curve25519/
+chacha20_poly1305 packages) was written and verified correct on the
+host LLVM JIT, then boot-tested live on real (QEMU-emulated) AArch64.
+
+Boot-testing initially showed what looked exactly like a vani-compiler
+AArch64 codegen bug: enabling `tls_self_test_rpi4()`'s boot-time call
+corrupted unrelated memory badly enough to fail later self-tests (TCP
+connection lifecycle/UDP/DHCP) and eventually fault, reproducible down
+to a single minimal `chacha20_poly1305_encrypt`+`decrypt` round trip
+with a short (<64-byte) plaintext — correct on the host LLVM JIT
+(x86-64) and on Pi 1's own real ARM32 hardware, wrong only when cross-
+compiled to AArch64 and run under real QEMU. Extensive isolation
+(standalone host-JIT repro, `--target=aarch64-linux-gnu` under
+`qemu-aarch64`, and a hand-rolled bare-metal `aarch64-none-elf`
+pipeline with a custom `_start` and canary buffers) ruled out compiler
+codegen at every target checked, which pointed back at the ONE
+difference those isolated repros didn't share with the real boot: the
+real call depth.
+
+**Actual root cause, found via `vanic stack-depth`**: a genuine boot-
+stack overflow. `vanic stack-depth kernel/kernel_main_rpi4.vani
+--entry=kmain_rpi4_vani --max=16384` (a built-in static call-graph
+frame-size analyzer, `vanic build --help` documents it) showed the
+real chain `kmain_rpi4_vani -> tls_self_test_rpi4 ->
+tls_decrypt_record_rpi4 -> chacha20_poly1305_decrypt ->
+chacha20_encrypt -> cp_zero512_bytes -> cp_zero256_bytes` needs 27032
+bytes — 10648 bytes OVER the old 16KB boot stack budget, silently
+corrupting whatever memory sat past the stack's bottom (no guard page
+on this board). A function's OWN `alloca` byte-count (what looked
+"comfortably under 16KB" on a first, incorrect pass) is NOT the same
+as the cumulative depth at the point of deepest call-chain nesting,
+which also stacks every callee's own frame on top. **Fixed** by
+bumping `boot/rpi4/link.ld`'s boot stack from 16KB to 64KB — same
+"map/allocate more, don't shrink working code to fit an arbitrary old
+limit" philosophy as round 71's GPU-RAM fix and round 108's own ARM-
+RAM-mapping fix on Pi 1. Verified via a full `rpi4_boot_smoke.py` AND
+`rpi4_shell_smoke.py` pass, TLS 1.3's live handshake+app-data self-test
+included, plus everything downstream that had been breaking (TCP/UDP/
+DHCP/DHCPS/NETCFG/MQTT/preemption demo) now passing cleanly too.
+
+There was never a vani-compiler bug. Re-run `vanic stack-depth`
+against any future round that adds a deep new call chain, rather than
+discovering the ceiling via a live corruption bug again.
+
+**Still open**: per the standing policy above, extract this pure-logic
+TLS 1.3 layer into a new `vani-tls13` shared kosh package instead of
+leaving it duplicated inside `kernel_main_rpi4.vani` — and migrate
+Pi 1's own original TLS implementation to consume the same package
+too, closing the duplication rather than creating a third copy of a
+pattern already unified for crypto (rounds 98-102) and networking
+(rounds 106a-106f). Tracked as task #172.
 
 **Round 40 correction**: `docs/PORTING.md` previously claimed no QEMU
 target exists for Pi 4/5 at all. Verified false for Pi 4 — QEMU's
