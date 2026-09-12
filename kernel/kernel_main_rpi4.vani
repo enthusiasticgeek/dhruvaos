@@ -647,13 +647,15 @@ extern "C" fn yv_x_sp_addr() -> mut ref i64;
 extern "C" fn yv_y_sp_addr() -> mut ref i64;
 extern "C" fn yv_driver_sp_addr() -> mut ref i64;
 
-// Round 179: heap allocator (Phase 1 -- bump allocator, no stack-
-// guard-page variant yet, see runtime_stubs_rpi4.c's own comment).
+// Round 179: heap allocator (Phase 1 -- bump allocator).
 // Ported from kernel_main.vani's own identically-shaped dhruva_alloc_
 // bytes/dhruva_heap_used_bytes/dhruva_alloc_count_get extern block.
 extern "C" fn dhruva_alloc_bytes_rpi4(n: i64) -> mut ref i64;
 extern "C" fn dhruva_heap_used_bytes_rpi4() -> i64;
 extern "C" fn dhruva_alloc_count_get_rpi4() -> i64;
+// Task #178: stack-guard-page variant, now that mmu_init.S's own
+// mmu_l3_table_data gives this board 4KB page-table granularity.
+extern "C" fn dhruva_alloc_stack_guarded_rpi4(n: i64) -> mut ref i64;
 // buf_write_byte/buf_read_byte: NOT declared here -- round 174 added
 // them to vani-tls13's own heap-pointer API (vendor/tls13/src/
 // lib.vani), transitively `use`d below, and a duplicate declaration
@@ -783,6 +785,53 @@ fn heap_alloc_self_test_rpi4() -> i64 {
   if dhruva_heap_used_bytes_rpi4() != (used_before + 128) { ok = 0; }
 
   let _ = uart_puts_rpi4_vani("HEAP: dhruva_alloc_bytes_rpi4 two-allocation write/read + no-overlap check");
+  if ok == 1 {
+    let _ = uart_puts_rpi4_vani(" (PASS)\n");
+  } else {
+    let _ = uart_puts_rpi4_vani(" (FAIL)\n");
+  }
+  return ok;
+}
+
+// Task #178: correctness check for dhruva_alloc_stack_guarded_rpi4's
+// own allocation/alignment bookkeeping -- deliberately does NOT
+// dereference the guard page itself to prove the fault fires (that
+// would halt this self-test's own boot sequence, same reason
+// kernel_main.vani's own guard-page mechanism has never had a
+// permanent, automated fault-triggering regression test either -- see
+// mmu_guard_page_install_rpi4's own comment for how this WAS verified
+// live, once, via a temporary test hook since removed). What this
+// self-test CAN and does prove on every boot: the usable region
+// returned is correctly writable/readable with no overlap, and the
+// heap's own accounting (used bytes, alloc count) reflects a real
+// guard-page-sized reservation, not just a plain allocation.
+fn guard_page_self_test_rpi4() -> i64 {
+  let ok: i64 = 1;
+  let count_before: i64 = dhruva_alloc_count_get_rpi4();
+  let used_before: i64 = dhruva_heap_used_bytes_rpi4();
+
+  let stack_bytes: i64 = 64;
+  let s: mut ref i64 = dhruva_alloc_stack_guarded_rpi4(stack_bytes);
+
+  let i: u32 = 0 as u32;
+  while i < (64 as u32) {
+    let _ = buf_write_byte(s, i, 0xEF as u32);
+    i = i + (1 as u32);
+  }
+  i = 0 as u32;
+  while i < (64 as u32) {
+    if buf_read_byte(s, i) != (0xEF as u32) { ok = 0; }
+    i = i + (1 as u32);
+  }
+
+  if dhruva_alloc_count_get_rpi4() != (count_before + 1) { ok = 0; }
+  // At least stack_bytes + one full 4KB guard page -- exact delta also
+  // includes whatever alignment padding was needed to reach the next
+  // page boundary from wherever the heap offset happened to be, which
+  // varies by call site, so ">=" is the real invariant, not "==".
+  if dhruva_heap_used_bytes_rpi4() < (used_before + stack_bytes + 4096) { ok = 0; }
+
+  let _ = uart_puts_rpi4_vani("HEAP: dhruva_alloc_stack_guarded_rpi4 usable-region write/read + guard-page-sized accounting");
   if ok == 1 {
     let _ = uart_puts_rpi4_vani(" (PASS)\n");
   } else {
@@ -4049,6 +4098,7 @@ fn kmain_rpi4_vani() -> i64 {
   let _ = preempt_yield_self_test();
   let _ = preempt_init();
   let _ = heap_alloc_self_test_rpi4();
+  let _ = guard_page_self_test_rpi4();
   let _ = heap_usage_self_test_rpi4();
   let _ = sha256_self_test_rpi4();
   let _ = sha512_self_test_rpi4();
@@ -4331,6 +4381,7 @@ fn rpi4_shell_dispatch() -> i64 {
   if rpi4_shell_line_matches("heap") == (1 as u32) {
     let _ = uart_puts_rpi4_vani("\n");
     let _ = heap_alloc_self_test_rpi4();
+    let _ = guard_page_self_test_rpi4();
     let _ = heap_usage_self_test_rpi4();
     return 0;
   }

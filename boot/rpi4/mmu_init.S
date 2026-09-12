@@ -118,6 +118,14 @@
 .equ DESC_UXN,    (1 << 54)
 .equ DESC_BLOCK,  0x1
 .equ DESC_TABLE,  0x3
+/* Task #178: at level 3 (the LAST level for this 4KB-granule, 3-level
+ * walk), there is no "next level" for type=0b11 to point to -- the
+ * architecture repurposes the same bit pattern DESC_TABLE uses at
+ * levels 1/2 to instead mean "page descriptor" (a leaf), with
+ * type=0b01 reserved/invalid at this level. Same numeric value as
+ * DESC_TABLE, given its own name here purely so every L3 fill loop
+ * below reads as "this is a leaf," not "this points somewhere else." */
+.equ DESC_PAGE,   0x3
 
 /* Flags-only (no base address) for the three block-descriptor kinds
  * this table ever uses -- ORed with a 2MB-aligned physical base in
@@ -125,6 +133,12 @@
 .equ FLAGS_CODE_RX,   (DESC_UXN | DESC_AF | DESC_SH_INNER | DESC_AP_RO | DESC_ATTR_NORMAL | DESC_BLOCK)
 .equ FLAGS_DATA_RW,   (DESC_PXN | DESC_UXN | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL | DESC_BLOCK)
 .equ FLAGS_DEVICE_RW, (DESC_PXN | DESC_UXN | DESC_AF | DESC_SH_INNER | DESC_ATTR_DEVICE | DESC_BLOCK)
+/* Task #178: same attribute bits as FLAGS_DATA_RW (AF/SH/AttrIndx/
+ * PXN/UXN all sit at identical bit positions regardless of level --
+ * only the low type field's semantic meaning differs by level), but
+ * with DESC_PAGE in place of DESC_BLOCK for mmu_l3_table_data's own
+ * 512 leaf entries below. */
+.equ FLAGS_DATA_RW_L3, (DESC_PXN | DESC_UXN | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL | DESC_PAGE)
 
 .section ".bss"
 .align 12   /* 4KB alignment -- each table is exactly one page (512
@@ -147,6 +161,31 @@ mmu_l2_table_1:
 mmu_l2_table_3:
     .space 4096
 
+/* Task #178 -- per-task stack guard pages, the AArch64 twin of
+ * boot/mmu_init.S's own mmu_l2_table_data (see that file's own
+ * comment for the full motivating history: a real stack overflow that
+ * silently corrupted adjacent memory and crashed somewhere else,
+ * minutes later, with a misleading fault address, instead of faulting
+ * at the moment of overflow). mmu_l2_table_0's own entry 1 (PA
+ * 0x00200000-0x003FFFFF, where .data/.bss/the heap actually land, per
+ * link.ld's own 2MB ALIGN before .data) used to be one 2MB BLOCK
+ * descriptor -- one uniform permission for the whole 2MB, no finer
+ * boundary expressible. This L3 ("page") table gives that ONE entry
+ * 4KB granularity instead -- 512 entries x 8 bytes, exactly a 2MB
+ * region at 4KB pages -- so mmu_guard_page_install_rpi4 can mark one
+ * page invalid at runtime, well after this table is first built
+ * (there is no dynamic task creation on this board yet -- #169's own
+ * scheduler-generification task is what would eventually call this --
+ * so this is real, tested new MMU capability with no live caller yet,
+ * exactly like round 179's own heap allocator was before #174 gave it
+ * one). Every entry defaults to the exact same RW/PXN/UXN permissions
+ * entry 1's own block descriptor already used -- nothing about this
+ * region's actual behavior changes until a guard page is explicitly
+ * installed. */
+.align 12
+mmu_l3_table_data:
+    .space 4096
+
 .section ".text"
 
 .global mmu_init_rpi4
@@ -158,10 +197,40 @@ mmu_init_rpi4:
     mov x13, x12            /* base address is 0 for entry 0 */
     str x13, [x9, #0]
 
-    /* L2 table 0, entries 1-511: rest of the low 1GB (where .data/
-     * .bss/stack actually land, per link.ld's 2MB ALIGN before
-     * .data), read+write, never execute. */
-    mov x10, #1
+    /* L2 table 0, entry 1 (PA 0x00200000-0x003FFFFF, where .data/
+     * .bss/the heap actually land): task #178 -- now a TABLE
+     * descriptor pointing to mmu_l3_table_data instead of a plain 2MB
+     * block, so a guard page can be installed at 4KB granularity. Same
+     * "page table" type value as a higher-level table descriptor
+     * (0b11) -- context (this is level 2, not the last level) is what
+     * makes it mean "points to a next-level table" here. */
+    ldr x10, =mmu_l3_table_data
+    orr x10, x10, #DESC_TABLE
+    str x10, [x9, #8]
+
+    /* mmu_l3_table_data's own 512 page descriptors -- exactly entry
+     * 1's old 2MB block, now expressed as 512 x 4KB pages, same
+     * RW/PXN/UXN permissions throughout (see FLAGS_DATA_RW_L3's own
+     * comment above for why the attribute bits carry over unchanged).
+     */
+    ldr x9, =mmu_l3_table_data
+    mov x10, #0
+    ldr x12, =FLAGS_DATA_RW_L3
+    ldr x14, =0x00200000
+mmu_l3_data_loop:
+    lsl x11, x10, #12       /* base = index * 4KB */
+    add x11, x11, x14
+    orr x13, x11, x12
+    str x13, [x9, x10, lsl #3]
+    add x10, x10, #1
+    cmp x10, #512
+    b.lt mmu_l3_data_loop
+
+    /* L2 table 0, entries 2-511: rest of the low 1GB, read+write,
+     * never execute -- unchanged 2MB block descriptors (only entry 1
+     * needed 4KB granularity, for the guard page). */
+    ldr x9, =mmu_l2_table_0
+    mov x10, #2
     ldr x12, =FLAGS_DATA_RW
 mmu_l2_0_data_loop:
     lsl x11, x10, #21       /* base = index * 2MB */
@@ -271,4 +340,40 @@ mmu_l2_3_loop:
     msr sctlr_el1, x9
     isb
 
+    ret
+
+/* void mmu_guard_page_install_rpi4(unsigned long addr) -- task #178,
+ * the AArch64 twin of boot/mmu_init.S's own mmu_guard_page_install
+ * (see mmu_l3_table_data's own comment above for the full design).
+ * Called from dhruva_alloc_stack_guarded_rpi4 (boot/rpi4/
+ * runtime_stubs_rpi4.c), whenever this board eventually gets dynamic
+ * task creation (#169) -- genuinely modifies the live page table at
+ * runtime, unlike the boot-time-only fill loops above.
+ *
+ * addr MUST be a 4KB-page-aligned address inside mmu_l2_table_0 entry
+ * 1's own 0x00200000-0x003FFFFF range -- dhruva_alloc_stack_guarded_
+ * rpi4's own bump-and-align logic is what guarantees this, same
+ * single-caller-contract convention boot/mmu_init.S's own version
+ * documents for the ARMv6 side.
+ *
+ * Zeroing the page descriptor gives bits[1:0]=00, "invalid, fault on
+ * any access" -- the same convention this whole table already uses
+ * for anything unmapped. `tlbi vae1` (by VA, EL1, current ASID -- this
+ * kernel never assigns non-zero ASIDs, so "current ASID" is the only
+ * one that has ever existed) invalidates just this one page's stale
+ * TLB entry, the AArch64 equivalent of ARMv6's TLBIMVA. */
+.global mmu_guard_page_install_rpi4
+mmu_guard_page_install_rpi4:
+    ldr x1, =0x00200000
+    sub x1, x0, x1
+    lsr x1, x1, #12
+    ldr x2, =mmu_l3_table_data
+    mov x3, #0
+    str x3, [x2, x1, lsl #3]
+
+    dsb ish
+    lsr x4, x0, #12
+    tlbi vae1, x4
+    dsb ish
+    isb
     ret

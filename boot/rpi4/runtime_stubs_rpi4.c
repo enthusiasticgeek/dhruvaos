@@ -147,12 +147,11 @@ void exit(int code) {
  * set with `msr daifset, #2` and restored by writing the whole
  * register back with `msr daif, %0` -- same "always leave interrupts
  * exactly as this function found them" critical-section shape, just
- * AArch64's own instructions for it. No stack-guard-page variant yet
- * (Pi 1's dhruva_alloc_stack_guarded) -- this board's MMU
- * (boot/rpi4/mmu_init.S) only has 2MB block descriptors so far, no
- * 4KB page-table level to install a guard page into; tracked
- * separately (task #178) as a real new MMU capability, not just a
- * port of this function. */
+ * AArch64's own instructions for it. The stack-guard-page variant
+ * (Pi 1's dhruva_alloc_stack_guarded) is below, as dhruva_alloc_
+ * stack_guarded_rpi4 -- task #178 added the 4KB page-table level
+ * (boot/rpi4/mmu_init.S's own mmu_l3_table_data) this board's MMU
+ * needed first. */
 #define DHRUVA_HEAP_BYTES_RPI4 (768 * 1024)
 static unsigned char dhruva_heap_rpi4[DHRUVA_HEAP_BYTES_RPI4];
 static unsigned long dhruva_heap_used_rpi4 = 0;
@@ -221,4 +220,65 @@ void *dhruva_alloc_bytes_rpi4(long n) {
         i = i + 1;
     }
     return (void*)p;
+}
+
+/* Task #178 -- per-task stack guard pages, the AArch64 twin of
+ * boot/rpi1/runtime_stubs.c's own dhruva_alloc_stack_guarded (see that
+ * function's own comment for the full motivating history, and
+ * boot/rpi4/mmu_init.S's own mmu_l3_table_data comment for the page-
+ * table-granularity design this builds on). Same bump-allocator shape
+ * as dhruva_alloc_bytes_rpi4 above, but: rounds the CURRENT position
+ * up to the next real 4KB page boundary (using the ABSOLUTE address,
+ * dhruva_heap_rpi4's own base + offset, same reasoning as the ARM32
+ * version -- the static array itself has no guaranteed alignment from
+ * the linker), reserves one FULL page there as a guard (never returned
+ * to the caller, never written to), then allocates the actual
+ * requested stack bytes immediately after. mmu_guard_page_install_
+ * rpi4 marks that one page invalid in the live page table before this
+ * function returns, so a downward-growing stack overflowing past its
+ * own allocation takes a real, immediate Data Abort at the exact
+ * moment of overflow instead of silently corrupting whatever
+ * allocation happened to come next.
+ *
+ * No live caller yet -- this board has no dynamic task creation (#169,
+ * the scheduler-generification task, deliberately deferred), so
+ * nothing calls this today, exactly like round 179's own heap
+ * allocator had no live consumer until #174 gave it one. Real, tested
+ * new MMU capability all the same: verified live via a temporary test
+ * hook that installed a guard page and confirmed a genuine Data Abort
+ * at FAR_EL1 exactly at the guarded address, removed before this
+ * round's own commit (see mmu_guard_page_install_rpi4's own comment
+ * for the mechanism it exercises). */
+extern void mmu_guard_page_install_rpi4(unsigned long addr);
+
+void *dhruva_alloc_stack_guarded_rpi4(long n) {
+    unsigned long need = (unsigned long)n;
+    unsigned long saved_daif;
+    __asm__ volatile ("mrs %0, daif\n\tmsr daifset, #2" : "=r"(saved_daif) :: "memory");
+
+    unsigned long base = (unsigned long)dhruva_heap_rpi4;
+    unsigned long cur_abs = base + dhruva_heap_used_rpi4;
+    unsigned long aligned_abs = (cur_abs + 4095UL) & ~4095UL;
+    unsigned long guard_offset = aligned_abs - base;
+    unsigned long usable_offset = guard_offset + 4096UL;
+
+    if (usable_offset + need > DHRUVA_HEAP_BYTES_RPI4) {
+        unsigned long used_at_failure = dhruva_heap_used_rpi4;
+        dhruva_oom_fatal_rpi4(need, used_at_failure);
+        /* unreachable -- dhruva_oom_fatal_rpi4 never returns */
+    }
+    unsigned char *guard_ptr = dhruva_heap_rpi4 + guard_offset;
+    unsigned char *usable_ptr = dhruva_heap_rpi4 + usable_offset;
+    dhruva_heap_used_rpi4 = usable_offset + need;
+    dhruva_alloc_count_rpi4 = dhruva_alloc_count_rpi4 + 1;
+    __asm__ volatile ("msr daif, %0" :: "r"(saved_daif) : "memory");
+
+    mmu_guard_page_install_rpi4((unsigned long)guard_ptr);
+
+    unsigned long i = 0;
+    while (i < need) {
+        usable_ptr[i] = 0;
+        i = i + 1;
+    }
+    return (void*)usable_ptr;
 }
