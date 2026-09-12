@@ -39,6 +39,42 @@
 .section ".text.boot"
 .global _start
 _start:
+    /* Task #163 sibling finding (2026-09-12, from Pi 1's own first
+     * real-hardware boot investigation -- see boot/rpi1/boot.S's own
+     * much longer comment for the full reasoning): the same "don't
+     * trust the firmware handoff's cache/TLB state, force it clean
+     * yourself" principle applies here too, and for the identical
+     * underlying reason -- every line of this file has only ever
+     * executed under QEMU, which always starts perfectly clean by
+     * construction and could never have caught a real-hardware-only
+     * staleness bug even if one exists. IC IALLU (invalidate all
+     * instruction caches to PoU) is EL-agnostic -- valid at whichever
+     * EL this code actually starts at, unlike the TLBI/SCTLR
+     * operations below which are genuinely EL3-specific.
+     *
+     * NOT fixed here, and deliberately left as an open, documented
+     * question rather than a speculative rewrite: this file assumes
+     * it starts at EL3 (confirmed true under QEMU's own raw -kernel
+     * boot, round 40's own spike), but real Pi 4 hardware's DEFAULT
+     * armstub8.bin firmware is widely documented (Raspberry Pi
+     * community bare-metal references) to drop the CPU to EL2 before
+     * ever handing off to kernel8.img -- meaning the `msr scr_el3`
+     * write further down (an EL3-only register) would likely trap
+     * immediately on real hardware, before anything past this comment
+     * ever runs. This is a SEPARATE, more fundamental gap than cache
+     * staleness, and NOT safely fixable speculatively: QEMU's own
+     * raw-kernel boot always starts at EL3 by construction, so any
+     * runtime `mrs x0, CurrentEL`-based branch added here to handle
+     * "already at EL2" could never be exercised or verified by this
+     * project's own QEMU-based testing either -- exactly the same
+     * blind spot that made the cache issue invisible until now. Read
+     * CurrentEL FIRST (the same technique round 40's own spike already
+     * used to verify QEMU's EL3 start) the moment real Pi 4/5 hardware
+     * bring-up actually begins, before assuming this file's EL3
+     * setup path is reachable at all. */
+    ic iallu
+    isb
+
     /* Same "only core 0 proceeds, everyone else parks in a low-power
      * wait loop" convention every multi-core ARM bring-up needs --
      * BCM2711 (Cortex-A72, quad-core) always starts all 4 cores

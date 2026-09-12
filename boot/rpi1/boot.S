@@ -21,6 +21,62 @@
 .global _start
 
 _start:
+    /* Task #163 (first real-hardware boot, 2026-09-12): force a known-
+     * clean cache/MMU/TLB/branch-predictor state before ANYTHING else
+     * runs, including before the stack pointer is even set up below.
+     *
+     * This file's own header comment above claims real BCM2835
+     * firmware hands off in "the same state" QEMU's raspi1ap model
+     * does -- MMU/caches off. That is the standard, widely-assumed
+     * convention, but "assumed" is exactly the word: every line in
+     * this entire project has only ever executed under QEMU until
+     * this task, which starts the emulated core from a genuinely
+     * clean slate every single run by construction, and so could
+     * never have caught a handoff-state mismatch even if one existed.
+     * Every serious bare-metal ARM1176/ARMv6 bring-up guide treats
+     * "don't trust the handoff state, force it clean yourself" as
+     * mandatory boilerplate for exactly this reason -- real GPU
+     * firmware's own ARM-core-touching code (voltage/clock setup,
+     * security checks) is undocumented and can plausibly leave
+     * caches/MMU/TLB/branch-predictor populated with stale entries
+     * from ITS OWN execution, at physical addresses this kernel is
+     * about to reuse for its own code and data.
+     *
+     * A stale I-cache entry at this kernel's own load address
+     * (0x8000) would silently fetch WRONG instructions with no fault,
+     * no diagnostic, and no way to ever reach uart_init() to report
+     * anything -- indistinguishable from a hang. This is the leading
+     * suspect for exactly that symptom on first real boot: the GPU's
+     * own firmware demonstrably DOES read this kernel off the SD card
+     * correctly (confirmed live via the ACT LED's own real SD-access
+     * blink pattern), yet zero UART output was ever observed across
+     * multiple verified-good adapters and multiple careful, freshly-
+     * timed capture attempts -- a clean hang before uart_init() ever
+     * runs fits that evidence exactly, and this exact class of bug is
+     * invisible under QEMU by construction, never something this
+     * project's own testing history could have exercised before now.
+     *
+     * r0 is free to clobber here (nothing meaningful in it yet). */
+    mrc p15, 0, r0, c1, c0, 0   /* read SCTLR */
+    bic r0, r0, #0x1000         /* clear I (icache enable) -- not
+                                 * encodable as one immediate together
+                                 * with the M/A/C bits below (ARM's
+                                 * 8-bit-rotated immediate encoding
+                                 * can't express both groups at once),
+                                 * hence two bic instructions */
+    bic r0, r0, #0x7            /* clear M (MMU), A (alignment fault
+                                 * checking), C (dcache enable) */
+    mcr p15, 0, r0, c1, c0, 0   /* write SCTLR back */
+    mov r0, #0
+    mcr p15, 0, r0, c7, c7, 0   /* invalidate I+D cache (ARMv6's
+                                 * combined "Invalidate Both Caches") */
+    mcr p15, 0, r0, c8, c7, 0   /* invalidate unified TLB */
+    mcr p15, 0, r0, c7, c5, 6   /* invalidate branch predictor array */
+    mcr p15, 0, r0, c7, c10, 4  /* data synchronization barrier */
+    mcr p15, 0, r0, c7, c5, 4   /* flush prefetch buffer (ARMv6's own
+                                 * instruction-barrier equivalent --
+                                 * ARMv6 has no dedicated `isb`) */
+
     ldr sp, =_stack_top
 
     mrs r0, cpsr
