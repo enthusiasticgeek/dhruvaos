@@ -2,12 +2,25 @@
  *
  * ARMv6 has no VBAR (that's an ARMv7+ addition) -- the vector table
  * location is fixed at either 0x00000000 (low vectors, the reset
- * default) or 0xFFFF0000 (high vectors). This uses low vectors, so
- * this section is placed at address 0 by the linker script, entirely
- * separate from the main image at 0x8000 that boot.S's _start lives
- * in: QEMU's -kernel loader jumps straight to 0x8000 at boot and never
- * touches address 0 unless an actual exception occurs, so both live in
- * the same physical RAM without conflict.
+ * default) or 0xFFFF0000 (high vectors). This uses low vectors, but
+ * TASK #163 FIX (first real-hardware boot, 2026-09-12): this table is
+ * no longer LINKED at address 0 directly. It used to be, and that
+ * worked fine under QEMU's own `-kernel` ELF loader (which places
+ * each of an ELF's segments at its own independent address) -- but
+ * real Pi firmware loads `kernel.img` as ONE flat raw binary at a
+ * single fixed address (0x8000), with no way to also place a second,
+ * disjoint region at address 0. This table is now linked AT 0x8000
+ * instead -- the real entry point, where firmware both loads AND
+ * jumps on real hardware -- immediately followed by the real boot
+ * code (boot.S's own `boot_entry`, not `_start` anymore: `_start` is
+ * THIS table now, matching the real firmware's own idea of where
+ * the kernel begins). `boot_entry`'s own first action explicitly
+ * copies this table down to address 0 at runtime, since that's where
+ * the CPU's own hardware actually reads exception vectors from, but
+ * is NOT an address real firmware can be told to load a plain raw-
+ * binary kernel.img at. See link.ld's own comment (`.vectors` output
+ * section) for the full reasoning, confirmed directly against
+ * dwelch67/raspberrypi's own well-known, proven blinker05 example.
  *
  * This is genuinely board/architecture-specific, not just BCM2835-
  * specific -- PandaBoard's Cortex-A9 is ARMv7-A and *does* have VBAR,
@@ -24,7 +37,9 @@
  */
 
 .section ".vectors", "ax"
+.global _start
 .global _vectors
+_start:
 _vectors:
     ldr pc, [pc, #24]   /* 0x00: reset */
     ldr pc, [pc, #24]   /* 0x04: undefined instruction */
@@ -34,7 +49,7 @@ _vectors:
     ldr pc, [pc, #24]   /* 0x14: reserved */
     ldr pc, [pc, #24]   /* 0x18: IRQ */
     ldr pc, [pc, #24]   /* 0x1C: FIQ */
-.word _start
+.word boot_entry
 .word fault_undef
 .word fault_swi
 .word fault_prefetch_abort

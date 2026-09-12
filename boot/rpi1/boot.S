@@ -57,10 +57,31 @@
 .endm
 
 .section ".text.boot"
-.global _start
+.global boot_entry
 
-_start:
-    /* One-time GPIO16 output setup for the diagnostic above. */
+boot_entry:
+    /* TASK #163 FIX (2026-09-12): copy the vector table (vectors.S's
+     * own `_start`/`_vectors`, now linked immediately before this
+     * function at the REAL entry point, 0x8000 -- see link.ld's own
+     * `.vectors` comment for the full reasoning) down to address
+     * 0x00000000, where the ARM core's own hardware actually reads
+     * exception vectors from (ARMv6 has no VBAR). This function used
+     * to BE `_start` itself, before this fix moved the vector table
+     * to the real entry point and renamed this to `boot_entry` --
+     * confirmed against dwelch67/raspberrypi's own well-known,
+     * PROVEN blinker05 example, which does exactly this same 16-word
+     * (64-byte) copy for exactly this same reason. Must happen before
+     * ANYTHING that could plausibly take an exception -- first thing
+     * in this function, before even the LED diagnostic's own GPIO
+     * setup below. */
+    ldr r0, =_start
+    mov r1, #0
+    ldmia r0!, {r2, r3, r4, r5, r6, r7, r8, r9}
+    stmia r1!, {r2, r3, r4, r5, r6, r7, r8, r9}
+    ldmia r0!, {r2, r3, r4, r5, r6, r7, r8, r9}
+    stmia r1!, {r2, r3, r4, r5, r6, r7, r8, r9}
+
+    /* One-time GPIO16 output setup for the diagnostic below. */
     ldr r9, =0x20200004         /* GPFSEL1 (GPIO10-19) */
     ldr r10, [r9]
     bic r10, r10, #(7 << 18)    /* GPIO16's own 3-bit field */

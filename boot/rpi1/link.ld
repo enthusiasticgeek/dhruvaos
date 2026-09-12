@@ -9,17 +9,50 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* ARMv6 has no VBAR -- the vector table must live at address 0
-     * (low vectors, the reset default) or not work at all. This is a
-     * genuinely separate region from the main image below; the linker
-     * happily places two disjoint regions in one output file, and
-     * KEEP() stops --gc-sections from discarding a section nothing
-     * ever calls via a normal branch (the vector table is only ever
-     * reached by hardware exception dispatch). */
-    . = 0x0;
-    .vectors : { KEEP(*(.vectors)) }
-
     . = 0x8000;
+
+    /* TASK #163 FIX (first real-hardware boot, 2026-09-12): ARMv6 has
+     * no VBAR -- the vector table must live at address 0 (low vectors,
+     * the reset default) or not work at all. This USED to be a
+     * genuinely separate output section linked at VMA 0x0 -- valid for
+     * QEMU's own `-kernel` ELF loader, which places each of an ELF's
+     * segments at its own independent address, but WRONG for real Pi
+     * firmware, which loads `kernel.img` as ONE flat, contiguous raw
+     * binary at a single fixed address (0x8000) with no concept of a
+     * second, disjoint load address. `objcopy -O binary` faithfully
+     * reproduces the ELF's own VMA layout as one contiguous file
+     * spanning from the LOWEST to HIGHEST address across every
+     * section -- confirmed by direct measurement: kernel.img's own
+     * first 32 bytes are genuinely the vector table's own encoding
+     * (`ldr pc, [pc, #24]`, repeated 8 times), not `_start`'s real
+     * code. Real firmware loading that file at its own fixed 0x8000
+     * would put the vector table AT the entry point instead of
+     * `_start`'s real boot code -- the CPU would execute the reset
+     * vector's own `ldr pc,[pc,#24]`, load its literal-pool value
+     * (`_start`'s own address, a link-time constant, 0x8000), and jump
+     * right back to the SAME physical address it's already executing
+     * from: a silent, tight infinite loop, never reaching ANY of this
+     * kernel's own code -- not uart_init(), not even this file's own
+     * earlier cache-invalidation fix. Invisible under QEMU by
+     * construction (QEMU's own multi-segment ELF loading sidesteps
+     * this raw-binary-specific constraint entirely), so this survived
+     * completely undetected across every prior fix this same
+     * investigation already made.
+     *
+     * Fixed the same way every well-known bare-metal Pi 1 reference
+     * handles this (confirmed directly against dwelch67/raspberrypi's
+     * own blinker05 example, and its own README's explicit reasoning:
+     * "our program is loaded at address 0x8000... I have made [an
+     * exception table] there anyway"): the vector table now lives
+     * AT the real entry point (0x8000, where firmware both loads AND
+     * jumps), immediately followed by the real boot code (renamed
+     * `boot_entry`, see boot.S) -- and `boot_entry`'s own first action
+     * is to explicitly copy this table down to address 0x0 at
+     * runtime, matching that same reference's own proven technique,
+     * since address 0 is where the CPU's own hardware actually reads
+     * exception vectors from, but is NOT where real firmware can be
+     * told to load anything for a plain raw-binary kernel.img. */
+    .vectors : { KEEP(*(.vectors)) }
 
     .text.boot : { *(.text.boot) }
     .text : { *(.text*) }
