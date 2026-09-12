@@ -18054,6 +18054,27 @@ fn shell_dispatch_crypto(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> 
   return 0;
 }
 
+// Task #177: on-demand heap-usage query, matching Pi 4/5's own `heap`
+// shell command (round 179) for cross-board interface consistency.
+// heap_usage_self_test already exists and already reports used/
+// capacity/headroom -- Pi 1's own bump allocator never frees, so
+// "current usage" and "peak-ever usage" are the same number, meaning
+// this live query already doubles as the high-water mark this task
+// was originally scoped around (see round 176/179's own scope
+// correction). Deliberately does NOT need a Pi-4/5-style separate
+// alloc-correctness self-test alongside it: Pi 1's allocator already
+// has hundreds of real call sites since boot implicitly proving it
+// works, unlike Pi 4/5's brand new (round 179) allocator, which had
+// zero real consumers yet at the time that test was added.
+fn shell_dispatch_heap() -> i64 {
+  let _ = uart_puts("\n");
+  let _ = heap_usage_self_test();
+  let _ = uart_puts("  allocations: ");
+  let _ = uart_put_i64(dhruva_alloc_count_get());
+  let _ = uart_puts(" total (never-freed bump allocator)\n");
+  return 0;
+}
+
 // Round 71: shell front end for general-purpose GPIO (see the driver
 // functions and their own header comment above `gpio_self_check`).
 // `<pin>` is a plain decimal 0-53 (the SoC's full real register
@@ -19034,6 +19055,10 @@ fn shell_dispatch() -> i64 {
 
   if shell_word_matches(line_buf, 0, cmd_end, "gpio") == 1 {
     return shell_dispatch_gpio(line_buf, cmd_end, line_len);
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "heap") == 1 {
+    return shell_dispatch_heap();
   }
 
   if shell_word_matches(line_buf, 0, cmd_end, "fb") == 1 {
