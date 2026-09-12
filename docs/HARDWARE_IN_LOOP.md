@@ -158,15 +158,42 @@ worked correctly on the wrong assumption.
 ### 4.1 Get the Pi 1 boot firmware
 
 The Pi's own GPU boot ROM needs three firmware files it loads before
-ever touching Dhruva's own code — this project doesn't (and can't)
-provide these, they come from the official Raspberry Pi firmware
-repository: `bootcode.bin`, `start.elf`, `fixup.dat`. Use the
-**original-generation** files (not the `_x`/`4` variants built for
-later boards) — the ones named exactly `bootcode.bin`/`start.elf`/
-`fixup.dat` with no suffix, from
-`https://github.com/raspberrypi/firmware/tree/master/boot` (or
-whatever source you trust for these — this project has no opinion on
-firmware provenance beyond "must be the Pi 1/Zero-generation files").
+ever touching Dhruva's own code: `bootcode.bin`, `start.elf`,
+`fixup.dat`. These are **Broadcom/Raspberry Pi (Trading) Ltd
+proprietary binary blobs — closed-source, not DhruvaOS code, and
+deliberately never committed to this repo.** Their license
+(`boot/LICENCE.broadcom` in the upstream `raspberrypi/firmware` repo)
+permits unmodified binary redistribution for the purpose of running a
+Raspberry Pi, but this project keeps its own tree free of
+non-DhruvaOS-authored binaries regardless — fetch them yourself into a
+persistent local directory OUTSIDE this repo (e.g. `~/pi1-firmware/`)
+and point the scripts below at that path.
+
+Use the **original-generation** files (not the `_x`/`4` variants built
+for later boards) — the ones named exactly `bootcode.bin`/`start.elf`/
+`fixup.dat` with no suffix, from the `boot/` directory of
+`raspberrypi/firmware`. `bootcode.bin` and `fixup.dat` are small enough
+for the GitHub Contents API; `start.elf` (~3MB) exceeds that API's
+size limit and needs the raw content endpoint instead:
+
+```sh
+mkdir -p ~/pi1-firmware && cd ~/pi1-firmware
+
+gh api repos/raspberrypi/firmware/contents/boot/bootcode.bin \
+    --jq '.content' | base64 -d > bootcode.bin
+
+gh api repos/raspberrypi/firmware/contents/boot/fixup.dat \
+    --jq '.content' | base64 -d > fixup.dat
+
+curl -sL -o start.elf \
+    "https://raw.githubusercontent.com/raspberrypi/firmware/master/boot/start.elf"
+
+ls -la bootcode.bin start.elf fixup.dat   # sanity check: none should be 0 bytes
+```
+
+(No `gh`/GitHub account handy? Any source you trust works — this
+project has no opinion on firmware provenance beyond "must be the Pi
+1/Zero-generation files, fetched fresh, never committed here.")
 
 ### 4.2 Partition layout — critical, avoids real data corruption
 
@@ -255,6 +282,29 @@ Copy `bootcode.bin`, `start.elf`, `fixup.dat` (§4.1), `config.txt`
 (§4.3), and the newly-built `kernel.img` (§4.4) to the FAT32
 partition's root. Unmount cleanly, remove the card, insert it in the
 Pi (powered off).
+
+### 4.5 Updating just the kernel on an already-flashed card
+
+Once a card has been through §4.2-§4.4 once, don't re-run
+`flash_sd_card.sh` for every `kernel_main.vani` change — it
+reformats the whole card from scratch. Use `update_kernel.sh` (repo
+root) instead: it rebuilds `kernel.img`, mounts the existing boot
+partition, verifies `bootcode.bin`/`start.elf`/`fixup.dat`/
+`config.txt` are already present (aborting without writing anything
+if not — it never fetches or writes firmware itself), and overwrites
+only `kernel.img`.
+
+```sh
+cd /path/to/dhruvaos
+./build.sh
+./update_kernel.sh /dev/sdX   # whole device, not a partition
+```
+
+It requires the device path explicitly (same convention as
+`flash_sd_card.sh`, no auto-detection) and checks the device size
+against the known card before touching anything, but this is
+non-destructive by construction — worst case is overwriting the wrong
+device's own `kernel.img`, not data loss on an unrelated disk.
 
 ## 5. First boot
 
