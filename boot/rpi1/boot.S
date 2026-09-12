@@ -17,10 +17,55 @@
  * here) until kernel_main explicitly unmasks them after the timer/
  * interrupt-controller setup in vani completes; this only prepares the
  * stack IRQ mode will use once that happens. */
+/* TEMPORARY, for this round's own real-hardware boot-progress
+ * diagnostic only -- blinks the ACT LED (GPIO16 on the original Pi 1
+ * Model B, active-low) N times, using ONLY raw GPIO register writes
+ * and a busy-wait delay, no UART/vani/anything else that could itself
+ * be broken. Placed at checkpoints through early boot so a human
+ * watching the LED can tell exactly how far execution actually gets,
+ * independent of the UART channel this round's own investigation has
+ * so far been unable to get a clear signal through. Removed once real
+ * hardware boot is confirmed working (or once this narrows down where
+ * it isn't). Uses r8-r12 as scratch -- none of _start's own code uses
+ * those registers, so this can't clobber anything the surrounding
+ * boot sequence still needs. */
+.macro BLINK_N n
+    mov r8, #\n
+1:
+    cmp r8, #0
+    beq 2f
+    ldr r9, =0x20200028         /* GPCLR0 */
+    mov r10, #0x10000           /* GPIO16 */
+    str r10, [r9]               /* LED ON (active-low) */
+    ldr r11, =80000000
+3:
+    subs r11, r11, #1
+    bne 3b
+    ldr r9, =0x2020001C         /* GPSET0 */
+    str r10, [r9]               /* LED OFF */
+    ldr r11, =80000000
+4:
+    subs r11, r11, #1
+    bne 4b
+    subs r8, r8, #1
+    b 1b
+2:
+    ldr r11, =200000000         /* gap between blink groups */
+5:
+    subs r11, r11, #1
+    bne 5b
+.endm
+
 .section ".text.boot"
 .global _start
 
 _start:
+    /* One-time GPIO16 output setup for the diagnostic above. */
+    ldr r9, =0x20200004         /* GPFSEL1 (GPIO10-19) */
+    ldr r10, [r9]
+    bic r10, r10, #(7 << 18)    /* GPIO16's own 3-bit field */
+    orr r10, r10, #(1 << 18)    /* set OUTPUT */
+    str r10, [r9]
     /* Task #163 (first real-hardware boot, 2026-09-12): force a known-
      * clean cache/MMU/TLB/branch-predictor state before ANYTHING else
      * runs, including before the stack pointer is even set up below.
@@ -77,6 +122,8 @@ _start:
                                  * instruction-barrier equivalent --
                                  * ARMv6 has no dedicated `isb`) */
 
+    BLINK_N 1   /* checkpoint 1: cache/MMU/TLB invalidation done */
+
     ldr sp, =_stack_top
 
     mrs r0, cpsr
@@ -101,6 +148,8 @@ _start:
     msr cpsr_c, r1
     ldr sp, =_stack_top    /* restore SVC's own sp (clobbered above) */
 
+    BLINK_N 2   /* checkpoint 2: mode-switching / stack setup done */
+
     /* QEMU's ELF loader does not clear .bss -- do it ourselves before
      * any vani code (which may rely on zero-initialized statics) runs. */
     ldr r0, =__bss_start
@@ -114,12 +163,19 @@ clear_bss:
     b clear_bss
 clear_bss_done:
 
+    BLINK_N 3   /* checkpoint 3: .bss clear done */
+
     /* Round 38: page table lives in .bss (mmu_init.S), so it must be
      * built AFTER clear_bss above, not before -- otherwise the zero
      * fill would wipe out every descriptor mmu_init just wrote. */
     bl mmu_init
 
+    BLINK_N 4   /* checkpoint 4: mmu_init returned */
+
     bl kernel_main
 
 hang:
+    BLINK_N 5   /* checkpoint 5, repeating: kernel_main returned --
+                 * should never happen (it runs forever), a sentinel
+                 * if it somehow does */
     b hang
