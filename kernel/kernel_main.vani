@@ -647,6 +647,12 @@ extern "C" fn ssh_server_rx_len_set(addr: mut ref i64) -> i64;
 extern "C" fn ssh_server_rx_len_get() -> mut ref i64;
 extern "C" fn ssh_frame_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn ssh_frame_scratch_get() -> mut ref i64;
+extern "C" fn crashlog_record_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn crashlog_record_scratch_get() -> mut ref i64;
+extern "C" fn crashlog_meta_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn crashlog_meta_scratch_get() -> mut ref i64;
+extern "C" fn crashlog_path_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn crashlog_path_scratch_get() -> mut ref i64;
 extern "C" fn ssh_chunk_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn ssh_chunk_scratch_get() -> mut ref i64;
 extern "C" fn ssh_recv_chunk_scratch_set(addr: mut ref i64) -> i64;
@@ -2128,6 +2134,12 @@ fn abort_report_data(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r
   let _ = uart_puts(" irqs=");
   let _ = uart_put_i64(irq_count_get());
   let _ = uart_puts(" -- halting\n");
+  // Persist this to DharaFS before halting -- see crashlog_record_
+  // crash's own header comment for the full design. Best-effort:
+  // its own return value is intentionally ignored here, same as
+  // this function's own callers already ignore ITS return value --
+  // the system halts regardless of whether the write succeeded.
+  let _ = crashlog_record_crash(crashlog_type_data_abort(), addr, status, fault_pc, orig_r0, orig_r1, orig_r2, orig_r3, orig_lr);
   return 0;
 }
 
@@ -2142,6 +2154,13 @@ fn abort_report_prefetch(addr: u32, status: u32) -> i64 {
     let _ = uart_puts(" (section permission fault)");
   }
   let _ = uart_puts(" -- halting\n");
+  // addr IS the faulting PC for a Prefetch Abort (the CPU tried to
+  // FETCH an instruction from there) -- passed as both fault_addr and
+  // pc below. r0-r3/lr aren't available at this call site (unlike
+  // abort_report_data's own vectors.S caller, nothing captures them
+  // for a prefetch abort today), recorded as 0 rather than left out
+  // of the fixed record layout.
+  let _ = crashlog_record_crash(crashlog_type_prefetch_abort(), addr, status, addr, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32);
   return 0;
 }
 
@@ -4953,6 +4972,260 @@ fn task_fsq() -> i64 {
       }
     }
     let _ = dhruva_prio_unlock(2);
+  }
+  return 0;
+}
+
+// Crash log: any real OS-level fault (Data Abort, Prefetch Abort so
+// far -- see abort_report_data/_prefetch below for where this gets
+// called) gets a small diagnostic record persisted here before the
+// system halts, so it survives past the halt/reboot for later
+// diagnosis instead of only ever reaching a UART console nobody may
+// be watching at the exact moment of a crash.
+//
+// Retention: the ask was "30 days or a reasonable size, whichever
+// hits earlier" -- this project has no real-time clock anywhere (no
+// RTC peripheral driver exists), so there is no wall-clock "30 days"
+// to measure against, only ticks-since-THIS-boot (resets to 0 every
+// reboot) and a persisted boot counter. Size-based retention is the
+// only half of "whichever hits earlier" implementable today: a fixed-
+// size circular set of the most recent crashlog_slot_count() crashes,
+// oldest slot silently overwritten once full. Each record still
+// stamps its own boot_count/uptime_ticks -- exactly what a future
+// real day-based expiry pass would need, if an RTC driver or NTP time
+// sync is ever added.
+//
+// Storage design: one small DharaFS path per slot (/crashlog0../
+// crashlogN-1), not one growing file. dharafs_list_dir is print-only
+// (no programmatic "what paths exist" API exists to enumerate and
+// find/delete the oldest entry), so a single-blob-plus-directory-
+// listing design wasn't available -- a small FIXED set of individually
+// addressable paths sidesteps that entirely (the crashlog shell
+// command below just tries reading each of the N known paths
+// directly, no enumeration needed). A tiny separate /crashlog_meta
+// path holds the only state that needs to persist across every crash:
+// the total-crashes-ever counter (used both to pick the next slot via
+// modulo and to stamp each record with its own true chronological
+// position, since two different crash counts can map to the same
+// slot after wraparound) and the boot counter.
+//
+// Uses ONLY dharafs_read/dharafs_read_raw/dharafs_append_raw (plus
+// buf_read_u32/buf_write_u32, native ARM32 accessors) -- all confirmed
+// to touch only pre-allocated persistent scratch, never
+// dhruva_alloc_bytes, the same property abort_report_data/_prefetch's
+// own #[no_heap] tag already requires of everything they call.
+fn crashlog_slot_count() -> u32 {
+  return 32 as u32;
+}
+
+// Writes v's decimal digits into buf starting at off, returns the
+// digit count written. Unsigned-only (every value this file ever
+// formats this way -- a slot number 0-31 or a crash/boot counter --
+// is naturally non-negative), simpler than uart_put_i64's own
+// negative-domain trick, which exists only to handle i64::MIN safely.
+fn u32_decimal_into(v: u32, buf: mut ref i64, off: i64) -> i64 {
+  let digits: mut ref i64 = uart_digits_scratch_get();
+  let n: i64 = 0;
+  let val: u32 = v;
+  if val == (0 as u32) {
+    let _ = buf_write_byte(digits, 0 as u32, 48 as u32);
+    n = 1;
+  } else {
+    while val != (0 as u32) {
+      let d: u32 = val - ((val / (10 as u32)) * (10 as u32));
+      let _ = buf_write_byte(digits, n as u32, (48 as u32) + d);
+      n = n + 1;
+      val = val / (10 as u32);
+    }
+  }
+  let i: i64 = n - 1;
+  let j: i64 = off;
+  while i >= 0 {
+    let b: u32 = buf_read_byte(digits, i as u32);
+    let _ = buf_write_byte(buf, j as u32, b);
+    i = i - 1;
+    j = j + 1;
+  }
+  return n;
+}
+
+// Builds "/crashlogN" into crashlog_path_scratch, returns its length.
+fn crashlog_build_path(slot: u32) -> i64 {
+  let buf: mut ref i64 = crashlog_path_scratch_get();
+  let prefix: Str = "/crashlog";
+  let prefix_len: i64 = str_len_bytes(prefix);
+  let i: i64 = 0;
+  while i < prefix_len {
+    let _ = buf_write_byte(buf, i as u32, str_byte_at(prefix, i) as u32);
+    i = i + 1;
+  }
+  let digit_count: i64 = u32_decimal_into(slot, buf, prefix_len);
+  return prefix_len + digit_count;
+}
+
+// Builds "/crashlog_meta" into crashlog_path_scratch, returns its
+// length. A fixed literal, but still copied into a raw buffer (rather
+// than passed as a Str) so both the meta path and the per-slot record
+// paths above go through the identical dharafs_append_raw call shape
+// -- meta's own DATA is 8 raw bytes (two u32 counters), which can't
+// safely round-trip through a Str-typed value the way dharafs_append's
+// own Str/Str wrapper assumes real text can.
+fn crashlog_build_meta_path() -> i64 {
+  let buf: mut ref i64 = crashlog_path_scratch_get();
+  let path: Str = "/crashlog_meta";
+  let path_len: i64 = str_len_bytes(path);
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return path_len;
+}
+
+// Reads /crashlog_meta into crashlog_meta_scratch, or zeroes it if the
+// path doesn't exist yet (this device's very first crash/boot).
+// Callers read the two u32 fields out of the shared scratch directly
+// (offset 0 = total-crashes-ever count, offset 4 = boot count) -- same
+// "read into shared scratch, caller extracts fields" convention
+// dharafs_append's own meta_buf handling already uses.
+fn crashlog_read_meta() -> i64 {
+  let buf: mut ref i64 = crashlog_meta_scratch_get();
+  let status: i64 = dharafs_read("/crashlog_meta", buf);
+  if status != 8 {
+    let _ = buf_write_u32(buf, 0 as u32, 0 as u32);
+    let _ = buf_write_u32(buf, 4 as u32, 0 as u32);
+    return 0;
+  }
+  return 1;
+}
+
+fn crashlog_write_meta(count: u32, boot_count: u32) -> i64 {
+  let buf: mut ref i64 = crashlog_meta_scratch_get();
+  let _ = buf_write_u32(buf, 0 as u32, count);
+  let _ = buf_write_u32(buf, 4 as u32, boot_count);
+  let path_len: i64 = crashlog_build_meta_path();
+  return dharafs_append_raw(crashlog_path_scratch_get(), path_len, buf, 8, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
+}
+
+// The main entry point: called from abort_report_data/_prefetch (see
+// below) right before they halt. Deliberately best-effort -- a failed
+// write here must never itself loop, retry, or fault; the system is
+// halting either way, and this is already strictly better than
+// nothing even if the FS write doesn't succeed (the UART report these
+// callers already print happens regardless, before or after this).
+#[no_mangle]
+#[no_heap]
+fn crashlog_record_crash(crash_type: u32, fault_addr: u32, status: u32, pc: u32, r0: u32, r1: u32, r2: u32, r3: u32, lr: u32) -> i64 {
+  let _ = crashlog_read_meta();
+  let meta: mut ref i64 = crashlog_meta_scratch_get();
+  let count: u32 = buf_read_u32(meta, 0 as u32);
+  let boot_count: u32 = buf_read_u32(meta, 4 as u32);
+  let slot: u32 = count - ((count / crashlog_slot_count()) * crashlog_slot_count());
+
+  let rec: mut ref i64 = crashlog_record_scratch_get();
+  let _ = buf_write_u32(rec, 0 as u32, count);
+  let _ = buf_write_u32(rec, 4 as u32, boot_count);
+  let _ = buf_write_u32(rec, 8 as u32, scheduler_get_tick_count());
+  let _ = buf_write_u32(rec, 12 as u32, crash_type);
+  let _ = buf_write_u32(rec, 16 as u32, fault_addr);
+  let _ = buf_write_u32(rec, 20 as u32, status);
+  let _ = buf_write_u32(rec, 24 as u32, pc);
+  let _ = buf_write_u32(rec, 28 as u32, r0);
+  let _ = buf_write_u32(rec, 32 as u32, r1);
+  let _ = buf_write_u32(rec, 36 as u32, r2);
+  let _ = buf_write_u32(rec, 40 as u32, r3);
+  let _ = buf_write_u32(rec, 44 as u32, lr);
+  let _ = buf_write_u32(rec, 48 as u32, context_switch_count_get() as u32);
+  let _ = buf_write_u32(rec, 52 as u32, irq_count_get() as u32);
+
+  let path_len: i64 = crashlog_build_path(slot);
+  let _ = dharafs_append_raw(crashlog_path_scratch_get(), path_len, rec, 56, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
+  let _ = crashlog_write_meta(count + (1 as u32), boot_count);
+  return 0;
+}
+
+// Called once at boot, after dharafs_init -- increments the persisted
+// boot counter every record stamps itself with. Not fault-path (no
+// #[no_heap] needed), but built from the exact same primitives for
+// consistency.
+fn crashlog_boot_increment() -> i64 {
+  let _ = crashlog_read_meta();
+  let meta: mut ref i64 = crashlog_meta_scratch_get();
+  let count: u32 = buf_read_u32(meta, 0 as u32);
+  let boot_count: u32 = buf_read_u32(meta, 4 as u32);
+  return crashlog_write_meta(count, boot_count + (1 as u32));
+}
+
+// Crash type tags -- see crashlog_record_crash's own callers.
+fn crashlog_type_data_abort() -> u32 {
+  return 0 as u32;
+}
+fn crashlog_type_prefetch_abort() -> u32 {
+  return 1 as u32;
+}
+
+// Shell front end: prints every slot that has a real record in it.
+// Deliberately unsorted by chronological order (physical slot order,
+// not seq order) -- each printed record carries its own seq/boot/
+// uptime fields, which is enough for a human (or a log-scraping
+// script) to reorder if it matters, and avoids needing an in-memory
+// sort of unknown-in-advance record count for what's already a rare,
+// manually-invoked diagnostic command.
+fn shell_dispatch_crashlog() -> i64 {
+  let _ = uart_puts("\n");
+  let slots: u32 = crashlog_slot_count();
+  let s: u32 = 0 as u32;
+  let any_found: i64 = 0;
+  while s < slots {
+    let path_len: i64 = crashlog_build_path(s);
+    let rec: mut ref i64 = crashlog_record_scratch_get();
+    let status: i64 = dharafs_read_raw(crashlog_path_scratch_get(), path_len, rec);
+    if status == 56 {
+      any_found = 1;
+      let crash_type: u32 = buf_read_u32(rec, 12 as u32);
+      let _ = uart_puts("crash #");
+      let _ = uart_put_i64(buf_read_u32(rec, 0 as u32) as i64);
+      let _ = uart_puts(" (boot ");
+      let _ = uart_put_i64(buf_read_u32(rec, 4 as u32) as i64);
+      let _ = uart_puts(", uptime_ticks=");
+      let _ = uart_put_i64(buf_read_u32(rec, 8 as u32) as i64);
+      let _ = uart_puts("): ");
+      if crash_type == crashlog_type_data_abort() {
+        let _ = uart_puts("Data Abort");
+      } else {
+        if crash_type == crashlog_type_prefetch_abort() {
+          let _ = uart_puts("Prefetch Abort");
+        } else {
+          let _ = uart_puts("unknown type ");
+          let _ = uart_put_i64(crash_type as i64);
+        }
+      }
+      let _ = uart_puts(" addr=");
+      let _ = uart_put_hex32(buf_read_u32(rec, 16 as u32));
+      let _ = uart_puts(" status=");
+      let _ = uart_put_hex32(buf_read_u32(rec, 20 as u32));
+      let _ = uart_puts(" pc=");
+      let _ = uart_put_hex32(buf_read_u32(rec, 24 as u32));
+      let _ = uart_puts(" r0=");
+      let _ = uart_put_hex32(buf_read_u32(rec, 28 as u32));
+      let _ = uart_puts(" r1=");
+      let _ = uart_put_hex32(buf_read_u32(rec, 32 as u32));
+      let _ = uart_puts(" r2=");
+      let _ = uart_put_hex32(buf_read_u32(rec, 36 as u32));
+      let _ = uart_puts(" r3=");
+      let _ = uart_put_hex32(buf_read_u32(rec, 40 as u32));
+      let _ = uart_puts(" lr=");
+      let _ = uart_put_hex32(buf_read_u32(rec, 44 as u32));
+      let _ = uart_puts(" ctxsw=");
+      let _ = uart_put_i64(buf_read_u32(rec, 48 as u32) as i64);
+      let _ = uart_puts(" irqs=");
+      let _ = uart_put_i64(buf_read_u32(rec, 52 as u32) as i64);
+      let _ = uart_puts("\n");
+    }
+    s = s + (1 as u32);
+  }
+  if any_found == 0 {
+    let _ = uart_puts("crashlog: empty (no crash ever recorded on this card)\n");
   }
   return 0;
 }
@@ -19061,6 +19334,10 @@ fn shell_dispatch() -> i64 {
     return shell_dispatch_heap();
   }
 
+  if shell_word_matches(line_buf, 0, cmd_end, "crashlog") == 1 {
+    return shell_dispatch_crashlog();
+  }
+
   if shell_word_matches(line_buf, 0, cmd_end, "fb") == 1 {
     return shell_dispatch_fb(line_buf, cmd_end, line_len);
   }
@@ -20313,8 +20590,17 @@ fn shell_dispatch() -> i64 {
 // annotation raised to 12288, real headroom both above the reported
 // 5064 AND with margin left in the doubled real allocation for
 // whatever the checker is still failing to see.
+// Task #177/crash-log round: raised again, 12288 -> 13312, after
+// adding the `heap` and `crashlog` shell commands' own dispatch checks
+// -- each is just a one-line `if shell_word_matches(...) { return
+// shell_dispatch_X(); }`, but shell_dispatch is one shared function
+// whose locals all sum together on the worst-case chain regardless of
+// which command's own branch they're in (see feedback_vani_sweep_
+// sibling_functions_after_bugfix's own sibling note on this exact
+// gotcha) -- pushed the existing ssh_shell_test_cmd chain 4 bytes over
+// the prior budget. Real headroom left again, not the bare minimum.
 #[no_mangle]
-#[bounded_stack(bytes=12288)]
+#[bounded_stack(bytes=13312)]
 fn task_f() -> i64 {
   while true {
     let ready: u32 = shell_get_line_ready();
@@ -28137,6 +28423,9 @@ fn kernel_main() -> i64 {
   let _ = ssh_server_rx_buf_set(dhruva_alloc_bytes(2048));
   let _ = ssh_server_rx_len_set(dhruva_alloc_bytes(4));
   let _ = ssh_frame_scratch_set(dhruva_alloc_bytes(1514));
+  let _ = crashlog_record_scratch_set(dhruva_alloc_bytes(56));
+  let _ = crashlog_meta_scratch_set(dhruva_alloc_bytes(8));
+  let _ = crashlog_path_scratch_set(dhruva_alloc_bytes(32));
   let _ = ssh_chunk_scratch_set(dhruva_alloc_bytes(64));
   let _ = ssh_recv_chunk_scratch_set(dhruva_alloc_bytes(64));
   let _ = ssh_ack_scratch_set(dhruva_alloc_bytes(8));
@@ -28218,6 +28507,7 @@ fn kernel_main() -> i64 {
   // per path (not the first, not a mix) and an unrelated path is
   // unaffected.
   let _ = dharafs_init();
+  let _ = crashlog_boot_increment();
 
   // Report what recovery alone found, BEFORE any fresh writes this
   // boot might make -- test/power_yank.py checks exactly this line
