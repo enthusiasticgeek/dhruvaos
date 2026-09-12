@@ -1,0 +1,11 @@
+[package]
+name        = "gpio"
+version     = "0.1.0"
+entry       = "src/lib.vani"
+authors     = "enthusiasticgeek"
+license     = "Apache-2.0"
+description = "SoC-agnostic GPIO pull-mode contract (none/down/up) -- a board's own driver translates these canonical values to/from its real hardware register encoding, which differs across chip families (and even within the same vendor's own SoC lineup). Extracted from Dhruva OS."
+registry    = "kosh"
+
+[deps]
+# None -- pure symbolic-constant functions, no runtime dependency.

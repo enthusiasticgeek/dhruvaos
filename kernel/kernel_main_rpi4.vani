@@ -341,11 +341,49 @@ fn gpio_pupdn_shift_for_rpi4(pin: i64) -> i64 {
   return (pin % 16) * 2;
 }
 
+// Round 170 (GPIO/UART hardware-agnostic interface scoping): translates
+// between the shared, SoC-agnostic `gpio` kosh package's own pull-mode
+// contract (gpio_pull_none/_down/_up -- see that package's own header
+// comment) and BCM2711's real PUP_PDN_CNTRL hardware bits. This
+// translation is the whole reason gpio_set_pull/_rpi4 can't just share
+// one implementation with kernel_main.vani's own gpio_set_pull:
+// BCM2835's GPPUD encoding (none=0, down=1, up=2) happens to match the
+// canonical contract 1:1, but BCM2711's own encoding (none=0, up=1,
+// down=2, per Broadcom's own BCM2711 doc) has up/down SWAPPED relative
+// to it -- calling gpio_set_pull_rpi4 with a raw hardware bit pattern
+// intended for BCM2835 would silently configure the OPPOSITE pull
+// direction. Any future non-Raspberry-Pi board's own GPIO driver is
+// expected to need this same kind of small, private translation layer
+// against the package's unchanging canonical values, never a new set
+// of magic numbers.
+use "../vendor/gpio/src/lib.vani";
+
+fn gpio_pull_to_hw_rpi4(pull: u32) -> u32 {
+  if pull == gpio_pull_up() {
+    return 1 as u32;
+  }
+  if pull == gpio_pull_down() {
+    return 2 as u32;
+  }
+  return 0 as u32;
+}
+
+fn gpio_pull_from_hw_rpi4(hw: u32) -> u32 {
+  if hw == (1 as u32) {
+    return gpio_pull_up();
+  }
+  if hw == (2 as u32) {
+    return gpio_pull_down();
+  }
+  return gpio_pull_none();
+}
+
 fn gpio_set_pull_rpi4(pin: i64, pull: u32) -> i64 {
   let reg: i64 = gpio_pupdn_reg_for_rpi4(pin);
   let shift: u32 = gpio_pupdn_shift_for_rpi4(pin) as u32;
   let mask: u32 = ((3 as u32) << shift) ^ (0xFFFFFFFF as u32);
-  let bits: u32 = (pull & (3 as u32)) << shift;
+  let hw: u32 = gpio_pull_to_hw_rpi4(pull);
+  let bits: u32 = (hw & (3 as u32)) << shift;
   let cur: u32 = mmio_read_u32(reg);
   let _ = mmio_write_u32(reg, (cur & mask) | bits);
   return 0;
@@ -355,7 +393,8 @@ fn gpio_get_pull_rpi4(pin: i64) -> u32 {
   let reg: i64 = gpio_pupdn_reg_for_rpi4(pin);
   let shift: u32 = gpio_pupdn_shift_for_rpi4(pin) as u32;
   let cur: u32 = mmio_read_u32(reg);
-  return (cur >> shift) & (3 as u32);
+  let hw: u32 = (cur >> shift) & (3 as u32);
+  return gpio_pull_from_hw_rpi4(hw);
 }
 
 // Self-test, run once at boot -- same shape as kernel_main.vani's own
@@ -424,21 +463,25 @@ fn gpio_self_check_rpi4() -> i64 {
 
   // Pull-control round trip across the REG0/REG1/REG3 (pin 15/16/48)
   // boundaries -- genuinely QEMU-verified here, unlike kernel_main.
-  // vani's own BCM2835 equivalent.
+  // vani's own BCM2835 equivalent. Exercises the shared `gpio` package's
+  // own canonical values through gpio_pull_to_hw_rpi4/_from_hw_rpi4's
+  // translation, not just a raw register round trip -- this is what
+  // actually confirms the up/down swap fix (round 170) works, not just
+  // that whatever bit pattern goes in comes back out unchanged.
   let origp15: u32 = gpio_get_pull_rpi4(15);
-  let _ = gpio_set_pull_rpi4(15, 1 as u32);
-  if gpio_get_pull_rpi4(15) != (1 as u32) {
+  let _ = gpio_set_pull_rpi4(15, gpio_pull_down());
+  if gpio_get_pull_rpi4(15) != gpio_pull_down() {
     ok = 0;
   }
-  let _ = gpio_set_pull_rpi4(15, 2 as u32);
-  if gpio_get_pull_rpi4(15) != (2 as u32) {
+  let _ = gpio_set_pull_rpi4(15, gpio_pull_up());
+  if gpio_get_pull_rpi4(15) != gpio_pull_up() {
     ok = 0;
   }
   let _ = gpio_set_pull_rpi4(15, origp15);
 
   let origp48: u32 = gpio_get_pull_rpi4(48);
-  let _ = gpio_set_pull_rpi4(48, 1 as u32);
-  if gpio_get_pull_rpi4(48) != (1 as u32) {
+  let _ = gpio_set_pull_rpi4(48, gpio_pull_down());
+  if gpio_get_pull_rpi4(48) != gpio_pull_down() {
     ok = 0;
   }
   let _ = gpio_set_pull_rpi4(48, origp48);

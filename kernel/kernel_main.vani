@@ -1579,14 +1579,25 @@ fn gpio_read(pin: i64) -> u32 {
   return (val >> bit) & (1 as u32);
 }
 
-// Pull-up/down/none control (0=none, 1=pull-down, 2=pull-up per the
-// BCM2835 GPPUD encoding) -- same GPPUD-then-clock-pulse-then-clear
-// sequence gpio_uart_alt_init above already uses for pins 14/15,
-// generalized to any pin. See this section's own header comment: real,
-// spec-correct code, but its actual effect is unverifiable under QEMU
-// (GPPUD/GPPUDCLK are stubbed "Not implemented" in QEMU's own GPIO
-// model) -- only real hardware can confirm this actually configures a
-// pull resistor.
+// Round 170 (GPIO/UART hardware-agnostic interface scoping): pull-mode
+// values passed to this function come from the shared, SoC-agnostic
+// `gpio` kosh package (gpio_pull_none/_down/_up) -- never a bare
+// hardware bit literal. BCM2835's own GPPUD encoding (none=0, down=1,
+// up=2) happens to match that package's canonical values exactly, so
+// this function needs no translation step -- but that's a coincidence
+// of THIS chip, not a guarantee: BCM2711 (kernel_main_rpi4.vani) has
+// up/down swapped relative to BCM2835 despite being the same vendor's
+// own later SoC (see gpio_pull_to_hw_rpi4's own comment there), and
+// any future non-Raspberry-Pi board is expected to need its own
+// translation too. Same GPPUD-then-clock-pulse-then-clear sequence
+// gpio_uart_alt_init above already uses for pins 14/15, generalized to
+// any pin. See this section's own header comment: real, spec-correct
+// code, but its actual effect is unverifiable under QEMU (GPPUD/
+// GPPUDCLK are stubbed "Not implemented" in QEMU's own GPIO model) --
+// only real hardware can confirm this actually configures a pull
+// resistor.
+use "../vendor/gpio/src/lib.vani";
+
 fn gpio_set_pull(pin: i64, pull: u32) -> i64 {
   let gppud: i64 = GPPUD;
   let clk_reg: i64 = if pin < 32 { GPPUDCLK0 } else { GPPUDCLK1 };
@@ -18105,9 +18116,9 @@ fn shell_dispatch_gpio(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
     let pull_start: i64 = sub_end + 1;
     let pull_end: i64 = shell_find_space(line_buf, pull_start, line_len);
     let pull: u32 = if shell_word_matches(line_buf, pull_start, pull_end, "up") == 1 {
-      2 as u32
+      gpio_pull_up()
     } else {
-      if shell_word_matches(line_buf, pull_start, pull_end, "down") == 1 { 1 as u32 } else { 0 as u32 }
+      if shell_word_matches(line_buf, pull_start, pull_end, "down") == 1 { gpio_pull_down() } else { gpio_pull_none() }
     };
     let _ = gpio_set_pull(pin, pull);
     let _ = uart_puts("ok (not verifiable under QEMU -- see docs/TODO.md)\n");

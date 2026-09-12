@@ -1,0 +1,51 @@
+// gpio -- SoC-agnostic GPIO pull-mode contract.
+//
+// Every GPIO-capable chip lets a pin's internal pull resistor be
+// configured to roughly the same 3 states -- none, pull-down, or
+// pull-up -- but the REGISTER ENCODING for those 3 states is not
+// standardized even within one vendor's own product line. Two
+// concrete, real examples from Dhruva OS's own multi-board port:
+//
+//   - Broadcom BCM2835 (Raspberry Pi 1): GPPUD register, none=0b00,
+//     down=0b01, up=0b10.
+//   - Broadcom BCM2711 (Raspberry Pi 4): GPIO_PUP_PDN_CNTRL register,
+//     none=0b00, up=0b01, down=0b10 -- up/down SWAPPED relative to
+//     BCM2835, despite being the same vendor's own later SoC.
+//
+// A caller that passes a raw hardware bit pattern across that boundary
+// silently gets the OPPOSITE pull direction. This package exists so
+// that never happens again: `gpio_pull_none/_down/_up()` are the only
+// values any board's own `gpio_set_pull`/`gpio_get_pull` function
+// should accept or return. Each board's own driver owns a small,
+// private translation table (see kernel_main_rpi4.vani's own
+// `gpio_pull_to_hw_rpi4`/`gpio_pull_from_hw_rpi4` for the BCM2711
+// example) mapping these 3 canonical values to and from its own real
+// register bits -- the canonical values themselves never change, so a
+// brand new board (not a Raspberry Pi, not even Broadcom) only ever
+// needs to write ITS OWN translation table against this same contract,
+// never touch any other board's driver, and never introduce a new set
+// of magic numbers for callers to get wrong.
+//
+// Deliberately does NOT attempt to cover GPIO function-select (input/
+// output/alternate-function routing): unlike pull-mode, that
+// mechanism itself varies by chip family, not just its encoding (e.g.
+// BCM28xx packs a single 3-bit alt-function field per pin, while an
+// STM32 GPIO uses a 2-bit mode field plus an entirely separate
+// alternate-function-selection register) -- there is no single small
+// contract that fits all of them, so that stays a per-board concern.
+// Plain digital write/read (drive a pin high/low, read its level) are
+// universal enough that they don't need a contract like this one
+// either -- every board's own `gpio_write(pin, value)`/`gpio_read(pin)`
+// already agree on that shape without any translation layer.
+
+fn gpio_pull_none() -> u32 {
+  return 0 as u32;
+}
+
+fn gpio_pull_down() -> u32 {
+  return 1 as u32;
+}
+
+fn gpio_pull_up() -> u32 {
+  return 2 as u32;
+}
