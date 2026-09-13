@@ -587,8 +587,50 @@ mmu_init_domain_outer_done:
     mov r5, #0
     mcr p15, 0, r5, c8, c7, 0
 
+    /* TASK #163 FOLLOW-UP (2026-09-13, found comparing against
+     * dwelch67/raspberrypi's own proven mmu/novectors.s after this
+     * project's second real-hardware boot attempt still failed --
+     * rebooting/hanging before ANY UART output, even after the
+     * vector-table fix): this file NEVER touched TTBCR or TTBR1,
+     * relying entirely on TTBCR.N being 0 at boot -- meaning "TTBR0
+     * alone covers the whole 4GB address space, TTBR1 is irrelevant."
+     * That is the standard reset/expected value, but it is exactly
+     * the same class of unverified handoff-state assumption this
+     * project's own boot.S header comment already calls out by name
+     * for cache/MMU/TLB state ("don't trust the handoff state, force
+     * it clean yourself") -- never actually enforced here for TTBCR
+     * specifically. If real GPU firmware (or the ARM1176 core's own
+     * reset behavior) ever leaves TTBCR.N nonzero, some portion of
+     * the address space -- possibly including this kernel's own
+     * 0x8000 entry point -- would resolve through TTBR1 instead,
+     * which this file has NEVER initialized, reading whatever
+     * arbitrary value happens to be there as a page table base. A
+     * single QEMU model is not proof this can't happen on real
+     * silicon; QEMU's own ARM1176 model has already been confirmed
+     * to diverge from real hardware in this exact category (XN
+     * enforcement, this file's own header). Fixed exactly the way
+     * dwelch67's own proven start_mmu does: explicitly force TTBCR=0
+     * (making "TTBR0 covers everything" the file's own enforced
+     * design decision, not an inherited assumption) AND write the
+     * SAME table base into TTBR1 too, so the outcome is identical
+     * regardless of what TTBCR.N actually is on whatever silicon this
+     * runs on -- belt and suspenders, matching the proven reference's
+     * own defensive redundancy exactly. Cannot be verified as the
+     * actual root cause of the current real-hardware symptom under
+     * QEMU (by construction -- QEMU's own model may not even
+     * implement the TTBR0/TTBR1 split distinctly for this core), only
+     * that it doesn't regress QEMU behavior; real confirmation needs
+     * the next real-hardware boot attempt. */
+    mov r6, #0
+    mcr p15, 0, r6, c2, c0, 2   /* TTBCR = 0: force N=0, TTBR0 covers
+                                 * the entire address space */
+
     /* TTBR0 = page table base. */
     mcr p15, 0, r4, c2, c0, 0
+    /* TTBR1 = same table base -- belt and suspenders, see comment
+     * above. Harmless even though TTBCR=0 above should make this
+     * register's own content irrelevant. */
+    mcr p15, 0, r4, c2, c0, 1
 
     /* DACR: domain 0 = client (0b01) -- access permission is checked
      * per the AP/APX bits in each descriptor above, rather than
