@@ -1,5 +1,15 @@
 /* Dhruva Phase 2 -- fixed-priority preemptive scheduler + a minimal
- * Immediate Priority Ceiling Protocol mutex (ARM32).
+ * Immediate Priority Ceiling Protocol mutex (ARM32). Round 184
+ * (2026-09-12) added dynamic-priority AGING on top of fixed priority,
+ * to bound how long a ready lower-priority task can be starved by an
+ * always-ready higher-priority one -- see ready_wait_ticks_table's own
+ * comment below for the full mechanism and its correctness argument.
+ *
+ * Three statically-prioritized tasks now (HIGH=0, MEDIUM=1, LOW=2 --
+ * lower number wins), replacing Step B's plain 2-task round-robin.
+ * scheduler_pick_next is the shared "who runs next" decision, called
+ * from both the timer-tick path (scheduler_switch_from_irq) and the
+ * new voluntary path (task_sleep_ticks) -- the same policy either way.
  *
  * Three statically-prioritized tasks now (HIGH=0, MEDIUM=1, LOW=2 --
  * lower number wins), replacing Step B's plain 2-task round-robin.
@@ -218,6 +228,69 @@ mutex_block_start_tick_table:
                          * which can only be set by dhruva_mutex_lock
                          * having already written this entry first). */
 
+/* Round 184 (2026-09-12): dynamic-priority AGING, closing the exact gap
+ * round 83's own comment left undocumented-away ("naive fixed-priority
+ * scheduling with no round-robin among equal/lower priorities and no
+ * aging" -- docs/TODO.md). Round 75 already fixed fairness among tasks
+ * TIED at the same priority; this closes the other half: a lower-
+ * priority ready task that is NEVER tied with anything, permanently
+ * outranked by an always-ready higher-priority task, still deserves a
+ * bounded worst-case wait, not an unbounded one.
+ *
+ * Mechanism: ready_wait_ticks_table[i] counts consecutive scheduling
+ * decisions where task i was READY but NOT the one picked; reset to 0
+ * the instant it IS picked. scheduler_pick_next's fair (non-ceiling-
+ * boosted) path computes an "aged priority" = eff_prio[i] - min(eff_
+ * prio[i], ready_wait_ticks[i] >> AGING_SHIFT) for ranking purposes
+ * ONLY -- this table is never written into eff_prio_table itself, so
+ * dhruva_prio_lock/unlock's and dhruva_mutex_lock/unlock's own boost/
+ * restore bookkeeping (which both read AND write eff_prio_table
+ * directly, assuming it reflects only real ceiling/inheritance boosts)
+ * stays exactly correct, completely unaware aging exists. The `min()`
+ * clamp means a starved task's aged priority can fall to 0 (this
+ * scheme's best) but never below it -- aging brings a starved task UP
+ * TO PARITY with whatever's currently contending, never past it, and
+ * round 75's existing round-robin tie-breaking is what actually gives
+ * it a turn once tied. With AGING_SHIFT below, a task at priority N
+ * reaches parity with priority 0 after N * 16 ticks of being passed
+ * over -- e.g. LOW (priority 2) waits at most ~32 ticks.
+ *
+ * Deliberately does NOT apply to the ceiling-boosted-incumbent path
+ * (spn_old_algorithm): that path exists specifically so ties favor the
+ * incumbent unconditionally while it holds a ceiling-protected lock --
+ * see this file's own top-of-file comment. Aging touching that
+ * decision at all would silently reopen the exact race the ceiling
+ * protocol exists to prevent, so it's routed around entirely rather
+ * than reasoned about ad hoc.
+ *
+ * Deliberately DOES apply to every ready task except idle (index
+ * IDLE_TASK_INDEX below) -- including the GC/best-effort band (index
+ * 4, priority 3). This is a considered tradeoff, not an oversight:
+ * DHRUVA_ARCHITECTURE.md's own "never above any hard-RT task" note is
+ * a convention for how *new static priority numbers* get assigned, not
+ * an instantaneous runtime invariant -- and unbounded GC starvation is
+ * itself a real bug (a GC that provably never runs under sustained
+ * hard-RT load can exhaust memory). Idle is the one hard exclusion:
+ * running idle ahead of ANY genuinely ready task is never correct
+ * regardless of how long idle has waited, so idle's own counter is
+ * simply never incremented, permanently pinning its aged priority at
+ * its true one (4). */
+.equ IDLE_TASK_INDEX, 3
+.equ AGING_SHIFT, 4        /* 16 ticks of being passed over = 1 priority
+                            * level of aging credit; tunable, not
+                            * derived from any hardware constant */
+.equ AGING_CAP, 1024       /* saturate the raw counter well above any
+                            * value that could still change the aged-
+                            * priority formula's outcome (max real
+                            * priority in use today is 4, needing at
+                            * most 4 << AGING_SHIFT = 64 ticks of credit
+                            * to fully saturate its own bonus) -- purely
+                            * defense in depth against an unbounded
+                            * 32-bit counter, not load-bearing for
+                            * correctness. */
+ready_wait_ticks_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
 .section ".text"
 
 /* Shared "who runs next" policy: the lowest eff_prio_table value among
@@ -388,12 +461,16 @@ spn_next:
 spn_new_algorithm:
     /* Round 75: fair (round-robin) tie-breaking, safe here because
      * current_task is either not ready or not boosted (gated above).
-     * Pass 1 -- find the lowest eff_prio among ALL ready tasks
-     * (including current, which competes on equal footing with
-     * everyone else in this path). Idle (index 3, priority 4, never
-     * sleeps) guarantees r7 always ends up <= 4, never the empty-scan
-     * sentinel. */
-    mov r7, #255                    /* min eff_prio found so far */
+     * Pass 1 -- find the lowest AGED priority (round 184: eff_prio[i]
+     * minus its aging bonus, see this file's own ready_wait_ticks_table
+     * comment) among ALL ready tasks (including current, which
+     * competes on equal footing with everyone else in this path). Idle
+     * (index 3, priority 4, never sleeps, never ages -- see
+     * IDLE_TASK_INDEX) guarantees r7 always ends up <= 4, never the
+     * empty-scan sentinel. r12 = &ready_wait_ticks_table, loaded once
+     * here and still valid (read-only) through pass 2 below. */
+    ldr r12, =ready_wait_ticks_table
+    mov r7, #255                    /* min aged priority found so far */
     mov r9, #0
 spn_p1_loop:
     cmp r9, #16
@@ -402,19 +479,29 @@ spn_p1_loop:
     cmp r6, r1
     bgt spn_p1_next                 /* not ready -> skip */
     ldr r6, [r4, r9, lsl #2]       /* eff_prio[i] */
+    ldr r0, [r12, r9, lsl #2]      /* ready_wait_ticks[i] */
+    mov r0, r0, lsr #AGING_SHIFT   /* r0 = aging bonus */
+    cmp r0, r6
+    movgt r0, r6                    /* clamp: bonus can't exceed eff_prio
+                                    * itself, so aged prio can't go
+                                    * below 0 */
+    sub r6, r6, r0                  /* r6 = aged_prio[i] */
     cmp r6, r7
     movlt r7, r6
 spn_p1_next:
     add r9, r9, #1
     b spn_p1_loop
 spn_p1_done:
-    /* Pass 2 -- among ready tasks tied at r7 (the min just found),
-     * pick whichever comes first when scanning circularly starting
-     * just AFTER rr_last_picked, so repeated ties rotate through every
-     * tied contender in turn instead of always landing on the same
-     * index. r9 here is an OFFSET (1..16) from rr_last_picked, not a
-     * raw task index -- `and r6,r6,#15` folds it back into 0-15 (valid
-     * since MAX_TASKS=16 is a power of 2). */
+    /* Pass 2 -- among ready tasks tied at r7 (the min AGED priority
+     * just found), pick whichever comes first when scanning circularly
+     * starting just AFTER rr_last_picked, so repeated ties rotate
+     * through every tied contender in turn instead of always landing
+     * on the same index. r9 here is an OFFSET (1..16) from
+     * rr_last_picked, not a raw task index -- `and r6,r6,#15` folds it
+     * back into 0-15 (valid since MAX_TASKS=16 is a power of 2). r8 is
+     * used as scratch for the aging computation below (safe: nothing
+     * reads r8's value in this path until it's deliberately written
+     * with the final pick, either here or the fallback below). */
     ldr r10, =rr_last_picked
     ldr r11, [r10]                  /* r11 = last picked index */
     mov r9, #1
@@ -425,8 +512,13 @@ spn_p2_loop:
     cmp r0, r1
     bgt spn_p2_next                 /* not ready -> skip */
     ldr r0, [r4, r6, lsl #2]       /* eff_prio[candidate] */
+    ldr r8, [r12, r6, lsl #2]      /* ready_wait_ticks[candidate] */
+    mov r8, r8, lsr #AGING_SHIFT
+    cmp r8, r0
+    movgt r8, r0                    /* clamp, same as pass 1 */
+    sub r0, r0, r8                  /* r0 = aged_prio[candidate] */
     cmp r0, r7
-    bne spn_p2_next                 /* not at the min priority -> skip */
+    bne spn_p2_next                 /* not at the min aged priority -> skip */
     mov r8, r6                      /* found this tick's pick */
     b spn_p2_found
 spn_p2_next:
@@ -457,6 +549,47 @@ spn_finish:
     str r11, [r10]
 spn_no_switch:
     str r8, [r2]                   /* current_task = best index */
+
+    /* Round 184: update ready_wait_ticks_table now that this decision
+     * is final (r8). Runs regardless of which algorithm above made the
+     * pick -- correct either way: under spn_old_algorithm (ceiling-
+     * boosted incumbent), everyone else still correctly accrues wait
+     * credit while genuinely passed over, and the incumbent (r8==r3)
+     * still correctly resets to 0. A task that is not ready right now
+     * (still asleep) is left untouched -- sleeping is voluntary, not
+     * starvation, and waking from a long sleep must not hand out a
+     * false aging credit for time it was never actually waiting to
+     * run. IDLE_TASK_INDEX is permanently excluded (see this file's
+     * ready_wait_ticks_table comment for why). r1 (tick_count), r5
+     * (&sleep_until_table), and r8 (final pick, read-only from here) are
+     * all still live and correct from earlier in this function. */
+    ldr r12, =ready_wait_ticks_table
+    mov r9, #0
+aging_update_loop:
+    cmp r9, #16
+    bge aging_update_done
+    cmp r9, #IDLE_TASK_INDEX
+    beq aging_update_next          /* idle never ages -- see comment above */
+    ldr r6, [r5, r9, lsl #2]       /* sleep_until[i] */
+    cmp r6, r1
+    bgt aging_update_next          /* not ready -> leave counter as-is */
+    cmp r9, r8
+    bne aging_update_bump
+    mov r7, #0
+    str r7, [r12, r9, lsl #2]      /* just picked -> reset its wait clock */
+    b aging_update_next
+aging_update_bump:
+    ldr r7, [r12, r9, lsl #2]
+    ldr r6, =AGING_CAP
+    cmp r7, r6
+    bge aging_update_next          /* already saturated -> leave */
+    add r7, r7, #1
+    str r7, [r12, r9, lsl #2]
+aging_update_next:
+    add r9, r9, #1
+    b aging_update_loop
+aging_update_done:
+
     ldr r6, =sp_table
     ldr r0, [r6, r8, lsl #2]      /* r0 = sp_table[best] -- must read
                                     * this before the pop below touches

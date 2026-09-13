@@ -6072,3 +6072,24 @@ support of any kind.
   exists for it than for common USB dongle chipsets, since Broadcom's
   SDIO/UART wireless parts are notoriously under-documented even by
   the standards of consumer WiFi silicon).
+
+- **`uart_puts` is not mutually excluded across tasks — concurrent
+  callers can interleave mid-string** `[found round 184, 2026-09-12,
+  not fixed]`. Surfaced as a side effect of live-verifying the round
+  184 scheduler aging fix: a temporary, always-ready priority-0 demo
+  task printing on every loop iteration corrupted the interactive
+  shell's own output mid-line (`cat /milestonAGING-HOG: starting,e/note`
+  in the captured log — two tasks' own `uart_puts` calls genuinely
+  interleaved byte-for-byte on a real preemption between them, not a
+  logging artifact). This is a real, pre-existing bug independent of
+  the aging work itself (any two tasks printing around the same time
+  could always have hit this, aging just made a permanently-ready
+  contender common enough to expose it reliably) — every existing demo
+  task already prints from `uart_puts` with no locking around it.
+  **Not fixed here**: fixing it needs either a real UART output
+  mutex (interacting with dhruva_mutex_lock/unlock's own priority
+  inheritance, since a low-priority task holding a print lock while
+  preempted by a high-priority one wanting to print is exactly the
+  scenario that primitive exists for) or a per-task output buffer
+  flushed atomically — sized as a real, separate round, not a one-line
+  fix bolted onto the scheduler change that happened to find it.

@@ -46,6 +46,37 @@ doesn't yet attempt.
   full incident and warning for any future attempt) — the algorithm fix
   itself was independently verified via the live regression above instead,
   judged safer than shipping a self-test that could crash the system.
+- ~~**No aging — a lower-priority ready task can starve indefinitely under
+  an always-ready higher-priority one.** Round 75 above only fixed
+  fairness among tasks *tied* at the same priority; a task strictly
+  outranked by a different, permanently-ready priority number had no
+  such protection — flagged explicitly in round 83's own comment
+  (`docs/TODO.md`): "naive fixed-priority scheduling with no round-robin
+  among equal/lower priorities and no aging."~~ **`[DONE, round 184,
+  2026-09-12]`** — `ready_wait_ticks_table` (`boot/context_switch.S`)
+  counts consecutive scheduling decisions a ready task is passed over,
+  reset to 0 the instant it's picked. The fair (non-ceiling-boosted)
+  path now ranks tasks by an "aged priority" (`eff_prio - min(eff_prio,
+  wait_ticks >> AGING_SHIFT)`) instead of raw `eff_prio` — a starved
+  task's aged priority falls toward 0 (this scheme's best) but never
+  below it, so aging brings it up to parity with whatever's currently
+  contending, never past it; round 75's own tie-breaking is what
+  actually gives it a turn once tied. Never written back into
+  `eff_prio_table` itself, so the priority-ceiling and priority-
+  inheritance boost/restore logic (which read/write that table
+  directly) stay completely unaware aging exists. Idle is the sole
+  permanent exclusion (running it ahead of any genuinely ready task is
+  never correct, aged or not).
+
+  Live-verified with a temporary, self-retiring demo pair (one task at
+  priority 0 that never sleeps, one at priority 3 with no tie to fall
+  back on) before being removed again: the priority-3 task was
+  genuinely unreachable without aging and got scheduled at tick 1053
+  once its wait credit closed the gap, exactly as designed. That same
+  experiment also surfaced a real, pre-existing, unrelated bug worth
+  tracking separately — concurrent `uart_puts` calls from different
+  tasks are not mutually excluded and can interleave mid-string on a
+  real preemption (`docs/TODO.md`'s own open item).
 - **500ms tick granularity.** Documented by the project itself as "fine for
   this project's own demo... far too coarse for most real control loops."
   Real RTOS work typically wants 1ms ticks or a tickless (timer-per-deadline)
