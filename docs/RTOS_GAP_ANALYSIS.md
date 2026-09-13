@@ -241,22 +241,67 @@ doesn't yet attempt.
   `power_yank.py`) clean, including the pre-existing MUTEX-LOW/HIGH
   ceiling-protocol demo (round 75's own scheduler-fairness fix) still
   behaving identically alongside this new lock usage.
-- **No priority- or deadline-aware I/O ordering** (already an open,
-  correctly-scoped `docs/TODO.md` item — "Priority/deadline-aware FS request
-  queue"). Today, FS operations run in strict call order: a low-priority
-  task's large write can delay a high-priority task's small, urgent one with
-  no way to preempt or reorder.
+- ~~**No priority- or deadline-aware I/O ordering.** Today, FS operations run
+  in strict call order: a low-priority task's large write can delay a
+  high-priority task's small, urgent one with no way to preempt or
+  reorder.~~ **`[DONE, round 67, 2026-09-02]`** — this line was stale;
+  `docs/TODO.md`'s own "Priority/deadline-aware FS request queue" entry
+  already closed it well before this document was last touched.
+  `boot/fsqueue_state.S` (8 fixed slots) + `dharafs_queue_submit_*` +
+  `dharafs_queue_dispatch_one` (always dispatches the numerically lowest
+  priority value, oldest-first among ties) + a dedicated background
+  task (`task_fsq`) drain it. 34 host-harness checks cover it, including
+  explicit priority-inversion-shaped ordering tests (a low-priority
+  submit made FIRST is dispatched AFTER a high-priority one submitted
+  later). Purely additive/opt-in — every existing synchronous
+  `dharafs_*` call site is unaffected, so this doesn't retroactively
+  make EVERY FS operation priority-ordered (a caller has to actually use
+  the queue), which is the real remaining nuance, not "doesn't exist."
 - **No pre-reserved, guaranteed-bounded allocation path.** A hard-real-time
   filesystem generally wants a worst-case-bounded write path (e.g.
   pre-committed block regions for known-critical writers), not the current
   "scan the log, append, maybe compact" model, whose per-operation cost can
   vary with fragmentation and log state.
-- **SD command-level timeouts exist but aren't tied into a documented
+- ~~**SD command-level timeouts exist but aren't tied into a documented
   worst-case latency contract.** `sdhost_cmd_timed_out` already detects a
   hung command at the hardware-register level — a real, existing building
   block — but no one has computed or documented "a full read/write/compact
   call takes at most N ticks, worst case," the number an RTOS scheduling
-  analysis would actually need.
+  analysis would actually need.~~ **`[DOCUMENTED, 2026-09-12]`** — the
+  real, code-enforced bound per `sdhost_cmd` call (`kernel_main.vani`)
+  is its own software poll loop: 1,000,000 iterations of a single
+  `SDCMD` MMIO read + `NEW_FLAG` check, confirmed by reading the
+  function directly. SDTOUT (the SDHOST controller's own hardware
+  timeout register, set to `0xF00000` = 15,728,640 SD-clock cycles in
+  `sdhost_init`) is a strictly LARGER threshold, so it never actually
+  fires in practice — the software poll always gives up first, by
+  construction, matching the round-15 audit comment already in that
+  code ("well before the hardware's own much-longer SDTOUT-based
+  timeout would have fired").
+
+  Per-operation command counts, each individually bounded by that same
+  1,000,000-iteration cap:
+  - `sdhost_read_block`/`sdhost_write_block`: exactly 1 `sdhost_cmd`
+    call each (CMD17/CMD24).
+  - One `dharafs_compact` call: up to `dharafs_compact_blocks_per_call()`
+    (8) blocks scanned, each doing 1 read plus, if the record is still
+    live and needs carrying forward, 1 write — **≤16 `sdhost_cmd` calls,
+    worst case**, confirmed by reading `dharafs_compact`'s own scan loop
+    directly (1 read always, 1 conditional write per block).
+
+  **Deliberately NOT converted to an absolute time bound (ms/µs) here**:
+  doing that honestly needs either a measured or a conservatively
+  assumed per-iteration cost for `sdhost_cmd`'s poll body, and this
+  project has no cycle counter wired up anywhere to measure it — the
+  ARM1176's own PMCCNTR is never touched by this codebase. Presenting
+  a specific millisecond figure without that would be false precision,
+  not a real bound. What IS real and code-enforced today: **worst case,
+  no single SD operation can wait more than
+  (command count) × 1,000,000 poll iterations**, a genuine, verifiable
+  ceiling — the still-open piece, if an absolute time bound is ever
+  needed, is wiring up PMCCNTR (or an equivalent free-running counter)
+  to measure that iteration's real cost once, not a new architectural
+  gap.
 
 ## Suggested phasing (cheapest/highest-value first, not a commitment)
 
