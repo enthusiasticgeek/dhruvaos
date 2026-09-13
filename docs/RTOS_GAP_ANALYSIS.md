@@ -81,6 +81,37 @@ doesn't yet attempt.
   this project's own demo... far too coarse for most real control loops."
   Real RTOS work typically wants 1ms ticks or a tickless (timer-per-deadline)
   design.
+
+  **Attempted, reverted, round 191 (2026-09-13)**: first extracted the
+  tick period into a single-source-of-truth `scheduler_tick_interval_us()`
+  (kept — was duplicated as a raw `500000` literal in two places,
+  `timer_ic_init` and `irq_dispatch`, a real drift risk), then lowered
+  it to 100ms as a deliberately conservative first step (5x finer, not
+  the full 50-500x jump to 1-10ms) — rescaling every wall-clock-
+  meaningful tick constant found by auditing the whole codebase for
+  hidden period assumptions (`tcp_rtx_timeout_ticks`, DHCP's own
+  `ticks_per_second`, and `auth_lockout_ticks` — the last one a real,
+  narrow finding on its own: a **security-relevant** lockout duration
+  that would have silently shortened to 1/5th its intended length if
+  missed). The mechanism itself worked correctly at the new rate —
+  domain isolation, aging, priority ceiling all stayed correct — but it
+  broke this project's own PRIMARY verification method:
+  `phase4_milestone.py`'s later interactive shell commands (`udpecho`
+  onward) reproducibly, 100% of the time, never reached the guest at
+  all. Leading hypothesis, not fully confirmed: DACR now gets written
+  via `mcr` on every context switch (round 192) and the tick handler
+  runs 5x more often, and QEMU's TCG backend traps/emulates privileged
+  coprocessor and MMIO accesses in software at real, non-trivial HOST
+  cost per access — architecturally free on real ARM1176 silicon, but
+  measurably slower under emulation, silently eating into the fixed
+  real-world time budget the test harness's own `SETTLE_S` delays
+  assume. Since this project's entire verification loop runs on QEMU,
+  reverted rather than shipped unverified. Going further needs either a
+  real cycle counter (task #188's own already-identified gap) to tell
+  "genuinely too much work per tick" apart from "QEMU-specific trap
+  overhead," or accepting slower QEMU-based regression testing as a
+  real tradeoff and adjusting the test harness's own timing budgets
+  accordingly — neither attempted here.
 - ~~**No formal schedulability analysis.** Priorities are hand-assigned;
   there is no tool computing a utilization bound (rate-monotonic) or
   running a response-time analysis across the declared task set's

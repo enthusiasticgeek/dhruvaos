@@ -2291,15 +2291,57 @@ fn uart_put_i64(v: i64) -> i64 {
 // not something Dhruva configures.
 extern "C" fn enable_irqs() -> i64;
 
+// Round 191 (2026-09-13): single source of truth for the scheduler
+// tick period, used by both timer_ic_init (first arm) and
+// irq_dispatch (every reschedule) -- previously the same "500000"
+// literal duplicated in both places, a real drift risk (this project
+// has hit exactly that class of "two copies of the same constant slowly
+// disagree" bug before elsewhere). Kept at the original 500ms: an
+// attempted 100ms tick (5x finer) was fully implemented, including
+// rescaling every wall-clock-meaningful tick constant found in this
+// codebase (tcp_rtx_timeout_ticks, dhcp's own `ticks_per_second`,
+// auth_lockout_ticks -- a real, if narrow, audit finding on its own:
+// auth_lockout_ticks was NOT initially rescaled and would have quietly
+// shortened the real account-lockout duration to 1/5th its intended
+// length), and passed the ORIGINAL "does the mechanism still work"
+// question -- domain isolation, aging, priority ceiling all stayed
+// correct. But it broke this project's own PRIMARY verification
+// method: `phase4_milestone.py`'s later interactive shell commands
+// (`udpecho` onward) reproducibly, 100% of the time, never reached the
+// guest at all -- not garbled, simply never received. Root cause not
+// fully confirmed given time constraints, but the leading hypothesis
+// is real and worth recording: DACR now gets written via `mcr` on
+// EVERY context switch (round 192) and the tick handler itself now
+// runs 5x more often, and unlike real ARM1176 silicon, QEMU's TCG
+// backend traps/emulates privileged coprocessor and MMIO accesses in
+// SOFTWARE at real, non-negligible HOST cost per access -- meaning a
+// change that's architecturally free on real hardware can measurably
+// slow the GUEST down in actual wall-clock time under emulation,
+// silently eating into the fixed real-world time budget this test
+// harness's own SETTLE_S delays assume. Since this project's entire
+// verification loop runs on QEMU (no day-to-day real-hardware testing
+// exists), a change that degrades that IS a real regression to how
+// this project is actually developed, independent of whether real
+// silicon would handle it fine. Reverted rather than shipped
+// unverified; going further needs either a real cycle counter (task
+// #188's own already-identified gap) to distinguish "genuinely too
+// much work per tick" from "QEMU-specific trap overhead" before
+// trying again, or accepting QEMU-based regression testing gets
+// slower as a real tradeoff and adjusting the test harness's own
+// timing budgets accordingly -- not attempted here.
+fn scheduler_tick_interval_us() -> u32 {
+  return 500000 as u32;
+}
+
 fn timer_ic_init() -> i64 {
   let timer_cs: i64 = TIMER_CS;
   let timer_clo: i64 = TIMER_CLO;
   let timer_c1: i64 = TIMER_C1;
   let ic_enable1: i64 = IC_ENABLE1;
 
-  // Arm the first compare match 500ms out (500000 us @ 1MHz).
+  // Arm the first compare match one tick out.
   let now: u32 = mmio_read_u32(timer_clo);
-  let interval: u32 = 500000 as u32;
+  let interval: u32 = scheduler_tick_interval_us();
   let first: u32 = now + interval;
   let _ = mmio_write_u32(timer_c1, first);
 
@@ -2380,8 +2422,12 @@ fn watchdog_arm(timeout_ticks: u32) -> i64 {
 
 // Ticks run at 65536 Hz (a fixed property of this peripheral, same
 // SECS_TO_WDOG_TICKS(x) = x << 16 constant Linux's bcm2835_wdt driver
-// uses) -- 2 seconds gives four missed 500ms ticks of margin before a
-// reset, generous for jitter but still tight enough to prove the
+// uses) -- entirely independent of scheduler_tick_interval_us's own
+// tick period (a SEPARATE hardware counter, confirmed when round 191
+// audited every tick-count constant in this codebase for hidden
+// wall-clock assumptions -- this one had none). 2 seconds gives four
+// missed 500ms scheduler ticks of margin before a reset, generous for
+// jitter but still tight enough to prove the
 // watchdog actually does something if irq_dispatch ever stops running.
 fn watchdog_init() -> i64 {
   let two_seconds_in_ticks: u32 = 131072 as u32; // 2 << 16
@@ -6822,12 +6868,14 @@ fn irq_dispatch() -> i64 {
     let timer_c1: i64 = TIMER_C1;
 
     // Acknowledge channel 1's match (write-1-to-clear) and reschedule
-    // the next one 500ms out, before doing anything else -- if the
-    // tick-handling work below ever took long enough to matter, the
-    // next deadline should already be armed, not computed late.
+    // the next one tick out (scheduler_tick_interval_us -- round 191,
+    // single source of truth shared with timer_ic_init), before doing
+    // anything else -- if the tick-handling work below ever took long
+    // enough to matter, the next deadline should already be armed, not
+    // computed late.
     let _ = mmio_write_u32(timer_cs, 2 as u32);
     let now: u32 = mmio_read_u32(timer_clo);
-    let interval: u32 = 500000 as u32;
+    let interval: u32 = scheduler_tick_interval_us();
     let next: u32 = now + interval;
     let _ = mmio_write_u32(timer_c1, next);
 
@@ -9727,6 +9775,10 @@ fn tcp_state_closing() -> u32 { return 6 as u32; }
 // timeout rather than firing on ordinary scheduling jitter. 3 retries
 // before giving up, matching this project's own established "bounded,
 // not forever" polling discipline used everywhere else.
+//
+// (Round 191, 2026-09-13: briefly rescaled to 20 for an attempted
+// 100ms tick, reverted along with scheduler_tick_interval_us itself --
+// see that function's own comment for why.)
 fn tcp_rtx_timeout_ticks() -> u32 {
   return 4 as u32;
 }
@@ -11008,7 +11060,9 @@ fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
 // (timer_ic_init's own 500ms compare interval), computed here rather
 // than assumed inline so the arithmetic's own units are visible at
 // every step: T1 = lease/2, T2 = lease*7/8, both converted from
-// seconds to ticks by the same factor.
+// seconds to ticks by the same factor. (Round 191, 2026-09-13: briefly
+// 10/second for an attempted 100ms tick, reverted -- see scheduler_
+// tick_interval_us's own comment for why.)
 //
 // Deliberately sends at most ONE attempt per threshold (no
 // retransmission/backoff while RENEWING) -- matching this client's
@@ -21434,7 +21488,11 @@ fn auth_is_weak_password(pw: mut ref i64, pw_len: i64) -> i64 {
 // Failed-attempt rate limiting: 3 strikes locks the account for 20
 // ticks (10s at this project's 500ms tick). Per-slot, not global --
 // see boot/auth_state.S's own file comment on why a lockout on one
-// user must not also block a different user.
+// user must not also block a different user. (Round 191, 2026-09-13:
+// briefly 100 for an attempted 100ms tick -- a real audit catch, this
+// is a security-relevant constant that would have silently shrunk to
+// 1/5th its real duration otherwise -- reverted along with the tick
+// period itself; see scheduler_tick_interval_us's own comment for why.)
 fn auth_lockout_ticks() -> u32 {
   return 20 as u32;
 }
