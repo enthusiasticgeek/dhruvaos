@@ -151,9 +151,30 @@ doesn't yet attempt.
   (`phase4_milestone.py`, `heap_stress.py`, `power_yank.py`) clean,
   heap headroom still ~290KB despite the new per-stack guard-page
   overhead.
-- **No fault containment between tasks.** A bug in one task can freely
+- ~~**No fault containment between tasks.** A bug in one task can freely
   corrupt another task's state or global kernel memory; there is no
-  hardware boundary a task's own bug is contained by.
+  hardware boundary a task's own bug is contained by.~~ **`[DONE, round
+  192, 2026-09-13]`** — ARMv6's 16 hardware domains map one-to-one onto
+  this project's `MAX_TASKS=16`: domain 0 stays permanently Client
+  (kernel/shared memory, unaffected), domains 1-15 map to task indices
+  0-14, each with its own dedicated 1MB region and its own guard page
+  (index 15 has no 16th domain, documented fallback). `scheduler_pick_
+  next` writes a new DACR on every scheduling decision — only the
+  picked task's own domain plus domain 0 are reachable, everything else
+  takes a real Domain Fault. Live-verified, not just written: a
+  temporary probe had task 0 write directly into task 8's own stack
+  region and took a genuine, correctly-attributed Domain Fault (address,
+  value, and domain all matching, `current_task=0` confirming the
+  isolation direction was right). Two real bugs found and fixed along
+  the way — a DACR-write-before-pop ordering bug and an i64/u32 AAPCS
+  register-pairing mismatch that silently zeroed every task's own
+  domain index — see commit `6538ae8` for the full story.
+
+  **Honest limitation, not fixed by this**: protects each task's
+  PRIVATE STACK only. A wild pointer can still corrupt another task's
+  data if it lives in the shared domain-0 heap, which is most
+  allocations today. Per-task heap arenas would be a much larger
+  redesign, out of scope here.
 
 ## 4. Timing analysis / determinism gaps
 
