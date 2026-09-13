@@ -60,6 +60,51 @@
 .global boot_entry
 
 boot_entry:
+    /* FOUND 2026-09-13, comparing against Linux's own arch/arm/kernel/
+     * head.S (ENTRY(stext)) after the vector-table fix above still did
+     * not produce a working real-hardware boot -- the user's own
+     * suggestion to check other proven GitHub Pi 1 sources, not just
+     * dwelch67's minimal examples, is what surfaced this. Linux's own
+     * ARM entry point does NOT trust the CPU is in SVC mode with
+     * interrupts masked when the kernel starts -- its very first real
+     * action (after an optional Hyp-mode check, irrelevant here: this
+     * ARM1176 core predates Hyp mode entirely) is `safe_svcmode_
+     * maskall`: force SVC mode, mask IRQ AND FIQ, unconditionally,
+     * before anything else runs. The comment on that macro in
+     * arch/arm/include/asm/assembler.h is explicit that this exists
+     * because various real bootloaders/firmware do NOT reliably hand
+     * off in that state -- this is not theoretical caution, it is a
+     * real, extensively-hit class of bug across the whole ARM Linux
+     * ecosystem, encoded directly into the kernel's own entry point
+     * for exactly that reason.
+     *
+     * This project's own boot_entry has NEVER done this -- it assumes
+     * SVC mode + masked interrupts as a given (true of the ARM
+     * architectural reset state, and true of QEMU's own `-kernel`
+     * boot by construction, but NOT verified against whatever real
+     * GPU firmware's own handoff actually does). If firmware hands off
+     * via anything other than a genuine CPU reset -- a plain branch
+     * from firmware's own still-running context, which may have
+     * interrupts enabled for its own purposes -- an IRQ or FIQ could
+     * fire at literally the first instruction of this function, before
+     * the vector table below is even copied, jumping to whatever
+     * garbage already occupies address 0x00000000/0x18/0x1C at that
+     * exact moment. This exact class of bug is invisible under QEMU
+     * by construction (its own `-kernel` loader always starts from a
+     * clean, fully-masked SVC-mode state), matching every other real-
+     * hardware-only bug found this investigation.
+     *
+     * Fixed the same way Linux's own macro does for a pre-Hyp-mode
+     * core (its own "#else" branch, since ARM1176 has no Hyp mode to
+     * check for): read CPSR, force mode=SVC and set both I and F mask
+     * bits, unconditionally, as literally the first instructions this
+     * function executes -- before even the vector-table copy, since
+     * that copy itself must not be interruptible either. */
+    mrs r0, cpsr
+    bic r0, r0, #0x1F      /* clear mode bits */
+    orr r0, r0, #0xD3      /* SVC mode (0x13) | I mask (0x80) | F mask (0x40) */
+    msr cpsr_c, r0
+
     /* TASK #163 FIX (2026-09-12): copy the vector table (vectors.S's
      * own `_start`/`_vectors`, now linked immediately before this
      * function at the REAL entry point, 0x8000 -- see link.ld's own
@@ -152,6 +197,18 @@ boot_entry:
     orr r1, r1, #0x12      /* IRQ mode */
     msr cpsr_c, r1
     ldr sp, =_irq_stack_top
+
+    BLINK_N 2   /* checkpoint 2 (round 2026-09-13, real-hardware
+                 * investigation): IRQ mode entered, sp_irq set. Split
+                 * out from the old single "mode-switching / stack
+                 * setup done" checkpoint after the user reported a
+                 * live LED pattern (one short blink, then stuck ON
+                 * for ~2s) matching checkpoint 1 completing but
+                 * something failing before the old checkpoint 2 ever
+                 * fired -- narrowing down WHICH of the three mode
+                 * switches below is actually the problem, rather than
+                 * guessing, on the next real-hardware attempt. */
+
     bic r1, r0, #0x1F
     orr r1, r1, #0x17      /* Round 38: Abort mode -- same reasoning as
                              * IRQ above: entering Abort mode with sp_abt
@@ -164,12 +221,18 @@ boot_entry:
                              * permission faults a real, expected event. */
     msr cpsr_c, r1
     ldr sp, =_abort_stack_top
+
+    BLINK_N 3   /* checkpoint 3 (round 2026-09-13): Abort mode entered,
+                 * sp_abt set. See checkpoint 2's own comment above. */
+
     bic r1, r0, #0x1F
     orr r1, r1, #0x13      /* back to SVC mode */
     msr cpsr_c, r1
     ldr sp, =_stack_top    /* restore SVC's own sp (clobbered above) */
 
-    BLINK_N 2   /* checkpoint 2: mode-switching / stack setup done */
+    BLINK_N 4   /* checkpoint 4 (was checkpoint 2 before the 2026-09-13
+                 * split above): back in SVC mode, sp restored --
+                 * mode-switching / stack setup fully done */
 
     /* QEMU's ELF loader does not clear .bss -- do it ourselves before
      * any vani code (which may rely on zero-initialized statics) runs. */
@@ -184,19 +247,19 @@ clear_bss:
     b clear_bss
 clear_bss_done:
 
-    BLINK_N 3   /* checkpoint 3: .bss clear done */
+    BLINK_N 5   /* checkpoint 5 (was 3): .bss clear done */
 
     /* Round 38: page table lives in .bss (mmu_init.S), so it must be
      * built AFTER clear_bss above, not before -- otherwise the zero
      * fill would wipe out every descriptor mmu_init just wrote. */
     bl mmu_init
 
-    BLINK_N 4   /* checkpoint 4: mmu_init returned */
+    BLINK_N 6   /* checkpoint 6 (was 4): mmu_init returned */
 
     bl kernel_main
 
 hang:
-    BLINK_N 5   /* checkpoint 5, repeating: kernel_main returned --
+    BLINK_N 7   /* checkpoint 7 (was 5), repeating: kernel_main returned --
                  * should never happen (it runs forever), a sentinel
                  * if it somehow does */
     b hang
