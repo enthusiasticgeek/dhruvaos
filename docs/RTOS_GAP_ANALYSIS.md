@@ -81,11 +81,38 @@ doesn't yet attempt.
   this project's own demo... far too coarse for most real control loops."
   Real RTOS work typically wants 1ms ticks or a tickless (timer-per-deadline)
   design.
-- **No formal schedulability analysis.** Priorities are hand-assigned; there
-  is no tool computing a utilization bound (rate-monotonic) or running a
-  response-time analysis across the declared task set's periods/WCETs.
-  `#[wcet(cycles=N)]` bounds a single function's cost — nothing ties that
-  into "is this whole task set actually schedulable."
+- ~~**No formal schedulability analysis.** Priorities are hand-assigned;
+  there is no tool computing a utilization bound (rate-monotonic) or
+  running a response-time analysis across the declared task set's
+  periods/WCETs. `#[wcet(cycles=N)]` bounds a single function's cost —
+  nothing ties that into "is this whole task set actually
+  schedulable."~~ **`[TOOL DONE, round 190, 2026-09-13 — not yet
+  applied to DhruvaOS's own task set]`** — `test/schedulability_
+  analysis.py` implements both the Liu & Layland (1973) sufficient
+  utilization-bound test and exact fixed-priority response-time
+  analysis (Joseph & Pandya, 1986), validated against 4 independently-
+  hand-worked textbook examples (including one where the sufficient
+  bound fails but exact RTA proves the set schedulable anyway — the
+  actual textbook reason exact analysis exists, not a redundant second
+  check).
+
+  **Deliberately NOT run against DhruvaOS's own current demo task set**
+  in this round, for the same reason `docs/TODO.md`'s own "Per-task
+  runtime histograms + a real deadline/budget model" entry already
+  gave for the sibling deadline-detection problem: none of HIGH/
+  MEDIUM/LOW/etc. have a declared WCET anywhere (`#[wcet(cycles=N)]`
+  exists on exactly one function project-wide, `irq_dispatch`, an
+  interrupt handler, not a task) — and every demo task body calls the
+  blocking `uart_puts`, not the WCET-safe `uart_putc_nonblocking`
+  `irq_dispatch` itself uses specifically to stay analyzable, so they
+  likely couldn't pass a real WCET check without being rewritten
+  first. Inventing period/WCET numbers for them just to produce SOME
+  output would be "fabricating a number, not observing one" — that
+  TODO entry's own phrase for exactly this trap. Point this tool at
+  DhruvaOS's own task set the round a real timing-constrained task
+  (a genuine sensor poll loop, a real network deadline) actually needs
+  it, matching that entry's own "build it when a real workload exists"
+  plan.
 - **No aperiodic/sporadic server.** Interrupt-triggered, non-periodic work
   (e.g. UART RX) runs directly in `irq_dispatch`, not budgeted against any
   task's own time allowance.
