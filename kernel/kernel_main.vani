@@ -2560,92 +2560,171 @@ fn sdhost_init() -> i64 {
   }
 
   // CMD8: SEND_IF_COND -- 0x1AA = 2.7-3.6V range + the 0xAA check
-  // pattern. A card that doesn't echo it back either doesn't
-  // implement CMD8 (an old SDSC card -- not supported by this driver
-  // yet) or something's wrong with the link; not checked yet, just
-  // logged, since the only card this needs to handle right now is
-  // QEMU's own `-drive if=sd` image. A genuine software-level timeout
-  // (the controller itself wedged, not just an old card that doesn't
-  // implement this command) is still a real, distinct failure worth
-  // catching -- an unresponsive CMD8 either way means nothing later in
-  // this sequence stands a real chance either.
+  // pattern. Every real SD 2.0+ card implements this and echoes the
+  // pattern back; a card that doesn't respond at all is either an old
+  // SDSC card (SD 1.x, not supported by this driver) or -- task #186,
+  // Compute Module/Pi Zero support -- a genuine MMC/eMMC card, which
+  // never implements this SD-specific command at all. Round 186
+  // (2026-09-12) changed this from an immediate hard failure to a
+  // fork: CMD8 timing out is exactly the standard, real-world way a
+  // host tells "not SD" apart from "SD, just not ready yet" (matching
+  // U-Boot's own drivers/mmc/mmc.c overall attach strategy -- try the
+  // SD sequence, fall back to the MMC one). is_mmc gates every command
+  // below that genuinely differs between the two protocols; command
+  // INDICES 2/9/7/16 and their argument/response shapes are identical
+  // between SD and MMC at this level (both descend from the same MMC
+  // command class) and stay completely unbranched.
+  //
+  // UNTESTABLE UNDER THIS PROJECT'S QEMU HARNESS: `qemu-system-arm
+  // -device help` on this build only exposes `sd-card`/`sd-card-spi`
+  // (confirmed by inspecting the actual device list) -- there is no
+  // MMC/eMMC card model to attach via `-drive if=sd`, so
+  // phase4_milestone.py and every other test here can only ever
+  // exercise the is_mmc==0 branch. The is_mmc==1 path is implemented
+  // directly against U-Boot's mmc_send_op_cond/mmc_send_op_cond_iter
+  // (proven, widely-deployed reference for real eMMC bring-up) rather
+  // than reasoned from protocol docs alone, per this project's own
+  // "escalate to a proven reference" convention -- but it genuinely
+  // cannot be regression-tested until real Compute Module/eMMC
+  // hardware exists, same category of gap as the Pi 1B real-boot
+  // vector-table bug (docs/TODO.md, project memory
+  // project_dhruva_pi1b_real_boot_investigation_2026_09_12).
   let cmd8_status: u32 = sdhost_cmd(8 as u32, 0x1AA as u32);
-  if sdhost_cmd_timed_out(cmd8_status) == 1 {
-    let _ = uart_puts("SD: CMD8 (SEND_IF_COND) timed out\n");
-    return 0 - 1;
-  }
-  let _ = uart_puts("SD: CMD8 RSP0=0x");
-  let _ = uart_put_hex32(mmio_read_u32(sdrsp0));
-  let _ = uart_puts("\n");
-
-  // ACMD41 loop: CMD55 (APP_CMD) then CMD41 (SD_SEND_OP_COND) with
-  // the HCS bit set (this driver only supports SDHC/SDXC-style
-  // block-addressed cards) until the card's busy bit (bit 31 of the
-  // OCR response) sets, meaning it finished its own internal power-up
-  // sequence. Capped iteration count, not `while true` -- same
-  // reasoning as sdhost_cmd's own poll loop.
+  let is_mmc: i64 = if sdhost_cmd_timed_out(cmd8_status) == 1 { 1 } else { 0 };
   let ocr_busy: u32 = 0x80000000 as u32;
   let hcs: u32 = 0x40000000 as u32;
   let voltage_window: u32 = 0x00FF8000 as u32;
-  let acmd_iter: i64 = 0;
   let ocr: u32 = 0 as u32;
-  let acmd41_wedged: i64 = 0;
-  while (acmd_iter < 1000) && (acmd41_wedged == 0) {
-    let cmd55_status: u32 = sdhost_cmd(55 as u32, 0 as u32);
-    let cmd41_status: u32 = sdhost_cmd(41 as u32, hcs | voltage_window);
-    // A software-level timeout on either command here is a different,
-    // more severe condition than the ordinary "OCR busy bit not set
-    // yet" retry this loop already exists to tolerate -- that's the
-    // card correctly reporting it isn't ready; a timeout means the
-    // controller itself never even completed the command, and
-    // retrying against a wedged controller for the remaining
-    // iterations would just be a long wait for something that was
-    // never going to succeed. Distinguished from the ordinary retry
-    // path so it fails fast instead.
-    if (sdhost_cmd_timed_out(cmd55_status) == 1) || (sdhost_cmd_timed_out(cmd41_status) == 1) {
-      acmd41_wedged = 1;
-    } else {
-      ocr = mmio_read_u32(sdrsp0);
-      if (ocr & ocr_busy) != (0 as u32) {
-        break;
+
+  if is_mmc == 0 {
+    let _ = uart_puts("SD: CMD8 RSP0=0x");
+    let _ = uart_put_hex32(mmio_read_u32(sdrsp0));
+    let _ = uart_puts("\n");
+
+    // ACMD41 loop: CMD55 (APP_CMD) then CMD41 (SD_SEND_OP_COND) with
+    // the HCS bit set (this driver only supports SDHC/SDXC-style
+    // block-addressed cards) until the card's busy bit (bit 31 of the
+    // OCR response) sets, meaning it finished its own internal
+    // power-up sequence. Capped iteration count, not `while true` --
+    // same reasoning as sdhost_cmd's own poll loop. Only reached once
+    // CMD8 has already confirmed this is genuinely an SD card, so an
+    // ACMD41 timeout here stays a hard failure (unlike CMD8 above) --
+    // there is no third protocol to fall back to.
+    let acmd_iter: i64 = 0;
+    let acmd41_wedged: i64 = 0;
+    while (acmd_iter < 1000) && (acmd41_wedged == 0) {
+      let cmd55_status: u32 = sdhost_cmd(55 as u32, 0 as u32);
+      let cmd41_status: u32 = sdhost_cmd(41 as u32, hcs | voltage_window);
+      // A software-level timeout on either command here is a
+      // different, more severe condition than the ordinary "OCR busy
+      // bit not set yet" retry this loop already exists to tolerate --
+      // that's the card correctly reporting it isn't ready; a timeout
+      // means the controller itself never even completed the command,
+      // and retrying against a wedged controller for the remaining
+      // iterations would just be a long wait for something that was
+      // never going to succeed. Distinguished from the ordinary retry
+      // path so it fails fast instead.
+      if (sdhost_cmd_timed_out(cmd55_status) == 1) || (sdhost_cmd_timed_out(cmd41_status) == 1) {
+        acmd41_wedged = 1;
+      } else {
+        ocr = mmio_read_u32(sdrsp0);
+        if (ocr & ocr_busy) != (0 as u32) {
+          break;
+        }
+        acmd_iter = acmd_iter + 1;
       }
-      acmd_iter = acmd_iter + 1;
     }
+    if acmd41_wedged == 1 {
+      let _ = uart_puts("SD: ACMD41 (CMD55/CMD41) timed out\n");
+      return 0 - 1;
+    }
+    let _ = uart_puts("SD: ACMD41 done, OCR=0x");
+    let _ = uart_put_hex32(ocr);
+    let _ = uart_puts("\n");
+  } else {
+    let _ = uart_puts("MMC: CMD8 got no response -- retrying as MMC/eMMC (task #186)\n");
+
+    // "Some cards seem to need this" -- U-Boot's own comment in
+    // mmc_send_op_cond before its CMD1 loop; re-idling before
+    // switching protocols is standard practice, not cargo-culted.
+    let cmd0_retry_status: u32 = sdhost_cmd(sdcmd_no_response, 0 as u32);
+    if sdhost_cmd_timed_out(cmd0_retry_status) == 1 {
+      let _ = uart_puts("MMC: CMD0 retry (GO_IDLE_STATE) timed out\n");
+      return 0 - 1;
+    }
+
+    // CMD1 (SEND_OP_COND): MMC's own OCR-negotiation command, entirely
+    // separate from SD's CMD55/CMD41 pair -- no APP_CMD prefix, MMC
+    // doesn't have the concept. Matching U-Boot's mmc_send_op_cond_iter:
+    // the very first attempt is a bare probe (argument 0, just reading
+    // back the card's own capabilities), every attempt after that
+    // proposes HCS + the same voltage window SD's ACMD41 already uses
+    // above -- OCR_HCS (0x40000000) and the busy bit (0x80000000) are
+    // the identical bit positions in both protocols' OCR word,
+    // confirmed against U-Boot's own include/mmc.h, not assumed from
+    // the SD spec alone.
+    let mmc_iter: i64 = 0;
+    let mmc_wedged: i64 = 0;
+    while (mmc_iter < 1000) && (mmc_wedged == 0) {
+      let cmd1_arg: u32 = if mmc_iter == 0 { 0 as u32 } else { hcs | voltage_window };
+      let cmd1_status: u32 = sdhost_cmd(1 as u32, cmd1_arg);
+      if sdhost_cmd_timed_out(cmd1_status) == 1 {
+        mmc_wedged = 1;
+      } else {
+        ocr = mmio_read_u32(sdrsp0);
+        if (ocr & ocr_busy) != (0 as u32) {
+          break;
+        }
+        mmc_iter = mmc_iter + 1;
+      }
+    }
+    if mmc_wedged == 1 {
+      let _ = uart_puts("MMC: CMD1 (SEND_OP_COND) timed out -- no supported card found\n");
+      return 0 - 1;
+    }
+    let _ = uart_puts("MMC: CMD1 done, OCR=0x");
+    let _ = uart_put_hex32(ocr);
+    let _ = uart_puts("\n");
   }
-  if acmd41_wedged == 1 {
-    let _ = uart_puts("SD: ACMD41 (CMD55/CMD41) timed out\n");
-    return 0 - 1;
-  }
-  let _ = uart_puts("SD: ACMD41 done, OCR=0x");
-  let _ = uart_put_hex32(ocr);
-  let _ = uart_puts("\n");
 
   // CMD2: ALL_SEND_CID -- long (136-bit) response. No addressing yet
   // (this is the one open-drain-style "every card on the bus
   // responds" command) -- fine here since exactly one card exists.
   let cmd2_status: u32 = sdhost_cmd(sdcmd_long_response | (2 as u32), 0 as u32);
   if sdhost_cmd_timed_out(cmd2_status) == 1 {
-    let _ = uart_puts("SD: CMD2 (ALL_SEND_CID) timed out\n");
+    let _ = uart_puts("SD/MMC: CMD2 (ALL_SEND_CID) timed out\n");
     return 0 - 1;
   }
 
-  // CMD3: SEND_RELATIVE_ADDR -- the card publishes its own RCA in the
-  // top 16 bits of the (short) response; every later addressed
-  // command needs it in that same position, so no shift is needed
-  // between reading it here and using it below.
-  let cmd3_status: u32 = sdhost_cmd(3 as u32, 0 as u32);
+  // CMD3: SD names this SEND_RELATIVE_ADDR (card publishes its own
+  // RCA, argument ignored) -- MMC names the SAME command index
+  // SET_RELATIVE_ADDR (HOST assigns the RCA via the argument, card
+  // just echoes it back), per U-Boot's own mmc_set_relative_addr /
+  // include/mmc.h (MMC_CMD_SET_RELATIVE_ADDR == 3, same index).
+  // Assigning a fixed RCA of 1 (matching U-Boot's own hardcoded
+  // `mmc->rca = 1`, not derived from anything card-specific) works for
+  // this driver's single-card-per-bus assumption exactly like SD's own
+  // "exactly one card exists" note on CMD2 above. Positioned in bits
+  // 31:16 either way, so every later addressed command (CMD9/CMD7)
+  // stays completely unbranched below.
+  let cmd3_arg: u32 = if is_mmc == 1 { 0x00010000 as u32 } else { 0 as u32 };
+  let cmd3_status: u32 = sdhost_cmd(3 as u32, cmd3_arg);
   if sdhost_cmd_timed_out(cmd3_status) == 1 {
     let _ = uart_puts("SD: CMD3 (SEND_RELATIVE_ADDR) timed out\n");
     return 0 - 1;
   }
-  let rca: u32 = mmio_read_u32(sdrsp0) & (0xFFFF0000 as u32);
+  // For MMC, trust the value just assigned rather than re-parsing the
+  // response -- matching U-Boot's own approach (it never reads the
+  // RCA back out of CMD3's response either). For SD, unchanged: the
+  // card's own published RCA.
+  let rca: u32 = if is_mmc == 1 { cmd3_arg } else { mmio_read_u32(sdrsp0) & (0xFFFF0000 as u32) };
 
   // CMD9: SEND_CSD -- long response, addressed by the RCA just
   // published. Not parsed yet (card capacity/speed class live here on
   // real hardware) -- deferred until the driver actually needs it.
   let cmd9_status: u32 = sdhost_cmd(sdcmd_long_response | (9 as u32), rca);
   if sdhost_cmd_timed_out(cmd9_status) == 1 {
-    let _ = uart_puts("SD: CMD9 (SEND_CSD) timed out\n");
+    let _ = uart_puts("SD/MMC: CMD9 (SEND_CSD) timed out\n");
     return 0 - 1;
   }
 
@@ -2654,7 +2733,7 @@ fn sdhost_init() -> i64 {
   // this first.
   let cmd7_status: u32 = sdhost_cmd(sdcmd_busywait | (7 as u32), rca);
   if sdhost_cmd_timed_out(cmd7_status) == 1 {
-    let _ = uart_puts("SD: CMD7 (SELECT_CARD) timed out\n");
+    let _ = uart_puts("SD/MMC: CMD7 (SELECT_CARD) timed out\n");
     return 0 - 1;
   }
 
@@ -2662,20 +2741,29 @@ fn sdhost_init() -> i64 {
   // blocks, set once here rather than before every single read/write.
   let cmd16_status: u32 = sdhost_cmd(16 as u32, 512 as u32);
   if sdhost_cmd_timed_out(cmd16_status) == 1 {
-    let _ = uart_puts("SD: CMD16 (SET_BLOCKLEN) timed out\n");
+    let _ = uart_puts("SD/MMC: CMD16 (SET_BLOCKLEN) timed out\n");
     return 0 - 1;
   }
 
-  // OCR bit 30 (CCS, Card Capacity Status) is only meaningful once
-  // ACMD41 reported busy=0 (ready) above -- 1 means SDHC/SDXC
-  // (block-addressed), 0 means SDSC (byte-addressed, block_num*512).
-  // QEMU's generic SD card model derives this from the attached
-  // image's size, not anything this driver controls.
+  // OCR bit 30 is SD's CCS (Card Capacity Status) and MMC's own
+  // access-mode/high-capacity bit -- the SAME bit position in both
+  // protocols' OCR word (confirmed against U-Boot's OCR_HCS,
+  // include/mmc.h, used identically for both card types there), only
+  // meaningful once the OCR-negotiation loop above (ACMD41 or CMD1)
+  // reported busy=0 (ready). 1 means block-addressed (SDHC/SDXC, or
+  // MMC's own sector-addressing mode), 0 means byte-addressed
+  // (SDSC, block_num*512) -- sdhost_card_addr below already branches
+  // on exactly this distinction and needs no MMC-specific change,
+  // since the addressing math itself is identical either way. QEMU's
+  // generic SD card model derives this from the attached image's
+  // size, not anything this driver controls -- the is_mmc==1 path
+  // can't be exercised there at all (see this function's own CMD8
+  // comment above).
   let ccs_bit: u32 = 0x40000000 as u32;
   let is_sdhc: i64 = if (ocr & ccs_bit) != (0 as u32) { 1 } else { 0 };
   let _ = sd_state_set(rca as i64, is_sdhc);
 
-  let _ = uart_puts("SD: init done, RCA=0x");
+  let _ = uart_puts("SD/MMC: init done, RCA=0x");
   let _ = uart_put_hex32(rca);
   let _ = uart_puts(" is_sdhc=");
   let _ = uart_put_hex32(is_sdhc as u32);
