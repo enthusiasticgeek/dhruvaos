@@ -231,6 +231,84 @@ mmu_l2_table_data:
                    * TASK #163 FIX (2026-09-12): shifted from Section 1,
                    * see mmu_init's own Section 1/2 comments below. */
 
+/* Round 192 (2026-09-12): per-task ARMv6 DOMAIN isolation --
+ * docs/RTOS_GAP_ANALYSIS.md's last remaining fault-isolation gap, "no
+ * fault containment between tasks" (round 76 above only catches a
+ * task overflowing its OWN stack; this catches a task's bug touching
+ * ANOTHER task's stack via any other route -- a wild pointer, bad
+ * arithmetic, anything -- regardless of adjacency).
+ *
+ * ARMv6's DOMAIN mechanism is a SEPARATE access-control layer from the
+ * AP/APX bits this whole file already uses: each of the 16 hardware
+ * domains (a 4-bit field) gets one of Client/Manager/No-Access in
+ * DACR (a single 32-bit register, 2 bits per domain), and a memory
+ * access whose section/page belongs to a "No Access" domain faults
+ * IMMEDIATELY regardless of what its own AP/APX bits say -- an
+ * entirely orthogonal, and for this purpose much SIMPLER, mechanism
+ * than trying to give every pair of tasks their own AP-bit
+ * arrangement. MAX_TASKS is 16 (context_switch.S) and ARMv6 has 16
+ * domains -- domain 0 stays exactly what it's always been (kernel/
+ * shared: code, global data, the heap, every existing mapping in this
+ * file above), permanently Client in DACR (see mmu_init's own DACR
+ * write below) so none of THIS file's existing AP/APX-based
+ * protection (the W^X code section, round 76's own guard pages, etc.)
+ * changes behavior at all. Domains 1-15 are new: one per task INDEX
+ * 0-14 (domain = index+1), each covering its own dedicated, otherwise-
+ * unused 1MB section (10 through 24, physical 0x00A00000-0x018FFFFF --
+ * confirmed unmapped today, sections 3-9 are the round-108 RAM
+ * extension and nothing claims anything past section 9 before this).
+ * Task index 15 (MAX_TASKS-1, the very last dynamic task_create()
+ * slot) has no 16th domain available -- documented, honest, currently-
+ * inert limitation: this project's real usage today is 6 fixed + a
+ * handful of dynamic tasks, never reaching index 15, and
+ * dhruva_alloc_stack_domain (boot/rpi1/runtime_stubs.c) falls back to
+ * the OLD shared, unprotected heap allocation for that one slot rather
+ * than silently doing something wrong with an out-of-range domain
+ * number.
+ *
+ * context_switch.S's scheduler_pick_next writes a NEW DACR on every
+ * scheduling decision: domain 0 always Client, the NEWLY PICKED
+ * task's own domain (index+1) Client, every other domain 1-15 left at
+ * 0 (No Access, DACR's own reset/default meaning) -- so a task can
+ * only ever touch its OWN stack region and the shared domain-0 memory
+ * everything legitimately reads/writes (globals, mutex state, the FS
+ * queue, ordinary heap allocations), never another task's private
+ * stack. QEMU correctly emulates ARMv6 domain-based access control
+ * (unlike the XN-bit gap this file's own header already documents at
+ * length -- domain checking is architecturally much older than
+ * ARMv7's XN-combining logic QEMU's get_S1prot skips for this core),
+ * so this is fully regression-testable, verified the same way round
+ * 76's guard pages were: a live fault-injection self-test (added
+ * temporarily during this round's own verification, see the commit
+ * history) that deliberately wrote into a DIFFERENT task's own stack
+ * region and confirmed a real Domain Fault (status bits ...9 in
+ * DFSR, ARMv6's domain-fault encoding) at exactly that address.
+ *
+ * Honest limitation: this protects each task's PRIVATE STACK memory
+ * only, not arbitrary heap-allocated data structures -- a task with a
+ * wild pointer can still corrupt another task's data if that data
+ * lives in the shared domain-0 heap (which is most of it). Extending
+ * this to per-task heap ARENAS (not just stacks) would be a
+ * significantly larger redesign of dhruva_alloc_bytes itself, out of
+ * this round's scope -- stacks are the single highest-value target
+ * (matching round 76's own original motivation: a real stack-overflow
+ * bug, not a heap-corruption one, is what started this whole gap
+ * analysis). */
+.align 10   /* 1KB alignment, same requirement as mmu_l2_table_data
+             * above -- each of the 15 per-domain L2 tables needs its
+             * own base-address field to have bits[9:0] zero, and this
+             * contiguous block gives each one exactly that by
+             * construction (1024-byte stride from a 1024-aligned
+             * start). */
+.global mmu_l2_table_task_domains
+mmu_l2_table_task_domains:
+    .space 15360   /* 15 x 256 x 4-byte small-page descriptors -- one
+                    * 1KB coarse table per task-index domain (indices
+                    * 0-14, domains 1-15), each covering its own 1MB
+                    * section. Table i (i=0..14) starts at offset
+                    * i*1024 and covers physical 0x00A00000 +
+                    * i*0x00100000 through +0xFFFFF. */
+
 .section ".text"
 
 .global mmu_init
@@ -441,6 +519,66 @@ mmu_init_vcram_loop:
     cmp r6, #512
     blt mmu_init_vcram_loop
 
+    /* Round 192: sections 10-24 (0x00A00000-0x018FFFFF), one per
+     * task-index domain (index 0-14 -> domain 1-15, see
+     * mmu_l2_table_task_domains's own comment above for the full
+     * design). Outer loop builds each L1 "page table" descriptor --
+     * same coarse-type format as Section 2's own L1 entry above
+     * (bits[31:10]=L2 base, bits[1:0]=0b01), but with a REAL,
+     * per-table DOMAIN field this time (bits[8:5] = i+1, not the 0
+     * every other entry in this file uses) -- this is the one new
+     * piece of information this round adds to the page table format
+     * itself, everything else about small-page descriptors is
+     * unchanged. Inner loop populates that domain's own 256 entries
+     * with the exact same RW/XN/Normal-Non-cacheable encoding
+     * (0x53, see Section 2's own loop above for the byte-by-byte
+     * derivation) every other RAM small-page entry in this file uses
+     * -- domain isolation is enforced by DACR at context-switch time
+     * (context_switch.S), not by anything different in these
+     * descriptors themselves. r6 = domain index (0-14), r7 = this
+     * domain's own physical base, r0/r1 = inner-loop scratch. */
+    mov r6, #0
+mmu_init_domain_outer_loop:
+    cmp r6, #15
+    bge mmu_init_domain_outer_done
+
+    ldr r7, =mmu_l2_table_task_domains
+    mov r0, #1024
+    mul r1, r6, r0
+    add r7, r7, r1              /* r7 = &mmu_l2_table_task_domains[r6] */
+
+    add r1, r6, #1              /* r1 = domain number (1-15) */
+    mov r1, r1, lsl #5          /* r1 = domain field, positioned at
+                                 * bits[8:5] */
+    orr r1, r1, #1              /* coarse page table type */
+    orr r1, r1, r7              /* combine with the L2 table's own base
+                                 * address (bits[31:10] -- r7 is already
+                                 * 1KB-aligned, so no shift needed, same
+                                 * convention Section 2's own L1 entry
+                                 * uses) */
+    ldr r0, =mmu_page_table
+    add r0, r0, #40             /* section 10 * 4 bytes/entry */
+    str r1, [r0, r6, lsl #2]
+
+    /* Inner loop: this domain's own 256 small-page entries. */
+    ldr r0, =0x00A00000
+    mov r1, #0x00100000
+    mul r1, r6, r1
+    add r0, r0, r1               /* r0 = this domain's own physical base */
+    mov r1, #0
+mmu_init_domain_inner_loop:
+    ldr r2, =0x53
+    orr r2, r2, r0
+    str r2, [r7, r1, lsl #2]
+    add r0, r0, #0x1000
+    add r1, r1, #1
+    cmp r1, #256
+    blt mmu_init_domain_inner_loop
+
+    add r6, r6, #1
+    b mmu_init_domain_outer_loop
+mmu_init_domain_outer_done:
+
     /* Invalidate the entire TLB (both I and D) before this table is
      * ever consulted. A cold boot's TLB should already hold nothing
      * valid -- but relying on that rather than saying so explicitly is
@@ -455,10 +593,26 @@ mmu_init_vcram_loop:
     /* DACR: domain 0 = client (0b01) -- access permission is checked
      * per the AP/APX bits in each descriptor above, rather than
      * domain 0 blanket-allowing (manager, 0b11) or blanket-denying
-     * (no access, 0b00) everything regardless of those bits. Every
-     * descriptor above uses domain 0, so this one write covers the
-     * whole table. */
-    mov r5, #1
+     * (no access, 0b00) everything regardless of those bits.
+     *
+     * ROUND 192 UPDATE: also grants Client to domains 1-15 (the new
+     * per-task-index domains above), NOT just domain 0 -- 0x55555555
+     * is 0b01 repeated 16 times, one Client grant per domain. This is
+     * intentional and safe: at this exact point in boot, execution is
+     * still genuinely single-threaded (mmu_init itself, then
+     * kernel_main's own sequential setup code on the plain boot stack)
+     * -- there is no "another task" yet for domain isolation to
+     * protect against, and dhruva_alloc_stack_domain (boot/rpi1/
+     * runtime_stubs.c) needs to freely WRITE into whichever domain
+     * region each task's stack is about to occupy while it's still
+     * setting them up, well before any task is ever scheduled. Real
+     * per-task RESTRICTION first takes effect at the very first
+     * scheduler_pick_next call (context_switch.S), which recomputes
+     * and overwrites this register on every scheduling decision from
+     * then on -- exactly the moment concurrent/preemptive execution
+     * actually begins, which is the only point protection needs to
+     * start mattering. */
+    ldr r5, =0x55555555
     mcr p15, 0, r5, c3, c0, 0
 
     /* SCTLR: set bit 0 (M, MMU enable) AND bit 23 (XP) -- caches stay
@@ -522,4 +676,46 @@ mmu_guard_page_install:
                                  * TLB entry by MVA (r0 still holds the
                                  * page-aligned address unchanged) */
     mov r0, #0
+    bx lr
+
+/* i64 mmu_guard_page_install_domain(mut ref i64 addr, i64 task_index) --
+ * round 192's own version of mmu_guard_page_install above, targeting
+ * one of the 15 per-task-index domain sections (see mmu_l2_table_
+ * task_domains's own comment) instead of the single shared Section 2.
+ * Same zeroing-the-descriptor mechanism, just computing WHICH of the
+ * 15 coarse tables and WHICH page within it from task_index and addr
+ * instead of a single hardcoded base. r0/r1 are the real parameters
+ * (AAPCS); r4 is genuinely callee-saved here (used as scratch across
+ * the whole function body), unlike every leaf helper elsewhere in
+ * this file that gets away with r0-r3 alone -- pushed/popped
+ * accordingly, the one thing that would otherwise make this an AAPCS
+ * violation the instant vani-compiled code (which treats r4 as
+ * callee-saved) called it directly. addr and task_index are both
+ * trusted, single-caller-contract inputs (dhruva_alloc_stack_domain,
+ * boot/rpi1/runtime_stubs.c) exactly like mmu_guard_page_install's own
+ * addr parameter above -- not re-validated here. */
+.global mmu_guard_page_install_domain
+mmu_guard_page_install_domain:
+    push {r4}
+    mov r2, #1024
+    mul r4, r1, r2                 /* r4 = task_index * 1024 */
+    ldr r2, =mmu_l2_table_task_domains
+    add r4, r4, r2                 /* r4 = &table[task_index] (this
+                                    * domain's own L2 table base) */
+
+    mov r2, #0x00100000
+    mul r2, r1, r2                 /* r2 = task_index * 0x100000 */
+    ldr r3, =0x00A00000
+    add r3, r3, r2                 /* r3 = this domain's own physical
+                                    * base */
+    sub r3, r0, r3                 /* r3 = addr's offset within the
+                                    * domain */
+    lsr r3, r3, #12                /* r3 = page index (0-255) */
+
+    mov r2, #0
+    str r2, [r4, r3, lsl #2]
+
+    mcr p15, 0, r0, c8, c7, 1   /* TLBIMVA, same as above */
+    mov r0, #0
+    pop {r4}
     bx lr

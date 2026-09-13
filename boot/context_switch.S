@@ -288,6 +288,14 @@ mutex_block_start_tick_table:
                             * defense in depth against an unbounded
                             * 32-bit counter, not load-bearing for
                             * correctness. */
+.equ MAX_DOMAIN_TASK_INDEX, 14  /* round 192: task indices 0-14 map to
+                            * ARMv6 domains 1-15 (domain = index+1,
+                            * domain 0 reserved for kernel/shared); index
+                            * 15 (MAX_TASKS-1) has no 16th domain
+                            * available -- see mmu_l2_table_task_domains'
+                            * own comment in boot/mmu_init.S for the full
+                            * design and why this is an honest, currently
+                            * -inert limitation, not a bug. */
 ready_wait_ticks_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
@@ -623,14 +631,107 @@ aging_update_next:
     b aging_update_loop
 aging_update_done:
 
+    /* Round 192: ARMv6 domain-based cross-task memory isolation --
+     * write the DACR that makes r8 (the task just picked) the only
+     * one whose own private stack domain is actually reachable this
+     * tick, closing docs/RTOS_GAP_ANALYSIS.md's "no fault containment
+     * between tasks" gap. See boot/mmu_init.S's own
+     * mmu_l2_table_task_domains comment for the full design; this is
+     * the ONE place that design's "restriction starts at the first
+     * real scheduling decision" promise is actually kept. Domain 0
+     * (bit0:1 of DACR) is unconditionally granted Client on every
+     * write, matching mmu_init's own permanent choice for it (kernel/
+     * shared memory -- code, globals, the heap, mutex/FS-queue state
+     * -- must always stay reachable from every task, isolation only
+     * targets each task's own PRIVATE stack). r8 (final pick) is
+     * read-only here, still needed unmodified for the sp_table read
+     * just below -- r6/r7/r9/r10/r11 are free scratch (aging loop
+     * above is done with them). Runs unconditionally, whether or not
+     * the pick actually changed from current -- an idempotent MCR
+     * write is cheap, and always recomputing avoids any subtlety from
+     * trying to skip it on a no-switch tick. */
+    cmp r8, #MAX_DOMAIN_TASK_INDEX
+    bgt dacr_no_domain          /* index 15 -- no 16th domain available,
+                                 * fall back to domain-0-only (see
+                                 * MAX_DOMAIN_TASK_INDEX's own comment) */
+    add r9, r8, #1              /* r9 = this task's own domain (1-15) */
+    mov r10, #1
+    mov r11, r9, lsl #1         /* r11 = bit position = domain*2 */
+    mov r10, r10, lsl r11       /* r10 = Client bit for this domain */
+    orr r10, r10, #1            /* + domain 0 = Client, always */
+    b dacr_stash
+dacr_no_domain:
+    mov r10, #1                 /* domain 0 Client only */
+dacr_stash:
+    /* BUG caught live (round 192's own first real-multitasking test):
+     * the DACR write must NOT happen here. This function's own entry
+     * pushed {r8-r11} onto "sp" -- at that point, and still right now,
+     * "sp" is the OUTGOING task's own sp_svc; the ACTUAL stack-pointer
+     * SWITCH to the newly-picked task's own stack only happens in the
+     * CALLER, after this function returns. Writing the restricted DACR
+     * here, before the matching `pop` below, closes the OUTGOING
+     * task's own domain while "sp" is STILL pointing into it -- the
+     * pop then tries to read from now-forbidden memory and takes a
+     * genuine Domain Fault on this function's own epilogue. Confirmed
+     * live: the very first real scheduling decision after boot faulted
+     * on exactly this pop, address matching where THIS function's own
+     * entry-push had just written, current_task already updated to the
+     * newly-picked task despite the fault occurring on the OUTGOING
+     * task's own memory. Fix: stash the computed value in r1 (dead by
+     * this point -- tick_count's own copy, this function's last use of
+     * it was the aging-update loop above) and defer the actual MCR
+     * write until AFTER the pop, when "sp" no longer matters to this
+     * function at all. */
+    mov r1, r10
+
     ldr r6, =sp_table
     ldr r0, [r6, r8, lsl #2]      /* r0 = sp_table[best] -- must read
                                     * this before the pop below touches
                                     * r8, but r0 itself is untouched by
                                     * that pop either way */
-    pop {r8, r9, r10, r11}         /* restore the caller's own values,
-                                    * see this function's own entry
-                                    * comment */
+    pop {r8, r9, r10, r11}         /* restore the caller's own values --
+                                    * safe: still the OUTGOING task's own
+                                    * domain, unchanged since this
+                                    * function's own entry push used it */
+    mcr p15, 0, r1, c3, c0, 0      /* NOW switch DACR -- nothing after
+                                    * this point touches memory via "sp"
+                                    * until the caller performs its own
+                                    * stack-pointer switch */
+    bx lr
+
+/* i64 dacr_open_all() -- round 192's own escape hatch from the domain
+ * restriction above, for genuine cross-task KERNEL diagnostics that
+ * need to read every task's own memory, not just the current task's.
+ * Found live, the hard way: stack_canary_check_all() (boot/stack_
+ * canary.S), called from irq_dispatch on every real timer tick, reads
+ * EVERY tracked task's own stack-base sentinel to catch an overflow --
+ * exactly the kind of legitimate cross-task access this whole domain
+ * scheme would otherwise break, and did, on literally the very first
+ * tick after real multitasking began (a genuine Domain Fault, address
+ * inside a task other than whichever was current -- proof the
+ * mechanism itself works correctly, just applied one level too
+ * broadly at first).
+ *
+ * Sets DACR back to mmu_init's own boot-time value (0x55555555, every
+ * domain Client) -- safe and temporary: irq_dispatch (this function's
+ * only caller) always runs BEFORE scheduler_switch_from_irq/
+ * scheduler_pick_next within the same IRQ (irq_entry.S's own `bl irq_
+ * dispatch` precedes `bl scheduler_switch_from_irq`), and scheduler_
+ * pick_next unconditionally OVERWRITES DACR on every single
+ * invocation -- so this "open everything" state can never leak into
+ * actual task-level execution; it only ever lasts for the remainder of
+ * irq_dispatch's own kernel-context IRQ handling, then gets correctly
+ * re-restricted to whichever task is picked next before anything
+ * task-specific ever runs again. The general principle this
+ * establishes: IRQ HANDLER BODY code is kernel context (needs
+ * unrestricted access, matching domain 0's own permanent-Client
+ * status), only TASK BODY code running between scheduling decisions is
+ * domain-restricted. */
+.global dacr_open_all
+dacr_open_all:
+    ldr r0, =0x55555555
+    mcr p15, 0, r0, c3, c0, 0
+    mov r0, #0
     bx lr
 
 /* void *scheduler_switch_from_irq(void *current_sp, i64 was_timer_tick)
@@ -1668,6 +1769,20 @@ start_multitasking:
     ldr r6, =current_task
     mov r7, #0
     str r7, [r6]
+
+    /* Round 192: this function hands off straight to task 0 (HIGH)
+     * WITHOUT going through scheduler_pick_next -- its own DACR-
+     * restriction write (see that function's own comment) never runs
+     * for this very first task, which would otherwise leave DACR at
+     * mmu_init's permissive boot-time value (every domain Client)
+     * until the first real scheduling decision. Task 0's own domain is
+     * always domain 1 (task_index+1, task_index==0 here, hardcoded
+     * rather than computed since this path only ever picks task 0) --
+     * same domain-0-plus-own-domain-Client, everything-else-No-Access
+     * value scheduler_pick_next would compute: bit0:1 (domain 0) |
+     * bit2:3 (domain 1) = 0x1 | 0x4 = 0x5. */
+    mov r7, #5
+    mcr p15, 0, r7, c3, c0, 0
 
     mov sp, r0
     ldmia sp!, {r0, r1}

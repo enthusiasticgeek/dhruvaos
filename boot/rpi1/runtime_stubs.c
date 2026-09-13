@@ -498,6 +498,81 @@ void *dhruva_alloc_stack_guarded(long n) {
     return (void*)usable_ptr;
 }
 
+/* Round 192 -- true CROSS-TASK memory isolation, on top of round 76's
+ * own guard pages above (which only catch a task overflowing its OWN
+ * stack; this catches a bug touching ANOTHER task's stack via any
+ * other route). See boot/mmu_init.S's mmu_l2_table_task_domains
+ * comment for the full ARMv6-domain design this implements the
+ * allocation side of.
+ *
+ * Unlike dhruva_alloc_stack_guarded above, this does NOT bump-allocate
+ * from the shared dhruva_heap at all -- each task_index (0-14) gets
+ * its own WHOLE dedicated 1MB physical region (0x00A00000 +
+ * task_index*0x100000), so there is no shared mutable bump pointer to
+ * race on and no interrupt-masking needed here the way the general
+ * heap allocator requires. Guard page always at the domain's own
+ * offset 0, stack immediately after at offset 0x1000 -- a task only
+ * ever gets ONE stack, ever (no task-deletion/reuse API exists yet,
+ * same limitation dhruva_alloc_stack_guarded's own header already
+ * notes), so there's no bump-within-the-domain need either.
+ *
+ * BUG caught live (round 192's own first real-multitasking test): both
+ * parameters are `unsigned long` (32-bit on this ILP32 target),
+ * DELIBERATELY not `i64` on the vani side either, despite `n` being a
+ * byte count that might look like it "should" be i64 to match
+ * dhruva_alloc_stack_guarded's own single-i64-parameter signature
+ * above. A first version used `(n: i64, task_index: i64)` on the vani
+ * extern with `(long n, long task_index)` here -- AAPCS places a
+ * 64-bit argument in an aligned register PAIR, so vani passed n in
+ * r0:r1 and task_index in r2:r3, but this C signature (two plain
+ * 32-bit `long`s, no pairing) read its second parameter from r1, not
+ * r2 -- i.e. n's own (always-zero) upper 32 bits, not task_index at
+ * all. Every call site silently computed task_index=0 regardless of
+ * what was actually passed, so every task's stack landed in domain
+ * 1 -- confirmed live via a temporary diagnostic print
+ * (mutex_high_stack, meant for domain 9, came back byte-identical to
+ * stack_a's own domain-1 address). Exactly the register-pairing
+ * gotcha this project's own accessor-file convention already warns
+ * about (see dharafs_buf.S's file comment) -- missed here because it
+ * was the FUNCTION SIGNATURE, not a `.S` file's hand-written register
+ * access, that needed the same discipline applied to it. */
+extern void mmu_guard_page_install_domain(unsigned long addr, unsigned long task_index);
+
+void *dhruva_alloc_stack_domain(unsigned long n, unsigned long task_index) {
+    unsigned long need = n;
+
+    if (task_index > 14) {
+        /* Task index 15 (MAX_TASKS-1): no 16th ARMv6 domain available
+         * (domain 0 is reserved for kernel/shared) -- honest, currently
+         * -inert fallback to the old shared, unprotected allocation
+         * rather than doing something wrong with an out-of-range
+         * domain number. This project's real usage today (6 fixed + a
+         * handful of dynamic tasks) never reaches index 15. */
+        return dhruva_alloc_stack_guarded(n);
+    }
+
+    unsigned long domain_base = 0x00A00000UL + ((unsigned long)task_index) * 0x00100000UL;
+    unsigned long guard_addr = domain_base;
+    unsigned char *usable_ptr = (unsigned char *)(domain_base + 4096UL);
+
+    if (need + 4096UL > 0x00100000UL) {
+        /* Defense in depth, not a real constraint -- every actual task
+         * stack in this project (512B-4KB) is nowhere close to this
+         * domain's own full 1MB-minus-one-guard-page capacity. */
+        dhruva_oom_fatal(need, 0, 0);
+        /* unreachable -- dhruva_oom_fatal never returns */
+    }
+
+    mmu_guard_page_install_domain(guard_addr, (unsigned long)task_index);
+
+    unsigned long i = 0;
+    while (i < need) {
+        usable_ptr[i] = 0;
+        i = i + 1;
+    }
+    return (void *)usable_ptr;
+}
+
 /* Backs kernel_main.vani's heap_usage_self_test -- a permanent
  * early-warning canary added by the same round-10 fix that resized
  * this heap, so a future round eating back into the new headroom
