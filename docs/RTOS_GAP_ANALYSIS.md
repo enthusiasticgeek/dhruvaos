@@ -177,6 +177,21 @@ doesn't yet attempt.
   correctly scoped there as not-yet-started and blocked on a real workload
   to make the numbers meaningful, not duplicated here.
 
+  **Partial step, `[round 189, 2026-09-12]`**: added the measurement
+  primitive this will need, deliberately NOT the detection itself —
+  `task_run_ticks_table` (`boot/context_switch.S`) counts, per task,
+  one tick every time `scheduler_pick_next` picks it to run, exposed
+  via `task_run_ticks_get_at(index)` and the shell's `diagnose` output
+  (`task run-ticks (HIGH/MEDIUM/LOW/IDLE/GC/SHELL): ...`). This is real
+  per-task CPU-time distribution data, useful on its own today (e.g.
+  spotting a task starved far below what its priority should
+  guarantee), but it is NOT deadline-miss detection: no task declares a
+  budget anywhere yet, so there is nothing to compare this count
+  against. That remains blocked on the same thing this item already
+  said — a real declared per-task period/budget, which is also exactly
+  what "formal schedulability analysis" (Phase C item 9 below) needs
+  the same input for.
+
 ## 5. DharaFS-specific gaps
 
 - ~~**`dharafs_compact()` has unbounded worst-case cost.** Its own main loop

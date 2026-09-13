@@ -291,7 +291,31 @@ mutex_block_start_tick_table:
 ready_wait_ticks_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
+/* Round 189 (2026-09-12): per-task CPU-time accounting, real and
+ * always-on regardless of whether any task has a declared deadline/
+ * budget yet (none do -- docs/RTOS_GAP_ANALYSIS.md's own "no deadline-
+ * miss detection" item is correctly scoped there as blocked on a real
+ * periodic workload to make a MISS meaningful; this is deliberately
+ * NOT that -- it's the measurement primitive future deadline/budget
+ * work will need, buildable and useful today on its own). Incremented
+ * once per scheduler_pick_next decision, attributing that tick to
+ * whichever task was `current_task` AT THE START of the decision --
+ * the same "one tick of CPU" sampling convention `tick_count` itself
+ * already uses, and correct regardless of which of the two tie-
+ * breaking algorithms below actually runs, or whether the pick
+ * changes at all (a task re-picked repeatedly just keeps accruing,
+ * correctly). */
+task_run_ticks_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
 .section ".text"
+
+.global task_run_ticks_get_at
+task_run_ticks_get_at:
+    ldr r1, =task_run_ticks_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
 
 /* Shared "who runs next" policy: the lowest eff_prio_table value among
  * tasks whose sleep_until_table <= tick_count (i.e. ready). Returns
@@ -403,6 +427,15 @@ scheduler_pick_next:
     ldr r3, [r2]                  /* r3 = current task index */
     ldr r4, =eff_prio_table
     ldr r5, =sleep_until_table
+
+    /* Round 189: attribute this tick to whichever task was current
+     * BEFORE this decision -- see task_run_ticks_table's own comment.
+     * r6/r12 are free scratch here (not yet assigned any meaning this
+     * early in the function). */
+    ldr r12, =task_run_ticks_table
+    ldr r6, [r12, r3, lsl #2]
+    add r6, r6, #1
+    str r6, [r12, r3, lsl #2]
 
     /* Round 75 gate: is current_task ready right now, AND currently
      * boosted (holding a ceiling-protected lock)? If so, this decision

@@ -1020,6 +1020,12 @@ extern "C" fn dhruva_prio_unlock(base_priority: i64) -> i64;
 // exists to attach it to.
 extern "C" fn context_switch_count_get() -> i64;
 extern "C" fn prio_lock_count_get() -> i64;
+// Round 189: real per-task CPU-time accounting (ticks attributed to
+// each task by scheduler_pick_next), the measurement primitive future
+// deadline/budget work needs -- see task_run_ticks_table's own comment
+// in context_switch.S for why this is deliberately NOT deadline-miss
+// detection itself (no task has a declared budget yet).
+extern "C" fn task_run_ticks_get_at(index: u32) -> u32;
 extern "C" fn irq_count_increment() -> i64;
 extern "C" fn irq_count_get() -> i64;
 // Round 66: the ring-buffer half of this section's own "not yet
@@ -19824,6 +19830,28 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("\n");
       hi = hi + 1;
     }
+
+    // Round 189: real per-task CPU-time distribution -- one tick
+    // attributed per scheduler_pick_next decision to whichever task
+    // was running, regardless of whether any task has a declared
+    // budget yet (none do). The 6 fixed indices only (0-5); dynamic
+    // task_create() slots (6-15) aren't named here the way these are,
+    // and printing raw indices without names would be less useful than
+    // this, not more -- a future round can extend this if a dynamic
+    // task's own accounting is ever actually needed.
+    let _ = uart_puts("  task run-ticks (HIGH/MEDIUM/LOW/IDLE/GC/SHELL): ");
+    let _ = uart_put_i64(task_run_ticks_get_at(0 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_run_ticks_get_at(1 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_run_ticks_get_at(2 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_run_ticks_get_at(3 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_run_ticks_get_at(4 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_run_ticks_get_at(5 as u32) as i64);
+    let _ = uart_puts("\n");
     return 0;
   }
 

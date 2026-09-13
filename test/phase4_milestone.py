@@ -162,6 +162,15 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     # extra margin on top of the standard settle time regardless.
     send("ls")
     time.sleep(SETTLE_S + 4)
+    # Round 189: "don't leave a new command's verification ephemeral,"
+    # same discipline as every prior round's own new shell output.
+    # Not checking exact numbers (inherently timing-dependent across
+    # runs/machines) -- just that the new per-task run-tick line prints
+    # with the right shape, proving task_run_ticks_get_at's own
+    # end-to-end wiring (context_switch.S -> kernel_main.vani ->
+    # `diagnose`) actually works live, not just "it compiled."
+    send("diagnose")
+    time.sleep(SETTLE_S + 4)
 
     proc.terminate()
     try:
@@ -188,6 +197,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         ("httpecho completes a live HTTP/1.1 POST/response round trip over TLS 1.3", 'httpecho: POST /echo -> 200 OK, body "hello-http"'),
         ("mqttecho completes a live CONNECT/SUBSCRIBE/PUBLISH(QoS1)/PINGREQ/DISCONNECT round trip over TLS 1.3", 'mqttecho: CONNECT->CONNACK, SUBSCRIBE(QoS1)->SUBACK, PUBLISH(QoS1) "hello-mqtt"'),
         ("ls shows /milestone/note", "  /milestone/note"),
+        ("diagnose shows per-task run-ticks", "task run-ticks (HIGH/MEDIUM/LOW/IDLE/GC/SHELL): "),
     ]
 
     cursor = 0
