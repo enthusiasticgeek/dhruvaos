@@ -1820,7 +1820,18 @@ fn fb_init(width: i64, height: i64, bpp: i64) -> i64 {
   let size: u32 = buf_read_u32_le(buf, 96);
   let pitch: u32 = buf_read_u32_le(buf, 112);
 
-  let _ = fb_base_set(base as i64);
+  // Real hardware only (invisible under QEMU's mailbox model, which
+  // returns the plain physical address directly): FRAMEBUFFER_ALLOCATE
+  // returns a "bus address" with the top 2 bits encoding the VideoCore
+  // cache-alias policy, not a directly usable ARM physical address.
+  // Confirmed 2026-09-13 against rsta2/circle's own bcmframebuffer.cpp
+  // (m_nBufferPtr = ...nBufferBaseAddress & 0x3FFFFFFF) after a real
+  // Pi 1B Data Abort in fb_fill_pixel: base came back as 0x5EACE000,
+  // outside every range boot/mmu_init.S maps; masking gives 0x1EACE000,
+  // a clean physical address.
+  let base_phys: u32 = base & (0x3FFFFFFF as u32);
+
+  let _ = fb_base_set(base_phys as i64);
   let _ = fb_size_set(size as i64);
   let _ = fb_pitch_set(pitch as i64);
   return 0;
