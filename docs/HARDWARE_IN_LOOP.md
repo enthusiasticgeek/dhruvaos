@@ -361,11 +361,15 @@ real fidelity gaps:
 - **USB Bluetooth HCI transport** — same situation: written to spec,
   the QEMU device that once modeled this (`usb-bt-dongle`) was removed
   from modern QEMU years ago.
-- **USB WiFi (RTL8188CU/RTL8192CU) enumeration + vendor register I/O**
-  — stops deliberately short of firmware upload (`DHRUVAOS_MANUAL.md`
-  §1's own explanation); real hardware is the only way to confirm even
-  the enumeration/register-read layer behaves as expected against a
-  genuine chip.
+- **USB WiFi (RTL8188CU/RTL8192CU) enumeration + vendor register I/O +
+  MCU firmware download/start** — task #164 (2026-09-14) implemented
+  the real firmware-download sequence beyond round 58's own original
+  enumeration-only stopping point (see §6.1 below for how to actually
+  load the firmware file). Real hardware is still the only way to
+  confirm ANY of this against a genuine chip — completely untestable
+  under QEMU (no USB WiFi device model exists). 802.11 MAC-layer
+  association/WPA2 remain genuinely new, not-yet-started work beyond
+  this.
 - **The real hardware watchdog** (`watchdog_arm`/`_init`/`_kick`,
   `DHRUVAOS_MANUAL.md` §1) — confirmed that QEMU's `raspi1ap` model
   doesn't honor `PM_WDOG`'s timeout at all (an armed reset fires
@@ -429,6 +433,53 @@ real fidelity gaps:
   device-specific timing/quirks at this point, same lower-priority
   role USB mass storage's own real-device testing already has above,
   not unverified core logic.
+
+### 6.1 Loading the RTL8188CU/RTL8188CUS WiFi firmware
+
+Same licensing posture as §4.1's own GPU boot firmware: this is a
+**proprietary Realtek binary blob, never committed to this repo**.
+Fetch it yourself from `linux-firmware` (the same legally-
+redistributable collection the real Linux kernel's own driver uses):
+
+```sh
+mkdir -p ~/wifi-firmware && cd ~/wifi-firmware
+curl -sL -o rtl8192cufw_TMSC.bin \
+    "https://raw.githubusercontent.com/kernel-firmware/linux-firmware/main/rtlwifi/rtl8192cufw_TMSC.bin"
+ls -la rtl8192cufw_TMSC.bin   # sanity check: ~16KB, not 0 bytes
+```
+
+(This is the file this project's own `rtl_fw_header_parse` and round
+58's own live verification were checked against — see
+`kernel_main.vani`'s own `rtl8188cu_download_firmware` comment for the
+exact byte-level details. Any source you trust works, per §4.1's own
+"no opinion on firmware provenance" note — the point is fetched fresh,
+never committed here.)
+
+This project has no SCP/SFTP or FAT-write-from-kernel capability yet,
+so the file has to go over the same UART/SSH shell connection you're
+already using, as hex-encoded chunks via the `wifikey` command (root
+only):
+
+```
+wifikey chunk <128 hex chars, i.e. 64 bytes, per line>
+wifikey chunk <next 64 bytes>
+... (~252 lines for the real 16126-byte file)
+wifikey commit
+```
+
+Genuinely tedious to type by hand — this is meant to be driven by a
+small host-side script that hex-encodes the file and sends one
+`wifikey chunk <hex>` line at a time over the same serial/SSH
+connection, matching this project's own established pattern for
+tedious multi-step hardware setup (e.g. `update_kernel.sh`). That
+script is not written yet — a real, clearly-scoped follow-up, not a
+silent gap. `wifikey abort` discards an in-progress upload without
+committing if you make a mistake partway through.
+
+Once committed, the firmware lives at `/wifi/fw.bin` in DharaFS and is
+loaded automatically the next time `rtl8188cu_probe` runs (i.e., the
+next boot with the WiFi dongle attached) — no separate "install"
+step.
 
 ## 7. See also
 
