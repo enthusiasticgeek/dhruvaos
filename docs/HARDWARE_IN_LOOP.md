@@ -483,14 +483,33 @@ first and found, live, to silently overflow that buffer -- see
 `shell_dispatch_wifikey`'s own comment in `kernel_main.vani` for the
 full story.)
 
-Genuinely tedious to type by hand — this is meant to be driven by a
-small host-side script that hex-encodes the file and sends one
-`wifikey chunk <hex>` line at a time over the same serial/SSH
-connection, matching this project's own established pattern for
-tedious multi-step hardware setup (e.g. `update_kernel.sh`). That
-script is not written yet — a real, clearly-scoped follow-up, not a
-silent gap. `wifikey abort` discards an in-progress upload without
-committing if you make a mistake partway through.
+Genuinely tedious to type by hand — driven instead by
+`test/wifikey_upload.py`, which hex-encodes the file and sends one
+`wifikey chunk <hex>` line at a time over the same serial connection,
+waiting for each chunk's own confirmation before sending the next
+(same event-driven read-until-a-marker approach as
+`test/shell_interactive_check.py`, not a blind fixed delay — a fixed
+delay was tried first for this project's own ad-hoc testing and found,
+live, to silently drop bytes and permanently wedge the shell when
+sent too fast):
+
+```
+python3 test/wifikey_upload.py /dev/ttyUSB0 rtl8192cufw_TMSC.bin
+```
+
+No `pyserial` dependency — opens the tty device directly via the
+stdlib `termios` module (matching this project's own no-extra-Python-
+deps convention everywhere else under `test/`). Validated against a
+real kernel-level PTY pair (not just QEMU's own stdio shortcut) with a
+stub shell standing in for the real kernel's `wifikey` responses, at
+both small scale and the real file's full 336-chunk scale — the actual
+on-device protocol behavior was separately verified end to end against
+the real firmware file under QEMU (see the task #164 round summary).
+Not yet run against a genuine `/dev/ttyUSB0` + real Pi 1B, since that
+needs the physical hardware in hand. `wifikey abort` discards an
+in-progress upload without committing if you make a mistake partway
+through; the script itself doesn't retry past a failed chunk --rerun
+it (or use `wifikey abort` then restart) if a run fails partway.
 
 Once committed, the firmware lives at `/wifi/fw.bin` in DharaFS and is
 loaded automatically the next time `rtl8188cu_probe` runs (i.e., the
