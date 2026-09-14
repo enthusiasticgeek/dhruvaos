@@ -1323,6 +1323,10 @@ extern "C" fn usb_hid_set_intr_in_toggle(value: u32) -> u32;
 // (no data path exists).
 extern "C" fn usb_wifi_get_kind() -> u32;
 extern "C" fn usb_wifi_set_kind(value: u32) -> u32;
+// Task #164 follow-up: persistent scratch for the real MCU firmware-
+// download sequence -- see boot/usb_wifi_state.S's own comment.
+extern "C" fn usb_wifi_fw_buf_get() -> mut ref i64;
+extern "C" fn usb_wifi_fw_chunk_get() -> mut ref i64;
 
 // Round 60 (boot/fw_state.S): packet filtering rule table. proto: 0=any/
 // 1=ICMP/6=TCP/17=UDP (real IPv4 protocol numbers, matching ipv4_get_
@@ -3227,8 +3231,30 @@ fn dharafs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
 fn dharafs_block_payload_cap() -> i64 {
   return 448;
 }
+// TASK #164 FOLLOW-UP (2026-09-14): raised from 4096 (round 39's own
+// original value) to accommodate the WiFi MCU firmware file
+// (rtl8192cufw_TMSC.bin, 16126 bytes, verified round 58) -- per
+// explicit user instruction, fixed the actual limitation rather than
+// building a second, DharaFS-bypassing raw-block storage mechanism
+// for just this one caller. Multi-block chaining (dharafs_append_raw,
+// see this file's own header comment on the on-disk format) was
+// already fully generic -- num_chunks computed from data_len with no
+// hardcoded bound -- so this was genuinely just a validation ceiling,
+// not a structural limit. 20480 (20KB) gives real margin over the
+// 16126-byte firmware, matching this project's own "give real margin,
+// not the bare minimum" convention (e.g. update_kernel.sh's device
+// size check, round 108's RAM extension). Swept and fixed every
+// buffer whose size was tied to the OLD 4096 value: dharafs_data_
+// scratch, dharafs_appendonly_check_scratch, and both dharafs_compact
+// callers' own data_buf (task_e's live GC pass + this file's own
+// dharafs_compact self-tests) -- all raised to match. Deliberately
+// did NOT touch dharafs_log_existing_scratch/dharafs_log_combined_
+// scratch or dharafs_log_rollover_threshold() -- those are a SEPARATE,
+// deliberately-independent invariant for the append-log feature
+// specifically (3584 + 512 == 4096 exactly, see that function's own
+// comment), not meant to scale with the general per-file cap.
 fn dharafs_file_max_len() -> i64 {
-  return 4096;
+  return 20480;
 }
 
 // Round 42: default permission bits for a newly-created file --
@@ -4432,10 +4458,10 @@ fn dharafs_snapshot_read(path: Str, name: Str, out_buf: mut ref i64) -> i64 {
 // prefix it didn't strictly need to, never a correctness problem,
 // since "latest wins" already tolerates the old and new copies of a
 // record coexisting.
-// buf/path_buf/data_buf are caller-owned scratch space (512/32/4096
-// bytes respectively -- data_buf's cap raised in round 39 to hold a
-// full multi-block file's reconstructed content, see dharafs_read_raw),
-// not allocated in here.
+// buf/path_buf/data_buf are caller-owned scratch space (512/32/20480
+// bytes respectively -- data_buf's cap raised in round 39 (and again,
+// task #164, 2026-09-14) to hold a full multi-block file's
+// reconstructed content, see dharafs_read_raw), not allocated in here.
 //
 // BUG (found via a real crash-and-reboot loop under Phase 6's
 // checkpoint regression test, not by inspection): this function used
@@ -4704,7 +4730,7 @@ fn dharafs_compact_resumable_self_test() -> i64 {
 
   let buf: mut ref i64 = dhruva_alloc_bytes(512);
   let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
-  let data_buf: mut ref i64 = dhruva_alloc_bytes(4096);
+  let data_buf: mut ref i64 = dhruva_alloc_bytes(20480); // matches dharafs_file_max_len(), task #164
 
   // First call: with >= 20 blocks of range and an 8-block budget, this
   // must NOT finish the whole pass in one call.
@@ -4949,7 +4975,8 @@ fn dharafs_read(path: Str, out_buf: mut ref i64) -> i64 {
 // crash-safe log entry (same checksum/sequence-number machinery as
 // any other write) whose data_len field is the sentinel 0xFFFFFFFF,
 // a value no genuine record can ever have (a file's total length is
-// capped at dharafs_file_max_len(), 4096 bytes as of round 39). dharafs_read/
+// capped at dharafs_file_max_len(), 20480 bytes as of task #164,
+// 2026-09-14 -- 4096 originally, round 39). dharafs_read/
 // dharafs_list treat the newest tombstone for a path
 // exactly like the path never existed; compaction (dharafs_compact) can
 // still find and re-carry a tombstone forward as "the latest record"
@@ -5745,7 +5772,10 @@ fn dharafs_verified_companion_path_raw(path_buf: mut ref i64, path_len: i64, out
 // KNOWN remaining cost, deliberately not fixed here (see docs/
 // TODO.md): sha256_hash ITSELF still allocates its own internal
 // working buffers (padded message, H/K/W tables) fresh on every call
-// -- up to ~4.7KB per call for a file near dharafs_file_max_len().
+// -- up to ~4.7KB per call for a file near the OLD 4096-byte
+// dharafs_file_max_len() (round 39), now up to roughly ~21KB per call
+// after task #164 (2026-09-14) raised the cap to 20480 -- scales with
+// whatever the cap is, same proportional overhead either way.
 // Every writev/catv call permanently costs that much heap. Bounded
 // and safely handled (round 45's dhruva_alloc_bytes OOM-fatal path
 // halts cleanly rather than corrupting memory if the heap is ever
@@ -5850,8 +5880,15 @@ fn dharafs_read_verified_checked(path_buf: mut ref i64, path_len: i64, out_buf: 
 // about, doubly so for a logging feature whose entire point is being
 // called often over a session's lifetime.
 fn dharafs_log_rollover_threshold() -> i64 {
-  return 3584; // headroom under dharafs_file_max_len() (4096) --
-               // combined with the 512-byte per-record cap below,
+  // TASK #164 NOTE (2026-09-14): dharafs_file_max_len() was raised to
+  // 20480 this round, but this value and dharafs_log_combined_scratch
+  // (still 4096) were DELIBERATELY left unchanged -- this is now an
+  // independent, self-contained invariant for the append-log feature
+  // specifically (3584 + 512 == 4096 exactly), not derived from the
+  // general per-file cap. The log feature has no need for the larger
+  // ceiling, and scaling every related buffer up to 20480 when
+  // unused would just waste heap.
+  return 3584; // combined with the 512-byte per-record cap below,
                // dharafs_log_combined_scratch (sized exactly 4096)
                // can never overflow: 3584 + 512 = 4096 exactly.
 }
@@ -17595,7 +17632,7 @@ fn task_e() -> i64 {
   let gc_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
-  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(4096);
+  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(20480); // matches dharafs_file_max_len(), task #164
   let dhcp_my_mac: mut ref i64 = dhruva_alloc_bytes(8);
   let _ = netif_get_mac(dhcp_my_mac);
   while true {
@@ -28822,7 +28859,7 @@ fn kernel_main() -> i64 {
   // call sites is safe.
   let _ = dharafs_sd_scratch_set(dhruva_alloc_bytes(512));
   let _ = dharafs_path_scratch_set(dhruva_alloc_bytes(32));
-  let _ = dharafs_data_scratch_set(dhruva_alloc_bytes(4096));
+  let _ = dharafs_data_scratch_set(dhruva_alloc_bytes(20480)); // matches dharafs_file_max_len(), task #164 follow-up
   let _ = dharafs_stat_scratch_set(dhruva_alloc_bytes(12));
   let _ = dharafs_dir_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_log_path_scratch_set(dhruva_alloc_bytes(32));
@@ -28833,7 +28870,7 @@ fn kernel_main() -> i64 {
   let _ = dharafs_verified_companion_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_verified_digest_a_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_verified_digest_b_scratch_set(dhruva_alloc_bytes(32));
-  let _ = dharafs_appendonly_check_scratch_set(dhruva_alloc_bytes(4096));
+  let _ = dharafs_appendonly_check_scratch_set(dhruva_alloc_bytes(20480)); // matches dharafs_file_max_len(), task #164 follow-up
   let _ = dharafs_rename_new_path_scratch_set(dhruva_alloc_bytes(32));
   let _ = gatt_send_scratch_set(dhruva_alloc_bytes(256));
   let _ = gatt_recv_scratch_set(dhruva_alloc_bytes(256));
@@ -29164,7 +29201,7 @@ fn kernel_main() -> i64 {
   let next_block_before: u32 = dharafs_state_get_next_block();
   let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
-  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(4096);
+  let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(20480); // matches dharafs_file_max_len(), task #164
   let _ = dharafs_compact(compact_buf, compact_path_buf, compact_data_buf);
   let log_start_after: u32 = dharafs_state_get_log_start();
   let next_block_after: u32 = dharafs_state_get_next_block();
