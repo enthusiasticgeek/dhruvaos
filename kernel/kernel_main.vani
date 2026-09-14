@@ -21816,6 +21816,156 @@ fn sha256_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
   return 1;
 }
 
+// SHA-1 (FIPS 180-4). Task #164 (WiFi/WPA2) groundwork: kept ONLY for
+// interop with legacy protocols that hardcode it and offer no
+// substitute -- WPA2-PSK's own PBKDF2/PRF key derivation is specified
+// with HMAC-SHA1, and there's no way to swap in SHA-256 there and
+// still interoperate with a real access point. Not recommended for
+// anything new. Same heap-based one-shot wrapper shape as sha256_hash
+// above, built on the vendored package's own sha1_init/update/finalize
+// streaming primitives (vendor/crypto_hash/src/core.vani, pulled in by
+// the same `use` at the top of this section).
+fn sha1_hash(msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  let ctx: Sha1Ctx = sha1_init();
+  let offset: i64 = 0;
+  while offset < msg_len {
+    let remaining: i64 = msg_len - offset;
+    let chunk_n: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = zero256_bytes();
+    let i: i64 = 0;
+    while i < chunk_n {
+      chunk[i] = buf_read_byte(msg, (offset + i) as u32) as u8;
+      i = i + 1;
+    }
+    ctx = sha1_update(ref ctx, mut ref chunk, chunk_n);
+    offset = offset + chunk_n;
+  }
+  let digest: [u8; 20] = sha1_finalize(ref ctx);
+  let j: i64 = 0;
+  while j < 20 {
+    let _ = buf_write_byte(out, j as u32, digest[j] as u32);
+    j = j + 1;
+  }
+  return 0;
+}
+
+// Three FIPS 180-4/NIST known-answer vectors -- same shape as
+// sha256_self_test (empty, "abc", 56-byte 2-block message). Every
+// expected digest byte here was generated from and cross-checked
+// against two independent, authoritative implementations (Python's
+// hashlib and openssl sha1), not typed from memory -- see the vendored
+// package's own sha1_self_test (vendor/crypto_hash/src/lib.vani) for
+// the full story on why that mattered: a first attempt at hand-
+// transcribing the textbook "abc" and 56-byte digests from
+// recollection was wrong in both cases (each missing its real trailing
+// byte), caught only by regenerating and comparing.
+fn sha1_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let msg0: mut ref i64 = dhruva_alloc_bytes(1);
+  let out0: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = sha1_hash(msg0, 0, out0);
+  let exp0: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = buf_write_byte(exp0, 0 as u32, 0xda as u32);
+  let _ = buf_write_byte(exp0, 1 as u32, 0x39 as u32);
+  let _ = buf_write_byte(exp0, 2 as u32, 0xa3 as u32);
+  let _ = buf_write_byte(exp0, 3 as u32, 0xee as u32);
+  let _ = buf_write_byte(exp0, 4 as u32, 0x5e as u32);
+  let _ = buf_write_byte(exp0, 5 as u32, 0x6b as u32);
+  let _ = buf_write_byte(exp0, 6 as u32, 0x4b as u32);
+  let _ = buf_write_byte(exp0, 7 as u32, 0x0d as u32);
+  let _ = buf_write_byte(exp0, 8 as u32, 0x32 as u32);
+  let _ = buf_write_byte(exp0, 9 as u32, 0x55 as u32);
+  let _ = buf_write_byte(exp0, 10 as u32, 0xbf as u32);
+  let _ = buf_write_byte(exp0, 11 as u32, 0xef as u32);
+  let _ = buf_write_byte(exp0, 12 as u32, 0x95 as u32);
+  let _ = buf_write_byte(exp0, 13 as u32, 0x60 as u32);
+  let _ = buf_write_byte(exp0, 14 as u32, 0x18 as u32);
+  let _ = buf_write_byte(exp0, 15 as u32, 0x90 as u32);
+  let _ = buf_write_byte(exp0, 16 as u32, 0xaf as u32);
+  let _ = buf_write_byte(exp0, 17 as u32, 0xd8 as u32);
+  let _ = buf_write_byte(exp0, 18 as u32, 0x07 as u32);
+  let _ = buf_write_byte(exp0, 19 as u32, 0x09 as u32);
+  if sha256_bytes_equal(out0, exp0, 20) == 0 { ok = 0; }
+
+  let msg1: mut ref i64 = dhruva_alloc_bytes(3);
+  let _ = buf_write_byte(msg1, 0 as u32, 0x61 as u32);
+  let _ = buf_write_byte(msg1, 1 as u32, 0x62 as u32);
+  let _ = buf_write_byte(msg1, 2 as u32, 0x63 as u32);
+  let out1: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = sha1_hash(msg1, 3, out1);
+  let exp1: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = buf_write_byte(exp1, 0 as u32, 0xa9 as u32);
+  let _ = buf_write_byte(exp1, 1 as u32, 0x99 as u32);
+  let _ = buf_write_byte(exp1, 2 as u32, 0x3e as u32);
+  let _ = buf_write_byte(exp1, 3 as u32, 0x36 as u32);
+  let _ = buf_write_byte(exp1, 4 as u32, 0x47 as u32);
+  let _ = buf_write_byte(exp1, 5 as u32, 0x06 as u32);
+  let _ = buf_write_byte(exp1, 6 as u32, 0x81 as u32);
+  let _ = buf_write_byte(exp1, 7 as u32, 0x6a as u32);
+  let _ = buf_write_byte(exp1, 8 as u32, 0xba as u32);
+  let _ = buf_write_byte(exp1, 9 as u32, 0x3e as u32);
+  let _ = buf_write_byte(exp1, 10 as u32, 0x25 as u32);
+  let _ = buf_write_byte(exp1, 11 as u32, 0x71 as u32);
+  let _ = buf_write_byte(exp1, 12 as u32, 0x78 as u32);
+  let _ = buf_write_byte(exp1, 13 as u32, 0x50 as u32);
+  let _ = buf_write_byte(exp1, 14 as u32, 0xc2 as u32);
+  let _ = buf_write_byte(exp1, 15 as u32, 0x6c as u32);
+  let _ = buf_write_byte(exp1, 16 as u32, 0x9c as u32);
+  let _ = buf_write_byte(exp1, 17 as u32, 0xd0 as u32);
+  let _ = buf_write_byte(exp1, 18 as u32, 0xd8 as u32);
+  let _ = buf_write_byte(exp1, 19 as u32, 0x9d as u32);
+  if sha256_bytes_equal(out1, exp1, 20) == 0 { ok = 0; }
+
+  let msg2: mut ref i64 = dhruva_alloc_bytes(56);
+  let m2: [u8; 56] = [
+    0x61 as u8, 0x62 as u8, 0x63 as u8, 0x64 as u8, 0x62 as u8, 0x63 as u8, 0x64 as u8, 0x65 as u8,
+    0x63 as u8, 0x64 as u8, 0x65 as u8, 0x66 as u8, 0x64 as u8, 0x65 as u8, 0x66 as u8, 0x67 as u8,
+    0x65 as u8, 0x66 as u8, 0x67 as u8, 0x68 as u8, 0x66 as u8, 0x67 as u8, 0x68 as u8, 0x69 as u8,
+    0x67 as u8, 0x68 as u8, 0x69 as u8, 0x6a as u8, 0x68 as u8, 0x69 as u8, 0x6a as u8, 0x6b as u8,
+    0x69 as u8, 0x6a as u8, 0x6b as u8, 0x6c as u8, 0x6a as u8, 0x6b as u8, 0x6c as u8, 0x6d as u8,
+    0x6b as u8, 0x6c as u8, 0x6d as u8, 0x6e as u8, 0x6c as u8, 0x6d as u8, 0x6e as u8, 0x6f as u8,
+    0x6d as u8, 0x6e as u8, 0x6f as u8, 0x70 as u8, 0x6e as u8, 0x6f as u8, 0x70 as u8, 0x71 as u8
+  ];
+  let mi2: i64 = 0;
+  while mi2 < 56 {
+    let _ = buf_write_byte(msg2, mi2 as u32, m2[mi2] as u32);
+    mi2 = mi2 + 1;
+  }
+  let out2: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = sha1_hash(msg2, 56, out2);
+  let exp2: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = buf_write_byte(exp2, 0 as u32, 0x84 as u32);
+  let _ = buf_write_byte(exp2, 1 as u32, 0x98 as u32);
+  let _ = buf_write_byte(exp2, 2 as u32, 0x3e as u32);
+  let _ = buf_write_byte(exp2, 3 as u32, 0x44 as u32);
+  let _ = buf_write_byte(exp2, 4 as u32, 0x1c as u32);
+  let _ = buf_write_byte(exp2, 5 as u32, 0x3b as u32);
+  let _ = buf_write_byte(exp2, 6 as u32, 0xd2 as u32);
+  let _ = buf_write_byte(exp2, 7 as u32, 0x6e as u32);
+  let _ = buf_write_byte(exp2, 8 as u32, 0xba as u32);
+  let _ = buf_write_byte(exp2, 9 as u32, 0xae as u32);
+  let _ = buf_write_byte(exp2, 10 as u32, 0x4a as u32);
+  let _ = buf_write_byte(exp2, 11 as u32, 0xa1 as u32);
+  let _ = buf_write_byte(exp2, 12 as u32, 0xf9 as u32);
+  let _ = buf_write_byte(exp2, 13 as u32, 0x51 as u32);
+  let _ = buf_write_byte(exp2, 14 as u32, 0x29 as u32);
+  let _ = buf_write_byte(exp2, 15 as u32, 0xe5 as u32);
+  let _ = buf_write_byte(exp2, 16 as u32, 0xe5 as u32);
+  let _ = buf_write_byte(exp2, 17 as u32, 0x46 as u32);
+  let _ = buf_write_byte(exp2, 18 as u32, 0x70 as u32);
+  let _ = buf_write_byte(exp2, 19 as u32, 0xf1 as u32);
+  if sha256_bytes_equal(out2, exp2, 20) == 0 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: SHA-1 vs 3 NIST/FIPS-180-4 KATs (empty, \"abc\", 2-block) -- legacy interop only (WPA2 groundwork)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Three FIPS 180-4 / NIST known-answer vectors: the empty string, the
 // "abc" worked example from the spec itself, and a 56-byte message
 // whose padding lands exactly on a second 64-byte block -- the one
@@ -29874,6 +30024,12 @@ fn kernel_main() -> i64 {
 
   // Round 41: crypto primitives foundation, hash-function half.
   let _ = sha256_self_test();
+
+  // Task #164 (WiFi/WPA2) groundwork: SHA-1, legacy-interop-only,
+  // needed for WPA2-PSK's own HMAC-SHA1-based PBKDF2/PRF key
+  // derivation (no substitute exists that still interoperates with a
+  // real access point). See sha1_self_test's own header comment.
+  let _ = sha1_self_test();
 
   // Real authentication: HMAC-SHA256/PBKDF2-HMAC-SHA256, built on
   // round 41's SHA-256, ahead of everything su/passwd itself needs.
