@@ -120,40 +120,93 @@ sd_state_get_is_sdhc:
  * calling-convention bug here rather than an SD-protocol one, once
  * actually checked against the disassembly instead of guessed at from
  * symptoms alone. */
+/* TASK #163 FOLLOW-UP (2026-09-14): both loops below used to blast
+ * word_count words straight at SDDATA with NO polling of any FIFO-
+ * readiness status at all -- correct only if the controller can always
+ * accept/produce a word the instant the CPU asks for one. Found after
+ * the second real Pi 1B boot showed reproducible SD/DharaFS write
+ * corruption (kernel_main.vani's own "SD: 8-block round-trip sweep"
+ * self-test, and downstream DharaFS persistence, both real -- see
+ * project memory) that QEMU's own SD FIFO model never exhibited across
+ * this whole project's testing history, because it has no real
+ * backpressure to violate. Confirmed against Linux's own real
+ * driver for this exact controller (drivers/mmc/host/bcm2835.c,
+ * bcm2835_transfer_block_pio): it polls SDEDM's own FIFO-word-count
+ * field, bits[8:4] ((edm >> 4) & 0x1F), before transferring, using a
+ * documented 16-word FIFO depth (SDDATA_FIFO_WORDS). That driver polls
+ * once per up-to-8-word burst for throughput; this file polls once per
+ * WORD instead -- simpler to get unconditionally correct in raw asm,
+ * and this project's own established "correctness first" convention
+ * (boot/rpi1/boot.S's own header comment) makes that the right
+ * trade-off here over matching Linux's burst optimization exactly.
+ * Bounded retry count per word (100000), not `while true`, matching
+ * sdhost_cmd's own "a wedged card can never hang the caller forever"
+ * convention just above in kernel_main.vani -- if the FIFO genuinely
+ * never becomes ready, the caller's own post-transfer SDHSTS error-bit
+ * check (sdhost_read_block/write_block) is what actually surfaces the
+ * failure; this bound only prevents an infinite spin. */
 .global sdhost_drain_fifo_to_buffer
 sdhost_drain_fifo_to_buffer:
-    push {r4}                /* r4 is callee-saved (AAPCS) -- see the
+    push {r4, r5, r6}         /* r4/r5/r6 callee-saved (AAPCS) -- see the
                                * file-level note below on why this
                                * isn't optional here */
     mov r4, r2               /* r4 = word_count (r2:r3 pair, low half) */
-    ldr r2, =0x20202040     /* SDDATA */
+    ldr r6, =0x20202034      /* SDEDM */
 sdhost_drain_loop:
     cmp r4, #0
     beq sdhost_drain_done
+    ldr r5, =100000          /* bounded per-word poll-for-data retry cap --
+                               * ldr, not mov: 100000 (0x186A0) isn't a
+                               * valid ARM rotated-immediate */
+sdhost_drain_poll:
+    ldr r2, [r6]
+    mov r2, r2, lsr #4
+    and r2, r2, #0x1F        /* r2 = current FIFO word count */
+    cmp r2, #0
+    bne sdhost_drain_ready    /* at least 1 word available -- go read it */
+    subs r5, r5, #1
+    bne sdhost_drain_poll
+sdhost_drain_ready:
+    ldr r2, =0x20202040      /* SDDATA */
     ldr r3, [r2]
     str r3, [r0], #4
     sub r4, r4, #1
     b sdhost_drain_loop
 sdhost_drain_done:
-    pop {r4}
+    pop {r4, r5, r6}
     mov r0, #0
     mov r1, #0
     bx lr
 
 .global sdhost_fill_fifo_from_buffer
 sdhost_fill_fifo_from_buffer:
-    push {r4}
+    push {r4, r5, r6}
     mov r4, r2               /* r4 = word_count (r2:r3 pair, low half) */
-    ldr r2, =0x20202040     /* SDDATA */
+    ldr r6, =0x20202034      /* SDEDM */
 sdhost_fill_loop:
     cmp r4, #0
     beq sdhost_fill_done
+    ldr r5, =100000          /* bounded per-word poll-for-space retry cap --
+                               * ldr, not mov: 100000 (0x186A0) isn't a
+                               * valid ARM rotated-immediate */
+sdhost_fill_poll:
+    ldr r2, [r6]
+    mov r2, r2, lsr #4
+    and r2, r2, #0x1F        /* r2 = current FIFO word count */
+    cmp r2, #16              /* SDDATA_FIFO_WORDS (confirmed against
+                               * Linux's own bcm2835.c) -- full when the
+                               * count reaches this */
+    blt sdhost_fill_ready     /* room for at least 1 more word */
+    subs r5, r5, #1
+    bne sdhost_fill_poll
+sdhost_fill_ready:
+    ldr r2, =0x20202040      /* SDDATA */
     ldr r3, [r0], #4
     str r3, [r2]
     sub r4, r4, #1
     b sdhost_fill_loop
 sdhost_fill_done:
-    pop {r4}
+    pop {r4, r5, r6}
     mov r0, #0
     mov r1, #0
     bx lr
