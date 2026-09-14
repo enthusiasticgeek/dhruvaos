@@ -444,9 +444,18 @@ redistributable collection the real Linux kernel's own driver uses):
 ```sh
 mkdir -p ~/wifi-firmware && cd ~/wifi-firmware
 curl -sL -o rtl8192cufw_TMSC.bin \
-    "https://raw.githubusercontent.com/kernel-firmware/linux-firmware/main/rtlwifi/rtl8192cufw_TMSC.bin"
-ls -la rtl8192cufw_TMSC.bin   # sanity check: ~16KB, not 0 bytes
+    "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/rtlwifi/rtl8192cufw_TMSC.bin"
+ls -la rtl8192cufw_TMSC.bin   # sanity check: exactly 16126 bytes, not 0
 ```
+
+(GitLab's own canonical mirror, not GitHub — a `raw.githubusercontent.
+com/kernel-firmware/linux-firmware/...` URL looks plausible but 404s;
+verified 2026-09-14 by actually fetching from the URL above, checking
+it byte-for-byte against round 58's own findings — 16126 bytes total,
+signature 0x88C1, ramcodesize 16094 at bytes 12-13 — then deleting the
+file immediately after, same "fetch temporarily to verify, never
+commit" pattern as every other proprietary binary this project
+touches.)
 
 (This is the file this project's own `rtl_fw_header_parse` and round
 58's own live verification were checked against — see
@@ -461,11 +470,18 @@ already using, as hex-encoded chunks via the `wifikey` command (root
 only):
 
 ```
-wifikey chunk <128 hex chars, i.e. 64 bytes, per line>
-wifikey chunk <next 64 bytes>
-... (~252 lines for the real 16126-byte file)
+wifikey chunk <96 hex chars, i.e. 48 bytes, per line>
+wifikey chunk <next 48 bytes>
+... (~337 lines for the real 16126-byte file)
 wifikey commit
 ```
+
+(48 bytes/96 hex chars per chunk, not a rounder-looking 64 -- the
+`"wifikey chunk "` prefix plus the hex data both have to fit inside
+`shell_line_scratch`'s own 128-byte line buffer; 64 bytes was tried
+first and found, live, to silently overflow that buffer -- see
+`shell_dispatch_wifikey`'s own comment in `kernel_main.vani` for the
+full story.)
 
 Genuinely tedious to type by hand — this is meant to be driven by a
 small host-side script that hex-encodes the file and sends one

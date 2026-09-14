@@ -19045,7 +19045,7 @@ fn shell_dispatch_sshkey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> 
 // concatenate onto a prior write), so chunk-by-chunk DharaFS writes
 // would silently overwrite each other rather than build up the file.
 //
-// `wifikey chunk <hex>` -- decode and append up to 64 bytes (128 hex
+// `wifikey chunk <hex>` -- decode and append up to 48 bytes (96 hex
 // chars) to the in-progress upload. `wifikey commit` -- write the
 // accumulated bytes to /wifi/fw.bin as one real DharaFS file (task
 // #164's own file-size-cap fix makes this fit as a NORMAL file, no
@@ -19054,9 +19054,23 @@ fn shell_dispatch_sshkey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> 
 // same reasoning as sshkey add: this configures what a boot-time
 // hardware sequence trusts and executes, not a self-service operation.
 //
+// REAL BUG FOUND AND FIXED (2026-09-14, while actually testing this
+// command against the real firmware file end to end, not just a small
+// synthetic payload): originally allowed 64 bytes (128 hex chars) per
+// chunk, but "wifikey chunk " (14 characters) plus 128 hex characters
+// is 142 characters total -- OVER shell_line_scratch's own 128-byte
+// line buffer. Every chunk at the old max silently overflowed the
+// line buffer before ever reaching a recognized end-of-line, and
+// NOTHING after the very first overflowed attempt was processed at
+// all for the rest of the session -- confirmed live: a full 252-chunk
+// real-file upload produced zero successful chunks and no further
+// shell responses whatsoever, not just a cosmetic echo glitch. 48
+// bytes (96 hex chars) + the 14-character prefix = 110, comfortably
+// under 128 with real margin, not just barely fitting.
+//
 // A real, honest limitation, not silently glossed over: with a
-// 128-hex-char (64-byte) chunk cap, the real 16126-byte firmware file
-// needs ~252 separate `wifikey chunk` commands. Genuinely tedious to
+// 96-hex-char (48-byte) chunk cap, the real 16126-byte firmware file
+// needs ~337 separate `wifikey chunk` commands. Genuinely tedious to
 // type by hand -- intended to be driven by a small host-side script
 // (hex-encode the file, send one `wifikey chunk <hex>\r` per line over
 // the same serial/SSH connection every other host-side tool in this
@@ -19116,7 +19130,7 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
 
   if shell_word_matches(line_buf, sub_start, sub_end, "chunk") == 1 {
     if sub_end >= line_len {
-      let _ = uart_puts("usage: wifikey chunk <hex, up to 128 hex chars/64 bytes per call>\n");
+      let _ = uart_puts("usage: wifikey chunk <hex, up to 96 hex chars/48 bytes per call>\n");
       return 0;
     }
     let hex_start: i64 = sub_end + 1;
@@ -19127,8 +19141,13 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
       return 0;
     }
     let byte_len: i64 = hex_len / 2;
-    if byte_len > (64 as i64) {
-      let _ = uart_puts("wifikey: chunk too large (max 64 bytes/128 hex chars per call)\n");
+    // 48 bytes (96 hex chars), not 64/128: "wifikey chunk " (14 chars)
+    // + 96 hex chars = 110, safely under shell_line_scratch's own
+    // 128-byte line buffer. See this function's own header comment --
+    // the OLD 64-byte cap genuinely overflowed that buffer, found live
+    // against the real firmware file, not a hypothetical.
+    if byte_len > (48 as i64) {
+      let _ = uart_puts("wifikey: chunk too large (max 48 bytes/96 hex chars per call)\n");
       return 0;
     }
     let current_len: i64 = usb_wifi_fw_upload_len_get() as i64;
@@ -19586,7 +19605,45 @@ fn mqtt_recv_packet(rx_buf: mut ref i64, rx_len_buf: mut ref i64, key: mut ref i
 // restriction that protects that path doesn't need to apply here too.
 fn shell_dispatch() -> i64 {
   let line_len: i64 = shell_get_line_len() as i64;
+  // WIFIKEY-UPLOAD RACE FIX (2026-09-14, task #164 follow-up): this used
+  // to be released only by task_f, AFTER shell_dispatch() fully returned
+  // (i.e. after this whole command's dispatch AND any uart_puts output
+  // had finished printing). shell_rx_push_char deliberately drops any
+  // byte that arrives while shell_line_ready is still 1 (see
+  // shell_state.S's own comment -- an accepted tradeoff for an
+  // interactive human, who just retypes a dropped keystroke), and a slow
+  // print (uart_puts's own blocking per-byte TX-FIFO wait -- see its
+  // task #185 fix) kept ready==1 for this whole command's dispatch+print
+  // duration. A host-side script -- wifikey chunk's own intended real
+  // upload driver, see that function's header comment -- sends the next
+  // line far faster than a human ever would: confirmed live, anything
+  // under ~5s between chunk commands let the next chunk's leading bytes
+  // arrive while the PREVIOUS one was still being dispatched/printed,
+  // silently dropping them, corrupting the next line (it never saw its
+  // own real CR), and permanently wedging the shell for the rest of the
+  // session -- nothing after ever assembled a complete, correctly
+  // terminated line again. Fix: release the raw line buffer for new
+  // input as soon as it's been copied into the local line_buf below
+  // (BEFORE running this command's own dispatch logic and prints), not
+  // after -- shrinks the drop window down to just this copy loop instead
+  // of this whole command's execution time.
+  //
+  // ORDERING BUG CAUGHT LIVE IN THIS SAME FIX (2026-09-14): the first
+  // version of this fix called shell_clear_line() up here, BEFORE the
+  // copy loop, reasoning that line_len was already captured so nothing
+  // else depended on the raw state. Wrong: shell_rx_push_char's own
+  // ready==0 check is exactly what stops the RX ISR from touching
+  // shell_line_buf/shell_line_len while a command is still being read
+  // out of them -- clearing ready before the copy loop below finishes
+  // reopened the same class of race one line earlier (the NEXT line's
+  // incoming bytes could now overwrite shell_line_buf while THIS copy
+  // loop was still reading from it), and reproduced the exact same
+  // real-firmware wifikey chunk-2 failure end to end. shell_clear_line()
+  // must run AFTER the copy loop (still below line_len==0's own early
+  // return, which also needs its own clear -- an empty Enter press is
+  // real ready==1 state that still needs releasing).
   if line_len == 0 {
+    let _ = shell_clear_line();
     return 0;
   }
   let line_buf: mut ref i64 = shell_line_scratch_get();
@@ -19596,6 +19653,13 @@ fn shell_dispatch() -> i64 {
     let _ = buf_write_byte(line_buf, i as u32, c);
     i = i + 1;
   }
+  // Safe here: every byte of this line has just been copied into the
+  // local line_buf above, and nothing below (or anywhere else in this
+  // file) reads shell_get_line_len/shell_get_line_ready/
+  // shell_get_line_byte again -- everything from here on uses only the
+  // local copy. task_f's own former post-dispatch call is now redundant
+  // and was removed there.
+  let _ = shell_clear_line();
 
   let cmd_end: i64 = shell_find_space(line_buf, 0, line_len);
 
@@ -21592,7 +21656,11 @@ fn task_f() -> i64 {
       let _ = dhruva_prio_lock(2);
       let _ = shell_dispatch();
       let _ = dhruva_prio_unlock(3);
-      let _ = shell_clear_line();
+      // shell_dispatch() now releases the raw line buffer itself, right
+      // after capturing this command's bytes and before running its own
+      // (possibly slow, UART-bound) logic -- see its own header comment
+      // (WIFIKEY-UPLOAD RACE FIX) for why calling shell_clear_line() out
+      // here, only after the whole command finished, was a real bug.
     }
   }
   return 0;
