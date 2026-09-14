@@ -2894,21 +2894,79 @@ fn sdhost_card_addr(block_num: i64) -> u32 {
 // NEW_FLAG in `status` too: still set means sdhost_cmd's own poll gave
 // up before the command ever completed, a failure regardless of what
 // SDHSTS shows.
+// TASK #163 FOLLOW-UP (2026-09-14): after the real Pi 1B's own SD/
+// DharaFS write self-tests kept reproducibly failing even after fixing
+// the FIFO-polling gap (SDEDM's word-count field, see sdhost_drain_
+// fifo_to_buffer/sdhost_fill_fifo_from_buffer's own comment), checked
+// Linux's own driver for this exact controller (drivers/mmc/host/
+// bcm2835.c) one level deeper and found TWO more real gaps, both
+// invisible under QEMU for the same reason every other real-hardware-
+// only bug this investigation has found is: QEMU's own SD model
+// completes transfers instantaneously with no real controller FSM to
+// desynchronize.
+//
+// Gap A (fixed by reordering below): Linux's bcm2835_prepare_data
+// writes SDHBCT/SDHBLC (the transfer's own block-length/count) BEFORE
+// bcm2835_send_command ever writes SDCMD -- this file's own read/write
+// used to do it the other way around, issuing the command (via
+// sdhost_cmd, which blocks until NEW_FLAG clears) BEFORE the
+// controller had any idea how much data to expect for the data phase
+// that command triggers.
+//
+// Gap B (fixed by sdhost_wait_transfer_complete below): Linux does NOT
+// consider a transfer complete just because the FIFO loop finished and
+// HSTS shows no error bits -- it polls SDEDM's own FSM field (bits
+// [3:0]) until the controller's internal state machine actually
+// returns to IDENTMODE(0) or DATAMODE(1), matching
+// bcm2835_wait_transfer_complete exactly (including its own "stuck in
+// the expected in-between state" escape hatch: WRITESTART1(0xA) for a
+// write / READWAIT(4) for a read, forced out via SDEDM_FORCE_DATA_MODE,
+// bit 19). Real SD cards take genuine additional time to actually
+// finish committing a transfer at the controller level; a card genuinely
+// still be mid-transfer while this file's own code had already moved on
+// to the next command is exactly the kind of silent corruption this
+// project's own repeated real-hardware SD/DharaFS write failures
+// describe. Bounded at 100000 iterations, matching Linux's own value
+// exactly, not `while true`, same "never hang forever" convention as
+// sdhost_cmd's own poll.
+fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
+  let sdedm: i64 = SDEDM;
+  let iter: i64 = 0;
+  while iter < 100000 {
+    let edm: u32 = mmio_read_u32(sdedm);
+    let fsm: u32 = edm & (0xF as u32);
+    if (fsm == (0 as u32)) || (fsm == (1 as u32)) {
+      return 0;
+    }
+    if fsm == alternate_idle {
+      let _ = mmio_write_u32(sdedm, edm | (0x80000 as u32));
+      return 0;
+    }
+    iter = iter + 1;
+  }
+  return 1;
+}
+
 fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
   let sdhsts: i64 = SDHSTS;
   let sdcmd_read: u32 = 0x40 as u32;
   let sdcmd_new_flag: u32 = 0x8000 as u32;
+  let fsm_readwait: u32 = 4 as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
-  let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
+  let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
   let _ = sdhost_drain_fifo_to_buffer(buf, 128);
+  let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
+    return 1;
+  }
+  if wait_status != 0 {
     return 1;
   }
   if errs != (0 as u32) {
@@ -2930,15 +2988,20 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhsts: i64 = SDHSTS;
   let sdcmd_write: u32 = 0x80 as u32;
   let sdcmd_new_flag: u32 = 0x8000 as u32;
+  let fsm_writestart1: u32 = 0xA as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
-  let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
+  let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
   let _ = sdhost_fill_fifo_from_buffer(buf, 128);
+  let wait_status: i64 = sdhost_wait_transfer_complete(fsm_writestart1);
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
+    return 1;
+  }
+  if wait_status != 0 {
     return 1;
   }
   if errs != (0 as u32) {
