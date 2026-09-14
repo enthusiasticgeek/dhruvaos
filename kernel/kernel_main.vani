@@ -2077,7 +2077,45 @@ fn uart_put_hex32_irq(v: u32) -> i64 {
   return 0;
 }
 
+// TASK #185 FIX (2026-09-14): uart_puts had no mutual exclusion across
+// tasks -- found live as a side effect of round 184's own scheduler-
+// aging demo, which reliably produced byte-for-byte interleaved output
+// between two tasks' own uart_puts calls (each call's own uart_putc
+// loop could be preempted mid-string by another task's own call to
+// this same function). Fixed with this project's own established
+// priority-CEILING protocol (dhruva_prio_lock/unlock,
+// boot/context_switch.S) -- boosting to ceiling 0 (HIGH's own
+// priority, the highest in the system) for the duration of the print
+// makes this task un-preemptible by anything, matching the exact
+// "entering critical section" pattern already used elsewhere in this
+// project for other shared resources. Unlike dhruva_mutex_lock, this
+// primitive is unconditional (no wait queue, no context switch, ever)
+// -- confirmed safe to call from single-threaded pre-scheduler boot
+// code too, not just from real tasks post-start_multitasking.
+// current_eff_prio() snapshots this task's OWN priority before the
+// boost so it restores to the correct value regardless of caller (a
+// hardcoded restore constant, the pattern this project's own demo
+// tasks use for a KNOWN fixed base priority, wouldn't work here since
+// uart_puts is called from every task at every priority level).
+//
+// Deliberately scoped to uart_puts ONLY, not swept across every other
+// uart_put_* helper (uart_put_hex32/uart_put_i64/uart_put_hex_byte/
+// uart_put_ip) despite those having the exact same theoretical race:
+// those are also called from abort_report_data/abort_report_prefetch
+// (vectors.S's own Data/Prefetch Abort handlers, running in exception
+// context whose entire job is reporting corruption reliably even when
+// other state is already broken). dhruva_prio_lock/unlock write
+// eff_prio_table[current_task] -- a WRITE through current_task as an
+// array index, not just a read -- and if the very corruption that
+// caused the fault happened to also corrupt current_task itself, that
+// write becomes a new wild-write risk introduced BY this fix, in
+// exactly the one path that must never gain new failure modes. The
+// confirmed, reproduced bug (round 184) was specifically uart_puts
+// racing with uart_puts; fixing exactly that without extending new
+// risk into the fault handler is the right scope for this round.
 fn uart_puts(s: Str) -> i64 {
+  let saved_prio: u32 = current_eff_prio();
+  let _ = dhruva_prio_lock(0);
   let n: i64 = str_len_bytes(s);
   let i: i64 = 0;
   while i < n {
@@ -2085,6 +2123,7 @@ fn uart_puts(s: Str) -> i64 {
     let _ = uart_putc(b);
     i = i + 1;
   }
+  let _ = dhruva_prio_unlock(saved_prio as i64);
   return 0;
 }
 
