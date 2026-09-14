@@ -559,6 +559,12 @@ fn ssh_build_channel_window_adjust(peer_chan: u32, bytes_to_add: u32, out: mut r
 struct SshUserauthPubkeyRequest {
   ok: i64,           // 1 = parsed a well-formed publickey request, 0 = not (wrong method, or parse error)
   has_sig: i64,       // 1 = this is the real signed request, 0 = the "query" probe (no signature yet)
+  user_off: i64, user_len: i64,      // TASK #193: the username field this parser used to skip over
+                                      // without exposing -- see this project's own security-gap memory:
+                                      // with no identity ever visible to the caller, there was no way to
+                                      // check the presented key against anything beyond "is this signature
+                                      // valid for whatever key the client itself sent," i.e. proof-of-
+                                      // possession only, not real access control.
   alg_off: i64, alg_len: i64,
   keyblob_off: i64, keyblob_len: i64,
   sig_off: i64, sig_len: i64,        // only meaningful if has_sig == 1
@@ -570,8 +576,9 @@ struct SshUserauthPubkeyRequest {
 // (ok=0) result for any other method -- caller should respond with
 // SSH2_MSG_USERAUTH_FAILURE in that case.
 fn ssh_parse_userauth_pubkey_request(payload: mut ref i64, _payload_len: i64) -> SshUserauthPubkeyRequest {
-  let bad: SshUserauthPubkeyRequest = SshUserauthPubkeyRequest { ok: 0, has_sig: 0, alg_off: 0, alg_len: 0, keyblob_off: 0, keyblob_len: 0, sig_off: 0, sig_len: 0, signed_data_end_off: 0 };
+  let bad: SshUserauthPubkeyRequest = SshUserauthPubkeyRequest { ok: 0, has_sig: 0, user_off: 0, user_len: 0, alg_off: 0, alg_len: 0, keyblob_off: 0, keyblob_len: 0, sig_off: 0, sig_len: 0, signed_data_end_off: 0 };
   let off: i64 = 1; // skip msg type byte
+  let user_off: i64 = off + 4;
   let ulen: i64 = ssh_read_u32(payload, off) as i64;
   off = off + 4 + ulen;
   let slen: i64 = ssh_read_u32(payload, off) as i64;
@@ -599,11 +606,11 @@ fn ssh_parse_userauth_pubkey_request(payload: mut ref i64, _payload_len: i64) ->
   off = keyblob_off + keyblob_len;
 
   if has_sig == (0 as u32) {
-    return SshUserauthPubkeyRequest { ok: 1, has_sig: 0, alg_off: alg_off, alg_len: alg_len, keyblob_off: keyblob_off, keyblob_len: keyblob_len, sig_off: 0, sig_len: 0, signed_data_end_off: off };
+    return SshUserauthPubkeyRequest { ok: 1, has_sig: 0, user_off: user_off, user_len: ulen, alg_off: alg_off, alg_len: alg_len, keyblob_off: keyblob_off, keyblob_len: keyblob_len, sig_off: 0, sig_len: 0, signed_data_end_off: off };
   }
   let sig_len: i64 = ssh_read_u32(payload, off) as i64;
   let sig_off: i64 = off + 4;
-  return SshUserauthPubkeyRequest { ok: 1, has_sig: 1, alg_off: alg_off, alg_len: alg_len, keyblob_off: keyblob_off, keyblob_len: keyblob_len, sig_off: sig_off, sig_len: sig_len, signed_data_end_off: off };
+  return SshUserauthPubkeyRequest { ok: 1, has_sig: 1, user_off: user_off, user_len: ulen, alg_off: alg_off, alg_len: alg_len, keyblob_off: keyblob_off, keyblob_len: keyblob_len, sig_off: sig_off, sig_len: sig_len, signed_data_end_off: off };
 }
 
 // Builds the "signed data" a publickey userauth signature covers

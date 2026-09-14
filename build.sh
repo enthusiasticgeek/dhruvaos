@@ -139,6 +139,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/auth_state.S" -o "${BUILD_DIR}/auth_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/ssh_auth_state.S" -o "${BUILD_DIR}/ssh_auth_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/media_crypto_state.S" -o "${BUILD_DIR}/media_crypto_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -225,6 +228,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/usb_hid_state.o" \
   "${BUILD_DIR}/fw_state.o" \
   "${BUILD_DIR}/auth_state.o" \
+  "${BUILD_DIR}/ssh_auth_state.o" \
   "${BUILD_DIR}/media_crypto_state.o" \
   "${BUILD_DIR}/fault_inject_state.o" \
   "${BUILD_DIR}/diag_ring_state.o" \

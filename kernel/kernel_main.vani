@@ -892,6 +892,12 @@ extern "C" fn auth_get_fail_count(index: u32) -> u32;
 extern "C" fn auth_set_fail_count(index: u32, count: u32) -> i64;
 extern "C" fn auth_get_lockout_until(index: u32) -> u32;
 extern "C" fn auth_set_lockout_until(index: u32, tick: u32) -> i64;
+// Task #193: SSH authorized-keys table -- see boot/ssh_auth_state.S's
+// own file comment for the full security-gap writeup.
+extern "C" fn ssh_auth_table_init() -> i64;
+extern "C" fn ssh_auth_get_uid(index: u32) -> u32;
+extern "C" fn ssh_auth_set_uid(index: u32, uid: u32) -> i64;
+extern "C" fn ssh_auth_key_ptr(index: u32) -> mut ref i64;
 extern "C" fn auth_salt_nonce_next() -> u32;
 extern "C" fn hmac_key_block_ptr() -> mut ref i64;
 extern "C" fn hmac_msg_scratch_ptr() -> mut ref i64;
@@ -18468,6 +18474,150 @@ fn shell_dispatch_passwd(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> 
   return 0;
 }
 
+// Task #193: strict hex-string -> raw-bytes parser for `sshkey add`'s
+// own 64-hex-char (32-byte) Ed25519 public key argument. Deliberately
+// rejects (returns 0-1) rather than silently substituting 0 for an
+// invalid digit the way hex_ascii_to_nibble's own USB-descriptor
+// caller can afford to (a MAC address string from real USB hardware is
+// trusted input; a key an operator just typed is exactly the kind of
+// input this project's own "reject, don't guess" posture exists for --
+// an SSH key with one mistyped hex digit accepted silently would grant
+// access to a DIFFERENT key than the operator thinks they configured).
+fn shell_is_hex_digit(c: u32) -> i64 {
+  if (c >= (0x30 as u32)) && (c <= (0x39 as u32)) { return 1; }
+  if (c >= (0x61 as u32)) && (c <= (0x66 as u32)) { return 1; }
+  if (c >= (0x41 as u32)) && (c <= (0x46 as u32)) { return 1; }
+  return 0;
+}
+
+fn shell_parse_hex_bytes(buf: mut ref i64, start: i64, end: i64, out: mut ref i64, expected_bytes: i64) -> i64 {
+  if (end - start) != (expected_bytes * 2) {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < expected_bytes {
+    let hi_c: u32 = buf_read_byte(buf, (start + (i * 2)) as u32);
+    let lo_c: u32 = buf_read_byte(buf, (start + (i * 2) + 1) as u32);
+    if (shell_is_hex_digit(hi_c) != 1) || (shell_is_hex_digit(lo_c) != 1) {
+      return 0 - 1;
+    }
+    let byte_val: u32 = (hex_ascii_to_nibble(hi_c) << 4) | hex_ascii_to_nibble(lo_c);
+    let _ = buf_write_byte(out, i as u32, byte_val);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// `sshkey add <uid> <64-hex-char-ed25519-pubkey>` / `sshkey rm <uid>` /
+// `sshkey list` -- manages the authorized-keys table task #193 added
+// (boot/ssh_auth_state.S). Root-only (unlike passwd's own self-service
+// "caller_uid == uid" carve-out) -- granting SSH access to a uid is a
+// strictly more sensitive operation than a user changing their own
+// local password, and this project has no notion of "a user pre-
+// authorizing their own future SSH key" to make self-service
+// meaningful here anyway (the whole point is the SERVER decides who's
+// allowed in, not the connecting client).
+fn shell_dispatch_sshkey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  if dharafs_user_get_uid() != (0 as u32) {
+    let _ = uart_puts("sshkey: permission denied (root only)\n");
+    return 0;
+  }
+  if cmd_end >= line_len {
+    let _ = uart_puts("usage: sshkey add <uid> <64-hex-char-ed25519-pubkey> | sshkey rm <uid> | sshkey list\n");
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "list") == 1 {
+    let i: u32 = 0 as u32;
+    while i < (8 as u32) {
+      let uid: u32 = ssh_auth_get_uid(i);
+      if uid != (0xFFFFFFFF as u32) {
+        let _ = uart_puts("  uid=");
+        let _ = uart_put_hex32(uid);
+        let _ = uart_puts(" key=");
+        let key_ptr: mut ref i64 = ssh_auth_key_ptr(i);
+        let ki: i64 = 0;
+        while ki < 32 {
+          let _ = uart_put_hex_byte(buf_read_byte(key_ptr, ki as u32));
+          ki = ki + 1;
+        }
+        let _ = uart_puts("\n");
+      }
+      i = i + (1 as u32);
+    }
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "rm") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: sshkey rm <uid>\n");
+      return 0;
+    }
+    let uid_start: i64 = sub_end + 1;
+    let uid_end: i64 = shell_find_space(line_buf, uid_start, line_len);
+    let uid: i64 = shell_parse_decimal(line_buf, uid_start, uid_end);
+    if uid < 0 {
+      let _ = uart_puts("usage: sshkey rm <uid> (uid a non-negative integer)\n");
+      return 0;
+    }
+    let i: u32 = 0 as u32;
+    let removed: i64 = 0;
+    while i < (8 as u32) {
+      if ssh_auth_get_uid(i) == (uid as u32) {
+        let _ = ssh_auth_set_uid(i, 0xFFFFFFFF as u32);
+        removed = 1;
+      }
+      i = i + (1 as u32);
+    }
+    if removed == 1 {
+      let _ = uart_puts("ok\n");
+    } else {
+      let _ = uart_puts("sshkey: no key found for that uid\n");
+    }
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "add") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: sshkey add <uid> <64-hex-char-ed25519-pubkey>\n");
+      return 0;
+    }
+    let uid_start: i64 = sub_end + 1;
+    let uid_end: i64 = shell_find_space(line_buf, uid_start, line_len);
+    if uid_end >= line_len {
+      let _ = uart_puts("usage: sshkey add <uid> <64-hex-char-ed25519-pubkey>\n");
+      return 0;
+    }
+    let uid: i64 = shell_parse_decimal(line_buf, uid_start, uid_end);
+    if uid < 0 {
+      let _ = uart_puts("usage: sshkey add <uid> <64-hex-char-ed25519-pubkey> (uid a non-negative integer)\n");
+      return 0;
+    }
+    let key_start: i64 = uid_end + 1;
+    let key_end: i64 = shell_find_space(line_buf, key_start, line_len);
+
+    let slot: i64 = ssh_auth_find_free_slot();
+    if slot < (0 as i64) {
+      let _ = uart_puts("sshkey: authorized-key table full\n");
+      return 0;
+    }
+    let key_ptr: mut ref i64 = ssh_auth_key_ptr(slot as u32);
+    let parse_status: i64 = shell_parse_hex_bytes(line_buf, key_start, key_end, key_ptr, 32);
+    if parse_status != 0 {
+      let _ = uart_puts("sshkey: key must be exactly 64 hex characters (32-byte raw Ed25519 public key)\n");
+      return 0;
+    }
+    let _ = ssh_auth_set_uid(slot as u32, uid as u32);
+    let _ = uart_puts("ok\n");
+    return 0;
+  }
+
+  let _ = uart_puts("usage: sshkey add <uid> <64-hex-char-ed25519-pubkey> | sshkey rm <uid> | sshkey list\n");
+  return 0;
+}
+
 // Round 51/62: shell front end for every fault-injection type this
 // project has. `fault alloc <n>` (round 51) deliberately triggers the
 // SAME real, unrecoverable dhruva_alloc_bytes OOM-fatal halt a genuine
@@ -19363,6 +19513,11 @@ fn shell_dispatch() -> i64 {
   // Real authentication: set (or change) a uid's password.
   if shell_word_matches(line_buf, 0, cmd_end, "passwd") == 1 {
     return shell_dispatch_passwd(line_buf, cmd_end, line_len);
+  }
+
+  // Task #193: manage the SSH authorized-keys table.
+  if shell_word_matches(line_buf, 0, cmd_end, "sshkey") == 1 {
+    return shell_dispatch_sshkey(line_buf, cmd_end, line_len);
   }
 
   // Round 42: change an existing file's permission bits. Mode is a
@@ -21519,6 +21674,46 @@ fn auth_find_free_slot() -> i64 {
     i = i + (1 as u32);
   }
   return 0 - 1;
+}
+
+// Task #193: SSH authorized-keys table's own small helpers, same
+// linear-scan-over-8-fixed-slots shape as auth_find_slot/auth_find_
+// free_slot above -- this project's own established convention for
+// every small fixed table, not worth a different data structure for 8
+// entries.
+fn ssh_auth_find_free_slot() -> i64 {
+  let i: u32 = 0 as u32;
+  while i < (8 as u32) {
+    if ssh_auth_get_uid(i) == (0xFFFFFFFF as u32) {
+      return i as i64;
+    }
+    i = i + (1 as u32);
+  }
+  return 0 - 1;
+}
+
+// Returns 1 iff `uid` has an authorized key in this table AND it
+// byte-for-byte matches `client_pub` (32 bytes, raw Ed25519 public key)
+// -- checked in ADDITION to (never instead of) the signature-validity
+// check already performed by the caller. A uid may occupy more than
+// one slot (multiple authorized keys); this returns 1 on the FIRST
+// matching slot, scanning all 8 regardless of uid match to keep this a
+// simple, constant-shape loop (this table is tiny -- 8 iterations --
+// so there is no real performance reason to short-circuit early, and
+// not short-circuiting on a uid mismatch means the same code path runs
+// whether or not the claimed uid exists in the table at all).
+fn ssh_auth_check(uid: i64, client_pub: mut ref i64) -> i64 {
+  let i: u32 = 0 as u32;
+  while i < (8 as u32) {
+    if ssh_auth_get_uid(i) == (uid as u32) {
+      let stored: mut ref i64 = ssh_auth_key_ptr(i);
+      if hmac_sha256_bytes_equal(client_pub, stored, 32) == 1 {
+        return 1;
+      }
+    }
+    i = i + (1 as u32);
+  }
+  return 0;
 }
 
 fn buf_equals_str(buf: mut ref i64, buf_len: i64, s: Str) -> i64 {
@@ -26975,9 +27170,29 @@ fn ssh_real_phase3b_verify_signed(conn_id: u32, my_mac: mut ref i64, dst_mac: mu
   let _ = ssh_copy(recv_client_sig, 0, recv_sig_blob2, recv_sig_field2.value_off, 64);
 
   let auth_sig_ok: i64 = ed25519_verify_heap(recv_client_pub, server_signed_data, server_signed_data_len, recv_client_sig);
+
+  // TASK #193 FIX: a valid signature alone used to be enough to reach
+  // USERAUTH_SUCCESS -- proof the client holds the private key for
+  // WHATEVER public key it presented, but no check that key is actually
+  // AUTHORIZED for anything. The SSH username field (parsed the same
+  // "decimal uid string" way every other uid in this project already
+  // is -- see boot/ssh_auth_state.S's own file comment for why no
+  // separate name-to-uid mapping exists) must now also resolve to a
+  // configured uid whose authorized-keys table contains this exact
+  // presented key. Both checks are required -- a valid signature over
+  // an unauthorized key, or an authorized key with an invalid
+  // signature, both correctly fail here.
+  let claimed_uid: i64 = shell_parse_decimal(recv_signed, signed_fields.user_off, signed_fields.user_off + signed_fields.user_len);
+  let auth_key_ok: i64 = if claimed_uid >= 0 {
+    ssh_auth_check(claimed_uid, recv_client_pub)
+  } else {
+    0
+  };
+  let auth_ok: i64 = if (auth_sig_ok == 1) && (auth_key_ok == 1) { 1 } else { 0 };
+
   let userauth_ok_payload: mut ref i64 = ssh_payload_buf_get();
   let userauth_reply_len: i64 = 0;
-  if auth_sig_ok == 1 {
+  if auth_ok == 1 {
     userauth_reply_len = ssh_build_userauth_success(userauth_ok_payload);
   } else {
     userauth_reply_len = ssh_build_userauth_failure(userauth_ok_payload);
@@ -26985,7 +27200,19 @@ fn ssh_real_phase3b_verify_signed(conn_id: u32, my_mac: mut ref i64, dst_mac: mu
   let out_seq4: u32 = ssh_seq_take(ssh_server_seq_out_get());
   let enc_len4: i64 = ssh_build_enc_packet(ref s2c_main, ref s2c_header, out_seq4, userauth_ok_payload, userauth_reply_len, packet_buf);
   let _ = ssh_real_send_over_tcp(conn_id, my_mac, dst_mac, packet_buf, enc_len4);
-  if auth_sig_ok != 1 { return 0 - 4; }
+  if auth_ok != 1 { return 0 - 4; }
+
+  // Every existing privileged operation in this project (chmod, rm,
+  // write, the local shell's own default) checks dharafs_current_uid --
+  // an SSH session that authenticated as uid N must actually RUN as
+  // uid N, not implicitly as whatever the last thing to call
+  // dharafs_user_set happened to leave behind (root, by default, since
+  // nothing else in the boot path ever changes it). gid = uid: this
+  // project has no separate primary-group concept for SSH logins
+  // (matching the "no username infrastructure" scoping above) --
+  // uid 0 gets gid 0 (root:root), matching every other place uid 0 is
+  // already treated as root throughout this codebase.
+  let _ = dharafs_user_set(claimed_uid as u32, claimed_uid as u32);
 
   return 0;
 }
@@ -27290,6 +27517,72 @@ fn pki_self_test() -> i64 {
   }
 
   let _ = uart_puts("CRYPTO: PKI raw public-key trust (pinned-key verify + real dharafs file round trip)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Task #193: unit-level self-test for ssh_auth_check, the SSH server's
+// own actual access-control decision (see ssh_real_phase3b_verify_
+// signed's own comment for how this fits into the live protocol) --
+// exercised directly against the table rather than via a full live SSH
+// handshake, since this table lookup IS the fix; a live-protocol test
+// would only prove the surrounding transport still works, which
+// ssh_run_self_test already covers. Per this project's own security-
+// gap memory for this exact task: "testing must include a NEGATIVE
+// case -- that's the actual proof, not just legitimate clients still
+// get in." Three negative cases here, not one: wrong key for a real
+// uid, right key for the wrong uid, and an uid with no entry at all.
+fn ssh_auth_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let key_a: mut ref i64 = dhruva_alloc_bytes(32);
+  let key_b: mut ref i64 = dhruva_alloc_bytes(32);
+  let ki: i64 = 0;
+  while ki < 32 {
+    let _ = buf_write_byte(key_a, ki as u32, (ki + 1) as u32);
+    let _ = buf_write_byte(key_b, ki as u32, (ki + 100) as u32);
+    ki = ki + 1;
+  }
+
+  let slot: i64 = ssh_auth_find_free_slot();
+  let test_uid: i64 = 77;
+  let _ = ssh_auth_set_uid(slot as u32, test_uid as u32);
+  let stored_key: mut ref i64 = ssh_auth_key_ptr(slot as u32);
+  let ci: i64 = 0;
+  while ci < 32 {
+    let _ = buf_write_byte(stored_key, ci as u32, buf_read_byte(key_a, ci as u32));
+    ci = ci + 1;
+  }
+
+  // Positive: the exact authorized key for the exact authorized uid.
+  if ssh_auth_check(test_uid, key_a) != 1 {
+    ok = 0;
+  }
+  // Negative #1: a DIFFERENT (but validly-formed) key for that same
+  // authorized uid -- this is the case a signature-only check (the
+  // original bug) could never catch, since a client can generate a
+  // perfectly valid Ed25519 keypair and sign correctly with it; only
+  // an authorized-keys check catches this.
+  if ssh_auth_check(test_uid, key_b) != 0 {
+    ok = 0;
+  }
+  // Negative #2: the CORRECT key, but claimed under a uid it was never
+  // authorized for.
+  if ssh_auth_check(test_uid + 1, key_a) != 0 {
+    ok = 0;
+  }
+  // Negative #3: a uid with no authorized-keys entry at all.
+  if ssh_auth_check(9999, key_a) != 0 {
+    ok = 0;
+  }
+
+  let _ = ssh_auth_set_uid(slot as u32, 0xFFFFFFFF as u32);
+
+  let _ = uart_puts("SSH: authorized-keys check (positive match + 3 negative cases: wrong key, wrong uid, no entry)");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -29135,6 +29428,27 @@ fn kernel_main() -> i64 {
   // same "seed the sentinel first" discipline as task_table_init
   // just above.
   let _ = auth_table_init();
+
+  // Task #193: same "seed the sentinel first" discipline, for the SSH
+  // authorized-keys table -- must run before any SSH connection could
+  // possibly be accepted.
+  let _ = ssh_auth_table_init();
+  // BUG CAUGHT BEFORE THIS ROUND'S OWN FIRST COMMIT: this self-test
+  // was originally placed much earlier (right after pki_self_test(),
+  // near the crypto self-test block), textually BEFORE this exact
+  // init call despite the comment above insisting init must run
+  // first -- a real ordering bug, not just a misplaced test. With the
+  // table still all-zero (not yet seeded to the 0xFFFFFFFF sentinel),
+  // ssh_auth_find_free_slot() found no "empty" slot, returned -1, and
+  // ssh_auth_set_uid((-1) as u32, ...) wrote through a wild
+  // out-of-bounds array index -- genuine memory corruption, not merely
+  // a failed self-test. Caught by checking the ACTUAL boot log for
+  // this test's own PASS/FAIL line directly rather than trusting that
+  // "matches the known 16/18 baseline" on phase4_milestone.py's own
+  // checklist meant this new (not-yet-added-to-that-checklist) test
+  // had passed too. Must run here, strictly after ssh_auth_table_init
+  // above, not anywhere else in this function.
+  let _ = ssh_auth_self_test();
 
   // Round 60 crash investigation: was 512 bytes (matching this fn's own
   // #[bounded_stack(bytes=512)] budget exactly, with zero headroom --
