@@ -41,6 +41,13 @@ usb_wifi_fw_buf:
     .space 16384
 usb_wifi_fw_chunk:
     .space 128
+/* TASK #164 FOLLOW-UP: `wifikey chunk`/`commit` shell command's own
+ * running upload-length counter (kernel_main.vani) -- reuses usb_wifi_
+ * fw_buf itself as the accumulation target (safe: upload and the real
+ * probe-time download never happen concurrently, one operator-driven
+ * one-time setup step vs. one boot-time hardware sequence). */
+usb_wifi_fw_upload_len:
+    .word 0
 
 .section ".text"
 
@@ -68,5 +75,20 @@ usb_wifi_fw_buf_get:
 .global usb_wifi_fw_chunk_get
 usb_wifi_fw_chunk_get:
     ldr r0, =usb_wifi_fw_chunk
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_fw_upload_len_get
+usb_wifi_fw_upload_len_get:
+    ldr r0, =usb_wifi_fw_upload_len
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_fw_upload_len_set
+usb_wifi_fw_upload_len_set:
+    ldr r1, =usb_wifi_fw_upload_len
+    str r0, [r1]
+    mov r0, #0
     mov r1, #0
     bx lr
