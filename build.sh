@@ -178,6 +178,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/aead_hkdf_scratch.S" -o "${BUILD_DIR}/aead_hkdf_scratch.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/wpa2_hmac_state.S" -o "${BUILD_DIR}/wpa2_hmac_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/keccak_scratch.S" -o "${BUILD_DIR}/keccak_scratch.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -241,6 +244,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/ed25519_scratch.o" \
   "${BUILD_DIR}/pki_state.o" \
   "${BUILD_DIR}/aead_hkdf_scratch.o" \
+  "${BUILD_DIR}/wpa2_hmac_state.o" \
   "${BUILD_DIR}/keccak_scratch.o" \
   "${BUILD_DIR}/mlkem_scratch.o" \
   "${BUILD_DIR}/tls13_scratch.o" \

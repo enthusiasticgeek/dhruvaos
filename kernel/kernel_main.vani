@@ -905,6 +905,17 @@ extern "C" fn hmac_inner_hash_ptr() -> mut ref i64;
 extern "C" fn pbkdf2_u_ptr() -> mut ref i64;
 extern "C" fn pbkdf2_t_ptr() -> mut ref i64;
 extern "C" fn pbkdf2_salt_ctr_ptr() -> mut ref i64;
+// Task #164 (WPA2) groundwork: a SEPARATE HMAC-SHA1/PBKDF2-HMAC-SHA1
+// scratch set (boot/wpa2_hmac_state.S) -- see that file's own header
+// comment for why this can't just reuse the HMAC-SHA256 scratch above
+// (two logically independent subsystems can genuinely run at the same
+// time on this project's preemptive scheduler).
+extern "C" fn hmac_sha1_key_block_ptr() -> mut ref i64;
+extern "C" fn hmac_sha1_msg_scratch_ptr() -> mut ref i64;
+extern "C" fn hmac_sha1_inner_hash_ptr() -> mut ref i64;
+extern "C" fn pbkdf2_sha1_u_ptr() -> mut ref i64;
+extern "C" fn pbkdf2_sha1_t_ptr() -> mut ref i64;
+extern "C" fn pbkdf2_sha1_salt_ctr_ptr() -> mut ref i64;
 extern "C" fn passwd_scratch_ptr() -> mut ref i64;
 extern "C" fn su_hash_scratch_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_get_enabled() -> u32;
@@ -22365,6 +22376,331 @@ fn pbkdf2_hmac_sha256_self_test() -> i64 {
   return 0;
 }
 
+// HMAC-SHA1 (task #164, WPA2-PSK groundwork). Legacy-interop-only --
+// same reasoning as sha1_hash's own header comment: WPA2-PSK's own
+// PBKDF2/PRF key derivation is specified with HMAC-SHA1, no
+// substitute exists that still interoperates with a real access
+// point. Identical shape to hmac_sha256 above (64-byte block, same
+// inner/outer-pad construction), just SHA-1's 20-byte digest instead
+// of SHA-256's 32, and its own dedicated scratch set (see the extern
+// declarations' own comment on why that scratch can't be shared).
+fn hmac_sha1(key: mut ref i64, key_len: i64, msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  if msg_len > 64 {
+    return 0 - 1;
+  }
+  let key_block: mut ref i64 = hmac_sha1_key_block_ptr();
+  let i: i64 = 0;
+  if key_len > 64 {
+    let _ = sha1_hash(key, key_len, key_block);
+    i = 20;
+  } else {
+    while i < key_len {
+      let _ = buf_write_byte(key_block, i as u32, buf_read_byte(key, i as u32));
+      i = i + 1;
+    }
+  }
+  while i < 64 {
+    let _ = buf_write_byte(key_block, i as u32, 0 as u32);
+    i = i + 1;
+  }
+
+  let msg_scratch: mut ref i64 = hmac_sha1_msg_scratch_ptr();
+  i = 0;
+  while i < 64 {
+    let kb: u32 = buf_read_byte(key_block, i as u32);
+    let _ = buf_write_byte(msg_scratch, i as u32, kb ^ (0x36 as u32));
+    i = i + 1;
+  }
+  i = 0;
+  while i < msg_len {
+    let _ = buf_write_byte(msg_scratch, (64 + i) as u32, buf_read_byte(msg, i as u32));
+    i = i + 1;
+  }
+  let inner_hash: mut ref i64 = hmac_sha1_inner_hash_ptr();
+  let _ = sha1_hash(msg_scratch, 64 + msg_len, inner_hash);
+
+  i = 0;
+  while i < 64 {
+    let kb2: u32 = buf_read_byte(key_block, i as u32);
+    let _ = buf_write_byte(msg_scratch, i as u32, kb2 ^ (0x5c as u32));
+    i = i + 1;
+  }
+  i = 0;
+  while i < 20 {
+    let _ = buf_write_byte(msg_scratch, (64 + i) as u32, buf_read_byte(inner_hash, i as u32));
+    i = i + 1;
+  }
+  let _ = sha1_hash(msg_scratch, 84, out);
+  return 0;
+}
+
+// Three HMAC-SHA1 known-answer vectors -- RFC 2202 test cases 1
+// ("Hi There", 20-byte key -- exercises the "key already <= block
+// size" path) and 2 ("Jefe"/"what do ya want for nothing?", a 4-byte
+// key), plus an 80-byte-key case (exercises the "key > 64 bytes, hash
+// it down first" branch neither RFC 2202 case above reaches). Every
+// expected digest here was computed fresh via Python's hmac/hashlib
+// and cross-checked against the RFC's own published values, not typed
+// from memory -- see sha1_self_test's own header comment (in the
+// vendored crypto_hash package) for why that mattered earlier this
+// same round.
+fn hmac_sha1_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let key0: mut ref i64 = dhruva_alloc_bytes(20);
+  let ki0: i64 = 0;
+  while ki0 < 20 { let _ = buf_write_byte(key0, ki0 as u32, 0x0b as u32); ki0 = ki0 + 1; }
+  let msg0: mut ref i64 = dhruva_alloc_bytes(8);
+  let m0: [u8; 8] = [0x48 as u8, 0x69 as u8, 0x20 as u8, 0x54 as u8, 0x68 as u8, 0x65 as u8, 0x72 as u8, 0x65 as u8]; // "Hi There"
+  let mi0: i64 = 0;
+  while mi0 < 8 { let _ = buf_write_byte(msg0, mi0 as u32, m0[mi0] as u32); mi0 = mi0 + 1; }
+  let out0: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = hmac_sha1(key0, 20, msg0, 8, out0);
+  let exp0: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = buf_write_byte(exp0, 0 as u32, 0xb6 as u32);
+  let _ = buf_write_byte(exp0, 1 as u32, 0x17 as u32);
+  let _ = buf_write_byte(exp0, 2 as u32, 0x31 as u32);
+  let _ = buf_write_byte(exp0, 3 as u32, 0x86 as u32);
+  let _ = buf_write_byte(exp0, 4 as u32, 0x55 as u32);
+  let _ = buf_write_byte(exp0, 5 as u32, 0x05 as u32);
+  let _ = buf_write_byte(exp0, 6 as u32, 0x72 as u32);
+  let _ = buf_write_byte(exp0, 7 as u32, 0x64 as u32);
+  let _ = buf_write_byte(exp0, 8 as u32, 0xe2 as u32);
+  let _ = buf_write_byte(exp0, 9 as u32, 0x8b as u32);
+  let _ = buf_write_byte(exp0, 10 as u32, 0xc0 as u32);
+  let _ = buf_write_byte(exp0, 11 as u32, 0xb6 as u32);
+  let _ = buf_write_byte(exp0, 12 as u32, 0xfb as u32);
+  let _ = buf_write_byte(exp0, 13 as u32, 0x37 as u32);
+  let _ = buf_write_byte(exp0, 14 as u32, 0x8c as u32);
+  let _ = buf_write_byte(exp0, 15 as u32, 0x8e as u32);
+  let _ = buf_write_byte(exp0, 16 as u32, 0xf1 as u32);
+  let _ = buf_write_byte(exp0, 17 as u32, 0x46 as u32);
+  let _ = buf_write_byte(exp0, 18 as u32, 0xbe as u32);
+  let _ = buf_write_byte(exp0, 19 as u32, 0x00 as u32);
+  if sha256_bytes_equal(out0, exp0, 20) == 0 { ok = 0; }
+
+  let key1: mut ref i64 = dhruva_alloc_bytes(4);
+  let _ = buf_write_byte(key1, 0 as u32, 0x4a as u32); // 'J'
+  let _ = buf_write_byte(key1, 1 as u32, 0x65 as u32); // 'e'
+  let _ = buf_write_byte(key1, 2 as u32, 0x66 as u32); // 'f'
+  let _ = buf_write_byte(key1, 3 as u32, 0x65 as u32); // 'e'
+  let msg1: mut ref i64 = dhruva_alloc_bytes(28);
+  let m1: [u8; 28] = [
+    0x77 as u8, 0x68 as u8, 0x61 as u8, 0x74 as u8, 0x20 as u8, 0x64 as u8, 0x6f as u8, 0x20 as u8,
+    0x79 as u8, 0x61 as u8, 0x20 as u8, 0x77 as u8, 0x61 as u8, 0x6e as u8, 0x74 as u8, 0x20 as u8,
+    0x66 as u8, 0x6f as u8, 0x72 as u8, 0x20 as u8, 0x6e as u8, 0x6f as u8, 0x74 as u8, 0x68 as u8,
+    0x69 as u8, 0x6e as u8, 0x67 as u8, 0x3f as u8
+  ]; // "what do ya want for nothing?"
+  let mi1: i64 = 0;
+  while mi1 < 28 { let _ = buf_write_byte(msg1, mi1 as u32, m1[mi1] as u32); mi1 = mi1 + 1; }
+  let out1: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = hmac_sha1(key1, 4, msg1, 28, out1);
+  let exp1: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = buf_write_byte(exp1, 0 as u32, 0xef as u32);
+  let _ = buf_write_byte(exp1, 1 as u32, 0xfc as u32);
+  let _ = buf_write_byte(exp1, 2 as u32, 0xdf as u32);
+  let _ = buf_write_byte(exp1, 3 as u32, 0x6a as u32);
+  let _ = buf_write_byte(exp1, 4 as u32, 0xe5 as u32);
+  let _ = buf_write_byte(exp1, 5 as u32, 0xeb as u32);
+  let _ = buf_write_byte(exp1, 6 as u32, 0x2f as u32);
+  let _ = buf_write_byte(exp1, 7 as u32, 0xa2 as u32);
+  let _ = buf_write_byte(exp1, 8 as u32, 0xd2 as u32);
+  let _ = buf_write_byte(exp1, 9 as u32, 0x74 as u32);
+  let _ = buf_write_byte(exp1, 10 as u32, 0x16 as u32);
+  let _ = buf_write_byte(exp1, 11 as u32, 0xd5 as u32);
+  let _ = buf_write_byte(exp1, 12 as u32, 0xf1 as u32);
+  let _ = buf_write_byte(exp1, 13 as u32, 0x84 as u32);
+  let _ = buf_write_byte(exp1, 14 as u32, 0xdf as u32);
+  let _ = buf_write_byte(exp1, 15 as u32, 0x9c as u32);
+  let _ = buf_write_byte(exp1, 16 as u32, 0x25 as u32);
+  let _ = buf_write_byte(exp1, 17 as u32, 0x9a as u32);
+  let _ = buf_write_byte(exp1, 18 as u32, 0x7c as u32);
+  let _ = buf_write_byte(exp1, 19 as u32, 0x79 as u32);
+  if sha256_bytes_equal(out1, exp1, 20) == 0 { ok = 0; }
+
+  // Key > 64 bytes -- exercises the "hash the key down first" branch.
+  let key2: mut ref i64 = dhruva_alloc_bytes(80);
+  let ki2: i64 = 0;
+  while ki2 < 80 { let _ = buf_write_byte(key2, ki2 as u32, 0x78 as u32); ki2 = ki2 + 1; } // 'x' * 80
+  let msg2: mut ref i64 = dhruva_alloc_bytes(12);
+  let m2: [u8; 12] = [0x74 as u8, 0x65 as u8, 0x73 as u8, 0x74 as u8, 0x20 as u8, 0x6d as u8, 0x65 as u8, 0x73 as u8, 0x73 as u8, 0x61 as u8, 0x67 as u8, 0x65 as u8]; // "test message"
+  let mi2: i64 = 0;
+  while mi2 < 12 { let _ = buf_write_byte(msg2, mi2 as u32, m2[mi2] as u32); mi2 = mi2 + 1; }
+  let out2: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = hmac_sha1(key2, 80, msg2, 12, out2);
+  let exp2: mut ref i64 = dhruva_alloc_bytes(20);
+  let _ = buf_write_byte(exp2, 0 as u32, 0x84 as u32);
+  let _ = buf_write_byte(exp2, 1 as u32, 0x27 as u32);
+  let _ = buf_write_byte(exp2, 2 as u32, 0xd2 as u32);
+  let _ = buf_write_byte(exp2, 3 as u32, 0x17 as u32);
+  let _ = buf_write_byte(exp2, 4 as u32, 0x1a as u32);
+  let _ = buf_write_byte(exp2, 5 as u32, 0x9d as u32);
+  let _ = buf_write_byte(exp2, 6 as u32, 0x44 as u32);
+  let _ = buf_write_byte(exp2, 7 as u32, 0x25 as u32);
+  let _ = buf_write_byte(exp2, 8 as u32, 0xa0 as u32);
+  let _ = buf_write_byte(exp2, 9 as u32, 0xd9 as u32);
+  let _ = buf_write_byte(exp2, 10 as u32, 0x24 as u32);
+  let _ = buf_write_byte(exp2, 11 as u32, 0xa5 as u32);
+  let _ = buf_write_byte(exp2, 12 as u32, 0xc1 as u32);
+  let _ = buf_write_byte(exp2, 13 as u32, 0xee as u32);
+  let _ = buf_write_byte(exp2, 14 as u32, 0x07 as u32);
+  let _ = buf_write_byte(exp2, 15 as u32, 0x7c as u32);
+  let _ = buf_write_byte(exp2, 16 as u32, 0x92 as u32);
+  let _ = buf_write_byte(exp2, 17 as u32, 0x4d as u32);
+  let _ = buf_write_byte(exp2, 18 as u32, 0x59 as u32);
+  let _ = buf_write_byte(exp2, 19 as u32, 0xa1 as u32);
+  if sha256_bytes_equal(out2, exp2, 20) == 0 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: HMAC-SHA1 vs RFC 2202 case 1/2 + long-key case -- legacy interop only (WPA2 groundwork)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// PBKDF2-HMAC-SHA1 (task #164, WPA2-PSK groundwork). Unlike
+// pbkdf2_hmac_sha256 above (hardcoded to a single 32-byte output block,
+// since SHA-256's own digest size happens to exactly match that
+// function's only real caller's need), this is the real, general
+// PBKDF2 construction (RFC 8018 5.2): concatenates as many T_i blocks
+// as needed to cover `out_len`, each with its own 4-byte big-endian
+// block-index suffix on the salt. Needed because WPA2-PSK's own PMK
+// is a 256-bit (32-byte) key built from SHA-1's 160-bit (20-byte) PRF
+// output -- genuinely 2 blocks (20+12 truncated), not 1.
+fn pbkdf2_hmac_sha1(password: mut ref i64, password_len: i64, salt: mut ref i64, salt_len: i64, iterations: i64, out: mut ref i64, out_len: i64) -> i64 {
+  if salt_len > 32 {
+    return 0 - 1;
+  }
+  if out_len > 64 {
+    return 0 - 1;
+  }
+  let sc: mut ref i64 = pbkdf2_sha1_salt_ctr_ptr();
+  let u: mut ref i64 = pbkdf2_sha1_u_ptr();
+  let t: mut ref i64 = pbkdf2_sha1_t_ptr();
+
+  let num_blocks: i64 = (out_len + 19) / 20;
+  let block_idx: i64 = 1;
+  let out_pos: i64 = 0;
+  while block_idx <= num_blocks {
+    let i: i64 = 0;
+    while i < salt_len {
+      let _ = buf_write_byte(sc, i as u32, buf_read_byte(salt, i as u32));
+      i = i + 1;
+    }
+    let _ = buf_write_byte(sc, salt_len as u32, ((block_idx >> 24) & 255) as u32);
+    let _ = buf_write_byte(sc, (salt_len + 1) as u32, ((block_idx >> 16) & 255) as u32);
+    let _ = buf_write_byte(sc, (salt_len + 2) as u32, ((block_idx >> 8) & 255) as u32);
+    let _ = buf_write_byte(sc, (salt_len + 3) as u32, (block_idx & 255) as u32);
+
+    let _ = hmac_sha1(password, password_len, sc, salt_len + 4, u);
+    i = 0;
+    while i < 20 {
+      let _ = buf_write_byte(t, i as u32, buf_read_byte(u, i as u32));
+      i = i + 1;
+    }
+
+    let iter: i64 = 1;
+    while iter < iterations {
+      // Safe to alias msg==out==u: see pbkdf2_hmac_sha256's own
+      // identical comment on why hmac_sha1 fully consumes msg before
+      // ever writing out.
+      let _ = hmac_sha1(password, password_len, u, 20, u);
+      let j: i64 = 0;
+      while j < 20 {
+        let tb: u32 = buf_read_byte(t, j as u32);
+        let ub: u32 = buf_read_byte(u, j as u32);
+        let _ = buf_write_byte(t, j as u32, tb ^ ub);
+        j = j + 1;
+      }
+      iter = iter + 1;
+    }
+
+    let copy_n: i64 = out_len - out_pos;
+    if copy_n > 20 {
+      copy_n = 20;
+    }
+    let k: i64 = 0;
+    while k < copy_n {
+      let _ = buf_write_byte(out, (out_pos + k) as u32, buf_read_byte(t, k as u32));
+      k = k + 1;
+    }
+    out_pos = out_pos + copy_n;
+    block_idx = block_idx + 1;
+  }
+  return 0;
+}
+
+// The canonical IEEE 802.11i / WPA2 worked example: PMK =
+// PBKDF2-HMAC-SHA1("password", "IEEE", 4096, 256 bits). Verified THREE
+// independent ways before being hardcoded here (Python's own
+// hashlib.pbkdf2_hmac, a from-scratch manual U/T-loop reimplementation
+// in Python exercising the same 2-block/4096-iteration path this
+// function itself takes, and openssl's own `kdf PBKDF2` command) --
+// not copied from a remembered "well-known" value: an initial recall
+// attempt at this exact vector was WRONG (right for the first 14
+// bytes, diverging after that), caught only by actually computing it.
+fn pbkdf2_hmac_sha1_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let password: mut ref i64 = dhruva_alloc_bytes(8);
+  let pw: [u8; 8] = [0x70 as u8, 0x61 as u8, 0x73 as u8, 0x73 as u8, 0x77 as u8, 0x6f as u8, 0x72 as u8, 0x64 as u8]; // "password"
+  let pi: i64 = 0;
+  while pi < 8 { let _ = buf_write_byte(password, pi as u32, pw[pi] as u32); pi = pi + 1; }
+
+  let ssid: mut ref i64 = dhruva_alloc_bytes(4);
+  let ss: [u8; 4] = [0x49 as u8, 0x45 as u8, 0x45 as u8, 0x45 as u8]; // "IEEE"
+  let si: i64 = 0;
+  while si < 4 { let _ = buf_write_byte(ssid, si as u32, ss[si] as u32); si = si + 1; }
+
+  let pmk: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = pbkdf2_hmac_sha1(password, 8, ssid, 4, 4096, pmk, 32);
+
+  let exp: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = buf_write_byte(exp, 0 as u32, 0xf4 as u32);
+  let _ = buf_write_byte(exp, 1 as u32, 0x2c as u32);
+  let _ = buf_write_byte(exp, 2 as u32, 0x6f as u32);
+  let _ = buf_write_byte(exp, 3 as u32, 0xc5 as u32);
+  let _ = buf_write_byte(exp, 4 as u32, 0x2d as u32);
+  let _ = buf_write_byte(exp, 5 as u32, 0xf0 as u32);
+  let _ = buf_write_byte(exp, 6 as u32, 0xeb as u32);
+  let _ = buf_write_byte(exp, 7 as u32, 0xef as u32);
+  let _ = buf_write_byte(exp, 8 as u32, 0x9e as u32);
+  let _ = buf_write_byte(exp, 9 as u32, 0xbb as u32);
+  let _ = buf_write_byte(exp, 10 as u32, 0x4b as u32);
+  let _ = buf_write_byte(exp, 11 as u32, 0x90 as u32);
+  let _ = buf_write_byte(exp, 12 as u32, 0xb3 as u32);
+  let _ = buf_write_byte(exp, 13 as u32, 0x8a as u32);
+  let _ = buf_write_byte(exp, 14 as u32, 0x5f as u32);
+  let _ = buf_write_byte(exp, 15 as u32, 0x90 as u32);
+  let _ = buf_write_byte(exp, 16 as u32, 0x2e as u32);
+  let _ = buf_write_byte(exp, 17 as u32, 0x83 as u32);
+  let _ = buf_write_byte(exp, 18 as u32, 0xfe as u32);
+  let _ = buf_write_byte(exp, 19 as u32, 0x1b as u32);
+  let _ = buf_write_byte(exp, 20 as u32, 0x13 as u32);
+  let _ = buf_write_byte(exp, 21 as u32, 0x5a as u32);
+  let _ = buf_write_byte(exp, 22 as u32, 0x70 as u32);
+  let _ = buf_write_byte(exp, 23 as u32, 0xe2 as u32);
+  let _ = buf_write_byte(exp, 24 as u32, 0x3a as u32);
+  let _ = buf_write_byte(exp, 25 as u32, 0xed as u32);
+  let _ = buf_write_byte(exp, 26 as u32, 0x76 as u32);
+  let _ = buf_write_byte(exp, 27 as u32, 0x2e as u32);
+  let _ = buf_write_byte(exp, 28 as u32, 0x97 as u32);
+  let _ = buf_write_byte(exp, 29 as u32, 0x10 as u32);
+  let _ = buf_write_byte(exp, 30 as u32, 0xa1 as u32);
+  let _ = buf_write_byte(exp, 31 as u32, 0x2e as u32);
+  if sha256_bytes_equal(pmk, exp, 32) == 0 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: PBKDF2-HMAC-SHA1 vs the IEEE 802.11i WPA2-PSK PMK worked example (password/IEEE/4096/32)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // PBKDF2-HMAC-SHA256 iteration count for real authentication.
 //
 // Round 68 (2026-09-04): raised 200 -> 20000, now that the bug that
@@ -30035,6 +30371,12 @@ fn kernel_main() -> i64 {
   // round 41's SHA-256, ahead of everything su/passwd itself needs.
   let _ = hmac_sha256_self_test();
   let _ = pbkdf2_hmac_sha256_self_test();
+
+  // Task #164 (WiFi/WPA2) groundwork: HMAC-SHA1/PBKDF2-HMAC-SHA1,
+  // legacy-interop-only, needed for WPA2-PSK's own PMK/PRF key
+  // derivation. See sha1_self_test's own header comment.
+  let _ = hmac_sha1_self_test();
+  let _ = pbkdf2_hmac_sha1_self_test();
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   let _ = chacha20_self_test();
