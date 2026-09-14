@@ -255,6 +255,7 @@ kernel=kernel.img
 init_uart_clock=3000000
 enable_uart=1
 disable_splash=1
+uart_2ndstage=1
 ```
 
 (`init_uart_clock` is the critical one — see §3.2. `enable_uart=1` and
@@ -262,7 +263,14 @@ disable_splash=1
 only suppresses the GPU firmware's own rainbow-screen splash before
 this kernel ever runs; it has no effect on round 71's own framebuffer
 driver, which doesn't touch the display until the `fb init` shell
-command is actually run.)
+command is actually run. `uart_2ndstage=1` (added 2026-09-14, during
+the real-hardware UART-delay investigation) makes `start.elf` itself
+emit its own diagnostic text over UART0 during the bootloader stage —
+i.e. genuinely before `kernel.img` is even loaded, let alone running —
+the one gap none of this project's own boot-time diagnostics (LED
+checkpoints, self-test output) can ever see into, since they only run
+once this kernel is already executing. Official, documented Raspberry
+Pi firmware option, not project-specific.)
 
 ### 4.4 Building and copying the kernel image
 
@@ -305,6 +313,18 @@ It requires the device path explicitly (same convention as
 against the known card before touching anything, but this is
 non-destructive by construction — worst case is overwriting the wrong
 device's own `kernel.img`, not data loss on an unrelated disk.
+
+### 4.6 Updating just config.txt on an already-flashed card
+
+Same idea as §4.5, but for `config.txt` instead of `kernel.img` — use
+`update_config.sh` when only a `config.txt` setting changed (e.g.
+toggling `uart_2ndstage`) and a kernel rebuild isn't needed. Same
+safety checks, same non-destructive contract.
+
+```sh
+cd /path/to/dhruvaos
+./update_config.sh /dev/sdX   # whole device, not a partition
+```
 
 ## 5. First boot
 
