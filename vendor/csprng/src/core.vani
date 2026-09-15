@@ -1,0 +1,153 @@
+use "../../crypto_hash/src/core.vani";
+
+// A minimal hash-based (SHA-256) generator: reseed-then-generate-then-
+// ratchet. NOT a NIST SP 800-90A DRBG (Hash_DRBG/HMAC_DRBG/CTR_DRBG) --
+// deliberately simpler, closer in spirit to Fortuna's own generator
+// (hash/cipher the running state with a counter, then ratchet the
+// state forward for forward secrecy) than to a fully-specified NIST
+// construction, matching this project's own "smallest real increment,
+// not the whole surface" discipline. Genuinely a CSPRNG in the sense
+// that matters here: its output is computationally indistinguishable
+// from random PROVIDED the seed itself carries real entropy (supplied
+// by a board-specific hardware entropy source -- BCM2835's own RNG
+// peripheral on Pi 1 -- kept deliberately OUTSIDE this package, same
+// separation this project's own AES/CCMP-vs-vani-aes split already
+// established: hardware register access lives in the board-specific
+// kernel, algorithm logic lives in a hardware-agnostic kosh package).
+
+fn zero32_bytes() -> [u8; 32] {
+  return [0 as u8; 32];
+}
+
+fn csprng_zero8_bytes() -> [u8; 8] {
+  return [0 as u8; 8];
+}
+
+// Fixed 32-byte domain-separation constant for the post-generate
+// ratchet step. All 0xFF -- distinct from the all-zero initial state
+// and from any real counter value, so ratchet/reseed/generate can
+// never accidentally collide on the same hash input by construction.
+// Forward secrecy rationale: after `csprng_generate` ratchets state
+// via SHA256(state || this constant), an attacker who later obtains
+// only the POST-ratchet state cannot recompute this call's own output
+// blocks -- each was SHA256(PRE-ratchet-state || a *different* input,
+// the block counter) -- since SHA-256 is one-way, the post-ratchet
+// state doesn't reveal the pre-ratchet state it was derived from.
+fn csprng_ratchet_const() -> [u8; 32] {
+  return [0xff as u8; 32];
+}
+
+// Big-endian 8-byte counter increment (byte 7 is the LSB) -- the same
+// byte-array increment shape this project's own EAPOL-Key replay
+// counter already uses elsewhere, applied here to the CSPRNG's own
+// internal per-block counter instead.
+fn csprng_counter_increment(counter: mut ref [u8; 8]) -> i64 {
+  let i: i64 = 7;
+  let carry: i64 = 1;
+  while i >= 0 {
+    let v: i64 = (counter[i] as i64) + carry;
+    counter[i] = (v & 255) as u8;
+    if v > 255 {
+      carry = 1;
+    } else {
+      carry = 0;
+    }
+    i = i - 1;
+  }
+  return 0;
+}
+
+// Mixes 32 bytes of fresh entropy into the 32-byte state: state =
+// SHA256(state || entropy). Deliberately MIXES rather than replaces --
+// even entropy an attacker could predict or influence can't move the
+// state to an attacker-chosen value outright, only combine with
+// whatever the state already held.
+fn csprng_reseed(state: mut ref [u8; 32], entropy: ref [u8; 32]) -> i64 {
+  let msg: [u8; 256] = zero256_bytes();
+  let i: i64 = 0;
+  while i < 32 {
+    msg[i] = state[i];
+    i = i + 1;
+  }
+  i = 0;
+  while i < 32 {
+    msg[32 + i] = entropy[i];
+    i = i + 1;
+  }
+  let ctx: Sha256Ctx = sha256_init();
+  let ctx2: Sha256Ctx = sha256_update(ref ctx, mut ref msg, 64);
+  let digest: [u8; 32] = sha256_finalize(ref ctx2);
+  i = 0;
+  while i < 32 {
+    state[i] = digest[i];
+    i = i + 1;
+  }
+  return 0;
+}
+
+const CSPRNG_MAX_OUTPUT: i64 = 64;
+
+// Generates `n` (<= CSPRNG_MAX_OUTPUT) pseudo-random bytes into `out`.
+// Each 32-byte block is SHA256(state || counter); counter is
+// incremented after every block (whether fully consumed or the last
+// one truncated) -- the same "hash the state with a running counter"
+// principle as CTR-mode block-cipher keystreams, just with SHA-256
+// standing in for the cipher. After the requested bytes are produced,
+// `state` is ratcheted forward (see csprng_ratchet_const's own
+// comment). Returns 0 on success, 0 - 1 if `n` is out of range.
+fn csprng_generate(state: mut ref [u8; 32], counter: mut ref [u8; 8], out: mut ref [u8; 64], n: i64) -> i64 {
+  if n < 0 { return 0 - 1; }
+  if n > CSPRNG_MAX_OUTPUT { return 0 - 1; }
+
+  let produced: i64 = 0;
+  while produced < n {
+    let msg: [u8; 256] = zero256_bytes();
+    let i: i64 = 0;
+    while i < 32 {
+      msg[i] = state[i];
+      i = i + 1;
+    }
+    i = 0;
+    while i < 8 {
+      msg[32 + i] = counter[i];
+      i = i + 1;
+    }
+    let ctx: Sha256Ctx = sha256_init();
+    let ctx2: Sha256Ctx = sha256_update(ref ctx, mut ref msg, 40);
+    let block: [u8; 32] = sha256_finalize(ref ctx2);
+    let _ = csprng_counter_increment(counter);
+
+    let remaining: i64 = n - produced;
+    let take: i64 = 32;
+    if remaining < 32 { take = remaining; }
+    i = 0;
+    while i < take {
+      out[produced + i] = block[i];
+      i = i + 1;
+    }
+    produced = produced + take;
+  }
+
+  let ratchet: [u8; 32] = csprng_ratchet_const();
+  let rmsg: [u8; 256] = zero256_bytes();
+  let ri: i64 = 0;
+  while ri < 32 {
+    rmsg[ri] = state[ri];
+    ri = ri + 1;
+  }
+  ri = 0;
+  while ri < 32 {
+    rmsg[32 + ri] = ratchet[ri];
+    ri = ri + 1;
+  }
+  let rctx: Sha256Ctx = sha256_init();
+  let rctx2: Sha256Ctx = sha256_update(ref rctx, mut ref rmsg, 64);
+  let rdigest: [u8; 32] = sha256_finalize(ref rctx2);
+  let i2: i64 = 0;
+  while i2 < 32 {
+    state[i2] = rdigest[i2];
+    i2 = i2 + 1;
+  }
+
+  return 0;
+}

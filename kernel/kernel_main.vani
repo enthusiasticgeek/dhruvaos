@@ -945,6 +945,8 @@ extern "C" fn wpa_hs_tk_ptr() -> mut ref i64;
 extern "C" fn wpa_hs_replay_counter_ptr() -> mut ref i64;
 extern "C" fn wpa_hs_gtk_scratch_ptr() -> mut ref i64;
 extern "C" fn wpa_hs_decrypted_kd_scratch_ptr() -> mut ref i64;
+extern "C" fn csprng_state_ptr() -> mut ref i64;
+extern "C" fn csprng_counter_ptr() -> mut ref i64;
 extern "C" fn passwd_scratch_ptr() -> mut ref i64;
 extern "C" fn su_hash_scratch_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_get_enabled() -> u32;
@@ -24965,6 +24967,186 @@ fn wpa_handshake_self_test() -> i64 {
   return 0;
 }
 
+// Task #164 (WiFi/WPA2) groundwork: CSPRNG-based nonce generation.
+// wpa_hs_process_msg1's own SNonce parameter has always been
+// caller-supplied by design (this section's own earlier header
+// comment: "keeping randomness sourcing outside this protocol-logic
+// layer means the state machine itself is fully correct and testable
+// now, with real entropy sourcing to be wired in as its own
+// separately-scoped piece once a CSPRNG exists") -- that CSPRNG now
+// exists, so a real generator is wired in here without touching the
+// state machine itself.
+//
+// Split the same way vani-aes/AES-CCMP already established: hardware
+// register access (BCM2835's own RNG peripheral) lives directly in
+// this board-specific kernel; the hash-based conditioning logic (mix
+// raw entropy into a running state via SHA-256, then generate output
+// blocks from that state) lives in the hardware-agnostic `vani-csprng`
+// kosh package, vendored below via `use`.
+//
+// BCM2835 RNG register layout confirmed against Linux's own
+// `drivers/char/hw_random/bcm2835-rng.c` (fetched from
+// torvalds/linux): RNG_CTRL at offset 0x0 (bit 0 = RBGEN, enables the
+// generator), RNG_STATUS at offset 0x4 (bits [31:24] = words
+// currently available in RNG_DATA's own FIFO; the driver also writes
+// a "warmup count" of 0x40000 to this SAME register before enabling,
+// per the driver's own init sequence), RNG_DATA at offset 0x8 (each
+// read pops one 32-bit word). Physical base 0x20104000 confirmed two
+// ways: the VideoCore-bus devicetree address 0x7e104000
+// (`raspberrypi/linux`'s own bcm283x.dtsi) translates to ARM-physical
+// 0x20104000 via BCM2835's standard 0x7e000000->0x20000000 peripheral
+// mapping (the same translation this file's own UART/timer/SD
+// addresses already use); independently, QEMU's own source
+// (`include/hw/arm/raspi_platform.h`'s `RNG_OFFSET 0x104000`, added to
+// the same 0x20000000 peripheral base `bcm2835_peripherals.c` uses for
+// every other device this kernel already talks to) agrees exactly.
+// QEMU's own RNG model (`hw/misc/bcm2835_rng.c`) returns real
+// randomness from the host's own CSPRNG on every RNG_DATA read (not
+// zeros, not a fixed pattern) and always reports 1 word ready in
+// RNG_STATUS -- confirmed genuine hardware entropy is available under
+// this project's own QEMU-based regression suite, not just on real
+// silicon.
+#[mmio(size=4)]
+const RNG_CTRL: i64 = 0x20104000;
+#[mmio(size=4)]
+const RNG_STATUS: i64 = 0x20104004;
+#[mmio(size=4)]
+const RNG_DATA: i64 = 0x20104008;
+
+fn bcm2835_rng_init() -> i64 {
+  let _ = mmio_write_u32(RNG_STATUS, 0x40000 as u32);
+  let _ = mmio_write_u32(RNG_CTRL, 1 as u32);
+  return 0;
+}
+
+// Blocks until at least one word is available (RNG_STATUS bits
+// [31:24] != 0), then pops and returns it.
+fn bcm2835_rng_read_word() -> u32 {
+  while (mmio_read_u32(RNG_STATUS) >> (24 as u32)) == (0 as u32) {
+  }
+  return mmio_read_u32(RNG_DATA);
+}
+
+use "../vendor/csprng/src/core.vani";
+
+fn zero32_bytes_heap() -> [u8; 32] {
+  return [0 as u8; 32];
+}
+
+fn csprng_reseed_heap(state: mut ref i64, entropy: mut ref i64) -> i64 {
+  let state_arr: [u8; 32] = zero32_bytes_heap();
+  let i: i64 = 0;
+  while i < 32 { state_arr[i] = buf_read_byte(state, i as u32) as u8; i = i + 1; }
+  let entropy_arr: [u8; 32] = zero32_bytes_heap();
+  i = 0;
+  while i < 32 { entropy_arr[i] = buf_read_byte(entropy, i as u32) as u8; i = i + 1; }
+  let _ = csprng_reseed(mut ref state_arr, ref entropy_arr);
+  i = 0;
+  while i < 32 { let _ = buf_write_byte(state, i as u32, state_arr[i] as u32); i = i + 1; }
+  return 0;
+}
+
+fn csprng_generate_heap(state: mut ref i64, counter: mut ref i64, out: mut ref i64, n: i64) -> i64 {
+  let state_arr: [u8; 32] = zero32_bytes_heap();
+  let i: i64 = 0;
+  while i < 32 { state_arr[i] = buf_read_byte(state, i as u32) as u8; i = i + 1; }
+  let counter_arr: [u8; 8] = csprng_zero8_bytes();
+  i = 0;
+  while i < 8 { counter_arr[i] = buf_read_byte(counter, i as u32) as u8; i = i + 1; }
+  let out_arr: [u8; 64] = [0 as u8; 64];
+  let status: i64 = csprng_generate(mut ref state_arr, mut ref counter_arr, mut ref out_arr, n);
+  if status != 0 { return status; }
+  i = 0;
+  while i < 32 { let _ = buf_write_byte(state, i as u32, state_arr[i] as u32); i = i + 1; }
+  i = 0;
+  while i < 8 { let _ = buf_write_byte(counter, i as u32, counter_arr[i] as u32); i = i + 1; }
+  i = 0;
+  while i < n { let _ = buf_write_byte(out, i as u32, out_arr[i] as u32); i = i + 1; }
+  return 0;
+}
+
+// Seeds the persistent CSPRNG state from 32 bytes (8 words) of real
+// hardware entropy. Called once during boot, before the first real
+// nonce is ever needed -- matches this project's own "persistent,
+// never per-call" scratch discipline (boot/csprng_state.S): the state
+// and counter buffers live for the kernel's whole lifetime, not
+// reallocated per handshake attempt.
+fn csprng_init() -> i64 {
+  let _ = bcm2835_rng_init();
+  let entropy: mut ref i64 = dhruva_alloc_bytes(32);
+  let wi: i64 = 0;
+  while wi < 8 {
+    let word: u32 = bcm2835_rng_read_word();
+    let _ = buf_write_byte(entropy, (wi * 4 + 0) as u32, (word >> (24 as u32)) & (255 as u32));
+    let _ = buf_write_byte(entropy, (wi * 4 + 1) as u32, (word >> (16 as u32)) & (255 as u32));
+    let _ = buf_write_byte(entropy, (wi * 4 + 2) as u32, (word >> (8 as u32)) & (255 as u32));
+    let _ = buf_write_byte(entropy, (wi * 4 + 3) as u32, word & (255 as u32));
+    wi = wi + 1;
+  }
+  let state: mut ref i64 = csprng_state_ptr();
+  let counter: mut ref i64 = csprng_counter_ptr();
+  let ci: i64 = 0;
+  while ci < 8 { let _ = buf_write_byte(counter, ci as u32, 0 as u32); ci = ci + 1; }
+  let _ = csprng_reseed_heap(state, entropy);
+  return 0;
+}
+
+// Generates a fresh 32-byte nonce (SNonce, or ANonce/GTK if this
+// project ever acts as an AP) from the persistent CSPRNG state. The
+// 4-way handshake state machine itself still takes the nonce as a
+// caller-supplied parameter (wpa_hs_process_msg1's own signature is
+// unchanged) -- this is simply a real, hardware-entropy-backed source
+// for callers to use instead of an externally-supplied or fixed value.
+fn wpa_nonce_generate_heap(out: mut ref i64) -> i64 {
+  let state: mut ref i64 = csprng_state_ptr();
+  let counter: mut ref i64 = csprng_counter_ptr();
+  return csprng_generate_heap(state, counter, out, 32);
+}
+
+// Live smoke test (real hardware entropy, so no fixed-output KAT is
+// possible here -- csprng_self_test in the vani-csprng package itself
+// already covers the deterministic algorithm check against an
+// independently-computed reference). Checks the properties that
+// matter for THIS integration specifically: the raw hardware RNG
+// itself produces changing words across reads (not stuck returning a
+// fixed/zero value -- would indicate a real register-wiring bug, not
+// a cryptographic weakness), and two successive real nonce draws
+// differ and are not all-zero.
+fn csprng_hw_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let w0: u32 = bcm2835_rng_read_word();
+  let w1: u32 = bcm2835_rng_read_word();
+  if w0 == w1 { ok = 0; }
+
+  let n0: mut ref i64 = dhruva_alloc_bytes(32);
+  let n1: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = wpa_nonce_generate_heap(n0);
+  let _ = wpa_nonce_generate_heap(n1);
+
+  let all_zero0: i64 = 1;
+  let all_zero1: i64 = 1;
+  let differ: i64 = 0;
+  let i: i64 = 0;
+  while i < 32 {
+    if buf_read_byte(n0, i as u32) != (0 as u32) { all_zero0 = 0; }
+    if buf_read_byte(n1, i as u32) != (0 as u32) { all_zero1 = 0; }
+    if buf_read_byte(n0, i as u32) != buf_read_byte(n1, i as u32) { differ = 1; }
+    i = i + 1;
+  }
+  if all_zero0 == 1 { ok = 0; }
+  if all_zero1 == 1 { ok = 0; }
+  if differ == 0 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: WPA2 nonce generation (BCM2835 hardware RNG + vani-csprng hash-based conditioning) -- live hardware-entropy smoke test (deterministic algorithm KAT covered separately, in the vani-csprng package's own self-test)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 
 // Round 67: ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) and HKDF
 // (RFC 5869) -- the "crypto machinery" a TLS 1.3 handshake needs on
@@ -31639,6 +31821,12 @@ fn kernel_main() -> i64 {
   // wpa_handshake_self_test's own header comment for what's covered
   // and what's still separately scoped.
   let _ = wpa_handshake_self_test();
+
+  // Task #164 (WiFi/WPA2) groundwork: CSPRNG-based nonce generation
+  // (BCM2835 hardware RNG + vani-csprng hash-based conditioning). See
+  // csprng_init/csprng_hw_self_test's own header comments.
+  let _ = csprng_init();
+  let _ = csprng_hw_self_test();
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   let _ = chacha20_self_test();

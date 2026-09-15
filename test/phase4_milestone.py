@@ -32,7 +32,7 @@ import time
 
 QEMU_BIN = "qemu-system-arm"
 MACHINE = "raspi1ap"
-SETTLE_S = 12  # inter-command delay; a 6s value missed the final "eval"
+SETTLE_S = 14  # inter-command delay; a 6s value missed the final "eval"
                # command once in testing (task_f and task_e/GC share one
                # best-effort priority band, so a GC pass in progress right
                # when a command arrives can push task_f's own turn out a
@@ -56,6 +56,25 @@ SETTLE_S = 12  # inter-command delay; a 6s value missed the final "eval"
                # logic bug in the newly-added crypto (each of which
                # already asserts its own hardcoded-correct KAT output
                # and would abort loudly if wrong).
+               #
+               # Raised 12 -> 14 (2026-09-14, task #164 CSPRNG groundwork):
+               # the same class of regression, same root cause. Adding
+               # csprng_init/csprng_hw_self_test to the boot sequence
+               # pushed real "PASS" later again -- confirmed live: 2 of 3
+               # regression runs at the old value failed a LATER command
+               # than before (previously "ping"; now "diagnose" -- the
+               # kernel's own diagnose output was visibly truncated
+               # before its "task run-ticks" line, i.e. cut off by
+               # end-of-session teardown, not garbled by the separately-
+               # tracked shell-echo-interleave gap, which this run's log
+               # ALSO happened to show independently on "write" -- two
+               # distinct symptoms in the same log, not one). A uniform,
+               # constant per-command delay increase is the correct fix
+               # for "everything downstream lands a little later than it
+               # used to" (unlike the interleave gap, which no SETTLE_S
+               # value can fix -- see
+               # project_dhruva_shell_echo_interleave_gap_2026_09_14 in
+               # project memory).
 
 
 def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
