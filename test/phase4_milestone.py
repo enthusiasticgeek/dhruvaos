@@ -32,12 +32,30 @@ import time
 
 QEMU_BIN = "qemu-system-arm"
 MACHINE = "raspi1ap"
-SETTLE_S = 8  # inter-command delay; a 6s value missed the final "eval"
-              # command once in testing (task_f and task_e/GC share one
-              # best-effort priority band, so a GC pass in progress right
-              # when a command arrives can push task_f's own turn out a
-              # little further than usual -- ordinary scheduling
-              # variance, not a functional break)
+SETTLE_S = 12  # inter-command delay; a 6s value missed the final "eval"
+               # command once in testing (task_f and task_e/GC share one
+               # best-effort priority band, so a GC pass in progress right
+               # when a command arrives can push task_f's own turn out a
+               # little further than usual -- ordinary scheduling
+               # variance, not a functional break). Raised 8 -> 12
+               # (2026-09-14, task #164): this file's own FIRST send()
+               # is anchored to process-launch time, not to an observed
+               # "PASS" marker (unlike test/shell_interactive_check.py's
+               # event-driven approach) -- the boot self-test suite has
+               # grown substantially since 8 was chosen (SHA-1, HMAC-
+               # SHA1, PBKDF2-HMAC-SHA1, and AES-CCMP all added this
+               # session, the last of which runs real AES-128 block
+               # operations), pushing real "PASS" later than 8s covers.
+               # Confirmed live: "ping 0.0.0.0" (an early command in
+               # this file's own fixed sequence) failed on 2 of 2 runs
+               # at the old value, with the boot log showing a stray
+               # "unknown command" response and a visibly garbled
+               # command echo right after it -- both consistent with
+               # commands landing while the kernel hadn't yet fully
+               # settled into steady-state interactive operation, not a
+               # logic bug in the newly-added crypto (each of which
+               # already asserts its own hardcoded-correct KAT output
+               # and would abort loudly if wrong).
 
 
 def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
