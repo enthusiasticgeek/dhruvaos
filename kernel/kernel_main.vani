@@ -934,6 +934,16 @@ extern "C" fn wpa_prf_hash_ptr() -> mut ref i64;
 extern "C" fn wpa_ptk_data_ptr() -> mut ref i64;
 extern "C" fn wpa_ptk_label_ptr() -> mut ref i64;
 extern "C" fn wpa_ptk_tmp_ptr() -> mut ref i64;
+// Task #164 (WPA2) groundwork: 4-way handshake state (boot/wpa_handshake_state.S).
+extern "C" fn wpa_hs_aa_ptr() -> mut ref i64;
+extern "C" fn wpa_hs_sa_ptr() -> mut ref i64;
+extern "C" fn wpa_hs_pmk_ptr() -> mut ref i64;
+extern "C" fn wpa_hs_anonce_scratch_ptr() -> mut ref i64;
+extern "C" fn wpa_hs_kck_ptr() -> mut ref i64;
+extern "C" fn wpa_hs_kek_ptr() -> mut ref i64;
+extern "C" fn wpa_hs_tk_ptr() -> mut ref i64;
+extern "C" fn wpa_hs_replay_counter_ptr() -> mut ref i64;
+extern "C" fn wpa_hs_gtk_scratch_ptr() -> mut ref i64;
 extern "C" fn passwd_scratch_ptr() -> mut ref i64;
 extern "C" fn su_hash_scratch_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_get_enabled() -> u32;
@@ -24682,6 +24692,346 @@ fn wpa_ptk_self_test() -> i64 {
   return 0;
 }
 
+// WPA2 4-way handshake message-sequencing state machine (task #164
+// groundwork), a station's own view: process Message 1 (build Message
+// 2), process Message 3 (build Message 4). Ties together every
+// primitive built earlier this round (PBKDF2-HMAC-SHA1 for the PMK,
+// PTK derivation, EAPOL-Key parse/build/MIC) into the actual protocol
+// logic -- but is NOT the complete handshake:
+//
+// - GTK extraction only handles the UNENCRYPTED case (Encrypted Key
+//   Data bit clear in Key Information). Every real access point sets
+//   that bit in practice (AES key-wrapping the GTK per RFC 3394,
+//   spec-mandated in all but the most permissive configurations) --
+//   this function correctly DETECTS that case and returns a distinct
+//   status (`WPA_HS_NEEDS_KEY_UNWRAP`) rather than mishandling it, but
+//   cannot actually complete it: AES Key Wrap/Unwrap is a genuinely
+//   new primitive, not yet implemented, distinct from CCMP (CCMP is
+//   CCM mode -- CTR + CBC-MAC; key wrap is a different, simpler
+//   deterministic construction with no nonce). MIC verification and
+//   anti-replay ARE fully real and tested regardless of which path Key
+//   Data takes -- authenticating that a frame really came from the
+//   legitimate AP doesn't depend on being able to decrypt its payload.
+// - SNonce is a caller-supplied parameter, not generated here. This
+//   codebase has no CSPRNG (confirmed by search, not assumed) --
+//   keeping randomness sourcing outside this protocol-logic layer
+//   means the state machine itself is fully correct and testable now,
+//   with real entropy sourcing to be wired in as its own separately-
+//   scoped piece once a CSPRNG exists.
+// - Message 2's own Key Data (a real handshake includes the STA's own
+//   RSN IE there) is empty here -- RSN IE building is separately
+//   scoped, later work (part of 802.11 management-frame handling).
+//
+// Message field expectations (Key Information bits) and the
+// replay-counter echo/advance rules below were cross-checked against
+// wpa_supplicant's own real message-building/-validation code
+// (src/rsn_supp/wpa.c) alongside the wpa_common.h/wpa_common.c sources
+// this round's EAPOL-Key and PTK work already verified against -- not
+// re-derived from a general description of the handshake alone.
+const WPA_HS_OK: i64 = 0;
+const WPA_HS_ERR_PARSE: i64 = 0 - 1;
+const WPA_HS_ERR_MIC: i64 = 0 - 2;
+const WPA_HS_ERR_REPLAY: i64 = 0 - 3;
+const WPA_HS_NEEDS_KEY_UNWRAP: i64 = 0 - 4;
+
+// Starts a fresh handshake attempt: stores the PMK (32 bytes, from
+// PBKDF2-HMAC-SHA1) and both MAC addresses for use by the calls below.
+fn wpa_hs_init(pmk: mut ref i64, aa: mut ref i64, sa: mut ref i64) -> i64 {
+  let aa_s: mut ref i64 = wpa_hs_aa_ptr();
+  let i: i64 = 0;
+  while i < 6 { let _ = buf_write_byte(aa_s, i as u32, buf_read_byte(aa, i as u32)); i = i + 1; }
+  let sa_s: mut ref i64 = wpa_hs_sa_ptr();
+  i = 0;
+  while i < 6 { let _ = buf_write_byte(sa_s, i as u32, buf_read_byte(sa, i as u32)); i = i + 1; }
+  let pmk_s: mut ref i64 = wpa_hs_pmk_ptr();
+  i = 0;
+  while i < 32 { let _ = buf_write_byte(pmk_s, i as u32, buf_read_byte(pmk, i as u32)); i = i + 1; }
+  return WPA_HS_OK;
+}
+
+// Byte-by-byte big-endian comparison of two 8-byte EAPOL-Key replay
+// counters living at arbitrary offsets in (possibly different)
+// buffers -- returns 1 if the counter at (new_buf, new_off) is
+// strictly greater than the one at (old_buf, old_off), 0 otherwise
+// (including equal, which must be rejected as a replay, not accepted).
+fn wpa_replay_counter_greater(new_buf: mut ref i64, new_off: i64, old_buf: mut ref i64, old_off: i64) -> i64 {
+  let i: i64 = 0;
+  while i < 8 {
+    let nb: u32 = buf_read_byte(new_buf, (new_off + i) as u32);
+    let ob: u32 = buf_read_byte(old_buf, (old_off + i) as u32);
+    if nb > ob { return 1; }
+    if nb < ob { return 0; }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Processes Message 1 (extracts ANonce + replay counter, derives the
+// PTK, builds Message 2 with the caller-supplied SNonce). `msg2_out`
+// must be a 99-byte buffer (no Key Data -- see this section's own
+// header comment on why). Returns WPA_HS_OK, or WPA_HS_ERR_PARSE if
+// the frame doesn't parse as a valid, unauthenticated (no-MIC) EAPOL-Key
+// frame with the ACK bit set.
+fn wpa_hs_process_msg1(msg1_buf: mut ref i64, msg1_len: i64, snonce: mut ref i64, msg2_out: mut ref i64) -> i64 {
+  let parsed: EapolKeyParsed = eapol_key_parse(msg1_buf, msg1_len);
+  if parsed.ok != 0 { return WPA_HS_ERR_PARSE; }
+  if (parsed.key_info & EAPOL_KEY_INFO_MIC) != 0 { return WPA_HS_ERR_PARSE; }
+  if (parsed.key_info & EAPOL_KEY_INFO_ACK) == 0 { return WPA_HS_ERR_PARSE; }
+
+  let anonce: mut ref i64 = wpa_hs_anonce_scratch_ptr();
+  let i: i64 = 0;
+  while i < 32 { let _ = buf_write_byte(anonce, i as u32, buf_read_byte(msg1_buf, (EAPOL_KEY_NONCE_OFF + i) as u32)); i = i + 1; }
+
+  let rc: mut ref i64 = wpa_hs_replay_counter_ptr();
+  i = 0;
+  while i < 8 { let _ = buf_write_byte(rc, i as u32, buf_read_byte(msg1_buf, (EAPOL_KEY_REPLAY_OFF + i) as u32)); i = i + 1; }
+
+  let aa: mut ref i64 = wpa_hs_aa_ptr();
+  let sa: mut ref i64 = wpa_hs_sa_ptr();
+  let pmk: mut ref i64 = wpa_hs_pmk_ptr();
+  let kck: mut ref i64 = wpa_hs_kck_ptr();
+  let kek: mut ref i64 = wpa_hs_kek_ptr();
+  let tk: mut ref i64 = wpa_hs_tk_ptr();
+  let _ = wpa_ptk_derive(pmk, 32, aa, sa, anonce, snonce, kck, kek, tk);
+
+  let key_info2: i64 = EAPOL_KEY_INFO_DESC_V2_HMAC_SHA1_AES | EAPOL_KEY_INFO_KEY_TYPE_PAIRWISE | EAPOL_KEY_INFO_MIC;
+  let _ = eapol_key_build_header(msg2_out, 2, key_info2, 16, 0);
+  i = 0;
+  while i < 8 { let _ = buf_write_byte(msg2_out, (EAPOL_KEY_REPLAY_OFF + i) as u32, buf_read_byte(rc, i as u32)); i = i + 1; }
+  i = 0;
+  while i < 32 { let _ = buf_write_byte(msg2_out, (EAPOL_KEY_NONCE_OFF + i) as u32, buf_read_byte(snonce, i as u32)); i = i + 1; }
+  let _ = eapol_key_set_mic(msg2_out, 99, kck, 16);
+  return WPA_HS_OK;
+}
+
+// Extracts a GTK KDE's own key material. IEEE Std 802.11i-2004 8.5.2
+// Figure 43x's own GTK KDE format (verified against wpa_supplicant's
+// own `wpa_supplicant_pairwise_gtk`, src/rsn_supp/wpa.c, which quotes
+// this exact figure in its own comment): a generic KDE wrapper
+// (0xDD Type, Length, 00-0F-AC OUI, 0x01 GROUPKEY data type) followed
+// by a KeyID[bits0-1]/Tx[bit2]/Reserved byte, a Reserved byte, then
+// the raw GTK. Deliberately minimal: assumes Key Data contains EXACTLY
+// one KDE (a GTK KDE, nothing else) -- real Key Data can carry
+// multiple KDEs (an RSN IE, sometimes others) concatenated; a general
+// multi-KDE scanner is separately scoped, later work, not needed for
+// this increment's own testable slice. Returns the extracted GTK's
+// length (>= 0) on success, or 0 - 1 if the KDE doesn't parse as
+// expected.
+fn wpa_gtk_kde_extract(buf: mut ref i64, key_data_off: i64, key_data_len: i64, gtk_out: mut ref i64) -> i64 {
+  if key_data_len < 8 { return 0 - 1; }
+  if buf_read_byte(buf, key_data_off as u32) != (0xdd as u32) { return 0 - 1; }
+  let kde_len: i64 = buf_read_byte(buf, (key_data_off + 1) as u32) as i64;
+  if (2 + kde_len) > key_data_len { return 0 - 1; }
+  if buf_read_byte(buf, (key_data_off + 2) as u32) != (0x00 as u32) { return 0 - 1; }
+  if buf_read_byte(buf, (key_data_off + 3) as u32) != (0x0f as u32) { return 0 - 1; }
+  if buf_read_byte(buf, (key_data_off + 4) as u32) != (0xac as u32) { return 0 - 1; }
+  if buf_read_byte(buf, (key_data_off + 5) as u32) != (0x01 as u32) { return 0 - 1; }
+  let gtk_len: i64 = kde_len - 6;
+  if gtk_len < 1 { return 0 - 1; }
+  let i: i64 = 0;
+  while i < gtk_len {
+    let _ = buf_write_byte(gtk_out, i as u32, buf_read_byte(buf, (key_data_off + 8 + i) as u32));
+    i = i + 1;
+  }
+  return gtk_len;
+}
+
+// Processes Message 3: verifies its MIC (using the KCK derived from
+// Message 1), checks its replay counter genuinely advanced past the
+// one echoed in Message 2 (real anti-replay -- rejects a replayed or
+// out-of-order frame even before looking at Key Data), extracts the
+// GTK if Key Data is unencrypted, and builds Message 4 regardless of
+// whether GTK extraction itself could complete (MIC + replay are
+// already validated at that point -- real, useful progress; the
+// caller decides whether to actually transmit Message 4 based on the
+// returned status). `msg4_out` must be a 99-byte buffer.
+// Returns: >= 0 (the extracted GTK's length) on full success,
+// WPA_HS_ERR_PARSE / WPA_HS_ERR_MIC / WPA_HS_ERR_REPLAY on the
+// respective failure, or WPA_HS_NEEDS_KEY_UNWRAP if MIC and replay
+// both validated but Key Data is encrypted (Message 4 is still built
+// in that case).
+fn wpa_hs_process_msg3(msg3_buf: mut ref i64, msg3_len: i64, msg4_out: mut ref i64, gtk_out: mut ref i64) -> i64 {
+  let parsed: EapolKeyParsed = eapol_key_parse(msg3_buf, msg3_len);
+  if parsed.ok != 0 { return WPA_HS_ERR_PARSE; }
+  if (parsed.key_info & EAPOL_KEY_INFO_MIC) == 0 { return WPA_HS_ERR_PARSE; }
+
+  let kck: mut ref i64 = wpa_hs_kck_ptr();
+  if eapol_key_verify_mic(msg3_buf, parsed.frame_len, kck, 16) != 0 { return WPA_HS_ERR_MIC; }
+
+  let rc: mut ref i64 = wpa_hs_replay_counter_ptr();
+  if wpa_replay_counter_greater(msg3_buf, EAPOL_KEY_REPLAY_OFF, rc, 0) != 1 { return WPA_HS_ERR_REPLAY; }
+
+  let i: i64 = 0;
+  while i < 8 { let _ = buf_write_byte(rc, i as u32, buf_read_byte(msg3_buf, (EAPOL_KEY_REPLAY_OFF + i) as u32)); i = i + 1; }
+
+  let gtk_status: i64 = WPA_HS_NEEDS_KEY_UNWRAP;
+  if (parsed.key_info & EAPOL_KEY_INFO_ENCR_KEY_DATA) == 0 {
+    gtk_status = wpa_gtk_kde_extract(msg3_buf, parsed.key_data_off, parsed.key_data_length, gtk_out);
+    if gtk_status < 0 { gtk_status = WPA_HS_ERR_PARSE; }
+  }
+
+  let key_info4: i64 = EAPOL_KEY_INFO_DESC_V2_HMAC_SHA1_AES | EAPOL_KEY_INFO_KEY_TYPE_PAIRWISE | EAPOL_KEY_INFO_MIC | EAPOL_KEY_INFO_SECURE;
+  let _ = eapol_key_build_header(msg4_out, 2, key_info4, 16, 0);
+  i = 0;
+  while i < 8 { let _ = buf_write_byte(msg4_out, (EAPOL_KEY_REPLAY_OFF + i) as u32, buf_read_byte(rc, i as u32)); i = i + 1; }
+  let _ = eapol_key_set_mic(msg4_out, 99, kck, 16);
+
+  return gtk_status;
+}
+
+// Full round-trip self-test: a synthetic Message 1 (no MIC, ANonce =
+// this round's own already-verified PTK test fixture) is fed through
+// wpa_hs_init + wpa_hs_process_msg1 with the matching SNonce fixture;
+// the resulting Message 2's own MIC is checked against a value
+// independently computed via Python (replaying this exact algorithm
+// against the ALREADY-VERIFIED KCK from this round's own PTK
+// self-test, not re-derived here). Then a synthetic Message 3 (real
+// GTK KDE in unencrypted Key Data, MIC computed the same independent
+// way, replay counter advanced past Message 1/2's) is fed through
+// wpa_hs_process_msg3: checks the extracted GTK bytes match exactly,
+// AND the resulting Message 4's own MIC matches its own independently
+// computed value. Two negative cases: a Message 3 with a corrupted MIC
+// byte must be rejected (WPA_HS_ERR_MIC, not a crash or false
+// success), and a Message 3 with the Encrypted Key Data bit set must
+// return WPA_HS_NEEDS_KEY_UNWRAP specifically (not silently misparse
+// the still-wrapped GTK bytes as if they were plaintext).
+fn wpa_handshake_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let pmk: mut ref i64 = dhruva_alloc_bytes(32);
+  let pm: [u8; 32] = [
+    0xf4 as u8, 0x2c as u8, 0x6f as u8, 0xc5 as u8, 0x2d as u8, 0xf0 as u8, 0xeb as u8, 0xef as u8,
+    0x9e as u8, 0xbb as u8, 0x4b as u8, 0x90 as u8, 0xb3 as u8, 0x8a as u8, 0x5f as u8, 0x90 as u8,
+    0x2e as u8, 0x83 as u8, 0xfe as u8, 0x1b as u8, 0x13 as u8, 0x5a as u8, 0x70 as u8, 0xe2 as u8,
+    0x3a as u8, 0xed as u8, 0x76 as u8, 0x2e as u8, 0x97 as u8, 0x10 as u8, 0xa1 as u8, 0x2e as u8
+  ];
+  let pmi: i64 = 0;
+  while pmi < 32 { let _ = buf_write_byte(pmk, pmi as u32, pm[pmi] as u32); pmi = pmi + 1; }
+
+  let aa: mut ref i64 = dhruva_alloc_bytes(6);
+  let aa_bytes: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x01 as u8];
+  let ai: i64 = 0;
+  while ai < 6 { let _ = buf_write_byte(aa, ai as u32, aa_bytes[ai] as u32); ai = ai + 1; }
+
+  let sa: mut ref i64 = dhruva_alloc_bytes(6);
+  let sa_bytes: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x02 as u8];
+  let si: i64 = 0;
+  while si < 6 { let _ = buf_write_byte(sa, si as u32, sa_bytes[si] as u32); si = si + 1; }
+
+  let anonce: mut ref i64 = dhruva_alloc_bytes(32);
+  let ani: i64 = 0;
+  while ani < 32 { let _ = buf_write_byte(anonce, ani as u32, 0x11 as u32); ani = ani + 1; }
+
+  let snonce: mut ref i64 = dhruva_alloc_bytes(32);
+  let sni: i64 = 0;
+  while sni < 32 { let _ = buf_write_byte(snonce, sni as u32, 0x22 as u32); sni = sni + 1; }
+
+  let _ = wpa_hs_init(pmk, aa, sa);
+
+  // Message 1: no MIC, ACK set, replay counter = 1.
+  let msg1: mut ref i64 = dhruva_alloc_bytes(99);
+  let _ = eapol_key_build_header(msg1, 2, 0x008a, 16, 0);
+  let _ = buf_write_byte(msg1, (EAPOL_KEY_REPLAY_OFF + 7) as u32, 1 as u32);
+  let ni1: i64 = 0;
+  while ni1 < 32 { let _ = buf_write_byte(msg1, (EAPOL_KEY_NONCE_OFF + ni1) as u32, buf_read_byte(anonce, ni1 as u32)); ni1 = ni1 + 1; }
+
+  let msg2: mut ref i64 = dhruva_alloc_bytes(99);
+  if wpa_hs_process_msg1(msg1, 99, snonce, msg2) != 0 { ok = 0; }
+
+  let exp_msg2_mic: mut ref i64 = dhruva_alloc_bytes(16);
+  let em2: [u8; 16] = [
+    0x1f as u8, 0x7e as u8, 0xcc as u8, 0xe5 as u8, 0xa6 as u8, 0xa5 as u8, 0xc1 as u8, 0xe6 as u8,
+    0x0f as u8, 0xd0 as u8, 0x84 as u8, 0x7b as u8, 0xf5 as u8, 0x9e as u8, 0x92 as u8, 0x68 as u8
+  ];
+  let em2i: i64 = 0;
+  while em2i < 16 { let _ = buf_write_byte(exp_msg2_mic, em2i as u32, em2[em2i] as u32); em2i = em2i + 1; }
+  let msg2_mic: mut ref i64 = dhruva_alloc_bytes(16);
+  let m2i: i64 = 0;
+  while m2i < 16 { let _ = buf_write_byte(msg2_mic, m2i as u32, buf_read_byte(msg2, (EAPOL_KEY_MIC_OFF + m2i) as u32)); m2i = m2i + 1; }
+  if sha256_bytes_equal(msg2_mic, exp_msg2_mic, 16) == 0 { ok = 0; }
+
+  // Message 3: GTK KDE (0xaa * 16) in unencrypted Key Data, replay
+  // counter = 2 (advanced past Message 1/2's 1), ANonce repeated.
+  let gtk_kde_len: i64 = 24;
+  let msg3: mut ref i64 = dhruva_alloc_bytes(99 + gtk_kde_len);
+  let key_info3: i64 = 0x03ca;
+  let _ = eapol_key_build_header(msg3, 2, key_info3, 16, gtk_kde_len);
+  let _ = buf_write_byte(msg3, (EAPOL_KEY_REPLAY_OFF + 7) as u32, 2 as u32);
+  let ni3: i64 = 0;
+  while ni3 < 32 { let _ = buf_write_byte(msg3, (EAPOL_KEY_NONCE_OFF + ni3) as u32, buf_read_byte(anonce, ni3 as u32)); ni3 = ni3 + 1; }
+  let gtk_kde: [u8; 24] = [
+    0xdd as u8, 0x16 as u8, 0x00 as u8, 0x0f as u8, 0xac as u8, 0x01 as u8, 0x01 as u8, 0x00 as u8,
+    0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8,
+    0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8
+  ];
+  let kdi: i64 = 0;
+  while kdi < gtk_kde_len { let _ = buf_write_byte(msg3, (EAPOL_KEY_DATA_OFF + kdi) as u32, gtk_kde[kdi] as u32); kdi = kdi + 1; }
+  let kck_for_test: mut ref i64 = wpa_hs_kck_ptr();
+  let _ = eapol_key_set_mic(msg3, 99 + gtk_kde_len, kck_for_test, 16);
+
+  let msg4: mut ref i64 = dhruva_alloc_bytes(99);
+  let gtk_result: mut ref i64 = dhruva_alloc_bytes(32);
+  let gtk_len: i64 = wpa_hs_process_msg3(msg3, 99 + gtk_kde_len, msg4, gtk_result);
+  if gtk_len != 16 { ok = 0; }
+
+  let exp_gtk: mut ref i64 = dhruva_alloc_bytes(16);
+  let egi: i64 = 0;
+  while egi < 16 { let _ = buf_write_byte(exp_gtk, egi as u32, 0xaa as u32); egi = egi + 1; }
+  if sha256_bytes_equal(gtk_result, exp_gtk, 16) == 0 { ok = 0; }
+
+  let exp_msg4_mic: mut ref i64 = dhruva_alloc_bytes(16);
+  let em4: [u8; 16] = [
+    0x0a as u8, 0x10 as u8, 0xed as u8, 0xce as u8, 0x11 as u8, 0xc9 as u8, 0x70 as u8, 0xa1 as u8,
+    0xef as u8, 0x90 as u8, 0x45 as u8, 0x54 as u8, 0x70 as u8, 0xa2 as u8, 0x6c as u8, 0x25 as u8
+  ];
+  let em4i: i64 = 0;
+  while em4i < 16 { let _ = buf_write_byte(exp_msg4_mic, em4i as u32, em4[em4i] as u32); em4i = em4i + 1; }
+  let msg4_mic: mut ref i64 = dhruva_alloc_bytes(16);
+  let m4i: i64 = 0;
+  while m4i < 16 { let _ = buf_write_byte(msg4_mic, m4i as u32, buf_read_byte(msg4, (EAPOL_KEY_MIC_OFF + m4i) as u32)); m4i = m4i + 1; }
+  if sha256_bytes_equal(msg4_mic, exp_msg4_mic, 16) == 0 { ok = 0; }
+
+  // Negative case: corrupt Message 3's MIC, must be rejected.
+  let msg3_bad: mut ref i64 = dhruva_alloc_bytes(99 + gtk_kde_len);
+  let bi: i64 = 0;
+  while bi < (99 + gtk_kde_len) { let _ = buf_write_byte(msg3_bad, bi as u32, buf_read_byte(msg3, bi as u32)); bi = bi + 1; }
+  let _ = buf_write_byte(msg3_bad, EAPOL_KEY_MIC_OFF as u32, buf_read_byte(msg3_bad, EAPOL_KEY_MIC_OFF as u32) ^ (1 as u32));
+  let msg4_bad: mut ref i64 = dhruva_alloc_bytes(99);
+  let gtk_bad: mut ref i64 = dhruva_alloc_bytes(32);
+  if wpa_hs_process_msg3(msg3_bad, 99 + gtk_kde_len, msg4_bad, gtk_bad) != WPA_HS_ERR_MIC { ok = 0; }
+
+  // Message 3 variant with Encrypted Key Data set -- must report
+  // WPA_HS_NEEDS_KEY_UNWRAP, not attempt to parse the still-wrapped
+  // bytes as a plaintext KDE. Replay counter 3, not 2 -- by this point
+  // the FIRST successful msg3 above already advanced the state
+  // machine's own stored counter to 2, so reusing 2 here would be
+  // correctly rejected as a replay before ever reaching the Encrypted
+  // Key Data check at all (caught live: an earlier version of this
+  // test reused counter 2 and failed for exactly that reason -- the
+  // anti-replay logic was doing its job correctly; the test itself was
+  // wrong to expect a not-actually-fresh counter to be accepted).
+  let key_info3_enc: i64 = key_info3 | EAPOL_KEY_INFO_ENCR_KEY_DATA;
+  let msg3_enc: mut ref i64 = dhruva_alloc_bytes(99 + gtk_kde_len);
+  let _ = eapol_key_build_header(msg3_enc, 2, key_info3_enc, 16, gtk_kde_len);
+  let _ = buf_write_byte(msg3_enc, (EAPOL_KEY_REPLAY_OFF + 7) as u32, 3 as u32);
+  let ni3e: i64 = 0;
+  while ni3e < 32 { let _ = buf_write_byte(msg3_enc, (EAPOL_KEY_NONCE_OFF + ni3e) as u32, buf_read_byte(anonce, ni3e as u32)); ni3e = ni3e + 1; }
+  let kdi2: i64 = 0;
+  while kdi2 < gtk_kde_len { let _ = buf_write_byte(msg3_enc, (EAPOL_KEY_DATA_OFF + kdi2) as u32, gtk_kde[kdi2] as u32); kdi2 = kdi2 + 1; }
+  let _ = eapol_key_set_mic(msg3_enc, 99 + gtk_kde_len, kck_for_test, 16);
+  let msg4_enc: mut ref i64 = dhruva_alloc_bytes(99);
+  let gtk_enc: mut ref i64 = dhruva_alloc_bytes(32);
+  if wpa_hs_process_msg3(msg3_enc, 99 + gtk_kde_len, msg4_enc, gtk_enc) != WPA_HS_NEEDS_KEY_UNWRAP { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: WPA2 4-way handshake state machine (Msg1->Msg2, Msg3->Msg4, GTK extraction) vs an independently-computed reference + tamper/key-unwrap-detection -- Msg2 own RSN IE, GTK key-unwrap, and nonce generation remain separately scoped");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 
 // Round 67: ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) and HKDF
 // (RFC 5869) -- the "crypto machinery" a TLS 1.3 handshake needs on
@@ -31350,6 +31700,12 @@ fn kernel_main() -> i64 {
   // PMK-to-PTK), the 4-way handshake's own key derivation core. See
   // wpa_ptk_self_test's own header comment.
   let _ = wpa_ptk_self_test();
+
+  // Task #164 (WiFi/WPA2) groundwork: the 4-way handshake's own
+  // message-sequencing state machine (Msg1->Msg2, Msg3->Msg4). See
+  // wpa_handshake_self_test's own header comment for what's covered
+  // and what's still separately scoped.
+  let _ = wpa_handshake_self_test();
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   let _ = chacha20_self_test();

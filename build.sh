@@ -190,6 +190,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/wpa_ptk_scratch.S" -o "${BUILD_DIR}/wpa_ptk_scratch.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/wpa_handshake_state.S" -o "${BUILD_DIR}/wpa_handshake_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/keccak_scratch.S" -o "${BUILD_DIR}/keccak_scratch.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -257,6 +260,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/aes_ccmp_scratch.o" \
   "${BUILD_DIR}/eapol_key_scratch.o" \
   "${BUILD_DIR}/wpa_ptk_scratch.o" \
+  "${BUILD_DIR}/wpa_handshake_state.o" \
   "${BUILD_DIR}/keccak_scratch.o" \
   "${BUILD_DIR}/mlkem_scratch.o" \
   "${BUILD_DIR}/tls13_scratch.o" \
