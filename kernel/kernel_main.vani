@@ -928,6 +928,12 @@ extern "C" fn aes_ccmp_computed_tag_ptr() -> mut ref i64;
 // Task #164 (WPA2) groundwork: EAPOL-Key scratch (boot/eapol_key_scratch.S).
 extern "C" fn eapol_key_saved_mic_ptr() -> mut ref i64;
 extern "C" fn eapol_key_full_mic_ptr() -> mut ref i64;
+// Task #164 (WPA2) groundwork: PTK derivation scratch (boot/wpa_ptk_scratch.S).
+extern "C" fn wpa_prf_msg_ptr() -> mut ref i64;
+extern "C" fn wpa_prf_hash_ptr() -> mut ref i64;
+extern "C" fn wpa_ptk_data_ptr() -> mut ref i64;
+extern "C" fn wpa_ptk_label_ptr() -> mut ref i64;
+extern "C" fn wpa_ptk_tmp_ptr() -> mut ref i64;
 extern "C" fn passwd_scratch_ptr() -> mut ref i64;
 extern "C" fn su_hash_scratch_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_get_enabled() -> u32;
@@ -24442,6 +24448,240 @@ fn eapol_key_self_test() -> i64 {
   return 0;
 }
 
+// PTK derivation (task #164, WPA2-PSK groundwork: the 4-way
+// handshake's own key derivation core). IEEE 802.11i 8.5.1.1's PRF-X
+// (a SHA-1-HMAC-based pseudo-random function distinct from PBKDF2 --
+// PBKDF2 derives the PMK from a passphrase; PRF-X derives the
+// per-session PTK from the PMK plus both sides' nonces/MAC addresses)
+// and 8.5.1.2's PMK->PTK derivation built on it. Construction verified
+// directly against wpa_supplicant's own `sha1_prf`
+// (src/crypto/sha1-prf.c) and `wpa_pmk_to_ptk`
+// (src/common/wpa_common.c), fetched fresh -- same reference this
+// project's EAPOL-Key work already used. Two details confirmed from
+// that real source, not assumed from a general description of PRF-X:
+// the label string's own trailing NUL byte is included in the hashed
+// input (`label_len = strlen(label) + 1` in the real code -- easy to
+// miss since the label reads like a plain ASCII string), and the
+// PTK-label call site (`src/rsn_supp/wpa.c`) confirms the exact
+// string "Pairwise key expansion", not a guessed rendering of it.
+//
+// PRF-X: for counter = 0, 1, 2, ... concatenate HMAC-SHA1(key,
+// label || 0x00 || data || counter-as-one-byte) until `out_len` bytes
+// are produced (the final block truncated, not the whole 20-byte
+// HMAC-SHA1 output discarded). `label`/`data` are fed as ONE combined
+// message per call (this project's own hmac_sha1 takes a single
+// buffer, unlike wpa_supplicant's own vector-of-buffers
+// hmac_sha1_vector) -- built fresh into a persistent scratch buffer
+// each iteration rather than per-call dhruva_alloc_bytes.
+fn wpa_sha1_prf(key: mut ref i64, key_len: i64, label: mut ref i64, label_len: i64, data: mut ref i64, data_len: i64, out: mut ref i64, out_len: i64) -> i64 {
+  let msg_scratch: mut ref i64 = wpa_prf_msg_ptr();
+  let i: i64 = 0;
+  while i < label_len {
+    let _ = buf_write_byte(msg_scratch, i as u32, buf_read_byte(label, i as u32));
+    i = i + 1;
+  }
+  let _ = buf_write_byte(msg_scratch, label_len as u32, 0 as u32);
+  i = 0;
+  while i < data_len {
+    let _ = buf_write_byte(msg_scratch, (label_len + 1 + i) as u32, buf_read_byte(data, i as u32));
+    i = i + 1;
+  }
+  let counter_off: i64 = label_len + 1 + data_len;
+  let msg_len: i64 = counter_off + 1;
+
+  let hash_out: mut ref i64 = wpa_prf_hash_ptr();
+  let pos: i64 = 0;
+  let counter: i64 = 0;
+  while pos < out_len {
+    let _ = buf_write_byte(msg_scratch, counter_off as u32, counter as u32);
+    let _ = hmac_sha1(key, key_len, msg_scratch, msg_len, hash_out);
+    let remaining: i64 = out_len - pos;
+    let take: i64 = if remaining < 20 { remaining } else { 20 };
+    let j: i64 = 0;
+    while j < take {
+      let _ = buf_write_byte(out, (pos + j) as u32, buf_read_byte(hash_out, j as u32));
+      j = j + 1;
+    }
+    pos = pos + take;
+    counter = counter + 1;
+  }
+  return 0;
+}
+
+fn wpa_bytes_less_than(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    let av: u32 = buf_read_byte(a, i as u32);
+    let bv: u32 = buf_read_byte(b, i as u32);
+    if av < bv { return 1; }
+    if av > bv { return 0; }
+    i = i + 1;
+  }
+  return 0; // equal -- matches memcmp==0 taking the real code's own
+            // "else" (not-less-than) branch
+}
+
+// PMK -> PTK (IEEE 802.11i 8.5.1.2): PTK = PRF-384(PMK, "Pairwise key
+// expansion", Min(AA,SA)||Max(AA,SA)||Min(ANonce,SNonce)||Max(ANonce,SNonce)),
+// split into KCK (16 bytes, EAPOL-Key MIC), KEK (16 bytes, EAPOL-Key
+// Key Data encryption -- AES key-unwrap of the GTK in Message 3 is
+// separately scoped, later work), and TK (16 bytes, the actual CCMP
+// data-frame key). `addr1`/`addr2` and `nonce1`/`nonce2` are
+// deliberately unordered pairs, not "AP" and "STA" specifically --
+// canonicalized internally via `wpa_bytes_less_than` so the AP and
+// the STA (each calling this with their OWN local "self"/"peer"
+// labeling) derive the IDENTICAL PTK regardless of which side is
+// "addr1"/"nonce1" in a given call -- the self-test below verifies
+// this order-independence explicitly, not just the forward
+// computation.
+fn wpa_ptk_derive(pmk: mut ref i64, pmk_len: i64, addr1: mut ref i64, addr2: mut ref i64, nonce1: mut ref i64, nonce2: mut ref i64, kck_out: mut ref i64, kek_out: mut ref i64, tk_out: mut ref i64) -> i64 {
+  let data: mut ref i64 = wpa_ptk_data_ptr();
+  let i: i64 = 0;
+  if wpa_bytes_less_than(addr1, addr2, 6) == 1 {
+    i = 0;
+    while i < 6 { let _ = buf_write_byte(data, i as u32, buf_read_byte(addr1, i as u32)); i = i + 1; }
+    i = 0;
+    while i < 6 { let _ = buf_write_byte(data, (6 + i) as u32, buf_read_byte(addr2, i as u32)); i = i + 1; }
+  } else {
+    i = 0;
+    while i < 6 { let _ = buf_write_byte(data, i as u32, buf_read_byte(addr2, i as u32)); i = i + 1; }
+    i = 0;
+    while i < 6 { let _ = buf_write_byte(data, (6 + i) as u32, buf_read_byte(addr1, i as u32)); i = i + 1; }
+  }
+  if wpa_bytes_less_than(nonce1, nonce2, 32) == 1 {
+    i = 0;
+    while i < 32 { let _ = buf_write_byte(data, (12 + i) as u32, buf_read_byte(nonce1, i as u32)); i = i + 1; }
+    i = 0;
+    while i < 32 { let _ = buf_write_byte(data, (44 + i) as u32, buf_read_byte(nonce2, i as u32)); i = i + 1; }
+  } else {
+    i = 0;
+    while i < 32 { let _ = buf_write_byte(data, (12 + i) as u32, buf_read_byte(nonce2, i as u32)); i = i + 1; }
+    i = 0;
+    while i < 32 { let _ = buf_write_byte(data, (44 + i) as u32, buf_read_byte(nonce1, i as u32)); i = i + 1; }
+  }
+
+  // "Pairwise key expansion" -- 22 ASCII bytes (verified via Python's
+  // own len(), NOT hand-counted -- an initial hand-count here said 23
+  // and was wrong, caught before ever building by checking
+  // programmatically instead of trusting the count), matching the
+  // real call site (src/rsn_supp/wpa.c).
+  let label: mut ref i64 = wpa_ptk_label_ptr();
+  let lbl: [u8; 22] = [
+    0x50 as u8, 0x61 as u8, 0x69 as u8, 0x72 as u8, 0x77 as u8, 0x69 as u8, 0x73 as u8, 0x65 as u8,
+    0x20 as u8, 0x6b as u8, 0x65 as u8, 0x79 as u8, 0x20 as u8, 0x65 as u8, 0x78 as u8, 0x70 as u8,
+    0x61 as u8, 0x6e as u8, 0x73 as u8, 0x69 as u8, 0x6f as u8, 0x6e as u8
+  ];
+  let li: i64 = 0;
+  while li < 22 {
+    let _ = buf_write_byte(label, li as u32, lbl[li] as u32);
+    li = li + 1;
+  }
+
+  let ptk_tmp: mut ref i64 = wpa_ptk_tmp_ptr();
+  let _ = wpa_sha1_prf(pmk, pmk_len, label, 22, data, 76, ptk_tmp, 48);
+
+  i = 0;
+  while i < 16 { let _ = buf_write_byte(kck_out, i as u32, buf_read_byte(ptk_tmp, i as u32)); i = i + 1; }
+  i = 0;
+  while i < 16 { let _ = buf_write_byte(kek_out, i as u32, buf_read_byte(ptk_tmp, (16 + i) as u32)); i = i + 1; }
+  i = 0;
+  while i < 16 { let _ = buf_write_byte(tk_out, i as u32, buf_read_byte(ptk_tmp, (32 + i) as u32)); i = i + 1; }
+  return 0;
+}
+
+// Verified against a PTK independently computed via Python, replaying
+// the exact algorithm above against wpa_supplicant's own real
+// sha1_prf/wpa_pmk_to_ptk source (not derived from this same vani
+// code): the PMK from this session's own already-verified IEEE
+// 802.11i WPA2-PSK worked example (password/IEEE/4096/32), arbitrary
+// (but fixed) AP/STA MAC addresses and nonces. A second call with
+// addr1/addr2 and nonce1/nonce2 SWAPPED from the first must produce
+// the IDENTICAL PTK -- proving the Min/Max canonicalization genuinely
+// makes this order-independent, the real property the AP and STA each
+// depend on (both call this with their own local "self"/"peer"
+// labeling and must still agree on the same PTK).
+fn wpa_ptk_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let pmk: mut ref i64 = dhruva_alloc_bytes(32);
+  let pm: [u8; 32] = [
+    0xf4 as u8, 0x2c as u8, 0x6f as u8, 0xc5 as u8, 0x2d as u8, 0xf0 as u8, 0xeb as u8, 0xef as u8,
+    0x9e as u8, 0xbb as u8, 0x4b as u8, 0x90 as u8, 0xb3 as u8, 0x8a as u8, 0x5f as u8, 0x90 as u8,
+    0x2e as u8, 0x83 as u8, 0xfe as u8, 0x1b as u8, 0x13 as u8, 0x5a as u8, 0x70 as u8, 0xe2 as u8,
+    0x3a as u8, 0xed as u8, 0x76 as u8, 0x2e as u8, 0x97 as u8, 0x10 as u8, 0xa1 as u8, 0x2e as u8
+  ];
+  let pmi: i64 = 0;
+  while pmi < 32 { let _ = buf_write_byte(pmk, pmi as u32, pm[pmi] as u32); pmi = pmi + 1; }
+
+  let aa: mut ref i64 = dhruva_alloc_bytes(6);
+  let aa_bytes: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x01 as u8];
+  let ai: i64 = 0;
+  while ai < 6 { let _ = buf_write_byte(aa, ai as u32, aa_bytes[ai] as u32); ai = ai + 1; }
+
+  let sa: mut ref i64 = dhruva_alloc_bytes(6);
+  let sa_bytes: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x02 as u8];
+  let si: i64 = 0;
+  while si < 6 { let _ = buf_write_byte(sa, si as u32, sa_bytes[si] as u32); si = si + 1; }
+
+  let anonce: mut ref i64 = dhruva_alloc_bytes(32);
+  let ani: i64 = 0;
+  while ani < 32 { let _ = buf_write_byte(anonce, ani as u32, 0x11 as u32); ani = ani + 1; }
+
+  let snonce: mut ref i64 = dhruva_alloc_bytes(32);
+  let sni: i64 = 0;
+  while sni < 32 { let _ = buf_write_byte(snonce, sni as u32, 0x22 as u32); sni = sni + 1; }
+
+  let kck: mut ref i64 = dhruva_alloc_bytes(16);
+  let kek: mut ref i64 = dhruva_alloc_bytes(16);
+  let tk: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = wpa_ptk_derive(pmk, 32, aa, sa, anonce, snonce, kck, kek, tk);
+
+  let exp_kck: mut ref i64 = dhruva_alloc_bytes(16);
+  let ek: [u8; 16] = [
+    0xe9 as u8, 0xcd as u8, 0xf3 as u8, 0xaf as u8, 0xca as u8, 0xce as u8, 0xd6 as u8, 0x64 as u8,
+    0xd7 as u8, 0x0b as u8, 0xc4 as u8, 0x3e as u8, 0xcc as u8, 0x94 as u8, 0xba as u8, 0x97 as u8
+  ];
+  let eki: i64 = 0;
+  while eki < 16 { let _ = buf_write_byte(exp_kck, eki as u32, ek[eki] as u32); eki = eki + 1; }
+  if sha256_bytes_equal(kck, exp_kck, 16) == 0 { ok = 0; }
+
+  let exp_kek: mut ref i64 = dhruva_alloc_bytes(16);
+  let ekk: [u8; 16] = [
+    0x0e as u8, 0x89 as u8, 0x56 as u8, 0x8b as u8, 0xd8 as u8, 0x5d as u8, 0xe9 as u8, 0x9f as u8,
+    0x26 as u8, 0x3a as u8, 0xe7 as u8, 0x21 as u8, 0x34 as u8, 0xd9 as u8, 0x94 as u8, 0x68 as u8
+  ];
+  let ekki: i64 = 0;
+  while ekki < 16 { let _ = buf_write_byte(exp_kek, ekki as u32, ekk[ekki] as u32); ekki = ekki + 1; }
+  if sha256_bytes_equal(kek, exp_kek, 16) == 0 { ok = 0; }
+
+  let exp_tk: mut ref i64 = dhruva_alloc_bytes(16);
+  let etk: [u8; 16] = [
+    0x5b as u8, 0x88 as u8, 0x69 as u8, 0x4a as u8, 0x82 as u8, 0x68 as u8, 0xc0 as u8, 0x5b as u8,
+    0xfe as u8, 0x4c as u8, 0x53 as u8, 0xde as u8, 0x87 as u8, 0xb9 as u8, 0x7d as u8, 0x81 as u8
+  ];
+  let etki: i64 = 0;
+  while etki < 16 { let _ = buf_write_byte(exp_tk, etki as u32, etk[etki] as u32); etki = etki + 1; }
+  if sha256_bytes_equal(tk, exp_tk, 16) == 0 { ok = 0; }
+
+  // Order-independence: swap addr1/addr2 and nonce1/nonce2, must get
+  // the identical PTK.
+  let kck2: mut ref i64 = dhruva_alloc_bytes(16);
+  let kek2: mut ref i64 = dhruva_alloc_bytes(16);
+  let tk2: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = wpa_ptk_derive(pmk, 32, sa, aa, snonce, anonce, kck2, kek2, tk2);
+  if sha256_bytes_equal(kck, kck2, 16) == 0 { ok = 0; }
+  if sha256_bytes_equal(kek, kek2, 16) == 0 { ok = 0; }
+  if sha256_bytes_equal(tk, tk2, 16) == 0 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: WPA2 PTK derivation (PRF-X + PMK-to-PTK) vs an independently-computed reference + order-independence check -- 4-way-handshake groundwork");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 
 // Round 67: ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) and HKDF
 // (RFC 5869) -- the "crypto machinery" a TLS 1.3 handshake needs on
@@ -31105,6 +31345,11 @@ fn kernel_main() -> i64 {
   // the 4-way handshake's actual wire format. See
   // eapol_key_self_test's own header comment.
   let _ = eapol_key_self_test();
+
+  // Task #164 (WiFi/WPA2) groundwork: PTK derivation (PRF-X +
+  // PMK-to-PTK), the 4-way handshake's own key derivation core. See
+  // wpa_ptk_self_test's own header comment.
+  let _ = wpa_ptk_self_test();
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   let _ = chacha20_self_test();
