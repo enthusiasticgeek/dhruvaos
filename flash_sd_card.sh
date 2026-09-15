@@ -148,8 +148,48 @@ sync
 sudo umount "$MOUNT_POINT"
 rmdir "$MOUNT_POINT"
 
+# FIX (2026-09-15): verify by UNMOUNTING then REMOUNTING and re-reading
+# every file back, not just checksumming while still mounted -- a file
+# that reads back correctly from the SAME mount can still be sitting
+# only in the page cache, not actually durable on the physical media
+# yet (the exact "FAT32 write-caching/flush reliability over a USB SD
+# reader" risk category flagged, but left mechanistically unconfirmed,
+# by this round's own research). A real unmount+remount+re-read cycle
+# is what actually rules that out, not `sync` alone (which flushes but
+# doesn't itself prove the flush reached the device before the card was
+# powered off/removed in a real accident scenario -- this can't fully
+# simulate power loss either, but it's a strictly stronger check than
+# anything this script did before).
+echo "=== Verifying: unmounting, remounting, re-reading every file back ==="
+mkdir -p "$MOUNT_POINT"
+sudo mount "$BOOT_PART" "$MOUNT_POINT"
+VERIFY_OK=1
+for f in bootcode.bin start.elf fixup.dat config.txt kernel.img; do
+    SRC=""
+    case "$f" in
+        bootcode.bin|start.elf|fixup.dat) SRC="$FW_DIR/$f" ;;
+        config.txt) SRC="$CONFIG_TXT" ;;
+        kernel.img) SRC="$ROOT/build/kernel.img" ;;
+    esac
+    SRC_SUM=$(md5sum "$SRC" | cut -d' ' -f1)
+    CARD_SUM=$(sudo md5sum "$MOUNT_POINT/$f" 2>/dev/null | cut -d' ' -f1 || echo "MISSING")
+    if [ "$SRC_SUM" != "$CARD_SUM" ]; then
+        echo "ERROR: $f mismatch after remount -- source=$SRC_SUM card=$CARD_SUM" >&2
+        VERIFY_OK=0
+    fi
+done
+sudo umount "$MOUNT_POINT"
+rmdir "$MOUNT_POINT"
+
+if [ "$VERIFY_OK" -ne 1 ]; then
+    echo "ERROR: verification FAILED -- do not trust this card, re-run this" >&2
+    echo "script (or investigate the SD reader/card itself) before testing" >&2
+    echo "on real hardware." >&2
+    exit 1
+fi
+
 echo
-echo "=== Done. Contents written to $BOOT_PART: ==="
+echo "=== Done. Contents written AND verified (post-remount re-read) on $BOOT_PART: ==="
 echo "  bootcode.bin, start.elf, fixup.dat, config.txt, kernel.img"
 echo
 echo "Safe to remove the card and insert it in the powered-off Pi."
