@@ -925,6 +925,9 @@ extern "C" fn aes_ccmp_x_block_ptr() -> mut ref i64;
 extern "C" fn aes_ccmp_a_block_ptr() -> mut ref i64;
 extern "C" fn aes_ccmp_s_block_ptr() -> mut ref i64;
 extern "C" fn aes_ccmp_computed_tag_ptr() -> mut ref i64;
+// Task #164 (WPA2) groundwork: EAPOL-Key scratch (boot/eapol_key_scratch.S).
+extern "C" fn eapol_key_saved_mic_ptr() -> mut ref i64;
+extern "C" fn eapol_key_full_mic_ptr() -> mut ref i64;
 extern "C" fn passwd_scratch_ptr() -> mut ref i64;
 extern "C" fn su_hash_scratch_ptr() -> mut ref i64;
 extern "C" fn dharafs_crypto_get_enabled() -> u32;
@@ -22389,14 +22392,28 @@ fn pbkdf2_hmac_sha256_self_test() -> i64 {
 // same reasoning as sha1_hash's own header comment: WPA2-PSK's own
 // PBKDF2/PRF key derivation is specified with HMAC-SHA1, no
 // substitute exists that still interoperates with a real access
-// point. Identical shape to hmac_sha256 above (64-byte block, same
-// inner/outer-pad construction), just SHA-1's 20-byte digest instead
-// of SHA-256's 32, and its own dedicated scratch set (see the extern
-// declarations' own comment on why that scratch can't be shared).
+// point. Identical inner/outer-pad construction to hmac_sha256 above,
+// just SHA-1's 20-byte digest instead of SHA-256's 32, and its own
+// dedicated scratch set (see the extern declarations' own comment on
+// why that scratch can't be shared).
+//
+// REAL LIMITATION FOUND AND FIXED (2026-09-14, EAPOL-Key work): this
+// originally capped msg_len at 64 bytes, copied unmodified from
+// hmac_sha256's own convention when this function was first written
+// (PBKDF2-HMAC-SHA1's own two call shapes -- a <=36-byte salt+counter,
+// or a bare 20-byte U value -- never exercised anything larger, so the
+// cap went unnoticed). The EAPOL-Key MIC (this function's other real
+// caller, needed to authenticate 4-way-handshake messages) covers the
+// ENTIRE EAPOL frame -- fixed header alone is 99 bytes, well over 64,
+// before any Key Data. Fixed properly rather than picking a new, still
+// arbitrary fixed cap: the inner hash now feeds the 64-byte ipad and
+// then the message itself through SHA-1's own STREAMING API
+// (sha1_init/update/finalize, chunked 256 bytes at a time -- the same
+// pattern sha1_hash's own kernel-level wrapper already uses) instead
+// of copying ipad+message into one combined one-shot buffer first --
+// msg_len is now genuinely unbounded, matching what sha1_hash itself
+// already supports, rather than a limitation of THIS function alone.
 fn hmac_sha1(key: mut ref i64, key_len: i64, msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
-  if msg_len > 64 {
-    return 0 - 1;
-  }
   let key_block: mut ref i64 = hmac_sha1_key_block_ptr();
   let i: i64 = 0;
   if key_len > 64 {
@@ -22413,21 +22430,39 @@ fn hmac_sha1(key: mut ref i64, key_len: i64, msg: mut ref i64, msg_len: i64, out
     i = i + 1;
   }
 
-  let msg_scratch: mut ref i64 = hmac_sha1_msg_scratch_ptr();
-  i = 0;
-  while i < 64 {
-    let kb: u32 = buf_read_byte(key_block, i as u32);
-    let _ = buf_write_byte(msg_scratch, i as u32, kb ^ (0x36 as u32));
-    i = i + 1;
+  let ipad_chunk: [u8; 256] = zero256_bytes();
+  let pi: i64 = 0;
+  while pi < 64 {
+    let kb: u32 = buf_read_byte(key_block, pi as u32);
+    ipad_chunk[pi] = (kb ^ (0x36 as u32)) as u8;
+    pi = pi + 1;
   }
-  i = 0;
-  while i < msg_len {
-    let _ = buf_write_byte(msg_scratch, (64 + i) as u32, buf_read_byte(msg, i as u32));
-    i = i + 1;
-  }
-  let inner_hash: mut ref i64 = hmac_sha1_inner_hash_ptr();
-  let _ = sha1_hash(msg_scratch, 64 + msg_len, inner_hash);
+  let ctx: Sha1Ctx = sha1_init();
+  ctx = sha1_update(ref ctx, mut ref ipad_chunk, 64);
 
+  let offset: i64 = 0;
+  while offset < msg_len {
+    let remaining: i64 = msg_len - offset;
+    let chunk_n: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = zero256_bytes();
+    let ci: i64 = 0;
+    while ci < chunk_n {
+      chunk[ci] = buf_read_byte(msg, (offset + ci) as u32) as u8;
+      ci = ci + 1;
+    }
+    ctx = sha1_update(ref ctx, mut ref chunk, chunk_n);
+    offset = offset + chunk_n;
+  }
+  let inner_digest: [u8; 20] = sha1_finalize(ref ctx);
+
+  let inner_hash: mut ref i64 = hmac_sha1_inner_hash_ptr();
+  let hi: i64 = 0;
+  while hi < 20 {
+    let _ = buf_write_byte(inner_hash, hi as u32, inner_digest[hi] as u32);
+    hi = hi + 1;
+  }
+
+  let msg_scratch: mut ref i64 = hmac_sha1_msg_scratch_ptr();
   i = 0;
   while i < 64 {
     let kb2: u32 = buf_read_byte(key_block, i as u32);
@@ -24084,6 +24119,321 @@ fn aes_ccmp_self_test() -> i64 {
   if sha256_bytes_equal(pt1_back, pt1, 16) == 0 { ok = 0; }
 
   let _ = uart_puts("CRYPTO: AES-CCMP vs RFC 3610 Packet Vector #1 + a no-AAD single-block vector, encrypt+decrypt+tamper-detect");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// EAPOL-Key frame parsing/building (task #164, WPA2-PSK groundwork:
+// the 4-way handshake's actual wire format). Field layout verified
+// directly against wpa_supplicant's own `struct wpa_eapol_key`
+// (src/common/wpa_common.h, fetched fresh from its real source, not
+// recalled) -- the production reference implementation virtually
+// every real access point and client interoperates against, not a
+// derivation from the IEEE 802.11i text alone. That text turns out to
+// matter here: wpa_supplicant's own `wpa_eapol_key_mic` doc comment
+// explicitly flags that IEEE Std 802.11i-2004's own description of the
+// MIC computation is WRONG (says the input starts at the EAPOL-Key
+// header) -- the actual behavior every real implementation uses (and
+// what's implemented below) starts at the EAPOL header's own version
+// byte instead, per the corrected IEEE 802.11i/D10 draft. A naive
+// from-the-spec-text implementation would have silently failed to
+// interoperate with any real access point.
+//
+// Layout (all multi-byte fields big-endian; offsets from the start of
+// the EAPOL header):
+//   0   1  EAPOL protocol version
+//   1   1  EAPOL packet type (3 = EAPOL-Key)
+//   2   2  EAPOL body length
+//   4   1  Key Descriptor Type (2 = RSN)
+//   5   2  Key Information
+//   7   2  Key Length
+//   9   8  Key Replay Counter
+//  17  32  Key Nonce
+//  49  16  Key IV (all-zero for CCMP; historically used by TKIP)
+//  65   8  Key RSC
+//  73   8  Key ID / Reserved
+//  81  16  Key MIC (HMAC-SHA1-128 truncated -- this project only
+//          implements the CCMP/WPA2-PSK key descriptor version;
+//          WPA3/Suite-B's 24-byte HMAC-SHA384 variant is out of scope)
+//  97   2  Key Data Length
+//  99   -  Key Data (Key Data Length bytes; RSN IE/GTK KDE parsing is
+//          separately scoped, later work -- this layer treats it as
+//          an opaque blob of the declared length)
+const EAPOL_HDR_LEN: i64 = 4;
+const EAPOL_KEY_PACKET_TYPE: i64 = 3;
+const EAPOL_KEY_DESCRIPTOR_RSN: i64 = 2;
+const EAPOL_KEY_TYPE_OFF: i64 = 4;
+const EAPOL_KEY_INFO_OFF: i64 = 5;
+const EAPOL_KEY_LENGTH_OFF: i64 = 7;
+const EAPOL_KEY_REPLAY_OFF: i64 = 9;
+const EAPOL_KEY_NONCE_OFF: i64 = 17;
+const EAPOL_KEY_IV_OFF: i64 = 49;
+const EAPOL_KEY_RSC_OFF: i64 = 65;
+const EAPOL_KEY_ID_OFF: i64 = 73;
+const EAPOL_KEY_MIC_OFF: i64 = 81;
+const EAPOL_KEY_DATALEN_OFF: i64 = 97;
+const EAPOL_KEY_DATA_OFF: i64 = 99;
+const EAPOL_KEY_FIXED_BODY_LEN: i64 = 95; // descriptor type through key_data_length
+const EAPOL_KEY_MIC_LEN: i64 = 16;
+
+// Key Information bit field (IEEE 802.11, 8.5.2). Only the bits this
+// project's own CCMP/WPA2-PSK path needs are named -- WPA legacy's own
+// key-index bits (4-5) and SMK/PeerKey (bit 13) are neither read nor
+// written here.
+const EAPOL_KEY_INFO_DESC_V2_HMAC_SHA1_AES: i64 = 2; // Key Descriptor Version: CCMP/WPA2-PSK
+const EAPOL_KEY_INFO_KEY_TYPE_PAIRWISE: i64 = 0x0008;
+const EAPOL_KEY_INFO_INSTALL: i64 = 0x0040;
+const EAPOL_KEY_INFO_ACK: i64 = 0x0080;
+const EAPOL_KEY_INFO_MIC: i64 = 0x0100;
+const EAPOL_KEY_INFO_SECURE: i64 = 0x0200;
+const EAPOL_KEY_INFO_ERROR: i64 = 0x0400;
+const EAPOL_KEY_INFO_REQUEST: i64 = 0x0800;
+const EAPOL_KEY_INFO_ENCR_KEY_DATA: i64 = 0x1000;
+
+fn eapol_key_read_be16(buf: mut ref i64, off: i64) -> i64 {
+  let b0: u32 = buf_read_byte(buf, off as u32);
+  let b1: u32 = buf_read_byte(buf, (off + 1) as u32);
+  return ((b0 << (8 as u32)) | b1) as i64;
+}
+
+fn eapol_key_write_be16(buf: mut ref i64, off: i64, v: i64) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, ((v >> 8) & 255) as u32);
+  let _ = buf_write_byte(buf, (off + 1) as u32, (v & 255) as u32);
+  return 0;
+}
+
+struct EapolKeyParsed {
+  ok: i64,
+  version: i64,
+  packet_type: i64,
+  body_length: i64,
+  descriptor_type: i64,
+  key_info: i64,
+  key_length: i64,
+  key_data_length: i64,
+  key_data_off: i64,
+  frame_len: i64
+}
+
+// Parses an EAPOL-Key frame already sitting at the front of `buf`
+// (`buf_len` bytes available). `ok` is 0 on success; nonzero (and
+// every other field still populated for diagnostics) if the buffer is
+// too short, the packet type isn't EAPOL-Key, the descriptor isn't
+// RSN, or the declared key data would run past `buf_len`. Fixed-size
+// sub-fields (replay counter, nonce, IV, RSC, key ID, MIC) are
+// deliberately NOT copied out into the struct -- callers read them
+// directly via `buf_read_byte(buf, EAPOL_KEY_*_OFF + i)` at the named
+// offset constants above, avoiding copies for fields a given caller
+// may not even need.
+fn eapol_key_parse(buf: mut ref i64, buf_len: i64) -> EapolKeyParsed {
+  if buf_len < EAPOL_KEY_DATA_OFF {
+    return EapolKeyParsed { ok: 0 - 1, version: 0, packet_type: 0, body_length: 0, descriptor_type: 0, key_info: 0, key_length: 0, key_data_length: 0, key_data_off: EAPOL_KEY_DATA_OFF, frame_len: 0 };
+  }
+  let version: i64 = buf_read_byte(buf, 0 as u32) as i64;
+  let packet_type: i64 = buf_read_byte(buf, 1 as u32) as i64;
+  let body_length: i64 = eapol_key_read_be16(buf, 2);
+  let descriptor_type: i64 = buf_read_byte(buf, EAPOL_KEY_TYPE_OFF as u32) as i64;
+  let key_info: i64 = eapol_key_read_be16(buf, EAPOL_KEY_INFO_OFF);
+  let key_length: i64 = eapol_key_read_be16(buf, EAPOL_KEY_LENGTH_OFF);
+  let key_data_length: i64 = eapol_key_read_be16(buf, EAPOL_KEY_DATALEN_OFF);
+  let frame_len: i64 = EAPOL_HDR_LEN + body_length;
+
+  let ok: i64 = 0;
+  if packet_type != EAPOL_KEY_PACKET_TYPE {
+    ok = 0 - 1;
+  }
+  if descriptor_type != EAPOL_KEY_DESCRIPTOR_RSN {
+    ok = 0 - 1;
+  }
+  if (EAPOL_KEY_DATA_OFF + key_data_length) > buf_len {
+    ok = 0 - 1;
+  }
+
+  return EapolKeyParsed { ok: ok, version: version, packet_type: packet_type, body_length: body_length, descriptor_type: descriptor_type, key_info: key_info, key_length: key_length, key_data_length: key_data_length, key_data_off: EAPOL_KEY_DATA_OFF, frame_len: frame_len };
+}
+
+// Writes the fixed-format header/descriptor fields of an EAPOL-Key
+// frame into `buf` and zeroes everything from Replay Counter through
+// Key MIC (offsets 9-96 inclusive) -- the caller fills in replay
+// counter/nonce/IV/RSC afterward via direct `buf_write_byte` calls at
+// the named offsets, appends `key_data_length` bytes of Key Data
+// starting at EAPOL_KEY_DATA_OFF, and finally calls
+// `eapol_key_set_mic` once the frame is otherwise complete.
+fn eapol_key_build_header(buf: mut ref i64, version: i64, key_info: i64, key_length: i64, key_data_length: i64) -> i64 {
+  let _ = buf_write_byte(buf, 0 as u32, version as u32);
+  let _ = buf_write_byte(buf, 1 as u32, EAPOL_KEY_PACKET_TYPE as u32);
+  let body_length: i64 = EAPOL_KEY_FIXED_BODY_LEN + key_data_length;
+  let _ = eapol_key_write_be16(buf, 2, body_length);
+  let _ = buf_write_byte(buf, EAPOL_KEY_TYPE_OFF as u32, EAPOL_KEY_DESCRIPTOR_RSN as u32);
+  let _ = eapol_key_write_be16(buf, EAPOL_KEY_INFO_OFF, key_info);
+  let _ = eapol_key_write_be16(buf, EAPOL_KEY_LENGTH_OFF, key_length);
+  let i: i64 = EAPOL_KEY_REPLAY_OFF;
+  while i < EAPOL_KEY_DATALEN_OFF {
+    let _ = buf_write_byte(buf, i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let _ = eapol_key_write_be16(buf, EAPOL_KEY_DATALEN_OFF, key_data_length);
+  return 0;
+}
+
+// Computes and installs the EAPOL-Key MIC over `buf[0..frame_len)`
+// (the whole EAPOL frame, from the EAPOL header's own version byte --
+// see this section's own header comment on why NOT starting at the
+// EAPOL-Key descriptor matters) using HMAC-SHA1-128 with `kck` as the
+// key. The MIC field must read as all-zero for the duration of this
+// computation (already true for a freshly-built frame via
+// `eapol_key_build_header`); the real computed value is written into
+// the MIC field directly afterward.
+fn eapol_key_set_mic(buf: mut ref i64, frame_len: i64, kck: mut ref i64, kck_len: i64) -> i64 {
+  let i: i64 = 0;
+  while i < EAPOL_KEY_MIC_LEN {
+    let _ = buf_write_byte(buf, (EAPOL_KEY_MIC_OFF + i) as u32, 0 as u32);
+    i = i + 1;
+  }
+  let full_mic: mut ref i64 = eapol_key_full_mic_ptr();
+  let _ = hmac_sha1(kck, kck_len, buf, frame_len, full_mic);
+  i = 0;
+  while i < EAPOL_KEY_MIC_LEN {
+    let _ = buf_write_byte(buf, (EAPOL_KEY_MIC_OFF + i) as u32, buf_read_byte(full_mic, i as u32));
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Verifies a received frame's own MIC: saves the received MIC bytes,
+// zeroes the field, recomputes HMAC-SHA1-128(kck, whole frame), and
+// compares -- then restores the original received bytes into `buf`
+// regardless of outcome, so this function never leaves the caller's
+// buffer altered. Returns 0 on match, 0 - 1 on mismatch.
+fn eapol_key_verify_mic(buf: mut ref i64, frame_len: i64, kck: mut ref i64, kck_len: i64) -> i64 {
+  let saved_mic: mut ref i64 = eapol_key_saved_mic_ptr();
+  let i: i64 = 0;
+  while i < EAPOL_KEY_MIC_LEN {
+    let _ = buf_write_byte(saved_mic, i as u32, buf_read_byte(buf, (EAPOL_KEY_MIC_OFF + i) as u32));
+    let _ = buf_write_byte(buf, (EAPOL_KEY_MIC_OFF + i) as u32, 0 as u32);
+    i = i + 1;
+  }
+  let full_mic: mut ref i64 = eapol_key_full_mic_ptr();
+  let _ = hmac_sha1(kck, kck_len, buf, frame_len, full_mic);
+  i = 0;
+  while i < EAPOL_KEY_MIC_LEN {
+    let _ = buf_write_byte(buf, (EAPOL_KEY_MIC_OFF + i) as u32, buf_read_byte(saved_mic, i as u32));
+    i = i + 1;
+  }
+  i = 0;
+  while i < EAPOL_KEY_MIC_LEN {
+    if buf_read_byte(full_mic, i as u32) != buf_read_byte(saved_mic, i as u32) {
+      return 0 - 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Two independently-verified cases: a 99-byte frame (no Key Data) and
+// a 139-byte frame (40 bytes of Key Data, deliberately chosen to push
+// the whole frame past 64 bytes and exercise hmac_sha1's own
+// just-fixed unbounded-message path -- the specific limitation this
+// same round found and fixed). Both frames are BUILT via this file's
+// own eapol_key_build_header (not hand-assembled), then their
+// replay counter/nonce/key data are filled in, then
+// eapol_key_set_mic computes the real MIC -- compared against a value
+// independently computed via Python's hmac module for the exact same
+// bytes, not derived from this same code. Round-trips through
+// eapol_key_parse too, checking every scalar field comes back exactly
+// as built, and eapol_key_verify_mic on the freshly-MIC'd frame, plus
+// a negative case (a single flipped Key Data byte must make
+// verification fail).
+fn eapol_key_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  // Case 1: 99-byte frame, no Key Data.
+  let buf0: mut ref i64 = dhruva_alloc_bytes(99);
+  let _ = eapol_key_build_header(buf0, 2, 0x008a, 16, 0);
+  let ri0: i64 = 0;
+  while ri0 < 8 { let _ = buf_write_byte(buf0, (EAPOL_KEY_REPLAY_OFF + ri0) as u32, (ri0 + 1) as u32); ri0 = ri0 + 1; }
+  let ni0: i64 = 0;
+  while ni0 < 32 { let _ = buf_write_byte(buf0, (EAPOL_KEY_NONCE_OFF + ni0) as u32, (ni0 + 0x20) as u32); ni0 = ni0 + 1; }
+
+  let parsed0: EapolKeyParsed = eapol_key_parse(buf0, 99);
+  if parsed0.ok != 0 { ok = 0; }
+  if parsed0.version != 2 { ok = 0; }
+  if parsed0.packet_type != 3 { ok = 0; }
+  if parsed0.body_length != 95 { ok = 0; }
+  if parsed0.descriptor_type != 2 { ok = 0; }
+  if parsed0.key_info != 0x008a { ok = 0; }
+  if parsed0.key_length != 16 { ok = 0; }
+  if parsed0.key_data_length != 0 { ok = 0; }
+  if parsed0.frame_len != 99 { ok = 0; }
+
+  let kck0: mut ref i64 = dhruva_alloc_bytes(16);
+  let ki0: i64 = 0;
+  while ki0 < 16 { let _ = buf_write_byte(kck0, ki0 as u32, 0xaa as u32); ki0 = ki0 + 1; }
+  let _ = eapol_key_set_mic(buf0, 99, kck0, 16);
+
+  let exp_mic0: mut ref i64 = dhruva_alloc_bytes(16);
+  let em0: [u8; 16] = [
+    0xaf as u8, 0x6f as u8, 0x6b as u8, 0xf1 as u8, 0x6c as u8, 0x9d as u8, 0x98 as u8, 0xe7 as u8,
+    0x94 as u8, 0x6e as u8, 0xda as u8, 0x15 as u8, 0x1f as u8, 0xa5 as u8, 0x04 as u8, 0x6e as u8
+  ];
+  let emi0: i64 = 0;
+  while emi0 < 16 { let _ = buf_write_byte(exp_mic0, emi0 as u32, em0[emi0] as u32); emi0 = emi0 + 1; }
+  let mic_off0: mut ref i64 = dhruva_alloc_bytes(16);
+  let mo0: i64 = 0;
+  while mo0 < 16 { let _ = buf_write_byte(mic_off0, mo0 as u32, buf_read_byte(buf0, (EAPOL_KEY_MIC_OFF + mo0) as u32)); mo0 = mo0 + 1; }
+  if sha256_bytes_equal(mic_off0, exp_mic0, 16) == 0 { ok = 0; }
+  if eapol_key_verify_mic(buf0, 99, kck0, 16) != 0 { ok = 0; }
+
+  // Case 2: 139-byte frame, 40 bytes of Key Data.
+  let key_data_len1: i64 = 40;
+  let buf1: mut ref i64 = dhruva_alloc_bytes(99 + key_data_len1);
+  let _ = eapol_key_build_header(buf1, 2, 0x13ca, 16, key_data_len1);
+  let ri1: i64 = 0;
+  while ri1 < 8 { let _ = buf_write_byte(buf1, (EAPOL_KEY_REPLAY_OFF + ri1) as u32, (0x10 + ri1) as u32); ri1 = ri1 + 1; }
+  let ni1: i64 = 0;
+  while ni1 < 32 { let _ = buf_write_byte(buf1, (EAPOL_KEY_NONCE_OFF + ni1) as u32, (0x40 + ni1) as u32); ni1 = ni1 + 1; }
+  let kdi1: i64 = 0;
+  while kdi1 < key_data_len1 {
+    let _ = buf_write_byte(buf1, (EAPOL_KEY_DATA_OFF + kdi1) as u32, ((kdi1 * 7 + 3) & 255) as u32);
+    kdi1 = kdi1 + 1;
+  }
+
+  let parsed1: EapolKeyParsed = eapol_key_parse(buf1, 99 + key_data_len1);
+  if parsed1.ok != 0 { ok = 0; }
+  if parsed1.body_length != (95 + key_data_len1) { ok = 0; }
+  if parsed1.key_data_length != key_data_len1 { ok = 0; }
+  if parsed1.key_data_off != EAPOL_KEY_DATA_OFF { ok = 0; }
+  if parsed1.frame_len != (99 + key_data_len1) { ok = 0; }
+
+  let kck1: mut ref i64 = dhruva_alloc_bytes(16);
+  let ki1: i64 = 0;
+  while ki1 < 16 { let _ = buf_write_byte(kck1, ki1 as u32, 0x55 as u32); ki1 = ki1 + 1; }
+  let frame_len1: i64 = 99 + key_data_len1;
+  let _ = eapol_key_set_mic(buf1, frame_len1, kck1, 16);
+
+  let exp_mic1: mut ref i64 = dhruva_alloc_bytes(16);
+  let em1: [u8; 16] = [
+    0xb2 as u8, 0x71 as u8, 0xab as u8, 0xca as u8, 0xfb as u8, 0x49 as u8, 0xfd as u8, 0x05 as u8,
+    0x16 as u8, 0x36 as u8, 0x2f as u8, 0xc7 as u8, 0x79 as u8, 0xbb as u8, 0x4b as u8, 0x02 as u8
+  ];
+  let emi1: i64 = 0;
+  while emi1 < 16 { let _ = buf_write_byte(exp_mic1, emi1 as u32, em1[emi1] as u32); emi1 = emi1 + 1; }
+  let mic_off1: mut ref i64 = dhruva_alloc_bytes(16);
+  let mo1: i64 = 0;
+  while mo1 < 16 { let _ = buf_write_byte(mic_off1, mo1 as u32, buf_read_byte(buf1, (EAPOL_KEY_MIC_OFF + mo1) as u32)); mo1 = mo1 + 1; }
+  if sha256_bytes_equal(mic_off1, exp_mic1, 16) == 0 { ok = 0; }
+  if eapol_key_verify_mic(buf1, frame_len1, kck1, 16) != 0 { ok = 0; }
+
+  // Negative case: flip one Key Data byte, verification must fail.
+  let tampered: u32 = buf_read_byte(buf1, EAPOL_KEY_DATA_OFF as u32) ^ (1 as u32);
+  let _ = buf_write_byte(buf1, EAPOL_KEY_DATA_OFF as u32, tampered);
+  if eapol_key_verify_mic(buf1, frame_len1, kck1, 16) == 0 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: EAPOL-Key frame parse/build + HMAC-SHA1-128 MIC vs an independently-computed reference, 2 sizes + tamper-detect -- WPA2 4-way-handshake groundwork");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -30750,6 +31100,11 @@ fn kernel_main() -> i64 {
   // WPA2's actual data-frame encryption. See aes_ccmp_self_test's own
   // header comment.
   let _ = aes_ccmp_self_test();
+
+  // Task #164 (WiFi/WPA2) groundwork: EAPOL-Key frame parsing/building,
+  // the 4-way handshake's actual wire format. See
+  // eapol_key_self_test's own header comment.
+  let _ = eapol_key_self_test();
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   let _ = chacha20_self_test();
