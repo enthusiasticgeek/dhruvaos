@@ -92,3 +92,117 @@ usb_wifi_fw_upload_len_set:
     mov r0, #0
     mov r1, #0
     bx lr
+
+/* TASK #164 FOLLOW-UP (real USB TX/RX for 802.11 frames): bulk
+ * endpoint address/max-packet-size and data-toggle state, same shape
+ * as usb_net_state.S's own fields -- dwc2_fetch_and_set_configuration
+ * (which discovers these while walking the config descriptor) and
+ * dwc2_wifi_bulk_out/in (which actually use them) are separate calls
+ * with nothing else to carry this across. A separate module from
+ * usb_net_state.S, not a shared one, for the same isolation reason
+ * usb_net_state.S's own header comment already gives for why IT is
+ * separate from usb_msd_state.S: a non-WiFi device enumerating after
+ * a WiFi one (or vice versa) must not inherit stale endpoint state. */
+.align 4
+usb_wifi_bulk_in_epaddr:
+    .word 0
+usb_wifi_bulk_in_mps:
+    .word 0
+usb_wifi_bulk_out_epaddr:
+    .word 0
+usb_wifi_bulk_out_mps:
+    .word 0
+usb_wifi_in_toggle:
+    .word 0
+usb_wifi_out_toggle:
+    .word 0
+
+.global usb_wifi_get_bulk_in_epaddr
+usb_wifi_get_bulk_in_epaddr:
+    ldr r0, =usb_wifi_bulk_in_epaddr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_bulk_in_epaddr
+usb_wifi_set_bulk_in_epaddr:
+    ldr r1, =usb_wifi_bulk_in_epaddr
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_bulk_in_mps
+usb_wifi_get_bulk_in_mps:
+    ldr r0, =usb_wifi_bulk_in_mps
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_bulk_in_mps
+usb_wifi_set_bulk_in_mps:
+    ldr r1, =usb_wifi_bulk_in_mps
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_bulk_out_epaddr
+usb_wifi_get_bulk_out_epaddr:
+    ldr r0, =usb_wifi_bulk_out_epaddr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_bulk_out_epaddr
+usb_wifi_set_bulk_out_epaddr:
+    ldr r1, =usb_wifi_bulk_out_epaddr
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_bulk_out_mps
+usb_wifi_get_bulk_out_mps:
+    ldr r0, =usb_wifi_bulk_out_mps
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_bulk_out_mps
+usb_wifi_set_bulk_out_mps:
+    ldr r1, =usb_wifi_bulk_out_mps
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_in_toggle
+usb_wifi_get_in_toggle:
+    ldr r0, =usb_wifi_in_toggle
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_in_toggle
+usb_wifi_set_in_toggle:
+    ldr r1, =usb_wifi_in_toggle
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_out_toggle
+usb_wifi_get_out_toggle:
+    ldr r0, =usb_wifi_out_toggle
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_out_toggle
+usb_wifi_set_out_toggle:
+    ldr r1, =usb_wifi_out_toggle
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr

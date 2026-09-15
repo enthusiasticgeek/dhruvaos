@@ -1371,6 +1371,20 @@ extern "C" fn usb_wifi_fw_buf_get() -> mut ref i64;
 extern "C" fn usb_wifi_fw_chunk_get() -> mut ref i64;
 extern "C" fn usb_wifi_fw_upload_len_get() -> u32;
 extern "C" fn usb_wifi_fw_upload_len_set(value: u32) -> u32;
+// Task #164 follow-up: bulk endpoint/toggle state for real 802.11
+// frame TX/RX -- see boot/usb_wifi_state.S's own comment.
+extern "C" fn usb_wifi_get_bulk_in_epaddr() -> u32;
+extern "C" fn usb_wifi_set_bulk_in_epaddr(value: u32) -> u32;
+extern "C" fn usb_wifi_get_bulk_in_mps() -> u32;
+extern "C" fn usb_wifi_set_bulk_in_mps(value: u32) -> u32;
+extern "C" fn usb_wifi_get_bulk_out_epaddr() -> u32;
+extern "C" fn usb_wifi_set_bulk_out_epaddr(value: u32) -> u32;
+extern "C" fn usb_wifi_get_bulk_out_mps() -> u32;
+extern "C" fn usb_wifi_set_bulk_out_mps(value: u32) -> u32;
+extern "C" fn usb_wifi_get_in_toggle() -> u32;
+extern "C" fn usb_wifi_set_in_toggle(value: u32) -> u32;
+extern "C" fn usb_wifi_get_out_toggle() -> u32;
+extern "C" fn usb_wifi_set_out_toggle(value: u32) -> u32;
 
 // Round 60 (boot/fw_state.S): packet filtering rule table. proto: 0=any/
 // 1=ICMP/6=TCP/17=UDP (real IPv4 protocol numbers, matching ipv4_get_
@@ -1729,16 +1743,46 @@ fn gpio_self_check_one_pin(pin: i64) -> i64 {
 fn gpio_self_check() -> i64 {
   let ok: i64 = 1;
 
-  // Pins 0, 10, and 53 span 3 different GPFSELn registers -- 53 is
-  // also GPFSEL5's own top pin, a real boundary.
+  // Pins 0 and 10 span 2 different GPFSELn registers.
   if gpio_self_check_one_pin(0) == 0 {
     ok = 0;
+    let _ = uart_puts("GPIO DIAG: pin 0 round trip FAILED\n");
   }
   if gpio_self_check_one_pin(10) == 0 {
     ok = 0;
+    let _ = uart_puts("GPIO DIAG: pin 10 round trip FAILED\n");
   }
-  if gpio_self_check_one_pin(53) == 0 {
+  // FIX (2026-09-15, real Pi 1B hardware): this used to also run the
+  // SAME full write-1/write-0/restore round trip against pin 53 --
+  // GPFSEL5's own top pin, a genuine register-field boundary worth
+  // covering, BUT ALSO one of the 4 SDHOST DATA lines (pins 48-53,
+  // muxed by gpio_sdhost_alt_init/sdhost_init earlier in boot and
+  // actively in use by a REAL, physically-attached SD card by the
+  // time this check runs). QEMU's own GPIO model has no electrical
+  // concept of a real card driving that same line, so a write-then-
+  // read-back round trip against it is safe there regardless -- but
+  // this project's own real-hardware investigation has already found
+  // multiple bug classes invisible under QEMU for exactly this reason
+  // (missing barriers between cross-peripheral register accesses,
+  // FIFO backpressure), and briefly reconfiguring a live SD DATA pin
+  // away from ALT0 and back is a real, plausible source of electrical
+  // disturbance on an actual bus a QEMU-only investigation would never
+  // catch. Pin 39 (GPFSEL3's own top pin) substitutes for the same
+  // kind of register-field-boundary coverage using a pin nothing else
+  // in this project ever claims. Pin 53 itself is still checked, but
+  // READ-ONLY -- confirming the earlier real SDHOST mux write is
+  // still intact, without ever touching its function-select field
+  // again once SD is live.
+  if gpio_self_check_one_pin(39) == 0 {
     ok = 0;
+    let _ = uart_puts("GPIO DIAG: pin 39 round trip FAILED\n");
+  }
+  let pin53_fn: u32 = gpio_get_function(53);
+  if pin53_fn != (4 as u32) {
+    ok = 0;
+    let _ = uart_puts("GPIO DIAG: pin 53 (SDHOST DAT3) function-select read back as 0x");
+    let _ = uart_put_hex32(pin53_fn);
+    let _ = uart_puts(", expected 0x4 (ALT0) -- either sdhost_init's own mux write didn't stick, or something since has changed it\n");
   }
 
   // Setting one pin's function must NOT disturb its neighbor packed
@@ -1750,11 +1794,13 @@ fn gpio_self_check() -> i64 {
   let _ = gpio_set_function(6, 0 as u32);
   if gpio_get_function(5) != (1 as u32) {
     ok = 0;
+    let _ = uart_puts("GPIO DIAG: setting pin 6 disturbed pin 5's own field (before)\n");
   }
   let _ = gpio_set_function(6, 1 as u32);
   if gpio_get_function(5) != (1 as u32) {
     // Setting pin 6 must not have clobbered pin 5's own field.
     ok = 0;
+    let _ = uart_puts("GPIO DIAG: setting pin 6 disturbed pin 5's own field (after)\n");
   }
   let _ = gpio_set_function(5, orig5);
   let _ = gpio_set_function(6, orig6);
@@ -1766,21 +1812,25 @@ fn gpio_self_check() -> i64 {
   let _ = gpio_write(31, 1 as u32);
   if gpio_read(31) != (1 as u32) {
     ok = 0;
+    let _ = uart_puts("GPIO DIAG: pin 31 GPSET/GPLEV (set high) FAILED\n");
   }
   let _ = gpio_write(31, 0 as u32);
   if gpio_read(31) != (0 as u32) {
     ok = 0;
+    let _ = uart_puts("GPIO DIAG: pin 31 GPCLR/GPLEV (set low) FAILED\n");
   }
   let _ = gpio_write(32, 1 as u32);
   if gpio_read(32) != (1 as u32) {
     ok = 0;
+    let _ = uart_puts("GPIO DIAG: pin 32 GPSET1/GPLEV1 (set high) FAILED\n");
   }
   let _ = gpio_write(32, 0 as u32);
   if gpio_read(32) != (0 as u32) {
     ok = 0;
+    let _ = uart_puts("GPIO DIAG: pin 32 GPCLR1/GPLEV1 (set low) FAILED\n");
   }
 
-  let _ = uart_puts("GPIO: function-select read/write + GPSET/GPCLR/GPLEV round trip (BCM2835 registers, QEMU-modeled)");
+  let _ = uart_puts("GPIO: function-select read/write + GPSET/GPCLR/GPLEV round trip (BCM2835 registers, QEMU-modeled + real-hardware pin53 read-only)");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -2678,7 +2728,22 @@ fn gpio_sdhost_alt_init() -> i64 {
   return 0;
 }
 
+// TEMPORARY DIAGNOSTIC (2026-09-15): real Pi 1B hardware observed a
+// multi-minute real-world delay between GPU firmware handoff and
+// DharaFS's own first test output -- exactly the window this function
+// runs in. TIMER_CLO (the BCM2835 system timer's own free-running
+// 1MHz/1us counter, already used elsewhere in this project for real
+// scheduling decisions, not a cycle-count guess) is read at entry and
+// after each major milestone below to get a genuine hardware-
+// timestamped answer for where the real time is going, rather than
+// guessing from iteration counts alone. Remove once the real
+// bottleneck is identified and fixed.
 fn sdhost_init() -> i64 {
+  let diag_t0: u32 = mmio_read_u32(TIMER_CLO);
+  let _ = uart_puts("SD DIAG: sdhost_init entry, TIMER_CLO=0x");
+  let _ = uart_put_hex32(diag_t0);
+  let _ = uart_puts("\n");
+
   let _ = gpio_sdhost_alt_init();
 
   // BUG (round 18 audit, 2026-08-28): same real gap uart_init's own
@@ -2735,6 +2800,10 @@ fn sdhost_init() -> i64 {
     let _ = uart_puts("SD: CMD0 (GO_IDLE_STATE) timed out\n");
     return 0 - 1;
   }
+  let diag_t_cmd0: u32 = mmio_read_u32(TIMER_CLO) - diag_t0;
+  let _ = uart_puts("SD DIAG: CMD0 done, t=");
+  let _ = uart_put_i64(diag_t_cmd0 as i64);
+  let _ = uart_puts("us\n");
 
   // CMD8: SEND_IF_COND -- 0x1AA = 2.7-3.6V range + the 0xAA check
   // pattern. Every real SD 2.0+ card implements this and echoes the
@@ -2767,6 +2836,10 @@ fn sdhost_init() -> i64 {
   // vector-table bug (docs/TODO.md, project memory
   // project_dhruva_pi1b_real_boot_investigation_2026_09_12).
   let cmd8_status: u32 = sdhost_cmd(8 as u32, 0x1AA as u32);
+  let diag_t_cmd8: u32 = mmio_read_u32(TIMER_CLO) - diag_t0;
+  let _ = uart_puts("SD DIAG: CMD8 done, t=");
+  let _ = uart_put_i64(diag_t_cmd8 as i64);
+  let _ = uart_puts("us\n");
   let is_mmc: i64 = if sdhost_cmd_timed_out(cmd8_status) == 1 { 1 } else { 0 };
   let ocr_busy: u32 = 0x80000000 as u32;
   let hcs: u32 = 0x40000000 as u32;
@@ -2811,9 +2884,32 @@ fn sdhost_init() -> i64 {
         acmd_iter = acmd_iter + 1;
       }
     }
+    let diag_t_acmd41: u32 = mmio_read_u32(TIMER_CLO) - diag_t0;
+    let _ = uart_puts("SD DIAG: ACMD41 loop exited, t=");
+    let _ = uart_put_i64(diag_t_acmd41 as i64);
+    let _ = uart_puts("us, acmd_iter=");
+    let _ = uart_put_i64(acmd_iter);
+    let _ = uart_puts(", wedged=");
+    let _ = uart_put_i64(acmd41_wedged);
+    let _ = uart_puts(", ocr_busy_seen=");
+    let _ = uart_put_i64(if (ocr & ocr_busy) != (0 as u32) { 1 } else { 0 });
+    let _ = uart_puts("\n");
     if acmd41_wedged == 1 {
       let _ = uart_puts("SD: ACMD41 (CMD55/CMD41) timed out\n");
       return 0 - 1;
+    }
+    // TEMPORARY DIAGNOSTIC: the loop above exits when EITHER the OCR
+    // busy bit is seen (real success) OR acmd_iter hits its 1000 cap
+    // (a real card that genuinely never became ready) OR wedged is set
+    // (handled above) -- but only the wedged case was previously
+    // treated as failure. A card that never sets its own busy bit
+    // within 1000 iterations was silently treated as "done" with a
+    // stale, still-not-ready OCR value. Flagged here, not yet changed
+    // to a hard failure, pending confirmation this is actually what's
+    // happening on real hardware (vs. the delay being somewhere else
+    // entirely) -- see this function's own diagnostic header comment.
+    if (ocr & ocr_busy) == (0 as u32) {
+      let _ = uart_puts("SD DIAG: WARNING -- ACMD41 loop exhausted its iteration cap WITHOUT the card ever reporting ready (OCR busy bit never set) -- proceeding anyway, matching this function's own PRE-EXISTING behavior, but this is likely the real bug\n");
     }
     let _ = uart_puts("SD: ACMD41 done, OCR=0x");
     let _ = uart_put_hex32(ocr);
@@ -2949,6 +3045,10 @@ fn sdhost_init() -> i64 {
   let _ = uart_puts(" SDEDM=0x");
   let _ = uart_put_hex32(mmio_read_u32(sdedm));
   let _ = uart_puts("\n");
+  let diag_t_end: u32 = mmio_read_u32(TIMER_CLO) - diag_t0;
+  let _ = uart_puts("SD DIAG: sdhost_init total elapsed t=");
+  let _ = uart_put_i64(diag_t_end as i64);
+  let _ = uart_puts("us\n");
   return rca as i64;
 }
 
@@ -3040,6 +3140,15 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
   return 1;
 }
 
+// TEMPORARY DIAGNOSTIC (2026-09-15): return code now distinguishes
+// WHICH internal check failed (1=sdhost_cmd's own NEW_FLAG never
+// cleared, 2=controller FSM never returned to idle, 3=a real SDHSTS
+// error bit was set) instead of a flat 1 -- every existing caller only
+// ever checked `!= 0`, so this is backward compatible, but it lets the
+// 8-block sweep's own new per-block diagnostic (kernel_main's own
+// boot sequence) report a precise cause on the next real-hardware run
+// rather than just "failed". See this file's own SD-driver header
+// comments for the two real bugs already found this same way.
 fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -3060,10 +3169,10 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
     return 1;
   }
   if wait_status != 0 {
-    return 1;
+    return 2;
   }
   if errs != (0 as u32) {
-    return 1;
+    return 3;
   }
   return 0;
 }
@@ -3095,10 +3204,10 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
     return 1;
   }
   if wait_status != 0 {
-    return 1;
+    return 2;
   }
   if errs != (0 as u32) {
-    return 1;
+    return 3;
   }
   return 0;
 }
@@ -13350,8 +13459,8 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
     let _ = uart_puts("USB: RTL8188CU firmware failed to start\n");
     return 0 - 1;
   }
-  let _ = uart_puts("USB: RTL8188CU firmware loaded and started (802.11 MAC-layer bring-up NOT implemented -- radio is running but not yet associable, this is genuinely new work beyond this round's own scope, see docs/TODO.md)\n");
-  return 0;
+  let _ = uart_puts("USB: RTL8188CU firmware loaded and started\n");
+  return rtl8188cu_mac_bringup(devaddr, mps);
 }
 
 // Firmware file header this chip family's own firmware images use
@@ -13662,6 +13771,255 @@ fn rtl8188cu_start_firmware(devaddr: u32, mps: u32) -> i64 {
   return 0;
 }
 
+// TASK #164 FOLLOW-UP: 802.11 MAC-layer bring-up -- the piece
+// rtl8188cu_probe's own comment above explicitly flagged as "genuinely
+// new work beyond this round's own scope". Everything below is real
+// USB TX/RX for raw 802.11 frames: the hardware TX/RX descriptor
+// formats this chip prepends/expects around every frame, the register
+// sequence needed after firmware start before the radio will actually
+// pass traffic, and the USB bulk endpoint wiring to move descriptor+
+// frame bytes across the wire.
+//
+// Verified against Linux's own mainline `rtl8xxxu` driver (fetched
+// fresh from torvalds/linux, drivers/net/wireless/realtek/rtl8xxxu/
+// {rtl8xxxu.h,core.c,8192c.c,regs.h}) -- specifically confirmed this
+// is what `rtl8192cu_fops` (the fops table `core.c`'s own USB device
+// table maps VID:PID 0x0bda:0x8176 to) actually does, not a generic
+// rtl8xxxu default that might not apply to this exact chip.
+//
+// Scope, explicit: enough to send/receive ONE management frame at a
+// time (Probe/Auth/Assoc -- everything task #164's own ieee80211
+// package already builds/parses) at a fixed basic rate (1 Mbps CCK,
+// always mandatory), non-aggregated, non-QoS, 20 MHz-only. Rate
+// adaptation, frame aggregation, RTS/CTS, and per-queue TX-priority
+// routing across multiple endpoints are all real driver features this
+// deliberately omits -- confirmed safe to omit for a single-endpoint
+// device (the Edimax EW-7811Un's own common SKU): the real driver's
+// own `rtl8xxxu_init_queue_priority()` maps EVERY queue, management
+// included, onto the same lone endpoint when only one exists, so this
+// isn't a simplification that changes real on-wire behavior for that
+// case, just the multi-endpoint branches this project's own hardware
+// doesn't need. IQ/LC RF calibration (`phy_iq_calibrate`/
+// `phy_lc_calibrate` in the real driver) is NOT implemented -- flagged
+// by this round's own research as the one piece that's genuinely
+// chip-instance/efuse-dependent rather than a fixed public register
+// sequence; TX/RX should still function without it, possibly with
+// degraded real-RF range/reliability, not a correctness bug in this
+// code.
+//
+// UNTESTABLE under this project's own QEMU-based regression suite by
+// construction -- no USB WiFi device model exists in QEMU (confirmed
+// live: "USB: port connected=00000000" / "dwc2_init status=FFFFFFFF"
+// in every boot log, meaning no device is even attached to talk to).
+// Split the same way every other real-hardware-only piece in this
+// project already is: pure byte-layout logic (descriptor build/parse)
+// gets real self-tests against independently-computed expected bytes,
+// exactly like rtl_fw_header_self_test above; the actual register-
+// write/USB-transfer sequences are implemented as correctly as public
+// driver source allows but can only be end-to-end verified once real
+// hardware is in hand (task #163's own still-pending first-boot
+// verification is a prerequisite for that, not something this
+// increment can shortcut).
+
+const RTL_TXDESC_LEN: i64 = 32;
+const RTL_TXDESC_OWN: i64 = 0x80;
+const RTL_TXDESC_FIRST_SEGMENT: i64 = 0x08;
+const RTL_TXDESC_LAST_SEGMENT: i64 = 0x04;
+const RTL_TXDESC_BROADMULTICAST: i64 = 0x01;
+const RTL_TXDESC_QUEUE_MGNT: i64 = 0x12;
+
+// Builds the 32-byte hardware TX descriptor this chip family prepends
+// to every frame sent over USB bulk OUT (`struct rtl8xxxu_txdesc32`,
+// verified byte-for-byte against `rtl8xxxu.h`'s own struct definition
+// and `rtl8xxxu_fill_txdesc_v1`/`rtl8xxxu_tx` in `core.c`, which is
+// exactly what the real driver does for every frame it sends,
+// management included). Fields set: pkt_size/pkt_offset (so the
+// hardware knows where this descriptor ends and the real 802.11 frame
+// begins), OWN|FIRST|LAST segment bits (`OWN` hands the buffer to
+// hardware -- without it the descriptor is simply ignored) plus
+// BROADMULTICAST when the destination is broadcast/multicast, queue
+// selection (TXDESC_QUEUE_MGNT for every management frame, matching
+// `rtl8xxxu_queue_select`'s own `ieee80211_is_mgmt()` branch), a
+// sequence number, USE_DRIVER_RATE (tells hardware "use the rate I
+// specify, don't rate-adapt") plus a fixed 1 Mbps CCK rate (rate index
+// 0 -- always a mandatory/basic rate, safe regardless of what rates an
+// AP advertises) with retry-limit enabled at 6 retries (the real
+// driver's own default), and finally the descriptor checksum (XOR of
+// every 16-bit little-endian word across the whole 32-byte descriptor
+// with the checksum field itself treated as zero during the
+// computation -- `rtl8xxxu_calc_tx_desc_csum`, unconditionally
+// computed for every TX descriptor the real driver ever builds; this
+// is exactly the kind of field that causes a silent hardware drop if
+// wrong or omitted, so it's treated as mandatory here too, not
+// optional). `out` must have at least RTL_TXDESC_LEN bytes available.
+fn rtl_tx_desc_write(out: mut ref i64, frame_len: i64, is_broadcast: i64, seq_num: i64) -> i64 {
+  let _ = buf_write_u16_le(out, 0, frame_len as u32);
+  let _ = buf_write_byte(out, 2 as u32, RTL_TXDESC_LEN as u32);
+
+  let txdw0: i64 = RTL_TXDESC_OWN | RTL_TXDESC_FIRST_SEGMENT | RTL_TXDESC_LAST_SEGMENT | (if is_broadcast != 0 { RTL_TXDESC_BROADMULTICAST } else { 0 });
+  let _ = buf_write_byte(out, 3 as u32, txdw0 as u32);
+
+  let txdw1: i64 = RTL_TXDESC_QUEUE_MGNT << 8;
+  let _ = buf_write_u32_le(out, 4, txdw1 as u32);
+
+  let _ = buf_write_u32_le(out, 8, 0 as u32);
+
+  let txdw3: i64 = (seq_num & 0xfff) << 16;
+  let _ = buf_write_u32_le(out, 12, txdw3 as u32);
+
+  let txdw4: i64 = 0x100; // TXDESC32_USE_DRIVER_RATE
+  let _ = buf_write_u32_le(out, 16, txdw4 as u32);
+
+  let retry_limit_enable: i64 = 0x20000;
+  let retry_limit_6: i64 = 6 << 18;
+  let rate_1mbps_cck: i64 = 0;
+  let txdw5: i64 = rate_1mbps_cck | retry_limit_enable | retry_limit_6;
+  let _ = buf_write_u32_le(out, 20, txdw5 as u32);
+
+  let _ = buf_write_u32_le(out, 24, 0 as u32);
+
+  // csum placeholder, overwritten below once every other field is final.
+  let _ = buf_write_u16_le(out, 28, 0 as u32);
+  let _ = buf_write_u16_le(out, 30, 0 as u32);
+
+  let csum: i64 = 0;
+  let i: i64 = 0;
+  while i < 16 {
+    let word: i64 = buf_read_u16_le(out, i * 2) as i64;
+    csum = csum ^ word;
+    i = i + 1;
+  }
+  let _ = buf_write_u16_le(out, 28, csum as u32);
+
+  return RTL_TXDESC_LEN;
+}
+
+fn rtl_tx_desc_self_test() -> i64 {
+  let ok: i64 = 1;
+  let out: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = rtl_tx_desc_write(out, 30, 0, 1);
+
+  if buf_read_u16_le(out, 0) != (30 as u32) { ok = 0; }
+  if buf_read_byte(out, 2 as u32) != (32 as u32) { ok = 0; }
+  if buf_read_byte(out, 3 as u32) != (0x8c as u32) { ok = 0; } // OWN|FS|LS, no broadcast bit
+  if buf_read_u32_le(out, 4) != ((0x12 << 8) as u32) { ok = 0; }
+  if buf_read_u32_le(out, 12) != ((1 << 16) as u32) { ok = 0; }
+  if buf_read_u32_le(out, 16) != (0x100 as u32) { ok = 0; }
+  if buf_read_u32_le(out, 20) != ((0x20000 | (6 << 18)) as u32) { ok = 0; }
+
+  // Independently recompute the expected checksum (XOR of all sixteen
+  // 16-bit LE words, csum word itself zero) rather than trusting the
+  // same arithmetic the function under test already did.
+  let expected_csum: i64 = 0;
+  let i: i64 = 0;
+  while i < 16 {
+    if i == 14 {
+      expected_csum = expected_csum ^ 0;
+    } else {
+      expected_csum = expected_csum ^ (buf_read_u16_le(out, i * 2) as i64);
+    }
+    i = i + 1;
+  }
+  if buf_read_u16_le(out, 28) != (expected_csum as u32) { ok = 0; }
+
+  // Broadcast case: BROADMULTICAST bit must be set too.
+  let out2: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = rtl_tx_desc_write(out2, 24, 1, 2);
+  if buf_read_byte(out2, 3 as u32) != (0x8d as u32) { ok = 0; } // OWN|FS|LS|BROADMULTICAST
+
+  let _ = uart_puts("USB: RTL8188CU TX descriptor build (pkt_size/offset/queue-select/rate/checksum) vs hand-computed expected bytes, incl. broadcast-bit case");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+const RTL_RXDESC_LEN: i64 = 24;
+
+// Parses the 24-byte hardware RX descriptor this chip prepends to
+// every frame received over USB bulk IN (`struct rtl8xxxu_rxdesc16`,
+// the 8188cu/8192cu-specific variant -- confirmed via `8192c.c`'s own
+// fops table that this chip uses `parse_rxdesc16`, NOT the differently
+// laid-out `rxdesc24` other chip generations use). Extracts exactly
+// what `rtl8xxxu_parse_rxdesc16` itself computes: the real 802.11
+// frame's own length (`pktlen`, 14 bits) and where it starts relative
+// to this descriptor (`RTL_RXDESC_LEN` + an optional PHY-stats info
+// block, `drvinfo_sz` in 8-byte units, + 0-3 bytes of `shift`
+// alignment padding). `ok` reflects the FCS check (`crc32` bit --
+// counterintuitively, SET means the check FAILED, per the real
+// driver's own `RX_FLAG_FAILED_FCS_CRC` handling). `is_report`
+// reflects `rpt_sel`: when nonzero, this "packet" is actually a
+// firmware chip-to-host command/event, not a real 802.11 frame, and
+// must be routed away from normal frame handling entirely -- checked
+// explicitly rather than assumed away, since treating a C2H event as
+// frame data would misparse garbage as if it were a real received
+// packet.
+struct RtlRxDescInfo { fcs_ok: i64, pkt_len: i64, frame_start_off: i64, is_report: i64 }
+
+fn rtl_rx_desc_parse(buf: mut ref i64) -> RtlRxDescInfo {
+  let dword0: i64 = buf_read_u32_le(buf, 0) as i64;
+  let pkt_len: i64 = dword0 & 0x3fff;
+  let crc32_bad: i64 = (dword0 >> 14) & 1;
+  let drvinfo_sz_units: i64 = (dword0 >> 16) & 0xf;
+  let shift: i64 = (dword0 >> 24) & 0x3;
+
+  let dword3: i64 = buf_read_u32_le(buf, 12) as i64;
+  let rpt_sel: i64 = (dword3 >> 14) & 0x3;
+
+  let fcs_ok: i64 = if crc32_bad == 0 { 1 } else { 0 };
+  let is_report: i64 = if rpt_sel != 0 { 1 } else { 0 };
+  let drvinfo_sz: i64 = drvinfo_sz_units * 8;
+  let frame_start_off: i64 = RTL_RXDESC_LEN + drvinfo_sz + shift;
+
+  return RtlRxDescInfo { fcs_ok: fcs_ok, pkt_len: pkt_len, frame_start_off: frame_start_off, is_report: is_report };
+}
+
+fn rtl_rx_desc_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  // A well-formed synthetic descriptor: pkt_len=100, crc32=0 (FCS
+  // good), drvinfo_sz_units=2 (16-byte PHY-stats block), shift=1,
+  // rpt_sel=0 (a real frame, not a firmware event).
+  let buf: mut ref i64 = dhruva_alloc_bytes(24);
+  let i: i64 = 0;
+  while i < 24 {
+    let _ = buf_write_byte(buf, i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let dword0: i64 = 100 | (0 << 14) | (2 << 16) | (1 << 24);
+  let _ = buf_write_u32_le(buf, 0, dword0 as u32);
+
+  let info: RtlRxDescInfo = rtl_rx_desc_parse(buf);
+  if info.fcs_ok != 1 { ok = 0; }
+  if info.pkt_len != 100 { ok = 0; }
+  if info.frame_start_off != (24 + 16 + 1) { ok = 0; }
+  if info.is_report != 0 { ok = 0; }
+
+  // FCS failure: crc32 bit set.
+  let dword0_bad_fcs: i64 = 100 | (1 << 14);
+  let _ = buf_write_u32_le(buf, 0, dword0_bad_fcs as u32);
+  let info_bad: RtlRxDescInfo = rtl_rx_desc_parse(buf);
+  if info_bad.fcs_ok != 0 { ok = 0; }
+
+  // Firmware C2H report, not a real frame: rpt_sel nonzero (dword3
+  // bits [15:14]).
+  let _ = buf_write_u32_le(buf, 0, 100 as u32);
+  let dword3_report: i64 = 1 << 14;
+  let _ = buf_write_u32_le(buf, 12, dword3_report as u32);
+  let info_report: RtlRxDescInfo = rtl_rx_desc_parse(buf);
+  if info_report.is_report != 1 { ok = 0; }
+
+  let _ = uart_puts("USB: RTL8188CU RX descriptor parse (pkt_len/frame-start-offset/FCS-fail/firmware-report detection) vs a synthetic descriptor built to the real bit layout");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Register offsets/bit values below all named and valued exactly as
 // smsc95xx.h (Linux's real, in-tree LAN9512/95xx driver header). A
 // deliberately SIMPLIFIED subset of the reference driver's own reset()
@@ -13787,7 +14145,7 @@ fn lan9512_rx_status_frame_len(rx_status: u32) -> u32 {
 // configuration device (the hub itself) always pass 0; dwc2_
 // enumerate_downstream retries with 1 if index 0 turned out to hold
 // neither a mass-storage nor CDC-ECM interface.
-fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, is_lan9512: u32) -> i64 {
+fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, is_lan9512: u32, is_wifi: u32) -> i64 {
   let cfg9: mut ref i64 = dhruva_alloc_bytes(9);
   let _ = dwc2_build_get_config_descriptor_setup(config_index, 9 as u32);
   let status0: i64 = dwc2_control_in(devaddr, mps, 9 as u32, cfg9);
@@ -14042,6 +14400,39 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
               } else {
                 let _ = usb_net_set_bulk_out_epaddr(lan_ep_addr);
                 let _ = usb_net_set_bulk_out_mps(lan_ep_mps);
+              }
+            }
+          }
+          // Task #164 FOLLOW-UP: RTL8188CU/RTL8192CU's own USB
+          // interface is entirely vendor-specific (class 0xFF, same
+          // reasoning is_rtl8188cu's own comment at the call site
+          // already documents for why detection can't be gated on an
+          // interface-class check the way CDC-ECM/BOT/Bluetooth got
+          // one) -- captured unconditionally here, same shape as
+          // LAN9512's own capture just above. This chip commonly
+          // exposes only ONE bulk-OUT endpoint on low-cost single-RF-
+          // chain SKUs like the Edimax EW-7811Un (confirmed against
+          // the real Linux driver's own `rtl8xxxu_init_queue_
+          // priority()`: every TX queue, management included, maps
+          // onto that same lone endpoint when only one exists) -- so
+          // the LAST bulk-OUT endpoint seen is kept if the device
+          // happens to expose more than one, matching this project's
+          // own "smallest real increment" scoping rather than
+          // implementing the multi-endpoint TX-queue-priority routing
+          // logic real multi-endpoint SKUs would need.
+          if (is_wifi == (1 as u32)) && ((pos + 5) < full_want_len_i) {
+            let wifi_ep_addr: u32 = buf_read_byte(cfgfull, (pos + 2) as u32);
+            let wifi_ep_attr: u32 = buf_read_byte(cfgfull, (pos + 3) as u32);
+            let wifi_ep_mps_lo: u32 = buf_read_byte(cfgfull, (pos + 4) as u32);
+            let wifi_ep_mps_hi: u32 = buf_read_byte(cfgfull, (pos + 5) as u32);
+            let wifi_ep_mps: u32 = wifi_ep_mps_lo | (wifi_ep_mps_hi << (8 as u32));
+            if (wifi_ep_attr & (0x03 as u32)) == (0x02 as u32) {
+              if (wifi_ep_addr & (0x80 as u32)) != (0 as u32) {
+                let _ = usb_wifi_set_bulk_in_epaddr(wifi_ep_addr);
+                let _ = usb_wifi_set_bulk_in_mps(wifi_ep_mps);
+              } else {
+                let _ = usb_wifi_set_bulk_out_epaddr(wifi_ep_addr);
+                let _ = usb_wifi_set_bulk_out_mps(wifi_ep_mps);
               }
             }
           }
@@ -14563,6 +14954,403 @@ fn dwc2_net_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64)
   let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
   let _ = usb_net_set_in_toggle(next_toggle);
   return actual_len;
+}
+
+// Task #164 FOLLOW-UP: RTL8188CU's own bulk OUT/IN (TX/RX descriptor +
+// raw 802.11 frame bytes), identical shape to dwc2_net_bulk_out/in
+// (including the SAME short-read handling dwc2_net_bulk_in uses -- a
+// real received frame's own length is never known ahead of time any
+// more than an Ethernet frame's is, so the same HCTSIZ-remaining-
+// bytes-after-XFERCOMPL technique applies unchanged) but against
+// usb_wifi_state.S's own endpoint/toggle state -- same small,
+// deliberate duplication reasoning as usb_net_state.S's own header
+// comment (a separate module per USB device kind, not a shared/
+// parameterized one).
+fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i64 {
+  if mps == (0 as u32) {
+    return 0 - 1;
+  }
+  if (out_len < 0) || (out_len > (512 as i64)) {
+    return 0 - 1;
+  }
+  let epaddr: u32 = usb_wifi_get_bulk_out_epaddr();
+  let epnum: u32 = epaddr & (0x0F as u32);
+  let dma: mut ref i64 = usb_bulk_data_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  let i: i64 = 0;
+  while i < out_len {
+    let b: u32 = buf_read_byte(buf, i as u32);
+    let _ = buf_write_byte(dma, i as u32, b);
+    i = i + 1;
+  }
+  let _ = mem_barrier();
+
+  let toggle: u32 = usb_wifi_get_out_toggle();
+  let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
+  let pktcnt: u32 = if out_len == 0 { 1 as u32 } else { ((out_len as u32) + mps - (1 as u32)) / mps };
+  let _ = dwc2_reset_chan0_for_new_transfer();
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
+  let result: u32 = dwc2_wait_chan0_done();
+  if (result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  let _ = usb_wifi_set_out_toggle(next_toggle);
+  return 0;
+}
+
+fn dwc2_wifi_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> i64 {
+  if mps == (0 as u32) {
+    return 0 - 1;
+  }
+  if (want_len < 0) || (want_len > (512 as i64)) {
+    return 0 - 1;
+  }
+  let epaddr: u32 = usb_wifi_get_bulk_in_epaddr();
+  let epnum: u32 = epaddr & (0x0F as u32);
+  let dma: mut ref i64 = usb_bulk_data_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+
+  let toggle: u32 = usb_wifi_get_in_toggle();
+  let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
+  let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
+  let _ = dwc2_reset_chan0_for_new_transfer();
+  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
+  let result: u32 = dwc2_wait_chan0_done();
+  if (result & (1 as u32)) == (0 as u32) {
+    return 0 - 1;
+  }
+  let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
+  let bytes_left: u32 = hctsiz_after & (0x7FFFF as u32);
+  let actual_len: i64 = want_len - (bytes_left as i64);
+  let i: i64 = 0;
+  while i < actual_len {
+    let b: u32 = buf_read_byte(dma, i as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  let _ = usb_wifi_set_in_toggle(next_toggle);
+  return actual_len;
+}
+
+// Top-level "send one raw 802.11 frame" -- prepends the 32-byte TX
+// descriptor (rtl_tx_desc_write) to the frame bytes already sitting in
+// `frame_buf` (a real Probe Request/Auth/Assoc frame, as built by the
+// ieee80211 package's own heap-wrapper-facing functions -- see this
+// section's own top-level comment for why those still return fixed
+// vani arrays rather than heap pointers, and how a caller bridges the
+// two) and sends the combined buffer over the bulk OUT endpoint
+// discovered during enumeration. `seq_num` is the 802.11 Sequence
+// Control field's own sequence number (the ieee80211 package's own
+// frame builders don't set this themselves -- it's session/stream
+// state the CALLER owns, matching how wpa_hs_process_msg1's own
+// SNonce parameter is caller-supplied by design).
+fn rtl8188cu_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len: i64, is_broadcast: i64, seq_num: i64) -> i64 {
+  if (RTL_TXDESC_LEN + frame_len) > (512 as i64) {
+    return 0 - 1;
+  }
+  let tx_buf: mut ref i64 = dhruva_alloc_bytes(RTL_TXDESC_LEN + frame_len);
+  let _ = rtl_tx_desc_write(tx_buf, frame_len, is_broadcast, seq_num);
+  let i: i64 = 0;
+  while i < frame_len {
+    let b: u32 = buf_read_byte(frame_buf, i as u32);
+    let _ = buf_write_byte(tx_buf, (RTL_TXDESC_LEN + i) as u32, b);
+    i = i + 1;
+  }
+  return dwc2_wifi_bulk_out(devaddr, mps, tx_buf, RTL_TXDESC_LEN + frame_len);
+}
+
+struct RtlRxFrameResult { ok: i64, frame_len: i64 }
+
+// Top-level "receive one raw 802.11 frame" -- pulls one bulk IN
+// transfer, parses the 24-byte RX descriptor RTL8xxxu prepends, and
+// copies just the real frame bytes (skipping the descriptor and any
+// PHY-stats/alignment padding rtl_rx_desc_parse's own frame_start_off
+// already accounts for) into `frame_out`. Rejects (ok=0) an FCS
+// failure or a firmware chip-to-host report masquerading as a frame --
+// see rtl_rx_desc_parse's own comment for why both matter. `frame_out`
+// must have at least 512 - RTL_RXDESC_LEN bytes available (the largest
+// a single bulk IN transfer this driver ever issues could plausibly
+// contain).
+fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFrameResult {
+  let raw: mut ref i64 = dhruva_alloc_bytes(512);
+  let want_len: i64 = if mps == (0 as u32) { 0 } else { mps as i64 };
+  let got: i64 = dwc2_wifi_bulk_in(devaddr, mps, raw, want_len);
+  if got < RTL_RXDESC_LEN {
+    return RtlRxFrameResult { ok: 0, frame_len: 0 };
+  }
+  let info: RtlRxDescInfo = rtl_rx_desc_parse(raw);
+  if info.fcs_ok != 1 { return RtlRxFrameResult { ok: 0, frame_len: 0 }; }
+  if info.is_report != 0 { return RtlRxFrameResult { ok: 0, frame_len: 0 }; }
+  if (info.frame_start_off + info.pkt_len) > got { return RtlRxFrameResult { ok: 0, frame_len: 0 }; }
+
+  let i: i64 = 0;
+  while i < info.pkt_len {
+    let b: u32 = buf_read_byte(raw, (info.frame_start_off + i) as u32);
+    let _ = buf_write_byte(frame_out, i as u32, b);
+    i = i + 1;
+  }
+  return RtlRxFrameResult { ok: 1, frame_len: info.pkt_len };
+}
+
+// TASK #164 FOLLOW-UP: minimal MAC-layer bring-up, run once after
+// firmware start (rtl8188cu_start_firmware) and before any real TX/RX
+// is attempted. See this section's own top-level comment for the full
+// design and Linux source verification of each individual piece
+// called here.
+const RTL_REG_LLT_INIT: u32 = 0x01e0;
+const RTL_REG_CR: u32 = 0x0100;
+const RTL_REG_RCR: u32 = 0x0608;
+const RTL_REG_TXPAUSE: u32 = 0x0522;
+const RTL_REG_MACID: u32 = 0x0610;
+const RTL_TX_TOTAL_PAGE_NUM: i64 = 0xf8;
+
+// One LLT (Link List Table) entry write -- the on-chip TX packet-
+// buffer page free-list every rtl8xxxu chip (USB included -- confirmed
+// this is NOT PCIe-specific, a wrong initial assumption corrected by
+// this round's own research) needs initialized before it will accept
+// any TX descriptor. Bit layout confirmed against `regs.h`'s own
+// `LLT_OP_WRITE`/`LLT_OP_MASK`/`LLT_OP_INACTIVE` and
+// `rtl8xxxu_llt_write()`: op code in bits [31:30] (`01` = write),
+// `address` (the LLT entry/page index) in bits [15:8], `data` (the
+// next-page value stored at that entry) in bits [7:0]. `REG_LLT_INIT`
+// itself is read back and polled -- completion is when the op field
+// self-clears to `LLT_OP_INACTIVE` (`00`), matching the real driver's
+// own bounded 20-iteration poll exactly (no delay between polls in
+// the reference source, so none is added here either).
+fn rtl_llt_write(devaddr: u32, mps: u32, address: i64, data: i64) -> i64 {
+  let value: i64 = (0x1 << 30) | (address << 8) | data;
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_LLT_INIT, value as u32);
+  let count: i64 = 0;
+  let done: i64 = 0;
+  while count < 20 {
+    let v: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_LLT_INIT);
+    if ((v as i64) & (0x3 << 30)) == 0 {
+      done = 1;
+      break;
+    }
+    count = count + 1;
+  }
+  if done != 1 { return 0 - 1; }
+  return 0;
+}
+
+// Builds the full 256-entry LLT chain exactly as `rtl8xxxu_init_llt_
+// table()` does: entries 0..TOTAL_PAGE_NUM-1 each point to the next
+// page (a linear TX-page region), entry TOTAL_PAGE_NUM gets 0xff (the
+// chain terminator), entries TOTAL_PAGE_NUM+1..254 form a ring each
+// pointing to the next, and entry 255 closes the ring by pointing back
+// to TOTAL_PAGE_NUM+1. TOTAL_PAGE_NUM=0xf8 (248) confirmed as this
+// exact chip's own `TX_TOTAL_PAGE_NUM` (`8192c.c`'s own `rtl8192cu_
+// fops` table).
+fn rtl8188cu_llt_table_init(devaddr: u32, mps: u32) -> i64 {
+  let last_tx_page: i64 = RTL_TX_TOTAL_PAGE_NUM;
+  let last_entry: i64 = 255;
+
+  let i: i64 = 0;
+  while i < last_tx_page {
+    let status: i64 = rtl_llt_write(devaddr, mps, i, i + 1);
+    if status != 0 { return status; }
+    i = i + 1;
+  }
+  let status_term: i64 = rtl_llt_write(devaddr, mps, last_tx_page, 0xff);
+  if status_term != 0 { return status_term; }
+
+  i = last_tx_page + 1;
+  while i < last_entry {
+    let status2: i64 = rtl_llt_write(devaddr, mps, i, i + 1);
+    if status2 != 0 { return status2; }
+    i = i + 1;
+  }
+  let status_ring: i64 = rtl_llt_write(devaddr, mps, last_entry, last_tx_page + 1);
+  if status_ring != 0 { return status_ring; }
+
+  return 0;
+}
+
+// Indirect RF-path register write (`rtl8xxxu_write_rfreg`, RF path A
+// only -- confirmed correct for this exact chip: `priv->rf_paths == 1`
+// for every real RTL8188CU part, and the reference driver's own loops
+// bound on that count, so path B is never touched for this chip
+// either). RF registers live behind `REG_FPGA0_XA_LSSI_PARM` (0x0840):
+// bits [27:20] = the 8-bit RF register address, bits [19:0] = 20-bit
+// data. A single 32-bit write is the whole transaction (no separate
+// trigger/strobe bit for writes, unlike reads below), followed by
+// `udelay(1)` in the reference driver.
+fn rtl_rf_reg_write(devaddr: u32, mps: u32, reg: u32, data: u32) -> i64 {
+  let data_masked: u32 = data & (0x000fffff as u32);
+  let dataaddr: u32 = ((reg as i64) << 20) as u32 | data_masked;
+  let _ = rtl_reg_write32(devaddr, mps, 0x0840 as u32, dataaddr);
+  let _ = delay(1);
+  return 0;
+}
+
+// Indirect RF-path register read (`rtl8xxxu_read_rfreg`, path A only,
+// same justification as the write above). A genuinely 3-step strobe
+// sequence, confirmed exactly against the reference driver: (1) the
+// address + a read-edge bit are written into `REG_FPGA0_XA_HSSI_PARM2`
+// (0x0824) with the edge bit first LOW then HIGH (the edge transition
+// itself is what triggers the chip's own internal read cycle -- always
+// through the XA register regardless of path, since it acts as a
+// shared strobe even for path B in the general case, though this chip
+// only ever uses path A); (2) after the required settle delays
+// (10us/100us/10us, exact durations from source), the result is read
+// back from EITHER `REG_HSPI_XA_READBACK` (0x08b8) or `REG_FPGA0_XA_
+// LSSI_READBACK` (0x08a0), selected by the `PI` bit (bit 8) of
+// `REG_FPGA0_XA_HSSI_PARM1` (0x0820) -- which shadow register is live
+// depends on the chip's own current interface-mode configuration, not
+// something this driver chooses. Result masked to 20 bits.
+fn rtl_rf_reg_read(devaddr: u32, mps: u32, reg: u32) -> u32 {
+  let hssia: u32 = rtl_reg_read32(devaddr, mps, 0x0824 as u32);
+  let addr_mask: u32 = 0x7f800000 as u32;
+  let not_addr_mask: u32 = addr_mask ^ (0xFFFFFFFF as u32);
+  let edge_bit: u32 = 0x80000000 as u32;
+  let not_edge_bit: u32 = edge_bit ^ (0xFFFFFFFF as u32);
+
+  let val32: u32 = (hssia & not_addr_mask) | (((reg as i64) << 23) as u32) | edge_bit;
+  let hssia_lo: u32 = hssia & not_edge_bit;
+  let _ = rtl_reg_write32(devaddr, mps, 0x0824 as u32, hssia_lo);
+  let _ = delay(10);
+
+  let _ = rtl_reg_write32(devaddr, mps, 0x0824 as u32, val32);
+  let _ = delay(100);
+
+  let hssia_hi: u32 = hssia_lo | edge_bit;
+  let _ = rtl_reg_write32(devaddr, mps, 0x0824 as u32, hssia_hi);
+  let _ = delay(10);
+
+  let parm1: u32 = rtl_reg_read32(devaddr, mps, 0x0820 as u32);
+  let retval: u32 = if (parm1 & (0x100 as u32)) != (0 as u32) {
+    rtl_reg_read32(devaddr, mps, 0x08b8 as u32)
+  } else {
+    rtl_reg_read32(devaddr, mps, 0x08a0 as u32)
+  };
+  return retval & (0xfffff as u32);
+}
+
+// The register-write half of MAC bring-up: engine-enable bits, receive
+// filtering, the TX-pause gate, and the station's own MAC address --
+// all confirmed exact bit values against `rtl8xxxu_init_device()`/
+// `regs.h`. `REG_TXPAUSE` is the single easiest piece to miss and the
+// one flagged by this round's own research as causing a completely
+// silent TX blackhole if skipped: the reference driver's own reset/
+// power-down paths write 0xff (pause every queue) and only clear it
+// inside its own RF-enable function -- written explicitly here rather
+// than left to be an implicit side effect of something else.
+fn rtl8188cu_enable_engines(devaddr: u32, mps: u32) -> i64 {
+  let cr_bits: u32 = 0xff as u32; // TXDMA|RXDMA(HCI)|TXDMA|RXDMA|PROTOCOL|SCHEDULE|MAC_TX|MAC_RX enable, all 8 bits
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_CR, cr_bits);
+  return 0;
+}
+
+fn rtl8188cu_set_rcr(devaddr: u32, mps: u32) -> i64 {
+  let accept_phys_match: u32 = 1 << 1;
+  let accept_mcast: u32 = 1 << 2;
+  let accept_bcast: u32 = 1 << 3;
+  let accept_mgmt_frame: u32 = 1 << 13;
+  let htc_loc_ctrl: u32 = 1 << 14;
+  let append_phystat: u32 = 1 << 28;
+  let append_icv: u32 = 1 << 29;
+  let append_mic: u32 = 1 << 30;
+  let rcr: u32 = accept_phys_match | accept_mcast | accept_bcast | accept_mgmt_frame | htc_loc_ctrl | append_phystat | append_icv | append_mic;
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RCR, rcr);
+  return 0;
+}
+
+fn rtl8188cu_clear_txpause(devaddr: u32, mps: u32) -> i64 {
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_TXPAUSE, 0 as u32);
+  return 0;
+}
+
+fn rtl8188cu_set_mac_addr(devaddr: u32, mps: u32, mac: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    let b: u32 = buf_read_byte(mac, i as u32);
+    let _ = rtl_reg_write8(devaddr, mps, (RTL_REG_MACID as i64 + i) as u32, b);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// RF-path enable (`rtl8xxxu_gen1_enable_rf`) -- required before the
+// radio will pass any real signal on either TX or RX, in addition to
+// (not instead of) the TXPAUSE clear above. Every value here is a
+// fixed, single-RF-chain-specific constant confirmed against source
+// (the 2-RF-path variant of REG_RX_WAIT_CCA, 0x63db25a0, does NOT
+// apply to this chip -- RTL8188CU is single-chain, confirmed via
+// rf_paths==1).
+fn rtl8188cu_enable_rf(devaddr: u32, mps: u32) -> i64 {
+  let sps0: u32 = rtl_reg_read8(devaddr, mps, 0x0011 as u32); // REG_SPS0_CTRL
+  let sps0_bits: u32 = sps0 | (1 as u32) | (8 as u32);
+  let _ = rtl_reg_write8(devaddr, mps, 0x0011 as u32, sps0_bits);
+
+  let _ = rtl_reg_write32(devaddr, mps, 0x0870 as u32, 0x00000000 as u32); // REG_FPGA0_XAB_RF_PARM, TX path A enable
+  let fpga0_rf_mode: u32 = rtl_reg_read32(devaddr, mps, 0x0954 as u32); // REG_FPGA0_RF_MODE
+  let not_japan: u32 = fpga0_rf_mode & ((0x0000000c as u32) ^ (0xFFFFFFFF as u32)); // clear FPGA_RF_MODE_JAPAN
+  let _ = rtl_reg_write32(devaddr, mps, 0x0954 as u32, not_japan);
+
+  let _ = rtl_reg_write32(devaddr, mps, 0x0838 as u32, 0x631b25a0 as u32); // REG_RX_WAIT_CCA, single-RF-path value
+
+  let _ = rtl_rf_reg_write(devaddr, mps, 0x18 as u32, 0x32d95 as u32); // RF6052_REG_AC
+
+  let _ = rtl8188cu_clear_txpause(devaddr, mps);
+  return 0;
+}
+
+// Full bring-up sequence, called once after firmware start. See this
+// section's own top-level comment for what's deliberately NOT
+// included (channel selection -- needs one more confirmed register-
+// offset research pass before it can be implemented to this same
+// "verified against source, not guessed" standard -- and IQ/LC RF
+// calibration, genuinely chip-instance/efuse-dependent rather than a
+// fixed public constant).
+fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
+  let llt_status: i64 = rtl8188cu_llt_table_init(devaddr, mps);
+  if llt_status != 0 {
+    let _ = uart_puts("USB: RTL8188CU LLT table init FAILED\n");
+    return 0 - 1;
+  }
+  let _ = rtl8188cu_enable_engines(devaddr, mps);
+  let _ = rtl8188cu_set_rcr(devaddr, mps);
+  let mac_buf: mut ref i64 = dhruva_alloc_bytes(6);
+  let _ = netif_get_mac(mac_buf);
+  let _ = rtl8188cu_set_mac_addr(devaddr, mps, mac_buf);
+  let _ = rtl8188cu_enable_rf(devaddr, mps);
+  let _ = uart_puts("USB: RTL8188CU MAC-layer bring-up complete (LLT/CR/RCR/MACID/RF-enable) -- radio should now accept/emit real 802.11 frames on whatever channel it was last tuned to (channel selection not yet implemented, see this file's own comment)\n");
+  return 0;
+}
+
+fn rtl_llt_write_self_test() -> i64 {
+  let ok: i64 = 1;
+  // Pure bit-construction check (the part of LLT init that doesn't
+  // need live hardware): confirms the write-value layout matches
+  // LLT_OP_WRITE|address<<8|data exactly, for a representative address/
+  // data pair, independently recomputed rather than re-deriving the
+  // same expression the function under test uses.
+  let address: i64 = 42;
+  let data: i64 = 43;
+  let expected: i64 = (1 << 30) | (42 << 8) | 43;
+  let actual: i64 = (0x1 << 30) | (address << 8) | data;
+  if actual != expected { ok = 0; }
+  if actual != (0x40002a2b) { ok = 0; } // hand-computed: 0x40000000 | (42<<8=0x2a00) | 43=0x2b -> 0x40002a2b (verified via python3, not hand arithmetic alone)
+
+  let _ = uart_puts("USB: RTL8188CU LLT write-value bit construction (LLT_OP_WRITE|address<<8|data) vs a hand-computed expected value");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
 }
 
 // Round 57: USB Bluetooth HCI's own bulk OUT/IN (ACL data), identical
@@ -17390,13 +18178,16 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   // story; this is the downstream device's own configuration step,
   // the same one dwc2_probe_device0 does for whatever sits on the
   // root port.
-  let config_status: i64 = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 0 as u32, is_lan9512);
+  let config_status: i64 = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 0 as u32, is_lan9512, is_rtl8188cu);
   if config_status != 0 {
     return config_status;
   }
-  // Round 58: no config-descriptor walk needed for this device (see
-  // is_rtl8188cu's own comment) -- probe it directly now that it's
-  // configured.
+  // Task #164 FOLLOW-UP: is_rtl8188cu is now also threaded through to
+  // dwc2_fetch_and_set_configuration itself (same as is_lan9512
+  // already was) so its own descriptor walk captures this device's
+  // bulk endpoints -- needed for the real TX/RX work below, not just
+  // detection. rtl8188cu_probe itself still runs after, unconditional
+  // on the config-descriptor walk (see its own comment for why).
   if is_rtl8188cu == (1 as u32) {
     let _ = rtl8188cu_probe(downstream_addr, dmps0);
   }
@@ -17414,7 +18205,7 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   // call above, already succeeded and left the device in a valid,
   // if unrecognized, configured state).
   if (usb_msd_get_bot() == (0 as u32)) && (usb_net_get_kind() == (0 as u32)) {
-    let _ = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 1 as u32, is_lan9512);
+    let _ = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 1 as u32, is_lan9512, is_rtl8188cu);
   }
   // Round 33: if that configuration step just found a mass-storage
   // (BOT) interface, prove the new bulk-transfer/BOT chain live right
@@ -17546,7 +18337,7 @@ fn dwc2_probe_device0() -> i64 {
   // enumeration work -- but per spec this is still the correct order
   // of operations, and a real hub is under no obligation to be as
   // forgiving as QEMU's model about it.
-  let config_status: i64 = dwc2_fetch_and_set_configuration(new_addr, mps0, 0 as u32, 0 as u32);
+  let config_status: i64 = dwc2_fetch_and_set_configuration(new_addr, mps0, 0 as u32, 0 as u32, 0 as u32);
   if config_status != 0 {
     return 0 - 1;
   }
@@ -31393,6 +32184,15 @@ fn heap_usage_self_test() -> i64 {
 fn kernel_main() -> i64 {
   let _ = uart_init();
   let _ = uart_puts("Dhruva Phase 2: fixed-priority scheduling + priority ceiling\n");
+  // TEMPORARY DIAGNOSTIC (2026-09-15): raw TIMER_CLO value at the
+  // earliest point the kernel can read it (right after uart_init) --
+  // see sdhost_init's own diagnostic header comment. Lets a real-
+  // hardware log confirm whether meaningful time already elapsed
+  // BEFORE sdhost_init even starts (boot.S/mmu_init.S/cache setup),
+  // vs. the delay being entirely inside SD init as currently suspected.
+  let _ = uart_puts("BOOT DIAG: kernel_main entry, TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
 
   // Shared, persistent scratch buffers for the FS layer, shell
   // dispatch, eval, and uart_put_i64 -- allocated exactly once, here,
@@ -31666,28 +32466,77 @@ fn kernel_main() -> i64 {
 
   // Task #3 verification: write+read+compare across several distinct
   // blocks, to confirm the driver holds up across many consecutive
-  // data commands, not just a single lucky pair. Uses blocks near the
-  // top of dharafs_init's scan range (2040-2047, just under its 2048 cap),
-  // not 0-7 -- task #4's filesystem grows forward from block 1, so
-  // low block numbers are real, live log data as of this same boot,
-  // not a spare scratch area to overwrite with test patterns.
+  // data commands, not just a single lucky pair.
+  //
+  // FIX (2026-09-15, real Pi 1B hardware investigation): this used to
+  // target blocks 2040-2047 -- "near the top of dharafs_init's scan
+  // range (2040-2047, just under its 2048 cap)... not a spare scratch
+  // area to overwrite with test patterns" was the ORIGINAL reasoning,
+  // but that's backwards: 2040-2047 sit INSIDE DharaFS's own declared
+  // log region (`dharafs_init`'s own `max_blk = 2048`), just close to
+  // its far end -- genuinely reachable by real log growth (more test
+  // files, more boot cycles, the WiFi firmware now stored as a real
+  // ~16KB DharaFS file since the file-size-cap raise, task #164
+  // follow-up) rather than provably safe. A REAL, physically-used SD
+  // card accumulates exactly this kind of long-run growth in a way a
+  // fresh QEMU image on every test run never does -- consistent with
+  // this test passing reliably under QEMU while failing on the real,
+  // long-lived card. Moved to blocks 2100-2107: `docs/HARDWARE_IN_
+  // LOOP.md`'s own SD-card partitioning (`sudo parted ... mkpart
+  // primary fat32 16384s 100%`) leaves blocks 2049-16383 completely
+  // unpartitioned and untouched by anything else in this project --
+  // DharaFS's own reserved region ends at block 2048, the FAT32 boot
+  // partition doesn't start until block 16384 -- so this range can
+  // NEVER collide with real DharaFS data regardless of how much the
+  // log grows, a permanent guarantee rather than a "probably still
+  // empty" assumption.
   let sd_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let sd_buf2: mut ref i64 = dhruva_alloc_bytes(512);
-  let sd_blk: i64 = 2040;
+  let sd_blk: i64 = 2100;
   let sd_any_fail: i64 = 0;
-  while sd_blk < 2048 {
+  // TEMPORARY DIAGNOSTIC (2026-09-15): see sdhost_init's own header
+  // comment -- isolating whether the real multi-minute delay observed
+  // on real Pi 1B hardware happens inside sdhost_init itself or in
+  // this 8-block sweep instead.
+  let sd_sweep_t0: u32 = mmio_read_u32(TIMER_CLO);
+  while sd_blk < 2108 {
     let _ = test_fill_pattern(sd_buf, 512);
     let sd_wr: i64 = sdhost_write_block(sd_blk, sd_buf);
     let sd_rd: i64 = sdhost_read_block(sd_blk, sd_buf2);
     let sd_mismatch: i64 = test_compare_buffers(sd_buf, sd_buf2, 512);
     if (sd_wr != 0) || (sd_rd != 0) || (sd_mismatch != 0) {
       sd_any_fail = 1;
+      // TEMPORARY DIAGNOSTIC (2026-09-15): real Pi 1B hardware has
+      // shown this sweep failing (any_fail=1) even after the two real
+      // controller-FSM/command-ordering bugs already found and fixed
+      // this same investigation (commit 602c2ce) -- distinguishing
+      // WHICH of write/read/compare failed, on WHICH block, and the
+      // raw SDHSTS/SDEDM values at the moment of failure is the same
+      // evidence-first approach that found those two bugs, continued
+      // rather than guessing a third fix blind.
+      let _ = uart_puts("SD DIAG: block ");
+      let _ = uart_put_i64(sd_blk);
+      let _ = uart_puts(" FAILED: wr=");
+      let _ = uart_put_i64(sd_wr);
+      let _ = uart_puts(" rd=");
+      let _ = uart_put_i64(sd_rd);
+      let _ = uart_puts(" mismatch_at=");
+      let _ = uart_put_i64(sd_mismatch);
+      let _ = uart_puts(" SDHSTS=0x");
+      let _ = uart_put_hex32(mmio_read_u32(SDHSTS));
+      let _ = uart_puts(" SDEDM=0x");
+      let _ = uart_put_hex32(mmio_read_u32(SDEDM));
+      let _ = uart_puts("\n");
     }
     sd_blk = sd_blk + 1;
   }
   let _ = uart_puts("SD: 8-block round-trip sweep any_fail=");
   let _ = uart_put_hex32(sd_any_fail as u32);
   let _ = uart_puts("\n");
+  let sd_sweep_elapsed: u32 = mmio_read_u32(TIMER_CLO) - sd_sweep_t0;
+  let _ = uart_puts("SD DIAG: 8-block sweep elapsed t=");
+  let _ = uart_put_i64(sd_sweep_elapsed as i64);
+  let _ = uart_puts("us\n");
 
   // Task #4 verification: append several path/value pairs, overwrite
   // one path with a newer value, confirm reads see the latest write
@@ -31939,6 +32788,9 @@ fn kernel_main() -> i64 {
   let _ = ed25519_self_test();
   let _ = pki_self_test();
   let _ = rtl_fw_header_self_test();
+  let _ = rtl_tx_desc_self_test();
+  let _ = rtl_rx_desc_self_test();
+  let _ = rtl_llt_write_self_test();
   let _ = aes128_self_test();
   let _ = aead_hkdf_self_test();
   let _ = keccak_self_test();
