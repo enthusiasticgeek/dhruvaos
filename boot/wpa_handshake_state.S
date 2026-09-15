@@ -30,7 +30,16 @@
  * unchanged in Message 4).
  * gtk_scratch (32 bytes): the GTK bytes extracted from Message 3's own
  * (unencrypted) Key Data, sized generously beyond CCMP's real 16-byte
- * GTK for headroom. */
+ * GTK for headroom.
+ * decrypted_kd_scratch (64 bytes): Message 3's own Key Data field,
+ * AES-key-unwrapped (RFC 3394, via the vani-aes kosh package) when
+ * EAPOL_KEY_INFO_ENCR_KEY_DATA is set -- a real access point always
+ * sets it in practice. wpa_gtk_kde_extract parses THIS buffer (not the
+ * raw frame) once unwrap succeeds, since the unwrapped plaintext is
+ * byte-for-byte the same unencrypted-Key-Data KDE format that function
+ * already handles. Sized to match aes_key_unwrap_heap's own
+ * AES_KW_MAX_BLOCKS=8 bound (64 bytes plaintext, i.e. ciphertext up to
+ * 72 bytes wrapped) -- comfortably beyond any real GTK/IGTK KDE. */
 
 .section ".bss"
 .align 4
@@ -52,6 +61,8 @@ wpa_hs_replay_counter:
     .space 8
 wpa_hs_gtk_scratch:
     .space 32
+wpa_hs_decrypted_kd_scratch:
+    .space 64
 
 .section ".text"
 
@@ -98,4 +109,9 @@ wpa_hs_replay_counter_ptr:
 .global wpa_hs_gtk_scratch_ptr
 wpa_hs_gtk_scratch_ptr:
     ldr r0, =wpa_hs_gtk_scratch
+    bx lr
+
+.global wpa_hs_decrypted_kd_scratch_ptr
+wpa_hs_decrypted_kd_scratch_ptr:
+    ldr r0, =wpa_hs_decrypted_kd_scratch
     bx lr

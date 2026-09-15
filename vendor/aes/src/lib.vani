@@ -1,0 +1,634 @@
+// AES-128 (FIPS-197), pure vani, hardware-agnostic and heap-free.
+//
+// Every function takes plain fixed-size arrays -- no heap allocator,
+// no `extern "C"` declarations, no persistent cross-call scratch
+// state. Extracted from DhruvaOS's own Pi 1 kernel, which only ever
+// needed AES in CTR mode (CCMP's own confidentiality) and CBC-MAC
+// (CCMP's own authentication) -- both ENCRYPT-direction-only uses, so
+// the original code never had a decrypt path. Decrypt is added new
+// here, needed by RFC 3394 AES Key Wrap/Unwrap's own unwrap direction
+// (which is itself needed to recover a WPA2 GTK from an EAPOL-Key
+// Message 3's own AES-key-wrapped Key Data -- see this package's own
+// README for that motivating use case).
+//
+// The constant-time, table-free S-box construction (`aes_sbox`) is
+// carried over unmodified from the original, already FIPS-197
+// Appendix B-verified implementation. Its own inverse (`aes_inv_sbox`)
+// uses the standard published inverse-affine-then-GF-invert formula
+// (`InvSBox(y) = inv(rotl(y,1) ^ rotl(y,3) ^ rotl(y,6) ^ 0x05)`) --
+// confirmed correct by independently computing the TRUE functional
+// inverse of THIS package's own `aes_sbox` (by inverting its 256-entry
+// output table in a one-off verification script) and checking the
+// formula reproduces that exact table for all 256 inputs, not trusted
+// from memory alone.
+
+fn gf256_mul(a: u32, b: u32) -> u32 {
+  let result: u32 = 0 as u32;
+  let av: u32 = a;
+  let i: i64 = 0;
+  while i < 8 {
+    let bit: u32 = (b >> (i as u32)) & (1 as u32);
+    let mask: u32 = wrapping_sub(0 as u32, bit) & (255 as u32);
+    result = result ^ (av & mask);
+    let hibit: u32 = (av >> (7 as u32)) & (1 as u32);
+    let hmask: u32 = wrapping_sub(0 as u32, hibit) & (255 as u32);
+    av = ((av << (1 as u32)) ^ ((27 as u32) & hmask)) & (255 as u32);
+    i = i + 1;
+  }
+  return result;
+}
+
+fn gf256_inv(x: u32) -> u32 {
+  let result: u32 = 1 as u32;
+  let base: u32 = x;
+  let exponent: u32 = 254 as u32;
+  let i: i64 = 0;
+  while i < 8 {
+    if ((exponent >> (i as u32)) & (1 as u32)) == (1 as u32) {
+      result = gf256_mul(result, base);
+    }
+    base = gf256_mul(base, base);
+    i = i + 1;
+  }
+  return result;
+}
+
+fn aes_rotl8(x: u32, n: u32) -> u32 {
+  return ((x << n) | (x >> ((8 as u32) - n))) & (255 as u32);
+}
+
+fn aes_sbox(x: u32) -> u32 {
+  let inv: u32 = gf256_inv(x);
+  let s: u32 = inv;
+  s = s ^ aes_rotl8(inv, 1 as u32);
+  s = s ^ aes_rotl8(inv, 2 as u32);
+  s = s ^ aes_rotl8(inv, 3 as u32);
+  s = s ^ aes_rotl8(inv, 4 as u32);
+  s = s ^ (0x63 as u32);
+  return s & (255 as u32);
+}
+
+fn aes_inv_sbox(x: u32) -> u32 {
+  let t: u32 = aes_rotl8(x, 1 as u32) ^ aes_rotl8(x, 3 as u32) ^ aes_rotl8(x, 6 as u32) ^ (0x05 as u32);
+  return gf256_inv(t) & (255 as u32);
+}
+
+fn zero16_bytes() -> [u8; 16] {
+  return [0 as u8; 16];
+}
+
+fn zero176_bytes() -> [u8; 176] {
+  return [0 as u8; 176];
+}
+
+// Expands a 16-byte AES-128 key into 176 bytes (44 4-byte words) of
+// round keys.
+fn aes128_key_expansion(key: ref [u8; 16], w_out: mut ref [u8; 176]) -> i64 {
+  let i: i64 = 0;
+  while i < 16 {
+    w_out[i] = key[i];
+    i = i + 1;
+  }
+  let rcon: u32 = 1 as u32;
+  let wi: i64 = 4;
+  while wi < 44 {
+    let t0: u32 = w_out[(wi - 1) * 4 + 0] as u32;
+    let t1: u32 = w_out[(wi - 1) * 4 + 1] as u32;
+    let t2: u32 = w_out[(wi - 1) * 4 + 2] as u32;
+    let t3: u32 = w_out[(wi - 1) * 4 + 3] as u32;
+    if (wi % 4) == 0 {
+      let r0: u32 = aes_sbox(t1);
+      let r1: u32 = aes_sbox(t2);
+      let r2: u32 = aes_sbox(t3);
+      let r3: u32 = aes_sbox(t0);
+      t0 = r0 ^ rcon;
+      t1 = r1;
+      t2 = r2;
+      t3 = r3;
+      rcon = gf256_mul(rcon, 2 as u32);
+    }
+    let p0: u32 = w_out[(wi - 4) * 4 + 0] as u32;
+    let p1: u32 = w_out[(wi - 4) * 4 + 1] as u32;
+    let p2: u32 = w_out[(wi - 4) * 4 + 2] as u32;
+    let p3: u32 = w_out[(wi - 4) * 4 + 3] as u32;
+    w_out[wi * 4 + 0] = (p0 ^ t0) as u8;
+    w_out[wi * 4 + 1] = (p1 ^ t1) as u8;
+    w_out[wi * 4 + 2] = (p2 ^ t2) as u8;
+    w_out[wi * 4 + 3] = (p3 ^ t3) as u8;
+    wi = wi + 1;
+  }
+  return 0;
+}
+
+fn aes_add_round_key(state: mut ref [u8; 16], w: ref [u8; 176], round: i64) -> i64 {
+  let c: i64 = 0;
+  while c < 4 {
+    let r: i64 = 0;
+    while r < 4 {
+      let sv: u32 = state[r + 4 * c] as u32;
+      let wv: u32 = w[(round * 4 + c) * 4 + r] as u32;
+      state[r + 4 * c] = (sv ^ wv) as u8;
+      r = r + 1;
+    }
+    c = c + 1;
+  }
+  return 0;
+}
+
+fn aes_sub_bytes(state: mut ref [u8; 16]) -> i64 {
+  let i: i64 = 0;
+  while i < 16 {
+    state[i] = aes_sbox(state[i] as u32) as u8;
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn aes_inv_sub_bytes(state: mut ref [u8; 16]) -> i64 {
+  let i: i64 = 0;
+  while i < 16 {
+    state[i] = aes_inv_sbox(state[i] as u32) as u8;
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Row r (0..4) shifted LEFT by r positions.
+fn aes_shift_rows(state: mut ref [u8; 16], temp: mut ref [u8; 4]) -> i64 {
+  let r: i64 = 1;
+  while r < 4 {
+    let c: i64 = 0;
+    while c < 4 {
+      let src_c: i64 = (c + r) % 4;
+      temp[c] = state[r + 4 * src_c];
+      c = c + 1;
+    }
+    let c2: i64 = 0;
+    while c2 < 4 {
+      state[r + 4 * c2] = temp[c2];
+      c2 = c2 + 1;
+    }
+    r = r + 1;
+  }
+  return 0;
+}
+
+// Row r (0..4) shifted RIGHT by r positions -- the inverse of
+// aes_shift_rows above.
+fn aes_inv_shift_rows(state: mut ref [u8; 16], temp: mut ref [u8; 4]) -> i64 {
+  let r: i64 = 1;
+  while r < 4 {
+    let c: i64 = 0;
+    while c < 4 {
+      let src_c: i64 = ((c - r) + 4) % 4;
+      temp[c] = state[r + 4 * src_c];
+      c = c + 1;
+    }
+    let c2: i64 = 0;
+    while c2 < 4 {
+      state[r + 4 * c2] = temp[c2];
+      c2 = c2 + 1;
+    }
+    r = r + 1;
+  }
+  return 0;
+}
+
+fn aes_mix_columns(state: mut ref [u8; 16]) -> i64 {
+  let c: i64 = 0;
+  while c < 4 {
+    let a0: u32 = state[0 + 4 * c] as u32;
+    let a1: u32 = state[1 + 4 * c] as u32;
+    let a2: u32 = state[2 + 4 * c] as u32;
+    let a3: u32 = state[3 + 4 * c] as u32;
+    let two: u32 = 2 as u32;
+    let three: u32 = 3 as u32;
+    let n0: u32 = gf256_mul(a0, two) ^ gf256_mul(a1, three) ^ a2 ^ a3;
+    let n1: u32 = a0 ^ gf256_mul(a1, two) ^ gf256_mul(a2, three) ^ a3;
+    let n2: u32 = a0 ^ a1 ^ gf256_mul(a2, two) ^ gf256_mul(a3, three);
+    let n3: u32 = gf256_mul(a0, three) ^ a1 ^ a2 ^ gf256_mul(a3, two);
+    state[0 + 4 * c] = n0 as u8;
+    state[1 + 4 * c] = n1 as u8;
+    state[2 + 4 * c] = n2 as u8;
+    state[3 + 4 * c] = n3 as u8;
+    c = c + 1;
+  }
+  return 0;
+}
+
+// The inverse MixColumns transform (FIPS-197 5.3.3), using GF(2^8)
+// constants 0x0e/0x0b/0x0d/0x09 in place of MixColumns' own 2/3/1/1.
+fn aes_inv_mix_columns(state: mut ref [u8; 16]) -> i64 {
+  let c: i64 = 0;
+  while c < 4 {
+    let a0: u32 = state[0 + 4 * c] as u32;
+    let a1: u32 = state[1 + 4 * c] as u32;
+    let a2: u32 = state[2 + 4 * c] as u32;
+    let a3: u32 = state[3 + 4 * c] as u32;
+    let e: u32 = 0x0e as u32;
+    let b: u32 = 0x0b as u32;
+    let d: u32 = 0x0d as u32;
+    let n: u32 = 0x09 as u32;
+    let n0: u32 = gf256_mul(a0, e) ^ gf256_mul(a1, b) ^ gf256_mul(a2, d) ^ gf256_mul(a3, n);
+    let n1: u32 = gf256_mul(a0, n) ^ gf256_mul(a1, e) ^ gf256_mul(a2, b) ^ gf256_mul(a3, d);
+    let n2: u32 = gf256_mul(a0, d) ^ gf256_mul(a1, n) ^ gf256_mul(a2, e) ^ gf256_mul(a3, b);
+    let n3: u32 = gf256_mul(a0, b) ^ gf256_mul(a1, d) ^ gf256_mul(a2, n) ^ gf256_mul(a3, e);
+    state[0 + 4 * c] = n0 as u8;
+    state[1 + 4 * c] = n1 as u8;
+    state[2 + 4 * c] = n2 as u8;
+    state[3 + 4 * c] = n3 as u8;
+    c = c + 1;
+  }
+  return 0;
+}
+
+fn aes128_encrypt_block(key: ref [u8; 16], block: ref [u8; 16], out: mut ref [u8; 16]) -> i64 {
+  let w: [u8; 176] = zero176_bytes();
+  let _ = aes128_key_expansion(key, mut ref w);
+  let state: [u8; 16] = zero16_bytes();
+  let i: i64 = 0;
+  while i < 16 {
+    state[i] = block[i];
+    i = i + 1;
+  }
+  let temp: [u8; 4] = [0 as u8; 4];
+  let _ = aes_add_round_key(mut ref state, ref w, 0);
+  let rnd: i64 = 1;
+  while rnd < 10 {
+    let _ = aes_sub_bytes(mut ref state);
+    let _ = aes_shift_rows(mut ref state, mut ref temp);
+    let _ = aes_mix_columns(mut ref state);
+    let _ = aes_add_round_key(mut ref state, ref w, rnd);
+    rnd = rnd + 1;
+  }
+  let _ = aes_sub_bytes(mut ref state);
+  let _ = aes_shift_rows(mut ref state, mut ref temp);
+  let _ = aes_add_round_key(mut ref state, ref w, 10);
+  i = 0;
+  while i < 16 {
+    out[i] = state[i];
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Standard (non-equivalent) inverse cipher, FIPS-197 5.3: the SAME
+// round-key schedule as encryption, applied in reverse round order --
+// deliberately not the "equivalent inverse cipher" variant (which
+// pre-transforms the round keys themselves via InvMixColumns), since
+// that would need its own separate key-schedule path; this way,
+// encrypt and decrypt share one `aes128_key_expansion`.
+fn aes128_decrypt_block(key: ref [u8; 16], block: ref [u8; 16], out: mut ref [u8; 16]) -> i64 {
+  let w: [u8; 176] = zero176_bytes();
+  let _ = aes128_key_expansion(key, mut ref w);
+  let state: [u8; 16] = zero16_bytes();
+  let i: i64 = 0;
+  while i < 16 {
+    state[i] = block[i];
+    i = i + 1;
+  }
+  let temp: [u8; 4] = [0 as u8; 4];
+  let _ = aes_add_round_key(mut ref state, ref w, 10);
+  let rnd: i64 = 9;
+  while rnd >= 1 {
+    let _ = aes_inv_shift_rows(mut ref state, mut ref temp);
+    let _ = aes_inv_sub_bytes(mut ref state);
+    let _ = aes_add_round_key(mut ref state, ref w, rnd);
+    let _ = aes_inv_mix_columns(mut ref state);
+    rnd = rnd - 1;
+  }
+  let _ = aes_inv_shift_rows(mut ref state, mut ref temp);
+  let _ = aes_inv_sub_bytes(mut ref state);
+  let _ = aes_add_round_key(mut ref state, ref w, 0);
+  i = 0;
+  while i < 16 {
+    out[i] = state[i];
+    i = i + 1;
+  }
+  return 0;
+}
+
+// RFC 3394 AES Key Wrap/Unwrap, built on the AES-128 block cipher
+// above. n (the number of 64-bit plaintext blocks) is bounded to
+// 2..=AES_KW_MAX_BLOCKS -- RFC 3394 itself imposes no such bound, but
+// this package's own fixed-array, heap-free design needs one, and
+// nothing this package's own real motivating use case (unwrapping a
+// WPA2 GTK, 16 bytes -> n=2, or an IGTK, 16/32 bytes -> n=2/4) ever
+// needs more. An explicit, bounded scope, not a silently-glossed-over
+// one. `t` (the per-iteration counter XORed into the running
+// integrity-check register `A`) is always well under 256 for any n
+// this small (max t = AES_KW_MAX_BLOCKS*5 + AES_KW_MAX_BLOCKS), so
+// it's XORed directly into A's own last byte rather than needing a
+// full 64-bit XOR.
+const AES_KW_MAX_BLOCKS: i64 = 8;
+
+fn zero64_bytes() -> [u8; 64] {
+  return [0 as u8; 64];
+}
+
+fn zero72_bytes() -> [u8; 72] {
+  return [0 as u8; 72];
+}
+
+fn zero8_bytes() -> [u8; 8] {
+  return [0 as u8; 8];
+}
+
+// Wraps `plaintext_len` bytes (a multiple of 8, 16..=AES_KW_MAX_BLOCKS*8)
+// of key data into `ciphertext_out` ((plaintext_len + 8) bytes).
+fn aes_key_wrap(kek: ref [u8; 16], plaintext: ref [u8; 64], plaintext_len: i64, ciphertext_out: mut ref [u8; 72]) -> i64 {
+  if (plaintext_len % 8) != 0 {
+    return 0 - 1;
+  }
+  let n: i64 = plaintext_len / 8;
+  if n < 2 {
+    return 0 - 1;
+  }
+  if n > AES_KW_MAX_BLOCKS {
+    return 0 - 1;
+  }
+
+  let a: [u8; 8] = zero8_bytes();
+  let ai: i64 = 0;
+  while ai < 8 {
+    a[ai] = 0xa6 as u8;
+    ai = ai + 1;
+  }
+
+  let r: [u8; 64] = zero64_bytes();
+  let i: i64 = 0;
+  while i < (n * 8) {
+    r[i] = plaintext[i];
+    i = i + 1;
+  }
+
+  let j: i64 = 0;
+  while j < 6 {
+    let ii: i64 = 1;
+    while ii <= n {
+      let block_in: [u8; 16] = zero16_bytes();
+      let bi: i64 = 0;
+      while bi < 8 {
+        block_in[bi] = a[bi];
+        bi = bi + 1;
+      }
+      bi = 0;
+      while bi < 8 {
+        block_in[8 + bi] = r[(ii - 1) * 8 + bi];
+        bi = bi + 1;
+      }
+
+      let block_out: [u8; 16] = zero16_bytes();
+      let _ = aes128_encrypt_block(kek, ref block_in, mut ref block_out);
+
+      let t: i64 = n * j + ii;
+      bi = 0;
+      while bi < 8 {
+        a[bi] = block_out[bi];
+        bi = bi + 1;
+      }
+      a[7] = (a[7] as u32 ^ (t as u32)) as u8;
+      bi = 0;
+      while bi < 8 {
+        r[(ii - 1) * 8 + bi] = block_out[8 + bi];
+        bi = bi + 1;
+      }
+
+      ii = ii + 1;
+    }
+    j = j + 1;
+  }
+
+  i = 0;
+  while i < 8 {
+    ciphertext_out[i] = a[i];
+    i = i + 1;
+  }
+  i = 0;
+  while i < (n * 8) {
+    ciphertext_out[8 + i] = r[i];
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Unwraps `ciphertext_len` bytes (a multiple of 8, >= 24, i.e. n>=2)
+// back into `plaintext_out` (`ciphertext_len - 8` bytes). Returns 0 on
+// success, 0 - 1 if the recovered integrity-check value doesn't match
+// the fixed IV (0xA6 repeated 8 times) -- a genuine authentication
+// failure, e.g. a corrupted or forged wrapped key, MUST be rejected,
+// not silently accepted with garbage plaintext.
+fn aes_key_unwrap(kek: ref [u8; 16], ciphertext: ref [u8; 72], ciphertext_len: i64, plaintext_out: mut ref [u8; 64]) -> i64 {
+  if (ciphertext_len % 8) != 0 {
+    return 0 - 1;
+  }
+  let n: i64 = (ciphertext_len / 8) - 1;
+  if n < 2 {
+    return 0 - 1;
+  }
+  if n > AES_KW_MAX_BLOCKS {
+    return 0 - 1;
+  }
+
+  let a: [u8; 8] = zero8_bytes();
+  let i: i64 = 0;
+  while i < 8 {
+    a[i] = ciphertext[i];
+    i = i + 1;
+  }
+
+  let r: [u8; 64] = zero64_bytes();
+  i = 0;
+  while i < (n * 8) {
+    r[i] = ciphertext[8 + i];
+    i = i + 1;
+  }
+
+  let j: i64 = 5;
+  while j >= 0 {
+    let ii: i64 = n;
+    while ii >= 1 {
+      let t: i64 = n * j + ii;
+      a[7] = (a[7] as u32 ^ (t as u32)) as u8;
+
+      let block_in: [u8; 16] = zero16_bytes();
+      let bi: i64 = 0;
+      while bi < 8 {
+        block_in[bi] = a[bi];
+        bi = bi + 1;
+      }
+      bi = 0;
+      while bi < 8 {
+        block_in[8 + bi] = r[(ii - 1) * 8 + bi];
+        bi = bi + 1;
+      }
+
+      let block_out: [u8; 16] = zero16_bytes();
+      let _ = aes128_decrypt_block(kek, ref block_in, mut ref block_out);
+
+      bi = 0;
+      while bi < 8 {
+        a[bi] = block_out[bi];
+        bi = bi + 1;
+      }
+      bi = 0;
+      while bi < 8 {
+        r[(ii - 1) * 8 + bi] = block_out[8 + bi];
+        bi = bi + 1;
+      }
+
+      ii = ii - 1;
+    }
+    j = j - 1;
+  }
+
+  i = 0;
+  let iv_ok: i64 = 1;
+  while i < 8 {
+    if a[i] != (0xa6 as u8) {
+      iv_ok = 0;
+    }
+    i = i + 1;
+  }
+  if iv_ok == 0 {
+    return 0 - 1;
+  }
+
+  i = 0;
+  while i < (n * 8) {
+    plaintext_out[i] = r[i];
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn aes_bytes_equal(a: ref [u8; 16], b: ref [u8; 16], n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if a[i] != b[i] {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// FIPS-197 Appendix B's own worked example, verified fresh against an
+// independent implementation (Python's cryptography.hazmat AES-ECB)
+// before being hardcoded here, not recalled from memory. Encrypt is
+// carried over from DhruvaOS's own already-verified implementation;
+// decrypt is genuinely new, checked both directions: decrypt(the
+// real FIPS ciphertext) must reproduce the real plaintext, AND
+// decrypt(this function's own encrypt(plaintext)) must round-trip --
+// two different ways of exercising the same new code, not the same
+// check twice.
+fn aes128_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let key: [u8; 16] = [
+    0x00 as u8, 0x01 as u8, 0x02 as u8, 0x03 as u8, 0x04 as u8, 0x05 as u8, 0x06 as u8, 0x07 as u8,
+    0x08 as u8, 0x09 as u8, 0x0a as u8, 0x0b as u8, 0x0c as u8, 0x0d as u8, 0x0e as u8, 0x0f as u8
+  ];
+  let pt: [u8; 16] = [
+    0x00 as u8, 0x11 as u8, 0x22 as u8, 0x33 as u8, 0x44 as u8, 0x55 as u8, 0x66 as u8, 0x77 as u8,
+    0x88 as u8, 0x99 as u8, 0xaa as u8, 0xbb as u8, 0xcc as u8, 0xdd as u8, 0xee as u8, 0xff as u8
+  ];
+  let expected_ct: [u8; 16] = [
+    0x69 as u8, 0xc4 as u8, 0xe0 as u8, 0xd8 as u8, 0x6a as u8, 0x7b as u8, 0x04 as u8, 0x30 as u8,
+    0xd8 as u8, 0xcd as u8, 0xb7 as u8, 0x80 as u8, 0x70 as u8, 0xb4 as u8, 0xc5 as u8, 0x5a as u8
+  ];
+
+  let ct: [u8; 16] = zero16_bytes();
+  let _ = aes128_encrypt_block(ref key, ref pt, mut ref ct);
+  if aes_bytes_equal(ref ct, ref expected_ct, 16) == 0 { ok = 0; }
+
+  let pt_from_expected_ct: [u8; 16] = zero16_bytes();
+  let _ = aes128_decrypt_block(ref key, ref expected_ct, mut ref pt_from_expected_ct);
+  if aes_bytes_equal(ref pt_from_expected_ct, ref pt, 16) == 0 { ok = 0; }
+
+  let pt_round_trip: [u8; 16] = zero16_bytes();
+  let _ = aes128_decrypt_block(ref key, ref ct, mut ref pt_round_trip);
+  if aes_bytes_equal(ref pt_round_trip, ref pt, 16) == 0 { ok = 0; }
+
+  let key1: [u8; 16] = zero16_bytes();
+  let ki: i64 = 0;
+  while ki < 16 { key1[ki] = (key[ki] as u32 ^ (1 as u32)) as u8; ki = ki + 1; }
+  let ct1: [u8; 16] = zero16_bytes();
+  let _ = aes128_encrypt_block(ref key1, ref pt, mut ref ct1);
+  if aes_bytes_equal(ref ct, ref ct1, 16) == 1 {
+    ok = 0; // a single flipped key bit produced the SAME ciphertext -- broken
+  }
+
+  if ok == 1 {
+    print "aes: AES-128 encrypt+decrypt vs FIPS-197 Appendix B (PASS)";
+  } else {
+    print "aes: AES-128 encrypt+decrypt FAILED";
+  }
+  return ok;
+}
+
+// RFC 3394's own official 128-bit-KEK/128-bit-key test vector (Section
+// 4), fetched from the RFC text directly and independently
+// cross-checked against Python's cryptography.hazmat.primitives.keywrap
+// (both agreeing byte for byte) before being hardcoded. Wrap, unwrap,
+// AND a negative case (a single flipped ciphertext byte must make
+// unwrap fail its own integrity check, not silently return garbage
+// plaintext) all tested.
+fn aes_key_wrap_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let kek: [u8; 16] = [
+    0x00 as u8, 0x01 as u8, 0x02 as u8, 0x03 as u8, 0x04 as u8, 0x05 as u8, 0x06 as u8, 0x07 as u8,
+    0x08 as u8, 0x09 as u8, 0x0a as u8, 0x0b as u8, 0x0c as u8, 0x0d as u8, 0x0e as u8, 0x0f as u8
+  ];
+  let pt: [u8; 64] = zero64_bytes();
+  let pt16: [u8; 16] = [
+    0x00 as u8, 0x11 as u8, 0x22 as u8, 0x33 as u8, 0x44 as u8, 0x55 as u8, 0x66 as u8, 0x77 as u8,
+    0x88 as u8, 0x99 as u8, 0xaa as u8, 0xbb as u8, 0xcc as u8, 0xdd as u8, 0xee as u8, 0xff as u8
+  ];
+  let pi: i64 = 0;
+  while pi < 16 { pt[pi] = pt16[pi]; pi = pi + 1; }
+
+  let expected_wrapped: [u8; 72] = zero72_bytes();
+  let ew24: [u8; 24] = [
+    0x1f as u8, 0xa6 as u8, 0x8b as u8, 0x0a as u8, 0x81 as u8, 0x12 as u8, 0xb4 as u8, 0x47 as u8,
+    0xae as u8, 0xf3 as u8, 0x4b as u8, 0xd8 as u8, 0xfb as u8, 0x5a as u8, 0x7b as u8, 0x82 as u8,
+    0x9d as u8, 0x3e as u8, 0x86 as u8, 0x23 as u8, 0x71 as u8, 0xd2 as u8, 0xcf as u8, 0xe5 as u8
+  ];
+  let ewi: i64 = 0;
+  while ewi < 24 { expected_wrapped[ewi] = ew24[ewi]; ewi = ewi + 1; }
+
+  let wrapped: [u8; 72] = zero72_bytes();
+  let wrap_status: i64 = aes_key_wrap(ref kek, ref pt, 16, mut ref wrapped);
+  if wrap_status != 0 { ok = 0; }
+  let wi: i64 = 0;
+  while wi < 24 {
+    if wrapped[wi] != expected_wrapped[wi] { ok = 0; }
+    wi = wi + 1;
+  }
+
+  let unwrapped: [u8; 64] = zero64_bytes();
+  let unwrap_status: i64 = aes_key_unwrap(ref kek, ref wrapped, 24, mut ref unwrapped);
+  if unwrap_status != 0 { ok = 0; }
+  let ui: i64 = 0;
+  while ui < 16 {
+    if unwrapped[ui] != pt[ui] { ok = 0; }
+    ui = ui + 1;
+  }
+
+  // Negative case: corrupt one byte of the wrapped ciphertext.
+  let wrapped_bad: [u8; 72] = zero72_bytes();
+  let bi: i64 = 0;
+  while bi < 24 { wrapped_bad[bi] = wrapped[bi]; bi = bi + 1; }
+  wrapped_bad[0] = (wrapped_bad[0] as u32 ^ (1 as u32)) as u8;
+  let unwrapped_bad: [u8; 64] = zero64_bytes();
+  let bad_status: i64 = aes_key_unwrap(ref kek, ref wrapped_bad, 24, mut ref unwrapped_bad);
+  if bad_status == 0 { ok = 0; }
+
+  if ok == 1 {
+    print "aes: RFC 3394 Key Wrap/Unwrap vs the official 128-bit test vector + tamper-detect (PASS)";
+  } else {
+    print "aes: RFC 3394 Key Wrap/Unwrap FAILED";
+  }
+  return ok;
+}
