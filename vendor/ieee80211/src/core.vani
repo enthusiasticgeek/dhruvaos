@@ -1,0 +1,408 @@
+// IEEE 802.11 management-frame build/parse and the WPA2-PSK/CCMP RSN
+// Information Element -- the layer between "have a derived PMK" and
+// "can start the 4-way handshake": a real access point won't accept
+// EAPOL-Key frames from a station that hasn't first associated with
+// it (Probe Request/Response, Open System Authentication, Association
+// Request/Response, in that order). Deliberately does NOT include
+// beacon parsing (Probe Response covers the same fields this package
+// needs -- SSID, RSN IE -- without also needing to track a periodic
+// broadcast), WEP/Shared-Key authentication (WPA2-PSK always uses Open
+// System auth; the real "authentication" happens later, in the 4-way
+// handshake itself), or any RF/USB transmit-receive plumbing (that's
+// the RTL8188CU driver's own, separately-scoped job -- this package
+// only builds/parses the BYTES of a frame, the same "pure wire format,
+// no transport" scoping this project's own EAPOL-Key package already
+// established).
+//
+// Field layouts (Frame Control bit assignments, frame type/subtype
+// values, fixed-field order for Authentication/Association frames, the
+// generic Element ID/Length/Value IE wrapper) verified directly against
+// Linux's own `include/linux/ieee80211.h` (a Tier-1 reference: these
+// are the exact structs `mac80211`/`cfg80211` build and parse for every
+// real device Linux drives, not a derivation from prose alone). RSN IE
+// field order and the WPA2-PSK/CCMP cipher-suite/AKM-suite byte values
+// (00-0F-AC OUI, CCMP=4, PSK=2) verified against wpa_supplicant's own
+// `src/common/wpa_common.h`/`wpa_ie.c`, cross-checked against
+// Wireshark's own independent `packet-ieee80211.c` dissector tables.
+
+const FC_STYPE_ASSOC_REQ: i64 = 0x0000;
+const FC_STYPE_ASSOC_RESP: i64 = 0x0010;
+const FC_STYPE_PROBE_REQ: i64 = 0x0040;
+const FC_STYPE_PROBE_RESP: i64 = 0x0050;
+const FC_STYPE_AUTH: i64 = 0x00b0;
+const FC_STYPE_DEAUTH: i64 = 0x00c0;
+
+const EID_SSID: i64 = 0;
+const EID_SUPP_RATES: i64 = 1;
+const EID_RSN: i64 = 48;
+
+const WLAN_AUTH_OPEN: i64 = 0;
+const WLAN_STATUS_SUCCESS: i64 = 0;
+
+// A single canonical fixed-size buffer for anything RECEIVED (Probe
+// Response, Authentication Response, Association Response) -- real
+// 802.11 management frames this package cares about (a handful of
+// small fixed fields plus a few short IEs) comfortably fit well within
+// 256 bytes; anything larger is rejected as malformed by the bounds
+// checks below rather than silently truncated.
+const FRAME_BUF_LEN: i64 = 256;
+
+fn zero6_bytes() -> [u8; 6] {
+  return [0 as u8; 6];
+}
+
+fn zero32_bytes_80211() -> [u8; 32] {
+  return [0 as u8; 32];
+}
+
+// The generic 802.11 MAC header (IEEE 802.11, Frame Control/Duration/
+// Address1-3/Sequence Control) -- 24 bytes, no Address4 (management
+// frames never set both ToDS and FromDS, the only case Address4 is
+// used). All multi-byte fields are little-endian on the wire.
+struct Mac80211Hdr { frame_control: i64, duration: i64, seq_ctrl: i64 }
+
+fn mac_header_parse(buf: ref [u8; 256], addr1_out: mut ref [u8; 6], addr2_out: mut ref [u8; 6], addr3_out: mut ref [u8; 6]) -> Mac80211Hdr {
+  let frame_control: i64 = (buf[0] as i64) | ((buf[1] as i64) << 8);
+  let duration: i64 = (buf[2] as i64) | ((buf[3] as i64) << 8);
+  let i: i64 = 0;
+  while i < 6 {
+    addr1_out[i] = buf[4 + i];
+    addr2_out[i] = buf[10 + i];
+    addr3_out[i] = buf[16 + i];
+    i = i + 1;
+  }
+  let seq_ctrl: i64 = (buf[22] as i64) | ((buf[23] as i64) << 8);
+  return Mac80211Hdr { frame_control: frame_control, duration: duration, seq_ctrl: seq_ctrl };
+}
+
+// Scans a generic Element-ID/Length/Value IE sequence (as found after
+// any management frame's own fixed fields) for the first IE matching
+// `target_eid`. Bounded by the caller-supplied `ies_len` -- an IE
+// claiming a length that would run past that bound is treated as
+// malformed and scanning stops (returns not-found) rather than reading
+// out of the caller's own intended region.
+struct IeFindResult { found: i64, data_off: i64, data_len: i64 }
+
+fn ie_find(buf: ref [u8; 256], ies_off: i64, ies_len: i64, target_eid: i64) -> IeFindResult {
+  let pos: i64 = ies_off;
+  let end: i64 = ies_off + ies_len;
+  while (pos + 2) <= end {
+    let eid: i64 = buf[pos] as i64;
+    let ie_data_len: i64 = buf[pos + 1] as i64;
+    if (pos + 2 + ie_data_len) > end {
+      return IeFindResult { found: 0, data_off: 0, data_len: 0 };
+    }
+    if eid == target_eid {
+      return IeFindResult { found: 1, data_off: pos + 2, data_len: ie_data_len };
+    }
+    pos = pos + 2 + ie_data_len;
+  }
+  return IeFindResult { found: 0, data_off: 0, data_len: 0 };
+}
+
+// Builds the minimal, spec-compliant WPA2-PSK/CCMP RSN IE (Element ID
+// 0x30/48): version 1, group cipher CCMP, exactly one pairwise cipher
+// (CCMP), exactly one AKM (PSK), capabilities 0x0000, no PMKID list, no
+// group management cipher (both optional trailing fields, only
+// relevant to 802.11w/PMF -- confirmed omittable for a minimal WPA2-PSK
+// IE by reading wpa_supplicant's own `wpa_gen_wpa_ie_rsn`, which only
+// appends them conditionally). Fixed 22-byte output, matching a real
+// worked example derived from these same confirmed constants:
+// 30 14 01 00 00 0F AC 04 01 00 00 0F AC 04 01 00 00 0F AC 02 00 00.
+fn rsn_ie_build_wpa2_psk_ccmp(out: mut ref [u8; 22]) -> i64 {
+  out[0] = 0x30 as u8;
+  out[1] = 20 as u8;
+  out[2] = 0x01 as u8;
+  out[3] = 0x00 as u8;
+  out[4] = 0x00 as u8;
+  out[5] = 0x0f as u8;
+  out[6] = 0xac as u8;
+  out[7] = 0x04 as u8;
+  out[8] = 0x01 as u8;
+  out[9] = 0x00 as u8;
+  out[10] = 0x00 as u8;
+  out[11] = 0x0f as u8;
+  out[12] = 0xac as u8;
+  out[13] = 0x04 as u8;
+  out[14] = 0x01 as u8;
+  out[15] = 0x00 as u8;
+  out[16] = 0x00 as u8;
+  out[17] = 0x0f as u8;
+  out[18] = 0xac as u8;
+  out[19] = 0x02 as u8;
+  out[20] = 0x00 as u8;
+  out[21] = 0x00 as u8;
+  return 22;
+}
+
+// Checks whether an RSN IE (as located by ie_find -- `data_off`/
+// `data_len` point at the IE's DATA, i.e. right after its own EID/
+// Length bytes) advertises CCMP as its group cipher, CCMP among its
+// pairwise ciphers, and PSK among its AKMs -- exactly the combination
+// this package's own rsn_ie_build_wpa2_psk_ccmp produces, so a real AP
+// advertising the same real-world-common configuration is recognized.
+// Deliberately minimal: does not validate RSN Capabilities or any
+// PMKID/group-management-cipher trailing fields (not needed to decide
+// "can I join this network with a PSK", the only question this
+// function answers). Bounds pairwise/AKM counts to 4 each -- both
+// generous for any real AP and small enough to keep every array access
+// provably within the 256-byte receive buffer.
+fn rsn_ie_supports_wpa2_psk_ccmp(buf: ref [u8; 256], data_off: i64, data_len: i64) -> i64 {
+  if data_len < 8 { return 0; }
+  if !(buf[data_off + 2] == (0x00 as u8) && buf[data_off + 3] == (0x0f as u8) && buf[data_off + 4] == (0xac as u8) && buf[data_off + 5] == (0x04 as u8)) {
+    return 0;
+  }
+  let pairwise_count: i64 = (buf[data_off + 6] as i64) | ((buf[data_off + 7] as i64) << 8);
+  if pairwise_count < 1 { return 0; }
+  if pairwise_count > 4 { return 0; }
+  if data_len < (8 + pairwise_count * 4 + 2) { return 0; }
+
+  let found_ccmp: i64 = 0;
+  let i: i64 = 0;
+  while i < pairwise_count {
+    let p: i64 = data_off + 8 + i * 4;
+    if buf[p] == (0x00 as u8) && buf[p + 1] == (0x0f as u8) && buf[p + 2] == (0xac as u8) && buf[p + 3] == (0x04 as u8) {
+      found_ccmp = 1;
+    }
+    i = i + 1;
+  }
+  if found_ccmp == 0 { return 0; }
+
+  let akm_count_off: i64 = data_off + 8 + pairwise_count * 4;
+  let akm_count: i64 = (buf[akm_count_off] as i64) | ((buf[akm_count_off + 1] as i64) << 8);
+  if akm_count < 1 { return 0; }
+  if akm_count > 4 { return 0; }
+  if data_len < ((akm_count_off - data_off) + 2 + akm_count * 4) { return 0; }
+
+  let found_psk: i64 = 0;
+  let akm_list_off: i64 = akm_count_off + 2;
+  i = 0;
+  while i < akm_count {
+    let a: i64 = akm_list_off + i * 4;
+    if buf[a] == (0x00 as u8) && buf[a + 1] == (0x0f as u8) && buf[a + 2] == (0xac as u8) && buf[a + 3] == (0x02 as u8) {
+      found_psk = 1;
+    }
+    i = i + 1;
+  }
+  if found_psk == 0 { return 0; }
+
+  return 1;
+}
+
+const PROBE_REQ_MAX_LEN: i64 = 64;
+
+// Builds a wildcard-BSSID Probe Request: Address1 (destination) and
+// Address3 (BSSID) both the broadcast address, Address2 (source) the
+// station's own MAC -- the standard way to actively scan for any AP on
+// the current channel rather than a specific already-known one.
+// Contains the SSID IE (the network being searched for) and a fixed,
+// standard 802.11b Supported Rates IE (1/2/5.5/11 Mbps, each with the
+// "basic rate" bit set per the 500 kbit/s-unit encoding IEEE 802.11
+// itself defines) -- real rate negotiation beyond "the AP sees at
+// least one rate it also supports" is out of this package's own scope.
+// Returns the actual frame length used (24 + 2+ssid_len + 2+4).
+fn probe_request_build(own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, out: mut ref [u8; 64]) -> i64 {
+  let broadcast: [u8; 6] = [0xff as u8; 6];
+  out[0] = (FC_STYPE_PROBE_REQ & (255 as i64)) as u8;
+  out[1] = ((FC_STYPE_PROBE_REQ >> 8) & (255 as i64)) as u8;
+  out[2] = 0 as u8;
+  out[3] = 0 as u8;
+  let i: i64 = 0;
+  while i < 6 {
+    out[4 + i] = broadcast[i];
+    out[10 + i] = own_mac[i];
+    out[16 + i] = broadcast[i];
+    i = i + 1;
+  }
+  out[22] = 0 as u8;
+  out[23] = 0 as u8;
+
+  let off: i64 = 24;
+  out[off] = EID_SSID as u8;
+  out[off + 1] = ssid_len as u8;
+  i = 0;
+  while i < ssid_len {
+    out[off + 2 + i] = ssid[i];
+    i = i + 1;
+  }
+  off = off + 2 + ssid_len;
+
+  out[off] = EID_SUPP_RATES as u8;
+  out[off + 1] = 4 as u8;
+  out[off + 2] = 0x82 as u8;
+  out[off + 3] = 0x84 as u8;
+  out[off + 4] = 0x8b as u8;
+  out[off + 5] = 0x96 as u8;
+  off = off + 6;
+
+  return off;
+}
+
+struct ProbeRespInfo { ok: i64, ssid_len: i64, has_rsn: i64 }
+
+// Parses a Probe Response: fixed fields are Timestamp (8 bytes),
+// Beacon Interval (2 bytes), Capability Information (2 bytes) --
+// 12 bytes total, immediately after the 24-byte MAC header, before any
+// IEs begin. Extracts the SSID (so the caller can confirm this is
+// really the network it asked for, not a same-channel neighbor) and
+// whether a WPA2-PSK/CCMP-compatible RSN IE is present.
+fn probe_response_parse(buf: ref [u8; 256], frame_len: i64, ssid_out: mut ref [u8; 32]) -> ProbeRespInfo {
+  if frame_len < 36 {
+    return ProbeRespInfo { ok: 0, ssid_len: 0, has_rsn: 0 };
+  }
+  let ies_off: i64 = 36;
+  let ies_len: i64 = frame_len - ies_off;
+
+  let ssid_ie: IeFindResult = ie_find(buf, ies_off, ies_len, EID_SSID);
+  let ssid_len: i64 = 0;
+  if ssid_ie.found == 1 {
+    if ssid_ie.data_len > 32 {
+      return ProbeRespInfo { ok: 0, ssid_len: 0, has_rsn: 0 };
+    }
+    ssid_len = ssid_ie.data_len;
+    let i: i64 = 0;
+    while i < ssid_len {
+      ssid_out[i] = buf[ssid_ie.data_off + i];
+      i = i + 1;
+    }
+  }
+
+  let rsn_ie: IeFindResult = ie_find(buf, ies_off, ies_len, EID_RSN);
+  let has_rsn: i64 = 0;
+  if rsn_ie.found == 1 {
+    has_rsn = rsn_ie_supports_wpa2_psk_ccmp(buf, rsn_ie.data_off, rsn_ie.data_len);
+  }
+
+  return ProbeRespInfo { ok: 1, ssid_len: ssid_len, has_rsn: has_rsn };
+}
+
+// Builds an Open System Authentication Request: Algorithm Number 0
+// (Open System, the only algorithm WPA2-PSK ever uses -- the real
+// "authentication" happens later, in the 4-way handshake itself),
+// Transaction Sequence Number 1, Status Code 0 (meaningless/ignored on
+// a request, present for fixed-field-layout symmetry with the
+// response), no Challenge Text (that IE only appears for Shared Key
+// authentication, algorithm 1). Fixed 30-byte frame.
+fn auth_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], out: mut ref [u8; 30]) -> i64 {
+  out[0] = (FC_STYPE_AUTH & (255 as i64)) as u8;
+  out[1] = ((FC_STYPE_AUTH >> 8) & (255 as i64)) as u8;
+  out[2] = 0 as u8;
+  out[3] = 0 as u8;
+  let i: i64 = 0;
+  while i < 6 {
+    out[4 + i] = bssid[i];
+    out[10 + i] = own_mac[i];
+    out[16 + i] = bssid[i];
+    i = i + 1;
+  }
+  out[22] = 0 as u8;
+  out[23] = 0 as u8;
+  out[24] = (WLAN_AUTH_OPEN & (255 as i64)) as u8;
+  out[25] = ((WLAN_AUTH_OPEN >> 8) & (255 as i64)) as u8;
+  out[26] = 1 as u8;
+  out[27] = 0 as u8;
+  out[28] = 0 as u8;
+  out[29] = 0 as u8;
+  return 30;
+}
+
+// Parses an Authentication Response: succeeds only if Algorithm Number
+// is Open System, Transaction Sequence Number is 2 (the response's own
+// fixed value), and Status Code is Success -- any other combination
+// (a different algorithm, an out-of-sequence transaction number, or a
+// non-zero status) is treated as a real authentication failure, not
+// silently accepted.
+fn auth_response_parse(buf: ref [u8; 256], frame_len: i64) -> i64 {
+  if frame_len < 30 { return 0; }
+  let algorithm: i64 = (buf[24] as i64) | ((buf[25] as i64) << 8);
+  let transaction: i64 = (buf[26] as i64) | ((buf[27] as i64) << 8);
+  let status: i64 = (buf[28] as i64) | ((buf[29] as i64) << 8);
+  if algorithm != WLAN_AUTH_OPEN { return 0; }
+  if transaction != 2 { return 0; }
+  if status != WLAN_STATUS_SUCCESS { return 0; }
+  return 1;
+}
+
+const ASSOC_REQ_MAX_LEN: i64 = 90;
+
+// Builds an Association Request: Capability Information advertises ESS
+// (infrastructure BSS, bit 0) and Privacy (bit 4 -- required whenever
+// the network uses RSN, per the real capability-info convention
+// wpa_supplicant/mac80211 both follow), a fixed Listen Interval, the
+// SSID and standard Supported Rates IEs (same values as the Probe
+// Request), and finally the caller-supplied RSN IE (this station's own
+// echo of the cipher/AKM choice it's asking to use -- always this
+// package's own rsn_ie_build_wpa2_psk_ccmp output in practice, but
+// taken as a parameter rather than called internally so a caller could
+// substitute a different negotiated IE without this function needing
+// to change). Returns the actual frame length used.
+fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, rsn_ie: ref [u8; 22], out: mut ref [u8; 90]) -> i64 {
+  out[0] = (FC_STYPE_ASSOC_REQ & (255 as i64)) as u8;
+  out[1] = ((FC_STYPE_ASSOC_REQ >> 8) & (255 as i64)) as u8;
+  out[2] = 0 as u8;
+  out[3] = 0 as u8;
+  let i: i64 = 0;
+  while i < 6 {
+    out[4 + i] = bssid[i];
+    out[10 + i] = own_mac[i];
+    out[16 + i] = bssid[i];
+    i = i + 1;
+  }
+  out[22] = 0 as u8;
+  out[23] = 0 as u8;
+
+  let capab_info: i64 = 0x0011;
+  out[24] = (capab_info & (255 as i64)) as u8;
+  out[25] = ((capab_info >> 8) & (255 as i64)) as u8;
+  let listen_interval: i64 = 10;
+  out[26] = (listen_interval & (255 as i64)) as u8;
+  out[27] = ((listen_interval >> 8) & (255 as i64)) as u8;
+
+  let off: i64 = 28;
+  out[off] = EID_SSID as u8;
+  out[off + 1] = ssid_len as u8;
+  i = 0;
+  while i < ssid_len {
+    out[off + 2 + i] = ssid[i];
+    i = i + 1;
+  }
+  off = off + 2 + ssid_len;
+
+  out[off] = EID_SUPP_RATES as u8;
+  out[off + 1] = 4 as u8;
+  out[off + 2] = 0x82 as u8;
+  out[off + 3] = 0x84 as u8;
+  out[off + 4] = 0x8b as u8;
+  out[off + 5] = 0x96 as u8;
+  off = off + 6;
+
+  i = 0;
+  while i < 22 {
+    out[off + i] = rsn_ie[i];
+    i = i + 1;
+  }
+  off = off + 22;
+
+  return off;
+}
+
+struct AssocRespInfo { ok: i64, status_code: i64, association_id: i64 }
+
+// Parses an Association Response: fixed fields are Capability
+// Information (2 bytes), Status Code (2 bytes), Association ID
+// (2 bytes) -- 6 bytes total, right after the 24-byte MAC header.
+// `ok` reflects whether Status Code was Success; `association_id`
+// (only meaningful when `ok == 1`) is what the station must present in
+// every subsequent data frame's own Duration/ID-adjacent addressing
+// (out of THIS package's own scope -- CCMP data-frame handling is
+// vani-aes/AES-CCMP's own job).
+fn assoc_response_parse(buf: ref [u8; 256], frame_len: i64) -> AssocRespInfo {
+  if frame_len < 30 {
+    return AssocRespInfo { ok: 0, status_code: 0 - 1, association_id: 0 };
+  }
+  let status_code: i64 = (buf[26] as i64) | ((buf[27] as i64) << 8);
+  let association_id: i64 = (buf[28] as i64) | ((buf[29] as i64) << 8);
+  let ok: i64 = 0;
+  if status_code == WLAN_STATUS_SUCCESS { ok = 1; }
+  return AssocRespInfo { ok: ok, status_code: status_code, association_id: association_id };
+}

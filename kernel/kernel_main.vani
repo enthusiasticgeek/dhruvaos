@@ -25147,6 +25147,103 @@ fn csprng_hw_self_test() -> i64 {
   return 0;
 }
 
+// Task #164 (WiFi/WPA2) groundwork: IEEE 802.11 management-frame
+// build/parse (Probe Request/Response, Open System Authentication,
+// Association Request/Response) and the WPA2-PSK/CCMP RSN Information
+// Element -- the layer between "have a derived PMK" and "can start the
+// 4-way handshake" (a real access point won't accept EAPOL-Key frames
+// from a station that hasn't first associated with it). Vendored as
+// its own kosh package (vani-ieee80211), same hardware-agnostic-
+// package split this round already established for AES and the
+// CSPRNG: pure wire-format build/parse logic, no RF/USB transmit-
+// receive plumbing of any kind -- that remains the RTL8188CU driver's
+// own, separately-scoped job (no USB WiFi device model exists in
+// QEMU, so real over-the-air association can't be tested here anyway;
+// see this project's own already-documented pattern for every other
+// real-hardware-only USB peripheral). ieee80211_self_test is entirely
+// self-contained (build-then-check-bytes, parse-against-independently-
+// placed-bytes) and needs no hardware to run, exactly like AES-CCMP,
+// EAPOL-Key, and the 4-way handshake state machine were each proven
+// this same way well before any of them had real RF to talk to.
+use "../vendor/ieee80211/src/core.vani";
+
+// Kernel-level smoke test (mirrors this project's own established
+// pattern for every other vendored crypto/protocol package -- e.g.
+// aes128_self_test, wpa_handshake_self_test -- a single consolidated
+// uart_puts PASS/FAIL line, not a reuse of the package's own lib.vani
+// self-test, which is host-side-only tooling not vendored here at
+// all). Exhaustive positive/negative coverage (wrong cipher, wrong
+// AKM, malformed IE lengths, refused/out-of-sequence responses) lives
+// in the vani-ieee80211 package's own test suite; this exercises the
+// same functions end-to-end on real target code, the property that
+// actually matters for a live boot self-test.
+fn ieee80211_boot_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let rsn: [u8; 22] = [0 as u8; 22];
+  if rsn_ie_build_wpa2_psk_ccmp(mut ref rsn) != 22 { ok = 0; }
+  if rsn[0] != (0x30 as u8) { ok = 0; }
+  if rsn[7] != (0x04 as u8) { ok = 0; }
+
+  let bssid: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x01 as u8];
+  let own_mac: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x02 as u8];
+  let ssid: [u8; 32] = zero32_bytes_80211();
+  ssid[0] = 0x74 as u8;
+  ssid[1] = 0x65 as u8;
+  ssid[2] = 0x73 as u8;
+  ssid[3] = 0x74 as u8;
+
+  let preq: [u8; 64] = [0 as u8; 64];
+  if probe_request_build(ref own_mac, ref ssid, 4, mut ref preq) != 36 { ok = 0; }
+
+  let presp_buf: [u8; 256] = [0 as u8; 256];
+  let fc_presp: i64 = FC_STYPE_PROBE_RESP;
+  presp_buf[0] = (fc_presp & (255 as i64)) as u8;
+  presp_buf[1] = ((fc_presp >> 8) & (255 as i64)) as u8;
+  presp_buf[36] = EID_SSID as u8;
+  presp_buf[37] = 4 as u8;
+  presp_buf[38] = 0x74 as u8;
+  presp_buf[39] = 0x65 as u8;
+  presp_buf[40] = 0x73 as u8;
+  presp_buf[41] = 0x74 as u8;
+  let i: i64 = 0;
+  while i < 22 {
+    presp_buf[42 + i] = rsn[i];
+    i = i + 1;
+  }
+  let ssid_out: [u8; 32] = [0 as u8; 32];
+  let presp_info: ProbeRespInfo = probe_response_parse(ref presp_buf, 42 + 22, mut ref ssid_out);
+  if presp_info.ok != 1 { ok = 0; }
+  if presp_info.has_rsn != 1 { ok = 0; }
+
+  let areq: [u8; 30] = [0 as u8; 30];
+  if auth_request_build(ref bssid, ref own_mac, mut ref areq) != 30 { ok = 0; }
+  let aresp_buf: [u8; 256] = [0 as u8; 256];
+  let fc_auth: i64 = FC_STYPE_AUTH;
+  aresp_buf[0] = (fc_auth & (255 as i64)) as u8;
+  aresp_buf[1] = ((fc_auth >> 8) & (255 as i64)) as u8;
+  aresp_buf[26] = 2 as u8;
+  if auth_response_parse(ref aresp_buf, 30) != 1 { ok = 0; }
+
+  let assocreq: [u8; 90] = [0 as u8; 90];
+  if assoc_request_build(ref bssid, ref own_mac, ref ssid, 4, ref rsn, mut ref assocreq) != 62 { ok = 0; }
+  let assocresp_buf: [u8; 256] = [0 as u8; 256];
+  let fc_assoc: i64 = FC_STYPE_ASSOC_RESP;
+  assocresp_buf[0] = (fc_assoc & (255 as i64)) as u8;
+  assocresp_buf[1] = ((fc_assoc >> 8) & (255 as i64)) as u8;
+  assocresp_buf[28] = 7 as u8;
+  let assoc_info: AssocRespInfo = assoc_response_parse(ref assocresp_buf, 30);
+  if assoc_info.ok != 1 { ok = 0; }
+  if assoc_info.association_id != 7 { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: IEEE 802.11 management frames (Probe Req/Resp, Open System Auth, Assoc Req/Resp) + WPA2-PSK/CCMP RSN IE -- build/parse round trip, real RF/USB transmit-receive remains the RTL8188CU driver's own separately-scoped job");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
 
 // Round 67: ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) and HKDF
 // (RFC 5869) -- the "crypto machinery" a TLS 1.3 handshake needs on
@@ -31827,6 +31924,12 @@ fn kernel_main() -> i64 {
   // csprng_init/csprng_hw_self_test's own header comments.
   let _ = csprng_init();
   let _ = csprng_hw_self_test();
+
+  // Task #164 (WiFi/WPA2) groundwork: IEEE 802.11 management frames
+  // (Probe Req/Resp, Open System Auth, Assoc Req/Resp) + the
+  // WPA2-PSK/CCMP RSN IE. See ieee80211_boot_self_test's own header
+  // comment.
+  let _ = ieee80211_boot_self_test();
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   let _ = chacha20_self_test();
