@@ -90,6 +90,18 @@ fi
 echo "=== Zeroing the first $ZERO_BLOCK_COUNT blocks (DharaFS log + crypto-metadata region) ==="
 sudo dd if=/dev/zero of="$DEVICE" bs=512 count="$ZERO_BLOCK_COUNT" conv=fsync status=progress
 
+# FIX (2026-09-15, real-hardware finding): this dd write touches block 0
+# (the MBR itself), a real partition-table-affecting operation, same as
+# flash_sd_card.sh's own mklabel/mkpart calls right after it -- without
+# an explicit settle here, the kernel/udev's own view of the device can
+# still be catching up when flash_sd_card.sh's `parted mklabel` runs
+# next, especially over a slow USB SD card reader. `udevadm settle` is
+# the documented, race-free wait (see flash_sd_card.sh's own comment on
+# its equivalent step for the full reasoning) -- a plain sleep here was
+# the actual root cause the first time this script caused a real,
+# previously-working card to stop producing any boot output at all.
+sudo udevadm settle
+
 echo
 echo "=== Running the normal full reflash (flash_sd_card.sh) ==="
 # flash_sd_card.sh has its own two confirmation prompts too -- expected,

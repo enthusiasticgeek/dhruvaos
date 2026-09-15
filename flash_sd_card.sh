@@ -91,7 +91,28 @@ if [ ! -b "$BOOT_PART" ]; then
     # (e.g. /dev/mmcblk0p1) -- handle the common alternate shape.
     BOOT_PART="${DEVICE}p1"
 fi
-sleep 1  # let the kernel re-read the partition table
+# FIX (2026-09-15): a plain `sleep 1` doesn't guarantee the kernel's own
+# partition-table view (and udev's own /dev/sdXN node creation) has
+# actually caught up with what parted just wrote -- neither parted's
+# own manual nor its man page document this as reliable, and it's a
+# well-known race specifically on removable/USB media (slower to
+# re-enumerate than a fixed sleep can assume). `udevadm settle` is the
+# documented, race-free wait -- blocks until udev's own event queue is
+# actually empty, not a fixed guess at how long that might take. Also
+# explicitly wait for BOOT_PART's own device node to exist (belt and
+# suspenders: settle can return before every device-specific symlink/
+# node is live on some systems).
+sudo udevadm settle
+for _ in $(seq 1 50); do
+    [ -b "$BOOT_PART" ] && break
+    sleep 0.2
+done
+if [ ! -b "$BOOT_PART" ]; then
+    echo "ERROR: $BOOT_PART never appeared after partitioning -- the kernel" >&2
+    echo "may not have picked up the new partition table. Try re-running," >&2
+    echo "or manually run 'sudo partprobe $DEVICE' first." >&2
+    exit 1
+fi
 
 echo "=== Formatting $BOOT_PART as FAT32 ==="
 sudo mkfs.vfat -F 32 "$BOOT_PART"
@@ -100,12 +121,21 @@ echo "=== Building kernel.img from build/dhruva.elf ==="
 arm-none-eabi-objcopy -O binary "$ROOT/build/dhruva.elf" "$ROOT/build/kernel.img"
 
 echo "=== Writing config.txt ==="
+# FIX (2026-09-15): this template used to be missing uart_2ndstage=1
+# (added 2026-09-14 to a since-updated build/config.txt, but never
+# back-ported here) -- a full reflash via this script silently
+# overwrote a working card's own config.txt with this stale version,
+# losing the GPU/bootloader's own 2nd-stage UART diagnostic log for
+# no visible reason. Kept in sync with build/config.txt's own real
+# content going forward rather than a separate hardcoded copy that can
+# drift again.
 CONFIG_TXT="$ROOT/build/config.txt"
 cat > "$CONFIG_TXT" <<'EOF'
 kernel=kernel.img
 init_uart_clock=3000000
 enable_uart=1
 disable_splash=1
+uart_2ndstage=1
 EOF
 
 echo "=== Mounting $BOOT_PART and copying files ==="
