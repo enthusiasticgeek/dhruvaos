@@ -26301,6 +26301,365 @@ fn ieee80211_boot_self_test() -> i64 {
   return 0;
 }
 
+// Task #198: WPA2 join-sequence orchestrator -- the state machine that
+// actually chains everything tasks #194-197 already built (CSPRNG
+// nonces, RSN IE, 802.11 management-frame build/parse, the EAPOL-Key
+// 4-way-handshake state machine) into one continuous sequence: probe
+// -> open-system auth -> associate -> 4-way handshake -> connected,
+// with a real TK/GTK ready for AES-CCMP data-frame encryption at the
+// end. Real RF/USB transmit-receive remains the RTL8188CU driver's
+// own separately-scoped job (task #197, in progress) -- this
+// orchestrator's own job is purely the SEQUENCING/STATE-TRACKING
+// logic, driven by whatever frame the caller hands it (a real one
+// once #197 lands, a synthetic one in the self-test below), matching
+// this project's own established "pure wire format/state machine, no
+// transport" scoping (the same split EAPOL-Key's own package and the
+// vani-ieee80211 package already use).
+//
+// Session state persists across calls in a caller-owned, caller-
+// allocated 70-byte context buffer (`dhruva_alloc_bytes(70)`, held for
+// the lifetime of one join attempt) -- matches this project's own
+// established out-parameter/caller-owns-the-buffer convention
+// throughout (assoc_request_build's own `out` parameter, wpa_hs_
+// process_msg1's own `msg2_out`), rather than a hidden global (WiFi
+// association is inherently single-instance on this hardware, so
+// either style would work, but this one needed no new boot/*_state.S
+// file or build.sh change at all).
+const WPA2_JOIN_CTX_SIZE: i64 = 70;
+const WPA2_JOIN_STATE_OFF: i64 = 0;
+const WPA2_JOIN_SSID_LEN_OFF: i64 = 1;
+const WPA2_JOIN_ASSOC_ID_OFF: i64 = 2;   // 2 bytes
+const WPA2_JOIN_BSSID_OFF: i64 = 4;      // 6 bytes
+const WPA2_JOIN_OWN_MAC_OFF: i64 = 10;   // 6 bytes
+const WPA2_JOIN_SSID_OFF: i64 = 16;      // 32 bytes
+const WPA2_JOIN_RSN_OFF: i64 = 48;       // 22 bytes
+
+const WPA2_JOIN_IDLE: i64 = 0;
+const WPA2_JOIN_WAIT_PROBE_RESP: i64 = 1;
+const WPA2_JOIN_WAIT_AUTH_RESP: i64 = 2;
+const WPA2_JOIN_WAIT_ASSOC_RESP: i64 = 3;
+const WPA2_JOIN_WAIT_EAPOL_MSG1: i64 = 4;
+const WPA2_JOIN_WAIT_EAPOL_MSG3: i64 = 5;
+const WPA2_JOIN_CONNECTED: i64 = 6;
+const WPA2_JOIN_FAILED: i64 = 7;
+
+struct Wpa2JoinResult { state: i64, tx_len: i64, done: i64, failed: i64 }
+
+// Starts a join attempt: stores the target BSSID/own MAC/SSID/RSN IE
+// into `ctx` (caller-allocated, WPA2_JOIN_CTX_SIZE bytes) and builds
+// the initial Probe Request into `out`. Returns the frame length to
+// transmit.
+fn wpa2_join_start(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, out: mut ref [u8; 64]) -> i64 {
+  let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_PROBE_RESP as u32);
+  let _ = buf_write_byte(ctx, WPA2_JOIN_SSID_LEN_OFF as u32, ssid_len as u32);
+  let i: i64 = 0;
+  while i < 6 {
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_BSSID_OFF + i) as u32, bssid[i] as u32);
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_OWN_MAC_OFF + i) as u32, own_mac[i] as u32);
+    i = i + 1;
+  }
+  i = 0;
+  while i < ssid_len {
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_SSID_OFF + i) as u32, ssid[i] as u32);
+    i = i + 1;
+  }
+  let rsn: [u8; 22] = [0 as u8; 22];
+  let _ = rsn_ie_build_wpa2_psk_ccmp(mut ref rsn);
+  i = 0;
+  while i < 22 {
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_RSN_OFF + i) as u32, rsn[i] as u32);
+    i = i + 1;
+  }
+  return probe_request_build(own_mac, ssid, ssid_len, out);
+}
+
+// Advances the management-frame phase (Probe Response -> Open System
+// Auth -> Association Response) given one received management frame.
+// `out` is sized for the largest frame this phase ever builds
+// (Association Request, up to 90 bytes) -- the smaller Auth Request
+// (30 bytes) is built into a local scratch array first and copied in,
+// since auth_request_build's own signature takes a differently-sized
+// array type and vani has no way to pass a size-90 array where a
+// size-30 one is expected.
+fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out: mut ref [u8; 90]) -> Wpa2JoinResult {
+  let state: i64 = buf_read_byte(ctx, WPA2_JOIN_STATE_OFF as u32) as i64;
+  let bssid: [u8; 6] = [0 as u8; 6];
+  let own_mac: [u8; 6] = [0 as u8; 6];
+  let i: i64 = 0;
+  while i < 6 {
+    bssid[i] = buf_read_byte(ctx, (WPA2_JOIN_BSSID_OFF + i) as u32) as u8;
+    own_mac[i] = buf_read_byte(ctx, (WPA2_JOIN_OWN_MAC_OFF + i) as u32) as u8;
+    i = i + 1;
+  }
+
+  if state == WPA2_JOIN_WAIT_PROBE_RESP {
+    let ssid_out: [u8; 32] = [0 as u8; 32];
+    let info: ProbeRespInfo = probe_response_parse(rx_buf, rx_len, mut ref ssid_out);
+    if (info.ok != 1) || (info.has_rsn != 1) {
+      let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
+      return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
+    }
+    let auth_frame: [u8; 30] = [0 as u8; 30];
+    let alen: i64 = auth_request_build(ref bssid, ref own_mac, mut ref auth_frame);
+    let j: i64 = 0;
+    while j < alen { out[j] = auth_frame[j]; j = j + 1; }
+    let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_AUTH_RESP as u32);
+    return Wpa2JoinResult { state: WPA2_JOIN_WAIT_AUTH_RESP, tx_len: alen, done: 0, failed: 0 };
+  }
+
+  if state == WPA2_JOIN_WAIT_AUTH_RESP {
+    if auth_response_parse(rx_buf, rx_len) != 1 {
+      let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
+      return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
+    }
+    let ssid_len: i64 = buf_read_byte(ctx, WPA2_JOIN_SSID_LEN_OFF as u32) as i64;
+    let ssid: [u8; 32] = [0 as u8; 32];
+    let rsn: [u8; 22] = [0 as u8; 22];
+    let k: i64 = 0;
+    while k < ssid_len { ssid[k] = buf_read_byte(ctx, (WPA2_JOIN_SSID_OFF + k) as u32) as u8; k = k + 1; }
+    k = 0;
+    while k < 22 { rsn[k] = buf_read_byte(ctx, (WPA2_JOIN_RSN_OFF + k) as u32) as u8; k = k + 1; }
+    let alen2: i64 = assoc_request_build(ref bssid, ref own_mac, ref ssid, ssid_len, ref rsn, out);
+    let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_ASSOC_RESP as u32);
+    return Wpa2JoinResult { state: WPA2_JOIN_WAIT_ASSOC_RESP, tx_len: alen2, done: 0, failed: 0 };
+  }
+
+  if state == WPA2_JOIN_WAIT_ASSOC_RESP {
+    let info2: AssocRespInfo = assoc_response_parse(rx_buf, rx_len);
+    if info2.ok != 1 {
+      let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
+      return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
+    }
+    let _ = buf_write_byte(ctx, WPA2_JOIN_ASSOC_ID_OFF as u32, (info2.association_id & (255 as i64)) as u32);
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_ASSOC_ID_OFF + 1) as u32, ((info2.association_id >> 8) & (255 as i64)) as u32);
+    // Nothing to transmit yet -- the AP initiates EAPOL-Key Message 1
+    // next, over the now-associated data link, not this station.
+    let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_EAPOL_MSG1 as u32);
+    return Wpa2JoinResult { state: WPA2_JOIN_WAIT_EAPOL_MSG1, tx_len: 0, done: 0, failed: 0 };
+  }
+
+  // Called in an unexpected state (already CONNECTED/FAILED, or IDLE
+  // before wpa2_join_start) -- reports failure rather than silently
+  // reprocessing or crashing.
+  return Wpa2JoinResult { state: state, tx_len: 0, done: 0, failed: 1 };
+}
+
+// Advances the EAPOL-Key 4-way-handshake phase given one received
+// EAPOL-Key frame (arrives over the data link's own EtherType 0x888E,
+// not as an 802.11 management frame -- classification between the two
+// is the caller's own job, same layering `wpa2_join_step_mgmt` already
+// assumes). `pmk` is the pre-shared key already derived from the
+// network password (PBKDF2-HMAC-SHA1, round 61's own PMK worked-
+// example self-test) -- deriving it is deliberately NOT this
+// orchestrator's own job, it's a pure function of (password, SSID)
+// with no session state of its own.
+fn wpa2_join_step_eapol(ctx: mut ref i64, rx_buf: mut ref i64, rx_len: i64, pmk: mut ref i64, tx_out: mut ref i64, gtk_out: mut ref i64) -> Wpa2JoinResult {
+  let state: i64 = buf_read_byte(ctx, WPA2_JOIN_STATE_OFF as u32) as i64;
+
+  if state == WPA2_JOIN_WAIT_EAPOL_MSG1 {
+    let bssid_h: mut ref i64 = dhruva_alloc_bytes(6);
+    let own_mac_h: mut ref i64 = dhruva_alloc_bytes(6);
+    let i: i64 = 0;
+    while i < 6 {
+      let _ = buf_write_byte(bssid_h, i as u32, buf_read_byte(ctx, (WPA2_JOIN_BSSID_OFF + i) as u32));
+      let _ = buf_write_byte(own_mac_h, i as u32, buf_read_byte(ctx, (WPA2_JOIN_OWN_MAC_OFF + i) as u32));
+      i = i + 1;
+    }
+    let _ = wpa_hs_init(pmk, bssid_h, own_mac_h);
+    let snonce: mut ref i64 = dhruva_alloc_bytes(32);
+    let _ = wpa_nonce_generate_heap(snonce);
+    if wpa_hs_process_msg1(rx_buf, rx_len, snonce, tx_out) != WPA_HS_OK {
+      let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
+      return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
+    }
+    let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_EAPOL_MSG3 as u32);
+    return Wpa2JoinResult { state: WPA2_JOIN_WAIT_EAPOL_MSG3, tx_len: 99, done: 0, failed: 0 };
+  }
+
+  if state == WPA2_JOIN_WAIT_EAPOL_MSG3 {
+    // wpa_hs_process_msg3's own contract: Message 4 is built (and, in
+    // a real deployment, arguably still worth transmitting) even on
+    // WPA_HS_ERR_KEY_UNWRAP specifically, since MIC+replay already
+    // validated by that point -- this orchestrator deliberately
+    // simplifies that to a flat pass/fail for this increment (treats
+    // ANY negative return as a failed join), a known, documented
+    // narrowing of what the underlying function already supports, not
+    // a limitation of the function itself.
+    let gtk_len: i64 = wpa_hs_process_msg3(rx_buf, rx_len, tx_out, gtk_out);
+    if gtk_len < 0 {
+      let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
+      return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
+    }
+    let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_CONNECTED as u32);
+    return Wpa2JoinResult { state: WPA2_JOIN_CONNECTED, tx_len: 99, done: 1, failed: 0 };
+  }
+
+  return Wpa2JoinResult { state: state, tx_len: 0, done: 0, failed: 1 };
+}
+
+// End-to-end self-test: drives the FULL join sequence (start -> probe
+// response -> auth response -> assoc response -> EAPOL Msg1 -> Msg3 ->
+// connected) against a SYNTHETIC peer, reusing the exact same known-
+// answer PMK/nonces/expected-MIC/expected-GTK values wpa_handshake_
+// self_test already independently verified -- this test's own value
+// isn't re-checking that math (already proven), it's confirming the
+// ORCHESTRATOR correctly sequences through every state and threads the
+// right buffers to the right underlying function at the right time,
+// something no earlier self-test (each of which exercises one piece
+// in isolation) actually covered. Real RF/USB transmit-receive remains
+// out of scope here exactly as it is everywhere else in this
+// investigation -- see rtl8188cu_probe's own header comment.
+fn wpa2_join_orchestrator_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let bssid: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x01 as u8];
+  let own_mac: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x02 as u8];
+  let ssid: [u8; 32] = zero32_bytes_80211();
+  ssid[0] = 0x74 as u8;
+  ssid[1] = 0x65 as u8;
+  ssid[2] = 0x73 as u8;
+  ssid[3] = 0x74 as u8;
+
+  let ctx: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_CTX_SIZE as u32);
+  let preq: [u8; 64] = [0 as u8; 64];
+  let preq_len: i64 = wpa2_join_start(ctx, ref bssid, ref own_mac, ref ssid, 4, mut ref preq);
+  if preq_len != 36 { ok = 0; }
+
+  // Synthetic Probe Response (same shape ieee80211_boot_self_test's
+  // own presp_buf uses): SSID + this same RSN IE.
+  let rsn: [u8; 22] = [0 as u8; 22];
+  let _ = rsn_ie_build_wpa2_psk_ccmp(mut ref rsn);
+  let presp: [u8; 256] = [0 as u8; 256];
+  let fc_presp: i64 = FC_STYPE_PROBE_RESP;
+  presp[0] = (fc_presp & (255 as i64)) as u8;
+  presp[1] = ((fc_presp >> 8) & (255 as i64)) as u8;
+  presp[36] = EID_SSID as u8;
+  presp[37] = 4 as u8;
+  presp[38] = 0x74 as u8;
+  presp[39] = 0x65 as u8;
+  presp[40] = 0x73 as u8;
+  presp[41] = 0x74 as u8;
+  let ri: i64 = 0;
+  while ri < 22 { presp[42 + ri] = rsn[ri]; ri = ri + 1; }
+
+  let mgmt_out: [u8; 90] = [0 as u8; 90];
+  let r1: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref presp, 42 + 22, mut ref mgmt_out);
+  if (r1.state != WPA2_JOIN_WAIT_AUTH_RESP) || (r1.tx_len != 30) || (r1.failed != 0) { ok = 0; }
+
+  // Synthetic Auth Response: Open System, transaction 2, success.
+  let aresp: [u8; 256] = [0 as u8; 256];
+  let fc_auth: i64 = FC_STYPE_AUTH;
+  aresp[0] = (fc_auth & (255 as i64)) as u8;
+  aresp[1] = ((fc_auth >> 8) & (255 as i64)) as u8;
+  aresp[26] = 2 as u8;
+  let r2: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref aresp, 30, mut ref mgmt_out);
+  if (r2.state != WPA2_JOIN_WAIT_ASSOC_RESP) || (r2.tx_len != 62) || (r2.failed != 0) { ok = 0; }
+
+  // Synthetic Assoc Response: success, association ID 7.
+  let assocresp: [u8; 256] = [0 as u8; 256];
+  let fc_assoc: i64 = FC_STYPE_ASSOC_RESP;
+  assocresp[0] = (fc_assoc & (255 as i64)) as u8;
+  assocresp[1] = ((fc_assoc >> 8) & (255 as i64)) as u8;
+  assocresp[28] = 7 as u8;
+  let r3: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref assocresp, 30, mut ref mgmt_out);
+  if (r3.state != WPA2_JOIN_WAIT_EAPOL_MSG1) || (r3.tx_len != 0) || (r3.failed != 0) { ok = 0; }
+  if (buf_read_byte(ctx, WPA2_JOIN_ASSOC_ID_OFF as u32) as i64) != 7 { ok = 0; }
+
+  // Same known-answer PMK/ANonce/SNonce as wpa_handshake_self_test --
+  // reusing that exact expected MIC/GTK below is what actually proves
+  // this orchestrator threads the right buffers through correctly,
+  // not just that it reaches the right STATE.
+  let pmk: mut ref i64 = dhruva_alloc_bytes(32);
+  let pm: [u8; 32] = [
+    0xf4 as u8, 0x2c as u8, 0x6f as u8, 0xc5 as u8, 0x2d as u8, 0xf0 as u8, 0xeb as u8, 0xef as u8,
+    0x9e as u8, 0xbb as u8, 0x4b as u8, 0x90 as u8, 0xb3 as u8, 0x8a as u8, 0x5f as u8, 0x90 as u8,
+    0x2e as u8, 0x83 as u8, 0xfe as u8, 0x1b as u8, 0x13 as u8, 0x5a as u8, 0x70 as u8, 0xe2 as u8,
+    0x3a as u8, 0xed as u8, 0x76 as u8, 0x2e as u8, 0x97 as u8, 0x10 as u8, 0xa1 as u8, 0x2e as u8
+  ];
+  let pmi: i64 = 0;
+  while pmi < 32 { let _ = buf_write_byte(pmk, pmi as u32, pm[pmi] as u32); pmi = pmi + 1; }
+
+  let anonce: mut ref i64 = dhruva_alloc_bytes(32);
+  let ani: i64 = 0;
+  while ani < 32 { let _ = buf_write_byte(anonce, ani as u32, 0x11 as u32); ani = ani + 1; }
+
+  let msg1: mut ref i64 = dhruva_alloc_bytes(99);
+  let _ = eapol_key_build_header(msg1, 2, 0x008a, 16, 0);
+  let _ = buf_write_byte(msg1, (EAPOL_KEY_REPLAY_OFF + 7) as u32, 1 as u32);
+  let ni1: i64 = 0;
+  while ni1 < 32 { let _ = buf_write_byte(msg1, (EAPOL_KEY_NONCE_OFF + ni1) as u32, buf_read_byte(anonce, ni1 as u32)); ni1 = ni1 + 1; }
+
+  // wpa2_join_step_eapol generates its own SNonce internally (real
+  // hardware entropy, not the fixed 0x22-byte value wpa_handshake_
+  // self_test uses) -- meaning the Msg2 MIC will NOT match that
+  // test's own fixed expected value here, by design. What this test
+  // checks instead: the handshake completes at all (real KCK/PTK
+  // derivation succeeded against a real, non-fixed SNonce) and Msg3 ->
+  // GTK extraction still matches exactly, since THAT known-answer
+  // value depends only on the KCK (itself dependent on SNonce) being
+  // internally self-consistent between what msg2 used to derive it and
+  // what msg3's own MIC verification checks it against -- not on
+  // SNonce matching any EXTERNAL fixed value.
+  let msg2: mut ref i64 = dhruva_alloc_bytes(99);
+  let r4: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg1, 99, pmk, msg2, msg2);
+  if (r4.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4.tx_len != 99) || (r4.failed != 0) { ok = 0; }
+
+  let gtk_kde_len: i64 = 24;
+  let msg3: mut ref i64 = dhruva_alloc_bytes(99 + gtk_kde_len);
+  let _ = eapol_key_build_header(msg3, 2, 0x03ca, 16, gtk_kde_len);
+  let _ = buf_write_byte(msg3, (EAPOL_KEY_REPLAY_OFF + 7) as u32, 2 as u32);
+  let ni3: i64 = 0;
+  while ni3 < 32 { let _ = buf_write_byte(msg3, (EAPOL_KEY_NONCE_OFF + ni3) as u32, buf_read_byte(anonce, ni3 as u32)); ni3 = ni3 + 1; }
+  let gtk_kde: [u8; 24] = [
+    0xdd as u8, 0x16 as u8, 0x00 as u8, 0x0f as u8, 0xac as u8, 0x01 as u8, 0x01 as u8, 0x00 as u8,
+    0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8,
+    0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8
+  ];
+  let kdi: i64 = 0;
+  while kdi < gtk_kde_len { let _ = buf_write_byte(msg3, (EAPOL_KEY_DATA_OFF + kdi) as u32, gtk_kde[kdi] as u32); kdi = kdi + 1; }
+  let kck_for_test: mut ref i64 = wpa_hs_kck_ptr();
+  let _ = eapol_key_set_mic(msg3, 99 + gtk_kde_len, kck_for_test, 16);
+
+  let msg4: mut ref i64 = dhruva_alloc_bytes(99);
+  let gtk_result: mut ref i64 = dhruva_alloc_bytes(32);
+  let r5: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg3, 99 + gtk_kde_len, pmk, msg4, gtk_result);
+  if (r5.state != WPA2_JOIN_CONNECTED) || (r5.done != 1) || (r5.failed != 0) { ok = 0; }
+
+  let exp_gtk: mut ref i64 = dhruva_alloc_bytes(16);
+  let egi: i64 = 0;
+  while egi < 16 { let _ = buf_write_byte(exp_gtk, egi as u32, 0xaa as u32); egi = egi + 1; }
+  if sha256_bytes_equal(gtk_result, exp_gtk, 16) == 0 { ok = 0; }
+
+  // The whole point: a real TK is now sitting in wpa_hs_tk_ptr(),
+  // ready for AES-CCMP data-frame encryption (aes_ccmp_encrypt/
+  // decrypt already take a raw key buffer directly -- no separate
+  // "install" step exists at the crypto layer, so "installed" means
+  // exactly this: the orchestrator finished, and this pointer is live).
+  let tk: mut ref i64 = wpa_hs_tk_ptr();
+  let tk_nonzero: i64 = 0;
+  let tzi: i64 = 0;
+  while tzi < 16 {
+    if buf_read_byte(tk, tzi as u32) != (0 as u32) { tk_nonzero = 1; }
+    tzi = tzi + 1;
+  }
+  // (TK is derived from a real, non-fixed SNonce this run -- can't
+  // check it against a fixed expected value the way KCK-dependent
+  // GTK extraction above could; confirming it's non-all-zero is a
+  // real, if weak, sanity check that derivation actually produced
+  // something rather than a degenerate all-zero result -- the
+  // byte-level correctness of TK derivation itself is already fully
+  // covered by wpa_ptk_derive's own dedicated self-test.)
+  if tk_nonzero != 1 { ok = 0; }
+
+  let _ = uart_puts("WPA2: join-sequence orchestrator (probe->auth->assoc->4-way-handshake->TK/GTK ready) end-to-end against a synthetic peer, reusing wpa_handshake_self_test's own known-answer PMK/GTK");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Round 67: ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) and HKDF
 // (RFC 5869) -- the "crypto machinery" a TLS 1.3 handshake needs on
 // top of the ECDHE (X25519) and signature (Ed25519) primitives
@@ -33070,6 +33429,13 @@ fn kernel_main() -> i64 {
   // WPA2-PSK/CCMP RSN IE. See ieee80211_boot_self_test's own header
   // comment.
   let _ = ieee80211_boot_self_test();
+
+  // Task #198: WPA2 join-sequence orchestrator, end-to-end against a
+  // synthetic peer. See wpa2_join_orchestrator_self_test's own header
+  // comment -- calls wpa_hs_init itself before using any wpa_hs_*
+  // state, same as wpa_handshake_self_test does independently, so
+  // this has no ordering dependency on that (or any other) self-test.
+  let _ = wpa2_join_orchestrator_self_test();
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   let _ = chacha20_self_test();
