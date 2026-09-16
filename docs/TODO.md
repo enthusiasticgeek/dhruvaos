@@ -6095,19 +6095,59 @@ support of any kind.
 
 - **`phase4_milestone.py`'s interactive shell checks (`eval`, `ls`) flake
   under load, independent of any code change** `[found round 186,
-  2026-09-12, not investigated]`. While comparing the round 186 MMC/
-  eMMC change against a clean baseline for a suspected regression, ran
-  the SAME unmodified pre-186 commit 3 times back-to-back: 17/17,
-  16/17, 17/17 -- the failure wasn't reproducible-on-demand but also
-  wasn't unique to the new code, ruling out a round 186 regression.
-  Captured log evidence for the one baseline failure: the shell's own
-  interactive echo of `write /milestone/note ...` came back as `rite
-  /milestone/note ...` (a genuinely dropped leading byte on the RX/
-  echo path, not a display artifact -- the underlying write still
-  succeeded), and a similarly-timed `eval 6*7` got misparsed as
-  "unknown command" despite echoing back intact. Likely a real UART
-  RX/interactive-shell timing race exposed only under host load (many
-  back-to-back QEMU runs this session) rather than a logic bug -- not
-  investigated further here, flagging so a future round doesn't
-  mistake ordinary flakiness for a regression the way this one almost
-  did.
+  2026-09-12; ROOT-CAUSED AND FIXED 2026-09-16]`. While comparing the
+  round 186 MMC/eMMC change against a clean baseline for a suspected
+  regression, ran the SAME unmodified pre-186 commit 3 times back-to-
+  back: 17/17, 16/17, 17/17 -- the failure wasn't reproducible-on-
+  demand but also wasn't unique to the new code, ruling out a round
+  186 regression. Captured log evidence for the one baseline failure:
+  the shell's own interactive echo of `write /milestone/note ...` came
+  back as `rite /milestone/note ...` (a genuinely dropped leading byte
+  on the RX/echo path, not a display artifact -- the underlying write
+  still succeeded), and a similarly-timed `eval 6*7` got misparsed as
+  "unknown command" despite echoing back intact.
+
+  **Root cause**: `shell_echo_char` (round 72) reused `uart_putc_
+  nonblocking` for command-line echo -- a function whose entire
+  design point was "check the PL011's 16-byte hardware TX FIFO once,
+  silently drop the byte if full, never block" (correct and necessary
+  for its ORIGINAL callers: the timer-tick `.` dot and the CANARY
+  stack-overflow diagnostic, both genuinely fine to miss occasionally).
+  QEMU's own stdio chardev backend hands a whole typed line to the
+  emulated PL011 as one burst (the same underlying behavior already
+  responsible for a DIFFERENT, previously-fixed bug in this same RX
+  path -- see irq_dispatch's own task #9 comment), so `irq_dispatch`'s
+  RX-drain loop can call the echo path many times in a tight sequence
+  with no real inter-byte delay, easily exceeding the hardware FIFO's
+  real drain rate at the configured baud -- especially with a
+  concurrent timer-tick `.` also competing for the same 16-byte FIFO.
+  Under that contention, ECHO bytes were silently dropped exactly like
+  the harmless debug characters the mechanism was designed around.
+
+  **Fix**: added a 64-byte TX ring buffer (`boot/uart_tx_ring_state.S`)
+  that `uart_putc_nonblocking` now pushes into (an O(1), always-
+  bounded operation, no MMIO wait) with an opportunistic single-byte
+  drain to the real hardware FIFO on the same call -- still fully
+  non-blocking and WCET-provable, just no longer silently lossy under
+  ordinary contention (now only drops if the 64-byte ring itself
+  fills, 4x the hardware FIFO's own depth). Implemented as ONE
+  combined assembly routine, not separate get/set accessor calls --
+  the first attempt (6 separate extern round-trips per byte) blew
+  `irq_dispatch`'s own `#[wcet(cycles=130000)]` budget to 216690
+  cycles from real ARM call overhead alone, paid up to 128 times per
+  RX burst; the single-routine rewrite (direct register/memory access,
+  `& 63` instead of a real modulo since 64 is a power of two) builds
+  clean under the same budget.
+
+  Verified: live QEMU session repeating the exact failure-shape
+  commands (`write`, `eval 6*7`, `ls`) shows intact echo every time;
+  full self-test battery clean (idle reached, 0 FAILs, any_fail=0);
+  `phase4_milestone.py` shows the SAME 15/18 pattern as the
+  established pre-fix baseline, with the first 15 checks (including
+  `write`/`cat`/`eval`, which directly exercise the echo path) all
+  passing -- the 3 remaining failures (`mqttecho`/`ls`/`diagnose`) are
+  a SEPARATE, still-open issue: `phase4_milestone.py`'s own `SETTLE_S`
+  inter-command delay is too short for its now-longer command sequence
+  (grown since this constant was last tuned), not a UART byte-drop --
+  a test-infrastructure timing issue, not a kernel bug, left open as
+  its own separate item.

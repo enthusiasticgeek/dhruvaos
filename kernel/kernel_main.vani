@@ -1386,6 +1386,15 @@ extern "C" fn usb_wifi_set_in_toggle(value: u32) -> u32;
 extern "C" fn usb_wifi_get_out_toggle() -> u32;
 extern "C" fn usb_wifi_set_out_toggle(value: u32) -> u32;
 
+// Round 2026-09-16: persistent state backing uart_putc_nonblocking's
+// own TX ring buffer -- see boot/uart_tx_ring_state.S's own header
+// comment for the full root-cause writeup (a real, previously-
+// undiagnosed dropped-byte bug in command-line echo) and why this is
+// ONE combined extern call rather than separate get/set accessors
+// (the first attempt, at 6 separate extern round-trips per byte,
+// blew irq_dispatch's own WCET budget from real ARM call overhead).
+extern "C" fn uart_tx_ring_push_and_drain(c: u32) -> u32;
+
 // Round 2026-09-15 real-hardware timing investigation: TIMER_CLO
 // snapshots taken at boot.S's own 7 pre-kernel_main LED checkpoints (see
 // boot/rpi1/boot.S's SNAP_TIMER macro) -- printed once uart_init() has
@@ -2169,34 +2178,25 @@ fn uart_putc(c: i64) -> i64 {
   return 0;
 }
 
-// Best-effort, WCET-safe single-char write for hard-RT contexts:
-// uart_putc's own FIFO-full wait loop has no compile-time-provable
-// iteration bound (the estimator correctly rejects it under
-// #[wcet(...)] for exactly that reason), so this checks the FIFO
-// status once and silently drops the byte if it's full rather than
-// spinning -- a genuine tradeoff (an occasional missed debug
-// character), not a workaround: an ISR that MUST make forward
-// progress can never afford to block on a shared peripheral no matter
-// how unlikely the wait would be in practice.
+// Best-effort, WCET-safe single-char write for hard-RT contexts.
+// ROUND 2026-09-16: no longer writes the hardware FIFO directly --
+// pushes into uart_tx_ring_push_and_drain's own ring buffer instead
+// (an O(1), always-bounded operation, no MMIO status wait needed in
+// vani code at all -- see boot/uart_tx_ring_state.S's own header
+// comment for the full root-cause writeup and why the push+drain
+// logic lives there as one combined assembly routine rather than
+// separate vani-level accessor calls). Fixes a real, previously-
+// undiagnosed bug: the OLD "check FIFO once, silently drop if full"
+// behavior was a correct tradeoff for this function's original
+// callers (the timer-tick '.' dot, the CANARY diagnostic) but broke
+// command-line ECHO (round 72's own reuse of this same function)
+// under real FIFO contention -- a genuinely dropped byte in user-
+// visible output, not a harmless missed debug character. Still
+// cannot block -- still fully WCET-provable, just no longer silently
+// lossy under ordinary contention (only drops if the ring itself is
+// full, a 64-byte buffer versus the hardware FIFO's own 16 bytes).
 fn uart_putc_nonblocking(c: i64) -> i64 {
-  let uart_fr: i64 = UART_FR;
-  let uart_dr: i64 = UART_DR;
-  // ROUND 2026-09-16: deliberately NOT given the same auto-CR-before-LF
-  // fix as uart_putc -- tried it, found two real problems. (1) Every
-  // hard-RT caller of this function that ever emits a raw '\n' (10)
-  // already hand-manages its own CR+LF explicitly at the call site
-  // (e.g. the shell-echo path a few hundred lines below does
-  // `uart_putc_nonblocking(13); uart_putc_nonblocking(10);` itself) --
-  // auto-inserting a CR here too would have DOUBLED it at that site.
-  // (2) The extra branch pushed irq_dispatch's own static WCET
-  // estimate from just under its `#[wcet(cycles=130000)]` budget to
-  // 145851 cycles, a hard build-time rejection -- this function exists
-  // specifically for hard-RT contexts where that budget is a real,
-  // enforced correctness property, not a soft target. Left unchanged.
-  let fr: u32 = mmio_read_u32(uart_fr);
-  if (fr & (0x20 as u32)) == (0 as u32) {
-    let _ = mmio_write_u8(uart_dr, c as u8);
-  }
+  let _ = uart_tx_ring_push_and_drain(c as u32);
   return 0;
 }
 
