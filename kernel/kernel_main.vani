@@ -3186,13 +3186,34 @@ fn sdhost_card_addr(block_num: i64) -> u32 {
 // still be mid-transfer while this file's own code had already moved on
 // to the next command is exactly the kind of silent corruption this
 // project's own repeated real-hardware SD/DharaFS write failures
-// describe. Bounded at 100000 iterations, matching Linux's own value
-// exactly, not `while true`, same "never hang forever" convention as
-// sdhost_cmd's own poll.
+// describe.
+//
+// ROUND 2026-09-16 (real-hardware investigation): originally bounded
+// at 100000 iterations to match Linux's own bcm2835_wait_transfer_
+// complete constant exactly -- but a real-hardware log showed this
+// timing out (fsm never seen as 0/1/alternate_idle across all 100000
+// iterations) on EVERY single data command, then the very NEXT read of
+// SDEDM (in the caller's own failure-diagnostic print, moments later)
+// already showing fsm=1 (DATAMODE -- one of the states this function
+// itself treats as success). That's consistent with the transfer
+// genuinely completing shortly after this poll gives up, not a truly
+// wedged controller -- Linux's own 100000-iteration constant is
+// calibrated for ITS OWN compiled loop body polling a bare readl();
+// this driver's own per-iteration real wall-clock cost, compiled via
+// vani rather than gcc, is not guaranteed to match that, and this
+// exact investigation already found today (BLINK_N's own busy-wait,
+// same class of bare polling loop) that real per-iteration cost on
+// this hardware can diverge sharply from a naive assumption either
+// direction. Bumped 50x (to 5000000, still bounded, same "never hang
+// forever" convention as sdhost_cmd's own 1000000-iteration cap,
+// which itself is already larger than this one WAS despite covering
+// less real work -- a command/response handshake, not a full 512-byte
+// FIFO transfer plus card busy-time). Speculative -- not yet confirmed
+// by a real-hardware log with this specific change in place.
 fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
   let sdedm: i64 = SDEDM;
   let iter: i64 = 0;
-  while iter < 100000 {
+  while iter < 5000000 {
     let edm: u32 = mmio_read_u32(sdedm);
     let fsm: u32 = edm & (0xF as u32);
     if (fsm == (0 as u32)) || (fsm == (1 as u32)) {
