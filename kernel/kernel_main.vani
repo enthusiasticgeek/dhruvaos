@@ -2669,6 +2669,22 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   let sdarg: i64 = SDARG;
   let sdcmd: i64 = SDCMD;
   let sdcmd_new_flag: u32 = 0x8000 as u32;
+  // ROUND 2026-09-16 (real-hardware investigation, speculative -- see
+  // sdhost_read_block_once's own header comment for the full context):
+  // real Linux's bcm2835_send_command() always clears any pending
+  // SDHSTS error bits BEFORE writing SDCMD for the NEXT command, not
+  // just after the PREVIOUS one finishes -- this driver only ever did
+  // the latter (in sdhost_read_block_once/write_block_once, after
+  // their own transfer completes). A stale error bit surviving from
+  // whatever the last command was (control or data) could otherwise
+  // still be sitting in SDHSTS when the NEXT command's own data phase
+  // starts checking it. Matches real Linux exactly: read, and only
+  // write back if any of the documented error bits (0xF8 -- REW_
+  // TIMEOUT|CMD_TIMEOUT|CRC16|CRC7|FIFO_ERROR) are actually set.
+  let sdhsts_pre: u32 = mmio_read_u32(SDHSTS);
+  if (sdhsts_pre & (0xF8 as u32)) != (0 as u32) {
+    let _ = mmio_write_u32(SDHSTS, sdhsts_pre);
+  }
   let _ = mmio_write_u32(sdarg, arg);
   let _ = mmio_write_u32(sdcmd, sdcmd_new_flag | cmd_and_flags);
 
@@ -3269,6 +3285,25 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
 // count should be revisited rather than silently masking that.
 const SD_MAX_ATTEMPTS: i64 = 3;
 
+// ROUND 2026-09-16 (real-hardware investigation, speculative): real
+// Linux's bcm2835_prepare_data() calls bcm2835_set_transfer_irqs()
+// before EVERY data command, writing SDHCFG_DATA_IRPT_EN(bit4) |
+// SDHCFG_BLOCK_IRPT_EN(bit8) | SDHCFG_BUSY_IRPT_EN(bit10) = 0x510 for
+// a PIO transfer (the DMA case, irrelevant here, only sets the busy
+// bit). This driver has left SDHCFG at 0 (all bits clear) permanently
+// since sdhost_init's own one-time write -- it never gets touched
+// again for any data command. On real BCM2835 silicon these "IRQ
+// enable" bits may double as internal event-detection/latch enables
+// for the data-phase state machine itself, not purely "route this to
+// the ARM interrupt controller" bits (this driver never enables the
+// interrupt controller for SDHOST at all, so setting them here cannot
+// cause a real IRQ to actually fire regardless). This exact symptom
+// -- CMD0/CMD8/ACMD41/CMD2/CMD3/CMD9/CMD7 (no data phase) succeed
+// 100% of the time, every real data command (CMD17/CMD24) wedges the
+// FSM 100% of the time, and a full controller reset doesn't fix it --
+// is consistent with the data-phase state machine never being told
+// (via these bits) that a data phase is even happening. Not yet
+// confirmed by a real-hardware log with this fix in place.
 fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -3278,6 +3313,7 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_readwait: u32 = 4 as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
+  let _ = mmio_write_u32(SDHCFG, 0x510 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
   let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
@@ -3333,6 +3369,8 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   return 2;
 }
 
+// See sdhost_read_block_once's own header comment for the SDHCFG
+// reasoning -- same fix, same speculation, same fallback plan.
 fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -3342,6 +3380,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_writestart1: u32 = 0xA as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
+  let _ = mmio_write_u32(SDHCFG, 0x510 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
   let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
