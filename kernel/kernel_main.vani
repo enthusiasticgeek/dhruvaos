@@ -2133,6 +2133,31 @@ fn uart_rx_irq_init() -> i64 {
 fn uart_putc(c: i64) -> i64 {
   let uart_fr: i64 = UART_FR;
   let uart_dr: i64 = UART_DR;
+  // ROUND 2026-09-16: a raw terminal in the mode picocom uses for real-
+  // hardware debugging does NOT translate a bare LF (\n, 0x0A) into a
+  // full CRLF the way virtually every text-file tool/editor silently
+  // does when reading a SAVED log back afterward -- LF alone just
+  // moves the cursor down one row, without returning it to column 0,
+  // so every one of this kernel's own `uart_puts("...\n")` calls (the
+  // overwhelming majority of them, throughout the whole file) produced
+  // a real, live "staircase" indentation effect on an actual picocom
+  // session that was completely invisible in every saved log this
+  // investigation had looked at up to this point, since `cat`/`grep`/
+  // any ordinary text reader already normalizes a bare LF into a real
+  // newline before a human ever sees it. Fixed at the single lowest
+  // common layer (this function) rather than touching every print
+  // call site across the file: emit a CR (\r, 0x0D) immediately before
+  // any LF, matching the standard "onlcr" behavior a full terminal
+  // driver would normally provide, which this bare UART has none of.
+  if c == 10 {
+    while true {
+      let fr_cr: u32 = mmio_read_u32(uart_fr);
+      if (fr_cr & (0x20 as u32)) == (0 as u32) {
+        break;
+      }
+    }
+    let _ = mmio_write_u8(uart_dr, 13 as u8);
+  }
   // Wait while the TX FIFO is full (FR bit 5).
   while true {
     let fr: u32 = mmio_read_u32(uart_fr);
@@ -2156,6 +2181,18 @@ fn uart_putc(c: i64) -> i64 {
 fn uart_putc_nonblocking(c: i64) -> i64 {
   let uart_fr: i64 = UART_FR;
   let uart_dr: i64 = UART_DR;
+  // ROUND 2026-09-16: deliberately NOT given the same auto-CR-before-LF
+  // fix as uart_putc -- tried it, found two real problems. (1) Every
+  // hard-RT caller of this function that ever emits a raw '\n' (10)
+  // already hand-manages its own CR+LF explicitly at the call site
+  // (e.g. the shell-echo path a few hundred lines below does
+  // `uart_putc_nonblocking(13); uart_putc_nonblocking(10);` itself) --
+  // auto-inserting a CR here too would have DOUBLED it at that site.
+  // (2) The extra branch pushed irq_dispatch's own static WCET
+  // estimate from just under its `#[wcet(cycles=130000)]` budget to
+  // 145851 cycles, a hard build-time rejection -- this function exists
+  // specifically for hard-RT contexts where that budget is a real,
+  // enforced correctness property, not a soft target. Left unchanged.
   let fr: u32 = mmio_read_u32(uart_fr);
   if (fr & (0x20 as u32)) == (0 as u32) {
     let _ = mmio_write_u8(uart_dr, c as u8);
@@ -3208,7 +3245,31 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
 // hit path 3 at all (its SDHSTS values were 0x1, entirely outside the
 // 0xF8 error mask) -- only paths 1 and 2 -- so this stays scoped to
 // exactly the failure modes actual hardware evidence showed needed it.
-fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
+// ROUND 2026-09-16 FOLLOW-UP (speculative -- see this function's own
+// caller for why): the reset-on-wedge fix above stops one failed
+// transfer from wedging every command AFTER it, but still hands the
+// caller (DharaFS, the 8-block sweep) a failure for the block that
+// actually wedged -- the controller comes back clean for the NEXT
+// command, not the current one. Real Linux's MMC core wraps every
+// request in its own bounded retry (mmc_blk_issue_rw_rq's default
+// retry count), re-attempting the SAME operation a few times after a
+// reset rather than surfacing one failure immediately. This driver
+// had no equivalent. Added one: sdhost_read_block_once/
+// sdhost_write_block_once below hold the exact single-attempt logic
+// this file already had (unchanged); sdhost_read_block/
+// sdhost_write_block now retry up to SD_MAX_ATTEMPTS times on the two
+// failure modes real hardware actually showed (1/2), resetting
+// between attempts exactly as before. NOT yet confirmed necessary by
+// a real-hardware log showing a block still failing after a reset --
+// added proactively, matching Linux's own long-standing defensive
+// posture, not a fix for a specific observed symptom. If a future
+// real-hardware log shows every retry attempt failing identically for
+// several consecutive blocks, that would point at a genuinely bad
+// block/card region instead of a transient wedge, and this retry
+// count should be revisited rather than silently masking that.
+const SD_MAX_ATTEMPTS: i64 = 3;
+
+fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
   let sdhsts: i64 = SDHSTS;
@@ -3225,32 +3286,54 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
-    let _ = uart_puts("SD: read wedge detected (NEW_FLAG stuck) -- resetting controller\n");
-    let _ = sdhost_init();
     return 1;
   }
   if wait_status != 0 {
-    let _ = uart_puts("SD: read wedge detected (FSM stuck) -- resetting controller\n");
-    let _ = sdhost_init();
     return 2;
   }
   if errs != (0 as u32) {
-    // Deliberately NOT reset here -- see this function's own header
-    // comment for why (QEMU-only persistent-SDHSTS regression found
+    // Deliberately NOT reset/retried here -- see this function's own
+    // caller for why (QEMU-only persistent-SDHSTS regression found
     // and reverted; real hardware never actually hit this path).
     return 3;
   }
   return 0;
 }
 
-fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
-  // Round 62 (fault injection): `fault write <n>` -- see
-  // fault_write_maybe_inject's own comment. Checked before touching
-  // any hardware register at all, so an injected failure has zero
-  // side effects on the real SD controller state.
-  if fault_write_maybe_inject() == (1 as u32) {
-    return 1;
+fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
+  let attempt: i64 = 0;
+  while attempt < SD_MAX_ATTEMPTS {
+    let result: i64 = sdhost_read_block_once(block_num, buf);
+    if result == 0 {
+      return 0;
+    }
+    if result == 3 {
+      return 3;
+    }
+    attempt = attempt + 1;
+    if attempt < SD_MAX_ATTEMPTS {
+      let _ = uart_puts("SD: read wedge detected (");
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
+      let _ = uart_puts(") -- resetting controller and retrying, attempt ");
+      let _ = uart_put_i64(attempt + 1);
+      let _ = uart_puts("/");
+      let _ = uart_put_i64(SD_MAX_ATTEMPTS);
+      let _ = uart_puts("\n");
+      let _ = sdhost_init();
+    } else {
+      let _ = uart_puts("SD: read wedge detected (");
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
+      let _ = uart_puts(") -- resetting controller, giving up after ");
+      let _ = uart_put_i64(SD_MAX_ATTEMPTS);
+      let _ = uart_puts(" attempts\n");
+      let _ = sdhost_init();
+      return result;
+    }
   }
+  return 2;
+}
+
+fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
   let sdhsts: i64 = SDHSTS;
@@ -3267,22 +3350,64 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
-    let _ = uart_puts("SD: write wedge detected (NEW_FLAG stuck) -- resetting controller\n");
-    let _ = sdhost_init();
     return 1;
   }
   if wait_status != 0 {
-    let _ = uart_puts("SD: write wedge detected (FSM stuck) -- resetting controller\n");
-    let _ = sdhost_init();
     return 2;
   }
   if errs != (0 as u32) {
-    // Deliberately NOT reset here -- see sdhost_read_block's own
-    // header comment for why (QEMU-only persistent-SDHSTS regression
-    // found and reverted; real hardware never actually hit this path).
+    // Deliberately NOT reset/retried here -- see sdhost_read_block_
+    // once's own caller for why (QEMU-only persistent-SDHSTS
+    // regression found and reverted; real hardware never actually hit
+    // this path).
     return 3;
   }
   return 0;
+}
+
+fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
+  // Round 62 (fault injection): `fault write <n>` -- see
+  // fault_write_maybe_inject's own comment. Checked before touching
+  // any hardware register at all, so an injected failure has zero
+  // side effects on the real SD controller state. Deliberately
+  // OUTSIDE the retry loop below: fault_write_maybe_inject is a
+  // one-shot countdown (see its own comment) -- calling it again on a
+  // retry would silently find the countdown already spent and report
+  // "no fault" on the second attempt, masking the exact single-fault
+  // behavior this injection mechanism exists to test.
+  if fault_write_maybe_inject() == (1 as u32) {
+    return 1;
+  }
+  let attempt: i64 = 0;
+  while attempt < SD_MAX_ATTEMPTS {
+    let result: i64 = sdhost_write_block_once(block_num, buf);
+    if result == 0 {
+      return 0;
+    }
+    if result == 3 {
+      return 3;
+    }
+    attempt = attempt + 1;
+    if attempt < SD_MAX_ATTEMPTS {
+      let _ = uart_puts("SD: write wedge detected (");
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
+      let _ = uart_puts(") -- resetting controller and retrying, attempt ");
+      let _ = uart_put_i64(attempt + 1);
+      let _ = uart_puts("/");
+      let _ = uart_put_i64(SD_MAX_ATTEMPTS);
+      let _ = uart_puts("\n");
+      let _ = sdhost_init();
+    } else {
+      let _ = uart_puts("SD: write wedge detected (");
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
+      let _ = uart_puts(") -- resetting controller, giving up after ");
+      let _ = uart_put_i64(SD_MAX_ATTEMPTS);
+      let _ = uart_puts(" attempts\n");
+      let _ = sdhost_init();
+      return result;
+    }
+  }
+  return 2;
 }
 
 // Round 36: block-device abstraction the FS layer's own raw block I/O
@@ -7392,6 +7517,13 @@ fn irq_dispatch() -> i64 {
       let _ = uart_put_hex32_irq(canary_breach);
       let _ = uart_putc_nonblocking(32); // ' '
       let _ = uart_put_hex32_irq(scheduler_get_tick_count());
+      let _ = uart_putc_nonblocking(13); // '\r' -- see uart_putc_nonblocking's
+                                          // own comment: raw LF alone
+                                          // staircases on a live terminal,
+                                          // hand-added here to match the
+                                          // shell-echo path's own explicit
+                                          // CR+LF pattern a few hundred
+                                          // lines above, not centralized.
       let _ = uart_putc_nonblocking(10); // '\n'
     }
   }

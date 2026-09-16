@@ -216,6 +216,21 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         proc.kill()
         out, _ = proc.communicate()
     output = out.decode("utf-8", "replace")
+    # ROUND 2026-09-16: uart_putc now emits a real CR before every LF
+    # (fixes a real "staircase" indentation bug on a live picocom
+    # terminal -- invisible in any saved log, since ordinary text
+    # tools already normalize a bare LF when displaying one). That
+    # changed this captured output from "...\n42\n..." to
+    # "...\r\n42\r\n...", which silently broke the "eval 6*7 == 42"
+    # needle below (it expects a bare "\n" on BOTH sides of "42" --
+    # the one immediately after "42" is now "\r", not "\n", so the
+    # literal 4-byte substring no longer occurs at all). Normalized
+    # here, matching the same "\r\n" -> "\n" approach this project's
+    # own vani-compiler test suite already uses for exactly this
+    # reason, rather than special-casing the one needle that happens
+    # to embed a newline on both sides -- protects every OTHER needle
+    # here (and any future one) from the same class of breakage too.
+    output = output.replace("\r\n", "\n")
 
     steps = [
         ("boot reaches PASS", "PASS"),

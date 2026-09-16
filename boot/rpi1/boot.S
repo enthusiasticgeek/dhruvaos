@@ -17,18 +17,30 @@
  * here) until kernel_main explicitly unmasks them after the timer/
  * interrupt-controller setup in vani completes; this only prepares the
  * stack IRQ mode will use once that happens. */
-/* TEMPORARY, for this round's own real-hardware boot-progress
- * diagnostic only -- blinks the ACT LED (GPIO16 on the original Pi 1
- * Model B, active-low) N times, using ONLY raw GPIO register writes
- * and a busy-wait delay, no UART/vani/anything else that could itself
- * be broken. Placed at checkpoints through early boot so a human
- * watching the LED can tell exactly how far execution actually gets,
- * independent of the UART channel this round's own investigation has
- * so far been unable to get a clear signal through. Removed once real
- * hardware boot is confirmed working (or once this narrows down where
- * it isn't). Uses r8-r12 as scratch -- none of _start's own code uses
- * those registers, so this can't clobber anything the surrounding
- * boot sequence still needs. */
+/* REMOVED 2026-09-16: the ACT-LED BLINK_N diagnostic that used to live
+ * here (blinks GPIO16 N times per checkpoint, raw GPIO writes + a
+ * busy-wait, no UART needed) was explicitly TEMPORARY per its own
+ * comment -- "removed once real hardware boot is confirmed working."
+ * That happened 2026-09-13. It kept running on every boot since, and
+ * turned out to be the ENTIRE root cause of the 5-10 minute real-
+ * hardware boot delay this same investigation chased for days: its
+ * busy-wait loop is a tight 2-instruction (`subs`/`bne`) sequence that
+ * costs ~2-4 cycles per iteration when cached, but checkpoint 1 below
+ * disables both I- and D-cache (a real, necessary fix, not something
+ * to revert) -- from that point on, EVERY loop iteration re-fetches
+ * those 2 instructions from SDRAM uncached. Measured directly via the
+ * SNAP_TIMER checkpoints below on real hardware: ~50-65 CPU cycles per
+ * iteration (not ~2-4), consistent within a tight band across all 6
+ * checkpoints regardless of blink count -- the signature of a real,
+ * fixed uncached-fetch cost, not noise. At up to 1.16 billion
+ * iterations for the largest blink group (BLINK_N(6): 6*(80M+80M) +
+ * 200M), that alone accounted for minutes of the delay, every boot,
+ * for something that was only ever meant to be a temporary visual aid
+ * before UART diagnostics existed. UART has been reliable since long
+ * before this was noticed, and the SNAP_TIMER/BOOT DIAG mechanism
+ * below is a strict upgrade over counting LED blinks by eye anyway --
+ * removed rather than shrunk, since it no longer serves any purpose
+ * the UART diagnostics don't already cover better. */
 /* Round 2026-09-15 real-hardware timing investigation: the user reported
  * a real, reproducible 5-10 minute pause between the GPU's own "Starting
  * ARM" handoff and DharaFS/self-tests appearing on UART, with the SAME
@@ -53,7 +65,7 @@
  * point. Uses r2/r3 only -- verified free (not live) at every insertion
  * point: checkpoint 0 is the function's first instruction; checkpoints
  * 1/5/6 only have r0/r1 live at that point (cache-op garbage / bss-clear
- * loop vars, both dead by the time each BLINK_N fires); checkpoints
+ * loop vars, both already dead); checkpoints
  * 2/3/4 keep the saved CPSR in r0 and a scratch mode value in r1 across
  * the whole mode-switching block (see their own comments below) --
  * neither is r2 or r3, so this can't clobber them. */
@@ -62,33 +74,6 @@
     ldr r3, [r2]
     ldr r2, =boot_checkpoint_\slot
     str r3, [r2]
-.endm
-
-.macro BLINK_N n
-    mov r8, #\n
-1:
-    cmp r8, #0
-    beq 2f
-    ldr r9, =0x20200028         /* GPCLR0 */
-    mov r10, #0x10000           /* GPIO16 */
-    str r10, [r9]               /* LED ON (active-low) */
-    ldr r11, =80000000
-3:
-    subs r11, r11, #1
-    bne 3b
-    ldr r9, =0x2020001C         /* GPSET0 */
-    str r10, [r9]               /* LED OFF */
-    ldr r11, =80000000
-4:
-    subs r11, r11, #1
-    bne 4b
-    subs r8, r8, #1
-    b 1b
-2:
-    ldr r11, =200000000         /* gap between blink groups */
-5:
-    subs r11, r11, #1
-    bne 5b
 .endm
 
 .section ".text.boot"
@@ -156,9 +141,8 @@ boot_entry:
      * confirmed against dwelch67/raspberrypi's own well-known,
      * PROVEN blinker05 example, which does exactly this same 16-word
      * (64-byte) copy for exactly this same reason. Must happen before
-     * ANYTHING that could plausibly take an exception -- first thing
-     * in this function, before even the LED diagnostic's own GPIO
-     * setup below. */
+     * ANYTHING that could plausibly take an exception -- literally the
+     * first real work this function does. */
     ldr r0, =_start
     mov r1, #0
     ldmia r0!, {r2, r3, r4, r5, r6, r7, r8, r9}
@@ -166,12 +150,6 @@ boot_entry:
     ldmia r0!, {r2, r3, r4, r5, r6, r7, r8, r9}
     stmia r1!, {r2, r3, r4, r5, r6, r7, r8, r9}
 
-    /* One-time GPIO16 output setup for the diagnostic below. */
-    ldr r9, =0x20200004         /* GPFSEL1 (GPIO10-19) */
-    ldr r10, [r9]
-    bic r10, r10, #(7 << 18)    /* GPIO16's own 3-bit field */
-    orr r10, r10, #(1 << 18)    /* set OUTPUT */
-    str r10, [r9]
     /* Task #163 (first real-hardware boot, 2026-09-12): force a known-
      * clean cache/MMU/TLB/branch-predictor state before ANYTHING else
      * runs, including before the stack pointer is even set up below.
@@ -228,8 +206,7 @@ boot_entry:
                                  * instruction-barrier equivalent --
                                  * ARMv6 has no dedicated `isb`) */
 
-    SNAP_TIMER 1
-    BLINK_N 1   /* checkpoint 1: cache/MMU/TLB invalidation done */
+    SNAP_TIMER 1   /* checkpoint 1: cache/MMU/TLB invalidation done */
 
     ldr sp, =_stack_top
 
@@ -239,17 +216,15 @@ boot_entry:
     msr cpsr_c, r1
     ldr sp, =_irq_stack_top
 
+    /* checkpoint 2 (round 2026-09-13, real-hardware investigation):
+     * IRQ mode entered, sp_irq set. Split out from the old single
+     * "mode-switching / stack setup done" checkpoint after the user
+     * reported a live LED pattern (one short blink, then stuck ON for
+     * ~2s, back when this was still LED-based) matching checkpoint 1
+     * completing but something failing before the old checkpoint 2
+     * ever fired -- narrowing down WHICH of the three mode switches
+     * below was actually the problem, rather than guessing. */
     SNAP_TIMER 2
-    BLINK_N 2   /* checkpoint 2 (round 2026-09-13, real-hardware
-                 * investigation): IRQ mode entered, sp_irq set. Split
-                 * out from the old single "mode-switching / stack
-                 * setup done" checkpoint after the user reported a
-                 * live LED pattern (one short blink, then stuck ON
-                 * for ~2s) matching checkpoint 1 completing but
-                 * something failing before the old checkpoint 2 ever
-                 * fired -- narrowing down WHICH of the three mode
-                 * switches below is actually the problem, rather than
-                 * guessing, on the next real-hardware attempt. */
 
     bic r1, r0, #0x1F
     orr r1, r1, #0x17      /* Round 38: Abort mode -- same reasoning as
@@ -264,19 +239,19 @@ boot_entry:
     msr cpsr_c, r1
     ldr sp, =_abort_stack_top
 
+    /* checkpoint 3 (round 2026-09-13): Abort mode entered, sp_abt set.
+     * See checkpoint 2's own comment above. */
     SNAP_TIMER 3
-    BLINK_N 3   /* checkpoint 3 (round 2026-09-13): Abort mode entered,
-                 * sp_abt set. See checkpoint 2's own comment above. */
 
     bic r1, r0, #0x1F
     orr r1, r1, #0x13      /* back to SVC mode */
     msr cpsr_c, r1
     ldr sp, =_stack_top    /* restore SVC's own sp (clobbered above) */
 
+    /* checkpoint 4 (was checkpoint 2 before the 2026-09-13 split
+     * above): back in SVC mode, sp restored -- mode-switching / stack
+     * setup fully done */
     SNAP_TIMER 4
-    BLINK_N 4   /* checkpoint 4 (was checkpoint 2 before the 2026-09-13
-                 * split above): back in SVC mode, sp restored --
-                 * mode-switching / stack setup fully done */
 
     /* QEMU's ELF loader does not clear .bss -- do it ourselves before
      * any vani code (which may rely on zero-initialized statics) runs. */
@@ -291,23 +266,20 @@ clear_bss:
     b clear_bss
 clear_bss_done:
 
-    SNAP_TIMER 5
-    BLINK_N 5   /* checkpoint 5 (was 3): .bss clear done */
+    SNAP_TIMER 5   /* checkpoint 5 (was 3): .bss clear done */
 
     /* Round 38: page table lives in .bss (mmu_init.S), so it must be
      * built AFTER clear_bss above, not before -- otherwise the zero
      * fill would wipe out every descriptor mmu_init just wrote. */
     bl mmu_init
 
-    SNAP_TIMER 6
-    BLINK_N 6   /* checkpoint 6 (was 4): mmu_init returned */
+    SNAP_TIMER 6   /* checkpoint 6 (was 4): mmu_init returned */
 
     bl kernel_main
 
 hang:
-    BLINK_N 7   /* checkpoint 7 (was 5), repeating: kernel_main returned --
-                 * should never happen (it runs forever), a sentinel
-                 * if it somehow does */
+    /* kernel_main returned -- should never happen (it runs forever),
+     * a sentinel if it somehow does. */
     b hang
 
 /* Storage for the SNAP_TIMER checkpoints above. Deliberately .data, not
