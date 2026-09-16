@@ -1386,6 +1386,20 @@ extern "C" fn usb_wifi_set_in_toggle(value: u32) -> u32;
 extern "C" fn usb_wifi_get_out_toggle() -> u32;
 extern "C" fn usb_wifi_set_out_toggle(value: u32) -> u32;
 
+// Round 2026-09-15 real-hardware timing investigation: TIMER_CLO
+// snapshots taken at boot.S's own 7 pre-kernel_main LED checkpoints (see
+// boot/rpi1/boot.S's SNAP_TIMER macro) -- printed once uart_init() has
+// run, to localize the ~5-10 minute real-hardware pause the user
+// reported to one specific checkpoint transition instead of boot.S's
+// ~250-line span as a whole.
+extern "C" fn boot_diag_get_checkpoint_0() -> u32;
+extern "C" fn boot_diag_get_checkpoint_1() -> u32;
+extern "C" fn boot_diag_get_checkpoint_2() -> u32;
+extern "C" fn boot_diag_get_checkpoint_3() -> u32;
+extern "C" fn boot_diag_get_checkpoint_4() -> u32;
+extern "C" fn boot_diag_get_checkpoint_5() -> u32;
+extern "C" fn boot_diag_get_checkpoint_6() -> u32;
+
 // Round 60 (boot/fw_state.S): packet filtering rule table. proto: 0=any/
 // 1=ICMP/6=TCP/17=UDP (real IPv4 protocol numbers, matching ipv4_get_
 // protocol's own return value directly). fw_add_rule is the only write
@@ -3149,6 +3163,51 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
 // boot sequence) report a precise cause on the next real-hardware run
 // rather than just "failed". See this file's own SD-driver header
 // comments for the two real bugs already found this same way.
+//
+// ROUND 2026-09-15 FOLLOW-UP: the resulting real-hardware log (8-block
+// sweep at blocks 2100-2107) showed block 2100 failing with
+// SDEDM=0x0000C603 -- FSM field (bits[3:0]) = 0x3 = WRITEDATA, per
+// Linux's own drivers/mmc/host/bcm2835.c SDEDM_FSM_* enum. That is NOT
+// one of the two "expected in-between" states sdhost_wait_transfer_
+// complete already knows how to force out of (READWAIT=4 for a read,
+// WRITESTART1=0xA for a write) -- it's a genuinely stuck controller
+// with no escape hatch, and every block AFTER 2100 in that same sweep
+// (2101-2107) shows the IDENTICAL wedged SDEDM value, proving the
+// controller never recovered on its own and every subsequent command
+// failed immediately for the same reason. DharaFS's own mount/self-
+// test code runs immediately after this sweep in the boot sequence, on
+// the SAME wedged controller -- explaining why the same 5 DharaFS
+// tests (multi-block round trip, crash-consistency, compact-resume,
+// permissions, directory hierarchy) fail identically on every real-
+// hardware boot: this was never an independent DharaFS bug, it was
+// fallout from an unrecovered SD-layer wedge.
+//
+// Real Linux calls bcm2835_reset() (a full controller register reset)
+// on exactly this class of failure. This driver has no DMA channel to
+// terminate (PIO/polling only), so rather than guess at a partial/
+// minimal recovery sequence with no proven reference for it, this
+// re-runs sdhost_init() in full on the two failure paths that matched
+// what real hardware actually showed (1=NEW_FLAG never cleared,
+// 2=FSM never reached idle) -- the exact same power-cycle + card-
+// identification sequence already proven (every boot) to bring the
+// controller and card up clean from scratch, including re-persisting
+// RCA via sd_state_set.
+//
+// Deliberately NOT reset on path 3 (a real SDHSTS error bit set):
+// tried it, verified under QEMU first per this project's own "verify
+// before real hardware" convention, and found a genuine regression --
+// QEMU's own SD card model leaves SDHSTS=0x41 (CMD_TIME_OUT + DATA_
+// FLAG) set persistently from very early in the sweep, in a way this
+// project's own W1C clear write never manages to actually clear under
+// that model, and every later block's read/write hits the same stuck
+// bit again. Resetting on that path doesn't clear it either (QEMU's
+// model, not a real register state, doesn't respond to it), so it
+// just turned an existing, harmless-to-boot-completion QEMU-only test
+// failure into a repeating reset loop that never reached idle within
+// 30 real seconds. The real-hardware log this fix is based on never
+// hit path 3 at all (its SDHSTS values were 0x1, entirely outside the
+// 0xF8 error mask) -- only paths 1 and 2 -- so this stays scoped to
+// exactly the failure modes actual hardware evidence showed needed it.
 fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -3166,12 +3225,19 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
+    let _ = uart_puts("SD: read wedge detected (NEW_FLAG stuck) -- resetting controller\n");
+    let _ = sdhost_init();
     return 1;
   }
   if wait_status != 0 {
+    let _ = uart_puts("SD: read wedge detected (FSM stuck) -- resetting controller\n");
+    let _ = sdhost_init();
     return 2;
   }
   if errs != (0 as u32) {
+    // Deliberately NOT reset here -- see this function's own header
+    // comment for why (QEMU-only persistent-SDHSTS regression found
+    // and reverted; real hardware never actually hit this path).
     return 3;
   }
   return 0;
@@ -3201,12 +3267,19 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
+    let _ = uart_puts("SD: write wedge detected (NEW_FLAG stuck) -- resetting controller\n");
+    let _ = sdhost_init();
     return 1;
   }
   if wait_status != 0 {
+    let _ = uart_puts("SD: write wedge detected (FSM stuck) -- resetting controller\n");
+    let _ = sdhost_init();
     return 2;
   }
   if errs != (0 as u32) {
+    // Deliberately NOT reset here -- see sdhost_read_block's own
+    // header comment for why (QEMU-only persistent-SDHSTS regression
+    // found and reverted; real hardware never actually hit this path).
     return 3;
   }
   return 0;
@@ -32192,6 +32265,32 @@ fn kernel_main() -> i64 {
   // vs. the delay being entirely inside SD init as currently suspected.
   let _ = uart_puts("BOOT DIAG: kernel_main entry, TIMER_CLO=0x");
   let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
+
+  // Round 2026-09-15: print all 7 pre-kernel_main checkpoint TIMER_CLO
+  // snapshots boot.S took (see SNAP_TIMER there) -- the smallest gap
+  // between two consecutive values pinpoints which checkpoint
+  // transition the real 5-10 minute pause actually happens in.
+  let _ = uart_puts("BOOT DIAG: checkpoint 0 (boot_entry start), TIMER_CLO=0x");
+  let _ = uart_put_hex32(boot_diag_get_checkpoint_0());
+  let _ = uart_puts("\n");
+  let _ = uart_puts("BOOT DIAG: checkpoint 1 (cache/MMU/TLB invalidated), TIMER_CLO=0x");
+  let _ = uart_put_hex32(boot_diag_get_checkpoint_1());
+  let _ = uart_puts("\n");
+  let _ = uart_puts("BOOT DIAG: checkpoint 2 (IRQ mode + sp_irq set), TIMER_CLO=0x");
+  let _ = uart_put_hex32(boot_diag_get_checkpoint_2());
+  let _ = uart_puts("\n");
+  let _ = uart_puts("BOOT DIAG: checkpoint 3 (Abort mode + sp_abt set), TIMER_CLO=0x");
+  let _ = uart_put_hex32(boot_diag_get_checkpoint_3());
+  let _ = uart_puts("\n");
+  let _ = uart_puts("BOOT DIAG: checkpoint 4 (back in SVC mode, sp restored), TIMER_CLO=0x");
+  let _ = uart_put_hex32(boot_diag_get_checkpoint_4());
+  let _ = uart_puts("\n");
+  let _ = uart_puts("BOOT DIAG: checkpoint 5 (.bss cleared), TIMER_CLO=0x");
+  let _ = uart_put_hex32(boot_diag_get_checkpoint_5());
+  let _ = uart_puts("\n");
+  let _ = uart_puts("BOOT DIAG: checkpoint 6 (mmu_init returned), TIMER_CLO=0x");
+  let _ = uart_put_hex32(boot_diag_get_checkpoint_6());
   let _ = uart_puts("\n");
 
   // Shared, persistent scratch buffers for the FS layer, shell

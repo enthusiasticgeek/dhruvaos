@@ -29,6 +29,41 @@
  * it isn't). Uses r8-r12 as scratch -- none of _start's own code uses
  * those registers, so this can't clobber anything the surrounding
  * boot sequence still needs. */
+/* Round 2026-09-15 real-hardware timing investigation: the user reported
+ * a real, reproducible 5-10 minute pause between the GPU's own "Starting
+ * ARM" handoff and DharaFS/self-tests appearing on UART, with the SAME
+ * LED checkpoint blink count repeating the whole time (i.e. not a reset
+ * loop -- one checkpoint genuinely taking that long). A TIMER_CLO read
+ * added at kernel_main's own first line already proved the pause is
+ * entirely BEFORE kernel_main ever runs (TIMER_CLO read ~359s there vs.
+ * the GPU's own ~2.7s "Starting ARM" timestamp, while everything AFTER
+ * kernel_main -- SD init, DharaFS, the full self-test suite -- completes
+ * in well under a minute), which points squarely at boot_entry's own
+ * pre-kernel_main code below. This snapshots TIMER_CLO (BCM2835 System
+ * Timer low 32 bits, free-running at 1MHz, independent of ARM core
+ * state) at each of the existing 7 LED checkpoints PLUS boot_entry's own
+ * very first instruction (checkpoint 0), so kernel_main can print all 8
+ * once UART is up and pinpoint exactly which checkpoint transition eats
+ * the time -- narrowing from "somewhere in ~250 lines of boot.S" to one
+ * specific segment, the same evidence-first approach that found the
+ * cache/MMU/vector-table bugs on 2026-09-12/13.
+ *
+ * Storage MUST be .data, not .bss: checkpoint 5 below zeroes .bss, which
+ * would wipe any checkpoint values already stored there before that
+ * point. Uses r2/r3 only -- verified free (not live) at every insertion
+ * point: checkpoint 0 is the function's first instruction; checkpoints
+ * 1/5/6 only have r0/r1 live at that point (cache-op garbage / bss-clear
+ * loop vars, both dead by the time each BLINK_N fires); checkpoints
+ * 2/3/4 keep the saved CPSR in r0 and a scratch mode value in r1 across
+ * the whole mode-switching block (see their own comments below) --
+ * neither is r2 or r3, so this can't clobber them. */
+.macro SNAP_TIMER slot
+    ldr r2, =0x20003004         /* TIMER_CLO */
+    ldr r3, [r2]
+    ldr r2, =boot_checkpoint_\slot
+    str r3, [r2]
+.endm
+
 .macro BLINK_N n
     mov r8, #\n
 1:
@@ -60,6 +95,11 @@
 .global boot_entry
 
 boot_entry:
+    SNAP_TIMER 0    /* checkpoint 0: boot_entry's own first instruction --
+                     * a small value here (close to the GPU's own
+                     * "Starting ARM" timestamp) rules out the GPU/ARM
+                     * handoff itself as the source of the delay. */
+
     /* FOUND 2026-09-13, comparing against Linux's own arch/arm/kernel/
      * head.S (ENTRY(stext)) after the vector-table fix above still did
      * not produce a working real-hardware boot -- the user's own
@@ -188,6 +228,7 @@ boot_entry:
                                  * instruction-barrier equivalent --
                                  * ARMv6 has no dedicated `isb`) */
 
+    SNAP_TIMER 1
     BLINK_N 1   /* checkpoint 1: cache/MMU/TLB invalidation done */
 
     ldr sp, =_stack_top
@@ -198,6 +239,7 @@ boot_entry:
     msr cpsr_c, r1
     ldr sp, =_irq_stack_top
 
+    SNAP_TIMER 2
     BLINK_N 2   /* checkpoint 2 (round 2026-09-13, real-hardware
                  * investigation): IRQ mode entered, sp_irq set. Split
                  * out from the old single "mode-switching / stack
@@ -222,6 +264,7 @@ boot_entry:
     msr cpsr_c, r1
     ldr sp, =_abort_stack_top
 
+    SNAP_TIMER 3
     BLINK_N 3   /* checkpoint 3 (round 2026-09-13): Abort mode entered,
                  * sp_abt set. See checkpoint 2's own comment above. */
 
@@ -230,6 +273,7 @@ boot_entry:
     msr cpsr_c, r1
     ldr sp, =_stack_top    /* restore SVC's own sp (clobbered above) */
 
+    SNAP_TIMER 4
     BLINK_N 4   /* checkpoint 4 (was checkpoint 2 before the 2026-09-13
                  * split above): back in SVC mode, sp restored --
                  * mode-switching / stack setup fully done */
@@ -247,6 +291,7 @@ clear_bss:
     b clear_bss
 clear_bss_done:
 
+    SNAP_TIMER 5
     BLINK_N 5   /* checkpoint 5 (was 3): .bss clear done */
 
     /* Round 38: page table lives in .bss (mmu_init.S), so it must be
@@ -254,6 +299,7 @@ clear_bss_done:
      * fill would wipe out every descriptor mmu_init just wrote. */
     bl mmu_init
 
+    SNAP_TIMER 6
     BLINK_N 6   /* checkpoint 6 (was 4): mmu_init returned */
 
     bl kernel_main
@@ -263,3 +309,80 @@ hang:
                  * should never happen (it runs forever), a sentinel
                  * if it somehow does */
     b hang
+
+/* Storage for the SNAP_TIMER checkpoints above. Deliberately .data, not
+ * .bss -- see SNAP_TIMER's own comment: checkpoint 5 zeroes .bss, which
+ * would wipe these if they lived there. link.ld places .data right
+ * before __bss_start, so this is unaffected by that clear regardless of
+ * which checkpoint fires first. */
+.section ".data"
+.align 4
+.global boot_checkpoint_0
+.global boot_checkpoint_1
+.global boot_checkpoint_2
+.global boot_checkpoint_3
+.global boot_checkpoint_4
+.global boot_checkpoint_5
+.global boot_checkpoint_6
+boot_checkpoint_0: .word 0
+boot_checkpoint_1: .word 0
+boot_checkpoint_2: .word 0
+boot_checkpoint_3: .word 0
+boot_checkpoint_4: .word 0
+boot_checkpoint_5: .word 0
+boot_checkpoint_6: .word 0
+
+/* Getters for kernel_main.vani, matching usb_wifi_state.S's own
+ * established extern-fn pattern exactly: return value in r0, r1=0 (no
+ * error code needed here, but kept for calling-convention consistency
+ * with every other extern fn this project calls from vani). */
+.section ".text.boot_diag"
+.global boot_diag_get_checkpoint_0
+.global boot_diag_get_checkpoint_1
+.global boot_diag_get_checkpoint_2
+.global boot_diag_get_checkpoint_3
+.global boot_diag_get_checkpoint_4
+.global boot_diag_get_checkpoint_5
+.global boot_diag_get_checkpoint_6
+
+boot_diag_get_checkpoint_0:
+    ldr r0, =boot_checkpoint_0
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+boot_diag_get_checkpoint_1:
+    ldr r0, =boot_checkpoint_1
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+boot_diag_get_checkpoint_2:
+    ldr r0, =boot_checkpoint_2
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+boot_diag_get_checkpoint_3:
+    ldr r0, =boot_checkpoint_3
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+boot_diag_get_checkpoint_4:
+    ldr r0, =boot_checkpoint_4
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+boot_diag_get_checkpoint_5:
+    ldr r0, =boot_checkpoint_5
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+boot_diag_get_checkpoint_6:
+    ldr r0, =boot_checkpoint_6
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
