@@ -6151,3 +6151,122 @@ support of any kind.
   (grown since this constant was last tuned), not a UART byte-drop --
   a test-infrastructure timing issue, not a kernel bug, left open as
   its own separate item.
+
+- **Task #215/#216 (2026-09-17): SD data-transfer clock speed.**
+  Real-hardware picocom logs (round 2026-09-16) showed the SDHCFG/
+  SDHSTS pre-clear fix and a 50x poll-cap bump both failed to resolve
+  the real-hardware SD data-phase wedge -- every data command (CMD17/
+  CMD24) still wedged the SDHOST controller's FSM 100% of the time,
+  identical `SDEDM=0x0000C601` after every reset. Checked real Linux
+  (`drivers/mmc/host/bcm2835.c`) and U-Boot (`bcm2835_sdhost.c`) one
+  level deeper: both compute `SDCDIV` from the SD core clock (queried
+  live via a VideoCore mailbox `GET_CLOCK_RATE` call, clock id 4 =
+  CORE -- never a hardcoded constant) and switch from an identification-
+  speed divisor to a real data-transfer-speed one once the card is
+  identified. This driver set `SDCDIV` once during `sdhost_init()`
+  (identification speed, `0x148`) and never touched it again for any
+  data command -- the leading remaining candidate for the wedge, since
+  sustained multi-word FIFO PIO transfer timing genuinely depends on
+  the SD clock ticking at a sane rate.
+
+  **Fix**: added `sdhost_get_core_clock_hz()` (`boot/sdcard_state.S`,
+  mirroring the existing `governor_state.S` mailbox pattern for the ARM
+  clock) and wired a real data-transfer-speed `SDCDIV` computation into
+  `sdhost_init()` (25MHz target -- the mandatory SD "default speed"
+  ceiling every card supports without CMD6 high-speed negotiation,
+  which this driver doesn't implement), using the identical divisor
+  formula both references share. Falls back to the existing
+  identification-speed divisor if the mailbox query fails.
+
+  **Not yet confirmed by a real-hardware log with this fix in place**
+  (task #217, blocked on hardware access) -- this is still the leading
+  hypothesis, not a proven fix, same honesty standard as the two prior
+  attempts.
+
+  **QEMU verification finding worth recording**: confirmed directly
+  against QEMU's own SD-host model source (`hw/sd/bcm2835_sdhost.c`:
+  `case SDCDIV: break;` -- the register write is a literal no-op) that
+  this fix cannot affect QEMU's simulated transfer correctness or
+  timing, and indeed plain SD read/write (`write`/`cat`) never
+  regressed once across dozens of test runs made while investigating
+  this. However, the fix's one extra mailbox round trip plus two extra
+  diagnostic print lines during boot (a real, if small, one-time
+  addition to boot wall-clock time) was enough to make `httpecho` newly
+  marginal against `phase4_milestone.py`'s own blind, unsynchronized
+  `SETTLE_S` timing (same root-cause class the `mqttecho`/`ls`/
+  `diagnose` entry above already documents) -- confirmed on a
+  genuinely clean, idle host (load 0.69-1.94), ruling out host-load
+  noise as the explanation. Neither a global `SETTLE_S` raise (14->18,
+  tested under contaminated load, inconclusive) nor a targeted +4 on
+  just `httpecho` (tested clean, still failed) reliably fixed it;
+  left at plain `SETTLE_S` rather than chase a tuning value further.
+  `httpecho` now joins `mqttecho`/`ls`/`diagnose` as a 4th member of
+  this same pre-existing, non-blocking test-harness-timing class:
+  verified functionally correct, occasionally too slow for this
+  harness's own timing, not a kernel regression.
+
+- **Task #219-222 (2026-09-17): shell echo task-preemption interleave
+  gap -- FIXED, and rescoped down from the original hypothesis.**
+  Originally described (project memory,
+  `project_dhruva_shell_echo_interleave_gap_2026_09_14`) as needing a
+  scheduling-level redesign to distinguish "buffered input, safe to
+  echo as one atomic burst" from "waiting on the next keystroke, must
+  stay preemptible." Re-investigated directly against the current code
+  before designing anything: `shell_echo_char` (round 72) actually runs
+  entirely INSIDE `irq_dispatch`, once per UART RX interrupt -- each
+  interrupt's own echo work is already atomic (no IRQ nesting), but
+  genuinely separate keystrokes arrive as genuinely separate hardware
+  interrupts, with ordinary task-level code (including other tasks' own
+  `uart_puts` calls) running normally in the real time between them --
+  the same situation as any two independent writers sharing one tty.
+
+  **Load-bearing fact the original write-up didn't call out**: confirmed
+  directly from `shell_rx_push_char`'s own code (`boot/shell_state.S`)
+  that it only ever touches `shell_line_buf`/`shell_line_len`/`shell_
+  line_ready` -- a data path completely separate from `shell_echo_char`/
+  `uart_putc_nonblocking` (the DISPLAY path). An interleaved async
+  message can garble what's SHOWN on the terminal but can never corrupt
+  the command the shell actually receives and executes. Confirmed live
+  with a deliberate byte-at-a-time repro (typing `ping 0.0.0.0` with
+  ~250ms inter-keystroke gaps while background tasks print normally):
+  the echoed line came back glued (`ping 0.0.0.0LOW: locked, entering
+  critical section`), but the shell still correctly ran the command
+  (`PING 0.0.0.0` / `reply from 0.0.0.0 seq=1` printed right after,
+  exactly as expected). This reframes the bug from "a correctness risk
+  needing new scheduling machinery" to "a display-ordering nicety" --
+  and rules out the scheduling redesign the original write-up
+  considered (which the SAME write-up already correctly argued would be
+  wrong regardless: locking a whole human-paced command line would
+  starve every other task for as long as a human takes to type).
+
+  **Fix**: `uart_puts` now checks, inside its own existing
+  `dhruva_prio_lock(0)` section (task #185), whether a command is
+  currently mid-typing (`shell_get_line_ready()==0 && shell_get_line_
+  len()>0`) before printing, and if so, emits a `\r\n` break first --
+  so an unrelated message can never glue onto the tail of a user's
+  not-yet-submitted input. Deliberately does NOT attempt to redraw the
+  in-progress line afterward: `shell_line_buf` holds the RAW typed
+  bytes even during `su`/`passwd` password suppression (`shell_echo_
+  char` never echoes those characters at all, not even as asterisks),
+  so reprinting it verbatim would leak a password onto the screen.
+
+  **Known residual gap, found live while verifying**: callers that
+  build one logical line from SEVERAL separate `uart_puts` calls (e.g.
+  `governor_step`'s 5-call "GOVERNOR: step ready=...` print, interleaved
+  with unprotected `uart_put_i64` calls) can now fragment across
+  multiple lines if a command is mid-typing across the whole sequence,
+  since each call independently inserts its own break. This is a real
+  but strictly SMALLER problem than before (the user's own typed
+  command is never glued into; only another task's own already-multi-
+  call print fragments further) and traces back to a separate,
+  pre-existing gap task #185 deliberately scoped out at the time
+  (`uart_put_i64`/`uart_put_hex32`/etc. have no mutual exclusion of
+  their own) -- not fixed here, left for a future round if it turns out
+  to matter in practice.
+
+  Verified: rebuilt clean; the exact repro that reproduced the glued-
+  line symptom now shows `ping 0.0.0.0` on its own clean line with
+  `LOW:`'s message starting on the next line; full `phase4_milestone.py`
+  regression battery shows the identical pre-existing 4-FAIL pattern
+  (`httpecho`/`mqttecho`/`ls`/`diagnose`, all `SETTLE_S`-class, see
+  entry above), no new regressions.

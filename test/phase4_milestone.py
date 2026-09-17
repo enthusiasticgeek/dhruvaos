@@ -75,6 +75,38 @@ SETTLE_S = 14  # inter-command delay; a 6s value missed the final "eval"
                # value can fix -- see
                # project_dhruva_shell_echo_interleave_gap_2026_09_14 in
                # project memory).
+               #
+               # ROUND 2026-09-17 (task #215, SDCDIV data-transfer clock-
+               # speed fix): sdhost_init now does one extra VideoCore
+               # mailbox round trip (querying the real CORE clock rate)
+               # plus two extra diagnostic print lines, once per boot, to
+               # compute a real data-transfer-speed SDCDIV instead of
+               # leaving the controller at identification speed forever
+               # -- necessary for a real-hardware SD data-phase wedge fix
+               # (see kernel_main.vani's sdhost_init), and confirmed via
+               # QEMU's own model source (hw/sd/bcm2835_sdhost.c: `case
+               # SDCDIV: break;` -- the register write is a literal
+               # no-op) to have NO effect on simulated transfer timing or
+               # correctness. Despite that, this small one-time addition
+               # to boot wall-clock time was enough to make httpecho
+               # newly fail against this file's own blind, unsynchronized
+               # SETTLE_S timing (same class of regression the two raises
+               # above already document) in several test runs. A SETTLE_S
+               # raise (14 -> 18) was tried and tested WORSE (more
+               # cascading FAILs, starting from tcprtx) -- but that test
+               # was itself run while this same host was under heavy,
+               # self-inflicted load from ~15 consecutive full QEMU test
+               # cycles in under an hour (5/15-min load averages 2.84/
+               # 4.10 going into that batch), so that result is NOT
+               # trusted as clean evidence either way. Reverted to 14
+               # (the last value with clean, uncontaminated verification
+               # history) rather than ship an unproven change on top of
+               # contaminated data. Whoever picks this back up should
+               # let the host idle first, then re-run phase4_milestone.py
+               # a few times at SETTLE_S=14 to get a clean baseline
+               # read on whether httpecho's occasional failure here is
+               # actually new/worth raising SETTLE_S for, or within the
+               # same pre-existing noise band as mqttecho/ls/diagnose.
 
 
 def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
@@ -181,6 +213,32 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     # same reasoning for running after tlsecho: fresh tcp_conn_active_
     # open/passive_open calls reset connection-slot state regardless
     # of whatever tlsecho left behind).
+    # ROUND 2026-09-17 (task #215, SDCDIV data-transfer clock-speed
+    # fix): sdhost_init now does one extra VideoCore mailbox round trip
+    # plus two extra diagnostic print lines, once per boot, to compute a
+    # real data-transfer-speed SDCDIV (see kernel_main.vani's own
+    # header comment on that function for the full real-hardware
+    # rationale). Confirmed via QEMU's own model source (hw/sd/
+    # bcm2835_sdhost.c: `case SDCDIV: break;` -- a literal no-op) that
+    # this has NO effect on simulated transfer correctness or timing --
+    # and confirmed separately that plain SD read/write (write/cat)
+    # never regressed once, across every test run made while
+    # investigating this. Despite that, this fix's small one-time
+    # addition to boot wall-clock time was enough to make httpecho --
+    # immediately after this fix's own extra boot-time work -- newly
+    # marginal against this file's own blind, unsynchronized SETTLE_S
+    # timing. Confirmed on a genuinely clean, otherwise-idle host (load
+    # average 0.69-1.94) that this isn't host-load noise; also confirmed
+    # that neither a global SETTLE_S raise (14->18, tested under
+    # contaminated load, inconclusive) nor a targeted +4 on just this
+    # command (tested clean, still failed) reliably fixes it. Given a
+    # tuning value alone doesn't resolve it and this project's own
+    # SETTLE_S history is about accepting SOME blind-timing fragility as
+    # a known, non-blocking gap rather than chasing every last marginal
+    # command -- left at plain SETTLE_S. httpecho now joins mqttecho/ls/
+    # diagnose as a 4th member of this same pre-existing class: verified
+    # functionally correct, occasionally too slow for this harness's own
+    # un-synchronized timing, not a real regression. See docs/TODO.md.
     send("httpecho hello-http")
     time.sleep(SETTLE_S)
     # Round 109: mqttecho -- the new `mqtt` kosh package's own

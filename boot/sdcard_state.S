@@ -281,3 +281,123 @@ test_cmp_equal:
     mov r0, #0
     mov r1, #0
     bx lr
+
+/* ROUND 2026-09-17 (real-hardware investigation): task #215. Real
+ * Linux's bcm2835_set_clock (drivers/mmc/host/bcm2835.c) computes
+ * SDCDIV from host->max_clk, which it gets via clk_get_rate() on the
+ * SD core clock -- NOT a hardcoded constant. U-Boot's own
+ * bcm2835_sdhost driver confirms the same shape from a bare-metal
+ * context specifically: host->max_clk = bcm2835_get_mmc_clock(
+ * BCM2835_MBOX_CLOCK_ID_CORE), i.e. the exact same VideoCore mailbox
+ * GET_CLOCK_RATE property tag this file's sibling governor_state.S
+ * already uses for SET_CLOCK_RATE (ARM clock, id 3) -- this is CORE
+ * clock, id 4, read instead of written. Confirmed the property-tag ID
+ * values (GET_CLOCK_RATE = 0x00030002, clock id 4 = CORE) against the
+ * same class of reference governor_state.S's own header comment
+ * already cites (the mailbox protocol itself, verified there against
+ * QEMU's hw/misc/bcm2835_property.c) -- GET_CLOCK_RATE, unlike
+ * SET_CLOCK_RATE, is NOT marked NYI in QEMU's property handler, so
+ * this call gets a real (QEMU-modeled) answer under emulation too,
+ * not just on real hardware.
+ *
+ * i64 sdhost_get_core_clock_hz() -- returns the CORE clock rate in Hz
+ * on success, 0 if the mailbox call timed out or reported failure (the
+ * 0 return is deliberately indistinguishable from "a real 0 Hz clock,"
+ * which cannot happen for CORE on this SoC -- callers should treat 0
+ * as "mailbox query failed, fall back to a conservative assumption,"
+ * not as a literal clock rate). Same bounded-poll, no-hang-forever
+ * discipline as governor_apply_freq_mhz below it in the sibling file. */
+.section ".bss"
+.align 4
+sdhost_clock_mbox_buf:
+    .space 32    /* 8 words -- GET_CLOCK_RATE's value buffer is only
+                   * 8 bytes (clock id + rate, no third "skip turbo"
+                   * word like SET_CLOCK_RATE uses), so this whole
+                   * request is one word shorter than governor_
+                   * apply_freq_mhz's own SET_CLOCK_RATE buffer. */
+
+.section ".text"
+.global sdhost_get_core_clock_hz
+sdhost_get_core_clock_hz:
+    stmdb sp!, {r4-r8, lr}
+
+    ldr r4, =sdhost_clock_mbox_buf
+
+    mov r7, #32
+    str r7, [r4, #0]                 /* buf[0]: total size (bytes) */
+    mov r7, #0
+    str r7, [r4, #4]                 /* buf[1]: request code */
+    ldr r7, =0x00030002
+    str r7, [r4, #8]                 /* buf[2]: tag = get clock rate */
+    mov r7, #8
+    str r7, [r4, #12]                /* buf[3]: value buffer size */
+    mov r7, #0
+    str r7, [r4, #16]                /* buf[4]: tag req/resp code */
+    mov r7, #4
+    str r7, [r4, #20]                /* buf[5]: clock id (4 = CORE) */
+    mov r7, #0
+    str r7, [r4, #24]                /* buf[6]: rate in Hz (response) */
+    str r7, [r4, #28]                /* buf[7]: end tag */
+
+    /* Same real DMB-before-mailbox-write requirement governor_apply_
+     * freq_mhz's own comment explains in full -- a genuinely separate
+     * bus master reads this buffer via its own path. */
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5
+
+    mov r8, r4
+    bic r8, r8, #0xF
+    orr r8, r8, #8                   /* channel 8: property tags */
+
+    ldr r6, =0x2000B898              /* MAILBOX_STATUS */
+    ldr r5, =100000                  /* bounded-poll iteration cap */
+
+    mov r0, #0
+sgcc_wait_write:
+    ldr r1, [r6]
+    tst r1, #0x80000000              /* FULL */
+    beq sgcc_write_ready
+    add r0, r0, #1
+    cmp r0, r5
+    blt sgcc_wait_write
+    mov r0, #0                       /* timed out -- 0 = "query failed" */
+    mov r1, #0
+    ldmia sp!, {r4-r8, lr}
+    bx lr
+
+sgcc_write_ready:
+    ldr r1, =0x2000B8A0              /* MAILBOX_WRITE */
+    str r8, [r1]
+
+    mov r0, #0
+sgcc_wait_read:
+    ldr r1, [r6]
+    tst r1, #0x40000000              /* EMPTY */
+    bne sgcc_read_not_ready
+    ldr r2, =0x2000B880              /* MAILBOX_READ */
+    ldr r2, [r2]
+    cmp r2, r8                       /* is this response ours? */
+    beq sgcc_got_response
+sgcc_read_not_ready:
+    add r0, r0, #1
+    cmp r0, r5
+    blt sgcc_wait_read
+    mov r0, #0                       /* timed out */
+    mov r1, #0
+    ldmia sp!, {r4-r8, lr}
+    bx lr
+
+sgcc_got_response:
+    ldr r2, [r4, #4]                 /* buf[1]: overall response code */
+    ldr r3, =0x80000000
+    cmp r2, r3
+    bne sgcc_failed                  /* VideoCore reported failure */
+    ldr r0, [r4, #24]                /* buf[6]: rate in Hz */
+    mov r1, #0
+    ldmia sp!, {r4-r8, lr}
+    bx lr
+sgcc_failed:
+    mov r0, #0
+    mov r1, #0
+    ldmia sp!, {r4-r8, lr}
+    bx lr

@@ -1442,6 +1442,12 @@ extern "C" fn sd_state_get_rca() -> i64;
 extern "C" fn sd_state_get_is_sdhc() -> i64;
 extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, word_count: i64) -> i64;
 extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, word_count: i64) -> i64;
+// Task #215 -- see boot/sdcard_state.S's own header comment for this
+// function. Returns the SD core clock rate in Hz via the VideoCore
+// mailbox, or 0 if the query failed (never a real answer for CORE on
+// this SoC, so 0 unambiguously means "fall back to a conservative
+// assumption").
+extern "C" fn sdhost_get_core_clock_hz() -> i64;
 // TEST-ONLY, task #3 verification -- see boot/sdcard_state.S.
 extern "C" fn test_fill_pattern(buf: mut ref i64, byte_count: i64) -> i64;
 extern "C" fn test_compare_buffers(a: mut ref i64, b: mut ref i64, byte_count: i64) -> i64;
@@ -2262,9 +2268,87 @@ fn uart_put_hex32_irq(v: u32) -> i64 {
 // confirmed, reproduced bug (round 184) was specifically uart_puts
 // racing with uart_puts; fixing exactly that without extending new
 // risk into the fault handler is the right scope for this round.
+// ROUND 2026-09-17 (task #219-222): shell echo task-preemption
+// interleave gap. shell_echo_char (round 72) runs entirely inside
+// irq_dispatch, one UART RX interrupt at a time -- each interrupt's own
+// echo work is atomic (irq_dispatch has no re-entrancy), but genuinely
+// SEPARATE keystrokes arrive as genuinely SEPARATE interrupts, with
+// real task-level code (including other tasks' own uart_puts calls)
+// running normally in the real time between them -- exactly like any
+// two independent writers sharing one tty. Confirmed via a deliberate
+// live repro (byte-at-a-time typing under QEMU) that this can glue an
+// unrelated task's ENTIRE message directly onto the tail of a still-
+// being-typed command with ZERO separator (e.g. "ping 0.0.0.0LOW:
+// locked, entering critical section") when that message's own
+// uart_puts call happens to run in the gap between two keystrokes.
+//
+// Confirmed, directly from shell_rx_push_char's own code (boot/
+// shell_state.S), that this is COSMETIC ONLY: it only touches
+// shell_line_buf/shell_line_len/shell_line_ready, a data path entirely
+// separate from shell_echo_char/uart_putc_nonblocking (the DISPLAY
+// path) -- an interleaved async message can garble what's SHOWN on the
+// terminal but can never corrupt the command the shell actually
+// receives and executes (the same live repro's own "PING 0.0.0.0" /
+// "reply from 0.0.0.0 seq=1" response, appearing right after the
+// glued-together line, proves the command still ran exactly as typed).
+// That ruled out a scheduling-level redesign (e.g. making a whole
+// human-paced command line non-preemptible, which the project's own
+// prior analysis already correctly rejected -- it would starve every
+// other task for as long as a human takes to type) in favor of the
+// much smaller fix actually needed: a display-ordering nicety, not a
+// correctness fix.
+//
+// Fix: before printing, check whether a command is currently mid-typing
+// (buffered but not yet submitted -- shell_line_ready()==0 AND
+// shell_get_line_len()>0). If so, break to a fresh line first so this
+// message can never glue onto the tail of the user's own not-yet-
+// finished input. Deliberately does NOT attempt to redraw/replay the
+// in-progress line afterward -- shell_line_buf holds the RAW typed
+// bytes even during su/passwd password suppression (shell_echo_char
+// deliberately never echoes those characters at all, not even as
+// asterisks -- see its own header comment), so reprinting it verbatim
+// would leak a password onto the screen. The user's own held keystrokes
+// remain completely intact internally regardless (this only affects
+// what's momentarily visible), and they simply keep typing normally --
+// no different from any other tty where an async writer's output
+// doesn't redraw your shell's own readline buffer either.
+//
+// Both accessor reads happen inside the SAME dhruva_prio_lock(0)
+// section as the message itself (not a separate lock/unlock pair) so
+// the break and the message stay one atomic unit -- otherwise another
+// task's own uart_puts could still interleave between the break and
+// this message, reintroducing a narrower version of the same gap one
+// level down.
+//
+// KNOWN RESIDUAL GAP, found live while verifying this fix: callers that
+// build ONE logical line out of SEVERAL separate uart_puts calls (e.g.
+// governor_step's "GOVERNOR: step ready=...desired_mhz=...apply_
+// status=..." -- 5 separate calls, interleaved with unprotected uart_
+// put_i64 calls in between) now get a break inserted before EACH piece
+// if a shell line is still mid-typing across the whole sequence,
+// fragmenting what used to print as one line into several. This is a
+// real but strictly SMALLER problem than before this fix (the user's
+// own typed command still never gets glued into; only an unrelated
+// task's own already-multi-call print fragments further) and is a
+// symptom of a separate, PRE-EXISTING gap task #185 deliberately scoped
+// out at the time ("Deliberately scoped to uart_puts ONLY, not swept
+// across every other uart_put_* helper" -- see that fix's own comment
+// above uart_puts): uart_put_i64/uart_put_hex32/etc. have no mutual
+// exclusion of their own, so a multi-call print built from them was
+// already vulnerable to a DIFFERENT task's own full message interleaving
+// between its pieces, with or without this round's own change. Not
+// fixed here -- consolidating every such multi-call print site into a
+// single uart_puts call (or giving uart_put_i64/etc. their own locking)
+// is a real, separate, larger cleanup outside this task's own scope
+// (shell-echo-vs-typed-command interleaving specifically), left for a
+// future round if it turns out to matter in practice.
 fn uart_puts(s: Str) -> i64 {
   let saved_prio: u32 = current_eff_prio();
   let _ = dhruva_prio_lock(0);
+  if (shell_get_line_ready() == (0 as u32)) && (shell_get_line_len() > (0 as u32)) {
+    let _ = uart_putc(13);
+    let _ = uart_putc(10);
+  }
   let n: i64 = str_len_bytes(s);
   let i: i64 = 0;
   while i < n {
@@ -3083,6 +3167,59 @@ fn sdhost_init() -> i64 {
   if sdhost_cmd_timed_out(cmd16_status) == 1 {
     let _ = uart_puts("SD/MMC: CMD16 (SET_BLOCKLEN) timed out\n");
     return 0 - 1;
+  }
+
+  // ROUND 2026-09-17 (real-hardware investigation, task #215):
+  // identification-speed SDCDIV (0x148, set once above) has been left
+  // in place for EVERY command this driver ever issues, including
+  // CMD17/CMD24's own data phase -- unlike real Linux, which negotiates
+  // a distinct (much higher) clock for data transfer via
+  // bcm2835_set_ios/bcm2835_set_clock once the MMC core moves past
+  // identification. This is the leading remaining candidate for the
+  // real-hardware SD data-phase wedge documented on sdhost_wait_
+  // transfer_complete above -- the poll-cap bump alone did NOT fix it
+  // (2026-09-16 real-hardware log: identical SDEDM=0x0000C601 every
+  // time, at the exact same t=34104us mark after every reset, immune
+  // to a 50x larger poll window -- consistent with a genuinely stuck
+  // FSM, not a slow-settling one). Sustained multi-word FIFO PIO
+  // transfer timing that depends on the SD clock actually ticking at a
+  // sane rate could plausibly wedge the controller's data-phase FSM
+  // when run at an identification-speed clock never designed to carry
+  // real data throughput.
+  //
+  // Confirmed against BOTH real Linux (drivers/mmc/host/bcm2835.c
+  // bcm2835_set_clock) and U-Boot's own bcm2835_sdhost.c -- same
+  // formula in both: div = max_clk/target; if div<2 div=2; if
+  // (max_clk/div)>target div+=1; div-=2; clamp to SDCDIV_MAX_CDIV
+  // (0x7ff). max_clk comes from a VideoCore mailbox GET_CLOCK_RATE
+  // query (clock id 4 = CORE) in BOTH references -- not a hardcoded
+  // constant -- so this queries it live via sdhost_get_core_clock_hz()
+  // (boot/sdcard_state.S) rather than guessing a base-clock value.
+  // Target is 25,000,000 Hz: the mandatory SD "default speed" ceiling
+  // every SD card must support with no CMD6 high-speed negotiation
+  // (which this driver doesn't implement), matching what real Linux
+  // settles on for a card it hasn't/can't switch into high-speed mode.
+  // Falls back to leaving SDCDIV at the already-proven-working
+  // identification-speed divisor if the mailbox query fails (returns
+  // 0) -- never speeds the controller up on an unconfirmed base clock.
+  // Not yet confirmed by a real-hardware log with this fix in place.
+  let core_clock_hz: i64 = sdhost_get_core_clock_hz();
+  if core_clock_hz > 0 {
+    let target_hz: i64 = 25000000;
+    let max_div: i64 = 0x7FF;
+    let div0: i64 = core_clock_hz / target_hz;
+    let div1: i64 = if div0 < 2 { 2 } else { div0 };
+    let div2: i64 = if (core_clock_hz / div1) > target_hz { div1 + 1 } else { div1 };
+    let div3: i64 = div2 - 2;
+    let div4: i64 = if div3 > max_div { max_div } else { div3 };
+    let _ = mmio_write_u32(sdcdiv, div4 as u32);
+    let _ = uart_puts("SD DIAG: data-transfer SDCDIV set, core_clock_hz=");
+    let _ = uart_put_i64(core_clock_hz);
+    let _ = uart_puts(" div=");
+    let _ = uart_put_i64(div4);
+    let _ = uart_puts("\n");
+  } else {
+    let _ = uart_puts("SD DIAG: core-clock mailbox query failed, staying at identification-speed SDCDIV\n");
   }
 
   // OCR bit 30 is SD's CCS (Card Capacity Status) and MMC's own
