@@ -6270,3 +6270,65 @@ support of any kind.
   regression battery shows the identical pre-existing 4-FAIL pattern
   (`httpecho`/`mqttecho`/`ls`/`diagnose`, all `SETTLE_S`-class, see
   entry above), no new regressions.
+
+- **Task #197/#223 (2026-09-17): RTL8188CU `rtl8188cu_enable_rf` had
+  FOUR real register-address bugs, found while researching channel
+  selection -- fixed, and channel selection now implemented.** This
+  whole section is untestable end-to-end under QEMU (no RTL8188CU
+  device model exists there -- confirmed via this project's own boot
+  log: `USB: dwc2_init status=FFFFFFFF (...no device attached)`), so a
+  real address typo here could never have been caught by any self-test
+  or regression run -- only by re-checking every existing address
+  against the real reference line by line, which this round did before
+  writing any new code, rather than trusting this file's own prior
+  "confirmed against source" claim at face value.
+
+  Checked fresh against `drivers/net/wireless/realtek/rtl8xxxu/{core.c,
+  regs.h}` (`rtl8xxxu_gen1_enable_rf`) and found:
+  1. `REG_FPGA0_XAB_RF_PARM` used `0x0870` -- real register is `0x0878`.
+  2. That register was blindly overwritten with `0x00000000` instead of
+     a real read-modify-write (clear `BIT(4)|BIT(5)`, SET `BIT(3)`) --
+     the reference driver never writes a bare 0 there; the old code
+     would have left `BIT(3)` (which must be SET) cleared instead.
+  3. `REG_FPGA0_RF_MODE` used `0x0954` with mask `0x0000000c` for
+     "clear `FPGA_RF_MODE_JAPAN`" -- real register is `0x0800`, real
+     `FPGA_RF_MODE_JAPAN` bit is `BIT(1)` (`0x2`), not bits 2-3. `0x0954`
+     has no defined meaning in the reference driver at all.
+  4. The RF-register write labeled "`RF6052_REG_AC`" used RF address
+     `0x18` -- that address is actually `RF6052_REG_MODE_AG` (the
+     channel/bandwidth register). Real `RF6052_REG_AC` is RF address
+     `0x00`. The old code would have corrupted the channel/BW register
+     with an unrelated bias value while never touching the real AC
+     register at all.
+
+  Also added the reference driver's own `REG_OFDM0_TRX_PATH_ENABLE`
+  (`0x0c04`) step, missing entirely before -- clears
+  `OFDM_RF_PATH_TX_MASK` (`0xf0`) and sets `OFDM_RF_PATH_TX_A`
+  (`BIT(4)`), matching this chip's single-TX-path configuration.
+  `REG_RX_WAIT_CCA`'s real address is `0x0e70` (was `0x0838`, an
+  entirely different register) -- its single-RF-path value
+  (`0x631b25a0`) was already correct.
+
+  **Channel selection** (`rtl8188cu_set_channel`, new): implements
+  `rtl8xxxu_gen1_config_channel`'s 20MHz/non-HT path (this driver has
+  no 40MHz/HT support anywhere else, so that branch wasn't ported) --
+  `REG_BW_OPMODE`/`REG_FPGA0_RF_MODE`/`REG_FPGA1_RF_MODE`/
+  `REG_FPGA0_ANALOG2` for the bandwidth-mode registers, two
+  `RF6052_REG_MODE_AG` read-modify-write passes (channel number in
+  bits[9:0], bandwidth in bits[11:10]) matching the reference driver's
+  own two-pass structure exactly, and the SIFS timing registers.
+  Deliberately NOT called automatically from `rtl8188cu_mac_bringup` --
+  matches the real driver's own separation (mac80211 core calls
+  config_channel independently of bring-up) and because a real join
+  needs to tune to whatever channel the target BSSID is actually on,
+  not a value this function could guess.
+
+  New `rtl8188cu_set_channel_self_test` (bit-construction only, same
+  QEMU-testable-without-hardware discipline as this section's other
+  self-tests) wired into the boot self-test battery. Verified: clean
+  build, new self-test shows `(PASS)`, full `phase4_milestone.py`
+  regression battery shows the identical pre-existing 4-FAIL pattern,
+  no new regressions. Still NOT live-verified against real hardware
+  (same as every other RTL8188CU register-level function in this
+  section) -- IQ/LC RF calibration (genuinely chip-instance/efuse-
+  dependent) remains the one piece deliberately not attempted.
