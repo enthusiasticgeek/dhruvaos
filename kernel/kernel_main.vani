@@ -14229,6 +14229,7 @@ const RTL_TXDESC_FIRST_SEGMENT: i64 = 0x08;
 const RTL_TXDESC_LAST_SEGMENT: i64 = 0x04;
 const RTL_TXDESC_BROADMULTICAST: i64 = 0x01;
 const RTL_TXDESC_QUEUE_MGNT: i64 = 0x12;
+const RTL_TXDESC32_AGG_BREAK: i64 = 0x40; // BIT(6) of txdw1
 
 // Builds the 32-byte hardware TX descriptor this chip family prepends
 // to every frame sent over USB bulk OUT (`struct rtl8xxxu_txdesc32`,
@@ -14241,8 +14242,20 @@ const RTL_TXDESC_QUEUE_MGNT: i64 = 0x12;
 // hardware -- without it the descriptor is simply ignored) plus
 // BROADMULTICAST when the destination is broadcast/multicast, queue
 // selection (TXDESC_QUEUE_MGNT for every management frame, matching
-// `rtl8xxxu_queue_select`'s own `ieee80211_is_mgmt()` branch), a
-// sequence number, USE_DRIVER_RATE (tells hardware "use the rate I
+// `rtl8xxxu_queue_select`'s own `ieee80211_is_mgmt()` branch) plus
+// AGG_BREAK (BIT(6) of txdw1 -- BUG, round 2026-09-17 audit: this bit
+// was missing entirely before. Traced the real call path in
+// `rtl8xxxu_tx`/`rtl8xxxu_fill_txdesc_v1`: `ampdu_enable` only ever
+// becomes true for a QoS data frame from a station with negotiated HT
+// aggregation -- never true for a management frame, and this driver
+// implements no AMPDU aggregation at all for ANY frame type yet -- so
+// `fill_txdesc_v1`'s own `if (ampdu_enable...) txdw1 |= AGG_ENABLE;
+// else txdw1 |= AGG_BREAK;` always takes the `else` branch in every
+// case this driver can currently produce. AGG_BREAK is the hardware's
+// own "this frame is not part of an aggregation burst" signal --
+// omitting it left every TX descriptor implicitly claiming an
+// undefined/default aggregation state instead of an explicit one),
+// a sequence number, USE_DRIVER_RATE (tells hardware "use the rate I
 // specify, don't rate-adapt") plus a fixed 1 Mbps CCK rate (rate index
 // 0 -- always a mandatory/basic rate, safe regardless of what rates an
 // AP advertises) with retry-limit enabled at 6 retries (the real
@@ -14261,7 +14274,7 @@ fn rtl_tx_desc_write(out: mut ref i64, frame_len: i64, is_broadcast: i64, seq_nu
   let txdw0: i64 = RTL_TXDESC_OWN | RTL_TXDESC_FIRST_SEGMENT | RTL_TXDESC_LAST_SEGMENT | (if is_broadcast != 0 { RTL_TXDESC_BROADMULTICAST } else { 0 });
   let _ = buf_write_byte(out, 3 as u32, txdw0 as u32);
 
-  let txdw1: i64 = RTL_TXDESC_QUEUE_MGNT << 8;
+  let txdw1: i64 = (RTL_TXDESC_QUEUE_MGNT << 8) | RTL_TXDESC32_AGG_BREAK;
   let _ = buf_write_u32_le(out, 4, txdw1 as u32);
 
   let _ = buf_write_u32_le(out, 8, 0 as u32);
@@ -14304,7 +14317,7 @@ fn rtl_tx_desc_self_test() -> i64 {
   if buf_read_u16_le(out, 0) != (30 as u32) { ok = 0; }
   if buf_read_byte(out, 2 as u32) != (32 as u32) { ok = 0; }
   if buf_read_byte(out, 3 as u32) != (0x8c as u32) { ok = 0; } // OWN|FS|LS, no broadcast bit
-  if buf_read_u32_le(out, 4) != ((0x12 << 8) as u32) { ok = 0; }
+  if buf_read_u32_le(out, 4) != (((0x12 << 8) | 0x40) as u32) { ok = 0; } // QUEUE_MGNT | AGG_BREAK
   if buf_read_u32_le(out, 12) != ((1 << 16) as u32) { ok = 0; }
   if buf_read_u32_le(out, 16) != (0x100 as u32) { ok = 0; }
   if buf_read_u32_le(out, 20) != ((0x20000 | (6 << 18)) as u32) { ok = 0; }
@@ -15527,15 +15540,29 @@ const RTL_TX_TOTAL_PAGE_NUM: i64 = 0xf8;
 // `address` (the LLT entry/page index) in bits [15:8], `data` (the
 // next-page value stored at that entry) in bits [7:0]. `REG_LLT_INIT`
 // itself is read back and polled -- completion is when the op field
-// self-clears to `LLT_OP_INACTIVE` (`00`), matching the real driver's
-// own bounded 20-iteration poll exactly (no delay between polls in
+// self-clears to `LLT_OP_INACTIVE` (`00`) (no delay between polls in
 // the reference source, so none is added here either).
+//
+// BUG (round 2026-09-17 audit), off-by-one: the reference
+// (`rtl8xxxu_llt_write`) polls via `do { ...check...; } while (count++
+// < 20);` -- a do-while whose body always runs once unconditionally
+// BEFORE the condition is even evaluated, and whose condition compares
+// count's PRE-increment value. Working through it precisely: the body
+// runs for count = 0,1,...,20 (21 total attempts) before `count++ < 20`
+// finally evaluates false (at count=20) and the loop exits. A plain
+// pre-check `while count < 20` loop, as this function used to have,
+// only ever runs the body for count = 0,1,...,19 -- 20 attempts, one
+// fewer than the real driver. Fixed by bumping the bound to 21 so the
+// real number of attempts matches exactly, not just the "20" the old
+// comment (and this project's own prior claim of matching it "exactly")
+// asserted without actually working through the do-while's own
+// semantics.
 fn rtl_llt_write(devaddr: u32, mps: u32, address: i64, data: i64) -> i64 {
   let value: i64 = (0x1 << 30) | (address << 8) | data;
   let _ = rtl_reg_write32(devaddr, mps, RTL_REG_LLT_INIT, value as u32);
   let count: i64 = 0;
   let done: i64 = 0;
-  while count < 20 {
+  while count < 21 {
     let v: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_LLT_INIT);
     if ((v as i64) & (0x3 << 30)) == 0 {
       done = 1;

@@ -6332,3 +6332,69 @@ support of any kind.
   (same as every other RTL8188CU register-level function in this
   section) -- IQ/LC RF calibration (genuinely chip-instance/efuse-
   dependent) remains the one piece deliberately not attempted.
+
+- **Task #224 (2026-09-17): continued the same Linux-reference audit
+  across the rest of the RTL8188CU driver (user asked to "find any bugs
+  in code so far using linux reference") -- found 2 more real, confirmed
+  bugs; the firmware download/start sequence and RX descriptor parser
+  both check out fully correct against source (reassuring, since not
+  every prior "verified against source" claim in this codebase turned
+  out wrong, just `enable_rf` specifically).**
+
+  1. **TX descriptor `txdw1` was missing `AGG_BREAK` (`BIT(6)` =
+     `0x40`).** Traced the real call path
+     (`rtl8xxxu_tx`/`rtl8xxxu_fill_txdesc_v1`) precisely: `ampdu_enable`
+     only ever becomes true for a QoS data frame from a station with
+     negotiated HT aggregation -- never for a management frame, and this
+     driver implements no AMPDU aggregation for any frame type yet -- so
+     `fill_txdesc_v1`'s own `if (ampdu_enable...) txdw1 |= AGG_ENABLE;
+     else txdw1 |= AGG_BREAK;` always takes the `else` branch for every
+     frame this driver can currently produce. `AGG_BREAK` is the
+     hardware's own "this frame is not part of an aggregation burst"
+     signal -- every TX descriptor was implicitly claiming an undefined
+     default aggregation state instead of an explicit one. Fixed:
+     `rtl_tx_desc_write`'s `txdw1` now includes it unconditionally
+     (matching that this driver never takes the AMPDU branch).
+
+  2. **`rtl_llt_write`'s poll loop was off-by-one.** The reference
+     (`rtl8xxxu_llt_write`) polls via `do { ...check...; } while
+     (count++ < 20);` -- the body runs unconditionally once BEFORE the
+     condition is even evaluated, and the condition compares count's
+     PRE-increment value, so the body actually runs for count =
+     0,1,...,20 -- 21 total attempts, not 20. The old code's plain
+     pre-check `while count < 20` only ran 20. Low real-world impact
+     (an LLT write completing on attempt 21 but not 20 is unlikely) but
+     a genuine, confirmable deviation from source, and from this
+     project's own prior claim of matching the real driver's poll count
+     "exactly" -- fixed by bumping the bound to 21.
+
+  Everything else checked systematically against `drivers/net/wireless/
+  realtek/rtl8xxxu/{core.c,rtl8xxxu.h,8192c.c,regs.h}` and confirmed
+  correct: the full LLT table structure and `TX_TOTAL_PAGE_NUM`
+  (`0xf8`, confirmed as `rtl8192cu_fops`'s own value -- the fops table
+  this file's own header comment confirms covers RTL8188CUS too, not
+  just RTL8192CU); the TX descriptor's full byte layout (all 11 fields
+  of `struct rtl8xxxu_txdesc32` at their exact real offsets) and its
+  checksum algorithm (XOR of all 16 little-endian words with the
+  checksum field pre-zeroed, matching `rtl8xxxu_calc_tx_desc_csum`
+  exactly -- including confirming the checksum-inversion step some
+  chips need does NOT apply to this one, RTL8710B/RTL8192F-only); the
+  RX descriptor's dword0/dword3 bit positions (`pktlen`/`crc32`/
+  `drvinfo_sz`/`shift`/`rpt_sel`, all exact matches against `struct
+  rtl8xxxu_rxdesc16`'s own little-endian bitfield layout); and the
+  entire firmware download/start sequence (`REG_SYS_FUNC`/
+  `REG_RSV_CTRL`/`REG_MCU_FW_DL` addresses, `SYS_FUNC_CPU_ENABLE`/
+  `MCU_FW_DL_ENABLE`/`MCU_FW_RAM_SEL`/`MCU_FW_DL_CSUM_REPORT`/
+  `MCU_WINT_INIT_READY` bit values, the bare `BIT(19)` 8051-reset step
+  -- initially suspected wrong against an unrelated `MCU_CP_RESET =
+  BIT(23)` constant found nearby in `regs.h`, but the actual reference
+  function uses the literal `BIT(19)` inline with no named constant, so
+  this code was right all along -- and `rtl8xxxu_reset_8051`/
+  `rtl8xxxu_start_firmware`'s own exact sequences).
+
+  Verified: clean build, both new expected-value self-tests
+  (`rtl_tx_desc_self_test`, `rtl_llt_write_self_test`) show `(PASS)`,
+  full `phase4_milestone.py` regression battery shows the identical
+  pre-existing 4-FAIL pattern, no new regressions. Still NOT
+  live-verified against real hardware, same as the rest of this
+  section.
