@@ -257,6 +257,23 @@ mutex_handoff_worst_us:
                          * schedulability_analysis.py's own context-
                          * switch/handoff overhead term once a real
                          * value has been captured from a live run. */
+
+/* ROUND 2026-09-18 (RTOS true-compliance pass, task #243): real
+ * measured cost of one full timer-tick IRQ dispatch under QEMU --
+ * TIMER_CLO-bracketed from irq_dispatch's own entry to its own return,
+ * kept only when was_timer_tick==1 (see kernel_main.vani's own call
+ * site). Directly answers task #191/192's own open question (round
+ * 191's reverted 100ms-tick attempt, round 192's DACR-trap-overhead
+ * hypothesis) with real data instead of guessing again: is QEMU's own
+ * per-tick overhead now small enough to justify re-attempting a finer
+ * tick, after the 2026-09-17 DACR follow-up removed the UART-RX path's
+ * unnecessary dacr_open_all() call (the timer-tick path's OWN
+ * dacr_open_all()/stack_canary_check_all() cost is unchanged by that
+ * fix -- still the real, necessary cost this measures). Pure vani-code
+ * MMIO reads, no assembly changed here -- this file only adds the
+ * scalar + accessors. */
+irq_tick_worst_us:
+    .word 0
 mutex_block_start_tick_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
                         /* tick_count at the moment task[i] most
@@ -1674,6 +1691,20 @@ mutex_handoff_worst_us_get:
 .global mutex_handoff_worst_us_set
 mutex_handoff_worst_us_set:
     ldr r1, =mutex_handoff_worst_us
+    str r0, [r1]
+    mov r1, #0
+    bx lr
+
+.global irq_tick_worst_us_get
+irq_tick_worst_us_get:
+    ldr r0, =irq_tick_worst_us
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global irq_tick_worst_us_set
+irq_tick_worst_us_set:
+    ldr r1, =irq_tick_worst_us
     str r0, [r1]
     mov r1, #0
     bx lr
