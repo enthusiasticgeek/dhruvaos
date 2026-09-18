@@ -649,7 +649,28 @@ aging_update_done:
      * above is done with them). Runs unconditionally, whether or not
      * the pick actually changed from current -- an idempotent MCR
      * write is cheap, and always recomputing avoids any subtlety from
-     * trying to skip it on a no-switch tick. */
+     * trying to skip it on a no-switch tick.
+     *
+     * Round 2026-09-17 (RTOS audit follow-up): a "skip this write when
+     * r8==r3 (no real switch)" version was drafted here and then
+     * REVERTED before it ever built, after tracing the actual call
+     * pattern: irq_dispatch (kernel_main.vani) calls dacr_open_all()
+     * UNCONDITIONALLY at the very top of EVERY IRQ, before even
+     * checking timer-vs-UART-RX, setting DACR to "everything open"
+     * (0x55555555). scheduler_switch_from_irq/scheduler_pick_next run
+     * right after, on every single IRQ, no exceptions. That means DACR
+     * is ALREADY dirtied by the time this function is entered on
+     * essentially every real invocation -- a "skip when no switch"
+     * version would have left DACR wide open (isolation silently
+     * defeated) on precisely the common no-switch-tick case it was
+     * meant to speed up, not a performance miss but a real correctness
+     * regression. The genuine fix for task #191's own DACR-trap finding
+     * has to start at dacr_open_all's OWN call site instead -- it's
+     * unconditional for every IRQ even though the cross-task read it
+     * exists for (stack_canary_check_all) only actually runs inside
+     * irq_dispatch's own `was_timer_tick == 1` branch -- not here. Not
+     * attempted this round; recorded as the real next step, not
+     * silently dropped. */
     cmp r8, #MAX_DOMAIN_TASK_INDEX
     bgt dacr_no_domain          /* index 15 -- no 16th domain available,
                                  * fall back to domain-0-only (see

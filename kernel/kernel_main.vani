@@ -7853,12 +7853,29 @@ fn shell_echo_self_test() -> i64 {
 // scheduler_switch_from_irq and gate the tick_count increment on it.
 fn irq_dispatch() -> i64 {
   // Round 192: this entire function is kernel-context IRQ handling,
-  // not any one task's own code -- open every domain for its duration
-  // (stack_canary_check_all below needs to read every tracked task's
-  // own stack, not just whichever was interrupted). Always correctly
-  // re-restricted by scheduler_pick_next before this IRQ ever returns
-  // to task-level code -- see dacr_open_all's own comment.
-  let _ = dacr_open_all();
+  // not any one task's own code. Always correctly re-restricted by
+  // scheduler_pick_next before this IRQ ever returns to task-level
+  // code -- see dacr_open_all's own comment.
+  //
+  // ROUND 2026-09-17 (RTOS audit follow-up, task #191's own DACR-trap
+  // finding traced to its real source): dacr_open_all() USED to run
+  // unconditionally right here, for every IRQ -- timer tick AND UART
+  // RX alike. The only reason it's needed at all is stack_canary_
+  // check_all's own cross-task read (every OTHER access in this
+  // function -- the shell line buffer, the diagnostic counters, every
+  // MMIO register -- is kernel/shared state, domain 0, always
+  // reachable regardless of DACR's task-domain bits; verified by
+  // reading this whole function top to bottom, not assumed). And that
+  // check only ever runs inside the `was_timer_tick == 1` branch below.
+  // Calling dacr_open_all() unconditionally here meant every UART RX
+  // interrupt (fires once per keystroke during real interactive use,
+  // independent of and far more frequent than the scheduler's own
+  // tick rate) paid for an "open everything, then scheduler_pick_next
+  // re-restricts it" round trip it never needed. Moved down into the
+  // timer branch, immediately before the one call that actually
+  // requires it -- see that call site's own comment for confirmation
+  // this doesn't change WHEN task-level code can observe an open DACR,
+  // only removes an unnecessary open/reclose pair on the UART RX path.
   let _ = irq_count_increment();
   let ic_pending1: i64 = IC_PENDING1;
   let pending: u32 = mmio_read_u32(ic_pending1);
@@ -7999,6 +8016,14 @@ fn irq_dispatch() -> i64 {
     // diagnose. Not a fix for the overflow itself -- see that file's
     // comment for why a real MMU guard page isn't possible yet at this
     // project's current 1MB section granularity.
+    //
+    // ROUND 2026-09-17: dacr_open_all() moved here from the top of
+    // irq_dispatch (see this function's own entry comment) -- this is
+    // the one and only reason it's ever needed. Always correctly
+    // re-restricted by scheduler_pick_next before this IRQ ever
+    // returns to task-level code, same guarantee as before, just no
+    // longer paid for on every UART RX interrupt too.
+    let _ = dacr_open_all();
     let canary_breach: u32 = stack_canary_check_all();
     if canary_breach != (0 as u32) {
       // Fixed, unrolled sequence of single-byte non-blocking putc
