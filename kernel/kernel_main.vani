@@ -3288,7 +3288,23 @@ fn gpio_sdhost_alt_init() -> i64 {
 // timestamped answer for where the real time is going, rather than
 // guessing from iteration counts alone. Remove once the real
 // bottleneck is identified and fixed.
-fn sdhost_init() -> i64 {
+// ROUND 2026-09-18 (SD wedge investigation, user question: "should we
+// try adaptive clock after a few tries"): split out from the original
+// parameterless sdhost_init so the wedge-retry loops below can step
+// the data-transfer clock DOWN across attempts, matching how mature
+// MMC drivers (Linux's own mmc core error-recovery path) treat
+// repeated bus errors as a signal-integrity problem worth retrying at
+// a slower, more tolerant clock, not just re-running the identical
+// command against the identical speed and hoping. `target_hz <= 0` is
+// a deliberate sentinel meaning "skip the data-speed switch entirely,
+// stay at the already-proven-reliable identification-speed divisor
+// (0x148) for data commands too" -- the last, most conservative rung
+// this driver can offer, reusing the SAME fallback path already used
+// when the core-clock mailbox query itself fails (see below).
+// sdhost_init() itself (unchanged signature, every existing call site
+// untouched) is now a one-line wrapper defaulting to the original
+// 25MHz SD "default speed" target.
+fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let diag_t0: u32 = mmio_read_u32(TIMER_CLO);
   let _ = uart_puts("SD DIAG: sdhost_init entry, TIMER_CLO=0x");
   let _ = uart_put_hex32(diag_t0);
@@ -3603,8 +3619,7 @@ fn sdhost_init() -> i64 {
   // 0) -- never speeds the controller up on an unconfirmed base clock.
   // Not yet confirmed by a real-hardware log with this fix in place.
   let core_clock_hz: i64 = sdhost_get_core_clock_hz();
-  if core_clock_hz > 0 {
-    let target_hz: i64 = 25000000;
+  if (core_clock_hz > 0) && (target_hz > 0) {
     let max_div: i64 = 0x7FF;
     let div0: i64 = core_clock_hz / target_hz;
     let div1: i64 = if div0 < 2 { 2 } else { div0 };
@@ -3614,11 +3629,19 @@ fn sdhost_init() -> i64 {
     let _ = mmio_write_u32(sdcdiv, div4 as u32);
     let _ = uart_puts("SD DIAG: data-transfer SDCDIV set, core_clock_hz=");
     let _ = uart_put_i64(core_clock_hz);
+    let _ = uart_puts(" target_hz=");
+    let _ = uart_put_i64(target_hz);
     let _ = uart_puts(" div=");
     let _ = uart_put_i64(div4);
     let _ = uart_puts("\n");
   } else {
-    let _ = uart_puts("SD DIAG: core-clock mailbox query failed, staying at identification-speed SDCDIV\n");
+    let _ = uart_puts("SD DIAG: staying at identification-speed SDCDIV (");
+    if target_hz <= 0 {
+      let _ = uart_puts("adaptive backoff: last-resort attempt");
+    } else {
+      let _ = uart_puts("core-clock mailbox query failed");
+    }
+    let _ = uart_puts(")\n");
   }
 
   // OCR bit 30 is SD's CCS (Card Capacity Status) and MMC's own
@@ -3653,6 +3676,14 @@ fn sdhost_init() -> i64 {
   let _ = uart_put_i64(diag_t_end as i64);
   let _ = uart_puts("us\n");
   return rca as i64;
+}
+
+// Plain wrapper preserving the original parameterless call -- every
+// existing call site (boot sequence, the "giving up, reset for
+// whatever comes next" branch in the wedge-retry loops below) keeps
+// working unchanged, always at the standard 25MHz SD default speed.
+fn sdhost_init() -> i64 {
+  return sdhost_init_at_speed(25000000);
 }
 
 // CMD17 (READ_SINGLE_BLOCK) / CMD24 (WRITE_BLOCK). block_num is a
@@ -3867,6 +3898,25 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
 // count should be revisited rather than silently masking that.
 const SD_MAX_ATTEMPTS: i64 = 3;
 
+// ROUND 2026-09-18 (real-hardware wedge, adaptive clock backoff):
+// mature MMC drivers (Linux's mmc_core / bcm2835-sdhost) step the bus
+// clock DOWN on repeated data-phase errors before giving up, as a
+// signal-integrity resilience measure -- not a guess at a specific
+// root cause, just a well-precedented defensive layer this driver
+// lacked. Real Pi 1B logs (2026-09-18) show the wedge is specific to
+// the data-transfer phase at the standard 25MHz speed (see
+// project_dhruva_sdcdiv_fix_insufficient_2026_09_18 memory); the real
+// root cause is still unconfirmed pending a fresh capture with the
+// new sdhost_wait_transfer_complete diagnostic, so this backoff is a
+// resilience net, not a fix for a specific identified defect.
+// SD_SPEED_BACKOFF_HZ: first retry step, half the default speed.
+// A second retry (the last one before giving up) drops all the way to
+// 0 -- sdhost_init_at_speed's own sentinel for "skip the data-speed
+// switch entirely, stay at the identification-phase 400kHz-class
+// speed for data commands too" -- the slowest, most conservative
+// setting this controller supports.
+const SD_SPEED_BACKOFF_HZ: i64 = 12500000;
+
 // ROUND 2026-09-16 (real-hardware investigation, speculative): real
 // Linux's bcm2835_prepare_data() calls bcm2835_set_transfer_irqs()
 // before EVERY data command, writing SDHCFG_DATA_IRPT_EN(bit4) |
@@ -3930,14 +3980,17 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
     }
     attempt = attempt + 1;
     if attempt < SD_MAX_ATTEMPTS {
+      let backoff_hz: i64 = if attempt == 1 { SD_SPEED_BACKOFF_HZ } else { 0 };
       let _ = uart_puts("SD: read wedge detected (");
       let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
       let _ = uart_puts(") -- resetting controller and retrying, attempt ");
       let _ = uart_put_i64(attempt + 1);
       let _ = uart_puts("/");
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
-      let _ = uart_puts("\n");
-      let _ = sdhost_init();
+      let _ = uart_puts(" (backoff target_hz=");
+      let _ = uart_put_i64(backoff_hz);
+      let _ = uart_puts(")\n");
+      let _ = sdhost_init_at_speed(backoff_hz);
     } else {
       let _ = uart_puts("SD: read wedge detected (");
       let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
@@ -4010,14 +4063,17 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
     }
     attempt = attempt + 1;
     if attempt < SD_MAX_ATTEMPTS {
+      let backoff_hz: i64 = if attempt == 1 { SD_SPEED_BACKOFF_HZ } else { 0 };
       let _ = uart_puts("SD: write wedge detected (");
       let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
       let _ = uart_puts(") -- resetting controller and retrying, attempt ");
       let _ = uart_put_i64(attempt + 1);
       let _ = uart_puts("/");
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
-      let _ = uart_puts("\n");
-      let _ = sdhost_init();
+      let _ = uart_puts(" (backoff target_hz=");
+      let _ = uart_put_i64(backoff_hz);
+      let _ = uart_puts(")\n");
+      let _ = sdhost_init_at_speed(backoff_hz);
     } else {
       let _ = uart_puts("SD: write wedge detected (");
       let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
