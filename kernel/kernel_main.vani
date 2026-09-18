@@ -3695,6 +3695,33 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let div3: i64 = div2 - 2;
     let div4: i64 = if div3 > max_div { max_div } else { div3 };
     let _ = mmio_write_u32(sdcdiv, div4 as u32);
+    // ROUND 2026-09-18 (SD wedge investigation, fresh real-HW log
+    // picocom_20260918_163633.log): a real, new, narrowing finding --
+    // the write wedge now reproduces on the VERY FIRST write command
+    // issued after sdhost_init completes, every single time, at ALL
+    // THREE backoff speeds including 0x148 (the untouched
+    // identification-speed divisor that has never itself been the
+    // problem) -- ruling out clock frequency, the already-applied
+    // SDHCFG_SLOW_CARD fix, and FIFO pacing (already correct, verified
+    // by reading sdcard_state.S directly, polls SDEDM's own FIFO
+    // word-count field per word like Linux's own reference) as the
+    // SOLE cause. The one thing genuinely different about "the very
+    // first data command" vs every later one: it's the closest in
+    // time to this exact SDCDIV write, which changes the controller's
+    // real output clock frequency -- a real clock generator take some
+    // finite time to settle after a divisor change, and issuing a
+    // command before it has could plausibly explain an FSM wedge that
+    // depends on timing, not just the target rate. A small, cheap,
+    // safe delay here (can only add negligible latency, never break
+    // correctness) is the well-precedented defensive response real
+    // host-controller drivers commonly use after any clock-generator
+    // reconfiguration. Explicitly NOT presented as a confirmed fix --
+    // this project has already shipped three prior SD fixes that
+    // looked well-reasoned and were each falsified by the next real
+    // log (SDHCFG/SDHSTS pre-clear, poll-cap bump, SDCDIV+SLOW_CARD+
+    // FIFO-threshold) -- needs a fourth real-hardware capture to know
+    // whether this one actually helps.
+    let _ = delay(10000);
     let _ = uart_puts("SD DIAG: data-transfer SDCDIV set, core_clock_hz=");
     let _ = uart_put_i64(core_clock_hz);
     let _ = uart_puts(" target_hz=");
