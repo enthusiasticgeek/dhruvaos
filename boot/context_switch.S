@@ -150,6 +150,30 @@ rr_last_picked:
                          * index, no different in kind from any other
                          * starting point. */
 
+/* ROUND 2026-09-18 (Gap B): bookkeeping for kernel_main.vani's shadow-
+ * model self-test -- see the eff_prio_table_get_at group's own comment
+ * above for the full design. Plain scalar state, same shape as
+ * everything else in this file; 0xFFFFFFFF is the sentinel "no
+ * prediction made yet" (never a real task index, MAX_TASKS=16). */
+spn_shadow_predicted_task:
+    .word 0
+spn_shadow_ctxsw_baseline:
+    .word 0
+spn_shadow_mismatch_count:
+    .word 0
+spn_shadow_prediction_valid:
+    .word 0             /* .bss can only zero-init (a real assembler
+                         * error caught this: "attempt to store non-
+                         * zero value in section .bss" on an earlier
+                         * attempt to use a 0xFFFFFFFF sentinel
+                         * directly in spn_shadow_predicted_task
+                         * instead) -- 0 = no prediction made yet
+                         * (correctly true before the very first IRQ
+                         * ever completes this logic), 1 = pending.
+                         * Task index 0 (a real, valid prediction) is
+                         * no longer ambiguous with "no prediction"
+                         * this way. */
+
 /* Round 55: a real, second synchronization primitive (dhruva_mutex_
  * lock/unlock, below) alongside the existing priority-CEILING protocol
  * (dhruva_prio_lock/unlock, above) -- a genuine blocking mutex with
@@ -322,6 +346,120 @@ task_run_ticks_table:
 task_run_ticks_get_at:
     ldr r1, =task_run_ticks_table
     ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+/* ROUND 2026-09-18 (RTOS/DharaFS safety-certification audit, Gap B):
+ * read-only accessors for scheduler_pick_next's own input tables --
+ * eff_prio_table/base_prio_table/sleep_until_table/ready_wait_ticks_
+ * table/rr_last_picked. Exist for exactly one purpose: an independent,
+ * side-effect-free vani-level REIMPLEMENTATION of scheduler_pick_
+ * next's own decision algorithm (kernel_main.vani's scheduler_pick_
+ * next_shadow_predict), cross-checked against what the REAL live
+ * scheduler actually picks, entirely by OBSERVATION (current_task_get/
+ * context_switch_count_get, both already existing, safe accessors) --
+ * never by calling scheduler_pick_next itself. See that function's own
+ * header comment for why: round 75 already tried a white-box test that
+ * called scheduler_pick_next directly and found a real, never-fully-
+ * root-caused crash (a wild SP jump ~200KB out, deep inside a wrapper's
+ * own return path, even after fixing the more obvious r4-r7 AAPCS
+ * clobber bug). These five accessors are plain, single-instruction
+ * table reads -- zero risk, same shape and same r1-clearing discipline
+ * as every other `_get_at`/`_get` accessor in this file (see context_
+ * switch_count_get's own comment on why r1 must be explicitly zeroed,
+ * not left as whatever garbage happened to be in it -- a real bug
+ * found and fixed here once already). */
+.global eff_prio_table_get_at
+eff_prio_table_get_at:
+    ldr r1, =eff_prio_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global base_prio_table_get_at
+base_prio_table_get_at:
+    ldr r1, =base_prio_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global sleep_until_table_get_at
+sleep_until_table_get_at:
+    ldr r1, =sleep_until_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global ready_wait_ticks_table_get_at
+ready_wait_ticks_table_get_at:
+    ldr r1, =ready_wait_ticks_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global rr_last_picked_get
+rr_last_picked_get:
+    ldr r0, =rr_last_picked
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_predicted_task_get
+spn_shadow_predicted_task_get:
+    ldr r0, =spn_shadow_predicted_task
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_predicted_task_set
+spn_shadow_predicted_task_set:
+    ldr r1, =spn_shadow_predicted_task
+    str r0, [r1]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_ctxsw_baseline_get
+spn_shadow_ctxsw_baseline_get:
+    ldr r0, =spn_shadow_ctxsw_baseline
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_ctxsw_baseline_set
+spn_shadow_ctxsw_baseline_set:
+    ldr r1, =spn_shadow_ctxsw_baseline
+    str r0, [r1]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_mismatch_count_get
+spn_shadow_mismatch_count_get:
+    ldr r0, =spn_shadow_mismatch_count
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_mismatch_count_increment
+spn_shadow_mismatch_count_increment:
+    ldr r0, =spn_shadow_mismatch_count
+    ldr r1, [r0]
+    add r1, r1, #1
+    str r1, [r0]
+    mov r0, r1
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_prediction_valid_get
+spn_shadow_prediction_valid_get:
+    ldr r0, =spn_shadow_prediction_valid
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_prediction_valid_set
+spn_shadow_prediction_valid_set:
+    ldr r1, =spn_shadow_prediction_valid
+    str r0, [r1]
     mov r1, #0
     bx lr
 

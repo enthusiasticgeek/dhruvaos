@@ -1145,6 +1145,26 @@ extern "C" fn mem_barrier() -> i64;
 // renewal timer needs a read-only view of elapsed scheduler time.
 extern "C" fn scheduler_get_tick_count() -> u32;
 extern "C" fn current_task_get() -> u32;
+// ROUND 2026-09-18 (Gap B): read-only accessors for scheduler_pick_
+// next's own input tables -- see their own comment in context_
+// switch.S (right after task_run_ticks_get_at) for why these exist:
+// an independent, side-effect-free shadow model of scheduler_pick_
+// next's decision algorithm, never a direct call into the real
+// function (round 75's own documented, never-fully-root-caused crash
+// history).
+extern "C" fn eff_prio_table_get_at(index: u32) -> u32;
+extern "C" fn base_prio_table_get_at(index: u32) -> u32;
+extern "C" fn sleep_until_table_get_at(index: u32) -> u32;
+extern "C" fn ready_wait_ticks_table_get_at(index: u32) -> u32;
+extern "C" fn rr_last_picked_get() -> u32;
+extern "C" fn spn_shadow_predicted_task_get() -> u32;
+extern "C" fn spn_shadow_predicted_task_set(v: u32) -> i64;
+extern "C" fn spn_shadow_ctxsw_baseline_get() -> u32;
+extern "C" fn spn_shadow_ctxsw_baseline_set(v: u32) -> i64;
+extern "C" fn spn_shadow_mismatch_count_get() -> u32;
+extern "C" fn spn_shadow_mismatch_count_increment() -> u32;
+extern "C" fn spn_shadow_prediction_valid_get() -> u32;
+extern "C" fn spn_shadow_prediction_valid_set(v: u32) -> i64;
 // TEST-ONLY -- see context_switch.S's own comment on
 // scheduler_set_tick_count_test_only.
 extern "C" fn scheduler_set_tick_count_test_only(value: u32) -> i64;
@@ -7839,6 +7859,204 @@ fn shell_echo_self_test() -> i64 {
   return 0;
 }
 
+// ROUND 2026-09-18 (RTOS/DharaFS safety-certification audit, Gap B):
+// "safe automated self-test for scheduler_pick_next" -- round 75's own
+// header comment on that function documents a real, never-fully-root-
+// caused crash from a previous attempt to test it directly (a white-box
+// test calling it from vani-compiled code first hit an AAPCS r4-r7
+// clobber, which got fixed with a save/restore wrapper, but THEN hit a
+// second, deeper crash -- a wild SP jump ~200KB out, inside the
+// wrapper's own return path, root cause never found despite extensive
+// live tracing). That function's own explicit warning: don't assume a
+// simple wrapper is sufficient, and calling it (or any wrapper around
+// it) from vani-compiled code is the first suspect if this recurs.
+//
+// This takes a genuinely different approach that never calls
+// scheduler_pick_next, or anything that touches its own internal
+// state, at all: an independent, side-effect-free REIMPLEMENTATION of
+// its decision algorithm (both branches -- old ceiling-tie-break and
+// new round-robin-with-aging -- faithfully mirroring context_switch.S's
+// own spn_old_algorithm/spn_new_algorithm line for line), reading the
+// exact same input tables via new plain read-only accessors (eff_prio_
+// table_get_at and friends, see their own comment in context_switch.S).
+// Verification happens entirely by OBSERVATION afterward -- comparing
+// this model's own prediction against what current_task_get() and
+// context_switch_count_get() (both pre-existing, already-safe
+// accessors) show the REAL scheduler actually did -- never by calling
+// the real function or touching its state. Wired into irq_dispatch,
+// which runs on every IRQ, exactly matching how often scheduler_pick_
+// next itself actually runs (scheduler_switch_from_irq, called right
+// after irq_dispatch returns, on every IRQ, not just real timer ticks
+// -- confirmed via this same audit's own DACR investigation).
+//
+// A genuine race exists and is handled honestly, not ignored: between
+// this prediction (made at the top of one irq_dispatch call) and the
+// next check (top of the FOLLOWING irq_dispatch call), a task could
+// call task_sleep_ticks or dhruva_mutex_unlock directly (both invoke
+// scheduler_pick_next OUTSIDE the IRQ path too), causing an extra,
+// unmodeled decision in between. context_switch_count_get()'s own
+// delta since the prediction was made detects this (more than one real
+// switch happened) and the comparison is honestly SKIPPED that round
+// rather than risking a false mismatch report.
+const SPN_SHADOW_AGING_SHIFT: u32 = 4;
+const SPN_SHADOW_IDLE_FALLBACK: u32 = 3;
+
+#[no_heap]
+fn spn_shadow_is_ready(idx: u32, tick: u32) -> i64 {
+  let su: u32 = sleep_until_table_get_at(idx);
+  if su > tick {
+    return 0;
+  }
+  return 1;
+}
+
+// Mirrors scheduler_pick_next's own pass1/pass2 aged-priority
+// computation exactly: bonus = ready_wait_ticks[i] >> AGING_SHIFT,
+// clamped so it can never exceed the raw priority itself (aged prio
+// can't go negative), then subtracted.
+#[no_heap]
+fn spn_shadow_aged_prio(idx: u32) -> u32 {
+  let raw_prio: u32 = eff_prio_table_get_at(idx);
+  let raw_wait: u32 = ready_wait_ticks_table_get_at(idx);
+  let bonus: u32 = raw_wait >> SPN_SHADOW_AGING_SHIFT;
+  let clamped: u32 = if bonus > raw_prio { raw_prio } else { bonus };
+  return raw_prio - clamped;
+}
+
+// Mirrors spn_old_algorithm exactly: current is pre-seeded as the
+// tentative best (ties favor the incumbent), then every OTHER ready
+// task with a STRICTLY lower eff_prio replaces it -- scanned index
+// order 0..15, first strict improvement wins on further ties.
+#[no_heap]
+fn spn_shadow_old_algorithm(current: u32, current_eff: u32, tick: u32) -> u32 {
+  let best_idx: u32 = current;
+  let best_prio: u32 = current_eff;
+  for i from 0 to 16 {
+    let idx: u32 = i as u32;
+    if idx != current {
+      let ready: i64 = spn_shadow_is_ready(idx, tick);
+      if ready == 1 {
+        let p: u32 = eff_prio_table_get_at(idx);
+        if p < best_prio {
+          best_prio = p;
+          best_idx = idx;
+        }
+      }
+    }
+  }
+  return best_idx;
+}
+
+// Mirrors spn_new_algorithm exactly: pass 1 finds the minimum AGED
+// priority among all ready tasks (including current); pass 2 scans
+// circularly starting just after rr_last_picked (offsets 1..16,
+// wrapping mod 16) for the first ready task at that minimum, so
+// repeated ties rotate through every tied contender instead of always
+// landing on the same one. IDLE (index 3) is always ready and always
+// <= any real min_aged, so pass 2 is guaranteed to find a match within
+// 16 steps in practice -- the IDLE fallback below mirrors the real
+// function's own "unreachable in practice" safety net, not a case this
+// model expects to actually hit.
+#[no_heap]
+fn spn_shadow_new_algorithm(tick: u32) -> u32 {
+  let min_aged: u32 = 255 as u32;
+  for i from 0 to 16 {
+    let idx: u32 = i as u32;
+    let ready: i64 = spn_shadow_is_ready(idx, tick);
+    if ready == 1 {
+      let aged: u32 = spn_shadow_aged_prio(idx);
+      if aged < min_aged {
+        min_aged = aged;
+      }
+    }
+  }
+
+  let last: u32 = rr_last_picked_get();
+  let result: u32 = SPN_SHADOW_IDLE_FALLBACK;
+  let found: i64 = 0;
+  for offset from 1 to 17 {
+    if found == 0 {
+      let off: u32 = offset as u32;
+      let candidate: u32 = (last + off) & (15 as u32);
+      let ready2: i64 = spn_shadow_is_ready(candidate, tick);
+      if ready2 == 1 {
+        let aged2: u32 = spn_shadow_aged_prio(candidate);
+        if aged2 == min_aged {
+          result = candidate;
+          found = 1;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+// Mirrors scheduler_pick_next's own round-75 gate exactly: the OLD
+// (ties-favor-incumbent) algorithm only applies when current_task is
+// both ready right now AND currently ceiling-boosted (eff_prio <
+// base_prio) -- otherwise the fair round-robin-with-aging algorithm
+// applies, current competing on equal footing with everyone else.
+#[no_heap]
+fn scheduler_pick_next_shadow_predict() -> u32 {
+  let tick: u32 = scheduler_get_tick_count();
+  let current: u32 = current_task_get();
+  let current_ready: i64 = spn_shadow_is_ready(current, tick);
+  let current_eff: u32 = eff_prio_table_get_at(current);
+  let current_base: u32 = base_prio_table_get_at(current);
+
+  if (current_ready == 1) && (current_eff < current_base) {
+    return spn_shadow_old_algorithm(current, current_eff, tick);
+  }
+  return spn_shadow_new_algorithm(tick);
+}
+
+// Bounded, non-blocking, byte-at-a-time report -- same discipline as
+// the CANARY breach print elsewhere in this file (not uart_puts,
+// whose own `while` loop is unbounded under #[wcet(...)]; not
+// rate-limited, since a genuine mismatch should be rare enough that
+// flooding isn't a real risk, and immediate visibility matters more
+// here than log tidiness for something this safety-relevant).
+#[no_heap]
+fn spn_shadow_report_mismatch(predicted: u32, actual: u32, tick: u32) -> i64 {
+  let _ = spn_shadow_mismatch_count_increment();
+  let _ = uart_putc_nonblocking(83);  // S
+  let _ = uart_putc_nonblocking(67);  // C
+  let _ = uart_putc_nonblocking(72);  // H
+  let _ = uart_putc_nonblocking(69);  // E
+  let _ = uart_putc_nonblocking(68);  // D
+  let _ = uart_putc_nonblocking(32);  // ' '
+  let _ = uart_putc_nonblocking(83);  // S
+  let _ = uart_putc_nonblocking(72);  // H
+  let _ = uart_putc_nonblocking(65);  // A
+  let _ = uart_putc_nonblocking(68);  // D
+  let _ = uart_putc_nonblocking(79);  // O
+  let _ = uart_putc_nonblocking(87);  // W
+  let _ = uart_putc_nonblocking(32);  // ' '
+  let _ = uart_putc_nonblocking(77);  // M
+  let _ = uart_putc_nonblocking(73);  // I
+  let _ = uart_putc_nonblocking(83);  // S
+  let _ = uart_putc_nonblocking(77);  // M
+  let _ = uart_putc_nonblocking(65);  // A
+  let _ = uart_putc_nonblocking(84);  // T
+  let _ = uart_putc_nonblocking(67);  // C
+  let _ = uart_putc_nonblocking(72);  // H
+  let _ = uart_putc_nonblocking(32);  // ' '
+  let _ = uart_putc_nonblocking(112); // p
+  let _ = uart_putc_nonblocking(61);  // =
+  let _ = uart_put_hex32_irq(predicted);
+  let _ = uart_putc_nonblocking(32);  // ' '
+  let _ = uart_putc_nonblocking(97);  // a
+  let _ = uart_putc_nonblocking(61);  // =
+  let _ = uart_put_hex32_irq(actual);
+  let _ = uart_putc_nonblocking(32);  // ' '
+  let _ = uart_putc_nonblocking(116); // t
+  let _ = uart_putc_nonblocking(61);  // =
+  let _ = uart_put_hex32_irq(tick);
+  let _ = uart_putc_nonblocking(13);
+  let _ = uart_putc_nonblocking(10);
+  return 0;
+}
+
 // Runs in real IRQ context (called from boot/irq_entry.S's irq_entry,
 // itself reached only via the hardware vector table -- never via a
 // normal vani call chain). #[interrupt] gets real value here: it
@@ -7906,6 +8124,39 @@ fn irq_dispatch() -> i64 {
   // this doesn't change WHEN task-level code can observe an open DACR,
   // only removes an unnecessary open/reclose pair on the UART RX path.
   let _ = irq_count_increment();
+
+  // ROUND 2026-09-18 (Gap B): check the PREVIOUS call's shadow
+  // prediction against what the real scheduler actually did (a switch
+  // happens in scheduler_switch_from_irq, called by irq_entry.S right
+  // after THIS function returns, on every IRQ -- so "previous call's
+  // prediction" always corresponds to exactly the decision that
+  // happened between then and now, unless an intervening non-tick
+  // switch also occurred, detected and honestly skipped below), then
+  // compute a FRESH prediction for the next call to check. See
+  // scheduler_pick_next_shadow_predict's own header comment for the
+  // full design and why this never calls the real scheduler_pick_next.
+  let spn_valid: u32 = spn_shadow_prediction_valid_get();
+  if spn_valid == (1 as u32) {
+    let spn_pending: u32 = spn_shadow_predicted_task_get();
+    let spn_ctxsw_now: u32 = context_switch_count_get() as u32;
+    let spn_ctxsw_baseline: u32 = spn_shadow_ctxsw_baseline_get();
+    let spn_delta: u32 = spn_ctxsw_now - spn_ctxsw_baseline;
+    if spn_delta <= (1 as u32) {
+      let spn_actual: u32 = current_task_get();
+      if spn_actual != spn_pending {
+        let _ = spn_shadow_report_mismatch(spn_pending, spn_actual, scheduler_get_tick_count());
+      }
+    }
+    // spn_delta > 1: an intervening task_sleep_ticks/dhruva_mutex_
+    // unlock decision happened outside this tick -- too ambiguous to
+    // compare against, skip honestly rather than risk a false report.
+  }
+  let spn_predicted: u32 = scheduler_pick_next_shadow_predict();
+  let spn_ctxsw_baseline_now: u32 = context_switch_count_get() as u32;
+  let _ = spn_shadow_predicted_task_set(spn_predicted);
+  let _ = spn_shadow_ctxsw_baseline_set(spn_ctxsw_baseline_now);
+  let _ = spn_shadow_prediction_valid_set(1 as u32);
+
   let ic_pending1: i64 = IC_PENDING1;
   let pending: u32 = mmio_read_u32(ic_pending1);
   let was_timer_tick: i64 = 0;
@@ -22632,6 +22883,18 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("  prio_lock calls: ");
     let _ = uart_put_i64(prio_lock_count_get());
     let _ = uart_puts(" total (ceiling-protected critical section entries)\n");
+
+    // ROUND 2026-09-18 (Gap B): shadow-model mismatch count -- see
+    // scheduler_pick_next_shadow_predict's own header comment. Zero
+    // across a real boot/regression run is the expected, healthy
+    // state; any nonzero value means the independent model disagreed
+    // with what the real scheduler actually picked at least once, a
+    // genuine finding worth investigating (the immediate "SCHED SHADOW
+    // MISMATCH" print at the moment it happened has the specific
+    // predicted/actual/tick values).
+    let _ = uart_puts("  scheduler shadow-model mismatches: ");
+    let _ = uart_put_i64(spn_shadow_mismatch_count_get() as i64);
+    let _ = uart_puts(" total (0 expected -- see scheduler_pick_next_shadow_predict's own comment)\n");
 
     // Round 59: the "remaining, not done" note on round 55's real
     // blocking mutex -- now that dhruva_mutex_lock/unlock give a
