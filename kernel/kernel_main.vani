@@ -1097,6 +1097,19 @@ extern "C" fn task_deadline_worst_wait_table_get_at(index: u32) -> u32;
 extern "C" fn task_deadline_worst_wait_table_set_at(index: u32, v: u32) -> i64;
 extern "C" fn task_deadline_miss_count_table_get_at(index: u32) -> u32;
 extern "C" fn task_deadline_miss_count_table_increment_at(index: u32) -> u32;
+// ROUND 2026-09-18 (task #242): UART RX interrupt work, bounded
+// against a real sporadic-server-style budget -- see uart_rx_irq_
+// budget's own header comment in boot/uart_rx_budget_state.S for the
+// full design.
+extern "C" fn uart_rx_irq_budget_get() -> u32;
+extern "C" fn uart_rx_irq_budget_set(v: u32) -> i64;
+extern "C" fn uart_rx_deferred_get() -> u32;
+extern "C" fn uart_rx_deferred_set(v: u32) -> i64;
+// 4 RX-IRQ services (up to 128 bytes drained each) per 500ms tick =
+// up to 512 bytes/tick -- deliberately generous, well beyond real
+// interactive typing speed, only a genuine machine-speed flood could
+// ever reach it.
+const UART_RX_IRQ_BUDGET_PER_TICK: i64 = 4;
 // Round 192: opens every ARMv6 domain (kernel-context escape hatch) --
 // see dacr_open_all's own comment in context_switch.S for why
 // irq_dispatch needs this (stack_canary_check_all's own cross-task
@@ -8424,6 +8437,20 @@ fn irq_dispatch() -> i64 {
     let next: u32 = now + interval;
     let _ = mmio_write_u32(timer_c1, next);
 
+    // ROUND 2026-09-18 (RTOS true-compliance pass, task #242): replenish
+    // this tick's UART RX IRQ budget -- see uart_rx_irq_budget's own
+    // header comment in boot/uart_rx_budget_state.S for the full
+    // sporadic-server design. If the previous tick's own budget got
+    // exhausted (a real sustained RX burst), the RX branch below
+    // masked UART_IMSC's RXIM bit to avoid a livelock -- re-enable it
+    // now that a fresh budget exists, so the level-triggered condition
+    // (if still genuinely pending) can fire and get serviced again.
+    let _ = uart_rx_irq_budget_set(UART_RX_IRQ_BUDGET_PER_TICK as u32);
+    if uart_rx_deferred_get() == (1 as u32) {
+      let _ = mmio_write_u32(UART_IMSC, 0x10 as u32);
+      let _ = uart_rx_deferred_set(0 as u32);
+    }
+
     // ROUND 2026-09-17: wired, gated by the same source-level constant
     // watchdog_arm's own header comment explains in full -- disabled
     // by default (real hardware watchdogs cannot be armed here without
@@ -8493,24 +8520,41 @@ fn irq_dispatch() -> i64 {
     // hangs or blocks anything, it just silently stops delivering. 128
     // -- shell_line_buf's own hard cap on how long a line can ever
     // legitimately be -- comfortably covers one full line every time.
-    for i from 0 to 128 {
-      let fr: u32 = mmio_read_u32(uart_fr);
-      if (fr & (0x10 as u32)) == (0 as u32) {
-        let c: u32 = mmio_read_u32(uart_dr) & (0xFF as u32);
-        let line_len_before: u32 = shell_get_line_len();
-        let _ = shell_rx_push_char(c);
-        // Round 72: input echo (see shell_echo_char's own header
-        // comment for why this needs to run here, and how su/passwd's
-        // password argument gets suppressed).
-        let echo_state: u32 = shell_get_echo_state();
-        let new_echo_state: u32 = shell_echo_char(echo_state, c, line_len_before);
-        let _ = shell_set_echo_state(new_echo_state);
+    // ROUND 2026-09-18 (task #242): sporadic-server-style budget check
+    // -- see uart_rx_irq_budget's own header comment in boot/uart_rx_
+    // budget_state.S for the full design. Normal case (budget
+    // available, true for every real interactive typing session):
+    // drain exactly as before, then consume one unit of budget.
+    // Exhausted case (a genuine sustained burst, not physically
+    // reachable at human typing speed): do NOT drain -- mask RXIM so
+    // this level-triggered condition can't force an immediate re-entry
+    // (a real livelock this design deliberately avoids), remember to
+    // unmask at the next tick once a fresh budget exists.
+    let rx_budget: u32 = uart_rx_irq_budget_get();
+    if rx_budget > (0 as u32) {
+      for i from 0 to 128 {
+        let fr: u32 = mmio_read_u32(uart_fr);
+        if (fr & (0x10 as u32)) == (0 as u32) {
+          let c: u32 = mmio_read_u32(uart_dr) & (0xFF as u32);
+          let line_len_before: u32 = shell_get_line_len();
+          let _ = shell_rx_push_char(c);
+          // Round 72: input echo (see shell_echo_char's own header
+          // comment for why this needs to run here, and how su/passwd's
+          // password argument gets suppressed).
+          let echo_state: u32 = shell_get_echo_state();
+          let new_echo_state: u32 = shell_echo_char(echo_state, c, line_len_before);
+          let _ = shell_set_echo_state(new_echo_state);
+        }
       }
+      let _ = uart_rx_irq_budget_set(rx_budget - (1 as u32));
+      // Draining the FIFO above is what actually de-asserts this
+      // level-triggered condition; this just clears any stale raw
+      // status defensively, same pattern as the timer branch above.
+      let _ = mmio_write_u32(uart_icr, 0x10 as u32);
+    } else {
+      let _ = mmio_write_u32(UART_IMSC, 0 as u32);
+      let _ = uart_rx_deferred_set(1 as u32);
     }
-    // Draining the FIFO above is what actually de-asserts this
-    // level-triggered condition; this just clears any stale raw
-    // status defensively, same pattern as the timer branch above.
-    let _ = mmio_write_u32(uart_icr, 0x10 as u32);
   }
 
   // Round 66: sample the running counters into the history ring buffer
@@ -23239,6 +23283,19 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("/");
     let _ = uart_put_i64(task_deadline_worst_wait_table_get_at(2 as u32) as i64);
     let _ = uart_puts(" ticks (expected to stay BELOW each task's own declared deadline 3/1/2 -- reaching it exactly is what the miss counts above track)\n");
+
+    // ROUND 2026-09-18 (task #242): UART RX sporadic-server budget --
+    // see uart_rx_irq_budget's own header comment in boot/uart_rx_
+    // budget_state.S. deferred=1 means RX is CURRENTLY masked (a
+    // genuine burst exhausted this tick's budget); expected 0 under
+    // any real interactive session.
+    let _ = uart_puts("  uart rx budget remaining this tick: ");
+    let _ = uart_put_i64(uart_rx_irq_budget_get() as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(UART_RX_IRQ_BUDGET_PER_TICK);
+    let _ = uart_puts(" deferred=");
+    let _ = uart_put_i64(uart_rx_deferred_get() as i64);
+    let _ = uart_puts(" (1 = RX currently masked, a real burst exhausted the budget)\n");
     return 0;
   }
 
@@ -34905,6 +34962,12 @@ fn kernel_main() -> i64 {
   let _ = delay_wcet_measure_self_test();
   let _ = i64_div_wcet_measure_self_test();
   let _ = task_deadlines_init();
+  // ROUND 2026-09-18 (task #242): seed the very first tick's own UART
+  // RX budget before interrupts are ever enabled -- .bss's zero-init
+  // would otherwise leave it at 0 until the first real timer tick sets
+  // it, incorrectly deferring/masking RX if a keystroke somehow beat
+  // the first tick.
+  let _ = uart_rx_irq_budget_set(UART_RX_IRQ_BUDGET_PER_TICK as u32);
   let _ = stack_canary_self_test();
   let _ = aes128_self_test();
   let _ = aead_hkdf_self_test();
