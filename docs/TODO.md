@@ -7308,3 +7308,14 @@ real demo workload either (comfortable schedulability margins at
 500ms, no live sub-tick control loop exists today). Documented in
 full in RTOS_GAP_ANALYSIS.md rather than attempted, matching task
 #246's own real-hardware-dependent-risk precedent.
+
+**Task #249 closed: generic inter-task mailbox IPC.** Commit
+`4c58db5`. See the commit's own message for the full design and the
+provenance story (adopted, independently reviewed, one real
+discrepancy found and fixed, unlike the OTHER draft from the same
+subagent incident which was reverted entirely). New send/pick/
+consume API in kernel_main.vani, mirroring dharafs_queue_pick_next's
+own priority+sequence tie-break algorithm exactly. Verified: clean
+build, full regression battery unchanged, new self-test genuinely
+PASSES (round trip, priority tie-break, consume semantics, dest
+isolation all directly exercised).
