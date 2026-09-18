@@ -267,14 +267,26 @@ doesn't yet attempt.
   overrun. If a task's real execution time exceeds its declared WCET for any
   reason the static model didn't capture, there is no runtime safety net at
   all.
-- **The static model itself has a known, recently-found soundness gap.**
+- ~~**The static model itself has a known, recently-found soundness gap.**
   `#[bounded_stack]`'s checker used to charge exactly 0 bytes for any
   `extern "C"` (hand-written assembly) callee — fixed this session
   (vani-compiler BUG-233) to a conservative nonzero default, but that's
   still an approximation, not a real per-function measured cost. A
   genuinely trustworthy WCET/stack story needs either real per-extern-fn
   cost annotations or a way to measure hand-written assembly's actual cost
-  and feed it back into the checker — neither exists yet.
+  and feed it back into the checker — neither exists yet.~~ **`[COMPILER
+  MECHANISM DONE, task #245, 2026-09-18]`** — vani-compiler now has
+  `#[stack_cost(bytes=N)]`, a real per-extern-fn annotation the checker's
+  call-graph walk consults before falling back to the flat default
+  (vani-compiler commit `0eb25978`, 3 new tests, full suite 3033/3033).
+  `vanic` rebuilt from this commit and DhruvaOS reverified against it:
+  clean build, identical stack-depth report, same 4-FAIL regression
+  baseline. Honest scope note: this closes the COMPILER-side gap only --
+  DhruvaOS's own real extern fns (`dhruva_mutex_lock`, `task_sleep_
+  ticks`, etc.) are NOT yet annotated with real measured values (the
+  ~64-byte figures BUG-233's own original write-up cited were informal,
+  never independently re-measured); that real-measurement-plus-
+  annotation pass is a genuine, natural follow-up, not done here.
 - **No deadline-miss detection or logging.** Ties directly into
   `docs/TODO.md`'s own already-open "Per-task runtime histograms + a real
   deadline/budget model" and "'Why is my task late' query" items — both
@@ -480,8 +492,11 @@ doesn't yet attempt.
    applied to DhruvaOS's own real task set: Gap C/226, 2026-09-17]`** —
    see item 4 above ("No formal schedulability analysis"). Context-switch
    overhead as a modeled term remains open — task #240.
-10. Close BUG-233's remaining gap: real per-extern-fn stack-cost annotations
-    instead of a conservative constant — task #245 (vani-compiler repo).
+10. ~~Close BUG-233's remaining gap: real per-extern-fn stack-cost
+    annotations instead of a conservative constant~~ **`[COMPILER
+    MECHANISM DONE, 2026-09-18]`** — task #245 (vani-compiler repo).
+    Applying real measured annotations to DhruvaOS's own extern fns
+    remains open, see "Timing analysis / determinism gaps" above.
 11. ~~Watchdog-triggered recovery for a real (non-QEMU) deployment
     target.~~ **`[WIRED, Gap F audit, 2026-09-17]`** — see "Interrupt
     handling gaps" above; implemented and gated, not yet exercised by CI.

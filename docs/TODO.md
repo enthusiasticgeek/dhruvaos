@@ -7254,3 +7254,21 @@ public wrappers' own "preserve existing owner/mode" convenience lookup
 for real-time-critical callers. Verified: clean build, full regression
 battery unchanged, new self-test genuinely PASSES (round-trip data +
 explicit-metadata verification, not just wired in).
+
+**Task #245 closed (compiler mechanism only): real per-extern-fn
+stack costs for vani #[bounded_stack].** vani-compiler commit
+`0eb25978` (+ docs `e7a85c9d`): new `#[stack_cost(bytes=N)]`,
+legal only on an `extern "C" fn` declaration, hard-error semantic-
+checked (rejected on ordinary fns, rejected combined with any other
+attribute on an extern fn), consulted by `stack_depth`'s call-graph
+walk before falling back to the pre-existing flat
+`FRAME_OVERHEAD_BYTES` default. 3 new tests, full vani-compiler suite
+3033/3033, zero regressions. `vanic` rebuilt from this commit and
+DhruvaOS reverified against it (clean build, identical stack-depth
+report, same 4-FAIL baseline) -- confirms the change is genuinely
+additive with zero effect on any unannotated code path.
+
+Honest scope note, not closed here: DhruvaOS's own real extern fns
+(`dhruva_mutex_lock`, `task_sleep_ticks`, etc.) are not yet annotated
+with real measured `#[stack_cost(...)]` values -- that real-
+measurement-plus-annotation pass is a genuine, natural follow-up.
