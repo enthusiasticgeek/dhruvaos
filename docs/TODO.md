@@ -6267,6 +6267,80 @@ support of any kind.
   the user's own real Pi 1B hardware access -- not something resolvable
   from this environment alone.
 
+  **Follow-up (2026-09-18): adaptive clock backoff added as a
+  resilience layer, NOT a root-cause fix.** User asked directly whether
+  formatting, init sequence, or clock math were suspect (all confirmed
+  correct by hand/against Linux+U-Boot references) and proposed trying
+  an adaptive-clock-backoff pattern matching mature MMC drivers
+  (Linux's `bcm2835-sdhost`/`mmc_core` step the bus clock down on
+  repeated data errors before giving up). Implemented: `sdhost_init()`
+  split into a parameterized `sdhost_init_at_speed(target_hz: i64)`
+  (with `target_hz <= 0` as a sentinel meaning "skip the data-speed
+  switch, stay at identification-phase speed for data commands too")
+  plus a plain wrapper preserving every existing call site at the
+  default 25MHz. New `SD_SPEED_BACKOFF_HZ = 12500000` constant. Both
+  `sdhost_read_block`/`sdhost_write_block`'s retry branches (not the
+  final "giving up" branch, which still resets to full 25MHz for
+  whatever comes next) now step the clock down before re-attempting:
+  first retry at 12.5MHz, second (last) retry at identification-speed
+  only. Each retry log line now also prints the backoff target_hz used.
+  Verified: clean build, full `phase4_milestone.py` regression battery
+  unchanged (same 4-FAIL baseline: httpecho/mqttecho/ls/diagnose, all
+  pre-existing `SETTLE_S`-class harness-timing issues). Commit
+  `51f1af3`.
+
+  This is explicitly a defensive resilience layer matching
+  well-precedented real-driver behavior, not a guess at the specific
+  root cause -- that still requires the fresh real-hardware capture
+  described above, to see whether the new `sdhost_wait_transfer_
+  complete` diagnostic reveals the true wedged register state, and
+  separately whether the backoff itself measurably helps in practice.
+
+  **Follow-up (2026-09-18): two concrete, evidence-backed fixes found
+  by diffing directly against real Linux source (user provided
+  `drivers/mmc/host/bcm2835-sdhost.c`, rpi-6.1.y).** Unlike the two
+  earlier guesses on this bug (SDHCFG/SDHSTS pre-clear, poll-cap
+  bump), both of the following are named, documented hardware errata
+  workarounds in the actual shipped driver, not speculation:
+
+  1. **Missing `SDHCFG_SLOW_CARD` (bit3, 0x8) -- the strongest lead
+     found so far.** Real `bcm2835_sdhost_set_clock`'s own comment:
+     this controller's `SDCDIV` is an 11-bit register during identify/
+     command mode, but hardware AUTOMATICALLY switches to honoring
+     only the BOTTOM 3 BITS of `SDCDIV` once the FSM enters real data
+     mode (READDATA/WRITEDATA) -- unless `SDHCFG_SLOW_CARD` forces it
+     to keep using the full 11-bit value the whole time. Real
+     `bcm2835_sdhost_set_ios` sets this bit UNCONDITIONALLY on every
+     call ("Disable clever clock switching, to cope with fast core
+     clocks"). Our own data-transfer divisor (8, for a 25MHz target on
+     a 250MHz core clock) does NOT fit in 3 bits (range 0-7, and 8's
+     bottom 3 bits are 0) -- an unmasked hardware auto-switch would
+     silently run the real data-transfer clock at whatever the
+     3-bit-truncated divisor produces, not the intended 25MHz. This
+     mechanistically matches every real-hardware symptom observed:
+     data-transfer-phase-only (identification has no data phase to
+     trigger the auto-switch), deterministic at the same blocks every
+     time, and invisible under QEMU (whose SD host model has no reason
+     to emulate this specific silicon quirk). Fix: `sdhost_read_block_
+     once`/`sdhost_write_block_once`'s own `SDHCFG` write, 0x510 ->
+     0x518 (adds bit3).
+  2. **Missing SDEDM FIFO read/write threshold fix.** Real
+     `bcm2835_sdhost_reset_internal` sets SDEDM bits [18:14] (read
+     threshold) and [13:9] (write threshold) to 4 each, on every
+     reset, with its own comment: "Limit fifo usage due to silicon
+     bug". This driver never touched these bits at all before today.
+     Fix: added to `sdhost_init_at_speed`, right after the identity-
+     speed SDVDD power-cycle.
+
+  Verified: clean build, full `phase4_milestone.py` regression battery
+  (run twice) unchanged from the same baseline (httpecho/mqttecho/ls/
+  diagnose flake within the known `SETTLE_S`-timing set, no new
+  failures, QEMU's SD model stays dormant as expected). Still NOT
+  confirmed against real hardware -- this is a real, sourced, named-
+  errata match, a materially stronger basis than the two earlier
+  guesses on this bug, but "matches every symptom" is not the same as
+  "confirmed fixed" until the next real Pi 1B capture.
+
 - **Task #219-222 (2026-09-17): shell echo task-preemption interleave
   gap -- FIXED, and rescoped down from the original hypothesis.**
   Originally described (project memory,

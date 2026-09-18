@@ -3336,6 +3336,22 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let sdhsts: i64 = SDHSTS;
   let sdedm: i64 = SDEDM;
 
+  // ROUND 2026-09-18 (real-hardware investigation): real Linux's
+  // bcm2835_sdhost_reset_internal (drivers/mmc/host/bcm2835-sdhost.c,
+  // user-provided source, rpi-6.1.y) does this unconditionally on
+  // every reset, with its own comment: "Limit fifo usage due to
+  // silicon bug". This driver never touched these bits at all before
+  // today. SDEDM bits [18:14] = read threshold, [13:9] = write
+  // threshold (5-bit fields each); real driver sets both to 4
+  // (FIFO_READ_THRESHOLD/FIFO_WRITE_THRESHOLD). A documented silicon
+  // errata workaround, not a guess -- not yet confirmed by a real-
+  // hardware log with this fix in place.
+  let edm_pre: u32 = mmio_read_u32(sdedm);
+  let edm_threshold_mask: u32 = ((0x1F << 14) | (0x1F << 9)) as u32;
+  let edm_threshold_val: u32 = ((4 << 14) | (4 << 9)) as u32;
+  let edm_fixed: u32 = (edm_pre & (edm_threshold_mask ^ (0xFFFFFFFF as u32))) | edm_threshold_val;
+  let _ = mmio_write_u32(sdedm, edm_fixed);
+
   // Power off, then back on -- a clean, known starting FSM state
   // rather than trusting whatever QEMU's reset default happens to be.
   let _ = mmio_write_u32(sdvdd, 0 as u32);
@@ -3936,6 +3952,30 @@ const SD_SPEED_BACKOFF_HZ: i64 = 12500000;
 // is consistent with the data-phase state machine never being told
 // (via these bits) that a data phase is even happening. Not yet
 // confirmed by a real-hardware log with this fix in place.
+//
+// ROUND 2026-09-18 (real-hardware investigation): 0x510 is now 0x518
+// -- adds SDHCFG_SLOW_CARD (bit3, 0x8). Real Linux's
+// bcm2835_sdhost_set_ios (user-provided source) sets this
+// UNCONDITIONALLY on every call, with its own comment: "Disable
+// clever clock switching, to cope with fast core clocks". Its
+// bcm2835_sdhost_set_clock has a matching comment explaining why:
+// this controller's SDCDIV is an 11-bit register during identify/
+// command mode, but hardware AUTOMATICALLY switches to honoring only
+// the BOTTOM 3 BITS of SDCDIV once the FSM enters real data mode
+// (READDATA/WRITEDATA) -- unless SLOW_CARD forces it to keep using
+// the full 11-bit value. Our own data-transfer div (8, for a 25MHz
+// target on a 250MHz core clock -- see the SDCDIV-set block above)
+// does NOT fit in 3 bits (max range 0-7): its bottom 3 bits are 0,
+// so an unmasked hardware auto-switch would silently run the actual
+// data-transfer clock at whatever the 3-bit-truncated divisor
+// produces, not the intended 25MHz -- exactly the kind of thing that
+// would wedge the FSM specifically during data commands, never
+// during identification (which has no data phase to trigger the
+// auto-switch), and never reproduce under QEMU (whose SD host model
+// has no reason to model this specific silicon quirk). A concrete,
+// named, documented hardware errata match for every real-hardware
+// symptom observed so far -- not yet confirmed by a real-hardware log
+// with this fix in place.
 fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -3945,7 +3985,7 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_readwait: u32 = 4 as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
-  let _ = mmio_write_u32(SDHCFG, 0x510 as u32);
+  let _ = mmio_write_u32(SDHCFG, 0x518 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
   let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
@@ -4005,7 +4045,9 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
 }
 
 // See sdhost_read_block_once's own header comment for the SDHCFG
-// reasoning -- same fix, same speculation, same fallback plan.
+// reasoning (both the original 0x510 IRQ-enable bits and the
+// 2026-09-18 SDHCFG_SLOW_CARD addition, 0x510 -> 0x518) -- identical
+// fix, identical justification, same read/write-symmetric register.
 fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -4015,7 +4057,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_writestart1: u32 = 0xA as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
-  let _ = mmio_write_u32(SDHCFG, 0x510 as u32);
+  let _ = mmio_write_u32(SDHCFG, 0x518 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
   let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
