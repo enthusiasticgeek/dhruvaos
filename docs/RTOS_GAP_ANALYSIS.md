@@ -39,13 +39,17 @@ doesn't yet attempt.
   still never preempts a boosted LOW mid-critical-section — plus correct
   `task_create()` slot ordering, `heap_stress.py`, `power_yank.py`).
 
-  A white-box self-test calling `scheduler_pick_next` directly against
+  ~~A white-box self-test calling `scheduler_pick_next` directly against
   controlled table state was attempted and abandoned after it triggered a
-  real, only partially root-caused crash (see `boot/context_switch.S`'s
-  own comment on `scheduler_pick_next`, right above the function, for the
-  full incident and warning for any future attempt) — the algorithm fix
-  itself was independently verified via the live regression above instead,
-  judged safer than shipping a self-test that could crash the system.
+  real, only partially root-caused crash...~~ **`[DONE via a different
+  approach, Gap B, 2026-09-18]`** — a white-box test of the real function
+  is still avoided (that crash risk is real and undiminished), but a safe
+  independent shadow-model reimplementation of the same decision algorithm
+  now runs on every IRQ, verified purely by observing outcomes through
+  pre-existing safe accessors, never touching the real function's internal
+  state. Zero mismatches across the full regression suite; a nonzero count
+  is surfaced immediately (bounded diagnostic print) and in the `diagnose`
+  shell command, not silently tolerated.
 - ~~**No aging — a lower-priority ready task can starve indefinitely under
   an always-ready higher-priority one.** Round 75 above only fixed
   fairness among tasks *tied* at the same priority; a task strictly
@@ -127,23 +131,26 @@ doesn't yet attempt.
   actual textbook reason exact analysis exists, not a redundant second
   check).
 
-  **Deliberately NOT run against DhruvaOS's own current demo task set**
-  in this round, for the same reason `docs/TODO.md`'s own "Per-task
-  runtime histograms + a real deadline/budget model" entry already
-  gave for the sibling deadline-detection problem: none of HIGH/
-  MEDIUM/LOW/etc. have a declared WCET anywhere (`#[wcet(cycles=N)]`
-  exists on exactly one function project-wide, `irq_dispatch`, an
-  interrupt handler, not a task) — and every demo task body calls the
-  blocking `uart_puts`, not the WCET-safe `uart_putc_nonblocking`
-  `irq_dispatch` itself uses specifically to stay analyzable, so they
-  likely couldn't pass a real WCET check without being rewritten
-  first. Inventing period/WCET numbers for them just to produce SOME
-  output would be "fabricating a number, not observing one" — that
-  TODO entry's own phrase for exactly this trap. Point this tool at
-  DhruvaOS's own task set the round a real timing-constrained task
-  (a genuine sensor poll loop, a real network deadline) actually needs
-  it, matching that entry's own "build it when a real workload exists"
-  plan.
+  ~~**Deliberately NOT run against DhruvaOS's own current demo task set**
+  in this round...~~ **`[DONE, RTOS audit Gap C/226, 2026-09-17]`** —
+  applied for real. `#[wcet(cycles=N)]` now exists on every task body
+  that can honestly carry one (6 of 10, with `uart_puts`/`uart_put_i64`
+  call sites swapped to new bounded, WCET-safe counterparts so they
+  stop transitively poisoning the estimate). The 4 left untagged
+  (`task_c`/GC/`task_f`/`task_fsq`) each have genuinely runtime-data-
+  dependent bodies (a data-dependent loop bound, or fan-out to
+  arbitrary interactive commands) — real measured `TIMER_CLO` values
+  feed the schedulability tool for those instead of a dishonest static
+  tag, not "invented" numbers. `schedulability_analysis.py` extended
+  with a real blocking-time term (Sha/Rajkumar/Lehoczky 1990) and run
+  against the real demo set (HIGH/MEDIUM/LOW) using the measured 50ms
+  LOW-priority blocking term: **verdict schedulable, 440ms-1445ms
+  slack.** Honest residual gaps from that same pass: GC's own critical
+  section is now measured too (Gap E, below), but context-switch
+  overhead itself still isn't a modeled term (task #240) and per-task
+  WCET only covers the demo set's dominant terms, not a hypothetical
+  production workload — the tool and method are proven, not every
+  future workload.
 - **No aperiodic/sporadic server.** Interrupt-triggered, non-periodic work
   (e.g. UART RX) runs directly in `irq_dispatch`, not budgeted against any
   task's own time allowance.
@@ -163,12 +170,30 @@ doesn't yet attempt.
 - **No measured/bounded worst-case interrupt latency.** Nothing in this
   project computes or asserts "an interrupt is serviced within N cycles of
   assertion, worst case."
-- **Watchdog-triggered recovery is deliberately disabled.** `irq_dispatch`'s
+- ~~**Watchdog-triggered recovery is deliberately disabled.** `irq_dispatch`'s
   own comment explains `watchdog_kick()` isn't actually called because doing
   so resets QEMU immediately, breaking the only test method this project
   has. Correct call for a dev/demo target; a genuine gap for anything meant
   to run unattended on real hardware, where a hung task should be
-  recoverable without human intervention.
+  recoverable without human intervention.~~ **`[WIRED, Gap F audit,
+  2026-09-17]`** — `watchdog_kick()` is now called from `irq_dispatch`,
+  gated behind `WATCHDOG_ENABLE_FOR_REAL_HARDWARE` (default 0, same gating
+  pattern as `GUARD_PAGE_FAULT_INJECTION_TEST` — arming a real watchdog
+  under QEMU would reset the VM mid-test, breaking every regression run).
+  Real recovery mechanism exists and is source-verified, but its actual
+  firing behavior is **not exercised by the normal QEMU regression suite**
+  since it stays off there by design — only exercised on a real hardware
+  build with the flag flipped. This is a genuinely different claim than
+  "tested and works": it's "implemented, gated correctly, unverified in
+  CI."
+- **No per-thread execution-time supervision, only a system-wide
+  watchdog.** The watchdog above is a single hardware timer covering the
+  whole system — if ANY task keeps kicking it (even a wrong one, or one
+  stuck in an infinite loop that still happens to call something that
+  kicks it), a different task silently hanging forever goes undetected.
+  CMSIS-RTOS2's "thread watchdog" pattern (a per-thread timeout, checked
+  independently) is the standard reference design for this — see task
+  #241 (runtime deadline-miss detection).
 
 ## 3. Memory / fault isolation gaps (the largest one)
 
@@ -422,20 +447,48 @@ doesn't yet attempt.
    histogram/deadline-model TODO item.
 
 **Phase C — larger, some blocked on real hardware or real workloads:**
-7. Tickless or higher-resolution timer.
+7. ~~Tickless or higher-resolution timer.~~ Split into two tracked items,
+   task #243 (re-attempt a finer periodic tick, now that Gap-audit's DACR
+   follow-up narrowed one contributing QEMU-trap-overhead source) and
+   task #247 (tickless redesign, sequenced after #243 since both attack
+   the same problem and #243's measurements inform whether tickless is
+   worth the larger redesign cost).
 8. A real interrupt-priority scheme (needs BCM2835's fuller interrupt
    controller capability wired up, not just the two pending-bit checks used
-   today).
-9. Formal schedulability analysis tooling (utilization bound / response-time
-   analysis) over the declared task set.
+   today) — task #246.
+9. ~~Formal schedulability analysis tooling (utilization bound / response-time
+   analysis) over the declared task set.~~ **`[DONE, tool: round 190;
+   applied to DhruvaOS's own real task set: Gap C/226, 2026-09-17]`** —
+   see item 4 above ("No formal schedulability analysis"). Context-switch
+   overhead as a modeled term remains open — task #240.
 10. Close BUG-233's remaining gap: real per-extern-fn stack-cost annotations
-    instead of a conservative constant.
-11. Watchdog-triggered recovery for a real (non-QEMU) deployment target.
+    instead of a conservative constant — task #245 (vani-compiler repo).
+11. ~~Watchdog-triggered recovery for a real (non-QEMU) deployment
+    target.~~ **`[WIRED, Gap F audit, 2026-09-17]`** — see "Interrupt
+    handling gaps" above; implemented and gated, not yet exercised by CI.
+    Per-thread execution-time supervision (distinct from the system-wide
+    watchdog) remains open — task #241.
+
+**Post-2026-09-18 additions, from a direct "what qualifies as a true
+RTOS" pass against external references** (NASA RTOS-101, priority-ceiling
+protocol literature, CMSIS-RTOS2's thread-watchdog/MPU-zone model): two
+gaps this document didn't previously name at all —
+12. Runtime deadline-miss detection with declared per-task budgets
+    (task #241) — `task_run_ticks_table` (round 189) has the raw data but
+    nothing declares a budget to compare it against yet.
+13. Aperiodic/sporadic server budget for UART RX interrupt-triggered work
+    (task #242) — currently unbudgeted against any task's own time
+    allowance, a real gap in the schedulability model's own completeness.
+14. Pre-reserved bounded-allocation write path for DharaFS (task #244) —
+    see "DharaFS-specific gaps" above, item "No pre-reserved,
+    guaranteed-bounded allocation path."
 
 See `docs/TODO.md` for the items above that already have their own tracked
 entry (per-task histograms/deadline model, "why is my task late", FS
 priority queue) — this document exists to name the gaps that *aren't*
-tracked yet (scheduler fairness, DharaFS concurrency, per-task memory
-protection, bounded compaction) and to give the already-tracked ones the
-concrete "why this matters" grounding found while investigating this
-session's own real stack-overflow bug.
+tracked yet and to give the already-tracked ones the concrete "why this
+matters" grounding found while investigating this session's own real
+stack-overflow bug. Current status of every numbered item above is
+cross-checked against the task tracker (#239-247) as of 2026-09-18, not
+just this document's own prose — see `docs/TODO.md`'s Gap A-F closure
+entries for the full verification detail behind each `[DONE]` marker.
