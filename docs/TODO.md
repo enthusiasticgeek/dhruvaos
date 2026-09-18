@@ -7192,3 +7192,19 @@ no `subagent_type`, accidentally spawning a second, useless agent that
 did nothing (0 tool uses). Harmless, but a reminder to use `SendMessage`
 to an existing agent by name rather than `Agent` when the goal is to
 continue a conversation with one that already exists.
+
+**Task #241 closed: runtime deadline-miss detection.** Commit
+`d1cc855`. See the commit's own message for the full design (built
+entirely as a safe observer on top of the already-proven round-184
+`ready_wait_ticks_table`, no changes to `scheduler_pick_next`/
+`scheduler_switch_from_irq`). Real, directly-verified result: 0/0/0
+misses across a live QEMU run, matching the schedulability tool's own
+verdict. An honest, recorded (not hidden) limitation: a deliberate
+attempt to fault-inject a real miss (temporarily setting HIGH's own
+declared deadline to an unrealistically tight 1 tick) still showed 0
+misses -- not a bug in the detector, but a real finding about this
+demo workload's own behavior (HIGH, priority 0, is only ever blocked
+by LOW's sub-tick ceiling-0 section, never a full tick). The detector
+itself was not verified firing on a genuine miss because this demo set
+doesn't produce one to observe; that remains true until a real
+workload with tighter margins exists.
