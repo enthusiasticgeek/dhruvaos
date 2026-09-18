@@ -3761,6 +3761,31 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
     }
     iter = iter + 1;
   }
+  // ROUND 2026-09-18 (SD wedge investigation, fresh real-HW log
+  // picocom_20260918_074005.log): 238 wedge events even WITH the
+  // SDCDIV clock-speed fix in place -- that fix did NOT resolve the
+  // underlying issue. The existing caller-side diagnostic ("SD DIAG:
+  // block N FAILED ... SDEDM=0x...") does NOT capture the real
+  // wedged FSM value -- by the time it runs, sdhost_write/read_block's
+  // own retry loop has already called sdhost_init() at least once
+  // (on the "giving up" branch), which resets SDEDM back to a normal
+  // idle value. Every SDEDM this project has captured on a real wedge
+  // so far (0xC603, FSM=WRITEDATA, round 2026-09-15) came from a
+  // narrower diagnostic window that happened to catch it mid-failure,
+  // not from this function's own timeout path, which has never once
+  // printed anything -- this is the actual missing evidence needed
+  // before attempting a fourth fix blind. Printed here, INSIDE this
+  // function, is the only place guaranteed to see the true wedged
+  // state before anything else touches these registers.
+  let _ = uart_puts("SD DIAG: wait_transfer_complete timeout, alternate_idle=0x");
+  let _ = uart_put_hex32(alternate_idle);
+  let _ = uart_puts(" SDEDM=0x");
+  let _ = uart_put_hex32(mmio_read_u32(sdedm));
+  let _ = uart_puts(" SDHSTS=0x");
+  let _ = uart_put_hex32(mmio_read_u32(SDHSTS));
+  let _ = uart_puts(" SDCDIV=0x");
+  let _ = uart_put_hex32(mmio_read_u32(SDCDIV));
+  let _ = uart_puts("\n");
   return 1;
 }
 
