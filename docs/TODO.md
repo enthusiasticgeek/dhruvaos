@@ -7349,3 +7349,37 @@ priority, #253 privilege separation) investigated thoroughly and
 deliberately left as documented, scoped, real-hardware-dependent
 follow-ups rather than shipped as unverified high-risk changes -- the
 same honest-scoping discipline applied throughout this whole session.
+
+**Follow-up (2026-09-18, later same day): fresh real-HW log
+(picocom_20260918_163633.log) shows the wedge STILL present after the
+SDHCFG_SLOW_CARD + FIFO-threshold fix (commit 01808aa).** User flagged
+this directly ("still issue SD card") and asked for it to be tracked
+and fixed. New narrowing finding: the write wedge reproduces on the
+VERY FIRST write command after sdhost_init, every time, at all three
+adaptive-backoff speeds (25MHz/12.5MHz/0x148 identification-speed) --
+ruling out clock frequency, SLOW_CARD, and FIFO pacing (re-verified
+correct by reading sdcard_state.S directly) as the sole cause. Real
+captured wedged state this time: `SDEDM=0x00010803` (FSM=WRITEDATA)
+for writes, `SDEDM=0x000108F2`/`0x00010902` (FSM=READDATA) for reads,
+`SDHSTS=0x00000001` (DATA_FLAG only, no hardware error bit) -- the
+controller genuinely stops advancing mid-transfer with no error
+reported, not a command-level failure.
+
+Downstream impact confirmed still real: 10 SD-related (FAIL)s
+(DharaFS multi-block round trip, crash-consistency, compact-resume,
+permissions, directory hierarchy, dharafs_write_bounded round trip,
+4 CRYPTO tests), 80 of 240 wedge episodes still exhaust all 3 retries
+even with the adaptive clock backoff in place, though the backoff
+mechanism IS measurably helping (160/240 episodes now recover via
+retry that would have failed outright before that existed).
+
+Added a small clock-settle delay (commit `e389227`) after the
+data-speed SDCDIV write, motivated by the new "always fails on the
+first command after the clock change" pattern -- cheap, safe,
+explicitly NOT claimed as confirmed given this project's own history
+of three prior SD fixes each falsified by the next real log. Needs a
+FIFTH real-hardware capture to know whether this one helps. If it
+doesn't, the responsible next step is real-hardware experimentation
+this environment can't provide (e.g. a logic analyzer on the SD bus,
+or systematically trying a different physical SD card to rule out
+card-specific marginality, both suggested earlier this session).
