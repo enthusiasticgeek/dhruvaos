@@ -6205,6 +6205,68 @@ support of any kind.
   verified functionally correct, occasionally too slow for this
   harness's own timing, not a kernel regression.
 
+  **Task #217 FOLLOW-UP (2026-09-18): SDCDIV fix confirmed NOT
+  sufficient on real hardware -- task #217 falsified, not just still
+  pending.** Fresh real-HW picocom log (`picocom_20260918_074005.log`,
+  19277 lines) captured WITH this fix in place: **238 total
+  `write`/`read` wedge events, 79 of which exhaust all 3 retry
+  attempts** ("giving up after 3 attempts") -- the wedge is still
+  happening, SDCDIV alone did not fix it. Cascades into the same class
+  of DharaFS/crypto FAILs documented before (9 total: multi-block
+  write, crash consistency, compaction resume, permissions, directory
+  listing, AEAD round-trip, two-time-pad fix, tamper detection, media-
+  encryption SD round-trip).
+
+  **A real, narrowing clue found while reading the full log, not just
+  the summary counts**: every one of the 238 wedge events falls within
+  the FIRST ~2565 lines (~13% of the log) -- the initial SD self-test
+  phase (the 8-block sweep at blocks 2100-2107 plus the SD-touching
+  crypto/media-encryption tests that immediately follow it). The
+  remaining ~16700 lines -- normal multitasking, background task
+  chatter, the rest of a long-running session -- show ZERO further
+  wedge events. Whatever's wrong is concentrated in/around the initial
+  data-transfer-speed SDCDIV transition and the specific rapid-fire
+  write+read+compare sequence across those 8 consecutive blocks, not a
+  general "SD breaks under any sustained load" issue.
+
+  **A real gap found in the diagnostic infrastructure itself**: the
+  existing per-block diagnostic (`SD DIAG: block N FAILED ...
+  SDEDM=0x...`, task #4 verification code) does NOT capture the actual
+  wedged register state -- by the time it runs, `sdhost_write_block`/
+  `sdhost_read_block`'s own retry loop has already called
+  `sdhost_init()` at least once (the "giving up" branch), which resets
+  `SDEDM` back to a normal idle value before this print ever reads it.
+  Confirmed directly: the log's own `SD DIAG: block 2100 FAILED:
+  wr=2 rd=2 mismatch_at=1 ... SDEDM=0x0000C601` shows `SDEDM`'s FSM
+  field (bits[3:0]) as `0x1` -- one of the IDLE states
+  `sdhost_wait_transfer_complete` itself already treats as success --
+  which is exactly what a POST-RESET read would show, not a wedged
+  one. Every real wedged `SDEDM` value this project has ever actually
+  captured (`0xC603`, FSM=WRITEDATA, round 2026-09-15) came from a
+  narrower diagnostic window that happened to catch it mid-failure by
+  luck, not from this timeout path itself, which has never once
+  printed anything in its own right.
+
+  **Fix (diagnostic only, not a functional fix)**: added a print
+  directly inside `sdhost_wait_transfer_complete`, immediately before
+  its own `return 1` timeout path -- `alternate_idle`/`SDEDM`/
+  `SDHSTS`/`SDCDIV`, the one place guaranteed to see the true wedged
+  state before `sdhost_init()` or anything else touches these
+  registers again. Verified: clean build, full `phase4_milestone.py`
+  regression battery unchanged (stays dormant under QEMU, whose own SD
+  model doesn't wedge). Commit `a4e7305`.
+
+  **Responsible next step, not attempted here**: a FRESH real-hardware
+  capture with this new diagnostic in place, to finally get the real
+  missing evidence (the true wedged FSM/SDHSTS value) before
+  attempting a fourth fix. Guessing at a next clock divider or timing
+  value without that evidence would repeat the exact mistake this
+  investigation has already learned twice not to make (SDHCFG/SDHSTS
+  pre-clear, then the poll-cap bump, both shipped on plausible-sounding
+  theories and both confirmed insufficient by the next real log). Needs
+  the user's own real Pi 1B hardware access -- not something resolvable
+  from this environment alone.
+
 - **Task #219-222 (2026-09-17): shell echo task-preemption interleave
   gap -- FIXED, and rescoped down from the original hypothesis.**
   Originally described (project memory,
