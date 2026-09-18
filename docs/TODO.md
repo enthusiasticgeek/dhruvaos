@@ -6803,3 +6803,49 @@ unchanged (same 4-FAIL baseline), no new regressions, full log
 manually checked for Domain Faults/aborts/CANARY false positives
 (none found), exactly one boot banner (no unexpected reboot). Commit
 `6202935`.
+
+### Gap F closed: the 325ms WiFi/BLE/netif ceiling-lock exposure bounded (2026-09-17)
+
+`ssh_real_accept`/`ssh_real_deliver_one_frame` and task_e's own DHCP
+poll hold a ceiling-2 lock across `netif_recv_frame` ->
+`dwc2_net_bulk_in` -> `dwc2_wait_chan0_done` -- a real, measured
+325.6ms worst case (the audit's own earlier WiFi/BLE/UART WCET
+follow-up), fully exposed to LOW and below whenever the USB link
+genuinely has nothing to deliver.
+
+**Root-cause fix, not a workaround**: `dwc2_net_bulk_in` has exactly
+one caller-family (`netif_recv_frame`), and every caller of THAT is
+already a speculative "is a frame ready" poll with its own
+retry-on-nothing-ready contract (`task_sleep_ticks` + loop, or "caller
+polls again next tick") -- never a "this transfer MUST complete" case
+the way a control transfer (enumeration), a WiFi bulk transfer, or a
+BLE bulk transfer is. Added `dwc2_wait_chan0_done_bounded(max_tries)`,
+a parallel sibling of the shared `dwc2_wait_chan0_done` -- deliberately
+NOT a shared/parameterized change to that function itself, so every
+other USB transfer class (control transfers, WiFi, BLE, mass storage)
+keeps its original 1000000-iteration/~325ms budget completely
+unchanged. `dwc2_net_bulk_in` now calls the bounded sibling with a new
+`NET_BULK_IN_POLL_CAP=20000` constant.
+
+**Real measured worst case, same "no device attached, guaranteed full
+timeout" methodology as the original 325620us figure (not a guess)**,
+via a new `dwc2_net_bulk_in_poll_wcet_measure_self_test` wired into the
+boot sequence: **6584us (~6.6ms) -- a ~48x reduction.** Fed directly
+into `test/schedulability_analysis.py`'s own
+`gc_dhcp_poll_worst_case_ms` (was 325.62ms): **LOW's margin improves
+from 609ms to 927ms**, same HIGH/MEDIUM margins otherwise unaffected.
+
+Verified: clean build, full `phase4_milestone.py` regression battery
+unchanged (same 4-FAIL baseline), no new regressions. Commit `b805016`.
+
+This closes out every gap from the original scoped plan that was
+in-session-sized: Gap C (WCET bounds), Gap E (GC critical-section
+measurement), and Gap F (this one) are all done. Gap A (real MMU guard
+pages), Gap B (safe `scheduler_pick_next` self-test), and Gap D
+(independent verification of vani's own WCET/stack-depth estimator
+soundness) remain explicitly deferred to their own dedicated future
+sessions, per the audit's own original scoping -- each is
+substantial enough (new ARMv6 page-table engineering, a function with
+documented unresolved crash history, a separate compiler-correctness
+audit) to warrant its own focused pass rather than being squeezed in
+here.
