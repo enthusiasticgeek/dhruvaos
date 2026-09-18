@@ -7221,3 +7221,24 @@ regression battery. Honest limitation: the defer/mask path itself
 (triggered only by a burst exceeding 512 bytes within one 500ms tick)
 was not exercised -- not attempted given this codebase's own
 well-documented SETTLE_S timing fragility.
+
+**Task #243 closed (measurement + real finding, tick period NOT
+changed): re-attempted finer scheduler tick.** Commit `4502503`. New
+permanent instrumentation (`irq_tick_worst_us`) measures the real
+timer-tick IRQ dispatch cost round 191/192 could only hypothesize
+about -- result: 0us worst-case (1us TIMER_CLO resolution) across a
+live QEMU run, meaning the previously-stated "DACR/MMIO trap overhead"
+hypothesis for round 191's own SETTLE_S-cascade breakage does NOT hold
+up under direct measurement. A temporary, reverted experiment (tick
+500ms -> 250ms, a more conservative 2x step than round 191's 5x jump)
+still reproduced the same class of cascading test failure starting
+around tcpecho/udpecho -- confirming the effect is real, but with
+per-tick dispatch cost now ruled out, the evidence points at round
+191's own already-documented "hidden period assumptions"
+(`tcp_rtx_timeout_ticks`/DHCP's `ticks_per_second`, confirmed present
+in the code) expressing real-time durations as raw tick counts, so a
+faster tick silently changes real protocol timing, not just
+scheduling. The tick period remains 500ms; the real prerequisite for
+a future attempt (the full constant-rescaling audit round 191 already
+scoped) is unchanged, now with a materially stronger evidence base for
+where to look first.
