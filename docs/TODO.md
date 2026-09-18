@@ -6560,3 +6560,57 @@ applied to a sibling problem). Verified throughout: clean builds, full
 `phase4_milestone.py` regression battery unchanged (same pre-existing
 `httpecho`/`mqttecho`/`ls`/`diagnose` `SETTLE_S`-class 4-FAIL pattern),
 no new regressions from any change in this pass.
+
+### Follow-up: does WiFi/BLE/UART affect WCET/RTOS guarantees? (2026-09-17)
+
+Direct user question, answered with real measurement, not a guess.
+**UART** is interrupt-driven and already fully inside `irq_dispatch`'s
+own measured `#[wcet(cycles=130000)]` budget (the 128-byte RX drain
+loop is the worst case that budget was raised for, round 72). **WiFi
+and BLE are NOT interrupt-driven at all** -- `rtl8188cu_tx_frame`/
+`rx_frame` and the BT bulk transfer functions all run via USB polling
+in ordinary TASK context, so they never touch `irq_dispatch`'s budget
+directly.
+
+But polling isn't free: new `dwc2_wait_chan0_done_wcet_measure_self_
+test` measured the real worst-case duration of `dwc2_wait_chan0_done`
+-- the ONE polling primitive underlying literally every USB bulk
+transfer in this codebase (WiFi via `dwc2_wifi_bulk_out/in`, BLE via
+`dwc2_bt_bulk_out/in`, the network interface via `dwc2_net_bulk_in`,
+even USB mass storage and enumeration) -- via `TIMER_CLO`, with no USB
+device attached (the actual condition under every QEMU test this
+project runs, and therefore the TRUE worst case: a device that
+responds finishes faster, so measuring the guaranteed-full-timeout
+path measures the real upper bound, not a contrived one).
+
+**Real result: 325620us (~325.6ms)** -- over 6x LOW's own measured
+50ms ceiling-lock critical section, and nearly two-thirds of a single
+500ms scheduler tick.
+
+**This is an ACTIVE exposure today, not just a hypothetical future
+one**: traced the call chain and confirmed `ssh_real_accept`/`ssh_
+real_deliver_one_frame` (the real SSH-over-USB-Ethernet server path)
+already wrap `netif_recv_frame` -- which calls `dwc2_net_bulk_in` --
+which calls `dwc2_wait_chan0_done` directly -- in `dhruva_prio_lock(2)`.
+That means a real, already-shipped code path can hold a ceiling-2 lock
+for up to ~325ms if the USB Ethernet link stops responding. Ceiling 2
+means this does NOT block HIGH(0)/MEDIUM(1) (their priority number is
+below the ceiling, so they preempt normally) -- but it DOES fully
+block LOW and anything at priority >=2 for that whole window. Not
+fixed in this pass (would need either a much lower poll bound with a
+real accuracy/robustness tradeoff, or restructuring to not hold a
+ceiling lock across a USB operation at all) -- recorded here as a real,
+measured, traceable finding for whoever designs real WiFi-task
+integration next, not silently discovered later via a missed deadline.
+
+**Implication for future WiFi/BLE task integration**: if a WiFi RX
+task is ever built to run at a HIGH/MEDIUM-adjacent priority (rather
+than only from the shell/best-effort band, as today), or if any future
+code wraps a WiFi/BLE bulk transfer in a ceiling lock at ceiling 0 or
+1, this 325ms number becomes a real `B_i` blocking term that MUST be
+fed into `schedulability_analysis.py` before trusting that task's own
+deadline -- exactly the same discipline this audit's own `dhruvaos_
+demo_task_set_analysis()` applied to LOW's 50ms term. Verified: clean
+build, new self-test prints the real number live, full
+`phase4_milestone.py` regression battery unchanged, no new
+regressions.

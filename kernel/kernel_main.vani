@@ -1700,6 +1700,39 @@ fn stack_canary_self_test() -> i64 {
   return 0;
 }
 
+// ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, user
+// question: "will wifi or ble or uart affect wcet and rtos functions"):
+// real, measured worst-case duration of dwc2_wait_chan0_done -- the
+// USB polling primitive underlying EVERY WiFi TX/RX call
+// (dwc2_wifi_bulk_out/_in, called from rtl8188cu_tx_frame/rx_frame,
+// which run in ordinary TASK context, never from irq_dispatch/ISR
+// context -- WiFi is entirely poll-based on this driver, not
+// interrupt-driven, so it does NOT add to irq_dispatch's own
+// #[wcet(cycles=130000)] budget the way UART RX does). Its own poll
+// cap is 1000000 iterations -- 10x sdhost_cmd's own 100000-iteration
+// cap -- and unlike delay()'s bare increment loop, each iteration here
+// does a real MMIO read (mmio_read_u32(hcint0)), typically far more
+// expensive per iteration than a plain ALU op.
+//
+// Calling this with NO real USB device attached (true of every QEMU
+// invocation this project tests with, and of this specific self-test's
+// own call here -- no transfer was ever armed) is not a synthetic
+// worst case, it's the ACTUAL worst case: a device that responds
+// quickly finishes faster, so measuring the guaranteed-full-timeout
+// path is measuring the real upper bound this function can ever take,
+// not a contrived stress scenario.
+fn dwc2_wait_chan0_done_wcet_measure_self_test() -> i64 {
+  let timer_clo: i64 = TIMER_CLO;
+  let t0: u32 = mmio_read_u32(timer_clo);
+  let _ = dwc2_wait_chan0_done();
+  let t1: u32 = mmio_read_u32(timer_clo);
+  let us: u32 = t1 - t0;
+  let _ = uart_puts("WCET DIAG: dwc2_wait_chan0_done() full-timeout (no USB device attached, the real worst case) = ");
+  let _ = uart_put_i64(us as i64);
+  let _ = uart_puts("us -- this is the real cost EVERY WiFi TX/RX call (rtl8188cu_tx_frame/rx_frame) can block its OWN calling task for, in task context, never irq_dispatch's budget\n");
+  return 0;
+}
+
 // GPIO alt-function setup for UART0 TXD/RXD on pins 14/15 (BCM2835).
 // Real hardware needs this before the PL011 UART will actually drive
 // the pins; QEMU's emulated PL011 likely doesn't care, but doing it
@@ -33946,6 +33979,7 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("USB: dwc2_init status=");
   let _ = uart_put_hex32(usb_status as u32);
   let _ = uart_puts(" (0=device attached+port enabled, nonzero=no device attached)\n");
+  let _ = dwc2_wait_chan0_done_wcet_measure_self_test();
 
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();
