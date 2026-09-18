@@ -1581,6 +1581,125 @@ fn delay(count: i64) -> i64 {
   return 0;
 }
 
+// ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit): real,
+// measured cost of delay(N) at the current CPU clock, via TIMER_CLO
+// (a real free-running 1MHz hardware counter, same one every other
+// "DIAG: ...t=...us" print in this codebase already uses -- not a
+// theoretical cycle count, an actual measured wall-clock duration
+// under whatever clock rate is live at the moment this runs).
+// Motivation: task_c (LOW, kernel_main's own demo task set) holds a
+// priority-CEILING-protected lock at ceiling 0 (HIGH's own priority)
+// across delay(3000000) -- meaning EVERY other real task in the
+// system is provably blocked for that entire duration, by design (the
+// ceiling protocol's whole point is bounding priority inversion to
+// "at most the duration of the longest critical section held at or
+// above my own priority," not eliminating it). Whether that bound is
+// actually SAFE relative to the other tasks' own periods (HIGH sleeps
+// 3 ticks, MEDIUM sleeps 1 tick, both at 500ms/tick =
+// scheduler_tick_interval_us) is exactly a WCET question this project
+// had no measured answer to before this -- "should be well under
+// 500ms" was an assumption, not a fact, and this project has already
+// been burned once by trusting a busy-loop timing assumption instead
+// of measuring it for real (BLINK_N, task #207). Measures the exact
+// count task_c actually uses (3000000) plus two bracketing values (for
+// a rough per-iteration-cost sanity check, not a claim of true
+// linearity across compiler optimization boundaries) so a future WCET
+// tool has real numbers to work from instead of a guess.
+fn delay_wcet_measure_self_test() -> i64 {
+  let timer_clo: i64 = TIMER_CLO;
+
+  let t0: u32 = mmio_read_u32(timer_clo);
+  let _ = delay(100000);
+  let t1: u32 = mmio_read_u32(timer_clo);
+  let us_100k: u32 = t1 - t0;
+
+  let t2: u32 = mmio_read_u32(timer_clo);
+  let _ = delay(3000000); // exactly task_c's own real usage
+  let t3: u32 = mmio_read_u32(timer_clo);
+  let us_3m: u32 = t3 - t2;
+
+  let t4: u32 = mmio_read_u32(timer_clo);
+  let _ = delay(10000000);
+  let t5: u32 = mmio_read_u32(timer_clo);
+  let us_10m: u32 = t5 - t4;
+
+  let _ = uart_puts("WCET DIAG: delay(100000)=");
+  let _ = uart_put_i64(us_100k as i64);
+  let _ = uart_puts("us delay(3000000)=");
+  let _ = uart_put_i64(us_3m as i64);
+  let _ = uart_puts("us delay(10000000)=");
+  let _ = uart_put_i64(us_10m as i64);
+  let _ = uart_puts("us -- task_c's own critical-section hold time (delay(3000000), while holding a ceiling-0 lock) is the middle figure\n");
+  return 0;
+}
+
+// ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit): the
+// stack overflow canary (boot/stack_canary.S) has existed since round
+// 68 and is documented in real, specific detail (four historical
+// incidents it was built to catch faster) -- but was NEVER actually
+// exercised end-to-end: every existing verification is either the
+// static bit-construction kind (not applicable here, there's no pure
+// logic to unit-test in isolation) or "it hasn't fired a false alarm,"
+// which proves it doesn't cry wolf, not that it actually catches a
+// real breach. This deliberately, safely CORRUPTS a tracked sentinel
+// (simulating exactly what a real stack overflow would do to it) and
+// confirms stack_canary_check_all() actually flags it, then restores
+// the sentinel before returning.
+//
+// Uses task index 10 -- the fixed 6 tasks (0-5) and the 4 task_create'd
+// demo tasks kernel_main() creates (6-9, see stack_canary.S's own
+// header for the exact order) are ALL real, live, currently-running
+// tasks by the time boot-time self-tests run; corrupting one of THEIR
+// tracked slots even briefly would risk a real false alarm firing on
+// the very next tick if this self-test's own restore step is ever
+// skipped by an early return/panic elsewhere. Index 10 is genuinely
+// unused -- this test's own scratch buffer, not a real task's stack --
+// so a bug in this test itself can only ever produce a spurious
+// "task 10 breached" print, never impersonate or interfere with a real
+// task's own canary.
+fn stack_canary_self_test() -> i64 {
+  let ok: i64 = 1;
+  let scratch: mut ref i64 = dhruva_alloc_bytes(16);
+  let test_index: u32 = 10 as u32;
+
+  let _ = stack_canary_set_base(test_index, scratch);
+
+  // Baseline: freshly set, must read back clean.
+  let baseline: u32 = stack_canary_check_all();
+  if (baseline & (1 << 10)) != (0 as u32) { ok = 0; }
+
+  // Simulate an overflow: overwrite the sentinel word with something
+  // else entirely (not just any wrong value -- 0x00000000, the most
+  // likely REAL overflow pattern from a zeroed/uninitialized stack
+  // frame writing past its own bounds, rather than a value chosen to
+  // be conveniently different).
+  let _ = buf_write_u32_le(scratch, 0, 0 as u32);
+  let breached: u32 = stack_canary_check_all();
+  if (breached & (1 << 10)) == (0 as u32) { ok = 0; }
+
+  // Confirm every OTHER tracked task's own bit is unaffected -- this
+  // test must not have corrupted anything beyond its own scratch slot.
+  let others_mask: u32 = breached & ((1 << 10) as u32 ^ (0xFFFFFFFF as u32));
+  if others_mask != (0 as u32) { ok = 0; }
+
+  // Restore -- critical: stack_canary_table has no "untrack" function,
+  // so index 10 stays permanently checked by every future real tick
+  // (irq_dispatch's own stack_canary_check_all call) for the rest of
+  // this boot. Leaving it corrupted would print a false "CANARY"
+  // breach line forever after this self-test returns.
+  let _ = buf_write_u32_le(scratch, 0, 0xDEADC0DE as u32);
+  let restored: u32 = stack_canary_check_all();
+  if (restored & (1 << 10)) != (0 as u32) { ok = 0; }
+
+  let _ = uart_puts("SAFETY: stack overflow canary actually detects a live-corrupted sentinel (not just documented to)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // GPIO alt-function setup for UART0 TXD/RXD on pins 14/15 (BCM2835).
 // Real hardware needs this before the PL011 UART will actually drive
 // the pins; QEMU's emulated PL011 likely doesn't care, but doing it
@@ -2679,23 +2798,51 @@ fn timer_ic_init() -> i64 {
 // per tick, let the SoC reset itself the instant the kicks stop.
 //
 // Implemented per the real, documented register semantics (matches
-// bcm2835_wdt.c's constants exactly), but NOT wired into kernel_main/
-// irq_dispatch's live path -- confirmed empirically that QEMU's
-// raspi1ap machine model does not honor PM_WDOG's timeout field at
-// all: writing PM_RSTC with WRCFG=FULL_RESET resets the emulated
-// machine immediately, regardless of what's in PM_WDOG (tested at both
+// bcm2835_wdt.c's constants exactly). Confirmed empirically that
+// QEMU's raspi1ap machine model does not honor PM_WDOG's timeout field
+// at all: writing PM_RSTC with WRCFG=FULL_RESET resets the emulated
+// machine IMMEDIATELY, regardless of what's in PM_WDOG (tested at both
 // a 2-second timeout and the maximum possible 20-bit value, 0xFFFFF --
 // both reset within milliseconds; disabling only the PM_RSTC write,
 // leaving PM_WDOG alone, restores completely normal operation, which
 // isolates the immediate-reset behavior to that one write). Since this
-// project tests exclusively via QEMU's raspi1ap, arming this for real
-// would make the one and only test method permanently unable to boot
-// the system at all -- a hardware-verification gap, not a Dhruva or
-// vani-compiler bug, tracked here rather than silently worked around.
-// PM_WDOG/PM_RSTC both require a magic password in their top byte on
-// every write, or the write is silently ignored -- not optional, not
-// a Dhruva convention, this is how the peripheral itself is gated
-// against accidental writes.
+// project tests exclusively via QEMU's raspi1ap, unconditionally
+// arming this would make the one and only test method permanently
+// unable to boot the system at all -- a real QEMU-model limitation
+// (its watchdog isn't a faithful timing model, not a stub -- there is
+// no timeout value under it that both "does something" and "doesn't
+// fire immediately"), not a Dhruva or vani-compiler bug.
+//
+// ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit): this was
+// previously left completely unwired -- fully implemented, matching
+// real hardware register semantics exactly, but never actually armed
+// anywhere in the live boot path, meaning a genuinely wedged system
+// (irq_dispatch itself stops running, or any of vectors.S's own fault
+// handlers -- fault_undef/fault_swi/fault_reserved/fault_fiq/the
+// post-diagnostic-print tail of fault_data_abort/fault_prefetch_abort,
+// every one of which ends in a bare `b .`, an infinite halt with zero
+// recovery) had NO automatic recovery path at all. For a system this
+// project's own docs already frame in ASIL-D/DO-178C-grade terms
+// (#[wcet(...)]'s own header comment), an unarmed watchdog combined
+// with halt-forever fault handlers is precisely the kind of gap real
+// safety certification would block on. Fixed via a single source-level
+// gate (WATCHDOG_ENABLE_FOR_REAL_HARDWARE below) rather than a runtime
+// QEMU-vs-real-hardware heuristic -- vani has no preprocessor/
+// conditional-compilation, and a runtime heuristic guessing "am I
+// under QEMU" is itself a real, fragile thing to get wrong (a false
+// positive on real hardware would silently ship with no watchdog
+// again; a false negative under some future QEMU machine type could
+// resume the exact permanently-unbootable failure mode this constant
+// exists to prevent). Left at 0 (disabled) as this project's own
+// checked-in default, matching its actual day-to-day QEMU-driven
+// development loop -- flip to 1 and rebuild before flashing an image
+// intended for real, unattended hardware deployment. PM_WDOG/PM_RSTC
+// both require a magic password in their top byte on every write, or
+// the write is silently ignored -- not optional, not a Dhruva
+// convention, this is how the peripheral itself is gated against
+// accidental writes.
+const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 0;
+
 fn watchdog_arm(timeout_ticks: u32) -> i64 {
   let pm_password: u32 = 0x5A000000 as u32;
   let pm_rstc: i64 = PM_RSTC;
@@ -7583,11 +7730,16 @@ fn irq_dispatch() -> i64 {
     let next: u32 = now + interval;
     let _ = mmio_write_u32(timer_c1, next);
 
-    // watchdog_kick() would belong here, once per tick -- see
-    // watchdog_arm's comment for why it isn't actually called: doing
-    // so resets QEMU's raspi1ap immediately rather than arming a real
-    // countdown, which would break the only test method this project
-    // has.
+    // ROUND 2026-09-17: wired, gated by the same source-level constant
+    // watchdog_arm's own header comment explains in full -- disabled
+    // by default (real hardware watchdogs cannot be armed here without
+    // permanently breaking every QEMU test run, so this project's own
+    // checked-in default keeps it off), real protection once
+    // WATCHDOG_ENABLE_FOR_REAL_HARDWARE is flipped to 1 for an actual
+    // hardware deployment build.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
     //
     // '.' instead of "tick\n": uart_puts's own wait loop makes it
     // unboundable under #[wcet(...)] (see uart_putc_nonblocking's
@@ -33757,6 +33909,8 @@ fn kernel_main() -> i64 {
   let _ = rtl_rx_desc_self_test();
   let _ = rtl_llt_write_self_test();
   let _ = rtl8188cu_set_channel_self_test();
+  let _ = delay_wcet_measure_self_test();
+  let _ = stack_canary_self_test();
   let _ = aes128_self_test();
   let _ = aead_hkdf_self_test();
   let _ = keccak_self_test();
@@ -33795,6 +33949,15 @@ fn kernel_main() -> i64 {
 
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();
+
+  // See watchdog_arm's own header comment for why this is gated rather
+  // than unconditional -- disabled by default (this project's own
+  // checked-in QEMU-driven development posture), real protection once
+  // WATCHDOG_ENABLE_FOR_REAL_HARDWARE is flipped to 1 for an actual
+  // hardware deployment build.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_init();
+  }
 
   let stack_bytes: i64 = 4096;
   let stack_a: mut ref i64 = dhruva_alloc_stack_domain(stack_bytes as u32, 0 as u32);

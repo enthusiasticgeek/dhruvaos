@@ -6398,3 +6398,165 @@ support of any kind.
   pre-existing 4-FAIL pattern, no new regressions. Still NOT
   live-verified against real hardware, same as the rest of this
   section.
+
+## RTOS/DharaFS safety-certification audit (2026-09-17)
+
+User request: "full audit pass, same rigor as RTL8188CU. simulate
+workload if possible to test. be thorough. wcet analysis or anything
+else expected to get rtos certified for safety and correctness." Unlike
+RTL8188CU, there's no external reference to cross-check against here
+(this scheduler/FS design is original, not a port) -- the method was
+direct correctness reading of `boot/context_switch.S` (1792 lines),
+`boot/irq_entry.S`, `boot/rpi1/vectors.S`, `boot/stack_canary.S`, real
+measurement via new permanent boot-time diagnostics, and applying (for
+the first time) this project's own existing formal-schedulability tool
+to its actual demo task set with real numbers.
+
+**Real fixes made:**
+
+- **Watchdog wired, gated (task #230).** `watchdog_arm`/`watchdog_init`/
+  `watchdog_kick` were fully implemented (correct real hardware register
+  semantics, matching `bcm2835_wdt.c`) but never actually called from
+  anywhere in the live boot/tick path -- confirmed by direct code read,
+  not assumed. Combined with every fault handler in `vectors.S`
+  (`fault_undef`/`fault_swi`/`fault_reserved`/`fault_fiq`, and the
+  post-diagnostic-print tail of `fault_data_abort`/`fault_prefetch_
+  abort`) ending in a bare `b .` -- an infinite halt with zero recovery
+  -- this meant a genuinely wedged system (irq_dispatch itself stops
+  running, or any unrecoverable fault) had NO automatic recovery path
+  at all. Root cause for why it was never wired: QEMU's `raspi1ap`
+  watchdog model isn't a faithful timing model -- ANY `PM_RSTC` write
+  with `WRCFG=FULL_RESET` resets the emulated machine immediately
+  regardless of the requested timeout (confirmed empirically at both a
+  2-second and the maximum 20-bit timeout value), so there is no
+  timeout value that both "does something" and "doesn't break every
+  QEMU test run." Fixed via a single source-level gate
+  (`WATCHDOG_ENABLE_FOR_REAL_HARDWARE`, `kernel_main.vani`) rather than
+  a runtime QEMU-detection heuristic (vani has no preprocessor, and a
+  wrong heuristic is itself a real risk -- a false negative on real
+  hardware silently ships with no watchdog again). Defaults to 0
+  (matches this project's own checked-in QEMU-driven development
+  posture); flip to 1 and rebuild before flashing an image for actual
+  unattended hardware deployment. Verified: both states (0 and 1) build
+  clean, including confirming `watchdog_kick()`'s addition to
+  `irq_dispatch` doesn't blow its own `#[wcet(cycles=130000)]` budget.
+  The enabled state was NOT boot-tested (would immediately reset QEMU
+  by design, exactly as documented) -- real verification needs actual
+  hardware.
+
+- **Stack overflow canary now has real, live validation (task #228).**
+  `boot/stack_canary.S`'s own sentinel-detection mechanism (round 68,
+  4 historical incidents it was built to catch faster) had existed
+  since round 68 but was NEVER actually exercised end-to-end -- every
+  prior check was either static bit-construction (not applicable, no
+  pure logic to isolate) or "hasn't false-alarmed," which proves it
+  doesn't cry wolf, not that it catches a real breach. New
+  `stack_canary_self_test` (kernel_main.vani) deliberately corrupts a
+  tracked sentinel (using a scratch heap buffer at an unused task-index
+  slot, never a real task's own stack, so a bug in the test itself can
+  only ever produce a spurious report, never interfere with a real
+  task), confirms `stack_canary_check_all()` actually flags it AND that
+  no other tracked task's own bit is affected, then restores the
+  sentinel (critical: there's no "untrack" function, so a skipped
+  restore would false-alarm on every real tick for the rest of that
+  boot). Verified live: `(PASS)`, and confirmed via the full log that
+  no unexpected `CANARY` line appeared anywhere else in the run.
+
+- **Real, measured WCET data + schedulability analysis applied to
+  DhruvaOS's own task set for the first time (task #226).** `#[wcet(
+  cycles=N)]` exists on exactly ONE function project-wide
+  (`irq_dispatch`) -- no task body has ever had a WCET bound, and
+  `test/schedulability_analysis.py` (task #190) was deliberately never
+  applied to DhruvaOS's own demo task set (its own header comment:
+  "that set has no declared WCET anywhere"). New
+  `delay_wcet_measure_self_test` (kernel_main.vani) measures `delay()`'s
+  real cost via `TIMER_CLO` (a genuine 1MHz hardware counter) rather
+  than assuming it -- this project has already been burned once by a
+  busy-loop timing assumption (BLINK_N, task #207). Real result:
+  `delay(3000000)` -- exactly what `task_c` (LOW) holds a ceiling-0
+  lock across -- measured at **49906us (~50ms)**, confirmed
+  near-linear against two bracketing measurements (100k and 10M
+  iterations). Ceiling 0 means this blocks EVERY other task in the
+  system for that whole window, by construction (the ceiling
+  protocol's own "prevent inversion" guarantee -- not a resource-
+  specific block).
+
+  `schedulability_analysis.py` extended with a real blocking-time term
+  (`Task.blocking`, Sha/Rajkumar/Lehoczky 1990's standard extension:
+  `R_i = C_i + B_i + sum interference`) -- the original tool covered
+  only pure fixed-priority preemptive interference, which silently
+  ignores exactly the mechanism DhruvaOS's own scheduler is built
+  around (`dhruva_prio_lock`/`dhruva_mutex_lock`). New self-test
+  (Example 5) proves the extension itself is correct: a trivially-
+  schedulable task (R=2<=D=6) flips to provably unschedulable once a
+  real blocking term (5) is added, with a zero-blocking control
+  confirming the same task set is fine without it. New
+  `dhruvaos_demo_task_set_analysis()` applies this to the REAL demo set
+  (HIGH/MEDIUM/LOW) using the measured 50ms blocking term (+ a
+  clearly-labeled, NOT independently measured, 5ms conservative round-
+  up for each task's own remaining body). **Verdict: schedulable, with
+  comfortable margin (440ms-1445ms slack across all three tasks).**
+  Caveat, stated in the tool's own output: GC (task_e)'s own ceiling-2
+  critical section duration was not measured in this pass (it can't
+  block HIGH/MEDIUM, whose priority is numerically below the ceiling,
+  but COULD block LOW via the tie-break rule) -- flagged as a real
+  follow-up, not assumed away.
+
+**Verified correct, no bug found (traced, not just pattern-matched):**
+priority-ceiling protocol (`dhruva_prio_lock`/`unlock`) and priority-
+inheritance mutex (`dhruva_mutex_lock`/`unlock`) implementations in
+`context_switch.S`; the IRQ entry/relocate/restore sequence in
+`irq_entry.S` (the true-lr-vs-resume-pc frame layout from round 68's
+own real bug fix); `scheduler_pick_next`'s aging/round-robin/ceiling-
+tie-break algorithm; the hardcoded `dhruva_prio_unlock(3)` pattern in
+the real-SSH-server code path -- initially looked like the exact
+"hardcoded restore value, multi-caller function" bug class round 53
+already fixed once for `uart_puts`, but tracing the actual call graph
+confirmed `ssh_real_server_cmd()` is only ever reached via the `sshd`
+shell command, exclusively from task_f (SHELL, priority 3) -- single-
+context, so the hardcoding is safe.
+
+**Real, honest gaps this audit did NOT fix, worth recording plainly for
+anyone evaluating this project against a real certification standard
+(DO-178C/IEC 61508-style framing):**
+
+1. **Stack overflow is DETECTED (within ~500ms), not PREVENTED.** No
+   fine-grained MMU guard pages exist -- the current page tables can't
+   express anything finer than a 1MB section (see `stack_canary.S`'s
+   own header). Between an overflow happening and the next tick's
+   canary check, corrupted memory could already have been read by
+   other code. A real guard-page implementation is out of scope for
+   this pass (needs second-level 4KB page tables, already tracked as
+   its own future item).
+2. **`scheduler_pick_next` has no automated self-test of its own**
+   (documented since round 75: an attempted white-box test found a
+   real, never-fully-root-caused crash and was deliberately abandoned
+   rather than ship a test that could crash the system). Verification
+   for this function rests on live regression trace evidence (this
+   audit's own Phase 7, 1031 real concurrent-activity log lines in one
+   run, dozens of clean runs across this whole session) plus manual
+   code tracing, not an automated unit test.
+3. **Per-task WCET only exists for the demo task set's dominant term**
+   (LOW's measured 50ms), not comprehensively for every function any
+   real task might call. A real production task set needs its own
+   WCET measurement pass before trusting `schedulability_analysis.py`'s
+   verdict -- this tool (and this audit) proves the METHOD works, not
+   that every possible workload is schedulable.
+4. **No formal proof the vani `#[wcet(...)]`/`#[bounded_stack(...)]`
+   static estimators are themselves sound** (i.e. never under-
+   estimate) -- they're already documented elsewhere in this codebase
+   as "a conservative estimator, not an exact analysis," and this
+   audit didn't independently re-verify that claim against the
+   compiler's own implementation.
+5. **GC (task_e)'s own ceiling-2 critical section duration is
+   unmeasured** (see the schedulability analysis's own caveat above).
+
+None of these are being silently worked around or hidden -- they're
+the honest current boundary of what this pass covered, in the same
+spirit as this project's own established discipline (`RTOS_GAP_
+ANALYSIS.md`, the per-task deadline/budget model's own "don't fabricate
+a number, build it when a real workload needs it" reasoning already
+applied to a sibling problem). Verified throughout: clean builds, full
+`phase4_milestone.py` regression battery unchanged (same pre-existing
+`httpecho`/`mqttecho`/`ls`/`diagnose` `SETTLE_S`-class 4-FAIL pattern),
+no new regressions from any change in this pass.

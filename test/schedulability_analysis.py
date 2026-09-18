@@ -47,6 +47,31 @@ class Task:
     period: float    # T_i
     wcet: float      # C_i, worst-case execution time
     deadline: float = None  # D_i; defaults to period (implicit-deadline model)
+    blocking: float = 0.0  # B_i -- ROUND 2026-09-17 (RTOS/DharaFS safety-
+                     # certification audit) addition: worst-case time this
+                     # task can be blocked by a LOWER-priority task holding
+                     # a resource whose priority-ceiling/inherited priority
+                     # is >= this task's own priority. The original tool
+                     # (task #190) deliberately covered only pure fixed-
+                     # priority preemptive interference (Joseph & Pandya
+                     # 1986) -- correct for a task set with no shared
+                     # resources, but DhruvaOS's own scheduler is built
+                     # specifically AROUND priority-ceiling/inheritance
+                     # locking (dhruva_prio_lock/dhruva_mutex_lock,
+                     # boot/context_switch.S), so any real application of
+                     # this tool to DhruvaOS's own task set without a
+                     # blocking term would silently ignore exactly the
+                     # mechanism this RTOS's own scheduler exists to
+                     # demonstrate. Standard extension (Sha/Rajkumar/
+                     # Lehoczky 1990, "Priority Inheritance Protocols":
+                     # An Approach to Real-Time Synchronization" -- the
+                     # same "at most one lower-priority critical section"
+                     # bound both dhruva_prio_lock's ceiling protocol and
+                     # dhruva_mutex_lock's inheritance protocol are
+                     # designed to guarantee): R_i = C_i + B_i +
+                     # sum_{j in hp(i)} ceil(R_i/T_j)*C_j -- see
+                     # response_time_analysis below for where this is
+                     # actually added in.
 
     def __post_init__(self):
         if self.deadline is None:
@@ -55,6 +80,8 @@ class Task:
             raise ValueError(f"{self.name}: wcet must be positive")
         if self.period <= 0:
             raise ValueError(f"{self.name}: period must be positive")
+        if self.blocking < 0:
+            raise ValueError(f"{self.name}: blocking cannot be negative")
         if self.wcet > self.deadline:
             raise ValueError(f"{self.name}: wcet ({self.wcet}) exceeds its own deadline ({self.deadline}) -- cannot ever meet it even alone")
 
@@ -76,15 +103,21 @@ def utilization_bound_ok(tasks: list[Task]) -> tuple[bool, float]:
 
 def response_time_analysis(tasks: list[Task]) -> dict[str, tuple[float, bool]]:
     """Exact fixed-priority response-time analysis (Joseph & Pandya,
-    1986). For each task i, iterates the fixed-point recurrence
-        R_i^(0) = C_i
-        R_i^(k+1) = C_i + sum_{j in hp(i)} ceil(R_i^(k) / T_j) * C_j
+    1986), extended with a blocking term (Sha/Rajkumar/Lehoczky 1990) for
+    priority-ceiling/inheritance-protected critical sections. For each
+    task i, iterates the fixed-point recurrence
+        R_i^(0) = C_i + B_i
+        R_i^(k+1) = C_i + B_i + sum_{j in hp(i)} ceil(R_i^(k) / T_j) * C_j
     until it converges (R_i^(k+1) == R_i^(k)) or exceeds D_i (provably
     unschedulable, no point iterating further -- the recurrence is
     monotonically non-decreasing, so once it passes the deadline it
     can only get worse). hp(i) = every task with priority number
     STRICTLY LESS than task i's own (this project's own "0 is highest"
     convention, matching eff_prio_table throughout context_switch.S).
+    B_i defaults to 0 (pure Joseph & Pandya, no shared resources) --
+    only load-bearing when the caller has actually supplied a real,
+    measured worst-case blocking time for a task set that uses
+    dhruva_prio_lock/dhruva_mutex_lock.
 
     Returns {task_name: (response_time_or_None, meets_deadline)} --
     response_time is None if the iteration was aborted early because it
@@ -93,10 +126,10 @@ def response_time_analysis(tasks: list[Task]) -> dict[str, tuple[float, bool]]:
     results = {}
     for i, task in enumerate(tasks):
         higher_priority = [t for t in tasks if t.priority < task.priority]
-        r = task.wcet
+        r = task.wcet + task.blocking
         while True:
             interference = sum(ceil(r / hp.period) * hp.wcet for hp in higher_priority)
-            r_next = task.wcet + interference
+            r_next = task.wcet + task.blocking + interference
             if r_next > task.deadline:
                 results[task.name] = (None, False)
                 break
@@ -198,6 +231,29 @@ def main() -> int:
     else:
         print(f"[PASS] Example 4 correctly honors an explicit deadline tighter than period: {rta4}")
 
+    # Example 5 (ROUND 2026-09-17, blocking-term extension): a task
+    # that's trivially schedulable with C alone (R=2<=6) becomes
+    # provably UNSCHEDULABLE once a real blocking term is added -- the
+    # exact scenario dhruva_prio_lock's own ceiling protocol produces
+    # for any task sharing a ceiling with a long-held lower-priority
+    # critical section. Top priority (0), so no interference term at
+    # all -- isolates the blocking term as the only thing that changed
+    # between the two checks.
+    tasks5 = [Task("A", priority=0, period=6, wcet=2, blocking=5)]
+    rta5 = response_time_analysis(tasks5)
+    if rta5["A"][1] is not False:
+        print(f"[FAIL] Example 5: expected blocking (5) + wcet (2) > deadline (6) to fail, got {rta5}")
+        all_ok = False
+    else:
+        print(f"[PASS] Example 5 blocking term correctly flips an otherwise-schedulable task to unschedulable: {rta5}")
+        tasks5b = [Task("A", priority=0, period=6, wcet=2, blocking=0)]
+        rta5b = response_time_analysis(tasks5b)
+        if rta5b["A"] != (2, True):
+            print(f"[FAIL] Example 5 control (blocking=0): expected (2, True), got {rta5b}")
+            all_ok = False
+        else:
+            print(f"[PASS] Example 5 control (blocking=0) confirms the SAME task set is fine without it: {rta5b}")
+
     print()
     if all_ok:
         print("ALL SELF-TESTS PASS")
@@ -207,6 +263,105 @@ def main() -> int:
         return 1
 
 
+def dhruvaos_demo_task_set_analysis() -> int:
+    """ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, user
+    request: "simulate workload if possible to test... wcet analysis").
+    This tool (task #190) was correctly never applied to DhruvaOS's own
+    demo task set before now (see this file's own header comment) --
+    it had no WCET data to apply. This closes that gap with REAL,
+    MEASURED numbers, not invented ones, for the one figure that
+    actually matters most: task_c (LOW)'s own delay(3000000) busy-wait,
+    held across a dhruva_prio_lock(0) ceiling-0 critical section --
+    measured live under QEMU via a new permanent boot-time diagnostic
+    (kernel_main.vani's delay_wcet_measure_self_test, TIMER_CLO-based,
+    a real 1MHz hardware counter) at 49906us (~50ms). Ceiling 0 means
+    this blocks EVERY other task in the system for that whole window,
+    by design -- not a resource-specific block like a mutex, the whole
+    point of the ceiling protocol's own "prevent inversion by
+    construction" guarantee (see context_switch.S's own file header).
+
+    The rest of each task body's own WCET (a handful of uart_puts calls
+    plus lock/unlock bookkeeping) is NOT independently measured to the
+    same precision -- conservatively rounded up to 5ms per task here,
+    labeled as such rather than presented as equally rigorous. This
+    tool's own job is to show whether the DOMINANT, MEASURED cost
+    (the 50ms critical section) keeps the real demo task set
+    schedulable against its own real periods (task_sleep_ticks counts x
+    scheduler_tick_interval_us = 500ms/tick) -- it does, comfortably,
+    but the margin is worth seeing in real numbers, not just asserted."""
+    MS = 1.0  # working in milliseconds throughout
+    TICK_MS = 500.0  # scheduler_tick_interval_us() = 500000us = 500ms
+
+    measured_low_critical_section_ms = 49.906  # delay(3000000), TIMER_CLO-measured
+    other_body_estimate_ms = 5.0  # conservative, NOT independently measured
+
+    tasks = [
+        # HIGH (task_a): sleeps 3 ticks, priority 0. Own body has no
+        # busy-wait -- its own WCET is the "other_body_estimate" only.
+        # Blocked by LOW's ceiling-0 critical section whenever it lands
+        # inside one (ties favor the incumbent at equal boosted
+        # priority -- see context_switch.S's own scheduler_pick_next
+        # comment).
+        Task("HIGH", priority=0, period=3 * TICK_MS, wcet=other_body_estimate_ms,
+             blocking=measured_low_critical_section_ms),
+        # MEDIUM (task_b): sleeps 1 tick, priority 1. Same blocking
+        # exposure as HIGH -- LOW's ceiling-0 boost outranks MEDIUM's
+        # own priority 1 outright, no tie-break needed.
+        Task("MEDIUM", priority=1, period=1 * TICK_MS, wcet=other_body_estimate_ms,
+             blocking=measured_low_critical_section_ms),
+        # LOW (task_c): sleeps 2 ticks, priority 2. Its own WCET
+        # includes the real measured critical section (it's the one
+        # DOING the delay, not waiting on someone else's). Not blocked
+        # by anything at its own priority or below in THIS task set
+        # (GC's own ceiling-2 ARDF/compaction lock is a separate,
+        # unmeasured question -- see this function's own caller for why
+        # that's flagged as a follow-up, not silently assumed zero).
+        Task("LOW", priority=2, period=2 * TICK_MS,
+             wcet=other_body_estimate_ms + measured_low_critical_section_ms),
+    ]
+
+    print("DhruvaOS demo task set (HIGH/MEDIUM/LOW) -- real measured blocking term:")
+    for t in tasks:
+        print(f"  {t.name}: priority={t.priority} period={t.period}ms wcet={t.wcet:.3f}ms "
+              f"blocking={t.blocking:.3f}ms deadline={t.deadline}ms")
+    print()
+
+    bound_ok, util = utilization_bound_ok(tasks)
+    print(f"Liu & Layland utilization bound (sufficient, not necessary): "
+          f"U={util:.4f}, {'PASSES' if bound_ok else 'fails (exact RTA below is the real answer)'}")
+    print()
+
+    results = response_time_analysis(tasks)
+    all_ok = True
+    for name, (r, ok) in results.items():
+        task = next(t for t in tasks if t.name == name)
+        margin = task.deadline - r if r is not None else None
+        status = f"R={r:.3f}ms <= D={task.deadline}ms (margin {margin:.3f}ms)" if ok else "MISSES DEADLINE"
+        print(f"  {name}: {status} -- {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            all_ok = False
+
+    print()
+    if all_ok:
+        print("VERDICT: schedulable with real measured blocking data, comfortable margin.")
+        print("CAVEAT: 'other_body_estimate_ms' (5ms/task) is a conservative round-up,")
+        print("not independently measured to the same rigor as the 50ms figure -- and")
+        print("GC (task_e)'s own ceiling-2 critical section duration was not measured")
+        print("in this pass (out of scope: it can't block HIGH/MEDIUM at ceiling 2 < their")
+        print("own priority, but COULD block LOW via the tie-break rule -- a real follow-up,")
+        print("not assumed away). Re-run with real numbers before trusting this for any")
+        print("actual production workload, not just this demonstration task set.")
+        return 0
+    else:
+        print("VERDICT: NOT schedulable with real measured blocking data.")
+        return 1
+
+
 if __name__ == "__main__":
     import sys
-    sys.exit(main())
+    rc = main()
+    print()
+    print("=" * 70)
+    print()
+    rc2 = dhruvaos_demo_task_set_analysis()
+    sys.exit(rc if rc != 0 else rc2)
