@@ -6649,3 +6649,157 @@ the honest worst-case number: LOW is still schedulable** -- R=390.526ms
 measurements captured across 10 passes in one run, full
 `phase4_milestone.py` regression battery unchanged, no new
 regressions.
+
+### Gap C closed: #[wcet(...)] bounds added to every task body that can honestly carry one (2026-09-17)
+
+Before this round, `#[wcet(cycles=N)]` existed on exactly ONE function
+project-wide (`irq_dispatch`) -- no task body had ever had a WCET
+bound, even though the whole point of the scheduler's fixed-priority
+design is to make per-task execution-time bounds meaningful.
+
+**Extraction pattern** (task_a, task_b, task_d, task_custom_demo,
+task_mutex_demo_low, task_mutex_demo_high): each task's `while true`
+shell never returns by design, and `#[wcet(...)]` can't apply to a
+non-terminating loop, nor does vani's estimator accept ANY `while`
+loop as bounded regardless of what's inside it. Fix: extract the real
+"one wake-up-to-next-sleep" segment into its own `_wake_body` helper,
+tag THAT with `#[wcet(cycles=N)]`, leave the eternal
+`while true { task_sleep_ticks(...); call_helper(); }` shell untagged
+(fine -- nothing requires the outer driver loop itself to carry a
+bound, only the real work done per wake, exactly the C_i term
+`schedulability_analysis.py`'s own `Task.wcet` field already models).
+
+**A real architectural problem had to be solved first, not just a
+mechanical extraction**: any WCET-tagged helper that called the
+existing `uart_puts`/`uart_put_i64` got transitively poisoned -- both
+have their own internal `while` loops (string length / digit
+extraction), and the estimator's call-graph analysis doesn't care
+whether the loop is in the tagged function itself or three calls deep.
+Fix: two new bounded counterparts, `uart_puts_bounded` (96-char
+compile-time cap) and `uart_put_i64_bounded` (20-digit compile-time
+cap), both using `for i from 0 to N { if ... }` instead of `while`
+(vani only accepts a `for` loop with a literal/const bound -- a
+non-const-bound `for` is treated as unbounded too, confirmed via the
+compiler's own error text) and `uart_putc_nonblocking` instead of
+blocking `uart_putc`, mirroring `irq_dispatch`'s own established
+pattern for this exact problem. `uart_puts_bounded` preserves both the
+task #185 mutual-exclusion fix and the task #219 shell-echo-interleave
+fix from the real `uart_puts` it replaces in these call sites.
+`extern "C"` calls (`dhruva_prio_lock/unlock`, `dhruva_mutex_lock/
+unlock`, `task_sleep_ticks`, `cpu_wfi`, `governor_apply_freq_mhz`) are
+opaque black boxes to the estimator, not vani-level loops -- they
+don't poison a WCET tag, including a mid-body `task_sleep_ticks(5)`
+call inside `task_mutex_demo_low`'s own deliberate hold-across-sleep
+contention window. `governor_step` (called from `task_d`'s wake body)
+also had its own internal `uart_puts`/`uart_put_i64` calls swapped to
+the bounded variants for the same reason -- it has exactly one caller,
+so this was safe to do directly rather than needing a second wrapper.
+Every declared `#[wcet(cycles=N)]` budget was set from the compiler's
+OWN reported static estimate on first failure (e.g. task_a needed
+50000, not a guessed 25000; task_d needed 100000, not 15000), not
+picked in advance -- the estimator's number is the actual ceiling here.
+
+**Four tasks deliberately left WITHOUT a `#[wcet(...)]` tag, each with
+an explicit code comment explaining why -- this is NOT the same as the
+uart_puts problem above, these are genuine cases where a static bound
+would be dishonest, not a compiler quirk to route around:**
+
+- **`task_c` (LOW)**: `delay(count)` takes its loop bound as a
+  RUNTIME parameter, not a compile-time constant -- the estimator
+  would be correct to call it unbounded (worst case `count` is
+  `i64::MAX`). LOW's real dominant WCET term is instead the MEASURED
+  value from Gap 226's own `delay_wcet_measure_self_test`
+  (`delay(3000000)` = 49906us), already the `B_i` term
+  `schedulability_analysis.py` uses for HIGH/MEDIUM and part of LOW's
+  own C_i.
+- **`task_e` (GC)**: `dharafs_compact` has 2 real `while` loops walking
+  the DharaFS log -- genuinely data-dependent on filesystem state at
+  runtime. Gap E (above) already closed the empirical side of this
+  exact question with live TIMER_CLO measurement; that's what feeds
+  `schedulability_analysis.py`, not a static estimate this task's own
+  structure can't honestly produce.
+- **`task_f` (SHELL)**: `shell_dispatch()` fans out to arbitrary
+  user-typed commands, several with their own live network round-trip
+  polling loops (`tlsecho`'s full TLS 1.3 handshake, `tcprtx`'s
+  retransmission-recovery loop, `udpecho`/`tcpecho`'s socket polling)
+  -- best-effort, interactively-triggered work by design, not a
+  periodic hard-RT task with a real deadline.
+- **`task_fsq`**: its drain loop is a `while` (unconditionally
+  unbounded to the estimator regardless of `fsqueue_max_slots()`'s
+  real fixed cap of 8), and even a `for`-loop rewrite bounded by that
+  cap wouldn't make the real per-iteration work boundable --
+  `dharafs_queue_dispatch_one`'s own path/data byte-copy loops are
+  runtime-length-dependent, the same class of issue as `task_e`'s.
+
+**Verified**: clean build (two rounds of budget-too-low errors fixed
+by raising the declared cycles to the compiler's own reported
+estimate, not by loosening the code), full `phase4_milestone.py`
+regression battery unchanged (same pre-existing httpecho/mqttecho/ls/
+diagnose `SETTLE_S`-class 4-FAIL pattern), no new regressions.
+Commit `a4c6471`.
+
+### DACR trap-rate follow-up: root cause found, first fix rejected before it shipped (2026-09-17)
+
+Direct follow-up to a user question ("why 500ms tick instead of 10-20ms
+like a true RTOS, what's the alternative") pointing back at task #191's
+own reverted 100ms-tick attempt. Re-reading `context_switch.S` during
+this same conversation found the concrete mechanism task #191 could
+only hypothesize about: `scheduler_pick_next`'s own comment said it
+"unconditionally OVERWRITES DACR on every single invocation" -- worth
+checking whether that write is genuinely needed every time.
+
+**First attempt, caught and reverted before it ever built**: skip the
+DACR `mcr` write in `scheduler_pick_next` whenever the newly-picked
+task equals the current one (`r8 == r3`, no real context switch). The
+reasoning looked sound in isolation -- `r3` (the pre-decision
+`current_task` value) is genuinely read-only for the rest of the
+function, verified by inspection, so the comparison itself is safe.
+**But tracing the actual call pattern showed the premise was wrong**:
+`irq_dispatch` (`kernel_main.vani`) called `dacr_open_all()`
+UNCONDITIONALLY at the very top of every IRQ -- timer tick or UART RX
+alike -- setting DACR to "everything open" (0x55555555), and
+`scheduler_switch_from_irq`/`scheduler_pick_next` always runs
+immediately after, every single IRQ, no exceptions. That means DACR is
+already dirtied by the time `scheduler_pick_next` is entered on
+essentially every real invocation. A "skip when no switch" version
+would have left DACR wide open -- cross-task memory isolation silently
+defeated -- on precisely the common no-switch-tick case it was meant to
+speed up. Not a performance miss: a real correctness regression, caught
+by tracing the actual runtime call graph before ever compiling it, not
+after.
+
+**The real fix**: `dacr_open_all()`'s only reason to exist is
+`stack_canary_check_all()`'s own cross-task read (every tracked task's
+stack-base sentinel). That check itself only ever runs inside
+`irq_dispatch`'s own `was_timer_tick == 1` branch. Verified by reading
+the whole function top to bottom that nothing else in it -- the shell
+line buffer, the diagnostic ring/counters, every MMIO register access
+-- touches per-task private stack memory (all of it is kernel/shared
+state, domain 0, always reachable regardless of DACR's per-task
+bits). Moved the `dacr_open_all()` call from the top of `irq_dispatch`
+to immediately before `stack_canary_check_all()`, inside the timer-tick
+branch specifically. UART RX interrupts (fire once per keystroke during
+real interactive use, independent of and typically far more frequent
+than the scheduler's own tick) no longer pay for an open-DACR round
+trip they never needed; the timer-tick path (where the canary check
+genuinely needs it) is functionally unchanged. `scheduler_pick_next`
+itself is untouched -- back to its original unconditional-write
+behavior, same as before this whole investigation, since that write is
+genuinely still needed there for real switches and the reverted skip
+attempt is gone.
+
+**Not yet done**: this doesn't directly re-test task #191's own
+100ms-tick hypothesis (that change wasn't re-attempted this round,
+only the specific DACR-related trap source it flagged was investigated
+and partially addressed). A future attempt at a finer scheduler tick
+should re-measure QEMU test-harness timing with this fix in place
+before assuming the original 100ms regression is fully resolved --
+the timer-tick path's own DACR cost (needed for the canary check) is
+unchanged by this fix, only the UART-RX-interrupt path's unnecessary
+cost was removed.
+
+Verified: clean build, full `phase4_milestone.py` regression battery
+unchanged (same 4-FAIL baseline), no new regressions, full log
+manually checked for Domain Faults/aborts/CANARY false positives
+(none found), exactly one boot banner (no unexpected reboot). Commit
+`6202935`.
