@@ -1653,6 +1653,71 @@ fn delay_wcet_measure_self_test() -> i64 {
   return 0;
 }
 
+// ROUND 2026-09-18 (RTOS/DharaFS safety-certification audit, Gap D):
+// real measured cost of a raw i64 `/` (division) on THIS target --
+// ARM1176JZF-S has no hardware integer-divide instruction at all
+// (build.sh's own header comment: any `/` on an i64 compiles to a
+// call to `__aeabi_ldivmod`, libgcc's software division routine).
+// Directly informs a real finding in vani-compiler's own WCET
+// estimator (src/safety.rs's wcet_expr, E::Binary arm): it charges a
+// FLAT 2 cycles for every binary operator, completely ignoring which
+// one (`op: BinaryOp` is pattern-matched away via `..`) -- so a raw
+// `/`/`%` gets the exact same charge as `+`. The estimator's own
+// adjacent doc comment (wcet_builtin_cycles' header) documents an
+// INTENDED "Integer divide / modulo: 20-40 cycles (in-order cores)"
+// category, but that number is only ever applied to named stdlib
+// functions (i64_div_floor etc.), never to the raw operator itself --
+// the actual gap this measurement grounds a fix for.
+//
+// Runs enough real divisions that per-division noise (accumulated
+// timer read/loop overhead) averages out, accumulates the results
+// into a value that gets PRINTED afterward specifically so nothing
+// upstream can dead-code-eliminate the divisions as unused.
+fn i64_div_wcet_measure_self_test() -> i64 {
+  let timer_clo: i64 = TIMER_CLO;
+  let iters: i64 = 100000;
+  let acc: i64 = 0;
+  let n: i64 = 123456789;
+  let t0: u32 = mmio_read_u32(timer_clo);
+  for i from 0 to 100000 {
+    let d: i64 = n / (i + 3);
+    acc = acc + d;
+  }
+  let t1: u32 = mmio_read_u32(timer_clo);
+  let us: u32 = t1 - t0;
+  let _ = uart_puts("WCET DIAG: i64 division real cost = ");
+  let _ = uart_put_i64(us as i64);
+  let _ = uart_puts("us / ");
+  let _ = uart_put_i64(iters);
+  let _ = uart_puts(" divisions (includes loop overhead, a real upper-bound-friendly measurement, not isolated-instruction-only) acc=");
+  let _ = uart_put_i64(acc);
+  let _ = uart_puts(" -- vani's own WCET estimator currently charges a flat 2 cycles for ANY binary operator including this one (src/safety.rs wcet_expr's E::Binary arm ignores `op` entirely), a real soundness gap this measurement documents evidence for\n");
+
+  // Same loop shape, `+` instead of `/` -- an apples-to-apples
+  // comparison sharing the exact same QEMU-TCG-emulation host-speed
+  // baseline and loop overhead as the measurement above, so the RATIO
+  // between the two is meaningful evidence even though neither
+  // absolute number is literal real-ARM1176-silicon cycles (QEMU's
+  // own emulation speed depends on the host machine, not the
+  // target's real clock -- the same honest caveat this whole
+  // project's other QEMU-based timing measurements already carry).
+  let acc2: i64 = 0;
+  let n2: i64 = 123456789;
+  let t2: u32 = mmio_read_u32(timer_clo);
+  for j from 0 to 100000 {
+    let s: i64 = n2 + (j + 3);
+    acc2 = acc2 + s;
+  }
+  let t3: u32 = mmio_read_u32(timer_clo);
+  let us2: u32 = t3 - t2;
+  let _ = uart_puts("WCET DIAG: i64 addition real cost (same loop shape, for comparison) = ");
+  let _ = uart_put_i64(us2 as i64);
+  let _ = uart_puts("us / 100000 additions acc=");
+  let _ = uart_put_i64(acc2);
+  let _ = uart_puts(" -- division/addition ratio is the real, host-speed-independent evidence for how much vani's own flat 2-cycle-for-every-operator model undercounts division specifically\n");
+  return 0;
+}
+
 // ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit): the
 // stack overflow canary (boot/stack_canary.S) has existed since round
 // 68 and is documented in real, specific detail (four historical
@@ -34581,6 +34646,7 @@ fn kernel_main() -> i64 {
   let _ = rtl_llt_write_self_test();
   let _ = rtl8188cu_set_channel_self_test();
   let _ = delay_wcet_measure_self_test();
+  let _ = i64_div_wcet_measure_self_test();
   let _ = stack_canary_self_test();
   let _ = aes128_self_test();
   let _ = aead_hkdf_self_test();
