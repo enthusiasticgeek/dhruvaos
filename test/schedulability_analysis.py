@@ -336,6 +336,28 @@ def dhruvaos_demo_task_set_analysis() -> int:
 
     measured_low_critical_section_ms = 49.906  # delay(3000000), TIMER_CLO-measured
     other_body_estimate_ms = 5.0  # conservative, NOT independently measured
+    # ROUND 2026-09-18 (RTOS true-compliance pass, task #240): real
+    # measured context-switch/mutex-handoff overhead -- see kernel_
+    # main.vani's task_mutex_demo_low/high_wake_body (mutex_handoff_
+    # t0/mutex_handoff_worst_us in context_switch.S). "Fixed-time task
+    # switching" is a standard RTOS-qualifying property this model
+    # previously left completely unmodeled -- a real, honest gap
+    # RTOS_GAP_ANALYSIS.md now names. Measured live under QEMU (worst
+    # case 182us across a full phase4_milestone.py run, steady-state
+    # 14-30us) via the existing MUTEX-LOW/HIGH demo pair's own real
+    # unlock-to-running latency (covers the priority-inheritance wake
+    # path + scheduler_pick_next + register restore -- the real
+    # mechanical cost of one real handoff, not a synthetic benchmark).
+    # Folded into every task's own WCET once (the standard simplified
+    # RTA treatment: each activation implies being switched INTO,
+    # whether via a tick-driven preemption decision or a direct
+    # mutex/ceiling handoff) -- conservative given the actual per-tick
+    # scheduler_pick_next cost (no mutex handoff involved) is smaller
+    # and unmeasured on its own, and this demo set's dominant terms
+    # (49.9ms/7.7ms/6.6ms) dwarf it regardless. QEMU-measured, not
+    # confirmed identical to real Pi 1B hardware timing (same caveat
+    # as every other TIMER_CLO measurement in this codebase).
+    measured_ctxsw_handoff_ms = 0.182
     # GC's own two ceiling-2 critical sections -- see this function's
     # own header for why the DHCP-poll one uses a real worst-case
     # figure (12-478us was only ever the healthy-path average across 10
@@ -362,12 +384,14 @@ def dhruvaos_demo_task_set_analysis() -> int:
         # comment). NOT blocked by GC's own ceiling-2 sections -- 0 < 2,
         # HIGH preempts a ceiling-2-boosted task outright, no tie-break
         # needed.
-        Task("HIGH", priority=0, period=3 * TICK_MS, wcet=other_body_estimate_ms,
+        Task("HIGH", priority=0, period=3 * TICK_MS,
+             wcet=other_body_estimate_ms + measured_ctxsw_handoff_ms,
              blocking=measured_low_critical_section_ms),
         # MEDIUM (task_b): sleeps 1 tick, priority 1. Same reasoning as
         # HIGH -- blocked by LOW's ceiling-0 section, not by GC's
         # ceiling-2 ones (1 < 2).
-        Task("MEDIUM", priority=1, period=1 * TICK_MS, wcet=other_body_estimate_ms,
+        Task("MEDIUM", priority=1, period=1 * TICK_MS,
+             wcet=other_body_estimate_ms + measured_ctxsw_handoff_ms,
              blocking=measured_low_critical_section_ms),
         # LOW (task_c): sleeps 2 ticks, priority 2. Its own WCET
         # includes the real measured critical section (it's the one
@@ -375,7 +399,7 @@ def dhruvaos_demo_task_set_analysis() -> int:
         # carries GC's own worst-case blocking term (see this
         # function's own header) -- the gap this round closes.
         Task("LOW", priority=2, period=2 * TICK_MS,
-             wcet=other_body_estimate_ms + measured_low_critical_section_ms,
+             wcet=other_body_estimate_ms + measured_low_critical_section_ms + measured_ctxsw_handoff_ms,
              blocking=gc_worst_blocking_ms),
     ]
 

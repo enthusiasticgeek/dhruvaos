@@ -237,6 +237,26 @@ mutex_wait_worst_ticks:
                          * it's even measurable, since blocking and
                          * resuming can't happen within the same tick
                          * this driver can distinguish). */
+mutex_handoff_t0:
+    .word 0             /* ROUND 2026-09-18 (RTOS true-compliance pass,
+                         * task #240): TIMER_CLO value the LOW-priority
+                         * mutex demo task records right before calling
+                         * dhruva_mutex_unlock() -- read back by the
+                         * HIGH-priority waiter immediately after its own
+                         * dhruva_mutex_lock() call returns, giving a
+                         * real measured unlock-to-running latency
+                         * (context switch + mutex handoff combined),
+                         * not an estimate. Treating 0 as "not yet set"
+                         * is a safe sentinel here (unlike a task-index
+                         * value elsewhere in this file) -- TIMER_CLO is
+                         * never genuinely 0 by the time any task first
+                         * runs. */
+mutex_handoff_worst_us:
+    .word 0             /* longest observed unlock-to-resumed-execution
+                         * latency seen so far, in microseconds -- feeds
+                         * schedulability_analysis.py's own context-
+                         * switch/handoff overhead term once a real
+                         * value has been captured from a live run. */
 mutex_block_start_tick_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
                         /* tick_count at the moment task[i] most
@@ -1530,6 +1550,34 @@ mutex_contention_count_get:
 mutex_wait_worst_ticks_get:
     ldr r0, =mutex_wait_worst_ticks
     ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global mutex_handoff_t0_get
+mutex_handoff_t0_get:
+    ldr r0, =mutex_handoff_t0
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global mutex_handoff_t0_set
+mutex_handoff_t0_set:
+    ldr r1, =mutex_handoff_t0
+    str r0, [r1]
+    mov r1, #0
+    bx lr
+
+.global mutex_handoff_worst_us_get
+mutex_handoff_worst_us_get:
+    ldr r0, =mutex_handoff_worst_us
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global mutex_handoff_worst_us_set
+mutex_handoff_worst_us_set:
+    ldr r1, =mutex_handoff_worst_us
+    str r0, [r1]
     mov r1, #0
     bx lr
 

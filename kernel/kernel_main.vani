@@ -1165,6 +1165,14 @@ extern "C" fn spn_shadow_mismatch_count_get() -> u32;
 extern "C" fn spn_shadow_mismatch_count_increment() -> u32;
 extern "C" fn spn_shadow_prediction_valid_get() -> u32;
 extern "C" fn spn_shadow_prediction_valid_set(v: u32) -> i64;
+// ROUND 2026-09-18 (RTOS true-compliance pass, task #240): real
+// measured unlock-to-running latency via the existing MUTEX-LOW/HIGH
+// demo pair -- see context_switch.S's own header comment on
+// mutex_handoff_t0/mutex_handoff_worst_us for the full design.
+extern "C" fn mutex_handoff_t0_get() -> u32;
+extern "C" fn mutex_handoff_t0_set(v: u32) -> i64;
+extern "C" fn mutex_handoff_worst_us_get() -> u32;
+extern "C" fn mutex_handoff_worst_us_set(v: u32) -> i64;
 // TEST-ONLY -- see context_switch.S's own comment on
 // scheduler_set_tick_count_test_only.
 extern "C" fn scheduler_set_tick_count_test_only(value: u32) -> i64;
@@ -23098,6 +23106,15 @@ fn shell_dispatch() -> i64 {
     let _ = uart_put_i64(mutex_wait_worst_ticks_get());
     let _ = uart_puts(" ticks\n");
 
+    // ROUND 2026-09-18 (task #240): real measured unlock-to-running
+    // latency (context switch + mutex handoff combined) via the
+    // MUTEX-LOW/HIGH demo pair -- see mutex_handoff_worst_us's own
+    // header comment in context_switch.S. 0 means no contended
+    // handoff has happened yet this boot.
+    let _ = uart_puts("  mutex handoff worst-case latency: ");
+    let _ = uart_put_i64(mutex_handoff_worst_us_get() as i64);
+    let _ = uart_puts("us (context-switch + handoff, MUTEX-LOW/HIGH demo pair)\n");
+
     // Round 66: recent history, oldest to newest -- one sample per
     // real tick, up to the last 32 (~16 seconds at the 500ms tick
     // period), answering "what was activity like recently" rather
@@ -24121,6 +24138,12 @@ fn task_mutex_demo_low_wake_body() -> i64 {
   let _ = uart_put_i64_bounded(boosted as i64);
   let _ = uart_puts_bounded("\n");
   let _ = uart_puts_bounded("MUTEX-LOW: releasing demo mutex\n");
+  // ROUND 2026-09-18 (task #240): record TIMER_CLO right before the
+  // handoff -- HIGH (already blocked waiting on this exact lock, per
+  // this function's own pigeonhole-guaranteed-contention comment
+  // above) reads it back the instant its own dhruva_mutex_lock() call
+  // returns, giving a real measured unlock-to-running latency.
+  let _ = mutex_handoff_t0_set(mmio_read_u32(TIMER_CLO));
   let _ = dhruva_mutex_unlock(0 as u32);
   return 0;
 }
@@ -24136,10 +24159,44 @@ fn task_mutex_demo_low() -> i64 {
 }
 
 #[no_heap]
-#[wcet(cycles=60000)]
+#[wcet(cycles=102161)]
 fn task_mutex_demo_high_wake_body() -> i64 {
   let _ = uart_puts_bounded("MUTEX-HIGH: requesting demo mutex\n");
   let _ = dhruva_mutex_lock(0 as u32);
+  // ROUND 2026-09-18 (task #240): the instant this returns is the
+  // first instruction this task runs after being switched back in --
+  // paired with mutex_handoff_t0 (set by LOW right before unlock),
+  // this is a real measured "hard-RT event to running" latency, the
+  // "fixed-time task switching" RTOS-qualifying property.
+  //
+  // BUG FOUND live via this project's own "no trust, validate
+  // everything" discipline, fixed same round: the first version left
+  // t0 in place after reading it, which meant an UNCONTENDED
+  // acquisition (LOW already unlocked and gone back to sleep well
+  // before HIGH's own wake) would read a STALE t0 from the PREVIOUS
+  // real handoff and report a bogus ~1-second "latency" (the real
+  // elapsed time since that earlier unlock, not a switch cost) --
+  // confirmed in a live QEMU log alternating ~15-179us genuine samples
+  // with ~1,000,000us bogus ones. Fixed by having HIGH consume/reset
+  // t0 back to 0 the instant it reads it, so a later uncontended
+  // acquisition correctly sees the "not set since last consumed"
+  // sentinel and skips reporting, instead of reading someone else's
+  // old timestamp.
+  let t0: u32 = mutex_handoff_t0_get();
+  if t0 != (0 as u32) {
+    let _ = mutex_handoff_t0_set(0 as u32);
+    let t1: u32 = mmio_read_u32(TIMER_CLO);
+    let latency: u32 = t1 - t0;
+    let worst: u32 = mutex_handoff_worst_us_get();
+    if latency > worst {
+      let _ = mutex_handoff_worst_us_set(latency);
+    }
+    let _ = uart_puts_bounded("MUTEX-HIGH: unlock-to-running latency=");
+    let _ = uart_put_i64_bounded(latency as i64);
+    let _ = uart_puts_bounded("us (worst so far=");
+    let _ = uart_put_i64_bounded(mutex_handoff_worst_us_get() as i64);
+    let _ = uart_puts_bounded("us)\n");
+  }
   let _ = uart_puts_bounded("MUTEX-HIGH: acquired demo mutex\n");
   let _ = dhruva_mutex_unlock(0 as u32);
   let _ = uart_puts_bounded("MUTEX-HIGH: released demo mutex\n");
