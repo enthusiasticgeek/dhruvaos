@@ -337,6 +337,69 @@ doesn't yet attempt.
   allocations today. Per-task heap arenas would be a much larger
   redesign, out of scope here.
 
+- **No CPU-privilege-level separation between tasks and the kernel**
+  (task #253, investigated 2026-09-18, deliberately NOT implemented).
+  Every task runs in ARM SVC (privileged) mode today -- domain-based
+  isolation (round 192, above) restricts which MEMORY REGIONS a task
+  can reach, but nothing restricts which CPU INSTRUCTIONS it can
+  execute. A genuine USR-mode-tasks/SVC-mode-kernel split (the
+  standard textbook OS privilege boundary, enforced via a real SWI/SVC
+  syscall trap) is real, additional defense-in-depth beyond domain
+  isolation -- but building it from scratch here turned out to be a
+  substantially larger undertaking than initially scoped, confirmed by
+  reading the actual code rather than estimating:
+
+  1. **No syscall infrastructure exists at all.** `boot/rpi1/
+     vectors.S`'s own SWI vector points at `fault_swi`, a crash
+     handler -- identical treatment to the FIQ vector task #246 found
+     unused. A real syscall path needs a working SWI handler, a
+     defined ABI (argument marshaling, syscall numbering), and
+     per-task DUAL stacks (ARM banks `sp`/`lr` per mode, so a task
+     needs both a USR-mode stack for normal execution and an SVC-mode
+     stack for the kernel side of each syscall) -- none of which exist
+     today.
+  2. **The real privileged surface is narrower than raw MMIO-call
+     count suggests, a genuine finding worth recording.** 205 direct
+     `mmio_*` call sites exist in `kernel_main.vani` -- but ordinary
+     peripheral MMIO access doesn't strictly require CPU privilege
+     mode on ARM, only that the target memory region be mapped with
+     appropriate access permissions (a real MPU/domain-based scheme,
+     matching how FreeRTOS-MPU/Zephyr allow direct peripheral access
+     from unprivileged threads). What genuinely DOES need a syscall
+     boundary is the scheduler/synchronization primitive family --
+     `task_sleep_ticks`/`dhruva_mutex_lock`/`_unlock`/`dhruva_prio_
+     lock`/`_unlock`/`task_create` -- confirmed at 65 real call sites
+     project-wide. Every genuinely privileged CPU-control-register
+     operation (DACR/SCTLR/cache control) already lives exclusively in
+     `context_switch.S`/`mmu_init.S`'s own extern "C" functions, never
+     inlined into ordinary task-level vani code -- meaning task bodies
+     never touch privileged instructions directly today, only through
+     these ~65 call sites, a real, bounded, much smaller conversion
+     surface than "205 MMIO sites" would suggest.
+  3. **Even with that narrower scope, this is still the single
+     highest-risk item in this entire audit pass.** It needs new
+     vector-table/mode-switch/banked-register code (exactly the class
+     this project has repeatedly gotten wrong on a first attempt --
+     round 68's true-lr bug, `scheduler_pick_next`'s own documented
+     crash history, and this same session's own subagent incident:
+     unverified assembly in the IRQ-return path, found broken,
+     reverted) interacting with the EXISTING priority-ceiling,
+     priority-inheritance, and domain-isolation machinery under a
+     fundamentally new privilege-transition model those subsystems
+     were never designed against -- and there is no real Pi 1B
+     hardware available in this environment to validate the result,
+     nor confidence that QEMU's own mode-switch/SWI emulation fidelity
+     would make a "passes under QEMU" claim trustworthy even if
+     attempted (the same caution task #246's own FIQ finding already
+     applied).
+
+  Documented and scoped, not attempted, matching this same pass's own
+  established precedent (task #246's FIQ finding, task #247's tickless
+  finding) for real-hardware-dependent, high-blast-radius risk. The
+  narrower real privileged surface (65 scheduler-primitive call sites,
+  not 205 MMIO ones) is the concrete, useful starting point for
+  whoever picks this up with real hardware access.
+
 ## 4. Timing analysis / determinism gaps
 
 - **`#[bounded_stack]`/`#[wcet]` are compile-time-only.** They produce a

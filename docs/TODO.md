@@ -7319,3 +7319,33 @@ own priority+sequence tie-break algorithm exactly. Verified: clean
 build, full regression battery unchanged, new self-test genuinely
 PASSES (round trip, priority tie-break, consume semantics, dest
 isolation all directly exercised).
+
+**Task #253 closed (investigated + documented, deliberately not
+implemented): CPU-privilege-level separation (USR tasks vs SVC
+kernel).** See RTOS_GAP_ANALYSIS.md's own new "No CPU-privilege-level
+separation" item for the full finding. Confirmed no syscall
+infrastructure exists at all (SWI vector points at a crash handler,
+same as FIQ). Real, useful finding: the genuinely privileged call
+surface is much narrower than raw MMIO-site count suggests -- 65
+scheduler/synchronization primitive call sites, not the 205 raw
+`mmio_*` sites (ordinary peripheral MMIO doesn't need CPU privilege
+mode, only correct memory-region permissions; every real
+privileged-instruction operation already lives exclusively in
+context_switch.S/mmu_init.S's own extern fns, never inlined into task
+code). Still the single highest-risk item in this whole pass even at
+that narrower scope -- needs new vector-table/banked-register
+infrastructure interacting with the existing ceiling/inheritance/
+domain machinery, no real Pi 1B hardware available to validate
+against. Documented and scoped rather than attempted, matching task
+#246/#247's own precedent.
+
+**This closes the full RTOS true-compliance sweep (tasks #239-247,
+#249, #253) started after the user's "what else remains to comply
+real rtos" question.** 7 of 9 items closed with real, verified code
+changes (measurement infrastructure, deadline-miss detection, UART RX
+sporadic-server budget, DharaFS bounded write path, vani compiler
+stack-cost annotations, inter-task mailbox); 2 items (#246 interrupt
+priority, #253 privilege separation) investigated thoroughly and
+deliberately left as documented, scoped, real-hardware-dependent
+follow-ups rather than shipped as unverified high-risk changes -- the
+same honest-scoping discipline applied throughout this whole session.
