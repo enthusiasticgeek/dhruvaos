@@ -7208,3 +7208,16 @@ by LOW's sub-tick ceiling-0 section, never a full tick). The detector
 itself was not verified firing on a genuine miss because this demo set
 doesn't produce one to observe; that remains true until a real
 workload with tighter margins exists.
+
+**Task #242 closed: sporadic-server budget for UART RX.** Commit
+`7aa5e42`. See the commit's own message for the full design (new
+`boot/uart_rx_budget_state.S`, a per-tick budget checked in
+`irq_dispatch`'s own RX branch, masking `UART_IMSC` rather than
+"defer without masking" specifically to avoid a real livelock risk
+from the PL011's level-triggered RX interrupt). Directly verified: a
+real command's own budget consumption observed (3/4 remaining after
+one line), no disruption to normal interactive use across the full
+regression battery. Honest limitation: the defer/mask path itself
+(triggered only by a burst exceeding 512 bytes within one 500ms tick)
+was not exercised -- not attempted given this codebase's own
+well-documented SETTLE_S timing fragility.
