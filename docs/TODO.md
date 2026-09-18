@@ -7272,3 +7272,24 @@ Honest scope note, not closed here: DhruvaOS's own real extern fns
 (`dhruva_mutex_lock`, `task_sleep_ticks`, etc.) are not yet annotated
 with real measured `#[stack_cost(...)]` values -- that real-
 measurement-plus-annotation pass is a genuine, natural follow-up.
+
+**Task #246 closed (re-audited + documented, deliberately not
+implemented): real interrupt-priority scheme.** Re-read `irq_dispatch`
+directly rather than trusting the gap item's own prior wording:
+timer-tick handling already runs FIRST, unconditionally, before the
+UART RX branch even reads its own pending register -- a real (if
+implicit) prioritization that already existed, and combined with task
+#242's own new UART RX budget, the practical starvation risk is real
+but small, not the open-ended gap originally described. The one
+genuine remaining option -- routing the timer tick to FIQ, the only
+real hardware priority mechanism BCM2835 offers -- is documented in
+full in RTOS_GAP_ANALYSIS.md (including why it's the technically
+correct design) but deliberately NOT implemented: it needs new
+banked-register save/restore and a parallel entry path independent of
+existing IRQ entry, exactly the vector-table/context-save code class
+this project has repeatedly gotten wrong on a first attempt (including
+this same session's own subagent incident), and QEMU's own FIQ
+emulation fidelity for this machine is unverified -- matches this
+project's own established precedent for real-hardware-dependent risk
+(Pi 4/5 "ON HOLD, no real HW planned") rather than shipping an
+unverified exception-vector change.

@@ -157,16 +157,48 @@ doesn't yet attempt.
 
 ## 2. Interrupt handling gaps
 
-- **One flat interrupt priority level.** `irq_dispatch` (`kernel_main.vani`)
-  checks the timer-tick pending bit, then the UART RX pending bit, in a
-  single non-nested, non-prioritized sequence — confirmed by reading the
-  function directly. There is no interrupt controller priority scheme: a
-  lower-importance interrupt source can never be preempted by a
-  higher-importance one arriving mid-handler, because there is only one
-  handler and it runs to completion regardless of what arrives next. A true
-  RTOS on real hardware with a real interrupt controller (BCM2835's own is
-  more capable than what's wired up here) would assign interrupt priorities
-  that mirror task priorities.
+- **One flat interrupt priority level, re-audited 2026-09-18 (task
+  #246) with a real, narrower, more honest finding than the original
+  wording above.** `irq_dispatch` (`kernel_main.vani`) checks the
+  timer-tick pending bit, then the UART RX pending bit, in a single
+  non-nested sequence — confirmed by reading the function directly,
+  still true. But "non-prioritized" overstates it: the timer branch
+  runs FIRST, unconditionally, in every single dispatch, before the
+  UART branch even reads its own pending register -- so timer-tick
+  handling (the single most schedule-critical interrupt in this
+  system) is NEVER delayed by UART RX servicing within one entry, a
+  real (if implicit, code-order-only) prioritization that already
+  existed. Combined with task #242's own new sporadic-server budget
+  (UART RX servicing per tick is now capped at ~512 bytes of MMIO
+  work, no longer unbounded), the practical starvation risk this item
+  originally worried about is real but SMALL today, not the open-ended
+  gap the original wording implied.
+
+  **What's genuinely still missing, and why it's documented rather
+  than attempted here**: true PREEMPTIVE interrupt priority -- a
+  higher-priority source interrupting a lower one that's ALREADY
+  mid-service, not just going first when both are pending at entry.
+  BCM2835 has exactly one real hardware mechanism for this: routing a
+  single source to FIQ (a genuinely separate ARM exception vector with
+  its own banked registers, unmasked-by-default relative to IRQ) --
+  confirmed unused today, `boot/rpi1/vectors.S`'s own FIQ vector
+  points at `fault_fiq`, a crash handler, not a real handler. Routing
+  the timer tick to FIQ (the standard RTOS pattern -- reserve FIQ for
+  the single most timing-critical source) is the real, correct design
+  for this SoC, not a software workaround. Deliberately NOT
+  implemented in this pass: it needs new banked-register save/restore
+  and a parallel entry path completely independent of the existing
+  IRQ entry -- exactly the class of vector-table/context-save code
+  this project has repeatedly gotten wrong on a first attempt (round
+  68's true-lr bug, `scheduler_pick_next`'s own documented crash
+  history, and this same session's own incident: unverified assembly
+  written directly into the IRQ-return path by a subagent, found
+  broken, reverted) -- and QEMU's own FIQ emulation fidelity for this
+  machine model is unverified, so "tested under QEMU" wouldn't be a
+  trustworthy claim here even if attempted. Matches this project's own
+  established precedent for real-hardware-dependent risk (Pi 4/5 work
+  "ON HOLD, no real HW planned") rather than shipping an unverified
+  exception-vector change.
 - **No measured/bounded worst-case interrupt latency.** Nothing in this
   project computes or asserts "an interrupt is serviced within N cycles of
   assertion, worst case."
@@ -484,9 +516,13 @@ doesn't yet attempt.
    task #247 (tickless redesign, sequenced after #243 since both attack
    the same problem and #243's measurements inform whether tickless is
    worth the larger redesign cost).
-8. A real interrupt-priority scheme (needs BCM2835's fuller interrupt
+8. ~~A real interrupt-priority scheme (needs BCM2835's fuller interrupt
    controller capability wired up, not just the two pending-bit checks used
-   today) — task #246.
+   today)~~ **`[RE-AUDITED, 2026-09-18]`** — task #246, see "Interrupt
+   handling gaps" above for the full finding: narrower than originally
+   scoped, and the one real remaining option (FIQ for the timer tick)
+   deliberately documented rather than implemented without real-HW
+   validation.
 9. ~~Formal schedulability analysis tooling (utilization bound / response-time
    analysis) over the declared task set.~~ **`[DONE, tool: round 190;
    applied to DhruvaOS's own real task set: Gap C/226, 2026-09-17]`** —
