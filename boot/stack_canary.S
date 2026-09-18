@@ -1,31 +1,46 @@
 /* Dhruva -- per-task stack overflow canary (ARM32).
  *
- * This project's task stacks are plain sequential dhruva_alloc_bytes
- * heap allocations with no MMU guard page between them. The current
- * MMU setup (mmu_init.S) only has 1MB SECTION granularity -- .data/
- * .bss/heap/every task stack all share ONE 1MB section with uniform
- * read+write permissions, so a real guard page would need second-
- * level 4KB page tables, which is out of scope here (flagged in
- * docs/TODO.md as real future work; see mmu_init.S's own header for
- * why the current table can't express anything finer than 1MB).
+ * HISTORICAL NOTE (this file predates round 76): this comment used to
+ * open by claiming task stacks had "no MMU guard page between them"
+ * and that a real one would need second-level 4KB page tables, "out
+ * of scope." That's no longer true and was left stale for a long time
+ * -- round 76 (mmu_init.S's own mmu_l2_table_data/mmu_guard_page_
+ * install) added exactly that second-level table and a real, zeroed
+ * (invalid-descriptor) guard page installed before every task's own
+ * stack, and round 192 extended it with full per-task ARMv6 domain
+ * isolation (mmu_l2_table_task_domains/mmu_guard_page_install_domain)
+ * so a task can't touch ANOTHER task's stack either, not just its own
+ * overflow. Every real task stack in this project (all 10, via
+ * dhruva_alloc_stack_domain in boot/rpi1/runtime_stubs.c) gets one.
+ * Live-verified via a real fault-injection boot (RTOS/DharaFS safety-
+ * certification audit, Gap A, 2026-09-17 -- see kernel_main.vani's own
+ * GUARD_PAGE_FAULT_INJECTION_TEST for the permanent, gated re-
+ * verification procedure): a deliberate write to a known guard-page
+ * address produced a real Data Abort, DFSR status 0b00111
+ * ("Translation fault, page"), at exactly the expected address.
  *
- * Without that, a task that overflows its own allocated stack today
- * silently corrupts whatever memory sits immediately below it (the
- * previous stack in allocation order) with NO detection at all --
- * until the corruption eventually manifests as an unrelated-looking
- * crash somewhere completely different, arbitrarily far downstream in
- * both time and call depth. That's exactly the failure mode this
- * file's own kernel_main.vani comments document hitting FOUR separate
- * times already (task_f round 9, task_e round 27, task_custom_demo
- * round 60, task_f again round 67 for tlsecho) -- each one only ever
- * "fixed" by empirically raising a real stack allocation past
- * whatever the static #[bounded_stack] checker (itself documented as
- * "a conservative estimator, not an exact analysis") claimed was
- * enough, with nothing structural added to catch the NEXT occurrence
- * early. This is that structural piece.
+ * So overflow IS now genuinely PREVENTED at the hardware level, not
+ * just detected after the fact -- this canary is a complementary,
+ * defense-in-depth layer, not the only protection: it catches the
+ * degenerate case where a single write leaps clean over an entire 4KB
+ * guard page in one access (a giant fixed-offset buffer overflow, not
+ * a normal frame-by-frame stack growth -- the guard page catches that
+ * case immediately, no canary needed), and it still gives a softer,
+ * logged "which task, which tick" diagnostic that a raw Data Abort
+ * halt-and-report alone doesn't provide as legibly. That's exactly the
+ * failure mode this file's own kernel_main.vani comments document
+ * hitting FOUR separate times already, all BEFORE round 76 existed
+ * (task_f round 9, task_e round 27, task_custom_demo round 60, task_f
+ * again round 67 for tlsecho) -- each one only ever "fixed" by
+ * empirically raising a real stack allocation past whatever the static
+ * #[bounded_stack] checker (itself documented as "a conservative
+ * estimator, not an exact analysis") claimed was enough. This canary
+ * was the first structural piece added to catch the next occurrence
+ * early; round 76/192 are the second, stronger piece (genuine
+ * prevention, not just detection) -- keep both, they cover different
+ * failure shapes.
  *
- * Doesn't PREVENT overflow (only a real guard page could) -- it
- * plants a known sentinel word at the very base (lowest address, the
+ * Plants a known sentinel word at the very base (lowest address, the
  * first byte a full-descending stack's overflow would reach) of every
  * task's stack at boot, and gives irq_dispatch a cheap, O(task count)
  * way to check all of them once per real timer tick (the same ~500ms

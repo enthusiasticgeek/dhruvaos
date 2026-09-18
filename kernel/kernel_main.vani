@@ -3000,6 +3000,16 @@ fn timer_ic_init() -> i64 {
 // accidental writes.
 const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 0;
 
+// ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, Gap A):
+// same gating pattern as WATCHDOG_ENABLE_FOR_REAL_HARDWARE above, for
+// a completely different reason -- this one can't safely run during
+// ANY normal boot (it deliberately triggers a real, unrecoverable
+// hardware fault to prove the round-76/192 stack guard-page mechanism
+// still works), not a real-vs-QEMU distinction. See its own call site
+// (right before start_multitasking, the last thing kernel_main does)
+// for the full manual re-verification procedure.
+const GUARD_PAGE_FAULT_INJECTION_TEST: i64 = 0;
+
 fn watchdog_arm(timeout_ticks: u32) -> i64 {
   let pm_password: u32 = 0x5A000000 as u32;
   let pm_rstc: i64 = PM_RSTC;
@@ -8032,9 +8042,14 @@ fn irq_dispatch() -> i64 {
     // it eventually surfaces as an unrelated wild-pointer crash
     // arbitrarily far downstream, which is what made every one of this
     // bug class's four prior incidents (round 9, 27, 60, 67) so hard to
-    // diagnose. Not a fix for the overflow itself -- see that file's
-    // comment for why a real MMU guard page isn't possible yet at this
-    // project's current 1MB section granularity.
+    // diagnose. A complementary, defense-in-depth layer alongside the
+    // real MMU guard pages every task stack now has (round 76/192,
+    // see stack_canary.S's own header for the full story and Gap A's
+    // 2026-09-17 live-verified fault-injection confirmation) -- this
+    // canary catches the rare "single write leaps clean over an entire
+    // 4KB guard page" case and gives a softer, per-task/per-tick
+    // diagnostic; the guard pages themselves are what genuinely
+    // PREVENT overflow now, not just detect it.
     //
     // ROUND 2026-09-17: dacr_open_all() moved here from the top of
     // irq_dispatch (see this function's own entry comment) -- this is
@@ -34615,6 +34630,58 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("DHCP: client_start status=");
   let _ = uart_put_hex32(dhcp_boot_status as u32);
   let _ = uart_puts(" (0=DISCOVER sent, state=SELECTING)\n");
+
+  // ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, Gap A):
+  // real 4KB MMU guard pages already exist (round 76's mmu_guard_
+  // page_install, extended by round 192's per-task domain version) --
+  // this audit's own earlier "overflow detected not prevented" Phase 4
+  // finding was WRONG, sourced from stack_canary.S's own stale header
+  // comment (written before round 76 existed) without cross-checking
+  // mmu_init.S's actual current state. The mechanism genuinely
+  // prevents overflow via a real hardware fault (a ZEROED, invalid L2
+  // small-page descriptor -- faults on the translation-table walk
+  // itself, before AP/APX or domain checks even run, per mmu_guard_
+  // page_install_domain's own comment in mmu_init.S). What WAS
+  // missing: round 76/192's own original verification was a temporary,
+  // one-off self-test used during initial development then removed
+  // (confirmed -- no permanent guard-page fault-injection test exists
+  // anywhere in this file today), so nothing has re-proven this
+  // mechanism still works on every later change since. This closes
+  // that gap: a PERMANENT, gated (off by default) re-verification,
+  // matching WATCHDOG_ENABLE_FOR_REAL_HARDWARE's own established
+  // pattern for something that can't safely run during every ordinary
+  // boot. This one deliberately CANNOT be a normal always-on self-test
+  // like every other one in this file -- unlike a QEMU-based watchdog
+  // arm (which just resets the emulated machine), a real fault here
+  // hits this project's own abort handlers, which report the fault
+  // then halt forever (`b .`, no recovery path -- see boot/rpi1/
+  // vectors.S's own fault_data_abort) -- exactly the expected, correct
+  // outcome for THIS test, but it means the system can never continue
+  // to normal task scheduling afterward, so it has to be the literal
+  // last thing kernel_main does, gated off by default so it never
+  // interferes with phase4_milestone.py or any other regression run.
+  //
+  // Deliberately targets stack_a's own guard page (task_index=0,
+  // domain 1, guard address 0x00A00000 -- see dhruva_alloc_stack_
+  // domain's own comment in runtime_stubs.c) rather than constructing
+  // a real stack-overflow scenario: a direct write to the KNOWN guard
+  // address exercises the exact same page-table mechanism a real
+  // overflow would trip, without needing to actually blow a task's
+  // real stack (which would also work, but is a less precise, harder
+  // to reason about test of the same underlying invariant). To
+  // re-verify by hand: flip GUARD_PAGE_FAULT_INJECTION_TEST to 1,
+  // rebuild, boot under QEMU, and confirm the UART log shows the
+  // "about to write" line immediately followed by this file's own
+  // abort_report_data output with a Translation Fault status (DFSR
+  // bits[4:0]=0b00111, "translation fault, page" -- confirmed live at
+  // status=00000817 the first time this was run) and address==
+  // 0x00A00000 -- then flip it back to 0 before committing, since this
+  // build can never reach normal task scheduling.
+  if GUARD_PAGE_FAULT_INJECTION_TEST == 1 {
+    let _ = uart_puts("GUARD PAGE TEST: about to write to stack_a's own guard page at 0x00A00000 -- expect a real Data Abort (Translation Fault) + halt, no recovery\n");
+    let _ = mmio_write_u32(0x00A00000, 0xDEADBEEF as u32);
+    let _ = uart_puts("GUARD PAGE TEST: FAIL -- the write above did NOT fault, guard page protection is NOT working\n");
+  }
 
   // watchdog_init() would belong here, right before handing off to the
   // scheduler -- see watchdog_arm's comment for why it isn't actually
