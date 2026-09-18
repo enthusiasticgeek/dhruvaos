@@ -19588,6 +19588,17 @@ fn task_e() -> i64 {
     // gives any future round real evidence this lock is actually
     // engaging, not silently a no-op if e.g. a future refactor ever
     // reordered these calls relative to the DharaFS work they guard.
+    //
+    // ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit,
+    // gap #237): TIMER_CLO-bracketed, every real pass -- closes the
+    // "GC's own ceiling-2 critical section duration was not measured"
+    // gap the audit's own schedulability analysis flagged (this is the
+    // one thing that COULD block LOW via the tie-break rule: LOW's own
+    // true priority, 2, exactly matches this ceiling). A live,
+    // continuous measurement across every real compaction pass for
+    // the rest of this boot, not a one-shot self-test -- shows real
+    // variance across a live boot instead of a single sample.
+    let gc_dharafs_t0: u32 = mmio_read_u32(TIMER_CLO);
     let _ = uart_puts("GC: entering DharaFS critical section, eff_prio=");
     let _ = uart_put_hex32(current_eff_prio());
     let _ = uart_puts("\n");
@@ -19596,10 +19607,13 @@ fn task_e() -> i64 {
     let _ = uart_puts("GC: compaction pass, /config/mode = \"");
     let _ = dharafs_print_data(gc_buf, gc_mode_len);
     let _ = uart_puts("\"\n");
+    let gc_dharafs_t1: u32 = mmio_read_u32(TIMER_CLO);
     let _ = dhruva_prio_unlock(3);
     let _ = uart_puts("GC: left DharaFS critical section, eff_prio=");
     let _ = uart_put_hex32(current_eff_prio());
-    let _ = uart_puts("\n");
+    let _ = uart_puts(" WCET DIAG: real critical-section duration=");
+    let _ = uart_put_i64((gc_dharafs_t1 - gc_dharafs_t0) as i64);
+    let _ = uart_puts("us\n");
     // Round 182, re-tested after fixing the real root cause (DWC2
     // channel-0 CHENA wedge, see dwc2_net_bulk_in's own comment): with
     // that bug fixed, task_e's own dhcp_client_poll and sshd's own
@@ -19611,9 +19625,24 @@ fn task_e() -> i64 {
     // this same lock couldn't actually exercise (every poll was
     // already broken by the CHENA wedge regardless of locking). Same
     // ceiling=2/base=3 convention as the DharaFS lock just above.
+    // ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, gap
+    // #237/follow-up to the WiFi/BLE WCET finding): this critical
+    // section, unlike the DharaFS one above, calls into the real netif
+    // receive path (dhcp_client_poll -> netif_recv_frame ->
+    // dwc2_net_bulk_in -> dwc2_wait_chan0_done) -- the exact same
+    // polling primitive this audit measured at up to 325620us (~325ms)
+    // worst case with no USB device responding. Measured here too,
+    // live, every real pass, rather than assumed identical to the
+    // DharaFS section above -- they're genuinely different workloads
+    // under the same ceiling.
+    let gc_dhcp_t0: u32 = mmio_read_u32(TIMER_CLO);
     let _ = dhruva_prio_lock(2);
     let _ = dhcp_client_poll(dhcp_my_mac);
     let _ = dhruva_prio_unlock(3);
+    let gc_dhcp_t1: u32 = mmio_read_u32(TIMER_CLO);
+    let _ = uart_puts("GC: DHCP poll critical section WCET DIAG: real duration=");
+    let _ = uart_put_i64((gc_dhcp_t1 - gc_dhcp_t0) as i64);
+    let _ = uart_puts("us\n");
   }
   return 0;
 }

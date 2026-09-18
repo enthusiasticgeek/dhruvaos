@@ -288,12 +288,47 @@ def dhruvaos_demo_task_set_analysis() -> int:
     (the 50ms critical section) keeps the real demo task set
     schedulable against its own real periods (task_sleep_ticks counts x
     scheduler_tick_interval_us = 500ms/tick) -- it does, comfortably,
-    but the margin is worth seeing in real numbers, not just asserted."""
+    but the margin is worth seeing in real numbers, not just asserted.
+
+    ROUND 2026-09-17 follow-up (gap #237): LOW's own B_LOW was
+    previously left at 0 with an explicit "unmeasured" caveat -- GC
+    (task_e) holds TWO separate ceiling-2 critical sections (DharaFS
+    compaction, and a dhcp_client_poll that reaches into the real netif
+    receive path), and LOW's own true priority (2) exactly matches that
+    ceiling, so scheduler_pick_next's own tie-break rule (ties favor the
+    incumbent when the incumbent is ceiling-boosted) means LOW genuinely
+    CAN be blocked by whichever one GC happens to be running. Both are
+    now measured live, every real pass, via kernel_main.vani's own
+    task_e print lines: DharaFS compaction measured 5741-7689us across
+    10 real passes in one test run (consistently small); the DHCP poll
+    measured mostly 12-478us under HEALTHY conditions (a working
+    virtual network, lease already held) -- but that poll's own real
+    worst case is NOT the healthy-path number: it calls into
+    dwc2_wait_chan0_done, the SAME USB polling primitive measured
+    elsewhere at up to 325620us (~325ms) if the link genuinely stalls.
+    A rigorous WCET bound has to assume the pessimistic case can
+    happen, not just what one test run observed -- so B_LOW uses that
+    worst-case figure, not the smaller healthy-path average, exactly
+    the same "don't trust the optimistic number" discipline this
+    audit's own delay()/dwc2 measurements were built on in the first
+    place."""
     MS = 1.0  # working in milliseconds throughout
     TICK_MS = 500.0  # scheduler_tick_interval_us() = 500000us = 500ms
 
     measured_low_critical_section_ms = 49.906  # delay(3000000), TIMER_CLO-measured
     other_body_estimate_ms = 5.0  # conservative, NOT independently measured
+    # GC's own two ceiling-2 critical sections -- see this function's
+    # own header for why the DHCP-poll one uses the dwc2 WORST CASE
+    # (325.62ms), not the smaller healthy-path figure actually observed
+    # (12-478us across 10 real passes in one test run). B_LOW is the
+    # larger of the two -- LOW blocks on whichever one is in progress
+    # when it becomes ready, not both at once (they're separated by a
+    # real dhruva_prio_unlock(3)/dhruva_prio_lock(2) pair in task_e's
+    # own body, a genuine window where LOW, at priority 2, can preempt
+    # GC back at its own true priority 3 normally).
+    gc_dharafs_critical_section_ms = 7.689  # measured max, 10 real passes
+    gc_dhcp_poll_worst_case_ms = 325.62  # dwc2_wait_chan0_done's own worst case
+    gc_worst_blocking_ms = max(gc_dharafs_critical_section_ms, gc_dhcp_poll_worst_case_ms)
 
     tasks = [
         # HIGH (task_a): sleeps 3 ticks, priority 0. Own body has no
@@ -301,23 +336,24 @@ def dhruvaos_demo_task_set_analysis() -> int:
         # Blocked by LOW's ceiling-0 critical section whenever it lands
         # inside one (ties favor the incumbent at equal boosted
         # priority -- see context_switch.S's own scheduler_pick_next
-        # comment).
+        # comment). NOT blocked by GC's own ceiling-2 sections -- 0 < 2,
+        # HIGH preempts a ceiling-2-boosted task outright, no tie-break
+        # needed.
         Task("HIGH", priority=0, period=3 * TICK_MS, wcet=other_body_estimate_ms,
              blocking=measured_low_critical_section_ms),
-        # MEDIUM (task_b): sleeps 1 tick, priority 1. Same blocking
-        # exposure as HIGH -- LOW's ceiling-0 boost outranks MEDIUM's
-        # own priority 1 outright, no tie-break needed.
+        # MEDIUM (task_b): sleeps 1 tick, priority 1. Same reasoning as
+        # HIGH -- blocked by LOW's ceiling-0 section, not by GC's
+        # ceiling-2 ones (1 < 2).
         Task("MEDIUM", priority=1, period=1 * TICK_MS, wcet=other_body_estimate_ms,
              blocking=measured_low_critical_section_ms),
         # LOW (task_c): sleeps 2 ticks, priority 2. Its own WCET
         # includes the real measured critical section (it's the one
-        # DOING the delay, not waiting on someone else's). Not blocked
-        # by anything at its own priority or below in THIS task set
-        # (GC's own ceiling-2 ARDF/compaction lock is a separate,
-        # unmeasured question -- see this function's own caller for why
-        # that's flagged as a follow-up, not silently assumed zero).
+        # DOING the delay, not waiting on someone else's). Now also
+        # carries GC's own worst-case blocking term (see this
+        # function's own header) -- the gap this round closes.
         Task("LOW", priority=2, period=2 * TICK_MS,
-             wcet=other_body_estimate_ms + measured_low_critical_section_ms),
+             wcet=other_body_estimate_ms + measured_low_critical_section_ms,
+             blocking=gc_worst_blocking_ms),
     ]
 
     print("DhruvaOS demo task set (HIGH/MEDIUM/LOW) -- real measured blocking term:")
@@ -345,12 +381,12 @@ def dhruvaos_demo_task_set_analysis() -> int:
     if all_ok:
         print("VERDICT: schedulable with real measured blocking data, comfortable margin.")
         print("CAVEAT: 'other_body_estimate_ms' (5ms/task) is a conservative round-up,")
-        print("not independently measured to the same rigor as the 50ms figure -- and")
-        print("GC (task_e)'s own ceiling-2 critical section duration was not measured")
-        print("in this pass (out of scope: it can't block HIGH/MEDIUM at ceiling 2 < their")
-        print("own priority, but COULD block LOW via the tie-break rule -- a real follow-up,")
-        print("not assumed away). Re-run with real numbers before trusting this for any")
-        print("actual production workload, not just this demonstration task set.")
+        print("not independently measured to the same rigor as the other figures. LOW's own")
+        print(f"B_LOW ({gc_worst_blocking_ms:.3f}ms) now uses GC's real measured worst case")
+        print("(the dwc2 USB-poll timeout, not the smaller healthy-path figure actually")
+        print("observed across 10 real test passes -- a rigorous bound has to assume the")
+        print("pessimistic case can happen). Re-run with real numbers before trusting this")
+        print("for any actual production workload, not just this demonstration task set.")
         return 0
     else:
         print("VERDICT: NOT schedulable with real measured blocking data.")

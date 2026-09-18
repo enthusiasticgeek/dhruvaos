@@ -6614,3 +6614,38 @@ demo_task_set_analysis()` applied to LOW's 50ms term. Verified: clean
 build, new self-test prints the real number live, full
 `phase4_milestone.py` regression battery unchanged, no new
 regressions.
+
+### Gap E closed: GC's own critical section duration measured (2026-09-17)
+
+Closes the schedulability analysis's own explicitly-flagged caveat
+("GC's own ceiling-2 critical section duration was not measured").
+`task_e` (GC) holds TWO separate ceiling-2 critical sections, now both
+measured live, every real pass, via new `TIMER_CLO`-bracketed prints
+in `kernel_main.vani`'s own task_e body (not a one-shot self-test --
+shows real variance across a live boot):
+
+- **DharaFS compaction pass**: 5741-7689us across 10 real passes in
+  one test run -- consistently small, nowhere close to threatening
+  anything.
+- **`dhcp_client_poll`**: mostly 12-478us under HEALTHY conditions (a
+  working virtual network, lease already held) -- but this poll calls
+  into `netif_recv_frame` -> `dwc2_net_bulk_in` -> `dwc2_wait_chan0_
+  done`, the SAME USB polling primitive measured elsewhere at up to
+  325620us (~325ms) worst case if the link genuinely stalls. Using the
+  smaller healthy-path number here would NOT be a rigorous WCET bound
+  -- a real bound has to assume the pessimistic case can happen, so
+  `schedulability_analysis.py`'s own `dhruvaos_demo_task_set_analysis`
+  now sets LOW's `B_LOW` to the dwc2 worst case (325.62ms), not the
+  observed average, and re-derives the verdict from that honest number.
+
+**LOW's own true priority (2) exactly matches GC's ceiling boost (2)**,
+so `scheduler_pick_next`'s own tie-break rule (ties favor the
+incumbent when it's ceiling-boosted) means LOW genuinely CAN be
+blocked by whichever GC-held critical section is in progress -- this
+was the real mechanism the original caveat was pointing at, now
+quantified rather than left as an open question. **Verdict, even with
+the honest worst-case number: LOW is still schedulable** -- R=390.526ms
+<= D=1000ms, 609ms margin. Verified: clean build, real live
+measurements captured across 10 passes in one run, full
+`phase4_milestone.py` regression battery unchanged, no new
+regressions.
