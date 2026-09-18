@@ -6869,3 +6869,57 @@ substantial enough (new ARMv6 page-table engineering, a function with
 documented unresolved crash history, a separate compiler-correctness
 audit) to warrant its own focused pass rather than being squeezed in
 here.
+
+### Gap B closed: safe shadow-model self-test for scheduler_pick_next (2026-09-18)
+
+`scheduler_pick_next`'s own header comment documents a real, never-
+fully-root-caused crash from a previous test attempt (round 75): an
+AAPCS r4-r7 clobber got fixed with a save/restore wrapper, but a
+second, deeper crash remained -- a wild SP jump ~200KB out, inside the
+wrapper's own return path -- that never reproduced with the fix in
+place, root cause unresolved despite extensive live tracing. That
+function's own explicit warning: calling it (or any wrapper around it)
+from vani-compiled code is the first suspect if this recurs, don't
+assume a simple wrapper is sufficient.
+
+**The approach that avoids this entirely**: an independent, side-
+effect-free reimplementation of `scheduler_pick_next`'s own decision
+algorithm -- both the ceiling tie-break branch and the round-robin-
+with-aging branch, mirroring `context_switch.S` line for line -- that
+never calls the real function or touches its internal state at all.
+Reads the same input tables via five new plain read-only accessors
+(`eff_prio_table_get_at` and four others). Verification happens
+entirely by observation: comparing the model's own prediction against
+what `current_task_get()`/`context_switch_count_get()` (both pre-
+existing, already-safe accessors) show the real scheduler actually
+did. Wired into `irq_dispatch`'s own top, which runs on every IRQ --
+matching exactly how often `scheduler_pick_next` itself runs (not just
+real timer ticks, confirmed via this same audit's own DACR
+investigation).
+
+A genuine race is handled honestly, not ignored: a task calling
+`task_sleep_ticks`/`dhruva_mutex_unlock` directly also invokes
+`scheduler_pick_next` outside the IRQ path, which could happen between
+one prediction and the next check. `context_switch_count`'s own delta
+since the prediction was made detects this (more than one real switch
+happened) and the comparison is skipped that round rather than risking
+a false mismatch report.
+
+Found a real assembler error along the way (not a logic bug): an
+initial `0xFFFFFFFF` sentinel value in a `.bss`-section word --
+`.bss` can only zero-initialize. Redesigned around a separate, zero-
+initialized "prediction valid" flag instead, which also removes the
+ambiguity a magic sentinel would have had with task index 0 (`task_a`)
+being a genuinely valid prediction.
+
+**Verified**: clean build (`irq_dispatch`'s existing
+`#[wcet(cycles=130000)]` budget absorbed the new per-IRQ work without
+needing to be raised), full `phase4_milestone.py` regression battery
+unchanged (same 4-FAIL baseline), and -- the actual point of this
+test -- **zero `SCHED SHADOW MISMATCH` reports across the entire
+regression run**: the independent model agreed with the real live
+scheduler on every single decision it made. A nonzero count going
+forward (surfaced immediately via a bounded diagnostic print, and
+summarized in the `diagnose` shell command's own output) is a genuine
+finding worth investigating, not something silently tolerated. Commit
+`3b15008`.
