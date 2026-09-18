@@ -7242,3 +7242,15 @@ scheduling. The tick period remains 500ms; the real prerequisite for
 a future attempt (the full constant-rescaling audit round 191 already
 scoped) is unchanged, now with a materially stronger evidence base for
 where to look first.
+
+**Task #244 closed: bounded-cost write path for DharaFS.** Commit
+`021bcb4`. See the commit's own message for the full design -- the
+real gap turned out narrower than RTOS_GAP_ANALYSIS.md's own original
+description ("scan the log, append, maybe compact"): `dharafs_append_
+raw` was already fully bounded, the actual unbounded cost lived in the
+public wrappers' own "preserve existing owner/mode" convenience lookup
+(a real, reachable dirindex-miss case, not hypothetical). New
+`dharafs_write_bounded` exposes the already-bounded primitive directly
+for real-time-critical callers. Verified: clean build, full regression
+battery unchanged, new self-test genuinely PASSES (round-trip data +
+explicit-metadata verification, not just wired in).

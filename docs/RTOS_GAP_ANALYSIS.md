@@ -376,11 +376,30 @@ doesn't yet attempt.
   `dharafs_*` call site is unaffected, so this doesn't retroactively
   make EVERY FS operation priority-ordered (a caller has to actually use
   the queue), which is the real remaining nuance, not "doesn't exist."
-- **No pre-reserved, guaranteed-bounded allocation path.** A hard-real-time
+- ~~**No pre-reserved, guaranteed-bounded allocation path.** A hard-real-time
   filesystem generally wants a worst-case-bounded write path (e.g.
   pre-committed block regions for known-critical writers), not the current
   "scan the log, append, maybe compact" model, whose per-operation cost can
-  vary with fragmentation and log state.
+  vary with fragmentation and log state.~~ **`[DONE, task #244, 2026-09-18]`**
+  -- narrower and more precisely locatable than this item's own original
+  description: `dharafs_append_raw` was ALREADY fully bounded (pure
+  sequential append, no scan) -- the real gap was that every PUBLIC
+  entry point (`dharafs_append`, `dharafs_write_raw_checked`) wrapped it
+  with a "preserve existing owner/mode" convenience lookup
+  (`dharafs_stat`) that falls through to a genuinely unbounded linear
+  scan on a directory-index miss (a real, reachable case: 256 fixed
+  slots, not unlimited). New `dharafs_write_bounded(path, data,
+  owner_uid, owner_gid, mode)` exposes the already-bounded primitive
+  directly, requiring explicit metadata instead of auto-preserving it --
+  real, provable cost: exactly `ceil(data_len/block_payload_cap)` SD
+  block WRITES, zero SD reads, independent of log size/fragmentation.
+  Verified by direct code inspection (the same discipline task #188's
+  own SD worst-case-latency contract used) plus a live round-trip +
+  explicit-metadata self-test (genuinely PASSES). Honest scope note:
+  this is NOT "pre-committed block regions" in the strongest sense some
+  hard-RT filesystems use (reserving specific blocks ahead of actual
+  need) -- it closes the practical, reachable unbounded-cost risk in the
+  existing write path, not a full pre-allocation redesign.
 - ~~**SD command-level timeouts exist but aren't tied into a documented
   worst-case latency contract.** `sdhost_cmd_timed_out` already detects a
   hung command at the hardware-register level — a real, existing building
@@ -479,9 +498,9 @@ gaps this document didn't previously name at all —
 13. Aperiodic/sporadic server budget for UART RX interrupt-triggered work
     (task #242) — currently unbudgeted against any task's own time
     allowance, a real gap in the schedulability model's own completeness.
-14. Pre-reserved bounded-allocation write path for DharaFS (task #244) —
-    see "DharaFS-specific gaps" above, item "No pre-reserved,
-    guaranteed-bounded allocation path."
+14. ~~Pre-reserved bounded-allocation write path for DharaFS (task #244)~~
+    **`[DONE, 2026-09-18]`** — see "DharaFS-specific gaps" above, item
+    "No pre-reserved, guaranteed-bounded allocation path."
 
 See `docs/TODO.md` for the items above that already have their own tracked
 entry (per-task histograms/deadline model, "why is my task late", FS
