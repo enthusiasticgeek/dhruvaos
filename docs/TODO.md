@@ -7293,3 +7293,18 @@ emulation fidelity for this machine is unverified -- matches this
 project's own established precedent for real-hardware-dependent risk
 (Pi 4/5 "ON HOLD, no real HW planned") rather than shipping an
 unverified exception-vector change.
+
+**Task #247 closed (evaluated + documented, deliberately not
+implemented): tickless scheduling design.** Evaluated directly against
+task #243's own fresh evidence rather than as an independent question:
+going tickless doesn't sidestep the real blocker #243 found (tick-
+count-expressed protocol durations like `tcp_rtx_timeout_ticks`/DHCP's
+`ticks_per_second`) -- it's the same underlying problem from a
+different angle, and making it genuinely correct (not just faster)
+needs migrating every one of those constants to real microseconds
+throughout, a larger, more invasive rewrite than the rescaling audit
+already scoped for the tick-based approach. Not well-motivated by the
+real demo workload either (comfortable schedulability margins at
+500ms, no live sub-tick control loop exists today). Documented in
+full in RTOS_GAP_ANALYSIS.md rather than attempted, matching task
+#246's own real-hardware-dependent-risk precedent.

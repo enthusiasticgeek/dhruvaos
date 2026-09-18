@@ -116,6 +116,52 @@ doesn't yet attempt.
   overhead," or accepting slower QEMU-based regression testing as a
   real tradeoff and adjusting the test harness's own timing budgets
   accordingly — neither attempted here.
+
+  **Re-attempted with the real cycle-counter measurement, task #243
+  (2026-09-18)**: the "real cycle counter" this item's own text called
+  for now exists (`irq_tick_worst_us`, TIMER_CLO-bracketed). Real
+  result: worst-case timer-tick IRQ dispatch cost measures 0us across
+  a live run — a genuine correction to the "DACR/MMIO trap overhead"
+  hypothesis above, which does NOT hold up under direct measurement. A
+  temporary, reverted 250ms experiment (2x, more conservative than
+  round 191's 5x jump) still reproduced the same class of cascading
+  SETTLE_S failure, confirming the effect is real but NOT caused by
+  per-tick dispatch cost — the evidence instead points at exactly what
+  this item's own round-191 paragraph already found and didn't fully
+  chase down: `tcp_rtx_timeout_ticks`/DHCP's own `ticks_per_second`
+  express real-time durations as raw tick counts, so a faster tick
+  silently changes real protocol timing, not just scheduling. Tick
+  period unchanged (500ms); the real prerequisite is the same
+  constant-rescaling audit round 191 already scoped, now with a
+  materially stronger evidence base for where to look first.
+
+  **Tickless design evaluated on this same evidence, task #247
+  (2026-09-18), deliberately NOT implemented**: going tickless doesn't
+  sidestep the real blocker task #243 just found -- it's the SAME
+  underlying problem from a different angle. A tickless (timer-
+  reprogrammed-for-the-next-actual-deadline) design still needs a
+  time base every tick-count-expressed duration in this codebase can
+  be measured against consistently; the moment `tcp_rtx_timeout_ticks`
+  or DHCP's `ticks_per_second` exist as *tick counts* rather than
+  continuous durations, "when is the next real deadline" is ambiguous
+  without first deciding what a tick even means once ticks stop being
+  periodic. Migrating every one of those constants to real
+  microseconds throughout (the only way to make tickless genuinely
+  correct, not just faster) is a substantially larger, more invasive
+  rewrite than the rescaling audit round 191/243 already scoped for
+  the tick-based approach — touching the same fragile timer/interrupt
+  code class that has now caused two real, confirmed regressions this
+  session alone (round 191's own revert, task #243's own reproduced
+  250ms cascade), with no real Pi 1B hardware available in this
+  environment to validate the result against. Not well-motivated by
+  this project's own actual workload either: the real demo task set's
+  own schedulability analysis (task #226/240) shows comfortable
+  margins at 500ms (440ms-1445ms slack) — there is no live control
+  loop today that needs sub-tick timing DhruvaOS doesn't already have.
+  Documented and scoped rather than attempted, matching this project's
+  own precedent for real-hardware-dependent, high-blast-radius risk
+  (task #246's own FIQ finding, Pi 4/5 work "ON HOLD, no real HW
+  planned").
 - ~~**No formal schedulability analysis.** Priorities are hand-assigned;
   there is no tool computing a utilization bound (rate-monotonic) or
   running a response-time analysis across the declared task set's
@@ -510,12 +556,13 @@ doesn't yet attempt.
    histogram/deadline-model TODO item.
 
 **Phase C — larger, some blocked on real hardware or real workloads:**
-7. ~~Tickless or higher-resolution timer.~~ Split into two tracked items,
-   task #243 (re-attempt a finer periodic tick, now that Gap-audit's DACR
-   follow-up narrowed one contributing QEMU-trap-overhead source) and
-   task #247 (tickless redesign, sequenced after #243 since both attack
-   the same problem and #243's measurements inform whether tickless is
-   worth the larger redesign cost).
+7. ~~Tickless or higher-resolution timer.~~ **`[BOTH RESOLVED, 2026-09-
+   18, neither implemented]`** — split into task #243 (re-attempted with
+   real measurement: per-tick dispatch cost is negligible, tick period
+   unchanged, real cause is tick-count-expressed protocol durations) and
+   task #247 (tickless evaluated on that same evidence and deliberately
+   not implemented — see "500ms tick granularity" above for the full
+   finding on both).
 8. ~~A real interrupt-priority scheme (needs BCM2835's fuller interrupt
    controller capability wired up, not just the two pending-bit checks used
    today)~~ **`[RE-AUDITED, 2026-09-18]`** — task #246, see "Interrupt
