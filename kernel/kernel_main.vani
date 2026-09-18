@@ -1733,6 +1733,25 @@ fn dwc2_wait_chan0_done_wcet_measure_self_test() -> i64 {
   return 0;
 }
 
+// ROUND 2026-09-17 (Gap F): same real-measurement discipline as the
+// self-test just above, applied to dwc2_wait_chan0_done_bounded's own
+// NET_BULK_IN_POLL_CAP -- feeds directly into task_e's own DHCP-poll
+// critical-section bound and ssh_real_accept/_deliver_one_frame's
+// ceiling-2 lock hold time (see dwc2_net_bulk_in's own call site).
+// Same "no device attached, guaranteed full timeout" real-worst-case
+// methodology as the plain-cap self-test above, not a contrived one.
+fn dwc2_net_bulk_in_poll_wcet_measure_self_test() -> i64 {
+  let timer_clo: i64 = TIMER_CLO;
+  let t0: u32 = mmio_read_u32(timer_clo);
+  let _ = dwc2_wait_chan0_done_bounded(NET_BULK_IN_POLL_CAP);
+  let t1: u32 = mmio_read_u32(timer_clo);
+  let us: u32 = t1 - t0;
+  let _ = uart_puts("WCET DIAG: dwc2_wait_chan0_done_bounded(NET_BULK_IN_POLL_CAP) full-timeout (no USB device attached, the real worst case) = ");
+  let _ = uart_put_i64(us as i64);
+  let _ = uart_puts("us -- this is the real cost netif_recv_frame (and everything that polls it: task_e's DHCP poll, ssh_real_accept/_deliver_one_frame's ceiling-2 lock) can block for, down from dwc2_wait_chan0_done's own unbounded-cap 325ms\n");
+  return 0;
+}
+
 // GPIO alt-function setup for UART0 TXD/RXD on pins 14/15 (BCM2835).
 // Real hardware needs this before the PL011 UART will actually drive
 // the pins; QEMU's emulated PL011 likely doesn't care, but doing it
@@ -13371,6 +13390,54 @@ fn dwc2_wait_chan0_done() -> u32 {
   return 0 as u32;
 }
 
+// ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, Gap F):
+// bounded sibling of dwc2_wait_chan0_done, used ONLY by dwc2_net_
+// bulk_in (see that function's own call site) -- NOT a change to the
+// shared 1000000-iteration primitive every OTHER USB transfer class
+// (control transfers/enumeration, WiFi bulk, BLE bulk, mass storage)
+// still uses unchanged. Deliberately parallel code, not a shared
+// helper parameterized by tries -- same reasoning as dacr_stash's own
+// "keep this path a plain independent straight line" choice earlier
+// this same audit: this poll loop is the single hottest, most-called
+// primitive in the whole USB stack, not worth risking an extra branch
+// or parameter-passing subtlety on its hot path for the sake of
+// sharing four lines of code with a function that has fundamentally
+// different real-time requirements.
+//
+// Why THIS specific caller can safely use a far shorter cap: dwc2_net_
+// bulk_in has exactly one caller-family, netif_recv_frame, and EVERY
+// caller of netif_recv_frame (DHCP, TCP/UDP tests, the DHCP/SSH polls
+// in task_e and ssh_real_accept/_deliver_one_frame) is already a
+// speculative "is a frame ready right now" poll with its own retry-
+// on-nothing-ready contract (task_sleep_ticks + loop, or "caller polls
+// again next tick") -- never a "this transfer MUST complete" case the
+// way a control-transfer SETUP/DATA/STATUS stage or a firmware-
+// download chunk is. A real, in-flight bulk-IN transfer that's
+// actually going to succeed sets HCINT0 within microseconds of being
+// armed (real USB bus speed, not software-bounded) -- the full 1000000/
+// ~325ms budget only ever gets spent on the "genuinely nothing to
+// receive" case, which is the COMMON case for this specific caller
+// (a network stack polling for the next frame is idle far more often
+// than it's actively receiving), not an edge case worth defending with
+// a 325ms worst case. NET_BULK_IN_POLL_CAP's own real worst-case cost
+// is measured live by dwc2_net_bulk_in_poll_wcet_measure_self_test
+// below, not assumed from a linear scaling guess.
+const NET_BULK_IN_POLL_CAP: i64 = 20000;
+
+fn dwc2_wait_chan0_done_bounded(max_tries: i64) -> u32 {
+  let hcint0: i64 = dwc2_hcint0_addr();
+  let tries: i64 = 0;
+  while tries < max_tries {
+    let hi: u32 = mmio_read_u32(hcint0);
+    if hi != (0 as u32) {
+      let _ = mmio_write_u32(hcint0, hi);
+      return hi;
+    }
+    tries = tries + 1;
+  }
+  return 0 as u32;
+}
+
 // One complete control transfer (SETUP + optional IN data stage +
 // zero-length STATUS stage) targeting device address `devaddr`,
 // endpoint 0, using `mps` as the control endpoint's max packet size
@@ -15669,7 +15736,13 @@ fn dwc2_net_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64)
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
-  let result: u32 = dwc2_wait_chan0_done();
+  // ROUND 2026-09-17 (Gap F): dwc2_wait_chan0_done_bounded, not the
+  // plain 1000000-iteration dwc2_wait_chan0_done -- see that bounded
+  // function's own comment for why this specific call site (a
+  // speculative "is a frame ready" poll, this function's only caller)
+  // can safely use a far shorter cap without affecting any other USB
+  // transfer class.
+  let result: u32 = dwc2_wait_chan0_done_bounded(NET_BULK_IN_POLL_CAP);
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
@@ -34267,6 +34340,7 @@ fn kernel_main() -> i64 {
   let _ = uart_put_hex32(usb_status as u32);
   let _ = uart_puts(" (0=device attached+port enabled, nonzero=no device attached)\n");
   let _ = dwc2_wait_chan0_done_wcet_measure_self_test();
+  let _ = dwc2_net_bulk_in_poll_wcet_measure_self_test();
 
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();

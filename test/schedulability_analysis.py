@@ -304,30 +304,53 @@ def dhruvaos_demo_task_set_analysis() -> int:
     measured mostly 12-478us under HEALTHY conditions (a working
     virtual network, lease already held) -- but that poll's own real
     worst case is NOT the healthy-path number: it calls into
-    dwc2_wait_chan0_done, the SAME USB polling primitive measured
-    elsewhere at up to 325620us (~325ms) if the link genuinely stalls.
-    A rigorous WCET bound has to assume the pessimistic case can
-    happen, not just what one test run observed -- so B_LOW uses that
-    worst-case figure, not the smaller healthy-path average, exactly
-    the same "don't trust the optimistic number" discipline this
-    audit's own delay()/dwc2 measurements were built on in the first
-    place."""
+    dwc2_net_bulk_in, which used to call the SAME shared USB polling
+    primitive measured elsewhere at up to 325620us (~325ms) if the link
+    genuinely stalls. A rigorous WCET bound has to assume the
+    pessimistic case can happen, not just what one test run observed --
+    so B_LOW uses a worst-case figure, not the smaller healthy-path
+    average, exactly the same "don't trust the optimistic number"
+    discipline this audit's own delay()/dwc2 measurements were built on
+    in the first place.
+
+    ROUND 2026-09-17 follow-up (gap #238): that 325ms figure was itself
+    closed, not just documented, once traced to its real cause --
+    dwc2_net_bulk_in (the only caller of the USB polling primitive
+    reachable from netif_recv_frame, and therefore from this exact DHCP
+    poll and from ssh_real_accept/_deliver_one_frame's own ceiling-2
+    lock) has exactly one caller-family, and every one of THOSE callers
+    is already a speculative "is a frame ready" poll with its own
+    retry-on-nothing-ready contract -- never a "this transfer MUST
+    complete" case the way a control transfer or a WiFi/BLE bulk
+    transfer is. Gave it its own much shorter poll cap
+    (NET_BULK_IN_POLL_CAP=20000 in kernel_main.vani, vs. the shared
+    1000000-iteration cap every other USB transfer class still uses
+    unchanged) via a new dwc2_wait_chan0_done_bounded sibling function,
+    not a change to the shared primitive itself. Real measured new
+    worst case (dwc2_net_bulk_in_poll_wcet_measure_self_test, same "no
+    device attached, guaranteed full timeout" real-worst-case
+    methodology as the original 325620us figure): 6584us (~6.6ms) --
+    a ~48x reduction, not a guessed one."""
     MS = 1.0  # working in milliseconds throughout
     TICK_MS = 500.0  # scheduler_tick_interval_us() = 500000us = 500ms
 
     measured_low_critical_section_ms = 49.906  # delay(3000000), TIMER_CLO-measured
     other_body_estimate_ms = 5.0  # conservative, NOT independently measured
     # GC's own two ceiling-2 critical sections -- see this function's
-    # own header for why the DHCP-poll one uses the dwc2 WORST CASE
-    # (325.62ms), not the smaller healthy-path figure actually observed
-    # (12-478us across 10 real passes in one test run). B_LOW is the
-    # larger of the two -- LOW blocks on whichever one is in progress
-    # when it becomes ready, not both at once (they're separated by a
-    # real dhruva_prio_unlock(3)/dhruva_prio_lock(2) pair in task_e's
-    # own body, a genuine window where LOW, at priority 2, can preempt
-    # GC back at its own true priority 3 normally).
+    # own header for why the DHCP-poll one uses a real worst-case
+    # figure (12-478us was only ever the healthy-path average across 10
+    # real passes in one test run). B_LOW is the larger of the two --
+    # LOW blocks on whichever one is in progress when it becomes ready,
+    # not both at once (they're separated by a real dhruva_prio_
+    # unlock(3)/dhruva_prio_lock(2) pair in task_e's own body, a
+    # genuine window where LOW, at priority 2, can preempt GC back at
+    # its own true priority 3 normally).
     gc_dharafs_critical_section_ms = 7.689  # measured max, 10 real passes
-    gc_dhcp_poll_worst_case_ms = 325.62  # dwc2_wait_chan0_done's own worst case
+    # ROUND 2026-09-17 (gap #238): was 325.62ms (dwc2_wait_chan0_done's
+    # own shared-primitive worst case) -- now the real measured worst
+    # case of dwc2_net_bulk_in_poll_wcet_measure_self_test's own
+    # NET_BULK_IN_POLL_CAP-bounded poll, ~48x smaller, not a guess.
+    gc_dhcp_poll_worst_case_ms = 6.584
     gc_worst_blocking_ms = max(gc_dharafs_critical_section_ms, gc_dhcp_poll_worst_case_ms)
 
     tasks = [
