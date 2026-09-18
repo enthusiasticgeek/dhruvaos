@@ -360,12 +360,109 @@ ready_wait_ticks_table:
 task_run_ticks_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
+/* ROUND 2026-09-18 (RTOS true-compliance pass, task #241): the
+ * measurement primitive round 189's own comment above said this would
+ * need -- a real, periodic demo task set now exists with real declared
+ * deadlines (schedulability_analysis.py's own dhruvaos_demo_task_set_
+ * analysis, task #240/226), so "blocked on a real workload" no longer
+ * applies.
+ *
+ * Deliberately does NOT touch scheduler_pick_next or scheduler_switch_
+ * from_irq at all -- this project's own established, hard-learned
+ * discipline for that exact function (see its own header comment, and
+ * task #240's own incident earlier this same round: unverified
+ * assembly written directly into this path was found broken and
+ * reverted). Built entirely as an independent OBSERVER instead,
+ * exactly like Gap B's shadow-model: read-only accessors below expose
+ * ready_wait_ticks_table (round 184, already-safe, already-existing)
+ * to vani code, which does the actual miss-detection logic from
+ * irq_dispatch's own top -- the same safe vantage point Gap B's own
+ * shadow check already uses.
+ *
+ * task_deadline_ticks_table: 0 = no declared deadline for this task
+ * (don't check it) -- a real deadline is always >= 1 tick for every
+ * task that has one, so 0 is an unambiguous "unset" sentinel, same
+ * reasoning as mutex_handoff_t0's own comment.
+ *
+ * Honest imprecision, stated plainly: ready_wait_ticks_table counts
+ * scheduling DECISIONS a ready task was passed over, not strictly
+ * "ticks" -- task_sleep_ticks/dhruva_mutex_unlock trigger extra
+ * decisions outside the timer-tick path too (see Gap B's own comment).
+ * A tick-based deadline compared against this is a real, CONSERVATIVE
+ * bound (fires at or before the true tick-based deadline would be
+ * exceeded, never after, since decisions can only happen MORE often
+ * than once per tick, never less) -- not an exact tick count, and not
+ * claimed as one. */
+task_deadline_ticks_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+task_deadline_worst_wait_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                        /* longest ready_wait_ticks_table value ever
+                         * observed for task[i] while it had a declared
+                         * deadline -- a real worst-case-wait watermark,
+                         * not an estimate. */
+task_deadline_miss_count_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                        /* incremented exactly once per overrun episode
+                         * (edge-triggered on ready_wait_ticks_table[i]
+                         * == task_deadline_ticks_table[i], not >=,
+                         * since the counter increments by exactly 1
+                         * per decision -- see irq_dispatch's own call
+                         * site for the exact check). */
+
 .section ".text"
 
 .global task_run_ticks_get_at
 task_run_ticks_get_at:
     ldr r1, =task_run_ticks_table
     ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global task_deadline_ticks_table_get_at
+task_deadline_ticks_table_get_at:
+    ldr r1, =task_deadline_ticks_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global task_deadline_ticks_table_set_at
+task_deadline_ticks_table_set_at:
+    ldr r2, =task_deadline_ticks_table
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global task_deadline_worst_wait_table_get_at
+task_deadline_worst_wait_table_get_at:
+    ldr r1, =task_deadline_worst_wait_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global task_deadline_worst_wait_table_set_at
+task_deadline_worst_wait_table_set_at:
+    ldr r2, =task_deadline_worst_wait_table
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global task_deadline_miss_count_table_get_at
+task_deadline_miss_count_table_get_at:
+    ldr r1, =task_deadline_miss_count_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global task_deadline_miss_count_table_increment_at
+task_deadline_miss_count_table_increment_at:
+    ldr r1, =task_deadline_miss_count_table
+    ldr r2, [r1, r0, lsl #2]
+    add r2, r2, #1
+    str r2, [r1, r0, lsl #2]
+    mov r0, #0
     mov r1, #0
     bx lr
 

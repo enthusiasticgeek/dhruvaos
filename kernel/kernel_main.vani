@@ -1088,6 +1088,15 @@ extern "C" fn prio_lock_count_get() -> i64;
 // in context_switch.S for why this is deliberately NOT deadline-miss
 // detection itself (no task has a declared budget yet).
 extern "C" fn task_run_ticks_get_at(index: u32) -> u32;
+// ROUND 2026-09-18 (task #241): runtime deadline-miss detection --
+// see task_deadline_ticks_table's own header comment in
+// context_switch.S for the full design.
+extern "C" fn task_deadline_ticks_table_get_at(index: u32) -> u32;
+extern "C" fn task_deadline_ticks_table_set_at(index: u32, v: u32) -> i64;
+extern "C" fn task_deadline_worst_wait_table_get_at(index: u32) -> u32;
+extern "C" fn task_deadline_worst_wait_table_set_at(index: u32, v: u32) -> i64;
+extern "C" fn task_deadline_miss_count_table_get_at(index: u32) -> u32;
+extern "C" fn task_deadline_miss_count_table_increment_at(index: u32) -> u32;
 // Round 192: opens every ARMv6 domain (kernel-context escape hatch) --
 // see dacr_open_all's own comment in context_switch.S for why
 // irq_dispatch needs this (stack_canary_check_all's own cross-task
@@ -8263,6 +8272,21 @@ fn spn_shadow_report_mismatch(predicted: u32, actual: u32, tick: u32) -> i64 {
 // codegen (register save/restore, vector entry, interrupt-return
 // instruction) -- confirmed by checking all four backends contain no
 // reference to the `interrupt` flag at all. That part is entirely
+// ROUND 2026-09-18 (task #241): one-time boot setup, declaring each
+// fixed task's own deadline in ticks -- matches schedulability_
+// analysis.py's own dhruvaos_demo_task_set_analysis() periods exactly
+// (implicit-deadline model, deadline==period): HIGH sleeps 3 ticks,
+// MEDIUM 1 tick, LOW 2 ticks. IDLE/GC/SHELL deliberately left at 0
+// (no declared deadline) -- IDLE by definition has none, GC/SHELL are
+// best-effort by design (see Gap C's own task_e/task_f WCET-tag
+// exclusion reasoning, same argument applies here).
+fn task_deadlines_init() -> i64 {
+  let _ = task_deadline_ticks_table_set_at(0 as u32, 3 as u32);
+  let _ = task_deadline_ticks_table_set_at(1 as u32, 1 as u32);
+  let _ = task_deadline_ticks_table_set_at(2 as u32, 2 as u32);
+  return 0;
+}
+
 // boot/irq_entry.S and boot/rpi1/vectors.S's job.
 #[no_mangle]
 #[interrupt(priority=0)]
@@ -8352,6 +8376,33 @@ fn irq_dispatch() -> i64 {
   let _ = spn_shadow_predicted_task_set(spn_predicted);
   let _ = spn_shadow_ctxsw_baseline_set(spn_ctxsw_baseline_now);
   let _ = spn_shadow_prediction_valid_set(1 as u32);
+
+  // ROUND 2026-09-18 (RTOS true-compliance pass, task #241): runtime
+  // deadline-miss detection for the 6 fixed task indices (matching
+  // task_run_ticks_table's own HIGH/MEDIUM/LOW/IDLE/GC/SHELL
+  // convention) -- a genuine, previously-open RTOS-qualifying gap
+  // (RTOS_GAP_ANALYSIS.md's own "no deadline-miss detection" item,
+  // round 189's own measurement primitive finally has a real declared
+  // budget to compare against). Same safe vantage point as Gap B's
+  // shadow check above, for the same reason: runs on every IRQ (not
+  // just timer ticks), matching exactly how often scheduler_pick_next
+  // itself runs, and never touches scheduler_pick_next/scheduler_
+  // switch_from_irq directly -- see task_deadline_ticks_table's own
+  // header comment in context_switch.S for the full design and the
+  // honest imprecision this measurement carries.
+  for dl_i from 0 to 6 {
+    let dl_deadline: u32 = task_deadline_ticks_table_get_at(dl_i as u32);
+    if dl_deadline != (0 as u32) {
+      let dl_wait: u32 = ready_wait_ticks_table_get_at(dl_i as u32);
+      let dl_worst: u32 = task_deadline_worst_wait_table_get_at(dl_i as u32);
+      if dl_wait > dl_worst {
+        let _ = task_deadline_worst_wait_table_set_at(dl_i as u32, dl_wait);
+      }
+      if dl_wait == dl_deadline {
+        let _ = task_deadline_miss_count_table_increment_at(dl_i as u32);
+      }
+    }
+  }
 
   let ic_pending1: i64 = IC_PENDING1;
   let pending: u32 = mmio_read_u32(ic_pending1);
@@ -23162,6 +23213,32 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("/");
     let _ = uart_put_i64(task_run_ticks_get_at(5 as u32) as i64);
     let _ = uart_puts("\n");
+
+    // ROUND 2026-09-18 (task #241): real runtime deadline-miss
+    // detection -- see task_deadline_ticks_table's own header comment
+    // in context_switch.S for the full design (declared deadlines:
+    // HIGH=3 MEDIUM=1 LOW=2 ticks; IDLE/GC/SHELL have none, so both
+    // rows read 0/0/0 for those three by construction).
+    let _ = uart_puts("  deadline misses (HIGH/MEDIUM/LOW/IDLE/GC/SHELL): ");
+    let _ = uart_put_i64(task_deadline_miss_count_table_get_at(0 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_deadline_miss_count_table_get_at(1 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_deadline_miss_count_table_get_at(2 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_deadline_miss_count_table_get_at(3 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_deadline_miss_count_table_get_at(4 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_deadline_miss_count_table_get_at(5 as u32) as i64);
+    let _ = uart_puts(" (declared deadlines 3/1/2/-/-/- ticks)\n");
+    let _ = uart_puts("  deadline worst-case wait (HIGH/MEDIUM/LOW): ");
+    let _ = uart_put_i64(task_deadline_worst_wait_table_get_at(0 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_deadline_worst_wait_table_get_at(1 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_deadline_worst_wait_table_get_at(2 as u32) as i64);
+    let _ = uart_puts(" ticks (expected to stay BELOW each task's own declared deadline 3/1/2 -- reaching it exactly is what the miss counts above track)\n");
     return 0;
   }
 
@@ -34827,6 +34904,7 @@ fn kernel_main() -> i64 {
   let _ = rtl8188cu_set_channel_self_test();
   let _ = delay_wcet_measure_self_test();
   let _ = i64_div_wcet_measure_self_test();
+  let _ = task_deadlines_init();
   let _ = stack_canary_self_test();
   let _ = aes128_self_test();
   let _ = aead_hkdf_self_test();
