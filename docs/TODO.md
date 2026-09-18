@@ -6520,14 +6520,34 @@ context, so the hardcoding is safe.
 anyone evaluating this project against a real certification standard
 (DO-178C/IEC 61508-style framing):**
 
-1. **Stack overflow is DETECTED (within ~500ms), not PREVENTED.** No
-   fine-grained MMU guard pages exist -- the current page tables can't
-   express anything finer than a 1MB section (see `stack_canary.S`'s
-   own header). Between an overflow happening and the next tick's
-   canary check, corrupted memory could already have been read by
-   other code. A real guard-page implementation is out of scope for
-   this pass (needs second-level 4KB page tables, already tracked as
-   its own future item).
+1. ~~**Stack overflow is DETECTED (within ~500ms), not PREVENTED.** No
+   fine-grained MMU guard pages exist...~~ **WRONG, corrected 2026-09-17
+   (Gap A)**: this finding was sourced from `stack_canary.S`'s own
+   stale header comment (written before round 76 existed) without
+   cross-checking `mmu_init.S`'s actual current state. Real 4KB MMU
+   guard pages already existed the whole time this audit was running
+   (round 76's `mmu_guard_page_install`, extended by round 192's
+   per-task domain version, `mmu_guard_page_install_domain`) -- every
+   real task stack (all 10, via `dhruva_alloc_stack_domain`) gets a
+   zeroed, invalid L2 descriptor installed directly before it, which
+   faults on the translation-table walk itself, genuinely PREVENTING
+   overflow via a real hardware fault, not just detecting it after the
+   fact. What WAS a real gap: round 76/192's own original verification
+   was a one-off self-test used during initial development, then
+   removed -- nothing re-proved the mechanism still worked on every
+   later change since. Closed that: `kernel_main.vani`'s new
+   `GUARD_PAGE_FAULT_INJECTION_TEST` (default 0, same gating pattern as
+   `WATCHDOG_ENABLE_FOR_REAL_HARDWARE` -- can't safely run during a
+   normal boot since it deliberately triggers an unrecoverable fault)
+   gives a permanent, documented, re-runnable procedure. Live-verified
+   this round: a deliberate write to stack_a's own guard page
+   (0x00A00000) produced a real Data Abort, DFSR status `00000817`
+   (bits[4:0]=0b00111, "Translation fault, page"), at exactly that
+   address. `stack_canary.S`'s own header and its kernel_main.vani call
+   site are both corrected to match. The canary remains valuable as a
+   complementary, defense-in-depth layer (catches a single write that
+   leaps clean over an entire 4KB guard page in one access), not the
+   only protection it was previously described as.
 2. **`scheduler_pick_next` has no automated self-test of its own**
    (documented since round 75: an attempted white-box test found a
    real, never-fully-root-caused crash and was deliberately abandoned
