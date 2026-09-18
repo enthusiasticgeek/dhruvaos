@@ -2512,6 +2512,60 @@ fn uart_puts(s: Str) -> i64 {
   return 0;
 }
 
+// ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, gap
+// #235): a genuinely WCET-safe print primitive, for #[wcet(...)]-
+// tagged task bodies that need to print status output without losing
+// their own compiler-enforced cycle bound. Plain `uart_puts` can NEVER
+// pass a #[wcet(...)] check -- confirmed empirically, not assumed: its
+// own `while i < n` string-length loop (n = the real, data-dependent
+// string length) is unconditionally treated as unbounded by vani's
+// static estimator, and #[wcet(...)] performs TRANSITIVE call-graph
+// analysis, so ANY caller of uart_puts inherits that same rejection.
+// Even a `for` loop bounded by a runtime PARAMETER doesn't help --
+// the estimator's own error message is explicit that the bound must
+// be a real compile-time constant ("a non-const-bound `for` loop" is
+// listed as its own separate unbounded case).
+//
+// Fix: a FIXED, compile-time-constant iteration count (matching
+// irq_dispatch's own proven pattern -- `for i from 0 to 128`, an `if`
+// guard inside skipping iterations past the real content instead of a
+// `break`, since this project has no prior example of `break` inside a
+// `for` loop to trust). UART_PUTS_BOUNDED_MAX_LEN (96) comfortably
+// covers every current demo-task message (the longest today is 78
+// characters, MUTEX-LOW's own hold-notice) -- a real, disclosed
+// tradeoff: a caller-supplied string longer than 96 bytes is silently
+// truncated, not an error, matching this project's own established
+// "correctness first, but a print truncation is not a correctness
+// bug" bar (nothing safety-relevant is ever communicated ONLY through
+// a status message this function would print). Uses uart_putc_
+// nonblocking, not blocking uart_putc, for the exact same reason
+// irq_dispatch itself does (see that function's own comment) --
+// uart_putc's own FIFO-full wait loop has no static bound either.
+// Keeps the SAME dhruva_prio_lock(0) cross-task mutual exclusion
+// (task #185) and shell-echo-interleave-gap newline-break (task #219)
+// real uart_puts already has -- a WCET-safe print path is worthless if
+// it reintroduces either of those two already-fixed real bugs.
+const UART_PUTS_BOUNDED_MAX_LEN: i64 = 96;
+
+#[wcet(cycles=15000)]
+fn uart_puts_bounded(s: Str) -> i64 {
+  let saved_prio: u32 = current_eff_prio();
+  let _ = dhruva_prio_lock(0);
+  if (shell_get_line_ready() == (0 as u32)) && (shell_get_line_len() > (0 as u32)) {
+    let _ = uart_putc_nonblocking(13);
+    let _ = uart_putc_nonblocking(10);
+  }
+  let n: i64 = str_len_bytes(s);
+  for i from 0 to UART_PUTS_BOUNDED_MAX_LEN {
+    if i < n {
+      let b: i64 = str_byte_at(s, i);
+      let _ = uart_putc_nonblocking(b);
+    }
+  }
+  let _ = dhruva_prio_unlock(saved_prio as i64);
+  return 0;
+}
+
 // Debug helper for bringing up new MMIO peripherals (Phase 3's SD
 // driver first): print a u32 as 8 hex digits, most-significant nibble
 // first. Not on any hard-RT path, so plain uart_putc's blocking wait
@@ -2719,6 +2773,57 @@ fn uart_put_i64(v: i64) -> i64 {
     let c: u32 = buf_read_byte(digits, i as u32);
     let _ = uart_putc(c as i64);
     i = i - 1;
+  }
+  return 0;
+}
+
+const UART_PUT_I64_BOUNDED_MAX_DIGITS: i64 = 20;
+
+// ROUND 2026-09-17 (Gap #235): bounded counterpart to uart_put_i64,
+// needed because governor_step (called from task_d's new WCET-tagged
+// wake body) prints a ready/desired/status summary via uart_put_i64,
+// and uart_put_i64's own two `while` loops (digit extraction, then
+// digit-reversal print) are exactly the same "unbounded, transitively
+// poisons any caller" problem uart_puts already had -- same fix shape
+// as uart_puts_bounded: swap `while` for a compile-time-bound
+// `for i from 0 to N { if ... }` loop, and uart_putc for
+// uart_putc_nonblocking. i64's max magnitude is 19 digits
+// (9223372036854775807), so 20 safely covers every value.
+#[no_heap]
+#[wcet(cycles=6000)]
+fn uart_put_i64_bounded(v: i64) -> i64 {
+  let is_neg: i64 = 0;
+  if v < 0 {
+    is_neg = 1;
+  }
+  let neg_value: i64 = v;
+  if v > 0 {
+    neg_value = 0 - v;
+  }
+  let digits: mut ref i64 = uart_digits_scratch_get();
+  let n: i64 = 0;
+  if neg_value == 0 {
+    let _ = buf_write_byte(digits, 0 as u32, 48 as u32);
+    n = 1;
+  } else {
+    for i from 0 to UART_PUT_I64_BOUNDED_MAX_DIGITS {
+      if neg_value < 0 {
+        let d: i64 = 0 - (neg_value - ((neg_value / 10) * 10));
+        let _ = buf_write_byte(digits, n as u32, (48 + d) as u32);
+        n = n + 1;
+        neg_value = neg_value / 10;
+      }
+    }
+  }
+  if is_neg == 1 {
+    let _ = uart_putc_nonblocking(45); // '-'
+  }
+  for j from 0 to UART_PUT_I64_BOUNDED_MAX_DIGITS {
+    let idx: i64 = n - 1 - j;
+    if idx >= 0 {
+      let c: u32 = buf_read_byte(digits, idx as u32);
+      let _ = uart_putc_nonblocking(c as i64);
+    }
   }
   return 0;
 }
@@ -5981,6 +6086,18 @@ fn dharafs_queue_pending_count() -> i64 {
 // bounded burst of work" shape as task_e's compaction loop, drains
 // the ENTIRE queue each wake (not just one entry) so a burst of
 // submissions during one sleep interval doesn't pile up indefinitely.
+//
+// ROUND 2026-09-17 (Gap #235): also deliberately NOT given a
+// #[wcet(...)] tag, same category as task_c/task_e/task_f. The drain
+// loop below is a `while`, unconditionally unbounded to the estimator
+// regardless of fsqueue_max_slots()'s real fixed cap (8) -- and even a
+// `for`-loop rewrite bounded by that cap wouldn't make the REAL work
+// per iteration boundable anyway: dharafs_queue_dispatch_one's own
+// path/data byte-copy loops are genuinely runtime-length-dependent
+// (the actual queued request's path_len/data_len), the same "real
+// data-dependent walk, not a compile-time constant" issue as
+// dharafs_compact's loops in task_e. Same discipline: best-effort,
+// not a periodic hard-RT task with a real deadline to model.
 fn task_fsq() -> i64 {
   while true {
     let _ = task_sleep_ticks(5);
@@ -19125,18 +19242,52 @@ fn dwc2_probe_device0() -> i64 {
 // matter how many tick-driven scheduling decisions happen in between.
 // The bound on how long HIGH can be kept waiting is now just LOW's
 // own critical-section length -- provable, not open-ended.
+// ROUND 2026-09-17 (Gap #235, same pattern as task_b_wake_body):
+// extracted bounded wake-up body so a real WCET number covers HIGH's
+// actual per-wake work (three prints + a ceiling-0 lock/unlock pair),
+// leaving the eternal `while true` shell unbounded as before.
+#[no_heap]
+#[wcet(cycles=50000)]
+fn task_a_wake_body() -> i64 {
+  let _ = uart_puts_bounded("HIGH: waking, requesting resource\n");
+  let _ = dhruva_prio_lock(0);
+  let _ = uart_puts_bounded("HIGH: acquired resource\n");
+  let _ = dhruva_prio_unlock(0);
+  let _ = uart_puts_bounded("HIGH: released resource\n");
+  return 0;
+}
+
 #[no_mangle]
 #[no_heap]
 #[bounded_stack(bytes=512)]
 fn task_a() -> i64 {
   while true {
     let _ = task_sleep_ticks(3);
-    let _ = uart_puts("HIGH: waking, requesting resource\n");
-    let _ = dhruva_prio_lock(0);
-    let _ = uart_puts("HIGH: acquired resource\n");
-    let _ = dhruva_prio_unlock(0);
-    let _ = uart_puts("HIGH: released resource\n");
+    let _ = task_a_wake_body();
   }
+  return 0;
+}
+
+// ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, gap
+// #235): #[wcet(...)] cannot apply to task_b() itself -- its own
+// `while true` never returns by design (every real RTOS task is an
+// infinite loop), and vani's own WCET estimator unconditionally
+// treats ANY `while` loop as unbounded regardless of what's actually
+// inside it (confirmed elsewhere in this file, irq_dispatch's own
+// header comment: "only `for i from LOW to HIGH`... carries a
+// statically-known trip count the estimator can multiply through").
+// The real, meaningful WCET question for a periodic task isn't "how
+// long does the whole infinite loop take" (unbounded, meaningless) --
+// it's "how long can ONE wake-up-to-next-sleep segment take," exactly
+// the C_i term schedulability_analysis.py's own Task.wcet field
+// already models. Extracted that segment into its own bounded helper,
+// leaving the eternal scheduling shell (task_sleep_ticks + the call)
+// unbounded, which is fine -- nothing requires the OUTER driver loop
+// itself to carry a cycle bound, only the real work done per wake.
+#[no_heap]
+#[wcet(cycles=20000)]
+fn task_b_wake_body() -> i64 {
+  let _ = uart_puts_bounded("MEDIUM: running (never touches the resource)\n");
   return 0;
 }
 
@@ -19146,11 +19297,22 @@ fn task_a() -> i64 {
 fn task_b() -> i64 {
   while true {
     let _ = task_sleep_ticks(1);
-    let _ = uart_puts("MEDIUM: running (never touches the resource)\n");
+    let _ = task_b_wake_body();
   }
   return 0;
 }
 
+// ROUND 2026-09-17 (Gap #235): deliberately NOT extracted into a
+// #[wcet(...)]-tagged helper like task_a/task_b were. delay(count)
+// takes `count` as a RUNTIME parameter, not a compile-time constant --
+// the static estimator would be correct to call that unbounded (worst
+// case count is i64::MAX), this isn't a false-rejection quirk to work
+// around like uart_puts's transitive string-length loop was. LOW's
+// real dominant WCET term is instead the MEASURED value from the
+// audit's own delay_wcet_measure_self_test (delay(3000000)=49906us),
+// already fed into test/schedulability_analysis.py as LOW's own C_i --
+// a real empirical bound stands in for a static one here, same
+// discipline as Gap E's GC critical-section measurement.
 #[no_mangle]
 #[no_heap]
 #[bounded_stack(bytes=512)]
@@ -19343,13 +19505,13 @@ fn governor_step() -> i64 {
     if status == 0 {
       let _ = governor_set_last_applied_mhz(desired);
     }
-    let _ = uart_puts("GOVERNOR: step ready=");
-    let _ = uart_put_i64(ready);
-    let _ = uart_puts(" desired_mhz=");
-    let _ = uart_put_i64(desired);
-    let _ = uart_puts(" apply_status=");
-    let _ = uart_put_i64(status);
-    let _ = uart_puts("\n");
+    let _ = uart_puts_bounded("GOVERNOR: step ready=");
+    let _ = uart_put_i64_bounded(ready);
+    let _ = uart_puts_bounded(" desired_mhz=");
+    let _ = uart_put_i64_bounded(desired);
+    let _ = uart_puts_bounded(" apply_status=");
+    let _ = uart_put_i64_bounded(status);
+    let _ = uart_puts_bounded("\n");
   }
   return 0;
 }
@@ -19472,14 +19634,28 @@ fn governor_replay_test() -> i64 {
 // DHRUVA_ARCHITECTURE.md §7 Phase 5's own caveat), but the scheduling
 // behavior itself (idle genuinely blocking rather than burning a fixed
 // cycle count every pass) is real and observable here too.
+// ROUND 2026-09-17 (Gap #235): same extraction pattern. governor_step
+// and cpu_wfi are both plain calls with no internal while/for loops of
+// their own (governor_step is straight-line logic; cpu_wfi is a
+// single WFI instruction via extern "C" -- it halts the CPU rather
+// than spinning, so it costs ~0 analyzable cycles even though the
+// real wall-clock wait until the next interrupt is unbounded by
+// design, exactly what IDLE is supposed to do).
+#[no_heap]
+#[wcet(cycles=100000)]
+fn task_d_wake_body() -> i64 {
+  let _ = uart_puts_bounded("idle\n");
+  let _ = governor_step();
+  let _ = cpu_wfi();
+  return 0;
+}
+
 #[no_mangle]
 #[no_heap]
 #[bounded_stack(bytes=512)]
 fn task_d() -> i64 {
   while true {
-    let _ = uart_puts("idle\n");
-    let _ = governor_step();
-    let _ = cpu_wfi();
+    let _ = task_d_wake_body();
   }
   return 0;
 }
@@ -19554,6 +19730,20 @@ fn task_d() -> i64 {
 // own commit history), pushing this task's worst-case chain to 4700
 // bytes, past the 4096 budget. Raised to 6144, again for real headroom
 // against the next addition, not the bare ~600 bytes actually needed.
+// ROUND 2026-09-17 (Gap #235): deliberately NOT extracted into a
+// #[wcet(...)]-tagged helper, same reasoning as task_c's own comment
+// above. dharafs_compact has 2 real `while` loops walking the DharaFS
+// log -- genuinely data-dependent on filesystem state at runtime, not
+// a compile-time constant, so a static bound would either be rejected
+// outright or (if some artificial cap were added just to satisfy the
+// estimator) dishonestly understate the real worst case. The DHCP-poll
+// path bottoms out in dwc2_wait_chan0_done, already measured at 325.6ms
+// worst case (see the WiFi/BLE/UART WCET follow-up in docs/TODO.md).
+// Gap #237 already closed the empirical side of this exact question --
+// both critical sections below are TIMER_CLO-measured live, every real
+// pass, and that measured worst case is what's fed into
+// test/schedulability_analysis.py as LOW's own blocking term, not a
+// static estimate this task's own structure can't honestly produce.
 #[no_mangle]
 #[bounded_stack(bytes=6144)]
 fn task_e() -> i64 {
@@ -23254,6 +23444,20 @@ fn shell_dispatch() -> i64 {
 // sibling_functions_after_bugfix's own sibling note on this exact
 // gotcha) -- pushed the existing ssh_shell_test_cmd chain 4 bytes over
 // the prior budget. Real headroom left again, not the bare minimum.
+// ROUND 2026-09-17 (Gap #235): also deliberately NOT given a
+// #[wcet(...)] tag, same reasoning as task_c/task_e above but even more
+// clear-cut here: shell_dispatch() fans out to arbitrary user-typed
+// commands, several of which perform real, live, I/O-bound network
+// round trips with their own internal poll loops (tcprtx's simulated-
+// retransmission handshake loop just above, tlsecho's full TLS 1.3
+// handshake, udpecho/tcpecho's own socket polling) -- this is best-
+// effort, interactively-triggered work BY DESIGN, not a periodic
+// hard-RT task with a real deadline. A static bound here would either
+// be rejected (real `while`/non-const `for` loops throughout
+// shell_dispatch's own command handlers) or would have to be so large
+// (bounding a live network handshake) it couldn't mean anything useful
+// as a schedulability input. Priority 3, same best-effort band as
+// task_e/GC -- neither was ever meant to carry a WCET guarantee.
 #[no_mangle]
 #[bounded_stack(bytes=13312)]
 fn task_f() -> i64 {
@@ -23293,12 +23497,20 @@ fn task_f() -> i64 {
 // populated at runtime, not just that the API compiles. Priority 3,
 // the same best-effort band GC/SHELL already share -- an ordinary new
 // task has no reason to outrank the existing hard-RT demo.
+// ROUND 2026-09-17 (Gap #235): same extraction pattern as task_a/b/d.
+#[no_heap]
+#[wcet(cycles=20000)]
+fn task_custom_demo_wake_body() -> i64 {
+  let _ = uart_puts_bounded("CUSTOM: dynamically-created task running\n");
+  return 0;
+}
+
 #[no_mangle]
 #[bounded_stack(bytes=512)]
 fn task_custom_demo() -> i64 {
   while true {
     let _ = task_sleep_ticks(7);
-    let _ = uart_puts("CUSTOM: dynamically-created task running\n");
+    let _ = task_custom_demo_wake_body();
   }
   return 0;
 }
@@ -23326,22 +23538,47 @@ fn task_custom_demo() -> i64 {
 // current_eff_prio(), printed live right after waking, before release)
 // whenever HIGH did contend during the hold -- provable, not just
 // asserted.
+// ROUND 2026-09-17 (Gap #235): same extraction pattern as task_a/b/d.
+// dhruva_mutex_lock/unlock and task_sleep_ticks are all extern "C"
+// (context_switch.S) -- opaque black-box calls to the estimator, not
+// vani-level loops, so the mid-body task_sleep_ticks(5) call (while
+// still holding the mutex, the deliberate contention-window this demo
+// exists to prove) doesn't poison this bound the way a real vani
+// `while`/`for` loop would.
+#[no_heap]
+#[wcet(cycles=100000)]
+fn task_mutex_demo_low_wake_body() -> i64 {
+  let _ = uart_puts_bounded("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
+  let _ = dhruva_mutex_lock(0 as u32);
+  let _ = uart_puts_bounded("MUTEX-LOW: holding demo mutex, now sleeping 5 ticks while still holding it\n");
+  let _ = task_sleep_ticks(5);
+  let boosted: u32 = current_eff_prio();
+  let _ = uart_puts_bounded("MUTEX-LOW: woke up still holding demo mutex, eff_prio now=");
+  let _ = uart_put_i64_bounded(boosted as i64);
+  let _ = uart_puts_bounded("\n");
+  let _ = uart_puts_bounded("MUTEX-LOW: releasing demo mutex\n");
+  let _ = dhruva_mutex_unlock(0 as u32);
+  return 0;
+}
+
 #[no_mangle]
 #[bounded_stack(bytes=512)]
 fn task_mutex_demo_low() -> i64 {
   while true {
     let _ = task_sleep_ticks(2);
-    let _ = uart_puts("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
-    let _ = dhruva_mutex_lock(0 as u32);
-    let _ = uart_puts("MUTEX-LOW: holding demo mutex, now sleeping 5 ticks while still holding it\n");
-    let _ = task_sleep_ticks(5);
-    let boosted: u32 = current_eff_prio();
-    let _ = uart_puts("MUTEX-LOW: woke up still holding demo mutex, eff_prio now=");
-    let _ = uart_put_i64(boosted as i64);
-    let _ = uart_puts("\n");
-    let _ = uart_puts("MUTEX-LOW: releasing demo mutex\n");
-    let _ = dhruva_mutex_unlock(0 as u32);
+    let _ = task_mutex_demo_low_wake_body();
   }
+  return 0;
+}
+
+#[no_heap]
+#[wcet(cycles=60000)]
+fn task_mutex_demo_high_wake_body() -> i64 {
+  let _ = uart_puts_bounded("MUTEX-HIGH: requesting demo mutex\n");
+  let _ = dhruva_mutex_lock(0 as u32);
+  let _ = uart_puts_bounded("MUTEX-HIGH: acquired demo mutex\n");
+  let _ = dhruva_mutex_unlock(0 as u32);
+  let _ = uart_puts_bounded("MUTEX-HIGH: released demo mutex\n");
   return 0;
 }
 
@@ -23350,11 +23587,7 @@ fn task_mutex_demo_low() -> i64 {
 fn task_mutex_demo_high() -> i64 {
   while true {
     let _ = task_sleep_ticks(2);
-    let _ = uart_puts("MUTEX-HIGH: requesting demo mutex\n");
-    let _ = dhruva_mutex_lock(0 as u32);
-    let _ = uart_puts("MUTEX-HIGH: acquired demo mutex\n");
-    let _ = dhruva_mutex_unlock(0 as u32);
-    let _ = uart_puts("MUTEX-HIGH: released demo mutex\n");
+    let _ = task_mutex_demo_high_wake_body();
   }
   return 0;
 }
