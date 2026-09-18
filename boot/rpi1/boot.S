@@ -226,6 +226,24 @@ boot_entry:
      * below was actually the problem, rather than guessing. */
     SNAP_TIMER 2
 
+    /* Task #246 (RTOS true-compliance pass, 2026-09-18): FIQ mode --
+     * same reasoning as IRQ above (entering with sp_fiq at its
+     * reset-time garbage value is only harmless as long as nothing
+     * ever takes an FIQ, true up to this round -- the FIQ vector
+     * pointed at a crash handler). The timer tick is now routed to
+     * FIQ (boot/fiq_entry.S), BCM2835's one real interrupt-priority
+     * mechanism, giving it genuine hardware precedence over IRQ-level
+     * work (UART RX) instead of both sharing one flat, non-prioritized
+     * dispatch. Deliberately NOT given its own numbered SNAP_TIMER
+     * checkpoint -- checkpoints 0-6 are consumed downstream (kernel_
+     * main.vani's own boot_diag_get_checkpoint_N accessors); renumbering
+     * them for one more mode-switch step is unnecessary churn this
+     * change doesn't need. */
+    bic r1, r0, #0x1F
+    orr r1, r1, #0x11      /* FIQ mode */
+    msr cpsr_c, r1
+    ldr sp, =_fiq_stack_top
+
     bic r1, r0, #0x1F
     orr r1, r1, #0x17      /* Round 38: Abort mode -- same reasoning as
                              * IRQ above: entering Abort mode with sp_abt

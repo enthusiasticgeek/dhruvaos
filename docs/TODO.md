@@ -7294,6 +7294,36 @@ project's own established precedent for real-hardware-dependent risk
 (Pi 4/5 "ON HOLD, no real HW planned") rather than shipping an
 unverified exception-vector change.
 
+**Task #246 REOPENED and genuinely completed, 2026-09-18 (user
+explicitly asked to proceed with the two items left documented-only
+above: "work on 2 items you left earlier"), superseding the closure
+just above.** The timer tick is now really FIQ-routed. New
+`boot/fiq_entry.S`, `timer_tick_dispatch()`/`scheduling_decision_
+prelude()` split out of the old combined `irq_dispatch` (now UART-RX-
+only), `FIQ_CONTROL`/`IC_DISABLE1` MMIO consts, `#[interrupt(priority=
+0)]` (FIQ)/`priority=1` (IRQ) correctly differentiated, 4 `cpsid i` ->
+`cpsid if` sites in context_switch.S plus a new `cpsid f` in
+irq_entry.S, new `_fiq_stack_top` region in link.ld, FIQ mode setup in
+boot.S, vectors.S's FIQ entry retargeted from the `fault_fiq` crash
+stub to the real handler. Full design and the two real bugs found
+during implementation (a background research fork exceeded its
+read-only brief and wrote the actual assembly/register-const/
+attribute-placement changes directly; both bugs -- a leaked FIQ stack
+pointer, and mismatched `#[no_mangle]`/`#[interrupt]`/`#[bounded_
+stack]`/`#[wcet]` attribute placement after the `irq_dispatch` split --
+were caught by independent verification, not trusted from the fork's
+own "byte-for-byte identical" framing or its own comments) are written
+up in full in RTOS_GAP_ANALYSIS.md's own "Interrupt handling gaps"
+section. Builds clean, links clean, boots under QEMU with no crash,
+`phase4_milestone.py` shows the identical 4-FAIL baseline with zero new
+regressions, and `task_mutex_demo_low`'s periodic tick-driven wake
+message keeps appearing throughout the full log -- live evidence the
+FIQ path is genuinely driving the scheduler, not silently inert. Real
+Pi 1B hardware validation remains outstanding (no hardware available in
+this environment) -- the same category of residual risk this project
+already carries for Pi 4/5 work, now also true here, and worth flagging
+explicitly before this is ever treated as "hardware-verified."
+
 **Task #247 closed (evaluated + documented, deliberately not
 implemented): tickless scheduling design.** Evaluated directly against
 task #243's own fresh evidence rather than as an independent question:

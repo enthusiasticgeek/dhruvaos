@@ -95,6 +95,24 @@ irq_entry:
      * updated to the same 17-word layout for consistency -- for their
      * voluntary/initial-launch cases true_lr and resume_pc are
      * legitimately the same value, so they just store it twice. */
+    /* Task #246 (RTOS true-compliance pass, 2026-09-18): mask FIQ for
+     * this entire dispatch, same reasoning as context_switch.S's own
+     * `cpsid i` -> `cpsid if` sites. Taking an IRQ exception
+     * automatically masks further IRQs (the I bit) but NOT FIQ -- and
+     * the timer tick is now FIQ-routed, meaning without this, a real
+     * timer FIQ could preempt THIS path's own scheduler_switch_from_
+     * irq call (below) while it's mid-flight, racing on the exact same
+     * global scheduler tables (current_task, sp_table, eff_prio_table)
+     * a concurrent FIQ-driven switch would also touch -- the same
+     * class of hazard `cpsid if` already closes for task_sleep_ticks/
+     * dhruva_mutex_lock/_unlock/task_create. No corresponding explicit
+     * unmask is needed at the end: the final `ldmia ...^` below
+     * restores the FULL CPSR (mode+I+F) from the resumed task's own
+     * staged SPSR atomically, exactly how the I bit's own restore
+     * already worked before this change -- `cps`'s own mode-only form
+     * (used throughout this function) never touches I/F either way,
+     * so this one `cpsid f` is the only place that needs to change. */
+    cpsid f
     sub lr, lr, #4                /* IRQ's lr is 4 ahead of the instruction
                                    * that should actually resume */
     stmdb sp!, {r0-r12, lr}       /* stage on the IRQ stack -- temporary,

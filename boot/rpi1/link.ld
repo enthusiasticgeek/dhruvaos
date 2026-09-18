@@ -95,6 +95,23 @@ SECTIONS
     . = . + 0x1000;
     _irq_stack_top = .;
 
+    /* Task #246 (RTOS true-compliance pass, 2026-09-18): 4KB FIQ-mode
+     * stack, same size class as IRQ's own -- the timer tick is now
+     * routed to FIQ (BCM2835's only real interrupt-priority mechanism,
+     * confirmed unused: the FIQ vector previously pointed at a crash
+     * handler) instead of ordinary IRQ, giving it genuine hardware
+     * priority over UART RX -- FIQ automatically masks BOTH further
+     * FIQs AND IRQs on entry (ARM architectural guarantee), so this
+     * handler can never itself be preempted, and it can preempt an
+     * in-progress IRQ handler, which previously never happened (IRQ
+     * was the only active exception class, always non-nested). See
+     * boot/fiq_entry.S's own header comment for the full design and
+     * the real correctness work this required elsewhere
+     * (context_switch.S's own scheduler-critical-section masking). */
+    . = ALIGN(16);
+    . = . + 0x1000;
+    _fiq_stack_top = .;
+
     /* Round 38: 4KB Abort-mode stack, same size class as IRQ's own --
      * boot.S never gave Abort mode a banked sp before now (nothing
      * could trigger a Data/Prefetch Abort worth handling until this

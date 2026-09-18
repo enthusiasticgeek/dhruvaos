@@ -203,48 +203,86 @@ doesn't yet attempt.
 
 ## 2. Interrupt handling gaps
 
-- **One flat interrupt priority level, re-audited 2026-09-18 (task
-  #246) with a real, narrower, more honest finding than the original
-  wording above.** `irq_dispatch` (`kernel_main.vani`) checks the
-  timer-tick pending bit, then the UART RX pending bit, in a single
-  non-nested sequence — confirmed by reading the function directly,
-  still true. But "non-prioritized" overstates it: the timer branch
-  runs FIRST, unconditionally, in every single dispatch, before the
-  UART branch even reads its own pending register -- so timer-tick
-  handling (the single most schedule-critical interrupt in this
-  system) is NEVER delayed by UART RX servicing within one entry, a
-  real (if implicit, code-order-only) prioritization that already
-  existed. Combined with task #242's own new sporadic-server budget
-  (UART RX servicing per tick is now capped at ~512 bytes of MMIO
-  work, no longer unbounded), the practical starvation risk this item
-  originally worried about is real but SMALL today, not the open-ended
-  gap the original wording implied.
+- **Real preemptive interrupt priority via FIQ, IMPLEMENTED 2026-09-18
+  (task #246, reopened and completed after the earlier 2026-09-18
+  investigation below had closed it as "documented, not implemented" —
+  the user explicitly asked to proceed despite the documented risk).**
+  The timer tick is now routed to BCM2835's FIQ line, the SoC's one
+  genuine hardware interrupt-priority mechanism: `timer_ic_init`
+  (`kernel_main.vani`) disables the timer's ordinary IC_ENABLE1 bit
+  (`IC_DISABLE1`, base+0x1C) before configuring `FIQ_CONTROL`
+  (base+0x0C, bit7=enable | bit[6:0]=source-select=1, the timer's own
+  GPU-bank-1 bit position) — both register facts confirmed directly
+  against real Linux `drivers/irqchip/irq-bcm2835.c`, not recalled from
+  memory, including that specific disable-before-FIQ-config ordering
+  requirement ("otherwise both handlers will fire at the same time",
+  the real driver's own words). A new `boot/fiq_entry.S` (mirroring
+  `irq_entry.S`'s save/relocate/dispatch/restore shape, but for FIQ's
+  genuinely different register-banking — FIQ banks r8-r14, five more
+  registers than IRQ's r13/r14 only, so only r0-r7 need staging/
+  relocation; r8-r12 are read directly once SVC mode is entered) calls
+  a new `timer_tick_dispatch()`, split out of the old combined
+  `irq_dispatch` (which now handles only UART RX). A shared
+  `scheduling_decision_prelude()` (irq_count, Gap B's shadow-check,
+  task #241's deadline-miss detection) runs from both paths, since both
+  independently drive real scheduling decisions. `#[interrupt(priority=
+  0)]` (FIQ) / `#[interrupt(priority=1)]` (IRQ) on the two real ISR
+  entry points, correctly DIFFERENT now (not both 0, which would have
+  silently disabled vani's own S-20 pairwise priority-inversion checker
+  between them — verified neither currently locks a shared mutex, but
+  the numbers need to be honest regardless). FIQ's architectural
+  guarantee (taking FIQ masks both further FIQ AND IRQ; taking IRQ
+  masks only IRQ) meant every existing SVC-mode scheduler critical
+  section needed re-auditing: 4 `cpsid i` sites in `context_switch.S`
+  (`task_sleep_ticks`, `dhruva_mutex_lock`/`_unlock`, `task_create`)
+  upgraded to `cpsid if`, and `irq_entry.S` gained its own `cpsid f` at
+  entry, protecting its `scheduler_switch_from_irq` call from FIQ
+  preemption (impossible before this change, since IRQ was previously
+  the only active exception class).
 
-  **What's genuinely still missing, and why it's documented rather
-  than attempted here**: true PREEMPTIVE interrupt priority -- a
-  higher-priority source interrupting a lower one that's ALREADY
-  mid-service, not just going first when both are pending at entry.
-  BCM2835 has exactly one real hardware mechanism for this: routing a
-  single source to FIQ (a genuinely separate ARM exception vector with
-  its own banked registers, unmasked-by-default relative to IRQ) --
-  confirmed unused today, `boot/rpi1/vectors.S`'s own FIQ vector
-  points at `fault_fiq`, a crash handler, not a real handler. Routing
-  the timer tick to FIQ (the standard RTOS pattern -- reserve FIQ for
-  the single most timing-critical source) is the real, correct design
-  for this SoC, not a software workaround. Deliberately NOT
-  implemented in this pass: it needs new banked-register save/restore
-  and a parallel entry path completely independent of the existing
-  IRQ entry -- exactly the class of vector-table/context-save code
-  this project has repeatedly gotten wrong on a first attempt (round
-  68's true-lr bug, `scheduler_pick_next`'s own documented crash
-  history, and this same session's own incident: unverified assembly
-  written directly into the IRQ-return path by a subagent, found
-  broken, reverted) -- and QEMU's own FIQ emulation fidelity for this
-  machine model is unverified, so "tested under QEMU" wouldn't be a
-  trustworthy claim here even if attempted. Matches this project's own
-  established precedent for real-hardware-dependent risk (Pi 4/5 work
-  "ON HOLD, no real HW planned") rather than shipping an unverified
-  exception-vector change.
+  **Two real bugs found and fixed during implementation, both the kind
+  this exact code class has produced before (round 68's true-lr bug,
+  this same session's own earlier subagent incident: unverified
+  assembly in this path, found broken, reverted)**: (1) a background
+  research fork, asked only to verify the FIQ_CONTROL register layout,
+  went beyond that brief and wrote `fiq_entry.S` directly — its file
+  was missing the equivalent of `irq_entry.S`'s own `cps #0x12; add
+  sp,sp,#64; cps #0x13` step that pops the staging area back off the
+  IRQ stack; `fiq_entry.S` never popped its own 40-byte staging area
+  off `sp_fiq`, which would have leaked 40 bytes per tick and walked
+  off the 4KB `_fiq_stack_top` region within ~100 ticks — found by
+  diffing every step against `irq_entry.S`'s real equivalent sequence,
+  not by trusting the file's own "byte-for-byte identical" framing
+  (true only for the tail, not the whole file), fixed before the first
+  build. (2) The same fork's edit relocated `#[no_mangle]`/
+  `#[interrupt(priority=0)]`/`#[bounded_stack]`/`#[wcet]` to the wrong
+  function during the `irq_dispatch` split (attributes ended up on the
+  new shared helper instead of the two real entry points) — caught
+  immediately by the linker (`undefined reference to 'irq_dispatch'`/
+  `'timer_tick_dispatch'`, since unmangled names are what the assembly
+  calls), fixed by moving the attributes to the correct functions with
+  correct, differentiated priority numbers (see above).
+
+  **Verification**: builds clean, links clean, boots under QEMU with
+  no crash/reboot, `phase4_milestone.py`'s full regression suite shows
+  the exact same pre-existing 4-FAIL baseline (`httpecho`/`mqttecho`/
+  `ls`/`diagnose`, all pre-existing `SETTLE_S`-class test-harness
+  timing issues) with zero new regressions, and the log shows
+  `task_mutex_demo_low`'s periodic "sleeping 5 ticks" message
+  continuing to repeat throughout the run — live evidence the
+  scheduler tick is genuinely advancing via the new FIQ path (not
+  silently inert), and that the `sp_fiq` leak above does not manifest
+  (would have crashed within seconds at this tick rate). **Not
+  verified**: real Pi 1B hardware (this environment has no more RPi
+  hardware available, per the project's own current strategic
+  scoping) or real ARM1176JZF-S FIQ silicon behavior beyond what QEMU
+  models — the same category of real-hardware-only risk this project
+  already carries for Pi 4/5 USB/EMMC work, now also true here. The
+  original 2026-09-18 investigation's caution about this exact code
+  class was warranted and is why it took two full review passes
+  (independent verification of a subagent's own register-banking
+  claims, then independent verification of its actual diff before
+  trusting it) before shipping, rather than one.
 - **No measured/bounded worst-case interrupt latency.** Nothing in this
   project computes or asserts "an interrupt is serviced within N cycles of
   assertion, worst case."
@@ -628,11 +666,11 @@ doesn't yet attempt.
    finding on both).
 8. ~~A real interrupt-priority scheme (needs BCM2835's fuller interrupt
    controller capability wired up, not just the two pending-bit checks used
-   today)~~ **`[RE-AUDITED, 2026-09-18]`** — task #246, see "Interrupt
-   handling gaps" above for the full finding: narrower than originally
-   scoped, and the one real remaining option (FIQ for the timer tick)
-   deliberately documented rather than implemented without real-HW
-   validation.
+   today)~~ **`[DONE, 2026-09-18]`** — task #246, see "Interrupt handling
+   gaps" above: the timer tick is now genuinely FIQ-routed, preempting
+   in-progress IRQ-level work (UART RX), QEMU-verified with no
+   regressions; real Pi 1B hardware validation still outstanding (no
+   hardware available in this environment).
 9. ~~Formal schedulability analysis tooling (utilization bound / response-time
    analysis) over the declared task set.~~ **`[DONE, tool: round 190;
    applied to DhruvaOS's own real task set: Gap C/226, 2026-09-17]`** —

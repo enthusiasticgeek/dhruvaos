@@ -1078,7 +1078,25 @@ scheduler_switch_from_irq_skip_tick:
  * used, since no tick count in this design remotely approaches 2^32. */
 .global task_sleep_ticks
 task_sleep_ticks:
-    /* Round 65 hardening: unlike dhruva_mutex_lock's own blocked path
+    /* Task #246 (RTOS true-compliance pass, 2026-09-18): `cpsid i` ->
+     * `cpsid if` here and at every other scheduler-state critical
+     * section in this file (dhruva_mutex_lock/_unlock, task_create) --
+     * the timer tick is now routed to FIQ, which can genuinely preempt
+     * this exact kind of SVC-mode critical section (FIQ is NOT masked
+     * by a bare `cpsid i`, only by the interrupt controller's own
+     * automatic entry-time masking while ALREADY inside an FIQ/IRQ
+     * handler -- a plain SVC-mode function like this one needs to ask
+     * for that protection explicitly). Restoring is unaffected: every
+     * site here either restores the FULL saved CPSR via `msr cpsr_c`
+     * (dhruva_mutex_lock/_unlock/task_create), or -- this function
+     * specifically -- never restores the live CPSR at all, always
+     * switching away instead, with the RESUMED task's own eventual
+     * state coming from a hardcoded `0x13` staged into its own saved
+     * frame below (confirmed by reading that line directly), never
+     * derived from the live CPSR this `cpsid if` affects -- so this
+     * change is safe with zero effect on resumed-task state either way.
+     *
+     * Round 65 hardening: unlike dhruva_mutex_lock's own blocked path
      * (see its header comment -- explicit `cpsid i` before touching
      * any shared scheduler state), this function never masked
      * interrupts across its own multi-instruction critical section
@@ -1116,7 +1134,7 @@ task_sleep_ticks:
      * irqs() ever runs) is NOT explained by the round-68 fix -- that
      * narrower mystery, if it's still reproducible, remains genuinely
      * open. */
-    cpsid i
+    cpsid if
     /* Round 68: explicit 17-word (68-byte) frame -- spsr, pad, r0-r12,
      * true_lr, resume_pc -- replacing the old 16-word stmdb-built one.
      * See irq_entry.S's own header comment for the full "why" (the old
@@ -1274,7 +1292,7 @@ current_eff_prio:
 .global dhruva_mutex_lock
 dhruva_mutex_lock:
     mrs r1, cpsr
-    cpsid i
+    cpsid if
 
     ldr r2, =mutex_owner_table
     ldr r3, [r2, r0, lsl #2]
@@ -1390,7 +1408,7 @@ dml_contended:
 dhruva_mutex_unlock:
     stmdb sp!, {r4-r9, lr}
     mrs r1, cpsr
-    cpsid i
+    cpsid if
 
     ldr r4, =current_task
     ldr r4, [r4]                     /* r4 = current_task (outgoing owner) */
@@ -1972,7 +1990,7 @@ task_create:
     mov r7, r3              /* priority */
 
     mrs r8, cpsr
-    cpsid i
+    cpsid if
 
     ldr r0, =eff_prio_table
     mov r9, #6               /* first free-slot candidate */

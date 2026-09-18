@@ -88,6 +88,26 @@ const IC_PENDING2: i64 = 0x2000B208;
 const IC_ENABLE1: i64 = 0x2000B210;
 #[mmio(size=4)]
 const IC_ENABLE2: i64 = 0x2000B214;
+// Task #246 (RTOS true-compliance pass, 2026-09-18): IC_DISABLE1 and
+// FIQ_CONTROL, for routing the timer tick to FIQ instead of ordinary
+// IRQ -- BCM2835's one real interrupt-priority mechanism. Register
+// facts confirmed directly against real Linux (drivers/irqchip/
+// irq-bcm2835.c, rpi-6.1.y, user-fetched source, not recalled from
+// memory): IC_DISABLE1 = base+0x1C (bank-1 IRQ disable, matching
+// IC_ENABLE1's own base+0x10 for the same bank); FIQ_CONTROL =
+// base+0x0C, bit 7 = FIQ generation enable, bits[6:0] = source select
+// using the FIQ register's OWN numbering (GPU bank-1 sources 0-31
+// map directly, no offset -- confirmed by hand-tracing the real
+// driver's own hwirq_to_fiq() helper for our exact source, GPU bank-1
+// bit 1, the same one IC_PENDING1/IC_ENABLE1 already expose as bit
+// 1). The real driver's own header comment states the one hard
+// requirement this project's timer_ic_init now follows: "An interrupt
+// must be disabled [via IC_DISABLE1] before configuring it for FIQ
+// generation otherwise both handlers will fire at the same time."
+#[mmio(size=4)]
+const IC_DISABLE1: i64 = 0x2000B21C;
+#[mmio(size=4)]
+const FIQ_CONTROL: i64 = 0x2000B20C;
 // Power management / watchdog (base 0x20100000)
 #[mmio(size=4)]
 const PM_RSTC: i64 = 0x2010001C;
@@ -3039,7 +3059,6 @@ fn timer_ic_init() -> i64 {
   let timer_cs: i64 = TIMER_CS;
   let timer_clo: i64 = TIMER_CLO;
   let timer_c1: i64 = TIMER_C1;
-  let ic_enable1: i64 = IC_ENABLE1;
 
   // Arm the first compare match one tick out.
   let now: u32 = mmio_read_u32(timer_clo);
@@ -3077,8 +3096,26 @@ fn timer_ic_init() -> i64 {
   // event the way it can here.
   let _ = mem_barrier();
 
-  // Enable IC line 1 (timer channel 1's compare-match interrupt).
-  let _ = mmio_write_u32(ic_enable1, 2 as u32);
+  // Task #246 (RTOS true-compliance pass, 2026-09-18): route the timer
+  // tick to FIQ instead of ordinary IRQ -- BCM2835's one real hardware
+  // interrupt-priority mechanism (see the IC_DISABLE1/FIQ_CONTROL
+  // const comments above for the register facts, confirmed directly
+  // against real Linux's own irq-bcm2835.c). The real driver's own
+  // header comment states a hard ordering requirement: an interrupt
+  // must be DISABLED on the ordinary IRQ path before being configured
+  // for FIQ generation, "otherwise both handlers will fire at the same
+  // time" -- so IC_DISABLE1 bit 1 is written FIRST (this bank's own
+  // enable/disable pair are truly independent write-only bits per the
+  // real hardware, not a read-modify-write toggle -- writing 1 to
+  // DISABLE clears the corresponding ENABLE bit unconditionally,
+  // regardless of ic_enable1's own prior state), then FIQ_CONTROL gets
+  // bit7 (enable) | source-select=1 (this timer's own GPU-bank-1 bit
+  // position, unchanged from what IC_PENDING1/IC_ENABLE1 already used).
+  let ic_disable1: i64 = IC_DISABLE1;
+  let fiq_control: i64 = FIQ_CONTROL;
+  let _ = mmio_write_u32(ic_disable1, 2 as u32);
+  let _ = mem_barrier();
+  let _ = mmio_write_u32(fiq_control, 0x81 as u32);
   return 0;
 }
 
@@ -8604,10 +8641,16 @@ fn task_deadlines_init() -> i64 {
 }
 
 // boot/irq_entry.S and boot/rpi1/vectors.S's job.
-#[no_mangle]
-#[interrupt(priority=0)]
-#[bounded_stack(bytes=1024)]
-#[wcet(cycles=130000)]
+//
+// ROUND 2026-09-18 (task #246 wiring fix): the #[no_mangle]/
+// #[interrupt(priority=...)]/#[bounded_stack]/#[wcet] attribute block
+// that used to sit directly above the single combined irq_dispatch
+// moved down to timer_tick_dispatch and irq_dispatch individually (see
+// each function's own header below) now that the timer branch is a
+// separate real ISR entry point (fiq_entry.S) from the UART RX one
+// (irq_entry.S) -- neither belongs on scheduling_decision_prelude
+// itself, a plain internal helper both call, never invoked directly
+// from assembly.
 // Round 72: budget raised from 100000 -- the new per-byte shell-echo
 // call (shell_echo_char, invoked from the UART RX branch below) pushed
 // the static estimate to 118044 cycles. Re-audited: still small,
@@ -8634,49 +8677,21 @@ fn task_deadlines_init() -> i64 {
 // Fixed by returning 1 here iff the timer branch below actually fired
 // this call, 0 otherwise, so irq_entry.S can pass that flag through to
 // scheduler_switch_from_irq and gate the tick_count increment on it.
-fn irq_dispatch() -> i64 {
-  // ROUND 2026-09-18 (task #243): real measured full-IRQ-dispatch cost
-  // -- see irq_tick_worst_us's own header comment in context_switch.S.
-  // Read unconditionally (every IRQ, timer tick or UART RX) but only
-  // ever CONSUMED/reported when was_timer_tick==1 at the bottom of
-  // this function, so this doesn't change what's being measured.
-  let irq_t0: u32 = mmio_read_u32(TIMER_CLO);
-  // Round 192: this entire function is kernel-context IRQ handling,
-  // not any one task's own code. Always correctly re-restricted by
-  // scheduler_pick_next before this IRQ ever returns to task-level
-  // code -- see dacr_open_all's own comment.
-  //
-  // ROUND 2026-09-17 (RTOS audit follow-up, task #191's own DACR-trap
-  // finding traced to its real source): dacr_open_all() USED to run
-  // unconditionally right here, for every IRQ -- timer tick AND UART
-  // RX alike. The only reason it's needed at all is stack_canary_
-  // check_all's own cross-task read (every OTHER access in this
-  // function -- the shell line buffer, the diagnostic counters, every
-  // MMIO register -- is kernel/shared state, domain 0, always
-  // reachable regardless of DACR's task-domain bits; verified by
-  // reading this whole function top to bottom, not assumed). And that
-  // check only ever runs inside the `was_timer_tick == 1` branch below.
-  // Calling dacr_open_all() unconditionally here meant every UART RX
-  // interrupt (fires once per keystroke during real interactive use,
-  // independent of and far more frequent than the scheduler's own
-  // tick rate) paid for an "open everything, then scheduler_pick_next
-  // re-restricts it" round trip it never needed. Moved down into the
-  // timer branch, immediately before the one call that actually
-  // requires it -- see that call site's own comment for confirmation
-  // this doesn't change WHEN task-level code can observe an open DACR,
-  // only removes an unnecessary open/reclose pair on the UART RX path.
+// ROUND 2026-09-18 (task #246): extracted verbatim from irq_dispatch's
+// own former top (Gap B's shadow check + task #241's deadline-miss
+// detection, plus irq_count_increment) -- the timer tick is now
+// FIQ-routed (boot/fiq_entry.S) instead of sharing this ordinary IRQ
+// path, so BOTH real dispatch entry points (this one, for UART RX; the
+// new timer_tick_dispatch below, for the timer) need to run this
+// exact prelude, unchanged, to preserve their own documented
+// invariant: "runs on every real scheduling decision, matching
+// exactly how often scheduler_pick_next itself runs" -- true before
+// this split (every IRQ), and still true now (every IRQ OR FIQ), just
+// via two call sites sharing one function instead of one function
+// handling both cases inline.
+fn scheduling_decision_prelude() -> i64 {
   let _ = irq_count_increment();
 
-  // ROUND 2026-09-18 (Gap B): check the PREVIOUS call's shadow
-  // prediction against what the real scheduler actually did (a switch
-  // happens in scheduler_switch_from_irq, called by irq_entry.S right
-  // after THIS function returns, on every IRQ -- so "previous call's
-  // prediction" always corresponds to exactly the decision that
-  // happened between then and now, unless an intervening non-tick
-  // switch also occurred, detected and honestly skipped below), then
-  // compute a FRESH prediction for the next call to check. See
-  // scheduler_pick_next_shadow_predict's own header comment for the
-  // full design and why this never calls the real scheduler_pick_next.
   let spn_valid: u32 = spn_shadow_prediction_valid_get();
   if spn_valid == (1 as u32) {
     let spn_pending: u32 = spn_shadow_predicted_task_get();
@@ -8699,19 +8714,6 @@ fn irq_dispatch() -> i64 {
   let _ = spn_shadow_ctxsw_baseline_set(spn_ctxsw_baseline_now);
   let _ = spn_shadow_prediction_valid_set(1 as u32);
 
-  // ROUND 2026-09-18 (RTOS true-compliance pass, task #241): runtime
-  // deadline-miss detection for the 6 fixed task indices (matching
-  // task_run_ticks_table's own HIGH/MEDIUM/LOW/IDLE/GC/SHELL
-  // convention) -- a genuine, previously-open RTOS-qualifying gap
-  // (RTOS_GAP_ANALYSIS.md's own "no deadline-miss detection" item,
-  // round 189's own measurement primitive finally has a real declared
-  // budget to compare against). Same safe vantage point as Gap B's
-  // shadow check above, for the same reason: runs on every IRQ (not
-  // just timer ticks), matching exactly how often scheduler_pick_next
-  // itself runs, and never touches scheduler_pick_next/scheduler_
-  // switch_from_irq directly -- see task_deadline_ticks_table's own
-  // header comment in context_switch.S for the full design and the
-  // honest imprecision this measurement carries.
   for dl_i from 0 to 6 {
     let dl_deadline: u32 = task_deadline_ticks_table_get_at(dl_i as u32);
     if dl_deadline != (0 as u32) {
@@ -8725,71 +8727,209 @@ fn irq_dispatch() -> i64 {
       }
     }
   }
+  return 0;
+}
 
-  let ic_pending1: i64 = IC_PENDING1;
-  let pending: u32 = mmio_read_u32(ic_pending1);
-  let was_timer_tick: i64 = 0;
-  if (pending & (2 as u32)) != (0 as u32) {
-    let timer_cs: i64 = TIMER_CS;
-    let timer_clo: i64 = TIMER_CLO;
-    let timer_c1: i64 = TIMER_C1;
+// ROUND 2026-09-18 (task #246): the timer tick's own dispatch,
+// extracted from irq_dispatch's former `if (pending & 2)` branch and
+// called EXCLUSIVELY from boot/fiq_entry.S now that the timer is
+// FIQ-routed -- unlike irq_dispatch (still shared, still checks its
+// own pending bits since multiple IRQ sources could exist), this
+// function is only ever invoked because a real timer FIQ fired, so it
+// needs no pending-bit check of its own: every call IS a real tick,
+// by construction (FIQ_CONTROL routes exactly one source here). Always
+// returns 1 (was_timer_tick), for scheduler_switch_from_irq's own
+// tick_count-increment gating, mirroring irq_dispatch's own
+// was_timer_tick==1 contract exactly.
+//
+// ROUND 2026-09-18 (task #246): priority=0 (S-20's own "lower number =
+// higher urgency" convention, parser.rs) -- genuinely correct now, not
+// just copied from the old combined function: this runs in FIQ mode,
+// which has REAL hardware priority over irq_dispatch's own IRQ mode
+// (FIQ preempts an in-progress IRQ; IRQ can never preempt FIQ) --
+// giving these two functions the SAME priority number (as an earlier,
+// mechanical version of this split briefly did, before this review)
+// would have silently disabled S-20's own pairwise priority-inversion
+// check between them (`if pi == pj { continue; }`, safety.rs) for
+// exactly the class of hazard that check exists to catch, on exactly
+// the two functions where a real preemption relationship now exists
+// for the first time in this project. Verified neither function (nor
+// anything reachable from scheduling_decision_prelude, which both
+// call) actually calls dhruva_mutex_lock -- so the check has nothing
+// to flag today -- but the priority numbers themselves need to be
+// honest regardless, for whenever that changes.
+#[no_mangle]
+#[interrupt(priority=0)]
+#[bounded_stack(bytes=1024)]
+#[wcet(cycles=130000)]
+fn timer_tick_dispatch() -> i64 {
+  // Real measured full timer-FIQ-dispatch cost -- see irq_tick_worst_
+  // us's own header comment in context_switch.S. Task #243's own
+  // measurement, semantics unchanged by the FIQ move (still "how long
+  // does the timer tick's own dispatch take"), just simpler now that
+  // this function is dedicated to exactly that case (no more sharing
+  // the entry/exit timestamps with an unrelated UART RX path).
+  let irq_t0: u32 = mmio_read_u32(TIMER_CLO);
 
-    // Acknowledge channel 1's match (write-1-to-clear) and reschedule
-    // the next one tick out (scheduler_tick_interval_us -- round 191,
-    // single source of truth shared with timer_ic_init), before doing
-    // anything else -- if the tick-handling work below ever took long
-    // enough to matter, the next deadline should already be armed, not
-    // computed late.
-    let _ = mmio_write_u32(timer_cs, 2 as u32);
-    let now: u32 = mmio_read_u32(timer_clo);
-    let interval: u32 = scheduler_tick_interval_us();
-    let next: u32 = now + interval;
-    let _ = mmio_write_u32(timer_c1, next);
+  let _ = scheduling_decision_prelude();
 
-    // ROUND 2026-09-18 (RTOS true-compliance pass, task #242): replenish
-    // this tick's UART RX IRQ budget -- see uart_rx_irq_budget's own
-    // header comment in boot/uart_rx_budget_state.S for the full
-    // sporadic-server design. If the previous tick's own budget got
-    // exhausted (a real sustained RX burst), the RX branch below
-    // masked UART_IMSC's RXIM bit to avoid a livelock -- re-enable it
-    // now that a fresh budget exists, so the level-triggered condition
-    // (if still genuinely pending) can fire and get serviced again.
-    let _ = uart_rx_irq_budget_set(UART_RX_IRQ_BUDGET_PER_TICK as u32);
-    if uart_rx_deferred_get() == (1 as u32) {
-      let _ = mmio_write_u32(UART_IMSC, 0x10 as u32);
-      let _ = uart_rx_deferred_set(0 as u32);
-    }
+  let timer_cs: i64 = TIMER_CS;
+  let timer_clo: i64 = TIMER_CLO;
+  let timer_c1: i64 = TIMER_C1;
 
-    // ROUND 2026-09-17: wired, gated by the same source-level constant
-    // watchdog_arm's own header comment explains in full -- disabled
-    // by default (real hardware watchdogs cannot be armed here without
-    // permanently breaking every QEMU test run, so this project's own
-    // checked-in default keeps it off), real protection once
-    // WATCHDOG_ENABLE_FOR_REAL_HARDWARE is flipped to 1 for an actual
-    // hardware deployment build.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
-      let _ = watchdog_kick();
-    }
-    //
-    // '.' instead of "tick\n": uart_puts's own wait loop makes it
-    // unboundable under #[wcet(...)] (see uart_putc_nonblocking's
-    // comment) -- a single best-effort byte keeps ticks visible in
-    // the log without reintroducing a blocking call to a hard-RT ISR.
-    let _ = uart_putc_nonblocking(46);
+  // Acknowledge channel 1's match (write-1-to-clear) and reschedule
+  // the next one tick out (scheduler_tick_interval_us -- round 191,
+  // single source of truth shared with timer_ic_init), before doing
+  // anything else -- if the tick-handling work below ever took long
+  // enough to matter, the next deadline should already be armed, not
+  // computed late.
+  let _ = mmio_write_u32(timer_cs, 2 as u32);
+  let now: u32 = mmio_read_u32(timer_clo);
+  let interval: u32 = scheduler_tick_interval_us();
+  let next: u32 = now + interval;
+  let _ = mmio_write_u32(timer_c1, next);
 
-    // Round 62 (fault injection): `fault irqburst <n>` -- see
-    // fault_irqburst_take's own comment for exactly what this does
-    // and does NOT simulate. Jumps the clock forward by n EXTRA ticks
-    // before scheduler_switch_from_irq (called by our own caller,
-    // irq_entry.S) does its normal +1 -- net effect, this tick's
-    // tick_count advances by n+1 instead of 1.
-    let irqburst_extra: u32 = fault_irqburst_take();
-    if irqburst_extra > (0 as u32) {
-      let _ = scheduler_set_tick_count_test_only(scheduler_get_tick_count() + irqburst_extra);
-    }
-
-    was_timer_tick = 1;
+  // ROUND 2026-09-18 (RTOS true-compliance pass, task #242): replenish
+  // this tick's UART RX IRQ budget -- see uart_rx_irq_budget's own
+  // header comment in boot/uart_rx_budget_state.S for the full
+  // sporadic-server design. If the previous tick's own budget got
+  // exhausted (a real sustained RX burst), the RX branch in irq_
+  // dispatch masked UART_IMSC's RXIM bit to avoid a livelock --
+  // re-enable it now that a fresh budget exists, so the level-
+  // triggered condition (if still genuinely pending) can fire and get
+  // serviced again.
+  let _ = uart_rx_irq_budget_set(UART_RX_IRQ_BUDGET_PER_TICK as u32);
+  if uart_rx_deferred_get() == (1 as u32) {
+    let _ = mmio_write_u32(UART_IMSC, 0x10 as u32);
+    let _ = uart_rx_deferred_set(0 as u32);
   }
+
+  // ROUND 2026-09-17: wired, gated by the same source-level constant
+  // watchdog_arm's own header comment explains in full -- disabled
+  // by default (real hardware watchdogs cannot be armed here without
+  // permanently breaking every QEMU test run, so this project's own
+  // checked-in default keeps it off), real protection once
+  // WATCHDOG_ENABLE_FOR_REAL_HARDWARE is flipped to 1 for an actual
+  // hardware deployment build.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
+  //
+  // '.' instead of "tick\n": uart_puts's own wait loop makes it
+  // unboundable under #[wcet(...)] (see uart_putc_nonblocking's
+  // comment) -- a single best-effort byte keeps ticks visible in
+  // the log without reintroducing a blocking call to a hard-RT ISR.
+  let _ = uart_putc_nonblocking(46);
+
+  // Round 62 (fault injection): `fault irqburst <n>` -- see
+  // fault_irqburst_take's own comment for exactly what this does
+  // and does NOT simulate. Jumps the clock forward by n EXTRA ticks
+  // before scheduler_switch_from_irq (called by our own caller,
+  // fiq_entry.S) does its normal +1 -- net effect, this tick's
+  // tick_count advances by n+1 instead of 1.
+  let irqburst_extra: u32 = fault_irqburst_take();
+  if irqburst_extra > (0 as u32) {
+    let _ = scheduler_set_tick_count_test_only(scheduler_get_tick_count() + irqburst_extra);
+  }
+
+  // Round 66: sample the running counters into the history ring buffer
+  // once per real tick -- ties "last N seconds" semantics to wall-clock
+  // ticks, not arbitrary IRQ frequency. scheduler_get_tick_count() is
+  // read fresh here rather than reusing anything already in scope --
+  // this project's own tick advance happens in scheduler_switch_from_
+  // irq, called by our own caller (fiq_entry.S) AFTER this function
+  // returns, so the value at this exact point is still last tick's
+  // count, one behind what this sample will actually represent by the
+  // time anything reads it back. Not a bug worth chasing: the counters
+  // sampled alongside it (context_switch/irq/prio_lock) are already
+  // exactly "as of now," and being one tick's worth of x-axis label
+  // behind them is a cosmetic granularity question, not a correctness
+  // one, for a "roughly what was activity like recently" query.
+  let _ = diag_ring_push(scheduler_get_tick_count(), context_switch_count_get() as u32, irq_count_get() as u32, prio_lock_count_get() as u32);
+
+  // Round 68 (this investigation): per-task stack overflow canary
+  // check (see boot/stack_canary.S's own header for the full "why").
+  // Same once-per-real-tick cadence as diag_ring_push just above --
+  // catches a breach within ~500ms of it happening and names the
+  // exact task, instead of the corruption silently propagating until
+  // it eventually surfaces as an unrelated wild-pointer crash
+  // arbitrarily far downstream, which is what made every one of this
+  // bug class's four prior incidents (round 9, 27, 60, 67) so hard to
+  // diagnose. A complementary, defense-in-depth layer alongside the
+  // real MMU guard pages every task stack now has (round 76/192,
+  // see stack_canary.S's own header for the full story and Gap A's
+  // 2026-09-17 live-verified fault-injection confirmation) -- this
+  // canary catches the rare "single write leaps clean over an entire
+  // 4KB guard page" case and gives a softer, per-task/per-tick
+  // diagnostic; the guard pages themselves are what genuinely
+  // PREVENT overflow now, not just detect it.
+  //
+  // ROUND 2026-09-17: dacr_open_all()'s one and only reason to exist
+  // is stack_canary_check_all's own cross-task read -- always
+  // correctly re-restricted by scheduler_pick_next before this
+  // exception ever returns to task-level code, same guarantee as
+  // before. ROUND 2026-09-18 (task #246): this whole function only
+  // ever runs for a real tick now (no more UART-RX sharing to avoid
+  // paying for), so there's no longer a reason to gate this behind a
+  // was_timer_tick check at all -- it's unconditional here by
+  // construction.
+  let _ = dacr_open_all();
+  let canary_breach: u32 = stack_canary_check_all();
+  if canary_breach != (0 as u32) {
+    // Fixed, unrolled sequence of single-byte non-blocking putc
+    // calls -- not uart_puts (blocking `while`, unbounded under
+    // #[wcet(...)], see uart_put_hex32_irq's own comment above for
+    // why) -- printing "CANARY mask=<hex> tick=<hex>\n" one
+    // hardcoded byte at a time.
+    let _ = uart_putc_nonblocking(67); // C
+    let _ = uart_putc_nonblocking(65); // A
+    let _ = uart_putc_nonblocking(78); // N
+    let _ = uart_putc_nonblocking(65); // A
+    let _ = uart_putc_nonblocking(82); // R
+    let _ = uart_putc_nonblocking(89); // Y
+    let _ = uart_putc_nonblocking(32); // ' '
+    let _ = uart_put_hex32_irq(canary_breach);
+    let _ = uart_putc_nonblocking(32); // ' '
+    let _ = uart_put_hex32_irq(scheduler_get_tick_count());
+    let _ = uart_putc_nonblocking(13); // '\r' -- see uart_putc_nonblocking's
+                                        // own comment: raw LF alone
+                                        // staircases on a live terminal,
+                                        // hand-added here to match the
+                                        // shell-echo path's own explicit
+                                        // CR+LF pattern a few hundred
+                                        // lines above, not centralized.
+    let _ = uart_putc_nonblocking(10); // '\n'
+  }
+
+  let irq_t1: u32 = mmio_read_u32(TIMER_CLO);
+  let irq_elapsed: u32 = irq_t1 - irq_t0;
+  let irq_worst: u32 = irq_tick_worst_us_get();
+  if irq_elapsed > irq_worst {
+    let _ = irq_tick_worst_us_set(irq_elapsed);
+  }
+  return 1;
+}
+
+// ROUND 2026-09-18 (task #246): simplified -- the timer tick moved to
+// its own FIQ-exclusive dispatch (timer_tick_dispatch above); this
+// function now handles only UART RX (the one remaining ordinary-IRQ
+// source), always returning 0 (was_timer_tick) since it's never a
+// tick anymore, by construction. Round 192's own comment on this
+// being kernel-context IRQ handling, always re-restricted by
+// scheduler_pick_next before returning to task-level code, still
+// applies unchanged.
+//
+// priority=1: genuinely lower urgency than timer_tick_dispatch's own
+// priority=0 -- see that function's own comment on why these two
+// values must differ now, not just be copied from the old combined
+// function's single priority=0.
+#[no_mangle]
+#[interrupt(priority=1)]
+#[bounded_stack(bytes=1024)]
+#[wcet(cycles=130000)]
+fn irq_dispatch() -> i64 {
+  let _ = scheduling_decision_prelude();
+  let was_timer_tick: i64 = 0;
 
   let ic_pending2: i64 = IC_PENDING2;
   let pending2: u32 = mmio_read_u32(ic_pending2);
@@ -8866,88 +9006,14 @@ fn irq_dispatch() -> i64 {
     }
   }
 
-  // Round 66: sample the running counters into the history ring buffer
-  // once per REAL tick only (not every UART RX interrupt) -- ties
-  // "last N seconds" semantics to wall-clock ticks, not arbitrary IRQ
-  // frequency, and keeps this at the same ~500ms granularity as every
-  // other tick-driven thing in this project (the governor, sleep_
-  // until_table). scheduler_get_tick_count() is read fresh here rather
-  // than reusing anything already in scope -- this project's own tick
-  // advance happens in scheduler_switch_from_irq, called by our OWN
-  // caller (irq_entry.S) AFTER irq_dispatch returns, so the value at
-  // this exact point is still last tick's count, one behind what this
-  // sample will actually represent by the time anything reads it back.
-  // Not a bug worth chasing: the counters sampled alongside it
-  // (context_switch/irq/prio_lock) are already exactly "as of now,"
-  // and being one tick's worth of x-axis label behind them is a
-  // cosmetic granularity question, not a correctness one, for a
-  // "roughly what was activity like recently" query.
-  if was_timer_tick == 1 {
-    let _ = diag_ring_push(scheduler_get_tick_count(), context_switch_count_get() as u32, irq_count_get() as u32, prio_lock_count_get() as u32);
-
-    // Round 68 (this investigation): per-task stack overflow canary
-    // check (see boot/stack_canary.S's own header for the full "why").
-    // Same once-per-real-tick cadence as diag_ring_push just above --
-    // catches a breach within ~500ms of it happening and names the
-    // exact task, instead of the corruption silently propagating until
-    // it eventually surfaces as an unrelated wild-pointer crash
-    // arbitrarily far downstream, which is what made every one of this
-    // bug class's four prior incidents (round 9, 27, 60, 67) so hard to
-    // diagnose. A complementary, defense-in-depth layer alongside the
-    // real MMU guard pages every task stack now has (round 76/192,
-    // see stack_canary.S's own header for the full story and Gap A's
-    // 2026-09-17 live-verified fault-injection confirmation) -- this
-    // canary catches the rare "single write leaps clean over an entire
-    // 4KB guard page" case and gives a softer, per-task/per-tick
-    // diagnostic; the guard pages themselves are what genuinely
-    // PREVENT overflow now, not just detect it.
-    //
-    // ROUND 2026-09-17: dacr_open_all() moved here from the top of
-    // irq_dispatch (see this function's own entry comment) -- this is
-    // the one and only reason it's ever needed. Always correctly
-    // re-restricted by scheduler_pick_next before this IRQ ever
-    // returns to task-level code, same guarantee as before, just no
-    // longer paid for on every UART RX interrupt too.
-    let _ = dacr_open_all();
-    let canary_breach: u32 = stack_canary_check_all();
-    if canary_breach != (0 as u32) {
-      // Fixed, unrolled sequence of single-byte non-blocking putc
-      // calls -- not uart_puts (blocking `while`, unbounded under
-      // #[wcet(...)], see uart_put_hex32_irq's own comment above for
-      // why) -- printing "CANARY mask=<hex> tick=<hex>\n" one
-      // hardcoded byte at a time.
-      let _ = uart_putc_nonblocking(67); // C
-      let _ = uart_putc_nonblocking(65); // A
-      let _ = uart_putc_nonblocking(78); // N
-      let _ = uart_putc_nonblocking(65); // A
-      let _ = uart_putc_nonblocking(82); // R
-      let _ = uart_putc_nonblocking(89); // Y
-      let _ = uart_putc_nonblocking(32); // ' '
-      let _ = uart_put_hex32_irq(canary_breach);
-      let _ = uart_putc_nonblocking(32); // ' '
-      let _ = uart_put_hex32_irq(scheduler_get_tick_count());
-      let _ = uart_putc_nonblocking(13); // '\r' -- see uart_putc_nonblocking's
-                                          // own comment: raw LF alone
-                                          // staircases on a live terminal,
-                                          // hand-added here to match the
-                                          // shell-echo path's own explicit
-                                          // CR+LF pattern a few hundred
-                                          // lines above, not centralized.
-      let _ = uart_putc_nonblocking(10); // '\n'
-    }
-  }
-
-  // ROUND 2026-09-18 (task #243): consume the entry timestamp -- see
-  // this function's own top and irq_tick_worst_us's header comment in
-  // context_switch.S.
-  if was_timer_tick == 1 {
-    let irq_t1: u32 = mmio_read_u32(TIMER_CLO);
-    let irq_elapsed: u32 = irq_t1 - irq_t0;
-    let irq_worst: u32 = irq_tick_worst_us_get();
-    if irq_elapsed > irq_worst {
-      let _ = irq_tick_worst_us_set(irq_elapsed);
-    }
-  }
+  // ROUND 2026-09-18 (task #246): the diag_ring_push/stack-canary/
+  // irq_tick_worst_us block that used to live here, gated on
+  // `was_timer_tick == 1`, moved to timer_tick_dispatch (see that
+  // function's own body) along with the timer branch that used to be
+  // the only way was_timer_tick ever became 1 in this function. This
+  // function is UART-RX-only now -- was_timer_tick is always 0 here,
+  // by construction, so that gated block would never have executed
+  // again anyway.
   return was_timer_tick;
 }
 

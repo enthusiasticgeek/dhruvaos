@@ -82,6 +82,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/irq_entry.S" -o "${BUILD_DIR}/irq_entry.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/fiq_entry.S" -o "${BUILD_DIR}/fiq_entry.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/rpi1/vectors.S" -o "${BUILD_DIR}/vectors.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -241,7 +244,7 @@ llc -mtriple="${TRIPLE}" -mcpu="${CPU}" -filetype=obj \
 arm-none-eabi-gcc -nostdlib -ffreestanding \
   -Wl,--gc-sections -Wl,-T,"${ROOT}/boot/rpi1/link.ld" \
   "${BUILD_DIR}/boot.o" "${BUILD_DIR}/mmu_init.o" "${BUILD_DIR}/context_switch.o" \
-  "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/vectors.o" \
+  "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/fiq_entry.o" "${BUILD_DIR}/vectors.o" \
   "${BUILD_DIR}/sdcard_state.o" "${BUILD_DIR}/dharafs_buf.o" \
   "${BUILD_DIR}/dharafs_state.o" "${BUILD_DIR}/shell_state.o" \
   "${BUILD_DIR}/governor_state.o" "${BUILD_DIR}/netif_state.o" \

@@ -56,12 +56,18 @@ _vectors:
 .word fault_data_abort
 .word fault_reserved
 .word irq_entry
-.word fault_fiq
+.word fiq_entry           /* Task #246 (2026-09-18): real handler now,
+                            * boot/fiq_entry.S -- was fault_fiq (crash
+                            * stub) up to this round; the timer tick is
+                            * routed here instead of ordinary IRQ, see
+                            * that file's own header comment. */
 
 /* Phase 2 doesn't recover from most of these -- just halts, so a real
  * bug shows up as "the board stopped," not as running on into
- * corrupted state. undef/swi/reserved/fiq still have no UART
- * diagnostic; not required for anything built so far.
+ * corrupted state. undef/swi/reserved still have no UART diagnostic;
+ * not required for anything built so far. fiq (task #246, 2026-09-18)
+ * is no longer in this group -- see boot/fiq_entry.S, a real handler
+ * now that the timer tick is FIQ-routed.
  *
  * Round 38: fault_data_abort/fault_prefetch_abort get a real
  * diagnostic instead -- MMU permission faults (this round's own W^X
@@ -86,11 +92,9 @@ _vectors:
 .global fault_undef
 .global fault_swi
 .global fault_reserved
-.global fault_fiq
 fault_undef:
 fault_swi:
 fault_reserved:
-fault_fiq:
     b .
 
 .global fault_data_abort
