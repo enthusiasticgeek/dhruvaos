@@ -6923,3 +6923,72 @@ forward (surfaced immediately via a bounded diagnostic print, and
 summarized in the `diagnose` shell command's own output) is a genuine
 finding worth investigating, not something silently tolerated. Commit
 `3b15008`.
+
+### Gap D closed: two real, confirmed bugs found and fixed in vani's own #[wcet(...)]/#[interrupt] enforcement (2026-09-18)
+
+"Independently verify vani's own `#[wcet(...)]`/`#[bounded_stack(...)]`
+static estimators are actually sound (never under-estimate)" -- rather
+than treat this as an unfalsifiable question, read `vani-compiler`'s
+own `src/safety.rs` (the actual enforcement source) line by line and
+found two real, confirmed, previously-unnoticed bugs.
+
+**BUG-236 (vani-compiler)**: `wcet_expr`'s own `E::Binary` handler
+charged a FLAT 2 cycles for every binary operator -- `op: BinaryOp`
+pattern-matched away via `..` -- meaning a raw `/`/`%` got charged
+identically to `+`. `wcet_builtin_cycles`' own adjacent doc comment
+already documented an INTENDED "Integer divide / modulo: 20-40 cycles
+(in-order cores)" category, but that number was only ever wired up for
+named stdlib functions, never the raw operator a real program actually
+writes. On ARM1176JZF-S (this project's own real target, no hardware
+integer-divide instruction at all -- a raw `/` compiles to a real
+`__aeabi_ldivmod` software-division call), this meant `#[wcet(...)]`
+could silently pass a function whose real worst-case execution time
+it dramatically underestimated -- the exact "never under-estimate"
+soundness property this whole mechanism exists to guarantee, violated.
+Also ignored `checked` (the real divisor-!=-0/overflow/bounds runtime
+guard) entirely, for every operator.
+
+Grounded the fix in a real measurement, not a guess: added
+`i64_div_wcet_measure_self_test` (TIMER_CLO-bracketed, 100000
+divisions) plus a same-shape addition-loop comparison sharing the
+identical QEMU-TCG-emulation host-speed baseline. Real result: a
+single division's own marginal cost came out to roughly **10.6x** a
+single checked-add's -- informing the corrected estimator's new
+Div/Rem base cost of 50 (not the file's own previously-documented but
+never-applied "20-40" range, which was apparently tuned for cores
+with SOME hardware divide support, optimistic for this one). Fixed
+upstream in `vani-compiler` (commit `dc326a4e`); rebuilding DhruvaOS
+against the corrected `vanic` needed **zero** `#[wcet(cycles=N)]`
+budget changes -- the generous headroom already given to Gap C's own
+task-body budgets (raised well past the bare minimum at the time,
+established practice all session) happened to absorb the more-honest
+costs without further adjustment.
+
+**BUG-237 (vani-compiler)**: `#[interrupt]`'s own "forbid blocking
+lock acquire" check used a hardcoded 3-name denylist
+(`"mutex_lock"`/`"condvar_wait"`/`"condvar_wait_timeout"`) -- all
+vani's own LANGUAGE-LEVEL `Mutex<T>`/`Condvar` builtins. This
+project's own real, genuinely-blocking mutex (`dhruva_mutex_lock`, a
+real priority-inheritance mutex, `extern "C"`) matched none of them --
+a call to it from inside an `#[interrupt]` function would have been
+silently ALLOWED, defeating the exact deadlock-prevention guarantee
+the check's own diagnostic message describes. Confirmed currently
+INERT for this project (its one `#[interrupt]` function, `irq_dispatch`,
+never calls it) -- a real, exploitable gap in the mechanism itself,
+not a live incident. Fixed narrowly upstream (added the one concrete
+name); the general fix (a new `#[blocking]` attribute surface for
+`extern` function declarations) is real, substantial scope, tracked
+as vani-compiler's own follow-up, not attempted here.
+
+**Verified**: `vani-compiler`'s own full test suite (3030 tests, two
+pre-existing tests' hardcoded expected cycle counts updated to reflect
+the now-honest `checked`-guard cost, confirmed by hand the delta is
+exactly explained by the fix) passes 100% clean. DhruvaOS rebuilt
+against the corrected compiler: clean build, full
+`phase4_milestone.py` regression battery unchanged (same 4-FAIL
+baseline), zero `SCHED SHADOW MISMATCH` reports (Gap B's own
+verification unaffected by the compiler change). DhruvaOS commit
+`6a5dfcb`; vani-compiler commit `dc326a4e`.
+
+**This closes every gap from the RTOS/DharaFS safety-certification
+audit's original scoped list**: A, B, C, D, E, F all done.
