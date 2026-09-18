@@ -4824,6 +4824,115 @@ fn dharafs_append(path: Str, data: Str) -> i64 {
   return dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
 }
 
+// ROUND 2026-09-18 (RTOS true-compliance pass, task #244): guaranteed-
+// bounded write entry point for real-time-critical callers --
+// RTOS_GAP_ANALYSIS.md's own "no pre-reserved, guaranteed-bounded
+// allocation path" item.
+//
+// dharafs_append above LOOKS bounded but genuinely isn't: its own
+// "preserve existing owner/mode on overwrite" convenience calls
+// dharafs_stat, which falls through to dharafs_find_latest_block_raw's
+// real, unbounded linear SD-read scan (log_start..next_block) on a
+// dirindex miss -- and the dirindex is a fixed 256-slot hash table, so
+// a miss (table full, or a path genuinely never indexed) is a real,
+// reachable case, not a hypothetical one. dharafs_append_raw ITSELF
+// has no such lookup at all (confirmed by reading its own body: no
+// call to dharafs_block_read, no loop whose trip count depends on log
+// size) -- this just exposes that already-bounded primitive as a
+// proper Str-taking entry point, requiring the caller to supply
+// owner/gid/mode explicitly instead of auto-preserving them, so the
+// unbounded lookup is structurally unreachable, not merely unlikely.
+//
+// Real, provable worst-case cost: exactly ceil(data_len /
+// dharafs_block_payload_cap()) SD block WRITES, and ZERO SD reads --
+// independent of log size, fragmentation, or dirindex state. Verified
+// by direct code inspection (the same discipline task #188's own SD
+// worst-case-latency contract used), not a live counter -- there is no
+// loop in the call path below whose bound is anything but a fixed
+// function of data_len.
+fn dharafs_write_bounded(path: Str, data: Str, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  let data_len: i64 = str_len_bytes(data);
+  if path_len <= 0 {
+    return 1;
+  }
+  if path_len > 32 {
+    return 1;
+  }
+  if data_len > dharafs_file_max_len() {
+    return 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let j: i64 = 0;
+  while j < data_len {
+    let _ = buf_write_byte(data_buf, j as u32, str_byte_at(data, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+// ROUND 2026-09-18 (task #244): round-trip correctness for dharafs_
+// write_bounded -- the bounded-cost CLAIM is verified by direct code
+// inspection (see that function's own header comment), this verifies
+// the data itself is genuinely correct, including confirming stat
+// reports back exactly the explicit owner/gid/mode passed in (proving
+// this path really does skip the "preserve existing" lookup, not just
+// happening to produce the same values by coincidence).
+fn dharafs_write_bounded_self_test() -> i64 {
+  let ok: i64 = 1;
+  let path: Str = "/boundedtest/f";
+  let data: Str = "hello-bounded-write";
+  let write_status: i64 = dharafs_write_bounded(path, data, 42 as u32, 7 as u32, 0x1A0 as u32 /* 0o640, rw-r----- */);
+  if write_status != 0 {
+    ok = 0;
+  }
+
+  let read_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let read_len: i64 = dharafs_read(path, read_buf);
+  let data_len: i64 = str_len_bytes(data);
+  if read_len != data_len {
+    ok = 0;
+  }
+  let ci: i64 = 0;
+  while ci < data_len {
+    let want: u32 = str_byte_at(data, ci) as u32;
+    let got: u32 = buf_read_byte(read_buf, ci as u32);
+    if got != want {
+      ok = 0;
+    }
+    ci = ci + 1;
+  }
+
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat(path, meta_buf);
+  if stat_status != 0 {
+    ok = 0;
+  }
+  if buf_read_u32(meta_buf, 0 as u32) != (42 as u32) {
+    ok = 0;
+  }
+  if buf_read_u32(meta_buf, 4 as u32) != (7 as u32) {
+    ok = 0;
+  }
+  if buf_read_u32(meta_buf, 8 as u32) != (0x1A0 as u32 /* 0o640, rw-r----- */) {
+    ok = 0;
+  }
+
+  let _ = uart_puts("DharaFS: dharafs_write_bounded round trip + explicit owner/gid/mode (no preserve-existing lookup)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return ok;
+}
+
 // Round 42: permission-enforcing entry points. dharafs_read_raw/
 // dharafs_append_raw/dharafs_delete_raw themselves stay UNCHECKED, trusted
 // primitives -- dharafs_compact and dharafs_list both need to operate across
@@ -34825,6 +34934,7 @@ fn kernel_main() -> i64 {
 
   // Round 39: multi-block files + journaling hardening.
   let _ = dharafs_multiblock_self_test();
+  let _ = dharafs_write_bounded_self_test();
   let _ = dharafs_multiblock_crash_consistency_self_test();
 
   // Round 77: dharafs_compact's own resumable, per-call-bounded pass.
