@@ -4055,6 +4055,81 @@ fn sdhost_card_addr(block_num: i64) -> u32 {
 // less real work -- a command/response handshake, not a full 512-byte
 // FIFO transfer plus card busy-time). Speculative -- not yet confirmed
 // by a real-hardware log with this specific change in place.
+// BUG found 2026-09-19 (real-hardware SD wedge investigation, per a
+// fresh real-HW log captured with the newly-added CMD17/CMD24
+// FAIL_FLAG check and write-path SDEDM instrumentation both active for
+// the first time): confirmed READS now genuinely succeed (task #217's
+// own READDATA fix), but the very NEXT write command issued right
+// after a successful read -- with NO intervening controller reinit --
+// sometimes fails outright with SDCMD_FAIL_FLAG + SDHSTS_CMD_TIME_OUT
+// on CMD24 itself (the card never responds at all), captured directly:
+// "CMD24 (WRITE_BLOCK) FAILED (SDCMD_FAIL_FLAG set) -- SDCMD=0x4098
+// SDHSTS=0x41". This sequence (successful read immediately followed by
+// a write, no reinit in between) never happened before the READDATA
+// fix -- reads never used to succeed at all, so this exact interaction
+// is new territory this investigation has never been able to exercise
+// until now.
+//
+// Checked both real references (Linux/U-Boot bcm2835-sdhost.c) for
+// whether SDEDM_FORCE_DATA_MODE (bit19, the bit this function sets to
+// force the FSM out of READWAIT/WRITESTART1/READDATA) is ever
+// explicitly cleared afterward -- it is NOT, in either reference,
+// anywhere. That's consistent with it being a self-clearing "pulse"
+// trigger on real silicon (write 1, hardware handles the actual
+// transition and the bit reads back 0 once settled) -- but neither
+// reference's own driver ever exercises the specific "force a read
+// out, then immediately issue a write with no reset in between"
+// sequence this project's own polling-only, no-DMA design does
+// (Linux/U-Boot are both interrupt-driven and structure requests
+// differently). If this bit is NOT fully self-clearing on THIS
+// specific silicon/timing, leaving it set would be exactly the kind
+// of stale state that could plausibly disrupt the next command's own
+// dispatch. Explicitly confirming the forced transition actually
+// completed (FSM reaches DATAMODE/IDENTMODE) and then explicitly
+// clearing the bit ourselves cannot make this worse (a no-op if the
+// bit was already self-clearing) and directly closes this gap if it
+// wasn't -- see this function's own two call sites below.
+// ROUND 2026-09-19 (regression fix): originally bounded at 100000 to
+// mirror this file's other real-hardware-calibrated poll loops, but
+// this function's own caller discards its return value on both call
+// sites (`let _ = sdhost_force_data_mode_settle(...); return 0;`) --
+// nothing downstream ever distinguishes "settled" from "timed out
+// here." Its only real job is to give the hardware a brief window to
+// finish the forced transition before the FORCE_DATA_MODE bit is
+// cleared; it is not a primary wait (sdhost_wait_transfer_complete's
+// own outer loop, bounded at 5000000, already owns "genuinely stuck").
+// Under QEMU, phase4_milestone.py caught this directly: adding this
+// settle step newly failed tlsecho (previously always PASS), and the
+// SD 8-block diagnostic sweep's own elapsed time (9141us) showed no
+// obvious blowup there -- pointing instead at cumulative cost from
+// this function running to its full bound on ordinary reads, not just
+// real-hardware wedge cases (FSM briefly reading 2/READDATA on a
+// normal, otherwise-fast QEMU read is exactly what the fsm==2 branch
+// above now also routes through this function). Bounded at 1000
+// instead: still a real settle window on genuine hardware, two orders
+// of magnitude cheaper in the worst case where QEMU's SD model never
+// visibly moves FSM to 0/1 in response to the forced write at all.
+fn sdhost_force_data_mode_settle(sdedm: i64) -> i64 {
+  let iter: i64 = 0;
+  while iter < 1000 {
+    let edm: u32 = mmio_read_u32(sdedm);
+    let fsm: u32 = edm & (0xF as u32);
+    if (fsm == (0 as u32)) || (fsm == (1 as u32)) {
+      let _ = mmio_write_u32(sdedm, edm & (0xFFF7FFFF as u32));
+      return 0;
+    }
+    iter = iter + 1;
+  }
+  // The forced transition didn't visibly complete within this bound --
+  // still clear the bit rather than leaving it stuck set indefinitely
+  // (this path is diagnostic-worthy but this function's own caller
+  // already treats the outer wait as a success either way, matching
+  // this function's own pre-existing behavior before this round).
+  let edm_final: u32 = mmio_read_u32(sdedm);
+  let _ = mmio_write_u32(sdedm, edm_final & (0xFFF7FFFF as u32));
+  return 1;
+}
+
 fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
   let sdedm: i64 = SDEDM;
   let iter: i64 = 0;
@@ -4066,6 +4141,7 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
     }
     if fsm == alternate_idle {
       let _ = mmio_write_u32(sdedm, edm | (0x80000 as u32));
+      let _ = sdhost_force_data_mode_settle(sdedm);
       return 0;
     }
     // BUG found 2026-09-19 (real-hardware SD wedge investigation, 8th
@@ -4090,6 +4166,7 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
     // read/write-conditional version of it.
     if fsm == (2 as u32) {
       let _ = mmio_write_u32(sdedm, edm | (0x80000 as u32));
+      let _ = sdhost_force_data_mode_settle(sdedm);
       return 0;
     }
     iter = iter + 1;

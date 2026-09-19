@@ -8066,3 +8066,62 @@ have confused interpretation; widened to two hex digits. Verified via
 a fresh real-HW log -- this is the first diagnostic in this whole
 investigation to show what's happening DURING the write, not just
 before/after it.
+
+**Eleventh round, same day (2026-09-19), triggered directly by the
+tenth round's own new FAIL_FLAG check.** The very next real-HW log
+(`picocom_20260919_165624.log`) caught, for the first time ever, a
+genuine `FAIL_FLAG` + `CMD_TIME_OUT` on CMD24 itself
+(`SDCMD=0x00004098 SDHSTS=0x00000041`) -- the card never responded at
+all -- immediately following a successful CMD17 read, with no
+controller reinit in between. This exact sequence (successful read
+immediately followed by a write) never happened before the eighth
+round's own READDATA fix, since reads never used to succeed at all --
+new territory this investigation could not exercise until now.
+
+Checked both real references again for whether `SDEDM_FORCE_DATA_MODE`
+(bit19 -- the bit the eighth round's fix sets to force the FSM out of
+READWAIT/WRITESTART1/READDATA) is ever explicitly cleared afterward:
+it is NOT, in either Linux or U-Boot, anywhere. Consistent with a
+self-clearing pulse trigger on real silicon -- but neither reference
+ever exercises this project's own specific "force a read out, then
+immediately issue a write with no reset in between" sequence (both are
+interrupt-driven and structure requests differently). Hypothesis: if
+this bit is not fully self-clearing on this specific silicon/timing,
+leaving it set could plausibly disrupt the very next command's own
+dispatch. Added `sdhost_force_data_mode_settle` (`kernel_main.vani`):
+after forcing the bit, polls for the FSM to genuinely reach
+DATAMODE/IDENTMODE, then explicitly clears bit19, wired into both of
+`sdhost_wait_transfer_complete`'s own force-exit branches
+(`alternate_idle` and the eighth round's READDATA/`fsm==2` case).
+
+**One real regression caught via the mandatory post-change
+`phase4_milestone.py` run, root-caused and fixed before committing.**
+First version bounded the new settle poll at 100000 iterations
+(matching this file's other real-hardware-calibrated bounds) --
+this newly failed `tlsecho` (previously PASS in every run this entire
+investigation). Root cause: `sdhost_force_data_mode_settle`'s own
+return value is discarded by both call sites
+(`let _ = sdhost_force_data_mode_settle(...); return 0;`) -- nothing
+downstream ever distinguishes "settled" from "timed out here," so the
+100000-iteration bound was buying zero correctness benefit, only real
+QEMU wall-clock cost. Under QEMU, `FSM=READDATA` (the eighth round's
+own fix target) is apparently a normal transient state on ordinary
+successful reads, not exclusively a real-hardware wedge symptom, and
+QEMU's own SD model does not appear to visibly move `FSM` in response
+to the forced-bit write within a tight poll -- so this function likely
+ran to its full bound on most/all reads, adding cumulative latency
+across the whole boot sequence, enough to tip the already-marginal
+TLS-dependent test chain over `tlsecho`'s own blind `SETTLE_S` budget
+(the exact same class of cumulative-SD-latency regression this file's
+own SDCDIV-fix entry above already documents happening to `httpecho`).
+Fixed by shrinking the bound to 1000 -- still a real settle window on
+genuine hardware, two orders of magnitude cheaper in the QEMU worst
+case, with no correctness change (the return value was never used).
+Re-verified via `phase4_milestone.py`: exact 4-FAIL baseline restored,
+`tlsecho` back to PASS, SD 8-block sweep unchanged (`any_fail=0`,
+~9.1-9.2ms both before and after). Not yet real-HW tested. This fix
+targets the FAIL_FLAG/CMD_TIME_OUT symptom specifically -- it does NOT
+explain or fix the ORIGINAL data-phase wedge (FSM stuck in WRITEDATA
+from word 1 through word 128, FIFO empty throughout, block 2100's own
+first write attempt), which remains a separate, still-unexplained
+failure mode.
