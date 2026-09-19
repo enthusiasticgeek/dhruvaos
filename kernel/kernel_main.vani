@@ -4065,6 +4065,30 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
       let _ = mmio_write_u32(sdedm, edm | (0x80000 as u32));
       return 0;
     }
+    // BUG found 2026-09-19 (real-hardware SD wedge investigation, 8th
+    // fix attempt, against U-Boot's own bcm2835_sdhost.c fetched fresh
+    // -- a bare-metal/polling driver architecturally closer to this
+    // one than Linux's IRQ-driven design, per the user's own structured
+    // debugging prompt). U-Boot's own bcm2835_wait_transfer_complete is
+    // UNPARAMETERIZED -- one function, used for both reads and writes,
+    // that treats THREE FSM states as safe to force out of via
+    // SDEDM_FORCE_DATA_MODE: READWAIT(4), WRITESTART1(0xA), AND
+    // READDATA(2) -- checked unconditionally, not gated by transfer
+    // direction. This function only ever checked the single
+    // `alternate_idle` its caller passed (READWAIT for reads,
+    // WRITESTART1 for writes) -- READDATA was never recognized as an
+    // exit state at all. Every real-hardware READ wedge this
+    // investigation has ever captured decodes to FSM=READDATA
+    // (SDEDM=0x10902/0x108F2/etc, confirmed via the authoritative
+    // SDEDM_FSM_* bit definitions both Linux and U-Boot agree on) --
+    // exactly the state this function had no escape hatch for. Add the
+    // same unconditional check U-Boot uses, matching its own real,
+    // proven-working sequence exactly rather than re-deriving a
+    // read/write-conditional version of it.
+    if fsm == (2 as u32) {
+      let _ = mmio_write_u32(sdedm, edm | (0x80000 as u32));
+      return 0;
+    }
     iter = iter + 1;
   }
   // ROUND 2026-09-18 (SD wedge investigation, fresh real-HW log
