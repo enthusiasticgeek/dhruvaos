@@ -35689,37 +35689,73 @@ fn kernel_main() -> i64 {
   // task_d/IDLE -- this is the real first test of a USR-mode task that
   // actually uses privileged syscalls, not just the mode-switch
   // machinery alone.
-  // Task #253 Phase 3 (2026-09-19): task_a's OWN USR-mode conversion
-  // attempted this round, REVERTED here -- not yet safe. Found and
-  // fixed real bugs in the underlying trap infrastructure along the
-  // way (kept, see swi_entry.S: cpsid f masking, r5/r6/r8/r9/r11/r7
-  // register preservation, is_usr_mode_task-gated usr_sp_table
-  // capture/restore, dhruva_prio_lock/_unlock now real syscalls#3/#4),
-  // each individually verified against phase4_milestone.py. But task_a
-  // itself kept reproducing a genuine, not-yet-fully-characterized
-  // scheduler race: task_a's own current_task reads WRONG (3/IDLE
-  // instead of 0/task_a) inside task_sleep_ticks_impl on its own third
-  // wake cycle, corrupting sleep_until_table[3] with a bogus future
-  // wake time, which makes IDLE -- the scheduler's own permanent
-  // "always ready" safety net -- look "not ready" to scheduler_pick_
-  // next, which then falls through to an unused task-index sentinel
-  // and crashes on resume (sp_table entry NULL). Root cause traced as
-  // far as: task_a (index 0) and task_d/IDLE both sit at effective
-  // priority 0 (task_a's own base priority; IDLE only while its own
-  // uart_puts_bounded-internal ceiling-0 lock is held) -- but task_a's
-  // OWN eff_prio[0]==base_prio[0] always, so scheduler_pick_next's own
-  // "boosted, ties favor incumbent" gate (spn_old_algorithm) never
-  // triggers FOR task_a specifically, meaning task_a always competes
-  // via the fair round-robin path (spn_new_algorithm) even when IDLE
-  // is using the strict-incumbent path -- a genuine asymmetry between
-  // the two tie-breaking algorithms for two same-priority tasks that
-  // needs real design attention, not a quick register fix, before
-  // task_a can safely convert. Real next step: understand and fix that
-  // asymmetry (or give task_a's own ceiling-0 calls the same strict-
-  // incumbent treatment IDLE gets) BEFORE re-attempting task_a's own
-  // conversion; task_d/IDLE's own existing USR-mode conversion is
-  // unaffected (proven clean both before and after this round's fixes).
+  // Task #253 Phase 3 RE-ATTEMPTED (2026-09-19), same day: the first
+  // attempt found a genuine scheduler-design bug, not a register bug --
+  // scheduler_pick_next's own "ties favor incumbent" protection used to
+  // be gated on "eff_prio[current] < base_prio[current]" (a proxy for
+  // "is this task inside a ceiling-protected critical section"), which
+  // is structurally unable to trigger for task_a specifically: task_a's
+  // OWN base_prio is ALREADY the system ceiling (0), so dhruva_prio_
+  // lock(0) on it is a no-op boost (0 -> 0, no change), and the old gate
+  // could never tell "task_a is mid-critical-section" from "task_a is
+  // just running normally". Root-caused and FIXED at the architectural
+  // level (context_switch.S): replaced the eff_prio/base_prio proxy
+  // with an explicit ceiling_depth_table[task], incremented/decremented
+  // by dhruva_prio_lock_impl/dhruva_prio_unlock_impl themselves -- see
+  // that table's own header comment in context_switch.S for the full
+  // design rationale (this IS the real, correct fix a Priority Ceiling
+  // Protocol implementation needs, kept regardless of task_a's own
+  // status below: an explicit "am I in my own critical section" state,
+  // not an inference from a side effect that happens not to occur at
+  // the ceiling). Re-verified clean against phase4_milestone.py on its
+  // own (task_a still SVC-mode) before re-attempting task_a's own
+  // conversion with it in place.
+  //
+  // RE-ATTEMPT RESULT: the ceiling_depth_table fix is real and
+  // necessary, but NOT sufficient -- task_a's own conversion still
+  // reproduces a crash, and live GDB tracing found a SEPARATE, deeper
+  // bug: ceiling_depth_table[3] (IDLE) reads 0 (not protected) at the
+  // exact moment eff_prio_table[3] STILL shows 0 (boosted) -- a state
+  // that should be impossible if lock/unlock ever paired correctly,
+  // meaning task_sleep_ticks_impl's own `sp_table[current] = our frame`
+  // write happened with current_task misread as 3 (IDLE) at some
+  // EARLIER point during task_a's own execution, planting task_a's own
+  // saved-context pointer into IDLE's sp_table slot -- from then on,
+  // every legitimate "resume task 3" decision actually resumes task_a's
+  // own code under IDLE's identity, a self-sustaining corruption the
+  // tie-break fix cannot prevent (it protects against being PREEMPTED,
+  // not against a wrong INDEX being written in the first place). Root
+  // cause of THAT misread not yet found -- needs dedicated
+  // investigation with fresh budget, not a quick continuation. Reverted
+  // task_a to SVC mode again pending that; ceiling_depth_table stays
+  // (independently correct). Converting task_b next instead (see its
+  // own comment below) to keep making real, verified progress on task
+  // #253's broader goal without task_a's own ceiling-priority edge case.
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
+  // Task #253 Phase 3, task_b -- ALSO reverted to SVC mode (2026-09-19).
+  // Converted to USR mode as the "sidesteps task_a's ceiling-priority
+  // edge case" attempt above describes, then live-tested: hung with the
+  // IDENTICAL crash signature as task_a's own attempt (current_task
+  // misread as 3/IDLE inside task_sleep_ticks_impl's own scheduler_pick_
+  // next call, "old=3 new=10", sp_table[3] getting overwritten with the
+  // wrong task's saved-context pointer). task_b has NO explicit dhruva_
+  // prio_lock/unlock of its own and is not the system ceiling -- this
+  // rules OUT the ceiling-priority/nested-locking theory entirely: the
+  // bug is task-independent. The real common factor: task_d/IDLE is the
+  // ONLY task that has ever run in USR mode before this work, and IDLE
+  // NEVER calls task_sleep_ticks (it uses cpu_wfi() instead) -- so
+  // task_sleep_ticks_impl's own block-and-much-later-resume cycle
+  // (which round-trips through possibly many OTHER context switches
+  // before the sleeping task's own sp_table/usr_resume_pc_table slot is
+  // read back) had literally never been exercised by a genuinely USR-
+  // mode-originated call before task_a's or task_b's own conversion
+  // attempts. That is the real, still-open bug surface for task #253's
+  // remaining scope -- NOT specific to task_a or task_b. Reverting both
+  // to the proven baseline (task_d/IDLE only in USR mode) rather than
+  // continuing to retry other tasks one-by-one against the same
+  // untouched root cause. See docs/TODO.md for the full writeup and the
+  // decision to treat this as BLOCKED pending a dedicated root-cause
+  // session, not a quick continuation.
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
   let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
   let sp_d: mut ref i64 = task_d_init_stack_usr(stack_d, stack_bytes);

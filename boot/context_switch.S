@@ -202,6 +202,39 @@ base_prio_table:
                           * fixed tasks and by task_create for dynamic
                           * ones, exactly mirroring eff_prio_table's own
                           * seeding. */
+/* Task #253 architectural fix (2026-09-19): explicit ceiling-critical-
+ * section DEPTH per task, replacing scheduler_pick_next's own former
+ * "eff_prio[current] < base_prio[current]" proxy for "is current_task
+ * inside a dhruva_prio_lock/unlock section right now". That proxy is
+ * structurally unable to represent the answer correctly for any task
+ * whose base_prio is ALREADY the system ceiling (0 today, task_a/HIGH)
+ * -- dhruva_prio_lock(0) on such a task boosts eff_prio to 0, i.e. NO
+ * CHANGE, since it started at 0 already, so eff_prio never differs
+ * from base_prio and the old gate could never trigger for it. Found
+ * live: converting task_a to USR mode exposed this for the first time
+ * (task_a is the only task whose own base_prio is 0) -- its own
+ * ceiling-0 critical sections (uart_puts_bounded's internal lock, and
+ * its own explicit lock/unlock around "acquired/released resource")
+ * got ZERO "ties favor incumbent" protection, silently letting the
+ * fair round-robin path preempt it mid-section and corrupt shared
+ * scheduler state (task_d/IDLE's own sleep_until_table entry, in the
+ * observed crash). An explicit depth counter, orthogonal to whatever
+ * numeric priority a task happens to hold, is correct regardless: it
+ * answers "is this task genuinely inside its own critical section"
+ * directly, the same question every real Priority Ceiling Protocol
+ * implementation (Sha/Rajkumar/Lehoczky 1990) needs answered, instead
+ * of inferring it from a side effect (a changed priority number) that
+ * happens not to occur at the system ceiling. A COUNTER, not a single
+ * bit -- dhruva_prio_lock/unlock nest for real in this codebase (task_
+ * a_wake_body's own explicit lock(0)/unlock(0) wraps a uart_puts_
+ * bounded call that ALSO takes/releases this same lock internally) --
+ * a boolean would have the inner unlock incorrectly clear protection
+ * while the outer lock is still logically held. Populated by dhruva_
+ * prio_lock_impl/dhruva_prio_unlock_impl below; consulted by scheduler_
+ * pick_next's own gate in place of the old eff_prio/base_prio compare. */
+ceiling_depth_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
 .equ MAX_MUTEXES, 4
 mutex_owner_table:
     .word 0, 0, 0, 0    /* owning task index per mutex, or 255
@@ -801,30 +834,38 @@ scheduler_pick_next:
     add r6, r6, #1
     str r6, [r12, r3, lsl #2]
 
-    /* Round 75 gate: is current_task ready right now, AND currently
-     * boosted (holding a ceiling-protected lock)? If so, this decision
-     * MUST use the old "ties favor the incumbent" algorithm -- see
-     * this function's own header comment for why round-robin here
-     * would be a real correctness regression, not just a style choice. */
+    /* Round 75 gate, FIXED task #253 (2026-09-19): is current_task
+     * ready right now, AND genuinely inside a ceiling-protected
+     * critical section? If so, this decision MUST use the old "ties
+     * favor the incumbent" algorithm -- see this function's own header
+     * comment for why round-robin here would be a real correctness
+     * regression, not just a style choice. Was "eff_prio[current] <
+     * base_prio[current]" (a proxy that breaks for task_a/HIGH, whose
+     * base_prio is already the system ceiling -- see ceiling_depth_
+     * table's own header comment for the full incident); now a direct
+     * read of ceiling_depth_table[current], set/cleared by dhruva_
+     * prio_lock_impl/dhruva_prio_unlock_impl themselves, correct
+     * regardless of what numeric priority the task holds. */
     ldr r6, [r5, r3, lsl #2]      /* sleep_until[current] */
     cmp r6, r1
     bgt spn_new_algorithm          /* current not ready -> no protection
                                     * needed, use the fair algorithm */
-    ldr r6, [r4, r3, lsl #2]      /* eff_prio[current] */
-    ldr r12, =base_prio_table
-    ldr r7, [r12, r3, lsl #2]     /* base_prio[current] */
-    cmp r6, r7
-    bge spn_new_algorithm          /* eff_prio >= base_prio -> not
-                                    * boosted, use the fair algorithm */
+    ldr r12, =ceiling_depth_table
+    ldr r7, [r12, r3, lsl #2]     /* ceiling_depth[current] */
+    cmp r7, #0
+    beq spn_new_algorithm          /* depth == 0 -> not in a critical
+                                    * section, use the fair algorithm */
 
 spn_old_algorithm:
     /* Unchanged from before round 75: ties favor the incumbent
      * unconditionally. Only reached when current_task is ready AND
-     * boosted, so r7 is always current's own (boosted) eff_prio here
-     * -- re-seed explicitly rather than relying on the gate above
-     * having left the right value in r7 (it did, but re-reading is
-     * cheap and keeps this block self-contained/independently
-     * readable). */
+     * genuinely inside a ceiling-protected critical section (task #253:
+     * ceiling_depth_table[current] > 0, checked by the gate above --
+     * NOT "boosted" in the old eff_prio-vs-base_prio sense, which broke
+     * for task_a/HIGH; see this file's own ceiling_depth_table comment).
+     * r7 held ceiling_depth[current] on entry here (just tested against
+     * 0 above) -- re-seed explicitly with eff_prio[current], the value
+     * this block's own tie-breaking loop actually needs. */
     ldr r7, [r4, r3, lsl #2]       /* seed = eff_prio[current] */
     mov r8, r3                     /* tentative best index = current */
 
@@ -1347,6 +1388,20 @@ dhruva_prio_lock_impl:
     ldr r3, [r2]
     ldr r2, =eff_prio_table
     str r0, [r2, r3, lsl #2]
+    /* Task #253 architectural fix (2026-09-19): bump this task's own
+     * ceiling-critical-section depth -- see ceiling_depth_table's own
+     * header comment for the full "why" (scheduler_pick_next's own
+     * "ties favor incumbent" gate now reads this directly, instead of
+     * inferring "am I in a critical section" from whether eff_prio
+     * changed, which silently never worked for a task whose base_prio
+     * is already the system ceiling). A COUNTER, not a flag -- this
+     * project's own dhruva_prio_lock/unlock calls nest for real
+     * (uart_puts_bounded's own internal lock, called from inside
+     * task_a_wake_body's own explicit lock/unlock section). */
+    ldr r2, =ceiling_depth_table
+    ldr r1, [r2, r3, lsl #2]
+    add r1, r1, #1
+    str r1, [r2, r3, lsl #2]
     msr cpsr_c, r12
     mov r0, #0              /* return value: 0 (unused by every caller
                               * today, but see test_compare_buffers'
@@ -1364,6 +1419,18 @@ dhruva_prio_unlock_impl:
     ldr r3, [r2]
     ldr r2, =eff_prio_table
     str r0, [r2, r3, lsl #2]
+    /* Matching decrement -- see dhruva_prio_lock_impl's own comment
+     * above. Floored at 0 defensively (`movmi`, taken only if the
+     * subtract goes negative): should never actually happen if every
+     * lock is paired with its own unlock, but a stray extra unlock
+     * must not leave this task permanently "protected" forever instead
+     * of silently doing nothing, the way an unmatched dhruva_prio_lock
+     * call already silently does nothing harmful today. */
+    ldr r2, =ceiling_depth_table
+    ldr r1, [r2, r3, lsl #2]
+    subs r1, r1, #1
+    movmi r1, #0
+    str r1, [r2, r3, lsl #2]
     msr cpsr_c, r12
     mov r0, #0
     mov r1, #0

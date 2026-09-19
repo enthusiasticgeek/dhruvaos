@@ -7633,3 +7633,109 @@ conversion -- likely needs either giving priority-0 tasks their own
 incumbent-favoring treatment, or a different mechanism entirely for
 "this task must not be preempted right now" that doesn't rely on
 eff_prio ever differing from base_prio.
+
+**Task #253 Phase 3, second round: `ceiling_depth_table` architectural
+fix designed + verified correct, but a DEEPER task-independent bug
+found underneath it, task_a AND task_b both reverted again, same day
+(2026-09-19).** Followed the real-next-step above: replaced the
+`eff_prio[current] < base_prio[current]` tie-break gate (structurally
+blind to task_a, whose base_prio literally IS the system ceiling, so
+the inequality can never fire) with an explicit
+`ceiling_depth_table[16]` counter, incremented in
+`dhruva_prio_lock_impl` and decremented (floor 0) in
+`dhruva_prio_unlock_impl`, in `boot/context_switch.S`. A counter, not a
+boolean, because these calls genuinely nest in this codebase --
+`task_a_wake_body`'s own explicit `dhruva_prio_lock(0)`/`unlock(0)`
+wraps a `uart_puts_bounded` call that *also* takes/releases the same
+lock internally. `scheduler_pick_next`'s gate now reads
+`ceiling_depth_table[current] > 0` instead of the priority-number
+proxy -- correct regardless of a task's numeric priority, and grounded
+in the standard Priority Ceiling Protocol literature (Sha/Rajkumar/
+Lehoczky 1990): "is a critical section held" is properly a distinct,
+explicit signal, not something to infer as a side effect of priority
+math. `dhruva_prio_lock`/`dhruva_prio_unlock` were promoted from plain
+callable SVC functions to real SWI syscalls (#3/#4) for this work,
+after first trying (and immediately self-catching, before shipping) a
+WRONG fix that added `cpsid if` directly inside the plain functions --
+`cps`/`cpsid` are privileged instructions and silently no-op in USR
+mode, so that would have left USR-mode callers completely
+unprotected. Verified independently: rebuilt with ONLY this fix (task_a
+still SVC), `phase4_milestone.py` matches the 4-FAIL baseline exactly,
+zero regressions.
+
+Re-enabled task_a in USR mode with the fix in place: **still crashed,
+identically.** Live GDB tracing found the fix is necessary but not
+sufficient -- caught a live inconsistency (`ceiling_depth[3]=0` while
+`eff_prio[3]=0`, an impossible state for correctly-paired lock/unlock
+calls) proving `current_task` gets misread as 3 (IDLE) at some earlier,
+untraced point during task_a's own execution, planting task_a's own
+saved-context pointer into IDLE's `sp_table` slot -- a self-propagating
+corruption where every later "resume task 3" decision actually resumes
+task_a's code under IDLE's identity. The tie-break fix protects against
+being *preempted*; it can't protect against a wrong *index* being
+written to `sp_table` in the first place, so it was silently
+insufficient here.
+
+Reverted task_a again, tried task_b (MEDIUM, priority 1) instead, on
+the theory that task_b sidesteps the whole ceiling-priority question --
+its own base_prio (1) is genuinely not the system ceiling, and it has
+no explicit `dhruva_prio_lock`/`unlock` of its own at all (unlike
+`task_a_wake_body`). **task_b hung with the identical crash signature**
+(`current_task` old=3 new=10 inside `task_sleep_ticks_impl`'s own
+`scheduler_pick_next` call, same as task_a). This is the decisive
+result: since task_b has no ceiling-priority involvement and no nested
+locking whatsoever, the ceiling-priority/nested-locking theory is ruled
+out entirely -- the bug is task-independent.
+
+The real common factor, found by elimination: `task_d`/IDLE is the
+*only* task that has ever run in USR mode before this work, and IDLE
+never calls `task_sleep_ticks` -- its own task body uses `cpu_wfi()`
+instead. So `task_sleep_ticks_impl`'s own block-and-much-later-resume
+cycle (save a 68-byte frame, call `scheduler_pick_next`, and
+potentially not get resumed again until many *other* tasks have run in
+between) had literally never been exercised by a genuinely USR-mode-
+originated call before task_a's or task_b's own conversion attempts.
+IDLE's only USR-mode syscalls (`dhruva_prio_lock`/`unlock`, reached via
+`uart_puts_bounded`) return through `swi_return_to_usr` *immediately*,
+in the same unbroken execution flow as their own entry capture --
+there is no opportunity for anything else to run in between and disturb
+`current_task`. `task_sleep_ticks`'s resume, by contrast, can happen an
+arbitrary number of context switches later. This is genuinely new,
+unexercised territory, and is the most likely location of the real bug
+-- not yet root-caused as of this writeup.
+
+**Disposition**: BOTH task_a and task_b reverted to plain SVC launch
+(`task_a_init_stack`, `task_b_init_stack`) in kernel_main.vani. The
+`ceiling_depth_table` fix, all `swi_entry.S`/`context_switch.S`
+register-preservation fixes, and the `dhruva_prio_lock`/`unlock`
+syscall conversion are all KEPT (independently correct, needed
+regardless of when the deeper bug is found). Rebuilt and re-verified:
+`phase4_milestone.py` matches the exact same 4-FAIL baseline again
+(httpecho/mqttecho/ls/diagnose -- pre-existing, unrelated to this
+work), zero FATAL, task_d/IDLE the only USR-mode task, same as the
+proven-safe state before this entire round.
+
+**Architectural decision** (per explicit instruction to settle this
+rather than keep guessing task-by-task): the core RTOS -- preemptive,
+priority-based real-time scheduling -- has been solid and proven
+throughout this entire investigation; that was never in question. What
+remains broken is specifically the *privilege-separation hardening*
+layer (USR-mode tasks) for two or more concurrent USR-mode tasks, and
+specifically the case where a second one exercises
+`task_sleep_ticks_impl`'s block/resume cycle. Every remaining task
+(task_a/b/c/e/f, plus dynamically-created ones) calls `task_sleep_ticks`
+as part of normal operation, so this bug would block every future
+one-at-a-time attempt identically -- retrying a different task without
+root-causing it first is not expected to produce a different outcome.
+Task #253's remaining scope (Phase 3: convert all tasks to USR mode) is
+marked BLOCKED, not abandoned, pending a dedicated root-cause session
+with a scripted/automated GDB harness that can step through many
+`scheduler_pick_next` decisions and correlate every `current_task`
+transition against which task is actually, physically executing, to
+find the exact point where they first diverge -- this needs more
+focused budget than a continuation of the current session can give it.
+The shipped state (task_d/IDLE only in USR mode) is not a fallback of
+convenience: it is itself a genuine, real security improvement over the
+all-SVC baseline this project started task #253 from, and is fully
+proven safe under the same regression battery used throughout this
+project.
