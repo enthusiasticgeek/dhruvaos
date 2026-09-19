@@ -1287,10 +1287,44 @@ task_sleep_ticks_impl:
 
 /* i64 dhruva_prio_lock(i64 ceiling) -- boosts the calling task's effective
  * priority to `ceiling`. i64 dhruva_prio_unlock(i64 base_priority) --
- * restores it. Both plain data writes; see the file header for why no
- * lock-state/switch is needed here. */
-.global dhruva_prio_lock
-dhruva_prio_lock:
+ * restores it. */
+/* BUG found 2026-09-19 (task #253 Phase 3, converting task_a to USR
+ * mode): these were "plain data writes... no lock-state/switch needed
+ * here" (see this file's own original header reasoning) -- true as
+ * long as scheduler_pick_next's own "boosted, ties favor incumbent"
+ * rule was the ONLY protection needed, which in turn assumed current_
+ * task is always consistent relative to whichever task is actually
+ * executing. That assumption broke the instant TWO genuinely USR-mode,
+ * FIQ-preemptible tasks (task_a and task_d/IDLE, both calling this via
+ * uart_puts_bounded's own internal ceiling-0 lock) could race through
+ * this exact read-current_task-then-write sequence concurrently --
+ * live-reproduced via GDB watchpoints on eff_prio_table[3]/current_
+ * task: IDLE's own eff_prio_table[3] got boosted to 0 and never
+ * released, sleep_until_table[3] then received a bogus future wake
+ * time from an UNRELATED task_sleep_ticks call (current_task read as 3
+ * instead of the real caller's own index), which made IDLE (task_d) --
+ * the scheduler's own permanent "always ready" fallback that
+ * guarantees a real candidate is always found -- look "not ready", and
+ * scheduler_pick_next's own pass 2 fell through to its unused-slot
+ * sentinel (255) and picked a never-created task index, whose sp_table
+ * entry is NULL, crashing on resume.
+ *
+ * FIRST FIX ATTEMPT (reverted, caught before ever passing a test): add
+ * `cpsid if` around the read-then-write, same pattern as every OTHER
+ * scheduler-critical-section in this file. WRONG -- `cps`/`cpsid`/
+ * `cpsie` are privileged instructions, silently a no-op (not a fault,
+ * just ignored) when executed in USR mode, per ARM architecture. Since
+ * task_a and task_d call this DIRECTLY, with no SWI trap (the entire
+ * reason these were "safe to call from USR mode" in the first place),
+ * that fix would have been dead code for exactly the two callers that
+ * needed it.
+ *
+ * REAL FIX: route through the SWI trap like task_sleep_ticks/dhruva_
+ * mutex_lock/_unlock -- see boot/swi_entry.S's own trampolines
+ * (syscalls #3/#4) and dhruva_prio_lock_impl/dhruva_prio_unlock_impl
+ * below, which now do mask interrupts (legal there -- SVC mode). */
+.global dhruva_prio_lock_impl
+dhruva_prio_lock_impl:
     // BUG (found live, round 53, via a genuinely corrupted UART byte
     // stream under QEMU -- caught by power_yank.py itself failing to
     // even decode the output, not a subtle test assertion): this used
@@ -1303,6 +1337,8 @@ dhruva_prio_lock:
     // below are safe (caller-saved scratch registers, and r2 is
     // already reassigned by the pre-existing code right after, same
     // pattern this function already used for r2/r3 before this fix).
+    mrs r12, cpsr
+    cpsid if
     ldr r1, =prio_lock_count
     ldr r2, [r1]
     add r2, r2, #1
@@ -1311,6 +1347,7 @@ dhruva_prio_lock:
     ldr r3, [r2]
     ldr r2, =eff_prio_table
     str r0, [r2, r3, lsl #2]
+    msr cpsr_c, r12
     mov r0, #0              /* return value: 0 (unused by every caller
                               * today, but see test_compare_buffers'
                               * comment in sdcard_state.S for why a
@@ -1319,12 +1356,15 @@ dhruva_prio_lock:
     mov r1, #0
     bx lr
 
-.global dhruva_prio_unlock
-dhruva_prio_unlock:
+.global dhruva_prio_unlock_impl
+dhruva_prio_unlock_impl:
+    mrs r12, cpsr
+    cpsid if
     ldr r2, =current_task
     ldr r3, [r2]
     ldr r2, =eff_prio_table
     str r0, [r2, r3, lsl #2]
+    msr cpsr_c, r12
     mov r0, #0
     mov r1, #0
     bx lr
@@ -1981,11 +2021,28 @@ task_d_init_stack_usr:
     /* is_usr_mode_task[3] = 1 -- set explicitly here rather than in
      * the table's own .bss initializer (the assembler correctly
      * rejects a non-zero .bss value; see that table's own comment),
-     * using r3/r4 as scratch (r0-r2 must survive untouched for the
+     * using r3/r12 as scratch (r0-r2 must survive untouched for the
      * tail call below). */
+    /* BUG found+fixed 2026-09-19 (task #253 Phase 3, converting task_a
+     * to USR mode): this and every other task_X_init_stack_usr function
+     * below originally used r4 for the scratch "value 1" write -- but
+     * r4 is AAPCS callee-saved, and kernel_main.vani's own boot
+     * sequence keeps genuinely live values in r4-r11 across calls on
+     * the strength of that guarantee (same bug class as sdcard_state.S's
+     * own file-level comment, and as the r5/r6/r8/r9/r11/r7 bugs just
+     * fixed in swi_entry.S). Latent and harmless as long as only
+     * task_d_init_stack_usr was ever called (nothing downstream needed
+     * r4 preserved across it) -- surfaced the instant task_a_init_
+     * stack_usr was wired in ahead of it in the same boot sequence: its
+     * own r4 clobber destroyed kernel_main's still-live r4 (holding
+     * stack_d), corrupting task_d_init_stack_usr's own later call with
+     * a near-zero stack pointer. Fixed by moving the scratch write to
+     * r12 (AAPCS caller-saved, always safe to clobber) in all six of
+     * these functions -- r0-r2 must still survive untouched for the
+     * tail call to prepare_stack_common_usr below. */
     ldr r3, =is_usr_mode_task
-    mov r4, #1
-    str r4, [r3, #12]      /* index 3 * 4 bytes */
+    mov r12, #1
+    str r12, [r3, #12]     /* index 3 * 4 bytes */
     add r0, r0, r2
     ldr r1, =task_d
     b prepare_stack_common_usr
@@ -2002,8 +2059,8 @@ task_d_init_stack_usr:
 .global task_a_init_stack_usr
 task_a_init_stack_usr:
     ldr r3, =is_usr_mode_task
-    mov r4, #1
-    str r4, [r3, #0]        /* index 0 */
+    mov r12, #1
+    str r12, [r3, #0]       /* index 0 */
     add r0, r0, r2
     ldr r1, =task_a
     b prepare_stack_common_usr
@@ -2011,8 +2068,8 @@ task_a_init_stack_usr:
 .global task_b_init_stack_usr
 task_b_init_stack_usr:
     ldr r3, =is_usr_mode_task
-    mov r4, #1
-    str r4, [r3, #4]        /* index 1 */
+    mov r12, #1
+    str r12, [r3, #4]       /* index 1 */
     add r0, r0, r2
     ldr r1, =task_b
     b prepare_stack_common_usr
@@ -2020,8 +2077,8 @@ task_b_init_stack_usr:
 .global task_c_init_stack_usr
 task_c_init_stack_usr:
     ldr r3, =is_usr_mode_task
-    mov r4, #1
-    str r4, [r3, #8]        /* index 2 */
+    mov r12, #1
+    str r12, [r3, #8]       /* index 2 */
     add r0, r0, r2
     ldr r1, =task_c
     b prepare_stack_common_usr
@@ -2029,8 +2086,8 @@ task_c_init_stack_usr:
 .global task_e_init_stack_usr
 task_e_init_stack_usr:
     ldr r3, =is_usr_mode_task
-    mov r4, #1
-    str r4, [r3, #16]       /* index 4 */
+    mov r12, #1
+    str r12, [r3, #16]      /* index 4 */
     add r0, r0, r2
     ldr r1, =task_e
     b prepare_stack_common_usr
@@ -2038,8 +2095,8 @@ task_e_init_stack_usr:
 .global task_f_init_stack_usr
 task_f_init_stack_usr:
     ldr r3, =is_usr_mode_task
-    mov r4, #1
-    str r4, [r3, #20]       /* index 5 */
+    mov r12, #1
+    str r12, [r3, #20]      /* index 5 */
     add r0, r0, r2
     ldr r1, =task_f
     b prepare_stack_common_usr

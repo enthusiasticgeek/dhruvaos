@@ -35559,6 +35559,47 @@ fn kernel_main() -> i64 {
   // work, but needs a one-task-at-a-time approach with a full
   // regression cycle after each addition, not another all-at-once
   // attempt, given what this round found.
+  //
+  // Task #253 Phase 3 continued (2026-09-19): first of the one-at-a-
+  // time conversions, now that the SWI trap itself has been re-wired
+  // and hardened (3 real bugs found+fixed in swi_entry.S -- see that
+  // file's own header comment) and re-verified clean against phase4_
+  // milestone.py. task_a (HIGH-priority task) genuinely exercises the
+  // trap (calls task_sleep_ticks/dhruva_mutex_lock/_unlock in its own
+  // body, per task_a_init_stack_usr's own comment above), unlike
+  // task_d/IDLE -- this is the real first test of a USR-mode task that
+  // actually uses privileged syscalls, not just the mode-switch
+  // machinery alone.
+  // Task #253 Phase 3 (2026-09-19): task_a's OWN USR-mode conversion
+  // attempted this round, REVERTED here -- not yet safe. Found and
+  // fixed real bugs in the underlying trap infrastructure along the
+  // way (kept, see swi_entry.S: cpsid f masking, r5/r6/r8/r9/r11/r7
+  // register preservation, is_usr_mode_task-gated usr_sp_table
+  // capture/restore, dhruva_prio_lock/_unlock now real syscalls#3/#4),
+  // each individually verified against phase4_milestone.py. But task_a
+  // itself kept reproducing a genuine, not-yet-fully-characterized
+  // scheduler race: task_a's own current_task reads WRONG (3/IDLE
+  // instead of 0/task_a) inside task_sleep_ticks_impl on its own third
+  // wake cycle, corrupting sleep_until_table[3] with a bogus future
+  // wake time, which makes IDLE -- the scheduler's own permanent
+  // "always ready" safety net -- look "not ready" to scheduler_pick_
+  // next, which then falls through to an unused task-index sentinel
+  // and crashes on resume (sp_table entry NULL). Root cause traced as
+  // far as: task_a (index 0) and task_d/IDLE both sit at effective
+  // priority 0 (task_a's own base priority; IDLE only while its own
+  // uart_puts_bounded-internal ceiling-0 lock is held) -- but task_a's
+  // OWN eff_prio[0]==base_prio[0] always, so scheduler_pick_next's own
+  // "boosted, ties favor incumbent" gate (spn_old_algorithm) never
+  // triggers FOR task_a specifically, meaning task_a always competes
+  // via the fair round-robin path (spn_new_algorithm) even when IDLE
+  // is using the strict-incumbent path -- a genuine asymmetry between
+  // the two tie-breaking algorithms for two same-priority tasks that
+  // needs real design attention, not a quick register fix, before
+  // task_a can safely convert. Real next step: understand and fix that
+  // asymmetry (or give task_a's own ceiling-0 calls the same strict-
+  // incumbent treatment IDLE gets) BEFORE re-attempting task_a's own
+  // conversion; task_d/IDLE's own existing USR-mode conversion is
+  // unaffected (proven clean both before and after this round's fixes).
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
   let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);

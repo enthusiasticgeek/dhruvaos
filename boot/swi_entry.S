@@ -149,8 +149,42 @@ swi_entry:
     str r11, [r9, r8, lsl #2]
     ldr r9, =usr_resume_pc_table
     str r5, [r9, r8, lsl #2]
+    /* BUG found+fixed 2026-09-19 (task #253 Phase 3, converting task_a
+     * to USR mode): this usr_sp_table write used to be unconditional --
+     * "even a hypothetical future SVC-mode caller would behave
+     * harmlessly here (the sp_usr capture/restore would just shuffle an
+     * unused register)" (this file's own original header reasoning).
+     * That reasoning breaks down the moment a genuinely USR-mode task
+     * and an SVC-mode CALLER share the SAME task_index -- exactly
+     * kernel_main.vani's own boot-time execution (current_task reads
+     * its .bss default, 0, the entire time kernel_main itself is
+     * running, before start_multitasking ever hands off) and task_a
+     * (also index 0, once converted). Adding dhruva_prio_lock/_unlock
+     * as syscalls (see this file's own trampolines below) meant every
+     * ordinary boot-time uart_puts call -- NOT just uart_puts_bounded,
+     * used throughout self-tests during boot, current_task==0 the
+     * whole time -- now traps through here too, unconditionally
+     * OVERWRITING usr_sp_table[0] with whatever boot-time sp_usr
+     * garbage happened to be live, silently destroying kernel_main's
+     * own correct `usr_sp_table_set_at(0, stack_a_usr_top)` seed made
+     * moments earlier. Live-reproduced via GDB: task_a's own first
+     * instruction faulted with sp_usr==0 (address -8, matching `push`
+     * on a null stack) -- traced directly to this write, hit
+     * repeatedly by boot-time uart_puts->dhruva_prio_lock calls between
+     * the seed and start_multitasking. Fixed by gating this write (and
+     * swi_return_to_usr's own matching sp_usr restore below) on is_usr_
+     * mode_task[current_task], exactly the same check scheduler_
+     * restore_usr_sp already uses -- the spsr/pc tables above stay
+     * UNCONDITIONAL (genuinely needed by every caller, USR or SVC, to
+     * survive an arbitrarily long nested-preemption detour -- only the
+     * sp_usr-specific table was ever meant to be USR-only). */
+    ldr r9, =is_usr_mode_task
+    ldr r9, [r9, r8, lsl #2]
+    cmp r9, #0
+    beq swi_entry_skip_usr_sp_capture
     ldr r9, =usr_sp_table
     str r6, [r9, r8, lsl #2]
+swi_entry_skip_usr_sp_capture:
     pop {r5, r6, r8, r9, r11}  /* restore the caller's true originals
                                * before the dispatched function (or its
                                * own later-resumed frame) ever sees them
@@ -169,6 +203,10 @@ swi_entry:
     beq swi_do_mutex_lock
     cmp r7, #2
     beq swi_do_mutex_unlock
+    cmp r7, #3
+    beq swi_do_prio_lock
+    cmp r7, #4
+    beq swi_do_prio_unlock
     b swi_return_to_usr        /* unknown syscall number -- no-op,
                                * fall straight through to the restore
                                * rather than doing anything undefined */
@@ -183,6 +221,14 @@ swi_do_mutex_lock:
 
 swi_do_mutex_unlock:
     bl dhruva_mutex_unlock_impl
+    b swi_return_to_usr
+
+swi_do_prio_lock:
+    bl dhruva_prio_lock_impl
+    b swi_return_to_usr
+
+swi_do_prio_unlock:
+    bl dhruva_prio_unlock_impl
     b swi_return_to_usr
 
 swi_return_to_usr:
@@ -209,11 +255,24 @@ swi_return_to_usr:
     ldr r2, =current_task
     ldr r2, [r2]
 
+    /* Gated on is_usr_mode_task, matching swi_entry's own entry-capture
+     * fix above and scheduler_restore_usr_sp's own established pattern
+     * -- see that fix's own comment for the full "why" (this restore
+     * must NOT touch sp_usr for an SVC-mode caller sharing a task_index
+     * with a genuinely USR-mode task, e.g. kernel_main.vani's own
+     * boot-time execution and task_a both being index 0). r12, not r3,
+     * for the lookup -- r3 still needs to hold usr_sp_table's own
+     * looked-up value afterward, unclobbered. */
+    ldr r12, =is_usr_mode_task
+    ldr r12, [r12, r2, lsl #2]
+    cmp r12, #0
+    beq swi_return_skip_usr_sp_restore
     ldr r3, =usr_sp_table
     ldr r3, [r3, r2, lsl #2]
     cps #0x1F
     mov sp, r3
     cps #0x13
+swi_return_skip_usr_sp_restore:
 
     ldr r3, =usr_resume_spsr_table
     ldr r3, [r3, r2, lsl #2]
@@ -319,6 +378,37 @@ dhruva_mutex_unlock:
     push {r4, r7}
     mov r4, lr
     mov r7, #2
+    swi #0
+    mov lr, r4
+    pop {r4, r7}
+    bx lr
+
+/* Task #253 Phase 3 continued (2026-09-19): dhruva_prio_lock/_unlock
+ * added as syscalls #3/#4 -- see context_switch.S's own dhruva_prio_
+ * lock_impl/_unlock_impl header comment for the full "why" (these used
+ * to be callable directly, no trap, until a genuine race between two
+ * concurrently-preemptible USR-mode tasks -- task_a and task_d/IDLE --
+ * both racing through the unmasked read-current_task-then-write
+ * sequence corrupted scheduler state; the fix needs `cpsid if`, which
+ * is a privileged instruction and silently a no-op in USR mode, so it
+ * has to run on the SVC side of a real trap, same as every other
+ * privileged operation in this file). Same trampoline shape as the
+ * three above. */
+.global dhruva_prio_lock
+dhruva_prio_lock:
+    push {r4, r7}
+    mov r4, lr
+    mov r7, #3
+    swi #0
+    mov lr, r4
+    pop {r4, r7}
+    bx lr
+
+.global dhruva_prio_unlock
+dhruva_prio_unlock:
+    push {r4, r7}
+    mov r4, lr
+    mov r7, #4
     swi #0
     mov lr, r4
     pop {r4, r7}

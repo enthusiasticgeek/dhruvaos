@@ -7559,8 +7559,77 @@ matches the ORIGINAL Phase 1/2 baseline exactly -- same 4-FAIL set
 harness timing gaps, not kernel bugs), zero `FATAL`, zero `SCHED SHADOW
 MISMATCH`, `idle` printed 265 times -- with the SWI trap now genuinely
 exercised at full scale by every SVC-mode task's own `task_sleep_
-ticks`/`dhruva_mutex_lock`/`_unlock` calls, not reverted to inert. Real
-next step: convert the remaining 9 tasks (a/b/c/e/f + the 4 dynamic
-tasks) to USR mode ONE AT A TIME, with a full regression cycle after
-each -- not another all-at-once attempt, per this project's own
-hard-won lesson from the earlier full-10-task attempt.
+ticks`/`dhruva_mutex_lock`/`_unlock` calls, not reverted to inert.
+
+**Task #253 Phase 3, task_a conversion attempted and REVERTED, same day
+(2026-09-19).** Converted task_a (HIGH) to genuine USR mode as the
+first one-at-a-time conversion. Found and fixed three more real bugs
+in the trap infrastructure along the way, each verified via full
+regression before moving to the next:
+1. `swi_entry.S` used r5/r6/r8/r9/r11 as its own entry-capture scratch
+   without saving them -- AAPCS callee-saved registers the trampolines
+   never protected. Fixed via push/pop around the capture.
+2. The trampolines also clobbered r7 (carries the syscall number)
+   without saving it. Fixed via `push {r4,r7}`/`pop {r4,r7}`.
+3. `swi_entry.S` unconditionally captured/restored `usr_sp_table[current_
+   task]` regardless of whether current_task was genuinely USR-mode --
+   harmless when only task_d/IDLE existed in USR mode, but once task_a
+   (index 0) shared its task_index with kernel_main.vani's own boot-time
+   execution context (current_task reads its .bss default, 0, for all of
+   kernel_main's own runtime, until start_multitasking's explicit set),
+   every ordinary boot-time `uart_puts` call (now routing through the
+   trap too, since `dhruva_prio_lock`/`_unlock` were added as syscalls
+   #3/#4 -- see below) silently clobbered task_a's own seeded sp_usr.
+   Fixed by gating the capture/restore on `is_usr_mode_task[current_
+   task]`, matching `scheduler_restore_usr_sp`'s own established pattern,
+   PLUS moving `usr_sp_table_set_at(0, ...)`'s own call site to be the
+   literal last statement before `start_multitasking` in kernel_main.vani
+   (nothing else may run between the seed and the handoff).
+4. `dhruva_prio_lock`/`dhruva_prio_unlock` (task_a and task_d/IDLE both
+   call these directly from USR mode, via uart_puts_bounded's own
+   internal ceiling-0 mutual-exclusion lock) were "plain data writes,
+   no lock-state needed" by original design -- true only as long as
+   scheduler_pick_next's own "boosted, ties favor incumbent" rule was
+   sufficient protection, which broke once two genuinely-preemptible
+   USR-mode tasks could race through the unmasked read-current_task-
+   then-write sequence concurrently. First fix attempt (`cpsid if`
+   directly in these functions) was WRONG and caught before ever
+   passing a test -- `cps`/`cpsid` are privileged, silently a no-op in
+   USR mode, exactly the callers that needed protection. Real fix:
+   added them as syscalls #3/#4 (`dhruva_prio_lock_impl`/`_unlock_impl`
+   in context_switch.S, now properly `cpsid if`-protected in SVC mode).
+
+**After all four fixes, a DEEPER, not-yet-understood scheduler race
+still reproduced deterministically**: task_a's own `current_task` reads
+WRONG (3/IDLE instead of 0/task_a) inside `task_sleep_ticks_impl` on its
+third wake cycle, corrupting `sleep_until_table[3]` with a bogus future
+wake time -- this makes IDLE (the scheduler's own permanent "always
+ready" safety net) look "not ready" to `scheduler_pick_next`, which then
+falls through to an unused task-index sentinel (255) and crashes on
+resume (NULL `sp_table` entry). Traced as far as: task_a (index 0) and
+task_d/IDLE both sit at effective priority 0 (task_a's own permanent
+base priority; IDLE only transiently, while its own uart_puts_bounded-
+internal lock is held) -- but task_a's own `eff_prio[0]` always EQUALS
+`base_prio[0]` (0==0, never actually changes), so `scheduler_pick_next`'s
+own "boosted, ties favor incumbent" gate (`spn_old_algorithm`) never
+triggers FOR task_a specifically, meaning task_a always competes via the
+FAIR round-robin path (`spn_new_algorithm`) even in situations where
+IDLE gets the strict-incumbent path instead -- a genuine, real asymmetry
+between how the two same-priority-0 tasks are tie-broken that needs real
+scheduler-design attention, not another register fix, before task_a can
+safely convert.
+
+**Disposition**: task_a's own conversion REVERTED (`task_a_init_stack`,
+plain SVC launch, restored in kernel_main.vani) -- NOT yet safe. All
+four infrastructure fixes above are KEPT (genuinely correct regardless
+of which task exercises them) and re-verified: `phase4_milestone.py`
+matches the original 4-FAIL baseline exactly again (zero FATAL, zero
+SCHED SHADOW MISMATCH, idle x266) with task_d/IDLE still the only
+USR-mode task, same as before this round started. Real next step:
+design and fix the eff_prio[0]==base_prio[0] tie-breaking asymmetry
+between task_a-shaped (permanently-highest-priority) and IDLE-shaped
+(transiently-boosted) tasks BEFORE re-attempting task_a's own
+conversion -- likely needs either giving priority-0 tasks their own
+incumbent-favoring treatment, or a different mechanism entirely for
+"this task must not be preempted right now" that doesn't rely on
+eff_prio ever differing from base_prio.
