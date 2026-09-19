@@ -1244,6 +1244,14 @@ extern "C" fn mutex_handoff_worst_us_set(v: u32) -> i64;
 // context_switch.S.
 extern "C" fn irq_tick_worst_us_get() -> u32;
 extern "C" fn irq_tick_worst_us_set(v: u32) -> i64;
+// ROUND 2026-09-19 (task #253 Phase 3 instrumentation): real measured
+// cost of the SWI trap's own FAST (never-blocking) round trip -- see
+// context_switch.S's own swi_fast_worst_us/total_us/count header
+// comment for the full design and the real-reference (seL4) check
+// behind it.
+extern "C" fn swi_fast_worst_us_get() -> u32;
+extern "C" fn swi_fast_total_us_get() -> u32;
+extern "C" fn swi_fast_count_get() -> u32;
 // TEST-ONLY -- see context_switch.S's own comment on
 // scheduler_set_tick_count_test_only.
 extern "C" fn scheduler_set_tick_count_test_only(value: u32) -> i64;
@@ -20648,13 +20656,41 @@ fn dwc2_probe_device0() -> i64 {
 // extracted bounded wake-up body so a real WCET number covers HIGH's
 // actual per-wake work (three prints + a ceiling-0 lock/unlock pair),
 // leaving the eternal `while true` shell unbounded as before.
+// ROUND 2026-09-19 (task #253 Phase 3, real-WCET investigation, per
+// user request to add instrumentation and check reputable OS
+// references): removed the explicit dhruva_prio_lock(0)/
+// dhruva_prio_unlock(0) pair that used to wrap ONLY the "acquired
+// resource" print below. Real, verified-redundant SWI round trip:
+// uart_puts_bounded's OWN body (see its own definition) already does
+// an identical dhruva_prio_lock(0)/dhruva_prio_unlock(saved_prio) pair
+// internally, around every call -- nothing else ever ran between this
+// function's own outer lock/unlock beyond that one print, so the outer
+// pair boosted eff_prio_table[task_a] to 0, then the print's own
+// internal call boosted it to 0 AGAIN (a genuine no-op, task_a's own
+// base priority already being 0/HIGH, the system ceiling), then
+// restored to 0 via its own internal unlock, then the outer pair
+// restored to 0 again -- four real register-write/interrupt-mask round
+// trips producing the exact same eff_prio_table[task_a]==0 state a
+// single (the inner) pair alone already produces. Confirmed against a
+// real, reputable reference before removing this (seL4's own
+// arm_swi_syscall, src/arch/arm/32/traps.S -- see context_switch.S's
+// own swi_fast_worst_us header comment for the full fetch/finding):
+// even seL4's fastpath optimizes by skipping DOWNSTREAM dispatch cost
+// for hot operations, not by trying to shrink an individual trap's own
+// entry further -- the real lever here is reducing HOW OFTEN a
+// frequently-waking, ceiling-boosting task traps at all, exactly what
+// this redundant nested pair was doing for no observable benefit.
+// Removing it saves 2 of this function's own 9 total SWI round trips
+// per 3-tick wake cycle (~22%) with ZERO behavioral change: the print
+// is still emitted at ceiling 0 either way (via uart_puts_bounded's
+// own now-sole lock/unlock), and the CRLF-for-interactive-typing
+// handling (task #185) that a plain uart_puts call would have lost
+// stays intact, since uart_puts_bounded is still what's called here.
 #[no_heap]
 #[wcet(cycles=50000)]
 fn task_a_wake_body() -> i64 {
   let _ = uart_puts_bounded("HIGH: waking, requesting resource\n");
-  let _ = dhruva_prio_lock(0);
   let _ = uart_puts_bounded("HIGH: acquired resource\n");
-  let _ = dhruva_prio_unlock(0);
   let _ = uart_puts_bounded("HIGH: released resource\n");
   return 0;
 }
@@ -24050,6 +24086,27 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("  timer-tick IRQ dispatch worst-case: ");
     let _ = uart_put_i64(irq_tick_worst_us_get() as i64);
     let _ = uart_puts("us (QEMU-measured; real Pi 1B silicon has no TCG trap overhead, see task #191/192's own finding)\n");
+
+    // ROUND 2026-09-19 (task #253 Phase 3 instrumentation): real
+    // measured cost of the SWI trap's own fast (never-blocking) round
+    // trip -- see swi_fast_worst_us's own header comment in
+    // context_switch.S. count==0 (no fast syscall has run yet, e.g. a
+    // boot-time-only build) is a safe "avg N/A" case, not a fault --
+    // matches every other divide-only-when-meaningful pattern already
+    // used elsewhere in this function (e.g. dhruva_heap_used_bytes's
+    // own pct calculation above).
+    let swi_fast_count: i64 = swi_fast_count_get() as i64;
+    let _ = uart_puts("  SWI fast-syscall round trip: worst=");
+    let _ = uart_put_i64(swi_fast_worst_us_get() as i64);
+    let _ = uart_puts("us avg=");
+    if swi_fast_count > 0 {
+      let _ = uart_put_i64((swi_fast_total_us_get() as i64) / swi_fast_count);
+    } else {
+      let _ = uart_puts("N/A");
+    }
+    let _ = uart_puts("us count=");
+    let _ = uart_put_i64(swi_fast_count);
+    let _ = uart_puts(" (dhruva_mutex_unlock/dhruva_prio_lock/dhruva_prio_unlock only -- see this counter's own header comment for why #0/#1's blocking path is excluded)\n");
     return 0;
   }
 

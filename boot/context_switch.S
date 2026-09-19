@@ -313,6 +313,51 @@ mutex_handoff_worst_us:
  * scalar + accessors. */
 irq_tick_worst_us:
     .word 0
+/* Task #253 Phase 3 instrumentation round (2026-09-19, user request:
+ * "add more instrumentation... check other established reputed OS
+ * source code as a guide"). Real, hardware-measured cost of the SWI
+ * trap's own FAST (never-blocking) round trip -- syscalls #2/#3/#4
+ * (dhruva_mutex_unlock/dhruva_prio_lock/dhruva_prio_unlock), which
+ * task_a's own wake body and every uart_puts_bounded call project-wide
+ * (task #185's own mutual-exclusion fix, routed through the trap since
+ * task #253's race fix -- see dhruva_prio_lock_impl's own header
+ * comment) exercise on every single call. Deliberately excludes
+ * syscalls #0 (task_sleep_ticks) and #1 (dhruva_mutex_lock)'s own
+ * CONTENDED path: both can resume arbitrarily later via a completely
+ * separate trap instance's own swi_return_to_usr, so a plain t0/t1
+ * bracket around THIS instance would measure unrelated blocked wall-
+ * clock time, not trap overhead, for any caller that actually blocks --
+ * see swi_entry.S's own measurement site for the full reasoning on why
+ * only these three are safe to bracket this way.
+ *
+ * Checked against a real, reputable reference before adding this
+ * (per this project's own established "verify against proven reference"
+ * discipline): fetched seL4's own arm_swi_syscall (src/arch/arm/32/
+ * traps.S, seL4/seL4 master, a formally-verified microkernel on this
+ * exact classic-ARM banked-register USR/SVC architecture, about as
+ * reputable and latency-obsessed a reference as exists for this exact
+ * problem). Confirmed seL4 pays a FULL unconditional `stmdb sp,
+ * {r0-lr}^` register save on EVERY trap, including its own documented
+ * "CONFIG_FASTPATH" -- the fastpath check for its two hottest syscalls
+ * (SYSCALL_CALL/SYSCALL_REPLY_RECV) happens AFTER that same full save,
+ * skipping only the downstream generic C dispatch/capability-lookup
+ * cost, never the entry save itself. This project's own swi_entry.S
+ * already does LESS work than seL4's baseline entry (r0-r12 genuinely
+ * unbanked, never saved at all -- only sp_usr/lr_svc/SPSR, which
+ * actually need it), so shrinking the entry sequence further is not
+ * where real savings are left; seL4's own design instead confirms the
+ * right lever is reducing HOW OFTEN a hot path traps at all -- exactly
+ * what this instrumentation is measuring the real cost of, to make
+ * that argument with hardware numbers instead of just this comment. */
+.global swi_fast_worst_us
+swi_fast_worst_us:
+    .word 0
+.global swi_fast_total_us
+swi_fast_total_us:
+    .word 0
+.global swi_fast_count
+swi_fast_count:
+    .word 0
 mutex_block_start_tick_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
                         /* tick_count at the moment task[i] most
@@ -1927,6 +1972,27 @@ mutex_handoff_worst_us_set:
 .global irq_tick_worst_us_get
 irq_tick_worst_us_get:
     ldr r0, =irq_tick_worst_us
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global swi_fast_worst_us_get
+swi_fast_worst_us_get:
+    ldr r0, =swi_fast_worst_us
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global swi_fast_total_us_get
+swi_fast_total_us_get:
+    ldr r0, =swi_fast_total_us
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global swi_fast_count_get
+swi_fast_count_get:
+    ldr r0, =swi_fast_count
     ldr r0, [r0]
     mov r1, #0
     bx lr

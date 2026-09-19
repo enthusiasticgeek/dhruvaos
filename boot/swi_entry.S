@@ -228,16 +228,93 @@ swi_do_mutex_lock:
     b swi_return_to_usr
 
 swi_do_mutex_unlock:
+    push {r6}
+    bl swi_fast_measure_start
     bl dhruva_mutex_unlock_impl
+    bl swi_fast_measure_end
+    pop {r6}
     b swi_return_to_usr
 
 swi_do_prio_lock:
+    push {r6}
+    bl swi_fast_measure_start
     bl dhruva_prio_lock_impl
+    bl swi_fast_measure_end
+    pop {r6}
     b swi_return_to_usr
 
 swi_do_prio_unlock:
+    push {r6}
+    bl swi_fast_measure_start
     bl dhruva_prio_unlock_impl
+    bl swi_fast_measure_end
+    pop {r6}
     b swi_return_to_usr
+
+/* Task #253 Phase 3 instrumentation round (2026-09-19): real,
+ * hardware-measured cost of the SWI trap's own fast round trip -- see
+ * context_switch.S's own swi_fast_worst_us/total_us/count header
+ * comment for the full "why" (only #2/#3/#4 are safe to bracket this
+ * way; #0/#1 have a genuinely blocking path that can resume via a
+ * LATER, separate trap instance). r6 as the t0/delta holder: verified
+ * free ACROSS THE IMPL CALL ITSELF -- dhruva_prio_lock_impl/dhruva_
+ * prio_unlock_impl only ever touch r0-r3/r12 (never r4-r11), and
+ * dhruva_mutex_unlock_impl explicitly saves/restores r4-r9 itself
+ * (`stmdb sp!, {r4-r9,lr}` / matching `ldmia`) -- AAPCS-compliant
+ * either way, so r6 survives the `bl <impl>` intact regardless of
+ * which of the three is dispatched.
+ *
+ * BUG found+fixed here (self-caught via phase4_milestone.py's own
+ * mandatory post-change regression run -- "integer overflow in u32
+ * sub" panic partway through boot, before this file's own first
+ * commit): that impl-level safety is NOT the same thing as whole-
+ * round-trip safety. r6 is AAPCS callee-saved -- a vani-compiled
+ * CALLER of dhruva_prio_lock/_unlock/dhruva_mutex_unlock is free to
+ * keep a live value in r6 across the call, trusting it survives -- but
+ * the trampolines below (dhruva_prio_lock/_unlock/dhruva_mutex_unlock)
+ * only ever save/restore r4/r7 around the trap (the true-lr and
+ * syscall-number fixes, see this file's own earlier header comment),
+ * nothing about r6. Using r6 as bare scratch here, with no save of its
+ * own, silently destroyed any live value a caller held there --
+ * exactly the same bug class this file's own "SECOND real bug" fix
+ * above already hit once (r5/r8/r9/r11 used as scratch without saving
+ * first). Fixed by push/pop-ing r6 around the ENTIRE measured region
+ * in each dispatch stub below (not just inside these two helpers),
+ * preserving the caller's true r6 across the whole round trip
+ * regardless of what this instrumentation does with it internally.
+ *
+ * Safe as a bare register hand-off between measure_start/measure_end
+ * with no locking of its own: IRQ is auto-masked by the `swi`
+ * exception entry itself and FIQ by swi_entry's own `cpsid f` above,
+ * so nothing can interleave a DIFFERENT syscall's own start/end pair
+ * between these two calls on this single core. lr is free to clobber
+ * via these nested `bl`s -- not needed again until swi_return_to_usr's
+ * own fresh table lookups, which don't depend on it (see that
+ * function's own header comment). */
+swi_fast_measure_start:
+    ldr r6, =0x20003004        /* TIMER_CLO */
+    ldr r6, [r6]
+    bx lr
+
+swi_fast_measure_end:
+    push {r0, r1}
+    ldr r12, =0x20003004       /* TIMER_CLO */
+    ldr r12, [r12]
+    sub r6, r12, r6             /* r6 = elapsed us */
+    ldr r12, =swi_fast_total_us
+    ldr r1, [r12]
+    add r1, r1, r6
+    str r1, [r12]
+    ldr r12, =swi_fast_count
+    ldr r1, [r12]
+    add r1, r1, #1
+    str r1, [r12]
+    ldr r12, =swi_fast_worst_us
+    ldr r1, [r12]
+    cmp r6, r1
+    strgt r6, [r12]
+    pop {r0, r1}
+    bx lr
 
 swi_return_to_usr:
     /* current_task here always correctly reflects whichever task is
