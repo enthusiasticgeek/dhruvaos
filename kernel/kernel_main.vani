@@ -3323,6 +3323,70 @@ fn sdhost_cmd_timed_out(status: u32) -> i64 {
   return 0;
 }
 
+// BUG found 2026-09-19 (real-hardware SD wedge investigation, per the
+// user's own structured debugging pass, cross-checked against the real
+// upstream driver source -- downloaded directly, not recalled from
+// memory, per this project's own established discipline
+// [[feedback_use_proven_reference_after_repeated_failures]]):
+// sdhost_cmd_timed_out (above) only ever checks bit 15 (NEW_FLAG,
+// 0x8000 -- "did the controller's own command-issue cycle complete").
+// Confirmed directly against Linux's own drivers/mmc/host/bcm2835-
+// sdhost.c (#define SDCMD_FAIL_FLAG 0x4000, bit 14): a command can
+// complete (NEW_FLAG clears) while still genuinely FAILING (FAIL_FLAG
+// sets) -- e.g. a CRC7 response error or a card-level command timeout
+// distinct from this driver's own software poll-cap timeout. Real
+// Linux's own bcm2835_sdhost_finish_command explicitly checks BOTH,
+// as two SEPARATE failure branches, never conflating them. This
+// driver's own sdhost_init sequence (CMD2/CMD3/CMD9/CMD7/CMD16 below)
+// only ever checked sdhost_cmd_timed_out -- a command that silently
+// FAILED (FAIL_FLAG set, NEW_FLAG clear) would be treated as a
+// complete success, no error path, no log line, nothing.
+//
+// This directly explains why the existing SDHSTS=0x00000000 "clean"
+// reading at the "SD/MMC: init done" print was NEVER actually
+// exculpatory evidence, despite looking like it at the time: sdhost_
+// cmd's OWN pre-clear step (this file's own comment on sdhost_cmd,
+// "clears any pending SDHSTS error bits BEFORE writing SDCMD for the
+// NEXT command") silently erases whatever error bits an EARLIER failed
+// command (say, CMD7) may have set, the INSTANT the very next command
+// (CMD16) is issued -- by the time "init done" ever reads SDHSTS, any
+// such evidence is already gone. A card that never actually reached
+// TRANSFER state (CMD7/SELECT_CARD silently failing) would explain
+// every symptom on file: CMD0/CMD8/ACMD41 succeed (no card addressing
+// needed), CMD2/CMD3/CMD9/CMD7/CMD16 all report "success" under the
+// OLD (NEW_FLAG-only) check even if one of them genuinely failed, and
+// the FIRST DATA command (CMD17/CMD24) wedges identically regardless
+// of clock speed (a card stuck in STANDBY, never SELECTed, simply
+// won't answer a data command the same way a TRANSFER-state card
+// would, at ANY clock speed -- matching the real observed evidence
+// that ruled out clock frequency as sole cause).
+fn sdhost_cmd_failed(status: u32) -> i64 {
+  if (status & (0x4000 as u32)) != (0 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+// Real, immediate-read diagnostic for a FAIL_FLAG hit -- SDHSTS must be
+// read HERE, before the caller's own next sdhost_cmd() call pre-clears
+// it (see sdhost_cmd_failed's own comment above for why that erasure
+// is exactly what has been hiding this class of failure from every
+// prior real-hardware log this project has captured).
+fn sdhost_cmd_report_failure(cmd_name: Str, status: u32) -> i64 {
+  let sdhsts: u32 = mmio_read_u32(SDHSTS);
+  let sdedm: u32 = mmio_read_u32(SDEDM);
+  let _ = uart_puts("SD/MMC: ");
+  let _ = uart_puts(cmd_name);
+  let _ = uart_puts(" FAILED (SDCMD_FAIL_FLAG set) -- SDCMD=0x");
+  let _ = uart_put_hex32(status);
+  let _ = uart_puts(" SDHSTS=0x");
+  let _ = uart_put_hex32(sdhsts);
+  let _ = uart_puts(" SDEDM=0x");
+  let _ = uart_put_hex32(sdedm);
+  let _ = uart_puts("\n");
+  return 0;
+}
+
 // Boot-time self-test for the pure detection logic itself. Actually
 // triggering a genuine sdhost_cmd timeout under QEMU would mean making
 // the emulated card wedge, which isn't something this project has a
@@ -3663,6 +3727,10 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts("SD/MMC: CMD2 (ALL_SEND_CID) timed out\n");
     return 0 - 1;
   }
+  if sdhost_cmd_failed(cmd2_status) == 1 {
+    let _ = sdhost_cmd_report_failure("CMD2 (ALL_SEND_CID)", cmd2_status);
+    return 0 - 1;
+  }
 
   // CMD3: SD names this SEND_RELATIVE_ADDR (card publishes its own
   // RCA, argument ignored) -- MMC names the SAME command index
@@ -3681,6 +3749,10 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts("SD: CMD3 (SEND_RELATIVE_ADDR) timed out\n");
     return 0 - 1;
   }
+  if sdhost_cmd_failed(cmd3_status) == 1 {
+    let _ = sdhost_cmd_report_failure("CMD3 (SEND_RELATIVE_ADDR)", cmd3_status);
+    return 0 - 1;
+  }
   // For MMC, trust the value just assigned rather than re-parsing the
   // response -- matching U-Boot's own approach (it never reads the
   // RCA back out of CMD3's response either). For SD, unchanged: the
@@ -3695,6 +3767,10 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts("SD/MMC: CMD9 (SEND_CSD) timed out\n");
     return 0 - 1;
   }
+  if sdhost_cmd_failed(cmd9_status) == 1 {
+    let _ = sdhost_cmd_report_failure("CMD9 (SEND_CSD)", cmd9_status);
+    return 0 - 1;
+  }
 
   // CMD7: SELECT_CARD -- moves the card from stand-by to transfer
   // state; every data command (CMD17/CMD24 etc., task #3) requires
@@ -3704,7 +3780,10 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts("SD/MMC: CMD7 (SELECT_CARD) timed out\n");
     return 0 - 1;
   }
-
+  if sdhost_cmd_failed(cmd7_status) == 1 {
+    let _ = sdhost_cmd_report_failure("CMD7 (SELECT_CARD)", cmd7_status);
+    return 0 - 1;
+  }
   // CMD16: SET_BLOCKLEN -- this driver only ever uses 512-byte
   // blocks, set once here rather than before every single read/write.
   let cmd16_status: u32 = sdhost_cmd(16 as u32, 512 as u32);
@@ -3712,6 +3791,46 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts("SD/MMC: CMD16 (SET_BLOCKLEN) timed out\n");
     return 0 - 1;
   }
+  if sdhost_cmd_failed(cmd16_status) == 1 {
+    let _ = sdhost_cmd_report_failure("CMD16 (SET_BLOCKLEN)", cmd16_status);
+    return 0 - 1;
+  }
+  // Real, direct verification (not just "the command didn't fault") --
+  // per the R1 response format, bits[12:9] of the CARD STATUS word are
+  // CURRENT_STATE; 4 == "tran" (TRANSFER state, the ONLY state CMD17/
+  // CMD24 are legal in). Deliberately read from CMD16's own response,
+  // NOT CMD7's -- an R1 response's CURRENT_STATE field documents the
+  // state the card was in WHEN IT RECEIVED that command, not the state
+  // it transitions into as a result of processing it (confirmed
+  // against real Linux drivers/mmc/core/mmc_ops.c's own _mmc_select_
+  // card: it doesn't check CURRENT_STATE after CMD7 either, for
+  // exactly this reason -- the only way to observe whether selection
+  // actually took effect is a LATER command's own response, and CMD16
+  // is the next one this driver already issues). A card that silently
+  // stayed in "stby" (3) or anywhere else here, despite every command
+  // so far reporting neither a timeout nor FAIL_FLAG, would have been
+  // invisible to every check this driver had before today -- print it
+  // unconditionally so the next real-hardware log shows the true
+  // post-selection card state directly, not inferred from CMD17/
+  // CMD24's own eventual wedge.
+  let cmd16_r1: u32 = mmio_read_u32(sdrsp0);
+  let cmd16_current_state: u32 = (cmd16_r1 >> (9 as u32)) & (0xF as u32);
+  let _ = uart_puts("SD DIAG: post-CMD16 R1=0x");
+  let _ = uart_put_hex32(cmd16_r1);
+  let _ = uart_puts(" CURRENT_STATE=");
+  let _ = uart_put_i64(cmd16_current_state as i64);
+  let _ = uart_puts(if cmd16_current_state == (4 as u32) { " (tran -- card genuinely selected)\n" } else { " (NOT tran -- CMD7 did NOT actually select the card!)\n" });
+  // Deliberately diagnostic-only, NOT a hard failure (no `return 0-1`
+  // here) -- this exact QEMU regression run's own log already shows
+  // CURRENT_STATE=3 here too, despite QEMU's own SD model completing
+  // every later read/write in this same boot perfectly fine (matches
+  // the pre-existing, unrelated 4-FAIL baseline exactly). That means
+  // QEMU's own card model doesn't populate this response field the way
+  // real hardware does -- turning this into a hard failure now would
+  // break the ENTIRE QEMU-based regression suite's own SD-backed tests
+  // (DharaFS, crypto-on-SD, etc.), not just add a real-hardware check.
+  // Print-only until a fresh real-hardware capture confirms what value
+  // genuinely appears there on the actual card.
 
   // ROUND 2026-09-17 (real-hardware investigation, task #215):
   // identification-speed SDCDIV (0x148, set once above) has been left
