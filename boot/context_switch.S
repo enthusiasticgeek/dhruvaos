@@ -489,6 +489,28 @@ is_usr_mode_task:
 usr_sp_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
+/* Task #253 Phase 3 (2026-09-18): the SWI syscall trap's own per-task
+ * resume state -- see boot/swi_entry.S's own header comment for the
+ * full design. usr_sp_table above already solves this exact problem
+ * (a single physical banked register shared by every task) for
+ * r13_usr; these two solve the SAME problem for SPSR_svc and lr_svc,
+ * which get clobbered by ANY intervening SWI/exception from another
+ * task while this one is blocked inside a syscall (task_sleep_ticks_
+ * impl/dhruva_mutex_lock_impl's own blocked path can take arbitrarily
+ * long, during which many OTHER tasks' own syscalls and timer FIQs
+ * may run) -- captured once, at SWI entry, before dispatching to the
+ * real privileged function; restored once, at the very end of every
+ * syscall (whether it returned immediately or blocked and resumed
+ * much later), keyed on current_task so it's correct regardless of
+ * which task is ACTUALLY resuming by the time that final restore
+ * runs. */
+.global usr_resume_spsr_table
+.global usr_resume_pc_table
+usr_resume_spsr_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+usr_resume_pc_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
 .section ".text"
 
 .global task_run_ticks_get_at
@@ -1138,6 +1160,20 @@ scheduler_switch_from_irq_skip_tick:
  * same event). ticks is a plain i64, so AAPCS's 64-bit-argument
  * register pairing applies (r0:r1) -- only r0 (the low 32 bits) is
  * used, since no tick count in this design remotely approaches 2^32. */
+/* Task #253 Phase 3 (2026-09-18): briefly renamed to task_sleep_
+ * ticks_impl with all callers routed through a new SWI trampoline
+ * (boot/swi_entry.S) -- reverted back to this original name/direct-
+ * call form after live QEMU testing surfaced a real, still-open crash
+ * (SD-driver and shell-dispatch code paths, appearing only once the
+ * trap was actually exercised at scale) beyond the true-lr/resume-pc
+ * bug already found and fixed in the trampolines themselves (see
+ * swi_entry.S's own header comment for that fix, kept and still
+ * correct -- the file's own trampoline is renamed, not deleted, so
+ * this real fix isn't lost, just not wired into the live call graph
+ * yet). Every one of this project's own ~65 call sites (kernel_main.
+ * vani's own extern "C" fn declaration, unchanged name) is back to
+ * calling this real implementation DIRECTLY -- the proven-stable
+ * Phase 1/2 behavior, byte-for-byte. */
 .global task_sleep_ticks
 task_sleep_ticks:
     /* Task #246 (RTOS true-compliance pass, 2026-09-18): `cpsid i` ->
@@ -1356,6 +1392,8 @@ current_eff_prio:
  * saved r0 slot is patched to 0 right after the save -- otherwise a
  * resumed caller would see r0 = the original mutex_id argument instead
  * of the return code. */
+/* Task #253 Phase 3 (2026-09-18): reverted back to this name -- see
+ * task_sleep_ticks's own comment above for the full story. */
 .global dhruva_mutex_lock
 dhruva_mutex_lock:
     mrs r1, cpsr
@@ -1473,6 +1511,8 @@ dml_contended:
  * Always returns normally (never suspends the caller) -- push/pop
  * r4-r9 around the whole body per AAPCS (round 53's lesson: called
  * directly from vani-compiled C, r4-r11 are callee-saved). */
+/* Task #253 Phase 3 (2026-09-18): reverted back to this name -- see
+ * task_sleep_ticks's own comment above for the full story. */
 .global dhruva_mutex_unlock
 dhruva_mutex_unlock:
     stmdb sp!, {r4-r9, lr}
@@ -1955,6 +1995,60 @@ task_d_init_stack_usr:
     ldr r1, =task_d
     b prepare_stack_common_usr
 
+/* Task #253 Phase 3 (2026-09-18): the remaining 5 fixed tasks'
+ * (HIGH/MEDIUM/LOW/GC/SHELL) own USR-mode launch paths -- byte-for-
+ * byte the same pattern as task_d_init_stack_usr above, just each
+ * setting its own task-index slot in is_usr_mode_task (0/1/2/4/5 --
+ * index 3, task_d, is already set by task_d_init_stack_usr itself)
+ * and branching to its own entry point. Every one of these now
+ * genuinely NEEDS the SWI syscall trap (boot/swi_entry.S) -- unlike
+ * task_d/IDLE, all five call at least one of task_sleep_ticks/dhruva_
+ * mutex_lock/_unlock somewhere in their own body. */
+.global task_a_init_stack_usr
+task_a_init_stack_usr:
+    ldr r3, =is_usr_mode_task
+    mov r4, #1
+    str r4, [r3, #0]        /* index 0 */
+    add r0, r0, r2
+    ldr r1, =task_a
+    b prepare_stack_common_usr
+
+.global task_b_init_stack_usr
+task_b_init_stack_usr:
+    ldr r3, =is_usr_mode_task
+    mov r4, #1
+    str r4, [r3, #4]        /* index 1 */
+    add r0, r0, r2
+    ldr r1, =task_b
+    b prepare_stack_common_usr
+
+.global task_c_init_stack_usr
+task_c_init_stack_usr:
+    ldr r3, =is_usr_mode_task
+    mov r4, #1
+    str r4, [r3, #8]        /* index 2 */
+    add r0, r0, r2
+    ldr r1, =task_c
+    b prepare_stack_common_usr
+
+.global task_e_init_stack_usr
+task_e_init_stack_usr:
+    ldr r3, =is_usr_mode_task
+    mov r4, #1
+    str r4, [r3, #16]       /* index 4 */
+    add r0, r0, r2
+    ldr r1, =task_e
+    b prepare_stack_common_usr
+
+.global task_f_init_stack_usr
+task_f_init_stack_usr:
+    ldr r3, =is_usr_mode_task
+    mov r4, #1
+    str r4, [r3, #20]       /* index 5 */
+    add r0, r0, r2
+    ldr r1, =task_f
+    b prepare_stack_common_usr
+
 /* mut ref i64 stack_region_top(mut ref i64 base, i64 bytes) -- trivial
  * `base + bytes` helper (same u32/i64-pairing convention as task_d_
  * init_stack_usr above: base -> r0, bytes's low word -> r2), used by
@@ -2143,6 +2237,18 @@ task_generic_init_stack:
     mov r1, r3               /* r1 = entry point */
     b prepare_stack_common
 
+/* Task #253 Phase 3 (2026-09-18): task_create_usr's own USR-mode
+ * counterpart to task_generic_init_stack above -- identical argument
+ * shape, just tail-calling prepare_stack_common_usr (spsr=0x10)
+ * instead of prepare_stack_common (spsr=0x13). */
+.global task_generic_init_stack_usr
+task_generic_init_stack_usr:
+    add r1, r1, r2
+    mov r3, r0
+    mov r0, r1
+    mov r1, r3
+    b prepare_stack_common_usr
+
 /* void task_table_init()
  * Seeds the 10 free slots (indices 6-15, task_create's own) of
  * eff_prio_table with the "unused" sentinel (255) -- .bss's own
@@ -2265,6 +2371,76 @@ tc_found_slot:
 
     msr cpsr_c, r8
     mov r0, r9                 /* return the new task's slot index */
+    ldmia sp!, {r4-r9, lr}
+    bx lr
+
+/* u32 task_create_usr(fn() -> i64 entry_fn, mut ref i64 stack_base,
+ *                       u32 stack_bytes, u32 priority)
+ * Task #253 Phase 3 (2026-09-18): task_create's own USR-mode
+ * counterpart -- byte-for-byte identical except it calls task_
+ * generic_init_stack_usr instead of task_generic_init_stack, and ALSO
+ * sets is_usr_mode_task[found slot] = 1 (task_create's own dynamic
+ * slot-assignment means, unlike the 6 fixed tasks, this can't be set
+ * ahead of time by a caller who already knows the index -- it's only
+ * known once task_create_usr itself finds a free slot). The 4 dynamic
+ * tasks this project creates today (task_custom_demo, task_mutex_
+ * demo_low/high, task_fsq -- kernel_main.vani's own boot sequence)
+ * all switch to calling this instead of plain task_create; each still
+ * needs its OWN separate USR stack allocated and seeded into usr_sp_
+ * table by its own caller in kernel_main.vani (dhruva_alloc_usrstack_
+ * domain + usr_sp_table_set_at + stack_region_top), exactly the same
+ * pattern task_d_init_stack_usr's own caller already established --
+ * this function only returns the new task's index, same as plain
+ * task_create, so that pattern is unchanged, just now also needed
+ * for 4 more callers instead of 1. */
+.global task_create_usr
+task_create_usr:
+    stmdb sp!, {r4-r9, lr}
+    mov r4, r0
+    mov r5, r1
+    mov r6, r2
+    mov r7, r3
+
+    mrs r8, cpsr
+    cpsid if
+
+    ldr r0, =eff_prio_table
+    mov r9, #6
+tcu_scan_loop:
+    cmp r9, #16
+    bge tcu_no_slot
+    ldr r1, [r0, r9, lsl #2]
+    cmp r1, #255
+    beq tcu_found_slot
+    add r9, r9, #1
+    b tcu_scan_loop
+tcu_no_slot:
+    msr cpsr_c, r8
+    mvn r0, #0
+    ldmia sp!, {r4-r9, lr}
+    bx lr
+tcu_found_slot:
+    mov r0, r4
+    mov r1, r5
+    mov r2, r6
+    bl task_generic_init_stack_usr
+    /* r9 still holds the free slot index (callee-saved across `bl`) */
+
+    ldr r1, =sp_table
+    str r0, [r1, r9, lsl #2]
+    ldr r1, =eff_prio_table
+    str r7, [r1, r9, lsl #2]
+    ldr r1, =base_prio_table
+    str r7, [r1, r9, lsl #2]
+    ldr r1, =sleep_until_table
+    mov r2, #0
+    str r2, [r1, r9, lsl #2]
+    ldr r1, =is_usr_mode_task
+    mov r2, #1
+    str r2, [r1, r9, lsl #2]
+
+    msr cpsr_c, r8
+    mov r0, r9
     ldmia sp!, {r4-r9, lr}
     bx lr
 

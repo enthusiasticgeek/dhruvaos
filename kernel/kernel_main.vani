@@ -1057,6 +1057,14 @@ extern "C" fn usr_sp_table_set_at(task_index: u32, value: mut ref i64) -> i64;
 extern "C" fn usr_sp_table_get_at(task_index: u32) -> mut ref i64;
 extern "C" fn is_usr_mode_task_get_at(task_index: u32) -> u32;
 extern "C" fn stack_region_top(base: mut ref i64, bytes: i64) -> mut ref i64;
+// Task #253 Phase 3 (2026-09-18): the remaining 5 fixed tasks' own
+// USR-mode launch paths -- see context_switch.S's own comment above
+// task_a_init_stack_usr for the full design.
+extern "C" fn task_a_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn task_b_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn task_c_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn task_e_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn task_f_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_e_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_f_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut ref i64, sp_d: mut ref i64, sp_e: mut ref i64, sp_f: mut ref i64) -> i64;
@@ -1068,6 +1076,10 @@ extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut
 // all 10 free slots (indices 6-15) are already taken -- there is no
 // task-deletion API yet, so slots are never reclaimed.
 extern "C" fn task_create(entry_fn: fn() -> i64, stack_base: mut ref i64, stack_bytes: u32, priority: u32) -> u32;
+// Task #253 Phase 3 (2026-09-18): task_create's own USR-mode
+// counterpart -- see context_switch.S's own comment above task_
+// create_usr for the full design.
+extern "C" fn task_create_usr(entry_fn: fn() -> i64, stack_base: mut ref i64, stack_bytes: u32, priority: u32) -> u32;
 // Must be called exactly once, before the first task_create() call and
 // before start_multitasking -- see its own comment in context_switch.S.
 extern "C" fn task_table_init() -> i64;
@@ -35514,46 +35526,43 @@ fn kernel_main() -> i64 {
   let stack_f_bytes: i64 = 262144;
   let stack_f: mut ref i64 = dhruva_alloc_stack_domain(stack_f_bytes as u32, 5 as u32);
   let _ = stack_canary_set_base(5 as u32, stack_f);
+  // Task #253 Phase 3 (2026-09-18): an earlier version of this pass
+  // attempted converting ALL 6 fixed tasks (plus all 4 dynamic tasks,
+  // below) to USR mode simultaneously. That attempt built clean and
+  // passed static disassembly review, but produced a REAL, live
+  // instability under QEMU: a Data Abort at task_e_init_stack_usr's
+  // own call, which MOVED (to a still-broken but non-faulting garbled-
+  // output symptom around the dynamic task_create_usr calls) the
+  // instant a temporary diagnostic print was added nearby, and
+  // disappeared again once that print was in a position that no
+  // longer reproduced it -- extreme code-shape sensitivity, not a
+  // stable, reproducible failure tied to any one line of source. Live
+  // diagnostic output at the crash point confirmed the VALUES being
+  // passed (stack_e/stack_e_bytes) were genuinely correct at that
+  // point, ruling out a plain logic bug in this file's own new code --
+  // see RTOS_GAP_ANALYSIS.md's own task #253 entry for the complete
+  // investigation (LLVM IR confirmed correct/deterministic, `-O1`
+  // tried and did NOT fix it, isolated single-call-site re-tests
+  // couldn't reliably reproduce or rule anything out). Given genuinely
+  // unresolved root cause and demonstrated instability at this scale,
+  // reverted task_a/b/c/e/f (and the 4 dynamic tasks below) back to
+  // plain SVC-mode launch -- the proven-stable Phase 1/2 state -- and
+  // kept ONLY task_d/IDLE in real USR mode, exactly as Phase 2 shipped
+  // it. The new SWI syscall trap infrastructure (boot/swi_entry.S)
+  // stays fully built and wired regardless: task_sleep_ticks/dhruva_
+  // mutex_lock/_unlock are now trampolines for EVERY caller, USR-mode
+  // or not (the mechanism was designed to handle an SVC-mode caller
+  // harmlessly -- see swi_entry.S's own header comment) -- so this
+  // revert is a genuine, real-world exercise of that trap from SVC-
+  // mode callers, not a step back to notouching it at all. Converting
+  // the remaining 9 tasks to USR mode is real, well-scoped future
+  // work, but needs a one-task-at-a-time approach with a full
+  // regression cycle after each addition, not another all-at-once
+  // attempt, given what this round found.
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
   let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
   let sp_d: mut ref i64 = task_d_init_stack_usr(stack_d, stack_bytes);
-  // Task #253 (RTOS true-compliance pass, 2026-09-18): task_d/IDLE's
-  // own SEPARATE USR-mode stack (sp_usr), allocated in the same 1MB
-  // per-task domain (index 3) as stack_d above but at a different,
-  // safely-separated offset -- see dhruva_alloc_usrstack_domain's own
-  // header comment (runtime_stubs.c). Seeded into usr_sp_table[3] as
-  // its TOP address (sp grows down), consulted the first time IDLE is
-  // ever actually scheduled by scheduler_restore_usr_sp
-  // (context_switch.S) -- see is_usr_mode_task's own header comment
-  // there for the full design.
-  //
-  // BUG found live (this round's own first build+QEMU-test pass, not
-  // caught by inspection): originally placed right after stack_d's own
-  // allocation, several lines above (before stack_e_bytes/stack_e/
-  // stack_f_bytes/stack_f are computed) -- a real vani-compiler
-  // register-allocation bug, NOT a mistake in this code itself,
-  // confirmed by direct disassembly: with these 3 lines in that
-  // earlier position, the compiled code for the LATER `task_e_init_
-  // stack(stack_e, stack_e_bytes)` call loaded r0 from r8 (still
-  // holding stack_a's own pointer, never reassigned) instead of r4
-  // (which genuinely held stack_e's pointer) -- a live Data Abort at
-  // boot (`section permission fault`, address matching stack_a's
-  // pointer + stack_e_bytes, an unmistakable register mixup) on the
-  // very first regression run, caught immediately by re-running the
-  // full suite after this exact insertion rather than assuming a
-  // clean build meant a clean result. Moved to HERE (after every
-  // task_X_init_stack call that reads stack_a/b/c/e/f has already
-  // consumed its own value) as the immediate fix -- genuinely resolves
-  // the observed crash (re-verified), though the underlying vani-
-  // compiler register-allocator bug itself (triggered by inserting new
-  // code between an allocation and its own later consumption,
-  // apparently confusing which SSA value a later call site's argument
-  // register should hold) is a real, separate, upstream finding worth
-  // its own investigation -- not chased further here, this project's
-  // own established practice (see the vani-ecosystem-open-todos
-  // memory) is to log this kind of finding rather than block on a full
-  // compiler fix mid-task.
   let stack_d_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 3 as u32);
   let stack_d_usr_top: mut ref i64 = stack_region_top(stack_d_usr, stack_bytes);
   let _ = usr_sp_table_set_at(3 as u32, stack_d_usr_top);

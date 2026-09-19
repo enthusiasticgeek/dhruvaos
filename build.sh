@@ -85,6 +85,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/fiq_entry.S" -o "${BUILD_DIR}/fiq_entry.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/swi_entry.S" -o "${BUILD_DIR}/swi_entry.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/rpi1/vectors.S" -o "${BUILD_DIR}/vectors.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -237,14 +240,35 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
 "${VANIC}" emit "${ROOT}/kernel/kernel_main.vani" --backend=llvm \
   -o "${BUILD_DIR}/kernel_main.ll"
 
-llc -mtriple="${TRIPLE}" -mcpu="${CPU}" -filetype=obj \
+# ROUND 2026-09-18 (task #253 Phase 3): explicit -O1, not llc's own
+# default (-O2) -- found live, via direct disassembly, not guessed:
+# at the default optimization level, specific vani-generated IR
+# shapes in this single enormous kernel_main basic block (thousands
+# of live ranges, no internal branches) triggered a real register
+# mixup in llc's own register allocator -- a later call site loaded
+# an unrelated EARLIER local's value instead of its own real argument
+# (confirmed twice, on two different call sites, as more code was
+# added to this same function -- see RTOS_GAP_ANALYSIS.md's own task
+# #253 entry for the full investigation, including why this was
+# NOT root-caused to vani-compiler's own IR generation, confirmed
+# correct/deterministic, nor cleanly reproduced in earlier isolated
+# single-optimization-level re-testing). An isolated repro at -O0/-O1
+# on the exact same broken IR did NOT reproduce the mixup; applying
+# -O1 here (instead of chasing a full root cause in a third-party
+# backend under real time pressure) is a genuine, empirically-
+# verified mitigation, not a guess -- confirmed by re-running the full
+# QEMU regression suite clean after this change. Costs some amount of
+# codegen quality (not measured) for real, load-bearing correctness;
+# worth revisiting if this project's own build ever migrates off this
+# LLVM version or this function ever gets meaningfully smaller.
+llc -mtriple="${TRIPLE}" -mcpu="${CPU}" -filetype=obj -O1 \
   -function-sections -data-sections \
   "${BUILD_DIR}/kernel_main.ll" -o "${BUILD_DIR}/kernel_main.o"
 
 arm-none-eabi-gcc -nostdlib -ffreestanding \
   -Wl,--gc-sections -Wl,-T,"${ROOT}/boot/rpi1/link.ld" \
   "${BUILD_DIR}/boot.o" "${BUILD_DIR}/mmu_init.o" "${BUILD_DIR}/context_switch.o" \
-  "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/fiq_entry.o" "${BUILD_DIR}/vectors.o" \
+  "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/fiq_entry.o" "${BUILD_DIR}/swi_entry.o" "${BUILD_DIR}/vectors.o" \
   "${BUILD_DIR}/sdcard_state.o" "${BUILD_DIR}/dharafs_buf.o" \
   "${BUILD_DIR}/dharafs_state.o" "${BUILD_DIR}/shell_state.o" \
   "${BUILD_DIR}/governor_state.o" "${BUILD_DIR}/netif_state.o" \

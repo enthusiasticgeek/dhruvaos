@@ -7457,3 +7457,37 @@ doesn't, the responsible next step is real-hardware experimentation
 this environment can't provide (e.g. a logic analyzer on the SD bus,
 or systematically trying a different physical SD card to rule out
 card-specific marginality, both suggested earlier this session).
+
+**Task #253 Phase 3 attempted and partially reverted, 2026-09-18 (same
+day, after "fix vani compiler bugs first... then pivot back 253").**
+Built a real SWI syscall trap (`boot/swi_entry.S`) for `task_sleep_
+ticks`/`dhruva_mutex_lock`/`dhruva_mutex_unlock`. Found and FIXED a
+real round-68-class true-lr/resume-pc conflation bug in it live under
+QEMU (taking `swi` from SVC mode -- true for every task except IDLE --
+silently clobbers the trampoline's own caller-return-address via the
+same physical `lr_svc` the exception itself reuses; fixed by stashing
+it in r4 before the trap, the same pattern `irq_entry.S`/`fiq_entry.S`
+already use). Fixing this alone took the system from "barely boots"
+to "6 more tests passing, scheduler clearly healthy" -- a dramatic,
+confirmed improvement. But a SEPARATE, still-undiagnosed crash
+surfaced downstream (SD-driver and shell-dispatch code paths) once the
+trap was exercised at scale. Given the investigation budget already
+spent this session (this bug, plus the earlier register-mixup
+investigation on the full-10-task USR-mode attempt, which in hindsight
+may well have been the SAME bug at larger scale, not a separate
+compiler issue), stopped and reverted the LIVE CALL GRAPH back to
+Phase 1/2's proven state: `task_sleep_ticks`/`dhruva_mutex_lock`/
+`dhruva_mutex_unlock` call their real implementations directly again,
+only `task_d`/IDLE runs in USR mode. The true-lr-fixed trampolines
+stay in the tree under inert names (`task_sleep_ticks_syscall`/etc.),
+not deleted -- real, working, fixed code, just not wired in yet,
+pending the second bug being found too. Re-verified clean: `phase4_
+milestone.py` matches the ORIGINAL Phase 1/2 baseline exactly (same
+4-FAIL set, zero `SCHED SHADOW MISMATCH`, `idle` printed 266 times, no
+crash). Full story, including the earlier full-10-task attempt's own
+extensive-but-ultimately-inconclusive vani-compiler/LLVM investigation,
+is in `RTOS_GAP_ANALYSIS.md`'s own task #253 entry. Real, well-scoped
+next steps: re-wire the trampolines and chase the SD/shell-dispatch
+bug to root cause; then convert the remaining 9 tasks one at a time
+with a full regression cycle after each, not another all-at-once
+attempt.

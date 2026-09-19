@@ -475,42 +475,101 @@ doesn't yet attempt.
   genuinely executing its own body from USR mode repeatedly, not
   silently inert or crash-looping invisibly.
 
-  **What's NOT implemented yet (Phase 3, still a real, well-scoped
-  follow-up, not attempted in this pass):**
-  1. **No syscall infrastructure exists yet.** `boot/rpi1/vectors.S`'s
-     own SWI vector still points at `fault_swi`, a crash handler.
-  2. **The other 5 fixed tasks (HIGH/MEDIUM/LOW/GC/SHELL) and task_
-     create's dynamic tasks all stay SVC-mode.** Every one of them
-     calls at least one of the 65 real privileged call sites (`task_
-     sleep_ticks`/`dhruva_mutex_lock`/`_unlock`/`dhruva_prio_lock`/
-     `_unlock`/`task_create`) -- of these, only `task_sleep_ticks`/
-     `dhruva_mutex_lock`/`_unlock`/`task_create` actually contain
-     privileged CPU instructions (`cpsid`/`msr cpsr_c`) that would
-     fault if called directly from USR mode; `dhruva_prio_lock`/
-     `_unlock` turned out, on closer inspection during this round, to
-     be PLAIN DATA WRITES with no privileged instruction inside at
-     all -- calling them from USR mode doesn't fault, it just works
-     (already exercised live: IDLE's own `uart_puts_bounded` calls
-     both, successfully, from real USR mode, no syscall needed). So
-     the real remaining syscall-trap requirement is narrower still:
-     only the 4 genuinely-privileged functions, not all 6 originally
-     named.
-  3. **The genuinely hard design problems are now solved and proven,
-     not just analyzed** -- this is what makes Phase 3 a materially
-     LOWER-risk follow-up than it looked before this round: the SPSR_
-     svc/lr_svc single-physical-register clobbering hazard across an
-     intervening exception from another task (the reason a syscall
-     trampoline can't just `bl` into `task_sleep_ticks` and `movs pc,
-     lr`) is understood and solved by the SAME per-task-table pattern
-     `usr_sp_table` already uses; the mode-aware IRQ/FIQ capture logic
-     is written and live-tested; the dual-stack-per-task model is
-     proven end-to-end for IDLE. Converting the remaining 5 fixed
-     tasks + task_create's dynamic path, and building the actual SWI
-     trampoline for the 4 genuinely-privileged functions, is real work
-     but mechanical repetition of an already-proven pattern, not new
-     design risk -- a fundamentally different, better-informed starting
-     point than the original investigation's "single highest-risk item
-     in this entire audit pass" framing.
+  **Phase 3 attempted, same day: real SWI syscall trap built, a real
+  bug found and fixed in it, a SEPARATE bug found and left open, ended
+  deliberately NOT wired into the live call graph.** `boot/swi_entry.S`
+  now exists: a working SWI handler (dispatch on a syscall number in
+  r7), per-task `usr_resume_spsr_table`/`usr_resume_pc_table` solving
+  the SPSR_svc/lr_svc single-physical-register clobbering hazard
+  exactly as designed, and three trampolines
+  (`task_sleep_ticks_syscall`/`dhruva_mutex_lock_syscall`/`dhruva_
+  mutex_unlock_syscall`) implementing the actual trap.
+
+  **Real bug #1, found and FIXED (a genuine round-68-class true-lr/
+  resume-pc conflation, not a compiler issue):** the first version of
+  the trampolines took `swi` directly from whatever mode the caller was
+  in. For a task that STAYS in SVC mode (every task except IDLE) taking
+  an SWI exception reuses the SAME physical `lr_svc`/`SPSR_svc` the
+  trampoline's own `bl`-based entry already occupied -- the CPU itself,
+  as part of taking the exception, overwrites `lr_svc` with the SWI's
+  own return address BEFORE any software could save the trampoline's
+  real caller-return-address, permanently losing it. Invisible for
+  IDLE (USR mode) because `lr_usr` is a genuinely separate banked
+  register, untouched by an SVC exception -- which is exactly why this
+  was missed until an SVC-mode caller (task_a-f) actually exercised the
+  trap live. Fixed the same way `irq_entry.S`/`fiq_entry.S` already fix
+  the identical class of problem: each trampoline stashes its own true
+  `lr` into r4 (unbanked, survives the whole round trip in either mode)
+  before the trap and restores it explicitly afterward -- `swi_entry`'s
+  own entry-capture scratch usage had to move off r4 (was using it for
+  spsr capture) onto r11 so it wouldn't clobber the trampoline's
+  stashed value. Verified via live QEMU regression: fixing this alone
+  took the system from "barely boots, almost every interactive test
+  fails, SCHED SHADOW MISMATCH cascades, `idle` prints once" to "6 more
+  tests pass (cat/eval/ping/ifconfig/tcpecho/udpecho/netstat), scheduler
+  clearly healthy (HIGH/MUTEX-LOW/idle all printing normally, hundreds
+  of times) -- a dramatic, unambiguous improvement.
+
+  **Real bug #2, found, NOT yet fixed:** even with bug #1 fixed, the
+  same regression run hit two later `FATAL: Data Abort`s -- one inside
+  `sdhost_drain_ready` (SD driver) at a suspiciously low address
+  (`0x00000004`, NULL-pointer-shaped), one inside `shell_dispatch` at a
+  huge/wrapped address (`0xFFFFF437`, underflow-shaped) -- both well
+  into the run (hundreds of real context switches in), in subsystems
+  with no obvious direct connection to the SWI trap itself. Not chased
+  to root cause in this pass: given the volume of investigation already
+  spent this session (the true-lr bug above, plus the earlier,
+  ultimately-not-vani-compiler register-mixup investigation on the
+  full-USR-mode-conversion attempt -- see that item's own history
+  immediately below), the honest, disciplined choice was to stop rather
+  than keep pulling threads indefinitely.
+
+  **Disposition: the trampolines are real, built, and have this one
+  confirmed fix in them -- but are deliberately NOT wired into the live
+  call graph.** `context_switch.S`'s own `task_sleep_ticks`/`dhruva_
+  mutex_lock`/`dhruva_mutex_unlock` are back to their original names,
+  called directly by every one of this project's ~65 existing call
+  sites, byte-for-byte the same as the proven Phase 1/2 state -- Phase 3
+  work is present in the tree (under the `_syscall`-suffixed inert
+  names) but inactive. Re-verified after this revert: `phase4_
+  milestone.py` matches the ORIGINAL Phase 1/2 baseline exactly (same
+  4-FAIL set, zero `SCHED SHADOW MISMATCH`, `idle` printed 266 times,
+  no crash) -- confirms the revert is genuinely clean, not just
+  "probably fine."
+
+  Also attempted, same day, as a separate, LARGER change before this
+  narrower investigation: converting ALL 10 tasks (6 fixed + 4 dynamic)
+  to USR mode simultaneously. That produced its own live crash
+  (`section permission fault` inside `prepare_stack_common_usr`,
+  `task_e_init_stack` receiving a value that traced back to `task_a`'s
+  own pointer on direct disassembly) that was extensively investigated
+  as a possible vani-compiler or LLVM `llc` register-allocation bug --
+  the generated LLVM IR was confirmed correct/deterministic, an
+  isolated `llc` re-test at the exact production flags did not
+  reproduce it, and `-O1` (kept in `build.sh` regardless, harmless) did
+  not fix it either. A live diagnostic print later showed the actual
+  runtime values were CORRECT at the point of use, yet the crash still
+  happened -- and, tellingly, adding that diagnostic print made the
+  specific crash disappear, replaced by a different symptom (garbled
+  UART output around dynamic task creation) at the same reduced-but-
+  still-broken scale. In hindsight, once real bug #1 above (the true-lr
+  conflation) was found and fixed, it's plausible -- though NOT
+  directly re-tested at the full 10-task scale in this session -- that
+  this was the SAME underlying bug manifesting differently under higher
+  register/task-count pressure, not a separate compiler issue at all.
+  Reverted to task_d-only USR mode (this item's own proven Phase 1/2
+  scope) rather than re-attempted with the fix applied, given the
+  investigation budget already spent.
+
+  **Real, well-scoped future work, in order:** (1) re-attempt wiring
+  the SWI trampolines back in (rename `_syscall`-suffixed labels back
+  to the real names, real implementations back to `_impl`) now that
+  the true-lr bug is fixed, and chase real bug #2 (the SD-driver/
+  shell-dispatch crash) to a real root cause before trusting it; (2)
+  once SVC-mode callers genuinely work end-to-end via the trap, convert
+  the remaining 9 tasks to USR mode one at a time with a full
+  regression cycle after each addition, not another all-at-once
+  attempt, per this round's own hard-won lesson.
 
   Real Pi 1B hardware validation remains outstanding for everything in
   this item (no hardware available in this environment) -- the same

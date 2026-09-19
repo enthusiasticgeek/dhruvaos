@@ -51,7 +51,13 @@ _vectors:
     ldr pc, [pc, #24]   /* 0x1C: FIQ */
 .word boot_entry
 .word fault_undef
-.word fault_swi
+.word swi_entry           /* Task #253 Phase 3 (2026-09-18): real
+                            * handler now, boot/swi_entry.S -- was
+                            * fault_swi (crash stub) up to this round;
+                            * the syscall trap for USR-mode task code
+                            * to reach genuinely privileged scheduler
+                            * primitives, see that file's own header
+                            * comment. */
 .word fault_prefetch_abort
 .word fault_data_abort
 .word fault_reserved
@@ -64,10 +70,12 @@ _vectors:
 
 /* Phase 2 doesn't recover from most of these -- just halts, so a real
  * bug shows up as "the board stopped," not as running on into
- * corrupted state. undef/swi/reserved still have no UART diagnostic;
- * not required for anything built so far. fiq (task #246, 2026-09-18)
- * is no longer in this group -- see boot/fiq_entry.S, a real handler
- * now that the timer tick is FIQ-routed.
+ * corrupted state. undef/reserved still have no UART diagnostic; not
+ * required for anything built so far. fiq (task #246, 2026-09-18) and
+ * swi (task #253 Phase 3, 2026-09-18) are no longer in this group --
+ * see boot/fiq_entry.S/boot/swi_entry.S, real handlers now that the
+ * timer tick is FIQ-routed and USR-mode task code has a real syscall
+ * trap.
  *
  * Round 38: fault_data_abort/fault_prefetch_abort get a real
  * diagnostic instead -- MMU permission faults (this round's own W^X
@@ -90,10 +98,8 @@ _vectors:
  * since QEMU's own source wasn't available to cross-check against
  * this time (unlike every other peripheral in this project). */
 .global fault_undef
-.global fault_swi
 .global fault_reserved
 fault_undef:
-fault_swi:
 fault_reserved:
     b .
 
