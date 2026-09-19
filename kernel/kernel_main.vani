@@ -4247,8 +4247,29 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let _ = mmio_write_u32(SDHCFG, 0x518 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
+  // DIAGNOSTIC (2026-09-19, real-hardware SD wedge investigation, per
+  // the user's own structured debugging prompt): confirmed via the
+  // real bcm2835-sdhost.c FSM/FIFO-count bit definitions that the
+  // observed wedge SDEDM values decode to FSM=READDATA with FIFO=16/16
+  // (completely FULL) on read, and FSM=WRITEDATA with FIFO=0/16
+  // (completely EMPTY) on write -- both consistent with the controller
+  // believing there is MORE than 512 bytes left to transfer after this
+  // function's own fixed 128-word (512-byte) PIO loop already finished,
+  // not with a clock/threshold/FIFO-polling bug (this file's own FIFO-
+  // count decode and burst logic were checked word-for-word against
+  // bcm2835_sdhost_write_block_pio/transfer_pio and match). Reading
+  // SDHBCT/SDHBLC back immediately (not just writing them) and
+  // snapshotting SDEDM the INSTANT the fixed-length loop finishes --
+  // before sdhost_wait_transfer_complete's own poll has any chance to
+  // change what's visible -- is the smallest change that can confirm
+  // or rule out a block-count/length mismatch on the next real-hardware
+  // log, per this investigation's own "smallest test that distinguishes
+  // the hypotheses" standard.
+  let sdhbct_readback: u32 = mmio_read_u32(sdhbct);
+  let sdhblc_readback: u32 = mmio_read_u32(sdhblc);
   let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
   let _ = sdhost_drain_fifo_to_buffer(buf, 128);
+  let edm_after_pio: u32 = mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
@@ -4256,6 +4277,18 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     return 1;
   }
   if wait_status != 0 {
+    // Only printed on the actual failure path -- this function runs
+    // for every DharaFS block access for the system's entire lifetime,
+    // not just the diagnostic sweep, so an unconditional print here
+    // would spam the UART well beyond what's needed to catch the next
+    // real-hardware wedge.
+    let _ = uart_puts("SD DIAG: read post-PIO (before wait) SDHBCT=0x");
+    let _ = uart_put_hex32(sdhbct_readback);
+    let _ = uart_puts(" SDHBLC=0x");
+    let _ = uart_put_hex32(sdhblc_readback);
+    let _ = uart_puts(" SDEDM=0x");
+    let _ = uart_put_hex32(edm_after_pio);
+    let _ = uart_puts("\n");
     return 2;
   }
   if errs != (0 as u32) {
@@ -4319,8 +4352,16 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let _ = mmio_write_u32(SDHCFG, 0x518 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
+  // DIAGNOSTIC (2026-09-19): see sdhost_read_block_once's own comment
+  // just above -- identical reasoning, write-side half of the same
+  // check. A wedge here shows FSM=WRITEDATA, FIFO=0/16 (EMPTY): the
+  // write-side mirror of the read-side FULL-FIFO wedge, equally
+  // consistent with the controller expecting more than 512 bytes.
+  let sdhbct_readback: u32 = mmio_read_u32(sdhbct);
+  let sdhblc_readback: u32 = mmio_read_u32(sdhblc);
   let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
   let _ = sdhost_fill_fifo_from_buffer(buf, 128);
+  let edm_after_pio: u32 = mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_writestart1);
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = mmio_write_u32(sdhsts, errs);
@@ -4328,6 +4369,16 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     return 1;
   }
   if wait_status != 0 {
+    // Only printed on the actual failure path -- see sdhost_read_
+    // block_once's own identical comment for why this can't be
+    // unconditional.
+    let _ = uart_puts("SD DIAG: write post-PIO (before wait) SDHBCT=0x");
+    let _ = uart_put_hex32(sdhbct_readback);
+    let _ = uart_puts(" SDHBLC=0x");
+    let _ = uart_put_hex32(sdhblc_readback);
+    let _ = uart_puts(" SDEDM=0x");
+    let _ = uart_put_hex32(edm_after_pio);
+    let _ = uart_puts("\n");
     return 2;
   }
   if errs != (0 as u32) {

@@ -7739,3 +7739,68 @@ convenience: it is itself a genuine, real security improvement over the
 all-SVC baseline this project started task #253 from, and is fully
 proven safe under the same regression battery used throughout this
 project.
+
+**SD data-phase wedge: register-level root-cause analysis, 2026-09-19
+(the user's own structured debugging pass, using `~/sdcard_prompt.txt`
+against a fresh real-HW picocom log).** The fresh log
+(`picocom_20260919_083531.log`) predates the already-committed
+`SDCMD_FAIL_FLAG`/CMD7-diagnostic fix (`366569b`) -- it never prints
+any of that fix's own diagnostic lines, meaning real hardware hasn't
+been reflashed with it yet, so this analysis is against the prior
+firmware. Decoded the observed wedge `SDEDM` values against Linux's
+own authoritative `drivers/mmc/host/bcm2835.c` bit definitions
+(`SDEDM_FSM_MASK`/`SDEDM_FSM_*`, FIFO-count field at bits[8:4]),
+fetched directly rather than recalled from memory:
+
+- Write wedge, `SDEDM=0x00010803`: FSM field (bits[3:0]) = `0x3` =
+  `WRITEDATA`, FIFO-count field (bits[8:4]) = `0` -- FIFO completely
+  EMPTY. The controller is sitting in the mid-transfer data state,
+  wanting more words, with nothing queued.
+- Read wedge, `SDEDM=0x00010902`: FSM = `0x2` = `READDATA`, FIFO-count
+  = `16` -- FIFO completely FULL (`SDDATA_FIFO_WORDS`). The controller
+  has pulled a full FIFO's worth from the card and nothing is draining
+  it.
+
+Both symptoms point the same direction: after this driver's own fixed
+128-word (512-byte) PIO loop (`sdhost_fill_fifo_from_buffer`/
+`sdhost_drain_fifo_to_buffer`) finishes, the controller (and/or card)
+still believes there is more than 512 bytes left to transfer -- a
+block-count/length mismatch, not a clock, threshold, or FIFO-polling
+bug. Verified this driver's own FIFO-count decode and fill/drain burst
+logic against Linux's `bcm2835_sdhost_write_block_pio`/
+`bcm2835_sdhost_transfer_pio` word-for-word: they match (same free-
+space computation, same FSM-progress check, same `SDDATA_FIFO_WORDS`=16
+constant) -- ruling out the FIFO-servicing code itself as the bug. Also
+confirmed `SDHSTS` bit 0 (`DATA_FLAG`, seen as `0x00000001` on every
+wedge) is purely an IRQ-routing notification bit in the real driver
+("There is no true data interrupt status bit... necessary to use the
+single shared data/space available FIFO status bit" -- Linux's own
+comment) with no documented hardware-blocking side effect, so its
+uncleared state in our polling-only driver is expected, not a symptom.
+
+Added a diagnostic (not yet real-HW verified) to
+`sdhost_read_block_once`/`sdhost_write_block_once`: read `SDHBCT`/
+`SDHBLC` back (not just write them) and snapshot `SDEDM` immediately
+after the fixed 128-word PIO loop finishes, before
+`sdhost_wait_transfer_complete`'s own up-to-5,000,000-iteration poll
+has any chance to change what's visible -- printed only on the actual
+failure path (`wait_status != 0`), not unconditionally, since these
+functions run for every DharaFS block access for the system's entire
+lifetime, not just the diagnostic sweep. This is the smallest change
+that can confirm or refute the block-count-mismatch hypothesis on the
+next real-hardware run: if `SDHBCT`/`SDHBLC` read back as anything
+other than `512`/`1` right at that point, or if `SDEDM`'s FIFO count is
+already abnormal the instant the fixed-length loop finishes (not just
+after the later 5,000,000-iteration wait times out), that's direct
+confirmation. Verified via `phase4_milestone.py`: identical 4-FAIL
+baseline, zero regressions (this print path is never exercised under
+QEMU, whose SD model doesn't wedge).
+
+**Next step**: get a fresh real-HW picocom log with this diagnostic
+(and the already-committed FAIL_FLAG/CMD7-selection check) in place.
+If the hypothesis is confirmed, the fix is almost certainly in how
+block length/count reaches the controller or card for a single-sector
+CMD17/CMD24 -- worth comparing directly against U-Boot's
+`bcm2835_sdhost.c` (a bare-metal/polling reference closer to this
+driver's own synchronous design than Linux's IRQ-driven one) if the
+readback alone doesn't pinpoint it.
