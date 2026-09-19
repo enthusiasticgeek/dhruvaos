@@ -35838,14 +35838,43 @@ fn kernel_main() -> i64 {
   //    guarantee (task #184) that the faster SVC-mode version stayed
   //    safely within. A real, measurable cost of USR-mode privilege
   //    separation for a FREQUENTLY-WAKING, CEILING-BOOSTING task
-  //    specifically -- not a logic bug, a genuine WCET increase that
-  //    needs to be either budgeted for (tune AGING_CAP/AGING_SHIFT, or
-  //    task_a's own sleep period) or reduced (a leaner, more targeted
-  //    SWI trap path for exactly this hot loop) before task_a can
-  //    safely run in USR mode. Not attempted this round -- reverted to
-  //    SVC again, keeping fix #1 above (it's real and needed regardless
-  //    of when task_a is re-attempted), pending a dedicated session to
-  //    either measure and budget the real overhead or cut it down.
+  //    specifically -- not a logic bug, a genuine WCET increase.
+  //
+  // 3. ATTEMPTED (real, measured improvement, NOT sufficient alone):
+  //    the dominant per-syscall cost was the `cps #0x1F; ...; cps
+  //    #0x13` SYS-mode dip used to read/write sp_usr in swi_entry.S,
+  //    irq_entry.S, fiq_entry.S, and scheduler_restore_usr_sp (four
+  //    separate call sites -- every one of task_a's own syscalls hits
+  //    at least one). Confirmed against real Linux (arch/arm/kernel/
+  //    entry-common.S's own `vector_swi`: `stmdb r8,{sp,lr}^`) that
+  //    ARM mode (not Thumb-2, which this project never targets) has a
+  //    dedicated single-instruction form for exactly this -- LDM/STM
+  //    with the `^` suffix and PC excluded from the register list
+  //    transfers the USER-bank version of whatever registers are
+  //    listed, from ANY privileged mode, with NO mode switch at all.
+  //    Linux's own `store_user_sp_lr`/`load_user_sp_lr` macros use the
+  //    slower `cps`-based dance ONLY as a Thumb-2 fallback, by their
+  //    own comment. Replaced all four call sites' dips with this form.
+  //    Re-tested task_a in USR mode with this fix alone: task_c (the
+  //    shell) measurably survived one MORE full critical-section cycle
+  //    after `write` than before the fix (2 cycles vs 1, confirmed via
+  //    direct log comparison) -- a real, verified reduction in overhead
+  //    -- but still not enough: `cat`/`eval` and everything after still
+  //    never got a response. The fix is real and worth keeping
+  //    regardless (it benefits every IRQ/FIQ/syscall touching a
+  //    USR-mode task project-wide, not just task_a), but task_a's own
+  //    3-tick sleep period combined with the REMAINING per-syscall cost
+  //    (table lookups, full 68-byte frame save/restore for the blocking
+  //    task_sleep_ticks path) is still enough to defeat the current
+  //    aging tuning. Real next step: either retune AGING_CAP/
+  //    AGING_SHIFT (or task_a's own sleep period) now that the "wrong
+  //    implementation" explanation is ruled out, or reduce the
+  //    remaining overhead further (e.g. a WCET DIAG measurement of the
+  //    trap's own real cost, matching this project's existing
+  //    measurement discipline, to see exactly where the remaining time
+  //    goes) -- a dedicated session, not another blind attempt.
+  //    Reverted to SVC again, keeping fixes #1 and #3 above (both real
+  //    and needed regardless of when task_a is re-attempted).
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   // Task #253 Phase 3, task_b -- ALSO reverted to SVC mode (2026-09-19).
   // Converted to USR mode as the "sidesteps task_a's ceiling-priority

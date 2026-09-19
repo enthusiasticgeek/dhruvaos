@@ -52,6 +52,19 @@
  * task_create, `cpsid i` -> `cpsid if`) -- is already done; this
  * handler's own atomicity comes for free from the hardware. */
 
+/* ROUND 2026-09-19 (task #253, real-WCET investigation): 2-word scratch
+ * for the USR-mode sp_usr/lr_usr capture below -- see irq_entry.S's
+ * own matching `irq_usr_capture_scratch` comment for the full "why"
+ * (single-instruction user-register STM instead of a `cps` dip,
+ * confirmed against real Linux's `vector_swi`). Dedicated to this file
+ * for the same reason irq_entry.S's own copy is dedicated to it: IRQ
+ * and FIQ auto-mask each other (this file's own header comment), so
+ * neither can ever preempt the other's use of its own scratch. */
+.section ".bss"
+.align 2
+fiq_usr_capture_scratch:
+    .word 0, 0
+
 .section ".text"
 .global fiq_entry
 fiq_entry:
@@ -115,16 +128,23 @@ fiq_entry:
     and r3, r1, #0x1F
     cmp r3, #0x10
     bne fiq_entry_true_lr_svc
-    cps #0x1F               /* SYS mode -- shares r13/r14 with USR, still
-                              * privileged, safe dip */
-    mov r5, lr                /* r5 = true lr_usr, held temporarily */
-    mov r3, sp                 /* r3 = live sp_usr */
-    cps #0x13
-    ldr r2, =current_task
-    ldr r2, [r2]
-    ldr r1, =usr_sp_table
-    str r3, [r1, r2, lsl #2]
-    mov r2, r5                 /* r2 = true lr_usr (final destination) */
+    /* Single-instruction user-register STM captures BOTH sp_usr and
+     * lr_usr at once, no mode switch -- see this file's own top-of-file
+     * comment on fiq_usr_capture_scratch for the full "why". r1/r3/r5
+     * used as scratch here, same set the original `cps`-based version
+     * used -- r2 written exactly once, at the very end, with its real
+     * final value (true_lr), matching this block's own established
+     * register discipline. */
+    ldr r1, =fiq_usr_capture_scratch
+    stmia r1, {sp, lr}^        /* [r1+0]=sp_usr, [r1+4]=lr_usr */
+    ldr r3, =current_task
+    ldr r3, [r3]
+    ldr r5, =usr_sp_table
+    add r5, r5, r3, lsl #2     /* r5 = &usr_sp_table[current_task] */
+    ldr r3, [r1]                /* r3 = sp_usr value */
+    str r3, [r5]                 /* usr_sp_table[current_task] = sp_usr */
+    ldr r2, [r1, #4]             /* r2 = lr_usr value = true_lr (final
+                                  * destination) */
     b fiq_entry_true_lr_done
 fiq_entry_true_lr_svc:
     mov r2, lr                 /* r2 = interrupted task's TRUE r14 --

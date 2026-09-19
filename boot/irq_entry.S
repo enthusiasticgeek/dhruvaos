@@ -44,6 +44,25 @@
  * voluntary.
  */
 
+/* ROUND 2026-09-19 (task #253, real-WCET investigation): 2-word scratch
+ * for the USR-mode sp_usr/lr_usr capture below, replacing a `cps
+ * #0x1F; ...; cps #0x13` mode-switch dip with ARM's single-instruction
+ * user-register STM form (`stmia Rn,{sp,lr}^`) -- see scheduler_
+ * restore_usr_sp's own header comment (context_switch.S) for the full
+ * "why" and the real Linux reference (arch/arm/kernel/entry-common.S's
+ * `vector_swi`, `stmdb r8,{sp,lr}^`) this is confirmed against.
+ * Dedicated to this file (not shared with fiq_entry.S's own identical
+ * need) so the two exception classes never have to reason about each
+ * other's use of it -- IRQ masks FIQ for its own entire dispatch
+ * (`cpsid f` below) and FIQ auto-masks both on entry, so this file's
+ * own use can never be interrupted by a second concurrent user of it,
+ * by construction, without depending on that same guarantee holding
+ * for a buffer some OTHER file also touches. */
+.section ".bss"
+.align 2
+irq_usr_capture_scratch:
+    .word 0, 0
+
 .section ".text"
 .global irq_entry
 irq_entry:
@@ -162,26 +181,24 @@ irq_entry:
      * restore path) that a USR-mode task's live sp_usr can change --
      * capture it into usr_sp_table NOW, before current_task potentially
      * changes below, so whichever task resumes THIS one later restores
-     * the correct value. r1/r3 are free scratch here (r1's real value
-     * was already staged to memory via `stmdb sp!,{r0,r1}` above, r3
-     * just consumed by the mode check above) -- r0 (spsr) and r4
-     * (staged pointer) must NOT be touched, both still needed below. */
-    cps #0x1F              /* SYS mode -- shares r13/r14 with USR, still
-                             * privileged, safe dip (same technique this
-                             * file's own IRQ-stack staging already used
-                             * for a different mode) */
-    mov r5, lr               /* r5 = true lr_usr, held here temporarily
-                              * -- r5 isn't assigned its own real
-                              * purpose (destination frame pointer)
-                              * until right after this whole block, so
-                              * safe to borrow */
-    mov r3, sp               /* r3 = live sp_usr */
-    cps #0x13
-    ldr r2, =current_task
-    ldr r2, [r2]
-    ldr r1, =usr_sp_table
-    str r3, [r1, r2, lsl #2]
-    mov r2, r5                /* r2 = true lr_usr (final destination) */
+     * the correct value. r1/r3/r5 are free scratch here (r1's real
+     * value was already staged to memory via `stmdb sp!,{r0,r1}` above,
+     * r3 just consumed by the mode check above, r5 isn't assigned its
+     * own real purpose -- destination frame pointer -- until right
+     * after this whole block) -- r0 (spsr) and r4 (staged pointer) must
+     * NOT be touched, both still needed below. Single-instruction
+     * user-register STM captures BOTH sp_usr and lr_usr at once, no
+     * mode switch -- see this file's own top-of-file comment on
+     * irq_usr_capture_scratch for the full "why". */
+    ldr r1, =irq_usr_capture_scratch
+    stmia r1, {sp, lr}^        /* [r1+0]=sp_usr, [r1+4]=lr_usr */
+    ldr r3, =current_task
+    ldr r3, [r3]
+    ldr r5, =usr_sp_table
+    ldr r2, [r1]               /* r2 = sp_usr value, temporarily */
+    str r2, [r5, r3, lsl #2]   /* usr_sp_table[current_task] = sp_usr */
+    ldr r2, [r1, #4]           /* r2 = lr_usr value = true_lr (final
+                                * destination) */
     b irq_entry_true_lr_done
 irq_entry_true_lr_svc:
     mov r2, lr                    /* r2 = interrupted task's TRUE r14 --

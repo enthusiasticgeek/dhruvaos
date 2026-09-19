@@ -132,16 +132,9 @@ swi_entry:
      * (trampoline's own true-lr) and r0-r3/r7 (real arguments/syscall
      * number) are deliberately excluded from this save/restore, exactly
      * as before. */
-    push {r5, r6, r8, r9, r11}
+    push {r5, r8, r9, r11}
     mrs r11, spsr             /* r11 = interrupted cpsr, temporarily */
     mov r5, lr                /* r5 = resume pc, temporarily */
-
-    cps #0x1F                 /* SYS mode -- shares r13/r14 with USR,
-                               * still privileged, safe dip (same
-                               * technique irq_entry.S/fiq_entry.S's
-                               * own mode-aware capture logic uses) */
-    mov r6, sp                 /* r6 = live sp_usr, temporarily */
-    cps #0x13                  /* back to SVC */
 
     ldr r8, =current_task
     ldr r8, [r8]
@@ -178,14 +171,29 @@ swi_entry:
      * UNCONDITIONAL (genuinely needed by every caller, USR or SVC, to
      * survive an arbitrarily long nested-preemption detour -- only the
      * sp_usr-specific table was ever meant to be USR-only). */
+    /* ROUND 2026-09-19 (task #253, real-WCET investigation): used to
+     * unconditionally dip into SYS mode (`cps #0x1F; mov r6,sp; cps
+     * #0x13`) to capture sp_usr into r6 BEFORE this gate, even for an
+     * SVC-mode caller that will just discard it -- two real mode
+     * switches paid on every single syscall regardless of caller mode.
+     * Now computes the table address first and, only when actually
+     * needed, stores sp_usr straight into memory with ARM's single-
+     * instruction user-register STM form (`stmia Rn,{sp}^`, valid
+     * because sp is in the list and pc is not, no writeback) -- see
+     * scheduler_restore_usr_sp's own header comment (context_switch.S)
+     * for the full "why" and the real Linux reference
+     * (arch/arm/kernel/entry-common.S's `vector_swi`) this is
+     * confirmed against. r6 no longer needed at all -- dropped from
+     * the save/restore list below too. */
     ldr r9, =is_usr_mode_task
     ldr r9, [r9, r8, lsl #2]
     cmp r9, #0
     beq swi_entry_skip_usr_sp_capture
     ldr r9, =usr_sp_table
-    str r6, [r9, r8, lsl #2]
+    add r9, r9, r8, lsl #2     /* r9 = &usr_sp_table[current_task] */
+    stmia r9, {sp}^            /* store sp_usr directly -- no mode switch */
 swi_entry_skip_usr_sp_capture:
-    pop {r5, r6, r8, r9, r11}  /* restore the caller's true originals
+    pop {r5, r8, r9, r11}      /* restore the caller's true originals
                                * before the dispatched function (or its
                                * own later-resumed frame) ever sees them
                                * again */
@@ -268,10 +276,12 @@ swi_return_to_usr:
     cmp r12, #0
     beq swi_return_skip_usr_sp_restore
     ldr r3, =usr_sp_table
-    ldr r3, [r3, r2, lsl #2]
-    cps #0x1F
-    mov sp, r3
-    cps #0x13
+    add r3, r3, r2, lsl #2     /* r3 = &usr_sp_table[current_task] --
+                                * see swi_entry's own matching capture
+                                * site above for the full "why" (single-
+                                * instruction user-register LDM instead
+                                * of a cps/mov/cps dip) */
+    ldmia r3, {sp}^            /* load sp_usr directly -- no mode switch */
 swi_return_skip_usr_sp_restore:
 
     ldr r3, =usr_resume_spsr_table

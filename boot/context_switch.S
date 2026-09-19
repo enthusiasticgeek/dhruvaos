@@ -1961,6 +1961,25 @@ is_usr_mode_task_get_at:
  * task in this project except IDLE today) -- existing behavior is
  * completely unchanged for those, by construction.
  *
+ * ROUND 2026-09-19 (task #253, real-WCET investigation): the `cps
+ * #0x1F; mov sp,r1; cps #0x13` dip below used to be how this read/
+ * wrote sp_usr -- two real mode-switch instructions on the hottest
+ * shared restore path in the whole scheduler, paid on every single
+ * context switch touching a USR-mode task. Confirmed against real
+ * Linux (arch/arm/kernel/entry-common.S's own `vector_swi`, `stmdb r8,
+ * {sp,lr}^`) that ARM mode (not Thumb-2, which this project never
+ * targets) has a dedicated single-instruction form for exactly this:
+ * LDM/STM with the `^` suffix and PC excluded from the register list
+ * transfers the USER-bank version of whatever registers ARE listed,
+ * from ANY privileged mode, with NO mode switch at all -- Linux's own
+ * `store_user_sp_lr`/`load_user_sp_lr` macros (entry-header.S) use the
+ * slower `cps`-based dance ONLY as a Thumb-2 fallback, where this form
+ * isn't encodable; their own comment says so directly. Not valid with
+ * register writeback (`!`) per the ARM ARM -- none used here. Replaces
+ * both the redundant value-load (`ldr r1,[r1,r0,lsl#2]`) AND the
+ * `cps`/`mov`/`cps` triple with one `ldmia` reading sp_usr straight out
+ * of usr_sp_table's own memory.
+ *
  * r0-r3 preserved defensively (every call site is about to overwrite
  * them from its own restore anyway, but preserving costs nothing and
  * removes any need to re-audit this if a future call site's own
@@ -1977,14 +1996,9 @@ scheduler_restore_usr_sp:
     cmp r1, #0
     beq scheduler_restore_usr_sp_done
     ldr r1, =usr_sp_table
-    ldr r1, [r1, r0, lsl #2]
-    cps #0x1F              /* SYS mode -- shares r13/r14 with USR, still
-                             * privileged, safe to dip into/out of freely
-                             * (same established technique irq_entry.S's
-                             * own IRQ-stack-staging dip already uses,
-                             * just a different target mode) */
-    mov sp, r1
-    cps #0x13
+    add r1, r1, r0, lsl #2  /* r1 = &usr_sp_table[current_task] */
+    ldmia r1, {sp}^         /* load sp_usr directly -- no mode switch,
+                             * see this function's own header comment */
 scheduler_restore_usr_sp_done:
     pop {r0-r3}
     bx lr
