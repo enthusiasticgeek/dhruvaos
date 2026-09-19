@@ -7966,3 +7966,39 @@ confirm or refute -- this is the most concrete, best-evidenced fix
 attempt so far (a genuine divergence from a proven-working reference,
 found only after three other hypotheses were directly eliminated by
 real captured evidence, not guessed past).
+
+**SD wedge: EIGHTH fix attempt, same day (commit `d8d1014`,
+2026-09-19) -- the seventh attempt was flashed and RE-TESTED, still
+falsified (identical wedge signature), leading directly to this one.**
+User flashed commit `bfca745` via `update_kernel.sh` and supplied a
+fresh log (`picocom_20260919_152928.log`): identical `SDEDM=0x00010803`
+(FSM=WRITEDATA, FIFO empty) write wedge, `SDHBCT`/`SDHBLC` still
+correctly 512/1, `CURRENT_STATE=4` still confirmed every time -- the
+`BLOCK_IRPT_EN` removal did not help.
+
+Fetched U-Boot's own `bcm2835_sdhost.c` (`drivers/mmc/bcm2835_sdhost.c`,
+`u-boot/u-boot` master) directly, per the user's own structured
+debugging prompt's suggestion of a bare-metal/polling reference closer
+to this driver's own design than Linux's IRQ-driven one. Found a real,
+decisive difference: U-Boot's own `bcm2835_wait_transfer_complete` is
+UNPARAMETERIZED -- one function for both reads and writes -- and
+treats THREE FSM states as safe to force out of via `SDEDM_FORCE_DATA_
+MODE`: `READWAIT`(4), `WRITESTART1`(0xA), AND `READDATA`(2), checked
+unconditionally. This driver's own `sdhost_wait_transfer_complete`
+only ever checked the single `alternate_idle` value its caller passed
+(`READWAIT` for reads, `WRITESTART1` for writes) -- `READDATA` was
+never recognized as a valid exit state at all. Every real-hardware
+READ wedge this investigation has EVER captured decodes to exactly
+`FSM=READDATA` (`SDEDM=0x10902`/`0x108F2`/etc, confirmed via the
+authoritative `SDEDM_FSM_*` definitions both Linux and U-Boot agree
+on) -- precisely the state this function had no escape hatch for.
+
+Added the same unconditional check U-Boot uses (matching its own real,
+proven-working sequence exactly, not re-deriving a read/write-
+conditional version of it). Verified via `phase4_milestone.py`: exact
+4-FAIL baseline, zero regressions. The write-side wedge (`FSM=
+WRITEDATA`) is NOT one of the three states either reference treats as
+safe to force -- deliberately left untouched rather than guessing past
+the evidence; that remains a separate, still-open problem, possibly
+worth its own dedicated investigation once (if) the read path is
+confirmed fixed. Needs a fresh real-HW log to confirm.
