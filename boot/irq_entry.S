@@ -144,7 +144,51 @@ irq_entry:
                                    * have changed it) -- grab it immediately,
                                    * before the first `bl` below gets a
                                    * chance to overwrite it. */
-    mov r2, lr                    /* r2 = interrupted task's TRUE r14 */
+    /* Task #253 (RTOS true-compliance pass, 2026-09-18): if the
+     * interrupted context was USR mode (is_usr_mode_task, today only
+     * IDLE/task_d), lr_svc here is NOT the interrupted task's true r14
+     * -- lr_svc is SVC mode's OWN banked register, untouched by
+     * anything USR-mode code did; USR mode has its OWN separately-
+     * banked lr_usr, which is where this task's real return address
+     * actually lives. r0 still holds the interrupted CPSR (from `mrs
+     * r0, spsr` above, unmodified since -- survives the mode switch,
+     * unbanked) -- check its mode bits before deciding which register
+     * bank true_lr should come from. */
+    and r3, r0, #0x1F
+    cmp r3, #0x10
+    bne irq_entry_true_lr_svc
+    /* USR-mode case: true_lr must come from lr_usr, and this is also
+     * the ONLY other place (besides scheduler_restore_usr_sp's own
+     * restore path) that a USR-mode task's live sp_usr can change --
+     * capture it into usr_sp_table NOW, before current_task potentially
+     * changes below, so whichever task resumes THIS one later restores
+     * the correct value. r1/r3 are free scratch here (r1's real value
+     * was already staged to memory via `stmdb sp!,{r0,r1}` above, r3
+     * just consumed by the mode check above) -- r0 (spsr) and r4
+     * (staged pointer) must NOT be touched, both still needed below. */
+    cps #0x1F              /* SYS mode -- shares r13/r14 with USR, still
+                             * privileged, safe dip (same technique this
+                             * file's own IRQ-stack staging already used
+                             * for a different mode) */
+    mov r5, lr               /* r5 = true lr_usr, held here temporarily
+                              * -- r5 isn't assigned its own real
+                              * purpose (destination frame pointer)
+                              * until right after this whole block, so
+                              * safe to borrow */
+    mov r3, sp               /* r3 = live sp_usr */
+    cps #0x13
+    ldr r2, =current_task
+    ldr r2, [r2]
+    ldr r1, =usr_sp_table
+    str r3, [r1, r2, lsl #2]
+    mov r2, r5                /* r2 = true lr_usr (final destination) */
+    b irq_entry_true_lr_done
+irq_entry_true_lr_svc:
+    mov r2, lr                    /* r2 = interrupted task's TRUE r14 --
+                                   * unchanged SVC-mode case, exactly as
+                                   * this file always did before this
+                                   * round */
+irq_entry_true_lr_done:
     sub sp, sp, #68                /* 17-word frame now, not 16 */
     mov r5, sp                    /* r5 = destination, on the task's real
                                    * stack */
@@ -214,6 +258,10 @@ irq_relocate_loop:
                                    * now a 68-byte frame */
     mov sp, r0                     /* sets real sp_svc -- correct now,
                                    * unlike the old IRQ-mode-only version */
+    bl scheduler_restore_usr_sp    /* task #253: no-op unless the task
+                                   * about to resume is USR-mode -- see
+                                   * that function's own header comment
+                                   * (context_switch.S) */
 
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0

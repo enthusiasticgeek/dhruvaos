@@ -95,7 +95,43 @@ fiq_entry:
                                         * point. "sp" here is sp_svc: the
                                         * interrupted task's own real
                                         * stack, wherever it was left. */
-    mov r2, lr                        /* r2 = interrupted task's TRUE r14 */
+    /* Task #253 (RTOS true-compliance pass, 2026-09-18): same mode-
+     * aware capture irq_entry.S's own equivalent point now does -- if
+     * the interrupted context was USR mode (is_usr_mode_task, today
+     * only IDLE/task_d), lr_svc is NOT this task's true r14 (it's SVC
+     * mode's own banked register, untouched by USR-mode execution);
+     * the real value lives in lr_usr instead. Unlike irq_entry.S, spsr
+     * isn't live in a register here anymore (it was pushed to the
+     * staged block already) -- peek it back from [r0, #0] without
+     * disturbing r0 itself (still needed as the staged-block source
+     * pointer below). r1/r3/r5 are free scratch at this exact point
+     * (r1's real value already staged to memory; r3/r5 not assigned
+     * their own real purpose -- frame base / second frame-base copy --
+     * until immediately after this block) -- r0, r2, r4, and r8-r12
+     * (already live as the interrupted task's own real r8-r12 the
+     * instant `cps #0x13` above executed, per this file's own header
+     * comment) must NOT be touched here. */
+    ldr r1, [r0, #0]        /* r1 = staged spsr (peek, r0 untouched) */
+    and r3, r1, #0x1F
+    cmp r3, #0x10
+    bne fiq_entry_true_lr_svc
+    cps #0x1F               /* SYS mode -- shares r13/r14 with USR, still
+                              * privileged, safe dip */
+    mov r5, lr                /* r5 = true lr_usr, held temporarily */
+    mov r3, sp                 /* r3 = live sp_usr */
+    cps #0x13
+    ldr r2, =current_task
+    ldr r2, [r2]
+    ldr r1, =usr_sp_table
+    str r3, [r1, r2, lsl #2]
+    mov r2, r5                 /* r2 = true lr_usr (final destination) */
+    b fiq_entry_true_lr_done
+fiq_entry_true_lr_svc:
+    mov r2, lr                 /* r2 = interrupted task's TRUE r14 --
+                                * unchanged SVC-mode case, exactly as
+                                * this file always did before this
+                                * round */
+fiq_entry_true_lr_done:
     sub sp, sp, #68                    /* allocate the 17-word (68-byte)
                                         * frame on the task's REAL stack --
                                         * same layout as everywhere else in
@@ -237,6 +273,10 @@ fiq_entry:
                                       * regardless of which exception
                                       * got us here. */
     mov sp, r0                       /* sets real sp_svc */
+    bl scheduler_restore_usr_sp      /* task #253: no-op unless the task
+                                      * about to resume is USR-mode --
+                                      * see that function's own header
+                                      * comment (context_switch.S) */
 
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0

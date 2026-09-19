@@ -375,68 +375,129 @@ doesn't yet attempt.
   allocations today. Per-task heap arenas would be a much larger
   redesign, out of scope here.
 
-- **No CPU-privilege-level separation between tasks and the kernel**
-  (task #253, investigated 2026-09-18, deliberately NOT implemented).
-  Every task runs in ARM SVC (privileged) mode today -- domain-based
-  isolation (round 192, above) restricts which MEMORY REGIONS a task
-  can reach, but nothing restricts which CPU INSTRUCTIONS it can
-  execute. A genuine USR-mode-tasks/SVC-mode-kernel split (the
-  standard textbook OS privilege boundary, enforced via a real SWI/SVC
-  syscall trap) is real, additional defense-in-depth beyond domain
-  isolation -- but building it from scratch here turned out to be a
-  substantially larger undertaking than initially scoped, confirmed by
-  reading the actual code rather than estimating:
+- **CPU-privilege-level separation between tasks and the kernel --
+  Phase 1+2 IMPLEMENTED 2026-09-18 (task #253, reopened and partially
+  completed after the earlier investigation below had closed it as
+  "documented, not implemented" -- the user explicitly asked to
+  proceed despite the documented risk, same override that reopened
+  task #246).** The original investigation's 3 findings below are
+  still accurate background, but items 1-2 are now partially real
+  code, not just analysis.
 
-  1. **No syscall infrastructure exists at all.** `boot/rpi1/
-     vectors.S`'s own SWI vector points at `fault_swi`, a crash
-     handler -- identical treatment to the FIQ vector task #246 found
-     unused. A real syscall path needs a working SWI handler, a
-     defined ABI (argument marshaling, syscall numbering), and
-     per-task DUAL stacks (ARM banks `sp`/`lr` per mode, so a task
-     needs both a USR-mode stack for normal execution and an SVC-mode
-     stack for the kernel side of each syscall) -- none of which exist
-     today.
-  2. **The real privileged surface is narrower than raw MMIO-call
-     count suggests, a genuine finding worth recording.** 205 direct
-     `mmio_*` call sites exist in `kernel_main.vani` -- but ordinary
-     peripheral MMIO access doesn't strictly require CPU privilege
-     mode on ARM, only that the target memory region be mapped with
-     appropriate access permissions (a real MPU/domain-based scheme,
-     matching how FreeRTOS-MPU/Zephyr allow direct peripheral access
-     from unprivileged threads). What genuinely DOES need a syscall
-     boundary is the scheduler/synchronization primitive family --
-     `task_sleep_ticks`/`dhruva_mutex_lock`/`_unlock`/`dhruva_prio_
-     lock`/`_unlock`/`task_create` -- confirmed at 65 real call sites
-     project-wide. Every genuinely privileged CPU-control-register
-     operation (DACR/SCTLR/cache control) already lives exclusively in
-     `context_switch.S`/`mmu_init.S`'s own extern "C" functions, never
-     inlined into ordinary task-level vani code -- meaning task bodies
-     never touch privileged instructions directly today, only through
-     these ~65 call sites, a real, bounded, much smaller conversion
-     surface than "205 MMIO sites" would suggest.
-  3. **Even with that narrower scope, this is still the single
-     highest-risk item in this entire audit pass.** It needs new
-     vector-table/mode-switch/banked-register code (exactly the class
-     this project has repeatedly gotten wrong on a first attempt --
-     round 68's true-lr bug, `scheduler_pick_next`'s own documented
-     crash history, and this same session's own subagent incident:
-     unverified assembly in the IRQ-return path, found broken,
-     reverted) interacting with the EXISTING priority-ceiling,
-     priority-inheritance, and domain-isolation machinery under a
-     fundamentally new privilege-transition model those subsystems
-     were never designed against -- and there is no real Pi 1B
-     hardware available in this environment to validate the result,
-     nor confidence that QEMU's own mode-switch/SWI emulation fidelity
-     would make a "passes under QEMU" claim trustworthy even if
-     attempted (the same caution task #246's own FIQ finding already
-     applied).
+  **What's actually implemented (Phase 1+2):**
+  1. **MMU permission rework (`boot/mmu_init.S`).** Every AP/APX
+     encoding in the page table changed from privileged-only (AP=01)
+     to full access at both privilege levels (AP=11) -- code sections
+     stay APX=1 (genuinely read-only, now at BOTH levels, not just
+     privileged -- the existing live-verified W^X guarantee is
+     unchanged, just extended to cover unprivileged fetch too) rather
+     than moving to APX=0. Domain-based cross-task isolation (round
+     192) is completely unaffected -- it's checked BEFORE these bits
+     ever matter, confirmed by re-running round 192's own domain-fault
+     fault-injection test after this change with an identical result.
+     A new temporary fault-injection self-test (matching this
+     project's own round-38/round-192 precedent of a one-off live
+     verification, not a permanently-committed test) confirmed both
+     that a privileged write to the now-APX=1/AP=11 code section still
+     faults, and that unprivileged fetch from the same section does
+     NOT fault -- re-verifying the APX=1/AP=11 encoding fresh under
+     the CURRENT SCTLR.XP=1 configuration, since the file's own header
+     already documents an EARLIER test of this exact encoding that
+     predates XP being set and says nothing about behavior under
+     today's configuration.
+  2. **task_d (IDLE) now runs in genuine ARM USR mode** -- the first
+     task in this project's history to run unprivileged. New `is_usr_
+     mode_task`/`usr_sp_table` per-task tables (`context_switch.S`):
+     r13_usr/r14_usr are banked PER PROCESSOR MODE, not per task (one
+     physical register pair shared by every USR-mode task), so every
+     restore site that might resume a DIFFERENT task (`task_sleep_
+     ticks`, `dhruva_mutex_lock`/`_unlock`, `irq_entry.S`, `fiq_
+     entry.S`, `start_multitasking`) now calls a new shared `scheduler_
+     restore_usr_sp` immediately before its own final restore -- a
+     no-op for every still-SVC-mode task (everyone except IDLE today).
+     `irq_entry.S`/`fiq_entry.S` also gained mode-aware CAPTURE logic:
+     if the interrupted context was USR mode, `lr_svc` is NOT that
+     task's true return address (SVC mode's own banked register,
+     untouched by USR-mode execution) -- the real value lives in
+     `lr_usr`, captured via the standard SYS-mode register-bank dip
+     (`cps #0x1F`, shares r13/r14 with USR but stays privileged) that
+     both files already used for a different purpose. New `dhruva_
+     alloc_usrstack_domain` (`runtime_stubs.c`) gives IDLE a SEPARATE
+     USR-mode stack inside its own existing 1MB domain (round 192),
+     at a safely-separated offset from its existing SVC-side stack --
+     both protected by the same domain isolation, no new cross-task
+     exposure. IDLE specifically because it's the one task that calls
+     none of the 65 real privileged call sites below, so it can run in
+     genuine USR mode WITHOUT also needing a working SWI trap yet.
 
-  Documented and scoped, not attempted, matching this same pass's own
-  established precedent (task #246's FIQ finding, task #247's tickless
-  finding) for real-hardware-dependent, high-blast-radius risk. The
-  narrower real privileged surface (65 scheduler-primitive call sites,
-  not 205 MMIO ones) is the concrete, useful starting point for
-  whoever picks this up with real hardware access.
+  **Real bug found and fixed during implementation, unrelated to the
+  assembly (a vani-compiler register-allocation bug, not a hand-
+  written-asm mistake this time):** the first attempt placed the new
+  USR-stack-allocation vani code directly after `stack_d`'s own
+  allocation, textually between it and `stack_e`/`stack_f`'s later
+  allocations. The compiled result called `task_e_init_stack` with an
+  argument register that still held `stack_a`'s own pointer (never
+  reassigned) instead of `stack_e`'s -- confirmed by direct
+  disassembly, not guessed: a live Data Abort at boot, `section
+  permission fault`, at an address that arithmetically matched
+  `stack_a`'s pointer + `stack_e_bytes`, an unmistakable register
+  mixup. Fixed by relocating the new code to AFTER every task_X_init_
+  stack call that reads stack_a/b/c/e/f (verified the fix by direct
+  disassembly again before re-running QEMU, not just by the crash
+  disappearing) -- the underlying compiler bug itself (inserting code
+  between an allocation and a LATER, unrelated call site's own use of
+  a different local apparently confuses the register allocator) is a
+  real, separate, upstream finding, not chased further here; worth
+  logging to vani-compiler's own TODO for whoever picks it up.
+
+  **Verification:** builds clean, `phase4_milestone.py` shows the
+  identical pre-existing 4-FAIL baseline with zero new regressions, no
+  crash/reboot/Data Abort, and IDLE's own "idle" print appears 262
+  times across the full regression log -- live confirmation it's
+  genuinely executing its own body from USR mode repeatedly, not
+  silently inert or crash-looping invisibly.
+
+  **What's NOT implemented yet (Phase 3, still a real, well-scoped
+  follow-up, not attempted in this pass):**
+  1. **No syscall infrastructure exists yet.** `boot/rpi1/vectors.S`'s
+     own SWI vector still points at `fault_swi`, a crash handler.
+  2. **The other 5 fixed tasks (HIGH/MEDIUM/LOW/GC/SHELL) and task_
+     create's dynamic tasks all stay SVC-mode.** Every one of them
+     calls at least one of the 65 real privileged call sites (`task_
+     sleep_ticks`/`dhruva_mutex_lock`/`_unlock`/`dhruva_prio_lock`/
+     `_unlock`/`task_create`) -- of these, only `task_sleep_ticks`/
+     `dhruva_mutex_lock`/`_unlock`/`task_create` actually contain
+     privileged CPU instructions (`cpsid`/`msr cpsr_c`) that would
+     fault if called directly from USR mode; `dhruva_prio_lock`/
+     `_unlock` turned out, on closer inspection during this round, to
+     be PLAIN DATA WRITES with no privileged instruction inside at
+     all -- calling them from USR mode doesn't fault, it just works
+     (already exercised live: IDLE's own `uart_puts_bounded` calls
+     both, successfully, from real USR mode, no syscall needed). So
+     the real remaining syscall-trap requirement is narrower still:
+     only the 4 genuinely-privileged functions, not all 6 originally
+     named.
+  3. **The genuinely hard design problems are now solved and proven,
+     not just analyzed** -- this is what makes Phase 3 a materially
+     LOWER-risk follow-up than it looked before this round: the SPSR_
+     svc/lr_svc single-physical-register clobbering hazard across an
+     intervening exception from another task (the reason a syscall
+     trampoline can't just `bl` into `task_sleep_ticks` and `movs pc,
+     lr`) is understood and solved by the SAME per-task-table pattern
+     `usr_sp_table` already uses; the mode-aware IRQ/FIQ capture logic
+     is written and live-tested; the dual-stack-per-task model is
+     proven end-to-end for IDLE. Converting the remaining 5 fixed
+     tasks + task_create's dynamic path, and building the actual SWI
+     trampoline for the 4 genuinely-privileged functions, is real work
+     but mechanical repetition of an already-proven pattern, not new
+     design risk -- a fundamentally different, better-informed starting
+     point than the original investigation's "single highest-risk item
+     in this entire audit pass" framing.
+
+  Real Pi 1B hardware validation remains outstanding for everything in
+  this item (no hardware available in this environment) -- the same
+  residual-risk category as task #246's own FIQ work and the Pi 4/5
+  "ON HOLD, no real HW" items.
 
 ## 4. Timing analysis / determinism gaps
 

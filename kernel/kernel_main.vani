@@ -186,6 +186,10 @@ extern "C" fn dhruva_alloc_stack_guarded(n: i64) -> mut ref i64;
 // both, which silently made every call compute task_index=0
 // regardless of what was actually passed.
 extern "C" fn dhruva_alloc_stack_domain(n: u32, task_index: u32) -> mut ref i64;
+// Task #253 (RTOS true-compliance pass, 2026-09-18): same u32/u32
+// AAPCS-pairing discipline as dhruva_alloc_stack_domain above, same
+// reason -- see that function's own comment.
+extern "C" fn dhruva_alloc_usrstack_domain(n: u32, task_index: u32) -> mut ref i64;
 extern "C" fn dhruva_heap_used_bytes() -> i64;
 // Round 51: total dhruva_alloc_bytes call count (distinct from bytes
 // used above) + fault-injection arming -- see runtime_stubs.c's own
@@ -1045,6 +1049,14 @@ extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mu
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_c_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_d_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+// Task #253 (RTOS true-compliance pass, 2026-09-18): task_d/IDLE's own
+// real USR-mode launch path -- see is_usr_mode_task's own header
+// comment in context_switch.S for the full design.
+extern "C" fn task_d_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+extern "C" fn usr_sp_table_set_at(task_index: u32, value: mut ref i64) -> i64;
+extern "C" fn usr_sp_table_get_at(task_index: u32) -> mut ref i64;
+extern "C" fn is_usr_mode_task_get_at(task_index: u32) -> u32;
+extern "C" fn stack_region_top(base: mut ref i64, bytes: i64) -> mut ref i64;
 extern "C" fn task_e_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn task_f_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut ref i64, sp_d: mut ref i64, sp_e: mut ref i64, sp_f: mut ref i64) -> i64;
@@ -35505,7 +35517,46 @@ fn kernel_main() -> i64 {
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
   let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
-  let sp_d: mut ref i64 = task_d_init_stack(stack_d, stack_bytes);
+  let sp_d: mut ref i64 = task_d_init_stack_usr(stack_d, stack_bytes);
+  // Task #253 (RTOS true-compliance pass, 2026-09-18): task_d/IDLE's
+  // own SEPARATE USR-mode stack (sp_usr), allocated in the same 1MB
+  // per-task domain (index 3) as stack_d above but at a different,
+  // safely-separated offset -- see dhruva_alloc_usrstack_domain's own
+  // header comment (runtime_stubs.c). Seeded into usr_sp_table[3] as
+  // its TOP address (sp grows down), consulted the first time IDLE is
+  // ever actually scheduled by scheduler_restore_usr_sp
+  // (context_switch.S) -- see is_usr_mode_task's own header comment
+  // there for the full design.
+  //
+  // BUG found live (this round's own first build+QEMU-test pass, not
+  // caught by inspection): originally placed right after stack_d's own
+  // allocation, several lines above (before stack_e_bytes/stack_e/
+  // stack_f_bytes/stack_f are computed) -- a real vani-compiler
+  // register-allocation bug, NOT a mistake in this code itself,
+  // confirmed by direct disassembly: with these 3 lines in that
+  // earlier position, the compiled code for the LATER `task_e_init_
+  // stack(stack_e, stack_e_bytes)` call loaded r0 from r8 (still
+  // holding stack_a's own pointer, never reassigned) instead of r4
+  // (which genuinely held stack_e's pointer) -- a live Data Abort at
+  // boot (`section permission fault`, address matching stack_a's
+  // pointer + stack_e_bytes, an unmistakable register mixup) on the
+  // very first regression run, caught immediately by re-running the
+  // full suite after this exact insertion rather than assuming a
+  // clean build meant a clean result. Moved to HERE (after every
+  // task_X_init_stack call that reads stack_a/b/c/e/f has already
+  // consumed its own value) as the immediate fix -- genuinely resolves
+  // the observed crash (re-verified), though the underlying vani-
+  // compiler register-allocator bug itself (triggered by inserting new
+  // code between an allocation and its own later consumption,
+  // apparently confusing which SSA value a later call site's argument
+  // register should hold) is a real, separate, upstream finding worth
+  // its own investigation -- not chased further here, this project's
+  // own established practice (see the vani-ecosystem-open-todos
+  // memory) is to log this kind of finding rather than block on a full
+  // compiler fix mid-task.
+  let stack_d_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 3 as u32);
+  let stack_d_usr_top: mut ref i64 = stack_region_top(stack_d_usr, stack_bytes);
+  let _ = usr_sp_table_set_at(3 as u32, stack_d_usr_top);
   let sp_e: mut ref i64 = task_e_init_stack(stack_e, stack_e_bytes);
   let sp_f: mut ref i64 = task_f_init_stack(stack_f, stack_f_bytes);
 

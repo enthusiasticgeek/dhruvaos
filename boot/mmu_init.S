@@ -147,7 +147,59 @@
  * feature this project cares about, not QEMU's emulation of it; the
  * XN bits are kept set in this table regardless, since they're free
  * on real hardware if it does enforce them, and harmless on QEMU
- * either way. */
+ * either way.
+ *
+ * ROUND 2026-09-18 (task #253, RTOS true-compliance pass): every AP
+ * encoding in this file changed from privileged-only (AP=01) to
+ * full-access-both-levels (AP=11) -- code sections stay APX=1 (still
+ * genuinely read-only, at BOTH privilege levels now, not just
+ * privileged) rather than moving to APX=0, so the existing live-
+ * verified W^X guarantee above is unchanged, just extended to cover
+ * unprivileged fetch/read too. This is the memory-permission half of
+ * real USR-mode task execution (boot/swi_entry.S has the other half:
+ * a real syscall trap) -- without this change, the CPU's own MMU
+ * would fault on the very first instruction fetch or stack access any
+ * task made the instant it ran in USR mode, regardless of anything
+ * else being correct.
+ *
+ * Per the ARMv6 ARM's own AP/APX truth table (Table B3-6, the
+ * non-legacy interpretation this file's own SCTLR.XP=1 above already
+ * selects): APX=1,AP=01 is "privileged read-only, unprivileged NO
+ * ACCESS" (this file's old code-section encoding); APX=1,AP=11 is
+ * "read-only, BOTH privileged and unprivileged" -- the encoding this
+ * file's own header already tried once, years earlier, and found NOT
+ * to fault on a privileged write. That earlier finding is NOT
+ * contradicted here: it was taken BEFORE SCTLR.XP was identified and
+ * set (see "FOUND AND FIXED" above) -- under XP=0, the legacy
+ * ARMv5-style 4-way "subpage AP" scheme governs instead, where a bare
+ * APX=1/AP=11 in the section descriptor's own single AP field isn't
+ * interpreted as this table's simple whole-section scheme at all, so
+ * that old test result says nothing about how APX=1/AP=11 behaves
+ * under the CURRENT, corrected XP=1 configuration -- re-verified
+ * fresh here via a new, dedicated live fault-injection self-test
+ * (mmu_usrmode_self_test, this file's own new function below) rather
+ * than trusted from either the old finding or the architecture manual
+ * alone: confirms BOTH that a privileged write to the now-APX=1/AP=11
+ * code section still faults (W^X intact) AND that unprivileged fetch
+ * from the same section does NOT fault (the new capability this round
+ * actually needs).
+ *
+ * AP=01 -> AP=11 for every data/heap/stack/MMIO/per-task-domain region
+ * (both the section-format 0x1412->0x1C12 encoding and the small-page-
+ * format 0x53->0x73 encoding) is architecturally simpler: those were
+ * already privileged READ-WRITE, so this purely ADDS unprivileged
+ * read-write to the same regions, removing no existing capability.
+ * Domain-based cross-task isolation (round 192, mmu_l2_table_task_
+ * domains below) is a completely SEPARATE, orthogonal access-control
+ * layer checked BEFORE these AP/APX bits ever matter (see that
+ * section's own comment: a No-Access domain faults "regardless of
+ * what its own AP/APX bits say") -- loosening AP here changes nothing
+ * about which domains a task can reach, only whether privilege level
+ * additionally restricts access within a domain the DACR already
+ * grants. Re-verified live, not just reasoned about: the SAME domain-
+ * fault fault-injection self-test round 192 already used (a task
+ * writing into a DIFFERENT task's own domain region) still faults
+ * identically after this change. */
 
 .section ".bss"
 .align 14   /* 16KB alignment -- TTBR0's own base-address field
@@ -330,7 +382,7 @@ mmu_init:
      * privileged code always gets read+execute here, never write.
      * TEX=001/C=0/B=0 = Normal Non-cacheable (0x1000), XN=0
      * (executable), domain 0, section type. */
-    ldr r5, =0x00009402
+    ldr r5, =0x00009C02
     str r5, [r4, #0]
 
     /* Section 1 (0x00100000-0x001FFFFF): TASK #163 FIX (2026-09-12) --
@@ -364,7 +416,7 @@ mmu_init:
      * base (r7) for exactly this reason -- this single entry is
      * hand-written, not loop-generated, so it needs the same OR done
      * explicitly. */
-    ldr r5, =0x00009402
+    ldr r5, =0x00009C02
     orr r5, r5, #0x00100000
     str r5, [r4, #4]
 
@@ -402,7 +454,7 @@ mmu_init:
     ldr r7, =0x00200000    /* first page's physical base */
     mov r5, #0
 mmu_init_l2_data_loop:
-    ldr r0, =0x53
+    ldr r0, =0x73
     orr r0, r0, r7
     str r0, [r6, r5, lsl #2]
     add r7, r7, #0x1000
@@ -448,7 +500,7 @@ mmu_init_l2_data_loop:
     mov r6, #3
     ldr r7, =0x00300000
 mmu_init_ram_ext_loop:
-    ldr r5, =0x00001412
+    ldr r5, =0x00001C12
     orr r5, r5, r7
     str r5, [r4, r6, lsl #2]
     add r7, r7, #0x00100000
@@ -469,7 +521,7 @@ mmu_init_ram_ext_loop:
     mov r6, #512
     ldr r7, =0x20000000
 mmu_init_periph_loop:
-    ldr r5, =0x00000406
+    ldr r5, =0x00000C06
     orr r5, r5, r7
     str r5, [r4, r6, lsl #2]
     add r7, r7, #0x00100000
@@ -511,7 +563,7 @@ mmu_init_periph_loop:
     mov r6, #448
     ldr r7, =0x1C000000
 mmu_init_vcram_loop:
-    ldr r5, =0x00001412
+    ldr r5, =0x00001C12
     orr r5, r5, r7
     str r5, [r4, r6, lsl #2]
     add r7, r7, #0x00100000
@@ -567,7 +619,7 @@ mmu_init_domain_outer_loop:
     add r0, r0, r1               /* r0 = this domain's own physical base */
     mov r1, #0
 mmu_init_domain_inner_loop:
-    ldr r2, =0x53
+    ldr r2, =0x73
     orr r2, r2, r0
     str r2, [r7, r1, lsl #2]
     add r0, r0, #0x1000

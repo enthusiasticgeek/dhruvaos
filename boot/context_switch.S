@@ -110,6 +110,12 @@ sleep_until_table:
                           * regardless of this table's own value there) */
 tick_count:
     .word 0
+/* task #253: .global so irq_entry.S/fiq_entry.S's own new mode-aware
+ * USR-context-capture logic can reference it directly by symbol
+ * (cross-file) -- every OTHER reference to this label is same-file,
+ * within context_switch.S itself, which never needed .global before
+ * this round. */
+.global current_task
 current_task:
     .word 0
 context_switch_count:
@@ -426,6 +432,62 @@ task_deadline_miss_count_table:
                          * since the counter increments by exactly 1
                          * per decision -- see irq_dispatch's own call
                          * site for the exact check). */
+
+/* ROUND 2026-09-18 (task #253, RTOS true-compliance pass): real USR-
+ * mode task execution needs its own per-task state, separate from
+ * everything above -- r13_usr/r14_usr (the "user stack pointer"/"user
+ * link register") are banked PER PROCESSOR MODE, not per task: there
+ * is exactly ONE physical r13_usr in this whole CPU, shared by every
+ * USR-mode task, the same way there is exactly one r13_svc shared by
+ * every task's own kernel-side execution. Whichever task is CURRENTLY
+ * resumed into USR mode owns whatever r13_usr physically holds right
+ * now -- so every place in this project that resumes a DIFFERENT task
+ * (task_sleep_ticks, dhruva_mutex_lock/_unlock, irq_entry.S,
+ * fiq_entry.S, start_multitasking) must explicitly reload r13_usr from
+ * THIS task's own saved value before jumping back into its USR-mode
+ * code, exactly the same reasoning that already makes r13_svc/sp_table
+ * necessary for the SVC-mode case -- see scheduler_restore_usr_sp's
+ * own comment below for where this actually happens, and irq_entry.S/
+ * fiq_entry.S's own new mode-aware capture logic for where usr_sp_
+ * table gets WRITTEN (a USR-mode task's own live sp_usr, captured the
+ * instant IRQ/FIQ interrupts it -- the ONLY other place r13_usr can
+ * change without going through this table).
+ *
+ * is_usr_mode_task: 0 = this task index runs in SVC mode, unchanged
+ * from every task in this project before this round (every restore
+ * site's new usr_sp restore step is a harmless no-op for these).
+ * 1 = this task index runs in USR mode -- today, ONLY task index 3
+ * (task_d/IDLE, IDLE_TASK_INDEX above) is ever set to 1: IDLE is the
+ * one task that calls none of the ~65 real privileged call sites
+ * (task_sleep_ticks/dhruva_mutex_lock/_unlock/dhruva_prio_lock/
+ * _unlock/task_create), so it's the one task that can run in genuine
+ * USR mode WITHOUT also needing a working SWI syscall trap yet (see
+ * docs/RTOS_GAP_ANALYSIS.md's own task #253 entry for the fuller
+ * design and why the other 5 fixed tasks + task_create's dynamic
+ * tasks stay SVC-mode for now, a deliberate, honestly-scoped stopping
+ * point, not an oversight). */
+.align 2
+/* .global on both: irq_entry.S/fiq_entry.S's own new mode-aware
+ * capture logic references usr_sp_table directly by symbol
+ * (cross-file). is_usr_mode_task itself is only ever read via the
+ * is_usr_mode_task_get_at accessor from elsewhere, but marked .global
+ * anyway for consistency and in case a future direct reference needs
+ * it (harmless either way).
+ *
+ * All-zero here (BUG caught by the assembler itself, not live testing:
+ * `.bss` cannot hold a non-zero initializer -- "attempt to store
+ * non-zero value in section `.bss'", a real error, not a warning, the
+ * first build attempt with task index 3 hardcoded to 1 right in this
+ * table failed on) -- task_d_init_stack_usr below sets index 3's
+ * entry to 1 explicitly at boot time instead, the same "set it
+ * explicitly rather than rely on .bss's own zero-init" discipline
+ * task_create's own sleep_until_table comment already uses. */
+.global is_usr_mode_task
+.global usr_sp_table
+is_usr_mode_task:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+usr_sp_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
 .section ".text"
 
@@ -1183,6 +1245,11 @@ task_sleep_ticks:
 
     bl scheduler_pick_next
     mov sp, r0
+    bl scheduler_restore_usr_sp     /* task #253: no-op unless the task
+                                     * about to resume (current_task, set
+                                     * by scheduler_pick_next just above)
+                                     * is USR-mode -- see that function's
+                                     * own header comment */
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
     ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
@@ -1394,6 +1461,8 @@ dml_contended:
                                         * own tail-call, which never
                                         * explicitly re-enables either */
     mov sp, r0
+    bl scheduler_restore_usr_sp     /* task #253: see task_sleep_ticks's
+                                     * own call site above */
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
     ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
@@ -1727,6 +1796,57 @@ irq_tick_worst_us_set:
     mov r1, #0
     bx lr
 
+/* u32 is_usr_mode_task_get_at(u32 task_index) -- see is_usr_mode_task's
+ * own header comment above for the full design. */
+.global is_usr_mode_task_get_at
+is_usr_mode_task_get_at:
+    ldr r1, =is_usr_mode_task
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+/* void scheduler_restore_usr_sp() -- called immediately before EVERY
+ * final `ldmia sp!,{r0,r1};msr spsr_cxsf,r0;ldmia sp!,{r0-12,lr,pc}^`
+ * restore in this project (task_sleep_ticks below, dhruva_mutex_lock/
+ * _unlock, irq_entry.S, fiq_entry.S, start_multitasking) -- see usr_
+ * sp_table's own header comment above for the full "why". current_
+ * task at every one of those call sites always already correctly
+ * reflects WHICHEVER task is about to actually resume (set by
+ * scheduler_pick_next before every one of them runs), regardless of
+ * which specific site triggered the switch -- so one shared check
+ * here, keyed on current_task, is correct from any of them. A no-op
+ * for every SVC-mode task (is_usr_mode_task[i]==0, true for every
+ * task in this project except IDLE today) -- existing behavior is
+ * completely unchanged for those, by construction.
+ *
+ * r0-r3 preserved defensively (every call site is about to overwrite
+ * them from its own restore anyway, but preserving costs nothing and
+ * removes any need to re-audit this if a future call site's own
+ * register usage differs) -- r4-r11 never touched, so no AAPCS
+ * callee-save concern even though every caller here is hand-written
+ * asm, not vani code. */
+.global scheduler_restore_usr_sp
+scheduler_restore_usr_sp:
+    push {r0-r3}
+    ldr r0, =current_task
+    ldr r0, [r0]
+    ldr r1, =is_usr_mode_task
+    ldr r1, [r1, r0, lsl #2]
+    cmp r1, #0
+    beq scheduler_restore_usr_sp_done
+    ldr r1, =usr_sp_table
+    ldr r1, [r1, r0, lsl #2]
+    cps #0x1F              /* SYS mode -- shares r13/r14 with USR, still
+                             * privileged, safe to dip into/out of freely
+                             * (same established technique irq_entry.S's
+                             * own IRQ-stack-staging dip already uses,
+                             * just a different target mode) */
+    mov sp, r1
+    cps #0x13
+scheduler_restore_usr_sp_done:
+    pop {r0-r3}
+    bx lr
+
 .global irq_count_increment
 irq_count_increment:
     ldr r0, =irq_count
@@ -1741,6 +1861,115 @@ irq_count_get:
     ldr r0, =irq_count
     ldr r0, [r0]
     mov r1, #0
+    bx lr
+
+/* u32 usr_sp_table_get_at(u32 task_index) / i64 usr_sp_table_set_at(
+ *   u32 task_index, mut ref i64 value) -- see usr_sp_table's own
+ * header comment above for the full design. _set_at is called exactly
+ * once per USR-mode task, at creation time, to seed its initial sp_usr
+ * (dhruva_alloc_usrstack_domain's own caller in kernel_main.vani) --
+ * every LATER update happens automatically, via irq_entry.S/
+ * fiq_entry.S's own new mode-aware capture logic, never through this
+ * setter again. */
+.global usr_sp_table_get_at
+usr_sp_table_get_at:
+    ldr r1, =usr_sp_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global usr_sp_table_set_at
+usr_sp_table_set_at:
+    ldr r2, =usr_sp_table
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* mut ref i64 prepare_stack_common_usr(mut ref i64 stack_top,
+ *                                        fn() -> i64 entry_addr)
+ * Byte-for-byte identical to prepare_stack_common above, EXCEPT
+ * spsr=0x10 (USR mode) instead of 0x13 (SVC) -- see is_usr_mode_
+ * task's own header comment for the full "why". Duplicated rather
+ * than parameterized (a 3rd "which mode" argument would work, but
+ * every OTHER two-shaped-exit function in this project already
+ * favors visible duplication over a shared branchy helper for this
+ * exact class of fragile frame-construction code -- see fiq_entry.S's
+ * own header comment on why its restore tail is duplicated from
+ * irq_entry.S's rather than branched-to) -- kept next to prepare_
+ * stack_common on purpose so a future change to one is easy to notice
+ * needs the same change in the other. task_d is the only caller
+ * today (task_d_init_stack_usr, below); a freshly-launched USR-mode
+ * task's own initial sp_usr is NOT set here -- that's usr_sp_table's
+ * own job (seeded separately by task_d_init_stack_usr's own caller in
+ * kernel_main.vani), consulted later by scheduler_restore_usr_sp the
+ * first time this task actually gets scheduled. */
+.global prepare_stack_common_usr
+prepare_stack_common_usr:
+    sub r0, r0, #68
+    mov r2, #0x10          /* spsr = USR mode -- the one difference from
+                             * prepare_stack_common's own 0x13 */
+    str r2, [r0, #0]       /* spsr */
+    mov r2, #0
+    str r2, [r0, #4]       /* pad */
+    str r2, [r0, #8]       /* r0 */
+    str r2, [r0, #12]      /* r1 */
+    str r2, [r0, #16]      /* r2 */
+    str r2, [r0, #20]      /* r3 */
+    str r2, [r0, #24]      /* r4 */
+    str r2, [r0, #28]      /* r5 */
+    str r2, [r0, #32]      /* r6 */
+    str r2, [r0, #36]      /* r7 */
+    str r2, [r0, #40]      /* r8 */
+    str r2, [r0, #44]      /* r9 */
+    str r2, [r0, #48]      /* r10 */
+    str r2, [r0, #52]      /* r11 */
+    str r2, [r0, #56]      /* r12 */
+    str r1, [r0, #60]      /* true_lr = entry point */
+    str r1, [r0, #64]      /* resume_pc = entry point */
+    bx lr
+
+/* mut ref i64 task_d_init_stack_usr(mut ref i64 stack_base,
+ *                                     i64 stack_bytes)
+ * task #253: task_d (IDLE)'s own USR-mode launch path -- same 2-arg
+ * shape as task_d_init_stack above (stack_base -> r0, stack_bytes's
+ * low word -> r2, matching this file's own established AAPCS i64-
+ * pairing convention, see task_create's own header comment), just
+ * calling prepare_stack_common_usr instead of prepare_stack_common.
+ * Builds task_d's INITIAL SVC-side frame only (the one sp_table[3]
+ * itself points at) -- task_d's own separate USR-mode stack (sp_usr)
+ * is allocated and seeded into usr_sp_table[3] by this function's own
+ * caller in kernel_main.vani (dhruva_alloc_usrstack_domain +
+ * usr_sp_table_set_at), not here. */
+.global task_d_init_stack_usr
+task_d_init_stack_usr:
+    /* is_usr_mode_task[3] = 1 -- set explicitly here rather than in
+     * the table's own .bss initializer (the assembler correctly
+     * rejects a non-zero .bss value; see that table's own comment),
+     * using r3/r4 as scratch (r0-r2 must survive untouched for the
+     * tail call below). */
+    ldr r3, =is_usr_mode_task
+    mov r4, #1
+    str r4, [r3, #12]      /* index 3 * 4 bytes */
+    add r0, r0, r2
+    ldr r1, =task_d
+    b prepare_stack_common_usr
+
+/* mut ref i64 stack_region_top(mut ref i64 base, i64 bytes) -- trivial
+ * `base + bytes` helper (same u32/i64-pairing convention as task_d_
+ * init_stack_usr above: base -> r0, bytes's low word -> r2), used by
+ * kernel_main.vani's own boot sequence to compute a USR stack's TOP
+ * address (usr_sp_table_set_at needs the top -- sp grows down -- not
+ * the base dhruva_alloc_usrstack_domain returns) without needing raw
+ * pointer arithmetic on the vani side. Exactly the same one-
+ * instruction computation every task_X_init_stack function above
+ * already does internally for its own SVC-side stack; exposed here as
+ * its own callable primitive since this particular addition needs to
+ * happen on the CALLER's side (kernel_main.vani), not inside an
+ * init_stack function, for the USR-stack case. */
+.global stack_region_top
+stack_region_top:
+    add r0, r0, r2
     bx lr
 
 
@@ -2138,6 +2367,15 @@ start_multitasking:
     mcr p15, 0, r7, c3, c0, 0
 
     mov sp, r0
+    bl scheduler_restore_usr_sp     /* task #253: see task_sleep_ticks's
+                                     * own call site above -- a no-op
+                                     * here today (task_a/HIGH, index 0,
+                                     * is always the first-launched task
+                                     * and stays SVC-mode), kept for the
+                                     * same reason every other restore
+                                     * site gets this call: correctness
+                                     * shouldn't depend on WHICH task
+                                     * happens to launch first. */
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
     ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore

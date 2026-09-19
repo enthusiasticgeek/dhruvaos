@@ -573,6 +573,57 @@ void *dhruva_alloc_stack_domain(unsigned long n, unsigned long task_index) {
     return (void *)usable_ptr;
 }
 
+/* Task #253 (RTOS true-compliance pass, 2026-09-18): USR-mode task
+ * stack allocator -- same per-task-domain design as dhruva_alloc_
+ * stack_domain above (own dedicated 1MB region, own guard page, no
+ * shared bump pointer to race on), but placed at a DIFFERENT fixed
+ * offset (0x00080000, 512KB into the domain) than the existing SVC-
+ * side stack (offset 0x1000) -- the two stacks for the same task
+ * coexist in the SAME 1MB domain (still isolated from every OTHER
+ * task's own domain exactly as before, round 192's own guarantee is
+ * completely unaffected by this), just at safely separated offsets
+ * within it: this project's real stack sizes (512B-4KB) leave over
+ * 1000KB of genuinely unused headroom in every domain, comfortably
+ * wide margin between the two regions with no risk of the SVC-side
+ * stack (which grows DOWN from its own top) ever colliding with this
+ * one. Only task_index 3 (IDLE, is_usr_mode_task's own only USR-mode
+ * entry today) has any real caller -- the >14 guard mirrors dhruva_
+ * alloc_stack_domain's own honest, currently-inert fallback for
+ * task_index 15 (no 16th domain exists), kept for the same reason:
+ * this function's own real usage today never reaches it, but silently
+ * doing something wrong with an out-of-range domain number would be
+ * worse than a documented, currently-unexercised fallback. */
+void *dhruva_alloc_usrstack_domain(unsigned long n, unsigned long task_index) {
+    unsigned long need = n;
+
+    if (task_index > 14) {
+        return dhruva_alloc_stack_guarded(n);
+    }
+
+    unsigned long domain_base = 0x00A00000UL + ((unsigned long)task_index) * 0x00100000UL;
+    unsigned long guard_addr = domain_base + 0x00080000UL;
+    unsigned char *usable_ptr = (unsigned char *)(guard_addr + 4096UL);
+
+    if (need + 0x00081000UL > 0x00100000UL) {
+        /* Defense in depth, not a real constraint -- see dhruva_alloc_
+         * stack_domain's own identical comment; this function's own
+         * offset (512KB in, not 0) leaves even less theoretical
+         * headroom (~448KB) than that one, still wildly more than any
+         * real stack size this project uses. */
+        dhruva_oom_fatal(need, 0, 0);
+        /* unreachable -- dhruva_oom_fatal never returns */
+    }
+
+    mmu_guard_page_install_domain(guard_addr, (unsigned long)task_index);
+
+    unsigned long i = 0;
+    while (i < need) {
+        usable_ptr[i] = 0;
+        i = i + 1;
+    }
+    return (void *)usable_ptr;
+}
+
 /* Backs kernel_main.vani's heap_usage_self_test -- a permanent
  * early-warning canary added by the same round-10 fix that resized
  * this heap, so a future round eating back into the new headroom

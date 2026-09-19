@@ -7369,6 +7369,43 @@ domain machinery, no real Pi 1B hardware available to validate
 against. Documented and scoped rather than attempted, matching task
 #246/#247's own precedent.
 
+**Task #253 REOPENED and Phase 1+2 completed, 2026-09-18 (same "work
+on 2 items you left earlier" user override that reopened #246),
+superseding the closure just above.** MMU AP rework (boot/mmu_init.S:
+every AP=01 -> AP=11, code stays APX=1 read-only at both privilege
+levels now instead of privileged-only) + task_d/IDLE running in real
+ARM USR mode for the first time in this project's history -- new
+is_usr_mode_task/usr_sp_table per-task state (context_switch.S),
+scheduler_restore_usr_sp called before every restore site that might
+resume a different task, mode-aware lr_usr/sp_usr capture added to
+irq_entry.S/fiq_entry.S, new dhruva_alloc_usrstack_domain (runtime_
+stubs.c) giving IDLE its own separate USR stack inside its existing
+round-192 domain. Full design and the real vani-compiler register-
+allocation bug found+fixed during implementation (inserting new code
+between stack_d's allocation and stack_e/f's later allocations caused
+the compiled task_e_init_stack call to load the wrong register --
+confirmed by direct disassembly, fixed by relocating the new code, the
+underlying compiler bug itself not chased further) are written up in
+full in RTOS_GAP_ANALYSIS.md's own updated entry. Builds clean,
+phase4_milestone.py shows the identical 4-FAIL baseline with zero new
+regressions, no crash, and IDLE's own "idle" print appears 262 times
+across the full log -- confirms it's genuinely executing from USR
+mode, not inert.
+
+**Not done (Phase 3, a well-scoped, genuinely lower-risk follow-up now
+that the hard design problems are solved and proven rather than just
+analyzed):** the other 5 fixed tasks + task_create's dynamic tasks
+stay SVC-mode (each calls at least one privileged site); no SWI
+syscall trap exists yet. Real narrowing found along the way: dhruva_
+prio_lock/_unlock turned out to be plain data writes with no actual
+privileged CPU instruction inside (already proven safe to call from
+USR mode directly, no syscall needed -- IDLE's own uart_puts_bounded
+already does this live) -- only task_sleep_ticks/dhruva_mutex_lock/
+_unlock/task_create genuinely need the syscall boundary, narrower than
+the originally-named 6. Real Pi 1B hardware validation still
+outstanding for everything here (no hardware available in this
+environment).
+
 **This closes the full RTOS true-compliance sweep (tasks #239-247,
 #249, #253) started after the user's "what else remains to comply
 real rtos" question.** 7 of 9 items closed with real, verified code
