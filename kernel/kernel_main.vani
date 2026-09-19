@@ -35782,6 +35782,70 @@ fn kernel_main() -> i64 {
   // (independently correct). Converting task_b next instead (see its
   // own comment below) to keep making real, verified progress on task
   // #253's broader goal without task_a's own ceiling-priority edge case.
+  // Task #253 Phase 3, task_a -- THIRD round, real progress + a NEW
+  // blocker found, same day (2026-09-19). Two real findings this round:
+  //
+  // 1. FOUND + FIXED: task_a_init_stack_usr's own usr_sp_table seed
+  //    (dhruva_alloc_usrstack_domain + usr_sp_table_set_at) was placed
+  //    right here, copying task_b's own pattern -- WRONG for task_a
+  //    specifically. task_b's own comment explains why early seeding is
+  //    safe for IT: current_task reads 0 (task_a's own index), never 1,
+  //    for kernel_main's entire boot-time execution, so no boot-time
+  //    uart_puts_bounded call (routed through the dhruva_prio_lock/
+  //    _unlock syscalls) can ever misdirect a usr_sp_table write into
+  //    task_b's slot. That protection does NOT extend to task_a itself
+  //    -- task_a's own index IS 0, current_task's own boot-time
+  //    default, so EVERY later boot-time uart_puts_bounded call (task_
+  //    b/c/d/e/f's own setup, every self-test between here and start_
+  //    multitasking) unconditionally overwrote usr_sp_table[0] with
+  //    whatever garbage the physical sp_usr register held during
+  //    kernel_main's own SVC-mode execution -- destroying the seed
+  //    moments after it was made. Live-reproduced: task_a's own first
+  //    instruction faulted at address 0xFFFFFFF8 (push on a near-null
+  //    sp) with ctxsw=0 (before start_multitasking even ran). Real fix
+  //    (matching the ALREADY-PROVEN pattern from the SECOND round's own
+  //    investigation of this exact task, both times independently
+  //    rediscovered): defer the seed to the literal last statement
+  //    before start_multitasking itself, where nothing else can run in
+  //    between to clobber it -- confirmed this fully resolves the
+  //    crash: task_a ran cleanly through many real wake/acquire/release
+  //    cycles under live testing, current_task correctly reading 0
+  //    every time, no fault. This also strongly suggests the SECOND
+  //    round's own "current_task misread as 3 inside task_sleep_ticks_
+  //    impl" finding was a downstream symptom of THIS SAME corruption
+  //    (gathered while this exact bug was still present), not a
+  //    separate task_sleep_ticks-specific scheduler bug -- not
+  //    independently re-confirmed either way, since the NEW blocker
+  //    below made further USR-mode testing moot for now.
+  //
+  // 2. FOUND, NOT YET FIXED: a genuine WCET/schedulability regression.
+  //    With the crash fixed and task_a running correctly in USR mode,
+  //    the LOW-priority shell task (task_c) stopped responding to
+  //    interactive commands after the first one -- confirmed via a live
+  //    A/B comparison against this exact proven-safe baseline (task_a
+  //    plain SVC): the baseline handles the identical command sequence
+  //    (write/cat/eval) correctly, `LOW: locked/unlocking` cycling
+  //    continuously throughout; with task_a in USR mode, `write`
+  //    succeeds once and then `LOW:` output stops appearing entirely --
+  //    the shell task stops making progress. task_a's own scheduling
+  //    shape (3-tick sleep period, ceiling-0 boost via dhruva_prio_lock/
+  //    unlock during task_a_wake_body) is IDENTICAL in both
+  //    configurations -- the only difference is USR-mode task_a paying
+  //    real SWI-trap overhead (SYS-mode register-bank dip, per-task
+  //    table lookups, full context save/restore) on every syscall
+  //    inside that SAME critical section, extending its real hold time
+  //    enough to break the existing dynamic-priority-aging fairness
+  //    guarantee (task #184) that the faster SVC-mode version stayed
+  //    safely within. A real, measurable cost of USR-mode privilege
+  //    separation for a FREQUENTLY-WAKING, CEILING-BOOSTING task
+  //    specifically -- not a logic bug, a genuine WCET increase that
+  //    needs to be either budgeted for (tune AGING_CAP/AGING_SHIFT, or
+  //    task_a's own sleep period) or reduced (a leaner, more targeted
+  //    SWI trap path for exactly this hot loop) before task_a can
+  //    safely run in USR mode. Not attempted this round -- reverted to
+  //    SVC again, keeping fix #1 above (it's real and needed regardless
+  //    of when task_a is re-attempted), pending a dedicated session to
+  //    either measure and budget the real overhead or cut it down.
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   // Task #253 Phase 3, task_b -- ALSO reverted to SVC mode (2026-09-19).
   // Converted to USR mode as the "sidesteps task_a's ceiling-priority
@@ -36039,6 +36103,13 @@ fn kernel_main() -> i64 {
   // watchdog_init() would belong here, right before handing off to the
   // scheduler -- see watchdog_arm's comment for why it isn't actually
   // called under QEMU's raspi1ap.
+  //
+  // task_a's own usr_sp_table seed would belong here, deliberately the
+  // LAST thing kernel_main does before handing off (see the long
+  // comment at this function's own task_a setup site above for why) --
+  // omitted while task_a stays reverted to plain SVC; restore this
+  // exact placement (not task_b's earlier-seed pattern) when task_a is
+  // next re-attempted.
   //
   // Never returns. start_multitasking's own restore sets CPSR (via
   // the fake frame's spsr=0x13) with interrupts already enabled, so

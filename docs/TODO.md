@@ -7804,3 +7804,81 @@ CMD17/CMD24 -- worth comparing directly against U-Boot's
 `bcm2835_sdhost.c` (a bare-metal/polling reference closer to this
 driver's own synchronous design than Linux's IRQ-driven one) if the
 readback alone doesn't pinpoint it.
+
+**Task #253 Phase 3, task_a -- THIRD round, real crash bug found+fixed,
+NEW schedulability blocker found, same day (2026-09-19), per explicit
+instruction to fix this properly rather than leave it blocked
+("correctness and safety over speed").** Re-enabled task_a in USR mode
+to root-cause the deep bug from the SECOND round (task_a/task_b both
+hanging with `current_task` misread as 3 inside `task_sleep_ticks_
+impl`). Live-reproduced a DIFFERENT, earlier crash first: `FATAL: Data
+Abort at address FFFFFFF8 ... current_task=00000000 ... ctxsw=0` --
+happening during kernel_main's own boot-time setup, before
+`start_multitasking` ever ran, not inside `task_sleep_ticks_impl` at
+all.
+
+**Root cause, found and fixed**: task_a's own `usr_sp_table` seed
+(`dhruva_alloc_usrstack_domain` + `usr_sp_table_set_at(0, ...)`) was
+placed right after `task_a_init_stack_usr`, copying task_b's own
+pattern from the prior round. That pattern is safe for task_b
+specifically because `current_task` reads 0 (task_a's own index),
+never 1, for kernel_main's entire boot-time execution -- no boot-time
+`uart_puts_bounded` call (routed through the `dhruva_prio_lock`/
+`_unlock` syscalls) can ever misdirect a `usr_sp_table` write into
+task_b's slot. That protection does not extend to task_a itself --
+task_a's own index IS 0, current_task's own boot-time default, so
+EVERY later boot-time `uart_puts_bounded` call (task_b/c/d/e/f's own
+setup, every self-test between the seed and `start_multitasking`)
+unconditionally overwrote `usr_sp_table[0]` with whatever garbage the
+physical `sp_usr` register held during kernel_main's own SVC-mode
+execution -- destroying the seed moments after it was made. Fixed by
+deferring the seed to the literal last statement before
+`start_multitasking`, matching the pattern the SECOND round had
+already independently discovered and applied for this exact task,
+before the deeper task_sleep_ticks investigation began.
+
+**Confirmed via live testing**: with this fix alone, task_a ran
+correctly through many real wake/acquire/release cycles (`HIGH:
+waking, requesting resource` / `acquired` / `released`, repeated),
+`current_task` correctly reading 0 every time, zero faults -- well
+past the "hangs after 2-3 cycles" signature the SECOND round
+documented. This strongly suggests that finding was itself a
+downstream symptom of THIS bug (gathered while it was still present),
+not an independent task_sleep_ticks-specific scheduler defect -- not
+independently re-confirmed either way, since a new blocker (below)
+made further USR-mode testing moot before task_b could be re-tested
+against just this fix.
+
+**NEW blocker found**: a genuine WCET/schedulability regression, not a
+logic bug. With the crash fixed, the LOW-priority shell task (task_c)
+stopped responding to interactive commands after the first one.
+Confirmed via a live A/B comparison against the proven-safe baseline
+(task_a plain SVC) using the identical command sequence (write/cat/
+eval): the baseline handles all three correctly, with `LOW: locked/
+unlocking` (task_c's own loop) cycling continuously throughout; with
+task_a in USR mode, `write` succeeds once and `LOW:` output then stops
+appearing entirely -- task_c stops making progress, confirmed not to
+recover even after 60+ extra seconds of wall-clock time (ruling out
+"just slow," pointing at real starvation). task_a's own scheduling
+shape (3-tick sleep period, ceiling-0 boost via `dhruva_prio_lock`/
+`unlock` inside `task_a_wake_body`) is identical in both
+configurations -- the only difference is USR-mode task_a paying real
+SWI-trap overhead (SYS-mode register-bank dip, per-task table lookups,
+full context save/restore) on every syscall inside that SAME critical
+section, extending its real hold time enough to defeat the existing
+dynamic-priority-aging fairness guarantee (task #184) that the faster
+SVC-mode version stayed safely within.
+
+**Disposition**: task_a reverted to SVC again (`task_a_init_stack`),
+keeping the seed-placement fix's lesson documented in place (dormant,
+not currently exercised) for whenever task_a is next attempted.
+Verified via `phase4_milestone.py`: exact original 4-FAIL baseline,
+zero regressions. This is real, useful progress -- one genuine crash
+bug found and fixed, and the remaining blocker reframed from
+"mysterious current_task corruption" to a concrete, measurable WCET cost of
+USR-mode privilege separation for a frequently-waking, ceiling-boosting
+task specifically. Real next step: either budget for the overhead
+(tune `AGING_CAP`/`AGING_SHIFT`, or task_a's own sleep period) or
+reduce it (a leaner, more targeted SWI trap path for exactly this hot
+loop) before re-attempting task_a in USR mode -- a dedicated
+measurement session, not another blind attempt.
