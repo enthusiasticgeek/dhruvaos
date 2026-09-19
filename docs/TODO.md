@@ -8002,3 +8002,67 @@ safe to force -- deliberately left untouched rather than guessing past
 the evidence; that remains a separate, still-open problem, possibly
 worth its own dedicated investigation once (if) the read path is
 confirmed fixed. Needs a fresh real-HW log to confirm.
+
+**CONFIRMED on real hardware, same day: the READDATA fix works.**
+Fresh log (`picocom_20260919_160254.log`): all 8 blocks in the sweep
+now show `rd=0` (read succeeds) -- a real, verified win. Writes remain
+completely unchanged (`wr=2`/`wr=3`, `FSM=WRITEDATA`, every single
+block). A new, secondary read symptom appeared: the first read attempt
+per block now hits `NEW_FLAG stuck`, self-heals via one retry +
+controller reset, then succeeds -- likely was always present but
+previously masked by the (now-fixed) READDATA hang dominating the
+failure signature. Tracked separately, not yet root-caused, not
+currently blocking (reads still complete).
+
+**Ninth+tenth rounds, same day (commit `0c8f03a`, 2026-09-19), per the
+user's own structured follow-up debugging prompt pivoting specifically
+to the write path.** Investigated whether U-Boot's own command/PIO
+ordering differs from ours (the prompt's own item 17) -- re-read
+`bcm2835_send_cmd`'s real top-level orchestration (not just the
+individual `send_command`/`finish_command` functions in isolation) and
+found `finish_command` (which waits for `NEW_FLAG`) IS called
+immediately after `send_command`, BEFORE the PIO transfer loop, for
+CMD17/CMD24 specifically (`use_busy=false` for both) -- U-Boot's real
+ordering matches ours exactly. An initial hypothesis that U-Boot
+starts PIO before `NEW_FLAG` clears was WRONG (based on reading the
+functions in isolation, not their actual call site) -- caught before
+shipping any change built on it, per the prompt's own explicit
+instruction not to repeat that mistake.
+
+Instead found two concrete, previously-unchecked gaps (prompt items 8
+and 2/11):
+
+1. **CMD17/CMD24's own status was never checked for `FAIL_FLAG`**
+   (`0x4000`) -- only `NEW_FLAG` (`0x8000`). This exact gap was already
+   fixed for the init-sequence commands (CMD2/3/9/7/16, commit
+   `366569b`) but never extended to the data commands themselves,
+   meaning a real command-level rejection could have been completely
+   invisible this whole investigation. Added the check (new return
+   code 4, "FAIL_FLAG set") to both `sdhost_read_block_once` and
+   `sdhost_write_block_once`, reusing the existing `sdhost_cmd_failed`/
+   `sdhost_cmd_report_failure` helpers.
+
+2. **No diagnostic has ever captured state DURING the write PIO loop**
+   -- every prior diagnostic only ever captured the END of the fixed
+   128-word loop or the eventual timeout. Added
+   `sdhost_fill_fifo_from_buffer_diag` (`boot/sdcard_state.S`): dumps
+   `SDEDM` immediately before the first `SDDATA` write and again after
+   words 1/4/8/16, to see whether the FIRST write changes FIFO
+   fill/FSM at all, or whether it looks wrong from the very first word.
+
+**Two real bugs caught before shipping, via this project's own
+established "verify, don't trust" discipline**: (a) the diagnostic
+was first wired in unconditionally -- QEMU regression run showed 790
+diagnostic blocks firing across the whole boot (every DharaFS write,
+not just the intended 8-block sweep), tanking 6 timing-sensitive
+network tests; fixed by gating on `block_num` (2100-2107, the existing
+sweep's own permanently-safe range), confirmed back to exactly 40
+blocks (8 x 5 checkpoints). (b) the word-16 checkpoint's own label
+truncated through a single-hex-digit print (`16 & 0xF = 0`), showing
+as "w0" (same text as the pre-write snapshot) instead of "w16" -- the
+captured `SDEDM` value was correct either way, but the label would
+have confused interpretation; widened to two hex digits. Verified via
+`phase4_milestone.py`: exact 4-FAIL baseline, zero regressions. Needs
+a fresh real-HW log -- this is the first diagnostic in this whole
+investigation to show what's happening DURING the write, not just
+before/after it.
