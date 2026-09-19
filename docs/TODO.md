@@ -7919,3 +7919,50 @@ own sleep period) now that the implementation-quality explanation is
 ruled out, or measure the remaining per-syscall cost directly (a
 `WCET DIAG` line, matching this project's existing measurement
 discipline) to see exactly where the remaining time goes.
+
+**SD wedge: sixth fix attempt, real register-level divergence from
+Linux found and fixed (2026-09-19), against a fresh real-HW log
+(`picocom_20260919_145143.log`) that includes BOTH the FAIL_FLAG fix
+(366569b) and the SDHBCT/SDHBLC-readback diagnostic (e710121) for the
+first time together.** The new diagnostic gave direct, decisive
+evidence: `SDHBCT=0x200 SDHBLC=0x1` at the exact moment the fixed
+128-word PIO loop finishes, every single time -- correctly programmed,
+ruling out the block-count-mismatch hypothesis from the prior round
+outright. `CURRENT_STATE=4 (tran)` also confirmed on every single
+CMD16 check -- CMD7 card selection is genuinely working, not the
+problem either. `sdhost_card_addr`'s own SDHC/SDSC branch was verified
+directly against the code and is correct (block-number addressing for
+this SDHC card, matching `is_sdhc=1` consistently reported).
+
+With those three hypotheses eliminated, re-examined `SDHCFG`'s own bit
+configuration against a freshly re-fetched Linux `bcm2835-sdhost.c`
+(not recalled from memory). Found a real, concrete divergence:
+`bcm2835_sdhost_set_transfer_irqs`'s own PIO branch (`dma_desc ==
+NULL`, this driver's own case) sets ONLY `SDHCFG_DATA_IRPT_EN |
+SDHCFG_BUSY_IRPT_EN` at the START of a transfer -- `SDHCFG_BLOCK_
+IRPT_EN` is explicitly masked OUT there, and Linux only ever adds it
+later, inside `bcm2835_sdhost_data_irq`, "for writes after the first
+block" (multi-block transfers only; the read path in that same
+function never touches it at all). This driver's own transfers are
+ALWAYS exactly one block (`SDHBLC=1`), so Linux's own real, proven-
+working configuration for this exact class of transfer NEVER includes
+`BLOCK_IRPT_EN` -- but this driver's own `SDHCFG` value (`0x518`) has
+included it unconditionally since the 2026-09-18 `SDHCFG_SLOW_CARD`
+round. This project's own earlier finding on these exact bits ("may
+double as internal event-detection/latch enables for the data-phase
+state machine itself, not purely IRQ-routing bits") makes this
+mechanistically plausible as a real cause, not just a cosmetic
+mismatch: an extra enable bit the FSM was never designed to see set
+during a single-block transfer.
+
+Fixed: `0x518` -> `0x418` (drops bit8/`BLOCK_IRPT_EN` only; `SLOW_CARD`/
+`DATA_IRPT_EN`/`BUSY_IRPT_EN` all unchanged, each independently
+justified by its own separate prior finding) in both `sdhost_read_
+block_once` and `sdhost_write_block_once`. Verified via
+`phase4_milestone.py`: identical 4-FAIL baseline, zero regressions
+(QEMU's own SD model never wedges either way, so this can only be
+confirmed by a real-HW retest). Needs a fresh real-HW picocom log to
+confirm or refute -- this is the most concrete, best-evidenced fix
+attempt so far (a genuine divergence from a proven-working reference,
+found only after three other hypotheses were directly eliminated by
+real captured evidence, not guessed past).

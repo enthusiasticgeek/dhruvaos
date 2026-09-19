@@ -4244,7 +4244,28 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_readwait: u32 = 4 as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
-  let _ = mmio_write_u32(SDHCFG, 0x518 as u32);
+  // BUG found 2026-09-19 (real-hardware SD wedge investigation, fifth
+  // real-HW log): 0x518 included SDHCFG_BLOCK_IRPT_EN (bit8, 0x100)
+  // unconditionally -- confirmed against a fresh diagnostic capture
+  // that this is wrong for this driver's own single-block PIO
+  // transfers. Real Linux's bcm2835_sdhost_set_transfer_irqs (fetched
+  // fresh, not recalled) sets ONLY SDHCFG_DATA_IRPT_EN|BUSY_IRPT_EN at
+  // the START of a PIO transfer (dma_desc == NULL branch) -- BLOCK_
+  // IRPT_EN is explicitly masked OUT there, and only ever gets added
+  // later, by bcm2835_sdhost_data_irq, "for writes after the first
+  // block" (multi-block only). This driver's own transfers are ALWAYS
+  // exactly one block (SDHBLC=1 below), so Linux's own real, working
+  // sequence NEVER sets BLOCK_IRPT_EN for the class of transfer this
+  // driver ever does -- confirmed by reading bcm2835_sdhost_data_irq's
+  // own read-path branch directly, which never touches BLOCK_IRPT_EN
+  // at all. This project's own earlier comment on these bits ("may
+  // double as internal event-detection/latch enables for the data-
+  // phase state machine itself, not purely IRQ-routing") makes this a
+  // real, mechanistically plausible candidate: an extra enable bit set
+  // before the FSM was ever designed to see it. 0x518 -> 0x418 (drops
+  // bit8 only; SLOW_CARD/DATA_IRPT_EN/BUSY_IRPT_EN all unchanged and
+  // still independently justified by their own separate findings).
+  let _ = mmio_write_u32(SDHCFG, 0x418 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
   // DIAGNOSTIC (2026-09-19, real-hardware SD wedge investigation, per
@@ -4337,9 +4358,10 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
 }
 
 // See sdhost_read_block_once's own header comment for the SDHCFG
-// reasoning (both the original 0x510 IRQ-enable bits and the
-// 2026-09-18 SDHCFG_SLOW_CARD addition, 0x510 -> 0x518) -- identical
-// fix, identical justification, same read/write-symmetric register.
+// reasoning (the original 0x510 IRQ-enable bits, the 2026-09-18
+// SDHCFG_SLOW_CARD addition 0x510 -> 0x518, and the 2026-09-19
+// BLOCK_IRPT_EN removal 0x518 -> 0x418) -- identical fix, identical
+// justification, same read/write-symmetric register.
 fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -4349,7 +4371,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_writestart1: u32 = 0xA as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
-  let _ = mmio_write_u32(SDHCFG, 0x518 as u32);
+  let _ = mmio_write_u32(SDHCFG, 0x418 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
   // DIAGNOSTIC (2026-09-19): see sdhost_read_block_once's own comment
