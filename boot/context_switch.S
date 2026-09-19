@@ -1160,22 +1160,15 @@ scheduler_switch_from_irq_skip_tick:
  * same event). ticks is a plain i64, so AAPCS's 64-bit-argument
  * register pairing applies (r0:r1) -- only r0 (the low 32 bits) is
  * used, since no tick count in this design remotely approaches 2^32. */
-/* Task #253 Phase 3 (2026-09-18): briefly renamed to task_sleep_
- * ticks_impl with all callers routed through a new SWI trampoline
- * (boot/swi_entry.S) -- reverted back to this original name/direct-
- * call form after live QEMU testing surfaced a real, still-open crash
- * (SD-driver and shell-dispatch code paths, appearing only once the
- * trap was actually exercised at scale) beyond the true-lr/resume-pc
- * bug already found and fixed in the trampolines themselves (see
- * swi_entry.S's own header comment for that fix, kept and still
- * correct -- the file's own trampoline is renamed, not deleted, so
- * this real fix isn't lost, just not wired into the live call graph
- * yet). Every one of this project's own ~65 call sites (kernel_main.
- * vani's own extern "C" fn declaration, unchanged name) is back to
- * calling this real implementation DIRECTLY -- the proven-stable
- * Phase 1/2 behavior, byte-for-byte. */
-.global task_sleep_ticks
-task_sleep_ticks:
+/* Task #253 Phase 3 (2026-09-19): re-wired to task_sleep_ticks_impl,
+ * with all USR-mode-relevant callers routed through the SWI trampoline
+ * (boot/swi_entry.S, task_sleep_ticks_syscall renamed back to task_
+ * sleep_ticks) -- see that file's own header comment for the true-lr
+ * fix already verified working here, and for the separate SD-driver/
+ * shell-dispatch crash this round is now chasing down before trusting
+ * the trap at scale again. */
+.global task_sleep_ticks_impl
+task_sleep_ticks_impl:
     /* Task #246 (RTOS true-compliance pass, 2026-09-18): `cpsid i` ->
      * `cpsid if` here and at every other scheduler-state critical
      * section in this file (dhruva_mutex_lock/_unlock, task_create) --
@@ -1392,10 +1385,11 @@ current_eff_prio:
  * saved r0 slot is patched to 0 right after the save -- otherwise a
  * resumed caller would see r0 = the original mutex_id argument instead
  * of the return code. */
-/* Task #253 Phase 3 (2026-09-18): reverted back to this name -- see
- * task_sleep_ticks's own comment above for the full story. */
-.global dhruva_mutex_lock
-dhruva_mutex_lock:
+/* Task #253 Phase 3 (2026-09-19): re-wired to dhruva_mutex_lock_impl
+ * -- see task_sleep_ticks_impl's own comment above for the full
+ * story. */
+.global dhruva_mutex_lock_impl
+dhruva_mutex_lock_impl:
     mrs r1, cpsr
     cpsid if
 
@@ -1511,10 +1505,11 @@ dml_contended:
  * Always returns normally (never suspends the caller) -- push/pop
  * r4-r9 around the whole body per AAPCS (round 53's lesson: called
  * directly from vani-compiled C, r4-r11 are callee-saved). */
-/* Task #253 Phase 3 (2026-09-18): reverted back to this name -- see
- * task_sleep_ticks's own comment above for the full story. */
-.global dhruva_mutex_unlock
-dhruva_mutex_unlock:
+/* Task #253 Phase 3 (2026-09-19): re-wired to dhruva_mutex_unlock_impl
+ * -- see task_sleep_ticks_impl's own comment above for the full
+ * story. */
+.global dhruva_mutex_unlock_impl
+dhruva_mutex_unlock_impl:
     stmdb sp!, {r4-r9, lr}
     mrs r1, cpsr
     cpsid if

@@ -68,19 +68,71 @@ swi_entry:
     /* SVC mode now. r7 = syscall number, r0-r3 = args, all directly
      * live from the USR-mode caller (unbanked). lr = lr_svc = correct
      * return address already. SPSR_svc = interrupted USR CPSR. */
-    /* r11 (not r4!) for the interrupted-cpsr scratch -- see this
-     * file's own trampolines below for the full "why": r4 must pass
-     * through this entire function UNTOUCHED, since the trampolines
-     * now stash their own true caller-return-address there before
-     * ever executing `swi`, and rely on it surviving to restore lr
-     * correctly afterward (the exact round-68 true-lr/resume-pc
-     * conflation bug, recurring and fixed here -- see the trampolines'
-     * own comment for the full incident). r5/r6/r11 are otherwise
-     * genuinely free scratch here: nothing above has touched them,
-     * and the dispatched functions below are free to clobber them
-     * same as any ordinary callee would (only r0-r4 matter to this
-     * file's own callers -- r0-r3 as real arguments, r4 as the
-     * trampoline's own preserved true-lr). */
+    /* BUG found+fixed 2026-09-19 (re-wire round, chasing the SD-driver/
+     * shell-dispatch crash): taking `swi` auto-masks I (every exception
+     * does) but NEVER F -- unlike every other scheduler-critical-section
+     * entry point in this project (task_sleep_ticks_impl/dhruva_mutex_
+     * lock_impl/_unlock_impl's own `cpsid if`, irq_entry.S's own `cpsid
+     * f`), this file had no equivalent, leaving F genuinely unmasked
+     * through both of its own `cps #0x1F` SYS-mode register-bank dips
+     * below (entry capture here, and swi_return_to_usr's own restore) --
+     * live-reachable, not theoretical: dhruva_mutex_lock_impl's own
+     * fast/uncontended path restores the FULL original CPSR (`msr
+     * cpsr_c, r1`, captured before ITS OWN `cpsid if`) before `bx lr`
+     * back into swi_do_mutex_lock, which had F=0 the entire time (this
+     * file never touched it) -- so by the time swi_return_to_usr's own
+     * dip runs, F is back to unmasked. A real timer tick FIQ landing in
+     * either dip window interrupts this task while the CPU is literally
+     * IN SYS mode (0x1F) -- a THIRD mode fiq_entry.S's own true-lr mode
+     * check (`cmp r3,#0x10` -- USR only) was never built to recognize,
+     * only USR (0x10) vs "everything else assumed SVC"; SYS shares its
+     * r13/r14 bank with USR, not SVC, so that fallthrough silently reads
+     * the wrong physical register as this task's own "true" r14 at the
+     * interrupted instant. Fixed here at the root (mask F for this
+     * file's entire body, matching every other scheduler-critical-
+     * section's own convention) rather than teaching fiq_entry.S a
+     * third mode case -- no explicit `cpsie f` needed anywhere below:
+     * every exit path here ends by restoring the ORIGINAL full CPSR
+     * from a saved SPSR (either this function's own final `msr
+     * spsr_cxsf`+`movs pc,lr`, or a dispatched function's own full
+     * switch-away `ldmia ...^`), which naturally un-masks F again the
+     * same way `cpsid if` elsewhere in this project relies on. */
+    cpsid f
+    /* SECOND real bug found+fixed here 2026-09-19 (same round as the
+     * cpsid f fix above; THIS one, not that one, turned out to be the
+     * actual cause of the SD-driver/shell-dispatch crash -- verified by
+     * testing the cpsid f fix alone first, which built and ran clean
+     * but reproduced the identical crash unchanged, then finding this
+     * one and re-testing): r5/r6/r8/r9/r11 were being used as scratch
+     * below WITHOUT saving them first -- wrongly reasoned, in the
+     * comment this replaces, to be "genuinely free". They are NOT: per
+     * AAPCS, r4-r11 are callee-saved, and this function is reached via
+     * a plain `bl` from vani-compiled caller code (through the
+     * trampolines below) that relies on that guarantee -- the exact
+     * same bug class this project has hit before (see sdcard_state.S's
+     * own file-level comment: "vani's generated caller code keeps
+     * genuinely live values in [r4-r11] across calls on the strength
+     * of that guarantee"). The trampolines only save/restore r4 (the
+     * true-lr fix above) -- nothing saved r5/r6/r8/r9/r11, so any live
+     * value a caller held in one of those across a call to task_sleep_
+     * ticks/dhruva_mutex_lock/_unlock was silently destroyed by this
+     * function's own bookkeeping before the caller ever got control
+     * back. Worse for the two functions with a blocking path: task_
+     * sleep_ticks_impl/dhruva_mutex_lock_impl's own 68-byte frame saves
+     * "r5/r6/r8/r9/r11" too -- but by the time they run, this function
+     * had ALREADY overwritten those registers with its own scratch
+     * values, so the corrupted values got faithfully saved and later
+     * faithfully RESTORED when the task woke back up -- a corrupted
+     * register that only surfaces as a crash much later, whenever that
+     * task next actually uses it (exactly matching the observed
+     * symptom: a stack/buffer pointer that had decayed to a near-null
+     * address, surfacing tens to hundreds of context switches after
+     * the actual corruption). Fixed by saving the true originals first
+     * and restoring them before ever reaching the dispatch below -- r4
+     * (trampoline's own true-lr) and r0-r3/r7 (real arguments/syscall
+     * number) are deliberately excluded from this save/restore, exactly
+     * as before. */
+    push {r5, r6, r8, r9, r11}
     mrs r11, spsr             /* r11 = interrupted cpsr, temporarily */
     mov r5, lr                /* r5 = resume pc, temporarily */
 
@@ -99,6 +151,10 @@ swi_entry:
     str r5, [r9, r8, lsl #2]
     ldr r9, =usr_sp_table
     str r6, [r9, r8, lsl #2]
+    pop {r5, r6, r8, r9, r11}  /* restore the caller's true originals
+                               * before the dispatched function (or its
+                               * own later-resumed frame) ever sees them
+                               * again */
 
     /* Dispatch on r7 (syscall number). Each stub calls the real
      * privileged implementation directly (legal now -- we're in SVC
@@ -118,15 +174,15 @@ swi_entry:
                                * rather than doing anything undefined */
 
 swi_do_sleep_ticks:
-    bl task_sleep_ticks
+    bl task_sleep_ticks_impl
     b swi_return_to_usr
 
 swi_do_mutex_lock:
-    bl dhruva_mutex_lock
+    bl dhruva_mutex_lock_impl
     b swi_return_to_usr
 
 swi_do_mutex_unlock:
-    bl dhruva_mutex_unlock
+    bl dhruva_mutex_unlock_impl
     b swi_return_to_usr
 
 swi_return_to_usr:
@@ -167,25 +223,23 @@ swi_return_to_usr:
     ldr lr, [r3, r2, lsl #2]
     movs pc, lr
 
-/* Trampolines -- NOT currently wired into the live call graph (see
- * this file's own bottom-of-header status note): kept under distinct,
- * inert names (task_sleep_ticks_syscall/dhruva_mutex_lock_syscall/
- * dhruva_mutex_unlock_syscall) rather than the real functions' own
- * names (context_switch.S), specifically so nothing calls them yet --
- * a real, separate bug surfaced downstream (SD-driver and shell-
- * dispatch code paths) once this trap was exercised at scale under
- * live QEMU testing, beyond the true-lr bug documented and fixed
- * below, and wiring these back in is deferred until that's found too.
- * Once ready to re-enable: rename these three labels (and their own
- * `.global`s) to task_sleep_ticks/dhruva_mutex_lock/dhruva_mutex_
- * unlock, and rename context_switch.S's own real implementations to
- * _impl (exactly the reverse of this round's own revert) -- everы one
- * of this project's own ~65 existing vani-side call sites (kernel_
- * main.vani's own extern "C" fn declarations) needs no changes either
- * way, since they always call by the same plain name regardless of
- * which side of that rename currently owns it. Syscall number in r7
+/* Trampolines -- RE-WIRED into the live call graph as of 2026-09-19
+ * (task #253 Phase 3 continued): these now carry the real, plain
+ * names (task_sleep_ticks/dhruva_mutex_lock/dhruva_mutex_unlock) --
+ * every existing vani-side call site (kernel_main.vani's own extern
+ * "C" fn declarations, ~65 of them) resolves to these trampolines
+ * unchanged, exactly as designed. The genuine privileged
+ * implementations now live under context_switch.S's own _impl-
+ * suffixed names (task_sleep_ticks_impl/dhruva_mutex_lock_impl/
+ * dhruva_mutex_unlock_impl), reachable only via swi_do_sleep_ticks/
+ * swi_do_mutex_lock/swi_do_mutex_unlock above. Syscall number in r7
  * (this file's own convention, matching swi_entry's own dispatch
  * above), arguments passed through completely unchanged in r0-r3.
+ *
+ * The separate SD-driver/shell-dispatch crash that surfaced downstream
+ * when this trap was previously exercised at scale under live QEMU
+ * testing is being actively chased now that these are wired back in --
+ * see docs/RTOS_GAP_ANALYSIS.md and docs/TODO.md for the live status.
  *
  * REAL BUG found and fixed here, live-tested (task #253 Phase 3,
  * 2026-09-18) -- the exact round-68 true-lr/resume-pc conflation bug
@@ -219,33 +273,53 @@ swi_return_to_usr:
  * than trusting whatever physical lr happens to hold post-trap. r4 is
  * AAPCS callee-saved -- pushed/popped around the whole body, since
  * these are called directly from vani-compiled code that may have a
- * live value there. */
-.global task_sleep_ticks_syscall
-task_sleep_ticks_syscall:
-    push {r4}
+ * live value there.
+ *
+ * THIRD bug found+fixed here 2026-09-19 (same round as the cpsid f and
+ * r5/r6/r8/r9/r11 fixes above -- found because even after both of
+ * those, a NEW, different-looking crash appeared at the exact same
+ * ctxsw=94 moment: buf_write_byte called with r0=0 from dharafs_read_
+ * from_block_raw, a NULL base pointer, matching this project's own
+ * previously-documented "was the base pointer really 0" crash shape --
+ * see vectors.S's own round-62c comment): r7 carries the syscall
+ * number below (`mov r7, #0/1/2`), but r7 is ALSO AAPCS callee-saved,
+ * same as r4 -- and unlike r4, nothing here was saving/restoring the
+ * caller's own original r7 across the trap. `mov r7, #0` (task_sleep_
+ * ticks's own syscall number) makes this especially damaging: any
+ * caller holding a live pointer in r7 across a task_sleep_ticks call
+ * would have it silently replaced with a literal 0 (NULL) -- exactly
+ * the observed symptom. Fixed the same way as r4: push the caller's
+ * true r7 before overwriting it with the syscall number, pop it back
+ * after `swi #0` returns -- push/pop with a register list restores in
+ * register-number order regardless of list-write order, so `push
+ * {r4,r7}` / `pop {r4,r7}` round-trips both correctly with no ordering
+ * hazard against the `mov r7,#N` in between. */
+.global task_sleep_ticks
+task_sleep_ticks:
+    push {r4, r7}
     mov r4, lr
     mov r7, #0
     swi #0
     mov lr, r4
-    pop {r4}
+    pop {r4, r7}
     bx lr
 
-.global dhruva_mutex_lock_syscall
-dhruva_mutex_lock_syscall:
-    push {r4}
+.global dhruva_mutex_lock
+dhruva_mutex_lock:
+    push {r4, r7}
     mov r4, lr
     mov r7, #1
     swi #0
     mov lr, r4
-    pop {r4}
+    pop {r4, r7}
     bx lr
 
-.global dhruva_mutex_unlock_syscall
-dhruva_mutex_unlock_syscall:
-    push {r4}
+.global dhruva_mutex_unlock
+dhruva_mutex_unlock:
+    push {r4, r7}
     mov r4, lr
     mov r7, #2
     swi #0
     mov lr, r4
-    pop {r4}
+    pop {r4, r7}
     bx lr

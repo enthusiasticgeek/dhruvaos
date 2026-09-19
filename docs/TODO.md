@@ -7486,8 +7486,81 @@ milestone.py` matches the ORIGINAL Phase 1/2 baseline exactly (same
 4-FAIL set, zero `SCHED SHADOW MISMATCH`, `idle` printed 266 times, no
 crash). Full story, including the earlier full-10-task attempt's own
 extensive-but-ultimately-inconclusive vani-compiler/LLVM investigation,
-is in `RTOS_GAP_ANALYSIS.md`'s own task #253 entry. Real, well-scoped
-next steps: re-wire the trampolines and chase the SD/shell-dispatch
-bug to root cause; then convert the remaining 9 tasks one at a time
-with a full regression cycle after each, not another all-at-once
-attempt.
+is in `RTOS_GAP_ANALYSIS.md`'s own task #253 entry.
+
+**Task #253 Phase 3 RE-WIRED and the SD-driver/shell-dispatch bug
+CLOSED, 2026-09-19 (same day, "re-wire the trampolines and chase the
+SD/shell-dispatch bug and fix any other issues found").** Renamed the
+trampolines in `boot/swi_entry.S` back to their real names (`task_
+sleep_ticks`/`dhruva_mutex_lock`/`dhruva_mutex_unlock`) and the real
+implementations in `context_switch.S` to `_impl`, exactly reversing the
+prior revert -- then found and fixed THREE more real bugs before the
+trap was trustworthy at scale, each caught by rebuilding and re-running
+`phase4_milestone.py` after every change rather than trusting static
+disassembly reasoning alone (a lesson this project has learned hard
+before):
+1. **`swi_entry.S` never masked FIQ.** Every other scheduler-critical-
+   section entry point in this project (`task_sleep_ticks_impl`/
+   `dhruva_mutex_lock_impl`/`_unlock_impl`'s own `cpsid if`, `irq_
+   entry.S`'s own `cpsid f`) masks FIQ explicitly; `swi_entry.S` had no
+   equivalent, leaving F genuinely unmasked through its own two SYS-
+   mode register-bank dips. A real, live-reachable window (`dhruva_
+   mutex_lock_impl`'s own fast/uncontended path restores the full
+   original CPSR, F=0 included, before returning through the dip) that
+   also exposed a real, independent defect in `fiq_entry.S`'s own
+   mode-check (`cmp r3,#0x10` recognizes USR but not SYS, a third mode
+   only reachable via this exact dip) -- fixed by adding `cpsid f` at
+   `swi_entry`'s own top, matching this project's established
+   convention, rather than teaching `fiq_entry.S` a third mode case.
+   Confirmed real and independently worth fixing, but empirically did
+   NOT change the crash when tested alone (`phase4_milestone.py`
+   reproduced the identical SD-driver fault, address shifted by 4 bytes
+   from the unrelated code-layout change, otherwise unchanged) --
+   correctly not mistaken for the root cause just because it was a real
+   bug.
+2. **The actual root cause of the SD-driver crash: `swi_entry.S` used
+   r5/r6/r8/r9/r11 as its own entry-capture scratch without saving
+   them first.** These are AAPCS callee-saved registers; the
+   trampolines only preserved r4 (the true-lr fix). Any live value a
+   vani caller held in r5/r6/r8/r9/r11 across a call to `task_sleep_
+   ticks`/`dhruva_mutex_lock`/`_unlock` was silently destroyed --
+   exactly the bug class `sdcard_state.S`'s own file-level comment
+   already documents from an earlier round. Worse for the blocking
+   paths: `task_sleep_ticks_impl`/`dhruva_mutex_lock_impl`'s own
+   68-byte frame captured the ALREADY-corrupted values and faithfully
+   restored them whenever the task woke back up, so the actual
+   corruption and its crash were separated by many context switches --
+   this is why the fault kept landing in unrelated-looking code
+   (`sdhost_drain_ready`, then after fix #2 below, `buf_write_byte`)
+   long after the real damage was done. Fixed by pushing/popping
+   {r5,r6,r8,r9,r11} around the entry-capture bookkeeping, restoring
+   the caller's true originals before ever reaching the dispatch
+   branch. This alone took `phase4_milestone.py` from 6 FAILs (with 2
+   live `FATAL` Data Aborts) to 3 FAILs, zero crashes -- BETTER than
+   the original 4-FAIL baseline (tcprtx/tlsecho/httpecho all newly
+   passing).
+3. **The remaining crash: the trampolines also clobbered r7 (also
+   AAPCS callee-saved) without saving it.** r7 carries the syscall
+   number (`mov r7, #0/1/2`) but was never saved/restored around that
+   overwrite, unlike r4. `task_sleep_ticks`'s own `mov r7, #0` is
+   uniquely damaging: any caller holding a live pointer in r7 across a
+   sleep call would see it replaced with a literal NULL -- exactly what
+   surfaced as `buf_write_byte` called with r0=0 from `dharafs_read_
+   from_block_raw`, at the exact same `ctxsw=94` moment fix #2's own
+   crash used to occur, once fix #2 let execution get one step further
+   before hitting this one. Fixed the same way as r4: `push {r4,r7}` /
+   `pop {r4,r7}` in all three trampolines (register-list order doesn't
+   matter -- push/pop always order by register number, so this
+   round-trips correctly around the intervening `mov r7,#N`).
+
+**Verified clean after all three fixes**: `phase4_milestone.py` now
+matches the ORIGINAL Phase 1/2 baseline exactly -- same 4-FAIL set
+(httpecho/mqttecho/ls/diagnose, all pre-existing `SETTLE_S`-class
+harness timing gaps, not kernel bugs), zero `FATAL`, zero `SCHED SHADOW
+MISMATCH`, `idle` printed 265 times -- with the SWI trap now genuinely
+exercised at full scale by every SVC-mode task's own `task_sleep_
+ticks`/`dhruva_mutex_lock`/`_unlock` calls, not reverted to inert. Real
+next step: convert the remaining 9 tasks (a/b/c/e/f + the 4 dynamic
+tasks) to USR mode ONE AT A TIME, with a full regression cycle after
+each -- not another all-at-once attempt, per this project's own
+hard-won lesson from the earlier full-10-task attempt.

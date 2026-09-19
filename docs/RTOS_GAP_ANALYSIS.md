@@ -561,15 +561,63 @@ doesn't yet attempt.
   scope) rather than re-attempted with the fix applied, given the
   investigation budget already spent.
 
-  **Real, well-scoped future work, in order:** (1) re-attempt wiring
-  the SWI trampolines back in (rename `_syscall`-suffixed labels back
-  to the real names, real implementations back to `_impl`) now that
-  the true-lr bug is fixed, and chase real bug #2 (the SD-driver/
-  shell-dispatch crash) to a real root cause before trusting it; (2)
-  once SVC-mode callers genuinely work end-to-end via the trap, convert
-  the remaining 9 tasks to USR mode one at a time with a full
-  regression cycle after each addition, not another all-at-once
-  attempt, per this round's own hard-won lesson.
+  **Phase 3 RE-WIRED and CLOSED, 2026-09-19 (same day, "re-wire the
+  trampolines and chase the SD/shell-dispatch bug and fix any other
+  issues found").** Renamed the trampolines back to their real names
+  and the real implementations back to `_impl`, exactly reversing the
+  revert above -- then found and fixed three more real bugs before the
+  trap was trustworthy at scale under `phase4_milestone.py`, each one
+  confirmed (or ruled out) empirically by rebuilding and re-running the
+  full regression suite after every change, not by static reasoning
+  alone:
+
+  1. `swi_entry.S` never masked FIQ across its own two SYS-mode
+     register-bank dips (every other scheduler-critical-section entry
+     point in this project does -- `cpsid if`/`cpsid f`), a real,
+     live-reachable gap (`dhruva_mutex_lock`'s own fast path restores
+     F=0 before returning through the dip) that also exposed a genuine,
+     independent defect in `fiq_entry.S`'s own mode-check (recognizes
+     USR but not SYS, a third mode only reachable via this exact dip).
+     Fixed with `cpsid f` at `swi_entry`'s own top. Real and worth
+     fixing, but tested alone it did NOT change the crash (`phase4_
+     milestone.py` reproduced the identical SD-driver fault, confirming
+     it was not the root cause before moving on -- exactly the kind of
+     verification this project's "no trust, validate everything" habit
+     is for).
+  2. **The actual root cause of the SD-driver crash**: `swi_entry.S`
+     used r5/r6/r8/r9/r11 as its own entry-capture scratch without
+     saving them -- AAPCS callee-saved registers the trampolines never
+     protected (only r4, the true-lr fix, was). Any live caller value
+     in those registers across a `task_sleep_ticks`/`dhruva_mutex_
+     lock`/`_unlock` call was silently destroyed, and for the blocking
+     paths the ALREADY-corrupted values got captured into the task's
+     own 68-byte frame and faithfully restored on wake -- separating
+     the real corruption from its crash by many context switches,
+     which is why the fault kept relocating to unrelated-looking code
+     as later fixes let execution get further. Fixed by pushing/
+     popping {r5,r6,r8,r9,r11} around the entry-capture bookkeeping,
+     restored before the dispatch branch. Alone, this took `phase4_
+     milestone.py` from 6 FAILs with 2 live `FATAL` Data Aborts to 3
+     FAILs and zero crashes -- BETTER than the original 4-FAIL
+     baseline.
+  3. **The remaining crash**: the trampolines also clobbered r7 (also
+     AAPCS callee-saved, carries the syscall number) without saving it
+     -- `task_sleep_ticks`'s own `mov r7, #0` replaced any caller's own
+     live r7 with a literal NULL, surfacing as `buf_write_byte` called
+     with r0=0 from `dharafs_read_from_block_raw`. Fixed the same way
+     as r4: `push {r4,r7}`/`pop {r4,r7}` in all three trampolines.
+
+  **Verified clean**: `phase4_milestone.py` now matches the ORIGINAL
+  Phase 1/2 baseline exactly (same 4-FAIL set, zero `FATAL`, zero
+  `SCHED SHADOW MISMATCH`, `idle` printed 265 times) with the SWI trap
+  genuinely wired in and exercised at full scale by every SVC-mode
+  task, not reverted to inert.
+
+  **Real, well-scoped future work:** convert the remaining 9 tasks (6
+  fixed minus `task_d` + the 4 dynamic tasks) to USR mode ONE AT A
+  TIME, with a full regression cycle after each addition -- not another
+  all-at-once attempt, per this project's own hard-won lesson from the
+  earlier full-10-task attempt above.
 
   Real Pi 1B hardware validation remains outstanding for everything in
   this item (no hardware available in this environment) -- the same
