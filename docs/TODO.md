@@ -7882,3 +7882,40 @@ task specifically. Real next step: either budget for the overhead
 reduce it (a leaner, more targeted SWI trap path for exactly this hot
 loop) before re-attempting task_a in USR mode -- a dedicated
 measurement session, not another blind attempt.
+
+**Task #253 Phase 3, task_a -- FOURTH round, same day (commit
+`6e8645a`, 2026-09-19), a real WCET win that wasn't quite enough.**
+User asked how Linux handles SVC/USR mode transitions without this
+class of overhead, and to check whether that reference solves the
+starvation. Fetched real Linux source directly
+(`arch/arm/kernel/entry-common.S`'s `vector_swi`: `stmdb r8,{sp,lr}^`)
+-- ARM mode has a single-instruction "user-register" LDM/STM form
+(valid when PC is excluded from the register list, no writeback) that
+transfers the USER-bank version of listed registers from any privileged
+mode with NO mode switch at all. Linux's own `cps`-based fallback macros
+are explicitly Thumb-2-only by their own comment; this project builds
+pure ARM mode, so the fast form applies directly.
+
+Replaced the `cps #0x1F; ...; cps #0x13` dip at all 4 real call sites
+(`scheduler_restore_usr_sp` -- shared by every restore path project-
+wide, `swi_entry.S`'s entry capture + `swi_return_to_usr`'s restore,
+`irq_entry.S`/`fiq_entry.S`'s own USR-mode capture points) with the
+single-instruction form. Verified via `phase4_milestone.py`: exact
+4-FAIL baseline, zero regressions.
+
+Re-tested task_a in USR mode with this fix alone: the shell task
+measurably survived one MORE full critical-section cycle after the
+first command than before the fix (2 vs 1, confirmed via direct log
+comparison) -- a real, verified overhead reduction -- but still not
+enough: `cat`/`eval` and everything after still never got a response.
+Kept the fix (genuinely correct, benefits every IRQ/FIQ/syscall
+touching a USR-mode task project-wide, not just task_a) and reverted
+task_a to SVC again. This rules out "wrong SYS-mode-dip implementation"
+as the SOLE cause -- the remaining per-syscall cost (table lookups,
+full 68-byte frame save/restore for the blocking path) combined with
+task_a's own tight 3-tick sleep period still defeats the current aging
+tuning. Real next step: retune `AGING_CAP`/`AGING_SHIFT` (or task_a's
+own sleep period) now that the implementation-quality explanation is
+ruled out, or measure the remaining per-syscall cost directly (a
+`WCET DIAG` line, matching this project's existing measurement
+discipline) to see exactly where the remaining time goes.
