@@ -1541,6 +1541,9 @@ extern "C" fn sd_state_get_rca() -> i64;
 extern "C" fn sd_state_get_is_sdhc() -> i64;
 extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, word_count: i64) -> i64;
 extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, word_count: i64) -> i64;
+// TEMPORARY DIAGNOSTIC (2026-09-19) -- see boot/sdcard_state.S's own
+// header comment on sdhost_fill_fifo_from_buffer_diag. Write-path only.
+extern "C" fn sdhost_fill_fifo_from_buffer_diag(buf: mut ref i64, word_count: i64) -> i64;
 // Task #215 -- see boot/sdcard_state.S's own header comment for this
 // function. Returns the SD core clock rate in Hz via the VideoCore
 // mailbox, or 0 if the query failed (never a real answer for CORE on
@@ -4313,6 +4316,20 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct_readback: u32 = mmio_read_u32(sdhbct);
   let sdhblc_readback: u32 = mmio_read_u32(sdhblc);
   let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
+  // BUG found 2026-09-19 (real-hardware SD wedge investigation, per the
+  // user's own structured follow-up prompt, item 8: "determine whether
+  // the card ever responds to CMD24/CMD17" -- FAIL_FLAG was already
+  // fixed for the init-sequence commands (CMD2/3/9/7/16, commit
+  // 366569b) but never extended to the actual data commands
+  // themselves. status here was ONLY ever checked for NEW_FLAG
+  // (0x8000) -- FAIL_FLAG (0x4000, "the card genuinely rejected this
+  // command") was never checked at all, meaning a real CMD17/CMD24
+  // failure could have been silently indistinguishable from "command
+  // accepted, data phase wedged" this whole investigation.
+  if sdhost_cmd_failed(status) == 1 {
+    let _ = sdhost_cmd_report_failure("CMD17 (READ_SINGLE_BLOCK)", status);
+    return 4;
+  }
   let _ = sdhost_drain_fifo_to_buffer(buf, 128);
   let edm_after_pio: u32 = mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
@@ -4359,7 +4376,7 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
     if attempt < SD_MAX_ATTEMPTS {
       let backoff_hz: i64 = if attempt == 1 { SD_SPEED_BACKOFF_HZ } else { 0 };
       let _ = uart_puts("SD: read wedge detected (");
-      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
       let _ = uart_puts(") -- resetting controller and retrying, attempt ");
       let _ = uart_put_i64(attempt + 1);
       let _ = uart_puts("/");
@@ -4370,7 +4387,7 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = sdhost_init_at_speed(backoff_hz);
     } else {
       let _ = uart_puts("SD: read wedge detected (");
-      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
       let _ = uart_puts(") -- resetting controller, giving up after ");
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
       let _ = uart_puts(" attempts\n");
@@ -4406,7 +4423,33 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct_readback: u32 = mmio_read_u32(sdhbct);
   let sdhblc_readback: u32 = mmio_read_u32(sdhblc);
   let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
-  let _ = sdhost_fill_fifo_from_buffer(buf, 128);
+  // BUG found 2026-09-19: see sdhost_read_block_once's own matching
+  // comment above -- identical gap, write-side half. If the card is
+  // silently rejecting CMD24 itself (FAIL_FLAG), this is the ONE place
+  // that can ever see it, before this function's own pre-clear-on-
+  // next-command logic erases it.
+  if sdhost_cmd_failed(status) == 1 {
+    let _ = sdhost_cmd_report_failure("CMD24 (WRITE_BLOCK)", status);
+    return 4;
+  }
+  // TEMPORARY (2026-09-19): diagnostic variant, see boot/sdcard_
+  // state.S's own header comment -- dumps SDEDM at the first few
+  // SDDATA writes, blocking/slow (raw polled UART, ~5 print blocks
+  // per call). BUG caught before shipping (QEMU regression run: 790
+  // diagnostic blocks fired, way beyond the 8-block sweep this is
+  // meant for, tanking every timing-sensitive network test downstream)
+  // -- this function runs for EVERY DharaFS write for the system's
+  // entire lifetime, not just the diagnostic sweep, so an unconditional
+  // call here is exactly the same class of mistake this project's own
+  // task #253 diagnostic (context_switch.S, since removed) and the SD
+  // read/write-post-PIO diagnostics above both already learned NOT to
+  // make. Gated on block_num instead, matching this project's own
+  // established, permanently-safe diagnostic sweep range (2100-2107,
+  // "never collide with real DharaFS/FAT32 data" -- see the 8-block
+  // sweep's own header comment in kernel_main.vani for why that range
+  // is safe) -- confines the overhead to exactly the intended test.
+  let use_write_diag: bool = (block_num >= 2100) && (block_num < 2108);
+  let _ = if use_write_diag { sdhost_fill_fifo_from_buffer_diag(buf, 128) } else { sdhost_fill_fifo_from_buffer(buf, 128) };
   let edm_after_pio: u32 = mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_writestart1);
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
@@ -4463,7 +4506,7 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
     if attempt < SD_MAX_ATTEMPTS {
       let backoff_hz: i64 = if attempt == 1 { SD_SPEED_BACKOFF_HZ } else { 0 };
       let _ = uart_puts("SD: write wedge detected (");
-      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
       let _ = uart_puts(") -- resetting controller and retrying, attempt ");
       let _ = uart_put_i64(attempt + 1);
       let _ = uart_puts("/");
@@ -4474,7 +4517,7 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = sdhost_init_at_speed(backoff_hz);
     } else {
       let _ = uart_puts("SD: write wedge detected (");
-      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { "FSM stuck" });
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
       let _ = uart_puts(") -- resetting controller, giving up after ");
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
       let _ = uart_puts(" attempts\n");

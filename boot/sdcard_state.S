@@ -211,6 +211,175 @@ sdhost_fill_done:
     mov r1, #0
     bx lr
 
+/* TEMPORARY DIAGNOSTIC (2026-09-19, real-hardware SD write-wedge
+ * investigation, per the user's own structured follow-up debugging
+ * prompt, item 2/11: instrument the FIRST few SDDATA writes with SDEDM
+ * captures, since every prior diagnostic only ever captured state at
+ * the very END of the fixed 128-word loop or at the eventual timeout --
+ * never during the loop itself, so there's no evidence yet on whether
+ * the FIRST write actually changes FIFO fill/FSM at all, or whether
+ * the FSM already looks wrong from the very first word.
+ *
+ * i64 sdhost_fill_fifo_from_buffer_diag(mut ref i64 buf, i64 word_count)
+ * -- byte-for-byte the same fill loop as sdhost_fill_fifo_from_buffer
+ * above, PLUS a blocking raw UART print of SDEDM immediately before the
+ * very first write (word index 0, i.e. right after CMD24's own NEW_FLAG
+ * cleared, before this function has touched SDDATA at all) and again
+ * after words 1, 4, 8, and 16 have been written. Deliberately NOT the
+ * vani-level uart_puts (unsafe to call mid-critical-section from hand-
+ * written asm with no established calling convention for it here) or
+ * the async ring-buffer path (non-blocking, could drop exactly the
+ * bytes this diagnostic exists to capture) -- same reasoning and same
+ * technique as this project's own earlier task #253 diagnostic
+ * (context_switch.S, since removed). Write-path ONLY: the read path
+ * already works (task #217's own READDATA fix, confirmed on real
+ * hardware) and is deliberately left untouched to avoid any risk of
+ * regressing it. To be removed once the write wedge is root-caused. */
+.global sdhost_fill_fifo_from_buffer_diag
+sdhost_fill_fifo_from_buffer_diag:
+    push {r4, r5, r6, r7, r8, lr}
+    mov r8, r0                /* r8 = buffer pointer, kept persistent
+                               * here (NOT auto-incremented via r0 the
+                               * way the non-diag version does) since
+                               * r0 is needed as scratch by every
+                               * diagnostic call below -- none of
+                               * sdhost_diag_putc/_puts/_put_hex1/
+                               * _put_hex32 ever touch r4-r11, so r8
+                               * survives all of them untouched */
+    mov r4, r2               /* r4 = word_count */
+    mov r7, #0                /* r7 = words written so far */
+    ldr r6, =0x20202034      /* SDEDM */
+
+    /* word index 0: before any write at all */
+    ldr r0, =sdhost_diag_w0
+    bl sdhost_diag_puts
+    ldr r0, [r6]
+    bl sdhost_diag_put_hex32
+    mov r0, #10
+    bl sdhost_diag_putc
+
+sdhost_fill_diag_loop:
+    cmp r4, #0
+    beq sdhost_fill_diag_done
+    ldr r5, =100000
+sdhost_fill_diag_poll:
+    ldr r0, [r6]
+    mov r0, r0, lsr #4
+    and r0, r0, #0x1F
+    cmp r0, #16
+    blt sdhost_fill_diag_ready
+    subs r5, r5, #1
+    bne sdhost_fill_diag_poll
+sdhost_fill_diag_ready:
+    ldr r0, [r8], #4          /* r0 = next word from the buffer, buffer
+                               * pointer advances */
+    ldr r1, =0x20202040       /* SDDATA */
+    str r0, [r1]
+    sub r4, r4, #1
+    add r7, r7, #1
+
+    /* Print SDEDM right after words 1, 4, 8, 16 -- r4/r6/r7/r8 must
+     * survive these calls (confirmed: the diag helpers below only
+     * touch r0-r3, never r4-r11). */
+    cmp r7, #1
+    beq sdhost_fill_diag_snap
+    cmp r7, #4
+    beq sdhost_fill_diag_snap
+    cmp r7, #8
+    beq sdhost_fill_diag_snap
+    cmp r7, #16
+    beq sdhost_fill_diag_snap
+    b sdhost_fill_diag_loop
+sdhost_fill_diag_snap:
+    /* BUG caught before shipping (QEMU verification): r7 (words
+     * written so far) can be 16 at this point, but sdhost_diag_
+     * put_hex1 only ever prints a single nibble (`and r0,r0,#0xF`) --
+     * 16 truncates to 0, mislabeling this checkpoint "w0" (same text
+     * as the pre-write snapshot) instead of "w16", even though the
+     * SDEDM VALUE captured is correct either way. Two hex digits
+     * (00/01/04/08/10) removes the ambiguity. */
+    ldr r0, =sdhost_diag_wn
+    bl sdhost_diag_puts
+    mov r0, r7, lsr #4
+    bl sdhost_diag_put_hex1
+    mov r0, r7
+    bl sdhost_diag_put_hex1
+    ldr r0, =sdhost_diag_arrow
+    bl sdhost_diag_puts
+    ldr r0, [r6]
+    bl sdhost_diag_put_hex32
+    mov r0, #10
+    bl sdhost_diag_putc
+    b sdhost_fill_diag_loop
+sdhost_fill_diag_done:
+    pop {r4, r5, r6, r7, r8, lr}
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.section ".rodata"
+sdhost_diag_w0:
+    .asciz "SD DIAG: pre-write(w0) SDEDM="
+sdhost_diag_wn:
+    .asciz "SD DIAG: post-write(w"
+sdhost_diag_arrow:
+    .asciz ") SDEDM="
+.section ".text"
+
+/* void sdhost_diag_putc(r0=char) -- blocking single-byte UART write. */
+sdhost_diag_putc:
+    push {r1, r3}
+sdhost_diag_putc_wait:
+    ldr r1, =0x20201018      /* UART_FR */
+    ldr r3, [r1]
+    tst r3, #0x20             /* TXFF */
+    bne sdhost_diag_putc_wait
+    ldr r1, =0x20201000      /* UART_DR */
+    strb r0, [r1]
+    pop {r1, r3}
+    bx lr
+
+/* void sdhost_diag_puts(r0=&nul-terminated string) -- blocking. */
+sdhost_diag_puts:
+    push {r0, lr}
+    mov r3, r0
+sdhost_diag_puts_loop:
+    ldrb r0, [r3], #1
+    cmp r0, #0
+    beq sdhost_diag_puts_done
+    push {r3}
+    bl sdhost_diag_putc
+    pop {r3}
+    b sdhost_diag_puts_loop
+sdhost_diag_puts_done:
+    pop {r0, lr}
+    bx lr
+
+/* void sdhost_diag_put_hex1(r0=value 0-15) -- one hex digit, blocking. */
+sdhost_diag_put_hex1:
+    push {r0, lr}
+    and r0, r0, #0xF
+    cmp r0, #9
+    addgt r0, r0, #('A' - 10 - '0')
+    add r0, r0, #'0'
+    bl sdhost_diag_putc
+    pop {r0, lr}
+    bx lr
+
+/* void sdhost_diag_put_hex32(r0=value) -- 8 hex digits, blocking. */
+sdhost_diag_put_hex32:
+    push {r0-r3, lr}
+    mov r3, #8
+    mov r2, r0
+sdhost_diag_put_hex32_loop:
+    mov r0, r2, lsr #28
+    bl sdhost_diag_put_hex1
+    mov r2, r2, lsl #4
+    subs r3, r3, #1
+    bne sdhost_diag_put_hex32_loop
+    pop {r0-r3, lr}
+    bx lr
+
 /* TEST-ONLY (round-trip verification for task #3, not part of the
  * driver proper): fill a buffer with a byte pattern (index & 0xFF),
  * and compare two buffers byte-for-byte.
