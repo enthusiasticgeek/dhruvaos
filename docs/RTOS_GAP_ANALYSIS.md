@@ -430,25 +430,43 @@ doesn't yet attempt.
      none of the 65 real privileged call sites below, so it can run in
      genuine USR mode WITHOUT also needing a working SWI trap yet.
 
-  **Real bug found and fixed during implementation, unrelated to the
-  assembly (a vani-compiler register-allocation bug, not a hand-
-  written-asm mistake this time):** the first attempt placed the new
-  USR-stack-allocation vani code directly after `stack_d`'s own
-  allocation, textually between it and `stack_e`/`stack_f`'s later
-  allocations. The compiled result called `task_e_init_stack` with an
-  argument register that still held `stack_a`'s own pointer (never
-  reassigned) instead of `stack_e`'s -- confirmed by direct
-  disassembly, not guessed: a live Data Abort at boot, `section
+  **Real bug found and fixed during implementation, root cause
+  corrected after further investigation (2026-09-18, same day):** the
+  first attempt placed the new USR-stack-allocation vani code directly
+  after `stack_d`'s own allocation, textually between it and `stack_e`/
+  `stack_f`'s later allocations. The compiled result called `task_e_
+  init_stack` with an argument register that still held `stack_a`'s
+  own pointer (never reassigned) instead of `stack_e`'s -- confirmed by
+  direct disassembly, not guessed: a live Data Abort at boot, `section
   permission fault`, at an address that arithmetically matched
   `stack_a`'s pointer + `stack_e_bytes`, an unmistakable register
   mixup. Fixed by relocating the new code to AFTER every task_X_init_
   stack call that reads stack_a/b/c/e/f (verified the fix by direct
   disassembly again before re-running QEMU, not just by the crash
-  disappearing) -- the underlying compiler bug itself (inserting code
-  between an allocation and a LATER, unrelated call site's own use of
-  a different local apparently confuses the register allocator) is a
-  real, separate, upstream finding, not chased further here; worth
-  logging to vani-compiler's own TODO for whoever picks it up.
+  disappearing) -- this relocation fix stands, verified twice over via
+  full pipeline rebuild + live QEMU regression.
+  <br>Originally attributed to a vani-compiler register-allocation
+  bug -- **that attribution was premature and is now corrected**: a
+  follow-up investigation (prompted by the user directly asking to fix
+  and push the vani-compiler bug before continuing) inspected the
+  actual LLVM IR `vanic emit --backend=llvm` produced for the broken
+  source and found it unambiguously correct, ordinary SSA -- the exact
+  value from `stack_e`'s own allocation call, used directly as `task_e_
+  init_stack`'s argument, no aliasing with `stack_a` anywhere in the
+  IR (confirmed vani's own IR generation is deterministic across
+  repeated runs on identical source, byte-identical output). Not a
+  vani-compiler bug. Attempting to reproduce the actual llc-level
+  misregistration in isolation (identical `.ll` by hash, identical
+  `llc` version/flags/target, both the codebase's own default and
+  explicit `-O2`) did NOT reproduce the mixup -- meaning even the
+  "LLVM llc bug" half of the original finding couldn't be pinned to a
+  concrete, reproducible root cause with the investigation time
+  available. Left as a genuinely open, low-priority mystery (something
+  about the full build pipeline's own state differs from the isolated
+  retest in a way not yet identified) rather than a false, confident
+  attribution to either vani-compiler or LLVM -- the shipped code-
+  relocation fix is what actually matters here and is independently
+  verified regardless of the unresolved root cause.
 
   **Verification:** builds clean, `phase4_milestone.py` shows the
   identical pre-existing 4-FAIL baseline with zero new regressions, no

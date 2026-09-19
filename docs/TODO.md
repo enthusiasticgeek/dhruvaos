@@ -7380,13 +7380,20 @@ scheduler_restore_usr_sp called before every restore site that might
 resume a different task, mode-aware lr_usr/sp_usr capture added to
 irq_entry.S/fiq_entry.S, new dhruva_alloc_usrstack_domain (runtime_
 stubs.c) giving IDLE its own separate USR stack inside its existing
-round-192 domain. Full design and the real vani-compiler register-
-allocation bug found+fixed during implementation (inserting new code
-between stack_d's allocation and stack_e/f's later allocations caused
-the compiled task_e_init_stack call to load the wrong register --
-confirmed by direct disassembly, fixed by relocating the new code, the
-underlying compiler bug itself not chased further) are written up in
-full in RTOS_GAP_ANALYSIS.md's own updated entry. Builds clean,
+round-192 domain. Full design and the register-mixup bug found+fixed during
+implementation (inserting new code between stack_d's allocation and
+stack_e/f's later allocations caused the compiled task_e_init_stack
+call to load the wrong register -- confirmed by direct disassembly,
+fixed by relocating the new code) are written up in full in
+RTOS_GAP_ANALYSIS.md's own updated entry -- including a same-day
+correction: originally attributed to a vani-compiler register-
+allocation bug, but a follow-up investigation (direct LLVM IR
+inspection, confirmed deterministic across repeated vanic runs, plus
+an isolated llc re-test at the exact production flags) found vani's
+own generated IR correct and could not reproduce the actual llc-level
+misregistration in isolation either -- not a vani-compiler bug, root
+cause left genuinely unresolved rather than falsely attributed. The
+shipped relocation fix itself is independently verified regardless. Builds clean,
 phase4_milestone.py shows the identical 4-FAIL baseline with zero new
 regressions, no crash, and IDLE's own "idle" print appears 262 times
 across the full log -- confirms it's genuinely executing from USR
