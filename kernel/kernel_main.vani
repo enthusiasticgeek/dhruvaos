@@ -1733,6 +1733,12 @@ extern "C" fn fault_irqburst_countdown_set(v: u32) -> i64;
 extern "C" fn fault_netdrop_countdown_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn fault_netdrop_countdown_set(v: u32) -> i64;
+// ROUND 2026-09-20 (task #279): see fault_inject_state.S's own header
+// comment ("stuck:") for the full design.
+#[stack_cost(bytes=1)]
+extern "C" fn fault_stuck_ticks_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn fault_stuck_ticks_set(v: u32) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -23974,9 +23980,16 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
 // fault_irqburst_take's own comment for why that's a deliberate scope
 // limit). `fault netdrop <n>` (round 62) silently discards the next n
 // outgoing network frames while reporting success, exercising
-// existing TCP timeout/retransmission logic on demand.
+// existing TCP timeout/retransmission logic on demand. `fault stuck
+// <n>` (2026-09-20, task #279) arms task_custom_demo's own NEXT wake
+// cycle to spin for n ticks instead of sleeping, deliberately
+// exercising task #269's per-thread heartbeat detection and task
+// #271's WCET-enforcement eviction on demand -- neither had ever
+// actually fired in any test before this. n should exceed task_
+// custom_demo's own declared heartbeat bound (35 ticks, task_
+// heartbeat_init) with real margin to reliably trigger both.
 fn shell_dispatch_fault(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
-  let usage: Str = "usage: fault alloc|write|irqburst|netdrop <n>\n";
+  let usage: Str = "usage: fault alloc|write|irqburst|netdrop|stuck <n>\n";
   if cmd_end >= line_len {
     let _ = uart_puts(usage);
     return 0;
@@ -24021,6 +24034,13 @@ fn shell_dispatch_fault(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i
     let _ = uart_puts("armed: the ");
     let _ = uart_put_i64(n);
     let _ = uart_puts("th subsequent outgoing network frame will be silently dropped.\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "stuck") == 1 {
+    let _ = fault_stuck_ticks_set(n as u32);
+    let _ = uart_puts("armed: task_custom_demo's next wake cycle will spin for ");
+    let _ = uart_put_i64(n);
+    let _ = uart_puts(" ticks without voluntarily yielding (exercises task #269 heartbeat detection + task #271 WCET-enforcement eviction).\n");
     return 0;
   }
   let _ = uart_puts(usage);
@@ -26657,11 +26677,53 @@ fn task_custom_demo_wake_body() -> i64 {
   return 0;
 }
 
+// ROUND 2026-09-20 (task #279): fault-injection helper -- see fault_
+// inject_state.S's own header comment ("stuck:") for the full design.
+// Deliberately time-based (scheduler_get_tick_count(), the SAME clock
+// task_heartbeat_bound_table is measured against), NOT a raw busy-
+// loop iteration count -- baking in a fixed iteration count here would
+// repeat the exact mistake the SD-driver investigation (tasks #274/
+// #275) just found and fixed the hard way: real Pi 1B silicon and
+// QEMU execute the SAME tight loop at wildly different effective
+// rates (measured ~18.6x apart), so a "safe for both platforms"
+// iteration count doesn't really exist -- a tick-count-based exit
+// condition sidesteps the whole problem by construction, the same way
+// every other real-time duration in this codebase already does.
+// Deliberately never calls task_sleep_ticks or a blocking-mutex call
+// -- this task's own task_heartbeat_last_tick_table entry is
+// genuinely never re-stamped while this runs, exactly simulating a
+// task that stopped making real forward progress. Still gets
+// preempted normally at every real timer tick (this scheduler is
+// FIQ-driven-preemptive, not cooperative -- see timer_tick_dispatch's
+// own header comment) -- other tasks keep running in between, this
+// doesn't freeze the system, it just never voluntarily yields itself.
+#[no_heap]
+fn task_custom_demo_stuck_spin(extra_ticks: u32) -> i64 {
+  let start_tick: u32 = scheduler_get_tick_count();
+  let target_tick: u32 = start_tick + extra_ticks;
+  while scheduler_get_tick_count() < target_tick {
+    // Real MMIO read as the loop's own body -- matches this codebase's
+    // established tight-poll idiom (e.g. sdhost_wait_transfer_
+    // complete's own loop) rather than an empty block.
+    let _ = mmio_read_u32(TIMER_CLO);
+  }
+  return 0;
+}
+
 #[no_mangle]
 #[bounded_stack(bytes=512)]
 fn task_custom_demo() -> i64 {
   while true {
-    let _ = task_sleep_ticks(7);
+    let stuck_ticks: u32 = fault_stuck_ticks_take();
+    if stuck_ticks > (0 as u32) {
+      let _ = uart_puts("CUSTOM: fault-injected stuck spin, ");
+      let _ = uart_put_i64(stuck_ticks as i64);
+      let _ = uart_puts(" ticks, no voluntary yield\n");
+      let _ = task_custom_demo_stuck_spin(stuck_ticks);
+      let _ = uart_puts("CUSTOM: stuck spin finished, resuming normal operation\n");
+    } else {
+      let _ = task_sleep_ticks(7);
+    }
     let _ = task_custom_demo_wake_body();
   }
   return 0;
@@ -36497,6 +36559,17 @@ fn fault_netdrop_maybe_inject() -> u32 {
     return 1 as u32;
   }
   return 0 as u32;
+}
+
+// ROUND 2026-09-20 (task #279): same "arm the size directly, self-
+// disarm" shape as fault_irqburst_take above -- see fault_inject_
+// state.S's own header comment ("stuck:") for the full design.
+fn fault_stuck_ticks_take() -> u32 {
+  let n: u32 = fault_stuck_ticks_get();
+  if n > (0 as u32) {
+    let _ = fault_stuck_ticks_set(0 as u32);
+  }
+  return n;
 }
 
 // Round 100 -- X25519 (and the bignum/field25519 foundation it and

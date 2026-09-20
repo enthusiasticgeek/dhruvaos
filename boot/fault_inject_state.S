@@ -34,7 +34,20 @@
  *           never learns a "send" call was internally faked), letting
  *           existing timeout/retransmission logic (round 37) be
  *           exercised on demand in a live session instead of only via
- *           test/*.py's own synthetic packet-loss construction. */
+ *           test/*.py's own synthetic packet-loss construction.
+ * stuck:    ROUND 2026-09-20 (task #279): arms task_custom_demo's own
+ *           NEXT wake cycle to spin (via scheduler_get_tick_count(),
+ *           never calling task_sleep_ticks) for N ticks instead of
+ *           sleeping normally -- deliberately exercising task #269's
+ *           per-thread heartbeat detection and task #271's WCET-
+ *           enforcement eviction, neither of which had ever actually
+ *           fired in any test before this (diagnose always read 0 for
+ *           both, every run, since nothing had ever made a task
+ *           genuinely overrun its own declared bound). Same "arm the
+ *           size directly, self-disarm on next real trigger" shape as
+ *           irqburst above, not the Nth-call countdown shape -- a
+ *           stuck episode, like a burst, is logically "the very next
+ *           one," not "the Nth future one." */
 
 .section ".bss"
 .align 4
@@ -43,6 +56,8 @@ fault_write_countdown:
 fault_irqburst_countdown:
     .word 0
 fault_netdrop_countdown:
+    .word 0
+fault_stuck_ticks:
     .word 0
 
 .section ".text"
@@ -82,6 +97,19 @@ fault_netdrop_countdown_get:
 .global fault_netdrop_countdown_set
 fault_netdrop_countdown_set:
     ldr r1, =fault_netdrop_countdown
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global fault_stuck_ticks_get
+fault_stuck_ticks_get:
+    ldr r0, =fault_stuck_ticks
+    ldr r0, [r0]
+    bx lr
+
+.global fault_stuck_ticks_set
+fault_stuck_ticks_set:
+    ldr r1, =fault_stuck_ticks
     str r0, [r1]
     mov r0, #0
     bx lr
