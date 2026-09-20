@@ -9133,3 +9133,60 @@ as a now-more-justified controlled experiment given how much has
 already been ruled out, or accepting this as a real hardware
 limitation of this specific peripheral/card pairing and prioritizing
 the already-supported USB mass storage block-device backend instead).
+
+### Seventeenth SD round: third independent reference driver (FreeBSD) cross-checked, a genuinely new gap found and instrumented (2026-09-20)
+
+User's own explicit follow-up: "did you miss any other comparisons
+with known good reference sd host drivers for bcm2835 or other rpi 1b
+chips meticulously?" -- a fair challenge, since Linux and U-Boot's own
+`bcm2835-sdhost.c`/`bcm2835_sdhost.c` share the same original
+reverse-engineering lineage and could plausibly share the same blind
+spot. Checked whether a genuinely INDEPENDENT third implementation
+exists: FreeBSD does have its own
+`sys/arm/broadcom/bcm2835/bcm2835_sdhost.c` (production-grade, ships
+on real hardware -- FreeBSD's Pi 1/Zero support has no other SD
+interface to fall back to, so this driver has to genuinely work),
+architecturally built as an SDHCI-register-shim rather than a native
+MMC host driver -- a real, different codebase, not just another copy.
+
+Two findings from a careful read:
+
+1. FreeBSD's own reset function uses `DELAY(250000)` (250ms) around
+   both the FIFO-threshold config write and the power-on cycle --
+   12.5x more generous than U-Boot's own 20ms this project already
+   matched (task #275). Checked whether this changes anything: it
+   doesn't. Task #274's own accidentally-mis-sized `delay(1200000)`
+   already gave ~372ms per call in the 15th round -- MORE generous
+   than FreeBSD's 250ms -- and the wedge reproduced identically
+   anyway. The settle-delay-magnitude question was already answered
+   conclusively before this round even started; FreeBSD's own larger
+   number doesn't reopen it.
+
+2. A genuinely new difference, not previously tested: FreeBSD's own
+   `bcm_sdhost_write_multi_4` explicitly polls the SAME FIFO-occupancy
+   field this project's own fill loop already reads
+   (`(SDEDM>>4)&0x1F`) down to exactly 0 -- "wait until FIFO is really
+   empty", its own comment -- immediately after pushing every word,
+   BEFORE ever checking FSM state at all. Neither Linux's nor U-Boot's
+   own PIO fill loop does this (confirmed by re-reading both again
+   specifically for this), and neither did DhruvaOS's own `sdhost_
+   fill_fifo_from_buffer(_diag)` -- it stops the instant there's room
+   for the last word, then goes straight to FSM-based `sdhost_wait_
+   transfer_complete`, never confirming the FIFO itself actually
+   finished draining to the card first.
+
+Added this missing step as new instrumentation in `sdhost_write_
+block_once` (commit `53005a1`): a bounded (1,000,000-iteration) poll
+of FIFO occupancy to 0, with a real diagnostic print on timeout. This
+is genuinely new evidence regardless of outcome -- no prior diagnostic
+in this 17-round investigation has ever read FIFO occupancy at this
+exact point, only FSM state. If the wedge resolves, the fill loop was
+returning before the FIFO genuinely drained and FSM state was never
+going to unstick on its own without this. If it doesn't (FIFO reads 0
+immediately, same as before), that's still real information: it rules
+out "FIFO itself stuck non-empty" as a category and confirms the
+wedge is purely an FSM-state phenomenon, narrowing the search further
+than it's ever been narrowed before. Two identical `phase4_
+milestone.py` runs confirm zero regression. Needs a fresh real-HW
+retest -- the new diagnostic print (if it fires) or the wedge simply
+resolving are both real, actionable outcomes either way.
