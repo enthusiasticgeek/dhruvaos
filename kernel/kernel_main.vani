@@ -4262,6 +4262,18 @@ extern "C" fn enable_irqs() -> i64;
 // trying again, or accepting QEMU-based regression testing gets
 // slower as a real tradeoff and adjusting the test harness's own
 // timing budgets accordingly -- not attempted here.
+//
+// ROUND 2026-09-20 (task #272): the PERIOD itself still isn't touched
+// here -- that re-attempt needs the cycle-counter prerequisite above
+// regardless -- but every wall-clock-meaningful tick constant this
+// codebase has (tcp_rtx_timeout_ticks, dhcp_client_check_lease's own
+// ticks_per_second, auth_lockout_ticks) now DERIVES its tick count
+// from this function at runtime instead of hardcoding one, closing
+// the actual root cause behind round 191's own revert (and its own
+// auth_lockout_ticks near-miss): a future change to the return value
+// below now automatically rescales every real-time duration in this
+// codebase correctly, rather than requiring a manual, error-prone
+// audit of every call site the way round 191 needed.
 fn scheduler_tick_interval_us() -> u32 {
   return 500000 as u32;
 }
@@ -13445,19 +13457,32 @@ fn tcp_state_closed_final() -> u32 { return 5 as u32; }
 // own FIN_WAIT/CLOSING branches below.
 fn tcp_state_closing() -> u32 { return 6 as u32; }
 
-// Round 37: retransmission timing constants. 4 ticks (timer_ic_init's
-// own 500ms compare interval -- confirmed against that function's own
-// comment) = 2 real seconds, short enough for a live test to actually
-// wait one out without an excessive delay, long enough to be a real
-// timeout rather than firing on ordinary scheduling jitter. 3 retries
-// before giving up, matching this project's own established "bounded,
-// not forever" polling discipline used everywhere else.
+// Round 37: retransmission timing constants. 2 real seconds, short
+// enough for a live test to actually wait one out without an
+// excessive delay, long enough to be a real timeout rather than
+// firing on ordinary scheduling jitter. 3 retries before giving up,
+// matching this project's own established "bounded, not forever"
+// polling discipline used everywhere else.
 //
 // (Round 191, 2026-09-13: briefly rescaled to 20 for an attempted
 // 100ms tick, reverted along with scheduler_tick_interval_us itself --
-// see that function's own comment for why.)
+// see that function's own comment for why. ROUND 2026-09-20, task
+// #272: that revert's real root cause -- a hardcoded tick count
+// silently meaning a different real duration whenever the tick period
+// changes -- is fixed here properly instead of just reverted around
+// again: this function now DERIVES its own tick count from the real
+// 2-second duration it actually means, divided by whatever scheduler_
+// tick_interval_us currently is (ceiling division, so the real timeout
+// never comes in SHORTER than intended). At today's unchanged 500ms
+// tick this returns exactly 4, the same literal this function always
+// returned -- a pure decoupling, not a behavior change. The tick
+// PERIOD itself is deliberately still untouched this round; this is
+// the prerequisite task #243/#247's own findings called for before
+// ever revisiting that.)
 fn tcp_rtx_timeout_ticks() -> u32 {
-  return 4 as u32;
+  let tick_us: u32 = scheduler_tick_interval_us();
+  let real_us: u32 = 2000000 as u32; // 2 real seconds
+  return (real_us + tick_us - (1 as u32)) / tick_us;
 }
 fn tcp_rtx_max_retries() -> u32 {
   return 3 as u32;
@@ -14733,13 +14758,23 @@ fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
 // never sent option 51 -- see dhcp_lease_time's own .bss comment).
 // All three thresholds (T1, T2, final expiry) are measured as elapsed
 // ticks from the SAME lease_start_tick throughout -- per spec, not
-// reset at each RENEWING/REBINDING transition. Ticks run at 2/second
-// (timer_ic_init's own 500ms compare interval), computed here rather
-// than assumed inline so the arithmetic's own units are visible at
-// every step: T1 = lease/2, T2 = lease*7/8, both converted from
-// seconds to ticks by the same factor. (Round 191, 2026-09-13: briefly
-// 10/second for an attempted 100ms tick, reverted -- see scheduler_
-// tick_interval_us's own comment for why.)
+// reset at each RENEWING/REBINDING transition. Ticks run at
+// 1000000/scheduler_tick_interval_us() per second (today that's
+// 2/second, from the 500ms compare interval -- DERIVED below, not a
+// literal, since round 191's own revert; see scheduler_tick_interval_
+// us's own comment) -- computed here rather than assumed inline so
+// the arithmetic's own units are visible at every step: T1 = lease/2,
+// T2 = lease*7/8, both converted from seconds to ticks by the same
+// factor. (Round 191, 2026-09-13: briefly 10/second for an attempted
+// 100ms tick, reverted -- see scheduler_tick_interval_us's own
+// comment for why. ROUND 2026-09-20, task #272: the literal `2` that
+// caused that revert's own silent-rescale risk is now derived from
+// the real tick period instead of hardcoded -- same reasoning as
+// tcp_rtx_timeout_ticks's own header comment above in this file.
+// Integer division: exact at today's 500ms tick (1000000/500000=2);
+// a future tick period that doesn't evenly divide 1000000 would round
+// down here, a known, accepted approximation, not attempted or
+// needed this round since the tick period itself stays unchanged.)
 //
 // Deliberately sends at most ONE attempt per threshold (no
 // retransmission/backoff while RENEWING) -- matching this client's
@@ -14760,7 +14795,7 @@ fn dhcp_client_check_lease(my_mac: mut ref i64) -> i64 {
     return 0;
   }
 
-  let ticks_per_second: i64 = 2;
+  let ticks_per_second: i64 = 1000000 / (scheduler_tick_interval_us() as i64);
   let lease_ticks: i64 = (lease_time as i64) * ticks_per_second;
   let t1_ticks: i64 = lease_ticks / 2;
   let t2_ticks: i64 = (lease_ticks * 7) / 8;
@@ -27687,16 +27722,27 @@ fn auth_is_weak_password(pw: mut ref i64, pw_len: i64) -> i64 {
   return 0;
 }
 
-// Failed-attempt rate limiting: 3 strikes locks the account for 20
-// ticks (10s at this project's 500ms tick). Per-slot, not global --
-// see boot/auth_state.S's own file comment on why a lockout on one
-// user must not also block a different user. (Round 191, 2026-09-13:
-// briefly 100 for an attempted 100ms tick -- a real audit catch, this
-// is a security-relevant constant that would have silently shrunk to
-// 1/5th its real duration otherwise -- reverted along with the tick
-// period itself; see scheduler_tick_interval_us's own comment for why.)
+// Failed-attempt rate limiting: 3 strikes locks the account for 10
+// real seconds. Per-slot, not global -- see boot/auth_state.S's own
+// file comment on why a lockout on one user must not also block a
+// different user. (Round 191, 2026-09-13: briefly 100 for an
+// attempted 100ms tick -- a real audit catch, this is a security-
+// relevant constant that would have silently shrunk to 1/5th its real
+// duration otherwise -- reverted along with the tick period itself;
+// see scheduler_tick_interval_us's own comment for why. ROUND
+// 2026-09-20, task #272: fixed properly instead of just reverted
+// around again -- this function now DERIVES its tick count from the
+// real 10-second duration it actually means, same reasoning as tcp_
+// rtx_timeout_ticks's own header comment above in this file. At
+// today's unchanged 500ms tick this still returns exactly 20 -- a
+// pure decoupling, not a behavior change. This was the ONE constant
+// round 191's own audit found NOT rescaled correctly the first time,
+// a real illustration of exactly the silent-shrink risk this whole
+// task #272 exists to close for good.)
 fn auth_lockout_ticks() -> u32 {
-  return 20 as u32;
+  let tick_us: u32 = scheduler_tick_interval_us();
+  let real_us: u32 = 10000000 as u32; // 10 real seconds
+  return (real_us + tick_us - (1 as u32)) / tick_us;
 }
 fn auth_max_fail_attempts() -> u32 {
   return 3 as u32;

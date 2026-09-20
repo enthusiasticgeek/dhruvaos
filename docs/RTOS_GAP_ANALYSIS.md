@@ -162,6 +162,30 @@ doesn't yet attempt.
   own precedent for real-hardware-dependent, high-blast-radius risk
   (task #246's own FIQ finding, Pi 4/5 work "ON HOLD, no real HW
   planned").
+
+  **Prerequisite closed, task #272 (2026-09-20)**: the constant-
+  rescaling audit round 191/243 both called for as the real
+  prerequisite before ever touching the tick period again is now done
+  — `tcp_rtx_timeout_ticks`, DHCP's own `ticks_per_second` (inside
+  `dhcp_client_check_lease`), and `auth_lockout_ticks` no longer
+  hardcode a tick count; each now DERIVES it from the real duration it
+  actually means (2 real seconds, 1 real second, 10 real seconds
+  respectively) divided by `scheduler_tick_interval_us()` at runtime.
+  A future change to that one function's return value now
+  automatically rescales all three correctly, closing the exact root
+  cause behind round 191's own revert on its own terms — no more
+  manual, error-prone, whole-codebase audit needed before ever
+  re-attempting a finer tick (or tickless) again. The tick PERIOD
+  itself is deliberately still untouched this round (still 500ms) —
+  at that unchanged value, all three functions return exactly their
+  old literal results (4/2/20), a pure decoupling verified by hand,
+  not a behavior change; two identical `phase4_milestone.py` runs
+  (including `tcprtx`, which directly exercises `tcp_rtx_timeout_
+  ticks`) confirm zero regression. Whether to actually attempt a finer
+  tick or tickless design again, now that this prerequisite is closed,
+  remains a separate decision — task #243/#247's own real-hardware and
+  schedulability-margin reasoning above for NOT attempting it yet
+  still applies unchanged.
 - ~~**No formal schedulability analysis.** Priorities are hand-assigned;
   there is no tool computing a utilization bound (rate-monotonic) or
   running a response-time analysis across the declared task set's
