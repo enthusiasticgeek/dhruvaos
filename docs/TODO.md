@@ -8466,3 +8466,83 @@ explain or fix the ORIGINAL data-phase wedge (FSM stuck in WRITEDATA
 from word 1 through word 128, FIFO empty throughout, block 2100's own
 first write attempt), which remains a separate, still-unexplained
 failure mode.
+
+**Twelfth round (2026-09-20): FreeRTOS/Zephyr checked at user's
+request (neither applicable), Linux mainline's own wait-loop confirmed
+IDENTICAL to ours -- software references now exhausted.** Fresh
+real-HW log (`picocom_20260920_083637.log`) shows the unchanged
+symptom: `SDEDM=0x00010803` (FSM=WRITEDATA, FIFO empty) pinned across
+every post-write checkpoint, at all three adaptive-backoff clock
+speeds, `wait_transfer_complete` timeout every time. User separately
+confirmed the physical card-lock switch is unlocked (rules out simple
+write-protection).
+
+Checked whether FreeRTOS or Zephyr support the original Pi 1B
+(BCM2835/ARM1176) as an additional reference. Neither does: Zephyr's
+own supported Raspberry Pi boards (`boards/raspberrypi/`) are
+`rpi_4b`/`rpi_5`/`rpi_debug_probe`/`rpi_pico`/`rpi_pico2`/
+`rpi_zero_2w` only, and `drivers/sdhc/` has no BCM2835-SDHOST driver
+at all. FreeRTOS has no official Raspberry Pi board support in its
+own GitHub org repos at all. Linux's `bcm2835-sdhost.c` and U-Boot's
+`bcm2835_sdhost.c` remain the only two real references for this exact
+peripheral.
+
+Re-fetched Linux `bcm2835-sdhost.c` fresh and read its own
+`bcm2835_sdhost_wait_transfer_complete` line-by-line (not the U-Boot
+variant checked in round 8) -- structurally identical to this
+driver's own function for the write case. Two findings: (1) Linux's
+mainline version does NOT force-exit on READDATA unconditionally the
+way U-Boot's does (that fix, round 8, was based on U-Boot's more
+aggressive variant); (2) **Linux's own reference has no escape hatch
+for a genuinely stuck WRITEDATA state either** -- if FSM never reaches
+WRITESTART1 or idle, Linux's own loop spins until its own
+100000-iteration bound, then reports `-ETIMEDOUT` and returns. The
+authoritative reference driver, if it saw exactly what real hardware
+is showing, would ALSO time out. Also re-confirmed the FIFO-fill
+loop's own polling logic against Linux's `bcm2835_sdhost_write_block_
+pio`: FIFO reading 0 at every diagnostic checkpoint is the expected,
+healthy pattern for a write where the SD bus drains faster than the
+CPU polling loop fills it, not evidence of a stuck FIFO -- ruled out
+an emerging hypothesis before shipping anything on it.
+
+No code changes this round -- twelve real-hardware rounds have now
+exhausted every concrete software-level divergence available from
+both real reference drivers; shipping another speculative register
+guess would repeat exactly the pattern this investigation's own
+memory already warns against.
+
+**Thirteenth round (2026-09-20): user correctly pushed back on "try a
+different card" -- reframed, new CMD13 (SEND_STATUS) card-status
+diagnostic shipped instead.** User: "i have transcend class 10 64 GB
+45MB/sec 300x SD/HC that you are testing. so if card is bad then why
+can you read and wformat and write correctly?" -- fair correction: the
+card demonstrably works fine through a normal PC reader.
+
+The reframing that survives it: a PC's SD reader is a far more capable
+host controller (UHS, DMA, engineered signal integrity) than the
+RPi's own legacy 2012-era PIO-only "sdhost" peripheral, which this
+project has already found two confirmed real silicon errata in. A
+card working through one controller says nothing about a different
+controller's own edge cases. The GPU firmware's own read of
+`kernel.img` through this EXACT peripheral, with this EXACT card,
+succeeds every boot (visible in every log's own opening lines) --
+more relevant same-peripheral evidence than "works on a PC," and it's
+read-only; no write has ever succeeded through this peripheral with
+this card anywhere, DhruvaOS's own code included.
+
+Instead of another card-swap suggestion, shipped commit `a8c03cb`:
+CMD13 (SEND_STATUS), issued right after wedge detection in
+`sdhost_write_block_once`, asks the CARD ITSELF what state it
+believes it's in -- every diagnostic across 12 prior rounds has only
+ever read the CONTROLLER's own registers (SDEDM/SDHSTS/SDHBCT/
+SDHBLC). Prints the card's full 32-bit R1 status word (decodable
+against the SD spec's own error bits: OUT_OF_RANGE, WP_VIOLATION,
+COM_CRC_ERROR, ILLEGAL_COMMAND, CARD_ECC_FAILED, CC_ERROR, ERROR) plus
+CURRENT_STATE. Best-effort: times out gracefully (and prints that) if
+the controller is too wedged to even issue CMD13.
+
+Verified: two identical `phase4_milestone.py` runs, byte-for-byte
+matching, zero regression (QEMU's SD model never wedges, path stays
+dormant under test as expected). Needs a fresh real-HW log -- this is
+the first time this investigation will have direct card-side evidence
+rather than only controller-side.
