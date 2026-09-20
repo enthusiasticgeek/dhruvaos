@@ -4727,20 +4727,53 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // today. SDEDM bits [18:14] = read threshold, [13:9] = write
   // threshold (5-bit fields each); real driver sets both to 4
   // (FIFO_READ_THRESHOLD/FIFO_WRITE_THRESHOLD). A documented silicon
-  // errata workaround, not a guess -- not yet confirmed by a real-
-  // hardware log with this fix in place.
+  // errata workaround, not a guess. CONFIRMED, 2026-09-20 (task
+  // #273-followup, real-hardware log picocom_20260920_133428.log):
+  // this register write alone is NOT sufficient -- the write wedge
+  // (FSM stuck at WRITEDATA=3, SDEDM=0x10803, confirmed via the new
+  // CMD13 SEND_STATUS diagnostic that the controller's own COMMAND
+  // path is completely unresponsive at that point, not just the data
+  // path) still reproduces with this fix active. See the two new
+  // settle delays immediately below for the real, still-missing piece
+  // this finding led to.
   let edm_pre: u32 = mmio_read_u32(sdedm);
   let edm_threshold_mask: u32 = ((0x1F << 14) | (0x1F << 9)) as u32;
   let edm_threshold_val: u32 = ((4 << 14) | (4 << 9)) as u32;
   let edm_fixed: u32 = (edm_pre & (edm_threshold_mask ^ (0xFFFFFFFF as u32))) | edm_threshold_val;
   let _ = mmio_write_u32(sdedm, edm_fixed);
 
+  // ROUND 2026-09-20 (task #273-followup): U-Boot's own bcm2835_
+  // sdhost.c (drivers/mmc/bcm2835_sdhost.c, fetched fresh) does NOT
+  // proceed straight from this exact SDEDM threshold write to the
+  // SDVDD power cycle the way this function always has -- it inserts
+  // `msleep(20)` immediately after, with its own explicit comment:
+  // "Wait for FIFO threshold to populate". This driver had NO delay
+  // at all here before now -- a real, reference-documented settle
+  // requirement this codebase was silently skipping. delay(N)'s own
+  // real measured cost (delay_wcet_measure_self_test's own finding,
+  // delay(3000000)=49906us) puts 20ms at delay(1200000).
+  let _ = delay(1200000);
+
   // Power off, then back on -- a clean, known starting FSM state
   // rather than trusting whatever QEMU's reset default happens to be.
+  // ROUND 2026-09-20 (task #273-followup): U-Boot's own reference
+  // sequence settles for a full `msleep(20)` -- "Wait for all
+  // components to go through power on cycle" -- after asserting
+  // SDVDD_POWER_ON; this codebase's own pre-existing delay(10000)
+  // here measures to only ~166us (delay(3000000)=49906us, ~0.0166us/
+  // iteration), roughly 120x shorter than the reference driver's own
+  // real, presumably electrically-motivated (voltage-rail/card-side
+  // power-on-reset settling, not a software artifact QEMU's own
+  // idealized SD model would ever need or expose) value. Bumped to
+  // delay(1200000) (~20ms) on both sides of the power cycle to match
+  // U-Boot's own real, working sequence exactly rather than guess at
+  // a smaller number -- real-hardware-only timing sensitivity,
+  // consistent with this whole investigation's own recurring theme
+  // (QEMU's SD model has no analog realism to ever surface this).
   let _ = mmio_write_u32(sdvdd, 0 as u32);
-  let _ = delay(10000);
+  let _ = delay(1200000);
   let _ = mmio_write_u32(sdvdd, 1 as u32);
-  let _ = delay(10000);
+  let _ = delay(1200000);
 
   // Identification-speed clock divisor and a generous command
   // timeout -- real-hardware bcm2835-sdhost values, not QEMU-specific
