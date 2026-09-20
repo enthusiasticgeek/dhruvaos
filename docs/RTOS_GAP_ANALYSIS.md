@@ -197,9 +197,10 @@ doesn't yet attempt.
   WCET only covers the demo set's dominant terms, not a hypothetical
   production workload — the tool and method are proven, not every
   future workload.
-- **No aperiodic/sporadic server.** Interrupt-triggered, non-periodic work
-  (e.g. UART RX) runs directly in `irq_dispatch`, not budgeted against any
-  task's own time allowance.
+- ~~**No aperiodic/sporadic server.**~~ **`[DONE, task #242, 2026-09-18]`**
+  — UART RX interrupt work now runs against a real sporadic-server-style
+  budget (`uart_rx_irq_*`, `kernel/kernel_main.vani`), checked every
+  tick and every IRQ entry.
 
 ## 2. Interrupt handling gaps
 
