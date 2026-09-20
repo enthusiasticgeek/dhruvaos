@@ -36334,7 +36334,17 @@ fn kernel_main() -> i64 {
   let stack_d_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 3 as u32);
   let stack_d_usr_top: mut ref i64 = stack_region_top(stack_d_usr, stack_bytes);
   let _ = usr_sp_table_set_at(3 as u32, stack_d_usr_top);
-  let sp_e: mut ref i64 = task_e_init_stack(stack_e, stack_e_bytes);
+  // Task #262 (2026-09-20), one-task-at-a-time rollout, fourth task --
+  // index 4, early-seed safe (never kernel_main's own boot-time
+  // current_task default of 0). task_e/GC has the deepest, most
+  // DharaFS-heavy call chain of any task here (round-4 audit's own
+  // reason for its larger stack_e_bytes allocation) -- the most
+  // demanding conversion yet, verified with its own dedicated
+  // regression pass rather than assumed safe by analogy.
+  let sp_e: mut ref i64 = task_e_init_stack_usr(stack_e, stack_e_bytes);
+  let stack_e_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_e_bytes as u32, 4 as u32);
+  let stack_e_usr_top: mut ref i64 = stack_region_top(stack_e_usr, stack_e_bytes);
+  let _ = usr_sp_table_set_at(4 as u32, stack_e_usr_top);
   let sp_f: mut ref i64 = task_f_init_stack(stack_f, stack_f_bytes);
 
   // Round 54: live demonstration of the new task_create API -- a
