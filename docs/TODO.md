@@ -8218,14 +8218,48 @@ both from round 5's SWI-trap hardening) -- reinforcing that the earlier
 and that the actual unblock was the correctness fix, not a performance
 one.
 
-**Task #262's remaining scope** (converting task_b/c/e/f, plus the rest
-of the "all tasks USR mode" goal) is now considerably less risky than
-before -- the specific mechanism that broke every earlier one-task-at-a-
-time attempt is fixed and independently verified -- but each remaining
-task still needs its own live regression pass before conversion, one at
-a time, per this round's own now-twice-proven discipline (build, dual
-`phase4_milestone.py` runs, direct log inspection for cycle counts and
-FATAL lines) rather than an all-at-once attempt.
+**Task #262 fully completed the same day (2026-09-20)**, immediately
+following task_a's own re-enable above, by continuing the proven one-
+task-at-a-time discipline (build, dual `phase4_milestone.py` runs,
+direct log inspection for cycle counts and FATAL lines) through the
+rest of the roster:
+
+- **task_b** (index 1): re-enabled via `task_b_init_stack_usr` +
+  early `usr_sp_table_set_at(1,...)` (safe early, unlike task_a's own
+  index-0 collision with kernel_main's boot-time `current_task`
+  default). Two identical runs: 453 MEDIUM/HIGH/LOW cycles, zero
+  FATAL. Commit `7382f6b`.
+- **task_c** (index 2): same pattern. Two identical runs: 453 cycles,
+  zero FATAL. Commit `3507bb7`.
+- **task_e/GC** (index 4), the most DharaFS-call-chain-heavy
+  conversion yet (its own larger `stack_e_bytes` allocation, round-4
+  audit): same pattern. Two identical runs: 48 GC critical-section
+  cycles, zero FATAL. Commit `ff64cf3`.
+- **task_f** (index 5), the interactive shell -- every SD/DharaFS/
+  crypto/network command dispatches from here, by far the deepest
+  call chain and largest stack (262144 bytes) of any task, sized
+  identically for its USR-mode counterpart rather than reusing the
+  stock 4096-byte allocation every other task above got: same
+  pattern. Two identical, BYTE-FOR-BYTE matching runs (`diff` empty),
+  `write`/`cat`/`eval` (all shell-dispatched) all pass, zero FATAL.
+  Commit `0e390bb`.
+- **The 4 dynamically-created tasks** (`task_custom_demo`, `task_
+  mutex_demo_low`/`_high`, `task_fsq`, created via `task_create` at
+  runtime, not compile-time) were still calling the plain SVC-mode
+  `task_create` even after all 6 static tasks were converted --
+  `task_create_usr` already existed but was unused. Since a dynamic
+  task's slot index is only known after the call returns (unlike the
+  6 fixed tasks), the `usr_sp_table` seed necessarily happens AFTER
+  `task_create_usr`, not before -- safe regardless, since every
+  dynamic slot is >= 6, never index 0. Two identical runs: correct
+  task IDs (6,7,8,9), 425 combined dynamic-task activity lines both
+  times, zero FATAL. Commit `00e84da`.
+
+**All 10 tasks in this project (6 static + 4 dynamic) now run in USR
+mode**, each independently verified via its own dual-run regression
+pass -- task #253/#262's privilege-separation goal, open since the
+first USR-mode attempt (round 1 of this same comment chain), is
+complete. Pushed to origin master/pi4/main (`00e84da`).
 
 **SD wedge: sixth fix attempt, real register-level divergence from
 Linux found and fixed (2026-09-19), against a fresh real-HW log
