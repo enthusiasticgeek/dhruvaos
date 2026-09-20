@@ -36345,7 +36345,21 @@ fn kernel_main() -> i64 {
   let stack_e_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_e_bytes as u32, 4 as u32);
   let stack_e_usr_top: mut ref i64 = stack_region_top(stack_e_usr, stack_e_bytes);
   let _ = usr_sp_table_set_at(4 as u32, stack_e_usr_top);
-  let sp_f: mut ref i64 = task_f_init_stack(stack_f, stack_f_bytes);
+  // Task #262 (2026-09-20), one-task-at-a-time rollout, fifth and
+  // final task -- index 5, early-seed safe. task_f is the interactive
+  // shell: the deepest, most varied call chain of any task here
+  // (every shell command -- SD/DharaFS/crypto/network -- dispatches
+  // from this task), and the reason its own stack_f_bytes (262144) is
+  // far larger than any other task's. Given its own USR-mode stack
+  // must be equally generous (whatever depth the SVC-side stack needs,
+  // the USR-side one -- where the shell's own vani code actually
+  // executes post-conversion -- needs at least as much), sized
+  // identically rather than reusing the stock 4096-byte allocation
+  // every other USR-mode task above gets.
+  let sp_f: mut ref i64 = task_f_init_stack_usr(stack_f, stack_f_bytes);
+  let stack_f_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_f_bytes as u32, 5 as u32);
+  let stack_f_usr_top: mut ref i64 = stack_region_top(stack_f_usr, stack_f_bytes);
+  let _ = usr_sp_table_set_at(5 as u32, stack_f_usr_top);
 
   // Round 54: live demonstration of the new task_create API -- a
   // genuinely dynamically-created 7th task, not one of the 6 built in
