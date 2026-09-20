@@ -108,6 +108,7 @@ sleep_until_table:
                           * sentinel is what actually keeps
                           * scheduler_pick_next from ever picking it,
                           * regardless of this table's own value there) */
+.global tick_count
 tick_count:
     .word 0
 /* task #253: .global so irq_entry.S/fiq_entry.S's own new mode-aware
@@ -118,6 +119,7 @@ tick_count:
 .global current_task
 current_task:
     .word 0
+.global context_switch_count
 context_switch_count:
     .word 0             /* Round 53: total number of times scheduler_
                          * pick_next actually changed current_task to a
@@ -369,7 +371,11 @@ sleep_ticks_diag_last_outgoing:
     .word 0
 /* Task #253 Phase 3 bug-B investigation (2026-09-19) -- caps sleep_
  * ticks_diag_print at 8 total firings, see that print's own call site
- * for the full "why". */
+ * for the full "why". .global so boot/fiq_entry.S's own matching
+ * diagnostic (investigating whether task_a's SECOND, tick-driven
+ * resume ever reaches that restore path at all) can share the same
+ * cap rather than doubling the cumulative print cost. */
+.global sleep_ticks_diag_fire_count
 sleep_ticks_diag_fire_count:
     .word 0
 mutex_block_start_tick_table:
@@ -1475,6 +1481,7 @@ sleep_ticks_diag_skip:
  * is root-caused. Only ever touches r0-r3 -- see sleep_ticks_diag_print
  * itself, the only entry point this file's own diagnostic code calls;
  * the other three are its own internal helpers, called only from here. */
+.global sched_diag_putc
 sched_diag_putc:
     push {r1, r3}
 sched_diag_putc_wait:
@@ -1487,6 +1494,7 @@ sched_diag_putc_wait:
     pop {r1, r3}
     bx lr
 
+.global sched_diag_puts
 sched_diag_puts:
     push {r0, lr}
     mov r3, r0
@@ -1502,6 +1510,7 @@ sched_diag_puts_done:
     pop {r0, lr}
     bx lr
 
+.global sched_diag_put_hex1
 sched_diag_put_hex1:
     push {r0, lr}
     and r0, r0, #0xF
@@ -1512,6 +1521,7 @@ sched_diag_put_hex1:
     pop {r0, lr}
     bx lr
 
+.global sched_diag_put_hex32
 sched_diag_put_hex32:
     push {r0-r3, lr}
     mov r3, #8

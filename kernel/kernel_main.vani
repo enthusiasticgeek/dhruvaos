@@ -35838,18 +35838,10 @@ fn kernel_main() -> i64 {
   // task_a's own USR-mode stack allocation (dhruva_alloc_usrstack_
   // domain(stack_bytes, 0)) + deferred usr_sp_table seed would belong
   // here / right before start_multitasking respectively -- omitted
-  // while task_a stays reverted to plain SVC. Two live A/B re-attempts
-  // this round (2026-09-19): #1 hit a Data Abort that turned out to be
-  // caused by this investigation's OWN diagnostic tooling (sleep_ticks_
-  // diag_print, context_switch.S -- fixed, see that function's own
-  // header comment), NOT a real task_a/USR-mode bug -- confirmed via a
-  // control run (task_a back in SVC, identical crash reproduced). #2,
-  // with the diagnostic fixed, confirmed task_a's own first involuntary
-  // resume genuinely works, but reproduced a real, still-open total
-  // system freeze (not just shell starvation) after task_a's SECOND
-  // wake cycle -- see this function's own task_a setup site below for
-  // the full account. Restore both lines when task_a is next
-  // re-attempted.
+  // while task_a stays reverted to plain SVC. See this function's own
+  // task_a setup site below for the full round-4 finding: a real,
+  // decisive fault signature captured live (GDB), but root cause NOT
+  // YET FOUND. Restore both lines when task_a is next re-attempted.
   let stack_b: mut ref i64 = dhruva_alloc_stack_domain(stack_bytes as u32, 1 as u32);
   let _ = stack_canary_set_base(1 as u32, stack_b);
   let stack_c: mut ref i64 = dhruva_alloc_stack_domain(stack_bytes as u32, 2 as u32);
@@ -36144,26 +36136,81 @@ fn kernel_main() -> i64 {
   // confirm the hypothesized bug rather than checked against a control.
   //
   // With that confound removed, re-enabled task_a in USR mode again for
-  // a clean read. RESULT: no crash this time -- confirms task_a's own
-  // FIRST involuntary resume (via irq_entry.S's shared restore path,
-  // NOT task_sleep_ticks_impl's own tail -- the fixed diagnostic
-  // printed "SLEEP: task_a resumed, outgoing=00000008" cleanly,
-  // proving the blocking-resume mechanism itself is sound) works
-  // correctly. But the ORIGINAL, real issue reproduces unchanged: after
-  // exactly 2 "HIGH: waking/acquired/released resource" cycles, the
-  // ENTIRE system goes silent -- not just the shell (task_c), but
+  // a clean read (re-attempt #3). RESULT: no crash this time -- confirms
+  // task_a's own FIRST involuntary resume (via irq_entry.S's shared
+  // restore path, NOT task_sleep_ticks_impl's own tail -- the fixed
+  // diagnostic printed "SLEEP: task_a resumed, outgoing=00000008"
+  // cleanly, proving the blocking-resume mechanism itself is sound)
+  // works correctly. But the ORIGINAL, real issue reproduces unchanged:
+  // after exactly 2 "HIGH: waking/acquired/released resource" cycles,
+  // the ENTIRE system goes silent -- not just the shell (task_c), but
   // MEDIUM/idle/every background task too, with no crash report and no
-  // reboot (QEMU keeps running, nothing observable happens). This is a
-  // materially different, better-understood failure than the vague
-  // "shell stops responding" this file's own THIRD-round comment
-  // originally reported: a total scheduler freeze, not a fairness/
-  // aging-tuning shortfall alone -- something specific to task_a's
-  // SECOND wake cycle in USR mode wedges the whole system, not merely
-  // starves one task relative to others. Needs its own dedicated live-
-  // GDB investigation (same discipline as every other deep bug this
-  // project has hit) -- not resolved this round. Reverted to plain SVC
-  // mode again rather than shipping a build that reliably hangs; see
-  // docs/TODO.md for the full writeup and the real next steps.
+  // reboot in the ordinary log (QEMU keeps running, nothing observable
+  // happens). This is a materially different, better-understood failure
+  // than the vague "shell stops responding" this file's own THIRD-round
+  // comment originally reported.
+  //
+  // ROUND 4 (2026-09-19, user request: "check other online authoritative
+  // resources and source code" + "fix fully"): added a THIRD diagnostic
+  // (swi_return_to_usr, printing the actual resume-pc value about to be
+  // used -- see swi_entry.S's own header comment for a real bug self-
+  // caught and fixed while adding it: reused a stale register as if it
+  // still held usr_resume_pc_table's base address). Confirmed via that
+  // diagnostic AND direct printf evidence that task_a's own USR-mode
+  // stack pointer (usr_sp_table[0]), resume-pc, and is_usr_mode_task[0]
+  // all read CORRECTLY and PLAUSIBLY for every syscall observed before
+  // the freeze -- no sign of corruption in the visible window.
+  //
+  // Used QEMU's own GDB stub (gdb-multiarch, `-S -gdb tcp::1234`) for
+  // live inspection, since printf evidence alone had been exhausted --
+  // this is exactly the kind of ground-truth tool this project's own
+  // established discipline calls for once indirect evidence stops being
+  // conclusive. Set a breakpoint at fault_data_abort's own entry and let
+  // the system run freely (no shell input needed -- confirmed the
+  // freeze is purely tick/time-driven, not dependent on typed commands
+  // at all). DECISIVE FINDING: fault_data_abort DOES fire (a real Data
+  // Abort IS occurring at the freeze point), but its own report never
+  // reaches the UART -- captured directly: DFAR=0xFFFFFFF0, DFSR=0x805
+  // (decodes to WnR=1 -- a WRITE -- Translation Fault, Section, domain
+  // 0). Address 0xFFFFFFF0 is exactly "0 minus 16 bytes" -- the classic
+  // signature of a STACK POINTER THAT IS EXACTLY NULL having a multi-
+  // register push/stmdb applied to it (matches this project's own prior
+  // incident at 0xFFFFFFF8, "push on a near-null sp", same class, one
+  // register narrower). This means fault_data_abort's OWN attempt to
+  // build its report frame (`sub sp,sp,#16` after switching to SVC mode)
+  // itself faults -- a genuine double-fault, exactly like the earlier
+  // (self-caused, already-fixed) diagnostic-placement bug looked, but
+  // this time with NO known-buggy diagnostic in the loop -- this is real.
+  //
+  // Ruled out via careful re-reading, NOT yet confirmed via a live watch:
+  // (1) all 5 SWI trampolines (task_sleep_ticks/dhruva_mutex_lock/_
+  // unlock/dhruva_prio_lock/_unlock) push{r4,r7}/pop{r4,r7} symmetrically
+  // -- no leak there. (2) swi_entry's own entry-capture and swi_return_
+  // to_usr's own restore both use `^`-suffixed single-register LDM/STM
+  // to touch sp_usr specifically -- these do NOT affect the plain "sp"
+  // register (sp_svc) that ordinary push/pop instructions use, so my own
+  // new diagnostic's `push {r0-r11}`/`pop {r0-r11}` (also verified
+  // balanced) cannot be interacting with sp_usr's own leak, if any. (3)
+  // sp_svc is architecturally a SINGLE physical register, not banked
+  // per-task, but every task-switch path (task_sleep_ticks_impl's tail,
+  // irq_entry.S, fiq_entry.S) explicitly reloads it from sp_table[current]
+  // before resuming -- reasoned through by hand to be self-consistent
+  // (a block-then-resume cycle returns sp_svc to the exact same baseline
+  // it started at), though NOT yet confirmed by directly watching the
+  // value across the actual failing cycle.
+  //
+  // NOT YET FOUND: the actual mechanism causing either sp_usr or sp_svc
+  // for whichever context is active at the freeze moment to reach
+  // exactly 0. Real, concrete next step for a dedicated session: a GDB
+  // hardware watchpoint on usr_sp_table[0]/sp_table[0]'s own memory
+  // (not more printf probing) to catch the EXACT write that drives it to
+  // zero, or a stack canary placed at the very bottom of stack_a's own
+  // SVC-side 4096-byte region (dhruva_alloc_stack_domain's own guard
+  // page already protects the region's low end structurally, but a
+  // canary would catch a slow approach before the guard page itself
+  // triggers). Reverted task_a to plain SVC mode again rather than
+  // shipping a build with a confirmed, reproducible double-fault; see
+  // docs/TODO.md for the full writeup.
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   // Task #253 Phase 3, task_b -- ALSO reverted to SVC mode (2026-09-19).
   // Converted to USR mode as the "sidesteps task_a's ceiling-priority

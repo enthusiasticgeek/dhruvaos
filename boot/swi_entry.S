@@ -365,6 +365,71 @@ swi_return_skip_usr_sp_restore:
     ldr r3, [r3, r2, lsl #2]
     msr spsr_cxsf, r3
 
+    /* Task #253 Phase 3 bug investigation continued (2026-09-19):
+     * gated on current_task(r2)==0 (task_a), printing the ACTUAL
+     * resume-pc value about to be used, right before the final jump --
+     * to see directly whether it looks like a plausible code address or
+     * garbage. Saves r0-r11 wholesale before touching anything (the
+     * sched_diag_* helpers freely use r0-r3 internally) and restores
+     * them verbatim afterward -- r0/r1 hold the dispatched syscall's
+     * real return value, r2 is current_task, both still needed by the
+     * real code below; none of r0-r3 may end up changed by the time
+     * this block exits.
+     *
+     * BUG self-caught before this ever ran clean (first version
+     * crashed at the very first boot-time syscall, "Data Abort at
+     * address 800001D3"): r3 at this exact point does NOT hold usr_
+     * resume_pc_table's base address -- it holds the VALUE just loaded
+     * from usr_resume_spsr_table[r2] two lines above (`ldr r3,[r3,r2,
+     * lsl#2]` overwrote r3's own base-address copy with the looked-up
+     * SPSR value, then `msr spsr_cxsf,r3` consumed it). The first
+     * version of this diagnostic wrongly reused that stale r3 as if it
+     * were still usr_resume_pc_table's base, computing `[SPSR_VALUE +
+     * current_task*4]` -- a wild address, dereferenced and faulted
+     * immediately. Fixed by loading usr_resume_pc_table's own base
+     * address fresh, into r6 (untouched at this point), instead of
+     * trusting r3's stale contents. Shares the same fire-cap counter as
+     * the other two investigation points. */
+    push {r0-r11}
+    cmp r2, #0
+    bne swi_return_diag_skip
+    /* Excludes boot-time noise. First attempt gated on tick_count>0 --
+     * self-caught as ALSO wrong: tick_count gets artificially advanced
+     * by scheduler_set_tick_count_test_only, used by the DHCP lease-
+     * renewal/DHCPNAK self-tests to simulate elapsed time, well before
+     * start_multitasking ever runs (confirmed live: this diagnostic
+     * fired during "DHCP: lease renewal"/"DHCP: client resets to INIT"
+     * boot-time self-test output). context_switch_count is the correct
+     * gate instead: it only increments inside scheduler_pick_next
+     * itself when a real scheduling decision actually changes the
+     * running task, and nothing during boot-time setup (DHCP/crypto/
+     * SD/etc. self-tests) ever calls scheduler_pick_next, directly or
+     * indirectly -- it's reachable only via task_sleep_ticks_impl,
+     * dhruva_mutex_lock_impl's contended path, task_create, or the IRQ/
+     * FIQ scheduling paths, none of which boot-time self-tests exercise. */
+    ldr r6, =context_switch_count
+    ldr r6, [r6]
+    cmp r6, #0
+    beq swi_return_diag_skip
+    ldr r4, =sleep_ticks_diag_fire_count
+    ldr r5, [r4]
+    cmp r5, #8
+    bge swi_return_diag_skip
+    add r5, r5, #1
+    str r5, [r4]
+    ldr r6, =usr_resume_pc_table
+    ldr r4, [r6, r2, lsl #2]        /* r4 = usr_resume_pc_table[0], the
+                                      * value about to be loaded into lr
+                                      * a few lines below */
+    ldr r0, =swi_return_diag_msg
+    bl sched_diag_puts
+    mov r0, r4
+    bl sched_diag_put_hex32
+    mov r0, #10
+    bl sched_diag_putc
+swi_return_diag_skip:
+    pop {r0-r11}
+
     ldr r3, =usr_resume_pc_table
     ldr lr, [r3, r2, lsl #2]
     movs pc, lr
@@ -500,3 +565,8 @@ dhruva_prio_unlock:
     mov lr, r4
     pop {r4, r7}
     bx lr
+
+.section ".rodata"
+swi_return_diag_msg:
+    .asciz "SWI_RETURN: task_a resume_pc=0x"
+.section ".text"

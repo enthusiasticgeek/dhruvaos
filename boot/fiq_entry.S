@@ -293,6 +293,34 @@ fiq_entry_true_lr_done:
                                       * regardless of which exception
                                       * got us here. */
     mov sp, r0                       /* sets real sp_svc */
+    /* Task #253 Phase 3 bug investigation (2026-09-19): same current_
+     * task==0-gated diagnostic as task_sleep_ticks_impl's own
+     * (context_switch.S) -- checking whether task_a's SECOND
+     * involuntary resume (the one that never happens, per this
+     * session's own live A/B testing: total system freeze after
+     * exactly 2 "HIGH: waking/acquired/released" cycles) is even
+     * reaching this FIQ-driven, tick-triggered restore path at all.
+     * Placed AFTER `mov sp, r0` above, matching the FIXED (not the
+     * original buggy) placement discipline task_sleep_ticks_impl's own
+     * diagnostic needed -- doing this BEFORE the sp switch would fault
+     * (DACR already switched to the newly-picked task's domain by
+     * scheduler_pick_next, while sp would still point at the outgoing
+     * task's own stack). Shares that diagnostic's own fire-cap counter
+     * (sleep_ticks_diag_fire_count) so the two investigation points'
+     * cumulative print cost stays bounded together, not doubled. */
+    ldr r1, =current_task
+    ldr r1, [r1]
+    cmp r1, #0
+    bne fiq_resume_diag_skip
+    ldr r2, =sleep_ticks_diag_fire_count
+    ldr r3, [r2]
+    cmp r3, #8
+    bge fiq_resume_diag_skip
+    add r3, r3, #1
+    str r3, [r2]
+    ldr r0, =fiq_resume_diag_msg
+    bl sched_diag_puts
+fiq_resume_diag_skip:
     bl scheduler_restore_usr_sp      /* task #253: no-op unless the task
                                       * about to resume is USR-mode --
                                       * see that function's own header
@@ -331,3 +359,8 @@ enable_fiqs:
     mov r0, #0
     mov r1, #0
     bx lr
+
+.section ".rodata"
+fiq_resume_diag_msg:
+    .asciz "FIQ: task_a resumed (tick-driven)\n"
+.section ".text"

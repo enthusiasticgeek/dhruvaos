@@ -8031,6 +8031,93 @@ commit under identical host conditions). Task #253 Phase 3 remains
 open: task_a's own second-wake-cycle total-freeze bug is real,
 reproducible, and better-scoped than before, but not yet root-caused.
 
+**Task #253 Phase 3, task_a -- SIXTH round, same day (2026-09-19): live
+GDB investigation finds a real, decisive fault signature; root cause
+still not found.** User: "i need scheduler freeze bug fixed fully.
+check other online authoritative resources and source code."
+
+*Reference check*: the timer tick is FIQ-routed (task #246), so task_a's
+own tick-driven resume goes through `fiq_entry.S`, not `irq_entry.S` --
+the file this round's own earlier diagnostic never covered. Checked
+seL4's own `arm_fiq_exception` (`src/arch/arm/32/traps.S`) as a
+reputable-OS cross-check specifically for FIQ handling: seL4 does NOT
+support FIQ at all (`blx halt` on it) -- not a usable reference for this
+mechanism. FreeRTOS's Cortex-A ports (GIC-based, FIQ reserved
+specifically for the tick, to guarantee it can't be blocked by
+application-installed IRQ handlers) are the closer architectural
+analogy, though this project's own bare-metal BCM2835 FIQ_CONTROL
+routing was already independently designed before this round, not newly
+adopted from that reference.
+
+*Third diagnostic added*: `swi_return_to_usr` (`swi_entry.S`), printing
+the actual resume-pc value about to be used, gated on `current_task==0`.
+Self-caught a real bug while adding it (documented in that file's own
+comment): reused a register that had already been overwritten with the
+SPSR value from two lines above, computing a garbage address and
+faulting on the very first boot-time syscall -- fixed by loading `usr_
+resume_pc_table`'s own base address fresh instead of trusting stale
+register contents. Also had to fix the diagnostic's OWN gating twice:
+first gated on `tick_count>0` (self-caught as wrong -- the DHCP self-
+tests advance `tick_count` artificially via `scheduler_set_tick_count_
+test_only` well before real multitasking starts), then switched to
+`context_switch_count>0` (only ever incremented inside `scheduler_pick_
+next` on a genuine scheduling decision -- no boot-time self-test
+reaches that function, directly or indirectly).
+
+With all three diagnostics correctly gated, direct printf evidence
+showed `usr_sp_table[0]`, `usr_resume_pc_table[0]`, and `is_usr_mode_
+task[0]` all reading CORRECTLY and PLAUSIBLY for every syscall observed
+in the log before the freeze -- no sign of corruption in the visible
+window, ruling out the simplest "obviously garbled state" explanation.
+
+*Live GDB investigation*: printf evidence exhausted, so used QEMU's own
+GDB stub (`gdb-multiarch`, `-S -gdb tcp::1234`) for direct, ground-truth
+inspection -- the proper tool once indirect evidence stops being
+conclusive, per this project's own "use a proven reference/tool, don't
+keep guessing" discipline. Confirmed the freeze is purely tick/time-
+driven, not dependent on typed shell commands at all (reproduces
+identically with zero characters ever sent to the interactive shell).
+Set a breakpoint at `fault_data_abort`'s own entry and let the system
+run freely.
+
+**Decisive finding**: `fault_data_abort` DOES fire at the freeze point
+-- a real Data Abort IS occurring, it just never reaches the UART.
+Captured directly: `DFAR=0xFFFFFFF0`, `DFSR=0x805` (decodes to WnR=1 --
+a WRITE -- Translation Fault, Section, domain 0). Address `0xFFFFFFF0`
+is exactly "0 minus 16 bytes" -- the signature of a multi-register
+push/stmdb applied to a stack pointer that is EXACTLY NULL (matches
+this project's own prior incident at `0xFFFFFFF8`, "push on a near-null
+sp", same class, one register narrower). This means `fault_data_abort`'s
+OWN attempt to build its own report frame (`sub sp,sp,#16` right after
+switching to SVC mode) itself faults -- a genuine double-fault. This
+looks structurally identical to this round's OWN earlier (self-caused,
+already-fixed) diagnostic-placement bug, but this time with no known-
+buggy diagnostic in the loop -- it is real.
+
+*Ruled out by careful re-reading (not yet confirmed by a live watch)*:
+(1) all 5 SWI trampolines push/pop `{r4,r7}` symmetrically -- no leak
+there. (2) `swi_entry`'s entry-capture and `swi_return_to_usr`'s restore
+both use `^`-suffixed single-register LDM/STM to touch `sp_usr`
+specifically, which does NOT affect the plain `sp` register (`sp_svc`)
+ordinary push/pop instructions use -- this round's own new diagnostic
+push/pop is verified balanced and cannot be the sp_usr leak, if any. (3)
+`sp_svc` is a single physical register, not banked per-task, but every
+task-switch path explicitly reloads it from `sp_table[current]` before
+resuming -- reasoned by hand to be self-consistent (a block-then-resume
+cycle returns `sp_svc` to its exact starting baseline), though not yet
+confirmed by directly watching the value across the actual failing
+cycle.
+
+**Not yet found**: the actual mechanism driving either `sp_usr` or
+`sp_svc` (whichever is active at the freeze moment) to exactly 0. Real,
+concrete next step for a dedicated session: a GDB hardware watchpoint on
+`usr_sp_table[0]`/`sp_table[0]`'s own memory (not more printf probing)
+to catch the exact write that drives it to zero, or a stack canary at
+the bottom of `stack_a`'s own SVC-side 4096-byte region. Reverted task_a
+to plain SVC mode again rather than ship a build with a confirmed,
+reproducible double-fault. `phase4_milestone.py` re-verified: 4-FAIL
+baseline, no crash, no reboot.
+
 **SD wedge: sixth fix attempt, real register-level divergence from
 Linux found and fixed (2026-09-19), against a fresh real-HW log
 (`picocom_20260919_145143.log`) that includes BOTH the FAIL_FLAG fix
