@@ -36306,31 +36306,23 @@ fn kernel_main() -> i64 {
   let sp_a: mut ref i64 = task_a_init_stack_usr(stack_a, stack_bytes);
   let stack_a_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 0 as u32);
   let stack_a_usr_top: mut ref i64 = stack_region_top(stack_a_usr, stack_bytes);
-  // Task #253 Phase 3, task_b -- ALSO reverted to SVC mode (2026-09-19).
-  // Converted to USR mode as the "sidesteps task_a's ceiling-priority
-  // edge case" attempt above describes, then live-tested: hung with the
-  // IDENTICAL crash signature as task_a's own attempt (current_task
-  // misread as 3/IDLE inside task_sleep_ticks_impl's own scheduler_pick_
-  // next call, "old=3 new=10", sp_table[3] getting overwritten with the
-  // wrong task's saved-context pointer). task_b has NO explicit dhruva_
-  // prio_lock/unlock of its own and is not the system ceiling -- this
-  // rules OUT the ceiling-priority/nested-locking theory entirely: the
-  // bug is task-independent. The real common factor: task_d/IDLE is the
-  // ONLY task that has ever run in USR mode before this work, and IDLE
-  // NEVER calls task_sleep_ticks (it uses cpu_wfi() instead) -- so
-  // task_sleep_ticks_impl's own block-and-much-later-resume cycle
-  // (which round-trips through possibly many OTHER context switches
-  // before the sleeping task's own sp_table/usr_resume_pc_table slot is
-  // read back) had literally never been exercised by a genuinely USR-
-  // mode-originated call before task_a's or task_b's own conversion
-  // attempts. That is the real, still-open bug surface for task #253's
-  // remaining scope -- NOT specific to task_a or task_b. Reverting both
-  // to the proven baseline (task_d/IDLE only in USR mode) rather than
-  // continuing to retry other tasks one-by-one against the same
-  // untouched root cause. See docs/TODO.md for the full writeup and the
-  // decision to treat this as BLOCKED pending a dedicated root-cause
-  // session, not a quick continuation.
-  let sp_b: mut ref i64 = task_b_init_stack(stack_b, stack_bytes);
+  // Task #253 Phase 3, task_b -- RE-ENABLED 2026-09-20 (task #262,
+  // one-task-at-a-time rollout) now that the real root cause (lr_usr
+  // never restored, commit f37d933) is fixed and task_a's own
+  // conversion (a strictly harder case: frequently-waking, ceiling-
+  // boosting) is independently verified clean (388 wake cycles, zero
+  // FATAL). The crash this round originally hit ("current_task misread
+  // as 3/IDLE inside task_sleep_ticks_impl") was never task_b-specific
+  // -- matches task_a's own item-1 finding (a stale usr_sp_table seed
+  // overwritten by an intervening boot-time syscall), and task_b's own
+  // index (1) was ALREADY safe to seed early even under the OLD bug,
+  // per that same finding ("current_task reads 0 [task_a's own index],
+  // never 1, for kernel_main's entire boot-time execution") -- so
+  // task_b's own seed stays inline here, unlike task_a's deferred one.
+  let sp_b: mut ref i64 = task_b_init_stack_usr(stack_b, stack_bytes);
+  let stack_b_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 1 as u32);
+  let stack_b_usr_top: mut ref i64 = stack_region_top(stack_b_usr, stack_bytes);
+  let _ = usr_sp_table_set_at(1 as u32, stack_b_usr_top);
   let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
   let sp_d: mut ref i64 = task_d_init_stack_usr(stack_d, stack_bytes);
   let stack_d_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 3 as u32);
