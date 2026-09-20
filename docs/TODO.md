@@ -9088,3 +9088,48 @@ This closes the "separate, much larger finding" flagged in the
 15th-round entry immediately above -- `docs/RTOS_GAP_ANALYSIS.md`'s
 own "verdict schedulable" claim is now genuinely real-hardware-backed,
 not a QEMU coincidence that happened to look right.
+
+### Sixteenth SD round: correctly-sized settle delays confirmed insufficient -- settle-timing theory now conclusively ruled out (2026-09-20)
+
+Fresh real-HW retest (`picocom_20260920_165043.log`, user: "new
+picocom log fetched after update kernel script /dev/sdb") of task
+#275's corrected `delay(64500)` sizing. First confirmed the fix is
+genuinely running at the intended magnitude this time: `sdhost_init`'s
+own "total elapsed" diagnostic shows +53439-53519us total across the 3
+delay calls per init (~17.8ms each, matching the ~20ms real target
+within measurement/overhead variance -- NOT the ~372ms/call the
+wrongly-sized version gave, and NOT the ~166us/call the original
+too-short version gave).
+
+The wedge still reproduces IDENTICALLY: same SDCDIV backoff
+progression (0x8/0x12/0x148), same "block 2100 FAILED" mismatch point,
+CMD13 (SEND_STATUS) still times out every single time (controller's
+own command path still totally frozen once wedged).
+
+This is now a conclusive result, not just another inconclusive
+attempt: settle-delay timing has been tested at THREE different
+magnitudes across the 14th/15th/16th rounds -- too short (~166us/call,
+the pre-existing behavior), far too long (~372ms/call, task #274's own
+mis-sized first attempt), and now correctly sized to match U-Boot's
+own real, documented, working reference values (~17.8ms/call, task
+#275's correction) -- and the wedge reproduces identically at every
+single one of them. Insufficient settle time is no longer a credible
+root-cause theory for this wedge; it's ruled out as thoroughly as
+clock speed already was (task #274's own finding: wedges even at the
+slowest identification-speed clock).
+
+**State of the investigation after 16 rounds:** the two most
+reference-grounded software-side leads this project could find (the
+already-applied SDEDM FIFO-threshold silicon-errata workaround, and
+now the settle delays around it) are both confirmed present, correctly
+sized, and confirmed insufficient. Every genuinely new diagnostic this
+investigation has shipped (CMD13 card-status query, clock-speed sweep,
+settle-delay sweep) has narrowed the search space without finding the
+actual fix. Not proposing a 17th speculative register/timing tweak
+without a new concrete lead -- reported honestly to the user rather
+than guessing again, pending their direction on how to proceed (e.g.
+a genuinely different reference driver angle, trying a second SD card
+as a now-more-justified controlled experiment given how much has
+already been ruled out, or accepting this as a real hardware
+limitation of this specific peripheral/card pairing and prioritizing
+the already-supported USB mass storage block-device backend instead).
