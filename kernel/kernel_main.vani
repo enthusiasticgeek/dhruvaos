@@ -35839,9 +35839,12 @@ fn kernel_main() -> i64 {
   // domain(stack_bytes, 0)) + deferred usr_sp_table seed would belong
   // here / right before start_multitasking respectively -- omitted
   // while task_a stays reverted to plain SVC. See this function's own
-  // task_a setup site below for the full round-4 finding: a real,
-  // decisive fault signature captured live (GDB), but root cause NOT
-  // YET FOUND. Restore both lines when task_a is next re-attempted.
+  // task_a setup site below for round 5's full finding: the interrupt-
+  // masking fix (0x13->0xD3) and the fault-handler ABT-mode/stack-reset
+  // hardening are both real, kept, and independently verified -- but
+  // task_a's own resume still corrupts a code-address value somewhere
+  // and jumps into a literal pool, executing data as code. Restore both
+  // lines when task_a is next re-attempted.
   let stack_b: mut ref i64 = dhruva_alloc_stack_domain(stack_bytes as u32, 1 as u32);
   let _ = stack_canary_set_base(1 as u32, stack_b);
   let stack_c: mut ref i64 = dhruva_alloc_stack_domain(stack_bytes as u32, 2 as u32);
@@ -36199,18 +36202,92 @@ fn kernel_main() -> i64 {
   // it started at), though NOT yet confirmed by directly watching the
   // value across the actual failing cycle.
   //
-  // NOT YET FOUND: the actual mechanism causing either sp_usr or sp_svc
-  // for whichever context is active at the freeze moment to reach
-  // exactly 0. Real, concrete next step for a dedicated session: a GDB
-  // hardware watchpoint on usr_sp_table[0]/sp_table[0]'s own memory
-  // (not more printf probing) to catch the EXACT write that drives it to
-  // zero, or a stack canary placed at the very bottom of stack_a's own
-  // SVC-side 4096-byte region (dhruva_alloc_stack_domain's own guard
-  // page already protects the region's low end structurally, but a
-  // canary would catch a slow approach before the guard page itself
-  // triggers). Reverted task_a to plain SVC mode again rather than
-  // shipping a build with a confirmed, reproducible double-fault; see
-  // docs/TODO.md for the full writeup.
+  // ROUND 5 (2026-09-19/20, user: "if you need to make architectural
+  // decision to resolve issue... do so"): two real, independently-kept
+  // architectural fixes, plus a sharper fault signature -- root cause
+  // still not found.
+  //
+  // FIX 1 (context_switch.S): task_sleep_ticks_impl's and dhruva_mutex_
+  // lock_impl's contended-path frames both staged spsr=0x13 (plain SVC,
+  // I/F BOTH unmasked) for their own intermediate landing inside swi_
+  // return_to_usr -- a real, live race window: that landing point still
+  // has real bookkeeping left to do (current_task/is_usr_mode_task
+  // lookups, the sp_usr restore, the usr_resume_spsr/pc_table reads)
+  // before its own final `movs pc,lr` restores the task's TRUE original
+  // interrupt state. A real FIQ landing inside that window re-enters
+  // fiq_entry.S's own interrupted-context capture, which reads current_
+  // task (already updated to the resuming task by this exact function's
+  // own scheduler_pick_next call) and captures this transient, mid-
+  // bookkeeping state as if it belonged to that task -- clobbering its
+  // own sp_table/usr_sp_table entries. Fixed: 0x13 -> 0xD3 (mask I/F for
+  // this intermediate landing only; the task's own final resumed state
+  // is unaffected, still restored from usr_resume_spsr_table). Verified
+  // via phase4_milestone.py: no regression to the existing baseline.
+  // Did NOT change the observable freeze at all when tested live --
+  // real and worth keeping regardless, but not sufficient alone (or not
+  // the actual mechanism at play in this specific reproduction).
+  //
+  // FIX 2 (boot/rpi1/vectors.S), found via live GDB on the SAME
+  // reproduction: fault_data_abort/fault_prefetch_abort used to `cps
+  // #0x13` (switch to SVC) and build their own report frame ON SP_SVC,
+  // reasoning "never returning, safe to reuse whatever's on that
+  // stack." That reasoning has a real hole -- sp_svc can be INVALID,
+  // not just "someone else's stack we're about to clobber harmlessly" --
+  // confirmed live: the ORIGINAL fault (DFAR=0xFFFFFFF0, WRITE,
+  // Translation Fault) never printed a single "FATAL:" byte, because
+  // fault_data_abort's OWN attempt to build its report frame on the
+  // (corrupted) sp_svc faulted a SECOND time, silently. Fixed at the
+  // architectural level: ABT mode already has its own dedicated,
+  // guaranteed-valid stack (sp_abt / `_abort_stack_top`, set up once at
+  // boot, never touched by any task or any other exception mode) --
+  // both handlers now build their ENTIRE report and call abort_report_
+  // data/_prefetch WITHOUT ever leaving ABT mode, so a corrupted sp_svc
+  // can no longer defeat fault reporting at all. Also masks FIQ on
+  // entry (ABT mode auto-masks I but not F -- the identical "third
+  // privileged mode fiq_entry.S's own true-lr check doesn't recognize"
+  // gap already found and fixed once for the syscall path). Trade-off
+  // accepted: `orig_lr` in the report is now lr_ABT, not lr_SVC (ARMv6
+  // has no cross-mode banked-register read -- an ARMv7+ addition) --
+  // real loss of one diagnostic field, worth it for a handler that can
+  // no longer be silently defeated by the exact class of corruption it
+  // exists to report.
+  //
+  // SECOND bug self-caught immediately after shipping fix 2, live via
+  // GDB on the SAME build: fault_data_abort now genuinely RE-ENTERED
+  // ITSELF repeatedly (a real recursive fault loop -- identical lr/r2
+  // on every hit after the first), because sp_abt was never explicitly
+  // RESET on entry -- each recursive re-entry's own `sub sp,sp,#16`
+  // started from wherever the PREVIOUS failed attempt left off, eating
+  // 16 bytes of sp_abt per recursion with no bound, silently walking off
+  // the bottom of the 4KB region. Fixed: `ldr sp,=_abort_stack_top`
+  // added right after `cpsid f` in both handlers, so every entry starts
+  // from a known-good baseline regardless of how it was reached.
+  //
+  // Even with both fixes in place, still NO "FATAL:" line ever reaches
+  // the UART. Re-ran the live GDB session: fault_data_abort's own
+  // fault_pc (lr_abt - 8) now lands INSIDE A LITERAL POOL -- a data
+  // region embedded between two functions in .text, holding raw
+  // constant words (table addresses, etc.), not executable code. This
+  // is a SHARPER, more decisive signature than "a stack pointer reached
+  // NULL": something is loading a CORRUPTED VALUE into pc or lr (most
+  // likely usr_resume_pc_table[0], or a trampoline's own r4/lr chain)
+  // that points into this literal pool instead of real code, and
+  // execution runs off into raw data being interpreted as instructions
+  // until it faults. Confirmed independently on two different builds
+  // (different exact addresses, same structural signature: fault_pc
+  // sits inside a `.word` literal-pool run between two real functions,
+  // never inside actual code).
+  //
+  // Real, concrete next step for a dedicated session: a GDB hardware
+  // watchpoint on usr_resume_pc_table[0] specifically (not sp_table/
+  // usr_sp_table, both already confirmed reading correctly throughout
+  // the visible window) to catch the EXACT write that corrupts it into
+  // a non-code address. Both architectural fixes above are real,
+  // independently valuable, and kept regardless of whether they turn
+  // out to be the full story -- but task_a's own resume still corrupts
+  // a code-address value somewhere, so it stays reverted to plain SVC
+  // mode rather than shipping a build with a confirmed, reproducible
+  // wild-jump. See docs/TODO.md for the full writeup.
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   // Task #253 Phase 3, task_b -- ALSO reverted to SVC mode (2026-09-19).
   // Converted to USR mode as the "sidesteps task_a's ceiling-priority

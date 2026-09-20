@@ -1357,7 +1357,39 @@ task_sleep_ticks_impl:
     str r12, [sp, #56]
     str lr, [sp, #60]               /* true_lr (== resume point here) */
     str lr, [sp, #64]               /* resume_pc, same value duplicated */
-    mov r2, #0x13
+    /* ARCHITECTURAL FIX (2026-09-19, task #253 scheduler-freeze
+     * investigation): was `mov r2,#0x13` -- plain SVC mode, I and F
+     * BOTH unmasked. This is genuinely wrong: resume_pc above lands in
+     * `swi_return_to_usr` (boot/swi_entry.S), NOT directly in the
+     * resumed task's own USR-mode code -- that function has its own
+     * real bookkeeping to do first (current_task/is_usr_mode_task
+     * lookups, the sp_usr restore via `scheduler_restore_usr_sp`,
+     * reading usr_resume_spsr_table/usr_resume_pc_table) BEFORE its own
+     * final `movs pc,lr` does the REAL transition back to the task's
+     * true original mode and interrupt state (from usr_resume_spsr_
+     * table, captured at the task's own original syscall entry).
+     * Landing in this SVC-mode intermediate stop with I/F already
+     * unmasked leaves a genuine, live race window: a real timer FIQ
+     * landing anywhere inside `swi_return_to_usr`'s own few
+     * instructions re-enters fiq_entry.S's own interrupted-context
+     * capture, which reads `current_task` (ALREADY updated to the
+     * task now being resumed, by this exact function's own
+     * `scheduler_pick_next` call above) and captures THIS transient,
+     * mid-bookkeeping SVC-mode state as if it belonged to that task,
+     * clobbering its own `sp_table`/`usr_sp_table` entries with
+     * garbage from a state that was never meant to be resumed
+     * standalone. Confirmed live via GDB (task #253 investigation,
+     * docs/TODO.md's own writeup): a real Data Abort, DFAR=0xFFFFFFF0,
+     * a WRITE to a stack pointer that had become exactly NULL -- the
+     * signature this exact race window would produce if the captured
+     * "sp_usr" happened to be 0 the instant the tick landed. Fixed by
+     * masking I and F (0x13 -> 0xD3) for this INTERMEDIATE landing
+     * only -- `swi_return_to_usr`'s own final `movs pc,lr` still
+     * restores the task's TRUE original interrupt state from usr_
+     * resume_spsr_table regardless, so this change only closes the
+     * race window, it does not change the resumed task's own eventual
+     * live state at all. */
+    mov r2, #0xD3
     str r2, [sp, #0]                 /* spsr */
     mov r3, #0
     str r3, [sp, #4]                 /* pad */
@@ -1765,9 +1797,15 @@ dml_contended:
     str r12, [sp, #56]
     str lr, [sp, #60]                /* true_lr (== resume point here) */
     str lr, [sp, #64]                /* resume_pc, same value duplicated */
-    mov r4, #0x13
-    str r4, [sp, #0]                  /* spsr=0x13 (SVC, IRQs enabled on
-                                       * restore) */
+    /* ARCHITECTURAL FIX (2026-09-19, task #253 scheduler-freeze
+     * investigation): same fix as task_sleep_ticks_impl's own frame
+     * above (0x13 -> 0xD3, masking I/F for this SVC-mode intermediate
+     * landing in swi_return_to_usr only) -- see that site's own full
+     * comment for the complete "why". This contended dhruva_mutex_lock
+     * path resumes through the exact same swi_return_to_usr bookkeeping
+     * window, so it carries the identical race exposure. */
+    mov r4, #0xD3
+    str r4, [sp, #0]                  /* spsr */
     mov r5, #0
     str r5, [sp, #4]                  /* pad */
     mov r4, sp                       /* r4 = frame base */

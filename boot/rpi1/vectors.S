@@ -105,50 +105,90 @@ fault_reserved:
 
 .global fault_data_abort
 fault_data_abort:
-    /* Round 62c crash investigation (task #154): r0-r3 are NOT banked
-     * in Abort mode -- they're still exactly the faulting instruction's
-     * own live operand registers at entry here -- but the two `mrc`
-     * reads below are about to overwrite r0/r1, and DFAR/DFSR/fault_pc
-     * need r0-r2 for abort_report_data's existing 3 args. Stash the
-     * ORIGINAL r0-r3 into r4-r7 first (never banked/touched by anything
-     * below until the explicit stack spill), so a faulting `str rD,
-     * [rN, rM]`-shaped instruction's actual base/offset register
-     * VALUES can be reported too, not just the fault address -- the
-     * open question this round is stuck on is exactly "was the base
-     * pointer really 0, or something else," which DFAR alone can't
-     * distinguish from e.g. a corrupted offset added to a valid base. */
+    /* ARCHITECTURAL FIX (2026-09-19/20, task #253 scheduler-freeze
+     * investigation): this handler used to `cps #0x13` (switch to SVC
+     * mode) and build its own report frame there, on the theory that
+     * "never returning, safe to reuse whatever's on that stack." That
+     * reasoning has a real hole: it assumes sp_svc is merely "some
+     * task's stack we're about to clobber harmlessly" -- but sp_svc can
+     * ALSO simply be INVALID (corrupted, or exactly 0/NULL) at the
+     * moment of a genuine fault, especially for the exact class of bug
+     * this investigation is chasing (a scheduler-state stack pointer
+     * reaching NULL). If sp_svc itself is bad, `sub sp,sp,#16` and the
+     * `str`s right after it ALSO fault -- a genuine double-fault that
+     * silently swallows the ENTIRE report, which is EXACTLY what live
+     * GDB caught happening (docs/TODO.md's own task #253 writeup):
+     * fault_data_abort's own entry hit, but no "FATAL:" line ever
+     * reached the UART, because building ITS OWN report frame on the
+     * (corrupted) sp_svc faulted a second time.
+     *
+     * Fixed at the architectural level: ABT mode already has its own
+     * dedicated, guaranteed-valid stack (sp_abt, set up once at boot --
+     * see boot.S's own round-38 comment, `_abort_stack_top`, a fixed
+     * 4KB region never touched by any task or any other exception
+     * mode). Building the ENTIRE report frame here, in ABT mode, on
+     * sp_abt, and calling `abort_report_data` WITHOUT ever switching to
+     * SVC at all, means this handler can report a real fault regardless
+     * of what corrupted sp_svc -- exactly the guarantee a fault handler
+     * is supposed to provide (the same reason ARM gives every exception
+     * mode its own banked sp/lr in the first place, and the same
+     * principle real OSes rely on for fault/panic handlers that must
+     * work even when the interrupted context is thoroughly broken).
+     *
+     * Also masks FIQ on entry (`cpsid f`) -- ABT mode's own exception
+     * entry auto-masks I but NOT F, the exact same "third privileged
+     * mode fiq_entry.S's own true-lr check was never built to
+     * recognize" gap already found and fixed once in swi_entry.S (see
+     * that file's own header comment) -- without this, a real timer
+     * tick landing mid-report here would hit fiq_entry.S's own mode
+     * check (USR vs "assume SVC"), misread THIS abort-mode context as
+     * SVC, and corrupt scheduler state exactly the way that earlier fix
+     * already had to prevent for the syscall path.
+     *
+     * Trade-off, accepted deliberately: `orig_lr` in the report below
+     * used to be lr_SVC (the ORIGINAL calling function's own return
+     * address, only reachable by physically switching to SVC mode --
+     * ARMv6 has no banked-register-read instruction across modes, that
+     * is an ARMv7+ virtualization-extension addition). Staying in ABT
+     * mode throughout means this field is now lr_ABT instead (the
+     * abort's own return-address convention, closely related to but
+     * not identical to fault_pc/r2 below) -- a real loss of one
+     * diagnostic nicety, worth it for a fault handler that can no
+     * longer be silently defeated by the exact class of corruption it
+     * exists to report. */
+    cpsid f
+    /* SECOND real bug found live via GDB right after the ABT-mode fix
+     * above: `abort_report_data` itself (or something it calls) can
+     * ALSO fault -- observed directly, a real recursive re-entry into
+     * this exact handler, over and over, each time from the SAME
+     * instruction (identical lr/r2 on every hit after the first).
+     * Before this fix, sp_abt was NEVER reset on entry -- each
+     * recursive re-entry did its own `sub sp,sp,#16` starting from
+     * WHEREVER the previous (failed) attempt left off, silently eating
+     * 16 bytes of sp_abt per recursion with no bound, walking off the
+     * bottom of `_abort_stack_top` (4KB) and corrupting whatever memory
+     * sits below it -- caught only because a live GDB breakpoint here
+     * happened to be watching; on real hardware this would have been a
+     * second, silent, undiagnosable corruption on top of the first.
+     * Resetting sp to `_abort_stack_top` on EVERY entry means a
+     * recursive fault during report-building can happen at most once
+     * more before hitting this same reset point again -- it can no
+     * longer run away or corrupt adjacent memory, even though the
+     * underlying "something the report path touches is ALSO corrupted"
+     * finding (docs/TODO.md's own task #253 writeup) is not yet fixed. */
+    ldr sp, =_abort_stack_top
     mov r4, r0
     mov r5, r1
     mov r6, r2
     mov r7, r3
     mrc p15, 0, r0, c6, c0, 0   /* DFAR: data fault address */
     mrc p15, 0, r1, c5, c0, 0   /* DFSR: data fault status */
-    /* Round 60 crash investigation: lr_abt (data abort convention) =
-     * address of the aborting instruction + 8 -- capture it as r2
-     * BEFORE the mode switch below, since lr is banked per-mode and
-     * this value would otherwise be gone the instant SVC mode's own
-     * lr_svc becomes current. */
-    sub r2, lr, #8
+    sub r2, lr, #8              /* fault_pc = lr_abt - 8 */
     mov r3, r4                  /* orig_r0 -> arg4 */
-    cps #0x13                   /* SVC mode -- never returning, safe to
-                                  * reuse whatever's on that stack */
-    /* Round 68: lr is banked per-mode, so the instant we're in SVC
-     * mode, "lr" transparently means lr_svc -- whatever the SVC-mode
-     * code (i.e. the faulting function's own caller) last set it to
-     * via its own `bl`, completely untouched by taking this exception
-     * (that only ever affects lr_abt, a physically different
-     * register). For every crash this investigation has actually
-     * hit, the fault happens on buf_read_u32/buf_write_u32's own
-     * FIRST instruction (a 2-instruction leaf: `ldr r0,[r0,r1]; bx
-     * lr`) -- so lr_svc here is exactly that function's own return
-     * address, i.e. the real call site that invoked it with a bad
-     * pointer, addr2line-able like any other address. r8 is safe
-     * scratch (unused anywhere else in this handler, not yet spilled
-     * to the stack below). Captured here, before `bl
-     * abort_report_data` below overwrites lr with ITS OWN return
-     * address. */
-    mov r8, lr
-    sub sp, sp, #16
+    mov r8, lr                  /* orig_lr (now lr_abt -- see header
+                                  * comment above for why this changed) */
+    sub sp, sp, #16             /* on sp_abt now, always valid -- see
+                                  * header comment above */
     str r5, [sp, #0]            /* orig_r1 -> arg5 (stack) */
     str r6, [sp, #4]            /* orig_r2 -> arg6 (stack) */
     str r7, [sp, #8]            /* orig_r3 -> arg7 (stack) */
@@ -158,8 +198,15 @@ fault_data_abort:
 
 .global fault_prefetch_abort
 fault_prefetch_abort:
+    /* Same architectural fix as fault_data_abort above -- stays in ABT
+     * mode throughout (sp_abt, guaranteed valid, never sp_svc) and
+     * masks FIQ on entry. See that function's own header comment for
+     * the full "why". */
+    cpsid f
+    ldr sp, =_abort_stack_top   /* see fault_data_abort's own header
+                                 * comment for why every entry resets sp
+                                 * rather than trusting it's still valid */
     mrc p15, 0, r0, c6, c0, 2   /* IFAR: instruction fault address */
     mrc p15, 0, r1, c5, c0, 1   /* IFSR: instruction fault status */
-    cps #0x13
     bl abort_report_prefetch
     b .
