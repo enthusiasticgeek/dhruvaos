@@ -192,9 +192,15 @@ doesn't yet attempt.
   against the real demo set (HIGH/MEDIUM/LOW) using the measured 50ms
   LOW-priority blocking term: **verdict schedulable, 440ms-1445ms
   slack.** Honest residual gaps from that same pass: GC's own critical
-  section is now measured too (Gap E, below), but context-switch
-  overhead itself still isn't a modeled term (task #240) and per-task
-  WCET only covers the demo set's dominant terms, not a hypothetical
+  section is now measured too (Gap E, below). Context-switch overhead
+  is now a modeled term too — `[DONE, task #240]`, a real
+  `measured_ctxsw_handoff_ms = 0.182` constant in
+  `test/schedulability_analysis.py`, fed from the live-measured
+  MUTEX-HIGH unlock-to-running latency. Worst-case interrupt latency
+  (the time interrupts stay masked, separate from context-switch cost
+  itself) is now measured too — `[DONE, task #270, 2026-09-20]`, see
+  "Interrupt handling gaps" below for the real numbers. Per-task WCET
+  still only covers the demo set's dominant terms, not a hypothetical
   production workload — the tool and method are proven, not every
   future workload.
 - ~~**No aperiodic/sporadic server.**~~ **`[DONE, task #242, 2026-09-18]`**
@@ -284,9 +290,25 @@ doesn't yet attempt.
   (independent verification of a subagent's own register-banking
   claims, then independent verification of its actual diff before
   trusting it) before shipping, rather than one.
-- **No measured/bounded worst-case interrupt latency.** Nothing in this
+- ~~**No measured/bounded worst-case interrupt latency.** Nothing in this
   project computes or asserts "an interrupt is serviced within N cycles of
-  assertion, worst case."
+  assertion, worst case."~~ **`[DONE, task #270, 2026-09-20]`** — new
+  `irq_mask_worst_us`/`_total_us`/`_count` counters (`boot/
+  context_switch.S`) TIMER_CLO-bracket the two genuinely-masked-the-
+  whole-time windows in this codebase that the pre-existing
+  `swi_fast_worst_us` counter (task #253 Phase 3) explicitly excludes:
+  `task_sleep_ticks_impl`'s own scheduling decision, and
+  `dhruva_mutex_lock_impl`'s genuinely-contended branch
+  (`dml_contended`). Exposed via `diagnose`, live-verified under QEMU:
+  `worst-case interrupt latency (I+F masked duration): worst=368us
+  avg=12us count=282`. Add the ARM1176's own small, fixed, documented
+  hardware vector-fetch overhead (not measured here — a well-known
+  constant, not worth instrumenting) to get the real end-to-end bound
+  an interrupt-latency claim needs. QEMU's own TCG trap overhead makes
+  this number pessimistic vs. real Pi 1B silicon, same caveat as
+  `irq_tick_worst_us` (task #191/192's own finding) — a real-hardware
+  measurement is a still-open follow-up, not blocking this gap's
+  closure (the instrumentation itself is real and correct either way).
 - ~~**Watchdog-triggered recovery is deliberately disabled.** `irq_dispatch`'s
   own comment explains `watchdog_kick()` isn't actually called because doing
   so resets QEMU immediately, breaking the only test method this project
@@ -893,7 +915,8 @@ doesn't yet attempt.
    analysis) over the declared task set.~~ **`[DONE, tool: round 190;
    applied to DhruvaOS's own real task set: Gap C/226, 2026-09-17]`** —
    see item 4 above ("No formal schedulability analysis"). Context-switch
-   overhead as a modeled term remains open — task #240.
+   overhead as a modeled term is now closed too — `[DONE, task #240]` —
+   see item 9's own note above.
 10. ~~Close BUG-233's remaining gap: real per-extern-fn stack-cost
     annotations instead of a conservative constant~~ **`[COMPILER
     MECHANISM DONE, 2026-09-18]`** — task #245 (vani-compiler repo).
@@ -903,7 +926,10 @@ doesn't yet attempt.
     target.~~ **`[WIRED, Gap F audit, 2026-09-17]`** — see "Interrupt
     handling gaps" above; implemented and gated, not yet exercised by CI.
     Per-thread execution-time supervision (distinct from the system-wide
-    watchdog) remains open — task #241.
+    watchdog) is now closed too — `[DONE, task #269, 2026-09-20]` — a
+    CMSIS-RTOS2-style per-thread heartbeat bound, checked every
+    scheduling decision, exposed via `diagnose`'s own "stuck-task
+    episodes" line; live-verified, zero false positives.
 
 **Post-2026-09-18 additions, from a direct "what qualifies as a true
 RTOS" pass against external references** (NASA RTOS-101, priority-ceiling

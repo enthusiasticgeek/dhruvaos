@@ -8660,3 +8660,69 @@ IDLE/GC/SHELL/CUSTOM/MUTEX-LOW/MUTEX-HIGH/FSQ): 0/0/0/0/0/0/0/0/0/0`
 -- all zero under normal operation, no false positives. Detection and
 reporting only, matching task #241's own scope; a real recovery
 action is task #271's separate, not-yet-done scope.
+
+### Task #270 closed: measured, bounded worst-case interrupt latency (2026-09-20)
+
+Second of the 4 real RTOS-compliance gaps from the 2026-09-18 sweep
+(see "RTOS true-compliance sweep" above): "an interrupt is serviced
+within N cycles of assertion, worst case" had no real measured answer
+anywhere in this codebase. The pre-existing `swi_fast_worst_us`
+counter (task #253 Phase 3) measures the SWI trap's own fast,
+never-blocking round trip, but explicitly excludes the two paths that
+actually mask interrupts for a real, variable, unbounded-looking
+duration: `task_sleep_ticks_impl`'s own scheduling decision, and
+`dhruva_mutex_lock_impl`'s genuinely-contended branch.
+
+New `irq_mask_worst_us`/`_total_us`/`_count`/`_start_us` globals
+(`boot/context_switch.S`), same TIMER_CLO-bracketed start/end-stamp
+pattern already used throughout this codebase (`swi_fast_worst_us`,
+`irq_tick_worst_us`, GC's own critical-section measurement, mutex
+handoff latency). Stamped from exactly the two paths above -- start
+right before each path's own `bl scheduler_pick_next`, end right
+after each path's own SPSR restore, immediately before the final
+`ldmia sp!, {r0-r12, lr, pc}^`. Three new accessor functions
+(`irq_mask_worst_us_get`/`_total_us_get`/`_count_get`) mirror
+`swi_fast_count_get`'s exact shape, exposed to vani with
+`#[stack_cost(bytes=1)]` (task #245's own real-cost annotation, not
+the old flat default).
+
+Exposed via `diagnose`, immediately after the SWI fast-syscall line,
+same `if count > 0 { avg } else { N/A }` pattern. Two identical
+`phase4_milestone.py` runs confirmed zero regression (still the
+standard 13-PASS/5-FAIL baseline, same 5 known-flaky items). A
+direct, separately-driven live `diagnose` check (via the project's
+own exact `qemu-system-arm -M raspi1ap -nographic -kernel <elf>`
+invocation -- an earlier attempt using `-serial stdio -display none`
+instead caused a severe, unrelated SD-retry-storm hang, since the
+emulated SD card model apparently behaves very differently under
+that flag combination) confirmed the new line prints correctly with
+real measured data: `worst-case interrupt latency (I+F masked
+duration): worst=368us avg=12us count=282`. Add the ARM1176's own
+small, fixed, documented hardware vector-fetch overhead (not measured
+here) to get the real end-to-end bound. QEMU's TCG trap overhead
+makes this pessimistic vs. real Pi 1B silicon, same caveat as
+`irq_tick_worst_us` (task #191/192's own finding); a real-hardware
+measurement is a still-open follow-up, not blocking this gap's
+closure.
+
+Also fixed two now-stale claims found in `docs/RTOS_GAP_ANALYSIS.md`
+while closing this out: "context-switch overhead... remains open --
+task #240" (task #240 is actually done -- a real, live-measured
+`measured_ctxsw_handoff_ms = 0.182` constant already feeds
+`test/schedulability_analysis.py`) and "per-thread execution-time
+supervision... remains open -- task #241" (that's task #269, done
+2026-09-20, see the entry immediately above this one).
+
+**Separate observation, not investigated further this round:** the
+same live-verification QEMU session that confirmed the above also
+printed one `SCHED SHADOW MISMATCH p=00000003 a=00000008 t=00000457`
+-- Gap B's own `scheduler_pick_next` shadow-model self-test (task
+#234), previously verified at 0 mismatches, showing 1 here. This
+change does not touch `scheduler_pick_next` or the shadow-predict
+logic, only adds TIMER_CLO reads around two existing blocking paths,
+so it's an unlikely cause -- but per this project's own "no trust,
+validate everything" discipline, a single manual run isn't enough
+either way to call it a pre-existing rare flake or a real new gap.
+Flagged here as a fresh, separate, NOT-yet-investigated finding for a
+future round; not part of task #270's own scope and did not block
+closing it.

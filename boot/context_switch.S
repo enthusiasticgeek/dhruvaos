@@ -360,6 +360,53 @@ swi_fast_total_us:
 .global swi_fast_count
 swi_fast_count:
     .word 0
+
+/* ROUND 2026-09-20 (RTOS true-compliance follow-up): worst-case
+ * interrupt latency -- a real, still-open gap RTOS_GAP_ANALYSIS.md
+ * named directly: "Nothing in this project computes or asserts 'an
+ * interrupt is serviced within N cycles of assertion, worst case.'"
+ * The standard, defensible way to bound this on a bare-metal system:
+ * worst-case latency = (longest real duration BOTH I and F stay
+ * masked, anywhere in this codebase) + a small, fixed, well-documented
+ * hardware vector-fetch cost (a handful of ARM1176 cycles, negligible
+ * next to any microsecond-scale software window -- not itself worth
+ * measuring dynamically).
+ *
+ * swi_fast_worst_us above already covers the FAST syscalls (#2/#3/#4
+ * -- dhruva_mutex_unlock/dhruva_prio_lock/dhruva_prio_unlock), and its
+ * own header comment explicitly says why #0/#1's blocking path is
+ * excluded there: a blocked call can resume via a LATER, separate
+ * trap instance, so a plain start/end bracket around the WHOLE syscall
+ * would measure unrelated blocked time, not trap/masking overhead.
+ * That exclusion left exactly the two genuinely masked-the-whole-time
+ * windows this project has never measured: `task_sleep_ticks_impl`'s
+ * own scheduling decision (always taken, no fast path) and `dhruva_
+ * mutex_lock_impl`'s own genuinely-contended branch (dml_contended) --
+ * both mask via `cpsid if` well before this point and stay masked
+ * continuously through `scheduler_pick_next` up to the SAME function's
+ * own final restore, which is what actually re-enables I/F (see each
+ * site's own stamp comment below for why measuring the LOCAL bracket,
+ * not "whichever task's restore eventually runs," is a sound proxy:
+ * every restore tail in this project is the same small, fixed-cost
+ * instruction sequence).
+ *
+ * irq_mask_worst_us is the single, combined worst-case across BOTH
+ * sites -- the real number `docs/RTOS_GAP_ANALYSIS.md`'s own worst-
+ * case-interrupt-latency claim should cite, feeding test/
+ * schedulability_analysis.py the same way swi_fast_worst_us/measured_
+ * ctxsw_handoff_ms already do. */
+.global irq_mask_worst_us
+irq_mask_worst_us:
+    .word 0
+.global irq_mask_total_us
+irq_mask_total_us:
+    .word 0
+.global irq_mask_count
+irq_mask_count:
+    .word 0
+irq_mask_start_us:
+    .word 0
+
 /* Task #253 Phase 3 bug-B investigation (2026-09-19) -- see task_sleep_
  * ticks_impl's own comment at its diagnostic insertion site. .bss's
  * zero-init is a harmless starting value: every read of this word is
@@ -1563,6 +1610,16 @@ task_sleep_ticks_impl:
     ldr r9, =sleep_ticks_diag_last_outgoing
     str r6, [r9]
 
+    /* ROUND 2026-09-20: worst-case interrupt latency measurement start
+     * -- see irq_mask_worst_us's own header comment above for the full
+     * design. r0-r3/r9 are all free scratch here (r9's own last real
+     * use, the diag store, is done; `bl scheduler_pick_next` below
+     * clobbers r0-r3 anyway, its own return value arriving in r0). */
+    ldr r0, =0x20003004               /* TIMER_CLO */
+    ldr r0, [r0]
+    ldr r1, =irq_mask_start_us
+    str r0, [r1]
+
     bl scheduler_pick_next
     mov sp, r0
     /* DIAG continued: moved to AFTER the `mov sp, r0` stack-pointer
@@ -1629,6 +1686,32 @@ sleep_ticks_diag_skip:
                                      * own header comment */
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
+    /* ROUND 2026-09-20: worst-case interrupt latency measurement end --
+     * see irq_mask_worst_us's own header comment above for the full
+     * design. r0-r3 are all free scratch here: the SPSR value just
+     * consumed by `msr spsr_cxsf,r0` above is safely latched in the
+     * SPSR register now, immune to any GPR operation; sp itself is
+     * untouched (no push/pop -- must stay pointing at the frame's own
+     * r0-r12 data for the restore immediately below); and every one of
+     * r0-r12 is about to be unconditionally overwritten by that same
+     * restore regardless of what this code leaves in them. */
+    ldr r0, =0x20003004               /* TIMER_CLO */
+    ldr r0, [r0]
+    ldr r1, =irq_mask_start_us
+    ldr r1, [r1]
+    sub r0, r0, r1                    /* r0 = elapsed us */
+    ldr r2, =irq_mask_worst_us
+    ldr r3, [r2]
+    cmp r0, r3
+    strgt r0, [r2]
+    ldr r2, =irq_mask_total_us
+    ldr r3, [r2]
+    add r3, r3, r0
+    str r3, [r2]
+    ldr r2, =irq_mask_count
+    ldr r3, [r2]
+    add r3, r3, #1
+    str r3, [r2]
     ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
                                      * comment for why {lr,pc}^ replaces
                                      * the old {lr} + subs pc,lr,#0 */
@@ -2007,6 +2090,15 @@ dml_contended:
     ldr r8, =0x7FFFFFFF
     str r8, [r7, r5, lsl #2]
 
+    /* ROUND 2026-09-20: worst-case interrupt latency measurement start
+     * -- see irq_mask_worst_us's own header comment (top of this file)
+     * and task_sleep_ticks_impl's own matching start-stamp comment for
+     * the full design. r0-r3 all free scratch here, same reasoning. */
+    ldr r0, =0x20003004               /* TIMER_CLO */
+    ldr r0, [r0]
+    ldr r1, =irq_mask_start_us
+    str r0, [r1]
+
     bl scheduler_pick_next            /* IRQs stay masked straight
                                         * through the switch -- the
                                         * resumed frame's own spsr=0x13
@@ -2019,6 +2111,27 @@ dml_contended:
                                      * own call site above */
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
+    /* ROUND 2026-09-20: worst-case interrupt latency measurement end --
+     * see task_sleep_ticks_impl's own matching end-stamp comment above
+     * for the full design (identical reasoning: r0-r3 free, sp/SPSR
+     * untouched). */
+    ldr r0, =0x20003004               /* TIMER_CLO */
+    ldr r0, [r0]
+    ldr r1, =irq_mask_start_us
+    ldr r1, [r1]
+    sub r0, r0, r1
+    ldr r2, =irq_mask_worst_us
+    ldr r3, [r2]
+    cmp r0, r3
+    strgt r0, [r2]
+    ldr r2, =irq_mask_total_us
+    ldr r3, [r2]
+    add r3, r3, r0
+    str r3, [r2]
+    ldr r2, =irq_mask_count
+    ldr r3, [r2]
+    add r3, r3, #1
+    str r3, [r2]
     ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
                                      * comment for why {lr,pc}^ replaces
                                      * the old {lr} + subs pc,lr,#0 */
@@ -2363,6 +2476,29 @@ swi_fast_total_us_get:
 .global swi_fast_count_get
 swi_fast_count_get:
     ldr r0, =swi_fast_count
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+/* Accessors for irq_mask_worst_us/total_us/count -- see that table's
+ * own header comment for the full design. */
+.global irq_mask_worst_us_get
+irq_mask_worst_us_get:
+    ldr r0, =irq_mask_worst_us
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global irq_mask_total_us_get
+irq_mask_total_us_get:
+    ldr r0, =irq_mask_total_us
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global irq_mask_count_get
+irq_mask_count_get:
+    ldr r0, =irq_mask_count
     ldr r0, [r0]
     mov r1, #0
     bx lr

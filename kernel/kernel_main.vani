@@ -2114,6 +2114,15 @@ extern "C" fn swi_fast_worst_us_get() -> u32;
 extern "C" fn swi_fast_total_us_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn swi_fast_count_get() -> u32;
+// ROUND 2026-09-20: worst-case interrupt latency -- see context_
+// switch.S's own irq_mask_worst_us/total_us/count header comment for
+// the full design.
+#[stack_cost(bytes=1)]
+extern "C" fn irq_mask_worst_us_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn irq_mask_total_us_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn irq_mask_count_get() -> u32;
 // TEST-ONLY -- see context_switch.S's own comment on
 // scheduler_set_tick_count_test_only.
 #[stack_cost(bytes=1)]
@@ -25406,6 +25415,31 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("us count=");
     let _ = uart_put_i64(swi_fast_count);
     let _ = uart_puts(" (dhruva_mutex_unlock/dhruva_prio_lock/dhruva_prio_unlock only -- see this counter's own header comment for why #0/#1's blocking path is excluded)\n");
+
+    // ROUND 2026-09-20: real, measured worst-case interrupt latency --
+    // see context_switch.S's own irq_mask_worst_us header comment for
+    // the full design. This covers exactly the two genuinely-masked-
+    // the-whole-time windows the SWI fast-syscall counter above
+    // explicitly excludes (task_sleep_ticks_impl's own scheduling
+    // decision, dhruva_mutex_lock_impl's own genuinely-contended
+    // branch) -- the real worst-case bound this project's own
+    // RTOS_GAP_ANALYSIS.md previously had nothing to cite for "an
+    // interrupt is serviced within N cycles of assertion, worst case."
+    // Add the ARM1176's own small, fixed vector-fetch overhead (a
+    // documented hardware constant, not measured here) to get the
+    // real end-to-end worst case.
+    let irq_mask_count: i64 = irq_mask_count_get() as i64;
+    let _ = uart_puts("  worst-case interrupt latency (I+F masked duration): worst=");
+    let _ = uart_put_i64(irq_mask_worst_us_get() as i64);
+    let _ = uart_puts("us avg=");
+    if irq_mask_count > 0 {
+      let _ = uart_put_i64((irq_mask_total_us_get() as i64) / irq_mask_count);
+    } else {
+      let _ = uart_puts("N/A");
+    }
+    let _ = uart_puts("us count=");
+    let _ = uart_put_i64(irq_mask_count);
+    let _ = uart_puts(" (task_sleep_ticks/dhruva_mutex_lock's own contended path only -- plus a small, fixed ARM1176 vector-fetch cost, not measured here, for the real end-to-end bound)\n");
     return 0;
   }
 
