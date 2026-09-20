@@ -8846,3 +8846,70 @@ margin reasoning for not attempting it yet still applies.
 closed**: per-thread execution-time supervision (#269), worst-case
 interrupt latency measurement (#270), real WCET/deadline enforcement
 (#271), and this task's own tick-constant decoupling (#272).
+
+### Task #273 closed: fixed a real shadow-model false-positive mismatch, root-caused against real Linux source (2026-09-20)
+
+Follow-up to task #270: that task's own live verification session
+(typing `diagnose` at the interactive UART shell) surfaced one real
+`SCHED SHADOW MISMATCH p=00000003 a=00000008 t=00000457` -- Gap B's
+own scheduler shadow-model self-test (task #234), previously verified
+at 0 mismatches across the automated regression suite. Flagged as a
+separate, not-yet-investigated finding at the time; investigated and
+fixed this round per explicit user request.
+
+Root cause, confirmed by tracing both real ISR entry points
+(`kernel_main.vani`): `irq_dispatch` (the UART RX path) calls
+`scheduling_decision_prelude()` -- which stashes this call's own
+shadow-predicted task plus a context-switch-count baseline -- at the
+very top of the function, then does substantial further real work (RX
+FIFO drain loop, up to 128 iterations) BEFORE its caller
+(`scheduler_switch_from_irq`, `context_switch.S`) actually invokes the
+real `scheduler_pick_next`. `timer_tick_dispatch` (the FIQ path) has
+the identical shape: prelude first, real work after.
+
+The automated `phase4_milestone.py` harness never triggered this
+because ordinary IRQ entry only masks further IRQ, never FIQ. This was
+suspected but not simply assumed -- checked against real Linux ARM32
+source (`arch/arm/kernel/entry-armv.S`) to confirm before writing any
+fix: the `vector_stub` macro's own comment reads "Prepare for SVC32
+mode. IRQs remain disabled," and the actual code (`eor r0, r0,
+#(\mode ^ SVC_MODE | PSR_ISETSTATE)`) only touches mode bits, leaving
+whatever F was in the interrupted context's own CPSR unchanged --
+i.e. real Linux does NOT mask FIQ during ordinary IRQ handling either.
+This is standard ARM32 behavior, not a DhruvaOS gap, and it directly
+ruled out the more drastic candidate fix (masking FIQ for the duration
+of `irq_dispatch`) -- Linux doesn't do that, and doing it here would
+have regressed task #246's own real FIQ-latency work. So: a real timer
+FIQ CAN legitimately preempt `irq_dispatch` mid-drain, run its own
+complete scheduling decision (context_switch_count can advance by
+exactly 1, tick_count always advances by exactly 1), and by the time
+the interrupted `irq_dispatch` finally reaches its own real `scheduler_
+pick_next` call, the world has moved on from what its own
+already-stashed prediction assumed -- yet the existing `ctxsw-delta<=1`
+guard, designed to catch "more than one intervening decision," doesn't
+catch this specific single-nested-decision case.
+
+Fixed with a second, narrower guard rather than touching `scheduler_
+pick_next` itself (consistent with this project's own established
+caution around that function -- round 75's real, never-fully-root-
+caused crash from white-box testing it directly, see Gap B/task #234's
+own shadow-model workaround). New `spn_shadow_tick_baseline`
+(`boot/context_switch.S`, same shape as the pre-existing
+`spn_shadow_ctxsw_baseline`), stamped via `scheduler_get_tick_count()`
+at the same moment the ctxsw baseline is stamped. The mismatch check
+now requires BOTH `ctxsw-delta<=1` AND `tick_count` still matching the
+baseline before trusting the comparison -- a nested FIQ always
+advances `tick_count` (that's the literal definition of a timer tick)
+while an ordinary UART RX IRQ never does, so this reliably
+distinguishes "a real nested scheduling decision happened" from "no
+intervening decision at all," which is exactly what the existing
+ctxsw-only guard couldn't do on its own.
+
+Two identical `phase4_milestone.py` runs confirm zero regression. Five
+separate live interactive QEMU sessions (10 total `diagnose`
+invocations -- the exact scenario that originally surfaced the bug)
+all show `scheduler shadow-model mismatches: 0 total` with no `SCHED
+SHADOW MISMATCH` output anywhere. Given the original race was
+observed only once across many prior sessions, this is strong but not
+absolute confidence -- consistent with the fix working, not
+mathematically exhaustive proof for a timing-dependent race.
