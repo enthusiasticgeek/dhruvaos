@@ -1945,6 +1945,21 @@ extern "C" fn task_deadline_worst_wait_table_set_at(index: u32, v: u32) -> i64;
 extern "C" fn task_deadline_miss_count_table_get_at(index: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn task_deadline_miss_count_table_increment_at(index: u32) -> u32;
+// ROUND 2026-09-20: per-thread execution-time supervision -- see
+// task_heartbeat_last_tick_table's own header comment in
+// boot/context_switch.S for the full design.
+#[stack_cost(bytes=1)]
+extern "C" fn task_heartbeat_last_tick_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn task_heartbeat_last_tick_table_set_at(index: u32, v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn task_heartbeat_bound_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn task_heartbeat_bound_table_set_at(index: u32, v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn task_heartbeat_stuck_count_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn task_heartbeat_stuck_count_table_increment_at(index: u32) -> u32;
 // ROUND 2026-09-18 (task #242): UART RX interrupt work, bounded
 // against a real sporadic-server-style budget -- see uart_rx_irq_
 // budget's own header comment in boot/uart_rx_budget_state.S for the
@@ -10179,6 +10194,57 @@ fn task_deadlines_init() -> i64 {
   return 0;
 }
 
+// ROUND 2026-09-20 (RTOS true-compliance follow-up): per-thread
+// execution-time supervision -- see task_heartbeat_last_tick_table's
+// own header comment in boot/context_switch.S for the full design and
+// why this answers a genuinely different question than task_deadlines_
+// init above. Bounds are a generous multiple (5-10x) of each task's
+// own declared task_sleep_ticks period, deliberately wide enough to
+// absorb every legitimate blocking/scheduling-jitter term this demo
+// set has ever measured (mutex handoff 174us worst case, task_e's own
+// GC/DHCP critical sections ~50ms, task_f's own worst network-blocking
+// term 325.6ms -- all comfortably under one 500ms tick, so even a
+// single-tick bound would technically be safe; the extra headroom is
+// for real margin, matching this project's own established convention,
+// not because the bare minimum was found insufficient).
+//
+// task_d/IDLE (index 3) is deliberately left at its .bss zero-init
+// (0 = not supervised) -- it never calls task_sleep_ticks at all (uses
+// cpu_wfi() instead), so it structurally has nothing to stamp here;
+// same reasoning CMSIS-RTOS2 uses for exempting the idle thread from
+// its own thread-watchdog check.
+fn task_heartbeat_init() -> i64 {
+  let now: u32 = scheduler_get_tick_count();
+  // Explicit seed for task_heartbeat_last_tick_table, not left to
+  // .bss's own zero-init -- correct either way AT THIS EXACT MOMENT
+  // (tick_count is genuinely 0 here too, called before start_
+  // multitasking), but explicit matches this project's own established
+  // discipline (see eff_prio_table's own free-slot-sentinel comment)
+  // and makes the invariant "last_tick is meaningful the instant bound
+  // becomes nonzero" hold by construction, not by lucky boot-order
+  // timing that a future change to the boot sequence could quietly
+  // break.
+  let _ = task_heartbeat_bound_table_set_at(0 as u32, 15 as u32);  // task_a, period 3
+  let _ = task_heartbeat_last_tick_table_set_at(0 as u32, now);
+  let _ = task_heartbeat_bound_table_set_at(1 as u32, 10 as u32);  // task_b, period 1
+  let _ = task_heartbeat_last_tick_table_set_at(1 as u32, now);
+  let _ = task_heartbeat_bound_table_set_at(2 as u32, 10 as u32);  // task_c, period 2
+  let _ = task_heartbeat_last_tick_table_set_at(2 as u32, now);
+  let _ = task_heartbeat_bound_table_set_at(4 as u32, 100 as u32); // task_e, period 20
+  let _ = task_heartbeat_last_tick_table_set_at(4 as u32, now);
+  let _ = task_heartbeat_bound_table_set_at(5 as u32, 20 as u32);  // task_f, period 2
+  let _ = task_heartbeat_last_tick_table_set_at(5 as u32, now);
+  let _ = task_heartbeat_bound_table_set_at(6 as u32, 35 as u32);  // task_custom_demo, period 7
+  let _ = task_heartbeat_last_tick_table_set_at(6 as u32, now);
+  let _ = task_heartbeat_bound_table_set_at(7 as u32, 10 as u32);  // task_mutex_demo_low, period 2
+  let _ = task_heartbeat_last_tick_table_set_at(7 as u32, now);
+  let _ = task_heartbeat_bound_table_set_at(8 as u32, 10 as u32);  // task_mutex_demo_high, period 2
+  let _ = task_heartbeat_last_tick_table_set_at(8 as u32, now);
+  let _ = task_heartbeat_bound_table_set_at(9 as u32, 25 as u32);  // task_fsq, period 5
+  let _ = task_heartbeat_last_tick_table_set_at(9 as u32, now);
+  return 0;
+}
+
 // boot/irq_entry.S and boot/rpi1/vectors.S's job.
 //
 // ROUND 2026-09-18 (task #246 wiring fix): the #[no_mangle]/
@@ -10263,6 +10329,37 @@ fn scheduling_decision_prelude() -> i64 {
       }
       if dl_wait == dl_deadline {
         let _ = task_deadline_miss_count_table_increment_at(dl_i as u32);
+      }
+    }
+  }
+
+  // ROUND 2026-09-20: per-thread execution-time supervision -- see
+  // task_heartbeat_last_tick_table's own header comment
+  // (boot/context_switch.S) for the full design. Answers a genuinely
+  // different question than the deadline-miss loop just above: "has
+  // this task stopped making its OWN real forward progress," not "has
+  // a ready task been kept waiting." Runs here for the same reason the
+  // deadline-miss check does -- this function fires on every real
+  // scheduling decision, the correct cadence for both checks.
+  //
+  // Edge-triggered the SAME way task_deadline_miss_count_table already
+  // is (only increments once per overrun episode, not once per tick
+  // for however long the overrun persists) -- checked via `>=` against
+  // the bound then immediately re-stamped to `now`, so a task that's
+  // GENUINELY stuck forever reports exactly one stuck episode per
+  // bound-length window it stays stuck through, not an ever-growing,
+  // unbounded count that would say more about how long this function
+  // has been running than about the actual number of distinct stuck
+  // episodes.
+  for hb_i from 0 to 10 {
+    let hb_bound: u32 = task_heartbeat_bound_table_get_at(hb_i as u32);
+    if hb_bound != (0 as u32) {
+      let hb_now: u32 = scheduler_get_tick_count();
+      let hb_last: u32 = task_heartbeat_last_tick_table_get_at(hb_i as u32);
+      let hb_elapsed: u32 = hb_now - hb_last;
+      if hb_elapsed >= hb_bound {
+        let _ = task_heartbeat_stuck_count_table_increment_at(hb_i as u32);
+        let _ = task_heartbeat_last_tick_table_set_at(hb_i as u32, hb_now);
       }
     }
   }
@@ -25238,6 +25335,37 @@ fn shell_dispatch() -> i64 {
     let _ = uart_put_i64(task_deadline_worst_wait_table_get_at(2 as u32) as i64);
     let _ = uart_puts(" ticks (expected to stay BELOW each task's own declared deadline 3/1/2 -- reaching it exactly is what the miss counts above track)\n");
 
+    // ROUND 2026-09-20: per-thread execution-time supervision -- see
+    // task_heartbeat_last_tick_table's own header comment
+    // (boot/context_switch.S) for the full design. A different
+    // question than the deadline-miss row above: "has this task
+    // stopped making its own real forward progress" (execution
+    // liveness), not "has a ready task been kept waiting"
+    // (scheduling starvation). task_d/IDLE has no bound (never calls
+    // task_sleep_ticks), so its own column reads 0 by construction,
+    // same as the deadline row's own IDLE/GC/SHELL columns above.
+    let _ = uart_puts("  stuck-task episodes (HIGH/MEDIUM/LOW/IDLE/GC/SHELL/CUSTOM/MUTEX-LOW/MUTEX-HIGH/FSQ): ");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(0 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(1 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(2 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(3 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(4 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(5 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(6 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(7 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(8 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(9 as u32) as i64);
+    let _ = uart_puts(" (each expected to stay 0 under normal operation -- a nonzero count means that task went >= its own declared bound of ticks without a single voluntary task_sleep_ticks/blocking-mutex call)\n");
+
     // ROUND 2026-09-18 (task #242): UART RX sporadic-server budget --
     // see uart_rx_irq_budget's own header comment in boot/uart_rx_
     // budget_state.S. deferred=1 means RX is CURRENTLY masked (a
@@ -36946,6 +37074,7 @@ fn kernel_main() -> i64 {
   let _ = delay_wcet_measure_self_test();
   let _ = i64_div_wcet_measure_self_test();
   let _ = task_deadlines_init();
+  let _ = task_heartbeat_init();
   // ROUND 2026-09-18 (task #242): seed the very first tick's own UART
   // RX budget before interrupts are ever enabled -- .bss's zero-init
   // would otherwise leave it at 0 until the first real timer tick sets

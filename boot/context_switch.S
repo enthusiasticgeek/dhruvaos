@@ -531,6 +531,58 @@ task_deadline_miss_count_table:
                          * per decision -- see irq_dispatch's own call
                          * site for the exact check). */
 
+/* ROUND 2026-09-20 (RTOS true-compliance follow-up): per-thread
+ * execution-time supervision -- a real, still-open gap the audit's own
+ * RTOS_GAP_ANALYSIS.md named directly: "No per-thread execution-time
+ * supervision, only a system-wide watchdog... CMSIS-RTOS2's 'thread
+ * watchdog' pattern (a per-thread timeout, checked independently) is
+ * the standard reference design." task_deadline_ticks_table above
+ * (task #241) answers a DIFFERENT question -- "how long has a READY
+ * task been kept WAITING to be scheduled" (starvation/priority-
+ * inversion) -- and is structurally blind to the failure this table
+ * exists for: a task that IS running (or genuinely, correctly
+ * blocked) but has stopped making its own real forward progress,
+ * which never shows up in ready_wait_ticks_table at all (a running
+ * task's own "ready wait" is always 0).
+ *
+ * task_heartbeat_last_tick_table: tick_count at the moment task[i]
+ * last voluntarily gave up the CPU for a real, sanctioned reason --
+ * task_sleep_ticks_impl (which ALWAYS blocks, no fast path) or
+ * dhruva_mutex_lock_impl's own genuinely-contended branch (a real
+ * wait for a resource, not a bug) -- see each function's own stamp
+ * site below. Deliberately NOT stamped by dhruva_mutex_lock's own
+ * fast/uncontended path, dhruva_prio_lock/unlock, or any other
+ * syscall: those are point-in-time calls a genuinely stuck task
+ * (looping forever without ever reaching its own next real
+ * task_sleep_ticks/blocking-mutex call) could still make repeatedly,
+ * which would defeat the whole point of this check by looking like
+ * proof of life when it isn't.
+ *
+ * task_heartbeat_bound_table: 0 = not supervised (task_d/IDLE's own
+ * permanent value -- it never calls task_sleep_ticks at all, using
+ * cpu_wfi() instead, so it structurally can't have a heartbeat here;
+ * an idle thread isn't watchdog-supervised in the CMSIS-RTOS2 model
+ * either). Every other task gets a real, generous multiple of its own
+ * declared wake period (task_heartbeat_init, kernel_main.vani) --
+ * generous specifically to absorb legitimate scheduling jitter and
+ * blocking (this demo set's own measured worst mutex-handoff latency
+ * is 174us, task_e/task_f's own measured worst blocking terms are
+ * 50ms/325.6ms respectively -- all comfortably under one 500ms tick)
+ * without ever false-triggering on normal operation.
+ *
+ * task_heartbeat_stuck_count_table: incremented once per overrun
+ * episode the SAME edge-triggered discipline task_deadline_miss_
+ * count_table above uses (see scheduling_decision_prelude's own check,
+ * kernel_main.vani) -- detection and reporting only, matching task
+ * #241's own scope; a real recovery ACTION (distinct from detection)
+ * is task #271's own separate, not-yet-done scope. */
+task_heartbeat_last_tick_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+task_heartbeat_bound_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+task_heartbeat_stuck_count_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
 /* ROUND 2026-09-18 (task #253, RTOS true-compliance pass): real USR-
  * mode task execution needs its own per-task state, separate from
  * everything above -- r13_usr/r14_usr (the "user stack pointer"/"user
@@ -674,6 +726,57 @@ task_deadline_miss_count_table_get_at:
 .global task_deadline_miss_count_table_increment_at
 task_deadline_miss_count_table_increment_at:
     ldr r1, =task_deadline_miss_count_table
+    ldr r2, [r1, r0, lsl #2]
+    add r2, r2, #1
+    str r2, [r1, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* Accessors for task_heartbeat_last_tick_table/task_heartbeat_bound_
+ * table/task_heartbeat_stuck_count_table -- see those tables' own
+ * header comment above for the full design. Same shape as every other
+ * accessor in this file. */
+.global task_heartbeat_last_tick_table_get_at
+task_heartbeat_last_tick_table_get_at:
+    ldr r1, =task_heartbeat_last_tick_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global task_heartbeat_last_tick_table_set_at
+task_heartbeat_last_tick_table_set_at:
+    ldr r2, =task_heartbeat_last_tick_table
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global task_heartbeat_bound_table_get_at
+task_heartbeat_bound_table_get_at:
+    ldr r1, =task_heartbeat_bound_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global task_heartbeat_bound_table_set_at
+task_heartbeat_bound_table_set_at:
+    ldr r2, =task_heartbeat_bound_table
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global task_heartbeat_stuck_count_table_get_at
+task_heartbeat_stuck_count_table_get_at:
+    ldr r1, =task_heartbeat_stuck_count_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global task_heartbeat_stuck_count_table_increment_at
+task_heartbeat_stuck_count_table_increment_at:
+    ldr r1, =task_heartbeat_stuck_count_table
     ldr r2, [r1, r0, lsl #2]
     add r2, r2, #1
     str r2, [r1, r0, lsl #2]
@@ -1426,6 +1529,21 @@ task_sleep_ticks_impl:
     ldr r9, =sp_table
     str r4, [r9, r6, lsl #2]        /* sp_table[current] = our saved sp */
 
+    /* ROUND 2026-09-20 (RTOS true-compliance follow-up): proof-of-life
+     * stamp for the new per-thread execution-time supervision check --
+     * see task_heartbeat_last_tick_table's own header comment above for
+     * the full design. task_sleep_ticks always reaches this point (no
+     * fast/no-op path, unlike dhruva_mutex_lock below), so this stamp
+     * is unconditional. r7 still points at tick_count's own address
+     * (loaded above, never overwritten); r8 was consumed into wake_time
+     * (tick_count+ticks) already stored to sleep_until_table two lines
+     * up, so it's free to reuse -- reload the RAW tick_count fresh
+     * rather than trying to reconstruct it by subtracting r0 back out
+     * of the now-mixed wake_time value. */
+    ldr r8, [r7]
+    ldr r9, =task_heartbeat_last_tick_table
+    str r8, [r9, r6, lsl #2]
+
     /* Task #253 Phase 3 bug-B investigation (2026-09-19, live A/B
      * re-attempt froze solid -- HIGH/MEDIUM/IDLE all stopped advancing,
      * not just the shell -- with task_a converted to USR mode, matching
@@ -1868,6 +1986,19 @@ dml_contended:
     ldr r1, =tick_count
     ldr r2, [r1]
     ldr r1, =mutex_block_start_tick_table
+    str r2, [r1, r5, lsl #2]
+
+    /* ROUND 2026-09-20 (RTOS true-compliance follow-up): same proof-
+     * of-life stamp as task_sleep_ticks_impl's own -- see task_
+     * heartbeat_last_tick_table's own header comment above for the
+     * full design. This IS the genuinely-contended branch (a real
+     * wait for a resource, not a bug) -- the fast/uncontended path
+     * above returns immediately without ever reaching here, and is
+     * deliberately NOT stamped (see that table's own comment on why).
+     * r2 already holds the fresh tick_count value just stored to
+     * mutex_block_start_tick_table; r1 is free again immediately
+     * after that store. */
+    ldr r1, =task_heartbeat_last_tick_table
     str r2, [r1, r5, lsl #2]
 
     /* Block: never ready via the ordinary tick comparison until
