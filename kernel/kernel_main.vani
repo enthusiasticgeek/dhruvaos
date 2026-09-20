@@ -5823,6 +5823,50 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // is safe) -- confines the overhead to exactly the intended test.
   let use_write_diag: bool = (block_num >= 2100) && (block_num < 2108);
   let _ = if use_write_diag { sdhost_fill_fifo_from_buffer_diag(buf, 128) } else { sdhost_fill_fifo_from_buffer(buf, 128) };
+
+  // ROUND 2026-09-20 (task #278, real-HW SD write-wedge investigation,
+  // 17th round): FreeBSD's own independent bcm2835_sdhost driver
+  // (sys/arm/broadcom/bcm2835/bcm2835_sdhost.c, fetched fresh -- an
+  // SDHCI-shim architecture genuinely different from Linux/U-Boot's
+  // shared lineage, not just another copy of the same original
+  // reverse-engineering effort) does something neither of those two
+  // does in their own PIO fill loop: after pushing every word into
+  // the FIFO, it explicitly polls the SAME FIFO-occupancy field this
+  // driver's own fill loop already reads ((SDEDM>>4)&0x1F) until it
+  // reads exactly 0 -- "wait until FIFO is really empty", its own
+  // comment -- BEFORE ever looking at FSM state at all. This driver's
+  // own fill loop (sdhost_fill_fifo_from_buffer(_diag), boot/sdcard_
+  // state.S) stops the instant there's room for the LAST word, then
+  // goes straight to polling FSM state via sdhost_wait_transfer_
+  // complete below -- never confirming the FIFO itself actually
+  // finished draining out to the card first. Adding FreeBSD's own
+  // missing step as new instrumentation: bounded (1,000,000 iterations,
+  // matching sdhost_cmd's own "a wedged card can never hang the caller
+  // forever" cap), with a real diagnostic print on timeout -- new
+  // evidence either way, since no prior diagnostic in this
+  // investigation has ever read FIFO occupancy at this exact point,
+  // only FSM state. If this DOES resolve the wedge, the fill loop was
+  // returning before the FIFO genuinely finished draining and FSM
+  // state was never going to unstick on its own without this. If it
+  // does NOT (FIFO reads 0 immediately, no different from before),
+  // that's still new, real information: it rules out "FIFO itself
+  // stuck non-empty" and confirms the wedge is purely an FSM-state
+  // phenomenon, narrowing the search further.
+  let fifo_drain_iter: i64 = 0;
+  while fifo_drain_iter < 1000000 {
+    let edm_drain: u32 = mmio_read_u32(SDEDM);
+    let fifo_occupancy: u32 = (edm_drain >> (4 as u32)) & (0x1F as u32);
+    if fifo_occupancy == (0 as u32) {
+      break;
+    }
+    fifo_drain_iter = fifo_drain_iter + 1;
+  }
+  if fifo_drain_iter >= 1000000 {
+    let _ = uart_puts("SD DIAG: FIFO-drain-to-empty poll timed out (new signal, never checked before) SDEDM=0x");
+    let _ = uart_put_hex32(mmio_read_u32(SDEDM));
+    let _ = uart_puts("\n");
+  }
+
   let edm_after_pio: u32 = mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_writestart1);
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
