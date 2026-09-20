@@ -358,6 +358,20 @@ swi_fast_total_us:
 .global swi_fast_count
 swi_fast_count:
     .word 0
+/* Task #253 Phase 3 bug-B investigation (2026-09-19) -- see task_sleep_
+ * ticks_impl's own comment at its diagnostic insertion site. .bss's
+ * zero-init is a harmless starting value: every read of this word is
+ * gated behind the SAME function invocation's own prior write (the
+ * store happens unconditionally right before `bl scheduler_pick_next`;
+ * the gated read happens right after, on the same straight-line path),
+ * so the initial value is never actually observed either way. */
+sleep_ticks_diag_last_outgoing:
+    .word 0
+/* Task #253 Phase 3 bug-B investigation (2026-09-19) -- caps sleep_
+ * ticks_diag_print at 8 total firings, see that print's own call site
+ * for the full "why". */
+sleep_ticks_diag_fire_count:
+    .word 0
 mutex_block_start_tick_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
                         /* tick_count at the moment task[i] most
@@ -1358,8 +1372,84 @@ task_sleep_ticks_impl:
     ldr r9, =sp_table
     str r4, [r9, r6, lsl #2]        /* sp_table[current] = our saved sp */
 
+    /* Task #253 Phase 3 bug-B investigation (2026-09-19, live A/B
+     * re-attempt froze solid -- HIGH/MEDIUM/IDLE all stopped advancing,
+     * not just the shell -- with task_a converted to USR mode, matching
+     * this file's own long-documented open question: this exact block-
+     * then-much-later-resume cycle "had literally never been exercised
+     * by a genuinely USR-mode-originated call before task_a's or task_
+     * b's own conversion attempts," per kernel_main.vani's own task_a
+     * setup comment). Record the OUTGOING task index into memory
+     * (cheap, unconditional, one store -- not gated, since this alone
+     * can't corrupt anything or cost meaningfully more than the
+     * existing sp_table store two lines above) so the gated print below
+     * can report it without needing r6 to survive the upcoming `bl
+     * scheduler_pick_next` (AAPCS says it should, as a callee-saved
+     * register, but this exact file has hit that assumption being wrong
+     * before -- not worth risking on a diagnostic meant to be trustworthy
+     * evidence). */
+    ldr r9, =sleep_ticks_diag_last_outgoing
+    str r6, [r9]
+
     bl scheduler_pick_next
     mov sp, r0
+    /* DIAG continued: moved to AFTER the `mov sp, r0` stack-pointer
+     * switch above -- NOT a stylistic choice. `scheduler_pick_next`'s
+     * own LAST action before returning is the round-192 DACR domain
+     * switch, restricting memory access to the NEWLY PICKED task's own
+     * domain (plus domain 0) -- see that function's own header comment.
+     * The first version of this diagnostic ran its push/pop BEFORE this
+     * `mov sp, r0`, meaning "sp" was still the OUTGOING task's own
+     * stack pointer while DACR had ALREADY switched to the new task's
+     * domain -- exactly the same bug class scheduler_pick_next's own
+     * "BUG caught live" fix (see its comment: "the DACR write must NOT
+     * happen here... closes the OUTGOING task's own domain while sp is
+     * STILL pointing into it") already exists to prevent, reintroduced
+     * here by this diagnostic's own push/pop. Live-reproduced: a real
+     * Data Abort (status=0000082B, ARMv6 DFSR "Domain fault, Page"),
+     * fault address squarely inside a DIFFERENT task's own domain,
+     * reproduced identically whether or not task_a itself was in USR
+     * or SVC mode -- proving this was never a USR-mode-specific bug at
+     * all, just this diagnostic's own placement. Now that sp has
+     * already been switched, any push/pop below operates on the newly-
+     * picked task's own genuine, DACR-matching stack -- safe. Fires
+     * only when the FRESH current_task read is 0 (task_a) -- i.e. only
+     * on a real "task_a is about to resume" event, not on every single
+     * call this function receives from every other task project-wide.
+     * Bounded by construction: this can fire at most as often as task_a
+     * itself is actually scheduled -- not the kind of unconditional
+     * hot-path print this project's own history has been burned by
+     * twice already this session (see docs/TODO.md's own SD write-
+     * diagnostic entries). r0 no longer needs preserving across the
+     * print -- its only job (holding the chosen task's sp) is already
+     * done, consumed into sp itself by the `mov sp, r0` above. */
+    ldr r1, =current_task
+    ldr r1, [r1]
+    cmp r1, #0
+    bne sleep_ticks_diag_skip
+    /* Capped at 8 firings total (2026-09-19, self-caught via phase4_
+     * milestone.py): this print already delivered its verdict (task_a's
+     * own involuntary resume works; the real remaining bug is elsewhere
+     * -- see kernel_main.vani's own task_a setup comment). Left
+     * uncapped, it fires on every task_a wake cycle project-wide
+     * (~24/run measured), and its own cumulative blocking-UART cost
+     * was enough to occasionally tip tlsecho past its blind SETTLE_S
+     * budget (same class of regression as this session's own SD
+     * force_data_mode_settle finding) -- confirmed via two otherwise-
+     * identical regression runs, one clean and one with tlsecho newly
+     * failing. Capping keeps the diagnostic available (first 8 real
+     * events is ample evidence for a future investigation) without an
+     * ongoing per-run cost. */
+    ldr r2, =sleep_ticks_diag_fire_count
+    ldr r3, [r2]
+    cmp r3, #8
+    bge sleep_ticks_diag_skip
+    add r3, r3, #1
+    str r3, [r2]
+    ldr r0, =sleep_ticks_diag_last_outgoing
+    ldr r0, [r0]
+    bl sleep_ticks_diag_print
+sleep_ticks_diag_skip:
     bl scheduler_restore_usr_sp     /* task #253: no-op unless the task
                                      * about to resume (current_task, set
                                      * by scheduler_pick_next just above)
@@ -1370,6 +1460,91 @@ task_sleep_ticks_impl:
     ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
                                      * comment for why {lr,pc}^ replaces
                                      * the old {lr} + subs pc,lr,#0 */
+
+/* Task #253 Phase 3 bug-B investigation (2026-09-19): self-contained,
+ * blocking raw-UART print helpers for the gated diagnostic above --
+ * same pattern already established twice this session (boot/sdcard_
+ * state.S's own sdhost_diag_* helpers) for exactly this situation:
+ * printing from deep inside hand-written assembly where neither vani's
+ * uart_puts (unsafe calling convention from raw asm) nor the async
+ * ring-buffer path (non-blocking, could drop bytes, and could itself
+ * recurse into scheduler state this diagnostic is trying to observe)
+ * are appropriate. Deliberately a fresh, file-local copy rather than
+ * reusing sdcard_state.S's own (not .global there) -- keeps this
+ * diagnostic fully self-contained and removable as one unit once bug B
+ * is root-caused. Only ever touches r0-r3 -- see sleep_ticks_diag_print
+ * itself, the only entry point this file's own diagnostic code calls;
+ * the other three are its own internal helpers, called only from here. */
+sched_diag_putc:
+    push {r1, r3}
+sched_diag_putc_wait:
+    ldr r1, =0x20201018      /* UART_FR */
+    ldr r3, [r1]
+    tst r3, #0x20             /* TXFF */
+    bne sched_diag_putc_wait
+    ldr r1, =0x20201000      /* UART_DR */
+    strb r0, [r1]
+    pop {r1, r3}
+    bx lr
+
+sched_diag_puts:
+    push {r0, lr}
+    mov r3, r0
+sched_diag_puts_loop:
+    ldrb r0, [r3], #1
+    cmp r0, #0
+    beq sched_diag_puts_done
+    push {r3}
+    bl sched_diag_putc
+    pop {r3}
+    b sched_diag_puts_loop
+sched_diag_puts_done:
+    pop {r0, lr}
+    bx lr
+
+sched_diag_put_hex1:
+    push {r0, lr}
+    and r0, r0, #0xF
+    cmp r0, #9
+    addgt r0, r0, #('A' - 10 - '0')
+    add r0, r0, #'0'
+    bl sched_diag_putc
+    pop {r0, lr}
+    bx lr
+
+sched_diag_put_hex32:
+    push {r0-r3, lr}
+    mov r3, #8
+    mov r2, r0
+sched_diag_put_hex32_loop:
+    mov r0, r2, lsr #28
+    bl sched_diag_put_hex1
+    mov r2, r2, lsl #4
+    subs r3, r3, #1
+    bne sched_diag_put_hex32_loop
+    pop {r0-r3, lr}
+    bx lr
+
+/* void sleep_ticks_diag_print(r0 = outgoing task index) -- prints
+ * "SLEEP: task_a resumed, outgoing=<hex>\n". Called only from task_
+ * sleep_ticks_impl's own gated diagnostic above (current_task==0 at
+ * that exact point), so the "resumed" framing is always accurate. */
+sleep_ticks_diag_print:
+    push {r0, lr}
+    ldr r0, =sleep_ticks_diag_msg
+    bl sched_diag_puts
+    pop {r0, lr}
+    push {lr}
+    bl sched_diag_put_hex32
+    mov r0, #10
+    bl sched_diag_putc
+    pop {lr}
+    bx lr
+
+.section ".rodata"
+sleep_ticks_diag_msg:
+    .asciz "SLEEP: task_a resumed, outgoing="
+.section ".text"
 
 /* i64 dhruva_prio_lock(i64 ceiling) -- boosts the calling task's effective
  * priority to `ceiling`. i64 dhruva_prio_unlock(i64 base_priority) --

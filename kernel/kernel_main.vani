@@ -35835,6 +35835,21 @@ fn kernel_main() -> i64 {
   let stack_bytes: i64 = 4096;
   let stack_a: mut ref i64 = dhruva_alloc_stack_domain(stack_bytes as u32, 0 as u32);
   let _ = stack_canary_set_base(0 as u32, stack_a);
+  // task_a's own USR-mode stack allocation (dhruva_alloc_usrstack_
+  // domain(stack_bytes, 0)) + deferred usr_sp_table seed would belong
+  // here / right before start_multitasking respectively -- omitted
+  // while task_a stays reverted to plain SVC. Two live A/B re-attempts
+  // this round (2026-09-19): #1 hit a Data Abort that turned out to be
+  // caused by this investigation's OWN diagnostic tooling (sleep_ticks_
+  // diag_print, context_switch.S -- fixed, see that function's own
+  // header comment), NOT a real task_a/USR-mode bug -- confirmed via a
+  // control run (task_a back in SVC, identical crash reproduced). #2,
+  // with the diagnostic fixed, confirmed task_a's own first involuntary
+  // resume genuinely works, but reproduced a real, still-open total
+  // system freeze (not just shell starvation) after task_a's SECOND
+  // wake cycle -- see this function's own task_a setup site below for
+  // the full account. Restore both lines when task_a is next
+  // re-attempted.
   let stack_b: mut ref i64 = dhruva_alloc_stack_domain(stack_bytes as u32, 1 as u32);
   let _ = stack_canary_set_base(1 as u32, stack_b);
   let stack_c: mut ref i64 = dhruva_alloc_stack_domain(stack_bytes as u32, 2 as u32);
@@ -36098,6 +36113,57 @@ fn kernel_main() -> i64 {
   //    goes) -- a dedicated session, not another blind attempt.
   //    Reverted to SVC again, keeping fixes #1 and #3 above (both real
   //    and needed regardless of when task_a is re-attempted).
+  // LIVE A/B RE-ATTEMPT #1 (2026-09-19, task #253 Phase 3): re-enabled
+  // task_a in USR mode to test whether the ~22% SWI round-trip
+  // reduction (task_a_wake_body's own redundant nested ceiling-lock
+  // removal) was enough to stop starving the shell. Produced a real
+  // Data Abort, ctxsw=2, status=0000082B (ARMv6 DFSR "Domain fault,
+  // Page"), fault address squarely inside TASK_B's own protected
+  // domain (task #192's per-task-domain scheme) -- INITIALLY suspected
+  // as a genuine task_a-USR-mode bug in task_sleep_ticks_impl's
+  // involuntary-resume path.
+  //
+  // MISDIAGNOSIS CAUGHT (re-attempt #2, same day): re-ran with task_a
+  // reverted back to plain SVC mode, as a control -- the IDENTICAL
+  // crash reproduced byte-for-byte. This proved the fault had NOTHING
+  // to do with task_a's USR/SVC mode at all: the real cause was this
+  // investigation's OWN diagnostic (sleep_ticks_diag_print, context_
+  // switch.S), which fires whenever current_task==0 is freshly picked
+  // regardless of that task's privilege mode. Root cause: the
+  // diagnostic's own push/pop ran BEFORE `mov sp, r0` in task_sleep_
+  // ticks_impl, meaning it touched memory via the OUTGOING task's own
+  // stack pointer AFTER scheduler_pick_next had ALREADY switched DACR
+  // to the NEWLY PICKED task's domain -- exactly the same bug class
+  // scheduler_pick_next's own "BUG caught live" fix already exists to
+  // prevent (see that function's own header comment), reintroduced by
+  // this diagnostic's placement. Fixed by moving the diagnostic to
+  // after the sp switch -- see sleep_ticks_diag_print's own call site
+  // in context_switch.S for the full account. A real, if humbling,
+  // instance of this project's own [[feedback_no_trust_validate_
+  // everything]] discipline: the FIRST live crash was assumed to
+  // confirm the hypothesized bug rather than checked against a control.
+  //
+  // With that confound removed, re-enabled task_a in USR mode again for
+  // a clean read. RESULT: no crash this time -- confirms task_a's own
+  // FIRST involuntary resume (via irq_entry.S's shared restore path,
+  // NOT task_sleep_ticks_impl's own tail -- the fixed diagnostic
+  // printed "SLEEP: task_a resumed, outgoing=00000008" cleanly,
+  // proving the blocking-resume mechanism itself is sound) works
+  // correctly. But the ORIGINAL, real issue reproduces unchanged: after
+  // exactly 2 "HIGH: waking/acquired/released resource" cycles, the
+  // ENTIRE system goes silent -- not just the shell (task_c), but
+  // MEDIUM/idle/every background task too, with no crash report and no
+  // reboot (QEMU keeps running, nothing observable happens). This is a
+  // materially different, better-understood failure than the vague
+  // "shell stops responding" this file's own THIRD-round comment
+  // originally reported: a total scheduler freeze, not a fairness/
+  // aging-tuning shortfall alone -- something specific to task_a's
+  // SECOND wake cycle in USR mode wedges the whole system, not merely
+  // starves one task relative to others. Needs its own dedicated live-
+  // GDB investigation (same discipline as every other deep bug this
+  // project has hit) -- not resolved this round. Reverted to plain SVC
+  // mode again rather than shipping a build that reliably hangs; see
+  // docs/TODO.md for the full writeup and the real next steps.
   let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
   // Task #253 Phase 3, task_b -- ALSO reverted to SVC mode (2026-09-19).
   // Converted to USR mode as the "sidesteps task_a's ceiling-priority

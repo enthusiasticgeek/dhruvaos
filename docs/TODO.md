@@ -7920,6 +7920,117 @@ ruled out, or measure the remaining per-syscall cost directly (a
 `WCET DIAG` line, matching this project's existing measurement
 discipline) to see exactly where the remaining time goes.
 
+**Task #253 Phase 3, task_a -- FIFTH round, same day (2026-09-19):
+real instrumentation added, a real misdiagnosis caught and corrected,
+and a genuinely new, better-understood open bug.** User asked
+specifically for more instrumentation and to check reputable OS source
+as a guide, given how important the USR/SVC scheduler boundary is.
+
+*Instrumentation*: added real, `TIMER_CLO`-measured worst/avg/count
+stats for the SWI trap's fast (never-blocking) round trip -- syscalls
+#2/#3/#4 (`dhruva_mutex_unlock`/`dhruva_prio_lock`/`dhruva_prio_unlock`),
+exposed via `diagnose`. Deliberately excludes #0/#1's blocking path
+(can resume via a later, separate trap instance, so a plain bracket
+would measure unrelated blocked time, not trap overhead).
+
+*Reputable-OS check*: fetched seL4's real `arm_swi_syscall`
+(`src/arch/arm/32/traps.S`, seL4/seL4 master) -- a formally-verified
+microkernel on this exact classic-ARM banked-register USR/SVC
+architecture, about as reputable and latency-obsessed a reference as
+exists for this problem. Confirmed seL4 pays a FULL unconditional
+register save (`stmdb sp, {r0-lr}^`) on every single trap, including
+its own `CONFIG_FASTPATH` -- the fastpath check for its two hottest
+syscalls happens AFTER that same full save, skipping only the
+downstream generic dispatch/capability-lookup cost, never the entry
+save itself. This project's own entry already does LESS work than
+seL4's baseline (r0-r12 are genuinely unbanked, never saved at all --
+only sp_usr/lr_svc/SPSR, which actually need it), confirming the real
+lever is reducing HOW OFTEN a hot path traps, not shrinking each trap
+further.
+
+*Applied directly*: `task_a_wake_body`'s own explicit
+`dhruva_prio_lock(0)`/`dhruva_prio_unlock(0)` pair wrapped ONLY a
+single `uart_puts_bounded` call that already takes the identical
+ceiling-0 lock internally -- a fully redundant nested trap pair with
+zero behavioral effect (uart_puts_bounded's own internal lock already
+produces the identical eff_prio_table transitions). Removed it, cutting
+2 of task_a's own 9 SWI round trips per 3-tick wake cycle (~22%).
+
+*Real bug #1, self-caught via the mandatory regression run*: the new
+instrumentation used `r6` as bare scratch across the traced impl call
+without saving it. `r6` is AAPCS callee-saved -- the three impl
+functions themselves preserve it correctly, but the SWI trampolines
+(`dhruva_prio_lock`/`_unlock`/`dhruva_mutex_unlock`) only ever save/
+restore `r4`/`r7` around the whole trap, so a vani caller holding a
+live value in `r6` across one of these calls had it silently destroyed
+(surfaced as an "integer overflow in u32 sub" panic elsewhere in the
+same boot -- the same corrupted-register-surfaces-later bug class this
+file has hit before). Fixed by push/pop-ing `r6` around the entire
+measured region in each dispatch stub.
+
+*Live A/B re-attempt #1*: re-enabled task_a in USR mode with both
+fixes in place. Produced a real Data Abort, `ctxsw=2`, `status=
+0000082B` (ARMv6 DFSR "Domain fault, Page"), fault address squarely
+inside TASK_B's own protected domain (task #192's per-task-domain
+scheme) -- initially read as a genuine task_a/USR-mode bug in task_
+sleep_ticks_impl's involuntary-resume path.
+
+*Misdiagnosis caught (re-attempt #2, same day)*: re-ran with task_a
+reverted back to plain SVC mode as a control -- the IDENTICAL crash
+reproduced byte-for-byte, proving the fault had nothing to do with
+task_a's privilege mode. Real root cause: a NEW diagnostic added this
+same round to investigate the crash (`sleep_ticks_diag_print`,
+`context_switch.S`, gated on the freshly-picked task being
+`current_task==0`) ran its own push/pop BEFORE `mov sp, r0` in `task_
+sleep_ticks_impl` -- meaning it touched memory via the OUTGOING task's
+own stack pointer AFTER `scheduler_pick_next` had ALREADY switched DACR
+to the NEWLY PICKED task's domain (that function's own last action
+before returning). Exactly the same bug class `scheduler_pick_next`'s
+own "BUG caught live" fix already exists to prevent (see its header
+comment), reintroduced by this diagnostic's own placement. Fixed by
+moving the diagnostic to after the sp switch. A genuine instance of
+this project's own `feedback_no_trust_validate_everything` discipline:
+the first live crash was assumed to confirm the hypothesized bug rather
+than checked against a control.
+
+*Live A/B re-attempt #3*: with the diagnostic's own bug fixed,
+re-enabled task_a in USR mode again for a clean read. Result: no crash
+-- `SLEEP: task_a resumed, outgoing=00000008` printed cleanly, proving
+task_a's own first involuntary resume (via irq_entry.S's shared restore
+path) genuinely works. But the real, original issue reproduced
+unchanged: after exactly 2 "HIGH: waking/acquired/released resource"
+cycles, the ENTIRE system goes silent -- not just the shell, but every
+background task (MEDIUM/idle/etc), with no crash and no reboot. This is
+a materially better-understood failure than the vague "shell stops
+responding" the fourth round reported: a total scheduler freeze
+specific to task_a's SECOND USR-mode wake cycle, not a fairness/aging-
+tuning shortfall alone. Reverted task_a to plain SVC mode again rather
+than ship a build that reliably hangs. Needs its own dedicated live-GDB
+investigation -- not resolved this round.
+
+*Diagnostic cost, capped*: `sleep_ticks_diag_print` fires legitimately
+whenever task_a is freshly picked (~24 times per full regression run,
+regardless of task_a's own SVC/USR mode, since task_a is task index 0
+either way) -- its own cumulative blocking-UART cost was enough to
+occasionally tip `tlsecho` past its blind `SETTLE_S` budget (same class
+of regression as this session's own SD `force_data_mode_settle`
+finding). Capped at 8 total firings -- ample evidence for a future
+investigation, no ongoing per-run cost.
+
+*Unrelated finding during this investigation*: the vani-localfuzz
+harness/ollama pair (a separate project, autostart via systemd user
+unit) was found consuming ~120% CPU concurrently with these QEMU
+regression runs, contributing to real host-load-induced test timing
+flakiness. Stopped and disabled per explicit user request ("stop and
+disable localfuzz") -- see that project's own memory entry.
+
+Committed with the instrumentation, both real bugs' fixes, and task_a
+left in plain SVC mode (proven-stable) -- `phase4_milestone.py`
+verified clean (4-FAIL baseline, matching a control run of the prior
+commit under identical host conditions). Task #253 Phase 3 remains
+open: task_a's own second-wake-cycle total-freeze bug is real,
+reproducible, and better-scoped than before, but not yet root-caused.
+
 **SD wedge: sixth fix attempt, real register-level divergence from
 Linux found and fixed (2026-09-19), against a fresh real-HW log
 (`picocom_20260919_145143.log`) that includes BOTH the FAIL_FLAG fix
