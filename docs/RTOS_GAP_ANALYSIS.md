@@ -50,6 +50,37 @@ doesn't yet attempt.
   state. Zero mismatches across the full regression suite; a nonzero count
   is surfaced immediately (bounded diagnostic print) and in the `diagnose`
   shell command, not silently tolerated.
+
+  **Real false-positive found and fixed, task #273 (2026-09-20)**: a
+  live, interactive-shell session (typing `diagnose` at the UART
+  prompt — a scenario the automated `phase4_milestone.py` harness
+  doesn't exercise the same way) surfaced exactly one `SCHED SHADOW
+  MISMATCH`. Root cause, confirmed by tracing both real ISR entry
+  points: `irq_dispatch` (UART RX) stashes its own shadow prediction
+  immediately on entry, then does substantial further work (RX FIFO
+  drain, up to 128 iterations) before its caller's real `scheduler_
+  pick_next` call actually runs. Ordinary IRQ entry masks only further
+  IRQ, never FIQ (confirmed against real Linux ARM32 source,
+  `arch/arm/kernel/entry-armv.S`'s own `vector_stub` macro comment:
+  "Prepare for SVC32 mode. IRQs remain disabled" — F is carried through
+  unchanged) — so a genuine timer FIQ can preempt that window, run its
+  own complete scheduling decision, and invalidate the IRQ path's
+  already-stashed prediction while still passing the existing ctxsw-
+  delta<=1 guard (a single nested decision that doesn't change
+  `current_task` can slip through). Confirming this against Linux also
+  ruled out the more drastic alternative fix (masking FIQ during
+  `irq_dispatch`) — Linux doesn't do that either, and it would have
+  regressed task #246's own FIQ-latency work. Fixed with a second,
+  narrower guard instead: a new `spn_shadow_tick_baseline`
+  (`boot/context_switch.S`), stamped alongside the existing ctxsw
+  baseline, must also still match `tick_count` before a comparison is
+  trusted — a nested FIQ always advances `tick_count` (that's what a
+  timer tick IS) while an ordinary UART RX IRQ never does, so this
+  reliably detects exactly the race above without touching `scheduler_
+  pick_next` itself or adding any new locking. Two identical
+  `phase4_milestone.py` runs plus 5 separate live interactive sessions
+  (10 total `diagnose` invocations, the same scenario that originally
+  surfaced the bug) confirm zero mismatches and zero regressions.
 - ~~**No aging — a lower-priority ready task can starve indefinitely under
   an always-ready higher-priority one.** Round 75 above only fixed
   fairness among tasks *tied* at the same priority; a task strictly

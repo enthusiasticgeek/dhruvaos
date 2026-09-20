@@ -2090,6 +2090,13 @@ extern "C" fn spn_shadow_predicted_task_set(v: u32) -> i64;
 extern "C" fn spn_shadow_ctxsw_baseline_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_ctxsw_baseline_set(v: u32) -> i64;
+// ROUND 2026-09-20 (task #273): see spn_shadow_tick_baseline's own
+// header comment in context_switch.S for the full false-positive-
+// mismatch fix this exists for.
+#[stack_cost(bytes=1)]
+extern "C" fn spn_shadow_tick_baseline_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn spn_shadow_tick_baseline_set(v: u32) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_mismatch_count_get() -> u32;
 #[stack_cost(bytes=1)]
@@ -10338,20 +10345,42 @@ fn scheduling_decision_prelude() -> i64 {
     let spn_ctxsw_now: u32 = context_switch_count_get() as u32;
     let spn_ctxsw_baseline: u32 = spn_shadow_ctxsw_baseline_get();
     let spn_delta: u32 = spn_ctxsw_now - spn_ctxsw_baseline;
-    if spn_delta <= (1 as u32) {
+    // ROUND 2026-09-20 (task #273): real, live-observed false-positive
+    // fixed here -- a genuine timer FIQ can preempt an in-progress
+    // irq_dispatch (UART RX) mid-flight, since taking an ordinary IRQ
+    // masks only further IRQ, never FIQ (task #246's own documented
+    // behavior). That nested FIQ runs its OWN full scheduling_decision_
+    // prelude call -- its own real scheduler_pick_next decision can
+    // change current_task/context_switch_count by exactly 1 (passing
+    // the ctxsw-delta<=1 guard below unchanged) while still silently
+    // invalidating THIS call's own already-stashed prediction, which
+    // was computed from state that existed before the nested tick.
+    // tick_count is the reliable second signal ctxsw_count alone can't
+    // provide here: a nested FIQ always advances it (that's what a
+    // timer tick IS), while an ordinary UART RX IRQ never does -- so
+    // requiring it to also match the baseline stamped at prediction
+    // time catches exactly this race without needing to touch
+    // scheduler_pick_next itself or add any new locking.
+    let spn_tick_now: u32 = scheduler_get_tick_count();
+    let spn_tick_baseline: u32 = spn_shadow_tick_baseline_get();
+    if (spn_delta <= (1 as u32)) && (spn_tick_now == spn_tick_baseline) {
       let spn_actual: u32 = current_task_get();
       if spn_actual != spn_pending {
-        let _ = spn_shadow_report_mismatch(spn_pending, spn_actual, scheduler_get_tick_count());
+        let _ = spn_shadow_report_mismatch(spn_pending, spn_actual, spn_tick_now);
       }
     }
-    // spn_delta > 1: an intervening task_sleep_ticks/dhruva_mutex_
-    // unlock decision happened outside this tick -- too ambiguous to
-    // compare against, skip honestly rather than risk a false report.
+    // spn_delta > 1, or spn_tick_now != spn_tick_baseline: an
+    // intervening task_sleep_ticks/dhruva_mutex_unlock decision, or a
+    // nested real timer tick, happened between this prediction's own
+    // stash and this check -- too ambiguous (or, for the tick case,
+    // provably stale) to compare against, skip honestly rather than
+    // risk a false report.
   }
   let spn_predicted: u32 = scheduler_pick_next_shadow_predict();
   let spn_ctxsw_baseline_now: u32 = context_switch_count_get() as u32;
   let _ = spn_shadow_predicted_task_set(spn_predicted);
   let _ = spn_shadow_ctxsw_baseline_set(spn_ctxsw_baseline_now);
+  let _ = spn_shadow_tick_baseline_set(scheduler_get_tick_count());
   let _ = spn_shadow_prediction_valid_set(1 as u32);
 
   for dl_i from 0 to 6 {

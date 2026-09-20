@@ -167,6 +167,22 @@ spn_shadow_predicted_task:
     .word 0
 spn_shadow_ctxsw_baseline:
     .word 0
+spn_shadow_tick_baseline:
+    .word 0             /* ROUND 2026-09-20 (task #273): fixes a real,
+                         * live-observed false-positive mismatch report
+                         * -- see scheduling_decision_prelude's own
+                         * updated comment (kernel_main.vani) for the
+                         * full root cause (a genuine timer FIQ nesting
+                         * inside an in-progress irq_dispatch's own
+                         * UART RX drain loop, invalidating an already-
+                         * stashed prediction while still passing the
+                         * pre-existing ctxsw-delta<=1 guard). Stamped
+                         * alongside spn_shadow_ctxsw_baseline at
+                         * prediction time; the mismatch check now also
+                         * requires THIS to still match tick_count,
+                         * since a nested FIQ always advances tick_count
+                         * by construction (it's the timer tick) while
+                         * an ordinary UART RX IRQ never does. */
 spn_shadow_mismatch_count:
     .word 0
 spn_shadow_prediction_valid:
@@ -976,6 +992,20 @@ spn_shadow_ctxsw_baseline_get:
 .global spn_shadow_ctxsw_baseline_set
 spn_shadow_ctxsw_baseline_set:
     ldr r1, =spn_shadow_ctxsw_baseline
+    str r0, [r1]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_tick_baseline_get
+spn_shadow_tick_baseline_get:
+    ldr r0, =spn_shadow_tick_baseline
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_tick_baseline_set
+spn_shadow_tick_baseline_set:
+    ldr r1, =spn_shadow_tick_baseline
     str r0, [r1]
     mov r1, #0
     bx lr
