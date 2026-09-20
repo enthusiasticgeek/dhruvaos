@@ -36422,7 +36422,18 @@ fn kernel_main() -> i64 {
   let custom_stack_bytes: u32 = 4096 as u32;
   let custom_stack: mut ref i64 = dhruva_alloc_stack_domain(custom_stack_bytes as u32, 6 as u32);
   let _ = stack_canary_set_base(6 as u32, custom_stack);
-  let custom_task_id: u32 = task_create(task_custom_demo, custom_stack, custom_stack_bytes, 3 as u32);
+  // Task #262 (2026-09-20): dynamic tasks converted to USR mode too,
+  // now that all 6 static tasks are independently verified clean --
+  // task_create_usr's own index is only known once it returns (unlike
+  // the 6 fixed tasks), so the usr_sp_table seed necessarily comes
+  // AFTER this call, not before -- safe regardless, since every
+  // task_create_usr slot is >= 6, never kernel_main's own boot-time
+  // current_task default of 0 (the only index that ever needed a
+  // deferred seed, see task_a's own setup comment above).
+  let custom_task_id: u32 = task_create_usr(task_custom_demo, custom_stack, custom_stack_bytes, 3 as u32);
+  let custom_stack_usr: mut ref i64 = dhruva_alloc_usrstack_domain(custom_stack_bytes as u32, custom_task_id);
+  let custom_stack_usr_top: mut ref i64 = stack_region_top(custom_stack_usr, custom_stack_bytes as i64);
+  let _ = usr_sp_table_set_at(custom_task_id, custom_stack_usr_top);
   let _ = uart_puts("task_create: new task id=");
   let _ = uart_put_i64(custom_task_id as i64);
   let _ = uart_puts("\n");
@@ -36437,11 +36448,17 @@ fn kernel_main() -> i64 {
   let mutex_low_stack_bytes: u32 = 4096 as u32;
   let mutex_low_stack: mut ref i64 = dhruva_alloc_stack_domain(mutex_low_stack_bytes as u32, 7 as u32);
   let _ = stack_canary_set_base(7 as u32, mutex_low_stack);
-  let mutex_low_task_id: u32 = task_create(task_mutex_demo_low, mutex_low_stack, mutex_low_stack_bytes, 2 as u32);
+  let mutex_low_task_id: u32 = task_create_usr(task_mutex_demo_low, mutex_low_stack, mutex_low_stack_bytes, 2 as u32);
+  let mutex_low_stack_usr: mut ref i64 = dhruva_alloc_usrstack_domain(mutex_low_stack_bytes as u32, mutex_low_task_id);
+  let mutex_low_stack_usr_top: mut ref i64 = stack_region_top(mutex_low_stack_usr, mutex_low_stack_bytes as i64);
+  let _ = usr_sp_table_set_at(mutex_low_task_id, mutex_low_stack_usr_top);
   let mutex_high_stack_bytes: u32 = 4096 as u32;
   let mutex_high_stack: mut ref i64 = dhruva_alloc_stack_domain(mutex_high_stack_bytes as u32, 8 as u32);
   let _ = stack_canary_set_base(8 as u32, mutex_high_stack);
-  let mutex_high_task_id: u32 = task_create(task_mutex_demo_high, mutex_high_stack, mutex_high_stack_bytes, 0 as u32);
+  let mutex_high_task_id: u32 = task_create_usr(task_mutex_demo_high, mutex_high_stack, mutex_high_stack_bytes, 0 as u32);
+  let mutex_high_stack_usr: mut ref i64 = dhruva_alloc_usrstack_domain(mutex_high_stack_bytes as u32, mutex_high_task_id);
+  let mutex_high_stack_usr_top: mut ref i64 = stack_region_top(mutex_high_stack_usr, mutex_high_stack_bytes as i64);
+  let _ = usr_sp_table_set_at(mutex_high_task_id, mutex_high_stack_usr_top);
   let _ = uart_puts("task_create: mutex demo task ids=");
   let _ = uart_put_i64(mutex_low_task_id as i64);
   let _ = uart_puts(",");
@@ -36457,7 +36474,10 @@ fn kernel_main() -> i64 {
   let fsq_stack_bytes: u32 = 4096 as u32;
   let fsq_stack: mut ref i64 = dhruva_alloc_stack_domain(fsq_stack_bytes as u32, 9 as u32);
   let _ = stack_canary_set_base(9 as u32, fsq_stack);
-  let fsq_task_id: u32 = task_create(task_fsq, fsq_stack, fsq_stack_bytes, 2 as u32);
+  let fsq_task_id: u32 = task_create_usr(task_fsq, fsq_stack, fsq_stack_bytes, 2 as u32);
+  let fsq_stack_usr: mut ref i64 = dhruva_alloc_usrstack_domain(fsq_stack_bytes as u32, fsq_task_id);
+  let fsq_stack_usr_top: mut ref i64 = stack_region_top(fsq_stack_usr, fsq_stack_bytes as i64);
+  let _ = usr_sp_table_set_at(fsq_task_id, fsq_stack_usr_top);
   let _ = uart_puts("task_create: fsqueue dispatcher task id=");
   let _ = uart_put_i64(fsq_task_id as i64);
   let _ = uart_puts("\n");
