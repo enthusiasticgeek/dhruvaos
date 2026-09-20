@@ -36323,7 +36323,13 @@ fn kernel_main() -> i64 {
   let stack_b_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 1 as u32);
   let stack_b_usr_top: mut ref i64 = stack_region_top(stack_b_usr, stack_bytes);
   let _ = usr_sp_table_set_at(1 as u32, stack_b_usr_top);
-  let sp_c: mut ref i64 = task_c_init_stack(stack_c, stack_bytes);
+  // Task #262 (2026-09-20), one-task-at-a-time rollout, third task
+  // after task_a/task_b -- same early-seed pattern (index 2, never
+  // kernel_main's own boot-time current_task default of 0).
+  let sp_c: mut ref i64 = task_c_init_stack_usr(stack_c, stack_bytes);
+  let stack_c_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 2 as u32);
+  let stack_c_usr_top: mut ref i64 = stack_region_top(stack_c_usr, stack_bytes);
+  let _ = usr_sp_table_set_at(2 as u32, stack_c_usr_top);
   let sp_d: mut ref i64 = task_d_init_stack_usr(stack_d, stack_bytes);
   let stack_d_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 3 as u32);
   let stack_d_usr_top: mut ref i64 = stack_region_top(stack_d_usr, stack_bytes);
