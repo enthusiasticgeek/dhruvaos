@@ -4553,6 +4553,39 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     let _ = uart_puts(" SDEDM=0x");
     let _ = uart_put_hex32(edm_after_pio);
     let _ = uart_puts("\n");
+    // NEW DIAGNOSTIC (2026-09-20, real-hardware write-wedge investigation,
+    // round 12): every diagnostic this project has ever shipped for this
+    // bug reads the CONTROLLER's own FSM/FIFO state (SDEDM) -- never once
+    // asked the CARD ITSELF what state it believes it's in. CMD13 (SEND_
+    // STATUS) is a plain, addressed R1 command -- same shape as CMD7/CMD16
+    // above, no special response-length/busy flags -- and its response IS
+    // the card's own 32-bit status word, including bits[31:19] (OUT_OF_
+    // RANGE/ADDRESS_ERROR/BLOCK_LEN_ERROR/WP_VIOLATION/CARD_IS_LOCKED/
+    // COM_CRC_ERROR/ILLEGAL_COMMAND/CARD_ECC_FAILED/CC_ERROR/ERROR, per
+    // the SD spec's own card status table) that no prior diagnostic in
+    // this investigation has ever captured. If the controller's own FSM
+    // is wedged but the card itself reports a specific, decodable error
+    // (e.g. WP_VIOLATION despite the lock switch reading unlocked, or
+    // COM_CRC_ERROR suggesting a real signal-integrity issue this
+    // peripheral's own weak PIO timing can't compensate for), that is
+    // qualitatively new evidence -- everything captured so far has only
+    // ever shown "the controller didn't finish," never "here's what the
+    // card says went wrong." Deliberately best-effort: if CMD13 itself
+    // times out (the controller may genuinely be too wedged to issue any
+    // further command), that's still informative -- printed either way,
+    // never gates the function's own return value.
+    let cmd13_status: u32 = sdhost_cmd(13 as u32, sd_state_get_rca() as u32);
+    if sdhost_cmd_timed_out(cmd13_status) == 1 {
+      let _ = uart_puts("SD DIAG: post-wedge CMD13 (SEND_STATUS) timed out -- controller too wedged to respond\n");
+    } else {
+      let cmd13_r1: u32 = mmio_read_u32(SDRSP0);
+      let cmd13_current_state: u32 = (cmd13_r1 >> (9 as u32)) & (0xF as u32);
+      let _ = uart_puts("SD DIAG: post-wedge CMD13 (SEND_STATUS) R1=0x");
+      let _ = uart_put_hex32(cmd13_r1);
+      let _ = uart_puts(" CURRENT_STATE=");
+      let _ = uart_put_i64(cmd13_current_state as i64);
+      let _ = uart_puts("\n");
+    }
     return 2;
   }
   if errs != (0 as u32) {
