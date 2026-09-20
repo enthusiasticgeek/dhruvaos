@@ -8616,3 +8616,47 @@ Verified: clean build, `vanic stack-depth --entry=task_fsq --max=14336`
 now passes cleanly (was a hard, previously-silent failure), two
 identical `phase4_milestone.py` runs, zero regression. Pushed to
 origin master/pi4/main.
+
+**Per-thread execution-time supervision, commit `2e7d09c`
+(2026-09-20).** Closed a real, explicitly-named `RTOS_GAP_ANALYSIS.md`
+gap: "No per-thread execution-time supervision, only a system-wide
+watchdog... CMSIS-RTOS2's 'thread watchdog' pattern... is the standard
+reference design." Task #241's own deadline-miss detection tracks how
+long a READY task waits to be scheduled -- structurally blind to a
+task that IS running (or correctly blocked) but has stopped making
+its own real forward progress, since a running task's own "ready
+wait" is always 0.
+
+Three new per-task tables (`boot/context_switch.S`): `task_heartbeat_
+last_tick_table` (tick at the task's last genuine voluntary yield),
+`task_heartbeat_bound_table` (0 = unsupervised; a generous 5-10x
+multiple of each task's own declared wake period otherwise, wide
+enough to absorb every legitimate blocking term this demo set has
+ever measured -- mutex handoff 174us, GC/DHCP ~50ms, worst network
+blocking 325.6ms, all comfortably under one 500ms tick), `task_
+heartbeat_stuck_count_table` (edge-triggered overrun counter, same
+discipline as task #241's own miss counter).
+
+Stamped from exactly two places: `task_sleep_ticks_impl`
+(unconditional -- no fast path, it always blocks) and `dhruva_mutex_
+lock_impl`'s genuinely-contended branch only (a real resource wait,
+not a bug -- the fast/uncontended path is deliberately NOT stamped).
+Neither `dhruva_prio_lock`/`unlock` nor the mutex fast path counts as
+proof of life -- a task stuck in an infinite loop could still call
+those repeatedly, which would defeat the whole point by looking alive
+when it isn't. Checked in `scheduling_decision_prelude`, the same
+function and cadence task #241's own check already uses. `task_d`/
+IDLE stays permanently unsupervised (never calls `task_sleep_ticks`,
+uses `cpu_wfi()` instead) -- the same exemption CMSIS-RTOS2 gives its
+own idle thread.
+
+Exposed via `diagnose`. Two identical `phase4_milestone.py` runs (zero
+regression) plus a direct, separately-driven live `diagnose` check
+(needed since the automated harness's own `diagnose` check is a
+known, documented pre-existing timing flake -- see this file's own
+SD-wedge entries for the same `SETTLE_S`-class issue) confirmed the
+new line prints correctly: `stuck-task episodes (HIGH/MEDIUM/LOW/
+IDLE/GC/SHELL/CUSTOM/MUTEX-LOW/MUTEX-HIGH/FSQ): 0/0/0/0/0/0/0/0/0/0`
+-- all zero under normal operation, no false positives. Detection and
+reporting only, matching task #241's own scope; a real recovery
+action is task #271's separate, not-yet-done scope.

@@ -303,14 +303,24 @@ doesn't yet attempt.
   build with the flag flipped. This is a genuinely different claim than
   "tested and works": it's "implemented, gated correctly, unverified in
   CI."
-- **No per-thread execution-time supervision, only a system-wide
-  watchdog.** The watchdog above is a single hardware timer covering the
-  whole system — if ANY task keeps kicking it (even a wrong one, or one
-  stuck in an infinite loop that still happens to call something that
-  kicks it), a different task silently hanging forever goes undetected.
-  CMSIS-RTOS2's "thread watchdog" pattern (a per-thread timeout, checked
-  independently) is the standard reference design for this — see task
-  #241 (runtime deadline-miss detection).
+- ~~**No per-thread execution-time supervision, only a system-wide
+  watchdog.**~~ **`[DONE, 2026-09-20, commit `2e7d09c`]`** — three new
+  per-task tables (`task_heartbeat_last_tick_table`/`_bound_table`/
+  `_stuck_count_table`, `boot/context_switch.S`) implement exactly the
+  CMSIS-RTOS2 "thread watchdog" pattern this note called for: each
+  task stamps its own last-genuine-voluntary-yield tick (from
+  `task_sleep_ticks_impl`, unconditional, and `dhruva_mutex_lock_impl`'s
+  genuinely-contended branch only — deliberately NOT the mutex fast
+  path or `dhruva_prio_lock`/`unlock`, since a task stuck in an
+  infinite loop could still call those repeatedly and falsely look
+  alive), checked independently in `scheduling_decision_prelude`
+  against a generous per-task bound. `task_d`/IDLE stays unsupervised
+  (never calls `task_sleep_ticks`), matching CMSIS-RTOS2's own idle-
+  thread exemption. Exposed via `diagnose`, live-verified: all-zero
+  under normal operation, no false positives from any of this demo
+  set's own real blocking terms. Detection/reporting only — a real
+  recovery action is a separate, still-open item (see task #271 in
+  `docs/TODO.md`).
 
 ## 3. Memory / fault isolation gaps (the largest one)
 
