@@ -246,7 +246,27 @@ doesn't yet attempt.
   with a real blocking-time term (Sha/Rajkumar/Lehoczky 1990) and run
   against the real demo set (HIGH/MEDIUM/LOW) using the measured 50ms
   LOW-priority blocking term: **verdict schedulable, 440ms-1445ms
-  slack.** Honest residual gaps from that same pass: GC's own critical
+  slack.**
+
+  **Correctness note, task #276 (2026-09-20)**: that "measured 50ms"
+  figure was QEMU-only and, at the time, silently assumed to also hold
+  on real hardware — it did not. Real Pi 1B silicon runs `delay(N)`'s
+  own tight busy loop ~18.6x slower than QEMU's TCG JIT does (confirmed
+  via two independent real picocom logs from 2026-09-18), so LOW's
+  real critical-section hold time was actually ~930ms, not ~50ms —
+  genuinely enough to miss MEDIUM's own 500ms deadline (confirmed:
+  re-running the tool with the real number substituted flips the
+  verdict to NOT schedulable). Fixed at the root, not by loosening
+  MEDIUM's deadline: `task_c`'s own busy-wait count corrected from
+  3000000 to 161000, the real count that gives the originally intended
+  ~50ms on real hardware — restoring the "verdict schedulable"
+  conclusion above to genuine, real-hardware-confirmed validity
+  instead of a QEMU-only coincidence. See `test/schedulability_
+  analysis.py`'s own updated docstring and `kernel_main.vani`'s own
+  `task_c`/`delay_wcet_measure_self_test` comments for the full
+  writeup.
+
+  Honest residual gaps from that same pass: GC's own critical
   section is now measured too (Gap E, below). Context-switch overhead
   is now a modeled term too — `[DONE, task #240]`, a real
   `measured_ctxsw_handoff_ms = 0.182` constant in

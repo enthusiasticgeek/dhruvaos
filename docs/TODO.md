@@ -9037,3 +9037,54 @@ updating the audit's own conclusion; or something else the user
 prefers). This is a genuinely new, separate finding from the SD
 investigation itself, surfaced as a byproduct of cross-checking a
 number this round happened to reuse.
+
+### Task #276 closed: real MEDIUM deadline miss fixed at the root, not papered over (2026-09-20)
+
+User's own direction: "go with recommended way - correctness and
+safety over speed," then "faster is better but not at the expense of
+safety and correctness" -- both pointed at the same answer. Two
+options were on the table: shorten `task_c`'s own demo critical
+section to genuinely fit MEDIUM's declared deadline, or loosen
+MEDIUM's own declared deadline to accommodate the real (buggy)
+blocking term. Went with the former -- a declared deadline is a
+requirement; the right response to an implementation violating it is
+fixing the implementation, not weakening the requirement to match a
+bug. Real safety-critical practice (ARINC 653/DO-178C-class
+convention) treats it the same way.
+
+Turned out to be the cleaner fix in every sense, not just the safer
+one: this project's own long-standing design intent for `task_c`'s
+critical section was ALWAYS "about 50ms" (see round 17's own original
+comment, and `test/schedulability_analysis.py`'s own docstring) --
+the ~930ms real duration was never intentional, it was purely the
+QEMU-miscalibration bug from the 15th SD round leaking into this
+task's own busy-wait count. So "fix the implementation" and "restore
+the original intent" were the same edit: `task_c`'s `delay(3000000)`
+(real ~930ms) corrected to `delay(161000)` (real ~49.92ms, matching
+the ORIGINALLY intended ~50ms almost exactly once correctly
+calibrated against real hardware's own 0.310044us/iteration cost
+rather than QEMU's). `delay_wcet_measure_self_test`'s own middle
+measurement point updated in lockstep (was already documented as
+"exactly task_c's own real usage" -- kept true, not left stale).
+
+Re-ran `test/schedulability_analysis.py` (unchanged constant,
+`measured_low_critical_section_ms=49.906` -- now genuinely valid
+again rather than a QEMU-only coincidence) after the kernel fix:
+`VERDICT: schedulable with real measured blocking data, comfortable
+margin` -- all three tasks PASS, MEDIUM specifically at
+R=60.270ms/D=500ms (439.730ms margin). The tool itself was never
+wrong; only the one input it was fed was.
+
+Documented the full QEMU-vs-real discrepancy directly in code (both
+`kernel_main.vani`'s own `task_c`/`delay_wcet_measure_self_test`
+comments and `schedulability_analysis.py`'s own docstring) rather than
+only in `docs/TODO.md`, specifically so this project doesn't reuse an
+unverified QEMU-only busy-loop timing a THIRD time (this was already
+the second time this exact number caused a real bug, after tasks
+#274/#275's own SD settle-delay mis-sizing). Two identical
+`phase4_milestone.py` runs confirm zero regression.
+
+This closes the "separate, much larger finding" flagged in the
+15th-round entry immediately above -- `docs/RTOS_GAP_ANALYSIS.md`'s
+own "verdict schedulable" claim is now genuinely real-hardware-backed,
+not a QEMU coincidence that happened to look right.
