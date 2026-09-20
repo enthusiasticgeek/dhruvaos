@@ -736,12 +736,24 @@ doesn't yet attempt.
 
 ## 4. Timing analysis / determinism gaps
 
-- **`#[bounded_stack]`/`#[wcet]` are compile-time-only.** They produce a
+- ~~**`#[bounded_stack]`/`#[wcet]` are compile-time-only.** They produce a
   *static* estimate and reject a build that provably exceeds it — but
   nothing at runtime detects or traps an actual deadline miss or budget
   overrun. If a task's real execution time exceeds its declared WCET for any
   reason the static model didn't capture, there is no runtime safety net at
-  all.
+  all.~~ **`[DONE, tasks #241 + #271, 2026-09-18/20]`** — the static
+  check is still compile-time-only (unchanged, and correctly so — that's
+  what a static estimate is), but a real runtime safety net now exists
+  on top of it: task #241's `task_deadline_miss_count_table` detects a
+  ready-wait deadline overrun, and task #271's `task_wcet_enforce_
+  evicted_count_table` (`boot/context_switch.S`) ACTS on task #269's
+  own execution-time-supervision overrun by forcing the offending task
+  off the CPU for one cooldown window via `sleep_until_table` — real
+  detection AND enforcement, not just a static rejection at build time.
+  Deliberately scoped, not unconditional: enforcement is skipped when
+  the task holds a ceiling-protected critical section (would strand
+  other waiters), so this is a real but bounded safety net, not a
+  guarantee against every possible overrun scenario.
 - ~~**The static model itself has a known, recently-found soundness gap.**
   `#[bounded_stack]`'s checker used to charge exactly 0 bytes for any
   `extern "C"` (hand-written assembly) callee — fixed this session
