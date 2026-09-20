@@ -613,16 +613,20 @@ doesn't yet attempt.
   genuinely wired in and exercised at full scale by every SVC-mode
   task, not reverted to inert.
 
-  **Real, well-scoped future work:** convert the remaining 9 tasks (6
-  fixed minus `task_d` + the 4 dynamic tasks) to USR mode ONE AT A
-  TIME, with a full regression cycle after each addition -- not another
-  all-at-once attempt, per this project's own hard-won lesson from the
-  earlier full-10-task attempt above.
+  **`[DONE, task #262, 2026-09-20]`** -- the root cause blocking this
+  (lr_usr, r14 in USR mode, never restored -- a single physical
+  register shared by every USR-mode task, silently clobbered across
+  context switches) was found and fixed (commit `f37d933`, verified
+  against real Linux `arch/arm/kernel/entry-header.S`). All 10 tasks
+  (6 static + 4 dynamic) now run in USR mode, each converted one at a
+  time with its own dual `phase4_milestone.py` regression pass per
+  this doc's own hard-won lesson above -- zero regressions, zero
+  `FATAL` across every conversion (commits `7382f6b`..`00e84da`).
 
-  Real Pi 1B hardware validation remains outstanding for everything in
-  this item (no hardware available in this environment) -- the same
-  residual-risk category as task #246's own FIQ work and the Pi 4/5
-  "ON HOLD, no real HW" items.
+  Real Pi 1B hardware validation remains outstanding for this item
+  (no hardware available in this environment) -- the same residual-
+  risk category as task #246's own FIQ work and the Pi 4/5 "ON HOLD,
+  no real HW" items.
 
 ## 4. Timing analysis / determinism gaps
 
@@ -652,11 +656,14 @@ doesn't yet attempt.
   ~64-byte figures BUG-233's own original write-up cited were informal,
   never independently re-measured); that real-measurement-plus-
   annotation pass is a genuine, natural follow-up, not done here.
-- **No deadline-miss detection or logging.** Ties directly into
-  `docs/TODO.md`'s own already-open "Per-task runtime histograms + a real
-  deadline/budget model" and "'Why is my task late' query" items — both
-  correctly scoped there as not-yet-started and blocked on a real workload
-  to make the numbers meaningful, not duplicated here.
+- ~~**No deadline-miss detection or logging.**~~ **`[DONE, task #241]`**
+  — `task_deadline_ticks_table`/`task_deadline_miss_count_table`
+  (`boot/context_switch.S`) track a declared per-task deadline and
+  increment a real miss counter, exposed via the `diagnose` shell
+  command. Ties into `docs/TODO.md`'s own "Per-task runtime histograms
+  + a real deadline/budget model" and "'Why is my task late' query"
+  items, both still genuinely open (a full histogram/model on top of
+  the counters that now exist, not duplicated here).
 
   **Partial step, `[round 189, 2026-09-12]`**: added the measurement
   primitive this will need, deliberately NOT the detection itself —
