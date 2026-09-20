@@ -201,607 +201,1191 @@ extern "C" fn dhruva_fault_inject_alloc_arm(after_n: i64) -> i64;
 // comment for why these exist (dharafs_compact wasn't the only place a
 // dhruva_alloc_bytes call was hiding inside something called every GC
 // wake or every shell command instead of once at boot).
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_sd_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_sd_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_path_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_path_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_data_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_data_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_stat_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_stat_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_dir_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_dir_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_path_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_path_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_data_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_data_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn poly1305_block_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn poly1305_block_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha512_h_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha512_h_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha512_k_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha512_k_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha512_w_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha512_w_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha512_padded_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha512_padded_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_d_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_d_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_2d_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_2d_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sqrt_m1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sqrt_m1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_l_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_l_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_gx_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_gx_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_gy_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_gy_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_gz_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_gz_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_gt_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_gt_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp2_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp2_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp3_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp3_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp4_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp4_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp5_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp5_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp6_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp6_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp7_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp7_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp8_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_tmp8_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_qx_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_qx_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_qy_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_qy_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_qz_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_qz_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_qt_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_qt_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_bx_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_bx_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_by_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_by_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_bz_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_bz_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_bt_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_bt_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_scalar_remainder_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_scalar_remainder_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_scalar_product_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_scalar_product_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_scalar_sum_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_scalar_sum_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_hash_input_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_hash_input_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_hash_out_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_hash_out_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf2_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf2_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf3_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf3_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf4_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf4_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf5_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf5_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf6_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf6_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf7_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf7_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf8_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_buf8_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_ax_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_ax_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_ay_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_ay_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_az_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_az_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_at_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_at_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_rx_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_rx_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_ry_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_ry_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_rz_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_rz_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_rt_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_rt_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_kax_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_kax_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_kay_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_kay_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_kaz_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_kaz_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_kat_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_kat_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sbx_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sbx_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sby_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sby_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sbz_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sbz_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sbt_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ed25519_sbt_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pki_pinned_key_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pki_pinned_key_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pki_sig_path_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pki_sig_path_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pki_sig_data_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pki_sig_data_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_state_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_state_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_working_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_working_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_keystream_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_keystream_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_block_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_block_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_otk_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_otk_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_mac_data_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_mac_data_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_computed_tag_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aead_computed_tag_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_hmac_key_block_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_hmac_key_block_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_hmac_msg_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_hmac_msg_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_hmac_inner_hash_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_hmac_inner_hash_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_t_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_t_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_hmac_input_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hkdf_hmac_input_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_state_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_state_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_temp_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_temp_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_c_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_c_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_d_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_d_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_rc_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_rc_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_rho_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_rho_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_pi_dest_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_pi_dest_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_pad_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn keccak_pad_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_zetas_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_zetas_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_gammas_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_gammas_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_a00_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_a00_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_a01_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_a01_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_a10_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_a10_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_a11_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_a11_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_s0_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_s0_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_s1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_s1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_e0_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_e0_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_e1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_e1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_t0_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_t0_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_t1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_t1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_r0_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_r0_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_r1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_r1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_enc_e1_0_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_enc_e1_0_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_enc_e1_1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_enc_e1_1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_u0_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_u0_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_u1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_u1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_v_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_v_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_mu_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_mu_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_w_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_w_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_e2_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_e2_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_acc_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_acc_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_tmp1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_tmp1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_tmp2_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_tmp2_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_rho_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_rho_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_sigma_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_sigma_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_prf_out_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_prf_out_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_xof_out_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_xof_out_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_h_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_h_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_z_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_z_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_mprime_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_mprime_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_kprime_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_kprime_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_rprime_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_rprime_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_kbar_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_kbar_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_ekpke_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_ekpke_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_cprime_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mlkem_cprime_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_random_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_random_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_random_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_random_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_x25519_priv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_x25519_priv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_x25519_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_x25519_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_x25519_priv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_x25519_priv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_x25519_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_x25519_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_shared_secret_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_shared_secret_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_id_priv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_id_priv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_id_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_id_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_early_secret_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_early_secret_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_derived_es_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_derived_es_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_handshake_secret_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_handshake_secret_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_hs_traffic_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_hs_traffic_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_hs_traffic_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_hs_traffic_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_hs_key_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_hs_key_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_hs_iv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_hs_iv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_hs_key_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_hs_key_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_hs_iv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_hs_iv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_derived_hs_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_derived_hs_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_master_secret_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_master_secret_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_ap_traffic_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_ap_traffic_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_ap_traffic_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_ap_traffic_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_ap_key_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_ap_key_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_ap_iv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_ap_iv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_ap_key_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_ap_key_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_ap_iv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_ap_iv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_transcript_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_transcript_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_ch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_ch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_sh_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_sh_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_ee_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_ee_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cert_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cert_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_fin_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_fin_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_fin_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_fin_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_hash_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_hash_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_hkdf_label_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_hkdf_label_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cv_signed_content_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cv_signed_content_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_finished_key_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_finished_key_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_record_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_record_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_record_aad_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_record_aad_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_record_nonce_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_record_nonce_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_content_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_content_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_tag_in_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_tag_in_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_rec_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_rec_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_msg_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_msg_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_reply_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_reply_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_decrypted_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_decrypted_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_rx_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_rx_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_rx_len_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_rx_len_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_rx_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_rx_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_rx_len_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_rx_len_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_frame_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_frame_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_chunk_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_chunk_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_recv_chunk_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_recv_chunk_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_ack_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_ack_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_ch_record_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_ch_record_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_sh_record_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_sh_record_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_client_random_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_client_random_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_client_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_client_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_server_random_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_server_random_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_server_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_server_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_flight_combined_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_flight_combined_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_server_id_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_parsed_server_id_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_phase_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_client_phase_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_phase_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_server_phase_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cert_hash_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cert_hash_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cv_sig_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_cv_sig_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_verify_data_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_s_verify_data_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_verify_data_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_c_verify_data_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_basepoint_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_basepoint_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_zero32_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_zero32_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_transcript_len_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_transcript_len_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_t_len_sh_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_t_len_sh_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_t_len_cert_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_t_len_cert_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_t_len_cv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_t_len_cv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_t_len_s_fin_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tls_t_len_s_fin_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn http_req_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn http_req_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn http_resp_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn http_resp_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mqtt_pkt_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mqtt_pkt_scratch_get() -> mut ref i64;
 // Round 180: SSH-2.0 server persistent scratch -- see
 // boot/ssh_scratch.S's own header comment.
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_v_c_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_v_c_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_v_s_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_v_s_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_v_c_len_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_v_c_len_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_v_s_len_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_v_s_len_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_kexinit_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_kexinit_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_kexinit_len_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_kexinit_len_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_kexinit_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_kexinit_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_kexinit_len_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_kexinit_len_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_cookie16_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_cookie16_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_x25519_priv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_x25519_priv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_x25519_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_x25519_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_x25519_priv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_x25519_priv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_x25519_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_x25519_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_shared_secret_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_shared_secret_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_host_priv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_host_priv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_host_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_host_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_id_priv_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_id_priv_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_id_pub_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_id_pub_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_exchange_hash_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_exchange_hash_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_session_id_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_session_id_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_c2s_key64_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_c2s_key64_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_s2c_key64_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_s2c_key64_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_hostkey_blob_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_hostkey_blob_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_sigblob_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_sigblob_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_keyblob_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_keyblob_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_sigblob_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_sigblob_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_userauth_signed_data_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_userauth_signed_data_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_payload_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_payload_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_payload_buf2_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_payload_buf2_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_packet_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_packet_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_packet_buf2_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_packet_buf2_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_decrypted_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_decrypted_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_rx_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_rx_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_rx_len_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_rx_len_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_rx_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_rx_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_rx_len_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_rx_len_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_frame_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_frame_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn crashlog_record_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn crashlog_record_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn crashlog_meta_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn crashlog_meta_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn crashlog_path_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn crashlog_path_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_chunk_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_chunk_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_recv_chunk_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_recv_chunk_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_ack_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_ack_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_seq_out_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_seq_out_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_seq_in_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_seq_in_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_seq_out_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_seq_out_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_seq_in_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_seq_in_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_phase_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_client_phase_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_phase_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_server_phase_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_exec_cmd_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_exec_cmd_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_channel_data_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_channel_data_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_dst_mac_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_dst_mac_get() -> mut ref i64;
 // X25519 (RFC 7748) persistent scratch buffers -- see
 // boot/x25519_scratch.S's own header comment.
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_x1_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_x1_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_x2_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_x2_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_z2_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_z2_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_x3_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_x3_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_z3_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_z3_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_a_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_a_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_aa_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_aa_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_b_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_b_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_bb_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_bb_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_e_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_e_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_c_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_c_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_d_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_d_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_da_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_da_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_cb_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_cb_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_a24e_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_a24e_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_product_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_product_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_invert_base_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_invert_base_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_invert_result_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_invert_result_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_p_bytes_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_p_bytes_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_p_minus_2_bytes_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_p_minus_2_bytes_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_p9_bytes_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_p9_bytes_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_fold_t_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_fold_t_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_fold_s_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_fold_s_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_a24_bytes_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn x25519_a24_bytes_get() -> mut ref i64;
 // Round 49: dharafs_log_append_raw's own persistent scratch -- see
 // boot/scratch_state.S's own comment on each buffer's exact role.
 // Same "never dhruva_alloc_bytes on every call" discipline as every
 // other buffer in that file (a log append is meant to be called
 // repeatedly at runtime, not once at boot).
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_path_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_path_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_header_path_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_header_path_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_header_data_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_header_data_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_existing_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_existing_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_combined_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_log_combined_scratch_get() -> mut ref i64;
 // Round 48 bug fix (found during round 49's own audit): dharafs_write_
 // verified_raw/dharafs_read_verified_checked need persistent scratch
 // too -- see boot/scratch_state.S's own comment.
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_verified_companion_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_verified_companion_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_verified_digest_a_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_verified_digest_a_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_verified_digest_b_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_verified_digest_b_scratch_get() -> mut ref i64;
 // Round 50: dharafs_attr_check_write's own persistent scratch -- see
 // boot/scratch_state.S's own comment.
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_appendonly_check_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_appendonly_check_scratch_get() -> mut ref i64;
 // BUG FIX: dharafs_rename/shell `mv`'s own NEW-path buffer -- see
 // boot/scratch_state.S's own comment.
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_rename_new_path_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_rename_new_path_scratch_get() -> mut ref i64;
 // Round 66: gatt_att_send/_recv's own outgoing/incoming ACL+L2CAP+ATT
 // PDU buffers -- see boot/scratch_state.S's own comment.
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_send_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_send_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_recv_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_recv_scratch_get() -> mut ref i64;
 // Round 66: GATT's own discovered-services/characteristics tables --
 // see boot/gatt_state.S's own header comment for the full design (why
@@ -816,226 +1400,409 @@ extern "C" fn gatt_recv_scratch_get() -> mut ref i64;
 // r1, nothing more) actually expect. u32 sidesteps the whole class:
 // each stays in exactly one register, matching diag_ring_push's own
 // same fix for the identical reason.
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_get_count() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_set_count(count: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_get_start_handle_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_set_start_handle_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_get_end_handle_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_set_end_handle_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_get_uuid16_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_set_uuid16_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_get_count() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_set_count(count: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_get_decl_handle_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_set_decl_handle_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_get_properties_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_set_properties_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_get_value_handle_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_set_value_handle_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_get_uuid16_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_set_uuid16_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_get_service_index_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_set_service_index_at(index: u32, value: u32) -> i64;
 // Round 66 follow-up: 128-bit custom UUID storage for both discovery
 // tables -- see boot/gatt_state.S's own follow-up header comment.
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_get_is_uuid128_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_set_is_uuid128_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_get_uuid128_byte(combined_index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_service_set_uuid128_byte(combined_index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_get_is_uuid128_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_set_is_uuid128_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_get_uuid128_byte(combined_index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_set_uuid128_byte(combined_index: u32, value: u32) -> i64;
 // Round 66 follow-up: notifications/indications -- per-characteristic
 // discovered CCCD handle, plus the most recent Notification/
 // Indication's own value handle (single global, one active connection
 // at a time in this project's own driver model). See boot/gatt_
 // state.S's own follow-up header comment.
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_get_cccd_handle_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_char_set_cccd_handle_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_last_notify_handle_get() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_last_notify_handle_set(value: u32) -> i64;
 // Round 66: GATT SERVER's own attribute database -- see boot/gatt_
 // server_state.S's own header comment for the full design (flat,
 // handle-ordered, handle == index+1, value bytes via a caller-
 // computed combined index).
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_get_count() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_set_count(count: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_get_uuid16_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_set_uuid16_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_get_value_len_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_set_value_len_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_get_writable_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_set_writable_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_get_value_byte(combined_index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn gatt_server_attr_set_value_byte(combined_index: u32, value: u32) -> i64;
 // BUG FIX: ping/ifconfig/tcpecho/udpecho/tcprtx's own persistent
 // scratch -- see boot/scratch_state.S's own comment.
+#[stack_cost(bytes=1)]
 extern "C" fn shell_my_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_my_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_ping_dst_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_ping_dst_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_ping_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_ping_payload_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_ping_recv_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_ping_recv_payload_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_ping_recv_meta_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_ping_recv_meta_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_tcpecho_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_tcpecho_payload_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_tcp_poll_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_tcp_poll_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_tcpecho_recv_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_tcpecho_recv_payload_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_udpecho_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_udpecho_payload_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_udpecho_recv_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_udpecho_recv_payload_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_udpecho_recv_meta_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_udpecho_recv_meta_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_tcprtx_drop_buf_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_tcprtx_drop_buf_scratch_get() -> mut ref i64;
 // BUG FIX: sha256_hash's own internal working buffers -- see
 // boot/scratch_state.S's own comment on the exact worst-case sizing.
+#[stack_cost(bytes=1)]
 extern "C" fn sha256_padded_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha256_padded_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha256_h_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha256_h_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha256_k_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha256_k_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha256_w_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sha256_w_scratch_get() -> mut ref i64;
 // Real authentication: HMAC-SHA256/PBKDF2-HMAC-SHA256 state + the
 // user credential table -- see boot/auth_state.S's own file comment.
+#[stack_cost(bytes=1)]
 extern "C" fn auth_table_init() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn auth_get_uid(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn auth_set_uid(index: u32, uid: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn auth_salt_ptr(index: u32) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn auth_hash_ptr(index: u32) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn auth_get_fail_count(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn auth_set_fail_count(index: u32, count: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn auth_get_lockout_until(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn auth_set_lockout_until(index: u32, tick: u32) -> i64;
 // Task #193: SSH authorized-keys table -- see boot/ssh_auth_state.S's
 // own file comment for the full security-gap writeup.
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_auth_table_init() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_auth_get_uid(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_auth_set_uid(index: u32, uid: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ssh_auth_key_ptr(index: u32) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn auth_salt_nonce_next() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn hmac_key_block_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hmac_msg_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hmac_inner_hash_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pbkdf2_u_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pbkdf2_t_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pbkdf2_salt_ctr_ptr() -> mut ref i64;
 // Task #164 (WPA2) groundwork: a SEPARATE HMAC-SHA1/PBKDF2-HMAC-SHA1
 // scratch set (boot/wpa2_hmac_state.S) -- see that file's own header
 // comment for why this can't just reuse the HMAC-SHA256 scratch above
 // (two logically independent subsystems can genuinely run at the same
 // time on this project's preemptive scheduler).
+#[stack_cost(bytes=1)]
 extern "C" fn hmac_sha1_key_block_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hmac_sha1_msg_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn hmac_sha1_inner_hash_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pbkdf2_sha1_u_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pbkdf2_sha1_t_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn pbkdf2_sha1_salt_ctr_ptr() -> mut ref i64;
 // Task #164 (WPA2) groundwork: AES-CCMP scratch (boot/aes_ccmp_scratch.S).
+#[stack_cost(bytes=1)]
 extern "C" fn aes_ccmp_w_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aes_ccmp_state_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aes_ccmp_temp_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aes_ccmp_b_block_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aes_ccmp_x_block_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aes_ccmp_a_block_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aes_ccmp_s_block_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn aes_ccmp_computed_tag_ptr() -> mut ref i64;
 // Task #164 (WPA2) groundwork: EAPOL-Key scratch (boot/eapol_key_scratch.S).
+#[stack_cost(bytes=1)]
 extern "C" fn eapol_key_saved_mic_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn eapol_key_full_mic_ptr() -> mut ref i64;
 // Task #164 (WPA2) groundwork: PTK derivation scratch (boot/wpa_ptk_scratch.S).
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_prf_msg_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_prf_hash_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_ptk_data_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_ptk_label_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_ptk_tmp_ptr() -> mut ref i64;
 // Task #164 (WPA2) groundwork: 4-way handshake state (boot/wpa_handshake_state.S).
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_aa_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_sa_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_pmk_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_anonce_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_kck_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_kek_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_tk_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_replay_counter_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_gtk_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn wpa_hs_decrypted_kd_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn csprng_state_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn csprng_counter_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn passwd_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn su_hash_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_get_enabled() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_set_enabled(v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_key_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_nonce_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_state_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_working_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_keystream_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_scratch_ptr() -> mut ref i64;
 // Round 69: dedicated AEAD + per-block-metadata scratch, see
 // boot/dharafs_crypto2_state.S's own header comment for why this is
 // deliberately separate from TLS's own AEAD scratch. Fixed static
 // buffers (matching media_crypto_state.S's own style), so only a
 // getter is needed -- no boot-time _set(dhruva_alloc_bytes(...)) call.
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_block_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_otk_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_mac_data_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_computed_tag_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_tag_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_aad_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_crypto_meta_sector_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fault_write_countdown_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fault_write_countdown_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fault_irqburst_countdown_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fault_irqburst_countdown_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fault_netdrop_countdown_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fault_netdrop_countdown_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_line_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn eval_values_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn eval_values_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn eval_ops_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn eval_ops_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn uart_digits_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn uart_digits_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dwc2_dma_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dwc2_dma_scratch_get() -> mut ref i64;
 // Round 35 (boot/scratch_state.S): dwc2_bulk_out/dwc2_bulk_in's own
 // dedicated 512-byte DMA buffer, separate from dwc2_dma_scratch (64
 // bytes, control transfers only) -- see that state file's own comment
 // for why a full sector's worth of headroom is a real, not
 // speculative, need (READ(10)/WRITE(10)).
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bulk_data_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bulk_data_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_empty_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_empty_payload_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn net_send_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn net_send_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn net_recv_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn net_recv_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn udp_send_arp_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn udp_send_arp_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_resolve_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_resolve_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_resolve_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_resolve_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_payload_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_frame_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_frame_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_bcast_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_bcast_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn ptr_to_u32(p: mut ref i64) -> u32;
 // Per-task stack overflow canary (boot/stack_canary.S) -- see that
 // file's own header comment for the full "why" (four historical
@@ -1043,30 +1810,49 @@ extern "C" fn ptr_to_u32(p: mut ref i64) -> u32;
 // project's current 1MB section granularity). set_base is called once
 // per task, at boot, right after that task's stack is allocated;
 // check_all runs once per real timer tick from irq_dispatch below.
+#[stack_cost(bytes=1)]
 extern "C" fn stack_canary_set_base(index: u32, base: mut ref i64) -> i64;
+#[stack_cost(bytes=16)]
 extern "C" fn stack_canary_check_all() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn task_a_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_b_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_c_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_d_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
 // Task #253 (RTOS true-compliance pass, 2026-09-18): task_d/IDLE's own
 // real USR-mode launch path -- see is_usr_mode_task's own header
 // comment in context_switch.S for the full design.
+#[stack_cost(bytes=1)]
 extern "C" fn task_d_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn usr_sp_table_set_at(task_index: u32, value: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn usr_sp_table_get_at(task_index: u32) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn is_usr_mode_task_get_at(task_index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn stack_region_top(base: mut ref i64, bytes: i64) -> mut ref i64;
 // Task #253 Phase 3 (2026-09-18): the remaining 5 fixed tasks' own
 // USR-mode launch paths -- see context_switch.S's own comment above
 // task_a_init_stack_usr for the full design.
+#[stack_cost(bytes=1)]
 extern "C" fn task_a_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_b_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_c_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_e_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_f_init_stack_usr(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_e_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_f_init_stack(stack_base: mut ref i64, stack_bytes: i64) -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut ref i64, sp_d: mut ref i64, sp_e: mut ref i64, sp_f: mut ref i64) -> i64;
 // Round 54: general task-creation API -- generalizes the fixed 6-task
 // scheduler (boot/context_switch.S) to a real, callable API. Takes any
@@ -1075,13 +1861,16 @@ extern "C" fn start_multitasking(sp_a: mut ref i64, sp_b: mut ref i64, sp_c: mut
 // side). Returns the new task's slot index, or 0xFFFFFFFF (u32 -1) if
 // all 10 free slots (indices 6-15) are already taken -- there is no
 // task-deletion API yet, so slots are never reclaimed.
+#[stack_cost(bytes=28)]
 extern "C" fn task_create(entry_fn: fn() -> i64, stack_base: mut ref i64, stack_bytes: u32, priority: u32) -> u32;
 // Task #253 Phase 3 (2026-09-18): task_create's own USR-mode
 // counterpart -- see context_switch.S's own comment above task_
 // create_usr for the full design.
+#[stack_cost(bytes=28)]
 extern "C" fn task_create_usr(entry_fn: fn() -> i64, stack_base: mut ref i64, stack_bytes: u32, priority: u32) -> u32;
 // Must be called exactly once, before the first task_create() call and
 // before start_multitasking -- see its own comment in context_switch.S.
+#[stack_cost(bytes=1)]
 extern "C" fn task_table_init() -> i64;
 // Round 55: a real, second synchronization primitive alongside the
 // existing priority-CEILING protocol (dhruva_prio_lock/unlock, below) --
@@ -1089,11 +1878,14 @@ extern "C" fn task_table_init() -> i64;
 // dhruva_mutex_lock's own comment in context_switch.S for the full
 // design (direct ownership handoff, no recursion, no nested-mutex
 // inheritance stacking -- all deliberate scope limits, not oversights).
+#[stack_cost(bytes=8)]
 extern "C" fn dhruva_mutex_lock(mutex_id: u32) -> u32;
+#[stack_cost(bytes=8)]
 extern "C" fn dhruva_mutex_unlock(mutex_id: u32) -> u32;
 // Reads eff_prio_table[current_task] -- lets a task observe its own
 // effective priority live, e.g. to prove a dhruva_mutex_lock inheritance
 // boost actually happened.
+#[stack_cost(bytes=1)]
 extern "C" fn current_eff_prio() -> u32;
 // task_a=HIGH(priority 0), task_b=MEDIUM(priority 1), task_c=LOW(priority 2),
 // task_d=IDLE (priority 4, moved up from 3 back in Phase 3 to make
@@ -1116,38 +1908,54 @@ extern "C" fn current_eff_prio() -> u32;
 // scheduler_switch_from_irq has no vani-side declaration: it's called
 // only from hand-written assembly (boot/irq_entry.S), never from a
 // vani call chain.
+#[stack_cost(bytes=8)]
 extern "C" fn task_sleep_ticks(ticks: i64) -> i64;
+#[stack_cost(bytes=8)]
 extern "C" fn dhruva_prio_lock(ceiling: i64) -> i64;
+#[stack_cost(bytes=8)]
 extern "C" fn dhruva_prio_unlock(base_priority: i64) -> i64;
 // Round 53: real, workload-independent scheduler/interrupt event
 // counters (boot/context_switch.S) -- see docs/TODO.md's own note on
 // why these are built now while a deadline/priority-inversion model
 // is deliberately deferred until a real timing-constrained workload
 // exists to attach it to.
+#[stack_cost(bytes=1)]
 extern "C" fn context_switch_count_get() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn prio_lock_count_get() -> i64;
 // Round 189: real per-task CPU-time accounting (ticks attributed to
 // each task by scheduler_pick_next), the measurement primitive future
 // deadline/budget work needs -- see task_run_ticks_table's own comment
 // in context_switch.S for why this is deliberately NOT deadline-miss
 // detection itself (no task has a declared budget yet).
+#[stack_cost(bytes=1)]
 extern "C" fn task_run_ticks_get_at(index: u32) -> u32;
 // ROUND 2026-09-18 (task #241): runtime deadline-miss detection --
 // see task_deadline_ticks_table's own header comment in
 // context_switch.S for the full design.
+#[stack_cost(bytes=1)]
 extern "C" fn task_deadline_ticks_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn task_deadline_ticks_table_set_at(index: u32, v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_deadline_worst_wait_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn task_deadline_worst_wait_table_set_at(index: u32, v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn task_deadline_miss_count_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn task_deadline_miss_count_table_increment_at(index: u32) -> u32;
 // ROUND 2026-09-18 (task #242): UART RX interrupt work, bounded
 // against a real sporadic-server-style budget -- see uart_rx_irq_
 // budget's own header comment in boot/uart_rx_budget_state.S for the
 // full design.
+#[stack_cost(bytes=1)]
 extern "C" fn uart_rx_irq_budget_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn uart_rx_irq_budget_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn uart_rx_deferred_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn uart_rx_deferred_set(v: u32) -> i64;
 // 4 RX-IRQ services (up to 128 bytes drained each) per 500ms tick =
 // up to 512 bytes/tick -- deliberately generous, well beyond real
@@ -1159,9 +1967,12 @@ const UART_RX_IRQ_BUDGET_PER_TICK: i64 = 4;
 // irq_dispatch needs this (stack_canary_check_all's own cross-task
 // reads) and why it's safe (scheduler_pick_next always re-restricts
 // before any task-level code runs again).
+#[stack_cost(bytes=1)]
 extern "C" fn dacr_open_all() -> i64;
 extern "C" fn sp_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn irq_count_increment() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn irq_count_get() -> i64;
 // Round 66: the ring-buffer half of this section's own "not yet
 // started" note -- see boot/diag_ring_state.S's own header comment for
@@ -1170,12 +1981,19 @@ extern "C" fn irq_count_get() -> i64;
 // context_switch.S's own scheduler_pick_next/dhruva_prio_lock, exactly
 // the fragile hand-written-asm area this project has already taken two
 // real, hard-to-diagnose bugs from).
+#[stack_cost(bytes=8)]
 extern "C" fn diag_ring_push(tick: u32, ctxsw: u32, irqs: u32, priolock: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn diag_ring_get_head() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn diag_ring_get_count() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn diag_ring_get_tick_at(physical_index: i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn diag_ring_get_ctxsw_at(physical_index: i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn diag_ring_get_irqs_at(physical_index: i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn diag_ring_get_priolock_at(physical_index: i64) -> i64;
 
 // Translates a LOGICAL sample index (0 = oldest available, count-1 =
@@ -1197,19 +2015,26 @@ fn diag_ring_physical_index(logical_index: i64) -> i64 {
 // counts genuine blocks (not every lock call); mutex_wait_worst_ticks
 // is the longest observed wait, in ticks, from blocking to actually
 // being handed ownership.
+#[stack_cost(bytes=1)]
 extern "C" fn mutex_contention_count_get() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mutex_wait_worst_ticks_get() -> i64;
 // Phase 5: cpu_wfi/scheduler_ready_count -- context_switch.S.
+#[stack_cost(bytes=1)]
 extern "C" fn cpu_wfi() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn scheduler_ready_count() -> i64;
 // Round 16 audit -- context_switch.S's own comment on mem_barrier has
 // the full story: a real-hardware memory-ordering gap this project's
 // only test environment (QEMU) can't reveal.
+#[stack_cost(bytes=1)]
 extern "C" fn mem_barrier() -> i64;
 // Round 22 audit -- context_switch.S's own comment on
 // scheduler_get_tick_count has the full story: DHCP's new lease-
 // renewal timer needs a read-only view of elapsed scheduler time.
+#[stack_cost(bytes=1)]
 extern "C" fn scheduler_get_tick_count() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn current_task_get() -> u32;
 // ROUND 2026-09-18 (Gap B): read-only accessors for scheduler_pick_
 // next's own input tables -- see their own comment in context_
@@ -1218,137 +2043,233 @@ extern "C" fn current_task_get() -> u32;
 // next's decision algorithm, never a direct call into the real
 // function (round 75's own documented, never-fully-root-caused crash
 // history).
+#[stack_cost(bytes=1)]
 extern "C" fn eff_prio_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn base_prio_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn sleep_until_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn ready_wait_ticks_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn rr_last_picked_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_predicted_task_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_predicted_task_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_ctxsw_baseline_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_ctxsw_baseline_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_mismatch_count_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_mismatch_count_increment() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_prediction_valid_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_prediction_valid_set(v: u32) -> i64;
 // ROUND 2026-09-18 (RTOS true-compliance pass, task #240): real
 // measured unlock-to-running latency via the existing MUTEX-LOW/HIGH
 // demo pair -- see context_switch.S's own header comment on
 // mutex_handoff_t0/mutex_handoff_worst_us for the full design.
+#[stack_cost(bytes=1)]
 extern "C" fn mutex_handoff_t0_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn mutex_handoff_t0_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mutex_handoff_worst_us_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn mutex_handoff_worst_us_set(v: u32) -> i64;
 // ROUND 2026-09-18 (task #243): real measured full-timer-tick IRQ
 // dispatch cost -- see irq_tick_worst_us's own header comment in
 // context_switch.S.
+#[stack_cost(bytes=1)]
 extern "C" fn irq_tick_worst_us_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn irq_tick_worst_us_set(v: u32) -> i64;
 // ROUND 2026-09-19 (task #253 Phase 3 instrumentation): real measured
 // cost of the SWI trap's own FAST (never-blocking) round trip -- see
 // context_switch.S's own swi_fast_worst_us/total_us/count header
 // comment for the full design and the real-reference (seL4) check
 // behind it.
+#[stack_cost(bytes=1)]
 extern "C" fn swi_fast_worst_us_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn swi_fast_total_us_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn swi_fast_count_get() -> u32;
 // TEST-ONLY -- see context_switch.S's own comment on
 // scheduler_set_tick_count_test_only.
+#[stack_cost(bytes=1)]
 extern "C" fn scheduler_set_tick_count_test_only(value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn governor_get_last_applied_mhz() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn governor_set_last_applied_mhz(mhz: i64) -> i64;
+#[stack_cost(bytes=28)]
 extern "C" fn governor_apply_freq_mhz(mhz: i64) -> i64;
 // Round 71: HDMI framebuffer -- generic VideoCore mailbox property-tag
 // transport (boot/fb_state.S), generalized from governor_apply_freq_
 // mhz's own already-verified protocol.
+#[stack_cost(bytes=28)]
 extern "C" fn mbox_property_call(buf: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fb_mbox_buf_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fb_base_get() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fb_base_set(v: i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fb_size_get() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fb_size_set(v: i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fb_pitch_get() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fb_pitch_set(v: i64) -> i64;
 // Phase 5 step 2: run-queue-depth history for the smoothed scoring
 // function -- governor_state.S.
+#[stack_cost(bytes=1)]
 extern "C" fn governor_history_push(new_sample: i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn governor_history_get0() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn governor_history_get1() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn governor_history_get2() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn governor_history_get3() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn governor_history_reset() -> i64;
 // Phase 6: netif loopback queue state -- netif_state.S.
+#[stack_cost(bytes=1)]
 extern "C" fn netif_set_queue_buf(buf: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn netif_get_queue_buf() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn netif_get_head() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn netif_get_tail() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn netif_get_count() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn netif_get_slot_len(slot_index: i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn netif_set_slot_len(slot_index: i64, value: i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn netif_advance_head() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn netif_advance_tail() -> i64;
 // Phase 6: ARP cache state -- arp_state.S.
+#[stack_cost(bytes=1)]
 extern "C" fn arp_cache_set_macs_buf(buf: mut ref i64) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_cache_get_macs_buf() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_cache_get_count() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_cache_set_count(count: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_cache_get_next_slot() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_cache_set_next_slot(slot: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_cache_get_ip(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn arp_cache_set_ip(index: u32, value: u32) -> u32;
 
 // Phase 6 (boot/tcp_state.S): two-slot persistent TCP connection
 // state -- see that file's own comment for why two slots (a real
 // handshake/data/close cycle needs both sides tracked independently
 // in this single-threaded, no-second-task-available environment).
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_state(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_state(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_local_seq(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_local_seq(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_remote_seq(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_remote_seq(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_local_port(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_local_port(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_remote_port(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_remote_port(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_local_ip(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_local_ip(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_remote_ip(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_remote_ip(conn_id: u32, value: u32) -> u32;
 // Round 37 (boot/tcp_state.S): per-connection retransmission state --
 // see that file's own comment on each field.
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_rtx_deadline(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_rtx_deadline(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_rtx_count(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_rtx_count(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_rtx_seq(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_rtx_seq(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_rtx_len(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_rtx_len(conn_id: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_rtx_buf(conn_id: u32) -> mut ref i64;
 // Round 72: the peer's own last-advertised receive window -- see
 // boot/tcp_state.S's own comment.
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_get_remote_window(conn_id: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn tcp_conn_set_remote_window(conn_id: u32, value: u32) -> u32;
 
 // Phase 6 continued (boot/dhcp_state.S): the DHCP client's own
 // persistent state -- same vani-call-boundary gap as every other
 // stateful layer in this file, see that file's own header comment.
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_get_client_state() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_client_state(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_get_xid() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_xid(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_get_offered_ip() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_offered_ip(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_get_server_ip() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_server_ip(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_get_leased_ip() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_leased_ip(value: u32) -> u32;
 // Round 22 (2026-08-28): lease-renewal timer state, same file, same
 // vani-call-boundary reasoning.
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_get_lease_time() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_lease_time(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_get_lease_start_tick() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_lease_start_tick(value: u32) -> u32;
 
 // Round 107 (boot/dhcp_server_state.S): DHCP SERVER persistent state
@@ -1356,27 +2277,49 @@ extern "C" fn dhcp_state_set_lease_start_tick(value: u32) -> u32;
 // is a direct port of Pi 4/5's own round-92 design (see that file's
 // own header comment). The message-format algorithm consuming this
 // state already lives in the shared `netstack` package (round 106e).
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_set_config(server_ip: u32, pool_base_ip: u32, pool_size: u32, lease_time: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_get_server_ip() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_get_pool_base_ip() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_get_pool_size() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_get_lease_time() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_reset() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_get_lease_state(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_set_lease_state(index: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_get_lease_ip(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_set_lease_ip(index: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_get_lease_xid(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_set_lease_xid(index: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_get_lease_start_tick(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_set_lease_start_tick(index: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_get_lease_mac_byte(index: u32, byte_idx: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_set_lease_mac_byte(index: u32, byte_idx: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_frame_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_frame_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_client_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_client_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_server_payload_scratch_get() -> mut ref i64;
 
 // Round 33 (boot/usb_msd_state.S): USB mass-storage (Bulk-Only
@@ -1385,19 +2328,33 @@ extern "C" fn dhcp_server_payload_scratch_get() -> mut ref i64;
 // comment for why (bulk endpoint discovery and the bulk-transfer
 // calls that use it are separate calls with nothing else to carry
 // this across).
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_get_bot() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_set_bot(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_get_bulk_in_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_set_bulk_in_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_get_bulk_in_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_set_bulk_in_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_get_bulk_out_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_set_bulk_out_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_get_bulk_out_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_set_bulk_out_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_get_in_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_set_in_toggle(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_get_out_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_msd_set_out_toggle(value: u32) -> u32;
 
 // Round 56 (boot/usb_net_state.S): same shape as usb_msd_state.S
@@ -1406,23 +2363,41 @@ extern "C" fn usb_msd_set_out_toggle(value: u32) -> u32;
 // net_kind: 0=none (loopback), 1=CDC-ECM (QEMU usb-net + real USB
 // Ethernet dongles), 2=real SMSC LAN9512 (spec-only, see its own
 // comment at the LAN9512 backend below).
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_kind() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_kind(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_bulk_in_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_bulk_in_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_bulk_in_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_bulk_in_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_bulk_out_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_bulk_out_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_bulk_out_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_bulk_out_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_in_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_in_toggle(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_out_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_out_toggle(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_cdc_data_iface_num() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_cdc_data_iface_num(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_mac_scratch_ptr() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_mac_scratch_ptr(addr: mut ref i64) -> i64;
 
 // Round 57 (boot/usb_bt_state.S): same shape as usb_net_state.S above,
@@ -1432,37 +2407,65 @@ extern "C" fn usb_net_set_mac_scratch_ptr(addr: mut ref i64) -> i64;
 // Three endpoints (bulk in/out for ACL data, interrupt-in for HCI
 // events) instead of the usual two -- HCI commands go over the control
 // endpoint instead, no endpoint state needed for those.
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_kind() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_kind(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_bulk_in_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_bulk_in_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_bulk_in_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_bulk_in_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_bulk_out_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_bulk_out_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_bulk_out_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_bulk_out_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_bulk_in_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_bulk_in_toggle(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_bulk_out_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_bulk_out_toggle(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_intr_in_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_intr_in_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_intr_in_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_intr_in_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_intr_in_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_intr_in_toggle(value: u32) -> u32;
 
 // Round 71: USB HID (keyboard/mouse), boot/usb_hid_state.S -- same
 // shape as usb_bt_state.S above, one interrupt-IN endpoint only (this
 // driver is read-only, no LED-output support).
+#[stack_cost(bytes=1)]
 extern "C" fn usb_hid_get_kind() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_hid_set_kind(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_hid_get_intr_in_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_hid_set_intr_in_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_hid_get_intr_in_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_hid_set_intr_in_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_hid_get_intr_in_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_hid_set_intr_in_toggle(value: u32) -> u32;
 
 // Round 58 (boot/usb_wifi_state.S): USB WiFi (Realtek RTL8188CU/
@@ -1470,27 +2473,45 @@ extern "C" fn usb_hid_set_intr_in_toggle(value: u32) -> u32;
 // enumeration + vendor register read/write, see rtl8188cu_probe's own
 // comment for exactly why and where. No endpoint state needed yet
 // (no data path exists).
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_get_kind() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_set_kind(value: u32) -> u32;
 // Task #164 follow-up: persistent scratch for the real MCU firmware-
 // download sequence -- see boot/usb_wifi_state.S's own comment.
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_fw_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_fw_chunk_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_fw_upload_len_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_fw_upload_len_set(value: u32) -> u32;
 // Task #164 follow-up: bulk endpoint/toggle state for real 802.11
 // frame TX/RX -- see boot/usb_wifi_state.S's own comment.
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_get_bulk_in_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_set_bulk_in_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_get_bulk_in_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_set_bulk_in_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_get_bulk_out_epaddr() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_set_bulk_out_epaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_get_bulk_out_mps() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_set_bulk_out_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_get_in_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_set_in_toggle(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_get_out_toggle() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_set_out_toggle(value: u32) -> u32;
 
 // Round 2026-09-16: persistent state backing uart_putc_nonblocking's
@@ -1500,6 +2521,7 @@ extern "C" fn usb_wifi_set_out_toggle(value: u32) -> u32;
 // ONE combined extern call rather than separate get/set accessors
 // (the first attempt, at 6 separate extern round-trips per byte,
 // blew irq_dispatch's own WCET budget from real ARM call overhead).
+#[stack_cost(bytes=12)]
 extern "C" fn uart_tx_ring_push_and_drain(c: u32) -> u32;
 
 // Round 2026-09-15 real-hardware timing investigation: TIMER_CLO
@@ -1508,12 +2530,19 @@ extern "C" fn uart_tx_ring_push_and_drain(c: u32) -> u32;
 // run, to localize the ~5-10 minute real-hardware pause the user
 // reported to one specific checkpoint transition instead of boot.S's
 // ~250-line span as a whole.
+#[stack_cost(bytes=1)]
 extern "C" fn boot_diag_get_checkpoint_0() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn boot_diag_get_checkpoint_1() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn boot_diag_get_checkpoint_2() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn boot_diag_get_checkpoint_3() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn boot_diag_get_checkpoint_4() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn boot_diag_get_checkpoint_5() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn boot_diag_get_checkpoint_6() -> u32;
 
 // Round 60 (boot/fw_state.S): packet filtering rule table. proto: 0=any/
@@ -1522,16 +2551,27 @@ extern "C" fn boot_diag_get_checkpoint_6() -> u32;
 // path for a rule's 6 fields together (see its own comment); individual
 // getters read them back for filter_check_frame's matching loop and the
 // `fw list` shell command.
+#[stack_cost(bytes=1)]
 extern "C" fn fw_get_rule_count() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fw_get_default_policy() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fw_set_default_policy(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fw_flush() -> u32;
+#[stack_cost(bytes=12)]
 extern "C" fn fw_add_rule(proto: u32, src_ip: u32, src_ip_valid: u32, dst_port: u32, dst_port_valid: u32, action: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fw_get_rule_proto(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fw_get_rule_src_ip(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fw_get_rule_src_ip_valid(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fw_get_rule_dst_port(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fw_get_rule_dst_port_valid(index: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn fw_get_rule_action(index: u32) -> u32;
 
 // Phase 3 (boot/sdcard_state.S): sd_state_set/get persist the RCA and
@@ -1544,124 +2584,209 @@ extern "C" fn fw_get_rule_action(index: u32) -> u32;
 // mmio_read_u32/mmio_write_u32 need, so this one small transfer loop
 // lives in hand-written assembly like every other raw-pointer gap
 // this project has hit.
+#[stack_cost(bytes=1)]
 extern "C" fn sd_state_set(rca: i64, is_sdhc: i64) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sd_state_get_rca() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn sd_state_get_is_sdhc() -> i64;
+#[stack_cost(bytes=12)]
 extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, word_count: i64) -> i64;
+#[stack_cost(bytes=12)]
 extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, word_count: i64) -> i64;
 // TEMPORARY DIAGNOSTIC (2026-09-19) -- see boot/sdcard_state.S's own
 // header comment on sdhost_fill_fifo_from_buffer_diag. Write-path only.
+#[stack_cost(bytes=24)]
 extern "C" fn sdhost_fill_fifo_from_buffer_diag(buf: mut ref i64, word_count: i64) -> i64;
 // Task #215 -- see boot/sdcard_state.S's own header comment for this
 // function. Returns the SD core clock rate in Hz via the VideoCore
 // mailbox, or 0 if the query failed (never a real answer for CORE on
 // this SoC, so 0 unambiguously means "fall back to a conservative
 // assumption").
+#[stack_cost(bytes=24)]
 extern "C" fn sdhost_get_core_clock_hz() -> i64;
 // TEST-ONLY, task #3 verification -- see boot/sdcard_state.S.
+#[stack_cost(bytes=4)]
 extern "C" fn test_fill_pattern(buf: mut ref i64, byte_count: i64) -> i64;
+#[stack_cost(bytes=8)]
 extern "C" fn test_compare_buffers(a: mut ref i64, b: mut ref i64, byte_count: i64) -> i64;
 
 // Phase 3 task #4 -- boot/dharafs_buf.S. Every parameter here is `u32`, not
 // `i64`, specifically to avoid the AAPCS argument/return-register bug
 // classes task #3 hit -- see that file's header for why this sidesteps
 // them by construction.
+#[stack_cost(bytes=1)]
 extern "C" fn buf_write_byte(buf: mut ref i64, offset: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn buf_read_byte(buf: mut ref i64, offset: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn buf_write_u32(buf: mut ref i64, offset: u32, value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn buf_read_u32(buf: mut ref i64, offset: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn buf_checksum(buf: mut ref i64, start_offset: u32, byte_len: u32) -> u32;
 
 // boot/dharafs_state.S -- persists dharafs_init()'s recovery-scan result (where
 // the log's append cursor sits, the highest sequence number seen)
 // across the vani-call-boundary gap the same way sd_state does for
 // the SD driver's own RCA/addressing-mode.
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_state_set(next_block: u32, next_seq: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_state_get_next_block() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_state_get_next_seq() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_state_set_log_start(log_start: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_state_get_log_start() -> u32;
 // Round 77: dharafs_compact's own resumable-pass state -- see that
 // function's own comment.
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_compact_set_resume_block(block: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_compact_get_resume_block() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_compact_set_failed(failed: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_compact_get_failed() -> u32;
 // Hashed directory index (boot/dirindex_state.S) -- see that file's own
 // header comment. Pure RAM-only lookup accelerator for
 // dharafs_find_latest_block_raw, never a correctness authority by
 // itself (a miss always falls back to the original linear scan).
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_get_valid_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_set_valid_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_get_hash_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_set_hash_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_get_pathlen_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_set_pathlen_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_get_block_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_set_block_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_get_path_byte(combined_index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dirindex_set_path_byte(combined_index: u32, value: u32) -> i64;
 // Priority-aware FS request queue (boot/fsqueue_state.S) -- see that
 // file's own header comment. Opt-in: dharafs_queue_submit_write/
 // _delete alongside (not replacing) the existing synchronous calls.
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_valid_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_valid_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_priority_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_priority_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_task_id_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_task_id_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_op_type_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_op_type_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_path_len_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_path_len_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_data_len_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_data_len_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_owner_uid_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_owner_uid_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_owner_gid_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_owner_gid_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_mode_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_mode_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_seq_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_seq_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_result_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_result_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_next_seq_get() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_next_seq_set(value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_get_path_byte(combined_index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_set_path_byte(combined_index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_get_data_byte(combined_index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn fsqueue_set_data_byte(combined_index: u32, value: u32) -> i64;
 // ROUND 2026-09-18 (RTOS true-compliance pass, task #249): generic
 // inter-task mailbox (boot/mailbox_state.S) -- see that file's own
 // header comment for the full design.
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_valid_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_valid_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_sender_task_id_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_sender_task_id_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_dest_task_id_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_dest_task_id_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_priority_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_priority_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_seq_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_seq_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_payload_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_payload_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_next_seq_get() -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn mailbox_next_seq_set(value: u32) -> i64;
 // DharaFS named snapshots (boot/snapshot_state.S) -- see that file's
 // own header comment for why this doesn't need to touch dharafs_compact.
+#[stack_cost(bytes=1)]
 extern "C" fn snapshot_valid_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn snapshot_valid_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn snapshot_pinned_seq_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn snapshot_pinned_seq_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn snapshot_name_len_get_at(index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn snapshot_name_len_set_at(index: u32, value: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn snapshot_get_name_byte(combined_index: u32) -> i64;
+#[stack_cost(bytes=1)]
 extern "C" fn snapshot_set_name_byte(combined_index: u32, value: u32) -> i64;
 // Round 36: which block-device backend dharafs_block_read/dharafs_block_write
 // dispatch to -- see dharafs_state.S's own comment on dharafs_block_dev.
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_state_set_block_dev(dev: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_state_get_block_dev() -> u32;
 // dev==2 is a THIRD block-device backend used only by the host-side
 // ASAN/UBSAN test harness (test/host_harness/) to exercise DharaFS's
@@ -1676,14 +2801,19 @@ extern "C" fn host_virtual_disk_read(block_num: i64, buf: mut ref i64) -> i64;
 extern "C" fn host_virtual_disk_write(block_num: i64, buf: mut ref i64) -> i64;
 // Round 42: the active user/group context for FS permission checks --
 // see dharafs_state.S's own comment on dharafs_current_uid/dharafs_current_gid.
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_user_set(uid: u32, gid: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_user_get_uid() -> u32;
 // Round 51: total successful dharafs_block_write count -- u32, not
 // i64, matching every other assembly-backed state accessor in this
 // file (a real AAPCS pitfall for a 32-bit ARM target, not a style
 // choice -- see boot/dharafs_buf.S's own file-level comment).
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_commit_count_increment() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_commit_count_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_user_get_gid() -> u32;
 
 // Phase 4 -- boot/shell_state.S: the interactive shell's line buffer,
@@ -1691,13 +2821,20 @@ extern "C" fn dharafs_user_get_gid() -> u32;
 // (real IRQ context, so this needs to be genuinely simple -- see that
 // file's own header) and drained by the shell's command loop once a
 // complete line is ready.
+#[stack_cost(bytes=1)]
 extern "C" fn shell_rx_push_char(c: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_get_line_len() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_get_line_ready() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_get_line_byte(offset: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_clear_line() -> u32;
 // Round 72: persistent input-echo matcher state -- see shell_echo_advance.
+#[stack_cost(bytes=1)]
 extern "C" fn shell_get_echo_state() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn shell_set_echo_state(value: u32) -> u32;
 
 fn delay(count: i64) -> i64 {
@@ -3046,6 +4183,7 @@ fn uart_put_i64_bounded(v: i64) -> i64 {
 // the IC's "pending 1" / "enable 1" registers. The timer free-runs at
 // 1MHz (1 tick = 1 microsecond) -- a fixed property of this peripheral,
 // not something Dhruva configures.
+#[stack_cost(bytes=1)]
 extern "C" fn enable_irqs() -> i64;
 
 // Round 191 (2026-09-13): single source of truth for the scheduler
@@ -36503,8 +37641,26 @@ fn kernel_main() -> i64 {
   // dynamically-created-via-task_create pattern as the demo tasks
   // just above. Entirely opt-in: nothing here changes any EXISTING
   // synchronous dharafs_* call site.
+  //
+  // BUG found 2026-09-20 (task #245 follow-up: real #[stack_cost]
+  // annotations applied project-wide, see boot/*.S's own extern decls):
+  // this was 4096 bytes with ZERO margin -- `vanic stack-depth --entry=
+  // task_fsq` (never run before; build.sh only auto-gates kernel_main,
+  // see that gate's own header comment) reports a REAL worst case of
+  // 4152 bytes via task_fsq -> dharafs_queue_dispatch_one ->
+  // dharafs_append_raw -> dharafs_block_write -> dharafs_crypto_
+  // encrypt_block -> chacha20_poly1305_encrypt_heap's own AEAD chain --
+  // a genuine 56-byte overflow of the raw allocation, confirmed
+  // unchanged even after annotating every real extern fn this chain
+  // touches with its true (not flat-32-byte-default) cost, since this
+  // specific chain is pure vani/kosh-package code with zero extern
+  // calls on it at all. Bumped to 16384, matching task_e/GC's own
+  // allocation for the same reason (task_e's own real worst case,
+  // 4716 bytes, gets the identical 16384-byte budget for exactly this
+  // "encrypted DharaFS block I/O background task" profile) rather than
+  // picking a new, unprecedented number.
   let _ = dharafs_queue_reset();
-  let fsq_stack_bytes: u32 = 4096 as u32;
+  let fsq_stack_bytes: u32 = 16384 as u32;
   let fsq_stack: mut ref i64 = dhruva_alloc_stack_domain(fsq_stack_bytes as u32, 9 as u32);
   let _ = stack_canary_set_base(9 as u32, fsq_stack);
   let fsq_task_id: u32 = task_create_usr(task_fsq, fsq_stack, fsq_stack_bytes, 2 as u32);
