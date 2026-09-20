@@ -270,7 +270,7 @@ def dhruvaos_demo_task_set_analysis() -> int:
     demo task set before now (see this file's own header comment) --
     it had no WCET data to apply. This closes that gap with REAL,
     MEASURED numbers, not invented ones, for the one figure that
-    actually matters most: task_c (LOW)'s own delay(3000000) busy-wait,
+    actually matters most: task_c (LOW)'s own delay(N) busy-wait,
     held across a dhruva_prio_lock(0) ceiling-0 critical section --
     measured live under QEMU via a new permanent boot-time diagnostic
     (kernel_main.vani's delay_wcet_measure_self_test, TIMER_CLO-based,
@@ -279,6 +279,26 @@ def dhruvaos_demo_task_set_analysis() -> int:
     by design -- not a resource-specific block like a mutex, the whole
     point of the ceiling protocol's own "prevent inversion by
     construction" guarantee (see context_switch.S's own file header).
+
+    ROUND 2026-09-20 (task #276) CORRECTNESS NOTE: the "49906us"
+    measurement above was QEMU-only and, at the time, silently assumed
+    to also hold on real hardware -- it does not. Real Pi 1B silicon
+    runs this specific busy loop (delay(N)'s own tight, register-only
+    while-loop, no memory/peripheral access) ~18.6x slower than QEMU's
+    TCG JIT does, even though TIMER_CLO itself is emulated correctly
+    (confirmed via two independent real picocom logs from
+    2026-09-18). task_c's own original delay(3000000) call was
+    therefore ACTUALLY holding this ceiling-0 lock for ~930ms on real
+    hardware, not ~50ms -- genuinely enough to miss MEDIUM's own
+    500ms deadline (930ms alone exceeds it, confirmed by re-running
+    this exact tool with the real number substituted: verdict flips to
+    NOT schedulable, MEDIUM misses its deadline). Fixed at the root,
+    not by loosening MEDIUM's deadline: task_c's own count is now
+    161000 -- the REAL count that gives the ORIGINALLY INTENDED ~50ms
+    on real hardware, restoring the number below to genuine validity
+    rather than a QEMU-only coincidence. See kernel_main.vani's own
+    task_c/delay_wcet_measure_self_test comments for the full
+    writeup.
 
     The rest of each task body's own WCET (a handful of uart_puts calls
     plus lock/unlock bookkeeping) is NOT independently measured to the
@@ -334,7 +354,7 @@ def dhruvaos_demo_task_set_analysis() -> int:
     MS = 1.0  # working in milliseconds throughout
     TICK_MS = 500.0  # scheduler_tick_interval_us() = 500000us = 500ms
 
-    measured_low_critical_section_ms = 49.906  # delay(3000000), TIMER_CLO-measured
+    measured_low_critical_section_ms = 49.906  # delay(161000), TIMER_CLO-measured -- see this function's own 2026-09-20 correctness note above
     other_body_estimate_ms = 5.0  # conservative, NOT independently measured
     # ROUND 2026-09-18 (RTOS true-compliance pass, task #240): real
     # measured context-switch/mutex-handoff overhead -- see kernel_
