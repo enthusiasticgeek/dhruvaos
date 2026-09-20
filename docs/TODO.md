@@ -8118,6 +8118,115 @@ to plain SVC mode again rather than ship a build with a confirmed,
 reproducible double-fault. `phase4_milestone.py` re-verified: 4-FAIL
 baseline, no crash, no reboot.
 
+**Task #253 Phase 3, task_a -- SEVENTH round, real root cause FOUND and
+FIXED (2026-09-20), redesign attempts along the way, task_a's own
+conversion RE-ENABLED and verified clean.** User pushed back on an
+earlier session's claim of having "confirmed against real Linux" during
+a mid-session redesign attempt ("did you compare with known os similar
+design with source code -- perhaps review implementation against
+theirs"), which was fair: that claim was from recollection, not a fresh
+read. Actually fetched real Linux ARM32 kernel source this round
+(`curl` from `raw.githubusercontent.com/torvalds/linux/master/arch/arm/
+kernel/entry-header.S`, `entry-armv.S`, `entry-common.S` -- not a
+summarized fetch).
+
+**Root cause, finally confirmed**: `lr_usr` (r14 in USR mode) was NEVER
+restored anywhere in this project -- only `sp_usr` was (`scheduler_
+restore_usr_sp`, `boot/context_switch.S`). `lr_usr` is a single physical
+register shared by every USR-mode task; this project's own shared
+exception-return idiom (`ldmia sp!,{r0-r12,lr,pc}^`) loads its own "lr"
+word into whichever mode's bank is ACTIVE WHEN THAT INSTRUCTION EXECUTES
+-- still SVC, since the mode switch to USR only takes effect as PC/CPSR
+load, last, per the ARM ARM's own LDM-exception-return pseudocode.
+Confirmed directly against Linux's `restore_user_regs` (entry-header.S):
+Linux NEVER folds a user-mode resume's r0-r12+lr restore into that same
+combined, pc-inclusive form -- that form (`svc_exit`) is reserved for
+SAME-mode resume (e.g. IRQ returning to interrupted SVC code, where "lr
+loads into the active bank" is exactly correct because no mode switch
+happens). A genuine user-mode resume always uses a separate, non-pc `^`
+form (`ldmdb r2,{r0-lr}^`) specifically because excluding pc changes
+this from "LDM exception return" to "LDM user registers" -- targeting
+the user bank of every listed register unconditionally, lr included,
+regardless of current mode. Every fault signature chased across all six
+rounds above (the literal-pool wild-jump, the `0xFFFFFFF0`/`0xFFFFFFF8`
+near-null-sp double-faults) matches exactly what a silently-stale,
+cross-task-clobbered `lr_usr` would produce.
+
+**Three same-day attempts at the fix, all reverted** (full writeup:
+memory `project_dhruva_task253_lr_usr_redesign_attempt_2026_09_20`) --
+all tried to GROW the 68-byte frame to carry new `sp_usr`/`lr_usr`
+fields, which requires every restore tail's own fixed instruction count
+to agree on the new size; two of the three regressed on exactly that
+size-accounting asymmetry, the third eliminated the crash but caused a
+new, unexplained shell hang. Reverted clean to `f292fc4` rather than
+ship any of them.
+
+**The actual fix, once the real Linux structure was understood, needed
+no frame resizing at all**: `irq_entry.S`/`fiq_entry.S`'s own capture-
+side fix (already committed 2026-09-19, `stmia r1,{sp,lr}^`, never
+reverted) already stores the correct `lr_usr` value into the EXISTING
+68-byte frame's `true_lr` field (offset 60) -- only `scheduler_restore_
+usr_sp`'s restore side was still discarding it. Extended it to also read
+that field and restore both `sp_usr` and `lr_usr` via one `ldmia
+scratch,{sp,lr}^`, mirroring the exact idiom the codebase already used
+for `sp_usr` alone. Traced and confirmed safe even for the SVC-internal
+`task_sleep_ticks_impl`/`dhruva_mutex_lock_impl` block-then-resume path,
+where that same field isn't really `lr_usr` (it's "return to `swi_
+return_to_usr`") -- the "wrong" write there is harmless, unconditionally
+overwritten by the calling trampoline's own `mov lr,r4` before `lr_usr`
+is ever read (`r4` independently round-trips the task's TRUE original
+`lr_usr` through the frame's own ordinary r0-r12 save/restore the whole
+time). Shipped as commit `f37d933`, two identical `phase4_milestone.py`
+runs, 13-pass/5-fail baseline (the 5 are the long-documented tlsecho/
+httpecho/mqttecho/ls/diagnose flakes, unrelated), zero regression.
+
+**Task_a's own USR-mode conversion re-attempted with the fix in place**
+(user: "unblock task #262 if possible qemu"), restoring the exact
+proven late-seed pattern from round 3's item 1 (`task_a_init_stack_usr`
++ deferred `usr_sp_table_set_at(0, ...)` as the literal last statement
+before `start_multitasking`). Result, confirmed via two identical
+`phase4_milestone.py` runs: no crash, no reboot, 13-pass/5-fail baseline
+unchanged, and directly counted in the captured guest log -- **388**
+`HIGH: waking/acquired/released` cycles (not the 2 that used to trigger
+total freeze) and **390** continuous `LOW: locked/unlocking` shell
+cycles with zero interruption, zero `FATAL`/Abort lines anywhere in the
+log. Both previously-reported symptoms (the crash AND the "shell stops
+responding" WCET/starvation regression from round 3) are gone. Given
+the WCET regression was measured DURING earlier rounds where this exact
+corruption was already present, it now looks like that symptom was very
+likely a downstream consequence of the same `lr_usr` corruption (some
+background USR-mode task, most plausibly IDLE, going haywire mid-run),
+not an irreducible scheduling/fairness shortfall in its own right --
+though this is inferred from the disappearance, not independently
+re-proven.
+
+**Also checked against real-RTOS precedent, at user's request** (FreeRTOS-
+Kernel `portable/GCC/ARM_CA9/port.c`, Zephyr `arch/arm/core/cortex_a_r/
+swap_helper.S`+`userspace.S`, both freshly fetched): FreeRTOS's mainline
+Cortex-A port `configASSERT`s that the CPU is NEVER in USR mode when
+entering a critical section -- it does not attempt genuine unprivileged-
+task memory separation on this architecture at all, sidestepping this
+class of problem entirely rather than solving it. Zephyr's own `z_arm_
+svc` (Cortex-A/R, `CONFIG_USERSPACE`) pays the same full register-save
+entry cost for every SVC reason code (context-switch, syscall, oops
+alike) -- no cheaper fast path for scheduling-only traps exists there
+either. Neither reference offers a "make the trap itself cheaper" trick
+beyond what this project had already applied (removing the SYS-mode
+`cps` dip via banked LDM/STM, removing a redundant nested ceiling lock,
+both from round 5's SWI-trap hardening) -- reinforcing that the earlier
+"reduce trap overhead further" direction was close to its real floor,
+and that the actual unblock was the correctness fix, not a performance
+one.
+
+**Task #262's remaining scope** (converting task_b/c/e/f, plus the rest
+of the "all tasks USR mode" goal) is now considerably less risky than
+before -- the specific mechanism that broke every earlier one-task-at-a-
+time attempt is fixed and independently verified -- but each remaining
+task still needs its own live regression pass before conversion, one at
+a time, per this round's own now-twice-proven discipline (build, dual
+`phase4_milestone.py` runs, direct log inspection for cycle counts and
+FATAL lines) rather than an all-at-once attempt.
+
 **SD wedge: sixth fix attempt, real register-level divergence from
 Linux found and fixed (2026-09-19), against a fresh real-HW log
 (`picocom_20260919_145143.log`) that includes BOTH the FAIL_FLAG fix

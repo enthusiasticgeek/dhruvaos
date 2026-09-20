@@ -36288,7 +36288,24 @@ fn kernel_main() -> i64 {
   // a code-address value somewhere, so it stays reverted to plain SVC
   // mode rather than shipping a build with a confirmed, reproducible
   // wild-jump. See docs/TODO.md for the full writeup.
-  let sp_a: mut ref i64 = task_a_init_stack(stack_a, stack_bytes);
+  // Task #253 Phase 3, task_a -- SEVENTH round, re-attempted 2026-09-20
+  // after task #253's own lr_usr-never-restored root cause was found
+  // and fixed (commit f37d933, boot/context_switch.S's scheduler_
+  // restore_usr_sp): the literal-pool wild-jump/double-fault signature
+  // every earlier round in this comment chain reproduced (fault_pc
+  // resolving to a `.word` data line, or fault_data_abort itself
+  // double-faulting on a near-null sp) matches exactly what a silently-
+  // clobbered lr_usr produces -- a stale return address shared across
+  // every USR-mode task (today, only IDLE ever exercised it), jumped to
+  // as data. Allocation kept early (harmless, doesn't touch usr_sp_
+  // table); the usr_sp_table SEED itself stays deferred to the literal
+  // last statement before start_multitasking (this function's own task_
+  // a setup comment, item 1 below, and the matching comment right before
+  // start_multitasking's own call site) -- that placement bug is
+  // unrelated to lr_usr and still real.
+  let sp_a: mut ref i64 = task_a_init_stack_usr(stack_a, stack_bytes);
+  let stack_a_usr: mut ref i64 = dhruva_alloc_usrstack_domain(stack_bytes as u32, 0 as u32);
+  let stack_a_usr_top: mut ref i64 = stack_region_top(stack_a_usr, stack_bytes);
   // Task #253 Phase 3, task_b -- ALSO reverted to SVC mode (2026-09-19).
   // Converted to USR mode as the "sidesteps task_a's ceiling-priority
   // edge case" attempt above describes, then live-tested: hung with the
@@ -36546,12 +36563,15 @@ fn kernel_main() -> i64 {
   // scheduler -- see watchdog_arm's comment for why it isn't actually
   // called under QEMU's raspi1ap.
   //
-  // task_a's own usr_sp_table seed would belong here, deliberately the
-  // LAST thing kernel_main does before handing off (see the long
-  // comment at this function's own task_a setup site above for why) --
-  // omitted while task_a stays reverted to plain SVC; restore this
-  // exact placement (not task_b's earlier-seed pattern) when task_a is
-  // next re-attempted.
+  // task_a's own usr_sp_table seed, deliberately the LAST thing
+  // kernel_main does before handing off (see the long comment at this
+  // function's own task_a setup site above for the full "why": every
+  // boot-time uart_puts_bounded call between an earlier seed and here
+  // routes through dhruva_prio_lock/_unlock's own SWI trap, which
+  // unconditionally overwrites usr_sp_table[0] for current_task==0 --
+  // task_a's own index, and kernel_main's own boot-time default --
+  // destroying an earlier seed moments after it was made).
+  let _ = usr_sp_table_set_at(0 as u32, stack_a_usr_top);
   //
   // Never returns. start_multitasking's own restore sets CPSR (via
   // the fake frame's spsr=0x13) with interrupts already enabled, so
