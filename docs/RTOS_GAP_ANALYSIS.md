@@ -774,6 +774,20 @@ doesn't yet attempt.
   the task holds a ceiling-protected critical section (would strand
   other waiters), so this is a real but bounded safety net, not a
   guarantee against every possible overrun scenario.
+
+  **Live-fired and verified, task #279 (2026-09-20)**: this whole
+  safety net had never actually FIRED in any test before this —
+  `diagnose` always read 0 for both the stuck-task and eviction
+  counters, every run, since nothing had ever made a task genuinely
+  overrun its own declared bound. New `fault stuck <n>` shell command
+  (matching the established `fault alloc/write/irqburst/netdrop`
+  pattern) deliberately makes `task_custom_demo` spin past its own
+  heartbeat bound without yielding. Live-verified under QEMU: both
+  counters fire for the first time ever (exactly 1 each, not spurious
+  repeats), the task genuinely recovers and resumes normal operation,
+  and every other task keeps running correctly throughout — no FATAL,
+  no shadow-model mismatch. Confirms the mechanism is correct, not
+  just implemented.
 - ~~**The static model itself has a known, recently-found soundness gap.**
   `#[bounded_stack]`'s checker used to charge exactly 0 bytes for any
   `extern "C"` (hand-written assembly) callee — fixed this session

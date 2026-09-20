@@ -9190,3 +9190,74 @@ than it's ever been narrowed before. Two identical `phase4_
 milestone.py` runs confirm zero regression. Needs a fresh real-HW
 retest -- the new diagnostic print (if it fires) or the wedge simply
 resolving are both real, actionable outcomes either way.
+
+### Task #279: fault-injection test proves WCET enforcement + heartbeat detection actually work (2026-09-20)
+
+User: "how about other rtos scheduling improvements? any bugs through
+regression tests or edge cases to uncover any test cases?" -- answered
+with a concrete, real gap: task #271's WCET-enforcement eviction and
+task #269's stuck-task detection had never actually FIRED in any test
+this project has ever run. `diagnose` always read 0 for both, every
+single run, because nothing had ever made a task genuinely overrun
+its own declared bound -- a safety mechanism with zero real coverage
+of its own actual firing behavior. User: "yes build it. improve the
+os. we need to uncover hidden bugs."
+
+New `fault stuck <n>` shell command, matching the established `fault
+alloc/write/irqburst/netdrop` shape exactly (same one-shot-arm/self-
+disarm pattern as `fault_irqburst_take`) -- new state in `boot/
+fault_inject_state.S` (`fault_stuck_ticks`), new `fault_stuck_ticks_
+take()` helper in `kernel_main.vani`.
+
+Injection target: `task_custom_demo` (index 6, CUSTOM) -- chosen
+specifically because it holds no ceiling lock and no mutex, so
+eviction there has zero interaction complexity with either
+synchronization primitive (the cleanest possible test of the eviction
+path in isolation). Armed, its own next wake cycle spins instead of
+sleeping -- `task_custom_demo_stuck_spin`, deliberately time-based
+(`scheduler_get_tick_count()` as the spin's own exit condition), NOT
+a raw busy-loop iteration count. This was a deliberate choice to avoid
+repeating the exact mistake tasks #274/#275 just found and fixed the
+hard way in the SD-driver investigation: QEMU and real Pi 1B silicon
+execute the SAME tight busy loop at wildly different effective rates
+(measured ~18.6x apart), so a "safe for both platforms" iteration
+count doesn't reliably exist -- a tick-count-based exit condition
+sidesteps the whole problem by construction. Still gets preempted
+normally at every real timer tick (this scheduler is FIQ-driven-
+preemptive, not cooperative, per task #246's own design) -- other
+tasks keep running throughout, this doesn't freeze the system, it
+just never voluntarily yields itself.
+
+**Live-verified end to end under QEMU** (`fault stuck 40`, chosen
+above `task_custom_demo`'s own 35-tick heartbeat bound with real
+margin -- needed two attempts to get the verification harness right:
+a first attempt's blind 60-second `sleep` inside the `expect` script
+stopped its own event loop from reading QEMU's frequent demo-task
+output, overflowing the default buffer and producing a false
+"nothing happened" read; fixed by waiting on the actual "stuck spin
+finished" marker instead of a blind sleep, plus a larger `match_max`):
+
+- `stuck-task episodes (.../CUSTOM/...)`: 0 -> 1 (task #269's
+  detection fired for the first time ever)
+- `WCET-enforcement evictions (.../CUSTOM/...)`: 0 -> 1 (task #271's
+  eviction fired for the first time ever)
+- `CUSTOM: stuck spin finished, resuming normal operation` -- the
+  task genuinely recovered, not just got evicted
+- `deadline misses (HIGH/MEDIUM/LOW/IDLE/GC/SHELL): 0/0/0/0/0/0` --
+  every OTHER task's own deadlines stayed intact throughout the
+  episode
+- Every other task (HIGH/MEDIUM/LOW/MUTEX-LOW/MUTEX-HIGH/GC/SHELL)
+  kept running correctly throughout and after the injected stuck
+  episode -- no FATAL, no shadow-model mismatch, clean shutdown
+
+This is a genuine, positive finding, not a null result: it confirms
+both previously-unexercised safety mechanisms are correct, not just
+implemented -- exactly the "uncover hidden bugs" the user asked for,
+even though in this case the answer is "the mechanism works as
+designed." The fault-injection test itself is now a permanent,
+reusable regression capability (matches the same "opt-in, shell-
+triggered, zero behavior change when disarmed" contract every other
+`fault` subcommand already has) -- future changes to the heartbeat/
+eviction logic can be re-verified with this exact command instead of
+relying on code review alone. Two identical `phase4_milestone.py`
+runs confirm zero regression.
