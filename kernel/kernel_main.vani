@@ -4749,31 +4749,57 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // `msleep(20)` immediately after, with its own explicit comment:
   // "Wait for FIFO threshold to populate". This driver had NO delay
   // at all here before now -- a real, reference-documented settle
-  // requirement this codebase was silently skipping. delay(N)'s own
-  // real measured cost (delay_wcet_measure_self_test's own finding,
-  // delay(3000000)=49906us) puts 20ms at delay(1200000).
-  let _ = delay(1200000);
+  // requirement this codebase was silently skipping.
+  //
+  // BUG found the SAME DAY this landed (task #274-followup, real-HW
+  // retest picocom_20260920_161425.log): the first version of this
+  // fix sized delay(N) off `delay(3000000)=49906us`, a number this
+  // project's own docs/schedulability_analysis.py and memory already
+  // cited as "measured." That number is QEMU-only -- TWO real-hardware
+  // picocom logs from 2026-09-18 (picocom_20260918_074005.log,
+  // picocom_20260918_163633.log) already had the real answer sitting
+  // in them the whole time, un-cross-checked until now:
+  // `delay(3000000)=930168us`/`930098us` (~930ms), a ~18.6x
+  // discrepancy. QEMU's TCG JIT runs a tight register-only busy loop
+  // at a completely different effective rate than real ARM1176
+  // silicon while still emulating TIMER_CLO's own 1MHz tick correctly
+  // -- so a delay() calibration taken under QEMU silently measures
+  // "how fast does the host machine execute this loop," not real Pi
+  // 1B timing, for any *non*-MMIO-bound busy loop (TIMER_CLO reads
+  // themselves are real/correct under QEMU; the CPU-bound loop between
+  // them is not). Confirmed directly: the first version of this fix's
+  // own delay(1200000) measured to ~372ms real elapsed time per call
+  // (sdhost_init's own "total elapsed" diagnostic: 1103260us extra
+  // across 3 calls / 3 = ~367753us each) instead of the intended
+  // ~20ms -- the wedge still reproduced identically even with settle
+  // delays ~18x more generous than U-Boot's own real, working values,
+  // which is itself strong NEW negative evidence against "insufficient
+  // settle time" as the write wedge's actual root cause (see this
+  // function's own investigation log in docs/TODO.md for the fuller
+  // writeup; this comment only documents the real-vs-QEMU timing bug
+  // itself). Real per-iteration cost: 930168/3000000 ~= 0.31006us:
+  // 20ms is delay(64500), not delay(1200000).
+  let _ = delay(64500);
 
   // Power off, then back on -- a clean, known starting FSM state
   // rather than trusting whatever QEMU's reset default happens to be.
-  // ROUND 2026-09-20 (task #273-followup): U-Boot's own reference
-  // sequence settles for a full `msleep(20)` -- "Wait for all
-  // components to go through power on cycle" -- after asserting
-  // SDVDD_POWER_ON; this codebase's own pre-existing delay(10000)
-  // here measures to only ~166us (delay(3000000)=49906us, ~0.0166us/
-  // iteration), roughly 120x shorter than the reference driver's own
-  // real, presumably electrically-motivated (voltage-rail/card-side
-  // power-on-reset settling, not a software artifact QEMU's own
-  // idealized SD model would ever need or expose) value. Bumped to
-  // delay(1200000) (~20ms) on both sides of the power cycle to match
-  // U-Boot's own real, working sequence exactly rather than guess at
-  // a smaller number -- real-hardware-only timing sensitivity,
-  // consistent with this whole investigation's own recurring theme
-  // (QEMU's SD model has no analog realism to ever surface this).
+  // ROUND 2026-09-20 (task #273-followup, corrected task #274-
+  // followup): U-Boot's own reference sequence settles for a full
+  // `msleep(20)` -- "Wait for all components to go through power on
+  // cycle" -- after asserting SDVDD_POWER_ON; this codebase's own
+  // pre-existing delay(10000) here measures to only ~3.1ms at the
+  // REAL (not QEMU-derived) per-iteration cost above, still ~6.5x
+  // shorter than the reference driver's own real, presumably
+  // electrically-motivated (voltage-rail/card-side power-on-reset
+  // settling, not a software artifact QEMU's own idealized SD model
+  // would ever need or expose) value. Bumped to delay(64500) (~20ms
+  // real, matching delay(3000000)=930168us's own real measured rate)
+  // on both sides of the power cycle to match U-Boot's own real,
+  // working sequence exactly.
   let _ = mmio_write_u32(sdvdd, 0 as u32);
-  let _ = delay(1200000);
+  let _ = delay(64500);
   let _ = mmio_write_u32(sdvdd, 1 as u32);
-  let _ = delay(1200000);
+  let _ = delay(64500);
 
   // Identification-speed clock divisor and a generous command
   // timeout -- real-hardware bcm2835-sdhost values, not QEMU-specific
