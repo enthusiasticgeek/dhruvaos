@@ -8726,3 +8726,65 @@ either way to call it a pre-existing rare flake or a real new gap.
 Flagged here as a fresh, separate, NOT-yet-investigated finding for a
 future round; not part of task #270's own scope and did not block
 closing it.
+
+### Task #271 closed: real runtime WCET/deadline ENFORCEMENT, not just detection (2026-09-20)
+
+Third of the 4 real RTOS-compliance gaps from the 2026-09-18 sweep.
+Task #269 (per-thread execution-time supervision) already detects a
+task that's stopped making real forward progress; this task closes
+the gap between "detected" and "acted on."
+
+Design question going in: what recovery action is both real and safe
+to build on top of this scheduler's existing machinery, given the
+project's own hard-won caution around this exact function
+(`scheduler_pick_next`'s own header comment documents a real,
+never-fully-root-caused crash from round 75's white-box testing --
+see Gap B/task #234's own shadow-model workaround for why nothing
+calls that function directly from vani). Ruled out a full task
+kill/reset (needs resource-release machinery this codebase doesn't
+have yet, real scope creep) in favor of the minimal, already-proven
+mechanism this scheduler uses for every other blocking call:
+`sleep_until_table`. Every task that's ever waited for anything in
+this codebase (`task_sleep_ticks_impl`, `dhruva_mutex_lock_impl`'s
+contended branch) becomes "not ready" by writing exactly this one
+table, which `scheduler_pick_next`'s own ready-gate already reads on
+every decision. Forcing an overrunning task through the SAME table,
+from `scheduling_decision_prelude` (which already runs immediately
+BEFORE `scheduler_pick_next` on every real scheduling decision, so
+the eviction takes effect the same tick it's detected), adds zero new
+control-flow paths to the scheduler itself -- just feeds its existing,
+already-verified input.
+
+New `task_wcet_enforce_evicted_count_table` (`boot/context_switch.S`,
+same 16-word table shape as every other per-task counter in this
+file). On a heartbeat-bound overrun (task #269's own check), write
+`sleep_until_table[i] = now + bound` (self-healing: automatically
+ready again after one cooldown window, no kill/reset needed) UNLESS
+`ceiling_depth_table[i] > 0` -- the task genuinely holds a
+ceiling-protected critical section. New `ceiling_depth_table_get_at`
+accessor added for this check (read-only, same safety class as Gap
+B's own existing accessors: a single-instruction table read, never
+calls `scheduler_pick_next` itself). Evicting a mutex holder without
+also releasing what it holds would strand every other task waiting on
+that same resource -- a strictly worse failure mode than the overrun
+itself -- so those episodes are still detected (the stuck-count row
+still increments) but deliberately not enforced. This is effectively
+ARINC 653's "freeze the overrunning partition until the next window"
+applied per-task instead of per-partition, and mirrors `scheduler_
+pick_next`'s own existing ceiling-aware gate for this same table (see
+its "Round 75 gate" comment) -- a stuck ceiling-holder is never
+evicted through either path.
+
+Exposed via `diagnose`, same row-of-10 format as the stuck-count line
+immediately above it. Two identical `phase4_milestone.py` runs
+confirmed zero regression. A direct, separately-driven live `diagnose`
+check confirmed the new line prints correctly: `WCET-enforcement
+evictions (HIGH/MEDIUM/LOW/IDLE/GC/SHELL/CUSTOM/MUTEX-LOW/MUTEX-HIGH/
+FSQ): 0/0/0/0/0/0/0/0/0/0` -- all zero under normal operation,
+matching the stuck-count row 1:1 (no ceiling-holding task has ever
+overrun its bound in this demo set, so the two rows track exactly).
+
+One item left in the 4-gap program: task #272 (tick granularity),
+explicitly HIGH RISK per this file's own prior entries -- needs the
+tick-count-expressed real-time constants migrated to microseconds
+FIRST, before ever touching the tick rate again.
