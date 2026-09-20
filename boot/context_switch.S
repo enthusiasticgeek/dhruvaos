@@ -587,6 +587,22 @@ is_usr_mode_task:
 usr_sp_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
+/* Task #253 redesign attempt 4 (2026-09-20): 2-word scratch for
+ * scheduler_restore_usr_sp's own combined sp_usr+lr_usr restore below --
+ * see that function's own header comment for the full design. Dedicated
+ * (not shared with irq_usr_capture_scratch/fiq_usr_capture_scratch) for
+ * the same reason those two are dedicated to their own files: this
+ * function can never race a concurrent user of ITS OWN scratch, by
+ * construction (it always runs to completion, uninterrupted by its own
+ * caller's own masking -- every call site holds `cpsid if` or an
+ * exception's own automatic masking across this call), but sharing a
+ * buffer with irq_entry.S/fiq_entry.S's own capture-side scratch would
+ * require reasoning about their independence all over again for no
+ * benefit. */
+.align 2
+usr_sp_lr_restore_scratch:
+    .word 0, 0
+
 /* Task #253 Phase 3 (2026-09-18): the SWI syscall trap's own per-task
  * resume state -- see boot/swi_entry.S's own header comment for the
  * full design. usr_sp_table above already solves this exact problem
@@ -2269,6 +2285,65 @@ is_usr_mode_task_get_at:
  * `cps`/`mov`/`cps` triple with one `ldmia` reading sp_usr straight out
  * of usr_sp_table's own memory.
  *
+ * ROUND 2026-09-20 (task #253 redesign attempt 4 -- real root cause,
+ * minimal fix, no frame resizing): this function used to restore ONLY
+ * sp_usr, never lr_usr -- lr_usr (r14_usr) is a SINGLE PHYSICAL
+ * REGISTER shared by every USR-mode task, and the shared exception-
+ * return idiom every restore call site ends with (`ldmia sp!,{r0-12,
+ * lr,pc}^`) loads its own "lr" word into whichever mode's bank is
+ * ACTIVE WHEN THAT INSTRUCTION EXECUTES -- still SVC, since the mode
+ * switch to USR only takes effect as that instruction retires, per the
+ * ARM ARM's own LDM-exception-return pseudocode (general-purpose
+ * registers load first, into the CURRENT bank; PC/CPSR load last).
+ * Confirmed directly against real Linux (arch/arm/kernel/entry-
+ * header.S's `restore_user_regs`): Linux NEVER folds a user-mode
+ * resume's r0-r12+lr restore into the same combined, pc-inclusive `^`
+ * form this project's shared restore tail uses (that form -- Linux's
+ * own `svc_exit` -- is reserved for SAME-mode resume, e.g. IRQ
+ * returning to interrupted SVC code, where "lr loads into the active
+ * bank" is exactly correct because no mode switch happens). For a
+ * genuine user-mode resume, Linux always uses a SEPARATE, non-pc `^`
+ * form (`ldmdb r2,{r0-lr}^`, entry-header.S) specifically BECAUSE
+ * excluding pc from the list changes this from "LDM exception return"
+ * to "LDM user registers" -- unconditionally targeting the USER bank
+ * of every listed register, lr included, regardless of current mode,
+ * with no mode switch of its own at all. This function's own existing
+ * `ldmia r1,{sp}^` already relies on exactly that same non-pc form for
+ * sp_usr -- it was simply never extended to lr at the same time.
+ *
+ * Three previous attempts at this fix (2026-09-20, reverted --
+ * memory: project_dhruva_task253_lr_usr_redesign_attempt_2026_09_20)
+ * all tried to GROW the 68-byte frame to carry sp_usr/lr_usr as new
+ * fields, which requires every restore tail's own fixed instruction
+ * count to agree on the new size -- exactly the class of asymmetry
+ * that caused two of those three regressions. This fix needs no frame
+ * resizing at all: irq_entry.S/fiq_entry.S's own capture-side fix
+ * (round 2026-09-19, `stmia r1,{sp,lr}^`) ALREADY stores the correct
+ * lr_usr value into the EXISTING true_lr field (frame offset 60) --
+ * that work was already committed, tested, and never reverted; only
+ * the RESTORE side (here) was still discarding it. At the moment this
+ * function runs, "sp" (post this function's own `push{r0-r3}` below)
+ * points 16 bytes into the about-to-resume task's own frame, so
+ * [sp,#76] == [original frame base, #60] == that same true_lr field.
+ *
+ * That field's value is ALWAYS safe to write into lr_usr, even though
+ * it is not always semantically "a real lr_usr" -- for a task resuming
+ * via irq_entry.S/fiq_entry.S (genuinely preempted mid-USR-code), it
+ * IS the real lr_usr, correctly captured. For a task resuming via
+ * task_sleep_ticks_impl/dhruva_mutex_lock_impl's own voluntary block-
+ * then-resume (always SVC-mode-internal: true_lr there is "return to
+ * swi_return_to_usr", boot/swi_entry.S), writing that address into
+ * lr_usr is harmless because it is UNCONDITIONALLY overwritten before
+ * ever being read: swi_return_to_usr's own final `movs pc,lr` uses
+ * lr_SVC (loaded via a plain, non-banked `ldr`, untouched by this
+ * function), and lands back inside the calling trampoline
+ * (task_sleep_ticks/dhruva_mutex_lock/etc., swi_entry.S), whose very
+ * first instruction on resume is `mov lr, r4` -- r4 having staged the
+ * task's TRUE original lr_usr, unbanked, safely round-tripped through
+ * this exact frame's own ordinary r0-r12 save/restore the whole time.
+ * So the transient "wrong" write this function makes in that case is
+ * always replaced before any code path can observe it.
+ *
  * r0-r3 preserved defensively (every call site is about to overwrite
  * them from its own restore anyway, but preserving costs nothing and
  * removes any need to re-audit this if a future call site's own
@@ -2286,8 +2361,21 @@ scheduler_restore_usr_sp:
     beq scheduler_restore_usr_sp_done
     ldr r1, =usr_sp_table
     add r1, r1, r0, lsl #2  /* r1 = &usr_sp_table[current_task] */
-    ldmia r1, {sp}^         /* load sp_usr directly -- no mode switch,
-                             * see this function's own header comment */
+    ldr r2, [r1]             /* r2 = saved sp_usr */
+    ldr r3, [sp, #76]        /* r3 = resuming frame's own true_lr field
+                             * (original frame base + 60, adjusted +16
+                             * for this function's own push{r0-r3}
+                             * above) -- see this function's own header
+                             * comment for why this is always either a
+                             * genuine lr_usr or a harmless, soon-
+                             * overwritten value */
+    ldr r1, =usr_sp_lr_restore_scratch
+    str r2, [r1]
+    str r3, [r1, #4]
+    ldmia r1, {sp, lr}^      /* single instruction restores BOTH sp_usr
+                             * and lr_usr -- no mode switch, no pc in
+                             * the list, see this function's own header
+                             * comment */
 scheduler_restore_usr_sp_done:
     pop {r0-r3}
     bx lr
