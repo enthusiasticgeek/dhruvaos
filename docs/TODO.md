@@ -8547,6 +8547,53 @@ dormant under test as expected). Needs a fresh real-HW log -- this is
 the first time this investigation will have direct card-side evidence
 rather than only controller-side.
 
+**Fourteenth round (2026-09-20): command path confirmed frozen, clock
+speed ruled out, two real missing U-Boot-documented settle delays
+found and fixed.** Fresh real-HW log (`picocom_20260920_133428.log`,
+user: "new picocom log hone folder") with the CMD13 diagnostic firing
+for the first time. Two concrete new findings from it:
+
+1. CMD13 (SEND_STATUS) itself times out every time the wedge occurs
+   ("controller too wedged to respond") -- the controller's own
+   COMMAND path, not just the data path, is completely unresponsive
+   once FSM sticks at WRITEDATA (SDEDM=0x10803). No command-level
+   recovery is possible once this happens; only a full controller
+   reset can escape it, which the code already does.
+2. The wedge reproduces even at the SLOWEST identification-speed
+   clock (SDCDIV=0x148, the adaptive backoff's own last-resort rung),
+   on the very first write attempt after backing off to it --
+   conclusively rules out clock speed as the root cause.
+
+Since command-path unresponsiveness rules out clock speed, did a
+targeted line-by-line diff of `sdhost_init` against U-Boot's real
+`drivers/mmc/bcm2835_sdhost.c` (fetched fresh) rather than the
+broader wait-loop comparison prior rounds already exhausted (per the
+user's own follow-up, "check linux or other os if similar logic," the
+same discipline just applied to task #273). Found two real, reference-
+documented gaps:
+
+1. No delay at all after the already-applied SDEDM FIFO-threshold
+   register write (task #209's own silicon-errata fix, "Limit fifo
+   usage due to silicon bug") -- U-Boot inserts `msleep(20)`
+   immediately after, with its own explicit comment "Wait for FIFO
+   threshold to populate." This driver had none.
+2. The existing SDVDD power-cycle settle (`delay(10000)`) measures to
+   only ~166us real time (`delay_wcet_measure_self_test`'s own
+   measured finding: `delay(3000000)=49906us`, ~0.0166us/iteration)
+   -- roughly 120x shorter than U-Boot's real `msleep(20)` on both
+   sides of the power-on cycle.
+
+Both bumped to `delay(1200000)` (~20ms, matching U-Boot's real,
+working values rather than guessing at a smaller number) -- commit
+`0d3b2f2`. Real-hardware-only timing sensitivity by construction:
+QEMU's idealized SD model has no analog rail-settling/card-power-on-
+reset behavior to ever expose a gap like this, consistent with this
+whole investigation's own recurring pattern (every confirmed real bug
+found here has been invisible under emulation). Two identical
+`phase4_milestone.py` runs confirm zero regression (necessarily inert
+under QEMU). Needs a fresh real-HW retest -- the only test this fix
+can actually be judged by.
+
 **Task #245 follow-up: real per-extern-fn `#[stack_cost]` annotations
 applied project-wide, real `task_fsq` overflow found and fixed
 (2026-09-20, commit `396d626`).** While looking for QEMU-appropriate
