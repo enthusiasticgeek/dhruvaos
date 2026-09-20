@@ -1960,6 +1960,20 @@ extern "C" fn task_heartbeat_bound_table_set_at(index: u32, v: u32) -> i64;
 extern "C" fn task_heartbeat_stuck_count_table_get_at(index: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn task_heartbeat_stuck_count_table_increment_at(index: u32) -> u32;
+// ROUND 2026-09-20 (task #271): real WCET/deadline ENFORCEMENT, not
+// just detection -- see task_wcet_enforce_evicted_count_table's own
+// header comment in context_switch.S for the full design (forced
+// eviction via sleep_until_table, skipped whenever ceiling_depth_
+// table[i] > 0 to avoid stranding other tasks waiting on a held
+// mutex).
+#[stack_cost(bytes=1)]
+extern "C" fn task_wcet_enforce_evicted_count_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn task_wcet_enforce_evicted_count_table_increment_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn ceiling_depth_table_get_at(index: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn sleep_until_table_set_at(index: u32, v: u32) -> i64;
 // ROUND 2026-09-18 (task #242): UART RX interrupt work, bounded
 // against a real sporadic-server-style budget -- see uart_rx_irq_
 // budget's own header comment in boot/uart_rx_budget_state.S for the
@@ -10369,6 +10383,23 @@ fn scheduling_decision_prelude() -> i64 {
       if hb_elapsed >= hb_bound {
         let _ = task_heartbeat_stuck_count_table_increment_at(hb_i as u32);
         let _ = task_heartbeat_last_tick_table_set_at(hb_i as u32, hb_now);
+
+        // ROUND 2026-09-20 (task #271): real enforcement, not just
+        // detection -- see task_wcet_enforce_evicted_count_table's own
+        // header comment in context_switch.S for the full design.
+        // Skip eviction while the task genuinely holds a ceiling-
+        // protected critical section (ceiling_depth_table[i] > 0):
+        // forcing it off the CPU without also releasing what it holds
+        // would strand every other task waiting on that same resource,
+        // a strictly worse outcome than the overrun itself. This mirrors
+        // scheduler_pick_next's own gate for the exact same table (see
+        // its "Round 75 gate" comment), so a stuck ceiling-holder is
+        // never evicted through either path.
+        let hb_ceiling: u32 = ceiling_depth_table_get_at(hb_i as u32);
+        if hb_ceiling == (0 as u32) {
+          let _ = sleep_until_table_set_at(hb_i as u32, hb_now + hb_bound);
+          let _ = task_wcet_enforce_evicted_count_table_increment_at(hb_i as u32);
+        }
       }
     }
   }
@@ -25374,6 +25405,37 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("/");
     let _ = uart_put_i64(task_heartbeat_stuck_count_table_get_at(9 as u32) as i64);
     let _ = uart_puts(" (each expected to stay 0 under normal operation -- a nonzero count means that task went >= its own declared bound of ticks without a single voluntary task_sleep_ticks/blocking-mutex call)\n");
+
+    // ROUND 2026-09-20 (task #271): real WCET/deadline ENFORCEMENT, not
+    // just detection -- see task_wcet_enforce_evicted_count_table's own
+    // header comment in context_switch.S for the full design. A count
+    // here should track the stuck-task row above 1:1 UNLESS the
+    // offending task was genuinely holding a ceiling-protected section
+    // at the moment it was caught (deliberately not evicted then, to
+    // avoid stranding other tasks waiting on that same resource) -- a
+    // gap between the two rows is itself diagnostic information, not a
+    // bug.
+    let _ = uart_puts("  WCET-enforcement evictions (HIGH/MEDIUM/LOW/IDLE/GC/SHELL/CUSTOM/MUTEX-LOW/MUTEX-HIGH/FSQ): ");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(0 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(1 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(2 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(3 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(4 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(5 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(6 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(7 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(8 as u32) as i64);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(task_wcet_enforce_evicted_count_table_get_at(9 as u32) as i64);
+    let _ = uart_puts(" (forced off the CPU via sleep_until_table, self-healing after one cooldown window -- each expected to stay 0 under normal operation; SKIPPED, not evicted, whenever the task held a ceiling-protected section when caught, see this line's own header comment)\n");
 
     // ROUND 2026-09-18 (task #242): UART RX sporadic-server budget --
     // see uart_rx_irq_budget's own header comment in boot/uart_rx_

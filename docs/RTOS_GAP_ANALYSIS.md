@@ -340,9 +340,27 @@ doesn't yet attempt.
   (never calls `task_sleep_ticks`), matching CMSIS-RTOS2's own idle-
   thread exemption. Exposed via `diagnose`, live-verified: all-zero
   under normal operation, no false positives from any of this demo
-  set's own real blocking terms. Detection/reporting only — a real
-  recovery action is a separate, still-open item (see task #271 in
-  `docs/TODO.md`).
+  set's own real blocking terms. Detection/reporting only in this
+  round — a real recovery action is now closed too, **`[DONE, task
+  #271, 2026-09-20]`**: a new `task_wcet_enforce_evicted_count_table`
+  (`boot/context_switch.S`) forces an overrunning task OFF the CPU by
+  writing `sleep_until_table[i] = now + bound`, the exact same "not
+  ready" input `scheduler_pick_next` already trusts for every other
+  blocking call in this codebase — no new control-flow path inside the
+  scheduler itself, just feeding its existing, already-verified input.
+  Self-healing: the task becomes ready again automatically after one
+  cooldown window, matching ARINC 653's "freeze the overrunning
+  partition until the next window" applied per-task. Deliberately
+  SKIPPED whenever `ceiling_depth_table[i] > 0` (the task genuinely
+  holds a ceiling-protected critical section) — evicting a mutex
+  holder without releasing what it holds would strand every other task
+  waiting on that same resource, a strictly worse outcome than the
+  overrun itself; those episodes are still detected (the stuck-count
+  row above still increments) but not enforced, an intentionally
+  narrower scope than "evict on every overrun." Exposed via
+  `diagnose`, live-verified: all-zero under normal operation, matching
+  the stuck-count row 1:1 in this demo set (no ceiling-holding task has
+  ever overrun its bound).
 
 ## 3. Memory / fault isolation gaps (the largest one)
 

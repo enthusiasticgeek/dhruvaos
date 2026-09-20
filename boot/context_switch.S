@@ -622,12 +622,34 @@ task_deadline_miss_count_table:
  * count_table above uses (see scheduling_decision_prelude's own check,
  * kernel_main.vani) -- detection and reporting only, matching task
  * #241's own scope; a real recovery ACTION (distinct from detection)
- * is task #271's own separate, not-yet-done scope. */
+ * was task #271's own separate scope, DONE 2026-09-20:
+ *
+ * task_wcet_enforce_evicted_count_table: a task that overruns its own
+ * heartbeat bound is forced OFF the CPU, not just counted -- scheduling_
+ * decision_prelude sets sleep_until_table[i] = now + bound (the exact
+ * same "not ready" mechanism task_sleep_ticks_impl itself already uses
+ * and scheduler_pick_next already trusts), so the very next scheduler_
+ * pick_next call in this same tick skips it, same as any other blocked
+ * task. Self-healing: the task becomes ready again automatically once
+ * the cooldown elapses, no kill/reset machinery needed. Deliberately
+ * SKIPPED whenever ceiling_depth_table[i] > 0 (task is genuinely
+ * holding a ceiling-protected critical section) -- evicting a mutex
+ * holder without also releasing what it holds would strand every other
+ * task waiting on that same resource, a strictly worse outcome than
+ * the overrun itself; those cases still increment the stuck counter
+ * above (detected) but not this one (not enforced), an intentional,
+ * honestly-scoped gap matching this project's own established pattern
+ * of narrowing enforcement to cases it can act on safely rather than
+ * enforcing everywhere and accepting a worse failure mode. This is
+ * effectively ARINC 653's "freeze the overrunning partition until the
+ * next window" applied per-task instead of per-partition. */
 task_heartbeat_last_tick_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 task_heartbeat_bound_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 task_heartbeat_stuck_count_table:
+    .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+task_wcet_enforce_evicted_count_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
 /* ROUND 2026-09-18 (task #253, RTOS true-compliance pass): real USR-
@@ -827,6 +849,50 @@ task_heartbeat_stuck_count_table_increment_at:
     ldr r2, [r1, r0, lsl #2]
     add r2, r2, #1
     str r2, [r1, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global task_wcet_enforce_evicted_count_table_get_at
+task_wcet_enforce_evicted_count_table_get_at:
+    ldr r1, =task_wcet_enforce_evicted_count_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global task_wcet_enforce_evicted_count_table_increment_at
+task_wcet_enforce_evicted_count_table_increment_at:
+    ldr r1, =task_wcet_enforce_evicted_count_table
+    ldr r2, [r1, r0, lsl #2]
+    add r2, r2, #1
+    str r2, [r1, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* ROUND 2026-09-20 (task #271): the two real enforcement primitives --
+ * ceiling_depth_table_get_at (read-only, same shape/safety class as
+ * Gap B's own eff_prio_table_get_at etc. above -- a plain single-
+ * instruction table read, never calls scheduler_pick_next itself, so
+ * none of round 75's own white-box-test crash risk applies here) lets
+ * scheduling_decision_prelude check "is this task genuinely holding a
+ * ceiling-protected section" before deciding whether eviction is safe.
+ * sleep_until_table_set_at is the eviction mechanism itself: same
+ * shape as task_heartbeat_last_tick_table_set_at (r0=index, r1=value),
+ * writing the exact table scheduler_pick_next's own "ready" gate
+ * already reads on every decision -- no new control-flow path in the
+ * scheduler itself, just feeding its existing, already-trusted input. */
+.global ceiling_depth_table_get_at
+ceiling_depth_table_get_at:
+    ldr r1, =ceiling_depth_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+.global sleep_until_table_set_at
+sleep_until_table_set_at:
+    ldr r2, =sleep_until_table
+    str r1, [r2, r0, lsl #2]
     mov r0, #0
     mov r1, #0
     bx lr
