@@ -650,12 +650,26 @@ doesn't yet attempt.
   (vani-compiler commit `0eb25978`, 3 new tests, full suite 3033/3033).
   `vanic` rebuilt from this commit and DhruvaOS reverified against it:
   clean build, identical stack-depth report, same 4-FAIL regression
-  baseline. Honest scope note: this closes the COMPILER-side gap only --
-  DhruvaOS's own real extern fns (`dhruva_mutex_lock`, `task_sleep_
-  ticks`, etc.) are NOT yet annotated with real measured values (the
-  ~64-byte figures BUG-233's own original write-up cited were informal,
-  never independently re-measured); that real-measurement-plus-
-  annotation pass is a genuine, natural follow-up, not done here.
+  baseline. **`[MEASUREMENT+ANNOTATION DONE, 2026-09-20, commit
+  `396d626`]`** -- the real-measurement-plus-annotation pass this note
+  called out as a genuine follow-up is done: every extern fn's real
+  worst-case frame size measured mechanically from its own boot/*.S
+  assembly (or from the 8 known zero-frame `*_SCRATCH_PAIR` accessor
+  macros), 1138/1148 (99.1%) now carry a real `#[stack_cost(bytes=N)]`
+  (10 remaining are C-implemented, boot-time-only allocator/host-disk
+  stubs, left at the default). Real costs top out at 28 bytes anywhere
+  in this codebase -- the flat 32-byte default was already a safe
+  over-approximation everywhere, never an under-count, so this closes
+  the gap as a precision/confidence improvement, not a correctness
+  fix. One genuine, previously-undetected finding surfaced along the
+  way (unrelated to the annotation imprecision itself, since the
+  number was unchanged before/after): `task_fsq`'s real worst case
+  (4152 bytes) exceeded its own raw 4096-byte stack allocation --
+  `vanic stack-depth --entry=task_fsq` had simply never been run
+  before (`build.sh` only auto-gates `kernel_main`, see this file's
+  own §3 note on the same class of gap). Fixed by bumping `fsq_stack_
+  bytes` to 16384, matching `task_e`/GC's own precedent for the same
+  task profile.
 - ~~**No deadline-miss detection or logging.**~~ **`[DONE, task #241]`**
   — `task_deadline_ticks_table`/`task_deadline_miss_count_table`
   (`boot/context_switch.S`) track a declared per-task deadline and
