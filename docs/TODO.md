@@ -8788,3 +8788,61 @@ One item left in the 4-gap program: task #272 (tick granularity),
 explicitly HIGH RISK per this file's own prior entries -- needs the
 tick-count-expressed real-time constants migrated to microseconds
 FIRST, before ever touching the tick rate again.
+
+### Task #272 closed: tick-count timeout constants decoupled from the tick period (2026-09-20)
+
+Last of the 4 real RTOS-compliance gaps from the 2026-09-18 sweep.
+Given this exact subsystem's own two prior full reverts (round 191,
+task #243, same root cause both times), checked in with the user
+before starting rather than proceeding on the earlier 3 gaps' own
+autonomous momentum -- confirmed: do the safe prerequisite step only
+(decouple the constants), do NOT touch the tick period itself this
+round.
+
+Three functions hardcoded a raw tick count that only meant its real-
+world duration at the CURRENT 500ms tick period: `tcp_rtx_timeout_
+ticks` (2 real seconds), `dhcp_client_check_lease`'s own local
+`ticks_per_second` (1 real second per unit), `auth_lockout_ticks` (10
+real seconds, and the one round 191's own audit caught NOT rescaled
+the first time -- a real, if narrow, security-relevant near-miss).
+Each now derives its tick count from the real duration it actually
+means, divided by `scheduler_tick_interval_us()` (the existing single-
+source-of-truth tick period, itself still returning the same 500000
+literal, unchanged) -- ceiling division for the two functions
+(`tcp_rtx_timeout_ticks`, `auth_lockout_ticks`) so a real timeout can
+never come in SHORTER than intended; plain integer division for
+`ticks_per_second` (matches its own pre-existing 2-per-second
+semantics exactly, with a documented rounding caveat for a future tick
+period that doesn't evenly divide 1,000,000 -- not a concern at
+today's unchanged period).
+
+At today's unchanged 500ms tick, all three functions return EXACTLY
+their old literal results (4/2/20) -- verified by hand, a pure
+decoupling, not a behavior change. Two identical `phase4_milestone.py`
+runs confirm zero regression, including `tcprtx` (which directly
+exercises `tcp_rtx_timeout_ticks` via a live simulated SYN-loss
+retransmission) passing both times.
+
+Also audited every other `_ticks`-named constant in the codebase for
+the same hidden-coupling risk: the PM watchdog's own `two_seconds_in_
+ticks` (131072 = 2<<16) runs on a genuinely SEPARATE 65536Hz hardware
+counter, already confirmed independent of the scheduler tick by round
+191's own original audit -- no fix needed, left alone. The demo tasks'
+own `task_sleep_ticks(N)` wake-period call sites (task_a-f, the
+dynamic demo tasks) are intentionally tick-relative scheduling
+behavior, not external real-world-duration requirements like an RFC-
+mandated RTO or a security lockout window -- out of this task's scope
+by design, not an oversight.
+
+This closes the actual prerequisite task #243/#247 both already
+identified: any FUTURE attempt at a finer tick or tickless design no
+longer needs a fresh, error-prone, whole-codebase audit for hidden
+tick-period assumptions before it can even start. Whether to actually
+make that attempt is a separate decision, unchanged by this task --
+task #243/#247's own real-hardware-availability and schedulability-
+margin reasoning for not attempting it yet still applies.
+
+**All 4 RTOS-compliance gaps from the 2026-09-18 sweep are now
+closed**: per-thread execution-time supervision (#269), worst-case
+interrupt latency measurement (#270), real WCET/deadline enforcement
+(#271), and this task's own tick-constant decoupling (#272).
