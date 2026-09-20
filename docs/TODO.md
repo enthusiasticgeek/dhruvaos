@@ -8960,3 +8960,80 @@ SHADOW MISMATCH` output anywhere. Given the original race was
 observed only once across many prior sessions, this is strong but not
 absolute confidence -- consistent with the fix working, not
 mathematically exhaustive proof for a timing-dependent race.
+
+### Fifteenth SD round: task #274's own settle-delay fix retested, found insufficiently sized, corrected -- AND a much bigger, separate finding surfaced (2026-09-20)
+
+Fresh real-HW log (`picocom_20260920_161425.log`, user: "new picocom
+log sdcard wedge in home folder of this pc") showed the write wedge
+reproduces IDENTICALLY after task #274's settle-delay fix -- same
+SDCDIV backoff progression, same "block 2100 FAILED" failure point.
+
+Investigated why by comparing `sdhost_init`'s own "total elapsed"
+diagnostic across the two logs: the new log's `sdhost_init` calls take
+~1.15s each, ~1.1s longer than before the fix -- confirming the added
+`delay()` calls ARE executing, just not for the intended ~20ms each.
+Root cause: task #274's own sizing used `delay(3000000)=49906us`, a
+number this project's OWN `test/schedulability_analysis.py` and two
+memory files already cite as "measured" (task #226/240's own
+schedulability audit). That number is QEMU-only. Two real picocom
+logs already sitting in this project's own history since 2026-09-18
+(`picocom_20260918_074005.log`, `picocom_20260918_163633.log`) have
+the real answer, un-cross-checked until today:
+`delay(3000000)=930168us`/`930098us` -- an ~18.6x discrepancy. QEMU's
+TCG JIT executes a tight register-only busy loop (no memory/peripheral
+access) at a completely different effective rate than real ARM1176
+silicon, while still correctly emulating TIMER_CLO's own 1MHz tick --
+so a `delay()` calibration taken under QEMU silently measures "how
+fast the host machine executes this loop," not real Pi 1B timing.
+
+Corrected the SD settle delays to `delay(64500)` (real ~20ms, matching
+the real per-iteration cost) -- commit `7c2b038`. Useful negative
+evidence along the way: the WRONGLY-sized delay(1200000) gave ~372ms
+settle time per call, ~18x MORE generous than U-Boot's own real 20ms
+values, and the wedge still reproduced identically -- further evidence
+against "insufficient settle time" as this wedge's actual root cause,
+on top of everything task #274's own round already found. Two
+identical `phase4_milestone.py` runs confirm no regression. Needs a
+fresh real-HW retest with the corrected timing.
+
+**Separate, much larger finding from the same root cause, NOT yet
+acted on pending user direction:** `test/schedulability_analysis.py`'s
+own `measured_low_critical_section_ms = 49.906` (line 337) -- the
+blocking term (B_i) fed into the RTOS-compliance program's own
+"verdict: schedulable, 440ms-1445ms slack" conclusion (task #226/240,
+2026-09-17) -- is the SAME QEMU-only number. Re-ran the tool locally
+with the real measured value (930.168ms) substituted for this one
+input, everything else unchanged:
+
+```
+HIGH: R=935.350ms <= D=1500.0ms (margin 564.650ms) -- PASS
+MEDIUM: MISSES DEADLINE -- FAIL
+LOW: R=958.585ms <= D=1000.0ms (margin 41.415ms) -- PASS
+VERDICT: NOT schedulable with real measured blocking data.
+```
+
+MEDIUM's own 500ms deadline is smaller than LOW's real ~930ms
+ceiling-0 critical-section hold time alone, before any of MEDIUM's own
+execution time is even added -- a real, structural deadline miss on
+real Pi 1B hardware for the demo task set's own declared periods, not
+a QEMU artifact. This does NOT invalidate the schedulability tool
+itself (`schedulability_analysis.py`'s own self-tests all still pass,
+and the tool correctly computed "NOT schedulable" once given the right
+input) -- it invalidates the ONE INPUT this project sourced from a
+QEMU-only busy-loop measurement without ever cross-checking it against
+real hardware, even though two real logs with the correct answer were
+already sitting in this project's own history for two days. Given how
+consequential this is (a real, structural deadline-miss claim, not
+just a documentation staleness fix), deliberately NOT silently
+"corrected" here -- `test/schedulability_analysis.py`'s own checked-in
+constant and `docs/RTOS_GAP_ANALYSIS.md`'s own schedulability claims
+are both left unchanged pending the user's own direction on how to
+respond (options include: shortening `task_c`'s own demo `delay(
+3000000)` critical-section hold to something that actually fits
+MEDIUM's real declared deadline; loosening MEDIUM's own declared
+period/deadline to genuinely accommodate the real blocking term;
+re-deriving the whole schedulability picture with corrected inputs and
+updating the audit's own conclusion; or something else the user
+prefers). This is a genuinely new, separate finding from the SD
+investigation itself, surfaced as a byproduct of cross-checking a
+number this round happened to reuse.
