@@ -9191,6 +9191,45 @@ milestone.py` runs confirm zero regression. Needs a fresh real-HW
 retest -- the new diagnostic print (if it fires) or the wedge simply
 resolving are both real, actionable outcomes either way.
 
+### Eighteenth SD round: sdhost_wait_transfer_complete's own timeout was never a real-time bound (2026-09-20)
+
+User shared a link unprompted mid-session: a Raspberry Pi forum thread
+(https://forums.raspberrypi.com/viewtopic.php?t=242510) describing a
+U-Boot fix for `bcm2835_sdhost.c`'s own `bcm2835_wait_transfer_complete`
+-- the SAME controller/driver family this project's own `sdhost_wait_
+transfer_complete` implements. Their bug: an iteration-count timeout
+calibrated to LOOK like ~1 second actually only covered ~12ms on real
+silicon, timing out before some cards' own legitimate up-to-56ms CMD25
+write completion. Checked DhruvaOS's own equivalent function: it had
+the EXACT same shape (`while iter < 5000000`), never fixed in any of
+the prior 17 SD rounds despite this project independently proving the
+underlying mechanism already (tasks #274/#275's own ~18.6x QEMU-vs-
+real busy-loop-rate measurement) -- the fix for THAT finding was
+applied to `delay()`'s own sizing, never to this function's own
+timeout loop, which nobody had connected to the same root cause until
+this forum thread's own parallel example made it obvious.
+
+**Fixed**: replaced the iteration count with `TIMER_CLO`-based real
+elapsed microseconds (1 second, matching the U-Boot fix's own real-
+world-validated choice) -- `TIMER_CLO` is the BCM2835 system timer's
+free-running 1MHz counter, already correctly emulated at 1MHz under
+QEMU elsewhere in this file, so a microsecond bound here means the
+SAME real-world timeout duration in both environments by construction,
+not by re-tuning a magic constant a ninth time. The function's own two
+exit-state checks (READWAIT/WRITESTART1 `alternate_idle`, and the
+READDATA=2 check added in the 8th fix attempt) are unchanged -- only
+the timeout mechanism changed. Commit `7ecc2a2`.
+
+Two identical `phase4_milestone.py` runs confirm zero regression; the
+8-block sweep's own elapsed time (9106us) stayed in the same order of
+magnitude as before the change (well under the new 1-second real-time
+cap, as expected for a controller that isn't actually wedged). Real
+Pi 1B hardware retest still needed (no hardware available in this
+environment) -- this is a real, independently-motivated fix regardless
+of whether it turns out to be the SD write wedge's own root cause; task
+#218 (confirm DharaFS/crypto downstream FAILs clear) remains the
+tracking item for that outcome.
+
 ### Task #279: fault-injection test proves WCET enforcement + heartbeat detection actually work (2026-09-20)
 
 User: "how about other rtos scheduling improvements? any bugs through
