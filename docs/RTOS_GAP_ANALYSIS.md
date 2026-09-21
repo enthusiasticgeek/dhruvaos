@@ -812,26 +812,49 @@ doesn't yet attempt.
 
   *Mutex holder* (`task_mutex_demo_low` spins 40 ticks while holding
   the demo mutex via priority INHERITANCE, not the ceiling protocol):
-  **a real, previously-undocumented asymmetry** — unlike the ceiling
-  case, MUTEX-LOW's OWN eviction counter DID increment (4/4, matching
-  its stuck-episode count exactly), because task #271's skip gate only
-  checks `ceiling_depth_table`, which a priority-inheritance mutex
-  holder never touches. Self-heals correctly (MUTEX-HIGH still
-  eventually acquires the mutex once LOW's spin finishes and releases
-  it, `mutex handoff worst-case latency` stayed in the same double-
-  digit-microsecond range as normal operation, zero shadow-model
-  mismatches) — but by the same reasoning `task_wcet_enforce_evicted_
-  count_table`'s own header comment uses for skipping ceiling holders
-  ("evicting a mutex holder... would strand every other task waiting
-  on that same resource, a strictly worse outcome"), forcibly setting
-  `sleep_until_table` on a mutex holder mid-critical-section pauses
-  its OWN progress toward releasing what everyone else is waiting on —
-  the enforcement mechanism can only make total resolution slower
-  here, never faster, for exactly the class of holder it was built to
-  help recover from. Not fixed (self-healing, bounded, no crash/
-  deadlock observed) — an honestly-scoped gap matching this project's
-  own established pattern, logged here rather than silently left
-  implicit.
+  **a real asymmetry, found and then FIXED, task #281 (2026-09-20)** —
+  unlike the ceiling case, MUTEX-LOW's OWN eviction counter DID
+  increment (4/4, matching its stuck-episode count exactly), because
+  task #271's skip gate originally only checked `ceiling_depth_table`,
+  which a priority-inheritance mutex holder never touches. Self-healed
+  correctly even before the fix (MUTEX-HIGH still eventually acquired
+  the mutex once LOW's spin finished and released it, `mutex handoff
+  worst-case latency` stayed in the same double-digit-microsecond
+  range as normal operation, zero shadow-model mismatches) — but by
+  the same reasoning `task_wcet_enforce_evicted_count_table`'s own
+  header comment uses for skipping ceiling holders ("evicting a mutex
+  holder... would strand every other task waiting on that same
+  resource, a strictly worse outcome"), forcibly setting `sleep_until_
+  table` on a mutex holder mid-critical-section paused its OWN
+  progress toward releasing what everyone else was waiting on — the
+  enforcement mechanism could only make total resolution slower there,
+  never faster, for exactly the class of holder it was built to help
+  recover from.
+
+  **Fixed, task #281**: new `task_holds_any_mutex_get_at` accessor
+  (`context_switch.S`) scans `mutex_owner_table`'s `MAX_MUTEXES` slots;
+  `scheduling_decision_prelude`'s own eviction gate now skips whenever
+  EITHER `ceiling_depth_table[i] > 0` OR this new check is true. New
+  permanent self-test (`task_holds_any_mutex_self_test`) proves the
+  accessor correctly reflects a real lock/unlock cycle in isolation
+  (before=0, held=1, after=0) — placement mattered here: it must run
+  AFTER `task_table_init()` seeds `mutex_owner_table`'s 255 ("free")
+  sentinel, or `dhruva_mutex_lock_impl` reads the table's raw zero-init
+  as "owned by task 0" and blocks forever waiting for a lock nobody
+  ever held (found live, at boot, when first placed too early — the
+  same class of ordering bug this file's own SSH auth-table history
+  already documents).
+
+  Live re-verified (`fault stuckmutex 40`, post-fix): temporary,
+  non-printing debug counters (uart_puts prints directly in the hot
+  path broke `irq_dispatch`'s own `#[wcet(cycles=130000)]` budget, so
+  this had to be counter-based, not printed, then removed once root-
+  caused) confirmed the fix skips eviction 100% of the times the
+  accessor reads "holding" — every remaining eviction was for a
+  genuine "not holding" overrun, natural scheduling jitter during
+  ordinary operation (the same class of variance task #276's own real
+  deadline-miss investigation already documented), not a flaw in this
+  fix. Two identical `phase4_milestone.py` runs, zero regression.
 
   *Repeated back-to-back episodes* (`fault stuck 40` armed twice in a
   row on `task_custom_demo`, `diagnose` read between each): CUSTOM's

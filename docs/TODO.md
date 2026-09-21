@@ -9337,3 +9337,58 @@ harness bug, not a kernel bug (confirmed by task #185/#219's own
 buffer is unaffected by concurrent TX from another task). Fixed by
 matching on the diagnose block's own last line and adding settle time
 between commands.
+
+### Task #281: fix the mutex-holder eviction asymmetry task #280 found (2026-09-20)
+
+User: "fix stuckmutex gap" -- task #280's own real finding (task #271's
+eviction-skip gate protected ceiling holders but not priority-
+inheritance mutex holders) is now closed, not just logged.
+
+New `task_holds_any_mutex_get_at` accessor (`boot/context_switch.S`)
+scans `mutex_owner_table`'s `MAX_MUTEXES` slots for the task index
+being checked; `scheduling_decision_prelude`'s own eviction gate
+(`kernel_main.vani`) now skips whenever EITHER `ceiling_depth_table[i]
+> 0` OR this new check reads true -- same "detected but not enforced"
+treatment the ceiling case already got, now symmetric across both
+synchronization primitives.
+
+New permanent self-test, `task_holds_any_mutex_self_test`: proves the
+accessor correctly reflects a real lock/unlock cycle in total isolation
+(before=0, held=1, after=0), using mutex id 1 (never touched by the
+live MUTEX-LOW/MUTEX-HIGH demo pair, which uses id 0) so it can't
+interact with real system state. **Placement caught a real ordering
+bug before the first commit**: originally placed right after
+`mailbox_self_test()`, textually BEFORE `task_table_init()` -- which
+is what seeds `mutex_owner_table`'s 255 ("free") sentinel across its
+slots. With the table still raw zero-init at that point,
+`dhruva_mutex_lock_impl` read owner=0 (not 255), took the CONTENDED
+path, and blocked forever waiting for a lock nobody had ever actually
+held -- boot hung completely, confirmed live under QEMU (no output
+after `mailbox_self_test`'s own PASS line, even after 40+ seconds).
+Moved to right after `task_table_init()`; same exact class of
+ordering bug this file's own SSH auth-table history already
+documents catching once before.
+
+**Root-causing the live discrepancy**: the FIRST live re-verification
+of the fix (`fault stuckmutex 40`) showed MUTEX-LOW's own eviction
+count drop from 4/4 (pre-fix) to 2/4 -- an improvement, but not the
+clean 0/4 the ceiling case achieved, and reproducible identically
+across two separate runs (not random noise). Adding `uart_puts` debug
+prints directly inside `scheduling_decision_prelude` to investigate
+broke `irq_dispatch`'s own `#[wcet(cycles=130000)]` budget (that
+function calls this one) -- printing itself was the WCET-relevant
+cost, not a loop. Root-caused instead via two temporary, non-printing
+debug counters (`debug_hb7_mutex_seen_table`, since removed): every
+single time the accessor read "holding", eviction was correctly
+skipped (0 incorrect evictions) -- the remaining evictions were ALL
+for genuine "not holding" overrun detections, i.e. real (if unrelated
+to the fault) scheduling jitter during MUTEX-LOW's own ordinary
+operation, the same class of variance task #276's own real deadline-
+miss investigation already found and documented elsewhere in this
+project. The fix itself is proven correct, both in isolation (self-
+test) and under live multi-tasking load (100% correct skip rate for
+every genuine holding case observed).
+
+Two identical `phase4_milestone.py` runs, zero regression. Full
+write-up in `docs/RTOS_GAP_ANALYSIS.md`'s "Timing analysis /
+determinism gaps" section.
