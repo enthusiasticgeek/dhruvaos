@@ -1739,6 +1739,16 @@ extern "C" fn fault_netdrop_countdown_set(v: u32) -> i64;
 extern "C" fn fault_stuck_ticks_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn fault_stuck_ticks_set(v: u32) -> i64;
+// ROUND 2026-09-20 (task #280): see fault_inject_state.S's own header
+// comment ("stuckceiling:"/"stuckmutex:") for the full design.
+#[stack_cost(bytes=1)]
+extern "C" fn fault_stuck_ceiling_ticks_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn fault_stuck_ceiling_ticks_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn fault_stuck_mutex_ticks_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn fault_stuck_mutex_ticks_set(v: u32) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn shell_line_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -22303,7 +22313,22 @@ fn task_c() -> i64 {
   while true {
     let _ = dhruva_prio_lock(0);
     let _ = uart_puts("LOW: locked, entering critical section\n");
-    let _ = delay(161000);
+    // ROUND 2026-09-20 (task #280): fault-injection check -- see
+    // fault_inject_state.S's own header comment ("stuckceiling:") for
+    // the full design. Deliberately checked AFTER the real lock is
+    // already held, not before -- the whole point is testing task
+    // #271's own eviction gate while ceiling_depth_table[LOW] is
+    // genuinely > 0, not a simulated version of that state.
+    let stuck_ceiling_ticks: u32 = fault_stuck_ceiling_ticks_take();
+    if stuck_ceiling_ticks > (0 as u32) {
+      let _ = uart_puts("LOW: fault-injected stuck spin WHILE HOLDING CEILING LOCK, ");
+      let _ = uart_put_i64(stuck_ceiling_ticks as i64);
+      let _ = uart_puts(" ticks\n");
+      let _ = task_custom_demo_stuck_spin(stuck_ceiling_ticks);
+      let _ = uart_puts("LOW: stuck spin finished, unlocking normally\n");
+    } else {
+      let _ = delay(161000);
+    }
     let _ = uart_puts("LOW: leaving critical section, unlocking\n");
     let _ = dhruva_prio_unlock(2);
     let _ = task_sleep_ticks(2);
@@ -23987,9 +24012,23 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
 // #271's WCET-enforcement eviction on demand -- neither had ever
 // actually fired in any test before this. n should exceed task_
 // custom_demo's own declared heartbeat bound (35 ticks, task_
-// heartbeat_init) with real margin to reliably trigger both.
+// heartbeat_init) with real margin to reliably trigger both. `fault
+// stuckceiling <n>` and `fault stuckmutex <n>` (2026-09-20, task #280)
+// are stuck's own siblings, exercising the two branches stuck's own
+// target (task_custom_demo, index 6, holds neither a ceiling lock nor
+// a mutex) structurally can't reach: stuckceiling makes task_c (LOW,
+// heartbeat bound 10 ticks) spin while genuinely holding its own
+// ceiling-0 lock -- proves task #271's own eviction-SKIP branch
+// (ceiling_depth_table[i] > 0) actually works, not just that it
+// exists. stuckmutex makes task_mutex_demo_low (index 7, heartbeat
+// bound 10 ticks) spin while genuinely holding the demo mutex
+// (priority inheritance, NOT tracked by ceiling_depth_table at all)
+// -- eviction SHOULD fire here, unlike stuckceiling, since task #271
+// has no way to see a regular mutex hold; exercises whether forcibly
+// evicting a mutex holder (while task_mutex_demo_high sits blocked on
+// the same lock) causes any real correctness problem.
 fn shell_dispatch_fault(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
-  let usage: Str = "usage: fault alloc|write|irqburst|netdrop|stuck <n>\n";
+  let usage: Str = "usage: fault alloc|write|irqburst|netdrop|stuck|stuckceiling|stuckmutex <n>\n";
   if cmd_end >= line_len {
     let _ = uart_puts(usage);
     return 0;
@@ -24041,6 +24080,20 @@ fn shell_dispatch_fault(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i
     let _ = uart_puts("armed: task_custom_demo's next wake cycle will spin for ");
     let _ = uart_put_i64(n);
     let _ = uart_puts(" ticks without voluntarily yielding (exercises task #269 heartbeat detection + task #271 WCET-enforcement eviction).\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "stuckceiling") == 1 {
+    let _ = fault_stuck_ceiling_ticks_set(n as u32);
+    let _ = uart_puts("armed: task_c's next critical section will spin for ");
+    let _ = uart_put_i64(n);
+    let _ = uart_puts(" ticks WHILE STILL HOLDING its own ceiling-0 lock (exercises task #271's own eviction-skip branch for a ceiling holder).\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "stuckmutex") == 1 {
+    let _ = fault_stuck_mutex_ticks_set(n as u32);
+    let _ = uart_puts("armed: task_mutex_demo_low's next hold will spin for ");
+    let _ = uart_put_i64(n);
+    let _ = uart_puts(" ticks WHILE STILL HOLDING the demo mutex (exercises eviction of a priority-inheritance mutex holder, a genuinely different mechanism from stuckceiling's own ceiling protocol).\n");
     return 0;
   }
   let _ = uart_puts(usage);
@@ -26781,12 +26834,48 @@ fn task_mutex_demo_low_wake_body() -> i64 {
   return 0;
 }
 
+// ROUND 2026-09-20 (task #280): fault-injection sibling of task_
+// mutex_demo_low_wake_body above -- deliberately a SEPARATE, untagged
+// function rather than adding an unbounded branch inside that one.
+// task_mutex_demo_low_wake_body's own #[wcet(cycles=100000)] tag is
+// real and load-bearing for Gap C's own schedulability claims
+// (docs/RTOS_GAP_ANALYSIS.md); task_custom_demo_stuck_spin's own loop
+// is genuinely unbounded (its exit condition is a runtime parameter,
+// same class of thing delay(N) already is -- see that function's own
+// comment on why it's deliberately NOT WCET-tagged either), so calling
+// it from inside a #[wcet(...)]-tagged function would either falsely
+// poison that real, already-measured bound or fail the static check
+// outright. Same reasoning as fault_inject_state.S's own "stuckmutex"
+// design note: spins WHILE STILL HOLDING the demo mutex (priority
+// INHERITANCE, not the ceiling protocol task_c/"stuckceiling" tests --
+// a genuinely different mechanism, not tracked by ceiling_depth_table
+// at all, so task #271's own eviction gate has no way to skip this
+// case the way it correctly does for a ceiling holder).
+#[no_heap]
+fn task_mutex_demo_low_stuck_body(stuck_ticks: u32) -> i64 {
+  let _ = uart_puts("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
+  let _ = dhruva_mutex_lock(0 as u32);
+  let _ = uart_puts("MUTEX-LOW: fault-injected stuck spin WHILE HOLDING DEMO MUTEX, ");
+  let _ = uart_put_i64(stuck_ticks as i64);
+  let _ = uart_puts(" ticks\n");
+  let _ = task_custom_demo_stuck_spin(stuck_ticks);
+  let _ = uart_puts("MUTEX-LOW: stuck spin finished, releasing demo mutex\n");
+  let _ = mutex_handoff_t0_set(mmio_read_u32(TIMER_CLO));
+  let _ = dhruva_mutex_unlock(0 as u32);
+  return 0;
+}
+
 #[no_mangle]
 #[bounded_stack(bytes=512)]
 fn task_mutex_demo_low() -> i64 {
   while true {
     let _ = task_sleep_ticks(2);
-    let _ = task_mutex_demo_low_wake_body();
+    let stuck_mutex_ticks: u32 = fault_stuck_mutex_ticks_take();
+    if stuck_mutex_ticks > (0 as u32) {
+      let _ = task_mutex_demo_low_stuck_body(stuck_mutex_ticks);
+    } else {
+      let _ = task_mutex_demo_low_wake_body();
+    }
   }
   return 0;
 }
@@ -36568,6 +36657,28 @@ fn fault_stuck_ticks_take() -> u32 {
   let n: u32 = fault_stuck_ticks_get();
   if n > (0 as u32) {
     let _ = fault_stuck_ticks_set(0 as u32);
+  }
+  return n;
+}
+
+// ROUND 2026-09-20 (task #280): same shape again, targeting task_c's
+// own ceiling-0 hold -- see fault_inject_state.S's own header comment
+// ("stuckceiling:") for the full design.
+fn fault_stuck_ceiling_ticks_take() -> u32 {
+  let n: u32 = fault_stuck_ceiling_ticks_get();
+  if n > (0 as u32) {
+    let _ = fault_stuck_ceiling_ticks_set(0 as u32);
+  }
+  return n;
+}
+
+// Same shape again, targeting task_mutex_demo_low's own mutex hold --
+// see fault_inject_state.S's own header comment ("stuckmutex:") for
+// the full design.
+fn fault_stuck_mutex_ticks_take() -> u32 {
+  let n: u32 = fault_stuck_mutex_ticks_get();
+  if n > (0 as u32) {
+    let _ = fault_stuck_mutex_ticks_set(0 as u32);
   }
   return n;
 }

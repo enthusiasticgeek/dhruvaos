@@ -47,7 +47,28 @@
  *           size directly, self-disarm on next real trigger" shape as
  *           irqburst above, not the Nth-call countdown shape -- a
  *           stuck episode, like a burst, is logically "the very next
- *           one," not "the Nth future one." */
+ *           one," not "the Nth future one."
+ * stuckceiling: ROUND 2026-09-20 (task #280): same shape as stuck
+ *           above, but targets task_c (LOW) and makes it spin WHILE
+ *           STILL HOLDING its own ceiling-0 lock -- the ONE branch of
+ *           task #271's own eviction gate ("stuck" fixes above never
+ *           exercised): a task caught overrunning its bound while
+ *           ceiling_depth_table[i] > 0 must be DETECTED (task #269's
+ *           own counter) but NOT evicted (task #271 would strand
+ *           every other task waiting on that same ceiling). Proves
+ *           the skip logic actually works, not just that it exists.
+ * stuckmutex: ROUND 2026-09-20 (task #280): same shape again, targets
+ *           task_mutex_demo_low and makes it spin WHILE STILL HOLDING
+ *           the demo mutex (dhruva_mutex_lock -- priority INHERITANCE,
+ *           a genuinely different mechanism from the ceiling protocol
+ *           above, and NOT tracked by ceiling_depth_table at all) --
+ *           unlike stuckceiling, eviction here SHOULD fire, since
+ *           task #271's own gate has no way to see a regular mutex
+ *           hold. Exercises whether forcibly evicting a mutex holder
+ *           (while task_mutex_demo_high sits blocked on the exact
+ *           same lock via priority inheritance) causes any real
+ *           correctness problem, or genuinely self-heals once the
+ *           cooldown expires and the holder resumes and unlocks. */
 
 .section ".bss"
 .align 4
@@ -58,6 +79,10 @@ fault_irqburst_countdown:
 fault_netdrop_countdown:
     .word 0
 fault_stuck_ticks:
+    .word 0
+fault_stuck_ceiling_ticks:
+    .word 0
+fault_stuck_mutex_ticks:
     .word 0
 
 .section ".text"
@@ -110,6 +135,32 @@ fault_stuck_ticks_get:
 .global fault_stuck_ticks_set
 fault_stuck_ticks_set:
     ldr r1, =fault_stuck_ticks
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global fault_stuck_ceiling_ticks_get
+fault_stuck_ceiling_ticks_get:
+    ldr r0, =fault_stuck_ceiling_ticks
+    ldr r0, [r0]
+    bx lr
+
+.global fault_stuck_ceiling_ticks_set
+fault_stuck_ceiling_ticks_set:
+    ldr r1, =fault_stuck_ceiling_ticks
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global fault_stuck_mutex_ticks_get
+fault_stuck_mutex_ticks_get:
+    ldr r0, =fault_stuck_mutex_ticks
+    ldr r0, [r0]
+    bx lr
+
+.global fault_stuck_mutex_ticks_set
+fault_stuck_mutex_ticks_set:
+    ldr r1, =fault_stuck_mutex_ticks
     str r0, [r1]
     mov r0, #0
     bx lr
