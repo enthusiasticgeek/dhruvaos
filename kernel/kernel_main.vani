@@ -1988,6 +1988,14 @@ extern "C" fn task_wcet_enforce_evicted_count_table_get_at(index: u32) -> u32;
 extern "C" fn task_wcet_enforce_evicted_count_table_increment_at(index: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn ceiling_depth_table_get_at(index: u32) -> u32;
+// ROUND 2026-09-20 (task #280 follow-up): mutex-holder analogue of
+// ceiling_depth_table_get_at above -- see task_holds_any_mutex_get_at's
+// own header comment (context_switch.S) for the full design. Real
+// measured stack cost, not the neighboring accessors' bytes=1: this
+// one does `push {r4, r5, r6}` (12 bytes) to scan mutex_owner_table's
+// MAX_MUTEXES slots, unlike a plain single-instruction table read.
+#[stack_cost(bytes=12)]
+extern "C" fn task_holds_any_mutex_get_at(index: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn sleep_until_table_set_at(index: u32, v: u32) -> i64;
 // ROUND 2026-09-18 (task #242): UART RX interrupt work, bounded
@@ -8435,6 +8443,50 @@ fn mailbox_self_test() -> i64 {
   return ok;
 }
 
+// ROUND 2026-09-20 (task #281): task #280's own live QEMU verification
+// of the mutex-holder eviction-skip fix (scheduling_decision_prelude,
+// see task_holds_any_mutex_get_at's own header comment in context_
+// switch.S) showed a real discrepancy -- MUTEX-LOW's own eviction count
+// dropped but didn't reach a clean 0 like the ceiling-holder case did.
+// Adding uart_puts debug prints directly inside scheduling_decision_
+// prelude to investigate broke irq_dispatch's own #[wcet(cycles=130000)]
+// budget (that function calls this one), so this is a standalone,
+// isolated self-test of the accessor itself instead -- same "verify
+// the primitive directly, not just through the hot path that broke
+// when instrumented" approach GC's own self-tests already use
+// elsewhere in this file. Uses mutex id 1, never touched by the live
+// MUTEX-LOW/MUTEX-HIGH demo pair (mutex id 0) -- zero interaction with
+// real system state.
+fn task_holds_any_mutex_self_test() -> i64 {
+  let ok: i64 = 1;
+  let self_idx: u32 = current_task_get();
+
+  if task_holds_any_mutex_get_at(self_idx) != (0 as u32) {
+    ok = 0; // nothing locked yet
+  }
+  let lock_status: u32 = dhruva_mutex_lock(1 as u32);
+  if lock_status != (0 as u32) {
+    ok = 0; // mutex 1 should have been free (fast path, no context switch)
+  }
+  if task_holds_any_mutex_get_at(self_idx) != (1 as u32) {
+    ok = 0; // now genuinely holding it -- this is the exact check
+             // scheduling_decision_prelude's own eviction-skip gate
+             // relies on
+  }
+  let _ = dhruva_mutex_unlock(1 as u32);
+  if task_holds_any_mutex_get_at(self_idx) != (0 as u32) {
+    ok = 0; // released -- must go back to 0, not stay stuck at 1
+  }
+
+  let _ = uart_puts("SCHED: task_holds_any_mutex_get_at reflects a real lock/unlock cycle (before=0, held=1, after=0)");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return ok;
+}
+
 // Round 66 follow-up: dedicated background task draining the priority
 // queue above -- every existing dharafs_* call site is untouched, this
 // only serves callers that opt in via dharafs_queue_submit(_raw). Low
@@ -10589,8 +10641,22 @@ fn scheduling_decision_prelude() -> i64 {
         // scheduler_pick_next's own gate for the exact same table (see
         // its "Round 75 gate" comment), so a stuck ceiling-holder is
         // never evicted through either path.
+        //
+        // ROUND 2026-09-20 (task #280 follow-up): ALSO skip eviction
+        // while the task genuinely holds a regular priority-inheritance
+        // mutex (dhruva_mutex_lock) -- a different mechanism, not
+        // tracked by ceiling_depth_table at all. Task #280's own live
+        // QEMU verification (`fault stuckmutex`) found this gate only
+        // ever checked the ceiling table, so a stuck mutex holder WAS
+        // being evicted (unlike a stuck ceiling holder) -- same
+        // "strictly worse outcome" reasoning applies: evicting it
+        // doesn't release the mutex, it only delays the holder's own
+        // progress toward releasing it. See task_holds_any_mutex_
+        // get_at's own header comment (context_switch.S) for the
+        // accessor this adds.
         let hb_ceiling: u32 = ceiling_depth_table_get_at(hb_i as u32);
-        if hb_ceiling == (0 as u32) {
+        let hb_holds_mutex: u32 = task_holds_any_mutex_get_at(hb_i as u32);
+        if (hb_ceiling == (0 as u32)) && (hb_holds_mutex == (0 as u32)) {
           let _ = sleep_until_table_set_at(hb_i as u32, hb_now + hb_bound);
           let _ = task_wcet_enforce_evicted_count_table_increment_at(hb_i as u32);
         }
@@ -38197,6 +38263,19 @@ fn kernel_main() -> i64 {
   // free slot" -- see task_table_init's own comment in
   // context_switch.S for the full story.
   let _ = task_table_init();
+
+  // ROUND 2026-09-20 (task #281): same "seed the sentinel first"
+  // discipline the comment above already establishes for task_table_
+  // init itself -- this self-test calls dhruva_mutex_lock, which reads
+  // mutex_owner_table's own 255 ("free") sentinel, ALSO seeded by
+  // task_table_init just above. Originally placed near mailbox_self_
+  // test (much earlier, textually before this init call) -- found live
+  // under QEMU: with mutex_owner_table's slot still raw-zero (not yet
+  // 255), dhruva_mutex_lock_impl read owner=0 (not "free"), took the
+  // CONTENDED path, and blocked forever waiting for a lock nobody ever
+  // held -- the exact same class of ordering bug the SSH auth-table
+  // comment below already documents catching for a different table.
+  let _ = task_holds_any_mutex_self_test();
 
   // Real authentication: seed the user-credential table's own
   // "empty" sentinel before anything (passwd/su) can touch it --

@@ -649,16 +649,28 @@ task_deadline_miss_count_table:
  * task. Self-healing: the task becomes ready again automatically once
  * the cooldown elapses, no kill/reset machinery needed. Deliberately
  * SKIPPED whenever ceiling_depth_table[i] > 0 (task is genuinely
- * holding a ceiling-protected critical section) -- evicting a mutex
- * holder without also releasing what it holds would strand every other
- * task waiting on that same resource, a strictly worse outcome than
- * the overrun itself; those cases still increment the stuck counter
- * above (detected) but not this one (not enforced), an intentional,
- * honestly-scoped gap matching this project's own established pattern
- * of narrowing enforcement to cases it can act on safely rather than
- * enforcing everywhere and accepting a worse failure mode. This is
- * effectively ARINC 653's "freeze the overrunning partition until the
- * next window" applied per-task instead of per-partition. */
+ * holding a ceiling-protected critical section) OR task_holds_any_
+ * mutex_get_at(i) == 1 (task genuinely holds a regular priority-
+ * inheritance mutex, dhruva_mutex_lock -- a different mechanism, not
+ * tracked by ceiling_depth_table at all) -- evicting a holder of
+ * EITHER kind without also releasing what it holds would strand every
+ * other task waiting on that same resource, a strictly worse outcome
+ * than the overrun itself; those cases still increment the stuck
+ * counter above (detected) but not this one (not enforced), an
+ * intentional, honestly-scoped gap matching this project's own
+ * established pattern of narrowing enforcement to cases it can act on
+ * safely rather than enforcing everywhere and accepting a worse
+ * failure mode. This is effectively ARINC 653's "freeze the
+ * overrunning partition until the next window" applied per-task
+ * instead of per-partition.
+ *
+ * ROUND 2026-09-20 (task #280 follow-up): the mutex-holder half of
+ * this skip is NEW -- task #280's own live QEMU verification (`fault
+ * stuckmutex`) found the gate only ever checked ceiling_depth_table,
+ * so a stuck mutex holder WAS being evicted (unlike a stuck ceiling
+ * holder), which could only delay its own progress toward releasing
+ * the mutex everyone else was waiting on. See task_holds_any_mutex_
+ * get_at's own header comment above for the accessor this adds. */
 task_heartbeat_last_tick_table:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 task_heartbeat_bound_table:
@@ -902,6 +914,48 @@ task_wcet_enforce_evicted_count_table_increment_at:
 ceiling_depth_table_get_at:
     ldr r1, =ceiling_depth_table
     ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+/* ROUND 2026-09-20 (task #280 follow-up): mutex-holder analogue of
+ * ceiling_depth_table_get_at above -- task #280's own live QEMU
+ * verification (fault stuckmutex) found a real asymmetry: the
+ * eviction-skip gate above protects a ceiling holder (checked via
+ * ceiling_depth_table) but had NO equivalent check for a task holding
+ * a regular priority-INHERITANCE mutex (dhruva_mutex_lock), a
+ * genuinely different mechanism this codebase deliberately does NOT
+ * track in ceiling_depth_table at all. Forcibly evicting a mutex
+ * holder mid-critical-section doesn't release the mutex -- it only
+ * delays the holder's own progress toward releasing it, the exact
+ * same "strictly worse outcome" reasoning task_wcet_enforce_evicted_
+ * count_table's own header comment already uses to justify skipping
+ * ceiling holders. r0 = task index in; scans mutex_owner_table's
+ * MAX_MUTEXES slots (a fixed, small, bounded loop -- 4 iterations
+ * today) and returns 1 if r0 owns any of them, else 0. Task indices
+ * are always < 16; mutex_owner_table's own "unlocked" sentinel is 255
+ * (task_table_init's own seed value), so no valid task index can ever
+ * collide with it. */
+.global task_holds_any_mutex_get_at
+task_holds_any_mutex_get_at:
+    push {r4, r5, r6}
+    mov r4, r0
+    ldr r5, =mutex_owner_table
+    mov r6, #0
+.Ltask_holds_mutex_loop:
+    cmp r6, #MAX_MUTEXES
+    bge .Ltask_holds_mutex_not_found
+    ldr r1, [r5, r6, lsl #2]
+    cmp r1, r4
+    beq .Ltask_holds_mutex_found
+    add r6, r6, #1
+    b .Ltask_holds_mutex_loop
+.Ltask_holds_mutex_not_found:
+    mov r0, #0
+    b .Ltask_holds_mutex_done
+.Ltask_holds_mutex_found:
+    mov r0, #1
+.Ltask_holds_mutex_done:
+    pop {r4, r5, r6}
     mov r1, #0
     bx lr
 
