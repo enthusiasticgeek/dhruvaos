@@ -5450,10 +5450,39 @@ fn sdhost_force_data_mode_settle(sdedm: i64) -> i64 {
   return 1;
 }
 
+// ROUND 2026-09-20 (18th SD round): this function's own primary
+// timeout was a raw busy-loop iteration count (`iter < 5000000`), not
+// a real elapsed-time bound -- the EXACT bug class a U-Boot forum
+// thread (bcm2835_sdhost.c's own bcm2835_wait_transfer_complete,
+// https://forums.raspberrypi.com/viewtopic.php?t=242510) documents
+// fixing on this SAME controller/driver family: their own iteration
+// counter, calibrated to APPEAR like ~1 second, actually only covered
+// ~12ms on real silicon -- some cards legitimately need up to 56ms for
+// a CMD25 write to complete, so the timeout fired before the card was
+// ever actually stuck. This project has ALREADY independently proven
+// the exact mechanism that makes a bare iteration count untrustworthy
+// as a real-time bound: tasks #274/#275 measured the SAME class of
+// tight busy loop executing at a ~18.6x different effective rate under
+// QEMU vs real Pi 1B silicon -- a count calibrated (deliberately or
+// not) against one environment's own execution speed says nothing
+// reliable about the other's. Fixed the same way this file's own
+// sdhost_init/8-block-sweep diagnostics already measure real elapsed
+// time: TIMER_CLO, the BCM2835 system timer's free-running 1MHz
+// counter, correctly emulated at 1MHz under QEMU too (see this file's
+// own "TIMER_CLO... while still correctly emulating TIMER_CLO's own
+// 1MHz tick" comments elsewhere), so a microsecond-based bound here
+// means the SAME real-world timeout duration in both environments --
+// structurally immune to the QEMU-vs-real rate-mismatch class of bug
+// by construction, not by re-tuning a magic constant again. 1 second
+// (1000000us), matching the U-Boot fix's own real-world-validated
+// choice (1000ms) rather than inventing a new number -- this
+// function's own two exit-state checks below are unchanged, only the
+// timeout MECHANISM changed.
 fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
   let sdedm: i64 = SDEDM;
-  let iter: i64 = 0;
-  while iter < 5000000 {
+  let wtc_timeout_us: u32 = 1000000 as u32;
+  let wtc_t0: u32 = mmio_read_u32(TIMER_CLO);
+  while (mmio_read_u32(TIMER_CLO) - wtc_t0) < wtc_timeout_us {
     let edm: u32 = mmio_read_u32(sdedm);
     let fsm: u32 = edm & (0xF as u32);
     if (fsm == (0 as u32)) || (fsm == (1 as u32)) {
@@ -5489,7 +5518,6 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
       let _ = sdhost_force_data_mode_settle(sdedm);
       return 0;
     }
-    iter = iter + 1;
   }
   // ROUND 2026-09-18 (SD wedge investigation, fresh real-HW log
   // picocom_20260918_074005.log): 238 wedge events even WITH the
