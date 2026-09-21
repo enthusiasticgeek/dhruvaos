@@ -9265,6 +9265,24 @@ register write/reset sequence, if any, can move the controller off
 WRITEDATA once it's landed there) rather than any variant of "wait
 longer" or "detect the stuck state sooner."
 
+**Second real-HW card ruled out card wear (2026-09-21,
+`picocom_20260921_080631.log`)**: a total-silence "does not boot"
+report turned out to be a stale/disconnected `picocom` session, not a
+real boot failure (confirmed by reflashing the SAME known-good
+`1cb81a0` kernel.img and getting normal output again) -- NOT caused by
+any code change. While diagnosing it, the user tried a brand-new,
+different-capacity 16GB card (previous card: 64GB) with the exact same
+known-good `1cb81a0` build (no new instrumentation). Result: byte-for-
+byte the SAME wedge signature (SDEDM=0x00010803, FSM=WRITEDATA,
+blocks 2100/2101 both failing after 3 retries each, identical SDCDIV
+backoff sequence 0x08/0x12/0x148). This DEFINITIVELY RULES OUT "the
+original 64GB card is worn out from 19 rounds of forced-reset stress
+testing" as an explanation -- two completely different physical cards
+(different capacity, almost certainly different controller/manufacturer)
+produce the identical failure, strong independent confirmation this is
+a genuine DhruvaOS driver/protocol/controller-timing issue, not a
+card-specific hardware fault.
+
 ### Task #279: fault-injection test proves WCET enforcement + heartbeat detection actually work (2026-09-20)
 
 User: "how about other rtos scheduling improvements? any bugs through
