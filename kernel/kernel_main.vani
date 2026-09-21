@@ -2667,6 +2667,12 @@ extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, word_count: i64) ->
 // header comment on sdhost_fill_fifo_from_buffer_diag. Write-path only.
 #[stack_cost(bytes=24)]
 extern "C" fn sdhost_fill_fifo_from_buffer_diag(buf: mut ref i64, word_count: i64) -> i64;
+// TEMPORARY DIAGNOSTIC (19th SD round, 2026-09-20) -- see boot/
+// sdcard_state.S's own header comment on these two entry points.
+#[stack_cost(bytes=4)]
+extern "C" fn sdhost_diag_dump_regs_pre_cmd24() -> i64;
+#[stack_cost(bytes=4)]
+extern "C" fn sdhost_diag_dump_regs_post_cmd24() -> i64;
 // Task #215 -- see boot/sdcard_state.S's own header comment for this
 // function. Returns the SD core clock rate in Hz via the VideoCore
 // mailbox, or 0 if the query failed (never a real answer for CORE on
@@ -5837,6 +5843,10 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_writestart1: u32 = 0xA as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
+  // Moved up from just above sdhost_fill_fifo_from_buffer_diag's own
+  // call site (2026-09-19 original placement) so it can also gate the
+  // new pre-CMD24 instrumentation below (19th SD round, 2026-09-20).
+  let use_write_diag: bool = (block_num >= 2100) && (block_num < 2108);
   let _ = mmio_write_u32(SDHCFG, 0x418 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
@@ -5847,6 +5857,31 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // consistent with the controller expecting more than 512 bytes.
   let sdhbct_readback: u32 = mmio_read_u32(sdhbct);
   let sdhblc_readback: u32 = mmio_read_u32(sdhblc);
+  // ROUND 2026-09-20 (19th SD round): user's own explicit follow-up
+  // after the 18th round's timer-based timeout fix confirmed the wedge
+  // persists on real hardware -- "stop modifying timeout/retry
+  // behavior, instrument the CMD24 transaction at instruction/register
+  // level... also capture CMD13/R1 immediately before CMD24." Every
+  // prior CMD13 (SEND_STATUS) diagnostic in this investigation only
+  // ever ran AFTER a wedge was already detected -- this is the first
+  // "before" baseline, letting a future log directly compare the
+  // card's own reported state going INTO the write against its state
+  // once wedged (captured further below, unchanged).
+  if use_write_diag {
+    let pre_cmd13_status: u32 = sdhost_cmd(13 as u32, sd_state_get_rca() as u32);
+    if sdhost_cmd_timed_out(pre_cmd13_status) == 1 {
+      let _ = uart_puts("SD DIAG: pre-CMD24 CMD13 (SEND_STATUS) timed out\n");
+    } else {
+      let pre_cmd13_r1: u32 = mmio_read_u32(SDRSP0);
+      let pre_cmd13_current_state: u32 = (pre_cmd13_r1 >> (9 as u32)) & (0xF as u32);
+      let _ = uart_puts("SD DIAG: pre-CMD24 CMD13 (SEND_STATUS) R1=0x");
+      let _ = uart_put_hex32(pre_cmd13_r1);
+      let _ = uart_puts(" CURRENT_STATE=");
+      let _ = uart_put_i64(pre_cmd13_current_state as i64);
+      let _ = uart_puts("\n");
+    }
+    let _ = sdhost_diag_dump_regs_pre_cmd24();
+  }
   let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
   // BUG found 2026-09-19: see sdhost_read_block_once's own matching
   // comment above -- identical gap, write-side half. If the card is
@@ -5856,6 +5891,15 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   if sdhost_cmd_failed(status) == 1 {
     let _ = sdhost_cmd_report_failure("CMD24 (WRITE_BLOCK)", status);
     return 4;
+  }
+  // ROUND 2026-09-20 (19th SD round): register state immediately after
+  // CMD24's own command phase completes (R1 response received, NEW_
+  // FLAG cleared inside sdhost_cmd), before this function has touched
+  // SDDATA at all -- the direct counterpart to the pre-CMD24 dump
+  // above, isolating whatever CMD24's own command phase itself changes
+  // from whatever the FIFO fill loop changes afterward.
+  if use_write_diag {
+    let _ = sdhost_diag_dump_regs_post_cmd24();
   }
   // TEMPORARY (2026-09-19): diagnostic variant, see boot/sdcard_
   // state.S's own header comment -- dumps SDEDM at the first few
@@ -5873,7 +5917,8 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // "never collide with real DharaFS/FAT32 data" -- see the 8-block
   // sweep's own header comment in kernel_main.vani for why that range
   // is safe) -- confines the overhead to exactly the intended test.
-  let use_write_diag: bool = (block_num >= 2100) && (block_num < 2108);
+  // (use_write_diag itself is now computed up near `addr` above, so it
+  // can also gate the pre/post-CMD24 instrumentation.)
   let _ = if use_write_diag { sdhost_fill_fifo_from_buffer_diag(buf, 128) } else { sdhost_fill_fifo_from_buffer(buf, 128) };
 
   // ROUND 2026-09-20 (task #278, real-HW SD write-wedge investigation,

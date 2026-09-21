@@ -220,21 +220,34 @@ sdhost_fill_done:
  * the FIRST write actually changes FIFO fill/FSM at all, or whether
  * the FSM already looks wrong from the very first word.
  *
+ * EXTENDED (2026-09-20, 19th SD round): user's own explicit follow-up
+ * after the 18th round's timer-based timeout fix confirmed the wedge
+ * persists -- "stop modifying timeout/retry behavior, instrument the
+ * CMD24 transaction at instruction/register level." Every checkpoint
+ * below now dumps SDCMD/SDARG/SDHBCT/SDHBLC/SDHSTS/SDEDM together
+ * (sdhost_diag_dump_regs_body, shared with the new pre/post-CMD24
+ * dump points in kernel_main.vani's own sdhost_write_block_once), not
+ * just SDEDM alone -- and checkpoints now cover every 16-word FIFO
+ * batch boundary (16/32/48/64/80/96/112/128), not just the first
+ * FIFO's worth (previously 1/4/8/16 only, nothing beyond word 16 in a
+ * 128-word/512-byte transfer).
+ *
  * i64 sdhost_fill_fifo_from_buffer_diag(mut ref i64 buf, i64 word_count)
  * -- byte-for-byte the same fill loop as sdhost_fill_fifo_from_buffer
- * above, PLUS a blocking raw UART print of SDEDM immediately before the
+ * above, PLUS a blocking raw UART register dump immediately before the
  * very first write (word index 0, i.e. right after CMD24's own NEW_FLAG
- * cleared, before this function has touched SDDATA at all) and again
- * after words 1, 4, 8, and 16 have been written. Deliberately NOT the
- * vani-level uart_puts (unsafe to call mid-critical-section from hand-
- * written asm with no established calling convention for it here) or
- * the async ring-buffer path (non-blocking, could drop exactly the
- * bytes this diagnostic exists to capture) -- same reasoning and same
- * technique as this project's own earlier task #253 diagnostic
- * (context_switch.S, since removed). Write-path ONLY: the read path
- * already works (task #217's own READDATA fix, confirmed on real
- * hardware) and is deliberately left untouched to avoid any risk of
- * regressing it. To be removed once the write wedge is root-caused. */
+ * cleared, before this function has touched SDDATA at all), immediately
+ * after the first write, and after every subsequent 16-word batch.
+ * Deliberately NOT the vani-level uart_puts (unsafe to call mid-
+ * critical-section from hand-written asm with no established calling
+ * convention for it here) or the async ring-buffer path (non-blocking,
+ * could drop exactly the bytes this diagnostic exists to capture) --
+ * same reasoning and same technique as this project's own earlier
+ * task #253 diagnostic (context_switch.S, since removed). Write-path
+ * ONLY: the read path already works (task #217's own READDATA fix,
+ * confirmed on real hardware) and is deliberately left untouched to
+ * avoid any risk of regressing it. To be removed once the write wedge
+ * is root-caused. */
 .global sdhost_fill_fifo_from_buffer_diag
 sdhost_fill_fifo_from_buffer_diag:
     push {r4, r5, r6, r7, r8, lr}
@@ -244,19 +257,20 @@ sdhost_fill_fifo_from_buffer_diag:
                                * r0 is needed as scratch by every
                                * diagnostic call below -- none of
                                * sdhost_diag_putc/_puts/_put_hex1/
-                               * _put_hex32 ever touch r4-r11, so r8
-                               * survives all of them untouched */
+                               * _put_hex32/_dump_regs_body ever touch
+                               * r4-r11, so r8 survives all of them
+                               * untouched */
     mov r4, r2               /* r4 = word_count */
     mov r7, #0                /* r7 = words written so far */
-    ldr r6, =0x20202034      /* SDEDM */
+    ldr r6, =0x20202034      /* SDEDM -- still used for the FIFO-room
+                               * poll below; dump_regs_body re-reads it
+                               * (and every other register) fresh each
+                               * time it's called, independent of r6 */
 
-    /* word index 0: before any write at all */
+    /* word index 0: before any write at all -- full register dump */
     ldr r0, =sdhost_diag_w0
     bl sdhost_diag_puts
-    ldr r0, [r6]
-    bl sdhost_diag_put_hex32
-    mov r0, #10
-    bl sdhost_diag_putc
+    bl sdhost_diag_dump_regs_body
 
 sdhost_fill_diag_loop:
     cmp r4, #0
@@ -278,38 +292,47 @@ sdhost_fill_diag_ready:
     sub r4, r4, #1
     add r7, r7, #1
 
-    /* Print SDEDM right after words 1, 4, 8, 16 -- r4/r6/r7/r8 must
-     * survive these calls (confirmed: the diag helpers below only
-     * touch r0-r3, never r4-r11). */
+    /* Full register dump right after word 1 (immediately after the
+     * FIRST SDDATA write, the user's own explicit request), then after
+     * every 16-word FIFO batch boundary through the full 128-word
+     * transfer -- r4/r6/r7/r8 must survive these calls (confirmed:
+     * every diag helper below only touches r0-r3, never r4-r11). */
     cmp r7, #1
-    beq sdhost_fill_diag_snap
-    cmp r7, #4
-    beq sdhost_fill_diag_snap
-    cmp r7, #8
     beq sdhost_fill_diag_snap
     cmp r7, #16
     beq sdhost_fill_diag_snap
+    cmp r7, #32
+    beq sdhost_fill_diag_snap
+    cmp r7, #48
+    beq sdhost_fill_diag_snap
+    cmp r7, #64
+    beq sdhost_fill_diag_snap
+    cmp r7, #80
+    beq sdhost_fill_diag_snap
+    cmp r7, #96
+    beq sdhost_fill_diag_snap
+    cmp r7, #112
+    beq sdhost_fill_diag_snap
+    cmp r7, #128
+    beq sdhost_fill_diag_snap
     b sdhost_fill_diag_loop
 sdhost_fill_diag_snap:
-    /* BUG caught before shipping (QEMU verification): r7 (words
-     * written so far) can be 16 at this point, but sdhost_diag_
+    /* BUG caught before shipping (QEMU verification, 2026-09-19): r7
+     * (words written so far) can be 16 at this point, but sdhost_diag_
      * put_hex1 only ever prints a single nibble (`and r0,r0,#0xF`) --
      * 16 truncates to 0, mislabeling this checkpoint "w0" (same text
      * as the pre-write snapshot) instead of "w16", even though the
-     * SDEDM VALUE captured is correct either way. Two hex digits
-     * (00/01/04/08/10) removes the ambiguity. */
+     * register VALUES captured are correct either way. Two hex digits
+     * (00/01/10/20/30/40/50/60/70/80) removes the ambiguity. */
     ldr r0, =sdhost_diag_wn
     bl sdhost_diag_puts
     mov r0, r7, lsr #4
     bl sdhost_diag_put_hex1
     mov r0, r7
     bl sdhost_diag_put_hex1
-    ldr r0, =sdhost_diag_arrow
+    ldr r0, =sdhost_diag_close_paren
     bl sdhost_diag_puts
-    ldr r0, [r6]
-    bl sdhost_diag_put_hex32
-    mov r0, #10
-    bl sdhost_diag_putc
+    bl sdhost_diag_dump_regs_body
     b sdhost_fill_diag_loop
 sdhost_fill_diag_done:
     pop {r4, r5, r6, r7, r8, lr}
@@ -317,13 +340,128 @@ sdhost_fill_diag_done:
     mov r1, #0
     bx lr
 
+/* ROUND 2026-09-20 (19th SD round): pre/post-CMD24 register-level
+ * instrumentation, per the user's own explicit request -- "show SDCMD,
+ * SDARG, SDHBCT, SDHBLC, SDHSTS and SDEDM immediately before CMD24,
+ * after command completion... also capture CMD13/R1 immediately
+ * before CMD24." The CMD13-before-CMD24 half lives in kernel_main.vani
+ * itself (sdhost_write_block_once) since it's plain scalar SD-protocol
+ * logic (sdhost_cmd, a real function vani can already call) -- these
+ * two entry points are only for the raw MMIO register dump, the one
+ * piece that (like the FIFO fill loop above) needs a blocking, no-
+ * established-calling-convention print from a context vani's own
+ * uart_puts isn't safely reachable from... except these two ARE called
+ * from plain vani code (not mid-critical-section assembly), so unlike
+ * the FIFO loop's own internal checkpoints, a vani-level uart_puts
+ * call actually WOULD be safe here. Kept as raw asm regardless, for
+ * ONE concrete, load-bearing reason: vani has no way to pass a string
+ * literal to an extern "C" function as a raw pointer (Str is a real,
+ * distinct vani type, not a bare address -- see this file's own header
+ * comment on the raw-pointer gap this project has hit before), so a
+ * single parameterized "dump with this label" entry point callable
+ * from vani isn't expressible; two small, purpose-named, zero-argument
+ * entry points are the direct fix, matching this project's own
+ * established pattern of a hardcoded, purpose-specific function over a
+ * parameterized one when the parameter can't actually cross the
+ * vani/asm boundary (sdhost_fill_fifo_from_buffer_diag itself is the
+ * same shape of workaround, one call up). To be removed once the write
+ * wedge is root-caused. */
+.global sdhost_diag_dump_regs_pre_cmd24
+sdhost_diag_dump_regs_pre_cmd24:
+    push {lr}
+    ldr r0, =sdhost_diag_lbl_pre_cmd24
+    bl sdhost_diag_puts
+    bl sdhost_diag_dump_regs_body
+    pop {lr}
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global sdhost_diag_dump_regs_post_cmd24
+sdhost_diag_dump_regs_post_cmd24:
+    push {lr}
+    ldr r0, =sdhost_diag_lbl_post_cmd24
+    bl sdhost_diag_puts
+    bl sdhost_diag_dump_regs_body
+    pop {lr}
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* void sdhost_diag_dump_regs_body(void) -- internal helper (no
+ * .global -- only ever called from within this file), prints
+ * " SDCMD=0x.. SDARG=0x.. SDHBCT=0x.. SDHBLC=0x.. SDHSTS=0x..
+ * SDEDM=0x..\n". Caller is expected to have already printed its own
+ * label with no trailing newline. Never touches r4-r11 -- every call
+ * site above relies on this to keep its own loop-persistent registers
+ * alive across the call. */
+sdhost_diag_dump_regs_body:
+    push {lr}
+
+    ldr r0, =sdhost_diag_lbl_sdcmd
+    bl sdhost_diag_puts
+    ldr r1, =0x20202000       /* SDCMD */
+    ldr r0, [r1]
+    bl sdhost_diag_put_hex32
+
+    ldr r0, =sdhost_diag_lbl_sdarg
+    bl sdhost_diag_puts
+    ldr r1, =0x20202004       /* SDARG */
+    ldr r0, [r1]
+    bl sdhost_diag_put_hex32
+
+    ldr r0, =sdhost_diag_lbl_sdhbct
+    bl sdhost_diag_puts
+    ldr r1, =0x2020203C       /* SDHBCT */
+    ldr r0, [r1]
+    bl sdhost_diag_put_hex32
+
+    ldr r0, =sdhost_diag_lbl_sdhblc
+    bl sdhost_diag_puts
+    ldr r1, =0x20202050       /* SDHBLC */
+    ldr r0, [r1]
+    bl sdhost_diag_put_hex32
+
+    ldr r0, =sdhost_diag_lbl_sdhsts
+    bl sdhost_diag_puts
+    ldr r1, =0x20202020       /* SDHSTS */
+    ldr r0, [r1]
+    bl sdhost_diag_put_hex32
+
+    ldr r0, =sdhost_diag_lbl_sdedm
+    bl sdhost_diag_puts
+    ldr r1, =0x20202034       /* SDEDM */
+    ldr r0, [r1]
+    bl sdhost_diag_put_hex32
+
+    mov r0, #10
+    bl sdhost_diag_putc
+    pop {lr}
+    bx lr
+
 .section ".rodata"
 sdhost_diag_w0:
-    .asciz "SD DIAG: pre-write(w0) SDEDM="
+    .asciz "SD DIAG: pre-write(w00)"
 sdhost_diag_wn:
     .asciz "SD DIAG: post-write(w"
-sdhost_diag_arrow:
-    .asciz ") SDEDM="
+sdhost_diag_close_paren:
+    .asciz ")"
+sdhost_diag_lbl_pre_cmd24:
+    .asciz "SD DIAG: pre-CMD24"
+sdhost_diag_lbl_post_cmd24:
+    .asciz "SD DIAG: post-CMD24-cmd-complete"
+sdhost_diag_lbl_sdcmd:
+    .asciz " SDCMD=0x"
+sdhost_diag_lbl_sdarg:
+    .asciz " SDARG=0x"
+sdhost_diag_lbl_sdhbct:
+    .asciz " SDHBCT=0x"
+sdhost_diag_lbl_sdhblc:
+    .asciz " SDHBLC=0x"
+sdhost_diag_lbl_sdhsts:
+    .asciz " SDHSTS=0x"
+sdhost_diag_lbl_sdedm:
+    .asciz " SDEDM=0x"
 .section ".text"
 
 /* void sdhost_diag_putc(r0=char) -- blocking single-byte UART write. */

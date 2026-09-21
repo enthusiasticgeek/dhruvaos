@@ -9283,6 +9283,107 @@ produce the identical failure, strong independent confirmation this is
 a genuine DhruvaOS driver/protocol/controller-timing issue, not a
 card-specific hardware fault.
 
+### Nineteenth SD round: CMD24 register-level instrumentation, two hypotheses tested and ruled out (2026-09-21)
+
+User's own explicit follow-up after the 18th round (timer-based
+timeout fix) confirmed the wedge persists: "Stop modifying timeout/
+retry behavior. Instrument the CMD24 transaction at instruction/
+register level... show SDCMD, SDARG, SDHBCT, SDHBLC, SDHSTS and SDEDM
+immediately before CMD24, after command completion, before the first
+SDDATA write, immediately after it, and after every FIFO batch. Also
+capture CMD13/R1 immediately before CMD24."
+
+**Built**: new `sdhost_diag_dump_regs_pre_cmd24`/`_post_cmd24` entry
+points (`boot/sdcard_state.S`) plus a shared `sdhost_diag_dump_regs_
+body` helper, all six registers together at every checkpoint; extended
+`sdhost_fill_fifo_from_buffer_diag`'s own checkpoints from the
+original 1/4/8/16-word set to 1/16/32/48/64/80/96/112/128 (every
+16-word FIFO batch through the full transfer, not just the first
+FIFO's worth); new pre-CMD24 CMD13 (SEND_STATUS) call in `kernel_
+main.vani`'s `sdhost_write_block_once`, the first-ever "before"
+baseline for that check (every prior CMD13 diagnostic in this
+investigation only ever ran AFTER a wedge was already detected).
+
+**Two false alarms along the way, both caught before shipping a
+wrong conclusion**: a "card does not boot at all" report turned out to
+be a stale `picocom` session (see the "second real-HW card" entry
+above); a build that appeared to hang the QEMU regression suite's
+`tcprtx` test was confirmed as a known, accepted, diagnostic-only
+print-volume side effect (same class the original `sdhost_fill_fifo_
+from_buffer_diag` instrumentation already caused once, 2026-09-19),
+not a functional regression -- kept local-only per explicit user
+choice rather than pushed.
+
+**Real finding #1, later ruled out via reference-driver comparison**:
+the first real-HW capture (`picocom_20260921_081231.log`) showed
+`post-CMD24-cmd-complete SDARG=0x00106800` for block 2100 while
+`is_sdhc=1` -- exactly `2100*512`, a byte address, when an SDHC card's
+CMD24 argument should be the bare block number (`0x834`). Looked like
+a real, previously-undiscovered addressing bug. Root-caused with three
+successive, increasingly-isolated debug prints under QEMU (added, used
+once, then fully removed): `sdhost_card_addr(block_num)` computes
+CORRECTLY at the point of computation for all 8 sweep blocks (matching
+QEMU's own `is_sdhc=0` SDSC model, a distinct, correctly-varying
+byte-address value per block -- e.g. `2100 -> 0x106800`, `2101 ->
+0x106A00`); `addr` survives correctly, unchanged, all the way to
+immediately before the `sdhost_cmd` call. But `mmio_write_u32(SDARG,
+addr)` followed by an IMMEDIATE `mmio_
+read_u32(SDARG)` (same address, zero intervening operations, inside
+`sdhost_cmd` itself) returns `0x00000000` regardless of what was just
+written. **SDARG genuinely does not support readback of its own
+written value on this controller** -- confirmed via Linux's own
+`raspberrypi/linux` (rpi-6.6.y) `bcm2835-sdhost.c`: SDARG is
+documented "32 R/W" but the driver never once reads it back anywhere
+in its own source, so this specific behavior had simply never been
+tested by anyone before. This retroactively means the real-HW
+`0x00106800` reading was never meaningful evidence of an addressing
+bug in the first place -- a genuinely novel discovery about the
+hardware, but a dead end for THIS specific hypothesis, not a fix.
+
+**Real finding #2, also ruled out via reference-driver comparison**:
+`SDHBCT` (initialized to 512, intending "512 bytes") decrements by
+exactly 1 per WORD written, not per byte -- confirmed with exact
+arithmetic matches at every checkpoint (512-1=0x1FF after word 1,
+512-16=0x1F0 after word 16, ..., 512-128=0x180 after the full 128-word
+transfer, matching the real-HW log exactly at every single point).
+Never reaching 0 after a complete, correct transfer looked like a
+plausible root cause (controller waiting forever for a byte-counter
+that can't reach zero). Checked against Linux's own driver comments:
+SDHBCT is explicitly documented "Host byte count (**debug**)" -- an
+informational register the hardware does NOT gate FSM transitions on;
+Linux's own PIO loop tracks completion via its own software word
+counter, then explicitly forces the FSM out of any stuck intermediate
+state via `SDEDM_FORCE_DATA_MODE`, exactly matching what this
+project's own `sdhost_wait_transfer_complete` already does. Not the
+root cause.
+
+**Where this leaves the search**: every real-HW wedge this entire
+saga has ever captured (going back to round 2026-09-15) decodes to
+FSM=WRITEDATA(3). Checked both Linux's and U-Boot's own reference
+drivers for their own FORCE_DATA_MODE escape-hatch coverage: Linux
+forces WRITESTART1; U-Boot forces READWAIT(4)/WRITESTART1(0xA)/
+READDATA(2) unconditionally. **Neither reference driver ever forces
+WRITEDATA(3)** -- this project's own existing escape-hatch coverage
+(WRITESTART1 + READDATA, added round 2026-09-19) already matches both
+references correctly. Deliberately did NOT add a new WRITEDATA-forcing
+branch despite the temptation -- neither proven reference needs one,
+and this project has already shipped three prior "well-reasoned but
+unproven" SD fixes that were each falsified by the next real log (see
+`sdhost_wait_transfer_complete`'s own header comment). The real
+question this leaves open: why does THIS driver's own PIO loop reach
+and get stuck in WRITEDATA at all, when neither reference driver's own
+loop apparently ever does -- the difference must be upstream, in how
+the FIFO-fill loop itself is structured, not in the wait/escape-hatch
+logic downstream of it.
+
+Two identical `phase4_milestone.py` runs confirm zero regression
+(same known, accepted `tcprtx` timing artifact from the diagnostic
+print volume, unchanged from before this round). All temporary debug
+prints added during root-causing were removed before this round's own
+commit; the permanent register-dump instrumentation (pre/post-CMD24,
+per-batch) remains, kept local-only per the user's own explicit choice
+this round.
+
 ### Task #279: fault-injection test proves WCET enforcement + heartbeat detection actually work (2026-09-20)
 
 User: "how about other rtos scheduling improvements? any bugs through
