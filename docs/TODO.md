@@ -9223,12 +9223,47 @@ the timeout mechanism changed. Commit `7ecc2a2`.
 Two identical `phase4_milestone.py` runs confirm zero regression; the
 8-block sweep's own elapsed time (9106us) stayed in the same order of
 magnitude as before the change (well under the new 1-second real-time
-cap, as expected for a controller that isn't actually wedged). Real
-Pi 1B hardware retest still needed (no hardware available in this
-environment) -- this is a real, independently-motivated fix regardless
-of whether it turns out to be the SD write wedge's own root cause; task
-#218 (confirm DharaFS/crypto downstream FAILs clear) remains the
-tracking item for that outcome.
+cap, as expected for a controller that isn't actually wedged).
+
+**Real-HW retest, same evening (`picocom_20260920_224933.log`)**: the
+write wedge is STILL PRESENT -- every one of the 8-block sweep's writes
+still gives up after 3 retries, identical to every prior round. But
+the fix IS confirmed active and produced a genuinely useful negative
+result. Comparing the "write attempt -> wait_transfer_complete timeout
+-> CMD13(SEND_STATUS) timeout -> controller reset" segment's own real
+elapsed time (via consecutive `sdhost_init entry, TIMER_CLO=...`
+timestamps) against the immediately-prior PRE-fix log
+(`picocom_20260920_165043.log`, captured before this fix was pushed):
+pre-fix ~3.21s, post-fix ~1.49s -- the timing genuinely changed,
+confirming the new code path is live, not a no-op.
+
+The direction is the OPPOSITE of the U-Boot bug this round was
+prompted by: DhruvaOS's own old iteration-count loop was already
+running LONG on real hardware (~3.2s for the whole segment), not too
+SHORT. This makes sense in hindsight -- this loop's own dominant
+per-iteration cost is a real `mmio_read_u32` bus transaction, not pure
+ALU cycles like the `delay()` loop tasks #274/#275 examined, and MMIO
+read latency is comparably bus-bound on both QEMU and real silicon,
+unlike a tight arithmetic loop's own ~18.6x rate mismatch. The fix
+still mattered (structural correctness, and a real ~1.7s reduction in
+worst-case failure-detection latency), but "timeout window too short"
+was never going to be the write wedge's own root cause here.
+
+**Real, useful negative result**: all 16 timeout events in the new log
+show byte-for-byte IDENTICAL `SDEDM=0x00010803` (FSM=3=WRITEDATA),
+whether the wait was ~1s (new) or ~3s+ (old, from the same evening's
+own earlier log). The controller is genuinely, permanently stuck at
+that FSM state for the ENTIRE real-time window regardless of how long
+you wait -- this DEFINITIVELY RULES OUT "the timeout fires before the
+transfer genuinely finishes" as any part of the write-path wedge's own
+explanation, a hypothesis class this 18-round saga had never formally
+eliminated before (every prior round addressed settle delays, FIFO
+draining, clock speed, or FSM escape-hatch coverage -- never directly
+tested "is the wait simply not long enough"). task #218 remains open;
+the search narrows to genuine FSM-recovery mechanics (what real
+register write/reset sequence, if any, can move the controller off
+WRITEDATA once it's landed there) rather than any variant of "wait
+longer" or "detect the stuck state sooner."
 
 ### Task #279: fault-injection test proves WCET enforcement + heartbeat detection actually work (2026-09-20)
 
