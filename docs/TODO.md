@@ -9261,3 +9261,79 @@ triggered, zero behavior change when disarmed" contract every other
 eviction logic can be re-verified with this exact command instead of
 relying on code review alone. Two identical `phase4_milestone.py`
 runs confirm zero regression.
+
+### Task #280: fault-injection edge-case sweep -- ceiling holder, mutex holder, repeated episodes, irqburst combo (2026-09-20)
+
+User: "any more edge cases we can find?" after task #279 shipped.
+Answered with the most valuable untested branch: task #271's eviction
+gate only checks `ceiling_depth_table`, never `dhruva_mutex_lock`'s
+own priority-inheritance holds -- a genuinely different mechanism, not
+tracked by that table at all. Plus two smaller candidates: repeated
+back-to-back stuck episodes on the same task (does the counter double-
+count?), and a stuck task combined with `fault irqburst` (does a
+sudden tick-jump corrupt the heartbeat's own `now - last` arithmetic?).
+User: "yes fix all" -- all four built/verified.
+
+New fault types `fault stuckceiling <n>` / `fault stuckmutex <n>`
+(`boot/fault_inject_state.S`: `fault_stuck_ceiling_ticks`/`fault_stuck_
+mutex_ticks`, same one-shot-arm/self-disarm shape as `fault_stuck_
+ticks`). `stuckceiling` targets `task_c`/LOW, checked AFTER it already
+holds its own ceiling-0 lock (deliberately exercising the REAL gated
+state, not a simulated one). `stuckmutex` targets `task_mutex_demo_
+low` via a new, deliberately SEPARATE, untagged sibling function
+(`task_mutex_demo_low_stuck_body`) rather than adding an unbounded
+branch inside `task_mutex_demo_low_wake_body` -- that function carries
+a real, load-bearing `#[wcet(cycles=100000)]` tag (Gap C), and the
+spin helper's loop is genuinely unbounded, so calling it from inside a
+`#[wcet(...)]`-tagged function would have falsely poisoned that
+measured bound or failed the static check outright.
+
+**All four live-verified under QEMU** (two identical `phase4_
+milestone.py` runs first, zero regression from task #279's own
+baseline):
+
+1. **`fault stuckceiling 40`**: LOW's own `WCET-enforcement evictions`
+   stayed 0 (the skip gate correctly protects the ceiling holder)
+   while `stuck-task episodes` fired 4 times (floor(40 / LOW's own
+   10-tick bound), edge-triggered, no double-counting). Every OTHER
+   task's own counters ALSO went nonzero during the window, each
+   matching floor(40 / that task's own bound) exactly -- not a bug:
+   ceiling-0 is the system's highest ceiling, so by Immediate Priority
+   Ceiling Protocol semantics every other task is blocked from running
+   for the whole window regardless of whether it touches LOW's
+   specific resource, so cascading heartbeat staleness is the
+   textbook-correct consequence, confirmed harmless (those "evictions"
+   are a no-op on a task that's already off the CPU).
+2. **`fault stuckmutex 40`**: a real, previously-undocumented
+   asymmetry -- MUTEX-LOW's OWN eviction counter DID fire (4/4,
+   unlike the ceiling case), because task #271's skip gate never
+   checks mutex holds, only `ceiling_depth_table`. Self-heals
+   correctly (MUTEX-HIGH still eventually acquires the mutex once
+   LOW's spin finishes and releases it, no deadlock, zero shadow-model
+   mismatches, mutex handoff latency stayed in the normal double-digit-
+   microsecond range) -- but by the exact same reasoning the ceiling
+   skip exists for, forcing a mutex holder off the CPU mid-critical-
+   section can only delay its OWN progress toward releasing what
+   everyone else is waiting on. Not fixed (bounded, self-healing, no
+   crash observed) -- logged in `docs/RTOS_GAP_ANALYSIS.md` as an
+   honestly-scoped gap rather than left silently implicit.
+3. **Repeated stuck episodes** (`fault stuck 40` armed twice back-to-
+   back on `task_custom_demo`, `diagnose` read between each): counters
+   went 0 -> 1 -> 2, exactly +1 per episode -- no double- or under-
+   counting across separate arm/self-disarm cycles.
+4. **Stuck + irqburst combo** (`fault irqburst 500` immediately
+   followed by `fault stuck 40` on the same task): counters went
+   2 -> 3, one more clean increment despite the discontinuous 500-tick
+   clock jump -- `hb_elapsed = hb_now - hb_last` (`u32`, monotonic)
+   showed no underflow/corruption, no crash, no shell hang.
+
+See `docs/RTOS_GAP_ANALYSIS.md`'s "Timing analysis / determinism gaps"
+section for the full write-up. Verification note: the first combined-
+session attempt raced ahead of a still-printing `diagnose` (matched on
+a mid-block line instead of the block's actual last line), sending the
+next fault command while output was still interleaving -- a test-
+harness bug, not a kernel bug (confirmed by task #185/#219's own
+"cosmetic only" interleave finding still holding: the shell's RX line
+buffer is unaffected by concurrent TX from another task). Fixed by
+matching on the diagnose block's own last line and adding settle time
+between commands.

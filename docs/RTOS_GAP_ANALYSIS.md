@@ -788,6 +788,67 @@ doesn't yet attempt.
   and every other task keeps running correctly throughout — no FATAL,
   no shadow-model mismatch. Confirms the mechanism is correct, not
   just implemented.
+
+  **Edge-case sweep, task #280 (2026-09-20)**: four further fault
+  types (`fault stuckceiling/stuckmutex <n>`, plus reusing `fault
+  stuck`/`fault irqburst` back-to-back), all live-verified under QEMU.
+
+  *Ceiling holder* (`task_c`/LOW spins 40 ticks while holding its own
+  ceiling-0 lock): eviction correctly stayed 0 for LOW itself (the
+  skip gate works) while detection fired 4 times (floor(40/10), the
+  task's own 10-tick bound) — matching, edge-triggered, no double-
+  counting. Every OTHER task's own stuck/eviction counters ALSO went
+  nonzero during this window (HIGH=2, MEDIUM=4, MUTEX-LOW/HIGH=4,
+  CUSTOM=1, SHELL=2, FSQ=1 — every value exactly floor(40/that task's
+  own bound)) — not a bug: ceiling-0 is the system's highest ceiling,
+  so by the Immediate Priority Ceiling Protocol's own correct
+  semantics, EVERY other task is blocked from running for the full
+  window regardless of whether it touches the specific resource LOW
+  holds, so all of their heartbeats going stale and firing is the
+  textbook-correct cascading consequence, confirmed by the WCET-
+  enforcement eviction counters matching 1:1 (a "stuck episode" on a
+  task that's merely blocked by the ceiling, not evicted, causes zero
+  operational effect — the task was already off the CPU).
+
+  *Mutex holder* (`task_mutex_demo_low` spins 40 ticks while holding
+  the demo mutex via priority INHERITANCE, not the ceiling protocol):
+  **a real, previously-undocumented asymmetry** — unlike the ceiling
+  case, MUTEX-LOW's OWN eviction counter DID increment (4/4, matching
+  its stuck-episode count exactly), because task #271's skip gate only
+  checks `ceiling_depth_table`, which a priority-inheritance mutex
+  holder never touches. Self-heals correctly (MUTEX-HIGH still
+  eventually acquires the mutex once LOW's spin finishes and releases
+  it, `mutex handoff worst-case latency` stayed in the same double-
+  digit-microsecond range as normal operation, zero shadow-model
+  mismatches) — but by the same reasoning `task_wcet_enforce_evicted_
+  count_table`'s own header comment uses for skipping ceiling holders
+  ("evicting a mutex holder... would strand every other task waiting
+  on that same resource, a strictly worse outcome"), forcibly setting
+  `sleep_until_table` on a mutex holder mid-critical-section pauses
+  its OWN progress toward releasing what everyone else is waiting on —
+  the enforcement mechanism can only make total resolution slower
+  here, never faster, for exactly the class of holder it was built to
+  help recover from. Not fixed (self-healing, bounded, no crash/
+  deadlock observed) — an honestly-scoped gap matching this project's
+  own established pattern, logged here rather than silently left
+  implicit.
+
+  *Repeated back-to-back episodes* (`fault stuck 40` armed twice in a
+  row on `task_custom_demo`, `diagnose` read between each): CUSTOM's
+  own counters went 0 -> 1 -> 2, exactly +1 per episode, no double- or
+  under-counting across separate arm/self-disarm cycles.
+
+  *Stuck + irqburst combo* (`fault irqburst 500` — a 500-tick synthetic
+  clock jump — immediately followed by `fault stuck 40` on the same
+  task): counters went 2 -> 3, exactly one more clean increment despite
+  the discontinuous jump; `hb_elapsed = hb_now - hb_last` (both `u32`,
+  monotonic) has no underflow/wraparound exposure here since `irqburst`
+  only ever moves the clock forward, confirmed empirically (no crash,
+  no corrupted count, no shell hang — the shell answered a command
+  immediately afterward).
+
+  All four cases: two identical `phase4_milestone.py` regression runs,
+  zero regression from baseline.
 - ~~**The static model itself has a known, recently-found soundness gap.**
   `#[bounded_stack]`'s checker used to charge exactly 0 bytes for any
   `extern "C"` (hand-written assembly) callee — fixed this session
