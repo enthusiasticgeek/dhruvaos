@@ -10150,3 +10150,83 @@ retest to confirm the fix actually works**, but this is the first
 fix in the entire saga backed by a direct, mechanistic, real-hardware
 comparison against a known-working reference, not source-reading or
 protocol-timeout reasoning alone.
+
+### Twenty-sixth SD round: the 25th round's fix was never actually tested -- diagnostic clone had drifted out of sync; full U-Boot re-comparison done (2026-09-25)
+
+User retested the 25th round's own burst-write fix on real hardware
+and got the IDENTICAL old wedge signature. Root cause of the false
+negative: the 8-block sweep (blocks 2100-2107) -- the ONE test this
+entire 26-round saga has ever used for real-HW validation -- calls
+`sdhost_fill_fifo_from_buffer_diag`, a separate, hand-maintained
+diagnostic clone of the fill loop, kept around specifically to add
+register-dump instrumentation without touching the production path.
+The 25th round restructured `sdhost_fill_fifo_from_buffer_impl` to
+burst-write but never touched this clone -- so the ONE test that's
+ever validated a fix in this saga was silently still running the OLD
+per-word-poll code the whole time. **The 25th round's own fix was
+never actually exercised by any real-HW test until now.** Fixed:
+restructured the diagnostic clone to match `_impl`'s own burst-write
+loop exactly, dump now fires once per real burst instead of at fixed
+16-word marks. Two identical `phase4_milestone.py` runs, known
+baseline unchanged, SD 8-block sweep `any_fail=0` under QEMU.
+
+User, separately: "I think you need to revisit u-boot source and
+compare all relevant files" -- a full re-read of every function in
+`drivers/mmc/bcm2835_sdhost.c` (reset/init, clock setup, command
+dispatch, set_ios, probe/bind), not just the write-path functions
+already compared for the 24th/25th rounds:
+
+- **FIFO read/write threshold bits (SDEDM[18:14]/[13:9], set to 4/4
+  in `bcm2835_reset_internal`, "Limit fifo usage due to silicon
+  bug")** -- already matched; DhruvaOS's own `sdhost_init` already
+  sets these identically, found and confirmed insufficient ALONE back
+  on 2026-09-20 (task #273-followup), which is what led to the settle-
+  delay and later SLOW_CARD/SDCDIV work. Not a new gap.
+- **SDTOUT (0xf00000 in `bcm2835_reset_internal`)** -- already
+  matches DhruvaOS's own value exactly.
+- **SDHCFG_SLOW_CARD (bit 3)** -- already matched; DhruvaOS's own
+  0x418 includes it, added 2026-09-18 after the exact same real
+  Linux comment this U-Boot source also carries ("cope with fast core
+  clocks"). Not a new gap.
+- **4-bit vs 1-bit bus width (SDHCFG_WIDE_INT_BUS/_EXT_BUS)** --
+  DhruvaOS never issues ACMD6 (SET_BUS_WIDTH) and never sets these
+  bits, running 1-bit throughout; deliberate and internally
+  consistent (card and controller agree), not a mismatch. Not a new
+  gap, and unlikely to explain an FSM-transition wedge specifically
+  (a real width mismatch would break command responses too, which
+  never happens -- CMD13 always succeeds even when writes wedge).
+- **SDHCFG_DATA_IRPT_EN (bit 4) -- a genuinely NEW finding, not yet
+  acted on.** DhruvaOS's own 0x418 includes this bit, deliberately
+  added 2026-09-16 after comparing against real Linux's own
+  interrupt-driven `bcm2835_sdhost_set_transfer_irqs` (which sets
+  DATA_IRPT_EN|BUSY_IRPT_EN for every PIO transfer). U-Boot's own
+  `bcm2835_add_host`/`bcm2835_set_ios`, by contrast, NEVER sets
+  DATA_IRPT_EN at all -- its own successful write happened with this
+  bit clear. Neither driver is actually interrupt-controller-driven
+  for this operation (both poll), so this isn't about whether an IRQ
+  literally fires -- it's a real, empirically-different register value
+  between a driver that wedges and one that doesn't. This project's
+  own EARLIER speculation on this exact bit (2026-09-16, quoted above
+  in this same file) already reasoned these "IRQ enable" bits "may
+  double as internal event-detection/latch enables for the data-phase
+  state machine itself, not purely IRQ-routing" -- U-Boot's own
+  working counter-example is new, real evidence FOR that theory, not
+  yet tested by removing the bit.
+- **`bcm2835_send_cmd`'s own pre-command FSM-idle gate** (refuses to
+  issue a new command unless SDEDM's FSM already reads IDENTMODE or
+  DATAMODE, `!= STOP_TRANSMISSION`) -- DhruvaOS has no direct
+  equivalent. Every real-HW log's own pre-CMD24 CMD13 always shows
+  FSM=DATAMODE already, so this gate would never have actually fired
+  differently in any captured log -- likely not the cause, but a
+  reasonable defensive addition to consider separately.
+
+**Deliberately NOT bundled into this round's own fix**: changing
+SDHCFG's own DATA_IRPT_EN bit at the same time as the already-built
+burst-write fix would make the next real-HW result impossible to
+attribute to either change individually -- this project's own
+established discipline (three prior "well-reasoned but unproven"
+fixes already falsified, most recently the interrupt-masking
+hypothesis in the 23rd round) is to test one real change at a time.
+The corrected build (burst-write fix + the NOW-actually-exercising-it
+diagnostic clone) is what needs the next real-HW retest; DATA_IRPT_EN
+removal is the next candidate if burst-write alone isn't sufficient.
