@@ -10317,3 +10317,27 @@ in initialization/clock-setup sequencing rather than the write path
 itself, this round's experiment would not have caught it. Porting
 `bcm2835_reset_internal`/`bcm2835_set_clock` as literal C, the same
 way, is the natural next step.
+
+## 29th SD round (2026-09-25): SDTOUT never updated on data-transfer clock change, matched to U-Boot
+
+Reviewing U-Boot's `bcm2835_reset_internal`/`bcm2835_set_clock` as
+candidates for the same literal-C-port treatment the write path got
+in the 28th round, found a genuine, previously-uncaught gap:
+`bcm2835_set_clock` rewrites `SDTOUT` to the ACHIEVED clock
+(`core_clock_hz/(div+2)`, not the originally requested `target_hz`)
+divided by 2 every time the data-transfer clock is set -- its own
+comment: "Set the timeout to 500ms". This driver's own `SDTOUT` write
+(`0xF00000`, matching U-Boot's `reset_internal` value) happens exactly
+once, during reset, and was never revisited once the data-transfer
+clock got set afterward.
+
+Fixed: computes `achieved_clock_hz = core_clock_hz / (div4 + 2)` and
+writes `achieved_clock_hz / 2` to SDTOUT, inside the same branch that
+switches the data-transfer clock (matching U-Boot's own low-speed
+`clock < 100000` branch, which deliberately does NOT touch SDTOUT --
+the identification-speed fallback path here is unaffected).
+
+Verified: build clean, `phase4_milestone.py` run twice, identical to
+documented baseline both times. Commit `0ff4de7`. **Not yet real-HW
+tested** -- bundle with (or test separately from) the 28th round's
+write-path C-port build for the next real-HW retest.
