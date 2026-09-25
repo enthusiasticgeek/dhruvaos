@@ -10273,3 +10273,47 @@ pre-existing artifact, not a new regression from this change. Commit
 clear the wedge, revert to 0x418 before trying the next candidate
 (the `bcm2835_send_cmd` pre-command FSM-idle gate is the next
 concrete idea on the list, though considered less likely).
+
+## 28th SD round (2026-09-25): literal C port of U-Boot's write algorithm wedges identically -- driver logic ruled out
+
+Built `boot/rpi1/uboot_sdhost_write.c` -- a literal, self-contained C
+transliteration of U-Boot's real, working `bcm2835_sdhost.c` write
+path (`bcm2835_send_command`'s data-command subset,
+`bcm2835_finish_command`, `bcm2835_transfer_block_pio`,
+`bcm2835_transfer_pio`, `bcm2835_wait_transfer_complete`), copied
+line-for-line from the real upstream source, not reasoned about and
+reimplemented. Raw MMIO only, zero shared code with the existing asm
+driver. Wired in as an early return in `sdhost_write_block_once`,
+active ONLY for the existing 8-block real-HW diagnostic sweep
+(block_num 2100-2107) -- production write path untouched.
+
+**Real-HW result: identical wedge.** `pre-CMD24 SDEDM=0x10801`
+(FSM=DATAMODE) -> `post-CMD24-cmd-complete SDEDM=0x1080A`
+(FSM=WRITESTART1) -- both exactly as expected -- -> `post-PIO
+SDEDM=0x10803` (FSM=WRITEDATA, stuck) -> `wait_transfer_complete`
+timeout at the same value, every block, every retry. This is the
+single most decisive result in the whole investigation: a byte-
+faithful port of proven-working reference code cannot get past this
+wedge inside DhruvaOS's own environment. **Driver write-path logic of
+every kind tested so far is ruled out** -- register values, burst
+structure, and now the entire command-issue-through-completion
+control flow have all matched a working reference and still failed.
+
+Also ruled out this round via source inspection (no live test
+needed): the SDHOST peripheral block is already correctly mapped
+Shareable Device memory (`boot/mmu_init.S`, TEX=000/C=0/B=1), not
+cacheable -- rules out CPU write-buffer reordering/staleness as an
+explanation.
+
+Commit `c1c9143`.
+
+**Next candidate, not yet tried**: the ported write function reuses
+DhruvaOS's own `sdhost_init` (clock divisor, SDTOUT, SDHCFG, FIFO
+thresholds) rather than porting U-Boot's own init sequence too --
+every individual register value has been checked against U-Boot's
+source across many earlier rounds, but never as one single, literal,
+end-to-end port the way the write path just was. If the real gap is
+in initialization/clock-setup sequencing rather than the write path
+itself, this round's experiment would not have caught it. Porting
+`bcm2835_reset_internal`/`bcm2835_set_clock` as literal C, the same
+way, is the natural next step.
