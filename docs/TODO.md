@@ -9447,8 +9447,58 @@ Also worth noting going in: masking IRQ+FIQ across the fill loop, even
 correctly, adds to this kernel's own worst-case interrupt latency
 budget (task #270) and needs a schedulability re-check (task #190's
 own tooling) once built, since it's a new source of bounded-but-
-nonzero blocking time. Scoped out of this round pending explicit
-direction on whether to build the syscall now.
+nonzero blocking time.
+
+### Twenty-first SD round: built the 6th SWI syscall trampoline, real fix now shipped, needs real-HW retest (2026-09-24)
+
+User: "yes build it now" -- direct follow-up to the 20th round's own
+open question. Built the syscall the 20th round's revert identified as
+necessary, following `dhruva_prio_lock`/`_unlock`'s own migration shape
+exactly (both had hit the identical "cpsid/cpsie silently no-ops in USR
+mode" bug once already, per `dhruva_prio_lock_impl`'s own header
+comment in context_switch.S -- an independent, exact confirmation of
+the 20th round's own root-cause finding, found only after committing
+to build the real fix, not before).
+
+**Built**: renamed `sdhost_fill_fifo_from_buffer` (boot/sdcard_
+state.S) to `sdhost_fill_fifo_from_buffer_impl` and gave it the exact
+`dhruva_prio_lock_impl` treatment -- `mrs r12,cpsr` / `cpsid if` at
+entry, `msr cpsr_c,r12` before return, masking the ENTIRE 128-word fill
+loop for its whole duration (not per-word) since the syscall body never
+returns to USR mode until the loop is completely done. Added syscall
+#5 in boot/swi_entry.S (`swi_do_sd_fill_fifo`, dispatching to the new
+`_impl`) and a new trampoline that keeps the ORIGINAL name and
+signature `sdhost_fill_fifo_from_buffer(buf, word_count)` -- exactly
+like task_sleep_ticks/dhruva_mutex_lock/dhruva_prio_lock's own
+trampolines -- so kernel_main.vani's existing call site and extern
+declaration needed ZERO changes; the fix is entirely contained in the
+two assembly files. `sdhost_fill_fifo_from_buffer_diag` (the temporary
+2100-2107-gated diagnostic variant) deliberately left unmasked and
+unchanged -- it's diagnostic-only, not the production write path this
+fix targets.
+
+Confirmed r0 (buf)/r2:r3 (word_count pair, this project's own
+established i64-after-1-register ABI quirk) survive the trap
+completely untouched: swi_entry's own entry-capture code only uses
+r5/r8/r9/r11 as scratch before dispatch, never r0-r3 (same guarantee
+task_sleep_ticks/dhruva_mutex_lock already rely on).
+
+Built clean (no duplicate-symbol/undefined-reference linker errors --
+the trampoline reuses the exact name the old direct function had, now
+freed up by the `_impl` rename). Two identical `phase4_milestone.py`
+runs: back to the exact known baseline (only the already-accepted
+`tcprtx` artifact), and the boot-time "SD: 8-block round-trip sweep"
+self-test still reports `any_fail=00000000` -- functionally correct
+under QEMU, not just non-crashing, though QEMU was never where the
+wedge reproduced in the first place, so this can only confirm no
+regression, never confirm the fix.
+
+**Status**: real fix shipped, matches Linux's own reference protection
+exactly, but -- like every fix in this 21-round saga -- can only be
+validated by a real-HW retest. Not pushed yet (still stacked on the
+19th/20th rounds' own local-only commits per the user's earlier
+choice); commit hash and real-HW retest results to be recorded once
+available.
 
 ### Task #279: fault-injection test proves WCET enforcement + heartbeat detection actually work (2026-09-20)
 

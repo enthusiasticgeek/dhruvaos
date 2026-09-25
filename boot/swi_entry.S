@@ -215,6 +215,8 @@ swi_entry_skip_usr_sp_capture:
     beq swi_do_prio_lock
     cmp r7, #4
     beq swi_do_prio_unlock
+    cmp r7, #5
+    beq swi_do_sd_fill_fifo
     b swi_return_to_usr        /* unknown syscall number -- no-op,
                                * fall straight through to the restore
                                * rather than doing anything undefined */
@@ -249,6 +251,24 @@ swi_do_prio_unlock:
     bl dhruva_prio_unlock_impl
     bl swi_fast_measure_end
     pop {r6}
+    b swi_return_to_usr
+
+/* Syscall #5 (2026-09-24, 21st SD round): sdhost_fill_fifo_from_buffer
+ * -- see boot/sdcard_state.S's own _impl header comment for the full
+ * "why" (real structural gap vs. Linux's own bcm2835_sdhost_write_
+ * block_pio, first attempted as a direct cpsid/cpsie call, reverted
+ * after a live regression, fixed the same way dhruva_prio_lock/_unlock
+ * needed the identical fix once before). Not bracketed by swi_fast_
+ * measure_start/_end -- unlike prio_lock/unlock/mutex_unlock, this
+ * genuinely does variable-length polled work (up to 128 words times a
+ * bounded 100000-iteration-per-word retry cap), not a fixed handful of
+ * instructions, so folding it into that same worst-case/total-time
+ * accounting would conflate this new source of latency with the
+ * others' -- left unmeasured here deliberately; a future round can add
+ * its own dedicated counters (mirroring swi_fast_worst_us's own
+ * pattern) if this trap's own overhead ever needs the same scrutiny. */
+swi_do_sd_fill_fifo:
+    bl sdhost_fill_fifo_from_buffer_impl
     b swi_return_to_usr
 
 /* Task #253 Phase 3 instrumentation round (2026-09-19): real,
@@ -561,6 +581,25 @@ dhruva_prio_unlock:
     push {r4, r7}
     mov r4, lr
     mov r7, #4
+    swi #0
+    mov lr, r4
+    pop {r4, r7}
+    bx lr
+
+/* sdhost_fill_fifo_from_buffer (syscall #5, 2026-09-24) -- keeps the
+ * exact name/signature every existing vani-side call site (kernel_
+ * main.vani) already uses; the real logic moved to sdhost_fill_fifo_
+ * from_buffer_impl (boot/sdcard_state.S), same migration shape as
+ * dhruva_prio_lock/_unlock above. r0 (buf) and r2:r3 (word_count pair,
+ * this project's own established i64-after-1-register ABI quirk) pass
+ * through completely unchanged -- nothing in swi_entry's own entry
+ * capture touches r0-r3 before dispatch (see that function's own
+ * header comment). */
+.global sdhost_fill_fifo_from_buffer
+sdhost_fill_fifo_from_buffer:
+    push {r4, r7}
+    mov r4, lr
+    mov r7, #5
     swi #0
     mov lr, r4
     pop {r4, r7}

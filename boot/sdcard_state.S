@@ -178,9 +178,32 @@ sdhost_drain_done:
     mov r1, #0
     bx lr
 
-.global sdhost_fill_fifo_from_buffer
-sdhost_fill_fifo_from_buffer:
+/* 20th/21st SD round (2026-09-24): renamed from the bare
+ * sdhost_fill_fifo_from_buffer to _impl and given the exact dhruva_
+ * prio_lock_impl treatment (boot/context_switch.S) -- `mrs r12,cpsr;
+ * cpsid if` at entry, `msr cpsr_c,r12` before return -- for the real
+ * structural gap found comparing this loop against Linux's own
+ * bcm2835_sdhost_write_block_pio: Linux wraps its entire PIO write-
+ * block loop in local_irq_save/restore, this loop never masked
+ * anything. A first attempt called `cpsid if`/`cpsie if` directly from
+ * this function while it was still reachable straight from USR-mode
+ * task code -- exactly the same UNPREDICTABLE-instruction mistake
+ * dhruva_prio_lock/_unlock's own history already made once (see that
+ * function's header comment, "FIRST FIX ATTEMPT (reverted)") -- caught
+ * by a live QEMU regression (eval/ping/ifconfig/tcpecho/etc. all newly
+ * broken), reverted, and fixed the same way that one was: routed
+ * through a real SWI trap (syscall #5, boot/swi_entry.S) so the mask/
+ * restore genuinely happens in SVC mode. The trampoline below keeps
+ * the plain sdhost_fill_fifo_from_buffer name and signature unchanged
+ * -- every existing vani-side call site (kernel_main.vani) needed ZERO
+ * changes, exactly like dhruva_prio_lock's own migration. r12 is
+ * caller-saved scratch under AAPCS -- no push/pop needed for it, same
+ * as dhruva_prio_lock_impl. */
+.global sdhost_fill_fifo_from_buffer_impl
+sdhost_fill_fifo_from_buffer_impl:
     push {r4, r5, r6}
+    mrs r12, cpsr
+    cpsid if
     mov r4, r2               /* r4 = word_count (r2:r3 pair, low half) */
     ldr r6, =0x20202034      /* SDEDM */
 sdhost_fill_loop:
@@ -206,6 +229,7 @@ sdhost_fill_ready:
     sub r4, r4, #1
     b sdhost_fill_loop
 sdhost_fill_done:
+    msr cpsr_c, r12
     pop {r4, r5, r6}
     mov r0, #0
     mov r1, #0
