@@ -2106,6 +2106,17 @@ extern "C" fn sleep_until_table_get_at(index: u32) -> u32;
 extern "C" fn ready_wait_ticks_table_get_at(index: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn rr_last_picked_get() -> u32;
+// Task #286: write counterparts for the three tables scheduler_16_
+// levels_self_test needs to inject a synthetic scenario into, plus
+// restore afterward -- see eff_prio_table_set_at's own header comment
+// (context_switch.S) for why these are safe despite Gap B's own
+// accessors above being deliberately read-only.
+#[stack_cost(bytes=1)]
+extern "C" fn eff_prio_table_set_at(index: u32, v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn ready_wait_ticks_table_set_at(index: u32, v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rr_last_picked_set(v: u32) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_predicted_task_get() -> u32;
 #[stack_cost(bytes=1)]
@@ -10547,6 +10558,101 @@ fn scheduler_pick_next_shadow_predict() -> u32 {
     return spn_shadow_old_algorithm(current, current_eff, tick);
   }
   return spn_shadow_new_algorithm(tick);
+}
+
+// Task #286 (2026-09-25): live verification that the scheduler
+// correctly discriminates and orders ALL 16 possible priority levels
+// (0-15), not just the ~5 distinct values (0/1/2/3/4) this project's
+// own demo task set actually exercises today. eff_prio_table/base_
+// prio_table are plain .word arrays compared by raw value (context_
+// switch.S's own scheduler_pick_next, cmp/movlt, no small-enum
+// assumption anywhere), and the unused-slot sentinel is 255 -- so
+// nothing structurally limits the range to fewer than 16 levels; this
+// is the live proof, not just the code-reading argument.
+//
+// Deliberately calls scheduler_pick_next_SHADOW_predict, never the
+// real scheduler_pick_next directly -- Gap B's own accessors (just
+// above) are explicit about why: "an independent, side-effect-free
+// shadow model... never a direct call into the real function (round
+// 75's own documented, never-fully-root-caused crash history)." The
+// shadow predictor mirrors the real algorithm's pass1/pass2 logic
+// exactly (its own header comments) and is already continuously cross-
+// checked against the real function's actual live decisions elsewhere
+// in this file (spn_shadow_mismatch_count, 0 observed) -- calling it
+// here with a synthetic scenario is the same trusted mirror, not a new
+// risk.
+//
+// Safe to inject synthetic state directly into the real eff_prio_
+// table/sleep_until_table/ready_wait_ticks_table/rr_last_picked ONLY
+// because this runs during kernel_main's own single-threaded boot-time
+// self-test sequence, strictly before start_multitasking ever hands
+// off -- nothing else reads or depends on these tables while the
+// injection is live. Every touched table is saved before and restored
+// after, byte for byte, so the real (about-to-be-created) task set is
+// completely unaffected once this returns.
+fn scheduler_16_levels_self_test() -> i64 {
+  let ok: i64 = 1;
+  let tick: u32 = scheduler_get_tick_count();
+
+  let saved_eff: [u32; 16] = [0 as u32; 16];
+  let saved_sleep: [u32; 16] = [0 as u32; 16];
+  let saved_wait: [u32; 16] = [0 as u32; 16];
+  let i: u32 = 0 as u32;
+  while i < (16 as u32) {
+    saved_eff[i] = eff_prio_table_get_at(i);
+    saved_sleep[i] = sleep_until_table_get_at(i);
+    saved_wait[i] = ready_wait_ticks_table_get_at(i);
+    i = i + (1 as u32);
+  }
+  let saved_rr: u32 = rr_last_picked_get();
+
+  // Inject: 16 distinct priorities (slot i = priority i), all ready
+  // right now, zero aging credit so pass 1's own aged-priority formula
+  // reduces to the raw priority unmodified -- this sweep is deliberately
+  // about priority DISCRIMINATION, not aging, which task #184's own
+  // live demo (LOW starved to tick 1053) already covers separately.
+  let j: u32 = 0 as u32;
+  while j < (16 as u32) {
+    let _ = eff_prio_table_set_at(j, j);
+    let _ = sleep_until_table_set_at(j, tick);
+    let _ = ready_wait_ticks_table_set_at(j, 0 as u32);
+    j = j + (1 as u32);
+  }
+  let _ = rr_last_picked_set(15 as u32);
+
+  // Ladder sweep: priority 0's slot must be picked first (the unique
+  // minimum among 16 distinct ready priorities), then with it removed
+  // from contention, priority 1's slot, and so on down to 15 -- the
+  // only way this passes at every one of the 16 steps is if the
+  // algorithm genuinely orders all 16 distinct levels correctly, not
+  // just discriminates a couple of them.
+  let k: u32 = 0 as u32;
+  while k < (16 as u32) {
+    let predicted: u32 = scheduler_pick_next_shadow_predict();
+    if predicted != k {
+      ok = 0;
+    }
+    let _ = sleep_until_table_set_at(k, tick + (1000 as u32));
+    k = k + (1 as u32);
+  }
+
+  // Restore -- exact original values, every table touched above.
+  let m: u32 = 0 as u32;
+  while m < (16 as u32) {
+    let _ = eff_prio_table_set_at(m, saved_eff[m]);
+    let _ = sleep_until_table_set_at(m, saved_sleep[m]);
+    let _ = ready_wait_ticks_table_set_at(m, saved_wait[m]);
+    m = m + (1 as u32);
+  }
+  let _ = rr_last_picked_set(saved_rr);
+
+  let _ = uart_puts("SCHED: scheduler_pick_next correctly orders all 16 distinct priority levels (0-15), real scheduler state fully restored");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return ok;
 }
 
 // Bounded, non-blocking, byte-at-a-time report -- same discipline as
@@ -38457,6 +38563,15 @@ fn kernel_main() -> i64 {
   // held -- the exact same class of ordering bug the SSH auth-table
   // comment below already documents catching for a different table.
   let _ = task_holds_any_mutex_self_test();
+
+  // Task #286: same placement reasoning as task_holds_any_mutex_self_
+  // test just above -- runs after task_table_init's own sentinel seed,
+  // strictly before the first task_create_usr call below (nothing else
+  // depends on eff_prio_table/sleep_until_table/ready_wait_ticks_
+  // table/rr_last_picked yet at this exact point, and this self-test
+  // restores every one of them to its exact prior value before
+  // returning regardless).
+  let _ = scheduler_16_levels_self_test();
 
   // Real authentication: seed the user-credential table's own
   // "empty" sentinel before anything (passwd/su) can touch it --

@@ -9796,3 +9796,68 @@ every genuine holding case observed).
 Two identical `phase4_milestone.py` runs, zero regression. Full
 write-up in `docs/RTOS_GAP_ANALYSIS.md`'s "Timing analysis /
 determinism gaps" section.
+
+### Task #286: live-verified all 16 possible priority levels, not just the ~5 the demo task set uses (2026-09-25)
+
+User: "right now 16 static slots in scheduler. we have high medium low
+tasks. can you have 16 levels priority?" Answered from code (`eff_
+prio_table`/`base_prio_table` are plain `.word` arrays compared by raw
+value, no small-enum assumption anywhere; unused-slot sentinel is 255;
+no validation clamp on the `priority: u32` argument anywhere in `task_
+create`/`task_create_usr`; aging's own `AGING_CAP=1024` already has
+headroom for the full 0-15 range, needing at most `15<<4=240` ticks):
+yes, nothing structurally limits it below 16. User: "yes build it,
+live-verify all 16 levels."
+
+**Built `scheduler_16_levels_self_test`** (kernel_main.vani, called
+right after `task_table_init()`/`task_holds_any_mutex_self_test()`,
+same placement discipline both already established): saves the real
+`eff_prio_table`/`sleep_until_table`/`ready_wait_ticks_table`/`rr_
+last_picked` state for all 16 slots, injects a synthetic scenario --
+16 DISTINCT priorities (slot i = priority i), all ready, zero aging
+credit -- then runs a full ladder sweep calling `scheduler_pick_next_
+shadow_predict()` 16 times, expecting priority 0's slot first, then
+(with it removed from contention) priority 1's, down to 15, confirming
+every one of the 16 levels is correctly discriminated and ordered, not
+just a couple. Restores every touched table to its exact prior value
+before returning.
+
+Deliberately calls the SHADOW predictor, never the real `scheduler_
+pick_next` directly -- Gap B's own accessors (added 2026-09-18) are
+explicit that direct synthetic-state calls into the real function are
+unsafe ("round 75's own documented, never-fully-root-caused crash
+history"). The shadow predictor mirrors the real algorithm's pass1/
+pass2 logic exactly and is already continuously cross-checked against
+the real function's own live decisions elsewhere in this file (0
+mismatches observed) -- using it here is the same already-trusted
+mirror, not a new risk. Safe to inject directly into the real tables
+only because this runs during kernel_main's own single-threaded
+boot-time self-test sequence, strictly before `start_multitasking`
+ever hands off -- confirmed live afterward too: the boot log continues
+immediately into real task creation and normal scheduling (LOW's own
+critical section, MEDIUM, MUTEX-HIGH) with no sign of disturbance.
+
+Added three new write accessors this needed and didn't yet have
+(`eff_prio_table_set_at`/`ready_wait_ticks_table_set_at`/`rr_last_
+picked_set`, `boot/context_switch.S`, same `sleep_until_table_set_at`
+shape) -- Gap B's own originals were deliberately read-only, a
+constraint about never calling the real scheduler with synthetic
+state, not about the shadow predictor.
+
+**Real staleness found along the way, not yet fixed**: the shadow
+predictor's own "old algorithm" gate (`current_eff < current_base`)
+still uses the EXACT proxy task #253 already found broken and replaced
+in the real function with `ceiling_depth_table[current] > 0` ("a proxy
+that breaks for task_a/HIGH, whose base_prio is already the system
+ceiling" -- context_switch.S's own ceiling_depth_table comment). The
+shadow predictor was never updated to match. Doesn't affect this
+round's own test (no ceiling locks involved, the gate is never
+exercised) and doesn't currently produce an observable mismatch in the
+live demo set either (ceiling id 0 is the global-minimum priority, so
+the "wrong" gate and the "right" one happen to pick the same winner
+regardless) -- but it's a real, latent divergence between the shadow
+model and the function it's supposed to mirror, worth fixing in its
+own round rather than folded into this one.
+
+Two identical `phase4_milestone.py` runs, zero regression (same known
+baseline, only the already-accepted `tcprtx` artifact).

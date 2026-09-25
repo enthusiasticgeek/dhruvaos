@@ -994,6 +994,31 @@ eff_prio_table_get_at:
     mov r1, #0
     bx lr
 
+/* Task #286 (2026-09-25): write counterparts for eff_prio_table/
+ * ready_wait_ticks_table/rr_last_picked, same shape as sleep_until_
+ * table_set_at above (r0=index, r1=value) -- Gap B's own original
+ * accessors here were deliberately read-only ("an independent, side-
+ * effect-free shadow model... never a direct call into the real
+ * function, round 75's own... crash history"), but that constraint was
+ * about never calling the REAL scheduler_pick_next with synthetic
+ * state, not about the shadow predictor itself. scheduler_16_levels_
+ * self_test (kernel_main.vani) needs these three to inject a full
+ * synthetic 16-distinct-priority scenario into the SAME tables the
+ * (already continuously live-validated) shadow predictor reads, run a
+ * full ladder sweep through it, and restore every table to its exact
+ * prior value before returning -- safe specifically because this only
+ * ever runs during kernel_main's own single-threaded boot-time self-
+ * test sequence, strictly before start_multitasking ever hands off, so
+ * nothing else reads or depends on these tables while the injection is
+ * live. */
+.global eff_prio_table_set_at
+eff_prio_table_set_at:
+    ldr r2, =eff_prio_table
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
 .global base_prio_table_get_at
 base_prio_table_get_at:
     ldr r1, =base_prio_table
@@ -1015,10 +1040,28 @@ ready_wait_ticks_table_get_at:
     mov r1, #0
     bx lr
 
+/* Task #286 -- see eff_prio_table_set_at's own header comment above
+ * for the full "why" (scheduler_16_levels_self_test, kernel_
+ * main.vani). Same shape as every other _set_at here. */
+.global ready_wait_ticks_table_set_at
+ready_wait_ticks_table_set_at:
+    ldr r2, =ready_wait_ticks_table
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
 .global rr_last_picked_get
 rr_last_picked_get:
     ldr r0, =rr_last_picked
     ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global rr_last_picked_set
+rr_last_picked_set:
+    ldr r1, =rr_last_picked
+    str r0, [r1]
     mov r1, #0
     bx lr
 
