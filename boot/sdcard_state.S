@@ -201,6 +201,86 @@ sdhost_drain_done:
     mov r1, #0
     bx lr
 
+/* 30th SD round (2026-09-25) TEMPORARY DIAGNOSTIC: identical to
+ * sdhost_drain_fifo_to_buffer above (deliberately NOT sharing code
+ * with it -- this needs to work even if the thing being investigated
+ * turns out to be a bug in that shared function itself), except it
+ * prints the FIFO fill count and the RAW word just read from SDDATA
+ * BEFORE storing it to the buffer, for every word. Purpose: the SCR
+ * read (ACMD51, 2 words) came back showing a "shift register" style
+ * corruption pattern identical in shape to the original CMD24 write
+ * corruption from earlier this same investigation -- first time this
+ * project's own drain loop has ever been exercised with a short
+ * (2-word) count instead of a full 128-word block read (task #217).
+ * This shows whether the wrong bytes are ALREADY in SDDATA at the
+ * moment of the read (a real hardware/timing issue) or only appear
+ * wrong after storage/printing (a software bug in this project's own
+ * code, findable and fixable directly). Hardcoded to exactly 2 words
+ * -- this is a narrow diagnostic for the SCR read specifically, not a
+ * general-purpose replacement.
+ * i64 sd_scr_drain_diag(mut ref i64 buf) */
+.global sd_scr_drain_diag
+sd_scr_drain_diag:
+    push {r4, r5, r6, r7, lr}
+    mov r4, r0                /* r4 = buffer pointer */
+    mov r7, #0                /* r7 = word index (0 or 1), for the label */
+    ldr r6, =0x20202034       /* SDEDM */
+sd_scr_diag_loop:
+    cmp r7, #2
+    beq sd_scr_diag_done
+    ldr r5, =100000
+sd_scr_diag_poll:
+    ldr r0, [r6]
+    mov r1, r0, lsr #4
+    and r1, r1, #0x1F         /* r1 = current FIFO word count, kept live
+                               * across the print call below (r1 is
+                               * caller-saved, but sdhost_diag_puts/
+                               * put_hex32 never touch it -- confirmed
+                               * by reading both, same as this file's
+                               * own established convention elsewhere) */
+    cmp r1, #0
+    bne sd_scr_diag_ready
+    subs r5, r5, #1
+    bne sd_scr_diag_poll
+sd_scr_diag_ready:
+    ldr r0, =sd_scr_diag_lbl_word
+    bl sdhost_diag_puts
+    mov r0, r7
+    bl sdhost_diag_put_hex1
+    ldr r0, =sd_scr_diag_lbl_fill
+    bl sdhost_diag_puts
+    mov r0, r1
+    bl sdhost_diag_put_hex1
+    ldr r0, =sd_scr_diag_lbl_data
+    bl sdhost_diag_puts
+    ldr r0, =0x20202040       /* SDDATA */
+    ldr r5, [r0]               /* r5 = raw word -- poll-cap countdown
+                               * in r5 is dead here (loop already
+                               * exited), safe to reuse; the SAME
+                               * value gets printed AND stored below,
+                               * no room for the two to diverge */
+    mov r0, r5
+    bl sdhost_diag_put_hex32
+    mov r0, #10
+    bl sdhost_diag_putc
+    str r5, [r4], #4
+    add r7, r7, #1
+    b sd_scr_diag_loop
+sd_scr_diag_done:
+    pop {r4, r5, r6, r7, lr}
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.section ".rodata"
+sd_scr_diag_lbl_word:
+    .asciz "SD DIAG: SCR word "
+sd_scr_diag_lbl_fill:
+    .asciz " fifo_fill=0x"
+sd_scr_diag_lbl_data:
+    .asciz " SDDATA=0x"
+.section ".text"
+
 /* 20th/21st SD round (2026-09-24): renamed from the bare
  * sdhost_fill_fifo_from_buffer to _impl and given the exact dhruva_
  * prio_lock_impl treatment (boot/context_switch.S) -- `mrs r12,cpsr;

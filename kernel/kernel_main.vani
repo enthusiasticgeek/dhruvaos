@@ -2678,6 +2678,10 @@ extern "C" fn sd_state_get_is_4bit() -> i64;
 // 30th SD round -- see boot/sdcard_state.S's own header comment.
 #[stack_cost(bytes=16)]
 extern "C" fn sd_scr_dump_and_check_4bit(buf: mut ref i64) -> i64;
+// 30th SD round follow-up -- see boot/sdcard_state.S's own header
+// comment on sd_scr_drain_diag.
+#[stack_cost(bytes=20)]
+extern "C" fn sd_scr_drain_diag(buf: mut ref i64) -> i64;
 #[stack_cost(bytes=12)]
 extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, word_count: i64) -> i64;
 #[stack_cost(bytes=12)]
@@ -4960,7 +4964,16 @@ fn sd_read_scr(rca: u32) -> i64 {
   }
 
   let scr_buf: mut ref i64 = dhruva_alloc_bytes(8);
-  let _ = sdhost_drain_fifo_to_buffer(scr_buf, 2);
+  // 30th SD round follow-up: SCR came back with a "shift register"
+  // corruption pattern identical in shape to the original CMD24
+  // write corruption -- first time this project's drain loop has
+  // run with a short (2-word) count instead of a full 128-word block
+  // (task #217). sd_scr_drain_diag prints FIFO fill + the raw SDDATA
+  // word at the moment of each read, showing whether the wrong bytes
+  // are already in the FIFO (real hardware/timing) or only wrong
+  // after storage (a findable software bug). See boot/sdcard_state.S
+  // for the full comment.
+  let _ = sd_scr_drain_diag(scr_buf);
   let edm_after_pio: u32 = mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
   let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
