@@ -2670,6 +2670,14 @@ extern "C" fn sd_state_set(rca: i64, is_sdhc: i64) -> i64;
 extern "C" fn sd_state_get_rca() -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn sd_state_get_is_sdhc() -> i64;
+// 30th SD round -- see boot/sdcard_state.S's own header comment.
+#[stack_cost(bytes=4)]
+extern "C" fn sd_state_set_is_4bit(is_4bit: i64) -> i64;
+#[stack_cost(bytes=4)]
+extern "C" fn sd_state_get_is_4bit() -> i64;
+// 30th SD round -- see boot/sdcard_state.S's own header comment.
+#[stack_cost(bytes=16)]
+extern "C" fn sd_scr_dump_and_check_4bit(buf: mut ref i64) -> i64;
 #[stack_cost(bytes=12)]
 extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, word_count: i64) -> i64;
 #[stack_cost(bytes=12)]
@@ -2705,6 +2713,9 @@ extern "C" fn uboot_style_sdhost_write_block(buf: mut ref i64, block_addr: i64) 
 extern "C" fn test_fill_pattern(buf: mut ref i64, byte_count: i64) -> i64;
 #[stack_cost(bytes=8)]
 extern "C" fn test_compare_buffers(a: mut ref i64, b: mut ref i64, byte_count: i64) -> i64;
+// 30th SD round -- see boot/sdcard_state.S's own header comment.
+#[stack_cost(bytes=12)]
+extern "C" fn test_dump16(buf: mut ref i64) -> i64;
 
 // Phase 3 task #4 -- boot/dharafs_buf.S. Every parameter here is `u32`, not
 // `i64`, specifically to avoid the AAPCS argument/return-register bug
@@ -4889,6 +4900,91 @@ fn gpio_sdhost_alt_init() -> i64 {
   return 0;
 }
 
+// 30th SD round (2026-09-25): ACMD51 (SEND_SCR) -- reads the card's
+// own 8-byte SCR register, matching real U-Boot's sd_get_capabilities
+// (drivers/mmc/mmc.c) exactly: CMD55(rca) then CMD51(read, arg=0),
+// SDHBCT=8/SDHBLC=1, drain 2 words via the SAME sdhost_drain_fifo_
+// to_buffer already proven correct by every real-HW read this project
+// has ever done (task #217). Two purposes: (1) gate ACMD6 on the
+// card's own reported 4-bit capability instead of assuming every card
+// supports it, matching U-Boot's own real gating; (2) diagnostic --
+// ACMD51 requires the SAME 'tran' card state ACMD6 does, so if THIS
+// also fails/times out identically, that's real evidence the actual
+// problem is upstream of either specific app command (e.g. CMD7 never
+// really selecting the card, the "NOT tran" warning this file has
+// printed -- and dismissed as benign -- on every single real-HW log
+// this entire investigation). If ACMD51 succeeds where ACMD6 alone
+// previously failed, that narrows the problem to ACMD6 specifically.
+fn sd_read_scr(rca: u32) -> i64 {
+  let sdhbct: i64 = SDHBCT;
+  let sdhblc: i64 = SDHBLC;
+  let sdhsts: i64 = SDHSTS;
+  let sdcmd_read: u32 = 0x40 as u32;
+  let fsm_readwait: u32 = 4 as u32;
+
+  let _ = mmio_write_u32(SDHCFG, 0x418 as u32);
+  let _ = mmio_write_u32(sdhbct, 8 as u32);
+  let _ = mmio_write_u32(sdhblc, 1 as u32);
+
+  let cmd55_status: u32 = sdhost_cmd(55 as u32, rca);
+  let cmd55_timed_out: i64 = sdhost_cmd_timed_out(cmd55_status);
+  let cmd55_failed: i64 = sdhost_cmd_failed(cmd55_status);
+  let _ = uart_puts("SD DIAG: SCR-read CMD55 status=0x");
+  let _ = uart_put_hex32(cmd55_status);
+  let _ = uart_puts(" timed_out=");
+  let _ = uart_put_i64(cmd55_timed_out);
+  let _ = uart_puts(" failed=");
+  let _ = uart_put_i64(cmd55_failed);
+  let _ = uart_puts(" SDHSTS=0x");
+  let _ = uart_put_hex32(mmio_read_u32(sdhsts));
+  let _ = uart_puts("\n");
+  if (cmd55_timed_out == 1) || (cmd55_failed == 1) {
+    return 0 - 1;
+  }
+
+  let cmd51_status: u32 = sdhost_cmd(sdcmd_read | (51 as u32), 0 as u32);
+  let cmd51_timed_out: i64 = sdhost_cmd_timed_out(cmd51_status);
+  let cmd51_failed: i64 = sdhost_cmd_failed(cmd51_status);
+  let _ = uart_puts("SD DIAG: ACMD51 (SEND_SCR) status=0x");
+  let _ = uart_put_hex32(cmd51_status);
+  let _ = uart_puts(" timed_out=");
+  let _ = uart_put_i64(cmd51_timed_out);
+  let _ = uart_puts(" failed=");
+  let _ = uart_put_i64(cmd51_failed);
+  let _ = uart_puts(" SDHSTS=0x");
+  let _ = uart_put_hex32(mmio_read_u32(sdhsts));
+  let _ = uart_puts("\n");
+  if (cmd51_timed_out == 1) || (cmd51_failed == 1) {
+    let _ = sdhost_cmd_report_failure("ACMD51 (SEND_SCR)", cmd51_status);
+    return 0 - 1;
+  }
+
+  let scr_buf: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = sdhost_drain_fifo_to_buffer(scr_buf, 2);
+  let edm_after_pio: u32 = mmio_read_u32(SDEDM);
+  let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
+  let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
+  let _ = mmio_write_u32(sdhsts, errs);
+  if wait_status != 0 {
+    let _ = uart_puts("SD DIAG: ACMD51 (SEND_SCR) data-phase wedge SDEDM=0x");
+    let _ = uart_put_hex32(edm_after_pio);
+    let _ = uart_puts("\n");
+    return 0 - 1;
+  }
+  if errs != (0 as u32) {
+    let _ = uart_puts("SD DIAG: ACMD51 (SEND_SCR) SDHSTS error=0x");
+    let _ = uart_put_hex32(errs);
+    let _ = uart_puts("\n");
+    return 0 - 1;
+  }
+
+  let is_4bit_capable: i64 = sd_scr_dump_and_check_4bit(scr_buf);
+  let _ = uart_puts("SD DIAG: SCR reports 4-bit support=");
+  let _ = uart_put_i64(is_4bit_capable);
+  let _ = uart_puts("\n");
+  return is_4bit_capable;
+}
+
 // TEMPORARY DIAGNOSTIC (2026-09-15): real Pi 1B hardware observed a
 // multi-minute real-world delay between GPU firmware handoff and
 // DharaFS's own first test output -- exactly the window this function
@@ -5325,6 +5421,84 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // Print-only until a fresh real-hardware capture confirms what value
   // genuinely appears there on the actual card.
 
+  // 30th SD round (2026-09-25): ACMD6 (SET_BUS_WIDTH, arg=2 -> 4-bit)
+  // -- this exact board's own device tree declares `bus-width = <4>`
+  // for the sdhost node, and the Pi 1B's SD slot really does have all
+  // four DAT lines wired (bcm2835-rpi-b.dts's own gpio-line-names:
+  // SD_DATA0_R..SD_DATA3_R). Real U-Boot's MMC core auto-negotiates
+  // 4-bit mode whenever the platform declares that capability -- this
+  // driver never has, staying 1-bit-only since Phase 3. Found while
+  // chasing a real-HW write-success-but-corrupted-data symptom: after
+  // SDHCFG_WIDE_INT_BUS (27th/28th round) finally got a write past the
+  // FSM wedge, the read-back showed a deterministic, clock-speed-
+  // independent corruption pattern with BOTH the CMD24 address and
+  // the source buffer content independently confirmed correct at
+  // write time -- consistent with the controller's internal datapath
+  // now configured wide (WIDE_INT_BUS) while the card itself has never
+  // been told to actually use more than 1 DAT line, a genuine
+  // width mismatch the controller's own FSM/FIFO bookkeeping has no
+  // way to detect as an error.
+  //
+  // Sent AFTER CMD7/CMD16 (card must be in 'tran' state, an app
+  // command like every ACMD41/ACMD6 needs CMD55 first) -- mandatory
+  // per the SD spec for any card that passed CMD8 (this function's
+  // own `is_mmc == 0` branch; MMC's own bus-width switch is a
+  // different command entirely, out of scope, matching this driver's
+  // pre-existing SD-only 4-bit handling). Diagnostic-only on failure
+  // (falls back to 1-bit / SDHCFG_WIDE_EXT_BUS staying unset) rather
+  // than a hard init failure -- matches this function's own established
+  // pattern for CMD16's CURRENT_STATE check just above: a card that
+  // doesn't support the switch for some real-world reason should still
+  // be usable at 1-bit, not brick this driver's own init.
+  if is_mmc == 0 {
+    // 30th SD round follow-up: read SCR (ACMD51) BEFORE attempting
+    // ACMD6 -- matches real U-Boot's own gating (sd_get_capabilities
+    // before sd_select_bus_width) and, since ACMD51 requires the SAME
+    // 'tran' card state ACMD6 does, doubles as a direct test of
+    // whether the problem is ACMD6-specific or upstream of any app
+    // command issued at this point (the "NOT tran" warning this file
+    // has printed on every real-HW log so far). A negative return
+    // (-1) means ACMD51 itself failed/timed out/wedged -- attempt
+    // ACMD6 anyway for comparison, but do NOT trust a "SCR says no
+    // 4-bit support" answer we never actually got.
+    let scr_result: i64 = sd_read_scr(rca);
+    let acmd6_cmd55_status: u32 = sdhost_cmd(55 as u32, rca);
+    let acmd6_cmd55_timed_out: i64 = sdhost_cmd_timed_out(acmd6_cmd55_status);
+    let acmd6_cmd55_failed: i64 = sdhost_cmd_failed(acmd6_cmd55_status);
+    let _ = uart_puts("SD DIAG: ACMD6-prefix CMD55 status=0x");
+    let _ = uart_put_hex32(acmd6_cmd55_status);
+    let _ = uart_puts(" timed_out=");
+    let _ = uart_put_i64(acmd6_cmd55_timed_out);
+    let _ = uart_puts(" failed=");
+    let _ = uart_put_i64(acmd6_cmd55_failed);
+    let _ = uart_puts(" SDHSTS=0x");
+    let _ = uart_put_hex32(mmio_read_u32(SDHSTS));
+    let _ = uart_puts("\n");
+    let acmd6_status: u32 = sdhost_cmd(6 as u32, 2 as u32);
+    let acmd6_timed_out: i64 = sdhost_cmd_timed_out(acmd6_status);
+    let acmd6_failed: i64 = sdhost_cmd_failed(acmd6_status);
+    let _ = uart_puts("SD DIAG: ACMD6 status=0x");
+    let _ = uart_put_hex32(acmd6_status);
+    let _ = uart_puts(" timed_out=");
+    let _ = uart_put_i64(acmd6_timed_out);
+    let _ = uart_puts(" failed=");
+    let _ = uart_put_i64(acmd6_failed);
+    let _ = uart_puts(" R1=0x");
+    let _ = uart_put_hex32(mmio_read_u32(sdrsp0));
+    let _ = uart_puts(" SDHSTS=0x");
+    let _ = uart_put_hex32(mmio_read_u32(SDHSTS));
+    let _ = uart_puts("\n");
+    if (acmd6_cmd55_timed_out == 1) || (acmd6_timed_out == 1) || (acmd6_cmd55_failed == 1) || (acmd6_failed == 1) || (scr_result != 1) {
+      let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH) failed/timed out, or SCR didn't confirm 4-bit -- staying 1-bit\n");
+      let _ = sd_state_set_is_4bit(0);
+    } else {
+      let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH=4-bit) accepted, SCR confirms support\n");
+      let _ = sd_state_set_is_4bit(1);
+    }
+  } else {
+    let _ = sd_state_set_is_4bit(0);
+  }
+
   // ROUND 2026-09-17 (real-hardware investigation, task #215):
   // identification-speed SDCDIV (0x148, set once above) has been left
   // in place for EVERY command this driver ever issues, including
@@ -5466,8 +5640,28 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
 // existing call site (boot sequence, the "giving up, reset for
 // whatever comes next" branch in the wedge-retry loops below) keeps
 // working unchanged, always at the standard 25MHz SD default speed.
+// 30th SD round follow-up (2026-09-25): the C write-path port
+// (boot/rpi1/uboot_sdhost_write.c, 28th round) just cleared the FSM
+// wedge for the first time in this entire saga (SDHCFG_WIDE_INT_BUS,
+// this same round) -- write now completes and reads back, but with
+// corrupted data: a real-HW dump showed word W's bytes as
+// [W,W-1,W-2,W-3] (zero-padded), the exact signature of a FIFO-
+// drain/shift-register timing artifact, not an addressing bug (both
+// the read loop's and this port's own fill loop use correct 4-byte-
+// stride word accesses, confirmed by direct re-read of both). The
+// 24th round's own real, independently-verified-correct U-Boot write
+// on this exact board+card ran at 50MHz, not this driver's own
+// "default speed" 25MHz -- never actually empirically justified on
+// real hardware, chosen only because it's the SD spec's own
+// mandatory ceiling without CMD6 high-speed negotiation. Testing
+// U-Boot's own real, proven-correct clock rate directly: 25000000 ->
+// 50000000. Global (not diagnostic-sweep-scoped) since the retry
+// ladder's own re-init calls always use this same default -- a
+// diagnostic-only override would get silently reverted by the very
+// next retry. Reads already succeed at 25MHz (task #217) -- if 50MHz
+// breaks them, that's real, informative evidence too.
 fn sdhost_init() -> i64 {
-  return sdhost_init_at_speed(25000000);
+  return sdhost_init_at_speed(50000000);
 }
 
 // CMD17 (READ_SINGLE_BLOCK) / CMD24 (WRITE_BLOCK). block_num is a
@@ -5903,7 +6097,13 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // before the FSM was ever designed to see it. 0x518 -> 0x418 (drops
   // bit8 only; SLOW_CARD/DATA_IRPT_EN/BUSY_IRPT_EN all unchanged and
   // still independently justified by their own separate findings).
-  let _ = mmio_write_u32(SDHCFG, 0x418 as u32);
+  // 30th SD round (2026-09-25): OR in SDHCFG_WIDE_EXT_BUS (bit2,
+  // 0x04) when ACMD6 confirmed the card actually switched to 4-bit --
+  // see sdhost_init_at_speed's own ACMD6 comment for the full "why".
+  // Read path already worked at 1-bit (task #217) -- this only
+  // changes anything once is_4bit is actually 1.
+  let read_sdhcfg: u32 = if sd_state_get_is_4bit() == 1 { 0x41C as u32 } else { 0x418 as u32 };
+  let _ = mmio_write_u32(SDHCFG, read_sdhcfg);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
   // DIAGNOSTIC (2026-09-19, real-hardware SD wedge investigation, per
@@ -6047,7 +6247,33 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // call site (2026-09-19 original placement) so it can also gate the
   // new pre-CMD24 instrumentation below (19th SD round, 2026-09-20).
   let use_write_diag: bool = (block_num >= 2100) && (block_num < 2108);
-  let _ = mmio_write_u32(SDHCFG, 0x408 as u32);
+  // 30th SD round (2026-09-25): found while assembling the exact
+  // SDHCFG value the 28th round's C port (boot/rpi1/uboot_sdhost_
+  // write.c) would need if it ever ported bcm2835_set_ios too --
+  // U-Boot's own bcm2835_set_ios UNCONDITIONALLY sets SDHCFG_WIDE_
+  // INT_BUS (bit1, 0x02), regardless of external bus width (only
+  // SDHCFG_WIDE_EXT_BUS, bit2, is actually conditional on 4-bit
+  // mode): "host->hcfg |= SDHCFG_WIDE_INT_BUS;" runs every single
+  // call, unconditionally, with no width check at all. This bit has
+  // never been set by this driver at any point in this entire SD-
+  // wedge investigation -- 0x408 (SLOW_CARD|BUSY_IRPT_EN) does not
+  // include it. Final U-Boot write-path value: 0x40A. Not previously
+  // flagged by any earlier round's own SDHCFG re-comparison (they
+  // each focused on the IRQ-enable/BLOCK_IRPT_EN bits, never on the
+  // WIDE_INT_BUS/WIDE_EXT_BUS pair) -- found only by needing the
+  // COMPLETE assembled value for a literal port, not by re-reading
+  // the same bits again.
+  // 30th SD round follow-up: WIDE_INT_BUS alone (0x40A) got the write
+  // past the FSM wedge for the first time, but real-HW read-back
+  // showed a deterministic, clock-speed-independent corruption
+  // pattern with both the CMD24 address and source buffer content
+  // independently confirmed correct at write time -- the controller's
+  // internal datapath configured wide while the card was never told
+  // to use more than 1 DAT line. Now OR in SDHCFG_WIDE_EXT_BUS (0x04)
+  // once ACMD6 has actually switched the card, matching WIDE_INT_BUS
+  // with a genuinely wide external bus instead of a mismatched one.
+  let write_sdhcfg: u32 = if sd_state_get_is_4bit() == 1 { 0x40E as u32 } else { 0x40A as u32 };
+  let _ = mmio_write_u32(SDHCFG, write_sdhcfg);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
   // DIAGNOSTIC (2026-09-19): see sdhost_read_block_once's own comment
@@ -37799,6 +38025,13 @@ fn kernel_main() -> i64 {
       let _ = uart_puts(" SDEDM=0x");
       let _ = uart_put_hex32(mmio_read_u32(SDEDM));
       let _ = uart_puts("\n");
+      // 30th SD round: byte-level dump on mismatch -- the first time
+      // in this saga a write has succeeded far enough for a content
+      // mismatch to be the interesting thing, not a protocol wedge.
+      let _ = uart_puts("SD DIAG: expected(w) ");
+      let _ = test_dump16(sd_buf);
+      let _ = uart_puts("SD DIAG: actual  (r) ");
+      let _ = test_dump16(sd_buf2);
     }
     sd_blk = sd_blk + 1;
   }

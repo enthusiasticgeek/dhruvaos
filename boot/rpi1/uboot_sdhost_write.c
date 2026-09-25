@@ -181,6 +181,12 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
     mmio_w(SDHBCT_ADDR, 512u);
     mmio_w(SDHBLC_ADDR, 1u);
 
+    u_puts("SD DIAG: uboot-port addr=0x");
+    u_hex32(addr);
+    u_puts(" buf0=0x");
+    u_hex32(buf[0]);
+    u_puts("\n");
+
     mmio_w(SDARG_ADDR, addr);
     sdcmd = (24u & SDCMD_CMD_MASK) | SDCMD_WRITE_CMD;
     mmio_w(SDCMD_ADDR, sdcmd | SDCMD_NEW_FLAG);

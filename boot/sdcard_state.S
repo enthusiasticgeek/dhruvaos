@@ -23,6 +23,14 @@ sd_is_sdhc:
     .word 0        /* 0 = SDSC (byte-addressed), 1 = SDHC/SDXC
                      * (block-addressed) -- from the OCR's CCS bit,
                      * valid only once ACMD41 reports busy=0 (ready) */
+sd_is_4bit:
+    .word 0        /* 30th SD round (2026-09-25): 1 once ACMD6 (SET_
+                     * BUS_WIDTH, arg=2) has been confirmed accepted --
+                     * gates whether SDHCFG_WIDE_EXT_BUS gets set on the
+                     * read/write paths. See kernel_main.vani's own
+                     * sdhost_init_at_speed comment for the full "why"
+                     * (this board's own DT declares bus-width=4, real
+                     * U-Boot auto-negotiates it, this driver never had). */
 
 .section ".text"
 
@@ -81,6 +89,21 @@ sd_state_get_rca:
 .global sd_state_get_is_sdhc
 sd_state_get_is_sdhc:
     ldr r0, =sd_is_sdhc
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global sd_state_set_is_4bit
+sd_state_set_is_4bit:
+    ldr r1, =sd_is_4bit
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global sd_state_get_is_4bit
+sd_state_get_is_4bit:
+    ldr r0, =sd_is_4bit
     ldr r0, [r0]
     mov r1, #0
     bx lr
@@ -722,6 +745,100 @@ test_cmp_equal:
     mov r0, #0
     mov r1, #0
     bx lr
+
+/* 30th SD round (2026-09-25) TEMPORARY DIAGNOSTIC: dumps the first 16
+ * bytes of a buffer as space-separated hex, to see the EXACT byte
+ * values around an early mismatch_at report from test_compare_buffers
+ * -- the first time in this entire saga a write has succeeded far
+ * enough for a content mismatch (as opposed to a protocol wedge) to
+ * be the thing worth looking at. void test_dump16(mut ref i64 buf) */
+.global test_dump16
+test_dump16:
+    push {r4, r5, lr}
+    mov r4, r0
+    mov r5, #0
+test_dump16_loop:
+    cmp r5, #16
+    beq test_dump16_done
+    ldrb r0, [r4, r5]
+    lsr r0, r0, #4
+    bl sdhost_diag_put_hex1
+    ldrb r0, [r4, r5]
+    bl sdhost_diag_put_hex1
+    mov r0, #' '
+    bl sdhost_diag_putc
+    add r5, r5, #1
+    b test_dump16_loop
+test_dump16_done:
+    mov r0, #10
+    bl sdhost_diag_putc
+    pop {r4, r5, lr}
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* 30th SD round (2026-09-25) TEMPORARY DIAGNOSTIC: prints the 8-byte
+ * SCR (SD CARD Configuration Register, ACMD51) as hex, then decodes
+ * whether the card itself reports 4-bit bus support -- real U-Boot's
+ * own sd_get_capabilities (drivers/mmc/mmc.c) checks scr[0] &
+ * SD_DATA_4BIT (bit 18 of the FIRST big-endian 32-bit word) before
+ * ever attempting ACMD6, gating a real-HW switch attempt on the
+ * card's own reported capability instead of assuming every card
+ * supports it. SCR is transmitted MSB-first on the wire (big-endian),
+ * so byte[0] is the most-significant byte of word0 -- this function
+ * reassembles it that way explicitly rather than treating the 8
+ * received bytes as two little-endian machine words.
+ * i64 sd_scr_dump_and_check_4bit(mut ref i64 buf) -- returns 1 if the
+ * card's own SCR reports 4-bit support, 0 otherwise. */
+.global sd_scr_dump_and_check_4bit
+sd_scr_dump_and_check_4bit:
+    push {r4, r5, r6, lr}
+    mov r4, r0
+    ldr r0, =sd_scr_label
+    bl sdhost_diag_puts
+    mov r5, #0
+sd_scr_dump_loop:
+    cmp r5, #8
+    beq sd_scr_dump_done
+    ldrb r0, [r4, r5]
+    lsr r0, r0, #4
+    bl sdhost_diag_put_hex1
+    ldrb r0, [r4, r5]
+    bl sdhost_diag_put_hex1
+    mov r0, #' '
+    bl sdhost_diag_putc
+    add r5, r5, #1
+    b sd_scr_dump_loop
+sd_scr_dump_done:
+    mov r0, #10
+    bl sdhost_diag_putc
+
+    /* Reassemble word0 big-endian: byte[0]<<24 | byte[1]<<16 |
+     * byte[2]<<8 | byte[3]. */
+    ldrb r0, [r4, #0]
+    lsl r0, r0, #24
+    ldrb r6, [r4, #1]
+    lsl r6, r6, #16
+    orr r0, r0, r6
+    ldrb r6, [r4, #2]
+    lsl r6, r6, #8
+    orr r0, r0, r6
+    ldrb r6, [r4, #3]
+    orr r0, r0, r6
+
+    /* SD_DATA_4BIT = bit 18 (0x00040000). */
+    ldr r6, =0x00040000
+    tst r0, r6
+    moveq r0, #0
+    movne r0, #1
+    pop {r4, r5, r6, lr}
+    mov r1, #0
+    bx lr
+
+.section ".rodata"
+sd_scr_label:
+    .asciz "SD DIAG: SCR="
+.section ".text"
 
 /* ROUND 2026-09-17 (real-hardware investigation): task #215. Real
  * Linux's bcm2835_set_clock (drivers/mmc/host/bcm2835.c) computes
