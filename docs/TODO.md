@@ -10341,3 +10341,46 @@ Verified: build clean, `phase4_milestone.py` run twice, identical to
 documented baseline both times. Commit `0ff4de7`. **Not yet real-HW
 tested** -- bundle with (or test separately from) the 28th round's
 write-path C-port build for the next real-HW retest.
+
+## 30th SD round (2026-09-25): real fix found by going deeper into U-Boot's read-side PIO -- burst-read the FIFO, matching the write-side fix exactly
+
+Following explicit user pushback that the U-Boot comparison wasn't
+deep enough, re-examined `bcm2835_transfer_block_pio`'s READ branch
+(`is_read=true`) -- the function this project's WRITE path already had
+its own burst counterpart ported from (25th-28th round), but whose
+READ half had never actually been compared. Real U-Boot: `words =
+edm_fifo_fill(edm)`, gated on `words >= min(SDDATA_FIFO_PIO_BURST(8),
+copy_words)` BEFORE reading anything, then reads that many words
+back-to-back with zero intervening polls.
+
+This project's own `sdhost_drain_fifo_to_buffer` -- used for every
+real-HW read this project has ever done, including the 128-word block
+reads task #217 validated -- read the first word the instant fill>=1,
+a deliberate 2026-09-14 "correctness first" choice made before any
+real-HW evidence existed either way. Structurally the exact same
+per-word-vs-per-burst gap the CMD24 write wedge turned out to be
+(25th round), just never exposed on the read side because a 128-word
+block's own FIFO refill cadence usually made "fill>=1" and "fill>=8"
+coincide in practice.
+
+The SCR read (ACMD51, 2 words, added this same round to gate ACMD6 on
+real card capability) was the first genuinely short transfer this
+project's drain loop has ever been exercised with, and it exposed the
+gap immediately: the received SCR's byte[1] came back 0x00 -- a real
+SD card can never report that (not even claiming mandatory 1-bit
+support) -- the same "shift register" corruption signature as the
+original write bug.
+
+Fixed: rewrote `sdhost_drain_fifo_to_buffer` to match U-Boot's real
+gate and burst read exactly, mirroring this file's own existing
+write-side burst fix's structure. Single shared function, same
+signature -- every call site (the real 512-byte block read path, the
+new SCR read) picks up the fix with no call-site changes.
+
+Verified: build clean, boots under QEMU, `phase4_milestone.py` run
+THREE times (given this touches the real production read path)
+identical to the documented baseline every time. Commit `a0bee99`.
+**Not yet real-HW tested** -- this is now the most promising fix in
+the whole investigation: it corrects a genuine, newly-found bug in
+the read path, independent of (and possibly relevant beyond) the
+write-side bus-width work from earlier this same round.
