@@ -10230,3 +10230,46 @@ hypothesis in the 23rd round) is to test one real change at a time.
 The corrected build (burst-write fix + the NOW-actually-exercising-it
 diagnostic clone) is what needs the next real-HW retest; DATA_IRPT_EN
 removal is the next candidate if burst-write alone isn't sufficient.
+
+## 27th SD round (2026-09-25): burst-write confirmed insufficient by real-HW retest, DATA_IRPT_EN removed on write path
+
+A fresh real-HW picocom log (14:31/14:39, both same build, commit
+e3f9569) was checked against the 26th round's corrected diag clone to
+confirm it genuinely exercised the burst-write fix -- not just a
+label-string coincidence. The `_diag` clone's checkpoint label is
+computed from a live cumulative word counter (`r7`), not a static
+string, so the observed sequence `w00 -> w10 -> w20 -> ... -> w80`
+means 8 real 16-word bursts (`SDDATA_FIFO_WORDS`, exactly matching
+U-Boot's own burst size), confirmed by re-reading
+`sdhost_fill_fifo_from_buffer_diag`'s own current source directly,
+not assumed.
+
+Result: **the wedge is unchanged.** All 128 words write out in
+byte-identical burst structure to U-Boot's own successful trace, yet
+SDEDM is stuck at `0x...803` (FSM=WRITEDATA) immediately after the
+transfer completes, `wait_transfer_complete` times out, the
+post-wedge CMD13 comes back dead, on every block and every retry.
+This falsifies per-word-vs-per-burst SDEDM polling as the (sole) root
+cause of the wedge -- the 25th/26th rounds' fix was necessary (it
+matches a real working reference exactly) but not sufficient.
+
+Action taken: dropped `SDHCFG_DATA_IRPT_EN` (bit4) from
+`sdhost_write_block_once`'s own SDHCFG write, `0x418 -> 0x408` --
+the one other concrete difference the 26th round's full U-Boot
+re-comparison found (U-Boot's own polling-only write path never sets
+this bit). Write-path only; the read path (`sdhost_read_block_once`,
+still `0x418`) is left untouched since reads already work (task
+#217, real-HW confirmed) and there's no reason to risk regressing a
+working path while isolating a write-only variable.
+
+Verified: build clean, `phase4_milestone.py` run twice, identical
+pass/fail set to a baseline build of the immediately-prior commit
+(e3f9569, `git stash`-verified) -- the 6 FAILs
+(tcprtx/tlsecho/httpecho/mqttecho/ls/diagnose) are the long-documented
+pre-existing artifact, not a new regression from this change. Commit
+`4c6bff9`.
+
+**Still needs its first real-HW retest.** If 0x408 alone doesn't
+clear the wedge, revert to 0x418 before trying the next candidate
+(the `bcm2835_send_cmd` pre-command FSM-idle gate is the next
+concrete idea on the list, though considered less likely).
