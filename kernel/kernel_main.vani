@@ -5368,6 +5368,22 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let div3: i64 = div2 - 2;
     let div4: i64 = if div3 > max_div { max_div } else { div3 };
     let _ = mmio_write_u32(sdcdiv, div4 as u32);
+    // 28th SD round follow-up (2026-09-25): U-Boot's own bcm2835_
+    // set_clock does NOT stop at writing SDCDIV -- it also rewrites
+    // SDTOUT to the ACHIEVED clock (core_clock_hz/(div+2), not the
+    // originally requested target_hz) divided by 2: "Set the timeout
+    // to 500ms". This driver's own SDTOUT write (0xF00000, matching
+    // U-Boot's own reset_internal value) happens exactly ONCE, during
+    // reset, and is never revisited once the data-transfer clock is
+    // set -- found by porting this function's full sequence literally
+    // (see boot/rpi1/uboot_sdhost_write.c's own header comment for
+    // the same-round write-path port this mirrors), not by guessing.
+    // U-Boot's own low-speed branch (clock < 100000) deliberately
+    // does NOT touch SDTOUT at all -- matched here by only computing
+    // this when the data-transfer clock switch itself is happening
+    // (inside this same `if`, not the `else` fallback branch below).
+    let achieved_clock_hz: i64 = core_clock_hz / (div4 + 2);
+    let _ = mmio_write_u32(sdtout, (achieved_clock_hz / 2) as u32);
     // ROUND 2026-09-18 (SD wedge investigation, fresh real-HW log
     // picocom_20260918_163633.log): a real, new, narrowing finding --
     // the write wedge now reproduces on the VERY FIRST write command
