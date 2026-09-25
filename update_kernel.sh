@@ -11,22 +11,22 @@
 #
 # Safety: unlike flash_sd_card.sh, this never partitions or formats
 # anything -- worst case here is overwriting the wrong device's own
-# kernel.img file. Still checks the target is a block device sized
-# like the one known 64GB card on this machine (not any other disk)
-# before touching it, and shows the boot partition's own existing
-# contents for a last visual check before overwriting.
+# kernel.img file. No longer gated on a specific card size (2026-09-25:
+# removed the original 55-68GB/"the one 64GB card" range check at the
+# user's own explicit request -- media in use now varies, e.g. the
+# 16GB card from the SD-wedge card-independence test). The real safety
+# net is the existing-boot-files check further down (bootcode.bin/
+# start.elf/fixup.dat/config.txt must already be present) -- that
+# confirms this is genuinely an already-flashed Dhruva card regardless
+# of its size, which size alone never actually verified anyway (a
+# same-sized WRONG device would have passed the old check too). Still
+# checks the target is a real block device, and shows the boot
+# partition's own existing contents for a last visual check before
+# overwriting.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOUNT_POINT="/tmp/dhruva_sdcard_mount_$$"
-
-# The one real card this project has flashed is a 64GB unit -- actual
-# reported capacity for "64GB" media is almost always a bit under that
-# (flash/SD vendors count in decimal GB, block devices report binary
-# bytes), so this checks a wide-but-still-specific band rather than an
-# exact byte count.
-MIN_BYTES=$((55 * 1000 * 1000 * 1000))
-MAX_BYTES=$((68 * 1000 * 1000 * 1000))
 
 if [ "$#" -ne 1 ]; then
     echo "Usage: $0 <device, e.g. /dev/sdb>" >&2
@@ -46,14 +46,7 @@ if [ ! -f "$ROOT/build/dhruva.elf" ]; then
 fi
 
 SIZE_BYTES=$(sudo blockdev --getsize64 "$DEVICE")
-if [ "$SIZE_BYTES" -lt "$MIN_BYTES" ] || [ "$SIZE_BYTES" -gt "$MAX_BYTES" ]; then
-    echo "ERROR: $DEVICE is ${SIZE_BYTES} bytes -- not in the expected" >&2
-    echo "55-68GB range for the known Dhruva SD card. Refusing to" >&2
-    echo "continue -- this does not look like the right device." >&2
-    exit 1
-fi
-
-echo "=== Target device (size check passed: ${SIZE_BYTES} bytes) ==="
+echo "=== Target device (${SIZE_BYTES} bytes -- VERIFY this is your SD card) ==="
 lsblk "$DEVICE"
 echo
 
