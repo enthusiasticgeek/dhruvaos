@@ -362,24 +362,44 @@ sdhost_fill_done:
  * 128-word/512-byte transfer).
  *
  * i64 sdhost_fill_fifo_from_buffer_diag(mut ref i64 buf, i64 word_count)
- * -- byte-for-byte the same fill loop as sdhost_fill_fifo_from_buffer
- * above, PLUS a blocking raw UART register dump immediately before the
- * very first write (word index 0, i.e. right after CMD24's own NEW_FLAG
- * cleared, before this function has touched SDDATA at all), immediately
- * after the first write, and after every subsequent 16-word batch.
- * Deliberately NOT the vani-level uart_puts (unsafe to call mid-
- * critical-section from hand-written asm with no established calling
- * convention for it here) or the async ring-buffer path (non-blocking,
- * could drop exactly the bytes this diagnostic exists to capture) --
- * same reasoning and same technique as this project's own earlier
- * task #253 diagnostic (context_switch.S, since removed). Write-path
- * ONLY: the read path already works (task #217's own READDATA fix,
- * confirmed on real hardware) and is deliberately left untouched to
- * avoid any risk of regressing it. To be removed once the write wedge
- * is root-caused. */
+ *
+ * 25th SD round (2026-09-25) CORRECTNESS FIX: this diagnostic clone had
+ * silently drifted out of sync with the real fix. sdhost_fill_fifo_
+ * from_buffer_impl was restructured this same round to burst-write
+ * (poll SDEDM once, write multiple words back-to-back -- see that
+ * function's own header comment for the full real-HW-comparison-
+ * derived root cause), but THIS function -- the one the 8-block sweep
+ * (block_num 2100-2107) actually calls for every real-HW SD-wedge test
+ * in this entire saga -- still used the OLD per-word-poll structure
+ * untouched. A real-HW retest after the burst-write fix landed showed
+ * the identical wedge signature, byte-for-byte, as every prior round;
+ * only on close comparison did it become clear why: the fix was never
+ * actually exercised by this test at all. Restructured to match
+ * _impl's own burst-write loop exactly (same poll-once/write-multiple
+ * logic), with the register dump now firing once per REAL burst
+ * (whatever size the FIFO's own room happened to allow) instead of at
+ * fixed 16-word marks that no longer necessarily align with an actual
+ * burst boundary -- still bounded (at most 128 dumps, same worst case
+ * as before bursting existed, since the smallest possible burst is 1
+ * word), and this function remains genuinely diagnostic/unmasked
+ * (still no cpsid if/cpsie if) -- only the production path (_impl)
+ * needs the syscall #5 masking, this one exists purely to observe.
+ *
+ * Blocking raw UART register dump immediately before the very first
+ * write (before this function has touched SDDATA at all), then again
+ * after every burst through the full transfer. Deliberately NOT the
+ * vani-level uart_puts (unsafe to call mid-critical-section from hand-
+ * written asm with no established calling convention for it here) or
+ * the async ring-buffer path (non-blocking, could drop exactly the
+ * bytes this diagnostic exists to capture) -- same reasoning and same
+ * technique as this project's own earlier task #253 diagnostic
+ * (context_switch.S, since removed). Write-path ONLY: the read path
+ * already works (task #217's own READDATA fix, confirmed on real
+ * hardware) and is deliberately left untouched to avoid any risk of
+ * regressing it. To be removed once the write wedge is root-caused. */
 .global sdhost_fill_fifo_from_buffer_diag
 sdhost_fill_fifo_from_buffer_diag:
-    push {r4, r5, r6, r7, r8, lr}
+    push {r4, r5, r6, r7, r8, r9, lr}
     mov r8, r0                /* r8 = buffer pointer, kept persistent
                                * here (NOT auto-incremented via r0 the
                                * way the non-diag version does) since
@@ -389,14 +409,12 @@ sdhost_fill_fifo_from_buffer_diag:
                                * _put_hex32/_dump_regs_body ever touch
                                * r4-r11, so r8 survives all of them
                                * untouched */
-    mov r4, r2               /* r4 = word_count */
-    mov r7, #0                /* r7 = words written so far */
-    ldr r6, =0x20202034      /* SDEDM -- still used for the FIFO-room
-                               * poll below; dump_regs_body re-reads it
-                               * (and every other register) fresh each
-                               * time it's called, independent of r6 */
+    mov r4, r2               /* r4 = word_count remaining */
+    mov r7, #0                /* r7 = cumulative words written so far,
+                               * for the checkpoint label only */
+    ldr r6, =0x20202034      /* SDEDM */
 
-    /* word index 0: before any write at all -- full register dump */
+    /* before any write at all -- full register dump */
     ldr r0, =sdhost_diag_w0
     bl sdhost_diag_puts
     bl sdhost_diag_dump_regs_body
@@ -404,55 +422,42 @@ sdhost_fill_fifo_from_buffer_diag:
 sdhost_fill_diag_loop:
     cmp r4, #0
     beq sdhost_fill_diag_done
-    ldr r5, =100000
+    ldr r5, =100000            /* bounded burst-readiness retry cap --
+                               * this function is genuinely unmasked, so
+                               * the large shared constant is correct
+                               * here, unlike _impl's own masked-loop-
+                               * specific 1000 */
 sdhost_fill_diag_poll:
     ldr r0, [r6]
     mov r0, r0, lsr #4
-    and r0, r0, #0x1F
-    cmp r0, #16
-    blt sdhost_fill_diag_ready
+    and r0, r0, #0x1F         /* r0 = current FIFO fill count */
+    rsb r9, r0, #16           /* r9 = room = SDDATA_FIFO_WORDS(16) - fill,
+                               * matching _impl's own burst-write logic
+                               * exactly */
+    cmp r9, #0
+    bgt sdhost_fill_diag_have_room
     subs r5, r5, #1
     bne sdhost_fill_diag_poll
-sdhost_fill_diag_ready:
+    mov r9, #1                 /* retry cap exhausted -- force a 1-word
+                               * burst, same "give up and write anyway"
+                               * contract as _impl */
+sdhost_fill_diag_have_room:
+    cmp r9, r4
+    movgt r9, r4               /* clamp burst size to remaining word count */
+    sub r4, r4, r9
+    add r7, r7, r9             /* r7 = cumulative words after this burst,
+                               * for the checkpoint label below */
+    ldr r1, =0x20202040       /* SDDATA */
+sdhost_fill_diag_burst:
     ldr r0, [r8], #4          /* r0 = next word from the buffer, buffer
                                * pointer advances */
-    ldr r1, =0x20202040       /* SDDATA */
     str r0, [r1]
-    sub r4, r4, #1
-    add r7, r7, #1
+    subs r9, r9, #1
+    bne sdhost_fill_diag_burst
 
-    /* Full register dump right after word 1 (immediately after the
-     * FIRST SDDATA write, the user's own explicit request), then after
-     * every 16-word FIFO batch boundary through the full 128-word
-     * transfer -- r4/r6/r7/r8 must survive these calls (confirmed:
-     * every diag helper below only touches r0-r3, never r4-r11). */
-    cmp r7, #1
-    beq sdhost_fill_diag_snap
-    cmp r7, #16
-    beq sdhost_fill_diag_snap
-    cmp r7, #32
-    beq sdhost_fill_diag_snap
-    cmp r7, #48
-    beq sdhost_fill_diag_snap
-    cmp r7, #64
-    beq sdhost_fill_diag_snap
-    cmp r7, #80
-    beq sdhost_fill_diag_snap
-    cmp r7, #96
-    beq sdhost_fill_diag_snap
-    cmp r7, #112
-    beq sdhost_fill_diag_snap
-    cmp r7, #128
-    beq sdhost_fill_diag_snap
-    b sdhost_fill_diag_loop
-sdhost_fill_diag_snap:
-    /* BUG caught before shipping (QEMU verification, 2026-09-19): r7
-     * (words written so far) can be 16 at this point, but sdhost_diag_
-     * put_hex1 only ever prints a single nibble (`and r0,r0,#0xF`) --
-     * 16 truncates to 0, mislabeling this checkpoint "w0" (same text
-     * as the pre-write snapshot) instead of "w16", even though the
-     * register VALUES captured are correct either way. Two hex digits
-     * (00/01/10/20/30/40/50/60/70/80) removes the ambiguity. */
+    /* Full register dump after every real burst -- r4/r6/r7/r8 must
+     * survive the calls below (confirmed: every diag helper only
+     * touches r0-r3, never r4-r11). */
     ldr r0, =sdhost_diag_wn
     bl sdhost_diag_puts
     mov r0, r7, lsr #4
@@ -464,7 +469,7 @@ sdhost_fill_diag_snap:
     bl sdhost_diag_dump_regs_body
     b sdhost_fill_diag_loop
 sdhost_fill_diag_done:
-    pop {r4, r5, r6, r7, r8, lr}
+    pop {r4, r5, r6, r7, r8, r9, lr}
     mov r0, #0
     mov r1, #0
     bx lr
