@@ -9960,3 +9960,65 @@ point than "duration constants, maybe" -- rate-limit/reduce demo-task
 status-print volume, or move the harness to pattern-based readiness
 detection instead of blind `SETTLE_S`, BEFORE the next tick-rate
 attempt, not concurrently with one.
+
+### Twenty-third SD round: real-HW retest of the syscall #5 masking fix -- THE WEDGE STILL PERSISTS, hypothesis falsified (2026-09-25)
+
+Fresh real-HW log (`picocom_20260925_083346.log`, 8:33am), the first
+capture with the 21st/22nd rounds' own IRQ/FIQ-masking fix (task
+#284/#285) actually flashed and running. **Result: no change.** Every
+single write attempt across 4 fully-completed blocks (2100-2103) ends
+in the EXACT SAME signature every prior round in this 22-round saga
+has shown: `SDEDM=0x00010803` (FSM=WRITEDATA/3) after the full 128-word
+fill completes, `wait_transfer_complete timeout, alternate_idle=
+0x0000000A`, then `post-wedge CMD13... timed out -- controller too
+wedged to respond`. This happens with IRQ+FIQ now PROVABLY masked for
+the entire fill loop (syscall #5) -- **directly falsifying this whole
+three-round hypothesis** (missing interrupt masking as the write
+wedge's root cause). The masking fix itself was real, well-supported by
+a direct Linux-reference match, and worth having built regardless (it
+closed a genuine gap versus the reference driver, and task #285's own
+worst-case-latency fix and schedulability corrections stand on their
+own merit) -- but it was not, or not solely, what has been wedging this
+controller for 22 rounds.
+
+Two secondary observations, BOTH already-known phenomena recurring, not
+new leads:
+- `SD/MMC: CMD24 (WRITE_BLOCK) FAILED (SDCMD_FAIL_FLAG set)` fires on
+  the first write sub-attempt for every block after the first (2101,
+  2102, 2103) -- this is the exact, already-documented "a write issued
+  immediately after a successful read, with no intervening controller
+  reinit, sometimes fails outright on CMD24 itself" artifact
+  (kernel_main.vani's own `sdhost_force_data_mode_settle` header
+  comment, predating this session). The 8-block sweep's own write-
+  then-read-then-compare-per-block structure naturally reproduces this
+  exact adjacency for every block but the first. Recovers via the
+  existing retry-with-reinit logic every time (attempt 2 always reaches
+  the normal full data phase) -- not itself blocking anything, just
+  visible again because THIS log is the first one whose per-block
+  retry sequence happens to hit it repeatedly.
+- `SD DIAG: post-CMD16 R1=... CURRENT_STATE=13 (NOT tran -- CMD7 did
+  NOT actually select the card!)` fires on every single `sdhost_init`.
+  This print has existed since before this session specifically
+  "print-only until a fresh real-hardware capture confirms what value
+  genuinely appears there" (its own header comment) -- now answered:
+  13, not 4. Still not a real problem: the VERY NEXT command (CMD13,
+  pre-CMD24) always correctly reports `CURRENT_STATE=4` (tran) instead
+  -- the same class of readback-unreliable field this saga's own 19th
+  round already found for SDARG. Left as diagnostic-only, unchanged.
+
+**Open question, not resolved from the log alone**: the capture ends
+abruptly mid-way through block 2104's third write attempt (right after
+`post-write(w80)`, no `wait_transfer_complete timeout` line following
+it the way every prior wedge in this SAME log did) -- ambiguous whether
+the picocom session was manually stopped at that exact moment or the
+board was genuinely unresponsive. Needs the user to confirm which.
+
+**Where this leaves the search**: back to genuinely open, with the
+interrupt-masking hypothesis now ruled out by direct real-HW evidence
+rather than just unproven. 23 rounds in, the "PIO fill loop structure
+differs from Linux's own reference loop" thread from the 20th round's
+own writeup remains the one avenue never yet directly pursued (an
+actual side-by-side structural/assembly comparison of `sdhost_fill_
+fifo_from_buffer_impl` against Linux's `bcm2835_sdhost_write_block_pio`
+beyond just the interrupt-masking difference already checked) -- not
+started this round, pending direction.
