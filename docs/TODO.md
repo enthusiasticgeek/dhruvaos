@@ -10384,3 +10384,32 @@ identical to the documented baseline every time. Commit `a0bee99`.
 the whole investigation: it corrects a genuine, newly-found bug in
 the read path, independent of (and possibly relevant beyond) the
 write-side bus-width work from earlier this same round.
+
+## 30th SD round follow-up: same burst-gate bug found on the write side too
+
+Cross-checking the just-fixed read-side burst gate against U-Boot's
+own write-side gate (both use the identical structure: `words < min
+(SDDATA_FIFO_PIO_BURST(8), copy_words)`) found the SAME asymmetry, in
+the direction that had been missed before: `sdhost_fill_fifo_from_
+buffer_impl` -- the PRODUCTION write path used by every real DharaFS
+write, not the 28th round's C-port diagnostic sweep, which already had
+this exact gate correct -- used `room > 0` (proceed with any nonzero
+room) instead of `room >= min(8, remaining)`. Never caught by the
+25th-26th round's own burst-write fix because that only verified the
+burst SIZE matched a real trace (16-word bursts observed), never the
+READINESS GATE itself -- which happens to coincide with room>0 in the
+common case (FIFO fully drained or fully available) but not in
+general.
+
+Fixed both `sdhost_fill_fifo_from_buffer_impl` and its `_diag` twin
+to match. `_diag` is confirmed dead code now (unreachable -- the
+C-port early-return fires first for every diagnostic-sweep block) --
+fixed for consistency, flagged safe to delete once the real-HW retest
+lands.
+
+Verified: build clean, boots under QEMU, `phase4_milestone.py` run
+THREE times, identical to documented baseline every time. Commit
+`26ac248`. **Not yet real-HW tested** -- this is now genuinely the
+most complete fix in the whole saga: both read and write PIO paths
+match U-Boot's real gate-then-burst semantics exactly, not just the
+burst size.
