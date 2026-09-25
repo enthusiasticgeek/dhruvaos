@@ -5987,8 +5987,28 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
 // See sdhost_read_block_once's own header comment for the SDHCFG
 // reasoning (the original 0x510 IRQ-enable bits, the 2026-09-18
 // SDHCFG_SLOW_CARD addition 0x510 -> 0x518, and the 2026-09-19
-// BLOCK_IRPT_EN removal 0x518 -> 0x418) -- identical fix, identical
-// justification, same read/write-symmetric register.
+// BLOCK_IRPT_EN removal 0x518 -> 0x418) -- shared history up through
+// 0x418, now DIVERGES from the read path below.
+//
+// 26th SD round (2026-09-25): the burst-write fix (25th round, commit
+// ba3ef0f) was confirmed genuinely exercised by a corrected real-HW
+// test (diag clone fix, commit 1a76e87) -- full 128-word block written
+// in clean 16-word bursts, byte-identical in structure to U-Boot's own
+// working trace -- and the wedge STILL occurred, FSM stuck at
+// WRITEDATA(3) after the transfer completes, every block, every retry.
+// This falsifies per-word-vs-per-burst polling as the (sole) root
+// cause and reopens the one other real difference found by the full
+// U-Boot bcm2835_sdhost.c re-comparison the same round: U-Boot's own
+// successful write path never sets SDHCFG_DATA_IRPT_EN (bit4, 0x10),
+// even though it (like this driver) is polling-only, never interrupt-
+// controller-driven, for this operation. Write-path ONLY (0x418 ->
+// 0x408): the read path already works (task #217, confirmed real-HW)
+// and is deliberately left untouched, matching this file's own
+// existing "don't touch a working path while isolating a write-only
+// variable" discipline (see sdhost_fill_fifo_from_buffer_diag's header
+// comment for the same reasoning applied to the FIFO loop). If this
+// alone doesn't clear the wedge, revert to 0x418 before trying the
+// next candidate -- one variable at a time.
 fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -6002,7 +6022,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // call site (2026-09-19 original placement) so it can also gate the
   // new pre-CMD24 instrumentation below (19th SD round, 2026-09-20).
   let use_write_diag: bool = (block_num >= 2100) && (block_num < 2108);
-  let _ = mmio_write_u32(SDHCFG, 0x418 as u32);
+  let _ = mmio_write_u32(SDHCFG, 0x408 as u32);
   let _ = mmio_write_u32(sdhbct, 512 as u32);
   let _ = mmio_write_u32(sdhblc, 1 as u32);
   // DIAGNOSTIC (2026-09-19): see sdhost_read_block_once's own comment
