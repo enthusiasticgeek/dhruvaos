@@ -10541,20 +10541,33 @@ fn spn_shadow_new_algorithm(tick: u32) -> u32 {
   return result;
 }
 
-// Mirrors scheduler_pick_next's own round-75 gate exactly: the OLD
-// (ties-favor-incumbent) algorithm only applies when current_task is
-// both ready right now AND currently ceiling-boosted (eff_prio <
-// base_prio) -- otherwise the fair round-robin-with-aging algorithm
-// applies, current competing on equal footing with everyone else.
+// Task #287 (2026-09-25) fix: this gate used to mirror scheduler_pick_
+// next's own PRE-task-#253 round-75 gate ("eff_prio < base_prio") --
+// stale since task #253 (2026-09-19) replaced that exact proxy in the
+// REAL function with a direct ceiling_depth_table[current] > 0 read,
+// specifically because the proxy breaks whenever a task's own base_
+// prio already equals the ceiling it locks at (task_a/HIGH's case --
+// see ceiling_depth_table's own header comment, context_switch.S, for
+// the full incident). This shadow predictor was never updated to
+// match at the time, found during task #286's own 16-priority-level
+// work (comparing the two functions side by side to make sure the
+// synthetic test scenario was trustworthy) -- no observable mismatch
+// in the live demo set today (ceiling id 0 is the global-minimum
+// priority, so both the old and new gate happen to agree in every
+// scenario actually exercised), but a real, latent divergence between
+// the model and the real function it's supposed to mirror. Fixed by
+// mirroring the real gate exactly, same accessor task #280's own
+// eviction-skip-gate fix already established as the correct one to use
+// (ceiling_depth_table_get_at).
 #[no_heap]
 fn scheduler_pick_next_shadow_predict() -> u32 {
   let tick: u32 = scheduler_get_tick_count();
   let current: u32 = current_task_get();
   let current_ready: i64 = spn_shadow_is_ready(current, tick);
   let current_eff: u32 = eff_prio_table_get_at(current);
-  let current_base: u32 = base_prio_table_get_at(current);
+  let current_ceiling_depth: u32 = ceiling_depth_table_get_at(current);
 
-  if (current_ready == 1) && (current_eff < current_base) {
+  if (current_ready == 1) && (current_ceiling_depth > (0 as u32)) {
     return spn_shadow_old_algorithm(current, current_eff, tick);
   }
   return spn_shadow_new_algorithm(tick);
