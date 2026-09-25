@@ -464,27 +464,51 @@ sdhost_fill_loop:
 sdhost_fill_poll:
     ldr r2, [r6]
     mov r2, r2, lsr #4
-    and r2, r2, #0x1F        /* r2 = current FIFO word count */
-    rsb r7, r2, #16          /* r7 = room = SDDATA_FIFO_WORDS(16) - fill,
+    and r2, r2, #0x1F        /* r2 = current FIFO fill count */
+    rsb r2, r2, #16          /* r2 = room = SDDATA_FIFO_WORDS(16) - fill,
                                * matching U-Boot's own bcm2835_sdhost.c
                                * (confirmed identical constant) */
-    cmp r7, #0
-    bgt sdhost_fill_have_room
+    mov r7, #8                /* SDDATA_FIFO_PIO_BURST -- 30th SD round:
+                               * this function's own gate used to be
+                               * `room > 0` (proceed with ANY nonzero
+                               * room), looser than U-Boot's real gate.
+                               * Found by direct comparison after fixing
+                               * the exact same read-side gap in
+                               * sdhost_drain_fifo_to_buffer this same
+                               * round -- U-Boot's real write gate is
+                               * `room < min(SDDATA_FIFO_PIO_BURST(8),
+                               * copy_words)`, the SAME strict threshold
+                               * as reads, not just `room==0`. This
+                               * production write path (used by every
+                               * real DharaFS write, not just the 28th
+                               * round's C-port diagnostic sweep, which
+                               * already had this exact gate correct)
+                               * never got the same correction. */
+    cmp r7, r4
+    movgt r7, r4              /* r7 = burst_words = min(8, remaining) */
+    cmp r2, r7
+    bge sdhost_fill_have_room
     subs r5, r5, #1
     bne sdhost_fill_poll
-    mov r7, #1                /* retry cap exhausted -- force a 1-word
+    mov r2, #1                /* retry cap exhausted -- force a 1-word
                                * burst rather than spin forever, matching
                                * this function's own pre-existing "give up
                                * and write anyway" contract exactly */
 sdhost_fill_have_room:
-    cmp r7, r4
-    movgt r7, r4              /* clamp burst size to remaining word count */
-    sub r4, r4, r7
-    ldr r2, =0x20202040      /* SDDATA */
+    cmp r2, r4
+    movgt r2, r4              /* actual burst size = min(room, remaining)
+                               * -- NOT clamped to burst_words, matching
+                               * U-Boot's own real semantics: the gate
+                               * only decides READINESS, the burst
+                               * itself writes everything there's room
+                               * for */
+    sub r4, r4, r2
+    ldr r7, =0x20202040      /* SDDATA -- r7's burst_words role is done,
+                               * safe to reuse */
 sdhost_fill_burst:
     ldr r3, [r0], #4
-    str r3, [r2]
-    subs r7, r7, #1
+    str r3, [r7]
+    subs r2, r2, #1
     bne sdhost_fill_burst
     b sdhost_fill_loop
 sdhost_fill_done:
@@ -585,11 +609,21 @@ sdhost_fill_diag_poll:
     ldr r0, [r6]
     mov r0, r0, lsr #4
     and r0, r0, #0x1F         /* r0 = current FIFO fill count */
-    rsb r9, r0, #16           /* r9 = room = SDDATA_FIFO_WORDS(16) - fill,
-                               * matching _impl's own burst-write logic
-                               * exactly */
-    cmp r9, #0
-    bgt sdhost_fill_diag_have_room
+    rsb r9, r0, #16           /* r9 = room = SDDATA_FIFO_WORDS(16) - fill */
+    mov r0, #8                 /* SDDATA_FIFO_PIO_BURST -- 30th SD round:
+                               * matches _impl's own same-round fix
+                               * (room>0 -> room>=min(8,remaining)). This
+                               * function is now dead code (kernel_main.
+                               * vani's own call site is unreachable --
+                               * the 28th round's C-port early-return
+                               * fires first for every use_write_diag
+                               * block), fixed anyway for consistency;
+                               * safe to delete entirely once the 30th
+                               * round's real-HW retest confirms the fix. */
+    cmp r0, r4
+    movgt r0, r4                /* r0 = burst_words = min(8, remaining) */
+    cmp r9, r0
+    bge sdhost_fill_diag_have_room
     subs r5, r5, #1
     bne sdhost_fill_diag_poll
     mov r9, #1                 /* retry cap exhausted -- force a 1-word
@@ -597,7 +631,7 @@ sdhost_fill_diag_poll:
                                * contract as _impl */
 sdhost_fill_diag_have_room:
     cmp r9, r4
-    movgt r9, r4               /* clamp burst size to remaining word count */
+    movgt r9, r4               /* actual burst size = min(room, remaining) */
     sub r4, r4, r9
     add r7, r7, r9             /* r7 = cumulative words after this burst,
                                * for the checkpoint label below */
