@@ -10080,3 +10080,73 @@ already captures, rebuilding, and having the user re-run the same
 trace -- something no amount of further source-reading can produce --
 to diff directly against DhruvaOS's own abundant failing traces from
 every prior round. Not started, pending direction.
+
+### Twenty-fifth SD round: the actual root cause, found by diffing a real successful trace against 24 rounds of failing ones -- fix implemented (2026-09-25)
+
+Direct continuation of the 24th round. Instrumented U-Boot's own
+`bcm2835_sdhost.c` write path (`drivers/mmc/bcm2835_sdhost.c` in the
+local build tree, `~/source/sdwedge-uboot-test`) with checkpoints
+matching DhruvaOS's own SD DIAG labels exactly (`pre-CMD24`,
+`post-CMD24-cmd-complete`, per-burst, `post-PIO`, `wait_transfer_
+complete`), rebuilt, had the user re-run the same `mmc write`/`mmc
+read`/`cmp.b` test at block 2100. **Result: a real, complete,
+successful register-level trace, for the first time in 24 rounds.**
+
+Direct comparison at the exact same checkpoint (`post-PIO`, right
+after the fill loop finishes writing every word, before waiting for
+completion) is unambiguous:
+- DhruvaOS, every real-HW attempt across all 24 prior rounds:
+  `SDEDM=0x...803`, FSM=WRITEDATA(3) -- stuck, never progresses.
+- U-Boot's own real, successful write, same checkpoint: `SDEDM=
+  0x...807`, FSM=WRITEWAIT1(7) -- the hardware has ALREADY
+  autonomously started leaving WRITEDATA on its own by the time the
+  fill loop returns, no software intervention needed.
+
+FSM=WRITEDATA itself was never the bug -- it's the normal state
+during active transfer (U-Boot's own trace shows it repeatedly too,
+in every mid-transfer burst: `0a`(WRITESTART1) -> `53`/`03`/`23`/
+`13`(WRITEDATA, 11 bursts) -> `07`(WRITEWAIT1) -> `01`(DATAMODE/idle)
+at the final check). The bug is that DhruvaOS's own transfer never
+triggers the hardware's own natural WRITEDATA-to-WRITEWAIT1 exit the
+way U-Boot's does.
+
+**Root cause identified**: U-Boot's own `bcm2835_transfer_block_pio`
+polls SDEDM ONCE to compute available FIFO room, then writes MULTIPLE
+words back-to-back with ZERO intervening register reads (`words =
+min(SDDATA_FIFO_WORDS(16) - fifo_fill(edm), copy_words)`, then a tight
+write loop). DhruvaOS's own `sdhost_fill_fifo_from_buffer_impl`
+instead polled SDEDM before EVERY SINGLE word -- 128 separate MMIO
+reads interleaved between the 128 SDDATA writes for one block, every
+one a real bus transaction on real silicon, where U-Boot's reference
+has none between words in the same burst. Working theory, well-
+supported by this real-HW comparison but not independently proven
+beyond it: the controller needs the LAST few words of a block written
+in a tight, minimal-gap cadence for its own internal FSM to correctly
+recognize "block complete" and leave WRITEDATA -- DhruvaOS's own
+per-word polling overhead was apparently enough gap to prevent that
+recognition from ever firing, every single time, on every real-HW
+attempt across 24 rounds.
+
+**Fixed**: restructured `sdhost_fill_fifo_from_buffer_impl` (`boot/
+sdcard_state.S`) to match -- poll SDEDM once per burst, clamp to
+remaining word count, write that many words back-to-back, repeat.
+Bounded retry (still 1000, task #285's own figure) now gates finding
+ANY room for the next burst rather than a single word; if ever
+exhausted, forces a 1-word burst to guarantee forward progress,
+preserving the function's own pre-existing "give up and write anyway"
+contract exactly. New callee-saved scratch register (r7) for the
+burst word-counter. Worst-case masked duration is unchanged from task
+#285's own 41.984ms figure -- the pathological case (room=1 found
+every single outer-loop pass) still bounds the total iteration count
+identically to the old per-word loop; bursting only improves the
+typical case.
+
+Built clean, two identical `phase4_milestone.py` runs: known baseline
+unchanged (only the already-accepted `tcprtx` artifact), SD 8-block
+round-trip sweep still `any_fail=00000000` under QEMU. Like every fix
+in this 25-round saga, QEMU never reproduced the wedge in the first
+place, so this can only confirm no regression -- **needs a real-HW
+retest to confirm the fix actually works**, but this is the first
+fix in the entire saga backed by a direct, mechanistic, real-hardware
+comparison against a known-working reference, not source-reading or
+protocol-timeout reasoning alone.

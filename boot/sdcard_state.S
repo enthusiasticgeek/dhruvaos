@@ -235,40 +235,107 @@ sdhost_drain_done:
  * error check catch it" contract (this function's own file-level
  * comment, unchanged since 2026-09-14), only how long it waits before
  * falling back on that already-existing safety net. */
+/* 25th SD round (2026-09-25): THE ACTUAL ROOT CAUSE, found by real-HW
+ * comparison against a WORKING reference driver on THIS exact board
+ * (task #284's own IRQ-masking fix, ruled out by real-HW retest, led
+ * directly here -- see docs/TODO.md's own "24th SD round" for the full
+ * story: built U-Boot for this exact BCM2835/Pi-1B target, added
+ * matching SDCMD/SDARG/SDHBCT/SDHBLC/SDHSTS/SDEDM checkpoints to its
+ * own bcm2835_sdhost.c write path -- the SAME controller, confirmed by
+ * matching bus address -- and captured a REAL successful write trace
+ * for the first time in this entire saga).
+ *
+ * The direct comparison at the exact same checkpoint ("post-PIO",
+ * immediately after the software fill loop finishes writing every
+ * word, before waiting for transfer completion) is unambiguous:
+ *   DhruvaOS (EVERY real-HW attempt, all 24 prior rounds): SDEDM=
+ *     0x...803, FSM=WRITEDATA(3) -- stuck, never progresses.
+ *   U-Boot's own real, successful write, same checkpoint: SDEDM=
+ *     0x...807, FSM=WRITEWAIT1(7) -- the hardware has ALREADY
+ *     autonomously started leaving WRITEDATA on its own, no software
+ *     intervention, by the time the fill loop returns.
+ * FSM=WRITEDATA itself was never the bug -- it's the NORMAL state
+ * during active transfer (U-Boot's own successful trace shows it
+ * repeatedly too, in every mid-transfer burst). The bug is that
+ * DhruvaOS's own transfer never triggers the hardware's own natural
+ * WRITEDATA-to-WRITEWAIT1 exit the way U-Boot's does.
+ *
+ * The one structural difference between the two loops: U-Boot's own
+ * bcm2835_transfer_block_pio (confirmed directly in its source,
+ * drivers/mmc/bcm2835_sdhost.c) polls SDEDM ONCE per available-room
+ * check, then writes MULTIPLE words back-to-back with ZERO
+ * intervening register reads (room = SDDATA_FIFO_WORDS(16) -
+ * fifo_fill(edm); words = min(room, copy_words); tight write loop).
+ * This function's own PREVIOUS version polled SDEDM before EVERY
+ * SINGLE word, even when the FIFO obviously still had room -- 128
+ * separate MMIO reads interleaved between the 128 SDDATA writes for
+ * one block, every one of them a real bus transaction on real
+ * silicon, where U-Boot's own reference has none between words in
+ * the same burst. The working theory, well-supported but not yet
+ * independently proven beyond this real-HW comparison: the controller
+ * needs the LAST few words of a block written in a tight, minimal-
+ * gap cadence for its own internal FSM to correctly recognize "block
+ * complete" and leave WRITEDATA on its own -- DhruvaOS's own per-word
+ * polling overhead, even though individually small, was apparently
+ * enough gap to prevent that recognition from ever firing.
+ *
+ * Fixed by restructuring to match: poll SDEDM once per burst (room =
+ * 16 - fill), clamp to remaining word count, write that many words
+ * back-to-back with no polling in between, repeat. Bounded retry (see
+ * this function's own header comment above for why 1000, not the
+ * shared 100000) still applies per burst-readiness-check, not per
+ * word -- if the retry cap is ever exhausted (room stays 0), forces
+ * a 1-word burst to guarantee forward progress, preserving this
+ * function's own established "give up and write anyway, let the
+ * post-transfer SDHSTS check catch it" contract exactly. r7 is a new
+ * callee-saved scratch register for the burst word-counter, pushed/
+ * popped alongside r4-r6 as before. */
 .global sdhost_fill_fifo_from_buffer_impl
 sdhost_fill_fifo_from_buffer_impl:
-    push {r4, r5, r6}
+    push {r4, r5, r6, r7}
     mrs r12, cpsr
     cpsid if
-    mov r4, r2               /* r4 = word_count (r2:r3 pair, low half) */
+    mov r4, r2               /* r4 = word_count remaining */
     ldr r6, =0x20202034      /* SDEDM */
 sdhost_fill_loop:
     cmp r4, #0
     beq sdhost_fill_done
-    ldr r5, =1000            /* bounded per-word poll-for-space retry cap,
+    ldr r5, =1000            /* bounded burst-readiness retry cap,
                                * MASKED-loop-specific (see this function's
                                * own header comment above for why this is
                                * 1000, not the shared 100000 every other
-                               * per-word poll in this file still uses) */
+                               * per-word poll in this file still uses) --
+                               * now gates finding ANY room for the next
+                               * burst, not a single word */
 sdhost_fill_poll:
     ldr r2, [r6]
     mov r2, r2, lsr #4
     and r2, r2, #0x1F        /* r2 = current FIFO word count */
-    cmp r2, #16              /* SDDATA_FIFO_WORDS (confirmed against
-                               * Linux's own bcm2835.c) -- full when the
-                               * count reaches this */
-    blt sdhost_fill_ready     /* room for at least 1 more word */
+    rsb r7, r2, #16          /* r7 = room = SDDATA_FIFO_WORDS(16) - fill,
+                               * matching U-Boot's own bcm2835_sdhost.c
+                               * (confirmed identical constant) */
+    cmp r7, #0
+    bgt sdhost_fill_have_room
     subs r5, r5, #1
     bne sdhost_fill_poll
-sdhost_fill_ready:
+    mov r7, #1                /* retry cap exhausted -- force a 1-word
+                               * burst rather than spin forever, matching
+                               * this function's own pre-existing "give up
+                               * and write anyway" contract exactly */
+sdhost_fill_have_room:
+    cmp r7, r4
+    movgt r7, r4              /* clamp burst size to remaining word count */
+    sub r4, r4, r7
     ldr r2, =0x20202040      /* SDDATA */
+sdhost_fill_burst:
     ldr r3, [r0], #4
     str r3, [r2]
-    sub r4, r4, #1
+    subs r7, r7, #1
+    bne sdhost_fill_burst
     b sdhost_fill_loop
 sdhost_fill_done:
     msr cpsr_c, r12
-    pop {r4, r5, r6}
+    pop {r4, r5, r6, r7}
     mov r0, #0
     mov r1, #0
     bx lr
