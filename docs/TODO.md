@@ -10022,3 +10022,61 @@ actual side-by-side structural/assembly comparison of `sdhost_fill_
 fifo_from_buffer_impl` against Linux's `bcm2835_sdhost_write_block_pio`
 beyond just the interrupt-masking difference already checked) -- not
 started this round, pending direction.
+
+### Twenty-fourth SD round: a REAL, WORKING reference driver, on THIS exact board and card, at 50MHz -- the hardware is exonerated (2026-09-25)
+
+User: "would it make sense to load known os and flash on card and look
+sdcard logs?" -- the one thing this entire 23-round saga had never
+actually tried: running a real, independently-maintained driver
+against this exact physical hardware, not just reading its source
+(already done exhaustively) or comparing register semantics (also
+already done). Built U-Boot 2021.01 for `rpi_defconfig` (BCM2835/Pi-1B,
+DTB `bcm2835-rpi-b` embedded, matches this exact board's own boardrev
+`e`) from a local source tree, using this session's own `arm-none-
+eabi-gcc`. Added it to the existing SD card as a selectable kernel
+(`kernel=u-boot.bin` appended to config.txt, fully non-destructive to
+the card's own partitioning/firmware/DhruvaOS kernel.img -- see
+`~/source/sdwedge-uboot-test/flash_uboot_test.sh`).
+
+**Result: `mmc write`/`mmc read`/`cmp.b` at block 2100 (0x834) -- the
+EXACT block that has wedged on every single one of the prior 23
+rounds' own real-HW tests, no exceptions -- succeeded cleanly on the
+very first try.** `MMC write: ... 1 blocks written: OK`, `MMC read:
+... 1 blocks read: OK`, `cmp.b`: `Total of 512 byte(s) were the same`.
+No retry, no timeout, no FSM wedge, nothing. U-Boot's own `mmc info`
+reports `Bus Speed: 50000000` / `Mode: SD High Speed (50MHz)` -- this
+succeeded at DOUBLE DhruvaOS's own normal 25MHz operating clock (and
+4x its first-retry 12.5MHz backoff), directly ruling out "the clock is
+too fast" as any part of the explanation, in either direction. U-Boot's
+own device name in the log, `mmc@7e202000`, is the SDHOST controller's
+own bus address (matches `0x20202000` physical -- the exact same
+peripheral DhruvaOS's own SDCMD/SDARG/etc. constants target) --
+confirmed directly against the U-Boot source tree
+(`drivers/mmc/bcm2835_sdhost.c` is the active driver, not the
+alternate `bcm2835_sdhci.c`/EMMC-controller path) -- a true apples-to-
+apples same-silicon comparison, not a different piece of hardware.
+
+**This is the single most conclusive result in the entire saga: the
+Pi 1B board, this exact SD card, and the wiring are all confirmed
+fully functional.** Every hardware-adjacent hypothesis this saga has
+ever entertained or partially entertained (worn/marginal card --
+already separately ruled out by the two-card test, round "second-card
+real-HW confirmation" -- silicon defect, signal integrity, wiring) is
+now closed for good by direct, positive evidence, not just absence of
+a found cause. The bug is, with about as much confidence as real-
+hardware testing can provide, entirely within DhruvaOS's own SD driver
+code -- some real difference between `sdhost_fill_fifo_from_buffer_
+impl`'s own PIO write loop (and/or its surrounding command sequence)
+and `bcm2835_sdhost.c`'s own, that source-level reading across 23
+rounds has not yet pinpointed.
+
+**Where this leaves the search**: the next step this result directly
+motivates -- not yet done -- is adding real register-dump
+instrumentation to U-Boot's own (now-confirmed-working)
+`bcm2835_sdhost.c` write path, mirroring the exact SDCMD/SDARG/SDHBCT/
+SDHBLC/SDHSTS/SDEDM checkpoints DhruvaOS's own diagnostic build
+already captures, rebuilding, and having the user re-run the same
+`mmc write` test to capture a REAL, successful, real-hardware register
+trace -- something no amount of further source-reading can produce --
+to diff directly against DhruvaOS's own abundant failing traces from
+every prior round. Not started, pending direction.
