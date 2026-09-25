@@ -143,131 +143,182 @@ sd_state_get_is_4bit:
  * calling-convention bug here rather than an SD-protocol one, once
  * actually checked against the disassembly instead of guessed at from
  * symptoms alone. */
-/* TASK #163 FOLLOW-UP (2026-09-14): both loops below used to blast
- * word_count words straight at SDDATA with NO polling of any FIFO-
- * readiness status at all -- correct only if the controller can always
- * accept/produce a word the instant the CPU asks for one. Found after
- * the second real Pi 1B boot showed reproducible SD/DharaFS write
- * corruption (kernel_main.vani's own "SD: 8-block round-trip sweep"
- * self-test, and downstream DharaFS persistence, both real -- see
- * project memory) that QEMU's own SD FIFO model never exhibited across
- * this whole project's testing history, because it has no real
- * backpressure to violate. Confirmed against Linux's own real
- * driver for this exact controller (drivers/mmc/host/bcm2835.c,
- * bcm2835_transfer_block_pio): it polls SDEDM's own FIFO-word-count
- * field, bits[8:4] ((edm >> 4) & 0x1F), before transferring, using a
- * documented 16-word FIFO depth (SDDATA_FIFO_WORDS). That driver polls
- * once per up-to-8-word burst for throughput; this file polls once per
- * WORD instead -- simpler to get unconditionally correct in raw asm,
- * and this project's own established "correctness first" convention
- * (boot/rpi1/boot.S's own header comment) makes that the right
- * trade-off here over matching Linux's burst optimization exactly.
- * Bounded retry count per word (100000), not `while true`, matching
- * sdhost_cmd's own "a wedged card can never hang the caller forever"
- * convention just above in kernel_main.vani -- if the FIFO genuinely
- * never becomes ready, the caller's own post-transfer SDHSTS error-bit
- * check (sdhost_read_block/write_block) is what actually surfaces the
- * failure; this bound only prevents an infinite spin. */
+/* TASK #163 FOLLOW-UP (2026-09-14), SUPERSEDED (30th SD round,
+ * 2026-09-25): this loop originally polled SDEDM's FIFO-word-count
+ * field once per WORD (reading the instant fill>=1), a deliberate
+ * "correctness first" choice over matching Linux/U-Boot's own
+ * per-burst polling -- reasonable-looking at the time, but never
+ * actually exercised with a short transfer until this same round's
+ * SCR read (ACMD51, 2 words) came back with a "shift register"
+ * corruption pattern: byte[1]=0x00, which a real card's SCR can never
+ * report (not even claiming mandatory 1-bit support). Re-reading
+ * U-Boot's own real bcm2835_transfer_block_pio(is_read=true)
+ * (drivers/mmc/bcm2835_sdhost.c) -- the function this driver's WRITE
+ * path already had its own burst-read counterpart ported from
+ * (25th-28th round) -- found the read side was NEVER actually
+ * compared: `words = edm_fifo_fill(edm)`, gated on `words >=
+ * min(SDDATA_FIFO_PIO_BURST(8), copy_words)` BEFORE reading anything,
+ * then reads that many words back-to-back with ZERO intervening
+ * polls. Reading the instant fill>=1 (this function's old behavior)
+ * can grab a word from the FIFO before a word AFTER it in the same
+ * burst has actually finished settling -- invisible for a 128-word
+ * block read (task #217) where the FIFO's own refill cadence usually
+ * makes "fill>=1" and "fill>=8" coincide anyway, glaringly visible
+ * for a genuinely short 2-word transfer. Rewritten to match U-Boot's
+ * own real gate and burst read exactly -- same structure as this
+ * file's own sdhost_fill_fifo_from_buffer_impl (the write-side burst
+ * fix), mirrored for reads. Bounded retry count (100000) on the gate
+ * itself now, not per-word -- same "a wedged card can never hang the
+ * caller forever" contract, applied once per burst instead of once
+ * per word. */
 .global sdhost_drain_fifo_to_buffer
 sdhost_drain_fifo_to_buffer:
-    push {r4, r5, r6}         /* r4/r5/r6 callee-saved (AAPCS) -- see the
+    push {r4, r5, r6, r7}     /* r4-r7 callee-saved (AAPCS) -- see the
                                * file-level note below on why this
                                * isn't optional here */
-    mov r4, r2               /* r4 = word_count (r2:r3 pair, low half) */
+    mov r4, r2               /* r4 = word_count remaining (r2:r3 pair,
+                               * low half) */
     ldr r6, =0x20202034      /* SDEDM */
 sdhost_drain_loop:
     cmp r4, #0
     beq sdhost_drain_done
-    ldr r5, =100000          /* bounded per-word poll-for-data retry cap --
+    ldr r5, =100000          /* bounded burst-readiness retry cap --
                                * ldr, not mov: 100000 (0x186A0) isn't a
                                * valid ARM rotated-immediate */
 sdhost_drain_poll:
     ldr r2, [r6]
     mov r2, r2, lsr #4
-    and r2, r2, #0x1F        /* r2 = current FIFO word count */
-    cmp r2, #0
-    bne sdhost_drain_ready    /* at least 1 word available -- go read it */
+    and r2, r2, #0x1F        /* r2 = current FIFO word count (fill) */
+    mov r7, #8               /* SDDATA_FIFO_PIO_BURST, matching
+                               * U-Boot's own real constant exactly */
+    cmp r7, r4
+    movgt r7, r4              /* r7 = burst_words = min(8, remaining) */
+    cmp r2, r7
+    bge sdhost_drain_have_enough
     subs r5, r5, #1
     bne sdhost_drain_poll
-sdhost_drain_ready:
-    ldr r2, =0x20202040      /* SDDATA */
-    ldr r3, [r2]
-    str r3, [r0], #4
-    sub r4, r4, #1
+    mov r2, #1                /* retry cap exhausted -- force reading
+                               * at least 1 word rather than hang
+                               * forever, matching this file's own
+                               * write-side burst fix's identical
+                               * "give up and continue" contract */
+sdhost_drain_have_enough:
+    cmp r2, r4
+    movgt r2, r4               /* actual burst size = min(fill, remaining)
+                               * -- NOT clamped to burst_words, matching
+                               * U-Boot's own real semantics: the gate
+                               * only decides READINESS, the burst
+                               * itself drains everything available */
+    sub r4, r4, r2
+    ldr r3, =0x20202040      /* SDDATA */
+sdhost_drain_burst:
+    ldr r1, [r3]
+    str r1, [r0], #4
+    subs r2, r2, #1
+    bne sdhost_drain_burst
     b sdhost_drain_loop
 sdhost_drain_done:
-    pop {r4, r5, r6}
+    pop {r4, r5, r6, r7}
     mov r0, #0
     mov r1, #0
     bx lr
 
-/* 30th SD round (2026-09-25) TEMPORARY DIAGNOSTIC: identical to
- * sdhost_drain_fifo_to_buffer above (deliberately NOT sharing code
- * with it -- this needs to work even if the thing being investigated
- * turns out to be a bug in that shared function itself), except it
- * prints the FIFO fill count and the RAW word just read from SDDATA
- * BEFORE storing it to the buffer, for every word. Purpose: the SCR
- * read (ACMD51, 2 words) came back showing a "shift register" style
- * corruption pattern identical in shape to the original CMD24 write
- * corruption from earlier this same investigation -- first time this
- * project's own drain loop has ever been exercised with a short
- * (2-word) count instead of a full 128-word block read (task #217).
- * This shows whether the wrong bytes are ALREADY in SDDATA at the
- * moment of the read (a real hardware/timing issue) or only appear
- * wrong after storage/printing (a software bug in this project's own
- * code, findable and fixable directly). Hardcoded to exactly 2 words
- * -- this is a narrow diagnostic for the SCR read specifically, not a
- * general-purpose replacement.
+/* 30th SD round follow-up (2026-09-25): the ORIGINAL version of this
+ * function (per-word poll, reading as soon as fill>=1) showed the
+ * SCR's two words arriving with a "shift register" corruption
+ * signature -- byte[1] came back 0x00 where a real card's SCR can
+ * never report that (not even claiming mandatory 1-bit support).
+ * Re-read U-Boot's OWN real bcm2835_transfer_block_pio(is_read=true)
+ * (drivers/mmc/bcm2835_sdhost.c) -- the function this project's write
+ * path already ported the BURST-write half of (25th-28th round), but
+ * never compared the READ half against: for reads, `words =
+ * edm_fifo_fill(edm)` and the gate is `if (words < burst_words)
+ * continue;` where `burst_words = min(SDDATA_FIFO_PIO_BURST, copy_
+ * words)` -- for a 2-word transfer, burst_words=2, meaning U-Boot's
+ * real code requires BOTH words to already be sitting in the FIFO
+ * simultaneously before reading EITHER one, then reads them back-to-
+ * back with ZERO intervening polls. This project's own sdhost_drain_
+ * fifo_to_buffer (used for every real-HW read this whole project has
+ * ever done, including the 128-word block reads task #217 validated)
+ * reads the FIRST word the INSTANT fill>=1 -- structurally the exact
+ * same per-word-vs-per-burst gap the original CMD24 write wedge
+ * turned out to be (25th round), just never exposed before because a
+ * 128-word transfer's own FIFO refill cadence made "fill>=1" and
+ * "fill>=8" coincide often enough in practice; a genuinely short
+ * (2-word) transfer is the first thing in this whole investigation to
+ * expose it on the read side. Rewritten to match U-Boot's own real
+ * gate exactly: single poll for fill>=2, then two back-to-back SDDATA
+ * reads with NO diagnostic calls (or anything else) between them --
+ * only printed afterward, so the diagnostic itself can't perturb the
+ * burst timing being tested.
  * i64 sd_scr_drain_diag(mut ref i64 buf) */
 .global sd_scr_drain_diag
 sd_scr_drain_diag:
-    push {r4, r5, r6, r7, lr}
+    push {r4, r5, r6, r7, r8, lr}
     mov r4, r0                /* r4 = buffer pointer */
-    mov r7, #0                /* r7 = word index (0 or 1), for the label */
     ldr r6, =0x20202034       /* SDEDM */
-sd_scr_diag_loop:
-    cmp r7, #2
-    beq sd_scr_diag_done
-    ldr r5, =100000
+    ldr r5, =100000           /* bounded poll-for-both-words retry cap */
 sd_scr_diag_poll:
     ldr r0, [r6]
     mov r1, r0, lsr #4
-    and r1, r1, #0x1F         /* r1 = current FIFO word count, kept live
-                               * across the print call below (r1 is
-                               * caller-saved, but sdhost_diag_puts/
-                               * put_hex32 never touch it -- confirmed
-                               * by reading both, same as this file's
-                               * own established convention elsewhere) */
-    cmp r1, #0
-    bne sd_scr_diag_ready
+    and r1, r1, #0x1F         /* r1 = current FIFO word count */
+    cmp r1, #2                /* need BOTH words ready, matching
+                               * U-Boot's own burst_words=min(8,2)=2 */
+    bge sd_scr_diag_ready
     subs r5, r5, #1
     bne sd_scr_diag_poll
+    /* retry cap exhausted -- proceed anyway with whatever's there
+     * rather than hang forever, matching this project's own
+     * established "give up and continue" contract elsewhere
+     * (sdhost_fill_fifo_from_buffer_impl); r1 (fill<2) still gets
+     * printed below so this is visible in the log, not silent. */
 sd_scr_diag_ready:
+    mov r8, r1                /* r8 = fill count AT THE GATE, snapshot
+                               * before either real read (which could
+                               * itself change fill) -- printed for
+                               * both words below */
+    ldr r7, =0x20202040       /* SDDATA */
+    ldr r5, [r7]               /* word 0 */
+    ldr r0, [r7]               /* word 1 -- back-to-back with word 0,
+                               * zero instructions in between besides
+                               * the two loads themselves, matching
+                               * U-Boot's own real burst loop exactly */
+    str r5, [r4]
+    str r0, [r4, #4]
+    mov r6, r0                 /* r6 (SDEDM addr, no longer needed)
+                               * now holds word 1 for the print below */
+
     ldr r0, =sd_scr_diag_lbl_word
     bl sdhost_diag_puts
-    mov r0, r7
+    mov r0, #0
     bl sdhost_diag_put_hex1
     ldr r0, =sd_scr_diag_lbl_fill
     bl sdhost_diag_puts
-    mov r0, r1
+    mov r0, r8
     bl sdhost_diag_put_hex1
     ldr r0, =sd_scr_diag_lbl_data
     bl sdhost_diag_puts
-    ldr r0, =0x20202040       /* SDDATA */
-    ldr r5, [r0]               /* r5 = raw word -- poll-cap countdown
-                               * in r5 is dead here (loop already
-                               * exited), safe to reuse; the SAME
-                               * value gets printed AND stored below,
-                               * no room for the two to diverge */
     mov r0, r5
     bl sdhost_diag_put_hex32
     mov r0, #10
     bl sdhost_diag_putc
-    str r5, [r4], #4
-    add r7, r7, #1
-    b sd_scr_diag_loop
-sd_scr_diag_done:
-    pop {r4, r5, r6, r7, lr}
+
+    ldr r0, =sd_scr_diag_lbl_word
+    bl sdhost_diag_puts
+    mov r0, #1
+    bl sdhost_diag_put_hex1
+    ldr r0, =sd_scr_diag_lbl_fill
+    bl sdhost_diag_puts
+    mov r0, r8
+    bl sdhost_diag_put_hex1
+    ldr r0, =sd_scr_diag_lbl_data
+    bl sdhost_diag_puts
+    mov r0, r6
+    bl sdhost_diag_put_hex32
+    mov r0, #10
+    bl sdhost_diag_putc
+
+    pop {r4, r5, r6, r7, r8, lr}
     mov r0, #0
     mov r1, #0
     bx lr
