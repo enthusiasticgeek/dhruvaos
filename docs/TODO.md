@@ -9861,3 +9861,102 @@ own round rather than folded into this one.
 
 Two identical `phase4_milestone.py` runs, zero regression (same known
 baseline, only the already-accepted `tcprtx` artifact).
+
+### Task #287: fixed the stale shadow-predictor gate found during #286 (2026-09-25)
+
+`scheduler_pick_next_shadow_predict`'s own "is current_task ceiling-
+protected" gate still used the pre-task-#253 proxy (`eff_prio <
+base_prio`) -- the exact condition task #253 already found broken in
+the REAL `scheduler_pick_next` and replaced with a direct
+`ceiling_depth_table[current] > 0` read, because the proxy structurally
+can't detect a critical section when a task's own base_prio already
+equals the ceiling it locks at (task_a/HIGH's case). The shadow
+predictor was never updated to match at the time -- found while
+comparing the two functions side by side during task #286's own work,
+not something this round went looking for. No observable live
+mismatch today (ceiling id 0 is the global-minimum priority, so both
+gates happen to agree in every scenario the demo set actually
+exercises), but a real, latent divergence between the model and the
+function it mirrors. Fixed by mirroring the real gate exactly (same
+`ceiling_depth_table_get_at` accessor task #280's own eviction-skip-
+gate fix already established). Two identical `phase4_milestone.py`
+runs: known baseline unchanged, zero `SCHED SHADOW MISMATCH` prints
+during live operation, task #286's own 16-level self-test still PASS.
+
+### Task #288: re-attempted the finer scheduler tick, reverted again -- but with a materially better-narrowed finding (2026-09-25)
+
+User: "did we manage get tick below 500ms to make faster yet correct
+or was that not attempted" -> "yes attempt it." Direct re-attempt of
+round 191/task #243's own experiment, now that task #272's own
+prerequisite (rescaling `tcp_rtx_timeout_ticks`/DHCP's own
+`ticks_per_second`/`auth_lockout_ticks` to derive from `scheduler_
+tick_interval_us()` at runtime) is closed.
+
+**Pre-change audit**: swept every `task_sleep_ticks(N)` literal in
+kernel_main.vani and `task_heartbeat_init`'s own bound table. All of
+them are task PERIODS (how often a task wakes) or heartbeat-bound
+MULTIPLES of a task's own period (5-10x) -- both tick-rate-invariant
+by construction, not real-duration bugs task #272's own three fixes
+missed. One softer case noted but deliberately left alone: the real-
+SSH-frame-polling retry loops (`while (iter < 200) { ...
+task_sleep_ticks(4) }`) total 800 ticks of worst-case wait for a
+network frame -- a generic bounded-retry safety margin, not a
+protocol-mandated duration, still 80 real seconds at 100ms/tick (down
+from 400s) -- ample margin, watched for rather than pre-rewritten.
+
+**Changed `scheduler_tick_interval_us()` 500000 -> 100000** (5x finer,
+matching round 191's own original target). Built clean.
+`phase4_milestone.py` reproduced the EXACT same class of cascading
+failure both prior rounds hit (eval/ping/ifconfig/tcpecho/udpecho/
+netstat/tcprtx/etc. all newly failing, harness's own overall timeout
+hit mid-run) -- but this time with new, directly-measured evidence
+narrowing the explanation further than task #243 ever got to:
+
+- **`time python3 test/phase4_milestone.py`**: 222s real wall-clock,
+  only 32s combined user+sys CPU. QEMU itself is NOT compute-bound
+  during the failing run -- rules out a raw per-instruction emulation-
+  speed explanation task #243's own dispatch-cost measurement couldn't
+  fully rule out on its own (that measurement used the GUEST's own
+  TIMER_CLO, blind to any real HOST-side slowdown that doesn't track
+  guest virtual time 1:1).
+- **"eval" (the 3rd command) never appears anywhere in the captured
+  log at all** -- the same class of failure as before, now starting
+  one command index earlier than either prior attempt's own described
+  symptom.
+- **Directly observed, measured contributing factor**: GC (task_e)'s
+  own DharaFS critical sections, unchanged in tick-COUNT period (20
+  ticks), now recur ~5x more often in real wall-clock time (every 2s
+  instead of every 10s) -- confirmed firing twice within the first
+  ~500 log lines. Every HIGH/MEDIUM/LOW/MUTEX demo task's own status-
+  print volume scales the identical way: period unchanged in ticks,
+  so PRINT volume unchanged in tick-count terms, but 5x denser in real
+  time -- the log's own line density between "write" and "cat" (540
+  lines) is direct, measured evidence. Leading hypothesis, not fully
+  isolated: this print-volume multiplication, on a still-blind (fixed
+  `SETTLE_S=14`, not readiness-pattern-based) test harness, most
+  likely swamps or delays the actual useful UART RX/TX for the
+  harness's own commands -- the same general class of print-volume-
+  vs-fixed-timing fragility this project has hit before (task #279's
+  own diagnostic print volume breaking `tcprtx` once; the 2026-09-14
+  "Boot UART markers destabilized QEMU test timing" entry), just never
+  previously connected to the TICK RATE itself as a multiplier.
+- **Genuinely new compounding factor, not separable from the above
+  without further instrumentation**: this session's own recent SD-
+  write IRQ/FIQ masking (task #284/#285, syscall #5) didn't exist
+  during either prior attempt. GC's own DharaFS writes now mask
+  interrupts for up to 41.984ms worst case -- 42% of a 100ms tick
+  period vs. 8.4% of the original 500ms one. Measured critical-section
+  durations in this run (10.8ms/16.0ms) stayed well under that worst
+  case, so this alone likely isn't the dominant cause, but it's a real
+  factor neither round 191 nor task #243 ever had to contend with.
+
+**Reverted** -- same "don't ship unverified against this project's
+entire QEMU-only verification loop" discipline task #243 already
+established. `scheduler_tick_interval_us()` back to 500000, rebuilt,
+`phase4_milestone.py` confirmed back to the exact known baseline (only
+the already-accepted `tcprtx` artifact). Real forward progress even in
+the revert: the next attempt has a materially better-narrowed starting
+point than "duration constants, maybe" -- rate-limit/reduce demo-task
+status-print volume, or move the harness to pattern-based readiness
+detection instead of blind `SETTLE_S`, BEFORE the next tick-rate
+attempt, not concurrently with one.

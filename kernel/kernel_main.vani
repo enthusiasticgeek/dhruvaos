@@ -4436,17 +4436,70 @@ extern "C" fn enable_irqs() -> i64;
 // slower as a real tradeoff and adjusting the test harness's own
 // timing budgets accordingly -- not attempted here.
 //
-// ROUND 2026-09-20 (task #272): the PERIOD itself still isn't touched
-// here -- that re-attempt needs the cycle-counter prerequisite above
-// regardless -- but every wall-clock-meaningful tick constant this
-// codebase has (tcp_rtx_timeout_ticks, dhcp_client_check_lease's own
-// ticks_per_second, auth_lockout_ticks) now DERIVES its tick count
-// from this function at runtime instead of hardcoding one, closing
-// the actual root cause behind round 191's own revert (and its own
-// auth_lockout_ticks near-miss): a future change to the return value
+// ROUND 2026-09-20 (task #272): every wall-clock-meaningful tick
+// constant this codebase has (tcp_rtx_timeout_ticks, dhcp_client_
+// check_lease's own ticks_per_second, auth_lockout_ticks) DERIVES its
+// tick count from this function at runtime instead of hardcoding one,
+// closing the actual root cause behind round 191's own revert (and its
+// own auth_lockout_ticks near-miss): a change to the return value
 // below now automatically rescales every real-time duration in this
 // codebase correctly, rather than requiring a manual, error-prone
 // audit of every call site the way round 191 needed.
+//
+// ROUND 2026-09-25 (task #288): RE-ATTEMPTED at 100000 (5x finer,
+// matching round 191's own original target) now that task #272's own
+// prerequisite is closed. REVERTED AGAIN -- the exact same cascading
+// phase4_milestone.py failure recurred (eval/ping/ifconfig/tcpecho/
+// udpecho/netstat/tcprtx/etc. all newly failing, harness's own overall
+// timeout hit mid-run) -- but with new evidence narrowing the cause
+// further than task #243 got to. Real (`time`) measurement of the
+// failing run: 222s wall-clock, only 32s combined user+sys CPU --
+// QEMU itself is NOT compute-bound, ruling out a raw per-instruction
+// emulation-speed explanation task #243's own dispatch-cost
+// measurement couldn't fully rule out on its own (that measurement
+// used the GUEST's own TIMER_CLO, blind to any real HOST-side slowdown
+// that doesn't track guest virtual time 1:1). "eval" (the 3rd command)
+// never appears anywhere in the captured log at all -- the SAME class
+// of failure as before, just now starting one command index earlier.
+// Real, measured, DIRECTLY-observed contributing factor: GC (task_e)'s
+// own DharaFS critical sections, unchanged in tick-COUNT period (20
+// ticks), now recur ~5x more often in real wall-clock time (every 2s
+// instead of every 10s) -- confirmed firing twice within the first
+// ~500 log lines, vs. once every several thousand at the old rate.
+// Every HIGH/MEDIUM/LOW/MUTEX demo task's own status-print volume
+// scales the identical way (period unchanged in ticks, so period
+// unchanged in real time -- but tasks awoken via task_sleep_ticks(N)
+// for demo-visibility periods never had their own PRINT VOLUME
+// intended to track tick rate, only their scheduling period did) --
+// the log's own line density between "write" and "cat" (540 lines,
+// vs. a small fraction of that at 500ms) is direct, measured evidence
+// of this. Leading hypothesis, NOT yet fully isolated from task #272's
+// own already-fixed class of bug: 5x more demo-task/GC status-print
+// volume in the same real SETTLE_S window, on a still-blind (not
+// readiness-pattern-based) test harness, most likely swamps or delays
+// the actual useful UART RX/TX for the harness's own commands -- the
+// same general class of print-volume-vs-fixed-timing fragility this
+// project has hit repeatedly before (task #279's own diagnostic print
+// volume breaking tcprtx once; "Boot UART markers destabilized QEMU
+// test timing," 2026-09-14), just never previously connected to the
+// TICK RATE itself as a multiplier on top of it. Confounded further by
+// this session's OWN recent SD-write IRQ/FIQ masking (task #284/#285,
+// syscall #5): GC's own DharaFS writes now mask interrupts for up to
+// 41.984ms worst case, a MUCH larger fraction of a 100ms tick period
+// (42%) than of the original 500ms one (8.4%) -- measured critical-
+// section durations in this run (10.8ms/16.0ms) stayed well under that
+// worst case, so this alone likely isn't the dominant cause, but it's
+// a genuinely NEW compounding factor neither round 191 nor task #243
+// ever had to contend with, since syscall #5 didn't exist yet. Not
+// cleanly separable from the print-volume hypothesis without further,
+// more targeted instrumentation this round didn't build. Reverted
+// rather than chased further -- same "don't ship unverified against
+// this project's entire QEMU-only verification loop" discipline task
+// #243 already established, now with a materially better-narrowed
+// explanation for the next attempt to start from: rate-limit/reduce
+// demo-task status-print volume (or move the harness to pattern-based
+// readiness detection instead of blind SETTLE_S) BEFORE the next
+// tick-rate attempt, not concurrently with one.
 fn scheduler_tick_interval_us() -> u32 {
   return 500000 as u32;
 }
