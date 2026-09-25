@@ -4295,6 +4295,17 @@ fn uart_put_i64_bounded(v: i64) -> i64 {
 #[stack_cost(bytes=1)]
 extern "C" fn enable_irqs() -> i64;
 
+// 20th SD round (2026-09-24): disable_irqs_and_fiqs/enable_irqs_and_
+// fiqs (irq_entry.S) are DELIBERATELY not declared extern here --
+// `cpsid`/`cpsie` are privileged and every real caller in this
+// codebase is a USR-mode task (task #253/#261), so a direct vani call
+// would hit the exact UNPREDICTABLE-instruction bug a live regression
+// just confirmed. See irq_entry.S's own header comment on both symbols
+// and this file's sdhost_write_block_once (search "20th SD round") for
+// the full writeup. Not deleting the asm itself -- a future SWI
+// syscall trampoline (6th, alongside the existing 5 in swi_entry.S)
+// needs exactly this cpsid-if/cpsie-if pair as its SVC-mode body.
+
 // Round 191 (2026-09-13): single source of truth for the scheduler
 // tick period, used by both timer_ic_init (first arm) and
 // irq_dispatch (every reschedule) -- previously the same "500000"
@@ -5919,6 +5930,22 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // is safe) -- confines the overhead to exactly the intended test.
   // (use_write_diag itself is now computed up near `addr` above, so it
   // can also gate the pre/post-CMD24 instrumentation.)
+  // 20th SD round (2026-09-24): tried masking IRQ/FIQ directly around
+  // this call (matching Linux's own bcm2835_sdhost_write_block_pio,
+  // which wraps its equivalent loop in local_irq_save/restore) -- a
+  // real structural gap this driver had that Linux's doesn't. REVERTED:
+  // this function runs in USR-mode task context (task #253/#261 --
+  // "every real caller today is a USR-mode task", swi_entry.S's own
+  // header comment), where `cpsid`/`cpsie` are privileged and
+  // UNPREDICTABLE, exactly the bug class swi_entry.S's own two 2026-
+  // 09-19 fixes already hit once building the SWI trap for a different
+  // primitive. A live QEMU regression confirmed the damage (cascading
+  // failures well beyond SD/DharaFS -- eval/ping/ifconfig/tcpecho all
+  // newly broken, vs. only the already-accepted tcprtx artifact
+  // before). Doing this correctly needs a 6th SWI syscall trampoline
+  // (dhruva_mutex_lock/_unlock, dhruva_prio_lock/_unlock, task_sleep_
+  // ticks are the existing 5), not a direct asm call -- scoped out of
+  // this round, see docs/TODO.md for the writeup and open question.
   let _ = if use_write_diag { sdhost_fill_fifo_from_buffer_diag(buf, 128) } else { sdhost_fill_fifo_from_buffer(buf, 128) };
 
   // ROUND 2026-09-20 (task #278, real-HW SD write-wedge investigation,

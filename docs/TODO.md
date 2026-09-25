@@ -9384,6 +9384,72 @@ commit; the permanent register-dump instrumentation (pre/post-CMD24,
 per-batch) remains, kept local-only per the user's own explicit choice
 this round.
 
+### Twentieth SD round: found the real structural gap (missing IRQ/FIQ masking), reverted a broken naive fix, real gap for the fix still open (2026-09-24)
+
+Direct answer to the 19th round's own open question: pulled Linux's
+own `bcm2835_sdhost_write_block_pio` (raspberrypi/linux rpi-6.6.y) and
+compared its structure against this driver's `sdhost_fill_fifo_from_
+buffer` (boot/sdcard_state.S), word by word. Found a real, concrete
+difference every one of the previous 19 rounds missed, because all of
+them looked at register semantics/timeouts/protocol, never at
+concurrency: **Linux wraps its entire PIO write-block loop in
+`local_irq_save(flags)`/`local_irq_restore(flags)`, unconditionally,
+every call** -- this driver's equivalent loop never masked anything.
+This kernel is FIQ-driven-preemptive (round 191/246) with a 500ms
+scheduler tick PLUS ordinary IRQ sources (UART RX from picocom, USB)
+that can land at any time -- every real-HW session in this whole saga
+has had picocom attached throughout. A write FIFO is far more time-
+sensitive than a read FIFO (the card must drain it into flash cells in
+real time; a read FIFO the card can just hold full and wait on) --
+consistent with this saga's write-only symptom, and the read side
+(fixed task #217) never needing this. If a task switch or IRQ handler
+lands between two SDDATA word writes for long enough, the controller's
+own FSM can get stuck exactly where every real-HW log in this entire
+saga has always shown it: WRITEDATA(3). QEMU's own IRQ/FIQ timing and
+SD FIFO emulation have no equivalent real-hardware backpressure to
+violate -- consistent with the wedge never once reproducing there
+across 19 rounds.
+
+**Built, then REVERTED after a live regression caught a real
+architectural conflict**: added `disable_irqs_and_fiqs`/`enable_irqs_
+and_fiqs` (`cpsid if`/`cpsie if` wrappers, irq_entry.S) and wrapped the
+`sdhost_fill_fifo_from_buffer(_diag)` call site in `sdhost_write_
+block_once` (matching Linux's own scope exactly -- only the PIO loop,
+not the surrounding command/status phases). `phase4_milestone.py`
+immediately showed a severe regression far beyond the known `tcprtx`
+artifact: `eval`/`ping`/`ifconfig`/`tcpecho`/`udpecho`/`netstat` all
+newly failing, the run terminating on the harness's own overall
+timeout mid-sequence. Root cause: `cpsid`/`cpsie` are privileged
+instructions, and **every real caller of this code path is a USR-mode
+task** (task #253/#261 -- "every real caller today is a USR-mode
+task", swi_entry.S's own header comment; the existing 5 SWI syscall
+trampolines -- `task_sleep_ticks`, `dhruva_mutex_lock`/`_unlock`,
+`dhruva_prio_lock`/`_unlock` -- are the ONLY sanctioned way for USR-
+mode vani code to reach a privileged primitive). A direct call hits
+the exact UNPREDICTABLE-instruction bug class swi_entry.S's own two
+2026-09-19 fixes already found and fixed once, building the SWI trap
+for a different primitive -- `enable_irqs`/`enable_fiqs` themselves
+are dead code today for the identical reason (irq_entry.S/fiq_entry.S
+own header comments: "declared+defined but never actually called
+anywhere"). Reverted the call site and the vani-side extern decls;
+kept the `cpsid if`/`cpsie if` assembly itself in irq_entry.S as the
+correctly-reasoned SVC-mode body a future syscall trampoline needs.
+Rebuilt + reran `phase4_milestone.py`: confirmed back to the exact
+known baseline (only the already-accepted `tcprtx` artifact).
+
+**Where this leaves the search**: the structural gap is real and well-
+supported (a direct, explicit Linux-reference match), but implementing
+it correctly needs a 6th SWI syscall trampoline -- a genuinely bigger
+lift than any prior round in this saga (the existing 5 took two real
+bugs to get right the first time: F-masking gap and an unsaved-
+callee-register clobber, both swi_entry.S's own 2026-09-19 history).
+Also worth noting going in: masking IRQ+FIQ across the fill loop, even
+correctly, adds to this kernel's own worst-case interrupt latency
+budget (task #270) and needs a schedulability re-check (task #190's
+own tooling) once built, since it's a new source of bounded-but-
+nonzero blocking time. Scoped out of this round pending explicit
+direction on whether to build the syscall now.
+
 ### Task #279: fault-injection test proves WCET enforcement + heartbeat detection actually work (2026-09-20)
 
 User: "how about other rtos scheduling improvements? any bugs through

@@ -312,3 +312,53 @@ enable_irqs:
     mov r0, #0
     mov r1, #0
     bx lr
+
+/* void disable_irqs_and_fiqs(void) / enable_irqs_and_fiqs(void) --
+ * SD write-wedge investigation, 20th round (2026-09-24): comparing
+ * this driver's own sdhost_fill_fifo_from_buffer PIO loop (boot/
+ * sdcard_state.S) against Linux's own reference bcm2835-sdhost.c
+ * PIO write path (bcm2835_sdhost_write_block_pio, fetched fresh from
+ * raspberrypi/linux rpi-6.6.y) found a real structural difference
+ * every prior round of this investigation missed, because all 19
+ * prior rounds looked at register semantics and timeout values, never
+ * at concurrency: Linux wraps its ENTIRE PIO write-block loop in
+ * `local_irq_save(flags)`/`local_irq_restore(flags)`, unconditionally,
+ * every single call -- this driver's own equivalent loop never masked
+ * anything. This kernel is FIQ-driven-preemptive (round 191/246's own
+ * comments, context_switch.S) with a periodic 500ms scheduler tick
+ * PLUS ordinary IRQ sources (UART RX, USB) that can land at any time
+ * -- every real-HW session in this saga has picocom attached (UART RX
+ * IRQ traffic) and several also drive network tests (USB IRQ traffic)
+ * concurrently with SD writes, while QEMU's own IRQ/FIQ timing model
+ * and SD FIFO emulation have no equivalent real hardware backpressure
+ * to violate. A write FIFO is far more time-sensitive than a read FIFO
+ * (the card must drain it into flash cells in real time, vs. a read
+ * FIFO the card can simply hold full and wait on) -- consistent with
+ * this saga's own write-only symptom and the read side (already fixed,
+ * task #217) never needing this. If a task switch or IRQ handler lands
+ * between two SDDATA word writes for long enough, the controller's own
+ * FSM can get stuck exactly where every real-HW log in this whole saga
+ * has always shown it: WRITEDATA(3). These two primitives are the only
+ * way for vani code (which can't manipulate CPSR directly) to bound
+ * that window the same way Linux's own reference driver does -- see
+ * their one call site (sdhost_write_block_once, kernel_main.vani) for
+ * the exact scope (only the PIO fill loop itself, matching Linux's own
+ * scope exactly -- not the surrounding command/status phases, which
+ * still need to stay preemptible for this kernel's own WCET/
+ * schedulability guarantees). `cpsid if`/`cpsie if` mask and unmask
+ * BOTH bits in one atomic instruction, avoiding any window where only
+ * one of IRQ/FIQ is masked the way two separate enable_irqs()+
+ * enable_fiqs() calls would leave. */
+.global disable_irqs_and_fiqs
+disable_irqs_and_fiqs:
+    cpsid if
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global enable_irqs_and_fiqs
+enable_irqs_and_fiqs:
+    cpsie if
+    mov r0, #0
+    mov r1, #0
+    bx lr
