@@ -199,6 +199,42 @@ sdhost_drain_done:
  * changes, exactly like dhruva_prio_lock's own migration. r12 is
  * caller-saved scratch under AAPCS -- no push/pop needed for it, same
  * as dhruva_prio_lock_impl. */
+/* Task #285 (2026-09-25, 22nd SD round): retry cap for THIS masked
+ * loop only, deliberately much smaller than the shared 100000 constant
+ * every other per-word poll in this file still uses (sdhost_drain_
+ * fifo_to_buffer/sdhost_fill_fifo_from_buffer_diag, both genuinely
+ * unmasked -- a slow poll there just costs one task some extra
+ * (interruptible) time, never blocks the whole system). A live,
+ * measured self-test (kernel_main.vani's sd_fill_poll_body_wcet_
+ * measure_self_test) found this loop's own real per-iteration cost --
+ * 0.327us -- and multiplied it out against the ORIGINAL 100000-
+ * iteration cap: 128 words x 100000 retries x 0.327us = ~4.19
+ * SECONDS of IRQ+FIQ masked in the genuinely-wedged-FIFO worst case,
+ * the exact scenario this entire SD-wedge saga has been about. During
+ * that whole window neither task #271's WCET-eviction nor task #269's
+ * stuck-task watchdog can fire -- both depend on the very timer tick
+ * this loop masks -- so the one mechanism built specifically to catch
+ * a hung critical section is itself disabled for the duration of the
+ * worst case it would most need to catch. 100000 was tuned for this
+ * loop's ORIGINAL unmasked calling convention, where an occasional long
+ * wait only cost the calling task itself, never the whole machine --
+ * that assumption stopped holding the moment task #284 masked the
+ * loop, and nothing revisited the cap's own real cost until this
+ * round's measurement.
+ *
+ * 1000 chosen to land this loop's own new worst case (128 x 1000 x
+ * 0.327us = ~41.9ms) under this project's own largest ALREADY-
+ * schedulability-checked blocking term (LOW's 49.906ms ceiling-0
+ * critical section, test/schedulability_analysis.py) -- reusing an
+ * already-validated tolerance instead of inventing a new one. Still
+ * roughly 100-1000x more headroom than any per-word retry count ever
+ * actually observed in this saga's own real-HW/QEMU logs (every
+ * healthy FIFO check has always succeeded within a handful of
+ * iterations) -- this does not change the retry loop's own pre-
+ * existing "give up and write anyway, let the post-transfer SDHSTS
+ * error check catch it" contract (this function's own file-level
+ * comment, unchanged since 2026-09-14), only how long it waits before
+ * falling back on that already-existing safety net. */
 .global sdhost_fill_fifo_from_buffer_impl
 sdhost_fill_fifo_from_buffer_impl:
     push {r4, r5, r6}
@@ -209,9 +245,11 @@ sdhost_fill_fifo_from_buffer_impl:
 sdhost_fill_loop:
     cmp r4, #0
     beq sdhost_fill_done
-    ldr r5, =100000          /* bounded per-word poll-for-space retry cap --
-                               * ldr, not mov: 100000 (0x186A0) isn't a
-                               * valid ARM rotated-immediate */
+    ldr r5, =1000            /* bounded per-word poll-for-space retry cap,
+                               * MASKED-loop-specific (see this function's
+                               * own header comment above for why this is
+                               * 1000, not the shared 100000 every other
+                               * per-word poll in this file still uses) */
 sdhost_fill_poll:
     ldr r2, [r6]
     mov r2, r2, lsr #4

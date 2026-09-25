@@ -3071,6 +3071,86 @@ fn i64_div_wcet_measure_self_test() -> i64 {
   return 0;
 }
 
+// Task #284 follow-up (2026-09-25, 22nd SD round): the 21st round's own
+// new syscall #5 (sdhost_fill_fifo_from_buffer, boot/swi_entry.S ->
+// boot/sdcard_state.S's own _impl) masks IRQ+FIQ for its ENTIRE fill
+// loop, not just the atomic word-transfer instant -- necessarily so,
+// matching Linux's own bcm2835_sdhost_write_block_pio, which does the
+// same. That loop's own per-word poll-for-room retry is bounded at
+// 100000 iterations before falling through regardless (never an actual
+// infinite spin) -- but nothing in this project had ever computed what
+// that bound actually COSTS in real masked time across a full 128-word
+// transfer, the exact worst case a genuinely wedged/slow FIFO would
+// hit. With IRQ+FIQ masked for that whole duration, this is now the
+// ONE window in this entire codebase where task #271's WCET-enforcement
+// eviction and task #269's stuck-task watchdog literally CANNOT fire --
+// both depend on the very timer tick this window masks. A real,
+// measured number belongs in the schedulability model (test/
+// schedulability_analysis.py) as GC (task_e)'s own new/updated blocking
+// term, the same "measured, not invented" bar every other blocking
+// figure in that tool already meets (see gc_dharafs_critical_section_ms/
+// gc_dhcp_poll_worst_case_ms's own header there).
+//
+// Measures the real per-iteration cost of the EXACT poll body
+// (sdhost_fill_fifo_from_buffer_impl's own `ldr;lsr;and;cmp` sequence,
+// boot/sdcard_state.S) via the same real SDEDM MMIO register the actual
+// driver polls -- not a synthetic ALU loop -- so this shares the "MMIO-
+// read-dominated loops are comparably bus-bound under QEMU and real
+// hardware" property already established for sdhost_cmd's own NEW_FLAG
+// poll and sdhost_wait_transfer_complete (unlike delay()'s own pure
+// ALU busy-loop, independently measured ~18.6x off between QEMU and
+// real Pi 1B silicon, task #275) -- the one property that makes this
+// QEMU-only measurement usable as a real bound at all.
+fn sd_fill_poll_body_wcet_measure_self_test() -> i64 {
+  let sdedm: i64 = SDEDM;
+  let iters: i64 = 100000;
+  let acc: u32 = 0;
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  for i from 0 to 100000 {
+    let edm: u32 = mmio_read_u32(sdedm);
+    let fifo_words: u32 = (edm >> (4 as u32)) & (0x1F as u32);
+    if fifo_words < (16 as u32) {
+      acc = acc + (1 as u32);
+    }
+  }
+  let t1: u32 = mmio_read_u32(TIMER_CLO);
+  let us: u32 = t1 - t0;
+  let _ = uart_puts("WCET DIAG: sd_fill_poll_body real cost = ");
+  let _ = uart_put_i64(us as i64);
+  let _ = uart_puts("us / ");
+  let _ = uart_put_i64(iters);
+  let _ = uart_puts(" iterations (ready-count=");
+  let _ = uart_put_i64(acc as i64);
+  let _ = uart_puts(") -- real per-iteration cost of the exact SDEDM-poll body syscall #5 now runs with IRQ+FIQ masked\n");
+
+  // Worst case: every one of 128 words in a transfer exhausts the
+  // per-word retry cap before falling through and writing anyway
+  // (sdhost_fill_fifo_from_buffer_impl's own bounded-not-infinite
+  // contract) -- the genuinely-wedged-FIFO case this whole 21-round
+  // saga has been about. retry_cap MUST track sdhost_fill_fifo_from_
+  // buffer_impl's own real `ldr r5,=N` constant (boot/sdcard_state.S)
+  // by hand -- this measurement caught that exact constant at 100000
+  // once (worst case ~4.19s, IRQ+FIQ masked the whole time -- fixed,
+  // task #285, reduced to 1000) and there is no automatic link between
+  // the two; if that assembly constant ever changes again, this number
+  // must be updated to match or it will silently misreport. `us` above
+  // is the measured cost of exactly `iters` (100000) iterations, so
+  // one word's own worst case is `us * retry_cap / iters` -- computed
+  // as a single division, not a loop, so vani's own known division-
+  // cost soundness gap (this file's own i64_div_wcet_measure_self_test
+  // above) doesn't apply to this one-shot computation.
+  let retry_cap: i64 = 1000;
+  let words: i64 = 128;
+  let per_word_worst_us: i64 = ((us as i64) * retry_cap) / iters;
+  let worst_case_us: i64 = words * per_word_worst_us;
+  let _ = uart_puts("WCET DIAG: sd_fill_fifo worst-case masked duration (");
+  let _ = uart_put_i64(retry_cap);
+  let _ = uart_puts(" retries/word x 128 words, wedged-FIFO case) = ");
+  let _ = uart_put_i64(worst_case_us);
+  let _ = uart_puts("us -- IRQ+FIQ masked the ENTIRE window (syscall #5), so task #271 WCET eviction and task #269 stuck-task watchdog cannot fire until it returns\n");
+  return 0;
+}
+
 // ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit): the
 // stack overflow canary (boot/stack_canary.S) has existed since round
 // 68 and is documented in real, specific detail (four historical
@@ -37761,6 +37841,7 @@ fn kernel_main() -> i64 {
   let _ = rtl8188cu_set_channel_self_test();
   let _ = delay_wcet_measure_self_test();
   let _ = i64_div_wcet_measure_self_test();
+  let _ = sd_fill_poll_body_wcet_measure_self_test();
   let _ = task_deadlines_init();
   let _ = task_heartbeat_init();
   // ROUND 2026-09-18 (task #242): seed the very first tick's own UART

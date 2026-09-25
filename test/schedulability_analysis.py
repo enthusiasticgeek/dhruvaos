@@ -387,7 +387,26 @@ def dhruvaos_demo_task_set_analysis() -> int:
     # unlock(3)/dhruva_prio_lock(2) pair in task_e's own body, a
     # genuine window where LOW, at priority 2, can preempt GC back at
     # its own true priority 3 normally).
-    gc_dharafs_critical_section_ms = 7.689  # measured max, 10 real passes
+    # ROUND 2026-09-25 (task #285, 22nd SD round): GC's own DharaFS
+    # critical section calls dharafs_block_write_raw -> sdhost_write_
+    # block -> the SD PIO fill loop, which as of task #284 masks IRQ+
+    # FIQ for its own duration (syscall #5, boot/swi_entry.S). The
+    # 7.689ms figure below was only ever the HEALTHY-path measured
+    # total across 10 real compaction passes -- same "don't trust the
+    # optimistic number" gap this function's own DHCP-poll figure
+    # already closed once (see this function's own header). A live
+    # self-test (kernel_main.vani's sd_fill_poll_body_wcet_measure_
+    # self_test) now measures the real worst case a genuinely wedged
+    # SD write can add on top: 41.984ms (1000-iteration masked retry
+    # cap x 128 words -- see boot/sdcard_state.S's own sdhost_fill_
+    # fifo_from_buffer_impl header comment for why 1000, not the
+    # original 100000 that measured out to ~4.19 SECONDS masked before
+    # this same round reduced it). Added, not substituted -- the
+    # healthy-path execution still has to happen either way, and a
+    # wedge is additional time on top of it, not instead of it.
+    gc_dharafs_healthy_ms = 7.689  # measured max, 10 real passes
+    sd_fill_fifo_worst_case_wedge_ms = 41.984  # measured+computed, task #285
+    gc_dharafs_critical_section_ms = gc_dharafs_healthy_ms + sd_fill_fifo_worst_case_wedge_ms
     # ROUND 2026-09-17 (gap #238): was 325.62ms (dwc2_wait_chan0_done's
     # own shared-primitive worst case) -- now the real measured worst
     # case of dwc2_net_bulk_in_poll_wcet_measure_self_test's own
@@ -395,24 +414,51 @@ def dhruvaos_demo_task_set_analysis() -> int:
     gc_dhcp_poll_worst_case_ms = 6.584
     gc_worst_blocking_ms = max(gc_dharafs_critical_section_ms, gc_dhcp_poll_worst_case_ms)
 
+    # ROUND 2026-09-25 (task #285) correctness fix: HIGH/MEDIUM's own
+    # blocking term below used to be JUST LOW's ceiling-0 section,
+    # correctly reasoned as the only thing that could ever delay them
+    # (0 < 2 and 1 < 2 -- both strictly outrank GC's own ceiling-2, so
+    # the SOFTWARE tie-break in scheduler_pick_next was never a factor
+    # for either). That reasoning silently stopped covering the whole
+    # picture the moment task #284 made GC's own DharaFS writes mask
+    # IRQ+FIQ at the HARDWARE level (syscall #5) -- ceiling priority is
+    # irrelevant to a masked interrupt controller: while GC is inside
+    # that window, literally nothing else on the system can run,
+    # including HIGH/MEDIUM, regardless of how much higher their own
+    # priority is. This is a genuinely NEW, universal blocking source
+    # ceiling protocol was never designed to model (it blocks by
+    # disabling preemption outright, not by priority comparison) --
+    # every task in the system, not just LOW, needs it as a candidate
+    # blocking term now. Standard treatment for multiple independent
+    # candidate blocking sources (Sha/Rajkumar/Lehoczky's own "at most
+    # one lower-priority critical section blocks a task per
+    # activation," generalized across resources): B_i = MAX over every
+    # candidate, not a sum -- exactly the same pattern gc_worst_
+    # blocking_ms above already uses for LOW's own two GC-side
+    # candidates. Numerically a no-op today (49.906 > 41.984, so the
+    # max is unchanged) -- fixed anyway because the MODEL was
+    # incomplete, not because today's numbers demanded it; if either
+    # figure moves in a future round, this is what keeps the bound
+    # honest instead of silently stale.
+    high_medium_blocking_ms = max(measured_low_critical_section_ms, sd_fill_fifo_worst_case_wedge_ms)
+
     tasks = [
         # HIGH (task_a): sleeps 3 ticks, priority 0. Own body has no
         # busy-wait -- its own WCET is the "other_body_estimate" only.
         # Blocked by LOW's ceiling-0 critical section whenever it lands
         # inside one (ties favor the incumbent at equal boosted
         # priority -- see context_switch.S's own scheduler_pick_next
-        # comment). NOT blocked by GC's own ceiling-2 sections -- 0 < 2,
-        # HIGH preempts a ceiling-2-boosted task outright, no tie-break
-        # needed.
+        # comment), OR by GC's own SD-write masked window (task #285 --
+        # see this function's own header just above for why ceiling
+        # priority doesn't protect against that one).
         Task("HIGH", priority=0, period=3 * TICK_MS,
              wcet=other_body_estimate_ms + measured_ctxsw_handoff_ms,
-             blocking=measured_low_critical_section_ms),
+             blocking=high_medium_blocking_ms),
         # MEDIUM (task_b): sleeps 1 tick, priority 1. Same reasoning as
-        # HIGH -- blocked by LOW's ceiling-0 section, not by GC's
-        # ceiling-2 ones (1 < 2).
+        # HIGH.
         Task("MEDIUM", priority=1, period=1 * TICK_MS,
              wcet=other_body_estimate_ms + measured_ctxsw_handoff_ms,
-             blocking=measured_low_critical_section_ms),
+             blocking=high_medium_blocking_ms),
         # LOW (task_c): sleeps 2 ticks, priority 2. Its own WCET
         # includes the real measured critical section (it's the one
         # DOING the delay, not waiting on someone else's). Now also
@@ -449,10 +495,12 @@ def dhruvaos_demo_task_set_analysis() -> int:
         print("VERDICT: schedulable with real measured blocking data, comfortable margin.")
         print("CAVEAT: 'other_body_estimate_ms' (5ms/task) is a conservative round-up,")
         print("not independently measured to the same rigor as the other figures. LOW's own")
-        print(f"B_LOW ({gc_worst_blocking_ms:.3f}ms) now uses GC's real measured worst case")
-        print("(the dwc2 USB-poll timeout, not the smaller healthy-path figure actually")
+        print(f"B_LOW ({gc_worst_blocking_ms:.3f}ms) now uses GC's real measured worst case --")
+        print(f"as of task #285 that's the DharaFS/SD-write path (healthy {gc_dharafs_healthy_ms:.3f}ms +")
+        print(f"worst-case-wedge {sd_fill_fifo_worst_case_wedge_ms:.3f}ms), not the smaller dwc2 USB-poll")
+        print("figure (6.584ms) or the even smaller healthy-path-only DharaFS average actually")
         print("observed across 10 real test passes -- a rigorous bound has to assume the")
-        print("pessimistic case can happen). Re-run with real numbers before trusting this")
+        print("pessimistic case can happen. Re-run with real numbers before trusting this")
         print("for any actual production workload, not just this demonstration task set.")
         return 0
     else:

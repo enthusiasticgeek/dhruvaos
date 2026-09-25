@@ -9500,6 +9500,101 @@ validated by a real-HW retest. Not pushed yet (still stacked on the
 choice); commit hash and real-HW retest results to be recorded once
 available.
 
+### Twenty-second SD round: syscall #5's own worst-case masked duration measured and fixed, contention/deadlock audit (2026-09-25)
+
+User, while waiting on the real-HW retest: "are there any other
+adversarial tests... any gaps fix to make close to rtos or atleast
+real-time preempt," then "fix any gaps with your best judgement," then
+"predict if any contention or deadlocks by reading code and compare
+online authoritative resources if needed and fix issues."
+
+**Real gap found and fixed**: the 21st round's own new syscall #5 masks
+IRQ+FIQ for its entire SD PIO fill loop -- necessarily so, matching
+Linux's own reference driver -- but nothing had ever computed what that
+loop's own PRE-EXISTING 100000-iteration-per-word retry cap actually
+COSTS once masked. A new live self-test (`sd_fill_poll_body_wcet_
+measure_self_test`, kernel_main.vani) measured the real per-iteration
+poll cost (0.327us, via the exact SDEDM-poll body, not a synthetic ALU
+loop -- same "MMIO-read-dominated loops are comparably bus-bound under
+QEMU and real hardware" property this project already established for
+sdhost_cmd's own poll) and multiplied it out: 128 words x 100000
+retries x 0.327us = **~4.19 SECONDS** of IRQ+FIQ masked in the
+genuinely-wedged-FIFO worst case -- the exact scenario this entire
+21-round saga has been about. During that whole window, task #271's
+WCET-eviction and task #269's stuck-task watchdog CANNOT fire, since
+both depend on the very timer tick this window masks -- the one
+mechanism built specifically to catch a hung critical section was
+itself disabled for the worst case it would most need to catch. Fixed
+by reducing the masked loop's own retry cap (boot/sdcard_state.S's
+`sdhost_fill_fifo_from_buffer_impl` only -- the unmasked `_diag`
+variant and the read-side `sdhost_drain_fifo_to_buffer` both keep the
+original 100000, correctly, since neither of those blocks the whole
+system) to 1000, landing the new worst case at 41.984ms -- comfortably
+under this project's own largest ALREADY-schedulability-checked
+blocking term (LOW's 49.906ms ceiling-0 critical section) rather than
+inventing a new tolerance, and still ~100-1000x more headroom than any
+real per-word retry count ever observed in this saga's own logs. Does
+not change the retry loop's own pre-existing "give up and write
+anyway, rely on the post-transfer SDHSTS error check" contract
+(unchanged since 2026-09-14) -- only how long it waits before falling
+back on that already-existing safety net.
+
+**Schedulability model corrected, two real gaps**: (1) fed the new
+41.984ms worst case into `test/schedulability_analysis.py` as an
+ADDITION to GC (task_e)'s own DharaFS critical-section term (healthy
+7.689ms + wedge 41.984ms = 49.673ms), since GC's own compaction path is
+what actually calls into the now-masked syscall. (2) A second, more
+subtle gap found during the user's own follow-up contention/deadlock
+question: HIGH/MEDIUM's own blocking term used to be JUST LOW's
+ceiling-0 section, correctly reasoned at the time (0 < 2 and 1 < 2, so
+neither is ever blocked by GC's own ceiling-2 SOFTWARE tie-break) --
+but that reasoning silently stopped covering the whole picture the
+moment GC's own writes started masking IRQ+FIQ at the HARDWARE level:
+ceiling priority is irrelevant to a masked interrupt controller, so
+while GC is inside that window NOTHING can run, regardless of
+priority. Fixed by adding the SD-write worst case as a second candidate
+blocking source for HIGH/MEDIUM too, `B_i = max(...)` over both
+candidates -- the standard Sha/Rajkumar/Lehoczky treatment for multiple
+independent blocking sources, the same pattern GC's own two-candidate
+`gc_worst_blocking_ms` already used. Numerically a no-op today (49.906
+> 41.984, same max either way) -- fixed because the MODEL was
+incomplete, not because today's numbers demanded it. Full task set
+re-verified schedulable, comfortable margins unchanged (HIGH
+1444.912ms, MEDIUM 439.730ms, LOW 884.875ms).
+
+**Deadlock/contention code audit, no bugs found**: read every
+`dhruva_prio_lock`/`dhruva_mutex_lock` call site in kernel_main.vani.
+Ceiling locks (`dhruva_prio_lock`) are non-blocking by construction --
+they set the CALLING task's own eff_prio/ceiling-depth directly, never
+wait on another task -- so classic lock-ordering deadlock (circular
+wait) is structurally impossible through this primitive alone,
+confirmed against the standard priority-ceiling-protocol guarantee
+(Sha/Rajkumar/Lehoczky 1990: a task can block at most once, on entry,
+never while already holding a resource). Ceiling id 0 (task_a/task_c's
+demo "resource") and ceiling id 2 (task_e/task_f/task_fsq's DharaFS
+group) are two entirely disjoint task groups with zero call-site
+overlap -- no nested nor cross-ceiling acquisition anywhere in this
+codebase today, so no risk of an eff_prio restore-value mismatch either
+(eff_prio_table is SET, not incremented, per lock/unlock call -- only
+ceiling_depth_table is a real nesting counter). `dhruva_mutex_lock`
+(the one genuinely blocking primitive, with priority inheritance) is
+used at exactly two mutex ids (0: MUTEX-LOW/HIGH demo pair; 1: an
+isolated self-test) -- neither task ever holds both simultaneously
+anywhere in the codebase, so the other classic deadlock precondition
+(inconsistent lock-ordering across two-or-more real mutexes) doesn't
+apply either; genuinely deadlock-free by absence of any nested-mutex
+pattern, not just by protocol guarantee. Confirmed task_fsq's own
+declared priority (`task_create_usr(task_fsq, ..., 2 as u32)`) exactly
+matches ceiling 2, the textbook requirement for the ceiling protocol's
+own ordering guarantee to actually hold (the ceiling must equal the
+highest priority among the resource's real users) -- verified against
+code, not assumed from the comments describing it.
+
+Two identical `phase4_milestone.py` runs: unchanged from the known
+baseline (only the already-accepted `tcprtx` artifact). Commit still
+pending at time of writing this entry; see the next commit for the
+hash.
+
 ### Task #279: fault-injection test proves WCET enforcement + heartbeat detection actually work (2026-09-20)
 
 User: "how about other rtos scheduling improvements? any bugs through
