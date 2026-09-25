@@ -237,6 +237,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
+  "${ROOT}/boot/rpi1/uboot_sdhost_write.c" -o "${BUILD_DIR}/uboot_sdhost_write.o"
+
 "${VANIC}" emit "${ROOT}/kernel/kernel_main.vani" --backend=llvm \
   -o "${BUILD_DIR}/kernel_main.ll"
 
@@ -313,6 +316,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/csprng_state.o" \
   "${BUILD_DIR}/uart_tx_ring_state.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
+  "${BUILD_DIR}/uboot_sdhost_write.o" \
   -lgcc \
   -o "${BUILD_DIR}/dhruva.elf"
 

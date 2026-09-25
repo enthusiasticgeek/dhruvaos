@@ -2691,6 +2691,15 @@ extern "C" fn sdhost_diag_dump_regs_post_cmd24() -> i64;
 // assumption").
 #[stack_cost(bytes=24)]
 extern "C" fn sdhost_get_core_clock_hz() -> i64;
+// 28th SD round (2026-09-25) -- see boot/rpi1/uboot_sdhost_write.c's
+// own header comment for the full "why". Literal C transliteration
+// of real U-Boot's own working write-path algorithm, self-contained
+// (its own CMD24 issuance through wait_transfer_complete, raw MMIO
+// only), called ONLY from the existing 8-block real-HW diagnostic
+// sweep in sdhost_write_block_once below -- the production write
+// path is completely untouched.
+#[stack_cost(bytes=64)]
+extern "C" fn uboot_style_sdhost_write_block(buf: mut ref i64, block_addr: i64) -> i64;
 // TEST-ONLY, task #3 verification -- see boot/sdcard_state.S.
 #[stack_cost(bytes=4)]
 extern "C" fn test_fill_pattern(buf: mut ref i64, byte_count: i64) -> i64;
@@ -6032,6 +6041,23 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // consistent with the controller expecting more than 512 bytes.
   let sdhbct_readback: u32 = mmio_read_u32(sdhbct);
   let sdhblc_readback: u32 = mmio_read_u32(sdhblc);
+  // 28th SD round (2026-09-25): three real, well-reasoned fixes
+  // derived from register-level comparison against U-Boot's own
+  // source (burst-write, 25th/26th round; SDHCFG_DATA_IRPT_EN
+  // removal, 27th round) have each matched the reference exactly and
+  // still failed to clear the real-HW write wedge -- register diffing
+  // against this driver's own hand-written asm is exhausted for now.
+  // Routes the diagnostic sweep (only) through a literal C port of
+  // U-Boot's actual working algorithm instead -- see boot/rpi1/uboot_
+  // sdhost_write.c's own header comment for why this is a genuinely
+  // different, decisive test rather than one more register tweak.
+  // Early return: this function does its own complete CMD24-through-
+  // wait_transfer_complete sequence, so none of the diag/fill/wait
+  // logic below runs for these blocks. Production write path (every
+  // block outside 2100-2107) is completely unaffected.
+  if use_write_diag {
+    return uboot_style_sdhost_write_block(buf, addr as i64);
+  }
   // ROUND 2026-09-20 (19th SD round): user's own explicit follow-up
   // after the 18th round's timer-based timeout fix confirmed the wedge
   // persists on real hardware -- "stop modifying timeout/retry
