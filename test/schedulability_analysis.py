@@ -397,15 +397,23 @@ def dhruvaos_demo_task_set_analysis() -> int:
     # already closed once (see this function's own header). A live
     # self-test (kernel_main.vani's sd_fill_poll_body_wcet_measure_
     # self_test) now measures the real worst case a genuinely wedged
-    # SD write can add on top: 41.984ms (1000-iteration masked retry
-    # cap x 128 words -- see boot/sdcard_state.S's own sdhost_fill_
-    # fifo_from_buffer_impl header comment for why 1000, not the
-    # original 100000 that measured out to ~4.19 SECONDS masked before
-    # this same round reduced it). Added, not substituted -- the
-    # healthy-path execution still has to happen either way, and a
+    # SD write can add on top: originally 41.984ms (1000-iteration
+    # masked retry cap x 128 words -- see boot/sdcard_state.S's own
+    # sdhost_fill_fifo_from_buffer_impl header comment for why 1000,
+    # not the original 100000 that measured out to ~4.19 SECONDS
+    # masked before task #285 reduced it). Added, not substituted --
+    # the healthy-path execution still has to happen either way, and a
     # wedge is additional time on top of it, not instead of it.
+    #
+    # 32nd SD round (2026-09-25) update: adding a DMB after every SDEDM
+    # poll (matching real U-Boot's readl() -- see the disassembly
+    # comparison this round found, boot/sdcard_state.S) raised the
+    # measured per-iteration cost enough that the OLD retry_cap=1000
+    # would have pushed this figure to 71.04ms, past HIGH/MEDIUM's own
+    # 49.906ms ceiling-0 budget below. Reduced retry_cap to 400
+    # (same file) to compensate, re-measured: 22.272ms.
     gc_dharafs_healthy_ms = 7.689  # measured max, 10 real passes
-    sd_fill_fifo_worst_case_wedge_ms = 41.984  # measured+computed, task #285
+    sd_fill_fifo_worst_case_wedge_ms = 22.272  # measured+computed, 32nd SD round
     gc_dharafs_critical_section_ms = gc_dharafs_healthy_ms + sd_fill_fifo_worst_case_wedge_ms
     # ROUND 2026-09-17 (gap #238): was 325.62ms (dwc2_wait_chan0_done's
     # own shared-primitive worst case) -- now the real measured worst

@@ -3139,13 +3139,24 @@ fn i64_div_wcet_measure_self_test() -> i64 {
 // ALU busy-loop, independently measured ~18.6x off between QEMU and
 // real Pi 1B silicon, task #275) -- the one property that makes this
 // QEMU-only measurement usable as a real bound at all.
+// 32nd SD round (2026-09-25) update: the real asm poll body
+// (sdhost_fill_fifo_from_buffer_impl, boot/sdcard_state.S) now issues
+// a DMB after every SDEDM read -- this self-test's own approximation
+// updated to match (sd_mmio_read_u32 instead of a bare mmio_read_u32)
+// so the instruction sequence being measured is honest. Caveat that
+// matters more here than usual: QEMU does not model real DMB latency
+// on real ARMv6 silicon (it retires cp15 barrier instructions near-
+// instantly in the emulated core), so this number can show the
+// correct ORDER of magnitude for the surrounding loop overhead but
+// cannot validate the real-hardware cost the barrier itself adds --
+// that can only be confirmed by a real-HW timing capture, not QEMU.
 fn sd_fill_poll_body_wcet_measure_self_test() -> i64 {
   let sdedm: i64 = SDEDM;
   let iters: i64 = 100000;
   let acc: u32 = 0;
   let t0: u32 = mmio_read_u32(TIMER_CLO);
   for i from 0 to 100000 {
-    let edm: u32 = mmio_read_u32(sdedm);
+    let edm: u32 = sd_mmio_read_u32(sdedm);
     let fifo_words: u32 = (edm >> (4 as u32)) & (0x1F as u32);
     if fifo_words < (16 as u32) {
       acc = acc + (1 as u32);
@@ -3177,7 +3188,14 @@ fn sd_fill_poll_body_wcet_measure_self_test() -> i64 {
   // as a single division, not a loop, so vani's own known division-
   // cost soundness gap (this file's own i64_div_wcet_measure_self_test
   // above) doesn't apply to this one-shot computation.
-  let retry_cap: i64 = 1000;
+  // 32nd SD round (2026-09-25): reduced 1000 -> 400 here to match
+  // boot/sdcard_state.S's own real `ldr r5,=N` constant -- adding a DMB
+  // after every SDEDM poll (matching real U-Boot's readl()) raised the
+  // measured per-iteration cost enough that 1000 would have pushed the
+  // worst case past this project's own 49.906ms ceiling-0 schedulability
+  // budget. See sdhost_drain_fifo_to_buffer_impl's own comment for the
+  // full math.
+  let retry_cap: i64 = 400;
   let words: i64 = 128;
   let per_word_worst_us: i64 = ((us as i64) * retry_cap) / iters;
   let worst_case_us: i64 = words * per_word_worst_us;
@@ -4713,6 +4731,48 @@ fn watchdog_kick() -> i64 {
 // exactly this class of check) but the full init/read/write state
 // machine isn't done enough yet to annotate meaningfully; that lands
 // once the driver is complete, not incrementally per bring-up step.
+// 32nd SD round (2026-09-25): SD-driver-scoped register-access
+// wrappers, mirroring real U-Boot's own readl()/writel() macros
+// (arch/arm/include/asm/io.h) exactly: writel = DMB BEFORE the store,
+// readl = DMB AFTER the load, on EVERY single register access, no
+// exceptions. Confirmed via disassembly comparison that DhruvaOS's
+// own mmio_read_u32/mmio_write_u32 compile to bare ldr/str with ZERO
+// barriers anywhere in the SD driver (objdump -d --disassemble=
+// fn_sdhost_cmd), while U-Boot's compiled bcm2835_send_cmd carries an
+// `mcr p15,0,r3,cr7,cr10,{5}` (DMB) around every SDEDM/SDHSTS access.
+// This project's own MMU maps the 0x20000000-0x20FFFFFF peripheral
+// block (boot/mmu_init.S) as Shareable Device (TEX=000/C=0/B=1), NOT
+// Strongly Ordered -- on Device memory, writes can be posted with
+// real, non-zero latency before reaching the peripheral, so two
+// back-to-back writes to DIFFERENT registers in the same peripheral
+// (e.g. SDARG then SDCMD, where SDCMD's NEW_FLAG tells the controller
+// to go read SDARG right now) are not architecturally guaranteed to
+// land in that order without something enforcing it. This project
+// already hit exactly this class of bug once before, for a DIFFERENT
+// reason (gpio_sdhost_alt_init's own cross-peripheral mem_barrier(),
+// added when switching from GPIO to SDHOST) -- mem_barrier() (a real
+// `mcr p15,0,Rd,c7,c10,5`, boot/context_switch.S) already exists and
+// is reused here unchanged, not reinvented.
+//
+// Deliberately scoped to the SD driver only (every mmio_read_u32/
+// mmio_write_u32 call site inside sdhost_cmd, sdhost_cmd_report_
+// failure, sd_read_scr, sdhost_init_at_speed, sdhost_force_data_mode_
+// settle, sdhost_wait_transfer_complete, sdhost_read_block_once,
+// sdhost_write_block_once was mechanically retargeted to these
+// wrappers) -- not a global mmio_read_u32/mmio_write_u32 change.
+// Other peripherals (UART, GPIO, network, framebuffer) have no
+// comparable real-HW evidence of needing this, and adding barrier
+// overhead there is unjustified without it.
+fn sd_mmio_read_u32(addr: i64) -> u32 {
+  let v: u32 = mmio_read_u32(addr);
+  let _ = mem_barrier();
+  return v;
+}
+fn sd_mmio_write_u32(addr: i64, val: u32) -> i64 {
+  let _ = mem_barrier();
+  return mmio_write_u32(addr, val);
+}
+
 fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   let sdarg: i64 = SDARG;
   let sdcmd: i64 = SDCMD;
@@ -4729,12 +4789,12 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   // starts checking it. Matches real Linux exactly: read, and only
   // write back if any of the documented error bits (0xF8 -- REW_
   // TIMEOUT|CMD_TIMEOUT|CRC16|CRC7|FIFO_ERROR) are actually set.
-  let sdhsts_pre: u32 = mmio_read_u32(SDHSTS);
+  let sdhsts_pre: u32 = sd_mmio_read_u32(SDHSTS);
   if (sdhsts_pre & (0xF8 as u32)) != (0 as u32) {
-    let _ = mmio_write_u32(SDHSTS, sdhsts_pre);
+    let _ = sd_mmio_write_u32(SDHSTS, sdhsts_pre);
   }
-  let _ = mmio_write_u32(sdarg, arg);
-  let _ = mmio_write_u32(sdcmd, sdcmd_new_flag | cmd_and_flags);
+  let _ = sd_mmio_write_u32(sdarg, arg);
+  let _ = sd_mmio_write_u32(sdcmd, sdcmd_new_flag | cmd_and_flags);
 
   // Poll until the controller clears NEW_FLAG (command, and its
   // response if any, complete) or the iteration cap is hit -- capped,
@@ -4742,13 +4802,13 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   // the caller forever the way an unbounded wait would.
   let iter: i64 = 0;
   while iter < 1000000 {
-    let v: u32 = mmio_read_u32(sdcmd);
+    let v: u32 = sd_mmio_read_u32(sdcmd);
     if (v & sdcmd_new_flag) == (0 as u32) {
       break;
     }
     iter = iter + 1;
   }
-  return mmio_read_u32(sdcmd);
+  return sd_mmio_read_u32(sdcmd);
 }
 
 // BUG (round 15 audit, 2026-08-28): sdhost_init's own command sequence
@@ -4825,8 +4885,8 @@ fn sdhost_cmd_failed(status: u32) -> i64 {
 // is exactly what has been hiding this class of failure from every
 // prior real-hardware log this project has captured).
 fn sdhost_cmd_report_failure(cmd_name: Str, status: u32) -> i64 {
-  let sdhsts: u32 = mmio_read_u32(SDHSTS);
-  let sdedm: u32 = mmio_read_u32(SDEDM);
+  let sdhsts: u32 = sd_mmio_read_u32(SDHSTS);
+  let sdedm: u32 = sd_mmio_read_u32(SDEDM);
   let _ = uart_puts("SD/MMC: ");
   let _ = uart_puts(cmd_name);
   let _ = uart_puts(" FAILED (SDCMD_FAIL_FLAG set) -- SDCMD=0x");
@@ -4929,9 +4989,9 @@ fn sd_read_scr(rca: u32) -> i64 {
   let sdcmd_read: u32 = 0x40 as u32;
   let fsm_readwait: u32 = 4 as u32;
 
-  let _ = mmio_write_u32(SDHCFG, 0x418 as u32);
-  let _ = mmio_write_u32(sdhbct, 8 as u32);
-  let _ = mmio_write_u32(sdhblc, 1 as u32);
+  let _ = sd_mmio_write_u32(SDHCFG, 0x418 as u32);
+  let _ = sd_mmio_write_u32(sdhbct, 8 as u32);
+  let _ = sd_mmio_write_u32(sdhblc, 1 as u32);
 
   let cmd55_status: u32 = sdhost_cmd(55 as u32, rca);
   let cmd55_timed_out: i64 = sdhost_cmd_timed_out(cmd55_status);
@@ -4943,7 +5003,7 @@ fn sd_read_scr(rca: u32) -> i64 {
   let _ = uart_puts(" failed=");
   let _ = uart_put_i64(cmd55_failed);
   let _ = uart_puts(" SDHSTS=0x");
-  let _ = uart_put_hex32(mmio_read_u32(sdhsts));
+  let _ = uart_put_hex32(sd_mmio_read_u32(sdhsts));
   let _ = uart_puts("\n");
   if (cmd55_timed_out == 1) || (cmd55_failed == 1) {
     return 0 - 1;
@@ -4959,7 +5019,7 @@ fn sd_read_scr(rca: u32) -> i64 {
   let _ = uart_puts(" failed=");
   let _ = uart_put_i64(cmd51_failed);
   let _ = uart_puts(" SDHSTS=0x");
-  let _ = uart_put_hex32(mmio_read_u32(sdhsts));
+  let _ = uart_put_hex32(sd_mmio_read_u32(sdhsts));
   let _ = uart_puts("\n");
   if (cmd51_timed_out == 1) || (cmd51_failed == 1) {
     let _ = sdhost_cmd_report_failure("ACMD51 (SEND_SCR)", cmd51_status);
@@ -4979,7 +5039,7 @@ fn sd_read_scr(rca: u32) -> i64 {
   // SDEDM immediately, zero polling, zero loop iterations, the instant
   // cmd51_status itself confirmed non-timeout/non-fail -- the earliest
   // possible software observation of the true post-command fill.
-  let scr_edm_immediate: u32 = mmio_read_u32(SDEDM);
+  let scr_edm_immediate: u32 = sd_mmio_read_u32(SDEDM);
   let scr_fill_immediate: u32 = (scr_edm_immediate >> (4 as u32)) & (0x1F as u32);
   let _ = uart_puts("SD DIAG: SCR immediate (pre-poll) fifo_fill=0x");
   let _ = uart_put_hex32(scr_fill_immediate);
@@ -4996,10 +5056,10 @@ fn sd_read_scr(rca: u32) -> i64 {
   // after storage (a findable software bug). See boot/sdcard_state.S
   // for the full comment.
   let _ = sd_scr_drain_diag(scr_buf);
-  let edm_after_pio: u32 = mmio_read_u32(SDEDM);
+  let edm_after_pio: u32 = sd_mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
-  let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
-  let _ = mmio_write_u32(sdhsts, errs);
+  let errs: u32 = sd_mmio_read_u32(sdhsts) & (0xF8 as u32);
+  let _ = sd_mmio_write_u32(sdhsts, errs);
   if wait_status != 0 {
     let _ = uart_puts("SD DIAG: ACMD51 (SEND_SCR) data-phase wedge SDEDM=0x");
     let _ = uart_put_hex32(edm_after_pio);
@@ -5047,7 +5107,7 @@ fn sd_read_scr(rca: u32) -> i64 {
 // untouched) is now a one-line wrapper defaulting to the original
 // 25MHz SD "default speed" target.
 fn sdhost_init_at_speed(target_hz: i64) -> i64 {
-  let diag_t0: u32 = mmio_read_u32(TIMER_CLO);
+  let diag_t0: u32 = sd_mmio_read_u32(TIMER_CLO);
   let _ = uart_puts("SD DIAG: sdhost_init entry, TIMER_CLO=0x");
   let _ = uart_put_hex32(diag_t0);
   let _ = uart_puts("\n");
@@ -5095,11 +5155,11 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // path) still reproduces with this fix active. See the two new
   // settle delays immediately below for the real, still-missing piece
   // this finding led to.
-  let edm_pre: u32 = mmio_read_u32(sdedm);
+  let edm_pre: u32 = sd_mmio_read_u32(sdedm);
   let edm_threshold_mask: u32 = ((0x1F << 14) | (0x1F << 9)) as u32;
   let edm_threshold_val: u32 = ((4 << 14) | (4 << 9)) as u32;
   let edm_fixed: u32 = (edm_pre & (edm_threshold_mask ^ (0xFFFFFFFF as u32))) | edm_threshold_val;
-  let _ = mmio_write_u32(sdedm, edm_fixed);
+  let _ = sd_mmio_write_u32(sdedm, edm_fixed);
 
   // ROUND 2026-09-20 (task #273-followup): U-Boot's own bcm2835_
   // sdhost.c (drivers/mmc/bcm2835_sdhost.c, fetched fresh) does NOT
@@ -5155,9 +5215,9 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // real, matching delay(3000000)=930168us's own real measured rate)
   // on both sides of the power cycle to match U-Boot's own real,
   // working sequence exactly.
-  let _ = mmio_write_u32(sdvdd, 0 as u32);
+  let _ = sd_mmio_write_u32(sdvdd, 0 as u32);
   let _ = delay(64500);
-  let _ = mmio_write_u32(sdvdd, 1 as u32);
+  let _ = sd_mmio_write_u32(sdvdd, 1 as u32);
   let _ = delay(64500);
 
   // 30th SD round (2026-09-25): explicit FIFO drain-to-empty, right
@@ -5192,11 +5252,11 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // case the fill count itself is momentarily stale/settling.
   let fifo_preclear_iter: i64 = 0;
   while fifo_preclear_iter < 1000 {
-    let preclear_fill: u32 = (mmio_read_u32(sdedm) >> (4 as u32)) & (0x1F as u32);
+    let preclear_fill: u32 = (sd_mmio_read_u32(sdedm) >> (4 as u32)) & (0x1F as u32);
     if preclear_fill == (0 as u32) {
       break;
     }
-    let _ = mmio_read_u32(SDDATA);
+    let _ = sd_mmio_read_u32(SDDATA);
     fifo_preclear_iter = fifo_preclear_iter + 1;
   }
   if fifo_preclear_iter > 0 {
@@ -5208,14 +5268,14 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // Identification-speed clock divisor and a generous command
   // timeout -- real-hardware bcm2835-sdhost values, not QEMU-specific
   // tuning.
-  let _ = mmio_write_u32(sdcdiv, 0x148 as u32);
-  let _ = mmio_write_u32(sdtout, 0xF00000 as u32);
-  let _ = mmio_write_u32(sdhbct, 0 as u32);
-  let _ = mmio_write_u32(sdhblc, 0 as u32);
+  let _ = sd_mmio_write_u32(sdcdiv, 0x148 as u32);
+  let _ = sd_mmio_write_u32(sdtout, 0xF00000 as u32);
+  let _ = sd_mmio_write_u32(sdhbct, 0 as u32);
+  let _ = sd_mmio_write_u32(sdhblc, 0 as u32);
   // Interrupts stay disabled -- this driver polls SDCMD/SDHSTS
   // directly, the same way Phase 0-2's own peripherals were brought
   // up before anything needed a real IRQ line.
-  let _ = mmio_write_u32(sdhcfg, 0 as u32);
+  let _ = sd_mmio_write_u32(sdhcfg, 0 as u32);
 
   let sdcmd_no_response: u32 = 0x400 as u32;
   let sdcmd_long_response: u32 = 0x200 as u32;
@@ -5228,7 +5288,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts("SD: CMD0 (GO_IDLE_STATE) timed out\n");
     return 0 - 1;
   }
-  let diag_t_cmd0: u32 = mmio_read_u32(TIMER_CLO) - diag_t0;
+  let diag_t_cmd0: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
   let _ = uart_puts("SD DIAG: CMD0 done, t=");
   let _ = uart_put_i64(diag_t_cmd0 as i64);
   let _ = uart_puts("us\n");
@@ -5264,7 +5324,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // vector-table bug (docs/TODO.md, project memory
   // project_dhruva_pi1b_real_boot_investigation_2026_09_12).
   let cmd8_status: u32 = sdhost_cmd(8 as u32, 0x1AA as u32);
-  let diag_t_cmd8: u32 = mmio_read_u32(TIMER_CLO) - diag_t0;
+  let diag_t_cmd8: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
   let _ = uart_puts("SD DIAG: CMD8 done, t=");
   let _ = uart_put_i64(diag_t_cmd8 as i64);
   let _ = uart_puts("us\n");
@@ -5276,7 +5336,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
 
   if is_mmc == 0 {
     let _ = uart_puts("SD: CMD8 RSP0=0x");
-    let _ = uart_put_hex32(mmio_read_u32(sdrsp0));
+    let _ = uart_put_hex32(sd_mmio_read_u32(sdrsp0));
     let _ = uart_puts("\n");
 
     // ACMD41 loop: CMD55 (APP_CMD) then CMD41 (SD_SEND_OP_COND) with
@@ -5305,14 +5365,14 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
       if (sdhost_cmd_timed_out(cmd55_status) == 1) || (sdhost_cmd_timed_out(cmd41_status) == 1) {
         acmd41_wedged = 1;
       } else {
-        ocr = mmio_read_u32(sdrsp0);
+        ocr = sd_mmio_read_u32(sdrsp0);
         if (ocr & ocr_busy) != (0 as u32) {
           break;
         }
         acmd_iter = acmd_iter + 1;
       }
     }
-    let diag_t_acmd41: u32 = mmio_read_u32(TIMER_CLO) - diag_t0;
+    let diag_t_acmd41: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
     let _ = uart_puts("SD DIAG: ACMD41 loop exited, t=");
     let _ = uart_put_i64(diag_t_acmd41 as i64);
     let _ = uart_puts("us, acmd_iter=");
@@ -5372,7 +5432,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
       if sdhost_cmd_timed_out(cmd1_status) == 1 {
         mmc_wedged = 1;
       } else {
-        ocr = mmio_read_u32(sdrsp0);
+        ocr = sd_mmio_read_u32(sdrsp0);
         if (ocr & ocr_busy) != (0 as u32) {
           break;
         }
@@ -5426,7 +5486,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // response -- matching U-Boot's own approach (it never reads the
   // RCA back out of CMD3's response either). For SD, unchanged: the
   // card's own published RCA.
-  let rca: u32 = if is_mmc == 1 { cmd3_arg } else { mmio_read_u32(sdrsp0) & (0xFFFF0000 as u32) };
+  let rca: u32 = if is_mmc == 1 { cmd3_arg } else { sd_mmio_read_u32(sdrsp0) & (0xFFFF0000 as u32) };
 
   // CMD9: SEND_CSD -- long response, addressed by the RCA just
   // published. Not parsed yet (card capacity/speed class live here on
@@ -5482,7 +5542,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // unconditionally so the next real-hardware log shows the true
   // post-selection card state directly, not inferred from CMD17/
   // CMD24's own eventual wedge.
-  let cmd16_r1: u32 = mmio_read_u32(sdrsp0);
+  let cmd16_r1: u32 = sd_mmio_read_u32(sdrsp0);
   let cmd16_current_state: u32 = (cmd16_r1 >> (9 as u32)) & (0xF as u32);
   let _ = uart_puts("SD DIAG: post-CMD16 R1=0x");
   let _ = uart_put_hex32(cmd16_r1);
@@ -5552,7 +5612,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts(" failed=");
     let _ = uart_put_i64(acmd6_cmd55_failed);
     let _ = uart_puts(" SDHSTS=0x");
-    let _ = uart_put_hex32(mmio_read_u32(SDHSTS));
+    let _ = uart_put_hex32(sd_mmio_read_u32(SDHSTS));
     let _ = uart_puts("\n");
     let acmd6_status: u32 = sdhost_cmd(6 as u32, 2 as u32);
     let acmd6_timed_out: i64 = sdhost_cmd_timed_out(acmd6_status);
@@ -5564,9 +5624,9 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts(" failed=");
     let _ = uart_put_i64(acmd6_failed);
     let _ = uart_puts(" R1=0x");
-    let _ = uart_put_hex32(mmio_read_u32(sdrsp0));
+    let _ = uart_put_hex32(sd_mmio_read_u32(sdrsp0));
     let _ = uart_puts(" SDHSTS=0x");
-    let _ = uart_put_hex32(mmio_read_u32(SDHSTS));
+    let _ = uart_put_hex32(sd_mmio_read_u32(SDHSTS));
     let _ = uart_puts("\n");
     if (acmd6_cmd55_timed_out == 1) || (acmd6_timed_out == 1) || (acmd6_cmd55_failed == 1) || (acmd6_failed == 1) || (scr_result != 1) {
       let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH) failed/timed out, or SCR didn't confirm 4-bit -- staying 1-bit\n");
@@ -5621,7 +5681,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let div2: i64 = if (core_clock_hz / div1) > target_hz { div1 + 1 } else { div1 };
     let div3: i64 = div2 - 2;
     let div4: i64 = if div3 > max_div { max_div } else { div3 };
-    let _ = mmio_write_u32(sdcdiv, div4 as u32);
+    let _ = sd_mmio_write_u32(sdcdiv, div4 as u32);
     // 28th SD round follow-up (2026-09-25): U-Boot's own bcm2835_
     // set_clock does NOT stop at writing SDCDIV -- it also rewrites
     // SDTOUT to the ACHIEVED clock (core_clock_hz/(div+2), not the
@@ -5637,7 +5697,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     // this when the data-transfer clock switch itself is happening
     // (inside this same `if`, not the `else` fallback branch below).
     let achieved_clock_hz: i64 = core_clock_hz / (div4 + 2);
-    let _ = mmio_write_u32(sdtout, (achieved_clock_hz / 2) as u32);
+    let _ = sd_mmio_write_u32(sdtout, (achieved_clock_hz / 2) as u32);
     // ROUND 2026-09-18 (SD wedge investigation, fresh real-HW log
     // picocom_20260918_163633.log): a real, new, narrowing finding --
     // the write wedge now reproduces on the VERY FIRST write command
@@ -5705,11 +5765,11 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let _ = uart_puts(" is_sdhc=");
   let _ = uart_put_hex32(is_sdhc as u32);
   let _ = uart_puts(" SDHSTS=0x");
-  let _ = uart_put_hex32(mmio_read_u32(sdhsts));
+  let _ = uart_put_hex32(sd_mmio_read_u32(sdhsts));
   let _ = uart_puts(" SDEDM=0x");
-  let _ = uart_put_hex32(mmio_read_u32(sdedm));
+  let _ = uart_put_hex32(sd_mmio_read_u32(sdedm));
   let _ = uart_puts("\n");
-  let diag_t_end: u32 = mmio_read_u32(TIMER_CLO) - diag_t0;
+  let diag_t_end: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
   let _ = uart_puts("SD DIAG: sdhost_init total elapsed t=");
   let _ = uart_put_i64(diag_t_end as i64);
   let _ = uart_puts("us\n");
@@ -5892,10 +5952,10 @@ fn sdhost_card_addr(block_num: i64) -> u32 {
 fn sdhost_force_data_mode_settle(sdedm: i64) -> i64 {
   let iter: i64 = 0;
   while iter < 1000 {
-    let edm: u32 = mmio_read_u32(sdedm);
+    let edm: u32 = sd_mmio_read_u32(sdedm);
     let fsm: u32 = edm & (0xF as u32);
     if (fsm == (0 as u32)) || (fsm == (1 as u32)) {
-      let _ = mmio_write_u32(sdedm, edm & (0xFFF7FFFF as u32));
+      let _ = sd_mmio_write_u32(sdedm, edm & (0xFFF7FFFF as u32));
       return 0;
     }
     iter = iter + 1;
@@ -5905,8 +5965,8 @@ fn sdhost_force_data_mode_settle(sdedm: i64) -> i64 {
   // (this path is diagnostic-worthy but this function's own caller
   // already treats the outer wait as a success either way, matching
   // this function's own pre-existing behavior before this round).
-  let edm_final: u32 = mmio_read_u32(sdedm);
-  let _ = mmio_write_u32(sdedm, edm_final & (0xFFF7FFFF as u32));
+  let edm_final: u32 = sd_mmio_read_u32(sdedm);
+  let _ = sd_mmio_write_u32(sdedm, edm_final & (0xFFF7FFFF as u32));
   return 1;
 }
 
@@ -5941,15 +6001,15 @@ fn sdhost_force_data_mode_settle(sdedm: i64) -> i64 {
 fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
   let sdedm: i64 = SDEDM;
   let wtc_timeout_us: u32 = 1000000 as u32;
-  let wtc_t0: u32 = mmio_read_u32(TIMER_CLO);
-  while (mmio_read_u32(TIMER_CLO) - wtc_t0) < wtc_timeout_us {
-    let edm: u32 = mmio_read_u32(sdedm);
+  let wtc_t0: u32 = sd_mmio_read_u32(TIMER_CLO);
+  while (sd_mmio_read_u32(TIMER_CLO) - wtc_t0) < wtc_timeout_us {
+    let edm: u32 = sd_mmio_read_u32(sdedm);
     let fsm: u32 = edm & (0xF as u32);
     if (fsm == (0 as u32)) || (fsm == (1 as u32)) {
       return 0;
     }
     if fsm == alternate_idle {
-      let _ = mmio_write_u32(sdedm, edm | (0x80000 as u32));
+      let _ = sd_mmio_write_u32(sdedm, edm | (0x80000 as u32));
       let _ = sdhost_force_data_mode_settle(sdedm);
       return 0;
     }
@@ -5974,7 +6034,7 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
     // proven-working sequence exactly rather than re-deriving a
     // read/write-conditional version of it.
     if fsm == (2 as u32) {
-      let _ = mmio_write_u32(sdedm, edm | (0x80000 as u32));
+      let _ = sd_mmio_write_u32(sdedm, edm | (0x80000 as u32));
       let _ = sdhost_force_data_mode_settle(sdedm);
       return 0;
     }
@@ -5998,11 +6058,11 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
   let _ = uart_puts("SD DIAG: wait_transfer_complete timeout, alternate_idle=0x");
   let _ = uart_put_hex32(alternate_idle);
   let _ = uart_puts(" SDEDM=0x");
-  let _ = uart_put_hex32(mmio_read_u32(sdedm));
+  let _ = uart_put_hex32(sd_mmio_read_u32(sdedm));
   let _ = uart_puts(" SDHSTS=0x");
-  let _ = uart_put_hex32(mmio_read_u32(SDHSTS));
+  let _ = uart_put_hex32(sd_mmio_read_u32(SDHSTS));
   let _ = uart_puts(" SDCDIV=0x");
-  let _ = uart_put_hex32(mmio_read_u32(SDCDIV));
+  let _ = uart_put_hex32(sd_mmio_read_u32(SDCDIV));
   let _ = uart_puts("\n");
   return 1;
 }
@@ -6183,9 +6243,9 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // Read path already worked at 1-bit (task #217) -- this only
   // changes anything once is_4bit is actually 1.
   let read_sdhcfg: u32 = if sd_state_get_is_4bit() == 1 { 0x41C as u32 } else { 0x418 as u32 };
-  let _ = mmio_write_u32(SDHCFG, read_sdhcfg);
-  let _ = mmio_write_u32(sdhbct, 512 as u32);
-  let _ = mmio_write_u32(sdhblc, 1 as u32);
+  let _ = sd_mmio_write_u32(SDHCFG, read_sdhcfg);
+  let _ = sd_mmio_write_u32(sdhbct, 512 as u32);
+  let _ = sd_mmio_write_u32(sdhblc, 1 as u32);
   // DIAGNOSTIC (2026-09-19, real-hardware SD wedge investigation, per
   // the user's own structured debugging prompt): confirmed via the
   // real bcm2835-sdhost.c FSM/FIFO-count bit definitions that the
@@ -6204,8 +6264,8 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // or rule out a block-count/length mismatch on the next real-hardware
   // log, per this investigation's own "smallest test that distinguishes
   // the hypotheses" standard.
-  let sdhbct_readback: u32 = mmio_read_u32(sdhbct);
-  let sdhblc_readback: u32 = mmio_read_u32(sdhblc);
+  let sdhbct_readback: u32 = sd_mmio_read_u32(sdhbct);
+  let sdhblc_readback: u32 = sd_mmio_read_u32(sdhblc);
   let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
   // BUG found 2026-09-19 (real-hardware SD wedge investigation, per the
   // user's own structured follow-up prompt, item 8: "determine whether
@@ -6222,10 +6282,10 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     return 4;
   }
   let _ = sdhost_drain_fifo_to_buffer(buf, 128);
-  let edm_after_pio: u32 = mmio_read_u32(SDEDM);
+  let edm_after_pio: u32 = sd_mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
-  let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
-  let _ = mmio_write_u32(sdhsts, errs);
+  let errs: u32 = sd_mmio_read_u32(sdhsts) & (0xF8 as u32);
+  let _ = sd_mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
     return 1;
   }
@@ -6353,16 +6413,16 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // once ACMD6 has actually switched the card, matching WIDE_INT_BUS
   // with a genuinely wide external bus instead of a mismatched one.
   let write_sdhcfg: u32 = if sd_state_get_is_4bit() == 1 { 0x40E as u32 } else { 0x40A as u32 };
-  let _ = mmio_write_u32(SDHCFG, write_sdhcfg);
-  let _ = mmio_write_u32(sdhbct, 512 as u32);
-  let _ = mmio_write_u32(sdhblc, 1 as u32);
+  let _ = sd_mmio_write_u32(SDHCFG, write_sdhcfg);
+  let _ = sd_mmio_write_u32(sdhbct, 512 as u32);
+  let _ = sd_mmio_write_u32(sdhblc, 1 as u32);
   // DIAGNOSTIC (2026-09-19): see sdhost_read_block_once's own comment
   // just above -- identical reasoning, write-side half of the same
   // check. A wedge here shows FSM=WRITEDATA, FIFO=0/16 (EMPTY): the
   // write-side mirror of the read-side FULL-FIFO wedge, equally
   // consistent with the controller expecting more than 512 bytes.
-  let sdhbct_readback: u32 = mmio_read_u32(sdhbct);
-  let sdhblc_readback: u32 = mmio_read_u32(sdhblc);
+  let sdhbct_readback: u32 = sd_mmio_read_u32(sdhbct);
+  let sdhblc_readback: u32 = sd_mmio_read_u32(sdhblc);
   // 28th SD round (2026-09-25): three real, well-reasoned fixes
   // derived from register-level comparison against U-Boot's own
   // source (burst-write, 25th/26th round; SDHCFG_DATA_IRPT_EN
@@ -6395,7 +6455,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     if sdhost_cmd_timed_out(pre_cmd13_status) == 1 {
       let _ = uart_puts("SD DIAG: pre-CMD24 CMD13 (SEND_STATUS) timed out\n");
     } else {
-      let pre_cmd13_r1: u32 = mmio_read_u32(SDRSP0);
+      let pre_cmd13_r1: u32 = sd_mmio_read_u32(SDRSP0);
       let pre_cmd13_current_state: u32 = (pre_cmd13_r1 >> (9 as u32)) & (0xF as u32);
       let _ = uart_puts("SD DIAG: pre-CMD24 CMD13 (SEND_STATUS) R1=0x");
       let _ = uart_put_hex32(pre_cmd13_r1);
@@ -6490,7 +6550,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // phenomenon, narrowing the search further.
   let fifo_drain_iter: i64 = 0;
   while fifo_drain_iter < 1000000 {
-    let edm_drain: u32 = mmio_read_u32(SDEDM);
+    let edm_drain: u32 = sd_mmio_read_u32(SDEDM);
     let fifo_occupancy: u32 = (edm_drain >> (4 as u32)) & (0x1F as u32);
     if fifo_occupancy == (0 as u32) {
       break;
@@ -6499,14 +6559,14 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   }
   if fifo_drain_iter >= 1000000 {
     let _ = uart_puts("SD DIAG: FIFO-drain-to-empty poll timed out (new signal, never checked before) SDEDM=0x");
-    let _ = uart_put_hex32(mmio_read_u32(SDEDM));
+    let _ = uart_put_hex32(sd_mmio_read_u32(SDEDM));
     let _ = uart_puts("\n");
   }
 
-  let edm_after_pio: u32 = mmio_read_u32(SDEDM);
+  let edm_after_pio: u32 = sd_mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_writestart1);
-  let errs: u32 = mmio_read_u32(sdhsts) & (0xF8 as u32);
-  let _ = mmio_write_u32(sdhsts, errs);
+  let errs: u32 = sd_mmio_read_u32(sdhsts) & (0xF8 as u32);
+  let _ = sd_mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
     return 1;
   }
@@ -6546,7 +6606,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     if sdhost_cmd_timed_out(cmd13_status) == 1 {
       let _ = uart_puts("SD DIAG: post-wedge CMD13 (SEND_STATUS) timed out -- controller too wedged to respond\n");
     } else {
-      let cmd13_r1: u32 = mmio_read_u32(SDRSP0);
+      let cmd13_r1: u32 = sd_mmio_read_u32(SDRSP0);
       let cmd13_current_state: u32 = (cmd13_r1 >> (9 as u32)) & (0xF as u32);
       let _ = uart_puts("SD DIAG: post-wedge CMD13 (SEND_STATUS) R1=0x");
       let _ = uart_put_hex32(cmd13_r1);

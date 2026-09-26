@@ -204,14 +204,57 @@ sdhost_drain_fifo_to_buffer_impl:
 sdhost_drain_loop:
     cmp r4, #0
     beq sdhost_drain_done
-    ldr r5, =1000            /* bounded burst-readiness retry cap,
+    ldr r5, =400             /* bounded burst-readiness retry cap,
                                * MASKED-loop-specific -- see this
                                * function's own header comment for why
-                               * this is 1000, not the shared 100000
+                               * this is far below the shared 100000
                                * every genuinely-unmasked per-burst poll
-                               * elsewhere in this file still uses */
+                               * elsewhere in this file still uses.
+                               * REDUCED from 1000 to 400 in the 32nd SD
+                               * round: adding the DMB after every SDEDM
+                               * poll (this loop's own new mcr p15
+                               * instruction, right below) raised the
+                               * real measured per-iteration cost from
+                               * 0.327us (task #285) to 0.55515us
+                               * (sd_fill_poll_body_wcet_measure_self_
+                               * test, re-measured this round) -- at the
+                               * OLD cap of 1000 that pushes the worst
+                               * case (128 words x 1000 x 0.55515us =
+                               * 71.04ms) PAST this project's own
+                               * largest already-schedulability-checked
+                               * blocking term (LOW's 49.906ms ceiling-0
+                               * critical section, test/schedulability_
+                               * analysis.py) -- exactly the budget this
+                               * cap was originally tuned to fit under.
+                               * 400 lands the new worst case at 128 x
+                               * 400 x 0.55515us = 28.42ms, comfortably
+                               * under 49.906ms again (43% margin) even
+                               * though QEMU's own near-instant cp15
+                               * emulation likely UNDERSTATES real
+                               * ARMv6 DMB latency -- still 400x more
+                               * headroom than any per-word retry count
+                               * ever actually observed in this saga's
+                               * real-HW/QEMU logs (a healthy FIFO check
+                               * has always succeeded within a handful
+                               * of iterations), so this remains a
+                               * pathological-worst-case fallback bound,
+                               * never something the normal path
+                               * approaches. */
 sdhost_drain_poll:
     ldr r2, [r6]
+    mcr p15, 0, r1, c7, c10, 5 /* 32nd SD round: DMB after the SDEDM
+                               * read, matching U-Boot's own readl()
+                               * (arch/arm/include/asm/io.h: `__v =
+                               * __arch_getl(c); __iormb(); return
+                               * __v;`) -- confirmed via disassembly
+                               * that U-Boot's own bcm2835_transfer_
+                               * block_pio carries this on every single
+                               * EDM/SDDATA access, this loop had none.
+                               * r1 is free here (not live until the
+                               * burst section below). See boot/
+                               * context_switch.S's mem_barrier() for
+                               * the same instruction used elsewhere in
+                               * this project. */
     mov r2, r2, lsr #4
     and r2, r2, #0x1F        /* r2 = current FIFO word count (fill) */
     mov r7, #8               /* SDDATA_FIFO_PIO_BURST, matching
@@ -238,6 +281,16 @@ sdhost_drain_have_enough:
     ldr r3, =0x20202040      /* SDDATA */
 sdhost_drain_burst:
     ldr r1, [r3]
+    mcr p15, 0, r7, c7, c10, 5 /* 32nd SD round: DMB after the SDDATA
+                               * read, matching U-Boot's readl() again
+                               * -- r7's burst_words role is already
+                               * done by this point (same "safe to
+                               * reuse" reasoning as this file's own
+                               * write-side burst loop), free to use as
+                               * the DMB's SBZ operand. The following
+                               * str is a normal-memory buffer write,
+                               * not a peripheral access, so it needs
+                               * no barrier of its own. */
     str r1, [r0], #4
     subs r2, r2, #1
     bne sdhost_drain_burst
@@ -286,6 +339,12 @@ sd_scr_drain_diag:
     ldr r5, =100000           /* bounded poll-for-both-words retry cap */
 sd_scr_diag_poll:
     ldr r0, [r6]
+    mcr p15, 0, r2, c7, c10, 5 /* 32nd SD round: DMB after the SDEDM
+                               * read, matching U-Boot's readl() -- see
+                               * sdhost_drain_fifo_to_buffer_impl's own
+                               * matching comment for the full
+                               * rationale. r2 unused until the diag
+                               * prints below, safe as scratch. */
     mov r1, r0, lsr #4
     and r1, r1, #0x1F         /* r1 = current FIFO word count */
     cmp r1, #2                /* need BOTH words ready, matching
@@ -305,10 +364,19 @@ sd_scr_diag_ready:
                                * both words below */
     ldr r7, =0x20202040       /* SDDATA */
     ldr r5, [r7]               /* word 0 */
+    mcr p15, 0, r2, c7, c10, 5 /* 32nd SD round: DMB after word 0's
+                               * read -- U-Boot's own back-to-back
+                               * burst reads carry one per readl() call
+                               * too (arch/arm/include/asm/io.h), so
+                               * this doesn't break the "back-to-back"
+                               * intent below, it makes it byte-for-
+                               * byte match what readl()+readl() really
+                               * compiles to in the reference driver. */
     ldr r0, [r7]               /* word 1 -- back-to-back with word 0,
-                               * zero instructions in between besides
-                               * the two loads themselves, matching
-                               * U-Boot's own real burst loop exactly */
+                               * matching U-Boot's own real burst loop
+                               * exactly (each word's own readl() call,
+                               * barrier included) */
+    mcr p15, 0, r2, c7, c10, 5 /* DMB after word 1's read */
     str r5, [r4]
     str r0, [r4, #4]
     mov r6, r0                 /* r6 (SDEDM addr, no longer needed)
@@ -480,15 +548,28 @@ sdhost_fill_fifo_from_buffer_impl:
 sdhost_fill_loop:
     cmp r4, #0
     beq sdhost_fill_done
-    ldr r5, =1000            /* bounded burst-readiness retry cap,
+    ldr r5, =400             /* bounded burst-readiness retry cap,
                                * MASKED-loop-specific (see this function's
                                * own header comment above for why this is
-                               * 1000, not the shared 100000 every other
+                               * far below the shared 100000 every other
                                * per-word poll in this file still uses) --
-                               * now gates finding ANY room for the next
-                               * burst, not a single word */
+                               * gates finding ANY room for the next
+                               * burst, not a single word. REDUCED from
+                               * 1000 to 400 in the 32nd SD round -- see
+                               * sdhost_drain_fifo_to_buffer_impl's own
+                               * matching comment above for the full
+                               * DMB-overhead/schedulability rationale
+                               * (same measured per-iteration cost,
+                               * same 49.906ms budget, same math). */
 sdhost_fill_poll:
     ldr r2, [r6]
+    mcr p15, 0, r1, c7, c10, 5 /* 32nd SD round: DMB after the SDEDM
+                               * read, matching U-Boot's readl() -- see
+                               * sdhost_drain_fifo_to_buffer_impl's own
+                               * matching comment above for the full
+                               * rationale. r1 is unused anywhere in
+                               * this function, safe as the DMB's SBZ
+                               * operand. */
     mov r2, r2, lsr #4
     and r2, r2, #0x1F        /* r2 = current FIFO fill count */
     rsb r2, r2, #16          /* r2 = room = SDDATA_FIFO_WORDS(16) - fill,
@@ -533,6 +614,20 @@ sdhost_fill_have_room:
                                * safe to reuse */
 sdhost_fill_burst:
     ldr r3, [r0], #4
+    mcr p15, 0, r1, c7, c10, 5 /* 32nd SD round: DMB BEFORE the SDDATA
+                               * write, matching U-Boot's own writel()
+                               * (arch/arm/include/asm/io.h: `__iowmb();
+                               * __arch_putl(v,c);`) -- barrier-then-
+                               * store, the opposite ordering from the
+                               * read side, and the reason this driver's
+                               * own 0x20000000-0x20FFFFFF peripheral
+                               * mapping (Shareable Device, boot/mmu_
+                               * init.S) can't skip it the way Strongly
+                               * Ordered memory could: posted writes to
+                               * DIFFERENT registers aren't guaranteed
+                               * to land in issue order without this.
+                               * The preceding ldr is a normal-memory
+                               * buffer read, needs no barrier. */
     str r3, [r7]
     subs r2, r2, #1
     bne sdhost_fill_burst
