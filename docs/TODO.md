@@ -10413,3 +10413,32 @@ THREE times, identical to documented baseline every time. Commit
 most complete fix in the whole saga: both read and write PIO paths
 match U-Boot's real gate-then-burst semantics exactly, not just the
 burst size.
+
+## 30th SD round: read PIO loop masked too -- syscall #6, matching real Linux's own upstream driver
+
+A stray filesystem search (looking for something unrelated) turned up
+a real, cached Linux kernel source tree with the actual upstream
+`drivers/mmc/host/bcm2835-sdhost.c` -- genuinely more authoritative
+than U-Boot's own port of it, never checked directly in this
+investigation until now. Its read/write burst gate logic confirmed
+identical in structure to U-Boot's (independent triangulation the
+30th round's gate fixes are correct) -- but it also wraps BOTH
+`bcm2835_sdhost_read_block_pio` and `_write_block_pio` in
+`local_irq_save/restore` for their entire duration. This driver's
+write path already got that treatment (syscall #5, 21st SD round);
+the read path never did, and matters more now that correctness
+depends on genuinely uninterrupted back-to-back reads within a burst.
+
+Added syscall #6 (`sdhost_drain_fifo_to_buffer`), same migration shape
+as syscall #5: real logic renamed to `sdhost_drain_fifo_to_buffer_
+impl`, masked via the same mrs/cpsid/msr pattern, retry cap dropped
+100000 -> 1000 (matching the write side's own masked-loop-specific
+cap, already established correct by round 22's WCET analysis).
+
+Verified: build clean, boots under QEMU (exercises syscall #6 heavily
+throughout the boot self-test suite), `phase4_milestone.py` run THREE
+times, identical to documented baseline every time. Commit `8f0f7a7`.
+**Not yet real-HW tested.** This closes out the full set of real,
+U-Boot/Linux-comparison-derived fixes found this round: read+write
+burst gates now both match, and both PIO loops are now masked, not
+just the write one.
