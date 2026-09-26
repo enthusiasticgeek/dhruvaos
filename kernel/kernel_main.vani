@@ -2706,6 +2706,16 @@ extern "C" fn sdhost_diag_dump_regs_post_cmd24() -> i64;
 // assumption").
 #[stack_cost(bytes=24)]
 extern "C" fn sdhost_get_core_clock_hz() -> i64;
+// 2026-09-26: ARM1176JZF-S Performance Monitor cycle counter, CP15
+// c15 (see boot/pmccntr_state.S's own header for the exact register
+// encoding and why this predates the ARMv7 c9-based PMU). Closes the
+// RTOS_GAP_ANALYSIS.md gap noting sdhost_cmd's 1,000,000-iteration
+// poll cap had never had a real absolute-time bound computed, only
+// an iteration count, for lack of any cycle counter in this codebase.
+#[stack_cost(bytes=1)]
+extern "C" fn pmccntr_enable() -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn pmccntr_read() -> u32;
 // 28th SD round (2026-09-25) -- see boot/rpi1/uboot_sdhost_write.c's
 // own header comment for the full "why". Literal C transliteration
 // of real U-Boot's own working write-path algorithm, self-contained
@@ -3204,6 +3214,114 @@ fn sd_fill_poll_body_wcet_measure_self_test() -> i64 {
   let _ = uart_puts(" retries/word x 128 words, wedged-FIFO case) = ");
   let _ = uart_put_i64(worst_case_us);
   let _ = uart_puts("us -- IRQ+FIQ masked the ENTIRE window (syscall #5), so task #271 WCET eviction and task #269 stuck-task watchdog cannot fire until it returns\n");
+  return 0;
+}
+
+// 2026-09-26: RTOS_GAP_ANALYSIS.md, section 4, flags this precisely:
+// "this project has no cycle counter wired up anywhere to measure
+// [sdhost_cmd's poll-body cost]... presenting a specific millisecond
+// figure without that would be false precision, not a real bound."
+// Every other WCET self-test in this file (delay_wcet_measure_self_
+// test, i64_div_wcet_measure_self_test, sd_fill_poll_body_wcet_
+// measure_self_test above) derives its own per-iteration cost from
+// TIMER_CLO (1us resolution, amortized over 100,000 iterations) --
+// good enough for those, but this closes the SPECIFIC documented gap
+// by using a genuine, independent cycle counter instead, per the
+// user's own explicit direction to wire up PMCCNTR.
+//
+// Cross-validates PMCCNTR against TIMER_CLO FIRST, before trusting any
+// number derived from it: ARM1176JZF-S's performance-monitor CP15 c15
+// registers are real, architecturally-guaranteed hardware on real
+// silicon, but whether QEMU's own arm1176 CPU model actually
+// implements them is genuinely unknown until tested -- an
+// unimplemented MRC on this class of "implementation-defined" CP15
+// register is specified to read back a fixed/undefined value, not
+// trap, so a SILENT WRONG ANSWER (PMCCNTR never advancing) is the
+// real failure mode to guard against, not a crash.
+fn pmccntr_self_test() -> i64 {
+  let _ = pmccntr_enable();
+
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  let c0: u32 = pmccntr_read();
+  let busy_iter: i64 = 0;
+  while busy_iter < 1000000 {
+    busy_iter = busy_iter + 1;
+  }
+  let c1: u32 = pmccntr_read();
+  let t1: u32 = mmio_read_u32(TIMER_CLO);
+  let elapsed_us: u32 = t1 - t0;
+  let elapsed_cycles: u32 = c1 - c0;
+
+  let _ = uart_puts("PMCCNTR DIAG: cross-check vs TIMER_CLO -- elapsed_us=");
+  let _ = uart_put_i64(elapsed_us as i64);
+  let _ = uart_puts(" elapsed_cycles=");
+  let _ = uart_put_i64(elapsed_cycles as i64);
+
+  if elapsed_cycles == (0 as u32) {
+    let _ = uart_puts(" -- PMCCNTR NOT COUNTING (unimplemented on this core/emulator) -- cannot derive a real SD WCET time bound from it here\n");
+    return 0 - 1;
+  }
+
+  let implied_clock_mhz: i64 = (elapsed_cycles as i64) / (elapsed_us as i64);
+  let _ = uart_puts(" implied_clock_mhz=");
+  let _ = uart_put_i64(implied_clock_mhz);
+  let _ = uart_puts("\n");
+  return implied_clock_mhz;
+}
+
+// Applies pmccntr_self_test's own validated cycle counter to the
+// SPECIFIC gap RTOS_GAP_ANALYSIS.md names: sdhost_cmd's 1,000,000-
+// iteration poll cap has only ever been documented as an iteration
+// count, never a real absolute time bound. Measures the exact same
+// poll-body shape sdhost_cmd itself uses (a barriered SDCMD read +
+// NEW_FLAG mask/compare) via the real MMIO address, not a synthetic
+// stand-in -- valid whether or not real hardware/a card is actually
+// present, since the cost being measured is the read+compare
+// instruction sequence itself, not the card's own response.
+fn sdhost_cmd_poll_body_pmccntr_self_test() -> i64 {
+  let implied_clock_mhz: i64 = pmccntr_self_test();
+  if implied_clock_mhz <= 0 {
+    let _ = uart_puts("PMCCNTR DIAG: skipping sdhost_cmd poll-body cycle measurement (PMCCNTR unavailable on this build)\n");
+    return 0 - 1;
+  }
+
+  let sdcmd: i64 = SDCMD;
+  let sdcmd_new_flag: u32 = 0x8000 as u32;
+  let iters: i64 = 100000;
+  let acc: u32 = 0;
+  let c0: u32 = pmccntr_read();
+  let i: i64 = 0;
+  while i < iters {
+    let v: u32 = sd_mmio_read_u32(sdcmd);
+    if (v & sdcmd_new_flag) == (0 as u32) {
+      acc = acc + (1 as u32);
+    }
+    i = i + 1;
+  }
+  let c1: u32 = pmccntr_read();
+  let total_cycles: u32 = c1 - c0;
+  let cycles_per_iter: i64 = (total_cycles as i64) / iters;
+
+  let _ = uart_puts("PMCCNTR DIAG: sdhost_cmd poll body real cost = ");
+  let _ = uart_put_i64(cycles_per_iter);
+  let _ = uart_puts(" cycles/iteration (");
+  let _ = uart_put_i64(iters);
+  let _ = uart_puts(" iterations, ready-count=");
+  let _ = uart_put_i64(acc as i64);
+  let _ = uart_puts(") at implied ");
+  let _ = uart_put_i64(implied_clock_mhz);
+  let _ = uart_puts("MHz\n");
+
+  let poll_cap: i64 = 1000000;
+  let worst_case_cycles: i64 = cycles_per_iter * poll_cap;
+  let worst_case_us: i64 = worst_case_cycles / implied_clock_mhz;
+  let _ = uart_puts("PMCCNTR DIAG: sdhost_cmd worst-case poll duration (");
+  let _ = uart_put_i64(poll_cap);
+  let _ = uart_puts(" iterations x ");
+  let _ = uart_put_i64(cycles_per_iter);
+  let _ = uart_puts(" cycles) = ");
+  let _ = uart_put_i64(worst_case_us);
+  let _ = uart_puts("us -- the real, PMCCNTR-measured absolute-time bound for a single stuck sdhost_cmd call (closes RTOS_GAP_ANALYSIS.md's own documented gap)\n");
   return 0;
 }
 
@@ -38539,6 +38657,7 @@ fn kernel_main() -> i64 {
   let _ = delay_wcet_measure_self_test();
   let _ = i64_div_wcet_measure_self_test();
   let _ = sd_fill_poll_body_wcet_measure_self_test();
+  let _ = sdhost_cmd_poll_body_pmccntr_self_test();
   let _ = task_deadlines_init();
   let _ = task_heartbeat_init();
   // ROUND 2026-09-18 (task #242): seed the very first tick's own UART

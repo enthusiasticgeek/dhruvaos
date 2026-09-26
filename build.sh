@@ -106,6 +106,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/governor_state.S" -o "${BUILD_DIR}/governor_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/pmccntr_state.S" -o "${BUILD_DIR}/pmccntr_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/netif_state.S" -o "${BUILD_DIR}/netif_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -274,7 +277,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/fiq_entry.o" "${BUILD_DIR}/swi_entry.o" "${BUILD_DIR}/vectors.o" \
   "${BUILD_DIR}/sdcard_state.o" "${BUILD_DIR}/dharafs_buf.o" \
   "${BUILD_DIR}/dharafs_state.o" "${BUILD_DIR}/shell_state.o" \
-  "${BUILD_DIR}/governor_state.o" "${BUILD_DIR}/netif_state.o" \
+  "${BUILD_DIR}/governor_state.o" "${BUILD_DIR}/pmccntr_state.o" "${BUILD_DIR}/netif_state.o" \
   "${BUILD_DIR}/arp_state.o" "${BUILD_DIR}/scratch_state.o" \
   "${BUILD_DIR}/tcp_state.o" "${BUILD_DIR}/dhcp_state.o" \
   "${BUILD_DIR}/dhcp_server_state.o" \
