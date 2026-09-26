@@ -10603,3 +10603,65 @@ the real production read/write paths, not a diagnostic-only change.
 deterministic SCR/block corruption that has persisted across every
 fix attempted since the 25th round. Findings #1 and #2 above remain
 open, lower-priority follow-ups if #3 alone doesn't resolve it.
+
+**2026-09-26, 33rd/34th SD rounds: the DMB fix did NOT resolve it on
+real-HW retest -- but the follow-up instrumentation found the most
+decisive evidence in the whole saga.**
+
+33rd round: rewrote `sd_scr_drain_diag` to drain and print ALL 8 words
+the hardware reports for the SCR (was hardcoded to 2). Real-HW result:
+every word after the first is an exact byte-shift of the one before --
+`word[n] = (word[n-1] << 8) | new_byte`, with new bytes 0x02, 0x35,
+0x80, then zero forever. Mathematically exact across all 8 samples --
+a real hardware shift-register signature, not noise.
+
+34th round: added a print of the actual SDHSTS error-bit value in
+`sdhost_read_block_once`/`sdhost_write_block_once` (previously
+captured into `errs`, cleared, and only the boolean "was nonzero"
+ever survived as the wr=3/rd=3 return code) and a diagnostic-only
+FSM-idle precondition check in `sdhost_cmd` (the 32nd round's finding
+#2, U-Boot's own `bcm2835_send_cmd` refuses any command unless FSM is
+already idle -- DhruvaOS never checked this). Real-HW result:
+**write fails with CRC16 (0x20) -- a genuine data-CRC mismatch. Read
+fails with FIFO_ERROR (0x08) -- a genuine FIFO overrun/underrun.**
+Zero occurrences of FSM-not-idle -- that hypothesis is ruled out
+cleanly. Digging further into the SAME log: CMD17 itself was failing
+with SDCMD_FAIL_FLAG / SDHSTS=CMD_TIMEOUT on the FIRST attempt at
+50MHz on nearly every block (the card not responding to the read
+command within the timeout window at all), forcing the existing
+backoff-to-12.5MHz retry, which is what then hit the CRC16/FIFO_ERROR
+above. Command timeout + data CRC failure + FIFO error together are
+exactly what marginal real-world signal integrity looks like at
+speed -- not a software sequencing bug (round 28 already ruled out
+the PIO loop logic itself via a literal working-reference C port;
+this round's own FSM-idle check rules out state-machine bleed too).
+
+Separately, per direct user observation mid-investigation ("uart
+print can certainly impact timing boot"): audited
+`uboot_style_sdhost_write_block` (`boot/rpi1/uboot_sdhost_write.c` --
+the C-port write path the 8-block diagnostic sweep actually exercises
+for every block) and found 6 UNCONDITIONAL print sequences firing on
+every single write, success or not, including ones sitting squarely
+between CMD24's command phase completing and the PIO phase starting,
+and between PIO completion and the SDHSTS check. At this project's
+own ~87us/byte polled/blocking UART cost, that's tens of milliseconds
+of dead time inserted into every write's own critical timing window --
+a real confound riding on top of whatever the actual hardware issue
+is. Removed all 6 (kept every already-conditional failure-path print
+unchanged). The vani-level production read/write paths and the
+8-block sweep's own outer loop were already correctly failure-gated.
+
+**Fix**: dropped `sdhost_init()`'s default data-transfer clock
+50MHz -> 1MHz (`SD_SPEED_BACKOFF_HZ` also corrected 12.5MHz -> 500kHz,
+since it had become a step UP from the new default rather than a
+genuine backoff). A deliberately conservative, single-variable test
+directly targeting the newly-confirmed signal-integrity symptom.
+Commits `43d3c14` (error-bit + FSM-idle diagnostics), `3faa57b`
+(clock drop + print removal).
+
+Verified: build clean, boots under QEMU, `phase4_milestone.py` run 2x
+matching documented baseline exactly each time. **Awaiting real-HW
+retest** at the new 1MHz default with the timing-perturbing prints
+removed -- the cleanest test this whole saga has had: minimal
+diagnostic overhead, a conservative clock, and definitive per-error
+visibility if it still fails.
