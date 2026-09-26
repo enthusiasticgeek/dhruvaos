@@ -10442,3 +10442,40 @@ times, identical to documented baseline every time. Commit `8f0f7a7`.
 U-Boot/Linux-comparison-derived fixes found this round: read+write
 burst gates now both match, and both PIO loops are now masked, not
 just the write one.
+
+## 30th SD round: explicit FIFO drain-to-empty on every reset -- the actual root cause?
+
+Real-HW retest of this round's read/write burst-gate fixes + IRQ
+masking (previous entries) showed the new SCR-read diagnostic
+(`sd_scr_drain_diag`) reporting `fifo_fill=0x8` at the moment of BOTH
+2-word SCR reads -- objectively impossible for a genuine ACMD51
+response (only ever 8 real bytes = 2 words total). The raw `SDDATA`
+values read (`0x00000002`, `0x00000235`) were independently confirmed
+correct AT THE MOMENT of the MMIO read -- never a software bug in the
+drain/store/print code.
+
+The real tell: the exact same corrupted bytes
+(`02 00 00 00 35 02 00 00`) appeared byte-for-byte identical across
+EVERY real-HW test this entire session -- 25MHz and 50MHz, with and
+without ACMD6, before and after the burst-gate fix, before and after
+IRQ masking. That invariance only makes sense as stale data sitting in
+the FIFO's own hardware SRAM, never actually cleared by any "logical"
+register-level reset performed so far. Confirmed by re-reading Linux's
+own real upstream `bcm2835-sdhost.c`, U-Boot's port, and this driver's
+own reset sequence: none of the three ever explicitly reads-and-
+discards whatever's already sitting in the physical FIFO as part of
+reset -- the register writes and the SDVDD power toggle never touch
+`SDDATA` at all.
+
+Added an explicit FIFO drain-to-empty step to `sdhost_init_at_speed`,
+right after the reset/power-cycle, before any command is issued:
+reads and discards `SDDATA` while `SDEDM`'s fill count is nonzero,
+bounded at 1000 iterations. Runs on every init (first boot and every
+retry), so stale content can never silently survive a reset again.
+
+Verified: build clean, boots under QEMU, `phase4_milestone.py` run
+twice, identical to documented baseline both times. Commit `a4264c9`.
+**Not yet real-HW tested** -- but this is the first fix in the whole
+30-round saga directly, mechanistically supported by an otherwise-
+inexplicable, byte-for-byte-invariant symptom, rather than reasoning
+from a register-value comparison alone.
