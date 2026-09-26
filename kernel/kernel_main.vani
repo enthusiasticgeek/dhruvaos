@@ -2716,6 +2716,22 @@ extern "C" fn sdhost_get_core_clock_hz() -> i64;
 extern "C" fn pmccntr_enable() -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn pmccntr_read() -> u32;
+// 2026-09-26: real-HW UART corruption investigation -- see
+// boot/uart_clock_state.S's own header comment for the full "why".
+// Queries the UART's own clock rate live (mailbox GET_CLOCK_RATE,
+// clock id 2), to directly test whether it shifts when the CPU
+// frequency governor changes the ARM clock (id 3) at runtime.
+#[stack_cost(bytes=24)]
+extern "C" fn uart_get_clock_hz() -> i64;
+// 2026-09-26: real-HW investigation, second hypothesis after directly
+// ruling out the first (UART clock proven independent of the ARM
+// clock the governor scales, see uart_clock_governor_cross_check_
+// self_test). See boot/throttled_state.S's own header comment for the
+// full "why" -- real Raspberry Pi firmware's own hardware-detected
+// undervoltage/throttling status, completely independent of anything
+// this codebase's software does.
+#[stack_cost(bytes=24)]
+extern "C" fn get_throttled_status() -> i64;
 // 28th SD round (2026-09-25) -- see boot/rpi1/uboot_sdhost_write.c's
 // own header comment for the full "why". Literal C transliteration
 // of real U-Boot's own working write-path algorithm, self-contained
@@ -23681,6 +23697,86 @@ fn governor_replay_test() -> i64 {
   return 0;
 }
 
+// 2026-09-26: real-HW investigation -- a fresh picocom capture showed
+// genuine UART bit-level corruption (recognizable text like "idle"/
+// "GOVERNOR" degrading into repeated garbage, including picocom's own
+// "M-I" notation for a byte with the high bit incorrectly set --
+// definitive proof of real serial-line corruption, not a software
+// print bug) starting just a few lines after the live governor_step's
+// own FIRST real (not self-test) ARM-clock change of the boot. This
+// project's own UART init hardcodes its baud-rate divisor assuming a
+// fixed 3MHz UART clock, never queried live -- a well-known real
+// Raspberry Pi gotcha exists for exactly this shared-PLL dependency on
+// some firmware/config.txt combinations (UART baud drifting when core/
+// ARM clock changes at runtime).
+//
+// Direct test, run here (a plain boot-time self-test, deliberately NOT
+// inside governor_step itself -- an earlier attempt to add this same
+// query there pushed task_d_wake_body's own #[wcet(cycles=100000)]
+// static estimate to 129465 cycles via the mailbox round-trip's own
+// bounded-100000-iteration poll loops; this project's own WCET checker
+// caught that correctly, and a diagnostic has no business spending a
+// real task's declared safety budget): query the UART clock, make a
+// REAL governor_apply_freq_mhz call (the same mailbox SET_CLOCK_RATE
+// the live governor uses, ARM clock id 3), query the UART clock again
+// immediately after, and compare. Restores a safe default afterward --
+// this self-test's own job is to OBSERVE, not leave the system at an
+// arbitrary frequency for the rest of boot.
+fn uart_clock_governor_cross_check_self_test() -> i64 {
+  let uart_hz_before: i64 = uart_get_clock_hz();
+  let _ = uart_puts("UART DIAG: clock before a real governor_apply_freq_mhz call = ");
+  let _ = uart_put_i64(uart_hz_before);
+  let _ = uart_puts("Hz\n");
+
+  let apply_status: i64 = governor_apply_freq_mhz(700);
+  let uart_hz_after: i64 = uart_get_clock_hz();
+  let _ = uart_puts("UART DIAG: clock after governor_apply_freq_mhz(700) (status=");
+  let _ = uart_put_i64(apply_status);
+  let _ = uart_puts(") = ");
+  let _ = uart_put_i64(uart_hz_after);
+  let _ = uart_puts("Hz");
+  if uart_hz_after == uart_hz_before {
+    let _ = uart_puts(" -- UNCHANGED (UART clock independent of the ARM clock on this build -- rules out this hypothesis)\n");
+  } else {
+    let _ = uart_puts(" -- CHANGED (UART clock is NOT independent of the ARM clock the governor scales -- likely root cause of the real-HW UART corruption seen after governor activity)\n");
+  }
+
+  // 2026-09-26: with the ARM clock just deliberately forced to 700MHz
+  // above (this project's own highest current-draw state) and the
+  // UART-clock hypothesis directly ruled out, check real Raspberry Pi
+  // firmware's own hardware-detected power status right now -- a
+  // marginal supply/wiring sagging under load could plausibly degrade
+  // BOTH UART and SD signal integrity at once (this project's SD
+  // investigation has independently found real CMD_TIMEOUT/CRC16/
+  // FIFO_ERROR symptoms on this exact board), even though each
+  // peripheral's own clock source stays technically correct. Bit 0 =
+  // under-voltage detected right now; bit 16 = has occurred since
+  // boot (sticky, so this catches an EARLIER dip too, not just one
+  // happening at this exact instant).
+  let throttled: i64 = get_throttled_status();
+  let _ = uart_puts("POWER DIAG: GET_THROTTLED = 0x");
+  let _ = uart_put_hex32(throttled as u32);
+  if throttled == (0 - 1) {
+    let _ = uart_puts(" (mailbox query failed)\n");
+  } else {
+    let uv_now: i64 = throttled & 1;
+    let uv_since_boot: i64 = (throttled >> 16) & 1;
+    let _ = uart_puts(" under_voltage_now=");
+    let _ = uart_put_i64(uv_now);
+    let _ = uart_puts(" under_voltage_since_boot=");
+    let _ = uart_put_i64(uv_since_boot);
+    if (uv_now != 0) || (uv_since_boot != 0) {
+      let _ = uart_puts(" -- REAL HARDWARE-DETECTED UNDER-VOLTAGE (likely root cause of the real-HW UART/SD signal-integrity symptoms)\n");
+    } else {
+      let _ = uart_puts(" -- clean, no under-voltage detected at or before this point\n");
+    }
+  }
+
+  let _ = governor_apply_freq_mhz(250);
+  let _ = governor_set_last_applied_mhz(250);
+  return 0;
+}
+
 // Idle: always ready, lowest priority, never sleeps. Only ever runs
 // when HIGH/MEDIUM/LOW are all genuinely asleep at the same moment --
 // seeing "idle" in the log at all is a real, useful signal that the
@@ -38546,6 +38642,7 @@ fn kernel_main() -> i64 {
   let _ = governor_self_test(4, 700);
   let _ = governor_self_test(5, 700);
   let _ = governor_replay_test();
+  let _ = uart_clock_governor_cross_check_self_test();
 
   // Round 60: packet filtering's own default policy -- .bss's own
   // zero-init would otherwise leave fw_default_policy at 0 (deny),
