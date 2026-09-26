@@ -333,7 +333,7 @@ sdhost_drain_done:
  * i64 sd_scr_drain_diag(mut ref i64 buf) */
 .global sd_scr_drain_diag
 sd_scr_drain_diag:
-    push {r4, r5, r6, r7, r8, lr}
+    push {r4, r5, r6, r7, r8, r9, lr}
     mov r4, r0                /* r4 = buffer pointer */
     ldr r6, =0x20202034       /* SDEDM */
     ldr r5, =100000           /* bounded poll-for-both-words retry cap */
@@ -358,61 +358,74 @@ sd_scr_diag_poll:
      * (sdhost_fill_fifo_from_buffer_impl); r1 (fill<2) still gets
      * printed below so this is visible in the log, not silent. */
 sd_scr_diag_ready:
-    mov r8, r1                /* r8 = fill count AT THE GATE, snapshot
-                               * before either real read (which could
-                               * itself change fill) -- printed for
-                               * both words below */
+    mov r8, r1                /* r8 = fill count AT THE GATE -- 33rd SD
+                               * round (2026-09-26): the new pre-poll
+                               * immediate SDEDM read added last round
+                               * showed fill=8 INSTANTLY, before any
+                               * polling, for a transfer that's only
+                               * ever 2 words. This function used to
+                               * hardcode exactly 2 word reads
+                               * regardless of the real fill count,
+                               * leaving up to 6 words behind in the
+                               * FIFO -- silently available to whatever
+                               * command runs next (the 8-block sweep's
+                               * own write to block 2100 immediately
+                               * follows in the same init sequence).
+                               * Now drains and prints EVERY word the
+                               * hardware actually reports: (1) shows
+                               * the full FIFO content for the first
+                               * time in this whole investigation,
+                               * (2) leaves the FIFO genuinely empty
+                               * afterward instead of silently carrying
+                               * leftover words into the next command. */
+    cmp r8, #16
+    movgt r8, #16              /* defensive clamp -- physical FIFO is
+                               * 16 words max (already masked to 5 bits
+                               * above; this just keeps the loop bound
+                               * sane regardless) */
     ldr r7, =0x20202040       /* SDDATA */
-    ldr r5, [r7]               /* word 0 */
-    mcr p15, 0, r2, c7, c10, 5 /* 32nd SD round: DMB after word 0's
-                               * read -- U-Boot's own back-to-back
-                               * burst reads carry one per readl() call
-                               * too (arch/arm/include/asm/io.h), so
-                               * this doesn't break the "back-to-back"
-                               * intent below, it makes it byte-for-
-                               * byte match what readl()+readl() really
-                               * compiles to in the reference driver. */
-    ldr r0, [r7]               /* word 1 -- back-to-back with word 0,
-                               * matching U-Boot's own real burst loop
-                               * exactly (each word's own readl() call,
-                               * barrier included) */
-    mcr p15, 0, r2, c7, c10, 5 /* DMB after word 1's read */
-    str r5, [r4]
-    str r0, [r4, #4]
-    mov r6, r0                 /* r6 (SDEDM addr, no longer needed)
-                               * now holds word 1 for the print below */
+    mov r9, #0                /* r9 = word index / loop counter */
+sd_scr_diag_drain_loop:
+    cmp r9, r8
+    bge sd_scr_diag_done
+    ldr r1, [r7]               /* read next word, back-to-back with
+                               * the rest of this burst, matching
+                               * U-Boot's own real semantics */
+    mcr p15, 0, r2, c7, c10, 5 /* DMB after each read, matching
+                               * readl() -- same rationale as this
+                               * function's own 32nd-round comment
+                               * history above */
+    cmp r9, #0
+    streq r1, [r4]             /* word 0 -> caller's buffer, unchanged
+                               * -- sd_scr_dump_and_check_4bit still
+                               * only ever looks at the first 8 bytes */
+    cmp r9, #1
+    streq r1, [r4, #4]         /* word 1 -> caller's buffer */
 
     ldr r0, =sd_scr_diag_lbl_word
     bl sdhost_diag_puts
-    mov r0, #0
+    mov r0, r9
     bl sdhost_diag_put_hex1
     ldr r0, =sd_scr_diag_lbl_fill
     bl sdhost_diag_puts
     mov r0, r8
-    bl sdhost_diag_put_hex1
+    bl sdhost_diag_put_hex32   /* 33rd SD round: put_hex1 truncates to
+                               * a single nibble -- fill can now
+                               * legitimately reach 16 (this function's
+                               * own new defensive clamp), which would
+                               * misdisplay as "0" with put_hex1. Full
+                               * 32-bit print removes the ambiguity. */
     ldr r0, =sd_scr_diag_lbl_data
     bl sdhost_diag_puts
-    mov r0, r5
+    mov r0, r1
     bl sdhost_diag_put_hex32
     mov r0, #10
     bl sdhost_diag_putc
 
-    ldr r0, =sd_scr_diag_lbl_word
-    bl sdhost_diag_puts
-    mov r0, #1
-    bl sdhost_diag_put_hex1
-    ldr r0, =sd_scr_diag_lbl_fill
-    bl sdhost_diag_puts
-    mov r0, r8
-    bl sdhost_diag_put_hex1
-    ldr r0, =sd_scr_diag_lbl_data
-    bl sdhost_diag_puts
-    mov r0, r6
-    bl sdhost_diag_put_hex32
-    mov r0, #10
-    bl sdhost_diag_putc
-
-    pop {r4, r5, r6, r7, r8, lr}
+    add r9, r9, #1
+    b sd_scr_diag_drain_loop
+sd_scr_diag_done:
+    pop {r4, r5, r6, r7, r8, r9, lr}
     mov r0, #0
     mov r1, #0
     bx lr
