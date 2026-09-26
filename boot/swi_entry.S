@@ -219,6 +219,8 @@ swi_entry_skip_usr_sp_capture:
     beq swi_do_sd_fill_fifo
     cmp r7, #6
     beq swi_do_sd_drain_fifo
+    cmp r7, #7
+    beq swi_do_uart_tx_ring
     b swi_return_to_usr        /* unknown syscall number -- no-op,
                                * fall straight through to the restore
                                * rather than doing anything undefined */
@@ -289,6 +291,29 @@ swi_do_sd_fill_fifo:
  * same reason syscall #5 isn't -- see that syscall's own comment. */
 swi_do_sd_drain_fifo:
     bl sdhost_drain_fifo_to_buffer_impl
+    b swi_return_to_usr
+
+/* Syscall #7 (2026-09-26): uart_tx_ring_push_and_drain -- see
+ * boot/uart_tx_ring_state.S's own header comment for the full "why".
+ * Real, previously-undiagnosed bug found while investigating genuine
+ * real-HW UART bit corruption: this ring buffer's head/tail read-
+ * modify-write was completely unmasked, and is called from BOTH
+ * USR-mode task context (uart_puts_bounded, every ordinary task) AND
+ * directly from real interrupt context (timer_tick_dispatch/
+ * spn_shadow_report_mismatch, both running in privileged mode as part
+ * of irq_entry.S's own handler) -- a single-core task-vs-interrupt
+ * race on shared, unprotected global state, textbook data corruption
+ * if an interrupt lands mid-update. Unlike syscalls #5/#6, the
+ * PRIVILEGED-mode call path (from real interrupt context) never
+ * reaches this dispatcher at all -- it can't safely issue a nested
+ * SWI from inside an already-running SVC-mode interrupt handler
+ * (would clobber lr_svc, corrupting that handler's own return
+ * address) -- so uart_tx_ring_push_and_drain itself (boot/uart_tx_
+ * ring_state.S) checks its own caller's current mode and only routes
+ * through this trap when called from genuine USR mode, calling
+ * uart_tx_ring_push_and_drain_impl directly otherwise. */
+swi_do_uart_tx_ring:
+    bl uart_tx_ring_push_and_drain_impl
     b swi_return_to_usr
 
 /* Task #253 Phase 3 instrumentation round (2026-09-19): real,

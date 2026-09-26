@@ -59,21 +59,93 @@ uart_tx_ring_tail:
 
 .section ".text"
 
-/* uart_tx_ring_push_and_drain(c: u32) -> u32 -- r0 = byte to enqueue.
- * Pushes c into the ring (dropped only if the ring itself is full --
- * a 64-byte buffer, not the hardware's own 16-byte one), then attempts
- * to drain exactly one byte from the ring to the real UART TX FIFO if
- * there's room. Return value unused by the caller (matches the
- * existing uart_putc_nonblocking convention); r0 = 0 always.
+/* 2026-09-26: real-HW UART bit-corruption investigation. This ring's
+ * own head/tail read-modify-write below was completely UNMASKED --
+ * and this function is called from TWO genuinely different contexts:
+ * USR-mode task code (uart_puts_bounded, every ordinary task -- HIGH/
+ * MEDIUM/LOW/MUTEX-HIGH/idle/governor) AND directly from real
+ * interrupt context (timer_tick_dispatch/spn_shadow_report_mismatch,
+ * both running privileged, inside irq_entry.S's own handler, via
+ * uart_put_hex32_irq's direct uart_putc_nonblocking calls). On a
+ * single ARM1176 core, an interrupt landing mid-update here -- while a
+ * task is between reading head/tail and storing the updated value --
+ * is a textbook data race: the ISR's own concurrent read-modify-write
+ * of the SAME global head/tail (and potentially the same buffer slot)
+ * corrupts the ring's internal state and/or its byte contents. This
+ * is the root cause found for a real-HW symptom that had, until this
+ * round, only been explained by ruling things OUT: a fresh picocom
+ * capture showed genuine bit-level corruption -- recognizable text
+ * like "idle"/"GOVERNOR" (both printed via this exact path) degrading
+ * into repeated garbage, plus picocom's own "M-I" notation for a byte
+ * with the high bit incorrectly set -- appearing well into boot and
+ * getting worse over time (more interrupts landing in the vulnerable
+ * window the longer the system runs), while every OTHER print
+ * (uart_puts, writing the hardware FIFO directly with no shared ring
+ * state) stayed completely clean. Two other real-HW hypotheses (UART
+ * clock desyncing when the CPU governor changes the ARM clock; power-
+ * supply undervoltage under load) were tested and DIRECTLY ruled out
+ * first -- see project memory for the full round-by-round history.
  *
- * Uses r0-r5 as scratch, all caller-saved under AAPCS -- this
- * function's only caller (uart_putc_nonblocking, via vani's own
- * extern "C" call) never has anything live across the call it needs
- * preserved, same reasoning every other accessor function in this
- * project's boot/*_state.S files already relies on. */
+ * Fixed the same way this project has fixed every other "unmasked
+ * shared state, USR-mode callers can't cpsid/cpsie directly" bug
+ * before (dhruva_prio_lock/_unlock; the SD driver's own PIO fill/
+ * drain loops) -- EXCEPT this is the first case where a caller is
+ * ALSO privileged already (real interrupt context), which must never
+ * route through the SWI trap: issuing a nested SWI from inside an
+ * already-running SVC-mode interrupt handler would clobber lr_svc,
+ * corrupting THAT handler's own in-progress return address. This
+ * entry point checks its own caller's current mode and picks the
+ * correct path itself, so every existing call site (uart_putc_
+ * nonblocking, uart_put_hex32_irq) needs zero changes. */
 .global uart_tx_ring_push_and_drain
 uart_tx_ring_push_and_drain:
-    push {r4, r5, lr}
+    push {r4, lr}
+    mrs r4, cpsr
+    and r4, r4, #0x1F
+    cmp r4, #0x10                /* USR mode (0b10000)? */
+    bne utrpd_already_privileged
+
+    /* USR mode -- route through SWI #7 (boot/swi_entry.S) so the
+     * masking actually happens in SVC mode, matching this project's
+     * established pattern exactly. r0 already holds c; the SWI
+     * dispatcher passes r0-r3 through to _impl untouched (r0-r12
+     * aren't banked across the trap at all -- see swi_entry.S's own
+     * header comment). */
+    push {r5, r7}
+    mov r5, lr
+    mov r7, #7
+    swi #0
+    mov lr, r5
+    pop {r5, r7}
+    b utrpd_ret
+
+utrpd_already_privileged:
+    /* Already privileged -- this call originated from real interrupt
+     * context (timer_tick_dispatch/spn_shadow_report_mismatch, running
+     * in SVC/IRQ mode as part of irq_entry.S's own handler, never a
+     * USR-mode task). cpsid/cpsie is well-defined and safe here; call
+     * the masked implementation directly, no SWI involved. */
+    bl uart_tx_ring_push_and_drain_impl
+
+utrpd_ret:
+    pop {r4, lr}
+    bx lr
+
+/* uart_tx_ring_push_and_drain_impl(c: u32) -> u32 -- the real logic,
+ * unchanged from the original version except for the cpsid/cpsie
+ * masking now wrapping the entire head/tail read-modify-write and
+ * FIFO drain. Reachable two ways: directly (bl) from the trampoline
+ * above when already privileged, or via SWI #7 when the original
+ * caller was in USR mode. r0 = byte to enqueue on entry. Pushes c
+ * into the ring (dropped only if the ring itself is full -- a 64-byte
+ * buffer, not the hardware's own 16-byte one), then attempts to drain
+ * exactly one byte from the ring to the real UART TX FIFO if there's
+ * room. Return value unused by any caller; r0 = 0 always. */
+.global uart_tx_ring_push_and_drain_impl
+uart_tx_ring_push_and_drain_impl:
+    push {r4, r5, r6, lr}
+    mrs r6, cpsr
+    cpsid if
     mov r5, r0                  /* r5 = c, preserved across the whole routine */
 
     ldr r1, =uart_tx_ring_head
@@ -113,7 +185,8 @@ drain_step:
     str r4, [r1]
 
 done:
+    msr cpsr_c, r6
     mov r0, #0
     mov r1, #0
-    pop {r4, r5, lr}
+    pop {r4, r5, r6, lr}
     bx lr
