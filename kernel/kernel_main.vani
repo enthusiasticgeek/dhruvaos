@@ -6415,6 +6415,11 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_readwait: u32 = 4 as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
+  // 34th SD round follow-up (2026-09-26): read-side half of the same
+  // fix -- see sdhost_write_block_once's own matching comment for the
+  // full "why" (real U-Boot reissues CMD16/SET_BLOCKLEN before every
+  // single mmc_bread/mmc_bwrite, never just once at init).
+  let _ = sdhost_cmd(16 as u32, 512 as u32);
   // BUG found 2026-09-19 (real-hardware SD wedge investigation, fifth
   // real-HW log): 0x518 included SDHCFG_BLOCK_IRPT_EN (bit8, 0x100)
   // unconditionally -- confirmed against a fresh diagnostic capture
@@ -6602,6 +6607,40 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // call site (2026-09-19 original placement) so it can also gate the
   // new pre-CMD24 instrumentation below (19th SD round, 2026-09-20).
   let use_write_diag: bool = (block_num >= 2100) && (block_num < 2108);
+  // 34th SD round follow-up (2026-09-26): real U-Boot's own
+  // mmc_bwrite/mmc_write_blocks NEVER sets the card's block length
+  // once at init -- mmc_set_blocklen (CMD16) is called at the START of
+  // EVERY single write, unconditionally, every time (drivers/mmc/
+  // mmc_write.c). DhruvaOS's own sdhost_init_at_speed sends CMD16=512
+  // exactly once, during bring-up, and never again -- flagged as a
+  // real, unexplained divergence during the 32nd round's own
+  // systematic U-Boot comparison but never actually tested, since the
+  // DMB-barrier fix (finding #3 from that same round) looked like the
+  // stronger lead at the time. With clock speed now also ruled out
+  // (identical CRC16/write, FIFO_ERROR/read, and even a genuine
+  // CMD_TIMEOUT on CMD24 itself, all reproduced byte-for-byte at
+  // 1MHz -- a 50x slower, far more conservative speed than the 50MHz
+  // this investigation started at -- signal integrity at speed no
+  // longer explains the symptom), and the UART corruption investigated
+  // separately, this is the last identified, never-tested divergence
+  // from the reference implementation. If the card's own internal
+  // notion of "current block length" has drifted from the 512 bytes
+  // set once at boot for any reason, a CMD24 write's own data phase
+  // could plausibly hit exactly a data CRC failure or a genuine card-
+  // side non-response, matching what's actually been observed.
+  // Deliberately unconditional (both the diagnostic sweep AND the
+  // production write path below), matching U-Boot's own real
+  // per-transfer behavior exactly, not just the 8-block test range.
+  let cmd16_rewrite_status: u32 = sdhost_cmd(16 as u32, 512 as u32);
+  if use_write_diag {
+    let _ = uart_puts("SD DIAG: per-write CMD16 (SET_BLOCKLEN) status=0x");
+    let _ = uart_put_hex32(cmd16_rewrite_status);
+    let _ = uart_puts(" timed_out=");
+    let _ = uart_put_i64(sdhost_cmd_timed_out(cmd16_rewrite_status));
+    let _ = uart_puts(" failed=");
+    let _ = uart_put_i64(sdhost_cmd_failed(cmd16_rewrite_status));
+    let _ = uart_puts("\n");
+  }
   // 30th SD round (2026-09-25): found while assembling the exact
   // SDHCFG value the 28th round's C port (boot/rpi1/uboot_sdhost_
   // write.c) would need if it ever ported bcm2835_set_ios too --
