@@ -4967,6 +4967,25 @@ fn sd_read_scr(rca: u32) -> i64 {
   }
 
   let scr_buf: mut ref i64 = dhruva_alloc_bytes(8);
+  // 31st SD round (2026-09-25): the prior round's own sd_scr_drain_diag
+  // showed fifo_fill=0x8 at its poll GATE for an 8-byte/2-word transfer
+  // -- 4x too much. But that gate value is captured AFTER a (possibly
+  // many-iteration) busy-spin poll loop, so it can't distinguish "the
+  // FIFO already held 8 the instant CMD51's response finished" (real
+  // hardware/protocol anomaly) from "fill grew from 0 to 8 while this
+  // software was still spinning before its first read" (software-side
+  // polling too slow relative to how fast real hardware fills, or the
+  // card sending far more than block-length promised). This print reads
+  // SDEDM immediately, zero polling, zero loop iterations, the instant
+  // cmd51_status itself confirmed non-timeout/non-fail -- the earliest
+  // possible software observation of the true post-command fill.
+  let scr_edm_immediate: u32 = mmio_read_u32(SDEDM);
+  let scr_fill_immediate: u32 = (scr_edm_immediate >> (4 as u32)) & (0x1F as u32);
+  let _ = uart_puts("SD DIAG: SCR immediate (pre-poll) fifo_fill=0x");
+  let _ = uart_put_hex32(scr_fill_immediate);
+  let _ = uart_puts(" SDEDM=0x");
+  let _ = uart_put_hex32(scr_edm_immediate);
+  let _ = uart_puts("\n");
   // 30th SD round follow-up: SCR came back with a "shift register"
   // corruption pattern identical in shape to the original CMD24
   // write corruption -- first time this project's drain loop has
