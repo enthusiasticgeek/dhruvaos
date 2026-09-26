@@ -136,6 +136,9 @@ const SDHCFG: i64 = 0x20202038;
 const SDHBCT: i64 = 0x2020203C;
 #[mmio(size=4)]
 const SDHBLC: i64 = 0x20202050;
+// 30th SD round -- see sdhost_init_at_speed's own FIFO-drain-to-empty
+// comment for the full "why".
+const SDDATA: i64 = 0x20202040;
 
 // Context-switch mechanics (boot/context_switch.S) and the tiny amount
 // of raw memory allocation they need (boot/rpi1/runtime_stubs.c) are
@@ -5137,6 +5140,51 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let _ = delay(64500);
   let _ = mmio_write_u32(sdvdd, 1 as u32);
   let _ = delay(64500);
+
+  // 30th SD round (2026-09-25): explicit FIFO drain-to-empty, right
+  // after the reset/power-cycle, before any command is ever issued on
+  // a fresh init. Found via this same round's own new SCR-read
+  // diagnostic (ACMD51): sd_scr_drain_diag showed fifo_fill=0x8 at the
+  // moment of BOTH SCR word reads -- objectively wrong for a genuine
+  // 2-word (8-byte) SCR transfer, since the card can only ever
+  // physically send 8 real bytes for this command. The raw SDDATA
+  // values read (0x00000002, 0x00000235) were independently confirmed
+  // correct AT THE MOMENT OF THE MMIO READ -- this was never a
+  // software bug in the drain/store/print code. Neither Linux's own
+  // real bcm2835-sdhost.c, U-Boot's port, nor this driver's own
+  // register-level reset (SDCMD/SDARG/SDHCFG/SDCDIV/SDHBCT/SDHBLC=0,
+  // SDVDD power toggle) ever explicitly reads-and-discards whatever
+  // words are ALREADY sitting in the physical FIFO SRAM -- none of
+  // those writes touch SDDATA at all, and nothing suggests the SDVDD
+  // power toggle (a logical/protocol-level signal to the CARD, not
+  // necessarily a hard reset of the CONTROLLER's own internal FIFO
+  // memory) clears it either. The exact same corrupted bytes have
+  // appeared byte-for-byte identical across every test condition this
+  // whole session (25MHz/50MHz, with/without ACMD6, before/after the
+  // burst-gate fix, before/after IRQ masking) -- consistent with
+  // stale data left in the FIFO's own hardware buffer since early in
+  // this session, silently surviving every "logical" reset attempted
+  // so far, rather than fresh corruption on each new transfer. Drains
+  // by reading (and discarding) SDDATA while SDEDM's own fill count
+  // is nonzero, bounded (not `while true`) matching this file's own
+  // established "a wedged card can never hang the caller forever"
+  // convention -- 16 iterations covers the full FIFO depth
+  // (SDDATA_FIFO_WORDS) with room to spare, but capped much higher in
+  // case the fill count itself is momentarily stale/settling.
+  let fifo_preclear_iter: i64 = 0;
+  while fifo_preclear_iter < 1000 {
+    let preclear_fill: u32 = (mmio_read_u32(sdedm) >> (4 as u32)) & (0x1F as u32);
+    if preclear_fill == (0 as u32) {
+      break;
+    }
+    let _ = mmio_read_u32(SDDATA);
+    fifo_preclear_iter = fifo_preclear_iter + 1;
+  }
+  if fifo_preclear_iter > 0 {
+    let _ = uart_puts("SD DIAG: FIFO pre-clear drained ");
+    let _ = uart_put_i64(fifo_preclear_iter);
+    let _ = uart_puts(" stale word(s) before init\n");
+  }
 
   // Identification-speed clock divisor and a generous command
   // timeout -- real-hardware bcm2835-sdhost values, not QEMU-specific
