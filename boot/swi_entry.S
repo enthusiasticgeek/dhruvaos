@@ -217,6 +217,8 @@ swi_entry_skip_usr_sp_capture:
     beq swi_do_prio_unlock
     cmp r7, #5
     beq swi_do_sd_fill_fifo
+    cmp r7, #6
+    beq swi_do_sd_drain_fifo
     b swi_return_to_usr        /* unknown syscall number -- no-op,
                                * fall straight through to the restore
                                * rather than doing anything undefined */
@@ -269,6 +271,24 @@ swi_do_prio_unlock:
  * pattern) if this trap's own overhead ever needs the same scrutiny. */
 swi_do_sd_fill_fifo:
     bl sdhost_fill_fifo_from_buffer_impl
+    b swi_return_to_usr
+
+/* Syscall #6 (2026-09-25, 30th SD round): sdhost_drain_fifo_to_buffer
+ * -- the READ-side counterpart of syscall #5 above, added for the
+ * exact same reason. Real Linux's own bcm2835-sdhost.c (drivers/mmc/
+ * host/bcm2835-sdhost.c, a genuinely different, more authoritative
+ * source than U-Boot's own port of it -- fetched fresh this same
+ * round) wraps BOTH bcm2835_sdhost_read_block_pio and _write_block_pio
+ * in local_irq_save/restore for their entire duration; this driver's
+ * own write path already got that masking (syscall #5, 21st SD
+ * round), but the read path never did, and stayed unmasked even after
+ * this same round's burst-gate fix made it depend on genuinely
+ * uninterrupted back-to-back SDDATA reads within a burst -- a timer
+ * tick landing mid-burst would violate exactly the assumption that
+ * fix relies on. Not bracketed by swi_fast_measure_start/_end for the
+ * same reason syscall #5 isn't -- see that syscall's own comment. */
+swi_do_sd_drain_fifo:
+    bl sdhost_drain_fifo_to_buffer_impl
     b swi_return_to_usr
 
 /* Task #253 Phase 3 instrumentation round (2026-09-19): real,
@@ -600,6 +620,23 @@ sdhost_fill_fifo_from_buffer:
     push {r4, r7}
     mov r4, lr
     mov r7, #5
+    swi #0
+    mov lr, r4
+    pop {r4, r7}
+    bx lr
+
+/* sdhost_drain_fifo_to_buffer (syscall #6, 2026-09-25, 30th SD round)
+ * -- same migration shape as sdhost_fill_fifo_from_buffer above; keeps
+ * the exact name/signature every existing vani-side call site already
+ * uses, real logic moved to sdhost_drain_fifo_to_buffer_impl (boot/
+ * sdcard_state.S). Same (buf, word_count) register shape as syscall
+ * #5's own trampoline, so nothing about the parameter passing changes
+ * here either. */
+.global sdhost_drain_fifo_to_buffer
+sdhost_drain_fifo_to_buffer:
+    push {r4, r7}
+    mov r4, lr
+    mov r7, #6
     swi #0
     mov lr, r4
     pop {r4, r7}

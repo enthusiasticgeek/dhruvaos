@@ -170,21 +170,46 @@ sd_state_get_is_4bit:
  * fix), mirrored for reads. Bounded retry count (100000) on the gate
  * itself now, not per-word -- same "a wedged card can never hang the
  * caller forever" contract, applied once per burst instead of once
- * per word. */
-.global sdhost_drain_fifo_to_buffer
-sdhost_drain_fifo_to_buffer:
+ * per word.
+ *
+ * 30th SD round follow-up (2026-09-25): masked via the exact same
+ * syscall-trampoline treatment sdhost_fill_fifo_from_buffer_impl
+ * already has (syscall #5, 21st round) -- real Linux's own upstream
+ * bcm2835-sdhost.c (drivers/mmc/host/bcm2835-sdhost.c, fetched fresh,
+ * a genuinely more authoritative source than U-Boot's own port of it)
+ * wraps BOTH bcm2835_sdhost_read_block_pio and _write_block_pio in
+ * local_irq_save/restore for their entire duration -- this driver's
+ * write side already got that treatment, the read side never had, and
+ * now matters more than before: this same round's burst-gate fix
+ * (above) makes correctness depend on genuinely uninterrupted back-
+ * to-back SDDATA reads within a burst, which an unmasked timer tick
+ * landing mid-burst could violate. Renamed to _impl (real logic),
+ * kernel_main.vani's own call site is untouched -- the plain name now
+ * belongs to swi_entry.S's own new syscall #6 trampoline, same
+ * migration shape as syscall #5. Retry cap dropped 100000 -> 1000,
+ * matching _impl's own masked-loop-specific cap exactly (round 22's
+ * WCET fix already established 1000 as the correct value for a masked
+ * burst-gate poll -- reusing the shared 100000 here would reintroduce
+ * the exact worst-case-masked-duration problem that round fixed). */
+.global sdhost_drain_fifo_to_buffer_impl
+sdhost_drain_fifo_to_buffer_impl:
     push {r4, r5, r6, r7}     /* r4-r7 callee-saved (AAPCS) -- see the
                                * file-level note below on why this
                                * isn't optional here */
+    mrs r12, cpsr
+    cpsid if
     mov r4, r2               /* r4 = word_count remaining (r2:r3 pair,
                                * low half) */
     ldr r6, =0x20202034      /* SDEDM */
 sdhost_drain_loop:
     cmp r4, #0
     beq sdhost_drain_done
-    ldr r5, =100000          /* bounded burst-readiness retry cap --
-                               * ldr, not mov: 100000 (0x186A0) isn't a
-                               * valid ARM rotated-immediate */
+    ldr r5, =1000            /* bounded burst-readiness retry cap,
+                               * MASKED-loop-specific -- see this
+                               * function's own header comment for why
+                               * this is 1000, not the shared 100000
+                               * every genuinely-unmasked per-burst poll
+                               * elsewhere in this file still uses */
 sdhost_drain_poll:
     ldr r2, [r6]
     mov r2, r2, lsr #4
@@ -218,6 +243,7 @@ sdhost_drain_burst:
     bne sdhost_drain_burst
     b sdhost_drain_loop
 sdhost_drain_done:
+    msr cpsr_c, r12
     pop {r4, r5, r6, r7}
     mov r0, #0
     mov r1, #0
