@@ -10752,3 +10752,62 @@ concrete, unexplained evidence on file -- worth revisiting with a
 timing-focused lens (e.g. whether CMD7's own R1b busy completion is
 genuinely finished, by hardware guarantee, before CMD16 issues) before
 reaching for another memory/electrical theory.
+
+## 36th SD round (2026-09-26): user-directed real-U-Boot instrumentation finds the decisive CMD7->CMD16 timing gap
+
+Per the user's own direct instruction ("adding UBoot full print statements at every boot stage may
+help ... keep uart logging out of critical timing signals"): instrumented the real, working U-Boot
+tree (`~/source/sdwedge-uboot-test`) itself, not DhruvaOS -- four targeted additions, all bracketing
+prints placed OUTSIDE any register-polling or PIO loop:
+
+1. `arch/arm/lib/cache-cp15.c`'s `mmu_setup()`: captures the live section descriptor for the SDHOST
+   region into a new global (`dhruva_uboot_mmu_pt_entry_514`), printed later from a definitely-post-
+   console location (this early in boot, before `console_init_r`, `printf` isn't guaranteed to reach
+   the UART on every build).
+2. `drivers/mmc/bcm2835_sdhost.c`'s `bcm2835_probe()`: prints that captured MMU descriptor (decoded
+   TEX/C/B/XN/AP) plus the mailbox-reported max SD clock, once, at probe time.
+3. `drivers/pinctrl/broadcom/pinctrl-bcm283x.c`'s `bcm283x_pinctrl_set_state()`: prints which GPIO
+   function got applied to the SDHOST pins (48-53) after the write, and documents directly from this
+   driver's own source (not guessed) that it never touches pull-up/down registers anywhere.
+4. `bcm2835_sdhost.c`'s `bcm2835_finish_command()`: ONE print per command, placed immediately after
+   `bcm2835_read_wait_sdcmd`'s own polling has already returned and the response registers have
+   already been read -- decodes `CURRENT_STATE` (bits[12:9] of the R1 response) for every short-
+   response command, the exact same field DhruvaOS's own post-CMD16 diagnostic reads. Plus one
+   bracketing print at the end of `bcm2835_reset_internal`.
+
+Real-HW result (`u-boot.bin` flashed via the existing `flash_uboot_test.sh`, same reversible
+config.txt-override mechanism used since round 24):
+
+- **MMU descriptor confirmed live, not just inferred from source**: `0x20200c12` (TEX=0/C=0/B=0/XN=1/
+  AP=3) -- byte-for-byte IDENTICAL to DhruvaOS's own already-applied 35th-round fix. Doubly falsifies
+  the memory-type hypothesis: identical live MMU config on both systems, still only one of them works.
+- **GPIO**: `function=4 to 6 SDHOST pin(s) starting at 48` -- matches DhruvaOS's own ALT0-on-all-6-pins
+  exactly, no pull-resistor register touched, confirming the earlier by-reasoning conclusion directly.
+- **THE DECISIVE FINDING**: CMD16 (SET_BLOCKLEN) is reissued by real U-Boot's own MMC core before
+  every single read/write (matching round 32's finding #1) -- and its response shows
+  `CURRENT_STATE=4 (tran)` EVERY SINGLE TIME, without exception. DhruvaOS's own CMD16 -- the identical
+  command, on the identical silicon -- has shown `CURRENT_STATE=13` (SD-spec RESERVED) unconditionally
+  in every real-HW log this entire saga has ever captured. Since it's the exact same command, this
+  rules out response-decoding or command-semantics differences.
+- **The structural difference that explains it**: real U-Boot's own FIRST command after CMD7 is
+  CMD55+ACMD51 (SCR read), not CMD16 -- several full command round-trips of real elapsed time pass
+  before it ever issues CMD16. DhruvaOS issues CMD16 immediately, back-to-back, right after CMD7.
+  CMD7 uses R1b (SDCMD_BUSYWAIT) specifically so the CONTROLLER's own hardware should already wait for
+  the card's busy/DAT0 signal before NEW_FLAG clears -- but this exact controller's own driver already
+  documents real BCM2835 SDHOST silicon marginality elsewhere (`bcm2835_reset_internal`'s own "Limit
+  fifo usage due to silicon bug" comment), making an incomplete busywait margin a plausible, concrete,
+  previously-untested explanation.
+
+**Fix**: a real, adaptive readiness poll -- CMD13 (SEND_STATUS, already used elsewhere in this driver
+as a diagnostic) issued in a bounded loop (cap 1000, matching the ACMD41 loop's own convention)
+immediately after CMD7 succeeds, checking the SAME CURRENT_STATE field until it reports 4 (tran) or
+the loop times out, logging exactly how many iterations it took -- before CMD16 is issued. Deliberately
+adaptive rather than a blind fixed delay: this project's own settle-delay history ("16th SD round")
+already found fixed delays insufficient for the (different, data-phase) timing issue; polling the
+card's own actual reported state adapts to whatever the real settle time turns out to be.
+
+Verified: build clean, boots under QEMU (SD wedge at CMD2 is the long-documented, pre-existing QEMU-
+SD-emulation limitation -- the new code path isn't reached under QEMU at all, same as every prior SD
+round), `phase4_milestone.py` run once matching the long-documented 13-pass/5-fail baseline exactly
+(tlsecho/httpecho/mqttecho/ls/diagnose -- pre-existing, unrelated). **Awaiting real-HW retest** -- if
+`CURRENT_STATE` after CMD16 reads 4 instead of 13, this is very likely the actual root cause found.

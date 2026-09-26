@@ -5690,6 +5690,66 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = sdhost_cmd_report_failure("CMD7 (SELECT_CARD)", cmd7_status);
     return 0 - 1;
   }
+
+  // 35th SD round follow-up (2026-09-26): the user's own instrumented-
+  // real-U-Boot bring-up (drivers/mmc/bcm2835_sdhost.c, ~/source/
+  // sdwedge-uboot-test) showed the single most direct comparison point
+  // in this whole investigation -- CMD16 (SET_BLOCKLEN), the EXACT SAME
+  // command, on the EXACT SAME silicon, ALWAYS reports CURRENT_STATE=4
+  // (tran) on real U-Boot, every single time it's reissued, while
+  // DhruvaOS's own CMD16 has reported CURRENT_STATE=13 (an SD-spec
+  // RESERVED value) unconditionally in every real-HW log this entire
+  // 35-round saga has captured. The structural difference: real
+  // U-Boot's own FIRST command after CMD7 is CMD55+ACMD51 (SCR read),
+  // not CMD16 -- by the time it eventually issues its own CMD16 (much
+  // later, after ACMD51, two ACMD6 attempts, and a CMD13), several full
+  // command round-trips' worth of real elapsed time have passed since
+  // CMD7. DhruvaOS issues CMD16 immediately, back-to-back, right after
+  // CMD7. CMD7 uses R1b (SDCMD_BUSYWAIT) specifically so the
+  // CONTROLLER's own hardware waits for the card's busy/DAT0 signal to
+  // clear before NEW_FLAG clears -- in principle this should already
+  // guarantee the card has finished its internal SELECT_CARD
+  // transition by the time software sees the command complete. But
+  // this exact controller's own driver comments (see bcm2835_reset_
+  // internal's "Limit fifo usage due to silicon bug") already document
+  // real BCM2835 SDHOST silicon marginality elsewhere -- a busywait
+  // hardware flag that doesn't fully cover the card's own real internal
+  // settling time is a plausible, previously-untested instance of the
+  // same class of issue, testable directly and cheaply.
+  //
+  // Fix: a REAL, adaptive readiness poll (CMD13/SEND_STATUS, matching
+  // this driver's own already-established diagnostic use of CMD13
+  // elsewhere) rather than a blind fixed delay -- this driver's own
+  // settle-delay history (docs/TODO.md, "16th SD round") already found
+  // fixed delays insufficient for the (unrelated) data-phase timing;
+  // polling the card's own actual reported state adapts to whatever
+  // the real settle time turns out to be instead of guessing a
+  // constant. Capped at 1000 iterations (matching this file's own
+  // ACMD41 loop convention) so a genuinely wedged card still fails
+  // fast rather than hanging boot.
+  let cmd7_settle_iter: i64 = 0;
+  let cmd7_settle_state: u32 = 0 as u32;
+  let cmd7_settle_timed_out: i64 = 0;
+  while cmd7_settle_iter < 1000 {
+    let settle_cmd13_status: u32 = sdhost_cmd(13 as u32, rca);
+    if sdhost_cmd_timed_out(settle_cmd13_status) == 1 {
+      cmd7_settle_timed_out = 1;
+      break;
+    }
+    cmd7_settle_state = (sd_mmio_read_u32(sdrsp0) >> (9 as u32)) & (0xF as u32);
+    if cmd7_settle_state == (4 as u32) {
+      break;
+    }
+    cmd7_settle_iter = cmd7_settle_iter + 1;
+  }
+  let _ = uart_puts("SD DIAG: post-CMD7 readiness poll (CMD13) settled at CURRENT_STATE=");
+  let _ = uart_put_i64(cmd7_settle_state as i64);
+  let _ = uart_puts(" after ");
+  let _ = uart_put_i64(cmd7_settle_iter as i64);
+  let _ = uart_puts(" iteration(s) timed_out=");
+  let _ = uart_put_i64(cmd7_settle_timed_out);
+  let _ = uart_puts("\n");
+
   // CMD16: SET_BLOCKLEN -- this driver only ever uses 512-byte
   // blocks, set once here rather than before every single read/write.
   let cmd16_status: u32 = sdhost_cmd(16 as u32, 512 as u32);
