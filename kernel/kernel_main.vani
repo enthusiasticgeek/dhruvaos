@@ -5731,6 +5731,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let cmd7_settle_state: u32 = 0 as u32;
   let cmd7_settle_timed_out: i64 = 0;
   let cmd7_settle_failed: i64 = 0;
+  let cmd7_settle_crc7_retries: i64 = 0;
   while cmd7_settle_iter < 1000 {
     let settle_cmd13_status: u32 = sdhost_cmd(13 as u32, rca);
     if sdhost_cmd_timed_out(settle_cmd13_status) == 1 {
@@ -5739,19 +5740,41 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     }
     // Round 32's own finding, applied here too -- NEW_FLAG clearing
     // alone doesn't mean this CMD13 genuinely succeeded; a FAIL_FLAG
-    // hit (e.g. a real CRC7 error) would otherwise go undetected and
-    // this loop would keep reading a stale/undefined SDRSP0 value
-    // every remaining iteration instead of reporting the real failure.
+    // hit would otherwise go undetected and this loop would keep
+    // reading a stale/undefined SDRSP0 value every remaining
+    // iteration instead of reporting the real failure.
     if sdhost_cmd_failed(settle_cmd13_status) == 1 {
-      let _ = sdhost_cmd_report_failure("CMD13 (SEND_STATUS, post-CMD7 settle poll)", settle_cmd13_status);
-      cmd7_settle_failed = 1;
-      break;
+      // Real-HW result, first retest of this exact loop: CMD13's very
+      // first attempt (iteration 0) hit FAIL_FLAG with SDHSTS=0x10,
+      // CRC7_ERROR -- a genuinely corrupted RESPONSE, immediately after
+      // CMD7, is exactly the transient signature a card whose response-
+      // generation/CRC circuitry hasn't finished reconfiguring from its
+      // own SELECT_CARD transition would produce -- independent
+      // corroboration of the settle-time hypothesis, not a refutation
+      // of it. Matches this project's own already-established CRC7
+      // tolerance precedent (boot/rpi1/uboot_sdhost_full.c's
+      // `allow_crc7_tolerance`, used for ACMD41 for the identical
+      // reason: "some cards don't compute it correctly pre-ready").
+      // Scoped narrowly to CRC7 specifically (not a blanket FAIL_FLAG
+      // tolerance) -- any OTHER error bit (CMD_TIMEOUT, FIFO_ERROR,
+      // etc.) still reports and stops immediately, matching the
+      // conservative, evidence-based spirit of that same precedent.
+      let settle_sdhsts: u32 = sd_mmio_read_u32(SDHSTS);
+      if (settle_sdhsts & (0x10 as u32)) != (0 as u32) {
+        cmd7_settle_crc7_retries = cmd7_settle_crc7_retries + 1;
+        cmd7_settle_iter = cmd7_settle_iter + 1;
+      } else {
+        let _ = sdhost_cmd_report_failure("CMD13 (SEND_STATUS, post-CMD7 settle poll)", settle_cmd13_status);
+        cmd7_settle_failed = 1;
+        break;
+      }
+    } else {
+      cmd7_settle_state = (sd_mmio_read_u32(sdrsp0) >> (9 as u32)) & (0xF as u32);
+      if cmd7_settle_state == (4 as u32) {
+        break;
+      }
+      cmd7_settle_iter = cmd7_settle_iter + 1;
     }
-    cmd7_settle_state = (sd_mmio_read_u32(sdrsp0) >> (9 as u32)) & (0xF as u32);
-    if cmd7_settle_state == (4 as u32) {
-      break;
-    }
-    cmd7_settle_iter = cmd7_settle_iter + 1;
   }
   let _ = uart_puts("SD DIAG: post-CMD7 readiness poll (CMD13) settled at CURRENT_STATE=");
   let _ = uart_put_i64(cmd7_settle_state as i64);
@@ -5761,6 +5784,8 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let _ = uart_put_i64(cmd7_settle_timed_out);
   let _ = uart_puts(" failed=");
   let _ = uart_put_i64(cmd7_settle_failed);
+  let _ = uart_puts(" crc7_retries=");
+  let _ = uart_put_i64(cmd7_settle_crc7_retries);
   let _ = uart_puts("\n");
 
   // CMD16: SET_BLOCKLEN -- this driver only ever uses 512-byte
