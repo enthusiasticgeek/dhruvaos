@@ -10525,3 +10525,81 @@ already 8 instantly (implicating a genuine hardware/protocol mismatch
 between the programmed 8-byte block length and what the controller or
 card actually clock in) -- the root cause of the deterministic
 corruption remains unknown as of this round.
+
+**2026-09-25, 32nd SD round: systematic function-call-stack comparison
+found a disassembly-confirmed, systemic gap -- missing memory
+barriers.** Per the user's explicit request ("systematic functions
+implementation comparison in function call stack in sequence... if
+uboot disassembly differs from dhruva asm or vani code"), walked the
+full real U-Boot boot sequence (`mmc.c`'s `mmc_startup`/`mmc_start_
+init`, `bcm2835_sdhost.c`) function-by-function against DhruvaOS's
+own sequence, then went to the compiled-binary level using the
+round-24 instrumented real U-Boot ELF (`~/source/sdwedge-uboot-test/
+src/u-boot`) and DhruvaOS's own `build/dhruva.elf`, both disassembled
+with `arm-none-eabi-objdump`.
+
+Three real divergences found, in order of strength:
+1. **CMD16 (SET_BLOCKLEN) timing**: U-Boot never sets it during
+   bring-up at all -- `mmc_set_blocklen` is reissued immediately
+   before every single `mmc_bread`/`mmc_write` call. DhruvaOS sets it
+   once, during init, never again. Likely inert for SDHC cards (fixed
+   512-byte blocks per spec) but a real structural difference.
+2. **Missing per-command FSM-idle precondition**: U-Boot's top-level
+   `bcm2835_send_cmd` reads SDEDM and refuses to issue ANY command
+   (data or not) unless the controller's FSM is already IDENTMODE or
+   DATAMODE. DhruvaOS's `sdhost_cmd` has no equivalent check anywhere
+   -- diagnostic-only instrumentation for this was proposed but not
+   yet built (superseded in priority by finding #3 below).
+3. **Missing memory barriers on every single register access (the
+   strongest finding, disassembly-proven)**: U-Boot's `readl()`/
+   `writel()` macros (`arch/arm/include/asm/io.h`) wrap literally
+   every access -- `writel`: DMB then store; `readl`: load then DMB.
+   Confirmed in the compiled binary (`bcm2835_send_cmd` carries `mcr
+   15,0,r3,cr7,cr10,{5}` around SDEDM/SDHSTS accesses). DhruvaOS's
+   `mmio_read_u32`/`mmio_write_u32` compiled to bare `ldr`/`str` with
+   ZERO barriers anywhere in the SD driver (`objdump -d --disassemble=
+   fn_sdhost_cmd`). This project's own MMU maps the 0x20000000-
+   0x20FFFFFF peripheral block (`boot/mmu_init.S`) as Shareable Device
+   (TEX=000/C=0/B=1), not Strongly Ordered -- writes can be posted
+   with real latency before reaching the peripheral, so two back-to-
+   back writes to different registers (SDARG then SDCMD, where SDCMD's
+   NEW_FLAG tells the controller to read SDARG right now) aren't
+   architecturally guaranteed to land in issue order without
+   something enforcing it. This project already hit exactly this bug
+   class once before (`gpio_sdhost_alt_init`'s own cross-peripheral
+   `mem_barrier()`) -- reused unchanged here, not reinvented.
+
+**Fix** (commit `1b9a5a7`): added `sd_mmio_read_u32`/`sd_mmio_write_
+u32` wrappers (`kernel/kernel_main.vani`) mirroring U-Boot's `readl`/
+`writel` exactly, mechanically retargeted all 77 `mmio_read_u32`/
+`mmio_write_u32` call sites across `sdhost_cmd`, `sdhost_cmd_report_
+failure`, `sd_read_scr`, `sdhost_init_at_speed`, `sdhost_force_data_
+mode_settle`, `sdhost_wait_transfer_complete`, `sdhost_read_block_
+once`, and `sdhost_write_block_once`. Added inline DMB in the masked
+asm PIO loops (`boot/sdcard_state.S`: `sdhost_drain_fifo_to_buffer_
+impl`, `sdhost_fill_fifo_from_buffer_impl`, `sd_scr_drain_diag`) --
+confirmed via disassembly that all 6 insertions landed in the exact
+intended positions. Deliberately scoped to the SD driver only.
+
+**Schedulability follow-up**: the added per-iteration DMB cost raised
+the masked burst-readiness poll's measured cost from 0.327us (task
+#285) to ~0.44-0.56us under QEMU. At the old `retry_cap=1000` this
+would have pushed the masked worst-case duration to 71.04ms, past
+this project's own 49.906ms ceiling-0 blocking-term budget. Reduced
+`retry_cap` to 400 in both masked loops (plus the matching vani-side
+WCET estimator constant) -- re-measured worst case: 22.272ms,
+comfortable margin. Re-ran `test/schedulability_analysis.py` with the
+real updated number: still schedulable on all three demo tasks, HIGH/
+MEDIUM/LOW all comfortable margins. Caveat: QEMU does not model real
+ARMv6 DMB latency (near-instant emulation), so this number captures
+the right order of magnitude and the added instruction count
+faithfully, but the true real-hardware cost of the barrier itself
+can only be confirmed by a real-HW timing capture.
+
+Verified: build clean, boots under QEMU, `phase4_milestone.py` run 3x
+matching the documented baseline exactly each time -- this touches
+the real production read/write paths, not a diagnostic-only change.
+**Awaiting a fresh real-HW log** to see whether this resolves the
+deterministic SCR/block corruption that has persisted across every
+fix attempted since the 25th round. Findings #1 and #2 above remain
+open, lower-priority follow-ups if #3 alone doesn't resolve it.
