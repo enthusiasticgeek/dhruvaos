@@ -5834,8 +5834,33 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
 // diagnostic-only override would get silently reverted by the very
 // next retry. Reads already succeed at 25MHz (task #217) -- if 50MHz
 // breaks them, that's real, informative evidence too.
+//
+// 34th SD round (2026-09-26) update: the newest real-HW log (with the
+// 34th round's own new SDHSTS-error-bit print) showed something no
+// prior round had directly confirmed: CMD17 itself failing with
+// SDCMD_FAIL_FLAG / SDHSTS=CMD_TIMEOUT on the FIRST attempt at 50MHz
+// (the card not even responding to the read command within the
+// timeout window), on nearly every block, forcing the existing
+// backoff-to-12.5MHz retry -- which then itself hit genuine, real
+// SDHSTS error bits (write: CRC16=0x20, read: FIFO_ERROR=0x08), never
+// silent/undetected corruption. All three symptoms -- command
+// timeout, data CRC failure, FIFO error -- are exactly what marginal
+// real-world signal integrity on THIS specific wiring looks like at
+// speed, not what a software sequencing/logic bug produces (round 28
+// already ruled out the PIO loop logic itself via a literal working-
+// reference C port). Dropping the default to a deliberately
+// conservative 1MHz -- clearly below both 50MHz and the existing
+// 12.5MHz backoff step, a single clean variable change to test this
+// directly. If this resolves it, the real fix is a permanent, much
+// lower operating speed for this specific hardware (and SD_SPEED_
+// BACKOFF_HZ below needs to become a genuine backoff again, not a
+// step UP from the new default -- updated to match). If it does NOT
+// resolve it, that's equally real evidence: signal integrity at
+// even 1MHz would point somewhere else entirely (a genuinely marginal
+// physical connection, or a real logic bug this round's other fixes
+// haven't reached yet).
 fn sdhost_init() -> i64 {
-  return sdhost_init_at_speed(50000000);
+  return sdhost_init_at_speed(1000000);
 }
 
 // CMD17 (READ_SINGLE_BLOCK) / CMD24 (WRITE_BLOCK). block_num is a
@@ -6196,7 +6221,13 @@ const SD_MAX_ATTEMPTS: i64 = 3;
 // switch entirely, stay at the identification-phase 400kHz-class
 // speed for data commands too" -- the slowest, most conservative
 // setting this controller supports.
-const SD_SPEED_BACKOFF_HZ: i64 = 12500000;
+//
+// 34th SD round (2026-09-26): the default this backs off FROM dropped
+// 50000000 -> 1000000 (see sdhost_init's own comment) -- 12500000 was
+// a genuine half-speed backoff from the OLD 25/50MHz default, but
+// would have been 12.5x FASTER than the new 1MHz default, backwards.
+// Halved to match the new default instead (500000, half of 1000000).
+const SD_SPEED_BACKOFF_HZ: i64 = 500000;
 
 // ROUND 2026-09-16 (real-hardware investigation, speculative): real
 // Linux's bcm2835_prepare_data() calls bcm2835_set_transfer_irqs()

@@ -156,9 +156,19 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
     unsigned int sdhsts;
     unsigned int t0;
 
-    u_puts("SD DIAG: uboot-port pre-CMD24 SDEDM=0x");
-    u_hex32(mmio_r(SDEDM_ADDR));
-    u_puts("\n");
+    /* 34th SD round (2026-09-26): the pre-CMD24/post-CMD24/post-PIO/
+     * write-SUCCESS prints that used to sit here were UNCONDITIONAL --
+     * firing on every single write, not just failures. At ~87us/byte
+     * on this project's polled/blocking UART (no DMA, no buffering --
+     * u_putc's own busy-wait confirms it), the ~6 lines this function
+     * used to print per successful write cost tens of milliseconds of
+     * dead time, some of it sitting squarely between CMD24's command
+     * phase completing and the PIO data phase starting -- exactly
+     * where card-side timing expectations matter most. User's own
+     * direct observation ("uart print can certainly impact timing
+     * boot") -- removed entirely from the success path; every
+     * genuinely anomalous condition below already had its own
+     * conditional print and keeps it unchanged. */
 
     /* bcm2835_read_wait_sdcmd, called before issuing a new command. */
     t0 = now_us();
@@ -180,12 +190,6 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
     /* bcm2835_prepare_data: SDHBCT/SDHBLC written BEFORE SDARG/SDCMD. */
     mmio_w(SDHBCT_ADDR, 512u);
     mmio_w(SDHBLC_ADDR, 1u);
-
-    u_puts("SD DIAG: uboot-port addr=0x");
-    u_hex32(addr);
-    u_puts(" buf0=0x");
-    u_hex32(buf[0]);
-    u_puts("\n");
 
     mmio_w(SDARG_ADDR, addr);
     sdcmd = (24u & SDCMD_CMD_MASK) | SDCMD_WRITE_CMD;
@@ -212,10 +216,6 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
         u_puts("\n");
         return 4;
     }
-
-    u_puts("SD DIAG: uboot-port post-CMD24-cmd-complete SDEDM=0x");
-    u_hex32(mmio_r(SDEDM_ADDR));
-    u_puts("\n");
 
     /* bcm2835_transfer_block_pio (is_read = false), 128 words = one
      * 512-byte block -- burst_words = min(PIO_BURST, copy_words),
@@ -261,10 +261,6 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
         }
     }
 
-    u_puts("SD DIAG: uboot-port post-PIO SDEDM=0x");
-    u_hex32(mmio_r(SDEDM_ADDR));
-    u_puts("\n");
-
     /* bcm2835_transfer_pio's own post-transfer check. */
     sdhsts = mmio_r(SDHSTS_ADDR);
     if (sdhsts & (0x20u | 0x10u | 0x08u)) { /* CRC16 | CRC7 | FIFO_ERROR */
@@ -291,17 +287,11 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
         unsigned int fsm = edm & SDEDM_FSM_MASK;
 
         if ((fsm == SDEDM_FSM_IDENTMODE) || (fsm == SDEDM_FSM_DATAMODE)) {
-            u_puts("SD DIAG: uboot-port wait_transfer_complete natural-idle SDEDM=0x");
-            u_hex32(edm);
-            u_puts("\n");
             break;
         }
         if ((fsm == SDEDM_FSM_READWAIT) || (fsm == SDEDM_FSM_WRITESTART1) ||
             (fsm == SDEDM_FSM_READDATA)) {
             mmio_w(SDEDM_ADDR, edm | SDEDM_FSM_FORCE_DATA_MODE_BIT);
-            u_puts("SD DIAG: uboot-port wait_transfer_complete pre-force-data-mode SDEDM=0x");
-            u_hex32(edm);
-            u_puts("\n");
             break;
         }
         if (timed_out(t0, TIMEOUT_US)) {
@@ -321,6 +311,5 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
         return 3;
     }
 
-    u_puts("SD DIAG: uboot-port write SUCCESS\n");
     return 0;
 }
