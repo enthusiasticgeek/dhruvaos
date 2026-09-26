@@ -4777,6 +4777,40 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   let sdarg: i64 = SDARG;
   let sdcmd: i64 = SDCMD;
   let sdcmd_new_flag: u32 = 0x8000 as u32;
+  // 34th SD round (2026-09-26) -- 32nd round's own systematic U-Boot-
+  // vs-DhruvaOS comparison found this divergence but deprioritized it
+  // behind the DMB fix (which didn't resolve the issue). Real U-Boot's
+  // top-level `bcm2835_send_cmd` reads SDEDM and refuses to issue ANY
+  // command (data or not) unless the controller's FSM is already
+  // IDENTMODE(0) or DATAMODE(1) -- `sdhost_cmd`, the single function
+  // EVERY command in this driver goes through, has never checked this
+  // at all. Mechanistically plausible direct cause of the real CRC7/
+  // CRC16/FIFO_ERROR/REW_TIMEOUT/CMD_TIMEOUT errors this same round's
+  // sdhost_read_block_once/write_block_once instrumentation just
+  // exposed for the first time: issuing a new command while the
+  // controller's data-path state machine hasn't settled from the
+  // PRIOR operation could plausibly interleave residual/stray bits
+  // from that prior operation with the new command's own response or
+  // data phase. Diagnostic-only for now, deliberately NOT a hard gate
+  // like U-Boot's real one -- this project has never measured this
+  // condition's own real-HW baseline frequency, and unconditionally
+  // refusing commands here (matching U-Boot exactly) risks breaking
+  // the entire driver if it turns out to fire even in healthy
+  // operation. STOP_TRANSMISSION (CMD12, U-Boot's own documented
+  // exception) is never issued anywhere in this codebase (single-
+  // block transfers only), so the check doesn't need that exclusion
+  // to be meaningful here, but it's included anyway for exact fidelity
+  // to the real reference condition.
+  let cmd_idx_for_fsm_check: u32 = cmd_and_flags & (0x3F as u32);
+  let edm_pre_cmd: u32 = sd_mmio_read_u32(SDEDM);
+  let fsm_pre_cmd: u32 = edm_pre_cmd & (0xF as u32);
+  if (fsm_pre_cmd != (0 as u32)) && (fsm_pre_cmd != (1 as u32)) && (cmd_idx_for_fsm_check != (12 as u32)) {
+    let _ = uart_puts("SD DIAG: sdhost_cmd issuing cmd_and_flags=0x");
+    let _ = uart_put_hex32(cmd_and_flags);
+    let _ = uart_puts(" while FSM NOT idle (matches real U-Boot's own bcm2835_send_cmd precondition -- diagnostic only, not yet gating) SDEDM=0x");
+    let _ = uart_put_hex32(edm_pre_cmd);
+    let _ = uart_puts("\n");
+  }
   // ROUND 2026-09-16 (real-hardware investigation, speculative -- see
   // sdhost_read_block_once's own header comment for the full context):
   // real Linux's bcm2835_send_command() always clears any pending
@@ -6305,6 +6339,22 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     return 2;
   }
   if errs != (0 as u32) {
+    // 34th SD round (2026-09-26): the caller (the 8-block sweep) only
+    // ever prints "rd=3", never WHICH SDHSTS error bit (0xF8 mask:
+    // CMD_TIMEOUT|CRC16|CRC7|FIFO_ERROR|REW_TIMEOUT) actually fired --
+    // and by the time the caller reads SDHSTS itself for its own
+    // diagnostic print, this function has already cleared it (the
+    // write immediately above). This is the single most informative
+    // gap in the whole "wr=3/rd=3" symptom that has persisted since
+    // the 30th round's real-HW retest: distinguishing a genuine CRC
+    // failure (signal integrity/clock speed) from FIFO_ERROR (a real
+    // overrun/underrun) from REW_TIMEOUT/CMD_TIMEOUT (a real hardware
+    // timing gap) changes what to investigate next entirely. Printed
+    // here, before the clear above has any chance to matter for THIS
+    // observation (the value's already captured into `errs`).
+    let _ = uart_puts("SD DIAG: read errs=0x");
+    let _ = uart_put_hex32(errs);
+    let _ = uart_puts(" (CMD_TIMEOUT=0x40 CRC16=0x20 CRC7=0x10 FIFO_ERROR=0x08 REW_TIMEOUT=0x80)\n");
     // Deliberately NOT reset/retried here -- see this function's own
     // caller for why (QEMU-only persistent-SDHSTS regression found
     // and reverted; real hardware never actually hit this path).
@@ -6617,6 +6667,15 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     return 2;
   }
   if errs != (0 as u32) {
+    // 34th SD round (2026-09-26): see sdhost_read_block_once's own
+    // matching comment -- same gap, write-side half. "wr=3" alone
+    // never says whether it was a CRC failure (signal integrity),
+    // FIFO_ERROR (a real overrun/underrun), or a REW_TIMEOUT/
+    // CMD_TIMEOUT (a real timing gap); each points somewhere
+    // completely different.
+    let _ = uart_puts("SD DIAG: write errs=0x");
+    let _ = uart_put_hex32(errs);
+    let _ = uart_puts(" (CMD_TIMEOUT=0x40 CRC16=0x20 CRC7=0x10 FIFO_ERROR=0x08 REW_TIMEOUT=0x80)\n");
     // Deliberately NOT reset/retried here -- see sdhost_read_block_
     // once's own caller for why (QEMU-only persistent-SDHSTS
     // regression found and reverted; real hardware never actually hit
