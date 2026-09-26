@@ -2,25 +2,28 @@
 # Updates config.txt on an already-flashed Dhruva OS SD card (see
 # flash_sd_card.sh for the original, destructive full-card setup this
 # does NOT repeat). Mirrors update_kernel.sh's own safety pattern --
-# same size/partition checks -- but touches config.txt instead of
-# kernel.img. Use this when only a config.txt setting changed (e.g.
-# adding a diagnostic flag) and a full kernel rebuild+reflash isn't
-# needed.
+# same existing-boot-files/partition check -- but touches config.txt
+# instead of kernel.img. Use this when only a config.txt setting
+# changed (e.g. adding a diagnostic flag, or reverting a config.txt
+# override like flash_uboot_test.sh's own "kernel=u-boot.bin" append)
+# and a full kernel rebuild+reflash isn't needed.
 #
 # Usage:
 #   ./update_config.sh /dev/sdX
 #
 # Safety: never partitions or formats anything -- worst case here is
-# overwriting the wrong device's own config.txt file. Still checks the
-# target is a block device sized like the one known 64GB card on this
-# machine (not any other disk) before touching it.
+# overwriting the wrong device's own config.txt file. No longer gated
+# on a specific card size (2026-09-26: dropped the old 55-68GB/"the
+# one known 64GB card" range check to match update_kernel.sh's own
+# already-approved 2026-09-25 fix -- media in use varies, e.g. the
+# 14.9GB card in active use this session; a same-sized WRONG device
+# would have passed the old check too). The real safety net is the
+# existing-boot-files check further down (bootcode.bin/start.elf/
+# fixup.dat/kernel.img must already be present).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOUNT_POINT="/tmp/dhruva_sdcard_mount_$$"
-
-MIN_BYTES=$((55 * 1000 * 1000 * 1000))
-MAX_BYTES=$((68 * 1000 * 1000 * 1000))
 
 if [ "$#" -ne 1 ]; then
     echo "Usage: $0 <device, e.g. /dev/sdb>" >&2
@@ -40,14 +43,7 @@ if [ ! -f "$ROOT/build/config.txt" ]; then
 fi
 
 SIZE_BYTES=$(sudo blockdev --getsize64 "$DEVICE")
-if [ "$SIZE_BYTES" -lt "$MIN_BYTES" ] || [ "$SIZE_BYTES" -gt "$MAX_BYTES" ]; then
-    echo "ERROR: $DEVICE is ${SIZE_BYTES} bytes -- not in the expected" >&2
-    echo "55-68GB range for the known Dhruva SD card. Refusing to" >&2
-    echo "continue -- this does not look like the right device." >&2
-    exit 1
-fi
-
-echo "=== Target device (size check passed: ${SIZE_BYTES} bytes) ==="
+echo "=== Target device (${SIZE_BYTES} bytes -- VERIFY this is your SD card) ==="
 lsblk "$DEVICE"
 echo
 
