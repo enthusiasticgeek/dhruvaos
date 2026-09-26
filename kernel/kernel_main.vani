@@ -5730,10 +5730,21 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let cmd7_settle_iter: i64 = 0;
   let cmd7_settle_state: u32 = 0 as u32;
   let cmd7_settle_timed_out: i64 = 0;
+  let cmd7_settle_failed: i64 = 0;
   while cmd7_settle_iter < 1000 {
     let settle_cmd13_status: u32 = sdhost_cmd(13 as u32, rca);
     if sdhost_cmd_timed_out(settle_cmd13_status) == 1 {
       cmd7_settle_timed_out = 1;
+      break;
+    }
+    // Round 32's own finding, applied here too -- NEW_FLAG clearing
+    // alone doesn't mean this CMD13 genuinely succeeded; a FAIL_FLAG
+    // hit (e.g. a real CRC7 error) would otherwise go undetected and
+    // this loop would keep reading a stale/undefined SDRSP0 value
+    // every remaining iteration instead of reporting the real failure.
+    if sdhost_cmd_failed(settle_cmd13_status) == 1 {
+      let _ = sdhost_cmd_report_failure("CMD13 (SEND_STATUS, post-CMD7 settle poll)", settle_cmd13_status);
+      cmd7_settle_failed = 1;
       break;
     }
     cmd7_settle_state = (sd_mmio_read_u32(sdrsp0) >> (9 as u32)) & (0xF as u32);
@@ -5748,6 +5759,8 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let _ = uart_put_i64(cmd7_settle_iter as i64);
   let _ = uart_puts(" iteration(s) timed_out=");
   let _ = uart_put_i64(cmd7_settle_timed_out);
+  let _ = uart_puts(" failed=");
+  let _ = uart_put_i64(cmd7_settle_failed);
   let _ = uart_puts("\n");
 
   // CMD16: SET_BLOCKLEN -- this driver only ever uses 512-byte
