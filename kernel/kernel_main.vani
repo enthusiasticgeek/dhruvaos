@@ -2741,6 +2741,15 @@ extern "C" fn get_throttled_status() -> i64;
 // path is completely untouched.
 #[stack_cost(bytes=64)]
 extern "C" fn uboot_style_sdhost_write_block(buf: mut ref i64, block_addr: i64) -> i64;
+// 34th SD round follow-up -- see boot/rpi1/uboot_sdhost_full.c's own
+// header comment for the full "why". Runs a COMPLETELY independent
+// bring-up (CMD0 through CMD7, plus SCR/ACMD6 bus-width negotiation)
+// entirely bypassing DhruvaOS's own sdhost_init, then one write and
+// one read-back through round 28's own already-verified write port.
+// Returns 0 on full success or a negative stage code -- see that
+// file's header comment for exactly which stage each value means.
+#[stack_cost(bytes=96)]
+extern "C" fn uboot_style_full_sequence_test(block_addr: u32, write_buf: mut ref i64, read_buf: mut ref i64) -> i64;
 // TEST-ONLY, task #3 verification -- see boot/sdcard_state.S.
 #[stack_cost(bytes=4)]
 extern "C" fn test_fill_pattern(buf: mut ref i64, byte_count: i64) -> i64;
@@ -38525,6 +38534,28 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("SD DIAG: 8-block sweep elapsed t=");
   let _ = uart_put_i64(sd_sweep_elapsed as i64);
   let _ = uart_puts("us\n");
+
+  // 34th SD round follow-up: see boot/rpi1/uboot_sdhost_full.c's own
+  // header comment for the full "why". Block 2109 -- one past the
+  // 8-block sweep's own 2100-2107 range above, still inside the
+  // permanently-safe 2049-16383 window (docs/HARDWARE_IN_LOOP.md's own
+  // partition layout) that can never collide with real DharaFS/FAT32
+  // data. This test does its OWN completely independent bring-up from
+  // scratch (its own GPIO mux, SDVDD power-cycle, CMD0 through CMD7),
+  // bypassing sdhost_init entirely -- it deliberately leaves the
+  // controller in whatever state ITS OWN sequence establishes, so
+  // sdhost_init() is re-run immediately after to restore the exact
+  // same normal state the rest of boot (DharaFS, the crypto/TLS self-
+  // tests) already depends on, regardless of this test's own result.
+  let sd_full_write_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let sd_full_read_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let _ = test_fill_pattern(sd_full_write_buf, 512);
+  let sd_full_addr: u32 = sdhost_card_addr(2109);
+  let sd_full_status: i64 = uboot_style_full_sequence_test(sd_full_addr, sd_full_write_buf, sd_full_read_buf);
+  let _ = uart_puts("SD DIAG: uboot-full independent bring-up+write+read status=");
+  let _ = uart_put_i64(sd_full_status);
+  let _ = uart_puts(" (0=full success; -1 CMD0, -2 CMD8, -3 ACMD41, -4 CMD2, -5 CMD3, -6 CMD9, -7 CMD7, -8 write, -9 read, -10 mismatch)\n");
+  let _ = sdhost_init();
 
   // Task #4 verification: append several path/value pairs, overwrite
   // one path with a newer value, confirm reads see the latest write

@@ -10665,3 +10665,90 @@ retest** at the new 1MHz default with the timing-perturbing prints
 removed -- the cleanest test this whole saga has had: minimal
 diagnostic overhead, a conservative clock, and definitive per-error
 visibility if it still fails.
+
+## 35th SD round (2026-09-26): full independent U-Boot bring-up C port + MMU memory-type fix, BOTH real-HW tested, MMU fix falsified
+
+Per direct, repeated user instruction to keep comparing against
+U-Boot source rather than guessing bottom-up: extended round 28's
+literal C port of U-Boot's write algorithm to U-Boot's ENTIRE bring-up
+sequence. New file `boot/rpi1/uboot_sdhost_full.c`
+(`uboot_style_full_sequence_test`) runs a completely independent
+CMD0->CMD8->ACMD41->CMD2->CMD3->CMD9->CMD7->(SCR/ACMD6)->write->read,
+bypassing DhruvaOS's own `sdhost_init` entirely, then restores normal
+state via a fresh `sdhost_init()` call so the rest of boot (DharaFS
+etc.) isn't left on a diverged controller state. Wired into
+`kernel_main.vani` right after the existing 8-block sweep, targeting
+block 2109 (past the sweep's own 2100-2107 range, still inside the
+permanently-safe 2049-16383 window). Real ACMD51 (SCR read) +
+conditional ACMD6 (SET_BUS_WIDTH) added mid-implementation per the
+user's own instruction to check the real device tree first --
+`bcm2835-rpi-b.dts` -> `bcm2835-rpi.dtsi` declares `bus-width = <4>`
+for `&sdhost` on this exact board, meaning round 24's real U-Boot
+success may have used 4-bit mode; the port negotiates it for real
+rather than assuming 1-bit.
+
+**Real-HW result: status=-8 (write failed, CMD24 FAIL_FLAG), i.e. this
+literal, from-scratch, U-Boot-faithful command sequence fails exactly
+the same way DhruvaOS's own hand-written bring-up does.** Two
+independently-written implementations of the same protocol logic now
+fail identically -- decisive evidence that the root cause is NOT
+command sequencing, in either driver.
+
+The same real-HW log surfaced something new: DhruvaOS's own existing
+(previously print-only) post-CMD16 diagnostic reported
+`CURRENT_STATE=13` -- an SD-spec RESERVED value, not merely "wrong".
+Traced against the actual reference rather than guessed: real U-Boot
+(`~/source/sdwedge-uboot-test`, the same build round 24 already proved
+works on this exact card) runs with its MMU/cache enabled and maps
+every non-DRAM region (`arch/arm/lib/cache-cp15.c`'s `mmu_setup`) with
+`DCACHE_OFF`, which for this exact ARMv6/non-LPAE/non-CPU_V7A target
+(`arch/arm/include/asm/system.h`'s final `#else` branch, `DCACHE_OFF =
+0x12`) decodes to Strongly Ordered (TEX=000/C=0/B=0) plus XN=1.
+DhruvaOS's own `boot/mmu_init.S` mapped the SDHOST peripheral region
+as Shareable Device (TEX=000/C=0/B=1, permits write buffering) with
+XN=0 -- a genuine, previously-unexamined divergence from the
+reference, invisible under QEMU (no write-buffer timing model at all).
+Fixed to match the reference exactly: `0x00000C06` -> `0x00000C12`.
+
+**Real-HW retest, byte-verified**: flashed via the existing
+`update_kernel.sh`, and the resulting `kernel.img` on the card's boot
+partition was md5sum-confirmed identical to the freshly-built
+`build/kernel.img` *before* boot -- ruling out a stale-image false
+negative. Result: **byte-for-byte identical failure** to the pre-fix
+capture (`CURRENT_STATE=13` unchanged, write err=0x20/read err=0x08 on
+every block unchanged, the independent C port's own status=-8
+unchanged). The memory-type hypothesis is FALSIFIED. Kept the fix
+anyway (still the reference-matching, more conservative choice, costs
+nothing), but the real cause remains open. In hindsight: ARM's
+architecture guarantees same-core program-order for sequential
+accesses to Device-type memory regardless of the buffering bit --
+the buffering distinction only matters for OTHER observers (a second
+core, DMA), which was never this driver's situation (single core, no
+DMA, synchronous polling). A real, reference-grade divergence is not
+automatically evidence of causing the symptom under investigation.
+
+Also checked and ruled out by reasoning (not a fresh HW round, to
+avoid one more low-yield flash/test cycle): GPIO pull-resistor
+configuration for pins 48-53. `gpio_sdhost_alt_init` only ever sets
+GPFSEL4/GPFSEL5 (function select), never touches `GPPUD`/`GPPUDCLK1`
+for these pins -- but the GPU firmware (bootcode.bin/start.elf) had
+JUST used these exact same physical pins to successfully read
+`config.txt` and `kernel.img` off the SAME card moments before jumping
+to `kernel_main`, proving the pull state was already correct, and
+`gpio_set_pull`'s own single-bit-scoped clock pulse (verified
+correctly masked) means nothing else in DhruvaOS's boot path can have
+disturbed it since.
+
+Commit: (this round). **Status: genuinely open.** 35 real-hardware
+rounds have now ruled out: clock speed (50MHz down to 1MHz), CMD16/
+blocklen reissue timing, USB dongle interference, a real UART ring-
+buffer race (fixed, unrelated), CPU-governor/UART clock coupling,
+power-supply undervoltage, a card/hardware defect (round 24 already
+proved this exact card+board work under real U-Boot), command
+sequencing in TWO independent implementations, and now SDHOST
+peripheral memory-type/caching attributes. The remaining, still-
+reserved `CURRENT_STATE=13` after CMD7+CMD16 is the one piece of
+concrete, unexplained evidence on file -- worth revisiting with a
+timing-focused lens (e.g. whether CMD7's own R1b busy completion is
+genuinely finished, by hardware guarantee, before CMD16 issues) before
+reaching for another memory/electrical theory.

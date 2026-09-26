@@ -25,9 +25,11 @@
  * at this granularity at all; see that file's own comment.
  *
  * Deliberately does NOT enable caching (SCTLR bits 2/12 stay clear) --
- * every mapped region uses Normal-Non-cacheable (RAM) or Shareable-
- * Device (peripherals) memory types, matching this project's existing
- * cache-off design exactly (round 16-18's memory-ordering work assumed
+ * every mapped region uses Normal-Non-cacheable (RAM) or Strongly
+ * Ordered (peripherals, fixed from Shareable Device by the 34th SD
+ * round follow-up below -- see the peripheral section's own comment)
+ * memory types, matching this project's existing cache-off design
+ * exactly (round 16-18's memory-ordering work assumed
  * it, and the security roadmap's own DMA/NEON note flags the resulting
  * zero cache-timing-side-channel surface as worth preserving
  * deliberately, not losing by accident here). This round adds
@@ -513,15 +515,100 @@ mmu_init_ram_ext_loop:
      * wide margin -- confirmed by grepping every 0x20...... literal
      * address in this codebase before choosing this range (lowest:
      * 0x20003000 the system timer; highest: 0x20980000 DWC2 USB), not
-     * assumed from the datasheet alone. Read+write, never execute,
-     * Shareable Device memory (TEX=000/C=0/B=1, 0x4) -- the
-     * architecturally correct type for MMIO, distinct from the Normal
-     * Non-cacheable type used for RAM above. AP=01 (privileged-only),
-     * same reasoning as the RAM sections above. */
+     * assumed from the datasheet alone.
+     *
+     * 34th SD round follow-up (2026-09-26): this was Shareable Device
+     * memory (TEX=000/C=0/B=1, encoded as 0x00000C06 below -- B=1 is
+     * bit 2) until a fresh real-HW log showed something no prior round
+     * of this saga had ever produced: DhruvaOS's own existing (until
+     * now print-only) post-CMD16 diagnostic reported CURRENT_STATE=13,
+     * an SD-spec RESERVED value -- not just "wrong", genuinely
+     * undefined -- immediately after a from-scratch, literal C port of
+     * real U-Boot's own CMD0-CMD7 sequence (boot/rpi1/
+     * uboot_sdhost_full.c) ALSO failed the exact same way (write
+     * CMD24 CMD_TIMEOUT) despite matching U-Boot's own command
+     * sequencing byte-for-byte. Both driver-logic hypotheses (this
+     * project's own hand-written bring-up AND a literal from-scratch
+     * transliteration of the reference implementation) now failing
+     * identically rules out command sequencing entirely -- exactly the
+     * decisive outcome that C port's own header comment predicted for
+     * this case, pointing at something more fundamental: memory
+     * attributes for the peripheral region itself.
+     *
+     * Checked against the actual reference this time, not guessed:
+     * ~/source/sdwedge-uboot-test (the same real U-Boot build proven
+     * to write/read this exact card successfully, round 24) runs WITH
+     * its MMU and cache enabled (.config: CONFIG_SYS_DCACHE_OFF is NOT
+     * set) -- it is not simply avoiding this class of bug by running
+     * with the MMU off, the way this project did before round 38.
+     * arch/arm/lib/cache-cp15.c's own mmu_setup() maps the ENTIRE 4GB
+     * space (everything except the DRAM banks, which get overridden
+     * separately by dram_bank_mmu_setup) with dcache_option DCACHE_
+     * OFF -- and arch/arm/include/asm/system.h's final #else branch
+     * (the one that applies here: this board is ARM1176/ARMv6, neither
+     * CONFIG_ARMV7_LPAE nor CONFIG_CPU_V7A) defines `DCACHE_OFF =
+     * 0x12`. Decoded against this exact section-descriptor bit layout
+     * (this file's own header above): 0x12 sets ONLY the section-type
+     * bits and XN (bit 4) -- TEX, C, AND B are all 0. Per the TEX/C/B
+     * table (also confirmed against arch/arm/include/asm/system.h's
+     * own CPU_V7A comment block, which documents the same short-
+     * descriptor encoding this board uses): TEX=000/C=0/B=0 is Device-
+     * nGnRnE, i.e. Strongly Ordered -- NOT Shareable Device. Real
+     * U-Boot maps EVERY peripheral on this exact board, SDHOST
+     * included, as Strongly Ordered, and additionally marks it XN=1
+     * (execute-never) -- this project's own encoding had that bit
+     * clear too, an unrelated pre-existing W^X gap for MMIO the file's
+     * own original header never caught, closed here as a side effect
+     * of matching the reference exactly rather than left half-fixed.
+     *
+     * The distinction is not academic: Shareable Device memory (B=1)
+     * permits the write buffer to hold a posted write after the CPU
+     * has already moved on to the next instruction; Strongly Ordered
+     * memory (B=0) does not -- every access is guaranteed to actually
+     * reach the peripheral, in program order, before the next one is
+     * even issued. A hand-rolled polled MMIO driver that reads back a
+     * command's own response/status register immediately afterward
+     * (exactly this driver's own shape, and exactly where the CURRENT_
+     * STATE=13 corruption was observed) is precisely the pattern this
+     * distinction matters for. QEMU's own TCG MMIO model has no
+     * concept of write buffering or posted-write timing at all --
+     * every access is instantaneous from the guest's point of view
+     * regardless of memory type -- which is exactly why 34 rounds of
+     * QEMU-verified regression testing never surfaced this: it is
+     * architecturally invisible under QEMU by construction, real only
+     * on physical hardware, matching this entire saga's own repeated
+     * QEMU-vs-real-HW divergence pattern one level deeper than any
+     * prior round looked. AP=11, same reasoning as the RAM sections
+     * above (round 253's own USR-mode access change).
+     *
+     * FALSIFIED (2026-09-26, same-day real-HW retest): a fresh card
+     * flash was byte-verified (md5sum matched build/kernel.img exactly
+     * before boot) to confirm this exact fix was genuinely running,
+     * not a stale image -- the resulting picocom log was byte-for-byte
+     * identical to the pre-fix capture: CURRENT_STATE=13 unchanged,
+     * write err=0x20/read err=0x08 unchanged on every block, the
+     * independent uboot_sdhost_full.c port's own status unchanged
+     * (-8). Strongly Ordered vs Shareable Device memory type is NOT
+     * the cause of this symptom, whatever the theoretical write-
+     * buffering argument above suggested -- kept as Strongly Ordered
+     * anyway since it's still the reference-matching, more
+     * conservative choice and costs nothing, but the search for the
+     * real cause continues elsewhere. Worth noting for whoever picks
+     * this up next: ARM's own architecture guarantees accesses to
+     * Device-type memory (Strongly Ordered OR Shareable Device alike)
+     * stay in program order for the SAME observer/core issuing them
+     * sequentially -- the buffering distinction only matters for
+     * OTHER observers (a second core, a DMA engine) seeing completion
+     * timing, which was never this driver's situation to begin with
+     * (single core, no DMA, synchronous polling). In hindsight the
+     * theory was reference-grade evidence of a real divergence from
+     * U-Boot, but not causally connected to THIS symptom -- a useful
+     * reminder that matching a reference exactly is necessary evidence
+     * of nothing beyond itself. */
     mov r6, #512
     ldr r7, =0x20000000
 mmu_init_periph_loop:
-    ldr r5, =0x00000C06
+    ldr r5, =0x00000C12
     orr r5, r5, r7
     str r5, [r4, r6, lsl #2]
     add r7, r7, #0x00100000
