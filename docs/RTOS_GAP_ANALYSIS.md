@@ -1070,10 +1070,24 @@ doesn't yet attempt.
   not a real bound. What IS real and code-enforced today: **worst case,
   no single SD operation can wait more than
   (command count) × 1,000,000 poll iterations**, a genuine, verifiable
-  ceiling — the still-open piece, if an absolute time bound is ever
-  needed, is wiring up PMCCNTR (or an equivalent free-running counter)
-  to measure that iteration's real cost once, not a new architectural
-  gap.
+  ceiling.
+
+  **`[INFRASTRUCTURE DONE, 2026-09-26]`** — `boot/pmccntr_state.S` now
+  wires up ARM1176JZF-S's own CP15 c15 performance-monitor cycle
+  counter (`PMNC`/`CCNT`, confirmed against the ARM1176JZF-S TRM's own
+  register summary), plus `pmccntr_self_test()` (cross-validates
+  against `TIMER_CLO` before trusting any derived number) and
+  `sdhost_cmd_poll_body_pmccntr_self_test()` (measures the real
+  poll-body cost and computes the absolute-time bound this section
+  describes). **The actual number is still not in hand**: under QEMU,
+  PMCCNTR reads back a constant 0 (`elapsed_cycles=0` over a 14.875ms
+  busy-loop window) — QEMU's arm1176 CPU model does not implement this
+  core-specific CP15 c15 PMU, confirmed by the self-test's own
+  cross-check against `TIMER_CLO`, not assumed. Real ARM1176JZF-S
+  silicon guarantees these registers architecturally, so the real
+  absolute-time bound this section wants is one real-HW boot away, not
+  a further architectural gap — this is a QEMU-emulation ceiling, not
+  a driver limitation.
 
 ## Suggested phasing (cheapest/highest-value first, not a commitment)
 
