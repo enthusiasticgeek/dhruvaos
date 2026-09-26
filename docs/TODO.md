@@ -10479,3 +10479,49 @@ twice, identical to documented baseline both times. Commit `a4264c9`.
 30-round saga directly, mechanistically supported by an otherwise-
 inexplicable, byte-for-byte-invariant symptom, rather than reasoning
 from a register-value comparison alone.
+
+**2026-09-25, 31st SD round: FIFO drain-to-empty fix (a4264c9)
+FALSIFIED by real-HW retest.** The newest picocom log
+(`picocom_20260925_215303.log`, confirmed via `stat`/`git log`
+timestamp cross-check to be a genuine test of that exact commit)
+shows the pre-clear drain loop found ZERO stale words to discard on
+every single init (`grep -c "FIFO pre-clear" -> 0`) -- i.e. the FIFO
+genuinely was empty before any command ran, exactly as the fix
+intended. Yet the exact same corruption reappeared completely
+unchanged: `SD DIAG: SCR=02 00 00 00 35 02 00 00`, and the same
+regular-block mismatch pattern, byte-for-byte identical to every
+prior log. This rules out "stale FIFO SRAM content surviving reset"
+as the explanation.
+
+Re-reading this log turned up a clue not fully examined in the prior
+round: `sd_scr_drain_diag`'s own fifo_fill snapshot reads `0x8` (8
+words) at its poll gate, for a transfer that is only ever 2 words
+(SDHBCT=8 bytes, SDHBLC=1). 4x too much data appears to be sitting in
+the FIFO by the time software first checks it, for a command whose
+own hardware block-length registers were correctly reprogrammed to 8
+bytes immediately beforehand (verified by direct code inspection:
+`sd_read_scr` writes SDHCFG/SDHBCT=8/SDHBLC=1 before issuing CMD55,
+and `sdhost_cmd` itself never touches those registers -- also
+cross-checked against real Linux's own `bcm2835_sdhost_prepare_data`
++ `send_command` ordering, which matches exactly).
+
+That `fifo_fill=0x8` value was previously read only from
+`sd_scr_drain_diag`'s own post-poll-loop snapshot -- which cannot
+distinguish "hardware already held 8 words the instant CMD51's
+response phase finished" (a real protocol/hardware anomaly) from
+"fill grew from 0 to 8 while software was still busy-spinning before
+its first read" (the diagnostic's own polling being slower than the
+card can fill a 16-word-deep FIFO). Added an unconditional,
+zero-iteration SDEDM read in `sd_read_scr`, immediately after
+`cmd51_status` confirms non-timeout/non-fail and before
+`sd_scr_drain_diag`'s own poll loop runs at all -- the earliest
+possible software observation of the true post-command fill level.
+Commit `9ef4194`. Verified: build clean, QEMU boot, `phase4_milestone.py`
+run 3x matching documented baseline exactly each time (diagnostic-only
+addition, no production path touched). **Awaiting a fresh real-HW log**
+to determine whether the fill starts near 0 and overshoots to 8 before
+software's first read (implicating a busy-spin timing gap), or is
+already 8 instantly (implicating a genuine hardware/protocol mismatch
+between the programmed 8-byte block length and what the controller or
+card actually clock in) -- the root cause of the deterministic
+corruption remains unknown as of this round.
