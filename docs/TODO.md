@@ -10849,3 +10849,73 @@ CMD13 specifically).
 Verified: build clean, QEMU boot (same pre-existing CMD2 limitation, unreached either way),
 `phase4_milestone.py` matches the documented 13-pass/5-fail baseline exactly. **Awaiting real-HW
 retest.**
+
+## 37th SD round (2026-09-27): real-HW retest CONFIRMS the 36th round's fix -- CURRENT_STATE=4 achieved after 36 rounds; new blocker is a data-phase CRC16 error, not a state error
+
+Real-HW retest of the ACMD51/ACMD6 reorder fix (`picocom_20260927_075045.log`). Result: **outcome 1 of
+the two documented in the 36th round -- order, not raw elapsed time, was the fix.**
+
+```
+SD DIAG: post-CMD16 R1=0x00000900 CURRENT_STATE=4 (tran -- card genuinely selected)
+```
+
+This line appears in BOTH sdhost_init calls in this log (the main path and the independent uboot-full
+bring-up), with zero exceptions -- the first time in this entire 36-round saga that DhruvaOS's own
+CMD16 has shown anything other than the SD-spec-reserved `CURRENT_STATE=13`. The CMD13 settle-poll
+hypothesis (rounds up to 36) is now doubly dead: not only was the settle-poll itself decisively
+falsified, but the reorder that replaced it is the confirmed, working fix for the underlying state bug.
+
+**New blocker, previously unreachable**: with CURRENT_STATE now correct, all 8 blocks in the write
+sweep (2100-2107) still fail, but with a DIFFERENT symptom than every prior round:
+
+```
+SD DIAG: per-write CMD16 (SET_BLOCKLEN) status=0x00000010 timed_out=0 failed=0
+SD DIAG: uboot-port post-wait SDHSTS error=0x00000020
+SD DIAG: read errs=0x00000008 (CMD_TIMEOUT=0x40 CRC16=0x20 CRC7=0x10 FIFO_ERROR=0x08 REW_TIMEOUT=0x80)
+SD DIAG: block 2100 FAILED: wr=3 rd=3 mismatch_at=1 SDHSTS=0x00000000 SDEDM=0x00010801
+SD DIAG: expected(w) 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F
+SD DIAG: actual  (r) C3 C2 C1 C0 C3 C2 C1 C0 C3 C2 C1 C0 11 00 00 00
+```
+
+`error=0x00000020` is `SDHSTS_CRC16` per the driver's own legend (0x20, distinct from CRC7=0x10) --
+a data-phase integrity failure, not a command/state failure. This fires from
+`uboot_sdhost_write.c`'s `bcm2835_wait_transfer_complete`-equivalent post-wait check, AFTER the PIO
+burst-write loop (round 25's fix, unchanged and reviewed this round -- it still faithfully matches
+U-Boot's own `bcm2835_transfer_block_pio`: poll `SDEDM` fill once per `SDDATA_FIFO_PIO_BURST`-sized
+burst, gate on real room, write words back-to-back with no per-word poll). All 8 blocks fail
+identically, and the readback is NOT random-looking corruption -- a repeating `C3 C2 C1 C0` pattern,
+consistent with stale, pre-existing card data being read back after a write that never actually landed
+(the write's own CRC16 failure means the card rejected/aborted the block before committing it).
+
+**Separately**, the independent `uboot-full` bring-up path (round 34's literal C port, re-run
+immediately after the above 8-block sweep against the SAME card) fails even earlier, at the CMD24
+command-response phase itself:
+
+```
+SD DIAG: uboot-full CMD24 FAIL_FLAG SDHSTS=0x00000440
+```
+
+`0x440 & SDHSTS_ERROR_MASK(0xF8) = 0x40` = `CMD_TIME_OUT` -- the card didn't respond to the WRITE_BLOCK
+command token at all, before any data-phase code runs. This is a DIFFERENT failure mode than the main
+path's CRC16 error, on the same physical blocks, moments later in the same boot -- plausibly the card
+left in a transient state by the first path's own repeated failed writes rather than an independent
+bug, but not yet verified either way.
+
+**Downstream cascade, now attributable**: `DharaFS: post-recovery /config/mode = "(not found)"` and
+every subsequent DharaFS-layer FAIL in this log (`multi-block file round trip`, `dharafs_write_bounded`,
+`simulated crash mid-multi-block-write`, `dharafs_compact` resume, permission model, directory
+hierarchy) are direct consequences of every block write failing at the SD layer -- not independent
+DharaFS bugs. This directly answers task #218 ("Confirm DharaFS/crypto downstream FAILs clear once SD
+wedge is fixed"): they have NOT cleared yet, because the SD wedge itself has NOT fully cleared -- the
+state-selection half is fixed, the data-integrity half is not.
+
+**Not yet attempted, deliberately** (per this project's own "no trust, validate everything" +
+"use proven reference after repeated failures" discipline): no code change was made this round. Every
+prior blind code-level fix attempt at the write path (rounds 17-28, 30-35) targeted symptoms that are
+now confirmed to have been observed against a corrupted `CURRENT_STATE=13` context the entire time --
+none of that evidence is safe to re-apply to this newly-clean state without re-verifying it still holds.
+The next step that has repeatedly worked in this saga (rounds 24, 25, 27, 28, 34-36) is a fresh,
+targeted real-U-Boot instrumentation trace of ITS OWN successful CMD24 write at this exact RCA/block
+range/clock divisor (`div=248`, 1MHz data-transfer clock, confirmed identical on both sides), to
+determine whether the CRC16 failure is a timing-margin issue exposed only now that the command sequence
+is correct, or something else entirely -- rather than guessing at another burst-write tweak blind.
