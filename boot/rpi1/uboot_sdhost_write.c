@@ -52,8 +52,11 @@
 
 #define SDCMD_ADDR   0x20202000u
 #define SDARG_ADDR   0x20202004u
+#define SDTOUT_ADDR  0x20202008u
+#define SDCDIV_ADDR  0x2020200Cu
 #define SDHSTS_ADDR  0x20202020u
 #define SDEDM_ADDR   0x20202034u
+#define SDHCFG_ADDR  0x20202038u
 #define SDHBCT_ADDR  0x2020203Cu
 #define SDHBLC_ADDR  0x20202050u
 #define SDDATA_ADDR  0x20202040u
@@ -211,6 +214,32 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
      * conditional print and keeps it unchanged. */
 
     dhruva_sd_diag_dump("pre-CMD24");
+
+    /* 40th SD round (2026-09-27): one-time-only (block 2100 exactly,
+     * not the whole 2100-2107 sweep) capture of three registers never
+     * yet compared against real U-Boot's own matching capture (see
+     * that side's own dhruva_sd_diag_dump comment): SDHCFG (bus
+     * config), SDCDIV (clock divisor), SDTOUT (command timeout).
+     * These don't change across the 8-block sweep (SDCDIV/SDTOUT are
+     * set once at init; SDHCFG is recomputed identically every write
+     * since is_4bit doesn't change mid-sweep), so one sample is enough
+     * evidence -- deliberately NOT added to the main per-block dump
+     * (which now fires 16 times across the sweep): an earlier attempt
+     * at exactly that made all 8 blocks' worth of extra dumps and
+     * measurably shifted QEMU's own boot timing enough to fail
+     * phase4_milestone.py's unrelated tcprtx test (reproduced twice,
+     * deterministic) -- the same class of print-timing-confound risk
+     * documented on dhruva_sd_diag_dump itself. One extra line here
+     * costs a small, bounded, one-time amount instead. */
+    if (block_addr == 2100) {
+        u_puts("SD DIAG: one-time SDHCFG=0x");
+        u_hex32(mmio_r(SDHCFG_ADDR));
+        u_puts(" SDCDIV=0x");
+        u_hex32(mmio_r(SDCDIV_ADDR));
+        u_puts(" SDTOUT=0x");
+        u_hex32(mmio_r(SDTOUT_ADDR));
+        u_puts("\n");
+    }
 
     /* bcm2835_read_wait_sdcmd, called before issuing a new command. */
     t0 = now_us();
