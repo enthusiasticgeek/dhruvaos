@@ -6666,6 +6666,25 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // call site (2026-09-19 original placement) so it can also gate the
   // new pre-CMD24 instrumentation below (19th SD round, 2026-09-20).
   let use_write_diag: bool = (block_num >= 2100) && (block_num < 2108);
+  // 38th SD round follow-up (2026-09-27): a temporary diagnostic print
+  // right here (block_num/is_sdhc/addr) previously confirmed via a
+  // real-HW trace (picocom_20260927_084408.log) that sd_state_get_
+  // is_sdhc() was reading back 0 despite being set to 1 during init --
+  // SDARG was increasing by exactly 0x200 (512) per block, the
+  // signature of byte-addressing on a card whose own OCR reports
+  // is_sdhc=1 (block-addressing required). Root cause found and fixed
+  // in boot/sdcard_state.S's own sd_state_set (see that function's own
+  // comment): an AAPCS two-i64-parameter register-pairing bug, the
+  // same class already fixed once in netif_state.S's own
+  // netif_set_slot_len, silently storing 0 into sd_is_sdhc on every
+  // call since this function was first written. The diagnostic print
+  // itself was removed again after serving its purpose -- it measurably
+  // shifted QEMU's own timing enough to fail phase4_milestone.py's
+  // unrelated tcprtx test (a real instance of this project's own
+  // documented UART-print-timing-confound risk) -- the existing
+  // pre-CMD24/post-CMD24-cmd-complete dumps in boot/rpi1/uboot_sdhost_
+  // write.c already reveal the corrected SDARG value directly, with no
+  // need for this second, more expensive print.
   // 34th SD round follow-up (2026-09-26): real U-Boot's own
   // mmc_bwrite/mmc_write_blocks NEVER sets the card's block length
   // once at init -- mmc_set_blocklen (CMD16) is called at the START of

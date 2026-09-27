@@ -69,12 +69,46 @@ sd_is_4bit:
  * below for the instance that actually manifested, corrupting a
  * caller's own multi-term boolean logic despite the caller's own code
  * and vani's compiler both being entirely correct. */
+/* BUG found 38th SD round follow-up (2026-09-27), real-HW evidence:
+ * sd_state_set(rca: i64, is_sdhc: i64) -- TWO i64 parameters means
+ * AAPCS's 64-bit register-pair rule applies to BOTH, not just the
+ * first: rca occupies r0:r1, so is_sdhc actually arrives in r2:r3,
+ * not r1 as this function originally assumed. The original code read
+ * r1 (rca's own unused, always-zero high word, since RCA fits in 32
+ * bits) instead of r2 (is_sdhc's real value) -- silently storing 0
+ * into sd_is_sdhc regardless of what was actually passed in, on
+ * EVERY call, since this function was first written. This is the
+ * IDENTICAL bug class already found and fixed once in this project
+ * (boot/netif_state.S's own netif_set_slot_len, see that function's
+ * own comment) -- that fix's own scope was per-file, so this second,
+ * independent instance in a different file was never audited or
+ * caught until a real-HW trace directly observed sd_is_sdhc reading
+ * back 0 immediately after being set to 1 (picocom_20260927_084408.
+ * log), which is impossible to explain from this function's own
+ * source without exactly this register-pairing mistake. Confirmed by
+ * an exhaustive sweep of every extern "C" fn in kernel_main.vani for
+ * a second i64 parameter anywhere in the list -- these two functions
+ * are the ONLY two in the entire codebase with this shape.
+ *
+ * Real consequence: sdhost_card_addr (kernel_main.vani) branches on
+ * sd_state_get_is_sdhc() to choose SDHC block-addressing vs SDSC
+ * byte-addressing for every single SD read/write CMD17/CMD24 argument
+ * -- with is_sdhc silently always reading back 0, EVERY write/read on
+ * an actual SDHC card (this card included, is_sdhc=1 confirmed from
+ * the OCR's own CCS bit) has been sending byte-multiplied (block_num*
+ * 512) arguments to a card that requires the raw block number,
+ * addressing a wildly wrong location every time -- a very plausible
+ * root cause for this project's whole multi-round CRC16/write-failure
+ * saga, not just the 37th round's own specific finding. r12 (IP) used
+ * as the address scratch register, matching netif_set_slot_len's own
+ * convention, specifically so as not to further confuse which
+ * register holds which argument while reading this fix. */
 .global sd_state_set
 sd_state_set:
-    ldr r2, =sd_rca
-    str r0, [r2]
-    ldr r2, =sd_is_sdhc
-    str r1, [r2]
+    ldr r12, =sd_rca
+    str r0, [r12]
+    ldr r12, =sd_is_sdhc
+    str r2, [r12]
     mov r0, #0
     mov r1, #0
     bx lr
