@@ -11432,3 +11432,54 @@ Build clean (asm audit 0/0), QEMU PASS. Awaiting the next real-HW retest -- if t
 gap, it may also resolve some of the 6 pre-existing DharaFS-level FAILs (task #218), since a corrupted
 mid-transfer read is exactly the kind of thing that would produce symptoms like "multi-block file round
 trip... FAIL".
+
+### 42nd SD round, fourth follow-up (2026-09-27): DATA_IRPT_EN fix refuted too -- new hypothesis: retry cap too tight for 4-bit timing
+
+Real-HW retest (`picocom_20260927_192950.log`, commit `f7e3976`) confirmed via disassembly that the DATA_IRPT_EN
+removal genuinely built and shipped (literal `0x40E`/`0x40A` construction verified in the compiled object code)
+-- yet the result is byte-for-byte identical to the previous log: 0 wedges, 184 "read errs=0x00000008", 47
+PASS, 6 FAIL, same FAIL lines. Second refuted hypothesis for this specific symptom, honestly recorded.
+
+**New hypothesis, informed by a careful side-by-side register-order comparison** (not another isolated bit
+guess): the masked burst-readiness retry cap in `sdhost_drain_fifo_to_buffer_impl` (400 iterations, ~222us at
+the 32nd round's own measured 0.55515us/iteration) was reduced from 1000 specifically for 1-bit-mode-era WCET
+reasons (round 32), before 4-bit mode -- which needs the same 8-word burst filled in roughly 1/4 the real time
+-- was ever a consideration. If a genuine burst occasionally takes longer than ~222us to fill under real 4-bit
+timing (plausible, not yet measured), the retry cap exhausts before the FIFO actually has a word ready, and
+the existing "give up and read anyway" fallback (added long before this investigation, for a different reason)
+reads SDDATA while it's still empty -- a genuine hardware underrun the silicon correctly flags as FIFO_ERROR,
+not a false positive, and one the round-41 FSM-state check can never catch since the FSM validly stays in a
+read state (READDATA/READWAIT/READCRC) the entire time this happens.
+
+**Also considered and ruled out as the sole explanation**: an SDHBCT/SDHBLC write-ordering divergence from
+real U-Boot's own sequence (production writes them well before the merged function's own SDHSTS-clear step;
+real U-Boot and the diagnostic port both write them immediately after). Confirmed via direct code inspection
+that BOTH the read and write production paths share this exact same divergence -- yet only reads fail, ruling
+it out as the read/write-specific differentiator (a real, pre-existing minor divergence from the reference,
+but not this bug).
+
+**Instrumented before fixing blind, per this project's own "smallest test that distinguishes hypotheses"
+discipline** (2 guesses have already failed this round): added a persistent forced-fallback counter
+(`sd_drain_forced_fallback_count`, a new `.bss` word + accessor, matching this file's own existing sd_rca/
+sd_is_sdhc/sd_is_4bit pattern -- deliberately NOT threaded through the function's own i64 return value, since
+doing so via r1 would have corrupted every successful 0 return into a large nonzero 64-bit value) that counts
+every time the fallback fires during a read. Surfaced via a new diagnostic print in `sdhost_read_block_once`,
+unconditionally on any nonzero count regardless of overall outcome -- the next real-HW log will either
+directly confirm this mechanism (nonzero count on failing reads) or cleanly refute it too (always zero even
+when errs=0x08 still fires).
+
+**Bumped the retry cap 400->700** (~385us) as a testable, schedulability-safe change alongside the
+diagnostic -- scaled linearly from the write side's own measured 22.272ms-at-cap-400 figure (700/400 x
+22.272 = 38.976ms), comfortably under HIGH/MEDIUM's own 49.906ms ceiling-0 budget. `test/
+schedulability_analysis.py` updated to track this as its own new candidate (`sd_drain_fifo_worst_case_wedge_ms`)
+-- the read-side masked window (syscall #6, added round 30) had never been separately entered into the model
+at all, only the write side's identical-shape window ever was; re-ran the tool, verdict unchanged
+(schedulable, comfortable margin -- LOW's own 49.906ms ceiling-0 section remains the binding constraint,
+this new term isn't close to it). Write side's own cap left untouched (400) since it currently works and
+this symptom is read-only.
+
+Build clean (asm audit 0/0 -- confirms the new r8 callee-saved register and 5-register push/pop balance
+across every exit path is correct), QEMU PASS, no regressions (identical pre-existing QEMU SD-non-functional
+pattern). Awaiting the next real-HW retest -- this round tests a hypothesis AND ships the fix simultaneously,
+rather than another separate confirm-then-fix cycle, since raising an already-measured-safe retry cap and
+adding a read-only diagnostic counter carry negligible regression risk either way.

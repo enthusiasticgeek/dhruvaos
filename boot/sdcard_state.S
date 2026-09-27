@@ -31,6 +31,20 @@ sd_is_4bit:
                      * sdhost_init_at_speed comment for the full "why"
                      * (this board's own DT declares bus-width=4, real
                      * U-Boot auto-negotiates it, this driver never had). */
+sd_drain_forced_fallback_count:
+    .word 0        /* 42nd SD round, 4th follow-up (2026-09-27): set by
+                     * sdhost_drain_fifo_to_buffer_impl's own r8 (see
+                     * that function's own comment) right before every
+                     * return. Deliberately NOT threaded back through
+                     * the function's own i64 return value -- r0:r1 is
+                     * the AAPCS 64-bit return-value pair for an i64
+                     * result, so stuffing a diagnostic count into r1
+                     * would silently corrupt every successful (0)
+                     * return into a large nonzero 64-bit value the
+                     * caller's own `== 0` checks would never match again.
+                     * This file's own established small-.bss-plus-
+                     * extern-accessor pattern (sd_rca/sd_is_sdhc/
+                     * sd_is_4bit above) sidesteps that risk entirely. */
 
 .section ".text"
 
@@ -123,6 +137,13 @@ sd_state_get_rca:
 .global sd_state_get_is_sdhc
 sd_state_get_is_sdhc:
     ldr r0, =sd_is_sdhc
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global sd_state_get_drain_forced_fallback_count
+sd_state_get_drain_forced_fallback_count:
+    ldr r0, =sd_drain_forced_fallback_count
     ldr r0, [r0]
     mov r1, #0
     bx lr
@@ -262,9 +283,10 @@ sd_state_get_is_4bit:
  * FAIL_FLAG check passes, no function-call boundary in between. */
 .global sdhost_drain_fifo_to_buffer_impl
 sdhost_drain_fifo_to_buffer_impl:
-    push {r4, r5, r6, r7}     /* r4-r7 callee-saved (AAPCS) -- see the
-                               * file-level note below on why this
-                               * isn't optional here */
+    push {r4, r5, r6, r7, r8}  /* r4-r8 callee-saved (AAPCS) -- r8 added
+                               * this round for the forced-fallback
+                               * counter below; see the file-level note
+                               * below on why r4-r7 aren't optional here */
     mov r4, r0                /* r4 = buf, preserved across the command
                                * phase below (r0-r3 are otherwise free
                                * scratch until the drain loop needs them) */
@@ -325,14 +347,73 @@ sdhost_drain_cmd_poll_done:
     mov r0, r4                 /* r0 = buf, restored for the drain loop */
     mov r4, #128               /* r4 = word_count remaining (always one
                                * 512-byte block at every real call site) */
+    mov r8, #0                 /* 42nd SD round, 4th follow-up (2026-09-
+                               * 27): r8 = count of bursts where the
+                               * retry cap below was exhausted and the
+                               * fallback (force a read anyway) fired --
+                               * previously silent/unobservable. Real-HW
+                               * evidence so far: two independent SDHCFG
+                               * hypotheses (missing WIDE_INT_BUS, extra
+                               * DATA_IRPT_EN) each fixed a real, separate
+                               * problem or made no difference at all
+                               * (the first eliminated the command-level
+                               * wedge storm; the second, confirmed via
+                               * disassembly to have actually built and
+                               * shipped, changed nothing) -- the
+                               * remaining near-100%-reproducible
+                               * FIFO_ERROR-on-every-read symptom, with
+                               * neither this round's nor round 41's FSM/
+                               * SDHSTS checks ever firing, is consistent
+                               * with a genuine FIFO underrun: the retry
+                               * cap (400, ~222us at the 32nd round's own
+                               * measured 0.55515us/iteration) exhausting
+                               * BEFORE the FIFO genuinely has a word
+                               * ready, forcing sdhost_drain_burst to read
+                               * SDDATA anyway (see that label's own
+                               * "give up and continue" comment) -- a
+                               * real controller-level underrun, not a
+                               * software logic error, and one the FSM-
+                               * state check can never catch since FSM
+                               * validly stays in READDATA/READWAIT the
+                               * whole time. This cap was reduced from
+                               * 1000 in round 32 specifically for 1-bit-
+                               * mode-era WCET reasons, before 4-bit mode
+                               * (which needs the SAME burst filled in
+                               * 1/4 the real time) was ever a
+                               * consideration. Counting here, surfaced
+                               * to the caller via r1 on success, to
+                               * directly confirm or refute this on the
+                               * next real-HW log rather than guessing a
+                               * fourth isolated fix blind. */
     ldr r6, =0x20202034        /* SDEDM */
 sdhost_drain_loop:
     cmp r4, #0
     beq sdhost_drain_done
-    ldr r5, =400             /* bounded burst-readiness retry cap,
-                               * MASKED-loop-specific -- see this
-                               * function's own header comment for why
-                               * this is far below the shared 100000
+    ldr r5, =700             /* 42nd SD round, 4th follow-up: bumped from
+                               * 400 -> 700 (~385us, up from ~222us) --
+                               * see r8's own comment above for the full
+                               * "why". Schedulability-safe: the 32nd
+                               * round's own measured worst case at cap=
+                               * 400 was 22.272ms (test/schedulability_
+                               * analysis.py); scaling linearly (700/400 x
+                               * 22.272 = 38.98ms) stays comfortably under
+                               * HIGH/MEDIUM's own 49.906ms ceiling-0
+                               * budget -- schedulability_analysis.py
+                               * updated to track this as its own,
+                               * separate candidate (it previously only
+                               * modeled the write side's own identical-
+                               * shape masked window, syscall #5; this is
+                               * the read side's, syscall #6, which
+                               * shares the same architecture but had
+                               * never been separately entered into the
+                               * model at all). This is a scaled estimate,
+                               * not a fresh WCET self-test measurement --
+                               * flagged as such in that file's own
+                               * comment for a future round to tighten if
+                               * ever needed. Bounded burst-readiness
+                               * retry cap, MASKED-loop-specific -- see
+                               * this function's own header comment for
+                               * why this is far below the shared 100000
                                * every genuinely-unmasked per-burst poll
                                * elsewhere in this file still uses.
                                * REDUCED from 1000 to 400 in the 32nd SD
@@ -434,6 +515,9 @@ sdhost_drain_poll:
 sdhost_drain_fsm_retry:
     subs r5, r5, #1
     bne sdhost_drain_poll
+    add r8, r8, #1             /* 42nd SD round, 4th follow-up: count
+                               * this fallback firing -- see r8's own
+                               * init comment above for the full "why" */
     mov r2, #1                /* retry cap exhausted -- force reading
                                * at least 1 word rather than hang
                                * forever, matching this file's own
@@ -465,8 +549,14 @@ sdhost_drain_burst:
     bne sdhost_drain_burst
     b sdhost_drain_loop
 sdhost_drain_done:
+    ldr r1, =sd_drain_forced_fallback_count  /* stored BEFORE popping r8
+                               * back to the caller's own original value
+                               * below -- see that word's own comment for
+                               * why this isn't threaded through r1 as
+                               * part of the actual i64 return value */
+    str r8, [r1]
     msr cpsr_c, r12
-    pop {r4, r5, r6, r7}
+    pop {r4, r5, r6, r7, r8}
     mov r0, #0
     mov r1, #0
     bx lr
@@ -478,8 +568,12 @@ sdhost_drain_fifo_error:
      * The buffer beyond whatever was already drained is left
      * unfilled/stale; the caller already treats any non-zero SDHSTS
      * error as a failed read regardless. */
+    ldr r1, =sd_drain_forced_fallback_count  /* r8 valid here too (this
+                               * path runs after masking begins) --
+                               * stored for the same diagnostic reason. */
+    str r8, [r1]
     msr cpsr_c, r12
-    pop {r4, r5, r6, r7}
+    pop {r4, r5, r6, r7, r8}
     mov r0, #1
     mov r1, #0
     bx lr
@@ -487,8 +581,16 @@ sdhost_drain_cmd_exit:
     /* 42nd SD round: command phase (timeout, r0=2, or FAIL_FLAG, r0=3)
      * never reached the mask -- cpsr_c was never saved into r12 on this
      * path, so it must NOT be restored here (would corrupt the caller's
-     * own CPSR with whatever garbage happened to be in r12 at entry). */
-    pop {r4, r5, r6, r7}
+     * own CPSR with whatever garbage happened to be in r12 at entry).
+     * r8 was never initialized on this path (it's set up only after the
+     * mask below succeeds) -- explicitly zeroing the diagnostic word
+     * instead of storing r8's own garbage value, so a stale nonzero
+     * count from a PRIOR successful call can never be misread as
+     * belonging to this one. */
+    mov r2, #0
+    ldr r1, =sd_drain_forced_fallback_count
+    str r2, [r1]
+    pop {r4, r5, r6, r7, r8}
     mov r1, #0
     bx lr
 

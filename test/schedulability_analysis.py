@@ -415,6 +415,30 @@ def dhruvaos_demo_task_set_analysis() -> int:
     gc_dharafs_healthy_ms = 7.689  # measured max, 10 real passes
     sd_fill_fifo_worst_case_wedge_ms = 22.272  # measured+computed, 32nd SD round
     gc_dharafs_critical_section_ms = gc_dharafs_healthy_ms + sd_fill_fifo_worst_case_wedge_ms
+
+    # 42nd SD round, 4th follow-up (2026-09-27): the READ side's own
+    # identical-shape masked window (syscall #6, sdhost_drain_fifo_to_
+    # buffer_impl, added round 30) was never separately entered into this
+    # model at all -- only the write side's own figure above ever was.
+    # Its own burst-readiness retry cap was bumped 400->700 this round
+    # (boot/sdcard_state.S) to test a real hypothesis about 4-bit-mode
+    # read timing (see that file's own r8/sd_drain_forced_fallback_count
+    # comments) -- scaled linearly from the write side's own measured
+    # 400-cap figure (700/400 x 22.272 = 38.976ms) rather than a fresh
+    # WCET self-test measurement, since the two loops share the exact
+    # same architecture (128 words, same per-iteration DMB cost) and no
+    # sd_drain_poll_body_wcet_measure_self_test exists yet to measure it
+    # directly -- flagged here as an estimate for a future round to
+    # tighten with a real self-test if this ever becomes load-bearing.
+    # Still comfortably under HIGH/MEDIUM's own 49.906ms ceiling-0 budget
+    # below. Entered as its own separate candidate (not folded into GC's
+    # own critical section above -- DharaFS's own compaction/write path
+    # doesn't itself call the masked read syscall, so it isn't part of
+    # THAT specific critical section) but IS a candidate for HIGH/
+    # MEDIUM's own blocking term below, per task #285's own established
+    # reasoning: masking disables preemption universally regardless of
+    # which task or ceiling triggered it.
+    sd_drain_fifo_worst_case_wedge_ms = 38.976  # scaled estimate, 42nd SD round
     # ROUND 2026-09-17 (gap #238): was 325.62ms (dwc2_wait_chan0_done's
     # own shared-primitive worst case) -- now the real measured worst
     # case of dwc2_net_bulk_in_poll_wcet_measure_self_test's own
@@ -448,7 +472,8 @@ def dhruvaos_demo_task_set_analysis() -> int:
     # incomplete, not because today's numbers demanded it; if either
     # figure moves in a future round, this is what keeps the bound
     # honest instead of silently stale.
-    high_medium_blocking_ms = max(measured_low_critical_section_ms, sd_fill_fifo_worst_case_wedge_ms)
+    high_medium_blocking_ms = max(measured_low_critical_section_ms, sd_fill_fifo_worst_case_wedge_ms,
+                                   sd_drain_fifo_worst_case_wedge_ms)
 
     tasks = [
         # HIGH (task_a): sleeps 3 ticks, priority 0. Own body has no

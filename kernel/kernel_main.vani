@@ -2702,6 +2702,12 @@ extern "C" fn sd_state_get_is_sdhc() -> i64;
 extern "C" fn sd_state_set_is_4bit(is_4bit: i64) -> i64;
 #[stack_cost(bytes=4)]
 extern "C" fn sd_state_get_is_4bit() -> i64;
+// 42nd SD round, 4th follow-up (2026-09-27) -- see boot/sdcard_state.S's
+// own sd_drain_forced_fallback_count comment for the full "why" this is
+// a separate accessor rather than threaded through the drain function's
+// own i64 return value.
+#[stack_cost(bytes=1)]
+extern "C" fn sd_state_get_drain_forced_fallback_count() -> i64;
 // 30th SD round -- see boot/sdcard_state.S's own header comment.
 #[stack_cost(bytes=16)]
 extern "C" fn sd_scr_dump_and_check_4bit(buf: mut ref i64) -> i64;
@@ -6693,6 +6699,27 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // round-41 pre-PIO SDHSTS check ("check 7") both moved into the asm
   // too, immediately after the command completes, before the mask.
   let drain_status: i64 = sdhost_drain_fifo_to_buffer(buf, sdcmd_read | (17 as u32), addr);
+  // 42nd SD round, 4th follow-up (2026-09-27): direct confirm/refute test
+  // for the "retry cap (400, ~222us) exhausts before the FIFO genuinely
+  // has a word ready in 4-bit mode, forcing a read of an empty/not-yet-
+  // ready FIFO -- a real underrun the FSM-state check can never catch
+  // since FSM validly stays in a read state the whole time" hypothesis --
+  // see boot/sdcard_state.S's own sd_drain_forced_fallback_count comment
+  // for the full "why". Two earlier SDHCFG hypotheses this same round
+  // either fixed a real, different problem (WIDE_INT_BUS, confirmed via
+  // real-HW retest: wedge storm eliminated) or made no measurable
+  // difference at all (DATA_IRPT_EN, confirmed via disassembly to have
+  // actually built and shipped) -- printed here, unconditionally on any
+  // nonzero count regardless of overall outcome, so the next real-HW log
+  // either confirms this mechanism directly (a nonzero count on failing
+  // reads) or cleanly rules it out too (always zero even when errs=0x08
+  // still fires), rather than another blind guess.
+  let drain_fallback_count: i64 = sd_state_get_drain_forced_fallback_count();
+  if drain_fallback_count != 0 {
+    let _ = uart_puts("SD DIAG: read drain forced-fallback count=");
+    let _ = uart_put_i64(drain_fallback_count);
+    let _ = uart_puts(" (retry cap exhausted before FIFO fill was ready -- see this round's own hypothesis)\n");
+  }
   // 42nd SD round: command-phase outcomes (2/3/4) short-circuit BEFORE
   // ever calling sdhost_wait_transfer_complete -- none of these reached
   // the masked drain loop at all (the asm bails before ever masking),
