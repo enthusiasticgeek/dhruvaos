@@ -225,16 +225,107 @@ sd_state_get_is_4bit:
  * WCET fix already established 1000 as the correct value for a masked
  * burst-gate poll -- reusing the shared 100000 here would reintroduce
  * the exact worst-case-masked-duration problem that round fixed). */
+/* 42nd SD round (2026-09-27): folded CMD17 (READ_SINGLE_BLOCK) issuance
+ * directly into this function, immediately before the mask+drain, to
+ * close a real unmasked window this project's own disassembly-level
+ * audit found: previously the caller issued CMD17 via the plain
+ * (unmasked, USR-mode, preemptible) sdhost_cmd, THEN separately called
+ * this SWI-trampolined function, which only started masking interrupts
+ * AFTER its own trap dispatch overhead. Per the SD protocol, the card
+ * begins streaming block data onto the DAT lines almost immediately
+ * once the command's own R1 response lands (NEW_FLAG clearing) -- if
+ * a timer tick or any other interrupt preempted the task anywhere in
+ * that old gap (post-NEW_FLAG-clear, pre-cpsid), the FIFO could silently
+ * overflow before this function's own masked drain loop ever ran a
+ * single iteration. The 16-word FIFO's own real-time margin against
+ * that is a straight function of bus width -- 4x tighter in 4-bit mode
+ * than 1-bit, for the same clock -- which would explain exactly why
+ * this project's own 1-bit-mode boots were reliable and 4-bit-mode
+ * ones aren't: real U-Boot is single-threaded bare-metal bootloader
+ * code with no scheduler and no competing interrupts at all during its
+ * own SD access, so this exact gap can never matter for it regardless
+ * of bus width, while DhruvaOS is a genuine preemptive RTOS. Signature
+ * changed: buf/cmd_and_flags/arg (word_count is always 128 -- one
+ * block -- at every real call site, so it's hardcoded below rather
+ * than threaded through as a parameter no caller ever varies). New
+ * return codes 2 (command NEW_FLAG poll timed out) and 3 (command
+ * FAIL_FLAG set) added for the command phase, on top of the existing
+ * 0 (success) / 1 (FIFO/FSM error mid-burst, round 41) already
+ * returned by the unchanged drain logic below. The command-issue-and-
+ * poll phase itself stays UNMASKED and keeps the same 1,000,000-
+ * iteration cap sdhost_cmd already used -- masking that too would blow
+ * this project's own already-measured WCET/schedulability budgets
+ * (task #285) for no benefit, since the card hasn't started sending
+ * data yet during the command-response phase; only the handoff from
+ * "command done" to "FIFO service begins" needed to become gapless,
+ * and it now is -- cpsid is the literal next instruction after the
+ * FAIL_FLAG check passes, no function-call boundary in between. */
 .global sdhost_drain_fifo_to_buffer_impl
 sdhost_drain_fifo_to_buffer_impl:
     push {r4, r5, r6, r7}     /* r4-r7 callee-saved (AAPCS) -- see the
                                * file-level note below on why this
                                * isn't optional here */
+    mov r4, r0                /* r4 = buf, preserved across the command
+                               * phase below (r0-r3 are otherwise free
+                               * scratch until the drain loop needs them) */
+    mov r5, r1                /* r5 = cmd_and_flags */
+    mov r6, r2                /* r6 = arg (CMD17's own argument, the
+                               * already-computed card address) */
+
+    /* Command-issue phase, UNMASKED -- mirrors sdhost_cmd's own real
+     * logic (kernel_main.vani) exactly: pre-clear any latched SDHSTS
+     * error bits, write SDARG then SDCMD|NEW_FLAG, poll for NEW_FLAG
+     * to clear. Deliberately duplicated rather than calling sdhost_cmd
+     * itself -- this is raw asm with no AAPCS call boundary to cross,
+     * keeping every instruction between "command done" and "cpsid"
+     * inline and inspectable. */
+    ldr r0, =0x20202020        /* SDHSTS */
+    ldr r1, [r0]
+    ands r2, r1, #0xF8         /* SDHSTS_ERROR_MASK */
+    strne r1, [r0]
+
+    ldr r0, =0x20202004        /* SDARG */
+    str r6, [r0]
+    ldr r0, =0x20202000        /* SDCMD */
+    orr r1, r5, #0x8000        /* cmd_and_flags | NEW_FLAG */
+    str r1, [r0]
+
+    ldr r2, =1000000           /* same bound as sdhost_cmd's own poll cap */
+sdhost_drain_cmd_poll:
+    ldr r1, [r0]
+    tst r1, #0x8000
+    beq sdhost_drain_cmd_poll_done
+    subs r2, r2, #1
+    bne sdhost_drain_cmd_poll
+    mov r0, #2                 /* command NEW_FLAG poll timed out */
+    b sdhost_drain_cmd_exit
+sdhost_drain_cmd_poll_done:
+    tst r1, #0x4000            /* FAIL_FLAG */
+    moveq r0, #0
+    movne r0, #3               /* command FAIL_FLAG set */
+    bne sdhost_drain_cmd_exit
+
+    /* Pre-PIO SDHSTS check (real U-Boot's own bcm2835_transmit leading
+     * check, round 41's "check 7") -- folded in here, right before the
+     * mask, instead of a separate post-return check the caller used to
+     * do: with the command-issue-to-drain gap now closed, doing this
+     * check any later would just be reading the same register one
+     * function-call-boundary further away for no benefit. */
+    ldr r0, =0x20202020         /* SDHSTS */
+    ldr r1, [r0]
+    tst r1, #0xF8               /* SDHSTS_ERROR_MASK */
+    moveq r0, #0
+    movne r0, #4                /* pre-PIO SDHSTS already shows an error */
+    bne sdhost_drain_cmd_exit
+
+    /* SUCCESS: mask and start draining with zero gap -- cpsid is the
+     * very next instruction after the pre-PIO SDHSTS check above. */
     mrs r12, cpsr
     cpsid if
-    mov r4, r2               /* r4 = word_count remaining (r2:r3 pair,
-                               * low half) */
-    ldr r6, =0x20202034      /* SDEDM */
+    mov r0, r4                 /* r0 = buf, restored for the drain loop */
+    mov r4, #128               /* r4 = word_count remaining (always one
+                               * 512-byte block at every real call site) */
+    ldr r6, =0x20202034        /* SDEDM */
 sdhost_drain_loop:
     cmp r4, #0
     beq sdhost_drain_done
@@ -390,6 +481,14 @@ sdhost_drain_fifo_error:
     msr cpsr_c, r12
     pop {r4, r5, r6, r7}
     mov r0, #1
+    mov r1, #0
+    bx lr
+sdhost_drain_cmd_exit:
+    /* 42nd SD round: command phase (timeout, r0=2, or FAIL_FLAG, r0=3)
+     * never reached the mask -- cpsr_c was never saved into r12 on this
+     * path, so it must NOT be restored here (would corrupt the caller's
+     * own CPSR with whatever garbage happened to be in r12 at entry). */
+    pop {r4, r5, r6, r7}
     mov r1, #0
     bx lr
 
@@ -642,12 +741,69 @@ sd_scr_diag_lbl_data:
  * post-transfer SDHSTS check catch it" contract exactly. r7 is a new
  * callee-saved scratch register for the burst word-counter, pushed/
  * popped alongside r4-r6 as before. */
+/* 42nd SD round (2026-09-27): folded CMD24 (WRITE_BLOCK) issuance
+ * directly into this function, immediately before the mask+fill -- the
+ * write-side counterpart of sdhost_drain_fifo_to_buffer_impl's own
+ * identical change; see that function's own header comment for the
+ * full "why" (real disassembly-level audit found an unmasked window
+ * between "command's own NEW_FLAG clears" and "this function's own
+ * cpsid actually executes", during which the controller's FSM already
+ * expects the first FIFO word -- a timer tick landing there could
+ * leave the controller waiting past its own internal timeout, 4x more
+ * likely to matter in 4-bit mode than 1-bit for the same clock). Same
+ * signature change (buf/cmd_and_flags/arg, word_count hardcoded to 128)
+ * and same new return codes (2=command timeout, 3=FAIL_FLAG) on top of
+ * the existing 0/1 from the unchanged fill logic below. */
 .global sdhost_fill_fifo_from_buffer_impl
 sdhost_fill_fifo_from_buffer_impl:
     push {r4, r5, r6, r7}
+    mov r4, r0                /* r4 = buf, preserved across the command
+                               * phase below */
+    mov r5, r1                /* r5 = cmd_and_flags */
+    mov r6, r2                /* r6 = arg (CMD24's own argument) */
+
+    /* Command-issue phase, UNMASKED -- see sdhost_drain_fifo_to_
+     * buffer_impl's own identical block for the full rationale. */
+    ldr r0, =0x20202020        /* SDHSTS */
+    ldr r1, [r0]
+    ands r2, r1, #0xF8         /* SDHSTS_ERROR_MASK */
+    strne r1, [r0]
+
+    ldr r0, =0x20202004        /* SDARG */
+    str r6, [r0]
+    ldr r0, =0x20202000        /* SDCMD */
+    orr r1, r5, #0x8000        /* cmd_and_flags | NEW_FLAG */
+    str r1, [r0]
+
+    ldr r2, =1000000
+sdhost_fill_cmd_poll:
+    ldr r1, [r0]
+    tst r1, #0x8000
+    beq sdhost_fill_cmd_poll_done
+    subs r2, r2, #1
+    bne sdhost_fill_cmd_poll
+    mov r0, #2                 /* command NEW_FLAG poll timed out */
+    b sdhost_fill_cmd_exit
+sdhost_fill_cmd_poll_done:
+    tst r1, #0x4000            /* FAIL_FLAG */
+    moveq r0, #0
+    movne r0, #3               /* command FAIL_FLAG set */
+    bne sdhost_fill_cmd_exit
+
+    /* Pre-PIO SDHSTS check -- see sdhost_drain_fifo_to_buffer_impl's
+     * own identical block for the full rationale. */
+    ldr r0, =0x20202020         /* SDHSTS */
+    ldr r1, [r0]
+    tst r1, #0xF8               /* SDHSTS_ERROR_MASK */
+    moveq r0, #0
+    movne r0, #4                /* pre-PIO SDHSTS already shows an error */
+    bne sdhost_fill_cmd_exit
+
+    /* SUCCESS: mask and start filling with zero gap. */
     mrs r12, cpsr
     cpsid if
-    mov r4, r2               /* r4 = word_count remaining */
+    mov r0, r4                 /* r0 = buf, restored for the fill loop */
+    mov r4, #128               /* r4 = word_count remaining */
     ldr r6, =0x20202034      /* SDEDM */
 sdhost_fill_loop:
     cmp r4, #0
@@ -793,6 +949,13 @@ sdhost_fill_fifo_error:
     msr cpsr_c, r12
     pop {r4, r5, r6, r7}
     mov r0, #1
+    mov r1, #0
+    bx lr
+sdhost_fill_cmd_exit:
+    /* 42nd SD round: command phase (timeout, r0=2, or FAIL_FLAG, r0=3)
+     * never reached the mask -- cpsr_c was never saved into r12 on this
+     * path, so it must NOT be restored here. */
+    pop {r4, r5, r6, r7}
     mov r1, #0
     bx lr
 

@@ -2711,10 +2711,25 @@ extern "C" fn sd_scr_dump_and_check_4bit(buf: mut ref i64) -> i64;
 // after an earlier bytes=20 undercounted it.
 #[stack_cost(bytes=28)]
 extern "C" fn sd_scr_drain_diag(buf: mut ref i64) -> i64;
+// 42nd SD round (2026-09-27): signature changed from (buf, word_count)
+// to (buf, cmd_and_flags, arg) -- this function now issues CMD17/CMD24
+// itself, immediately before masking and draining, closing a real
+// unmasked window between "command completes" and "interrupts actually
+// masked" that a disassembly-level audit found (see boot/sdcard_
+// state.S's own header comment on sdhost_drain_fifo_to_buffer_impl for
+// the full "why"). word_count is gone from the signature entirely --
+// every real call site always passed 128 (one block), so it's now
+// hardcoded inside the asm rather than threaded through as a parameter
+// no caller ever varied. No i64 parameters at all in the new signature
+// (buf is a pointer, cmd_and_flags/arg are both u32), deliberately
+// avoiding the AAPCS 64-bit register-pairing pitfall this project has
+// already hit twice this session (sd_state_set, netif_set_slot_len).
 #[stack_cost(bytes=12)]
-extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, word_count: i64) -> i64;
+extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, cmd_and_flags: u32, arg: u32) -> i64;
+// Write-side counterpart -- see sdhost_drain_fifo_to_buffer's own
+// comment immediately above for the full rationale.
 #[stack_cost(bytes=12)]
-extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, word_count: i64) -> i64;
+extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, cmd_and_flags: u32, arg: u32) -> i64;
 // TEMPORARY DIAGNOSTIC (2026-09-19) -- see boot/sdcard_state.S's own
 // header comment on sdhost_fill_fifo_from_buffer_diag. Write-path only.
 // bytes=28: real push is {r4,r5,r6,r7,r8,r9,lr} (7 regs), caught by
@@ -6533,7 +6548,6 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhblc: i64 = SDHBLC;
   let sdhsts: i64 = SDHSTS;
   let sdcmd_read: u32 = 0x40 as u32;
-  let sdcmd_new_flag: u32 = 0x8000 as u32;
   let fsm_readwait: u32 = 4 as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
@@ -6610,42 +6624,53 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // the hypotheses" standard.
   let sdhbct_readback: u32 = sd_mmio_read_u32(sdhbct);
   let sdhblc_readback: u32 = sd_mmio_read_u32(sdhblc);
-  let status: u32 = sdhost_cmd(sdcmd_read | (17 as u32), addr);
-  // BUG found 2026-09-19 (real-hardware SD wedge investigation, per the
-  // user's own structured follow-up prompt, item 8: "determine whether
-  // the card ever responds to CMD24/CMD17" -- FAIL_FLAG was already
-  // fixed for the init-sequence commands (CMD2/3/9/7/16, commit
-  // 366569b) but never extended to the actual data commands
-  // themselves. status here was ONLY ever checked for NEW_FLAG
-  // (0x8000) -- FAIL_FLAG (0x4000, "the card genuinely rejected this
-  // command") was never checked at all, meaning a real CMD17/CMD24
-  // failure could have been silently indistinguishable from "command
-  // accepted, data phase wedged" this whole investigation.
-  if sdhost_cmd_failed(status) == 1 {
-    let _ = sdhost_cmd_report_failure("CMD17 (READ_SINGLE_BLOCK)", status);
+  // 42nd SD round (2026-09-27): CMD17 issuance folded directly into
+  // sdhost_drain_fifo_to_buffer_impl itself, right before it masks and
+  // drains -- see that function's own header comment (boot/sdcard_
+  // state.S) for the full "why" (a disassembly-level audit found a
+  // real unmasked window here between "command done" and "interrupts
+  // actually masked", 4x tighter in 4-bit mode than 1-bit for the same
+  // clock). This replaces the old separate sdhost_cmd(CMD17)-then-
+  // sdhost_drain_fifo_to_buffer two-step -- there is no longer a gap
+  // between them to have a bug in. The old FAIL_FLAG check and the
+  // round-41 pre-PIO SDHSTS check ("check 7") both moved into the asm
+  // too, immediately after the command completes, before the mask.
+  let drain_status: i64 = sdhost_drain_fifo_to_buffer(buf, sdcmd_read | (17 as u32), addr);
+  // 42nd SD round: command-phase outcomes (2/3/4) short-circuit BEFORE
+  // ever calling sdhost_wait_transfer_complete -- none of these reached
+  // the masked drain loop at all (the asm bails before ever masking),
+  // so there's no FSM-settle work for that function to do, matching the
+  // pre-42nd-round code's own short-circuit shape exactly (it returned
+  // immediately on FAIL_FLAG, never reaching drain/wait_transfer_
+  // complete either).
+  if drain_status == 2 {
+    // Command's own NEW_FLAG poll timed out inside the asm -- matches
+    // the pre-42nd-round "(status & sdcmd_new_flag) != 0" check's own
+    // external return code exactly, so sdhost_read_block's own wrapper-
+    // level "NEW_FLAG stuck" label still applies unchanged.
+    return 1;
+  }
+  if drain_status == 3 {
+    // CMD17 FAIL_FLAG -- read SDCMD back for the same diagnostic report
+    // the old separate sdhost_cmd call's return value used to feed.
+    let cmd17_status: u32 = sd_mmio_read_u32(SDCMD);
+    let _ = sdhost_cmd_report_failure("CMD17 (READ_SINGLE_BLOCK)", cmd17_status);
     return 4;
   }
-  // 41st SD round follow-up (2026-09-27): production counterpart of
-  // real U-Boot's own bcm2835_transmit leading SDHSTS check (round 41's
-  // diagnostic C ports' own "check 7") -- see sdhost_write_block_once's
-  // own identical check for the full rationale (purely additive, can't
-  // change behavior on an already-working read).
-  let pre_pio_hsts_r: u32 = sd_mmio_read_u32(sdhsts);
-  if (pre_pio_hsts_r & (0xF8 as u32)) != (0 as u32) {
+  if drain_status == 4 {
+    // Pre-PIO SDHSTS check (round 41's "check 7"), now performed inside
+    // the asm immediately before masking rather than as a separate
+    // post-return vani-level check.
     let _ = uart_puts("SD DIAG: read pre-PIO SDHSTS already shows error=0x");
-    let _ = uart_put_hex32(pre_pio_hsts_r);
+    let _ = uart_put_hex32(sd_mmio_read_u32(sdhsts));
     let _ = uart_puts("\n");
     return 6;
   }
-  let drain_status: i64 = sdhost_drain_fifo_to_buffer(buf, 128);
   let edm_after_pio: u32 = sd_mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
   let errs: u32 = sd_mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = sd_mmio_write_u32(sdhsts, errs);
-  if (status & sdcmd_new_flag) != (0 as u32) {
-    return 1;
-  }
-  if drain_status != 0 {
+  if drain_status == 1 {
     // 41st SD round (2026-09-27): sdhost_drain_fifo_to_buffer_impl now
     // has a production-path counterpart to round 41's read-side C
     // port's own check 5 (real U-Boot's bcm2835_transfer_block_pio FSM
@@ -6766,7 +6791,6 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhblc: i64 = SDHBLC;
   let sdhsts: i64 = SDHSTS;
   let sdcmd_write: u32 = 0x80 as u32;
-  let sdcmd_new_flag: u32 = 0x8000 as u32;
   let fsm_writestart1: u32 = 0xA as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
@@ -6905,40 +6929,20 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     }
     let _ = sdhost_diag_dump_regs_pre_cmd24();
   }
-  let status: u32 = sdhost_cmd(sdcmd_write | (24 as u32), addr);
-  // BUG found 2026-09-19: see sdhost_read_block_once's own matching
-  // comment above -- identical gap, write-side half. If the card is
-  // silently rejecting CMD24 itself (FAIL_FLAG), this is the ONE place
-  // that can ever see it, before this function's own pre-clear-on-
-  // next-command logic erases it.
-  if sdhost_cmd_failed(status) == 1 {
-    let _ = sdhost_cmd_report_failure("CMD24 (WRITE_BLOCK)", status);
-    return 4;
-  }
-  // 41st SD round follow-up (2026-09-27): production counterpart of
-  // real U-Boot's own bcm2835_transmit leading SDHSTS check (round 41's
-  // diagnostic C ports' own "check 7") -- catches an error already
-  // latched in SDHSTS the instant the command phase completes, before
-  // the PIO fill loop below ever runs a single iteration. Purely
-  // additive: a transfer that would otherwise succeed always has
-  // SDHSTS=0 here already, so this can never change behavior on a
-  // working write -- it only turns an error that would eventually be
-  // caught anyway (via `errs` below, after the whole PIO loop and
-  // wait_transfer_complete run first) into an immediate, precisely
-  // timestamped one.
-  let pre_pio_hsts_w: u32 = sd_mmio_read_u32(sdhsts);
-  if (pre_pio_hsts_w & (0xF8 as u32)) != (0 as u32) {
-    let _ = uart_puts("SD DIAG: write pre-PIO SDHSTS already shows error=0x");
-    let _ = uart_put_hex32(pre_pio_hsts_w);
-    let _ = uart_puts("\n");
-    return 6;
-  }
+  // 42nd SD round (2026-09-27): CMD24 issuance folded directly into
+  // sdhost_fill_fifo_from_buffer_impl itself, right before it masks and
+  // fills -- see that function's own header comment (boot/sdcard_
+  // state.S) and sdhost_read_block_once's own matching comment for the
+  // full "why". This replaces the old separate sdhost_cmd(CMD24)-then-
+  // sdhost_fill_fifo_from_buffer two-step. The old FAIL_FLAG check and
+  // the round-41 pre-PIO SDHSTS check ("check 7") both moved into the
+  // asm too, immediately after the command completes, before the mask.
   // ROUND 2026-09-20 (19th SD round): register state immediately after
-  // CMD24's own command phase completes (R1 response received, NEW_
-  // FLAG cleared inside sdhost_cmd), before this function has touched
-  // SDDATA at all -- the direct counterpart to the pre-CMD24 dump
-  // above, isolating whatever CMD24's own command phase itself changes
-  // from whatever the FIFO fill loop changes afterward.
+  // CMD24's own command phase completes -- see this project's own
+  // history for the full "why". use_write_diag is always false by this
+  // point in the function (the diagnostic sweep already returned via
+  // uboot_style_sdhost_write_block above), so this call is dead code,
+  // unaffected by the signature change above it.
   if use_write_diag {
     let _ = sdhost_diag_dump_regs_post_cmd24();
   }
@@ -6976,7 +6980,26 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // (dhruva_mutex_lock/_unlock, dhruva_prio_lock/_unlock, task_sleep_
   // ticks are the existing 5), not a direct asm call -- scoped out of
   // this round, see docs/TODO.md for the writeup and open question.
-  let fill_status: i64 = if use_write_diag { sdhost_fill_fifo_from_buffer_diag(buf, 128) } else { sdhost_fill_fifo_from_buffer(buf, 128) };
+  let fill_status: i64 = if use_write_diag { sdhost_fill_fifo_from_buffer_diag(buf, 128) } else { sdhost_fill_fifo_from_buffer(buf, sdcmd_write | (24 as u32), addr) };
+  // 42nd SD round: command-phase outcomes (2/3/4) short-circuit BEFORE
+  // ever running the FIFO-drain-to-empty poll, wait_transfer_complete,
+  // or errs -- none of these reached the masked fill loop at all (the
+  // asm bails before ever masking), matching sdhost_read_block_once's
+  // own identical short-circuit shape.
+  if fill_status == 2 {
+    return 1;
+  }
+  if fill_status == 3 {
+    let cmd24_status: u32 = sd_mmio_read_u32(SDCMD);
+    let _ = sdhost_cmd_report_failure("CMD24 (WRITE_BLOCK)", cmd24_status);
+    return 4;
+  }
+  if fill_status == 4 {
+    let _ = uart_puts("SD DIAG: write pre-PIO SDHSTS already shows error=0x");
+    let _ = uart_put_hex32(sd_mmio_read_u32(sdhsts));
+    let _ = uart_puts("\n");
+    return 6;
+  }
 
   // ROUND 2026-09-20 (task #278, real-HW SD write-wedge investigation,
   // 17th round): FreeBSD's own independent bcm2835_sdhost driver
@@ -7025,10 +7048,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_writestart1);
   let errs: u32 = sd_mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = sd_mmio_write_u32(sdhsts, errs);
-  if (status & sdcmd_new_flag) != (0 as u32) {
-    return 1;
-  }
-  if fill_status != 0 {
+  if fill_status == 1 {
     // 41st SD round follow-up (2026-09-27): write-side counterpart of
     // sdhost_read_block_once's own identical check -- see that
     // function's own comment for the full rationale. Distinct return

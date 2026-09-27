@@ -11297,3 +11297,46 @@ since visibility here is the actual missing piece, not a logic bug to port.
 Build clean (asm audit 0/0), QEMU PASS, no regressions. Next real-HW retest should show exactly what state
 the controller is in at the moment of the next command-level wedge, which is needed before any further fix
 can be attempted (matching this investigation's own repeated "don't fix blind" discipline).
+
+### 42nd SD round, main fix (2026-09-27): close the unmasked command-to-PIO gap
+
+Per explicit user direction ("fix right way first then test"), implemented the fix for the hypothesis
+developed via disassembly-level audit (see the previous TODO.md entry): folded CMD17/CMD24 issuance directly
+into `sdhost_drain_fifo_to_buffer_impl`/`sdhost_fill_fifo_from_buffer_impl` themselves, immediately before
+they mask and drain/fill, closing the unmasked window between "command completes" and "interrupts actually
+masked" where a preempting interrupt could let the FIFO silently overflow before the masked loop ever ran --
+a gap 4x tighter in 4-bit mode than 1-bit for the same clock, never present in bare-metal single-threaded
+U-Boot at all.
+
+**Design**: the command-issue-and-poll phase stays deliberately UNMASKED (same 1,000,000-iteration cap
+sdhost_cmd already used) -- masking that too would blow this project's own measured WCET/schedulability
+budgets (task #285) for no benefit, since the card hasn't started sending/expecting data yet during the
+command-response phase. Only the handoff needed to become gapless: `cpsid` is now the literal next
+instruction (after two register checks) once the command's own FAIL_FLAG and a folded-in pre-PIO SDHSTS
+check both pass -- no function-call boundary, no SWI-dispatch overhead, in between. Also folded round 41's
+"check 7" (pre-PIO SDHSTS check) into this same tight sequence, superseding the separate vani-level check
+added last round.
+
+**Signature change**: `sdhost_drain_fifo_to_buffer`/`sdhost_fill_fifo_from_buffer` now take
+`(buf, cmd_and_flags, arg)` instead of `(buf, word_count)` -- word_count was always 128 (one block) at every
+real call site, so it's hardcoded in the asm now. Deliberately avoided any i64 parameter in the new signature
+(all three params are single-register-width: a pointer and two u32s) to sidestep the AAPCS 64-bit
+register-pairing pitfall this project has already hit twice this session. New return codes: 2 (command
+NEW_FLAG poll timed out), 3 (command FAIL_FLAG set), 4 (pre-PIO SDHSTS error), alongside the existing 0/1 from
+the unchanged drain/fill logic. `sdhost_read_block_once`/`sdhost_write_block_once` remap these back to the
+same external return codes (1/4/6) callers already handle, so `sdhost_read_block`/`write_block`'s own
+wrapper-level retry logic is completely unchanged.
+
+**Verification** (per this project's own "no trust, validate everything" discipline, and given the real
+complexity/risk of hand-written asm register reallocation): disassembled the actual compiled output, not just
+reviewed source. Confirmed: (1) the SWI trampoline and dispatch table pass r0-r2 through untouched, so the new
+3-argument signature reaches `_impl` exactly as intended; (2) the call sites in `fn_sdhost_read_block_once`/
+`fn_sdhost_write_block_once` generate correct AAPCS argument setup (r0=buf, r1=cmd_and_flags, r2=arg) with no
+register-pairing bug; (3) the compiled `_impl` bodies match the intended design exactly -- `cpsid` is
+genuinely the next instruction after the pre-PIO SDHSTS check passes, zero gap; (4) the exit path that never
+masks (`sdhost_drain_cmd_exit`/`sdhost_fill_cmd_exit`) correctly skips restoring CPSR from stale `ip`, since it
+was never saved on that path. Build clean (asm audit 0/0), QEMU PASS, and confirmed via QEMU's own (non-
+functional but logically exercised) SD failure path that the full FAIL_FLAG -> return-code-3 -> external-
+code-4 -> "FAIL_FLAG set" wrapper-label chain still works end-to-end identically to before this change.
+
+Awaiting the first real-HW retest of this specific fix.
