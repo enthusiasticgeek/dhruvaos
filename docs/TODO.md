@@ -11370,3 +11370,28 @@ captured log including this one -- a clean, reproducible, control-flow-driven sp
 
 Fixed: added the missing bit (`0x418`->`0x41A`, `0x41C`->`0x41E`), matching the write side exactly. Build
 clean (asm audit 0/0), QEMU PASS. Awaiting the next real-HW retest.
+
+### 42nd SD round real-HW retest CONFIRMED: SDHCFG fix eliminates the wedge storm
+
+`picocom_20260927_170809.log`, commit `b107bec` (missing `SDHCFG_WIDE_INT_BUS` bit added to the read path).
+
+**Major result**: zero "wedge detected" messages anywhere in the log (down from 14 NEW_FLAG-stuck + 7
+FAIL_FLAG-set in the immediately-prior log). `sdhost_init` runs exactly ONCE for the entire boot and never
+needs to reinitialize again. The catastrophic command-level wedge storm that has plagued every 4-bit-mode
+real-HW boot since round 40 is gone. Boot now progresses all the way through DharaFS's own self-tests, the
+full network-stack self-test suite (NETIF/FW/ARP/IPv4/ICMP/UDP/TCP/DHCP/DHCPS), and well into the crypto
+self-test suite (47 PASS, capture stopped there mid-CRYPTO, not a crash -- everything up to that point is
+clean). This is by far the furthest any 4-bit-mode real-HW boot has gotten in this entire investigation.
+
+**Confirms the SDHCFG_WIDE_INT_BUS hypothesis was the real cause** of the command-level wedge storm
+specifically -- the wedge counts didn't just drop, they went to zero.
+
+**Remaining, now-lower-severity item**: "read errs=0x00000008" (post-transfer FIFO_ERROR, caught by the
+original, pre-existing check) still fires ~184 times across the boot. Critically, it no longer cascades --
+`sdhost_read_block` returns 3 immediately without retrying or forcing a reinit, and DharaFS's own higher-level
+code tolerates the failed read and proceeds (e.g. "post-recovery /config/mode = (not found)"). 6 DharaFS-level
+FAILs appear, matching exactly the pre-existing, already-tracked set (task #218: "Confirm DharaFS/crypto
+downstream FAILs clear once SD wedge is fixed") -- no new failures introduced. Worth investigating next
+whether these persistent FIFO_ERROR reads are the direct cause of some of those 6 FAILs (e.g. "multi-block
+file round trip... FAIL" is exactly the kind of symptom a corrupted mid-transfer read would produce), which
+would make task #218 and this remaining FIFO_ERROR the same underlying issue.
