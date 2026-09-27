@@ -11340,3 +11340,33 @@ functional but logically exercised) SD failure path that the full FAIL_FLAG -> r
 code-4 -> "FAIL_FLAG set" wrapper-label chain still works end-to-end identically to before this change.
 
 Awaiting the first real-HW retest of this specific fix.
+
+### 42nd SD round real-HW retest: masked-gap fix showed NO improvement -- found and fixed a real SDHCFG asymmetry instead
+
+`picocom_20260927_164821.log`, commit `47015b7` (the unmasked-command-to-PIO-gap fix). Verified against the
+previous log (`picocom_20260927_154810.log`, before that fix): wedge counts are statistically IDENTICAL --
+22 vs 20 "read errs=0x00000008" occurrences, 14 vs 13 "NEW_FLAG stuck", 7 vs 7 "FAIL_FLAG set". The 8-block
+sweep still passes (`any_fail=00000000`), and none of the round-41/42 mid-burst or pre-PIO diagnostic checks
+ever fired for these failures -- confirming the masked-gap fix is real, correct, and completely inert here
+(as intended when it doesn't apply), but it does NOT explain this symptom. Honest negative result, recorded
+per this project's own "reference match is not causal proof" discipline -- a real, verified fix isn't
+automatically the fix for the specific bug being chased.
+
+**Re-analyzing the SAME log's control-flow ordering found a real, concrete bug instead**: `sdhost_read_
+block_once`'s `use_read_diag` early-return happens BEFORE `read_sdhcfg` is ever computed/written -- so the
+8-block sweep's own diagnostic read NEVER executes that SDHCFG write at all, and instead inherits whatever
+SDHCFG the sweep's own immediately-prior diagnostic WRITE left in place. `sdhost_write_block_once`, by
+contrast, sets `write_sdhcfg` BEFORE its own diag early-return, so the diag write itself uses `write_sdhcfg`.
+`write_sdhcfg` has included `SDHCFG_WIDE_INT_BUS` (bit1, 0x02) since round 30, per this project's own already-
+documented finding that real U-Boot's `bcm2835_set_ios` sets it UNCONDITIONALLY, "regardless of external bus
+width" -- but that finding was only ever ported to the write side. `read_sdhcfg` (0x418/0x41C) has NEVER
+included it.
+
+Net effect: the sweep's diagnostic read runs with SDHCFG=0x40E (inherited from the write, WITH bit 0x02) and
+succeeds every single time this project has ever captured. Ordinary production reads run with SDHCFG=0x41C/
+0x418 (explicitly set right there, WITHOUT bit 0x02) and fail with FIFO_ERROR near-100% of the time in every
+captured log including this one -- a clean, reproducible, control-flow-driven split, not a timing coincidence
+(consistent with this symptom never having looked like an intermittent race in the first place).
+
+Fixed: added the missing bit (`0x418`->`0x41A`, `0x41C`->`0x41E`), matching the write side exactly. Build
+clean (asm audit 0/0), QEMU PASS. Awaiting the next real-HW retest.

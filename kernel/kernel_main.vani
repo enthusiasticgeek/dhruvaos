@@ -6600,7 +6600,31 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // see sdhost_init_at_speed's own ACMD6 comment for the full "why".
   // Read path already worked at 1-bit (task #217) -- this only
   // changes anything once is_4bit is actually 1.
-  let read_sdhcfg: u32 = if sd_state_get_is_4bit() == 1 { 0x41C as u32 } else { 0x418 as u32 };
+  // 42nd SD round follow-up (2026-09-27): real-HW retest of the masked-
+  // gap fix showed NO improvement (wedge counts statistically identical
+  // before/after: 22 vs 20 "read errs=0x08" occurrences, same NEW_FLAG-
+  // stuck/FAIL_FLAG-set counts) -- that fix was real and correctly
+  // closes the window it targeted, but it wasn't (the whole of) this
+  // symptom's cause. Comparing the SAME fresh log's own control-flow
+  // ordering found a real, concrete asymmetry instead: use_read_diag's
+  // own early return (above) happens BEFORE this read_sdhcfg is ever
+  // computed/written, so the 8-block sweep's diagnostic read never
+  // executes this line at all -- it inherits whatever SDHCFG the
+  // sweep's own immediately-prior diagnostic WRITE left behind
+  // (write_sdhcfg, sdhost_write_block_once, which -- unlike here --
+  // IS set before ITS OWN diag early-return). write_sdhcfg has always
+  // included SDHCFG_WIDE_INT_BUS (0x02) per this project's own round-30
+  // finding (real U-Boot's bcm2835_set_ios sets it UNCONDITIONALLY,
+  // "regardless of external bus width") -- but that finding was only
+  // ever applied to the write side. This read_sdhcfg constant has
+  // NEVER included it. The 8-block sweep's read (0x40E, inherited,
+  // WITH bit 0x02) succeeds every single time this project has ever
+  // captured; ordinary production reads (0x41C/0x418, explicitly set
+  // right here, WITHOUT bit 0x02) fail near-100% of the time in every
+  // captured log, including this one -- a clean, reproducible split
+  // this project's own control-flow, not a timing coincidence. Adding
+  // the missing bit (0x418->0x41A, 0x41C->0x41E) to close the gap.
+  let read_sdhcfg: u32 = if sd_state_get_is_4bit() == 1 { 0x41E as u32 } else { 0x41A as u32 };
   let _ = sd_mmio_write_u32(SDHCFG, read_sdhcfg);
   let _ = sd_mmio_write_u32(sdhbct, 512 as u32);
   let _ = sd_mmio_write_u32(sdhblc, 1 as u32);
