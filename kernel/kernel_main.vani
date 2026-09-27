@@ -2085,6 +2085,30 @@ extern "C" fn scheduler_ready_count() -> i64;
 // only test environment (QEMU) can't reveal.
 #[stack_cost(bytes=1)]
 extern "C" fn mem_barrier() -> i64;
+// 2026-09-27, per the user's own direct instruction ("dma be used to
+// save cpu cycles"): DMA-driven UART TX -- see boot/dma_uart_state.S's
+// own header comment for the full register-level justification
+// (official BCM2835 datasheet, cross-checked against real Linux's own
+// drivers/dma/bcm2835-dma.c). buf must stay valid/unmodified from
+// dma_uart_tx_start until dma_uart_tx_busy reports 0.
+// Stack costs below are the real `push {...}` byte count for each
+// function's own frame (4 bytes/register), not copied from an
+// unrelated trivial extern fn -- an earlier draft of this same file
+// wrongly declared all four as bytes=1, which would have silently
+// underestimated this project's own static worst-case stack-depth
+// analysis for any caller chain reaching these functions. Caught
+// during a real-vs-declared audit, not by the tool itself.
+#[stack_cost(bytes=8)]
+extern "C" fn dma_uart_init() -> i64;
+#[stack_cost(bytes=12)]
+extern "C" fn dma_uart_tx_start(buf: mut ref i64, byte_count: u32) -> u32;
+#[stack_cost(bytes=8)]
+extern "C" fn dma_uart_tx_busy() -> u32;
+// Diagnostic-only, added to isolate a real driver bug from a QEMU
+// DMA-to-peripheral modeling gap -- see boot/dma_uart_state.S's own
+// header comment on dma_ram_copy_test for the full "why".
+#[stack_cost(bytes=16)]
+extern "C" fn dma_ram_copy_test(src: mut ref i64, dst: mut ref i64, byte_count: u32) -> u32;
 // Round 22 audit -- context_switch.S's own comment on
 // scheduler_get_tick_count has the full story: DHCP's new lease-
 // renewal timer needs a read-only view of elapsed scheduler time.
@@ -23674,6 +23698,82 @@ fn governor_step() -> i64 {
 // runs the fixed result") through both v1 (instantaneous) and v2
 // (smoothed) governors, counting DVFS transitions and total MHz-time
 // for each, live, under QEMU, at boot.
+// 2026-09-27, per the user's own direct instruction ("dma be used to
+// save cpu cycles ... use arm reference if needed apart from bcm for
+// mmu/cache or dma"): first real-HW proof-of-concept for DMA-driven
+// UART TX (boot/dma_uart_state.S has the full register-level
+// justification). Sends a short, fixed message via DMA channel 5,
+// polls for completion (bounded, matching this project's own
+// established loop-cap convention), then prints a normal blocking
+// confirmation -- if "DMA UART TX OK" appears in the real-HW/QEMU log
+// BEFORE this confirmation line, the DMA transfer genuinely reached
+// the UART hardware, in order, with correct content. Deliberately
+// diagnostic-only at this stage (not yet replacing the production
+// uart_puts path) -- a new, previously-completely-unused peripheral
+// on this project's own real hardware, proven correct on its own
+// before anything depends on it, matching how every other new
+// peripheral this project has added was introduced.
+// Diagnostic-only, run BEFORE dma_uart_tx_self_test -- see boot/
+// dma_uart_state.S's own header comment on dma_ram_copy_test for why:
+// a plain RAM-to-RAM copy through the exact same CB/CS mechanics as
+// the UART TX path, but without any peripheral/DREQ involvement, to
+// prove this driver's own register setup is correct independent of
+// whether QEMU's own DMA model can reach MMIO peripherals at all.
+fn dma_ram_copy_self_test() -> i64 {
+  let copy_len: i64 = 16;
+  let src_buf: mut ref i64 = dhruva_alloc_bytes(copy_len);
+  let dst_buf: mut ref i64 = dhruva_alloc_bytes(copy_len);
+  let _ = test_fill_pattern(src_buf, copy_len);
+  let _ = test_fill_pattern(dst_buf, copy_len); // pre-fill differently
+  let _ = buf_write_byte(dst_buf, 0 as u32, 0xFF as u32); // ensure it differs from src before the copy
+  let _ = dma_ram_copy_test(src_buf, dst_buf, copy_len as u32);
+  let busy_iter: i64 = 0;
+  while (dma_uart_tx_busy() == (1 as u32)) && (busy_iter < 1000000) {
+    busy_iter = busy_iter + 1;
+  }
+  let mismatch: i64 = test_compare_buffers(src_buf, dst_buf, copy_len);
+  let _ = uart_puts("DMA RAM-COPY DIAG: busy-poll iterations=");
+  let _ = uart_put_i64(busy_iter);
+  let _ = uart_puts(" mismatch_at=");
+  let _ = uart_put_i64(mismatch);
+  let _ = uart_puts(if mismatch == 0 { " (PASS -- DMA channel 5's own CB/CS mechanics are genuinely correct)\n" } else { " (FAIL -- real driver bug, independent of any peripheral/QEMU question)\n" });
+  return 0;
+}
+
+fn dma_uart_tx_self_test() -> i64 {
+  let _ = dma_uart_init();
+  let msg_len: i64 = 16;
+  let msg_buf: mut ref i64 = dhruva_alloc_bytes(msg_len);
+  let _ = buf_write_byte(msg_buf, 0 as u32, 68 as u32);  // D
+  let _ = buf_write_byte(msg_buf, 1 as u32, 77 as u32);  // M
+  let _ = buf_write_byte(msg_buf, 2 as u32, 65 as u32);  // A
+  let _ = buf_write_byte(msg_buf, 3 as u32, 32 as u32);  // ' '
+  let _ = buf_write_byte(msg_buf, 4 as u32, 85 as u32);  // U
+  let _ = buf_write_byte(msg_buf, 5 as u32, 65 as u32);  // A
+  let _ = buf_write_byte(msg_buf, 6 as u32, 82 as u32);  // R
+  let _ = buf_write_byte(msg_buf, 7 as u32, 84 as u32);  // T
+  let _ = buf_write_byte(msg_buf, 8 as u32, 32 as u32);  // ' '
+  let _ = buf_write_byte(msg_buf, 9 as u32, 84 as u32);  // T
+  let _ = buf_write_byte(msg_buf, 10 as u32, 88 as u32); // X
+  let _ = buf_write_byte(msg_buf, 11 as u32, 32 as u32); // ' '
+  let _ = buf_write_byte(msg_buf, 12 as u32, 79 as u32); // O
+  let _ = buf_write_byte(msg_buf, 13 as u32, 75 as u32); // K
+  let _ = buf_write_byte(msg_buf, 14 as u32, 13 as u32); // \r
+  let _ = buf_write_byte(msg_buf, 15 as u32, 10 as u32); // \n
+
+  let start_status: u32 = dma_uart_tx_start(msg_buf, msg_len as u32);
+  let busy_iter: i64 = 0;
+  while (dma_uart_tx_busy() == (1 as u32)) && (busy_iter < 1000000) {
+    busy_iter = busy_iter + 1;
+  }
+  let _ = uart_puts("DMA UART DIAG: tx_start status=");
+  let _ = uart_put_i64(start_status as i64);
+  let _ = uart_puts(" busy-poll iterations=");
+  let _ = uart_put_i64(busy_iter);
+  let _ = uart_puts(" (real DMA success == \"DMA UART TX OK\" appears ABOVE this line, in order)\n");
+  return 0;
+}
+
 fn governor_replay_test() -> i64 {
   let workload: mut ref i64 = dhruva_alloc_bytes(30);
   let _ = buf_write_byte(workload, 0 as u32, 0 as u32);
@@ -38735,6 +38835,8 @@ fn kernel_main() -> i64 {
   let _ = governor_self_test(5, 700);
   let _ = governor_replay_test();
   let _ = uart_clock_governor_cross_check_self_test();
+  let _ = dma_ram_copy_self_test();
+  let _ = dma_uart_tx_self_test();
 
   // Round 60: packet filtering's own default policy -- .bss's own
   // zero-init would otherwise leave fw_default_policy at 0 (deny),
