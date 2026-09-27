@@ -11226,3 +11226,39 @@ read-path fix:
 Build clean (asm audit 0/0), QEMU PASS (SD self-test still shows QEMU's own long-standing non-functional SD
 emulation "giving up after 3 attempts" -- pre-existing, unrelated to these changes, confirmed by diffing
 against the pre-change QEMU output). No regressions.
+
+### 41st SD round: real-HW retest CONFIRMS the fix -- 8-block sweep any_fail=0 for the first time ever
+
+`picocom_20260927_154810.log`, same card, built from commit `0c11e0c` (round 41's full set: read-side C
+port + 3 new checks, production FSM-during-poll fix on both read and write, pre-PIO SDHSTS check on both).
+
+**The specific bug this round targeted is CONFIRMED FIXED**: `SD: 8-block round-trip sweep any_fail=00000000`
+-- every block, both read and write, succeeds cleanly. This is the first time in this entire 37-41 round SD
+investigation that the 8-block sweep has passed completely. None of the new diagnostic checks (5/6/7) fired
+during the sweep -- it passed cleanly, not "caught an error and recovered."
+
+**A separate, deeper problem is now visible for the first time**: past the sweep, real DharaFS boot traffic
+(config reads, log compaction -- ordinary blocks, not 2100-2107) hits frequent SD wedges: 14x "NEW_FLAG
+stuck" (command phase never completes) and 7x "FAIL_FLAG set" (command explicitly rejected), each triggering
+a full ~193ms re-init. None of round 41's new checks fired for these either -- confirming they're correctly
+inert where they don't apply, but also that this is a genuinely different failure class (a command-issuance-
+level hang/rejection, not a mid-PIO-burst FIFO condition).
+
+**Comparison against `picocom_20260927_142746.log` (39th round era, 1-bit mode, before the ACMD6/4-bit fix)**:
+that boot had only 2 total wedge events across its entire capture and ran all the way through the full
+self-test suite (network/crypto tests all printed) -- DharaFS's own self-tests did show separate, already-
+tracked FAILs (task #218), unrelated to SD wedging. The new 4-bit-mode log has 21+ wedge events and its
+capture cuts off mid-DharaFS-compaction, far short of reaching the network/crypto self-test section in a
+similar amount of log. This strongly suggests 4-bit mode itself -- while fixing both the CRC16 write bug
+(round 40) and the targeted FIFO_ERROR PIO-burst bug (round 41) -- has introduced a new real-HW reliability
+regression for ordinary traffic, most likely a genuine signal-integrity/timing-margin issue at the faster
+transfer rate on this specific card/wiring, not a logic bug this project's register-level comparison approach
+would catch. One observed sequence (line 225-227): a real block hits FIFO_ERROR (caught by the pre-existing
+post-transfer check, not the new mid-burst check -- so the error only manifests as a post-transfer flag here,
+not a live mid-burst FSM excursion), and the VERY NEXT read attempt immediately hits NEW_FLAG stuck --
+consistent with a failed transfer leaving the controller in a degraded state that the following command then
+inherits, cascading into the observed wedge storm.
+
+Presented to the user for direction: continue chasing 4-bit-mode's new reliability problem (42nd round), or
+step back and weigh whether 1-bit mode's own already-known, already-tracked issues (task #218) are the
+better tradeoff for now. Not unilaterally decided.
