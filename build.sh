@@ -69,6 +69,22 @@ mkdir -p "${BUILD_DIR}"
 "${VANIC}" stack-depth "${ROOT}/kernel/kernel_main.vani" \
   --entry=kernel_main --max=14336
 
+# ASM safety audit gate, added after a from-scratch full-codebase audit
+# (test/asm_safety_audit.py) found 2 real #[stack_cost] underestimates
+# that the stack-depth gate above can't see on its own -- that gate
+# trusts whatever number an extern fn declares; this one cross-checks
+# the declared number against the real push{...} in the .S file that
+# actually defines it. Also statically scans every boot/*.S file for
+# (a) reads of a register still clobbered by a call to a known
+# register-clobbering helper (e.g. mem_barrier's documented r0/r1
+# zeroing) and (b) push/pop stack imbalance. Exits 1 on any DEFINITE
+# finding, which -- combined with `set -euo pipefail` above -- halts
+# the build; REVIEW findings are printed but non-fatal. Run it by hand
+# any time an .S file changes without a full build (`python3
+# test/asm_safety_audit.py --boot-dir boot --vani kernel/kernel_main.vani`).
+python3 "${ROOT}/test/asm_safety_audit.py" \
+  --boot-dir "${ROOT}/boot" --vani "${ROOT}/kernel/kernel_main.vani"
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/rpi1/boot.S" -o "${BUILD_DIR}/boot.o"
 

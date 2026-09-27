@@ -2706,8 +2706,10 @@ extern "C" fn sd_state_get_is_4bit() -> i64;
 #[stack_cost(bytes=16)]
 extern "C" fn sd_scr_dump_and_check_4bit(buf: mut ref i64) -> i64;
 // 30th SD round follow-up -- see boot/sdcard_state.S's own header
-// comment on sd_scr_drain_diag.
-#[stack_cost(bytes=20)]
+// comment on sd_scr_drain_diag. bytes=28: real push is
+// {r4,r5,r6,r7,r8,r9,lr} (7 regs), caught by test/asm_safety_audit.py
+// after an earlier bytes=20 undercounted it.
+#[stack_cost(bytes=28)]
 extern "C" fn sd_scr_drain_diag(buf: mut ref i64) -> i64;
 #[stack_cost(bytes=12)]
 extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, word_count: i64) -> i64;
@@ -2715,7 +2717,9 @@ extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, word_count: i64) -> 
 extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, word_count: i64) -> i64;
 // TEMPORARY DIAGNOSTIC (2026-09-19) -- see boot/sdcard_state.S's own
 // header comment on sdhost_fill_fifo_from_buffer_diag. Write-path only.
-#[stack_cost(bytes=24)]
+// bytes=28: real push is {r4,r5,r6,r7,r8,r9,lr} (7 regs), caught by
+// test/asm_safety_audit.py after an earlier bytes=24 undercounted it.
+#[stack_cost(bytes=28)]
 extern "C" fn sdhost_fill_fifo_from_buffer_diag(buf: mut ref i64, word_count: i64) -> i64;
 // TEMPORARY DIAGNOSTIC (19th SD round, 2026-09-20) -- see boot/
 // sdcard_state.S's own header comment on these two entry points.
