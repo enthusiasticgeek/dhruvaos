@@ -671,9 +671,16 @@ sdhost_fill_poll:
                                * read, matching U-Boot's readl() -- see
                                * sdhost_drain_fifo_to_buffer_impl's own
                                * matching comment above for the full
-                               * rationale. r1 is unused anywhere in
-                               * this function, safe as the DMB's SBZ
-                               * operand. */
+                               * rationale. */
+    mov r1, r2                 /* 41st SD round follow-up (2026-09-27):
+                               * save the RAW edm value (before it's
+                               * turned into a room count below) for the
+                               * new FSM check just below -- r1 is free
+                               * for this the whole way to sdhost_fill_
+                               * burst, where it's overwritten by the DMB
+                               * SBZ operand again (never a real data
+                               * value in this function; r3 carries the
+                               * actual word to write). */
     mov r2, r2, lsr #4
     and r2, r2, #0x1F        /* r2 = current FIFO fill count */
     rsb r2, r2, #16          /* r2 = room = SDDATA_FIFO_WORDS(16) - fill,
@@ -699,6 +706,40 @@ sdhost_fill_poll:
     movgt r7, r4              /* r7 = burst_words = min(8, remaining) */
     cmp r2, r7
     bge sdhost_fill_have_room
+    /* 41st SD round follow-up (2026-09-27): write-side counterpart of
+     * the FSM-during-poll check just added to sdhost_drain_fifo_to_
+     * buffer_impl (real U-Boot's own bcm2835_transfer_block_pio has
+     * ONE shared check covering both directions -- see that function's
+     * own header comment for the full "why" and the real-HW-log
+     * evidence). Requested explicitly so the write path carries the
+     * same protection before the next real-HW round, rather than
+     * leaving an asymmetric gap now that both sides are otherwise
+     * identical. Purely defensive: in the success case the FSM never
+     * leaves a valid write state here, so this can never fire on a
+     * transfer that already works -- it only changes behavior on a
+     * genuine mid-burst error, from "silently force a stale write" to
+     * "bail out immediately with a distinguishable error". */
+    and r2, r1, #0xF          /* r2 = fsm state from the saved raw edm */
+    cmp r2, #3                  /* SDEDM_FSM_WRITEDATA */
+    cmpne r2, #6                 /* SDEDM_FSM_WRITECRC */
+    cmpne r2, #7                  /* SDEDM_FSM_WRITEWAIT1 */
+    cmpne r2, #0xA                 /* SDEDM_FSM_WRITESTART1 */
+    cmpne r2, #0xB                  /* SDEDM_FSM_WRITESTART2 */
+    cmpne r2, #0xD                   /* SDEDM_FSM_WRITEWAIT2 */
+    beq sdhost_fill_fsm_retry          /* still a valid write state --
+                               * keep polling via the existing retry-cap
+                               * logic below, exactly as before */
+    ldr r2, =0x20202020        /* SDHSTS */
+    ldr r2, [r2]
+    tst r2, #0xF8               /* SDHSTS_ERROR_MASK, matches real
+                               * U-Boot's own check exactly */
+    beq sdhost_fill_fsm_retry    /* FSM transient but no error latched
+                               * yet -- matches U-Boot's own bare
+                               * `continue` for this case */
+    b sdhost_fill_fifo_error       /* genuine error mid-burst -- bail
+                               * out now instead of forcing a stale
+                               * write after the retry cap exhausts */
+sdhost_fill_fsm_retry:
     subs r5, r5, #1
     bne sdhost_fill_poll
     mov r2, #1                /* retry cap exhausted -- force a 1-word
@@ -740,6 +781,18 @@ sdhost_fill_done:
     msr cpsr_c, r12
     pop {r4, r5, r6, r7}
     mov r0, #0
+    mov r1, #0
+    bx lr
+sdhost_fill_fifo_error:
+    /* 41st SD round follow-up (2026-09-27): distinguishable non-zero
+     * return, mirroring sdhost_drain_fifo_to_buffer_impl's own new
+     * error exit -- see that function's own comment for the full
+     * rationale. The buffer's remaining unwritten words are simply
+     * never sent; the caller already treats any non-zero SDHSTS error
+     * as a failed write regardless. */
+    msr cpsr_c, r12
+    pop {r4, r5, r6, r7}
+    mov r0, #1
     mov r1, #0
     bx lr
 

@@ -6596,6 +6596,18 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     let _ = sdhost_cmd_report_failure("CMD17 (READ_SINGLE_BLOCK)", status);
     return 4;
   }
+  // 41st SD round follow-up (2026-09-27): production counterpart of
+  // real U-Boot's own bcm2835_transmit leading SDHSTS check (round 41's
+  // diagnostic C ports' own "check 7") -- see sdhost_write_block_once's
+  // own identical check for the full rationale (purely additive, can't
+  // change behavior on an already-working read).
+  let pre_pio_hsts_r: u32 = sd_mmio_read_u32(sdhsts);
+  if (pre_pio_hsts_r & (0xF8 as u32)) != (0 as u32) {
+    let _ = uart_puts("SD DIAG: read pre-PIO SDHSTS already shows error=0x");
+    let _ = uart_put_hex32(pre_pio_hsts_r);
+    let _ = uart_puts("\n");
+    return 6;
+  }
   let drain_status: i64 = sdhost_drain_fifo_to_buffer(buf, 128);
   let edm_after_pio: u32 = sd_mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
@@ -6874,6 +6886,24 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     let _ = sdhost_cmd_report_failure("CMD24 (WRITE_BLOCK)", status);
     return 4;
   }
+  // 41st SD round follow-up (2026-09-27): production counterpart of
+  // real U-Boot's own bcm2835_transmit leading SDHSTS check (round 41's
+  // diagnostic C ports' own "check 7") -- catches an error already
+  // latched in SDHSTS the instant the command phase completes, before
+  // the PIO fill loop below ever runs a single iteration. Purely
+  // additive: a transfer that would otherwise succeed always has
+  // SDHSTS=0 here already, so this can never change behavior on a
+  // working write -- it only turns an error that would eventually be
+  // caught anyway (via `errs` below, after the whole PIO loop and
+  // wait_transfer_complete run first) into an immediate, precisely
+  // timestamped one.
+  let pre_pio_hsts_w: u32 = sd_mmio_read_u32(sdhsts);
+  if (pre_pio_hsts_w & (0xF8 as u32)) != (0 as u32) {
+    let _ = uart_puts("SD DIAG: write pre-PIO SDHSTS already shows error=0x");
+    let _ = uart_put_hex32(pre_pio_hsts_w);
+    let _ = uart_puts("\n");
+    return 6;
+  }
   // ROUND 2026-09-20 (19th SD round): register state immediately after
   // CMD24's own command phase completes (R1 response received, NEW_
   // FLAG cleared inside sdhost_cmd), before this function has touched
@@ -6917,7 +6947,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // (dhruva_mutex_lock/_unlock, dhruva_prio_lock/_unlock, task_sleep_
   // ticks are the existing 5), not a direct asm call -- scoped out of
   // this round, see docs/TODO.md for the writeup and open question.
-  let _ = if use_write_diag { sdhost_fill_fifo_from_buffer_diag(buf, 128) } else { sdhost_fill_fifo_from_buffer(buf, 128) };
+  let fill_status: i64 = if use_write_diag { sdhost_fill_fifo_from_buffer_diag(buf, 128) } else { sdhost_fill_fifo_from_buffer(buf, 128) };
 
   // ROUND 2026-09-20 (task #278, real-HW SD write-wedge investigation,
   // 17th round): FreeBSD's own independent bcm2835_sdhost driver
@@ -6968,6 +6998,17 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let _ = sd_mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
     return 1;
+  }
+  if fill_status != 0 {
+    // 41st SD round follow-up (2026-09-27): write-side counterpart of
+    // sdhost_read_block_once's own identical check -- see that
+    // function's own comment for the full rationale. Distinct return
+    // code (5) so this is never confused with the pre-existing
+    // wait_status(2)/errs(3) paths below.
+    let _ = uart_puts("SD DIAG: write fill bailed early (mid-burst FSM/SDHSTS error) SDEDM=0x");
+    let _ = uart_put_hex32(edm_after_pio);
+    let _ = uart_puts("\n");
+    return 5;
   }
   if wait_status != 0 {
     // Only printed on the actual failure path -- see sdhost_read_

@@ -11194,3 +11194,35 @@ Awaiting the same real-HW retest already requested for round 41's diagnostic por
 means the READ side of the upcoming retest now has two independent, complementary sources of evidence: the
 diagnostic sweep's own new checks 5/6/7, AND the production path's own new early-exit behavior (which now
 governs the actual DharaFS traffic, not just blocks 2100-2107).
+
+### 41st SD round, third pass (2026-09-27): closed remaining gaps to avoid a second real-HW round
+
+Per explicit user request ("fix gaps in dhruvaos that uboot have before I test on real hardware so i do not
+have to retest"), closed the remaining confirmed divergences found in this round's audit, beyond just the
+read-path fix:
+
+- **Write-side FSM-during-poll check**: ported the same fix already applied to `sdhost_drain_fifo_to_buffer_
+  impl` into `sdhost_fill_fifo_from_buffer_impl` (production write burst-poll), using the write-direction FSM
+  valid-state set (WRITEDATA/WRITECRC/WRITEWAIT1/WRITEWAIT2/WRITESTART1/WRITESTART2, matching real U-Boot's
+  own `bcm2835_transfer_block_pio` exactly). Previously deferred as "don't touch a working path without its
+  own confirmation" -- reconsidered given this specific check is provably inert on any transfer that already
+  succeeds (the FSM never leaves a valid write state during a healthy write, so the new check cannot fire
+  there) and only changes behavior on a genuine mid-burst error, where it improves diagnosis without changing
+  the ultimate pass/fail outcome. `sdhost_write_block_once` surfaces this as return code 5 (mirroring the
+  read side).
+- **Check 7 (pre-PIO SDHSTS check) added to both production paths**: `sdhost_read_block_once` and
+  `sdhost_write_block_once` now both check SDHSTS for latched errors immediately after their respective
+  command's FAIL_FLAG check, before the PIO loop starts -- matching real U-Boot's `bcm2835_transmit` leading
+  check exactly. New return code 6 on both sides. Same reasoning: inert on a transfer that already has
+  SDHSTS=0 at this point (every currently-working transfer), only ever fires on an error that would otherwise
+  be caught later anyway (via `errs`), just later and less precisely timestamped.
+- **Deliberately NOT changed**: `sdhost_cmd`'s existing FSM-idle check (round 34) remains diagnostic-only, not
+  a hard gate matching U-Boot's refusal. This is the single most central function in the driver (every
+  command in the codebase goes through it) -- confirmed via the 40th round's log that it has never once
+  fired, so it isn't implicated in the current bug, and converting it to a hard gate is a much broader,
+  untested behavior change than the two additions above. Flagged as a known, deliberately-preserved
+  divergence rather than silently left alone.
+
+Build clean (asm audit 0/0), QEMU PASS (SD self-test still shows QEMU's own long-standing non-functional SD
+emulation "giving up after 3 attempts" -- pre-existing, unrelated to these changes, confirmed by diffing
+against the pre-change QEMU output). No regressions.
