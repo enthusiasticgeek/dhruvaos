@@ -134,6 +134,46 @@ static void u_hex32(unsigned int v) {
     }
 }
 
+/* 38th SD round (2026-09-27): mirrors real U-Boot's own
+ * dhruva_sd_diag_dump helper (drivers/mmc/bcm2835_sdhost.c in
+ * ~/source/sdwedge-uboot-test) line-for-line in output shape (same
+ * register set, same label style) so a real-HW trace from THIS
+ * function can be diffed directly against a real-HW trace from that
+ * one -- the 37th round found a genuine CRC16 error appearing only on
+ * DhruvaOS's own write, and the 38th round's real-U-Boot trace of a
+ * successful single-block write showed SDHSTS=0 at the equivalent
+ * point, ruling out "the check itself is spurious" -- this is the
+ * next step: get the SAME register-level granularity from DhruvaOS's
+ * OWN write for a direct diff, not another blind guess.
+ *
+ * CAUTION, load-bearing: round 34 removed this exact style of
+ * unconditional per-write print from this file's own success path
+ * after the user's own direct observation that UART output can
+ * perturb the very hardware timing being measured (see this file's
+ * own comment on uboot_style_sdhost_write_block, and memory's
+ * feedback_dhruva_uart_diag_timing_confound). If reintroducing these
+ * two prints changes the outcome (write now succeeds where it failed
+ * before), that is NOT evidence of a logic fix -- it is evidence the
+ * print's own timing cost matters here, and must be re-tested with
+ * the prints removed again before drawing any conclusion. */
+static void dhruva_sd_diag_dump(const char *label) {
+    u_puts("SD DIAG: ");
+    u_puts(label);
+    u_puts(" SDCMD=0x");
+    u_hex32(mmio_r(SDCMD_ADDR));
+    u_puts(" SDARG=0x");
+    u_hex32(mmio_r(SDARG_ADDR));
+    u_puts(" SDHBCT=0x");
+    u_hex32(mmio_r(SDHBCT_ADDR));
+    u_puts(" SDHBLC=0x");
+    u_hex32(mmio_r(SDHBLC_ADDR));
+    u_puts(" SDHSTS=0x");
+    u_hex32(mmio_r(SDHSTS_ADDR));
+    u_puts(" SDEDM=0x");
+    u_hex32(mmio_r(SDEDM_ADDR));
+    u_puts("\n");
+}
+
 /* long long / void* signature to match vani's own extern "C" FFI
  * conventions exactly -- see runtime_stubs.c's own dhruva_fault_
  * inject_alloc_arm comment for the AAPCS register-pairing pitfall a
@@ -169,6 +209,8 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
      * boot") -- removed entirely from the success path; every
      * genuinely anomalous condition below already had its own
      * conditional print and keeps it unchanged. */
+
+    dhruva_sd_diag_dump("pre-CMD24");
 
     /* bcm2835_read_wait_sdcmd, called before issuing a new command. */
     t0 = now_us();
@@ -216,6 +258,8 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
         u_puts("\n");
         return 4;
     }
+
+    dhruva_sd_diag_dump("post-CMD24-cmd-complete");
 
     /* bcm2835_transfer_block_pio (is_read = false), 128 words = one
      * 512-byte block -- burst_words = min(PIO_BURST, copy_words),
@@ -301,6 +345,14 @@ long long uboot_style_sdhost_write_block(void *buf_ptr, long long block_addr) {
             return 2;
         }
     }
+
+    /* Matches real U-Boot's own diagnostic print at this exact point
+     * (added 38th round, see dhruva_sd_diag_dump's own comment) --
+     * unmasked, uncleared SDHSTS, before the extra check below (which
+     * has no counterpart in real U-Boot) reads/clears/acts on it. */
+    u_puts("SD DIAG: uboot-port post-FSM-settle SDHSTS=0x");
+    u_hex32(mmio_r(SDHSTS_ADDR));
+    u_puts("\n");
 
     sdhsts = mmio_r(SDHSTS_ADDR) & SDHSTS_ERROR_MASK;
     mmio_w(SDHSTS_ADDR, sdhsts);
