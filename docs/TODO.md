@@ -10919,3 +10919,67 @@ targeted real-U-Boot instrumentation trace of ITS OWN successful CMD24 write at 
 range/clock divisor (`div=248`, 1MHz data-transfer clock, confirmed identical on both sides), to
 determine whether the CRC16 failure is a timing-margin issue exposed only now that the command sequence
 is correct, or something else entirely -- rather than guessing at another burst-write tweak blind.
+
+## 38th SD round (2026-09-27): real U-Boot CMD24 trace refutes the "extra SDHSTS check is spurious" guess
+
+Instrumented real U-Boot's own `bcm2835_wait_transfer_complete` (`~/source/sdwedge-uboot-test`, outside
+this repo) with a diagnostic-only SDHSTS print at the exact point DhruvaOS's ported write path
+(`boot/rpi1/uboot_sdhost_write.c`) treats an SDHSTS error as fatal -- a check with no counterpart in the
+real source this file claims to be a line-for-line port of. A real-HW single-block write via that
+instrumented U-Boot (`mmc write` at block 0x834, `picocom_20260927_081523.log`) succeeded cleanly with
+`post-FSM-settle SDHSTS=0x00000000` at that point. **This refutes the hypothesis** that DhruvaOS's extra
+check is punishing a benign artifact: a correct write simply does not have CRC16 set there, so
+DhruvaOS's own write is producing a genuine error, not a false one. No DhruvaOS fix was made on the
+untested guess alone.
+
+Added the same three register-level dumps (pre-CMD24, post-CMD24-cmd-complete, post-FSM-settle) to
+`boot/rpi1/uboot_sdhost_write.c`, matching real U-Boot's own diagnostic format exactly, and re-ran the
+8-block sweep (`picocom_20260927_083138.log`). Direct comparison against real U-Boot's own trace at
+block 2100 revealed a second, independent bug:
+
+```
+Real U-Boot:  post-CMD24-cmd-complete SDARG=0x00000834
+DhruvaOS:     post-CMD24-cmd-complete SDARG=0x00106800
+```
+
+`0x00106800` = 1,075,200 = `2100 * 512`. Across all 8 blocks, DhruvaOS's own SDARG increased by exactly
+`0x200` (512) per block -- the signature of byte addressing -- on a card whose own OCR reports
+`is_sdhc=1` (block addressing required, confirmed via `kernel_main.vani`'s own `sdhost_card_addr`, which
+correctly branches on exactly this). Added one more small, gated diagnostic directly at the
+`sdhost_card_addr` call site and confirmed via a further real-HW retest (`picocom_20260927_084408.log`)
+that `sd_state_get_is_sdhc()` reads back **0** immediately after being set to 1 during init, despite
+`sdhost_card_addr`'s own branch logic and call site both being correct by direct source inspection.
+
+## 39th SD round (2026-09-27): AAPCS register-pairing bug found and fixed in sd_state_set
+
+Root cause: `boot/sdcard_state.S`'s `sd_state_set(rca: i64, is_sdhc: i64)` takes TWO `i64` parameters.
+AAPCS's 64-bit register-pair rule applies to BOTH, not just the first -- `rca` occupies r0:r1, so
+`is_sdhc` actually arrives in r2:r3, not r1 as the original code assumed. It read r1 (rca's own unused,
+always-zero high word) instead of r2 -- silently storing 0 into `sd_is_sdhc` on every single call since
+this function was first written (Dhruva Phase 3, per this file's own header -- this bug predates the
+entire SD-wedge saga). This is the IDENTICAL bug class already found and fixed once in this project
+(`boot/netif_state.S`'s own `netif_set_slot_len`) -- that fix's scope was per-file, so this second,
+independent instance was never caught. Swept the entire codebase for any other `extern "C" fn` with two
+`i64` parameters anywhere in the list: these two functions are the only two that have ever existed with
+this shape.
+
+Fixed (commit `4867d3a`): asm now reads r2 for `is_sdhc`. Also removed the temporary diagnostic that
+found this -- it measurably shifted QEMU's own boot timing enough to fail `phase4_milestone.py`'s
+unrelated `tcprtx` test (confirmed: removing the print alone restored the clean 13-pass/5-fail baseline
+with `tcprtx` passing again), a real instance of this project's own documented UART-print-timing-confound
+risk. The existing pre-CMD24/post-CMD24-cmd-complete dumps (38th round) were kept and directly show the
+fix's effect on the next real-HW retest.
+
+**Real-HW retest result** (`picocom_20260927_135308.log`): the addressing fix is CONFIRMED WORKING --
+SDARG now correctly increments by 1 per block (`0x834, 0x835, 0x836, ... 0x83B`), exactly matching real
+U-Boot's own addressing, instead of by 512. **However, all 8 blocks still FAIL identically** with the
+same CRC16 symptom (`post-FSM-settle SDHSTS=0x00000020`, `post-wait SDHSTS error=0x00000020`,
+`any_fail=00000001`). This is genuinely useful, decisive information: the AAPCS addressing bug was real
+and is now fixed -- and it likely explains a meaningful share of this project's broader SD-write history,
+since every prior write attempt on this SDHC card was silently targeting a wildly wrong block address --
+but it was NOT the (sole) cause of the CRC16 write failures specifically. Those persist as a genuinely
+separate, still-open problem, now on a CORRECTLY-addressed write for the first time -- meaning any future
+comparison against real U-Boot's own successful write (round 24, same block 2100) is now a true
+apples-to-apples comparison in a way it never was before (DhruvaOS was never actually touching block 2100
+at all until this fix landed). No further code change attempted this round; next step is a fresh,
+targeted investigation of the CRC16 failure now that addressing is confirmed correct.
