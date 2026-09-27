@@ -10811,3 +10811,41 @@ SD-emulation limitation -- the new code path isn't reached under QEMU at all, sa
 round), `phase4_milestone.py` run once matching the long-documented 13-pass/5-fail baseline exactly
 (tlsecho/httpecho/mqttecho/ls/diagnose -- pre-existing, unrelated). **Awaiting real-HW retest** -- if
 `CURRENT_STATE` after CMD16 reads 4 instead of 13, this is very likely the actual root cause found.
+
+**Real-HW retest #1: FAIL_FLAG never checked on the poll itself.** CMD13's very first attempt hit
+FAIL_FLAG with SDHSTS=0x10 (CRC7_ERROR) -- the loop's own error handling treated any FAIL_FLAG as a
+hard stop instead of retrying, so the poll never actually got to wait. Fixed to retry through CRC7
+specifically (matching this project's own established `allow_crc7_tolerance` precedent in
+`boot/rpi1/uboot_sdhost_full.c`, used for ACMD41 for the identical "some cards don't compute it
+correctly pre-ready" reason), while still stopping immediately on any other error bit.
+
+**Real-HW retest #2: DECISIVELY FALSIFIED.** All 1000 poll iterations hit FAIL_FLAG/CRC7_ERROR, every
+single one (`crc7_retries=1000`), consuming ~1.2 real extra seconds of boot time (8-block sweep elapsed
+jumped from ~352ms to ~1573ms) with zero convergence -- far more time than any genuine settling delay
+could plausibly need. Zero "FSM NOT idle" warnings fired during any of the 1000 attempts (`sdhost_cmd`'s
+own round-34 diagnostic), ruling out a controller data-path confusion. Real U-Boot's own instrumented
+log (round 36's own capture) proves the CMD13 argument choice wasn't the cause either -- it uses CMD13
+with BOTH `arg=0` and `arg=rca<<16` at different points in its own sequence and always gets a clean
+`CURRENT_STATE=4` either way. The settle-time-via-repeated-identical-command hypothesis is dead.
+
+**New experiment, same round**: re-examining what's actually DIFFERENT between DhruvaOS's failing CMD13
+and real U-Boot's own succeeding CMD13 calls -- U-Boot's actual intervening commands between CMD7 and
+its own (much later) CMD16 are CMD55+ACMD51 (SCR read) and CMD55+ACMD6 (bus width), never a repeated
+CMD13. DhruvaOS's OWN existing ACMD51/ACMD6 block (previously positioned AFTER CMD16, on the now-
+disproven assumption that CMD16 already established 'tran' state) has run with ZERO protocol errors in
+every single real-HW log this entire saga has ever captured -- unlike CMD13, it has never once hit
+FAIL_FLAG. Moved that exact, already-proven-clean block to run directly after CMD7 instead, matching
+real U-Boot's own actual command ORDER precisely, using only commands already known to work rather than
+inventing a new polling mechanism. The CMD13 settle-poll code was removed entirely (not left disabled)
+-- decisively falsified, not worth carrying forward as dead weight.
+
+This is a genuinely uncertain experiment, called out honestly rather than oversold: either CMD16's own
+`CURRENT_STATE` now reads 4 (order, not raw elapsed time, was the real fix), or ACMD51 itself starts
+failing when moved this early (equally informative -- it would prove the fragility is about being the
+FIRST addressed command issued right after CMD7, regardless of which command that happens to be,
+pointing at CMD7's own busy-completion signal itself as the real root cause rather than at CMD16 or
+CMD13 specifically).
+
+Verified: build clean, QEMU boot (same pre-existing CMD2 limitation, unreached either way),
+`phase4_milestone.py` matches the documented 13-pass/5-fail baseline exactly. **Awaiting real-HW
+retest.**

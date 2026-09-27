@@ -5691,150 +5691,32 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     return 0 - 1;
   }
 
-  // 35th SD round follow-up (2026-09-26): the user's own instrumented-
-  // real-U-Boot bring-up (drivers/mmc/bcm2835_sdhost.c, ~/source/
-  // sdwedge-uboot-test) showed the single most direct comparison point
-  // in this whole investigation -- CMD16 (SET_BLOCKLEN), the EXACT SAME
-  // command, on the EXACT SAME silicon, ALWAYS reports CURRENT_STATE=4
-  // (tran) on real U-Boot, every single time it's reissued, while
-  // DhruvaOS's own CMD16 has reported CURRENT_STATE=13 (an SD-spec
-  // RESERVED value) unconditionally in every real-HW log this entire
-  // 35-round saga has captured. The structural difference: real
-  // U-Boot's own FIRST command after CMD7 is CMD55+ACMD51 (SCR read),
-  // not CMD16 -- by the time it eventually issues its own CMD16 (much
-  // later, after ACMD51, two ACMD6 attempts, and a CMD13), several full
-  // command round-trips' worth of real elapsed time have passed since
-  // CMD7. DhruvaOS issues CMD16 immediately, back-to-back, right after
-  // CMD7. CMD7 uses R1b (SDCMD_BUSYWAIT) specifically so the
-  // CONTROLLER's own hardware waits for the card's busy/DAT0 signal to
-  // clear before NEW_FLAG clears -- in principle this should already
-  // guarantee the card has finished its internal SELECT_CARD
-  // transition by the time software sees the command complete. But
-  // this exact controller's own driver comments (see bcm2835_reset_
-  // internal's "Limit fifo usage due to silicon bug") already document
-  // real BCM2835 SDHOST silicon marginality elsewhere -- a busywait
-  // hardware flag that doesn't fully cover the card's own real internal
-  // settling time is a plausible, previously-untested instance of the
-  // same class of issue, testable directly and cheaply.
-  //
-  // Fix: a REAL, adaptive readiness poll (CMD13/SEND_STATUS, matching
-  // this driver's own already-established diagnostic use of CMD13
-  // elsewhere) rather than a blind fixed delay -- this driver's own
-  // settle-delay history (docs/TODO.md, "16th SD round") already found
-  // fixed delays insufficient for the (unrelated) data-phase timing;
-  // polling the card's own actual reported state adapts to whatever
-  // the real settle time turns out to be instead of guessing a
-  // constant. Capped at 1000 iterations (matching this file's own
-  // ACMD41 loop convention) so a genuinely wedged card still fails
-  // fast rather than hanging boot.
-  let cmd7_settle_iter: i64 = 0;
-  let cmd7_settle_state: u32 = 0 as u32;
-  let cmd7_settle_timed_out: i64 = 0;
-  let cmd7_settle_failed: i64 = 0;
-  let cmd7_settle_crc7_retries: i64 = 0;
-  while cmd7_settle_iter < 1000 {
-    let settle_cmd13_status: u32 = sdhost_cmd(13 as u32, rca);
-    if sdhost_cmd_timed_out(settle_cmd13_status) == 1 {
-      cmd7_settle_timed_out = 1;
-      break;
-    }
-    // Round 32's own finding, applied here too -- NEW_FLAG clearing
-    // alone doesn't mean this CMD13 genuinely succeeded; a FAIL_FLAG
-    // hit would otherwise go undetected and this loop would keep
-    // reading a stale/undefined SDRSP0 value every remaining
-    // iteration instead of reporting the real failure.
-    if sdhost_cmd_failed(settle_cmd13_status) == 1 {
-      // Real-HW result, first retest of this exact loop: CMD13's very
-      // first attempt (iteration 0) hit FAIL_FLAG with SDHSTS=0x10,
-      // CRC7_ERROR -- a genuinely corrupted RESPONSE, immediately after
-      // CMD7, is exactly the transient signature a card whose response-
-      // generation/CRC circuitry hasn't finished reconfiguring from its
-      // own SELECT_CARD transition would produce -- independent
-      // corroboration of the settle-time hypothesis, not a refutation
-      // of it. Matches this project's own already-established CRC7
-      // tolerance precedent (boot/rpi1/uboot_sdhost_full.c's
-      // `allow_crc7_tolerance`, used for ACMD41 for the identical
-      // reason: "some cards don't compute it correctly pre-ready").
-      // Scoped narrowly to CRC7 specifically (not a blanket FAIL_FLAG
-      // tolerance) -- any OTHER error bit (CMD_TIMEOUT, FIFO_ERROR,
-      // etc.) still reports and stops immediately, matching the
-      // conservative, evidence-based spirit of that same precedent.
-      let settle_sdhsts: u32 = sd_mmio_read_u32(SDHSTS);
-      if (settle_sdhsts & (0x10 as u32)) != (0 as u32) {
-        cmd7_settle_crc7_retries = cmd7_settle_crc7_retries + 1;
-        cmd7_settle_iter = cmd7_settle_iter + 1;
-      } else {
-        let _ = sdhost_cmd_report_failure("CMD13 (SEND_STATUS, post-CMD7 settle poll)", settle_cmd13_status);
-        cmd7_settle_failed = 1;
-        break;
-      }
-    } else {
-      cmd7_settle_state = (sd_mmio_read_u32(sdrsp0) >> (9 as u32)) & (0xF as u32);
-      if cmd7_settle_state == (4 as u32) {
-        break;
-      }
-      cmd7_settle_iter = cmd7_settle_iter + 1;
-    }
-  }
-  let _ = uart_puts("SD DIAG: post-CMD7 readiness poll (CMD13) settled at CURRENT_STATE=");
-  let _ = uart_put_i64(cmd7_settle_state as i64);
-  let _ = uart_puts(" after ");
-  let _ = uart_put_i64(cmd7_settle_iter as i64);
-  let _ = uart_puts(" iteration(s) timed_out=");
-  let _ = uart_put_i64(cmd7_settle_timed_out);
-  let _ = uart_puts(" failed=");
-  let _ = uart_put_i64(cmd7_settle_failed);
-  let _ = uart_puts(" crc7_retries=");
-  let _ = uart_put_i64(cmd7_settle_crc7_retries);
-  let _ = uart_puts("\n");
-
-  // CMD16: SET_BLOCKLEN -- this driver only ever uses 512-byte
-  // blocks, set once here rather than before every single read/write.
-  let cmd16_status: u32 = sdhost_cmd(16 as u32, 512 as u32);
-  if sdhost_cmd_timed_out(cmd16_status) == 1 {
-    let _ = uart_puts("SD/MMC: CMD16 (SET_BLOCKLEN) timed out\n");
-    return 0 - 1;
-  }
-  if sdhost_cmd_failed(cmd16_status) == 1 {
-    let _ = sdhost_cmd_report_failure("CMD16 (SET_BLOCKLEN)", cmd16_status);
-    return 0 - 1;
-  }
-  // Real, direct verification (not just "the command didn't fault") --
-  // per the R1 response format, bits[12:9] of the CARD STATUS word are
-  // CURRENT_STATE; 4 == "tran" (TRANSFER state, the ONLY state CMD17/
-  // CMD24 are legal in). Deliberately read from CMD16's own response,
-  // NOT CMD7's -- an R1 response's CURRENT_STATE field documents the
-  // state the card was in WHEN IT RECEIVED that command, not the state
-  // it transitions into as a result of processing it (confirmed
-  // against real Linux drivers/mmc/core/mmc_ops.c's own _mmc_select_
-  // card: it doesn't check CURRENT_STATE after CMD7 either, for
-  // exactly this reason -- the only way to observe whether selection
-  // actually took effect is a LATER command's own response, and CMD16
-  // is the next one this driver already issues). A card that silently
-  // stayed in "stby" (3) or anywhere else here, despite every command
-  // so far reporting neither a timeout nor FAIL_FLAG, would have been
-  // invisible to every check this driver had before today -- print it
-  // unconditionally so the next real-hardware log shows the true
-  // post-selection card state directly, not inferred from CMD17/
-  // CMD24's own eventual wedge.
-  let cmd16_r1: u32 = sd_mmio_read_u32(sdrsp0);
-  let cmd16_current_state: u32 = (cmd16_r1 >> (9 as u32)) & (0xF as u32);
-  let _ = uart_puts("SD DIAG: post-CMD16 R1=0x");
-  let _ = uart_put_hex32(cmd16_r1);
-  let _ = uart_puts(" CURRENT_STATE=");
-  let _ = uart_put_i64(cmd16_current_state as i64);
-  let _ = uart_puts(if cmd16_current_state == (4 as u32) { " (tran -- card genuinely selected)\n" } else { " (NOT tran -- CMD7 did NOT actually select the card!)\n" });
-  // Deliberately diagnostic-only, NOT a hard failure (no `return 0-1`
-  // here) -- this exact QEMU regression run's own log already shows
-  // CURRENT_STATE=3 here too, despite QEMU's own SD model completing
-  // every later read/write in this same boot perfectly fine (matches
-  // the pre-existing, unrelated 4-FAIL baseline exactly). That means
-  // QEMU's own card model doesn't populate this response field the way
-  // real hardware does -- turning this into a hard failure now would
-  // break the ENTIRE QEMU-based regression suite's own SD-backed tests
-  // (DharaFS, crypto-on-SD, etc.), not just add a real-hardware check.
-  // Print-only until a fresh real-hardware capture confirms what value
-  // genuinely appears there on the actual card.
+  // 36th SD round: a CMD13 (SEND_STATUS) readiness poll was tried here
+  // (real U-Boot's own CMD16 always reports CURRENT_STATE=4 while
+  // DhruvaOS's own CMD16 had always reported 13) -- REAL-HW RESULT:
+  // FALSIFIED, decisively. All 1000 poll iterations hit FAIL_FLAG/
+  // CRC7_ERROR, every single one, consuming ~1.2 real extra seconds of
+  // boot time with zero convergence -- far more time than any genuine
+  // settling delay could need, and zero "FSM NOT idle" warnings fired
+  // during any of it (sdhost_cmd's own round-34 diagnostic), ruling out
+  // a controller data-path confusion too. Real U-Boot's own log proves
+  // the argument wasn't the issue either -- it uses CMD13 with BOTH
+  // arg=0 and arg=rca<<16 at different points and always gets a clean
+  // CURRENT_STATE=4. The real, evidenced difference: U-Boot's actual
+  // intervening commands between CMD7 and its own CMD16 are CMD55+
+  // ACMD51 (SCR) and CMD55+ACMD6 (bus width) -- not a repeated CMD13.
+  // This project's OWN ACMD51/ACMD6 block (originally positioned AFTER
+  // CMD16 below, on the now-disproven assumption that CMD16 already
+  // established 'tran' state) has run with ZERO errors in every single
+  // real-HW log this whole saga has captured. Moved here, matching
+  // real U-Boot's own actual command ORDER exactly, using only
+  // commands already proven to work rather than inventing a new one.
+  // If CMD16's own CURRENT_STATE reads 4 now, order was the real fix.
+  // If ACMD51 itself starts failing here instead, that's equally
+  // decisive: it proves the "first addressed command right after CMD7"
+  // is what's fragile regardless of which command it is, pointing at
+  // CMD7's own busy-completion signal itself rather than at CMD16 or
+  // CMD13 specifically.
 
   // 30th SD round (2026-09-25): ACMD6 (SET_BUS_WIDTH, arg=2 -> 4-bit)
   // -- this exact board's own device tree declares `bus-width = <4>`
@@ -5854,17 +5736,11 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // width mismatch the controller's own FSM/FIFO bookkeeping has no
   // way to detect as an error.
   //
-  // Sent AFTER CMD7/CMD16 (card must be in 'tran' state, an app
-  // command like every ACMD41/ACMD6 needs CMD55 first) -- mandatory
-  // per the SD spec for any card that passed CMD8 (this function's
-  // own `is_mmc == 0` branch; MMC's own bus-width switch is a
-  // different command entirely, out of scope, matching this driver's
-  // pre-existing SD-only 4-bit handling). Diagnostic-only on failure
-  // (falls back to 1-bit / SDHCFG_WIDE_EXT_BUS staying unset) rather
-  // than a hard init failure -- matches this function's own established
-  // pattern for CMD16's CURRENT_STATE check just above: a card that
-  // doesn't support the switch for some real-world reason should still
-  // be usable at 1-bit, not brick this driver's own init.
+  // 36th SD round: moved to run directly after CMD7 (previously ran
+  // after CMD16, on the assumption CMD16 already put the card in
+  // 'tran' -- see this function's own header comment above for why
+  // that assumption is now known to be false, and why this exact
+  // block, unchanged, is the replacement experiment).
   if is_mmc == 0 {
     // 30th SD round follow-up: read SCR (ACMD51) BEFORE attempting
     // ACMD6 -- matches real U-Boot's own gating (sd_get_capabilities
@@ -5913,6 +5789,54 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   } else {
     let _ = sd_state_set_is_4bit(0);
   }
+
+  // CMD16: SET_BLOCKLEN -- this driver only ever uses 512-byte
+  // blocks, set once here rather than before every single read/write.
+  let cmd16_status: u32 = sdhost_cmd(16 as u32, 512 as u32);
+  if sdhost_cmd_timed_out(cmd16_status) == 1 {
+    let _ = uart_puts("SD/MMC: CMD16 (SET_BLOCKLEN) timed out\n");
+    return 0 - 1;
+  }
+  if sdhost_cmd_failed(cmd16_status) == 1 {
+    let _ = sdhost_cmd_report_failure("CMD16 (SET_BLOCKLEN)", cmd16_status);
+    return 0 - 1;
+  }
+  // Real, direct verification (not just "the command didn't fault") --
+  // per the R1 response format, bits[12:9] of the CARD STATUS word are
+  // CURRENT_STATE; 4 == "tran" (TRANSFER state, the ONLY state CMD17/
+  // CMD24 are legal in). Deliberately read from CMD16's own response,
+  // NOT CMD7's -- an R1 response's CURRENT_STATE field documents the
+  // state the card was in WHEN IT RECEIVED that command, not the state
+  // it transitions into as a result of processing it (confirmed
+  // against real Linux drivers/mmc/core/mmc_ops.c's own _mmc_select_
+  // card: it doesn't check CURRENT_STATE after CMD7 either, for
+  // exactly this reason -- the only way to observe whether selection
+  // actually took effect is a LATER command's own response, and CMD16
+  // is the next one this driver already issues). A card that silently
+  // stayed in "stby" (3) or anywhere else here, despite every command
+  // so far reporting neither a timeout nor FAIL_FLAG, would have been
+  // invisible to every check this driver had before today -- print it
+  // unconditionally so the next real-hardware log shows the true
+  // post-selection card state directly, not inferred from CMD17/
+  // CMD24's own eventual wedge.
+  let cmd16_r1: u32 = sd_mmio_read_u32(sdrsp0);
+  let cmd16_current_state: u32 = (cmd16_r1 >> (9 as u32)) & (0xF as u32);
+  let _ = uart_puts("SD DIAG: post-CMD16 R1=0x");
+  let _ = uart_put_hex32(cmd16_r1);
+  let _ = uart_puts(" CURRENT_STATE=");
+  let _ = uart_put_i64(cmd16_current_state as i64);
+  let _ = uart_puts(if cmd16_current_state == (4 as u32) { " (tran -- card genuinely selected)\n" } else { " (NOT tran -- CMD7 did NOT actually select the card!)\n" });
+  // Deliberately diagnostic-only, NOT a hard failure (no `return 0-1`
+  // here) -- this exact QEMU regression run's own log already shows
+  // CURRENT_STATE=3 here too, despite QEMU's own SD model completing
+  // every later read/write in this same boot perfectly fine (matches
+  // the pre-existing, unrelated 4-FAIL baseline exactly). That means
+  // QEMU's own card model doesn't populate this response field the way
+  // real hardware does -- turning this into a hard failure now would
+  // break the ENTIRE QEMU-based regression suite's own SD-backed tests
+  // (DharaFS, crypto-on-SD, etc.), not just add a real-hardware check.
+  // Print-only until a fresh real-hardware capture confirms what value
+  // genuinely appears there on the actual card.
 
   // ROUND 2026-09-17 (real-hardware investigation, task #215):
   // identification-speed SDCDIV (0x148, set once above) has been left
