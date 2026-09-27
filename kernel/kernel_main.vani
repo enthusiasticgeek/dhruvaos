@@ -2769,6 +2769,13 @@ extern "C" fn get_throttled_status() -> i64;
 // path is completely untouched.
 #[stack_cost(bytes=64)]
 extern "C" fn uboot_style_sdhost_write_block(buf: mut ref i64, block_addr: i64) -> i64;
+// 41st SD round (2026-09-27): read-side counterpart, literal C port of
+// real U-Boot's own read path (boot/rpi1/uboot_sdhost_read.c). Called
+// ONLY from the same 8-block real-HW diagnostic sweep in
+// sdhost_read_block_once below -- the production read path is
+// completely untouched.
+#[stack_cost(bytes=64)]
+extern "C" fn uboot_style_sdhost_read_block(buf: mut ref i64, block_addr: i64) -> i64;
 // 34th SD round follow-up -- see boot/rpi1/uboot_sdhost_full.c's own
 // header comment for the full "why". Runs a COMPLETELY independent
 // bring-up (CMD0 through CMD7, plus SCR/ACMD6 bus-width negotiation)
@@ -6506,6 +6513,24 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // full "why" (real U-Boot reissues CMD16/SET_BLOCKLEN before every
   // single mmc_bread/mmc_bwrite, never just once at init).
   let _ = sdhost_cmd(16 as u32, 512 as u32);
+  // 41st SD round (2026-09-27): direct read-side counterpart to
+  // sdhost_write_block_once's own use_write_diag early-return. The
+  // 40th round's ACMD6 fix confirmed real 4-bit mode and, in the same
+  // stroke, resolved the CRC16 write failure that had defined this
+  // investigation for rounds 37-40 -- but exposed a new read-side
+  // FIFO_ERROR that never had the chance to manifest while every write
+  // was already failing first. Routes the same 8-block diagnostic
+  // sweep through a literal C port of U-Boot's own read path (boot/
+  // rpi1/uboot_sdhost_read.c) instead of this driver's own hand-written
+  // asm read path, exactly mirroring how the write side already does
+  // this. CMD16 above is unconditional and already covers this path,
+  // matching the write side's own identical reliance on its outer
+  // unconditional CMD16 call. Production read path (every block outside
+  // 2100-2107) is completely unaffected.
+  let use_read_diag: bool = (block_num >= 2100) && (block_num < 2108);
+  if use_read_diag {
+    return uboot_style_sdhost_read_block(buf, addr as i64);
+  }
   // BUG found 2026-09-19 (real-hardware SD wedge investigation, fifth
   // real-HW log): 0x518 included SDHCFG_BLOCK_IRPT_EN (bit8, 0x100)
   // unconditionally -- confirmed against a fresh diagnostic capture

@@ -269,6 +269,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/uboot_sdhost_write.c" -o "${BUILD_DIR}/uboot_sdhost_write.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
+  "${ROOT}/boot/rpi1/uboot_sdhost_read.c" -o "${BUILD_DIR}/uboot_sdhost_read.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/uboot_sdhost_full.c" -o "${BUILD_DIR}/uboot_sdhost_full.o"
 
 "${VANIC}" emit "${ROOT}/kernel/kernel_main.vani" --backend=llvm \
@@ -351,6 +354,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/dma_uart_state.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
   "${BUILD_DIR}/uboot_sdhost_write.o" \
+  "${BUILD_DIR}/uboot_sdhost_read.o" \
   "${BUILD_DIR}/uboot_sdhost_full.o" \
   -lgcc \
   -o "${BUILD_DIR}/dhruva.elf"

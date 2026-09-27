@@ -11096,3 +11096,59 @@ resolved -- but the read-side FIFO_ERROR is a genuinely new, distinct problem, n
 further code change attempted; presenting this finding for direction on how to proceed (e.g., real-U-Boot
 comparison of its own read-side burst timing in 4-bit mode, or read-path diagnostics matching what the
 write path already has).
+
+### 41st SD round (2026-09-27): read-path C port with 3 new checks found via meticulous U-Boot re-read
+
+Direct follow-up to the 40th round's real-HW-confirmed 4-bit-mode fix, which resolved the CRC16 write
+failure that defined the whole 37-40 round saga but exposed a new read-side FIFO_ERROR. Per explicit user
+instruction ("add read-path diagnostics matching the write side. read uboot source code portion relevant to
+this." then "read all functions invoked uboot and examine meticulously"), built `boot/rpi1/
+uboot_sdhost_read.c`: a literal C transliteration of real U-Boot's own read path, mirroring the existing
+`uboot_sdhost_write.c` port's structure/conventions exactly, called only from the same 8-block real-HW
+diagnostic sweep (block_num 2100-2107) via a new `use_read_diag` gate in `sdhost_read_block_once`.
+
+A systematic function-by-function re-read of real U-Boot's `bcm2835_sdhost.c` (`bcm2835_send_cmd`,
+`bcm2835_send_command`, `bcm2835_finish_command`, `bcm2835_transmit`, `bcm2835_transfer_pio`,
+`bcm2835_transfer_block_pio`, `bcm2835_wait_transfer_complete`, `bcm2835_check_data_error`,
+`bcm2835_check_cmd_error`, `bcm2835_prepare_data`, `bcm2835_read_wait_sdcmd`, `edm_fifo_fill`) found three
+real gaps missing from every C port and from DhruvaOS's own hand-written asm read driver, all now added to
+the new file:
+
+1. **`bcm2835_send_cmd`'s own leading FSM-idle check** (new return code 6) -- the FSM must already be
+   IDENTMODE or DATAMODE before a new command is issued at all; catches the case where the immediately-prior
+   write's own FSM-settle hasn't actually completed by the time the read starts.
+2. **`bcm2835_transmit`'s own leading SDHSTS check** (new return code 7) -- catches an error already present
+   in SDHSTS the instant the command phase completes, before the PIO burst loop ever runs.
+3. **`bcm2835_transfer_block_pio`'s own FSM-state sanity check inside the burst-readiness poll** (new return
+   code 5) -- the real, decisive find: an early, explicit exit the instant the FSM leaves a valid
+   data-transfer state (READDATA/READWAIT/READCRC) while still waiting for FIFO fill, reading SDHSTS right
+   then. Neither the existing asm driver nor the existing write-side C port has this -- both just retry the
+   bare threshold up to a bounded cap with no visibility into why the FIFO was never ready. Directly
+   plausible explanation for the observed stale/repeating (C3 C2 C1 C0) readback pattern: if FIFO_ERROR sets
+   mid-transfer, prior code had no way to detect it AT THE POINT it happens, only via the post-transfer
+   check, by which point SDDATA no longer holds real transferred bytes.
+
+**Bug caught by the meticulous re-check itself, before any build**: initially wrote
+`SDEDM_FSM_READCRC` as `0x3` (copy-paste/recall error) -- direct `grep` of the real source confirmed the
+actual value is `0x5`; `0x3` is `SDEDM_FSM_WRITEDATA`, an unrelated write-side state. Fixed before this file
+was ever built or tested, avoiding a wasted real-HW round on a self-inflicted bug in the new diagnostic
+itself.
+
+Full audit (this round, per user's explicit "make sure addresses and magic numbers correct"): every MMIO
+address and bit-mask constant in the new file cross-checked both against a fresh `grep` of the real source
+and diffed against the existing, real-HW-confirmed-working `uboot_sdhost_write.c` -- all identical except the
+expected READ_CMD-vs-WRITE_CMD direction difference. Register-write ordering (SDHSTS-clear before SDHBCT/
+SDHBLC before SDARG before SDCMD), `edm_fifo_fill` bit math, the FSM valid-state sets, and the
+SDHSTS_ERROR_MASK bit groupings were all re-verified line-for-line against `bcm2835_transfer_block_pio`,
+`bcm2835_transfer_pio`, and `bcm2835_prepare_data` directly -- no further discrepancies found.
+
+`uboot_sdhost_write.c`'s own burst loop still lacks check 3 above -- deliberately NOT ported there this
+round, since the write side is currently working and per this project's own "verify causally" discipline, an
+unrequested change there needs its own separate real-HW confirmation, not a blind copy-paste.
+
+Wired: `build.sh` compiles and links `uboot_sdhost_read.o`; `kernel_main.vani` declares
+`uboot_style_sdhost_read_block` and gates `sdhost_read_block_once` on the same block-range condition as the
+write side's `use_write_diag`. Build clean (asm audit 0/0), QEMU `qemu_run.py` PASS, no regressions.
+`phase4_milestone.py` still skipped this round per the user's own standing instruction for this SD-debugging
+campaign. Awaiting a fresh real-HW retest to see which (if any) of checks 5/6/7 fires and whether the
+FIFO_ERROR root cause is finally pinpointed.
