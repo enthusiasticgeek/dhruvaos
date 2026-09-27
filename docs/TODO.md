@@ -11047,5 +11047,52 @@ investigation specifically, deliberately not chased this round per the user's ow
 gating logic first.
 
 Verified: build clean (asm_safety_audit.py gate 0 DEFINITE/0 REVIEW), qemu_run.py PASS.
-phase4_milestone.py skipped this round per explicit instruction to speed up SD debugging iteration. Not
-yet flashed to the SD card; awaiting real-HW retest.
+phase4_milestone.py skipped this round per explicit instruction to speed up SD debugging iteration.
+
+## 40th SD round real-HW retest (2026-09-27): the CRC16 write failure is GONE -- first-ever clean write in this entire saga; failure moved to the read side
+
+`picocom_20260927_144504.log`. Confirmed the ACMD6 fix works exactly as intended:
+`ACMD6 (SET_BUS_WIDTH=4-bit) accepted -- switching to 4-bit`, and the one-time SDHCFG capture now reads
+`0x0000040E` -- byte-for-byte identical to real U-Boot's own value (was `0x0000040A` before this round).
+
+**The write's own post-wait check is now clean for the first time in this entire investigation**:
+
+```
+SD DIAG: post-CMD24-cmd-complete SDCMD=0x00000098 SDARG=0x00000834 ... SDHSTS=0x00000001 SDEDM=0x0001080A
+SD DIAG: uboot-port post-FSM-settle SDHSTS=0x00000000
+```
+
+`SDHSTS=0x00000000` at post-FSM-settle -- no CRC16, no error bits at all. Every single block in the
+8-block sweep shows `wr=0` (write success) for the first time since this saga began (round ~5-9).
+
+**The failure has moved entirely to the read side**, consistently across all 8 blocks:
+
+```
+SD DIAG: read errs=0x00000008 (CMD_TIMEOUT=0x40 CRC16=0x20 CRC7=0x10 FIFO_ERROR=0x08 REW_TIMEOUT=0x80)
+SD DIAG: block 2100 FAILED: wr=0 rd=3 mismatch_at=1 SDHSTS=0x00000001 SDEDM=0x00010801
+SD DIAG: actual  (r) C3 C2 C1 C0 C3 C2 C1 C0 C3 C2 C1 C0 C3 C2 C1 C0
+```
+
+`errs=0x08` = FIFO_ERROR, a genuinely different error class than the CRC16 that dominated every prior
+round -- and the readback shows the same repeating non-random `C3 C2 C1 C0` pattern seen in earlier
+rounds' stale-data captures, consistent with the read never actually draining fresh FIFO data. Each
+block's own read failure then triggers a retry, and the RETRY's own write attempt fails too
+(`write wedge detected (FAIL_FLAG set)`) -- the controller appears to be left in a bad state by the
+failed read, not an independent write regression (the FIRST write attempt on every block still succeeds
+cleanly before the read fails).
+
+Checked `sdhost_drain_fifo_to_buffer_impl` (`boot/sdcard_state.S`, the function behind every real-HW
+block read this project has ever done, including task #217's own read-side fix): its own header comment
+confirms it ALREADY received the exact same U-Boot-matching burst-read gate fix `sd_scr_drain_diag` got in
+the 30th round (both were fixed together, not just the SCR-specific diagnostic) -- so this is not simply
+"the same already-known 30th-round bug reappearing unfixed." The most likely new explanation: 4-bit mode
+moves data roughly 4x faster per clock than the 1-bit mode this whole driver has run in since Phase 3 --
+a genuine FIFO_ERROR (not CRC16) is consistent with the card now filling the FIFO faster than this
+software's own burst-drain loop, timing, or retry/backoff assumptions were ever tuned for, since none of
+this driver's read-path timing has ever actually run in 4-bit mode until this fix landed.
+
+This is a major, positive milestone -- the write-side bug that defined the entire multi-round saga appears
+resolved -- but the read-side FIFO_ERROR is a genuinely new, distinct problem, not yet investigated. No
+further code change attempted; presenting this finding for direction on how to proceed (e.g., real-U-Boot
+comparison of its own read-side burst timing in 4-bit mode, or read-path diagnostics matching what the
+write path already has).
