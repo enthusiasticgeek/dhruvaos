@@ -5020,6 +5020,35 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
     }
     iter = iter + 1;
   }
+  // 42nd SD round (2026-09-27): sdhost_cmd is the single function EVERY
+  // command in this entire driver funnels through, and its own NEW_FLAG
+  // poll timeout path has never once printed anything -- every "NEW_FLAG
+  // stuck" wedge this project has ever logged (via sdhost_read_block's/
+  // sdhost_write_block's own generic wrapper-level message) has been a
+  // black box: which command, what argument, what SDEDM/SDHSTS actually
+  // showed at the exact moment the command-issue poll itself gave up.
+  // Real U-Boot's own bcm2835_read_wait_sdcmd has an equally terse
+  // timeout message (just "%s: timeout (%d us)\n", no register dump) --
+  // this is intentionally MORE detailed than the reference, since this
+  // is precisely the failure mode the 41st round's real-HW retest newly
+  // exposed (14x NEW_FLAG stuck, 7x FAIL_FLAG set, on ordinary DharaFS
+  // blocks in 4-bit mode, after the targeted PIO-burst bug was already
+  // fixed) and this driver has never had any visibility into it at all.
+  // Only printed on the actual timeout path -- this function runs for
+  // every single command issued by this driver, so an unconditional
+  // print here would be the same UART-timing-confound mistake already
+  // documented and avoided elsewhere in this file.
+  if iter >= 1000000 {
+    let _ = uart_puts("SD DIAG: sdhost_cmd NEW_FLAG poll timed out cmd_and_flags=0x");
+    let _ = uart_put_hex32(cmd_and_flags);
+    let _ = uart_puts(" arg=0x");
+    let _ = uart_put_hex32(arg);
+    let _ = uart_puts(" SDEDM=0x");
+    let _ = uart_put_hex32(sd_mmio_read_u32(SDEDM));
+    let _ = uart_puts(" SDHSTS=0x");
+    let _ = uart_put_hex32(sd_mmio_read_u32(SDHSTS));
+    let _ = uart_puts("\n");
+  }
   return sd_mmio_read_u32(sdcmd);
 }
 

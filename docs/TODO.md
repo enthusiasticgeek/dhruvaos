@@ -11262,3 +11262,38 @@ inherits, cascading into the observed wedge storm.
 Presented to the user for direction: continue chasing 4-bit-mode's new reliability problem (42nd round), or
 step back and weigh whether 1-bit mode's own already-known, already-tracked issues (task #218) are the
 better tradeoff for now. Not unilaterally decided.
+
+### 42nd SD round (2026-09-27): begin chasing the 4-bit-mode reliability regression
+
+Per explicit user direction ("chase the 4-bit-mode reliability issue" / "keep comparing with uboot since it
+is known to work"), started the next investigation thread opened by round 41's real-HW retest.
+
+**Key finding that reshapes the hypothesis**: real U-Boot's own driver config advertises `host_caps =
+MMC_MODE_4BIT | ...` (bcm2835_sdhost.c line 856), meaning real U-Boot negotiates and actually uses 4-bit mode
+on this exact card whenever it boots -- and U-Boot has booted this exact card/wiring reliably every single
+time in this entire project's history (loading kernel.img via many sequential FAT block reads). This is
+strong existing evidence AGAINST a fundamental 4-bit-mode hardware signal-integrity problem on this board --
+if the physical wiring/card genuinely couldn't sustain reliable 4-bit transfers, U-Boot's own real 4-bit
+reads would fail too, and they don't. This reframes the round-41 hypothesis: the remaining wedge (NEW_FLAG
+stuck / FAIL_FLAG set on ordinary blocks) is more likely still a DhruvaOS-side software gap in how it issues
+*repeated* commands across different blocks, not a hardware margin issue.
+
+**Also re-verified (already correct, ruled out as the gap)**: DhruvaOS's own `sdhost_init`'s reset sequence
+already matches real U-Boot's `bcm2835_reset_internal` register-for-register (SDVDD off/on power cycle,
+SDCMD/SDARG/SDCDIV/SDHCFG/SDHBCT/SDHBLC cleared, SDHSTS clear-mask, the FIFO read/write threshold silicon-
+errata workaround at SDEDM bits [18:14]/[13:9]=4, matching settle delays) -- this was already found and fixed
+in task #273/#274 (2026-09-20), well before this round. Not the missing piece.
+
+**Fixed this round**: `sdhost_cmd` -- the single function every command in the entire driver funnels through
+-- had NO diagnostic on its own NEW_FLAG poll timeout path, despite this being exactly the failure mode round
+41's retest newly exposed (14x NEW_FLAG stuck, 7x FAIL_FLAG set). Every occurrence so far has been a black
+box: which command, what argument, what SDEDM/SDHSTS actually showed at the moment the poll gave up. Added a
+diagnostic print (cmd_and_flags/arg/SDEDM/SDHSTS), gated to the timeout path only (matching this project's
+own established "only print on the actual failure path" discipline to avoid the UART-timing-confound class of
+regression already hit twice this session). Real U-Boot's own equivalent (`bcm2835_read_wait_sdcmd`) has an
+even terser message with no register dump at all -- this is intentionally more detailed than the reference,
+since visibility here is the actual missing piece, not a logic bug to port.
+
+Build clean (asm audit 0/0), QEMU PASS, no regressions. Next real-HW retest should show exactly what state
+the controller is in at the moment of the next command-level wedge, which is needed before any further fix
+can be attempted (matching this investigation's own repeated "don't fix blind" discipline).
