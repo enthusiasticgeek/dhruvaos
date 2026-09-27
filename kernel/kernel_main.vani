@@ -6624,7 +6624,40 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // captured log, including this one -- a clean, reproducible split
   // this project's own control-flow, not a timing coincidence. Adding
   // the missing bit (0x418->0x41A, 0x41C->0x41E) to close the gap.
-  let read_sdhcfg: u32 = if sd_state_get_is_4bit() == 1 { 0x41E as u32 } else { 0x41A as u32 };
+  //
+  // 42nd SD round, second follow-up (2026-09-27): that WIDE_INT_BUS fix
+  // (confirmed on real HW: command-level wedge storm eliminated, 0 of
+  // 21 wedges vs the prior log's 21) did NOT touch the read path's own
+  // remaining, separate FIFO_ERROR problem -- ~184 occurrences in the
+  // very same successful log, on essentially every ordinary read.
+  // Compared this line against write_sdhcfg (below) bit-for-bit: this
+  // constant is the ONLY place in the entire read path that still
+  // differs from what the sweep's own diagnostic read actually runs
+  // with (SDHCFG inherited from the sweep's immediately-prior
+  // diagnostic write, since use_read_diag's own early-return -- see
+  // above -- skips this line entirely for the sweep). That inherited
+  // value is write_sdhcfg, which has NEVER included SDHCFG_DATA_IRPT_EN
+  // (bit4, 0x10) -- round 27 removed it from the write side specifically
+  // ("U-Boot's own successful write path never sets SDHCFG_DATA_IRPT_
+  // EN"), but this read_sdhcfg constant has carried it since round 19
+  // ("Real Linux's bcm2835_sdhost_set_transfer_irqs... sets ONLY
+  // SDHCFG_DATA_IRPT_EN|BUSY_IRPT_EN at the START of a PIO transfer"),
+  // reasoned as read-specific and correct at the time. The real-HW
+  // evidence now directly contradicts that: the sweep's own read runs
+  // WITHOUT this bit and has succeeded every single time this project
+  // has ever captured; ordinary production reads run WITH it and fail
+  // with FIFO_ERROR essentially every time, in every log including the
+  // one that just confirmed the WIDE_INT_BUS fix. Bare Linux source
+  // (torvalds/linux drivers/mmc/host/bcm2835.c, fetched fresh this
+  // round) treats FIFO_ERROR as fatal, never a benign/retriable
+  // artifact -- ruling out "just ignore it" as a fix and leaving "this
+  // bit's presence is itself the problem" as the best-supported
+  // explanation. Dropping it here to match write_sdhcfg exactly --
+  // real, deterministic, reproducible real-HW A/B evidence (100% vs
+  // ~100% flipped) outweighs the untested reasoning that originally
+  // added it, per this project's own established practice of trusting
+  // fresh real-HW signal over prior speculative register analysis.
+  let read_sdhcfg: u32 = if sd_state_get_is_4bit() == 1 { 0x40E as u32 } else { 0x40A as u32 };
   let _ = sd_mmio_write_u32(SDHCFG, read_sdhcfg);
   let _ = sd_mmio_write_u32(sdhbct, 512 as u32);
   let _ = sd_mmio_write_u32(sdhblc, 1 as u32);

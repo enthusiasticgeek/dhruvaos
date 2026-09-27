@@ -11395,3 +11395,40 @@ downstream FAILs clear once SD wedge is fixed") -- no new failures introduced. W
 whether these persistent FIFO_ERROR reads are the direct cause of some of those 6 FAILs (e.g. "multi-block
 file round trip... FAIL" is exactly the kind of symptom a corrupted mid-transfer read would produce), which
 would make task #218 and this remaining FIFO_ERROR the same underlying issue.
+
+### 42nd SD round, third fix (2026-09-27): drop SDHCFG_DATA_IRPT_EN from the read path
+
+Per explicit user direction ("dig and fix" the remaining FIFO_ERROR-on-every-read pattern, then "compare to
+linux or uboot source"). The WIDE_INT_BUS fix (confirmed on real HW: 0 wedges) left a separate problem
+untouched: ~184 "read errs=0x00000008" (FIFO_ERROR) occurrences in that same successful log, on essentially
+every ordinary production read.
+
+Fetched real mainline Linux's own SDHOST driver (`torvalds/linux` `drivers/mmc/host/bcm2835.c`, confirmed via
+its own header this IS the polled-PIO SDHOST driver, not the DMA-capable EMMC one) to check FIFO_ERROR
+handling specifically: it's treated as **uniformly fatal** (`-EILSEQ`), grouped with the CRC errors, never
+retriable or documented as a known false-positive/silicon quirk. This rules out "the bit is just a benign
+artifact, safe to ignore" as a fix -- real Linux itself would also fail a transfer that genuinely set this bit.
+Also confirmed Linux sets `SDHCFG_WIDE_INT_BUS`/`SDHCFG_SLOW_CARD` unconditionally (matching this project's own
+round-30 finding and the fix already applied).
+
+Comparing the same log's own successful diagnostic-sweep read against the failing production read (after the
+WIDE_INT_BUS fix, both now share that bit) found ONE remaining difference: `SDHCFG_DATA_IRPT_EN` (bit4, 0x10).
+The sweep's read (inheriting SDHCFG from its own immediately-prior diagnostic write, per `use_read_diag`'s
+early-return ordering) never has this bit; the production read has carried it since round 19, reasoned at the
+time from real Linux's own `bcm2835_sdhost_set_transfer_irqs` ("sets ONLY SDHCFG_DATA_IRPT_EN|BUSY_IRPT_EN at
+the START of a PIO transfer"). Round 27 already removed this exact bit from the WRITE side specifically ("real
+U-Boot's own successful write path never sets SDHCFG_DATA_IRPT_EN") -- the read side never got the equivalent
+treatment.
+
+The real-HW evidence now directly contradicts round 19's own reasoning: the sweep's read, WITHOUT this bit,
+has succeeded every single time this project has ever captured across dozens of logs; the production read,
+WITH this bit, fails with FIFO_ERROR essentially every time, in every log including the one that just
+confirmed the WIDE_INT_BUS fix works. Per this project's own established practice (trust fresh, deterministic
+real-HW signal over prior speculative register reasoning, especially when the two directly conflict), dropped
+`SDHCFG_DATA_IRPT_EN` from `read_sdhcfg`, making it identical to `write_sdhcfg` (0x40E for 4-bit, 0x40A for
+1-bit) -- there is no longer any reasoned justification for these two constants to differ at all.
+
+Build clean (asm audit 0/0), QEMU PASS. Awaiting the next real-HW retest -- if this closes the FIFO_ERROR
+gap, it may also resolve some of the 6 pre-existing DharaFS-level FAILs (task #218), since a corrupted
+mid-transfer read is exactly the kind of thing that would produce symptoms like "multi-block file round
+trip... FAIL".
