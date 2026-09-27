@@ -289,6 +289,16 @@ sdhost_drain_poll:
                                * context_switch.S's mem_barrier() for
                                * the same instruction used elsewhere in
                                * this project. */
+    mov r1, r2                /* 41st SD round (2026-09-27): save the
+                               * RAW edm value (before it's shifted into
+                               * a fill count below) so the new FSM
+                               * check just below can still read it. r1
+                               * stays free for this until it's
+                               * overwritten by an actual SDDATA word in
+                               * sdhost_drain_burst -- safe, since the
+                               * FSM check below always resolves one way
+                               * or another before this loop ever
+                               * reaches that point. */
     mov r2, r2, lsr #4
     and r2, r2, #0x1F        /* r2 = current FIFO word count (fill) */
     mov r7, #8               /* SDDATA_FIFO_PIO_BURST, matching
@@ -297,6 +307,40 @@ sdhost_drain_poll:
     movgt r7, r4              /* r7 = burst_words = min(8, remaining) */
     cmp r2, r7
     bge sdhost_drain_have_enough
+    /* 41st SD round (2026-09-27): real U-Boot's own bcm2835_transfer_
+     * block_pio has an FSM-state sanity check INSIDE this exact poll --
+     * the instant the FSM leaves a valid read state (READDATA/READWAIT/
+     * READCRC) while still waiting for fill, it reads SDHSTS right then
+     * and bails immediately on a genuine error, rather than blindly
+     * retrying. This production loop never had that (only the bounded
+     * 400-iteration cap + force-a-stale-read fallback below) -- found
+     * via round 41's literal U-Boot C port (boot/rpi1/uboot_sdhost_
+     * read.c) and confirmed against real-HW evidence already in hand:
+     * round 40's picocom_20260927_144504.log shows every FIFO_ERROR
+     * read returning the exact same 4 bytes (C3 C2 C1 C0) repeated 4
+     * times -- the signature of this cap-exhaustion fallback firing
+     * repeatedly and forcing through stale FIFO content, not genuine
+     * per-word progress. Ported here for the first time so a genuine
+     * mid-burst error is caught and reported the instant it happens,
+     * instead of after 400 wasted retries and a stale read. */
+    and r2, r1, #0xF          /* r2 = fsm state from the saved raw edm */
+    cmp r2, #2                 /* SDEDM_FSM_READDATA */
+    cmpne r2, #4                /* SDEDM_FSM_READWAIT */
+    cmpne r2, #5                 /* SDEDM_FSM_READCRC */
+    beq sdhost_drain_fsm_retry     /* still a valid read state -- keep
+                               * polling via the existing retry-cap logic
+                               * below, exactly as before */
+    ldr r2, =0x20202020        /* SDHSTS */
+    ldr r2, [r2]
+    tst r2, #0xF8               /* SDHSTS_ERROR_MASK, matches real
+                               * U-Boot's own check exactly */
+    beq sdhost_drain_fsm_retry    /* FSM transient but no error latched
+                               * yet -- matches U-Boot's own bare
+                               * `continue` for this case */
+    b sdhost_drain_fifo_error       /* genuine error mid-burst -- bail
+                               * out now instead of forcing a stale read
+                               * after the retry cap exhausts */
+sdhost_drain_fsm_retry:
     subs r5, r5, #1
     bne sdhost_drain_poll
     mov r2, #1                /* retry cap exhausted -- force reading
@@ -333,6 +377,19 @@ sdhost_drain_done:
     msr cpsr_c, r12
     pop {r4, r5, r6, r7}
     mov r0, #0
+    mov r1, #0
+    bx lr
+sdhost_drain_fifo_error:
+    /* 41st SD round (2026-09-27): distinguishable non-zero return so
+     * the caller (sdhost_read_block_once) can tell "genuine mid-burst
+     * FSM/SDHSTS error, bailed out early" apart from normal completion
+     * -- this function previously had no error return path at all.
+     * The buffer beyond whatever was already drained is left
+     * unfilled/stale; the caller already treats any non-zero SDHSTS
+     * error as a failed read regardless. */
+    msr cpsr_c, r12
+    pop {r4, r5, r6, r7}
+    mov r0, #1
     mov r1, #0
     bx lr
 

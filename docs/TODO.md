@@ -11152,3 +11152,45 @@ write side's `use_write_diag`. Build clean (asm audit 0/0), QEMU `qemu_run.py` P
 `phase4_milestone.py` still skipped this round per the user's own standing instruction for this SD-debugging
 campaign. Awaiting a fresh real-HW retest to see which (if any) of checks 5/6/7 fires and whether the
 FIFO_ERROR root cause is finally pinpointed.
+
+### 41st SD round follow-up (2026-09-27): ported the FSM-during-poll fix into the PRODUCTION read path
+
+Per explicit user request ("where do the uboot and dhruvaos diverge. need to find hidden gaps"), audited the
+actual production SD driver (`boot/sdcard_state.S`'s `sdhost_drain_fifo_to_buffer_impl`/`sdhost_fill_fifo_
+from_buffer_impl`, and `kernel_main.vani`'s `sdhost_cmd`/`sdhost_wait_transfer_complete`) function-by-function
+against real U-Boot, separately from the diagnostic C ports. Findings:
+
+- **Confirmed, real, and now fixed**: both production burst-poll loops (`sdhost_drain_fifo_to_buffer_impl`
+  for reads, `sdhost_fill_fifo_from_buffer_impl` for writes) lacked U-Boot's FSM-state sanity check inside
+  the burst-readiness poll -- the exact same gap round 41's diagnostic read C port found and added. Re-reading
+  the 40th round's own captured log (`picocom_20260927_144504.log`) in light of this: every FIFO_ERROR read's
+  "actual (r)" bytes show the identical 4 bytes (`C3 C2 C1 C0`) repeated 4 times -- the precise signature of
+  the existing 400-iteration retry cap exhausting and force-reading 1 stale word, 4 separate times in a row,
+  not genuine per-word progress. This is now real-HW-log-confirmed evidence for the production failure
+  mechanism, not just a hypothesis carried over from the diagnostic port. Ported the check into
+  `sdhost_drain_fifo_to_buffer_impl` (production read path only): on a genuine mid-burst FSM/SDHSTS error it
+  now bails out immediately with a new distinguishable return code, instead of exhausting the retry cap and
+  forcing through stale FIFO content. `sdhost_read_block_once` now checks this and returns a new code (5).
+  The write side (`sdhost_fill_fifo_from_buffer_impl`) has the identical gap but was deliberately NOT touched
+  this round -- it's currently working for the first time ever (since the 40th round's ACMD6 fix), and per
+  this project's own "verify causally" discipline an unrequested change there needs its own separate real-HW
+  confirmation, not a blind copy-paste onto a path that isn't broken.
+- **Present but permissive, not a bug**: production `sdhost_cmd` already has a check matching U-Boot's
+  `bcm2835_send_cmd` leading FSM-idle precondition (added round 34), but it's diagnostic-only, never gates
+  like U-Boot's hard refusal does -- a deliberate, previously-made decision. Re-checked the round-40 log: this
+  diagnostic never fired once, meaning FSM was idle before every single command in that log, ruling out
+  "command issued while FSM unsettled" as the cause of the observed FIFO_ERROR reads.
+- **Missing entirely from production**: no equivalent of `bcm2835_transmit`'s leading SDHSTS check (round
+  41's check 7) exists in either `sdhost_read_block_once` or `sdhost_write_block_once` -- only in the new
+  diagnostic C ports. Not added to production this round (lower priority than the burst-poll fix; can be
+  added if the next real-HW round shows it's still needed).
+- **Confirmed NOT diverging**: `sdhost_wait_transfer_complete` matches real U-Boot's own unconditional
+  FSM-settle-then-return-0 behavior exactly. The "extra SDHSTS check" flagged in the 38th round as having no
+  real-U-Boot counterpart exists ONLY in the diagnostic C ports (`uboot_sdhost_write.c`), never in this
+  production function.
+
+Build clean (asm audit 0/0), QEMU PASS, no regressions. `phase4_milestone.py` still skipped this round.
+Awaiting the same real-HW retest already requested for round 41's diagnostic port -- this production fix
+means the READ side of the upcoming retest now has two independent, complementary sources of evidence: the
+diagnostic sweep's own new checks 5/6/7, AND the production path's own new early-exit behavior (which now
+governs the actual DharaFS traffic, not just blocks 2100-2107).

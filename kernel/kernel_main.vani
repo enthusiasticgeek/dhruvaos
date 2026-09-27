@@ -6596,13 +6596,28 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     let _ = sdhost_cmd_report_failure("CMD17 (READ_SINGLE_BLOCK)", status);
     return 4;
   }
-  let _ = sdhost_drain_fifo_to_buffer(buf, 128);
+  let drain_status: i64 = sdhost_drain_fifo_to_buffer(buf, 128);
   let edm_after_pio: u32 = sd_mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
   let errs: u32 = sd_mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = sd_mmio_write_u32(sdhsts, errs);
   if (status & sdcmd_new_flag) != (0 as u32) {
     return 1;
+  }
+  if drain_status != 0 {
+    // 41st SD round (2026-09-27): sdhost_drain_fifo_to_buffer_impl now
+    // has a production-path counterpart to round 41's read-side C
+    // port's own check 5 (real U-Boot's bcm2835_transfer_block_pio FSM
+    // sanity check inside the burst-readiness poll) -- this fires only
+    // when it caught a genuine mid-burst FSM/SDHSTS error and bailed
+    // out early, instead of the old behavior of retrying 400 times and
+    // then silently forcing through whatever stale word happened to be
+    // in the FIFO. New, distinct return code (5) so this is never
+    // confused with the pre-existing wait_status(2)/errs(3) paths below.
+    let _ = uart_puts("SD DIAG: read drain bailed early (mid-burst FSM/SDHSTS error) SDEDM=0x");
+    let _ = uart_put_hex32(edm_after_pio);
+    let _ = uart_puts("\n");
+    return 5;
   }
   if wait_status != 0 {
     // Only printed on the actual failure path -- this function runs
