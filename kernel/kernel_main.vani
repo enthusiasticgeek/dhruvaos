@@ -5776,11 +5776,12 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     // 'tran' card state ACMD6 does, doubles as a direct test of
     // whether the problem is ACMD6-specific or upstream of any app
     // command issued at this point (the "NOT tran" warning this file
-    // has printed on every real-HW log so far). A negative return
-    // (-1) means ACMD51 itself failed/timed out/wedged -- attempt
-    // ACMD6 anyway for comparison, but do NOT trust a "SCR says no
-    // 4-bit support" answer we never actually got.
-    let scr_result: i64 = sd_read_scr(rca);
+    // has printed on every real-HW log so far). Its own return value
+    // is no longer used to gate the ACMD6 success decision below (see
+    // the 40th round's own comment there) -- kept here purely for its
+    // diagnostic side effects (the SCR dump print, and exercising the
+    // 'tran'-state comparison this comment already describes).
+    let _ = sd_read_scr(rca);
     let acmd6_cmd55_status: u32 = sdhost_cmd(55 as u32, rca);
     let acmd6_cmd55_timed_out: i64 = sdhost_cmd_timed_out(acmd6_cmd55_status);
     let acmd6_cmd55_failed: i64 = sdhost_cmd_failed(acmd6_cmd55_status);
@@ -5807,11 +5808,37 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts(" SDHSTS=0x");
     let _ = uart_put_hex32(sd_mmio_read_u32(SDHSTS));
     let _ = uart_puts("\n");
-    if (acmd6_cmd55_timed_out == 1) || (acmd6_timed_out == 1) || (acmd6_cmd55_failed == 1) || (acmd6_failed == 1) || (scr_result != 1) {
-      let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH) failed/timed out, or SCR didn't confirm 4-bit -- staying 1-bit\n");
+    // 40th SD round (2026-09-27): dropped the `|| (scr_result != 1)`
+    // clause that used to be here. Real-HW evidence
+    // (picocom_20260927_142303.log vs picocom_20260927_142746.log,
+    // same card): real U-Boot's own ACMD6 (SET_BUS_WIDTH=4-bit)
+    // succeeds cleanly on this card (resp0=0x00000920, no error).
+    // DhruvaOS's OWN ACMD6 gets the IDENTICAL response
+    // (R1=0x00000920, timed_out=0, failed=0) -- ACMD6 itself has never
+    // been the problem. What overruled it was scr_result: sd_read_scr
+    // (ACMD51, above) captures a corrupted SCR on this driver (byte[1]
+    // reads 0x00, which no real card's SCR can ever report -- bit 0 of
+    // that byte, "1-bit support", is mandatory-always-1 by spec; the
+    // 0x35 that belongs there is found shifted three bytes later in
+    // the captured buffer instead) -- a pre-existing, still-open PIO/
+    // FIFO corruption this project's own 30th round already flagged as
+    // "identical in shape to the original CMD24 write corruption", and
+    // a fix attempted then (matching U-Boot's own burst-read gate) did
+    // not resolve it. Real U-Boot's own sd_get_capabilities/
+    // sd_select_bus_width (drivers/mmc/mmc.c) uses the SCR to decide
+    // WHETHER to attempt ACMD6 at all -- it does not re-check the SCR
+    // AFTER a successful ACMD6 to decide whether to trust it. This
+    // driver's own SCR read already runs first (sd_read_scr, above),
+    // matching that same gating intent -- folding scr_result into the
+    // POST-ACMD6 success decision as well was the actual bug: it let
+    // known-corrupted diagnostic data override a genuinely successful
+    // command result. Trusting ACMD6's own success/failure signals
+    // directly now matches real U-Boot's actual behavior exactly.
+    if (acmd6_cmd55_timed_out == 1) || (acmd6_timed_out == 1) || (acmd6_cmd55_failed == 1) || (acmd6_failed == 1) {
+      let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH) failed/timed out -- staying 1-bit\n");
       let _ = sd_state_set_is_4bit(0);
     } else {
-      let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH=4-bit) accepted, SCR confirms support\n");
+      let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH=4-bit) accepted -- switching to 4-bit\n");
       let _ = sd_state_set_is_4bit(1);
     }
   } else {

@@ -10983,3 +10983,69 @@ comparison against real U-Boot's own successful write (round 24, same block 2100
 apples-to-apples comparison in a way it never was before (DhruvaOS was never actually touching block 2100
 at all until this fix landed). No further code change attempted this round; next step is a fresh,
 targeted investigation of the CRC16 failure now that addressing is confirmed correct.
+
+## 40th SD round (2026-09-27): SDHCFG/SDCDIV/SDTOUT compared -- real U-Boot's ACMD6 (4-bit) succeeds where DhruvaOS's own logic wrongly overrules an identical success
+
+Extended both real U-Boot's and DhruvaOS's own diagnostic dumps with three registers never yet compared:
+SDHCFG (bus config), SDCDIV (clock divisor), SDTOUT (command timeout). First attempt mirrored the
+per-checkpoint dump on both sides -- reproducibly broke `phase4_milestone.py`'s unrelated `tcprtx` test
+under QEMU (confirmed deterministic across two runs), the same UART-print-timing-confound class already
+documented on `dhruva_sd_diag_dump`. Reverted that on DhruvaOS's side; captured a single one-time sample
+at block 2100 instead (these three registers don't change across the sweep).
+
+Direct comparison at the matching checkpoint, real HW, same card (`picocom_20260927_142303.log` = real
+U-Boot, `picocom_20260927_142746.log` = DhruvaOS):
+
+```
+Real U-Boot:  SDHCFG=0x0000040E  SDCDIV=0x00000003  SDTOUT=0x017D7840
+DhruvaOS:     SDHCFG=0x0000040A  SDCDIV=0x000000F8  SDTOUT=0x0007A120
+```
+
+SDCDIV/SDTOUT differ only because of the already-known, deliberate 1MHz-vs-50MHz data-transfer clock
+choice (SDTOUT = clock/2 in both cases -- 500ms in real time either way, proportionally consistent, not a
+bug). **SDHCFG differs by exactly bit 2 (`SDHCFG_WIDE_EXT_BUS`)** -- real U-Boot has it set, DhruvaOS
+does not, because DhruvaOS's own ACMD6 (SET_BUS_WIDTH=4-bit) attempt is logged as "failed... staying
+1-bit".
+
+Traced the real U-Boot log's own command sequence in full: `cmd=55 arg=<RCA>` then `cmd=6 arg=0x00000002`
+(this IS the real ACMD6 -- SD's plain CMD6 is SWITCH_FUNC, a different command that also appears in this
+same log with a different argument shape) returns `resp0=0x00000920 CURRENT_STATE=4 (tran)` -- a clean,
+successful 4-bit switch, on this exact card. **DhruvaOS's own ACMD6 gets the IDENTICAL response**:
+`ACMD6 status=0x00000006 timed_out=0 failed=0 R1=0x00000920` -- ACMD6 itself has never been the problem.
+
+Traced why DhruvaOS still concluded failure: `sdhost_init_at_speed`'s own gating condition was
+`(acmd6_cmd55_timed_out==1) || (acmd6_timed_out==1) || (acmd6_cmd55_failed==1) || (acmd6_failed==1) ||
+(scr_result != 1)` -- all four ACMD6-derived checks were false (clean success), but `scr_result` (from a
+separate `sd_read_scr` call) was 0, alone forcing the "failed" branch. Checked why: `sd_read_scr` captured
+SCR bytes `02 00 00 00 35 02 00 00`. Verified `sd_scr_dump_and_check_4bit`'s own bit-mask
+(`boot/sdcard_state.S`, checking bit 18 of the big-endian-reassembled first word) against the real SD
+Physical Layer spec's SD_BUS_WIDTHS field (bits 51:48, i.e. byte[1]'s low nibble) -- the mask is
+mathematically correct. The captured byte[1]=0x00 is what's wrong: per spec, SD_BUS_WIDTHS bit 0
+("1-bit support") is mandatory-always-1, so no real card's SCR can ever report byte[1]=0x00. The `0x35`
+that belongs there (low nibble 0101 = 1-bit AND 4-bit both supported, consistent with real U-Boot's own
+successful switch) is instead sitting three bytes later in the captured buffer -- a clean shift, not
+random noise. **This project's own 30th-round comment already flagged this exact corruption signature as
+"identical in shape to the original CMD24 write corruption"**, and a fix attempted then (matching real
+U-Boot's own burst-read gate in `sd_scr_drain_diag`) did not resolve it -- this fresh log shows the
+identical corrupted bytes, deterministically, across all 4 captures in this same boot.
+
+**Fixed** (per user's explicit direction after presenting both options): real U-Boot's own
+`sd_get_capabilities`/`sd_select_bus_width` uses the SCR to decide whether to *attempt* ACMD6 at all -- it
+does not re-check the SCR *after* a successful ACMD6 to decide whether to trust the result. DhruvaOS's own
+code already reads SCR first (matching that gating intent) but ALSO folded `scr_result` into the
+post-ACMD6 success decision -- letting known-corrupted diagnostic data override a genuinely successful
+command. Dropped the `|| (scr_result != 1)` clause; ACMD6's own success/failure signals are now trusted
+directly, matching real U-Boot's actual behavior exactly. `sd_read_scr`'s own call is kept (still needed
+for its diagnostic side effects and the pre-ACMD6 'tran'-state check), its return value simply isn't used
+to override ACMD6 anymore.
+
+This does not by itself resolve the CRC16 write failures (a different, not-yet-explained symptom), but it
+is the first real, root-caused *logic* bug found in this driver since the 39th round's AAPCS fix, and
+switching to genuine 4-bit mode is a real behavior change worth testing on its own merits -- plus the
+documented SCR/CMD24 corruption-signature connection remains an open, promising lead for the CRC16
+investigation specifically, deliberately not chased this round per the user's own choice to fix the ACMD6
+gating logic first.
+
+Verified: build clean (asm_safety_audit.py gate 0 DEFINITE/0 REVIEW), qemu_run.py PASS.
+phase4_milestone.py skipped this round per explicit instruction to speed up SD debugging iteration. Not
+yet flashed to the SD card; awaiting real-HW retest.
