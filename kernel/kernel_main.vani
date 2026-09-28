@@ -11156,6 +11156,24 @@ fn dharafs_permissions_self_test() -> i64 {
   let _ = dharafs_user_set(0 as u32, 0 as u32); // start as root, the default
 
   let _ = dharafs_append("/perm/rootfile", "secret"); // root, default mode 0o644
+  // FIX (2026-09-28, real Pi 1B hardware): dharafs_append's own "preserve
+  // existing owner/mode on overwrite" convenience (see its header comment)
+  // means the line above does NOT actually reset /perm/rootfile to 0o644
+  // if this exact fixed path already has a record from an earlier boot on
+  // a real, persistent SD card -- QEMU's own fresh-image-per-run has no
+  // such history, so this was invisible there. This self-test's own LAST
+  // step chmods this same file to 0o666 (world-writable) to exercise the
+  // "chmod loosens permission" case -- on real hardware that mode change
+  // survives to the NEXT boot, silently poisoning every subsequent run's
+  // "should be denied" assertions below (0o666's other-write bit stays
+  // set, so the denial checks correctly reflect the ACTUAL, now-loosened
+  // permissions and simply succeed -- not a bug in the permission-check
+  // logic itself, confirmed live via this round's own fail_bits=0x6
+  // capture: bit1/bit2, both routed through the exact same dharafs_check_
+  // permission call). Force the mode back to the expected starting point
+  // here, while still root (who bypasses every check), so this test is
+  // self-healing regardless of what any prior real-HW boot left behind.
+  let _ = dharafs_chmod("/perm/rootfile", dharafs_default_mode());
 
   let path1: Str = "/perm/rootfile";
   let path1_len: i64 = str_len_bytes(path1);
