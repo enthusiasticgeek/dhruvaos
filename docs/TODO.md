@@ -11847,3 +11847,33 @@ safety-scoped one subsystem at a time), then 6 separate "new driver" tasks for t
 implemented yet (I2C/SPI/CAN/RS485/audio/LoRa) -- explicitly flagged as their own multi-round driver-bring-up
 epics, not DHDL-layer work, each just expected to adopt the DHDL convention from its first commit rather than
 retrofit later. See `docs/DHDL_ROADMAP.md` for the full design and phased plan.
+
+### DHDL Phase 0 DONE: generic subsystem registration + dhdl list/query (task #294)
+
+Same day, following the roadmap scoping above -- implemented as a deliberately small effort per explicit
+instruction. New `boot/dhdl_state.S`: an 8-slot fixed table of `(id: u32, fn pointer)` pairs plus
+`dhdl_register`/`dhdl_call_by_id`/`dhdl_list_count`/`dhdl_list_id_at`. Deliberately NOT a vani-level array of
+fn-typed values -- the only existing precedent for passing a function value (`task_create`'s own `entry_fn`
+parameter) passes exactly one per call at fixed sites; there's no established pattern for a vani-level array
+of different fn values indexed and called at runtime, so real storage/indirect dispatch lives in hand-written
+assembly, the same way the scheduler's own task table already does. `dhdl_call_by_id` tail-calls the stored
+fn (`lr` restored before the `bx`), so the target's own return transparently becomes the caller's. Subsystem
+NAMES deliberately stay OUT of the `.S` file -- id<->name mapping lives in `kernel_main.vani` via
+`shell_word_matches`, the same tool every other shell subcommand already uses.
+
+Wired up against exactly one real subsystem this round (log-level, `/config/loglevel`) rather than a
+throwaway placeholder -- `log_level_describe()` reads `log_state_get_mask()` fresh at query time, `dhdl_init()`
+registers it once after `log_level_init()`, `shell_dispatch_dhdl` adds `dhdl list`/`dhdl query <name>` to the
+shell's own command chain.
+
+Self-caught one real finding via the asm safety audit before ever reaching QEMU: `#[stack_cost(bytes=8)]` for
+`dhdl_register` understated its real `push{r4,r5,lr}` cost (12 bytes) -- fixed to match reality.
+
+Verified end-to-end, not just that it compiles: `dhdl list` shows the 1 registered subsystem; `dhdl query
+loglevel` prints live state through the full register->indirect-call->describe-fn path; `dhdl query bogus`
+correctly reports unknown-subsystem. Confirmed the query reads genuinely LIVE state, not the config file:
+querying right after `write /config/loglevel 12` in the SAME boot still shows the old mask (config is
+boot-time-only, by design), while a real reboot against the same persisted SD image correctly shows the new
+mask (`0x0000000C`, DEMO GC) -- the full config+query round trip is real, not each half tested in isolation.
+asm audit 0/0, `qemu_run.py` clean, full DharaFS/GPIO self-test regression clean under a real-SD-image QEMU
+run. Commit `6a42efc`, local-only (push window closed). Task #294 marked complete; #295-304 remain pending.
