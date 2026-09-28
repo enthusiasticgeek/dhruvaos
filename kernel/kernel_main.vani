@@ -2216,6 +2216,32 @@ extern "C" fn governor_get_last_applied_mhz() -> i64;
 extern "C" fn governor_set_last_applied_mhz(mhz: i64) -> i64;
 #[stack_cost(bytes=28)]
 extern "C" fn governor_apply_freq_mhz(mhz: i64) -> i64;
+// Round 2026-09-28 (log-level configurability): UART log verbosity
+// mask (boot/log_state.S). Bit layout, one bit per category:
+//   bit0 (1)  LOG_CAT_SELFTEST -- reserved, not yet wired to any real
+//             call site; boot self-test PASS/FAIL verdicts stay
+//             unconditionally visible for now (this project's own
+//             primary real-HW debugging tool -- deliberately not put
+//             at risk this round).
+//   bit1 (2)  LOG_CAT_DIAG -- reserved, not yet wired up; the verbose
+//             per-register diagnostic dumps (SD DIAG/GPIO DIAG/WCET
+//             DIAG/BOOT DIAG/...) are a separate, larger retrofit left
+//             for a future round.
+//   bit2 (4)  LOG_CAT_DEMO -- wired up this round: the continuous
+//             background demo-task chatter (idle/HIGH/MEDIUM/LOW/
+//             MUTEX-LOW/MUTEX-HIGH/GOVERNOR) that runs for the entire
+//             life of the boot, the actual "clobbers user experience"
+//             complaint this feature exists to address.
+//   bit3 (8)  LOG_CAT_GC -- wired up this round: task_e/GC's own
+//             per-pass compaction/DHCP-poll prints, equally continuous.
+// Read fresh via log_state_get_mask() at every gated site rather than
+// cached in a local, so a future runtime `loglevel` shell command can
+// take effect immediately without needing each task to re-read it on
+// its own next wake first.
+#[stack_cost(bytes=1)]
+extern "C" fn log_state_get_mask() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn log_state_set_mask(mask: u32) -> u32;
 // Round 71: HDMI framebuffer -- generic VideoCore mailbox property-tag
 // transport (boot/fb_state.S), generalized from governor_apply_freq_
 // mhz's own already-verified protocol.
@@ -23791,9 +23817,11 @@ fn dwc2_probe_device0() -> i64 {
 #[no_heap]
 #[wcet(cycles=50000)]
 fn task_a_wake_body() -> i64 {
-  let _ = uart_puts_bounded("HIGH: waking, requesting resource\n");
-  let _ = uart_puts_bounded("HIGH: acquired resource\n");
-  let _ = uart_puts_bounded("HIGH: released resource\n");
+  if (log_state_get_mask() & (4 as u32)) != (0 as u32) { // LOG_CAT_DEMO
+    let _ = uart_puts_bounded("HIGH: waking, requesting resource\n");
+    let _ = uart_puts_bounded("HIGH: acquired resource\n");
+    let _ = uart_puts_bounded("HIGH: released resource\n");
+  }
   return 0;
 }
 
@@ -23827,7 +23855,9 @@ fn task_a() -> i64 {
 #[no_heap]
 #[wcet(cycles=20000)]
 fn task_b_wake_body() -> i64 {
-  let _ = uart_puts_bounded("MEDIUM: running (never touches the resource)\n");
+  if (log_state_get_mask() & (4 as u32)) != (0 as u32) { // LOG_CAT_DEMO
+    let _ = uart_puts_bounded("MEDIUM: running (never touches the resource)\n");
+  }
   return 0;
 }
 
@@ -23889,7 +23919,10 @@ fn task_b() -> i64 {
 fn task_c() -> i64 {
   while true {
     let _ = dhruva_prio_lock(0);
-    let _ = uart_puts("LOW: locked, entering critical section\n");
+    let log_demo: i64 = if (log_state_get_mask() & (4 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_DEMO
+    if log_demo == 1 {
+      let _ = uart_puts("LOW: locked, entering critical section\n");
+    }
     // ROUND 2026-09-20 (task #280): fault-injection check -- see
     // fault_inject_state.S's own header comment ("stuckceiling:") for
     // the full design. Deliberately checked AFTER the real lock is
@@ -23898,15 +23931,21 @@ fn task_c() -> i64 {
     // genuinely > 0, not a simulated version of that state.
     let stuck_ceiling_ticks: u32 = fault_stuck_ceiling_ticks_take();
     if stuck_ceiling_ticks > (0 as u32) {
-      let _ = uart_puts("LOW: fault-injected stuck spin WHILE HOLDING CEILING LOCK, ");
-      let _ = uart_put_i64(stuck_ceiling_ticks as i64);
-      let _ = uart_puts(" ticks\n");
+      if log_demo == 1 {
+        let _ = uart_puts("LOW: fault-injected stuck spin WHILE HOLDING CEILING LOCK, ");
+        let _ = uart_put_i64(stuck_ceiling_ticks as i64);
+        let _ = uart_puts(" ticks\n");
+      }
       let _ = task_custom_demo_stuck_spin(stuck_ceiling_ticks);
-      let _ = uart_puts("LOW: stuck spin finished, unlocking normally\n");
+      if log_demo == 1 {
+        let _ = uart_puts("LOW: stuck spin finished, unlocking normally\n");
+      }
     } else {
       let _ = delay(161000);
     }
-    let _ = uart_puts("LOW: leaving critical section, unlocking\n");
+    if log_demo == 1 {
+      let _ = uart_puts("LOW: leaving critical section, unlocking\n");
+    }
     let _ = dhruva_prio_unlock(2);
     let _ = task_sleep_ticks(2);
   }
@@ -24090,13 +24129,15 @@ fn governor_step() -> i64 {
     if status == 0 {
       let _ = governor_set_last_applied_mhz(desired);
     }
-    let _ = uart_puts_bounded("GOVERNOR: step ready=");
-    let _ = uart_put_i64_bounded(ready);
-    let _ = uart_puts_bounded(" desired_mhz=");
-    let _ = uart_put_i64_bounded(desired);
-    let _ = uart_puts_bounded(" apply_status=");
-    let _ = uart_put_i64_bounded(status);
-    let _ = uart_puts_bounded("\n");
+    if (log_state_get_mask() & (4 as u32)) != (0 as u32) { // LOG_CAT_DEMO
+      let _ = uart_puts_bounded("GOVERNOR: step ready=");
+      let _ = uart_put_i64_bounded(ready);
+      let _ = uart_puts_bounded(" desired_mhz=");
+      let _ = uart_put_i64_bounded(desired);
+      let _ = uart_puts_bounded(" apply_status=");
+      let _ = uart_put_i64_bounded(status);
+      let _ = uart_puts_bounded("\n");
+    }
   }
   return 0;
 }
@@ -24385,7 +24426,9 @@ fn uart_clock_governor_cross_check_self_test() -> i64 {
 #[no_heap]
 #[wcet(cycles=100000)]
 fn task_d_wake_body() -> i64 {
-  let _ = uart_puts_bounded("idle\n");
+  if (log_state_get_mask() & (4 as u32)) != (0 as u32) { // LOG_CAT_DEMO
+    let _ = uart_puts_bounded("idle\n");
+  }
   let _ = governor_step();
   let _ = cpu_wfi();
   return 0;
@@ -24529,22 +24572,29 @@ fn task_e() -> i64 {
     // continuous measurement across every real compaction pass for
     // the rest of this boot, not a one-shot self-test -- shows real
     // variance across a live boot instead of a single sample.
+    let gc_log: i64 = if (log_state_get_mask() & (8 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_GC
     let gc_dharafs_t0: u32 = mmio_read_u32(TIMER_CLO);
-    let _ = uart_puts("GC: entering DharaFS critical section, eff_prio=");
-    let _ = uart_put_hex32(current_eff_prio());
-    let _ = uart_puts("\n");
+    if gc_log == 1 {
+      let _ = uart_puts("GC: entering DharaFS critical section, eff_prio=");
+      let _ = uart_put_hex32(current_eff_prio());
+      let _ = uart_puts("\n");
+    }
     let _ = dharafs_compact(compact_buf, compact_path_buf, compact_data_buf);
     let gc_mode_len: i64 = dharafs_read("/config/mode", gc_buf);
-    let _ = uart_puts("GC: compaction pass, /config/mode = \"");
-    let _ = dharafs_print_data(gc_buf, gc_mode_len);
-    let _ = uart_puts("\"\n");
+    if gc_log == 1 {
+      let _ = uart_puts("GC: compaction pass, /config/mode = \"");
+      let _ = dharafs_print_data(gc_buf, gc_mode_len);
+      let _ = uart_puts("\"\n");
+    }
     let gc_dharafs_t1: u32 = mmio_read_u32(TIMER_CLO);
     let _ = dhruva_prio_unlock(3);
-    let _ = uart_puts("GC: left DharaFS critical section, eff_prio=");
-    let _ = uart_put_hex32(current_eff_prio());
-    let _ = uart_puts(" WCET DIAG: real critical-section duration=");
-    let _ = uart_put_i64((gc_dharafs_t1 - gc_dharafs_t0) as i64);
-    let _ = uart_puts("us\n");
+    if gc_log == 1 {
+      let _ = uart_puts("GC: left DharaFS critical section, eff_prio=");
+      let _ = uart_put_hex32(current_eff_prio());
+      let _ = uart_puts(" WCET DIAG: real critical-section duration=");
+      let _ = uart_put_i64((gc_dharafs_t1 - gc_dharafs_t0) as i64);
+      let _ = uart_puts("us\n");
+    }
     // Round 182, re-tested after fixing the real root cause (DWC2
     // channel-0 CHENA wedge, see dwc2_net_bulk_in's own comment): with
     // that bug fixed, task_e's own dhcp_client_poll and sshd's own
@@ -24571,9 +24621,11 @@ fn task_e() -> i64 {
     let _ = dhcp_client_poll(dhcp_my_mac);
     let _ = dhruva_prio_unlock(3);
     let gc_dhcp_t1: u32 = mmio_read_u32(TIMER_CLO);
-    let _ = uart_puts("GC: DHCP poll critical section WCET DIAG: real duration=");
-    let _ = uart_put_i64((gc_dhcp_t1 - gc_dhcp_t0) as i64);
-    let _ = uart_puts("us\n");
+    if gc_log == 1 {
+      let _ = uart_puts("GC: DHCP poll critical section WCET DIAG: real duration=");
+      let _ = uart_put_i64((gc_dhcp_t1 - gc_dhcp_t0) as i64);
+      let _ = uart_puts("us\n");
+    }
   }
   return 0;
 }
@@ -24662,6 +24714,32 @@ fn shell_parse_decimal(buf: mut ref i64, start: i64, end: i64) -> i64 {
     i = i + 1;
   }
   return value;
+}
+
+// Round 2026-09-28 (log-level configurability): reads /config/loglevel
+// (a single decimal number, the LOG_CAT_* bitmask -- see log_state_get_
+// mask's own extern comment for the current bit layout) and applies it
+// via log_state_set_mask. Called once from kernel_main, right after
+// dharafs_init -- same placement as every other /config/ consumer this
+// project already has (the /config/mode demo). Missing file, empty
+// file, or content that doesn't parse as a plain decimal number all
+// fall through to the same default: leave the mask at its .bss zero
+// default (everything LOG_CAT_DEMO/LOG_CAT_GC-gated stays quiet) --
+// reusing shell_parse_decimal's own generic buffer-based parser
+// (nothing about it is UART-shell-specific; it just reads digits out
+// of a buffer between two offsets) rather than writing a second one.
+fn log_level_init() -> i64 {
+  let buf: mut ref i64 = dhruva_alloc_bytes(16);
+  let read_len: i64 = dharafs_read("/config/loglevel", buf);
+  if read_len <= 0 {
+    return 0;
+  }
+  let parsed: i64 = shell_parse_decimal(buf, 0, read_len);
+  if parsed < 0 {
+    return 0;
+  }
+  let _ = log_state_set_mask(parsed as u32);
+  return 0;
 }
 
 // Task #10: minimal arithmetic expression evaluator -- +, -, *, /,
@@ -28548,15 +28626,22 @@ fn task_custom_demo() -> i64 {
 #[no_heap]
 #[wcet(cycles=100000)]
 fn task_mutex_demo_low_wake_body() -> i64 {
-  let _ = uart_puts_bounded("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
+  let mlow_log: i64 = if (log_state_get_mask() & (4 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_DEMO
+  if mlow_log == 1 {
+    let _ = uart_puts_bounded("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
+  }
   let _ = dhruva_mutex_lock(0 as u32);
-  let _ = uart_puts_bounded("MUTEX-LOW: holding demo mutex, now sleeping 5 ticks while still holding it\n");
+  if mlow_log == 1 {
+    let _ = uart_puts_bounded("MUTEX-LOW: holding demo mutex, now sleeping 5 ticks while still holding it\n");
+  }
   let _ = task_sleep_ticks(5);
   let boosted: u32 = current_eff_prio();
-  let _ = uart_puts_bounded("MUTEX-LOW: woke up still holding demo mutex, eff_prio now=");
-  let _ = uart_put_i64_bounded(boosted as i64);
-  let _ = uart_puts_bounded("\n");
-  let _ = uart_puts_bounded("MUTEX-LOW: releasing demo mutex\n");
+  if mlow_log == 1 {
+    let _ = uart_puts_bounded("MUTEX-LOW: woke up still holding demo mutex, eff_prio now=");
+    let _ = uart_put_i64_bounded(boosted as i64);
+    let _ = uart_puts_bounded("\n");
+    let _ = uart_puts_bounded("MUTEX-LOW: releasing demo mutex\n");
+  }
   // ROUND 2026-09-18 (task #240): record TIMER_CLO right before the
   // handoff -- HIGH (already blocked waiting on this exact lock, per
   // this function's own pigeonhole-guaranteed-contention comment
@@ -28586,13 +28671,20 @@ fn task_mutex_demo_low_wake_body() -> i64 {
 // case the way it correctly does for a ceiling holder).
 #[no_heap]
 fn task_mutex_demo_low_stuck_body(stuck_ticks: u32) -> i64 {
-  let _ = uart_puts("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
+  let mlow_stuck_log: i64 = if (log_state_get_mask() & (4 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_DEMO
+  if mlow_stuck_log == 1 {
+    let _ = uart_puts("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
+  }
   let _ = dhruva_mutex_lock(0 as u32);
-  let _ = uart_puts("MUTEX-LOW: fault-injected stuck spin WHILE HOLDING DEMO MUTEX, ");
-  let _ = uart_put_i64(stuck_ticks as i64);
-  let _ = uart_puts(" ticks\n");
+  if mlow_stuck_log == 1 {
+    let _ = uart_puts("MUTEX-LOW: fault-injected stuck spin WHILE HOLDING DEMO MUTEX, ");
+    let _ = uart_put_i64(stuck_ticks as i64);
+    let _ = uart_puts(" ticks\n");
+  }
   let _ = task_custom_demo_stuck_spin(stuck_ticks);
-  let _ = uart_puts("MUTEX-LOW: stuck spin finished, releasing demo mutex\n");
+  if mlow_stuck_log == 1 {
+    let _ = uart_puts("MUTEX-LOW: stuck spin finished, releasing demo mutex\n");
+  }
   let _ = mutex_handoff_t0_set(mmio_read_u32(TIMER_CLO));
   let _ = dhruva_mutex_unlock(0 as u32);
   return 0;
@@ -28613,10 +28705,20 @@ fn task_mutex_demo_low() -> i64 {
   return 0;
 }
 
+// Round 2026-09-28 (log-level configurability): bumped 102161->102300
+// -- the mhigh_log gating added around this function's own prints
+// pushed the static estimate to 102204 (log_state_get_mask() read +
+// branch overhead), a real, small, one-time cost of this round's own
+// change, not a regression in the underlying mutex-handoff logic
+// itself. Rounded up for a little headroom rather than matching the
+// reported figure exactly.
 #[no_heap]
-#[wcet(cycles=102161)]
+#[wcet(cycles=102300)]
 fn task_mutex_demo_high_wake_body() -> i64 {
-  let _ = uart_puts_bounded("MUTEX-HIGH: requesting demo mutex\n");
+  let mhigh_log: i64 = if (log_state_get_mask() & (4 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_DEMO
+  if mhigh_log == 1 {
+    let _ = uart_puts_bounded("MUTEX-HIGH: requesting demo mutex\n");
+  }
   let _ = dhruva_mutex_lock(0 as u32);
   // ROUND 2026-09-18 (task #240): the instant this returns is the
   // first instruction this task runs after being switched back in --
@@ -28646,15 +28748,21 @@ fn task_mutex_demo_high_wake_body() -> i64 {
     if latency > worst {
       let _ = mutex_handoff_worst_us_set(latency);
     }
-    let _ = uart_puts_bounded("MUTEX-HIGH: unlock-to-running latency=");
-    let _ = uart_put_i64_bounded(latency as i64);
-    let _ = uart_puts_bounded("us (worst so far=");
-    let _ = uart_put_i64_bounded(mutex_handoff_worst_us_get() as i64);
-    let _ = uart_puts_bounded("us)\n");
+    if mhigh_log == 1 {
+      let _ = uart_puts_bounded("MUTEX-HIGH: unlock-to-running latency=");
+      let _ = uart_put_i64_bounded(latency as i64);
+      let _ = uart_puts_bounded("us (worst so far=");
+      let _ = uart_put_i64_bounded(mutex_handoff_worst_us_get() as i64);
+      let _ = uart_puts_bounded("us)\n");
+    }
   }
-  let _ = uart_puts_bounded("MUTEX-HIGH: acquired demo mutex\n");
+  if mhigh_log == 1 {
+    let _ = uart_puts_bounded("MUTEX-HIGH: acquired demo mutex\n");
+  }
   let _ = dhruva_mutex_unlock(0 as u32);
-  let _ = uart_puts_bounded("MUTEX-HIGH: released demo mutex\n");
+  if mhigh_log == 1 {
+    let _ = uart_puts_bounded("MUTEX-HIGH: released demo mutex\n");
+  }
   return 0;
 }
 
@@ -39097,6 +39205,7 @@ fn kernel_main() -> i64 {
   // per path (not the first, not a mix) and an unrelated path is
   // unaffected.
   let _ = dharafs_init();
+  let _ = log_level_init();
   let _ = crashlog_boot_increment();
 
   // Report what recovery alone found, BEFORE any fresh writes this
