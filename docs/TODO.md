@@ -11639,3 +11639,41 @@ blind-timing-fragility baseline this file has recorded many times before (unrela
 Zero new regressions. `python3 test/qemu_run.py` also confirmed clean (PASS marker, full crypto/WPA2 suite
 green). Real-hardware retest of this fix, alongside the round-42 SD fix, deferred to the next real-HW
 session as instructed.
+
+### 43rd SD round follow-up: real-HW retest exposed a second, real-HW-only bug in the same self-test
+
+`picocom_20260928_070909.log`. `kernel.img` size/mtime on the card confirmed exactly matches the round-43
+build (2979664 bytes, built 07:08, one minute before this boot) -- this was a genuine retest of the fix
+above, not a stale binary. The round-42 SD fixes held (zero read errs, zero forced-fallbacks, 8-block
+sweep `any_fail=0`); `dharafs_compact resumes across multiple bounded calls...` still FAILed, and
+`permission model...` newly FAILed too.
+
+**Root cause of the still-failing compact self-test**: it assumed it always starts from `resume_block==0`
+-- true on every QEMU run (the log is fresh each boot, so kernel_main's own small "task #5 verification"
+`dharafs_compact()` call finishes in a single 8-block budget, log_start moving 1->8 in one shot per this
+file's own earlier note). On the real card, the log has accumulated to 112 blocks (`next_block=0x70`)
+across many prior boots with log_start stuck at 1 the whole time (compaction has apparently never once
+converged there) -- so that same task-5 call can't finish in 8 blocks, leaves `resume_block=9`/
+`pass_target=0x70` (round 43's own frozen target) sitting in RAM, and the resumable self-test then
+unknowingly inherits and tries to finish that unrelated backlog within its own 10-call budget (sized only
+for the 20 blocks it's about to add) -- confirmed by the math: 9 -> 17 -> ... over 10 calls reaches only
+~81, nowhere near 112, so `resume_block` is still nonzero when the self-test's own loop gives up. This
+also explains line 200 of that log verbatim: `compact log_start 00000001 -> 00000001, next_block
+00000070 -> 00000070` -- that lone task-5 call genuinely did nothing (no live record among the first 8
+blocks it happened to scan).
+
+**Fix**: `dharafs_compact_resumable_self_test()` now drains any already-in-progress pass (bounded at 500
+calls, i.e. up to 4000 blocks of pre-existing backlog) BEFORE writing its own 20 records and starting its
+measurement -- guarantees it always begins from a genuinely clean slate regardless of what ran earlier in
+boot, matching what QEMU's fresh-log case already did by accident. Verified: rebuilt (asm audit 0/0),
+`phase4_milestone.py`'s real-SD QEMU run still shows all 6 DharaFS self-tests PASS (drain loop is a no-op
+there, 0 iterations, since that earlier call already finishes cleanly under QEMU) -- zero regression.
+`qemu_run.py` also clean. Real-HW retest of THIS fix not yet done -- next real-HW session.
+
+**Separate, not-yet-explained finding**: `permission model (owner/group/other rwx, root bypass, chmod)...`
+also FAILed in this same log, for the first time (it was one of the 5 that PASSed cleanly in round 42's
+own real-HW retest). Not yet root-caused. Leading hypothesis: a cascading effect of the compact self-test
+above leaving DharaFS in a genuinely incomplete state (an active, unfinished pass, or a real transient SD
+read/write hiccup during it) right before this test runs immediately afterward -- if so, the drain fix
+above may clear it as a side effect, since it stops any pass from bleeding into whatever self-test runs
+next. Not independently confirmed; flagged for the next real-HW retest rather than guessed at further.

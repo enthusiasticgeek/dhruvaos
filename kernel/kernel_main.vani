@@ -9082,16 +9082,43 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
 fn dharafs_compact_resumable_self_test() -> i64 {
   let ok: i64 = 1;
 
+  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let data_buf: mut ref i64 = dhruva_alloc_bytes(20480); // matches dharafs_file_max_len(), task #164
+
+  // 43rd SD round follow-up (real-HW retest, 2026-09-28): kernel_main's
+  // own earlier "task #5 verification" dharafs_compact() call assumes
+  // nothing about this self-test, and this self-test used to assume
+  // resume_block==0 on entry -- true on a fresh QEMU log (that earlier
+  // call's own small range finishes in a single 8-block budget), but
+  // FALSE on a real card whose log has accumulated well past one call's
+  // budget across many prior boots (never fully reclaimed, since GC's
+  // own periodic pass shares the exact same resume state and is under
+  // no obligation to finish a pass within any one boot either). This
+  // self-test would then unknowingly inherit and try to finish that
+  // UNRELATED, already-in-progress pass within its own 10-call budget
+  // -- sized only for the 20 blocks it's about to add below, not for
+  // whatever backlog already existed -- and run out of budget before
+  // ever reaching its own writes. Confirmed live: real-HW log showed
+  // the earlier call leave resume_block=9/pass_target=0x70 (112)
+  // behind on a log that had never once compacted across many boots,
+  // exactly the scenario this drain avoids. Draining first makes this
+  // self-test's own pass genuinely start from a clean slate regardless
+  // of what ran earlier in boot -- bounded generously (500 calls, i.e.
+  // up to 4000 blocks of pre-existing backlog) so a genuine non-
+  // progress bug still fails loudly instead of hanging boot forever.
+  let drain_calls: i64 = 0;
+  while (dharafs_compact_get_resume_block() != (0 as u32)) && (drain_calls < 500) {
+    let _ = dharafs_compact(buf, path_buf, data_buf);
+    drain_calls = drain_calls + 1;
+  }
+
   let writes: i64 = 0;
   while writes < 20 {
     let _ = dharafs_append("/compacttest/file", "x");
     writes = writes + 1;
   }
   let target_next_block: u32 = dharafs_state_get_next_block();
-
-  let buf: mut ref i64 = dhruva_alloc_bytes(512);
-  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
-  let data_buf: mut ref i64 = dhruva_alloc_bytes(20480); // matches dharafs_file_max_len(), task #164
 
   // First call: with >= 20 blocks of range and an 8-block budget, this
   // must NOT finish the whole pass in one call.
