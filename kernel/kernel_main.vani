@@ -11118,6 +11118,12 @@ fn dharafs_list_dir_classify(dir: Str, segment: Str) -> i64 {
 // (dharafs_chmod, for one, reuses both internally for its own purposes).
 fn dharafs_permissions_self_test() -> i64 {
   let ok: i64 = 1;
+  let fail_bits: i64 = 0; // real-HW diagnostic (2026-09-28): this test only
+                          // ever printed a single PASS/FAIL, giving no way
+                          // to tell which of its 8 checks failed on a real
+                          // card without adding prints and burning another
+                          // real-HW round trip. One bit per check, printed
+                          // below only if ok==0.
   let _ = dharafs_user_set(0 as u32, 0 as u32); // start as root, the default
 
   let _ = dharafs_append("/perm/rootfile", "secret"); // root, default mode 0o644
@@ -11138,6 +11144,7 @@ fn dharafs_permissions_self_test() -> i64 {
   let read_status: i64 = dharafs_read_raw_checked(path1_buf, path1_len, read_buf, 100 as u32, 100 as u32);
   if read_status < 0 {
     ok = 0;
+    fail_bits = fail_bits | (1 << 0);
   }
 
   // ...but 644 has no other-write bit, so writing is denied.
@@ -11152,12 +11159,14 @@ fn dharafs_permissions_self_test() -> i64 {
   let write_status: i64 = dharafs_write_raw_checked(path1_buf, path1_len, data1_buf, data1_len, 100 as u32, 100 as u32);
   if write_status != (0 - 2) {
     ok = 0;
+    fail_bits = fail_bits | (1 << 1);
   }
 
   // Deletion needs write permission too -- also denied.
   let del_status: i64 = dharafs_delete_raw_checked(path1_buf, path1_len, 100 as u32, 100 as u32);
   if del_status != (0 - 2) {
     ok = 0;
+    fail_bits = fail_bits | (1 << 2);
   }
 
   // A brand-new path has no existing owner to be denied by -- non-root
@@ -11183,14 +11192,17 @@ fn dharafs_permissions_self_test() -> i64 {
   let create_status: i64 = dharafs_write_raw_checked(path2_buf, path2_len, data2_buf, data2_len, 100 as u32, 100 as u32);
   if create_status != 0 {
     ok = 0;
+    fail_bits = fail_bits | (1 << 3);
   }
   let meta_check: mut ref i64 = dhruva_alloc_bytes(12);
   let stat_check: i64 = dharafs_stat("/perm/userfile", meta_check);
   if stat_check != 0 {
     ok = 0;
+    fail_bits = fail_bits | (1 << 4);
   }
   if buf_read_u32(meta_check, 0 as u32) != (100 as u32) {
     ok = 0;
+    fail_bits = fail_bits | (1 << 5);
   }
 
   // Root bypasses every check regardless of mode.
@@ -11210,6 +11222,7 @@ fn dharafs_permissions_self_test() -> i64 {
   let root_write_status: i64 = dharafs_write_raw_checked(path1_buf_r, path1_len, data1_buf_r, data1_len, 0 as u32, 0 as u32);
   if root_write_status != 0 {
     ok = 0;
+    fail_bits = fail_bits | (1 << 6);
   }
 
   // dharafs_chmod loosens rootfile to world-writable (0o666 = 438 decimal);
@@ -11231,6 +11244,7 @@ fn dharafs_permissions_self_test() -> i64 {
   let write_status2: i64 = dharafs_write_raw_checked(path1_buf2, path1_len, data1_buf2, data1_len, 100 as u32, 100 as u32);
   if write_status2 != 0 {
     ok = 0;
+    fail_bits = fail_bits | (1 << 7);
   }
 
   // Restore the default root context so later self-tests/the shell
@@ -11241,7 +11255,13 @@ fn dharafs_permissions_self_test() -> i64 {
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
-    let _ = uart_puts(" (FAIL)\n");
+    let _ = uart_puts(" (FAIL) fail_bits=0x");
+    let _ = uart_put_hex32(fail_bits as u32);
+    // bit0=other-read-allowed check bit1=other-write-denied(-2) bit2=
+    // other-delete-denied(-2) bit3=non-root-create-succeeds(0)
+    // bit4=stat_check==0 bit5=new-file-owner==requester(100)
+    // bit6=root-write-bypass(0) bit7=chmod-loosened-write-succeeds(0)
+    let _ = uart_puts(" (bit0=read bit1=write-denied bit2=delete-denied bit3=create bit4=stat bit5=owner bit6=root-bypass bit7=chmod-write)\n");
   }
   return 0;
 }
