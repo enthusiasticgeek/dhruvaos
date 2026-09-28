@@ -11592,3 +11592,50 @@ yet investigated -- a new, distinct thread if pursued.
 This closes the core 4-bit-mode reliability investigation that spanned rounds 37-42 of the SD wedge saga: the
 CRC16 write failure (round 40), the command-level wedge storm (round 42's WIDE_INT_BUS fix), and the
 FIFO_ERROR read failure (round 42's mask-restructuring fix) are all confirmed resolved on real hardware.
+
+### 43rd SD round: dharafs_compact non-convergent resume bug, fixed and verified entirely under QEMU
+
+Picked up the one item round 42 left open: `dharafs_compact resumes across multiple bounded calls for a log
+larger than its per-call budget (FAIL)`. Per this round's own explicit instruction, attempted (and succeeded
+at) a QEMU-only fix before the next real-HW session, deferring real-HW retest to later.
+
+**First finding, before any code change**: `test/qemu_run.py` has no SD `-drive` at all (long-documented,
+see this file's own many earlier notes on that harness limitation) -- every DharaFS self-test trivially FAILs
+under it regardless of any real bug, since CMD2 (ALL_SEND_CID) never succeeds with no card attached at all.
+The self-test's earlier "confirmed to reproduce cleanly and deterministically under QEMU" note (previous
+session) was true only in the sense that it always printed FAIL there -- not evidence of the specific
+DharaFS-level bug in question. Switched to `test/phase4_milestone.py`'s own QEMU invocation (real 64MB SD
+`-drive` image) to get a real repro, per this project's own established "phase4_milestone.py is the one that
+can actually exercise SD/DharaFS logic under QEMU" convention -- and the standing "skip phase4_milestone
+during active SD debug" policy no longer applies now that the SD wedge saga above is closed.
+
+**Root cause** (confirmed via temporary diagnostic prints of resume_block/log_start/failed after every call,
+removed once the bug was understood): `dharafs_compact()`'s own stopping point for a pass (`old_next_block`)
+used to be re-read fresh from `dharafs_state_get_next_block()` on every call, including resumed ones, on the
+theory (stated in the function's own prior comment) that "it only ever grows... so a resumed pass simply
+covers slightly more ground". True for external appends, but NOT for the pass's OWN carry-forward writes: a
+still-live record found during the scan gets re-appended to the log's tail, which lands INSIDE the window a
+resumed call's freshly-re-read stopping point now newly covers. The next call reaches that new location,
+finds the same record live again, and carries it forward again -- chasing a target that retreats by roughly
+one call's own budget every time. Confirmed live under `phase4_milestone.py`: `resume_block` advanced by
+exactly the 8-block per-call budget (0x10, 0x18, 0x20, ... 0x58) on all 10 calls of the self-test's own
+generous retry cap, never reaching 0, while `log_start` never moved off its starting value.
+
+**Fix**: freeze the pass's stopping point in a new persisted field, `dharafs_compact_pass_target`
+(`boot/dharafs_state.S`, same `.bss`-word-plus-accessor pattern as `dharafs_compact_resume_block`/`_failed`),
+the moment a fresh pass starts (`resume_block == 0`), and reuse that frozen value on every resumed call
+instead of re-reading `next_block`. A record carried forward past the frozen target during this pass is
+correctly left for the NEXT pass to find (it's a real, valid block within `[log_start, current_next_block)`
+by then) rather than re-chased within this one. Reset alongside `resume_block`/`failed` once a pass genuinely
+finishes. `kernel/kernel_main.vani`'s `dharafs_compact()` updated accordingly; the underlying carry-forward
+scan logic itself (re-checking "is this still the current latest copy" every time) is untouched.
+
+**Verified**: rebuilt (asm safety audit 0/0), re-ran under `phase4_milestone.py`'s real-SD-image QEMU
+invocation -- `resume_block` now converges to 0 on call 5 (0x08 -> 0x10 -> 0x18 -> 0x20 -> 0x28 -> 0x00),
+`log_start` jumps straight to the frozen target, and all 6 DharaFS boot self-tests now PASS (previously 5/6
+per round 42; this was the last one). Full `phase4_milestone.py` run: 13 PASS, 6 FAIL -- the 6 are
+`tcprtx`/`tlsecho`/`httpecho`/`mqttecho`/`ls`/`diagnose`, the long-documented, pre-existing `SETTLE_S`-class
+blind-timing-fragility baseline this file has recorded many times before (unrelated to DharaFS or this fix).
+Zero new regressions. `python3 test/qemu_run.py` also confirmed clean (PASS marker, full crypto/WPA2 suite
+green). Real-hardware retest of this fix, alongside the round-42 SD fix, deferred to the next real-HW
+session as instructed.

@@ -102,6 +102,36 @@ dharafs_compact_failed:
                      * when a genuinely FRESH pass starts (resume
                      * cursor was 0), so an old pass's failure can
                      * never leak into a new one. */
+dharafs_compact_pass_target:
+    .word 0        /* 43rd SD round (2026-09-27), found live under
+                     * phase4_milestone.py once real SD I/O started
+                     * succeeding again: dharafs_compact() used to
+                     * re-read dharafs_state_get_next_block() as its own
+                     * stopping point on EVERY call, including resumed
+                     * ones -- reasoned (wrongly) to be safe since
+                     * next_block "only ever grows". It does grow from
+                     * the pass's OWN carry-forward writes, not just
+                     * external appends: a still-live file's newest copy
+                     * gets carried forward to the log's tail, which
+                     * lands INSIDE the very window a resumed call's
+                     * freshly-re-read stopping point now covers. The
+                     * next call finds that same file live again at its
+                     * new location and carries it forward again, over
+                     * and over, chasing a target that keeps retreating
+                     * by roughly one call's own budget each time --
+                     * confirmed live: dharafs_compact_resumable_self_
+                     * test's resume cursor advanced by exactly 8 (the
+                     * per-call budget) on all 10 calls of its generous
+                     * cap without ever reaching 0. Fixed by freezing the
+                     * pass's stopping point here the moment a FRESH pass
+                     * starts (resume cursor was 0) and reusing that
+                     * frozen value on every resumed call instead of
+                     * re-reading next_block -- any record carried
+                     * forward past the frozen target during this pass
+                     * is thus correctly left for the NEXT pass to find,
+                     * never re-chased within this one. Reset to 0
+                     * alongside resume_block/failed once a pass
+                     * genuinely finishes. */
 
 .section ".text"
 
@@ -162,6 +192,19 @@ dharafs_compact_set_failed:
 .global dharafs_compact_get_failed
 dharafs_compact_get_failed:
     ldr r0, =dharafs_compact_failed
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_compact_set_pass_target
+dharafs_compact_set_pass_target:
+    ldr r1, =dharafs_compact_pass_target
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_compact_get_pass_target
+dharafs_compact_get_pass_target:
+    ldr r0, =dharafs_compact_pass_target
     ldr r0, [r0]
     bx lr
 

@@ -2854,6 +2854,10 @@ extern "C" fn dharafs_compact_get_resume_block() -> u32;
 extern "C" fn dharafs_compact_set_failed(failed: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_compact_get_failed() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_compact_set_pass_target(target: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_compact_get_pass_target() -> u32;
 // Hashed directory index (boot/dirindex_state.S) -- see that file's own
 // header comment. Pure RAM-only lookup accelerator for
 // dharafs_find_latest_block_raw, never a correctness authority by
@@ -8839,7 +8843,7 @@ fn dharafs_compact_blocks_per_call() -> i64 {
 
 fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) -> i64 {
   let log_start: u32 = dharafs_state_get_log_start();
-  let old_next_block: u32 = dharafs_state_get_next_block();
+  let current_next_block: u32 = dharafs_state_get_next_block();
 
   // Not worth the SD traffic on a short log -- stay genuinely
   // low-cost when there's nothing meaningful to reclaim yet. Only
@@ -8848,7 +8852,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
   // even if this specific check would otherwise skip it.
   let resume_block: u32 = dharafs_compact_get_resume_block();
   if resume_block == (0 as u32) {
-    if (old_next_block - log_start) < (4 as u32) {
+    if (current_next_block - log_start) < (4 as u32) {
       return 0;
     }
   }
@@ -8866,17 +8870,33 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
   // progress, start fresh from log_start; block 0 is reserved and
   // never a real scan target, see dharafs_next_block's own comment,
   // so it's a safe sentinel) picks up exactly where a prior call's own
-  // budget ran out. old_next_block itself is re-read fresh (above)
-  // every call, including resumed ones -- it only ever grows (real
-  // writes keep advancing it), so a resumed pass simply covers
-  // slightly more ground by the time it finishes, never less; the
-  // underlying carry-forward logic is naturally safe to interrupt and
-  // resume this way, since it re-checks "is THIS block still the
-  // CURRENT latest copy" every time rather than working off a
-  // once-computed table -- a block already carried forward by an
-  // earlier partial call is simply found no-longer-latest (its new
-  // copy lives past old_next_block) and skipped harmlessly if
-  // re-scanned.
+  // budget ran out.
+  //
+  // 43rd SD round (2026-09-27): old_next_block -- this pass's own
+  // stopping point -- used to be re-read fresh from dharafs_state_get_
+  // next_block() on EVERY call, including resumed ones, on the
+  // (wrong) theory that it "only ever grows, so a resumed pass simply
+  // covers slightly more ground". It does grow from THIS PASS's own
+  // carry-forward writes, not just unrelated external appends: a
+  // still-live record's newest copy gets carried forward to the log's
+  // tail, landing INSIDE the window a resumed call's freshly-re-read
+  // stopping point now newly covers. The next call finds that same
+  // record live again at its new location and carries it forward
+  // again, chasing a target that keeps retreating by roughly one
+  // call's own budget every time -- confirmed live via dharafs_compact_
+  // resumable_self_test under phase4_milestone.py (real SD image):
+  // resume_block advanced by exactly the 8-block budget on all 10
+  // calls of its generous retry cap without ever reaching 0. Fixed by
+  // freezing the pass's stopping point in dharafs_compact_pass_target
+  // (boot/dharafs_state.S) the moment a fresh pass starts, and reusing
+  // that frozen value on every resumed call instead of re-reading
+  // next_block -- a record carried forward past the frozen target
+  // during this pass is thus correctly left for the NEXT pass to find
+  // (it's a real block within [log_start, current_next_block) by
+  // then), never re-chased within this one. The underlying carry-
+  // forward logic is otherwise unchanged and still safe to interrupt
+  // and resume: it re-checks "is THIS block still the CURRENT latest
+  // copy" every time rather than working off a once-computed table.
   //
   // dharafs_compact_failed is the STICKY equivalent of the local
   // all_ok below, persisted ACROSS resumed calls (unlike all_ok
@@ -8884,7 +8904,9 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
   // reset to 0 only when a genuinely fresh pass starts (resume_block
   // was 0), so a failure from an old, already-finished pass can never
   // leak into blocking a new one from advancing log_start.
+  let old_next_block: u32 = if resume_block == (0 as u32) { current_next_block } else { dharafs_compact_get_pass_target() };
   if resume_block == (0 as u32) {
+    let _ = dharafs_compact_set_pass_target(old_next_block);
     let _ = dharafs_compact_set_failed(0 as u32);
   }
   let start_blk: u32 = if resume_block == (0 as u32) { log_start } else { resume_block };
@@ -9028,14 +9050,16 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     // all_ok) -- a single failure anywhere in the pass leaves its only
     // copy in the region about to be abandoned, so log_start must stay
     // put in that case rather than orphan it. Either way, the pass is
-    // now genuinely done: reset both persisted fields so the next
-    // dharafs_compact call starts a fresh pass rather than "resuming"
-    // a finished one.
+    // now genuinely done: reset all three persisted fields so the next
+    // dharafs_compact call starts a fresh pass (re-reading next_block
+    // for a brand new pass_target) rather than "resuming" a finished
+    // one.
     if all_ok == 1 {
       let _ = dharafs_state_set_log_start(old_next_block);
     }
     let _ = dharafs_compact_set_resume_block(0 as u32);
     let _ = dharafs_compact_set_failed(0 as u32);
+    let _ = dharafs_compact_set_pass_target(0 as u32);
   } else {
     // Hit this call's own block budget before reaching old_next_block
     // -- remember exactly where to pick up next time. log_start does
