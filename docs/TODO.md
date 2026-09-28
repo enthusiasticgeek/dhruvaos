@@ -11822,3 +11822,28 @@ Verified end-to-end: default QEMU boot shows zero DEMO/GC chatter (only the 6 pr
 persisted to the SD image, then a real second boot against that SAME image round-trips correctly (357
 matching chatter lines vs 6 in the quiet boot) -- the config mechanism genuinely works end-to-end, not just
 compiles. `qemu_run.py` also clean. Commit `084c17a`, local-only (push window closed).
+
+### DHDL roadmap scoped: file-based, queryable subsystem config (design only, no code this round)
+
+User asked to scope a real DHDL (device-tree-style) subsystem config/query layer, generalizing the
+`/config/loglevel` pattern -- file-based config plus, critically, the ability to "query and dynamically
+fetch parameters wherever possible" at runtime, not just at boot.
+
+Surveyed every subsystem the user named (`kernel/kernel_main.vani` + `boot/*.S`) before designing anything:
+disk/SD, USB host, WiFi, ethernet, BLE, display, and DMA all have real, substantial drivers already (SD/
+`sdcard_state.S` is the most mature); RAM/heap is queryable but lives in the C runtime stub, a different
+pattern; audio, CAN, RS485, I2C, SPI, and LoRa have zero implementation at all. Full table, design, and
+phased plan written up in the new `docs/DHDL_ROADMAP.md` -- not duplicated here.
+
+Key finding: the codebase already has two hand-written precedents (`shell_dispatch_gpio`/`shell_dispatch_fb`
+for per-subsystem verbs, `diagnose` for an ad-hoc aggregate snapshot) but no GENERIC "register a subsystem,
+then query it" mechanism -- every existing query is its own hand-written `if` branch. That's the one
+genuinely new piece this roadmap adds; everything else is applying the already-shipped `/config/loglevel`
+pattern to more subsystems.
+
+Tracked as 10 new backlog tasks (#294-304): Phase 0 (generic `boot/dhdl_state.S` registration table +
+`dhdl list`/`dhdl query` shell commands) through Phase 4 (per-subsystem `dhdl set` live reconfiguration,
+safety-scoped one subsystem at a time), then 6 separate "new driver" tasks for the subsystems with nothing
+implemented yet (I2C/SPI/CAN/RS485/audio/LoRa) -- explicitly flagged as their own multi-round driver-bring-up
+epics, not DHDL-layer work, each just expected to adopt the DHDL convention from its first commit rather than
+retrofit later. See `docs/DHDL_ROADMAP.md` for the full design and phased plan.
