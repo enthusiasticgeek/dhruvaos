@@ -417,28 +417,46 @@ def dhruvaos_demo_task_set_analysis() -> int:
     gc_dharafs_critical_section_ms = gc_dharafs_healthy_ms + sd_fill_fifo_worst_case_wedge_ms
 
     # 42nd SD round, 4th follow-up (2026-09-27): the READ side's own
-    # identical-shape masked window (syscall #6, sdhost_drain_fifo_to_
-    # buffer_impl, added round 30) was never separately entered into this
-    # model at all -- only the write side's own figure above ever was.
-    # Its own burst-readiness retry cap was bumped 400->700 this round
-    # (boot/sdcard_state.S) to test a real hypothesis about 4-bit-mode
-    # read timing (see that file's own r8/sd_drain_forced_fallback_count
-    # comments) -- scaled linearly from the write side's own measured
-    # 400-cap figure (700/400 x 22.272 = 38.976ms) rather than a fresh
-    # WCET self-test measurement, since the two loops share the exact
-    # same architecture (128 words, same per-iteration DMB cost) and no
-    # sd_drain_poll_body_wcet_measure_self_test exists yet to measure it
-    # directly -- flagged here as an estimate for a future round to
-    # tighten with a real self-test if this ever becomes load-bearing.
-    # Still comfortably under HIGH/MEDIUM's own 49.906ms ceiling-0 budget
-    # below. Entered as its own separate candidate (not folded into GC's
-    # own critical section above -- DharaFS's own compaction/write path
-    # doesn't itself call the masked read syscall, so it isn't part of
-    # THAT specific critical section) but IS a candidate for HIGH/
-    # MEDIUM's own blocking term below, per task #285's own established
-    # reasoning: masking disables preemption universally regardless of
-    # which task or ceiling triggered it.
-    sd_drain_fifo_worst_case_wedge_ms = 38.976  # scaled estimate, 42nd SD round
+    # masked window (syscall #6, sdhost_drain_fifo_to_buffer_impl, added
+    # round 30) was never separately entered into this model at all --
+    # only the write side's own figure above ever was. Its own burst-
+    # readiness retry cap was bumped 400->700 to test a real hypothesis
+    # about 4-bit-mode read timing, scaled linearly from the write
+    # side's own measured 400-cap figure at the time (38.976ms).
+    #
+    # 42nd SD round, 6th follow-up (2026-09-27): that bump wasn't enough
+    # -- direct real-HW evidence (picocom_20260927_205734.log) showed
+    # the forced-fallback counter firing on the MAJORITY of bursts (up
+    # to 9 of 16 per block) even at cap=700, immediately preceding every
+    # single observed FIFO_ERROR. Root cause: real SD card read latency
+    # on this hardware is genuinely more variable than any BOUNDED
+    # masked wait can safely accommodate, and the old fallback was
+    # fabricating data from a FIFO that wasn't ready -- the confirmed,
+    # direct cause of every FIFO_ERROR. Fixed architecturally (boot/
+    # sdcard_state.S's own sdhost_drain_fifo_to_buffer_impl comment) by
+    # masking ONLY the actual burst copy (round 30's own original
+    # target -- "genuinely uninterrupted back-to-back SDDATA reads
+    # within a burst") and running the wait itself fully UNMASKED with a
+    # generous cap, matching sdhost_cmd's own established convention.
+    # This is a genuine WCET IMPROVEMENT on top of the correctness fix:
+    # the worst-case SINGLE masked window is now bounded by one 8-word
+    # burst copy (a handful of load/DMB/store instructions), not the
+    # whole transfer's own worst-case wait -- a conservative, generously
+    # padded estimate (real cost is likely under 10us) rather than a
+    # fresh WCET self-test measurement, since no sd_drain_burst_copy_
+    # wcet_measure_self_test exists yet -- flagged for a future round to
+    # tighten if this term is ever load-bearing (it currently isn't:
+    # dwarfed by LOW's own 49.906ms ceiling-0 term below). Entered as
+    # its own separate candidate for the same reason as before (not part
+    # of GC's own critical section, but a real candidate for HIGH/
+    # MEDIUM's own blocking term, per task #285's own masking-is-
+    # universal reasoning) -- write side's own masked window
+    # deliberately left as-is (still the old design, still 22.272ms)
+    # since it currently works and this round's real-HW evidence is
+    # read-specific; touching a working path without its own separate
+    # confirmation is exactly the mistake this project has learned not
+    # to make.
+    sd_drain_fifo_worst_case_wedge_ms = 1.0  # conservative estimate, 42nd SD round, 6th follow-up
     # ROUND 2026-09-17 (gap #238): was 325.62ms (dwc2_wait_chan0_done's
     # own shared-primitive worst case) -- now the real measured worst
     # case of dwc2_net_bulk_in_poll_wcet_measure_self_test's own

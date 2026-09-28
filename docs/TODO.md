@@ -11517,3 +11517,50 @@ SD-non-functional baseline). This round now bundles every real, confirmed-but-un
 investigation has found alongside the retry-cap bump and forced-fallback counter from the previous
 follow-up, so the next real-HW retest should surface whichever remaining mechanism (if any) is actually at
 play, rather than requiring another separate round to test each one in turn.
+
+### 42nd SD round real-HW retest CONFIRMS the retry-cap hypothesis; architectural fix implemented
+
+`picocom_20260927_205734.log`, commit `1369933` (raised cap + all bundled checks). Direct, unambiguous
+confirmation: the new forced-fallback counter fired 116 times, with counts up to 9 (out of 16 possible bursts
+per block), and **every single** "read errs=0x00000008" occurrence in the entire log is immediately preceded
+by a nonzero forced-fallback count -- zero exceptions. Even at the bumped 700-iteration cap (~385us), the
+majority of bursts in many reads still exhaust it. Zero wedges, and none of the new FSM-idle/prev-command
+checks ever fired (correctly inert, confirming no regressions from bundling). The log was shorter than
+before only because the user manually stopped capture after waiting longer than usual (the `dharafs_compact`
+self-test runs very slowly when nearly every read inside it hits this path) -- not a hang.
+
+**Root cause, now confirmed rather than hypothesized**: real SD card read latency on this hardware is
+genuinely more variable than any *bounded, masked* wait can safely accommodate. The old fallback -- forcing a
+read of SDDATA once the cap ran out, even though the FIFO wasn't confirmed ready -- was fabricating data from
+a FIFO that genuinely wasn't ready, which is the direct, confirmed cause of every observed FIFO_ERROR.
+Raising the cap further only trades more interrupt-disabled time for the same fundamental problem.
+
+**Fix implemented** (`sdhost_drain_fifo_to_buffer_impl`, read path only): re-examined round 30's own original
+rationale for masking this loop at all -- "genuinely uninterrupted back-to-back SDDATA reads within a burst" --
+and confirmed the WAIT for the FIFO to fill was never actually part of that requirement; words already in the
+FIFO can only sit there or grow while unread, never shrink, so a delay before draining them can't corrupt
+anything. Restructured so `cpsid`/`cpsie` now wrap ONLY the actual 8-word burst copy, individually, once per
+burst (up to 16 times per block) instead of once for the entire transfer. The wait itself now runs fully
+UNMASKED with a generous cap (1,000,000 iterations, matching `sdhost_cmd`'s own established convention) --
+safe specifically because nothing is masked during it. This removes the forced-stale-read fallback path
+entirely: a burst either genuinely becomes ready (patiently) or a genuine FSM/SDHSTS error (or a truly
+pathological full-cap timeout) is caught and reported -- never a fabricated result. Every exit point is now
+reached with interrupts already unmasked, simplifying the exit-path bookkeeping too.
+
+This is also a substantial WCET *improvement*, not just a correctness fix: the worst-case SINGLE masked
+window is now bounded by one burst copy (a handful of instructions) instead of the whole transfer's own
+worst-case wait. `test/schedulability_analysis.py` updated accordingly (the read-side term drops from an
+estimated 38.976ms to a generously-padded 1.0ms conservative estimate, pending a future real self-test
+measurement) -- re-ran the tool, verdict unchanged (schedulable, comfortable margin).
+
+**Deliberately NOT applied to the write side**: `sdhost_fill_fifo_from_buffer_impl` keeps its original
+single-mask-for-the-whole-loop design and 400-iteration cap unchanged. The write path currently works
+reliably, this round's real-HW evidence is read-specific, and touching a working critical path without its
+own separate confirmation is exactly the mistake this project has repeatedly learned not to make this
+session (the SDHBCT/SDHBLC-ordering and FSM-idle/prev-command checks were bundled into both sides since
+those are purely additive safety nets that cannot change already-working behavior; this masking
+restructuring is a genuine behavioral change to the loop's own timing characteristics, which needs its own
+evidence before touching a working path).
+
+Build clean (asm audit 0/0 -- confirms register balance across every exit path of the restructured
+function), QEMU PASS, no aborts, no regressions. Awaiting the next real-HW retest.

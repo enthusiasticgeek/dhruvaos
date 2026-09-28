@@ -395,112 +395,62 @@ sdhost_drain_cmd_poll_done:
     movne r0, #4                /* pre-PIO SDHSTS already shows an error */
     bne sdhost_drain_cmd_exit
 
-    /* SUCCESS: mask and start draining with zero gap -- cpsid is the
-     * very next instruction after the pre-PIO SDHSTS check above. */
-    mrs r12, cpsr
-    cpsid if
+    /* SUCCESS: command issued cleanly. 42nd SD round, 6th follow-up
+     * (2026-09-27): restructured per direct real-HW confirmation -- the
+     * forced-fallback counter (r8 below) fired on the MAJORITY of
+     * bursts (up to 9 of 16 per block) even after bumping the masked
+     * wait cap 400->700, immediately preceding every single observed
+     * FIFO_ERROR with zero exceptions across a full log. Bumping the
+     * cap further only trades more masked (interrupt-disabled) time for
+     * the same fundamental problem: real SD card read latency on this
+     * hardware is genuinely more variable than any BOUNDED masked wait
+     * can safely accommodate, and the old "give up and force a read
+     * anyway" fallback was fabricating data from a FIFO that genuinely
+     * wasn't ready -- the direct, confirmed cause of every FIFO_ERROR.
+     *
+     * Fix: only mask what round 30's own original masking was actually
+     * for -- "genuinely uninterrupted back-to-back SDDATA reads within
+     * a burst" (that round's own words). The WAIT for the FIFO to fill
+     * never needed protection; reads already in the FIFO can only sit
+     * there or grow, never shrink, while unmasked and unread, so a
+     * delay before draining them can't corrupt anything. Restructured
+     * so the wait now runs fully UNMASKED with a generous cap (matching
+     * sdhost_cmd's own established 1,000,000-iteration "a wedged card
+     * can never hang the caller forever" convention, not the old
+     * masked-loop-specific reduced cap), and `cpsid`/`cpsie` now wrap
+     * ONLY the actual 8-word burst copy, individually, 16 times per
+     * block instead of once for the whole transfer. This removes the
+     * forced-stale-read fallback entirely -- a burst either genuinely
+     * becomes ready (patiently, unmasked) or a genuine FSM/SDHSTS error
+     * is caught and reported, never a fabricated result -- and each
+     * individual masked window shrinks to just the copy itself (8
+     * loads + 8 DMBs + 8 stores), a large WCET improvement over the
+     * old single-mask-for-the-whole-loop design on top of the
+     * correctness fix. Every exit point below is now reached with
+     * interrupts already unmasked (either before that iteration's own
+     * mask ever begins, or after its own unmask already ran) -- no
+     * exit path needs to restore a saved CPSR anymore. */
     mov r0, r4                 /* r0 = buf, restored for the drain loop */
     mov r4, #128               /* r4 = word_count remaining (always one
                                * 512-byte block at every real call site) */
-    mov r8, #0                 /* 42nd SD round, 4th follow-up (2026-09-
-                               * 27): r8 = count of bursts where the
-                               * retry cap below was exhausted and the
-                               * fallback (force a read anyway) fired --
-                               * previously silent/unobservable. Real-HW
-                               * evidence so far: two independent SDHCFG
-                               * hypotheses (missing WIDE_INT_BUS, extra
-                               * DATA_IRPT_EN) each fixed a real, separate
-                               * problem or made no difference at all
-                               * (the first eliminated the command-level
-                               * wedge storm; the second, confirmed via
-                               * disassembly to have actually built and
-                               * shipped, changed nothing) -- the
-                               * remaining near-100%-reproducible
-                               * FIFO_ERROR-on-every-read symptom, with
-                               * neither this round's nor round 41's FSM/
-                               * SDHSTS checks ever firing, is consistent
-                               * with a genuine FIFO underrun: the retry
-                               * cap (400, ~222us at the 32nd round's own
-                               * measured 0.55515us/iteration) exhausting
-                               * BEFORE the FIFO genuinely has a word
-                               * ready, forcing sdhost_drain_burst to read
-                               * SDDATA anyway (see that label's own
-                               * "give up and continue" comment) -- a
-                               * real controller-level underrun, not a
-                               * software logic error, and one the FSM-
-                               * state check can never catch since FSM
-                               * validly stays in READDATA/READWAIT the
-                               * whole time. This cap was reduced from
-                               * 1000 in round 32 specifically for 1-bit-
-                               * mode-era WCET reasons, before 4-bit mode
-                               * (which needs the SAME burst filled in
-                               * 1/4 the real time) was ever a
-                               * consideration. Counting here, surfaced
-                               * to the caller via r1 on success, to
-                               * directly confirm or refute this on the
-                               * next real-HW log rather than guessing a
-                               * fourth isolated fix blind. */
+    mov r8, #0                 /* count of bursts where even the
+                               * generous unmasked wait below was
+                               * exhausted -- now a genuinely pathological
+                               * signal (card truly stuck), not "gave up
+                               * early," since nothing is fabricated
+                               * anymore on this path either (falls
+                               * through to the same genuine-error exit
+                               * as the FSM/SDHSTS check). */
     ldr r6, =0x20202034        /* SDEDM */
 sdhost_drain_loop:
     cmp r4, #0
     beq sdhost_drain_done
-    ldr r5, =700             /* 42nd SD round, 4th follow-up: bumped from
-                               * 400 -> 700 (~385us, up from ~222us) --
-                               * see r8's own comment above for the full
-                               * "why". Schedulability-safe: the 32nd
-                               * round's own measured worst case at cap=
-                               * 400 was 22.272ms (test/schedulability_
-                               * analysis.py); scaling linearly (700/400 x
-                               * 22.272 = 38.98ms) stays comfortably under
-                               * HIGH/MEDIUM's own 49.906ms ceiling-0
-                               * budget -- schedulability_analysis.py
-                               * updated to track this as its own,
-                               * separate candidate (it previously only
-                               * modeled the write side's own identical-
-                               * shape masked window, syscall #5; this is
-                               * the read side's, syscall #6, which
-                               * shares the same architecture but had
-                               * never been separately entered into the
-                               * model at all). This is a scaled estimate,
-                               * not a fresh WCET self-test measurement --
-                               * flagged as such in that file's own
-                               * comment for a future round to tighten if
-                               * ever needed. Bounded burst-readiness
-                               * retry cap, MASKED-loop-specific -- see
-                               * this function's own header comment for
-                               * why this is far below the shared 100000
-                               * every genuinely-unmasked per-burst poll
-                               * elsewhere in this file still uses.
-                               * REDUCED from 1000 to 400 in the 32nd SD
-                               * round: adding the DMB after every SDEDM
-                               * poll (this loop's own new mcr p15
-                               * instruction, right below) raised the
-                               * real measured per-iteration cost from
-                               * 0.327us (task #285) to 0.55515us
-                               * (sd_fill_poll_body_wcet_measure_self_
-                               * test, re-measured this round) -- at the
-                               * OLD cap of 1000 that pushes the worst
-                               * case (128 words x 1000 x 0.55515us =
-                               * 71.04ms) PAST this project's own
-                               * largest already-schedulability-checked
-                               * blocking term (LOW's 49.906ms ceiling-0
-                               * critical section, test/schedulability_
-                               * analysis.py) -- exactly the budget this
-                               * cap was originally tuned to fit under.
-                               * 400 lands the new worst case at 128 x
-                               * 400 x 0.55515us = 28.42ms, comfortably
-                               * under 49.906ms again (43% margin) even
-                               * though QEMU's own near-instant cp15
-                               * emulation likely UNDERSTATES real
-                               * ARMv6 DMB latency -- still 400x more
-                               * headroom than any per-word retry count
-                               * ever actually observed in this saga's
-                               * real-HW/QEMU logs (a healthy FIFO check
-                               * has always succeeded within a handful
-                               * of iterations), so this remains a
-                               * pathological-worst-case fallback bound,
-                               * never something the normal path
-                               * approaches. */
+    ldr r5, =1000000           /* UNMASKED wait cap -- matches sdhost_
+                               * cmd's own established bound exactly.
+                               * Safe to be this generous specifically
+                               * BECAUSE nothing is masked during this
+                               * wait anymore -- see this function's own
+                               * header comment above for the full "why". */
 sdhost_drain_poll:
     ldr r2, [r6]
     mcr p15, 0, r1, c7, c10, 5 /* 32nd SD round: DMB after the SDEDM
@@ -539,17 +489,7 @@ sdhost_drain_poll:
      * the instant the FSM leaves a valid read state (READDATA/READWAIT/
      * READCRC) while still waiting for fill, it reads SDHSTS right then
      * and bails immediately on a genuine error, rather than blindly
-     * retrying. This production loop never had that (only the bounded
-     * 400-iteration cap + force-a-stale-read fallback below) -- found
-     * via round 41's literal U-Boot C port (boot/rpi1/uboot_sdhost_
-     * read.c) and confirmed against real-HW evidence already in hand:
-     * round 40's picocom_20260927_144504.log shows every FIFO_ERROR
-     * read returning the exact same 4 bytes (C3 C2 C1 C0) repeated 4
-     * times -- the signature of this cap-exhaustion fallback firing
-     * repeatedly and forcing through stale FIFO content, not genuine
-     * per-word progress. Ported here for the first time so a genuine
-     * mid-burst error is caught and reported the instant it happens,
-     * instead of after 400 wasted retries and a stale read. */
+     * retrying. */
     and r2, r1, #0xF          /* r2 = fsm state from the saved raw edm */
     cmp r2, #2                 /* SDEDM_FSM_READDATA */
     cmpne r2, #4                /* SDEDM_FSM_READWAIT */
@@ -564,20 +504,18 @@ sdhost_drain_poll:
     beq sdhost_drain_fsm_retry    /* FSM transient but no error latched
                                * yet -- matches U-Boot's own bare
                                * `continue` for this case */
-    b sdhost_drain_fifo_error       /* genuine error mid-burst -- bail
-                               * out now instead of forcing a stale read
-                               * after the retry cap exhausts */
+    b sdhost_drain_fifo_error       /* genuine error -- unmasked here
+                               * (this whole wait phase always is now),
+                               * no CPSR to restore */
 sdhost_drain_fsm_retry:
     subs r5, r5, #1
     bne sdhost_drain_poll
-    add r8, r8, #1             /* 42nd SD round, 4th follow-up: count
-                               * this fallback firing -- see r8's own
-                               * init comment above for the full "why" */
-    mov r2, #1                /* retry cap exhausted -- force reading
-                               * at least 1 word rather than hang
-                               * forever, matching this file's own
-                               * write-side burst fix's identical
-                               * "give up and continue" contract */
+    add r8, r8, #1             /* even the generous unmasked cap
+                               * exhausted -- genuinely pathological,
+                               * not "gave up early"; treat exactly like
+                               * the FSM/SDHSTS error case below rather
+                               * than fabricating a read */
+    b sdhost_drain_fifo_error
 sdhost_drain_have_enough:
     cmp r2, r4
     movgt r2, r4               /* actual burst size = min(fill, remaining)
@@ -587,6 +525,10 @@ sdhost_drain_have_enough:
                                * itself drains everything available */
     sub r4, r4, r2
     ldr r3, =0x20202040      /* SDDATA */
+    mrs r12, cpsr              /* mask ONLY for the actual burst copy --
+                               * see this function's own header comment
+                               * above for the full "why" */
+    cpsid if
 sdhost_drain_burst:
     ldr r1, [r3]
     mcr p15, 0, r7, c7, c10, 5 /* 32nd SD round: DMB after the SDDATA
@@ -602,32 +544,27 @@ sdhost_drain_burst:
     str r1, [r0], #4
     subs r2, r2, #1
     bne sdhost_drain_burst
+    msr cpsr_c, r12            /* unmask again immediately -- the wait
+                               * for the NEXT burst (if any) runs
+                               * unmasked too, back at the loop top */
     b sdhost_drain_loop
 sdhost_drain_done:
-    ldr r1, =sd_drain_forced_fallback_count  /* stored BEFORE popping r8
-                               * back to the caller's own original value
-                               * below -- see that word's own comment for
-                               * why this isn't threaded through r1 as
-                               * part of the actual i64 return value */
+    ldr r1, =sd_drain_forced_fallback_count
     str r8, [r1]
-    msr cpsr_c, r12
     pop {r4, r5, r6, r7, r8}
     mov r0, #0
     mov r1, #0
     bx lr
 sdhost_drain_fifo_error:
     /* 41st SD round (2026-09-27): distinguishable non-zero return so
-     * the caller (sdhost_read_block_once) can tell "genuine mid-burst
-     * FSM/SDHSTS error, bailed out early" apart from normal completion
-     * -- this function previously had no error return path at all.
-     * The buffer beyond whatever was already drained is left
-     * unfilled/stale; the caller already treats any non-zero SDHSTS
-     * error as a failed read regardless. */
-    ldr r1, =sd_drain_forced_fallback_count  /* r8 valid here too (this
-                               * path runs after masking begins) --
-                               * stored for the same diagnostic reason. */
+     * the caller (sdhost_read_block_once) can tell "genuine FSM/SDHSTS
+     * error or a truly pathological wait, bailed out early" apart from
+     * normal completion. The buffer beyond whatever was already
+     * drained is left unfilled/stale; the caller already treats any
+     * non-zero SDHSTS error as a failed read regardless. Reached only
+     * from the unmasked wait phase -- no CPSR to restore. */
+    ldr r1, =sd_drain_forced_fallback_count
     str r8, [r1]
-    msr cpsr_c, r12
     pop {r4, r5, r6, r7, r8}
     mov r0, #1
     mov r1, #0
