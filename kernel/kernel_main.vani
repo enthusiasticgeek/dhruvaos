@@ -2242,6 +2242,22 @@ extern "C" fn governor_apply_freq_mhz(mhz: i64) -> i64;
 extern "C" fn log_state_get_mask() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn log_state_set_mask(mask: u32) -> u32;
+// DHDL Phase 0 (2026-09-28, task #294): generic subsystem registration
+// table (boot/dhdl_state.S) -- the one new mechanism docs/DHDL_ROADMAP.md
+// scopes; a small, fixed-capacity (8 slots) table of (id, fn pointer)
+// pairs, deliberately NOT a vani-level array of fn-typed values (see
+// that file's own header comment for why). Subsystem NAMES intentionally
+// stay out of the .S file entirely -- id<->name mapping lives here, in
+// vani, via shell_word_matches, the exact tool every other shell
+// subcommand already uses for literal-string matching.
+#[stack_cost(bytes=12)]
+extern "C" fn dhdl_register(id: u32, describe: fn() -> i64) -> i64;
+#[stack_cost(bytes=16)]
+extern "C" fn dhdl_call_by_id(id: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dhdl_list_count() -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dhdl_list_id_at(index: u32) -> u32;
 // Round 71: HDMI framebuffer -- generic VideoCore mailbox property-tag
 // transport (boot/fb_state.S), generalized from governor_apply_freq_
 // mhz's own already-verified protocol.
@@ -24742,6 +24758,61 @@ fn log_level_init() -> i64 {
   return 0;
 }
 
+// DHDL Phase 0 (task #294): the one real subsystem wired into `dhdl
+// list`/`dhdl query` this round, deliberately reusing the freshest,
+// simplest existing subsystem (log-level, /config/loglevel above)
+// rather than a throwaway placeholder -- proves the mechanism against
+// real state while staying genuinely small. `dhdl_subsys_loglevel_id()`
+// is the one place the numeric id 1 is defined; every other reference
+// to "the loglevel subsystem" (registration, and the name<->id mapping
+// in shell_dispatch_dhdl below) calls this function rather than
+// repeating the literal, so adding subsystem 2 later never risks
+// silently colliding with an id already in use elsewhere.
+fn dhdl_subsys_loglevel_id() -> u32 {
+  return 1 as u32;
+}
+
+// Prints the log-level subsystem's OWN current live state -- reads
+// log_state_get_mask() fresh, not a cached value, same "genuinely live
+// at query time" property every future dhdl-registered subsystem is
+// expected to have. Callable two ways: as an ordinary vani fn (used
+// nowhere directly), and as the `fn() -> i64` value registered with
+// dhdl_register below, which is what `dhdl query loglevel` actually
+// reaches through dhdl_call_by_id's own indirect-call dispatch.
+fn log_level_describe() -> i64 {
+  let mask: u32 = log_state_get_mask();
+  let _ = uart_puts("loglevel: mask=0x");
+  let _ = uart_put_hex32(mask);
+  let _ = uart_puts(" (");
+  let any: i64 = 0;
+  if (mask & (4 as u32)) != (0 as u32) {
+    let _ = uart_puts("DEMO");
+    any = 1;
+  }
+  if (mask & (8 as u32)) != (0 as u32) {
+    if any == 1 {
+      let _ = uart_puts(" ");
+    }
+    let _ = uart_puts("GC");
+    any = 1;
+  }
+  if any == 0 {
+    let _ = uart_puts("none");
+  }
+  let _ = uart_puts(")\n");
+  return 0;
+}
+
+// Called once from kernel_main, after log_level_init -- registers
+// every subsystem this round wires into the DHDL query mechanism.
+// Just one so far (task #294's own explicit "small effort" scope);
+// docs/DHDL_ROADMAP.md's Phase 1-3 add the rest, each just another
+// dhdl_register call here, no change to the mechanism itself.
+fn dhdl_init() -> i64 {
+  let _ = dhdl_register(dhdl_subsys_loglevel_id(), log_level_describe);
+  return 0;
+}
+
 // Task #10: minimal arithmetic expression evaluator -- +, -, *, /,
 // parentheses, standard precedence, integers -- wired into the shell
 // as `eval <expr>`. The closest thing to a "vani REPL entry point"
@@ -25980,6 +26051,67 @@ fn shell_dispatch_heap() -> i64 {
 // width) -- no validation against what a specific board's header
 // actually exposes, same "the peripheral register doesn't care"
 // posture the driver functions themselves take.
+// DHDL Phase 0 (task #294): `dhdl list` walks the registration table
+// (boot/dhdl_state.S) and prints each registered subsystem's name;
+// `dhdl query <name>` maps the name to its numeric id via shell_word_
+// matches (the same tool every other shell subcommand already uses
+// for literal matching) and dispatches through dhdl_call_by_id, which
+// tail-calls that subsystem's own registered describe fn -- genuinely
+// live data, read at query time, not a cached snapshot. Only one
+// subsystem (loglevel) is registered this round; dhdl_name_for_id's
+// own if/else chain is exactly where a future dhdl_register call's
+// matching name goes, no other change needed here.
+fn dhdl_name_for_id(id: u32) -> Str {
+  if id == dhdl_subsys_loglevel_id() {
+    return "loglevel";
+  }
+  return "?";
+}
+
+fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  let usage: Str = "usage: dhdl list|query <name>\n";
+  if cmd_end >= line_len {
+    let _ = uart_puts(usage);
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "list") == 1 {
+    let count: i64 = dhdl_list_count();
+    let _ = uart_puts("dhdl: ");
+    let _ = uart_put_i64(count);
+    let _ = uart_puts(" registered subsystem(s)\n");
+    let i: i64 = 0;
+    while i < count {
+      let id: u32 = dhdl_list_id_at(i as u32);
+      let _ = uart_puts("  ");
+      let _ = uart_puts(dhdl_name_for_id(id));
+      let _ = uart_puts("\n");
+      i = i + 1;
+    }
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "query") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts(usage);
+      return 0;
+    }
+    let name_start: i64 = sub_end + 1;
+    let name_end: i64 = shell_find_space(line_buf, name_start, line_len);
+    if shell_word_matches(line_buf, name_start, name_end, "loglevel") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_loglevel_id());
+      return 0;
+    }
+    let _ = uart_puts("dhdl: unknown subsystem (see `dhdl list`)\n");
+    return 0;
+  }
+
+  let _ = uart_puts(usage);
+  return 0;
+}
+
 fn shell_dispatch_gpio(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
   let usage: Str = "usage: gpio <pin> in|out|read|write <0|1>|pull none|up|down\n";
   if cmd_end >= line_len {
@@ -27012,6 +27144,10 @@ fn shell_dispatch() -> i64 {
 
   if shell_word_matches(line_buf, 0, cmd_end, "gpio") == 1 {
     return shell_dispatch_gpio(line_buf, cmd_end, line_len);
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "dhdl") == 1 {
+    return shell_dispatch_dhdl(line_buf, cmd_end, line_len);
   }
 
   if shell_word_matches(line_buf, 0, cmd_end, "heap") == 1 {
@@ -39206,6 +39342,7 @@ fn kernel_main() -> i64 {
   // unaffected.
   let _ = dharafs_init();
   let _ = log_level_init();
+  let _ = dhdl_init();
   let _ = crashlog_boot_increment();
 
   // Report what recovery alone found, BEFORE any fresh writes this
