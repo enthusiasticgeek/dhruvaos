@@ -1359,17 +1359,31 @@ sdhost_diag_lbl_sdedm:
     .asciz " SDEDM=0x"
 .section ".text"
 
-/* void sdhost_diag_putc(r0=char) -- blocking single-byte UART write. */
+/* void sdhost_diag_putc(r0=char).
+ *
+ * FIX (2026-09-28, real Pi 1B hardware): used to poll TXFF and strb
+ * straight to UART_DR itself, same as context_switch.S's own sched_
+ * diag_putc -- bypassing uart_tx_ring's shared per-byte critical
+ * section entirely. SD diagnostics aren't boot-only: task_e/GC's own
+ * background dharafs_compact calls can reach real SD retry/diagnostic
+ * prints during live multitasking too, so this had the exact same
+ * real-HW-only interleaving-corruption exposure sched_diag_putc's own
+ * (much longer) comment documents -- see that comment for the full
+ * root-cause writeup. Fixed the same way: route through uart_tx_ring_
+ * push_and_drain_impl (boot/uart_tx_ring_state.S, .global, pure
+ * ring+hardware manipulation, no scheduler involvement) instead of
+ * writing to hardware directly. */
+/* SELF-CAUGHT BUG (same round, before real-HW retest): see context_
+ * switch.S's own sched_diag_putc comment for the full writeup -- the
+ * identical issue exists here: sdhost_diag_put_hex32's loop relies on
+ * r2/r3 surviving across this call, which uart_tx_ring_push_and_
+ * drain_impl clobbers as ordinary AAPCS scratch. Preserve r0-r3
+ * explicitly so this function stays a true no-op on every register
+ * from the caller's point of view. */
 sdhost_diag_putc:
-    push {r1, r3}
-sdhost_diag_putc_wait:
-    ldr r1, =0x20201018      /* UART_FR */
-    ldr r3, [r1]
-    tst r3, #0x20             /* TXFF */
-    bne sdhost_diag_putc_wait
-    ldr r1, =0x20201000      /* UART_DR */
-    strb r0, [r1]
-    pop {r1, r3}
+    push {r0-r3, lr}
+    bl uart_tx_ring_push_and_drain_impl
+    pop {r0-r3, lr}
     bx lr
 
 /* void sdhost_diag_puts(r0=&nul-terminated string) -- blocking. */

@@ -1923,17 +1923,61 @@ sleep_ticks_diag_skip:
  * is root-caused. Only ever touches r0-r3 -- see sleep_ticks_diag_print
  * itself, the only entry point this file's own diagnostic code calls;
  * the other three are its own internal helpers, called only from here. */
+/* FIX (2026-09-28, real Pi 1B hardware): this used to poll TXFF and
+ * strb straight to UART_DR itself, completely bypassing uart_tx_ring's
+ * own per-byte critical section (boot/uart_tx_ring_state.S) -- the
+ * ONLY thing serializing every OTHER UART writer in this project
+ * (task-level uart_puts, both directions). This diagnostic fires from
+ * inside the IRQ/context-switch path itself (see sleep_ticks_diag_
+ * print's own call site above), which can land in the brief UNMASKED
+ * gap BETWEEN a task's own successive per-character ring pushes (each
+ * uart_tx_ring_push_and_drain call only masks IRQ for its own single-
+ * byte push+drain, then fully unmasks before the caller's next
+ * character) -- when it does, this function's raw, unsynchronized
+ * write went straight onto the physical FIFO, interleaved mid-string
+ * with whatever the preempted task was in the middle of printing.
+ * This is the real, previously-undiagnosed root cause of this
+ * project's own long-running real-HW-only UART corruption
+ * investigation (docs/TODO.md; "idle"/"GOVERNOR" text degrading into
+ * "d"/"i"/"l"/"e" fragments, sometimes escalating to a genuine
+ * Prefetch Abort) -- a real software race between two independent,
+ * unsynchronized writers sharing one physical FIFO, not a hardware/
+ * electrical issue; QEMU never showed it because its own timer-IRQ
+ * cadence relative to this diagnostic's narrow firing window never
+ * happened to line up the same way. Fixed by routing through the SAME
+ * shared ring mechanism instead of writing directly: uart_tx_ring_
+ * push_and_drain_impl (boot/uart_tx_ring_state.S, .global) is pure
+ * ring-buffer + hardware-register manipulation with NO scheduler
+ * involvement at all (unlike vani's own uart_puts, which this
+ * diagnostic's original header comment correctly avoided for a
+ * DIFFERENT reason -- recursing into the SVC trampoline's own mode-
+ * check could perturb the scheduler state this diagnostic exists to
+ * observe) -- calling it directly here, exactly the same way its own
+ * "already privileged" fast path already does for SVC/IRQ-mode
+ * callers, carries none of that risk, while finally giving every
+ * writer in this project the same single point of mutual exclusion. */
+/* SELF-CAUGHT BUG (same round, before real-HW retest): the FIRST
+ * version of this fix only preserved lr around the nested call,
+ * exactly matching what uart_tx_ring_push_and_drain_impl's own AAPCS
+ * contract technically allows (r0-r3 scratch) -- but sched_diag_put_
+ * hex32's own loop below only saves r0-r3+lr ONCE around its whole
+ * 8-digit loop, relying on r2 (the shifting value) and r3 (the digit
+ * counter) surviving UNTOUCHED across each iteration's nested call
+ * through sched_diag_put_hex1 into this function -- a real, implicit
+ * contract the OLD strb-based body upheld only by accident (it never
+ * touched r2 at all, and explicitly saved/restored r3). Breaking that
+ * contract here corrupted r2/r3 on the very first hex digit, live-
+ * caught under QEMU as a runaway flood of '0' bytes with no newlines
+ * (r3 no longer reliably reaching 0, r2 stuck shifting garbage) --
+ * proof this needed a QEMU regression run before ever reaching real
+ * hardware. Fixed by preserving r0-r3 explicitly across the call, so
+ * this function is observably a no-op on every register except
+ * whatever the caller already expected changed (none). */
 .global sched_diag_putc
 sched_diag_putc:
-    push {r1, r3}
-sched_diag_putc_wait:
-    ldr r1, =0x20201018      /* UART_FR */
-    ldr r3, [r1]
-    tst r3, #0x20             /* TXFF */
-    bne sched_diag_putc_wait
-    ldr r1, =0x20201000      /* UART_DR */
-    strb r0, [r1]
-    pop {r1, r3}
+    push {r0-r3, lr}
+    bl uart_tx_ring_push_and_drain_impl
+    pop {r0-r3, lr}
     bx lr
 
 .global sched_diag_puts
