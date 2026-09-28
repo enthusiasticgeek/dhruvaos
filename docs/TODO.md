@@ -11787,3 +11787,38 @@ session (those could be a downstream consequence of this exact race, or could be
 Real-HW retest is the next step. The dongle-unplug lead from the older investigation is now partially
 exercised too -- the user removed the BLE dongle mid-session (WiFi dongle still attached) -- so the next
 real-HW log is also a partial test of that hypothesis alongside this fix.
+
+### Configurable UART log-level system (/config/loglevel)
+
+User request: continuous background chatter (idle/LOW/HIGH/MEDIUM/MUTEX-LOW/MUTEX-HIGH/GOVERNOR-step) runs
+forever with no way to quiet it, and should be configurable via a real config file (like the GPIO/UART DHDL
+hardware-abstraction effort's own level of design rigor, per the user's own framing), with independent
+levels for UART and SSH.
+
+Scoping clarified via direct questions before touching code: named categories (not per-line numeric
+severity), boot self-test PASS/FAIL verdicts stay unconditionally visible (this project's own primary
+real-HW debugging tool), UART/SSH fully independent, config via a DharaFS file. **Investigated SSH first**:
+`ssh_real_phase4_channel` is still a one-shot handshake demo that sends back one hardcoded line and
+disconnects -- no command loop, no relay of console output -- so there is genuinely nothing SSH-side to gate
+yet. Scoped down to UART-only this round, framework designed so an independent SSH mask can be added later.
+
+New `boot/log_state.S` (single `.bss` word + accessors, same pattern as `governor_state.S`). Bit layout:
+bit0 SELFTEST (reserved), bit1 DIAG (reserved), bit2 DEMO (wired up), bit3 GC (wired up). `log_level_init()`
+reads `/config/loglevel` (plain decimal bitmask) right after `dharafs_init()`; missing/invalid file leaves
+the mask at its 0 default -- DEMO/GC chatter quiet out of the box, config file is the explicit opt-in.
+Retrofitted every DEMO/GC print site (task_a/b/c/d, GC/task_e, both mutex demo tasks), gating only the
+`uart_puts` calls themselves -- every real side effect (locks, WCET timing, `dharafs_compact`,
+`dhcp_client_poll`, fault-injection spins) stays fully unconditional, confirmed by reading each site's
+complete body before editing.
+
+Self-caught two build breaks before QEMU: `len` isn't a valid local variable name in vani (parse error,
+renamed to `read_len`), and gating `task_mutex_demo_high_wake_body`'s prints pushed its real static WCET
+estimate from 102161 to 102204 cycles -- bumped the declared budget to 102300 with a documented reason.
+Also needed `boot/log_state.S` added to `build.sh`'s own explicit per-file assemble+link list (no glob) --
+missed on the first build, caught immediately as a linker error.
+
+Verified end-to-end: default QEMU boot shows zero DEMO/GC chatter (only the 6 pre-existing one-time
+`GOVERNOR: ready_count=...` self-test verdicts, untouched); `write /config/loglevel 12` via the shell,
+persisted to the SD image, then a real second boot against that SAME image round-trips correctly (357
+matching chatter lines vs 6 in the quiet boot) -- the config mechanism genuinely works end-to-end, not just
+compiles. `qemu_run.py` also clean. Commit `084c17a`, local-only (push window closed).
