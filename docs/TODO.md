@@ -11677,3 +11677,34 @@ above leaving DharaFS in a genuinely incomplete state (an active, unfinished pas
 read/write hiccup during it) right before this test runs immediately afterward -- if so, the drain fix
 above may clear it as a side effect, since it stops any pass from bleeding into whatever self-test runs
 next. Not independently confirmed; flagged for the next real-HW retest rather than guessed at further.
+
+### 43rd SD round follow-up 2: hypothesis refuted, real-HW diagnostic added; GPIO pin 31/32 fixed
+
+`picocom_20260928_073536.log`. `dharafs_compact` now PASSes (confirms the drain fix), but `permission
+model...` STILL FAILed -- refuting the "cascading from the compact self-test" hypothesis above, since it
+fails even with a genuinely clean compact pass ahead of it. It's a real, independent bug. Since the test
+only ever printed a single PASS/FAIL across its 8 distinct permission checks, added a `fail_bits` bitmask
+(bit0=other-read-allowed, bit1=other-write-denied, bit2=other-delete-denied, bit3=non-root-create-succeeds,
+bit4=stat_check, bit5=new-file-owner==requester, bit6=root-bypass-write, bit7=chmod-loosened-write-succeeds),
+printed only on FAIL, so the next real-HW log identifies the exact failing check without another guess.
+Diagnostic-only, no logic changed. Commit `5623983`.
+
+Same log also showed `GPIO: function-select read/write + GPSET/GPCLR/GPLEV round trip...` FAIL, specifically
+pin 31/32's GPSET/GPLEV round trip (pin 0/10/39/53 all fine). Root-caused and FIXED this round: the pin
+31/32 half of this check never set function-select to OUTPUT before writing GPSET/GPCLR, on the (QEMU-only-
+valid) assumption stated in the code's own prior comment that GPSET/GPCLR/GPLEV work "regardless of the
+pin's function-select state" -- true only of QEMU's own simplified GPIO model (already documented as a "real
+hardware simplification" in this same file's header comment). Real BCM2835 silicon only drives a pin from
+GPSET/GPCLR when it's genuinely in OUTPUT mode; in any other mode (including the power-on-default INPUT
+state) the write is silently ignored and GPLEV reads the pin's actual electrical state instead. Confirmed
+via the real upstream `bcm2835-rpi-b-rev2.dts` (raspberrypi/linux, fetched directly, not guessed): GPIO31
+sits in an unused I2S ALT2 pinctrl group (never activated -- no I2S driver in this project) and GPIO32 has
+no assigned default at all -- neither is genuinely reserved the way pin 53 is (a live SDHOST DATA line this
+whole boot), just never explicitly switched to OUTPUT before this round trip. Fixed the same way pins
+0/10/39 already are: save/restore original function-select, forcing OUTPUT only for the check's duration.
+Verified: build clean (asm audit 0/0), `phase4_milestone.py`'s real-SD QEMU run and `qemu_run.py` both still
+clean (no-op change under QEMU's own simplified model). Commit `6c2da0d`.
+
+All three of this round's commits (`5623983`, `6c2da0d`, plus `1f350f4` from the prior entry) are local-only
+as of this writing -- held for the next open push window (workday 8pm-5am ET) per standing policy, not
+pushed immediately after committing this time.
