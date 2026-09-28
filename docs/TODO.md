@@ -11564,3 +11564,31 @@ evidence before touching a working path).
 
 Build clean (asm audit 0/0 -- confirms register balance across every exit path of the restructured
 function), QEMU PASS, no aborts, no regressions. Awaiting the next real-HW retest.
+
+### 42nd SD round real-HW retest: THE FIX WORKS -- FIFO_ERROR eliminated, 42-round saga closed
+
+`picocom_20260927_220027.log`, commit `869aa17` (mask-only-the-burst-copy restructuring). Confirmed clean:
+
+- **Zero "read errs=0x00000008"** anywhere in the log -- down from up to 184 occurrences per log across every
+  prior round this saga. FIFO_ERROR is gone.
+- **Zero forced-fallback counter occurrences** -- the FIFO is genuinely ready in time on every single burst
+  now; the unmasked, high-patience wait resolves cleanly without ever needing its own diagnostic to fire.
+- **Zero wedges**, and the FSM-idle/prev-command safety-net checks added earlier this round remain correctly
+  inert (never fire, confirming no regressions).
+- **52 PASS / 1 FAIL** in the self-test suite -- down from 6 FAILs in every prior successful log. Five of the
+  six previously-failing DharaFS tests (multi-block file round trip, dharafs_write_bounded, simulated crash
+  mid-write, permission model, directory hierarchy) now all PASS -- directly confirming, by elimination, that
+  those five were caused by the corrupted/failed reads this round fixed, not independent DharaFS bugs. This
+  answers task #218 for those five.
+- The log is markedly SHORTER (268 lines) while reaching FURTHER (the same deep-crypto-suite point every
+  prior "successful" log reached at 425-450+ lines) -- the boot is measurably faster too, as expected once the
+  repeated error/fallback diagnostic volume disappeared.
+
+**Remaining, now-isolated item**: `dharafs_compact resumes across multiple bounded calls for a log larger
+than its per-call budget (FAIL)` -- the only failure left, now clearly a genuine, separate DharaFS-level bug
+(isolated by elimination now that SD reliability is no longer masking it), unrelated to the SD driver. Not
+yet investigated -- a new, distinct thread if pursued.
+
+This closes the core 4-bit-mode reliability investigation that spanned rounds 37-42 of the SD wedge saga: the
+CRC16 write failure (round 40), the command-level wedge storm (round 42's WIDE_INT_BUS fix), and the
+FIFO_ERROR read failure (round 42's mask-restructuring fix) are all confirmed resolved on real hardware.
