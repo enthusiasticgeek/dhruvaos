@@ -11708,3 +11708,32 @@ clean (no-op change under QEMU's own simplified model). Commit `6c2da0d`.
 All three of this round's commits (`5623983`, `6c2da0d`, plus `1f350f4` from the prior entry) are local-only
 as of this writing -- held for the next open push window (workday 8pm-5am ET) per standing policy, not
 pushed immediately after committing this time.
+
+### 43rd SD round follow-up 3: permission-model FAIL root-caused and fixed
+
+`picocom_20260928_080145.log`. `GPIO: ...` now PASSes (confirms the pin 31/32 fix). `dharafs_compact`
+still PASSes. `permission model...` FAILed with `fail_bits=0x00000006` (bit1=write-denied,
+bit2=delete-denied) -- both checks route through the same `dharafs_check_permission` call on
+`/perm/rootfile` (nominally mode 0o644).
+
+Root cause: this self-test's own LAST step calls `dharafs_chmod("/perm/rootfile", 438)` (0o666,
+world-writable) to exercise the "chmod loosens permission" case. QEMU discards that on every fresh-image
+run; the real, persistent SD card this whole session has been testing against carries it forward across
+reboots -- and the test's own FIRST line (a bare `dharafs_append` meant to establish a known-0o644 starting
+point) silently inherits whatever mode the PREVIOUS boot's own test run left behind, via `dharafs_append`'s
+own "preserve existing owner/mode on overwrite" convenience (its own header comment). 0o666's other-write
+bit stays set (438 = 0b110110110, bit1 set), so the "should be denied" checks correctly reflect the ACTUAL,
+now-loosened permissions and simply succeed -- not a bug in `dharafs_check_permission` itself, just a test
+fixture that can't survive its own side effects on non-ephemeral storage. Once this happens on a real card
+once, it self-perpetuates forever (every subsequent boot re-inherits the loosened mode), which is exactly
+why it showed up mid-session rather than from the very first real-HW run.
+
+Fixed by forcing the mode back to `dharafs_default_mode()` via `dharafs_chmod` immediately after creating
+`/perm/rootfile`, while still root (bypasses every permission check) -- makes the test self-healing
+regardless of what any prior real-HW boot left behind. Verified: build clean (asm audit 0/0),
+`phase4_milestone.py`'s real-SD QEMU run and `qemu_run.py` both still clean. Commit `0cf4ed8`.
+
+**Net result of the 43rd round**: `dharafs_compact` (real-HW confirmed), GPIO pin 31/32 (real-HW confirmed),
+and `permission model` (root-caused and fixed, real-HW confirmation of THIS specific fix still pending) are
+all now resolved. Six commits total this round (`12152c9`, `1f350f4`, `5623983`, `6c2da0d`, `0eb10b8`,
+`0cf4ed8`) remain local-only, held for the next open push window per standing policy.
