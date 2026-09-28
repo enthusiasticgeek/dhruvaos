@@ -11737,3 +11737,53 @@ regardless of what any prior real-HW boot left behind. Verified: build clean (as
 and `permission model` (root-caused and fixed, real-HW confirmation of THIS specific fix still pending) are
 all now resolved. Six commits total this round (`12152c9`, `1f350f4`, `5623983`, `6c2da0d`, `0eb10b8`,
 `0cf4ed8`) remain local-only, held for the next open push window per standing policy.
+
+### UART corruption investigation: root-caused as a real software race, not a hardware issue
+
+Picked up the older, separate, long-running real-HW-only UART corruption thread (`idle`/`GOVERNOR` text
+degrading into `d`/`i`/`l`/`e` fragments right at the start of multitasking, sometimes escalating to a
+Prefetch Abort at a wild PC -- two prior sessions ruled out UART-clock-tied-to-governor and power-supply
+undervoltage; open lead was the attached WiFi+BLE USB dongles) at the user's explicit request.
+
+**Root cause**: `sched_diag_putc` (`boot/context_switch.S`, fires from inside the IRQ/context-switch path
+via `sleep_ticks_diag_print`) and `sdhost_diag_putc` (`boot/sdcard_state.S`, reachable from GC's background
+SD retries during live multitasking) both wrote directly to `UART_DR` via their own polled TXFF-then-`strb`
+sequence, completely bypassing `uart_tx_ring`'s per-byte critical section -- the ONLY thing serializing
+every other UART writer in this project (task #185's own "uart_puts not mutually excluded" fix). A task's
+own `uart_puts` loop only masks IRQ for each single character's own ring push+drain, fully UNMASKING between
+successive characters -- a timer tick landing in that gap let these diagnostics inject bytes straight onto
+the physical FIFO, interleaved mid-string with whatever the preempted task was printing. A genuine software
+race between two independent unsynchronized writers sharing one physical FIFO, not a hardware/electrical
+issue at all -- explains why it starts precisely at multitasking onset (these diagnostics only exist once
+tasks/context-switches exist) and why QEMU never showed it (its own timer-IRQ cadence never happened to
+line up the same way relative to this diagnostic's narrow firing window).
+
+**Fix**: route both through `uart_tx_ring_push_and_drain_impl` (`boot/uart_tx_ring_state.S`, `.global`) --
+pure ring-buffer + hardware-register manipulation with no scheduler involvement, the same primitive the
+ring's own "already privileged" fast path already uses for SVC/IRQ-mode callers. Gives every UART writer in
+the project the same single point of mutual exclusion.
+
+**Self-caught a real regression before it ever reached real hardware**: the first version of this fix only
+preserved `lr` around the nested call. `sched_diag_put_hex32`/`sdhost_diag_put_hex32`'s own loops save
+r0-r3+lr ONCE around their whole 8-digit loop, relying on r2 (shifting value) and r3 (digit counter)
+surviving UNTOUCHED across each iteration's nested call -- an implicit contract the OLD `strb`-based bodies
+upheld only by accident (never touched r2, explicitly saved/restored r3). `uart_tx_ring_push_and_drain_impl`
+clobbers r2/r3 as ordinary AAPCS scratch, so the first version of this fix corrupted them on the very first
+hex digit -- caught live under this round's own QEMU regression run as a runaway flood of `'0'` bytes with
+zero newlines (25MB+ output in 60 seconds, versus the normal ~40KB). Fixed by preserving r0-r3 explicitly
+around the nested call in both functions, making them true no-ops on every register from the caller's point
+of view. This is exactly the kind of thing a QEMU regression pass exists to catch before it costs a real-HW
+round trip.
+
+**Verified**: build clean (asm safety audit 0/0), full 60-second QEMU multitasking run (real SD image) shows
+clean, coherent output throughout -- GC/mutex/scheduler demo-task activity, all DharaFS/GPIO self-tests
+PASS, zero corruption, output size back to the normal ~40KB. `qemu_run.py` also clean. Commit `58cce2b`,
+local-only (push window still closed).
+
+**Honest scope note**: this is a real, well-evidenced root cause for the UART-corruption signature
+specifically, confirmed by strong circumstantial fit (exact onset timing, exact absence under QEMU) -- but
+NOT yet real-HW confirmed, and not yet proven to explain every single Prefetch Abort crash observed this
+session (those could be a downstream consequence of this exact race, or could be partially separate).
+Real-HW retest is the next step. The dongle-unplug lead from the older investigation is now partially
+exercised too -- the user removed the BLE dongle mid-session (WiFi dongle still attached) -- so the next
+real-HW log is also a partial test of that hypothesis alongside this fix.
