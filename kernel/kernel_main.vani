@@ -3783,9 +3783,33 @@ fn gpio_self_check() -> i64 {
   let _ = gpio_set_function(6, orig6);
 
   // GPSET/GPCLR/GPLEV round trip across the GPSET0/GPSET1 (pin
-  // 31/32) boundary -- confirmed live-modeled by QEMU regardless of
-  // the pin's function-select state (see header comment), so no
-  // function-select change is needed for this half of the test.
+  // 31/32) boundary.
+  //
+  // FIX (2026-09-28, real Pi 1B hardware): this round trip used to
+  // skip any function-select change, on the theory (stated in this
+  // comment's own prior wording) that GPSET/GPCLR/GPLEV work
+  // "regardless of the pin's function-select state". That's true only
+  // of QEMU's own simplified GPIO model (see this section's header
+  // comment: "GPSET/GPCLR update the GPLEV-visible level
+  // unconditionally regardless of function-select state -- a real
+  // hardware simplification"). Real BCM2835 silicon only drives a pin
+  // from GPSET/GPCLR when that pin's function-select is genuinely set
+  // to OUTPUT (func=1); in any other mode (including the power-on/
+  // firmware-default INPUT state, func=0) the output latch write is
+  // silently ignored and GPLEV reads back whatever the pin's actual
+  // electrical state is instead -- exactly the "PASS under QEMU, FAIL
+  // on real HW" signature this test showed. Confirmed via the real
+  // upstream `bcm2835-rpi-b-rev2.dts` (raspberrypi/linux): GPIO31 sits
+  // in an unused I2S ALT2 pinctrl group (never activated -- DhruvaOS
+  // has no I2S driver) and GPIO32 has no assigned default at all, so
+  // neither is "reserved" the way pin 53 genuinely is (a real, live
+  // SDHOST DATA line this whole boot) -- both are ordinary free pins,
+  // just never explicitly switched to OUTPUT before this round trip.
+  // Fixed the same way pins 0/10/39 already are above: save/restore
+  // the original function-select, forcing OUTPUT only for the
+  // duration of this check.
+  let orig31: u32 = gpio_get_function(31);
+  let _ = gpio_set_function(31, 1 as u32);
   let _ = gpio_write(31, 1 as u32);
   if gpio_read(31) != (1 as u32) {
     ok = 0;
@@ -3796,6 +3820,10 @@ fn gpio_self_check() -> i64 {
     ok = 0;
     let _ = uart_puts("GPIO DIAG: pin 31 GPCLR/GPLEV (set low) FAILED\n");
   }
+  let _ = gpio_set_function(31, orig31);
+
+  let orig32: u32 = gpio_get_function(32);
+  let _ = gpio_set_function(32, 1 as u32);
   let _ = gpio_write(32, 1 as u32);
   if gpio_read(32) != (1 as u32) {
     ok = 0;
@@ -3806,6 +3834,7 @@ fn gpio_self_check() -> i64 {
     ok = 0;
     let _ = uart_puts("GPIO DIAG: pin 32 GPCLR1/GPLEV1 (set low) FAILED\n");
   }
+  let _ = gpio_set_function(32, orig32);
 
   let _ = uart_puts("GPIO: function-select read/write + GPSET/GPCLR/GPLEV round trip (BCM2835 registers, QEMU-modeled + real-hardware pin53 read-only)");
   if ok == 1 {
