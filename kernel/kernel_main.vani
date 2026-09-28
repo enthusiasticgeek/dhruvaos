@@ -6734,6 +6734,24 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     // level "NEW_FLAG stuck" label still applies unchanged.
     return 1;
   }
+  if drain_status == 5 {
+    // 42nd SD round, 5th follow-up (2026-09-27): real U-Boot's own
+    // bcm2835_send_cmd leading FSM-idle check, bundled into the asm
+    // this round alongside every other identified gap. New external
+    // code (7) -- distinct from the pre-existing 1/4/6 so the next
+    // real-HW log can tell exactly which of the bundled checks fired.
+    let _ = uart_puts("SD DIAG: read FSM not idle before CMD17 issued SDEDM=0x");
+    let _ = uart_put_hex32(sd_mmio_read_u32(SDEDM));
+    let _ = uart_puts("\n");
+    return 7;
+  }
+  if drain_status == 6 {
+    // bcm2835_read_wait_sdcmd's own "wait for the previous command"
+    // check, bundled in alongside the FSM-idle check above. New
+    // external code (8).
+    let _ = uart_puts("SD DIAG: read previous command's NEW_FLAG never cleared before CMD17\n");
+    return 8;
+  }
   if drain_status == 3 {
     // CMD17 FAIL_FLAG -- read SDCMD back for the same diagnostic report
     // the old separate sdhost_cmd call's return value used to feed.
@@ -7072,6 +7090,19 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // own identical short-circuit shape.
   if fill_status == 2 {
     return 1;
+  }
+  if fill_status == 5 {
+    // 42nd SD round, 5th follow-up (2026-09-27): write-side counterpart
+    // of sdhost_read_block_once's own identical checks -- see that
+    // function's own comment for the full rationale.
+    let _ = uart_puts("SD DIAG: write FSM not idle before CMD24 issued SDEDM=0x");
+    let _ = uart_put_hex32(sd_mmio_read_u32(SDEDM));
+    let _ = uart_puts("\n");
+    return 7;
+  }
+  if fill_status == 6 {
+    let _ = uart_puts("SD DIAG: write previous command's NEW_FLAG never cleared before CMD24\n");
+    return 8;
   }
   if fill_status == 3 {
     let cmd24_status: u32 = sd_mmio_read_u32(SDCMD);

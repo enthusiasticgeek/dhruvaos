@@ -11483,3 +11483,37 @@ across every exit path is correct), QEMU PASS, no regressions (identical pre-exi
 pattern). Awaiting the next real-HW retest -- this round tests a hypothesis AND ships the fix simultaneously,
 rather than another separate confirm-then-fix cycle, since raising an already-measured-safe retry cap and
 adding a read-only diagnostic counter carry negligible regression risk either way.
+
+### 42nd SD round, fifth follow-up (2026-09-27): bundled every remaining identified gap into one round
+
+Per explicit user direction ("put all hypothesis code fix so reduce real hardware test runs"), closed the
+remaining confirmed-but-not-yet-applied gaps found during this round's investigation, rather than testing
+them one at a time across further rounds:
+
+- **SDHBCT/SDHBLC write-ordering**: found (but deliberately left unfixed, since it's shared identically by
+  both read and write and so isn't the read/write differentiator) that the production caller wrote SDHBCT/
+  SDHBLC well before the merged asm function's own SDHSTS-clear step, diverging from real U-Boot's own
+  `bcm2835_prepare_data` position (immediately after the SDHSTS clear, immediately before SDARG/SDCMD) and
+  from the diagnostic C port's own matching order. Moved both writes into the merged asm functions themselves
+  (both `sdhost_drain_fifo_to_buffer_impl` and `sdhost_fill_fifo_from_buffer_impl`), in the exact reference
+  position, for both read and write.
+- **Pre-command FSM-idle check**: real U-Boot's own `bcm2835_send_cmd` checks the FSM is already IDENTMODE/
+  DATAMODE before issuing ANY command, and the diagnostic C ports already have this (their own "check 6"/
+  FSM-idle check) -- never previously ported into the production merged functions at all. Added to both,
+  new internal code 5, new external return code 7.
+- **Wait for previous command's own NEW_FLAG**: real U-Boot's own `bcm2835_read_wait_sdcmd`, called before
+  `bcm2835_send_command`'s own SDHSTS-clear step, waits for whatever the PREVIOUS command was doing to
+  genuinely finish. Never previously ported into the production merged functions either (they went straight
+  to the SDHSTS clear). Added to both, new internal code 6, new external return code 8.
+
+Both new checks are purely additive safety nets matching the reference exactly -- in every log captured so
+far, FSM has always already been idle and NEW_FLAG has always already cleared by the time these functions
+run, so neither can change behavior on a transfer that already works; they only add precise diagnosis if
+either condition is ever NOT true, which the production path previously had no way to detect or report at
+all.
+
+Build clean (asm audit 0/0), QEMU PASS, no regressions (identical to the established pre-existing QEMU
+SD-non-functional baseline). This round now bundles every real, confirmed-but-unapplied gap this
+investigation has found alongside the retry-cap bump and forced-fallback counter from the previous
+follow-up, so the next real-HW retest should surface whichever remaining mechanism (if any) is actually at
+play, rather than requiring another separate round to test each one in turn.

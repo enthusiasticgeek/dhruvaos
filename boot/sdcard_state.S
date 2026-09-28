@@ -294,17 +294,72 @@ sdhost_drain_fifo_to_buffer_impl:
     mov r6, r2                /* r6 = arg (CMD17's own argument, the
                                * already-computed card address) */
 
+    /* 42nd SD round, 5th follow-up (2026-09-27): per explicit user
+     * direction to bundle every remaining identified gap into this
+     * same round rather than testing them one at a time, adding the
+     * two checks real U-Boot's own bcm2835_send_cmd/bcm2835_send_
+     * command run before ANYTHING else -- both already present in the
+     * diagnostic C port (boot/rpi1/uboot_sdhost_read.c's own checks 6
+     * and its own "bcm2835_read_wait_sdcmd" comment) but never ported
+     * into this production path until now. FSM-idle check first: the
+     * controller's FSM must already be IDENTMODE/DATAMODE before a new
+     * command is issued at all (STOP_TRANSMISSION's own real-U-Boot
+     * exception doesn't apply -- CMD17/CMD24 are the only commands
+     * that ever reach this function). */
+    ldr r0, =0x20202034        /* SDEDM */
+    ldr r1, [r0]
+    and r1, r1, #0xF
+    cmp r1, #0                  /* SDEDM_FSM_IDENTMODE */
+    cmpne r1, #1                 /* SDEDM_FSM_DATAMODE */
+    moveq r0, #0
+    movne r0, #5                /* FSM not idle before command issued */
+    bne sdhost_drain_cmd_exit
+
+    /* bcm2835_read_wait_sdcmd -- wait for whatever the PREVIOUS command
+     * was doing to genuinely finish before this one starts. In
+     * practice this should already be true by the time this function
+     * runs (the caller's own prior CMD16 already waited for its own
+     * NEW_FLAG to clear) -- included anyway for exact fidelity to the
+     * reference sequence rather than relying on that always holding. */
+    ldr r0, =0x20202000         /* SDCMD */
+    ldr r2, =1000000
+sdhost_drain_prev_cmd_wait:
+    ldr r1, [r0]
+    tst r1, #0x8000
+    beq sdhost_drain_prev_cmd_wait_done
+    subs r2, r2, #1
+    bne sdhost_drain_prev_cmd_wait
+    mov r0, #6                  /* previous command's NEW_FLAG never
+                               * cleared -- this function couldn't even
+                               * start its own command */
+    b sdhost_drain_cmd_exit
+sdhost_drain_prev_cmd_wait_done:
+
     /* Command-issue phase, UNMASKED -- mirrors sdhost_cmd's own real
      * logic (kernel_main.vani) exactly: pre-clear any latched SDHSTS
-     * error bits, write SDARG then SDCMD|NEW_FLAG, poll for NEW_FLAG
-     * to clear. Deliberately duplicated rather than calling sdhost_cmd
-     * itself -- this is raw asm with no AAPCS call boundary to cross,
-     * keeping every instruction between "command done" and "cpsid"
-     * inline and inspectable. */
+     * error bits, SDHBCT/SDHBLC (bcm2835_prepare_data), SDARG, then
+     * SDCMD|NEW_FLAG, poll for NEW_FLAG to clear. SDHBCT/SDHBLC moved
+     * here this round (previously written by the caller, well before
+     * this function's own SDHSTS-clear step -- a real, confirmed
+     * divergence from real U-Boot's own sequencing, though shared
+     * identically by the write side too and so not itself the read/
+     * write differentiator; fixed anyway per "bundle every identified
+     * gap" rather than leaving a known-real divergence in place).
+     * Deliberately duplicated rather than calling sdhost_cmd itself --
+     * this is raw asm with no AAPCS call boundary to cross, keeping
+     * every instruction between "command done" and "cpsid" inline and
+     * inspectable. */
     ldr r0, =0x20202020        /* SDHSTS */
     ldr r1, [r0]
     ands r2, r1, #0xF8         /* SDHSTS_ERROR_MASK */
     strne r1, [r0]
+
+    ldr r0, =0x2020203C        /* SDHBCT */
+    mov r1, #512
+    str r1, [r0]
+    ldr r0, =0x20202050        /* SDHBLC */
+    mov r1, #1
+    str r1, [r0]
 
     ldr r0, =0x20202004        /* SDARG */
     str r6, [r0]
@@ -864,12 +919,50 @@ sdhost_fill_fifo_from_buffer_impl:
     mov r5, r1                /* r5 = cmd_and_flags */
     mov r6, r2                /* r6 = arg (CMD24's own argument) */
 
+    /* 42nd SD round, 5th follow-up -- see sdhost_drain_fifo_to_
+     * buffer_impl's own identical block for the full rationale (bundled
+     * into both read and write this round per explicit user direction).
+     * FSM-idle check first. */
+    ldr r0, =0x20202034        /* SDEDM */
+    ldr r1, [r0]
+    and r1, r1, #0xF
+    cmp r1, #0                  /* SDEDM_FSM_IDENTMODE */
+    cmpne r1, #1                 /* SDEDM_FSM_DATAMODE */
+    moveq r0, #0
+    movne r0, #5                /* FSM not idle before command issued */
+    bne sdhost_fill_cmd_exit
+
+    /* bcm2835_read_wait_sdcmd -- wait for the previous command to
+     * genuinely finish. */
+    ldr r0, =0x20202000         /* SDCMD */
+    ldr r2, =1000000
+sdhost_fill_prev_cmd_wait:
+    ldr r1, [r0]
+    tst r1, #0x8000
+    beq sdhost_fill_prev_cmd_wait_done
+    subs r2, r2, #1
+    bne sdhost_fill_prev_cmd_wait
+    mov r0, #6                  /* previous command's NEW_FLAG never
+                               * cleared */
+    b sdhost_fill_cmd_exit
+sdhost_fill_prev_cmd_wait_done:
+
     /* Command-issue phase, UNMASKED -- see sdhost_drain_fifo_to_
-     * buffer_impl's own identical block for the full rationale. */
+     * buffer_impl's own identical block for the full rationale.
+     * SDHBCT/SDHBLC moved here this round, matching real U-Boot's own
+     * bcm2835_prepare_data position exactly (previously written by the
+     * caller, well before this function's own SDHSTS-clear). */
     ldr r0, =0x20202020        /* SDHSTS */
     ldr r1, [r0]
     ands r2, r1, #0xF8         /* SDHSTS_ERROR_MASK */
     strne r1, [r0]
+
+    ldr r0, =0x2020203C        /* SDHBCT */
+    mov r1, #512
+    str r1, [r0]
+    ldr r0, =0x20202050        /* SDHBLC */
+    mov r1, #1
+    str r1, [r0]
 
     ldr r0, =0x20202004        /* SDARG */
     str r6, [r0]
