@@ -11877,3 +11877,34 @@ boot-time-only, by design), while a real reboot against the same persisted SD im
 mask (`0x0000000C`, DEMO GC) -- the full config+query round trip is real, not each half tested in isolation.
 asm audit 0/0, `qemu_run.py` clean, full DharaFS/GPIO self-test regression clean under a real-SD-image QEMU
 run. Commit `6a42efc`, local-only (push window closed). Task #294 marked complete; #295-304 remain pending.
+
+### UART corruption investigation reopened: ring-race fix confirmed present but insufficient, dongle hypothesis ruled out, diagnostic redesigned
+
+The `58cce2b` ring-race fix above (`sched_diag_putc`/`sdhost_diag_putc` bypassing `uart_tx_ring`) was
+re-verified as still genuinely present and complete in the current build (git log + grep confirm no remaining
+direct `UART_DR` writes) -- but a real-HW retest showed corruption STILL happening, under a new signature
+("CUSTOM: dynamically-created task running" truncating). So the fix is real and necessary, just not the full
+explanation.
+
+User then explicitly asked to "rule out electrical" from the software side. Did a careful hand-trace of the
+entire UART-print chain -- ring buffer critical section, SWI #7 trampoline register preservation, dynamic
+task creation frame setup -- and found no new software bug. Honest negative result, not a clean bill of
+health, given this codebase's own history of bugs (e.g. `swi_entry.S`'s several register-preservation fixes)
+only ever caught via live capture, never by static review alone.
+
+Added a temporary diagnostic (`boot/custom_diag_state.S`, `task_custom_demo_wake_body`) to get more real-HW
+signal. First version (5 fields: fire count, tick, current_task, context_switch_count) needed `#[wcet]`
+bumped 20000->120000 (real cost 114133). User then removed BOTH USB dongles (WiFi + BLE) entirely and
+retested: corruption persisted regardless (`USB: port connected=00000000` confirms both gone) -- the dongle
+hypothesis, the single most concrete lead from the original investigation, is now definitively ruled out. The
+diagnostic print itself also got corrupted in that same capture, cutting off after "tick=10" before reaching
+`cur=`/`ctxsw=` -- no clean before/after comparison data yet.
+
+**Redesigned the diagnostic as a position "ruler"** (commit `4eb5048`): both real corrupted captures so far
+cut off in a similar 18-21 character range, so a 36-char string where every position is uniquely identifiable
+(`RULER:0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ`) turns that coincidence into a real measurement -- the exact
+last-intact character read off the wire gives the exact surviving byte count, no word-boundary guessing
+needed. A consistent cutoff position across fires would point to a fixed character-budget trigger; a varying
+cutoff would point to a timing/tick-periodic trigger instead. QEMU-verified clean (asm audit 0/0, `RULER:`/
+`CUSTOM:` print correctly on every fire, `qemu_run.py` PASS). Local-only (push window closed, Tuesday
+daytime). Next step is a real-HW retest with this build to read the actual cutoff position(s).
