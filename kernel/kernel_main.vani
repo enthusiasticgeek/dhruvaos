@@ -28716,15 +28716,22 @@ fn task_custom_demo_wake_body() -> i64 {
   let diag_fires: u32 = custom_diag_fire_count_get();
   if diag_fires < (20 as u32) {
     let _ = custom_diag_fire_count_set(diag_fires + (1 as u32));
-    let _ = uart_puts_bounded("CDIAG fire=");
-    let _ = uart_put_i64_bounded(diag_fires as i64);
-    let _ = uart_puts_bounded(" tick=");
-    let _ = uart_put_i64_bounded(scheduler_get_tick_count() as i64);
-    let _ = uart_puts_bounded(" cur=");
-    let _ = uart_put_i64_bounded(current_task_get() as i64);
-    let _ = uart_puts_bounded(" ctxsw=");
-    let _ = uart_put_i64_bounded(context_switch_count_get());
-    let _ = uart_puts_bounded("\n");
+    // Shrunk 2026-09-29 (real-HW retest, both USB dongles now fully
+    // removed): the previous multi-field version got corrupted before
+    // ever reaching cur=/ctxsw=, so it gave no usable comparison data.
+    // Both real corrupted strings captured so far cut off in roughly
+    // the same range (18-21 characters in: "CUSTOM: dynamicall"~18-19,
+    // "CDIAG fire=0 tick=10"~21) -- a "ruler" with every position
+    // uniquely identifiable turns that coincidence into a real
+    // measurement: wherever this actually cuts, the last intact
+    // character read directly off the wire tells us exactly how many
+    // bytes survived, no guessing from word-boundaries needed. If the
+    // cutoff position is the SAME every fire, that's real evidence for
+    // a fixed character-count trigger; if it varies fire to fire,
+    // that argues for a timing/tick-periodic trigger instead, whose
+    // exact cutoff depends on how much unrelated work happened to run
+    // just before this specific print started.
+    let _ = uart_puts_bounded("RULER:0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\n");
   }
   let _ = uart_puts_bounded("CUSTOM: dynamically-created task running\n");
   return 0;
