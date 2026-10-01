@@ -11943,6 +11943,30 @@ allocations=681`, matching the same boot's own `HEAP:` self-test line. Local-onl
 Thursday daytime). Task #296 marked complete. Registration table now at 6/8 slots -- Phase 3's 4 subsystems
 (USB host/ethernet/WiFi/BLE) will need `boot/dhdl_state.S`'s `DHDL_MAX_SLOTS` raised past 8 before they fit.
 
+### DHDL Phase 3 DONE: USB host, ethernet, WiFi, BLE enumeration state wired into dhdl query (task #297)
+
+Same opportunistic no-real-HW session as Phases 1-2 above. Raised `boot/dhdl_state.S`'s registration table
+8 -> 12 slots first (6 already used, this phase's 4 would have been the 9th -- exactly the trigger the
+file's own header comment named for when to raise the cap). Scoped DOWN from the roadmap's own "link state,
+MAC, WPA2 status, enumeration state" wishlist to what's actually a no-argument, no-side-effect query today:
+`usb_describe` reuses `dwc2_port_connected`/`_port_enabled` (direct real HPRT0 register reads, the same ones
+the boot self-test's own "USB: port connected=..." print already uses); `ethernet_describe`/`wifi_describe`/
+`ble_describe` each reuse that device class's own `_get_kind` accessor (`usb_net`/`usb_wifi`/`usb_bt_state.S`
+-- 0 = nothing of that class enumerated yet). Deliberately did NOT reach into the WPA2 join context
+(`wpa2_join_start`/`_step_mgmt`/`_step_eapol` all take an explicit caller-owned ctx, not a persisted global
+singleton a no-argument describe fn could read) or the GATT layer's own connection state -- both real,
+actively-evolving surfaces (task #197 is still in-progress) where exposing richer state needs its own
+persisted-state design, not a quick retrofit. That richer slice is a real follow-up, not blocked by this
+round's narrower "enumeration state" scope.
+
+QEMU-verified end-to-end: build clean (asm audit 0/0, including the slot-count bump), `qemu_run.py` clean
+(same 6 pre-existing baseline FAILs), direct interactive-shell boot confirmed: `dhdl list` now shows 10
+registered subsystems; `dhdl query usb` -> `port_connected=no port_enabled=no`; `dhdl query ethernet`/`wifi`/
+`ble` all correctly report `kind=0 (0=none enumerated)` -- exactly right, since no real USB device ever
+enumerates under QEMU's DWC2 model. Local-only (push window closed, Thursday daytime). Task #297 marked
+complete. All 4 DHDL retrofit phases (#294-297) now done; #298 (`dhdl set`, live reconfiguration) and #299-304
+(the 6 missing-driver epics) remain pending.
+
 ### UART corruption investigation reopened: ring-race fix confirmed present but insufficient, dongle hypothesis ruled out, diagnostic redesigned
 
 The `58cce2b` ring-race fix above (`sched_diag_putc`/`sdhost_diag_putc` bypassing `uart_tx_ring`) was

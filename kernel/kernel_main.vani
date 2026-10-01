@@ -24950,10 +24950,75 @@ fn ram_describe() -> i64 {
   return 0;
 }
 
+// DHDL Phase 3 (task #297, docs/DHDL_ROADMAP.md): the 4 USB-backed
+// subsystems. Scoped down from the roadmap's own "link state, MAC,
+// WPA2 status, enumeration state" wishlist to what's actually a
+// no-argument, no-side-effect query today: `dwc2_port_connected`/
+// `_port_enabled` (direct real HPRT0 register reads, the same ones
+// the boot-time "USB: port connected=..." self-test print already
+// uses) for the host controller itself, and each device class's own
+// `_get_kind` accessor (0 = nothing of that class enumerated yet;
+// nonzero = a specific real device variant detected during USB
+// enumeration) for ethernet/wifi/ble. Deliberately NOT reaching into
+// the WPA2 join context (`wpa2_join_start`/`_step_mgmt`/`_step_eapol`
+// all take an explicit caller-owned ctx, not a persisted global
+// singleton a no-argument describe fn could read) or the GATT layer's
+// own connection state -- both are real, actively-evolving surfaces
+// (task #197 is still in-progress), and exposing them meaningfully
+// needs its own persisted-state design, not a quick retrofit. Richer
+// per-subsystem state is exactly the kind of follow-up this round's
+// own "enumeration state" slice leaves room for without blocking it.
+fn dhdl_subsys_usb_id() -> u32 {
+  return 7 as u32;
+}
+
+fn usb_describe() -> i64 {
+  let _ = uart_puts("usb: port_connected=");
+  let _ = uart_puts(if dwc2_port_connected() == 1 { "yes" } else { "no" });
+  let _ = uart_puts(" port_enabled=");
+  let _ = uart_puts(if dwc2_port_enabled() == 1 { "yes" } else { "no" });
+  let _ = uart_puts("\n");
+  return 0;
+}
+
+fn dhdl_subsys_ethernet_id() -> u32 {
+  return 8 as u32;
+}
+
+fn ethernet_describe() -> i64 {
+  let _ = uart_puts("ethernet: usb_net_kind=");
+  let _ = uart_put_i64(usb_net_get_kind() as i64);
+  let _ = uart_puts(" (0=none enumerated)\n");
+  return 0;
+}
+
+fn dhdl_subsys_wifi_id() -> u32 {
+  return 9 as u32;
+}
+
+fn wifi_describe() -> i64 {
+  let _ = uart_puts("wifi: usb_wifi_kind=");
+  let _ = uart_put_i64(usb_wifi_get_kind() as i64);
+  let _ = uart_puts(" (0=none enumerated)\n");
+  return 0;
+}
+
+fn dhdl_subsys_ble_id() -> u32 {
+  return 10 as u32;
+}
+
+fn ble_describe() -> i64 {
+  let _ = uart_puts("ble: usb_bt_kind=");
+  let _ = uart_put_i64(usb_bt_get_kind() as i64);
+  let _ = uart_puts(" (0=none enumerated)\n");
+  return 0;
+}
+
 // Called once from kernel_main, after log_level_init -- registers
-// every subsystem this round wires into the DHDL query mechanism.
-// docs/DHDL_ROADMAP.md's Phase 3 adds the rest, each just another
-// dhdl_register call here, no change to the mechanism itself.
+// every subsystem wired into the DHDL query mechanism so far.
+// docs/DHDL_ROADMAP.md's Phase 4 adds per-subsystem `dhdl set`, not
+// new subsystems -- no more dhdl_register call sites expected here
+// until Phase 5's new drivers (I2C/SPI/CAN/RS485/audio/LoRa) land.
 fn dhdl_init() -> i64 {
   let _ = dhdl_register(dhdl_subsys_loglevel_id(), log_level_describe);
   let _ = dhdl_register(dhdl_subsys_sd_id(), sd_describe);
@@ -24961,6 +25026,10 @@ fn dhdl_init() -> i64 {
   let _ = dhdl_register(dhdl_subsys_display_id(), display_describe);
   let _ = dhdl_register(dhdl_subsys_dma_id(), dma_describe);
   let _ = dhdl_register(dhdl_subsys_ram_id(), ram_describe);
+  let _ = dhdl_register(dhdl_subsys_usb_id(), usb_describe);
+  let _ = dhdl_register(dhdl_subsys_ethernet_id(), ethernet_describe);
+  let _ = dhdl_register(dhdl_subsys_wifi_id(), wifi_describe);
+  let _ = dhdl_register(dhdl_subsys_ble_id(), ble_describe);
   return 0;
 }
 
@@ -26231,6 +26300,18 @@ fn dhdl_name_for_id(id: u32) -> Str {
   if id == dhdl_subsys_ram_id() {
     return "ram";
   }
+  if id == dhdl_subsys_usb_id() {
+    return "usb";
+  }
+  if id == dhdl_subsys_ethernet_id() {
+    return "ethernet";
+  }
+  if id == dhdl_subsys_wifi_id() {
+    return "wifi";
+  }
+  if id == dhdl_subsys_ble_id() {
+    return "ble";
+  }
   return "?";
 }
 
@@ -26288,6 +26369,22 @@ fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
     }
     if shell_word_matches(line_buf, name_start, name_end, "ram") == 1 {
       let _ = dhdl_call_by_id(dhdl_subsys_ram_id());
+      return 0;
+    }
+    if shell_word_matches(line_buf, name_start, name_end, "usb") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_usb_id());
+      return 0;
+    }
+    if shell_word_matches(line_buf, name_start, name_end, "ethernet") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_ethernet_id());
+      return 0;
+    }
+    if shell_word_matches(line_buf, name_start, name_end, "wifi") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_wifi_id());
+      return 0;
+    }
+    if shell_word_matches(line_buf, name_start, name_end, "ble") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_ble_id());
       return 0;
     }
     let _ = uart_puts("dhdl: unknown subsystem (see `dhdl list`)\n");

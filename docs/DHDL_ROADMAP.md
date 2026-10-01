@@ -138,6 +138,19 @@ there) proves the pattern live.
 - **Phase 3 — retrofit the USB-backed subsystems.** USB host, ethernet,
   WiFi, BLE — more parameters each (link state, MAC, WPA2 status,
   enumeration state), same mechanism, no new mechanism work.
+  **DONE (2026-10-01, task #297)**, scoped down to enumeration state
+  only: `usb_describe` (`dwc2_port_connected`/`_port_enabled`, direct
+  real HPRT0 reads, same ones the boot self-test's own "USB: port
+  connected=..." print already uses), `ethernet_describe`/`wifi_
+  describe`/`ble_describe` (each device class's own `_get_kind`
+  accessor). Deliberately did NOT reach into the WPA2 join context
+  (explicit caller-owned, not a persisted singleton) or GATT
+  connection state -- both real, actively-evolving surfaces (task #197
+  still in-progress); richer per-subsystem state is a follow-up, not
+  blocked by this round. Registration table raised 8->12 slots
+  (`boot/dhdl_state.S`) to fit; now at 10/12. QEMU-verified live: all 4
+  return correct state (no USB device ever enumerates under QEMU, so
+  every kind reads 0/no, exactly as expected).
 - **Phase 4 — per-subsystem `dhdl set` support.** Only after Phase 1-3
   prove `list`/`query` live; scoped and safety-reviewed one subsystem at
   a time, starting with the ones already proven safe to reconfigure live

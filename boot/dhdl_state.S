@@ -23,17 +23,24 @@
  * shell_word_matches, already used for every other shell subcommand),
  * so name<->id mapping stays in kernel_main.vani, and this file only
  * ever touches plain u32 ids and function-pointer words. Small, fixed
- * capacity (8 slots) -- this project's own established "no dynamic
- * collections, fixed-size + linear scan" convention (see dirindex_
- * state.S's own header comment). Raise DHDL_MAX_SLOTS the day an 9th
- * subsystem needs registering, not before. */
+ * capacity -- this project's own established "no dynamic collections,
+ * fixed-size + linear scan" convention (see dirindex_state.S's own
+ * header comment).
+ *
+ * Raised 8 -> 12 (2026-10-01, task #297, DHDL Phase 3): Phase 1/2
+ * already registered 6 (loglevel/sd/gpio/display/dma/ram); Phase 3's
+ * 4 USB-backed subsystems (usb/ethernet/wifi/ble) would have been the
+ * 9th slot, exactly the trigger this file's own header used to name
+ * for when to raise the cap. 12 gives 2 spare slots beyond this
+ * round's 10, not a large arbitrary headroom -- raise again the day a
+ * 13th subsystem needs registering, not before. */
 
 .section ".bss"
 .align 2
 dhdl_slot_ids:
-    .space 32      /* 8 slots * 4 bytes, u32 id each; 0 = never used */
+    .space 48      /* 12 slots * 4 bytes, u32 id each; 0 = never used */
 dhdl_slot_fns:
-    .space 32      /* 8 slots * 4 bytes, function-pointer word each */
+    .space 48      /* 12 slots * 4 bytes, function-pointer word each */
 dhdl_slot_count:
     .word 0
 
@@ -48,7 +55,7 @@ dhdl_register:
     push {r4, r5, lr}
     ldr r2, =dhdl_slot_count
     ldr r3, [r2]
-    cmp r3, #8
+    cmp r3, #12
     bge dhdl_register_full
     ldr r4, =dhdl_slot_ids
     str r0, [r4, r3, lsl #2]
