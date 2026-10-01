@@ -11908,3 +11908,40 @@ needed. A consistent cutoff position across fires would point to a fixed charact
 cutoff would point to a timing/tick-periodic trigger instead. QEMU-verified clean (asm audit 0/0, `RULER:`/
 `CUSTOM:` print correctly on every fire, `qemu_run.py` PASS). Local-only (push window closed, Tuesday
 daytime). Next step is a real-HW retest with this build to read the actual cutoff position(s).
+
+### UART corruption root-caused: one-byte-per-call drain rate, not a data/electrical bug -- burst-drain fix implemented
+
+Analyzed a fresh real-HW picocom capture (`~/picocom_20260929_085234.log`) taken with the ruler diagnostic
+above. Every single `RULER:` fire across dozens of occurrences truncated at the exact same ~18-character
+position (`RULER:0123456789ABF` or `...ABE` -- 18 correct chars then one wrong-but-plausible trailing hex
+digit), immediately followed by a genuine `\n` (confirmed via `cat -A` and a raw Python byte read -- no
+hidden `\r`/escape artifact misleading the analysis). `CUSTOM: dynamically-create[d]...` truncated at the
+same mark. Confirmed via `strings`/`grep -a -o` on the built ELF that the full 36-char RULER string is intact
+and correct in `.rodata` -- ruling out a compiler/constant-encoding bug and proving this is a transmission-
+ORDER problem, not data corruption. Early in the log, genuine `"FIQ: task_a resum"`/`"SLEEP: task_a resum"`
+fragments appear (the two diagnostics capped at 8 fires each) then stop, while the `RULER:...ABF/ABE`
+truncation pattern continues identically for dozens of fires afterward -- ruling out "live diagnostic
+interleaving" as the complete explanation, since it outlives the diagnostics that would cause it.
+
+**Root cause**: `uart_tx_ring_push_and_drain_impl` (`boot/uart_tx_ring_state.S`) only ever drained ONE byte
+to hardware per call, regardless of how much room the real 16-byte PL011 TX FIFO had. The ring has no
+independent periodic flush -- it only drains as a side effect of a new push (confirmed by exhaustive grep:
+`uart_putc_nonblocking` at `kernel_main.vani:4230` is the only call site into the drain logic anywhere).
+`timer_tick_dispatch`'s own unconditional `.` heartbeat (`kernel_main.vani:12317`, every real tick, ~10ms)
+is the only thing draining the ring when nothing else is actively printing -- a ~1 byte/~10ms drain rate,
+far slower than `task_custom_demo`'s own burst rate (~86 bytes every ~70ms). The ring saturates under
+sustained demo-task activity, and old undrained backlog bytes from earlier prints (plausibly the stray hex
+digits left over from the capped SLEEP:/FIQ: diagnostics) get spliced into the front of whatever prints
+next -- byte-correct, but visually meaningless. This explains every observed detail: real-HW-only
+reproduction (QEMU's emulated PL011/stdio chardev apparently never backs up the same way), the remarkably
+consistent ~18-character cutoff (a structural saturation point, not timing jitter), the plausible-but-wrong
+trailing bytes (real leftover bytes, not bit corruption), and the truncation outliving the capped
+diagnostics (it's the ring's own throughput limit, not those diagnostics' live activity).
+
+**Fix** (uncommitted hash pending): changed `uart_tx_ring_push_and_drain_impl`'s single-shot drain into a
+bounded loop capped at 16 iterations per call (matching the real PL011 TX FIFO depth), added `r7` to the
+save/restore list for the iteration counter. Build clean (asm audit 0/0), both `qemu_run.py` and a direct
+real-SD-image `qemu-system-arm` run show `RULER:`/`CUSTOM:` printing correctly every fire with no new
+regressions (the 6 DharaFS FAILs in `qemu_run.py` are the known pre-existing SD-less-harness gap, unrelated).
+Local-only (push window closed, Thursday daytime). **Real-HW retest is still required** -- this investigation
+has repeatedly shown QEMU passing is necessary but never sufficient evidence for this bug class.

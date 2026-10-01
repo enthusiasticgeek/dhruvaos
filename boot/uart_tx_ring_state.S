@@ -132,18 +132,44 @@ utrpd_ret:
     bx lr
 
 /* uart_tx_ring_push_and_drain_impl(c: u32) -> u32 -- the real logic,
- * unchanged from the original version except for the cpsid/cpsie
- * masking now wrapping the entire head/tail read-modify-write and
- * FIFO drain. Reachable two ways: directly (bl) from the trampoline
- * above when already privileged, or via SWI #7 when the original
- * caller was in USR mode. r0 = byte to enqueue on entry. Pushes c
- * into the ring (dropped only if the ring itself is full -- a 64-byte
- * buffer, not the hardware's own 16-byte one), then attempts to drain
- * exactly one byte from the ring to the real UART TX FIFO if there's
- * room. Return value unused by any caller; r0 = 0 always. */
+ * cpsid/cpsie masking the entire head/tail read-modify-write and FIFO
+ * drain. Reachable two ways: directly (bl) from the trampoline above
+ * when already privileged, or via SWI #7 when the original caller was
+ * in USR mode. r0 = byte to enqueue on entry. Pushes c into the ring
+ * (dropped only if the ring itself is full -- a 64-byte buffer, not
+ * the hardware's own 16-byte one), then drains up to 16 bytes (the
+ * real PL011 TX FIFO depth, not an arbitrary number) from the ring to
+ * hardware in the same call, as long as there's room. Return value
+ * unused by any caller; r0 = 0 always.
+ *
+ * 2026-10-01 (real-HW UART corruption investigation, ruler diagnostic
+ * round): previously drained exactly ONE byte per call, no matter how
+ * much room the hardware FIFO actually had. That one-byte-per-call
+ * rate is the real bottleneck, not UART baud rate: timer_tick_dispatch
+ * calls uart_putc_nonblocking once per tick (its own '.' heartbeat),
+ * and that was the ONLY thing ever draining this ring when nothing
+ * else happened to be printing -- confirmed by grep: this is the
+ * single call site into the drain logic anywhere in the codebase, no
+ * periodic/idle-time flush exists separately. A task that bursts two
+ * back-to-back prints (e.g. task_custom_demo's RULER + CUSTOM lines,
+ * ~86 bytes together) fills far more of the 64-byte ring than one
+ * byte/tick can ever drain before the NEXT burst adds another ~86 --
+ * net backlog only grows. Once the ring saturates, old undrained bytes
+ * from an unrelated, much earlier print (observed: stray hex digits
+ * left over from the capped SLEEP:/FIQ: resume diagnostics, long after
+ * those diagnostics' own 8-fire cap had been exhausted) get spliced in
+ * front of whatever prints next, byte-correct but visually meaningless
+ * -- explaining a real-HW-only, highly consistent early cutoff with no
+ * actual bit-level corruption involved: the ruler diagnostic's own
+ * exact 36-char string is intact and complete in .rodata (confirmed
+ * via `strings` on the built ELF); what gets corrupted is purely the
+ * TRANSMISSION ORDER, not the data. QEMU's emulated PL011 apparently
+ * never gets backed up the same way (its own stdio chardev likely
+ * accepts bytes far faster than one-per-call ever becomes a real
+ * bottleneck), which is why this was never reproducible there. */
 .global uart_tx_ring_push_and_drain_impl
 uart_tx_ring_push_and_drain_impl:
-    push {r4, r5, r6, lr}
+    push {r4, r5, r6, r7, lr}
     mrs r6, cpsr
     cpsid if
     mov r5, r0                  /* r5 = c, preserved across the whole routine */
@@ -155,20 +181,29 @@ uart_tx_ring_push_and_drain_impl:
     add r0, r2, #1
     and r0, r0, #63             /* r0 = next_head = (head + 1) & 63 */
     cmp r0, r4
-    beq drain_step               /* ring full -- skip the push, still try to drain */
+    beq drain_loop_init          /* ring full -- skip the push, still try to drain */
 
     ldr r1, =uart_tx_ring_buf
     strb r5, [r1, r2]            /* buf[head] = c */
     ldr r1, =uart_tx_ring_head
     str r0, [r1]                 /* head = next_head */
 
+drain_loop_init:
+    mov r7, #16                  /* bounded burst-drain cap, matching the
+                                   * real PL011 TX FIFO depth -- see this
+                                   * function's own header comment */
 drain_step:
+    cmp r7, #0
+    beq done                     /* burst cap reached -- remaining backlog
+                                   * waits for the next call, same as before */
+    sub r7, r7, #1
+
     ldr r1, =uart_tx_ring_head
     ldr r2, [r1]                 /* r2 = head (possibly just updated) */
     ldr r3, =uart_tx_ring_tail
     ldr r4, [r3]                 /* r4 = tail */
     cmp r2, r4
-    beq done                     /* ring empty -- nothing to drain */
+    beq done                     /* ring empty -- nothing left to drain */
 
     ldr r1, =0x20201018          /* UART_FR */
     ldr r0, [r1]
@@ -183,10 +218,11 @@ drain_step:
     and r4, r4, #63              /* next_tail = (tail + 1) & 63 */
     ldr r1, =uart_tx_ring_tail
     str r4, [r1]
+    b drain_step
 
 done:
     msr cpsr_c, r6
     mov r0, #0
     mov r1, #0
-    pop {r4, r5, r6, lr}
+    pop {r4, r5, r6, r7, lr}
     bx lr
