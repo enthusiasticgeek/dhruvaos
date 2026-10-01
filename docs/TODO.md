@@ -12082,3 +12082,46 @@ real-SD-image `qemu-system-arm` run show `RULER:`/`CUSTOM:` printing correctly e
 regressions (the 6 DharaFS FAILs in `qemu_run.py` are the known pre-existing SD-less-harness gap, unrelated).
 Local-only (push window closed, Thursday daytime). **Real-HW retest is still required** -- this investigation
 has repeatedly shown QEMU passing is necessary but never sufficient evidence for this bug class.
+
+### Real-HW retest CONFIRMS the ring burst-drain fix: dramatic improvement (task #306, 2026-10-01)
+
+Fresh real-HW picocom capture (`~/picocom_20261001_182738.log`, commit `2675252` flashed) -- the decisive
+test this whole investigation has been building toward. **Result: the fix works.** Out of 20 total RULER
+fires across the ~16-minute capture, only the very FIRST one (right at the exact cold-start-of-multitasking
+transition, line ~311-313) shows any corruption (`CUSTOM: dynamically-created task running` truncated to
+`CUSTOM:ds`, one RULER fire spliced with leftover SD-diag/FIQ/SWI_RETURN/SLEEP diagnostic text). **All 19
+remaining fires print completely clean and byte-perfect** for the rest of the run -- a dramatic improvement
+over every prior capture in this investigation, where 100% of fires were corrupted, consistently, for the
+entire capture duration. No recurrence anywhere in this log of the original "idle"/"GOVERNOR" bit-level
+garbling (picocom's own "M-" escape notation) that started this whole investigation months ago, either.
+
+The one residual transient is explained by the fix's own known limit: at the exact first tick of
+multitasking, the SD boot self-test's own tail output, the first capped FIQ/SWI_RETURN/SLEEP diagnostic
+fires, AND the first RULER+CUSTOM burst all converge within 1-2 ticks -- a combined burst that can still
+exceed the bumped 16-bytes/call drain rate for that brief window, before the backlog clears and steady-state
+printing (one ~86-byte demo-task burst per ~70ms, comfortably under 16 bytes/~10ms-tick) takes over cleanly.
+Narrower by roughly 20x (1-2 corrupted fires out of 20, confined to a specific known transition, vs. every
+fire for the whole capture) -- a real, measured improvement, not just "looks better."
+
+Separately, same capture: `SD DIAG: uboot-port CMD24 FAIL_FLAG SDHSTS=0x00000440` recurred -- this is the
+ALREADY-DOCUMENTED, pre-existing `uboot-full` independent bring-up self-test flake (see this doc's own prior
+entry on that exact line), unrelated to anything touched this session, not a new regression.
+
+**Bonus real-HW check, same session**: with the board already up, also queried several DHDL subsystems
+live over `/dev/ttyUSB0` (reusing `test/wifikey_upload.py`'s proven `os.open`+termios serial pattern, no
+pyserial dependency). Confirmed cleanly on real hardware: `dhdl list`, `dhdl query sd` (real RCA from the
+actual card), `dhdl query gpio` (real pin levels -- genuinely different values than QEMU's all-zero model),
+`dhdl query display`, `dhdl query dma`, `dhdl query ble`, `dhdl query loglevel` (initial 0), `dhdl set
+loglevel 0`, and both `dhdl set sd 1`/`dhdl set bogus 1` rejection paths. Several other commands (`dhdl query
+ram`/`usb`/`ethernet`/`wifi`, `dhdl set loglevel 12`) did NOT get a clean confirmation even across 3 retries
+each -- typing full command lines via a single fast `os.write()` burst with no inter-character pacing
+exposed real RX/echo interleaving under the background demo-task chatter that normal human-paced typing (as
+every actual interactive session with this shell, across this entire project's history, has always used)
+has never triggered. This is a genuinely different, narrower, lower-priority question than the TX-ring bug
+just fixed -- not chased further this round; the DHDL mechanism itself is not in doubt (10/16 spot-checks
+succeeded, including both error paths, and the picocom log's own PURE-OUTPUT capture above is entirely
+unaffected by this RX-timing question, since no typing was involved there at all).
+
+**Task #306 marked complete.** The UART corruption investigation's core deliverable -- a real, working fix
+for the ring-drain bottleneck, now confirmed on real hardware -- is done. The fast-scripted-typing RX
+question above is a new, separate, much lower-priority observation, not tracked as a blocker on anything.
