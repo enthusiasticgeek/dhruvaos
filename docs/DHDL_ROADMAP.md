@@ -113,6 +113,14 @@ there) proves the pattern live.
   surface.** SD (`sdcard_state.S`, most mature), GPIO, the already-shipped
   log-level system itself (dogfooding `dhdl query loglevel`). Smallest
   effort, proves the pattern against real, varied accessor shapes.
+  **DONE (2026-10-01, task #295)**: `sd_describe`/`gpio_describe` added
+  (`kernel_main.vani`), thin adapters over existing accessors (`sd_state_
+  get_rca`/`_is_sdhc`/`_is_4bit`/`_drain_forced_fallback_count`;
+  `gpio_get_function`/`gpio_read` on the 8 pins the boot code actively
+  drives: UART0 TXD/RXD + SDHOST CLK/CMD/DAT0-3). QEMU-verified live:
+  `dhdl list` shows all 3 subsystems, `dhdl query sd`/`dhdl query gpio`
+  both return genuinely live state (real RCA from boot-time card init,
+  correct ALT0 function-select on all 8 pins).
 - **Phase 2 — retrofit display, DMA, RAM/heap.** Display and DMA are
   direct retrofits; RAM needs one new adapter over the C-runtime-stub
   state (no new `.bss` file required, just an adapter fn).

@@ -24809,13 +24809,82 @@ fn log_level_describe() -> i64 {
   return 0;
 }
 
+// DHDL Phase 1 (task #295, docs/DHDL_ROADMAP.md): SD, the subsystem
+// with the densest existing accessor surface in this project per the
+// roadmap's own survey. `sd_state_get_rca`/`_get_is_sdhc`/`_get_is_4bit`/
+// `_get_drain_forced_fallback_count` already exist (boot/sdcard_state.S)
+// -- this is a pure retrofit, no new state or accessor. rca printed in
+// decimal, matching every other plain-integer field this shell already
+// prints (shell_dispatch_gpio's "read", diagnose's counters) rather than
+// inventing a hex convention this specific field has never used
+// elsewhere in the codebase.
+fn dhdl_subsys_sd_id() -> u32 {
+  return 2 as u32;
+}
+
+fn sd_describe() -> i64 {
+  let _ = uart_puts("sd: rca=");
+  let _ = uart_put_i64(sd_state_get_rca());
+  let _ = uart_puts(" is_sdhc=");
+  let _ = uart_puts(if sd_state_get_is_sdhc() == 1 { "yes" } else { "no" });
+  let _ = uart_puts(" is_4bit=");
+  let _ = uart_puts(if sd_state_get_is_4bit() == 1 { "yes" } else { "no" });
+  let _ = uart_puts(" drain_forced_fallback_count=");
+  let _ = uart_put_i64(sd_state_get_drain_forced_fallback_count());
+  let _ = uart_puts("\n");
+  return 0;
+}
+
+// DHDL Phase 1 (task #295): GPIO. Rather than describing all 54 pins
+// (most are unconfigured/irrelevant noise), reports function-select +
+// level for exactly the pins this project's own boot code actively
+// drives: 14/15 (UART0 TXD/RXD, gpio_uart_alt_init) and 48-53 (SDHOST
+// CLK/CMD/DAT0-3, gpio_sdhost_alt_init) -- the same "real, meaningful
+// state" posture gpio_self_check already takes when it checks pin 53's
+// function-select against its expected ALT0 value. fn printed as a
+// raw 0-7 code (matching gpio_get_function's own return shape) rather
+// than decoded to a name: ALT-function meaning is pin-specific (ALT0
+// on pin 14 is UART, ALT0 on a different pin means something else
+// entirely), so a generic describe fn can't decode it correctly
+// without a per-pin table this round's small scope doesn't need.
+fn dhdl_subsys_gpio_id() -> u32 {
+  return 3 as u32;
+}
+
+fn gpio_describe_one_pin(pin: i64, label: Str) -> i64 {
+  let _ = uart_puts("  pin ");
+  let _ = uart_put_i64(pin);
+  let _ = uart_puts(" (");
+  let _ = uart_puts(label);
+  let _ = uart_puts("): fn=");
+  let _ = uart_put_i64(gpio_get_function(pin) as i64);
+  let _ = uart_puts(" lvl=");
+  let _ = uart_put_i64(gpio_read(pin) as i64);
+  let _ = uart_puts("\n");
+  return 0;
+}
+
+fn gpio_describe() -> i64 {
+  let _ = uart_puts("gpio:\n");
+  let _ = gpio_describe_one_pin(14, "UART0 TXD");
+  let _ = gpio_describe_one_pin(15, "UART0 RXD");
+  let _ = gpio_describe_one_pin(48, "SDHOST CLK");
+  let _ = gpio_describe_one_pin(49, "SDHOST CMD");
+  let _ = gpio_describe_one_pin(50, "SDHOST DAT0");
+  let _ = gpio_describe_one_pin(51, "SDHOST DAT1");
+  let _ = gpio_describe_one_pin(52, "SDHOST DAT2");
+  let _ = gpio_describe_one_pin(53, "SDHOST DAT3");
+  return 0;
+}
+
 // Called once from kernel_main, after log_level_init -- registers
 // every subsystem this round wires into the DHDL query mechanism.
-// Just one so far (task #294's own explicit "small effort" scope);
-// docs/DHDL_ROADMAP.md's Phase 1-3 add the rest, each just another
+// docs/DHDL_ROADMAP.md's Phase 2-3 add the rest, each just another
 // dhdl_register call here, no change to the mechanism itself.
 fn dhdl_init() -> i64 {
   let _ = dhdl_register(dhdl_subsys_loglevel_id(), log_level_describe);
+  let _ = dhdl_register(dhdl_subsys_sd_id(), sd_describe);
+  let _ = dhdl_register(dhdl_subsys_gpio_id(), gpio_describe);
   return 0;
 }
 
@@ -26071,6 +26140,12 @@ fn dhdl_name_for_id(id: u32) -> Str {
   if id == dhdl_subsys_loglevel_id() {
     return "loglevel";
   }
+  if id == dhdl_subsys_sd_id() {
+    return "sd";
+  }
+  if id == dhdl_subsys_gpio_id() {
+    return "gpio";
+  }
   return "?";
 }
 
@@ -26108,6 +26183,14 @@ fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
     let name_end: i64 = shell_find_space(line_buf, name_start, line_len);
     if shell_word_matches(line_buf, name_start, name_end, "loglevel") == 1 {
       let _ = dhdl_call_by_id(dhdl_subsys_loglevel_id());
+      return 0;
+    }
+    if shell_word_matches(line_buf, name_start, name_end, "sd") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_sd_id());
+      return 0;
+    }
+    if shell_word_matches(line_buf, name_start, name_end, "gpio") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_gpio_id());
       return 0;
     }
     let _ = uart_puts("dhdl: unknown subsystem (see `dhdl list`)\n");

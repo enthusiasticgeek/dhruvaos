@@ -11878,6 +11878,25 @@ mask (`0x0000000C`, DEMO GC) -- the full config+query round trip is real, not ea
 asm audit 0/0, `qemu_run.py` clean, full DharaFS/GPIO self-test regression clean under a real-SD-image QEMU
 run. Commit `6a42efc`, local-only (push window closed). Task #294 marked complete; #295-304 remain pending.
 
+### DHDL Phase 1 DONE: SD + GPIO wired into dhdl query (task #295)
+
+Done opportunistically (2026-10-01) while real hardware was unavailable -- pure QEMU-verifiable retrofit work,
+no new mechanism, exactly the Phase 1 scope docs/DHDL_ROADMAP.md already laid out. Added `sd_describe()` and
+`gpio_describe()` to `kernel_main.vani`, both thin adapters over accessors that already existed: `sd_state_
+get_rca`/`_get_is_sdhc`/`_get_is_4bit`/`_get_drain_forced_fallback_count` (`boot/sdcard_state.S`) for SD;
+`gpio_get_function`/`gpio_read` for GPIO, applied to the 8 pins this project's own boot code actually drives
+(14/15 = UART0 TXD/RXD, 48-53 = SDHOST CLK/CMD/DAT0-3) rather than all 54 -- same "real, meaningful state"
+posture `gpio_self_check` already takes. Registered both in `dhdl_init()`, extended `dhdl_name_for_id`'s
+if/else chain and `shell_dispatch_dhdl`'s query word-match chain -- no change to the Phase 0 mechanism itself.
+
+Verified end-to-end: build clean (asm audit 0/0), `qemu_run.py` clean (same 6 pre-existing SD-less-harness
+DharaFS FAILs, no new regressions), and a direct interactive-shell QEMU boot typing `dhdl list`/`dhdl query
+sd`/`dhdl query gpio` confirmed all three subsystems report genuinely live state: `dhdl list` shows 3
+registered subsystems; `dhdl query sd` returns the real RCA from this boot's own card init
+(`rca=2421293056 is_sdhc=no is_4bit=yes drain_forced_fallback_count=0`); `dhdl query gpio` shows all 8 pins
+correctly muxed to ALT0 (`fn=4`). Local-only (push window closed, Thursday daytime). Task #295 marked
+complete; #296-298 (display/DMA/RAM, then USB-backed subsystems, then `dhdl set`) remain pending.
+
 ### UART corruption investigation reopened: ring-race fix confirmed present but insufficient, dongle hypothesis ruled out, diagnostic redesigned
 
 The `58cce2b` ring-race fix above (`sched_diag_putc`/`sdhost_diag_putc` bypassing `uart_tx_ring`) was
