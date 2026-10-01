@@ -135,6 +135,35 @@ class ShellSession:
     def send(self, line: str):
         os.write(self.fd, (line + "\r").encode())
 
+    def wait_until_ready(self, overall_timeout: float = 30, poll_interval: float = 1.0) -> bool:
+        """Attach-at-any-time readiness handshake (task #306 follow-up,
+        2026-10-01): the boot-time 'PASS' marker this class's own
+        read_until() callers already wait for (see main() below) is a
+        ONE-SHOT broadcast -- fine right after a fresh reset, useless if
+        you're attaching to a board that's already been running for a
+        while, since there's nothing left to wait for and no way to know
+        whether your own read cursor landed on a clean line boundary or
+        mid-corruption from whatever was already on the wire. The
+        kernel's `ready` shell command (kernel_main.vani, deliberately
+        the first command checked in shell_dispatch) is a trivial,
+        idempotent probe built for exactly this: same fixed `READY`
+        response every time, no side effect, safe to resend. Sends it
+        repeatedly rather than once -- a single attempt can still land
+        badly in the middle of whatever chatter was already in flight at
+        open() time, same as this investigation's own real-HW DHDL
+        check found the hard way; a fresh send+read_until each interval
+        gives each attempt its own full timeout and its own cursor
+        position to search from, so a single bad landing doesn't
+        compound into a lasting desync the way blindly resending a REAL
+        command (which has side effects and a less distinctive response)
+        can."""
+        deadline = time.time() + overall_timeout
+        while time.time() < deadline:
+            self.send("ready")
+            if self.read_until("READY", timeout=poll_interval):
+                return True
+        return False
+
     def step(self, line: str, expected: str, timeout: float, attempts: int) -> bool:
         for _ in range(attempts):
             self.send(line)

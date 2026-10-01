@@ -26865,6 +26865,26 @@ fn shell_dispatch() -> i64 {
 
   let cmd_end: i64 = shell_find_space(line_buf, 0, line_len);
 
+  // Host-side real-HW test tooling (test/wifikey_upload.py and this
+  // session's own ad-hoc DHDL real-HW check) has an established
+  // pattern for FRESH boots -- wait for the boot self-test suite's
+  // own one-shot "PASS" marker before sending anything real -- but no
+  // equivalent for attaching to a board that's ALREADY been running
+  // for a while: there's no marker left to wait for, and the host has
+  // no way to know whether its own read cursor is sitting on a clean
+  // line boundary or mid-corruption from whatever was on the wire
+  // before it opened the device. `ready` is a trivial, deliberately
+  // FIRST-CHECKED, idempotent probe for exactly that: always the same
+  // fixed one-line response, regardless of system state, with no
+  // side effect -- safe to send repeatedly in a poll loop (the host's
+  // own responsibility, not this command's) until it's seen cleanly
+  // once, at which point the host knows the RX/TX path is genuinely
+  // synchronized and can start sending commands that matter.
+  if shell_word_matches(line_buf, 0, cmd_end, "ready") == 1 {
+    let _ = uart_puts("READY\n");
+    return 0;
+  }
+
   if shell_word_matches(line_buf, 0, cmd_end, "ls") == 1 {
     // Round 42: bare "ls" keeps its original flat, every-live-record
     // behavior unchanged (phase4_milestone.py's own "ls shows

@@ -12125,3 +12125,27 @@ unaffected by this RX-timing question, since no typing was involved there at all
 **Task #306 marked complete.** The UART corruption investigation's core deliverable -- a real, working fix
 for the ring-drain bottleneck, now confirmed on real hardware -- is done. The fast-scripted-typing RX
 question above is a new, separate, much lower-priority observation, not tracked as a blocker on anything.
+
+### New `ready` shell command + host-side wait_until_ready() handshake (task #307)
+
+Direct follow-up to the DHDL real-HW spot-check's own RX-timing noise above. User's own framing: validate
+boot once, then keep the UART open and let an outside mechanism periodically probe "is the board ready"
+before sending any real test command, rather than attaching blind and hoping. The existing `wifikey_
+upload.py` pattern (wait for the boot self-test suite's own one-shot "PASS" marker) only works right after a
+fresh reset -- there's no equivalent for attaching to a board that's already been running a while, since
+there's nothing left to wait for and no way to know whether the host's own read cursor landed on a clean
+line boundary.
+
+Added `ready` to `kernel_main.vani`'s `shell_dispatch` -- deliberately the FIRST command checked (before
+`ls`), a trivial, idempotent, no-side-effect probe that always prints `READY` regardless of system state.
+Added `ShellSession.wait_until_ready(overall_timeout, poll_interval)` to `test/wifikey_upload.py` (the one
+proven, reusable real-serial host-side class): resends `ready` on its own `poll_interval` cadence, each
+attempt getting its own fresh `read_until("READY", ...)` call and cursor position, so a single bad landing
+can't compound into the kind of lasting desync this session's own naive fixed-delay DHDL check hit.
+
+Build clean (asm audit 0/0), `qemu_run.py` clean (same 6 pre-existing baseline FAILs), direct QEMU boot
+confirms `ready` -> `READY` cleanly on repeat sends. **Real-HW retest not yet done** -- getting this onto
+the actual board needs a new `kernel.img` written to the SD card's boot partition via `update_kernel.sh`
+(docs/HARDWARE_IN_LOOP.md §4.5), which requires the card to be physically moved from the Pi into this
+machine's own card reader (currently empty) -- a hands-on step, not something done remotely over UART.
+Local-only commit pending push-window check.
