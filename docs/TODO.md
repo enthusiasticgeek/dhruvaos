@@ -11967,6 +11967,36 @@ enumerates under QEMU's DWC2 model. Local-only (push window closed, Thursday day
 complete. All 4 DHDL retrofit phases (#294-297) now done; #298 (`dhdl set`, live reconfiguration) and #299-304
 (the 6 missing-driver epics) remain pending.
 
+### DHDL Phase 4 STARTED: `dhdl set`, loglevel first (task #298)
+
+Same opportunistic no-real-HW session as Phases 1-3 above, user explicitly asked for loglevel first. Built
+the generic `set` mechanism as a SEPARATE fixed 12-slot table in `boot/dhdl_state.S` (`dhdl_register_setter`/
+`dhdl_set_by_id`) rather than reusing the describe table -- a setter fn's `fn(u32) -> i64` shape (one
+argument) can't share the describe table's zero-argument dispatch path without the call site somehow
+knowing which shape to invoke. `dhdl set <name> <value>` added to `shell_dispatch_dhdl`, deliberately the
+same 2-argument shape as `dhdl query <name>` rather than the roadmap's own speculative `<name> <param>
+<value>` -- no registered subsystem has more than one settable parameter yet (loglevel's is just the mask),
+so a `<param>` level would be unused scaffolding. `log_level_set(value: u32) -> i64` is a thin wrapper over
+the already-existing `log_state_set_mask` (same accessor `log_level_init`'s own config-file path already
+calls) -- loglevel needed zero new logic, only plumbing, matching the roadmap's own reasoning for why it's
+the obvious first subsystem (no hardware side effect to safety-review, unlike SD bus width or a mid-
+association WiFi channel change). Only loglevel registered as a setter this round -- every other subsystem
+stays query-only; whether/when to extend `set` to them is an open, per-subsystem safety question, not
+scheduled.
+
+QEMU-verified a full live round trip in ONE boot, not query and set tested in isolation: `dhdl query
+loglevel` -> `mask=0x00000000 (none)`; `dhdl set loglevel 12` -> `ok`, and the DEMO/GC chatter (idle/HIGH/
+MEDIUM/LOW/MUTEX-HIGH/MUTEX-LOW/GC) starts appearing in the very next lines of output -- the real behavioral
+proof that the mask change took effect immediately, not just a changed number from a second query; `dhdl
+query loglevel` afterward confirms `mask=0x0000000C (DEMO GC)`. Both rejection paths verified too: `dhdl set
+sd 1` -> `dhdl: subsystem does not support \`set\`` (sd is query-only, the setter table itself is the single
+source of truth for this, not a second name list kept in sync by hand); `dhdl set bogus 1` -> `dhdl: unknown
+subsystem (see \`dhdl list\`)`. Build clean (asm audit 0/0, including the new `dhdl_register_setter`/
+`dhdl_set_by_id` extern stack costs), `qemu_run.py` clean (same 6 pre-existing baseline FAILs). Local-only
+(push window closed, Thursday). Task #298 left IN PROGRESS, not completed -- Phase 4 covers per-subsystem
+`set` work in general, and loglevel being done doesn't mean the task itself is finished; more subsystems may
+be added in future rounds, each needing its own safety call first.
+
 ### UART corruption investigation reopened: ring-race fix confirmed present but insufficient, dongle hypothesis ruled out, diagnostic redesigned
 
 The `58cce2b` ring-race fix above (`sched_diag_putc`/`sdhost_diag_putc` bypassing `uart_tx_ring`) was

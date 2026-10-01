@@ -2258,6 +2258,14 @@ extern "C" fn dhdl_call_by_id(id: u32) -> i64;
 extern "C" fn dhdl_list_count() -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dhdl_list_id_at(index: u32) -> u32;
+// DHDL Phase 4 (task #298): separate setter table, `push {r4,r5,lr}`
+// (12 bytes, same as dhdl_register above) and `push {r4,r5,r6,r7,lr}`
+// (20 bytes -- one more register than dhdl_call_by_id's own 16, since
+// the value argument has to survive the scan in its own register).
+#[stack_cost(bytes=12)]
+extern "C" fn dhdl_register_setter(id: u32, setter: fn(u32) -> i64) -> i64;
+#[stack_cost(bytes=20)]
+extern "C" fn dhdl_set_by_id(id: u32, value: u32) -> i64;
 // 2026-09-29: temporary real-HW UART-corruption diagnostic (see
 // task_custom_demo_wake_body's own comment) -- boot/custom_diag_state.S.
 #[stack_cost(bytes=1)]
@@ -24809,6 +24817,22 @@ fn log_level_describe() -> i64 {
   return 0;
 }
 
+// DHDL Phase 4 (task #298): loglevel is the first -- and, per docs/
+// DHDL_ROADMAP.md's own explicit reasoning, the obvious FIRST --
+// subsystem to get a live `dhdl set`: changing the mask has no
+// hardware side effect at all, unlike SD bus width or a mid-
+// association WiFi channel change, so there's no per-subsystem safety
+// analysis to do here before wiring it up (the roadmap's own stated
+// reason every OTHER subsystem stays query-only for now). Thin
+// wrapper matching the `fn(u32) -> i64` shape `dhdl_register_setter`
+// expects -- `log_state_set_mask` itself already does the real work
+// and already has its own real caller (`log_level_init`'s config-file
+// path), so this is purely plumbing, not new logic.
+fn log_level_set(value: u32) -> i64 {
+  let _ = log_state_set_mask(value);
+  return 0;
+}
+
 // DHDL Phase 1 (task #295, docs/DHDL_ROADMAP.md): SD, the subsystem
 // with the densest existing accessor surface in this project per the
 // roadmap's own survey. `sd_state_get_rca`/`_get_is_sdhc`/`_get_is_4bit`/
@@ -25015,10 +25039,12 @@ fn ble_describe() -> i64 {
 }
 
 // Called once from kernel_main, after log_level_init -- registers
-// every subsystem wired into the DHDL query mechanism so far.
-// docs/DHDL_ROADMAP.md's Phase 4 adds per-subsystem `dhdl set`, not
-// new subsystems -- no more dhdl_register call sites expected here
-// until Phase 5's new drivers (I2C/SPI/CAN/RS485/audio/LoRa) land.
+// every subsystem wired into the DHDL query mechanism so far, plus
+// (DHDL Phase 4, task #298) every subsystem proven safe to also
+// register as settable. Most subsystems are expected to stay query-
+// only indefinitely -- see dhdl_register_setter's own header comment
+// in boot/dhdl_state.S for why that's a deliberate per-subsystem
+// decision, not a gap to fill in uniformly.
 fn dhdl_init() -> i64 {
   let _ = dhdl_register(dhdl_subsys_loglevel_id(), log_level_describe);
   let _ = dhdl_register(dhdl_subsys_sd_id(), sd_describe);
@@ -25030,6 +25056,7 @@ fn dhdl_init() -> i64 {
   let _ = dhdl_register(dhdl_subsys_ethernet_id(), ethernet_describe);
   let _ = dhdl_register(dhdl_subsys_wifi_id(), wifi_describe);
   let _ = dhdl_register(dhdl_subsys_ble_id(), ble_describe);
+  let _ = dhdl_register_setter(dhdl_subsys_loglevel_id(), log_level_set);
   return 0;
 }
 
@@ -26316,7 +26343,7 @@ fn dhdl_name_for_id(id: u32) -> Str {
 }
 
 fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
-  let usage: Str = "usage: dhdl list|query <name>\n";
+  let usage: Str = "usage: dhdl list|query <name>|set <name> <value>\n";
   if cmd_end >= line_len {
     let _ = uart_puts(usage);
     return 0;
@@ -26388,6 +26415,95 @@ fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
       return 0;
     }
     let _ = uart_puts("dhdl: unknown subsystem (see `dhdl list`)\n");
+    return 0;
+  }
+
+  // DHDL Phase 4 (task #298): `dhdl set <name> <value>`, deliberately
+  // the same 2-word-argument shape as `dhdl query <name>` rather than
+  // the roadmap's own speculative `<name> <param> <value>` -- no
+  // registered subsystem has more than one settable parameter yet
+  // (loglevel's is just the mask), so a `<param>` level would be
+  // unused scaffolding; add it the day a real subsystem actually
+  // needs to disambiguate between two of its own settable values, not
+  // before. Name<->id resolution happens here (same `shell_word_
+  // matches` chain `query` uses, deliberately NOT deduplicated into a
+  // shared helper -- the two chains already read differently, `set`
+  // needs the id for dhdl_set_by_id rather than dispatching directly),
+  // then dhdl_set_by_id's own -1 return (checked here, not re-derived
+  // from the name chain) is what actually decides "does this
+  // subsystem support `set`" -- the single source of truth is the
+  // setter table itself, not a second list of names kept in sync with
+  // it by hand.
+  if shell_word_matches(line_buf, sub_start, sub_end, "set") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts(usage);
+      return 0;
+    }
+    let name_start: i64 = sub_end + 1;
+    let name_end: i64 = shell_find_space(line_buf, name_start, line_len);
+    if name_end >= line_len {
+      let _ = uart_puts(usage);
+      return 0;
+    }
+    let value_start: i64 = name_end + 1;
+    let value_end: i64 = shell_find_space(line_buf, value_start, line_len);
+    let value: i64 = shell_parse_decimal(line_buf, value_start, value_end);
+    if value < 0 {
+      let _ = uart_puts("dhdl: invalid value (expected a plain decimal number)\n");
+      return 0;
+    }
+
+    let id: u32 = 0 as u32;
+    if shell_word_matches(line_buf, name_start, name_end, "loglevel") == 1 {
+      id = dhdl_subsys_loglevel_id();
+    } else {
+      if shell_word_matches(line_buf, name_start, name_end, "sd") == 1 {
+        id = dhdl_subsys_sd_id();
+      } else {
+        if shell_word_matches(line_buf, name_start, name_end, "gpio") == 1 {
+          id = dhdl_subsys_gpio_id();
+        } else {
+          if shell_word_matches(line_buf, name_start, name_end, "display") == 1 {
+            id = dhdl_subsys_display_id();
+          } else {
+            if shell_word_matches(line_buf, name_start, name_end, "dma") == 1 {
+              id = dhdl_subsys_dma_id();
+            } else {
+              if shell_word_matches(line_buf, name_start, name_end, "ram") == 1 {
+                id = dhdl_subsys_ram_id();
+              } else {
+                if shell_word_matches(line_buf, name_start, name_end, "usb") == 1 {
+                  id = dhdl_subsys_usb_id();
+                } else {
+                  if shell_word_matches(line_buf, name_start, name_end, "ethernet") == 1 {
+                    id = dhdl_subsys_ethernet_id();
+                  } else {
+                    if shell_word_matches(line_buf, name_start, name_end, "wifi") == 1 {
+                      id = dhdl_subsys_wifi_id();
+                    } else {
+                      if shell_word_matches(line_buf, name_start, name_end, "ble") == 1 {
+                        id = dhdl_subsys_ble_id();
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if id == (0 as u32) {
+      let _ = uart_puts("dhdl: unknown subsystem (see `dhdl list`)\n");
+      return 0;
+    }
+    let result: i64 = dhdl_set_by_id(id, value as u32);
+    if result < 0 {
+      let _ = uart_puts("dhdl: subsystem does not support `set`\n");
+      return 0;
+    }
+    let _ = uart_puts("ok\n");
     return 0;
   }
 

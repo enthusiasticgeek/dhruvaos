@@ -155,6 +155,23 @@ there) proves the pattern live.
   prove `list`/`query` live; scoped and safety-reviewed one subsystem at
   a time, starting with the ones already proven safe to reconfigure live
   (log level).
+  **STARTED (2026-10-01, task #298)**: generic mechanism built -- a
+  SEPARATE fixed 12-slot table in `boot/dhdl_state.S` (`dhdl_register_
+  setter`/`dhdl_set_by_id`), since a setter fn's `fn(u32) -> i64` shape
+  can't share the describe table's zero-argument dispatch path. `dhdl
+  set <name> <value>` added to the shell (deliberately 2 arguments, not
+  the roadmap's own speculative `<name> <param> <value>` -- no
+  registered subsystem has more than one settable parameter yet). Only
+  loglevel registered as settable so far -- every other subsystem
+  stays query-only until its own safety analysis says otherwise, per
+  this entry's own long-standing reasoning. QEMU-verified a full live
+  round trip in one boot: `dhdl set loglevel 12` -> `ok`, demo-task
+  chatter starts appearing immediately (the real behavioral proof, not
+  just a changed number), `dhdl query loglevel` confirms `mask=
+  0x0000000C (DEMO GC)`; `dhdl set sd 1` correctly rejected (query-only
+  subsystem); `dhdl set bogus 1` correctly rejected (unknown name).
+  Remaining subsystems' settability is an open, subsystem-by-subsystem
+  question, not scheduled.
 - **Phase 5 (separate epic, not DHDL-layer work) — new drivers for the
   six subsystems with nothing today**: I2C, SPI, CAN, RS485, audio, LoRa.
   Each is its own multi-round driver-bring-up effort (register-level
