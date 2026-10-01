@@ -24877,14 +24877,90 @@ fn gpio_describe() -> i64 {
   return 0;
 }
 
+// DHDL Phase 2 (task #296, docs/DHDL_ROADMAP.md): display. Reuses
+// fb_base_get/_size_get/_pitch_get, the exact 3 accessors
+// shell_dispatch_fb's own "status" verb already prints -- same hex
+// format, so `dhdl query display` and `fb status` agree on everything
+// they both show (deliberately not de-duplicated into one shared
+// helper this round: `fb status`'s own output predates this
+// mechanism and has its own established real-HW-verification
+// history, not worth touching for a cosmetic refactor).
+fn dhdl_subsys_display_id() -> u32 {
+  return 4 as u32;
+}
+
+fn display_describe() -> i64 {
+  let _ = uart_puts("display: base=0x");
+  let _ = uart_put_hex32(fb_base_get() as u32);
+  let _ = uart_puts(" size=0x");
+  let _ = uart_put_hex32(fb_size_get() as u32);
+  let _ = uart_puts(" pitch=0x");
+  let _ = uart_put_hex32(fb_pitch_get() as u32);
+  let _ = uart_puts("\n");
+  return 0;
+}
+
+// DHDL Phase 2 (task #296): DMA. `dma_uart_tx_busy()` is a genuine
+// read-only query (boot/dma_uart_state.S's own header comment: reads
+// channel 5's real CS register via mem_barrier, no side effect) --
+// unlike `dma_ram_copy_self_test`/`dma_uart_tx_self_test`, which
+// actually KICK OFF a transfer and would be wrong to call from a
+// query path. No other live DMA state exists yet (boot-time self-
+// test only per docs/DHDL_ROADMAP.md's own survey), so "is channel
+// 5's transfer currently in flight" is the whole of this round's
+// describe fn.
+fn dhdl_subsys_dma_id() -> u32 {
+  return 5 as u32;
+}
+
+fn dma_describe() -> i64 {
+  let _ = uart_puts("dma: channel5_busy=");
+  let _ = uart_puts(if dma_uart_tx_busy() == (1 as u32) { "yes" } else { "no" });
+  let _ = uart_puts("\n");
+  return 0;
+}
+
+// DHDL Phase 2 (task #296): RAM/heap. The one subsystem in this
+// phase needing a NEW adapter rather than a pure retrofit, per the
+// roadmap's own survey -- its state lives in the C runtime stub
+// (`dhruva_heap_used_bytes`/`_alloc_count_get`), not a `boot/*_
+// state.S` file, but both accessors already exist and are already
+// queried live elsewhere (`diagnose`). `capacity` repeats the same
+// `786432` (DHRUVA_HEAP_BYTES) literal `diagnose` already hardcodes
+// rather than introducing a shared constant for a single reused
+// number -- matching this file's own established "repeat small
+// literals rather than build a constants layer for one reuse" style
+// (see e.g. gpio_self_check's own repeated pin literals).
+fn dhdl_subsys_ram_id() -> u32 {
+  return 6 as u32;
+}
+
+fn ram_describe() -> i64 {
+  let used: i64 = dhruva_heap_used_bytes();
+  let capacity: i64 = 786432;
+  let _ = uart_puts("ram: heap_used=");
+  let _ = uart_put_i64(used);
+  let _ = uart_puts(" heap_capacity=");
+  let _ = uart_put_i64(capacity);
+  let _ = uart_puts(" bytes (");
+  let _ = uart_put_i64((used * 100) / capacity);
+  let _ = uart_puts("% used, high-water mark since boot) allocations=");
+  let _ = uart_put_i64(dhruva_alloc_count_get());
+  let _ = uart_puts("\n");
+  return 0;
+}
+
 // Called once from kernel_main, after log_level_init -- registers
 // every subsystem this round wires into the DHDL query mechanism.
-// docs/DHDL_ROADMAP.md's Phase 2-3 add the rest, each just another
+// docs/DHDL_ROADMAP.md's Phase 3 adds the rest, each just another
 // dhdl_register call here, no change to the mechanism itself.
 fn dhdl_init() -> i64 {
   let _ = dhdl_register(dhdl_subsys_loglevel_id(), log_level_describe);
   let _ = dhdl_register(dhdl_subsys_sd_id(), sd_describe);
   let _ = dhdl_register(dhdl_subsys_gpio_id(), gpio_describe);
+  let _ = dhdl_register(dhdl_subsys_display_id(), display_describe);
+  let _ = dhdl_register(dhdl_subsys_dma_id(), dma_describe);
+  let _ = dhdl_register(dhdl_subsys_ram_id(), ram_describe);
   return 0;
 }
 
@@ -26146,6 +26222,15 @@ fn dhdl_name_for_id(id: u32) -> Str {
   if id == dhdl_subsys_gpio_id() {
     return "gpio";
   }
+  if id == dhdl_subsys_display_id() {
+    return "display";
+  }
+  if id == dhdl_subsys_dma_id() {
+    return "dma";
+  }
+  if id == dhdl_subsys_ram_id() {
+    return "ram";
+  }
   return "?";
 }
 
@@ -26191,6 +26276,18 @@ fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
     }
     if shell_word_matches(line_buf, name_start, name_end, "gpio") == 1 {
       let _ = dhdl_call_by_id(dhdl_subsys_gpio_id());
+      return 0;
+    }
+    if shell_word_matches(line_buf, name_start, name_end, "display") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_display_id());
+      return 0;
+    }
+    if shell_word_matches(line_buf, name_start, name_end, "dma") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_dma_id());
+      return 0;
+    }
+    if shell_word_matches(line_buf, name_start, name_end, "ram") == 1 {
+      let _ = dhdl_call_by_id(dhdl_subsys_ram_id());
       return 0;
     }
     let _ = uart_puts("dhdl: unknown subsystem (see `dhdl list`)\n");

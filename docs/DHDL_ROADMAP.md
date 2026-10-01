@@ -124,6 +124,17 @@ there) proves the pattern live.
 - **Phase 2 — retrofit display, DMA, RAM/heap.** Display and DMA are
   direct retrofits; RAM needs one new adapter over the C-runtime-stub
   state (no new `.bss` file required, just an adapter fn).
+  **DONE (2026-10-01, task #296)**: `display_describe`/`dma_describe`/
+  `ram_describe` added (`kernel_main.vani`). Display reuses `fb_base_
+  get`/`_size_get`/`_pitch_get` (same 3 accessors `fb status` already
+  prints). DMA reuses `dma_uart_tx_busy()` -- a genuine read-only CS-
+  register query, deliberately NOT the self-test fns, which actually
+  kick off a transfer. RAM is the one new adapter the roadmap
+  predicted, over `dhruva_heap_used_bytes`/`_alloc_count_get` (same
+  accessors `diagnose` already uses). QEMU-verified live: all three
+  return genuinely live state (real fb base/size/pitch, real DMA
+  busy=no, real heap usage). 6/8 registration-table slots now used --
+  Phase 3's 4 subsystems will need `DHDL_MAX_SLOTS` raised past 8.
 - **Phase 3 — retrofit the USB-backed subsystems.** USB host, ethernet,
   WiFi, BLE — more parameters each (link state, MAC, WPA2 status,
   enumeration state), same mechanism, no new mechanism work.

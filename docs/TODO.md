@@ -11925,6 +11925,24 @@ registered subsystems; `dhdl query sd` returns the real RCA from this boot's own
 correctly muxed to ALT0 (`fn=4`). Local-only (push window closed, Thursday daytime). Task #295 marked
 complete; #296-298 (display/DMA/RAM, then USB-backed subsystems, then `dhdl set`) remain pending.
 
+### DHDL Phase 2 DONE: display, DMA, RAM/heap wired into dhdl query (task #296)
+
+Same opportunistic no-real-HW session as Phase 1 above. Added `display_describe()` (reuses `fb_base_get`/
+`_size_get`/`_pitch_get`, the exact accessors `fb status` already prints, same hex format), `dma_describe()`
+(reuses `dma_uart_tx_busy()` -- confirmed via `boot/dma_uart_state.S`'s own header comment that this is a
+genuine read-only CS-register poll with no side effect, unlike the self-test fns which actually kick off a
+transfer and would be wrong to call from a query path), and `ram_describe()` (the one genuinely new adapter
+the roadmap predicted, over `dhruva_heap_used_bytes`/`dhruva_alloc_count_get`, the same accessors `diagnose`
+already uses). No change to the Phase 0/1 mechanism.
+
+QEMU-verified end-to-end: build clean (asm audit 0/0), `qemu_run.py` clean (same 6 pre-existing baseline
+FAILs), direct interactive-shell boot confirmed all three return genuinely live state: `dhdl list` now shows
+6 registered subsystems; `dhdl query display` → `base=0x1C100000 size=0x0012C000 pitch=0x00000A00`; `dhdl
+query dma` → `channel5_busy=no`; `dhdl query ram` → `heap_used=234912 heap_capacity=786432 bytes (29% used...)
+allocations=681`, matching the same boot's own `HEAP:` self-test line. Local-only (push window closed,
+Thursday daytime). Task #296 marked complete. Registration table now at 6/8 slots -- Phase 3's 4 subsystems
+(USB host/ethernet/WiFi/BLE) will need `boot/dhdl_state.S`'s `DHDL_MAX_SLOTS` raised past 8 before they fit.
+
 ### UART corruption investigation reopened: ring-race fix confirmed present but insufficient, dongle hypothesis ruled out, diagnostic redesigned
 
 The `58cce2b` ring-race fix above (`sched_diag_putc`/`sdhost_diag_putc` bypassing `uart_tx_ring`) was
