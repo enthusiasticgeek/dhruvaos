@@ -9961,6 +9961,34 @@ status-print volume, or move the harness to pattern-based readiness
 detection instead of blind `SETTLE_S`, BEFORE the next tick-rate
 attempt, not concurrently with one.
 
+### Task #289 finding: demo-task print volume already silenced by default, pre-existing work nobody connected back to this task (2026-10-01)
+
+Checked while real hardware was unavailable, no code change needed. The log-level feature
+([[project_dhruva_loglevel_config_2026_09_28]] in memory, shipped 2026-09-28 -- three days AFTER task #288's
+own revert note above) already gates every one of the standing demo tasks' own status prints behind
+`LOG_CAT_DEMO`/`LOG_CAT_GC` (`log_state_get_mask()`, `kernel_main.vani`): `task_a_wake_body`'s `"HIGH: ..."`,
+`task_b_wake_body`'s `"MEDIUM: ..."`, `task_d_wake_body`, both `task_mutex_demo_*_wake_body`, and GC's own
+`"GC: compaction pass..."` line all check the mask first and print nothing at all when it's 0. Confirmed via
+`log_level_init()`: the mask stays 0 unless a real `/config/loglevel` file exists and parses -- and grepped
+both `test/qemu_run.py` and `test/phase4_milestone.py` to confirm NEITHER ever writes that file. So every
+existing QEMU regression run, including every run this whole session, has ALREADY been executing with these
+prints fully silenced, without anyone having explicitly connected that side effect back to this task. Directly
+confirmed empty (`grep -c "HIGH:\|MEDIUM:\|GC:"` = 0) across two independent fresh-boot QEMU transcripts
+captured this session (the ring-fix regression run and the DHDL Phase 1 interactive check).
+
+This closes the specific print-volume half of task #288's own diagnosis -- the "5x denser real-time print
+volume" mechanism it measured can no longer occur under either harness's current default config. It does
+NOT by itself mean a 4th finer-tick attempt would now succeed (task #288's own entry also flagged a second,
+separable factor: GC's DharaFS write critical section now masking interrupts for up to 41.984ms, 42% of a
+100ms tick, a real factor neither this nor task #288 has isolated), and a 4th attempt is deliberately NOT
+made this round -- three prior attempts (#191, #243, #288) were each reverted, and this project's own
+established discipline ("don't ship unverified against this project's entire QEMU-only verification loop")
+argues for a dedicated round, not an opportunistic add-on, especially for a change this history-sensitive.
+Recorded here so the next attempt starts from "print volume: closed, interrupt-masking duration: still open"
+rather than re-deriving this. Task #289 marked complete on that basis -- not by writing new rate-limiting
+code (the task's own concern is already moot under default config), but by finding and documenting that
+state explicitly.
+
 ### Twenty-third SD round: real-HW retest of the syscall #5 masking fix -- THE WEDGE STILL PERSISTS, hypothesis falsified (2026-09-25)
 
 Fresh real-HW log (`picocom_20260925_083346.log`, 8:33am), the first
