@@ -181,6 +181,23 @@ there) proves the pattern live.
   later. Not scheduled; tracked here so the eventual work starts from
   this convention instead of reinventing one per driver.
 
+## `dhdl set` safety survey (2026-10-01, task #298)
+
+Before wiring a second settable subsystem, surveyed every other registered subsystem's own setter
+accessors: `sd_state_set`/`_set_is_4bit` (RCA, is_sdhc, is_4bit), `fb_base_set`/`_size_set`/`_pitch_set`, and
+every `usb_net`/`usb_wifi`/`usb_bt_set_kind`/`_set_bulk_*_epaddr`/`_mps`/`_toggle`. Every single one exists
+purely to RECORD what real hardware enumeration or mailbox negotiation already discovered -- not an
+independent, software-only policy knob the way loglevel's mask is. Letting `dhdl set` write any of them
+would desync software's belief about currently attached/negotiated hardware from reality -- exactly the
+per-subsystem danger this doc already named above (SD bus width, WiFi channel mid-association), now
+confirmed concretely rather than asserted. GPIO is the one genuine exception -- its function/pull/level
+writes are direct register writes, not cached beliefs, so they ARE safe to set live -- but it already has
+its own dedicated `gpio <pin> in|out|read|write|pull ...` shell command; a second `dhdl set gpio` path would
+duplicate it with no narrower risk and no real benefit. **Conclusion: no second subsystem is wired.**
+Loglevel remains the only registered subsystem with a safe, independent live-settable parameter among the
+10 currently in `dhdl list`. The next candidate is whichever FUTURE subsystem turns out to have a genuinely
+software-only policy parameter -- not a scheduled item, since none of the existing 10 qualify.
+
 ## Open questions for whoever picks this up
 
 - Registration table sizing: fixed array of N slots (matching this

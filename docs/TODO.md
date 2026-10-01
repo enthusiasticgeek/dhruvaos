@@ -11997,6 +11997,24 @@ subsystem (see \`dhdl list\`)`. Build clean (asm audit 0/0, including the new `d
 `set` work in general, and loglevel being done doesn't mean the task itself is finished; more subsystems may
 be added in future rounds, each needing its own safety call first.
 
+**Follow-up same day, no code change**: user asked to continue Phase 4 (a second subsystem). Surveyed every
+OTHER registered subsystem's own setter accessors before wiring anything, rather than picking one and
+hoping: `sd_state_set`/`_set_is_4bit` (RCA, is_sdhc, is_4bit), `fb_base_set`/`_size_set`/`_pitch_set`, and
+every `usb_net`/`usb_wifi`/`usb_bt_set_kind`/`_set_bulk_*_epaddr`/`_mps`/`_toggle` -- every single one exists
+purely to RECORD what real hardware enumeration or mailbox negotiation already discovered, not an
+independent, software-only policy knob the way loglevel's mask is. Exposing any of them via `dhdl set` would
+let software's belief about currently attached/negotiated hardware diverge from reality -- precisely the
+per-subsystem danger the roadmap's own Phase 4 entry named (SD bus width, WiFi channel mid-association) as
+needing its own safety review first, now confirmed concretely rather than just asserted abstractly. GPIO is
+the one actual exception -- `gpio_set_function`/`_write`/`_set_pull` are direct register writes, not cached
+beliefs, so they're genuinely safe to set live -- but it already has its own dedicated `gpio <pin> in|out|
+read|write|pull ...` shell command; a second `dhdl set gpio` path would duplicate it with no narrower risk
+and no real benefit. **Conclusion: no second subsystem wired this round** -- loglevel remains the only
+registered subsystem with a safe, independent live-settable parameter among the 10 currently in `dhdl list`.
+Task #298 stays IN PROGRESS: the next subsystem to extend `set` to is whichever FUTURE subsystem turns out
+to have a genuinely software-only policy parameter (not a cached hardware belief) -- not a scheduled item,
+since none of the existing 10 qualify.
+
 ### UART corruption investigation reopened: ring-race fix confirmed present but insufficient, dongle hypothesis ruled out, diagnostic redesigned
 
 The `58cce2b` ring-race fix above (`sched_diag_putc`/`sdhost_diag_putc` bypassing `uart_tx_ring`) was
