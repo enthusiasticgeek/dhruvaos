@@ -137,9 +137,6 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/dhdl_state.S" -o "${BUILD_DIR}/dhdl_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
-  "${ROOT}/boot/custom_diag_state.S" -o "${BUILD_DIR}/custom_diag_state.o"
-
-arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/netif_state.S" -o "${BUILD_DIR}/netif_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -321,7 +318,6 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/uart_clock_state.o" "${BUILD_DIR}/throttled_state.o" \
   "${BUILD_DIR}/log_state.o" \
   "${BUILD_DIR}/dhdl_state.o" \
-  "${BUILD_DIR}/custom_diag_state.o" \
   "${BUILD_DIR}/netif_state.o" \
   "${BUILD_DIR}/arp_state.o" "${BUILD_DIR}/scratch_state.o" \
   "${BUILD_DIR}/tcp_state.o" "${BUILD_DIR}/dhcp_state.o" \

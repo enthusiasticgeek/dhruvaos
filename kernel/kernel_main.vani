@@ -2266,12 +2266,6 @@ extern "C" fn dhdl_list_id_at(index: u32) -> u32;
 extern "C" fn dhdl_register_setter(id: u32, setter: fn(u32) -> i64) -> i64;
 #[stack_cost(bytes=20)]
 extern "C" fn dhdl_set_by_id(id: u32, value: u32) -> i64;
-// 2026-09-29: temporary real-HW UART-corruption diagnostic (see
-// task_custom_demo_wake_body's own comment) -- boot/custom_diag_state.S.
-#[stack_cost(bytes=1)]
-extern "C" fn custom_diag_fire_count_get() -> u32;
-#[stack_cost(bytes=1)]
-extern "C" fn custom_diag_fire_count_set(count: u32) -> u32;
 // Round 71: HDMI framebuffer -- generic VideoCore mailbox property-tag
 // transport (boot/fb_state.S), generalized from governor_apply_freq_
 // mhz's own already-verified protocol.
@@ -29090,62 +29084,8 @@ fn task_f() -> i64 {
 // task has no reason to outrank the existing hard-RT demo.
 // ROUND 2026-09-17 (Gap #235): same extraction pattern as task_a/b/d.
 #[no_heap]
-// Bumped 20000->120000 (2026-09-29): the temporary UART-corruption
-// diagnostic below adds real, one-time-per-fire cost (5 more bounded
-// prints, capped at 20 fires total) -- static estimate came back at
-// 114133 cycles; rounded up for headroom. Revert to 20000 when the
-// diagnostic block below is removed.
-#[wcet(cycles=120000)]
-// 2026-09-29: temporary real-HW UART-corruption diagnostic. This
-// print ("CUSTOM: dynamically-created task running") is exactly what
-// picocom_20260929_072018.log showed corrupted -- truncated at the
-// SAME character every single repetition ("CUSTOM: dynamicallr......"/
-// "CUSTOM: dynamicallc......"), never crashing, never printing the
-// rest of the string. A careful static re-audit of the whole chain
-// this corruption goes through (uart_tx_ring_push_and_drain_impl's
-// own cpsid-if-protected head/tail update, swi_entry.S's syscall #7
-// dispatch, task_create_usr's own frame setup for this exact
-// dynamically-created task) found no new bug -- the ring's masking is
-// complete, no third unsynchronized UART-write path exists anywhere in
-// boot/*.S, and task_create_usr mirrors the static USR-mode tasks'
-// own already-hardened setup exactly. This project's own history in
-// this exact area (swi_entry.S's header comments) shows every past
-// bug this subtle was only ever found via a LIVE capture, never by
-// re-reading assembly -- so rather than keep guessing blind, capture
-// real state at the exact moment this print runs: fire count (so
-// repeated captures can be lined up against each other), the real
-// tick count, current_task (should always read 6, this task's own
-// slot -- if it ever reads something else here, that alone would be
-// a major clue), and context_switch_count (rules out "this fires
-// before multitasking is even really running" the same way swi_
-// entry.S's own task_a diagnostic already guards against). Capped at
-// 20 fires -- plenty to catch several corrupted AND several clean
-// repetitions for comparison, without flooding. Uses its own counter
-// (custom_diag_fire_count, boot/custom_diag_state.S), not swi_entry.
-// S's existing sleep_ticks_diag_fire_count -- that budget is already
-// earmarked for task_a's own unrelated diagnostic. Remove this whole
-// block (and boot/custom_diag_state.S) once the investigation closes.
+#[wcet(cycles=20000)]
 fn task_custom_demo_wake_body() -> i64 {
-  let diag_fires: u32 = custom_diag_fire_count_get();
-  if diag_fires < (20 as u32) {
-    let _ = custom_diag_fire_count_set(diag_fires + (1 as u32));
-    // Shrunk 2026-09-29 (real-HW retest, both USB dongles now fully
-    // removed): the previous multi-field version got corrupted before
-    // ever reaching cur=/ctxsw=, so it gave no usable comparison data.
-    // Both real corrupted strings captured so far cut off in roughly
-    // the same range (18-21 characters in: "CUSTOM: dynamicall"~18-19,
-    // "CDIAG fire=0 tick=10"~21) -- a "ruler" with every position
-    // uniquely identifiable turns that coincidence into a real
-    // measurement: wherever this actually cuts, the last intact
-    // character read directly off the wire tells us exactly how many
-    // bytes survived, no guessing from word-boundaries needed. If the
-    // cutoff position is the SAME every fire, that's real evidence for
-    // a fixed character-count trigger; if it varies fire to fire,
-    // that argues for a timing/tick-periodic trigger instead, whose
-    // exact cutoff depends on how much unrelated work happened to run
-    // just before this specific print started.
-    let _ = uart_puts_bounded("RULER:0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\n");
-  }
   let _ = uart_puts_bounded("CUSTOM: dynamically-created task running\n");
   return 0;
 }

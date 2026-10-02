@@ -12189,3 +12189,32 @@ a hard size ceiling for v1 (new image must fit the already-allocated cluster cha
 test: overwrite kernel.img with itself) -> rollback mechanism -> real-HW fault-injection drill proving
 rollback actually works. Cross-referenced from docs/HARDWARE_IN_LOOP.md's existing §4.5 (`update_kernel.sh`)
 as the thing this would eventually replace. Task #308 created, tracking the whole phased effort.
+
+### Removed the temporary RULER diagnostic; found the real cause of unreliable fast real-HW typing (task #309)
+
+Same opportunistic real-HW session as task #307 above. With the board up, a scripted DHDL spot-check
+(`dhdl query`/`set` for every subsystem) failed badly even at this project's own proven 14s real-HW pacing
+(`SETTLE_S`-style) between commands -- echoes themselves came back corrupted (e.g. `dhdl query ethernet`
+echoed as `dhdl query ethern`, 2 characters short), not just responses arriving late. Traced to
+`task_custom_demo_wake_body`: the `RULER:` line was capped at 20 fires per boot (by design, for the task
+#306 investigation), but the `CUSTOM: dynamically-created task running` line right after it was NOT --
+it fires unconditionally on every ~70ms wake, forever, for the lifetime of the boot. On a board that's
+been up a while (exactly this session's situation), that's an unbounded background producer competing
+for the same TX ring bandwidth as command echo traffic -- plausibly saturating the ring's drain capacity
+when combined with typed command load, even though the ring fix itself (task #306) handles the
+demo-task-only steady-state load fine on its own (as the earlier passive picocom capture already proved).
+
+Removed the whole temporary diagnostic now that the investigation it was built for is closed, exactly per
+its own header comment's instruction ("Remove this whole block (and boot/custom_diag_state.S) once the
+investigation closes"): deleted the `RULER:` print + `custom_diag_fire_count` cap-checking logic from
+`task_custom_demo_wake_body`, reverted its `#[wcet(cycles=...)]` 120000 -> 20000 (also per the comment's
+own instruction), deleted `boot/custom_diag_state.S` and its two extern declarations, removed both
+`build.sh` references. `task_custom_demo_wake_body` now just prints its own original, legitimate
+`"CUSTOM: dynamically-created task running\n"` line unconditionally -- unchanged from before the
+investigation ever started, since that's the task's actual intended demo behavior, not a diagnostic.
+
+Build clean (asm audit 0/0), `qemu_run.py` clean (same 6 pre-existing baseline FAILs), a direct 60s QEMU
+boot confirms `CUSTOM:` still fires normally (11 times) and `RULER` no longer appears anywhere. No
+permanent test script ever asserted on `RULER` output (only `docs/TODO.md`'s own historical record
+mentions it, left as-is). **Real-HW retest not yet done** -- same physical SD-card-swap requirement as
+every other change this session; this fix is QEMU-verified only so far.
