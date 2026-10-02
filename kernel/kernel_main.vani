@@ -27175,6 +27175,25 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Task #317 follow-up ("there needs to be a software reboot
+  // command", 2026-10-02): watchdog_arm's own already-wired
+  // mechanism (see its own header comment), called directly rather
+  // than through watchdog_init/_kick's periodic-supervision path --
+  // writing PM_RSTC with WRCFG=FULL_RESET resets QEMU's raspi1ap
+  // machine IMMEDIATELY (confirmed, watchdog_arm's own comment) and
+  // triggers a real hardware reset once PM_WDOG's own short timeout
+  // elapses -- exactly the real bcm2835_wdt "software reset" trick
+  // Linux/raspberrypi-firmware's own reboot utilities use. 1 tick
+  // (~15us at the peripheral's fixed 65536Hz) is the minimum nonzero
+  // value -- no reason to wait longer for a deliberate, user-
+  // requested reboot the way watchdog_init/_kick's own 2-second
+  // supervision timeout needs to.
+  if shell_word_matches(line_buf, 0, cmd_end, "reboot") == 1 {
+    let _ = uart_puts("rebooting...\n");
+    let _ = watchdog_arm(1 as u32);
+    return 0;
+  }
+
   // Task #197 follow-up (2026-10-01): drive a REAL WPA2-PSK join
   // against the configured SSID -- see wifi_real_join's own header
   // comment for the full design, the vendor-agnostic wifi_radio_*

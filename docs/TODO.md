@@ -12397,3 +12397,17 @@ a cached value. Full design + verification detail in `docs/DHDL_ROADMAP.md`'s ow
 IMPLEMENTED). Hit the bare-`len`-identifier parse trap a third time during this work (`uart_capture_get_
 len()`'s result, and `uart_capture_end()`'s own return, both renamed) -- see `feedback_vani_bare_len_
 identifier_reserved` in memory, now updated to reflect three occurrences.
+
+### New `reboot` shell command (2026-10-02)
+
+User, mid real-HW testing session: "there needs to be a software reboot command if possible." There
+already was one, just never exposed as a user-triggerable verb: `watchdog_arm(timeout_ticks)` (BCM2835
+PM_WDOG/PM_RSTC), wired for automatic fault-recovery (`watchdog_init`/`_kick`, 2-second supervision
+timeout) but with no direct shell access. New `reboot` command calls it directly with the minimum nonzero
+timeout (1 tick, ~15us on real hardware) -- `watchdog_arm`'s own header comment already documents that
+writing PM_RSTC with WRCFG=FULL_RESET resets QEMU's raspi1ap machine IMMEDIATELY regardless of the PM_WDOG
+timeout value, so this doubles as a real reboot AND a QEMU one with the same one call.
+
+QEMU-verified live: sent `reboot` over a driven shell session, confirmed the boot banner ("Dhruva Phase 2")
+appears a second time in the captured output -- a real reset actually happened, not just an acknowledgment
+printed. `qemu_run.py` regression unaffected (new, unreached-by-self-tests command).
