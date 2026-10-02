@@ -12438,3 +12438,44 @@ causation here (same caution this project's own memory already carries under "re
 proof"). A real reflash + reboot + retest with the dongles attached is the only way to know; if this doesn't
 clear it, the next suspects are VBUS/power delivery at the board level (outside this driver's control) or a
 PHY-configuration register this project hasn't identified yet.
+
+### DWC2 real-HW investigation continued: retest #1 FAILED, two more real gaps added (2026-10-02)
+
+Retest confirmed: GRSTCTL core reset + HPRT0.PRTPWR (the previous entry's fix) did NOT clear the real
+symptom -- same `port connected=0` after reflashing and rebooting with both dongles attached. User: "i would
+say exhaust all software issues first before pointing at the hardware." GSNPSID itself read back 0x4F54280A
+on that same retest -- the real, correct, documented BCM2835 core release value (matches known-good real Pi
+boot logs), confirming MMIO genuinely reaches live silicon and the core itself is alive; the gap is
+specifically in port/connection logic, not a dead or unclocked peripheral.
+
+Checked against external references (Linux `drivers/usb/dwc2/`, Raspberry Pi forums, `raspberrypi/linux`
+commit history, `fpgas-online/rpi-qemu` issue tracker) before adding anything further, rather than guessing
+bottom-up. Two more real, independently-documented gaps found, neither ever referenced anywhere in this
+file before today:
+
+1. **GUSBCFG FORCEHOSTMODE + GINTSTS.CURMODE** -- a real core's host/device mode is not implicit; a real
+   `raspberrypi/linux` commit is literally titled "dwc_otg: Force host mode to fix incorrect compute module
+   boards," and an independent `fpgas-online/rpi-qemu` issue confirms real BCM2835 silicon raises a Mode
+   Mismatch condition when host-mode registers (HPRT0 included) are touched while the core believes it's in
+   device mode -- exactly this project's own symptom shape. New `dwc2_force_host_mode()`: forces host mode
+   (clearing FORCEDEVMODE first), waits 25ms (matching Linux's own `dwc2_force_mode()`'s `usleep_range(25000,
+   25500)`), then a bounded poll confirms GINTSTS.CURMODE actually flipped. Called right after the core soft
+   reset, before anything else.
+
+2. **VideoCore mailbox USB-HCD power-on** -- multiple independent real-hardware bare-metal Pi references
+   confirm the USB circuit must be explicitly powered on via a `SET_POWER_STATE` mailbox property-tag
+   request (device id 3 = USB HCD) before the DWC2 block's own operational logic is live at all -- a step
+   this project has never performed anywhere. New `boot/usb_power_state.S` (`usb_power_on()`), reusing
+   `boot/governor_state.S`'s own already-proven mailbox property-tag protocol (same register offsets,
+   channel 8, DMB-before-handoff discipline, bounded polls) with a different tag/value-buffer shape. Called
+   once, before `dwc2_init` touches anything.
+
+Both QEMU-verified as true no-ops: `-device usb-kbd` enumeration output is unchanged (byte-for-byte
+identical lines, just with the new `USB: power-on mailbox status=00000000 (0=success)` line prepended --
+QEMU's own mailbox model appears to handle the unfamiliar tag the same permissively-successful way it
+already handles `SET_CLOCK_RATE`), `qemu_run.py` regression unaffected. **Still NOT confirmed as THE fix**
+-- same "reference match isn't causal proof" discipline as every prior round of this investigation -- a real
+reflash + retest is the only way to know. If all four of these clear and the symptom somehow persists, FIFO
+sizing (GRXFSIZ/GNPTXFSIZ, confirmed as a separate real DWC2 core-init requirement via the Linux source) is
+the next concrete candidate, though it affects data transfers more than basic port-connect detection and is
+a less likely explanation for THIS specific symptom.

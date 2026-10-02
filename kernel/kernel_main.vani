@@ -1772,6 +1772,14 @@ extern "C" fn uart_digits_scratch_get() -> mut ref i64;
 extern "C" fn dwc2_dma_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dwc2_dma_scratch_get() -> mut ref i64;
+// boot/usb_power_state.S (task #197 follow-up, real-HW USB bring-up
+// investigation, 2026-10-02) -- see that file's own header comment
+// for the full "why" (VideoCore mailbox SET_POWER_STATE for the USB
+// HCD power domain, a real bare-metal Pi requirement this driver has
+// never performed, untestable under QEMU since its raspi1ap model
+// never power-gates the DWC2 block at all).
+#[stack_cost(bytes=28)]
+extern "C" fn usb_power_on() -> i64;
 // Round 35 (boot/scratch_state.S): dwc2_bulk_out/dwc2_bulk_in's own
 // dedicated 512-byte DMA buffer, separate from dwc2_dma_scratch (64
 // bytes, control transfers only) -- see that state file's own comment
@@ -12427,7 +12435,13 @@ fn timer_tick_dispatch() -> i64 {
   // unboundable under #[wcet(...)] (see uart_putc_nonblocking's
   // comment) -- a single best-effort byte keeps ticks visible in
   // the log without reintroducing a blocking call to a hard-RT ISR.
-  let _ = uart_putc_nonblocking(46);
+  // Task #319 (2026-10-02): gated behind boot_debug_enabled() like
+  // everything else this round -- same O(1) single-.bss-read shape
+  // uart_rx_deferred_get() above already proves fits this function's
+  // own #[wcet(cycles=130000)] budget.
+  if boot_debug_enabled() == 1 {
+    let _ = uart_putc_nonblocking(46);
+  }
 
   // Round 62 (fault injection): `fault irqburst <n>` -- see
   // fault_irqburst_take's own comment for exactly what this does
@@ -17920,14 +17934,69 @@ fn dwc2_port_reset() -> i64 {
 //      is exactly why this has been invisible under every QEMU-only
 //      round until a real device was actually attached to real
 //      hardware for the first time.
-// Both added below, both no-ops under QEMU (confirmed live: the same
+// Both added, both no-ops under QEMU (confirmed live: the same
 // `usb-kbd` enumeration this project already relies on for self-tests
 // still passes identically with these two calls added) -- genuinely
 // new behavior only on real silicon, where they're real requirements,
 // not a behavior change for anything this project can verify without
-// hardware. NOT yet confirmed to be THE fix for the real-HW symptom
-// (same "reference match isn't causal proof" caution this project's
-// own memory already carries) -- a real retest is still needed.
+// hardware. RETESTED 2026-10-02: reflashed, same real symptom
+// persists (`port connected=0`) -- these two were real, correct, and
+// still necessary bring-up steps, but NOT the actual root cause by
+// themselves. GSNPSID itself read back correctly (0x4F54280A, the
+// real documented BCM2835 core release, matching known-good real Pi
+// boot logs) on that same retest, confirming MMIO genuinely reaches
+// real silicon and the core is alive -- the gap is specifically in
+// port/connection logic, not a dead/unclocked peripheral.
+//
+// Third real gap added below: GUSBCFG FORCEHOSTMODE + GINTSTS.
+// CURMODE. Per the Synopsys DWC_otg/DWC2 databook (and confirmed
+// against Linux's own dwc2_force_mode(), called early in that
+// driver's host-only init path), a real core's host/device mode is
+// NOT implicit -- without explicitly forcing host mode and waiting
+// for GINTSTS.CURMODE to actually read back 1, HPRT0 and every other
+// host-mode register can behave as if nothing is attached regardless
+// of PRTPWR, exactly this project's own real symptom. Never referenced
+// anywhere in this file before now -- QEMU's own dwc2 model, being a
+// host-controller-only emulation with no device-mode state machine to
+// simulate at all, has no "wrong mode" to ever force correctly for,
+// which is why this stayed invisible through every prior QEMU round
+// same as the first two gaps. Still NOT confirmed as THE fix -- same
+// "reference match isn't causal proof" caution -- a real retest is
+// the only way to know.
+
+// GUSBCFG (offset 0x0C): FORCEHOSTMODE=bit29, FORCEDEVMODE=bit30.
+// GINTSTS (offset 0x14): CURMODE=bit0 (RO, 0=device, 1=host) --
+// confirmed against hcd-dwc2.h's own register offsets. Forces host
+// mode explicitly (clearing FORCEDEVMODE first, so the two force bits
+// are never both set) and waits 25ms (matching Linux's own dwc2_
+// force_mode()'s `usleep_range(25000, 25500)` -- the databook's own
+// documented settle time for the internal mode-switch state machine)
+// before a bounded poll (20 tries, same "never `while true` against
+// hardware" discipline as dwc2_core_soft_reset's own polls) confirms
+// CURMODE actually flipped. The delay itself is unconditional, not
+// gated behind boot_debug_enabled() -- this is real functional
+// hardware bring-up every real boot needs, the same category as
+// dwc2_port_reset's own un-gated settle delays in this exact call
+// chain, not diagnostic noise.
+fn dwc2_force_host_mode() -> i64 {
+  let gusbcfg: i64 = dwc2_base() + 0x0C;
+  let gintsts: i64 = dwc2_base() + 0x14;
+  let v: u32 = mmio_read_u32(gusbcfg);
+  let force_dev_clear: u32 = (0x40000000 as u32) ^ (0xFFFFFFFF as u32);
+  let _ = mmio_write_u32(gusbcfg, (v & force_dev_clear) | (0x20000000 as u32));
+  let _ = delay(25000);
+  let tries: i64 = 0;
+  while tries < 20 {
+    let s: u32 = mmio_read_u32(gintsts);
+    if (s & (1 as u32)) != (0 as u32) {
+      tries = 20;
+    } else {
+      tries = tries + 1;
+    }
+  }
+  return 0;
+}
+
 fn dwc2_init() -> i64 {
   let id: u32 = dwc2_read_gsnpsid();
   let _ = uart_puts("USB: GSNPSID=");
@@ -17935,6 +18004,7 @@ fn dwc2_init() -> i64 {
   let _ = uart_puts("\n");
 
   let _ = dwc2_core_soft_reset();
+  let _ = dwc2_force_host_mode();
   let _ = dwc2_enable_global_intr();
   let _ = dwc2_port_power_on();
 
@@ -25169,10 +25239,40 @@ fn log_level_describe() -> i64 {
     let _ = uart_puts("GC");
     any = 1;
   }
+  // Task #318 follow-up ("clean boot, no messages for issues already
+  // resolved", 2026-10-02): bit 16 (0x10), DEBUG -- gates the 77 boot-
+  // time self-test calls, the per-tick '.' heartbeat, and every
+  // historical "*DIAG:" print this project's own past investigations
+  // left behind (see boot_debug_enabled's own header comment). OFF by
+  // default like DEMO/GC above -- a normal boot now skips all of it
+  // entirely (a real speed win, not just silenced output, since the
+  // self-tests are skipped as function calls, not merely unprinted).
+  if (mask & (16 as u32)) != (0 as u32) {
+    if any == 1 {
+      let _ = uart_puts(" ");
+    }
+    let _ = uart_puts("DEBUG");
+    any = 1;
+  }
   if any == 0 {
     let _ = uart_puts("none");
   }
   let _ = uart_puts(")\n");
+  return 0;
+}
+
+// Task #318 follow-up (2026-10-02): the one check every gated self-
+// test call / tick dot / DIAG print below reads, reusing /config/
+// loglevel's own mask rather than inventing a second config file --
+// `write /config/loglevel 16` (or 20/28/etc. to combine with DEMO/GC)
+// before a reboot, or live via `write /dev/loglevel 16`/`dhdl set
+// loglevel 16`, turns the full verbose boot back on for active
+// diagnosis; anything else (no config file, or any value with bit 16
+// clear) is a clean, fast boot by default.
+fn boot_debug_enabled() -> i64 {
+  if (log_state_get_mask() & (16 as u32)) != (0 as u32) {
+    return 1;
+  }
   return 0;
 }
 
@@ -40656,7 +40756,7 @@ fn kernel_main() -> i64 {
   let _ = dhcp_server_frame_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
   let _ = dhcp_server_client_mac_scratch_set(dhruva_alloc_bytes(6));
 
-  let _ = sdhost_cmd_timed_out_self_test();
+  if boot_debug_enabled() == 1 { let _ = sdhost_cmd_timed_out_self_test(); }
 
   // BUG (round 15 audit, 2026-08-28): sdhost_init's own return value
   // (RCA on success, -1 on a newly-detected command timeout -- see
@@ -40877,22 +40977,22 @@ fn kernel_main() -> i64 {
   let _ = uart_puts(" (expect FFFFFFFF, i.e. -1, not found)\n");
 
   // Round 39: multi-block files + journaling hardening.
-  let _ = dharafs_multiblock_self_test();
-  let _ = dharafs_write_bounded_self_test();
-  let _ = mailbox_self_test();
-  let _ = dharafs_multiblock_crash_consistency_self_test();
+  if boot_debug_enabled() == 1 { let _ = dharafs_multiblock_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dharafs_write_bounded_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = mailbox_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dharafs_multiblock_crash_consistency_self_test(); }
 
   // Round 77: dharafs_compact's own resumable, per-call-bounded pass.
-  let _ = dharafs_compact_resumable_self_test();
+  if boot_debug_enabled() == 1 { let _ = dharafs_compact_resumable_self_test(); }
 
   // Round 42: directory hierarchy + owner/group/other rwx permissions.
-  let _ = dharafs_permissions_self_test();
-  let _ = dharafs_directory_hierarchy_self_test();
+  if boot_debug_enabled() == 1 { let _ = dharafs_permissions_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dharafs_directory_hierarchy_self_test(); }
 
   // Task #10 verification: eval_expr_raw, via boot-time self-test
   // rather than live shell input (see eval_self_test's own comment).
   // Round 72: shell input echo, with su/passwd password-mode suppression.
-  let _ = shell_echo_self_test();
+  if boot_debug_enabled() == 1 { let _ = shell_echo_self_test(); }
 
   let _ = eval_self_test("2+3", 5, 0);
   let _ = eval_self_test("2 + 3 * 4", 14, 0);
@@ -40936,9 +41036,9 @@ fn kernel_main() -> i64 {
   let _ = governor_self_test(4, 700);
   let _ = governor_self_test(5, 700);
   let _ = governor_replay_test();
-  let _ = uart_clock_governor_cross_check_self_test();
-  let _ = dma_ram_copy_self_test();
-  let _ = dma_uart_tx_self_test();
+  if boot_debug_enabled() == 1 { let _ = uart_clock_governor_cross_check_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dma_ram_copy_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dma_uart_tx_self_test(); }
 
   // Round 60: packet filtering's own default policy -- .bss's own
   // zero-init would otherwise leave fw_default_policy at 0 (deny),
@@ -40951,106 +41051,106 @@ fn kernel_main() -> i64 {
 
   // Phase 6 verification: netif's own loopback implementation.
   let _ = netif_init();
-  let _ = netif_self_test();
-  let _ = filter_self_test();
-  let _ = filter_outgoing_self_test();
-  let _ = arp_self_test();
-  let _ = arp_resolve_self_test();
-  let _ = ipv4_self_test();
-  let _ = ip_parse_self_test();
-  let _ = icmp_self_test();
-  let _ = udp_self_test();
-  let _ = udp_send_unresolved_self_test();
-  let _ = udp_recv_bounds_self_test();
-  let _ = udp_checksum_reject_self_test();
-  let _ = tcp_self_test();
-  let _ = tcp_conn_self_test();
-  let _ = tcp_conn_recv_bounds_self_test();
-  let _ = tcp_conn_simultaneous_open_self_test();
-  let _ = tcp_conn_simultaneous_close_self_test();
-  let _ = tcp_conn_window_enforcement_self_test();
-  let _ = dhcp_self_test();
-  let _ = dhcp_renewal_self_test();
-  let _ = dhcp_nak_self_test();
-  let _ = dhcp_server_self_test();
-  let _ = netif_queue_contention_self_test();
+  if boot_debug_enabled() == 1 { let _ = netif_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = filter_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = filter_outgoing_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = arp_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = arp_resolve_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = ipv4_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = ip_parse_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = icmp_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = udp_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = udp_send_unresolved_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = udp_recv_bounds_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = udp_checksum_reject_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = tcp_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = tcp_conn_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = tcp_conn_recv_bounds_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = tcp_conn_simultaneous_open_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = tcp_conn_simultaneous_close_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = tcp_conn_window_enforcement_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dhcp_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dhcp_renewal_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dhcp_nak_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dhcp_server_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = netif_queue_contention_self_test(); }
 
   // Round 41: crypto primitives foundation, hash-function half.
-  let _ = sha256_self_test();
+  if boot_debug_enabled() == 1 { let _ = sha256_self_test(); }
 
   // Task #164 (WiFi/WPA2) groundwork: SHA-1, legacy-interop-only,
   // needed for WPA2-PSK's own HMAC-SHA1-based PBKDF2/PRF key
   // derivation (no substitute exists that still interoperates with a
   // real access point). See sha1_self_test's own header comment.
-  let _ = sha1_self_test();
+  if boot_debug_enabled() == 1 { let _ = sha1_self_test(); }
 
   // Real authentication: HMAC-SHA256/PBKDF2-HMAC-SHA256, built on
   // round 41's SHA-256, ahead of everything su/passwd itself needs.
-  let _ = hmac_sha256_self_test();
-  let _ = pbkdf2_hmac_sha256_self_test();
+  if boot_debug_enabled() == 1 { let _ = hmac_sha256_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = pbkdf2_hmac_sha256_self_test(); }
 
   // Task #164 (WiFi/WPA2) groundwork: HMAC-SHA1/PBKDF2-HMAC-SHA1,
   // legacy-interop-only, needed for WPA2-PSK's own PMK/PRF key
   // derivation. See sha1_self_test's own header comment.
-  let _ = hmac_sha1_self_test();
-  let _ = pbkdf2_hmac_sha1_self_test();
+  if boot_debug_enabled() == 1 { let _ = hmac_sha1_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = pbkdf2_hmac_sha1_self_test(); }
 
   // Task #164 (WiFi/WPA2) groundwork: AES-CCMP (CCM mode, RFC 3610),
   // WPA2's actual data-frame encryption. See aes_ccmp_self_test's own
   // header comment.
-  let _ = aes_ccmp_self_test();
+  if boot_debug_enabled() == 1 { let _ = aes_ccmp_self_test(); }
 
   // Task #164 (WiFi/WPA2) groundwork: EAPOL-Key frame parsing/building,
   // the 4-way handshake's actual wire format. See
   // eapol_key_self_test's own header comment.
-  let _ = eapol_key_self_test();
+  if boot_debug_enabled() == 1 { let _ = eapol_key_self_test(); }
 
   // Task #164 (WiFi/WPA2) groundwork: PTK derivation (PRF-X +
   // PMK-to-PTK), the 4-way handshake's own key derivation core. See
   // wpa_ptk_self_test's own header comment.
-  let _ = wpa_ptk_self_test();
+  if boot_debug_enabled() == 1 { let _ = wpa_ptk_self_test(); }
 
   // Task #164 (WiFi/WPA2) groundwork: the 4-way handshake's own
   // message-sequencing state machine (Msg1->Msg2, Msg3->Msg4). See
   // wpa_handshake_self_test's own header comment for what's covered
   // and what's still separately scoped.
-  let _ = wpa_handshake_self_test();
+  if boot_debug_enabled() == 1 { let _ = wpa_handshake_self_test(); }
 
   // Task #164 (WiFi/WPA2) groundwork: CSPRNG-based nonce generation
   // (BCM2835 hardware RNG + vani-csprng hash-based conditioning). See
   // csprng_init/csprng_hw_self_test's own header comments.
   let _ = csprng_init();
-  let _ = csprng_hw_self_test();
+  if boot_debug_enabled() == 1 { let _ = csprng_hw_self_test(); }
 
   // Task #164 (WiFi/WPA2) groundwork: IEEE 802.11 management frames
   // (Probe Req/Resp, Open System Auth, Assoc Req/Resp) + the
   // WPA2-PSK/CCMP RSN IE. See ieee80211_boot_self_test's own header
   // comment.
-  let _ = ieee80211_boot_self_test();
+  if boot_debug_enabled() == 1 { let _ = ieee80211_boot_self_test(); }
 
   // Task #198: WPA2 join-sequence orchestrator, end-to-end against a
   // synthetic peer. See wpa2_join_orchestrator_self_test's own header
   // comment -- calls wpa_hs_init itself before using any wpa_hs_*
   // state, same as wpa_handshake_self_test does independently, so
   // this has no ordering dependency on that (or any other) self-test.
-  let _ = wpa2_join_orchestrator_self_test();
+  if boot_debug_enabled() == 1 { let _ = wpa2_join_orchestrator_self_test(); }
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
-  let _ = chacha20_self_test();
-  let _ = poly1305_self_test();
-  let _ = x25519_self_test();
-  let _ = sha512_self_test();
-  let _ = ed25519_self_test();
-  let _ = pki_self_test();
-  let _ = rtl_fw_header_self_test();
-  let _ = rtl_tx_desc_self_test();
-  let _ = rtl_rx_desc_self_test();
-  let _ = rtl_llt_write_self_test();
-  let _ = rtl8188cu_set_channel_self_test();
-  let _ = delay_wcet_measure_self_test();
-  let _ = i64_div_wcet_measure_self_test();
-  let _ = sd_fill_poll_body_wcet_measure_self_test();
-  let _ = sdhost_cmd_poll_body_pmccntr_self_test();
+  if boot_debug_enabled() == 1 { let _ = chacha20_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = poly1305_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = x25519_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = sha512_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = ed25519_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = pki_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = rtl_fw_header_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = rtl_tx_desc_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = rtl_rx_desc_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = rtl_llt_write_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = rtl8188cu_set_channel_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = delay_wcet_measure_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = i64_div_wcet_measure_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = sd_fill_poll_body_wcet_measure_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = sdhost_cmd_poll_body_pmccntr_self_test(); }
   let _ = task_deadlines_init();
   let _ = task_heartbeat_init();
   // ROUND 2026-09-18 (task #242): seed the very first tick's own UART
@@ -41059,13 +41159,13 @@ fn kernel_main() -> i64 {
   // it, incorrectly deferring/masking RX if a keystroke somehow beat
   // the first tick.
   let _ = uart_rx_irq_budget_set(UART_RX_IRQ_BUDGET_PER_TICK as u32);
-  let _ = stack_canary_self_test();
-  let _ = aes128_self_test();
-  let _ = aead_hkdf_self_test();
-  let _ = keccak_self_test();
-  let _ = mlkem_self_test();
-  let _ = tls_self_test();
-  let _ = tls_tcp_self_test();
+  if boot_debug_enabled() == 1 { let _ = stack_canary_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = aes128_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = aead_hkdf_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = keccak_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = mlkem_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = tls_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = tls_tcp_self_test(); }
 
   // Media (at-rest) encryption for DharaFS, layered on the ChaCha20
   // cipher above. Key derivation runs once here, single-threaded,
@@ -41081,10 +41181,20 @@ fn kernel_main() -> i64 {
   // Ed25519 self-tests below rather than a standalone bignum check.
 
   // Round 71: general-purpose GPIO.
-  let _ = gpio_self_check();
+  if boot_debug_enabled() == 1 { let _ = gpio_self_check(); }
 
   // Round 71: HDMI framebuffer (mailbox property-channel interface).
   let _ = fb_self_check();
+
+  // Task #197 follow-up (real-HW USB bring-up investigation,
+  // 2026-10-02): VideoCore mailbox USB-HCD power-on -- see boot/
+  // usb_power_state.S's own header comment for the full real-HW
+  // finding this addresses. Must happen before dwc2_init touches any
+  // DWC2 register at all.
+  let usb_power_status: i64 = usb_power_on();
+  let _ = uart_puts("USB: power-on mailbox status=");
+  let _ = uart_put_hex32(usb_power_status as u32);
+  let _ = uart_puts(" (0=success)\n");
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device
@@ -41095,8 +41205,8 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("USB: dwc2_init status=");
   let _ = uart_put_hex32(usb_status as u32);
   let _ = uart_puts(" (0=device attached+port enabled, nonzero=no device attached)\n");
-  let _ = dwc2_wait_chan0_done_wcet_measure_self_test();
-  let _ = dwc2_net_bulk_in_poll_wcet_measure_self_test();
+  if boot_debug_enabled() == 1 { let _ = dwc2_wait_chan0_done_wcet_measure_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dwc2_net_bulk_in_poll_wcet_measure_self_test(); }
 
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();
@@ -41665,7 +41775,7 @@ fn kernel_main() -> i64 {
   // CONTENDED path, and blocked forever waiting for a lock nobody ever
   // held -- the exact same class of ordering bug the SSH auth-table
   // comment below already documents catching for a different table.
-  let _ = task_holds_any_mutex_self_test();
+  if boot_debug_enabled() == 1 { let _ = task_holds_any_mutex_self_test(); }
 
   // Task #286: same placement reasoning as task_holds_any_mutex_self_
   // test just above -- runs after task_table_init's own sentinel seed,
@@ -41674,7 +41784,7 @@ fn kernel_main() -> i64 {
   // table/rr_last_picked yet at this exact point, and this self-test
   // restores every one of them to its exact prior value before
   // returning regardless).
-  let _ = scheduler_16_levels_self_test();
+  if boot_debug_enabled() == 1 { let _ = scheduler_16_levels_self_test(); }
 
   // Real authentication: seed the user-credential table's own
   // "empty" sentinel before anything (passwd/su) can touch it --
@@ -41701,7 +41811,7 @@ fn kernel_main() -> i64 {
   // checklist meant this new (not-yet-added-to-that-checklist) test
   // had passed too. Must run here, strictly after ssh_auth_table_init
   // above, not anywhere else in this function.
-  let _ = ssh_auth_self_test();
+  if boot_debug_enabled() == 1 { let _ = ssh_auth_self_test(); }
 
   // Round 60 crash investigation: was 512 bytes (matching this fn's own
   // #[bounded_stack(bytes=512)] budget exactly, with zero headroom --
@@ -41836,7 +41946,7 @@ fn kernel_main() -> i64 {
   // overwriting cleanly from index 0 again on the next real entry.
   let _ = arp_cache_set_count(0 as u32);
   let _ = arp_cache_set_next_slot(0 as u32);
-  let _ = heap_usage_self_test();
+  if boot_debug_enabled() == 1 { let _ = heap_usage_self_test(); }
 
   // Round 27 (2026-08-28): actually start real DHCP address
   // acquisition -- dhcp_client_start/dhcp_client_poll have existed

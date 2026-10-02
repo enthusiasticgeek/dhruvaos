@@ -122,6 +122,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/governor_state.S" -o "${BUILD_DIR}/governor_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/usb_power_state.S" -o "${BUILD_DIR}/usb_power_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/pmccntr_state.S" -o "${BUILD_DIR}/pmccntr_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -329,7 +332,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/fiq_entry.o" "${BUILD_DIR}/swi_entry.o" "${BUILD_DIR}/vectors.o" \
   "${BUILD_DIR}/sdcard_state.o" "${BUILD_DIR}/dharafs_buf.o" \
   "${BUILD_DIR}/dharafs_state.o" "${BUILD_DIR}/shell_state.o" \
-  "${BUILD_DIR}/governor_state.o" "${BUILD_DIR}/pmccntr_state.o" \
+  "${BUILD_DIR}/governor_state.o" "${BUILD_DIR}/usb_power_state.o" "${BUILD_DIR}/pmccntr_state.o" \
   "${BUILD_DIR}/uart_clock_state.o" "${BUILD_DIR}/throttled_state.o" \
   "${BUILD_DIR}/log_state.o" \
   "${BUILD_DIR}/dhdl_state.o" \
