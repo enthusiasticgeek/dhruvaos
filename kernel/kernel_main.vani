@@ -29703,10 +29703,25 @@ fn task_f() -> i64 {
 // the same best-effort band GC/SHELL already share -- an ordinary new
 // task has no reason to outrank the existing hard-RT demo.
 // ROUND 2026-09-17 (Gap #235): same extraction pattern as task_a/b/d.
+// Task #318 follow-up (real-HW testing session, 2026-10-02): this
+// print is NOT gated by /config/loglevel's DEMO bit (it was
+// deliberately reverted to this unconditional minimal form by task
+// #309, undoing an unrelated temporary diagnostic) -- unconditional
+// means it fires on every single wake of this demo task, frequently
+// enough on real hardware to corrupt/interleave with the shell's own
+// command reception badly enough to make typed commands unreliable
+// (confirmed live: `dhdl set loglevel 0` did not stop this message at
+// all, since it was never gated by that mask to begin with). Gated
+// behind boot_debug_enabled() now, same flag as everything else this
+// round -- same O(1) single-.bss-read shape already proven safe
+// inside irq_dispatch's own #[wcet(cycles=130000)] body, well within
+// this function's smaller 20000-cycle budget.
 #[no_heap]
 #[wcet(cycles=20000)]
 fn task_custom_demo_wake_body() -> i64 {
-  let _ = uart_puts_bounded("CUSTOM: dynamically-created task running\n");
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts_bounded("CUSTOM: dynamically-created task running\n");
+  }
   return 0;
 }
 

@@ -12479,3 +12479,28 @@ reflash + retest is the only way to know. If all four of these clear and the sym
 sizing (GRXFSIZ/GNPTXFSIZ, confirmed as a separate real DWC2 core-init requirement via the Linux source) is
 the next concrete candidate, though it affects data transfers more than basic port-connect detection and is
 a less likely explanation for THIS specific symptom.
+
+### Real-HW retest attempt revealed a SEPARATE, blocking chatter bug: `task_custom_demo`'s print was never gated (2026-10-02)
+
+Attempted a live retest of the four DWC2 fixes above by connecting directly to `/dev/ttyUSB0` (picocom
+wasn't holding it) and driving the shell myself. Found `dhdl set loglevel 0` reported `ok` but "CUSTOM:
+dynamically-created task running" kept firing anyway -- task #318's own boot-debug-flag work did NOT touch
+this message, because it was never gated by `/config/loglevel`'s DEMO bit at all: task #309 (2026-09-26)
+deliberately reverted it to an unconditional minimal form when removing an unrelated temporary RULER
+diagnostic, and that revert never restored DEMO-bit gating. Every OTHER demo task (`task_a`/`task_b`/
+`governor_step`/`task_d`/both mutex-demo tasks) already correctly gates its own prints on `LOG_CAT_DEMO` --
+checked all six before concluding `task_custom_demo_wake_body` was the only outlier.
+
+Real consequence, not just cosmetic: this task wakes frequently enough that its unconditional print was
+corrupting/interleaving with nearly every multi-character shell command sent to the real board -- `dhdl
+list`, `dhdl query usb/ble`, even `reboot` itself were all getting mangled into "unknown command" on most
+attempts, only occasionally landing clean. This is almost certainly why earlier USB retest attempts in this
+same session looked inconclusive -- the commands used to check the result were themselves unreliable.
+
+Fixed: gated behind `boot_debug_enabled()` (task #318's own flag), same O(1) shape already proven safe
+inside `irq_dispatch`'s own `#[wcet(cycles=130000)]` body, comfortably inside this function's smaller
+20000-cycle budget. QEMU-verified (build clean, `qemu_run.py` clean). Confirmed live on the real board
+(before this fix was flashed) that resending `dhdl set loglevel 0` with enough retries (15 attempts) did
+eventually land and reported `ok` -- the shell itself works fine, it's purely a reception-reliability
+problem caused by this one print's frequency. This fix needs to be reflashed before any further real-HW
+retest of the DWC2 work above can be trusted.
