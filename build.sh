@@ -278,6 +278,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/uart_tx_ring_state.S" -o "${BUILD_DIR}/uart_tx_ring_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/uart_capture_state.S" -o "${BUILD_DIR}/uart_capture_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/dma_uart_state.S" -o "${BUILD_DIR}/dma_uart_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
@@ -375,6 +378,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/crashlog_scratch.o" \
   "${BUILD_DIR}/csprng_state.o" \
   "${BUILD_DIR}/uart_tx_ring_state.o" \
+  "${BUILD_DIR}/uart_capture_state.o" \
   "${BUILD_DIR}/dma_uart_state.o" \
   "${BUILD_DIR}/kernel_main.o" "${BUILD_DIR}/runtime_stubs.o" \
   "${BUILD_DIR}/uboot_sdhost_write.o" \

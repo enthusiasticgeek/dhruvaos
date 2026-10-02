@@ -2736,6 +2736,24 @@ extern "C" fn usb_wifi_set_out_toggle(value: u32) -> u32;
 #[stack_cost(bytes=12)]
 extern "C" fn uart_tx_ring_push_and_drain(c: u32) -> u32;
 
+// Task #317 follow-up ("implement it. fix limitation", 2026-10-02):
+// generic UART-output capture, fixing the DHDL roadmap's own long-
+// standing open question ("whether describe fns print directly or
+// return structured data") without touching any of the 10 already-
+// registered describe fns at all. boot/uart_capture_state.S's own
+// header comment has the full design -- the short version: uart_putc
+// (every print primitive in this file funnels through it) checks
+// this state first, and when active, appends the raw byte into the
+// registered buffer instead of touching real hardware at all.
+extern "C" fn uart_capture_set_active(value: u32) -> u32;
+extern "C" fn uart_capture_get_active() -> u32;
+extern "C" fn uart_capture_set_buf_ptr(buf: mut ref i64) -> i64;
+extern "C" fn uart_capture_get_buf_ptr() -> mut ref i64;
+extern "C" fn uart_capture_set_len(value: u32) -> u32;
+extern "C" fn uart_capture_get_len() -> u32;
+extern "C" fn uart_capture_set_cap(value: u32) -> u32;
+extern "C" fn uart_capture_get_cap() -> u32;
+
 // Round 2026-09-15 real-hardware timing investigation: TIMER_CLO
 // snapshots taken at boot.S's own 7 pre-kernel_main LED checkpoints (see
 // boot/rpi1/boot.S's SNAP_TIMER macro) -- printed once uart_init() has
@@ -4228,6 +4246,25 @@ fn uart_rx_irq_init() -> i64 {
 }
 
 fn uart_putc(c: i64) -> i64 {
+  // Task #317 follow-up (2026-10-02): checked FIRST, before any real
+  // hardware access -- see boot/uart_capture_state.S's own header
+  // comment for the full design. Captures the logical byte as-is,
+  // deliberately bypassing the CR-before-LF step below entirely: that
+  // step exists only to adapt a logical '\n' for a real raw terminal,
+  // and a captured buffer gets REPLAYED through this same function
+  // later (dharafs_print_data, not in capture mode), where the CR
+  // adaptation naturally re-applies correctly on its own -- doing it
+  // twice would double every newline in the final printed output.
+  if uart_capture_get_active() == (1 as u32) {
+    let cur_len: u32 = uart_capture_get_len();
+    let cur_cap: u32 = uart_capture_get_cap();
+    if cur_len < cur_cap {
+      let cap_buf: mut ref i64 = uart_capture_get_buf_ptr();
+      let _ = buf_write_byte(cap_buf, cur_len, c as u32);
+      let _ = uart_capture_set_len(cur_len + (1 as u32));
+    }
+    return 0;
+  }
   let uart_fr: i64 = UART_FR;
   let uart_dr: i64 = UART_DR;
   // ROUND 2026-09-16: a raw terminal in the mode picocom uses for real-
@@ -4424,6 +4461,25 @@ fn uart_put_hex32_irq(v: u32) -> i64 {
 // is a real, separate, larger cleanup outside this task's own scope
 // (shell-echo-vs-typed-command interleaving specifically), left for a
 // future round if it turns out to matter in practice.
+// Task #317 follow-up (2026-10-02): starts/stops uart_putc's own
+// capture mode. NOT mutual-exclusion-safe on their own -- see boot/
+// uart_capture_state.S's own header comment; callers must wrap the
+// whole begin/call/end sequence in dhruva_prio_lock(0)/_unlock
+// themselves (dhdl_call_by_id_captured below is the one real caller
+// that does this correctly).
+fn uart_capture_begin(buf: mut ref i64, cap: u32) -> i64 {
+  let _ = uart_capture_set_buf_ptr(buf);
+  let _ = uart_capture_set_cap(cap);
+  let _ = uart_capture_set_len(0 as u32);
+  let _ = uart_capture_set_active(1 as u32);
+  return 0;
+}
+
+fn uart_capture_end() -> i64 {
+  let _ = uart_capture_set_active(0 as u32);
+  return uart_capture_get_len() as i64;
+}
+
 fn uart_puts(s: Str) -> i64 {
   let saved_prio: u32 = current_eff_prio();
   let _ = dhruva_prio_lock(0);
@@ -26563,6 +26619,92 @@ fn dhdl_name_for_id(id: u32) -> Str {
   return "?";
 }
 
+// Task #317 follow-up (2026-10-02): the reverse of dhdl_name_for_id
+// above, and the same name<->id chain `shell_dispatch_dhdl`'s own
+// `query`/`set` handlers used to each hand-roll separately -- factored
+// out here so `query`, `set`, and the new `/dev` routing (cat/write/ls
+// below) all resolve a name the same one way. Takes a generic
+// buf+range (same shape shell_word_matches itself takes) rather than
+// hardcoding `line_buf`, since the `/dev` routing resolves a name out
+// of a copied path buffer, not the raw shell line. Returns 0 for an
+// unknown name, matching dhdl_state.S's own "0 = never used" slot
+// convention -- not a second, different sentinel alongside it.
+fn dhdl_subsys_id_for_name(buf: mut ref i64, start: i64, end: i64) -> u32 {
+  if shell_word_matches(buf, start, end, "loglevel") == 1 {
+    return dhdl_subsys_loglevel_id();
+  }
+  if shell_word_matches(buf, start, end, "sd") == 1 {
+    return dhdl_subsys_sd_id();
+  }
+  if shell_word_matches(buf, start, end, "gpio") == 1 {
+    return dhdl_subsys_gpio_id();
+  }
+  if shell_word_matches(buf, start, end, "display") == 1 {
+    return dhdl_subsys_display_id();
+  }
+  if shell_word_matches(buf, start, end, "dma") == 1 {
+    return dhdl_subsys_dma_id();
+  }
+  if shell_word_matches(buf, start, end, "ram") == 1 {
+    return dhdl_subsys_ram_id();
+  }
+  if shell_word_matches(buf, start, end, "usb") == 1 {
+    return dhdl_subsys_usb_id();
+  }
+  if shell_word_matches(buf, start, end, "ethernet") == 1 {
+    return dhdl_subsys_ethernet_id();
+  }
+  if shell_word_matches(buf, start, end, "wifi") == 1 {
+    return dhdl_subsys_wifi_id();
+  }
+  if shell_word_matches(buf, start, end, "ble") == 1 {
+    return dhdl_subsys_ble_id();
+  }
+  return 0 as u32;
+}
+
+// Task #317 follow-up (2026-10-02): dhdl_call_by_id, but captures the
+// describe fn's own UART output into `out_buf` instead of letting it
+// reach real hardware -- see boot/uart_capture_state.S's own header
+// comment for why this needed no change to dhdl_call_by_id itself, or
+// to any of the 10 registered describe fns. The dhruva_prio_lock(0)
+// ceiling (same one uart_puts itself already uses, task #185) is
+// mandatory here, not optional: it is what stops a preempting task's
+// own unrelated uart_puts call from landing mid-capture and
+// corrupting `out_buf` with interleaved foreign bytes -- uart_capture_
+// begin/_end have no mutual-exclusion of their own. Returns the
+// number of bytes captured (0 is a legitimate describe fn that simply
+// printed nothing, same as uart_capture_end's own contract).
+fn dhdl_call_by_id_captured(id: u32, out_buf: mut ref i64, cap: u32) -> i64 {
+  let saved_prio: u32 = current_eff_prio();
+  let _ = dhruva_prio_lock(0);
+  let _ = uart_capture_begin(out_buf, cap);
+  let _ = dhdl_call_by_id(id);
+  let captured_len: i64 = uart_capture_end();
+  let _ = dhruva_prio_unlock(saved_prio as i64);
+  return captured_len;
+}
+
+// Task #317 follow-up (2026-10-02): true for the literal path "/dev"
+// or anything beginning "/dev/" -- the reserved virtual namespace
+// cat/write/ls below route to DHDL instead of the real DharaFS block
+// layer. Uses shell_word_matches for the fixed 4-byte prefix rather
+// than hand-rolled byte comparisons, matching how every other exact-
+// match check in this file already works.
+fn shell_path_is_dev(path_buf: mut ref i64, path_len: i64) -> i64 {
+  if path_len == 4 {
+    return shell_word_matches(path_buf, 0, 4, "/dev");
+  }
+  if path_len > 4 {
+    if shell_word_matches(path_buf, 0, 4, "/dev") == 1 {
+      if buf_read_byte(path_buf, 4 as u32) == (0x2F as u32) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
   let usage: Str = "usage: dhdl list|query <name>|set <name> <value>\n";
   if cmd_end >= line_len {
@@ -26595,47 +26737,15 @@ fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
     }
     let name_start: i64 = sub_end + 1;
     let name_end: i64 = shell_find_space(line_buf, name_start, line_len);
-    if shell_word_matches(line_buf, name_start, name_end, "loglevel") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_loglevel_id());
+    // Task #317 follow-up (2026-10-02): was a 10-way inline chain,
+    // now shared with `set` below and the new `/dev` routing (cat/
+    // write/ls) via dhdl_subsys_id_for_name.
+    let id: u32 = dhdl_subsys_id_for_name(line_buf, name_start, name_end);
+    if id == (0 as u32) {
+      let _ = uart_puts("dhdl: unknown subsystem (see `dhdl list`)\n");
       return 0;
     }
-    if shell_word_matches(line_buf, name_start, name_end, "sd") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_sd_id());
-      return 0;
-    }
-    if shell_word_matches(line_buf, name_start, name_end, "gpio") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_gpio_id());
-      return 0;
-    }
-    if shell_word_matches(line_buf, name_start, name_end, "display") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_display_id());
-      return 0;
-    }
-    if shell_word_matches(line_buf, name_start, name_end, "dma") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_dma_id());
-      return 0;
-    }
-    if shell_word_matches(line_buf, name_start, name_end, "ram") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_ram_id());
-      return 0;
-    }
-    if shell_word_matches(line_buf, name_start, name_end, "usb") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_usb_id());
-      return 0;
-    }
-    if shell_word_matches(line_buf, name_start, name_end, "ethernet") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_ethernet_id());
-      return 0;
-    }
-    if shell_word_matches(line_buf, name_start, name_end, "wifi") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_wifi_id());
-      return 0;
-    }
-    if shell_word_matches(line_buf, name_start, name_end, "ble") == 1 {
-      let _ = dhdl_call_by_id(dhdl_subsys_ble_id());
-      return 0;
-    }
-    let _ = uart_puts("dhdl: unknown subsystem (see `dhdl list`)\n");
+    let _ = dhdl_call_by_id(id);
     return 0;
   }
 
@@ -26646,12 +26756,8 @@ fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
   // (loglevel's is just the mask), so a `<param>` level would be
   // unused scaffolding; add it the day a real subsystem actually
   // needs to disambiguate between two of its own settable values, not
-  // before. Name<->id resolution happens here (same `shell_word_
-  // matches` chain `query` uses, deliberately NOT deduplicated into a
-  // shared helper -- the two chains already read differently, `set`
-  // needs the id for dhdl_set_by_id rather than dispatching directly),
-  // then dhdl_set_by_id's own -1 return (checked here, not re-derived
-  // from the name chain) is what actually decides "does this
+  // before. dhdl_set_by_id's own -1 return (checked here, not re-
+  // derived from the name chain) is what actually decides "does this
   // subsystem support `set`" -- the single source of truth is the
   // setter table itself, not a second list of names kept in sync with
   // it by hand.
@@ -26674,47 +26780,10 @@ fn shell_dispatch_dhdl(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
       return 0;
     }
 
-    let id: u32 = 0 as u32;
-    if shell_word_matches(line_buf, name_start, name_end, "loglevel") == 1 {
-      id = dhdl_subsys_loglevel_id();
-    } else {
-      if shell_word_matches(line_buf, name_start, name_end, "sd") == 1 {
-        id = dhdl_subsys_sd_id();
-      } else {
-        if shell_word_matches(line_buf, name_start, name_end, "gpio") == 1 {
-          id = dhdl_subsys_gpio_id();
-        } else {
-          if shell_word_matches(line_buf, name_start, name_end, "display") == 1 {
-            id = dhdl_subsys_display_id();
-          } else {
-            if shell_word_matches(line_buf, name_start, name_end, "dma") == 1 {
-              id = dhdl_subsys_dma_id();
-            } else {
-              if shell_word_matches(line_buf, name_start, name_end, "ram") == 1 {
-                id = dhdl_subsys_ram_id();
-              } else {
-                if shell_word_matches(line_buf, name_start, name_end, "usb") == 1 {
-                  id = dhdl_subsys_usb_id();
-                } else {
-                  if shell_word_matches(line_buf, name_start, name_end, "ethernet") == 1 {
-                    id = dhdl_subsys_ethernet_id();
-                  } else {
-                    if shell_word_matches(line_buf, name_start, name_end, "wifi") == 1 {
-                      id = dhdl_subsys_wifi_id();
-                    } else {
-                      if shell_word_matches(line_buf, name_start, name_end, "ble") == 1 {
-                        id = dhdl_subsys_ble_id();
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
+    // Task #317 follow-up (2026-10-02): was its own separate 10-way
+    // nested if/else chain, now the same shared helper `query` above
+    // and the new `/dev` routing (cat/write/ls) use.
+    let id: u32 = dhdl_subsys_id_for_name(line_buf, name_start, name_end);
     if id == (0 as u32) {
       let _ = uart_puts("dhdl: unknown subsystem (see `dhdl list`)\n");
       return 0;
@@ -27174,6 +27243,31 @@ fn shell_dispatch() -> i64 {
     // with no Str form to build from arbitrary bytes.
     let dir_buf: mut ref i64 = dharafs_dir_scratch_get();
     let _ = shell_copy_range(line_buf, path_start, path_end, dir_buf);
+    // Task #317 (2026-10-02): /dev is a reserved virtual namespace,
+    // routed to DHDL, never reaching dharafs_list_dir_raw below.
+    if shell_path_is_dev(dir_buf, path_len) == 1 {
+      if path_len == 4 {
+        let count: i64 = dhdl_list_count();
+        let i: i64 = 0;
+        while i < count {
+          let id: u32 = dhdl_list_id_at(i as u32);
+          let _ = uart_puts("/dev/");
+          let _ = uart_puts(dhdl_name_for_id(id));
+          let _ = uart_puts("\n");
+          i = i + 1;
+        }
+        return 0;
+      }
+      let name_id: u32 = dhdl_subsys_id_for_name(dir_buf, 5, path_len);
+      if name_id == (0 as u32) {
+        let _ = uart_puts("(not found)\n");
+      } else {
+        let _ = uart_puts("/dev/");
+        let _ = uart_puts(dhdl_name_for_id(name_id));
+        let _ = uart_puts("\n");
+      }
+      return 0;
+    }
     let dummy: mut ref i64 = dharafs_stat_scratch_get();
     let _ = dharafs_list_dir_raw(dir_buf, path_len, dummy, 0);
     return 0;
@@ -27211,6 +27305,24 @@ fn shell_dispatch() -> i64 {
     }
     let path_buf: mut ref i64 = dharafs_path_scratch_get();
     let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    // Task #317 (2026-10-02): /dev is a reserved virtual namespace,
+    // routed to DHDL, never reaching dharafs_read_raw_checked below.
+    if shell_path_is_dev(path_buf, path_len) == 1 {
+      if path_len == 4 {
+        let _ = uart_puts("usage: cat /dev/<name> (see `ls /dev`)\n");
+        return 0;
+      }
+      let name_id: u32 = dhdl_subsys_id_for_name(path_buf, 5, path_len);
+      if name_id == (0 as u32) {
+        let _ = uart_puts("(not found)\n");
+        return 0;
+      }
+      let cap_buf: mut ref i64 = dhruva_alloc_bytes(256);
+      let cap_len: i64 = dhdl_call_by_id_captured(name_id, cap_buf, 256 as u32);
+      let _ = dharafs_print_data(cap_buf, cap_len);
+      let _ = uart_puts("\n");
+      return 0;
+    }
     let out_buf: mut ref i64 = dharafs_data_scratch_get();
     // Round 42: permission-checked, as the current shell user
     // (dharafs_user_get_uid/gid) -- not the raw, unchecked primitive.
@@ -27433,6 +27545,39 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("error: path too long\n");
       return 0;
     }
+    let path_buf: mut ref i64 = dharafs_path_scratch_get();
+    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
+    // Task #317 (2026-10-02): /dev is a reserved virtual namespace,
+    // routed to DHDL, never reaching dharafs_write_raw_checked below.
+    // Numeric value, not free text -- a single space-delimited token,
+    // same parsing `dhdl set <name> <value>` already uses, not the
+    // free-form "everything to end of line" shape ordinary `write`
+    // uses for real file content.
+    if shell_path_is_dev(path_buf, path_len) == 1 {
+      if path_len == 4 {
+        let _ = uart_puts("error: /dev is reserved (use `write /dev/<name> <value>`)\n");
+        return 0;
+      }
+      let name_id: u32 = dhdl_subsys_id_for_name(path_buf, 5, path_len);
+      if name_id == (0 as u32) {
+        let _ = uart_puts("dhdl: unknown subsystem (see `ls /dev`)\n");
+        return 0;
+      }
+      let value_start: i64 = path_end + 1;
+      let value_end: i64 = shell_find_space(line_buf, value_start, line_len);
+      let value: i64 = shell_parse_decimal(line_buf, value_start, value_end);
+      if value < 0 {
+        let _ = uart_puts("dhdl: invalid value (expected a plain decimal number)\n");
+        return 0;
+      }
+      let set_result: i64 = dhdl_set_by_id(name_id, value as u32);
+      if set_result < 0 {
+        let _ = uart_puts("dhdl: subsystem does not support `set`\n");
+        return 0;
+      }
+      let _ = uart_puts("ok\n");
+      return 0;
+    }
     let text_start: i64 = path_end + 1;
     let text_len: i64 = line_len - text_start;
     // Round 39: matches dharafs_file_max_len(), though in practice the
@@ -27443,8 +27588,6 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("error: text too long\n");
       return 0;
     }
-    let path_buf: mut ref i64 = dharafs_path_scratch_get();
-    let _ = shell_copy_range(line_buf, path_start, path_end, path_buf);
     let data_buf: mut ref i64 = dharafs_data_scratch_get();
     let _ = shell_copy_range(line_buf, text_start, line_len, data_buf);
     let status: i64 = dharafs_write_raw_checked(path_buf, path_len, data_buf, text_len, dharafs_user_get_uid(), dharafs_user_get_gid());

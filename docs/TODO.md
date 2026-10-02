@@ -12367,14 +12367,33 @@ no dongle is currently attached. Build-level correctness and the two early-exit 
 verifiable right now; real-HW retest (with both the WiFi and BLE dongles reattached) is the next real
 milestone for both task #197 and this BLE work.
 
-### `/dev`-style path interface on top of DHDL -- scoped, task #317 (2026-10-02)
+### `/dev`-style path interface on top of DHDL, limitation fixed (task #317, 2026-10-02)
 
 User asked whether DhruvaOS has a Linux-"everything is a file"-style device abstraction; DHDL (`dhdl list/
-query/set`) is the closest existing analog but isn't path-addressable. Scoped (design only, no code) a
-reserved `/dev/<name>` namespace that `cat`/`write`/`ls` recognize and route straight to the existing
+query/set`) is the closest existing analog but isn't path-addressable. Scoped, then explicitly: "implement
+it. fix limitation." Both done.
+
+`cat`/`write`/`ls` now recognize a reserved `/dev/<name>` namespace and route straight to the existing
 `dhdl_call_by_id`/`dhdl_set_by_id`/`dhdl_list_*` machinery, intercepted before DharaFS's own real block-
-backed path layer ever sees the path -- same relationship real `/proc`/`/sys` have to a real disk-backed
-root fs. Full design (interception point, the one shared `dhdl_subsys_id_for_name` helper needed, the
-describe-fns-print-not-return limitation on true byte-buffer reads, namespace-reservation safety, explicit
-non-goals, verification plan) is in `docs/DHDL_ROADMAP.md`'s own new section. Not implemented -- tracked as
-task #317.
+backed path layer ever sees the path (same relationship real `/proc`/`/sys` have to a real disk-backed root
+fs) -- `cat /dev/wifi`, `write /dev/loglevel 12`, `ls /dev`. `dhdl_subsys_id_for_name` factored out of
+`shell_dispatch_dhdl`'s own `query`/`set` (each used to hand-roll the identical 10-way name chain), now
+shared by all three.
+
+**The limitation** (every registered `describe` fn prints directly, no buffer-returning variant, so a
+`/dev` read could only ever be a triggered print, never a real byte stream) **is fixed**, not just
+documented: new `boot/uart_capture_state.S` + one check at the top of `uart_putc` (every print primitive in
+this file bottoms out there) means a byte goes into a caller buffer instead of real hardware when capture
+mode is active -- zero changes needed to any of the 10 describe fns, or to `dhdl_call_by_id`'s own
+signature. New `dhdl_call_by_id_captured(id, out_buf, cap)` wraps the capture window in the same `dhruva_
+prio_lock(0)` ceiling `uart_puts` itself already uses (task #185) -- mandatory, since without it a
+preempting task's own unrelated print could land mid-capture and corrupt the buffer.
+
+QEMU-verified: build clean, `qemu_run.py` clean, `test/dhdl_realhw_check.py`'s existing 16-step real-
+protocol check still 16/16 after the refactor (zero regression), and a second ad-hoc script confirmed 13/13
+new `/dev` steps live over a QEMU `-serial pty` -- including `write /dev/loglevel 12` followed by `cat
+/dev/loglevel` correctly showing the updated mask, proving the capture is a real fresh read each time, not
+a cached value. Full design + verification detail in `docs/DHDL_ROADMAP.md`'s own section (now marked
+IMPLEMENTED). Hit the bare-`len`-identifier parse trap a third time during this work (`uart_capture_get_
+len()`'s result, and `uart_capture_end()`'s own return, both renamed) -- see `feedback_vani_bare_len_
+identifier_reserved` in memory, now updated to reflect three occurrences.

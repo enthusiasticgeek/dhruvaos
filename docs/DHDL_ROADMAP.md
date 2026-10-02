@@ -198,11 +198,14 @@ Loglevel remains the only registered subsystem with a safe, independent live-set
 10 currently in `dhdl list`. The next candidate is whichever FUTURE subsystem turns out to have a genuinely
 software-only policy parameter -- not a scheduled item, since none of the existing 10 qualify.
 
-## `/dev`-style path interface on top of DHDL (scoped 2026-10-02, task TBD — not yet implemented)
+## `/dev`-style path interface on top of DHDL (task #317, IMPLEMENTED 2026-10-02)
 
 User: "do we have a software subsystem we can query like linux treats devices as files" — then, after
 confirming DHDL (`dhdl list`/`query`/`set`) is the closest existing analog but isn't path-addressable:
-"scope the /dev-style path abstraction on top of DHDL." Design only below; no code written yet.
+"scope the /dev-style path abstraction on top of DHDL," then "implement it. fix limitation" (the describe-
+fns-print-not-return limitation the scoping below originally flagged). Both done -- design matches what
+shipped, with one addition: the limitation itself is fixed (see the Read section below), not just
+documented as a future follow-on.
 
 **What this is, and isn't.** Real Linux `/proc`/`/sys` are virtual filesystems: an `open()`/`read()` on
 `/sys/class/.../status` never touches a disk, it calls straight into live kernel state at access time. This
@@ -222,24 +225,29 @@ DharaFS's own already-audited internals ([[project_dharafs_scratch_bounds_audit_
 untouched.
 
 **One new shared helper, factored out of existing duplication.** `shell_dispatch_dhdl`'s own `query`/`set`
-handlers already each hand-roll the same name→id `shell_word_matches` if-chain (10 subsystems, duplicated
-twice). Factor it into `dhdl_subsys_id_for_name(line_buf: mut ref i64, name_start: i64, name_end: i64) -> i64`
-(returns -1 for unknown), used by `query`, `set`, AND the new `/dev/` routing — three call sites sharing one
-chain instead of two growing to three independently. The one actual code change to already-shipped logic
-this design needs; everything else below is purely additive.
+handlers each hand-rolled the same name→id `shell_word_matches` if-chain (10 subsystems, duplicated twice).
+Factored into `dhdl_subsys_id_for_name(buf: mut ref i64, start: i64, end: i64) -> u32` (returns 0 for
+unknown, matching `dhdl_state.S`'s own "0 = never used" slot convention rather than a second sentinel),
+used by `query`, `set`, AND the new `/dev/` routing — three call sites sharing one chain. `buf`/`start`/`end`
+generic (same shape `shell_word_matches` itself takes) rather than hardcoded to the raw shell line, since
+`/dev` routing resolves a name out of a copied path buffer, not `line_buf` directly.
 
-**Read: `cat /dev/<name>`.** Resolve `<name>` (the path segment after `/dev/`) via the new helper; unknown
-→ "(not found)" (matching `cat`'s existing behavior for a real missing path, not a different error shape
-for a different reason). Known → `dhdl_call_by_id(id)`, i.e. byte-for-byte the same output `dhdl query
-<name>` already produces today. **Honest limitation, inherited from the roadmap's own still-open "Open
-questions" entry below**: every registered `describe` fn is `fn() -> i64` that prints directly via
-`uart_puts` — there is no buffer-returning variant. So `cat /dev/wifi` behaves like a *command* that prints
-on demand (true to the real `/proc` model, where a read triggers live computation), not like a static file
-whose bytes could be captured, diffed, or piped into another in-kernel consumer. Capturing `describe` output
-into a caller-supplied buffer would need every registered describe fn's own signature to grow a buffer
-parameter — a real, larger change touching all 10 currently-registered subsystems, out of scope here and
-not worth doing until something other than a human at the UART actually needs programmatic access, not just
-a human-readable print.
+**Read: `cat /dev/<name>`, limitation FIXED, not just documented.** The scoping doc originally flagged that
+every registered `describe` fn is `fn() -> i64` printing directly via `uart_puts`, with no buffer-returning
+variant — meaning a `/dev` read could only ever behave like a triggered print, never a capturable byte
+stream. Fixed via a generic capture mechanism instead of threading a buffer through all 10 already-shipped
+describe fns: every print primitive in this file (`uart_puts`, `uart_put_hex32`, `uart_put_i64`, `dharafs_
+print_data`) bottoms out at exactly one function, `uart_putc`. New `boot/uart_capture_state.S` + a check at
+the top of `uart_putc` means that when capture mode is active, a byte is appended to a caller-registered
+buffer instead of touching real hardware — zero changes needed to any describe fn, or to `dhdl_call_by_id`
+itself. New `dhdl_call_by_id_captured(id, out_buf, cap) -> i64` wraps `uart_capture_begin`/`dhdl_call_by_id`/
+`uart_capture_end` inside the SAME `dhruva_prio_lock(0)`/`_unlock` ceiling `uart_puts` itself already uses
+(task #185) — mandatory, not optional: without it a preempting task's own unrelated `uart_puts` call could
+land mid-capture and corrupt the buffer with interleaved foreign bytes. `cat /dev/<name>` now gets a REAL
+byte-exact capture of the describe fn's output into a 256-byte heap buffer, then prints it once via
+`dharafs_print_data` — live-verified round-tripping through a `write /dev/loglevel 12` in between (the
+following `cat /dev/loglevel` correctly showed the updated mask, proving describe output is captured fresh
+each call, never cached).
 
 **Write: `write /dev/<name> <value>`.** Same name resolution, then `dhdl_set_by_id(id, value)` — identical
 semantics to `dhdl set <name> <value>` today, including its existing single-source-of-truth gate (the -1
@@ -262,16 +270,19 @@ in this project already uses. Confirmed before writing this doc: no existing Dha
 codebase or its tests already starts with `/dev` ((`grep -rn '"/dev'` across kernel_main.vani/test/docs)),
 so reserving it breaks nothing in flight.
 
-**Explicit non-goals for this phase**: no nested per-attribute files (one flat entry per subsystem, matching
-DHDL's own one-`describe`-call-per-subsystem shape, not real sysfs's multiple-attributes-per-device model);
-no new permission/ownership model beyond whatever already gates `dhdl set` (none, today); no byte-buffer
-read semantics (see the Read section's own limitation above). Each would be a real, separately-scoped
-follow-on, not a surprise discovered mid-implementation.
+**Explicit non-goals, still true after implementation**: no nested per-attribute files (one flat entry per
+subsystem, matching DHDL's own one-`describe`-call-per-subsystem shape, not real sysfs's multiple-
+attributes-per-device model); no new permission/ownership model beyond whatever already gates `dhdl set`
+(none, today).
 
-**Verification plan, matching this doc's own established pattern**: extend `test/dhdl_realhw_check.py`
-(already proven 16/16 via the `ready`/`READY` handshake) with `cat /dev/wifi` vs `dhdl query wifi` output-
-equivalence, `ls /dev` enumeration-matches-`dhdl list` check, and the `write /dev/x ...` reserved-prefix
-rejection — all QEMU-reachable without real hardware, same as every other DHDL phase so far.
+**Verified live, QEMU, 2026-10-02**: `test/dhdl_realhw_check.py` (the existing, unmodified 16-step real-
+serial-protocol check, run against a QEMU `-serial pty`) still passes 16/16 after the `dhdl_subsys_id_for_
+name` refactor — zero regression in already-shipped `dhdl list`/`query`/`set`. A second ad-hoc script over
+the same PTY confirmed 13/13 new `/dev` steps: `ls /dev` enumeration, `cat /dev/wifi`/`cat /dev/loglevel`
+byte-exact capture, `cat /dev/bogus` → "(not found)", `cat /dev` (bare) → usage, `write /dev/loglevel 12` →
+`ok` then a follow-up `cat /dev/loglevel` showing the updated mask, `write /dev/sd 1` → "does not support"
+(query-only subsystem), `write /dev/bogus 1` → "unknown subsystem", `write /dev typo` → the reserved-prefix
+rejection (never reaches real DharaFS), and `ls /dev/<name>`/`ls /dev/bogus` single-entry echo/not-found.
 
 ## Open questions for whoever picks this up
 
@@ -279,9 +290,10 @@ rejection — all QEMU-reachable without real hardware, same as every other DHDL
   codebase's own established "no dynamic collections, fixed-size +
   linear scan" convention — see `dirindex_max_slots()`) — needs an actual
   N once Phase 1-3's real subsystem count is known.
-- Whether `describe` fns print directly (matching every other diagnostic
-  in this codebase) or return structured data a caller formats — printing
-  directly is simpler and consistent with existing style; revisit only if
-  a non-shell consumer (e.g. a future SSH real command loop) needs the
-  same data in a different shape. **Directly blocks true byte-buffer
-  `/dev` read semantics — see that section above.**
+- ~~Whether `describe` fns print directly or return structured data a caller formats~~ — **RESOLVED
+  2026-10-02**: neither. `describe` fns still print directly (no signature change, no touching 10
+  already-shipped functions); a generic `uart_putc`-level capture mechanism (`boot/uart_capture_state.S`,
+  `dhdl_call_by_id_captured`) intercepts that output into a caller buffer instead, giving `/dev` reads real
+  byte-buffer semantics without forcing a describe-fn-signature change. Any future non-shell consumer (an
+  SSH real command loop, etc.) can reuse the exact same `dhdl_call_by_id_captured` this gave `/dev` — this
+  question doesn't come back even for that case.
