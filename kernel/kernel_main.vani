@@ -17800,6 +17800,30 @@ fn dwc2_hprt0_w1c_group_mask() -> u32 {
   return 0x2E as u32; // bits 1,2,3,5: CONNDET,ENA,ENACHG,OVRCURRCHG
 }
 
+// PCGCTL (Power and Clock Gating Control, offset 0x0E00):
+// STOPPCLK=bit0. Verified against both Linux's own `hw.h` (`#define
+// PCGCTL HSOTG_REG(0x0e00)`, `#define PCGCTL_STOPPCLK BIT(0)`) and
+// U-Boot's real `dwc2.c` host driver, where `writel(0, &regs->
+// pcgcctl)` is literally the FIRST hardware action `dwc_otg_core_
+// init()` takes, before even the core soft reset -- confirmed via
+// this project's own WebSearch cross-check (task #197, 2026-10-02),
+// not assumed. Never referenced anywhere in this file before now. If
+// STOPPCLK is left set (whatever state GPU firmware/reset leaves it
+// in by default), the PHY clock itself is stopped and NOTHING
+// downstream of it -- port connect detection included -- can
+// function, regardless of GRSTCTL/HPRT0.PRTPWR/GUSBCFG.FORCEHOSTMODE
+// all being done correctly, exactly the uniform "every HPRT0 field
+// reads as if nothing is attached" symptom this project's own real-HW
+// retests keep finding. QEMU's own dwc2 model has no power-gating
+// state machine to need unstuck at all, which is why this is the
+// THIRD real gap in a row invisible under every prior QEMU-only
+// round.
+fn dwc2_restart_phy_clock() -> i64 {
+  let pcgctl: i64 = dwc2_base() + 0xE00;
+  let _ = mmio_write_u32(pcgctl, 0 as u32);
+  return 0;
+}
+
 // GRSTCTL (offset 0x10): CSftRst=bit0 (self-clearing core soft
 // reset), AHBIdle=bit31 (RO, 1=AHB master bus idle, safe to proceed).
 // Bounded polls (20 tries each, matching this project's own "never
@@ -18003,6 +18027,7 @@ fn dwc2_init() -> i64 {
   let _ = uart_put_hex32(id);
   let _ = uart_puts("\n");
 
+  let _ = dwc2_restart_phy_clock();
   let _ = dwc2_core_soft_reset();
   let _ = dwc2_force_host_mode();
   let _ = dwc2_enable_global_intr();

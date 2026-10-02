@@ -116,8 +116,31 @@ upo_got_response:
     ldr r2, [r4, #4]                 /* buf[1]: overall response code */
     ldr r3, =0x80000000
     cmp r2, r3
-    moveq r0, #0
-    movne r0, #1
+    bne upo_failed
+
+    /* Per the official Raspberry Pi firmware mailbox property
+     * interface docs (confirmed via WebSearch, task #197, 2026-10-02):
+     * the response overwrites buf[6] with the tag's OWN state --
+     * bit0=1 means actually on (not just "request accepted"), bit1=1
+     * means "device does not exist." An overall-success response with
+     * state reporting device-does-not-exist or still-off is a real,
+     * distinct failure this function's own caller needs to be able to
+     * tell apart from "request never even landed" -- checking only
+     * buf[1] (the whole-transaction status) would silently treat that
+     * as success. */
+    ldr r2, [r4, #24]                /* buf[6]: response state */
+    tst r2, #1                       /* bit0: powered on? */
+    beq upo_failed
+    tst r2, #2                       /* bit1: device does not exist? */
+    bne upo_failed
+
+    mov r0, #0
+    mov r1, #0
+    ldmia sp!, {r4-r9, lr}
+    bx lr
+
+upo_failed:
+    mov r0, #1
     mov r1, #0
     ldmia sp!, {r4-r9, lr}
     bx lr

@@ -12504,3 +12504,37 @@ inside `irq_dispatch`'s own `#[wcet(cycles=130000)]` body, comfortably inside th
 eventually land and reported `ok` -- the shell itself works fine, it's purely a reception-reliability
 problem caused by this one print's frequency. This fix needs to be reflashed before any further real-HW
 retest of the DWC2 work above can be trusted.
+
+### DWC2 register verification against Linux/U-Boot source + a fourth real gap found (PCGCTL) (2026-10-02)
+
+User: "verify against datasheet and uboot or linux for usb enumeration. check your registers too." Fetched
+Linux's own `drivers/usb/dwc2/hw.h` and U-Boot's real `drivers/usb/host/dwc2.c`/`dwc2.h` directly (not
+secondhand summaries) and checked every register offset and bit this project's own driver uses, old and
+new:
+
+- GAHBCFG=0x008, GUSBCFG=0x00C, GRSTCTL=0x010, GINTSTS=0x014, HPRT0=0x440 -- all confirmed exact.
+- GUSBCFG.FORCEHOSTMODE=bit29, FORCEDEVMODE=bit30; GRSTCTL.CSFTRST=bit0, AHBIDLE=bit31; GINTSTS.
+  CURMODE_HOST=bit0; HPRT0.CONNSTS=bit0/CONNDET=bit1/ENA=bit2/ENACHG=bit3/OVRCURRCHG=bit5/RST=bit8/PWR=
+  bit12 -- every one confirmed exact, including the pre-existing `dwc2_hprt0_w1c_group_mask` this driver
+  already relied on.
+- Mailbox `SET_POWER_STATE` tag (0x00028001), device id 3 = USB HCD, 8-byte value buffer (device_id,
+  state) -- confirmed exact against the official Raspberry Pi firmware mailbox property interface docs.
+
+**One real gap found**: U-Boot's actual `dwc_otg_core_init()` does `writel(0, &regs->pcgcctl)` -- clearing
+PCGCTL (Power and Clock Gating Control, offset 0x0E00, confirmed against Linux's own `hw.h`:
+`PCGCTL_STOPPCLK = BIT(0)`) -- as the literal FIRST hardware action, before even the core soft reset. This
+project had never touched PCGCTL at all. If STOPPCLK is left set (whatever state GPU firmware/reset leaves
+it in), the PHY clock itself is stopped and nothing downstream -- port connect detection included -- can
+function, regardless of every other fix already applied. New `dwc2_restart_phy_clock()`, called as the
+very first step of `dwc2_init`, before `dwc2_core_soft_reset`.
+
+**Also tightened** `usb_power_on()`'s own success check: it previously only checked the mailbox
+transaction's overall response code (buf[1]), not the `SET_POWER_STATE` tag's own returned state value
+(buf[6] after the response overwrites it) -- per the official docs, bit0=actually-on and bit1=device-does-
+not-exist are both real, distinct outcomes an overall-success response could still carry. Now checks both.
+
+QEMU-verified: `-device usb-kbd` enumeration unchanged (byte-for-byte identical), `qemu_run.py` clean. This
+is the FOURTH real, independently-verified gap in a row that was invisible under every prior QEMU-only
+round -- same pattern each time (QEMU's behavioral model has no reason to need a step real silicon
+requires). Still not confirmed as THE fix. Needs a reflash + retest, this time over a channel that's
+actually reliable (see the chatter-fix entry above).
