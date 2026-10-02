@@ -12366,3 +12366,15 @@ Complete -- is UNTESTED against a real peripheral**: QEMU has no USB device mode
 no dongle is currently attached. Build-level correctness and the two early-exit paths are all that's
 verifiable right now; real-HW retest (with both the WiFi and BLE dongles reattached) is the next real
 milestone for both task #197 and this BLE work.
+
+### `/dev`-style path interface on top of DHDL -- scoped, task #317 (2026-10-02)
+
+User asked whether DhruvaOS has a Linux-"everything is a file"-style device abstraction; DHDL (`dhdl list/
+query/set`) is the closest existing analog but isn't path-addressable. Scoped (design only, no code) a
+reserved `/dev/<name>` namespace that `cat`/`write`/`ls` recognize and route straight to the existing
+`dhdl_call_by_id`/`dhdl_set_by_id`/`dhdl_list_*` machinery, intercepted before DharaFS's own real block-
+backed path layer ever sees the path -- same relationship real `/proc`/`/sys` have to a real disk-backed
+root fs. Full design (interception point, the one shared `dhdl_subsys_id_for_name` helper needed, the
+describe-fns-print-not-return limitation on true byte-buffer reads, namespace-reservation safety, explicit
+non-goals, verification plan) is in `docs/DHDL_ROADMAP.md`'s own new section. Not implemented -- tracked as
+task #317.

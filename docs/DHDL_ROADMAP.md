@@ -198,6 +198,81 @@ Loglevel remains the only registered subsystem with a safe, independent live-set
 10 currently in `dhdl list`. The next candidate is whichever FUTURE subsystem turns out to have a genuinely
 software-only policy parameter -- not a scheduled item, since none of the existing 10 qualify.
 
+## `/dev`-style path interface on top of DHDL (scoped 2026-10-02, task TBD — not yet implemented)
+
+User: "do we have a software subsystem we can query like linux treats devices as files" — then, after
+confirming DHDL (`dhdl list`/`query`/`set`) is the closest existing analog but isn't path-addressable:
+"scope the /dev-style path abstraction on top of DHDL." Design only below; no code written yet.
+
+**What this is, and isn't.** Real Linux `/proc`/`/sys` are virtual filesystems: an `open()`/`read()` on
+`/sys/class/.../status` never touches a disk, it calls straight into live kernel state at access time. This
+scopes the same relationship for DhruvaOS: a reserved `/dev/<name>` path namespace that the shell's existing
+`cat`/`write`/`ls` verbs recognize and route to DHDL, *before* the real DharaFS block-backed path layer ever
+sees them — same reasoning DharaFS's own write path already applies elsewhere (reject before touching real
+storage, don't let a look-alike path silently create a real persisted record). This is explicitly **not** a
+second command grammar to learn (`dhdl query wifi` still works, unchanged) — it's the same data, reachable
+through the uniform file-style verbs a user would reach for instinctively, matching the actual ask.
+
+**Interception point.** `shell_dispatch`'s own `cat`/`write`/`ls` handlers (kernel/kernel_main.vani) already
+copy the parsed path into `dharafs_path_scratch_get()` before calling `dharafs_read_raw_checked`/`dharafs_
+write`/`dharafs_list`. Add one check immediately after that copy, before any of those calls: if the path's
+first 5 bytes are literally `/dev/` (or the path is exactly `/dev`, for `ls`), branch into the new DHDL-
+routing logic instead and `return` — the real DharaFS call is never reached. Cheap, surgical, and leaves
+DharaFS's own already-audited internals ([[project_dharafs_scratch_bounds_audit_2026_09_27]]) completely
+untouched.
+
+**One new shared helper, factored out of existing duplication.** `shell_dispatch_dhdl`'s own `query`/`set`
+handlers already each hand-roll the same name→id `shell_word_matches` if-chain (10 subsystems, duplicated
+twice). Factor it into `dhdl_subsys_id_for_name(line_buf: mut ref i64, name_start: i64, name_end: i64) -> i64`
+(returns -1 for unknown), used by `query`, `set`, AND the new `/dev/` routing — three call sites sharing one
+chain instead of two growing to three independently. The one actual code change to already-shipped logic
+this design needs; everything else below is purely additive.
+
+**Read: `cat /dev/<name>`.** Resolve `<name>` (the path segment after `/dev/`) via the new helper; unknown
+→ "(not found)" (matching `cat`'s existing behavior for a real missing path, not a different error shape
+for a different reason). Known → `dhdl_call_by_id(id)`, i.e. byte-for-byte the same output `dhdl query
+<name>` already produces today. **Honest limitation, inherited from the roadmap's own still-open "Open
+questions" entry below**: every registered `describe` fn is `fn() -> i64` that prints directly via
+`uart_puts` — there is no buffer-returning variant. So `cat /dev/wifi` behaves like a *command* that prints
+on demand (true to the real `/proc` model, where a read triggers live computation), not like a static file
+whose bytes could be captured, diffed, or piped into another in-kernel consumer. Capturing `describe` output
+into a caller-supplied buffer would need every registered describe fn's own signature to grow a buffer
+parameter — a real, larger change touching all 10 currently-registered subsystems, out of scope here and
+not worth doing until something other than a human at the UART actually needs programmatic access, not just
+a human-readable print.
+
+**Write: `write /dev/<name> <value>`.** Same name resolution, then `dhdl_set_by_id(id, value)` — identical
+semantics to `dhdl set <name> <value>` today, including its existing single-source-of-truth gate (the -1
+return IS the "does this subsystem support set" check, no separate permission table). Unknown name or a
+query-only subsystem (everything except loglevel today, per this doc's own safety survey above) both already
+produce a clear rejection through the existing `dhdl_set_by_id` path; the `/dev/` front door doesn't change
+either outcome, just how it's reached.
+
+**Enumeration: `ls /dev`.** Synthesize a listing from `dhdl_list_count()`/`dhdl_list_id_at()`/`dhdl_name_
+for_id()` — the exact same 3 calls `dhdl list` already makes, just triggered from `ls`'s own dispatch when
+the path is exactly `/dev`. A real subdirectory-per-category hierarchy (`/dev/usb/wifi`, mirroring sysfs's
+own nested bus/class trees) is explicitly NOT in this scope — DHDL's own subsystem list is already flat (10
+names, no categories), so a flat `/dev` matches what's actually being exposed rather than inventing
+structure the backing registry doesn't have.
+
+**Namespace safety.** `/dev` becomes a reserved prefix: a real `write /dev/anything ...` must be rejected
+outright ("error: /dev is reserved") rather than silently falling through to a real persisted DharaFS
+record under that path, the same "reject, don't guess" posture every other wire-format/path boundary check
+in this project already uses. Confirmed before writing this doc: no existing DharaFS path anywhere in this
+codebase or its tests already starts with `/dev` ((`grep -rn '"/dev'` across kernel_main.vani/test/docs)),
+so reserving it breaks nothing in flight.
+
+**Explicit non-goals for this phase**: no nested per-attribute files (one flat entry per subsystem, matching
+DHDL's own one-`describe`-call-per-subsystem shape, not real sysfs's multiple-attributes-per-device model);
+no new permission/ownership model beyond whatever already gates `dhdl set` (none, today); no byte-buffer
+read semantics (see the Read section's own limitation above). Each would be a real, separately-scoped
+follow-on, not a surprise discovered mid-implementation.
+
+**Verification plan, matching this doc's own established pattern**: extend `test/dhdl_realhw_check.py`
+(already proven 16/16 via the `ready`/`READY` handshake) with `cat /dev/wifi` vs `dhdl query wifi` output-
+equivalence, `ls /dev` enumeration-matches-`dhdl list` check, and the `write /dev/x ...` reserved-prefix
+rejection — all QEMU-reachable without real hardware, same as every other DHDL phase so far.
+
 ## Open questions for whoever picks this up
 
 - Registration table sizing: fixed array of N slots (matching this
@@ -208,4 +283,5 @@ software-only policy parameter -- not a scheduled item, since none of the existi
   in this codebase) or return structured data a caller formats — printing
   directly is simpler and consistent with existing style; revisit only if
   a non-shell consumer (e.g. a future SSH real command loop) needs the
-  same data in a different shape.
+  same data in a different shape. **Directly blocks true byte-buffer
+  `/dev` read semantics — see that section above.**
