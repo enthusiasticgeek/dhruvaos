@@ -36,6 +36,7 @@
 
 .section ".bss"
 .align 4
+.global uart_capture_active
 uart_capture_active:
     .word 0
 uart_capture_buf_ptr_word:

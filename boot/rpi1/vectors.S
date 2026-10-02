@@ -157,6 +157,22 @@ fault_data_abort:
      * longer be silently defeated by the exact class of corruption it
      * exists to report. */
     cpsid f
+    /* Task #317/#318 follow-up (guard-rail audit, 2026-10-02): forces
+     * uart_capture_active off before anything else -- a NEW failure
+     * mode this project never had to guard against until today's
+     * `/dev`-path capture mechanism (boot/uart_capture_state.S)
+     * existed. If capture was left stuck active (e.g. a crash
+     * mid-capture, inside whatever triggered THIS fault), every
+     * uart_puts call below -- including the "FATAL: Data Abort..."
+     * report itself -- would silently vanish into a dead buffer
+     * instead of reaching the UART, turning a reportable fault into a
+     * silent hang with zero diagnostic output: exactly the failure
+     * mode a fault handler exists to prevent. r4/r5 are safe scratch
+     * here -- both get overwritten by `mov r4,r0`/`mov r5,r1` a few
+     * lines below before anything reads them for a real purpose. */
+    mov r4, #0
+    ldr r5, =uart_capture_active
+    str r4, [r5]
     /* SECOND real bug found live via GDB right after the ABT-mode fix
      * above: `abort_report_data` itself (or something it calls) can
      * ALSO fault -- observed directly, a real recursive re-entry into
@@ -203,6 +219,13 @@ fault_prefetch_abort:
      * masks FIQ on entry. See that function's own header comment for
      * the full "why". */
     cpsid f
+    /* Same uart_capture guard-rail as fault_data_abort above -- see
+     * that function's own comment for the full "why". r0/r1 are safe
+     * scratch here too, overwritten by the real MRC reads immediately
+     * below before anything relies on them. */
+    mov r0, #0
+    ldr r1, =uart_capture_active
+    str r0, [r1]
     ldr sp, =_abort_stack_top   /* see fault_data_abort's own header
                                  * comment for why every entry resets sp
                                  * rather than trusting it's still valid */

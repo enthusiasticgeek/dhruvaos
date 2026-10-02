@@ -12573,3 +12573,38 @@ QEMU-verified: `-device usb-kbd` enumeration unchanged (ENA already set on the v
 has), `qemu_run.py` clean. Still not confirmed as THE full fix for `port_enabled=no` specifically -- but
 this is the strongest, most direct candidate yet given it targets the exact symptom (enable, not connect)
 and is backed by a real, independently-confirmed timing bug, not a guess.
+
+### Safety audit: guard-rail gap found in today's own new `/dev`-path capture mechanism, fixed (2026-10-02)
+
+User: "audit codebase to improve [precision, safety, correctness, speed]... make sure safety and correctness
+not compromised... I need guard rails." Scoped to today's own new code first (task #317's UART capture
+mechanism), rather than re-auditing the entire already-certified codebase (RTOS/DharaFS safety-certification
+audit, tasks #225-240, already covers the rest) from scratch.
+
+**Real gap found**: `boot/uart_capture_state.S`'s `uart_capture_active` flag, once set by `dhdl_call_by_id_
+captured` (the `/dev` read path), is only ever cleared by `uart_capture_end()` -- which only runs if the
+captured describe-fn call returns NORMALLY. If a describe fn ever faulted (Data/Prefetch Abort) or hung
+mid-capture, `uart_capture_active` would stay stuck at 1 for the rest of that boot. Every `uart_puts` call
+system-wide after that point -- INCLUDING `fault_data_abort`/`fault_prefetch_abort`'s own "FATAL: ..." crash
+report -- would silently vanish into a dead capture buffer instead of reaching the UART. A fault that should
+have printed a diagnosable crash report would instead look like a silent, unexplained hang: exactly the
+failure mode a fault handler exists to prevent, and exactly what "guard rails, should not fail [silently]"
+means in practice on this bare-metal target (no segfault in the Linux sense; the real equivalent is an abort
+with no report, or an unbounded hang).
+
+**Fixed**: both `fault_data_abort` and `fault_prefetch_abort` (`boot/rpi1/vectors.S`) now force `uart_
+capture_active` to 0 as their first action, before any diagnostic register read or report call -- using
+registers (r4/r5, r0/r1 respectively) that get overwritten by the real diagnostic reads a few instructions
+later anyway, so this costs nothing and risks nothing. Guarantees a fault's own report can never be silently
+swallowed by a capture left running by whatever triggered the fault.
+
+**Also verified** (spot-check, not a full re-audit): all 76 boot-time self-test calls gated behind `boot_
+debug_enabled()` this session discard their return value via `let _ =` with nothing downstream ever reading
+it -- confirmed via grep, no case where a self-test's result fed into later logic, so skipping the call
+entirely changes nothing but whether it printed/ran. Also confirmed none of the real boot-sequence init
+calls (`dharafs_init`, `wifi_config_init`, `ble_config_init`, `dhdl_init`, task creation) were accidentally
+caught by the mechanical gating script -- all run unconditionally, as they must.
+
+QEMU-verified: build clean, `qemu_run.py` clean. A full systematic re-audit of the entire codebase (beyond
+today's own new code) against the existing RTOS/DharaFS safety-certification baseline is a separately-
+scoped, much larger undertaking -- not attempted in this pass.
