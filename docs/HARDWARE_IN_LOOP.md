@@ -314,6 +314,11 @@ against the known card before touching anything, but this is
 non-destructive by construction — worst case is overwriting the wrong
 device's own `kernel.img`, not data loss on an unrelated disk.
 
+Still requires physically moving the card between the Pi and this machine's own reader for every update.
+`docs/KERNEL_UPDATE_ROADMAP.md` scopes (not yet implemented, task #308) a way to push a new `kernel.img`
+over the already-connected UART instead, with an explicit fallback/rollback design for when the new image
+doesn't boot cleanly.
+
 ### 4.6 Updating just config.txt on an already-flashed card
 
 Same idea as §4.5, but for `config.txt` instead of `kernel.img` — use

@@ -12149,3 +12149,43 @@ the actual board needs a new `kernel.img` written to the SD card's boot partitio
 (docs/HARDWARE_IN_LOOP.md §4.5), which requires the card to be physically moved from the Pi into this
 machine's own card reader (currently empty) -- a hands-on step, not something done remotely over UART.
 Local-only commit pending push-window check.
+
+### Remote kernel update over UART: scoped, no code written (task #308)
+
+User's own follow-up to the DHDL real-HW tooling work: once a board boots correctly, could further
+debugging AND deployment both go over UART (or eventually BLE/WiFi)? Debugging already does (`dhdl query`/
+`ready`). Asked specifically whether a kernel update over UART is possible. Treated as exploratory first,
+then scoped as a new task with an explicit fallback-slot design per the user's own request -- no runtime
+code written this round, design + roadmap doc only, matching this project's own precedent for scoping
+rounds (e.g. the DHDL roadmap itself).
+
+**Grounded the scope before designing anything**: the hard reliability primitive this feature would
+otherwise need -- raw SD block read/write at an arbitrary block number -- already exists and is already
+proven (`dharafs_block_read_raw`/`_write_raw`, zero partition-table awareness, dispatches straight to
+`sdhost_read_block`/`_write_block`; this project's own months-long SD-write-reliability saga already did
+the hard part). A real hardware watchdog with software-triggerable full reset (`watchdog_arm`) and a proven
+chunked binary-transfer-over-UART protocol (`wifikey chunk`/`commit`, real-HW confirmed moving a ~16KB
+firmware blob) are both already there too. What's actually missing: nothing in this codebase understands
+the FAT32 boot partition's own structure (DharaFS and the boot partition are deliberately two separate,
+mutually-unaware regions, docs/HARDWARE_IN_LOOP.md §4.2) -- so finding where `kernel.img`'s bytes physically
+live needs a one-time FAT32 locator; and there's no fallback/rollback mechanism, which is the part that
+actually matters for safety.
+
+**The hard constraint found while scoping**: unlike U-Boot-based A/B systems, DhruvaOS has no separate,
+modifiable bootloader stage -- `bootcode.bin`/`start.elf` are closed-source Broadcom firmware that reads
+`config.txt`'s static `kernel=` line once, with no concept of trying a new image and falling back. Any
+"did the update work" decision has to live inside `kernel.img`'s own earliest, deliberately-frozen
+prologue. Documented the real residual risk plainly rather than glossing over it: an update broken badly
+enough to never reach that prologue can't be auto-recovered by this design -- the watchdog just reboots
+into the same broken image forever, same as today, until someone physically re-flashes the card. This
+design meaningfully reduces the common failure case (boots far enough to run code, then fails) without
+claiming to solve the pathological one.
+
+Full design in `docs/KERNEL_UPDATE_ROADMAP.md`: a new reserved raw status block (4200, clear of DharaFS's
+1-2048 and the crypto-metadata region at 4000-4128) for a pending-update flag + boot-attempt counter; bulk
+images (staged new kernel, backup of the live one) living in ordinary DharaFS files, not more raw blocks;
+a hard size ceiling for v1 (new image must fit the already-allocated cluster chain, no FAT writes at all).
+5 phases: read-only FAT32 locator -> UART staging -> backup capture -> the actual overwrite (first real-HW
+test: overwrite kernel.img with itself) -> rollback mechanism -> real-HW fault-injection drill proving
+rollback actually works. Cross-referenced from docs/HARDWARE_IN_LOOP.md's existing §4.5 (`update_kernel.sh`)
+as the thing this would eventually replace. Task #308 created, tracking the whole phased effort.
