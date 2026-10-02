@@ -2266,6 +2266,14 @@ extern "C" fn dhdl_list_id_at(index: u32) -> u32;
 extern "C" fn dhdl_register_setter(id: u32, setter: fn(u32) -> i64) -> i64;
 #[stack_cost(bytes=20)]
 extern "C" fn dhdl_set_by_id(id: u32, value: u32) -> i64;
+// WiFi credentials config (task #197 follow-up, 2026-10-01) --
+// boot/wifi_config_state.S's own header comment has the full design.
+extern "C" fn wifi_config_ssid_buf_ptr() -> mut ref i64;
+extern "C" fn wifi_config_ssid_len_get() -> u32;
+extern "C" fn wifi_config_ssid_len_set(new_len: u32) -> u32;
+extern "C" fn wifi_config_password_buf_ptr() -> mut ref i64;
+extern "C" fn wifi_config_password_len_get() -> u32;
+extern "C" fn wifi_config_password_len_set(new_len: u32) -> u32;
 // Round 71: HDMI framebuffer -- generic VideoCore mailbox property-tag
 // transport (boot/fb_state.S), generalized from governor_apply_freq_
 // mhz's own already-verified protocol.
@@ -24766,6 +24774,52 @@ fn log_level_init() -> i64 {
   return 0;
 }
 
+// WiFi credentials config (task #197 follow-up, 2026-10-01): reads
+// /config/wifi_ssid and /config/wifi_password, same dharafs_read()-
+// then-copy shape log_level_init() above already established. Two
+// separate files rather than one two-line file -- see boot/wifi_
+// config_state.S's own header comment for why. Missing/unreadable
+// file leaves that credential unset (buf stays zeroed, len stays 0)
+// -- quiet-by-default, matching every other config file in this
+// project, not an error (there's no WiFi hardware attached on every
+// boot this kernel runs, QEMU included, so "unconfigured" is the
+// common case, not a failure one). Truncates silently at the real
+// buffer capacity (32/64 bytes) rather than rejecting an oversized
+// file outright -- the 802.11 SSID field and WPA2-PSK passphrase
+// both have their own hard protocol-level maximums anyway (32, 63
+// bytes), so anything longer than this project's own buffers could
+// never have been a valid credential in the first place.
+fn wifi_config_init() -> i64 {
+  let ssid_heap: mut ref i64 = dhruva_alloc_bytes(32);
+  let ssid_read_len: i64 = dharafs_read("/config/wifi_ssid", ssid_heap);
+  if ssid_read_len > 0 {
+    let ssid_cap: i64 = if ssid_read_len > 32 { 32 } else { ssid_read_len };
+    let ssid_dst: mut ref i64 = wifi_config_ssid_buf_ptr();
+    let i: i64 = 0;
+    while i < ssid_cap {
+      let b: u32 = buf_read_byte(ssid_heap, i as u32);
+      let _ = buf_write_byte(ssid_dst, i as u32, b);
+      i = i + 1;
+    }
+    let _ = wifi_config_ssid_len_set(ssid_cap as u32);
+  }
+
+  let pwd_heap: mut ref i64 = dhruva_alloc_bytes(64);
+  let pwd_read_len: i64 = dharafs_read("/config/wifi_password", pwd_heap);
+  if pwd_read_len > 0 {
+    let pwd_cap: i64 = if pwd_read_len > 64 { 64 } else { pwd_read_len };
+    let pwd_dst: mut ref i64 = wifi_config_password_buf_ptr();
+    let i: i64 = 0;
+    while i < pwd_cap {
+      let b: u32 = buf_read_byte(pwd_heap, i as u32);
+      let _ = buf_write_byte(pwd_dst, i as u32, b);
+      i = i + 1;
+    }
+    let _ = wifi_config_password_len_set(pwd_cap as u32);
+  }
+  return 0;
+}
+
 // DHDL Phase 0 (task #294): the one real subsystem wired into `dhdl
 // list`/`dhdl query` this round, deliberately reusing the freshest,
 // simplest existing subsystem (log-level, /config/loglevel above)
@@ -25017,7 +25071,16 @@ fn dhdl_subsys_wifi_id() -> u32 {
 fn wifi_describe() -> i64 {
   let _ = uart_puts("wifi: usb_wifi_kind=");
   let _ = uart_put_i64(usb_wifi_get_kind() as i64);
-  let _ = uart_puts(" (0=none enumerated)\n");
+  let _ = uart_puts(" (0=none enumerated) configured_ssid=\"");
+  // SSID only -- the password buffer has no describe exposure
+  // anywhere, by design (see boot/wifi_config_state.S's own header
+  // comment). An empty quoted string means no /config/wifi_ssid file
+  // was ever read successfully, not an error.
+  let ssid_len: u32 = wifi_config_ssid_len_get();
+  if ssid_len > (0 as u32) {
+    let _ = dharafs_print_data(wifi_config_ssid_buf_ptr(), ssid_len as i64);
+  }
+  let _ = uart_puts("\"\n");
   return 0;
 }
 
@@ -39755,6 +39818,7 @@ fn kernel_main() -> i64 {
   // unaffected.
   let _ = dharafs_init();
   let _ = log_level_init();
+  let _ = wifi_config_init();
   let _ = dhdl_init();
   let _ = crashlog_boot_increment();
 

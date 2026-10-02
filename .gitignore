@@ -2,6 +2,8 @@ build/
 *.o
 *.elf
 *.ll
+__pycache__/
+*.pyc
 test/host_harness/harness
 test/host_harness/kernel_gen.c
 test/host_harness/kernel_gen_patched.c

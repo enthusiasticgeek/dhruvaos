@@ -12218,3 +12218,45 @@ boot confirms `CUSTOM:` still fires normally (11 times) and `RULER` no longer ap
 permanent test script ever asserted on `RULER` output (only `docs/TODO.md`'s own historical record
 mentions it, left as-is). **Real-HW retest not yet done** -- same physical SD-card-swap requirement as
 every other change this session; this fix is QEMU-verified only so far.
+
+### WiFi SSID/password configurable via /config/wifi_ssid+password; honest readiness answer (task #310)
+
+User asked directly: is the WiFi driver fully ready to test connecting to a real SSID, and asked for the
+SSID/password to be configurable via a config file (explicitly: never commit the user's own real test
+credentials, kept in `~/home-wifi-ssid.txt`/`~/home-wifi-pwd.txt` on this machine, outside the repo).
+
+**Honest answer: no, not fully ready.** The RTL8188CU register-level driver (`rtl8188cu_tx_frame`/
+`_rx_frame`), 802.11 frame building/parsing, and the full WPA2 join-sequence orchestrator (`wpa2_join_
+start`/`_step_mgmt`/`_step_eapol`) all exist and are self-tested -- but `wpa2_join_orchestrator_self_test`'s
+own header comment says plainly: "Real RF/USB transmit-receive remains out of scope here exactly as it is
+everywhere else in this investigation." Nothing currently wires the real USB TX/RX calls to drive an actual
+join attempt against a real access point; the orchestrator has only ever run against synthetic, hand-fed
+frames. `pbkdf2_hmac_sha1` (passphrase -> PMK) already exists too, so the remaining gap is specifically
+the real-hardware wiring + a scan/join loop, not any missing cryptographic primitive. That real-join wiring
+is task #197's own remaining scope, unaffected by this round.
+
+**Config-file piece built this round**: `boot/wifi_config_state.S` (same `.bss`+accessor pattern as every
+other config-derived state in this project) + `wifi_config_init()` (`kernel_main.vani`, same `dharafs_
+read()`-then-copy shape `log_level_init()` already established), reading `/config/wifi_ssid` and `/config/
+wifi_password` -- two separate files rather than one two-line file, matching how the user's own real
+credentials are already split on the host side and avoiding newline-escaping awkwardness over the shell's
+single-line `write <path> <text>` command. 32-byte SSID buffer (the real 802.11 field's own max), 64-byte
+password buffer (WPA2-PSK's own 8-63 ASCII-character max). `dhdl query wifi` now shows `configured_ssid=`
+-- the password has no describe exposure anywhere, by design.
+
+**Self-caught a real build break**: `wifi_config_ssid_len_set(len: u32)` -- a bare `len` parameter name --
+is apparently a reserved identifier in vani, producing a parse error that cascaded into dozens of unrelated
+"unknown function" errors much further down the file (already hit once before, during the `/config/
+loglevel` work, forgotten and repeated here; now saved as a standing memory, `feedback_vani_bare_len_
+identifier_reserved`, specifically so a third repeat doesn't happen). Renamed to `new_len`, rebuilt clean.
+
+QEMU-verified a full live round trip in two separate boots against the same persisted SD image (same
+discipline the loglevel round trip itself used): boot 1, `write /config/wifi_ssid testnetwork123` then
+`dhdl query wifi` in the SAME boot shows `configured_ssid=""` (config is boot-time-only, correctly not
+live-reloaded); boot 2, a fresh boot against the SAME image shows `configured_ssid="testnetwork123"` --
+the file was written, persisted, and read back correctly on the next boot. Build clean (asm audit 0/0),
+`qemu_run.py` clean (same 6 pre-existing baseline FAILs). Did not read or reference the user's own real
+`~/home-wifi-ssid.txt`/`~/home-wifi-pwd.txt` contents at any point. Local-only commit pending push-window
+check. **Real-HW retest not done** -- no WiFi dongle currently attached, and more importantly the bigger
+real-join-wiring piece (task #197) isn't done yet either, so there's nothing to real-join-test against
+even once a dongle is reattached.
