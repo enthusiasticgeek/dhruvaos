@@ -12538,3 +12538,38 @@ is the FOURTH real, independently-verified gap in a row that was invisible under
 round -- same pattern each time (QEMU's behavioral model has no reason to need a step real silicon
 requires). Still not confirmed as THE fix. Needs a reflash + retest, this time over a channel that's
 actually reliable (see the chatter-fix entry above).
+
+### Retest #2 (chatter fix + all 5 bring-up fixes flashed): REAL PROGRESS -- `port_connected=yes port_enabled=no` (2026-10-02)
+
+With the `task_custom_demo` chatter fix also flashed, got a genuinely clean read this time: `usb: port_
+connected=yes port_enabled=no`. This is real forward movement -- the root port now detects something
+electrically connected for the first time in this project's history (previously always `connected=0`,
+identical to nothing attached at all). Neither `wifi`/`ble` enumerated yet (expected -- device-class
+detection only runs after the port fully enables).
+
+Dug into WHY enable specifically fails, per the user's own direction to check Linux/U-Boot/datasheets
+before guessing further. Linux's `drivers/usb/dwc2/hcd.c` confirms real port-reset timing is asynchronous
+("the reset needs to occur within 1ms and have a duration of at least 50ms," released via a 50ms delayed
+work callback, not an inline wait) -- ENA comes up as a real, variable-time CONSEQUENCE of releasing reset,
+never synchronously guaranteed, unlike QEMU's own model (which sets ENA+ENACHG the instant the release
+write lands, confirmed in this file's own pre-existing comments).
+
+**A real, previously-unnoticed bug found while checking this**: `delay(N)` is a bare instruction-counting
+busy loop -- this project's OWN task #275/#276 already proved its real wall-clock duration is platform-
+dependent, NOT the literal value N in microseconds (QEMU: ~0.0166us/iteration; real Pi 1B, from two
+independent picocom logs: ~0.310044us/iteration, an ~18.6x difference). Every `delay(50000)`/`delay(25000)`
+added to the USB bring-up chain this round (`dwc2_core_soft_reset`, `dwc2_port_power_on`, `dwc2_port_reset`
+×2, `dwc2_force_host_mode`) assumed those counts meant ~50ms/~25ms -- on real hardware they actually
+produced ~15.5ms/~7.75ms, roughly a third of the real DWC2-spec-required reset hold. Recalibrated all five
+to the SAME proven-on-real-hardware counts task_c already uses (161000≈50ms, 80500≈25ms) rather than
+guessing a new number.
+
+**Also added**: `dwc2_port_reset()` now polls for ENA after releasing reset (20 tries, ~5ms real delay
+between checks) instead of a single immediate check -- matching the real async behavior Linux's own driver
+assumes, replacing the QEMU-only "synchronous" assumption the original comment documented.
+
+QEMU-verified: `-device usb-kbd` enumeration unchanged (ENA already set on the very first poll check there,
+0 extra iterations, confirming this is a true no-op for the one real device-enumeration test this project
+has), `qemu_run.py` clean. Still not confirmed as THE full fix for `port_enabled=no` specifically -- but
+this is the strongest, most direct candidate yet given it targets the exact symptom (enable, not connect)
+and is backed by a real, independently-confirmed timing bug, not a guess.

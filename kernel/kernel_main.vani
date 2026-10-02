@@ -17854,7 +17854,20 @@ fn dwc2_core_soft_reset() -> i64 {
       ahb_tries = ahb_tries + 1;
     }
   }
-  let _ = delay(50000);
+  // Task #197 follow-up (2026-10-02): 161000, not 50000 -- see
+  // delay_wcet_measure_self_test's own header comment (task #275/
+  // #276) for the full, previously-proven-the-hard-way reason:
+  // delay(N) is a bare instruction-counting busy loop, and its real
+  // wall-clock duration is platform-dependent, NOT the value N itself
+  // in microseconds. Real Pi 1B measurement (two independent picocom
+  // logs): ~0.310044us/iteration, so 50000 iterations is really only
+  // ~15.5ms real-world, not 50ms -- 161000 is the SAME already-
+  // verified-on-real-hardware count task_c now uses for its own real
+  // ~50ms delay. Every delay(50000)/delay(25000) in this whole USB
+  // bring-up chain (dwc2_port_power_on, dwc2_port_reset,
+  // dwc2_force_host_mode) had this exact same miscalibration --
+  // fixed together here, not just this one call site.
+  let _ = delay(161000);
   return 0;
 }
 
@@ -17862,9 +17875,12 @@ fn dwc2_core_soft_reset() -> i64 {
 // full real-HW finding this fixes. Preserves the w1c status group
 // (same discipline dwc2_port_reset's own header comment already
 // documents) -- a naive read-modify-write here would silently clear
-// CONNDET/ENA/ENACHG/OVRCURRCHG. Settle delay matches dwc2_port_
-// reset's own 50000us bound -- real USB bus-power rise time needs
-// real elapsed time, not an instruction-speed register write.
+// CONNDET/ENA/ENACHG/OVRCURRCHG. Settle delay uses the real-hardware-
+// proven 161000 count (see dwc2_core_soft_reset's own comment on
+// delay(N)'s platform-dependent real duration) -- real USB bus-power
+// rise time needs real elapsed time, not an instruction-speed
+// register write, and the ~50ms this now actually produces matters
+// more than ever once it's a real wait instead of ~15.5ms.
 fn dwc2_hprt0_pwr_bit() -> u32 {
   return 0x1000 as u32;
 }
@@ -17875,7 +17891,7 @@ fn dwc2_port_power_on() -> i64 {
   let not_w1c_mask: u32 = w1c_mask ^ (0xFFFFFFFF as u32);
   let v: u32 = mmio_read_u32(hprt0);
   let _ = mmio_write_u32(hprt0, (v & not_w1c_mask) | dwc2_hprt0_pwr_bit());
-  let _ = delay(50000);
+  let _ = delay(161000);
   return 0;
 }
 
@@ -17894,6 +17910,26 @@ fn dwc2_port_power_on() -> i64 {
 // out-of-order risk that guidance describes doesn't apply here. This
 // closes the "HPRT0 reset sequence" half of the open question round
 // 16's own mem_barrier comment flagged for a future round.
+// Task #197 follow-up (real-HW USB bring-up investigation, 2026-10-
+// 02): the comment right above this function already documented that
+// "the model's own RST-transition handler sets ENA+ENACHG itself...
+// synchronously" under QEMU -- true, but real DWC2 silicon does NOT
+// do this synchronously. Confirmed against Linux's own `drivers/usb/
+// dwc2/hcd.c`, whose comment on this exact reset is explicit: "the
+// reset needs to occur within 1ms and have a duration of at least
+// 50ms," and whose real reset-release path is an async delayed work
+// callback, not an inline wait -- ENA coming up is a real, variable-
+// time CONSEQUENCE of releasing reset, observed afterward, never
+// guaranteed the instant the release write completes. This function
+// used to return immediately after that release with no poll at all
+// (fine under QEMU's own synchronous shortcut, never tested against
+// anything else) -- real-HW retest (2026-10-02) confirmed exactly the
+// failure this predicts: `port_connected=yes port_enabled=no`.
+// dwc2_init's own caller-side single immediate check is now replaced
+// with this function doing its own bounded poll (20 tries, same
+// "never `while true` against hardware" discipline, generous margin
+// since this only needs to catch the real device's own response
+// landing shortly after release, not a long additional wait).
 fn dwc2_port_reset() -> i64 {
   let hprt0: i64 = dwc2_hprt0_addr();
   let w1c_mask: u32 = dwc2_hprt0_w1c_group_mask();
@@ -17901,22 +17937,44 @@ fn dwc2_port_reset() -> i64 {
   let not_w1c_mask: u32 = w1c_mask ^ (0xFFFFFFFF as u32);
 
   // Set RST=1, forcing the w1c group to 0 (preserve, clear nothing).
+  // 161000, not 50000 -- see dwc2_core_soft_reset's own comment on
+  // delay(N)'s real, platform-dependent duration; this is the real
+  // ~50ms USB-OTG spec minimum hold, not the ~15.5ms this used to
+  // actually produce on real hardware.
   let v: u32 = mmio_read_u32(hprt0);
   let _ = mmio_write_u32(hprt0, (v & not_w1c_mask) | (0x100 as u32));
-  let _ = delay(50000);
+  let _ = delay(161000);
 
   // Deassert RST, again forcing the w1c group to 0 in the WRITE value
-  // -- the model's own RST-transition handler sets ENA+ENACHG itself
-  // (unconditionally overriding whatever this write says for those
-  // two bits), so there's nothing to OR in here at all.
+  // -- QEMU's own model sets ENA+ENACHG itself, synchronously, the
+  // instant this write lands; real silicon does not (see this
+  // function's own header comment above).
   let v2: u32 = mmio_read_u32(hprt0);
   let clear_rst: u32 = (0x100 as u32) ^ (0xFFFFFFFF as u32);
   let _ = mmio_write_u32(hprt0, v2 & clear_rst & not_w1c_mask);
-  let _ = delay(50000);
+  let _ = delay(161000);
+
+  // Poll for ENA, bounded -- real hardware's own response to the
+  // reset release, not an instant software-model guarantee. Each
+  // iteration also re-delays a real, meaningful amount (16100 ≈ 5ms
+  // real, matching the project's own established per-iteration-cost
+  // calibration) rather than a tight spin, giving the real device
+  // genuine elapsed time between checks.
+  let enable_tries: i64 = 0;
+  while enable_tries < 20 {
+    let ve: u32 = mmio_read_u32(hprt0);
+    if (ve & (0x4 as u32)) != (0 as u32) {
+      enable_tries = 20;
+    } else {
+      let _ = delay(16100);
+      enable_tries = enable_tries + 1;
+    }
+  }
 
   // Acknowledge CONNDET+ENACHG (write 1 to clear just those two),
   // forcing ENA's own bit position to 0 in this write so its current
-  // 1 value is PRESERVED, not cleared.
+  // value (whatever the poll above just observed) is PRESERVED, not
+  // cleared.
   let v3: u32 = mmio_read_u32(hprt0);
   let ack_bits: u32 = (0x2 as u32) | (0x8 as u32); // CONNDET | ENACHG
   let _ = mmio_write_u32(hprt0, (v3 & not_w1c_mask) | ack_bits);
@@ -17992,23 +18050,26 @@ fn dwc2_port_reset() -> i64 {
 // GINTSTS (offset 0x14): CURMODE=bit0 (RO, 0=device, 1=host) --
 // confirmed against hcd-dwc2.h's own register offsets. Forces host
 // mode explicitly (clearing FORCEDEVMODE first, so the two force bits
-// are never both set) and waits 25ms (matching Linux's own dwc2_
-// force_mode()'s `usleep_range(25000, 25500)` -- the databook's own
-// documented settle time for the internal mode-switch state machine)
-// before a bounded poll (20 tries, same "never `while true` against
-// hardware" discipline as dwc2_core_soft_reset's own polls) confirms
-// CURMODE actually flipped. The delay itself is unconditional, not
-// gated behind boot_debug_enabled() -- this is real functional
-// hardware bring-up every real boot needs, the same category as
-// dwc2_port_reset's own un-gated settle delays in this exact call
-// chain, not diagnostic noise.
+// are never both set) and waits ~25ms real (matching Linux's own
+// dwc2_force_mode()'s `usleep_range(25000, 25500)` -- the databook's
+// own documented settle time for the internal mode-switch state
+// machine) before a bounded poll (20 tries, same "never `while true`
+// against hardware" discipline as dwc2_core_soft_reset's own polls)
+// confirms CURMODE actually flipped. 80500, not 25000 -- see dwc2_
+// core_soft_reset's own comment on delay(N)'s real, platform-
+// dependent duration (half of the proven 161000≈50ms count). The
+// delay itself is unconditional, not gated behind
+// boot_debug_enabled() -- this is real functional hardware bring-up
+// every real boot needs, the same category as dwc2_port_reset's own
+// un-gated settle delays in this exact call chain, not diagnostic
+// noise.
 fn dwc2_force_host_mode() -> i64 {
   let gusbcfg: i64 = dwc2_base() + 0x0C;
   let gintsts: i64 = dwc2_base() + 0x14;
   let v: u32 = mmio_read_u32(gusbcfg);
   let force_dev_clear: u32 = (0x40000000 as u32) ^ (0xFFFFFFFF as u32);
   let _ = mmio_write_u32(gusbcfg, (v & force_dev_clear) | (0x20000000 as u32));
-  let _ = delay(25000);
+  let _ = delay(80500);
   let tries: i64 = 0;
   while tries < 20 {
     let s: u32 = mmio_read_u32(gintsts);
