@@ -454,8 +454,20 @@ swi_return_skip_usr_sp_restore:
      * immediately. Fixed by loading usr_resume_pc_table's own base
      * address fresh, into r6 (untouched at this point), instead of
      * trusting r3's stale contents. Shares the same fire-cap counter as
-     * the other two investigation points. */
+     * the other two investigation points.
+     *
+     * Gated behind the DEBUG log category (2026-10-02, user: "clean
+     * boot with no uart messages for issues we already resolved" --
+     * the lr_usr bug this diagnostic was built for is FIXED and real-
+     * HW-verified, task #253/#262) -- same bit boot_debug_enabled()
+     * checks in kernel_main.vani. `bl` safe here: r0-r11 are already
+     * saved/restored around this whole block, and lr is reloaded
+     * fresh from usr_resume_pc_table right after `swi_return_diag_
+     * skip` regardless of which path got there. */
     push {r0-r11}
+    bl log_state_get_mask
+    tst r0, #16
+    beq swi_return_diag_skip
     cmp r2, #0
     bne swi_return_diag_skip
     /* Excludes boot-time noise. First attempt gated on tick_count>0 --

@@ -12639,3 +12639,35 @@ tracked separately -- not a new regression). True no-op for the one synthetic mu
 enumeration test this project has, confirming the fix only changes real-hardware timing, not logic. Still
 pending a real reflash + reboot + retest with both dongles attached to confirm `wifi`/`ble` finally enumerate
 past the now-working port-enable step.
+
+### Quiet-boot follow-up: three more already-resolved-issue diagnostics were still corrupting live shell commands (2026-10-02)
+
+With the latest build (five-function delay() fix above) flashed and the board booted, connected directly over
+`/dev/ttyUSB0` (no picocom holding the port) to query `dhdl query usb/wifi/ble/ethernet` and hit the EXACT
+same symptom this project already root-caused once this session (`task_custom_demo`'s unconditional print,
+see the chatter-fix entry above): command text arriving corrupted/interleaved with unrelated boot chatter,
+shell reporting "unknown command" for perfectly valid input.
+
+This time the chatter wasn't `task_custom_demo` -- it was three separate, already-capped (8-fires-total,
+shared counter) diagnostics left over from the already-resolved lr_usr investigation (task #253/#262, fixed
+and real-HW-confirmed back on 2026-09-20): `fiq_entry.S`'s `"FIQ: task_a resumed (tick-driven)"`,
+`context_switch.S`'s `"SLEEP: task_a resumed, outgoing=..."`, and `swi_entry.S`'s `"SWI_RETURN: task_a
+resume_pc=0x..."`. All three fire early in boot (within the first 8 real scheduling events, scheduler-wide),
+which is exactly the window any freshly-attached UART client's first few commands land in.
+
+Per the user's own standing instruction ("I need clean boot with no uart messages for issues we already
+resolved -- uart should only matter for new or ongoing diagnosis"): this is a resolved issue, not an ongoing
+one. Gated all three behind the same DEBUG log-category bit (`log_state_get_mask() & 16`) `boot_debug_
+enabled()` already uses in `kernel_main.vani` for the 76 self-test calls -- these three are the pure-
+assembly equivalent, since `boot_debug_enabled()` itself is a vani function and these diagnostics live in
+`fiq_entry.S`/`context_switch.S`/`swi_entry.S`, which can call `log_state_get_mask()` directly. Each gate is
+a single `bl log_state_get_mask` / `tst r0, #16` / `beq <skip>` inserted as the first step of the existing
+diagnostic block; verified `lr`-safety at each insertion point individually (in all three cases `bl` was
+already in active use moments earlier/later in the same code path with no expectation `lr` survives across
+this exact point).
+
+QEMU-verified: build clean, `qemu_run.py` clean (PASS marker, same known SD-model-only FAIL lines, not a
+regression), `-device usb-kbd` enumeration byte-for-byte unchanged with zero FIQ:/SLEEP:/SWI_RETURN lines
+present (DEBUG bit off by default, as expected). Real-HW retest (reflash + reboot + direct `/dev/ttyUSB0`
+query) still pending to confirm `wifi`/`ble`/`ethernet` enumeration status now that both this fix and the
+delay() recalibration above are both in the same build.

@@ -307,7 +307,21 @@ fiq_entry_true_lr_done:
      * scheduler_pick_next, while sp would still point at the outgoing
      * task's own stack). Shares that diagnostic's own fire-cap counter
      * (sleep_ticks_diag_fire_count) so the two investigation points'
-     * cumulative print cost stays bounded together, not doubled. */
+     * cumulative print cost stays bounded together, not doubled.
+     *
+     * Gated behind the DEBUG log category (2026-10-02, user: "clean
+     * boot with no uart messages for issues we already resolved" --
+     * the lr_usr bug this diagnostic was built for is FIXED and real-
+     * HW-verified, task #253/#262) -- same bit boot_debug_enabled()
+     * checks in kernel_main.vani. `bl` safe here: lr is already dead
+     * at this point -- the preceding `bl scheduler_switch_from_irq`
+     * already clobbered it, and the final restore a few lines below
+     * loads the true resume lr/pc straight off the task's own stack
+     * frame (`ldmia sp!, {r0-r12,lr,pc}^`), never from the lr
+     * register itself. */
+    bl log_state_get_mask
+    tst r0, #16
+    beq fiq_resume_diag_skip
     ldr r1, =current_task
     ldr r1, [r1]
     cmp r1, #0

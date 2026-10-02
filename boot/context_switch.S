@@ -1844,7 +1844,18 @@ task_sleep_ticks_impl:
      * twice already this session (see docs/TODO.md's own SD write-
      * diagnostic entries). r0 no longer needs preserving across the
      * print -- its only job (holding the chosen task's sp) is already
-     * done, consumed into sp itself by the `mov sp, r0` above. */
+     * done, consumed into sp itself by the `mov sp, r0` above.
+     *
+     * Gated behind the DEBUG log category (2026-10-02, user: "clean
+     * boot with no uart messages for issues we already resolved" --
+     * the lr_usr bug this diagnostic was built for is FIXED and real-
+     * HW-verified, task #253/#262) -- same bit boot_debug_enabled()
+     * checks in kernel_main.vani. `bl` safe here: lr was already
+     * clobbered by `bl scheduler_pick_next` a few lines above and
+     * nothing below this block depends on it. */
+    bl log_state_get_mask
+    tst r0, #16
+    beq sleep_ticks_diag_skip
     ldr r1, =current_task
     ldr r1, [r1]
     cmp r1, #0
