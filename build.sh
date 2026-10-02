@@ -140,6 +140,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/wifi_config_state.S" -o "${BUILD_DIR}/wifi_config_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/wifi_radio_state.S" -o "${BUILD_DIR}/wifi_radio_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/netif_state.S" -o "${BUILD_DIR}/netif_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -322,6 +325,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/log_state.o" \
   "${BUILD_DIR}/dhdl_state.o" \
   "${BUILD_DIR}/wifi_config_state.o" \
+  "${BUILD_DIR}/wifi_radio_state.o" \
   "${BUILD_DIR}/netif_state.o" \
   "${BUILD_DIR}/arp_state.o" "${BUILD_DIR}/scratch_state.o" \
   "${BUILD_DIR}/tcp_state.o" "${BUILD_DIR}/dhcp_state.o" \

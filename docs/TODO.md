@@ -12260,3 +12260,46 @@ the file was written, persisted, and read back correctly on the next boot. Build
 check. **Real-HW retest not done** -- no WiFi dongle currently attached, and more importantly the bigger
 real-join-wiring piece (task #197) isn't done yet either, so there's nothing to real-join-test against
 even once a dongle is reattached.
+
+### Real WiFi join wired up, vendor-agnostic by design (task #311)
+
+User: "go ahead, wire it up" (the real join, following task #310's config-file work), then explicitly:
+"write this in a way where if instead of 8188 any other chip used it works... vendor agnostic." Built both.
+
+**Vendor-agnostic radio abstraction**: `boot/wifi_radio_state.S`, reusing the exact same proven shape DHDL's
+own subsystem registration already uses (a stored fn pointer, called via a tail-call trampoline) --
+simplified to ONE active radio (devaddr/mps_in/mps_out plus 3 registered fn pointers: tx_frame/rx_frame/
+set_channel) rather than a searchable table, since there's only ever one WiFi chip attached at a time. The
+three trampolines are PURE forwarding: load the registered pointer into r12 (the one register AAPCS
+guarantees is scratch across any call, the same register real PLT/linker trampolines use for this exact
+"load target, jump" pattern) and `bx` straight into it, touching nothing else -- this is what makes
+forwarding a 6-argument call through a stored pointer safe without hand-deriving the i64-pairing/stack-
+argument ABI: as long as the vani-side extern declaration matches the registered function's real signature
+exactly, the compiler marshals both call sites identically and the trampoline never needs to know how.
+`wifi_radio_init_rtl8188cu()` + `rtl8188cu_rx_frame_adapter()` (kernel_main.vani) are the ONLY two places
+that know an RTL8188CU exists -- the adapter translates the chip's own struct return (`RtlRxFrameResult`)
+into the generic shape (`-1` = no frame, `>=0` = real frame_len, avoiding any struct-return-through-assembly
+ABI question). A future second chip driver needs only its own equivalent adapter matching the same 3
+generic signatures, registered via the setters; `wifi_real_join`/`wifi_scan_for_ssid` never change.
+
+**The real join sequence**: `wifi_scan_for_ssid` actively scans channels 1/6/11 (the non-overlapping
+2.4GHz defaults almost every real home AP uses) for a Probe Response matching the configured SSID,
+extracting the AP's BSSID from the received frame's own Address2. `wifi_real_join` then derives the PMK via
+PBKDF2-HMAC-SHA1 (IEEE 802.11-2020 Annex J.4.1's own formula, SSID as salt, 4096 iterations) from the
+configured password, drives `wpa2_join_start`/`_step_mgmt` through probe->auth->assoc (TXing each response
+over the registered radio), then switches to `wpa2_join_step_eapol` for the 4-way handshake -- EAPOL-Key
+frames travel as 802.11 Data frames with an LLC/SNAP header (Ethertype 0x888E), handled by two new
+functions added to `vendor/ieee80211` (`data_frame_build_eapol`/`data_frame_parse_eapol`, in both
+`core.vani` -- the one actually `use`d -- and `lib.vani`, kept in sync since they were already byte-
+identical up to that point). New `wifi join` shell command. Every failure path reports a specific, distinct
+reason (not configured / no device / SSID not heard / refused / handshake failed) rather than a bare error
+code.
+
+QEMU-verified everything reachable without real RF: build clean (asm audit 0/0), `qemu_run.py` clean (same
+6 pre-existing baseline FAILs), and both early-exit paths confirmed live across fresh boots against a
+persisted SD image -- unconfigured SSID reports "no SSID configured"; configured SSID + no USB device
+(QEMU's own permanent state, no WiFi device model exists) reports "no USB WiFi device enumerated". **The
+actual join sequence itself -- scan, auth, assoc, 4-way handshake -- is UNTESTED against a real AP**: QEMU
+has no USB device model for this driver at all, and no dongle is currently attached. Build-level correctness
+and the two early-exit paths are all that's verifiable right now; real-HW retest (with a dongle reattached)
+is the next real milestone for task #197's own remaining scope.

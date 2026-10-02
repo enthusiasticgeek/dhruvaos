@@ -406,3 +406,117 @@ fn assoc_response_parse(buf: ref [u8; 256], frame_len: i64) -> AssocRespInfo {
   if status_code == WLAN_STATUS_SUCCESS { ok = 1; }
   return AssocRespInfo { ok: ok, status_code: status_code, association_id: association_id };
 }
+
+// 802.11 DATA-frame encapsulation for EAPOL-Key frames (task #197
+// follow-up, 2026-10-01): once associated, EAPOL-Key messages travel
+// as ordinary 802.11 Data frames carrying an 802.2 LLC/SNAP header
+// (DSAP=SSAP=0xAA, Control=0x03, OUI=00:00:00) with Ethertype 0x888E
+// -- the standard EAPOL encapsulation, verified against Linux's own
+// `ETH_P_PAE` (0x888E, `include/uapi/linux/if_ether.h`) and
+// `ieee80211_data_to_8023` (`net/wireless/util.c`, the LLC/SNAP strip/
+// add logic every real 802.11 data path implements). Deliberately
+// builds a non-QoS Data frame (fixed 24-byte header) when SENDING --
+// this driver has no QoS/WMM negotiation at all (rtl8188cu_set_
+// channel's own comment: "no rate/HT-capability negotiation yet"), so
+// claiming a QoS Control field it can't back up would be worse than
+// a frame some real APs could in principle reject; a non-QoS Data
+// frame is what the 802.11 standard itself requires every AP to
+// accept regardless of what the BSS otherwise negotiates. PARSING an
+// incoming frame (the AP's own Msg1/Msg3) checks BOTH offsets --
+// every real AP sends QoS Data frames in practice (802.11n/ac/ax are
+// universal now), so a parser that only understood non-QoS would
+// never actually see them.
+const FC_TYPE_DATA: i64 = 0x0008;
+const FC_SUBTYPE_QOS_BIT: i64 = 0x0080;
+const FC_TODS: i64 = 0x0100;
+const DATA_HDR_LEN_NONQOS: i64 = 24;
+const DATA_HDR_LEN_QOS: i64 = 26;
+const LLC_SNAP_LEN: i64 = 8;
+const ETHERTYPE_EAPOL: i64 = 0x888e;
+// 24 (non-QoS data header) + 8 (LLC/SNAP) + 99 (the largest EAPOL-Key
+// frame this project's own eapol_key package ever builds, wpa_hs_
+// process_msg1's own Msg2) = 131, rounded up for headroom.
+const DATA_FRAME_EAPOL_MAX_LEN: i64 = 140;
+
+// Builds a non-QoS Data frame, ToDS=1 (station -> AP), ADDR1=ADDR3=
+// BSSID (EAPOL is a direct STA<->AP link exchange, never routed
+// beyond the AP itself -- the same reasoning this package's own
+// probe_request_build uses for setting ADDR3, just without the
+// broadcast case since the BSSID is already known by this point in
+// the join sequence), ADDR2=own MAC, wrapping `payload` (an EAPOL-Key
+// frame, as built by this project's own eapol_key package) behind the
+// LLC/SNAP header above. Returns the real frame length used.
+fn data_frame_build_eapol(bssid: ref [u8; 6], own_mac: ref [u8; 6], payload: ref [u8; 140], payload_len: i64, out: mut ref [u8; 140]) -> i64 {
+  let fc: i64 = FC_TYPE_DATA | FC_TODS;
+  out[0] = (fc & (255 as i64)) as u8;
+  out[1] = ((fc >> 8) & (255 as i64)) as u8;
+  out[2] = 0 as u8;
+  out[3] = 0 as u8;
+  let i: i64 = 0;
+  while i < 6 {
+    out[4 + i] = bssid[i];
+    out[10 + i] = own_mac[i];
+    out[16 + i] = bssid[i];
+    i = i + 1;
+  }
+  out[22] = 0 as u8;
+  out[23] = 0 as u8;
+
+  let llc_off: i64 = DATA_HDR_LEN_NONQOS;
+  out[llc_off] = 0xaa as u8;
+  out[llc_off + 1] = 0xaa as u8;
+  out[llc_off + 2] = 0x03 as u8;
+  out[llc_off + 3] = 0x00 as u8;
+  out[llc_off + 4] = 0x00 as u8;
+  out[llc_off + 5] = 0x00 as u8;
+  out[llc_off + 6] = ((ETHERTYPE_EAPOL >> 8) & (255 as i64)) as u8;
+  out[llc_off + 7] = (ETHERTYPE_EAPOL & (255 as i64)) as u8;
+
+  let payload_off: i64 = llc_off + LLC_SNAP_LEN;
+  let j: i64 = 0;
+  while j < payload_len {
+    out[payload_off + j] = payload[j];
+    j = j + 1;
+  }
+  return payload_off + payload_len;
+}
+
+struct DataFrameEapolResult { ok: i64, payload_len: i64 }
+
+// Parses an incoming Data frame, checking both the non-QoS (24-byte)
+// and QoS (26-byte) header lengths for an LLC/SNAP header carrying
+// Ethertype 0x888E -- see this function's own header comment above
+// for why both must be checked. `ok == 0` (not an EAPOL-carrying Data
+// frame, or too short to be one) is the expected, harmless outcome
+// for most frames an open RX poll loop will see -- background
+// traffic on a real, busy network, not a parse failure to report
+// loudly.
+fn data_frame_parse_eapol(buf: ref [u8; 256], frame_len: i64, payload_out: mut ref [u8; 140]) -> DataFrameEapolResult {
+  let fc: i64 = (buf[0] as i64) | ((buf[1] as i64) << 8);
+  let ftype: i64 = (fc >> 2) & (3 as i64);
+  if ftype != 2 {
+    return DataFrameEapolResult { ok: 0, payload_len: 0 };
+  }
+  let subtype: i64 = fc & (0x00f0 as i64);
+  let is_qos: i64 = if (subtype & FC_SUBTYPE_QOS_BIT) != 0 { 1 } else { 0 };
+  let hdr_len: i64 = if is_qos == 1 { DATA_HDR_LEN_QOS } else { DATA_HDR_LEN_NONQOS };
+  let llc_off: i64 = hdr_len;
+  if frame_len < (llc_off + LLC_SNAP_LEN) {
+    return DataFrameEapolResult { ok: 0, payload_len: 0 };
+  }
+  let ethertype: i64 = ((buf[llc_off + 6] as i64) << 8) | (buf[llc_off + 7] as i64);
+  if ethertype != ETHERTYPE_EAPOL {
+    return DataFrameEapolResult { ok: 0, payload_len: 0 };
+  }
+  let payload_off: i64 = llc_off + LLC_SNAP_LEN;
+  let payload_len: i64 = frame_len - payload_off;
+  if (payload_len < 0) || (payload_len > 140) {
+    return DataFrameEapolResult { ok: 0, payload_len: 0 };
+  }
+  let i: i64 = 0;
+  while i < payload_len {
+    payload_out[i] = buf[payload_off + i];
+    i = i + 1;
+  }
+  return DataFrameEapolResult { ok: 1, payload_len: payload_len };
+}

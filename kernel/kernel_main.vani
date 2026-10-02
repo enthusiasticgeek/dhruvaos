@@ -2274,6 +2274,27 @@ extern "C" fn wifi_config_ssid_len_set(new_len: u32) -> u32;
 extern "C" fn wifi_config_password_buf_ptr() -> mut ref i64;
 extern "C" fn wifi_config_password_len_get() -> u32;
 extern "C" fn wifi_config_password_len_set(new_len: u32) -> u32;
+// Vendor-agnostic WiFi radio interface (task #197 follow-up,
+// 2026-10-01) -- boot/wifi_radio_state.S's own header comment has the
+// full design. The join orchestrator below calls ONLY these, never
+// rtl8188cu_*/usb_wifi_* directly -- a future second chip driver needs
+// only its own adapter matching wifi_radio_tx_frame/_rx_frame's own
+// signatures, registered via the setters, and the orchestrator itself
+// never changes.
+extern "C" fn wifi_radio_set_devaddr(devaddr: u32) -> i64;
+extern "C" fn wifi_radio_set_mps_in(mps_in: u32) -> i64;
+extern "C" fn wifi_radio_set_mps_out(mps_out: u32) -> i64;
+extern "C" fn wifi_radio_set_present(present: u32) -> i64;
+extern "C" fn wifi_radio_set_tx_fn(tx_fn: fn(u32, u32, mut ref i64, i64, i64, i64) -> i64) -> i64;
+extern "C" fn wifi_radio_set_rx_fn(rx_fn: fn(u32, u32, mut ref i64) -> i64) -> i64;
+extern "C" fn wifi_radio_set_channel_fn(channel_fn: fn(u32, u32, u32) -> i64) -> i64;
+extern "C" fn wifi_radio_get_devaddr() -> u32;
+extern "C" fn wifi_radio_get_mps_in() -> u32;
+extern "C" fn wifi_radio_get_mps_out() -> u32;
+extern "C" fn wifi_radio_get_present() -> u32;
+extern "C" fn wifi_radio_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len: i64, is_broadcast: i64, seq_num: i64) -> i64;
+extern "C" fn wifi_radio_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> i64;
+extern "C" fn wifi_radio_set_channel(devaddr: u32, mps: u32, channel: u32) -> i64;
 // Round 71: HDMI framebuffer -- generic VideoCore mailbox property-tag
 // transport (boot/fb_state.S), generalized from governor_apply_freq_
 // mhz's own already-verified protocol.
@@ -26942,6 +26963,26 @@ fn shell_dispatch() -> i64 {
     return 0;
   }
 
+  // Task #197 follow-up (2026-10-01): drive a REAL WPA2-PSK join
+  // against the configured SSID -- see wifi_real_join's own header
+  // comment for the full design, the vendor-agnostic wifi_radio_*
+  // layer it goes through, and why this is still untested against a
+  // real AP as of this commit.
+  if shell_word_matches(line_buf, 0, cmd_end, "wifi") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: wifi join\n");
+      return 0;
+    }
+    let sub_start: i64 = cmd_end + 1;
+    let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+    if shell_word_matches(line_buf, sub_start, sub_end, "join") == 1 {
+      let _ = wifi_real_join();
+      return 0;
+    }
+    let _ = uart_puts("usage: wifi join\n");
+    return 0;
+  }
+
   if shell_word_matches(line_buf, 0, cmd_end, "ls") == 1 {
     // Round 42: bare "ls" keeps its original flat, every-live-record
     // behavior unchanged (phase4_milestone.py's own "ls shows
@@ -33220,6 +33261,324 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
     let _ = uart_puts(" (FAIL)\n");
   }
   return 0;
+}
+
+// RTL8188CU adapter for the vendor-agnostic WiFi radio interface
+// (boot/wifi_radio_state.S) -- the ONLY place in this whole join path
+// that knows this chip exists. `rtl8188cu_rx_frame` returns a struct
+// (`RtlRxFrameResult`); `wifi_radio_rx_frame`'s own generic signature
+// deliberately returns a plain i64 instead (-1 = no frame, >=0 = the
+// real frame_len) to avoid any struct-return ABI question through the
+// hand-written trampoline -- this adapter is the translation between
+// the two. `rtl8188cu_tx_frame`/`rtl8188cu_set_channel` already match
+// the generic signatures exactly (both take devaddr/mps explicitly
+// and return a plain i64), so they register directly with no adapter
+// needed.
+fn rtl8188cu_rx_frame_adapter(devaddr: u32, mps: u32, frame_out: mut ref i64) -> i64 {
+  let r: RtlRxFrameResult = rtl8188cu_rx_frame(devaddr, mps, frame_out);
+  if r.ok == 1 { return r.frame_len; }
+  return 0 - 1;
+}
+
+// Detects a real RTL8188CU and registers it as the active radio.
+// Returns 1 if a device was found and registered, 0 otherwise (no
+// USB WiFi device enumerated -- the expected, ordinary state on any
+// boot with no dongle attached, QEMU included, not a failure to
+// report loudly). Call once, e.g. right before the first `wifi join`
+// attempt -- cheap enough (a handful of .bss reads/writes) that
+// there's no reason to cache "already registered" state across calls.
+fn wifi_radio_init_rtl8188cu() -> i64 {
+  if usb_wifi_get_kind() == (0 as u32) {
+    return 0;
+  }
+  let _ = wifi_radio_set_devaddr(dwc2_downstream_addr());
+  let _ = wifi_radio_set_mps_in(usb_wifi_get_bulk_in_mps());
+  let _ = wifi_radio_set_mps_out(usb_wifi_get_bulk_out_mps());
+  let _ = wifi_radio_set_tx_fn(rtl8188cu_tx_frame);
+  let _ = wifi_radio_set_rx_fn(rtl8188cu_rx_frame_adapter);
+  let _ = wifi_radio_set_channel_fn(rtl8188cu_set_channel);
+  let _ = wifi_radio_set_present(1 as u32);
+  return 1;
+}
+
+// REAL join over whatever radio is currently registered via boot/
+// wifi_radio_state.S (task #197 follow-up, 2026-10-01) -- the piece
+// wpa2_join_orchestrator_self_test's own comment explicitly scoped out
+// ("Real RF/USB transmit-receive remains out of scope here"). Vendor-
+// agnostic by construction: everything below calls only wifi_radio_*,
+// never rtl8188cu_*/usb_wifi_* directly -- see boot/wifi_radio_
+// state.S's own header comment for the full design and what a future
+// second chip driver would need to do to plug in here unchanged.
+// UNTESTED against a real AP as of this commit: QEMU has no USB
+// device model for this driver at all (every other RTL8188CU function
+// in this file already documents the same limit), and no dongle was
+// attached when this was written -- build-level correctness and the
+// early "not configured"/"no device" exit paths are all that's
+// verifiable right now. Every failure path below reports a SPECIFIC,
+// distinct reason so a real run's own log output says exactly where
+// it stopped, without needing to re-read this function's source to
+// find out.
+//
+// Locally-administered (bit 1 of the first octet set, no vendor OUI
+// claimed), same convention this project's own software-defined MACs
+// already use elsewhere (netif_get_mac's own equivalent reasoning for
+// the wired interface) -- deliberately a different value than the
+// WPA2 self-test's own 0x02:...:02 example, so a real capture is
+// never ambiguous with test traffic if both ever end up in the same
+// log.
+fn wifi_real_own_mac() -> [u8; 6] {
+  return [0x02 as u8, 0x44 as u8, 0x48 as u8, 0x52 as u8, 0x55 as u8, 0x01 as u8];
+}
+
+const WIFI_RX_POLL_CAP: i64 = 50;
+const WIFI_RX_POLL_SLEEP_TICKS: i64 = 1;
+
+// Bridges a real RX frame (rtl8188cu_rx_frame's own heap-backed
+// `frame_out`) into the fixed `[u8; 256]` shape every ieee80211
+// package parser expects (mac_header_parse/probe_response_parse/
+// auth_response_parse/assoc_response_parse/data_frame_parse_eapol) --
+// the same "caller bridges the two" contract rtl8188cu_tx_frame's own
+// header comment already documents for the opposite direction.
+fn wifi_heap_to_fixed256(src: mut ref i64, src_len: i64, out: mut ref [u8; 256]) -> i64 {
+  let cap: i64 = if src_len > 256 { 256 } else { src_len };
+  let i: i64 = 0;
+  while i < cap {
+    out[i] = buf_read_byte(src, i as u32) as u8;
+    i = i + 1;
+  }
+  return cap;
+}
+
+fn wifi_scan_channel_at(i: i64) -> u32 {
+  if i == 0 { return 1 as u32; }
+  if i == 1 { return 6 as u32; }
+  return 11 as u32;
+}
+
+// Actively scans the 3 non-overlapping 2.4GHz channels (1/6/11 -- the
+// overwhelming real-world default for a home AP, and this driver has
+// no HT/40MHz support to need the others for bandwidth reasons either)
+// for a Probe Response matching the configured SSID, extracting the
+// responding AP's own BSSID via mac_header_parse's Address2 (the
+// source MAC -- the AP itself, for an infrastructure Probe Response).
+// Returns 1 + `bssid_out` on success, 0 if nothing matching was heard
+// on any of the 3 channels -- an expected, non-alarming outcome if the
+// AP is on a different channel, out of range, or simply didn't
+// respond to this particular probe, not a parse or protocol failure.
+fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, bssid_out: mut ref [u8; 6]) -> i64 {
+  let preq: [u8; 64] = [0 as u8; 64];
+  let preq_len: i64 = probe_request_build(own_mac, ssid, ssid_len, mut ref preq);
+  let tx_heap: mut ref i64 = dhruva_alloc_bytes(64);
+  let pi: i64 = 0;
+  while pi < preq_len {
+    let _ = buf_write_byte(tx_heap, pi as u32, preq[pi] as u32);
+    pi = pi + 1;
+  }
+
+  let rx_heap: mut ref i64 = dhruva_alloc_bytes(512);
+  let rx_fixed: [u8; 256] = [0 as u8; 256];
+  let ssid_echo: [u8; 32] = [0 as u8; 32];
+
+  let ci: i64 = 0;
+  while ci < 3 {
+    let channel: u32 = wifi_scan_channel_at(ci);
+    let _ = wifi_radio_set_channel(devaddr, mps_out, channel);
+    let _ = wifi_radio_tx_frame(devaddr, mps_out, tx_heap, preq_len, 1, 0);
+
+    let poll: i64 = 0;
+    while poll < WIFI_RX_POLL_CAP {
+      let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
+      if rx_len >= 0 {
+        let _ = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
+        let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, rx_len, mut ref ssid_echo);
+        if info.ok == 1 {
+          let matches: i64 = if info.ssid_len == ssid_len { 1 } else { 0 };
+          let si: i64 = 0;
+          while si < ssid_len {
+            if ssid_echo[si] != ssid[si] { matches = 0; }
+            si = si + 1;
+          }
+          if matches == 1 {
+            let a1: [u8; 6] = [0 as u8; 6];
+            let a2: [u8; 6] = [0 as u8; 6];
+            let a3: [u8; 6] = [0 as u8; 6];
+            let _ = mac_header_parse(ref rx_fixed, mut ref a1, mut ref a2, mut ref a3);
+            let bi: i64 = 0;
+            while bi < 6 {
+              bssid_out[bi] = a2[bi];
+              bi = bi + 1;
+            }
+            return 1;
+          }
+        }
+      } else {
+        let _ = task_sleep_ticks(WIFI_RX_POLL_SLEEP_TICKS);
+      }
+      poll = poll + 1;
+    }
+    ci = ci + 1;
+  }
+  return 0;
+}
+
+fn wifi_real_join() -> i64 {
+  let ssid_len: i64 = wifi_config_ssid_len_get() as i64;
+  let password_len: i64 = wifi_config_password_len_get() as i64;
+  if ssid_len == 0 {
+    let _ = uart_puts("wifi join: no SSID configured (write /config/wifi_ssid <name>, reboot, then retry)\n");
+    return 0 - 1;
+  }
+  if password_len == 0 {
+    let _ = uart_puts("wifi join: no password configured (write /config/wifi_password <pw>, reboot, then retry)\n");
+    return 0 - 1;
+  }
+  if wifi_radio_init_rtl8188cu() == 0 {
+    let _ = uart_puts("wifi join: no USB WiFi device enumerated\n");
+    return 0 - 1;
+  }
+
+  let ssid: [u8; 32] = [0 as u8; 32];
+  let si: i64 = 0;
+  while si < ssid_len {
+    ssid[si] = buf_read_byte(wifi_config_ssid_buf_ptr(), si as u32) as u8;
+    si = si + 1;
+  }
+
+  let password_heap: mut ref i64 = dhruva_alloc_bytes(64);
+  let pwi: i64 = 0;
+  while pwi < password_len {
+    let _ = buf_write_byte(password_heap, pwi as u32, buf_read_byte(wifi_config_password_buf_ptr(), pwi as u32));
+    pwi = pwi + 1;
+  }
+  let ssid_heap: mut ref i64 = dhruva_alloc_bytes(32);
+  let shi: i64 = 0;
+  while shi < ssid_len {
+    let _ = buf_write_byte(ssid_heap, shi as u32, ssid[shi] as u32);
+    shi = shi + 1;
+  }
+  // Standard WPA2-PSK key derivation: PBKDF2-HMAC-SHA1, the SSID as
+  // salt, 4096 iterations, 256-bit output -- IEEE 802.11-2020 Annex
+  // J.4.1's own formula, the same one every real WPA2 client uses.
+  let pmk: mut ref i64 = dhruva_alloc_bytes(32);
+  let _ = pbkdf2_hmac_sha1(password_heap, password_len, ssid_heap, ssid_len, 4096, pmk, 32);
+
+  let devaddr: u32 = wifi_radio_get_devaddr();
+  let mps_out: u32 = wifi_radio_get_mps_out();
+  let mps_in: u32 = wifi_radio_get_mps_in();
+  let own_mac: [u8; 6] = wifi_real_own_mac();
+
+  let _ = uart_puts("wifi join: scanning for configured SSID on channels 1/6/11...\n");
+  let bssid: [u8; 6] = [0 as u8; 6];
+  if wifi_scan_for_ssid(devaddr, mps_out, mps_in, ref own_mac, ref ssid, ssid_len, mut ref bssid) != 1 {
+    let _ = uart_puts("wifi join: never heard a Probe Response for the configured SSID\n");
+    return 0 - 1;
+  }
+  let _ = uart_puts("wifi join: found AP, starting join sequence\n");
+
+  let ctx: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_CTX_SIZE as u32);
+  let preq: [u8; 64] = [0 as u8; 64];
+  let preq_len: i64 = wpa2_join_start(ctx, ref bssid, ref own_mac, ref ssid, ssid_len, mut ref preq);
+  let preq_heap: mut ref i64 = dhruva_alloc_bytes(64);
+  let p1i: i64 = 0;
+  while p1i < preq_len {
+    let _ = buf_write_byte(preq_heap, p1i as u32, preq[p1i] as u32);
+    p1i = p1i + 1;
+  }
+  let _ = wifi_radio_tx_frame(devaddr, mps_out, preq_heap, preq_len, 1, 1);
+
+  let rx_heap: mut ref i64 = dhruva_alloc_bytes(512);
+  let rx_fixed: [u8; 256] = [0 as u8; 256];
+  let mgmt_out: [u8; 90] = [0 as u8; 90];
+  let mgmt_heap: mut ref i64 = dhruva_alloc_bytes(90);
+
+  let seq: i64 = 2;
+  let mgmt_iter: i64 = 0;
+  let in_eapol: i64 = 0;
+  while (in_eapol == 0) && (mgmt_iter < WIFI_RX_POLL_CAP) {
+    let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
+    if rx_len >= 0 {
+      let _ = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
+      let r: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref rx_fixed, rx_len, mut ref mgmt_out);
+      if r.failed == 1 {
+        let _ = uart_puts("wifi join: authentication/association refused by the AP\n");
+        return 0 - 1;
+      }
+      if r.tx_len > 0 {
+        let mi: i64 = 0;
+        while mi < r.tx_len {
+          let _ = buf_write_byte(mgmt_heap, mi as u32, mgmt_out[mi] as u32);
+          mi = mi + 1;
+        }
+        let _ = wifi_radio_tx_frame(devaddr, mps_out, mgmt_heap, r.tx_len, 0, seq);
+        seq = seq + 1;
+      }
+      if r.state == WPA2_JOIN_WAIT_EAPOL_MSG1 { in_eapol = 1; }
+    } else {
+      let _ = task_sleep_ticks(WIFI_RX_POLL_SLEEP_TICKS);
+    }
+    mgmt_iter = mgmt_iter + 1;
+  }
+  if in_eapol == 0 {
+    let _ = uart_puts("wifi join: association never completed (no response from the AP)\n");
+    return 0 - 1;
+  }
+  let _ = uart_puts("wifi join: associated, waiting for the 4-way handshake...\n");
+
+  let eapol_payload: [u8; 140] = [0 as u8; 140];
+  let eapol_rx_heap: mut ref i64 = dhruva_alloc_bytes(140);
+  let eapol_tx_heap: mut ref i64 = dhruva_alloc_bytes(99);
+  let eapol_tx_fixed: [u8; 140] = [0 as u8; 140];
+  let gtk_out: mut ref i64 = dhruva_alloc_bytes(32);
+  let wrapped: [u8; 140] = [0 as u8; 140];
+  let wrapped_heap: mut ref i64 = dhruva_alloc_bytes(140);
+
+  let connected: i64 = 0;
+  let eapol_iter: i64 = 0;
+  while (connected == 0) && (eapol_iter < WIFI_RX_POLL_CAP) {
+    let rx2_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
+    if rx2_len >= 0 {
+      let _ = wifi_heap_to_fixed256(rx_heap, rx2_len, mut ref rx_fixed);
+      let dinfo: DataFrameEapolResult = data_frame_parse_eapol(ref rx_fixed, rx2_len, mut ref eapol_payload);
+      if dinfo.ok == 1 {
+        let ei: i64 = 0;
+        while ei < dinfo.payload_len {
+          let _ = buf_write_byte(eapol_rx_heap, ei as u32, eapol_payload[ei] as u32);
+          ei = ei + 1;
+        }
+        let er: Wpa2JoinResult = wpa2_join_step_eapol(ctx, eapol_rx_heap, dinfo.payload_len, pmk, eapol_tx_heap, gtk_out);
+        if er.failed == 1 {
+          let _ = uart_puts("wifi join: 4-way handshake failed (wrong password, or a MIC/replay check failed)\n");
+          return 0 - 1;
+        }
+        if er.tx_len > 0 {
+          let eti: i64 = 0;
+          while eti < er.tx_len {
+            eapol_tx_fixed[eti] = buf_read_byte(eapol_tx_heap, eti as u32) as u8;
+            eti = eti + 1;
+          }
+          let wrapped_len: i64 = data_frame_build_eapol(ref bssid, ref own_mac, ref eapol_tx_fixed, er.tx_len, mut ref wrapped);
+          let wj: i64 = 0;
+          while wj < wrapped_len {
+            let _ = buf_write_byte(wrapped_heap, wj as u32, wrapped[wj] as u32);
+            wj = wj + 1;
+          }
+          let _ = wifi_radio_tx_frame(devaddr, mps_out, wrapped_heap, wrapped_len, 0, seq);
+          seq = seq + 1;
+        }
+        if er.done == 1 { connected = 1; }
+      }
+    } else {
+      let _ = task_sleep_ticks(WIFI_RX_POLL_SLEEP_TICKS);
+    }
+    eapol_iter = eapol_iter + 1;
+  }
+
+  if connected == 1 {
+    let _ = uart_puts("wifi join: CONNECTED (4-way handshake complete, TK/GTK installed)\n");
+    return 0;
+  }
+  let _ = uart_puts("wifi join: 4-way handshake never completed (no EAPOL frames received from the AP)\n");
+  return 0 - 1;
 }
 
 // Round 67: ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) and HKDF
