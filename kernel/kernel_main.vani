@@ -17786,6 +17786,61 @@ fn dwc2_hprt0_w1c_group_mask() -> u32 {
   return 0x2E as u32; // bits 1,2,3,5: CONNDET,ENA,ENACHG,OVRCURRCHG
 }
 
+// GRSTCTL (offset 0x10): CSftRst=bit0 (self-clearing core soft
+// reset), AHBIdle=bit31 (RO, 1=AHB master bus idle, safe to proceed).
+// Bounded polls (20 tries each, matching this project's own "never
+// `while true` against hardware" discipline) rather than an infinite
+// wait -- a real core reset completes in microseconds, so 20
+// iterations of a bare register read is generous margin. Under QEMU,
+// where this register is "entirely logged-only" (dwc2_init's own
+// header comment) and never reflects the write at all, both loops
+// exit on their very first check -- zero added boot-time cost there.
+fn dwc2_core_soft_reset() -> i64 {
+  let grstctl: i64 = dwc2_base() + 0x10;
+  let _ = mmio_write_u32(grstctl, 1 as u32);
+  let csft_tries: i64 = 0;
+  while csft_tries < 20 {
+    let v: u32 = mmio_read_u32(grstctl);
+    if (v & (1 as u32)) == (0 as u32) {
+      csft_tries = 20;
+    } else {
+      csft_tries = csft_tries + 1;
+    }
+  }
+  let ahb_tries: i64 = 0;
+  while ahb_tries < 20 {
+    let v2: u32 = mmio_read_u32(grstctl);
+    if (v2 & (0x80000000 as u32)) != (0 as u32) {
+      ahb_tries = 20;
+    } else {
+      ahb_tries = ahb_tries + 1;
+    }
+  }
+  let _ = delay(50000);
+  return 0;
+}
+
+// HPRT0 bit 12 (PRTPWR) -- see dwc2_init's own header comment for the
+// full real-HW finding this fixes. Preserves the w1c status group
+// (same discipline dwc2_port_reset's own header comment already
+// documents) -- a naive read-modify-write here would silently clear
+// CONNDET/ENA/ENACHG/OVRCURRCHG. Settle delay matches dwc2_port_
+// reset's own 50000us bound -- real USB bus-power rise time needs
+// real elapsed time, not an instruction-speed register write.
+fn dwc2_hprt0_pwr_bit() -> u32 {
+  return 0x1000 as u32;
+}
+
+fn dwc2_port_power_on() -> i64 {
+  let hprt0: i64 = dwc2_hprt0_addr();
+  let w1c_mask: u32 = dwc2_hprt0_w1c_group_mask();
+  let not_w1c_mask: u32 = w1c_mask ^ (0xFFFFFFFF as u32);
+  let v: u32 = mmio_read_u32(hprt0);
+  let _ = mmio_write_u32(hprt0, (v & not_w1c_mask) | dwc2_hprt0_pwr_bit());
+  let _ = delay(50000);
+  return 0;
+}
+
 // AUDITED (round 17, 2026-08-28) -- this function's own read/write/
 // read/write/read/write sequence against HPRT0, and the read/write
 // sequence dwc2_init() runs against GSNPSID/GAHBCFG/HPRT0 on the way
@@ -17839,13 +17894,49 @@ fn dwc2_port_reset() -> i64 {
 // port reaches ENABLED with a device attached", used by the self-test
 // below to report pass/fail without the caller needing to inspect
 // raw register values.
+//
+// Real-HW finding (task #197 follow-up, 2026-10-02): this project's
+// first-ever attempt to attach ANYTHING to a real Pi 1B's USB port
+// (WiFi + BT dongles both plugged in) reported `port connected=0`/
+// `dwc2_init status=FFFFFFFF` on every boot -- the exact same result
+// as no device attached at all -- despite this driver cleanly
+// enumerating QEMU's own real `usb-kbd`/`usb-net`/`usb-storage`
+// devices every round before this one. Two real bring-up steps this
+// section's own header comment already flags as untested against real
+// silicon were missing entirely:
+//   1. GRSTCTL core soft reset -- "entirely logged-only in this
+//      [QEMU] model; writing it does nothing real," per that header
+//      comment, so it was never implemented at all. Real Synopsys
+//      DWC2 silicon needs this before ANY other register (HPRT0
+//      included) reflects true state.
+//   2. HPRT0.PRTPWR (bit 12) -- documented by name in dwc2_hprt0_
+//      addr's own comment ("PWR=bit12") but never actually SET
+//      anywhere. Real DWC2 host-mode silicon gates the root port's
+//      own VBUS/PHY logic on this bit; CONNSTS never goes high no
+//      matter what's physically attached until software powers the
+//      port. QEMU's emulated HPRT0 model never gates CONNSTS on PWR
+//      at all (confirmed: `usb-kbd` enumerated cleanly throughout
+//      this project's history with PRTPWR never once written), which
+//      is exactly why this has been invisible under every QEMU-only
+//      round until a real device was actually attached to real
+//      hardware for the first time.
+// Both added below, both no-ops under QEMU (confirmed live: the same
+// `usb-kbd` enumeration this project already relies on for self-tests
+// still passes identically with these two calls added) -- genuinely
+// new behavior only on real silicon, where they're real requirements,
+// not a behavior change for anything this project can verify without
+// hardware. NOT yet confirmed to be THE fix for the real-HW symptom
+// (same "reference match isn't causal proof" caution this project's
+// own memory already carries) -- a real retest is still needed.
 fn dwc2_init() -> i64 {
   let id: u32 = dwc2_read_gsnpsid();
   let _ = uart_puts("USB: GSNPSID=");
   let _ = uart_put_hex32(id);
   let _ = uart_puts("\n");
 
+  let _ = dwc2_core_soft_reset();
   let _ = dwc2_enable_global_intr();
+  let _ = dwc2_port_power_on();
 
   let connected: i64 = dwc2_port_connected();
   let _ = uart_puts("USB: port connected=");

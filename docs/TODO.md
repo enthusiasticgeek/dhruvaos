@@ -12411,3 +12411,30 @@ timeout value, so this doubles as a real reboot AND a QEMU one with the same one
 QEMU-verified live: sent `reboot` over a driven shell session, confirmed the boot banner ("Dhruva Phase 2")
 appears a second time in the captured output -- a real reset actually happened, not just an acknowledgment
 printed. `qemu_run.py` regression unaffected (new, unreached-by-self-tests command).
+
+### DWC2 USB bring-up: added core soft reset + port power, real-HW cause still UNCONFIRMED (2026-10-02)
+
+User, after plugging WiFi + BT dongles into a real Pi 1B for the first time and rebooting: "i could never see
+usb device or any dongle connected on dhruvaos so far." Live picocom log confirmed `USB: port connected=
+00000000` / `dwc2_init status=FFFFFFFF` -- the EXACT same result as no device attached at all, with real
+hardware physically plugged in.
+
+`dwc2_init`'s own header comment already flagged, by name, two real DWC2 host-mode bring-up steps this driver
+has never performed, specifically BECAUSE QEMU's emulated model doesn't need them: GRSTCTL core soft reset
+("entirely logged-only in this model; writing it does nothing real") and HPRT0.PRTPWR, bit 12 ("PWR=bit12",
+documented in a comment, never actually set anywhere). Real Synopsys DWC2 silicon gates the root port's own
+VBUS/PHY logic on PRTPWR -- CONNSTS never reads 1, no matter what's physically attached, until software
+powers the port -- while QEMU's own model never gates CONNSTS on it at all (confirmed: `-device usb-kbd` has
+enumerated cleanly every round of this project's history with PRTPWR never once written). Added both:
+`dwc2_core_soft_reset()` (bounded 20-try polls on CSftRst self-clear and AHBIdle, not an infinite wait) and
+`dwc2_port_power_on()` (preserves HPRT0's own w1c status group, same discipline `dwc2_port_reset` already
+uses, then a 50ms settle delay matching that function's own bound), both called at the top of `dwc2_init`.
+
+QEMU-verified as a true no-op: `-device usb-kbd` enumeration output is BYTE-FOR-BYTE IDENTICAL before and
+after this change (same GSNPSID/port-connected/enumerated-device/HID-detected lines), and `qemu_run.py`
+regression unaffected. **This is NOT yet confirmed to be the actual fix for the real-HW symptom** -- QEMU's
+own model doesn't exercise this code path differently either way, so nothing about QEMU passing can prove
+causation here (same caution this project's own memory already carries under "reference match isn't causal
+proof"). A real reflash + reboot + retest with the dongles attached is the only way to know; if this doesn't
+clear it, the next suspects are VBUS/power delivery at the board level (outside this driver's control) or a
+PHY-configuration register this project hasn't identified yet.
