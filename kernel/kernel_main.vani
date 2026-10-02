@@ -4253,10 +4253,32 @@ fn uart_init() -> i64 {
 // 0x44 offset used here, from uart_init/the existing TX path).
 fn uart_rx_irq_init() -> i64 {
   let uart_imsc: i64 = UART_IMSC;
-  // RXIM (bit 4): interrupt whenever the RX FIFO is above its trigger
-  // level -- left at the PL011 default (1/8 full), close enough to
-  // "every keystroke" for interactive typing at human speed.
-  let _ = mmio_write_u32(uart_imsc, 0x10 as u32);
+  // Task #324 real-HW fix (2026-10-02, user-observed multi-second
+  // per-keystroke lag + intermittent command corruption): RXIM (bit 4)
+  // ALONE, as this project originally shipped it, only fires once the
+  // RX FIFO crosses its trigger level -- the PL011 default (1/8 of a
+  // 16-byte FIFO) is 2 BYTES, not 1, despite this file's own prior
+  // comment claiming "close enough to every keystroke." A single
+  // isolated byte (the common case for real human typing, where
+  // keystrokes arrive well under one at a time per RX-FIFO-threshold
+  // window) sits in the hardware FIFO UNSERVICED until a second byte
+  // happens to arrive and cross the threshold -- confirmed directly
+  // against Linux's own `drivers/tty/serial/amba-pl011.c` and
+  // corroborating reports (raspberrypi/pico-sdk#500, "UART interrupts
+  // incompletely enabled for FIFO mode"; Linux commit 9b96fbacda34,
+  // "to get an interrupt for the last few characters in FIFO mode, the
+  // receive timeout interrupt needs to be enabled"): every real PL011
+  // driver enables RTIM (bit 6, Receive Timeout Interrupt -- fires
+  // after ~32 bit periods of RX inactivity with at least one byte
+  // still in the FIFO) ALONGSIDE RXIM for exactly this reason. Without
+  // it, this project's own RX path silently stalled on any FIFO
+  // occupancy below 2 bytes -- real-HW-reproduced as 1-2+ second lag
+  // per keystroke and, worse, functional shell-line corruption when a
+  // command's own trailing byte(s) sat unserviced long enough to
+  // collide with whatever arrived next. Never caught under QEMU: that
+  // model's own UART behavioral emulation doesn't reproduce real FIFO-
+  // trigger-level timing at all. RXIM|RTIM = 0x10|0x40 = 0x50.
+  let _ = mmio_write_u32(uart_imsc, 0x50 as u32);
 
   let ic_enable2: i64 = IC_ENABLE2;
   // GPU IRQ 57 (UART0) is bit 25 of the controller's second
@@ -12422,13 +12444,17 @@ fn timer_tick_dispatch() -> i64 {
   // header comment in boot/uart_rx_budget_state.S for the full
   // sporadic-server design. If the previous tick's own budget got
   // exhausted (a real sustained RX burst), the RX branch in irq_
-  // dispatch masked UART_IMSC's RXIM bit to avoid a livelock --
-  // re-enable it now that a fresh budget exists, so the level-
+  // dispatch masked UART_IMSC's RXIM+RTIM bits to avoid a livelock --
+  // re-enable them now that a fresh budget exists, so the level-
   // triggered condition (if still genuinely pending) can fire and get
-  // serviced again.
+  // serviced again. 0x50, matching uart_rx_irq_init's own RXIM|RTIM
+  // value (task #324) -- re-enabling RXIM alone here would have
+  // silently reintroduced the exact single-byte-never-serviced bug
+  // that fix exists to close, just scoped to the much rarer budget-
+  // exhaustion path instead of every boot.
   let _ = uart_rx_irq_budget_set(UART_RX_IRQ_BUDGET_PER_TICK as u32);
   if uart_rx_deferred_get() == (1 as u32) {
-    let _ = mmio_write_u32(UART_IMSC, 0x10 as u32);
+    let _ = mmio_write_u32(UART_IMSC, 0x50 as u32);
     let _ = uart_rx_deferred_set(0 as u32);
   }
 
@@ -12642,7 +12668,10 @@ fn irq_dispatch() -> i64 {
       // Draining the FIFO above is what actually de-asserts this
       // level-triggered condition; this just clears any stale raw
       // status defensively, same pattern as the timer branch above.
-      let _ = mmio_write_u32(uart_icr, 0x10 as u32);
+      // 0x50 (RXIC|RTIC), not just 0x10 (RXIC) -- task #324 now enables
+      // RTIM alongside RXIM in UART_IMSC, so a timeout-triggered entry
+      // needs its own status bit acknowledged too, not just RXIM's.
+      let _ = mmio_write_u32(uart_icr, 0x50 as u32);
     } else {
       let _ = mmio_write_u32(UART_IMSC, 0 as u32);
       let _ = uart_rx_deferred_set(1 as u32);

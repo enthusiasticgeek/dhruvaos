@@ -12710,3 +12710,47 @@ as expected -- QEMU's own PL011 model never backs up the ring the way real hardw
 own header comment, so this fix's actual benefit is only observable on real hardware). Real-HW retest
 pending: reflash, reboot (clears any already-accumulated backlog from the bug itself), then one single clean
 query.
+
+### Real root cause of the real-HW lag + intermittent corruption found: PL011 RTIM was never enabled (2026-10-02)
+
+Even with the ring-drain fix above flashed, real-HW retesting still hit intermittent `dhdl` command
+corruption (confirmed by the user directly, verbatim: `dhdl query ble` returned `"dhdl: unknown subsystem
+(see `dhdl list`)"` from their own interactive picocom session -- not a transmission artifact, the shell
+genuinely failed to recognize a correctly-spelled subsystem name). The user also reported, independently,
+that typed characters take 1-2 seconds to echo. Both turned out to be the SAME root cause.
+
+Measured directly (host-side script sending single isolated characters with no further input following):
+every single character missed a generous multi-second wait window entirely, only arriving once ADDITIONAL
+bytes were sent afterward. A 90-second fully passive listen (nothing sent) confirmed the board is completely
+silent when idle -- ruling out any background task (SD retries, GC/compaction) as the source, and narrowing
+the cause to something specifically triggered by RX activity itself.
+
+**Root cause, checked directly against Linux's own PL011 driver per the user's own explicit request to
+verify against authoritative sources**: `uart_rx_irq_init()` (`kernel_main.vani`) enabled ONLY RXIM (bit 4,
+UART_IMSC) -- the RX-FIFO-level-triggered interrupt, which the PL011 defaults to firing only once the FIFO
+crosses 1/8 full. On the real 16-byte PL011 FIFO, 1/8 is **2 bytes**, not 1 -- this file's own prior comment
+("left at the PL011 default... close enough to every keystroke") was simply wrong. A single isolated
+keystroke sitting alone in the FIFO never crosses that threshold and is never serviced AT ALL until a SECOND
+byte happens to arrive -- confirmed against `drivers/tty/serial/amba-pl011.c`, Linux commit `9b96fbacda34`
+("to get an interrupt for the last few characters in FIFO mode, the receive timeout interrupt needs to be
+enabled"), and a matching `raspberrypi/pico-sdk` issue (#500, "UART interrupts incompletely enabled for FIFO
+mode") -- every real PL011 driver enables RTIM (bit 6, Receive Timeout Interrupt -- fires after ~32 bit
+periods of RX silence with at least one byte still queued) ALONGSIDE RXIM for exactly this reason. This
+project's driver never did. Under normal human typing, successive keystrokes are far enough apart that
+RTIM-less servicing effectively randomly pairs up every OTHER character before anything fires, producing
+visible 1-2-second-scale lag; worse, a command's own TRAILING byte(s) (the common case where nothing follows
+immediately) could sit unserviced indefinitely, open to colliding with whatever arrived next and corrupting
+dispatch -- exactly the `ble` symptom. Never caught under QEMU: its UART emulation doesn't model real FIFO-
+trigger-level timing at all.
+
+**Fixed**: `uart_rx_irq_init()`'s IMSC write and the task #242 budget-recovery re-enable both now write
+`0x50` (RXIM|RTIM) instead of `0x10` (RXIM alone); the matching ICR acknowledge write in `irq_dispatch` now
+clears `0x50` (RXIC|RTIC) instead of just `0x10`, so a timeout-triggered entry gets its own status bit
+acknowledged correctly.
+
+QEMU-verified: build clean with zero `asm_safety_audit.py` findings, `qemu_run.py` clean, interactive
+`dhdl query usb/wifi/ble` sequence over a `-serial pty` still dispatches correctly (no regression), `-device
+usb-kbd` enumeration byte-for-byte unchanged. Real-HW retest pending -- this is the strongest candidate yet
+for the actual fix, given it's independently confirmed against three authoritative real-world PL011
+references and directly explains every symptom observed (lag, intermittent corruption, QEMU/real-HW
+divergence) rather than being inferred from guesswork.
