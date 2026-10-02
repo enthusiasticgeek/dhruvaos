@@ -226,3 +226,94 @@ done:
     mov r1, #0
     pop {r4, r5, r6, r7, lr}
     bx lr
+
+/* void uart_tx_ring_drain_only(void) -- pumps the drain side of this
+ * ring with NO push, for exactly one caller: timer_tick_dispatch,
+ * unconditionally, every tick (2026-10-02, task #319 regression fix).
+ *
+ * Task #319 ("boot-debug flag: gate tick dot + DIAG prints") gated the
+ * tick-dot's OWN uart_putc_nonblocking(46) call behind boot_debug_
+ * enabled() -- which defaults OFF. This function's own header comment
+ * (above) already documented that the tick-dot was "the ONLY thing
+ * ever draining this ring when nothing else happened to be printing"
+ * -- gating it silently removed the ring's only idle-time drain pump
+ * too, not just its visible character. Real-HW symptom this caused:
+ * once the ring backs up even slightly (e.g. a burst of echo bytes
+ * with no further prints immediately after), the backlog NEVER drains
+ * until something else happens to call uart_putc_nonblocking again --
+ * and because this is a FIFO ring, that next caller's own fresh bytes
+ * queue up BEHIND the old stale backlog, which drains out FIRST,
+ * splicing old leftover bytes in front of new output. Reproduced live
+ * this round: shell commands sent well after a prior session's own
+ * unrelated prints came back corrupted/truncated, with fragments of
+ * long-prior unrelated text (e.g. a stale "ethernet" tail) resurfacing
+ * in the middle of a totally different, later command's echo.
+ *
+ * Fix restores the pump WITHOUT restoring the visible dot: this is
+ * drain-ONLY (no push, so nothing new ever gets enqueued by a tick
+ * that has nothing to say), called unconditionally regardless of
+ * boot_debug_enabled(), while uart_putc_nonblocking(46)'s own push+
+ * drain call just above stays gated exactly as task #319 intended --
+ * whether the dot is VISIBLE and whether the ring gets PUMPED are two
+ * independent concerns that task #319 wrongly conflated by sharing one
+ * gated call site for both.
+ *
+ * Always called from already-privileged interrupt context (timer_
+ * tick_dispatch, inside irq_entry.S's own FIQ path) -- no USR-mode
+ * caller exists or is expected, so this skips uart_tx_ring_push_and_
+ * drain's own mode-check/SWI-routing trampoline entirely and masks/
+ * drains directly, matching uart_tx_ring_push_and_drain_impl's own
+ * "already privileged" direct-call path.
+ *
+ * Self-contained copy of the drain loop above (not a branch into
+ * drain_loop_init/drain_step/done) -- asm_safety_audit.py's own push/
+ * pop balance check works per-function and can't see a pop reached
+ * only via fall-through from a different function's labels, so
+ * branching in there would be a real audit-tool blind spot even
+ * though it is runtime-correct. Duplicating these ~15 lines keeps
+ * this function statically auditable on its own, matching this
+ * project's own standing preference for auditability over cleverness
+ * in safety-critical bare-metal code. */
+.global uart_tx_ring_drain_only
+uart_tx_ring_drain_only:
+    push {r4, r5, r6, r7, lr}
+    mrs r6, cpsr
+    cpsid if
+
+    mov r7, #16                  /* bounded burst-drain cap, matching the
+                                   * real PL011 TX FIFO depth -- see this
+                                   * file's own header comment */
+drain_only_step:
+    cmp r7, #0
+    beq drain_only_done           /* burst cap reached -- remaining backlog
+                                    * waits for the next tick, same as above */
+    sub r7, r7, #1
+
+    ldr r1, =uart_tx_ring_head
+    ldr r2, [r1]
+    ldr r3, =uart_tx_ring_tail
+    ldr r4, [r3]
+    cmp r2, r4
+    beq drain_only_done           /* ring empty -- nothing left to drain */
+
+    ldr r1, =0x20201018          /* UART_FR */
+    ldr r0, [r1]
+    tst r0, #0x20                /* TX FIFO full? (bit 5) */
+    bne drain_only_done           /* still full -- try again next tick */
+
+    ldr r1, =uart_tx_ring_buf
+    ldrb r0, [r1, r4]            /* r0 = buf[tail] */
+    ldr r1, =0x20201000          /* UART_DR */
+    strb r0, [r1]
+    add r4, r4, #1
+    and r4, r4, #63              /* next_tail = (tail + 1) & 63 */
+    ldr r1, =uart_tx_ring_tail
+    str r4, [r1]
+    b drain_only_step
+
+drain_only_done:
+    msr cpsr_c, r6
+    mov r0, #0
+    mov r1, #0
+    pop {r4, r5, r6, r7, lr}
+    bx lr

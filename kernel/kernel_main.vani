@@ -2744,6 +2744,18 @@ extern "C" fn usb_wifi_set_out_toggle(value: u32) -> u32;
 #[stack_cost(bytes=12)]
 extern "C" fn uart_tx_ring_push_and_drain(c: u32) -> u32;
 
+// Task #319 regression fix (2026-10-02): gating the tick-dot's own
+// uart_putc_nonblocking(46) call behind boot_debug_enabled() silently
+// removed this ring's only idle-time drain pump too (see this file's
+// own header comment, "the ONLY thing ever draining this ring when
+// nothing else happened to be printing"). Drain-only, no push -- keeps
+// the ring pumped every tick unconditionally, independent of whether
+// the visible dot itself is gated. Pushes {r4,r5,r6,r7,lr} = 20 bytes;
+// called directly from already-privileged FIQ context, same as uart_
+// tx_ring_push_and_drain_impl's own "already privileged" path.
+#[stack_cost(bytes=20)]
+extern "C" fn uart_tx_ring_drain_only() -> i64;
+
 // Task #317 follow-up ("implement it. fix limitation", 2026-10-02):
 // generic UART-output capture, fixing the DHDL roadmap's own long-
 // standing open question ("whether describe fns print directly or
@@ -12430,6 +12442,14 @@ fn timer_tick_dispatch() -> i64 {
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
     let _ = watchdog_kick();
   }
+  // Task #323 (2026-10-02, same-day regression fix): pump the TX
+  // ring's drain side EVERY tick, unconditionally -- see uart_tx_ring_
+  // drain_only's own header comment (boot/uart_tx_ring_state.S) for
+  // the full story. Gating the visible dot below also silently gated
+  // this ring's only idle-time drain pump, letting stale backlog bytes
+  // from any earlier print splice into later, unrelated output. Drain-
+  // only (no push), so a quiet tick enqueues nothing new.
+  let _ = uart_tx_ring_drain_only();
   //
   // '.' instead of "tick\n": uart_puts's own wait loop makes it
   // unboundable under #[wcet(...)] (see uart_putc_nonblocking's
@@ -12438,7 +12458,8 @@ fn timer_tick_dispatch() -> i64 {
   // Task #319 (2026-10-02): gated behind boot_debug_enabled() like
   // everything else this round -- same O(1) single-.bss-read shape
   // uart_rx_deferred_get() above already proves fits this function's
-  // own #[wcet(cycles=130000)] budget.
+  // own #[wcet(cycles=130000)] budget. Only the VISIBLE character is
+  // gated here; the ring-drain pump above runs regardless (task #323).
   if boot_debug_enabled() == 1 {
     let _ = uart_putc_nonblocking(46);
   }

@@ -12671,3 +12671,42 @@ regression), `-device usb-kbd` enumeration byte-for-byte unchanged with zero FIQ
 present (DEBUG bit off by default, as expected). Real-HW retest (reflash + reboot + direct `/dev/ttyUSB0`
 query) still pending to confirm `wifi`/`ble`/`ethernet` enumeration status now that both this fix and the
 delay() recalibration above are both in the same build.
+
+### Real root cause of the real-HW query corruption found: task #319 silently killed the TX ring's own idle-drain pump (2026-10-02)
+
+Real-HW retest (above) hit corrupted shell command dispatch -- user asked directly: "is your uart ring buffer
+inadequate for large stream data?" Investigated `boot/uart_tx_ring_state.S` on that question and found the
+real cause, NOT a sizing problem but a drain-rate regression introduced by THIS SAME SESSION's own earlier
+work: that file's own header comment (round 2026-10-01, task #306) already documents that `timer_tick_
+dispatch`'s own `.` heartbeat call was "the ONLY thing ever draining this ring when nothing else happened to
+be printing" -- there is no separate periodic/idle-time flush anywhere else in the codebase. Task #319
+("boot-debug flag: gate tick dot + DIAG prints") gated that exact call behind `boot_debug_enabled()`
+(default OFF) without noticing it was also the ring's only drain pump, not just a visible character.
+
+Consequence, exactly matching the corruption chased through this whole real-HW session: once the (64-byte)
+ring backs up even slightly -- a burst of shell-echo bytes with nothing immediately after to trigger another
+drain -- the backlog never clears until something else happens to call `uart_putc_nonblocking` again. Being a
+FIFO, that next caller's fresh bytes queue up BEHIND the stale backlog, which drains out FIRST, splicing old
+leftover bytes in front of brand-new, unrelated output -- explaining every "`dhdl query usb`" + unrelated
+mid-stream text + remaining-tail pattern seen across many independent real-HW connection attempts this
+session (confirmed NOT a chatter bug via a 20s zero-byte passive listen, and reproduced identically via two
+independent host-side implementations -- Python termios and plain shell `stty`/`cat`/`printf` -- ruling out a
+test-harness bug).
+
+**Fixed**: added `uart_tx_ring_drain_only()` (`boot/uart_tx_ring_state.S`) -- a drain-ONLY entry point (no
+push), called unconditionally from `timer_tick_dispatch` every tick regardless of `boot_debug_enabled()`,
+while the VISIBLE `.` character's own push+drain call stays exactly as gated as task #319 intended. Whether
+the dot is visible and whether the ring gets pumped are two independent concerns task #319 wrongly
+conflated by sharing one gated call site for both. Deliberately a self-contained duplicate of the ~15-line
+drain loop rather than a branch into the existing function's own `done:` label -- `asm_safety_audit.py`'s
+push/pop balance check (task #293) flagged the branch-in version as a real REVIEW finding (a push with no
+pop visible inside the same function's own body, even though runtime-correct via fall-through) -- duplicating
+keeps this new function statically auditable on its own, which this project's own tooling treats as a hard
+requirement, not a style preference.
+
+QEMU-verified: build clean with zero `asm_safety_audit.py` REVIEW/DEFINITE findings, `qemu_run.py` clean
+(same known SD-model-only FAIL lines), `-device usb-kbd` enumeration byte-for-byte unchanged (true no-op,
+as expected -- QEMU's own PL011 model never backs up the ring the way real hardware does, per this file's
+own header comment, so this fix's actual benefit is only observable on real hardware). Real-HW retest
+pending: reflash, reboot (clears any already-accumulated backlog from the bug itself), then one single clean
+query.
