@@ -12608,3 +12608,34 @@ caught by the mechanical gating script -- all run unconditionally, as they must.
 QEMU-verified: build clean, `qemu_run.py` clean. A full systematic re-audit of the entire codebase (beyond
 today's own new code) against the existing RTOS/DharaFS safety-certification baseline is a separately-
 scoped, much larger undertaking -- not attempted in this pass.
+
+### Retest #3 (ENA-poll fix + safety-audit fix flashed): root port FULLY enables for the first time -- `port_connected=yes port_enabled=yes` (2026-10-02)
+
+With retest #2's ENA-poll-loop fix and the safety-audit fault-handler fix both flashed, the root USB port now
+reports `port_connected=yes port_enabled=yes` -- the first time in this project's entire history the DWC2
+root port has ever fully enabled on real Pi 1B hardware. Direct confirmation that the delay()-recalibration
+fix (161000/80500 real-hardware-calibrated counts replacing the wrong 50000/25000 assumption) was the real
+cause of the enable failure, not a guess that happened to also be harmless.
+
+`wifi`/`ble`/`ethernet` still all report 0 (none enumerated) -- expected, since device-class detection runs
+strictly AFTER port-enable, and this was the very first time that code path became reachable at all. Working
+hypothesis: the SAME delay(50000)-means-50ms miscalibration this session already found and fixed for the
+root port also exists, unexamined until now, in every downstream enumeration function -- `dwc2_hub_bring_
+up_port` (hub port-power settle, hub port-reset settle, and its own 20-try C_PORT_RESET poll's per-iteration
+delay -- three calls), `dwc2_enumerate_downstream` (one call, after downstream SET_ADDRESS), and `dwc2_probe_
+device0` (one call, after the ROOT device's own SET_ADDRESS, the very last remaining `delay(50000)` anywhere
+in the direct enumeration chain). These were never reachable before today, so nobody could have hit this
+sooner.
+
+**Fixed**: all five of the above, same `delay(50000)`/`delay(25000)` -> `delay(161000)`/`delay(80500)`
+recalibration, no new values invented -- identical discipline to the root-port fix this same session already
+proved works on real silicon.
+
+QEMU-verified: `-device usb-kbd` enumeration unchanged -- full chain still completes (root device enumerated,
+hub port status read, downstream HID keyboard enumerated with both PASS markers, HID boot-protocol interface
+detected), `qemu_run.py` clean (PASS marker, exit 0; the pre-existing real-SD-model-only `CRYPTO:...(FAIL)`
+and `SD/MMC: CMD2...FAILED` lines are QEMU's own known emulated-SD-card limitation, unrelated to USB, already
+tracked separately -- not a new regression). True no-op for the one synthetic multi-level (hub+downstream)
+enumeration test this project has, confirming the fix only changes real-hardware timing, not logic. Still
+pending a real reflash + reboot + retest with both dongles attached to confirm `wifi`/`ble` finally enumerate
+past the now-working port-enable step.

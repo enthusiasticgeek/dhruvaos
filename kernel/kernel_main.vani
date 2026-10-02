@@ -23877,10 +23877,17 @@ fn dwc2_hub_port2() -> u32 {
 // port), -1 on a genuine hub communication failure (worth aborting
 // on, not worth trying another port for).
 fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
+  // Task #197 follow-up (real-HW USB bring-up investigation, 2026-10-
+  // 02): 161000, not 50000 -- see dwc2_core_soft_reset's own comment
+  // on delay(N)'s real, platform-dependent duration. Every delay(N)
+  // in this whole hub/device enumeration chain had the exact same
+  // miscalibration the root-port bring-up chain did (fixed first
+  // since it blocked everything downstream); fixed together here now
+  // that the root port is confirmed reachable on real hardware.
   let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port, hub_feature_port_power());
-  let _ = delay(50000);
+  let _ = delay(161000);
   let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port, hub_feature_port_reset());
-  let _ = delay(50000);
+  let _ = delay(161000);
 
   let status_buf: mut ref i64 = dhruva_alloc_bytes(4);
   let c_port_reset_bit: u32 = 0x10 as u32; // wPortChange bit4
@@ -23902,7 +23909,7 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
       let status_hi: u32 = buf_read_byte(status_buf, 1 as u32);
       port_status = status_lo | (status_hi << (8 as u32));
     } else {
-      let _ = delay(50000);
+      let _ = delay(161000);
     }
     poll_iter = poll_iter + 1;
   }
@@ -24007,7 +24014,7 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
     let _ = uart_puts("USB: downstream SET_ADDRESS failed\n");
     return 0 - 1;
   }
-  let _ = delay(50000);
+  let _ = delay(161000); // see dwc2_core_soft_reset's own comment
 
   let ddesc18: mut ref i64 = dhruva_alloc_bytes(18);
   let _ = dwc2_build_get_device_descriptor_setup(18 as u32);
@@ -24184,8 +24191,9 @@ fn dwc2_probe_device0() -> i64 {
   // ADDRESS before answering at the new address -- bounded, matching
   // this project's own established pattern for any post-hardware-
   // action settle wait (the port reset sequence earlier uses the
-  // same shape).
-  let _ = delay(50000);
+  // same shape). 161000, not 50000 -- see dwc2_core_soft_reset's own
+  // comment on delay(N)'s real, platform-dependent duration.
+  let _ = delay(161000);
 
   let desc18: mut ref i64 = dhruva_alloc_bytes(18);
   let _ = dwc2_build_get_device_descriptor_setup(18 as u32);
