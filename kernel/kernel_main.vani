@@ -2295,6 +2295,32 @@ extern "C" fn wifi_radio_get_present() -> u32;
 extern "C" fn wifi_radio_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len: i64, is_broadcast: i64, seq_num: i64) -> i64;
 extern "C" fn wifi_radio_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> i64;
 extern "C" fn wifi_radio_set_channel(devaddr: u32, mps: u32, channel: u32) -> i64;
+// BLE target device config (task #311 follow-up, "do same ble too",
+// 2026-10-01) -- boot/ble_config_state.S's own header comment has the
+// full design.
+extern "C" fn ble_config_target_name_buf_ptr() -> mut ref i64;
+extern "C" fn ble_config_target_name_len_get() -> u32;
+extern "C" fn ble_config_target_name_len_set(new_len: u32) -> u32;
+// Vendor-agnostic BLE/HCI transport interface (task #311 follow-up,
+// 2026-10-01) -- boot/ble_radio_state.S's own header comment has the
+// full design. The real connect orchestrator below calls ONLY these,
+// never dwc2_hci_*/usb_bt_* directly -- a future second BT chip
+// needing its own vendor firmware-download step needs only its own
+// adapter matching ble_radio_send_command/_poll_event's own
+// signatures, registered via the setters, and the orchestrator itself
+// never changes.
+extern "C" fn ble_radio_set_devaddr(devaddr: u32) -> i64;
+extern "C" fn ble_radio_set_mps_ctrl(mps_ctrl: u32) -> i64;
+extern "C" fn ble_radio_set_mps_intr_in(mps_intr_in: u32) -> i64;
+extern "C" fn ble_radio_set_present(present: u32) -> i64;
+extern "C" fn ble_radio_set_send_cmd_fn(send_cmd_fn: fn(u32, u32, mut ref i64, u32) -> i64) -> i64;
+extern "C" fn ble_radio_set_poll_event_fn(poll_event_fn: fn(u32, u32, mut ref i64, i64) -> i64) -> i64;
+extern "C" fn ble_radio_get_devaddr() -> u32;
+extern "C" fn ble_radio_get_mps_ctrl() -> u32;
+extern "C" fn ble_radio_get_mps_intr_in() -> u32;
+extern "C" fn ble_radio_get_present() -> u32;
+extern "C" fn ble_radio_send_command(devaddr: u32, mps: u32, cmd_buf: mut ref i64, cmd_len: u32) -> i64;
+extern "C" fn ble_radio_poll_event(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> i64;
 // Round 71: HDMI framebuffer -- generic VideoCore mailbox property-tag
 // transport (boot/fb_state.S), generalized from governor_apply_freq_
 // mhz's own already-verified protocol.
@@ -22947,6 +22973,94 @@ fn hci_le_conn_complete_peer_addr(event_buf: mut ref i64, out_addr: mut ref i64)
   return 0;
 }
 
+// Task #311 follow-up ("do same ble too", 2026-10-01): LE Advertising
+// Report (§7.7.65.2), Subevent_Code=0x02 -- the event that actually
+// lets this driver FIND a target peripheral before connecting to it,
+// genuinely missing until now despite scanning itself (hci_reset_and_
+// scan) already being wired at boot. Params = [Num_Reports (1)]
+// [Event_Type (1)][Address_Type (1)][Address (6)][Length_Data (1)]
+// [Data (Length_Data)][RSSI (1)], all offset by the 3-byte [Event_
+// Code][Param_Len][Subevent_Code] header. Deliberately handles only
+// Num_Reports=1 -- a real controller is free to pack several reports
+// into one event, but every controller this driver has any real
+// chance of meeting also happily sends one report per event when
+// scanning isn't especially congested, and this project's own
+// "smallest real increment" scoping (same reasoning wifi_scan_for_
+// ssid's own header comment gives for only scanning 3 fixed channels)
+// says don't build the multi-report-per-event unpacking loop until a
+// real capture actually needs it.
+fn hci_le_adv_report_is_valid(event_buf: mut ref i64) -> u32 {
+  if hci_event_is_le_meta(event_buf) == (0 as u32) {
+    return 0 as u32;
+  }
+  if hci_le_meta_subevent_code(event_buf) != (0x02 as u32) {
+    return 0 as u32;
+  }
+  return 1 as u32;
+}
+
+fn hci_le_adv_report_addr_type(event_buf: mut ref i64) -> u32 {
+  return buf_read_byte(event_buf, 5 as u32);
+}
+
+fn hci_le_adv_report_addr(event_buf: mut ref i64, out_addr: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    let b: u32 = buf_read_byte(event_buf, (6 + i) as u32);
+    let _ = buf_write_byte(out_addr, i as u32, b);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn hci_le_adv_report_data_len(event_buf: mut ref i64) -> u32 {
+  return buf_read_byte(event_buf, 12 as u32);
+}
+
+fn hci_le_adv_report_data_byte(event_buf: mut ref i64, idx: u32) -> u32 {
+  return buf_read_byte(event_buf, (13 as u32) + idx);
+}
+
+// Advertising Data is a sequence of [Length (1)][Type (1)][Data
+// (Length-1)] AD structures (Bluetooth Core Spec Vol 3 Part C §11) --
+// this extracts the first Complete (0x09) or Shortened (0x08) Local
+// Name found, the practical BLE analogue of WiFi's human-readable
+// SSID (see boot/ble_config_state.S's own header comment for why
+// matching by name rather than a fixed address is the right default
+// here). Returns the name's length copied into `out_name` (capped at
+// 32, matching ble_config_target_name_buf's own size), or 0 if no
+// Local Name AD structure is present in this report at all -- an
+// ordinary outcome for plenty of real advertisers (a name-less
+// beacon, or one that only puts its name in a SCAN_RSP this driver
+// doesn't request), not a parse failure.
+fn hci_le_adv_report_extract_name(event_buf: mut ref i64, out_name: mut ref i64) -> i64 {
+  let data_len: i64 = hci_le_adv_report_data_len(event_buf) as i64;
+  let pos: i64 = 0;
+  while pos < data_len {
+    let ad_len: i64 = hci_le_adv_report_data_byte(event_buf, pos as u32) as i64;
+    if ad_len == 0 {
+      return 0;
+    }
+    if (pos + ad_len) > data_len {
+      return 0;
+    }
+    let ad_type: u32 = hci_le_adv_report_data_byte(event_buf, (pos + 1) as u32);
+    if (ad_type == (0x09 as u32)) || (ad_type == (0x08 as u32)) {
+      let name_len: i64 = ad_len - 1;
+      let cap: i64 = if name_len > 32 { 32 } else { name_len };
+      let ni: i64 = 0;
+      while ni < cap {
+        let b: u32 = hci_le_adv_report_data_byte(event_buf, (pos + 2 + ni) as u32);
+        let _ = buf_write_byte(out_name, ni as u32, b);
+        ni = ni + 1;
+      }
+      return cap;
+    }
+    pos = pos + ad_len + 1;
+  }
+  return 0;
+}
+
 // Round 57: sends one HCI command and polls the interrupt endpoint
 // (bounded, not `while true`, matching this project's own established
 // hardware-poll discipline) for its Command Complete event, matching it
@@ -22984,13 +23098,20 @@ fn hci_send_command_and_wait_complete(devaddr: u32, mps: u32, intr_mps: u32, cmd
 // Round 57: HCI transport bring-up milestone -- HCI_Reset, then LE_Set_
 // Scan_Parameters, then LE_Set_Scan_Enable, matching this project's own
 // TODO.md scoping ("HCI transport + reset/scan/connect first, a real,
-// demonstrable milestone on its own"). Scan parameters: passive
-// scanning (type=0x00, no scan request PDUs sent), interval=window=
-// 0x0010 (10ms, a conservative default well within spec range), own
-// address type=public (0x00), no filter policy (0x00) -- reasonable
-// defaults for a first working scan, not tuned for any specific use
-// case yet. Enable=1, filter_duplicates=0 (report every advertisement,
-// not just the first from each device) -- the more useful default for
+// demonstrable milestone on its own"). Scan parameters: ACTIVE
+// scanning (type=0x01, changed from this round's original passive
+// default by task #311's follow-up, "do same ble too" -- a real
+// peripheral commonly puts its Local Name AD structure in the SCAN_
+// RSP rather than the primary ADV_IND to keep the advertisement
+// itself small, confirmed against the Bluetooth Core Spec's own
+// Advertising/Scanning Filter Policy section; passive scanning never
+// solicits that response at all, which would make ble_real_connect's
+// own name-matching scan silently blind to exactly those devices),
+// interval=window= 0x0010 (10ms, a conservative default well within
+// spec range), own address type=public (0x00), no filter policy
+// (0x00) -- reasonable defaults, not tuned for any specific use case
+// yet. Enable=1, filter_duplicates=0 (report every advertisement, not
+// just the first from each device) -- the more useful default for
 // initially proving scanning works at all.
 //
 // IMPORTANT, stated plainly like lan9512_reset_and_init's own comment:
@@ -23025,7 +23146,7 @@ fn hci_reset_and_scan(devaddr: u32, mps: u32) -> i64 {
     return 0 - 1;
   }
 
-  let scan_params_len: i64 = hci_build_le_set_scan_parameters_command(cmd_buf, 0x00 as u32, 0x0010 as u32, 0x0010 as u32, 0x00 as u32, 0x00 as u32);
+  let scan_params_len: i64 = hci_build_le_set_scan_parameters_command(cmd_buf, 0x01 as u32, 0x0010 as u32, 0x0010 as u32, 0x00 as u32, 0x00 as u32);
   let scan_params_opcode: u32 = hci_build_opcode(0x08 as u32, 0x000B as u32);
   let scan_params_status: u32 = hci_send_command_and_wait_complete(devaddr, mps, intr_mps, cmd_buf, scan_params_len as u32, scan_params_opcode);
   let _ = uart_puts("USB: LE_Set_Scan_Parameters status=");
@@ -24837,6 +24958,28 @@ fn wifi_config_init() -> i64 {
       i = i + 1;
     }
     let _ = wifi_config_password_len_set(pwd_cap as u32);
+  }
+  return 0;
+}
+
+// BLE target device name config (task #311 follow-up, "do same ble
+// too", 2026-10-01) -- same dharafs_read()-then-parse shape as
+// wifi_config_init above, just a single field (see boot/ble_config_
+// state.S's own header comment for why BLE has no password-equivalent
+// second field here).
+fn ble_config_init() -> i64 {
+  let name_heap: mut ref i64 = dhruva_alloc_bytes(32);
+  let name_read_len: i64 = dharafs_read("/config/ble_target_name", name_heap);
+  if name_read_len > 0 {
+    let name_cap: i64 = if name_read_len > 32 { 32 } else { name_read_len };
+    let name_dst: mut ref i64 = ble_config_target_name_buf_ptr();
+    let i: i64 = 0;
+    while i < name_cap {
+      let b: u32 = buf_read_byte(name_heap, i as u32);
+      let _ = buf_write_byte(name_dst, i as u32, b);
+      i = i + 1;
+    }
+    let _ = ble_config_target_name_len_set(name_cap as u32);
   }
   return 0;
 }
@@ -26980,6 +27123,26 @@ fn shell_dispatch() -> i64 {
       return 0;
     }
     let _ = uart_puts("usage: wifi join\n");
+    return 0;
+  }
+
+  // Task #311 follow-up ("do same ble too", 2026-10-01): drive a REAL
+  // BLE connection against the configured target device name -- see
+  // ble_real_connect's own header comment for the full design, the
+  // vendor-agnostic ble_radio_* layer it goes through, and why this is
+  // still untested against a real peripheral as of this commit.
+  if shell_word_matches(line_buf, 0, cmd_end, "ble") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: ble connect\n");
+      return 0;
+    }
+    let sub_start: i64 = cmd_end + 1;
+    let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+    if shell_word_matches(line_buf, sub_start, sub_end, "connect") == 1 {
+      let _ = ble_real_connect();
+      return 0;
+    }
+    let _ = uart_puts("usage: ble connect\n");
     return 0;
   }
 
@@ -33581,6 +33744,196 @@ fn wifi_real_join() -> i64 {
   return 0 - 1;
 }
 
+// Generic-HCI adapter for the vendor-agnostic BLE radio interface
+// (boot/ble_radio_state.S) -- the ONLY place in this whole connect
+// path that assumes "plain standard HCI, no vendor firmware-download
+// quirk needed first." Covers every real USB Bluetooth dongle this
+// project has any actual access to (cheap CSR8510-class adapters
+// speak HCI immediately); a future Broadcom/Intel-class chip needing
+// its own firmware patch first would get its own adapter here instead
+// (see boot/ble_radio_state.S's own header comment), and ble_real_
+// connect below would need zero changes to use it. Returns 1 if a
+// device was found and registered, 0 otherwise (no USB Bluetooth
+// device enumerated -- the expected, ordinary state on any boot with
+// no dongle attached, QEMU included, not a failure to report loudly).
+// mps_ctrl uses the fixed, spec-guaranteed-safe default of 8 (see
+// dwc2_control_in's own header comment on why every real call site in
+// this file already does this when a device's own bMaxPacketSize0
+// isn't separately persisted) -- this driver's HCI command packets
+// are always well under 32 bytes, so the handful of extra USB packets
+// a conservative mps costs is not a real concern.
+fn ble_radio_init_generic_hci() -> i64 {
+  if usb_bt_get_kind() == (0 as u32) {
+    return 0;
+  }
+  let _ = ble_radio_set_devaddr(dwc2_downstream_addr());
+  let _ = ble_radio_set_mps_ctrl(8 as u32);
+  let _ = ble_radio_set_mps_intr_in(usb_bt_get_intr_in_mps());
+  let _ = ble_radio_set_send_cmd_fn(dwc2_hci_send_command);
+  let _ = ble_radio_set_poll_event_fn(dwc2_hci_interrupt_in);
+  let _ = ble_radio_set_present(1 as u32);
+  return 1;
+}
+
+const BLE_RX_POLL_CAP: i64 = 50;
+const BLE_RX_POLL_SLEEP_TICKS: i64 = 1;
+
+// Sends one HCI command over the radio-abstracted transport and polls
+// for its matching Command Status event (NOT Command Complete --
+// LE_Create_Connection is a two-step async command, see hci_event_is_
+// command_status's own header comment), returning the status byte
+// (0=accepted, controller is now attempting the connection) or
+// 0xFFFFFFFF if nothing matching arrived within the poll bound.
+fn hci_send_command_and_wait_status_via_radio(devaddr: u32, mps: u32, intr_mps: u32, cmd_buf: mut ref i64, cmd_len: u32, expected_opcode: u32) -> u32 {
+  let send_status: i64 = ble_radio_send_command(devaddr, mps, cmd_buf, cmd_len);
+  if send_status != 0 {
+    return 0xFFFFFFFF as u32;
+  }
+  let event_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let tries: i64 = 0;
+  while tries < 20 {
+    let event_len: i64 = ble_radio_poll_event(devaddr, intr_mps, event_buf, intr_mps as i64);
+    if event_len > 0 {
+      if hci_event_is_command_status(event_buf) == (1 as u32) {
+        if hci_cmd_status_opcode(event_buf) == expected_opcode {
+          return hci_cmd_status_status(event_buf);
+        }
+      }
+    }
+    tries = tries + 1;
+  }
+  return 0xFFFFFFFF as u32;
+}
+
+// Scans incoming LE Advertising Report events (boot's own hci_reset_
+// and_scan already issued LE_Set_Scan_Enable(1) -- see that function's
+// own comment on why this driver now scans actively -- so this just
+// drains whatever the controller has already queued, or arrives while
+// polling, exactly the same "reuse boot-time chip bring-up, don't
+// redo it" relationship wifi_real_join has with rtl8188cu_enable_rf)
+// for one whose advertised Local Name matches `target_name`. On a
+// match, writes the peer's 6-byte address into addr_out[0..5] and its
+// address type into addr_out[6] (a single 7-byte out-buffer, not two
+// separate out-params -- same "avoid unnecessary multi-out-param
+// complexity" reasoning boot/wifi_radio_state.S's own header comment
+// gives for its split single-argument setters) and returns 1.
+// Returns 0 if nothing matching was heard within the poll bound -- an
+// expected, non-alarming outcome if the target is out of range,
+// asleep, or simply didn't advertise during this window, not a parse
+// or protocol failure.
+fn ble_scan_for_target(devaddr: u32, mps_intr: u32, target_name: mut ref i64, target_name_len: i64, addr_out: mut ref i64) -> i64 {
+  let event_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let name_heap: mut ref i64 = dhruva_alloc_bytes(32);
+  let poll: i64 = 0;
+  while poll < BLE_RX_POLL_CAP {
+    let event_len: i64 = ble_radio_poll_event(devaddr, mps_intr, event_buf, mps_intr as i64);
+    if event_len > 0 {
+      if hci_le_adv_report_is_valid(event_buf) == (1 as u32) {
+        let name_len: i64 = hci_le_adv_report_extract_name(event_buf, name_heap);
+        if name_len == target_name_len {
+          if sha256_bytes_equal(name_heap, target_name, target_name_len) == 1 {
+            let _ = hci_le_adv_report_addr(event_buf, addr_out);
+            let _ = buf_write_byte(addr_out, 6 as u32, hci_le_adv_report_addr_type(event_buf));
+            return 1;
+          }
+        }
+      }
+    } else {
+      let _ = task_sleep_ticks(BLE_RX_POLL_SLEEP_TICKS);
+    }
+    poll = poll + 1;
+  }
+  return 0;
+}
+
+// REAL connect over whatever BLE transport is currently registered
+// via boot/ble_radio_state.S (task #311 follow-up, "do same ble too",
+// 2026-10-01) -- the BLE counterpart to wifi_real_join above, same
+// discipline: everything below calls only ble_radio_*/hci_le_adv_
+// report_*, never dwc2_hci_*/usb_bt_* directly. UNTESTED against a
+// real peripheral as of this commit, for the exact same reason hci_
+// reset_and_scan's own header comment already gives (no QEMU USB
+// Bluetooth device model exists at all) -- build-level correctness
+// and the early "not configured"/"no device" exit paths are all
+// that's verifiable right now. Deliberately stops at a confirmed ACL
+// link (LE Connection Complete, status=0) -- GATT service discovery
+// over that link (gatt_discover_all already exists) is a natural next
+// step but a separate piece of scope, matching how wifi_real_join
+// itself stops at "TK/GTK installed" rather than exercising the
+// resulting encrypted channel.
+fn ble_real_connect() -> i64 {
+  let name_len: i64 = ble_config_target_name_len_get() as i64;
+  if name_len == 0 {
+    let _ = uart_puts("ble connect: no target device name configured (write /config/ble_target_name <name>, reboot, then retry)\n");
+    return 0 - 1;
+  }
+  if ble_radio_init_generic_hci() == 0 {
+    let _ = uart_puts("ble connect: no USB Bluetooth device enumerated\n");
+    return 0 - 1;
+  }
+
+  let devaddr: u32 = ble_radio_get_devaddr();
+  let mps_ctrl: u32 = ble_radio_get_mps_ctrl();
+  let mps_intr: u32 = ble_radio_get_mps_intr_in();
+
+  let target_name: mut ref i64 = dhruva_alloc_bytes(32);
+  let ni: i64 = 0;
+  while ni < name_len {
+    let _ = buf_write_byte(target_name, ni as u32, buf_read_byte(ble_config_target_name_buf_ptr(), ni as u32));
+    ni = ni + 1;
+  }
+
+  let _ = uart_puts("ble connect: scanning for configured target name...\n");
+  let addr_buf: mut ref i64 = dhruva_alloc_bytes(7);
+  if ble_scan_for_target(devaddr, mps_intr, target_name, name_len, addr_buf) != 1 {
+    let _ = uart_puts("ble connect: never heard an advertisement matching the configured target name\n");
+    return 0 - 1;
+  }
+  let peer_addr_type: u32 = buf_read_byte(addr_buf, 6 as u32);
+  let _ = uart_puts("ble connect: found target, requesting connection\n");
+
+  let cmd_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let create_conn_len: i64 = hci_build_le_create_connection_command(cmd_buf, 0x0010 as u32, 0x0010 as u32, 0x00 as u32, peer_addr_type, addr_buf, 0x00 as u32, 0x0018 as u32, 0x0028 as u32, 0x0000 as u32, 0x01F4 as u32);
+  let create_conn_opcode: u32 = hci_build_opcode(0x08 as u32, 0x000D as u32);
+  let create_conn_status: u32 = hci_send_command_and_wait_status_via_radio(devaddr, mps_ctrl, mps_intr, cmd_buf, create_conn_len as u32, create_conn_opcode);
+  if create_conn_status != (0 as u32) {
+    let _ = uart_puts("ble connect: LE_Create_Connection refused by the controller\n");
+    return 0 - 1;
+  }
+
+  let event_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let conn_handle: u32 = 0 as u32;
+  let done: i64 = 0;
+  let iter: i64 = 0;
+  while (done == 0) && (iter < BLE_RX_POLL_CAP) {
+    let event_len: i64 = ble_radio_poll_event(devaddr, mps_intr, event_buf, mps_intr as i64);
+    if event_len > 0 {
+      if hci_event_is_le_meta(event_buf) == (1 as u32) {
+        if hci_le_meta_subevent_code(event_buf) == (0x01 as u32) {
+          if hci_le_conn_complete_status(event_buf) != (0 as u32) {
+            let _ = uart_puts("ble connect: LE Connection Complete reported a failure status\n");
+            return 0 - 1;
+          }
+          conn_handle = hci_le_conn_complete_handle(event_buf);
+          done = 1;
+        }
+      }
+    } else {
+      let _ = task_sleep_ticks(BLE_RX_POLL_SLEEP_TICKS);
+    }
+    iter = iter + 1;
+  }
+  if done == 0 {
+    let _ = uart_puts("ble connect: connection never completed (no response from the target)\n");
+    return 0 - 1;
+  }
+
+  let _ = uart_puts("ble connect: CONNECTED (ACL link established, handle=0x");
+  let _ = uart_put_hex32(conn_handle);
+  let _ = uart_puts(")\n");
+  return 0;
+}
+
 // Round 67: ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) and HKDF
 // (RFC 5869) -- the "crypto machinery" a TLS 1.3 handshake needs on
 // top of the ECDHE (X25519) and signature (Ed25519) primitives
@@ -40178,6 +40531,7 @@ fn kernel_main() -> i64 {
   let _ = dharafs_init();
   let _ = log_level_init();
   let _ = wifi_config_init();
+  let _ = ble_config_init();
   let _ = dhdl_init();
   let _ = crashlog_boot_increment();
 

@@ -12303,3 +12303,66 @@ actual join sequence itself -- scan, auth, assoc, 4-way handshake -- is UNTESTED
 has no USB device model for this driver at all, and no dongle is currently attached. Build-level correctness
 and the two early-exit paths are all that's verifiable right now; real-HW retest (with a dongle reattached)
 is the next real milestone for task #197's own remaining scope.
+
+### Real BLE connect wired up, vendor-agnostic by design (task #311 follow-up, tasks #312-316)
+
+User, immediately after task #311 shipped: "push it. do same ble too. we will test real hardware tomorrow."
+Applied the identical pattern -- config file, vendor-agnostic radio abstraction, real connection orchestrator
+-- to BLE.
+
+**Why BLE's abstraction looks different from WiFi's**: USB Bluetooth HCI is already a *standardized*
+transport (this project's own USB enumeration already detects any compliant dongle generically, by class
+code, same shape as BOT/CDC-ECM -- not by vendor/product ID the way RTL8188CU's vendor-specific class 0xFF
+needed). So why does `boot/ble_radio_state.S` still need to exist? Because real Broadcom/Cypress/Intel USB
+Bluetooth chips require a vendor-specific firmware/patch download over this same transport *before* they
+answer HCI_Reset at all (confirmed against Linux's `btusb.c`: `btbcm_patchram_download()`/`btintel_download_
+firmware()` run transparently before the generic HCI path continues) -- "speaks standard HCI framing" and
+"needs nothing extra to start" are not the same guarantee. `boot/ble_radio_state.S` holds one active-
+transport descriptor (devaddr/mps_ctrl/mps_intr_in + 2 registered fn pointers: send_cmd/poll_event) behind
+2 pure r12-trampolines, same proven shape as `boot/wifi_radio_state.S`. `ble_radio_init_generic_hci()`
+(kernel_main.vani) is the ONLY place that knows "plain HCI, no firmware quirk" is being assumed -- it
+registers `dwc2_hci_send_command`/`dwc2_hci_interrupt_in` directly (no adapter needed, matching how `rtl8188cu_
+tx_frame` registered directly for WiFi). A future Broadcom/Intel-class chip needing its own firmware-download
+step first gets its own adapter instead, matching those 2 signatures; `ble_real_connect` never changes.
+
+**BLE's config has one field, not two**: `/config/ble_target_name` only (`boot/ble_config_state.S`) --
+matched against the *advertised Local Name* during scan, not a fixed address (a real peripheral's own
+Bluetooth address generally isn't known ahead of time the way an AP's own SSID is chosen by its owner; the
+advertised name is the practical BLE analogue of WiFi's human-readable SSID). No password-equivalent step
+exists in this driver's scope: GATT here runs unencrypted, no SMP/pairing layer exists anywhere in this
+codebase.
+
+**New HCI parsing**: LE Advertising Report (subevent 0x02) field accessors plus `hci_le_adv_report_extract_
+name`, walking the AD-structure sequence for a Complete (0x09) or Shortened (0x08) Local Name -- genuinely
+missing before this round despite LE Connection Complete's own field accessors already existing (round 66).
+Handles only Num_Reports=1 per event, same "smallest real increment" scoping `wifi_scan_for_ssid`'s own
+header comment already applies to scanning just 3 fixed channels. `hci_reset_and_scan`'s own boot-time scan
+parameters flipped from passive (0x00) to active (0x01) scanning -- a real peripheral commonly puts its Local
+Name in the SCAN_RSP rather than the primary ADV_IND to keep the advertisement small, and passive scanning
+never solicits that response at all, which would make the new name-matching scan silently blind to exactly
+those devices.
+
+**The real connect sequence**: `ble_real_connect` (kernel_main.vani) checks the configured target name,
+registers the generic HCI adapter, then `ble_scan_for_target` drains LE Advertising Report events (reusing
+whatever `hci_reset_and_scan` already started at boot -- same "don't redo chip bring-up" relationship `wifi_
+real_join` has with `rtl8188cu_enable_rf`) until one's extracted name matches, extracting the peer's address
++ address type. Builds and sends `LE_Create_Connection` (a genuine two-step async command -- Command Status
+immediately, the real outcome later as an LE Connection Complete event, same shape `hci_build_le_create_
+connection_command`'s own round-66 comment already documents), then polls for that Connection Complete,
+reporting the new ACL handle on success. New `ble connect` shell command. Deliberately stops at a confirmed
+ACL link (status=0) -- GATT service discovery over that link (`gatt_discover_all` already exists) is a
+natural next step but a separate piece of scope, matching how `wifi_real_join` itself stops at "TK/GTK
+installed" rather than exercising the resulting encrypted channel. Every failure path reports a specific,
+distinct reason (not configured / no device / target not heard / connection refused / connection never
+completed) rather than a bare error code.
+
+QEMU-verified everything reachable without real RF: build clean (asm audit 0/0), `qemu_run.py` clean (same
+baseline), and both early-exit paths confirmed live across fresh boots against a persisted SD image --
+unconfigured target name reports "no target device name configured"; configured target name + no USB device
+(QEMU's own permanent state, no Bluetooth device model exists -- `usb-bt-dongle` was deprecated/removed from
+QEMU in 2018, same limit `hci_reset_and_scan`'s own header comment already documents) reports "no USB
+Bluetooth device enumerated". **The actual connect sequence itself -- scan, LE_Create_Connection, Connection
+Complete -- is UNTESTED against a real peripheral**: QEMU has no USB device model for this driver at all, and
+no dongle is currently attached. Build-level correctness and the two early-exit paths are all that's
+verifiable right now; real-HW retest (with both the WiFi and BLE dongles reattached) is the next real
+milestone for both task #197 and this BLE work.
