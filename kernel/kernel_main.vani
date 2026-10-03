@@ -18893,6 +18893,56 @@ fn dwc2_core_soft_reset() -> i64 {
   return 0;
 }
 
+// Task #325 continued (2026-10-03, after the XACTERR-retry fix was
+// itself confirmed correct against three real references but still
+// expected to need real-HW verification): GUSBCFG bit 6 (PHYSEL, "PHY
+// Select") has never been set anywhere in this driver's history --
+// genuinely overlooked, not newly discovered: the full body of Linux's
+// `dwc2_fs_phy_init` was already read verbatim earlier this same round
+// while chasing FSLSPclkSel/FSLSSupp, and this exact step sits at the
+// TOP of that same function, immediately before the part that was
+// actually acted on. Re-examining U-Boot's own `dwc_otg_core_init`
+// confirms the identical step, word for word in its own comment:
+// "This programming sequence needs to happen in FS mode before any
+// other programming occurs" -- `setbits_le32(&regs->gusbcfg,
+// DWC2_GUSBCFG_PHYSEL)` followed immediately by a FRESH core reset,
+// before FSLSPclkSel, before GAHBCFG/DMAEN, before anything else.
+//
+// PHYSEL selects which physical transceiver interface GUSBCFG's own
+// downstream logic actually routes to -- the embedded FS/LS
+// transceiver (this bit set) vs. an external ULPI/UTMI+ PHY chip (this
+// bit clear, the reset default). BCM2835 has no external USB PHY chip
+// wired up at all -- only the embedded FS transceiver exists on this
+// silicon. Left at the reset default, every data-path register this
+// driver already programs correctly (HCDMA/HCTSIZ/HCCHAR, DMAEN,
+// FSLSPclkSel, TOUTCAL) could be routed through a transceiver path
+// that doesn't physically exist on this chip, while the separate,
+// simpler port-level CONNECT/ENABLE/SPEED detection logic (HPRT0)
+// could still partially function through shared lower-level circuitry
+// -- a mechanistically exact match for this investigation's entire
+// real-HW signature: HPRT0 has read clean (connected, enabled, full
+// speed) through every single retest so far, while every actual data
+// transaction has failed, unchanged, across five independent fixes
+// that all addressed real, confirmed, but evidently NOT sufficient
+// register-programming gaps.
+//
+// Mirrors U-Boot's own exact sequencing: set PHYSEL (only if not
+// already set, matching Linux's own `if (!(usbcfg & GUSBCFG_PHYSEL))`
+// guard -- redundant on a fresh boot, but makes this function safe to
+// call more than once without forcing an unnecessary extra reset),
+// then re-run the SAME core-soft-reset this driver already has a
+// proven, working, bounded-poll implementation of.
+fn dwc2_select_fs_phy() -> i64 {
+  let gusbcfg: i64 = dwc2_base() + 0x0C;
+  let physel_bit: u32 = (1 as u32) << (6 as u32);
+  let v: u32 = mmio_read_u32(gusbcfg);
+  if (v & physel_bit) == (0 as u32) {
+    let _ = mmio_write_u32(gusbcfg, v | physel_bit);
+    let _ = dwc2_core_soft_reset();
+  }
+  return 0;
+}
+
 // HPRT0 bit 12 (PRTPWR) -- see dwc2_init's own header comment for the
 // full real-HW finding this fixes. Preserves the w1c status group
 // (same discipline dwc2_port_reset's own header comment already
@@ -19203,6 +19253,45 @@ fn dwc2_config_fifos() -> i64 {
   return 0;
 }
 
+// Task #325 continued (2026-10-03, after MULTICNT/DMAEN/FSLSPclkSel all
+// confirmed correct yet XACTERR persisted unchanged on real-HW retest):
+// GUSBCFG bits [2:0] (TOUTCAL, "HS/FS Timeout Calibration") have never
+// been programmed anywhere in this driver's history. Found by directly
+// comparing against Linux's `dwc2_core_host_init` (hcd.c) -- the one
+// function that bundles every host-mode GAHBCFG/GUSBCFG/HCFG field this
+// project's own `dwc2_init` sequence has been working through gap by
+// gap, confirming each one already found (PCGCTL restart, FSLSPclkSel/
+// FSLSSupp) came from this exact same function and this is the one
+// remaining field it sets that this driver doesn't. Linux's own comment
+// for this field, verbatim: "The number of PHY clocks that the
+// application programs in this field is added to the high/full speed
+// interpacket timeout duration in the core to account for any
+// additional delays introduced by the PHY. This can be required,
+// because the delay introduced by the PHY in generating the linestate
+// condition can vary from one PHY to another." Set to 7 (max available
+// value) -- Linux's own choice, unconditional for every PHY type, not
+// device-specific tuning. A direct, plausible match for XACTERR
+// specifically: a real device whose own response arrives just outside
+// this core's DEFAULT (0, minimum) timeout-calibration margin would
+// XACTERR on exactly the real hardware this project has been testing
+// against, while QEMU's own simplified DWC2 model (which has never
+// cared about any of the three fields found before this one either)
+// would never need the extra margin to begin with.
+//
+// U-Boot's own driver never touches this field at all -- not evidence
+// it's unnecessary, since U-Boot's own real-device testing may simply
+// never have hit a device marginal enough to need it; Linux (the more
+// complete, more widely real-hardware-validated reference of the two)
+// sets it unconditionally for every real controller it initializes.
+fn dwc2_set_timeout_calibration() -> i64 {
+  let gusbcfg: i64 = dwc2_base() + 0x0C;
+  let toutcal_mask: u32 = (0x7 as u32) ^ (0xFFFFFFFF as u32);
+  let toutcal_max: u32 = 7 as u32;
+  let v: u32 = mmio_read_u32(gusbcfg);
+  let _ = mmio_write_u32(gusbcfg, (v & toutcal_mask) | toutcal_max);
+  return 0;
+}
+
 fn dwc2_init() -> i64 {
   let id: u32 = dwc2_read_gsnpsid();
   let _ = uart_puts("USB: GSNPSID=");
@@ -19211,6 +19300,7 @@ fn dwc2_init() -> i64 {
 
   let _ = dwc2_restart_phy_clock();
   let _ = dwc2_core_soft_reset();
+  let _ = dwc2_select_fs_phy();
   let _ = dwc2_force_host_mode();
   // Task #325: FIFO RAM partition -- must happen once we're definitely
   // in host mode (matching U-Boot's own relative ordering: core host
@@ -19222,6 +19312,7 @@ fn dwc2_init() -> i64 {
   let _ = dwc2_enable_global_intr();
   let _ = dwc2_enable_dma_mode();
   let _ = dwc2_init_fs_ls_pclk_sel();
+  let _ = dwc2_set_timeout_calibration();
   let _ = dwc2_port_power_on();
 
   let connected: i64 = dwc2_port_connected();
@@ -19389,23 +19480,77 @@ fn dwc2_build_hctsiz(pid: u32, pktcnt: u32, xfersize: u32) -> u32 {
 // driver already uses everywhere else) and the loop continues,
 // spending more of the SAME overall 1000000-iteration budget rather
 // than a fresh one -- no new unbounded wait introduced.
+// Task #325 continued (2026-10-03): XACTERR used to be immediately
+// fatal, one of the "hard error" bits this function returned on at the
+// very first sighting. Found to be wrong by comparing against THREE
+// independent real references, not just generic Linux: mainline
+// dwc2 (`dwc2_hc_xacterr_intr`, hcd_intr.c), U-Boot's own bare-metal
+// driver (silent on this specific bit, but also never hits it in its
+// own real-HW testing), and -- found via a forum/source search this
+// round specifically because this project's real board IS a Pi 1B --
+// Raspberry Pi's OWN downstream `dwc_otg` driver (drivers/usb/host/
+// dwc_otg/ in raspberrypi/linux, a genuinely different codebase from
+// mainline dwc2, built specifically for this exact BCM2835 silicon and
+// real-hardware-validated across years of production Pi 1/Zero/2/3
+// units). `dwc_otg_hcd_intr.c`'s own `handle_hc_xacterr_intr` does
+// EXACTLY what mainline dwc2 does: increments a per-transfer error
+// count, halts the channel, and lets the transfer restart from the
+// same point -- NOT an instant failure. Both references cap retries
+// at the identical threshold, confirmed by literal string match:
+// `qtd->error_count >= 3` in both hcd_intr.c (mainline) and dwc_otg_
+// hcd_intr.c (Raspberry Pi's own driver). A lone, isolated XACTERR is
+// a documented-normal, retryable real-silicon event on this exact
+// chip, not a protocol violation -- this driver was giving up after
+// the very first occurrence when the two best real references for
+// this exact hardware both tolerate two more.
+//
+// Retry mechanics: XACTERR fires before any data is acked (unlike a
+// completed-but-short transfer), so the channel hasn't made partial
+// progress -- re-arming with the SAME HCCHAR/HCTSIZ/HCDMA the caller
+// already programmed (just re-asserting CHENA, bit31, which the core
+// auto-clears when it halts the channel on this error) resumes the
+// identical transaction attempt, exactly what both real references
+// do via their own halt_channel()-then-requeue path.
 fn dwc2_wait_chan0_done() -> u32 {
   let hcint0: i64 = dwc2_hcint0_addr();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
   let hard_error_mask: u32 = (0x8 as u32) | (0x4 as u32) | (0x80 as u32) | (0x100 as u32) | (0x400 as u32); // STALL|AHBERR|XACTERR|BBLERR|DATATGLERR
+  let xacterr_bit: u32 = 0x80 as u32;
+  let chena_bit: u32 = (1 as u32) << (31 as u32);
   let transient_mask: u32 = (0x10 as u32) | (0x20 as u32); // NAK|ACK
+  let xacterr_count: i64 = 0;
   let tries: i64 = 0;
   while tries < 1000000 {
     let hi: u32 = mmio_read_u32(hcint0);
     if hi != (0 as u32) {
-      if ((hi & (1 as u32)) != (0 as u32)) || ((hi & hard_error_mask) != (0 as u32)) {
+      if (hi & (1 as u32)) != (0 as u32) {
         let _ = mmio_write_u32(hcint0, hi);
         return hi;
       }
-      if (hi & transient_mask) != (0 as u32) {
-        // Lone NAK/ACK, no real completion or error yet -- clear just
-        // these sticky status bits and keep waiting within the same
-        // overall budget, matching real DWC2 driver behavior.
-        let _ = mmio_write_u32(hcint0, hi & transient_mask);
+      if (hi & hard_error_mask) != (0 as u32) {
+        if (hi & hard_error_mask) == xacterr_bit {
+          xacterr_count = xacterr_count + 1;
+          let _ = mmio_write_u32(hcint0, hi);
+          if xacterr_count >= 3 {
+            return hi;
+          }
+          let rearm: u32 = mmio_read_u32(hcchar0) | chena_bit;
+          let _ = mmio_write_u32(hcchar0, rearm);
+        } else {
+          // STALL/AHBERR/BBLERR/DATATGLERR -- genuinely terminal
+          // (a protocol violation, not a transient bus condition),
+          // same as before: no retry for any of these.
+          let _ = mmio_write_u32(hcint0, hi);
+          return hi;
+        }
+      } else {
+        if (hi & transient_mask) != (0 as u32) {
+          // Lone NAK/ACK, no real completion or error yet -- clear
+          // just these sticky status bits and keep waiting within
+          // the same overall budget, matching real DWC2 driver
+          // behavior.
+          let _ = mmio_write_u32(hcint0, hi & transient_mask);
+        }
       }
     }
     tries = tries + 1;

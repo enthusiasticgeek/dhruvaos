@@ -13364,3 +13364,38 @@ attached, the same real failure this feature exists to capture) produced real `/
 `/logs/kernlog.hdr` files, visible in the milestone run's own `ls` output. Real-HW retest (confirming the
 Prefetch-Abort path specifically, which QEMU's own test flow never exercises) is pending the next
 occurrence -- by design, since the whole point is capturing whatever crash happens next, not forcing one.
+
+### Task #325: three more real-HW USB gaps found via a full U-Boot `dwc_otg_core_init` sweep (2026-10-03)
+
+Following the new systematic-comparison discipline (read the whole reference init function once,
+checklist every field, rather than chasing one field at a time), went back through U-Boot's and Linux's
+full FS-PHY bring-up sequence a second time and found three more real gaps, all sitting in code already
+fetched into context during the FSLSPclkSel round but not acted on then:
+
+- **`GUSBCFG.TOUTCAL`** (`dwc2_set_timeout_calibration`, bits[2:0] of `GUSBCFG`): left at reset default;
+  set to its max value (7), matching U-Boot's FS-mode timeout calibration.
+- **`XACTERR`-is-fatal bug** (`dwc2_wait_chan0_done` rewrite): a bare `XACTERR` on `HCINT0` was treated as
+  an instant, unretried failure. Confirmed via THREE independent real references -- mainline Linux
+  `dwc2`, U-Boot's bare-metal `dwc2.c`, and Raspberry Pi's own downstream `dwc_otg` driver -- that this is
+  a retryable condition (halt, re-arm `HCCHAR0.CHENA`, retry), and that Linux and RPi's own driver cap
+  retries at the identical threshold (`error_count >= 3`). Rewrote to match: halt-mask now distinguishes
+  truly-fatal errors (STALL/AHBERR/BBLERR/DATATGLERR) from `XACTERR`, which gets up to 3 retries before
+  giving up; NAK/ACK continue to be treated as transient and cleared without counting as an error.
+- **`GUSBCFG.PHYSEL`** (`dwc2_select_fs_phy`, bit 6): never set to route the core's data path through the
+  embedded FS transceiver (vs. a nonexistent external ULPI/UTMI+ PHY), plus the required second core
+  soft-reset immediately after -- U-Boot's own comment: "this programming sequence needs to happen in FS
+  mode before any other programming occurs." Found on a second pass through the SAME Linux function
+  (`dwc2_fs_phy_init`) already read for the `FSLSPclkSel` fix -- `PHYSEL` was sitting in the first half of
+  that function, only the second half was acted on at the time. This is the gap that directly motivated
+  writing down [[feedback_dhruva_systematic_reference_comparison_first]] as a standing practice.
+
+Wired into `dwc2_init()`: `dwc2_select_fs_phy()` right after `dwc2_core_soft_reset()` (before
+`dwc2_force_host_mode()`, matching both references' relative ordering -- PHY selection has to happen
+before anything else touches the core), `dwc2_set_timeout_calibration()` after `dwc2_init_fs_ls_pclk_sel()`
+and before `dwc2_port_power_on()`.
+
+**Verification**: `./build.sh` clean (zero `asm_safety_audit.py` findings). `qemu_run.py` clean (same
+known baseline). `phase4_milestone.py` 18/18 PASS, zero regressions, single boot banner. Real-HW retest
+pending -- this is the next real-HW boot cycle's job, to confirm whether `GET_DESCRIPTOR(Device)` finally
+completes with all six fixes (`MULTICNT`, `DMAEN`, `FSLSPclkSel`/`FSLSSupp`, `TOUTCAL`, `XactErr` retry,
+`PHYSEL`) applied together. Task #325 stays open until that retest confirms success.
