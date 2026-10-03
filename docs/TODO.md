@@ -12795,3 +12795,37 @@ QEMU-verified: build clean with zero `asm_safety_audit.py` findings, `qemu_run.p
 full enumeration chain (root device + hub + downstream HID keyboard, both PASS markers) byte-for-byte
 unchanged -- true no-op, as expected, since QEMU's own UART/USB models don't exercise real device-firmware
 reinitialization timing either way. Real-HW retest pending.
+
+### Task #325 continued: shared control-transfer wait primitive treated a lone NAK as fatal (2026-10-02)
+
+Continuing the systematic pass, found a second, more far-reaching gap in the SAME function family: `dwc2_
+wait_chan0_done()` -- the ONE shared poll loop every control transfer in the enumeration path goes through
+(GET_DESCRIPTOR, SET_ADDRESS, SET_CONFIGURATION) -- returned the INSTANT `HCINT` became nonzero for ANY
+reason, including a lone NAK (bit4) or ACK (bit5) alone, with neither XFERCOMPL nor any real hard-error bit
+set. A NAK is a normal, expected, transient "not ready yet" response (exactly what a dongle's own onboard
+firmware would send while still finishing its post-reset reinitialization, right where the new TRSTRCY delay
+above ends) -- not a failure.
+
+This exact bug CLASS was already found and fixed in this driver once before, for bulk transfers specifically
+(`dwc2_net_bulk_in`, round 182/task #182) -- but that fix addressed the SOFTWARE re-arm side (forcing CHDIS
+before re-polling), never this shared wait primitive's own premature-exit-on-NAK behavior, which every
+CONTROL transfer still had untouched.
+
+Confirmed against Linux's own `drivers/usb/dwc2/hw.h` bit layout (STALL=bit3, NAK=bit4, ACK=bit5,
+XACTERR=bit7, BBLERR=bit8, DATATGLERR=bit10) and `hcd_intr.c`'s own NAK handling -- real DWC2 drivers never
+treat a lone NAK as fatal.
+
+**Fixed**: `dwc2_wait_chan0_done()` now only ends the wait on XFERCOMPL or a genuine hard-error bit (STALL/
+AHBERR/XACTERR/BBLERR/DATATGLERR); a lone NAK/ACK is acknowledged (write-1-to-clear, the same sticky-bit
+pattern already used throughout this driver) and the loop keeps waiting within the SAME overall 1,000,000-
+iteration budget -- no new unbounded wait introduced. Deliberately did NOT touch `dwc2_wait_chan0_done_
+bounded` (the separate, shorter-budget sibling `dwc2_net_bulk_in` uses) -- that caller's own design
+intentionally wants a lone NAK to mean "nothing ready, fail fast, let the caller poll again next tick" for
+speculative network RX, a genuinely different contract than a control transfer that MUST complete.
+
+QEMU-verified: build clean with zero `asm_safety_audit.py` findings, `qemu_run.py` clean. Specifically re-ran
+BOTH real enumeration paths this project has under QEMU to confirm zero regression in the two already-working
+device classes that exercise this exact shared primitive: `-device usb-kbd` (full root+hub+HID chain,
+unchanged) AND `-device usb-storage` (full BOT/SCSI chain -- TEST UNIT READY including its own first-attempt
+CHECK CONDITION retry, INQUIRY, READ CAPACITY, WRITE(10)/READ(10) round trip, FS-abstraction check -- all
+still PASS, byte-for-byte unchanged). True no-op for both. Real-HW retest pending.

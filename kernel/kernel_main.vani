@@ -18272,14 +18272,54 @@ fn dwc2_build_hctsiz(pid: u32, pktcnt: u32, xfersize: u32) -> u32 {
 // exactly 0 to distinguish a timeout from a real, if unsuccessful,
 // transfer outcome), and always clears whatever HCINT bits it saw
 // (write-1-to-clear) before returning.
+// Task #325 (2026-10-02, systematic pass vs Linux/U-Boot before a
+// real-HW USB enumeration retest, per user request): this loop used to
+// return the INSTANT HCINT became nonzero for ANY reason -- including
+// a lone NAK (bit4) or ACK (bit5) alone, with neither XFERCOMPL (bit0)
+// nor any real hard-error bit set. NAK is a normal, EXPECTED,
+// transient response (a device -- especially a dongle with its own
+// onboard firmware still finishing its post-reset reinitialization,
+// right where this driver's own newly-added TRSTRCY delay ends --
+// legitimately NAKs while it isn't ready yet), not a failure. This
+// exact bug class was ALREADY found and fixed in this driver once
+// before, for bulk transfers specifically (dwc2_net_bulk_in's own
+// header comment, round 182/task #182) -- but that fix addressed the
+// SOFTWARE re-arm side (CHDIS before re-polling), not this shared
+// wait primitive's own premature-exit-on-NAK behavior, which every
+// control transfer (the entire enumeration path: GET_DESCRIPTOR,
+// SET_ADDRESS, SET_CONFIGURATION) still had.
+//
+// Confirmed against Linux's own `drivers/usb/dwc2/hw.h` bit layout
+// (STALL=bit3, NAK=bit4, ACK=bit5, XACTERR=bit7, BBLERR=bit8,
+// DATATGLERR=bit10) and its own `hcd_intr.c` `handle_hc_nak_intr` --
+// real DWC2 drivers never treat a lone NAK as fatal; a NAK-only or
+// ACK-only HCINT means the hardware is still mid-transaction (CHHLTD,
+// bit1, typically stays unset), not done and not failed, and software
+// should clear just that status bit and keep waiting for the real
+// outcome. Only XFERCOMPL or a genuine hard-error bit (STALL/AHBERR/
+// XACTERR/BBLERR/DATATGLERR) ends the wait now; NAK/ACK alone are
+// acknowledged (write-1-to-clear, the same sticky-bit pattern this
+// driver already uses everywhere else) and the loop continues,
+// spending more of the SAME overall 1000000-iteration budget rather
+// than a fresh one -- no new unbounded wait introduced.
 fn dwc2_wait_chan0_done() -> u32 {
   let hcint0: i64 = dwc2_hcint0_addr();
+  let hard_error_mask: u32 = (0x8 as u32) | (0x4 as u32) | (0x80 as u32) | (0x100 as u32) | (0x400 as u32); // STALL|AHBERR|XACTERR|BBLERR|DATATGLERR
+  let transient_mask: u32 = (0x10 as u32) | (0x20 as u32); // NAK|ACK
   let tries: i64 = 0;
   while tries < 1000000 {
     let hi: u32 = mmio_read_u32(hcint0);
     if hi != (0 as u32) {
-      let _ = mmio_write_u32(hcint0, hi);
-      return hi;
+      if ((hi & (1 as u32)) != (0 as u32)) || ((hi & hard_error_mask) != (0 as u32)) {
+        let _ = mmio_write_u32(hcint0, hi);
+        return hi;
+      }
+      if (hi & transient_mask) != (0 as u32) {
+        // Lone NAK/ACK, no real completion or error yet -- clear just
+        // these sticky status bits and keep waiting within the same
+        // overall budget, matching real DWC2 driver behavior.
+        let _ = mmio_write_u32(hcint0, hi & transient_mask);
+      }
     }
     tries = tries + 1;
   }
