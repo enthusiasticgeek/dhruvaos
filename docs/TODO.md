@@ -12844,3 +12844,21 @@ QEMU-verified: build clean, `qemu_run.py` clean, live self-ping (`ping 0.0.0.0`,
 project's own netif can resolve under QEMU's loopback-only model) still gets a correct reply -- both the
 ARP-resolve path (trivial for `my_ip`) and the ICMP-reply-poll path this fix touches are confirmed still
 functioning. True no-op, unrelated to and bundled alongside the USB fixes above for the same flash cycle.
+
+### Real-HW retest: TRSTRCY + NAK-tolerant fixes both confirmed flashed and active, `GET_DESCRIPTOR(Device)` STILL fails at the exact same point (2026-10-02)
+
+Reflashed with all three fixes above (delay() sweep, TRSTRCY, NAK-tolerant wait). `dhdl query usb/wifi/ble/
+ethernet` all still returned clean, fast, correct responses (confirms the UART/shell fixes hold). Enabled
+DEBUG logging (`dhdl set loglevel 16`) + `reboot` to capture the real boot-time self-test log -- confirms
+`port_connected=yes port_enabled=yes` still holds on a fresh boot, but `USB: GET_DESCRIPTOR(Device) transfer
+failed` persists at the EXACT same point as before either fix, with zero change in symptom.
+
+Rather than guess a fourth hypothesis blind, added real instrumentation to `dwc2_control_in`'s three failure
+points (SETUP/DATA/STATUS stage): each now prints the raw `HCINT` value it actually saw (0 means the full
+1,000,000-iteration budget elapsed with NO interrupt at all -- true silence -- vs a genuine hard-error bit)
+and `HPRT0`'s own live state at that exact moment (did the port actually stay connected/enabled THROUGH the
+transfer, or silently drop mid-transaction -- never previously checked). QEMU-verified as a true no-op
+(build clean, zero `asm_safety_audit.py` findings, `qemu_run.py` clean, `-device usb-kbd` full enumeration
+chain unchanged -- QEMU's own successful paths never hit these new print statements at all). Real-HW retest
+pending: this should finally show WHICH stage is failing and with what real hardware state, instead of
+continuing to guess.

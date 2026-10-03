@@ -18460,6 +18460,23 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let setup_result: u32 = dwc2_wait_chan0_done();
   if (setup_result & (1 as u32)) == (0 as u32) {
+    // Task #325 real-HW diagnostic (2026-10-02): both TRSTRCY and the
+    // NAK-tolerant wait fix are confirmed flashed and active, yet
+    // GET_DESCRIPTOR(Device) still fails at the exact same point --
+    // this project's own established discipline (every prior round
+    // this session) is to add real visibility before guessing a FOURTH
+    // hypothesis blind. Prints the raw HCINT value (0 means the full
+    // 1,000,000-iteration budget elapsed with NO interrupt at all --
+    // true silence, not a hard error bit -- vs a genuine STALL/
+    // XACTERR/etc value) and HPRT0's own live state (did the port
+    // actually stay connected/enabled THROUGH this exact transfer, or
+    // drop mid-transaction -- a real possibility this driver has never
+    // checked for).
+    let _ = uart_puts("USB DIAG: SETUP stage failed, raw HCINT=0x");
+    let _ = uart_put_hex32(setup_result);
+    let _ = uart_puts(" HPRT0=0x");
+    let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
+    let _ = uart_puts("\n");
     return 0 - 1; // XFERCOMPL (bit0) never set -- timeout or error
   }
 
@@ -18494,6 +18511,13 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
   let data_result: u32 = dwc2_wait_chan0_done();
   if (data_result & (1 as u32)) == (0 as u32) {
+    // Task #325 real-HW diagnostic -- see the SETUP-stage failure's
+    // own comment above for the full reasoning.
+    let _ = uart_puts("USB DIAG: DATA stage failed, raw HCINT=0x");
+    let _ = uart_put_hex32(data_result);
+    let _ = uart_puts(" HPRT0=0x");
+    let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
+    let _ = uart_puts("\n");
     return 0 - 1;
   }
   let i: i64 = 0;
@@ -18513,6 +18537,13 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let status_result: u32 = dwc2_wait_chan0_done();
   if (status_result & (1 as u32)) == (0 as u32) {
+    // Task #325 real-HW diagnostic -- see the SETUP-stage failure's
+    // own comment above for the full reasoning.
+    let _ = uart_puts("USB DIAG: STATUS stage failed, raw HCINT=0x");
+    let _ = uart_put_hex32(status_result);
+    let _ = uart_puts(" HPRT0=0x");
+    let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
+    let _ = uart_puts("\n");
     return 0 - 1;
   }
   return 0;
