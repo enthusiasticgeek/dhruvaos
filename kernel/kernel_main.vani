@@ -1834,6 +1834,22 @@ extern "C" fn tcp_unmatched_rst_peer_mac_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn tcp_unmatched_rst_peer_mac_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
+extern "C" fn dns_query_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dns_query_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dns_resp_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dns_resp_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dns_server_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dns_server_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn shell_hostname_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn shell_hostname_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_payload_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dhcp_payload_scratch_get() -> mut ref i64;
@@ -2497,6 +2513,10 @@ extern "C" fn dhcp_state_set_server_ip(value: u32) -> u32;
 extern "C" fn dhcp_state_get_leased_ip() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_leased_ip(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dhcp_state_get_dns_server() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dhcp_state_set_dns_server(value: u32) -> u32;
 // Round 22 (2026-08-28): lease-renewal timer state, same file, same
 // vani-call-boundary reasoning.
 #[stack_cost(bytes=1)]
@@ -16973,6 +16993,17 @@ fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
     let _ = dhcp_state_set_lease_time(lease_time);
     let _ = dhcp_state_set_lease_start_tick(scheduler_get_tick_count());
 
+    // DNS client support: learn a DNS server from option 6 (Domain
+    // Name Server), same "0 means never learned one" convention as
+    // lease_time above -- a server that doesn't send option 6 just
+    // leaves nslookup/ping-by-hostname without a default, same
+    // honest-gap posture as every other optional DHCP option this
+    // client doesn't insist on.
+    let dns_server: u32 = dhcp_find_option_u32(frame, dhcp_offset, dhcp_len, 6 as u32);
+    if dns_server != (0 as u32) {
+      let _ = dhcp_state_set_dns_server(dns_server);
+    }
+
     // Round 22: learn the server's MAC for free from this ACK's own
     // Ethernet source address -- exactly what a real minimal
     // implementation needs to send a later unicast renewal REQUEST
@@ -17023,6 +17054,203 @@ fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
     return 1;
   }
 
+  return 0;
+}
+
+// DNS client: a single A-record query/response round trip (RFC 1035),
+// scoped like u-boot's own bare-metal net/dns.c (the closest real
+// reference for this project's own from-scratch style -- Linux has no
+// in-kernel client to compare against, resolution is userspace there).
+// Mirrors `ping`'s own resolve-then-send-then-poll shape (unicast to a
+// known server, not DHCP's broadcast shape): ARP-resolve the DNS
+// server, send one query, bounded-poll for one matching reply. See
+// vani-netstack's own netstack_dns_build_query/netstack_dns_parse_
+// response for the actual wire-format codec and their shared header
+// comment for the full scope rationale (no CNAME-chain following, no
+// EDNS0, no TC-bit/retry-over-TCP, answer-section compression pointers
+// skipped structurally and never dereferenced).
+fn dns_client_port() -> u32 { return 50053 as u32; }
+fn dns_server_port() -> u32 { return 53 as u32; }
+
+fn dns_resolve_start(my_mac: mut ref i64, my_ip: u32, dns_server_ip: u32, hostname: mut ref i64, hostname_len: i64, xid: u32) -> i64 {
+  let dst_mac: mut ref i64 = dns_server_mac_scratch_get();
+  if arp_cache_lookup(dns_server_ip, dst_mac) != 1 {
+    return 0 - 1;
+  }
+  let hostname_arr: [u8; 64] = [0 as u8; 64];
+  let hi: i64 = 0;
+  while hi < hostname_len {
+    hostname_arr[hi] = buf_read_byte(hostname, hi as u32) as u8;
+    hi = hi + 1;
+  }
+  let query: mut ref i64 = dns_query_scratch_get();
+  let local: [u8; 512] = netstack_zero_frame();
+  let query_len: i64 = netstack_dns_build_query(mut ref local, 0, xid, ref hostname_arr, hostname_len);
+  let qi: i64 = 0;
+  while qi < query_len {
+    let _ = buf_write_byte(query, qi as u32, local[qi] as u32);
+    qi = qi + 1;
+  }
+  return udp_send(my_mac, dst_mac, my_ip, dns_server_ip, dns_client_port(), dns_server_port(), query, query_len);
+}
+
+// Dequeues the next queued frame and, if it's a UDP datagram addressed
+// to dns_client_port(), parses it as a DNS response. Same shared-queue
+// "drop if not mine" tolerance arp_resolve_poll/dhcp_client_poll both
+// already document and accept -- this project's netif has one shared
+// FIFO with no selective peek (see arp_resolve_poll's own comment for
+// the full reasoning).
+fn dns_resolve_poll(expect_xid: u32, out_ip: mut ref i64) -> i64 {
+  let frame: mut ref i64 = dns_resp_scratch_get();
+  let frame_len: i64 = netif_recv_frame(frame, netif_frame_slot_size());
+  if frame_len < 0 {
+    return 0;
+  }
+  if buf_read_u16_be(frame, 12) != (0x0800 as u32) {
+    return 0;
+  }
+  if ipv4_get_protocol(frame, 14) != (17 as u32) {
+    return 0;
+  }
+  if udp_get_dst_port(frame, 34) != dns_client_port() {
+    return 0;
+  }
+  let udp_len: u32 = udp_get_length(frame, 34);
+  let dns_len: i64 = (udp_len as i64) - 8;
+  if dns_len < 12 {
+    return 0;
+  }
+  if (42 + dns_len) > frame_len {
+    return 0;
+  }
+  let local: [u8; 512] = netstack_zero_frame();
+  let li: i64 = 0;
+  while li < dns_len {
+    local[li] = buf_read_byte(frame, (42 + li) as u32) as u8;
+    li = li + 1;
+  }
+  let result: DnsResolveResult = netstack_dns_parse_response(ref local, 0, dns_len, expect_xid);
+  if result.ok != 1 {
+    return 0;
+  }
+  let _ = buf_write_u32_be(out_ip, 0, result.resolved_ip);
+  return 1;
+}
+
+// Shared resolve helper used by both `nslookup` and `ping`'s own
+// hostname fallback: ARP-resolve-the-server + a bounded 20-iteration x
+// delay(161000) poll loop, the exact same constant already calibrated
+// for real-HW timing in ping's own resolve loop. Returns the resolved
+// IP, or 0 on failure (0.0.0.0 is never a valid DNS answer, so this
+// doubles as a clean failure sentinel without a separate out-param).
+fn dns_resolve(my_mac: mut ref i64, my_ip: u32, dns_server_ip: u32, hostname: mut ref i64, hostname_len: i64) -> u32 {
+  if dns_server_ip == (0 as u32) {
+    return 0 as u32;
+  }
+  let xid: u32 = scheduler_get_tick_count();
+  let start_status: i64 = dns_resolve_start(my_mac, my_ip, dns_server_ip, hostname, hostname_len, xid);
+  if start_status != 0 {
+    return 0 as u32;
+  }
+  let resolved_scratch: mut ref i64 = dhruva_alloc_bytes(4);
+  let iter: i64 = 0;
+  let resolved: i64 = 0;
+  while (iter < 20) && (resolved == 0) {
+    if dns_resolve_poll(xid, resolved_scratch) == 1 {
+      resolved = 1;
+    } else {
+      let _ = delay(161000);
+    }
+    iter = iter + 1;
+  }
+  if resolved == 0 {
+    return 0 as u32;
+  }
+  return buf_read_u32_be(resolved_scratch, 0);
+}
+
+// Boot-time self-test: drains the request queue arp_resolve_start/dns_
+// resolve_start might leave queued (same reasoning arp_resolve_self_
+// test's own header comment already establishes), proves dns_resolve_
+// start/poll's synchronous round trip over the real netif with a
+// manually-queued synthetic reply, plus the "nothing arrived yet" and
+// "wrong xid" cases.
+fn dns_resolve_self_test() -> i64 {
+  let ok: i64 = 1;
+  let my_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(my_mac);
+  let my_ip: u32 = 0xC0A80101 as u32; // 192.168.1.1
+  let dns_server_ip: u32 = 0xC0A80102 as u32; // 192.168.1.2, not touched by any earlier self-test
+  let _ = arp_cache_insert(dns_server_ip, my_mac); // stand in as our own "DNS server"
+
+  let hostname: mut ref i64 = dhruva_alloc_bytes(16);
+  let hn: [u8; 11] = [101 as u8, 120 as u8, 97 as u8, 109 as u8, 112 as u8, 108 as u8, 101 as u8, 46 as u8, 99 as u8, 111 as u8, 109 as u8]; // "example.com"
+  let hi: i64 = 0;
+  while hi < 11 {
+    let _ = buf_write_byte(hostname, hi as u32, hn[hi] as u32);
+    hi = hi + 1;
+  }
+
+  let xid: u32 = 0x4242 as u32;
+  let start_status: i64 = dns_resolve_start(my_mac, my_ip, dns_server_ip, hostname, 11, xid);
+  if start_status != 0 { ok = 0; }
+
+  // Drain our own query off the loopback queue (same real netif the
+  // query above was sent through), then hand-build a synthetic reply
+  // exactly as a real server would and queue it the same way.
+  let drained: mut ref i64 = dhruva_alloc_bytes(netif_frame_slot_size());
+  let drained_len: i64 = netif_recv_frame(drained, netif_frame_slot_size());
+  if drained_len <= 0 { ok = 0; }
+
+  let resolved_ip: u32 = 0xC0A80164 as u32; // 192.168.1.100
+  let dns_payload: [u8; 512] = netstack_zero_frame();
+  let dns_payload_len: i64 = 12 + 17 + 16; // header + "example.com" question (13-byte QNAME + 2-byte QTYPE + 2-byte QCLASS) + one A answer
+  let _ = netstack_write_u16_be(mut ref dns_payload, 0, xid);
+  let _ = netstack_write_u16_be(mut ref dns_payload, 2, 0x8180 as u32);
+  let _ = netstack_write_u16_be(mut ref dns_payload, 4, 1 as u32);
+  let _ = netstack_write_u16_be(mut ref dns_payload, 6, 1 as u32);
+  dns_payload[12] = 7 as u8;
+  let ei: i64 = 0;
+  while ei < 7 {
+    dns_payload[13 + ei] = hn[ei];
+    ei = ei + 1;
+  }
+  dns_payload[20] = 3 as u8;
+  dns_payload[21] = 99 as u8; dns_payload[22] = 111 as u8; dns_payload[23] = 109 as u8;
+  dns_payload[24] = 0 as u8;
+  let _ = netstack_write_u16_be(mut ref dns_payload, 25, 1 as u32);
+  let _ = netstack_write_u16_be(mut ref dns_payload, 27, 1 as u32);
+  dns_payload[29] = 0xC0 as u8;
+  dns_payload[30] = 12 as u8;
+  let _ = netstack_write_u16_be(mut ref dns_payload, 31, 1 as u32);
+  let _ = netstack_write_u16_be(mut ref dns_payload, 33, 1 as u32);
+  let _ = netstack_write_u32_be(mut ref dns_payload, 35, 300 as u32);
+  let _ = netstack_write_u16_be(mut ref dns_payload, 39, 4 as u32);
+  let _ = netstack_write_u32_be(mut ref dns_payload, 41, resolved_ip);
+
+  let reply_payload: mut ref i64 = dhruva_alloc_bytes(512);
+  let pi: i64 = 0;
+  while pi < dns_payload_len {
+    let _ = buf_write_byte(reply_payload, pi as u32, dns_payload[pi] as u32);
+    pi = pi + 1;
+  }
+  let _ = udp_send(my_mac, my_mac, dns_server_ip, my_ip, dns_server_port(), dns_client_port(), reply_payload, dns_payload_len);
+
+  let out_ip: mut ref i64 = dhruva_alloc_bytes(4);
+  let poll_result: i64 = dns_resolve_poll(xid, out_ip);
+  if poll_result != 1 { ok = 0; }
+  if buf_read_u32_be(out_ip, 0) != resolved_ip { ok = 0; }
+
+  // Nothing queued -- must report "not resolved," not a false positive.
+  let none_yet: i64 = dns_resolve_poll(xid, out_ip);
+  if none_yet != 0 { ok = 0; }
+
+  let _ = uart_puts("DNS: dns_resolve_start/poll live round trip");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
   return 0;
 }
 
@@ -28900,14 +29128,28 @@ fn shell_dispatch() -> i64 {
       return 0;
     }
     let dst_ip_parsed: i64 = ip_parse_dotted_quad(line_buf, ip_start, ip_end);
-    if dst_ip_parsed < 0 {
-      let _ = uart_puts("ping: invalid IP address\n");
-      return 0;
-    }
-    let dst_ip: u32 = dst_ip_parsed as u32;
     let my_mac: mut ref i64 = shell_my_mac_scratch_get();
     let _ = netif_get_mac(my_mac);
     let my_ip: u32 = dhcp_state_get_leased_ip();
+    let dst_ip: u32 = 0 as u32;
+    if dst_ip_parsed < 0 {
+      // Not a dotted-quad -- try it as a hostname via DNS before
+      // giving up, same fallback U-Boot/every real OS's own ping
+      // offers. Uses the DHCP-learned DNS server (option 6); if none
+      // was ever learned, dns_resolve itself reports failure cleanly
+      // rather than guessing at a server.
+      let hostname_buf: mut ref i64 = shell_hostname_scratch_get();
+      let _ = shell_copy_range(line_buf, ip_start, ip_end, hostname_buf);
+      let dns_server_ip: u32 = dhcp_state_get_dns_server();
+      let resolved_ip: u32 = dns_resolve(my_mac, my_ip, dns_server_ip, hostname_buf, ip_len);
+      if resolved_ip == (0 as u32) {
+        let _ = uart_puts("ping: invalid IP address or could not resolve hostname\n");
+        return 0;
+      }
+      dst_ip = resolved_ip;
+    } else {
+      dst_ip = dst_ip_parsed as u32;
+    }
 
     let dst_mac: mut ref i64 = shell_ping_dst_mac_scratch_get();
     let resolved: i64 = 0;
@@ -29030,6 +29272,59 @@ fn shell_dispatch() -> i64 {
     } else {
       let _ = uart_puts("ping: no reply\n");
     }
+    return 0;
+  }
+
+  // DNS client: resolves a hostname to an IPv4 address via a single
+  // A-record query/response (see dns_resolve's own header comment for
+  // the full scope). `server_ip` is optional -- defaults to whatever
+  // DHCP learned via option 6, same fallback ping's own hostname path
+  // uses.
+  if shell_word_matches(line_buf, 0, cmd_end, "nslookup") == 1 {
+    if cmd_end >= line_len {
+      let _ = uart_puts("usage: nslookup <hostname> [server_ip]\n");
+      return 0;
+    }
+    let host_start: i64 = cmd_end + 1;
+    let host_end: i64 = shell_find_space(line_buf, host_start, line_len);
+    let host_len: i64 = host_end - host_start;
+    if host_len == 0 {
+      let _ = uart_puts("usage: nslookup <hostname> [server_ip]\n");
+      return 0;
+    }
+    if host_len > (64 as i64) {
+      let _ = uart_puts("nslookup: hostname too long (max 64)\n");
+      return 0;
+    }
+    let dns_server_ip: u32 = 0 as u32;
+    if host_end < line_len {
+      let srv_start: i64 = host_end + 1;
+      let srv_end: i64 = shell_find_space(line_buf, srv_start, line_len);
+      if srv_end > srv_start {
+        let srv_parsed: i64 = ip_parse_dotted_quad(line_buf, srv_start, srv_end);
+        if srv_parsed < 0 {
+          let _ = uart_puts("nslookup: invalid server IP address\n");
+          return 0;
+        }
+        dns_server_ip = srv_parsed as u32;
+      }
+    }
+    if dns_server_ip == (0 as u32) {
+      dns_server_ip = dhcp_state_get_dns_server();
+    }
+    let hostname_buf: mut ref i64 = shell_hostname_scratch_get();
+    let _ = shell_copy_range(line_buf, host_start, host_end, hostname_buf);
+    let my_mac: mut ref i64 = shell_my_mac_scratch_get();
+    let _ = netif_get_mac(my_mac);
+    let my_ip: u32 = dhcp_state_get_leased_ip();
+    let resolved_ip: u32 = dns_resolve(my_mac, my_ip, dns_server_ip, hostname_buf, host_len);
+    if resolved_ip == (0 as u32) {
+      let _ = uart_puts("nslookup: could not resolve\n");
+      return 0;
+    }
+    let _ = uart_puts("nslookup: ");
+    let _ = uart_put_ip(resolved_ip);
+    let _ = uart_puts("\n");
     return 0;
   }
 
@@ -41447,6 +41742,10 @@ fn kernel_main() -> i64 {
   let _ = netif_arp_autoanswer_my_mac_scratch_set(dhruva_alloc_bytes(6));
   let _ = netif_arp_autoanswer_reply_scratch_set(dhruva_alloc_bytes(64));
   let _ = tcp_unmatched_rst_peer_mac_scratch_set(dhruva_alloc_bytes(6));
+  let _ = dns_query_scratch_set(dhruva_alloc_bytes(64));
+  let _ = dns_resp_scratch_set(dhruva_alloc_bytes(512));
+  let _ = dns_server_mac_scratch_set(dhruva_alloc_bytes(6));
+  let _ = shell_hostname_scratch_set(dhruva_alloc_bytes(64));
   let _ = dhcp_payload_scratch_set(dhruva_alloc_bytes(300));
   let _ = dhcp_frame_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
   let _ = dhcp_bcast_mac_scratch_set(dhruva_alloc_bytes(8));
@@ -41781,6 +42080,7 @@ fn kernel_main() -> i64 {
   if boot_debug_enabled() == 1 { let _ = dhcp_renewal_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dhcp_nak_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dhcp_server_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dns_resolve_self_test(); }
   if boot_debug_enabled() == 1 { let _ = netif_queue_contention_self_test(); }
 
   // Round 41: crypto primitives foundation, hash-function half.

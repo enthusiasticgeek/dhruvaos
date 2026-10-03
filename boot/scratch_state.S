@@ -258,6 +258,40 @@ tcp_unmatched_rst_peer_mac_scratch_addr:
                          * peer we have no established state for), so
                          * the RST can be addressed straight back at
                          * whoever sent the unmatched segment. */
+dns_query_scratch_addr:
+    .word 0             /* 64 bytes: dns_resolve's own outgoing DNS
+                         * query buffer (RFC 1035 -- single A-record
+                         * query/response client, scoped like u-boot's
+                         * own net/dns.c). Fixed size, built fresh per
+                         * call, same "never dhruva_alloc_bytes on
+                         * every call" discipline every other live
+                         * (not just self-test) networking buffer in
+                         * this file already follows. */
+dns_resp_scratch_addr:
+    .word 0             /* 512 bytes: dns_resolve_poll's own incoming
+                         * DNS response buffer -- 512 gives real
+                         * headroom over a realistic single-A-record
+                         * response (~40-60 bytes), same "don't trust
+                         * a synthetic size" lesson DHCP's own 512->
+                         * 1024 bump already taught this project. */
+dns_server_mac_scratch_addr:
+    .word 0             /* 6 bytes: dns_resolve_start's own holding
+                         * spot for the DNS server's MAC, learned via
+                         * arp_cache_lookup before unicasting the
+                         * query -- same per-buffer-single-purpose
+                         * discipline as every other scratch in this
+                         * file (not reused from e.g. dhcp_server_mac_
+                         * scratch, a different peer role entirely). */
+shell_hostname_scratch_addr:
+    .word 0             /* 64 bytes: the shell's own copy-out spot for
+                         * a hostname argument (nslookup's own, or
+                         * ping's hostname-fallback argument) -- safe
+                         * to share between the two since they're
+                         * mutually exclusive shell commands (one
+                         * shell task, one command at a time), same
+                         * reasoning shell_my_mac_scratch/shell_ping_
+                         * dst_mac_scratch already get reused across
+                         * multiple call sites within one command. */
 dhcp_payload_scratch_addr:
     .word 0             /* 300 bytes: the DHCP client's own message
                          * build buffer (DISCOVER/REQUEST), shared by
@@ -853,6 +887,62 @@ tcp_unmatched_rst_peer_mac_scratch_set:
 .global tcp_unmatched_rst_peer_mac_scratch_get
 tcp_unmatched_rst_peer_mac_scratch_get:
     ldr r0, =tcp_unmatched_rst_peer_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dns_query_scratch_set
+dns_query_scratch_set:
+    ldr r1, =dns_query_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dns_query_scratch_get
+dns_query_scratch_get:
+    ldr r0, =dns_query_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dns_resp_scratch_set
+dns_resp_scratch_set:
+    ldr r1, =dns_resp_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dns_resp_scratch_get
+dns_resp_scratch_get:
+    ldr r0, =dns_resp_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dns_server_mac_scratch_set
+dns_server_mac_scratch_set:
+    ldr r1, =dns_server_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dns_server_mac_scratch_get
+dns_server_mac_scratch_get:
+    ldr r0, =dns_server_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global shell_hostname_scratch_set
+shell_hostname_scratch_set:
+    ldr r1, =shell_hostname_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global shell_hostname_scratch_get
+shell_hostname_scratch_get:
+    ldr r0, =shell_hostname_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

@@ -13066,3 +13066,55 @@ panics, zero non-SD/DharaFS-related FAILs (the DharaFS/CRYPTO FAILs under `qemu_
 expected and pre-existing: that harness has no SD drive attached at all, unlike `phase4_milestone.py`).
 No real-hardware component to any of these 7 fixes -- all are pure protocol-logic gaps, reproduce
 identically under QEMU, no real-HW retest needed.
+
+### DNS client: single A-record resolver, `nslookup` + `ping` hostname fallback (tasks #334-337, 2026-10-03)
+
+User asked for DNS/IPv6/IPsec/SNMP to be scoped against Linux/U-Boot before any implementation, then
+confirmed DNS specifically should become a real feature. U-Boot's `net/dns.c` (~219 lines) is the closest
+real-world reference for this project's own from-scratch bare-metal style -- Linux has no in-kernel DNS
+client to compare against (resolution is userspace there). Scoped and built to match U-Boot's own stance:
+single QTYPE=A/QCLASS=IN query, no CNAME-chain following, no EDNS0, no TC-bit/retry-over-TCP. A server's
+answer-section name is never dereferenced even when compressed (a leading `0xc0` byte) -- a minimal client
+only needs the record's type/data, not to reconstruct the name string.
+
+**vani-netstack (pure codec, v0.7.0)**: `netstack_dns_build_query` (12-byte header + length-prefixed
+QNAME labels split on `.` + QTYPE/QCLASS), `netstack_dns_skip_name` (bounded walk treating a compression
+pointer as a fixed 2-byte skip, root label as 1 byte), `netstack_dns_parse_response` (validates xid/QR/
+RCODE, skips the question, walks up to `ancount` answers for the first TYPE=1/CLASS=1/RDLENGTH=4 record),
+and `netstack_dns_self_test`. Committed `64abd08`, synced into `vendor/netstack/src/lib.vani`.
+
+**kernel_main.vani orchestration**: new scratch buffers (`dns_query_scratch` 64B, `dns_resp_scratch` 512B,
+`dns_server_mac_scratch` 6B, `shell_hostname_scratch` 64B, shared between `nslookup` and `ping`'s hostname
+argument since the two commands are mutually exclusive); a small DHCP addition (option 6, Domain Name
+Server, was never parsed before -- now learned into a new `dhcp_state_get/set_dns_server` accessor pair,
+same 0-means-unset convention as `dhcp_lease_time`); `dns_resolve_start`/`dns_resolve_poll`/`dns_resolve`
+(ARP-resolve the server, unicast the query, bounded 20-iteration x `delay(161000)` poll -- same constant
+already calibrated for real-HW timing in `ping`'s own resolve loop); new `nslookup <hostname> [server_ip]`
+shell command (defaults to the DHCP-learned server when omitted); `ping <target>` now falls back to DNS
+when `ip_parse_dotted_quad` fails, matching the hostname-ping convenience every real OS offers.
+
+**Two bugs found and fixed during verification, before any commit** (both in the new, not-yet-shipped
+`dns_resolve_self_test`, caught by the same temporary-`boot_debug_enabled()`-override sweep this session's
+protocol audit round already established as necessary -- `phase4_milestone.py`/`qemu_run.py` both run with
+debug off by default, so neither would have caught either):
+- The synthetic reply's total length undercounted the question section by 4 bytes (counted the 13-byte
+  QNAME but not the 2-byte QTYPE + 2-byte QCLASS that follow it), truncating the last 4 bytes of RDATA (the
+  resolved IP itself) out of the frame actually sent. `netstack_dns_parse_response`'s own bounds-check
+  correctly rejected the truncated answer RR rather than reading past it -- the self-test failed loudly
+  with `(FAIL)`, not a false positive. Fixed: `12 + 13 + 16` -> `12 + 17 + 16`.
+- The self-test's own drain-the-just-sent-query step used a 64-byte buffer, but the real query frame
+  (Ethernet 14 + IPv4 20 + UDP 8 + a 29-byte DNS query for "example.com") is 71 bytes -- `netif_recv_frame`
+  correctly rejected it as oversized (bounds-checks `frame_len > max_len` before ever writing, so no
+  buffer overrun occurred), which still tripped the self-test's own `ok = 0`. Fixed by sizing the drain
+  buffer to `netif_frame_slot_size()`, same as every other self-test in this file that drains a
+  potentially-larger frame (DHCP, TCP's multi-segment tests).
+
+**Verification**: `./build.sh` zero `asm_safety_audit.py` findings. `qemu_run.py` clean (same known
+baseline). `phase4_milestone.py` 18/18 PASS, no regressions. A temporary `boot_debug_enabled()` override
+(reverted before commit, never shipped) exercised the new `dns_resolve_self_test` under QEMU twice -- first
+run caught both bugs above via a loud `(FAIL)`, second run after both fixes: `DNS: dns_resolve_start/poll
+live round trip (PASS)`, zero panics, zero new non-SD/DharaFS FAILs.
+
+Real end-to-end resolution against an actual DNS server can only be proven on real hardware (a real LAN
+has a real resolver reachable) -- flagged for the next real-HW boot cycle, same "QEMU can't fully prove
+this" category as USB enumeration and the ARP-auto-answer-against-a-real-peer feature earlier this session.

@@ -38,6 +38,17 @@ dhcp_leased_ip:
                      * address; stored separately from dhcp_offered_ip
                      * rather than assumed identical, since the ACK is
                      * the authoritative source of truth, not the OFFER */
+dhcp_dns_server_ip:
+    .word 0        /* option 6 (Domain Name Server) from the ACK, for
+                     * dns_resolve's own default when the shell's
+                     * `nslookup`/`ping` callers don't name a server
+                     * explicitly -- mirrors dhcp_server_ip's own role
+                     * (a learned peer address, not this client's own),
+                     * kept as its own field since it's a genuinely
+                     * different peer (the DHCP server and the DNS
+                     * server are not guaranteed to be the same host).
+                     * 0 means "never learned one" -- same convention
+                     * as dhcp_lease_time's own 0-means-unset. */
 dhcp_lease_time:
     .word 0        /* round 22 (2026-08-28): option 51 from the ACK,
                      * in seconds. 0 means "no lease timer armed" --
@@ -117,6 +128,19 @@ dhcp_state_get_leased_ip:
 .global dhcp_state_set_leased_ip
 dhcp_state_set_leased_ip:
     ldr r1, =dhcp_leased_ip
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_state_get_dns_server
+dhcp_state_get_dns_server:
+    ldr r0, =dhcp_dns_server_ip
+    ldr r0, [r0]
+    bx lr
+
+.global dhcp_state_set_dns_server
+dhcp_state_set_dns_server:
+    ldr r1, =dhcp_dns_server_ip
     str r0, [r1]
     mov r0, #0
     bx lr
