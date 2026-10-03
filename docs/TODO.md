@@ -12754,3 +12754,20 @@ usb-kbd` enumeration byte-for-byte unchanged. Real-HW retest pending -- this is 
 for the actual fix, given it's independently confirmed against three authoritative real-world PL011
 references and directly explains every symptom observed (lag, intermittent corruption, QEMU/real-HW
 divergence) rather than being inferred from guesswork.
+
+### Real-HW retest CONFIRMED: RTIM fix closes the lag/corruption investigation (2026-10-02)
+
+Reflashed and rebooted. All four `dhdl query usb/wifi/ble/ethernet` commands returned clean, correct
+responses in a single run -- zero "unknown command"/"unknown subsystem" corruption, ~700-750ms round trip
+each (keystroke-scale responsive, not the multi-second stalls from before). This closes out the real-HW
+lag/corruption investigation that spanned the delay() miscalibration fix, the TX-ring idle-drain fix, and
+this RTIM fix -- all three were real, independently-confirmed bugs, and together they account for every
+symptom observed this session.
+
+**USB enumeration status, confirmed live**: `usb: port_connected=yes port_enabled=yes` -- the root port enable
+fix (delay() recalibration) holds up on a fresh boot, not a fluke. `wifi`/`ble`/`ethernet` all still report 0
+(none enumerated). The boot-time self-test log now shows the FAILURE POINT has moved further down the chain
+than ever before: `USB: GET_DESCRIPTOR(Device) transfer failed` -- the root port enables correctly, but the
+very first real USB control transfer (reading the root device's own descriptor) fails. This is a distinct,
+narrower, new lead for a FUTURE round -- out of scope for this one, which was about restoring basic shell
+reliability, not USB enumeration depth.
