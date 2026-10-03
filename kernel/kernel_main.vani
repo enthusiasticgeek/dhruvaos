@@ -41407,6 +41407,16 @@ fn kernel_main() -> i64 {
   if boot_debug_enabled() == 1 { let _ = netif_self_test(); }
   if boot_debug_enabled() == 1 { let _ = filter_self_test(); }
   if boot_debug_enabled() == 1 { let _ = filter_outgoing_self_test(); }
+
+  // arp_cache_init() allocates and registers the ARP cache's own
+  // macs scratch buffer (arp_cache_set_macs_buf) -- this must run on
+  // EVERY boot, not just debug builds. It used to only run inside
+  // arp_self_test() below, which is gated behind boot_debug_enabled();
+  // on a normal boot the macs buffer pointer stayed NULL, and the
+  // first real arp_cache_insert() call (e.g. from `udpecho`, which
+  // unlike `ping` calls arp_cache_insert directly) NULL-derefed in
+  // buf_write_byte.
+  let _ = arp_cache_init();
   if boot_debug_enabled() == 1 { let _ = arp_self_test(); }
   if boot_debug_enabled() == 1 { let _ = arp_resolve_self_test(); }
   if boot_debug_enabled() == 1 { let _ = ipv4_self_test(); }

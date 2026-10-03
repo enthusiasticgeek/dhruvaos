@@ -12898,3 +12898,42 @@ no-op for both, as expected -- QEMU's own FIFO model doesn't require real sizing
 pending -- this is the strongest remaining candidate for the actual root cause, given it is independently
 confirmed via a real hardware register dump AND a real, working reference driver's own gating logic on this
 exact chip, not inferred from guesswork.
+
+### Task #326: `udpecho` kernel crash -- `arp_cache_init()` never ran on a non-debug boot (2026-10-03)
+
+While sweeping for QEMU-discoverable improvements (no real hardware needed), found a genuine, previously
+undocumented, 100%-deterministic kernel crash: the shell's `udpecho` command halted the kernel outright
+with a Data Abort the very first time it ran, discovered via `test/phase4_milestone.py` (the only QEMU
+harness with a real SD drive attached). This single crash cascaded into 8 additional `[FAIL]` lines in that
+harness (`udpecho` itself, both `netstat` checks, `tcprtx`, `tlsecho`, `httpecho`, `mqttecho`, `ls`,
+`diagnose`) -- none of those were independent bugs, they failed simply because the kernel had already
+halted.
+
+**Root cause**: `arp_cache_set_macs_buf()` -- which allocates and registers the ARP cache's own MAC-bytes
+scratch buffer -- is only ever called from `arp_cache_init()`. That function was itself only ever called
+from inside `arp_self_test()`, which is gated behind `boot_debug_enabled()` (added by task #318's
+self-test gating). On a normal, non-debug boot -- exactly how `phase4_milestone.py` boots -- the macs
+buffer pointer stayed NULL for the entire session. `ping` never hits this because it resolves via
+`arp_resolve_start`/`_poll`, a separate code path that never calls `arp_cache_insert`. `udpecho` is the
+first (and, before this fix, only) real caller of `arp_cache_insert()` on a normal boot, which NULL-derefs
+inside `buf_write_byte(macs, 0, mac_byte)` -- confirmed via disassembly (`strb r2,[r0,r1]` with r0=0,
+r1=0, r2=2) matching the exact fault registers reported (`r0=00000000 r1=00000000 r2=00000002`).
+
+Ruled out five other candidates first by directly reading each function's source, all confirmed correctly
+initialized at boot: the three `udpecho`-specific shell scratch buffers, `udp_send_arp_scratch`,
+`net_send_scratch`/`frame` (already proven working via `ping`/`tcpecho`), and `udp_checksum`'s own buffer
+(a stack array, never touches `buf_write_byte`). Confirmed the crash is not state corruption carried over
+from `tcpecho` running first, via an isolated repro (same QEMU+SD-drive setup, sending ONLY `udpecho` with
+nothing before it) that reproduced the identical fault signature.
+
+**Fixed**: moved `arp_cache_init()` to run unconditionally on every boot (right before the still-gated
+`arp_self_test()` call), instead of only as a side effect of the debug-only self-test.
+
+QEMU-verified: build clean with zero `asm_safety_audit.py` findings, `qemu_run.py` clean (same known
+baseline). Re-ran the full `test/phase4_milestone.py` -- all 18 checks now PASS, including `udpecho` and
+all 8 previously-cascading failures, confirming the single root cause explained every one of them. This
+also closes task #218 (DharaFS/crypto SD round-trip FAILs): the full boot log's `CRYPTO:` lines (AEAD
+round trip, two-time-pad fix, tamper detection, real SD media-encryption round trip) all show `(PASS)` in
+this same clean run -- the earlier SD-wedge fix (task #217) already cleared these, this run just confirms
+it with a harness that exercises them end-to-end. No real-hardware component to this bug (pure logic gap,
+reproduces identically in QEMU) -- no real-HW retest needed.
