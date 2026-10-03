@@ -28505,7 +28505,13 @@ fn shell_dispatch() -> i64 {
               resolved = 1;
             }
           } else {
-            let _ = delay(50000);
+            // 161000, not 50000 -- see dwc2_core_soft_reset's own
+            // comment on delay(N)'s real, platform-dependent duration.
+            // Found during the session-wide delay() sweep: this was
+            // producing ~15.5ms real per retry instead of the intended
+            // ~50ms, making ping's own 20-iteration ARP-resolve window
+            // ~310ms total on real hardware instead of ~1s.
+            let _ = delay(161000);
           }
           arp_iter = arp_iter + 1;
         }
@@ -28554,7 +28560,10 @@ fn shell_dispatch() -> i64 {
         }
       }
       if got_reply == 0 {
-        let _ = delay(50000);
+        // 161000, not 50000 -- same real-hardware recalibration as the
+        // ARP-resolve retry above; this was ~15.5ms real per retry
+        // instead of the intended ~50ms.
+        let _ = delay(161000);
       }
       poll_iter = poll_iter + 1;
     }

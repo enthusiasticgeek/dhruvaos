@@ -12829,3 +12829,18 @@ device classes that exercise this exact shared primitive: `-device usb-kbd` (ful
 unchanged) AND `-device usb-storage` (full BOT/SCSI chain -- TEST UNIT READY including its own first-attempt
 CHECK CONDITION retry, INQUIRY, READ CAPACITY, WRITE(10)/READ(10) round trip, FS-abstraction check -- all
 still PASS, byte-for-byte unchanged). True no-op for both. Real-HW retest pending.
+
+### Small bundled fix before the retest flash: `ping`'s own two leftover delay(50000) calls (2026-10-02)
+
+User asked for any other known, low-risk improvements to fold into the same flash before testing the USB
+fixes above. The two `delay(50000)` calls in `shell_dispatch`'s `ping` command (the ARP-resolve retry loop
+and the ICMP-reply poll loop, both noted but deliberately left alone earlier this session as out of scope
+for the USB investigation) got the same real-hardware recalibration every other `delay(N)` call in this
+session's own sweep already received: `delay(50000)` -> `delay(161000)`. Real impact: `ping`'s own 20-
+iteration retry windows were ~310ms total on real hardware instead of the intended ~1s, making the command
+more likely to report "could not resolve"/time out prematurely against a real, slightly slow network.
+
+QEMU-verified: build clean, `qemu_run.py` clean, live self-ping (`ping 0.0.0.0`, the one scenario this
+project's own netif can resolve under QEMU's loopback-only model) still gets a correct reply -- both the
+ARP-resolve path (trivial for `my_ip`) and the ICMP-reply-poll path this fix touches are confirmed still
+functioning. True no-op, unrelated to and bundled alongside the USB fixes above for the same flash cycle.
