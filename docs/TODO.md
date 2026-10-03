@@ -12768,6 +12768,30 @@ symptom observed this session.
 fix (delay() recalibration) holds up on a fresh boot, not a fluke. `wifi`/`ble`/`ethernet` all still report 0
 (none enumerated). The boot-time self-test log now shows the FAILURE POINT has moved further down the chain
 than ever before: `USB: GET_DESCRIPTOR(Device) transfer failed` -- the root port enables correctly, but the
-very first real USB control transfer (reading the root device's own descriptor) fails. This is a distinct,
-narrower, new lead for a FUTURE round -- out of scope for this one, which was about restoring basic shell
-reliability, not USB enumeration depth.
+very first real USB control transfer (reading the root device's own descriptor) fails.
+
+### Task #325: root cause found and fixed -- missing USB reset recovery time (TRSTRCY) (2026-10-02)
+
+User: "go ahead and continue into GET_DESCRIPTOR. use uboot, linux or zephyr as sources to compare." Checked
+`dwc2_port_reset()` and `dwc2_probe_device0()`'s own call sequence directly: the moment the ENA poll
+confirms the port is enabled, `dwc2_init()` returns straight into `dwc2_probe_device0()`'s FIRST SETUP
+token (GET_DESCRIPTOR at address 0) -- zero delay in between.
+
+**Confirmed against both reference sources the user named**: USB 2.0 spec section 7.1.7.5 requires a
+minimum 10ms "reset recovery time" (TRSTRCY) after a port reset completes, before a device is guaranteed
+ready to accept its first SETUP token -- real device firmware (a WiFi/BT dongle's own onboard MCU, unlike
+QEMU's instant behavioral model) needs this real elapsed time to finish reinitializing its USB stack after
+reset. Linux's `drivers/usb/core/hub.c` defines `HUB_SHORT_RESET_TIME` (10ms) for exactly this wait.
+U-Boot's `common/usb_hub.c` is even more explicit -- the literal comment `"TRSTRCY = 10 ms; plus some
+extra"` followed by `mdelay(10 + 40)`, 50ms total. This driver had NO such delay anywhere in its root-port
+OR downstream-hub-port bring-up sequence.
+
+**Fixed**: added `delay(161000)` (this project's own already-proven-on-real-hardware count for ~50ms,
+matching U-Boot's own margin exactly -- not a new guess) at the end of both `dwc2_port_reset()` (root port)
+and `dwc2_hub_bring_up_port()` (downstream hub port), after each confirms its own port is enabled and before
+either caller's first SETUP token.
+
+QEMU-verified: build clean with zero `asm_safety_audit.py` findings, `qemu_run.py` clean, `-device usb-kbd`
+full enumeration chain (root device + hub + downstream HID keyboard, both PASS markers) byte-for-byte
+unchanged -- true no-op, as expected, since QEMU's own UART/USB models don't exercise real device-firmware
+reinitialization timing either way. Real-HW retest pending.

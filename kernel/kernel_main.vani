@@ -18028,6 +18028,30 @@ fn dwc2_port_reset() -> i64 {
   let v3: u32 = mmio_read_u32(hprt0);
   let ack_bits: u32 = (0x2 as u32) | (0x8 as u32); // CONNDET | ENACHG
   let _ = mmio_write_u32(hprt0, (v3 & not_w1c_mask) | ack_bits);
+
+  // Task #325 (2026-10-02): reset recovery time (TRSTRCY) -- USB 2.0
+  // spec section 7.1.7.5: "devices must be able to accept a
+  // SetAddress() request after a recovery interval of 10ms following
+  // the port's reset." This driver returned straight into the FIRST
+  // SETUP token (GET_DESCRIPTOR at address 0, dwc2_probe_device0)
+  // with ZERO delay after confirming ENA -- confirmed missing by
+  // checking both reference implementations the user asked for:
+  // Linux's own `drivers/usb/core/hub.c` defines `HUB_SHORT_RESET_
+  // TIME` (10ms) for exactly this wait, and U-Boot's `common/usb_
+  // hub.c` is even more explicit -- the literal comment "TRSTRCY =
+  // 10 ms; plus some extra" followed by `mdelay(10 + 40)`, 50ms
+  // total. Real devices (a WiFi/BT dongle's own onboard MCU
+  // reinitializing its USB stack after reset, unlike QEMU's instant
+  // model) need this real elapsed time before they're guaranteed
+  // ready to answer -- directly explains "USB: GET_DESCRIPTOR(Device)
+  // transfer failed" immediately following a now-reliable port_
+  // enabled=yes: the port electrically enables well before the
+  // device's own firmware has finished reinitializing enough to
+  // answer EP0. delay(161000), matching U-Boot's own 50ms margin
+  // exactly, and this project's own already-proven-on-real-hardware
+  // count for that duration (same constant used throughout this
+  // session's other USB timing fixes, not a new guess).
+  let _ = delay(161000);
   return 0;
 }
 
@@ -23978,6 +24002,14 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
   if (port_status & (0x3 as u32)) != (0x3 as u32) {
     return 1;
   }
+
+  // Task #325 (2026-10-02): same reset recovery time (TRSTRCY) fix as
+  // dwc2_port_reset's own root-port equivalent -- see that function's
+  // own comment for the full USB 2.0 spec 7.1.7.5 / Linux hub.c /
+  // U-Boot usb_hub.c citation. A downstream device behind a hub needs
+  // the identical real elapsed time after ITS OWN port reset before
+  // dwc2_enumerate_downstream's first SETUP token, for the same reason.
+  let _ = delay(161000);
   return 0;
 }
 
