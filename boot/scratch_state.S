@@ -292,6 +292,18 @@ shell_hostname_scratch_addr:
                          * reasoning shell_my_mac_scratch/shell_ping_
                          * dst_mac_scratch already get reused across
                          * multiple call sites within one command. */
+kernlog_line_scratch_addr:
+    .word 0             /* 512 bytes: kernlog_write's own composed-line
+                         * build buffer (timestamp + level + message),
+                         * capped to match dharafs_log_record_max_len()
+                         * -- the one real ceiling this buffer must
+                         * never exceed, since dharafs_log_append_raw
+                         * itself rejects anything longer. Persistent
+                         * for the same "never dhruva_alloc_bytes on
+                         * every call" reason as every other buffer in
+                         * this file: kernlog_write fires from fault
+                         * handlers and hot error paths, not a one-shot
+                         * boot step. */
 dhcp_payload_scratch_addr:
     .word 0             /* 300 bytes: the DHCP client's own message
                          * build buffer (DISCOVER/REQUEST), shared by
@@ -929,6 +941,20 @@ dns_server_mac_scratch_set:
 .global dns_server_mac_scratch_get
 dns_server_mac_scratch_get:
     ldr r0, =dns_server_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global kernlog_line_scratch_set
+kernlog_line_scratch_set:
+    ldr r1, =kernlog_line_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global kernlog_line_scratch_get
+kernlog_line_scratch_get:
+    ldr r0, =kernlog_line_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

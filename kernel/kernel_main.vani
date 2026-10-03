@@ -1850,6 +1850,10 @@ extern "C" fn shell_hostname_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn shell_hostname_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
+extern "C" fn kernlog_line_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn kernlog_line_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_payload_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dhcp_payload_scratch_get() -> mut ref i64;
@@ -2517,6 +2521,18 @@ extern "C" fn dhcp_state_set_leased_ip(value: u32) -> u32;
 extern "C" fn dhcp_state_get_dns_server() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_dns_server(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernlog_state_get_min_level() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernlog_state_set_min_level(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernlog_state_get_maxsize() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernlog_state_set_maxsize(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernlog_state_get_backups() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernlog_state_set_backups(value: u32) -> u32;
 // Round 22 (2026-08-28): lease-renewal timer state, same file, same
 // vani-call-boundary reasoning.
 #[stack_cost(bytes=1)]
@@ -4664,6 +4680,282 @@ fn uart_put_hex32(v: u32) -> i64 {
 // returns in practice (the assembly caller always follows with `b .`
 // regardless of what these do), so the return value is unused.
 //
+// kernlog: a rotating, severity-gated crash/diagnostic log persisted
+// to DharaFS, built directly on dharafs_log_append_raw (see that
+// function's own header comment for the on-disk layout: numbered
+// /logs/kernlog-NNNN.log files + a /logs/kernlog.hdr header tracking
+// the current generation).
+//
+// Scoped 2026-10-03 at the user's own explicit request, directly
+// motivated by task #325's real-HW Prefetch Abort during idle: this
+// project's fault reports only ever reached the live UART before this
+// -- genuinely lost if nobody happened to be watching when the crash
+// occurred. This persists the highest-value lines (Data/Prefetch
+// Abort reports, USB enumeration failures) to DharaFS instead,
+// surviving across reboots for later diagnosis.
+//
+// Severity-gated by the user's own explicit choice -- CRITICAL+FATAL
+// only by default, not every uart_puts call project-wide. Keeping
+// this project's single most-called primitive (uart_puts) completely
+// untouched avoids turning a logging feature into a stability/
+// performance risk of its own for the sake of a completeness nothing
+// here actually needs.
+//
+// Timestamps are ISO8601 DURATION format (PT<seconds>.<microseconds>S)
+// measured from TIMER_CLO, NOT a real calendar date-time -- this board
+// has no RTC and no NTP client (confirmed: no wall-clock time source
+// exists anywhere in this codebase, grep for "rtc"/"ntp" turns up
+// nothing). Per the user's own explicit design: check for a real time
+// source first (RTC, then NTP-synced), fall back to this boot-relative
+// duration when neither is present -- which is always, today, so the
+// fallback is what every entry actually uses in practice. Written as
+// its own check rather than a bare constant specifically so a future
+// RTC/NTP addition slots in without touching any caller.
+fn kernlog_level_critical() -> u32 { return 2 as u32; }
+fn kernlog_level_fatal() -> u32 { return 3 as u32; }
+
+fn kernlog_min_level_default() -> u32 { return 2 as u32; } // CRITICAL
+fn kernlog_maxsize_default() -> i64 { return 2048; }
+fn kernlog_backups_default() -> i64 { return 3; }
+
+fn kernlog_min_level() -> u32 {
+  let v: u32 = kernlog_state_get_min_level();
+  if v == (0 as u32) { return kernlog_min_level_default(); }
+  return v;
+}
+
+fn kernlog_maxsize() -> i64 {
+  let v: u32 = kernlog_state_get_maxsize();
+  if v == (0 as u32) { return kernlog_maxsize_default(); }
+  return v as i64;
+}
+
+fn kernlog_backups() -> i64 {
+  let v: u32 = kernlog_state_get_backups();
+  if v == (0 as u32) { return kernlog_backups_default(); }
+  return v as i64;
+}
+
+// Reads /config/kernlog_maxsize + /config/kernlog_backups at boot,
+// same dharafs_read()-then-parse shape as log_level_init() above --
+// missing/unreadable leaves the field at 0 (unset), meaning kernlog_
+// maxsize()/kernlog_backups() fall back to their own defaults above.
+fn kernlog_config_init() -> i64 {
+  let buf: mut ref i64 = dhruva_alloc_bytes(16);
+  let size_len: i64 = dharafs_read("/config/kernlog_maxsize", buf);
+  if size_len > 0 {
+    let parsed: i64 = shell_parse_decimal(buf, 0, size_len);
+    if parsed > 0 {
+      let _ = kernlog_state_set_maxsize(parsed as u32);
+    }
+  }
+  let buf2: mut ref i64 = dhruva_alloc_bytes(16);
+  let backups_len: i64 = dharafs_read("/config/kernlog_backups", buf2);
+  if backups_len > 0 {
+    let parsed2: i64 = shell_parse_decimal(buf2, 0, backups_len);
+    if parsed2 > 0 {
+      let _ = kernlog_state_set_backups(parsed2 as u32);
+    }
+  }
+  return 0;
+}
+
+// Checks for a real time source (RTC, then NTP-synced) before falling
+// back to the boot-relative duration timestamp below -- neither exists
+// in this codebase today, so kernlog_write_timestamp always takes the
+// fallback branch in practice, but written this way so a future
+// addition of either slots in without touching any caller.
+fn kernlog_has_rtc() -> i64 { return 0; }
+fn kernlog_has_ntp_synced() -> i64 { return 0; }
+
+// Writes `value`'s decimal digits (no leading zeros, at least "0") at
+// out_buf[offset), returning the digit count written -- the seconds
+// half of the timestamp below, variable-width since a boot-relative
+// elapsed-seconds count has no natural fixed width.
+fn kernlog_write_decimal(out_buf: mut ref i64, offset: i64, value: u32) -> i64 {
+  let count: i64 = 1;
+  let probe: u32 = value;
+  while probe >= (10 as u32) {
+    probe = probe / (10 as u32);
+    count = count + 1;
+  }
+  let divisor: u32 = 1 as u32;
+  let k: i64 = 1;
+  while k < count {
+    divisor = divisor * (10 as u32);
+    k = k + 1;
+  }
+  let i: i64 = 0;
+  let remaining: u32 = value;
+  while i < count {
+    let d: u32 = (remaining / divisor) % (10 as u32);
+    let _ = buf_write_byte(out_buf, (offset + i) as u32, (48 as u32) + d);
+    divisor = divisor / (10 as u32);
+    i = i + 1;
+  }
+  return count;
+}
+
+// Writes a zero-padded 6-digit decimal (000000-999999) for `value`
+// starting at out_buf[offset) -- the microsecond-fraction half of the
+// timestamp below. Same fixed-width-digit shape as dharafs_log_write_
+// index_digits (4 digits), just 6.
+fn kernlog_write_6digits(out_buf: mut ref i64, offset: i64, value: u32) -> i64 {
+  let d0: u32 = (value / (100000 as u32)) % (10 as u32);
+  let d1: u32 = (value / (10000 as u32)) % (10 as u32);
+  let d2: u32 = (value / (1000 as u32)) % (10 as u32);
+  let d3: u32 = (value / (100 as u32)) % (10 as u32);
+  let d4: u32 = (value / (10 as u32)) % (10 as u32);
+  let d5: u32 = value % (10 as u32);
+  let _ = buf_write_byte(out_buf, offset as u32, (48 as u32) + d0);
+  let _ = buf_write_byte(out_buf, (offset + 1) as u32, (48 as u32) + d1);
+  let _ = buf_write_byte(out_buf, (offset + 2) as u32, (48 as u32) + d2);
+  let _ = buf_write_byte(out_buf, (offset + 3) as u32, (48 as u32) + d3);
+  let _ = buf_write_byte(out_buf, (offset + 4) as u32, (48 as u32) + d4);
+  let _ = buf_write_byte(out_buf, (offset + 5) as u32, (48 as u32) + d5);
+  return 6;
+}
+
+// Writes "PT<seconds>.<6-digit-microseconds>S" at out_buf[offset),
+// returning the total length written -- see this section's own header
+// comment for why this is boot-relative (TIMER_CLO, a free-running
+// microsecond counter since boot), not a real calendar timestamp.
+fn kernlog_write_timestamp(out_buf: mut ref i64, offset: i64) -> i64 {
+  let timer_clo: i64 = TIMER_CLO;
+  let now_us: u32 = mmio_read_u32(timer_clo);
+  let secs: u32 = now_us / (1000000 as u32);
+  let frac_us: u32 = now_us % (1000000 as u32);
+  let _ = buf_write_byte(out_buf, offset as u32, 80 as u32);       // 'P'
+  let _ = buf_write_byte(out_buf, (offset + 1) as u32, 84 as u32); // 'T'
+  let secs_len: i64 = kernlog_write_decimal(out_buf, offset + 2, secs);
+  let dot_off: i64 = offset + 2 + secs_len;
+  let _ = buf_write_byte(out_buf, dot_off as u32, 46 as u32); // '.'
+  let _ = kernlog_write_6digits(out_buf, dot_off + 1, frac_us);
+  let s_off: i64 = dot_off + 7;
+  let _ = buf_write_byte(out_buf, s_off as u32, 83 as u32); // 'S'
+  return (s_off + 1) - offset;
+}
+
+fn kernlog_write_hex32(out_buf: mut ref i64, offset: i64, v: u32) -> i64 {
+  let shift: i64 = 28;
+  let i: i64 = 0;
+  while shift >= 0 {
+    let nibble: u32 = (v >> (shift as u32)) & (0xF as u32);
+    let n: i64 = nibble as i64;
+    let c: u32 = if n < 10 { (48 + n) as u32 } else { (55 + n) as u32 };
+    let _ = buf_write_byte(out_buf, (offset + i) as u32, c);
+    shift = shift - 4;
+    i = i + 1;
+  }
+  return 8;
+}
+
+fn kernlog_write_str(out_buf: mut ref i64, offset: i64, s: Str) -> i64 {
+  let s_len: i64 = str_len_bytes(s);
+  let i: i64 = 0;
+  while i < s_len {
+    let _ = buf_write_byte(out_buf, (offset + i) as u32, str_byte_at(s, i) as u32);
+    i = i + 1;
+  }
+  return s_len;
+}
+
+// Shared tail for every kernlog_write_* variant below: names the one
+// log ("kernlog") this entire feature ever writes to and hands the
+// already-formatted line (kernlog_line_scratch, length `line_len`) to
+// dharafs_log_append_raw with kernlog's own independently-configurable
+// maxsize/backups -- decoupled from the shared dharafs_log_rollover_
+// threshold()/dharafs_log_retention_count() constants the generic
+// `log <name> <text>` shell command still uses unchanged.
+fn kernlog_flush(line_len: i64) -> i64 {
+  let buf: mut ref i64 = kernlog_line_scratch_get();
+  let name: Str = "kernlog";
+  let name_len: i64 = str_len_bytes(name);
+  let name_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < name_len {
+    let _ = buf_write_byte(name_buf, i as u32, str_byte_at(name, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_log_append_raw(name_buf, name_len, buf, line_len, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode(), kernlog_maxsize(), kernlog_backups());
+}
+
+// Tailored to the Data/Prefetch Abort handlers' own exact data shape
+// (both pass the identical 7 numeric fields) -- the highest-value
+// target this feature exists for. #[no_heap]-safe: every buffer here
+// is persistent scratch (kernlog_line_scratch/dharafs_path_scratch),
+// and dharafs_log_append_raw's own call chain is already proven safe
+// to call from these exact fault handlers -- crashlog_record_crash
+// already does so, right alongside this function's own call sites.
+fn kernlog_write_fault(level: u32, label: Str, addr: u32, status: u32, pc: u32, r0: u32, r1: u32, r2: u32, r3: u32, lr: u32) -> i64 {
+  if level < kernlog_min_level() {
+    return 0;
+  }
+  let buf: mut ref i64 = kernlog_line_scratch_get();
+  let off: i64 = 0;
+  off = off + kernlog_write_timestamp(buf, off);
+  off = off + kernlog_write_str(buf, off, " [");
+  let level_label: Str = if level >= kernlog_level_fatal() { "FATAL" } else { "CRITICAL" };
+  off = off + kernlog_write_str(buf, off, level_label);
+  off = off + kernlog_write_str(buf, off, "] ");
+  off = off + kernlog_write_str(buf, off, label);
+  off = off + kernlog_write_str(buf, off, " addr=");
+  off = off + kernlog_write_hex32(buf, off, addr);
+  off = off + kernlog_write_str(buf, off, " status=");
+  off = off + kernlog_write_hex32(buf, off, status);
+  off = off + kernlog_write_str(buf, off, " pc=");
+  off = off + kernlog_write_hex32(buf, off, pc);
+  off = off + kernlog_write_str(buf, off, " r0=");
+  off = off + kernlog_write_hex32(buf, off, r0);
+  off = off + kernlog_write_str(buf, off, " r1=");
+  off = off + kernlog_write_hex32(buf, off, r1);
+  off = off + kernlog_write_str(buf, off, " r2=");
+  off = off + kernlog_write_hex32(buf, off, r2);
+  off = off + kernlog_write_str(buf, off, " r3=");
+  off = off + kernlog_write_hex32(buf, off, r3);
+  off = off + kernlog_write_str(buf, off, " lr=");
+  off = off + kernlog_write_hex32(buf, off, lr);
+  off = off + kernlog_write_str(buf, off, "\n");
+  return kernlog_flush(off);
+}
+
+// Tailored to the USB enumeration failure prints (dwc2_control_in's
+// own SETUP/DATA/STATUS stage diagnostics, task #325's own own
+// original audit target): label + HCINT + HPRT0, CRITICAL by default.
+fn kernlog_write_usb(label: Str, hcint: u32, hprt0: u32) -> i64 {
+  if kernlog_level_critical() < kernlog_min_level() {
+    return 0;
+  }
+  let buf: mut ref i64 = kernlog_line_scratch_get();
+  let off: i64 = 0;
+  off = off + kernlog_write_timestamp(buf, off);
+  off = off + kernlog_write_str(buf, off, " [CRITICAL] ");
+  off = off + kernlog_write_str(buf, off, label);
+  off = off + kernlog_write_str(buf, off, " HCINT=0x");
+  off = off + kernlog_write_hex32(buf, off, hcint);
+  off = off + kernlog_write_str(buf, off, " HPRT0=0x");
+  off = off + kernlog_write_hex32(buf, off, hprt0);
+  off = off + kernlog_write_str(buf, off, "\n");
+  return kernlog_flush(off);
+}
+
+// Tailored to dwc2_init's own single nonzero-status report: label +
+// one value, CRITICAL by default.
+fn kernlog_write_simple(label: Str, value: u32) -> i64 {
+  if kernlog_level_critical() < kernlog_min_level() {
+    return 0;
+  }
+  let buf: mut ref i64 = kernlog_line_scratch_get();
+  let off: i64 = 0;
+  off = off + kernlog_write_timestamp(buf, off);
+  off = off + kernlog_write_str(buf, off, " [CRITICAL] ");
+  off = off + kernlog_write_str(buf, off, label);
+  off = off + kernlog_write_str(buf, off, "=0x");
+  off = off + kernlog_write_hex32(buf, off, value);
+  off = off + kernlog_write_str(buf, off, "\n");
+  return kernlog_flush(off);
+}
+
 // Status bits[3:0] == 0b1101 (0xD) identifies a section permission
 // fault under the plain (non-remapped, non-LPAE) ARMv6 short-
 // descriptor format this project's page table uses -- called out
@@ -4726,12 +5018,13 @@ fn abort_report_data(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r
   // this function's own callers already ignore ITS return value --
   // the system halts regardless of whether the write succeeded.
   let _ = crashlog_record_crash(crashlog_type_data_abort(), addr, status, fault_pc, orig_r0, orig_r1, orig_r2, orig_r3, orig_lr);
+  let _ = kernlog_write_fault(kernlog_level_fatal(), "Data Abort", addr, status, fault_pc, orig_r0, orig_r1, orig_r2, orig_r3, orig_lr);
   return 0;
 }
 
 #[no_mangle]
 #[no_heap]
-fn abort_report_prefetch(addr: u32, status: u32) -> i64 {
+fn abort_report_prefetch(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r1: u32, orig_r2: u32, orig_r3: u32, orig_lr: u32) -> i64 {
   let _ = uart_puts("\nFATAL: Prefetch Abort at address ");
   let _ = uart_put_hex32(addr);
   let _ = uart_puts(" status=");
@@ -4739,14 +5032,39 @@ fn abort_report_prefetch(addr: u32, status: u32) -> i64 {
   if abort_fault_is_section_permission(status) == 1 {
     let _ = uart_puts(" (section permission fault)");
   }
+  let _ = uart_puts(" current_task=");
+  let _ = uart_put_hex32(current_task_get());
+  // Preemptive-audit follow-up (2026-10-03, task #325's own real-HW
+  // Prefetch Abort during idle): this handler used to report only the
+  // bare wild address -- vectors.S's own fault_prefetch_abort never
+  // captured r0-r3/lr before its IFAR/IFSR MRC reads clobbered r0/r1.
+  // Now mirrors abort_report_data's own capture exactly (see that
+  // function's own header comment for why r0-r3/lr are the fields that
+  // actually distinguish failure classes, not just the address alone):
+  // orig_lr in particular is the faulting function's own return
+  // address -- for a wild jump through a corrupted function pointer,
+  // this is the call site that made the bad jump, which is often far
+  // more actionable than the garbage destination address itself.
+  let _ = uart_puts(" r0=");
+  let _ = uart_put_hex32(orig_r0);
+  let _ = uart_puts(" r1=");
+  let _ = uart_put_hex32(orig_r1);
+  let _ = uart_puts(" r2=");
+  let _ = uart_put_hex32(orig_r2);
+  let _ = uart_puts(" r3=");
+  let _ = uart_put_hex32(orig_r3);
+  let _ = uart_puts(" lr=");
+  let _ = uart_put_hex32(orig_lr);
+  let _ = uart_puts(" ctxsw=");
+  let _ = uart_put_i64(context_switch_count_get());
+  let _ = uart_puts(" irqs=");
+  let _ = uart_put_i64(irq_count_get());
   let _ = uart_puts(" -- halting\n");
   // addr IS the faulting PC for a Prefetch Abort (the CPU tried to
   // FETCH an instruction from there) -- passed as both fault_addr and
-  // pc below. r0-r3/lr aren't available at this call site (unlike
-  // abort_report_data's own vectors.S caller, nothing captures them
-  // for a prefetch abort today), recorded as 0 rather than left out
-  // of the fixed record layout.
-  let _ = crashlog_record_crash(crashlog_type_prefetch_abort(), addr, status, addr, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32);
+  // pc below, same as vectors.S's own fault_pc=addr copy.
+  let _ = crashlog_record_crash(crashlog_type_prefetch_abort(), addr, status, fault_pc, orig_r0, orig_r1, orig_r2, orig_r3, orig_lr);
+  let _ = kernlog_write_fault(kernlog_level_fatal(), "Prefetch Abort", addr, status, fault_pc, orig_r0, orig_r1, orig_r2, orig_r3, orig_lr);
   return 0;
 }
 
@@ -10852,7 +11170,17 @@ fn dharafs_log_header_path_raw(name_buf: mut ref i64, name_len: i64, out_buf: mu
 // writes the whole thing back, same "read whole, re-append whole"
 // shape dharafs_compact's own carry-forward and dharafs_chmod/
 // dharafs_chown already use elsewhere in this file.
-fn dharafs_log_append_raw(name_buf: mut ref i64, name_len: i64, record_buf: mut ref i64, record_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
+// Preemptive-audit follow-up (2026-10-03, kernlog feature): took on a
+// rollover_threshold/retention_count PARAMETER pair instead of calling
+// dharafs_log_rollover_threshold()/dharafs_log_retention_count()
+// directly, so a second named log (kernlog, see kernlog_write's own
+// header comment) can use its own independently-configurable size/
+// retention without touching the shared constants the `log <name>
+// <text>` shell command and dharafs_log_append still rely on --
+// both of those pass the original two functions' values through
+// unchanged below, so this is a pure signature extension, not a
+// behavior change for either existing caller.
+fn dharafs_log_append_raw(name_buf: mut ref i64, name_len: i64, record_buf: mut ref i64, record_len: i64, owner_uid: u32, owner_gid: u32, mode: u32, rollover_threshold: i64, retention_count: i64) -> i64 {
   if (name_len <= 0) || (record_len <= 0) {
     return 1;
   }
@@ -10871,7 +11199,7 @@ fn dharafs_log_append_raw(name_buf: mut ref i64, name_len: i64, record_buf: mut 
 
   let log_path_buf: mut ref i64 = dharafs_log_path_scratch_get();
   let needs_rollover: i64 = if current_index == (0 as u32) { 1 } else {
-    if (current_size + record_len) > dharafs_log_rollover_threshold() { 1 } else { 0 }
+    if (current_size + record_len) > rollover_threshold { 1 } else { 0 }
   };
 
   if needs_rollover == 1 {
@@ -10901,7 +11229,7 @@ fn dharafs_log_append_raw(name_buf: mut ref i64, name_len: i64, record_buf: mut 
     // already genuinely succeeded, so this function's own return value
     // still reflects only the part the caller actually asked for.
     if header_write_status == 0 {
-      let retention: i64 = dharafs_log_retention_count();
+      let retention: i64 = retention_count;
       if (new_index as i64) > retention {
         let old_index: u32 = new_index - (retention as u32);
         let old_path_len: i64 = dharafs_log_path_raw(name_buf, name_len, old_index, log_path_buf);
@@ -10965,7 +11293,7 @@ fn dharafs_log_append(name: Str, line: Str) -> i64 {
     let _ = buf_write_byte(record_buf, j as u32, str_byte_at(line, j) as u32);
     j = j + 1;
   }
-  return dharafs_log_append_raw(name_buf, name_len, record_buf, line_len_s, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
+  return dharafs_log_append_raw(name_buf, name_len, record_buf, line_len_s, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode(), dharafs_log_rollover_threshold(), dharafs_log_retention_count());
 }
 
 // Round 39's live milestone: write a payload well past the 448-byte
@@ -18349,6 +18677,94 @@ fn dwc2_enable_global_intr() -> i64 {
   return 0;
 }
 
+// Task #325 real-HW investigation (2026-10-03, after the DMAEN retest
+// moved the failure from "HCINT=0x00000000 true silence" to a real
+// HCINT=0x00000080 (XACTERR, Transaction Error) on the first genuine
+// SETUP transaction this driver has ever actually issued on the wire):
+// HCFG (offset 0x400 -- confirmed against both Linux's hw.h `#define
+// HCFG HSOTG_REG(0x0400)` and U-Boot's own `struct dwc2_host_regs`
+// layout, `host_regs` at 0x400 with `hcfg` as its first word) bits
+// [1:0] (FSLSPclkSel) and bit 2 (FSLSSupp) have never been programmed
+// anywhere in this driver's history either.
+//
+// FSLSPclkSel selects what clock rate the host core uses for its own
+// FS/LS bit-level signaling -- exactly the kind of timing parameter a
+// wrong value for would manifest as XACTERR (bit-stuff/CRC/turnaround
+// errors) on the very first real transaction attempted, while leaving
+// the port-level state machine (HPRT0 connect/enable) completely
+// unaffected, since that's a separate, coarser state machine. Both
+// real references agree, independently, on the exact same value for
+// this exact PHY type: Linux's `dwc2_init_fs_ls_pclk_sel` (core.c) sets
+// `HCFG_FSLSPCLKSEL_48_MHZ` (value 1) whenever `phy_type ==
+// DWC2_PHY_TYPE_PARAM_FS` -- true for BCM2835's embedded FS-only PHY,
+// not the HS ULPI/UTMI path (that path's own `USBTRDTIM` adjustment,
+// checked and ruled out first, only applies to HS PHYs and only in
+// device mode -- irrelevant here). U-Boot's own `init_fslspclksel()`
+// sets the identical `DWC2_HCFG_FSLSPCLKSEL_48_MHZ` for "Full speed
+// PHY", called during core init, and additionally sets `DWC2_HCFG_
+// FSLSSUPP` (bit 2, "FS/LS-Only Support") right after -- both programmed
+// together as a pair in the one real reference closest to this
+// project's own bare-metal, polling-based driver shape.
+fn dwc2_init_fs_ls_pclk_sel() -> i64 {
+  let hcfg: i64 = dwc2_base() + 0x400;
+  let fslspclksel_48mhz: u32 = 1 as u32;
+  let fslssupp: u32 = (1 as u32) << (2 as u32);
+  let v: u32 = mmio_read_u32(hcfg);
+  let cleared: u32 = v & (0xFFFFFFFC as u32);
+  let _ = mmio_write_u32(hcfg, cleared | fslspclksel_48mhz | fslssupp);
+  return 0;
+}
+
+// Task #325 real-HW investigation (2026-10-03, after MULTICNT retest still
+// showed the identical failure): GAHBCFG bit 5 (DMAEN) was never set
+// anywhere in this driver's history, and it is the one bit this whole
+// control-transfer path has implicitly assumed was already on since the
+// very first line of code that ever wrote to HCDMA. Every transfer this
+// driver issues (dwc2_control_in's SETUP/DATA/STATUS stages, dwc2_net_
+// bulk_in, every WiFi/BLE/mass-storage bulk path) programs HCDMA with a
+// real memory address and expects the controller to DMA the SETUP packet
+// / data straight out of (or into) that address -- true ONLY while the
+// core is actually in DMA mode. Without GAHBCFG.DMAEN set, a real DWC2
+// core stays in Slave/FIFO mode instead: it ignores HCDMA entirely and
+// expects the CPU to push/pop packet bytes through the FIFO data
+// registers directly (GRXSTSP / the non-periodic TxFIFO) -- registers
+// this driver has never touched, since it was written entirely around
+// the DMA-mode model from the start.
+//
+// This single missing bit explains every real-HW symptom this
+// investigation has produced, including why TRSTRCY/NAK-tolerance/FIFO-
+// sizing/MULTICNT all left `HCINT=0x00000000` identically unchanged: a
+// channel enabled on a core still in Slave mode has nothing to transmit
+// (the SETUP bytes sit in dwc2_dma_scratch, never pushed into any FIFO),
+// so it never issues anything on the wire at all -- true silence, not a
+// hard-error bit -- while HPRT0 and every port-level register, which
+// have nothing to do with DMA-vs-Slave mode, keep reporting a clean,
+// connected, enabled port throughout, exactly as every retest this
+// session has shown.
+//
+// Confirmed against both real references, independently:
+// - Linux's hcd.c `dwc2_gahbcfg_init` ORs in `GAHBCFG_DMA_EN` whenever
+//   `hsotg->params.host_dma` is set (the normal case for any real host
+//   driver that uses HCDMA the way this one does).
+// - U-Boot's own bare-metal dwc2.c explicitly switches on `GHWCFG2`'s
+//   ARCHITECTURE field and, for `DWC2_HWCFG2_ARCHITECTURE_INT_DMA`, ORs
+//   in both `DWC2_GAHBCFG_HBURSTLEN_INCR4` and `DWC2_GAHBCFG_DMAENABLE`.
+// This exact chip IS Internal-DMA-architecture: decoding the real
+// GHWCFG2 register dump already pulled from live BCM2835 silicon during
+// the FIFO-sizing investigation (`GHWCFG2=0x228ddd50`), bits[4:3]
+// (ARCHITECTURE) read `0b10` = 2 = INT_DMA_ARCH, the same value U-Boot's
+// own switch statement gates this exact code path on. Burst length is
+// set to INCR4 (U-Boot's own choice for this architecture) alongside
+// DMAEN, both bits this driver has simply never programmed.
+fn dwc2_enable_dma_mode() -> i64 {
+  let gahbcfg: i64 = dwc2_base() + 0x08;
+  let dmaen: u32 = (1 as u32) << (5 as u32);
+  let hburstlen_incr4: u32 = (3 as u32) << (1 as u32);
+  let v: u32 = mmio_read_u32(gahbcfg);
+  let _ = mmio_write_u32(gahbcfg, v | dmaen | hburstlen_incr4);
+  return 0;
+}
+
 // HPRT0 (offset 0x440) bit layout confirmed against hcd-dwc2.c:
 // CONNSTS=bit0 (RO), CONNDET=bit1 (W1C), ENA=bit2 (RO, self-setting
 // only), ENACHG=bit3 (W1C), RST=bit8, PWR=bit12, LNSTS=bits[11:10]
@@ -18804,6 +19220,8 @@ fn dwc2_init() -> i64 {
   // finding.
   let _ = dwc2_config_fifos();
   let _ = dwc2_enable_global_intr();
+  let _ = dwc2_enable_dma_mode();
+  let _ = dwc2_init_fs_ls_pclk_sel();
   let _ = dwc2_port_power_on();
 
   let connected: i64 = dwc2_port_connected();
@@ -18849,12 +19267,43 @@ fn dwc2_hcdma0_addr() -> i64 {
 }
 
 // HCCHAR field layout confirmed against hcd-dwc2.c's dwc2_enable_chan
-// (CHENA=bit31, DEVADDR=bits[28:22], EPTYPE=bits[19:18] (0=control),
-// EPDIR=bit15 (0=out,1=in), EPNUM=bits[14:11], MPS=bits[10:0]).
+// (CHENA=bit31, DEVADDR=bits[28:22], MULTICNT=bits[21:20], EPTYPE=
+// bits[19:18] (0=control), EPDIR=bit15 (0=out,1=in), EPNUM=bits[14:11],
+// MPS=bits[10:0]).
+//
+// Task #325 real-HW retest (2026-10-03): MULTICNT was never set here --
+// every one of this function's 18 call sites left bits[21:20] at their
+// reset value, 0b00. Compared against Linux's hcd.c (`chan->multi_
+// count = 1` is the unconditional default set in dwc2_hc_init, only
+// ever overridden to `qh->maxp_mult` for INTR/ISOC endpoints -- which
+// is itself always 1 on this project's own full-speed/low-speed-only
+// hardware -- then explicitly OR'd into HCCHAR by dwc2_hc_start_
+// transfer's own `hcchar |= (ec_mc << HCCHAR_MULTICNT_SHIFT) & ...`
+// immediately before the same write that sets CHENA) and U-Boot's own
+// bare-metal, polling-based dwc2.c (transfer_chunk's `clrsetbits_le32`
+// explicitly ORs in `(1 << DWC2_HCCHAR_MULTICNT_OFFSET)` alongside
+// DWC2_HCCHAR_CHEN, every single transfer) -- both real, working
+// references agree this field must be 1, never 0, for every endpoint
+// type this hardware ever uses (0b00 is the reserved/undefined
+// encoding, not "1 transaction"). A real DWC2 core's own internal
+// transaction-scheduling logic consults this field to decide how many
+// transactions to actually issue on the wire; left at the reserved
+// value, the real, documented failure signature is exactly what this
+// driver has shown on every real-HW retest so far: the channel never
+// issues anything at all (HCINT stays 0x00000000, true silence, not a
+// NAK/STALL/error) while HPRT0 and every port-level register keep
+// reporting a clean, connected, enabled port throughout. QEMU's own
+// simplified DWC2 model evidently never consults this field at all --
+// every enumeration path this project has under QEMU (`-device
+// usb-kbd`, `-device usb-storage`) has passed unchanged through every
+// prior round this bug has been present, which is why it was invisible
+// until a real-HW HCINT/HPRT0 trace was captured.
 fn dwc2_build_hcchar(devaddr: u32, eptype: u32, epdir: u32, epnum: u32, mps: u32) -> u32 {
   let chena: u32 = 1 as u32;
+  let multicnt: u32 = 1 as u32;
   let v: u32 = (chena << (31 as u32))
     | (devaddr << (22 as u32))
+    | (multicnt << (20 as u32))
     | (eptype << (18 as u32))
     | (epdir << (15 as u32))
     | (epnum << (11 as u32))
@@ -19115,6 +19564,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
     let _ = uart_puts(" HPRT0=0x");
     let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
     let _ = uart_puts("\n");
+    let _ = kernlog_write_usb("USB SETUP stage failed", setup_result, mmio_read_u32(dwc2_hprt0_addr()));
     return 0 - 1; // XFERCOMPL (bit0) never set -- timeout or error
   }
 
@@ -19156,6 +19606,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
     let _ = uart_puts(" HPRT0=0x");
     let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
     let _ = uart_puts("\n");
+    let _ = kernlog_write_usb("USB DATA stage failed", data_result, mmio_read_u32(dwc2_hprt0_addr()));
     return 0 - 1;
   }
   let i: i64 = 0;
@@ -19182,6 +19633,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
     let _ = uart_puts(" HPRT0=0x");
     let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
     let _ = uart_puts("\n");
+    let _ = kernlog_write_usb("USB STATUS stage failed", status_result, mmio_read_u32(dwc2_hprt0_addr()));
     return 0 - 1;
   }
   return 0;
@@ -28786,7 +29238,7 @@ fn shell_dispatch() -> i64 {
     let _ = shell_copy_range(line_buf, name_start, name_end, name_buf);
     let record_buf: mut ref i64 = dharafs_data_scratch_get();
     let _ = shell_copy_range(line_buf, text_start, line_len, record_buf);
-    let status: i64 = dharafs_log_append_raw(name_buf, name_len, record_buf, text_len, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
+    let status: i64 = dharafs_log_append_raw(name_buf, name_len, record_buf, text_len, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode(), dharafs_log_rollover_threshold(), dharafs_log_retention_count());
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
@@ -41499,6 +41951,17 @@ fn kernel_main() -> i64 {
   // own doc comment for why these exist and why sharing them across
   // call sites is safe.
   let _ = dharafs_sd_scratch_set(dhruva_alloc_bytes(512));
+  // kernlog_line_scratch set as early as possible, deliberately ahead
+  // of its own natural place alongside the other round-2026-10-03
+  // buffers -- kernlog_write_fault is called from the Data/Prefetch
+  // Abort handlers, which can fire at literally any point once the
+  // kernel is running. If a fault landed before this buffer existed,
+  // kernlog_write_fault would dereference the still-zeroed .bss
+  // pointer and fault a SECOND time inside the fault handler itself --
+  // exactly the catastrophic "the crash handler crashes" class of bug
+  // fault_data_abort's own sp_abt-reset guard already exists to limit
+  // the damage from, not one to introduce a fresh way into.
+  let _ = kernlog_line_scratch_set(dhruva_alloc_bytes(512));
   let _ = dharafs_path_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_data_scratch_set(dhruva_alloc_bytes(20480)); // matches dharafs_file_max_len(), task #164 follow-up
   let _ = dharafs_stat_scratch_set(dhruva_alloc_bytes(12));
@@ -41880,6 +42343,7 @@ fn kernel_main() -> i64 {
   // unaffected.
   let _ = dharafs_init();
   let _ = log_level_init();
+  let _ = kernlog_config_init();
   let _ = wifi_config_init();
   let _ = ble_config_init();
   let _ = dhdl_init();
@@ -42213,6 +42677,9 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("USB: dwc2_init status=");
   let _ = uart_put_hex32(usb_status as u32);
   let _ = uart_puts(" (0=device attached+port enabled, nonzero=no device attached)\n");
+  if usb_status != 0 {
+    let _ = kernlog_write_simple("USB dwc2_init status", usb_status as u32);
+  }
   if boot_debug_enabled() == 1 { let _ = dwc2_wait_chan0_done_wcet_measure_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dwc2_net_bulk_in_poll_wcet_measure_self_test(); }
 

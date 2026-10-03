@@ -219,17 +219,47 @@ fault_prefetch_abort:
      * masks FIQ on entry. See that function's own header comment for
      * the full "why". */
     cpsid f
+    /* Preemptive-audit follow-up (2026-10-03, task #325's own real-HW
+     * Prefetch Abort during idle): r0-r3/lr used to go unreported here
+     * entirely ("recorded as 0", abort_report_prefetch's own old
+     * comment) -- this handler simply never saved them before the IFAR/
+     * IFSR MRC reads below overwrote r0/r1. Mirrors fault_data_abort's
+     * own capture exactly, saved into r4-r8 BEFORE anything else
+     * (including the uart_capture guard just below, now on r9/r10
+     * instead of r0/r1 for exactly this reason) can touch r0-r3: lr in
+     * particular is the faulting function's own return address, the
+     * single most useful piece of context for telling "a corrupted
+     * function pointer was jumped through" apart from "a corrupted
+     * return address was jumped to" -- neither distinguishable from the
+     * bare wild PC alone, which is all this handler used to report. */
+    mov r4, r0
+    mov r5, r1
+    mov r6, r2
+    mov r7, r3
+    mov r8, lr
     /* Same uart_capture guard-rail as fault_data_abort above -- see
-     * that function's own comment for the full "why". r0/r1 are safe
-     * scratch here too, overwritten by the real MRC reads immediately
-     * below before anything relies on them. */
-    mov r0, #0
-    ldr r1, =uart_capture_active
-    str r0, [r1]
+     * that function's own comment for the full "why". r9/r10 instead of
+     * r0/r1 (fault_data_abort's own choice), since r0-r3 now hold the
+     * ORIGINAL fault-time values captured just above and must stay
+     * untouched until the MRC reads below deliberately overwrite them. */
+    mov r9, #0
+    ldr r10, =uart_capture_active
+    str r9, [r10]
     ldr sp, =_abort_stack_top   /* see fault_data_abort's own header
                                  * comment for why every entry resets sp
                                  * rather than trusting it's still valid */
     mrc p15, 0, r0, c6, c0, 2   /* IFAR: instruction fault address */
     mrc p15, 0, r1, c5, c0, 1   /* IFSR: instruction fault status */
+    mov r2, r0                  /* fault_pc = addr itself for a Prefetch
+                                  * Abort (IFAR already IS the faulting
+                                  * instruction's own address, no lr-8
+                                  * adjustment needed the way Data
+                                  * Abort's lr-based fault_pc requires) */
+    mov r3, r4                  /* orig_r0 -> arg4 */
+    sub sp, sp, #16             /* on sp_abt now, always valid */
+    str r5, [sp, #0]            /* orig_r1 -> arg5 (stack) */
+    str r6, [sp, #4]            /* orig_r2 -> arg6 (stack) */
+    str r7, [sp, #8]            /* orig_r3 -> arg7 (stack) */
+    str r8, [sp, #12]           /* orig_lr -> arg8 (stack) */
     bl abort_report_prefetch
     b .

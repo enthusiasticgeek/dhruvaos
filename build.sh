@@ -170,6 +170,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/dhcp_server_state.S" -o "${BUILD_DIR}/dhcp_server_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/kernlog_state.S" -o "${BUILD_DIR}/kernlog_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/uart_rx_budget_state.S" -o "${BUILD_DIR}/uart_rx_budget_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -344,6 +347,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/arp_state.o" "${BUILD_DIR}/scratch_state.o" \
   "${BUILD_DIR}/tcp_state.o" "${BUILD_DIR}/dhcp_state.o" \
   "${BUILD_DIR}/dhcp_server_state.o" \
+  "${BUILD_DIR}/kernlog_state.o" \
   "${BUILD_DIR}/uart_rx_budget_state.o" \
   "${BUILD_DIR}/mailbox_state.o" \
   "${BUILD_DIR}/usb_msd_state.o" \

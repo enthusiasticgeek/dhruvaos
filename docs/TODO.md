@@ -13118,3 +13118,249 @@ live round trip (PASS)`, zero panics, zero new non-SD/DharaFS FAILs.
 Real end-to-end resolution against an actual DNS server can only be proven on real hardware (a real LAN
 has a real resolver reachable) -- flagged for the next real-HW boot cycle, same "QEMU can't fully prove
 this" category as USB enumeration and the ARP-auto-answer-against-a-real-peer feature earlier this session.
+
+### Task #325 retest: FIFO-sizing fix flashed, `GET_DESCRIPTOR(Device)` STILL fails at the identical point (2026-10-03)
+
+User reflashed with the latest build (includes today's FIFO-sizing fix from the previous entry, plus the
+new DNS client) and asked for a UART check. Ran `test/dhdl_realhw_check.py` (16/16 steps confirmed, board
+fully responsive, zero panics/reboots) and pulled its raw log (`/tmp/dhdl_realhw_check.log`, captured via
+`ShellSession`'s own always-on log file -- no separate boot-capture script needed this time since the
+session's `wait_until_ready()` handshake doesn't discard anything before it, it just reads from whatever
+is already buffered on the wire).
+
+The boot banner shows the exact same failure signature as the `GRXFSIZ`/`GNPTXFSIZ`/`HPTXFSIZ` fix was
+meant to resolve: `port_connected=1 port_enabled=1` (port bring-up still clean), then `USB DIAG: SETUP
+stage failed, raw HCINT=0x00000000 HPRT0=0x00021405` -- the exact same `HCINT=0` ("true silence": the
+full polling budget elapsed with zero interrupt bits ever set, not a hard-error bit) and the exact same
+`HPRT0` value already on record from the pre-FIFO-fix retest. **The FIFO-sizing fix, despite being
+independently confirmed via a real BCM2835 register dump and U-Boot's own matching reference-driver gating
+logic, did NOT change this board's behavior at all.** This was flagged as "the strongest remaining
+candidate" in the prior entry -- that theory is now disproven by direct real-HW evidence, not just
+unconfirmed.
+
+Given `HCINT` never shows even a single bit (not NAK, not XFRC, not a hard error -- nothing), the channel
+either never actually gets enabled on real silicon despite the driver believing it did, or the core's own
+interrupt-aggregation/enable path (`GINTMSK`/`HAINTMSK`/per-channel `HCINTMSK`) has a gap this driver has
+never audited -- `HPRT0`/port-level state has had four real fixes now (TRSTRCY, NAK-tolerance, FIFO
+sizing, plus the original reset+power-on pair) and all of them left the port layer looking correct while
+the actual channel-level transfer silently never completes. Not fixed this round -- flagging for the next
+pass rather than guessing a fifth hypothesis blind, same discipline the prior entry itself called for.
+Task #325 stays open.
+
+### Task #325: found and fixed a real HCCHAR.MULTICNT gap -- channel enable was missing a required field (2026-10-03)
+
+User asked to dig into the interrupt-mask registers (`GINTMSK`/`HAINTMSK`/`HCINTMSK`) specifically, and to
+compare against U-Boot's and Linux's real RPi-family DWC2 sources before touching anything.
+
+**Interrupt-mask hypothesis checked and ruled out first**: U-Boot's own `drivers/usb/host/dwc2.c` (the
+closest architectural match -- a real, working, polling-based bare-metal driver, no IRQ line) writes
+`hcintmsk=0` and never touches `GINTMSK`/`HAINTMSK` at all in its host transfer path -- the exact same
+choice this driver already made (see `dwc2_wait_chan0_done`'s own header comment, which independently
+reached the same conclusion from `hcd_intr.c`'s `dwc2_update_hc_irq` months ago). A real, working reference
+for this exact use case needs no interrupt-mask programming to poll `HCINT` directly. That theory is dead.
+
+**What the comparison found instead**: `HCCHAR.MULTICNT` (bits [21:20], "multi count" -- the number of
+transactions the host schedules for this channel) was never set anywhere in this driver's history. All 18
+call sites across control/bulk/interrupt transfers funnel through one shared builder, `dwc2_build_hcchar`,
+which only ever OR'd in CHENA/DEVADDR/EPTYPE/EPDIR/EPNUM/MPS -- bits [21:20] silently stayed at their reset
+value, `0b00` (the reserved encoding, not "1 transaction"). Confirmed against BOTH real references
+independently: Linux's `drivers/usb/dwc2/hcd.c` sets `chan->multi_count = 1` as the unconditional default
+in `dwc2_hc_init` (only ever overridden to `qh->maxp_mult` for INTR/ISOC endpoints -- itself always 1 on
+this project's own full-speed/low-speed-only BCM2835 hardware), then `dwc2_hc_start_transfer` explicitly
+ORs `(ec_mc << HCCHAR_MULTICNT_SHIFT)` into `HCCHAR` immediately before the same write that sets `CHENA`.
+U-Boot's own `transfer_chunk` does the identical thing more directly: `clrsetbits_le32(&hc_regs->hcchar,
+..., (1 << DWC2_HCCHAR_MULTICNT_OFFSET) | ... | DWC2_HCCHAR_CHEN)`. Both real, working drivers -- one
+interrupt-driven, one polling, on two different host-stack designs -- agree this field must be 1 for every
+single endpoint type this hardware ever uses; neither ever leaves it at 0.
+
+This matches the observed failure signature precisely: a real DWC2 core's internal scheduling logic
+consults `MULTICNT` to decide how many transactions to actually issue -- left at the reserved value, the
+channel can legitimately never issue anything on the wire at all, which is exactly "HCINT stays
+`0x00000000`, true silence, not a NAK/STALL/error" while `HPRT0` and every port-level register keep
+reporting a clean, connected, enabled port throughout (today's own prior retest, and in fact every retest
+back through the original TRSTRCY/NAK-tolerance/FIFO-sizing rounds). QEMU's own simplified DWC2 model
+evidently never consults this field at all -- every QEMU enumeration path this project has (`qemu_run.py`,
+`phase4_milestone.py`, plus the ad hoc `-device usb-kbd`/`-device usb-storage` manual checks from the prior
+round) has passed unchanged through every round this bug has been present, which is exactly why it stayed
+invisible until a real-HW `HCINT`/`HPRT0` trace was captured and compared directly against source.
+
+**Fixed**: `dwc2_build_hcchar` now ORs in `multicnt=1` at bits [21:20] alongside the existing fields --
+a single-point fix covering all 18 call sites (every control, bulk, and interrupt transfer this driver
+issues) rather than threading a new parameter through each site, since every real reference agrees the
+value is always 1 on this hardware regardless of endpoint type.
+
+**Verification**: `./build.sh` clean (zero `asm_safety_audit.py` findings). `qemu_run.py` clean (same known
+baseline). `phase4_milestone.py` 18/18 PASS, confirming this is a true no-op under QEMU exactly as
+predicted (QEMU's DWC2 model doesn't gate on this field). Real-HW retest is the actual proof this time --
+flagged for the next boot cycle. Task #325 stays open until that retest confirms `GET_DESCRIPTOR(Device)`
+actually completes.
+
+### Task #325 retest: MULTICNT fix flashed, identical failure signature -- theory disproven (2026-10-03)
+
+Real-HW retest of the MULTICNT fix: `test/dhdl_realhw_check.py` 16/16 confirmed, board stable, but the raw
+boot log (`/tmp/dhdl_realhw_check.log`) shows the byte-for-byte identical signature as every retest before
+it: `USB DIAG: SETUP stage failed, raw HCINT=0x00000000 HPRT0=0x00021405`. Despite strong, independently-
+corroborated evidence from both Linux and U-Boot that `MULTICNT` must be 1, setting it changed nothing on
+real silicon. That theory, while well-evidenced, is now disproven by direct real-HW observation -- not
+every real gap this driver has is the actual cause of this specific symptom, and this session's own
+discipline is to trust the hardware over the evidence when they disagree.
+
+### Task #325: found and fixed GAHBCFG.DMAEN -- never enabled in this driver's entire history (2026-10-03)
+
+User asked to dig into the interrupt-mask registers specifically and to compare against real U-Boot/Linux
+RPi sources, after the MULTICNT retest came back unchanged.
+
+**GAHBCFG itself -- not just the interrupt masks -- turned out to be the real gap.** `dwc2_enable_global_
+intr` is the only function in this driver that has ever touched GAHBCFG (offset 0x08), and it only ever
+ORs in bit 0 (GLBL_INTR_EN). Bit 5, DMAEN, has never been set anywhere in this driver's history, despite
+every single transfer this driver issues (every SETUP/DATA/STATUS stage, every bulk transfer for WiFi/BLE/
+mass storage) programming `HCDMA` with a real memory address and relying on the controller to actually
+honor it.
+
+Confirmed against both real references independently: Linux's `hcd.c` `dwc2_gahbcfg_init` ORs in
+`GAHBCFG_DMA_EN` whenever `host_dma` is set (the normal case for any driver using HCDMA the way this one
+does); U-Boot's own bare-metal `dwc2.c` explicitly switches on `GHWCFG2`'s ARCHITECTURE field and, for
+`DWC2_HWCFG2_ARCHITECTURE_INT_DMA`, ORs in both `DWC2_GAHBCFG_HBURSTLEN_INCR4` and `DWC2_GAHBCFG_
+DMAENABLE`. This exact chip IS Internal-DMA-architecture -- decoding the real `GHWCFG2=0x228ddd50` register
+dump already pulled from live BCM2835 silicon during the FIFO-sizing investigation, bits[4:3]
+(ARCHITECTURE) read `0b10` = 2 = `INT_DMA_ARCH`, the same value U-Boot's own switch statement gates this
+code path on.
+
+Without `DMAEN` set, a real DWC2 core stays in Slave/FIFO mode: it ignores `HCDMA` entirely and expects the
+CPU to push/pop packet bytes through FIFO data registers (`GRXSTSP`, the non-periodic TxFIFO) this driver
+has never touched -- it was written entirely around the DMA-mode model from the start. This explains why
+every prior real-HW fix this session (TRSTRCY, NAK-tolerance, FIFO-sizing, MULTICNT) left `HCINT=0x00000000`
+identically unchanged: none of them matter if the core was never actually in DMA mode to begin with -- a
+channel enabled on a Slave-mode core has nothing queued to transmit (the SETUP bytes sit in `dwc2_dma_
+scratch`, never pushed into any FIFO), so it genuinely never issues anything on the wire, which is exactly
+"true silence," while `HPRT0` and every port-level register (unrelated to DMA-vs-Slave mode) keep reporting
+a clean, connected, enabled port throughout -- precisely what every retest this session has shown. QEMU's
+own simplified DWC2 model evidently never enforces this distinction at all, which is why this gap has been
+invisible through every QEMU run this entire session.
+
+**Fixed**: new `dwc2_enable_dma_mode()`, called in `dwc2_init()` right after the existing `dwc2_enable_
+global_intr()` call (same relative ordering U-Boot uses -- GAHBCFG programming during core bring-up, before
+port power-on). Sets `DMAEN` (bit 5) and `HBURSTLEN=INCR4` (bits [4:1], U-Boot's own choice for this exact
+architecture), matching both references.
+
+**Verification**: `./build.sh` clean (zero `asm_safety_audit.py` findings). `qemu_run.py` clean (same
+known baseline). `phase4_milestone.py` 18/18 PASS, confirming this is a true no-op under QEMU exactly as
+predicted. Real-HW retest is the next step -- flagged for the next boot cycle. Task #325 stays open until
+that retest confirms `GET_DESCRIPTOR(Device)` actually completes.
+
+### Task #325 retest: DMAEN fix flashed, real progress -- failure moved from true silence to a real XACTERR (2026-10-03)
+
+Real-HW retest of the DMAEN fix: `test/dhdl_realhw_check.py` 16/16 confirmed, board stable. The raw boot
+log shows, for the first time in this entire investigation, a DIFFERENT HCINT value: `USB DIAG: SETUP
+stage failed, raw HCINT=0x00000080 HPRT0=0x00021405` -- bit 7 (XACTERR, Transaction Error), not
+`0x00000000`. Every single prior retest (TRSTRCY, NAK-tolerance, FIFO-sizing, MULTICNT) showed the
+identical `0x00000000` "true silence" value; DMAEN is the first fix that has changed the hardware's actual
+behavior at all. The channel is now genuinely attempting a transaction on the wire and getting a real
+(if still unsuccessful) response, confirming the DMAEN diagnosis was correct -- the core really was stuck
+in Slave mode the entire time, and every earlier fix was consulting registers the hardware was never
+actually using.
+
+### Task #325: found and fixed HCFG.FSLSPclkSel + FSLSSupp -- FS/LS PHY clock select never programmed (2026-10-03)
+
+Investigated the new XACTERR directly rather than guessing a retry policy. Checked Linux's `USBTRDTIM`
+field first (a classic XACTERR cause) and ruled it out: that adjustment only applies to high-speed ULPI/
+UTMI PHYs, gated behind an `else` branch Linux explicitly skips for FS/LS-with-FS-PHY configurations --
+BCM2835's own case (confirmed via `dwc2_phy_init`'s own dispatch: FS/LS speed + FS PHY type calls
+`dwc2_fs_phy_init`, never `dwc2_hs_phy_init` where `USBTRDTIM` lives). Not relevant to this hardware.
+
+**What actually matters for this exact PHY type**: `HCFG` (offset 0x400 -- confirmed identically against
+Linux's `hw.h` `#define HCFG HSOTG_REG(0x0400)` and U-Boot's own `struct dwc2_host_regs` layout at the same
+offset) bits [1:0] (`FSLSPclkSel`) and bit 2 (`FSLSSupp`) have never been programmed anywhere in this
+driver's history. `FSLSPclkSel` selects the clock rate the host core uses for its own FS/LS bit-level
+signaling -- a wrong value here is a textbook cause of exactly the bit-stuff/CRC/turnaround-timing errors
+XACTERR reports, on the very first real transaction attempted, while leaving the coarser port-level state
+machine (`HPRT0`) completely unaffected (a separate state machine, unrelated to this clock-select field).
+
+Confirmed against both real references, independently, with the identical value for this identical PHY
+type: Linux's `dwc2_init_fs_ls_pclk_sel` (`core.c`) sets `HCFG_FSLSPCLKSEL_48_MHZ` (value 1) whenever
+`phy_type == DWC2_PHY_TYPE_PARAM_FS` -- true for BCM2835's embedded FS-only PHY. U-Boot's own
+`init_fslspclksel()` sets the identical `DWC2_HCFG_FSLSPCLKSEL_48_MHZ` for "Full speed PHY", called during
+core init, and additionally sets `DWC2_HCFG_FSLSSUPP` (bit 2) right after -- both programmed together as a
+pair in the one real reference closest to this project's own bare-metal, polling-based driver shape.
+
+**Fixed**: new `dwc2_init_fs_ls_pclk_sel()`, called in `dwc2_init()` right after the DMAEN fix (matching
+both references' relative ordering -- core clock/mode configuration during bring-up, before port
+power-on). Sets `FSLSPclkSel=48MHz` and `FSLSSupp=1` together, matching U-Boot's exact pairing.
+
+**Verification**: `./build.sh` clean (zero `asm_safety_audit.py` findings). `qemu_run.py` clean (same
+known baseline). `phase4_milestone.py` 18/18 PASS, confirming this is a true no-op under QEMU (its DWC2
+model evidently doesn't model FS/LS clock-select timing either). Real-HW retest is the next step --
+flagged for the next boot cycle. Task #325 stays open until that retest confirms `GET_DESCRIPTOR(Device)`
+actually completes.
+
+### Task #325 retest: FSLSPclkSel fix flashed, XACTERR unchanged -- and a real-HW instability surfaced (2026-10-03)
+
+Real-HW retest of the FSLSPclkSel fix: `HCINT=0x00000080` (XACTERR), byte-for-byte identical to the
+DMAEN-only retest -- no further change from this specific fix. More significantly: a SEPARATE, genuine
+kernel crash was observed during this boot cycle -- `FATAL: Prefetch Abort at address 0x3F3F3F2E
+status=00000005`, occurring well into the idle loop, after the board had already been fully responsive
+for a stretch. The FIRST crash of this entire session.
+
+Audited directly rather than guessing a fix: ruled out an unmasked real USB hardware interrupt (`IC_
+ENABLE2`, the BCM2835 top-level interrupt controller, only ever has the UART0 bit set anywhere in this
+file -- USB's IRQ line cannot reach the CPU regardless of the DWC2 core's own internal state) and a
+missing ARM-to-bus address translation for the DMA buffer (the existing, already-proven-on-real-hardware
+`dma_ram_copy_test` self-test uses plain, untranslated addresses successfully on this exact chip, ruling
+out a general requirement on this memory map). Found a documented precedent for the exact same failure
+*class* (`corrupts a code-address value... jumps into a literal pool, executing data as code`) in this
+project's own history -- `task_a`'s USR-mode resume during the `lr_usr` saga (tasks #253/#262/#267) --
+confirmed that specific bug is fixed and not live today, but it establishes this general failure mode
+(PC corrupted -> literal-pool execution -> wild jump) has real precedent in this codebase. Most plausible
+mechanism, not yet confirmed: `DMAEN` likely changed real boot *timing* (the SETUP-stage poll loop now
+does real bus work before failing, instead of an instant silent timeout), and this project has several
+already-documented, hard-to-reproduce, timing-sensitive races (`SCHED SHADOW MISMATCH`, visible in these
+very logs; the `lr_usr` saga; the FIQ-in-IRQ nesting race from task #273) a timing shift could plausibly
+expose for the first time on this board, rather than a new memory-safety bug in the new register writes
+themselves (confirmed: none of the three USB fixes touch RAM, the stack, or any pointer).
+
+Attempted to reproduce via three further boot cycles and a 240-second passive idle watch -- no second
+occurrence. Two of the reproduction attempts themselves returned empty captures despite the board being
+confirmed alive immediately before and after (via `dhdl_realhw_check.py`), traced to a tooling issue in
+the ad hoc raw-capture script, not a second crash -- the board was never actually silent during those
+windows. Net: one confirmed crash, not yet reproduced, cause not yet confirmed. Flagged as a real but
+currently un-reproduced risk rather than blocking further USB work on it.
+
+### kernlog: rotating, severity-gated crash/diagnostic log persisted to DharaFS (2026-10-03)
+
+User asked for persistent boot-time logging on "all possible code logic which may be possible cause of
+crash," directly motivated by the Prefetch Abort above -- this project's fault reports and USB enumeration
+failures only ever reached the live UART before this, genuinely lost if nobody happened to be watching.
+Scoped interactively: severity-gated to CRITICAL+FATAL only (the user's own explicit choice, not every
+`uart_puts` call project-wide -- this project's single most-called primitive stays completely untouched);
+timestamps are ISO8601 DURATION format (`PT<seconds>.<microseconds>S`) from `TIMER_CLO`, not a real
+calendar date-time -- this board has no RTC and no NTP client (confirmed: no wall-clock source exists
+anywhere in this codebase) -- per the user's own design, a real time source (RTC, then NTP-synced) is
+checked first and this boot-relative duration is the fallback, which is what every entry uses today since
+neither exists; rotation reuses the project's own existing `dharafs_log_append_raw` primitive (already
+live via the `log <name> <text>` shell command, numbered `/logs/<name>-NNNN.log` files + a header),
+parameterized so kernlog gets its own independently-configurable max-size/backup-count (default 2048
+bytes / 3 generations, both overridable via `/config/kernlog_maxsize`+`/config/kernlog_backups` at boot
+or live via `dhdl`-style accessors) instead of the shared constants the generic `log` command still uses
+unchanged.
+
+Also enriched `fault_prefetch_abort` (`vectors.S`) to capture `r0`-`r3`/`lr` before its own IFAR/IFSR MRC
+reads clobber them -- mirroring `fault_data_abort`'s already-proven capture exactly. Previously these
+fields were "recorded as 0" (`abort_report_prefetch`'s own old comment) for every Prefetch Abort this
+project has ever reported, including the one above; `lr` in particular is the faulting function's own
+return address, likely the single most useful new field for root-causing a future recurrence.
+
+Wired into: `abort_report_data`/`abort_report_prefetch` (FATAL, right alongside the existing
+`crashlog_record_crash` calls), the three USB SETUP/DATA/STATUS stage failure prints in `dwc2_control_in`,
+and `dwc2_init`'s own nonzero-status report (CRITICAL). `kernlog_line_scratch` (the one new persistent
+buffer this feature needed) is allocated deliberately earlier than its own round's natural place in the
+boot sequence -- right after the very first scratch buffer, `dharafs_sd_scratch`, before anything that
+could possibly fault -- since a fault landing before this buffer existed would make the fault handler
+itself fault a second time dereferencing a still-zeroed pointer.
+
+**Verification**: `./build.sh` clean (zero `asm_safety_audit.py` findings, 82 `.S` files scanned, up from
+81). `qemu_run.py` clean (same known baseline). `phase4_milestone.py` 18/18 PASS, and confirmed genuinely
+functional, not just non-crashing: QEMU's own expected `USB: dwc2_init status=FFFFFFFF` (no device
+attached, the same real failure this feature exists to capture) produced real `/logs/kernlog-0001.log` +
+`/logs/kernlog.hdr` files, visible in the milestone run's own `ls` output. Real-HW retest (confirming the
+Prefetch-Abort path specifically, which QEMU's own test flow never exercises) is pending the next
+occurrence -- by design, since the whole point is capturing whatever crash happens next, not forcing one.
