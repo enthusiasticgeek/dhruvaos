@@ -12862,3 +12862,39 @@ transfer, or silently drop mid-transaction -- never previously checked). QEMU-ve
 chain unchanged -- QEMU's own successful paths never hit these new print statements at all). Real-HW retest
 pending: this should finally show WHICH stage is failing and with what real hardware state, instead of
 continuing to guess.
+
+### Task #325: found and fixed the real FIFO-sizing gap (2026-10-02)
+
+User asked to keep digging specifically on FIFO sizing before another retest. This driver NEVER programmed
+`GRXFSIZ`/`GNPTXFSIZ`/`HPTXFSIZ` (the RX / non-periodic-TX / periodic-TX FIFO RAM partition registers),
+leaving them at whatever the core's own power-on-reset state happens to be.
+
+**Confirmed this is a real, required gap, not an intentional simplification**: pulled a real register dump
+from actual BCM2835 silicon (a Raspberry Pi Zero W, same SoC family as the Pi 1B) -- `GHWCFG2=0x228ddd50`,
+`GHWCFG3=0x0ff000e8`. Decoded `GHWCFG2` bit 19 (`DYNAMIC_FIFO`, confirmed against Linux's own
+`drivers/usb/dwc2/hw.h` bit layout) -- it is **SET** on this exact chip, meaning its FIFO RAM is software-
+configurable, not fixed. Checked U-Boot's own real, working, host-mode-only bare-metal driver
+(`drivers/usb/host/dwc2.c`, the single closest reference to this project's own from-scratch style) --
+it gates its ENTIRE FIFO-sizing block on exactly this same `GHWCFG2` bit, and genuinely DOES write all
+three registers on BCM2835 as a result. A real, working reference driver needs this step on this
+hardware; this project's own omission was a real gap. `GHWCFG3[31:16]` confirms 4080 words of total FIFO
+RAM available on this chip -- comfortably more than the ~1300 words the three regions below need.
+
+**Fixed**: added `dwc2_config_fifos()`, called once per boot right after `dwc2_force_host_mode()` (matching
+U-Boot's own relative ordering -- core host init including FIFO sizing happens before VBUS/port power-on).
+Values and field layout taken directly from U-Boot's own `dwc2.h`/`dwc2.c` (`DWC2_HOST_RX_FIFO_SIZE=532`,
+`DWC2_HOST_NPERIO_TX_FIFO_SIZE=0x100`, `DWC2_HOST_PERIO_TX_FIFO_SIZE=0x200`; each non-RX register packs
+DEPTH in bits[31:16] and STARTADDR in bits[15:0], confirmed against Linux's own `hw.h`
+`FIFOSIZE_DEPTH_MASK`/`FIFOSIZE_STARTADDR_MASK`) -- not new values invented for this driver, with each
+region's start address immediately following the previous one, matching the same real driver's own layout
+exactly. Followed by the standard flush sequence (`GRSTCTL` TXFFLSH with TXFNUM=0x1F/"all", then RXFFLSH,
+each bounded-polled for self-clear) U-Boot's own code runs immediately after its FIFO-size writes.
+
+QEMU-verified: build clean with zero `asm_safety_audit.py` findings, `qemu_run.py` clean. Re-ran both real
+enumeration paths this project has under QEMU to confirm zero regression: `-device usb-kbd` (full
+root+hub+HID chain, unchanged) AND `-device usb-storage` (full BOT/SCSI chain -- TEST UNIT READY, INQUIRY,
+READ CAPACITY, WRITE(10)/READ(10), FS-abstraction check -- all still PASS, byte-for-byte unchanged). True
+no-op for both, as expected -- QEMU's own FIFO model doesn't require real sizing either way. Real-HW retest
+pending -- this is the strongest remaining candidate for the actual root cause, given it is independently
+confirmed via a real hardware register dump AND a real, working reference driver's own gating logic on this
+exact chip, not inferred from guesswork.

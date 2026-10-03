@@ -18156,6 +18156,81 @@ fn dwc2_force_host_mode() -> i64 {
   return 0;
 }
 
+// Task #325 (2026-10-02, real-HW USB bring-up investigation, user:
+// "keep digging on FIFO sizing"): this driver never once programmed
+// GRXFSIZ/GNPTXFSIZ/HPTXFSIZ (the RX/non-periodic-TX/periodic-TX FIFO
+// RAM partition), leaving them at whatever the core's own power-on
+// reset state happens to be. Confirmed this is a REAL, required gap
+// on real BCM2835 silicon, not just a cosmetic one: read real
+// hardware's own GHWCFG2 value (a published register dump from an
+// actual Pi, 0x228ddd50) and decoded bit 19 (GHWCFG2_DYNAMIC_FIFO,
+// confirmed against Linux's own drivers/usb/dwc2/hw.h bit layout) --
+// it is SET on this exact chip. U-Boot's own real, working, host-
+// mode-only bare-metal driver (drivers/usb/host/dwc2.c, the single
+// closest reference to this project's own from-scratch bring-up)
+// gates its ENTIRE FIFO-sizing block on exactly this same GHWCFG2
+// bit, and DOES write all three registers on this exact SoC as a
+// result -- meaning a real, working reference driver needs this step
+// on this hardware, and this project's own omission is a genuine gap,
+// not an intentional simplification. GHWCFG3[31:16] (0x0ff000e8 on
+// real hardware) confirms 4080 words of total FIFO RAM available --
+// comfortably more than the 1300 words these three regions need.
+//
+// Values and field layout taken directly from U-Boot's own dwc2.h/
+// dwc2.c (DWC2_HOST_RX_FIFO_SIZE=532, DWC2_HOST_NPERIO_TX_FIFO_SIZE=
+// 0x100, DWC2_HOST_PERIO_TX_FIFO_SIZE=0x200; each non-RX register
+// packs DEPTH in bits[31:16] and STARTADDR in bits[15:0], confirmed
+// against Linux's own hw.h FIFOSIZE_DEPTH_MASK/FIFOSIZE_STARTADDR_MASK
+// -- not new values invented for this driver), with each region's
+// start address immediately following the previous one, matching the
+// same real, working driver's own layout exactly rather than deriving
+// a fresh partition scheme.
+fn dwc2_config_fifos() -> i64 {
+  let grxfsiz: i64 = dwc2_base() + 0x24;
+  let gnptxfsiz: i64 = dwc2_base() + 0x28;
+  let hptxfsiz: i64 = dwc2_base() + 0x100;
+  let grstctl: i64 = dwc2_base() + 0x10;
+
+  let rx_size: u32 = 532 as u32;
+  let nptx_size: u32 = 0x100 as u32; // 256 words
+  let ptx_size: u32 = 0x200 as u32;  // 512 words
+
+  let _ = mmio_write_u32(grxfsiz, rx_size);
+  let _ = mmio_write_u32(gnptxfsiz, (nptx_size << (16 as u32)) | rx_size);
+  let _ = mmio_write_u32(hptxfsiz, (ptx_size << (16 as u32)) | (rx_size + nptx_size));
+
+  // Flush both TX FIFOs (TXFNUM=0x1F selects "all") and the RX FIFO
+  // after resizing -- standard DWC2 practice after any FIFO RAM
+  // repartition, confirmed against U-Boot's own dwc2_flush_tx_fifo(
+  // GRSTCTL_TXFNUM_ALL)/dwc2_flush_rx_fifo() call sequence immediately
+  // following its own FIFO-size writes. Each flush bit is self-
+  // clearing (polled, bounded, matching dwc2_core_soft_reset's own
+  // established pattern just above).
+  let txfnum_all: u32 = 0x1F as u32;
+  let _ = mmio_write_u32(grstctl, (0x20 as u32) | (txfnum_all << (6 as u32))); // TXFFLSH=bit5
+  let tx_flush_tries: i64 = 0;
+  while tx_flush_tries < 20 {
+    let v: u32 = mmio_read_u32(grstctl);
+    if (v & (0x20 as u32)) == (0 as u32) {
+      tx_flush_tries = 20;
+    } else {
+      tx_flush_tries = tx_flush_tries + 1;
+    }
+  }
+
+  let _ = mmio_write_u32(grstctl, 0x10 as u32); // RXFFLSH=bit4
+  let rx_flush_tries: i64 = 0;
+  while rx_flush_tries < 20 {
+    let v2: u32 = mmio_read_u32(grstctl);
+    if (v2 & (0x10 as u32)) == (0 as u32) {
+      rx_flush_tries = 20;
+    } else {
+      rx_flush_tries = rx_flush_tries + 1;
+    }
+  }
+  return 0;
+}
+
 fn dwc2_init() -> i64 {
   let id: u32 = dwc2_read_gsnpsid();
   let _ = uart_puts("USB: GSNPSID=");
@@ -18165,6 +18240,13 @@ fn dwc2_init() -> i64 {
   let _ = dwc2_restart_phy_clock();
   let _ = dwc2_core_soft_reset();
   let _ = dwc2_force_host_mode();
+  // Task #325: FIFO RAM partition -- must happen once we're definitely
+  // in host mode (matching U-Boot's own relative ordering: core host
+  // init, including FIFO sizing, happens before VBUS/port power-on
+  // operations) and before anything could attempt a real transfer.
+  // See dwc2_config_fifos's own header comment for the full real-HW
+  // finding.
+  let _ = dwc2_config_fifos();
   let _ = dwc2_enable_global_intr();
   let _ = dwc2_port_power_on();
 
