@@ -218,6 +218,46 @@ arp_resolve_mac_scratch_addr:
                          * that says what actually uses it beats a
                          * borrowed one that would read as a hidden
                          * coupling that doesn't exist. */
+netif_arp_autoanswer_sender_mac_scratch_addr:
+    .word 0             /* 6 bytes: netif_recv_frame's own ARP-auto-
+                         * answer hook (protocol-audit sweep, found via
+                         * a direct comparison against u-boot/net/
+                         * arp.c's arp_receive() and Linux's
+                         * arp_process() -- both answer an incoming
+                         * REQUEST transparently at the netif layer;
+                         * this project previously had NO code path
+                         * that ever did, at all -- arp_build_reply was
+                         * only ever called from self-tests). Holds the
+                         * requesting peer's MAC, extracted from the
+                         * just-dequeued REQUEST frame, before building
+                         * the reply. */
+netif_arp_autoanswer_my_mac_scratch_addr:
+    .word 0             /* 6 bytes: this board's own MAC, fetched via
+                         * netif_get_mac right before building the
+                         * auto-answer reply -- kept separate from
+                         * every other my_mac scratch in this file
+                         * (same per-buffer-single-purpose discipline),
+                         * since netif_recv_frame is the one consumer
+                         * here with no caller-supplied buffer to reuse. */
+netif_arp_autoanswer_reply_scratch_addr:
+    .word 0             /* 64 bytes: the auto-generated ARP reply frame
+                         * itself, built then immediately handed to
+                         * netif_send_frame from inside netif_recv_frame
+                         * -- same size as every other one-ARP-frame
+                         * buffer in this file (e.g. arp_resolve_scratch
+                         * above). */
+tcp_unmatched_rst_peer_mac_scratch_addr:
+    .word 0             /* 6 bytes: tcp_conn_poll's own RST-on-
+                         * unmatched-port hook (protocol-audit sweep --
+                         * compared against Linux's tcp_v4_send_reset,
+                         * the "no socket matches incoming packet"
+                         * path). Holds the Ethernet source MAC pulled
+                         * straight out of the just-dequeued segment's
+                         * own frame (there's no ARP-cache entry to
+                         * rely on here -- this is, by definition, a
+                         * peer we have no established state for), so
+                         * the RST can be addressed straight back at
+                         * whoever sent the unmatched segment. */
 dhcp_payload_scratch_addr:
     .word 0             /* 300 bytes: the DHCP client's own message
                          * build buffer (DISCOVER/REQUEST), shared by
@@ -757,6 +797,62 @@ arp_resolve_mac_scratch_set:
 .global arp_resolve_mac_scratch_get
 arp_resolve_mac_scratch_get:
     ldr r0, =arp_resolve_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global netif_arp_autoanswer_sender_mac_scratch_set
+netif_arp_autoanswer_sender_mac_scratch_set:
+    ldr r1, =netif_arp_autoanswer_sender_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global netif_arp_autoanswer_sender_mac_scratch_get
+netif_arp_autoanswer_sender_mac_scratch_get:
+    ldr r0, =netif_arp_autoanswer_sender_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global netif_arp_autoanswer_my_mac_scratch_set
+netif_arp_autoanswer_my_mac_scratch_set:
+    ldr r1, =netif_arp_autoanswer_my_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global netif_arp_autoanswer_my_mac_scratch_get
+netif_arp_autoanswer_my_mac_scratch_get:
+    ldr r0, =netif_arp_autoanswer_my_mac_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global netif_arp_autoanswer_reply_scratch_set
+netif_arp_autoanswer_reply_scratch_set:
+    ldr r1, =netif_arp_autoanswer_reply_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global netif_arp_autoanswer_reply_scratch_get
+netif_arp_autoanswer_reply_scratch_get:
+    ldr r0, =netif_arp_autoanswer_reply_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global tcp_unmatched_rst_peer_mac_scratch_set
+tcp_unmatched_rst_peer_mac_scratch_set:
+    ldr r1, =tcp_unmatched_rst_peer_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global tcp_unmatched_rst_peer_mac_scratch_get
+tcp_unmatched_rst_peer_mac_scratch_get:
+    ldr r0, =tcp_unmatched_rst_peer_mac_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

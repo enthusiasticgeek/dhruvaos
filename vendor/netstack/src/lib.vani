@@ -171,14 +171,24 @@ fn netstack_filter_check_frame(frame: ref [u8; 512], frame_len: i64, is_outgoing
   }
   let proto: u32 = frame[14 + 9] as u32;
   let src_ip: u32 = if is_outgoing == (1 as u32) { netstack_read_u32_be(frame, 14 + 16) } else { netstack_read_u32_be(frame, 14 + 12) };
+  // Protocol audit: this used to hardcode the L4 offset as 34 (14
+  // Ethernet + a fixed 20-byte IP header), ignoring the IP header's
+  // own IHL nibble -- any real packet carrying IP options (IHL>5)
+  // would have its TCP/UDP port fields read from the wrong offset
+  // (actually still-inside-the-options bytes), producing a wrong
+  // dst_port match. Linux always derives the L4 offset as iph->ihl*4
+  // bytes past the IP header start (net/ipv4/ip_input.c); do the same
+  // here instead of assuming IHL==5.
+  let ihl: i64 = (frame[14] & (0x0F as u8)) as i64;
+  let l4_offset: i64 = 14 + ihl * 4;
   let dst_port: u32 = 0 as u32;
   let has_port: u32 = 0 as u32;
-  if (proto == (6 as u32)) && (frame_len >= 38) {
-    dst_port = netstack_read_u16_be(frame, 34 + 2);
+  if (proto == (6 as u32)) && (frame_len >= (l4_offset + 4)) {
+    dst_port = netstack_read_u16_be(frame, l4_offset + 2);
     has_port = 1 as u32;
   }
-  if (proto == (17 as u32)) && (frame_len >= 38) {
-    dst_port = netstack_read_u16_be(frame, 34 + 2);
+  if (proto == (17 as u32)) && (frame_len >= (l4_offset + 4)) {
+    dst_port = netstack_read_u16_be(frame, l4_offset + 2);
     has_port = 1 as u32;
   }
 

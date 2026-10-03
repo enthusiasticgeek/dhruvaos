@@ -1818,6 +1818,22 @@ extern "C" fn arp_resolve_mac_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn arp_resolve_mac_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
+extern "C" fn netif_arp_autoanswer_sender_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_arp_autoanswer_sender_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_arp_autoanswer_my_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_arp_autoanswer_my_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_arp_autoanswer_reply_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_arp_autoanswer_reply_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn tcp_unmatched_rst_peer_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn tcp_unmatched_rst_peer_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
 extern "C" fn dhcp_payload_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dhcp_payload_scratch_get() -> mut ref i64;
@@ -13208,6 +13224,57 @@ fn filter_check_frame(frame: mut ref i64, frame_len: i64, is_outgoing: u32) -> u
 // round's live QEMU verification needs to confirm empirically, not
 // guess.
 
+// Protocol audit (compared against u-boot's net/arp.c arp_receive()
+// and Linux's net/ipv4/arp.c arp_process()) found this project had NO
+// code path that ever answered an incoming ARP REQUEST from a real
+// peer -- only arp_resolve_poll existed, and it only ever looks for
+// REPLIES (op==2); arp_build_reply itself was only ever called from
+// self-tests. On real hardware, any peer that ARPs for this board's
+// IP -- which every peer eventually does, whenever its own cache
+// entry for us expires -- would get no answer and could never learn
+// our MAC, silently breaking all real-world INBOUND connectivity
+// (SSH, HTTP, MQTT, the UDP/TCP echo servers) the first time a
+// peer's cache doesn't already happen to hold it. Invisible under
+// QEMU, where every existing self-test either resolves itself
+// (ping's own dst_ip==my_ip shortcut) or pre-seeds the ARP cache
+// directly (socket_udp_send's own arp_cache_insert for loopback), so
+// nothing ever sent a real, unanswered ARP REQUEST onto the wire
+// before this.
+//
+// Fixed at netif_recv_frame's own single shared funnel (not inside
+// any one protocol's own poller) so it answers regardless of which
+// consumer happens to be the one draining the queue when the request
+// arrives -- matching both references, which handle ARP centrally
+// rather than leaving it to whichever upper-layer socket polls next.
+// Returns 1 if the frame was a REQUEST for us (answered and
+// consumed -- the caller should treat this as "nothing ready," same
+// as a filter-denied frame), 0 otherwise (deliver the frame to the
+// caller as usual).
+fn netif_maybe_auto_answer_arp(frame: mut ref i64, frame_len: i64) -> i64 {
+  if frame_len < 42 {
+    return 0;
+  }
+  if arp_is_arp_frame(frame) != 1 {
+    return 0;
+  }
+  if arp_get_operation(frame) != (1 as u32) {
+    return 0; // only intercept REQUESTs; replies still go to arp_resolve_poll
+  }
+  let my_ip: u32 = dhcp_state_get_leased_ip();
+  if arp_get_target_ip(frame) != my_ip {
+    return 0; // not asking about us
+  }
+  let requester_mac: mut ref i64 = netif_arp_autoanswer_sender_mac_scratch_get();
+  let _ = arp_get_sender_mac(frame, requester_mac);
+  let requester_ip: u32 = arp_get_sender_ip(frame);
+  let my_mac: mut ref i64 = netif_arp_autoanswer_my_mac_scratch_get();
+  let _ = netif_get_mac(my_mac);
+  let reply_frame: mut ref i64 = netif_arp_autoanswer_reply_scratch_get();
+  let reply_len: i64 = arp_build_reply(reply_frame, my_mac, my_ip, requester_mac, requester_ip);
+  let _ = netif_send_frame(reply_frame, reply_len);
+  return 1;
+}
+
 fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   if usb_net_get_kind() == (1 as u32) {
     let mps: u32 = usb_net_get_bulk_in_mps();
@@ -13246,6 +13313,9 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
     // next poll dequeues whatever's next, same as any other "nothing
     // ready" case already does).
     if filter_check_frame(out_buf, total, 0 as u32) == (0 as u32) {
+      return 0 - 1;
+    }
+    if netif_maybe_auto_answer_arp(out_buf, total) == 1 {
       return 0 - 1;
     }
     return total;
@@ -13318,6 +13388,9 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
     if filter_check_frame(out_buf, usable_len, 0 as u32) == (0 as u32) {
       return 0 - 1;
     }
+    if netif_maybe_auto_answer_arp(out_buf, usable_len) == 1 {
+      return 0 - 1;
+    }
     return usable_len;
   }
   if netif_get_count() <= 0 {
@@ -13344,6 +13417,9 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   // also have already delivered the frame off the wire by the time
   // filtering happens).
   if filter_check_frame(out_buf, frame_len, 0 as u32) == (0 as u32) {
+    return 0 - 1;
+  }
+  if netif_maybe_auto_answer_arp(out_buf, frame_len) == 1 {
     return 0 - 1;
   }
   return frame_len;
@@ -13445,6 +13521,76 @@ fn netif_self_test() -> i64 {
     ok = 0; // must have been dequeued despite being rejected
   }
 
+  // Regression test for netif_maybe_auto_answer_arp (protocol audit,
+  // 2026-10-03 -- see its own comment for the full story): no QEMU
+  // test before this one ever sent a real, unanswered ARP REQUEST
+  // onto the wire (ping's self-ping shortcuts ARP entirely; udpecho/
+  // socket_udp_send pre-seed the cache directly) -- every existing
+  // path was blind to this bug. Builds a synthetic REQUEST exactly as
+  // a real external peer would send it (sender=a fake peer MAC/IP,
+  // target=our own leased IP), queues it via the real netif (as if it
+  // had arrived off the wire), and checks: (1) the request itself is
+  // NOT delivered raw to netif_recv_frame's caller (it must be
+  // answered and consumed, same as a filter-denied frame), and (2) a
+  // correctly-addressed REPLY was auto-queued in response -- right
+  // operation (2), right sender (us), right target (the fake peer).
+  let saved_leased_ip: u32 = dhcp_state_get_leased_ip();
+  let test_my_ip: u32 = 0xC0A80164 as u32; // 192.168.1.100
+  let _ = dhcp_state_set_leased_ip(test_my_ip);
+
+  let peer_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let pmi: i64 = 0;
+  while pmi < 6 {
+    let _ = buf_write_byte(peer_mac, pmi as u32, 0x02 as u32);
+    pmi = pmi + 1;
+  }
+  let _ = buf_write_byte(peer_mac, 5 as u32, 0x63 as u32); // 02:02:02:02:02:63
+  let peer_ip: u32 = 0xC0A80101 as u32; // 192.168.1.1
+
+  let req_frame: mut ref i64 = dhruva_alloc_bytes(64);
+  let req_len: i64 = arp_build_request(req_frame, peer_mac, peer_ip, test_my_ip);
+  let req_send_status: i64 = netif_send_frame(req_frame, req_len);
+  if req_send_status != 0 {
+    ok = 0;
+  }
+
+  let not_delivered_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let not_delivered_len: i64 = netif_recv_frame(not_delivered_buf, 64);
+  if not_delivered_len != (0 - 1) {
+    ok = 0; // the REQUEST must have been auto-answered and consumed, not handed to us
+  }
+
+  let auto_reply: mut ref i64 = dhruva_alloc_bytes(64);
+  let auto_reply_len: i64 = netif_recv_frame(auto_reply, 64);
+  if auto_reply_len < 42 {
+    ok = 0;
+  }
+  if arp_is_arp_frame(auto_reply) != 1 {
+    ok = 0;
+  }
+  if arp_get_operation(auto_reply) != (2 as u32) {
+    ok = 0;
+  }
+  if arp_get_sender_ip(auto_reply) != test_my_ip {
+    ok = 0;
+  }
+  if arp_get_target_ip(auto_reply) != peer_ip {
+    ok = 0;
+  }
+  let real_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = netif_get_mac(real_mac);
+  let reply_sender_mac: mut ref i64 = dhruva_alloc_bytes(8);
+  let _ = arp_get_sender_mac(auto_reply, reply_sender_mac);
+  let rmi: i64 = 0;
+  while rmi < 6 {
+    if buf_read_byte(reply_sender_mac, rmi as u32) != buf_read_byte(real_mac, rmi as u32) {
+      ok = 0;
+    }
+    rmi = rmi + 1;
+  }
+
+  let _ = dhcp_state_set_leased_ip(saved_leased_ip);
+
   let _ = uart_puts("NETIF: loopback send/recv + empty/full edge cases");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
@@ -13462,8 +13608,18 @@ fn netif_self_test() -> i64 {
 // Always returns 38 (>= the >=38 threshold filter_check_frame itself
 // requires before it will even look at a port), so this helper works
 // for TCP/UDP test frames uniformly; ICMP tests just ignore dst_port.
+//
+// Byte 14 (version/IHL) added by the protocol audit's IHL-derived-L4-
+// offset fix: netstack_filter_check_frame now reads this byte to
+// compute where the TCP/UDP header actually starts, instead of
+// hardcoding 34 -- a synthetic frame that leaves it at dhruva_alloc_
+// bytes' own zero-init (making IHL read as 0) would have its L4
+// offset computed as 14, not 34, breaking every port-matching rule
+// below. 0x45 (version 4, IHL 5) matches every other real IPv4 frame
+// this project builds (e.g. ipv4_build_header's own identical byte).
 fn filter_build_test_frame(frame: mut ref i64, proto: u32, src_ip: u32, dst_port: u32) -> i64 {
   let _ = buf_write_u16_be(frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let _ = buf_write_byte(frame, 14 as u32, 0x45 as u32); // version 4, IHL 5
   let _ = buf_write_byte(frame, 23 as u32, proto);    // ip_offset(14)+9
   let _ = buf_write_u32_be(frame, 26, src_ip);        // ip_offset(14)+12
   let _ = buf_write_u16_be(frame, 36, dst_port);      // tcp/udp_offset(34)+2
@@ -13557,6 +13713,7 @@ fn filter_self_test() -> i64 {
 // (for an outgoing frame, always-our-own) source.
 fn filter_build_test_frame_dst(frame: mut ref i64, proto: u32, dst_ip: u32, dst_port: u32) -> i64 {
   let _ = buf_write_u16_be(frame, 12, 0x0800 as u32); // ethertype: IPv4
+  let _ = buf_write_byte(frame, 14 as u32, 0x45 as u32); // version 4, IHL 5 -- see filter_build_test_frame's own comment
   let _ = buf_write_byte(frame, 23 as u32, proto);    // ip_offset(14)+9
   let _ = buf_write_u32_be(frame, 30, dst_ip);        // ip_offset(14)+16
   let _ = buf_write_u16_be(frame, 36, dst_port);      // tcp/udp_offset(34)+2
@@ -14100,6 +14257,32 @@ fn ipv4_verify_checksum(frame: mut ref i64, ip_offset: i64) -> i64 {
   return netstack_ipv4_verify_checksum(ref hdr);
 }
 
+// Protocol audit (compared against u-boot's own NetReceive, net/net.c,
+// and Linux's ip_rcv_core, net/ipv4/ip_input.c -- both validate
+// version and header length ONCE, centrally, before any upper-layer
+// code runs): icmp_poll/socket_udp_recv/the TCP receive path all
+// hardcode the transport-header offset as ip_offset+20, assuming
+// IHL==5 (no options) without ever checking it, and only icmp_poll
+// called ipv4_verify_checksum at all. A real peer sending IP options
+// (IHL>5) would have every byte past this point misread at the wrong
+// offset; a corrupted version/IHL byte on the wire was invisible to
+// socket_udp_recv/TCP (no IP checksum check there at all -- those
+// bytes aren't covered by the UDP/TCP pseudo-header). version==4 and
+// IHL==5 are this project's own deliberate, documented scope (no IP
+// options/fragmentation support, vani-netstack/src/lib.vani's own
+// IPv4 header comment) -- so rejecting anything else outright is
+// correct, not a new limitation.
+fn ipv4_header_is_well_formed(frame: mut ref i64, ip_offset: i64) -> i64 {
+  let vhl: u32 = buf_read_byte(frame, ip_offset as u32);
+  if (vhl & (0xF0 as u32)) != (0x40 as u32) {
+    return 0;
+  }
+  if (vhl & (0x0F as u32)) != (0x05 as u32) {
+    return 0;
+  }
+  return 1;
+}
+
 // Builds a full Ethernet+IPv4 frame around payload[0..payload_len) and
 // sends it via netif. Frame layout: [14-byte Ethernet header][20-byte
 // IP header][payload].
@@ -14516,6 +14699,9 @@ fn icmp_poll(my_mac: mut ref i64, my_ip: u32, out_payload: mut ref i64, max_payl
   if (14 + (total_len as i64)) > frame_len {
     return 0 - 1;
   }
+  if ipv4_header_is_well_formed(frame, 14) != 1 {
+    return 0 - 1;
+  }
   if ipv4_verify_checksum(frame, 14) != 1 {
     return 0 - 1;
   }
@@ -14896,6 +15082,17 @@ fn socket_udp_recv(out_payload: mut ref i64, out_meta: mut ref i64, max_payload_
     return 0 - 1;
   }
   if payload_len > max_payload_len {
+    return 0 - 1;
+  }
+  // Protocol audit: this function never validated the IP header
+  // itself (version/IHL, or its own checksum via ipv4_verify_
+  // checksum) before trusting the hardcoded udp_offset=34 -- only
+  // icmp_poll did. See ipv4_header_is_well_formed's own comment for
+  // the full u-boot/Linux citation.
+  if ipv4_header_is_well_formed(frame, 14) != 1 {
+    return 0 - 1;
+  }
+  if ipv4_verify_checksum(frame, 14) != 1 {
     return 0 - 1;
   }
   // BUG (round 8 audit, 2026-08-27): this function never checked the
@@ -15540,6 +15737,17 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
   // the segment's own data_offset field, since the checksum has to
   // cover the whole segment as received regardless of which branch
   // below ends up handling it.
+  // Protocol audit: neither this function nor socket_udp_recv ever
+  // validated the IP header itself (version/IHL, or its own checksum
+  // via ipv4_verify_checksum) before trusting the hardcoded tcp_offset
+  // =34 -- only icmp_poll did. See ipv4_header_is_well_formed's own
+  // comment for the full u-boot/Linux citation.
+  if ipv4_header_is_well_formed(frame, 14) != 1 {
+    return 0 - 1;
+  }
+  if ipv4_verify_checksum(frame, 14) != 1 {
+    return 0 - 1;
+  }
   let tcp_seg_len: i64 = recv_len - 34;
   let checksum_src_ip: u32 = ipv4_get_src_ip(frame, 14);
   let checksum_dst_ip: u32 = ipv4_get_dst_ip(frame, 14);
@@ -15688,7 +15896,24 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
     if tcp_conn_get_rtx_deadline(conn_id) != (0 as u32) {
       let rtx_seq: u32 = tcp_conn_get_rtx_seq(conn_id);
       let rtx_len: u32 = tcp_conn_get_rtx_len(conn_id);
-      if seg_ack >= (rtx_seq + rtx_len) {
+      // Protocol audit: plain unsigned >= breaks the instant sequence
+      // numbers wrap past 0xFFFFFFFF (never hit by this project's own
+      // short test ISNs, but a real latent bug for any long-lived
+      // connection) -- vani has no i32 to mirror Linux's own
+      // before()/after() (include/net/tcp.h) signed-subtraction
+      // macros directly, so get the same wraparound-safe result with
+      // unsigned-only arithmetic: a wrapping u32 subtraction's result
+      // has the same bit pattern as the signed difference would, so
+      // checking its top bit is clear (< 0x80000000) is exactly
+      // "(i32)(seg_ack - target) >= 0". MUST use wrapping_add/
+      // wrapping_sub, not plain +/- -- plain u32 `-` traps on
+      // underflow in vani (found live: this exact line crashed every
+      // boot with "integer overflow in u32 sub" the moment seg_ack <
+      // target, which is the ordinary not-yet-caught-up case, not a
+      // real wraparound), it does not silently wrap like C.
+      let target: u32 = wrapping_add(rtx_seq, rtx_len);
+      let diff: u32 = wrapping_sub(seg_ack, target);
+      if diff < (0x80000000 as u32) {
         let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
       }
     }
@@ -15920,6 +16145,72 @@ fn tcp_conn_check_retransmit(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref
 // and dequeuing a TCP frame tcpecho was actually waiting for. A third
 // instance of the same already-accepted, not-yet-solved tradeoff,
 // not a new one.
+// Protocol audit: compared against Linux's tcp_v4_send_reset (the
+// "no socket matches incoming packet" path in net/ipv4/tcp_ipv4.c) --
+// this project had no TCP RST generation anywhere at all
+// (tcp_flag_rst was declared but never referenced by anything). A
+// real peer's segment that doesn't match either of this project's 2
+// connection slots (a SYN to a closed port, or any stray segment
+// after a connection has already closed and freed its slot) got
+// silently dropped with no RST, leaving a real peer to wait out a
+// connection-attempt timeout instead of getting an immediate reset.
+// Builds the RST per RFC 793 S3.4 "Reset Generation": if the
+// offending segment has no ACK, reply with seq=0,
+// ack=SEG.SEQ+SEG.LEN, RST+ACK; if it has an ACK, reply with
+// seq=SEG.ACK, RST only (no ACK) -- and never RST a RST (RFC 793's
+// own explicit exception), matching both rules exactly. Scoped to
+// ONLY this "no matching local port" case (the true structural
+// equivalent of Linux's "no socket"), not the final fallthrough
+// inside tcp_conn_handle_segment's own per-state branches -- that
+// path can also be reached by ordinary duplicate/out-of-window
+// segments on an otherwise-live, matched connection, where blanket-
+// RSTing could tear down a connection a real peer expects to
+// recover from; a real design call, not a one-line extension of
+// this same fix.
+fn tcp_send_rst_for_unmatched(frame: mut ref i64, frame_len: i64, my_mac: mut ref i64) -> i64 {
+  let seg_flags: u32 = tcp_get_flags(frame, 34);
+  if (seg_flags & tcp_flag_rst()) != (0 as u32) {
+    return 0; // never reset a reset
+  }
+  let seg_src_port: u32 = tcp_get_src_port(frame, 34);
+  let seg_dst_port: u32 = tcp_get_dst_port(frame, 34);
+  let seg_seq: u32 = tcp_get_seq(frame, 34);
+  let seg_ack: u32 = tcp_get_ack(frame, 34);
+  let data_offset: i64 = tcp_get_data_offset_bytes(frame, 34);
+  let payload_len: i64 = frame_len - 34 - data_offset;
+  if payload_len < 0 {
+    return 0 - 1;
+  }
+  let syn_bit: u32 = if (seg_flags & tcp_flag_syn()) != (0 as u32) { 1 as u32 } else { 0 as u32 };
+  let fin_bit: u32 = if (seg_flags & tcp_flag_fin()) != (0 as u32) { 1 as u32 } else { 0 as u32 };
+  let seg_len: u32 = (payload_len as u32) + syn_bit + fin_bit;
+
+  let rst_seq: u32 = 0 as u32;
+  let rst_ack: u32 = 0 as u32;
+  let rst_flags: u32 = 0 as u32;
+  if (seg_flags & tcp_flag_ack()) == (0 as u32) {
+    rst_seq = 0 as u32;
+    rst_ack = wrapping_add(seg_seq, seg_len); // plain + traps on overflow in vani; seg_seq legitimately wraps near 0xFFFFFFFF
+    rst_flags = tcp_flag_rst() | tcp_flag_ack();
+  } else {
+    rst_seq = seg_ack;
+    rst_ack = 0 as u32;
+    rst_flags = tcp_flag_rst();
+  }
+
+  let peer_mac: mut ref i64 = tcp_unmatched_rst_peer_mac_scratch_get();
+  let pmi: i64 = 0;
+  while pmi < 6 {
+    let mb: u32 = buf_read_byte(frame, (6 + pmi) as u32);
+    let _ = buf_write_byte(peer_mac, pmi as u32, mb);
+    pmi = pmi + 1;
+  }
+  let my_ip: u32 = ipv4_get_dst_ip(frame, 14);
+  let peer_ip: u32 = ipv4_get_src_ip(frame, 14);
+  let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
+  return tcp_send_segment(my_mac, peer_mac, my_ip, peer_ip, seg_dst_port, seg_src_port, rst_seq, rst_ack, rst_flags, 0 as u32, empty_payload, 0);
+}
+
 fn tcp_conn_poll(my_mac: mut ref i64, out_payload: mut ref i64, max_payload_len: i64) -> i64 {
   // Round 37: checked on every call, for both connection slots,
   // regardless of whether a frame is even queued below -- a lost
@@ -15953,6 +16244,7 @@ fn tcp_conn_poll(my_mac: mut ref i64, out_payload: mut ref i64, max_payload_len:
     matched = 1;
   }
   if matched == 0 {
+    let _ = tcp_send_rst_for_unmatched(frame, frame_len, my_mac);
     return 0 - 1;
   }
   let result: i64 = tcp_conn_handle_segment(target_conn, frame, frame_len, my_mac, my_mac, out_payload, max_payload_len);
@@ -17345,6 +17637,37 @@ fn dhcp_server_send_reply(my_mac: mut ref i64, server_ip: u32, payload: mut ref 
   return udp_send(my_mac, bcast_mac, server_ip, bcast_ip, dhcp_server_port(), dhcp_client_port(), payload, payload_len);
 }
 
+// Frees any lease-table slot whose lease_time has elapsed since its
+// last OFFERED/BOUND transition (RFC 2131 s4.3: a server must
+// eventually reclaim expired leases). Without this, the 4-slot pool
+// was a monotonically-filling allocator: once 4 distinct MACs had
+// ever DISCOVERed, a 5th new client hit "pool exhausted" forever,
+// even hours after the first 4 leases had actually expired --
+// dhcp_server_set_lease_start_tick was declared but never called
+// anywhere, so there was nothing TO check against. lease_time==0
+// (server misconfigured with no timer) is treated as "never expire,"
+// matching dhcp_client_check_lease's own identical convention.
+fn dhcp_server_reclaim_expired() -> i64 {
+  let lease_time: u32 = dhcp_server_get_lease_time();
+  if lease_time == (0 as u32) {
+    return 0;
+  }
+  let ticks_per_second: i64 = 1000000 / (scheduler_tick_interval_us() as i64);
+  let lease_ticks: i64 = (lease_time as i64) * ticks_per_second;
+  let now: i64 = scheduler_get_tick_count() as i64;
+  let i: u32 = 0 as u32;
+  while i < (4 as u32) {
+    if dhcp_server_get_lease_state(i) != dhcp_lease_state_free() {
+      let elapsed: i64 = now - (dhcp_server_get_lease_start_tick(i) as i64);
+      if elapsed >= lease_ticks {
+        let _ = dhcp_server_set_lease_state(i, dhcp_lease_state_free());
+      }
+    }
+    i = i + (1 as u32);
+  }
+  return 0;
+}
+
 // DISCOVER: reuse an existing lease for this MAC if one exists
 // (re-offering the same address, matching real DHCP server behavior
 // for a client that DISCOVERs again before completing the handshake),
@@ -17352,8 +17675,11 @@ fn dhcp_server_send_reply(my_mac: mut ref i64, server_ip: u32, payload: mut ref 
 // free slot) is silently ignored -- a real, honest scope boundary
 // matching this project's own established "table full -> no room,
 // not a crash" posture elsewhere (the packet filter's own 8-rule
-// table, ARP's round-robin cache).
+// table, ARP's round-robin cache) -- but reclaim expired slots first,
+// so "exhausted" reflects real concurrent demand, not leases that
+// expired hours ago and were simply never freed.
 fn dhcp_server_handle_discover(frame: mut ref i64, my_mac: mut ref i64) -> i64 {
+  let _ = dhcp_server_reclaim_expired();
   let dhcp_offset: i64 = 42;
   let xid: u32 = dhcp_get_xid(frame, dhcp_offset);
   let client_mac: mut ref i64 = dhcp_server_client_mac_scratch_get();
@@ -17383,6 +17709,7 @@ fn dhcp_server_handle_discover(frame: mut ref i64, my_mac: mut ref i64) -> i64 {
   }
   let _ = dhcp_server_set_lease_state(slot as u32, dhcp_lease_state_offered());
   let _ = dhcp_server_set_lease_xid(slot as u32, xid);
+  let _ = dhcp_server_set_lease_start_tick(slot as u32, scheduler_get_tick_count());
 
   let server_ip: u32 = dhcp_server_get_server_ip();
   let lease_time: u32 = dhcp_server_get_lease_time();
@@ -17420,6 +17747,7 @@ fn dhcp_server_handle_request(frame: mut ref i64, dhcp_len: i64, my_mac: mut ref
   if ok_to_ack == 1 {
     let _ = dhcp_server_set_lease_state(slot as u32, dhcp_lease_state_bound());
     let _ = dhcp_server_set_lease_xid(slot as u32, xid);
+    let _ = dhcp_server_set_lease_start_tick(slot as u32, scheduler_get_tick_count());
     let lease_time: u32 = dhcp_server_get_lease_time();
     let ack_reply_len: i64 = dhcp_server_build_offer_ack(request_reply, 0, client_mac, xid, dhcp_msgtype_ack(), want_ip, server_ip, lease_time);
     let _ = dhcp_server_send_reply(my_mac, server_ip, request_reply, ack_reply_len);
@@ -28625,6 +28953,19 @@ fn shell_dispatch() -> i64 {
             // ~50ms, making ping's own 20-iteration ARP-resolve window
             // ~310ms total on real hardware instead of ~1s.
             let _ = delay(161000);
+            // Protocol audit: this loop used to poll 20x off a SINGLE
+            // arp_resolve_start call above -- a real request lost on
+            // the wire (plausible on this project's own RTL8188CU WiFi
+            // path) meant the entire ~1s window was spent waiting on a
+            // reply that was never actually going to arrive, since
+            // nothing ever asked again. u-boot's arp_timeout_check
+            // (net/arp.c) and Linux's arp_solicit() both resend
+            // periodically rather than asking once and only polling --
+            // resend every 5th iteration here (4 real requests across
+            // the ~1s budget) instead of exactly 1.
+            if (arp_iter % 5) == 4 {
+              let _ = arp_resolve_start(my_mac, my_ip, dst_ip);
+            }
           }
           arp_iter = arp_iter + 1;
         }
@@ -41102,6 +41443,10 @@ fn kernel_main() -> i64 {
   let _ = arp_resolve_scratch_set(dhruva_alloc_bytes(64));
   let _ = dhcp_server_mac_scratch_set(dhruva_alloc_bytes(6));
   let _ = arp_resolve_mac_scratch_set(dhruva_alloc_bytes(6));
+  let _ = netif_arp_autoanswer_sender_mac_scratch_set(dhruva_alloc_bytes(6));
+  let _ = netif_arp_autoanswer_my_mac_scratch_set(dhruva_alloc_bytes(6));
+  let _ = netif_arp_autoanswer_reply_scratch_set(dhruva_alloc_bytes(64));
+  let _ = tcp_unmatched_rst_peer_mac_scratch_set(dhruva_alloc_bytes(6));
   let _ = dhcp_payload_scratch_set(dhruva_alloc_bytes(300));
   let _ = dhcp_frame_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
   let _ = dhcp_bcast_mac_scratch_set(dhruva_alloc_bytes(8));

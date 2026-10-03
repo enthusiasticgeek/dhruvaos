@@ -12937,3 +12937,132 @@ round trip, two-time-pad fix, tamper detection, real SD media-encryption round t
 this same clean run -- the earlier SD-wedge fix (task #217) already cleared these, this run just confirms
 it with a harness that exercises them end-to-end. No real-hardware component to this bug (pure logic gap,
 reproduces identically in QEMU) -- no real-HW retest needed.
+
+### Tasks #327-333: full protocol audit vs Linux 5.10.12 / U-Boot 2015.01/2021.01 (2026-10-03)
+
+User asked to audit all protocol implementations (ARP, UDP, TCP, IPv4/ICMP, DHCP, link layer/filter)
+against u-boot or Linux source to find and fix bugs early, rather than waiting to hit them live. Both
+reference source trees were already on disk locally (`/home/virgo/Downloads/linux-5.10.12`,
+`/home/virgo/Downloads/u-boot-2021.01`, `/home/virgo/source/u-boot-2015.01`) -- same references used
+earlier this session for the DWC2 USB work. Ran 6 parallel read-only research forks, one per protocol
+area, each comparing this project's code (`kernel/kernel_main.vani` orchestration + the external
+`vani-netstack` kosh package's pure codec layer) against the matching reference. Confirmed clean (no bugs
+found, beyond deliberate scope limitations already documented in-repo): UDP codec/checksum, ARP codec,
+TCP checksum/handshake-validation/retransmission, DHCP option-parsing bounds, netif EtherType dispatch +
+hardware MAC filtering. Seven real, concrete bugs found and fixed; one found-and-rejected regression
+along the way (documented below); one larger architectural gap logged as backlog, not fixed in this pass.
+
+**Fix 1 (task #327, HIGH severity) -- no code path ever answered an incoming ARP REQUEST from a real
+peer.** `arp_build_reply()` was only ever called from self-tests; the only live consumer of incoming ARP
+traffic, `arp_resolve_poll()`, only ever looks for REPLIES (op==2). Compared against u-boot's
+`net/arp.c` `arp_receive()` and Linux's `net/ipv4/arp.c` `arp_process()` -- both answer an incoming
+REQUEST transparently, regardless of which upper-layer consumer happens to be polling. On real hardware,
+any peer that ARPs for this board's IP (every peer does, whenever its own cache entry for us expires)
+would get no answer and could never learn our MAC -- silently breaking all real-world INBOUND
+connectivity (SSH, HTTP, MQTT, the UDP/TCP echo servers) the first time a peer's cache doesn't already
+happen to hold it. Invisible under QEMU, where every existing test either resolves itself (ping's own
+dst_ip==my_ip shortcut) or pre-seeds the ARP cache directly. Fixed by adding
+`netif_maybe_auto_answer_arp()` at `netif_recv_frame`'s own single shared funnel (all 3 backends: CDC-
+ECM, LAN9512, loopback) -- answers and consumes any REQUEST addressed to our own leased IP, before it
+ever reaches any upper-layer poller. New regression test added to `netif_self_test` (gated behind
+`boot_debug_enabled()`, same as every other self-test) since nothing existing ever sent a real,
+unanswered REQUEST onto the wire -- builds a synthetic REQUEST as if from an external peer, queues it via
+the real netif, and checks both that it's auto-answered+consumed (not delivered raw) and that the
+auto-generated REPLY has the right operation/sender/target fields.
+
+**Fix 2 (task #327, MEDIUM) -- ARP resolve loop never retransmits.** `ping`'s resolve loop sent exactly
+one `arp_resolve_start()` then only polled for 20 iterations -- a single lost request (plausible on this
+project's own RTL8188CU WiFi path) burned the entire ~1s window waiting for a reply that was never going
+to arrive. u-boot's `arp_timeout_check()` and Linux's `arp_solicit()` both resend periodically. Fixed:
+resend every 5th iteration (4 real requests across the ~1s budget) instead of exactly 1.
+
+**Fix 3 (task #331, HIGH) -- DHCP server lease table never expires/reclaims.** `dhcp_server_set_lease_
+start_tick` was declared but never called anywhere; the 4-slot pool was a monotonically-filling
+allocator -- once 4 distinct MACs had ever DISCOVERed, a 5th new client hit "pool exhausted" forever,
+even hours after the first 4 leases had actually expired. RFC 2131 s4.3 requires eventual reclaim (no
+u-boot server exists to compare against -- it only implements the client). Fixed: `dhcp_server_set_
+lease_start_tick` now actually gets called at both the OFFERED and BOUND transitions, and a new
+`dhcp_server_reclaim_expired()` (called at the top of `dhcp_server_handle_discover`) frees any slot whose
+lease_time has elapsed since its last transition, mirroring `dhcp_client_check_lease`'s own existing
+tick-math pattern.
+
+**Fix 4 (task #328, HIGH) -- IPv4 version/IHL never validated, checksum verification inconsistent.**
+`icmp_poll`/`socket_udp_recv`/the TCP receive path all hardcode the transport-header offset as
+ip_offset+20 (IHL==5), without ever checking it; only `icmp_poll` called `ipv4_verify_checksum` at all.
+Compared against u-boot's `NetReceive` (`net/net.c`) and Linux's `ip_rcv_core` (`net/ipv4/ip_input.c`) --
+both validate version/IHL and the header checksum once, centrally, before any upper-layer code runs. A
+real peer sending IP options (IHL>5) would have every byte past this point misread at the wrong offset; a
+corrupted version/IHL byte was invisible to socket_udp_recv/TCP (not covered by the UDP/TCP pseudo-
+header). Fixed: new `ipv4_header_is_well_formed()` (version==4, IHL==5 -- this project's own already-
+documented scope, no IP options/fragmentation support) plus `ipv4_verify_checksum`, added to
+`socket_udp_recv` and `tcp_conn_handle_segment` (icmp_poll already had the checksum check, just not the
+version/IHL one).
+
+**Fix 5 (task #330, MEDIUM) -- no TCP RST ever generated.** `tcp_flag_rst()` was declared but never
+referenced; `tcp_conn_poll`'s unmatched-local-port case silently dropped the segment. Compared against
+Linux's `tcp_v4_send_reset` ("no socket matches incoming packet" path, `net/ipv4/tcp_ipv4.c` -- u-boot has
+no real TCP stack to compare against). A real peer's SYN to a closed port, or any stray segment after a
+connection already closed, left the peer waiting out a timeout instead of getting an immediate reset.
+Fixed: new `tcp_send_rst_for_unmatched()`, built per RFC 793 s3.4 (no-ACK segment -> seq=0,
+ack=SEG.SEQ+SEG.LEN, RST+ACK; ACK present -> seq=SEG.ACK, RST only; never RST a RST), called only from the
+"no matching local port" case in `tcp_conn_poll` -- deliberately NOT extended to
+`tcp_conn_handle_segment`'s own final per-state fallthrough, since that path can also be reached by
+ordinary duplicate/out-of-window segments on an otherwise-live connection, where blanket-RSTing could tear
+down something a real peer expects to recover from (a real design call, not a one-line extension).
+
+**Fix 6 (task #330, LOW) -- one TCP seq comparison not wraparound-safe.** `if seg_ack >= (rtx_seq +
+rtx_len)` used plain unsigned `>=`, the only comparison in this file that wasn't either pure equality or
+already wraparound-safe by construction -- breaks the instant a long-lived connection's sequence numbers
+wrap past 0xFFFFFFFF (never hit by this project's own short test ISNs). Linux mirrors this with signed-
+subtraction `before()`/`after()` macros (`include/net/tcp.h`); vani has no `i32` to do the same cast
+directly, so the fix computes the equivalent via unsigned-only arithmetic (a wrapping subtraction's result
+has the same bit pattern a signed difference would, so checking its top bit is clear is exactly `(i32)diff
+>= 0`).
+
+**Fix 7 (task #332, LOW-MEDIUM) -- packet filter hardcoded a 20-byte IP header instead of deriving IHL.**
+`netstack_filter_check_frame` (vani-netstack) always computed the TCP/UDP port-field position as byte 34,
+never reading the real IHL nibble -- any packet carrying IP options (IHL>5) would have its dst_port
+misread from inside the options bytes, a wrong port-rule match. Fixed in vani-netstack directly (`frame[14]
+& 0x0F` -> real L4 offset), bumped to v0.6.1, and synced into `vendor/netstack/src/lib.vani` (confirmed
+byte-identical to the standalone repo's pre-fix HEAD beforehand -- not stale, just needed the same patch
+applied to both copies since this project vendors the source rather than resolving it via kosh).
+
+**Found and fixed during verification, not part of the original 7 findings:**
+- `filter_build_test_frame`/`_dst` (the two filter self-test fixtures) never set byte 14 at all --
+  harmless under the OLD hardcoded-34 filter logic, but after Fix 7 this made IHL read as 0, computing a
+  wrong L4 offset and breaking both `filter_self_test` and `filter_outgoing_self_test`. Caught by
+  temporarily forcing `boot_debug_enabled()` to 1 and running the full debug self-test sweep under QEMU
+  (necessary since `phase4_milestone.py`/`qemu_run.py` both run with debug off by default, so neither
+  would have caught this). Fixed by having both fixtures write 0x45 (version 4, IHL 5) at byte 14, same as
+  every other real IPv4 frame this project builds.
+- Fix 6's own wraparound-safe rewrite used plain `-`/`+` on u32, assuming C-style silent wraparound --
+  wrong: vani's unsigned arithmetic TRAPS on overflow/underflow (`wrapping_add`/`wrapping_sub` are the
+  distinct, explicit-wraparound intrinsics, already used elsewhere in this file for exactly this reason).
+  This crashed every debug-mode boot with "integer overflow in u32 sub" the moment `seg_ack < target` --
+  the ordinary not-yet-caught-up case, not an actual wraparound, so every boot hit it. Also found the
+  identical risk in Fix 5's `seg_seq + seg_len` (seg_seq is peer-controlled and legitimately nears
+  0xFFFFFFFF by design). Both switched to `wrapping_add`/`wrapping_sub`. Caught by the same debug-mode
+  sweep above; re-verified clean afterward (zero panics, all self-tests PASS, including the newly-added
+  ARP-auto-answer regression test, DHCP client+server self-tests, and both filter self-tests).
+
+**Backlog, not fixed this round (task #333) -- netif has no real per-protocol demux.** `netif_recv_frame`
+is a single shared FIFO with no selective peek; every consumer (`arp_resolve_poll`, `icmp_poll`,
+`socket_udp_recv`, `tcp_conn_poll`, `dhcp_client_poll`) dequeues whatever's next and drops it if it isn't
+theirs, with no requeue. Linux's `netif_receive_skb`/`deliver_skb` and u-boot's `net_process_received_
+packet` both genuinely classify-and-route to the one correct handler before any handler sees a frame; this
+project has several single-shot pollers all racing to drain one queue instead. Currently low-probability
+(shell commands run strictly sequentially; the background demo tasks aren't network consumers) but a real
+architectural gap if concurrent network polling from different tasks is ever added. Needs a real design
+(a registered-handler classify table, or a single dispatcher task feeding per-protocol queues) -- flagged
+for a future round, not guessed at here.
+
+**Verification**: build clean, zero `asm_safety_audit.py` findings, each fix applied then one unified
+build+test pass at the end (all 7 fixes land in the same logical sweep). `qemu_run.py` clean (same known
+baseline). `phase4_milestone.py` 18/18 PASS both before touching `boot_debug_enabled()` for debug-mode
+verification and again afterward on the final, reverted state. A separate temporary-debug-mode QEMU run
+(reverted before commit, never shipped) exercised the full self-test suite including every protocol's own
+self-tests, the two filter self-tests, and the new ARP-auto-answer regression test -- all PASS, zero
+panics, zero non-SD/DharaFS-related FAILs (the DharaFS/CRYPTO FAILs under `qemu_run.py` specifically are
+expected and pre-existing: that harness has no SD drive attached at all, unlike `phase4_milestone.py`).
+No real-hardware component to any of these 7 fixes -- all are pure protocol-logic gaps, reproduce
+identically under QEMU, no real-HW retest needed.
