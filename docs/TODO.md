@@ -13399,3 +13399,48 @@ known baseline). `phase4_milestone.py` 18/18 PASS, zero regressions, single boot
 pending -- this is the next real-HW boot cycle's job, to confirm whether `GET_DESCRIPTOR(Device)` finally
 completes with all six fixes (`MULTICNT`, `DMAEN`, `FSLSPclkSel`/`FSLSSupp`, `TOUTCAL`, `XactErr` retry,
 `PHYSEL`) applied together. Task #325 stays open until that retest confirms success.
+
+### Task #325 retest: all six fixes regressed real-HW behavior, root-caused and fixed (2026-10-03)
+
+Real-HW retest of all six fixes together showed a genuine regression, not progress: `HCINT=0x00000000`
+(full silence) on the SETUP stage, identical to the symptom from before `DMAEN` was ever fixed, in place
+of the `XACTERR` the prior rounds had made real progress against. `dhdl query usb` still showed
+`port_connected=yes port_enabled=yes` throughout.
+
+First root-caused the ordering, not the registers: re-reading U-Boot's `dwc_otg_core_init` in full (not
+just the fields already chased) showed `HCFG.FSLSPclkSel`/`FSLSSupp` has to be programmed *immediately*
+after `GUSBCFG.PHYSEL` + its reset -- still inside the same "before any other programming occurs" block --
+not after `GAHBCFG.DMAEN` as this project had it ordered. Fixed the ordering and reflashed; the retest came
+back byte-identical to the pre-fix retest, down to the microsecond timestamp. Initially flagged as a
+possible stale-flash false alarm, but `flash_sd_card.sh`'s own post-remount re-read verify (`sha1sum`
+cross-checked directly) confirmed the correct binary was genuinely on the card -- the identical timing is
+actually expected for a pure instruction-reorder with no added/removed work, since the preceding SD-init
+preamble dominates and is fully deterministic on real hardware. The ordering fix itself was also confirmed
+correct against Raspberry Pi's own real downstream `dwc_otg_cil.c` (`dwc_otg_core_init`, lines ~1256-1283),
+not just U-Boot -- line-for-line the same PHYSEL-reset-FSLSPclkSel sequence.
+
+With the ordering independently confirmed correct and the symptom still unchanged, dispatched a research
+fork to trace the FULL enumeration call stack end to end (U-Boot's `dwc2.c` + `common/usb.c`, RPi's own
+`dwc_otg_cil.c` + `dwc_otg_hcd_intr.c`, and this project's own `dwc2_control_in`/`dwc2_wait_chan0_done`),
+rather than guess a seventh register-bringup field. It found a real logic bug instead, introduced in the
+same round as the `XactErr`-retry rewrite itself: the rewrite's NAK/ACK ("transient") branch cleared the
+sticky `HCINT0` status bit but never re-armed `HCCHAR0.CHENA` -- a NAK halts the channel in hardware, so
+once a retry survived past `XACTERR` into a NAK on a later attempt, the channel was left permanently
+halted with nothing left to ever set another interrupt. This fully explains the observed regression:
+the pre-retry-rewrite build genuinely hit `XACTERR` (no retry logic existed yet to mask it); the
+retry-rewrite build retries past `XACTERR` up to 3x, and on one of those retries the bus responds with a
+NAK instead -- which the rewrite's own NAK-handling branch then silently swallowed forever. Confirmed
+against both references: U-Boot's `chunk_msg`/`_submit_control_msg` retry loop fully re-programs the
+channel on every NAK (not just clears a bit and keeps polling the same dead attempt); RPi's own
+`dwc_otg_hc_init` explicitly unmasks `nak`/`ack` specifically so its real interrupt handler reacts and
+resubmits, never "ignore and keep waiting." Fixed by re-arming `CHENA` on NAK, the exact same pattern
+already used for the `XACTERR` retry branch.
+
+Also added `kernlog_write_usb_regs` (replacing the narrower `kernlog_write_usb`) at all three
+`dwc2_control_in` failure sites: captures `GUSBCFG`/`GAHBCFG`/`HCFG`/`GINTSTS`/`HCCHAR0`/`HCINTMSK0` live,
+in addition to `HCINT`/`HPRT0`, so any FUTURE real-HW failure gets a full register snapshot persisted to
+`/logs/kernlog-*.log` without needing another guess-a-field-and-reflash round.
+
+**Verification**: `./build.sh` clean (zero `asm_safety_audit.py` findings). `qemu_run.py` clean (same
+known baseline). `phase4_milestone.py` 18/18 PASS, zero regressions, single boot banner. Real-HW retest
+pending. Task #325 stays open until that retest confirms `GET_DESCRIPTOR(Device)` actually completes.

@@ -4922,7 +4922,24 @@ fn kernlog_write_fault(level: u32, label: Str, addr: u32, status: u32, pc: u32, 
 // Tailored to the USB enumeration failure prints (dwc2_control_in's
 // own SETUP/DATA/STATUS stage diagnostics, task #325's own own
 // original audit target): label + HCINT + HPRT0, CRITICAL by default.
-fn kernlog_write_usb(label: Str, hcint: u32, hprt0: u32) -> i64 {
+// Task #325 real-HW diagnostic (round 7): six real register-level
+// bring-up fixes (MULTICNT, DMAEN, FSLSPclkSel/FSLSSupp, TOUTCAL,
+// XactErr retry, PHYSEL -- the last two cross-checked against
+// Raspberry Pi's own real dwc_otg_cil.c, not just U-Boot/Linux) have
+// now all been real-HW-retested without changing the symptom at all:
+// HCINT=0x00000000 on the SETUP stage, i.e. the channel never raises
+// ANY interrupt, not even a NAK or XACTERR. Since none of the fields
+// already tried explain that, this captures a live, point-in-time
+// snapshot of every other register a wrong bring-up step could have
+// left in a bad state -- GUSBCFG (PHYSEL/FORCEHOSTMODE/TOUTCAL all
+// live here), GAHBCFG (GLBLINTRMSK/DMAEN/HBSTLEN), HCFG (FSLSPclkSel/
+// FSLSSupp), GINTSTS (is the core even still in host mode by the time
+// the transfer is attempted), and HCCHAR0 itself read back right
+// after the write that was supposed to start the channel (CHENA
+// should read back as 1 if the write actually took -- if it reads
+// back 0, the channel was never really enabled at all, which would
+// fully explain zero interrupts ever firing).
+fn kernlog_write_usb_regs(label: Str, hcint: u32) -> i64 {
   if kernlog_level_critical() < kernlog_min_level() {
     return 0;
   }
@@ -4934,7 +4951,19 @@ fn kernlog_write_usb(label: Str, hcint: u32, hprt0: u32) -> i64 {
   off = off + kernlog_write_str(buf, off, " HCINT=0x");
   off = off + kernlog_write_hex32(buf, off, hcint);
   off = off + kernlog_write_str(buf, off, " HPRT0=0x");
-  off = off + kernlog_write_hex32(buf, off, hprt0);
+  off = off + kernlog_write_hex32(buf, off, mmio_read_u32(dwc2_hprt0_addr()));
+  off = off + kernlog_write_str(buf, off, " GUSBCFG=0x");
+  off = off + kernlog_write_hex32(buf, off, mmio_read_u32(dwc2_base() + 0x0C));
+  off = off + kernlog_write_str(buf, off, " GAHBCFG=0x");
+  off = off + kernlog_write_hex32(buf, off, mmio_read_u32(dwc2_base() + 0x08));
+  off = off + kernlog_write_str(buf, off, " HCFG=0x");
+  off = off + kernlog_write_hex32(buf, off, mmio_read_u32(dwc2_base() + 0x400));
+  off = off + kernlog_write_str(buf, off, " GINTSTS=0x");
+  off = off + kernlog_write_hex32(buf, off, mmio_read_u32(dwc2_base() + 0x14));
+  off = off + kernlog_write_str(buf, off, " HCCHAR0=0x");
+  off = off + kernlog_write_hex32(buf, off, mmio_read_u32(dwc2_hcchar0_addr()));
+  off = off + kernlog_write_str(buf, off, " HCINTMSK0=0x");
+  off = off + kernlog_write_hex32(buf, off, mmio_read_u32(dwc2_hcintmsk0_addr()));
   off = off + kernlog_write_str(buf, off, "\n");
   return kernlog_flush(off);
 }
@@ -19301,6 +19330,16 @@ fn dwc2_init() -> i64 {
   let _ = dwc2_restart_phy_clock();
   let _ = dwc2_core_soft_reset();
   let _ = dwc2_select_fs_phy();
+  // Task #325 retest finding: U-Boot's dwc_otg_core_init sets
+  // HCFG.FSLSPclkSel/FSLSSupp IMMEDIATELY after PHYSEL+reset, still
+  // inside the same "this programming sequence needs to happen in FS
+  // mode before any other programming occurs" block -- before
+  // FORCEHOSTMODE, before any GAHBCFG/DMA programming. The previous
+  // placement (after dwc2_enable_dma_mode(), far later) was a real
+  // ordering bug: real-HW retest with that ordering regressed from a
+  // genuine XACTERR back to full silence (HCINT=0x00000000), matching
+  // the pre-DMAEN-fix symptom exactly.
+  let _ = dwc2_init_fs_ls_pclk_sel();
   let _ = dwc2_force_host_mode();
   // Task #325: FIFO RAM partition -- must happen once we're definitely
   // in host mode (matching U-Boot's own relative ordering: core host
@@ -19311,7 +19350,6 @@ fn dwc2_init() -> i64 {
   let _ = dwc2_config_fifos();
   let _ = dwc2_enable_global_intr();
   let _ = dwc2_enable_dma_mode();
-  let _ = dwc2_init_fs_ls_pclk_sel();
   let _ = dwc2_set_timeout_calibration();
   let _ = dwc2_port_power_on();
 
@@ -19545,11 +19583,27 @@ fn dwc2_wait_chan0_done() -> u32 {
         }
       } else {
         if (hi & transient_mask) != (0 as u32) {
-          // Lone NAK/ACK, no real completion or error yet -- clear
-          // just these sticky status bits and keep waiting within
-          // the same overall budget, matching real DWC2 driver
-          // behavior.
+          // BUG (found via a fork's full U-Boot/RPi dwc_otg_cil.c
+          // call-stack trace, 2026-10-03): a NAK halts the channel in
+          // hardware -- clearing the sticky status bit WITHOUT
+          // re-arming CHENA left the channel permanently halted, so
+          // nothing could ever set another interrupt again. This is
+          // exactly what regressed real-HW behavior from a genuine
+          // XACTERR (seen before this retry rewrite existed) back to
+          // full silence (HCINT=0x00000000 forever) once this retry
+          // rewrite started surviving past XACTERR into a NAK on a
+          // later attempt. U-Boot's own `chunk_msg`/`_submit_control_
+          // msg` retry loop (dwc2.c) fully re-programs the channel on
+          // every NAK (not just clears a bit and keeps polling the
+          // same halted attempt); RPi's own dwc_otg_hc_init unmasks
+          // nak/ack specifically so its real interrupt handler reacts
+          // and resubmits, never "ignore and keep waiting". Re-arming
+          // CHENA here (same pattern already used for the XACTERR
+          // retry above) restarts the transaction instead of leaving
+          // it dead.
           let _ = mmio_write_u32(hcint0, hi & transient_mask);
+          let rearm_nak: u32 = mmio_read_u32(hcchar0) | chena_bit;
+          let _ = mmio_write_u32(hcchar0, rearm_nak);
         }
       }
     }
@@ -19709,7 +19763,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
     let _ = uart_puts(" HPRT0=0x");
     let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
     let _ = uart_puts("\n");
-    let _ = kernlog_write_usb("USB SETUP stage failed", setup_result, mmio_read_u32(dwc2_hprt0_addr()));
+    let _ = kernlog_write_usb_regs("USB SETUP stage failed", setup_result);
     return 0 - 1; // XFERCOMPL (bit0) never set -- timeout or error
   }
 
@@ -19751,7 +19805,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
     let _ = uart_puts(" HPRT0=0x");
     let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
     let _ = uart_puts("\n");
-    let _ = kernlog_write_usb("USB DATA stage failed", data_result, mmio_read_u32(dwc2_hprt0_addr()));
+    let _ = kernlog_write_usb_regs("USB DATA stage failed", data_result);
     return 0 - 1;
   }
   let i: i64 = 0;
@@ -19778,7 +19832,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
     let _ = uart_puts(" HPRT0=0x");
     let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
     let _ = uart_puts("\n");
-    let _ = kernlog_write_usb("USB STATUS stage failed", status_result, mmio_read_u32(dwc2_hprt0_addr()));
+    let _ = kernlog_write_usb_regs("USB STATUS stage failed", status_result);
     return 0 - 1;
   }
   return 0;
