@@ -24641,6 +24641,23 @@ fn hci_build_le_create_connection_command(out_buf: mut ref i64, scan_interval: u
   return 28;
 }
 
+// LE_Create_Connection_Cancel (Bluetooth Core Spec Vol 4 Part E
+// §7.8.18): OGF=0x08, OCF=0x000E, no parameters. Per spec, the host
+// must not issue a second LE_Create_Connection while one is still
+// pending -- confirmed against Linux's own hci_conn.c (le_conn_
+// timeout always calls hci_abort_conn -> hci_cancel_connect_sync on
+// a central-role timeout specifically to send this and return the
+// controller to idle). Without this, a real controller will answer
+// every subsequent LE_Create_Connection with Command Disallowed
+// until reboot once one attempt has already timed out.
+fn hci_build_le_create_connection_cancel_command(out_buf: mut ref i64) -> i64 {
+  let opcode: u32 = hci_build_opcode(0x08 as u32, 0x000E as u32);
+  let _ = buf_write_byte(out_buf, 0 as u32, opcode & (0xFF as u32));
+  let _ = buf_write_byte(out_buf, 1 as u32, (opcode >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(out_buf, 2 as u32, 0 as u32);
+  return 3;
+}
+
 // LE_Create_Connection is unusual among the commands this driver has
 // sent so far: the controller answers with Command Status (§7.7.15,
 // Event_Code=0x0F -- "accepted, working on it," NOT Command Complete)
@@ -35084,7 +35101,7 @@ fn ieee80211_boot_self_test() -> i64 {
 // association is inherently single-instance on this hardware, so
 // either style would work, but this one needed no new boot/*_state.S
 // file or build.sh change at all).
-const WPA2_JOIN_CTX_SIZE: i64 = 70;
+const WPA2_JOIN_CTX_SIZE: i64 = 169;
 const WPA2_JOIN_STATE_OFF: i64 = 0;
 const WPA2_JOIN_SSID_LEN_OFF: i64 = 1;
 const WPA2_JOIN_ASSOC_ID_OFF: i64 = 2;   // 2 bytes
@@ -35092,6 +35109,15 @@ const WPA2_JOIN_BSSID_OFF: i64 = 4;      // 6 bytes
 const WPA2_JOIN_OWN_MAC_OFF: i64 = 10;   // 6 bytes
 const WPA2_JOIN_SSID_OFF: i64 = 16;      // 32 bytes
 const WPA2_JOIN_RSN_OFF: i64 = 48;       // 22 bytes
+// Caches the already-built Message 2 (round 2026-10-04, found via a
+// fork's full wpa_supplicant/wpa.c trace): a lost Message 2 makes the
+// AP legitimately retransmit Message 1 instead of ever reaching
+// Message 3 -- real wpa_supplicant resends the SAME cached Message 2
+// (not a freshly recomputed one, since the PTK already derived from
+// the first SNonce must stay consistent) rather than treating that
+// retransmission as a handshake failure. 99 bytes, matching Message
+// 2's own fixed tx_len everywhere else in this file.
+const WPA2_JOIN_MSG2_CACHE_OFF: i64 = 70; // 99 bytes
 
 const WPA2_JOIN_IDLE: i64 = 0;
 const WPA2_JOIN_WAIT_PROBE_RESP: i64 = 1;
@@ -35231,11 +35257,35 @@ fn wpa2_join_step_eapol(ctx: mut ref i64, rx_buf: mut ref i64, rx_len: i64, pmk:
       let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
       return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
     }
+    let ci: i64 = 0;
+    while ci < 99 {
+      let _ = buf_write_byte(ctx, (WPA2_JOIN_MSG2_CACHE_OFF + ci) as u32, buf_read_byte(tx_out, ci as u32));
+      ci = ci + 1;
+    }
     let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_EAPOL_MSG3 as u32);
     return Wpa2JoinResult { state: WPA2_JOIN_WAIT_EAPOL_MSG3, tx_len: 99, done: 0, failed: 0 };
   }
 
   if state == WPA2_JOIN_WAIT_EAPOL_MSG3 {
+    // BUG (found via a fork's full wpa_supplicant/wpa.c trace,
+    // 2026-10-04): this state previously assumed the next EAPOL-Key
+    // frame could only be a real Message 3, so a lost Message 2 (an
+    // entirely ordinary RF event -- it's the reason Message 1's own
+    // retry timer exists at all) made the AP's legitimate Message-1
+    // retransmission permanently fail the whole join. Classify the
+    // frame first: a retransmitted Message 1 has no MIC bit set
+    // (Message 3 always does) -- resend the cached Message 2 and keep
+    // waiting, exactly like real wpa_supplicant's wpa_sm_rx_eapol,
+    // instead of treating it as fatal.
+    let classify: EapolKeyParsed = eapol_key_parse(rx_buf, rx_len);
+    if (classify.ok == 0) && ((classify.key_info & EAPOL_KEY_INFO_MIC) == 0) {
+      let ri: i64 = 0;
+      while ri < 99 {
+        let _ = buf_write_byte(tx_out, ri as u32, buf_read_byte(ctx, (WPA2_JOIN_MSG2_CACHE_OFF + ri) as u32));
+        ri = ri + 1;
+      }
+      return Wpa2JoinResult { state: WPA2_JOIN_WAIT_EAPOL_MSG3, tx_len: 99, done: 0, failed: 0 };
+    }
     // wpa_hs_process_msg3's own contract: Message 4 is built (and, in
     // a real deployment, arguably still worth transmitting) even on
     // WPA_HS_ERR_KEY_UNWRAP specifically, since MIC+replay already
@@ -35362,6 +35412,18 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   let msg2: mut ref i64 = dhruva_alloc_bytes(99);
   let r4: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg1, 99, pmk, msg2, msg2);
   if (r4.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4.tx_len != 99) || (r4.failed != 0) { ok = 0; }
+
+  // Round 2026-10-04: directly exercises the retransmitted-Message-1
+  // fix found via a fork's full wpa_supplicant/wpa.c trace -- feed the
+  // SAME Message 1 bytes again while still in WAIT_EAPOL_MSG3 (as a
+  // real AP would if its own Message-2 response timer expired because
+  // our Message 2 was lost over the air) and confirm this orchestrator
+  // resends the EXACT already-cached Message 2 rather than failing the
+  // whole handshake or re-deriving a different one from a fresh SNonce.
+  let msg2_retrans: mut ref i64 = dhruva_alloc_bytes(99);
+  let r4b: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg1, 99, pmk, msg2_retrans, msg2_retrans);
+  if (r4b.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4b.tx_len != 99) || (r4b.done != 0) || (r4b.failed != 0) { ok = 0; }
+  if sha256_bytes_equal(msg2_retrans, msg2, 99) == 0 { ok = 0; }
 
   let gtk_kde_len: i64 = 24;
   let msg3: mut ref i64 = dhruva_alloc_bytes(99 + gtk_kde_len);
@@ -35798,6 +35860,36 @@ fn hci_send_command_and_wait_status_via_radio(devaddr: u32, mps: u32, intr_mps: 
   return 0xFFFFFFFF as u32;
 }
 
+// Same shape as hci_send_command_and_wait_status_via_radio, but for a
+// synchronous command whose own ack IS the real result (Command
+// Complete, not Command Status) -- used for LE_Create_Connection_
+// Cancel below. Needed as a distinct radio-abstracted variant because
+// the existing hci_send_command_and_wait_complete (non-"_via_radio")
+// calls dwc2_hci_send_command/dwc2_hci_interrupt_in directly, which
+// ble_real_connect's own header comment explicitly forbids itself
+// from doing ("everything below calls only ble_radio_*/hci_le_adv_
+// report_*, never dwc2_hci_*/usb_bt_* directly").
+fn hci_send_command_and_wait_complete_via_radio(devaddr: u32, mps: u32, intr_mps: u32, cmd_buf: mut ref i64, cmd_len: u32, expected_opcode: u32) -> u32 {
+  let send_status: i64 = ble_radio_send_command(devaddr, mps, cmd_buf, cmd_len);
+  if send_status != 0 {
+    return 0xFFFFFFFF as u32;
+  }
+  let event_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let tries: i64 = 0;
+  while tries < 20 {
+    let event_len: i64 = ble_radio_poll_event(devaddr, intr_mps, event_buf, intr_mps as i64);
+    if event_len > 0 {
+      if hci_event_is_command_complete(event_buf) == (1 as u32) {
+        if hci_cmd_complete_opcode(event_buf) == expected_opcode {
+          return hci_cmd_complete_status(event_buf);
+        }
+      }
+    }
+    tries = tries + 1;
+  }
+  return 0xFFFFFFFF as u32;
+}
+
 // Scans incoming LE Advertising Report events (boot's own hci_reset_
 // and_scan already issued LE_Set_Scan_Enable(1) -- see that function's
 // own comment on why this driver now scans actively -- so this just
@@ -35917,7 +36009,19 @@ fn ble_real_connect() -> i64 {
     iter = iter + 1;
   }
   if done == 0 {
-    let _ = uart_puts("ble connect: connection never completed (no response from the target)\n");
+    // BUG (found via a fork's full Linux hci_conn.c trace, 2026-10-03):
+    // a timed-out LE_Create_Connection was left pending at the
+    // controller forever -- the Bluetooth Core Spec forbids issuing a
+    // second LE_Create_Connection while one is still outstanding, so
+    // every retry after the first timeout would get Command
+    // Disallowed until reboot. Cancel it before giving up, matching
+    // Linux's own le_conn_timeout -> hci_abort_conn -> hci_cancel_
+    // connect_sync behavior.
+    let cancel_buf: mut ref i64 = dhruva_alloc_bytes(8);
+    let cancel_len: i64 = hci_build_le_create_connection_cancel_command(cancel_buf);
+    let cancel_opcode: u32 = hci_build_opcode(0x08 as u32, 0x000E as u32);
+    let _ = hci_send_command_and_wait_complete_via_radio(devaddr, mps_ctrl, mps_intr, cancel_buf, cancel_len as u32, cancel_opcode);
+    let _ = uart_puts("ble connect: connection never completed (no response from the target) -- cancelled pending attempt\n");
     return 0 - 1;
   }
 

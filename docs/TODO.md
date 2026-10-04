@@ -13444,3 +13444,64 @@ in addition to `HCINT`/`HPRT0`, so any FUTURE real-HW failure gets a full regist
 **Verification**: `./build.sh` clean (zero `asm_safety_audit.py` findings). `qemu_run.py` clean (same
 known baseline). `phase4_milestone.py` 18/18 PASS, zero regressions, single boot banner. Real-HW retest
 pending. Task #325 stays open until that retest confirms `GET_DESCRIPTOR(Device)` actually completes.
+
+### WiFi STA + BLE: two real bugs found via full call-stack research forks vs Linux (2026-10-04)
+
+User asked to run the same "full call-chain vs authoritative reference, dispatched as a research fork"
+discipline (established this session via task #325's USB investigation,
+[[feedback_dhruva_major_driver_research_fork]]) against WiFi (STA + AP) and BLE. Three forks ran in
+parallel: WiFi STA gap-hunt, WiFi AP mode scoping, BLE gap-hunt.
+
+**WiFi STA (HIGH CONFIDENCE, fixed)**: the WPA2 join state machine (`wpa2_join_step_eapol`) assumed the
+next EAPOL-Key frame after Message 1 could only be a real Message 3 -- so if the AP's own Message-2
+response timer expired because our Message 2 was lost over the air (an entirely ordinary RF event, the
+exact reason that retry timer exists at all) and the AP legitimately retransmitted Message 1 instead, this
+driver permanently failed the whole handshake instead of resending Message 2. Confirmed against real
+`wpa_supplicant` (`src/rsn_supp/wpa.c`, `wpa_sm_rx_eapol`), which explicitly re-handles a retransmitted
+Message 1 by resending its already-computed Message 2, not by failing. Fixed: `wpa2_join_step_eapol` now
+caches Message 2 (new `WPA2_JOIN_MSG2_CACHE_OFF`, 99 bytes, bumping `WPA2_JOIN_CTX_SIZE` 70->169) when it's
+first built, and on a later frame classified as a non-MIC-bearing retransmission (via `eapol_key_parse`'s
+own `key_info` field) resends that exact cached buffer instead of calling `wpa_hs_process_msg3` and
+failing. `wpa2_join_orchestrator_self_test` gained a new case that directly exercises this: feeds the same
+Message 1 bytes a second time while already in `WAIT_EAPOL_MSG3`, asserts the state/tx_len/done/failed
+fields are all correct, AND that the resent bytes are byte-identical to the originally cached Message 2
+(`sha256_bytes_equal`) -- not just "didn't crash." The same fork also flagged a broader, lower-confidence
+version of this pattern throughout `wpa2_join_step_mgmt`'s probe/auth/assoc states (any stray/retransmitted
+management frame there is similarly fatal) -- NOT fixed this round, since unicast 802.11 frames already get
+hardware-level retry (confirmed bit-exact against `rtl8xxxu_fill_txdesc_v1`'s `TXDESC32_RETRY_LIMIT_ENABLE`)
+making that path far less likely to actually hit in practice; flagged here as real backlog, not silently
+dropped.
+
+**BLE (HIGH CONFIDENCE, fixed)**: `ble_real_connect()` never sent `LE_Create_Connection_Cancel` when its
+own connection attempt timed out -- the Bluetooth Core Spec forbids issuing a second
+`LE_Create_Connection` while one is still outstanding, confirmed against Linux's `hci_conn.c`
+(`le_conn_timeout` always calls `hci_abort_conn` -> `hci_cancel_connect_sync` on a central-role timeout
+specifically to cancel and return the controller to idle). Without this, a real controller would answer
+every subsequent connection attempt with Command Disallowed until reboot, after just one timeout. Fixed:
+new `hci_build_le_create_connection_cancel_command` (OGF=0x08, OCF=0x000E, no parameters) and a new
+radio-abstracted `hci_send_command_and_wait_complete_via_radio` (mirroring the existing `..._wait_status_
+via_radio`, needed because the pre-existing non-"_via_radio" variant calls `dwc2_hci_*` directly, which
+`ble_real_connect`'s own header comment explicitly forbids itself from doing), wired into the timeout
+branch. The same fork also flagged `l2cap_sig_poll`/`gatt_server_poll`/`gatt_client_poll_notifications` as
+fully-implemented but never-called post-connect (a real peripheral's Connection Parameter Update Request
+right after connecting would go unanswered) and that `att_build_exchange_mtu_request` is never sent --
+NOT fixed this round: both need a real post-connect session-maintenance loop this project doesn't have
+yet (not a one-line wiring fix), and the correct ACL-bulk-endpoint `mps` to feed it isn't currently exposed
+by the vendor-agnostic BLE radio abstraction either. Flagged as real, scoped backlog.
+
+**WiFi AP mode (scoped, not built)**: separately confirmed via Linux's real `rtl8xxxu` driver
+(`8192c.c:725`, `fops.supports_ap = 1` for exactly this chip family) that RTL8188CU genuinely supports AP
+mode in hardware/firmware -- not a dead end. Reuses the existing STA bring-up, TX/RX path, and WPA2 crypto
+primitives; genuinely new work is periodic beacon-frame transmission (a real timer-driven task, not a
+register tweak), a per-associated-station MACID/CAM-key table (today's driver is single-link throughout),
+probe/assoc request-response handling (the reverse direction of STA mode), and the WPA2 4-way handshake
+from the AUTHENTICATOR side (ANonce generation, SNonce+MIC verification, GTK distribution -- a separate
+protocol role from the existing supplicant-side code). Effort: medium-large, roughly 1.5-2x the original
+STA join work. User approved proceeding with this as real work; tracked as new scope below this entry.
+
+**Verification**: `./build.sh` clean (zero `asm_safety_audit.py` findings). `qemu_run.py` clean.
+`phase4_milestone.py` 18/18 PASS, zero regressions. `wpa2_join_orchestrator_self_test` (including the new
+retransmission case) confirmed PASS via a dedicated debug-enabled QEMU boot (`/config/loglevel 16` +
+`reboot`). No BLE/HCI self-test exists under QEMU at all (no USB Bluetooth device model -- a pre-existing,
+already-documented limitation of this project's BLE code, not new); the BLE fix's verification rests on
+clean build + general regression only, pending real-HW/real-peripheral retest.
