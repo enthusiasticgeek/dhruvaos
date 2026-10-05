@@ -29,6 +29,7 @@ const FC_STYPE_ASSOC_REQ: i64 = 0x0000;
 const FC_STYPE_ASSOC_RESP: i64 = 0x0010;
 const FC_STYPE_PROBE_REQ: i64 = 0x0040;
 const FC_STYPE_PROBE_RESP: i64 = 0x0050;
+const FC_STYPE_BEACON: i64 = 0x0080;
 const FC_STYPE_AUTH: i64 = 0x00b0;
 const FC_STYPE_DEAUTH: i64 = 0x00c0;
 
@@ -405,6 +406,199 @@ fn assoc_response_parse(buf: ref [u8; 256], frame_len: i64) -> AssocRespInfo {
   let ok: i64 = 0;
   if status_code == WLAN_STATUS_SUCCESS { ok = 1; }
   return AssocRespInfo { ok: ok, status_code: status_code, association_id: association_id };
+}
+
+// AP-side frame build/parse (2026-10-04 follow-up): everything above
+// this point is STATION-side (the frames a client sends/expects back
+// from an AP it's joining). An AP needs the reverse of each: it PARSES
+// Probe/Association Requests and BUILDS Probe/Association Responses
+// and Beacons, using the exact same field layouts already verified
+// above -- confirmed via a research fork's direct trace of Linux's
+// real `rtl8xxxu` driver (`core.c`'s `rtl8xxxu_send_beacon_frame`/
+// `rtl8xxxu_start_ap`) that a Beacon's own body is structurally
+// identical to a Probe Response's (Timestamp+BeaconInterval+CapInfo
+// fixed fields, then SSID/Rates/RSN IEs) -- it only differs in the
+// 802.11 header's own subtype and destination (broadcast, not the
+// specific station that asked), so `beacon_build` and
+// `probe_response_build` below share one internal helper rather than
+// duplicating the fixed-field+IE-writing logic twice.
+const BEACON_MAX_LEN: i64 = 100;
+const PROBE_RESP_MAX_LEN: i64 = 100;
+
+// Shared by beacon_build/probe_response_build: writes the 24-byte MAC
+// header (dest/addr1 given explicitly since a Beacon's is broadcast
+// but a Probe Response's is the specific requesting station) plus the
+// Timestamp(8, left as all-zero -- confirmed spec-safe: a real
+// Beacon's Timestamp is purely informational for client power-save/
+// sync, never checked for correctness by a scanning station, per the
+// same research fork's trace of `rtl8xxxu_send_beacon_frame`, which
+// builds this via mac80211's own generic `ieee80211_beacon_get`, not
+// any RTL-specific logic), Beacon Interval(2), Capability Info(2) --
+// ESS (bit 0) always set, Privacy (bit 4) set only when `has_rsn` --
+// then SSID/Supported Rates/RSN IEs (RSN only if `has_rsn`). Returns
+// the frame length used.
+fn ap_frame_body_build(dest: ref [u8; 6], bssid: ref [u8; 6], stype: i64, ssid: ref [u8; 32], ssid_len: i64, rsn_ie: ref [u8; 22], has_rsn: i64, beacon_interval: i64, out: mut ref [u8; 100]) -> i64 {
+  out[0] = (stype & (255 as i64)) as u8;
+  out[1] = ((stype >> 8) & (255 as i64)) as u8;
+  out[2] = 0 as u8;
+  out[3] = 0 as u8;
+  let i: i64 = 0;
+  while i < 6 {
+    out[4 + i] = dest[i];
+    out[10 + i] = bssid[i];
+    out[16 + i] = bssid[i];
+    i = i + 1;
+  }
+  out[22] = 0 as u8;
+  out[23] = 0 as u8;
+
+  i = 0;
+  while i < 8 { out[24 + i] = 0 as u8; i = i + 1; } // Timestamp
+  out[32] = (beacon_interval & (255 as i64)) as u8;
+  out[33] = ((beacon_interval >> 8) & (255 as i64)) as u8;
+  let capab_info: i64 = if has_rsn == 1 { 0x0011 } else { 0x0001 };
+  out[34] = (capab_info & (255 as i64)) as u8;
+  out[35] = ((capab_info >> 8) & (255 as i64)) as u8;
+
+  let off: i64 = 36;
+  out[off] = EID_SSID as u8;
+  out[off + 1] = ssid_len as u8;
+  i = 0;
+  while i < ssid_len {
+    out[off + 2 + i] = ssid[i];
+    i = i + 1;
+  }
+  off = off + 2 + ssid_len;
+
+  out[off] = EID_SUPP_RATES as u8;
+  out[off + 1] = 4 as u8;
+  out[off + 2] = 0x82 as u8;
+  out[off + 3] = 0x84 as u8;
+  out[off + 4] = 0x8b as u8;
+  out[off + 5] = 0x96 as u8;
+  off = off + 6;
+
+  if has_rsn == 1 {
+    i = 0;
+    while i < 22 { out[off + i] = rsn_ie[i]; i = i + 1; }
+    off = off + 22;
+  }
+
+  return off;
+}
+
+// Broadcast (Address1=Address3=own BSSID per this package's own
+// broadcast-addressing convention already used by probe_request_build
+// above, Address3 is the BSSID either way since the AP IS the BSSID).
+fn beacon_build(bssid: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, rsn_ie: ref [u8; 22], has_rsn: i64, beacon_interval: i64, out: mut ref [u8; 100]) -> i64 {
+  let broadcast: [u8; 6] = [0xff as u8; 6];
+  return ap_frame_body_build(ref broadcast, bssid, FC_STYPE_BEACON, ssid, ssid_len, rsn_ie, has_rsn, beacon_interval, out);
+}
+
+// Unicast to the specific station that sent the Probe Request --
+// real APs must answer BOTH a wildcard probe (empty SSID, "what
+// networks are here") and one naming this AP's own SSID specifically;
+// probe_request_parse below reports which so the caller can decide.
+fn probe_response_build(sta_mac: ref [u8; 6], bssid: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, rsn_ie: ref [u8; 22], has_rsn: i64, beacon_interval: i64, out: mut ref [u8; 100]) -> i64 {
+  return ap_frame_body_build(sta_mac, bssid, FC_STYPE_PROBE_RESP, ssid, ssid_len, rsn_ie, has_rsn, beacon_interval, out);
+}
+
+struct ProbeReqInfo { ok: i64, ssid_len: i64, is_wildcard: i64 }
+
+// A Probe Request has NO fixed fields before its IEs (unlike a Probe
+// Response's extra Timestamp/BeaconInterval/CapInfo) -- confirmed by
+// this same package's own probe_request_build above, which starts its
+// SSID IE at offset 24, right after the MAC header. An empty (zero-
+// length) SSID IE is the standard "wildcard" probe every real AP must
+// answer regardless of its own configured network name; a non-empty
+// SSID must match this AP's own to warrant a response.
+fn probe_request_parse(buf: ref [u8; 256], frame_len: i64, ssid_out: mut ref [u8; 32]) -> ProbeReqInfo {
+  if frame_len < 24 {
+    return ProbeReqInfo { ok: 0, ssid_len: 0, is_wildcard: 0 };
+  }
+  let ies_off: i64 = 24;
+  let ies_len: i64 = frame_len - ies_off;
+  let ssid_ie: IeFindResult = ie_find(buf, ies_off, ies_len, EID_SSID);
+  if ssid_ie.found == 0 {
+    return ProbeReqInfo { ok: 0, ssid_len: 0, is_wildcard: 0 };
+  }
+  if ssid_ie.data_len > 32 {
+    return ProbeReqInfo { ok: 0, ssid_len: 0, is_wildcard: 0 };
+  }
+  let i: i64 = 0;
+  while i < ssid_ie.data_len {
+    ssid_out[i] = buf[ssid_ie.data_off + i];
+    i = i + 1;
+  }
+  let is_wildcard: i64 = if ssid_ie.data_len == 0 { 1 } else { 0 };
+  return ProbeReqInfo { ok: 1, ssid_len: ssid_ie.data_len, is_wildcard: is_wildcard };
+}
+
+struct AssocReqInfo { ok: i64, ssid_len: i64, has_rsn: i64 }
+
+// Association Request fixed fields (Capability Info + Listen Interval,
+// 4 bytes) end at offset 28, where IEs begin -- confirmed by this same
+// package's own assoc_request_build above (`let off: i64 = 28;`).
+// Deliberately as minimal as assoc_response_parse's own STA-side
+// counterpart (which checks only Status Code, nothing else) -- an AP
+// accepting the association only needs to confirm the SSID matches
+// its own and, if it's running WPA2-PSK, that the station's own RSN
+// IE is compatible; Capability Info/Listen Interval are not checked.
+fn assoc_request_parse(buf: ref [u8; 256], frame_len: i64, ssid_out: mut ref [u8; 32]) -> AssocReqInfo {
+  if frame_len < 28 {
+    return AssocReqInfo { ok: 0, ssid_len: 0, has_rsn: 0 };
+  }
+  let ies_off: i64 = 28;
+  let ies_len: i64 = frame_len - ies_off;
+  let ssid_ie: IeFindResult = ie_find(buf, ies_off, ies_len, EID_SSID);
+  if ssid_ie.found == 0 {
+    return AssocReqInfo { ok: 0, ssid_len: 0, has_rsn: 0 };
+  }
+  if ssid_ie.data_len > 32 {
+    return AssocReqInfo { ok: 0, ssid_len: 0, has_rsn: 0 };
+  }
+  let i: i64 = 0;
+  while i < ssid_ie.data_len {
+    ssid_out[i] = buf[ssid_ie.data_off + i];
+    i = i + 1;
+  }
+  let rsn_ie: IeFindResult = ie_find(buf, ies_off, ies_len, EID_RSN);
+  let has_rsn: i64 = 0;
+  if rsn_ie.found == 1 {
+    has_rsn = rsn_ie_supports_wpa2_psk_ccmp(buf, rsn_ie.data_off, rsn_ie.data_len);
+  }
+  return AssocReqInfo { ok: 1, ssid_len: ssid_ie.data_len, has_rsn: has_rsn };
+}
+
+// Fixed 30 bytes, no trailing IEs -- deliberately matches assoc_
+// response_parse's own existing minimalism (that STA-side parser
+// above never looks past byte 30 either, so a real client this
+// project's own code would recognize needs nothing more); some real
+// client stacks additionally expect a trailing Supported Rates IE
+// here, a known, documented narrowing of full interop for this first
+// increment, not a limitation of the fixed-field encoding itself.
+fn assoc_response_build(sta_mac: ref [u8; 6], bssid: ref [u8; 6], association_id: i64, out: mut ref [u8; 30]) -> i64 {
+  out[0] = (FC_STYPE_ASSOC_RESP & (255 as i64)) as u8;
+  out[1] = ((FC_STYPE_ASSOC_RESP >> 8) & (255 as i64)) as u8;
+  out[2] = 0 as u8;
+  out[3] = 0 as u8;
+  let i: i64 = 0;
+  while i < 6 {
+    out[4 + i] = sta_mac[i];
+    out[10 + i] = bssid[i];
+    out[16 + i] = bssid[i];
+    i = i + 1;
+  }
+  out[22] = 0 as u8;
+  out[23] = 0 as u8;
+  let capab_info: i64 = 0x0011;
+  out[24] = (capab_info & (255 as i64)) as u8;
+  out[25] = ((capab_info >> 8) & (255 as i64)) as u8;
+  out[26] = (WLAN_STATUS_SUCCESS & (255 as i64)) as u8;
+  out[27] = ((WLAN_STATUS_SUCCESS >> 8) & (255 as i64)) as u8;
+  out[28] = (association_id & (255 as i64)) as u8;
+  out[29] = ((association_id >> 8) & (255 as i64)) as u8;
+  return 30;
 }
 
 // 802.11 DATA-frame encapsulation for EAPOL-Key frames (task #197

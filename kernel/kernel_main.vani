@@ -18785,12 +18785,56 @@ fn dwc2_init_fs_ls_pclk_sel() -> i64 {
 // own switch statement gates this exact code path on. Burst length is
 // set to INCR4 (U-Boot's own choice for this architecture) alongside
 // DMAEN, both bits this driver has simply never programmed.
+// Task #325 real-HW finding (round 13, after re-reading Linux's own
+// hcd.c `dwc2_gahbcfg_init` in full rather than trusting the platform
+// constant alone): round 12's own `bcm2835_ahbcfg = 0x10` fix was a
+// real improvement (confirmed live: GAHBCFG read back as the exact
+// expected 0x11 immediately after that fix) but still incomplete --
+// `dwc2_gahbcfg_init`'s real algorithm is `ahbcfg = (current &
+// GAHBCFG_CTRL_MASK) | (platform_ahbcfg & ~GAHBCFG_CTRL_MASK)`,
+// THEN, as a SEPARATE final step, `if (host_dma) ahbcfg |=
+// GAHBCFG_DMA_EN`. GAHBCFG_DMA_EN (bit5) is itself PART of
+// GAHBCFG_CTRL_MASK (confirmed directly in hw.h: `GAHBCFG_CTRL_MASK =
+// P_TXF_EMP_LVL | NP_TXF_EMP_LVL | DMA_EN | GLBL_INTR_EN`) -- meaning
+// the platform's own `ahbcfg=0x10` constant NEVER includes DMA_EN at
+// all, by design, the exact same way it never includes GLBL_INTR_EN
+// (which this driver already, correctly, sets as its own separate
+// step via dwc2_enable_global_intr). Round 12's fix silently dropped
+// DMA_EN entirely by treating 0x10 as if it were the complete value.
+// Round 18 correction (task #325, user: "why uboot usb logic not having
+// issues, check fundamental differences, be meticulous"): the round-13
+// comment above claimed the Linux BCM2835 platform constant `ahbcfg=
+// 0x10` encoded `HBSTLEN=INCR4` -- checked meticulously against
+// mainline's OWN symbolic constants (hw.h) and it does NOT. Every
+// OTHER platform in that exact same file (params.c) sets this field
+// via `GAHBCFG_HBSTLEN_INCRn << GAHBCFG_HBSTLEN_SHIFT` (HBSTLEN is
+// bits[4:1], confirmed identically in BOTH mainline hw.h AND the real
+// Broadcom/RPi downstream dwc_otg_regs.h's own gahbcfg_data_t struct --
+// same physical register, same bit positions, cross-checked). INCR4=3
+// shifted into bits[4:1] is `3<<1=0x06`, not `0x10`. `0x10` (bit4 only)
+// decodes to HBSTLEN=8 within that 4-bit field, which isn't one of the
+// five valid burst-length encodings (0,1,3,5,7) at all -- BCM2835 is
+// the ONLY platform in this file using a raw literal instead of the
+// symbolic shift, so this is plausibly a narrow quirk for a DIFFERENT
+// board/DT-compatible string sharing the same chip family, not
+// necessarily this exact Pi 1B silicon. Far more importantly: U-Boot's
+// own `dwc_otg_core_init` -- which demonstrably WORKS against this
+// exact board, with no Broadcom-specific AHBCFG quirk of any kind --
+// computes this register fully generically by reading GHWCFG2's
+// ARCHITECTURE field (bits[4:3], confirmed in both references) and
+// selecting HBSTLEN by the Synopsys architecture type. This project's
+// own live GHWCFG2 dump already pulled from real BCM2835 silicon
+// during the FIFO-sizing investigation reads `0x228ddd50` ->
+// bits[4:3]=0b10=2=INT_DMA_ARCH, the exact branch U-Boot takes for
+// `HBSTLEN=INCR4`. Switched to the verified-correct encoding (0x06,
+// matching U-Boot's own generic computation for the confirmed
+// architecture) instead of the unverified literal.
 fn dwc2_enable_dma_mode() -> i64 {
   let gahbcfg: i64 = dwc2_base() + 0x08;
+  let hbstlen_incr4: u32 = (3 as u32) << (1 as u32); // 0x06, bits[4:1]
   let dmaen: u32 = (1 as u32) << (5 as u32);
-  let hburstlen_incr4: u32 = (3 as u32) << (1 as u32);
   let v: u32 = mmio_read_u32(gahbcfg);
-  let _ = mmio_write_u32(gahbcfg, v | dmaen | hburstlen_incr4);
+  let _ = mmio_write_u32(gahbcfg, v | hbstlen_incr4 | dmaen);
   return 0;
 }
 
@@ -18967,7 +19011,24 @@ fn dwc2_select_fs_phy() -> i64 {
   let v: u32 = mmio_read_u32(gusbcfg);
   if (v & physel_bit) == (0 as u32) {
     let _ = mmio_write_u32(gusbcfg, v | physel_bit);
+    // Task #325 real-HW diagnostic (round 8): a live retest showed
+    // BOTH PHYSEL and TOUTCAL reading back as 0 at the point of the
+    // SETUP failure, despite both being explicitly set earlier in
+    // dwc2_init() with no reset in between that *should* clear
+    // TOUTCAL specifically (set well after this function's own
+    // internal reset, and no reset happens after it). This immediate
+    // pre/post-reset readback isolates WHERE PHYSEL actually gets
+    // lost: either the write never took at all (immediate_before
+    // would already show 0), or BCM2835's real core soft reset
+    // clears GUSBCFG entirely -- contrary to the generic Synopsys
+    // assumption U-Boot's/Linux's own "set PHYSEL, then reset"
+    // sequence relies on (immediate_before would show the bit set,
+    // immediate_after would show it cleared).
+    let immediate_before: u32 = mmio_read_u32(gusbcfg);
+    let _ = kernlog_write_simple("USB DIAG PHYSEL immediately after write, before reset", immediate_before);
     let _ = dwc2_core_soft_reset();
+    let immediate_after: u32 = mmio_read_u32(gusbcfg);
+    let _ = kernlog_write_simple("USB DIAG PHYSEL immediately after core soft reset", immediate_after);
   }
   return 0;
 }
@@ -19069,6 +19130,73 @@ fn dwc2_port_reset() -> i64 {
     } else {
       let _ = delay(16100);
       enable_tries = enable_tries + 1;
+    }
+  }
+
+  // Task #325 round 16, the real root cause (found by reading the
+  // ACTUAL reference driver for this exact chip, Broadcom/RPi's own
+  // downstream `dwc_otg` -- not just mainline Linux dwc2, which has no
+  // equivalent of this at all): `dwc_otg_hcd_intr.c`'s own
+  // handle_port_intr, "Port Enable Changed" case, reads HPRT0.PrtSpd
+  // the instant the port enables and, for FULL_SPEED or LOW_SPEED
+  // (HIGH_SPEED is 0), sets GUSBCFG.PHYLPWRCLKSEL (bit15) -- then,
+  // because that bit only takes effect cleanly in the PHY via a
+  // reset, unconditionally schedules `reset_tasklet_func`: a SECOND
+  // ~60ms HPRT0.PRTRST pulse, THEN re-polls for ENA again, before the
+  // port is considered usable. DhruvaOS only ever did the FIRST reset
+  // and never touched PHYLPWRCLKSEL at all (confirmed absent from
+  // mainline dwc2 too -- this is specific to BCM2835's own downstream
+  // driver, consistent with the chip's documented "customized
+  // register layout"). Real-HW evidence this round directly supports
+  // this as the actual mechanism, not a guess: the attached dongle's
+  // own HPRT0=0x00021405 failure-time snapshot decodes to PrtSpd=1
+  // (FULL_SPEED), and GAHBCFG/GUSBCFG (the AHB/PHY-interface-facing
+  // registers, exactly the ones a PHY clock-select mismatch would
+  // affect) lost valid state within ~100ms of first use while HCFG/
+  // HCCHAR0 (core-logic-side registers) stayed stable -- never
+  // explained by the power-domain theory alone, which under Linux's
+  // own runtime-PM semantics wouldn't fire this fast on an actively-
+  // used device. Mirroring the reference driver exactly: align
+  // PHYLPWRCLKSEL to the detected speed, and if that's a real change,
+  // redo the reset+enable-poll sequence (not just the register write)
+  // before this port is handed back to the caller.
+  let prtspd: u32 = (mmio_read_u32(hprt0) >> (17 as u32)) & (0x3 as u32);
+  if (prtspd == (1 as u32)) || (prtspd == (2 as u32)) {
+    let gusbcfg_for_speed: i64 = dwc2_base() + 0x0C;
+    let phylpwrclksel_bit: u32 = (1 as u32) << (15 as u32);
+    let uv: u32 = mmio_read_u32(gusbcfg_for_speed);
+    if (uv & phylpwrclksel_bit) == (0 as u32) {
+      let _ = mmio_write_u32(gusbcfg_for_speed, uv | phylpwrclksel_bit);
+      // Round 17 diagnostic (TEMPORARY -- remove once confirmed): verify
+      // this fix's own write actually sticks and the second reset
+      // actually completes, instead of inferring it from the eventual
+      // outcome -- per this project's own standing policy, don't just
+      // cite a mechanism, check it directly.
+      let _ = uart_puts("USB DIAG PHYLPWRCLKSEL immediately after write GUSBCFG=");
+      let _ = uart_put_hex32(mmio_read_u32(gusbcfg_for_speed));
+      let _ = uart_puts("\n");
+      let rv: u32 = mmio_read_u32(hprt0);
+      let _ = mmio_write_u32(hprt0, (rv & not_w1c_mask) | (0x100 as u32));
+      let _ = delay(161000);
+      let rv2: u32 = mmio_read_u32(hprt0);
+      let clear_rst2: u32 = (0x100 as u32) ^ (0xFFFFFFFF as u32);
+      let _ = mmio_write_u32(hprt0, rv2 & clear_rst2 & not_w1c_mask);
+      let _ = delay(161000);
+      let enable_tries2: i64 = 0;
+      while enable_tries2 < 20 {
+        let ve2: u32 = mmio_read_u32(hprt0);
+        if (ve2 & (0x4 as u32)) != (0 as u32) {
+          enable_tries2 = 20;
+        } else {
+          let _ = delay(16100);
+          enable_tries2 = enable_tries2 + 1;
+        }
+      }
+      let _ = uart_puts("USB DIAG after second reset HPRT0=");
+      let _ = uart_put_hex32(mmio_read_u32(hprt0));
+      let _ = uart_puts(" GUSBCFG=");
+      let _ = uart_put_hex32(mmio_read_u32(gusbcfg_for_speed));
+      let _ = uart_puts("\n");
     }
   }
 
@@ -19318,6 +19446,14 @@ fn dwc2_set_timeout_calibration() -> i64 {
   let toutcal_max: u32 = 7 as u32;
   let v: u32 = mmio_read_u32(gusbcfg);
   let _ = mmio_write_u32(gusbcfg, (v & toutcal_mask) | toutcal_max);
+  // Task #325 real-HW diagnostic (round 8), same reasoning as dwc2_
+  // select_fs_phy's own immediate-readback above -- no reset happens
+  // between this write and dwc2_port_power_on()/the first SETUP
+  // transaction, so if this readback is already wrong, the write
+  // itself never took (ruling out a later clobber as the explanation
+  // for THIS field specifically).
+  let immediate: u32 = mmio_read_u32(gusbcfg);
+  let _ = kernlog_write_simple("USB DIAG TOUTCAL immediately after write", immediate);
   return 0;
 }
 
@@ -19371,7 +19507,80 @@ fn dwc2_init() -> i64 {
   if enabled == 0 {
     return 0 - 1;
   }
+  let _ = dwc2_reassert_core_config_post_port_reset();
   return dwc2_probe_device0();
+}
+
+// Task #325 real-HW diagnostic (round 9): the immediate-readback
+// diagnostics added this round proved PHYSEL and TOUTCAL both land
+// correctly the instant they're written (confirmed live: GUSBCFG
+// read back 0x20401447 right after the TOUTCAL write -- bit6 and
+// bits[2:0] both correctly set), yet the SAME register reads back
+// with BOTH cleared (0x20402700) ~0.7s later, at the first SETUP
+// failure -- with nothing in this driver's own code writing GUSBCFG
+// again in between. GAHBCFG showed an analogous anomaly at that same
+// failure point (0x1F: DMAEN/bit5 clear, HBURSTLEN not the intended
+// encoding). Neither dwc2_port_power_on() nor dwc2_port_reset() touch
+// either register in this driver's own code -- the only real
+// candidate left is a hardware side effect of the HPRT0 PRTPWR/
+// PRTRST transitions themselves on this specific silicon, re-
+// initializing PHY-facing config as part of bringing the port up --
+// a real behavior neither U-Boot's nor Linux's own "set PHYSEL once,
+// trust it persists" sequence accounts for (their own code never
+// touches port power/reset until AFTER this exact sequence, and
+// never re-verifies it survived). Rather than fully root-cause WHY,
+// re-asserts every register this driver depends on for the first
+// transfer immediately before that transfer -- deliberately no core
+// soft reset here (unlike dwc2_select_fs_phy's own reset-if-needed
+// logic), since a core reset issued AFTER the port is already
+// connected+enabled risks dropping that state, a strictly worse
+// outcome than a redundant register write.
+fn dwc2_reassert_core_config_post_port_reset() -> i64 {
+  let gusbcfg: i64 = dwc2_base() + 0x0C;
+  let gahbcfg: i64 = dwc2_base() + 0x08;
+  let physel_bit: u32 = (1 as u32) << (6 as u32);
+  let toutcal_mask: u32 = (0x7 as u32) ^ (0xFFFFFFFF as u32);
+  let toutcal_max: u32 = 7 as u32;
+  let v: u32 = mmio_read_u32(gusbcfg);
+  let new_v: u32 = ((v | physel_bit) & toutcal_mask) | toutcal_max;
+  let _ = mmio_write_u32(gusbcfg, new_v);
+
+  // Round 18 correction: matches dwc2_enable_dma_mode's own fix --
+  // the Linux BCM2835 literal `ahbcfg=0x10` doesn't match the
+  // standard Synopsys HBSTLEN encoding any other platform in that
+  // same file uses, and doesn't correspond to a valid burst-length
+  // value at all (see dwc2_enable_dma_mode's own header comment for
+  // the full finding). Using the verified-correct INCR4 encoding
+  // (0x06), matching U-Boot's own generic, demonstrably-working
+  // computation for this chip's confirmed INT_DMA_ARCH. DMA_EN still
+  // OR'd in as its own separate step (GAHBCFG_CTRL_MASK's own bit,
+  // never part of the burst-length field).
+  let hbstlen_incr4: u32 = (3 as u32) << (1 as u32); // 0x06, bits[4:1]
+  let dmaen: u32 = (1 as u32) << (5 as u32);
+  let v2: u32 = mmio_read_u32(gahbcfg);
+  let new_v2: u32 = v2 | hbstlen_incr4 | dmaen;
+  let _ = mmio_write_u32(gahbcfg, new_v2);
+
+  // Round 18: switched from kernlog_write_simple to uart_puts --
+  // same real indirect-recursion risk documented in dwc2_wait_chan0_
+  // done's own header comment (kernlog -> DharaFS -> possibly USB
+  // mass storage -> back into this exact USB stack). This function
+  // isn't currently reachable from task_e/task_f (confirmed by the
+  // stack-depth gate passing), but DHDL Phase 4 (task #298, in
+  // progress) adds live per-subsystem reconfiguration commands via
+  // shell_dispatch -- a future "dhdl set usb reset" path could make
+  // this function reachable from task_f without anyone noticing the
+  // same recursion risk reappearing. Fixing proactively rather than
+  // waiting for it to resurface.
+  let readback_gusbcfg: u32 = mmio_read_u32(gusbcfg);
+  let _ = uart_puts("USB DIAG GUSBCFG immediately after post-port-reset reassert=");
+  let _ = uart_put_hex32(readback_gusbcfg);
+  let _ = uart_puts("\n");
+  let readback_gahbcfg: u32 = mmio_read_u32(gahbcfg);
+  let _ = uart_puts("USB DIAG GAHBCFG immediately after post-port-reset reassert=");
+  let _ = uart_put_hex32(readback_gahbcfg);
+  let _ = uart_puts("\n");
+  return 0;
 }
 
 // Host channel 0 register block: base 0x500, one control-endpoint
@@ -19558,6 +19767,23 @@ fn dwc2_wait_chan0_done() -> u32 {
   let transient_mask: u32 = (0x10 as u32) | (0x20 as u32); // NAK|ACK
   let xacterr_count: i64 = 0;
   let tries: i64 = 0;
+
+  // Round 15 real-HW finding: all 5 round-14 checkpoints (every
+  // 200000 iterations, ~100ms apart) showed GAHBCFG/GUSBCFG ALREADY
+  // reverted at the very FIRST one -- meaning the revert happens
+  // within ~100ms of entering this loop, not gradually across the
+  // loop's own ~500ms full duration as previously assumed. This
+  // one-time checkpoint at tries==0 (the instant this loop is
+  // entered, right after the caller's own pre-transfer reassert)
+  // narrows the window further: did it already revert before this
+  // loop even started polling, or does it happen somewhere in the
+  // first 100ms?
+  let _ = uart_puts("USB DIAG poll entry tries=0 GAHBCFG=");
+  let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
+  let _ = uart_puts(" GUSBCFG=");
+  let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
+  let _ = uart_puts("\n");
+
   while tries < 1000000 {
     let hi: u32 = mmio_read_u32(hcint0);
     if hi != (0 as u32) {
@@ -19604,8 +19830,102 @@ fn dwc2_wait_chan0_done() -> u32 {
           let _ = mmio_write_u32(hcint0, hi & transient_mask);
           let rearm_nak: u32 = mmio_read_u32(hcchar0) | chena_bit;
           let _ = mmio_write_u32(hcchar0, rearm_nak);
+        } else {
+          // Round 18 (task #325, the real bug this entire investigation
+          // was chasing): U-Boot's own `wait_for_chhltd` (dwc2.c) -- the
+          // ONE function every transfer type in that reference polls on
+          // -- waits SPECIFICALLY for HCINTMSK_CHHLTD (bit1, Channel
+          // Halted) FIRST, THEN inspects XFERCOMPL/NAK/FRMOVRUN to
+          // classify the result. This driver's own loop never checked
+          // bit1 AT ALL -- it only recognizes bit0 (XFERCOMPL), the
+          // hard_error_mask bits (STALL/AHBERR/XACTERR/BBLERR/
+          // DATATGLERR), and transient_mask (NAK/ACK). Real-HW evidence
+          // (round 18 retest, GET_DESCRIPTOR SETUP stage): the failure
+          // snapshot showed GINTSTS bit25 (HCHINT, "Host Channels
+          // Interrupt") SET -- a per-channel interrupt genuinely fired
+          // and was never serviced -- while HCCHAR0 showed CHENA
+          // (bit31) already cleared with every OTHER field (MULTICNT,
+          // MPS) intact, exactly matching real DWC2 silicon's
+          // documented CHENA-self-clears-on-halt behavior, not a
+          // "register reverted to power-on defaults" event at all.
+          // Before this fix, a CHHLTD-alone (or any other bit pattern
+          // this loop doesn't recognize) silently falls through with
+          // NOTHING cleared and NOTHING re-armed -- hcint0 stays
+          // exactly the same on every subsequent read (nothing ever
+          // writes it), so the loop spins uselessly for the FULL
+          // 1,000,000 iterations before giving up and reporting
+          // HCINT=0x00000000 (this function's own "nothing recognized"
+          // return value), which is what every single prior round of
+          // this investigation saw and interpreted as genuine silence.
+          // Mirroring U-Boot's own model: an unrecognized nonzero hi
+          // (almost certainly CHHLTD alone, or some combination this
+          // loop's three existing categories don't cover) is a real,
+          // terminal signal -- clear it and return it immediately
+          // instead of spinning blind. The caller's own `(result & 1)
+          // == 0` check already treats any non-XFERCOMPL return as
+          // failure, so this doesn't change success-path behavior at
+          // all, only how fast and how informatively a genuine
+          // unrecognized halt is reported.
+          let _ = mmio_write_u32(hcint0, hi);
+          return hi;
         }
       }
+    }
+    // Task #325 real-HW diagnostic (round 14, TEMPORARY -- remove
+    // once the real cause is pinned down): three consecutive retests
+    // all showed GAHBCFG/GUSBCFG reverted to the exact same fixed
+    // values by the time this loop exhausts and the caller's own
+    // failure snapshot is taken, while HCFG/HCCHAR0 (registers in a
+    // DIFFERENT functional block of the same core) stay stable --
+    // suggesting this is NOT a whole-domain/whole-core event. This
+    // single checkpoint (round 14b: collapsed from 5 separate `if
+    // tries == N` branches into one modulo check) samples GAHBCFG/
+    // GUSBCFG partway through this exact loop to pin down WHEN the
+    // revert actually happens (a fixed real-world delay matching this
+    // loop's own ~500ms real duration at 1,000,000 tight-spin
+    // iterations, vs. something else entirely) -- directly testable
+    // with real HW data instead of more guessing.
+    //
+    // Round 14c (real bug, not just slow analysis): the 14b version
+    // used kernlog_write_simple here, which builds the stack-depth
+    // analyzer's own call graph straight back into this function --
+    // kernlog_write_simple -> kernlog_flush -> dharafs_log_append_raw
+    // -> dharafs_block_write[_raw] -> usb_msd_write10 ->
+    // usb_msd_scsi_command -> dwc2_bulk_out -> dwc2_wait_chan0_done
+    // (THIS function). DharaFS can write through USB mass storage,
+    // so this is genuine indirect recursion in the call graph, not a
+    // false positive -- `vanic stack-depth` correctly rejected the
+    // build with "worst-case stack depth is UNBOUNDED" on task_e/
+    // task_f (both reach this loop). This hottest, most fundamental
+    // USB wait primitive must never depend on a logging path that can
+    // itself route through USB. Switched to direct uart_puts/
+    // uart_put_hex32 -- confirmed via the same call-graph analysis to
+    // never reach back into the USB/DharaFS stack -- which the live
+    // serial session already monitoring this retest captures in real
+    // time, same practical visibility without the recursion risk.
+    // Round 15 follow-up: the tries==0 entry checkpoint above and the
+    // coarse 200000-interval checkpoints below leave a 100ms gap
+    // ("already reverted by the first coarse checkpoint, status at
+    // entry unknown yet") -- these three finer early samples (~10ms/
+    // ~25ms/~50ms in, at ~0.5us/iteration) subdivide exactly that gap
+    // instead of guessing where within it the revert actually lands.
+    if (tries == 19999) || (tries == 49999) || (tries == 99999) {
+      let _ = uart_puts("USB DIAG poll early checkpoint tries=");
+      let _ = uart_put_hex32(tries as u32);
+      let _ = uart_puts(" GAHBCFG=");
+      let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
+      let _ = uart_puts(" GUSBCFG=");
+      let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
+      let _ = uart_puts("\n");
+    }
+    if tries % 200000 == 199999 {
+      let _ = uart_puts("USB DIAG poll checkpoint tries=");
+      let _ = uart_put_hex32(tries as u32);
+      let _ = uart_puts(" GAHBCFG=");
+      let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
+      let _ = uart_puts(" GUSBCFG=");
+      let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
+      let _ = uart_puts("\n");
     }
     tries = tries + 1;
   }
@@ -19739,6 +20059,39 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   // through.
   let _ = mem_barrier();
 
+  // Task #325 real-HW diagnostic (round 11): the post-port-reset
+  // reassert (dwc2_init's own call to dwc2_reassert_core_config_post_
+  // port_reset) was CONFIRMED correct by its own immediate readback --
+  // then confirmed WRONG again ~0.5s later at this exact SETUP write,
+  // with dwc2_probe_device0's own code in between touching no MMIO
+  // register at all (just builds a SETUP packet in a plain buffer).
+  // Re-asserting again here, as close as this driver can get to the
+  // actual channel-start write, tests directly whether a near-zero
+  // gap survives where a ~0.5s one didn't -- either isolating this to
+  // genuine time-based drift (if this holds), or ruling that out in
+  // favor of some other event-triggered cause (if even this reverts).
+  let _ = dwc2_reassert_core_config_post_port_reset();
+
+  // Round 18 (task #325, found by checking why this driver's own
+  // ALREADY-FIXED dwc2_reset_chan0_for_new_transfer() bug -- task
+  // #182, "writing CHENA=1 when it's already 1 is a silent no-op on
+  // real DWC2 silicon, no genuine 0->1 transition, channel never
+  // starts" -- was fixed for the BULK path but never applied to the
+  // FIRST-ever transfer this whole driver makes, this exact control-
+  // transfer SETUP stage. If HCCHAR0.CHENA came up non-zero from the
+  // port-enable/reset sequence (plausible on real silicon, unlike
+  // QEMU's always-clean-zero model), the HCCHAR0 write two lines
+  // below is EXACTLY the silent no-op task #182 already diagnosed:
+  // the channel never actually starts, consistent with every single
+  // piece of real-HW evidence this investigation has gathered --
+  // HCINT reading 0x00000000 forever (nothing ever happened, not a
+  // hard error), and GAHBCFG/GUSBCFG reading defaults from the very
+  // first poll-loop checkpoint (tries=0) rather than gradually
+  // reverting (if the channel never engaged, there was never a
+  // "before" state to revert FROM). Same fix, same function, applied
+  // here for the first time.
+  let _ = dwc2_reset_chan0_for_new_transfer();
+
   // SETUP stage: the 8-byte request already sits in dwc2_dma_scratch
   // (dma), written by the caller before this call.
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
@@ -19793,6 +20146,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   // driver's own poll loop already waits for that same final HCINT,
   // it just needs pktcnt to describe the truth up front.
   let pktcnt: u32 = (want_len + mps - (1 as u32)) / mps;
+  let _ = dwc2_reset_chan0_for_new_transfer(); // round 18, same as SETUP stage above
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), pktcnt, want_len));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
@@ -19820,6 +20174,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   // transfer is complete; no data buffer content matters here since
   // xfersize=0 means the model transfers nothing regardless of what
   // HCDMA points at, but a valid pointer is still supplied.
+  let _ = dwc2_reset_chan0_for_new_transfer(); // round 18, same as SETUP stage above
   let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
@@ -22578,6 +22933,152 @@ fn rtl_llt_write_self_test() -> i64 {
     let _ = uart_puts(" (PASS)\n");
   } else {
     let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// WiFi AP mode (2026-10-04): register addresses and the exact H2C
+// mailbox write pulled directly from a research fork's trace of
+// Linux's real `rtl8xxxu` driver (`regs.h`/`core.c`, fetched fresh
+// via `gh api`), independently re-verified line-for-line against the
+// same source before writing any of this -- not paraphrased from the
+// fork's own report. `RTL_AP_REG_HMBOX_0`'s mailbox index is hardcoded
+// to 0 rather than implementing Linux's own round-robin `next_mbox`
+// rotation across 4 mailboxes: AP mode only ever needs ONE H2C call
+// site (the JOIN_BSS_REPORT connect notification below), so a fixed
+// index is the correctly-scoped choice, not a missing feature --
+// nothing else in this driver contends for a mailbox.
+const RTL_AP_REG_BSSID: u32 = 0x0618;
+const RTL_AP_REG_BCN_INTERVAL: u32 = 0x0554;
+const RTL_AP_REG_HMTFR: u32 = 0x01cc;
+const RTL_AP_REG_HMBOX_0: u32 = 0x01d0;
+const RTL_AP_REG_FWHW_TXQ_CTRL: u32 = 0x0420;
+const RTL_AP_REG_TBTT_PROHIBIT: u32 = 0x0540;
+const RTL_AP_REG_TDECTRL: u32 = 0x0208;
+const RTL_AP_REG_DWBCN1_CTRL: u32 = 0x0228;
+
+// H2C_JOIN_BSS_REPORT (cmd=2), data=1 (connect) or 0 (disconnect) --
+// Linux's own `rtl8xxxu_gen1_report_connect` writes this as a single
+// 32-bit little-endian word (cmd in the low byte, data in the next),
+// since this specific H2C command's own payload is only 2 bytes (<=4,
+// so Linux's own `len > sizeof(u32)` extended-mailbox-register path
+// never triggers for it -- confirmed directly against gen1_h2c_cmd's
+// own real source, not assumed).
+fn rtl8188cu_h2c_join_bss_report(devaddr: u32, mps: u32, connect: u32) -> i64 {
+  let retry: i64 = 0;
+  let mbox_ready: i64 = 0;
+  while retry < 100 {
+    let val8: u32 = rtl_reg_read8(devaddr, mps, RTL_AP_REG_HMTFR);
+    if (val8 & (1 as u32)) == (0 as u32) {
+      mbox_ready = 1;
+      break;
+    }
+    retry = retry + 1;
+  }
+  if mbox_ready != 1 {
+    let _ = uart_puts("USB: RTL8188CU H2C mailbox busy, JOIN_BSS_REPORT not sent\n");
+    return 0 - 1;
+  }
+  let data_byte: u32 = if connect == (1 as u32) { 1 as u32 } else { 0 as u32 };
+  let h2c_word: u32 = (2 as u32) | (data_byte << (8 as u32));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_AP_REG_HMBOX_0, h2c_word);
+  return 0;
+}
+
+fn rtl8188cu_ap_set_bssid(devaddr: u32, mps: u32, bssid: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 6 {
+    let b: u32 = buf_read_byte(bssid, i as u32);
+    let _ = rtl_reg_write8(devaddr, mps, (RTL_AP_REG_BSSID as i64 + i) as u32, b);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn rtl8188cu_ap_set_beacon_interval(devaddr: u32, mps: u32, interval: u32) -> i64 {
+  let _ = rtl_reg_write16(devaddr, mps, RTL_AP_REG_BCN_INTERVAL, interval);
+  return 0;
+}
+
+// `rtl8xxxu_start_tx_beacon`/`stop_tx_beacon`, verified exact: both
+// touch only the BYTE at `REG_FWHW_TXQ_CTRL + 2` (bit 6, EN_BCNQ_DL's
+// own bit position once shifted into a byte-at-offset-2 view) and
+// `REG_TBTT_PROHIBIT + 1`/`+ 2`.
+fn rtl8188cu_ap_start_tx_beacon(devaddr: u32, mps: u32) -> i64 {
+  let v: u32 = rtl_reg_read8(devaddr, mps, RTL_AP_REG_FWHW_TXQ_CTRL + (2 as u32));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_AP_REG_FWHW_TXQ_CTRL + (2 as u32), v | (0x40 as u32));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_AP_REG_TBTT_PROHIBIT + (1 as u32), 0x80 as u32);
+  let v2: u32 = rtl_reg_read8(devaddr, mps, RTL_AP_REG_TBTT_PROHIBIT + (2 as u32));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_AP_REG_TBTT_PROHIBIT + (2 as u32), v2 & (0xF0 as u32));
+  return 0;
+}
+
+fn rtl8188cu_ap_stop_tx_beacon(devaddr: u32, mps: u32) -> i64 {
+  let v: u32 = rtl_reg_read8(devaddr, mps, RTL_AP_REG_FWHW_TXQ_CTRL + (2 as u32));
+  let not_bit6: u32 = (0x40 as u32) ^ (0xFF as u32);
+  let _ = rtl_reg_write8(devaddr, mps, RTL_AP_REG_FWHW_TXQ_CTRL + (2 as u32), v & not_bit6);
+  let _ = rtl_reg_write8(devaddr, mps, RTL_AP_REG_TBTT_PROHIBIT + (1 as u32), 0x64 as u32);
+  let v2: u32 = rtl_reg_read8(devaddr, mps, RTL_AP_REG_TBTT_PROHIBIT + (2 as u32));
+  let not_bit0: u32 = (0x01 as u32) ^ (0xFF as u32);
+  let _ = rtl_reg_write8(devaddr, mps, RTL_AP_REG_TBTT_PROHIBIT + (2 as u32), v2 & not_bit0);
+  return 0;
+}
+
+// `rtl8xxxu_start_ap`: BSSID + beacon interval + the JOIN_BSS_REPORT
+// connect notification -- matches Linux's own function exactly
+// (`RTL8XXXU_BC_MC_MACID`'s own macid/role args are silently ignored
+// by this specific chip generation's own gen1_report_connect, per the
+// fork's trace -- confirmed directly in gen1_h2c_cmd above too, only
+// `connect` ever reaches the wire). Beacon TX itself is started
+// separately (`rtl8188cu_ap_start_tx_beacon`) once the caller has at
+// least one beacon frame ready to send, matching this driver's own
+// established "don't start a subsystem before it has real work queued"
+// discipline (e.g. dwc2_enable_dma_mode's own placement in dwc2_init).
+fn rtl8188cu_ap_start(devaddr: u32, mps: u32, bssid: mut ref i64, beacon_interval: u32) -> i64 {
+  let _ = rtl8188cu_ap_set_bssid(devaddr, mps, bssid);
+  let _ = rtl8188cu_ap_set_beacon_interval(devaddr, mps, beacon_interval);
+  let _ = rtl8188cu_h2c_join_bss_report(devaddr, mps, 1 as u32);
+  return 0;
+}
+
+// `rtl8xxxu_send_beacon_frame`: BCN_VALID clear, SW_BCN_SEL select
+// port 0, transmit through the NORMAL TX path (confirmed directly in
+// Linux's own source: `rtl8xxxu_tx`, not a separate beacon-specific
+// DMA mechanism), then poll for BCN_VALID to be set back by hardware.
+// Reuses this driver's own single existing bulk-OUT endpoint
+// (`dwc2_wifi_bulk_out`) rather than a second, beacon-dedicated USB
+// pipe real `rtl8xxxu` selects on some chip generations (`pipe_out[
+// TXDESC_QUEUE_BEACON]`) -- this project's own USB enumeration for
+// this dongle (`dwc2_fetch_and_set_configuration`'s own `is_wifi`
+// branch) only ever captures ONE bulk-OUT endpoint's MPS, confirming
+// gen1 RTL8188CU's own USB descriptor doesn't expose a second one to
+// multiplex onto in the first place -- the TX descriptor's own queue-
+// select field (`TXDESC_QUEUE_BEACON=0x10`, matching `rtl_tx_desc_
+// write`'s existing `RTL_TXDESC_QUEUE_MGNT=0x12` constant's own
+// pattern) is what actually routes the frame to the right MAC-level
+// queue in hardware, independent of which USB pipe carried it.
+fn rtl8188cu_ap_send_beacon(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len: i64) -> i64 {
+  let v: u32 = rtl_reg_read8(devaddr, mps, RTL_AP_REG_TDECTRL + (2 as u32));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_AP_REG_TDECTRL + (2 as u32), v | (0x01 as u32));
+
+  let v2: u32 = rtl_reg_read8(devaddr, mps, RTL_AP_REG_DWBCN1_CTRL + (2 as u32));
+  let not_bit4: u32 = (0x10 as u32) ^ (0xFF as u32);
+  let _ = rtl_reg_write8(devaddr, mps, RTL_AP_REG_DWBCN1_CTRL + (2 as u32), v2 & not_bit4);
+
+  let _ = dwc2_wifi_bulk_out(devaddr, mps, frame_buf, frame_len);
+
+  let retry: i64 = 0;
+  let valid: i64 = 0;
+  while retry < 100 {
+    let v3: u32 = rtl_reg_read8(devaddr, mps, RTL_AP_REG_TDECTRL + (2 as u32));
+    if (v3 & (0x01 as u32)) != (0 as u32) {
+      valid = 1;
+      break;
+    }
+    retry = retry + 1;
+  }
+  if valid != 1 {
+    let _ = uart_puts("USB: RTL8188CU beacon TX did not confirm BCN_VALID (sent anyway, not necessarily lost -- see rtl8xxxu_send_beacon_frame's own real-driver behavior, which only logs this as a warning)\n");
   }
   return 0;
 }
@@ -35077,6 +35578,85 @@ fn ieee80211_boot_self_test() -> i64 {
   return 0;
 }
 
+// AP-mode counterpart to ieee80211_boot_self_test above -- same
+// "build-then-check-bytes, parse-against-independently-placed-bytes"
+// discipline, exercising the reverse-direction functions (beacon_
+// build, probe_request_parse, probe_response_build, assoc_request_
+// parse, assoc_response_build) added 2026-10-04 for WiFi AP mode.
+fn ieee80211_ap_boot_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let bssid: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x01 as u8];
+  let sta_mac: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x03 as u8];
+  let ssid: [u8; 32] = zero32_bytes_80211();
+  ssid[0] = 0x74 as u8;
+  ssid[1] = 0x65 as u8;
+  ssid[2] = 0x73 as u8;
+  ssid[3] = 0x74 as u8;
+  let rsn: [u8; 22] = [0 as u8; 22];
+  let _ = rsn_ie_build_wpa2_psk_ccmp(mut ref rsn);
+
+  // Beacon: 24 (hdr) + 12 (fixed) + 2+4 (SSID) + 2+4 (rates) + 22 (RSN) = 70.
+  let beacon: [u8; 100] = [0 as u8; 100];
+  let beacon_len: i64 = beacon_build(ref bssid, ref ssid, 4, ref rsn, 1, 100, mut ref beacon);
+  if beacon_len != 70 { ok = 0; }
+  if beacon[0] != (0x80 as u8) { ok = 0; } // FC_STYPE_BEACON low byte
+  if beacon[36] != (EID_SSID as u8) { ok = 0; }
+  if beacon[34] != (0x11 as u8) { ok = 0; } // Capability Info: ESS+Privacy
+
+  // A wildcard Probe Request (empty SSID) -- real APs must answer this.
+  let preq_buf: [u8; 256] = [0 as u8; 256];
+  preq_buf[24] = EID_SSID as u8;
+  preq_buf[25] = 0 as u8;
+  let preq_ssid_out: [u8; 32] = [0 as u8; 32];
+  let preq_info: ProbeReqInfo = probe_request_parse(ref preq_buf, 26, mut ref preq_ssid_out);
+  if preq_info.ok != 1 { ok = 0; }
+  if preq_info.is_wildcard != 1 { ok = 0; }
+
+  let presp: [u8; 100] = [0 as u8; 100];
+  let presp_len: i64 = probe_response_build(ref sta_mac, ref bssid, ref ssid, 4, ref rsn, 1, 100, mut ref presp);
+  if presp_len != 70 { ok = 0; }
+  if presp[0] != (0x50 as u8) { ok = 0; } // FC_STYPE_PROBE_RESP low byte
+  let j: i64 = 0;
+  while j < 6 {
+    if presp[4 + j] != sta_mac[j] { ok = 0; }
+    j = j + 1;
+  }
+
+  // Association Request: fixed fields (CapInfo+ListenInterval) end at
+  // offset 28, matching assoc_request_build's own layout.
+  let assocreq_buf: [u8; 256] = [0 as u8; 256];
+  assocreq_buf[28] = EID_SSID as u8;
+  assocreq_buf[29] = 4 as u8;
+  assocreq_buf[30] = 0x74 as u8;
+  assocreq_buf[31] = 0x65 as u8;
+  assocreq_buf[32] = 0x73 as u8;
+  assocreq_buf[33] = 0x74 as u8;
+  j = 0;
+  while j < 22 {
+    assocreq_buf[34 + j] = rsn[j];
+    j = j + 1;
+  }
+  let assocreq_ssid_out: [u8; 32] = [0 as u8; 32];
+  let assocreq_info: AssocReqInfo = assoc_request_parse(ref assocreq_buf, 34 + 22, mut ref assocreq_ssid_out);
+  if assocreq_info.ok != 1 { ok = 0; }
+  if assocreq_info.ssid_len != 4 { ok = 0; }
+  if assocreq_info.has_rsn != 1 { ok = 0; }
+
+  let assocresp: [u8; 30] = [0 as u8; 30];
+  if assoc_response_build(ref sta_mac, ref bssid, 5, mut ref assocresp) != 30 { ok = 0; }
+  if assocresp[0] != (0x10 as u8) { ok = 0; } // FC_STYPE_ASSOC_RESP low byte
+  if assocresp[28] != (5 as u8) { ok = 0; }
+
+  let _ = uart_puts("CRYPTO: IEEE 802.11 AP-mode frames (Beacon, Probe Req/Resp, Assoc Req/Resp) build/parse round trip -- reverse direction of the STA-side self-test above");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
 // Task #198: WPA2 join-sequence orchestrator -- the state machine that
 // actually chains everything tasks #194-197 already built (CSPRNG
 // nonces, RSN IE, 802.11 management-frame build/parse, the EAPOL-Key
@@ -42902,6 +43482,7 @@ fn kernel_main() -> i64 {
   // WPA2-PSK/CCMP RSN IE. See ieee80211_boot_self_test's own header
   // comment.
   if boot_debug_enabled() == 1 { let _ = ieee80211_boot_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = ieee80211_ap_boot_self_test(); }
 
   // Task #198: WPA2 join-sequence orchestrator, end-to-end against a
   // synthetic peer. See wpa2_join_orchestrator_self_test's own header
@@ -42958,9 +43539,6 @@ fn kernel_main() -> i64 {
   // Round 71: general-purpose GPIO.
   if boot_debug_enabled() == 1 { let _ = gpio_self_check(); }
 
-  // Round 71: HDMI framebuffer (mailbox property-channel interface).
-  let _ = fb_self_check();
-
   // Task #197 follow-up (real-HW USB bring-up investigation,
   // 2026-10-02): VideoCore mailbox USB-HCD power-on -- see boot/
   // usb_power_state.S's own header comment for the full real-HW
@@ -42970,6 +43548,26 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("USB: power-on mailbox status=");
   let _ = uart_put_hex32(usb_power_status as u32);
   let _ = uart_puts(" (0=success)\n");
+
+  // Task #325 real-HW refinement (round 10, requested alongside this
+  // round's register-reassert fix so both get tested in the same
+  // flash): usb_power_on()'s own mailbox call already sets the WAIT
+  // bit (blocks for the firmware's OWN report that the power rail has
+  // stabilized, not just "request accepted" -- see usb_power_state.S's
+  // header comment) -- but every other real-HW power/bus-adjacent
+  // event this project has ever instrumented (TRSTRCY, HPRT0.PRTPWR's
+  // own bus-power rise time) has needed MORE real elapsed settle time
+  // than its own first synchronization point implied. A confirmed
+  // BCM2835 USB-power-domain-cycling register-loss bug (see this
+  // round's own research: a real Linux maintainer mailing-list thread,
+  // "dwc2: Implement recovery after PM domain off") makes this a
+  // directly relevant place to add the same margin, not a speculative
+  // guess: the DWC2 core's own internal reset/sync logic plausibly
+  // needs real time AFTER the power rail itself is confirmed stable,
+  // before its registers reliably hold values dwc2_init() is about to
+  // write. Same already-proven-on-real-hardware 161000 count (~50ms)
+  // used throughout this driver's own bring-up delays.
+  let _ = delay(161000);
 
   // DWC2 bring-up: only reaches "port enabled" if a USB device is
   // actually attached to this QEMU invocation (`-usb -device
@@ -42985,6 +43583,26 @@ fn kernel_main() -> i64 {
   }
   if boot_debug_enabled() == 1 { let _ = dwc2_wait_chan0_done_wcet_measure_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dwc2_net_bulk_in_poll_wcet_measure_self_test(); }
+
+  // Round 17 experiment (task #325, real-HW): moved from BEFORE
+  // usb_power_on()/dwc2_init() to HERE, AFTER the whole USB bring-up
+  // sequence -- user asked directly whether this project's OWN other
+  // peripheral init could be interfering with USB. fb_self_check()
+  // and usb_power_on() share the exact same VideoCore mailbox
+  // property-channel; the mailbox call itself is synchronous and
+  // correctly WAIT-gated (see usb_power_state.S's own header comment)
+  // but the GPU's OWN downstream display/HDMI setup triggered by a
+  // framebuffer allocate could plausibly still be running after the
+  // mailbox response returns, on a shared SoC power/clock tree, with
+  // timing that would land right around when this project's own real-
+  // HW retests have shown GAHBCFG/GUSBCFG reverting. Directly testable
+  // by moving this call to the other side of the whole USB sequence:
+  // if the revert still happens identically, this hypothesis is
+  // falsified with real evidence (same discipline as every other
+  // ruled-out lead this investigation has kept, not silently dropped);
+  // if it changes, that's a real, actionable finding.
+  // Round 71: HDMI framebuffer (mailbox property-channel interface).
+  let _ = fb_self_check();
 
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();
