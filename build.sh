@@ -191,6 +191,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/usb_wifi_state.S" -o "${BUILD_DIR}/usb_wifi_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/usb_hub_state.S" -o "${BUILD_DIR}/usb_hub_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/usb_hid_state.S" -o "${BUILD_DIR}/usb_hid_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -354,6 +357,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/usb_net_state.o" \
   "${BUILD_DIR}/usb_bt_state.o" \
   "${BUILD_DIR}/usb_wifi_state.o" \
+  "${BUILD_DIR}/usb_hub_state.o" \
   "${BUILD_DIR}/usb_hid_state.o" \
   "${BUILD_DIR}/fw_state.o" \
   "${BUILD_DIR}/auth_state.o" \

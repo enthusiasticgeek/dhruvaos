@@ -38,6 +38,11 @@
 .align 4
 usb_net_kind:
     .word 0
+/* Round 59 (tasks #164/#197, 2026-10-10): the real USB address this
+ * device was actually assigned -- see usb_wifi_state.S's own devaddr
+ * field header comment for the full reasoning (dual-hub-port fix). */
+usb_net_devaddr:
+    .word 0
 usb_net_bulk_in_epaddr:
     .word 0
 usb_net_bulk_in_mps:
@@ -67,6 +72,21 @@ usb_net_get_kind:
 .global usb_net_set_kind
 usb_net_set_kind:
     ldr r1, =usb_net_kind
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_net_get_devaddr
+usb_net_get_devaddr:
+    ldr r0, =usb_net_devaddr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_net_set_devaddr
+usb_net_set_devaddr:
+    ldr r1, =usb_net_devaddr
     str r0, [r1]
     mov r0, #0
     mov r1, #0

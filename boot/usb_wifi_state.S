@@ -15,6 +15,17 @@
 usb_wifi_kind:
     .word 0
 
+/* Round 59 (tasks #164/#197, 2026-10-10, real-HW dual-hub-port fix):
+ * the real USB address this device was actually assigned, learned at
+ * probe time -- previously every caller just assumed the single fixed
+ * constant dwc2_downstream_addr() (2), correct only when this was the
+ * sole device ever enumerated behind the hub. Now that both hub ports
+ * are brought up independently (port1 -> addr 2, port2 -> addr 3), a
+ * WiFi dongle plugged into either port needs its own real address
+ * remembered, not assumed. */
+usb_wifi_devaddr:
+    .word 0
+
 /* TASK #164 FOLLOW-UP (2026-09-14): persistent scratch for the real
  * MCU firmware-download sequence (kernel_main.vani's own
  * rtl8188cu_download_firmware/rtl8188cu_start_firmware) -- allocated
@@ -61,6 +72,21 @@ usb_wifi_get_kind:
 .global usb_wifi_set_kind
 usb_wifi_set_kind:
     ldr r1, =usb_wifi_kind
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_devaddr
+usb_wifi_get_devaddr:
+    ldr r0, =usb_wifi_devaddr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_devaddr
+usb_wifi_set_devaddr:
+    ldr r1, =usb_wifi_devaddr
     str r0, [r1]
     mov r0, #0
     mov r1, #0

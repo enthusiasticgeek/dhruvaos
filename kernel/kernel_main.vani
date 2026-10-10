@@ -2640,6 +2640,10 @@ extern "C" fn usb_net_get_kind() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_kind(value: u32) -> u32;
 #[stack_cost(bytes=1)]
+extern "C" fn usb_net_get_devaddr() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_net_set_devaddr(value: u32) -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn usb_net_get_bulk_in_epaddr() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_bulk_in_epaddr(value: u32) -> u32;
@@ -2672,6 +2676,26 @@ extern "C" fn usb_net_get_mac_scratch_ptr() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_net_set_mac_scratch_ptr(addr: mut ref i64) -> i64;
 
+// Round 59 (boot/usb_hub_state.S, tasks #164/#197): real USB hotplug
+// detection state for the LAN9512's own 2-port downstream hub -- see
+// that file's own header comment for the full design.
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_get_ready() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_set_ready(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_get_mps() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_set_mps(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_get_port1_connected() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_set_port1_connected(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_get_port2_connected() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_set_port2_connected(value: u32) -> u32;
+
 // Round 57 (boot/usb_bt_state.S): same shape as usb_net_state.S above,
 // for the USB Bluetooth HCI transport -- a SEPARATE state module so a
 // mass-storage/network/Bluetooth device attached at different times can
@@ -2683,6 +2707,10 @@ extern "C" fn usb_net_set_mac_scratch_ptr(addr: mut ref i64) -> i64;
 extern "C" fn usb_bt_get_kind() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_bt_set_kind(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_bt_get_devaddr() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_bt_set_devaddr(value: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_bt_get_bulk_in_epaddr() -> u32;
 #[stack_cost(bytes=1)]
@@ -2749,6 +2777,10 @@ extern "C" fn usb_hid_set_intr_in_toggle(value: u32) -> u32;
 extern "C" fn usb_wifi_get_kind() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_set_kind(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_wifi_get_devaddr() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_wifi_set_devaddr(value: u32) -> u32;
 // Task #164 follow-up: persistent scratch for the real MCU firmware-
 // download sequence -- see boot/usb_wifi_state.S's own comment.
 #[stack_cost(bytes=1)]
@@ -13347,7 +13379,7 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
   }
   if usb_net_get_kind() == (1 as u32) {
     let mps: u32 = usb_net_get_bulk_out_mps();
-    let devaddr: u32 = dwc2_downstream_addr();
+    let devaddr: u32 = usb_net_get_devaddr();
     let chunk_buf: mut ref i64 = dhruva_alloc_bytes(64);
     let sent: i64 = 0;
     let frame_len_u: u32 = frame_len as u32;
@@ -13386,7 +13418,7 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
   // the way CDC-ECM's short-packet convention does.
   if usb_net_get_kind() == (2 as u32) {
     let mps2: u32 = usb_net_get_bulk_out_mps();
-    let devaddr2: u32 = dwc2_downstream_addr();
+    let devaddr2: u32 = usb_net_get_devaddr();
     let frame_len_u2: u32 = frame_len as u32;
     let total_len: i64 = frame_len + 8;
     let wrapped_buf: mut ref i64 = dhruva_alloc_bytes(520);
@@ -13655,7 +13687,7 @@ fn netif_maybe_auto_answer_arp(frame: mut ref i64, frame_len: i64) -> i64 {
 fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   if usb_net_get_kind() == (1 as u32) {
     let mps: u32 = usb_net_get_bulk_in_mps();
-    let devaddr: u32 = dwc2_downstream_addr();
+    let devaddr: u32 = usb_net_get_devaddr();
     let chunk_buf: mut ref i64 = dhruva_alloc_bytes(64);
     let total: i64 = 0;
     let done: i64 = 0;
@@ -13710,7 +13742,7 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   // need the same loop rx_fixup itself uses, not implemented here.
   if usb_net_get_kind() == (2 as u32) {
     let mps3: u32 = usb_net_get_bulk_in_mps();
-    let devaddr3: u32 = dwc2_downstream_addr();
+    let devaddr3: u32 = usb_net_get_devaddr();
     let chunk_buf3: mut ref i64 = dhruva_alloc_bytes(64);
     let raw_buf: mut ref i64 = dhruva_alloc_bytes(520);
     let raw_total: i64 = 0;
@@ -21193,6 +21225,7 @@ fn rtl_reg_write32(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
 // item become reachable at all.
 fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
   let _ = usb_wifi_set_kind(1 as u32);
+  let _ = usb_wifi_set_devaddr(devaddr);
   let iso_ctrl: u32 = rtl_reg_read16(devaddr, mps, 0x0000 as u32); // REG_SYS_ISO_CTRL
   let sys_func: u32 = rtl_reg_read16(devaddr, mps, 0x0002 as u32); // REG_SYS_FUNC
   let _ = uart_puts("USB: RTL8188CU/RTL8192CU family detected, REG_SYS_ISO_CTRL=");
@@ -22285,6 +22318,7 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
   }
   if (found_cdc_control == 1) && (found_net_bulk_eps == 1) {
     let _ = usb_net_set_kind(1 as u32);
+    let _ = usb_net_set_devaddr(devaddr);
     let _ = usb_net_set_cdc_data_iface_num((cdc_data_iface_target as u32));
     let _ = usb_net_set_in_toggle(0 as u32);
     let _ = usb_net_set_out_toggle(0 as u32);
@@ -22302,6 +22336,7 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
   }
   if (is_lan9512 == (1 as u32)) && (found_net_bulk_eps == 1) {
     let _ = usb_net_set_kind(2 as u32);
+    let _ = usb_net_set_devaddr(devaddr);
     let _ = usb_net_set_in_toggle(0 as u32);
     let _ = usb_net_set_out_toggle(0 as u32);
     let _ = uart_puts("USB: LAN9512 Ethernet function detected, bulk_in_ep=");
@@ -22316,6 +22351,7 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
   }
   if (found_bt == 1) && (found_bt_bulk_eps == 1) && (found_bt_intr_ep == 1) {
     let _ = usb_bt_set_kind(1 as u32);
+    let _ = usb_bt_set_devaddr(devaddr);
     let _ = usb_bt_set_bulk_in_toggle(0 as u32);
     let _ = usb_bt_set_bulk_out_toggle(0 as u32);
     let _ = usb_bt_set_intr_in_toggle(0 as u32);
@@ -26394,19 +26430,66 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
 // flagged rather than silently assumed away. Costs nothing when
 // nothing's there: the existing "not connected" handling already
 // covers a genuinely empty port 2 cleanly.
+fn dwc2_downstream_addr2() -> u32 {
+  return 3 as u32;
+}
+
+// Round 59 (tasks #164/#197, 2026-10-10): this used to try port1, and
+// ONLY fall back to port2 if port1 reported "not connected" -- an
+// either/or assumption baked in since round 23 ("whichever one
+// actually has a device"), correct for the ORIGINAL single-device
+// test setup but wrong now that a real board can have LAN9512's own
+// Ethernet function on one hub port AND a separate external device
+// (a WiFi dongle, confirmed live: a WiFi dongle plugged into the
+// LAN9512's other physical downstream port was never even probed,
+// because port1's own Ethernet function already made bring_up_result
+// 0, so the `if bring_up_result == 1` branch guarding port2 never
+// ran at all). Both ports are now brought up and enumerated
+// UNCONDITIONALLY and independently -- each with its own distinct
+// address (dwc2_downstream_addr()=2 for port1, dwc2_downstream_addr2()
+// =3 for port2) so neither enumeration's own address-0 SET_ADDRESS
+// sequence collides with the other's. The actual per-device
+// descriptor-fetch/configure/probe body is unchanged, just extracted
+// into dwc2_enumerate_one_downstream_device so it can run twice.
 fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   let hub_addr: u32 = dwc2_hub_addr();
 
-  let bring_up_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port1());
-  let final_result: i64 = bring_up_result;
-  if bring_up_result == 1 {
-    final_result = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port2());
-  }
-  if final_result != 0 {
+  // Round 59: persist the hub's own mps and "a hub genuinely exists"
+  // flag so usb_hotplug_poll (called much later, from an entirely
+  // different task/call stack) can make its own GET_PORT_STATUS calls
+  // without needing this boot-time call's own local variables.
+  let _ = usb_hub_set_mps(hub_mps);
+  let _ = usb_hub_set_ready(1 as u32);
+
+  let port1_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port1());
+  let port1_outcome: i64 = if port1_result == 0 {
+    dwc2_enumerate_one_downstream_device(dwc2_downstream_addr())
+  } else {
+    port1_result
+  };
+  let _ = usb_hub_set_port1_connected(if port1_result == 0 { 1 as u32 } else { 0 as u32 });
+
+  let port2_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port2());
+  let port2_outcome: i64 = if port2_result == 0 {
+    dwc2_enumerate_one_downstream_device(dwc2_downstream_addr2())
+  } else {
+    port2_result
+  };
+  let _ = usb_hub_set_port2_connected(if port2_result == 0 { 1 as u32 } else { 0 as u32 });
+
+  // "Not connected" (1) on BOTH ports is the only genuinely empty
+  // case; anything else (a real device enumerated on at least one
+  // port, even if the other port failed or is empty) counts as
+  // overall success -- a failure on one port must never mask a real
+  // device that came up cleanly on the other.
+  if (port1_outcome == (1 as i64)) && (port2_outcome == (1 as i64)) {
     let _ = uart_puts("USB: no downstream device (checked both hub ports)\n");
     return 0 - 1;
   }
+  return 0;
+}
 
+fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   let ddesc8: mut ref i64 = dhruva_alloc_bytes(8);
   let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
   let dstatus0: i64 = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, ddesc8);
@@ -26416,7 +26499,6 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   }
   let dmps0: u32 = buf_read_byte(ddesc8, 7 as u32);
 
-  let downstream_addr: u32 = dwc2_downstream_addr();
   let _ = dwc2_build_set_address_setup(downstream_addr);
   let daddr_status: i64 = dwc2_control_no_data(0 as u32, dmps0);
   if daddr_status != 0 {
@@ -26553,6 +26635,152 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
     // same device, not just the low-level usb_msd_read10/write10
     // primitives round 35 already proved.
     let _ = dharafs_block_dev_self_check();
+  }
+  return 0;
+}
+
+// Round 59 (tasks #164/#197, 2026-10-10): real USB hotplug detection,
+// researched against Linux's own drivers/usb/core/hub.c (hub_event's
+// debounce: sample GET_PORT_STATUS repeatedly, require N consecutive
+// identical reads before acting, rather than trusting a single
+// sample) before writing this. This driver has no hub interrupt-IN
+// endpoint and never will (every USB operation here is a polled
+// register/control-transfer sequence, no IRQ-driven anything) -- so
+// unlike Linux's own async hub_event (woken by that endpoint), this is
+// a periodic poll, called from task_e's own existing DHCP-poll pass
+// (see that call site's own comment for why it must share task_e's
+// existing ceiling-2 lock: GET_PORT_STATUS and a new device's own
+// enumeration both drive the same shared DWC2 channel-0 hardware
+// dhcp_client_poll's own netif_recv_frame path already contends for).
+//
+// Three consecutive identical reads, ~5ms apart (delay(16100), this
+// project's own calibrated real-HW constant for that duration) is a
+// much shorter stability window than Linux's own 100ms -- deliberately:
+// this already only runs once per task_e pass (every 20 ticks), so the
+// OUTER interval itself provides most of the real debounce Linux gets
+// from its own dedicated 25ms-step loop; this inner loop only guards
+// against catching a port truly mid-transition within a single pass,
+// not against the outer cadence being too fast.
+fn usb_hotplug_sample_port_connected(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
+  let status_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let last: i64 = 0 - 1; // sentinel: "no sample taken yet"
+  let stable_count: i64 = 0;
+  let tries: i64 = 0;
+  while tries < 3 {
+    let sr: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
+    if sr != 0 {
+      return 0 - 1; // hub communication failure -- caller treats as inconclusive
+    }
+    let status_lo: u32 = buf_read_byte(status_buf, 0 as u32);
+    let cur: i64 = (status_lo & (1 as u32)) as i64; // wPortStatus bit0, PORT_CONNECTION
+    if cur == last {
+      stable_count = stable_count + 1;
+    } else {
+      stable_count = 0;
+    }
+    last = cur;
+    tries = tries + 1;
+    if tries < 3 {
+      let _ = delay(16100);
+    }
+  }
+  if stable_count < 2 {
+    return 0 - 1; // not stable across all 3 samples -- try again next pass
+  }
+  return last;
+}
+
+// Clears whatever subsystem's state currently claims this address --
+// called the moment a port is seen to have gone from connected to not
+// connected. Checked against Linux's own disconnect-cleanup shape for
+// the three device classes this driver supports (usbnet_disconnect,
+// rtl8xxxu_disconnect, btusb_disconnect -- all three are PURELY local
+// teardown, no over-the-wire "goodbye" of any kind, since the device
+// is physically gone): clear the kind flag (the thing every TX/RX/
+// radio-init call site already checks before doing anything) and,
+// for WiFi/BLE specifically, also clear wifi_radio_set_present/
+// ble_radio_set_present so a stale "radio ready" state can't survive
+// past the device that registered it. Each check is gated on "was
+// THIS address the one that subsystem actually claimed" (not just
+// "is this subsystem's kind nonzero at all") -- necessary now that two
+// different subsystems can each be legitimately active at once, one
+// per hub port.
+fn usb_hotplug_clear_device_at_addr(addr: u32) -> i64 {
+  if (usb_net_get_kind() != (0 as u32)) && (usb_net_get_devaddr() == addr) {
+    let _ = usb_net_set_kind(0 as u32);
+    let _ = uart_puts("USB hotplug: Ethernet function disconnected, addr=");
+    let _ = uart_put_hex32(addr);
+    let _ = uart_puts("\n");
+  }
+  if (usb_wifi_get_kind() != (0 as u32)) && (usb_wifi_get_devaddr() == addr) {
+    let _ = usb_wifi_set_kind(0 as u32);
+    let _ = wifi_radio_set_present(0 as u32);
+    let _ = uart_puts("USB hotplug: WiFi dongle disconnected, addr=");
+    let _ = uart_put_hex32(addr);
+    let _ = uart_puts("\n");
+  }
+  if (usb_bt_get_kind() != (0 as u32)) && (usb_bt_get_devaddr() == addr) {
+    let _ = usb_bt_set_kind(0 as u32);
+    let _ = ble_radio_set_present(0 as u32);
+    let _ = uart_puts("USB hotplug: Bluetooth HCI dongle disconnected, addr=");
+    let _ = uart_put_hex32(addr);
+    let _ = uart_puts("\n");
+  }
+  return 0;
+}
+
+// The actual periodic check -- one call per task_e pass. Both hub
+// ports are checked independently and unconditionally (same reasoning
+// as dwc2_enumerate_downstream's own both-ports fix just above: a
+// fixed device on one port must never suppress checking the other).
+// A device newly appearing on a port gets the exact same bring-up +
+// enumerate sequence the boot-time path already uses; a device newly
+// disappearing gets its claimed address's state cleared. Reconnect-
+// race safety (a device disconnecting and a DIFFERENT one reconnecting
+// to the same port before cleanup finishes) is free here the way it
+// is in Linux's own hub_event, just for a different reason: Linux
+// serializes disconnect-then-reconnect on the same single-threaded hub
+// workqueue; this driver gets the same guarantee because task_e itself
+// is the only caller, and nothing else can run between this pass's own
+// disconnect-cleanup and reconnect-handling for the same port within
+// the same call.
+fn usb_hotplug_poll() -> i64 {
+  if usb_hub_get_ready() == (0 as u32) {
+    return 0; // no hub was ever found+configured at boot -- nothing to poll
+  }
+  let hub_addr: u32 = dwc2_hub_addr();
+  let hub_mps: u32 = usb_hub_get_mps();
+
+  let cur1: i64 = usb_hotplug_sample_port_connected(hub_addr, hub_mps, dwc2_hub_port1());
+  if cur1 >= 0 {
+    let was1: u32 = usb_hub_get_port1_connected();
+    if (cur1 as u32) != was1 {
+      if cur1 == 1 {
+        let br1: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port1());
+        if br1 == 0 {
+          let _ = dwc2_enumerate_one_downstream_device(dwc2_downstream_addr());
+        }
+      } else {
+        let _ = usb_hotplug_clear_device_at_addr(dwc2_downstream_addr());
+      }
+      let _ = usb_hub_set_port1_connected(cur1 as u32);
+    }
+  }
+
+  let cur2: i64 = usb_hotplug_sample_port_connected(hub_addr, hub_mps, dwc2_hub_port2());
+  if cur2 >= 0 {
+    let was2: u32 = usb_hub_get_port2_connected();
+    if (cur2 as u32) != was2 {
+      if cur2 == 1 {
+        let br2: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port2());
+        if br2 == 0 {
+          let _ = dwc2_enumerate_one_downstream_device(dwc2_downstream_addr2());
+        }
+      } else {
+        let _ = usb_hotplug_clear_device_at_addr(dwc2_downstream_addr2());
+      }
+      let _ = usb_hub_set_port2_connected(cur2 as u32);
+    }
   }
   return 0;
 }
@@ -27592,8 +27820,24 @@ fn task_e() -> i64 {
     // live, every real pass, rather than assumed identical to the
     // DharaFS section above -- they're genuinely different workloads
     // under the same ceiling.
+    // Round 59 (tasks #164/#197): usb_hotplug_poll shares this exact
+    // lock for the same reason dhcp_client_poll already needs it --
+    // both drive the same shared DWC2 channel-0 hardware (hub
+    // GET_PORT_STATUS control transfers, and a newly-connected
+    // device's own full enumeration sequence, are channel-0
+    // operations exactly like netif_recv_frame's own dwc2_net_bulk_in
+    // call). NOT yet folded into this critical section's own formal
+    // WCET measurement below (gc_dhcp_t0/t1 bracket dhcp_client_poll
+    // only) -- the common "nothing changed" case adds a bounded,
+    // modest cost (2 ports x up to 2x~5ms debounce reads), but a port
+    // that's actually new/gone pulls in a full bring-up-or-cleanup
+    // pass, an unmeasured addition to this ceiling's real worst case.
+    // Flagged here rather than silently expanding an already safety-
+    // audited critical section's WCET without comment; a full re-
+    // measurement is real follow-up work, not done this round.
     let gc_dhcp_t0: u32 = mmio_read_u32(TIMER_CLO);
     let _ = dhruva_prio_lock(2);
+    let _ = usb_hotplug_poll();
     let _ = dhcp_client_poll(dhcp_my_mac);
     let _ = dhruva_prio_unlock(3);
     let gc_dhcp_t1: u32 = mmio_read_u32(TIMER_CLO);
@@ -36620,7 +36864,7 @@ fn wifi_radio_init_rtl8188cu() -> i64 {
   if usb_wifi_get_kind() == (0 as u32) {
     return 0;
   }
-  let _ = wifi_radio_set_devaddr(dwc2_downstream_addr());
+  let _ = wifi_radio_set_devaddr(usb_wifi_get_devaddr());
   let _ = wifi_radio_set_mps_in(usb_wifi_get_bulk_in_mps());
   let _ = wifi_radio_set_mps_out(usb_wifi_get_bulk_out_mps());
   let _ = wifi_radio_set_tx_fn(rtl8188cu_tx_frame);
@@ -36932,7 +37176,7 @@ fn ble_radio_init_generic_hci() -> i64 {
   if usb_bt_get_kind() == (0 as u32) {
     return 0;
   }
-  let _ = ble_radio_set_devaddr(dwc2_downstream_addr());
+  let _ = ble_radio_set_devaddr(usb_bt_get_devaddr());
   let _ = ble_radio_set_mps_ctrl(8 as u32);
   let _ = ble_radio_set_mps_intr_in(usb_bt_get_intr_in_mps());
   let _ = ble_radio_set_send_cmd_fn(dwc2_hci_send_command);
