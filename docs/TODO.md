@@ -13505,3 +13505,55 @@ retransmission case) confirmed PASS via a dedicated debug-enabled QEMU boot (`/c
 `reboot`). No BLE/HCI self-test exists under QEMU at all (no USB Bluetooth device model -- a pre-existing,
 already-documented limitation of this project's BLE code, not new); the BLE fix's verification rests on
 clean build + general regression only, pending real-HW/real-peripheral retest.
+
+### Task #325 CLOSED: real root cause found and fixed -- LAN9512 vendor-command recipient bit (2026-10-10)
+
+After 37 rounds (register-level HCSPLT/channel-flush/GAHBCFG/GUSBCFG/FSLSPclkSel/DMAEN/MULTICNT fixes,
+a genuine ARM1176 DMB-vs-DSB memory-barrier bug in `mem_barrier()`, and two reverted regressions --
+U-Boot's mps=64 "Windows scheme" and a Zephyr-sourced AHBIDLE pre-check, both confirmed via back-to-back
+identical-binary real-HW retests to regress via pure timing shift, not logic errors), the actual root
+cause was found once the investigation finally reached a USB request type it had never exercised before:
+`lan9512_reg_read`/`lan9512_reg_write`'s vendor READ_REGISTER/WRITE_REGISTER commands used
+`bmRequestType = 0xC1`/`0x41` (`USB_RECIP_INTERFACE`) instead of `0xC0`/`0x40` (`USB_RECIP_DEVICE`).
+Confirmed definitively by fetching Linux's real in-tree `drivers/net/usb/smsc95xx.c` and reading its
+actual `usbnet_read_cmd`/`usbnet_write_cmd` call sites, both of which hardcode `USB_RECIP_DEVICE`, never
+`USB_RECIP_INTERFACE`. Every *standard* request this driver issues (`GET_DESCRIPTOR`, `SET_ADDRESS`,
+`SET_CONFIGURATION`) already used `USB_RECIP_DEVICE` correctly (baked into the standard-request
+`bmRequestType` values) and always worked; the LAN9512 vendor register commands were the only
+`RECIP_INTERFACE` request this driver ever issued, and the only one that ever STALLed
+(`HCINT=0x0A`, CHHLTD+STALL, identical signature to the original symptom).
+
+**How this was found**: a real-HW retest (after an unrelated bounded-retry fix for the original
+`GET_DESCRIPTOR` STALL) showed that symptom had stopped reproducing on its own, with enumeration
+proceeding further than ever before -- into the LAN9512 Ethernet function's bulk endpoint discovery. A
+NEW, identically-shaped STALL then appeared at the next step: `lan9512_reset_and_init`'s own HW_CFG
+lite-reset poll (bounded at 1000 tries, every single one failing identically) -- the first-ever
+vendor-class control request this driver had issued on real hardware. Fixing the recipient bit resolved
+it: real-HW retest confirmed `USB: LAN9512 reset+init complete` now prints (previously always
+"lite reset timed out"), `dwc2_init status=00000000`, boot proceeds normally into `DHCP: client_start`.
+Reproduced twice independently (once via manual picocom, once via a new persistent background UART
+logger, `test/uart_logger.py`, added this round specifically so future real-HW retests don't need a
+manually-managed terminal session at all).
+
+**Retrospective**: the BCM2835 USB power-domain register-loss erratum this investigation spent many
+rounds on (confirmed real via a genuine Linux maintainer mailing-list thread, and genuinely necessary to
+fix to get this far -- without its self-heal, GAHBCFG/GUSBCFG revert mid-transfer and nothing works at
+all) was NOT the cause of either STALL symptom. Both had mundane, protocol-level explanations once the
+investigation actually reached the request type each one lived in. **Generalizable lesson**: when a
+STALL/failure investigation has only ever been exercised against one request-type class (here:
+standard requests), hitting the same-looking failure on a DIFFERENT class (vendor requests) after
+getting further is not "the same bug resurfacing" -- check the new class's own request construction
+from scratch against a real reference, don't assume the earlier investigation's conclusions (already
+proven correct for the first class) still apply.
+
+A side investigation this round built and attempted to boot stock mainline U-Boot (`rpi_defconfig`) from
+the same SD card as independent ground truth (`swap_test_kernel.sh`, a new reusable helper for
+temporarily booting an alternate test image without touching partitions/firmware files) but got zero
+serial output even with the earliest possible pre-devicetree debug-UART hook, never reached a useful
+conclusion, and was abandoned per direct user instruction to refocus on DhruvaOS's own code -- which is
+what actually found the real bug.
+
+**Verification**: `./build.sh` clean (zero `asm_safety_audit.py` findings, stack-depth gate clean).
+Real-HW retest (twice, independently) confirmed `GET_DESCRIPTOR(Device)`, hub enumeration, downstream
+LAN9512 Ethernet function detection, AND the LAN9512 vendor-command reset+init sequence all complete
+successfully, with boot proceeding normally into `DHCP: client_start`. Task #325 CLOSED.
