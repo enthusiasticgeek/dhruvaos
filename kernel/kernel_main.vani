@@ -18829,12 +18829,35 @@ fn dwc2_init_fs_ls_pclk_sel() -> i64 {
 // `HBSTLEN=INCR4`. Switched to the verified-correct encoding (0x06,
 // matching U-Boot's own generic computation for the confirmed
 // architecture) instead of the unverified literal.
+// Round 26 (task #325, real-HW retest after round 25's self-heal fix
+// finally got the SETUP stage to succeed for the first time ever):
+// the DATA stage then STALLed. Re-decoded the failure snapshot's own
+// GAHBCFG=0x3F against round 18's own OR-only write and found the
+// real bug round 18 introduced: `v | hbstlen_incr4 | dmaen` ORs the
+// intended bits[1:2] ON TOP of whatever bits[4:1] already held --
+// never clearing the field first. `dwc2_core_soft_reset()` (called
+// earlier in dwc2_init) resets this register to its own power-on
+// hardware default, which this exact silicon evidently leaves with
+// bits 3 and 4 ALREADY set (a plausible, implementation-defined
+// "reserved" reset value, not zero) -- confirmed by the arithmetic:
+// 0x3E (bits1-4, the union of our intended 0x06 and the pre-existing
+// 0x18) | 0x01 (GLBL_INTR_EN, already set by dwc2_enable_global_intr
+// earlier) == 0x3F, exactly the observed value. The resulting
+// HBSTLEN field (0b1111=15) is not one of the five valid Synopsys
+// burst-length encodings (0,1,3,5,7) at all -- a genuinely undefined
+// AHB burst configuration, a fully sufficient explanation for a
+// device-side STALL once the transfer actually reaches the DATA
+// stage. Fixed by explicitly clearing bits[4:1] before setting them,
+// rather than switching the target value itself (U-Boot's own
+// generically-computed 0x06/INCR4 is kept -- this was never a wrong-
+// target-value bug, it was a missing-clear bug).
 fn dwc2_enable_dma_mode() -> i64 {
   let gahbcfg: i64 = dwc2_base() + 0x08;
+  let hbstlen_mask: u32 = ((0xF as u32) << (1 as u32)) ^ (0xFFFFFFFF as u32); // ~bits[4:1]
   let hbstlen_incr4: u32 = (3 as u32) << (1 as u32); // 0x06, bits[4:1]
   let dmaen: u32 = (1 as u32) << (5 as u32);
   let v: u32 = mmio_read_u32(gahbcfg);
-  let _ = mmio_write_u32(gahbcfg, v | hbstlen_incr4 | dmaen);
+  let _ = mmio_write_u32(gahbcfg, (v & hbstlen_mask) | hbstlen_incr4 | dmaen);
   return 0;
 }
 
@@ -18928,6 +18951,28 @@ fn dwc2_restart_phy_clock() -> i64 {
 // where this register is "entirely logged-only" (dwc2_init's own
 // header comment) and never reflects the write at all, both loops
 // exit on their very first check -- zero added boot-time cost there.
+// Round 34 (task #325, real-HW retest of round 33): REVERTED. Two
+// consecutive retests of round 33's exact binary (same code, no
+// rebuild between them, user hard-power-cycled both times) produced
+// BIT-FOR-BIT IDENTICAL SETUP-stage failures (HCINT=0x00000002,
+// HCCHAR0=0x00100008) -- conclusively ruling out real-HW
+// intermittency as the explanation (same binary, same deterministic
+// outcome twice). That leaves round 33's own addition as the only
+// genuinely new piece of logic this driver didn't have when round 29
+// last succeeded at this exact SETUP stage: a pre-reset AHBIDLE poll
+// loop (up to 20 x ~5ms = up to ~100ms) inserted at the very start of
+// dwc2_init(), before ANYTHING else touches the DWC2 core. This
+// entire investigation has repeatedly found this driver's own
+// downstream behavior to be extremely sensitive to exact timing
+// (the recurring power-domain register-revert's own cadence, the
+// self-heal's own tries-based checkpoints) -- an EXTRA, NEW ~100ms
+// delay inserted this early, if AHBIDLE wasn't already set and this
+// loop genuinely spun for some real portion of its budget, could
+// plausibly shift every downstream timing window relative to
+// whatever the revert's own cycle is, independent of the pre-check's
+// own logical correctness. Reverting this specific addition to
+// isolate it, keeping round 32's own clean mps=8/wLength=8 revert
+// otherwise untouched.
 fn dwc2_core_soft_reset() -> i64 {
   let grstctl: i64 = dwc2_base() + 0x10;
   let _ = mmio_write_u32(grstctl, 1 as u32);
@@ -19457,6 +19502,57 @@ fn dwc2_set_timeout_calibration() -> i64 {
   return 0;
 }
 
+// See dwc2_init's own call-site comment (round 28, task #325) for
+// the full U-Boot citation (`dwc_otg_core_host_init`'s channel-flush
+// loop). Pass 1: clear CHENA+EPDIR, set CHDIS (request a disable
+// without ever setting CHENA=1 first -- matches U-Boot's own
+// clrsetbits exactly, a plain read-modify-write preserving every
+// other field). Pass 2: clear EPDIR, set BOTH CHENA+CHDIS together
+// (the same "halt an active channel" register pattern this driver's
+// own dwc2_reset_chan0_for_new_transfer already uses elsewhere) --
+// but UNCONDITIONALLY this time, guaranteeing a genuine 0->1
+// transition on CHENA regardless of whatever it read as beforehand,
+// which dwc2_reset_chan0_for_new_transfer's own CHENA==1 guard can
+// never do for the very first transfer this driver ever attempts.
+// Waits for CHHLTD (this driver's own established, working
+// completion signal for a channel disable, confirmed since round 23)
+// rather than polling HCCHAR.CHENA directly the way U-Boot's
+// wait_for_bit does -- same real condition, already-proven mechanism.
+fn dwc2_flush_chan0_to_known_state() -> i64 {
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hcint0: i64 = dwc2_hcint0_addr();
+  let chena_bit: u32 = (1 as u32) << (31 as u32);
+  let chdis_bit: u32 = (1 as u32) << (30 as u32);
+  let epdir_bit: u32 = (1 as u32) << (15 as u32);
+  let chhltd_bit: u32 = (1 as u32) << (1 as u32);
+  let clear_chena_epdir: u32 = (chena_bit | epdir_bit) ^ (0xFFFFFFFF as u32);
+  let clear_epdir: u32 = epdir_bit ^ (0xFFFFFFFF as u32);
+
+  // Pass 1.
+  let v1: u32 = mmio_read_u32(hcchar0);
+  let _ = mmio_write_u32(hcchar0, (v1 & clear_chena_epdir) | chdis_bit);
+
+  // Pass 2: genuine 0->1 CHENA transition, unconditionally.
+  let v2: u32 = mmio_read_u32(hcchar0);
+  let _ = mmio_write_u32(hcchar0, (v2 & clear_epdir) | chena_bit | chdis_bit);
+  let flush_tries: i64 = 0;
+  while flush_tries < 50 {
+    let hi: u32 = mmio_read_u32(hcint0);
+    if (hi & chhltd_bit) != (0 as u32) {
+      let _ = mmio_write_u32(hcint0, hi);
+      flush_tries = 50;
+    } else {
+      let _ = delay(16100); // ~5ms real, same per-iteration cost used throughout this driver's own short real-HW waits
+      flush_tries = flush_tries + 1;
+    }
+  }
+  let stale: u32 = mmio_read_u32(hcint0);
+  if stale != (0 as u32) {
+    let _ = mmio_write_u32(hcint0, stale);
+  }
+  return 0;
+}
+
 fn dwc2_init() -> i64 {
   let id: u32 = dwc2_read_gsnpsid();
   let _ = uart_puts("USB: GSNPSID=");
@@ -19465,6 +19561,31 @@ fn dwc2_init() -> i64 {
 
   let _ = dwc2_restart_phy_clock();
   let _ = dwc2_core_soft_reset();
+
+  // Round 22 (task #325, found by fully decoding a real-HW GINTSTS
+  // snapshot instead of just its HCHINT bit): BOTH mainline Linux
+  // (`dwc2_enable_common_interrupts`, hcd.c) AND the real Broadcom/
+  // RPi downstream driver (`dwc_otg_enable_common_interrupts`,
+  // dwc_otg_cil.c) do, as their very FIRST two steps, unconditionally:
+  // `write 0xFFFFFFFF to GOTGINT` then `write 0xFFFFFFFF to GINTSTS`
+  // -- a deliberate clean-slate clear of every W1C sticky status bit
+  // in BOTH registers, BEFORE programming which of them should mask/
+  // unmask as real interrupts going forward. This driver has never
+  // done either. Real-HW evidence this round: the GET_DESCRIPTOR
+  // failure snapshot's own GINTSTS (0x5400882B) decodes to MODEMIS
+  // (bit1, Mode Mismatch), USBSUSP (bit11), CONIDSTSCHNG (bit28), and
+  // SESSREQINT (bit30) all SET -- plausible artifacts of this core's
+  // own natural device-mode-default-to-forced-host-mode transition
+  // during bring-up, sitting there, sticky, uncleared, since boot.
+  // Not yet proven to cause the CHHLTD-without-XFERCOMPL symptom this
+  // investigation is chasing, but a real, confirmed divergence from
+  // BOTH references' own explicit init discipline, worth fixing on
+  // its own correctness terms regardless.
+  let gotgint: i64 = dwc2_base() + 0x04;
+  let gintsts: i64 = dwc2_base() + 0x14;
+  let _ = mmio_write_u32(gotgint, 0xFFFFFFFF as u32);
+  let _ = mmio_write_u32(gintsts, 0xFFFFFFFF as u32);
+
   let _ = dwc2_select_fs_phy();
   // Task #325 retest finding: U-Boot's dwc_otg_core_init sets
   // HCFG.FSLSPclkSel/FSLSSupp IMMEDIATELY after PHYSEL+reset, still
@@ -19487,6 +19608,29 @@ fn dwc2_init() -> i64 {
   let _ = dwc2_enable_global_intr();
   let _ = dwc2_enable_dma_mode();
   let _ = dwc2_set_timeout_calibration();
+
+  // Round 28 (task #325, meticulous full read-through of U-Boot's
+  // own `dwc_otg_core_host_init`, not a spot-check): right after FIFO
+  // config and BEFORE vbus/port power-on, U-Boot unconditionally
+  // flushes every host channel to a known state:
+  //   for each channel: clrsetbits(hcchar, CHENA|EPDIR, CHDIS)
+  //   for each channel: clrsetbits(hcchar, EPDIR, CHENA|CHDIS);
+  //                      wait_for_bit(hcchar, CHENA, cleared, timeout)
+  // ("Flush out any leftover queued requests." / "Halt all channels
+  // to put them into a known state.") This driver has never done
+  // this -- its own channel-0 halt logic (dwc2_reset_chan0_for_new_
+  // transfer) only ever fires PER-TRANSFER and only when CHENA is
+  // already observed as 1, which can never catch whatever internal
+  // hardware state a genuine, unconditional 0->1->(wait for halt)->0
+  // CHENA cycle would flush at boot, before this driver has ever
+  // enabled the channel even once. Real-HW evidence already gathered
+  // this investigation (rounds 18-20) found CHENA coming up non-zero
+  // from the port-enable/reset sequence on real silicon -- exactly
+  // the "leftover queued request" scenario this exact step exists to
+  // clear. Scoped to channel 0 only (the only channel this driver
+  // ever drives, unlike U-Boot which loops over every GHWCFG2-
+  // reported channel).
+  let _ = dwc2_flush_chan0_to_known_state();
   let _ = dwc2_port_power_on();
 
   let connected: i64 = dwc2_port_connected();
@@ -19539,26 +19683,39 @@ fn dwc2_reassert_core_config_post_port_reset() -> i64 {
   let gusbcfg: i64 = dwc2_base() + 0x0C;
   let gahbcfg: i64 = dwc2_base() + 0x08;
   let physel_bit: u32 = (1 as u32) << (6 as u32);
+  // Round 29 (task #325): a full real-HW boot capture from power-on
+  // (not just the post-hoc kernlog failure snapshot) caught this
+  // register mid-revert, live, for the first time -- and decoded
+  // against the real gusbcfg_data_t bitfield layout (dwc_otg_regs.h),
+  // not just the two fields already being tracked. PHYLPWRCLKSEL
+  // (bit15, round 16's own real-HW-confirmed-required fix for FS/LS
+  // PHY operation, set once inside dwc2_port_reset) was 1 at this
+  // driver's very first wait-loop entry, then GONE (0) by the time
+  // the DATA stage began -- nothing in this function or the self-heal
+  // below has ever included it in what gets restored, unlike physel/
+  // toutcal/dmaen/hbstlen. Restoring it here too, same reasoning as
+  // every other field in this already-confirmed recurring revert.
+  let phylpwrclksel_bit: u32 = (1 as u32) << (15 as u32);
   let toutcal_mask: u32 = (0x7 as u32) ^ (0xFFFFFFFF as u32);
   let toutcal_max: u32 = 7 as u32;
   let v: u32 = mmio_read_u32(gusbcfg);
-  let new_v: u32 = ((v | physel_bit) & toutcal_mask) | toutcal_max;
+  let new_v: u32 = ((v | physel_bit | phylpwrclksel_bit) & toutcal_mask) | toutcal_max;
   let _ = mmio_write_u32(gusbcfg, new_v);
 
-  // Round 18 correction: matches dwc2_enable_dma_mode's own fix --
-  // the Linux BCM2835 literal `ahbcfg=0x10` doesn't match the
-  // standard Synopsys HBSTLEN encoding any other platform in that
-  // same file uses, and doesn't correspond to a valid burst-length
-  // value at all (see dwc2_enable_dma_mode's own header comment for
-  // the full finding). Using the verified-correct INCR4 encoding
-  // (0x06), matching U-Boot's own generic, demonstrably-working
-  // computation for this chip's confirmed INT_DMA_ARCH. DMA_EN still
+  // Round 26 correction (see dwc2_enable_dma_mode's own header
+  // comment for the full finding): round 18's fix here had the same
+  // missing-clear bug as dwc2_enable_dma_mode -- ORing the intended
+  // bits[1:2] on top of whatever bits[4:1] already held (this
+  // register's own post-soft-reset hardware default, confirmed non-
+  // zero on this silicon) instead of clearing the field first. Same
+  // fix: mask bits[4:1] to zero before setting them. DMA_EN still
   // OR'd in as its own separate step (GAHBCFG_CTRL_MASK's own bit,
   // never part of the burst-length field).
+  let hbstlen_mask: u32 = ((0xF as u32) << (1 as u32)) ^ (0xFFFFFFFF as u32); // ~bits[4:1]
   let hbstlen_incr4: u32 = (3 as u32) << (1 as u32); // 0x06, bits[4:1]
   let dmaen: u32 = (1 as u32) << (5 as u32);
   let v2: u32 = mmio_read_u32(gahbcfg);
-  let new_v2: u32 = v2 | hbstlen_incr4 | dmaen;
+  let new_v2: u32 = (v2 & hbstlen_mask) | hbstlen_incr4 | dmaen;
   let _ = mmio_write_u32(gahbcfg, new_v2);
 
   // Round 18: switched from kernlog_write_simple to uart_puts --
@@ -19604,6 +19761,48 @@ fn dwc2_hcdma0_addr() -> i64 {
   return dwc2_base() + 0x514;
 }
 
+// Task #325 round 24 (new hypothesis, not previously examined by this
+// investigation): HCDMA takes a VideoCore BUS address, not a raw ARM
+// physical address -- the DWC2 core is a bus-master on the SoC's VC
+// side, same as the DMA controller and the mailbox-framebuffer path
+// this project already had to mask (fb_init's `base & 0x3FFFFFFF`,
+// the reverse direction of this same quirk). Confirmed independently
+// from two authoritative sources, both specific to THIS exact chip
+// (BCM2835 -- Pi 1/Zero -- not BCM2836/2837/2711, which use a
+// different offset):
+//   1. U-Boot's own arch/arm/mach-bcm283x/phys2bus.c:
+//        #ifndef CONFIG_BCM2835
+//          return 0xc0000000 | phys;
+//        #else
+//          return 0x40000000 | phys;   // <-- this board
+//        #endif
+//      called from drivers/usb/host/dwc2.c's transfer_chunk, exactly
+//      the HCDMA write this function feeds: `writel(phys_to_bus(...),
+//      &hc_regs->hcdma)`.
+//   2. Linux's own arch/arm/boot/dts/broadcom/bcm2835.dtsi:
+//        dma-ranges = <0x40000000 0x00000000 0x20000000>;
+//      (child/bus address 0x40000000 == parent/CPU address 0, for the
+//      whole 512MB RAM window -- Pi 1B's entire RAM) -- applied
+//      transparently by Linux's generic DMA-mapping layer, which is
+//      exactly why grepping dwc2 itself (hcd.c/core.c) for this never
+//      turned up anything in this investigation's earlier rounds: the
+//      translation happens one layer removed from the driver, not
+//      inside it.
+// DhruvaOS's ptr_to_u32() (boot/scratch_state.S) is a pure identity
+// passthrough -- no such offset is applied anywhere in this driver.
+// Every one of this function's 18 call sites hands HCDMA a raw ARM
+// physical address. If the DWC2 core's own DMA engine then fetches
+// the SETUP/DATA buffer through the wrong bus window, the data it
+// sees need not match what was just written (possibly stale, zero,
+// or simply a different physical page depending on what that
+// un-offset address decodes to from the VC side) -- a mechanism fully
+// consistent with a channel that starts (CHENA transitions 0->1,
+// confirmed by earlier rounds) but never produces a sane XFERCOMPL.
+fn dwc2_dma_bus_addr(p: mut ref i64) -> u32 {
+  let bus_offset: u32 = 0x40000000 as u32;
+  return ptr_to_u32(p) | bus_offset;
+}
+
 // HCCHAR field layout confirmed against hcd-dwc2.c's dwc2_enable_chan
 // (CHENA=bit31, DEVADDR=bits[28:22], MULTICNT=bits[21:20], EPTYPE=
 // bits[19:18] (0=control), EPDIR=bit15 (0=out,1=in), EPNUM=bits[14:11],
@@ -19636,7 +19835,43 @@ fn dwc2_hcdma0_addr() -> i64 {
 // usb-kbd`, `-device usb-storage`) has passed unchanged through every
 // prior round this bug has been present, which is why it was invisible
 // until a real-HW HCINT/HPRT0 trace was captured.
+// Round 28 (task #325, user: "stop speculating, run a meticulous
+// comparison against U-Boot for the stages that don't work"): a full,
+// systematic read of U-Boot's own control-transfer path (chunk_msg /
+// _submit_control_msg, drivers/usb/host/dwc2.c) -- not spot-checking
+// registers already suspected, but reading dwc_otg_hc_init end to end
+// -- found a register this driver has NEVER written, in its entire
+// history: HCSPLT (offset base+0x500+0x04, confirmed against both
+// U-Boot's own dwc2.h and the real RPi downstream dwc_otg_regs.h's
+// hcsplt_data_t union -- same register, same offset, both references
+// agree). U-Boot's `dwc_otg_hc_init` writes it immediately alongside
+// HCCHAR, every single time a channel is (re)configured for a new
+// transfer attempt ("Program the HCSPLIT register, default to no
+// SPLIT") -- confirmed via `_submit_control_msg` that this happens
+// once per STAGE (chunk_msg is called separately for SETUP/DATA/
+// STATUS, and dwc_otg_hc_init runs at the top of every chunk_msg
+// call), the exact same cadence this driver's own dwc2_build_hcchar
+// already runs at for every stage of every transfer. SPLTENA is
+// bit31 of this register (confirmed against hcsplt_data_t's own
+// bitfield: prtaddr[6:0], hubaddr[13:7], xactpos[15:14], compsplt[16],
+// reserved[30:17], spltena[31]) -- if this register's post-reset
+// value on this exact silicon isn't clean zero (the same class of
+// bug already found twice this session for GAHBCFG), a stray SPLIT-
+// enable bit would have every control transfer framed as a split
+// transaction against a FS/LS device behind a HS hub -- a scenario
+// that doesn't even apply here (this is a direct FS link, no hub-
+// speed mismatch) -- fully sufficient to explain a device-visible
+// STALL on a request this driver's own SETUP/DATA/STATUS field
+// construction has already been re-verified byte-for-byte correct.
+// Cleared here, at the one chokepoint every HCCHAR-writing call site
+// in this driver already calls immediately before its own write,
+// rather than duplicating the write at each of the ~20 individual
+// call sites -- same per-stage cadence as U-Boot's own combined
+// "initialize channel" step, with a single point of truth instead of
+// hand-copying a register write to every caller.
 fn dwc2_build_hcchar(devaddr: u32, eptype: u32, epdir: u32, epnum: u32, mps: u32) -> u32 {
+  let hcsplt0: i64 = dwc2_base() + 0x504;
+  let _ = mmio_write_u32(hcsplt0, 0 as u32);
   let chena: u32 = 1 as u32;
   let multicnt: u32 = 1 as u32;
   let v: u32 = (chena << (31 as u32))
@@ -19804,6 +20039,17 @@ fn dwc2_wait_chan0_done() -> u32 {
           // STALL/AHBERR/BBLERR/DATATGLERR -- genuinely terminal
           // (a protocol violation, not a transient bus condition),
           // same as before: no retry for any of these.
+          // Round 26 diagnostic (task #325): how many iterations
+          // elapsed before this hard error actually appeared --
+          // distinguishes "device responded quickly with a real,
+          // deliberate error" (small tries) from "something else
+          // delayed the response first" (large tries, close to the
+          // loop's own 1000000 budget).
+          let _ = uart_puts("USB DIAG: hard error at tries=");
+          let _ = uart_put_hex32(tries as u32);
+          let _ = uart_puts(" hi=0x");
+          let _ = uart_put_hex32(hi);
+          let _ = uart_puts("\n");
           let _ = mmio_write_u32(hcint0, hi);
           return hi;
         }
@@ -19909,6 +20155,77 @@ fn dwc2_wait_chan0_done() -> u32 {
     // entry unknown yet") -- these three finer early samples (~10ms/
     // ~25ms/~50ms in, at ~0.5us/iteration) subdivide exactly that gap
     // instead of guessing where within it the revert actually lands.
+    // Round 25 (task #325): this project's own confirmed, documented
+    // BCM2835 USB-power-domain register-loss erratum (real Linux
+    // maintainer mailing-list citation already in this driver's own
+    // history: "dwc2: Implement recovery after PM domain off") was
+    // previously only ever corrected ONCE, by the caller, before
+    // entering this wait loop. Round 12's own real-HW retest already
+    // found the revert recurs ~0.5-0.7s later "regardless of how
+    // close to the transfer the reassert runs" -- and THIS round's
+    // fresh real-HW retest reconfirms the exact same pattern
+    // (GAHBCFG=0x1F, DMAEN/full HBSTLEN missing; GUSBCFG missing
+    // PHYSEL) in the failure snapshot taken after this exact loop
+    // gave up. A one-time reassert before the loop cannot survive a
+    // revert that recurs DURING the loop's own ~500ms wait window.
+    // Self-heals here instead, checked only when hi==0 (nothing in
+    // flight at the top of this same iteration -- never races a real
+    // in-progress completion event's own register state), every 1000
+    // iterations (~0.5ms apart at this loop's own measured per-
+    // iteration cost) -- frequent enough to give an eventual real
+    // wire-level transaction a continuously-correct register window
+    // to actually complete in, without writing these registers on
+    // literally every single spin.
+    if tries % 1000 == 999 {
+      let gahbcfg_addr: i64 = dwc2_base() + 0x08;
+      let gusbcfg_addr: i64 = dwc2_base() + 0x0C;
+      let dmaen_bit: u32 = (1 as u32) << (5 as u32);
+      let hbstlen_field_mask: u32 = (0xF as u32) << (1 as u32); // bits[4:1]
+      let hbstlen_clear_mask: u32 = hbstlen_field_mask ^ (0xFFFFFFFF as u32);
+      let hbstlen_incr4: u32 = (3 as u32) << (1 as u32); // 0x06
+      let cur_ahb: u32 = mmio_read_u32(gahbcfg_addr);
+      // Round 26: the OLD detection here (`superset includes these
+      // bits?`) was itself a real bug -- a corrupted field like the
+      // observed 0x3F (bits[4:1]=1111, a strict superset of the
+      // intended 0x06) already satisfies "dmaen_bit|hbstlen_bits are
+      // all set," so this self-heal silently concluded "nothing to
+      // heal" on the exact corruption it exists to catch. Checks the
+      // FIELD'S EXACT value now, not just that its bits are a subset
+      // of what's currently set, and clears bits[4:1] before setting
+      // them (same missing-clear bug as dwc2_enable_dma_mode's own
+      // fix -- see its header comment).
+      if ((cur_ahb & hbstlen_field_mask) != hbstlen_incr4) || ((cur_ahb & dmaen_bit) == (0 as u32)) {
+        let _ = mmio_write_u32(gahbcfg_addr, (cur_ahb & hbstlen_clear_mask) | hbstlen_incr4 | dmaen_bit);
+        let _ = uart_puts("USB DIAG self-heal: GAHBCFG reverted mid-wait, tries=");
+        let _ = uart_put_hex32(tries as u32);
+        let _ = uart_puts(" was=");
+        let _ = uart_put_hex32(cur_ahb);
+        let _ = uart_puts("\n");
+      }
+      let physel_bit: u32 = (1 as u32) << (6 as u32);
+      // Round 29: a full real-HW boot capture from power-on caught
+      // this exact self-heal firing live (tries=0xF9F, "was=
+      // 0x20402700") and decoded the "was" value against the real
+      // gusbcfg_data_t layout -- PHYLPWRCLKSEL (bit15) was ALSO
+      // reverted (0) at that moment, same recurring revert as physel/
+      // toutcal, but this self-heal never checked or restored it. See
+      // dwc2_reassert_core_config_post_port_reset's own header comment
+      // for the full finding (round 16's PHYLPWRCLKSEL fix had no
+      // ongoing protection against this register's own confirmed
+      // recurring revert, unlike physel/toutcal/dmaen/hbstlen).
+      let phylpwrclksel_bit: u32 = (1 as u32) << (15 as u32);
+      let toutcal_clear_mask: u32 = (0x7 as u32) ^ (0xFFFFFFFF as u32);
+      let toutcal_max: u32 = 7 as u32;
+      let cur_usb: u32 = mmio_read_u32(gusbcfg_addr);
+      if ((cur_usb & physel_bit) == (0 as u32)) || ((cur_usb & phylpwrclksel_bit) == (0 as u32)) {
+        let _ = mmio_write_u32(gusbcfg_addr, ((cur_usb | physel_bit | phylpwrclksel_bit) & toutcal_clear_mask) | toutcal_max);
+        let _ = uart_puts("USB DIAG self-heal: GUSBCFG reverted mid-wait, tries=");
+        let _ = uart_put_hex32(tries as u32);
+        let _ = uart_puts(" was=");
+        let _ = uart_put_hex32(cur_usb);
+        let _ = uart_puts("\n");
+      }
+    }
     if (tries == 19999) || (tries == 49999) || (tries == 99999) {
       let _ = uart_puts("USB DIAG poll early checkpoint tries=");
       let _ = uart_put_hex32(tries as u32);
@@ -20094,9 +20411,33 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
 
   // SETUP stage: the 8-byte request already sits in dwc2_dma_scratch
   // (dma), written by the caller before this call.
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  //
+  // Round 31 (task #325, real-HW retest of round 30's mps=64 change):
+  // the FIRST GET_DESCRIPTOR attempt now failed differently and
+  // WORSE than before -- the SETUP stage itself CHHLTD without ever
+  // completing (HCINT=0x00000002, bare CHHLTD, no XFERCOMPL/error/
+  // NAK), where previously (mps=8) this exact SETUP stage succeeded
+  // cleanly every time. The SETUP packet itself is ALWAYS exactly 8
+  // bytes by protocol definition, completely independent of any
+  // device's real negotiated bMaxPacketSize0 -- U-Boot's own
+  // reference does reuse the same (possibly 64) mps value for every
+  // stage including SETUP, but that's not proof this exact driver's
+  // own implementation handles mps=64 safely for an 8-byte OUT
+  // transfer on this exact silicon, and real-HW evidence now directly
+  // contradicts it. Per this project's own standing discipline
+  // (reference match isn't causal proof -- verify causally, don't
+  // just pattern-match against a citation), reverting ONLY the
+  // SETUP stage's own HCCHAR.MPS to the always-safe, protocol-
+  // guaranteed 8 -- every device's real mps is >=8 by spec, so an
+  // 8-byte OUT transfer can never mismatch regardless -- while
+  // keeping round 30's mps=64 for the DATA/STATUS stages below,
+  // where it's actually meant to matter. Isolates whether mps=64
+  // specifically on the SETUP channel config was the regression,
+  // without abandoning the DATA-stage experiment entirely.
+  let setup_mps: u32 = 8 as u32;
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_setup(), 1 as u32, 8 as u32));
-  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
+  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, setup_mps));
   let setup_result: u32 = dwc2_wait_chan0_done();
   if (setup_result & (1 as u32)) == (0 as u32) {
     // Task #325 real-HW diagnostic (2026-10-02): both TRSTRCY and the
@@ -20147,7 +20488,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   // it just needs pktcnt to describe the truth up front.
   let pktcnt: u32 = (want_len + mps - (1 as u32)) / mps;
   let _ = dwc2_reset_chan0_for_new_transfer(); // round 18, same as SETUP stage above
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), pktcnt, want_len));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
   let data_result: u32 = dwc2_wait_chan0_done();
@@ -20175,7 +20516,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   // xfersize=0 means the model transfers nothing regardless of what
   // HCDMA points at, but a valid pointer is still supplied.
   let _ = dwc2_reset_chan0_for_new_transfer(); // round 18, same as SETUP stage above
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let status_result: u32 = dwc2_wait_chan0_done();
@@ -20210,7 +20551,7 @@ fn dwc2_control_no_data(devaddr: u32, mps: u32) -> i64 {
   // dwc2_dma_scratch via plain stores before calling this function.
   let _ = mem_barrier();
 
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_setup(), 1 as u32, 8 as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let setup_result: u32 = dwc2_wait_chan0_done();
@@ -20219,7 +20560,7 @@ fn dwc2_control_no_data(devaddr: u32, mps: u32) -> i64 {
   }
 
   // STATUS stage (IN, zero-length, DATA1).
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
   let status_result: u32 = dwc2_wait_chan0_done();
@@ -20255,7 +20596,7 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   let hcdma0: i64 = dwc2_hcdma0_addr();
 
   let _ = mem_barrier();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_setup(), 1 as u32, 8 as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let setup_result: u32 = dwc2_wait_chan0_done();
@@ -20273,7 +20614,7 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   let _ = mem_barrier();
 
   let pktcnt: u32 = if out_len == (0 as u32) { 1 as u32 } else { (out_len + mps - (1 as u32)) / mps };
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), pktcnt, out_len));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let data_result: u32 = dwc2_wait_chan0_done();
@@ -20281,7 +20622,7 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
     return 0 - 1;
   }
 
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
   let status_result: u32 = dwc2_wait_chan0_done();
@@ -20638,7 +20979,22 @@ fn cdc_parse_mac_string(buf: mut ref i64, out_mac: mut ref i64) -> i64 {
 // other hardware-register code always keeps the vendor's own names.
 fn lan9512_reg_read(devaddr: u32, mps: u32, reg_offset: u32) -> u32 {
   let dma: mut ref i64 = dwc2_dma_scratch_get();
-  let _ = buf_write_byte(dma, 0 as u32, 0xC1 as u32);
+  // Round 37 (task #325, found via direct fetch+verification of Linux's
+  // real in-tree smsc95xx.c): bmRequestType must be 0xC0 (IN|VENDOR|
+  // RECIP_DEVICE), not 0xC1 (IN|VENDOR|RECIP_INTERFACE) -- confirmed
+  // against smsc95xx_read_reg's own usbnet_read_cmd call, which passes
+  // `USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE` explicitly, never
+  // RECIP_INTERFACE. This exact wrong-recipient bug is the most likely
+  // explanation for the real-HW "LAN9512 lite reset timed out" STALL
+  // (HCINT=0x0A) that appears immediately after standard enumeration
+  // (GET_DESCRIPTOR/SET_ADDRESS/SET_CONFIGURATION, all RECIP_DEVICE by
+  // spec, all working) succeeds cleanly but every vendor register
+  // access -- the only RECIP_INTERFACE request this driver ever issued
+  // -- STALLs 1000/1000 times: the device's own USB request dispatcher
+  // routes RECIP_DEVICE vendor commands to its top-level register-
+  // access handler, but has no reason to accept the same command
+  // addressed to "interface 0" instead.
+  let _ = buf_write_byte(dma, 0 as u32, 0xC0 as u32);
   let _ = buf_write_byte(dma, 1 as u32, 0xA1 as u32);
   let _ = buf_write_byte(dma, 2 as u32, 0 as u32);
   let _ = buf_write_byte(dma, 3 as u32, 0 as u32);
@@ -20662,7 +21018,11 @@ fn lan9512_reg_read(devaddr: u32, mps: u32, reg_offset: u32) -> u32 {
 
 fn lan9512_reg_write(devaddr: u32, mps: u32, reg_offset: u32, value: u32) -> i64 {
   let dma: mut ref i64 = dwc2_dma_scratch_get();
-  let _ = buf_write_byte(dma, 0 as u32, 0x41 as u32);
+  // Round 37 -- same fix as lan9512_reg_read's own header comment:
+  // 0x40 (OUT|VENDOR|RECIP_DEVICE), not 0x41 (RECIP_INTERFACE), matching
+  // smsc95xx_write_reg's own confirmed `USB_DIR_OUT | USB_TYPE_VENDOR |
+  // USB_RECIP_DEVICE`.
+  let _ = buf_write_byte(dma, 0 as u32, 0x40 as u32);
   let _ = buf_write_byte(dma, 1 as u32, 0xA0 as u32);
   let _ = buf_write_byte(dma, 2 as u32, 0 as u32);
   let _ = buf_write_byte(dma, 3 as u32, 0 as u32);
@@ -22156,7 +22516,7 @@ fn dwc2_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i64 
   // for the full finding) -- applies identically to every dwc2_*_in/
   // dwc2_*_out function that re-arms channel 0 on a polling loop.
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done();
@@ -22188,7 +22548,7 @@ fn dwc2_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> 
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done();
@@ -22253,7 +22613,7 @@ fn dwc2_net_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> 
   // a NAK'd bulk OUT never clears CHENA either, so an unconditional
   // reset before every attempt is required here too.
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done();
@@ -22315,10 +22675,99 @@ fn dwc2_net_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> 
 // effect (confirmed in the same source) -- drained here immediately
 // so the real transfer's own dwc2_wait_chan0_done() call can't
 // mistake that housekeeping bit for its own completion signal.
+// Round 20 correction (task #325, confirmed against the real
+// Broadcom/RPi downstream `dwc_otg_cil.c`'s own channel-halt sequence,
+// `dwc_otg_hc_halt`): this function's ORIGINAL write --
+// `mmio_write_u32(hcchar0, CHDIS_bit)` -- set CHDIS alone with CHENA
+// explicitly cleared to 0 in the SAME write (a fresh zeroed value, not
+// a read-modify-write). The reference does the opposite: `hcchar.d32
+// = DWC_READ_REG32(&hc_regs->hcchar)` (a REAL read of the channel's
+// CURRENT configuration first), THEN sets BOTH `chen=1` AND `chdis=1`
+// on top of it (preserving devaddr/eptype/epnum/mps exactly as they
+// already were) -- CHENA=1 is what tells the hardware "this IS a
+// currently-enabled channel, halt it", not "leave it disabled". This
+// bug was latent since task #182 (QEMU's emulated model doesn't care
+// about the distinction) and was only exposed once round 18 called
+// this function for the FIRST time on a fresh, never-before-enabled
+// channel (the control-transfer path) -- real-HW retest afterward
+// showed a bare CHHLTD (HCINT=0x00000002, no XFERCOMPL/NAK/error bit)
+// immediately on the SETUP stage, consistent with this exact
+// malformed disable request confusing the channel's own state machine
+// before the real transfer ever got a fair chance to run.
+// Round 21 correction (task #325, real-HW retest showed round 20's
+// CHENA+CHDIS fix executed exactly as intended -- HCCHAR0 at failure
+// time now correctly shows CHENA=1 instead of 0 -- yet the SAME bare
+// CHHLTD (HCINT=0x00000002, no XFERCOMPL) still fires, every time,
+// for the control-transfer path specifically). Re-read the real
+// Broadcom/RPi downstream `dwc_otg_cil.c`'s own `halt_channel`
+// function from its own top, not just the chen/chdis write snippet:
+// it has explicit EARLY-RETURN guards before ever touching HCCHAR --
+// "it's possible that the transfer has been assigned to a channel,
+// but not started yet when an URB is dequeued. Don't want to halt a
+// channel that hasn't started yet" -- this function is a RECOVERY
+// operation for an already-active/wedged channel (exactly task #182's
+// real NAK-wedge scenario, where CHENA genuinely WAS already 1), not
+// a mandatory "reset before every use" step. Calling it unconditionally
+// before the SETUP stage -- a channel that has NEVER been enabled
+// before, CHENA genuinely 0 -- is calling a recovery operation on a
+// channel with nothing to recover, and plausibly induces exactly the
+// kind of spurious CHHLTD this investigation keeps seeing (a CHDIS
+// write's own real propagation delay landing just as the REAL
+// transfer's own poll loop starts, misread as "the new transfer
+// immediately halted"). Guarding internally so every one of this
+// function's 10 call sites gets the fix at once: only issue the
+// halt-and-wait-for-CHHLTD request when CHENA is CURRENTLY 1 (a real
+// active/wedged channel to recover) -- for an idle channel, there is
+// nothing to halt, so skip the HCCHAR0 write entirely. Stale HCINT
+// draining stays unconditional (it never touches HCCHAR0, so it
+// carries none of this risk, and clears any leftover completion bits
+// a prior transfer may not have consumed).
+// Round 23 correction (task #325, real-HW retest showed CHDIS still
+// SET at the failure snapshot -- 0xC0100008, CHENA=1 AND CHDIS=1 --
+// even though the real SETUP-kickoff write that runs immediately
+// after this function returns builds its own HCCHAR value with
+// CHDIS=0 explicitly. CHDIS is a pure software-REQUEST bit; real
+// DWC2 silicon only ever CLEARS it (never sets it autonomously), and
+// clears it together with CHENA at the exact moment the disable it
+// requested actually completes (CHHLTD fires). This function's own
+// previous version requested the disable then did a single immediate
+// hcint0 read -- NOT a wait for completion -- and returned
+// immediately, letting the caller's own real kickoff write race
+// against an still-in-flight disable. On real silicon (confirmed by
+// this exact round's own real-HW evidence; QEMU's simplified model
+// never exposed this race), the channel's own in-flight disable
+// state can persist and interfere with a write that lands before it
+// finishes. The real Broadcom/RPi downstream driver never hits this
+// because `dwc_otg_hc_halt` is itself interrupt-driven -- it REQUESTS
+// a disable and returns, relying on a LATER CHHLTD interrupt
+// (`handle_hc_chhltd_intr`) to notify completion asynchronously, with
+// nothing else touching that channel until that interrupt fires. This
+// driver has no interrupts at all (pure polling) -- it must actually
+// WAIT for the completion signal itself before proceeding, not just
+// fire the request and immediately move on. Added a bounded poll for
+// CHHLTD (bit1) before returning, matching every other short real-HW
+// wait in this file's own established pattern.
 fn dwc2_reset_chan0_for_new_transfer() -> i64 {
   let hcchar0: i64 = dwc2_hcchar0_addr();
   let hcint0: i64 = dwc2_hcint0_addr();
-  let _ = mmio_write_u32(hcchar0, (1 as u32) << (30 as u32));
+  let chena_bit_local: u32 = (1 as u32) << (31 as u32);
+  let chdis_bit_local: u32 = (1 as u32) << (30 as u32);
+  let chhltd_bit_local: u32 = (1 as u32) << (1 as u32);
+  let current: u32 = mmio_read_u32(hcchar0);
+  if (current & chena_bit_local) != (0 as u32) {
+    let _ = mmio_write_u32(hcchar0, current | chena_bit_local | chdis_bit_local);
+    let halt_tries: i64 = 0;
+    while halt_tries < 50 {
+      let hi: u32 = mmio_read_u32(hcint0);
+      if (hi & chhltd_bit_local) != (0 as u32) {
+        let _ = mmio_write_u32(hcint0, hi);
+        halt_tries = 50;
+      } else {
+        let _ = delay(16100); // ~5ms real, same per-iteration cost used throughout this driver's own short real-HW waits
+        halt_tries = halt_tries + 1;
+      }
+    }
+  }
   let stale: u32 = mmio_read_u32(hcint0);
   if stale != (0 as u32) {
     let _ = mmio_write_u32(hcint0, stale);
@@ -22344,7 +22793,7 @@ fn dwc2_net_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64)
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
   // ROUND 2026-09-17 (Gap F): dwc2_wait_chan0_done_bounded, not the
@@ -22418,7 +22867,7 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if out_len == 0 { 1 as u32 } else { ((out_len as u32) + mps - (1 as u32)) / mps };
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done();
@@ -22448,7 +22897,7 @@ fn dwc2_wifi_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done();
@@ -23114,7 +23563,7 @@ fn dwc2_bt_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if out_len == 0 { 1 as u32 } else { ((out_len as u32) + mps - (1 as u32)) / mps };
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done();
@@ -23144,7 +23593,7 @@ fn dwc2_bt_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) 
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done();
@@ -24866,7 +25315,7 @@ fn dwc2_hci_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len:
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 3 as u32, 1 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done();
@@ -24916,7 +25365,7 @@ fn dwc2_hid_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len:
   let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
   let pktcnt: u32 = if want_len == 0 { 1 as u32 } else { ((want_len as u32) + mps - (1 as u32)) / mps };
   let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, ptr_to_u32(dma));
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 3 as u32, 1 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done();
@@ -26124,14 +26573,96 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
 // "succeeding" but returning garbage bytes would be a much worse
 // silent failure than an honest error return, the same reasoning
 // behind every checksum/validation check elsewhere in this project.
+// Round 30 (task #325, user: "check if other settings matter from
+// uboot while at it"): with HCSPLT/channel-flush/GAHBCFG-clear/
+// PHYLPWRCLKSEL all confirmed correctly held through to the DATA-
+// stage failure point on the latest real-HW retest -- and the device
+// STILL STALLing the identical DATA stage -- re-read U-Boot's own
+// `usb_setup_descriptor` (common/usb.c) in full rather than guessing
+// a fifth register tweak. Its own real, working first-descriptor-read
+// technique for a FULL_SPEED device (confirmed via live HPRT0 PRTSPD
+// read this exact retest: PRTSPD=1=FULL_SPEED, not LOW) is genuinely
+// different from what this driver has always done: guess bMaxPacket
+// Size0=64 (not 8) and request wLength=64 (not 8) -- its own header
+// comment explains why this is always safe regardless of the real
+// device's native mps ("the smallest maxpacket size is 8 bytes...
+// before we know the actual maxpacket, the USB controller may only
+// accept a single packet... we are only guaranteed to receive 1
+// packet (at least 8 bytes) even in a non-error case" -- 64 is the
+// maximum any FS device's real mps can be, so no device can ever
+// send a packet larger than what this configures the channel to
+// accept). U-Boot's own header comment on this exact technique:
+// "This is a Windows scheme of initialization sequence... Some
+// equipment is said to work only with such init sequence" -- directly
+// describing the class of real-device quirk this investigation has
+// been chasing. Only applied for FULL_SPEED (U-Boot's own `if (dev->
+// speed == USB_SPEED_LOW) mps=8 else mps=64` -- LOW-speed devices are
+// always exactly 8 regardless), matching this exact board's FS-only
+// PHY (no HS possible at all on BCM2835) and this exact device's own
+// confirmed speed.
+// Round 32 (task #325, real-HW retest of round 31): reverting the
+// SETUP stage's own HCCHAR.MPS to 8 did NOT fix it -- the SAME bare-
+// CHHLTD SETUP failure persisted (HCCHAR0=0x00100008 confirmed mps=8
+// was genuinely live on the channel this time), ruling out the
+// channel's own mps field as the cause after all. The one thing
+// round 31 did NOT revert was wLength itself (still 64, baked into
+// the SETUP packet's own content via dwc2_build_get_device_
+// descriptor_setup(first_mps)) -- logically this shouldn't affect
+// the SETUP token's own on-the-wire completion (the SETUP transfer
+// is always 8 raw bytes regardless of what its payload says), but
+// real-HW evidence already overruled one "shouldn't matter"
+// assumption this same round (mps=64 on HCCHAR). Doing a full,
+// clean revert of round 30 here -- both mps AND wLength back to 8 --
+// to get an unambiguous A/B test against round 29's own last known-
+// working configuration: if SETUP succeeds again with THIS exact
+// revert, wLength=64 really was the cause (abandon the 64-byte
+// technique for this device entirely); if it still fails, the cause
+// is something else entirely -- quite possibly genuine real-HW
+// intermittency unrelated to any of rounds 29-31's own changes, not
+// a regression this driver's code caused at all.
 fn dwc2_probe_device0() -> i64 {
-  let desc8: mut ref i64 = dhruva_alloc_bytes(8);
-  let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
-  let status0: i64 = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, desc8);
-  if status0 != 0 {
+  let desc64: mut ref i64 = dhruva_alloc_bytes(64);
+  // Task #325 round 36: the very first GET_DESCRIPTOR(Device) this
+  // driver ever issues used to get exactly ONE attempt -- any failure
+  // (STALL included) gave up immediately. A STALL on an unconfigured
+  // control endpoint is automatically cleared by the NEXT fresh SETUP
+  // per USB 2.0 spec 8.5.3 ("a STALLed endpoint is unstalled when it
+  // receives a SETUP token") -- so a composite hub+Ethernet chip like
+  // the onboard SMSC/Microchip LAN9512 whose own internal MCU is still
+  // finishing its post-reset init can legitimately STALL the DATA
+  // stage as a non-standard-but-real-world-common "not ready yet"
+  // signal while the SETUP stage itself (which USB spec mandates every
+  // device unconditionally ACK regardless of firmware readiness) keeps
+  // succeeding -- exactly this driver's own observed, 100%-repeatable
+  // symptom across every real-HW round of this investigation. Directly
+  // precedented: TinyUSB's own issue tracker (#4154) documents a real
+  // device that NAKs its first GET_DESCRIPTOR for ~5s and only
+  // enumerates through a host-side retry, not a single attempt. Each
+  // retry rebuilds the SETUP packet fresh (clearing any STALL latch)
+  // and waits another TRSTRCY-style settle (161000, the same constant
+  // already proven on real HW throughout this driver's other post-
+  // reset/post-SET_ADDRESS delays) before trying again. 5 attempts ->
+  // up to ~250ms total extra worst-case latency for a ONE-TIME boot
+  // enumeration step, matching the order of magnitude both the generic
+  // USB-spec TRSTRCY margin and the TinyUSB real-device precedent use.
+  let attempt: i64 = 0;
+  let result_status: i64 = 0 - 1;
+  while attempt < 5 {
+    let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
+    result_status = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, desc64);
+    if result_status == 0 {
+      attempt = 5;
+    } else {
+      let _ = uart_puts("USB DIAG: GET_DESCRIPTOR(Device) attempt failed, retrying after settle\n");
+      let _ = delay(161000);
+      attempt = attempt + 1;
+    }
+  }
+  if result_status != 0 {
     let _ = uart_puts("USB: GET_DESCRIPTOR(Device) transfer failed\n");
     return 0 - 1;
   }
+  let desc8: mut ref i64 = desc64;
   let blength0: u32 = buf_read_byte(desc8, 0 as u32);
   let bdesctype0: u32 = buf_read_byte(desc8, 1 as u32);
   let mps0: u32 = buf_read_byte(desc8, 7 as u32);

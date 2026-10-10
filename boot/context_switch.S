@@ -2590,10 +2590,35 @@ cpu_wfi:
  * affect correctness. watchdog_arm() only ever touches the one PM
  * peripheral (same-peripheral, already covered) and isn't even wired
  * into the live boot path -- not applicable either way. */
+/* Round 35 (task #325, user: "research online... domino effect with
+ * bug at some other place?"): this function's own name and every
+ * call site's own comment describe the DSB guarantee ("nothing
+ * guaranteed that write had actually reached memory before the
+ * HCDMA/HCCHAR writes just below hand this same address off to the
+ * DWC2 controller's own DMA engine, a genuinely separate hardware
+ * bus master") -- but the actual encoding used, CP15 c7,c10,opc2=5,
+ * is DMB (Data Memory Barrier: orders this core's own memory
+ * accesses relative to each other, no completion guarantee), not
+ * DSB (Data Synchronization Barrier: opc2=4, the one that actually
+ * drains the write buffer and blocks until prior explicit memory
+ * accesses are complete) -- confirmed against both the ARM1176/
+ * ARMv6 CP15 barrier encoding and the ARMv7-A ARM ARM's own
+ * description of the legacy CP15 barrier ops, independently cross-
+ * checked online. DMB does not give the guarantee this function's
+ * own name and every caller's own reasoning assumes: it can't force
+ * the CPU's write of the SETUP packet bytes out of its own write
+ * buffer before the very next MMIO write (HCDMA/HCCHAR) hands the
+ * address to a separate bus master. If the DMA engine reads stale/
+ * not-yet-drained bytes, the SETUP *transaction* still completes
+ * cleanly (DWC2 only cares about byte count and handshake, not
+ * content) while the device receives a garbled/stale request --
+ * fully sufficient to explain a device-side STALL on the immediately
+ * following DATA stage, with the SETUP stage itself still reporting
+ * success. Fixed to the correct opc2=4 (DSB). */
 .global mem_barrier
 mem_barrier:
     mov r0, #0
-    mcr p15, 0, r0, c7, c10, 5
+    mcr p15, 0, r0, c7, c10, 4
     mov r0, #0
     mov r1, #0
     bx lr
