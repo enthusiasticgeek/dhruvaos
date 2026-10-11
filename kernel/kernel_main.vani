@@ -26129,6 +26129,32 @@ fn hci_reset_and_scan(devaddr: u32, mps: u32) -> i64 {
     return 0 - 1;
   }
 
+  // Round 65 (real-HW finding, 2026-10-11): HCI_Reset's own Command
+  // Complete only means the chip ACKed the reset REQUEST -- Broadcom's
+  // module needs real wall-clock time afterward to actually finish
+  // resetting before it can process anything else. Confirmed against
+  // Linux's own reference driver: `btbcm_reset()` (drivers/bluetooth/
+  // btbcm.c) sends HCI_OP_RESET then does
+  // `msleep(100); /* 100 msec delay for module to complete reset
+  // process */` BEFORE its caller (`btbcm_initialize`) sends the next
+  // command, HCI_Read_Local_Version_Information itself. This function
+  // was missing that delay entirely -- sending the next command
+  // immediately after Reset's status=0 -- which is exactly why two
+  // real-HW boots both got a clean reset_status=0 followed by a dead
+  // interrupt-IN endpoint (0xFFFFFFFF, no response at all, not a
+  // false-rejection: `dwc2_wait_chan0_done`'s DATATGLERR fix earlier
+  // this same round already ruled that failure mode out) for EVERY
+  // command after Reset, including this one.
+  // delay(N)'s real per-iteration cost on THIS board (ARM1176, Pi 1B)
+  // was measured directly against real hardware, not assumed under
+  // QEMU (see this file's own delay()-calibration comment, task #276):
+  // 930133us / 3000000 iterations ~= 0.310044us/iteration. 100ms /
+  // 0.310044us ~= 322536 iterations; rounded up to 350000 (~108.5ms)
+  // for margin -- this is a one-time bring-up delay outside any
+  // ceiling-locked critical section, so erring generous costs nothing
+  // the way it would inside task_c's own measured budget.
+  let _ = delay(350000);
+
   // Round 64: identify the real chip revision -- see this command's
   // own builder/field-accessor comments for why (Broadcom's own
   // firmware-patch filename depends on LMP_Subversion, which this
