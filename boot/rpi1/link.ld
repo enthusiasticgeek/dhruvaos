@@ -1,15 +1,33 @@
 /* Dhruva Phase 0/2 linker script -- BCM2835 / Pi 1 Model B.
- * 0x8000 is the conventional Raspberry Pi kernel load address (matches
- * real hardware's GPU-firmware loader too, not just QEMU's -kernel path)
- * -- kept the same on purpose so this script doesn't need to change when
- * this eventually runs on the real board.
+ *
+ * UPDATED (2026-10-11, A/B kernel-slot feature): was 0x8000 (the fixed
+ * physical address GPU firmware loads the file named `kernel.img` at)
+ * until this feature introduced a real second boot stage. 0x8000 is
+ * now permanently occupied by boot/stage0/ (its own link.ld) -- the
+ * tiny, rarely-changed loader that decides which of two kernel
+ * payload slots to read off raw SD blocks and chain-loads this real
+ * kernel into RAM at the address below, then jumps here directly
+ * (not via a GPU-firmware load). See boot/stage0/stage0_main.c and
+ * the plan this came from for the full design.
+ *
+ * 0x00200000 (2MiB) chosen and verified with real margin, not
+ * guessed: measured via `arm-none-eabi-readelf -S` against the
+ * pre-relocation build, this kernel's own .text/.rodata/.data/.bss
+ * footprint is ~2.85MiB, so shifted by this same base this image now
+ * spans roughly 0x200000-0x4D0000 (~2-5MiB) -- comfortably clear of
+ * the fixed 0x00A00000 (10MiB) base where per-task MMU-domain stacks
+ * already live (boot/rpi1/runtime_stubs.c's dhruva_alloc_stack_domain),
+ * over 5MiB of untouched margin. No gpu_mem= override exists in
+ * build/config.txt, so the GPU's reserved region is carved from the
+ * TOP of RAM, never the bottom -- 0x200000 is safe on this board's
+ * RAM size regardless of split.
  */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x8000;
+    . = 0x00200000;
 
     /* TASK #163 FIX (first real-hardware boot, 2026-09-12): ARMv6 has
      * no VBAR -- the vector table must live at address 0 (low vectors,

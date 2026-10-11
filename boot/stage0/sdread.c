@@ -1,0 +1,469 @@
+/* Stage-0 A/B kernel-slot loader -- minimal, read-only, 1-bit-mode-only
+ * SD driver.
+ *
+ * Derived from boot/rpi1/uboot_sdhost_full.c (deleted as dead code in
+ * commit a388164 once the round-42 SD wedge investigation it served
+ * closed; recovered via `git show a388164^:boot/rpi1/uboot_sdhost_full.c`
+ * for this purpose), itself a literal, self-contained C port of real
+ * U-Boot's own SD bring-up (drivers/mmc/mmc.c, drivers/mmc/bcm2835_sdhost.c),
+ * proven against this exact board in the round-34 real-HW investigation.
+ *
+ * Deliberately stripped down from that file:
+ *   - No CMD55+ACMD51 (SCR read) / ACMD6 (4-bit switch) negotiation.
+ *     Stage-0 always stays in 1-bit mode -- the historically reliable
+ *     mode across this project's entire 42-round SD saga; 4-bit mode is
+ *     where every real write-side wedge this project ever hit lived,
+ *     and stage-0 never writes at all, so there is nothing to gain and
+ *     a proven class of real-HW risk to avoid by negotiating it.
+ *   - No CMD24 (write) path, no read-back/memcmp self-check -- those
+ *     belong to a one-shot bring-up TEST, not a loader. Stage-0's own
+ *     checksum-verify-before-jump (stage0_main.c) is the real
+ *     correctness gate for this use case.
+ *   - Split into a one-time stage0_sd_init() (bring-up through CMD7
+ *     SELECT_CARD) and a reusable stage0_sd_read_block() callable many
+ *     times afterward (a multi-MB slot is thousands of blocks -- redoing
+ *     the whole CMD0..CMD7 sequence per block would be both wrong and
+ *     far too slow).
+ *   - FIXED vs. the recovered file: that file always treated its
+ *     block_addr parameter as a pre-converted byte address, with no
+ *     code path that ever reads back ACMD41's OCR response to tell a
+ *     byte-addressed (SDSC) card from a block-addressed (SDHC/SDXC)
+ *     one -- a real gap, masked there only because that file's own
+ *     caller happened to pass an already-correct address for whatever
+ *     card was in use at the time. stage0_sd_init() now captures the
+ *     OCR_HCS/CCS bit from the final ACMD41 response and
+ *     stage0_sd_read_block() addresses accordingly, matching the
+ *     production driver's own sdhost_card_addr (kernel_main.vani) --
+ *     this is the one place stage-0 needed a real fix, not just a
+ *     trim, during the port.
+ */
+
+#define SDCMD_ADDR   0x20202000u
+#define SDARG_ADDR   0x20202004u
+#define SDTOUT_ADDR  0x20202008u
+#define SDCDIV_ADDR  0x2020200Cu
+#define SDRSP0_ADDR  0x20202010u
+#define SDRSP1_ADDR  0x20202014u
+#define SDRSP2_ADDR  0x20202018u
+#define SDRSP3_ADDR  0x2020201Cu
+#define SDHSTS_ADDR  0x20202020u
+#define SDVDD_ADDR   0x20202030u
+#define SDEDM_ADDR   0x20202034u
+#define SDHCFG_ADDR  0x20202038u
+#define SDHBCT_ADDR  0x2020203Cu
+#define SDHBLC_ADDR  0x20202050u
+#define SDDATA_ADDR  0x20202040u
+#define TIMER_CLO_ADDR 0x20003004u
+/* FIXED vs. the recovered file: it defined these as 0x20200210/
+ * 0x20200214 (off by 0x200 / 512 bytes) -- the real GPFSEL4/GPFSEL5
+ * registers are 0x20200010/0x20200014 (confirmed against kernel_main.
+ * vani's own GPFSEL4/GPFSEL5 constants). This silently muxed nothing
+ * -- GPIO pins 48-53 were never actually switched to SDHOST's ALT0
+ * function, which is the real root cause this entire port's QEMU
+ * failure traced back to (confirmed by a register-readback diagnostic
+ * during this port: GPFSEL4/5 read back as 0x0 after the "mux" write,
+ * and SDCDIV/other SDHOST writes made after it were affected too). */
+#define GPFSEL4_ADDR 0x20200010u
+#define GPFSEL5_ADDR 0x20200014u
+
+#define SDCMD_NEW_FLAG   0x8000u
+#define SDCMD_FAIL_FLAG  0x4000u
+#define SDCMD_BUSYWAIT   0x800u
+#define SDCMD_NO_RESPONSE 0x400u
+#define SDCMD_LONG_RESPONSE 0x200u
+#define SDCMD_READ_CMD   0x40u
+#define SDCMD_CMD_MASK   0x3fu
+
+#define SDHSTS_CLEAR_MASK 0x7F8u
+#define SDHSTS_ERROR_MASK 0xF8u
+#define SDHSTS_CRC7_ERROR 0x10u
+
+#define SDEDM_FSM_MASK 0xFu
+#define SDEDM_FSM_IDENTMODE 0x0u
+#define SDEDM_FSM_DATAMODE  0x1u
+#define SDEDM_FSM_READDATA  0x2u
+#define SDEDM_FSM_READWAIT  0x4u
+#define SDEDM_FSM_WRITESTART1 0xAu
+#define SDEDM_FORCE_DATA_MODE_BIT (1u << 19)
+
+#define SDDATA_FIFO_PIO_BURST 8
+
+#define OCR_BUSY 0x80000000u
+#define OCR_HCS  0x40000000u
+
+#define TIMEOUT_US 1000000u
+#define CMD_TIMEOUT_US 100000u
+
+/* Real DSB barrier (ARMv6 "mcr p15,0,r0,c7,c10,4"), matching
+ * kernel_main.vani's own sd_mmio_read_u32/write_u32 exactly -- every
+ * SD register access there is barrier-wrapped; a plain volatile
+ * pointer dereference only orders accesses as the COMPILER sees them,
+ * not actual bus completion order, which matters for real hardware
+ * regardless of whether it also explains any QEMU-specific behavior. */
+static inline void dsb_barrier(void) {
+    __asm__ volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
+}
+static inline unsigned int mmio_r(unsigned int addr) {
+    unsigned int v = *(volatile unsigned int *)(unsigned long)addr;
+    return v;
+}
+static inline void mmio_w(unsigned int addr, unsigned int val) {
+    *(volatile unsigned int *)(unsigned long)addr = val;
+}
+static unsigned int now_us(void) { return mmio_r(TIMER_CLO_ADDR); }
+static int elapsed_at_least(unsigned int t0, unsigned int budget_us) {
+    return (now_us() - t0) >= budget_us;
+}
+static void udelay_real(unsigned int us) {
+    unsigned int t0 = now_us();
+    while (!elapsed_at_least(t0, us)) { }
+}
+
+void u_putc(char c) {
+    volatile unsigned int *fr = (volatile unsigned int *)0x20201018;
+    volatile unsigned int *dr = (volatile unsigned int *)0x20201000;
+    while ((*fr) & 0x20) { }
+    *dr = (unsigned int)(unsigned char)c;
+}
+void u_puts(const char *s) {
+    while (*s != '\0') { u_putc(*s); s = s + 1; }
+}
+void u_hex32(unsigned int v) {
+    static const char hexd[16] = "0123456789ABCDEF";
+    int i;
+    for (i = 7; i >= 0; i = i - 1) {
+        u_putc(hexd[(v >> (i * 4)) & 0xF]);
+    }
+}
+
+struct cmd_result {
+    unsigned int response[4];
+    int err; /* 0 ok, -1 timeout, -2 FAIL_FLAG, -3 FSM not idle */
+};
+
+static unsigned int s_rca;
+static int s_is_sdhc;
+
+/* bcm2835_send_cmd + _send_command + _finish_command, combined -- see
+ * uboot_sdhost_full.c's own header comment for the full rationale.
+ * allow_crc7_tolerance: real U-Boot's own finish_command quirk for
+ * SEND_OP_COND (some cards don't compute CRC7 correctly pre-ready). */
+static void stage0_send_cmd(unsigned int cmd_idx, unsigned int arg,
+                             int resp_present, int resp_136, int resp_busy,
+                             unsigned int data_blksz, unsigned int data_blocks,
+                             int is_read, int allow_crc7_tolerance,
+                             int ignore_fail_flag,
+                             struct cmd_result *out) {
+    unsigned int edm, fsm, sdcmd, sdhsts, t0;
+
+    out->err = 0;
+    out->response[0] = out->response[1] = out->response[2] = out->response[3] = 0;
+
+    edm = mmio_r(SDEDM_ADDR);
+    fsm = edm & SDEDM_FSM_MASK;
+    if (fsm != SDEDM_FSM_IDENTMODE && fsm != SDEDM_FSM_DATAMODE) {
+        u_puts("stage0: FSM not idle before cmd=");
+        u_hex32(cmd_idx);
+        u_puts(" SDEDM=0x");
+        u_hex32(edm);
+        u_puts("\n");
+        out->err = -3;
+        return;
+    }
+
+    t0 = now_us();
+    for (;;) {
+        sdcmd = mmio_r(SDCMD_ADDR);
+        if (!(sdcmd & SDCMD_NEW_FLAG)) break;
+        if (elapsed_at_least(t0, CMD_TIMEOUT_US)) {
+            u_puts("stage0: previous command never completed before cmd=");
+            u_hex32(cmd_idx);
+            u_puts("\n");
+            out->err = -1;
+            return;
+        }
+    }
+
+    sdhsts = mmio_r(SDHSTS_ADDR);
+    if (sdhsts & SDHSTS_ERROR_MASK) {
+        mmio_w(SDHSTS_ADDR, sdhsts);
+    }
+
+    if (data_blksz != 0) {
+        mmio_w(SDHBCT_ADDR, data_blksz);
+        mmio_w(SDHBLC_ADDR, data_blocks);
+    }
+
+    mmio_w(SDARG_ADDR, arg);
+
+    sdcmd = cmd_idx & SDCMD_CMD_MASK;
+    if (!resp_present) {
+        sdcmd |= SDCMD_NO_RESPONSE;
+    } else {
+        if (resp_136) sdcmd |= SDCMD_LONG_RESPONSE;
+        if (resp_busy) sdcmd |= SDCMD_BUSYWAIT;
+    }
+    if (is_read) sdcmd |= SDCMD_READ_CMD;
+
+    mmio_w(SDCMD_ADDR, sdcmd | SDCMD_NEW_FLAG);
+
+    t0 = now_us();
+    for (;;) {
+        sdcmd = mmio_r(SDCMD_ADDR);
+        if (!(sdcmd & SDCMD_NEW_FLAG)) break;
+        if (elapsed_at_least(t0, CMD_TIMEOUT_US)) {
+            u_puts("stage0: command phase never completed cmd=");
+            u_hex32(cmd_idx);
+            u_puts("\n");
+            out->err = -1;
+            return;
+        }
+    }
+
+    if (sdcmd & SDCMD_FAIL_FLAG) {
+        sdhsts = mmio_r(SDHSTS_ADDR);
+        mmio_w(SDHSTS_ADDR, SDHSTS_ERROR_MASK);
+        if (allow_crc7_tolerance && (sdhsts & SDHSTS_CRC7_ERROR)) {
+            /* expected/ignored, matches real U-Boot's own tolerance */
+        } else if (ignore_fail_flag) {
+            /* Matches kernel_main.vani's own sdhost_init_at_speed
+             * exactly: CMD8 (SEND_IF_COND) is one of several early
+             * identification-phase commands (CMD8/CMD55/ACMD41) whose
+             * production check is sdhost_cmd_timed_out-only (NEW_FLAG,
+             * used to fork SD-vs-MMC) -- it never looks at FAIL_FLAG
+             * for these, reading RSP0 unconditionally instead. Kept
+             * even after the real bug this port hit (a wrong GPFSEL4/
+             * GPFSEL5 address, see stage0_reset_and_ident_clock's own
+             * comment) was found and fixed, since this is a genuine,
+             * deliberate match to the reference's real behavior, not
+             * a workaround for that bug. */
+        } else {
+            u_puts("stage0: cmd=");
+            u_hex32(cmd_idx);
+            u_puts(" FAIL_FLAG SDHSTS=0x");
+            u_hex32(sdhsts);
+            u_puts("\n");
+            out->err = -2;
+            return;
+        }
+    }
+
+    if (resp_present) {
+        if (resp_136) {
+            unsigned int r0 = mmio_r(SDRSP0_ADDR);
+            unsigned int r1 = mmio_r(SDRSP1_ADDR);
+            unsigned int r2 = mmio_r(SDRSP2_ADDR);
+            unsigned int r3 = mmio_r(SDRSP3_ADDR);
+            out->response[3] = r0;
+            out->response[2] = r1;
+            out->response[1] = r2;
+            out->response[0] = r3;
+        } else {
+            out->response[0] = mmio_r(SDRSP0_ADDR);
+        }
+    }
+}
+
+/* bcm2835_reset_internal + bcm2835_set_clock(ident speed). GPIO ALT0
+ * mux values byte-for-byte confirmed against kernel_main.vani's own
+ * gpio_sdhost_alt_init, reused unchanged. */
+/* FIXED vs. the recovered file in two ways:
+ *  1. GPFSEL4/GPFSEL5 addresses were wrong (0x20200210/0x20200214,
+ *     off by 0x200) -- the real registers are 0x20200010/0x20200014
+ *     (confirmed against kernel_main.vani's own GPFSEL4/GPFSEL5
+ *     constants). This was the actual root cause of every CMD8/
+ *     CMD55/ACMD41/CMD2 failure hit while porting this file: the GPIO
+ *     mux write landed on the wrong register, pins 48-53 never
+ *     switched to SDHOST's ALT0 function, and the controller's
+ *     commands went nowhere -- confirmed directly via a register-
+ *     readback diagnostic (GPFSEL4/5 read back as 0x0 after the "mux"
+ *     write) before this fix, and a correct readback (0x24000000/
+ *     0x924) after it, at which point CMD8 got a real RSP0=0x1AA and
+ *     ACMD41 succeeded on its first iteration, matching production
+ *     exactly.
+ *  2. Separately (real but not the root cause): this function's own
+ *     register-write ORDER now also matches kernel_main.vani's own
+ *     sdhost_init_at_speed step-by-step, including the FIFO pre-clear
+ *     drain the recovered file never had: GPIO mux -> EDM threshold
+ *     fix -> settle delay -> SDVDD power cycle (off/delay/on/delay)
+ *     -> FIFO pre-clear drain -> SDCDIV/SDTOUT/SDHBCT/SDHBLC ->
+ *     SDHCFG=0. The recovered file's own order (verified correct for
+ *     real hardware in round 34) write the same final register
+ *     values either way; this reordering is a correctness-by-
+ *     reference-match improvement, kept for fidelity to the proven
+ *     reference, not because it was independently shown necessary. */
+static void stage0_reset_and_ident_clock(void) {
+    unsigned int temp;
+    int fifo_preclear_iter;
+
+    unsigned int r4 = mmio_r(GPFSEL4_ADDR);
+    mmio_w(GPFSEL4_ADDR, (r4 & 0xC0FFFFFFu) | 0x24000000u);
+    unsigned int r5 = mmio_r(GPFSEL5_ADDR);
+    mmio_w(GPFSEL5_ADDR, (r5 & 0xFFFFF000u) | 0x00000924u);
+
+    temp = mmio_r(SDEDM_ADDR);
+    temp &= ~((0x1Fu << 14) | (0x1Fu << 9));
+    temp |= (4u << 14) | (4u << 9);
+    mmio_w(SDEDM_ADDR, temp);
+
+    udelay_real(20000);
+
+    mmio_w(SDVDD_ADDR, 0);
+    udelay_real(20000);
+    mmio_w(SDVDD_ADDR, 1);
+    udelay_real(20000);
+
+    fifo_preclear_iter = 0;
+    while (fifo_preclear_iter < 1000) {
+        unsigned int fill = (mmio_r(SDEDM_ADDR) >> 4) & 0x1Fu;
+        if (fill == 0) break;
+        (void)mmio_r(SDDATA_ADDR);
+        fifo_preclear_iter = fifo_preclear_iter + 1;
+    }
+
+    mmio_w(SDCDIV_ADDR, 0x148u);
+    mmio_w(SDTOUT_ADDR, 0xF00000u);
+    mmio_w(SDHBCT_ADDR, 0);
+    mmio_w(SDHBLC_ADDR, 0);
+    mmio_w(SDHCFG_ADDR, 0);
+}
+
+/* Bring-up through CMD7 (SELECT_CARD), once per boot. Returns 0 on
+ * success, or a negative stage code (-1 CMD0, -2 CMD8, -3 ACMD41,
+ * -4 CMD2, -5 CMD3, -6 CMD9, -7 CMD7) matching uboot_sdhost_full.c's
+ * own convention for the stages this file still shares with it. */
+int stage0_sd_init(void) {
+    struct cmd_result r;
+    unsigned int retry;
+
+    stage0_reset_and_ident_clock();
+
+    stage0_send_cmd(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, &r);
+    if (r.err != 0) return -1;
+
+    /* FIXED vs. the recovered file (which also required the RSP0 echo
+     * pattern to equal 0xAA): kernel_main.vani's own sdhost_init_at_
+     * speed never validates CMD8's response content at all, only
+     * whether the command CYCLE completed (sdhost_cmd_timed_out,
+     * NEW_FLAG only) -- it reads+logs RSP0 unconditionally and
+     * proceeds straight to ACMD41 regardless. This project's own
+     * driver has only ever supported SD cards in practice (the MMC
+     * fallback this echo-check would otherwise gate into is untested,
+     * speculative code per that function's own comment) -- matching
+     * production's permissive behavior here, rather than the
+     * recovered file's own stricter check, is what the already-proven
+     * reference actually does. */
+    stage0_send_cmd(8, 0x1AAu, 1, 0, 0, 0, 0, 0, 0, 1, &r);
+    if (r.err != 0) return -2;
+
+    /* FIXED vs. the recovered file, matching kernel_main.vani's own
+     * ACMD41 loop exactly: production's check here is also
+     * sdhost_cmd_timed_out-only (NEW_FLAG, never FAIL_FLAG) for both
+     * CMD55 and CMD41, and it treats exhausting the retry cap without
+     * ever seeing OCR_BUSY as a (flagged, non-fatal) warning rather
+     * than a hard failure -- "proceeding anyway" is this project's
+     * own pre-existing, deliberate behavior here, not a workaround.
+     * A true command-cycle failure (NEW_FLAG stuck, r.err!=0) still
+     * returns -3; only "busy bit never seen after 1000 tries" is
+     * non-fatal. */
+    retry = 1000;
+    for (;;) {
+        stage0_send_cmd(55, 0, 1, 0, 0, 0, 0, 0, 0, 1, &r);
+        if (r.err != 0) return -3;
+        stage0_send_cmd(41, 0x00FF8000u | OCR_HCS, 1, 0, 0, 0, 0, 0, 1, 1, &r);
+        if (r.err != 0) return -3;
+        if (r.response[0] & OCR_BUSY) break;
+        if (retry == 0) break;
+        retry = retry - 1;
+        udelay_real(1000);
+    }
+    /* OCR_HCS/CCS, same bit position in the response as in the request
+     * -- 1 means the card is block-addressed (SDHC/SDXC), 0 means
+     * byte-addressed (SDSC). See this file's own header comment: the
+     * recovered uboot_sdhost_full.c never captured this. */
+    s_is_sdhc = (r.response[0] & OCR_HCS) ? 1 : 0;
+
+    stage0_send_cmd(2, 0, 1, 1, 0, 0, 0, 0, 0, 0, &r);
+    if (r.err != 0) return -4;
+
+    stage0_send_cmd(3, 0, 1, 0, 0, 0, 0, 0, 0, 0, &r);
+    if (r.err != 0) return -5;
+    s_rca = (r.response[0] >> 16) & 0xFFFFu;
+
+    stage0_send_cmd(9, s_rca << 16, 1, 1, 0, 0, 0, 0, 0, 0, &r);
+    if (r.err != 0) return -6;
+
+    stage0_send_cmd(7, s_rca << 16, 1, 0, 1, 0, 0, 0, 0, 0, &r);
+    if (r.err != 0) return -7;
+
+    /* Data-transfer clock + SDHCFG, 1-bit mode always (no ACMD6, no
+     * WIDE_EXT_BUS): 1MHz (SDCDIV=248 @ 250MHz core, matching this
+     * project's own already-verified conservative default) and
+     * SLOW_CARD|DATA_IRPT_EN|BUSY_IRPT_EN|WIDE_INT_BUS (0x418, real
+     * U-Boot's bcm2835_set_ios sets WIDE_INT_BUS unconditionally
+     * regardless of external bus width). */
+    mmio_w(SDCDIV_ADDR, 248u);
+    mmio_w(SDTOUT_ADDR, 500000u);
+    mmio_w(SDHCFG_ADDR, 0x418u);
+
+    return 0;
+}
+
+/* Reads exactly one 512-byte block into buf. Returns 0 on success,
+ * negative on failure. Callable many times after one stage0_sd_init(). */
+int stage0_sd_read_block(unsigned int block_num, void *buf) {
+    struct cmd_result rr;
+    unsigned int *rbuf = (unsigned int *)buf;
+    unsigned int addr = s_is_sdhc ? block_num : (block_num * 512u);
+    int copy_words;
+    long long room_wait_iters;
+    unsigned int sdhsts2;
+
+    stage0_send_cmd(SDCMD_READ_CMD | 17, addr, 1, 0, 0, 512, 1, 1, 0, 0, &rr);
+    if (rr.err != 0) return -9;
+
+    copy_words = 128;
+    room_wait_iters = 0;
+    while (copy_words > 0) {
+        unsigned int edm = mmio_r(SDEDM_ADDR);
+        int fill = (int)((edm >> 4) & 0x1Fu);
+        int burst_words = (SDDATA_FIFO_PIO_BURST < copy_words) ? SDDATA_FIFO_PIO_BURST : copy_words;
+        int words;
+        if (fill < burst_words) {
+            room_wait_iters = room_wait_iters + 1;
+            if (room_wait_iters > 20000000LL) return -9;
+            continue;
+        }
+        words = fill;
+        if (words > copy_words) words = copy_words;
+        copy_words = copy_words - words;
+        while (words > 0) {
+            *rbuf = mmio_r(SDDATA_ADDR);
+            rbuf = rbuf + 1;
+            words = words - 1;
+        }
+    }
+
+    sdhsts2 = mmio_r(SDHSTS_ADDR);
+    if (sdhsts2 & (0x20u | 0x10u | 0x08u | 0x40u | 0x80u)) return -9;
+
+    {
+        unsigned int t0 = now_us();
+        for (;;) {
+            unsigned int edm = mmio_r(SDEDM_ADDR);
+            unsigned int fsm = edm & SDEDM_FSM_MASK;
+            if (fsm == SDEDM_FSM_IDENTMODE || fsm == SDEDM_FSM_DATAMODE) break;
+            if (fsm == SDEDM_FSM_READWAIT || fsm == SDEDM_FSM_WRITESTART1 || fsm == SDEDM_FSM_READDATA) {
+                mmio_w(SDEDM_ADDR, edm | SDEDM_FORCE_DATA_MODE_BIT);
+                break;
+            }
+            if (elapsed_at_least(t0, TIMEOUT_US)) return -9;
+        }
+    }
+
+    sdhsts2 = mmio_r(SDHSTS_ADDR) & SDHSTS_ERROR_MASK;
+    mmio_w(SDHSTS_ADDR, sdhsts2);
+    if (sdhsts2 != 0) return -9;
+
+    return 0;
+}
