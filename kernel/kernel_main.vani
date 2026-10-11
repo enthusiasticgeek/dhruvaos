@@ -21366,13 +21366,39 @@ fn rtl8188cu_load_firmware() -> i64 {
 // Block 8192 (4MB): comfortable margin past both DharaFS's own log
 // region (blocks 1-2048) and its crypto-metadata region (blocks 4000+,
 // dharafs_crypto_meta_sector_for's own comment), and well clear of
-// flash_sd_card.sh's own FAT boot partition (starts at sector 16384,
-// 8MiB) -- entirely unused raw space on every card this project's own
+// flash_sd_card.sh's own FAT boot partition (starts at sector 36864,
+// 18MiB as of the A/B kernel-slot feature -- was 8MiB) -- entirely
+// unused raw space on every card this project's own
 // scripts already produce. 32 blocks (16384 bytes) matches usb_wifi_
 // fw_buf's own existing capacity exactly.
 fn rtl8188cu_fw_raw_sd_base_block() -> i64 { return 8192; }
 fn rtl8188cu_fw_raw_sd_block_count() -> i64 { return 32; }
 
+// RESERVED (2026-10-11, A/B kernel-slot feature, see
+// docs/KERNEL_UPDATE_ROADMAP.md and the as-built AB_KERNEL_SLOTS.md
+// once written): blocks 9216-34815 are claimed by the new stage-0
+// loader's slot-state record and the two kernel payload slots. No
+// vani-side accessor functions exist for these yet (added in a later
+// phase, together with the real read/write logic) -- this comment
+// exists purely to stop them from being accidentally reused by some
+// other feature in the meantime. Exact layout (single source of truth
+// for now lives in test/kernel_slot_layout.py, mirrored here so a
+// reader of this file doesn't have to go find that):
+//   block 9216       slot-state record, copy A (512 bytes, see
+//                     test/kernel_slot_layout.py's SlotState for the
+//                     full field layout -- magic/generation/
+//                     active_slot/preferred_slot/attempt_count/
+//                     bootlimit/per-slot ready+len+sha256/crc32)
+//   block 9217       slot-state record, copy B (ping-pong pair with
+//                     9216 -- higher `generation` wins on read, same
+//                     redundancy convention U-Boot's own env storage
+//                     uses, so a power-loss mid-write never corrupts
+//                     the only copy)
+//   blocks 10240-22527   kernel slot A payload (6MiB)
+//   blocks 22528-34815   kernel slot B payload (6MiB)
+// flash_sd_card.sh's own FAT32 boot partition now starts at sector
+// 36864 (18MiB, was 8MiB) to make room for this -- see that script's
+// own BOOT_PART_START_SECTOR comment.
 fn rtl8188cu_load_firmware_from_sd_raw() -> i64 {
   let fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
   let scratch: mut ref i64 = dhruva_alloc_bytes(512);

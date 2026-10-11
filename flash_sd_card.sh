@@ -48,9 +48,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOOT_PART_START_SECTOR=16384   # 8MiB -- comfortable margin past DharaFS's
-                                # own 1MB (blocks 1-2048) ceiling; see
-                                # docs/HARDWARE_IN_LOOP.md §4.2.
+# 18MiB (was 8MiB until the A/B kernel-slot feature, 2026-10-11): widened
+# to make room for the new slot-state record + two 6MiB kernel payload
+# slots (blocks 9216-34815) below the partition, alongside DharaFS's own
+# log (blocks 1-2048) and crypto-metadata (blocks 4000+) regions and the
+# existing WiFi-firmware raw fallback (blocks 8192-8223). See
+# test/kernel_slot_layout.py for the single source of truth on the exact
+# block numbers, and kernel_main.vani's own reservation comment next to
+# rtl8188cu_fw_raw_sd_base_block. docs/HARDWARE_IN_LOOP.md §4.2.
+BOOT_PART_START_SECTOR=36864
 MOUNT_POINT="/tmp/dhruva_sdcard_mount_$$"
 
 WIFI_SERIAL_DEVICE=""
@@ -242,6 +248,18 @@ if [ "$VERIFY_OK" -ne 1 ]; then
     echo "on real hardware." >&2
     exit 1
 fi
+
+echo
+echo "=== Seeding A/B kernel-slot A with build/kernel.img + writing initial slot-state record ==="
+# Raw block writes below the FAT32 partition (blocks 9216+, see
+# test/kernel_slot_layout.py's own header comment) -- independent of
+# the partition/filesystem work above, needed so the A/B kernel-slot
+# feature's stage-0 loader (once it exists) has real data to chain-load
+# from slot A from the very first flash. Safe to run even before
+# stage-0 exists: nothing reads these blocks yet, and they sit well
+# past the FAT32 partition's own start sector, so this can never
+# collide with anything mounted above.
+sudo python3 "$ROOT/test/kernel_slot_layout.py" --device "$DEVICE" seed "$ROOT/build/kernel.img"
 
 echo
 echo "=== Done. Contents written AND verified (post-remount re-read) on $BOOT_PART: ==="
