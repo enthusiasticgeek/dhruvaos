@@ -19248,14 +19248,15 @@ fn dwc2_port_reset() -> i64 {
     let uv: u32 = mmio_read_u32(gusbcfg_for_speed);
     if (uv & phylpwrclksel_bit) == (0 as u32) {
       let _ = mmio_write_u32(gusbcfg_for_speed, uv | phylpwrclksel_bit);
-      // Round 17 diagnostic (TEMPORARY -- remove once confirmed): verify
-      // this fix's own write actually sticks and the second reset
-      // actually completes, instead of inferring it from the eventual
-      // outcome -- per this project's own standing policy, don't just
-      // cite a mechanism, check it directly.
-      let _ = uart_puts("USB DIAG PHYLPWRCLKSEL immediately after write GUSBCFG=");
-      let _ = uart_put_hex32(mmio_read_u32(gusbcfg_for_speed));
-      let _ = uart_puts("\n");
+      // Round 17 diagnostic, confirmed -- gated behind boot_debug_
+      // enabled() now (round 65 follow-up, 2026-10-11) rather than
+      // removed outright, same treatment as dwc2_wait_chan0_done's
+      // own checkpoints above.
+      if boot_debug_enabled() == 1 {
+        let _ = uart_puts("USB DIAG PHYLPWRCLKSEL immediately after write GUSBCFG=");
+        let _ = uart_put_hex32(mmio_read_u32(gusbcfg_for_speed));
+        let _ = uart_puts("\n");
+      }
       let rv: u32 = mmio_read_u32(hprt0);
       let _ = mmio_write_u32(hprt0, (rv & not_w1c_mask) | (0x100 as u32));
       let _ = delay(161000);
@@ -19273,11 +19274,13 @@ fn dwc2_port_reset() -> i64 {
           enable_tries2 = enable_tries2 + 1;
         }
       }
-      let _ = uart_puts("USB DIAG after second reset HPRT0=");
-      let _ = uart_put_hex32(mmio_read_u32(hprt0));
-      let _ = uart_puts(" GUSBCFG=");
-      let _ = uart_put_hex32(mmio_read_u32(gusbcfg_for_speed));
-      let _ = uart_puts("\n");
+      if boot_debug_enabled() == 1 {
+        let _ = uart_puts("USB DIAG after second reset HPRT0=");
+        let _ = uart_put_hex32(mmio_read_u32(hprt0));
+        let _ = uart_puts(" GUSBCFG=");
+        let _ = uart_put_hex32(mmio_read_u32(gusbcfg_for_speed));
+        let _ = uart_puts("\n");
+      }
     }
   }
 
@@ -19765,14 +19768,16 @@ fn dwc2_reassert_core_config_post_port_reset() -> i64 {
   // this function reachable from task_f without anyone noticing the
   // same recursion risk reappearing. Fixing proactively rather than
   // waiting for it to resurface.
-  let readback_gusbcfg: u32 = mmio_read_u32(gusbcfg);
-  let _ = uart_puts("USB DIAG GUSBCFG immediately after post-port-reset reassert=");
-  let _ = uart_put_hex32(readback_gusbcfg);
-  let _ = uart_puts("\n");
-  let readback_gahbcfg: u32 = mmio_read_u32(gahbcfg);
-  let _ = uart_puts("USB DIAG GAHBCFG immediately after post-port-reset reassert=");
-  let _ = uart_put_hex32(readback_gahbcfg);
-  let _ = uart_puts("\n");
+  if boot_debug_enabled() == 1 {
+    let readback_gusbcfg: u32 = mmio_read_u32(gusbcfg);
+    let _ = uart_puts("USB DIAG GUSBCFG immediately after post-port-reset reassert=");
+    let _ = uart_put_hex32(readback_gusbcfg);
+    let _ = uart_puts("\n");
+    let readback_gahbcfg: u32 = mmio_read_u32(gahbcfg);
+    let _ = uart_puts("USB DIAG GAHBCFG immediately after post-port-reset reassert=");
+    let _ = uart_put_hex32(readback_gahbcfg);
+    let _ = uart_puts("\n");
+  }
   return 0;
 }
 
@@ -20050,11 +20055,24 @@ fn dwc2_wait_chan0_done() -> u32 {
   // narrows the window further: did it already revert before this
   // loop even started polling, or does it happen somewhere in the
   // first 100ms?
-  let _ = uart_puts("USB DIAG poll entry tries=0 GAHBCFG=");
-  let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
-  let _ = uart_puts(" GUSBCFG=");
-  let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
-  let _ = uart_puts("\n");
+  // Round 65 follow-up (2026-10-11, user request): the rounds 14-29
+  // real-HW investigation these checkpoints were built for is done --
+  // this is the shared 1,000,000-iteration wait primitive every USB
+  // transfer (control/bulk/interrupt, every class) goes through, so
+  // leaving them unconditional meant every retry/timeout anywhere in
+  // USB enumeration cost multiple slow UART prints on top of the real
+  // poll time. Gated behind boot_debug_enabled() like every other
+  // post-investigation DIAG print in this codebase (task #319's own
+  // precedent) -- still available via `write /config/loglevel 16`
+  // (or live `dhdl set loglevel 16`) when this specific wait loop
+  // needs eyes on it again.
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("USB DIAG poll entry tries=0 GAHBCFG=");
+    let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
+    let _ = uart_puts(" GUSBCFG=");
+    let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
+    let _ = uart_puts("\n");
+  }
 
   while tries < 1000000 {
     let hi: u32 = mmio_read_u32(hcint0);
@@ -20279,11 +20297,13 @@ fn dwc2_wait_chan0_done() -> u32 {
       // fix -- see its header comment).
       if ((cur_ahb & hbstlen_field_mask) != hbstlen_incr4) || ((cur_ahb & dmaen_bit) == (0 as u32)) {
         let _ = mmio_write_u32(gahbcfg_addr, (cur_ahb & hbstlen_clear_mask) | hbstlen_incr4 | dmaen_bit);
-        let _ = uart_puts("USB DIAG self-heal: GAHBCFG reverted mid-wait, tries=");
-        let _ = uart_put_hex32(tries as u32);
-        let _ = uart_puts(" was=");
-        let _ = uart_put_hex32(cur_ahb);
-        let _ = uart_puts("\n");
+        if boot_debug_enabled() == 1 {
+          let _ = uart_puts("USB DIAG self-heal: GAHBCFG reverted mid-wait, tries=");
+          let _ = uart_put_hex32(tries as u32);
+          let _ = uart_puts(" was=");
+          let _ = uart_put_hex32(cur_ahb);
+          let _ = uart_puts("\n");
+        }
       }
       let physel_bit: u32 = (1 as u32) << (6 as u32);
       // Round 29: a full real-HW boot capture from power-on caught
@@ -20302,30 +20322,34 @@ fn dwc2_wait_chan0_done() -> u32 {
       let cur_usb: u32 = mmio_read_u32(gusbcfg_addr);
       if ((cur_usb & physel_bit) == (0 as u32)) || ((cur_usb & phylpwrclksel_bit) == (0 as u32)) {
         let _ = mmio_write_u32(gusbcfg_addr, ((cur_usb | physel_bit | phylpwrclksel_bit) & toutcal_clear_mask) | toutcal_max);
-        let _ = uart_puts("USB DIAG self-heal: GUSBCFG reverted mid-wait, tries=");
-        let _ = uart_put_hex32(tries as u32);
-        let _ = uart_puts(" was=");
-        let _ = uart_put_hex32(cur_usb);
-        let _ = uart_puts("\n");
+        if boot_debug_enabled() == 1 {
+          let _ = uart_puts("USB DIAG self-heal: GUSBCFG reverted mid-wait, tries=");
+          let _ = uart_put_hex32(tries as u32);
+          let _ = uart_puts(" was=");
+          let _ = uart_put_hex32(cur_usb);
+          let _ = uart_puts("\n");
+        }
       }
     }
-    if (tries == 19999) || (tries == 49999) || (tries == 99999) {
-      let _ = uart_puts("USB DIAG poll early checkpoint tries=");
-      let _ = uart_put_hex32(tries as u32);
-      let _ = uart_puts(" GAHBCFG=");
-      let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
-      let _ = uart_puts(" GUSBCFG=");
-      let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
-      let _ = uart_puts("\n");
-    }
-    if tries % 200000 == 199999 {
-      let _ = uart_puts("USB DIAG poll checkpoint tries=");
-      let _ = uart_put_hex32(tries as u32);
-      let _ = uart_puts(" GAHBCFG=");
-      let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
-      let _ = uart_puts(" GUSBCFG=");
-      let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
-      let _ = uart_puts("\n");
+    if boot_debug_enabled() == 1 {
+      if (tries == 19999) || (tries == 49999) || (tries == 99999) {
+        let _ = uart_puts("USB DIAG poll early checkpoint tries=");
+        let _ = uart_put_hex32(tries as u32);
+        let _ = uart_puts(" GAHBCFG=");
+        let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
+        let _ = uart_puts(" GUSBCFG=");
+        let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
+        let _ = uart_puts("\n");
+      }
+      if tries % 200000 == 199999 {
+        let _ = uart_puts("USB DIAG poll checkpoint tries=");
+        let _ = uart_put_hex32(tries as u32);
+        let _ = uart_puts(" GAHBCFG=");
+        let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
+        let _ = uart_puts(" GUSBCFG=");
+        let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
+        let _ = uart_puts("\n");
+      }
     }
     tries = tries + 1;
   }
@@ -20535,11 +20559,13 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
     // actually stay connected/enabled THROUGH this exact transfer, or
     // drop mid-transaction -- a real possibility this driver has never
     // checked for).
-    let _ = uart_puts("USB DIAG: SETUP stage failed, raw HCINT=0x");
-    let _ = uart_put_hex32(setup_result);
-    let _ = uart_puts(" HPRT0=0x");
-    let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
-    let _ = uart_puts("\n");
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("USB DIAG: SETUP stage failed, raw HCINT=0x");
+      let _ = uart_put_hex32(setup_result);
+      let _ = uart_puts(" HPRT0=0x");
+      let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
+      let _ = uart_puts("\n");
+    }
     let _ = kernlog_write_usb_regs("USB SETUP stage failed", setup_result);
     return 0 - 1; // XFERCOMPL (bit0) never set -- timeout or error
   }
@@ -20578,11 +20604,13 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   if (data_result & (1 as u32)) == (0 as u32) {
     // Task #325 real-HW diagnostic -- see the SETUP-stage failure's
     // own comment above for the full reasoning.
-    let _ = uart_puts("USB DIAG: DATA stage failed, raw HCINT=0x");
-    let _ = uart_put_hex32(data_result);
-    let _ = uart_puts(" HPRT0=0x");
-    let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
-    let _ = uart_puts("\n");
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("USB DIAG: DATA stage failed, raw HCINT=0x");
+      let _ = uart_put_hex32(data_result);
+      let _ = uart_puts(" HPRT0=0x");
+      let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
+      let _ = uart_puts("\n");
+    }
     let _ = kernlog_write_usb_regs("USB DATA stage failed", data_result);
     return 0 - 1;
   }
@@ -20606,11 +20634,13 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
   if (status_result & (1 as u32)) == (0 as u32) {
     // Task #325 real-HW diagnostic -- see the SETUP-stage failure's
     // own comment above for the full reasoning.
-    let _ = uart_puts("USB DIAG: STATUS stage failed, raw HCINT=0x");
-    let _ = uart_put_hex32(status_result);
-    let _ = uart_puts(" HPRT0=0x");
-    let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
-    let _ = uart_puts("\n");
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("USB DIAG: STATUS stage failed, raw HCINT=0x");
+      let _ = uart_put_hex32(status_result);
+      let _ = uart_puts(" HPRT0=0x");
+      let _ = uart_put_hex32(mmio_read_u32(dwc2_hprt0_addr()));
+      let _ = uart_puts("\n");
+    }
     let _ = kernlog_write_usb_regs("USB STATUS stage failed", status_result);
     return 0 - 1;
   }
@@ -26145,15 +26175,29 @@ fn hci_reset_and_scan(devaddr: u32, mps: u32) -> i64 {
   // false-rejection: `dwc2_wait_chan0_done`'s DATATGLERR fix earlier
   // this same round already ruled that failure mode out) for EVERY
   // command after Reset, including this one.
-  // delay(N)'s real per-iteration cost on THIS board (ARM1176, Pi 1B)
-  // was measured directly against real hardware, not assumed under
-  // QEMU (see this file's own delay()-calibration comment, task #276):
-  // 930133us / 3000000 iterations ~= 0.310044us/iteration. 100ms /
-  // 0.310044us ~= 322536 iterations; rounded up to 350000 (~108.5ms)
-  // for margin -- this is a one-time bring-up delay outside any
-  // ceiling-locked critical section, so erring generous costs nothing
-  // the way it would inside task_c's own measured budget.
-  let _ = delay(350000);
+  // Round 65 follow-up (2026-10-11, real-HW retest): delay(350000)
+  // (~108.5ms at task #276's calibrated 0.310044us/iteration) was NOT
+  // enough -- a fresh real-HW boot with this exact delay in place
+  // still got HCI_Read_Local_Version_Information status=FFFFFFFF.
+  // Real, likely explanation: task #276's calibration was a single
+  // measurement at whatever CPU clock happened to be active then,
+  // but this board's governor (governor_apply, Phase 5) scales the
+  // ARM clock across a 250-700MHz range (confirmed live during THIS
+  // same boot's own GOVERNOR self-test) -- delay(N) is a plain
+  // instruction-count busy loop, so its REAL wall-clock duration
+  // scales inversely with whatever clock rate is active when it
+  // runs, not a fixed figure. If HCI bring-up runs at the governor's
+  // high end while the calibration sample was taken at (or near) the
+  // low end, the same iteration count could complete in well under
+  // half the intended real time. Rather than re-deriving a precise
+  // number without another real-HW cycle to confirm it, scaled up by
+  // ~3.4x (to 1200000, ~372ms at the ORIGINAL calibration rate) --
+  // comfortably over 100ms even at the governor's fastest (700MHz)
+  // state relative to whatever rate the calibration sample ran at.
+  // Same reasoning as before on why generous costs nothing here: a
+  // one-time bring-up delay outside any ceiling-locked critical
+  // section, unlike task_c's own measured budget.
+  let _ = delay(1200000);
 
   // Round 64: identify the real chip revision -- see this command's
   // own builder/field-accessor comments for why (Broadcom's own
@@ -27258,7 +27302,9 @@ fn dwc2_probe_device0() -> i64 {
     if result_status == 0 {
       attempt = 5;
     } else {
-      let _ = uart_puts("USB DIAG: GET_DESCRIPTOR(Device) attempt failed, retrying after settle\n");
+      if boot_debug_enabled() == 1 {
+        let _ = uart_puts("USB DIAG: GET_DESCRIPTOR(Device) attempt failed, retrying after settle\n");
+      }
       let _ = delay(161000);
       attempt = attempt + 1;
     }
@@ -27351,20 +27397,29 @@ fn dwc2_hub_fetch_port_count(hub_addr: u32, hub_mps: u32) -> i64 {
   let _ = dwc2_build_setup(0xA0 as u32, 6 as u32, 0x2900 as u32, 0 as u32, 9 as u32);
   let status: i64 = dwc2_control_in(hub_addr, hub_mps, 9 as u32, hubdesc);
   if status != 0 {
-    let _ = uart_puts("USB DIAG: hub GET_DESCRIPTOR(Hub) failed\n");
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("USB DIAG: hub GET_DESCRIPTOR(Hub) failed\n");
+    }
     return 0 - 1;
   }
   let b_desc_length: u32 = buf_read_byte(hubdesc, 0 as u32);
   let b_nbr_ports: u32 = buf_read_byte(hubdesc, 2 as u32);
   let w_hub_char_lo: u32 = buf_read_byte(hubdesc, 3 as u32);
   let w_hub_char_hi: u32 = buf_read_byte(hubdesc, 4 as u32);
-  let _ = uart_puts("USB DIAG: real Hub Descriptor bDescLength=");
-  let _ = uart_put_hex32(b_desc_length);
-  let _ = uart_puts(" bNbrPorts=");
-  let _ = uart_put_hex32(b_nbr_ports);
-  let _ = uart_puts(" wHubCharacteristics=0x");
-  let _ = uart_put_hex32(w_hub_char_lo | (w_hub_char_hi << (8 as u32)));
-  let _ = uart_puts("\n");
+  // Round 61's own "diagnostic only for now" print -- the mystery it
+  // existed to settle (real bNbrPorts) was confirmed (=3) and already
+  // hardcoded into dwc2_enumerate_downstream/usb_hotplug_poll this
+  // same session, so gated behind boot_debug_enabled() now rather
+  // than printed on every boot.
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("USB DIAG: real Hub Descriptor bDescLength=");
+    let _ = uart_put_hex32(b_desc_length);
+    let _ = uart_puts(" bNbrPorts=");
+    let _ = uart_put_hex32(b_nbr_ports);
+    let _ = uart_puts(" wHubCharacteristics=0x");
+    let _ = uart_put_hex32(w_hub_char_lo | (w_hub_char_hi << (8 as u32)));
+    let _ = uart_puts("\n");
+  }
   return b_nbr_ports as i64;
 }
 
