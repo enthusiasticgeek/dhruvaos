@@ -2967,18 +2967,6 @@ extern "C" fn sdhost_drain_fifo_to_buffer(buf: mut ref i64, cmd_and_flags: u32, 
 // comment immediately above for the full rationale.
 #[stack_cost(bytes=12)]
 extern "C" fn sdhost_fill_fifo_from_buffer(buf: mut ref i64, cmd_and_flags: u32, arg: u32) -> i64;
-// TEMPORARY DIAGNOSTIC (2026-09-19) -- see boot/sdcard_state.S's own
-// header comment on sdhost_fill_fifo_from_buffer_diag. Write-path only.
-// bytes=28: real push is {r4,r5,r6,r7,r8,r9,lr} (7 regs), caught by
-// test/asm_safety_audit.py after an earlier bytes=24 undercounted it.
-#[stack_cost(bytes=28)]
-extern "C" fn sdhost_fill_fifo_from_buffer_diag(buf: mut ref i64, word_count: i64) -> i64;
-// TEMPORARY DIAGNOSTIC (19th SD round, 2026-09-20) -- see boot/
-// sdcard_state.S's own header comment on these two entry points.
-#[stack_cost(bytes=4)]
-extern "C" fn sdhost_diag_dump_regs_pre_cmd24() -> i64;
-#[stack_cost(bytes=4)]
-extern "C" fn sdhost_diag_dump_regs_post_cmd24() -> i64;
 // Task #215 -- see boot/sdcard_state.S's own header comment for this
 // function. Returns the SD core clock rate in Hz via the VideoCore
 // mailbox, or 0 if the query failed (never a real answer for CORE on
@@ -3012,31 +3000,6 @@ extern "C" fn uart_get_clock_hz() -> i64;
 // this codebase's software does.
 #[stack_cost(bytes=24)]
 extern "C" fn get_throttled_status() -> i64;
-// 28th SD round (2026-09-25) -- see boot/rpi1/uboot_sdhost_write.c's
-// own header comment for the full "why". Literal C transliteration
-// of real U-Boot's own working write-path algorithm, self-contained
-// (its own CMD24 issuance through wait_transfer_complete, raw MMIO
-// only), called ONLY from the existing 8-block real-HW diagnostic
-// sweep in sdhost_write_block_once below -- the production write
-// path is completely untouched.
-#[stack_cost(bytes=64)]
-extern "C" fn uboot_style_sdhost_write_block(buf: mut ref i64, block_addr: i64) -> i64;
-// 41st SD round (2026-09-27): read-side counterpart, literal C port of
-// real U-Boot's own read path (boot/rpi1/uboot_sdhost_read.c). Called
-// ONLY from the same 8-block real-HW diagnostic sweep in
-// sdhost_read_block_once below -- the production read path is
-// completely untouched.
-#[stack_cost(bytes=64)]
-extern "C" fn uboot_style_sdhost_read_block(buf: mut ref i64, block_addr: i64) -> i64;
-// 34th SD round follow-up -- see boot/rpi1/uboot_sdhost_full.c's own
-// header comment for the full "why". Runs a COMPLETELY independent
-// bring-up (CMD0 through CMD7, plus SCR/ACMD6 bus-width negotiation)
-// entirely bypassing DhruvaOS's own sdhost_init, then one write and
-// one read-back through round 28's own already-verified write port.
-// Returns 0 on full success or a negative stage code -- see that
-// file's header comment for exactly which stage each value means.
-#[stack_cost(bytes=96)]
-extern "C" fn uboot_style_full_sequence_test(block_addr: u32, write_buf: mut ref i64, read_buf: mut ref i64) -> i64;
 // TEST-ONLY, task #3 verification -- see boot/sdcard_state.S.
 #[stack_cost(bytes=4)]
 extern "C" fn test_fill_pattern(buf: mut ref i64, byte_count: i64) -> i64;
@@ -7217,24 +7180,19 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // full "why" (real U-Boot reissues CMD16/SET_BLOCKLEN before every
   // single mmc_bread/mmc_bwrite, never just once at init).
   let _ = sdhost_cmd(16 as u32, 512 as u32);
-  // 41st SD round (2026-09-27): direct read-side counterpart to
-  // sdhost_write_block_once's own use_write_diag early-return. The
-  // 40th round's ACMD6 fix confirmed real 4-bit mode and, in the same
-  // stroke, resolved the CRC16 write failure that had defined this
-  // investigation for rounds 37-40 -- but exposed a new read-side
-  // FIFO_ERROR that never had the chance to manifest while every write
-  // was already failing first. Routes the same 8-block diagnostic
-  // sweep through a literal C port of U-Boot's own read path (boot/
-  // rpi1/uboot_sdhost_read.c) instead of this driver's own hand-written
-  // asm read path, exactly mirroring how the write side already does
-  // this. CMD16 above is unconditional and already covers this path,
-  // matching the write side's own identical reliance on its outer
-  // unconditional CMD16 call. Production read path (every block outside
-  // 2100-2107) is completely unaffected.
-  let use_read_diag: bool = (block_num >= 2100) && (block_num < 2108);
-  if use_read_diag {
-    return uboot_style_sdhost_read_block(buf, addr as i64);
-  }
+  // REMOVED (2026-10-11): the 41st-round use_read_diag early-return
+  // above applied to EVERY read, not just the round-42 investigation's
+  // 8-block sweep -- "Production read path (every block outside
+  // 2100-2107) is completely unaffected" assumed DharaFS's own block
+  // allocator would never grow into that range, which was false: a
+  // real-HW boot showed a genuine DharaFS write land on block 2100
+  // (SDARG=0x00000834) and get silently routed into this frozen,
+  // unmaintained U-Boot-comparison C port instead of the real
+  // production path, hanging the boot post-PASS. The round-42 SD wedge
+  // investigation this scaffolding served is closed (commit bb1c4df);
+  // uboot_style_sdhost_read_block/write_block (boot/rpi1/uboot_sdhost_
+  // read.c/write.c) are kept for historical reference but are no
+  // longer called from anywhere.
   // BUG found 2026-09-19 (real-hardware SD wedge investigation, fifth
   // real-HW log): 0x518 included SDHCFG_BLOCK_IRPT_EN (bit8, 0x100)
   // unconditionally -- confirmed against a fresh diagnostic capture
@@ -7551,10 +7509,6 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_writestart1: u32 = 0xA as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
-  // Moved up from just above sdhost_fill_fifo_from_buffer_diag's own
-  // call site (2026-09-19 original placement) so it can also gate the
-  // new pre-CMD24 instrumentation below (19th SD round, 2026-09-20).
-  let use_write_diag: bool = (block_num >= 2100) && (block_num < 2108);
   // 38th SD round follow-up (2026-09-27): a temporary diagnostic print
   // right here (block_num/is_sdhc/addr) previously confirmed via a
   // real-HW trace (picocom_20260927_084408.log) that sd_state_get_
@@ -7599,15 +7553,6 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // production write path below), matching U-Boot's own real
   // per-transfer behavior exactly, not just the 8-block test range.
   let cmd16_rewrite_status: u32 = sdhost_cmd(16 as u32, 512 as u32);
-  if use_write_diag {
-    let _ = uart_puts("SD DIAG: per-write CMD16 (SET_BLOCKLEN) status=0x");
-    let _ = uart_put_hex32(cmd16_rewrite_status);
-    let _ = uart_puts(" timed_out=");
-    let _ = uart_put_i64(sdhost_cmd_timed_out(cmd16_rewrite_status));
-    let _ = uart_puts(" failed=");
-    let _ = uart_put_i64(sdhost_cmd_failed(cmd16_rewrite_status));
-    let _ = uart_puts("\n");
-  }
   // 30th SD round (2026-09-25): found while assembling the exact
   // SDHCFG value the 28th round's C port (boot/rpi1/uboot_sdhost_
   // write.c) would need if it ever ported bcm2835_set_ios too --
@@ -7644,48 +7589,15 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // consistent with the controller expecting more than 512 bytes.
   let sdhbct_readback: u32 = sd_mmio_read_u32(sdhbct);
   let sdhblc_readback: u32 = sd_mmio_read_u32(sdhblc);
-  // 28th SD round (2026-09-25): three real, well-reasoned fixes
-  // derived from register-level comparison against U-Boot's own
-  // source (burst-write, 25th/26th round; SDHCFG_DATA_IRPT_EN
-  // removal, 27th round) have each matched the reference exactly and
-  // still failed to clear the real-HW write wedge -- register diffing
-  // against this driver's own hand-written asm is exhausted for now.
-  // Routes the diagnostic sweep (only) through a literal C port of
-  // U-Boot's actual working algorithm instead -- see boot/rpi1/uboot_
-  // sdhost_write.c's own header comment for why this is a genuinely
-  // different, decisive test rather than one more register tweak.
-  // Early return: this function does its own complete CMD24-through-
-  // wait_transfer_complete sequence, so none of the diag/fill/wait
-  // logic below runs for these blocks. Production write path (every
-  // block outside 2100-2107) is completely unaffected.
-  if use_write_diag {
-    return uboot_style_sdhost_write_block(buf, addr as i64);
-  }
-  // ROUND 2026-09-20 (19th SD round): user's own explicit follow-up
-  // after the 18th round's timer-based timeout fix confirmed the wedge
-  // persists on real hardware -- "stop modifying timeout/retry
-  // behavior, instrument the CMD24 transaction at instruction/register
-  // level... also capture CMD13/R1 immediately before CMD24." Every
-  // prior CMD13 (SEND_STATUS) diagnostic in this investigation only
-  // ever ran AFTER a wedge was already detected -- this is the first
-  // "before" baseline, letting a future log directly compare the
-  // card's own reported state going INTO the write against its state
-  // once wedged (captured further below, unchanged).
-  if use_write_diag {
-    let pre_cmd13_status: u32 = sdhost_cmd(13 as u32, sd_state_get_rca() as u32);
-    if sdhost_cmd_timed_out(pre_cmd13_status) == 1 {
-      let _ = uart_puts("SD DIAG: pre-CMD24 CMD13 (SEND_STATUS) timed out\n");
-    } else {
-      let pre_cmd13_r1: u32 = sd_mmio_read_u32(SDRSP0);
-      let pre_cmd13_current_state: u32 = (pre_cmd13_r1 >> (9 as u32)) & (0xF as u32);
-      let _ = uart_puts("SD DIAG: pre-CMD24 CMD13 (SEND_STATUS) R1=0x");
-      let _ = uart_put_hex32(pre_cmd13_r1);
-      let _ = uart_puts(" CURRENT_STATE=");
-      let _ = uart_put_i64(pre_cmd13_current_state as i64);
-      let _ = uart_puts("\n");
-    }
-    let _ = sdhost_diag_dump_regs_pre_cmd24();
-  }
+  // REMOVED (2026-10-11): the 28th-round use_write_diag early-return
+  // (routing into uboot_style_sdhost_write_block, boot/rpi1/uboot_
+  // sdhost_write.c) and the 19th-round pre-CMD24 CMD13 diagnostic that
+  // used to be gated on it both applied to EVERY write, not just the
+  // round-42 investigation's 8-block sweep -- see sdhost_read_block_
+  // once's matching comment for the real-HW evidence this silently
+  // broke a genuine DharaFS write. That investigation is closed
+  // (commit bb1c4df); uboot_style_sdhost_write_block is kept for
+  // historical reference but is no longer called from anywhere.
   // 42nd SD round (2026-09-27): CMD24 issuance folded directly into
   // sdhost_fill_fifo_from_buffer_impl itself, right before it masks and
   // fills -- see that function's own header comment (boot/sdcard_
@@ -7694,33 +7606,6 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // sdhost_fill_fifo_from_buffer two-step. The old FAIL_FLAG check and
   // the round-41 pre-PIO SDHSTS check ("check 7") both moved into the
   // asm too, immediately after the command completes, before the mask.
-  // ROUND 2026-09-20 (19th SD round): register state immediately after
-  // CMD24's own command phase completes -- see this project's own
-  // history for the full "why". use_write_diag is always false by this
-  // point in the function (the diagnostic sweep already returned via
-  // uboot_style_sdhost_write_block above), so this call is dead code,
-  // unaffected by the signature change above it.
-  if use_write_diag {
-    let _ = sdhost_diag_dump_regs_post_cmd24();
-  }
-  // TEMPORARY (2026-09-19): diagnostic variant, see boot/sdcard_
-  // state.S's own header comment -- dumps SDEDM at the first few
-  // SDDATA writes, blocking/slow (raw polled UART, ~5 print blocks
-  // per call). BUG caught before shipping (QEMU regression run: 790
-  // diagnostic blocks fired, way beyond the 8-block sweep this is
-  // meant for, tanking every timing-sensitive network test downstream)
-  // -- this function runs for EVERY DharaFS write for the system's
-  // entire lifetime, not just the diagnostic sweep, so an unconditional
-  // call here is exactly the same class of mistake this project's own
-  // task #253 diagnostic (context_switch.S, since removed) and the SD
-  // read/write-post-PIO diagnostics above both already learned NOT to
-  // make. Gated on block_num instead, matching this project's own
-  // established, permanently-safe diagnostic sweep range (2100-2107,
-  // "never collide with real DharaFS/FAT32 data" -- see the 8-block
-  // sweep's own header comment in kernel_main.vani for why that range
-  // is safe) -- confines the overhead to exactly the intended test.
-  // (use_write_diag itself is now computed up near `addr` above, so it
-  // can also gate the pre/post-CMD24 instrumentation.)
   // 20th SD round (2026-09-24): tried masking IRQ/FIQ directly around
   // this call (matching Linux's own bcm2835_sdhost_write_block_pio,
   // which wraps its equivalent loop in local_irq_save/restore) -- a
@@ -7737,7 +7622,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // (dhruva_mutex_lock/_unlock, dhruva_prio_lock/_unlock, task_sleep_
   // ticks are the existing 5), not a direct asm call -- scoped out of
   // this round, see docs/TODO.md for the writeup and open question.
-  let fill_status: i64 = if use_write_diag { sdhost_fill_fifo_from_buffer_diag(buf, 128) } else { sdhost_fill_fifo_from_buffer(buf, sdcmd_write | (24 as u32), addr) };
+  let fill_status: i64 = sdhost_fill_fifo_from_buffer(buf, sdcmd_write | (24 as u32), addr);
   // 42nd SD round: command-phase outcomes (2/3/4) short-circuit BEFORE
   // ever running the FIFO-drain-to-empty poll, wait_transfer_complete,
   // or errs -- none of these reached the masked fill loop at all (the
