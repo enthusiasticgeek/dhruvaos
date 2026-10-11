@@ -22,9 +22,13 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding -O1 \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding -O1 \
   "${ROOT}/boot/stage0/stage0_main.c" -o "${BUILD_DIR}/stage0_main.o"
 
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding -O1 \
+  "${ROOT}/boot/stage0/sha256.c" -o "${BUILD_DIR}/stage0_sha256.o"
+
 arm-none-eabi-gcc -nostdlib -ffreestanding \
   -Wl,--gc-sections -Wl,-T,"${ROOT}/boot/stage0/link.ld" \
   "${BUILD_DIR}/stage0_entry.o" "${BUILD_DIR}/stage0_sdread.o" "${BUILD_DIR}/stage0_main.o" \
+  "${BUILD_DIR}/stage0_sha256.o" \
   -lgcc \
   -o "${BUILD_DIR}/stage0.elf"
 

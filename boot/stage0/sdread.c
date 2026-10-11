@@ -1,24 +1,36 @@
-/* Stage-0 A/B kernel-slot loader -- minimal, read-only, 1-bit-mode-only
- * SD driver.
+/* Stage-0 A/B kernel-slot loader -- minimal, 1-bit-mode-only SD driver.
+ * Read-only for kernel payload slots; the one exception is
+ * stage0_sd_write_block, added in Phase 3, used ONLY to persist the
+ * slot-state record's own updated attempt_count/generation/active_slot
+ * back to its 512-byte block (9216/9217) -- never used for payload
+ * data, which only the already-booted real kernel's `kernelupload`
+ * ever writes.
  *
  * Derived from boot/rpi1/uboot_sdhost_full.c (deleted as dead code in
  * commit a388164 once the round-42 SD wedge investigation it served
  * closed; recovered via `git show a388164^:boot/rpi1/uboot_sdhost_full.c`
- * for this purpose), itself a literal, self-contained C port of real
- * U-Boot's own SD bring-up (drivers/mmc/mmc.c, drivers/mmc/bcm2835_sdhost.c),
- * proven against this exact board in the round-34 real-HW investigation.
+ * for this purpose) and boot/rpi1/uboot_sdhost_write.c (recovered via
+ * `git show a388164^:boot/rpi1/uboot_sdhost_write.c`, write-path
+ * reference only -- stage0_sd_write_block below reuses this file's own
+ * stage0_send_cmd dispatcher instead of porting that file's own
+ * special-purpose CMD24 sequence verbatim, for one consistent code
+ * path instead of two different styles). Both are literal, self-
+ * contained C ports of real U-Boot's own SD bring-up (drivers/mmc/
+ * mmc.c, drivers/mmc/bcm2835_sdhost.c), proven against this exact
+ * board in the round-34/28 real-HW investigations.
  *
- * Deliberately stripped down from that file:
+ * Deliberately stripped down from the recovered bring-up file:
  *   - No CMD55+ACMD51 (SCR read) / ACMD6 (4-bit switch) negotiation.
  *     Stage-0 always stays in 1-bit mode -- the historically reliable
  *     mode across this project's entire 42-round SD saga; 4-bit mode is
  *     where every real write-side wedge this project ever hit lived,
- *     and stage-0 never writes at all, so there is nothing to gain and
- *     a proven class of real-HW risk to avoid by negotiating it.
- *   - No CMD24 (write) path, no read-back/memcmp self-check -- those
- *     belong to a one-shot bring-up TEST, not a loader. Stage-0's own
- *     checksum-verify-before-jump (stage0_main.c) is the real
- *     correctness gate for this use case.
+ *     and stage-0's own write use (the slot-state block only, 1 block
+ *     per boot) has nothing to gain from it.
+ *   - No read-back/memcmp self-check -- that belonged to a one-shot
+ *     bring-up TEST, not a loader. Stage-0's own checksum-verify-
+ *     before-jump (stage0_main.c) is the real correctness gate for
+ *     kernel payload data; the slot-state block protects itself with
+ *     its own CRC32 (stage0_main.c's parse_slot_state).
  *   - Split into a one-time stage0_sd_init() (bring-up through CMD7
  *     SELECT_CARD) and a reusable stage0_sd_read_block() callable many
  *     times afterward (a multi-MB slot is thousands of blocks -- redoing
@@ -72,6 +84,7 @@
 #define SDCMD_NO_RESPONSE 0x400u
 #define SDCMD_LONG_RESPONSE 0x200u
 #define SDCMD_READ_CMD   0x40u
+#define SDCMD_WRITE_CMD  0x80u
 #define SDCMD_CMD_MASK   0x3fu
 
 #define SDHSTS_CLEAR_MASK 0x7F8u
@@ -105,9 +118,11 @@ static inline void dsb_barrier(void) {
 }
 static inline unsigned int mmio_r(unsigned int addr) {
     unsigned int v = *(volatile unsigned int *)(unsigned long)addr;
+    dsb_barrier();
     return v;
 }
 static inline void mmio_w(unsigned int addr, unsigned int val) {
+    dsb_barrier();
     *(volatile unsigned int *)(unsigned long)addr = val;
 }
 static unsigned int now_us(void) { return mmio_r(TIMER_CLO_ADDR); }
@@ -151,7 +166,7 @@ static int s_is_sdhc;
 static void stage0_send_cmd(unsigned int cmd_idx, unsigned int arg,
                              int resp_present, int resp_136, int resp_busy,
                              unsigned int data_blksz, unsigned int data_blocks,
-                             int is_read, int allow_crc7_tolerance,
+                             int is_read, int is_write, int allow_crc7_tolerance,
                              int ignore_fail_flag,
                              struct cmd_result *out) {
     unsigned int edm, fsm, sdcmd, sdhsts, t0;
@@ -204,6 +219,7 @@ static void stage0_send_cmd(unsigned int cmd_idx, unsigned int arg,
         if (resp_busy) sdcmd |= SDCMD_BUSYWAIT;
     }
     if (is_read) sdcmd |= SDCMD_READ_CMD;
+    if (is_write) sdcmd |= SDCMD_WRITE_CMD;
 
     mmio_w(SDCMD_ADDR, sdcmd | SDCMD_NEW_FLAG);
 
@@ -338,7 +354,7 @@ int stage0_sd_init(void) {
 
     stage0_reset_and_ident_clock();
 
-    stage0_send_cmd(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, &r);
+    stage0_send_cmd(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, &r);
     if (r.err != 0) return -1;
 
     /* FIXED vs. the recovered file (which also required the RSP0 echo
@@ -353,7 +369,7 @@ int stage0_sd_init(void) {
      * production's permissive behavior here, rather than the
      * recovered file's own stricter check, is what the already-proven
      * reference actually does. */
-    stage0_send_cmd(8, 0x1AAu, 1, 0, 0, 0, 0, 0, 0, 1, &r);
+    stage0_send_cmd(8, 0x1AAu, 1, 0, 0, 0, 0, 0, 0, 0, 1, &r);
     if (r.err != 0) return -2;
 
     /* FIXED vs. the recovered file, matching kernel_main.vani's own
@@ -368,9 +384,9 @@ int stage0_sd_init(void) {
      * non-fatal. */
     retry = 1000;
     for (;;) {
-        stage0_send_cmd(55, 0, 1, 0, 0, 0, 0, 0, 0, 1, &r);
+        stage0_send_cmd(55, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, &r);
         if (r.err != 0) return -3;
-        stage0_send_cmd(41, 0x00FF8000u | OCR_HCS, 1, 0, 0, 0, 0, 0, 1, 1, &r);
+        stage0_send_cmd(41, 0x00FF8000u | OCR_HCS, 1, 0, 0, 0, 0, 0, 0, 1, 1, &r);
         if (r.err != 0) return -3;
         if (r.response[0] & OCR_BUSY) break;
         if (retry == 0) break;
@@ -383,17 +399,17 @@ int stage0_sd_init(void) {
      * recovered uboot_sdhost_full.c never captured this. */
     s_is_sdhc = (r.response[0] & OCR_HCS) ? 1 : 0;
 
-    stage0_send_cmd(2, 0, 1, 1, 0, 0, 0, 0, 0, 0, &r);
+    stage0_send_cmd(2, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, &r);
     if (r.err != 0) return -4;
 
-    stage0_send_cmd(3, 0, 1, 0, 0, 0, 0, 0, 0, 0, &r);
+    stage0_send_cmd(3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, &r);
     if (r.err != 0) return -5;
     s_rca = (r.response[0] >> 16) & 0xFFFFu;
 
-    stage0_send_cmd(9, s_rca << 16, 1, 1, 0, 0, 0, 0, 0, 0, &r);
+    stage0_send_cmd(9, s_rca << 16, 1, 1, 0, 0, 0, 0, 0, 0, 0, &r);
     if (r.err != 0) return -6;
 
-    stage0_send_cmd(7, s_rca << 16, 1, 0, 1, 0, 0, 0, 0, 0, &r);
+    stage0_send_cmd(7, s_rca << 16, 1, 0, 1, 0, 0, 0, 0, 0, 0, &r);
     if (r.err != 0) return -7;
 
     /* Data-transfer clock + SDHCFG, 1-bit mode always (no ACMD6, no
@@ -419,7 +435,7 @@ int stage0_sd_read_block(unsigned int block_num, void *buf) {
     long long room_wait_iters;
     unsigned int sdhsts2;
 
-    stage0_send_cmd(SDCMD_READ_CMD | 17, addr, 1, 0, 0, 512, 1, 1, 0, 0, &rr);
+    stage0_send_cmd(17, addr, 1, 0, 0, 512, 1, 1, 0, 0, 0, &rr);
     if (rr.err != 0) return -9;
 
     copy_words = 128;
@@ -466,4 +482,83 @@ int stage0_sd_read_block(unsigned int block_num, void *buf) {
     if (sdhsts2 != 0) return -9;
 
     return 0;
+}
+
+/* Writes exactly one 512-byte block from buf. Phase 3 addition --
+ * used ONLY for the slot-state record (1 block, once per boot, to
+ * persist an incremented attempt_count/bumped generation/possibly-
+ * flipped active_slot before jumping) -- see this file's own header
+ * comment. Mirrors stage0_sd_read_block's own shape (CMD24 instead of
+ * CMD17, filling SDDATA instead of draining it), reusing the same
+ * stage0_send_cmd dispatcher rather than porting boot/rpi1/uboot_
+ * sdhost_write.c's own special-purpose sequence verbatim. */
+int stage0_sd_write_block(unsigned int block_num, const void *buf) {
+    struct cmd_result rr;
+    const unsigned int *wbuf = (const unsigned int *)buf;
+    unsigned int addr = s_is_sdhc ? block_num : (block_num * 512u);
+    int fill_words;
+    long long room_wait_iters;
+    unsigned int sdhsts2;
+
+    stage0_send_cmd(24, addr, 1, 0, 0, 512, 1, 0, 1, 0, 0, &rr);
+    if (rr.err != 0) return -9;
+
+    fill_words = 128;
+    room_wait_iters = 0;
+    while (fill_words > 0) {
+        unsigned int edm = mmio_r(SDEDM_ADDR);
+        int fill = (int)((edm >> 4) & 0x1Fu);
+        int room = 16 - fill;
+        int burst_words = (SDDATA_FIFO_PIO_BURST < fill_words) ? SDDATA_FIFO_PIO_BURST : fill_words;
+        int words;
+        if (room < burst_words) {
+            room_wait_iters = room_wait_iters + 1;
+            if (room_wait_iters > 20000000LL) return -9;
+            continue;
+        }
+        words = room;
+        if (words > fill_words) words = fill_words;
+        fill_words = fill_words - words;
+        while (words > 0) {
+            mmio_w(SDDATA_ADDR, *wbuf);
+            wbuf = wbuf + 1;
+            words = words - 1;
+        }
+    }
+
+    sdhsts2 = mmio_r(SDHSTS_ADDR);
+    if (sdhsts2 & (0x20u | 0x10u | 0x08u | 0x40u | 0x80u)) return -9;
+
+    {
+        unsigned int t0 = now_us();
+        for (;;) {
+            unsigned int edm = mmio_r(SDEDM_ADDR);
+            unsigned int fsm = edm & SDEDM_FSM_MASK;
+            if (fsm == SDEDM_FSM_IDENTMODE || fsm == SDEDM_FSM_DATAMODE) break;
+            if (fsm == SDEDM_FSM_READWAIT || fsm == SDEDM_FSM_WRITESTART1 || fsm == SDEDM_FSM_READDATA) {
+                mmio_w(SDEDM_ADDR, edm | SDEDM_FORCE_DATA_MODE_BIT);
+                break;
+            }
+            if (elapsed_at_least(t0, TIMEOUT_US)) return -9;
+        }
+    }
+
+    sdhsts2 = mmio_r(SDHSTS_ADDR) & SDHSTS_ERROR_MASK;
+    mmio_w(SDHSTS_ADDR, sdhsts2);
+    if (sdhsts2 != 0) return -9;
+
+    return 0;
+}
+
+/* -nostdlib means no libc memcpy -- GCC's optimizer still recognizes
+ * struct-assignment and array-copy patterns in stage0_main.c and
+ * emits calls to it regardless. Trivial byte-wise implementation,
+ * correctness over speed (this only ever copies a 512-byte block
+ * buffer or small structs, never performance-critical). */
+void *memcpy(void *dest, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned long i;
+    for (i = 0; i < n; i = i + 1) d[i] = s[i];
+    return dest;
 }
