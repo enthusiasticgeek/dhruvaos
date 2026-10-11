@@ -58,16 +58,27 @@ mkdir -p "${BUILD_DIR}"
 # with its own real, MMU-guard-page-protected 4096-byte stack via
 # dhruva_alloc_stack_guarded -- see that function's own comment in
 # boot/rpi1/runtime_stubs.c) each deserve their own gate too, but
-# kernel_main.vani's real size (~27K lines) makes one `stack-depth`
-# pass here take ~40s -- gating all 4 dynamic tasks (task_custom_demo/
-# task_mutex_demo_low/task_mutex_demo_high/task_fsq) plus the 6 fixed
-# built-in ones (task_a..task_f) would add several minutes to every
-# single build. Deliberately left as a documented gap rather than
-# silently skipped -- run manually before any round that adds real
-# depth to one of those task bodies:
+# gating all 4 dynamic tasks (task_custom_demo/task_mutex_demo_low/
+# task_mutex_demo_high/task_fsq) plus the 6 fixed built-in ones
+# (task_a..task_f) would add real cost to every single build.
+# Deliberately left as a documented gap rather than silently skipped --
+# run manually before any round that adds real depth to one of those
+# task bodies:
 #   vanic stack-depth kernel/kernel_main.vani --entry=<task_fn> --max=3584 (dynamic tasks, 4096-byte stack minus margin)
-"${VANIC}" stack-depth "${ROOT}/kernel/kernel_main.vani" \
-  --entry=kernel_main --max=14336
+#
+# PERFORMANCE (2026-10-11): this gate used to run here as its own
+# `vanic stack-depth` invocation, a wholly separate process from the
+# `vanic emit` call further below -- each one independently re-paid
+# the full lex+parse+typecheck(+SMT) cost for the exact same file.
+# `emit`'s own `--stack-depth-entry=`/`--stack-depth-max=` flags (added
+# the same day, once that double cost was identified) run this SAME
+# gate check against the IR `emit` already produced for itself, so the
+# check and the real build output now come from ONE `vanic` invocation
+# -- see that call, moved up to here so a budget failure is still
+# caught before any of the C-file compilation below runs.
+"${VANIC}" emit "${ROOT}/kernel/kernel_main.vani" --backend=llvm \
+  --stack-depth-entry=kernel_main --stack-depth-max=14336 \
+  -o "${BUILD_DIR}/kernel_main.ll"
 
 # ASM safety audit gate, added after a from-scratch full-codebase audit
 # (test/asm_safety_audit.py) found 2 real #[stack_cost] underestimates
@@ -304,8 +315,11 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/uboot_sdhost_full.c" -o "${BUILD_DIR}/uboot_sdhost_full.o"
 
-"${VANIC}" emit "${ROOT}/kernel/kernel_main.vani" --backend=llvm \
-  -o "${BUILD_DIR}/kernel_main.ll"
+# kernel_main.ll was already produced by the merged `vanic emit
+# --stack-depth-max=...` call near the top of this script -- see that
+# call site's own comment for why the separate `stack-depth`
+# invocation that used to precede it (and the separate `emit` that
+# used to follow, right here) are both gone now.
 
 # ROUND 2026-09-18 (task #253 Phase 3): explicit -O1, not llc's own
 # default (-O2) -- found live, via direct disassembly, not guessed:

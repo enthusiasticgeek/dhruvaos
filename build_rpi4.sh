@@ -53,8 +53,13 @@ mkdir -p "${BUILD_DIR}"
 # QEMU or real hardware. Bump both this number and link.ld's own
 # allocation together if a real budget increase is ever needed; don't
 # just raise one to silence the other.
-"${VANIC}" stack-depth "${ROOT}/kernel/kernel_main_rpi4.vani" \
-  --entry=kmain_rpi4_vani --max=57344
+#
+# PERFORMANCE (2026-10-11): this gate now rides along on the `vanic
+# emit` call further down (via `--stack-depth-entry=`/
+# `--stack-depth-max=`) instead of running as its own separate `vanic
+# stack-depth` process here -- that used to pay the full
+# lex+parse+typecheck(+SMT) cost twice for the same file. See that
+# call site's own comment.
 
 "${CC}" -c -mgeneral-regs-only -ffreestanding \
   "${ROOT}/boot/rpi4/boot.S" -o "${BUILD_DIR}/rpi4_boot.o"
@@ -102,6 +107,7 @@ mkdir -p "${BUILD_DIR}"
   "${ROOT}/boot/rpi4/runtime_stubs_rpi4.c" -o "${BUILD_DIR}/rpi4_runtime_stubs.o"
 
 "${VANIC}" emit "${ROOT}/kernel/kernel_main_rpi4.vani" --backend=llvm \
+  --stack-depth-entry=kmain_rpi4_vani --stack-depth-max=57344 \
   -o "${BUILD_DIR}/kernel_main_rpi4.ll"
 
 llc -mtriple="${TRIPLE}" -filetype=obj \
