@@ -2795,6 +2795,28 @@ extern "C" fn usb_wifi_fw_chunk_get() -> mut ref i64;
 extern "C" fn usb_wifi_fw_upload_len_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_fw_upload_len_set(value: u32) -> u32;
+// A/B kernel slots (task #308): persistent scratch for `kernelupload`/
+// `kernelslot` -- see boot/kernelupload_state.S's own header comment.
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_block_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_sha_ctx_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_total_len_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_total_len_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_target_slot_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_target_slot_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_active_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_active_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_chunk_decode_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelslot_record_buf_get() -> mut ref i64;
 // Task #164 follow-up: bulk endpoint/toggle state for real 802.11
 // frame TX/RX -- see boot/usb_wifi_state.S's own comment.
 #[stack_cost(bytes=1)]
@@ -29790,6 +29812,639 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
   return 0;
 }
 
+// === A/B kernel slots (task #308): kernelupload/kernelslot ===
+//
+// Block-map/record-layout constants mirror test/kernel_slot_layout.py
+// (the single source of truth) and boot/stage0/stage0_main.c's own
+// matching parse/build -- three independent implementations of the
+// SAME fixed, documented wire format (Python host tool, C stage-0
+// loader, this file's own production-kernel side), not three
+// different formats. See this file's own reservation comment next to
+// rtl8188cu_fw_raw_sd_base_block for the raw block ranges.
+
+fn kernelslot_state_block_a() -> i64 { return 9216; }
+fn kernelslot_state_block_b() -> i64 { return 9217; }
+fn kernelslot_a_base_block() -> i64 { return 10240; }
+fn kernelslot_b_base_block() -> i64 { return 22528; }
+fn kernelslot_size_bytes() -> i64 { return 12288 * 512; }
+
+// Standard IEEE 802.3/zlib CRC32 (reflected, poly 0xEDB88320) -- matches
+// test/kernel_slot_layout.py's zlib.crc32 and boot/stage0/stage0_main.c's
+// own crc32_bytes byte-for-byte; a third from-scratch implementation of
+// one completely standard algorithm (every language this record
+// crosses needs its own -- there's no shared library to link against
+// either stage-0 or the host tool).
+fn kernelslot_crc32(buf: mut ref i64, buf_len: i64) -> u32 {
+  let crc: u32 = 4294967295 as u32;
+  let i: i64 = 0;
+  while i < buf_len {
+    crc = crc ^ (buf_read_byte(buf, i as u32) as u32);
+    let j: i64 = 0;
+    while j < 8 {
+      if (crc & (1 as u32)) != (0 as u32) {
+        crc = (crc >> (1 as u32)) ^ (3988292384 as u32);
+      } else {
+        crc = crc >> (1 as u32);
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return crc ^ (4294967295 as u32);
+}
+
+// Flattened: no nested struct (KernelSlotRecord embedding another
+// struct type is untested in this codebase, deliberately avoided).
+// `valid`/`chosen_block` are lookup metadata, not part of the on-disk
+// record itself -- kernelslot_build below only serializes the other
+// 11 fields.
+struct KernelSlotRecord {
+  valid: i64,
+  chosen_block: i64,
+  generation: u32,
+  active_slot: u8,
+  preferred_slot: u8,
+  attempt_count: u32,
+  bootlimit: u32,
+  slot_a_ready: u8,
+  slot_b_ready: u8,
+  slot_a_len: u32,
+  slot_b_len: u32,
+  slot_a_sha256: [u8; 32],
+  slot_b_sha256: [u8; 32],
+}
+
+fn kernelslot_record_crc_valid(raw: mut ref i64) -> i64 {
+  let magic: u32 = buf_read_u32_le(raw, 0);
+  if magic != (0x44485342 as u32) {
+    return 0;
+  }
+  let crc_stored: u32 = buf_read_u32_le(raw, 96);
+  let crc_actual: u32 = kernelslot_crc32(raw, 96);
+  if crc_actual != crc_stored {
+    return 0;
+  }
+  return 1;
+}
+
+// Only meaningful when kernelslot_record_crc_valid(raw) == 1 -- caller
+// checks first, same two-step shape as this file's other raw-block
+// parsers.
+fn kernelslot_parse(raw: mut ref i64, chosen_block: i64) -> KernelSlotRecord {
+  let sa: [u8; 32] = [0 as u8; 32];
+  let sb: [u8; 32] = [0 as u8; 32];
+  let i: i64 = 0;
+  while i < 32 {
+    sa[i] = buf_read_byte(raw, (32 + i) as u32) as u8;
+    sb[i] = buf_read_byte(raw, (64 + i) as u32) as u8;
+    i = i + 1;
+  }
+  return KernelSlotRecord {
+    valid: 1,
+    chosen_block: chosen_block,
+    generation: buf_read_u32_le(raw, 4),
+    active_slot: buf_read_byte(raw, 8) as u8,
+    preferred_slot: buf_read_byte(raw, 9) as u8,
+    attempt_count: buf_read_u32_le(raw, 12),
+    bootlimit: buf_read_u32_le(raw, 16),
+    slot_a_ready: buf_read_byte(raw, 20) as u8,
+    slot_b_ready: buf_read_byte(raw, 21) as u8,
+    slot_a_len: buf_read_u32_le(raw, 24),
+    slot_b_len: buf_read_u32_le(raw, 28),
+    slot_a_sha256: sa,
+    slot_b_sha256: sb,
+  };
+}
+
+fn kernelslot_build(rec: ref KernelSlotRecord, out: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 512 {
+    let _ = buf_write_byte(out, i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let _ = buf_write_u32_le(out, 0, 0x44485342 as u32);
+  let _ = buf_write_u32_le(out, 4, rec.generation);
+  let _ = buf_write_byte(out, 8, rec.active_slot as u32);
+  let _ = buf_write_byte(out, 9, rec.preferred_slot as u32);
+  let _ = buf_write_u32_le(out, 12, rec.attempt_count);
+  let _ = buf_write_u32_le(out, 16, rec.bootlimit);
+  let _ = buf_write_byte(out, 20, rec.slot_a_ready as u32);
+  let _ = buf_write_byte(out, 21, rec.slot_b_ready as u32);
+  let _ = buf_write_u32_le(out, 24, rec.slot_a_len);
+  let _ = buf_write_u32_le(out, 28, rec.slot_b_len);
+  let j: i64 = 0;
+  while j < 32 {
+    let _ = buf_write_byte(out, (32 + j) as u32, rec.slot_a_sha256[j] as u32);
+    let _ = buf_write_byte(out, (64 + j) as u32, rec.slot_b_sha256[j] as u32);
+    j = j + 1;
+  }
+  let crc: u32 = kernelslot_crc32(out, 96);
+  let _ = buf_write_u32_le(out, 96, crc);
+  return 0;
+}
+
+// Reads both ping-pong copies, returns the CRC-valid one with the
+// higher generation (matching boot/stage0/stage0_main.c's own
+// identical tie-break). rec.valid==0 if neither copy is CRC-valid --
+// callers must check this before trusting any other field.
+fn kernelslot_lookup() -> KernelSlotRecord {
+  let buf: mut ref i64 = kernelslot_record_buf_get();
+
+  let status_a: i64 = sdhost_read_block(kernelslot_state_block_a(), buf);
+  let valid_a: i64 = if status_a == 0 { kernelslot_record_crc_valid(buf) } else { 0 };
+  let rec_a: KernelSlotRecord = kernelslot_parse(buf, kernelslot_state_block_a());
+
+  let status_b: i64 = sdhost_read_block(kernelslot_state_block_b(), buf);
+  let valid_b: i64 = if status_b == 0 { kernelslot_record_crc_valid(buf) } else { 0 };
+  let rec_b: KernelSlotRecord = kernelslot_parse(buf, kernelslot_state_block_b());
+
+  if (valid_a == 1) && (valid_b == 1) {
+    if rec_a.generation >= rec_b.generation {
+      return rec_a;
+    } else {
+      return rec_b;
+    }
+  }
+  if valid_a == 1 {
+    return rec_a;
+  }
+  if valid_b == 1 {
+    return rec_b;
+  }
+  let invalid: KernelSlotRecord = rec_a;
+  invalid.valid = 0;
+  return invalid;
+}
+
+fn kernelslot_stale_block(rec: ref KernelSlotRecord) -> i64 {
+  if rec.chosen_block == kernelslot_state_block_a() {
+    return kernelslot_state_block_b();
+  }
+  return kernelslot_state_block_a();
+}
+
+fn kernelslot_write_record(rec: ref KernelSlotRecord, block_num: i64) -> i64 {
+  let buf: mut ref i64 = kernelslot_record_buf_get();
+  let _ = kernelslot_build(rec, buf);
+  return sdhost_write_block(block_num, buf);
+}
+
+// Persistent incremental SHA-256 context for `kernelupload chunk` --
+// serialized into kernelupload_sha_ctx's 112-byte scratch between
+// separate shell-command invocations (vani-crypto-hash's own Sha256Ctx
+// only lives as long as a single function call otherwise). carry_len/
+// total_len stored as their low 32 bits only -- safe here since one
+// kernelupload session is bounded by the 6MiB slot size, nowhere near
+// either field's full 64-bit range.
+fn kernelupload_ctx_load() -> Sha256Ctx {
+  let buf: mut ref i64 = kernelupload_sha_ctx_get();
+  let h: [u32; 8] = [0 as u32; 8];
+  let i: i64 = 0;
+  while i < 8 {
+    h[i] = buf_read_u32_le(buf, i * 4);
+    i = i + 1;
+  }
+  let carry: [u8; 64] = [0 as u8; 64];
+  let j: i64 = 0;
+  while j < 64 {
+    carry[j] = buf_read_byte(buf, (32 + j) as u32) as u8;
+    j = j + 1;
+  }
+  let carry_len: i64 = buf_read_u32_le(buf, 96) as i64;
+  let total_len: u64 = buf_read_u32_le(buf, 100) as u64;
+  return Sha256Ctx { h: h, carry: carry, carry_len: carry_len, total_len: total_len };
+}
+
+fn kernelupload_ctx_store(ctx: ref Sha256Ctx) -> i64 {
+  let buf: mut ref i64 = kernelupload_sha_ctx_get();
+  let i: i64 = 0;
+  while i < 8 {
+    let _ = buf_write_u32_le(buf, i * 4, ctx.h[i]);
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < 64 {
+    let _ = buf_write_byte(buf, (32 + j) as u32, ctx.carry[j] as u32);
+    j = j + 1;
+  }
+  let _ = buf_write_u32_le(buf, 96, ctx.carry_len as u32);
+  let _ = buf_write_u32_le(buf, 100, ctx.total_len as u32);
+  return 0;
+}
+
+// `kernelupload chunk <hex>` / `kernelupload commit <len> <sha256>` /
+// `kernelupload abort` -- same 48-byte/96-hex-char per-line cap as
+// `wifikey chunk` (shared 128-byte shell line buffer, see
+// shell_dispatch_wifikey's own comment). Unlike wifikey (buffers the
+// whole blob in a 16KB bss buffer -- a multi-MB kernel image doesn't
+// fit in this project's 768KB heap, let alone .bss), this streams:
+// accumulate into one 512-byte block buffer, flush+hash every time it
+// fills, never holding more than one block of the image in memory.
+fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  if dharafs_user_get_uid() != (0 as u32) {
+    let _ = uart_puts("kernelupload: permission denied (root only)\n");
+    return 0;
+  }
+  if cmd_end >= line_len {
+    let _ = uart_puts("usage: kernelupload chunk <hex> | kernelupload commit <len> <sha256> | kernelupload abort\n");
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "abort") == 1 {
+    let _ = kernelupload_active_set(0 as u32);
+    let _ = kernelupload_total_len_set(0 as u32);
+    let _ = uart_puts("ok\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "chunk") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: kernelupload chunk <hex, up to 96 hex chars/48 bytes per call>\n");
+      return 0;
+    }
+    let hex_start: i64 = sub_end + 1;
+    let hex_end: i64 = shell_find_space(line_buf, hex_start, line_len);
+    let hex_len: i64 = hex_end - hex_start;
+    if (hex_len <= 0) || ((hex_len % 2) != 0) {
+      let _ = uart_puts("kernelupload: chunk must be a non-empty, even-length hex string\n");
+      return 0;
+    }
+    let byte_len: i64 = hex_len / 2;
+    if byte_len > (48 as i64) {
+      let _ = uart_puts("kernelupload: chunk too large (max 48 bytes/96 hex chars per call)\n");
+      return 0;
+    }
+
+    if kernelupload_active_get() == (0 as u32) {
+      let lookup: KernelSlotRecord = kernelslot_lookup();
+      if lookup.valid != 1 {
+        let _ = uart_puts("kernelupload: no valid slot-state record found -- card not seeded?\n");
+        return 0;
+      }
+      let target: u32 = if lookup.active_slot == (0 as u8) { 1 as u32 } else { 0 as u32 };
+      let _ = kernelupload_target_slot_set(target);
+      let _ = kernelupload_total_len_set(0 as u32);
+      let fresh_ctx: Sha256Ctx = sha256_init();
+      let _ = kernelupload_ctx_store(ref fresh_ctx);
+      let _ = kernelupload_active_set(1 as u32);
+      let _ = uart_puts("kernelupload: starting fresh upload into slot ");
+      let _ = uart_puts(if target == (0 as u32) { "A" } else { "B" });
+      let _ = uart_puts("\n");
+    }
+
+    let decode_buf: mut ref i64 = kernelupload_chunk_decode_buf_get();
+    let parse_status: i64 = shell_parse_hex_bytes(line_buf, hex_start, hex_end, decode_buf, byte_len);
+    if parse_status != 0 {
+      let _ = uart_puts("kernelupload: invalid hex\n");
+      return 0;
+    }
+
+    let total_len: i64 = kernelupload_total_len_get() as i64;
+    let target_slot: u32 = kernelupload_target_slot_get();
+    let base_block: i64 = if target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() };
+    let block_buf: mut ref i64 = kernelupload_block_buf_get();
+    let ctx: Sha256Ctx = kernelupload_ctx_load();
+
+    let bi: i64 = 0;
+    while bi < byte_len {
+      let off_in_block: i64 = total_len % 512;
+      let _ = buf_write_byte(block_buf, off_in_block as u32, buf_read_byte(decode_buf, bi as u32));
+      total_len = total_len + 1;
+      bi = bi + 1;
+      if (total_len % 512) == 0 {
+        let block_index: i64 = (total_len / 512) - 1;
+        let wstatus: i64 = sdhost_write_block(base_block + block_index, block_buf);
+        if wstatus != 0 {
+          let _ = uart_puts("kernelupload: SD write failed, aborting\n");
+          let _ = kernelupload_active_set(0 as u32);
+          return 0;
+        }
+        let chunk1: [u8; 256] = zero256_bytes();
+        let chunk2: [u8; 256] = zero256_bytes();
+        let ci: i64 = 0;
+        while ci < 256 {
+          chunk1[ci] = buf_read_byte(block_buf, ci as u32) as u8;
+          chunk2[ci] = buf_read_byte(block_buf, (256 + ci) as u32) as u8;
+          ci = ci + 1;
+        }
+        ctx = sha256_update(ref ctx, mut ref chunk1, 256);
+        ctx = sha256_update(ref ctx, mut ref chunk2, 256);
+      }
+    }
+    let _ = kernelupload_ctx_store(ref ctx);
+    let _ = kernelupload_total_len_set(total_len as u32);
+    let _ = uart_puts("ok, ");
+    let _ = uart_put_i64(total_len);
+    let _ = uart_puts(" bytes accumulated\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "commit") == 1 {
+    if kernelupload_active_get() == (0 as u32) {
+      let _ = uart_puts("kernelupload: nothing to commit (no chunks uploaded yet)\n");
+      return 0;
+    }
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: kernelupload commit <total_len_bytes> <sha256_hex>\n");
+      return 0;
+    }
+    let len_start: i64 = sub_end + 1;
+    let len_end: i64 = shell_find_space(line_buf, len_start, line_len);
+    if len_end >= line_len {
+      let _ = uart_puts("usage: kernelupload commit <total_len_bytes> <sha256_hex>\n");
+      return 0;
+    }
+    let claimed_len: i64 = shell_parse_decimal(line_buf, len_start, len_end);
+    let actual_len: i64 = kernelupload_total_len_get() as i64;
+    if (claimed_len <= 0) || (claimed_len != actual_len) {
+      let _ = uart_puts("kernelupload: total_len mismatch or invalid (claimed ");
+      let _ = uart_put_i64(claimed_len);
+      let _ = uart_puts(", received ");
+      let _ = uart_put_i64(actual_len);
+      let _ = uart_puts(") -- not committing\n");
+      return 0;
+    }
+    if claimed_len > kernelslot_size_bytes() {
+      let _ = uart_puts("kernelupload: total_len exceeds slot size, not committing\n");
+      let _ = kernelupload_active_set(0 as u32);
+      return 0;
+    }
+
+    let sha_start: i64 = len_end + 1;
+    let sha_end: i64 = shell_find_space(line_buf, sha_start, line_len);
+    if (sha_end - sha_start) != 64 {
+      let _ = uart_puts("kernelupload: expected a 64-char (32-byte) sha256 hex digest\n");
+      return 0;
+    }
+    let claimed_digest: mut ref i64 = kernelupload_chunk_decode_buf_get();
+    let hex_status: i64 = shell_parse_hex_bytes(line_buf, sha_start, sha_end, claimed_digest, 32);
+    if hex_status != 0 {
+      let _ = uart_puts("kernelupload: invalid sha256 hex\n");
+      return 0;
+    }
+
+    let target_slot: u32 = kernelupload_target_slot_get();
+    let base_block: i64 = if target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() };
+    let block_buf: mut ref i64 = kernelupload_block_buf_get();
+    let ctx: Sha256Ctx = kernelupload_ctx_load();
+    let partial_bytes: i64 = actual_len % 512;
+
+    if partial_bytes != 0 {
+      let pad_i: i64 = partial_bytes;
+      while pad_i < 512 {
+        let _ = buf_write_byte(block_buf, pad_i as u32, 0 as u32);
+        pad_i = pad_i + 1;
+      }
+      let block_index: i64 = actual_len / 512;
+      let wstatus: i64 = sdhost_write_block(base_block + block_index, block_buf);
+      if wstatus != 0 {
+        let _ = uart_puts("kernelupload: final block SD write failed\n");
+        let _ = kernelupload_active_set(0 as u32);
+        return 0;
+      }
+      let pchunk1: [u8; 256] = zero256_bytes();
+      let pchunk2: [u8; 256] = zero256_bytes();
+      let pci: i64 = 0;
+      while pci < 256 {
+        pchunk1[pci] = buf_read_byte(block_buf, pci as u32) as u8;
+        pci = pci + 1;
+      }
+      let first_n: i64 = if partial_bytes < 256 { partial_bytes } else { 256 };
+      ctx = sha256_update(ref ctx, mut ref pchunk1, first_n);
+      if partial_bytes > 256 {
+        let pcj: i64 = 0;
+        while pcj < 256 {
+          pchunk2[pcj] = buf_read_byte(block_buf, (256 + pcj) as u32) as u8;
+          pcj = pcj + 1;
+        }
+        ctx = sha256_update(ref ctx, mut ref pchunk2, partial_bytes - 256);
+      }
+    }
+    let uploaded_digest: [u8; 32] = sha256_finalize(ref ctx);
+
+    let digest_cmp_buf: mut ref i64 = dharafs_sd_scratch_get();
+    let di: i64 = 0;
+    while di < 32 {
+      let _ = buf_write_byte(digest_cmp_buf, di as u32, uploaded_digest[di] as u32);
+      di = di + 1;
+    }
+    if sha256_bytes_equal(digest_cmp_buf, claimed_digest, 32) != 1 {
+      let _ = uart_puts("kernelupload: uploaded data does not match the claimed sha256 -- not committing\n");
+      let _ = kernelupload_active_set(0 as u32);
+      return 0;
+    }
+
+    // Readback verify: re-read every written block straight from SD
+    // and recompute SHA-256 over THAT, independent of the upload-time
+    // hash above -- catches a write-cycle fault the upload-time hash
+    // alone can't.
+    let readback_ctx: Sha256Ctx = sha256_init();
+    let nblocks: i64 = (actual_len + 511) / 512;
+    let rb: i64 = 0;
+    while rb < nblocks {
+      let rstatus: i64 = sdhost_read_block(base_block + rb, block_buf);
+      if rstatus != 0 {
+        let _ = uart_puts("kernelupload: readback failed, not committing\n");
+        let _ = kernelupload_active_set(0 as u32);
+        return 0;
+      }
+      let is_last: i64 = if (rb + 1) == nblocks { 1 } else { 0 };
+      let valid_in_block: i64 = if is_last == 1 { (if partial_bytes == 0 { 512 } else { partial_bytes }) } else { 512 };
+      let rchunk1: [u8; 256] = zero256_bytes();
+      let rchunk2: [u8; 256] = zero256_bytes();
+      let rci: i64 = 0;
+      while rci < 256 {
+        rchunk1[rci] = buf_read_byte(block_buf, rci as u32) as u8;
+        rci = rci + 1;
+      }
+      let rfirst_n: i64 = if valid_in_block < 256 { valid_in_block } else { 256 };
+      readback_ctx = sha256_update(ref readback_ctx, mut ref rchunk1, rfirst_n);
+      if valid_in_block > 256 {
+        let rcj: i64 = 0;
+        while rcj < 256 {
+          rchunk2[rcj] = buf_read_byte(block_buf, (256 + rcj) as u32) as u8;
+          rcj = rcj + 1;
+        }
+        readback_ctx = sha256_update(ref readback_ctx, mut ref rchunk2, valid_in_block - 256);
+      }
+      rb = rb + 1;
+    }
+    let readback_digest: [u8; 32] = sha256_finalize(ref readback_ctx);
+    let readback_cmp_buf: mut ref i64 = dharafs_sd_scratch_get();
+    let rdi: i64 = 0;
+    while rdi < 32 {
+      let _ = buf_write_byte(readback_cmp_buf, rdi as u32, readback_digest[rdi] as u32);
+      rdi = rdi + 1;
+    }
+    if sha256_bytes_equal(readback_cmp_buf, claimed_digest, 32) != 1 {
+      let _ = uart_puts("kernelupload: readback sha256 mismatch (write-cycle fault?) -- not committing\n");
+      let _ = kernelupload_active_set(0 as u32);
+      return 0;
+    }
+
+    let lookup: KernelSlotRecord = kernelslot_lookup();
+    if lookup.valid != 1 {
+      let _ = uart_puts("kernelupload: slot-state record vanished mid-commit (unexpected)\n");
+      let _ = kernelupload_active_set(0 as u32);
+      return 0;
+    }
+    let digest_arr: [u8; 32] = [0 as u8; 32];
+    let dgi: i64 = 0;
+    while dgi < 32 {
+      digest_arr[dgi] = buf_read_byte(claimed_digest, dgi as u32) as u8;
+      dgi = dgi + 1;
+    }
+    let stale: i64 = kernelslot_stale_block(ref lookup);
+    let new_rec: KernelSlotRecord = if target_slot == (0 as u32) {
+      KernelSlotRecord {
+        valid: 1, chosen_block: lookup.chosen_block,
+        generation: lookup.generation + 1,
+        active_slot: lookup.active_slot,
+        preferred_slot: lookup.preferred_slot,
+        attempt_count: lookup.attempt_count,
+        bootlimit: lookup.bootlimit,
+        slot_a_ready: 1 as u8,
+        slot_b_ready: lookup.slot_b_ready,
+        slot_a_len: actual_len as u32,
+        slot_b_len: lookup.slot_b_len,
+        slot_a_sha256: digest_arr,
+        slot_b_sha256: lookup.slot_b_sha256,
+      }
+    } else {
+      KernelSlotRecord {
+        valid: 1, chosen_block: lookup.chosen_block,
+        generation: lookup.generation + 1,
+        active_slot: lookup.active_slot,
+        preferred_slot: lookup.preferred_slot,
+        attempt_count: lookup.attempt_count,
+        bootlimit: lookup.bootlimit,
+        slot_a_ready: lookup.slot_a_ready,
+        slot_b_ready: 1 as u8,
+        slot_a_len: lookup.slot_a_len,
+        slot_b_len: actual_len as u32,
+        slot_a_sha256: lookup.slot_a_sha256,
+        slot_b_sha256: digest_arr,
+      }
+    };
+    let wstatus2: i64 = kernelslot_write_record(ref new_rec, stale);
+    let _ = kernelupload_active_set(0 as u32);
+    if wstatus2 != 0 {
+      let _ = uart_puts("kernelupload: slot-state write-back failed\n");
+      return 0;
+    }
+    let _ = uart_puts("ok, slot ");
+    let _ = uart_puts(if target_slot == (0 as u32) { "A" } else { "B" });
+    let _ = uart_puts(" verified and marked ready, ");
+    let _ = uart_put_i64(actual_len);
+    let _ = uart_puts(" bytes\n");
+    return 0;
+  }
+
+  let _ = uart_puts("usage: kernelupload chunk <hex> | kernelupload commit <len> <sha256> | kernelupload abort\n");
+  return 0;
+}
+
+// `kernelslot status` / `kernelslot activate <a|b>` -- the lasting
+// (not one-shot) switch the user confirmed: activate sets both
+// active_slot AND preferred_slot, resets attempt_count, and takes
+// effect on the next reboot.
+fn shell_dispatch_kernelslot(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  if cmd_end >= line_len {
+    let _ = uart_puts("usage: kernelslot status | kernelslot activate <a|b>\n");
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "status") == 1 {
+    let lookup: KernelSlotRecord = kernelslot_lookup();
+    if lookup.valid != 1 {
+      let _ = uart_puts("kernelslot: no valid slot-state record found\n");
+      return 0;
+    }
+    let _ = uart_puts("active_slot=");
+    let _ = uart_puts(if lookup.active_slot == (0 as u8) { "A" } else { "B" });
+    let _ = uart_puts(" preferred_slot=");
+    let _ = uart_puts(if lookup.preferred_slot == (0 as u8) { "A" } else { "B" });
+    let _ = uart_puts("\n");
+    let _ = uart_puts("attempt_count=");
+    let _ = uart_put_i64(lookup.attempt_count as i64);
+    let _ = uart_puts(" bootlimit=");
+    let _ = uart_put_i64(lookup.bootlimit as i64);
+    let _ = uart_puts("\n");
+    let _ = uart_puts("slot A: ready=");
+    let _ = uart_put_i64(lookup.slot_a_ready as i64);
+    let _ = uart_puts(" len=");
+    let _ = uart_put_i64(lookup.slot_a_len as i64);
+    let _ = uart_puts("\n");
+    let _ = uart_puts("slot B: ready=");
+    let _ = uart_put_i64(lookup.slot_b_ready as i64);
+    let _ = uart_puts(" len=");
+    let _ = uart_put_i64(lookup.slot_b_len as i64);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "activate") == 1 {
+    if dharafs_user_get_uid() != (0 as u32) {
+      let _ = uart_puts("kernelslot: permission denied (root only)\n");
+      return 0;
+    }
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: kernelslot activate <a|b>\n");
+      return 0;
+    }
+    let arg_start: i64 = sub_end + 1;
+    let arg_end: i64 = shell_find_space(line_buf, arg_start, line_len);
+    let want_a: i64 = shell_word_matches(line_buf, arg_start, arg_end, "a");
+    let want_b: i64 = shell_word_matches(line_buf, arg_start, arg_end, "b");
+    if (want_a != 1) && (want_b != 1) {
+      let _ = uart_puts("usage: kernelslot activate <a|b>\n");
+      return 0;
+    }
+    let lookup: KernelSlotRecord = kernelslot_lookup();
+    if lookup.valid != 1 {
+      let _ = uart_puts("kernelslot: no valid slot-state record found\n");
+      return 0;
+    }
+    let target_ready: u8 = if want_a == 1 { lookup.slot_a_ready } else { lookup.slot_b_ready };
+    if target_ready != (1 as u8) {
+      let _ = uart_puts("kernelslot: refusing to activate a slot that was never successfully uploaded/verified\n");
+      return 0;
+    }
+    let new_active: u8 = if want_a == 1 { 0 as u8 } else { 1 as u8 };
+    let stale: i64 = kernelslot_stale_block(ref lookup);
+    let new_rec: KernelSlotRecord = KernelSlotRecord {
+      valid: 1, chosen_block: lookup.chosen_block,
+      generation: lookup.generation + 1,
+      active_slot: new_active,
+      preferred_slot: new_active,
+      attempt_count: 0 as u32,
+      bootlimit: lookup.bootlimit,
+      slot_a_ready: lookup.slot_a_ready,
+      slot_b_ready: lookup.slot_b_ready,
+      slot_a_len: lookup.slot_a_len,
+      slot_b_len: lookup.slot_b_len,
+      slot_a_sha256: lookup.slot_a_sha256,
+      slot_b_sha256: lookup.slot_b_sha256,
+    };
+    let wstatus: i64 = kernelslot_write_record(ref new_rec, stale);
+    if wstatus != 0 {
+      let _ = uart_puts("kernelslot: write-back failed\n");
+      return 0;
+    }
+    let _ = uart_puts("ok, slot ");
+    let _ = uart_puts(if want_a == 1 { "A" } else { "B" });
+    let _ = uart_puts(" is now active (lasting choice, takes effect next reboot)\n");
+    return 0;
+  }
+
+  let _ = uart_puts("usage: kernelslot status | kernelslot activate <a|b>\n");
+  return 0;
+}
+
 // Round 51/62: shell front end for every fault-injection type this
 // project has. `fault alloc <n>` (round 51) deliberately triggers the
 // SAME real, unrecoverable dhruva_alloc_bytes OOM-fatal halt a genuine
@@ -31164,6 +31819,16 @@ fn shell_dispatch() -> i64 {
   // ASCII-line-oriented, unusable for a ~16KB binary file).
   if shell_word_matches(line_buf, 0, cmd_end, "wifikey") == 1 {
     return shell_dispatch_wifikey(line_buf, cmd_end, line_len);
+  }
+
+  // A/B kernel slots (task #308): upload a new kernel build over the
+  // same UART link, with automatic rollback if it turns out broken --
+  // see shell_dispatch_kernelupload's own comment.
+  if shell_word_matches(line_buf, 0, cmd_end, "kernelupload") == 1 {
+    return shell_dispatch_kernelupload(line_buf, cmd_end, line_len);
+  }
+  if shell_word_matches(line_buf, 0, cmd_end, "kernelslot") == 1 {
+    return shell_dispatch_kernelslot(line_buf, cmd_end, line_len);
   }
 
   // Round 42: change an existing file's permission bits. Mode is a
