@@ -2695,6 +2695,10 @@ extern "C" fn usb_hub_set_port1_connected(value: u32) -> u32;
 extern "C" fn usb_hub_get_port2_connected() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_hub_set_port2_connected(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_get_port3_connected() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_set_port3_connected(value: u32) -> u32;
 
 // Round 57 (boot/usb_bt_state.S): same shape as usb_net_state.S above,
 // for the USB Bluetooth HCI transport -- a SEPARATE state module so a
@@ -20028,8 +20032,9 @@ fn dwc2_build_hctsiz(pid: u32, pktcnt: u32, xfersize: u32) -> u32 {
 fn dwc2_wait_chan0_done() -> u32 {
   let hcint0: i64 = dwc2_hcint0_addr();
   let hcchar0: i64 = dwc2_hcchar0_addr();
-  let hard_error_mask: u32 = (0x8 as u32) | (0x4 as u32) | (0x80 as u32) | (0x100 as u32) | (0x400 as u32); // STALL|AHBERR|XACTERR|BBLERR|DATATGLERR
+  let hard_error_mask: u32 = (0x8 as u32) | (0x4 as u32) | (0x80 as u32) | (0x100 as u32); // STALL|AHBERR|XACTERR|BBLERR
   let xacterr_bit: u32 = 0x80 as u32;
+  let datatglerr_bit: u32 = 0x400 as u32;
   let chena_bit: u32 = (1 as u32) << (31 as u32);
   let transient_mask: u32 = (0x10 as u32) | (0x20 as u32); // NAK|ACK
   let xacterr_count: i64 = 0;
@@ -20068,9 +20073,11 @@ fn dwc2_wait_chan0_done() -> u32 {
           let rearm: u32 = mmio_read_u32(hcchar0) | chena_bit;
           let _ = mmio_write_u32(hcchar0, rearm);
         } else {
-          // STALL/AHBERR/BBLERR/DATATGLERR -- genuinely terminal
-          // (a protocol violation, not a transient bus condition),
-          // same as before: no retry for any of these.
+          // STALL/AHBERR/BBLERR -- genuinely terminal (a protocol
+          // violation, not a transient bus condition), same as
+          // before: no retry for any of these. DATATGLERR used to be
+          // lumped in here too; see its own dedicated branch below
+          // for why that was wrong.
           // Round 26 diagnostic (task #325): how many iterations
           // elapsed before this hard error actually appeared --
           // distinguishes "device responded quickly with a real,
@@ -20109,6 +20116,49 @@ fn dwc2_wait_chan0_done() -> u32 {
           let rearm_nak: u32 = mmio_read_u32(hcchar0) | chena_bit;
           let _ = mmio_write_u32(hcchar0, rearm_nak);
         } else {
+        if (hi & datatglerr_bit) != (0 as u32) {
+          // Round 63 (task #197, real-HW BLE finding, 2026-10-10):
+          // DATATGLERR used to sit in hard_error_mask as unconditionally
+          // terminal, same as STALL/AHBERR/BBLERR. Checked against BOTH
+          // mainline Linux dwc2 (`dwc2_hc_datatglerr_intr`, hcd_intr.c)
+          // AND Raspberry Pi's own downstream dwc_otg driver for this
+          // exact BCM2835 silicon (`handle_hc_datatglerr_intr`,
+          // dwc_otg_hcd_intr.c) -- both agree a DATATGLERR on a
+          // non-split transaction is NOT a real failure at all, just an
+          // informational re-sync: the real driver does `error_count =
+          // 0` (RPi's own comment: "for the sole purpose of resetting
+          // error counts") and keeps the transfer going, only halting
+          // on the SPLIT-transaction case. This driver has no split
+          // transactions at all (HCSPLT is unconditionally zeroed in
+          // dwc2_build_hcchar), so the non-split, non-fatal behavior is
+          // the ONLY behavior that ever applies here -- there is no
+          // direction-dependent (IN vs OUT) distinction worth encoding
+          // either, since mainline's own OUT branch is a no-op besides
+          // a debug log.
+          //
+          // Found live: the real Broadcom BT dongle (idVendor:idProduct
+          // 0x0A5C:0x21E8, reachable only after this same session's
+          // 3-port hub fix) answered HCI_Reset with a genuine Command
+          // Complete event -- the first real response this project's
+          // Bluetooth transport has ever received from actual hardware
+          // -- then its very next interrupt-IN poll (LE_Set_Scan_
+          // Parameters's own response) hit exactly this bit pattern
+          // (hi=0x00000402, CHHLTD|DATATGLERR) and was wrongly reported
+          // fatal, silently ending the HCI bring-up sequence right
+          // after it had just proven the transport layer genuinely
+          // works end-to-end. Resetting xacterr_count to 0 (matching
+          // Linux's own `error_count = 0`, not counted as a retryable-
+          // but-budgeted error the way XACTERR is) and re-arming CHENA
+          // (same mechanism already used for XACTERR/NAK) lets the
+          // transfer actually complete -- bounded only by this loop's
+          // own outer 1,000,000-iteration cap, the same bound every
+          // other retryable condition here already relies on instead
+          // of a dedicated sub-counter.
+          xacterr_count = 0;
+          let _ = mmio_write_u32(hcint0, hi);
+          let rearm_dtg: u32 = mmio_read_u32(hcchar0) | chena_bit;
+          let _ = mmio_write_u32(hcchar0, rearm_dtg);
+        } else {
           // Round 18 (task #325, the real bug this entire investigation
           // was chasing): U-Boot's own `wait_for_chhltd` (dwc2.c) -- the
           // ONE function every transfer type in that reference polls on
@@ -20116,8 +20166,8 @@ fn dwc2_wait_chan0_done() -> u32 {
           // Halted) FIRST, THEN inspects XFERCOMPL/NAK/FRMOVRUN to
           // classify the result. This driver's own loop never checked
           // bit1 AT ALL -- it only recognizes bit0 (XFERCOMPL), the
-          // hard_error_mask bits (STALL/AHBERR/XACTERR/BBLERR/
-          // DATATGLERR), and transient_mask (NAK/ACK). Real-HW evidence
+          // hard_error_mask bits (STALL/AHBERR/XACTERR/BBLERR), and
+          // transient_mask (NAK/ACK). Real-HW evidence
           // (round 18 retest, GET_DESCRIPTOR SETUP stage): the failure
           // snapshot showed GINTSTS bit25 (HCHINT, "Host Channels
           // Interrupt") SET -- a per-channel interrupt genuinely fired
@@ -20146,6 +20196,7 @@ fn dwc2_wait_chan0_done() -> u32 {
           // unrecognized halt is reported.
           let _ = mmio_write_u32(hcint0, hi);
           return hi;
+        }
         }
       }
     }
@@ -21243,9 +21294,14 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
   // GPU boot firmware, docs/HARDWARE_IN_LOOP.md �4.1) -- an absent
   // file is a normal, expected, non-fatal case on any card that
   // hasn't had it loaded yet, not an error.
-  let fw_len: i64 = rtl8188cu_load_firmware();
+  let fw_len_dharafs: i64 = rtl8188cu_load_firmware();
+  // Round 65: fall back to the fixed raw-SD-block region (see its own
+  // comment) if DharaFS has no file -- a purely additive second
+  // source for the exact same firmware, tried only when the primary
+  // DharaFS path found nothing.
+  let fw_len: i64 = if fw_len_dharafs > 0 { fw_len_dharafs } else { rtl8188cu_load_firmware_from_sd_raw() };
   if fw_len <= 0 {
-    let _ = uart_puts("USB: RTL8188CU firmware not found at /wifi/fw.bin -- radio inert until it's loaded (see docs/HARDWARE_IN_LOOP.md)\n");
+    let _ = uart_puts("USB: RTL8188CU firmware not found at /wifi/fw.bin or the raw-SD fallback block -- radio inert until it's loaded (see docs/HARDWARE_IN_LOOP.md)\n");
     return 0;
   }
   let fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
@@ -21372,6 +21428,89 @@ fn rtl8188cu_load_firmware() -> i64 {
   // header in place) so the rest of the download code always works
   // from a plain, zero-based payload buffer -- same reasoning ssh_copy
   // already has plenty of precedent for elsewhere in this project.
+  let _ = ssh_copy(fw_buf, 0, fw_buf, hdr.data_off, hdr.ramcodesize);
+  return hdr.ramcodesize;
+}
+
+// Round 65 (2026-10-10, local testing convenience -- NOT the primary
+// path): a FIXED raw SD block range reserved for the WiFi firmware
+// blob, read directly, bypassing DharaFS entirely. Added because the
+// live UART `wifikey chunk`/`commit` upload (rtl8188cu_load_firmware's
+// own DharaFS path above) needs the host-side script to correctly
+// detect this kernel's own boot-complete marker over a real serial
+// link -- real, but fiddly, round-trip timing to get exactly right on
+// a fresh real board (two host-script bugs already found and fixed
+// this same session chasing it: a loose substring match, then a
+// missed \r-before-\n wire detail -- see test/wifikey_upload.py's own
+// comments). This gives a second, simpler path for the SAME file: a
+// host-side script can `dd` the firmware directly onto these raw
+// sectors (completely independent of DharaFS's own append-only log
+// format, no host-side boot-timing/serial-protocol coordination
+// needed at all) while that UART path keeps getting exercised too.
+//
+// Block 8192 (4MB): comfortable margin past both DharaFS's own log
+// region (blocks 1-2048) and its crypto-metadata region (blocks 4000+,
+// dharafs_crypto_meta_sector_for's own comment), and well clear of
+// flash_sd_card.sh's own FAT boot partition (starts at sector 16384,
+// 8MiB) -- entirely unused raw space on every card this project's own
+// scripts already produce. 32 blocks (16384 bytes) matches usb_wifi_
+// fw_buf's own existing capacity exactly.
+fn rtl8188cu_fw_raw_sd_base_block() -> i64 { return 8192; }
+fn rtl8188cu_fw_raw_sd_block_count() -> i64 { return 32; }
+
+fn rtl8188cu_load_firmware_from_sd_raw() -> i64 {
+  let fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
+  let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let base: i64 = rtl8188cu_fw_raw_sd_base_block();
+  let count: i64 = rtl8188cu_fw_raw_sd_block_count();
+  let i: i64 = 0;
+  while i < count {
+    let rd_status: i64 = sdhost_read_block(base + i, scratch);
+    if rd_status != 0 {
+      return 0; // real I/O failure -- treat as "not present", same
+                // tolerance the DharaFS path already gives a missing
+                // file rather than a hard error.
+    }
+    let _ = ssh_copy(fw_buf, i * (512 as i64), scratch, 0, 512);
+    i = i + 1;
+  }
+  // BUG (found live, real-HW, 2026-10-11): rtl_fw_header_parse's own
+  // "ok" check requires `32 + ramcodesize` to EXACTLY equal the
+  // file_len it's given (see its own comment -- a deliberate self-
+  // consistency check, not an upper bound). Passing the full padded
+  // raw-block-read size here (count*512 = 16384) instead of the
+  // REAL file's own length (16126, since dd writes exactly the
+  // firmware file's own byte count, not a block-rounded size) made
+  // this check fail every time, even with a correctly-written region
+  // -- confirmed live: "RTL8188CU firmware not found at ... raw-SD
+  // fallback block" printed on a card freshly written by dhruva_
+  // flash_testing.sh's own dd (which itself verified a byte-for-byte
+  // readback match). Computing the real length from the header's own
+  // ramcodesize field (the exact same 2 bytes at offset 12-13
+  // rtl_fw_header_parse itself reads) before calling it, instead of
+  // trusting the padded block-read size, fixes this without changing
+  // rtl_fw_header_parse itself (still correct for its own DharaFS
+  // caller, which always passes a real file's own exact length).
+  let hdr_ramcodesize_lo: u32 = buf_read_byte(fw_buf, 12 as u32);
+  let hdr_ramcodesize_hi: u32 = buf_read_byte(fw_buf, 13 as u32);
+  let hdr_ramcodesize: i64 = (hdr_ramcodesize_lo | (hdr_ramcodesize_hi << (8 as u32))) as i64;
+  let real_file_len: i64 = 32 + hdr_ramcodesize;
+  // Deriving file_len from the very field rtl_fw_header_parse's own
+  // equality check compares it against would make that check
+  // trivially always pass -- this bound (the derived length must fit
+  // within what was actually read from the reserved region) is what
+  // still catches an uninitialized/garbage region (a fresh or foreign
+  // card's own never-written block range won't reliably decode to a
+  // small, in-range ramcodesize).
+  if (real_file_len < 32) || (real_file_len > (count * (512 as i64))) {
+    return 0;
+  }
+  let hdr: RtlFwHeader = rtl_fw_header_parse(fw_buf, real_file_len);
+  if hdr.ok != 1 {
+    return 0; // reserved region never written (fresh/foreign card) --
+              // normal, expected, non-fatal, same as DharaFS's own
+              // "no file yet" case.
+  }
   let _ = ssh_copy(fw_buf, 0, fw_buf, hdr.data_off, hdr.ramcodesize);
   return hdr.ramcodesize;
 }
@@ -21958,7 +22097,7 @@ fn lan9512_rx_status_frame_len(rx_status: u32) -> u32 {
 // configuration device (the hub itself) always pass 0; dwc2_
 // enumerate_downstream retries with 1 if index 0 turned out to hold
 // neither a mass-storage nor CDC-ECM interface.
-fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, is_lan9512: u32, is_wifi: u32) -> i64 {
+fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, is_lan9512: u32, is_wifi: u32, is_bt_vendor: u32) -> i64 {
   let cfg9: mut ref i64 = dhruva_alloc_bytes(9);
   let _ = dwc2_build_get_config_descriptor_setup(config_index, 9 as u32);
   let status0: i64 = dwc2_control_in(devaddr, mps, 9 as u32, cfg9);
@@ -22127,7 +22266,32 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
             if (iclass == (0x0A as u32)) && (cur_iface_num == cdc_data_iface_target) && ((ialt as i64) == 1) {
               cur_iface_is_cdc_data_active = 1;
             }
-            if (iclass == (0xE0 as u32)) && (isubclass == (0x01 as u32)) && (iproto == (0x01 as u32)) {
+            // Round 62 (task #197 follow-up, 2026-10-10, real-HW 3rd-
+            // port fix): the official USB-IF Bluetooth class (0xE0/
+            // 0x01/0x01) checked below is NOT what this project's own
+            // real hardware actually presents -- a real Broadcom BT
+            // dongle, finally reachable once the 3-port fix let the
+            // hub's 3rd port get probed at all, enumerated with
+            // idVendor:idProduct 0x0A5C:0x21E8 and was never classified
+            // as Bluetooth at all (no interface matched 0xE0/0x01/0x01
+            // anywhere in its descriptor). Confirmed against Linux's
+            // real in-tree btusb.c `btusb_table[]`: Broadcom's own BT
+            // chips (BCM2070/BCM20702/etc.) use a VENDOR-SPECIFIC
+            // interface class instead -- `USB_VENDOR_AND_INTERFACE_
+            // INFO(0x0a5c, 0xff, 0x01, 0x01), .driver_info =
+            // BTUSB_BCM_PATCHRAM` -- class 0xFF (vendor-specific),
+            // subclass 0x01, protocol 0x01, gated on idVendor==
+            // Broadcom's own 0x0a5c (not a bare class/subclass/
+            // protocol match on its own, which would false-positive on
+            // unrelated vendor-specific interfaces from other chips).
+            // is_bt_vendor is computed once at the call site from
+            // idVendor, same shape as is_lan9512/is_wifi already are.
+            // BTUSB_BCM_PATCHRAM itself (the chip needing a firmware/
+            // "patch RAM" upload before HCI commands are answered) is
+            // explicitly out of scope here -- same stopping point this
+            // project's own RTL8188CU work already established for its
+            // own firmware-load step, not attempted blind.
+            if ((iclass == (0xE0 as u32)) && (isubclass == (0x01 as u32)) && (iproto == (0x01 as u32))) || ((is_bt_vendor == (1 as u32)) && (iclass == (0xFF as u32)) && (isubclass == (0x01 as u32)) && (iproto == (0x01 as u32))) {
               cur_iface_is_bt = 1;
               found_bt = 1;
             }
@@ -25814,6 +25978,85 @@ fn hci_le_adv_report_extract_name(event_buf: mut ref i64, out_name: mut ref i64)
 // (expected and harmless under QEMU, where nothing ever answers --see
 // hci_reset_and_scan's own comment for why this whole function is
 // necessarily untested end-to-end today).
+// Round 64 (task #197 follow-up, 2026-10-10): HCI_Read_Local_Version_
+// Information (Bluetooth Core Spec Vol 4 Part E §7.4.1) -- OGF=0x04
+// (Informational Parameters), OCF=0x0001, no parameters. The one HCI
+// command every real Broadcom BT chip answers correctly even before
+// any firmware "patch RAM" is loaded (confirmed live: this project's
+// own real Broadcom dongle answered HCI_Reset with a genuine Command
+// Complete before this command even existed in this driver -- see
+// hci_reset_and_scan's own comment on that). Needed to identify which
+// EXACT chip revision is attached (LMP_Subversion) and, per Linux's
+// own btbcm.c `btbcm_initialize`, which .hcd patch file it needs --
+// that chip-to-filename mapping is itself hardcoded there
+// (`bcm_usb_subver_table[]`), not derivable from first principles, so
+// this driver reads and PRINTS the real value rather than guessing a
+// filename blind; the next round maps whatever this prints against
+// that same table.
+fn hci_build_read_local_version_command(out_buf: mut ref i64) -> i64 {
+  let opcode: u32 = hci_build_opcode(0x04 as u32, 0x0001 as u32);
+  let _ = buf_write_byte(out_buf, 0 as u32, opcode & (0xFF as u32));
+  let _ = buf_write_byte(out_buf, 1 as u32, (opcode >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(out_buf, 2 as u32, 0 as u32);
+  return 3;
+}
+
+// Return Parameters (after the shared Status byte at offset 5, same
+// Command Complete framing hci_cmd_complete_status's own comment
+// already documents): HCI_Version(1)@6, HCI_Revision(2,LE)@7,
+// LMP_Version(1)@9, Manufacturer_Name(2,LE)@10, LMP_Subversion(2,LE)@12.
+fn hci_local_version_hci_version(event_buf: mut ref i64) -> u32 {
+  return buf_read_byte(event_buf, 6 as u32);
+}
+fn hci_local_version_hci_revision(event_buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(event_buf, 7);
+}
+fn hci_local_version_lmp_version(event_buf: mut ref i64) -> u32 {
+  return buf_read_byte(event_buf, 9 as u32);
+}
+fn hci_local_version_manufacturer(event_buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(event_buf, 10);
+}
+fn hci_local_version_lmp_subversion(event_buf: mut ref i64) -> u32 {
+  return buf_read_u16_le(event_buf, 12);
+}
+
+// Same shape as hci_send_command_and_wait_complete below, except it
+// also copies the full matched Command Complete event into
+// out_event_buf (caller-allocated, at least 14 bytes) instead of only
+// returning the Status byte -- needed here because this command's
+// whole POINT is its multi-byte return parameters, not just success/
+// failure. A separate function rather than changing the existing
+// one's signature: hci_reset_and_scan's own HCI_Reset/LE_Set_Scan_*
+// calls never need more than the status byte, and every existing call
+// site already matches that simpler signature.
+fn hci_send_command_and_get_complete(devaddr: u32, mps: u32, intr_mps: u32, cmd_buf: mut ref i64, cmd_len: u32, expected_opcode: u32, out_event_buf: mut ref i64) -> u32 {
+  let send_status: i64 = dwc2_hci_send_command(devaddr, mps, cmd_buf, cmd_len);
+  if send_status != 0 {
+    return 0xFFFFFFFF as u32;
+  }
+  let event_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let tries: i64 = 0;
+  while tries < 20 {
+    let event_len: i64 = dwc2_hci_interrupt_in(devaddr, intr_mps, event_buf, intr_mps as i64);
+    if event_len > 0 {
+      if hci_event_is_command_complete(event_buf) == (1 as u32) {
+        if hci_cmd_complete_opcode(event_buf) == expected_opcode {
+          let i: i64 = 0;
+          while i < event_len {
+            let b: u32 = buf_read_byte(event_buf, i as u32);
+            let _ = buf_write_byte(out_event_buf, i as u32, b);
+            i = i + 1;
+          }
+          return hci_cmd_complete_status(event_buf);
+        }
+      }
+    }
+    tries = tries + 1;
+  }
+  return 0xFFFFFFFF as u32;
+}
+
 fn hci_send_command_and_wait_complete(devaddr: u32, mps: u32, intr_mps: u32, cmd_buf: mut ref i64, cmd_len: u32, expected_opcode: u32) -> u32 {
   let send_status: i64 = dwc2_hci_send_command(devaddr, mps, cmd_buf, cmd_len);
   if send_status != 0 {
@@ -25885,6 +26128,34 @@ fn hci_reset_and_scan(devaddr: u32, mps: u32) -> i64 {
   if reset_status != (0 as u32) {
     return 0 - 1;
   }
+
+  // Round 64: identify the real chip revision -- see this command's
+  // own builder/field-accessor comments for why (Broadcom's own
+  // firmware-patch filename depends on LMP_Subversion, which this
+  // print surfaces instead of guessing). Diagnostic only for now --
+  // not yet consulted by anything else -- so a failure here (no
+  // response, or a non-matching event) is reported but non-fatal,
+  // same tolerance this function already gives LE_Set_Scan_Enable's
+  // own status below.
+  let version_event: mut ref i64 = dhruva_alloc_bytes(16);
+  let version_len: i64 = hci_build_read_local_version_command(cmd_buf);
+  let version_opcode: u32 = hci_build_opcode(0x04 as u32, 0x0001 as u32);
+  let version_status: u32 = hci_send_command_and_get_complete(devaddr, mps, intr_mps, cmd_buf, version_len as u32, version_opcode, version_event);
+  let _ = uart_puts("USB: HCI_Read_Local_Version_Information status=");
+  let _ = uart_put_hex32(version_status);
+  if version_status == (0 as u32) {
+    let _ = uart_puts(" hci_version=");
+    let _ = uart_put_hex32(hci_local_version_hci_version(version_event));
+    let _ = uart_puts(" hci_revision=0x");
+    let _ = uart_put_hex32(hci_local_version_hci_revision(version_event));
+    let _ = uart_puts(" lmp_version=");
+    let _ = uart_put_hex32(hci_local_version_lmp_version(version_event));
+    let _ = uart_puts(" manufacturer=");
+    let _ = uart_put_hex32(hci_local_version_manufacturer(version_event));
+    let _ = uart_puts(" lmp_subversion=0x");
+    let _ = uart_put_hex32(hci_local_version_lmp_subversion(version_event));
+  }
+  let _ = uart_puts("\n");
 
   let scan_params_len: i64 = hci_build_le_set_scan_parameters_command(cmd_buf, 0x01 as u32, 0x0010 as u32, 0x0010 as u32, 0x00 as u32, 0x00 as u32);
   let scan_params_opcode: u32 = hci_build_opcode(0x08 as u32, 0x000B as u32);
@@ -26279,6 +26550,26 @@ fn dwc2_hub_port2() -> u32 {
   return 2 as u32;
 }
 
+// Round 61 (tasks #164/#197, 2026-10-10, real-HW 3-port fix): live
+// hardware (dwc2_hub_fetch_port_count, a real GET_DESCRIPTOR(Hub) class
+// request this project had never issued before today) confirmed
+// bNbrPorts=3, not 2 -- overturning this file's own round-23 assumption
+// above (and an earlier research pass's independent same wrong
+// conclusion) that the LAN9512's Ethernet function shares one of only
+// 2 total downstream ports with the external sockets. It does not:
+// multiple independent, authoritative sources (and now this live
+// descriptor read) confirm the real Pi 1 Model B gets BOTH of its 2
+// physical external USB sockets AND Ethernet simultaneously from this
+// one chip -- 2 externally-wired PHY ports (ports 1/2) plus a 3rd,
+// internally-wired port for the on-chip Ethernet MAC/PHY function.
+// Port numbering here is arbitrary from this driver's own perspective
+// (whichever port index the hub reports a device on is whichever port
+// it's on) -- the only thing that matters is that all 3 real ports get
+// checked, unconditionally, same as ports 1/2 already are.
+fn dwc2_hub_port3() -> u32 {
+  return 3 as u32;
+}
+
 // Powers on and resets one hub downstream port, polling for the hub's
 // own PORT_RESET completion rather than trusting a fixed delay.
 //
@@ -26433,6 +26724,9 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
 fn dwc2_downstream_addr2() -> u32 {
   return 3 as u32;
 }
+fn dwc2_downstream_addr3() -> u32 {
+  return 4 as u32;
+}
 
 // Round 59 (tasks #164/#197, 2026-10-10): this used to try port1, and
 // ONLY fall back to port2 if port1 reported "not connected" -- an
@@ -26477,13 +26771,26 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   };
   let _ = usb_hub_set_port2_connected(if port2_result == 0 { 1 as u32 } else { 0 as u32 });
 
-  // "Not connected" (1) on BOTH ports is the only genuinely empty
+  // Round 61: real hardware confirmed bNbrPorts=3 (see dwc2_hub_port3's
+  // own comment) -- a third real downstream port exists and must be
+  // brought up/enumerated unconditionally, same as ports 1/2, so
+  // whatever's actually attached there (a BLE dongle, in this board's
+  // case) finally gets probed instead of silently never being checked.
+  let port3_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port3());
+  let port3_outcome: i64 = if port3_result == 0 {
+    dwc2_enumerate_one_downstream_device(dwc2_downstream_addr3())
+  } else {
+    port3_result
+  };
+  let _ = usb_hub_set_port3_connected(if port3_result == 0 { 1 as u32 } else { 0 as u32 });
+
+  // "Not connected" (1) on ALL THREE ports is the only genuinely empty
   // case; anything else (a real device enumerated on at least one
-  // port, even if the other port failed or is empty) counts as
-  // overall success -- a failure on one port must never mask a real
-  // device that came up cleanly on the other.
-  if (port1_outcome == (1 as i64)) && (port2_outcome == (1 as i64)) {
-    let _ = uart_puts("USB: no downstream device (checked both hub ports)\n");
+  // port, even if the others failed or are empty) counts as overall
+  // success -- a failure on one port must never mask a real device
+  // that came up cleanly on another.
+  if (port1_outcome == (1 as i64)) && (port2_outcome == (1 as i64)) && (port3_outcome == (1 as i64)) {
+    let _ = uart_puts("USB: no downstream device (checked all 3 hub ports)\n");
     return 0 - 1;
   }
   return 0;
@@ -26556,7 +26863,34 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   // and_set_configuration's descriptor walk the way CDC-ECM/Bluetooth
   // HCI got one; detection happens here, independent of anything the
   // config descriptor says, matching LAN9512's own reasoning.
-  let is_rtl8188cu: u32 = if (d_id_vendor == (0x0BDA as u32)) && (d_id_product == (0x8176 as u32)) { 1 as u32 } else { 0 as u32 };
+  //
+  // Round 60 (tasks #164/#197, 2026-10-10): found LIVE on real hardware
+  // (the project's own target Edimax EW-7811Un, finally reachable once
+  // the dual-hub-port fix let port2 actually get probed at all) --
+  // idVendor:idProduct 0x7392:0x7811, NOT Realtek's own reference ID.
+  // This is expected, not a different chip: SMSC/Realtek-silicon OEM
+  // dongles routinely ship under the REBRANDER's own USB vendor ID.
+  // Confirmed against Linux's real in-tree rtl8xxxu driver (drivers/
+  // net/wireless/realtek/rtl8xxxu/core.c's own dev_table[]), which
+  // lists `{USB_DEVICE_AND_INTERFACE_INFO(0x7392, 0x7811, ...),
+  // .driver_info = &rtl8192cu_fops}` ("Tested by Larry Finger") --
+  // the EXACT SAME driver_info/fops as every other RTL8188/8192CU
+  // entry in that same table, not a separate chip family. Only this
+  // one exact ID is added (the one actually observed), not Edimax's
+  // other rebranded IDs in that same table (0xa611/0xb811/0xb722/
+  // 0x7822) -- adding those without ever having seen one would be
+  // guessing, not verifying.
+  let is_rtl8188cu: u32 = if ((d_id_vendor == (0x0BDA as u32)) && (d_id_product == (0x8176 as u32))) || ((d_id_vendor == (0x7392 as u32)) && (d_id_product == (0x7811 as u32))) { 1 as u32 } else { 0 as u32 };
+
+  // Round 62 (task #197 follow-up, 2026-10-10): Broadcom's own BT
+  // chips report their HCI interface as vendor-specific class 0xFF/
+  // 0x01/0x01 rather than the official 0xE0/0x01/0x01 -- see dwc2_
+  // fetch_and_set_configuration's own comment for the full Linux
+  // btusb.c citation. Gated on idVendor alone here, same as is_wifi/
+  // is_lan9512 above; the class/subclass/protocol check itself still
+  // happens inside the descriptor walk, same as every other device
+  // kind.
+  let is_bt_vendor: u32 = if d_id_vendor == (0x0A5C as u32) { 1 as u32 } else { 0 as u32 };
 
   // Round 24 (WiFi dongle enumeration prep, 2026-08-28): every device
   // this driver enumerates -- LAN9512's own Ethernet function today,
@@ -26566,7 +26900,7 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   // story; this is the downstream device's own configuration step,
   // the same one dwc2_probe_device0 does for whatever sits on the
   // root port.
-  let config_status: i64 = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 0 as u32, is_lan9512, is_rtl8188cu);
+  let config_status: i64 = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 0 as u32, is_lan9512, is_rtl8188cu, is_bt_vendor);
   if config_status != 0 {
     return config_status;
   }
@@ -26593,7 +26927,7 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   // call above, already succeeded and left the device in a valid,
   // if unrecognized, configured state).
   if (usb_msd_get_bot() == (0 as u32)) && (usb_net_get_kind() == (0 as u32)) {
-    let _ = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 1 as u32, is_lan9512, is_rtl8188cu);
+    let _ = dwc2_fetch_and_set_configuration(downstream_addr, dmps0, 1 as u32, is_lan9512, is_rtl8188cu, is_bt_vendor);
   }
   // Round 33: if that configuration step just found a mass-storage
   // (BOT) interface, prove the new bulk-transfer/BOT chain live right
@@ -26782,6 +27116,23 @@ fn usb_hotplug_poll() -> i64 {
       let _ = usb_hub_set_port2_connected(cur2 as u32);
     }
   }
+
+  // Round 61: third real port, same pattern as ports 1/2 above.
+  let cur3: i64 = usb_hotplug_sample_port_connected(hub_addr, hub_mps, dwc2_hub_port3());
+  if cur3 >= 0 {
+    let was3: u32 = usb_hub_get_port3_connected();
+    if (cur3 as u32) != was3 {
+      if cur3 == 1 {
+        let br3: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port3());
+        if br3 == 0 {
+          let _ = dwc2_enumerate_one_downstream_device(dwc2_downstream_addr3());
+        }
+      } else {
+        let _ = usb_hotplug_clear_device_at_addr(dwc2_downstream_addr3());
+      }
+      let _ = usb_hub_set_port3_connected(cur3 as u32);
+    }
+  }
   return 0;
 }
 
@@ -26954,11 +27305,41 @@ fn dwc2_probe_device0() -> i64 {
   // enumeration work -- but per spec this is still the correct order
   // of operations, and a real hub is under no obligation to be as
   // forgiving as QEMU's model about it.
-  let config_status: i64 = dwc2_fetch_and_set_configuration(new_addr, mps0, 0 as u32, 0 as u32, 0 as u32);
+  let config_status: i64 = dwc2_fetch_and_set_configuration(new_addr, mps0, 0 as u32, 0 as u32, 0 as u32, 0 as u32);
   if config_status != 0 {
     return 0 - 1;
   }
+  // Round 61 (user, 2026-10-10): this driver has assumed "exactly 2
+  // downstream ports" since round 23, from datasheet prose alone --
+  // never once actually fetched LAN9512's own real USB Hub Descriptor
+  // (class-specific GET_DESCRIPTOR, type 0x29) to check bNbrPorts
+  // against what the real silicon reports. Diagnostic only for now:
+  // print the real value so a live retest settles this with ground
+  // truth instead of another assumption.
+  let _ = dwc2_hub_fetch_port_count(new_addr, mps0);
   return dwc2_enumerate_downstream(mps0);
+}
+
+fn dwc2_hub_fetch_port_count(hub_addr: u32, hub_mps: u32) -> i64 {
+  let hubdesc: mut ref i64 = dhruva_alloc_bytes(9);
+  let _ = dwc2_build_setup(0xA0 as u32, 6 as u32, 0x2900 as u32, 0 as u32, 9 as u32);
+  let status: i64 = dwc2_control_in(hub_addr, hub_mps, 9 as u32, hubdesc);
+  if status != 0 {
+    let _ = uart_puts("USB DIAG: hub GET_DESCRIPTOR(Hub) failed\n");
+    return 0 - 1;
+  }
+  let b_desc_length: u32 = buf_read_byte(hubdesc, 0 as u32);
+  let b_nbr_ports: u32 = buf_read_byte(hubdesc, 2 as u32);
+  let w_hub_char_lo: u32 = buf_read_byte(hubdesc, 3 as u32);
+  let w_hub_char_hi: u32 = buf_read_byte(hubdesc, 4 as u32);
+  let _ = uart_puts("USB DIAG: real Hub Descriptor bDescLength=");
+  let _ = uart_put_hex32(b_desc_length);
+  let _ = uart_puts(" bNbrPorts=");
+  let _ = uart_put_hex32(b_nbr_ports);
+  let _ = uart_puts(" wHubCharacteristics=0x");
+  let _ = uart_put_hex32(w_hub_char_lo | (w_hub_char_hi << (8 as u32)));
+  let _ = uart_puts("\n");
+  return b_nbr_ports as i64;
 }
 
 // Phase 2 priority-inversion demo. All three tasks share one mutex

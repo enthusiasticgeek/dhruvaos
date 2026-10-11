@@ -441,6 +441,28 @@ real fidelity gaps:
 
 ### 6.1 Loading the RTL8188CU/RTL8188CUS WiFi firmware
 
+**Automated path (2026-10-10)**: pass `--with-wifi-firmware /dev/ttyUSB0`
+to either `flash_sd_card.sh` or `update_kernel.sh` -- after that
+script's own card-prep work finishes, it fetches the firmware below
+via `fetch_wifi_firmware.sh` (if not already cached in `~/wifi-
+firmware/`, never committed to this repo either way), prompts you to
+power on the board, and uploads it automatically once the board
+answers on the given serial device. The manual steps below are what
+that automates, and remain the reference if you want to run any piece
+by hand (e.g. re-verifying the fetched file, or uploading without
+re-flashing).
+
+Add `--with-wifi-creds <ssid-file> <pwd-file>` alongside
+`--with-wifi-firmware` to also write your own SSID/password right
+after the firmware upload, reusing that same already-booted board --
+this just drives `test/wifi_creds_upload.py` (its own docstring has
+the full story: `write`s into `/config/wifi_ssid`/`/config/
+wifi_password`, boot-time-only, contents never printed). Deliberately
+NOT auto-detected from any default/conventional path -- SSID/password
+are per-user secrets, unlike the firmware itself (one fixed binary,
+same for every user of this chip), so you always name the files
+explicitly.
+
 Same licensing posture as §4.1's own GPU boot firmware: this is a
 **proprietary Realtek binary blob, never committed to this repo**.
 Fetch it yourself from `linux-firmware` (the same legally-

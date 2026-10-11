@@ -13557,3 +13557,27 @@ what actually found the real bug.
 Real-HW retest (twice, independently) confirmed `GET_DESCRIPTOR(Device)`, hub enumeration, downstream
 LAN9512 Ethernet function detection, AND the LAN9512 vendor-command reset+init sequence all complete
 successfully, with boot proceeding normally into `DHCP: client_start`. Task #325 CLOSED.
+
+## Future hardware backlog: wireless keyboard, DharaFS raw NAND backend (2026-10-11)
+
+Two new epics, recorded at the user's own request, not started. Both tracked separately from the
+existing DHDL-layer driver backlog (I2C/SPI/CAN/RS485/Audio/LoRa, tasks #299-304) since neither is a
+DHDL peripheral in the same sense.
+
+- **Wireless keyboard** (task #345) — distinct from the already-DONE USB-wired HID keyboard (round 71,
+  see "New peripherals" section above) and the already-existing BLE HCI transport (round 57+). Two very
+  different possible paths depending on what dongle/keyboard is actually in hand: (a) BLE HID-over-GATT
+  on top of the existing BLE connect orchestrator (round 66+ real-HW work in progress), or (b) a
+  proprietary 2.4GHz USB receiver dongle (e.g. Logitech Unifying-style, vendor-specific protocol) via the
+  existing DWC2 USB stack. Needs its own research-fork scoping pass first — these two paths share almost
+  nothing protocol-wise, so which one applies depends entirely on the specific hardware being targeted.
+
+- **DharaFS raw NAND flash backend** (task #346) — DharaFS currently only targets SD/MMC via `sdhost`
+  (block-level, with the card's own onboard FTL handling wear-leveling/bad-block management
+  transparently). Raw NAND flash has no onboard FTL — ECC (bit-flip correction), wear-leveling, and
+  bad-block management would all need to live in this driver instead. DharaFS's own log-structured
+  append-only design is actually a reasonable philosophical fit (NAND already wants sequential writes,
+  not in-place rewrites), but `dharafs_block_read`/`dharafs_block_write`'s current SD-specific
+  implementation underneath that log format would need a genuinely new NAND-specific backend, not just a
+  new board target. Needs a research-fork scoping pass (real NAND controller on whatever target board,
+  ECC scheme, bad-block table format) before any implementation starts.

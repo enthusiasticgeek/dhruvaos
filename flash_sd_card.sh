@@ -13,12 +13,38 @@
 # block device).
 #
 # Usage:
-#   ./flash_sd_card.sh /dev/sdX /path/to/firmware/dir
+#   ./flash_sd_card.sh /dev/sdX /path/to/firmware/dir [--with-wifi-firmware /dev/ttyUSB0]
 #
 # /path/to/firmware/dir must already contain bootcode.bin, start.elf,
 # fixup.dat (the original, non-suffixed Pi 1/Zero-generation files --
 # see docs/HARDWARE_IN_LOOP.md §4.1 for where to get them; this
 # script does not fetch them for you).
+#
+# --with-wifi-firmware <serial-device> (optional, 2026-10-10): the
+# RTL8188CU/RTL8192CU WiFi firmware is NOT part of this script's own
+# boot-partition write -- it's a proprietary binary this project has
+# no FAT-write-from-kernel capability to place on the card directly
+# (see docs/HARDWARE_IN_LOOP.md §6.1), so it has to go over a LIVE
+# UART shell connection into DharaFS, which only exists once the board
+# is actually powered on and booted -- a fundamentally later step than
+# anything else this script does. Passing this flag fetches the
+# firmware (via fetch_wifi_firmware.sh, if not already cached locally
+# -- never committed to this repo either way), then, once this
+# script's own card-prep work is done, prompts you to power on the
+# board and uploads it automatically (test/wifikey_upload.py) once it
+# answers on <serial-device>.
+#
+# --with-wifi-creds <ssid-file> <pwd-file> (optional, 2026-10-10):
+# layered on top of --with-wifi-firmware's own power-on prompt (SSID/
+# password are boot-time-only config, same as the firmware, so the
+# SAME already-booted board is reused rather than prompting twice) --
+# runs test/wifi_creds_upload.py right after the firmware upload,
+# using YOUR explicit file paths. Deliberately NOT a default/
+# convention-based path: unlike the firmware (one fixed binary, same
+# for every user of this chip), SSID/password are per-user secrets --
+# this script has no business guessing which files are "yours," and
+# wifi_creds_upload.py's own design already keeps their contents out
+# of every log/transcript it touches.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,9 +53,38 @@ BOOT_PART_START_SECTOR=16384   # 8MiB -- comfortable margin past DharaFS's
                                 # docs/HARDWARE_IN_LOOP.md §4.2.
 MOUNT_POINT="/tmp/dhruva_sdcard_mount_$$"
 
+WIFI_SERIAL_DEVICE=""
+WIFI_SSID_FILE=""
+WIFI_PWD_FILE=""
+POSITIONAL=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --with-wifi-firmware)
+            WIFI_SERIAL_DEVICE="$2"
+            shift 2
+            ;;
+        --with-wifi-creds)
+            WIFI_SSID_FILE="$2"
+            WIFI_PWD_FILE="$3"
+            shift 3
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
 if [ "$#" -ne 2 ]; then
-    echo "Usage: $0 <device, e.g. /dev/sdX> <firmware-dir>" >&2
+    echo "Usage: $0 <device, e.g. /dev/sdX> <firmware-dir> [--with-wifi-firmware /dev/ttyUSB0] [--with-wifi-creds <ssid-file> <pwd-file>]" >&2
     echo "  firmware-dir must contain bootcode.bin, start.elf, fixup.dat" >&2
+    exit 1
+fi
+
+if [ -n "$WIFI_SSID_FILE" ] && [ -z "$WIFI_SERIAL_DEVICE" ]; then
+    echo "ERROR: --with-wifi-creds requires --with-wifi-firmware (it reuses that same" >&2
+    echo "already-booted board rather than prompting for a second power-on)." >&2
     exit 1
 fi
 
@@ -194,3 +249,20 @@ echo "  bootcode.bin, start.elf, fixup.dat, config.txt, kernel.img"
 echo
 echo "Safe to remove the card and insert it in the powered-off Pi."
 echo "See docs/HARDWARE_IN_LOOP.md §3 for wiring the UART console before power-on."
+
+if [ -n "$WIFI_SERIAL_DEVICE" ]; then
+    echo
+    echo "=== --with-wifi-firmware given: fetching WiFi firmware (if not already cached) ==="
+    WIFI_FW_PATH="$("$ROOT/fetch_wifi_firmware.sh")"
+    echo
+    echo "Insert the card and power on the Pi now."
+    read -r -p "Press Enter once the board is powered on and booting: " _
+    echo "=== Uploading $WIFI_FW_PATH over $WIFI_SERIAL_DEVICE (waits for boot to reach the shell) ==="
+    python3 "$ROOT/test/wifikey_upload.py" "$WIFI_SERIAL_DEVICE" "$WIFI_FW_PATH" --boot-timeout 180
+
+    if [ -n "$WIFI_SSID_FILE" ]; then
+        echo "=== Writing WiFi SSID/password (contents never shown) over $WIFI_SERIAL_DEVICE ==="
+        python3 "$ROOT/test/wifi_creds_upload.py" "$WIFI_SSID_FILE" "$WIFI_PWD_FILE" "$WIFI_SERIAL_DEVICE"
+        echo "Reboot the board (power-cycle) for the firmware + credentials to take effect."
+    fi
+fi

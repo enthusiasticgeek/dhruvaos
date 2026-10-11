@@ -201,7 +201,29 @@ def main() -> int:
 
     try:
         print("waiting for boot to reach the shell (PASS marker)...")
-        if not session.read_until("PASS", timeout=args.boot_timeout):
+        # BUG (found live against a real Pi 1B, 2026-10-10): a bare
+        # "PASS" substring match fires on the FIRST of this project's
+        # many self-test "(PASS)" annotations (EVAL/GOVERNOR/CRYPTO/
+        # USB, all printed well before the shell is actually listening)
+        # rather than the real standalone boot-complete marker
+        # (`uart_puts("PASS\n")`, kernel_main.vani) -- QEMU's own stub-
+        # shell validation never caught this because a stub shell
+        # doesn't also print dozens of earlier "(PASS)"-suffixed self-
+        # test lines first.
+        #
+        # SECOND BUG (found live, same session, immediately after
+        # "fixing" the above as "\nPASS\n"): `uart_putc` (kernel_main.
+        # vani) inserts a CR *before* every LF on the wire (task #208 --
+        # a raw terminal doesn't do onlcr itself, so every `uart_puts`
+        # call's own "\n" actually transmits as "\r\n") -- meaning the
+        # real marker's own wire bytes are "...\r\nPASS\r\n...", not
+        # "...\nPASS\n...". The first fix's own match string could
+        # never fire against real hardware for exactly the same reason
+        # the ORIGINAL bare-"PASS" bug couldn't be seen under a stub
+        # shell: nothing in this project's QEMU-stub validation path
+        # exercises the real uart_putc CR-insertion at all. Matching the
+        # marker's actual on-wire shape this time.
+        if not session.read_until("\r\nPASS\r\n", timeout=args.boot_timeout):
             print("[FAIL] boot never reached PASS -- is the device powered on and freshly reset?")
             return 1
         print("[boot ready]")

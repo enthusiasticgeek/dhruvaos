@@ -128,7 +128,27 @@ usb_wifi_fw_upload_len_set:
  * usb_net_state.S, not a shared one, for the same isolation reason
  * usb_net_state.S's own header comment already gives for why IT is
  * separate from usb_msd_state.S: a non-WiFi device enumerating after
- * a WiFi one (or vice versa) must not inherit stale endpoint state. */
+ * a WiFi one (or vice versa) must not inherit stale endpoint state.
+ *
+ * BUG (found 2026-10-10, real-HW): this block never had its own
+ * `.section ".bss"` switch -- the preceding `.section ".text"` (set
+ * once, far above, before usb_wifi_get_kind) stayed active, so the
+ * assembler emitted these six `.word 0`s as plain DATA INSIDE THE
+ * CODE SECTION. Harmless until today: boot/mmu_init.S marks the code
+ * section read-only (APX=1/AP=01, enforced since round 38's W^X
+ * work), so every READ of these words (e.g. usb_wifi_get_bulk_in_
+ * epaddr) worked fine, but this is the first time any REAL device was
+ * ever classified as RTL8188CU on real hardware (the Edimax EW-7811Un
+ * VID:PID fix, same session) -- so this is the first time any of the
+ * SET accessors below (dwc2_fetch_and_set_configuration's own bulk-
+ * endpoint capture) ever actually ran, and the first real-HW write
+ * into this wrongly-placed, read-only-mapped memory produced exactly
+ * the section-permission Data Abort this project's own crash log
+ * reported. Confirmed via `nm`: usb_net_bulk_in_epaddr/usb_bt_bulk_
+ * in_epaddr (this file's own direct siblings, correctly in `.bss`)
+ * show symbol type `b`; usb_wifi_bulk_in_epaddr showed type `t`
+ * (text) before this fix. */
+.section ".bss"
 .align 4
 usb_wifi_bulk_in_epaddr:
     .word 0
@@ -142,6 +162,8 @@ usb_wifi_in_toggle:
     .word 0
 usb_wifi_out_toggle:
     .word 0
+
+.section ".text"
 
 .global usb_wifi_get_bulk_in_epaddr
 usb_wifi_get_bulk_in_epaddr:

@@ -7,7 +7,14 @@
 # underway, instead of re-running flash_sd_card.sh from scratch.
 #
 # Usage:
-#   ./update_kernel.sh /dev/sdX
+#   ./update_kernel.sh /dev/sdX [--with-wifi-firmware /dev/ttyUSB0]
+#
+# --with-wifi-firmware <serial-device> / --with-wifi-creds <ssid-file>
+# <pwd-file> (optional, 2026-10-10): same flags/behavior as
+# flash_sd_card.sh's own -- see that script's header comment for why
+# the WiFi firmware upload is a separate, later, live-UART step rather
+# than something this script could write to the card directly, and
+# why credentials are never auto-picked by convention.
 #
 # Safety: unlike flash_sd_card.sh, this never partitions or formats
 # anything -- worst case here is overwriting the wrong device's own
@@ -28,8 +35,37 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOUNT_POINT="/tmp/dhruva_sdcard_mount_$$"
 
+WIFI_SERIAL_DEVICE=""
+WIFI_SSID_FILE=""
+WIFI_PWD_FILE=""
+POSITIONAL=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --with-wifi-firmware)
+            WIFI_SERIAL_DEVICE="$2"
+            shift 2
+            ;;
+        --with-wifi-creds)
+            WIFI_SSID_FILE="$2"
+            WIFI_PWD_FILE="$3"
+            shift 3
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
 if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <device, e.g. /dev/sdb>" >&2
+    echo "Usage: $0 <device, e.g. /dev/sdb> [--with-wifi-firmware /dev/ttyUSB0] [--with-wifi-creds <ssid-file> <pwd-file>]" >&2
+    exit 1
+fi
+
+if [ -n "$WIFI_SSID_FILE" ] && [ -z "$WIFI_SERIAL_DEVICE" ]; then
+    echo "ERROR: --with-wifi-creds requires --with-wifi-firmware (it reuses that same" >&2
+    echo "already-booted board rather than prompting for a second power-on)." >&2
     exit 1
 fi
 
@@ -98,3 +134,20 @@ echo
 echo "=== Done. kernel.img updated on $BOOT_PART. ==="
 echo "bootcode.bin/start.elf/fixup.dat/config.txt left untouched."
 echo "Safe to remove the card and insert it in the powered-off Pi."
+
+if [ -n "$WIFI_SERIAL_DEVICE" ]; then
+    echo
+    echo "=== --with-wifi-firmware given: fetching WiFi firmware (if not already cached) ==="
+    WIFI_FW_PATH="$("$ROOT/fetch_wifi_firmware.sh")"
+    echo
+    echo "Insert the card and power on the Pi now."
+    read -r -p "Press Enter once the board is powered on and booting: " _
+    echo "=== Uploading $WIFI_FW_PATH over $WIFI_SERIAL_DEVICE (waits for boot to reach the shell) ==="
+    python3 "$ROOT/test/wifikey_upload.py" "$WIFI_SERIAL_DEVICE" "$WIFI_FW_PATH" --boot-timeout 180
+
+    if [ -n "$WIFI_SSID_FILE" ]; then
+        echo "=== Writing WiFi SSID/password (contents never shown) over $WIFI_SERIAL_DEVICE ==="
+        python3 "$ROOT/test/wifi_creds_upload.py" "$WIFI_SSID_FILE" "$WIFI_PWD_FILE" "$WIFI_SERIAL_DEVICE"
+        echo "Reboot the board (power-cycle) for the firmware + credentials to take effect."
+    fi
+fi
