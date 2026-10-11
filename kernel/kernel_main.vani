@@ -44354,108 +44354,31 @@ fn kernel_main() -> i64 {
     let _ = uart_puts("SD: sdhost_init FAILED (see the timeout message above for which command)\n");
   }
 
-  // Task #3 verification: write+read+compare across several distinct
-  // blocks, to confirm the driver holds up across many consecutive
-  // data commands, not just a single lucky pair.
-  //
-  // FIX (2026-09-15, real Pi 1B hardware investigation): this used to
-  // target blocks 2040-2047 -- "near the top of dharafs_init's scan
-  // range (2040-2047, just under its 2048 cap)... not a spare scratch
-  // area to overwrite with test patterns" was the ORIGINAL reasoning,
-  // but that's backwards: 2040-2047 sit INSIDE DharaFS's own declared
-  // log region (`dharafs_init`'s own `max_blk = 2048`), just close to
-  // its far end -- genuinely reachable by real log growth (more test
-  // files, more boot cycles, the WiFi firmware now stored as a real
-  // ~16KB DharaFS file since the file-size-cap raise, task #164
-  // follow-up) rather than provably safe. A REAL, physically-used SD
-  // card accumulates exactly this kind of long-run growth in a way a
-  // fresh QEMU image on every test run never does -- consistent with
-  // this test passing reliably under QEMU while failing on the real,
-  // long-lived card. Moved to blocks 2100-2107: `docs/HARDWARE_IN_
-  // LOOP.md`'s own SD-card partitioning (`sudo parted ... mkpart
-  // primary fat32 16384s 100%`) leaves blocks 2049-16383 completely
-  // unpartitioned and untouched by anything else in this project --
-  // DharaFS's own reserved region ends at block 2048, the FAT32 boot
-  // partition doesn't start until block 16384 -- so this range can
-  // NEVER collide with real DharaFS data regardless of how much the
-  // log grows, a permanent guarantee rather than a "probably still
-  // empty" assumption.
-  let sd_buf: mut ref i64 = dhruva_alloc_bytes(512);
-  let sd_buf2: mut ref i64 = dhruva_alloc_bytes(512);
-  let sd_blk: i64 = 2100;
-  let sd_any_fail: i64 = 0;
-  // TEMPORARY DIAGNOSTIC (2026-09-15): see sdhost_init's own header
-  // comment -- isolating whether the real multi-minute delay observed
-  // on real Pi 1B hardware happens inside sdhost_init itself or in
-  // this 8-block sweep instead.
-  let sd_sweep_t0: u32 = mmio_read_u32(TIMER_CLO);
-  while sd_blk < 2108 {
-    let _ = test_fill_pattern(sd_buf, 512);
-    let sd_wr: i64 = sdhost_write_block(sd_blk, sd_buf);
-    let sd_rd: i64 = sdhost_read_block(sd_blk, sd_buf2);
-    let sd_mismatch: i64 = test_compare_buffers(sd_buf, sd_buf2, 512);
-    if (sd_wr != 0) || (sd_rd != 0) || (sd_mismatch != 0) {
-      sd_any_fail = 1;
-      // TEMPORARY DIAGNOSTIC (2026-09-15): real Pi 1B hardware has
-      // shown this sweep failing (any_fail=1) even after the two real
-      // controller-FSM/command-ordering bugs already found and fixed
-      // this same investigation (commit 602c2ce) -- distinguishing
-      // WHICH of write/read/compare failed, on WHICH block, and the
-      // raw SDHSTS/SDEDM values at the moment of failure is the same
-      // evidence-first approach that found those two bugs, continued
-      // rather than guessing a third fix blind.
-      let _ = uart_puts("SD DIAG: block ");
-      let _ = uart_put_i64(sd_blk);
-      let _ = uart_puts(" FAILED: wr=");
-      let _ = uart_put_i64(sd_wr);
-      let _ = uart_puts(" rd=");
-      let _ = uart_put_i64(sd_rd);
-      let _ = uart_puts(" mismatch_at=");
-      let _ = uart_put_i64(sd_mismatch);
-      let _ = uart_puts(" SDHSTS=0x");
-      let _ = uart_put_hex32(mmio_read_u32(SDHSTS));
-      let _ = uart_puts(" SDEDM=0x");
-      let _ = uart_put_hex32(mmio_read_u32(SDEDM));
-      let _ = uart_puts("\n");
-      // 30th SD round: byte-level dump on mismatch -- the first time
-      // in this saga a write has succeeded far enough for a content
-      // mismatch to be the interesting thing, not a protocol wedge.
-      let _ = uart_puts("SD DIAG: expected(w) ");
-      let _ = test_dump16(sd_buf);
-      let _ = uart_puts("SD DIAG: actual  (r) ");
-      let _ = test_dump16(sd_buf2);
-    }
-    sd_blk = sd_blk + 1;
-  }
-  let _ = uart_puts("SD: 8-block round-trip sweep any_fail=");
-  let _ = uart_put_hex32(sd_any_fail as u32);
-  let _ = uart_puts("\n");
-  let sd_sweep_elapsed: u32 = mmio_read_u32(TIMER_CLO) - sd_sweep_t0;
-  let _ = uart_puts("SD DIAG: 8-block sweep elapsed t=");
-  let _ = uart_put_i64(sd_sweep_elapsed as i64);
-  let _ = uart_puts("us\n");
-
-  // 34th SD round follow-up: see boot/rpi1/uboot_sdhost_full.c's own
-  // header comment for the full "why". Block 2109 -- one past the
-  // 8-block sweep's own 2100-2107 range above, still inside the
-  // permanently-safe 2049-16383 window (docs/HARDWARE_IN_LOOP.md's own
-  // partition layout) that can never collide with real DharaFS/FAT32
-  // data. This test does its OWN completely independent bring-up from
-  // scratch (its own GPIO mux, SDVDD power-cycle, CMD0 through CMD7),
-  // bypassing sdhost_init entirely -- it deliberately leaves the
-  // controller in whatever state ITS OWN sequence establishes, so
-  // sdhost_init() is re-run immediately after to restore the exact
-  // same normal state the rest of boot (DharaFS, the crypto/TLS self-
-  // tests) already depends on, regardless of this test's own result.
-  let sd_full_write_buf: mut ref i64 = dhruva_alloc_bytes(512);
-  let sd_full_read_buf: mut ref i64 = dhruva_alloc_bytes(512);
-  let _ = test_fill_pattern(sd_full_write_buf, 512);
-  let sd_full_addr: u32 = sdhost_card_addr(2109);
-  let sd_full_status: i64 = uboot_style_full_sequence_test(sd_full_addr, sd_full_write_buf, sd_full_read_buf);
-  let _ = uart_puts("SD DIAG: uboot-full independent bring-up+write+read status=");
-  let _ = uart_put_i64(sd_full_status);
-  let _ = uart_puts(" (0=full success; -1 CMD0, -2 CMD8, -3 ACMD41, -4 CMD2, -5 CMD3, -6 CMD9, -7 CMD7, -8 write, -9 read, -10 mismatch)\n");
-  let _ = sdhost_init();
+  // REMOVED (2026-10-11, real-HW finding): this used to be two
+  // temporary SD-wedge-investigation blocks -- an 8-block (2100-2107)
+  // write/read/compare sweep that, via sdhost_write_block/
+  // sdhost_read_block's own `use_write_diag`/`use_read_diag` block-
+  // range check, routed through the frozen, never-touched-since
+  // boot/rpi1/uboot_sdhost_write.c/read.c U-Boot comparison port
+  // instead of the real production path; and a "34th SD round
+  // follow-up" independent bring-up test (block 2109, uboot_style_
+  // full_sequence_test) whose own result was never consumed by
+  // anything ("regardless of this test's own result"). Both were
+  // explicitly temporary (see git history, "TEMPORARY DIAGNOSTIC
+  // (2026-09-15)") -- their one job was proving U-Boot's own
+  // algorithm wedged identically on this real hardware, ruling out a
+  // DhruvaOS-specific driver bug during the SD wedge saga. That saga
+  // closed in round 42 (commit bb1c4df) with the real fix
+  // (SDHCFG_WIDE_INT_BUS + mask-only-burst-copy) landing directly in
+  // the production path (sdhost_fill_fifo_from_buffer_impl) -- these
+  // two blocks were simply never removed afterward, and kept
+  // unconditionally re-running the frozen comparison code on every
+  // single boot. Found live: that frozen code (which the real fix was
+  // never backported into) hangs reproducibly on this exact board,
+  // inside its own from-scratch bring-up sequence -- blocking every
+  // boot from ever reaching PASS, including runs that have nothing to
+  // do with SD at all. See git history for the removed code if the
+  // comparison is ever needed again.
 
   // Task #4 verification: append several path/value pairs, overwrite
   // one path with a newer value, confirm reads see the latest write
