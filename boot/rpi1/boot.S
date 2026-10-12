@@ -80,6 +80,20 @@
 .global boot_entry
 
 boot_entry:
+    /* Task #308 Phase 5 (A/B kernel slots): stage-0 jumps here with
+     * r0 = the slot index it just booted (0=A, 1=B) -- see
+     * boot/stage0/stage0_main.c's own final jump. Stash it into .data
+     * (same reasoning as the SNAP_TIMER checkpoints just below: .bss
+     * gets zeroed at checkpoint 5, long before kernel_main could read
+     * this) before anything else in boot_entry has a chance to
+     * clobber r0 -- SNAP_TIMER itself only touches r2/r3, but the very
+     * next real instructions after checkpoint 0 load r0 with the
+     * current CPSR, so this must come first, not just "early". r1 is
+     * free here (nothing live on entry per the architectural reset/
+     * stage-0-handoff contract this function already relies on). */
+    ldr r1, =_boot_slot_index
+    str r0, [r1]
+
     SNAP_TIMER 0    /* checkpoint 0: boot_entry's own first instruction --
                      * a small value here (close to the GPU's own
                      * "Starting ARM" timestamp) rules out the GPU/ARM
@@ -314,6 +328,7 @@ hang:
 .global boot_checkpoint_4
 .global boot_checkpoint_5
 .global boot_checkpoint_6
+.global _boot_slot_index
 boot_checkpoint_0: .word 0
 boot_checkpoint_1: .word 0
 boot_checkpoint_2: .word 0
@@ -321,6 +336,12 @@ boot_checkpoint_3: .word 0
 boot_checkpoint_4: .word 0
 boot_checkpoint_5: .word 0
 boot_checkpoint_6: .word 0
+/* Task #308 Phase 5: slot index stage-0 handed off in r0, stashed by
+ * boot_entry's very first instructions above. 0 when this kernel was
+ * loaded directly (QEMU -kernel, or any pre-stage0 card) rather than
+ * chain-loaded -- kernel_slot_mark_boot_good() treats that as "slot A"
+ * the same as a genuine stage-0 handoff would for an untouched card. */
+_boot_slot_index: .word 0
 
 /* Getters for kernel_main.vani, matching usb_wifi_state.S's own
  * established extern-fn pattern exactly: return value in r0, r1=0 (no
@@ -334,6 +355,13 @@ boot_checkpoint_6: .word 0
 .global boot_diag_get_checkpoint_4
 .global boot_diag_get_checkpoint_5
 .global boot_diag_get_checkpoint_6
+.global boot_diag_get_boot_slot_index
+
+boot_diag_get_boot_slot_index:
+    ldr r0, =_boot_slot_index
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
 
 boot_diag_get_checkpoint_0:
     ldr r0, =boot_checkpoint_0

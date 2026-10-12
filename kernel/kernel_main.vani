@@ -2904,6 +2904,11 @@ extern "C" fn boot_diag_get_checkpoint_4() -> u32;
 extern "C" fn boot_diag_get_checkpoint_5() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn boot_diag_get_checkpoint_6() -> u32;
+// Task #308 Phase 5: slot index stage-0 passed in r0, stashed by
+// boot_entry's own first instructions (boot/rpi1/boot.S) before anything
+// else can clobber r0 -- see kernel_slot_mark_boot_good() below.
+#[stack_cost(bytes=1)]
+extern "C" fn boot_diag_get_boot_slot_index() -> u32;
 
 // Round 60 (boot/fw_state.S): packet filtering rule table. proto: 0=any/
 // 1=ICMP/6=TCP/17=UDP (real IPv4 protocol numbers, matching ipv4_get_
@@ -29989,6 +29994,55 @@ fn kernelslot_write_record(rec: ref KernelSlotRecord, block_num: i64) -> i64 {
   return sdhost_write_block(block_num, buf);
 }
 
+// Task #308 Phase 5: called once, immediately after the existing,
+// unconditional "PASS\n" banner further below -- a kernel that reached
+// PASS is, by definition, healthy enough to run the shell, so this
+// confirms that to the NEXT boot by resetting attempt_count back to 0
+// for whichever slot stage-0 says it just booted (boot_diag_get_boot_
+// slot_index(), stashed from r0 by boot/rpi1/boot.S's own first
+// instructions). Deliberately never touches active_slot or
+// preferred_slot -- which slot to prefer stays a fully separate, manual
+// `kernelslot activate` decision (the user's own confirmed "lasting
+// switch" semantics), not something a successful boot should silently
+// change.
+//
+// Only acts when the booted slot matches the record's own active_slot:
+// a mismatch means stage-0 and this kernel disagree about what's
+// running (stale/corrupt record, or this kernel was loaded directly
+// rather than chain-loaded through stage-0 at all) -- guessing which
+// side is right is worse than leaving the counter alone until a real
+// stage-0 boot resolves it. A no-op (no SD write) when the counter is
+// already 0, the common case once a slot has been confirmed good once.
+fn kernel_slot_mark_boot_good() -> i64 {
+  let boot_slot: u32 = boot_diag_get_boot_slot_index();
+  let lookup: KernelSlotRecord = kernelslot_lookup();
+  if lookup.valid != 1 {
+    return 0;
+  }
+  if (lookup.active_slot as u32) != boot_slot {
+    return 0;
+  }
+  if lookup.attempt_count == (0 as u32) {
+    return 0;
+  }
+  let stale: i64 = kernelslot_stale_block(ref lookup);
+  let new_rec: KernelSlotRecord = KernelSlotRecord {
+    valid: 1, chosen_block: lookup.chosen_block,
+    generation: lookup.generation + 1,
+    active_slot: lookup.active_slot,
+    preferred_slot: lookup.preferred_slot,
+    attempt_count: 0 as u32,
+    bootlimit: lookup.bootlimit,
+    slot_a_ready: lookup.slot_a_ready,
+    slot_b_ready: lookup.slot_b_ready,
+    slot_a_len: lookup.slot_a_len,
+    slot_b_len: lookup.slot_b_len,
+    slot_a_sha256: lookup.slot_a_sha256,
+    slot_b_sha256: lookup.slot_b_sha256,
+  };
+  return kernelslot_write_record(ref new_rec, stale);
+}
+
 // Persistent incremental SHA-256 context for `kernelupload chunk` --
 // serialized into kernelupload_sha_ctx's 112-byte scratch between
 // separate shell-command invocations (vani-crypto-hash's own Sha256Ctx
@@ -46043,6 +46097,12 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("\n");
 
   let _ = uart_puts("PASS\n");
+
+  // Task #308 Phase 5: reaching here means this boot is healthy enough
+  // to run the shell -- confirm that to the next boot (see
+  // kernel_slot_mark_boot_good's own header comment for exactly what
+  // this does and does not touch).
+  let _ = kernel_slot_mark_boot_good();
 
   // BUG (round 26 audit, found by actually driving the new shell
   // `ping` command interactively rather than just its self-test):
