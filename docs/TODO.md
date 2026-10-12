@@ -13628,3 +13628,24 @@ input must never trip its own safety net). Needs its own compile-time gate the s
 QEMU regression test — this can only be validated on real hardware, same as the kernel-side watchdog).
 Requires one physical SD reflash to deploy (stage0 cannot be updated over UART by this project's own
 design) — after that one reflash, the entire A/B feature becomes safe to drill unattended indefinitely.
+
+**Done remotely, same day**: implemented per the plan above —
+`boot/stage0/stage0_main.c`'s `stage0_arm_watchdog()` (15-second one-shot, same PM_WDOG/PM_RSTC protocol as
+`watchdog_arm`), gated by `STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE` (a real C `#if`, compiles to nothing
+when off); `kernel_main.vani`'s new `watchdog_disable()`, called right after
+`kernel_slot_mark_boot_good()`, gated by the matching `STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE`.
+Both default to 0 — build clean, QEMU regression (`phase4_milestone.py` 19/19) confirms neither flag
+changes anything while off. Still pending: flipping both to 1 together and the actual real-HW reflash to
+deploy and validate (commit `e59dea5`).
+
+**Separately found live during this same drilling attempt**: a real, unrelated "integer overflow in u32
+add" panic fired (triggered by `kernelslot status` or background activity at roughly the same point,
+undetermined which — see below) and halted the board permanently (`exit()`'s own `while(1){}`, no
+recovery without the watchdog fix above). `build/kernel_main.ll` confirms all ~215 "u32 add" overflow
+checks in `kernel_main.vani` share one deduplicated message string, so the panic text alone can't say
+which site fired; static analysis across all 215 without a live repro or debugger wasn't conclusive
+enough to safely guess-fix one blind. Fixed the diagnosability gap instead: `boot/rpi1/runtime_stubs.c`'s
+`exit()` now prints LR (the return address) before halting — `@__intent_trap` is `alwaysinline`, so by
+that point LR has unwound back into the original vani function that actually overflowed.
+`arm-none-eabi-objdump -d build/dhruva.elf` (or addr2line) against that printed address will pinpoint the
+exact site next time this reproduces, rather than another blind guess (same commit `e59dea5`).
