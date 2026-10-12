@@ -404,6 +404,29 @@ static unsigned int stage0_get_core_clock_hz(void) {
     return 0;
 }
 
+/* FIXED vs. the original port: after forcing the FSM out of READWAIT/
+ * WRITESTART1/READDATA via SDEDM_FORCE_DATA_MODE_BIT, production
+ * (kernel_main.vani's sdhost_force_data_mode_settle) polls (bounded,
+ * 1000 iterations) for the FSM to genuinely settle into IDENTMODE/
+ * DATAMODE, THEN clears the force bit either way -- the original port
+ * set the force bit and immediately broke out of its own poll loop
+ * without ever clearing it again, leaving SDEDM_FORCE_DATA_MODE_BIT
+ * stuck set for the rest of the boot (every later CMD17/CMD24 this
+ * program issues). Ported literally rather than re-derived. */
+static void stage0_force_data_mode_settle(void) {
+    int iter;
+    unsigned int edm;
+    for (iter = 0; iter < 1000; iter = iter + 1) {
+        edm = mmio_r(SDEDM_ADDR);
+        if ((edm & SDEDM_FSM_MASK) == SDEDM_FSM_IDENTMODE || (edm & SDEDM_FSM_MASK) == SDEDM_FSM_DATAMODE) {
+            mmio_w(SDEDM_ADDR, edm & ~SDEDM_FORCE_DATA_MODE_BIT);
+            return;
+        }
+    }
+    edm = mmio_r(SDEDM_ADDR);
+    mmio_w(SDEDM_ADDR, edm & ~SDEDM_FORCE_DATA_MODE_BIT);
+}
+
 /* Bring-up through CMD7 (SELECT_CARD), once per boot. Returns 0 on
  * success, or a negative stage code (-1 CMD0, -2 CMD8, -3 ACMD41,
  * -4 CMD2, -5 CMD3, -6 CMD9, -7 CMD7) matching uboot_sdhost_full.c's
@@ -507,7 +530,17 @@ int stage0_sd_init(void) {
             udelay_real(10000u);
         }
     }
-    mmio_w(SDHCFG_ADDR, 0x418u);
+    /* FIXED vs. the original port: 0x418 (DATA_IRPT_EN|BUSY_IRPT_EN|
+     * SLOW_CARD) does NOT match kernel_main.vani's own current, real-
+     * hardware-proven 1-bit-mode value (0x40A = WIDE_INT_BUS|SLOW_CARD|
+     * BUSY_IRPT_EN -- no DATA_IRPT_EN) -- this project's own 19th/27th/
+     * 30th/42nd SD rounds each found a real wedge/FIFO_ERROR tied to
+     * getting exactly this register's bits wrong, and stage0's port
+     * never incorporated any of those fixes. Only a conservative init-
+     * time default here; the real, authoritative write happens inside
+     * stage0_sd_read_block/stage0_sd_write_block below, matching
+     * production's own per-call rewrite (never just once at init). */
+    mmio_w(SDHCFG_ADDR, 0x40Au);
 
     return 0;
 }
@@ -521,6 +554,19 @@ int stage0_sd_read_block(unsigned int block_num, void *buf) {
     int copy_words;
     long long room_wait_iters;
     unsigned int sdhsts2;
+
+    /* FIXED vs. the original port: real U-Boot (drivers/mmc/mmc_read.c
+     * mmc_bread) reissues CMD16 (SET_BLOCKLEN) before EVERY single
+     * read, never just once at init -- matching kernel_main.vani's own
+     * sdhost_read_block_once exactly (round 2026-09-26). Result
+     * deliberately ignored, matching production's own `let _ =` --
+     * same reasoning: a card whose own notion of "current block
+     * length" has drifted is exactly the class of bug this guards
+     * against, and re-asserting it costs nothing. SDHCFG is rewritten
+     * here too (also per-call in production, not just once at init) --
+     * see stage0_sd_init's own comment for why 0x40A, not 0x418. */
+    stage0_send_cmd(16, 512u, 1, 0, 0, 0, 0, 0, 0, 0, 0, &rr);
+    mmio_w(SDHCFG_ADDR, 0x40Au);
 
     stage0_send_cmd(17, addr, 1, 0, 0, 512, 1, 1, 0, 0, 0, &rr);
     if (rr.err != 0) return -9;
@@ -558,6 +604,7 @@ int stage0_sd_read_block(unsigned int block_num, void *buf) {
             if (fsm == SDEDM_FSM_IDENTMODE || fsm == SDEDM_FSM_DATAMODE) break;
             if (fsm == SDEDM_FSM_READWAIT || fsm == SDEDM_FSM_WRITESTART1 || fsm == SDEDM_FSM_READDATA) {
                 mmio_w(SDEDM_ADDR, edm | SDEDM_FORCE_DATA_MODE_BIT);
+                stage0_force_data_mode_settle();
                 break;
             }
             if (elapsed_at_least(t0, TIMEOUT_US)) return -9;
@@ -587,6 +634,13 @@ int stage0_sd_write_block(unsigned int block_num, const void *buf) {
     long long room_wait_iters;
     unsigned int sdhsts2;
 
+    /* FIXED vs. the original port -- see stage0_sd_read_block's own
+     * matching comment for the full "why" (CMD16 reissue + correct
+     * SDHCFG, both per-call in production, matching sdhost_write_
+     * block_once exactly). */
+    stage0_send_cmd(16, 512u, 1, 0, 0, 0, 0, 0, 0, 0, 0, &rr);
+    mmio_w(SDHCFG_ADDR, 0x40Au);
+
     stage0_send_cmd(24, addr, 1, 0, 0, 512, 1, 0, 1, 0, 0, &rr);
     if (rr.err != 0) return -9;
 
@@ -613,6 +667,24 @@ int stage0_sd_write_block(unsigned int block_num, const void *buf) {
         }
     }
 
+    /* FIXED vs. the original port: missing the FreeBSD-derived "wait
+     * until FIFO is really empty" poll (round 2026-09-20, task #278)
+     * production's own write path added after finding the fill loop's
+     * own exit (room for the last word, not confirmed-drained) left a
+     * real gap before checking FSM state. Bounded, matching
+     * production's own 1,000,000-iteration cap -- a timeout here is
+     * informational, never fatal (production doesn't fail the
+     * transfer on it either), since the FSM-state poll right below
+     * this is still the real correctness gate. */
+    {
+        long long fifo_drain_iter = 0;
+        while (fifo_drain_iter < 1000000LL) {
+            unsigned int edm = mmio_r(SDEDM_ADDR);
+            if (((edm >> 4) & 0x1Fu) == 0u) break;
+            fifo_drain_iter = fifo_drain_iter + 1;
+        }
+    }
+
     sdhsts2 = mmio_r(SDHSTS_ADDR);
     if (sdhsts2 & (0x20u | 0x10u | 0x08u | 0x40u | 0x80u)) return -9;
 
@@ -624,6 +696,7 @@ int stage0_sd_write_block(unsigned int block_num, const void *buf) {
             if (fsm == SDEDM_FSM_IDENTMODE || fsm == SDEDM_FSM_DATAMODE) break;
             if (fsm == SDEDM_FSM_READWAIT || fsm == SDEDM_FSM_WRITESTART1 || fsm == SDEDM_FSM_READDATA) {
                 mmio_w(SDEDM_ADDR, edm | SDEDM_FORCE_DATA_MODE_BIT);
+                stage0_force_data_mode_settle();
                 break;
             }
             if (elapsed_at_least(t0, TIMEOUT_US)) return -9;
