@@ -13581,3 +13581,50 @@ DHDL peripheral in the same sense.
   implementation underneath that log format would need a genuinely new NAND-specific backend, not just a
   new board target. Needs a research-fork scoping pass (real NAND controller on whatever target board,
   ECC scheme, bad-block table format) before any implementation starts.
+
+## A/B kernel slots (task #352): real-HW dress rehearsal found and fixed three QEMU-invisible bugs; one gap remains, needs a physical reflash (2026-10-12)
+
+Phase 6's real-hardware dress rehearsal (boot through stage0 into the link-relocated real kernel) hung
+with zero/partial UART output on the first several attempts, every time in a place 34 prior rounds of
+QEMU-verified regression testing never touched. Root-caused and fixed three separate, genuinely real bugs,
+all invisible under QEMU by construction (no pipeline/prefetch-buffer model, no write-buffer timing):
+
+1. `boot/mmu_init.S`'s hardcoded page table never updated when this same task's own Phase 2 moved the real
+   kernel's link base from `0x8000` to `0x00200000` — Section 2 (now the kernel's own code, including
+   `mmu_init` itself) was still marked execute-never. Fixed: Sections 2/3 marked code, the guard-page
+   table moved to Section 4 to match where `.data`/`.bss` actually land now (commit `e457e7a`).
+2. `mmu_init.S` never issued a CP15 Flush Prefetch Buffer (ARMv6's real ISB) after the SCTLR write that
+   enables the MMU — confirmed required by cross-checking `~/source/sdwedge-uboot-test`, the exact U-Boot
+   build already proven on this real board, whose own `set_cr()` always does this (commit `7e74222`).
+3. `boot/stage0/stage0_main.c` wrote the freshly-read kernel payload into RAM and jumped straight into it
+   with no barrier at all — no `dsb` to drain the write buffer, no prefetch flush. Added the same
+   defensive invalidate sequence `stage0_entry.S` already uses at its own startup (commit `38f0ee8`).
+
+All three QEMU-regression-clean; real-HW retests after each confirmed progressively further boot success,
+culminating in full real-HW success including, for the first time, real USB enumeration (hub, downstream
+hub, RTL8188CU WiFi dongle) and a complete self-test run through `DHCP: client_start`.
+
+**Unattended reboot proven live**: with the real kernel fixed, issued the shell's own `reboot` command
+over UART (no physical access) — confirmed the full loop end to end: `last_reset_reason` persisted before
+the watchdog arms, the board resets itself, the next boot runs clean through all three previously-hanging
+points, reaches `PASS`, and `resetreason` correctly reports `clean reboot`.
+
+**Open gap, found before running the actual bad-kernel auto-revert drill**: `stage0_main.c` never arms any
+watchdog before jumping to the chosen slot. A genuinely bad kernel (this task's own
+`boot/badkernel/bad_entry.S`, a bare `b .`) has no way to recover on its own once jumped to — nothing
+except a hardware reset (watchdog or physical power cycle) can bring the board back, and stage0 itself can
+only be updated by physically re-flashing the SD card (confirmed: `kernelupload`/UART only ever touches
+the real-kernel payload slots). With the user not physically near the board, this means today's stage0 has
+**no automatic self-healing path** if the active slot's payload is bad enough to hang before the real
+kernel's own watchdog/mark-boot-good logic ever runs — exactly the gap "unattended debugging" needs closed.
+
+**TODO for when physical access is available again**: add a watchdog stage0 arms immediately before the
+jump (timeout comfortably longer than this board's observed real boot time to `PASS`, informed by this
+round's own real-HW timing), with the real kernel disarming it right at the existing `PASS`/
+`kernel_slot_mark_boot_good()` checkpoint (not just periodically kicking it — an idle shell waiting for
+input must never trip its own safety net). Needs its own compile-time gate the same shape as
+`WATCHDOG_ENABLE_FOR_REAL_HARDWARE` (QEMU's raspi1ap resets the WHOLE emulated machine immediately on any
+`PM_RSTC` write regardless of timeout, so an unconditional stage0 watchdog-arm would break every existing
+QEMU regression test — this can only be validated on real hardware, same as the kernel-side watchdog).
+Requires one physical SD reflash to deploy (stage0 cannot be updated over UART by this project's own
+design) — after that one reflash, the entire A/B feature becomes safe to drill unattended indefinitely.
