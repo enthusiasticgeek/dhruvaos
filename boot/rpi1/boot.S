@@ -76,10 +76,47 @@
     str r3, [r2]
 .endm
 
+/* TEMPORARY DIAGNOSTIC (2026-10-11, task #352 real-HW dress rehearsal):
+ * stage0 reads the whole kernel payload, verifies its SHA-256, prints
+ * "verified, jumping to 0x00200000", and calls entry() -- then
+ * NOTHING. Zero bytes out of the UART afterward, reproduced twice at
+ * the exact same point. This is the FIRST time this exact entry path
+ * (a software jump from stage0's own C code, not a genuine GPU-
+ * firmware hardware reset handoff) has ever run on real silicon --
+ * every earlier real-HW boot (task #163) was a direct firmware load
+ * at 0x8000, a fundamentally different handoff. The existing SNAP_
+ * TIMER/BOOT DIAG checkpoint mechanism (below) is useless for this:
+ * it stores into .data for kernel_main to print LATER, and if the
+ * hang is anywhere in THIS prologue (before kernel_main ever runs),
+ * nothing ever gets printed at all -- indistinguishable from "stage0
+ * never even jumped." Using r10-r12 throughout (confirmed untouched
+ * by every mode-switch/cache-op/bss-clear instruction in this whole
+ * prologue, including the very first one below, where r0 is still the
+ * live incoming slot/reason argument and must not be clobbered) so
+ * this can be inserted at any point without interfering with anything
+ * real. Same raw PL011 FR/DR register pokes stage0's own u_putc
+ * already proved work on this exact board over this exact UART --
+ * the GPIO ALT0 mux stage0 relied on is a peripheral register, not
+ * cache/MMU state, so it's still correctly configured at this exact
+ * moment regardless of what boot_entry's own prologue does next.
+ * REMOVE once the real hang is found and fixed. */
+.macro RAW_DIAG_PUTC char
+    ldr r10, =0x20201018  /* UART0 FR */
+    ldr r11, =0x20201000  /* UART0 DR */
+diag_wait_\@:
+    ldr r12, [r10]
+    tst r12, #0x20        /* TXFF */
+    bne diag_wait_\@
+    mov r12, #\char
+    str r12, [r11]
+.endm
+
 .section ".text.boot"
 .global boot_entry
 
 boot_entry:
+    RAW_DIAG_PUTC 'A'   /* reached boot_entry's very first instruction */
+
     /* Task #308 Phase 5 (A/B kernel slots): stage-0 jumps here with
      * r0 = the slot index it just booted (0=A, 1=B) -- see
      * boot/stage0/stage0_main.c's own final jump. Stash it into .data
@@ -93,6 +130,7 @@ boot_entry:
      * stage-0-handoff contract this function already relies on). */
     ldr r1, =_boot_slot_index
     str r0, [r1]
+    RAW_DIAG_PUTC 'B'   /* r0 stashed */
 
     SNAP_TIMER 0    /* checkpoint 0: boot_entry's own first instruction --
                      * a small value here (close to the GPU's own
@@ -163,6 +201,7 @@ boot_entry:
     stmia r1!, {r2, r3, r4, r5, r6, r7, r8, r9}
     ldmia r0!, {r2, r3, r4, r5, r6, r7, r8, r9}
     stmia r1!, {r2, r3, r4, r5, r6, r7, r8, r9}
+    RAW_DIAG_PUTC 'C'   /* vector table copied */
 
     /* Task #163 (first real-hardware boot, 2026-09-12): force a known-
      * clean cache/MMU/TLB/branch-predictor state before ANYTHING else
@@ -221,6 +260,7 @@ boot_entry:
                                  * ARMv6 has no dedicated `isb`) */
 
     SNAP_TIMER 1   /* checkpoint 1: cache/MMU/TLB invalidation done */
+    RAW_DIAG_PUTC 'D'   /* cache/MMU/TLB invalidated, SVC sp not yet set */
 
     ldr sp, =_stack_top
 
@@ -299,6 +339,7 @@ clear_bss:
 clear_bss_done:
 
     SNAP_TIMER 5   /* checkpoint 5 (was 3): .bss clear done */
+    RAW_DIAG_PUTC 'E'   /* .bss cleared */
 
     /* Round 38: page table lives in .bss (mmu_init.S), so it must be
      * built AFTER clear_bss above, not before -- otherwise the zero
@@ -306,6 +347,7 @@ clear_bss_done:
     bl mmu_init
 
     SNAP_TIMER 6   /* checkpoint 6 (was 4): mmu_init returned */
+    RAW_DIAG_PUTC 'F'   /* mmu_init returned, about to call kernel_main */
 
     bl kernel_main
 
