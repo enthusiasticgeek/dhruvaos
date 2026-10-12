@@ -13649,3 +13649,58 @@ enough to safely guess-fix one blind. Fixed the diagnosability gap instead: `boo
 that point LR has unwound back into the original vani function that actually overflowed.
 `arm-none-eabi-objdump -d build/dhruva.elf` (or addr2line) against that printed address will pinpoint the
 exact site next time this reproduces, rather than another blind guess (same commit `e59dea5`).
+
+**Correction (commit `7a4892a`, same night)**: the LR fix above was wrong, caught by a real repro. Every
+occurrence landed on the identical address — `objdump` against the exact deployed binary explained why:
+`@__intent_trap`'s LLVM IR says `alwaysinline`, but this build does NOT actually inline it (confirmed via
+`nm`: a real, single shared function, called via plain `bl __intent_trap` from every site). `lr` at
+`exit()`'s own entry is therefore always just "the return address right after `__intent_trap`'s OWN
+`bl exit`" — constant, telling nothing about which site fired. The real answer is one frame further up:
+`__intent_trap`'s prologue (`push {fp, lr}`) saves ITS OWN incoming `lr` — the actual overflow site — on
+its own stack frame, at `exit()`'s own `fp + 8` (worked through the arithmetic against the real
+disassembly, then confirmed the compiled code for `exit()` matches exactly: `mov r3,fp; add r3,r3,#8;
+ldr r3,[r3]`). Real-HW validation of this corrected version is still pending the next reproduction.
+
+## kernelupload-over-UART attempt (task #164/#352, same night): found and fixed a real, previously-undiscovered UART RX bug
+
+With the board up and the A/B feature proven for software-triggered `reboot`, attempted the obvious next
+step per the feature's own purpose: upload the new kernel (WiFi diagnostic + corrected panic-LR fix,
+commit `7a4892a`) to slot B entirely over UART via `test/kernel_upload.py`, no physical access. It failed
+on chunk 1, every attempt, with or without host-side write pacing (tried both).
+
+**Root-caused independent of kernelupload entirely**: a bare, unrelated 100-character test line (no
+`kernelupload` involved at all) hit the identical wall — truncates at exactly 56-58 characters, echo
+stops dead, and genuinely never recovers (checked again 5+ minutes later, still frozen). Short commands
+(`reboot`, `kernelslot status`, `resetreason`, all well under 20 characters) had worked perfectly all
+session. This is a real, general bug in the shell's UART RX path, not anything upload-specific — it had
+simply never been exercised by a line this long before (every interactive command this project has ever
+sent over a real UART link has been short).
+
+**Found via code reading, not guessing**: `boot/uart_tx_ring_state.S`'s own TX ring push/drain assembly
+was read in full first and is correct (bounded, non-blocking, no spin). The real cause is in
+`irq_dispatch`'s RX-drain loop (`kernel_main.vani`): a sporadic-server budget (task #242),
+`UART_RX_IRQ_BUDGET_PER_TICK = 4`, with a comment claiming "4 services × up to 128 bytes drained each =
+512 bytes/tick". That 128 is the loop's own defensive bound against `shell_line_buf`'s capacity, not a
+realistic per-call yield — the real PL011 hardware FIFO is only 16 bytes deep, so each budget unit
+realistically drains ~16 bytes. Real ceiling: 4×16=64 bytes/tick, matching the observed 56-58 character
+truncation almost exactly. Worse than merely slow: once budget hits 0, `irq_dispatch` masks
+`UART_IMSC`'s RXIM/RTIM bits until the next tick's replenish (confirmed correct in `timer_tick_dispatch`)
+— but the UART keeps transmitting regardless, and bytes arriving while masked overflow and are
+**permanently dropped** at the 16-byte hardware FIFO, not queued. If the line's own terminating `\r`
+lands in that dropped window, the line waits forever for a `\r` that already arrived and was lost, and
+every later command's bytes silently append onto that same stuck line instead of starting fresh —
+exactly the observed "permanently wedged, no amount of waiting helps" symptom.
+
+**Fix**: raised `UART_RX_IRQ_BUDGET_PER_TICK` to 8 — covers `shell_line_buf`'s own full 128-byte
+worst-case line in one tick (8×16=128) with no slack, tied to an existing accepted bound rather than an
+arbitrary new number. This doubles the RX path's own worst-case per-tick time (each service call's fixed
+cost is unchanged; only how many can fire per tick goes up) — **this project's own formal schedulability
+analysis (task #190) should be re-run against the new figure** before fully trusting real-time guarantees
+under worst-case RX load; not done as part of this fix, flagged rather than silently assumed fine.
+
+Build clean, QEMU regression (`phase4_milestone.py` 19/19, which drives every interactive shell command
+over this exact RX path) clean (commit `e94e798`). Real-HW validation of the actual fix — and finishing
+the kernelupload-over-UART flow this was blocking — needs the next physical reflash (user: "fix it, i
+will flash sdcard later"). `test/kernel_upload.py` itself needed no changes and is already tracked
+(commit `6ba5bc3`, Phase 4) — a host-side pacing attempt was tried and reverted once the real cause was
+found; it wasn't the fix.
