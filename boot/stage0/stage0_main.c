@@ -362,6 +362,53 @@ void stage0_main(void) {
         }
     }
 
+    /* TASK #352 FIX (2026-10-12, real-HW dress rehearsal): a fresh
+     * multi-boot real-HW capture after the mmu_init.S ISB fix showed a
+     * NEW failure mode, distinct from (and earlier than) the mmu_init
+     * hang this same investigation already fixed twice: some boots
+     * now hang with ZERO UART output at all -- not even boot.S's own
+     * very first RAW_DIAG_PUTC('A') -- immediately after this
+     * function's own "verified, jumping to 0x00200000" line, which
+     * DOES print successfully every time. That boundary is exactly
+     * where this function stops controlling memory (the block-copy
+     * loop above, writing the just-read kernel payload byte-for-byte
+     * into RAM at REAL_KERNEL_LOAD_ADDR) and starts trusting it (the
+     * jump below, fetching instructions from that same address) --
+     * with NO barrier of any kind between the two, unlike every other
+     * place in this codebase that writes code/tables it's about to
+     * rely on (stage0_entry.S's own defensive invalidate above;
+     * mmu_init.S's SCTLR-enable ISB fix, same commit series). Real
+     * bootloaders universally insert exactly this barrier before
+     * jumping into freshly-loaded code (U-Boot's own `bootm`/`go`,
+     * the Linux zImage decompressor) -- its absence here was a real
+     * gap, not a defensive guess. QEMU's TCG core has no write-buffer
+     * or instruction-prefetch model at all, so a race between the
+     * last written byte actually reaching memory and the CPU fetching
+     * from that same address as code is invisible under every one of
+     * this session's QEMU-verified tests by construction -- same
+     * class of QEMU-vs-real-HW divergence as the two fixes before it,
+     * which also explains why this only ever showed up intermittently
+     * on real hardware, never in QEMU.
+     *
+     * Same instruction sequence as stage0_entry.S's own defensive
+     * invalidate (that file's own comment for why each one matters):
+     * DSB (drain the write buffer -- the actual fix for this specific
+     * race), then I+D cache invalidate, TLB invalidate, branch-
+     * predictor invalidate, and ISB (flush prefetch buffer) -- belt
+     * and suspenders, not just the one instruction theoretically
+     * required, matching this project's own established convention
+     * for "about to trust memory state I'm not certain is settled". */
+    __asm__ volatile (
+        "mov r0, #0\n"
+        "mcr p15, 0, r0, c7, c10, 4\n"
+        "mcr p15, 0, r0, c7, c7, 0\n"
+        "mcr p15, 0, r0, c8, c7, 0\n"
+        "mcr p15, 0, r0, c7, c5, 6\n"
+        "mcr p15, 0, r0, c7, c10, 4\n"
+        "mcr p15, 0, r0, c7, c5, 4\n"
+        ::: "r0", "memory"
+    );
+
     u_puts("stage0: verified, jumping to 0x00200000\n");
 
     {
