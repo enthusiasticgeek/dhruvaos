@@ -43,7 +43,13 @@ DEFAULT_BOOTLIMIT = 3
 #   4   u32 generation
 #   8   u8  active_slot      (0=A, 1=B)
 #   9   u8  preferred_slot
-#   10  u16 reserved0
+#   10  u8  last_reset_reason (0=power-on, 1=clean reboot, 2=watchdog/
+#                              hang recovery, 3=auto-fallback -- task
+#                              #308 follow-up, "I need unattended
+#                              debugging" -- backward-compatible: an
+#                              old record's zeroed reserved0 byte
+#                              already decoded as 0/power-on)
+#   11  u8  reserved0b
 #   12  u32 attempt_count
 #   16  u32 bootlimit
 #   20  u8  slot_a_ready
@@ -54,18 +60,19 @@ DEFAULT_BOOTLIMIT = 3
 #   32  u8[32] slot_a_sha256
 #   64  u8[32] slot_b_sha256
 #   96  u32 crc32 (over bytes 0..95)
-_STRUCT_FMT = "<IIBBHII BBH II 32s32s I".replace(" ", "")
+_STRUCT_FMT = "<IIBBBBII BBH II 32s32s I".replace(" ", "")
 _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
 assert _STRUCT_SIZE == 100, _STRUCT_SIZE
 
 
 def pack_state(generation, active_slot, preferred_slot, attempt_count,
                bootlimit, slot_a_ready, slot_b_ready, slot_a_len,
-               slot_b_len, slot_a_sha256, slot_b_sha256):
+               slot_b_len, slot_a_sha256, slot_b_sha256,
+               last_reset_reason=0):
     assert len(slot_a_sha256) == 32 and len(slot_b_sha256) == 32
     body = struct.pack(
         _STRUCT_FMT[:-1],  # everything except the trailing crc32 'I'
-        MAGIC, generation, active_slot, preferred_slot, 0,
+        MAGIC, generation, active_slot, preferred_slot, last_reset_reason, 0,
         attempt_count, bootlimit, slot_a_ready, slot_b_ready, 0,
         slot_a_len, slot_b_len, slot_a_sha256, slot_b_sha256,
     )
@@ -79,9 +86,9 @@ def unpack_state(raw_block):
     if len(raw_block) < _STRUCT_SIZE:
         return None
     fields = struct.unpack(_STRUCT_FMT, raw_block[:_STRUCT_SIZE])
-    (magic, generation, active_slot, preferred_slot, _r0, attempt_count,
-     bootlimit, slot_a_ready, slot_b_ready, _r1, slot_a_len, slot_b_len,
-     slot_a_sha256, slot_b_sha256, crc) = fields
+    (magic, generation, active_slot, preferred_slot, last_reset_reason, _r0b,
+     attempt_count, bootlimit, slot_a_ready, slot_b_ready, _r1, slot_a_len,
+     slot_b_len, slot_a_sha256, slot_b_sha256, crc) = fields
     if magic != MAGIC:
         return None
     body = raw_block[:96]
@@ -91,6 +98,7 @@ def unpack_state(raw_block):
         "generation": generation,
         "active_slot": active_slot,
         "preferred_slot": preferred_slot,
+        "last_reset_reason": last_reset_reason,
         "attempt_count": attempt_count,
         "bootlimit": bootlimit,
         "slot_a_ready": slot_a_ready,
@@ -185,6 +193,8 @@ def cmd_status(args):
     print(f"active_slot={'A' if state['active_slot'] == 0 else 'B'}  "
           f"preferred_slot={'A' if state['preferred_slot'] == 0 else 'B'}")
     print(f"attempt_count={state['attempt_count']}  bootlimit={state['bootlimit']}")
+    reason_names = {0: "power-on", 1: "clean reboot", 2: "watchdog/hang recovery", 3: "auto-fallback"}
+    print(f"last_reset_reason={reason_names.get(state['last_reset_reason'], state['last_reset_reason'])}")
     print(f"slot A: ready={state['slot_a_ready']} len={state['slot_a_len']} "
           f"sha256={state['slot_a_sha256']}")
     print(f"slot B: ready={state['slot_b_ready']} len={state['slot_b_len']} "

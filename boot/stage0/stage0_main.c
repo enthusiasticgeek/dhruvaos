@@ -88,10 +88,21 @@ static void write_u32_le(unsigned char *buf, unsigned int off, unsigned int v) {
     buf[off + 3] = (unsigned char)(v >> 24);
 }
 
+/* Task #308 follow-up ("I need unattended debugging"/"reset reason"):
+ * REASON_* values for last_reset_reason below -- see test/kernel_
+ * slot_layout.py's own matching struct comment for the on-disk byte
+ * offset. Backward-compatible: an old record's zeroed reserved byte
+ * already decodes as REASON_POWER_ON. */
+#define REASON_POWER_ON 0u
+#define REASON_CLEAN_REBOOT 1u
+#define REASON_WATCHDOG_OR_HANG 2u
+#define REASON_AUTO_FALLBACK 3u
+
 struct slot_state {
     unsigned int generation;
     unsigned char active_slot;
     unsigned char preferred_slot;
+    unsigned char last_reset_reason;
     unsigned int attempt_count;
     unsigned int bootlimit;
     unsigned char slot_a_ready;
@@ -117,6 +128,7 @@ static int parse_slot_state(const unsigned char *raw, struct slot_state *out) {
     out->generation = read_u32_le(raw, 4);
     out->active_slot = raw[8];
     out->preferred_slot = raw[9];
+    out->last_reset_reason = raw[10];
     out->attempt_count = read_u32_le(raw, 12);
     out->bootlimit = read_u32_le(raw, 16);
     out->slot_a_ready = raw[20];
@@ -142,6 +154,7 @@ static void build_slot_state(const struct slot_state *s, unsigned char *out) {
     write_u32_le(out, 4, s->generation);
     out[8] = s->active_slot;
     out[9] = s->preferred_slot;
+    out[10] = s->last_reset_reason;
     write_u32_le(out, 12, s->attempt_count);
     write_u32_le(out, 16, s->bootlimit);
     out[20] = s->slot_a_ready;
@@ -218,6 +231,23 @@ void stage0_main(void) {
         stage0_fault(0xDEAD0002u);
     }
 
+    /* Task #308 follow-up ("I need unattended debugging"/"reset
+     * reason"): capture the record's state exactly as read, BEFORE
+     * this boot's own increment/fallback logic touches it, so the
+     * reason computed below reflects what actually happened to the
+     * PREVIOUS boot of this slot, not this one. prior_attempt_count
+     * > 0 means the previous boot never reached kernel_slot_mark_
+     * boot_good() (which always resets it to 0 on success) --
+     * i.e. it was interrupted, by a hang+watchdog, a crash, or a raw
+     * power loss, never a clean exit. prior_reason carries forward
+     * whatever the kernel's own `reboot` shell command may have just
+     * written right before resetting (REASON_CLEAN_REBOOT) -- the one
+     * case prior_attempt_count alone can't distinguish, since a
+     * deliberate reboot after a fully healthy boot also has
+     * attempt_count==0. */
+    unsigned int prior_attempt_count = chosen.attempt_count;
+    unsigned char prior_reason = chosen.last_reset_reason;
+
     /* Step 2/3: increment the current active slot's attempt counter;
      * flip to the other slot if it's exhausted the bootlimit and the
      * other slot is ready. */
@@ -230,6 +260,7 @@ void stage0_main(void) {
     u_hex32(chosen.bootlimit ? chosen.bootlimit : DEFAULT_BOOTLIMIT);
     u_puts("\n");
 
+    int fell_back = 0;
     {
         unsigned int bootlimit = chosen.bootlimit ? chosen.bootlimit : DEFAULT_BOOTLIMIT;
         if (chosen.attempt_count > bootlimit) {
@@ -240,10 +271,30 @@ void stage0_main(void) {
                 u_putc(chosen.active_slot == 0 ? 'A' : 'B');
                 u_puts("\n");
                 chosen.attempt_count = 0;
+                fell_back = 1;
             } else {
                 u_puts("stage0: bootlimit exceeded but other slot not ready, retrying active slot anyway\n");
             }
         }
+    }
+
+    /* Task #308 follow-up: decide this boot's own reset reason, for
+     * the NEXT kernel boot to read back (see the "resetreason" shell
+     * command, kernel_main.vani) -- precedence matches how
+     * informative each case is: an auto-fallback is always worth
+     * flagging even if it happens to follow a clean reboot (which
+     * can't itself explain exhausting bootlimit); a clean reboot only
+     * "counts" once, consumed here so the NEXT-next boot defaults
+     * back to power-on rather than claiming every future boot was
+     * also a clean reboot. */
+    if (fell_back) {
+        chosen.last_reset_reason = REASON_AUTO_FALLBACK;
+    } else if (prior_reason == REASON_CLEAN_REBOOT) {
+        chosen.last_reset_reason = REASON_CLEAN_REBOOT;
+    } else if (prior_attempt_count > 0) {
+        chosen.last_reset_reason = REASON_WATCHDOG_OR_HANG;
+    } else {
+        chosen.last_reset_reason = REASON_POWER_ON;
     }
 
     chosen.generation = chosen.generation + 1;
@@ -314,8 +365,12 @@ void stage0_main(void) {
     u_puts("stage0: verified, jumping to 0x00200000\n");
 
     {
+        /* Task #308 follow-up: pack the reset reason into the upper
+         * byte of the r0 handoff, slot index unchanged in the low
+         * byte -- boot/rpi1/boot.S's own getter masks each back out
+         * separately (see its own comment). */
         void (*entry)(unsigned int) = (void (*)(unsigned int))REAL_KERNEL_LOAD_ADDR;
-        entry((unsigned int)chosen.active_slot);
+        entry(((unsigned int)chosen.last_reset_reason << 8) | (unsigned int)chosen.active_slot);
     }
 
     /* Never reached -- entry() does not return. */

@@ -2909,6 +2909,12 @@ extern "C" fn boot_diag_get_checkpoint_6() -> u32;
 // else can clobber r0 -- see kernel_slot_mark_boot_good() below.
 #[stack_cost(bytes=1)]
 extern "C" fn boot_diag_get_boot_slot_index() -> u32;
+// Task #308 follow-up ("I need unattended debugging"/"reset reason"):
+// upper byte of the same r0 handoff, stage0's own computed reset
+// reason -- see shell_dispatch_resetreason below and stage0_main.c's
+// own final-jump comment for the packing.
+#[stack_cost(bytes=1)]
+extern "C" fn boot_diag_get_boot_reset_reason() -> u32;
 
 // Round 60 (boot/fw_state.S): packet filtering rule table. proto: 0=any/
 // 1=ICMP/6=TCP/17=UDP (real IPv4 protocol numbers, matching ipv4_get_
@@ -29858,6 +29864,23 @@ fn kernelslot_crc32(buf: mut ref i64, buf_len: i64) -> u32 {
   return crc ^ (4294967295 as u32);
 }
 
+// Task #308 follow-up ("I need unattended debugging"/"reset reason"):
+// decodes last_reset_reason -- see stage0_main.c's own REASON_*
+// constants and the struct field's own comment for exactly how each
+// value gets decided.
+fn kernelslot_reset_reason_name(reason: u8) -> Str {
+  if reason == (1 as u8) {
+    return "clean reboot";
+  }
+  if reason == (2 as u8) {
+    return "watchdog/hang recovery";
+  }
+  if reason == (3 as u8) {
+    return "auto-fallback (bootlimit exceeded)";
+  }
+  return "power-on";
+}
+
 // Flattened: no nested struct (KernelSlotRecord embedding another
 // struct type is untested in this codebase, deliberately avoided).
 // `valid`/`chosen_block` are lookup metadata, not part of the on-disk
@@ -29869,6 +29892,7 @@ struct KernelSlotRecord {
   generation: u32,
   active_slot: u8,
   preferred_slot: u8,
+  last_reset_reason: u8,
   attempt_count: u32,
   bootlimit: u32,
   slot_a_ready: u8,
@@ -29910,6 +29934,7 @@ fn kernelslot_parse(raw: mut ref i64, chosen_block: i64) -> KernelSlotRecord {
     generation: buf_read_u32_le(raw, 4),
     active_slot: buf_read_byte(raw, 8) as u8,
     preferred_slot: buf_read_byte(raw, 9) as u8,
+    last_reset_reason: buf_read_byte(raw, 10) as u8,
     attempt_count: buf_read_u32_le(raw, 12),
     bootlimit: buf_read_u32_le(raw, 16),
     slot_a_ready: buf_read_byte(raw, 20) as u8,
@@ -29931,6 +29956,7 @@ fn kernelslot_build(rec: ref KernelSlotRecord, out: mut ref i64) -> i64 {
   let _ = buf_write_u32_le(out, 4, rec.generation);
   let _ = buf_write_byte(out, 8, rec.active_slot as u32);
   let _ = buf_write_byte(out, 9, rec.preferred_slot as u32);
+  let _ = buf_write_byte(out, 10, rec.last_reset_reason as u32);
   let _ = buf_write_u32_le(out, 12, rec.attempt_count);
   let _ = buf_write_u32_le(out, 16, rec.bootlimit);
   let _ = buf_write_byte(out, 20, rec.slot_a_ready as u32);
@@ -30031,6 +30057,7 @@ fn kernel_slot_mark_boot_good() -> i64 {
     generation: lookup.generation + 1,
     active_slot: lookup.active_slot,
     preferred_slot: lookup.preferred_slot,
+    last_reset_reason: lookup.last_reset_reason,
     attempt_count: 0 as u32,
     bootlimit: lookup.bootlimit,
     slot_a_ready: lookup.slot_a_ready,
@@ -30357,6 +30384,7 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
         generation: lookup.generation + 1,
         active_slot: lookup.active_slot,
         preferred_slot: lookup.preferred_slot,
+        last_reset_reason: lookup.last_reset_reason,
         attempt_count: lookup.attempt_count,
         bootlimit: lookup.bootlimit,
         slot_a_ready: 1 as u8,
@@ -30372,6 +30400,7 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
         generation: lookup.generation + 1,
         active_slot: lookup.active_slot,
         preferred_slot: lookup.preferred_slot,
+        last_reset_reason: lookup.last_reset_reason,
         attempt_count: lookup.attempt_count,
         bootlimit: lookup.bootlimit,
         slot_a_ready: lookup.slot_a_ready,
@@ -30422,6 +30451,9 @@ fn shell_dispatch_kernelslot(line_buf: mut ref i64, cmd_end: i64, line_len: i64)
     let _ = uart_puts(if lookup.active_slot == (0 as u8) { "A" } else { "B" });
     let _ = uart_puts(" preferred_slot=");
     let _ = uart_puts(if lookup.preferred_slot == (0 as u8) { "A" } else { "B" });
+    let _ = uart_puts("\n");
+    let _ = uart_puts("last_reset_reason=");
+    let _ = uart_puts(kernelslot_reset_reason_name(lookup.last_reset_reason));
     let _ = uart_puts("\n");
     let _ = uart_puts("attempt_count=");
     let _ = uart_put_i64(lookup.attempt_count as i64);
@@ -30475,6 +30507,7 @@ fn shell_dispatch_kernelslot(line_buf: mut ref i64, cmd_end: i64, line_len: i64)
       generation: lookup.generation + 1,
       active_slot: new_active,
       preferred_slot: new_active,
+      last_reset_reason: lookup.last_reset_reason,
       attempt_count: 0 as u32,
       bootlimit: lookup.bootlimit,
       slot_a_ready: lookup.slot_a_ready,
@@ -31291,8 +31324,51 @@ fn shell_dispatch() -> i64 {
   // requested reboot the way watchdog_init/_kick's own 2-second
   // supervision timeout needs to.
   if shell_word_matches(line_buf, 0, cmd_end, "reboot") == 1 {
+    // Task #308 follow-up ("I need unattended debugging"/"reset
+    // reason"): record that this reset was deliberate BEFORE arming
+    // the watchdog -- watchdog_arm's own first write (PM_WDOG) is
+    // harmless, but its SECOND write (PM_RSTC) resets the real board
+    // immediately once the 1-tick timeout elapses, so this has to
+    // happen first or never. Best-effort: a missing/invalid record
+    // (A/B feature never seeded) doesn't block the reboot itself --
+    // see kernel_slot_mark_boot_good's own identical "don't guess"
+    // reasoning for not forcing a record into existence here either.
+    let reboot_lookup: KernelSlotRecord = kernelslot_lookup();
+    if reboot_lookup.valid == 1 {
+      let reboot_stale: i64 = kernelslot_stale_block(ref reboot_lookup);
+      let reboot_new_rec: KernelSlotRecord = KernelSlotRecord {
+        valid: 1, chosen_block: reboot_lookup.chosen_block,
+        generation: reboot_lookup.generation + 1,
+        active_slot: reboot_lookup.active_slot,
+        preferred_slot: reboot_lookup.preferred_slot,
+        last_reset_reason: 1 as u8,
+        attempt_count: reboot_lookup.attempt_count,
+        bootlimit: reboot_lookup.bootlimit,
+        slot_a_ready: reboot_lookup.slot_a_ready,
+        slot_b_ready: reboot_lookup.slot_b_ready,
+        slot_a_len: reboot_lookup.slot_a_len,
+        slot_b_len: reboot_lookup.slot_b_len,
+        slot_a_sha256: reboot_lookup.slot_a_sha256,
+        slot_b_sha256: reboot_lookup.slot_b_sha256,
+      };
+      let _ = kernelslot_write_record(ref reboot_new_rec, reboot_stale);
+    }
     let _ = uart_puts("rebooting...\n");
     let _ = watchdog_arm(1 as u32);
+    return 0;
+  }
+
+  // Task #308 follow-up ("I need unattended debugging"/"reset
+  // reason"): what stage0 decided caused THIS boot -- see boot/rpi1/
+  // boot.S's own boot_diag_get_boot_reset_reason getter and stage0_
+  // main.c's own final-jump comment for exactly how it's computed.
+  // Reads the live r0 handoff directly, not the SD record (same
+  // value in practice, but this is the cheaper, more direct source --
+  // no SD I/O needed just to answer "why am I up").
+  if shell_word_matches(line_buf, 0, cmd_end, "resetreason") == 1 {
+    let reason: u8 = boot_diag_get_boot_reset_reason() as u8;
+    let _ = uart_puts(kernelslot_reset_reason_name(reason));
+    let _ = uart_puts("\n");
     return 0;
   }
 
@@ -44695,6 +44771,29 @@ fn kernel_main() -> i64 {
   let _ = uart_put_hex32(boot_diag_get_checkpoint_6());
   let _ = uart_puts("\n");
 
+  // Task #308 follow-up (2026-10-11, "I need unattended debugging"):
+  // armed as early as UART diagnostics allow, not right before
+  // start_multitasking as this used to be -- a kernel that hangs
+  // ANYWHERE in the long self-test battery below (SD/DharaFS/crypto/
+  // USB/framebuffer, all of which run long before the scheduler ever
+  // starts and the timer-tick kick further down begins firing) had no
+  // watchdog protection at all under the old, late arm point, which
+  // defeats the entire point of the A/B kernel-slot feature's auto-
+  // revert for the single most likely real-world failure mode (a hang,
+  // not a clean crash): nothing re-triggers stage0's attempt-counter
+  // logic without an actual reset, and nothing resets a hung board
+  // without an independent watchdog. Explicit manual kicks after each
+  // major phase below keep a HEALTHY boot from ever tripping this on
+  // its own -- see each kick's own call site. Still gated by
+  // WATCHDOG_ENABLE_FOR_REAL_HARDWARE, still 0 by default: see that
+  // constant's own header comment for why (QEMU's raspi1ap resets
+  // IMMEDIATELY on the very first PM_RSTC write watchdog_arm makes,
+  // regardless of the timeout value -- this entire mechanism can only
+  // be validated on real hardware, never QEMU, by construction).
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_init();
+  }
+
   // Shared, persistent scratch buffers for the FS layer, shell
   // dispatch, eval, and uart_put_i64 -- allocated exactly once, here,
   // before anything that uses them ever runs. See scratch_state.S's
@@ -44983,6 +45082,14 @@ fn kernel_main() -> i64 {
   if sd_status < 0 {
     let _ = uart_puts("SD: sdhost_init FAILED (see the timeout message above for which command)\n");
   }
+  // Task #308 follow-up: kick after the SD bring-up phase -- a board
+  // that hangs INSIDE sdhost_init's own identification sequence (the
+  // single slowest, most real-hardware-timing-sensitive phase of
+  // early boot) gets reset and falls back within one watchdog period,
+  // rather than needing a physical power-cycle.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
 
   // REMOVED (2026-10-11, real-HW finding): this used to be two
   // temporary SD-wedge-investigation blocks -- an 8-block (2100-2107)
@@ -45021,6 +45128,11 @@ fn kernel_main() -> i64 {
   let _ = ble_config_init();
   let _ = dhdl_init();
   let _ = crashlog_boot_increment();
+  // Task #308 follow-up: kick after DharaFS's own recovery scan --
+  // see the kick right after sdhost_init's own matching comment.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
 
   // Report what recovery alone found, BEFORE any fresh writes this
   // boot might make -- test/power_yank.py checks exactly this line
@@ -45173,6 +45285,11 @@ fn kernel_main() -> i64 {
   if boot_debug_enabled() == 1 { let _ = uart_clock_governor_cross_check_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dma_ram_copy_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dma_uart_tx_self_test(); }
+  // Task #308 follow-up: kick after eval/governor self-tests -- see
+  // the kick right after sdhost_init's own matching comment.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
 
   // Round 60: packet filtering's own default policy -- .bss's own
   // zero-init would otherwise leave fw_default_policy at 0 (deny),
@@ -45319,6 +45436,12 @@ fn kernel_main() -> i64 {
   // controller, already brought up above.
   let _ = dharafs_crypto_key_init();
   let _ = dharafs_encryption_self_check();
+  // Task #308 follow-up: kick after the media-encryption self-check
+  // (its own real SD round trip) -- see the kick right after
+  // sdhost_init's own matching comment.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
 
   // Round 44's own bignum arithmetic base (bignum_add_raw/sub_raw/
   // mul_raw/etc, and its own bignum_self_test) was deleted round 100
@@ -45373,6 +45496,11 @@ fn kernel_main() -> i64 {
   }
   if boot_debug_enabled() == 1 { let _ = dwc2_wait_chan0_done_wcet_measure_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dwc2_net_bulk_in_poll_wcet_measure_self_test(); }
+  // Task #308 follow-up: kick after USB bring-up -- see the kick
+  // right after sdhost_init's own matching comment.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
 
   // Round 17 experiment (task #325, real-HW): moved from BEFORE
   // usb_power_on()/dwc2_init() to HERE, AFTER the whole USB bring-up
@@ -45397,13 +45525,15 @@ fn kernel_main() -> i64 {
   let _ = timer_ic_init();
   let _ = uart_rx_irq_init();
 
-  // See watchdog_arm's own header comment for why this is gated rather
-  // than unconditional -- disabled by default (this project's own
-  // checked-in QEMU-driven development posture), real protection once
-  // WATCHDOG_ENABLE_FOR_REAL_HARDWARE is flipped to 1 for an actual
-  // hardware deployment build.
+  // Task #308 follow-up: this USED to be where watchdog_init() first
+  // armed (right before task setup) -- moved to right after
+  // uart_init()'s own boot-diag prints instead (see that call site's
+  // own comment), so a kick here is what keeps the 2-second budget
+  // from expiring between the framebuffer self-check above and the
+  // timer interrupt starting up (which is what drives watchdog_kick()
+  // from here on, every tick -- see that call site's own comment).
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
-    let _ = watchdog_init();
+    let _ = watchdog_kick();
   }
 
   let stack_bytes: i64 = 4096;

@@ -356,10 +356,28 @@ _boot_slot_index: .word 0
 .global boot_diag_get_checkpoint_5
 .global boot_diag_get_checkpoint_6
 .global boot_diag_get_boot_slot_index
+.global boot_diag_get_boot_reset_reason
 
+/* Task #308 follow-up ("I need unattended debugging"/"reset reason"):
+ * stage0 now packs TWO values into the r0 it hands off -- the slot
+ * index in the low byte (unchanged meaning/callers from before), the
+ * reset reason in the next byte up (see stage0_main.c's own final-
+ * jump comment for the exact packing). Masking here, rather than
+ * changing what _boot_slot_index itself stores, keeps every existing
+ * caller of this getter (kernel_slot_mark_boot_good, in particular)
+ * correct with no changes on their side. */
 boot_diag_get_boot_slot_index:
     ldr r0, =_boot_slot_index
     ldr r0, [r0]
+    and r0, r0, #0xFF
+    mov r1, #0
+    bx lr
+
+boot_diag_get_boot_reset_reason:
+    ldr r0, =_boot_slot_index
+    ldr r0, [r0]
+    mov r0, r0, lsr #8
+    and r0, r0, #0xFF
     mov r1, #0
     bx lr
 
