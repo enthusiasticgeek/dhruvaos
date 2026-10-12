@@ -146,27 +146,40 @@ int dprintf(int fd, const char *fmt, ...) {
  * @.msg.ovf.u32.add global, all call sites emit the identical
  * pointer), that single line can't say WHICH one. Static analysis of
  * all 215 candidates without a live repro or debugger wasn't
- * conclusive enough to safely guess-fix one blind. This prints LR
- * (the return address) right before halting instead: @__intent_trap
- * is `alwaysinline` (build/kernel_main.ll's own definition), so by
- * the time exit() is reached, LR has already unwound through that
- * inlined wrapper back into the ORIGINAL vani function that hit the
- * overflow -- `arm-none-eabi-objdump -d build/dhruva.elf` (or
- * addr2line against it) against this printed address pinpoints
- * exactly which of the 215 sites fired, next time this reproduces,
- * rather than needing another blind guess. Captured here (not inside
- * dprintf/__intent_trap) because this is the LAST point before the
- * permanent halt and the simplest place to add a raw register read
- * without touching the compiler's own generated panic path at all. */
+ * conclusive enough to safely guess-fix one blind.
+ *
+ * FIRST VERSION of this fix (same commit series) printed the raw `lr`
+ * register here and was WRONG -- confirmed by a real repro landing at
+ * the same address (0x00206EC8) every time, and `objdump -d` against
+ * the exact deployed binary showing why: @__intent_trap's own LLVM IR
+ * says `alwaysinline`, but this build does NOT actually inline it --
+ * it's a real, single shared function (confirmed: `nm` gives it its
+ * own symbol, called via plain `bl __intent_trap` from every site).
+ * `lr` at exit()'s own entry is therefore always just "the return
+ * address right after __intent_trap's OWN `bl exit`" -- constant,
+ * telling nothing about which of the 215 call sites actually fired.
+ *
+ * The real answer is one frame further up: __intent_trap's prologue
+ * (`push {fp, lr}`, confirmed via objdump) saves ITS OWN incoming lr
+ * -- the actual overflow call site -- on its stack frame, 4 bytes
+ * above where it set its own sp. exit() never disturbs that frame
+ * (its own prologue only pushes further below); its own `fp` (set by
+ * its prologue's `add fp, sp, #4`, also confirmed via objdump) sits
+ * exactly 4 bytes below __intent_trap's own post-push sp. Working
+ * through the arithmetic once, concretely, rather than guessing a
+ * second time: __intent_trap's post-push sp = exit()'s own fp + 4;
+ * __intent_trap's saved lr lives at (that sp) + 4 = exit()'s fp + 8.
+ * That is the address actually read below. */
 void exit(int code) {
     (void)code;
-    unsigned int lr;
-    __asm__ volatile ("mov %0, lr" : "=r" (lr));
-    dhruva_dprintf_puts("panic LR=0x");
+    unsigned int exit_fp;
+    __asm__ volatile ("mov %0, fp" : "=r" (exit_fp));
+    unsigned int real_lr = *(unsigned int *)(exit_fp + 8);
+    dhruva_dprintf_puts("panic caller LR=0x");
     {
         int shift = 28;
         while (shift >= 0) {
-            unsigned int nib = (lr >> shift) & 0xF;
+            unsigned int nib = (real_lr >> shift) & 0xF;
             char c = (nib < 10) ? (char)('0' + nib) : (char)('A' + (nib - 10));
             dhruva_dprintf_putc(c);
             shift = shift - 4;
