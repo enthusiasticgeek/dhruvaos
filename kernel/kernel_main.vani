@@ -2057,11 +2057,44 @@ extern "C" fn uart_rx_irq_budget_set(v: u32) -> i64;
 extern "C" fn uart_rx_deferred_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn uart_rx_deferred_set(v: u32) -> i64;
-// 4 RX-IRQ services (up to 128 bytes drained each) per 500ms tick =
-// up to 512 bytes/tick -- deliberately generous, well beyond real
-// interactive typing speed, only a genuine machine-speed flood could
-// ever reach it.
-const UART_RX_IRQ_BUDGET_PER_TICK: i64 = 4;
+// TASK #352/#164 FOLLOW-UP (2026-10-12, real-HW finding): this constant's
+// own original comment (preserved below in spirit, corrected in fact)
+// assumed each service call could drain "up to 128 bytes" -- the
+// irq_dispatch RX loop's own defensive bound against shell_line_buf's
+// capacity, not a realistic per-call yield. The real PL011 hardware
+// FIFO is only 16 bytes deep; one service call can only ever find
+// what's ACTUALLY sitting in that 16-byte FIFO at entry time (the
+// 128-iteration poll just busy-waits through empty reads otherwise,
+// confirmed by reading irq_dispatch's own loop -- a `for` bound, not a
+// real drain amount). So the real per-tick ceiling with budget=4 was
+// 4*16=64 bytes, not the documented 512 -- confirmed live, the hard
+// way: a single `kernelupload chunk <96 hex chars>` line (~115 bytes)
+// and an unrelated bare 100-character test line BOTH wedged identically
+// at 56-58 characters in, every single time, with no recovery even
+// minutes later. Not merely delayed: once budget hits 0, irq_dispatch
+// masks UART_IMSC's RXIM/RTIM bits until the next tick's own replenish
+// (timer_tick_dispatch, confirmed correct) -- but while masked, any
+// MORE bytes arriving (the UART doesn't pause transmission) overflow
+// and are PERMANENTLY dropped at the 16-byte hardware FIFO itself, not
+// queued -- including, fatally, whatever byte happens to land there,
+// possibly the line's own terminating \r. The line's shell_line_buf
+// entry then waits forever for a \r that already arrived and was lost,
+// with every subsequent command's bytes silently appending onto that
+// same stuck, unterminated line instead of starting fresh -- exactly
+// the "permanently wedged, no amount of waiting recovers it" symptom
+// observed, as opposed to a merely slow one.
+//
+// Raised from 4 to 8: covers shell_line_buf's own full 128-byte worst-
+// case line length in one tick (8 * 16 = 128) with no slack, rather
+// than an arbitrary larger number -- tied to an already-accepted
+// existing bound, not a new guess. This DOES double the worst-case
+// per-tick time this RX path can consume (each service call's own
+// fixed 128-iteration-poll cost is unchanged; only how many times per
+// tick it can fire goes up) -- re-run this project's own formal
+// schedulability analysis (task #190) against the new figure before
+// trusting real-time guarantees under worst-case RX load; not done
+// as part of this fix, flagged here instead of silently assumed fine.
+const UART_RX_IRQ_BUDGET_PER_TICK: i64 = 8;
 // Round 192: opens every ARMv6 domain (kernel-context escape hatch) --
 // see dacr_open_all's own comment in context_switch.S for why
 // irq_dispatch needs this (stack_canary_check_all's own cross-task
