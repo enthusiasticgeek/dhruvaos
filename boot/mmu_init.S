@@ -422,22 +422,75 @@ mmu_init:
     orr r5, r5, #0x00100000
     str r5, [r4, #4]
 
-    /* Section 2 (0x00200000-0x002FFFFF): .data/.bss (includes the
-     * heap)/task stacks/.ARM.exidx+extab -- TASK #163 FIX (2026-09-12):
-     * moved here from Section 1 (see that entry's own comment for the
-     * full reasoning) now that link.ld's own self-adjusting ALIGN
-     * places this region at the SECOND 1MB boundary, not the first.
-     * PAGE TABLE (coarse) descriptor, not a plain section descriptor
-     * -- see mmu_l2_table_data's own comment above for why (per-task
-     * stack guard pages need 4KB granularity a 1MB section can't
-     * express). L1 "page table" format: bits[31:10] = L2 table base,
-     * bits[8:5] = domain (0, matching every other entry in this
+    /* TASK #352 FIX (2026-10-11/12, real-HW dress rehearsal of the A/B
+     * kernel-slot feature): Sections 2 AND 3 (0x00200000-0x003FFFFF)
+     * are CODE now, not data -- the A/B feature's own Phase 2 moved
+     * this kernel's link base from 0x8000 to 0x00200000 (boot/rpi1/
+     * link.ld), but this file's page table was never updated to
+     * match, still marking Section 2 as the execute-never guard-page-
+     * capable data region (the TASK #163 FIX below, which predates
+     * the link-base move). Confirmed via `readelf -S build/dhruva.elf`:
+     * .text.boot+.text now span 0x00200000-0x003AF630, .rodata extends
+     * to 0x003BBAF6 -- i.e. CODE occupies the whole of Section 2 and
+     * most of Section 3. Section 4 (0x00400000+) is where .data/.bss
+     * (the heap, task stacks) actually start now (confirmed via the
+     * same readelf output) -- see that section's own entry below for
+     * where the guard-page coarse table moved to.
+     *
+     * This exact mismatch is WHY the first two real-hardware dress-
+     * rehearsal attempts hung with zero UART output after stage0's own
+     * "verified, jumping to 0x00200000": the moment mmu_init below
+     * enables the MMU, the CPU's very next instruction fetch -- still
+     * inside mmu_init itself, trying to return -- resolves to an
+     * address inside this now-correctly-must-be-code Section 2, which
+     * the PREVIOUS (wrong) table marked execute-never. QEMU's ARM1176
+     * model never enforces XN at all (see this file's own header,
+     * "ROUND 70 UPDATE" -- confirmed against QEMU's actual source),
+     * so this was completely invisible across every one of this
+     * session's QEMU-verified A/B chain-load tests; real ARM1176
+     * silicon enforces it immediately, faulting before a single byte
+     * of output is possible. A raw UART diagnostic added directly to
+     * boot_entry's own prologue (boot/rpi1/boot.S, same commit series)
+     * narrowed this down precisely: checkpoints through "E" (.bss
+     * cleared) printed every time; "F" (mmu_init returned) never did.
+     *
+     * Plain CODE section descriptor, same encoding as Section 0/1
+     * above (read+execute, never write; TEX=001/Normal-Non-cacheable,
+     * domain 0). Section 3's own tail (0x003BC000-0x003FFFFF,
+     * past .rodata's own end) is genuinely unused today -- marking it
+     * executable anyway is harmless (same "comfortable margin" choice
+     * Section 0's own original comment already made), not a
+     * correctness requirement. */
+    ldr r5, =0x00009C02
+    orr r5, r5, #0x00200000
+    str r5, [r4, #8]
+    ldr r5, =0x00009C02
+    orr r5, r5, #0x00300000
+    str r5, [r4, #12]
+
+    /* Section 4 (0x00400000-0x004FFFFF): .data/.bss (includes the
+     * heap)/task stacks/.ARM.exidx+extab -- TASK #352 FIX: this is the
+     * guard-page-capable coarse-table region that USED to be Section 2
+     * (see the TASK #163 FIX comment preserved below for why a coarse
+     * table, not a plain section, is needed here) before the A/B
+     * feature's own link-base move pushed .data/.bss out to Section 4
+     * instead. mmu_guard_page_install's own hardcoded Section-2 base
+     * subtraction (below) is updated to match. PAGE TABLE (coarse)
+     * descriptor -- see mmu_l2_table_data's own comment above for why
+     * (per-task stack guard pages need 4KB granularity a 1MB section
+     * can't express). L1 "page table" format: bits[31:10] = L2 table
+     * base, bits[8:5] = domain (0, matching every other entry in this
      * table), bits[1:0] = 0b01 (coarse page table type). Populated
      * below with one uniform small-page descriptor per entry (read+
-     * write, never execute, Normal Non-cacheable). */
+     * write, never execute, Normal Non-cacheable).
+     *
+     * TASK #163 FIX (2026-09-12, preserved for history): this table
+     * used to live at Section 1, moved to Section 2 when .text/.rodata
+     * first outgrew Section 0 alone. Same class of bug as THIS fix,
+     * one link-address-shift later. */
     ldr r5, =mmu_l2_table_data
     orr r5, r5, #1
-    str r5, [r4, #8]
+    str r5, [r4, #16]
 
     /* Populate all 256 small-page entries. Small-page descriptor
      * format (DIFFERENT bit layout from the section format above --
@@ -450,10 +503,10 @@ mmu_init:
      * executable; this project's data/heap/stack region must never be
      * executable, same reasoning as this section's own original XN=1).
      * Value per entry (excluding page base) = TEX(0x40) | AP(0x10) |
-     * type+XN(0x3) = 0x53. Physical base now 0x00200000 (Section 2),
-     * not 0x00100000 -- see this section's own comment above. */
+     * type+XN(0x3) = 0x53. Physical base now 0x00400000 (Section 4,
+     * TASK #352 FIX) -- see this section's own comment above. */
     ldr r6, =mmu_l2_table_data
-    ldr r7, =0x00200000    /* first page's physical base */
+    ldr r7, =0x00400000    /* first page's physical base */
     mov r5, #0
 mmu_init_l2_data_loop:
     ldr r0, =0x73
@@ -499,8 +552,14 @@ mmu_init_l2_data_loop:
      * since this is writable data/heap/stack space, matching every RAM
      * section's own AP=01 (not the read-only APX=1/AP=01 code sections
      * use). */
-    mov r6, #3
-    ldr r7, =0x00300000
+    /* TASK #352 FIX: starts at Section 5, not 3 -- Sections 2-3 are now
+     * code and Section 4 is the guard-page coarse table (see their own
+     * entries above), so this generic RAM-extension loop no longer
+     * owns sections 3-4. Still ends at section 9 (5 sections of plain
+     * RW RAM instead of 7), comfortable headroom before the per-task
+     * domains start at Section 10 (0x00A00000). */
+    mov r6, #5
+    ldr r7, =0x00500000
 mmu_init_ram_ext_loop:
     ldr r5, =0x00001C12
     orr r5, r5, r7
@@ -828,10 +887,13 @@ mmu_init_domain_outer_done:
  * building it once at boot, since task stacks don't exist yet when
  * mmu_init itself runs.
  *
- * addr MUST be a 4KB-page-aligned address inside Section 2's own
- * 0x00200000-0x002FFFFF range (TASK #163 FIX, 2026-09-12: shifted from
- * Section 1 -- see that entry's own comment in mmu_init above for why)
- * -- dhruva_alloc_stack_guarded's own bump-and-align logic is what
+ * addr MUST be a 4KB-page-aligned address inside Section 4's own
+ * 0x00400000-0x004FFFFF range (TASK #352 FIX, 2026-10-12: shifted from
+ * Section 2 when the A/B kernel-slot feature's own link-base move
+ * pushed .data/.bss out to Section 4 -- see that entry's own comment
+ * in mmu_init above for why) -- dhruva_alloc_stack_guarded's own bump-
+ * and-align logic (which carves stacks from wherever the heap/.bss
+ * actually linked, now naturally Section 4) is what
  * guarantees this; this function does not (and architecturally cannot
  * cheaply) re-verify the range itself, matching this project's own
  * convention of trusting an internal, single-caller contract rather
@@ -847,7 +909,7 @@ mmu_init_domain_outer_done:
  * stale, now-wrong TLB entry from its previous (valid, RW) mapping. */
 .global mmu_guard_page_install
 mmu_guard_page_install:
-    sub r1, r0, #0x00200000
+    sub r1, r0, #0x00400000   /* TASK #352 FIX: Section 4, not 2 */
     lsr r1, r1, #12
     ldr r2, =mmu_l2_table_data
     mov r3, #0
