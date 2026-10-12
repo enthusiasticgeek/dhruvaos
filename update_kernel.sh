@@ -2,9 +2,16 @@
 # Updates kernel.img on an already-flashed Dhruva OS SD card (see
 # flash_sd_card.sh for the original, destructive full-card setup this
 # does NOT repeat -- partition table, FAT32 format, and firmware files
-# are left completely untouched here). Use this after any kernel_main.
-# vani/kernel_main_rpi4.vani change once real hardware bring-up is
-# underway, instead of re-running flash_sd_card.sh from scratch.
+# are left completely untouched here).
+#
+# A/B kernel slots (task #308): the file named kernel.img on the card
+# is now permanently stage-0, NOT the real DhruvaOS kernel -- that's
+# what GPU firmware loads at the fixed physical address 0x8000, and
+# stage-0 is the one piece of this feature that genuinely still needs
+# the physical card-swap dance to update (expected to be extremely
+# rare once proven). Routine kernel_main.vani/kernel_main_rpi4.vani
+# changes go over UART instead (`kernelupload`/`kernelslot`, see
+# test/kernel_upload.py) -- never through this script anymore.
 #
 # Usage:
 #   ./update_kernel.sh /dev/sdX [--with-wifi-firmware /dev/ttyUSB0]
@@ -76,8 +83,8 @@ if [ ! -b "$DEVICE" ]; then
     exit 1
 fi
 
-if [ ! -f "$ROOT/build/dhruva.elf" ]; then
-    echo "ERROR: $ROOT/build/dhruva.elf not found. Run ./build.sh first." >&2
+if [ ! -f "$ROOT/build/stage0.elf" ]; then
+    echo "ERROR: $ROOT/build/stage0.elf not found. Run ./build_stage0.sh first." >&2
     exit 1
 fi
 
@@ -97,8 +104,8 @@ if [ ! -b "$BOOT_PART" ]; then
     exit 1
 fi
 
-echo "=== Building kernel.img from build/dhruva.elf ==="
-arm-none-eabi-objcopy -O binary "$ROOT/build/dhruva.elf" "$ROOT/build/kernel.img"
+echo "=== Building kernel.img (stage-0) from build/stage0.elf ==="
+arm-none-eabi-objcopy -O binary "$ROOT/build/stage0.elf" "$ROOT/build/stage0.img"
 
 echo "=== Unmounting $BOOT_PART if already mounted ==="
 sudo umount "$BOOT_PART" 2>/dev/null || true
@@ -122,8 +129,8 @@ for f in bootcode.bin start.elf fixup.dat config.txt; do
     fi
 done
 
-echo "=== Replacing kernel.img (only file touched) ==="
-sudo cp "$ROOT/build/kernel.img" "$MOUNT_POINT/kernel.img"
+echo "=== Replacing kernel.img, i.e. stage-0 (only file touched) ==="
+sudo cp "$ROOT/build/stage0.img" "$MOUNT_POINT/kernel.img"
 sync
 
 echo "=== Unmounting ==="

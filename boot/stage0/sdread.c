@@ -344,6 +344,66 @@ static void stage0_reset_and_ident_clock(void) {
     mmio_w(SDHCFG_ADDR, 0);
 }
 
+#define MBOX_READ_ADDR   0x2000B880u
+#define MBOX_STATUS_ADDR 0x2000B898u
+#define MBOX_WRITE_ADDR  0x2000B8A0u
+#define MBOX_FULL        0x80000000u
+#define MBOX_EMPTY       0x40000000u
+
+/* Task #308 Phase 6 (real-HW bring-up): FIXED vs. the original port --
+ * this used to hardcode SDCDIV=248 (1MHz) assuming the core clock is
+ * exactly 250MHz, which real round-15/215-217 of this project's own
+ * SD-wedge saga already found to be unsafe: real BCM2835 silicon does
+ * not guarantee that, and the production driver (kernel_main.vani's
+ * sdhost_init_at_speed) queries the REAL core clock via a VideoCore
+ * mailbox GET_CLOCK_RATE call instead, then computes a divisor from
+ * the answer -- exactly the fix that closed task #217 ("reads now
+ * succeed on all 8 blocks") on real hardware. Stage0 skipped this
+ * during its original QEMU-only bring-up (QEMU's own bcm2835-sdhost
+ * model tolerates a hardcoded divisor fine) and failed its very first
+ * real-hardware CMD17 as a direct result -- same class of QEMU-vs-
+ * real-silicon gap this project has hit before (see e.g. the UART
+ * clock's own "assumed 3MHz" warning in docs/HARDWARE_IN_LOOP.md
+ * §3.2). Ported here literally rather than re-derived, down to the
+ * message buffer layout (boot/sdcard_state.S's own sdhost_get_core_
+ * clock_hz, itself a straight port of the VideoCore property-tags
+ * protocol every mailbox call on this SoC uses). Returns 0 if the
+ * mailbox call times out or VideoCore reports failure -- 0 cannot be
+ * a real CORE clock rate on this SoC, so callers treat it as
+ * "query failed," not a literal answer. */
+static unsigned int stage0_get_core_clock_hz(void) {
+    static unsigned int mbox_buf[8] __attribute__((aligned(16)));
+    unsigned int addr, i;
+
+    mbox_buf[0] = 32;          /* total size, bytes */
+    mbox_buf[1] = 0;           /* request code */
+    mbox_buf[2] = 0x00030002u; /* tag: get clock rate */
+    mbox_buf[3] = 8;           /* value buffer size */
+    mbox_buf[4] = 0;           /* tag req/resp code */
+    mbox_buf[5] = 4;           /* clock id: 4 = CORE */
+    mbox_buf[6] = 0;           /* rate in Hz (response) */
+    mbox_buf[7] = 0;           /* end tag */
+
+    addr = ((unsigned int)(unsigned long)mbox_buf & ~0xFu) | 8u; /* channel 8: property tags */
+
+    for (i = 0; i < 100000u; i = i + 1) {
+        if (!(mmio_r(MBOX_STATUS_ADDR) & MBOX_FULL)) break;
+    }
+    if (i == 100000u) return 0;
+
+    mmio_w(MBOX_WRITE_ADDR, addr);
+
+    for (i = 0; i < 100000u; i = i + 1) {
+        if (!(mmio_r(MBOX_STATUS_ADDR) & MBOX_EMPTY)) {
+            if (mmio_r(MBOX_READ_ADDR) == addr) {
+                if (mbox_buf[1] == 0x80000000u) return mbox_buf[6];
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
+
 /* Bring-up through CMD7 (SELECT_CARD), once per boot. Returns 0 on
  * success, or a negative stage code (-1 CMD0, -2 CMD8, -3 ACMD41,
  * -4 CMD2, -5 CMD3, -6 CMD9, -7 CMD7) matching uboot_sdhost_full.c's
@@ -413,13 +473,40 @@ int stage0_sd_init(void) {
     if (r.err != 0) return -7;
 
     /* Data-transfer clock + SDHCFG, 1-bit mode always (no ACMD6, no
-     * WIDE_EXT_BUS): 1MHz (SDCDIV=248 @ 250MHz core, matching this
-     * project's own already-verified conservative default) and
-     * SLOW_CARD|DATA_IRPT_EN|BUSY_IRPT_EN|WIDE_INT_BUS (0x418, real
+     * WIDE_EXT_BUS). Target 1MHz, matching kernel_main.vani's own
+     * sdhost_init() -> sdhost_init_at_speed(1000000) exactly -- real
+     * divisor computed from the REAL core clock (see stage0_get_core_
+     * clock_hz's own comment for why a hardcoded divisor isn't safe
+     * on real silicon), same formula both real Linux and U-Boot use:
+     * div = max_clk/target; if div<2 div=2; if (max_clk/div)>target
+     * div+=1; div-=2; clamp to 0x7FF. Falls back to leaving SDCDIV at
+     * the already-proven identification-speed divisor (0x148, set in
+     * stage0_reset_and_ident_clock above) if the mailbox query fails
+     * -- never speeds the controller up on an unconfirmed base clock,
+     * matching production's own fallback discipline. SDHCFG write
+     * (SLOW_CARD|DATA_IRPT_EN|BUSY_IRPT_EN|WIDE_INT_BUS, 0x418, real
      * U-Boot's bcm2835_set_ios sets WIDE_INT_BUS unconditionally
-     * regardless of external bus width). */
-    mmio_w(SDCDIV_ADDR, 248u);
-    mmio_w(SDTOUT_ADDR, 500000u);
+     * regardless of external bus width) happens either way. */
+    {
+        unsigned int core_clock_hz = stage0_get_core_clock_hz();
+        unsigned int target_hz = 1000000u;
+        if (core_clock_hz > 0u) {
+            unsigned int max_div = 0x7FFu;
+            unsigned int div0 = core_clock_hz / target_hz;
+            unsigned int div1 = (div0 < 2u) ? 2u : div0;
+            unsigned int div2 = ((core_clock_hz / div1) > target_hz) ? (div1 + 1u) : div1;
+            unsigned int div3 = div2 - 2u;
+            unsigned int div4 = (div3 > max_div) ? max_div : div3;
+            unsigned int achieved_clock_hz = core_clock_hz / (div4 + 2u);
+            mmio_w(SDCDIV_ADDR, div4);
+            mmio_w(SDTOUT_ADDR, achieved_clock_hz / 2u);
+            /* Settle delay after the clock-divisor change, before the
+             * first data command -- matches production's own fix
+             * (round 2026-09-18) for the exact same real-hardware
+             * wedge class this is guarding against. */
+            udelay_real(10000u);
+        }
+    }
     mmio_w(SDHCFG_ADDR, 0x418u);
 
     return 0;

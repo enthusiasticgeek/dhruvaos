@@ -116,6 +116,16 @@ if [ ! -f "$ROOT/build/dhruva.elf" ]; then
     exit 1
 fi
 
+# A/B kernel slots (task #308): the file GPU firmware loads at the fixed
+# physical address 0x8000 is now permanently stage-0, NOT the real
+# kernel -- the real kernel moved to 0x00200000 (boot/rpi1/link.ld) and
+# would crash immediately if loaded at 0x8000 directly (every absolute/
+# PC-relative reference in it is baked in for the relocated address).
+if [ ! -f "$ROOT/build/stage0.elf" ]; then
+    echo "ERROR: $ROOT/build/stage0.elf not found. Run ./build_stage0.sh first." >&2
+    exit 1
+fi
+
 echo "=== Target device details (VERIFY this is your SD card, not a disk you care about) ==="
 lsblk "$DEVICE"
 echo
@@ -178,8 +188,16 @@ fi
 echo "=== Formatting $BOOT_PART as FAT32 ==="
 sudo mkfs.vfat -F 32 "$BOOT_PART"
 
-echo "=== Building kernel.img from build/dhruva.elf ==="
-arm-none-eabi-objcopy -O binary "$ROOT/build/dhruva.elf" "$ROOT/build/kernel.img"
+echo "=== Building stage0.img (the on-disk kernel.img) and dhruva_real.img (the real kernel, seeded into slot A) ==="
+# stage0.img is what GPU firmware loads at 0x8000 and chain-loads from
+# -- that filename mapping ("kernel.img" on the FAT partition == stage0,
+# never the real kernel directly) is the critical conceptual flip this
+# feature depends on. dhruva_real.img is the actual DhruvaOS kernel's
+# flat binary, which only ever gets to RAM via stage0's own raw-block
+# chain-load (see test/kernel_slot_layout.py seed below), never via the
+# GPU firmware's own kernel= mechanism.
+arm-none-eabi-objcopy -O binary "$ROOT/build/stage0.elf" "$ROOT/build/stage0.img"
+arm-none-eabi-objcopy -O binary "$ROOT/build/dhruva.elf" "$ROOT/build/dhruva_real.img"
 
 echo "=== Writing config.txt ==="
 # FIX (2026-09-15): this template used to be missing uart_2ndstage=1
@@ -204,7 +222,7 @@ mkdir -p "$MOUNT_POINT"
 sudo mount "$BOOT_PART" "$MOUNT_POINT"
 sudo cp "$FW_DIR/bootcode.bin" "$FW_DIR/start.elf" "$FW_DIR/fixup.dat" "$MOUNT_POINT/"
 sudo cp "$CONFIG_TXT" "$MOUNT_POINT/config.txt"
-sudo cp "$ROOT/build/kernel.img" "$MOUNT_POINT/kernel.img"
+sudo cp "$ROOT/build/stage0.img" "$MOUNT_POINT/kernel.img"
 sync
 sudo umount "$MOUNT_POINT"
 rmdir "$MOUNT_POINT"
@@ -230,7 +248,7 @@ for f in bootcode.bin start.elf fixup.dat config.txt kernel.img; do
     case "$f" in
         bootcode.bin|start.elf|fixup.dat) SRC="$FW_DIR/$f" ;;
         config.txt) SRC="$CONFIG_TXT" ;;
-        kernel.img) SRC="$ROOT/build/kernel.img" ;;
+        kernel.img) SRC="$ROOT/build/stage0.img" ;;
     esac
     SRC_SUM=$(md5sum "$SRC" | cut -d' ' -f1)
     CARD_SUM=$(sudo md5sum "$MOUNT_POINT/$f" 2>/dev/null | cut -d' ' -f1 || echo "MISSING")
@@ -250,16 +268,13 @@ if [ "$VERIFY_OK" -ne 1 ]; then
 fi
 
 echo
-echo "=== Seeding A/B kernel-slot A with build/kernel.img + writing initial slot-state record ==="
+echo "=== Seeding A/B kernel-slot A with build/dhruva_real.img + writing initial slot-state record ==="
 # Raw block writes below the FAT32 partition (blocks 9216+, see
 # test/kernel_slot_layout.py's own header comment) -- independent of
-# the partition/filesystem work above, needed so the A/B kernel-slot
-# feature's stage-0 loader (once it exists) has real data to chain-load
-# from slot A from the very first flash. Safe to run even before
-# stage-0 exists: nothing reads these blocks yet, and they sit well
-# past the FAT32 partition's own start sector, so this can never
-# collide with anything mounted above.
-sudo python3 "$ROOT/test/kernel_slot_layout.py" --device "$DEVICE" seed "$ROOT/build/kernel.img"
+# the partition/filesystem work above, needed so stage-0 (now the file
+# actually named kernel.img above) has real data to chain-load from
+# slot A from the very first flash.
+sudo python3 "$ROOT/test/kernel_slot_layout.py" --device "$DEVICE" seed "$ROOT/build/dhruva_real.img"
 
 echo
 echo "=== Done. Contents written AND verified (post-remount re-read) on $BOOT_PART: ==="
