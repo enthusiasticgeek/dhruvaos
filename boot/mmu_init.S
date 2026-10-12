@@ -875,6 +875,36 @@ mmu_init_domain_outer_done:
     orr r5, r5, #0x800000
     mcr p15, 0, r5, c1, c0, 0
 
+    /* TASK #352 FIX (2026-10-12, real-HW dress rehearsal, THIRD attempt):
+     * missing CP15 "Flush Prefetch Buffer" (the ARMv6 equivalent of
+     * ISB) right after the SCTLR write above. Confirmed against
+     * ~/source/sdwedge-uboot-test -- the exact U-Boot build this
+     * project already proved boots this exact real board
+     * (project memory: round 24) -- arch/arm/include/asm/barriers.h's
+     * own `#elif __LINUX_ARM_ARCH__ == 6` branch defines `ISB` as
+     * `CP15ISB` = `mcr p15, 0, r0, c7, c5, 4`, and set_cr() (cache-
+     * cp15.c's mmu_setup(), the function that writes CR_M to enable
+     * the MMU) unconditionally calls isb() immediately afterward.
+     * This is the ONE barrier that reference's own mmu_setup() uses
+     * anywhere in its MMU-enable sequence (TTBR0/DACR are plain mcr,
+     * no barrier) -- real, not a defensive guess.
+     *
+     * Two earlier fixes this same real-HW dress rehearsal already
+     * tried (Section 2/3 XN correction for the A/B kernel-slot link-
+     * base move, see this file's own TASK #352 FIX comments above)
+     * were real, necessary bugs but did NOT resolve the hang -- a
+     * fresh real-HW capture after that fix still showed the identical
+     * "ABCDE but never F" RAW_DIAG_PUTC signature (boot/rpi1/boot.S),
+     * meaning execution still never returns from mmu_init. QEMU's TCG
+     * ARM1176 model has no pipeline/prefetch-buffer simulation at all,
+     * so a few already-fetched pre-MMU-enable instructions executing
+     * with stale state is invisible under every one of this session's
+     * QEMU-verified tests by construction, exactly like the XN gap
+     * before it -- same class of QEMU-vs-real-HW divergence this
+     * file's header already documents repeatedly, one layer deeper. */
+    mov r0, #0
+    mcr p15, 0, r0, c7, c5, 4
+
     ldmia sp!, {r4-r7, lr}
     bx lr
 
