@@ -40,6 +40,68 @@
 #define REAL_KERNEL_LOAD_ADDR 0x00200000u
 #define DEFAULT_BOOTLIMIT 3u
 
+/* TASK #353 (2026-10-12, found during task #352's own Phase 6
+ * drilling): stage0 used to jump to the chosen slot with NOTHING
+ * armed to recover it if that slot hangs before the real kernel's own
+ * watchdog_kick() calls ever run (kernel/kernel_main.vani's own
+ * WATCHDOG_ENABLE_FOR_REAL_HARDWARE, gated off by default) -- exactly
+ * the case for a deliberately-bad kernel (boot/badkernel/bad_entry.S,
+ * a bare infinite self-branch) used to drill the auto-revert path,
+ * and for any of the three real, QEMU-invisible hangs this same round
+ * already found and fixed one level further in (mmu_init.S's page
+ * table/missing ISB, this file's own missing pre-jump barrier). With
+ * no one physically at the board, a hang here has NO recovery path at
+ * all except a physical power cycle.
+ *
+ * Off (0) by default, same convention as WATCHDOG_ENABLE_FOR_REAL_
+ * HARDWARE -- QEMU's raspi1ap resets the WHOLE emulated machine
+ * IMMEDIATELY on the very first PM_RSTC write regardless of the
+ * timeout value actually requested (this file's own sibling comment
+ * in kernel_main.vani documents this, confirmed against QEMU's own
+ * source), so leaving this unconditionally on would make every
+ * existing QEMU-driven regression test (phase4_milestone.py,
+ * phase5_markbootgood_test.py, ...) immediately "reset" the instant
+ * this code ran, long before any of them could reach PASS. A real
+ * preprocessor #if (unlike kernel_main.vani's own runtime `if const
+ * == 1`, forced by vani having no conditional compilation) means this
+ * compiles out to literally nothing when off -- flip to 1 and rebuild
+ * stage0.img specifically before a real, unattended deployment (and
+ * flip kernel_main.vani's own matching
+ * STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE to 1 too, so a
+ * healthy boot disarms this at PASS instead of getting reset by its
+ * own safety net mid-session). */
+#define STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE 0
+
+#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
+/* Same BCM2835 PM_WDOG/PM_RSTC register protocol as kernel_main.vani's
+ * own watchdog_arm (PM_RSTC=0x2010001C, PM_WDOG=0x20100024, password
+ * 0x5A000000 required in the top byte of every write to either
+ * register or the write is silently ignored, ticks run at a fixed
+ * 65536Hz independent of any scheduler tick period) -- reusing the
+ * exact proven sequence, not re-deriving it. 15 seconds (983040 =
+ * 15<<16 ticks) is comfortably under the register's own 0xFFFFF-tick
+ * (~16s) ceiling, generous margin above the ~200ms this file's own
+ * real-HW logs show boot.S's prologue + mmu_init + sdhost_init
+ * actually take (the one gap this specific arm needs to cover: from
+ * here to kernel_main's own first watchdog_kick() call) while still
+ * short enough that a genuinely bad/hung jump target gets caught
+ * quickly rather than left spinning for a long time unattended. */
+#define PM_RSTC 0x2010001Cu
+#define PM_WDOG 0x20100024u
+static void stage0_arm_watchdog(void) {
+    volatile unsigned int *rstc = (volatile unsigned int *)PM_RSTC;
+    volatile unsigned int *wdog = (volatile unsigned int *)PM_WDOG;
+    unsigned int password = 0x5A000000u;
+    unsigned int wrcfg_clr = 0xFFFFFFCFu;
+    unsigned int wrcfg_full_reset = 0x00000020u;
+    unsigned int fifteen_seconds_in_ticks = 983040u; /* 15 << 16 */
+    unsigned int cur;
+    *wdog = password | (fifteen_seconds_in_ticks & 0xFFFFFu);
+    cur = *rstc;
+    *rstc = password | (cur & wrcfg_clr) | wrcfg_full_reset;
+}
+#endif
+
 extern void u_putc(char c);
 extern void u_puts(const char *s);
 extern void u_hex32(unsigned int v);
@@ -410,6 +472,10 @@ void stage0_main(void) {
     );
 
     u_puts("stage0: verified, jumping to 0x00200000\n");
+
+#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
+    stage0_arm_watchdog();
+#endif
 
     {
         /* Task #308 follow-up: pack the reset reason into the upper

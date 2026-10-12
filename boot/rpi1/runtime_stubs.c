@@ -136,8 +136,43 @@ int dprintf(int fd, const char *fmt, ...) {
     return 0;
 }
 
+/* TASK #352/#353 FOLLOW-UP (2026-10-12): a real-HW "integer overflow
+ * in u32 add" panic fired live during this round's own Phase 6
+ * drilling (kernelslot status, real board, idle shell after DHCP) --
+ * __intent_trap's own dprintf(2, msg) above already prints WHICH
+ * overflow class fired, but with the message string deduplicated
+ * across all ~215 call sites of this exact kind in kernel_main.vani
+ * (confirmed via build/kernel_main.ll: one shared
+ * @.msg.ovf.u32.add global, all call sites emit the identical
+ * pointer), that single line can't say WHICH one. Static analysis of
+ * all 215 candidates without a live repro or debugger wasn't
+ * conclusive enough to safely guess-fix one blind. This prints LR
+ * (the return address) right before halting instead: @__intent_trap
+ * is `alwaysinline` (build/kernel_main.ll's own definition), so by
+ * the time exit() is reached, LR has already unwound through that
+ * inlined wrapper back into the ORIGINAL vani function that hit the
+ * overflow -- `arm-none-eabi-objdump -d build/dhruva.elf` (or
+ * addr2line against it) against this printed address pinpoints
+ * exactly which of the 215 sites fired, next time this reproduces,
+ * rather than needing another blind guess. Captured here (not inside
+ * dprintf/__intent_trap) because this is the LAST point before the
+ * permanent halt and the simplest place to add a raw register read
+ * without touching the compiler's own generated panic path at all. */
 void exit(int code) {
     (void)code;
+    unsigned int lr;
+    __asm__ volatile ("mov %0, lr" : "=r" (lr));
+    dhruva_dprintf_puts("panic LR=0x");
+    {
+        int shift = 28;
+        while (shift >= 0) {
+            unsigned int nib = (lr >> shift) & 0xF;
+            char c = (nib < 10) ? (char)('0' + nib) : (char)('A' + (nib - 10));
+            dhruva_dprintf_putc(c);
+            shift = shift - 4;
+        }
+    }
+    dhruva_dprintf_putc('\n');
     while (1) {
         /* halt -- there is no OS to return to */
     }

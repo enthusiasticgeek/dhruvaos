@@ -5562,6 +5562,45 @@ fn watchdog_kick() -> i64 {
   return 0;
 }
 
+// TASK #353 (2026-10-12): cancels a pending watchdog reset -- the
+// counterpart to boot/stage0/stage0_main.c's own stage0_arm_watchdog
+// (the one-shot 15-second arm it does right before jumping here,
+// covering the gap between that jump and this kernel's own first
+// watchdog_kick() above, gated by STAGE0_PREJUMP_WATCHDOG_FOR_REAL_
+// HARDWARE there). Without this, a healthy boot that reaches PASS in
+// under 15 seconds (the common case) would still get reset by stage0's
+// own leftover armed countdown mid-interactive-session, confusingly,
+// with no hang to explain it -- same risk class this round's own
+// "unattended" requirement exists to close, just self-inflicted this
+// time instead of a real hang.
+//
+// WRCFG=0 (not WRCFG_FULL_RESET) tells the hardware to take no action
+// when PM_WDOG's countdown reaches zero -- the natural inverse of
+// watchdog_arm's own `(cur & wrcfg_clr) | wrcfg_full_reset`, same
+// password-gated PM_RSTC write, just without OR-ing the full-reset
+// bit back in. Matches Linux's own bcm2835_wdt driver's stop()
+// behavior for this exact peripheral.
+fn watchdog_disable() -> i64 {
+  let pm_password: u32 = 0x5A000000 as u32;
+  let pm_rstc: i64 = PM_RSTC;
+  let wrcfg_clr: u32 = 0xFFFFFFCF as u32;
+  let cur: u32 = mmio_read_u32(pm_rstc);
+  let _ = mmio_write_u32(pm_rstc, pm_password | (cur & wrcfg_clr));
+  return 0;
+}
+
+// Gates watchdog_disable's own call site below -- same convention and
+// same reasoning as WATCHDOG_ENABLE_FOR_REAL_HARDWARE above: QEMU
+// resets the whole emulated machine immediately on ANY PM_RSTC write,
+// including this "disable" one, so leaving this on unconditionally
+// would make every QEMU-driven regression test "reset" the instant it
+// reached its own PASS checkpoint -- the ONE place every single one of
+// them currently succeeds. Off (0) by default; flip to 1 (together
+// with stage0_main.c's own matching STAGE0_PREJUMP_WATCHDOG_FOR_REAL_
+// HARDWARE, and rebuild+reflash BOTH stage0.img and the real kernel)
+// only for a real, unattended-deployment image.
+const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 0;
+
 // Phase 3 -- BCM2835 SDHOST controller (base 0x20202000), the real SD
 // interface Pi 1 (and every earlier/simpler Pi) uses -- not the newer
 // EMMC/SDHCI interface later boards have. Register semantics are the
@@ -46233,6 +46272,13 @@ fn kernel_main() -> i64 {
   // kernel_slot_mark_boot_good's own header comment for exactly what
   // this does and does not touch).
   let _ = kernel_slot_mark_boot_good();
+
+  // Task #353: cancel stage0's own pre-jump watchdog now that this
+  // boot has proven itself alive -- see watchdog_disable's own header
+  // comment for why this can't be unconditional.
+  if STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_disable();
+  }
 
   // BUG (round 26 audit, found by actually driving the new shell
   // `ping` command interactively rather than just its self-test):
