@@ -21576,6 +21576,23 @@ fn rtl8188cu_write_firmware_page(devaddr: u32, mps: u32, reg_addr: u32, fw_buf: 
     let _ = dwc2_build_rtl_reg_write_setup(reg_addr, this_chunk as u32);
     let status: i64 = dwc2_control_out(devaddr, mps, chunk, this_chunk as u32);
     if status != 0 {
+      // TASK #164 FOLLOW-UP (2026-10-12): this chunk-write failure was
+      // completely silent before -- "firmware download FAILED" from
+      // the caller's own caller, with no way to tell which of the
+      // ~126 128-byte chunks in a 16KB image failed or why. Same
+      // "add a diagnostic, capture a real log" discipline this
+      // project has used for every other real-HW-only bug (the A/B
+      // kernel-slot hangs this same session, the USB TRSTRCY/FIFO-
+      // sizing gaps before that) -- untestable under QEMU (no USB
+      // WiFi device model exists), so this can only be resolved with
+      // a real capture.
+      let _ = uart_puts("USB: RTL8188CU firmware chunk write failed at fw offset ");
+      let _ = uart_put_i64(base_off + done);
+      let _ = uart_puts(" (chunk ");
+      let _ = uart_put_i64(this_chunk);
+      let _ = uart_puts(" bytes) dwc2_control_out status=");
+      let _ = uart_put_i64(status);
+      let _ = uart_puts("\n");
       return 0 - 1;
     }
     done = done + this_chunk;
