@@ -1984,6 +1984,12 @@ extern "C" fn dhruva_prio_unlock(base_priority: i64) -> i64;
 // exists to attach it to.
 #[stack_cost(bytes=1)]
 extern "C" fn context_switch_count_get() -> i64;
+// TASK #352 SCHED SHADOW MISMATCH fix (2026-10-12): counts scheduler_
+// pick_next calls made OUTSIDE the IRQ/FIQ path (task_sleep_ticks_impl,
+// dhruva_mutex_lock_impl's block path) -- see its own .bss comment in
+// context_switch.S for the full race this closes.
+#[stack_cost(bytes=1)]
+extern "C" fn syscall_reschedule_count_get() -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn prio_lock_count_get() -> i64;
 // Round 189: real per-task CPU-time accounting (ticks attributed to
@@ -2236,6 +2242,13 @@ extern "C" fn spn_shadow_ctxsw_baseline_set(v: u32) -> i64;
 extern "C" fn spn_shadow_tick_baseline_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_tick_baseline_set(v: u32) -> i64;
+// TASK #352 SCHED SHADOW MISMATCH fix: see syscall_reschedule_count_
+// get's own comment above and scheduling_decision_prelude's own
+// updated comment below for the full race this closes.
+#[stack_cost(bytes=1)]
+extern "C" fn spn_shadow_syscall_baseline_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn spn_shadow_syscall_baseline_set(v: u32) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_mismatch_count_get() -> u32;
 #[stack_cost(bytes=1)]
@@ -12276,12 +12289,18 @@ fn shell_echo_self_test() -> i64 {
 // A genuine race exists and is handled honestly, not ignored: between
 // this prediction (made at the top of one irq_dispatch call) and the
 // next check (top of the FOLLOWING irq_dispatch call), a task could
-// call task_sleep_ticks or dhruva_mutex_unlock directly (both invoke
-// scheduler_pick_next OUTSIDE the IRQ path too), causing an extra,
-// unmodeled decision in between. context_switch_count_get()'s own
-// delta since the prediction was made detects this (more than one real
-// switch happened) and the comparison is honestly SKIPPED that round
-// rather than risking a false mismatch report.
+// call task_sleep_ticks or dhruva_mutex_lock's block path directly
+// (both invoke scheduler_pick_next OUTSIDE the IRQ path too), causing
+// an extra, unmodeled decision in between. TASK #352 (2026-10-12):
+// context_switch_count_get()'s own delta alone is NOT sufficient to
+// detect this -- it only catches the case where that extra decision
+// ALSO changes current_task; if it ties while the IRQ path's own
+// predicted switch ALSO ties (or vice versa), the delta can still read
+// exactly 1 and wrongly look like "just the predicted switch happened".
+// Fixed with a dedicated syscall_reschedule_count (boot/context_
+// switch.S), incremented unconditionally at both syscall-triggered
+// call sites regardless of whether they actually switch -- see
+// scheduling_decision_prelude's own updated comment for the real guard.
 const SPN_SHADOW_AGING_SHIFT: u32 = 4;
 const SPN_SHADOW_IDLE_FALLBACK: u32 = 3;
 
@@ -12701,24 +12720,52 @@ fn scheduling_decision_prelude() -> i64 {
     // scheduler_pick_next itself or add any new locking.
     let spn_tick_now: u32 = scheduler_get_tick_count();
     let spn_tick_baseline: u32 = spn_shadow_tick_baseline_get();
-    if (spn_delta <= (1 as u32)) && (spn_tick_now == spn_tick_baseline) {
+    // TASK #352 SCHED SHADOW MISMATCH fix (2026-10-12): a THIRD guard,
+    // alongside the two above. Real, live-observed false-positive
+    // fixed here -- found while digging into "SCHED SHADOW MISMATCH
+    // p=00000002 a=00000004" firing repeatedly during a rapid UART RX
+    // IRQ burst (kernelupload). Root cause confirmed by reading boot/
+    // context_switch.S directly: this prelude's prediction only models
+    // scheduler_switch_from_irq's own tail-call into scheduler_pick_
+    // next (the IRQ/FIQ path) -- but task_sleep_ticks_impl and dhruva_
+    // mutex_lock_impl's block path ALSO call scheduler_pick_next
+    // directly, completely outside this path, and increment the SAME
+    // shared context_switch_count. The pre-existing ctxsw-delta<=1
+    // guard above assumed any single observed switch was "the IRQ
+    // path's own predicted one" -- true only if that predicted switch
+    // actually changes current_task. If it instead TIES (the picked
+    // task equals the already-current one, so context_switch.S's own
+    // spn_finish never increments the counter) WHILE a syscall-
+    // triggered switch happens in the same window, the total delta is
+    // still exactly 1 -- passing the old guard -- but that 1 came
+    // entirely from an unmodeled decision, not the predicted one.
+    // syscall_reschedule_count_get() is incremented unconditionally at
+    // both syscall-triggered call sites (whether or not they actually
+    // switch), so requiring ITS delta to be exactly 0 catches this
+    // regardless of tie/no-tie, closing the gap the ctxsw/tick guards
+    // above can't.
+    let spn_syscall_now: u32 = syscall_reschedule_count_get() as u32;
+    let spn_syscall_baseline: u32 = spn_shadow_syscall_baseline_get();
+    if (spn_delta <= (1 as u32)) && (spn_tick_now == spn_tick_baseline) && (spn_syscall_now == spn_syscall_baseline) {
       let spn_actual: u32 = current_task_get();
       if spn_actual != spn_pending {
         let _ = spn_shadow_report_mismatch(spn_pending, spn_actual, spn_tick_now);
       }
     }
-    // spn_delta > 1, or spn_tick_now != spn_tick_baseline: an
-    // intervening task_sleep_ticks/dhruva_mutex_unlock decision, or a
-    // nested real timer tick, happened between this prediction's own
-    // stash and this check -- too ambiguous (or, for the tick case,
-    // provably stale) to compare against, skip honestly rather than
-    // risk a false report.
+    // spn_delta > 1, spn_tick_now != spn_tick_baseline, or
+    // spn_syscall_now != spn_syscall_baseline: an intervening task_
+    // sleep_ticks/dhruva_mutex_lock-block decision, or a nested real
+    // timer tick, happened between this prediction's own stash and
+    // this check -- too ambiguous (or, for the tick/syscall cases,
+    // provably stale/unmodeled) to compare against, skip honestly
+    // rather than risk a false report.
   }
   let spn_predicted: u32 = scheduler_pick_next_shadow_predict();
   let spn_ctxsw_baseline_now: u32 = context_switch_count_get() as u32;
   let _ = spn_shadow_predicted_task_set(spn_predicted);
   let _ = spn_shadow_ctxsw_baseline_set(spn_ctxsw_baseline_now);
   let _ = spn_shadow_tick_baseline_set(scheduler_get_tick_count());
+  let _ = spn_shadow_syscall_baseline_set(syscall_reschedule_count_get() as u32);
   let _ = spn_shadow_prediction_valid_set(1 as u32);
 
   for dl_i from 0 to 6 {

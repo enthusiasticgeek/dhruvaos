@@ -119,6 +119,41 @@ tick_count:
 .global current_task
 current_task:
     .word 0
+.global syscall_reschedule_count
+syscall_reschedule_count:
+    .word 0             /* TASK #352 SCHED SHADOW MISMATCH fix (2026-
+                         * 10-12): counts every call to scheduler_pick_
+                         * next made OUTSIDE the IRQ/FIQ path -- today
+                         * that's exactly task_sleep_ticks_impl's own
+                         * call site and dhruva_mutex_lock_impl's block
+                         * path (see both sites' own comments below) --
+                         * as opposed to scheduler_switch_from_irq's tail
+                         * call, which is the ONLY one scheduling_
+                         * decision_prelude's shadow model (kernel_main.
+                         * vani) actually predicts. context_switch_count
+                         * alone can't distinguish "the IRQ path's own
+                         * predicted switch happened" from "a syscall-
+                         * triggered switch happened instead, AND the
+                         * IRQ path's own predicted switch tied (no
+                         * actual current_task change, so spn_finish
+                         * below never incremented it)" -- both give
+                         * ctxsw_delta==1, satisfying the old guard,
+                         * while actually comparing the stale prediction
+                         * against a decision it never modeled at all.
+                         * Live-observed on real HW: a rapid UART RX IRQ
+                         * burst (kernelupload) gave GC (task_e) more
+                         * chances to hit its own ceiling-2 section's
+                         * mutex-block/sleep calls between consecutive
+                         * shadow checks, firing "SCHED SHADOW MISMATCH
+                         * p=00000002 a=00000004" repeatedly -- both
+                         * p(task_c) and a(task_e) were each correct
+                         * decisions from two different, uncoordinated
+                         * call paths, not a real scheduler bug. This
+                         * counter lets the shadow check require ITS
+                         * delta to be exactly 0 (not just ctxsw_delta
+                         * <=1) before trusting the comparison -- see
+                         * scheduling_decision_prelude's own updated
+                         * comment. */
 .global context_switch_count
 context_switch_count:
     .word 0             /* Round 53: total number of times scheduler_
@@ -183,6 +218,19 @@ spn_shadow_tick_baseline:
                          * since a nested FIQ always advances tick_count
                          * by construction (it's the timer tick) while
                          * an ordinary UART RX IRQ never does. */
+spn_shadow_syscall_baseline:
+    .word 0             /* TASK #352 SCHED SHADOW MISMATCH fix (2026-
+                         * 10-12): stamped alongside spn_shadow_ctxsw_
+                         * baseline/spn_shadow_tick_baseline at
+                         * prediction time, from syscall_reschedule_
+                         * count_get() -- see that counter's own header
+                         * comment above for the race this closes (a
+                         * syscall-triggered reschedule, outside the IRQ/
+                         * FIQ path this shadow model actually predicts,
+                         * can give ctxsw_delta==1 on its own while the
+                         * IRQ path's own predicted switch ties). The
+                         * mismatch check now also requires THIS to
+                         * still match its own baseline. */
 spn_shadow_mismatch_count:
     .word 0
 spn_shadow_prediction_valid:
@@ -1107,6 +1155,20 @@ spn_shadow_tick_baseline_set:
     mov r1, #0
     bx lr
 
+.global spn_shadow_syscall_baseline_get
+spn_shadow_syscall_baseline_get:
+    ldr r0, =spn_shadow_syscall_baseline
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_syscall_baseline_set
+spn_shadow_syscall_baseline_set:
+    ldr r1, =spn_shadow_syscall_baseline
+    str r0, [r1]
+    mov r1, #0
+    bx lr
+
 .global spn_shadow_mismatch_count_get
 spn_shadow_mismatch_count_get:
     ldr r0, =spn_shadow_mismatch_count
@@ -1813,6 +1875,17 @@ task_sleep_ticks_impl:
     ldr r1, =irq_mask_start_us
     str r0, [r1]
 
+    /* TASK #352 SCHED SHADOW MISMATCH fix: tag this as a syscall-
+     * triggered reschedule BEFORE the call -- see syscall_reschedule_
+     * count's own header comment above. r2/r3 free here (r0/r1 just
+     * loaded for the irq_mask_start_us stamp above, both already
+     * written to memory, not needed again until scheduler_pick_next's
+     * own return value lands in r0). */
+    ldr r2, =syscall_reschedule_count
+    ldr r3, [r2]
+    add r3, r3, #1
+    str r3, [r2]
+
     bl scheduler_pick_next
     mov sp, r0
     /* DIAG continued: moved to AFTER the `mov sp, r0` stack-pointer
@@ -2347,6 +2420,14 @@ dml_contended:
     ldr r1, =irq_mask_start_us
     str r0, [r1]
 
+    /* TASK #352 SCHED SHADOW MISMATCH fix: same tag as task_sleep_
+     * ticks_impl's own call site above -- see syscall_reschedule_
+     * count's own header comment. r2/r3 free here, same reasoning. */
+    ldr r2, =syscall_reschedule_count
+    ldr r3, [r2]
+    add r3, r3, #1
+    str r3, [r2]
+
     bl scheduler_pick_next            /* IRQs stay masked straight
                                         * through the switch -- the
                                         * resumed frame's own spsr=0x13
@@ -2672,6 +2753,13 @@ current_task_get:
 .global context_switch_count_get
 context_switch_count_get:
     ldr r0, =context_switch_count
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global syscall_reschedule_count_get
+syscall_reschedule_count_get:
+    ldr r0, =syscall_reschedule_count
     ldr r0, [r0]
     mov r1, #0
     bx lr

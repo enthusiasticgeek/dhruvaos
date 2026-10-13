@@ -13704,3 +13704,36 @@ the kernelupload-over-UART flow this was blocking — needs the next physical re
 will flash sdcard later"). `test/kernel_upload.py` itself needed no changes and is already tracked
 (commit `6ba5bc3`, Phase 4) — a host-side pacing attempt was tried and reverted once the real cause was
 found; it wasn't the fix.
+
+### Task #352/#354: fixed a second real shadow-model false-positive (syscall-path reschedule race) (2026-10-12)
+
+Real, live-observed `SCHED SHADOW MISMATCH p=00000002 a=00000004` firing repeatedly during an actual
+real-HW `kernelupload` run (rapid back-to-back UART RX IRQs). Both task #273's existing guards
+(`ctxsw_delta<=1`, `tick_now==tick_baseline`) passed, so this was a different race from the one that
+task closed.
+
+**Root-caused by reading `boot/context_switch.S` directly, not guessed**: `scheduling_decision_prelude`
+(`kernel_main.vani`) only predicts `scheduler_switch_from_irq`'s own tail-call into `scheduler_pick_next`
+(the IRQ/FIQ path) — but `task_sleep_ticks_impl` and `dhruva_mutex_lock_impl`'s block path *also* call
+`scheduler_pick_next` directly, completely outside that path (confirmed via `grep`: exactly these two
+other call sites exist), incrementing the SAME shared `context_switch_count`. The pre-existing
+`ctxsw_delta<=1` guard implicitly assumed any single observed switch was "the IRQ path's own predicted
+one" — true only if that predicted switch actually changes `current_task`. If it instead **ties** (picked
+task equals the already-current one, so `context_switch.S`'s own `spn_finish` tail never increments the
+counter) *while* a syscall-triggered switch happens in the same window, the total delta is still exactly
+1 — passing the old guard — but that 1 came entirely from an unmodeled decision. Observed values matched
+exactly: predicted=task_c (an IRQ-path prediction that likely tied), actual=task_e (GC, independently
+known to run its own ceiling-2 critical section with mutex/sleep calls — Gap E, task #237) — two
+independently-correct decisions from uncoordinated paths, not a real scheduler bug.
+
+**Fix**: a new `syscall_reschedule_count` (`boot/context_switch.S`), incremented unconditionally at both
+syscall-triggered call sites (whether or not they actually switch, unlike `context_switch_count`), plus
+a matching `spn_shadow_syscall_baseline` stash. `scheduling_decision_prelude`'s guard now also requires
+this counter's delta to be exactly 0 before trusting the comparison — a third, independent signal
+alongside the existing ctxsw/tick guards, closing a gap neither of those could close on their own.
+
+Build clean (asm safety audit: 0 definite/review findings across the new assembly). QEMU regression
+(`phase4_milestone.py`) 19/19 clean, `scheduler shadow-model mismatches: 0 total` — no regression from
+the new counter/guard. Real-HW retest during an actual `kernelupload` burst (the condition that
+originally triggered this) still needed — deferred to the next physical reflash, same as task #352's own
+pending real-HW dress rehearsal.
