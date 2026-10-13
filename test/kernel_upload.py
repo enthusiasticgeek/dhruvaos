@@ -35,7 +35,20 @@ import time
 # Must match shell_dispatch_kernelupload's own enforced cap (kernel/
 # kernel_main.vani) -- same 48-byte/96-hex-char shell-line-buffer
 # ceiling wifikey's own chunk size is bounded by.
-CHUNK_BYTES = 48
+# TASK #352/#164 (2026-10-12): reduced from 48 after a real-HW finding
+# the same night -- even with UART_RX_IRQ_BUDGET_PER_TICK raised 4->8
+# (kernel_main.vani, commit e94e798), a 48-byte chunk's own ~115-byte
+# line still exceeds the real per-tick RX margin (confirmed live: a
+# 32-byte/~84-byte-line chunk got its own hex echoed fully but its
+# "ok, N bytes accumulated" RESPONSE truncated to just "ok" -- right at
+# the edge, not reliably safe). 24 bytes (~68-byte line) confirmed
+# clean on real hardware, response included, with real margin to
+# spare. Doubles the chunk count for a given upload vs. the original
+# 48 -- a real cost, not a one-line tweak to shrug off -- but a
+# further RX-budget increase (or line-length-aware pacing) that lets
+# this go back up belongs in a FUTURE round validated live, not
+# guessed here without a board to test against.
+CHUNK_BYTES = 24
 
 BAUD_MAP = {
     9600: termios.B9600,
