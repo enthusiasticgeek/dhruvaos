@@ -5175,6 +5175,65 @@ fn abort_report_data(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r
   return 0;
 }
 
+// TASK #357 (2026-10-15): best-effort stack dump, called from BOTH
+// fault_data_abort and fault_prefetch_abort (boot/rpi1/vectors.S)
+// strictly AFTER abort_report_data/_prefetch has already reached the
+// UART -- see those call sites' own header comments for the full
+// "why this ordering matters" (a double-fault in here, from EITHER
+// sp_usr or sp_svc turning out to also be garbage, is bounded by the
+// existing re-entry protection and never costs the original report).
+//
+// Added investigating a real, reproducible crash where pc/lr both
+// resolved (via addr2line against the exact crashed binary) into
+// diag_wait_1 -- a one-time, linear, no-branch-target cold-boot
+// sequence that should be unreachable once any task has ever run, yet
+// was reached again 9,740 context switches and ~20 minutes into real
+// uptime. Leading hypothesis this is meant to confirm or refute: a
+// task's own saved resume frame (the PC/SPSR a context switch pops
+// off ITS OWN stack to resume it -- see context_switch.S's own
+// `mov sp, r0` + epilogue) got corrupted to something that decodes as
+// address 0 -- which, via THIS board's own real reset vector at
+// address 0 (`ldr pc, [pc, #24]` -> boot_entry, see boot/rpi1/
+// vectors.S's own header comment), would branch into boot_entry and
+// fall straight through boot_entry -> diag_wait_0 -> diag_wait_1,
+// exactly matching the observed pc. Dumping words forward from each
+// SP shows whether a valid-looking saved PC/SPSR pair sits where one
+// should, or whether it's been overwritten with 0/garbage -- the
+// single most direct way to confirm or rule this out on a recurrence,
+// short of a full GDB session this project has never had available
+// on real hardware (no JTAG, per vectors.S's own existing comment).
+#[no_mangle]
+#[no_heap]
+fn abort_dump_task_stacks(spsr: u32, sp_usr: u32, sp_svc: u32) -> i64 {
+  let _ = uart_puts("spsr_abt=");
+  let _ = uart_put_hex32(spsr);
+  let _ = uart_puts(" (interrupted mode bits=");
+  let _ = uart_put_hex32(spsr & (0x1F as u32));
+  let _ = uart_puts(", 0x10=USR 0x13=SVC)\n");
+  let _ = uart_puts("sp_usr=");
+  let _ = uart_put_hex32(sp_usr);
+  let _ = uart_puts(":");
+  for i from 0 to 16 {
+    let off: u32 = wrapping_mul((i as u32), (4 as u32));
+    let addr: u32 = wrapping_add(sp_usr, off);
+    let word: u32 = mmio_read_u32(addr as i64);
+    let _ = uart_puts(" ");
+    let _ = uart_put_hex32(word);
+  }
+  let _ = uart_puts("\nsp_svc=");
+  let _ = uart_put_hex32(sp_svc);
+  let _ = uart_puts(":");
+  for i from 0 to 16 {
+    let off: u32 = wrapping_mul((i as u32), (4 as u32));
+    let addr: u32 = wrapping_add(sp_svc, off);
+    let word: u32 = mmio_read_u32(addr as i64);
+    let _ = uart_puts(" ");
+    let _ = uart_put_hex32(word);
+  }
+  let _ = uart_puts("\n");
+  return 0;
+}
+
 #[no_mangle]
 #[no_heap]
 fn abort_report_prefetch(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r1: u32, orig_r2: u32, orig_r3: u32, orig_lr: u32) -> i64 {

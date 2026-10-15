@@ -13871,3 +13871,36 @@ build can gather better evidence on a repeat.
 Build clean (0 safety-audit findings), `phase4_milestone.py` 19/19 clean, 0 shadow mismatches -- for fixes
 #1-#3 only; fix #4 (the crash) is NOT yet fixed, only characterized as precisely as current evidence
 allows.
+
+### Task #356 follow-up: stack-dump diagnostic added to abort handlers (2026-10-15)
+
+Implemented the "recommended next step" above, to gather real evidence on a recurrence of the
+unresolved `diag_wait_1` crash rather than continuing to guess. New `abort_dump_task_stacks(spsr, sp_usr,
+sp_svc)` (`kernel/kernel_main.vani`, right after `abort_report_data`) prints the interrupted context's
+real CPSR (`spsr_abt`, with the mode bits broken out) plus 16 words forward from both `sp_usr` and
+`sp_svc`. `boot/rpi1/vectors.S`'s `fault_data_abort`/`fault_prefetch_abort` each gained a short sequence,
+inserted strictly AFTER their existing `bl abort_report_data`/`bl abort_report_prefetch` call (i.e. after
+the already-proven fault report has already reached the UART): capture `spsr`, briefly `cps`-switch to
+USR mode to read `sp_usr` into a scratch register, switch back to ABT, briefly switch to SVC to read
+`sp_svc`, switch back to ABT, then call the new dump function. (ARMv6 has no cross-mode banked-register
+read -- the bare mode-only `cps` form, already used by this project's own `boot.S` IRQ/ABT stack setup, is
+the only way to read another mode's own `sp`.)
+
+Concrete hypothesis this is meant to confirm or refute: a task's own saved resume PC/SPSR, if corrupted to
+resolve to address 0, would -- via this board's real reset vector living at address 0, which falls
+straight through `boot_entry` into `diag_wait_0`/`diag_wait_1` -- reproduce exactly the observed crash's
+`pc`. If a recurrence shows a valid-looking PC/SPSR pair sitting on a task's own stack near its SP, that
+points elsewhere (e.g. a wild jump via a corrupted function pointer or LR, not a corrupted resume frame).
+
+Safety reasoning (documented in both files): this new code runs strictly after the UART has already
+received the full, already-proven fault report, so if `sp_usr`/`sp_svc` themselves turn out to be garbage
+and the dump double-faults, the existing, already-proven re-entry protection (sp_abt reset to
+`_abort_stack_top` on every single handler entry, from task #253's own investigation) bounds the damage to
+"report the new fault instead" -- it can only cost the new diagnostic, never the original report that was
+already sent.
+
+Verified: `./build.sh` clean (0 DEFINITE/REVIEW safety-audit findings, confirmed via a fresh `dhruva.elf`
+after deleting the stale one -- not just the exit code), `phase4_milestone.py` 19/19 clean, no
+regressions. NOT yet real-HW tested -- needs a reflash and a recurrence of the crash (or a repeat of the
+kernelupload-stream stress scenario) to actually produce useful stack-dump output. Root cause of the
+`diag_wait_1` crash remains OPEN until that evidence comes back.

@@ -210,6 +210,54 @@ fault_data_abort:
     str r7, [sp, #8]            /* orig_r3 -> arg7 (stack) */
     str r8, [sp, #12]           /* orig_lr -> arg8 (stack) */
     bl abort_report_data
+    /* TASK #357 (2026-10-15): best-effort stack dump, added strictly
+     * AFTER the already-proven report above has already reached the
+     * UART -- so even if this part double-faults (one of the two SPs
+     * read below turning out to ALSO be garbage), the original
+     * fault's own report is never at risk; the existing re-entry
+     * protection two comments up (sp reset to _abort_stack_top on
+     * EVERY entry) already bounds that to "one more re-entry,
+     * reporting the new fault instead of looping/corrupting", exactly
+     * the guarantee it was built for.
+     *
+     * Reads BOTH sp_usr and sp_svc, plus spsr_abt (the interrupted
+     * context's own real CPSR, captured automatically by hardware at
+     * abort entry) -- rather than guess which mode was actually
+     * running from current_task alone (task #253: all tasks run USR,
+     * but a fault during a dhruva_prio_lock/_unlock-style SWI-
+     * trampolined syscall, or inside kernel-context IRQ/FIQ work,
+     * would be executing in SVC, not USR). spsr tells us which one
+     * actually matters; dumping both costs little and removes the
+     * need to get that guess right to be useful.
+     *
+     * `cps <mode>` (bare mode-switch form, no `ie`/`id` suffix) only
+     * changes the M[4:0] bits -- confirmed against this project's own
+     * established use of the identical pattern in boot.S's own IRQ/
+     * ABT stack setup -- so this never touches the F mask this
+     * handler's own entry already set. */
+    mrs r0, spsr
+    mov r6, r0                  /* r6 = spsr_abt, preserved across both
+                                  * mode round-trips below */
+    mrs r1, cpsr
+    mov r7, r1                  /* r7 = our own current cpsr (ABT),
+                                  * to switch back to after each probe */
+    bic r1, r1, #0x1F
+    orr r1, r1, #0x10           /* USR mode */
+    msr cpsr_c, r1
+    mov r8, sp                  /* r8 = sp_usr */
+    msr cpsr_c, r7              /* back to ABT */
+    mrs r1, cpsr
+    bic r1, r1, #0x1F
+    orr r1, r1, #0x13           /* SVC mode */
+    msr cpsr_c, r1
+    mov r9, sp                  /* r9 = sp_svc */
+    msr cpsr_c, r7              /* back to ABT -- sp is sp_abt again,
+                                  * same one abort_report_data already
+                                  * used, still valid */
+    mov r0, r6
+    mov r1, r8
+    mov r2, r9
+    bl abort_dump_task_stacks
     b .
 
 .global fault_prefetch_abort
@@ -262,4 +310,29 @@ fault_prefetch_abort:
     str r7, [sp, #8]            /* orig_r3 -> arg7 (stack) */
     str r8, [sp, #12]           /* orig_lr -> arg8 (stack) */
     bl abort_report_prefetch
+    /* TASK #357: same best-effort stack dump as fault_data_abort's
+     * own, added after the same way for the same reason -- see that
+     * function's own header comment for the full "why" (both SPs,
+     * plus spsr_abt to show which mode was actually interrupted,
+     * added strictly after the already-proven report so a double-
+     * fault here can only cost this addition, never the original). */
+    mrs r0, spsr
+    mov r6, r0
+    mrs r1, cpsr
+    mov r7, r1
+    bic r1, r1, #0x1F
+    orr r1, r1, #0x10           /* USR mode */
+    msr cpsr_c, r1
+    mov r8, sp                  /* sp_usr */
+    msr cpsr_c, r7
+    mrs r1, cpsr
+    bic r1, r1, #0x1F
+    orr r1, r1, #0x13           /* SVC mode */
+    msr cpsr_c, r1
+    mov r9, sp                  /* sp_svc */
+    msr cpsr_c, r7               /* back to ABT */
+    mov r0, r6
+    mov r1, r8
+    mov r2, r9
+    bl abort_dump_task_stacks
     b .
