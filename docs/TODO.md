@@ -13737,3 +13737,72 @@ Build clean (asm safety audit: 0 definite/review findings across the new assembl
 the new counter/guard. Real-HW retest during an actual `kernelupload` burst (the condition that
 originally triggered this) still needed — deferred to the next physical reflash, same as task #352's own
 pending real-HW dress rehearsal.
+
+### Task #355: `kernelupload` redesigned as a raw-binary stream — root cause of the ~58 real-hour projection, and why wire bandwidth was never actually the bottleneck (2026-10-15)
+
+User question, prompted by the task #352 upload attempt's own ~0.6 chunks/sec measurement: "why would it
+take 58 hours to transfer 3MB over UART at 115200 baud when I expected 10 minutes." Real answer, confirmed
+by reading the code directly rather than guessing — **two independent bottlenecks, neither one wire
+bandwidth**:
+
+1. **`task_f`'s own idle-sleep.** Its loop is `if no line ready { task_sleep_ticks(2) } else { dispatch
+   }` — 2 ticks = 1 full second (500ms/tick, confirmed elsewhere in this file). After dispatching one
+   `chunk`, task_f loops back and checks readiness again immediately — false, because the host hasn't
+   even received the ack yet, let alone sent the next line — so it takes the sleep branch and pays a
+   full second EVERY round trip, totally decoupled from baud rate or chunk size. 125,637 chunks × ~1s ≈
+   35 real hours, the right order of magnitude for the observed 58.
+2. **`UART_RX_IRQ_BUDGET_PER_TICK`** (the same sporadic-server budget task #352 had just raised 4→8) caps
+   ALL UART RX draining to ~8 service calls × ~16 bytes = 128 bytes/tick = **256 bytes/sec, system-wide,
+   regardless of protocol** — a hard ceiling roughly 45× below the UART's own 11520 bytes/sec raw
+   capacity, deliberately scoped for WCET safety on ordinary interactive/typed traffic. A naive "just
+   remove the per-chunk round trip" fix would still be bottlenecked here: an unpaced raw blast exhausts
+   this budget in ~11ms, then RXIM gets masked until the next 500ms tick, and the real 16-byte hardware
+   FIFO permanently drops everything sent in between.
+
+User chose the bigger redesign (not the smaller "stop task_f idle-sleeping" patch alone) and explicitly
+signed off on the RX-budget tradeoff this requires: **during an active `kernelupload stream`, fully lift
+the budget** — drain every IRQ unconditionally, no per-tick cap — since the host is told via `GO` that
+nothing else talks on the UART until the stream's own declared length is reached or it's aborted, so no
+competing interactive traffic can be starved by it.
+
+**New protocol**: `kernelupload stream <len>` → board replies `GO <len>`, host blasts the whole file as
+one raw `write()` (no hex, no per-line round trip) → board periodically emits `ACK <total_len>
+<sha_prefix>` (every 64KB) → `DONE <total_len>` once the declared length is reached, at which point normal
+line-based shell processing resumes automatically → host sends the EXISTING, unchanged `kernelupload
+commit <len> <sha256>` (full SD readback-and-rehash verification, untouched).
+
+**Real build failure caught and fixed mid-implementation, not guessed around**: the first version called
+`kernelupload_accumulate_bytes` (which flushes to SD via `sdhost_write_block`) directly from
+`irq_dispatch`'s own new stream-drain branch. vanic correctly rejected this: `irq_dispatch` exceeded its
+`#[bounded_stack(bytes=1024)]` budget (2116 bytes via the real call chain into `sdhost_init`'s own retry/
+reinit path) AND its `#[wcet(cycles=130000)]` estimate went unbounded (that function's own `while` loop).
+Both diagnostics were correct: SD access has never belonged in interrupt context anywhere else in this
+codebase either. Fixed by splitting producer/consumer with a new lock-free single-producer/single-consumer
+byte ring (`kernelupload_rx_ring`, `boot/kernelupload_state.S`, 4096 bytes) — `irq_dispatch` only ever
+copies raw bytes off the hardware FIFO into the ring (O(1), no SD, no sha256, trivially within budget);
+`task_f`'s own new streaming branch (checked before its ordinary ready/sleep/dispatch logic) is the ring's
+sole consumer, busy-polling it (no sleep, since there's no competing shell work while a stream is active)
+and doing the actual SD-write/sha256/ack/completion work entirely at task level, under the same
+ceiling=2 lock every other kernelupload/DharaFS-touching command already uses. No masking needed on either
+side of the ring — a true SPSC ring needs none, only that index reads/writes are atomic, which plain
+32-bit load/store already is on this single-core target.
+
+The existing `chunk <hex>` path is unchanged and still works (its own per-byte accumulate+flush loop was
+factored out into the new shared `kernelupload_accumulate_bytes`, used by both paths) — `stream` is
+additive, not a replacement.
+
+Build clean (0 safety-audit findings in the new assembly). QEMU regression (`phase4_milestone.py`) 19/19
+clean, run twice against this code. End-to-end exercise of `stream` itself specifically (not just "no
+regression to existing behavior") is NOT yet confirmed: a standalone verification harness (seed a disk
+image, boot under QEMU, drive `stream`/`commit` against a synthetic payload) hit two real bugs in the
+TEST SCRIPT itself (unanchored `"PASS"`/`"GO"` substring matches against early self-test output
+containing `"(PASS)"` and `"GOVERNOR"` — both fixed), then became inconclusive due to genuine host load
+from many consecutive back-to-back QEMU runs in a short window (`uptime` confirmed 15-min load average
+3.36 at the time) — the same "contaminated data" condition this project has hit and documented before.
+`test/phase4_milestone.py` itself re-ran clean (19/19) on the same host immediately after, confirming the
+build/regression are fine; the open item is specifically a clean, uncontaminated live exercise of
+`kernelupload stream`'s own new code paths (ring, task_f branch, ack cadence, completion detection),
+which — like task #352's own real-HW burst retest and task #354's own real-HW shadow-mismatch retest —
+is deferred to the next session with either a rested host or the real Pi 1B, not guessed past.
+`test/kernel_upload.py` rewritten to use the new protocol (one raw `write()`, stall-timeout instead of
+per-chunk attempts/retries, `--stall-timeout` default 30s).

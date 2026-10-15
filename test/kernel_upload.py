@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
-"""Host-side driver for `kernelupload chunk`/`commit`: hex-encodes a
-kernel build (build/kernel.img) and streams it into the currently-
-INACTIVE A/B kernel slot over a live serial connection to an
-already-booted board -- see shell_dispatch_kernelupload's own header
-comment (kernel/kernel_main.vani) and the plan this came from.
+"""Host-side driver for `kernelupload stream`/`commit`: hex-encodes
+nothing -- streams a kernel build (build/kernel.img) as raw binary
+into the currently-INACTIVE A/B kernel slot over a live serial
+connection to an already-booted board -- see shell_dispatch_
+kernelupload's own header comment (kernel/kernel_main.vani) and the
+plan this came from.
 
-Mirrors test/wifikey_upload.py's structure exactly (same no-pyserial
-raw os.open+termios approach, same reader-thread + read_until()-with-
-retry pacing -- chunks sent faster than the shell can process them
-silently drop bytes, the same real bug wifikey_upload.py's own header
-comment documents). Differences: this script computes the sha256 once
-over the whole local file (no streaming constraint host-side -- the
-kernel itself streams because a multi-MB image doesn't fit in its own
-768KB heap) and sends it in the final `commit <len> <sha256>` line;
-expect thousands of chunks for a multi-MB image (vs. wifikey's ~337),
-so this adds a progress printout.
+Mirrors test/wifikey_upload.py's structure for the connection/reader-
+thread plumbing (same no-pyserial raw os.open+termios approach), but
+NOT its per-chunk hex/ack shape -- see TASK #355's own history for
+why: the original `chunk <hex>`-per-line design was found to project
+to ~58 REAL HOURS for a 3MB kernel at 115200 baud, root-caused to two
+independent bottlenecks that have nothing to do with wire bandwidth:
+(1) task_f's own idle-sleep (1 full second whenever no line is ready,
+paid on every single chunk's round trip, since the next chunk is
+never ready the instant task_f checks) and (2) the UART RX IRQ
+sporadic-server budget (a hard ~256 bytes/sec system-wide ceiling,
+deliberately scoped for WCET safety on ordinary interactive/typed
+traffic). `kernelupload stream <len>` fixes both: the board switches
+into a dedicated raw-binary drain mode (irq_dispatch bypasses the RX
+budget entirely while it's active, task_f busy-polls a lock-free ring
+instead of idle-sleeping) and the host just blasts the whole file in
+one write() -- no hex, no per-chunk round trip, no artificial pacing.
+Progress is reported via periodic `ACK <total_len> <sha_prefix>`
+lines (every 64KB) rather than a response-per-chunk; `DONE <total_len>`
+signals the raw phase is over and the EXISTING, unchanged `commit
+<len> <sha256>` command (full SD readback-and-rehash verification)
+is next.
 
 This does NOT reboot the board or activate the new slot -- that's a
 deliberate, separate decision (`kernelslot activate <a|b>`, run by
@@ -32,24 +44,6 @@ import termios
 import threading
 import time
 
-# Must match shell_dispatch_kernelupload's own enforced cap (kernel/
-# kernel_main.vani) -- same 48-byte/96-hex-char shell-line-buffer
-# ceiling wifikey's own chunk size is bounded by.
-# TASK #352/#164 (2026-10-12): reduced from 48 after a real-HW finding
-# the same night -- even with UART_RX_IRQ_BUDGET_PER_TICK raised 4->8
-# (kernel_main.vani, commit e94e798), a 48-byte chunk's own ~115-byte
-# line still exceeds the real per-tick RX margin (confirmed live: a
-# 32-byte/~84-byte-line chunk got its own hex echoed fully but its
-# "ok, N bytes accumulated" RESPONSE truncated to just "ok" -- right at
-# the edge, not reliably safe). 24 bytes (~68-byte line) confirmed
-# clean on real hardware, response included, with real margin to
-# spare. Doubles the chunk count for a given upload vs. the original
-# 48 -- a real cost, not a one-line tweak to shrug off -- but a
-# further RX-budget increase (or line-length-aware pacing) that lets
-# this go back up belongs in a FUTURE round validated live, not
-# guessed here without a board to test against.
-CHUNK_BYTES = 24
-
 BAUD_MAP = {
     9600: termios.B9600,
     19200: termios.B19200,
@@ -57,6 +51,13 @@ BAUD_MAP = {
     57600: termios.B57600,
     115200: termios.B115200,
 }
+
+# How often (in received bytes) the board sends an ACK line -- must
+# match kernel_main.vani's own 65536 boundary (scheduling_decision_
+# prelude has nothing to do with this; it's task_f's new streaming
+# branch). Only used here to size the stall-detection timeout
+# sensibly, not to validate the board's own cadence.
+ACK_INTERVAL_BYTES = 65536
 
 
 def open_serial(path: str, baud: int) -> int:
@@ -114,8 +115,17 @@ class ShellSession:
             time.sleep(0.05)
         return False
 
+    def tail_text(self, n: int = 500) -> str:
+        with self.lock:
+            return bytes(self.buf[-n:]).decode(errors="replace")
+
     def send(self, line: str):
         os.write(self.fd, (line + "\r").encode())
+
+    def send_raw(self, data: bytes):
+        """Write raw bytes with no line framing at all -- used only
+        for the stream payload itself, never for shell commands."""
+        os.write(self.fd, data)
 
     def wait_until_ready(self, overall_timeout: float = 30, poll_interval: float = 1.0) -> bool:
         """Same attach-at-any-time handshake as wifikey_upload.py's own
@@ -146,8 +156,9 @@ def main() -> int:
     ap.add_argument("device", help="serial device, e.g. /dev/ttyUSB0 (real hardware) or /dev/pts/N (QEMU -serial pty)")
     ap.add_argument("kernel_img", help="path to the flat kernel binary to upload (e.g. build/kernel.img)")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--chunk-timeout", type=float, default=10, help="seconds to wait for each chunk's 'bytes accumulated' response")
-    ap.add_argument("--chunk-attempts", type=int, default=3, help="retries per chunk before giving up")
+    ap.add_argument("--go-timeout", type=float, default=10, help="seconds to wait for the board's 'GO <len>' response")
+    ap.add_argument("--stall-timeout", type=float, default=30,
+                     help="abort if no new ACK/DONE arrives for this many seconds once streaming (a stall, not normal per-chunk pacing -- there is no per-chunk pacing anymore)")
     ap.add_argument("--commit-timeout", type=float, default=60, help="commit does a full SD readback+re-hash, give it real time")
     ap.add_argument("--ready-timeout", type=float, default=30, help="seconds to wait for the board to answer 'ready' at all")
     ap.add_argument("--log", default="/tmp/kernel_upload_full.log", help="path to write the raw captured serial log")
@@ -156,9 +167,7 @@ def main() -> int:
     data = open(args.kernel_img, "rb").read()
     real_len = len(data)
     real_sha256 = hashlib.sha256(data).hexdigest()
-    chunks = [data[i:i + CHUNK_BYTES] for i in range(0, len(data), CHUNK_BYTES)]
     print(f"kernel image: {real_len} bytes, sha256={real_sha256}")
-    print(f"{len(chunks)} chunks of up to {CHUNK_BYTES} bytes each")
 
     fd = open_serial(args.device, args.baud)
     session = ShellSession(fd, args.log)
@@ -170,14 +179,49 @@ def main() -> int:
             return 1
         print("[board ready]")
 
-        for idx, c in enumerate(chunks):
-            ok = session.step(f"kernelupload chunk {c.hex()}", "bytes accumulated",
-                               timeout=args.chunk_timeout, attempts=args.chunk_attempts)
-            if not ok:
-                print(f"[FAIL] chunk {idx + 1}/{len(chunks)} never confirmed after {args.chunk_attempts} attempts")
-                return 1
-            if idx % 200 == 0 or idx == len(chunks) - 1:
-                print(f"  ...chunk {idx + 1}/{len(chunks)} ok", flush=True)
+        print(f"sending 'kernelupload stream {real_len}'...")
+        session.send(f"kernelupload stream {real_len}")
+        if not session.read_until("GO ", timeout=args.go_timeout):
+            print("[FAIL] board never responded with 'GO <len>' -- is the slot-state record valid "
+                  "(card seeded?), or is the requested length too large for the slot?")
+            print("---last output---")
+            print(session.tail_text())
+            return 1
+        print("[board is GO] blasting the whole image as one raw write -- no hex, no per-chunk wait...")
+
+        t0 = time.time()
+        session.send_raw(data)
+        print(f"  ...all {real_len} bytes handed to the OS write() call, waiting for the board to "
+              f"drain + ack as it goes")
+
+        last_progress_bytes = 0
+        deadline = time.time() + args.stall_timeout
+        done = False
+        while time.time() < deadline:
+            if session.read_until("DONE ", timeout=0.5):
+                done = True
+                break
+            with session.lock:
+                buf_copy = bytes(session.buf)
+            # Count how many "ACK " lines have appeared so far, purely
+            # to decide whether real progress is happening (and reset
+            # the stall deadline) -- not parsing the exact byte count
+            # out of them, since DONE's own arrival is the real signal
+            # this loop is waiting for.
+            ack_count = buf_copy.count(b"ACK ")
+            if ack_count > last_progress_bytes:
+                last_progress_bytes = ack_count
+                print(f"  ...progress: {ack_count} ACK(s) seen so far ({(time.time() - t0):.1f}s elapsed)")
+                deadline = time.time() + args.stall_timeout
+        if not done:
+            print(f"[FAIL] stream stalled -- no DONE within {args.stall_timeout}s of the last progress ACK")
+            print("---last output---")
+            print(session.tail_text())
+            return 1
+
+        elapsed = time.time() - t0
+        rate = real_len / elapsed if elapsed > 0 else 0
+        print(f"[ok] got DONE after {elapsed:.1f}s ({rate:.0f} bytes/sec)")
 
         print("committing (board re-reads every written block from SD and re-verifies -- may take a while)...")
         commit_needle = "verified and marked ready"

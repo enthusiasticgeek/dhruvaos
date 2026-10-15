@@ -57,6 +57,66 @@ kernelupload_chunk_decode_buf:
  * state reads can never clobber either mid-operation. */
 kernelslot_record_buf:
     .space 512
+/* TASK #355 (2026-10-12): `kernelupload stream <len>` -- raw-binary
+ * mode, no hex/no per-line shell round trip. kernelupload_stream_
+ * active gates irq_dispatch's own UART-RX branch (kernel_main.vani):
+ * while set, it skips the UART_RX_IRQ_BUDGET_PER_TICK sporadic-server
+ * check ENTIRELY and drains the FIFO on every IRQ unconditionally --
+ * a deliberate, scoped exception to the budget (see that constant's
+ * own header comment) for this one, operator-initiated, UART-
+ * exclusive bulk-transfer mode. kernelupload_stream_expected_len is
+ * the total byte count `stream` was told to expect, so irq_dispatch
+ * can detect completion and fall back to normal budgeted shell
+ * behavior on its own, with no host-side "stop" message needed.
+ * kernelupload_stream_last_ack_len tracks total_len as of the last
+ * progress ack sent, so the drain path only needs a cheap `-` and
+ * compare (not a division) to decide whether a new 64KB boundary was
+ * crossed this call. kernelupload_stream_batch_buf is scratch for one
+ * IRQ's worth of raw bytes -- 32 bytes, double the PL011's real
+ * 16-byte RX FIFO depth, so a single call's drain (now unbounded by
+ * budget, draining until the FIFO reports empty) always has real
+ * headroom even if ISR entry latency let a couple of extra bytes
+ * arrive beyond one full FIFO's worth before this ran. */
+kernelupload_stream_active:
+    .space 4
+kernelupload_stream_expected_len:
+    .space 4
+kernelupload_stream_last_ack_len:
+    .space 4
+kernelupload_stream_batch_buf:
+    .space 32
+/* TASK #355, round 2: kernelupload_rx_ring is a lock-free single-
+ * producer/single-consumer byte ring -- irq_dispatch (interrupt
+ * context) is its ONLY producer, task_f (its own new streaming
+ * branch) is its ONLY consumer. An SPSC ring like this needs NO
+ * cpsid/cpsie masking on either side, unlike uart_tx_ring (boot/
+ * uart_tx_ring_state.S, genuinely multi-producer) -- head is written
+ * only by the producer, tail only by the consumer, and a plain
+ * aligned 32-bit load/store is already atomic on this single-core
+ * target, the only property an SPSC ring actually needs for
+ * correctness. This exists because the FIRST version of `kernelupload
+ * stream` called kernelupload_accumulate_bytes (which flushes to SD
+ * via sdhost_write_block) directly from irq_dispatch -- a real build
+ * failure (irq_dispatch's own #[bounded_stack(bytes=1024)]/#[wcet(...)]
+ * budgets, blown by the SD/driver call chain this pulled in) that
+ * confirmed what every other SD-touching path in this codebase already
+ * assumes: SD access never belongs in interrupt context. This ring is
+ * the fix -- irq_dispatch only ever copies raw bytes in (O(1), no SD,
+ * no sha256), task_f drains it and does the real work entirely at task
+ * level, busy-polling (no sleep) while a stream is active.
+ *
+ * 4096 bytes, a power of two (wraparound is `& 4095`, matching uart_
+ * tx_ring's own `& 63` reasoning) -- generous margin (≈355ms of
+ * continuous full-rate 115200-baud arrival) against task_f being
+ * delayed re-entering its own drain loop by higher-priority
+ * preemption, not a size tuned against any measured real-HW number
+ * yet (real-HW retest pending, same as the rest of this task). */
+kernelupload_rx_ring_buf:
+    .space 4096
+kernelupload_rx_ring_head:
+    .space 4
+kernelupload_rx_ring_tail:
+    .space 4
 
 .section ".text"
 
@@ -126,5 +186,92 @@ kernelupload_chunk_decode_buf_get:
 .global kernelslot_record_buf_get
 kernelslot_record_buf_get:
     ldr r0, =kernelslot_record_buf
+    mov r1, #0
+    bx lr
+
+.global kernelupload_stream_active_get
+kernelupload_stream_active_get:
+    ldr r0, =kernelupload_stream_active
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global kernelupload_stream_active_set
+kernelupload_stream_active_set:
+    ldr r1, =kernelupload_stream_active
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global kernelupload_stream_expected_len_get
+kernelupload_stream_expected_len_get:
+    ldr r0, =kernelupload_stream_expected_len
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global kernelupload_stream_expected_len_set
+kernelupload_stream_expected_len_set:
+    ldr r1, =kernelupload_stream_expected_len
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global kernelupload_stream_last_ack_len_get
+kernelupload_stream_last_ack_len_get:
+    ldr r0, =kernelupload_stream_last_ack_len
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global kernelupload_stream_last_ack_len_set
+kernelupload_stream_last_ack_len_set:
+    ldr r1, =kernelupload_stream_last_ack_len
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global kernelupload_stream_batch_buf_get
+kernelupload_stream_batch_buf_get:
+    ldr r0, =kernelupload_stream_batch_buf
+    mov r1, #0
+    bx lr
+
+.global kernelupload_rx_ring_buf_get
+kernelupload_rx_ring_buf_get:
+    ldr r0, =kernelupload_rx_ring_buf
+    mov r1, #0
+    bx lr
+
+.global kernelupload_rx_ring_head_get
+kernelupload_rx_ring_head_get:
+    ldr r0, =kernelupload_rx_ring_head
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global kernelupload_rx_ring_head_set
+kernelupload_rx_ring_head_set:
+    ldr r1, =kernelupload_rx_ring_head
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global kernelupload_rx_ring_tail_get
+kernelupload_rx_ring_tail_get:
+    ldr r0, =kernelupload_rx_ring_tail
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global kernelupload_rx_ring_tail_set
+kernelupload_rx_ring_tail_set:
+    ldr r1, =kernelupload_rx_ring_tail
+    str r0, [r1]
+    mov r0, #0
     mov r1, #0
     bx lr

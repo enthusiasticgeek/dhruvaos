@@ -2863,6 +2863,36 @@ extern "C" fn kernelupload_active_set(value: u32) -> u32;
 extern "C" fn kernelupload_chunk_decode_buf_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn kernelslot_record_buf_get() -> mut ref i64;
+// TASK #355: `kernelupload stream <len>` raw-binary mode -- see
+// boot/kernelupload_state.S's own header comment on these.
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_stream_active_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_stream_active_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_stream_expected_len_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_stream_expected_len_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_stream_last_ack_len_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_stream_last_ack_len_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_stream_batch_buf_get() -> mut ref i64;
+// TASK #355 round 2: lock-free SPSC ring, irq_dispatch's sole way of
+// handing stream bytes to task_f without SD/sha256 work ever running
+// in interrupt context -- see boot/kernelupload_state.S's own header
+// comment on kernelupload_rx_ring_buf.
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_rx_ring_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_rx_ring_head_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_rx_ring_head_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_rx_ring_tail_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_rx_ring_tail_set(value: u32) -> u32;
 // Task #164 follow-up: bulk endpoint/toggle state for real 802.11
 // frame TX/RX -- see boot/usb_wifi_state.S's own comment.
 #[stack_cost(bytes=1)]
@@ -13114,6 +13144,59 @@ fn irq_dispatch() -> i64 {
     // this level-triggered condition can't force an immediate re-entry
     // (a real livelock this design deliberately avoids), remember to
     // unmask at the next tick once a fresh budget exists.
+    // TASK #355 (2026-10-12): `kernelupload stream` raw-binary mode --
+    // while active, this is a DELIBERATE, scoped exception to the
+    // sporadic-server budget just below: skip it entirely and drain
+    // on every IRQ unconditionally, since the host is told (via the
+    // `GO` response) that nothing else should be on the wire until
+    // the stream's own declared length is reached or it's aborted.
+    // See kernelupload_stream_active's own header comment (boot/
+    // kernelupload_state.S) for the full reasoning and the explicit
+    // user sign-off this traded worst-case latency for other tasks
+    // (bounded to this mode's own operator-chosen duration) against
+    // throughput -- not a change to the budget's own behavior for
+    // ordinary interactive/typed traffic, which is untouched below.
+    //
+    // FIRST ATTEMPT (reverted): called kernelupload_accumulate_bytes
+    // -- which flushes to SD via sdhost_write_block -- directly from
+    // here. Build failed with a real, correct diagnostic: worst-case
+    // stack depth 2116 bytes via `irq_dispatch -> kernelupload_
+    // accumulate_bytes -> sdhost_write_block -> sdhost_init -> ...`,
+    // over double this function's own #[bounded_stack(bytes=1024)]
+    // budget, PLUS an unbounded WCET estimate (kernelupload_
+    // accumulate_bytes's own `while` loop). Both diagnostics were
+    // right: SD access belongs at task level everywhere else in this
+    // codebase (DharaFS writes, kernelupload's own pre-existing
+    // `chunk` path) and an ISR is exactly the wrong place to add the
+    // first exception -- unpredictable SD retry/reinit latency inside
+    // a hard-RT interrupt handler is a real correctness risk, not
+    // just a budget-accounting technicality.
+    //
+    // Fixed by splitting producer/consumer: this branch ONLY copies
+    // raw bytes off the hardware FIFO into kernelupload_rx_ring (a
+    // lock-free single-producer/single-consumer ring -- see its own
+    // header comment) -- O(1) per byte, no SD, no sha256, trivially
+    // within budget. task_f (see its own new branch) is the ring's
+    // sole consumer, draining it and doing the actual SD-write/
+    // sha256/ack/completion work entirely at task level, busy-polling
+    // (no sleep) while streaming instead of its usual idle-sleep --
+    // see task_f's own comment for why that's safe and necessary here.
+    if kernelupload_stream_active_get() == (1 as u32) {
+      for i from 0 to 32 {
+        let fr: u32 = mmio_read_u32(uart_fr);
+        if (fr & (0x10 as u32)) == (0 as u32) {
+          let c: u32 = mmio_read_u32(uart_dr) & (0xFF as u32);
+          let _ = kernelupload_rx_ring_push(c);
+        }
+      }
+      let _ = mmio_write_u32(uart_icr, 0x50 as u32);
+      // Falls through to the function's own closing brace below --
+      // deliberately does NOT touch rx_budget/uart_rx_irq_budget at
+      // all on this path, so ordinary typed-shell behavior resumes
+      // exactly where it left off once streaming ends (nothing to
+      // re-arm: the budget was never consulted or decremented while
+      // kernelupload_stream_active was 1).
+    } else {
     let rx_budget: u32 = uart_rx_irq_budget_get();
     if rx_budget > (0 as u32) {
       for i from 0 to 128 {
@@ -13141,6 +13224,7 @@ fn irq_dispatch() -> i64 {
     } else {
       let _ = mmio_write_u32(UART_IMSC, 0 as u32);
       let _ = uart_rx_deferred_set(1 as u32);
+    }
     }
   }
 
@@ -30249,6 +30333,164 @@ fn kernelupload_ctx_store(ctx: ref Sha256Ctx) -> i64 {
   return 0;
 }
 
+// TASK #355: shared byte-accumulation core, factored out of the
+// `chunk` handler's own former inline loop so BOTH that hex-decoded
+// path AND the new `stream` raw-binary IRQ-drain path (irq_dispatch,
+// below) feed the SAME one true place that writes kernelupload_
+// block_buf, flushes full 512-byte blocks to SD, and folds them into
+// the running incremental SHA-256 -- exactly the kind of duplication
+// this project's own sweep-sibling-functions-after-bugfix lesson
+// warns against letting happen across two call sites that do the
+// same real thing. Returns -1 (and leaves kernelupload_active as the
+// caller finds it -- this function never touches that flag itself)
+// on an SD write failure, 0 on success; the caller decides what to
+// print and whether to abort, since `chunk` and the IRQ-level stream
+// path want different handling (the former replies synchronously on
+// the same shell line, the latter is running inside an ISR and can
+// only use uart_putc_nonblocking, never a blocking print).
+fn kernelupload_accumulate_bytes(src_buf: mut ref i64, count: i64) -> i64 {
+  let total_len: i64 = kernelupload_total_len_get() as i64;
+  let target_slot: u32 = kernelupload_target_slot_get();
+  let base_block: i64 = if target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() };
+  let block_buf: mut ref i64 = kernelupload_block_buf_get();
+  let ctx: Sha256Ctx = kernelupload_ctx_load();
+
+  let bi: i64 = 0;
+  while bi < count {
+    let off_in_block: i64 = total_len % 512;
+    let _ = buf_write_byte(block_buf, off_in_block as u32, buf_read_byte(src_buf, bi as u32));
+    total_len = total_len + 1;
+    bi = bi + 1;
+    if (total_len % 512) == 0 {
+      let block_index: i64 = (total_len / 512) - 1;
+      let wstatus: i64 = sdhost_write_block(base_block + block_index, block_buf);
+      if wstatus != 0 {
+        let _ = kernelupload_total_len_set(total_len as u32);
+        return -1;
+      }
+      let chunk1: [u8; 256] = zero256_bytes();
+      let chunk2: [u8; 256] = zero256_bytes();
+      let ci: i64 = 0;
+      while ci < 256 {
+        chunk1[ci] = buf_read_byte(block_buf, ci as u32) as u8;
+        chunk2[ci] = buf_read_byte(block_buf, (256 + ci) as u32) as u8;
+        ci = ci + 1;
+      }
+      ctx = sha256_update(ref ctx, mut ref chunk1, 256);
+      ctx = sha256_update(ref ctx, mut ref chunk2, 256);
+    }
+  }
+  let _ = kernelupload_ctx_store(ref ctx);
+  let _ = kernelupload_total_len_set(total_len as u32);
+  return 0;
+}
+
+const KERNELUPLOAD_RX_RING_MASK: i64 = 4095;
+
+// TASK #355 round 2: push ONE byte -- called ONLY from irq_dispatch
+// (the ring's sole producer, always interrupt context). O(1), no
+// loop, no SD/sha256 -- see kernelupload_rx_ring_buf's own header
+// comment (boot/kernelupload_state.S) for why this needs no masking.
+// Returns -1 (byte dropped) if the ring is genuinely full -- sized
+// with real margin (see that same comment) so this is not expected to
+// ever actually happen, but a dropped byte here fails safely: it
+// shows up as a total_len that falls short of the stream's own
+// declared length, which the commit step's length check (already
+// existing, unchanged) will catch rather than silently accepting a
+// truncated image.
+fn kernelupload_rx_ring_push(c: u32) -> i64 {
+  let head: i64 = kernelupload_rx_ring_head_get() as i64;
+  let tail: i64 = kernelupload_rx_ring_tail_get() as i64;
+  let next_head: i64 = (head + 1) & KERNELUPLOAD_RX_RING_MASK;
+  if next_head == tail {
+    return -1;
+  }
+  let buf: mut ref i64 = kernelupload_rx_ring_buf_get();
+  let _ = buf_write_byte(buf, head as u32, c);
+  let _ = kernelupload_rx_ring_head_set(next_head as u32);
+  return 0;
+}
+
+// Pop up to max_count bytes into dst -- called ONLY from task_f (the
+// ring's sole consumer), busy-polling while kernelupload_stream_
+// active==1. Not WCET-bounded (task_f, like shell_dispatch, is
+// deliberately never given a #[wcet(...)] tag -- see task_f's own
+// header comment), so a plain `while` is fine here, unlike anything
+// called from irq_dispatch.
+fn kernelupload_rx_ring_pop_batch(dst: mut ref i64, max_count: i64) -> i64 {
+  let n: i64 = 0;
+  while n < max_count {
+    let head: i64 = kernelupload_rx_ring_head_get() as i64;
+    let tail: i64 = kernelupload_rx_ring_tail_get() as i64;
+    if head == tail {
+      return n;
+    }
+    let buf: mut ref i64 = kernelupload_rx_ring_buf_get();
+    let c: u32 = buf_read_byte(buf, tail as u32);
+    let _ = buf_write_byte(dst, n as u32, c);
+    let next_tail: i64 = (tail + 1) & KERNELUPLOAD_RX_RING_MASK;
+    let _ = kernelupload_rx_ring_tail_set(next_tail as u32);
+    n = n + 1;
+  }
+  return n;
+}
+
+// TASK #355: periodic liveness/progress signal for `kernelupload
+// stream`, sent every 64KB from task_f's own new streaming branch
+// (round 2: moved out of irq_dispatch along with the rest of the
+// SD/sha256 work -- see that branch's own comment). Still built from
+// the same IRQ-safe-only primitives (uart_putc_nonblocking/uart_put_
+// hex32_irq) purely because they already existed and work fine from
+// task level too, not because this still runs in interrupt context.
+// (uart_putc_nonblocking/uart_put_hex32_irq, same discipline as
+// spn_shadow_report_mismatch's own header comment). Includes a cheap
+// first-4-bytes prefix of the running SHA-256 digest-so-far: cloning
+// the persisted ctx and finalizing the CLONE is a bounded, fixed-cost
+// operation (sha256_finalize only ever processes the last <64-byte
+// partial block plus an 8-byte length field -- the cost of everything
+// already folded into ctx.h by prior sha256_update calls is NOT
+// re-done), so this never grows more expensive as the transfer gets
+// longer, and never touches the real persisted ctx kernelupload_
+// accumulate_bytes is still actively extending. This is a genuine,
+// real integrity signal (not just a progress heartbeat) -- a dropped
+// or corrupted byte earlier in the stream changes every digest prefix
+// printed after it, so a host watching these can abort on the first
+// divergence instead of only finding out at the very end via commit's
+// own (still authoritative, unchanged) full-file check.
+fn kernelupload_stream_report_ack(total_len: u32) -> i64 {
+  let snapshot: Sha256Ctx = kernelupload_ctx_load();
+  let digest: [u8; 32] = sha256_finalize(ref snapshot);
+  let pfx: u32 = ((digest[0] as u32) << (24 as u32)) | ((digest[1] as u32) << (16 as u32)) | ((digest[2] as u32) << (8 as u32)) | (digest[3] as u32);
+  let _ = uart_putc_nonblocking(65);  // A
+  let _ = uart_putc_nonblocking(67);  // C
+  let _ = uart_putc_nonblocking(75);  // K
+  let _ = uart_putc_nonblocking(32);  // ' '
+  let _ = uart_put_hex32_irq(total_len);
+  let _ = uart_putc_nonblocking(32);  // ' '
+  let _ = uart_put_hex32_irq(pfx);
+  let _ = uart_putc_nonblocking(13);
+  let _ = uart_putc_nonblocking(10);
+  return 0;
+}
+
+// Sent once, the instant task_f's own streaming branch sees total_len
+// reach the stream's own declared length -- tells the host the raw-binary phase
+// is over and normal shell-line processing has resumed, so it's safe
+// to send the EXISTING, unchanged `kernelupload commit <len>
+// <sha256>` command next (full readback-and-rehash verification
+// happens there, same as the `chunk` path always did).
+fn kernelupload_stream_report_done(total_len: u32) -> i64 {
+  let _ = uart_putc_nonblocking(68);  // D
+  let _ = uart_putc_nonblocking(79);  // O
+  let _ = uart_putc_nonblocking(78);  // N
+  let _ = uart_putc_nonblocking(69);  // E
+  let _ = uart_putc_nonblocking(32);  // ' '
+  let _ = uart_put_hex32_irq(total_len);
+  let _ = uart_putc_nonblocking(13);
+  let _ = uart_putc_nonblocking(10);
+  return 0;
+}
+
 // `kernelupload chunk <hex>` / `kernelupload commit <len> <sha256>` /
 // `kernelupload abort` -- same 48-byte/96-hex-char per-line cap as
 // `wifikey chunk` (shared 128-byte shell line buffer, see
@@ -30263,13 +30505,22 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     return 0;
   }
   if cmd_end >= line_len {
-    let _ = uart_puts("usage: kernelupload chunk <hex> | kernelupload commit <len> <sha256> | kernelupload abort\n");
+    let _ = uart_puts("usage: kernelupload chunk <hex> | kernelupload stream <len> | kernelupload commit <len> <sha256> | kernelupload abort\n");
     return 0;
   }
   let sub_start: i64 = cmd_end + 1;
   let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
 
   if shell_word_matches(line_buf, sub_start, sub_end, "abort") == 1 {
+    // TASK #355: also clear stream_active -- a line-based `abort`
+    // can only actually reach here once a stream has already
+    // finished on its own (irq_dispatch clears the flag at
+    // kernelupload_stream_expected_len_get() bytes received, which is
+    // the only way the shell line buffer starts accepting text again
+    // during an active stream), but clearing it defensively here too
+    // costs nothing and means this command can never leave stale
+    // stream state behind no matter how it's reached.
+    let _ = kernelupload_stream_active_set(0 as u32);
     let _ = kernelupload_active_set(0 as u32);
     let _ = kernelupload_total_len_set(0 as u32);
     let _ = uart_puts("ok\n");
@@ -30318,43 +30569,56 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
       return 0;
     }
 
-    let total_len: i64 = kernelupload_total_len_get() as i64;
-    let target_slot: u32 = kernelupload_target_slot_get();
-    let base_block: i64 = if target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() };
-    let block_buf: mut ref i64 = kernelupload_block_buf_get();
-    let ctx: Sha256Ctx = kernelupload_ctx_load();
-
-    let bi: i64 = 0;
-    while bi < byte_len {
-      let off_in_block: i64 = total_len % 512;
-      let _ = buf_write_byte(block_buf, off_in_block as u32, buf_read_byte(decode_buf, bi as u32));
-      total_len = total_len + 1;
-      bi = bi + 1;
-      if (total_len % 512) == 0 {
-        let block_index: i64 = (total_len / 512) - 1;
-        let wstatus: i64 = sdhost_write_block(base_block + block_index, block_buf);
-        if wstatus != 0 {
-          let _ = uart_puts("kernelupload: SD write failed, aborting\n");
-          let _ = kernelupload_active_set(0 as u32);
-          return 0;
-        }
-        let chunk1: [u8; 256] = zero256_bytes();
-        let chunk2: [u8; 256] = zero256_bytes();
-        let ci: i64 = 0;
-        while ci < 256 {
-          chunk1[ci] = buf_read_byte(block_buf, ci as u32) as u8;
-          chunk2[ci] = buf_read_byte(block_buf, (256 + ci) as u32) as u8;
-          ci = ci + 1;
-        }
-        ctx = sha256_update(ref ctx, mut ref chunk1, 256);
-        ctx = sha256_update(ref ctx, mut ref chunk2, 256);
-      }
+    let accum_status: i64 = kernelupload_accumulate_bytes(decode_buf, byte_len);
+    if accum_status != 0 {
+      let _ = uart_puts("kernelupload: SD write failed, aborting\n");
+      let _ = kernelupload_active_set(0 as u32);
+      return 0;
     }
-    let _ = kernelupload_ctx_store(ref ctx);
-    let _ = kernelupload_total_len_set(total_len as u32);
     let _ = uart_puts("ok, ");
-    let _ = uart_put_i64(total_len);
+    let _ = uart_put_i64(kernelupload_total_len_get() as i64);
     let _ = uart_puts(" bytes accumulated\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "stream") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: kernelupload stream <total_len_bytes> -- then blast raw binary, no hex/no per-chunk ack\n");
+      return 0;
+    }
+    let slen_start: i64 = sub_end + 1;
+    let slen_end: i64 = shell_find_space(line_buf, slen_start, line_len);
+    let claimed_total: i64 = shell_parse_decimal(line_buf, slen_start, slen_end);
+    if claimed_total <= 0 {
+      let _ = uart_puts("kernelupload: stream length must be positive\n");
+      return 0;
+    }
+    if claimed_total > kernelslot_size_bytes() {
+      let _ = uart_puts("kernelupload: stream length exceeds slot size\n");
+      return 0;
+    }
+    let lookup: KernelSlotRecord = kernelslot_lookup();
+    if lookup.valid != 1 {
+      let _ = uart_puts("kernelupload: no valid slot-state record found -- card not seeded?\n");
+      return 0;
+    }
+    let target: u32 = if lookup.active_slot == (0 as u8) { 1 as u32 } else { 0 as u32 };
+    let _ = kernelupload_target_slot_set(target);
+    let _ = kernelupload_total_len_set(0 as u32);
+    let fresh_ctx: Sha256Ctx = sha256_init();
+    let _ = kernelupload_ctx_store(ref fresh_ctx);
+    let _ = kernelupload_active_set(1 as u32);
+    let _ = kernelupload_stream_expected_len_set(claimed_total as u32);
+    let _ = kernelupload_stream_last_ack_len_set(0 as u32);
+    // Set LAST: irq_dispatch's own UART-RX branch checks this flag on
+    // every IRQ from here on, and starts treating incoming bytes as
+    // raw stream payload (bypassing the shell line buffer and the
+    // RX budget both) the instant it's 1 -- everything above must
+    // already be in its correct starting state before that happens.
+    let _ = kernelupload_stream_active_set(1 as u32);
+    let _ = uart_puts("GO ");
+    let _ = uart_put_i64(claimed_total);
+    let _ = uart_puts("\n");
     return 0;
   }
 
@@ -30561,7 +30825,7 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     return 0;
   }
 
-  let _ = uart_puts("usage: kernelupload chunk <hex> | kernelupload commit <len> <sha256> | kernelupload abort\n");
+  let _ = uart_puts("usage: kernelupload chunk <hex> | kernelupload stream <len> | kernelupload commit <len> <sha256> | kernelupload abort\n");
   return 0;
 }
 
@@ -33889,6 +34153,76 @@ fn shell_dispatch() -> i64 {
 #[bounded_stack(bytes=13312)]
 fn task_f() -> i64 {
   while true {
+    // TASK #355 (2026-10-12): `kernelupload stream` drain branch,
+    // checked FIRST, before the ordinary ready/sleep/dispatch logic
+    // below. Deliberately NO task_sleep_ticks here, unlike the normal
+    // idle branch -- the whole point of this redesign (root cause: a
+    // 1-second task_f idle-sleep taxing every single `kernelupload
+    // chunk` round trip, found investigating why a 3MB kernel
+    // projected to ~58 real hours over UART) was that busy-polling
+    // while there's genuine pending work beats any fixed sleep
+    // granularity. Safe to busy-poll here specifically because this
+    // branch is the ONLY thing task_f (priority 3, best-effort) does
+    // while a stream is active -- the host is told via `GO` that
+    // nothing else should be on the wire until the stream's own
+    // declared length is reached or it's aborted, so there is no
+    // competing ordinary shell work this could ever starve.
+    if kernelupload_stream_active_get() == (1 as u32) {
+      let batch: mut ref i64 = kernelupload_stream_batch_buf_get();
+      let popped: i64 = kernelupload_rx_ring_pop_batch(batch, 32);
+      if popped > 0 {
+        let total_before: i64 = kernelupload_total_len_get() as i64;
+        let expected: i64 = kernelupload_stream_expected_len_get() as i64;
+        let remaining: i64 = expected - total_before;
+        // Clamp to `remaining` so a batch that straddles the
+        // stream's own declared end never feeds past-the-end bytes
+        // into the payload -- any leftover in THIS SAME batch (only
+        // possible if the host starts sending its next line before
+        // seeing this stream's own `DONE` message, i.e. not
+        // following the documented protocol) is replayed through
+        // the ordinary shell line path below instead of being
+        // silently lost.
+        let consumed: i64 = if popped < remaining { popped } else { remaining };
+        if consumed > 0 {
+          // Same ceiling=2 lock as the ordinary dispatch branch below
+          // -- kernelupload_accumulate_bytes touches raw SD blocks via
+          // sdhost_write_block, exactly the kind of shared state this
+          // lock already protects for every other kernelupload/
+          // DharaFS-touching command.
+          let _ = dhruva_prio_lock(2);
+          let accum_status: i64 = kernelupload_accumulate_bytes(batch, consumed);
+          let _ = dhruva_prio_unlock(3);
+          if accum_status != 0 {
+            let _ = kernelupload_stream_active_set(0 as u32);
+            let _ = kernelupload_active_set(0 as u32);
+            let _ = uart_puts("\nkernelupload: SD write failed during stream, aborted\n");
+          }
+        }
+        let li: i64 = consumed;
+        while li < popped {
+          let lc: u32 = buf_read_byte(batch, li as u32);
+          let line_len_before: u32 = shell_get_line_len();
+          let _ = shell_rx_push_char(lc);
+          let echo_state: u32 = shell_get_echo_state();
+          let new_echo_state: u32 = shell_echo_char(echo_state, lc, line_len_before);
+          let _ = shell_set_echo_state(new_echo_state);
+          li = li + 1;
+        }
+        if kernelupload_stream_active_get() == (1 as u32) {
+          let total_now: u32 = kernelupload_total_len_get();
+          if (total_now as i64) >= expected {
+            let _ = kernelupload_stream_active_set(0 as u32);
+            let _ = kernelupload_stream_report_done(total_now);
+          } else {
+            let last_ack: u32 = kernelupload_stream_last_ack_len_get();
+            if (total_now - last_ack) >= (65536 as u32) {
+              let _ = kernelupload_stream_last_ack_len_set(total_now);
+              let _ = kernelupload_stream_report_ack(total_now);
+            }
+          }
+        }
+      }
+    } else {
     let ready: u32 = shell_get_line_ready();
     if ready == (0 as u32) {
       let _ = task_sleep_ticks(2);
@@ -33912,6 +34246,7 @@ fn task_f() -> i64 {
       // (possibly slow, UART-bound) logic -- see its own header comment
       // (WIFIKEY-UPLOAD RACE FIX) for why calling shell_clear_line() out
       // here, only after the whole command finished, was a real bug.
+    }
     }
   }
   return 0;
