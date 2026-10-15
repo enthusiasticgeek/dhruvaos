@@ -231,6 +231,19 @@ spn_shadow_syscall_baseline:
                          * IRQ path's own predicted switch ties). The
                          * mismatch check now also requires THIS to
                          * still match its own baseline. */
+spn_shadow_fingerprint_baseline:
+    .word 0             /* TASK #356 (2026-10-15): holistic replacement
+                         * for adding a fourth narrow counter -- see
+                         * spn_shadow_compute_fingerprint's own header
+                         * comment (kernel_main.vani) for the full
+                         * reasoning. A real, live-observed mismatch
+                         * (dhruva_prio_lock/_unlock mutating eff_prio_
+                         * table/ceiling_depth_table without ever
+                         * calling scheduler_pick_next, so neither
+                         * context_switch_count nor syscall_reschedule_
+                         * count change when they run) that task #354's
+                         * own fix could not see. Stamped alongside the
+                         * other baselines above at prediction time. */
 spn_shadow_mismatch_count:
     .word 0
 spn_shadow_prediction_valid:
@@ -846,6 +859,19 @@ task_deadline_ticks_table_set_at:
     mov r1, #0
     bx lr
 
+/* TASK #356 (2026-10-15): the new spn_shadow_fingerprint_baseline
+ * state/accessors added further down this file pushed this section's
+ * automatic end-of-file literal pool more than 4KB away from the
+ * `ldr =symbol` pseudo-ops just above -- a real assembler error
+ * ("pool needs to be closer"), not a false alarm. This .ltorg forces
+ * an EARLIER pool emission right here, close enough for those three
+ * instructions to reach; later code (including the new accessors)
+ * gets served by the next pool (explicit or the file's own automatic
+ * end-of-section one) same as before. First .ltorg this file has
+ * ever needed -- previously always small enough for gas's own
+ * automatic placement to stay in range on its own. */
+.ltorg
+
 .global task_deadline_worst_wait_table_get_at
 task_deadline_worst_wait_table_get_at:
     ldr r1, =task_deadline_worst_wait_table
@@ -1165,6 +1191,20 @@ spn_shadow_syscall_baseline_get:
 .global spn_shadow_syscall_baseline_set
 spn_shadow_syscall_baseline_set:
     ldr r1, =spn_shadow_syscall_baseline
+    str r0, [r1]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_fingerprint_baseline_get
+spn_shadow_fingerprint_baseline_get:
+    ldr r0, =spn_shadow_fingerprint_baseline
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global spn_shadow_fingerprint_baseline_set
+spn_shadow_fingerprint_baseline_set:
+    ldr r1, =spn_shadow_fingerprint_baseline
     str r0, [r1]
     mov r1, #0
     bx lr

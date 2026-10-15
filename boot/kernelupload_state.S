@@ -117,6 +117,27 @@ kernelupload_rx_ring_head:
     .space 4
 kernelupload_rx_ring_tail:
     .space 4
+/* TASK #355 follow-up (real-HW find, 2026-10-15): a stream has no
+ * host-initiated abort path once started -- confirmed live, the hard
+ * way. A real upload attempt got killed by its own outer timeout
+ * while a large os.write() was still blocked mid-drain (the real
+ * serial throughput hadn't finished feeding the OS's own TTY buffer
+ * yet); the board was left with kernelupload_stream_active==1,
+ * correctly waiting forever for bytes that could now never arrive,
+ * since the dead connection meant no new shell commands could reach
+ * it either (incoming bytes are stream payload while this flag is
+ * set, by design -- that's the whole point). Recovered by hand that
+ * time (sent enough throwaway padding bytes to force total_len up to
+ * the stream's own declared length, triggering DONE) -- not a fix,
+ * just a workaround available this once because the exact expected
+ * length was known. kernelupload_stream_last_activity_tick is the
+ * real fix: task_f's own streaming branch stamps this every time it
+ * actually pops new bytes from the ring, and auto-aborts the stream
+ * (falls back to normal shell processing on its own, no host action
+ * needed) if too many ticks pass with zero new bytes -- see task_f's
+ * own comment for the exact bound and reasoning. */
+kernelupload_stream_last_activity_tick:
+    .space 4
 
 .section ".text"
 
@@ -271,6 +292,21 @@ kernelupload_rx_ring_tail_get:
 .global kernelupload_rx_ring_tail_set
 kernelupload_rx_ring_tail_set:
     ldr r1, =kernelupload_rx_ring_tail
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global kernelupload_stream_last_activity_tick_get
+kernelupload_stream_last_activity_tick_get:
+    ldr r0, =kernelupload_stream_last_activity_tick
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global kernelupload_stream_last_activity_tick_set
+kernelupload_stream_last_activity_tick_set:
+    ldr r1, =kernelupload_stream_last_activity_tick
     str r0, [r1]
     mov r0, #0
     mov r1, #0

@@ -2249,6 +2249,16 @@ extern "C" fn spn_shadow_tick_baseline_set(v: u32) -> i64;
 extern "C" fn spn_shadow_syscall_baseline_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_syscall_baseline_set(v: u32) -> i64;
+// TASK #356 (2026-10-15): holistic replacement for the enumerated-
+// counter approach above -- see scheduling_decision_prelude's own
+// updated comment for the full reasoning (a live-observed shadow
+// mismatch, task_f's dhruva_prio_lock/_unlock during kernelupload
+// stream, that NEITHER ctxsw_delta NOR syscall_reschedule_count could
+// see, because neither function calls scheduler_pick_next at all).
+#[stack_cost(bytes=1)]
+extern "C" fn spn_shadow_fingerprint_baseline_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn spn_shadow_fingerprint_baseline_set(v: u32) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn spn_shadow_mismatch_count_get() -> u32;
 #[stack_cost(bytes=1)]
@@ -2893,6 +2903,12 @@ extern "C" fn kernelupload_rx_ring_head_set(value: u32) -> u32;
 extern "C" fn kernelupload_rx_ring_tail_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn kernelupload_rx_ring_tail_set(value: u32) -> u32;
+// TASK #355 follow-up: real-HW-confirmed stream inactivity timeout --
+// see its own header comment in boot/kernelupload_state.S.
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_stream_last_activity_tick_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_stream_last_activity_tick_set(value: u32) -> u32;
 // Task #164 follow-up: bulk endpoint/toggle state for real 802.11
 // frame TX/RX -- see boot/usb_wifi_state.S's own comment.
 #[stack_cost(bytes=1)]
@@ -12723,6 +12739,62 @@ fn task_heartbeat_init() -> i64 {
 // this split (every IRQ), and still true now (every IRQ OR FIQ), just
 // via two call sites sharing one function instead of one function
 // handling both cases inline.
+// TASK #356 (2026-10-15): HOLISTIC replacement for the enumerated-
+// counter pattern task #273/#354 grew one narrow guard at a time.
+// Root cause this closes: a real, live-observed, repeatable "SCHED
+// SHADOW MISMATCH p=00000005 a=00000003" during a real kernelupload
+// stream, caused by dhruva_prio_lock/dhruva_prio_unlock -- which
+// mutate eff_prio_table[current] and ceiling_depth_table[current]
+// (exactly the inputs scheduler_pick_next itself reads to choose
+// BOTH which algorithm branch to take and who wins within it) WITHOUT
+// EVER calling scheduler_pick_next. Task #354's syscall_reschedule_
+// count fix enumerated the two call sites that DO call scheduler_
+// pick_next outside the IRQ path (task_sleep_ticks, mutex-block) --
+// correct for those two, but blind to any OTHER function that changes
+// the real decision's inputs a different way. Task #355's new task_f
+// busy-poll branch calls dhruva_prio_lock/_unlock far more densely in
+// real time than anything before it did, finally exposing this gap in
+// the enumeration itself, not just one more hole in it.
+//
+// Rather than adding a FOURTH narrow counter (and leaving the general
+// class of gap open for whatever touches scheduler state in some
+// FIFTH way next), this computes a cheap, bounded fingerprint of the
+// actual read set (eff_prio_table, ceiling_depth_table, sleep_until_
+// table -- all 16 entries each) and requires it to be byte-for-byte
+// identical between the shadow's own stash and this check. Any
+// difference, from ANY cause, present or future, fails this check
+// honestly rather than needing its own dedicated counter. Deliberately
+// EXCLUDES ready_wait_ticks_table and rr_last_picked: those two are
+// supposed to change on every real decision (the aging/round-robin
+// bookkeeping scheduler_pick_next itself writes as part of making ANY
+// pick) -- including them would make the fingerprint differ on the
+// expected, predicted event itself, not just on unmodeled extra ones.
+// Not a cryptographic hash -- a bounded rotate-xor-fold is sufficient
+// here: the only property needed is "any single-entry change in any
+// of these three tables changes the output", not collision-resistance
+// against an adversary. Kept ALONGSIDE the existing ctxsw/tick/
+// syscall guards below rather than replacing them (all are cheap,
+// already-proven-safe, and this is a diagnostic-only mechanism where
+// extra redundant coverage costs nothing and only ever helps).
+#[no_heap]
+fn spn_shadow_compute_fingerprint() -> u32 {
+  let fp: u32 = 0 as u32;
+  for i from 0 to 16 {
+    let idx: u32 = i as u32;
+    let eff: u32 = eff_prio_table_get_at(idx);
+    let ceil: u32 = ceiling_depth_table_get_at(idx);
+    let slp: u32 = sleep_until_table_get_at(idx);
+    // Rotate by 1..16 (never 0 or 32 -- both undefined/degenerate for
+    // a 32-bit rotate) so each index's own contribution lands
+    // differently, rather than every index just re-XORing the same
+    // bit positions.
+    let shift: u32 = (idx & (15 as u32)) + (1 as u32);
+    let rot: u32 = (fp << shift) | (fp >> ((32 as u32) - shift));
+    fp = rot ^ eff ^ (ceil << (3 as u32)) ^ slp;
+  }
+  return fp;
+}
+
 fn scheduling_decision_prelude() -> i64 {
   let _ = irq_count_increment();
 
@@ -12776,19 +12848,27 @@ fn scheduling_decision_prelude() -> i64 {
     // above can't.
     let spn_syscall_now: u32 = syscall_reschedule_count_get() as u32;
     let spn_syscall_baseline: u32 = spn_shadow_syscall_baseline_get();
-    if (spn_delta <= (1 as u32)) && (spn_tick_now == spn_tick_baseline) && (spn_syscall_now == spn_syscall_baseline) {
+    // TASK #356: fourth guard, see spn_shadow_compute_fingerprint's
+    // own header comment for the full "why this exists alongside the
+    // three above instead of yet another enumerated counter".
+    let spn_fp_now: u32 = spn_shadow_compute_fingerprint();
+    let spn_fp_baseline: u32 = spn_shadow_fingerprint_baseline_get();
+    if (spn_delta <= (1 as u32)) && (spn_tick_now == spn_tick_baseline) && (spn_syscall_now == spn_syscall_baseline) && (spn_fp_now == spn_fp_baseline) {
       let spn_actual: u32 = current_task_get();
       if spn_actual != spn_pending {
         let _ = spn_shadow_report_mismatch(spn_pending, spn_actual, spn_tick_now);
       }
     }
-    // spn_delta > 1, spn_tick_now != spn_tick_baseline, or
-    // spn_syscall_now != spn_syscall_baseline: an intervening task_
-    // sleep_ticks/dhruva_mutex_lock-block decision, or a nested real
-    // timer tick, happened between this prediction's own stash and
-    // this check -- too ambiguous (or, for the tick/syscall cases,
-    // provably stale/unmodeled) to compare against, skip honestly
-    // rather than risk a false report.
+    // spn_delta > 1, spn_tick_now != spn_tick_baseline, spn_syscall_now
+    // != spn_syscall_baseline, or spn_fp_now != spn_fp_baseline: an
+    // intervening task_sleep_ticks/dhruva_mutex_lock-block decision, a
+    // nested real timer tick, or ANY other change to eff_prio_table/
+    // ceiling_depth_table/sleep_until_table (dhruva_prio_lock/_unlock,
+    // or anything else, present or future, that touches them outside
+    // the modeled IRQ path) happened between this prediction's own
+    // stash and this check -- too ambiguous (or, for the tick/syscall/
+    // fingerprint cases, provably stale/unmodeled) to compare against,
+    // skip honestly rather than risk a false report.
   }
   let spn_predicted: u32 = scheduler_pick_next_shadow_predict();
   let spn_ctxsw_baseline_now: u32 = context_switch_count_get() as u32;
@@ -12796,6 +12876,7 @@ fn scheduling_decision_prelude() -> i64 {
   let _ = spn_shadow_ctxsw_baseline_set(spn_ctxsw_baseline_now);
   let _ = spn_shadow_tick_baseline_set(scheduler_get_tick_count());
   let _ = spn_shadow_syscall_baseline_set(syscall_reschedule_count_get() as u32);
+  let _ = spn_shadow_fingerprint_baseline_set(spn_shadow_compute_fingerprint());
   let _ = spn_shadow_prediction_valid_set(1 as u32);
 
   for dl_i from 0 to 6 {
@@ -30610,6 +30691,11 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     let _ = kernelupload_active_set(1 as u32);
     let _ = kernelupload_stream_expected_len_set(claimed_total as u32);
     let _ = kernelupload_stream_last_ack_len_set(0 as u32);
+    // TASK #355 follow-up: stamp "now" as the starting point for the
+    // inactivity timeout task_f's own streaming branch checks -- a
+    // freshly-started stream with zero bytes received yet must not
+    // look stale on its very first check.
+    let _ = kernelupload_stream_last_activity_tick_set(scheduler_get_tick_count());
     // Set LAST: irq_dispatch's own UART-RX branch checks this flag on
     // every IRQ from here on, and starts treating incoming bytes as
     // raw stream payload (bypassing the shell line buffer and the
@@ -34170,7 +34256,34 @@ fn task_f() -> i64 {
     if kernelupload_stream_active_get() == (1 as u32) {
       let batch: mut ref i64 = kernelupload_stream_batch_buf_get();
       let popped: i64 = kernelupload_rx_ring_pop_batch(batch, 32);
+      if popped == 0 {
+        // TASK #355 follow-up (real-HW find, 2026-10-15): no new
+        // bytes this iteration -- check whether the stream has gone
+        // stale instead of busy-polling forever. Real-HW incident
+        // this closes: the host-side process driving a real upload
+        // got killed by its own outer timeout while still mid-write
+        // (the OS's own TTY buffer hadn't finished draining to the
+        // wire yet) -- the dead connection meant no more bytes would
+        // EVER arrive, and with no timeout, kernelupload_stream_
+        // active would have stayed 1 forever, permanently blocking
+        // ordinary shell commands (incoming bytes are stream payload
+        // while this flag is set, by design) with no way to recover
+        // except a power cycle. 20 ticks (10s of genuinely zero
+        // bytes, not just slow progress -- individual bytes/small
+        // batches arrive continuously during a real transfer,
+        // regardless of how long between 64KB ACK milestones) is
+        // generous margin against any real pause, while still
+        // bounding how long a dead connection can wedge the shell.
+        let now_tick: u32 = scheduler_get_tick_count();
+        let last_tick: u32 = kernelupload_stream_last_activity_tick_get();
+        if (now_tick - last_tick) > (20 as u32) {
+          let _ = kernelupload_stream_active_set(0 as u32);
+          let _ = kernelupload_active_set(0 as u32);
+          let _ = uart_puts("\nkernelupload: stream aborted -- no data received for 10s (host connection lost?)\n");
+        }
+      }
       if popped > 0 {
+        let _ = kernelupload_stream_last_activity_tick_set(scheduler_get_tick_count());
         let total_before: i64 = kernelupload_total_len_get() as i64;
         let expected: i64 = kernelupload_stream_expected_len_get() as i64;
         let remaining: i64 = expected - total_before;

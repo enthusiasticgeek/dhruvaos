@@ -13806,3 +13806,68 @@ which — like task #352's own real-HW burst retest and task #354's own real-HW 
 is deferred to the next session with either a rested host or the real Pi 1B, not guessed past.
 `test/kernel_upload.py` rewritten to use the new protocol (one raw `write()`, stall-timeout instead of
 per-chunk attempts/retries, `--stall-timeout` default 30s).
+
+### Task #355/#356: first real-HW `kernelupload stream` test — found 4 real bugs, one UNRESOLVED real crash (2026-10-15)
+
+First live exercise of task #355's new stream path on the real Pi 1B. Mechanism itself works -- `GO`,
+periodic `ACK <len> <sha_prefix>` every 64KB, real progress confirmed -- but surfaced four real, confirmed
+problems, three fixed tonight, one still open:
+
+**1. No host-abort path once a stream starts (FIXED).** The test script's own outer timeout killed the
+upload process while `os.write()` for the full 3MB was still blocked mid-drain (real serial throughput,
+not an instant buffered write) -- the board was left in `kernelupload_stream_active==1` forever, with no
+way for a dead connection to ever reach it again (incoming bytes are stream payload while this flag is
+set, by design). Recovered by hand that time (padding bytes to force `total_len` up to the declared
+length). Real fix: `kernelupload_stream_last_activity_tick` (`boot/kernelupload_state.S`) -- task_f's own
+streaming branch stamps it on every real byte received and auto-aborts (falls back to normal shell
+processing on its own) if 20 ticks (10s) pass with zero new bytes.
+
+**2. A second, DIFFERENT real shadow-mismatch race (FIXED, holistically).** "SCHED SHADOW MISMATCH
+p=00000005 a=00000003" fired three times during the same real stream, same predicted/actual pair every
+time -- confirmed via real code reading to be `dhruva_prio_lock`/`dhruva_prio_unlock` (task_f's own new
+busy-poll branch calls these far more densely than anything before it did), which mutate `eff_prio_table`/
+`ceiling_depth_table` WITHOUT ever calling `scheduler_pick_next` -- invisible to task #354's own
+`syscall_reschedule_count` guard. Per user instruction ("look at root cause holistically... likelihood of
+hitting it again seems high"), this was NOT fixed with a fourth enumerated counter. Instead:
+`spn_shadow_compute_fingerprint()` (`kernel_main.vani`) computes a cheap, bounded rotate-xor-fold over
+`eff_prio_table`/`ceiling_depth_table`/`sleep_until_table` (all 16 entries each) and requires it to match
+byte-for-byte between the shadow's own stash and check -- catching ANY future cause of this class, not
+just this one. Kept alongside the existing ctxsw/tick/syscall guards (all cheap, already-proven, extra
+redundant coverage costs nothing here).
+
+**3. A real build-breaking bug introduced by fix #2 itself, caught before it shipped (FIXED).** Adding the
+fingerprint's own backing state/accessors pushed `boot/context_switch.S`'s automatic literal pool more
+than 4KB from three pre-existing `ldr reg,=symbol` instructions -- a real assembler error ("pool needs to
+be closer"), not a false alarm. First `.ltorg` this file has ever needed. Caught specifically because
+`./build.sh`'s own exit code was checked AGAINST the actual presence of a freshly-built `dhruva.elf`
+(deleted the old one first) rather than trusted on its own -- the exit code shown was from `tail`, not
+`build.sh`, and would have silently looked like success otherwise.
+
+**4. A real, UNRESOLVED crash -- OPEN.** `FATAL: Data Abort addr=00000000 status=0000080D (section
+permission fault) pc=00200160 r0=00200020 r1=00000000 r2=E59FF018 r3=E59FF018 lr=00200168 ctxsw=9740
+irqs=833440`, roughly 20 minutes into the same real stream (recovery, not the original attempt), current_
+task=3 matching the "actual" side of every shadow mismatch above. Confirmed via `addr2line` against the
+EXACT crashed binary (git worktree at commit `3d792df`, the one actually flashed) that `pc`/`lr` both
+resolve inside `diag_wait_1` (`boot/rpi1/boot.S`) -- specifically the one-time, linear, no-branch-target
+vector-table-copy sequence (`ldm/stmia` pairs copying `_vectors` to address 0) that only ever runs once,
+at the very start of cold boot, long before any task exists. Reaching it again with real tasks already
+switched 9,740 times is a genuine, serious signature of corrupted control flow (a wild jump/return), not a
+logic bug in any one function's own reasoning. A careful, deliberate re-read of task_f's own new streaming
+branch (ring push/pop, the `dhruva_prio_lock(2)`/`kernelupload_accumulate_bytes`/`dhruva_prio_unlock(3)`
+sequence, the leftover-byte replay loop) found no additional logic flaw, and the mutual exclusion between
+`irq_dispatch`'s streaming-vs-normal branches holds up on inspection -- but ONE register dump with no
+stack trace is not enough to pin down a wild-jump's real origin, and this is exactly the kind of
+scheduler/memory-safety issue this project's own standing policy says not to guess-fix. The crashed log
+itself (`crashlog` shell command) stores the identical 8 fields already seen on UART, nothing more.
+Confirmed via `git worktree` that commit `3d792df` (the actually-flashed, actually-crashed binary) did
+NOT have bug #3's `.ltorg` problem -- ruled out as a contributing cause.
+
+**Recommended next step, not yet done**: add a small stack-dump (a few words either side of SP) to
+`abort_report_data`/`abort_report_prefetch` (`kernel/kernel_main.vani`) and `vectors.S`'s own fault
+handlers, so a recurrence gives enough evidence to actually root-cause the wild jump instead of guessing.
+Real-HW kernelupload-stream stress testing should stay paused until then, or until a stack-dump-enhanced
+build can gather better evidence on a repeat.
+
+Build clean (0 safety-audit findings), `phase4_milestone.py` 19/19 clean, 0 shadow mismatches -- for fixes
+#1-#3 only; fix #4 (the crash) is NOT yet fixed, only characterized as precisely as current evidence
+allows.
