@@ -14380,3 +14380,34 @@ fails fast (same harmless gap) -> checkpoint 14 (first time ever reaching it) ->
 clean, no reset. This is the first fully successful real-HW boot in the entire task #353 investigation,
 with every one of follow-ups #1 through #8 in place and the write-verification fix proving the deploy that
 produced it actually reached the card. Task #353 is DONE.
+
+### A/B kernel slots, task #352: real-HW dress rehearsal of the auto-revert drill -- DONE (2026-10-16)
+
+With task #353's watchdog confirmed working, ran the drill Phase 6 was always scoped for: prove stage0's
+own attempt-counter/bootlimit fallback actually switches slots on real hardware, using a kernel that never
+cooperates at all (test/build_bad_kernel.sh's `boot/badkernel/bad_entry.S` -- a 4-byte branch-to-self, no
+UART, no watchdog_kick(), nothing).
+
+Procedure: `python3 test/kernel_upload.py /dev/ttyUSB0 build/bad_kernel.img` streamed+committed the bad
+image into slot B (auto-targeted as "whichever slot isn't active"); `kernelslot activate b` made it active
++ preferred with attempt_count reset to 0; user power-cycled. Found live, immediately: `kernel_upload.py`
+and the persistent `dhruva-uart-logger.service` both reading `/dev/ttyUSB0` at once corrupts the GO/ACK
+handshake (two readers racing for bytes off one tty, the exact failure mode the UART-logger-never-stop
+memory already warned about) -- stopped the logger for the upload and the `kernelslot activate`/`status`
+calls, restarted it immediately after each, never left it down across a turn boundary.
+
+Real-HW UART capture confirmed the full cycle with zero kernel-side cooperation: `stage0: active_slot=B
+attempt_count=00000001/2/3` across three reboots (the pre-jump watchdog firing each time the bad kernel's
+branch-to-self left nobody servicing it -- the same mechanism task #353 just proved), then on the fourth:
+`stage0: active_slot=B attempt_count=00000004 bootlimit=00000003 -- bootlimit exceeded, falling back to
+slot A`, immediately followed by slot A's real kernel booting cleanly through to **PASS**. `kernelslot
+status` afterward confirmed it explicitly: `active_slot=A ... last_reset_reason=auto-fallback (bootlimit
+exceeded) attempt_count=0`. Restored `preferred_slot` back to A via `kernelslot activate a` afterward
+(cleanup -- it was still B from the test activation; stage0 itself only ever reads `active_slot`, so this
+was informational tidiness, not a correctness issue).
+
+This is the one case nothing else in the A/B system could prove: a kernel that "boots" by stage0's own
+measure (the CPU is executing, not crashed) but is completely useless -- exactly what a bootcount
+mechanism exists for, as opposed to a fault handler or the watchdog's own crash-recovery case. Task #352
+is DONE; the full A/B kernel-slot feature (tasks #347-#352) and its watchdog safety net (#353) are now
+both real-HW confirmed end to end.
