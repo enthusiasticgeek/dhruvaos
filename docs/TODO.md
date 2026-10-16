@@ -14236,3 +14236,22 @@ regressions. All prior instrumentation (checkpoints 7-12) left in place -- harml
 the boot loop recurs further into the self-test battery (the rest of kernel_main() -- filter/ARP/IP/TCP/
 UDP/DHCP/DNS self-tests, crypto self-tests, TLS/SSH -- has not been individually checked for the same
 class of gap, and plausibly has more of them given how large it is).
+
+### Task #353 real-HW deployment, follow-up #5: follow-up #4 WORKED -- every boot now reaches checkpoint 12, new gap found further along (2026-10-16)
+
+Confirmed real progress: every boot since follow-up #4 reaches checkpoint 12 (previously the hard failure
+point) and checkpoints 10b/12 both fire correctly. It is still looping afterward, though -- a different,
+later gap. Audited the rest of `kernel_main()` directly (not guessed): confirmed the ~75-call networking/
+crypto/WiFi/BLE/SSH self-test battery is entirely `boot_debug_enabled()`-gated and does not execute in a
+normal boot, and the final ~844-line tail is cheap task/stack-table setup with no SD or crypto work. The
+remaining untested span between checkpoint 12 and `PASS` is USB bring-up (`usb_power_on`/`dwc2_init`) --
+its own comment says reaching "port enabled" needs a real attached device, which this test rig doesn't
+have, so `dwc2_init()`'s internal give-up-polling duration with no device attached has never been measured
+against the 2-second budget.
+
+Added checkpoint 13 (pre-USB), checkpoint 14 (post-USB, already kick-adjacent), and checkpoint 15
+(immediately pre-`PASS`) rather than tracing `dwc2_probe_device0()`'s exact internal loop under time
+pressure -- the existing kick at checkpoint 12 and the one already following USB bring-up should already
+bracket it, but the new checkpoints will show definitively whether USB bring-up is actually the remaining
+cause or something else entirely once reached. `phase4_milestone.py` 18/18, all three checkpoints
+confirmed firing correctly under QEMU.

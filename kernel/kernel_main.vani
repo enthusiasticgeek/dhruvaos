@@ -46348,6 +46348,18 @@ fn kernel_main() -> i64 {
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
     let _ = watchdog_kick();
   }
+  // TASK #353 REAL-HW FOLLOW-UP #5 (2026-10-16): every boot now reaches
+  // checkpoint 12 (follow-up #4 closed that gap) but still resets
+  // somewhere between here and PASS. USB bring-up (usb_power_on/
+  // dwc2_init) right below is the leading suspect -- its own comment
+  // says reaching "port enabled" requires a real attached device, and
+  // this test rig has none, so whatever internal give-up polling
+  // dwc2_init() does when no device responds has never been measured
+  // against the 2-second budget. Checkpoint + kick on both sides
+  // rather than tracing the exact internal loop under time pressure.
+  let _ = uart_puts("BOOT DIAG: checkpoint 13 (pre-USB bring-up), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
 
   // Round 44's own bignum arithmetic base (bignum_add_raw/sub_raw/
   // mul_raw/etc, and its own bignum_self_test) was deleted round 100
@@ -46402,6 +46414,9 @@ fn kernel_main() -> i64 {
   }
   if boot_debug_enabled() == 1 { let _ = dwc2_wait_chan0_done_wcet_measure_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dwc2_net_bulk_in_poll_wcet_measure_self_test(); }
+  let _ = uart_puts("BOOT DIAG: checkpoint 14 (post-USB bring-up), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
   // Task #308 follow-up: kick after USB bring-up -- see the kick
   // right after sdhost_init's own matching comment.
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
@@ -47132,6 +47147,9 @@ fn kernel_main() -> i64 {
   let _ = uart_put_i64(fsq_task_id as i64);
   let _ = uart_puts("\n");
 
+  let _ = uart_puts("BOOT DIAG: checkpoint 15 (pre-PASS), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
   let _ = uart_puts("PASS\n");
 
   // Task #308 Phase 5: reaching here means this boot is healthy enough
