@@ -14007,10 +14007,26 @@ one deliberate physical reflash, exactly as its own title already said. Investig
 15-second PM_WDOG/PM_RSTC arm right before stage0's jump to the real kernel, plus kernel_main.vani's
 matching `WATCHDOG_ENABLE_FOR_REAL_HARDWARE` (periodic re-arm/kick throughout the whole boot self-test
 battery, already placed at each major phase boundary -- task #269-271's own WCET/deadline work) and
-`STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE` (cancels the watchdog once PASS is reached) -- all
-three still at their checked-in default of 0, because QEMU's raspi1ap resets the whole emulated machine
-immediately on any PM_RSTC write, which would make every QEMU regression test "reset" before reaching its
-own PASS checkpoint. The task tracker had never been updated to reflect that this was already built.
+`STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE` -- all three still at their checked-in default of 0,
+because QEMU's raspi1ap resets the whole emulated machine immediately on any PM_RSTC write, which would
+make every QEMU regression test "reset" before reaching its own PASS checkpoint. The task tracker had
+never been updated to reflect that this was already built.
+
+**Correction after the user flagged a pattern of happy-path-only checking (same day)**: the paragraph
+above originally described `watchdog_disable()` (the DISARM flag's call site, at the PASS checkpoint) as
+"cancelling" the watchdog. Traced the full call graph before deploying anything and found that's wrong:
+`timer_tick_dispatch()` (`kernel_main.vani`, the real timer-FIQ handler) unconditionally calls `watchdog_
+kick()` on EVERY tick once `WATCHDOG_ENABLE_FOR_REAL_HARDWARE==1`, for the entire remaining life of the
+system -- `watchdog_disable()` at PASS is therefore a no-op in practice, re-armed by the very next tick.
+Not a safety problem (continuous kicking for as long as the scheduler ticks is strictly MORE protection,
+not less, and this project's own WCET/schedulability work already bounds every masked critical section
+well under the 2-second kick window), just an inaccurate claim about the mechanism that would have shipped
+uncorrected. Separately checked whether `task_f`'s streaming busy-poll (tasks #355/#356, no sleep while a
+stream is active) could starve the timer tick long enough to cause a SPURIOUS watchdog reset mid-upload --
+ruled out: that busy-poll's own design note confirms "no masking needed on either side of the ring," so
+the timer FIQ (which always preempts regardless of task-level busy-polling) keeps firing and kicking
+normally throughout. Net effect on the actual deployment: unchanged from the plan below, just correctly
+described now.
 
 What was actually missing was a way to deploy it without a hand-edit-build-revert cycle on the vani
 source each time. Added a `-D` override to `build_stage0.sh` (`STAGE0_CFLAGS` env var) so stage0's own
