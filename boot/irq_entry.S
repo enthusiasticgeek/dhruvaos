@@ -282,6 +282,15 @@ irq_relocate_loop:
 
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
+    /* TASK #357 follow-up (2026-10-16): sentinel check -- see context_
+     * switch.S's own resume_pc_sentinel_check header comment for the
+     * full "why". Peeks both fields straight off the frame (sp already
+     * points at r0's slot here; true_lr/resume_pc sit 52/56 bytes past
+     * it) without disturbing sp, so the restore below is unaffected on
+     * the (expected, every time so far) valid path. */
+    ldr r0, [sp, #56]
+    ldr r1, [sp, #52]
+    bl resume_pc_sentinel_check
     ldmia sp!, {r0-r12, lr, pc}^    /* restores r0-r12 AND the TRUE lr from
                                    * two INDEPENDENT words, then jumps to
                                    * the (separately-stored) resume PC --

@@ -972,6 +972,18 @@ task_wcet_enforce_evicted_count_table_increment_at:
     mov r1, #0
     bx lr
 
+/* TASK #357 follow-up (2026-10-16): second .ltorg this file has ever
+ * needed -- adding resume_pc_sentinel_check (further down this same
+ * file) pushed the run of `ldr rX, =table_name` accessors between here
+ * and the first .ltorg (above) far enough that gas's own automatic
+ * pool placement could no longer reach them (same "pool needs to be
+ * closer" error the first .ltorg's own comment already explains).
+ * Pure assembler bookkeeping -- forces gas to place the literal
+ * constants pending since the last .ltorg here instead of further
+ * down; no effect on emitted instruction semantics or runtime
+ * behavior. */
+.ltorg
+
 /* ROUND 2026-09-20 (task #271): the two real enforcement primitives --
  * ceiling_depth_table_get_at (read-only, same shape/safety class as
  * Gap B's own eff_prio_table_get_at etc. above -- a plain single-
@@ -2029,6 +2041,12 @@ sleep_ticks_diag_skip:
     ldr r3, [r2]
     add r3, r3, #1
     str r3, [r2]
+    /* TASK #357 follow-up (2026-10-16): sentinel check -- see this
+     * file's own resume_pc_sentinel_check header comment. sp already
+     * points at r0's slot here (same as every other restore site). */
+    ldr r0, [sp, #56]
+    ldr r1, [sp, #52]
+    bl resume_pc_sentinel_check
     ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
                                      * comment for why {lr,pc}^ replaces
                                      * the old {lr} + subs pc,lr,#0 */
@@ -2144,6 +2162,89 @@ sched_diag_put_hex32_loop:
     bne sched_diag_put_hex32_loop
     pop {r0-r3, lr}
     bx lr
+
+/* void resume_pc_sentinel_check(r0 = candidate resume_pc, r1 = candidate
+ * true_lr) -- task #357 follow-up (2026-10-16), the sentinel the user
+ * asked for directly after this round's systematic concurrency audit
+ * fully characterized the diag_wait_1 wild-jump crash's own mechanism
+ * (a genuine resume into boot_entry's own address, correctly blocked by
+ * the MMU on its second write) without ever finding what actually
+ * trigger it. Called from all 5 of this project's real cross-task-
+ * resume sites -- irq_entry.S's own IRQ resume, fiq_entry.S's own FIQ/
+ * tick resume, and this file's task_sleep_ticks/dhruva_mutex_lock/
+ * first-task-launch voluntary-switch resumes -- with both fields
+ * freshly peeked off the resuming task's own 68-byte frame, immediately
+ * before the shared `ldmia sp!, {r0-r12,lr,pc}^` idiom actually commits
+ * to jumping there. Turns a silent wild jump into undefined, pre-MMU-
+ * section code (exactly what the still-unexplained crash did) into a
+ * loud, diagnosable halt instead.
+ *
+ * Valid range: [KERNEL_LINK_BASE, PERIPHERAL_BASE) = [0x00200000,
+ * 0x20000000) -- 0x00200000 is this kernel's own real link address
+ * since the A/B slot redesign (boot/rpi1/link.ld); 0x20000000 is the
+ * BCM2835 peripheral block's own base, confirmed via mmu_init.S's own
+ * peripheral-range comment as comfortably above every real MMIO
+ * address this project uses. A genuinely resuming task's resume_pc/
+ * true_lr can ONLY ever legitimately point into this project's own
+ * linked code -- confirmed against prepare_stack_common's own fresh-
+ * task initial frame (round 68: both fields seeded with the real entry
+ * -point address, same range, so a never-yet-run task cannot false-
+ * trigger this) and every live frame this project's own restore sites
+ * ever write, so this has zero known legitimate false-positive surface,
+ * not just a guessed range.
+ *
+ * Never returns if invalid -- halts in place via an infinite branch,
+ * after printing full diagnostics through sched_diag_puts/_put_hex32
+ * (the same fully register-preserving, blocking raw-UART path fiq_
+ * entry.S's own gated resume diagnostic already uses from deep
+ * assembly context) -- preferring a live, diagnosable, watchdog-
+ * recoverable hang (STAGE0_PREJUMP_WATCHDOG, task #353, resets and
+ * retries/falls back through the A/B slot mechanism on real hardware
+ * if WATCHDOG_ENABLE_FOR_REAL_HARDWARE is on) over actually executing
+ * whatever the corrupted address pointed at. r4/r5 used as scratch
+ * without saving -- this function's own bad-path never returns, and
+ * the good-path never touches them, so there is nothing to restore
+ * either way. */
+.global resume_pc_sentinel_check
+resume_pc_sentinel_check:
+    push {r2, r3}
+    ldr r2, =0x00200000
+    cmp r0, r2
+    blo resume_pc_sentinel_bad
+    ldr r2, =0x20000000
+    cmp r0, r2
+    bhs resume_pc_sentinel_bad
+    ldr r2, =0x00200000
+    cmp r1, r2
+    blo resume_pc_sentinel_bad
+    ldr r2, =0x20000000
+    cmp r1, r2
+    bhs resume_pc_sentinel_bad
+    pop {r2, r3}
+    bx lr
+
+resume_pc_sentinel_bad:
+    mov r4, r0
+    mov r5, r1
+    ldr r0, =resume_pc_sentinel_msg1
+    bl sched_diag_puts
+    mov r0, r4
+    bl sched_diag_put_hex32
+    ldr r0, =resume_pc_sentinel_msg2
+    bl sched_diag_puts
+    mov r0, r5
+    bl sched_diag_put_hex32
+    mov r0, #10
+    bl sched_diag_putc
+resume_pc_sentinel_halt:
+    b resume_pc_sentinel_halt
+
+.section ".rodata"
+resume_pc_sentinel_msg1:
+    .asciz "\nSENTINEL: corrupted resume state, refusing to jump! resume_pc="
+resume_pc_sentinel_msg2:
+    .asciz " true_lr="
+.section ".text"
 
 /* void sleep_ticks_diag_print(r0 = outgoing task index) -- prints
  * "SLEEP: task_a resumed, outgoing=<hex>\n". Called only from task_
@@ -2501,6 +2602,11 @@ dml_contended:
     ldr r3, [r2]
     add r3, r3, #1
     str r3, [r2]
+    /* TASK #357 follow-up (2026-10-16): sentinel check -- see this
+     * file's own resume_pc_sentinel_check header comment. */
+    ldr r0, [sp, #56]
+    ldr r1, [sp, #52]
+    bl resume_pc_sentinel_check
     ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
                                      * comment for why {lr,pc}^ replaces
                                      * the old {lr} + subs pc,lr,#0 */
@@ -3747,6 +3853,11 @@ start_multitasking:
                                      * happens to launch first. */
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
+    /* TASK #357 follow-up (2026-10-16): sentinel check -- see this
+     * file's own resume_pc_sentinel_check header comment. */
+    ldr r0, [sp, #56]
+    ldr r1, [sp, #52]
+    bl resume_pc_sentinel_check
     ldmia sp!, {r0-r12, lr, pc}^     /* see irq_entry.S's own restore
                                      * comment for why {lr,pc}^ replaces
                                      * the old {lr} + subs pc,lr,#0 */

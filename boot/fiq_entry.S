@@ -363,6 +363,11 @@ fiq_resume_diag_skip:
 
     ldmia sp!, {r0, r1}
     msr spsr_cxsf, r0
+    /* TASK #357 follow-up (2026-10-16): sentinel check -- see context_
+     * switch.S's own resume_pc_sentinel_check header comment. */
+    ldr r0, [sp, #56]
+    ldr r1, [sp, #52]
+    bl resume_pc_sentinel_check
     ldmia sp!, {r0-r12, lr, pc}^      /* restores r0-r12 AND the TRUE lr
                                       * from two independent words, then
                                       * jumps to the resume PC, restoring
