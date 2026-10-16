@@ -14210,3 +14210,29 @@ governor self-tests). Verified all six fire correctly, in order, under QEMU (`[3
 `phase4_milestone.py` 18/18, no regressions. The next real-HW attempt will show exactly which checkpoint
 is the last one reached and how long each span actually took, rather than inferring it from where output
 stops -- that's the evidence needed to actually fix this instead of guessing a fourth time.
+
+### Task #353 real-HW deployment, follow-up #4: real evidence found the actual gap -- CPU-only self-tests with zero SD I/O, zero kicks (2026-10-16)
+
+The checkpoint instrumentation from follow-up #3 paid off immediately -- real numbers from two real boots:
+checkpoint 7->8 (`dharafs_init`) took 3.8 real seconds; 8->9 (configs + `crashlog_boot_increment`) took
+20 real seconds; 10->11 (the manual `dharafs_compact` call) took 8.6ms; 11->12 (eval/governor self-tests)
+took 7.3 seconds on one boot, and a second boot reset SOMEWHERE in that same span before ever reaching
+checkpoint 12. Every one of the first three spans is already far past the nominal 2-second watchdog
+window, yet boot 1 survived all of them -- direct proof the existing kicks (`dharafs_init`'s own scan-loop
+kick, `sdhost_read_block`/`sdhost_write_block`'s own per-call kick, follow-ups #1/#2) are genuinely
+working, not the problem.
+
+**The actual gap**: `eval_self_test`/`governor_self_test`/`governor_replay_test` (11+6+1 calls) are PURE
+CPU/print work -- no DharaFS/SD calls at all, so none of the existing kicks (every one of them tied to a
+real SD block operation) ever reach this span. 7.3 real seconds for what looks like simple arithmetic and
+a dozen print lines is itself a real, separate finding worth understanding later (real PL011 print latency
+compounding, most likely, not investigated further under today's time pressure) -- but the immediate fix
+needed is coverage, not an explanation.
+
+**Fixed**: three more kicks -- before the eval-test block starts, once more partway through it, and again
+right before the governor-test block starts -- plus one more unconditional checkpoint (10b, pre-eval/
+governor) for next-round visibility if this still isn't the whole story. `phase4_milestone.py` 18/18, no
+regressions. All prior instrumentation (checkpoints 7-12) left in place -- harmless, and still useful if
+the boot loop recurs further into the self-test battery (the rest of kernel_main() -- filter/ARP/IP/TCP/
+UDP/DHCP/DNS self-tests, crypto self-tests, TLS/SSH -- has not been individually checked for the same
+class of gap, and plausibly has more of them given how large it is).

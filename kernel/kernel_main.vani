@@ -46121,6 +46121,22 @@ fn kernel_main() -> i64 {
   // Round 72: shell input echo, with su/passwd password-mode suppression.
   if boot_debug_enabled() == 1 { let _ = shell_echo_self_test(); }
 
+  // TASK #353 REAL-HW FOLLOW-UP #4 (2026-10-16): found via the
+  // checkpoint-7..12 instrumentation above -- the eval_self_test/
+  // governor_self_test block below is PURE CPU/print work, no SD
+  // calls at all, so NONE of the kicks already covering every real
+  // SD block I/O call in this function (dharafs_init's own scan,
+  // sdhost_read_block/write_block's own retry loops) ever reach it.
+  // Measured live: checkpoint 11 -> 12 took 7.3 real seconds on one
+  // boot, and a second boot reset SOMEWHERE in this exact span before
+  // ever reaching checkpoint 12 at all -- this is the confirmed
+  // remaining gap, not another guess.
+  let _ = uart_puts("BOOT DIAG: checkpoint 10b (pre-eval/governor self-tests), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
   let _ = eval_self_test("2+3", 5, 0);
   let _ = eval_self_test("2 + 3 * 4", 14, 0);
   let _ = eval_self_test("(2+3)*4", 20, 0);
@@ -46139,6 +46155,9 @@ fn kernel_main() -> i64 {
   // overflow-rejection path.
   let _ = eval_self_test("999999999999*999999999999", 0, 1);
   let _ = eval_self_test("5000000000+5000000000", 10000000000, 0);
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
 
   // Round 6 audit regression: uart_put_i64 used to negate its whole
   // input up front, which overflows for exactly one value, i64::MIN --
@@ -46156,6 +46175,9 @@ fn kernel_main() -> i64 {
   // (scheduler_ready_count() only means anything once start_multitasking
   // has handed off, at the very end of this function -- deterministic
   // logic like this needs no live task juggling to check).
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
   let _ = governor_self_test(0, 250);
   let _ = governor_self_test(1, 250);
   let _ = governor_self_test(2, 450);
