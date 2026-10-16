@@ -14127,3 +14127,38 @@ budget" even though every call was still making real, correct progress. Bumped t
 the test's own known, fixed 20-write range, not re-coupled to today's specific budget value). Rebuilt,
 reran the same two-boot verification: both self-tests PASS, zero FAIL lines. `phase4_milestone.py`
 re-confirmed 18/18 throughout.
+
+### Task #353 real-HW deployment: FIRST BOOT LOOP FOUND -- `dharafs_init()`'s recovery scan was never kick-protected (2026-10-16)
+
+Deployed via `deploy_realhw_watchdog.sh`. Boots 1-2 reached `PASS` cleanly on real hardware. Boot 3
+onward hung in the exact same spot every time -- immediately after `SD DIAG: sdhost_init total elapsed`,
+before anything else printed -- and got watchdog-reset, climbing `attempt_count` each time
+(`stage0: bootlimit exceeded but other slot not ready, retrying active slot anyway` once it passed 3).
+Not data loss or corruption -- stage0's own fallback logic behaved exactly as designed, just with nowhere
+to fall back to (slot B was never seeded) -- but a real, reproducible, worsening boot loop on the one
+board that matters.
+
+**Root cause, found by reading the actual code rather than guessing**: `dharafs_init()` (`kernel_main.
+vani`) scans sequentially from block 1 via real `dharafs_block_read` calls, up to `max_blk=2048`, on
+EVERY boot -- there's no persisted `log_start` across reboots (deliberate, see the function's own
+comment: recovery has no other safe starting point to trust). Compaction reclaims a block's VISIBILITY
+via the dirindex, not the raw block-number high-water mark this scan walks, so its real-SD-I/O cost only
+grows, boot over boot, as more gets written (including whatever partial writes a FAILED boot still makes
+before its own reset) -- never shrinks. `watchdog_init()`/`watchdog_kick()` both arm a 2-second window;
+the existing kicks (task #308 follow-up) bracket `dharafs_init()` but never protected the scan itself.
+This was simply never exercisable under QEMU -- `PM_RSTC` resets the whole emulated machine on the very
+first real write, so the entire mechanism (header comment's own words) "can only be validated on real
+hardware, never QEMU, by construction." First real exercise on real silicon just found the one gap that
+guarantee left unverified.
+
+**Fixed**: added `watchdog_kick()` inside the scan loop itself, every iteration, gated by
+`WATCHDOG_ENABLE_FOR_REAL_HARDWARE` (a no-op under QEMU, matching the existing convention) -- cheap (two
+MMIO writes next to a real SD block read) and keeps the scan safe regardless of how close to `max_blk` it
+ever needs to go, rather than trying to re-bound the scan's own algorithm under time pressure. `phase4_
+milestone.py` 18/18, no regressions. Checked `dharafs_find_latest_block_raw`'s own similar-shaped linear
+scan too -- left alone: it has a dirindex fast path (O(1) hash lookup) that `dharafs_init()` itself
+rebuilds at boot, so its slow path is a rare cold-cache-miss fallback, not a guaranteed-every-boot full
+scan like this one. NOT yet real-HW retested -- needs a re-deploy via `deploy_realhw_watchdog.sh` and a
+clean multi-boot confirmation before trusting this closes the loop. The card's own accumulated DharaFS
+log growth from the failed attempts is NOT itself a problem post-fix (the scan just takes however long it
+takes now, safely kicked throughout) -- no need to re-flash/wipe the log data separately.

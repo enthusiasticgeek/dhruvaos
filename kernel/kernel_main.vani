@@ -8508,6 +8508,30 @@ fn dharafs_init() -> i64 {
                             // disk looking for the first free block.
   let highest_seq: u32 = 0 as u32;
   while blk < max_blk {
+    // TASK #353 REAL-HW FOLLOW-UP (2026-10-16): found live -- this
+    // scan reads sequentially from block 1 on EVERY boot (no
+    // persisted log_start, see this function's own comment below on
+    // why), one real SD block per iteration, up to max_blk=2048 --
+    // cost that only grows, boot over boot, as more of the log gets
+    // written (compaction reclaims VISIBILITY via dirindex, not the
+    // raw block-number high-water mark this loop walks). The ONE
+    // existing kick before this call (task #308 follow-up, right
+    // after sdhost_init) and the ONE right after it never protected
+    // the scan itself -- fine under QEMU (PM_RSTC writes reset the
+    // whole machine there, so this path was never exercisable at
+    // all) but a real, reproducible watchdog-reset boot-loop once
+    // this scan's own real-SD-I/O cost crossed the 2-second
+    // watchdog_init()/watchdog_kick() window on actual hardware,
+    // confirmed live: boots 1-2 reached PASS fine, boot 3 onward hung
+    // in exactly this phase every time, growing worse (never better)
+    // as each attempt's own partial writes before the reset only
+    // added to what the NEXT boot has to re-scan. Kicking every
+    // iteration here is cheap (two MMIO writes next to a real SD
+    // block read) and keeps this scan safe regardless of how close
+    // to max_blk it ever needs to go.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
     let rd_status: i64 = dharafs_block_read(blk, buf);
     if rd_status != 0 {
       break;
