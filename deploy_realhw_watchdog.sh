@@ -43,9 +43,17 @@ cleanup() {
     echo "=== Restoring kernel_main.vani's watchdog flags to their checked-in 0 ==="
     sed -i 's/^const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 1;/const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 0;/' "$KMAIN"
     sed -i 's/^const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 1;/const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 0;/' "$KMAIN"
-    if ! git -C "$ROOT" diff --quiet -- "$KMAIN"; then
-        echo "WARNING: kernel_main.vani still shows a diff after revert -- check by hand:" >&2
-        git -C "$ROOT" diff -- "$KMAIN" >&2
+    # Checks ONLY that these two specific flags reverted -- not whether
+    # kernel_main.vani has ANY diff from HEAD, which a real-HW session
+    # doing other uncommitted work on this same file (the normal case)
+    # would also trigger, printing an unrelated full-file diff through
+    # a pager for no reason (found live, 2026-10-16: a legitimate set
+    # of uncommitted watchdog-kick edits elsewhere in this file made
+    # this fire every single deploy, with nothing actually wrong).
+    if grep -q '^const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 1;' "$KMAIN" || \
+       grep -q '^const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 1;' "$KMAIN"; then
+        echo "WARNING: kernel_main.vani's watchdog flags did NOT revert to 0 -- check by hand:" >&2
+        grep -n '^const WATCHDOG_ENABLE_FOR_REAL_HARDWARE\|^const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE' "$KMAIN" >&2
     fi
 }
 trap cleanup EXIT

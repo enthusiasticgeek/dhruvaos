@@ -20528,7 +20528,36 @@ fn dwc2_wait_chan0_done() -> u32 {
     let _ = uart_puts("\n");
   }
 
+  // TASK #353 REAL-HW FOLLOW-UP #8 (2026-10-16): this is the shared
+  // wait primitive EVERY control/bulk USB transfer in this whole
+  // driver goes through (control transfers during enumeration, WiFi
+  // bulk, BLE bulk, mass storage) -- a single call, up to 1,000,000
+  // tight-spin iterations (~500ms real worst case per this loop's own
+  // earlier comment), with no return to any caller until it finishes.
+  // Structurally the same risk class follow-up #7 found in pbkdf2's
+  // loop, just spread across many calls instead of one: a real-HW
+  // capture (WiFi dongle on hub port2, firmware download failing fast,
+  // then port3's own bring-up) reset BEFORE reaching checkpoint 14 even
+  // with follow-up #7's PBKDF2 fix and the 10s window both in place --
+  // no single call here needs anywhere near 1,000,000 iterations to
+  // prove the problem; it's the SUM of many calls (each port's
+  // SET_PORT_FEATURE/GET_PORT_STATUS, each device's GET_DESCRIPTOR/
+  // SET_ADDRESS/config fetch, RTL8188CU's register polls, BT's HCI
+  // command round trips) across 1-3 hub ports and however many devices
+  // answer on them that can add up past the window with zero chance
+  // for the watchdog to be serviced in between, depending on what's
+  // physically attached on a given boot -- inherently real-hardware-
+  // timing-dependent, not something QEMU can reproduce. Kicking inside
+  // this one shared primitive, rather than hunting every individual
+  // call site, closes the gap for this entire subsystem at once,
+  // present and future (a WiFi/BLE/mass-storage driver not written yet
+  // goes through this same function).
   while tries < 1000000 {
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if (tries % 50000) == 0 {
+        let _ = watchdog_kick();
+      }
+    }
     let hi: u32 = mmio_read_u32(hcint0);
     if hi != (0 as u32) {
       if (hi & (1 as u32)) != (0 as u32) {
@@ -27190,6 +27219,10 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
   let port_status: u32 = 0 as u32;
   let poll_iter: i64 = 0;
   while (poll_iter < 20) && (reset_seen == 0) {
+    // TASK #353 REAL-HW FOLLOW-UP #8: see dwc2_wait_chan0_done's own
+    // comment -- this loop's own up-to-20x delay(161000) (~1s worst
+    // case per port) is part of the same cross-port accumulation risk.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
     let status_result: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
     if status_result != 0 {
       let _ = uart_puts("USB: hub GET_PORT_STATUS failed\n");
@@ -27322,6 +27355,14 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   let _ = usb_hub_set_mps(hub_mps);
   let _ = usb_hub_set_ready(1 as u32);
 
+  // TASK #353 REAL-HW FOLLOW-UP #8: see dwc2_wait_chan0_done's own
+  // comment for the full finding -- a real boot reset somewhere across
+  // these three ports' combined bring-up+enumeration even with that
+  // shared primitive's own internal kick in place, so kicking again
+  // between each port here too (cheap, bounded work) bounds the
+  // accumulated real time across all three independently of whatever
+  // mix of devices happens to be attached on a given boot.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
   let port1_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port1());
   let port1_outcome: i64 = if port1_result == 0 {
     dwc2_enumerate_one_downstream_device(dwc2_downstream_addr())
@@ -27330,6 +27371,7 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   };
   let _ = usb_hub_set_port1_connected(if port1_result == 0 { 1 as u32 } else { 0 as u32 });
 
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
   let port2_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port2());
   let port2_outcome: i64 = if port2_result == 0 {
     dwc2_enumerate_one_downstream_device(dwc2_downstream_addr2())
@@ -27343,6 +27385,7 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   // brought up/enumerated unconditionally, same as ports 1/2, so
   // whatever's actually attached there (a BLE dongle, in this board's
   // case) finally gets probed instead of silently never being checked.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
   let port3_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port3());
   let port3_outcome: i64 = if port3_result == 0 {
     dwc2_enumerate_one_downstream_device(dwc2_downstream_addr3())

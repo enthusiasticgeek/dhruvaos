@@ -14339,3 +14339,44 @@ same-session file read are not proof a write reached the actual target; the spec
 that lies about media removal) was one I had not considered until the user's own observation forced it.
 Not yet re-verified against the real board with the card now confirmed inserted -- that is the next step,
 and it will be the first genuinely trustworthy real-HW test of follow-up #7's PBKDF2 fix.
+
+### Task #353 real-HW deployment, follow-up #8: second uninterruptible-loop root cause found and fixed -- then PASS, clean, for the first time (2026-10-16)
+
+The genuinely-verified redeploy (write-verification fix above now confirmed both scripts land on the real
+card) reached checkpoint 13 cleanly, same as follow-up #7's build had -- then reset anyway, every single
+time, across many consecutive real-HW attempts, always somewhere between checkpoint 13 and 14 (USB
+bring-up). Live UART captures nailed the exact point down precisely: port 1 (onboard LAN9512) always
+completes cleanly; port 2 (the user's Edimax RTL8188CU WiFi dongle) enumerates and fails its firmware
+download fast (a separate, already-known, non-fatal gap -- discarded return value, harmless to this
+investigation); the reset itself landed at varying points after that across different captures (once
+right after LAN9512 alone, once mid-RTL8188CU, once after a second config-descriptor retry) -- the
+variability itself was the tell: this was accumulated real time across MANY small waits, not one fixed
+call site, so QEMU could never have caught it (real USB bus response timing, not software-deterministic).
+
+Read `dwc2_wait_chan0_done()` (the shared wait primitive literally every control/bulk USB transfer in this
+driver goes through) end to end rather than guessing from the symptom: structurally identical to follow-up
+#7's pbkdf2 finding -- one function, `while tries < 1000000` (this loop's own comment already measured
+~500ms real worst case for the full budget), NAK responses re-arm and keep spinning, no return to any
+caller until it finishes, zero kicks inside. Not one single call needed anywhere near the full budget to
+reproduce this -- the SUM of many such calls (each port's SET_PORT_FEATURE/GET_PORT_STATUS, each device's
+GET_DESCRIPTOR/SET_ADDRESS/config fetch, RTL8188CU's register polls) across however many ports/devices
+happen to be populated on a given real boot is what varies and adds up.
+
+**Fixed**: added a `watchdog_kick()` every 50000 of `dwc2_wait_chan0_done`'s 1,000,000 iterations (20 kicks
+per full-budget call, same density as follow-up #7's pbkdf2 fix) -- this one shared primitive now protects
+every current and future USB transfer class (control, WiFi/BLE bulk, mass storage) at once. Also added a
+kick between each of the three hub ports in `dwc2_enumerate_downstream`, and inside `dwc2_hub_bring_up_
+port`'s own up-to-20x `delay(161000)` poll loop -- bounding the cross-port accumulated time independently
+of whatever's physically attached. `phase4_milestone.py` 18/18, no regressions.
+
+Also found and fixed, while the user was running the genuinely-verified deploy script: `deploy_realhw_
+watchdog.sh`'s own cleanup trap checked `git diff --quiet` against kernel_main.vani's WHOLE file, not just
+the two watchdog flags it reverts -- so any OTHER legitimate uncommitted work on that file (follow-up #8's
+own kick additions, mid-session) made it print a full, unrelated diff through a pager on every single
+deploy, which the user then had to manually quit out of. Narrowed to grep for just the two flag lines.
+
+Redeployed with both fixes. Real-HW UART capture: checkpoint 13 -> LAN9512 clean -> RTL8188CU firmware
+fails fast (same harmless gap) -> checkpoint 14 (first time ever reaching it) -> checkpoint 15 -> **PASS**,
+clean, no reset. This is the first fully successful real-HW boot in the entire task #353 investigation,
+with every one of follow-ups #1 through #8 in place and the write-verification fix proving the deploy that
+produced it actually reached the card. Task #353 is DONE.
