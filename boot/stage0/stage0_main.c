@@ -69,8 +69,18 @@
  * flip kernel_main.vani's own matching
  * STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE to 1 too, so a
  * healthy boot disarms this at PASS instead of getting reset by its
- * own safety net mid-session). */
+ * own safety net mid-session).
+ *
+ * TASK #353 FOLLOW-UP (2026-10-15): made build-time overridable via
+ * -D on the command line (build_stage0.sh's own STAGE0_CFLAGS env
+ * var) instead of only a hand-edit-build-revert cycle on this literal
+ * -- same real deployment this was always meant for, just without the
+ * risk of forgetting to revert a hand edit to the checked-in default
+ * before the next ordinary QEMU-driven build. Checked-in default
+ * stays 0, unchanged. */
+#ifndef STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
 #define STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE 0
+#endif
 
 #if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
 /* Same BCM2835 PM_WDOG/PM_RSTC register protocol as kernel_main.vani's

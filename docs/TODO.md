@@ -13996,3 +13996,42 @@ Build clean, `phase4_milestone.py` 19/19, no regressions. NOT yet real-HW retest
 diagnostic -- needs another recurrence to actually produce trustworthy `sp_table`/`usr_sp_table` output.
 Root cause of the `diag_wait_1` crash remains OPEN, but now reproduces much faster, which should make
 future diagnostic iterations considerably cheaper.
+
+### Task #353: stage0 watchdog-before-jump safety net -- enabled for real-HW deployment (2026-10-15)
+
+The user asked whether physical SD-card flashing could be eliminated going forward; the answer is yes
+for routine kernel updates (the A/B `kernelupload`/`kernelslot` shell commands, tasks #347-351, already
+do this entirely over UART) -- but task #353 itself, the one remaining safety gap, genuinely still needed
+one deliberate physical reflash, exactly as its own title already said. Investigating found the feature's
+*code* was already fully written (stage0_main.c's `STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE`, a one-shot
+15-second PM_WDOG/PM_RSTC arm right before stage0's jump to the real kernel, plus kernel_main.vani's
+matching `WATCHDOG_ENABLE_FOR_REAL_HARDWARE` (periodic re-arm/kick throughout the whole boot self-test
+battery, already placed at each major phase boundary -- task #269-271's own WCET/deadline work) and
+`STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE` (cancels the watchdog once PASS is reached) -- all
+three still at their checked-in default of 0, because QEMU's raspi1ap resets the whole emulated machine
+immediately on any PM_RSTC write, which would make every QEMU regression test "reset" before reaching its
+own PASS checkpoint. The task tracker had never been updated to reflect that this was already built.
+
+What was actually missing was a way to deploy it without a hand-edit-build-revert cycle on the vani
+source each time. Added a `-D` override to `build_stage0.sh` (`STAGE0_CFLAGS` env var) so stage0's own
+flag can be build-time overridden without ever touching the checked-in default -- vani itself has no
+preprocessor, so kernel_main.vani's two flags still need a literal (scripted, not hand-tracked) temporary
+edit-build-revert; both commits confirm the working tree returned to its committed flags=0 state via
+`git diff` before the normal kernel was rebuilt and `phase4_milestone.py` reconfirmed clean (18/18 PASS +
+"no reboot/crash", no regression from the revert).
+
+Produced two real-hardware-only artifacts, NOT committed (matching this project's own established
+convention for this exact class of flag, see `WATCHDOG_ENABLE_FOR_REAL_HARDWARE`'s own header comment):
+`build/stage0_realhw.img` (watchdog armed pre-jump) and `build/dhruva_real_hw.img` (flat kernel binary,
+watchdog-enabled). Deployment plan: `update_kernel.sh <device>` for the non-destructive stage0.img swap,
+then `test/kernel_slot_layout.py <device> --device seed build/dhruva_real_hw.img` to seed slot A directly
+via raw block I/O (bypassing both the destructive full `flash_sd_card.sh` reflash and the still-unreliable
+`kernelupload stream` UART path) with a fresh generation-1 slot-state record. This is the one physical
+card-swap task #353's own title always expected -- after it, the watchdog safety net is live, and it
+should directly cover the exact failure mode this session's `diag_wait_1` crash represents (an early hang
+well within the 15-second pre-jump window), without needing another physical reflash to recover from it.
+
+NOT yet real-HW verified -- /dev/sdb read 0 bytes (card currently in the Pi, not in a reader on this
+machine) at the point this was written. Pending: user inserts the card in a reader, run the two commands
+above, power on, confirm via the (now-running again) UART logger that boot reaches PASS cleanly with no
+unexpected reset loop.
