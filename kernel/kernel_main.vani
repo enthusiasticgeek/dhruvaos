@@ -5786,19 +5786,36 @@ fn watchdog_arm(timeout_ticks: u32) -> i64 {
 // uses) -- entirely independent of scheduler_tick_interval_us's own
 // tick period (a SEPARATE hardware counter, confirmed when round 191
 // audited every tick-count constant in this codebase for hidden
-// wall-clock assumptions -- this one had none). 2 seconds gives four
-// missed 500ms scheduler ticks of margin before a reset, generous for
-// jitter but still tight enough to prove the
-// watchdog actually does something if irq_dispatch ever stops running.
+// wall-clock assumptions -- this one had none).
+//
+// TASK #353 REAL-HW FOLLOW-UP #6 (2026-10-16): widened 2 -> 10 seconds.
+// The original 2-second value was reasoned about for STEADY-STATE
+// per-tick operation only ("four missed 500ms scheduler ticks"); it
+// was never validated against kernel_main's own one-time boot
+// sequence, because QEMU can't exercise a real PM_RSTC write at all.
+// First real-silicon exercise (task #353's own deployment) measured
+// several individual boot-time phases directly via TIMER_CLO
+// checkpoints -- dharafs_init() 3.8s, configs+crashlog_boot_increment
+// 20s, eval/governor self-tests 7.3s -- all legitimately real work,
+// not a bug, just far outside the 2-second regime this value was
+// ever reasoned about for. Five rounds of adding kicks one phase at a
+// time (follow-ups #1-#5) kept finding ANOTHER unmeasured real-HW
+// phase past the last fix; widening the shared window is the more
+// robust fix than continuing to hunt each one individually. 10
+// seconds still reliably catches a genuine stuck scheduler (the
+// mechanism this constant's own original comment cared about proving)
+// well within what "unattended recovery, no physical reflash" needs,
+// with real margin for whatever boot-time phase hasn't been
+// individually measured yet.
 fn watchdog_init() -> i64 {
-  let two_seconds_in_ticks: u32 = 131072 as u32; // 2 << 16
-  let _ = watchdog_arm(two_seconds_in_ticks);
+  let ten_seconds_in_ticks: u32 = 655360 as u32; // 10 << 16
+  let _ = watchdog_arm(ten_seconds_in_ticks);
   return 0;
 }
 
 fn watchdog_kick() -> i64 {
-  let two_seconds_in_ticks: u32 = 131072 as u32;
-  let _ = watchdog_arm(two_seconds_in_ticks);
+  let ten_seconds_in_ticks: u32 = 655360 as u32;
+  let _ = watchdog_arm(ten_seconds_in_ticks);
   return 0;
 }
 

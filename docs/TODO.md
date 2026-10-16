@@ -14255,3 +14255,24 @@ pressure -- the existing kick at checkpoint 12 and the one already following USB
 bracket it, but the new checkpoints will show definitively whether USB bring-up is actually the remaining
 cause or something else entirely once reached. `phase4_milestone.py` 18/18, all three checkpoints
 confirmed firing correctly under QEMU.
+
+### Task #353 real-HW deployment, follow-up #6: widened the watchdog window itself instead of hunting one more gap (2026-10-16)
+
+Follow-up #5's redeploy confirmed checkpoint 12 reached consistently (follow-up #4's fix held), but still
+reset before ever reaching checkpoint 13 -- between `dharafs_crypto_key_init()`/`dharafs_encryption_self_
+check()` (the latter's own comment: "its own real SD round trip") and the kicks bracketing it. That's the
+SIXTH individually-measured real boot-time phase this investigation has found exceeding its nominal
+watchdog budget, after five straight rounds of adding one more targeted kick each time just kept finding
+another unmeasured phase past the last fix.
+
+**Changed the fix itself, not just the target**: widened `watchdog_init()`/`watchdog_kick()`'s own shared
+timeout 2 -> 10 seconds, rather than hunting a sixth individual gap. The original 2-second value was only
+ever reasoned about for steady-state per-tick operation ("four missed 500ms scheduler ticks") -- it was
+never validated against kernel_main's own one-time boot sequence, because QEMU can't exercise a real
+`PM_RSTC` write at all, so this was simply never testable before this session's real-silicon deployment.
+Every individually-measured real phase so far (3.8s, 20s, 8.6ms, 7.3s) fits comfortably under 10s on its
+own; the ones that didn't (the 20s span) already have their own internal kick from earlier follow-ups,
+so 10s is real margin on top of that, not instead of it. Still reliably catches a genuinely stuck
+scheduler -- the actual mechanism this constant's own comment cared about proving -- well within what
+"unattended recovery, no physical reflash" needs. `phase4_milestone.py` 18/18, no regressions (the flag
+stays 0 under QEMU regardless of the constant's own value).
