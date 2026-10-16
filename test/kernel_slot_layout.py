@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import os
 import struct
+import subprocess
 import sys
 import zlib
 
@@ -161,24 +162,72 @@ def cmd_seed(args):
     if not args.device:
         _ensure_image_size(args.target, min_size)
 
+    record = pack_state(
+        generation=1, active_slot=0, preferred_slot=0,
+        attempt_count=0, bootlimit=DEFAULT_BOOTLIMIT,
+        slot_a_ready=1, slot_b_ready=0,
+        slot_a_len=kernel_len, slot_b_len=0,
+        slot_a_sha256=digest, slot_b_sha256=b"\x00" * 32,
+    )
     with open(args.target, "r+b") as f:
         f.seek(SLOT_A_BASE_BLOCK * BLOCK_SIZE)
         f.write(kernel_bytes)
-        record = pack_state(
-            generation=1, active_slot=0, preferred_slot=0,
-            attempt_count=0, bootlimit=DEFAULT_BOOTLIMIT,
-            slot_a_ready=1, slot_b_ready=0,
-            slot_a_len=kernel_len, slot_b_len=0,
-            slot_a_sha256=digest, slot_b_sha256=b"\x00" * 32,
-        )
         write_block(f, SLOT_STATE_BLOCK_A, record)
         write_block(f, SLOT_STATE_BLOCK_B, record)
         f.flush()
         os.fsync(f.fileno())
 
+    # TASK #353 REAL-HW FOLLOW-UP (2026-10-16): found live -- a USB SD
+    # reader that doesn't signal "media removed" when just the card
+    # (not the whole adapter) is pulled leaves the kernel's block layer
+    # with STALE cached pages for that device node, so writing then
+    # reading back through the SAME page cache (even in a fresh file
+    # handle -- Linux keys the page cache by device+offset, not by fd)
+    # can "verify" clean while the physical card never received
+    # anything. `blockdev --flushbufs` is the raw-block-device
+    # equivalent of flash_sd_card.sh's own proven "unmount, remount,
+    # re-read" trick (which works by dropping the FILESYSTEM's page
+    # cache on unmount) -- it drops the BLOCK device's own buffer
+    # cache, forcing the verification read below to actually hit
+    # physical media instead of replaying what was just written.
+    # Skipped for a plain disk-image file (`not args.device`): there is
+    # no removable-media staleness risk for a regular file, and
+    # `blockdev` doesn't apply to one anyway.
+    if args.device:
+        flush_status = subprocess.run(
+            ["blockdev", "--flushbufs", args.target],
+            capture_output=True, text=True,
+        )
+        if flush_status.returncode != 0:
+            print(f"ERROR: blockdev --flushbufs failed ({flush_status.stderr.strip()}) -- "
+                  f"cannot verify the write actually reached the card.", file=sys.stderr)
+            return 1
+
+    with open(args.target, "rb") as f:
+        f.seek(SLOT_A_BASE_BLOCK * BLOCK_SIZE)
+        readback_kernel = f.read(kernel_len)
+        readback_digest = hashlib.sha256(readback_kernel).digest()
+        readback_state_a = unpack_state(read_block(f, SLOT_STATE_BLOCK_A))
+        readback_state_b = unpack_state(read_block(f, SLOT_STATE_BLOCK_B))
+
+    if readback_digest != digest:
+        print(f"ERROR: post-write verification FAILED -- read back {len(readback_kernel)} bytes, "
+              f"sha256={readback_digest.hex()}, expected {digest.hex()}. The write did NOT "
+              f"actually reach the card (or this device/reader is reporting stale state -- "
+              f"confirm the card is genuinely inserted and re-run). Do NOT trust this seed.",
+              file=sys.stderr)
+        return 1
+    if readback_state_a is None or readback_state_a["slot_a_sha256"] != digest.hex():
+        print("ERROR: slot-state block A verification FAILED after readback.", file=sys.stderr)
+        return 1
+    if readback_state_b is None or readback_state_b["slot_a_sha256"] != digest.hex():
+        print("ERROR: slot-state block B verification FAILED after readback.", file=sys.stderr)
+        return 1
+
     print(f"Seeded slot A with {kernel_path} ({kernel_len} bytes, "
           f"sha256={digest.hex()}), wrote slot-state generation 1 to "
-          f"blocks {SLOT_STATE_BLOCK_A}/{SLOT_STATE_BLOCK_B}.")
+          f"blocks {SLOT_STATE_BLOCK_A}/{SLOT_STATE_BLOCK_B}. "
+          f"VERIFIED via blockdev --flushbufs + fresh readback.")
     return 0
 
 

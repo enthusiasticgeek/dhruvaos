@@ -137,8 +137,38 @@ echo "=== Unmounting ==="
 sudo umount "$MOUNT_POINT"
 rmdir "$MOUNT_POINT"
 
+# TASK #353 REAL-HW FOLLOW-UP (2026-10-16): this script used to declare
+# "Done" right after the cp+sync+umount above, with NOTHING verifying
+# the write actually reached physical media -- found live, the hard
+# way: a USB SD reader that doesn't signal "media removed" when just
+# the card (not the whole adapter) is pulled leaves the kernel's block
+# layer with STALE size/partition/page-cache state, so every check
+# this script already had (blockdev size, lsblk, the bootcode.bin/
+# start.elf/etc. existence check above) can all read cached data and
+# "pass" even with the card physically absent, and cp+sync can return
+# success against that same stale state. A genuine UNMOUNT, already
+# done above, drops this mount's own page cache -- but nothing forced
+# a fresh READ afterward to prove the NEXT mount isn't ALSO just
+# replaying stale cache. Remounting and reading the file straight back
+# (same "don't trust a cache hit" discipline flash_sd_card.sh's own
+# verify step already uses) is what actually proves this.
+echo "=== Verifying: remounting and reading kernel.img straight back ==="
+mkdir -p "$MOUNT_POINT"
+sudo mount "$BOOT_PART" "$MOUNT_POINT"
+SRC_SUM=$(md5sum "$ROOT/build/stage0.img" | cut -d' ' -f1)
+CARD_SUM=$(sudo md5sum "$MOUNT_POINT/kernel.img" 2>/dev/null | cut -d' ' -f1 || echo "MISSING")
+sudo umount "$MOUNT_POINT"
+rmdir "$MOUNT_POINT"
+if [ "$SRC_SUM" != "$CARD_SUM" ]; then
+    echo "ERROR: kernel.img verification FAILED after remount -- source=$SRC_SUM card=$CARD_SUM" >&2
+    echo "The write did NOT actually reach the card (or this device/reader" >&2
+    echo "is reporting stale state -- check the card is genuinely inserted" >&2
+    echo "and re-run). Do NOT trust this card until this passes clean." >&2
+    exit 1
+fi
+
 echo
-echo "=== Done. kernel.img updated on $BOOT_PART. ==="
+echo "=== Done and VERIFIED (remount + checksum match). kernel.img updated on $BOOT_PART. ==="
 echo "bootcode.bin/start.elf/fixup.dat/config.txt left untouched."
 echo "Safe to remove the card and insert it in the powered-off Pi."
 
