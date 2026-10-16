@@ -176,6 +176,27 @@ fiq_entry_true_lr_done:
      * irq_entry.S's own relocate loop uses with its own r8). */
     ldr r4, [r0], #4                  /* staged spsr */
     str r4, [r3, #0]                  /* F+0 = spsr */
+    /* TASK #357 follow-up (2026-10-16, real-HW crash investigation):
+     * found while diffing this file against irq_entry.S's own
+     * equivalent, word-for-word -- this file never wrote F+4 (the pad
+     * word), unlike IRQ's own relocate loop, which copies it (with
+     * irrelevant content, but AT LEAST something deterministic) as
+     * part of its uniform 16-word copy. Every FIQ-driven save (i.e.
+     * every timer tick, unconditionally) left this slot holding
+     * whatever stale content the task's own stack already had there
+     * before this frame was built. Harmless to the real restore path
+     * (ldmia sp!,{r0,r1} loads it into r1, immediately overwritten by
+     * the very next ldmia before anything reads r1 meaningfully), but
+     * a real gap for abort_dump_task_stacks (kernel_main.vani) or any
+     * future diagnostic that prints/trusts this field -- a stale value
+     * there could misleadingly look like genuine corruption. Not
+     * confirmed as the cause of the true_lr/resume_pc corruption this
+     * investigation is chasing (those ARE written, correctly offset,
+     * on every save -- verified line-by-line against this exact
+     * layout) -- a real, separate, now-fixed gap found along the way. */
+    mov r4, #0
+    str r4, [r3, #4]                  /* F+4 = pad (deterministic 0, not
+                                        * stale leftover stack content) */
     ldr r4, [r0], #4                  /* staged resume_pc */
     str r4, [r3, #64]                 /* F+64 = resume_pc */
     ldr r4, [r0], #4                  /* real r0 */
