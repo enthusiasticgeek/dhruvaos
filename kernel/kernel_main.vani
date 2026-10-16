@@ -34684,6 +34684,32 @@ fn task_f() -> i64 {
           let diag_ris: u32 = mmio_read_u32(UART_RIS);
           let diag_head: u32 = kernelupload_rx_ring_head_get();
           let diag_tail: u32 = kernelupload_rx_ring_tail_get();
+          // TASK #357 follow-up (2026-10-16, real-HW recurrence): the
+          // OERIS-clear fix (task #355/#356) did NOT stop this stall
+          // from recurring -- same exact fr/imsc/ris signature on a
+          // fresh attempt. The existing diagnostic only ever reads the
+          // UART peripheral's own registers, which all say "IMSC still
+          // correctly enabled, FIFO genuinely empty" -- consistent with
+          // either "nothing reached the wire" (ruled out: host-side
+          // os.write() timing already confirmed continuous line-rate
+          // transmission for the whole payload) or "the interrupt
+          // controller itself stopped delivering this IRQ line to the
+          // CPU, independent of the UART's own IMSC" -- a blind spot
+          // this diagnostic never checked. IC_ENABLE2 bit 25 is the
+          // SAME bit irq_dispatch's own `pending2 & 0x02000000` check
+          // reads; if it reads 0 here, something else in the system
+          // disabled this line at the controller level mid-stream --
+          // a real, different bug class from anything the OERIS fix
+          // could ever touch. irq_count/ctxsw_count/current tick are
+          // added too so a recurrence shows whether the system is
+          // still alive and ticking generally (interrupts firing for
+          // OTHER sources, pointing at this one IRQ line specifically)
+          // or has gone broadly quiet (pointing at something masking
+          // IRQs/FIQs globally instead).
+          let diag_ic_enable2: u32 = mmio_read_u32(IC_ENABLE2);
+          let diag_irq_count: i64 = irq_count_get();
+          let diag_ctxsw: i64 = context_switch_count_get();
+          let diag_tick: u32 = scheduler_get_tick_count();
           let _ = uart_puts("\nkernelupload: STALL DIAG fr=");
           let _ = uart_put_hex32(diag_fr);
           let _ = uart_puts(" imsc=");
@@ -34694,6 +34720,16 @@ fn task_f() -> i64 {
           let _ = uart_put_hex32(diag_head);
           let _ = uart_puts(" ring_tail=");
           let _ = uart_put_hex32(diag_tail);
+          let _ = uart_puts(" ic_enable2=");
+          let _ = uart_put_hex32(diag_ic_enable2);
+          let _ = uart_puts(" (uart0 bit25 ");
+          let _ = uart_puts(if (diag_ic_enable2 & (0x02000000 as u32)) != (0 as u32) { "SET -- controller still enabled" } else { "CLEAR -- controller-level IRQ disabled, real smoking gun" });
+          let _ = uart_puts(") irq_count=");
+          let _ = uart_put_i64(diag_irq_count);
+          let _ = uart_puts(" ctxsw=");
+          let _ = uart_put_i64(diag_ctxsw);
+          let _ = uart_puts(" tick=");
+          let _ = uart_put_hex32(diag_tick);
           let _ = uart_puts("\n");
           let _ = kernelupload_stream_active_set(0 as u32);
           let _ = kernelupload_active_set(0 as u32);
@@ -34714,6 +34750,7 @@ fn task_f() -> i64 {
         // the ordinary shell line path below instead of being
         // silently lost.
         let consumed: i64 = if popped < remaining { popped } else { remaining };
+        let sd_write_failed: i64 = 0;
         if consumed > 0 {
           // Same ceiling=2 lock as the ordinary dispatch branch below
           // -- kernelupload_accumulate_bytes touches raw SD blocks via
@@ -34724,11 +34761,29 @@ fn task_f() -> i64 {
           let accum_status: i64 = kernelupload_accumulate_bytes(batch, consumed);
           let _ = dhruva_prio_unlock(3);
           if accum_status != 0 {
-            let _ = kernelupload_stream_active_set(0 as u32);
-            let _ = kernelupload_active_set(0 as u32);
-            let _ = uart_puts("\nkernelupload: SD write failed during stream, aborted\n");
+            sd_write_failed = 1;
           }
         }
+        // TASK #357 follow-up (2026-10-16, systematic concurrency
+        // audit per user request): this drain loop MUST run, and
+        // finish, before kernelupload_stream_active is ever cleared --
+        // irq_dispatch's own unsynchronized read of that flag (task
+        // context here, interrupt context there) decides whether a
+        // freshly-arrived UART byte goes to kernelupload_rx_ring_push
+        // (safe, no shell state touched) or straight into shell_rx_
+        // push_char/_echo_char (the SAME non-reentrant shell line
+        // buffer/echo-state this loop is actively mid-update on).
+        // Clearing the flag first (the original SD-write-failure
+        // ordering) left a real window where an interrupt landing
+        // between that clear and this loop's own completion would call
+        // shell_rx_push_char CONCURRENTLY with this loop's own call --
+        // a genuine, unprotected task-vs-interrupt race on shared
+        // state, not merely a byte-classification ambiguity like the
+        // other 3 end-of-stream transitions (which already run after
+        // any shell-touching work in their own path). Fixed by
+        // deferring the SD-failure flag-clear/message to AFTER this
+        // loop, matching the normal-completion transition's own
+        // already-safe ordering below.
         let li: i64 = consumed;
         while li < popped {
           let lc: u32 = buf_read_byte(batch, li as u32);
@@ -34738,6 +34793,11 @@ fn task_f() -> i64 {
           let new_echo_state: u32 = shell_echo_char(echo_state, lc, line_len_before);
           let _ = shell_set_echo_state(new_echo_state);
           li = li + 1;
+        }
+        if sd_write_failed == 1 {
+          let _ = kernelupload_stream_active_set(0 as u32);
+          let _ = kernelupload_active_set(0 as u32);
+          let _ = uart_puts("\nkernelupload: SD write failed during stream, aborted\n");
         }
         if kernelupload_stream_active_get() == (1 as u32) {
           let total_now: u32 = kernelupload_total_len_get();
