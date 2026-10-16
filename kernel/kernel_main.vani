@@ -3173,6 +3173,54 @@ extern "C" fn buf_read_u32(buf: mut ref i64, offset: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn buf_checksum(buf: mut ref i64, start_offset: u32, byte_len: u32) -> u32;
 
+// Scheduler-speedup sweep follow-up (2026-10-15, user's own explicit
+// "byte-wise to word-wise copy sweep" request): generic buffer-to-
+// buffer copy, 4 bytes at a time via the existing buf_read_u32/
+// buf_write_u32 primitives above whenever dst_offset and src_offset
+// land on the SAME alignment phase mod 4 (every structured-record
+// copy this file does moves data to/from a fixed, already-4-aligned
+// header offset -- e.g. DharaFS's own record payload always starts
+// at byte 64 -- so this is the common case, not a rare one), falling
+// back to a plain byte-at-a-time copy for the unaligned lead/tail (or
+// the whole span, if the two offsets' phases don't match at all) --
+// never wrong, just not faster, when alignment doesn't line up. Both
+// buffers' own base pointers are already relied on being at least
+// 4-byte aligned throughout this entire file (every existing
+// buf_write_u32/buf_read_u32 call at a fixed offset already assumes
+// this, going all the way back to Phase 3's own dharafs_buf.S) --
+// this adds no new assumption, just a new way to use an old one.
+// Never pass `len` as a bare parameter name here -- see this
+// project's own standing memory on why.
+fn buf_copy_bytes(dst: mut ref i64, dst_offset: u32, src: mut ref i64, src_offset: u32, byte_count: u32) -> i64 {
+  let same_phase: i64 = if (dst_offset % (4 as u32)) == (src_offset % (4 as u32)) { 1 } else { 0 };
+  let lead_bytes: u32 = if same_phase == 1 { ((4 as u32) - (dst_offset % (4 as u32))) % (4 as u32) } else { byte_count };
+  let lead_bytes_capped: u32 = if lead_bytes > byte_count { byte_count } else { lead_bytes };
+  let i: u32 = 0 as u32;
+  while i < lead_bytes_capped {
+    let b: u32 = buf_read_byte(src, src_offset + i);
+    let _ = buf_write_byte(dst, dst_offset + i, b);
+    i = i + (1 as u32);
+  }
+  if same_phase == 1 {
+    let remaining_after_lead: u32 = byte_count - i;
+    let word_count: u32 = remaining_after_lead / (4 as u32);
+    let w: u32 = 0 as u32;
+    while w < word_count {
+      let word_off: u32 = i + (w * (4 as u32));
+      let v: u32 = buf_read_u32(src, src_offset + word_off);
+      let _ = buf_write_u32(dst, dst_offset + word_off, v);
+      w = w + (1 as u32);
+    }
+    i = i + (word_count * (4 as u32));
+  }
+  while i < byte_count {
+    let b2: u32 = buf_read_byte(src, src_offset + i);
+    let _ = buf_write_byte(dst, dst_offset + i, b2);
+    i = i + (1 as u32);
+  }
+  return 0;
+}
+
 // boot/dharafs_state.S -- persists dharafs_init()'s recovery-scan result (where
 // the log's append cursor sits, the highest sequence number seen)
 // across the vani-call-boundary gap the same way sd_state does for
@@ -8610,12 +8658,7 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
     let _ = buf_write_u32(buf, 52 as u32, owner_uid);
     let _ = buf_write_u32(buf, 56 as u32, owner_gid);
     let _ = buf_write_u32(buf, 60 as u32, mode);
-    let j: i64 = 0;
-    while j < data_len {
-      let b2: u32 = buf_read_byte(data_buf, j as u32);
-      let _ = buf_write_byte(buf, (64 + j) as u32, b2);
-      j = j + 1;
-    }
+    let _ = buf_copy_bytes(buf, 64 as u32, data_buf, 0 as u32, data_len as u32);
 
     // Checksum last, over everything written above -- covers exactly
     // what a torn write could have left half-updated.
@@ -8681,12 +8724,7 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
       let _ = buf_write_u32(buf, 60 as u32, 0 as u32);
     }
     let _ = buf_write_u32(buf, 48 as u32, next_block_field);
-    let j: i64 = 0;
-    while j < chunk_len {
-      let b2: u32 = buf_read_byte(data_buf, (chunk_offset + j) as u32);
-      let _ = buf_write_byte(buf, (64 + j) as u32, b2);
-      j = j + 1;
-    }
+    let _ = buf_copy_bytes(buf, 64 as u32, data_buf, chunk_offset as u32, chunk_len as u32);
 
     let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
     let _ = buf_write_u32(buf, 0 as u32, checksum);
@@ -9950,8 +9988,23 @@ fn dharafs_compact_resumable_self_test() -> i64 {
   // Keep calling until the pass genuinely finishes (resume cursor
   // returns to 0), bounded generously so a real non-progress bug fails
   // this self-test instead of hanging boot forever.
+  //
+  // TASK #288 FOLLOW-UP (2026-10-15): 10 -> 50. This cap used to be
+  // sized for dharafs_compact_blocks_per_call()'s own old budget of 8
+  // (comfortably covering the >=20-block range below in ~3 calls) --
+  // found live, via this exact self-test FAILING, once that budget
+  // was chunked down to 1 for the GC critical-section-shrinking work
+  // above: a 20+-block range now takes ~20 calls to drain, blowing
+  // through the old cap and tripping the "never finished" check below
+  // even though every call still made real, correct progress. Not
+  // caught by phase4_milestone.py (this self-test is gated behind
+  // boot_debug_enabled(), which that harness never sets) -- only found
+  // by actually running it. 50 stays generous relative to the known,
+  // fixed 20-write range regardless of whatever the budget constant
+  // is tuned to next, rather than re-coupling this cap to today's
+  // specific value the same way 10 was coupled to yesterday's.
   let calls: i64 = 1;
-  while (dharafs_compact_get_resume_block() != (0 as u32)) && (calls < 10) {
+  while (dharafs_compact_get_resume_block() != (0 as u32)) && (calls < 50) {
     let _ = dharafs_compact(buf, path_buf, data_buf);
     calls = calls + 1;
   }
@@ -10084,12 +10137,7 @@ fn dharafs_read_from_block_raw(blk: i64, out_buf: mut ref i64) -> i64 {
   let cap: i64 = dharafs_block_payload_cap();
   let total_len_i: i64 = total_len as i64;
   let head_chunk: i64 = if total_len_i < cap { total_len_i } else { cap };
-  let i: i64 = 0;
-  while i < head_chunk {
-    let b: u32 = buf_read_byte(tmp, (64 + i) as u32);
-    let _ = buf_write_byte(out_buf, i as u32, b);
-    i = i + 1;
-  }
+  let _ = buf_copy_bytes(out_buf, 0 as u32, tmp, 64 as u32, head_chunk as u32);
   let copied: i64 = head_chunk;
   let remaining: i64 = total_len_i - head_chunk;
   let next_blk: i64 = buf_read_u32(tmp, 48 as u32) as i64;
@@ -10139,12 +10187,7 @@ fn dharafs_read_from_block_raw(blk: i64, out_buf: mut ref i64) -> i64 {
       return 0 - 1;
     }
     let this_chunk: i64 = if cont_len < remaining { cont_len } else { remaining };
-    let k: i64 = 0;
-    while k < this_chunk {
-      let b2: u32 = buf_read_byte(cont, (64 + k) as u32);
-      let _ = buf_write_byte(out_buf, (copied + k) as u32, b2);
-      k = k + 1;
-    }
+    let _ = buf_copy_bytes(out_buf, copied as u32, cont, 64 as u32, this_chunk as u32);
     copied = copied + this_chunk;
     remaining = remaining - this_chunk;
     next_blk = buf_read_u32(cont, 48 as u32) as i64;

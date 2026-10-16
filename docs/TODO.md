@@ -14091,3 +14091,39 @@ stacking in one call" unexamined risk and tightens the headroom story, but the S
 500ms tick's own 4.4% ratio. A real finer-tick re-attempt still needs that number itself reduced (e.g.
 shrinking the masked PIO fill loop's own retry cap further, the same lever task #285/32nd-SD-round already
 used once) or accepting a less aggressive tick-period target than 100ms, before trying again.
+
+### Byte-wise to word-wise copy sweep (2026-10-15, user's own explicit request)
+
+New generic helper `buf_copy_bytes(dst, dst_offset, src, src_offset, byte_count)` (`kernel/kernel_main.
+vani`, right after the existing `buf_read_u32`/`buf_write_u32` externs): copies 4 bytes at a time via
+those same already-existing primitives whenever `dst_offset`/`src_offset` land on the same phase mod 4,
+falling back to a plain byte copy for the unaligned lead/tail (or the whole span, if the phases don't
+match). Both buffers' own base pointers are already relied on being at least 4-byte aligned throughout
+this entire file -- every existing `buf_write_u32`/`buf_read_u32` call at a fixed offset already assumes
+this (back to Phase 3's own `dharafs_buf.S`); this adds no new assumption.
+
+Applied to DharaFS's own four hottest, most file-size-scaling byte-copy loops -- every one of them already
+lands on matching 4-aligned offsets by construction (`dharafs_block_payload_cap()` is 448, itself a
+multiple of 4; the record payload always starts at byte 64, also a multiple of 4): `dharafs_append_raw`'s
+single-block and multi-block-chunk data copies, and `dharafs_read_from_block_raw`'s head-chunk and
+continuation-chunk reconstruction copies. Checked other candidate loops found by the same sweep (ICMP/UDP
+payload-into-frame copies) and correctly left them alone -- their own fixed header offsets (e.g. 34+8=42,
+not a multiple of 4) don't share a phase with the payload buffer's own 0-based offset, so the helper's own
+alignment check would just fall back to a byte copy anyway; no value in forcing it there.
+
+**Real regression found and fixed while verifying, not caused by this change but exposed by actually
+exercising a test path the standard regression suite never runs**: `dharafs_compact_resumable_self_test`
+and `dharafs_multiblock_self_test` are both gated behind `boot_debug_enabled()` (bit16 of `/config/
+loglevel`, read once at boot) -- `phase4_milestone.py` never sets that, so neither test runs under the
+normal regression suite, including throughout last turn's GC-chunking work. Verified this change with a
+dedicated two-boot QEMU script (boot 1 writes `/config/loglevel 16`, persisted to DharaFS; boot 2 reads it
+back and runs the full debug self-test battery) instead of trusting the standard suite's silence. The
+multi-block round trip (1000 bytes, byte-exact `test_compare_buffers`) passed immediately -- but the
+resumable-compaction self-test FAILED: its own `calls < 10` retry cap (right above the loop it bounds) was
+sized for `dharafs_compact_blocks_per_call()`'s OLD budget of 8 ("comfortably" draining a 20+-block range
+in ~3 calls), never updated when that budget was chunked to 1 last turn -- draining the same range now
+needs ~20 calls, blowing through the stale cap and tripping "never finished within a generous call
+budget" even though every call was still making real, correct progress. Bumped to 50 (generous relative to
+the test's own known, fixed 20-write range, not re-coupled to today's specific budget value). Rebuilt,
+reran the same two-boot verification: both self-tests PASS, zero FAIL lines. `phase4_milestone.py`
+re-confirmed 18/18 throughout.
