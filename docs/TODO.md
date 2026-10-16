@@ -14300,3 +14300,42 @@ retry loops. Proactively applied the identical fix to `pbkdf2_hmac_sha1`'s own l
 derivation during WiFi join, 4096 iterations) -- same risk class, not yet hit in this specific test
 scenario (no WiFi configured) but cheap to close now rather than wait for it to surface as a seventh
 separate incident. `phase4_milestone.py` 18/18, no regressions. NOT yet real-HW retested.
+
+### Task #353 real-HW deployment: found and fixed a silent write-verification gap in the deploy pipeline itself (2026-10-16)
+
+While trying to get a genuine real-HW retest of follow-up #7, the user asked a sharp question: how did
+`deploy_realhw_watchdog.sh` (which calls `update_kernel.sh` and `test/kernel_slot_layout.py seed`) report
+success with the SD card not even physically inserted in the reader? Checked `lsblk /dev/sdb` at that
+exact moment -- it reported a real, non-zero 14.9GB size with a real `sdb1` partition, despite the card
+being out. Root cause: this specific USB SD reader does not signal "media removed" to the Linux kernel
+when just the card (not the whole USB adapter) is pulled, so the kernel's block layer keeps serving STALE
+cached size/partition/page-cache state indefinitely. Every check either script had -- `blockdev
+--getsize64`, `lsblk`, the bootcode.bin/start.elf/etc. existence check, even a `cp`+`sync` -- can all read
+or write against that stale state and report success while nothing reaches physical media.
+
+This means follow-ups #5, #6, and #7's real-HW redeploys are now in doubt: checkpoint 13 (added in
+follow-up #5) never printed in ANY of those three captures, which is equally consistent with "USB
+bring-up genuinely never got reached" and "the card silently kept running follow-up #4's build the whole
+time because none of those three deploys actually landed." No way to tell which, after the fact.
+
+**Fixed both scripts to force a genuine re-read from physical media before declaring success**, using the
+discipline `flash_sd_card.sh`'s own verify step already proved out (a same-mount read can be served
+entirely from page cache -- only an unmount+remount forces the filesystem layer to drop its cache and
+genuinely re-fetch from the block device):
+- `update_kernel.sh`: after the existing cp+sync+umount, added a fresh mount+md5sum-readback+umount pass,
+  comparing against the source file's own md5sum. Hard-fails with a clear message if they don't match.
+- `test/kernel_slot_layout.py`'s `cmd_seed`: added `blockdev --flushbufs <device>` (the raw-block-device
+  equivalent of a filesystem unmount -- drops the kernel's buffer cache for that device; raw block I/O has
+  no mountable filesystem to unmount/remount) before reopening the device and reading back both the
+  kernel payload and both slot-state ping-pong blocks, sha256-comparing each against what was just
+  written. Skipped when the target is a plain disk-image file (no staleness risk there).
+
+Verified both: `bash -n` / `python3 -m py_compile` clean, plus a sanity run of the new `cmd_seed` logic
+against a throwaway disk image -- clean VERIFIED pass, correct 64-character sha256 digest (double-checked
+independently after momentarily misreading the printed digest's length by eye). Committed `d6fb013`.
+
+Direct instance of the standing "no trust, validate everything" policy -- an exit code and even a
+same-session file read are not proof a write reached the actual target; the specific edge case (a reader
+that lies about media removal) was one I had not considered until the user's own observation forced it.
+Not yet re-verified against the real board with the card now confirmed inserted -- that is the next step,
+and it will be the first genuinely trustworthy real-HW test of follow-up #7's PBKDF2 fix.
