@@ -45943,6 +45943,23 @@ fn kernel_main() -> i64 {
     let _ = watchdog_kick();
   }
 
+  // TASK #353 REAL-HW FOLLOW-UP #3 (2026-10-16): unconditional TIMER_
+  // CLO checkpoints, bracketing dharafs_init()/the Task #4/#5
+  // verification block/crashlog_boot_increment() -- two rounds of
+  // kicks (inside dharafs_init()'s own scan loop, inside sdhost_read_
+  // block/sdhost_write_block's own retry loops, the latter already
+  // firing on EVERY real block I/O, not just a wedge) still didn't
+  // resolve a real watchdog-reset boot loop, meaning the actual cause
+  // is something this file's own existing BOOT DIAG checkpoints never
+  // had visibility into. Rather than guess a fourth time, get direct
+  // evidence: these prints run on every boot unconditionally, so the
+  // next real-HW capture shows exactly how far execution gets and how
+  // long each span actually took, instead of inferring it from where
+  // output stops.
+  let _ = uart_puts("BOOT DIAG: checkpoint 7 (pre-dharafs_init), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
+
   // REMOVED (2026-10-11, real-HW finding): this used to be two
   // temporary SD-wedge-investigation blocks -- an 8-block (2100-2107)
   // write/read/compare sweep that, via sdhost_write_block/
@@ -45974,12 +45991,18 @@ fn kernel_main() -> i64 {
   // per path (not the first, not a mix) and an unrelated path is
   // unaffected.
   let _ = dharafs_init();
+  let _ = uart_puts("BOOT DIAG: checkpoint 8 (post-dharafs_init), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
   let _ = log_level_init();
   let _ = kernlog_config_init();
   let _ = wifi_config_init();
   let _ = ble_config_init();
   let _ = dhdl_init();
   let _ = crashlog_boot_increment();
+  let _ = uart_puts("BOOT DIAG: checkpoint 9 (post-crashlog_boot_increment), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
   // Task #308 follow-up: kick after DharaFS's own recovery scan --
   // see the kick right after sdhost_init's own matching comment.
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
@@ -46034,7 +46057,13 @@ fn kernel_main() -> i64 {
   let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
   let compact_data_buf: mut ref i64 = dhruva_alloc_bytes(20480); // matches dharafs_file_max_len(), task #164
+  let _ = uart_puts("BOOT DIAG: checkpoint 10 (pre-manual-compact), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
   let _ = dharafs_compact(compact_buf, compact_path_buf, compact_data_buf);
+  let _ = uart_puts("BOOT DIAG: checkpoint 11 (post-manual-compact), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
   let log_start_after: u32 = dharafs_state_get_log_start();
   let next_block_after: u32 = dharafs_state_get_next_block();
   let _ = uart_puts("DharaFS: compact log_start ");
@@ -46137,6 +46166,9 @@ fn kernel_main() -> i64 {
   if boot_debug_enabled() == 1 { let _ = uart_clock_governor_cross_check_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dma_ram_copy_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dma_uart_tx_self_test(); }
+  let _ = uart_puts("BOOT DIAG: checkpoint 12 (post-eval/governor self-tests), TIMER_CLO=0x");
+  let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
+  let _ = uart_puts("\n");
   // Task #308 follow-up: kick after eval/governor self-tests -- see
   // the kick right after sdhost_init's own matching comment.
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {

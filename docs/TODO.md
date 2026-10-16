@@ -14189,3 +14189,24 @@ full power-off/power-on before the next attempt, not another watchdog-driven sof
 give the SD card itself a chance to leave whatever wedged state 366+ abrupt resets may have left it in --
 the software fix alone may not be sufficient if the card's own hardware state needs a real power cycle to
 clear.
+
+### Task #353 real-HW deployment, follow-up #3: still hangs even after a real power cycle -- stopped guessing, added direct instrumentation (2026-10-16)
+
+User did a genuine full power cycle and redeployed follow-up #2. Still hung at the exact same point, on
+the first fresh attempt (`attempt_count=1`) through at least the third. This is a real, important
+realization: `sdhost_read_block`/`sdhost_write_block`'s own kick (follow-up #2) fires unconditionally at
+the TOP of their retry loop, on every single call, wedge or not -- meaning it already covers
+`dharafs_init()`'s scan, every `dharafs_append`/`dharafs_read`/`dharafs_compact` call in the Task #4/#5
+verification block, everything. If the actual cause were any of the hypotheses from follow-ups #1/#2,
+this should already be fixed. It is not, which means those hypotheses, while each individually real and
+worth fixing, were not THE cause (or not the only one) -- continuing to add more guessed kicks without
+evidence would be the same mistake a third time.
+
+**Stopped guessing, added direct evidence instead**: six new unconditional (not gated by any flag)
+`uart_puts`+`TIMER_CLO` checkpoints bracketing every major step from right after `sdhost_init()` through
+the end of the eval/governor self-tests -- checkpoint 7 (pre-`dharafs_init`), 8 (post-`dharafs_init`), 9
+(post-`crashlog_boot_increment`), 10/11 (pre/post the manual `dharafs_compact` call), 12 (post-eval/
+governor self-tests). Verified all six fire correctly, in order, under QEMU (`[30-69]` in the full log).
+`phase4_milestone.py` 18/18, no regressions. The next real-HW attempt will show exactly which checkpoint
+is the last one reached and how long each span actually took, rather than inferring it from where output
+stops -- that's the evidence needed to actually fix this instead of guessing a fourth time.
