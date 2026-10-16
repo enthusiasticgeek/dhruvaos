@@ -608,6 +608,20 @@ sha512_padded_scratch_addr:
                          * 4097, zero_pad=111, total_len=4097+111+16=
                          * 4224 (SHA-512 uses a 128-byte block and a
                          * 16-byte, not 8-byte, length trailer). */
+uart_dma_scratch_addr:
+    .word 0             /* Task #357: 512 bytes -- uart_puts's own DMA-
+                         * path copy buffer (kernel_main.vani). Longest
+                         * single uart_puts string literal measured in
+                         * this file today is 257 bytes; 512 is this
+                         * project's own established "generous costs
+                         * nothing for a one-time persistent buffer"
+                         * margin (same reasoning as usb_bulk_data_
+                         * scratch/dns_resp_scratch above, both also
+                         * 512). Separate from dwc2_dma_scratch/usb_
+                         * bulk_data_scratch -- UART and USB DMA never
+                         * run concurrently today, but this buffer's
+                         * whole reason to exist is per-subsystem
+                         * isolation, not a shared pool. */
 
 .section ".text"
 
@@ -1559,6 +1573,19 @@ sha512_padded_scratch_set:
 .global sha512_padded_scratch_get
 sha512_padded_scratch_get:
     ldr r0, =sha512_padded_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global uart_dma_scratch_set
+uart_dma_scratch_set:
+    ldr r1, =uart_dma_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global uart_dma_scratch_get
+uart_dma_scratch_get:
+    ldr r0, =uart_dma_scratch_addr
     ldr r0, [r0]
     bx lr
 

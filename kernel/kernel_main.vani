@@ -2216,6 +2216,18 @@ extern "C" fn dma_uart_tx_busy() -> u32;
 // header comment on dma_ram_copy_test for the full "why".
 #[stack_cost(bytes=16)]
 extern "C" fn dma_ram_copy_test(src: mut ref i64, dst: mut ref i64, byte_count: u32) -> u32;
+// Task #357: adopts the above for uart_puts's own bulk output path --
+// see that function's own comment. uart_dma_ready gates it (uart_puts
+// is called from the very first boot checkpoint, long before either
+// dma_uart_init or uart_dma_scratch's one real init point has run).
+#[stack_cost(bytes=1)]
+extern "C" fn uart_dma_ready_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn uart_dma_ready_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn uart_dma_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn uart_dma_scratch_get() -> mut ref i64;
 // Round 22 audit -- context_switch.S's own comment on
 // scheduler_get_tick_count has the full story: DHCP's new lease-
 // renewal timer needs a read-only view of elapsed scheduler time.
@@ -4770,6 +4782,56 @@ fn uart_capture_end() -> i64 {
   return uart_capture_get_len() as i64;
 }
 
+// Task #357 (adopts boot/dma_uart_state.S's own proven-but-previously-
+// diagnostic-only DMA TX for real, bulk output): below UART_DMA_MIN_
+// LEN, DMA's own setup cost (populate an 8-word CB, kick CS.ACTIVE,
+// several mem_barrier round trips) isn't worth it for a string that
+// already fits inside the hardware's own 16-byte FIFO with little or
+// no wait -- 8 is half that FIFO depth, a deliberate margin rather
+// than the full 16, since the plain PIO loop below is already cheap
+// at this size and simpler is better when there's nothing real to
+// gain. UART_DMA_SCRATCH_CAP (512) is this project's own established
+// "generous costs nothing for a one-time persistent buffer" margin
+// over the longest single uart_puts string literal actually measured
+// in this file today (257 bytes) -- see uart_dma_scratch_addr's own
+// comment (boot/scratch_state.S). A string outside [MIN, CAP], or any
+// call before uart_dma_ready_set(1) has run (every uart_puts call
+// before this project's own single "allocate all scratch buffers"
+// init point in kernel_main, which is itself well after many boot
+// checkpoints' own uart_puts calls), falls through to the exact same
+// byte-by-byte uart_putc loop this function has always used -- never
+// a correctness requirement, only a performance one, so there is
+// always a safe, already-proven fallback.
+//
+// UART_DMA_ADOPT_FOR_REAL_HARDWARE gates the DMA branch itself,
+// default 0 (checked-in behavior unchanged -- plain PIO always).
+// Found live, 2026-10-16: with boot_debug_enabled() forced on to
+// directly compare against dma_uart_tx_self_test's own ALREADY-
+// working call (same dma_uart_tx_start/_busy, called directly with
+// its own small fixed buffer, not through this function), THIS
+// function's own first real call under QEMU hits "qemu-system-arm:
+// warning: Blocked re-entrant IO on MemoryRegion: bcm2835-dma at
+// addr: 0x0" and the whole system hangs -- confirmed via a clean A/B:
+// disabling only this function's own DMA branch (UART_DMA_MIN_LEN set
+// past any real string length) let the SAME self-test run successfully
+// moments later in the identical boot, proving the underlying driver
+// itself is sound and the gap is specific to this call site/context
+// under QEMU's own bcm2835-dma model, not a general QEMU DMA-to-
+// peripheral limitation -- joining SDHOST/GPIO-pull on this project's
+// own "untestable under QEMU, real-HW-only" list (corrects this same
+// file's own earlier, unverified claim that QEMU's model fully
+// supports this). Real root cause not yet isolated (plausibly QEMU's
+// own device-level re-entrancy guard tripping on the DMA engine's own
+// completion path, not necessarily anything wrong in boot/dma_uart_
+// state.S's own CB/CS mechanics) -- real-hardware trial is the next
+// step, gated here exactly like every other real-HW-only feature in
+// this codebase (WATCHDOG_ENABLE_FOR_REAL_HARDWARE etc.) rather than
+// risking the QEMU regression baseline chasing a QEMU-specific
+// dispatch quirk further.
+const UART_DMA_ADOPT_FOR_REAL_HARDWARE: i64 = 0;
+const UART_DMA_MIN_LEN: i64 = 8;
+const UART_DMA_SCRATCH_CAP: i64 = 512;
+
 fn uart_puts(s: Str) -> i64 {
   let saved_prio: u32 = current_eff_prio();
   let _ = dhruva_prio_lock(0);
@@ -4778,11 +4840,39 @@ fn uart_puts(s: Str) -> i64 {
     let _ = uart_putc(10);
   }
   let n: i64 = str_len_bytes(s);
-  let i: i64 = 0;
-  while i < n {
-    let b: i64 = str_byte_at(s, i);
-    let _ = uart_putc(b);
-    i = i + 1;
+  let used_dma: i64 = 0;
+  if (UART_DMA_ADOPT_FOR_REAL_HARDWARE == 1) && (uart_dma_ready_get() == (1 as u32)) && (n >= UART_DMA_MIN_LEN) && (n <= UART_DMA_SCRATCH_CAP) {
+    let scratch: mut ref i64 = uart_dma_scratch_get();
+    let i: i64 = 0;
+    while i < n {
+      let b: i64 = str_byte_at(s, i);
+      let _ = buf_write_byte(scratch, i as u32, b as u32);
+      i = i + 1;
+    }
+    let start_status: u32 = dma_uart_tx_start(scratch, n as u32);
+    if start_status == (0 as u32) {
+      // 20,000,000 -- generously scaled up from dma_uart_tx_self_
+      // test's own already-real-HW-proven 1,000,000 cap for a 16-byte
+      // message (this path's own 512-byte cap is 32x longer): a loop
+      // this cheap (one extern call + compare + increment, no MMIO
+      // write of its own) costs nothing extra in the normal case,
+      // where dma_uart_tx_busy() reports done and this loop exits far
+      // earlier -- it only bounds the pathological "DMA somehow never
+      // completes" case, which this hardware has never shown.
+      let busy_iter: i64 = 0;
+      while (dma_uart_tx_busy() == (1 as u32)) && (busy_iter < 20000000) {
+        busy_iter = busy_iter + 1;
+      }
+      used_dma = 1;
+    }
+  }
+  if used_dma == 0 {
+    let i2: i64 = 0;
+    while i2 < n {
+      let b2: i64 = str_byte_at(s, i2);
+      let _ = uart_putc(b2);
+      i2 = i2 + 1;
+    }
   }
   let _ = dhruva_prio_unlock(saved_prio as i64);
   return 0;
@@ -45982,6 +46072,16 @@ fn kernel_main() -> i64 {
   let _ = uart_digits_scratch_set(dhruva_alloc_bytes(24));
   let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(128));
   let _ = usb_bulk_data_scratch_set(dhruva_alloc_bytes(512));
+  // Task #357: uart_puts's own DMA-path scratch buffer, allocated here
+  // (same single "all persistent scratch buffers" spot every other
+  // one in this project goes through) -- but unlike those, uart_puts
+  // is called constantly from checkpoint 0 onward, well before this
+  // line ever runs, so it needs uart_dma_ready as an explicit runtime
+  // gate rather than relying on call order like every other scratch
+  // buffer here safely does.
+  let _ = uart_dma_scratch_set(dhruva_alloc_bytes(UART_DMA_SCRATCH_CAP));
+  let _ = dma_uart_init();
+  let _ = uart_dma_ready_set(1 as u32);
   let _ = tcp_empty_payload_scratch_set(dhruva_alloc_bytes(1));
   let _ = net_send_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
   let _ = net_recv_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));

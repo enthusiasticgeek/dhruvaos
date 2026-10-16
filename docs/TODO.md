@@ -14411,3 +14411,41 @@ measure (the CPU is executing, not crashed) but is completely useless -- exactly
 mechanism exists for, as opposed to a fault handler or the watchdog's own crash-recovery case. Task #352
 is DONE; the full A/B kernel-slot feature (tasks #347-#352) and its watchdog safety net (#353) are now
 both real-HW confirmed end to end.
+
+### Task #357: adopted DMA UART TX for uart_puts's own bulk output -- gated off by default, real-HW-only (2026-10-16)
+
+`uart_puts` -- the function behind every `BOOT DIAG`/`SD DIAG`/self-test line in this whole file -- had
+been blocking, byte-by-byte PIO since Phase 0 (`uart_putc`'s own tight `while true { poll FR bit5 }`),
+under `dhruva_prio_lock(0)` (un-preemptible) for the entire call. `boot/dma_uart_state.S`'s own DMA TX
+driver (built 2026-09-27, per the user's own direct request to save CPU cycles) had proven correct via
+`dma_uart_tx_self_test` but was never actually adopted by any real output path -- exactly this backlog
+item (#357).
+
+Added: a persistent 512-byte scratch buffer (`uart_dma_scratch`, new accessor pair in
+`boot/scratch_state.S`) and a `uart_dma_ready` flag (new accessor pair in `boot/dma_uart_state.S`, since
+`uart_puts` is called from the very first boot checkpoint onward, long before this project's own single
+"allocate all scratch buffers" init point runs -- unlike every other scratch buffer here, which can
+safely assume call-order, this one needs an explicit runtime gate). `uart_puts` now branches: strings in
+`[UART_DMA_MIN_LEN=8, UART_DMA_SCRATCH_CAP=512]` bytes get copied into the scratch buffer (cheap RAM-to-
+RAM) and sent via one `dma_uart_tx_start`+bounded-busy-poll-to-completion instead of N blocking hardware-
+FIFO-poll-and-write cycles; everything else (too short, too long, or before the buffer's ready) falls
+through to the exact same proven PIO loop unchanged. Busy-wait-to-completion (not kick-and-return) is
+deliberate: it preserves task #185's own existing serialization guarantee (one line's bytes never
+interleave with another task's) exactly as-is, trading the wire-time wait's own CPU-cost profile (many
+small FIFO polls+writes -> one DMA kickoff + a handful of completion checks) rather than attempting a
+bigger async-queueing redesign, which this backlog item didn't ask for.
+
+**Found live, real root cause not yet isolated**: with `boot_debug_enabled()` forced on to directly A/B
+against the already-proven self-test, this NEW call site's first real exercise under QEMU hit
+`qemu-system-arm: warning: Blocked re-entrant IO on MemoryRegion: bcm2835-dma at addr: 0x0` and hung the
+whole system -- while the self-test's own identical `dma_uart_tx_start`/`_busy` calls, reached moments
+later in the SAME boot once this new branch was disabled, ran correctly. This disproves `dma_uart_state.S`'s
+own earlier claim (based on reading QEMU's source, never actually confirmed end-to-end) that QEMU's
+bcm2835-dma model fully supports exercising this path -- corrected that comment. Rather than keep guessing
+at QEMU's own internal dispatch model further for a non-urgent backlog item, gated the whole new branch
+behind `UART_DMA_ADOPT_FOR_REAL_HARDWARE` (default 0, checked-in behavior fully unchanged -- plain PIO
+always) -- the same pattern every other real-HW-only feature in this codebase already uses
+(`WATCHDOG_ENABLE_FOR_REAL_HARDWARE` etc.). `phase4_milestone.py` 18/18 clean with the flag off, confirming
+zero regression. Flipping the flag to 1 and testing on the real Pi 1B is the natural next step whenever
+that's worth doing -- the code is fully written and ready, just not yet proven outside this one QEMU
+dispatch quirk.

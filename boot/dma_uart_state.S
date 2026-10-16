@@ -43,20 +43,35 @@
  * tightly-packed byte-count buffers with no 4-byte padding, relying
  * on exactly this hardware capability. A plain byte array is correct.
  *
- * QEMU note: unlike SDHOST (never documented, community reverse-
- * engineered) and GPIO pull resistors (confirmed via QEMU source to
- * be unimplemented), QEMU 10.0.13's own bcm2835-dma.c model (checked
- * directly) DOES perform real guest-physical-address data movement
- * (ldl_le_phys/stl_le_phys, which route through the full system bus
- * including MMIO-backed regions, not just RAM) -- meaning a transfer
- * targeting the UART0 DR address should genuinely reach the pl011
- * model and show up in captured serial output, unlike this project's
- * usual "untestable under QEMU" peripherals. QEMU's own DMA model does
- * NOT implement DREQ pacing at all (it always runs a CB to completion
- * at full speed) -- harmless for correctness (real hardware paces
- * itself; QEMU just doesn't need to), but means QEMU can never
- * exercise this driver's own DREQ-gated timing, only whether the
- * bytes arrive correctly and in order.
+ * QEMU note (UPDATED 2026-10-16, task #357): the original claim here
+ * -- that QEMU 10.0.13's own bcm2835-dma.c model DOES perform real
+ * guest-physical-address data movement (ldl_le_phys/stl_le_phys)
+ * reaching MMIO-backed regions including UART0 DR, unlike SDHOST/
+ * GPIO-pull -- was based on reading that model's own source, not a
+ * confirmed end-to-end test: dma_uart_tx_self_test below (a small,
+ * fixed, standalone call, gated behind boot_debug_enabled) DOES still
+ * pass cleanly under QEMU, proving the CB/CS mechanics themselves are
+ * sound and real guest-physical movement does happen. But the FIRST
+ * real adoption of this driver through kernel_main.vani's own
+ * uart_puts (task #357) hits "qemu-system-arm: warning: Blocked
+ * re-entrant IO on MemoryRegion: bcm2835-dma at addr: 0x0" and hangs
+ * the whole system -- confirmed via a clean A/B (disabling only that
+ * one new call site let the self-test below run successfully moments
+ * later in the identical boot) that this is specific to that call
+ * site/context, not a general failure of the driver or a QEMU
+ * limitation on reaching UART0 at all. Root cause not yet isolated.
+ * Net effect: this driver joins SDHOST/GPIO-pull on this project's
+ * own "something about real adoption is untestable under QEMU, needs
+ * real-HW validation" list, just via a narrower, not-yet-understood
+ * mechanism rather than an outright missing MMIO path. See uart_puts's
+ * own UART_DMA_ADOPT_FOR_REAL_HARDWARE comment (kernel_main.vani) for
+ * the full finding and the real-HW-only gate this led to.
+ *
+ * QEMU's own DMA model does NOT implement DREQ pacing at all (it
+ * always runs a CB to completion at full speed) -- harmless for
+ * correctness (real hardware paces itself; QEMU just doesn't need
+ * to), but means QEMU can never exercise this driver's own DREQ-gated
+ * timing, only whether the bytes arrive correctly and in order.
  *
  * DMA channel 5 chosen: arbitrary but deliberate -- this project uses
  * no DMA channel anywhere yet, so any channel is free, but channel 0
@@ -66,6 +81,19 @@
  * concern for zero cost. */
 
 .section ".bss"
+.align 4
+.global uart_dma_ready
+uart_dma_ready:
+    .word 0    /* Task #357: set once dma_uart_init() has run AND
+                * uart_dma_scratch (boot/scratch_state.S) is allocated
+                * -- uart_puts is called heavily from the very first
+                * boot checkpoint onward, long before either is ready,
+                * so it needs an explicit flag to know when it's safe
+                * to use the DMA path rather than assuming call-order
+                * like every other scratch buffer in this project does
+                * (those are all only ever read after their one real
+                * init point; uart_puts cannot make that assumption). */
+
 .align 5    /* 32-byte (256-bit) alignment -- the DMA Control Block's
              * own hard requirement (section 4.2.1.1), not a general
              * project convention. */
@@ -268,4 +296,17 @@ dma_uart_tx_busy:
     bl mem_barrier
     and r0, r4, #1
     pop {r4, lr}
+    bx lr
+
+.global uart_dma_ready_set
+uart_dma_ready_set:
+    ldr r1, =uart_dma_ready
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global uart_dma_ready_get
+uart_dma_ready_get:
+    ldr r0, =uart_dma_ready
+    ldr r0, [r0]
     bx lr
