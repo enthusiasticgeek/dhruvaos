@@ -7755,6 +7755,25 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
 fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   let attempt: i64 = 0;
   while attempt < SD_MAX_ATTEMPTS {
+    // TASK #353 REAL-HW FOLLOW-UP #2 (2026-10-16): a wedged read here
+    // retries up to SD_MAX_ATTEMPTS times, each failed attempt
+    // followed by a FULL sdhost_init_at_speed/sdhost_init call (each
+    // independently ~150ms healthy, real-HW worse-case unmeasured) --
+    // dharafs_init()'s own per-iteration kick (this file's own
+    // immediately-prior fix) only covers the gap BETWEEN block reads,
+    // not a single call's own internal multi-attempt-plus-reinit
+    // retry sequence if THIS specific block happens to wedge. Found
+    // live: the per-iteration kick alone did not resolve a real
+    // watchdog-reset boot loop on a card that had just taken 366+
+    // consecutive hard resets with no intervening clean power cycle
+    // (a watchdog reset is CPU-only, it doesn't power-cycle the SD
+    // card itself) -- exactly the condition most likely to leave the
+    // card genuinely wedged going into the very next boot's own first
+    // reads. Kicking at the top of every attempt here closes the gap
+    // the outer per-iteration kick couldn't reach.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
     let result: i64 = sdhost_read_block_once(block_num, buf);
     if result == 0 {
       return 0;
@@ -8106,6 +8125,13 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   }
   let attempt: i64 = 0;
   while attempt < SD_MAX_ATTEMPTS {
+    // TASK #353 REAL-HW FOLLOW-UP #2: same reasoning as sdhost_read_
+    // block's own matching kick -- a wedged write retries with a full
+    // reinit per failed attempt, which the caller-side per-iteration
+    // kicks (dharafs_init, etc.) don't reach into.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
     let result: i64 = sdhost_write_block_once(block_num, buf);
     if result == 0 {
       return 0;

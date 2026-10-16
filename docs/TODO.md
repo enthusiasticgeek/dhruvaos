@@ -14162,3 +14162,30 @@ scan like this one. NOT yet real-HW retested -- needs a re-deploy via `deploy_re
 clean multi-boot confirmation before trusting this closes the loop. The card's own accumulated DharaFS
 log growth from the failed attempts is NOT itself a problem post-fix (the scan just takes however long it
 takes now, safely kicked throughout) -- no need to re-flash/wipe the log data separately.
+
+### Task #353 real-HW deployment, follow-up #2: the dharafs_init() kick alone did NOT fix it (2026-10-16)
+
+Redeployed the previous fix via `deploy_realhw_watchdog.sh`. Raw log check (`grep -c "stage0: A/B kernel-
+slot loader starting"`) revealed the ORIGINAL unfixed build had already hard-reset **366 times** before
+the user even ran the redeploy -- confirming this is a hard, deterministic loop, not an intermittent
+fluke. The redeployed ("fixed") build hung in the exact same place on its first 3 fresh attempts too: the
+per-iteration kick inside `dharafs_init()`'s scan loop did not resolve it.
+
+**Real cause, found by reading `sdhost_read_block`/`sdhost_write_block` rather than re-guessing**: both
+retry up to `SD_MAX_ATTEMPTS=3` times on a detected read/write "wedge" (NEW_FLAG stuck, FAIL_FLAG set, FSM
+stuck), and EVERY failed attempt is followed by a full `sdhost_init_at_speed`/`sdhost_init` call -- a
+second, DIFFERENT real-SD-I/O cost entirely enclosed within a SINGLE `dharafs_block_read`/`write` call,
+which `dharafs_init()`'s own per-ITERATION kick (checked once per block, not once per internal retry)
+never reaches into. A watchdog reset is CPU-only -- it does not power-cycle the SD card -- so 366+
+consecutive hard resets with zero intervening clean power-off is close to the worst real-world condition
+for leaving the card or controller genuinely wedged going into the very next boot's first reads, which is
+exactly the state this card was almost certainly in by the time of the "fixed" redeploy.
+
+**Fixed**: added the same `watchdog_kick()` (gated by `WATCHDOG_ENABLE_FOR_REAL_HARDWARE`) at the top of
+`sdhost_read_block`'s and `sdhost_write_block`'s own retry loops, so a multi-attempt wedge-recovery
+sequence inside a SINGLE block operation stays protected too, not just the gap between operations.
+`phase4_milestone.py` 18/18, no regressions. NOT yet real-HW retested. Explicitly recommended a genuine
+full power-off/power-on before the next attempt, not another watchdog-driven soft reset, specifically to
+give the SD card itself a chance to leave whatever wedged state 366+ abrupt resets may have left it in --
+the software fix alone may not be sufficient if the card's own hardware state needs a real power cycle to
+clear.
