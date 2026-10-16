@@ -124,8 +124,25 @@ class ShellSession:
 
     def send_raw(self, data: bytes):
         """Write raw bytes with no line framing at all -- used only
-        for the stream payload itself, never for shell commands."""
-        os.write(self.fd, data)
+        for the stream payload itself, never for shell commands.
+        A single os.write() to a tty is explicitly allowed by POSIX
+        to do a short write (the line discipline's output buffer is
+        bounded) -- a bare os.write() call silently dropped the tail
+        of the image on real hardware once the buffer filled, so the
+        remainder of the payload simply never reached the board. Must
+        loop until every byte is actually accepted."""
+        mv = memoryview(data)
+        total = 0
+        while total < len(mv):
+            t_call = time.time()
+            n = os.write(self.fd, mv[total:])
+            dt = time.time() - t_call
+            if dt > 0.5 or os.environ.get("KUPLOAD_DEBUG_WRITES"):
+                print(f"    [write debug] os.write call took {dt:.3f}s, returned n={n}, total_so_far={total+max(n,0)}", flush=True)
+            if n <= 0:
+                raise IOError(f"os.write returned {n} while streaming kernel image "
+                               f"({total}/{len(mv)} bytes sent so far)")
+            total += n
 
     def wait_until_ready(self, overall_timeout: float = 30, poll_interval: float = 1.0) -> bool:
         """Same attach-at-any-time handshake as wifikey_upload.py's own

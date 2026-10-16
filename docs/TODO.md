@@ -13904,3 +13904,48 @@ after deleting the stale one -- not just the exit code), `phase4_milestone.py` 1
 regressions. NOT yet real-HW tested -- needs a reflash and a recurrence of the crash (or a repeat of the
 kernelupload-stream stress scenario) to actually produce useful stack-dump output. Root cause of the
 `diag_wait_1` crash remains OPEN until that evidence comes back.
+
+### Task #355/#356 follow-up: real-HW `kernelupload stream` retest -- host partial-write bug, UART RX
+### overrun root-caused and fixed, original crash still OPEN (2026-10-15)
+
+Real-HW retest of the stall-diagnostic build above. The crash did NOT recur this session, but the retest
+surfaced two more real bugs along the way -- both now fixed:
+
+**1. Host-side `test/kernel_upload.py` silently dropped most of the payload (FIXED).** `send_raw()` fired
+a single `os.write()` and never checked its return value. POSIX explicitly allows a short write on a
+character device (the tty line discipline's output buffer is bounded) -- confirmed live: the first
+real retest attempt handed the OS "all 3019520 bytes" per its own log line, yet the board only ever saw
+~320KB of it. Fixed by looping `os.write()` until every byte is actually accepted
+(`test/kernel_upload.py`'s `send_raw`).
+
+**2. A real, previously-undiscovered UART RX FIFO overrun (FIXED).** Even after fix #1, the stream kept
+stalling early (192-384KB in, varying run to run) -- but timing-instrumented host-side logging proved the
+HOST was transmitting continuously at full 115200-baud line rate the entire time (a single `os.write()`
+call returned the complete byte count after exactly 262.2s, matching 3019520 bytes / 115200 baud to
+within measurement error) -- ruling out every host-side/USB-adapter explanation (flow control confirmed
+off both directions via `stty -a`; no USB errors in `dmesg`/`journalctl`). The stall is real and
+board-side. Added a live register dump (`UART_FR`/`UART_IMSC`/`UART_RIS`/ring head+tail) to task_f's own
+inactivity-abort branch (`kernel/kernel_main.vani`) to catch the board's exact state at the moment of a
+stall -- captured on the very next real-HW attempt: `ris=0x00000420`, i.e. UARTRIS bit 10 (OERIS, Overrun
+Error Raw Interrupt Status) was SET, while `fr=0x00000091` (RX FIFO genuinely empty right now) and
+`imsc=0x00000050` (RXIM|RTIM still correctly enabled) ruled out "interrupts got masked" or "bytes stuck
+undrained in hardware." A sustained, near-line-rate stream can overrun the PL011's own 16-byte RX FIFO
+faster than `irq_dispatch`'s 32-iteration drain loop and the scheduler's own IRQ-dispatch cadence can keep
+up with it -- something no earlier caller (interactive typing, the old per-chunk `wifikey`/`kernelupload`
+upload) ever sustained enough throughput to hit. Once OERIS sets, it stays latched until something writes
+to `UARTECR` (same address as `UARTRSR`, offset 0x04) -- and nothing in this driver ever did. Fixed:
+`UART_RSR_ECR` constant added, and both `irq_dispatch` RX branches (streaming and the pre-existing
+interactive path) now check `UARTRIS` bit 10 after their drain loop and clear it via `UARTECR` if set.
+
+**Still open / not yet confirmed**: per the PL011's own documented behavior, a lingering uncleared OERIS
+is supposed to be purely informational (existing FIFO contents stay valid, and reception should resume
+normally once there's room) -- so clearing it is a correct, overdue hygiene fix regardless, but whether it
+is *the* mechanism behind the full 10+-second total reception stoppage (as opposed to some BCM2835-
+specific deviation from the documented PL011 behavior, which this project has hit before with the SDHOST
+controller) is NOT yet confirmed. The next real-HW retest should show whether stalls stop recurring now
+that OERIS is cleared promptly, or whether the same symptom persists -- in which case the overrun is a
+symptom of something else (e.g. a real, longer-than-expected interrupt-servicing delay elsewhere in the
+system under this specific sustained-throughput load) rather than the cause.
+
+Build clean (0 safety-audit findings, fresh `dhruva.elf` confirmed), `phase4_milestone.py` 19/19 clean, no
+regressions. Real-HW retest of this exact fix not yet done as of this writing.

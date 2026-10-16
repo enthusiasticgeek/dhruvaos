@@ -58,6 +58,20 @@ const GPPUDCLK1: i64 = 0x2020009C;
 // UART0 / PL011 (base 0x20201000)
 #[mmio(size=4)]
 const UART_DR: i64 = 0x20201000;
+// Receive Status Register / Error Clear Register (same address,
+// read=RSR status for the next char in the FIFO, write=clears FE/PE/
+// BE/OE unconditionally regardless of value written). Added for task
+// #355/#356's real-HW overrun finding (2026-10-15): a sustained,
+// near-line-rate `kernelupload stream` burst set UARTRIS's OERIS bit
+// (confirmed via a live register dump at the exact moment task_f's
+// own inactivity-abort fired -- ris=0x420, bit 10 set) and NOTHING in
+// this driver ever wrote here to clear it -- a genuine missing step
+// versus a complete UART driver, not previously needed because every
+// earlier caller (interactive typing, the old `chunk`-based upload)
+// never sustained anywhere near the throughput required to overrun
+// the PL011's own 16-byte RX FIFO in the first place.
+#[mmio(size=4)]
+const UART_RSR_ECR: i64 = 0x20201004;
 #[mmio(size=4)]
 const UART_FR: i64 = 0x20201018;
 #[mmio(size=4)]
@@ -70,6 +84,16 @@ const UART_LCRH: i64 = 0x2020102C;
 const UART_CR: i64 = 0x20201030;
 #[mmio(size=4)]
 const UART_IMSC: i64 = 0x20201038;
+// Raw Interrupt Status -- read-only, reflects the PL011's own live
+// interrupt-condition bits BEFORE masking (unlike UARTMIS, which
+// would read as 0 for anything masked out in IMSC). Added for task
+// #355/#356's own real-HW stall diagnostic (task_f's inactivity-
+// abort branch) -- reading this tells us whether RXRIS/RTRIS were
+// still asserting at the moment of a stall (IMSC fine but somehow
+// not being serviced) versus genuinely clear (no new bytes ever
+// reached the hardware FIFO at all).
+#[mmio(size=4)]
+const UART_RIS: i64 = 0x2020103C;
 #[mmio(size=4)]
 const UART_ICR: i64 = 0x20201044;
 // System Timer (base 0x20003000)
@@ -13242,6 +13266,8 @@ fn irq_dispatch() -> i64 {
     let uart_fr: i64 = UART_FR;
     let uart_dr: i64 = UART_DR;
     let uart_icr: i64 = UART_ICR;
+    let uart_ris: i64 = UART_RIS;
+    let uart_rsr_ecr: i64 = UART_RSR_ECR;
     // Drain the RX FIFO for up to 128 iterations -- shell_line_buf's
     // own capacity (shell_state.S), not the PL011's real 16-byte
     // hardware FIFO depth. A `while` loop here, even one with a
@@ -13330,6 +13356,21 @@ fn irq_dispatch() -> i64 {
         }
       }
       let _ = mmio_write_u32(uart_icr, 0x50 as u32);
+      // TASK #355/#356 follow-up (2026-10-15, real-HW overrun find):
+      // a sustained, near-line-rate stream can overrun the PL011's
+      // own 16-byte RX FIFO faster than this 32-iteration drain loop
+      // and the scheduler's own IRQ-dispatch cadence keep up with it
+      // -- confirmed via a live register dump at the exact moment a
+      // real stream stalled (UARTRIS bit 10, OERIS, was set). Once
+      // set, OERIS stays latched until explicitly cleared here; left
+      // uncleared, every future iteration still has to deal with the
+      // bytes actually lost at the moment of the overrun (expected,
+      // the ring-push's own short-write handling already covers
+      // that), but clearing it keeps the status register from
+      // reporting a now-historical error as if it just happened again.
+      if (mmio_read_u32(uart_ris) & (0x400 as u32)) != (0 as u32) {
+        let _ = mmio_write_u32(uart_rsr_ecr, 0 as u32);
+      }
       // Falls through to the function's own closing brace below --
       // deliberately does NOT touch rx_budget/uart_rx_irq_budget at
       // all on this path, so ordinary typed-shell behavior resumes
@@ -13361,6 +13402,14 @@ fn irq_dispatch() -> i64 {
       // RTIM alongside RXIM in UART_IMSC, so a timeout-triggered entry
       // needs its own status bit acknowledged too, not just RXIM's.
       let _ = mmio_write_u32(uart_icr, 0x50 as u32);
+      // Same overrun-clear as the streaming branch above (task #355/
+      // #356 follow-up) -- interactive typing has never sustained
+      // enough throughput to actually hit this in practice, but
+      // there's no reason this path should silently leave a latched
+      // OERIS around if it ever does.
+      if (mmio_read_u32(uart_ris) & (0x400 as u32)) != (0 as u32) {
+        let _ = mmio_write_u32(uart_rsr_ecr, 0 as u32);
+      }
     } else {
       let _ = mmio_write_u32(UART_IMSC, 0 as u32);
       let _ = uart_rx_deferred_set(1 as u32);
@@ -34336,6 +34385,39 @@ fn task_f() -> i64 {
         let now_tick: u32 = scheduler_get_tick_count();
         let last_tick: u32 = kernelupload_stream_last_activity_tick_get();
         if (now_tick - last_tick) > (20 as u32) {
+          // TASK #355/#356 follow-up (2026-10-15): live register dump
+          // BEFORE declaring the abort, to root-cause a real-HW find --
+          // a continuous, full-line-rate host transmission (confirmed
+          // via host-side os.write() timing matching 115200 baud exactly
+          // for the WHOLE 3MB payload) still left this ring completely
+          // empty for 10+ real seconds partway through. Printed here,
+          // not after kernelupload_stream_active_set(0), so this reads
+          // the UART's actual live state at the moment of the stall,
+          // not after anything else has had a chance to touch it.
+          // UART_RIS (raw, pre-mask status) tells us whether RXRIS/
+          // RTRIS were still asserting (bytes sitting in hardware,
+          // never serviced -- an IRQ-dispatch-level bug) versus clear
+          // (nothing ever arrived at the hardware FIFO at all -- a
+          // different class of problem entirely). Ring head/tail let
+          // us confirm the ring's own bookkeeping is sane (head==tail,
+          // as popped==0 already implies, but worth the direct
+          // confirmation given how much hinges on this one diagnosis).
+          let diag_fr: u32 = mmio_read_u32(UART_FR);
+          let diag_imsc: u32 = mmio_read_u32(UART_IMSC);
+          let diag_ris: u32 = mmio_read_u32(UART_RIS);
+          let diag_head: u32 = kernelupload_rx_ring_head_get();
+          let diag_tail: u32 = kernelupload_rx_ring_tail_get();
+          let _ = uart_puts("\nkernelupload: STALL DIAG fr=");
+          let _ = uart_put_hex32(diag_fr);
+          let _ = uart_puts(" imsc=");
+          let _ = uart_put_hex32(diag_imsc);
+          let _ = uart_puts(" ris=");
+          let _ = uart_put_hex32(diag_ris);
+          let _ = uart_puts(" ring_head=");
+          let _ = uart_put_hex32(diag_head);
+          let _ = uart_puts(" ring_tail=");
+          let _ = uart_put_hex32(diag_tail);
+          let _ = uart_puts("\n");
           let _ = kernelupload_stream_active_set(0 as u32);
           let _ = kernelupload_active_set(0 as u32);
           let _ = uart_puts("\nkernelupload: stream aborted -- no data received for 10s (host connection lost?)\n");
