@@ -35476,6 +35476,24 @@ fn pbkdf2_hmac_sha256(password: mut ref i64, password_len: i64, salt: mut ref i6
 
   let iter: i64 = 1;
   while iter < iterations {
+    // TASK #353 REAL-HW FOLLOW-UP #7 (2026-10-16): root cause of the
+    // real watchdog boot loop that widening watchdog_kick()'s own
+    // window (follow-up #6) did NOT fix -- this is dharafs_crypto_
+    // key_init()'s own PBKDF2-HMAC-SHA256 call, 10000 iterations,
+    // ONE tight loop with no return to any caller (hence no caller-
+    // side kick, at any window size) until all 10000 complete. Every
+    // PRIOR gap this investigation found was "a real phase slower
+    // than assumed" (fixable by widening the window or kicking
+    // between operations); this one is qualitatively different --
+    // no amount of window-widening helps a single uninterrupted loop.
+    // Kicked every 500 iterations (20 kicks across the full run),
+    // matching the exact pattern already proven for dharafs_init's
+    // own scan loop and sdhost_read_block/write_block's retry loops.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if (iter % (500 as i64)) == 0 {
+        let _ = watchdog_kick();
+      }
+    }
     // Safe to alias msg==out==u here: hmac_sha256 fully copies msg into
     // its own persistent scratch before it ever writes a single byte
     // of `out` (see its own body -- the msg copy loop runs to
@@ -35800,6 +35818,15 @@ fn pbkdf2_hmac_sha1(password: mut ref i64, password_len: i64, salt: mut ref i64,
 
     let iter: i64 = 1;
     while iter < iterations {
+      // TASK #353 REAL-HW FOLLOW-UP #7: same fix as pbkdf2_hmac_
+      // sha256's own identical loop -- this is the real WPA2-PSK
+      // derivation path (4096 iterations), one tight loop with no
+      // return to any caller until it finishes.
+      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+        if (iter % (500 as i64)) == 0 {
+          let _ = watchdog_kick();
+        }
+      }
       // Safe to alias msg==out==u: see pbkdf2_hmac_sha256's own
       // identical comment on why hmac_sha1 fully consumes msg before
       // ever writing out.

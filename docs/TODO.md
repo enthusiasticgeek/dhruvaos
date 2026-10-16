@@ -14276,3 +14276,27 @@ so 10s is real margin on top of that, not instead of it. Still reliably catches 
 scheduler -- the actual mechanism this constant's own comment cared about proving -- well within what
 "unattended recovery, no physical reflash" needs. `phase4_milestone.py` 18/18, no regressions (the flag
 stays 0 under QEMU regardless of the constant's own value).
+
+### Task #353 real-HW deployment, follow-up #7: found the REAL root cause -- PBKDF2 is a single uninterruptible loop, no window size helps (2026-10-16)
+
+Follow-up #6's widened window (2s -> 10s) did NOT fix the boot loop either -- the exact same failure
+point (checkpoint 12 reached, checkpoint 13 never printed) persisted even at 5x the margin. That was the
+key signal: every prior gap in this investigation was "a real phase slower than assumed" (fixable by a
+kick between operations, or by more margin); a gap that widening the window can't touch at all means
+something structurally different -- a single function call with no return to any caller until it
+finishes, so there is no caller-side kick at any window size that could ever reach inside it.
+
+Found it by reading the actual code in that exact span rather than widening further blind:
+`dharafs_crypto_key_init()` calls `pbkdf2_hmac_sha256(..., 10000, ...)` -- PBKDF2-HMAC-SHA256 key
+derivation, 10,000 iterations, in ONE tight `while` loop with zero kicks inside it. No amount of
+widening `watchdog_kick()`'s own window helps a function that never returns control to a kicker during
+its own run. This is the first REAL root cause this investigation found, as opposed to "a real phase that
+needed more margin" -- every one of follow-ups #1-#6 was the latter; this one is categorically different.
+
+**Fixed**: added `watchdog_kick()` (gated by `WATCHDOG_ENABLE_FOR_REAL_HARDWARE`) every 500 iterations
+inside `pbkdf2_hmac_sha256`'s own main loop -- 20 kicks across the full 10,000-iteration run, the exact
+same pattern already proven for `dharafs_init`'s scan loop and `sdhost_read_block`/`sdhost_write_block`'s
+retry loops. Proactively applied the identical fix to `pbkdf2_hmac_sha1`'s own loop too (real WPA2-PSK
+derivation during WiFi join, 4096 iterations) -- same risk class, not yet hit in this specific test
+scenario (no WiFi configured) but cheap to close now rather than wait for it to surface as a seventh
+separate incident. `phase4_milestone.py` 18/18, no regressions. NOT yet real-HW retested.
