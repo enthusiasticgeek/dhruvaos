@@ -5228,28 +5228,45 @@ fn abort_report_data(addr: u32, status: u32, fault_pc: u32, orig_r0: u32, orig_r
 // on real hardware (no JTAG, per vectors.S's own existing comment).
 #[no_mangle]
 #[no_heap]
-fn abort_dump_task_stacks(spsr: u32, sp_usr: u32, sp_svc: u32) -> i64 {
+fn abort_dump_task_stacks(spsr: u32) -> i64 {
   let _ = uart_puts("spsr_abt=");
   let _ = uart_put_hex32(spsr);
   let _ = uart_puts(" (interrupted mode bits=");
   let _ = uart_put_hex32(spsr & (0x1F as u32));
   let _ = uart_puts(", 0x10=USR 0x13=SVC)\n");
-  let _ = uart_puts("sp_usr=");
-  let _ = uart_put_hex32(sp_usr);
-  let _ = uart_puts(":");
-  for i from 0 to 16 {
+  // REVISED same day as the first attempt (see vectors.S's own
+  // header comment for the full story of why a live sp_usr/sp_svc
+  // mode-switch is architecturally impossible to do safely). Instead,
+  // dump the current task's own SAVED resume frame -- sp_table/
+  // usr_sp_table (boot/context_switch.S) are the SAME per-task state
+  // the scheduler's own context-switch code reads to resume a task,
+  // safely readable from ABT/SVC with no mode switch at all. The
+  // 68-byte SVC-side frame layout (context_switch.S's own "Round 68"
+  // comment): offset 0=spsr, 4=pad, 8..56=r0-r12, 60=true_lr,
+  // 64=resume_pc -- dumping all 17 words shows directly whether
+  // resume_pc/true_lr look like valid code addresses or 0/garbage,
+  // which is exactly what the corrupted-resume-PC hypothesis predicts.
+  let cur_task: u32 = current_task_get();
+  let _ = uart_puts("current_task=");
+  let _ = uart_put_hex32(cur_task);
+  let sp_svc_val: u32 = sp_table_get_at(cur_task);
+  let _ = uart_puts(" sp_table[task]=");
+  let _ = uart_put_hex32(sp_svc_val);
+  let _ = uart_puts(" (68-byte frame: spsr,pad,r0-r12,true_lr,resume_pc):");
+  for i from 0 to 17 {
     let off: u32 = wrapping_mul((i as u32), (4 as u32));
-    let addr: u32 = wrapping_add(sp_usr, off);
+    let addr: u32 = wrapping_add(sp_svc_val, off);
     let word: u32 = mmio_read_u32(addr as i64);
     let _ = uart_puts(" ");
     let _ = uart_put_hex32(word);
   }
-  let _ = uart_puts("\nsp_svc=");
-  let _ = uart_put_hex32(sp_svc);
+  let sp_usr_val: u32 = ptr_to_u32(usr_sp_table_get_at(cur_task));
+  let _ = uart_puts("\nusr_sp_table[task]=");
+  let _ = uart_put_hex32(sp_usr_val);
   let _ = uart_puts(":");
   for i from 0 to 16 {
     let off: u32 = wrapping_mul((i as u32), (4 as u32));
-    let addr: u32 = wrapping_add(sp_svc, off);
+    let addr: u32 = wrapping_add(sp_usr_val, off);
     let word: u32 = mmio_read_u32(addr as i64);
     let _ = uart_puts(" ");
     let _ = uart_put_hex32(word);

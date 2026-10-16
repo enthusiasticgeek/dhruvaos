@@ -13949,3 +13949,50 @@ system under this specific sustained-throughput load) rather than the cause.
 
 Build clean (0 safety-audit findings, fresh `dhruva.elf` confirmed), `phase4_milestone.py` 19/19 clean, no
 regressions. Real-HW retest of this exact fix not yet done as of this writing.
+
+### Task #357: `diag_wait_1` crash RECURRED on real HW -- same location confirmed, own stack-dump
+### diagnostic found broken and fixed (2026-10-15)
+
+Real-HW retest of the overrun fix above: the stream got further than any previous attempt, then the
+ORIGINAL unresolved crash from task #356 recurred -- `FATAL: Data Abort addr=00000000 status=0000080D
+pc=002001F8 current_task=00000003 r0=00200020 r1=00000000 r2=E59FF018 r3=E59FF018 lr=00200200 ctxsw=629
+irqs=82629`. Confirmed via `addr2line` against the exact flashed binary (git worktree at commit `ab12be2`)
+that `pc`/`lr` both resolve inside `diag_wait_1` (`boot/rpi1/boot.S`) -- the IDENTICAL location as the
+first occurrence, now hit after only 629 context switches instead of 9,740. Likely explanation: fixing
+the host-side partial-write bug means the full continuous byte stream now reaches the board far sooner
+and far more aggressively than any earlier attempt ever managed, exposing whatever timing window causes
+this far more reliably -- a big win for being able to iterate on it at all, even though the root cause
+remains unfixed.
+
+**The stack-dump diagnostic itself was broken, found and fixed the same day.** It reported IDENTICAL
+values for `sp_usr` and `sp_svc` -- which should never happen if both reads were real. Root cause: ARM
+architecture explicitly treats writing CPSR's control bits (including the mode field) via plain `msr
+cpsr_c` as a no-op when the CURRENT mode is already USR (unprivileged code cannot elevate its own
+privilege this way). The original diagnostic's `cps`-style round-trip (ABT -> USR -> back to ABT -> SVC ->
+back to ABT) copied a pattern this project's own `boot.S` already uses safely for its IRQ/ABT stack setup
+-- but that pattern only works between PRIVILEGED modes (SVC/IRQ/ABT); USR is categorically different.
+Once the first switch entered USR mode, EVERY subsequent attempt to switch back silently failed, so both
+"sp_usr" and "sp_svc" reads actually came from whatever mode the core got stuck in (almost certainly USR,
+the one mode actually, successfully, entered) -- explaining the identical values directly.
+
+**Fixed, more safely and more usefully than the original attempt**: dropped the live USR-mode round-trip
+entirely (`boot/rpi1/vectors.S`'s `fault_data_abort`/`fault_prefetch_abort` now only keep the single safe
+`mrs r0, spsr` read before calling `abort_dump_task_stacks`). That function (`kernel/kernel_main.vani`)
+now instead reads `current_task_get()`'s `sp_table`/`usr_sp_table` entries (`boot/context_switch.S`) --
+the SAME per-task saved-frame state the scheduler's own context-switch code uses to resume a task, safely
+readable from ABT/SVC with no mode switch needed at all. This is also more directly useful than a live
+sp_usr read would have been: it dumps the actual SAVED resume frame (the 68-byte layout from
+`context_switch.S`'s own "Round 68" comment: spsr, pad, r0-r12, true_lr, resume_pc) that a corrupted-
+resume-PC bug would show up in directly.
+
+Two more real, small bugs found getting this working: (1) `sp_table_get_at` was already declared as an
+`extern "C" fn` in `kernel_main.vani` but had never actually been implemented anywhere in the assembly --
+a stale declaration with zero real callers until this diagnostic became the first one; added, mirroring
+`usr_sp_table_get_at`'s exact shape. (2) `task` is -- like `len` (see this project's own standing memory
+on that) -- a bare identifier vani's parser rejects, producing the same "expected identifier" parse-error
+cascade; renamed to `cur_task`.
+
+Build clean, `phase4_milestone.py` 19/19, no regressions. NOT yet real-HW retested with the corrected
+diagnostic -- needs another recurrence to actually produce trustworthy `sp_table`/`usr_sp_table` output.
+Root cause of the `diag_wait_1` crash remains OPEN, but now reproduces much faster, which should make
+future diagnostic iterations considerably cheaper.

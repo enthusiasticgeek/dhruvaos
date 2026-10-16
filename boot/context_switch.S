@@ -3064,6 +3064,21 @@ irq_count_get:
     mov r1, #0
     bx lr
 
+/* u32 sp_table_get_at(u32 index) -- read-only accessor for sp_table
+ * (this file's own, local -- never `.global` before now -- per-task
+ * saved SVC-stack-pointer table, the SAME state scheduler_pick_next's
+ * own restore path reads to resume a task). Declared in kernel_main.
+ * vani for a long time (`extern "C" fn sp_table_get_at`) but never
+ * actually implemented anywhere -- a stale declaration, not
+ * previously a real caller -- until task #357's own abort-handler
+ * stack-dump diagnostic (2026-10-15) became the first real use. */
+.global sp_table_get_at
+sp_table_get_at:
+    ldr r1, =sp_table
+    ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
 /* u32 usr_sp_table_get_at(u32 task_index) / i64 usr_sp_table_set_at(
  *   u32 task_index, mut ref i64 value) -- see usr_sp_table's own
  * header comment above for the full design. _set_at is called exactly
