@@ -14051,3 +14051,43 @@ NOT yet real-HW verified -- /dev/sdb read 0 bytes (card currently in the Pi, not
 machine) at the point this was written. Pending: user inserts the card in a reader, run the two commands
 above, power on, confirm via the (now-running again) UART logger that boot reaches PASS cleanly with no
 unexpected reset loop.
+
+### Task #288 follow-up: chunked GC's DharaFS critical section (2026-10-15)
+
+Direct follow-up to the "chunk GC's masked section" recommendation from the scheduler-speedup discussion
+above. Reduced `dharafs_compact_blocks_per_call()` (`kernel/kernel_main.vani`) from 8 to 1 -- the per-call
+block budget for `dharafs_compact`'s own already-resumable scan (round 77's mechanism, built for exactly
+this kind of tuning). This directly targets the blocker task #288 itself identified: GC's own masked
+SD-write wedge case (`sd_fill_fifo_worst_case_wedge_ms`, 22.272ms) going from an acceptable 8.4% of a
+500ms tick to an unacceptable 42% of a hypothetical 100ms one.
+
+**Real side effect found, not just a speed/size tradeoff**: `test/schedulability_analysis.py`'s own model
+only ever adds the wedge figure ONCE per GC critical section (its own "added, not substituted" comment) --
+an assumption that was only ever an approximation at budget=8, since up to 8 scanned blocks per call could
+each independently need a masked carry-forward write. Budget=1 makes that assumption EXACT by
+construction: at most one block, hence at most one possible write, hence at most one possible wedge, per
+call. No prior round had examined whether the single-wedge-per-call input was actually proven or just a
+reasonable-looking guess that hadn't been hit yet -- this closes that quietly, not just the tick-rate
+motivation that prompted it.
+
+Re-measured the healthy-path figure rather than estimating one: a new throwaway script
+(mirrors `test/phase4_milestone.py`'s own QEMU-with-SD-drive pattern) live-enabled `LOG_CAT_GC` via
+`dhdl set loglevel 8` (NOT `write /config/loglevel 8`, which only takes effect on the NEXT boot --
+`log_level_init()` reads that file once, at startup, well before this test's commands could run), built a
+real backlog the same way `dharafs_compact_resumable_self_test` does (20 writes to the same path), then
+captured 18 real per-pass "WCET DIAG" critical-section durations from task_e's own existing diagnostic
+print: max 4.616ms (down from the old 7.689ms/8-block figure), min 1.013ms. Fed into
+`gc_dharafs_healthy_ms`; `test/schedulability_analysis.py` re-run clean, all margins improved (LOW's own
+margin 884.875ms -> 907.660ms).
+
+Build clean, `phase4_milestone.py` 18/18 clean, no regressions (compaction pace is the only user-visible
+change -- a given backlog now takes up to 8x more of task_e's own 20-tick wakeups to fully reclaim, which
+`dharafs_compact_resumable_self_test`'s own 500-call drain cap already tolerates; "latest wins" semantics
+mean an uncompacted log stays fully correct, just slower to reclaim).
+
+**Still not sufficient on its own** to re-attempt the finer tick: this closes the specific "up to 8 wedges
+stacking in one call" unexamined risk and tightens the headroom story, but the SINGLE wedge figure itself
+(22.272ms) is still 22% of a hypothetical 100ms tick -- better than 42%, not yet back to the original
+500ms tick's own 4.4% ratio. A real finer-tick re-attempt still needs that number itself reduced (e.g.
+shrinking the masked PIO fill loop's own retry cap further, the same lever task #285/32nd-SD-round already
+used once) or accepting a less aggressive tick-period target than 100ms, before trying again.

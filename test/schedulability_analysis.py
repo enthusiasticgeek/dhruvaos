@@ -412,7 +412,15 @@ def dhruvaos_demo_task_set_analysis() -> int:
     # would have pushed this figure to 71.04ms, past HIGH/MEDIUM's own
     # 49.906ms ceiling-0 budget below. Reduced retry_cap to 400
     # (same file) to compensate, re-measured: 22.272ms.
-    gc_dharafs_healthy_ms = 7.689  # measured max, 10 real passes
+    # TASK #288 FOLLOW-UP (2026-10-15): re-measured after chunking
+    # dharafs_compact_blocks_per_call() 8 -> 1 (kernel_main.vani) --
+    # each GC pass now touches at most one block instead of up to
+    # eight, so the healthy-path figure dropped accordingly. Measured
+    # max across 18 real passes under QEMU (LOG_CAT_GC live-enabled via
+    # `dhdl set loglevel 8`, a real backlog built the same way
+    # dharafs_compact_resumable_self_test does), was 7.689ms at
+    # budget=8.
+    gc_dharafs_healthy_ms = 4.616  # measured max, 18 real passes, budget=1
     sd_fill_fifo_worst_case_wedge_ms = 22.272  # measured+computed, 32nd SD round
     gc_dharafs_critical_section_ms = gc_dharafs_healthy_ms + sd_fill_fifo_worst_case_wedge_ms
 

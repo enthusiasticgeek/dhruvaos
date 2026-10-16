@@ -9630,15 +9630,32 @@ fn dharafs_snapshot_read(path: Str, name: Str, out_buf: mut ref i64) -> i64 {
 // resumable scan (see that function's own comment) -- a named
 // constant rather than a bare literal so the bound is self-documenting
 // at every call site that might reason about it (e.g. a future WCET
-// annotation). 8 blocks of real SD I/O per call, chosen the same way
-// this function's own pre-existing "not worth it below 4 blocks"
-// threshold was: small enough that even several tick's worth of
-// compaction work stays a bounded, short slice of task_e's own 20-tick
-// period, large enough that a typical pass (this project's own
-// exercised scale: tens of blocks between passes) still finishes in a
-// small handful of calls, not dozens.
+// annotation).
+//
+// TASK #288 FOLLOW-UP (2026-10-15): reduced 8 -> 1. Task #288's own
+// re-attempt at a finer scheduler tick (500ms -> 100ms) was reverted
+// after finding GC's own DharaFS critical section -- specifically the
+// masked SD-write wedge case syscall #5 can add on top, 22.272ms
+// worst-case (test/schedulability_analysis.py's own sd_fill_fifo_
+// worst_case_wedge_ms) -- goes from an acceptable 8.4% of a 500ms tick
+// to an unacceptable 42% of a 100ms one. That schedulability model has
+// only ever added the wedge figure ONCE per GC critical section (see
+// its own "added, not substituted" comment), an assumption that was
+// only ever approximately true at budget=8: up to 8 scanned blocks per
+// call could each independently be a live record needing a masked
+// carry-forward write, so the model's own single-wedge-per-call input
+// was never actually proven, just a reasonable-looking approximation.
+// Reducing the budget to 1 makes that assumption EXACT by construction
+// -- at most one block, hence at most one possible write, hence at
+// most one possible wedge, per call -- which is what a finer-tick
+// attempt's own much tighter headroom needs: an honest worst case, not
+// an approximation that happened not to have been hit yet. Costs
+// nothing for correctness (a slower pass still converges -- "latest
+// wins" already tolerates an uncompacted log sitting around longer;
+// dharafs_compact_resumable_self_test's own 500-call drain cap already
+// accommodates many more, smaller calls), only pass-completion speed.
 fn dharafs_compact_blocks_per_call() -> i64 {
-  return 8;
+  return 1;
 }
 
 fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) -> i64 {
