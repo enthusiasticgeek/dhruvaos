@@ -488,8 +488,46 @@ dma_uart_tx_start:
     ldr r1, =dma_uart_cb
     ldr r0, =0x000C0148    /* TI: WAIT_RESP|DEST_DREQ|SRC_INC|PERMAP=12 */
     str r0, [r1, #0]
-    str r4, [r1, #4]       /* SOURCE_AD = buf_ptr */
-    ldr r0, =0x20201000    /* UART0 DR -- DEST_AD, fixed (DEST_INC=0) */
+    str r4, [r1, #4]       /* SOURCE_AD = buf_ptr -- RAM, no translation
+                             * needed (identical from ARM and VC bus
+                             * perspectives in this range). */
+    // TASK #357 real-HW follow-up (2026-10-17), seventh attempt: THE
+    // real root cause of the "zero bytes ever reach the wire, CS
+    // reports clean completion, no ERROR, transfer finishes in a
+    // handful of busy-wait iterations regardless of string length"
+    // symptom -- confirmed on real hardware via dedicated diagnostics
+    // (D0/D1 prints) showing every transfer "complete" in ~0-721
+    // iterations, orders of magnitude too few for genuine DREQ pacing
+    // at this board's ~4573 baud rate (a 35-byte string needs ~77ms of
+    // real wall-clock DREQ-gated time, which a cheap busy-wait loop
+    // would need on the order of 100,000+ iterations to cover, not
+    // ~721). THE classic, extensively-documented BCM2835 bare-metal
+    // DMA gotcha this whole file never accounted for: SOURCE_AD/DEST_AD
+    // are consumed by the DMA engine as an independent BUS MASTER, not
+    // by the ARM CPU -- when they target a PERIPHERAL (not RAM), they
+    // must use the VideoCore bus alias address (0x7Exxxxxx), never the
+    // ARM-side physical address (0x20xxxxxx) that only means anything
+    // from the ARM CPU's own MMU-translated viewpoint. dma_uart_init's
+    // own DMA_BASE=0x20007000 register writes are correct as-is (the
+    // ARM CPU itself is accessing the DMA controller's OWN registers
+    // directly there, not bus-mastering through it), but this DEST_AD
+    // -- UART0's DR register, the actual destination the DMA engine
+    // itself must reach as a bus master -- was wrong: 0x20201000 (ARM
+    // physical) instead of 0x7E201000 (VC bus alias, = 0x7E000000 +
+    // (0x20201000 - 0x20000000)). Writing to the wrong address faults
+    // nothing (hence CS never showing ERROR) and completes at full
+    // memory-bus speed with no real backpressure (hence the drastically
+    // too-fast completion) while never reaching the real UART0
+    // hardware at all -- exactly every observed symptom. Verified
+    // against the same two independent real sources already cited in
+    // this file's header comment for the byte-packing question: this
+    // ARM-vs-VC-bus addressing requirement for DMA peripheral targets
+    // is standard, widely-documented BCM2835 bare-metal practice (not
+    // modeled/enforced by QEMU's own bcm2835-dma.c, which is why this
+    // bug was invisible under every QEMU self-test run this project
+    // has ever done).
+    ldr r0, =0x7E201000    /* UART0 DR, VC bus alias -- DEST_AD, fixed
+                             * (DEST_INC=0) */
     str r0, [r1, #8]
     str r5, [r1, #12]      /* TXFR_LEN = len (bytes) */
     mov r0, #0
