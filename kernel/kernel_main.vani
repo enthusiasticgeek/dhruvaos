@@ -4909,19 +4909,27 @@ fn uart_puts(s: Str) -> i64 {
       i = i + 1;
     }
     let start_status: u32 = dma_uart_tx_start(scratch, (n * 4) as u32);
+    // TASK #357 real-HW follow-up (2026-10-17), eighth attempt: this
+    // function used to busy-wait HERE for the transfer's full
+    // completion before returning -- confirmed on real hardware to be
+    // a genuine, severe regression, not a correctness requirement:
+    // dharafs_init() (many back-to-back uart_puts calls interleaved
+    // with real SD I/O) took 3.6s with this busy-wait in place, vs
+    // ~230ms on the non-DMA path, long enough to blow the watchdog's
+    // deadline. Plain PIO uart_putc only blocks until the hardware
+    // FIFO has room for ONE more byte, not full drain -- successive
+    // short calls let the tail of each message keep draining in the
+    // background while the CPU moves on to the NEXT call's own work,
+    // overlapping real transmission time with real other work. Fully
+    // blocking here on EVERY call serialized every message's entire
+    // wire time with zero overlap, the opposite of DMA's whole point
+    // (freeing the CPU, not parking it in a spin loop). The ONLY
+    // correctness-critical synchronization is the pre-write busy-wait
+    // above, guarding the shared scratch buffer against a still-in-
+    // flight prior transfer -- this call's own transfer is left
+    // running in the background; the NEXT uart_puts call's own
+    // pre-write wait is what guarantees strict wire ordering.
     if start_status == (0 as u32) {
-      // 20,000,000 -- generously scaled up from dma_uart_tx_self_
-      // test's own already-real-HW-proven 1,000,000 cap for a 16-byte
-      // message (this path's own 512-byte cap is 32x longer): a loop
-      // this cheap (one extern call + compare + increment, no MMIO
-      // write of its own) costs nothing extra in the normal case,
-      // where dma_uart_tx_busy() reports done and this loop exits far
-      // earlier -- it only bounds the pathological "DMA somehow never
-      // completes" case, which this hardware has never shown.
-      let busy_iter: i64 = 0;
-      while (dma_uart_tx_busy() == (1 as u32)) && (busy_iter < 20000000) {
-        busy_iter = busy_iter + 1;
-      }
       used_dma = 1;
     }
   }
