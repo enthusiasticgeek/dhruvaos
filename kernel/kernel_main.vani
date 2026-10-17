@@ -4879,25 +4879,31 @@ fn uart_puts(s: Str) -> i64 {
       i = i + 1;
     }
     let start_status: u32 = dma_uart_tx_start(scratch, n as u32);
-    // TASK #357 real-HW follow-up, fifth attempt: two confirmed fixes
-    // (UARTDMACR.TXDMAE, scratch-buffer pre-write busy-wait) have NOT
-    // stopped every DMA-eligible literal from being dropped entirely
-    // (zero bytes reaching the wire, not partial/garbled) while
-    // separately-PIO'd numeric inserts survive -- identical, fully
-    // deterministic shape across repeated real-HW boots, ruling out a
-    // timing-dependent race. uart_puts_bounded+uart_put_hex32 are pure
-    // PIO (uart_putc_nonblocking), proven to never recurse into this
-    // same DMA branch, so this is safe to call from inside it.
+    // TASK #357 real-HW follow-up, sixth attempt: the fifth attempt's
+    // own uart_puts_bounded-based diagnostic labels ALSO came out
+    // dropped/garbled identically to the original SD DIAG literals --
+    // proving this isn't DMA-specific at all. uart_puts_bounded uses
+    // uart_putc_nonblocking, which queues into the TX ring buffer and
+    // relies on timer_tick_dispatch's idle-time drain pump -- NOT
+    // running yet this early in boot (before the scheduler starts),
+    // exactly the same already-documented constraint dma_uart_init's
+    // own diagnostics had to work around with dma_uart_init_diag_
+    // drain_wait. uart_put_hex32 survived because it uses BLOCKING
+    // uart_putc (direct to hardware), same as uart_puts's own non-DMA
+    // fallback loop below. Fix: use plain uart_puts (not _bounded) with
+    // every literal kept under UART_DMA_MIN_LEN (8) so it always takes
+    // uart_puts's own proven blocking fallback, regardless of the DMA
+    // flag -- never uart_puts_bounded/_nonblocking this early in boot.
     let post_start_cs: u32 = dma_uart_cs_read();
-    let _ = uart_puts_bounded("DMADIAG ss=");
+    let _ = diag_puts_blocking("D0 ss=");
     let _ = uart_put_hex32(start_status);
-    let _ = uart_puts_bounded(" n=");
+    let _ = diag_puts_blocking(" n=");
     let _ = uart_put_hex32(n as u32);
-    let _ = uart_puts_bounded(" pre=");
+    let _ = diag_puts_blocking(" pre=");
     let _ = uart_put_hex32(pre_busy_iter as u32);
-    let _ = uart_puts_bounded(" cs0=");
+    let _ = diag_puts_blocking(" cs0=");
     let _ = uart_put_hex32(post_start_cs);
-    let _ = uart_puts_bounded("\n");
+    let _ = diag_puts_blocking("\n");
     if start_status == (0 as u32) {
       // 20,000,000 -- generously scaled up from dma_uart_tx_self_
       // test's own already-real-HW-proven 1,000,000 cap for a 16-byte
@@ -4912,11 +4918,11 @@ fn uart_puts(s: Str) -> i64 {
         busy_iter = busy_iter + 1;
       }
       let post_cs: u32 = dma_uart_cs_read();
-      let _ = uart_puts_bounded("DMADIAG post busy_iter=");
+      let _ = diag_puts_blocking("D1 it=");
       let _ = uart_put_hex32(busy_iter as u32);
-      let _ = uart_puts_bounded(" cs=");
+      let _ = diag_puts_blocking(" cs=");
       let _ = uart_put_hex32(post_cs);
-      let _ = uart_puts_bounded("\n");
+      let _ = diag_puts_blocking("\n");
       used_dma = 1;
     }
   }
@@ -4983,6 +4989,36 @@ fn uart_puts_bounded(s: Str) -> i64 {
     }
   }
   let _ = dhruva_prio_unlock(saved_prio as i64);
+  return 0;
+}
+
+// Diagnostic-only (TASK #357 real-HW follow-up, sixth attempt): a
+// blocking-PIO twin of uart_puts_bounded, for use from INSIDE uart_
+// puts's own DMA branch where calling uart_puts itself would create a
+// self-recursive call-graph edge (confirmed: the vani stack-depth
+// analyzer correctly rejected every #[bounded_stack] task that
+// transitively calls uart_puts once uart_puts called itself, even
+// though the recursive call always took the short-string, non-DMA
+// branch at runtime -- static analysis can't see that). Also avoids
+// uart_puts_bounded's own uart_putc_nonblocking, which queues into the
+// TX ring buffer and relies on timer_tick_dispatch's idle-time drain
+// pump -- not running yet this early in boot, which is what made this
+// project's FIFTH #357 diagnostic attempt's own labels come out
+// dropped identically to the real bug under investigation. Uses plain
+// blocking uart_putc (direct to hardware), same primitive uart_puts's
+// own non-DMA fallback loop already relies on successfully. Not a
+// general-purpose replacement for uart_puts_bounded -- that function's
+// own WCET-safety reasoning (uart_putc's FIFO-full wait has no static
+// bound) still applies; this is strictly for pre-scheduler diagnostic
+// use where blocking briefly on a full FIFO is harmless.
+fn diag_puts_blocking(s: Str) -> i64 {
+  let n: i64 = str_len_bytes(s);
+  let i: i64 = 0;
+  while i < n {
+    let b: i64 = str_byte_at(s, i);
+    let _ = uart_putc(b);
+    i = i + 1;
+  }
   return 0;
 }
 
