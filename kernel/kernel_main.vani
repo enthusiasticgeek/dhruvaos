@@ -2215,6 +2215,10 @@ extern "C" fn dma_uart_init() -> i64;
 extern "C" fn dma_uart_tx_start(buf: mut ref i64, byte_count: u32) -> u32;
 #[stack_cost(bytes=8)]
 extern "C" fn dma_uart_tx_busy() -> u32;
+// Diagnostic only (TASK #357 real-HW follow-up, fifth attempt) -- see
+// boot/dma_uart_state.S's own header comment on dma_uart_cs_read.
+#[stack_cost(bytes=8)]
+extern "C" fn dma_uart_cs_read() -> u32;
 // Diagnostic-only, added to isolate a real driver bug from a QEMU
 // DMA-to-peripheral modeling gap -- see boot/dma_uart_state.S's own
 // header comment on dma_ram_copy_test for the full "why".
@@ -4875,6 +4879,25 @@ fn uart_puts(s: Str) -> i64 {
       i = i + 1;
     }
     let start_status: u32 = dma_uart_tx_start(scratch, n as u32);
+    // TASK #357 real-HW follow-up, fifth attempt: two confirmed fixes
+    // (UARTDMACR.TXDMAE, scratch-buffer pre-write busy-wait) have NOT
+    // stopped every DMA-eligible literal from being dropped entirely
+    // (zero bytes reaching the wire, not partial/garbled) while
+    // separately-PIO'd numeric inserts survive -- identical, fully
+    // deterministic shape across repeated real-HW boots, ruling out a
+    // timing-dependent race. uart_puts_bounded+uart_put_hex32 are pure
+    // PIO (uart_putc_nonblocking), proven to never recurse into this
+    // same DMA branch, so this is safe to call from inside it.
+    let post_start_cs: u32 = dma_uart_cs_read();
+    let _ = uart_puts_bounded("DMADIAG ss=");
+    let _ = uart_put_hex32(start_status);
+    let _ = uart_puts_bounded(" n=");
+    let _ = uart_put_hex32(n as u32);
+    let _ = uart_puts_bounded(" pre=");
+    let _ = uart_put_hex32(pre_busy_iter as u32);
+    let _ = uart_puts_bounded(" cs0=");
+    let _ = uart_put_hex32(post_start_cs);
+    let _ = uart_puts_bounded("\n");
     if start_status == (0 as u32) {
       // 20,000,000 -- generously scaled up from dma_uart_tx_self_
       // test's own already-real-HW-proven 1,000,000 cap for a 16-byte
@@ -4888,6 +4911,12 @@ fn uart_puts(s: Str) -> i64 {
       while (dma_uart_tx_busy() == (1 as u32)) && (busy_iter < 20000000) {
         busy_iter = busy_iter + 1;
       }
+      let post_cs: u32 = dma_uart_cs_read();
+      let _ = uart_puts_bounded("DMADIAG post busy_iter=");
+      let _ = uart_put_hex32(busy_iter as u32);
+      let _ = uart_puts_bounded(" cs=");
+      let _ = uart_put_hex32(post_cs);
+      let _ = uart_puts_bounded("\n");
       used_dma = 1;
     }
   }

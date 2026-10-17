@@ -654,6 +654,34 @@ dma_uart_tx_busy_done:
     pop {r4, lr}
     bx lr
 
+/* dma_uart_cs_read() -> u32 -- diagnostic only (TASK #357 real-HW
+ * follow-up, fifth attempt): raw CS register readback, not just the
+ * ACTIVE bit dma_uart_tx_busy() isolates. Needed to distinguish "the
+ * transfer genuinely completed" from "ERROR/some other condition
+ * cleared ACTIVE without the transfer actually moving real bytes" --
+ * two confirmed fixes (UARTDMACR.TXDMAE, scratch-buffer pre-write
+ * busy-wait) have not stopped every DMA-eligible literal from being
+ * dropped entirely (zero bytes on the wire) while separately-PIO'd
+ * numeric inserts survive, identically across repeated real-HW boots. */
+.global dma_uart_cs_read
+dma_uart_cs_read:
+    push {r4, lr}
+    ldr r1, =dma_uart_channel_valid
+    ldr r4, [r1]
+    cmp r4, #0
+    moveq r0, #0
+    beq dma_uart_cs_read_done
+    ldr r1, =dma_uart_channel_val
+    ldr r4, [r1]
+    ldr r1, =0x20007000    /* DMA_BASE */
+    add r1, r1, r4, lsl #8
+    ldr r4, [r1]
+    bl mem_barrier
+    mov r0, r4
+dma_uart_cs_read_done:
+    pop {r4, lr}
+    bx lr
+
 .global uart_dma_ready_set
 uart_dma_ready_set:
     ldr r1, =uart_dma_ready
