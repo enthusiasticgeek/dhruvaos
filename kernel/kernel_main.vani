@@ -2001,6 +2001,13 @@ extern "C" fn task_sleep_ticks(ticks: i64) -> i64;
 extern "C" fn dhruva_prio_lock(ceiling: i64) -> i64;
 #[stack_cost(bytes=8)]
 extern "C" fn dhruva_prio_unlock(base_priority: i64) -> i64;
+// User-requested (2026-10-17): masks IRQ+FIQ and spins forever --
+// see boot/context_switch.S's own header comment. Never returns;
+// bytes=1 is the attribute's own minimum (0 is rejected as invalid),
+// not a real claim about stack usage -- this function's actual body
+// has no push/pop at all.
+#[stack_cost(bytes=1)]
+extern "C" fn shutdown_halt_forever() -> i64;
 // Round 53: real, workload-independent scheduler/interrupt event
 // counters (boot/context_switch.S) -- see docs/TODO.md's own note on
 // why these are built now while a deadline/priority-inversion model
@@ -9593,21 +9600,6 @@ fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
 
   let next_block: u32 = dharafs_state_get_next_block();
   let log_start: u32 = dharafs_state_get_log_start();
-  // TASK #357 real-HW follow-up (2026-10-17), fourteenth attempt: with
-  // the SD/USB connection confirmed healthy again, boot STILL silently
-  // resets at this exact traced location (inside wifi_config_init's
-  // first dharafs_read call, which lands here on a dirindex miss) --
-  // this is a genuine, reproducible bug, not the earlier hardware
-  // flakiness. Printing the real scan bounds directly: if next_block
-  // is huge (this session's own dozens of real-HW reboots, each one
-  // through crashlog_boot_increment/dharafs writes, may have grown
-  // this log far larger than any prior test ever exercised), that's
-  // real, actionable evidence either way.
-  let _ = diag_puts_blocking("FLB ls=");
-  let _ = uart_put_hex32(log_start);
-  let _ = diag_puts_blocking(" nb=");
-  let _ = uart_put_hex32(next_block);
-  let _ = diag_puts_blocking("\n");
   let buf: mut ref i64 = dharafs_sd_scratch_get();
   let best_block: i64 = 0 - 1;
   let best_seq: u32 = 0 as u32;
@@ -31734,6 +31726,39 @@ fn shell_dispatch_heap() -> i64 {
   return 0;
 }
 
+// User-requested (2026-10-17, real-HW SD-corruption investigation,
+// task #357 follow-up): a hard power cut while the board might still
+// be mid-write to the SD card is what's suspected to have damaged
+// this session's own card (see feedback_dhruva_realhw_power_cycle_
+// safety memory note). DhruvaOS had no way to signal "nothing is
+// writing, it's genuinely safe to pull power now" -- this is that
+// signal. Root-gated like every other admin-ish command here (sshkey/
+// wifikey/kernelupload/kernelslot all share this exact check).
+//
+// Deliberately does NOT run dharafs_compact() first: compaction does
+// MORE writes, working against the "minimize write exposure right
+// before a power cut" goal this command exists for, not toward it.
+// Every write this kernel makes is already synchronous (sdhost_write_
+// block blocks until the hardware confirms completion), so there is
+// no software write-buffer to flush -- the only real risk is a write
+// genuinely IN FLIGHT at the moment of this call, which by definition
+// can't still be running once shell_dispatch() itself is running
+// (single-core, this call IS the currently-running code). Once the
+// banner below has reached the UART, shutdown_halt_forever() (boot/
+// context_switch.S) masks IRQ+FIQ and spins forever -- the scheduler
+// can never fire again, so nothing in this kernel can touch the SD
+// card (or anything else) after this point. Never returns.
+fn shell_dispatch_shutdown() -> i64 {
+  if dharafs_user_get_uid() != (0 as u32) {
+    let _ = uart_puts("shutdown: permission denied (root only)\n");
+    return 0;
+  }
+  let _ = uart_puts("\n");
+  let _ = uart_puts("Dhruva: halting. No further writes will occur.\n");
+  let _ = uart_puts("*** SAFE TO POWER OFF NOW ***\n");
+  return shutdown_halt_forever();
+}
+
 // Round 71: shell front end for general-purpose GPIO (see the driver
 // functions and their own header comment above `gpio_self_check`).
 // `<pin>` is a plain decimal 0-53 (the SoC's full real register
@@ -33212,6 +33237,10 @@ fn shell_dispatch() -> i64 {
 
   if shell_word_matches(line_buf, 0, cmd_end, "heap") == 1 {
     return shell_dispatch_heap();
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "shutdown") == 1 {
+    return shell_dispatch_shutdown();
   }
 
   if shell_word_matches(line_buf, 0, cmd_end, "crashlog") == 1 {

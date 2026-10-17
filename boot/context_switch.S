@@ -2850,6 +2850,33 @@ mem_barrier:
     mov r1, #0
     bx lr
 
+/* void shutdown_halt_forever(void) -- user-requested (2026-10-17,
+ * real-HW SD-corruption investigation, task #357 follow-up): a hard
+ * power cut while the board might still be mid-write to the SD card
+ * is what's suspected to have damaged this session's own card (see
+ * feedback_dhruva_realhw_power_cycle_safety memory note) -- DhruvaOS
+ * had no way to tell the user "nothing is writing, it's genuinely
+ * safe to pull power now" versus "a write might still be in flight".
+ * This is that signal's implementation: called ONLY from shell_
+ * dispatch_shutdown (kernel/kernel_main.vani) after that function's
+ * own "safe to power off" banner has already reached the UART.
+ *
+ * Masks BOTH IRQ and FIQ (unlike fault_data_abort/fault_prefetch_
+ * abort's own halt loop in boot/rpi1/vectors.S, which only needs an
+ * explicit `cpsid f` -- IRQ is already masked for them by the
+ * hardware's own exception-entry behavior, since they're real
+ * exceptions; this is a normal SVC-mode call, not a trap, so nothing
+ * has masked IRQ yet) -- guarantees the scheduler's own timer tick
+ * can never fire again after this point, so NOTHING in this kernel
+ * can touch the SD card (or anything else) once the banner has
+ * printed. Never returns, same shape as that same vectors.S halt
+ * loop -- `b .` is the only genuinely correct way to express "stop
+ * here forever" on this core. */
+.global shutdown_halt_forever
+shutdown_halt_forever:
+    cpsid if
+    b .
+
 /* u32 scheduler_get_tick_count() -- round 22 (2026-08-28): read-only
  * access to this whole scheduler's own notion of elapsed time (see
  * this file's own header comment on tick_count, and irq_entry.S's
