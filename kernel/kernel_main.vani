@@ -4871,14 +4871,44 @@ fn uart_puts(s: Str) -> i64 {
     while (dma_uart_tx_busy() == (1 as u32)) && (pre_busy_iter < 20000000) {
       pre_busy_iter = pre_busy_iter + 1;
     }
+    // TASK #357 real-HW follow-up (2026-10-17), seventh attempt: THE
+    // actual data-corruption root cause, found via the D0/D1
+    // diagnostics once the VC-bus DEST_AD fix (above commit) finally
+    // got real bytes reaching the wire at all -- confirmed byte-exact
+    // against raw hardware output, not theorized: this DMA engine has
+    // NO native byte-width mode (see dma_uart_init's own header
+    // comment -- SRC_WIDTH/DEST_WIDTH are only 32-bit or 128-bit), and
+    // SRC_INC increments the source address by the configured WIDTH
+    // (4 bytes here), not by 1 byte, per the datasheet's own SRC_INC
+    // field description. With a densely-packed byte buffer as
+    // SOURCE_AD, each 32-bit source read pulls in 4 real bytes at
+    // once, but the fixed, 8-bit-wide UART0 DR destination (DEST_INC=0)
+    // only latches the LOW byte of each 32-bit bus write and silently
+    // discards the other 3 -- so only every 4th source byte (offsets
+    // 0,4,8,...) ever reached the wire. Confirmed byte-for-byte: for
+    // "SD DIAG: sdhost_init entry, TIMER_CLO=0x", indices 0,4,8,12,...
+    // spell out exactly "SI oi rTRO", the real garbled output captured
+    // on real hardware. This project's own earlier comment ("the DMA
+    // can deal with byte aligned transfers... a plain byte array is
+    // correct") was a genuine misread -- the datasheet's "buffering and
+    // packing misaligned accesses" text describes memory-to-memory
+    // transfers where BOTH ends increment, not a fixed-address 8-bit
+    // peripheral register paired with 32-bit-wide source reads.
+    // Fix: spread each real byte to its own 4-byte-aligned slot (byte i
+    // goes at scratch offset i*4, matching what the hardware already
+    // does with a 32-bit SRC_WIDTH) and tell the DMA engine to move
+    // n*4 bytes (n 32-bit beats) instead of n. The 3 padding bytes
+    // per slot are never inspected by the 8-bit-wide destination, so
+    // they're left as whatever the persistent scratch buffer already
+    // holds -- never a correctness-relevant value.
     let scratch: mut ref i64 = uart_dma_scratch_get();
     let i: i64 = 0;
     while i < n {
       let b: i64 = str_byte_at(s, i);
-      let _ = buf_write_byte(scratch, i as u32, b as u32);
+      let _ = buf_write_byte(scratch, (i * 4) as u32, b as u32);
       i = i + 1;
     }
-    let start_status: u32 = dma_uart_tx_start(scratch, n as u32);
+    let start_status: u32 = dma_uart_tx_start(scratch, (n * 4) as u32);
     // TASK #357 real-HW follow-up, sixth attempt: the fifth attempt's
     // own uart_puts_bounded-based diagnostic labels ALSO came out
     // dropped/garbled identically to the original SD DIAG literals --
@@ -46246,7 +46276,14 @@ fn kernel_main() -> i64 {
   // line ever runs, so it needs uart_dma_ready as an explicit runtime
   // gate rather than relying on call order like every other scratch
   // buffer here safely does.
-  let _ = uart_dma_scratch_set(dhruva_alloc_bytes(UART_DMA_SCRATCH_CAP));
+  // TASK #357 real-HW follow-up (2026-10-17), seventh attempt: this
+  // DMA engine moves 4 bytes per beat (no native byte-width mode) --
+  // uart_puts now spreads each real byte to its own 4-byte-aligned
+  // scratch slot (see that function's own comment), so the PHYSICAL
+  // buffer needs 4x UART_DMA_SCRATCH_CAP's real-byte-length bound, not
+  // 1x. UART_DMA_SCRATCH_CAP itself stays the max-real-string-length
+  // check uart_puts already uses -- only this allocation size changes.
+  let _ = uart_dma_scratch_set(dhruva_alloc_bytes(UART_DMA_SCRATCH_CAP * 4));
   // TASK #357 real-HW follow-up (2026-10-17): only mark DMA ready if
   // dma_uart_init() actually found a VideoCore-firmware-safe channel
   // to use -- see its own header comment (boot/dma_uart_state.S) for
