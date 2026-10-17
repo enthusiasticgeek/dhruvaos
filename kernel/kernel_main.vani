@@ -9593,6 +9593,21 @@ fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
 
   let next_block: u32 = dharafs_state_get_next_block();
   let log_start: u32 = dharafs_state_get_log_start();
+  // TASK #357 real-HW follow-up (2026-10-17), fourteenth attempt: with
+  // the SD/USB connection confirmed healthy again, boot STILL silently
+  // resets at this exact traced location (inside wifi_config_init's
+  // first dharafs_read call, which lands here on a dirindex miss) --
+  // this is a genuine, reproducible bug, not the earlier hardware
+  // flakiness. Printing the real scan bounds directly: if next_block
+  // is huge (this session's own dozens of real-HW reboots, each one
+  // through crashlog_boot_increment/dharafs writes, may have grown
+  // this log far larger than any prior test ever exercised), that's
+  // real, actionable evidence either way.
+  let _ = diag_puts_blocking("FLB ls=");
+  let _ = uart_put_hex32(log_start);
+  let _ = diag_puts_blocking(" nb=");
+  let _ = uart_put_hex32(next_block);
+  let _ = diag_puts_blocking("\n");
   let buf: mut ref i64 = dharafs_sd_scratch_get();
   let best_block: i64 = 0 - 1;
   let best_seq: u32 = 0 as u32;
