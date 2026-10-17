@@ -4846,6 +4846,27 @@ fn uart_puts(s: Str) -> i64 {
   let n: i64 = str_len_bytes(s);
   let used_dma: i64 = 0;
   if (UART_DMA_ADOPT_FOR_REAL_HARDWARE == 1) && (uart_dma_ready_get() == (1 as u32)) && (n >= UART_DMA_MIN_LEN) && (n <= UART_DMA_SCRATCH_CAP) {
+    // TASK #357 real-HW follow-up (2026-10-17), fourth attempt: this
+    // function's own scratch buffer (uart_dma_scratch_get()) is ONE
+    // persistent buffer shared across every call -- dma_uart_tx_start's
+    // own busy-check (see its header comment) only guards against
+    // starting a SECOND transfer while a first is active; it does
+    // nothing to protect the buffer itself, which this function was
+    // about to overwrite via buf_write_byte below BEFORE ever calling
+    // dma_uart_tx_start. If a prior call's own busy-wait below exited
+    // (cap or genuine completion race) while that transfer's DMA engine
+    // was still mid-flight reading this exact buffer, overwriting it
+    // here corrupts BOTH the still-draining prior message and this new
+    // one -- confirmed on real hardware: back-to-back SD DIAG lines
+    // came out with their literal text dropped/garbled while the
+    // separately-PIO'd hex digit insertions stayed intact, exactly the
+    // signature of the scratch buffer being clobbered mid-DMA-read.
+    // Wait for the buffer to be genuinely free FIRST, same iteration
+    // cap reasoning as the post-start wait below.
+    let pre_busy_iter: i64 = 0;
+    while (dma_uart_tx_busy() == (1 as u32)) && (pre_busy_iter < 20000000) {
+      pre_busy_iter = pre_busy_iter + 1;
+    }
     let scratch: mut ref i64 = uart_dma_scratch_get();
     let i: i64 = 0;
     while i < n {
