@@ -162,15 +162,52 @@ def cmd_seed(args):
     if not args.device:
         _ensure_image_size(args.target, min_size)
 
-    record = pack_state(
-        generation=1, active_slot=0, preferred_slot=0,
-        attempt_count=0, bootlimit=DEFAULT_BOOTLIMIT,
-        slot_a_ready=1, slot_b_ready=0,
-        slot_a_len=kernel_len, slot_b_len=0,
-        slot_a_sha256=digest, slot_b_sha256=b"\x00" * 32,
-    )
+    slot = getattr(args, "slot", "a")
+    base_block = SLOT_A_BASE_BLOCK if slot == "a" else SLOT_B_BASE_BLOCK
+
+    # TASK #357 real-HW follow-up (2026-10-17): seeding slot B (the
+    # candidate-under-test slot) must NOT wipe slot A's own already-
+    # verified record -- slot A is exactly what stage0's attempt-
+    # counter/bootlimit auto-fallback needs intact to revert to if the
+    # candidate in slot B hangs. Read whatever valid record is already
+    # on the card first and carry its slot-A fields forward unchanged;
+    # only fall back to a from-scratch generation-1 record (the
+    # original single-slot-A behavior) when no valid record exists yet
+    # or --slot a was asked for explicitly.
+    if slot == "b":
+        with open(args.target, "rb") as f:
+            existing, _which = read_slot_state(f)
+        if existing is None:
+            print("ERROR: --slot b requires an existing valid slot-state "
+                  "record (slot A must already be seeded) -- refusing to "
+                  "seed B onto a fresh/corrupt card with no fallback "
+                  "target.", file=sys.stderr)
+            return 1
+        if not existing["slot_a_ready"]:
+            print("ERROR: --slot b requires slot A to be ready (the auto-"
+                  "fallback target) -- current record has slot_a_ready=0.",
+                  file=sys.stderr)
+            return 1
+        record = pack_state(
+            generation=existing["generation"] + 1,
+            active_slot=1, preferred_slot=existing["preferred_slot"],
+            attempt_count=0, bootlimit=existing["bootlimit"],
+            slot_a_ready=existing["slot_a_ready"], slot_b_ready=1,
+            slot_a_len=existing["slot_a_len"], slot_b_len=kernel_len,
+            slot_a_sha256=bytes.fromhex(existing["slot_a_sha256"]),
+            slot_b_sha256=digest,
+            last_reset_reason=0,
+        )
+    else:
+        record = pack_state(
+            generation=1, active_slot=0, preferred_slot=0,
+            attempt_count=0, bootlimit=DEFAULT_BOOTLIMIT,
+            slot_a_ready=1, slot_b_ready=0,
+            slot_a_len=kernel_len, slot_b_len=0,
+            slot_a_sha256=digest, slot_b_sha256=b"\x00" * 32,
+        )
     with open(args.target, "r+b") as f:
-        f.seek(SLOT_A_BASE_BLOCK * BLOCK_SIZE)
+        f.seek(base_block * BLOCK_SIZE)
         f.write(kernel_bytes)
         write_block(f, SLOT_STATE_BLOCK_A, record)
         write_block(f, SLOT_STATE_BLOCK_B, record)
@@ -203,8 +240,10 @@ def cmd_seed(args):
                   f"cannot verify the write actually reached the card.", file=sys.stderr)
             return 1
 
+    state_key = "slot_a_sha256" if slot == "a" else "slot_b_sha256"
+
     with open(args.target, "rb") as f:
-        f.seek(SLOT_A_BASE_BLOCK * BLOCK_SIZE)
+        f.seek(base_block * BLOCK_SIZE)
         readback_kernel = f.read(kernel_len)
         readback_digest = hashlib.sha256(readback_kernel).digest()
         readback_state_a = unpack_state(read_block(f, SLOT_STATE_BLOCK_A))
@@ -217,15 +256,15 @@ def cmd_seed(args):
               f"confirm the card is genuinely inserted and re-run). Do NOT trust this seed.",
               file=sys.stderr)
         return 1
-    if readback_state_a is None or readback_state_a["slot_a_sha256"] != digest.hex():
+    if readback_state_a is None or readback_state_a[state_key] != digest.hex():
         print("ERROR: slot-state block A verification FAILED after readback.", file=sys.stderr)
         return 1
-    if readback_state_b is None or readback_state_b["slot_a_sha256"] != digest.hex():
+    if readback_state_b is None or readback_state_b[state_key] != digest.hex():
         print("ERROR: slot-state block B verification FAILED after readback.", file=sys.stderr)
         return 1
 
-    print(f"Seeded slot A with {kernel_path} ({kernel_len} bytes, "
-          f"sha256={digest.hex()}), wrote slot-state generation 1 to "
+    print(f"Seeded slot {slot.upper()} with {kernel_path} ({kernel_len} bytes, "
+          f"sha256={digest.hex()}), wrote slot-state generation {readback_state_a['generation']} to "
           f"blocks {SLOT_STATE_BLOCK_A}/{SLOT_STATE_BLOCK_B}. "
           f"VERIFIED via blockdev --flushbufs + fresh readback.")
     return 0
@@ -282,8 +321,13 @@ def main():
                     help="target is a real block device (skip sparse-file sizing)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    seed_p = sub.add_parser("seed", help="write a kernel binary into slot A + a fresh slot-state record")
-    seed_p.add_argument("kernel_bin", help="path to the flat kernel binary to seed into slot A")
+    seed_p = sub.add_parser("seed", help="write a kernel binary into a slot + slot-state record")
+    seed_p.add_argument("kernel_bin", help="path to the flat kernel binary to seed")
+    seed_p.add_argument("--slot", choices=["a", "b"], default="a",
+                         help="which slot to seed (default: a, writes a fresh "
+                              "generation-1 record). 'b' preserves the existing "
+                              "slot A record as the auto-fallback target and "
+                              "sets active_slot=B for testing the candidate.")
 
     sub.add_parser("status", help="print the current slot-state record")
     sub.add_parser("verify", help="recompute sha256 over each ready slot's stored length, compare to the recorded digest")
