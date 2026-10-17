@@ -198,6 +198,7 @@ dma_uart_init:
 
     mov r0, r4
     bl mbox_property_call
+#ifdef DMA_UART_INIT_DIAG_FOR_REAL_HARDWARE
     mov r2, r0                       /* stash mbox status -- sched_diag_
                                        * puts/put_hex32 both take their
                                        * own argument in r0 but never
@@ -209,7 +210,11 @@ dma_uart_init:
     bl sched_diag_put_hex32
     ldr r0, =dma_uart_init_diag_nl
     bl sched_diag_puts
+    bl dma_uart_init_diag_drain_wait
     cmp r2, #0
+#else
+    cmp r0, #0
+#endif
     bne dma_uart_init_no_channel   /* mailbox call itself failed --
                                      * conservative: treat as "no
                                      * channel known safe", not "assume
@@ -217,12 +222,15 @@ dma_uart_init:
 
     ldr r5, [r4, #20]      /* r5 = firmware's own available-channel
                              * bitmask, bit N = channel N safe to use */
+#ifdef DMA_UART_INIT_DIAG_FOR_REAL_HARDWARE
     ldr r0, =dma_uart_init_diag_mask
     bl sched_diag_puts
     mov r0, r5
     bl sched_diag_put_hex32
     ldr r0, =dma_uart_init_diag_nl
     bl sched_diag_puts
+    bl dma_uart_init_diag_drain_wait
+#endif
     mov r6, #0             /* r6 = candidate channel, scan 0..15 */
 dma_uart_init_scan:
     cmp r6, #16
@@ -235,12 +243,15 @@ dma_uart_init_scan:
     b dma_uart_init_scan
 
 dma_uart_init_found:
+#ifdef DMA_UART_INIT_DIAG_FOR_REAL_HARDWARE
     ldr r0, =dma_uart_init_diag_chan
     bl sched_diag_puts
     mov r0, r6
     bl sched_diag_put_hex32
     ldr r0, =dma_uart_init_diag_nl
     bl sched_diag_puts
+    bl dma_uart_init_diag_drain_wait
+#endif
 
     ldr r1, =dma_uart_channel_val
     str r6, [r1]
@@ -255,6 +266,7 @@ dma_uart_init_found:
     str r0, [r1]
     bl mem_barrier
 
+#ifdef DMA_UART_INIT_DIAG_FOR_REAL_HARDWARE
     ldr r0, =dma_uart_init_diag_pre_enable_write
     bl sched_diag_puts
 
@@ -273,6 +285,8 @@ dma_uart_init_found:
      * was picked at all. */
     ldr r0, =dma_uart_init_diag_nl
     bl sched_diag_puts
+    bl dma_uart_init_diag_drain_wait
+#endif
 
     ldr r4, =0x20007000   /* DMA_BASE -- channel r6's CS register is
                             * DMA_BASE + r6*0x100, same uniform layout
@@ -282,10 +296,13 @@ dma_uart_init_found:
     str r0, [r4]
     bl mem_barrier
 
+#ifdef DMA_UART_INIT_DIAG_FOR_REAL_HARDWARE
     ldr r0, =dma_uart_init_diag_post_reset_write
     bl sched_diag_puts
     ldr r0, =dma_uart_init_diag_nl
     bl sched_diag_puts
+    bl dma_uart_init_diag_drain_wait
+#endif
 
     mov r0, #0
     mov r1, #0
@@ -293,11 +310,69 @@ dma_uart_init_found:
     bx lr
 
 dma_uart_init_no_channel:
+#ifdef DMA_UART_INIT_DIAG_FOR_REAL_HARDWARE
     ldr r0, =dma_uart_init_diag_no_channel
     bl sched_diag_puts
+    bl dma_uart_init_diag_drain_wait
+#endif
     mov r0, #1
     mov r1, #0
     pop {r4, r5, r6, lr}
+    bx lr
+
+#ifdef DMA_UART_INIT_DIAG_FOR_REAL_HARDWARE
+/* void dma_uart_init_diag_drain_wait() -- forces the UART TX ring
+ * (boot/uart_tx_ring_state.S) empty before this function's own debug
+ * prints continue, debugging-only helper added alongside this round's
+ * diagnostics. Needed because the ring's only idle-time drain pump
+ * (uart_tx_ring_drain_only, called from timer_tick_dispatch every
+ * tick) isn't running yet this early in boot -- the scheduler/timer
+ * hasn't started. Without this, each sched_diag_puts call only
+ * drains up to 16 bytes itself (the PL011 FIFO depth), so printing
+ * several diagnostic lines back-to-back with no intervening tick
+ * reliably overflows the ring's 64-byte capacity and SILENTLY drops
+ * everything past it -- confirmed live this round: every one of 3
+ * real-HW boot attempts cut off at the exact identical byte, deep
+ * inside the very first diagnostic string, well before any DMA
+ * register was even touched.
+ *
+ * Bounded by REAL ELAPSED TIME (TIMER_CLO, microseconds), not by a
+ * fixed iteration count -- a fast busy-spin loop with no per-
+ * iteration delay can execute tens of thousands of iterations in
+ * far less wall-clock time than the physical UART needs to drain
+ * even one FIFO's worth of bytes at this boot's measured ~4573 baud
+ * (~1.75ms/byte, ~112ms worst case for a full 64-byte ring) -- an
+ * iteration-count bound would appear to "wait" while actually giving
+ * up almost immediately. 200ms is comfortably over that worst case.
+ *
+ * GATED by DMA_UART_INIT_DIAG_FOR_REAL_HARDWARE (undefined by default
+ * -- see build.sh's own DMA_UART_STATE_CFLAGS passthrough), NOT a
+ * runtime flag: the first version of this diagnostic was unconditional
+ * and broke the normal QEMU regression (phase4_milestone.py went from
+ * a few seconds to 3m42s with 2 spurious FAILUREs) because dma_uart_
+ * init() itself is called unconditionally every boot regardless of
+ * UART_DMA_ADOPT_FOR_REAL_HARDWARE (see kernel_main.vani's own call
+ * site) -- this real-time wait must never run outside an explicit,
+ * deliberately-built real-HW debug image. */
+.global dma_uart_init_diag_drain_wait
+dma_uart_init_diag_drain_wait:
+    push {r4, r5, r6, r7, lr}
+    ldr r7, =0x20003004    /* TIMER_CLO -- free-running microsecond
+                             * counter, same register this project's
+                             * own BOOT DIAG checkpoints already read */
+    ldr r6, [r7]            /* r6 = start time */
+dma_uart_init_diag_drain_wait_loop:
+    bl uart_tx_ring_drain_only
+    bl uart_tx_ring_is_empty
+    cmp r0, #1
+    beq dma_uart_init_diag_drain_wait_done   /* ring empty -- done early */
+    ldr r4, [r7]
+    sub r4, r4, r6          /* elapsed (unsigned sub handles wrap) */
+    ldr r5, =200000         /* 200ms bound */
+    cmp r4, r5
+    bls dma_uart_init_diag_drain_wait_loop
+dma_uart_init_diag_drain_wait_done:
+    pop {r4, r5, r6, r7, lr}
     bx lr
 
 .section ".rodata"
@@ -309,6 +384,7 @@ dma_uart_init_diag_post_reset_write: .asciz "DMA INIT DIAG: CS RESET write done"
 dma_uart_init_diag_no_channel:    .asciz "DMA INIT DIAG: no firmware-safe channel, staying on PIO\n"
 dma_uart_init_diag_nl:            .asciz "\n"
 .section ".text"
+#endif
 
 /* dma_uart_tx_start(buf_ptr: u32, len: u32) -> u32 -- r0=buf_ptr,
  * r1=len on entry. Populates the control block and starts the

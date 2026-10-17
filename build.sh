@@ -303,7 +303,7 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/uart_capture_state.S" -o "${BUILD_DIR}/uart_capture_state.o"
 
-arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm ${DMA_UART_STATE_CFLAGS:-} \
   "${ROOT}/boot/dma_uart_state.S" -o "${BUILD_DIR}/dma_uart_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \

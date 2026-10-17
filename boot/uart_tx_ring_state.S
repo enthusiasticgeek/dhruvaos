@@ -317,3 +317,21 @@ drain_only_done:
     mov r1, #0
     pop {r4, r5, r6, r7, lr}
     bx lr
+
+/* u32 uart_tx_ring_is_empty() -- returns 1 if head==tail, 0 otherwise.
+ * head/tail are deliberately private (.bss, no .global) to this file
+ * -- this accessor exists so another file (boot/dma_uart_state.S's
+ * own debug drain-wait helper, task #357 real-HW follow-up) can poll
+ * ring-empty without reaching into that private state directly, same
+ * discipline as every other shared-state accessor in this project. */
+.global uart_tx_ring_is_empty
+uart_tx_ring_is_empty:
+    ldr r0, =uart_tx_ring_head
+    ldr r0, [r0]
+    ldr r1, =uart_tx_ring_tail
+    ldr r1, [r1]
+    cmp r0, r1
+    moveq r0, #1
+    movne r0, #0
+    mov r1, #0
+    bx lr
