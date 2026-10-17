@@ -198,7 +198,18 @@ dma_uart_init:
 
     mov r0, r4
     bl mbox_property_call
-    cmp r0, #0
+    mov r2, r0                       /* stash mbox status -- sched_diag_
+                                       * puts/put_hex32 both take their
+                                       * own argument in r0 but never
+                                       * touch r2, see their own header
+                                       * comments in context_switch.S */
+    ldr r0, =dma_uart_init_diag_mbox_status
+    bl sched_diag_puts
+    mov r0, r2
+    bl sched_diag_put_hex32
+    ldr r0, =dma_uart_init_diag_nl
+    bl sched_diag_puts
+    cmp r2, #0
     bne dma_uart_init_no_channel   /* mailbox call itself failed --
                                      * conservative: treat as "no
                                      * channel known safe", not "assume
@@ -206,6 +217,12 @@ dma_uart_init:
 
     ldr r5, [r4, #20]      /* r5 = firmware's own available-channel
                              * bitmask, bit N = channel N safe to use */
+    ldr r0, =dma_uart_init_diag_mask
+    bl sched_diag_puts
+    mov r0, r5
+    bl sched_diag_put_hex32
+    ldr r0, =dma_uart_init_diag_nl
+    bl sched_diag_puts
     mov r6, #0             /* r6 = candidate channel, scan 0..15 */
 dma_uart_init_scan:
     cmp r6, #16
@@ -218,6 +235,13 @@ dma_uart_init_scan:
     b dma_uart_init_scan
 
 dma_uart_init_found:
+    ldr r0, =dma_uart_init_diag_chan
+    bl sched_diag_puts
+    mov r0, r6
+    bl sched_diag_put_hex32
+    ldr r0, =dma_uart_init_diag_nl
+    bl sched_diag_puts
+
     ldr r1, =dma_uart_channel_val
     str r6, [r1]
     ldr r1, =dma_uart_channel_valid
@@ -231,6 +255,25 @@ dma_uart_init_found:
     str r0, [r1]
     bl mem_barrier
 
+    ldr r0, =dma_uart_init_diag_pre_enable_write
+    bl sched_diag_puts
+
+    /* TASK #357 real-HW follow-up (2026-10-17), second attempt: the
+     * ENABLE write above is a read-modify-write of a SHARED register
+     * every DMA channel's bit lives in -- diagnostic print placed
+     * AFTER it (not before) specifically to tell whether a hang is
+     * already happening here (shared ENABLE register access itself
+     * stalling the bus) versus only at the per-channel CS register
+     * below. The first real-HW trial's own comment (see this file's
+     * header) says the old hardcoded-channel-5 code hung "right at
+     * the channel-5 RESET write" specifically -- this print, if it's
+     * the LAST thing seen before a hang, confirms that same exact
+     * instruction is still the culprit even with a firmware-selected
+     * channel, which would mean the hang is not about WHICH channel
+     * was picked at all. */
+    ldr r0, =dma_uart_init_diag_nl
+    bl sched_diag_puts
+
     ldr r4, =0x20007000   /* DMA_BASE -- channel r6's CS register is
                             * DMA_BASE + r6*0x100, same uniform layout
                             * every channel (0-15) shares on this SoC */
@@ -239,16 +282,33 @@ dma_uart_init_found:
     str r0, [r4]
     bl mem_barrier
 
+    ldr r0, =dma_uart_init_diag_post_reset_write
+    bl sched_diag_puts
+    ldr r0, =dma_uart_init_diag_nl
+    bl sched_diag_puts
+
     mov r0, #0
     mov r1, #0
     pop {r4, r5, r6, lr}
     bx lr
 
 dma_uart_init_no_channel:
+    ldr r0, =dma_uart_init_diag_no_channel
+    bl sched_diag_puts
     mov r0, #1
     mov r1, #0
     pop {r4, r5, r6, lr}
     bx lr
+
+.section ".rodata"
+dma_uart_init_diag_mbox_status: .asciz "DMA INIT DIAG: mbox status=0x"
+dma_uart_init_diag_mask:         .asciz "DMA INIT DIAG: firmware channel mask=0x"
+dma_uart_init_diag_chan:         .asciz "DMA INIT DIAG: selected channel=0x"
+dma_uart_init_diag_pre_enable_write: .asciz "DMA INIT DIAG: ENABLE register write done"
+dma_uart_init_diag_post_reset_write: .asciz "DMA INIT DIAG: CS RESET write done"
+dma_uart_init_diag_no_channel:    .asciz "DMA INIT DIAG: no firmware-safe channel, staying on PIO\n"
+dma_uart_init_diag_nl:            .asciz "\n"
+.section ".text"
 
 /* dma_uart_tx_start(buf_ptr: u32, len: u32) -> u32 -- r0=buf_ptr,
  * r1=len on entry. Populates the control block and starts the
