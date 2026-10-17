@@ -304,6 +304,27 @@ dma_uart_init_found:
     bl dma_uart_init_diag_drain_wait
 #endif
 
+    /* TASK #357 real-HW follow-up (2026-10-17), third attempt: the
+     * MISSING piece this whole time -- the DMA channel itself was
+     * always correctly configured to wait for UART0 TX's own DREQ
+     * (PERMAP=12 in dma_uart_tx_start's own TI word) before paying
+     * out each byte, but nothing anywhere in this codebase EVER
+     * enabled DMA mode on the UART0 PERIPHERAL side (PL011's own
+     * UARTDMACR register, offset 0x48 off UART0's 0x20201000 base --
+     * confirmed via grep: no prior reference to this register exists
+     * at all) -- without UARTDMACR.TXDMAE (bit 1) set, UART0 never
+     * asserts that DREQ line in the first place, so the DMA channel
+     * waits for a request that can never arrive. This is set exactly
+     * ONCE here (not per-transfer in dma_uart_tx_start) since it's a
+     * one-time peripheral-mode switch, the same "configure once at
+     * init" shape as the DMA channel's own global ENABLE bit just
+     * above, not per-CB state like TI/SOURCE_AD/etc. */
+    ldr r1, =0x20201048   /* UART0 DMACR */
+    ldr r0, [r1]
+    orr r0, r0, #0x2      /* TXDMAE */
+    str r0, [r1]
+    bl mem_barrier
+
     mov r0, #0
     mov r1, #0
     pop {r4, r5, r6, lr}
