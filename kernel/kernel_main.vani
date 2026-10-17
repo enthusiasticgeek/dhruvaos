@@ -11189,25 +11189,11 @@ fn crashlog_record_crash(crash_type: u32, fault_addr: u32, status: u32, pc: u32,
 // #[no_heap] needed), but built from the exact same primitives for
 // consistency.
 fn crashlog_boot_increment() -> i64 {
-  // TASK #357 real-HW follow-up (2026-10-17), tenth attempt: TEMPORARY
-  // pinpoint diagnostic -- boot reaches checkpoint 8's own print
-  // cleanly (confirmed byte-exact, correctly ordered) but never reaches
-  // checkpoint 9, with the board resetting silently, zero output, in
-  // between. dharafs_init() itself was ruled out as the cause (its own
-  // ~3.46s cost is identical with DMA on or off -- a real, pre-existing
-  // cost, not a regression). crashlog_boot_increment() is the only
-  // thing that runs in that exact window. diag_puts_blocking is pure
-  // blocking PIO (no DMA, no ring) -- safe to use here regardless of
-  // whatever this function's own SD I/O does to any in-flight state.
-  let _ = diag_puts_blocking("CBI-A\n");
   let _ = crashlog_read_meta();
-  let _ = diag_puts_blocking("CBI-B\n");
   let meta: mut ref i64 = crashlog_meta_scratch_get();
   let count: u32 = buf_read_u32(meta, 0 as u32);
   let boot_count: u32 = buf_read_u32(meta, 4 as u32);
-  let result: i64 = crashlog_write_meta(count, boot_count + (1 as u32));
-  let _ = diag_puts_blocking("CBI-C\n");
-  return result;
+  return crashlog_write_meta(count, boot_count + (1 as u32));
 }
 
 // Crash type tags -- see crashlog_record_crash's own callers.
@@ -29228,18 +29214,8 @@ fn log_level_init() -> i64 {
 // bytes), so anything longer than this project's own buffers could
 // never have been a valid credential in the first place.
 fn wifi_config_init() -> i64 {
-  // TASK #357 real-HW follow-up (2026-10-17), twelfth attempt: P3
-  // (right after this function returns) never printed -- the hang is
-  // somewhere inside this function. It calls no uart_puts itself, only
-  // dharafs_read() + plain byte copies, so the real cause must be
-  // inside dharafs_read() (possibly a verbosity change from the
-  // log_level_init() call just before this one triggering a print deep
-  // in the SD/filesystem path for a config file that likely doesn't
-  // exist on this test card). Bracketing both reads to narrow further.
-  let _ = diag_puts_blocking("W0\n");
   let ssid_heap: mut ref i64 = dhruva_alloc_bytes(32);
   let ssid_read_len: i64 = dharafs_read("/config/wifi_ssid", ssid_heap);
-  let _ = diag_puts_blocking("W1\n");
   if ssid_read_len > 0 {
     let ssid_cap: i64 = if ssid_read_len > 32 { 32 } else { ssid_read_len };
     let ssid_dst: mut ref i64 = wifi_config_ssid_buf_ptr();
@@ -29254,7 +29230,6 @@ fn wifi_config_init() -> i64 {
 
   let pwd_heap: mut ref i64 = dhruva_alloc_bytes(64);
   let pwd_read_len: i64 = dharafs_read("/config/wifi_password", pwd_heap);
-  let _ = diag_puts_blocking("W2\n");
   if pwd_read_len > 0 {
     let pwd_cap: i64 = if pwd_read_len > 64 { 64 } else { pwd_read_len };
     let pwd_dst: mut ref i64 = wifi_config_password_buf_ptr();
@@ -46429,23 +46404,35 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("BOOT DIAG: checkpoint 8 (post-dharafs_init), TIMER_CLO=0x");
   let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
   let _ = uart_puts("\n");
-  // TASK #357 real-HW follow-up (2026-10-17), eleventh attempt: the
-  // tenth attempt's own CBI-A/B/C markers (inside crashlog_boot_
-  // increment itself) never printed at all -- execution never reaches
-  // that function. These 5 calls run BEFORE it; one of them is where
-  // the real hang/crash happens. Pinpointing with the same pure-PIO
-  // diag_puts_blocking markers, one per call.
-  let _ = diag_puts_blocking("P0\n");
+  // TASK #357 real-HW follow-up (2026-10-17), thirteenth attempt: the
+  // eleventh/twelfth attempts' own P0-P5/W0-W2 pinpoint markers
+  // narrowed the silent reset to somewhere inside wifi_config_init's
+  // first dharafs_read() call -- but that whole call chain (dharafs_
+  // read_raw -> dharafs_find_latest_block_raw -> dharafs_block_read)
+  // prints nothing at all, so this was never a DMA correctness bug in
+  // the first place. Same root cause as this project's own documented
+  // history right above dharafs_init()'s own call (TASK #353 REAL-HW
+  // FOLLOW-UP #3's comment, and watchdog_init()'s own header comment:
+  // "dharafs_init() 3.8s, configs+crashlog_boot_increment 20s...
+  // Five rounds of adding kicks one phase at a time") -- this project
+  // has hit this exact class of problem before. The real difference
+  // this round: with the DMA data-corruption bugs now fixed, every
+  // uart_puts call here actually transmits its full real wire time
+  // instead of mostly dropping bytes (silently fast before) -- for the
+  // first time, this phase pays its FULL legitimate cost, consuming
+  // watchdog margin that happened to be enough before purely because
+  // DMA output was accidentally truncated. Straightforward, low-risk
+  // fix matching this project's own five-times-precedented pattern:
+  // one more kick, right here, rather than chasing a phantom DMA bug
+  // in code that was already confirmed to print nothing at all.
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
+  }
   let _ = log_level_init();
-  let _ = diag_puts_blocking("P1\n");
   let _ = kernlog_config_init();
-  let _ = diag_puts_blocking("P2\n");
   let _ = wifi_config_init();
-  let _ = diag_puts_blocking("P3\n");
   let _ = ble_config_init();
-  let _ = diag_puts_blocking("P4\n");
   let _ = dhdl_init();
-  let _ = diag_puts_blocking("P5\n");
   let _ = crashlog_boot_increment();
   let _ = uart_puts("BOOT DIAG: checkpoint 9 (post-crashlog_boot_increment), TIMER_CLO=0x");
   let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
