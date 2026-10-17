@@ -94,6 +94,55 @@ uart_dma_ready:
                 * (those are all only ever read after their one real
                 * init point; uart_puts cannot make that assumption). */
 
+/* TASK #357 real-HW follow-up (2026-10-17): the first real-HW trial
+ * hung the board 3/3 times inside dma_uart_init() itself, right at the
+ * channel-5 RESET write, invisible under QEMU (34 prior rounds never
+ * caught it) -- QEMU's DMA model has no VideoCore-firmware-side
+ * activity to collide with. Root cause (not yet 100% proven on THIS
+ * board's specific firmware, but well-evidenced): per real Linux's own
+ * drivers/dma/bcm2835-dma.c (rpi-6.6.y, probe function), DMA channels
+ * are NOT a pure software free-for-all on real hardware -- the
+ * VideoCore GPU firmware actively reserves some channels for its own
+ * use, and WHICH ones is firmware-version-specific, which is exactly
+ * why Linux never hardcodes a channel: it reads a `brcm,dma-channel-
+ * mask` devicetree property that the firmware itself populates via the
+ * mailbox property tag RPI_FIRMWARE_GET_DMA_CHANNELS (0x00060001,
+ * confirmed in raspberrypi-firmware.h). This project has no
+ * devicetree, so dma_uart_init() below now calls that same tag
+ * directly (reusing boot/fb_state.S's own already-verified
+ * mbox_property_call transport, channel 8) and picks a channel the
+ * firmware itself reports as available, instead of the old hardcoded
+ * "channel 5, arbitrary but free" choice -- a real, unverified
+ * assumption this exact bug disproved. */
+.align 4
+.global dma_uart_channel_valid
+dma_uart_channel_valid:
+    .word 0    /* 0 = no channel selected yet / none available (the
+                * natural .bss zero-default -- `.bss` can't hold a
+                * non-zero initializer, caught by the assembler itself
+                * on the first build attempt here), 1 once dma_uart_
+                * init finds a real firmware-safe channel. Every one of
+                * dma_uart_tx_start/_busy/dma_ram_copy_test checks this
+                * FIRST and refuses to touch any DMA register at all
+                * while it's 0 -- not just a documented precondition,
+                * an enforced one, since dma_uart_channel_val alone
+                * (0 by default, a legitimate channel number) can't
+                * distinguish "channel 0 selected" from "never selected". */
+.global dma_uart_channel_val
+dma_uart_channel_val:
+    .word 0    /* meaningless until dma_uart_channel_valid == 1 */
+
+.align 4    /* mailbox buffer alignment requirement -- see fb_mbox_buf's
+             * own comment (boot/fb_state.S): mbox_property_call encodes
+             * (buf_addr & ~0xF) | channel, so the low 4 bits must
+             * already be zero. 4-word layout is exactly this call's
+             * real size (no padding needed): buf_size, req/resp code,
+             * tag id, value-buffer size, req/resp length, one value
+             * word, end tag -- 7 words = 28 bytes, comfortably within
+             * a 32-byte reservation. */
+dma_mbox_buf:
+    .space 32
+
 .align 5    /* 32-byte (256-bit) alignment -- the DMA Control Block's
              * own hard requirement (section 4.2.1.1), not a general
              * project convention. */
@@ -112,41 +161,109 @@ dma_uart_cb:
 
 .section ".text"
 
-/* dma_uart_init() -- one-time setup, called once at boot before any
- * dma_uart_tx_start call. Resets DMA channel 5 (RESET bit, W1SC, self-
- * clearing per the datasheet's own CS register description) and sets
- * its bit in the global ENABLE register -- never assumed already
- * enabled by reset default, matching this project's own established
- * "no trust, validate everything" discipline for every other
- * peripheral's own power/enable state. */
+/* dma_uart_init() -> i64 -- one-time setup, called once at boot before
+ * any dma_uart_tx_start call. TASK #357 real-HW follow-up (2026-10-17,
+ * see dma_uart_channel_val's own header comment for the full "why"):
+ * first queries the VideoCore firmware's own RPI_FIRMWARE_GET_DMA_
+ * CHANNELS mailbox tag (0x00060001) for a bitmask of channels the
+ * firmware itself reports safe to use, picks the lowest set bit, and
+ * only THEN resets/enables that channel (RESET bit, W1SC, self-
+ * clearing per the datasheet's own CS register description) -- never
+ * the old hardcoded "channel 5, arbitrary but free" assumption. Returns
+ * 0 on success (dma_uart_channel_val holds the real selected channel).
+ * Returns 1 if the mailbox call itself failed OR the firmware reported
+ * no available channel at all -- dma_uart_channel_valid stays at its
+ * .bss zero-default and NO DMA hardware register is ever touched in
+ * that case; the caller (kernel_main.vani) must not set uart_dma_ready
+ * in this case, same fail-safe-to-PIO contract every other failure
+ * path here already has. */
 .global dma_uart_init
 dma_uart_init:
-    push {r4, lr}
+    push {r4, r5, r6, lr}
+
+    ldr r4, =dma_mbox_buf
+    mov r0, #28
+    str r0, [r4, #0]       /* buf_size (bytes) */
+    mov r0, #0
+    str r0, [r4, #4]       /* req/resp code: 0 = process request */
+    ldr r0, =0x00060001    /* tag: RPI_FIRMWARE_GET_DMA_CHANNELS */
+    str r0, [r4, #8]
+    mov r0, #4
+    str r0, [r4, #12]      /* value buffer size: 4 bytes (one u32) */
+    mov r0, #0
+    str r0, [r4, #16]      /* req/resp length: 0 on send */
+    str r0, [r4, #20]      /* value word -- firmware overwrites with
+                             * the real bitmask on return */
+    str r0, [r4, #24]      /* end tag */
+
+    mov r0, r4
+    bl mbox_property_call
+    cmp r0, #0
+    bne dma_uart_init_no_channel   /* mailbox call itself failed --
+                                     * conservative: treat as "no
+                                     * channel known safe", not "assume
+                                     * anything is safe" */
+
+    ldr r5, [r4, #20]      /* r5 = firmware's own available-channel
+                             * bitmask, bit N = channel N safe to use */
+    mov r6, #0             /* r6 = candidate channel, scan 0..15 */
+dma_uart_init_scan:
+    cmp r6, #16
+    bge dma_uart_init_no_channel
+    mov r0, #1
+    mov r0, r0, lsl r6
+    tst r5, r0
+    bne dma_uart_init_found
+    add r6, r6, #1
+    b dma_uart_init_scan
+
+dma_uart_init_found:
+    ldr r1, =dma_uart_channel_val
+    str r6, [r1]
+    ldr r1, =dma_uart_channel_valid
+    mov r0, #1
+    str r0, [r1]
 
     ldr r1, =0x20007FF0   /* DMA global ENABLE register */
     ldr r0, [r1]
-    orr r0, r0, #(1 << 5) /* channel 5 */
+    mov r2, #1
+    orr r0, r0, r2, lsl r6
     str r0, [r1]
     bl mem_barrier
 
-    ldr r4, =0x20007500   /* DMA channel 5 CS register */
+    ldr r4, =0x20007000   /* DMA_BASE -- channel r6's CS register is
+                            * DMA_BASE + r6*0x100, same uniform layout
+                            * every channel (0-15) shares on this SoC */
+    add r4, r4, r6, lsl #8
     mov r0, #0x80000000   /* RESET (bit 31) */
     str r0, [r4]
     bl mem_barrier
 
-    pop {r4, lr}
+    mov r0, #0
+    mov r1, #0
+    pop {r4, r5, r6, lr}
+    bx lr
+
+dma_uart_init_no_channel:
+    mov r0, #1
+    mov r1, #0
+    pop {r4, r5, r6, lr}
     bx lr
 
 /* dma_uart_tx_start(buf_ptr: u32, len: u32) -> u32 -- r0=buf_ptr,
- * r1=len on entry. Populates the control block and starts DMA channel
- * 5 transferring len bytes from buf_ptr to the UART0 DR register,
+ * r1=len on entry. Populates the control block and starts the
+ * dynamically-selected DMA channel (see dma_uart_init's own header
+ * comment -- TASK #357 real-HW follow-up, no longer always channel 5)
+ * transferring len bytes from buf_ptr to the UART0 DR register,
  * DREQ-paced (PERMAP=12, UART TX). Returns 0 on success, 1 if len==0
  * (refuses to touch hardware for a no-op transfer rather than starting
  * a zero-length DMA whose behavior the datasheet doesn't document), 2
- * if channel 5 is already busy with a PRIOR transfer.
+ * if the selected channel is already busy with a PRIOR transfer, 3 if
+ * dma_uart_init never found a firmware-safe channel at all (dma_uart_
+ * channel_valid == 0 -- no DMA register touched in that case).
  *
- * Concurrency note, added after direct review: dma_uart_cb and channel
- * 5 are single, unlocked, shared global state -- this driver is
+ * Concurrency note, added after direct review: dma_uart_cb and the
+ * selected channel are single, unlocked, shared global state -- this driver is
  * single-channel, single-in-flight-transfer-at-a-time BY DESIGN, not
  * an accident. Every current call site (the boot-time self-tests) is
  * single-threaded, sequential, pre-scheduler, so there is provably
@@ -173,9 +290,19 @@ dma_uart_init:
  * own SD driver's own PIO buffer lifetime rules. */
 .global dma_uart_tx_start
 dma_uart_tx_start:
-    push {r4, r5, lr}
+    push {r4, r5, r6, lr}
     mov r4, r0            /* r4 = buf_ptr */
     mov r5, r1            /* r5 = len */
+
+    // TASK #357 real-HW follow-up: refuse up front if dma_uart_init
+    // never found a firmware-safe channel -- same reasoning as dma_
+    // uart_tx_busy's own matching guard (see its header comment).
+    // Checked here too, not just relied on via that call below, so
+    // this function is self-contained-safe regardless of call order.
+    ldr r6, =dma_uart_channel_valid
+    ldr r6, [r6]
+    cmp r6, #0
+    beq dma_uart_tx_start_no_channel
 
     bl dma_uart_tx_busy
     cmp r0, #0
@@ -202,7 +329,14 @@ dma_uart_tx_start:
     str r0, [r1, #28]
     bl mem_barrier
 
-    ldr r4, =0x20007500    /* DMA channel 5 CS/CONBLK_AD base */
+    ldr r6, =dma_uart_channel_val   /* TASK #357 real-HW follow-up:
+                                      * dynamically-selected channel,
+                                      * not the old hardcoded 5 -- see
+                                      * dma_uart_init's own header */
+    ldr r6, [r6]
+    ldr r4, =0x20007000    /* DMA_BASE; channel's own CS/CONBLK_AD base
+                             * is DMA_BASE + channel*0x100 */
+    add r4, r4, r6, lsl #8
     ldr r0, =dma_uart_cb
     str r0, [r4, #4]       /* CONBLK_AD */
     bl mem_barrier
@@ -211,17 +345,22 @@ dma_uart_tx_start:
     bl mem_barrier
 
     mov r0, #0
-    pop {r4, r5, lr}
+    pop {r4, r5, r6, lr}
     bx lr
 
 dma_uart_tx_start_noop:
     mov r0, #1
-    pop {r4, r5, lr}
+    pop {r4, r5, r6, lr}
     bx lr
 
 dma_uart_tx_start_busy:
     mov r0, #2
-    pop {r4, r5, lr}
+    pop {r4, r5, r6, lr}
+    bx lr
+
+dma_uart_tx_start_no_channel:
+    mov r0, #3
+    pop {r4, r5, r6, lr}
     bx lr
 
 /* dma_ram_copy_test(src, dst, count) -> u32 -- diagnostic only, added
@@ -241,7 +380,12 @@ dma_uart_tx_start_busy:
  * and the earlier zero-bytes result is a QEMU peripheral-modeling gap,
  * not a driver bug -- same "don't waste a real-HW round-trip on your
  * own uncaught bug" discipline this whole session has already paid
- * for once, applied here before it costs anything at all this time. */
+ * for once, applied here before it costs anything at all this time.
+ *
+ * TASK #357 real-HW follow-up (2026-10-17): returns 0 on success, 1 if
+ * dma_uart_init never found a firmware-safe channel (previously always
+ * returned 0 unconditionally, back when the channel was hardcoded and
+ * this function had no failure path at all). */
 .global dma_ram_copy_test
 dma_ram_copy_test:
     push {r4, r5, r6, lr}
@@ -266,7 +410,24 @@ dma_ram_copy_test:
     str r0, [r1, #28]
     bl mem_barrier
 
-    ldr r4, =0x20007500
+    // TASK #357 real-HW follow-up: refuse if dma_uart_init never found
+    // a firmware-safe channel -- same guard as dma_uart_tx_start/_busy
+    // (see dma_uart_init's own header comment). The CB writes above are
+    // harmless RAM-only state with no hardware side effect yet; nothing
+    // has actually started a transfer at this point.
+    ldr r4, =dma_uart_channel_valid
+    ldr r4, [r4]
+    cmp r4, #0
+    beq dma_ram_copy_test_no_channel
+
+    ldr r4, =dma_uart_channel_val   /* TASK #357 real-HW follow-up:
+                                      * dynamically-selected channel --
+                                      * src (this function's own r4) is
+                                      * already consumed above, safe to
+                                      * reuse here */
+    ldr r4, [r4]
+    ldr r0, =0x20007000
+    add r4, r0, r4, lsl #8
     ldr r0, =dma_uart_cb
     str r0, [r4, #4]
     bl mem_barrier
@@ -278,23 +439,48 @@ dma_ram_copy_test:
     pop {r4, r5, r6, lr}
     bx lr
 
-/* dma_uart_tx_busy() -> u32 -- 1 if channel 5's own transfer is still
- * in flight (CS.ACTIVE still set), 0 once it has completed. ACTIVE
- * auto-clears at the end of the transfer described by the current CB
- * (datasheet's own CS register description) -- reliable as a direct
- * completion signal precisely because NEXTCONBK is always 0 here
- * (single CB, never chained), so "the current CB" and "the whole
- * transfer" are the same thing. */
+dma_ram_copy_test_no_channel:
+    mov r0, #1
+    pop {r4, r5, r6, lr}
+    bx lr
+
+/* dma_uart_tx_busy() -> u32 -- 1 if the dynamically-selected channel's
+ * own transfer is still in flight (CS.ACTIVE still set), 0 once it has
+ * completed. ACTIVE auto-clears at the end of the transfer described
+ * by the current CB (datasheet's own CS register description) --
+ * reliable as a direct completion signal precisely because NEXTCONBK
+ * is always 0 here (single CB, never chained), so "the current CB"
+ * and "the whole transfer" are the same thing.
+ *
+ * TASK #357 real-HW follow-up: explicitly reports "not busy" (0)
+ * without touching any MMIO address at all if dma_uart_init never
+ * found a safe channel (dma_uart_channel_valid still 0) -- every real
+ * caller already gates on dma_uart_init's own return status first
+ * (uart_puts via uart_dma_ready, both self-tests directly), so this
+ * should never actually trigger, but reading dma_uart_channel_val's
+ * own meaningless-until-valid default (0, a legitimate channel number)
+ * as if it were a real selection instead would be a real, if currently
+ * unreachable, correctness gap -- silently driving channel 0 without
+ * it ever having been confirmed firmware-safe. */
 .global dma_uart_tx_busy
 dma_uart_tx_busy:
     push {r4, lr}
-    ldr r1, =0x20007500    /* DMA channel 5 CS register */
+    ldr r1, =dma_uart_channel_valid
+    ldr r4, [r1]
+    cmp r4, #0
+    moveq r0, #0
+    beq dma_uart_tx_busy_done
+    ldr r1, =dma_uart_channel_val
+    ldr r4, [r1]
+    ldr r1, =0x20007000    /* DMA_BASE */
+    add r1, r1, r4, lsl #8
     ldr r4, [r1]           /* mem_barrier (below) unconditionally
                              * zeroes r0/r1 on return -- the loaded CS
                              * value must survive in a register it
                              * doesn't touch, not r0. */
     bl mem_barrier
     and r0, r4, #1
+dma_uart_tx_busy_done:
     pop {r4, lr}
     bx lr
 
@@ -303,6 +489,15 @@ uart_dma_ready_set:
     ldr r1, =uart_dma_ready
     str r0, [r1]
     mov r0, #0
+    mov r1, #0     /* round-71-class bug swept here (2026-10-17): this
+                     * is declared `-> i64` in kernel_main.vani (real
+                     * r0:r1 AAPCS pair) but never set r1 -- every
+                     * caller today discards the result (`let _ = ...`)
+                     * so it was benign, same shape as the other fixes
+                     * this file's own header comment documents, fixed
+                     * on sight per this project's own sweep-sibling-
+                     * functions convention rather than left for a
+                     * future caller to trip over. */
     bx lr
 
 .global uart_dma_ready_get

@@ -2205,9 +2205,13 @@ extern "C" fn mem_barrier() -> i64;
 // underestimated this project's own static worst-case stack-depth
 // analysis for any caller chain reaching these functions. Caught
 // during a real-vs-declared audit, not by the tool itself.
-#[stack_cost(bytes=8)]
+// TASK #357 real-HW follow-up (2026-10-17): both bumped 8->16/12->16
+// -- dma_uart_init/dma_uart_tx_start's own push{} grew by one register
+// (r6) to hold the dynamically-selected DMA channel, see boot/dma_
+// uart_state.S's own header comment for the full "why".
+#[stack_cost(bytes=16)]
 extern "C" fn dma_uart_init() -> i64;
-#[stack_cost(bytes=12)]
+#[stack_cost(bytes=16)]
 extern "C" fn dma_uart_tx_start(buf: mut ref i64, byte_count: u32) -> u32;
 #[stack_cost(bytes=8)]
 extern "C" fn dma_uart_tx_busy() -> u32;
@@ -28470,6 +28474,19 @@ fn governor_step() -> i64 {
 // prove this driver's own register setup is correct independent of
 // whether QEMU's own DMA model can reach MMIO peripherals at all.
 fn dma_ram_copy_self_test() -> i64 {
+  // TASK #357 real-HW follow-up (2026-10-17): dma_uart_init() now picks
+  // a real channel via the VideoCore firmware's own mailbox query
+  // before any DMA register access is safe (see its own header
+  // comment) -- this self-test used to run BEFORE dma_uart_tx_self_
+  // test's own dma_uart_init() call, relying on the old hardcoded
+  // channel 5 needing no init at all. Now needs its own call, same as
+  // dma_uart_tx_self_test already has, or dma_uart_channel_val would
+  // still be its unselected sentinel here.
+  let init_status: i64 = dma_uart_init();
+  if init_status != 0 {
+    let _ = uart_puts("DMA RAM-COPY DIAG: dma_uart_init found no VideoCore-firmware-safe channel, skipping\n");
+    return 0;
+  }
   let copy_len: i64 = 16;
   let src_buf: mut ref i64 = dhruva_alloc_bytes(copy_len);
   let dst_buf: mut ref i64 = dhruva_alloc_bytes(copy_len);
@@ -28491,7 +28508,11 @@ fn dma_ram_copy_self_test() -> i64 {
 }
 
 fn dma_uart_tx_self_test() -> i64 {
-  let _ = dma_uart_init();
+  let init_status: i64 = dma_uart_init();
+  if init_status != 0 {
+    let _ = uart_puts("DMA UART DIAG: dma_uart_init found no VideoCore-firmware-safe channel, skipping\n");
+    return 0;
+  }
   let msg_len: i64 = 16;
   let msg_buf: mut ref i64 = dhruva_alloc_bytes(msg_len);
   let _ = buf_write_byte(msg_buf, 0 as u32, 68 as u32);  // D
@@ -46140,8 +46161,20 @@ fn kernel_main() -> i64 {
   // gate rather than relying on call order like every other scratch
   // buffer here safely does.
   let _ = uart_dma_scratch_set(dhruva_alloc_bytes(UART_DMA_SCRATCH_CAP));
-  let _ = dma_uart_init();
-  let _ = uart_dma_ready_set(1 as u32);
+  // TASK #357 real-HW follow-up (2026-10-17): only mark DMA ready if
+  // dma_uart_init() actually found a VideoCore-firmware-safe channel
+  // to use -- see its own header comment (boot/dma_uart_state.S) for
+  // why a hardcoded channel hung the board 3/3 on the first real-HW
+  // trial. Leaving uart_dma_ready at 0 here (the .bss default) when
+  // init fails means uart_puts silently keeps using its existing,
+  // already-proven PIO fallback -- the same fail-safe contract every
+  // other dma_uart_* failure path already has.
+  let dma_init_status: i64 = dma_uart_init();
+  if dma_init_status == 0 {
+    let _ = uart_dma_ready_set(1 as u32);
+  } else {
+    let _ = uart_puts("DMA: no VideoCore-firmware-safe UART-TX channel found, staying on PIO\n");
+  }
   let _ = tcp_empty_payload_scratch_set(dhruva_alloc_bytes(1));
   let _ = net_send_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
   let _ = net_recv_scratch_set(dhruva_alloc_bytes(netif_frame_slot_size()));
