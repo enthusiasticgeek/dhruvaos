@@ -4909,31 +4909,6 @@ fn uart_puts(s: Str) -> i64 {
       i = i + 1;
     }
     let start_status: u32 = dma_uart_tx_start(scratch, (n * 4) as u32);
-    // TASK #357 real-HW follow-up, sixth attempt: the fifth attempt's
-    // own uart_puts_bounded-based diagnostic labels ALSO came out
-    // dropped/garbled identically to the original SD DIAG literals --
-    // proving this isn't DMA-specific at all. uart_puts_bounded uses
-    // uart_putc_nonblocking, which queues into the TX ring buffer and
-    // relies on timer_tick_dispatch's idle-time drain pump -- NOT
-    // running yet this early in boot (before the scheduler starts),
-    // exactly the same already-documented constraint dma_uart_init's
-    // own diagnostics had to work around with dma_uart_init_diag_
-    // drain_wait. uart_put_hex32 survived because it uses BLOCKING
-    // uart_putc (direct to hardware), same as uart_puts's own non-DMA
-    // fallback loop below. Fix: use plain uart_puts (not _bounded) with
-    // every literal kept under UART_DMA_MIN_LEN (8) so it always takes
-    // uart_puts's own proven blocking fallback, regardless of the DMA
-    // flag -- never uart_puts_bounded/_nonblocking this early in boot.
-    let post_start_cs: u32 = dma_uart_cs_read();
-    let _ = diag_puts_blocking("D0 ss=");
-    let _ = uart_put_hex32(start_status);
-    let _ = diag_puts_blocking(" n=");
-    let _ = uart_put_hex32(n as u32);
-    let _ = diag_puts_blocking(" pre=");
-    let _ = uart_put_hex32(pre_busy_iter as u32);
-    let _ = diag_puts_blocking(" cs0=");
-    let _ = uart_put_hex32(post_start_cs);
-    let _ = diag_puts_blocking("\n");
     if start_status == (0 as u32) {
       // 20,000,000 -- generously scaled up from dma_uart_tx_self_
       // test's own already-real-HW-proven 1,000,000 cap for a 16-byte
@@ -4947,12 +4922,6 @@ fn uart_puts(s: Str) -> i64 {
       while (dma_uart_tx_busy() == (1 as u32)) && (busy_iter < 20000000) {
         busy_iter = busy_iter + 1;
       }
-      let post_cs: u32 = dma_uart_cs_read();
-      let _ = diag_puts_blocking("D1 it=");
-      let _ = uart_put_hex32(busy_iter as u32);
-      let _ = diag_puts_blocking(" cs=");
-      let _ = uart_put_hex32(post_cs);
-      let _ = diag_puts_blocking("\n");
       used_dma = 1;
     }
   }
