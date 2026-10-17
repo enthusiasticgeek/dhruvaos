@@ -356,7 +356,20 @@ dma_uart_init_no_channel:
  * deliberately-built real-HW debug image. */
 .global dma_uart_init_diag_drain_wait
 dma_uart_init_diag_drain_wait:
-    push {r4, r5, r6, r7, lr}
+    /* r0-r3 included here deliberately, not just r4-r7 -- the nested
+     * calls below (uart_tx_ring_drain_only especially: its own drain
+     * loop uses r0-r3 freely as scratch, e.g. a direct `ldr r2,[r1]`
+     * for the ring head, and never saves/restores them) clobber
+     * whatever the CALLER had in r0-r3. Found live this round: dma_
+     * uart_init stashes the mbox_property_call status in r2 right
+     * before its first call to this function -- without this fix,
+     * that status was silently overwritten by the ring head value
+     * read inside uart_tx_ring_drain_only, so the `cmp r2,#0` check
+     * immediately after returning here was comparing garbage, not
+     * the real mailbox result. Looked EXACTLY like a successful call
+     * with an all-zero channel mask on every single real-HW boot --
+     * it wasn't; the real mask was never actually read. */
+    push {r0, r1, r2, r3, r4, r5, r6, r7, lr}
     ldr r7, =0x20003004    /* TIMER_CLO -- free-running microsecond
                              * counter, same register this project's
                              * own BOOT DIAG checkpoints already read */
@@ -372,7 +385,7 @@ dma_uart_init_diag_drain_wait_loop:
     cmp r4, r5
     bls dma_uart_init_diag_drain_wait_loop
 dma_uart_init_diag_drain_wait_done:
-    pop {r4, r5, r6, r7, lr}
+    pop {r0, r1, r2, r3, r4, r5, r6, r7, lr}
     bx lr
 
 .section ".rodata"
