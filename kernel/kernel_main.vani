@@ -46418,11 +46418,23 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("BOOT DIAG: checkpoint 8 (post-dharafs_init), TIMER_CLO=0x");
   let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
   let _ = uart_puts("\n");
+  // TASK #357 real-HW follow-up (2026-10-17), eleventh attempt: the
+  // tenth attempt's own CBI-A/B/C markers (inside crashlog_boot_
+  // increment itself) never printed at all -- execution never reaches
+  // that function. These 5 calls run BEFORE it; one of them is where
+  // the real hang/crash happens. Pinpointing with the same pure-PIO
+  // diag_puts_blocking markers, one per call.
+  let _ = diag_puts_blocking("P0\n");
   let _ = log_level_init();
+  let _ = diag_puts_blocking("P1\n");
   let _ = kernlog_config_init();
+  let _ = diag_puts_blocking("P2\n");
   let _ = wifi_config_init();
+  let _ = diag_puts_blocking("P3\n");
   let _ = ble_config_init();
+  let _ = diag_puts_blocking("P4\n");
   let _ = dhdl_init();
+  let _ = diag_puts_blocking("P5\n");
   let _ = crashlog_boot_increment();
   let _ = uart_puts("BOOT DIAG: checkpoint 9 (post-crashlog_boot_increment), TIMER_CLO=0x");
   let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
