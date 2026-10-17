@@ -29228,8 +29228,18 @@ fn log_level_init() -> i64 {
 // bytes), so anything longer than this project's own buffers could
 // never have been a valid credential in the first place.
 fn wifi_config_init() -> i64 {
+  // TASK #357 real-HW follow-up (2026-10-17), twelfth attempt: P3
+  // (right after this function returns) never printed -- the hang is
+  // somewhere inside this function. It calls no uart_puts itself, only
+  // dharafs_read() + plain byte copies, so the real cause must be
+  // inside dharafs_read() (possibly a verbosity change from the
+  // log_level_init() call just before this one triggering a print deep
+  // in the SD/filesystem path for a config file that likely doesn't
+  // exist on this test card). Bracketing both reads to narrow further.
+  let _ = diag_puts_blocking("W0\n");
   let ssid_heap: mut ref i64 = dhruva_alloc_bytes(32);
   let ssid_read_len: i64 = dharafs_read("/config/wifi_ssid", ssid_heap);
+  let _ = diag_puts_blocking("W1\n");
   if ssid_read_len > 0 {
     let ssid_cap: i64 = if ssid_read_len > 32 { 32 } else { ssid_read_len };
     let ssid_dst: mut ref i64 = wifi_config_ssid_buf_ptr();
@@ -29244,6 +29254,7 @@ fn wifi_config_init() -> i64 {
 
   let pwd_heap: mut ref i64 = dhruva_alloc_bytes(64);
   let pwd_read_len: i64 = dharafs_read("/config/wifi_password", pwd_heap);
+  let _ = diag_puts_blocking("W2\n");
   if pwd_read_len > 0 {
     let pwd_cap: i64 = if pwd_read_len > 64 { 64 } else { pwd_read_len };
     let pwd_dst: mut ref i64 = wifi_config_password_buf_ptr();
