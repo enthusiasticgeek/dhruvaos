@@ -11189,11 +11189,25 @@ fn crashlog_record_crash(crash_type: u32, fault_addr: u32, status: u32, pc: u32,
 // #[no_heap] needed), but built from the exact same primitives for
 // consistency.
 fn crashlog_boot_increment() -> i64 {
+  // TASK #357 real-HW follow-up (2026-10-17), tenth attempt: TEMPORARY
+  // pinpoint diagnostic -- boot reaches checkpoint 8's own print
+  // cleanly (confirmed byte-exact, correctly ordered) but never reaches
+  // checkpoint 9, with the board resetting silently, zero output, in
+  // between. dharafs_init() itself was ruled out as the cause (its own
+  // ~3.46s cost is identical with DMA on or off -- a real, pre-existing
+  // cost, not a regression). crashlog_boot_increment() is the only
+  // thing that runs in that exact window. diag_puts_blocking is pure
+  // blocking PIO (no DMA, no ring) -- safe to use here regardless of
+  // whatever this function's own SD I/O does to any in-flight state.
+  let _ = diag_puts_blocking("CBI-A\n");
   let _ = crashlog_read_meta();
+  let _ = diag_puts_blocking("CBI-B\n");
   let meta: mut ref i64 = crashlog_meta_scratch_get();
   let count: u32 = buf_read_u32(meta, 0 as u32);
   let boot_count: u32 = buf_read_u32(meta, 4 as u32);
-  return crashlog_write_meta(count, boot_count + (1 as u32));
+  let result: i64 = crashlog_write_meta(count, boot_count + (1 as u32));
+  let _ = diag_puts_blocking("CBI-C\n");
+  return result;
 }
 
 // Crash type tags -- see crashlog_record_crash's own callers.
