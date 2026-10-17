@@ -210,6 +210,27 @@ drain_step:
     tst r0, #0x20                /* TX FIFO full? (bit 5) */
     bne done                     /* still full -- try again next call */
 
+    // TASK #357 real-HW follow-up (2026-10-17), race-condition audit:
+    // this write and dma_uart_tx_start's own DMA-engine writes target
+    // the SAME UART_DR register -- without this check, a byte queued
+    // here could race straight into the FIFO ahead of bytes an
+    // in-flight DMA transfer (started by uart_puts, which no longer
+    // busy-waits for full completion) hasn't gotten around to writing
+    // yet, corrupting wire order exactly like the uart_putc PIO path
+    // did before its own matching fix. dma_uart_tx_busy() already
+    // degrades to an immediate "not busy" (r0=0) whenever DMA was
+    // never initialized/adopted, so this costs one cheap extern call
+    // in that case -- same bail-out shape as the FIFO-full check just
+    // above (try again next call), not a busy-wait: correct for an
+    // interrupt-adjacent, WCET-sensitive drain pump where blocking
+    // would be a real latency violation, unlike uart_putc's own
+    // task-level bounded busy-wait. r4 (tail) survives this call --
+    // dma_uart_tx_busy's own push/pop covers it.
+    bl dma_uart_tx_busy
+    cmp r0, #1
+    beq done                     /* DMA transfer in flight -- try again
+                                   * next call rather than racing it */
+
     ldr r1, =uart_tx_ring_buf
     ldrb r0, [r1, r4]            /* r0 = buf[tail] */
     ldr r1, =0x20201000          /* UART_DR */
@@ -300,6 +321,21 @@ drain_only_step:
     ldr r0, [r1]
     tst r0, #0x20                /* TX FIFO full? (bit 5) */
     bne drain_only_done           /* still full -- try again next tick */
+
+    // TASK #357 real-HW follow-up (2026-10-17), race-condition audit:
+    // same reasoning as uart_tx_ring_push_and_drain_impl's own matching
+    // fix just above (see its comment) -- this function is called
+    // UNCONDITIONALLY every timer tick from interrupt context
+    // (timer_tick_dispatch), so once the scheduler is running this is
+    // the single highest-frequency caller racing the SAME UART_DR
+    // register against any in-flight DMA transfer. Deferred bail-out
+    // (try again next tick), never a busy-wait -- blocking inside a
+    // tick-dispatch/interrupt context would itself be a real WCET/
+    // latency violation this project's own design explicitly avoids.
+    bl dma_uart_tx_busy
+    cmp r0, #1
+    beq drain_only_done           /* DMA transfer in flight -- defer to
+                                    * the next tick rather than racing it */
 
     ldr r1, =uart_tx_ring_buf
     ldrb r0, [r1, r4]            /* r0 = buf[tail] */

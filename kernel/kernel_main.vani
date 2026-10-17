@@ -4575,6 +4575,36 @@ fn uart_putc(c: i64) -> i64 {
     }
     return 0;
   }
+  // TASK #357 real-HW follow-up (2026-10-17), ninth attempt: this
+  // function's own "wait while FIFO full" loop below only waits for
+  // hardware FIFO ROOM, not for any DMA transfer still feeding the
+  // SAME FIFO from uart_puts's own DMA branch (which no longer
+  // busy-waits for full completion before returning -- see that
+  // function's own prior commit). Without this check, a PIO write
+  // from here (the non-DMA fallback loop, or uart_put_hex32's own
+  // digit-by-digit calls -- the exact pattern every "uart_puts(prefix)
+  // + uart_put_hex32(value)" call site in this file uses) can race
+  // straight into the FIFO ahead of bytes the DMA engine hasn't gotten
+  // around to writing yet (DREQ-paced, slower than a direct CPU
+  // write) -- confirmed on real hardware: literal prefixes and their
+  // own immediately-following hex digits came out reordered relative
+  // to each other ("SD DIAG: s" + hex value + "dhost_init entry..."
+  // instead of the correct order) the moment the post-start busy-wait
+  // was removed from uart_puts. Waiting HERE, at the one common
+  // primitive every PIO write path already goes through, restores
+  // correct wire ordering for back-to-back DMA+PIO call sequences
+  // while still letting an uart_puts call's own transfer drain in the
+  // background for as long as nothing else touches the UART --
+  // exactly the overlap dharafs_init()'s real SD I/O needed. Gated
+  // identically to uart_puts's own DMA branch so this adds zero cost
+  // (one cheap, already-false condition check) whenever DMA adoption
+  // itself is off, including every QEMU regression run.
+  if (UART_DMA_ADOPT_FOR_REAL_HARDWARE == 1) && (uart_dma_ready_get() == (1 as u32)) {
+    let putc_pre_busy_iter: i64 = 0;
+    while (dma_uart_tx_busy() == (1 as u32)) && (putc_pre_busy_iter < 20000000) {
+      putc_pre_busy_iter = putc_pre_busy_iter + 1;
+    }
+  }
   let uart_fr: i64 = UART_FR;
   let uart_dr: i64 = UART_DR;
   // ROUND 2026-09-16: a raw terminal in the mode picocom uses for real-
