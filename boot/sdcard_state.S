@@ -669,6 +669,44 @@ sd_scr_diag_ready:
                                * sane regardless) */
     ldr r7, =0x20202040       /* SDDATA */
     mov r9, #0                /* r9 = word index / loop counter */
+    /* RTOS audit fix (2026-10-18): wrap the ENTIRE per-word diagnostic
+     * dump below (hardware reads + prints) in the same ceiling-0 lock
+     * uart_puts (kernel_main.vani) uses around its own composite multi-
+     * call lines. sdhost_diag_puts/_putc, unlike uart_puts, never took
+     * any lock across their own composite output -- a timer-tick-
+     * driven scheduler switch landing BETWEEN any two of this loop's
+     * per-word sdhost_diag_* calls could let a DIFFERENT task's own
+     * uart_puts-based print interleave character-by-character with
+     * this one's. Confirmed live (2026-10-17/18 real-HW session, task
+     * #357 follow-up): this exact function's own "SD DIAG: SCR
+     * word..." output came out with its leading "SD DIAG: " missing,
+     * immediately followed by a resume_pc_sentinel_check halt -- the
+     * same symptom this project's own sched_diag_putc comment already
+     * attributes to this bug class ("a background task's own 'SD
+     * DIAG: ...' print came out merged with fragments of something
+     * else mid-line"). uart_pio_busy (uart_tx_ring_state.S) already
+     * closed the FIQ-vs-task half of this same race; this is the
+     * TASK-vs-TASK half. Uses current_eff_prio()'s save / dhruva_prio_
+     * unlock(saved) restore shape, matching uart_puts exactly, not a
+     * hardcoded restore value -- this function is reachable from
+     * sdhost_init()'s own retry path (kernel_main.vani:8072/8430)
+     * while some OUTER lock may already be held, and the saved value
+     * correctly restores whatever ceiling was actually in effect on
+     * entry (today's dhruva_prio_unlock_impl nesting-depth fix, same
+     * audit, makes this safe even if it is). r6 (SDEDM poll address)
+     * is dead by this point -- the poll above is done -- so it holds
+     * saved_prio across the loop instead; r8/r9 (fill count, loop
+     * index) are explicitly pushed/popped around the two setup calls
+     * rather than trusting the SWI trap's register preservation
+     * implicitly, given this file's own documented history of callee-
+     * saved-register bugs (feedback_aapcs_callee_saved_registers_asm).
+     */
+    push {r8, r9}
+    bl current_eff_prio
+    mov r6, r0
+    mov r0, #0
+    bl dhruva_prio_lock
+    pop {r8, r9}
 sd_scr_diag_drain_loop:
     cmp r9, r8
     bge sd_scr_diag_done
@@ -709,6 +747,10 @@ sd_scr_diag_drain_loop:
     add r9, r9, #1
     b sd_scr_diag_drain_loop
 sd_scr_diag_done:
+    push {r8, r9}
+    mov r0, r6
+    bl dhruva_prio_unlock
+    pop {r8, r9}
     pop {r4, r5, r6, r7, r8, r9, lr}
     mov r0, #0
     mov r1, #0
@@ -1289,6 +1331,16 @@ test_dump16_done:
 sd_scr_dump_and_check_4bit:
     push {r4, r5, r6, lr}
     mov r4, r0
+    /* RTOS audit fix (2026-10-18): same fix and rationale as sd_scr_
+     * drain_diag's own header comment above -- wrap this function's
+     * composite "SD DIAG: SCR=..." dump in the same ceiling-0 lock
+     * uart_puts uses, closing the task-vs-task interleaving gap. r5/r6
+     * are both free until the reassembly logic below the print loop,
+     * so r6 holds saved_prio here; no r8/r9 in play in this function. */
+    bl current_eff_prio
+    mov r6, r0
+    mov r0, #0
+    bl dhruva_prio_lock
     ldr r0, =sd_scr_label
     bl sdhost_diag_puts
     mov r5, #0
@@ -1307,6 +1359,8 @@ sd_scr_dump_loop:
 sd_scr_dump_done:
     mov r0, #10
     bl sdhost_diag_putc
+    mov r0, r6
+    bl dhruva_prio_unlock
 
     /* Reassemble word0 big-endian: byte[0]<<24 | byte[1]<<16 |
      * byte[2]<<8 | byte[3]. */
