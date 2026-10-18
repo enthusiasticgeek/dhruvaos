@@ -96,6 +96,20 @@ mkdir -p "${BUILD_DIR}"
 python3 "${ROOT}/test/asm_safety_audit.py" \
   --boot-dir "${ROOT}/boot" --vani "${ROOT}/kernel/kernel_main.vani"
 
+# Per-task stack-depth gate (user request, 2026-10-18): the kernel_main
+# gate above only ever covered kernel_main's own boot-time call chain --
+# every real task entry point (task_a..f, the 4 dynamically-created
+# demo tasks) was a documented, manual-only gap ("run manually before
+# any round that adds real depth to one of those task bodies", this
+# file's own comment above). That's exactly how task_fsq's own real
+# stack overflow (task #245: 4096 allocated vs. a measured 4152-byte
+# worst case) went undetected until someone happened to run the tool
+# by hand. test/task_stack_depth_check.py runs `vanic stack-depth
+# --format=json` ONCE and checks every real task against its own
+# allocated stack size (minus the same 1/8 margin the kernel_main gate
+# above already uses), so this can never silently regress again.
+python3 "${ROOT}/test/task_stack_depth_check.py" "${VANIC}" "${ROOT}/kernel/kernel_main.vani"
+
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/rpi1/boot.S" -o "${BUILD_DIR}/boot.o"
 
