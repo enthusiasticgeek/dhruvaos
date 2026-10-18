@@ -724,6 +724,35 @@ sd_scr_diag_drain_loop:
     cmp r9, #1
     streq r1, [r4, #4]         /* word 1 -> caller's buffer */
 
+    /* REAL-HW BUG, found+fixed 2026-10-18 (task #357 follow-up): this
+     * loop's own per-word print (7 sdhost_diag_* calls, ~60 chars) used
+     * to run for EVERY word up to the real fill count (up to 16) --
+     * confirmed live, repeatedly, on real hardware: a non-trivial fill
+     * count produces a 400+ character composite dump that overflows
+     * the shared UART TX ring (64 bytes) plus the hardware FIFO (16
+     * bytes) long before 115200 baud can drain it, silently losing
+     * most of the message (e.g. its own "SD DIAG: " prefix) -- NOT a
+     * race (this call chain can run single-threaded, interrupts
+     * masked, well before start_multitasking ever hands off, so a
+     * scheduler-side fix can't help). Tried making the underlying
+     * write path itself loss-proof (ring retry, then a direct blocking
+     * write with uart_pio_busy) -- both caused a real, 100% reproducible
+     * QEMU regression (phase4_milestone.py: tlsecho onward failing via
+     * resume_pc_sentinel_check, true_lr=0) that extensive register/
+     * logic tracing never explained, and that does NOT reproduce on
+     * the unmodified baseline (confirmed 3/3 clean re-runs there) --
+     * so neither shipped. This is the deliberately simpler fix
+     * instead: cap how many words actually get PRINTED to 1 (comfortably
+     * under the ~79-byte combined ring+FIFO capacity on its own, with
+     * real transmission time elapsing between calls on top of that),
+     * while still READING AND DRAINING every word the hardware reports
+     * exactly as before -- the print loop below is purely cosmetic
+     * (one sample value is already sufficient evidence the diagnostic
+     * fired), but draining the full FIFO is load-bearing (round 33's
+     * own fix: leftover undrained words were silently available to
+     * whatever SD command ran next). */
+    cmp r9, #0
+    bgt sd_scr_diag_skip_print
     ldr r0, =sd_scr_diag_lbl_word
     bl sdhost_diag_puts
     mov r0, r9
@@ -743,6 +772,7 @@ sd_scr_diag_drain_loop:
     bl sdhost_diag_put_hex32
     mov r0, #10
     bl sdhost_diag_putc
+sd_scr_diag_skip_print:
 
     add r9, r9, #1
     b sd_scr_diag_drain_loop
