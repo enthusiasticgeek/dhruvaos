@@ -2220,6 +2220,16 @@ extern "C" fn mem_barrier() -> i64;
 extern "C" fn dma_uart_init() -> i64;
 #[stack_cost(bytes=16)]
 extern "C" fn dma_uart_tx_start(buf: mut ref i64, byte_count: u32) -> u32;
+// Confirmed live (2026-10-17): the real root cause of a scheduler-
+// resume-state corruption reproduced identically on BOTH a DMA-enabled
+// and a plain-PIO-only build -- see uart_pio_busy_set's own header
+// comment (boot/uart_tx_ring_state.S) for the full writeup. Set/cleared
+// by uart_putc around its own hardware touch; checked (never waited
+// on) by the two ring-drain functions before THEY touch hardware.
+#[stack_cost(bytes=1)]
+extern "C" fn uart_pio_busy_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn uart_pio_busy_get() -> u32;
 #[stack_cost(bytes=8)]
 extern "C" fn dma_uart_tx_busy() -> u32;
 // Diagnostic only (TASK #357 real-HW follow-up, fifth attempt) -- see
@@ -4614,6 +4624,15 @@ fn uart_putc(c: i64) -> i64 {
   }
   let uart_fr: i64 = UART_FR;
   let uart_dr: i64 = UART_DR;
+  // TASK #357 real-HW follow-up (2026-10-17): confirmed as the real
+  // root cause of a scheduler-resume-state corruption reproduced
+  // identically on BOTH a DMA-enabled and a plain-PIO-only build --
+  // see uart_pio_busy_set's own header comment (boot/uart_tx_ring_
+  // state.S) for the full writeup. Set for the whole remainder of this
+  // call (both the CR-before-LF write below and the real byte write),
+  // not just the final write, since the CR write touches the exact
+  // same hardware FIFO a racing tick's own ring-drain could land on.
+  let _ = uart_pio_busy_set(1 as u32);
   // ROUND 2026-09-16: a raw terminal in the mode picocom uses for real-
   // hardware debugging does NOT translate a bare LF (\n, 0x0A) into a
   // full CRLF the way virtually every text-file tool/editor silently
@@ -4647,6 +4666,7 @@ fn uart_putc(c: i64) -> i64 {
     }
   }
   let _ = mmio_write_u8(uart_dr, c as u8);
+  let _ = uart_pio_busy_set(0 as u32);
   return 0;
 }
 

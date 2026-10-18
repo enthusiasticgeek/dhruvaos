@@ -56,8 +56,66 @@ uart_tx_ring_head:
     .word 0
 uart_tx_ring_tail:
     .word 0
+// TASK #357 real-HW follow-up (2026-10-17): see uart_pio_busy_set's
+// own header comment below for the full "why" -- this flag is read by
+// uart_tx_ring_push_and_drain_impl/uart_tx_ring_drain_only (right
+// below) and written by uart_putc (kernel_main.vani).
+uart_pio_busy:
+    .word 0
 
 .section ".text"
+
+/* void uart_pio_busy_set(r0=0 or 1) / u32 uart_pio_busy_get() --
+ * confirmed on real hardware (2026-10-17): dhruva_prio_lock's own
+ * Immediate Priority Ceiling Protocol only ever serializes TASK-level
+ * callers against each other -- it does nothing against a hardware
+ * INTERRUPT, which can preempt any task regardless of its elevated
+ * priority. uart_putc's own blocking PIO write (poll FR, write DR) had
+ * no protection at all against timer_tick_dispatch's own unconditional
+ * uart_tx_ring_drain_only call (boot/context_switch.S) landing on the
+ * exact same hardware FIFO mid-write, once the scheduler is genuinely
+ * running multiple tasks and ticks are firing for real -- reproduced
+ * live, identically, on BOTH the DMA-enabled and the plain-PIO-only
+ * (no DMA at all) build: a background task's own "SD DIAG: ..." print
+ * came out merged with fragments of something else mid-line, shortly
+ * after the first real post-PASS tick-driven scheduling began.
+ *
+ * The textbook fix (Linux's own amba-pl011.c: pl011_int, the IRQ
+ * handler itself, and every TX path including pl011_console_write all
+ * take the SAME uap->port.lock via uart_port_lock_irqsave, which
+ * disables local interrupts for the critical section) doesn't port
+ * directly here: every real caller of uart_putc today is a USR-mode
+ * task (task #253/#261), where `cpsid`/`cpsie` are privileged and
+ * UNPREDICTABLE -- the exact bug class this project already hit once
+ * before trying the same thing for sdhost_write_block_once (see that
+ * function's own "20th SD round" comment) and reverted, deferring a
+ * real fix to a not-yet-built 6th SWI syscall trampoline.
+ *
+ * This needs no privileged instruction at all: a plain shared flag,
+ * set by uart_putc around its own hardware touch and checked (not
+ * waited on -- see the two ring-drain call sites) by the ring drain
+ * functions before THEY touch hardware, exactly mirroring the already-
+ * proven dma_uart_tx_busy()-vs-ring-drain fix earlier in this same
+ * investigation. Safe on this single-core target without any atomic
+ * primitive: the tick handler that reads this flag always runs to
+ * completion before the interrupted task resumes (a real exception,
+ * not concurrent execution), so there is no instant where both a
+ * write and a read of this flag are genuinely in flight at once --
+ * only "task sets 1, does its hardware touch, sets 0" as one
+ * uninterruptible-from-this-flag's-own-perspective sequence from the
+ * reader's point of view. */
+.global uart_pio_busy_set
+uart_pio_busy_set:
+    ldr r1, =uart_pio_busy
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global uart_pio_busy_get
+uart_pio_busy_get:
+    ldr r0, =uart_pio_busy
+    ldr r0, [r0]
+    bx lr
 
 /* 2026-09-26: real-HW UART bit-corruption investigation. This ring's
  * own head/tail read-modify-write below was completely UNMASKED --
@@ -231,6 +289,21 @@ drain_step:
     beq done                     /* DMA transfer in flight -- try again
                                    * next call rather than racing it */
 
+    // TASK #357 real-HW follow-up (2026-10-17): the SAME race as the
+    // DMA check just above, but against uart_putc's own PLAIN PIO
+    // write instead of a DMA transfer -- confirmed live, identically,
+    // on a build with DMA adoption entirely off: dhruva_prio_lock's
+    // own Immediate Priority Ceiling Protocol only serializes TASK-
+    // level callers against each other, never against a hardware
+    // interrupt (this function's own real caller, once scheduling is
+    // genuinely running). See uart_pio_busy_set's own header comment
+    // for the full writeup. r4 (tail) survives this call for the same
+    // reason it survives the dma_uart_tx_busy call above.
+    bl uart_pio_busy_get
+    cmp r0, #1
+    beq done                     /* a task's own PIO write is mid-flight
+                                   * -- defer to the next call */
+
     ldr r1, =uart_tx_ring_buf
     ldrb r0, [r1, r4]            /* r0 = buf[tail] */
     ldr r1, =0x20201000          /* UART_DR */
@@ -336,6 +409,24 @@ drain_only_step:
     cmp r0, #1
     beq drain_only_done           /* DMA transfer in flight -- defer to
                                     * the next tick rather than racing it */
+
+    // TASK #357 real-HW follow-up (2026-10-17): confirmed live, this
+    // is the ACTUAL root cause of a real post-PASS corruption/scheduler-
+    // resume-state-sentinel-halt reproduced identically on BOTH a DMA-
+    // enabled build and a plain-PIO-only (DMA entirely off) build --
+    // this function runs unconditionally every timer tick once the
+    // scheduler is genuinely running, and had no protection at all
+    // against racing a TASK's own uart_putc PIO write to this exact
+    // register. dhruva_prio_lock's priority-ceiling protocol cannot
+    // help here: it only ever serializes task-level callers against
+    // each other, never against a hardware interrupt preempting a task
+    // mid-write. See uart_pio_busy_set's own header comment for the
+    // full writeup (including why a Linux-style IRQ-disabling lock
+    // doesn't port directly onto this project's USR-mode task model).
+    bl uart_pio_busy_get
+    cmp r0, #1
+    beq drain_only_done           /* a task's own PIO write is mid-flight
+                                    * -- defer to the next tick */
 
     ldr r1, =uart_tx_ring_buf
     ldrb r0, [r1, r4]            /* r0 = buf[tail] */
