@@ -2165,6 +2165,14 @@ extern "C" fn diag_ring_get_ctxsw_at(physical_index: i64) -> i64;
 extern "C" fn diag_ring_get_irqs_at(physical_index: i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn diag_ring_get_priolock_at(physical_index: i64) -> i64;
+// RTOS audit follow-up (2026-10-17): see diag_ring_state.S's own
+// diag_ring_push comment -- `diagnose` must set this before reading
+// head/count/the four arrays and clear it after, so a timer tick
+// landing mid-read defers its push instead of racing a torn sample.
+#[stack_cost(bytes=1)]
+extern "C" fn diag_ring_read_busy_set(v: i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn diag_ring_read_busy_get() -> i64;
 
 // Translates a LOGICAL sample index (0 = oldest available, count-1 =
 // newest) into the PHYSICAL array slot diag_ring_get_*_at needs --
@@ -33757,6 +33765,13 @@ fn shell_dispatch() -> i64 {
     // header comment for the full design (why this samples the
     // existing counters instead of instrumenting their increment
     // sites directly).
+    // RTOS audit follow-up (2026-10-17): hold diag_ring_push off for
+    // the duration of this read -- see diag_ring_state.S's own comment
+    // on diag_ring_push for the torn-sample race this closes. Set
+    // before the FIRST read that touches ring state (diag_ring_get_
+    // count itself), not just before the loop, since the count/head
+    // read below is exactly as exposed as the per-sample reads.
+    let _ = diag_ring_read_busy_set(1);
     let hist_count: i64 = diag_ring_get_count();
     let _ = uart_puts("  recent history (");
     let _ = uart_put_i64(hist_count);
@@ -33775,6 +33790,7 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("\n");
       hi = hi + 1;
     }
+    let _ = diag_ring_read_busy_set(0);
 
     // Round 189: real per-task CPU-time distribution -- one tick
     // attributed per scheduler_pick_next decision to whichever task

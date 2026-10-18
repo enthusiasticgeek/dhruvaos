@@ -2358,8 +2358,6 @@ dhruva_prio_unlock_impl:
     cpsid if
     ldr r2, =current_task
     ldr r3, [r2]
-    ldr r2, =eff_prio_table
-    str r0, [r2, r3, lsl #2]
     /* Matching decrement -- see dhruva_prio_lock_impl's own comment
      * above. Floored at 0 defensively (`movmi`, taken only if the
      * subtract goes negative): should never actually happen if every
@@ -2372,6 +2370,34 @@ dhruva_prio_unlock_impl:
     subs r1, r1, #1
     movmi r1, #0
     str r1, [r2, r3, lsl #2]
+    /* RTOS audit fix (2026-10-17, networking-stack audit fork): this
+     * used to write eff_prio_table[current] = base_priority
+     * UNCONDITIONALLY, every call -- correct for a non-nested lock/
+     * unlock pair, but wrong the instant a call nests (confirmed real:
+     * ssh_real_accept/_deliver_one_frame/_server_cmd each take their
+     * OWN inner dhruva_prio_lock(2)/_unlock(3) pair around a netif_
+     * recv_frame call, while shell_dispatch()'s OUTER dhruva_prio_
+     * lock(2)/_unlock(3) wrap is still active around the whole ssh
+     * command -- kernel/kernel_main.vani:35040-35058). The inner
+     * unlock's blind write reset eff_prio_table to 3 (base) even
+     * though ceiling_depth_table[current] still correctly said "depth
+     * 1, still inside the outer section" -- silently defeating the
+     * outer lock's own mutual-exclusion guarantee for however long
+     * remained until the NEXT inner lock call or the outer unlock.
+     * Fix: only an unlock that brings depth back to 0 (i.e. the
+     * OUTERMOST one) actually restores eff_prio_table -- any unlock
+     * that still leaves depth > 0 leaves eff_prio_table exactly as
+     * the still-active enclosing lock set it, which is always correct
+     * for this project's real nesting pattern (every observed inner
+     * lock re-requests the SAME ceiling the outer one already holds).
+     * The pre-existing stray-extra-unlock defensive floor above is
+     * unaffected: that case already had depth==0 going in, so it still
+     * takes the write-eff_prio branch below exactly as before. */
+    cmp r1, #0
+    bne dhruva_prio_unlock_still_nested
+    ldr r2, =eff_prio_table
+    str r0, [r2, r3, lsl #2]
+dhruva_prio_unlock_still_nested:
     msr cpsr_c, r12
     mov r0, #0
     mov r1, #0

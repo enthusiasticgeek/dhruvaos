@@ -56,6 +56,12 @@ diag_ring_head:
     .word 0       /* next slot a push writes into */
 diag_ring_count:
     .word 0       /* how many slots hold a real sample, caps at 32 */
+diag_ring_read_busy:
+    .word 0       /* set by the `diagnose` shell command while it is
+                   * walking head/count/the four arrays; diag_ring_push
+                   * (FIQ context) checks this and skips the whole push
+                   * rather than racing a torn read -- see diag_ring_
+                   * push's own comment just below for the full story */
 
 .section ".text"
 
@@ -73,6 +79,30 @@ diag_ring_count:
  * this call untouched. */
 .global diag_ring_push
 diag_ring_push:
+    /* RTOS audit follow-up (2026-10-17, same investigation that fixed
+     * task #357's uart_pio_busy race): the `diagnose` shell command
+     * (task-level, USR mode) reads diag_ring_get_count/get_head once
+     * each, then re-derives a physical index per logical sample and
+     * does FOUR SEPARATE word reads (tick/ctxsw/irqs/priolock) at that
+     * index. This push runs from FIQ (timer_tick_dispatch), can land
+     * between any of those reads, and can (a) advance head/count out
+     * from under the reader's already-computed index, or (b) overwrite
+     * the exact slot being read, producing a torn sample mixing an old
+     * and a new tick's fields. Not memory-unsafe (index is always
+     * masked mod 32) and not scheduler-affecting -- purely a cosmetic
+     * "recent history" diagnostic row. Same defer-don't-busy-wait
+     * pattern as uart_tx_ring_state.S's uart_pio_busy: `diagnose` sets
+     * diag_ring_read_busy before its read loop and clears it after;
+     * this skips the ENTIRE push (not just part of it) for any tick
+     * that lands mid-read, so a reader never sees a half-written
+     * sample -- losing one sample's granularity for ~16ms is harmless
+     * for a "last ~16 seconds" query. */
+    ldr r12, =diag_ring_read_busy
+    ldr r12, [r12]
+    cmp r12, #1
+    moveq r0, #0
+    moveq r1, #0
+    bxeq lr
     push {r4, r5}
     ldr r12, =diag_ring_head
     ldr r4, [r12]
@@ -138,5 +168,25 @@ diag_ring_get_irqs_at:
 diag_ring_get_priolock_at:
     ldr r1, =diag_ring_priolock
     ldr r0, [r1, r0, lsl #2]
+    mov r1, #0
+    bx lr
+
+/* i64 diag_ring_read_busy_set(i64 v) / diag_ring_read_busy_get() --
+ * plain .bss flag, no atomics needed (single-core: the FIQ that reads
+ * this always runs to completion before the interrupted task resumes,
+ * so a write and a read are never truly simultaneous). Same shape as
+ * uart_tx_ring_state.S's uart_pio_busy_set/get. */
+.global diag_ring_read_busy_set
+diag_ring_read_busy_set:
+    ldr r1, =diag_ring_read_busy
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global diag_ring_read_busy_get
+diag_ring_read_busy_get:
+    ldr r0, =diag_ring_read_busy
+    ldr r0, [r0]
     mov r1, #0
     bx lr
