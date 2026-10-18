@@ -6457,15 +6457,17 @@ fn sd_read_scr(rca: u32) -> i64 {
   let cmd55_status: u32 = sdhost_cmd(55 as u32, rca);
   let cmd55_timed_out: i64 = sdhost_cmd_timed_out(cmd55_status);
   let cmd55_failed: i64 = sdhost_cmd_failed(cmd55_status);
-  let _ = uart_puts("SD DIAG: SCR-read CMD55 status=0x");
-  let _ = uart_put_hex32(cmd55_status);
-  let _ = uart_puts(" timed_out=");
-  let _ = uart_put_i64(cmd55_timed_out);
-  let _ = uart_puts(" failed=");
-  let _ = uart_put_i64(cmd55_failed);
-  let _ = uart_puts(" SDHSTS=0x");
-  let _ = uart_put_hex32(sd_mmio_read_u32(sdhsts));
-  let _ = uart_puts("\n");
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("SD DIAG: SCR-read CMD55 status=0x");
+    let _ = uart_put_hex32(cmd55_status);
+    let _ = uart_puts(" timed_out=");
+    let _ = uart_put_i64(cmd55_timed_out);
+    let _ = uart_puts(" failed=");
+    let _ = uart_put_i64(cmd55_failed);
+    let _ = uart_puts(" SDHSTS=0x");
+    let _ = uart_put_hex32(sd_mmio_read_u32(sdhsts));
+    let _ = uart_puts("\n");
+  }
   if (cmd55_timed_out == 1) || (cmd55_failed == 1) {
     return 0 - 1;
   }
@@ -6473,15 +6475,17 @@ fn sd_read_scr(rca: u32) -> i64 {
   let cmd51_status: u32 = sdhost_cmd(sdcmd_read | (51 as u32), 0 as u32);
   let cmd51_timed_out: i64 = sdhost_cmd_timed_out(cmd51_status);
   let cmd51_failed: i64 = sdhost_cmd_failed(cmd51_status);
-  let _ = uart_puts("SD DIAG: ACMD51 (SEND_SCR) status=0x");
-  let _ = uart_put_hex32(cmd51_status);
-  let _ = uart_puts(" timed_out=");
-  let _ = uart_put_i64(cmd51_timed_out);
-  let _ = uart_puts(" failed=");
-  let _ = uart_put_i64(cmd51_failed);
-  let _ = uart_puts(" SDHSTS=0x");
-  let _ = uart_put_hex32(sd_mmio_read_u32(sdhsts));
-  let _ = uart_puts("\n");
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("SD DIAG: ACMD51 (SEND_SCR) status=0x");
+    let _ = uart_put_hex32(cmd51_status);
+    let _ = uart_puts(" timed_out=");
+    let _ = uart_put_i64(cmd51_timed_out);
+    let _ = uart_puts(" failed=");
+    let _ = uart_put_i64(cmd51_failed);
+    let _ = uart_puts(" SDHSTS=0x");
+    let _ = uart_put_hex32(sd_mmio_read_u32(sdhsts));
+    let _ = uart_puts("\n");
+  }
   if (cmd51_timed_out == 1) || (cmd51_failed == 1) {
     let _ = sdhost_cmd_report_failure("ACMD51 (SEND_SCR)", cmd51_status);
     return 0 - 1;
@@ -6502,11 +6506,13 @@ fn sd_read_scr(rca: u32) -> i64 {
   // possible software observation of the true post-command fill.
   let scr_edm_immediate: u32 = sd_mmio_read_u32(SDEDM);
   let scr_fill_immediate: u32 = (scr_edm_immediate >> (4 as u32)) & (0x1F as u32);
-  let _ = uart_puts("SD DIAG: SCR immediate (pre-poll) fifo_fill=0x");
-  let _ = uart_put_hex32(scr_fill_immediate);
-  let _ = uart_puts(" SDEDM=0x");
-  let _ = uart_put_hex32(scr_edm_immediate);
-  let _ = uart_puts("\n");
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("SD DIAG: SCR immediate (pre-poll) fifo_fill=0x");
+    let _ = uart_put_hex32(scr_fill_immediate);
+    let _ = uart_puts(" SDEDM=0x");
+    let _ = uart_put_hex32(scr_edm_immediate);
+    let _ = uart_puts("\n");
+  }
   // 30th SD round follow-up: SCR came back with a "shift register"
   // corruption pattern identical in shape to the original CMD24
   // write corruption -- first time this project's drain loop has
@@ -6535,9 +6541,11 @@ fn sd_read_scr(rca: u32) -> i64 {
   }
 
   let is_4bit_capable: i64 = sd_scr_dump_and_check_4bit(scr_buf);
-  let _ = uart_puts("SD DIAG: SCR reports 4-bit support=");
-  let _ = uart_put_i64(is_4bit_capable);
-  let _ = uart_puts("\n");
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("SD DIAG: SCR reports 4-bit support=");
+    let _ = uart_put_i64(is_4bit_capable);
+    let _ = uart_puts("\n");
+  }
   return is_4bit_capable;
 }
 
@@ -6569,9 +6577,11 @@ fn sd_read_scr(rca: u32) -> i64 {
 // 25MHz SD "default speed" target.
 fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let diag_t0: u32 = sd_mmio_read_u32(TIMER_CLO);
-  let _ = uart_puts("SD DIAG: sdhost_init entry, TIMER_CLO=0x");
-  let _ = uart_put_hex32(diag_t0);
-  let _ = uart_puts("\n");
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("SD DIAG: sdhost_init entry, TIMER_CLO=0x");
+    let _ = uart_put_hex32(diag_t0);
+    let _ = uart_puts("\n");
+  }
 
   let _ = gpio_sdhost_alt_init();
 
@@ -6750,9 +6760,11 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     return 0 - 1;
   }
   let diag_t_cmd0: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
-  let _ = uart_puts("SD DIAG: CMD0 done, t=");
-  let _ = uart_put_i64(diag_t_cmd0 as i64);
-  let _ = uart_puts("us\n");
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("SD DIAG: CMD0 done, t=");
+    let _ = uart_put_i64(diag_t_cmd0 as i64);
+    let _ = uart_puts("us\n");
+  }
 
   // CMD8: SEND_IF_COND -- 0x1AA = 2.7-3.6V range + the 0xAA check
   // pattern. Every real SD 2.0+ card implements this and echoes the
@@ -6786,9 +6798,11 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // project_dhruva_pi1b_real_boot_investigation_2026_09_12).
   let cmd8_status: u32 = sdhost_cmd(8 as u32, 0x1AA as u32);
   let diag_t_cmd8: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
-  let _ = uart_puts("SD DIAG: CMD8 done, t=");
-  let _ = uart_put_i64(diag_t_cmd8 as i64);
-  let _ = uart_puts("us\n");
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("SD DIAG: CMD8 done, t=");
+    let _ = uart_put_i64(diag_t_cmd8 as i64);
+    let _ = uart_puts("us\n");
+  }
   let is_mmc: i64 = if sdhost_cmd_timed_out(cmd8_status) == 1 { 1 } else { 0 };
   let ocr_busy: u32 = 0x80000000 as u32;
   let hcs: u32 = 0x40000000 as u32;
@@ -6834,15 +6848,17 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
       }
     }
     let diag_t_acmd41: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
-    let _ = uart_puts("SD DIAG: ACMD41 loop exited, t=");
-    let _ = uart_put_i64(diag_t_acmd41 as i64);
-    let _ = uart_puts("us, acmd_iter=");
-    let _ = uart_put_i64(acmd_iter);
-    let _ = uart_puts(", wedged=");
-    let _ = uart_put_i64(acmd41_wedged);
-    let _ = uart_puts(", ocr_busy_seen=");
-    let _ = uart_put_i64(if (ocr & ocr_busy) != (0 as u32) { 1 } else { 0 });
-    let _ = uart_puts("\n");
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("SD DIAG: ACMD41 loop exited, t=");
+      let _ = uart_put_i64(diag_t_acmd41 as i64);
+      let _ = uart_puts("us, acmd_iter=");
+      let _ = uart_put_i64(acmd_iter);
+      let _ = uart_puts(", wedged=");
+      let _ = uart_put_i64(acmd41_wedged);
+      let _ = uart_puts(", ocr_busy_seen=");
+      let _ = uart_put_i64(if (ocr & ocr_busy) != (0 as u32) { 1 } else { 0 });
+      let _ = uart_puts("\n");
+    }
     if acmd41_wedged == 1 {
       let _ = uart_puts("SD: ACMD41 (CMD55/CMD41) timed out\n");
       return 0 - 1;
@@ -7041,29 +7057,33 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let acmd6_cmd55_status: u32 = sdhost_cmd(55 as u32, rca);
     let acmd6_cmd55_timed_out: i64 = sdhost_cmd_timed_out(acmd6_cmd55_status);
     let acmd6_cmd55_failed: i64 = sdhost_cmd_failed(acmd6_cmd55_status);
-    let _ = uart_puts("SD DIAG: ACMD6-prefix CMD55 status=0x");
-    let _ = uart_put_hex32(acmd6_cmd55_status);
-    let _ = uart_puts(" timed_out=");
-    let _ = uart_put_i64(acmd6_cmd55_timed_out);
-    let _ = uart_puts(" failed=");
-    let _ = uart_put_i64(acmd6_cmd55_failed);
-    let _ = uart_puts(" SDHSTS=0x");
-    let _ = uart_put_hex32(sd_mmio_read_u32(SDHSTS));
-    let _ = uart_puts("\n");
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("SD DIAG: ACMD6-prefix CMD55 status=0x");
+      let _ = uart_put_hex32(acmd6_cmd55_status);
+      let _ = uart_puts(" timed_out=");
+      let _ = uart_put_i64(acmd6_cmd55_timed_out);
+      let _ = uart_puts(" failed=");
+      let _ = uart_put_i64(acmd6_cmd55_failed);
+      let _ = uart_puts(" SDHSTS=0x");
+      let _ = uart_put_hex32(sd_mmio_read_u32(SDHSTS));
+      let _ = uart_puts("\n");
+    }
     let acmd6_status: u32 = sdhost_cmd(6 as u32, 2 as u32);
     let acmd6_timed_out: i64 = sdhost_cmd_timed_out(acmd6_status);
     let acmd6_failed: i64 = sdhost_cmd_failed(acmd6_status);
-    let _ = uart_puts("SD DIAG: ACMD6 status=0x");
-    let _ = uart_put_hex32(acmd6_status);
-    let _ = uart_puts(" timed_out=");
-    let _ = uart_put_i64(acmd6_timed_out);
-    let _ = uart_puts(" failed=");
-    let _ = uart_put_i64(acmd6_failed);
-    let _ = uart_puts(" R1=0x");
-    let _ = uart_put_hex32(sd_mmio_read_u32(sdrsp0));
-    let _ = uart_puts(" SDHSTS=0x");
-    let _ = uart_put_hex32(sd_mmio_read_u32(SDHSTS));
-    let _ = uart_puts("\n");
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("SD DIAG: ACMD6 status=0x");
+      let _ = uart_put_hex32(acmd6_status);
+      let _ = uart_puts(" timed_out=");
+      let _ = uart_put_i64(acmd6_timed_out);
+      let _ = uart_puts(" failed=");
+      let _ = uart_put_i64(acmd6_failed);
+      let _ = uart_puts(" R1=0x");
+      let _ = uart_put_hex32(sd_mmio_read_u32(sdrsp0));
+      let _ = uart_puts(" SDHSTS=0x");
+      let _ = uart_put_hex32(sd_mmio_read_u32(SDHSTS));
+      let _ = uart_puts("\n");
+    }
     // 40th SD round (2026-09-27): dropped the `|| (scr_result != 1)`
     // clause that used to be here. Real-HW evidence
     // (picocom_20260927_142303.log vs picocom_20260927_142746.log,
@@ -7094,7 +7114,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
       let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH) failed/timed out -- staying 1-bit\n");
       let _ = sd_state_set_is_4bit(0);
     } else {
-      let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH=4-bit) accepted -- switching to 4-bit\n");
+      if boot_debug_enabled() == 1 { let _ = uart_puts("SD DIAG: ACMD6 (SET_BUS_WIDTH=4-bit) accepted -- switching to 4-bit\n"); }
       let _ = sd_state_set_is_4bit(1);
     }
   } else {
@@ -7132,11 +7152,13 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // CMD24's own eventual wedge.
   let cmd16_r1: u32 = sd_mmio_read_u32(sdrsp0);
   let cmd16_current_state: u32 = (cmd16_r1 >> (9 as u32)) & (0xF as u32);
-  let _ = uart_puts("SD DIAG: post-CMD16 R1=0x");
-  let _ = uart_put_hex32(cmd16_r1);
-  let _ = uart_puts(" CURRENT_STATE=");
-  let _ = uart_put_i64(cmd16_current_state as i64);
-  let _ = uart_puts(if cmd16_current_state == (4 as u32) { " (tran -- card genuinely selected)\n" } else { " (NOT tran -- CMD7 did NOT actually select the card!)\n" });
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("SD DIAG: post-CMD16 R1=0x");
+    let _ = uart_put_hex32(cmd16_r1);
+    let _ = uart_puts(" CURRENT_STATE=");
+    let _ = uart_put_i64(cmd16_current_state as i64);
+    let _ = uart_puts(if cmd16_current_state == (4 as u32) { " (tran -- card genuinely selected)\n" } else { " (NOT tran -- CMD7 did NOT actually select the card!)\n" });
+  }
   // Deliberately diagnostic-only, NOT a hard failure (no `return 0-1`
   // here) -- this exact QEMU regression run's own log already shows
   // CURRENT_STATE=3 here too, despite QEMU's own SD model completing
@@ -7235,21 +7257,25 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     // FIFO-threshold) -- needs a fourth real-hardware capture to know
     // whether this one actually helps.
     let _ = delay(10000);
-    let _ = uart_puts("SD DIAG: data-transfer SDCDIV set, core_clock_hz=");
-    let _ = uart_put_i64(core_clock_hz);
-    let _ = uart_puts(" target_hz=");
-    let _ = uart_put_i64(target_hz);
-    let _ = uart_puts(" div=");
-    let _ = uart_put_i64(div4);
-    let _ = uart_puts("\n");
-  } else {
-    let _ = uart_puts("SD DIAG: staying at identification-speed SDCDIV (");
-    if target_hz <= 0 {
-      let _ = uart_puts("adaptive backoff: last-resort attempt");
-    } else {
-      let _ = uart_puts("core-clock mailbox query failed");
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("SD DIAG: data-transfer SDCDIV set, core_clock_hz=");
+      let _ = uart_put_i64(core_clock_hz);
+      let _ = uart_puts(" target_hz=");
+      let _ = uart_put_i64(target_hz);
+      let _ = uart_puts(" div=");
+      let _ = uart_put_i64(div4);
+      let _ = uart_puts("\n");
     }
-    let _ = uart_puts(")\n");
+  } else {
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("SD DIAG: staying at identification-speed SDCDIV (");
+      if target_hz <= 0 {
+        let _ = uart_puts("adaptive backoff: last-resort attempt");
+      } else {
+        let _ = uart_puts("core-clock mailbox query failed");
+      }
+      let _ = uart_puts(")\n");
+    }
   }
 
   // OCR bit 30 is SD's CCS (Card Capacity Status) and MMC's own
