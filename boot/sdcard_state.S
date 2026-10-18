@@ -1375,7 +1375,21 @@ sd_scr_dump_and_check_4bit:
     bl sdhost_diag_puts
     mov r5, #0
 sd_scr_dump_loop:
-    cmp r5, #8
+    /* REAL-HW BUG, found 2026-10-18 (task #357 follow-up, continued):
+     * this loop's own 8-byte hex dump, printed right after sd_scr_
+     * drain_diag's own already-capped (6e47a69) 1-word line, still
+     * pushed the COMBINED output just over the real UART ring+FIFO's
+     * ~79-byte capacity on real hardware -- confirmed live: the SAME
+     * SENTINEL corruption recurred even with that earlier cap in
+     * place. Capped to 2 bytes here, same minimal shape as 6e47a69's
+     * own fix (a loop-bound constant only, no new calls/branches --
+     * two earlier attempts to gate this print via extra log_state_
+     * get_mask() calls instead each caused an unrelated, unexplained
+     * QEMU regression in this exact function, so this deliberately
+     * avoids adding any new instructions here). The reassembly logic
+     * below reads buf[0..3] directly via r4, independent of r5, so
+     * this is purely a print-volume change. */
+    cmp r5, #2
     beq sd_scr_dump_done
     ldrb r0, [r4, r5]
     lsr r0, r0, #4
