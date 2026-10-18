@@ -46651,38 +46651,52 @@ fn kernel_main() -> i64 {
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
     let _ = watchdog_kick();
   }
-  let _ = eval_self_test("2+3", 5, 0);
-  let _ = eval_self_test("2 + 3 * 4", 14, 0);
-  let _ = eval_self_test("(2+3)*4", 20, 0);
-  let _ = eval_self_test("10-2-3", 5, 0);
-  let _ = eval_self_test("2*(3+4*(5-1))", 38, 0);
-  let _ = eval_self_test("-5+10", 5, 0);
-  let _ = eval_self_test("100/3", 33, 0);
-  let _ = eval_self_test("10/0", 0, 1);
-  let _ = eval_self_test("(1+2", 0, 1);
-  // Round 2 audit regression: values stack used to store each number as
-  // a truncating single u32 word, silently corrupting operands beyond
-  // +-2 billion before eval_apply ever saw them -- this used to return
-  // a wrong silent answer (no error) instead of correctly detecting
-  // overflow. Also exercises a large-but-in-range value end to end to
-  // confirm the hi/lo split round-trips correctly, not just the
-  // overflow-rejection path.
-  let _ = eval_self_test("999999999999*999999999999", 0, 1);
-  let _ = eval_self_test("5000000000+5000000000", 10000000000, 0);
+  // User request (2026-10-18): boot should be as fast and as quiet as
+  // possible by default -- live UART should show PASS/FAIL per stage,
+  // not every individual self-test's own verbose output, and self-
+  // tests themselves should be opt-in (run to diagnose a suspected
+  // issue) rather than paid on every single boot. These were the last
+  // boot-time self-tests in this function NOT already gated behind
+  // boot_debug_enabled() (every other self-test call site in this
+  // file already uses this exact convention) -- eval/governor/
+  // governor-replay/the i64::MIN print regression here, dharafs_
+  // encryption_self_check further below.
+  if boot_debug_enabled() == 1 {
+    let _ = eval_self_test("2+3", 5, 0);
+    let _ = eval_self_test("2 + 3 * 4", 14, 0);
+    let _ = eval_self_test("(2+3)*4", 20, 0);
+    let _ = eval_self_test("10-2-3", 5, 0);
+    let _ = eval_self_test("2*(3+4*(5-1))", 38, 0);
+    let _ = eval_self_test("-5+10", 5, 0);
+    let _ = eval_self_test("100/3", 33, 0);
+    let _ = eval_self_test("10/0", 0, 1);
+    let _ = eval_self_test("(1+2", 0, 1);
+    // Round 2 audit regression: values stack used to store each number as
+    // a truncating single u32 word, silently corrupting operands beyond
+    // +-2 billion before eval_apply ever saw them -- this used to return
+    // a wrong silent answer (no error) instead of correctly detecting
+    // overflow. Also exercises a large-but-in-range value end to end to
+    // confirm the hi/lo split round-trips correctly, not just the
+    // overflow-rejection path.
+    let _ = eval_self_test("999999999999*999999999999", 0, 1);
+    let _ = eval_self_test("5000000000+5000000000", 10000000000, 0);
+  }
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
     let _ = watchdog_kick();
   }
 
-  // Round 6 audit regression: uart_put_i64 used to negate its whole
-  // input up front, which overflows for exactly one value, i64::MIN --
-  // see uart_put_i64's own comment for why that's a real hang/wrong-
-  // answer risk on this target, not just theoretical. No caller passes
-  // i64::MIN today, but this is a general-purpose print helper, so
-  // this exercises it directly rather than only through whatever
-  // happens to call it elsewhere.
-  let _ = uart_puts("UART: uart_put_i64(i64::MIN)=");
-  let _ = uart_put_i64(0 - 9223372036854775807 - 1);
-  let _ = uart_puts(" (expect -9223372036854775808)\n");
+  if boot_debug_enabled() == 1 {
+    // Round 6 audit regression: uart_put_i64 used to negate its whole
+    // input up front, which overflows for exactly one value, i64::MIN --
+    // see uart_put_i64's own comment for why that's a real hang/wrong-
+    // answer risk on this target, not just theoretical. No caller passes
+    // i64::MIN today, but this is a general-purpose print helper, so
+    // this exercises it directly rather than only through whatever
+    // happens to call it elsewhere.
+    let _ = uart_puts("UART: uart_put_i64(i64::MIN)=");
+    let _ = uart_put_i64(0 - 9223372036854775807 - 1);
+    let _ = uart_puts(" (expect -9223372036854775808)\n");
+  }
 
   // Phase 5 verification: governor_desired_freq_mhz's threshold
   // boundaries, via boot-time self-test rather than live introspection
@@ -46692,13 +46706,15 @@ fn kernel_main() -> i64 {
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
     let _ = watchdog_kick();
   }
-  let _ = governor_self_test(0, 250);
-  let _ = governor_self_test(1, 250);
-  let _ = governor_self_test(2, 450);
-  let _ = governor_self_test(3, 450);
-  let _ = governor_self_test(4, 700);
-  let _ = governor_self_test(5, 700);
-  let _ = governor_replay_test();
+  if boot_debug_enabled() == 1 {
+    let _ = governor_self_test(0, 250);
+    let _ = governor_self_test(1, 250);
+    let _ = governor_self_test(2, 450);
+    let _ = governor_self_test(3, 450);
+    let _ = governor_self_test(4, 700);
+    let _ = governor_self_test(5, 700);
+    let _ = governor_replay_test();
+  }
   if boot_debug_enabled() == 1 { let _ = uart_clock_governor_cross_check_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dma_ram_copy_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dma_uart_tx_self_test(); }
@@ -46855,7 +46871,7 @@ fn kernel_main() -> i64 {
   // before start_multitasking. The self-check needs a working SD
   // controller, already brought up above.
   let _ = dharafs_crypto_key_init();
-  let _ = dharafs_encryption_self_check();
+  if boot_debug_enabled() == 1 { let _ = dharafs_encryption_self_check(); }
   // Task #308 follow-up: kick after the media-encryption self-check
   // (its own real SD round trip) -- see the kick right after
   // sdhost_init's own matching comment.
