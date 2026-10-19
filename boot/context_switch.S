@@ -1045,6 +1045,14 @@ task_holds_any_mutex_get_at:
     mov r1, #0
     bx lr
 
+/* Third .ltorg this file has needed (task #357 follow-up, 2026-10-18):
+ * same "pool needs to be closer" reason as the first two (see their
+ * own comments above) -- the resume_pc_sentinel_bad diagnostic dump
+ * added further down this file pushed the literal pool for this
+ * region's own `ldr =...` instructions (task_holds_any_mutex_get_at's
+ * mutex_owner_table, etc.) out of GNU as's PC-relative range. */
+.ltorg
+
 .global sleep_until_table_set_at
 sleep_until_table_set_at:
     ldr r2, =sleep_until_table
@@ -2226,6 +2234,33 @@ resume_pc_sentinel_check:
 resume_pc_sentinel_bad:
     mov r4, r0
     mov r5, r1
+    /* TASK #357 follow-up (2026-10-18, real-HW retest after the
+     * scheduler_ready_count fix): confirmed live -- every halt-path
+     * print from here on out came out truncated at a few bytes on
+     * real hardware ("SENTINEL: corrupted resu" and nothing more,
+     * repeatedly, byte-for-byte identical cutoff across separate
+     * boots), while QEMU never showed the truncation at all. Root
+     * cause: uart_pio_busy (boot/uart_tx_ring_state.S, added by the
+     * UART-PIO-vs-tick-drain race fix) is set to 1 by uart_putc for
+     * the ENTIRE duration of its own unbounded "wait while TX FIFO
+     * full" busy-wait loop (kernel_main.vani), cleared back to 0 only
+     * after the real hardware write completes. If whatever task was
+     * live inside that busy-wait at the moment of the ORIGINAL
+     * corruption (the actual bug this sentinel exists to catch) never
+     * resumes normally, that clear-back-to-0 never runs -- the flag
+     * is stuck at 1 forever. Both uart_tx_ring_drain_only and uart_tx_
+     * ring_push_and_drain_impl (which sched_diag_putc, this whole
+     * function's own print primitive, calls into) bail out immediately
+     * whenever this flag reads 1, so every byte pushed after that
+     * point sits in the ring forever, never reaching the wire --
+     * exactly the observed cutoff. Safe to force-clear here
+     * unconditionally: this function never returns to normal
+     * execution (it halts forever a few lines below), so there is no
+     * "restore the caller's expectation" concern the way there would
+     * be anywhere else this flag is touched -- only getting this
+     * diagnostic itself OUT over the wire matters from this point on. */
+    mov r0, #0
+    bl uart_pio_busy_set
     ldr r0, =resume_pc_sentinel_msg1
     bl sched_diag_puts
     mov r0, r4
@@ -2236,10 +2271,66 @@ resume_pc_sentinel_bad:
     bl sched_diag_put_hex32
     mov r0, #10
     bl sched_diag_putc
+    /* User request (2026-10-18): "domino effect" dump -- this only
+     * runs ONCE, right before halting forever (never on the good
+     * path, never in the per-tick hot path), so adding diagnostics
+     * here is safe: it cannot perturb the timing that led to this
+     * failure, unlike every earlier attempt to instrument the FIQ/IRQ
+     * entry path itself. Dumps the recorded SPSR (freshly read back --
+     * whatever the frame's own spsr field held was already staged into
+     * the real SPSR_svc register by this point, specifically for the
+     * restore this halt is replacing, so a plain `mrs` here reads it
+     * faithfully with zero extra plumbing) and current_task, then
+     * every one of r0-r12 straight off the frame (sp already points at
+     * r0's own slot here, same as the existing resume_pc/true_lr
+     * reads) -- answers the key question raw resume_pc/true_lr alone
+     * can't: is ONLY this pair corrupted (a narrow, late-stage bug), or
+     * is the WHOLE frame garbage (an earlier, wholesale corruption --
+     * wrong sp, a wild write, or similar)? r6/r7/r8/r9 used as
+     * additional scratch below -- same "never returns, nothing to
+     * restore" reasoning as r4/r5 above. */
+    mrs r6, spsr
+    ldr r0, =resume_pc_sentinel_msg_spsr
+    bl sched_diag_puts
+    mov r0, r6
+    bl sched_diag_put_hex32
+    ldr r7, =current_task
+    ldr r7, [r7]
+    ldr r0, =resume_pc_sentinel_msg_task
+    bl sched_diag_puts
+    mov r0, r7
+    bl sched_diag_put_hex32
+    mov r0, #10
+    bl sched_diag_putc
+    mov r8, sp                       /* r8 = frame base (r0's own slot) */
+    mov r9, #0                       /* r9 = word index, 0..12 (r0..r12) */
+resume_pc_sentinel_dump_loop:
+    cmp r9, #13
+    bge resume_pc_sentinel_halt
+    ldr r0, =resume_pc_sentinel_msg_r
+    bl sched_diag_puts
+    mov r0, r9
+    bl sched_diag_put_hex1
+    ldr r0, =resume_pc_sentinel_msg_eq
+    bl sched_diag_puts
+    ldr r0, [r8, r9, lsl #2]
+    bl sched_diag_put_hex32
+    mov r0, #' '
+    bl sched_diag_putc
+    add r9, r9, #1
+    b resume_pc_sentinel_dump_loop
 resume_pc_sentinel_halt:
     b resume_pc_sentinel_halt
 
 .section ".rodata"
+resume_pc_sentinel_msg_spsr:
+    .asciz "SENTINEL: recorded_spsr="
+resume_pc_sentinel_msg_task:
+    .asciz " current_task="
+resume_pc_sentinel_msg_r:
+    .asciz "SENTINEL: r"
+resume_pc_sentinel_msg_eq:
+    .asciz "="
 resume_pc_sentinel_msg1:
     .asciz "\nSENTINEL: corrupted resume state, refusing to jump! resume_pc="
 resume_pc_sentinel_msg2:
