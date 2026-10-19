@@ -83,6 +83,48 @@ fiq_entry:
     mrs r0, spsr                      /* r0 = interrupted cpsr -- r0's own
                                         * real value is already safely
                                         * staged above, free to clobber now */
+    /* TASK #357 follow-up (2026-10-18, real-HW root-cause investigation,
+     * re-applying an earlier-reverted fix): ARM IRQ exception entry
+     * auto-masks I but NOT F -- irq_entry.S's own first real instruction
+     * is `cpsid if` (see that file), meaning there is a genuine, narrow
+     * window between hardware exception entry and that instruction
+     * where IRQ mode is live with F still unmasked. If this timer FIQ
+     * lands in exactly that window, SPSR_fiq (just read into r0 above)
+     * reports mode=0x12 (IRQ) -- irq_entry.S's own partially-built state
+     * (its banked lr_irq/spsr_irq already hold the ORIGINAL interrupted
+     * context, not this FIQ's) is not something this function has any
+     * case for; capturing "true_lr"/mode here would stamp a stale or
+     * conflated value into the frame this FIQ builds, corrupting
+     * whichever task eventually gets resumed through it. Fixed the same
+     * way Linux's own `ARM: entry: Block IRQs in early IRQ context`
+     * patch (same hardware-level race, cited by an earlier investigation
+     * pass this round) accepts as the correct mitigation: bail out
+     * immediately, undoing the one `stmdb` above and returning via the
+     * standard FIQ-return idiom, deferring to the NEXT time F is
+     * unmasked (irq_entry.S's own `cpsid if`, a handful of instructions
+     * away, is reached either way -- the timer match condition stays
+     * pending at the hardware level since this bailout never reaches
+     * timer_tick_dispatch's own TIMER_CS write-1-to-clear, so nothing is
+     * lost, only deferred until it's actually safe to process). Tried
+     * once already this round and reverted after an apparent QEMU
+     * regression -- but this file's own earlier, purely-diagnostic
+     * (behaviorally inert) instrumentation attempt independently proved
+     * QEMU's failure rate for this exact hot path swings wildly (10% to
+     * 90%) from ANY instruction-count change near here, regardless of
+     * whether that change does anything at all -- so that QEMU evidence
+     * is not trusted on its own merits anymore. Real hardware gives a
+     * far more reproducible signal for the actual bug this round is
+     * chasing (consistent, repeatable crash shortly after PASS, once
+     * UART RX IRQs genuinely start interleaving with the timer FIQ for
+     * the first time in the whole boot sequence) -- validate THERE, not
+     * under QEMU, before judging this fix again. r2 is free scratch
+     * here (its own real value was already staged by the stmdb above). */
+    and r2, r0, #0x1F
+    cmp r2, #0x12
+    bne fiq_entry_not_irq_race
+    ldmia sp!, {r0-r7}
+    movs pc, lr
+fiq_entry_not_irq_race:
     mov r1, lr                        /* r1 = resume pc -- same reasoning,
                                         * r1's real value already staged */
     stmdb sp!, {r0, r1}                /* staged block, low-to-high in
