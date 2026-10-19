@@ -2200,7 +2200,13 @@ extern "C" fn mutex_wait_worst_ticks_get() -> i64;
 // Phase 5: cpu_wfi/scheduler_ready_count -- context_switch.S.
 #[stack_cost(bytes=1)]
 extern "C" fn cpu_wfi() -> i64;
-#[stack_cost(bytes=1)]
+// TASK #357 follow-up (2026-10-18): was bytes=1 -- stale the instant
+// this function gained its own push{r4,r5,r6,r9}/pop (16 bytes) to fix
+// a real AAPCS callee-saved violation found via a project-wide sweep
+// (context_switch.S's own header comment on scheduler_ready_count has
+// the full story). Caught immediately by build.sh's own stack-cost
+// audit, exactly as that gate is designed to.
+#[stack_cost(bytes=16)]
 extern "C" fn scheduler_ready_count() -> i64;
 // Round 16 audit -- context_switch.S's own comment on mem_barrier has
 // the full story: a real-hardware memory-ordering gap this project's

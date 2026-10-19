@@ -3549,9 +3549,34 @@ scheduler_set_tick_count_test_only:
  * function must explicitly skip an unused slot (eff_prio_table[i] ==
  * 255) too: it only ever looks at sleep_until_table, which an unused
  * slot's own .bss zero-init leaves at 0 (== "always ready"), and
- * would otherwise inflate the count with every never-created slot. */
+ * would otherwise inflate the count with every never-created slot.
+ *
+ * TASK #357 follow-up (2026-10-18, real-HW SENTINEL register-corruption
+ * investigation): found via a project-wide sweep for exactly this bug
+ * class (functions declared `extern "C" fn` in kernel_main.vani --
+ * i.e. called with a normal `bl` from vani/GCC-compiled code, where
+ * AAPCS makes r4-r11 the CALLEE's responsibility to preserve -- that
+ * freely clobber r4-r11 with no save/restore at all). This function
+ * used r4, r5, r6, r9 as pure scratch (loop index, temporaries) with
+ * zero protection -- unlike scheduler_pick_next's own r8-r11 (see its
+ * header comment: an almost identical incident, round 65, fixed with
+ * the exact same push/pop shape below) or dhruva_prio_lock_impl's own
+ * r4/r5 (round 53), both already hardened for this. One real call site
+ * (kernel_main.vani's `diagnose` shell command) runs directly inside
+ * task_f/shell -- the exact task this round's own live SENTINEL catch
+ * (resume_pc_sentinel_bad's new register dump) showed with garbage in
+ * several r0-r12 slots, and the same run where phase4_milestone.py's
+ * own "[FAIL] diagnose shows per-task run-ticks" clusters alongside
+ * tlsecho/httpecho/mqttecho failing together -- consistent with (not
+ * yet proven to be the sole cause of) a shared corruption event. If
+ * GCC keeps any of task_f's own live local state in r4/r5/r6/r9 across
+ * this call, it is silently destroyed the instant this function
+ * returns -- fixed the same way as every other instance of this bug
+ * class in this file: push the caller's values, pop them back
+ * immediately before the one return. */
 .global scheduler_ready_count
 scheduler_ready_count:
+    push {r4, r5, r6, r9}
     ldr r1, =tick_count
     ldr r1, [r1]                   /* r1 = tick_count */
     ldr r2, =sleep_until_table
@@ -3575,6 +3600,9 @@ srq_next:
 srq_done:
     mov r0, r3
     mov r1, #0
+    pop {r4, r5, r6, r9}            /* restore the caller's own values --
+                                     * see this function's own header
+                                     * comment for the full "why" */
     bx lr
 
 /* mut ref i64 task_{a,b,c,d}_init_stack(mut ref i64 stack_base, i64 stack_bytes)
