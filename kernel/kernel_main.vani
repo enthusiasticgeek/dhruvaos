@@ -132,6 +132,27 @@ const IC_ENABLE2: i64 = 0x2000B214;
 const IC_DISABLE1: i64 = 0x2000B21C;
 #[mmio(size=4)]
 const FIQ_CONTROL: i64 = 0x2000B20C;
+// TASK #357 follow-up (2026-10-18, real-HW SENTINEL corruption
+// investigation): IC_DISABLE2/IC_DISABLE_BASIC, for quiescing EVERY
+// interrupt-enable bit this project doesn't itself own, at the very
+// start of boot -- see boot_quiesce_interrupt_controller's own header
+// comment for the full "why" (confirmed real Linux bug this exact
+// combination of hardware/bootloader has: the Raspberry Pi
+// Foundation's closed-source GPU firmware is documented, upstream,
+// to hand off to the OS with at least the USB controller's own
+// interrupt-enable bit already set -- "irqchip/bcm2835: Quiesce IRQs
+// left enabled by bootloader", Lukas Wunner, accepted into Linux
+// 5.7). Register facts: same base/layout family as IC_ENABLE1/
+// IC_DISABLE1 above (base+0x214/base+0x21C for bank 2), plus the
+// "basic" bank's own enable/disable pair this project has never
+// needed a constant for before now (base+0x218 Enable_Basic_IRQs,
+// base+0x224 Disable_Basic_IRQs) -- all confirmed against the same
+// real irq-bcm2835.c register layout IC_DISABLE1's own comment above
+// already cites.
+#[mmio(size=4)]
+const IC_DISABLE2: i64 = 0x2000B220;
+#[mmio(size=4)]
+const IC_DISABLE_BASIC: i64 = 0x2000B224;
 // Power management / watchdog (base 0x20100000)
 #[mmio(size=4)]
 const PM_RSTC: i64 = 0x2010001C;
@@ -5897,6 +5918,53 @@ fn scheduler_tick_interval_us() -> u32 {
   return 500000 as u32;
 }
 
+// TASK #357 follow-up (2026-10-18, real-HW SENTINEL corruption
+// investigation): quiesce every interrupt-enable bit across all three
+// BCM2835 interrupt-controller banks (basic, bank 1, bank 2) at the
+// very start of boot, before this project's own init code (timer_ic_
+// init/uart_rx_irq_init, both called later) selectively re-enables
+// exactly what it needs. Confirmed real upstream Linux bug for this
+// exact hardware/bootloader combination: "irqchip/bcm2835: Quiesce
+// IRQs left enabled by bootloader" (Lukas Wunner, accepted Linux
+// 5.7) -- the Raspberry Pi Foundation's closed-source GPU firmware
+// hands off to the OS with at least the USB controller's own
+// interrupt-enable bit already set from its own earlier use of it,
+// not cleared on handoff the way a reset would leave it. This
+// project's own irq_dispatch() (further down this file) only ever
+// checks IC_PENDING2's UART bit -- it has no else-branch for any
+// OTHER source, so if a leftover-enabled peripheral (USB, matching
+// the cited upstream finding exactly) asserts its own interrupt line
+// at any point after this project's own USB bring-up starts touching
+// it, irq_entry.S would take a real IRQ for it, irq_dispatch would
+// find the UART bit clear and do nothing, and the ACTUAL pending
+// condition -- a level-triggered line -- would never get acknowledged
+// at its source, re-asserting immediately on every single return from
+// that IRQ. A tight IRQ-storm of that shape dramatically multiplies
+// how often ANY narrow FIQ/IRQ-entry race (see fiq_entry.S's own
+// header comment on the ARM IRQ-auto-masks-I-not-F hazard) actually
+// gets hit in practice, without needing the race itself to be common
+// -- and fits this investigation's own most puzzling fact (the real-
+// HW crash is consistently right after USB bring-up/PASS, far more
+// reproducible than under QEMU, whose emulated bootloader/USB model
+// does not replicate this exact leftover-enable-bit behavior).
+// Written unconditionally to all three disable registers regardless
+// of what the bootloader actually left set -- safe by construction:
+// every source this project actually needs gets explicitly re-enabled
+// by name afterward (timer_ic_init's own FIQ_CONTROL write, uart_rx_
+// irq_init's own IC_ENABLE2 write), so there is no risk of silently
+// losing something this code still depends on.
+fn boot_quiesce_interrupt_controller() -> i64 {
+  let ic_disable_basic: i64 = IC_DISABLE_BASIC;
+  let ic_disable1: i64 = IC_DISABLE1;
+  let ic_disable2: i64 = IC_DISABLE2;
+  let all_bits: u32 = 0xFFFFFFFF as u32;
+  let _ = mmio_write_u32(ic_disable_basic, all_bits);
+  let _ = mmio_write_u32(ic_disable1, all_bits);
+  let _ = mmio_write_u32(ic_disable2, all_bits);
+  let _ = mem_barrier();
+  return 0;
+}
+
 fn timer_ic_init() -> i64 {
   let timer_cs: i64 = TIMER_CS;
   let timer_clo: i64 = TIMER_CLO;
@@ -6014,7 +6082,7 @@ fn timer_ic_init() -> i64 {
 // the write is silently ignored -- not optional, not a Dhruva
 // convention, this is how the peripheral itself is gated against
 // accidental writes.
-const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 0;
+const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 1;
 
 // ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, Gap A):
 // same gating pattern as WATCHDOG_ENABLE_FOR_REAL_HARDWARE above, for
@@ -46079,6 +46147,12 @@ fn heap_usage_self_test() -> i64 {
 #[no_mangle]
 fn kernel_main() -> i64 {
   let _ = uart_init();
+  // TASK #357 follow-up (2026-10-18): as early as possible -- see
+  // boot_quiesce_interrupt_controller's own header comment for the
+  // full "why" (a confirmed real upstream Linux bug: the Pi's own
+  // closed-source bootloader can hand off with a peripheral's
+  // interrupt-enable bit, e.g. USB, already set).
+  let _ = boot_quiesce_interrupt_controller();
   let _ = uart_puts("Dhruva Phase 2: fixed-priority scheduling + priority ceiling\n");
   // TEMPORARY DIAGNOSTIC (2026-09-15): raw TIMER_CLO value at the
   // earliest point the kernel can read it (right after uart_init) --
