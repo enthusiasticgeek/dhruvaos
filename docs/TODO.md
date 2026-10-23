@@ -14499,3 +14499,32 @@ been pending for multiple seconds and fires immediately, compounding with whatev
 live at that exact instant -- fixed by re-arming a fresh interval right before the first unmask) and the
 `sd_wedge_ckpt_scratch`/`sd_wedge_checkpoint` raw-SD diagnostic infrastructure this investigation built
 along the way. Committed `129efbf`.
+
+### Task #357: DMA UART TX real-HW trial PASSED, no auto-revert needed (2026-10-23)
+
+First real-hardware exercise of `UART_DMA_ADOPT_FOR_REAL_HARDWARE` (gated off by default since 2026-10-16,
+see the entry above -- QEMU's `bcm2835-dma` model hit a re-entrant-IO hang specific to this call site, real
+hardware was always the deferred next step). Along the way, a real UART RX stall bug was found and fixed
+first (PL011 clear-after-drain interrupt-ordering race, matching Linux's own 2018 `amba-pl011.c` fix --
+see the kernelupload-stream-stall entry; committed `84421df`), since the normal UART upload path needed to
+be reliable before using it to get a DMA-TX build onto the board at all. That stall turned out unrelated to
+DMA TX itself, so the DMA build was transferred to slot B via a direct SD-card flash (`test/kernel_slot_layout.py
+... seed ... --slot b`) instead, bypassing the still-to-be-verified-on-real-HW upload path for this trial.
+
+Seeding slot B that way sets `active_slot=B` directly (`kernel_slot_layout.py`'s own documented
+"testing the candidate" seed semantics), so the very next power-up auto-booted the DMA-TX build with zero
+further commands needed -- confirmed via `kernelslot status` (`active_slot=B`, `attempt_count=0`, i.e.
+`kernel_slot_mark_boot_good()` already fired after reaching `PASS`) and independently via disassembly of
+the exact flashed binary (`build/dhruva_real.img`, sha256 `169a8d0...`): `fn_uart_puts` contains real `bl`
+instructions into `dma_uart_tx_start`/`dma_uart_tx_busy`, proving the DMA branch was compiled in, not
+dead-code-eliminated, i.e. this boot was genuinely exercising the DMA path and not silently falling back to
+PIO. Stress-tested with several heavy-output shell commands back-to-back (`diagnose`'s full multi-KB
+dump, `lrdump`, `netstat`, `ls`) over real UART -- all transmitted byte-correct with zero corruption, zero
+hangs, zero SENTINEL ring entries this boot. The A/B bootcount/watchdog fallback (task #352/#353) stood by
+as the safety net the whole time but was never needed -- slot A remains untouched and still `ready=1` if a
+revert is ever required.
+
+`preferred_slot` is still `A` (seeding only ever sets `active_slot`, by design -- a lasting switch is a
+separate, manual `kernelslot activate b`). Source tree's own `UART_DMA_ADOPT_FOR_REAL_HARDWARE` stays
+committed as `0` per this project's real-HW-only-flag convention; only the already-built, already-flashed
+artifact carries `1`.
