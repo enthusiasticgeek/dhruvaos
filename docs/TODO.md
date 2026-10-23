@@ -14449,3 +14449,53 @@ always) -- the same pattern every other real-HW-only feature in this codebase al
 zero regression. Flipping the flag to 1 and testing on the real Pi 1B is the natural next step whenever
 that's worth doing -- the code is fully written and ready, just not yet proven outside this one QEMU
 dispatch quirk.
+
+### Task #357 follow-up: real-HW "SENTINEL: corrupted resume state" crash -- root-caused and fixed, no CPU hazard involved (2026-10-22/23)
+
+A new real-HW crash surfaced on the A/B-slot kernel, reliably right after `PASS`/`DHCP: client_start`:
+`resume_pc_sentinel_check` (added by the earlier follow-up above this one, task #357's own original
+diagnostic sentinel) halting with `true_lr` out of its expected range. First suspicion was the capture
+mechanism itself -- task #253's single-instruction `stmia ...,{sp,lr}^` user-register capture -- so it was
+reverted to the original `cps #0x1F` SYS-mode dip as an A/B test. **Both forms reproduced the identical
+`true_lr=0`** on real hardware, ruling out the capture instruction. A ring buffer (`lr_capture_ring`,
+`context_switch.S`) recording every capture and every `resume_pc_sentinel_check` call, sorted
+chronologically by `TIMER_CLO`, pinned the fatal event precisely: task_d (idle) stopped with `true_lr=0`
+mid-`fn_governor_desired_freq_mhz_v2` at an address with no nearby `bl` -- architecturally, lr should have
+held a real return address there, not 0. This briefly looked like it could be a genuine ARM1176 hardware
+hazard reading `r14_usr` via the `cps` dip under real interrupt contention, so a double-dip-and-compare
+latch was built (dip twice in immediate succession, same site, in both `fiq_entry.S`/`irq_entry.S`) to test
+for a real CPU-level race -- a web-research pass found no documented ARM1176/BCM2835 erratum and no
+Linux/U-Boot/Zephyr precedent for this exact symptom either.
+
+Disassembly of the actual built binary settled it before the double-dip test was ever flashed:
+`fn_governor_desired_freq_mhz_v2`'s checked 64-bit multiply-accumulate (`w0*h0 + w1*h1 + w2*h2 + w3*h3`) is
+register-pressure-heavy, so the compiler does the completely ordinary thing -- push the real return address
+to its own stack frame in the prologue (`push {r4-r9,sl,fp,lr}`), then freely reuse `r14` as a plain
+scratch/accumulator register for the rest of the body (three separate `mov lr, #0` sites), returning via
+`pop {..., pc}` without ever touching `lr` again. `r14_usr` can legitimately be any value, including 0, at
+an arbitrary preemption point inside any function that does this -- ordinary AAPCS-legal codegen, not
+corruption, and not specific to this one function. Both capture forms agreeing on the same zero was never
+evidence of a race; it was evidence the value genuinely was zero.
+
+The real bug was `resume_pc_sentinel_check`'s own header comment claiming "zero known legitimate
+false-positive surface" for validating `true_lr` in the same code-address range as `resume_pc`. That claim
+was wrong. **Fix**: dropped the range check on `true_lr` (still logged into the ring for diagnostics, just
+no longer halts); `resume_pc` stays gated, since it comes from the exception frame's own PC/SPSR
+(`lr_fiq`/`lr_irq`, hardware-banked registers the interrupted task's own compiled code never touches) and
+is the only field actually required for a safe resume. Removed the now-unnecessary double-dip diagnostic
+entirely (it would only have confirmed both readings agree, which is now already understood, not a race).
+Verified `true_lr` has no other consumer anywhere that treats it as an address -- it only ever round-trips
+through the plain `ldmia ...^` register restore, safe for any value.
+
+Real-HW retest after the fix: booted clean through `PASS` -> `DHCP: client_start` -> the exact `SD DIAG:
+SCR=02 00` point that crashed every single time before, system fully alive and shell-responsive afterward
+(`lrdump` answered normally). The ring buffer caught the previously-fatal signature recurring twice more
+during that same run (task_d captured with `true_lr=0` inside the governor function) with zero halts
+either time -- direct confirmation the fix handles the real, recurring condition, not just the one
+originally-observed instance. Also folds in `timer_clear_stale_match_before_handoff` (a separate, real
+finding from the same investigation: the timer's first compare match is armed early in `kernel_main` while
+interrupts stay masked for the rest of boot, so by the time `start_multitasking` unmasks I/F, the match has
+been pending for multiple seconds and fires immediately, compounding with whatever UART RX state is also
+live at that exact instant -- fixed by re-arming a fresh interval right before the first unmask) and the
+`sd_wedge_ckpt_scratch`/`sd_wedge_checkpoint` raw-SD diagnostic infrastructure this investigation built
+along the way. Committed `129efbf`.
