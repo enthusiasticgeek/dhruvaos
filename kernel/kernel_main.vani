@@ -28955,7 +28955,9 @@ fn governor_step() -> i64 {
     if status == 0 {
       let _ = governor_set_last_applied_mhz(desired);
     }
-    if (log_state_get_mask() & (4 as u32)) != (0 as u32) { // LOG_CAT_DEMO
+    // 2026-10-23: also require the stream to be inactive -- see
+    // task_mutex_demo_high_wake_body's own matching comment.
+    if ((log_state_get_mask() & (4 as u32)) != (0 as u32)) && (kernelupload_stream_active_get() == (0 as u32)) { // LOG_CAT_DEMO
       let _ = uart_puts_bounded("GOVERNOR: step ready=");
       let _ = uart_put_i64_bounded(ready);
       let _ = uart_puts_bounded(" desired_mhz=");
@@ -29269,7 +29271,9 @@ fn uart_clock_governor_cross_check_self_test() -> i64 {
 #[no_heap]
 #[wcet(cycles=100000)]
 fn task_d_wake_body() -> i64 {
-  if (log_state_get_mask() & (4 as u32)) != (0 as u32) { // LOG_CAT_DEMO
+  // 2026-10-23: also require the stream to be inactive -- see
+  // task_mutex_demo_high_wake_body's own matching comment.
+  if ((log_state_get_mask() & (4 as u32)) != (0 as u32)) && (kernelupload_stream_active_get() == (0 as u32)) { // LOG_CAT_DEMO
     let _ = uart_puts_bounded("idle\n");
   }
   let _ = governor_step();
@@ -35562,7 +35566,10 @@ fn task_custom_demo() -> i64 {
 #[no_heap]
 #[wcet(cycles=100000)]
 fn task_mutex_demo_low_wake_body() -> i64 {
-  let mlow_log: i64 = if (log_state_get_mask() & (4 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_DEMO
+  // 2026-10-23 (real-HW kernelupload-stream stall investigation): also
+  // require the stream to be inactive, not just LOG_CAT_DEMO -- see
+  // task_mutex_demo_high_wake_body's own matching comment for why.
+  let mlow_log: i64 = if ((log_state_get_mask() & (4 as u32)) != (0 as u32)) && (kernelupload_stream_active_get() == (0 as u32)) { 1 } else { 0 }; // LOG_CAT_DEMO
   if mlow_log == 1 {
     let _ = uart_puts_bounded("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
   }
@@ -35651,7 +35658,20 @@ fn task_mutex_demo_low() -> i64 {
 #[no_heap]
 #[wcet(cycles=102300)]
 fn task_mutex_demo_high_wake_body() -> i64 {
-  let mhigh_log: i64 = if (log_state_get_mask() & (4 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_DEMO
+  // 2026-10-23 (real-HW kernelupload-stream stall investigation, user
+  // request): a `kernelupload stream` in progress claims the UART line
+  // exclusively by design (the host is told via `GO` that nothing else
+  // should be on the wire) -- but any background task that still has
+  // LOG_CAT_DEMO enabled would keep calling uart_puts_bounded on its
+  // own independent schedule regardless, competing for uart_puts's
+  // shared DMA scratch buffer/busy-wait with the stream's own ACK
+  // prints. Confirmed via a live log audit that these prints are OFF
+  // by default and were NOT the cause of this session's real-HW stall
+  // (zero MUTEX-LOW/MUTEX-HIGH/GOVERNOR-step/idle lines appeared in the
+  // captured boot log), but gating them here removes a real contention
+  // source for any config where LOG_CAT_DEMO is on, rather than relying
+  // on it happening to be off.
+  let mhigh_log: i64 = if ((log_state_get_mask() & (4 as u32)) != (0 as u32)) && (kernelupload_stream_active_get() == (0 as u32)) { 1 } else { 0 }; // LOG_CAT_DEMO
   if mhigh_log == 1 {
     let _ = uart_puts_bounded("MUTEX-HIGH: requesting demo mutex\n");
   }

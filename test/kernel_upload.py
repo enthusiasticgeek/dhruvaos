@@ -39,6 +39,7 @@ Usage:
 import argparse
 import hashlib
 import os
+import subprocess
 import sys
 import termios
 import threading
@@ -75,6 +76,58 @@ def open_serial(path: str, baud: int) -> int:
     cc[termios.VTIME] = 1
     termios.tcsetattr(fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, baud_const, baud_const, cc])
     return fd
+
+
+# A known, friendly way to stop the one process this project's own tooling
+# is expected to leave holding the port day-to-day -- see test/uart_logger.py
+# and dhruva-uart-logger.service. Anything else found holding the device is
+# reported by PID/cmdline with a generic fallback instead, since this script
+# has no way to know it's safe to kill.
+KNOWN_HOLDER_HINTS = (
+    ("uart_logger.py", "systemctl --user stop dhruva-uart-logger.service"),
+)
+
+
+def check_device_exclusive(device: str) -> bool:
+    """Real-HW find (2026-10-23): a second process reading the same serial
+    device at once (this project's persistent UART logger, a stale upload
+    attempt from a prior run, etc.) races this script for bytes off one tty
+    and corrupts the GO/ACK handshake -- see docs/TODO.md's task #352 entry
+    for the first time this bit a real upload. Rather than silently risking
+    that again, refuse to even open the device if anything else already has
+    it open, and tell the user exactly what to stop.
+
+    Returns True if the device looks exclusively available (or the check
+    itself couldn't run -- missing fuser/lsof should never block a upload
+    that would otherwise have worked), False if another process holds it
+    and the caller should abort.
+    """
+    try:
+        out = subprocess.run(["fuser", device], capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return True
+    pids = [tok.rstrip("cmfk") for tok in out.stdout.split()]
+    pids = [p for p in pids if p.isdigit()]
+    if not pids:
+        return True
+    print(f"[FAIL] refusing to open {device} -- {len(pids)} other process(es) already have it open:")
+    for pid in pids:
+        cmdline = ""
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().replace(b"\x00", b" ").decode(errors="replace").strip()
+        except OSError:
+            cmdline = "(cmdline unavailable -- process may have just exited)"
+        print(f"  pid {pid}: {cmdline}")
+        matched_hint = False
+        for needle, stop_cmd in KNOWN_HOLDER_HINTS:
+            if needle in cmdline:
+                print(f"    -> stop it with: {stop_cmd}")
+                matched_hint = True
+        if not matched_hint:
+            print(f"    -> stop it with: kill {pid}  (or: fuser -k {device})")
+    print("Re-run this upload once the device is free -- two readers on one tty corrupts the stream.")
+    return False
 
 
 class ShellSession:
@@ -185,6 +238,9 @@ def main() -> int:
     real_len = len(data)
     real_sha256 = hashlib.sha256(data).hexdigest()
     print(f"kernel image: {real_len} bytes, sha256={real_sha256}")
+
+    if not check_device_exclusive(args.device):
+        return 1
 
     fd = open_serial(args.device, args.baud)
     session = ShellSession(fd, args.log)
