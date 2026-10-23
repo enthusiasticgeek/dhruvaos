@@ -253,6 +253,15 @@ extern "C" fn dhruva_fault_inject_alloc_arm(after_n: i64) -> i64;
 extern "C" fn dharafs_sd_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_sd_scratch_get() -> mut ref i64;
+// TASK #357 follow-up (2026-10-18/19): dedicated scratch for the SD
+// wedge-retry checkpoint -- see sd_wedge_checkpoint's own header
+// comment (further down this file) and scratch_state.S's own comment
+// on sd_wedge_ckpt_scratch_addr for why this can't share dharafs_sd_
+// scratch above.
+#[stack_cost(bytes=1)]
+extern "C" fn sd_wedge_ckpt_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn sd_wedge_ckpt_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_path_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -6029,6 +6038,58 @@ fn timer_ic_init() -> i64 {
   return 0;
 }
 
+// TASK #357 follow-up (2026-10-19, real-HW SENTINEL corruption
+// investigation): called once, immediately before start_multitasking
+// -- see that function's own call site comment for the full "why".
+// timer_ic_init (above) arms the FIRST compare match one tick-interval
+// out from whenever IT runs, early in kernel_main, with interrupts
+// still masked for the entire rest of boot (every self-test, DharaFS
+// init, USB/framebuffer bring-up, DHCP...). By the time start_
+// multitasking finally unmasks I/F -- the ONE moment in this whole
+// boot where the CPU can take its very first real interrupt -- several
+// seconds and therefore several whole tick intervals have elapsed.
+// The timer's own match flag (TIMER_CS bit1) is edge-latched, not
+// level-sensitive like the UART's (see timer_ic_init's own comment on
+// exactly that distinction) -- it has been sitting PENDING at the
+// hardware level since the first interval elapsed, unable to actually
+// interrupt anything only because CPSR's I/F bits were masked, not
+// because the condition went away. uart_rx_irq_init's own line is
+// level-sensitive and re-evaluated live, so it needs no equivalent
+// treatment -- if a byte is genuinely waiting in the RX FIFO, that is
+// the TRUE, current state, not a stale artifact.
+//
+// Net effect without this fix: the very first interrupt ever taken on
+// real hardware is not a single, isolated FIQ landing on an otherwise
+// idle system -- it is a timer match that has been pending for
+// multiple seconds, firing in the same instant I/F unmask, with
+// whatever UART RX state also happens to be live at that exact
+// nanosecond (test harness traffic routinely arrives right around
+// this same point in boot). That is close to the worst-case
+// precondition for the FIQ-interrupting-IRQ's-early-entry race this
+// round's own fiq_entry.S fix already defends against -- not a rare,
+// occasional coincidence the way a steady-state tick landing badly
+// would be, but the first possible opportunity, every single boot.
+//
+// Fix: re-arm the compare match to one FRESH interval from right now
+// (not from whenever timer_ic_init happened to run) and clear the
+// stale match flag, in the same order and with the same mem_barrier
+// discipline timer_ic_init's own header comment already established
+// for this exact pair of registers -- so the first real interrupt
+// taken after unmasking is a genuinely fresh one, not a multi-second
+// backlog firing the instant it's finally allowed to.
+fn timer_clear_stale_match_before_handoff() -> i64 {
+  let timer_cs: i64 = TIMER_CS;
+  let timer_clo: i64 = TIMER_CLO;
+  let timer_c1: i64 = TIMER_C1;
+  let now: u32 = mmio_read_u32(timer_clo);
+  let interval: u32 = scheduler_tick_interval_us();
+  let fresh: u32 = now + interval;
+  let _ = mmio_write_u32(timer_c1, fresh);
+  let _ = mmio_write_u32(timer_cs, 2 as u32);
+  let _ = mem_barrier();
+  return 0;
+}
+
 // BCM2835 power-management watchdog (base 0x20100000) -- the same
 // peripheral real Pi firmware/Linux use to reboot the board on demand
 // (bcm2835_wdt) and to recover from a genuinely wedged system. This is
@@ -8121,6 +8182,48 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   return 0;
 }
 
+// TASK #357 follow-up (2026-10-18/19, real-HW SENTINEL corruption
+// investigation): raw SD blocks 8224/8225 -- the "slack for future
+// small raw regions" range already set aside past the WiFi firmware
+// raw-SD fallback (blocks 8192-8223) -- hold a before/after scheduler-
+// state snapshot bracketing the one call this round's own real-HW
+// evidence points at: sdhost_init_at_speed(), invoked from inside the
+// SD read/write wedge-retry loops below whenever a genuine SD wedge
+// is detected post-boot. User's own question: is the real-HW crash
+// landing at the exact same point every time, or different points?
+// UART text alone can't answer that reliably (the sentinel's own
+// print cuts off at a DIFFERENT byte count almost every real-HW
+// occurrence so far, consistent with the print pipeline itself being
+// perturbed, not a fixed instruction), and raw CPU registers (r0-r12)
+// are only inspectable from inside an asm context, not from here --
+// but current_task/ceiling_depth/eff_prio/tick_count/the three event
+// counters are all plain memory, readable from vani, and persisted to
+// SD survive the watchdog's own hardware reset (a .bss snapshot would
+// not). Read back on the next boot via the `sdckpt` shell command.
+const SD_WEDGE_CKPT_BLOCK_PRE: i64 = 8224;
+const SD_WEDGE_CKPT_BLOCK_POST: i64 = 8225;
+fn sd_wedge_checkpoint(block_num: i64, tag: u32, attempt: u32, result: u32) -> i64 {
+  let buf: mut ref i64 = sd_wedge_ckpt_scratch_get();
+  let cur: u32 = current_task_get();
+  let _ = buf_write_u32(buf, 0 as u32, tag);
+  let _ = buf_write_u32(buf, 4 as u32, scheduler_get_tick_count());
+  let _ = buf_write_u32(buf, 8 as u32, cur);
+  let _ = buf_write_u32(buf, 12 as u32, ceiling_depth_table_get_at(cur));
+  let _ = buf_write_u32(buf, 16 as u32, eff_prio_table_get_at(cur));
+  let _ = buf_write_u32(buf, 20 as u32, context_switch_count_get() as u32);
+  let _ = buf_write_u32(buf, 24 as u32, irq_count_get() as u32);
+  let _ = buf_write_u32(buf, 28 as u32, prio_lock_count_get() as u32);
+  let _ = buf_write_u32(buf, 32 as u32, attempt);
+  let _ = buf_write_u32(buf, 36 as u32, result);
+  // Best-effort, deliberately NOT retried on failure: if the
+  // controller is already too wedged to accept even this one write,
+  // that failure is itself evidence, not something to chase further
+  // here -- retrying would risk recursing back into the exact wedge-
+  // handling code this checkpoint exists to observe from the outside.
+  let _ = sdhost_write_block_once(block_num, buf);
+  return 0;
+}
+
 fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   let attempt: i64 = 0;
   while attempt < SD_MAX_ATTEMPTS {
@@ -8162,7 +8265,9 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = uart_puts(" (backoff target_hz=");
       let _ = uart_put_i64(backoff_hz);
       let _ = uart_puts(")\n");
+      let _ = sd_wedge_checkpoint(SD_WEDGE_CKPT_BLOCK_PRE, 1 as u32, attempt as u32, result as u32);
       let _ = sdhost_init_at_speed(backoff_hz);
+      let _ = sd_wedge_checkpoint(SD_WEDGE_CKPT_BLOCK_POST, 2 as u32, attempt as u32, result as u32);
     } else {
       let _ = uart_puts("SD: read wedge detected (");
       let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
@@ -8201,6 +8306,12 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
 // comment for the same reasoning applied to the FIFO loop). If this
 // alone doesn't clear the wedge, revert to 0x418 before trying the
 // next candidate -- one variable at a time.
+// TASK #357 follow-up (2026-10-19): #[no_mangle] so resume_pc_sentinel_
+// bad (boot/context_switch.S) can `bl` this directly by plain symbol
+// name for its own raw-SD diagnostic dump -- same requirement this
+// file's own timer_tick_dispatch already documents for the identical
+// asm-calls-into-vani pattern.
+#[no_mangle]
 fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -8520,7 +8631,9 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = uart_puts(" (backoff target_hz=");
       let _ = uart_put_i64(backoff_hz);
       let _ = uart_puts(")\n");
+      let _ = sd_wedge_checkpoint(SD_WEDGE_CKPT_BLOCK_PRE, 3 as u32, attempt as u32, result as u32);
       let _ = sdhost_init_at_speed(backoff_hz);
+      let _ = sd_wedge_checkpoint(SD_WEDGE_CKPT_BLOCK_POST, 4 as u32, attempt as u32, result as u32);
     } else {
       let _ = uart_puts("SD: write wedge detected (");
       let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
@@ -11401,6 +11514,136 @@ fn shell_dispatch_crashlog() -> i64 {
   }
   if any_found == 0 {
     let _ = uart_puts("crashlog: empty (no crash ever recorded on this card)\n");
+  }
+  return 0;
+}
+
+// TASK #357 follow-up (2026-10-18/19): prints whatever sd_wedge_
+// checkpoint last wrote to SD_WEDGE_CKPT_BLOCK_PRE/_POST -- see that
+// function's own header comment for the full "why". Reads the raw
+// blocks directly (sdhost_read_block_once, not through DharaFS), so
+// this works even if the SD wedge that triggered the checkpoint also
+// broke something DharaFS-level. tag 0 means that slot was never
+// written on this card -- most likely this build predates the
+// checkpoint existing, or the wedge-retry path was never reached.
+fn sd_wedge_checkpoint_print_one(label: Str, block_num: i64) -> i64 {
+  let buf: mut ref i64 = sd_wedge_ckpt_scratch_get();
+  let status: i64 = sdhost_read_block_once(block_num, buf);
+  let _ = uart_puts(label);
+  if status != 0 {
+    let _ = uart_puts(": read failed, status=");
+    let _ = uart_put_i64(status);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+  let tag: u32 = buf_read_u32(buf, 0 as u32);
+  let _ = uart_puts(": tag=");
+  let _ = uart_put_i64(tag as i64);
+  let _ = uart_puts(if tag == (1 as u32) { " (PRE read-retry)" } else { if tag == (2 as u32) { " (POST read-retry)" } else { if tag == (3 as u32) { " (PRE write-retry)" } else { if tag == (4 as u32) { " (POST write-retry)" } else { " (never written)" } } } });
+  let _ = uart_puts(" tick=");
+  let _ = uart_put_i64(buf_read_u32(buf, 4 as u32) as i64);
+  let _ = uart_puts(" current_task=");
+  let _ = uart_put_i64(buf_read_u32(buf, 8 as u32) as i64);
+  let _ = uart_puts(" ceiling_depth=");
+  let _ = uart_put_i64(buf_read_u32(buf, 12 as u32) as i64);
+  let _ = uart_puts(" eff_prio=");
+  let _ = uart_put_i64(buf_read_u32(buf, 16 as u32) as i64);
+  let _ = uart_puts(" ctxsw=");
+  let _ = uart_put_i64(buf_read_u32(buf, 20 as u32) as i64);
+  let _ = uart_puts(" irqs=");
+  let _ = uart_put_i64(buf_read_u32(buf, 24 as u32) as i64);
+  let _ = uart_puts(" priolock=");
+  let _ = uart_put_i64(buf_read_u32(buf, 28 as u32) as i64);
+  let _ = uart_puts(" attempt=");
+  let _ = uart_put_i64(buf_read_u32(buf, 32 as u32) as i64);
+  let _ = uart_puts(" wedge_result=");
+  let _ = uart_put_i64(buf_read_u32(buf, 36 as u32) as i64);
+  let _ = uart_puts("\n");
+  return 0;
+}
+
+fn shell_dispatch_sdckpt() -> i64 {
+  let _ = uart_puts("\n");
+  let _ = sd_wedge_checkpoint_print_one("PRE ", SD_WEDGE_CKPT_BLOCK_PRE);
+  let _ = sd_wedge_checkpoint_print_one("POST", SD_WEDGE_CKPT_BLOCK_POST);
+  return 0;
+}
+
+// TASK #357 follow-up (2026-10-19): prints whatever resume_pc_sentinel_
+// bad's own raw dump (boot/context_switch.S) last wrote to block 8226
+// -- the second, UART-bypassing copy of the same register/SPSR/
+// current_task dump the halt path's own print already attempts, added
+// specifically because that print has truncated at an unpredictable
+// point on every single real-HW occurrence captured so far. All zeros
+// here means the sentinel has never fired on this card since it was
+// last written with this build.
+fn shell_dispatch_sentdump() -> i64 {
+  let _ = uart_puts("\n");
+  let buf: mut ref i64 = sd_wedge_ckpt_scratch_get();
+  let status: i64 = sdhost_read_block_once(8226 as i64, buf);
+  if status != 0 {
+    let _ = uart_puts("sentdump: read failed, status=");
+    let _ = uart_put_i64(status);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+  let _ = uart_puts("resume_pc=0x");
+  let _ = uart_put_hex32(buf_read_u32(buf, 0 as u32));
+  let _ = uart_puts(" true_lr=0x");
+  let _ = uart_put_hex32(buf_read_u32(buf, 4 as u32));
+  let _ = uart_puts(" spsr=0x");
+  let _ = uart_put_hex32(buf_read_u32(buf, 8 as u32));
+  let _ = uart_puts(" current_task=");
+  let _ = uart_put_i64(buf_read_u32(buf, 12 as u32) as i64);
+  let _ = uart_puts("\n");
+  let i: u32 = 0 as u32;
+  while i < (13 as u32) {
+    let _ = uart_puts("r");
+    let _ = uart_put_i64(i as i64);
+    let _ = uart_puts("=0x");
+    let _ = uart_put_hex32(buf_read_u32(buf, (16 as u32) + (i * (4 as u32))));
+    let _ = uart_puts(" ");
+    i = i + (1 as u32);
+  }
+  let _ = uart_puts("\n");
+  return 0;
+}
+
+// DIAGNOSTIC (2026-10-22, true_lr=0 investigation): read back
+// lr_capture_ring's raw-SD persisted copy (block 8227, written by
+// resume_pc_sentinel_bad right after block 8226 above -- see that
+// ring's own .bss header comment in context_switch.S for format).
+// Each entry: tag (1=FIQ-USR, 2=FIQ-SVC, 3=IRQ-USR, 4=IRQ-SVC),
+// captured true_lr, staged spsr, TIMER_CLO at capture time. Answers
+// whether a bad true_lr was ever captured live for task 3 (IDLE), or a
+// good capture gets clobbered afterward.
+fn shell_dispatch_lrdump() -> i64 {
+  let _ = uart_puts("\n");
+  let buf: mut ref i64 = sd_wedge_ckpt_scratch_get();
+  let status: i64 = sdhost_read_block_once(8227 as i64, buf);
+  if status != 0 {
+    let _ = uart_puts("lrdump: read failed, status=");
+    let _ = uart_put_i64(status);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+  let i: u32 = 0 as u32;
+  while i < (16 as u32) {
+    let base: u32 = i * (20 as u32);
+    let _ = uart_puts("[");
+    let _ = uart_put_i64(i as i64);
+    let _ = uart_puts("] tag=");
+    let _ = uart_put_i64(buf_read_u32(buf, base) as i64);
+    let _ = uart_puts(" true_lr=0x");
+    let _ = uart_put_hex32(buf_read_u32(buf, base + (4 as u32)));
+    let _ = uart_puts(" spsr=0x");
+    let _ = uart_put_hex32(buf_read_u32(buf, base + (8 as u32)));
+    let _ = uart_puts(" timer_clo=0x");
+    let _ = uart_put_hex32(buf_read_u32(buf, base + (12 as u32)));
+    let _ = uart_puts(" task=");
+    let _ = uart_put_i64(buf_read_u32(buf, base + (16 as u32)) as i64);
+    let _ = uart_puts("\n");
+    i = i + (1 as u32);
   }
   return 0;
 }
@@ -33375,6 +33618,18 @@ fn shell_dispatch() -> i64 {
     return shell_dispatch_crashlog();
   }
 
+  if shell_word_matches(line_buf, 0, cmd_end, "sdckpt") == 1 {
+    return shell_dispatch_sdckpt();
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "sentdump") == 1 {
+    return shell_dispatch_sentdump();
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "lrdump") == 1 {
+    return shell_dispatch_lrdump();
+  }
+
   if shell_word_matches(line_buf, 0, cmd_end, "fb") == 1 {
     return shell_dispatch_fb(line_buf, cmd_end, line_len);
   }
@@ -46219,6 +46474,7 @@ fn kernel_main() -> i64 {
   // own doc comment for why these exist and why sharing them across
   // call sites is safe.
   let _ = dharafs_sd_scratch_set(dhruva_alloc_bytes(512));
+  let _ = sd_wedge_ckpt_scratch_set(dhruva_alloc_bytes(512));
   // kernlog_line_scratch set as early as possible, deliberately ahead
   // of its own natural place alongside the other round-2026-10-03
   // buffers -- kernlog_write_fault is called from the Data/Prefetch
@@ -47931,6 +48187,14 @@ fn kernel_main() -> i64 {
   // task_a's own index, and kernel_main's own boot-time default --
   // destroying an earlier seed moments after it was made).
   let _ = usr_sp_table_set_at(0 as u32, stack_a_usr_top);
+  // TASK #357 follow-up (2026-10-19): re-arm the timer's own compare
+  // match fresh, right before the handoff -- see timer_clear_stale_
+  // match_before_handoff's own header comment for the full "why".
+  // Safe here, after the usr_sp_table seed above: pure MMIO reads/
+  // writes + a barrier, no uart_puts_bounded/dhruva_prio_lock call
+  // anywhere in it, so it cannot re-trigger the SWI-trap clobber that
+  // comment warns about.
+  let _ = timer_clear_stale_match_before_handoff();
   //
   // Never returns. start_multitasking's own restore sets CPSR (via
   // the fake frame's spsr=0x13) with interrupts already enabled, so

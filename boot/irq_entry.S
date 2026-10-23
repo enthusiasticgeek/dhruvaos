@@ -176,36 +176,81 @@ irq_entry:
     and r3, r0, #0x1F
     cmp r3, #0x10
     bne irq_entry_true_lr_svc
-    /* USR-mode case: true_lr must come from lr_usr, and this is also
-     * the ONLY other place (besides scheduler_restore_usr_sp's own
-     * restore path) that a USR-mode task's live sp_usr can change --
-     * capture it into usr_sp_table NOW, before current_task potentially
-     * changes below, so whichever task resumes THIS one later restores
-     * the correct value. r1/r3/r5 are free scratch here (r1's real
-     * value was already staged to memory via `stmdb sp!,{r0,r1}` above,
-     * r3 just consumed by the mode check above, r5 isn't assigned its
-     * own real purpose -- destination frame pointer -- until right
-     * after this whole block) -- r0 (spsr) and r4 (staged pointer) must
-     * NOT be touched, both still needed below. Single-instruction
-     * user-register STM captures BOTH sp_usr and lr_usr at once, no
-     * mode switch -- see this file's own top-of-file comment on
-     * irq_usr_capture_scratch for the full "why". */
-    ldr r1, =irq_usr_capture_scratch
-    stmia r1, {sp, lr}^        /* [r1+0]=sp_usr, [r1+4]=lr_usr */
-    ldr r3, =current_task
-    ldr r3, [r3]
-    ldr r5, =usr_sp_table
-    ldr r2, [r1]               /* r2 = sp_usr value, temporarily */
-    str r2, [r5, r3, lsl #2]   /* usr_sp_table[current_task] = sp_usr */
-    ldr r2, [r1, #4]           /* r2 = lr_usr value = true_lr (final
-                                * destination) */
+    /* DIAGNOSTIC REVERT, RESOLVED (2026-10-22/23, true_lr=0
+     * investigation): same revert as fiq_entry.S's own matching block
+     * -- see that file's own header comment on this exact change for
+     * the full "why" and how it was resolved (lr_capture_ring live-
+     * confirmed the identical true_lr=0 from BOTH this `cps` dip and
+     * the single-instruction `stmia ...,{sp,lr}^` form, ruling out the
+     * capture instruction; root cause was resume_pc_sentinel_check
+     * wrongly treating true_lr as always a code address, when
+     * compiler-generated code legitimately reuses r14 as scratch).
+     * r1/r3/r5 free scratch here (same set the original `cps`-based
+     * version used) -- r0 (spsr) and r4 (staged pointer) must NOT be
+     * touched, both still needed below. */
+    cps #0x1F              /* SYS mode -- shares r13/r14 with USR, still
+                             * privileged, safe dip (same technique this
+                             * file's own IRQ-stack staging already used
+                             * for a different mode) */
+    mov r5, lr               /* r5 = true lr_usr, held here temporarily
+                              * -- r5 isn't assigned its own real
+                              * purpose (destination frame pointer)
+                              * until right after this whole block, so
+                              * safe to borrow */
+    mov r3, sp               /* r3 = live sp_usr */
+    cps #0x13
+    ldr r1, =current_task
+    ldr r1, [r1]
+    ldr r2, =usr_sp_table
+    str r3, [r2, r1, lsl #2]   /* usr_sp_table[current_task] = sp_usr */
+    mov r2, r5                /* r2 = true lr_usr (final destination) */
+    mov r6, #3                 /* diag tag: 3 = IRQ, USR-mode branch --
+                                * see lr_capture_ring's own header
+                                * comment (context_switch.S) */
     b irq_entry_true_lr_done
 irq_entry_true_lr_svc:
     mov r2, lr                    /* r2 = interrupted task's TRUE r14 --
                                    * unchanged SVC-mode case, exactly as
                                    * this file always did before this
                                    * round */
+    mov r6, #4                 /* diag tag: 4 = IRQ, SVC-mode branch */
 irq_entry_true_lr_done:
+    /* DIAGNOSTIC (2026-10-22, true_lr=0 investigation, round 2): record
+     * this capture into lr_capture_ring (context_switch.S) for EVERY
+     * task now, not just task 3/IDLE -- see fiq_entry.S's matching block
+     * for the full "why" (cross-task propagation through the single
+     * shared r14_usr register, via scheduler_restore_usr_sp). r0 (still
+     * = raw interrupted spsr here) and r2 (true_lr) and r4 (staged-block
+     * SOURCE pointer, needed by the relocate loop right below) must
+     * survive untouched; r1/r3/r5/r7 are free scratch (r5/r7's own real
+     * destination-pointer/loop-counter roles aren't assigned until after
+     * this block). */
+    ldr r5, =current_task
+    ldr r5, [r5]
+    ldr r3, =lr_capture_ring_idx
+    ldr r1, [r3]
+    mov r7, #20
+    mul r1, r7, r1              /* Rd=r1, Rm=r7, Rs=r1 -- Rd==Rm is
+                                 * UNPREDICTABLE on MUL per the ARM ARM,
+                                 * Rd==Rs is fine; r7 picked as Rm
+                                 * specifically to avoid that hazard */
+    ldr r7, =lr_capture_ring
+    add r7, r7, r1
+    str r6, [r7, #0]           /* tag */
+    str r2, [r7, #4]           /* captured true_lr */
+    str r0, [r7, #8]           /* raw interrupted spsr */
+    mov r1, r5                 /* stash current_task past the TIMER_CLO
+                                 * ldr below, which needs r7 as its own
+                                 * address scratch */
+    ldr r5, =0x20003004        /* TIMER_CLO, for time-ordering */
+    ldr r5, [r5]
+    str r5, [r7, #12]
+    str r1, [r7, #16]          /* current_task at capture time */
+    ldr r1, [r3]               /* r3 still = &lr_capture_ring_idx, never
+                                 * clobbered above */
+    add r1, r1, #1
+    and r1, r1, #15
+    str r1, [r3]
     sub sp, sp, #68                /* 17-word frame now, not 16 */
     mov r5, sp                    /* r5 = destination, on the task's real
                                    * stack */

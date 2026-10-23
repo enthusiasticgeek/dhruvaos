@@ -170,30 +170,74 @@ fiq_entry_not_irq_race:
     and r3, r1, #0x1F
     cmp r3, #0x10
     bne fiq_entry_true_lr_svc
-    /* Single-instruction user-register STM captures BOTH sp_usr and
-     * lr_usr at once, no mode switch -- see this file's own top-of-file
-     * comment on fiq_usr_capture_scratch for the full "why". r1/r3/r5
-     * used as scratch here, same set the original `cps`-based version
-     * used -- r2 written exactly once, at the very end, with its real
-     * final value (true_lr), matching this block's own established
-     * register discipline. */
-    ldr r1, =fiq_usr_capture_scratch
-    stmia r1, {sp, lr}^        /* [r1+0]=sp_usr, [r1+4]=lr_usr */
-    ldr r3, =current_task
-    ldr r3, [r3]
-    ldr r5, =usr_sp_table
-    add r5, r5, r3, lsl #2     /* r5 = &usr_sp_table[current_task] */
-    ldr r3, [r1]                /* r3 = sp_usr value */
-    str r3, [r5]                 /* usr_sp_table[current_task] = sp_usr */
-    ldr r2, [r1, #4]             /* r2 = lr_usr value = true_lr (final
-                                  * destination) */
+    /* DIAGNOSTIC REVERT, RESOLVED (2026-10-22/23, true_lr=0
+     * investigation): the single-instruction `stmia ...,{sp,lr}^` form
+     * (task #253) was suspected of a pipeline/timing hazard and
+     * reverted here to this `cps #0x1F` dip as an A/B test; real-HW
+     * retest showed the identical true_lr=0 under BOTH forms, ruling
+     * out the capture instruction. Root cause found by disassembly
+     * instead: resume_pc_sentinel_check (context_switch.S) was wrongly
+     * treating true_lr as a value that must always look like a code
+     * address. It doesn't -- compiler-generated code (confirmed in
+     * fn_governor_desired_freq_mhz_v2's checked 64-bit multiply-
+     * accumulate) routinely saves the real lr to its own stack frame
+     * and freely reuses r14 as scratch afterward, so r14_usr can
+     * legitimately be 0 (or anything else) at an arbitrary preemption
+     * point. Fixed by dropping the range check on true_lr in
+     * resume_pc_sentinel_check; no CPU hazard exists, so the `cps` dip
+     * here is no longer load-bearing for correctness -- left as-is
+     * rather than reverted back to `stmia` since that's a separate,
+     * not-yet-requested optimization. */
+    cps #0x1F               /* SYS mode -- shares r13/r14 with USR, still
+                              * privileged, safe dip */
+    mov r5, lr                /* r5 = true lr_usr, held temporarily */
+    mov r3, sp                 /* r3 = live sp_usr */
+    cps #0x13
+    ldr r1, =current_task
+    ldr r1, [r1]
+    ldr r4, =usr_sp_table
+    str r3, [r4, r1, lsl #2]   /* usr_sp_table[current_task] = sp_usr */
+    mov r2, r5                 /* r2 = true lr_usr (final destination) */
+    mov r6, #1                  /* diag tag: 1 = FIQ, USR-mode branch --
+                                  * see lr_capture_ring's own header
+                                  * comment (context_switch.S) */
     b fiq_entry_true_lr_done
 fiq_entry_true_lr_svc:
     mov r2, lr                 /* r2 = interrupted task's TRUE r14 --
                                 * unchanged SVC-mode case, exactly as
                                 * this file always did before this
                                 * round */
+    mov r6, #2                 /* diag tag: 2 = FIQ, SVC-mode branch */
 fiq_entry_true_lr_done:
+    /* DIAGNOSTIC (2026-10-22, true_lr=0 investigation, round 2): record
+     * this capture into lr_capture_ring (context_switch.S) for EVERY
+     * task now, not just task 3/IDLE -- the cps-based-dip A/B retest
+     * ruled out the capture instruction itself, so the open question is
+     * cross-task propagation through the single shared r14_usr register
+     * (scheduler_restore_usr_sp, context_switch.S), which needs every
+     * task's history. r0 (staged-block pointer) and r2 (true_lr) must
+     * survive untouched below; r1/r3/r4/r5/r7 are free scratch here (r4
+     * not yet used as the relocate loop's relay register, r7 not yet
+     * needed either). */
+    ldr r5, =current_task
+    ldr r5, [r5]
+    ldr r3, =lr_capture_ring_idx
+    ldr r4, [r3]
+    mov r1, #20
+    mul r1, r4, r1
+    ldr r7, =lr_capture_ring
+    add r1, r7, r1
+    str r6, [r1, #0]            /* tag */
+    str r2, [r1, #4]            /* captured true_lr */
+    ldr r7, [r0, #0]            /* staged spsr -- r0 still = staged ptr */
+    str r7, [r1, #8]
+    ldr r7, =0x20003004         /* TIMER_CLO, for time-ordering */
+    ldr r7, [r7]
+    str r7, [r1, #12]
+    str r5, [r1, #16]           /* current_task at capture time */
+    add r4, r4, #1
+    and r4, r4, #15
+    str r4, [r3]
     sub sp, sp, #68                    /* allocate the 17-word (68-byte)
                                         * frame on the task's REAL stack --
                                         * same layout as everywhere else in

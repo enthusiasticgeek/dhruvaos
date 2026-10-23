@@ -111,6 +111,53 @@ sleep_until_table:
 .global tick_count
 tick_count:
     .word 0
+/* DIAGNOSTIC (2026-10-22, true_lr=0 corruption investigation, round 2):
+ * ring buffer recording EVERY true_lr-capture decision, for EVERY task
+ * (no current_task gate -- round 1 gated this to task 3/IDLE only and
+ * the cps-based-dip A/B retest (fiq_entry.S/irq_entry.S headers) proved
+ * the single-instruction stmia form was never the hazard, so the
+ * question is now cross-task propagation through the single shared
+ * r14_usr register via scheduler_restore_usr_sp, which needs every
+ * task's history, not just IDLE's). ROUND 3 added a second producer,
+ * resume_pc_sentinel_check itself (below) -- round 2's entries only
+ * cover the OUTGOING task's capture at preemption; the actual question
+ * is about the INCOMING task's frame at resume time, a different event
+ * in the general case, so round 3 logs every resume ATTEMPT (all 5 of
+ * resume_pc_sentinel_check's own call sites) centrally, tagged 9.
+ * 16 entries x 5 words (20 bytes): [0]=tag (1=FIQ-USR-path, 2=FIQ-SVC-
+ * path, 3=IRQ-USR-path, 4=IRQ-SVC-path, 9=resume_pc_sentinel_check
+ * entry), [1]=captured true_lr (tags 1-4) or candidate true_lr (tag 9),
+ * [2]=staged spsr of the interrupted context (tags 1-4) or candidate
+ * resume_pc (tag 9, field reused -- not spsr for this tag), [3]=
+ * TIMER_CLO at capture time (for ordering), [4]=current_task. Index
+ * wraps 0..15. FIQ auto-masks IRQ and IRQ masks FIQ (`cpsid f`, already
+ * in place by the time either file reaches its own capture point) so
+ * fiq_entry.S/irq_entry.S can never race each other OR resume_pc_
+ * sentinel_check (always called from inside one of those same masked
+ * contexts, or from a `cpsid if`-masked voluntary-switch critical
+ * section) on this shared index. */
+/* RESOLVED (2026-10-22/23, true_lr=0 investigation): live hardware data
+ * (round 3's ring, chronologically sorted by TIMER_CLO) showed task 3
+ * (IDLE) captured with true_lr=0 mid-stream inside fn_governor_desired_
+ * freq_mhz_v2 (0x332280). A round-4 double-dip-and-compare latch (dip
+ * r14_usr twice in immediate succession at the same capture site in
+ * fiq_entry.S/irq_entry.S, since removed) was built to test a genuine
+ * CPU-level hazard on this ARM1176 -- but disassembly settled it first:
+ * that function's prologue saves the real lr to its own stack frame and
+ * then freely reuses r14 as a scratch/accumulator register for its
+ * checked 64-bit multiply-accumulate body (three separate `mov lr, #0`
+ * sites), returning via `pop {..., pc}` without ever touching lr again.
+ * r14_usr can legitimately be 0 at an arbitrary preemption point --
+ * ordinary compiler codegen, not corruption, not a CPU race. The real
+ * bug was resume_pc_sentinel_check treating true_lr as if it must
+ * always be a valid code address; fixed there by dropping that range
+ * check (see its own header comment). */
+.global lr_capture_ring_idx
+lr_capture_ring_idx:
+    .word 0
+.global lr_capture_ring
+lr_capture_ring:
+    .space 320
 /* task #253: .global so irq_entry.S/fiq_entry.S's own new mode-aware
  * USR-context-capture logic can reference it directly by symbol
  * (cross-file) -- every OTHER reference to this label is same-file,
@@ -2192,14 +2239,31 @@ sched_diag_put_hex32_loop:
  * since the A/B slot redesign (boot/rpi1/link.ld); 0x20000000 is the
  * BCM2835 peripheral block's own base, confirmed via mmu_init.S's own
  * peripheral-range comment as comfortably above every real MMIO
- * address this project uses. A genuinely resuming task's resume_pc/
- * true_lr can ONLY ever legitimately point into this project's own
- * linked code -- confirmed against prepare_stack_common's own fresh-
- * task initial frame (round 68: both fields seeded with the real entry
- * -point address, same range, so a never-yet-run task cannot false-
- * trigger this) and every live frame this project's own restore sites
- * ever write, so this has zero known legitimate false-positive surface,
- * not just a guessed range.
+ * address this project uses. Only r0 (resume_pc) is actually gated on
+ * this range -- see the 2026-10-22 true_lr correction note below for
+ * why r1 (true_lr) is logged but no longer validated.
+ *
+ * CORRECTION (2026-10-22, true_lr=0 investigation, round 5): this
+ * header used to claim the same range check was also safe to apply to
+ * r1/true_lr ("zero known legitimate false-positive surface"). That
+ * was wrong. Real-HW repro nailed the fatal capture to task_d (idle)
+ * stopped mid-fn_governor_desired_freq_mhz_v2 at the exact instruction
+ * after a compiler-emitted `mov lr, #0` -- confirmed via disassembly:
+ * that function's prologue pushes the real return address (`push
+ * {r4-r9,sl,fp,lr}`) and then freely reuses r14 as a plain scratch/
+ * accumulator register for its checked 64-bit multiply-accumulate
+ * body (three separate `mov lr, #0` sites), returning via `pop {...,
+ * pc}` without ever touching lr again. r14_usr can legitimately be
+ * ANY value, including 0, at an arbitrary preemption point inside any
+ * function that saves lr to its own frame and reuses it as scratch --
+ * ordinary, correct AAPCS-legal codegen, not corruption, and not
+ * specific to this one function (any register-pressure-heavy leaf/
+ * interior code can do the same thing). Both capture mechanisms
+ * (stmia^ and the cps #0x1F dip) agreeing on the same zero was never
+ * evidence of a race -- it was evidence the value genuinely was zero.
+ * resume_pc stays gated: it comes from the exception frame's own PC/
+ * SPSR, independent of whatever the task was doing with r14, and is
+ * the only field actually required for a safe resume.
  *
  * Never returns if invalid -- halts in place via an infinite branch,
  * after printing full diagnostics through sched_diag_puts/_put_hex32
@@ -2216,18 +2280,57 @@ sched_diag_put_hex32_loop:
 .global resume_pc_sentinel_check
 resume_pc_sentinel_check:
     push {r2, r3}
+    push {r4, r5, r6, r7}
+    /* DIAGNOSTIC (2026-10-22, true_lr=0 investigation, round 3): the
+     * round-2 ring (fiq_entry.S/irq_entry.S) logs the OUTGOING task's
+     * capture at preemption time -- but this function validates the
+     * INCOMING (about-to-resume) task's frame, a different task's data
+     * in the general case (only the same event when a task immediately
+     * re-resumes itself). Log unconditionally, right here, at all 5 of
+     * this function's own real call sites (irq_entry.S, fiq_entry.S,
+     * task_sleep_ticks_impl/dhruva_mutex_lock_impl/start_multitasking's
+     * own voluntary-switch resumes), before the actual check -- this is
+     * the one place that sees every resume ATTEMPT regardless of which
+     * path produced it. tag=9 marks these entries (vs. 1-4 for the
+     * round-2 outgoing-capture entries sharing the same ring); field
+     * layout for tag=9 is [0]=9 [4]=candidate true_lr (r1) [8]=
+     * candidate resume_pc (r0, NOT spsr -- reusing the slot) [12]=
+     * TIMER_CLO [16]=current_task (the task about to resume). r0/r1
+     * must survive untouched for the real check below; r4-r7 pushed/
+     * popped around this block since callers rely on them surviving a
+     * resume_pc_sentinel_check call (the pre-existing push{r2,r3} same
+     * convention, just extended). */
+    ldr r4, =lr_capture_ring_idx
+    ldr r5, [r4]
+    mov r6, #20
+    mul r5, r6, r5
+    ldr r6, =lr_capture_ring
+    add r6, r6, r5
+    mov r7, #9
+    str r7, [r6, #0]
+    str r1, [r6, #4]
+    str r0, [r6, #8]
+    ldr r7, =0x20003004
+    ldr r7, [r7]
+    str r7, [r6, #12]
+    ldr r7, =current_task
+    ldr r7, [r7]
+    str r7, [r6, #16]
+    ldr r5, [r4]
+    add r5, r5, #1
+    and r5, r5, #15
+    str r5, [r4]
+    pop {r4, r5, r6, r7}
     ldr r2, =0x00200000
     cmp r0, r2
     blo resume_pc_sentinel_bad
     ldr r2, =0x20000000
     cmp r0, r2
     bhs resume_pc_sentinel_bad
-    ldr r2, =0x00200000
-    cmp r1, r2
-    blo resume_pc_sentinel_bad
-    ldr r2, =0x20000000
-    cmp r1, r2
-    bhs resume_pc_sentinel_bad
+    /* r1 (true_lr) deliberately NOT range-checked -- see the
+     * 2026-10-22 correction note above the ring-logging block: it can
+     * legitimately be any value, including 0, whenever the resuming
+     * task was preempted inside code that reuses r14 as scratch. */
     pop {r2, r3}
     bx lr
 
@@ -2303,10 +2406,35 @@ resume_pc_sentinel_bad:
     mov r0, #10
     bl sched_diag_putc
     mov r8, sp                       /* r8 = frame base (r0's own slot) */
+    /* TASK #357 follow-up (2026-10-19): raw, direct-to-SD copy of this
+     * same dump, bypassing UART/the ring entirely -- see sentinel_
+     * raw_dump_write's own header comment below for the full "why"
+     * (the UART print above has truncated at an unpredictable point
+     * on every single real-HW occurrence so far; this is a second,
+     * independent channel for the exact same data, costing nothing on
+     * every normal boot since this whole function only runs on the
+     * way to an unconditional halt). r10 = scratch dump buffer
+     * (reused sd_wedge_ckpt_scratch -- safe here: this function never
+     * returns, so there is no other concurrent use to collide with).
+     * Layout: +0 resume_pc, +4 true_lr, +8 spsr, +12 current_task,
+     * +16..+64 r0-r12 (13 words). */
+    bl sd_wedge_ckpt_scratch_get
+    mov r10, r0
+    str r4, [r10, #0]
+    str r5, [r10, #4]
+    str r6, [r10, #8]
+    str r7, [r10, #12]
+    add r11, r10, #16                /* r11 = &buf[r0's own slot] -- the
+                                        * 13 register words start here,
+                                        * right after the 4 header
+                                        * words above; r10 itself stays
+                                        * unmodified (still needed as
+                                        * the whole-buffer base for the
+                                        * SD write after this loop) */
     mov r9, #0                       /* r9 = word index, 0..12 (r0..r12) */
 resume_pc_sentinel_dump_loop:
     cmp r9, #13
-    bge resume_pc_sentinel_halt
+    bge resume_pc_sentinel_dump_done
     ldr r0, =resume_pc_sentinel_msg_r
     bl sched_diag_puts
     mov r0, r9
@@ -2314,13 +2442,95 @@ resume_pc_sentinel_dump_loop:
     ldr r0, =resume_pc_sentinel_msg_eq
     bl sched_diag_puts
     ldr r0, [r8, r9, lsl #2]
+    str r0, [r11, r9, lsl #2]        /* same word, also persisted to
+                                        * the raw-SD dump buffer */
     bl sched_diag_put_hex32
     mov r0, #' '
     bl sched_diag_putc
     add r9, r9, #1
     b resume_pc_sentinel_dump_loop
+resume_pc_sentinel_dump_done:
+    /* r10 still points at the dump buffer base; r8 (frame base) no
+     * longer needed. r0=block_num (i64 -- AAPCS pairing: r0=low,
+     * r1=high, MUST be explicit per this file's own repeated history
+     * of silent register-pairing bugs on this exact pattern), r2=buf. */
+    mov r2, r10
+    ldr r0, =8226
+    mov r1, #0
+    bl sdhost_write_block_once
+    /* DIAGNOSTIC (2026-10-22, true_lr=0 investigation): dump the
+     * lr_capture_ring (see its own .bss definition's header comment,
+     * earlier in this file) -- best-effort over UART (may truncate like
+     * every other print in this function) AND persisted to a second raw
+     * SD block (8227, same scratch buffer reused -- block 8226's own
+     * write above already completed, so overwriting it now is safe),
+     * read back via the new "lrdump" shell command. Answers whether a
+     * bad true_lr was ever captured live for task 3, or a good capture
+     * gets clobbered afterward. */
+    ldr r0, =resume_pc_sentinel_msg_ring
+    bl sched_diag_puts
+    bl sd_wedge_ckpt_scratch_get
+    mov r10, r0
+    ldr r11, =lr_capture_ring
+    mov r9, #0
+    mov r12, #20                     /* entry stride, bytes (not a power
+                                       * of 2 since round 2 added the
+                                       * current_task field -- mul, not
+                                       * lsl) */
+resume_pc_sentinel_ring_dump_loop:
+    cmp r9, #16
+    bge resume_pc_sentinel_ring_dump_done
+    mul r4, r9, r12
+    add r5, r11, r4                  /* r5 = &lr_capture_ring[r9] */
+    ldr r0, [r5, #0]
+    bl sched_diag_put_hex32
+    mov r0, #' '
+    bl sched_diag_putc
+    ldr r0, [r5, #4]
+    bl sched_diag_put_hex32
+    mov r0, #' '
+    bl sched_diag_putc
+    ldr r0, [r5, #8]
+    bl sched_diag_put_hex32
+    mov r0, #' '
+    bl sched_diag_putc
+    ldr r0, [r5, #12]
+    bl sched_diag_put_hex32
+    mov r0, #' '
+    bl sched_diag_putc
+    ldr r0, [r5, #16]
+    bl sched_diag_put_hex32
+    mov r0, #10
+    bl sched_diag_putc
+    add r6, r10, r4                  /* r6 = &raw_dump_buf[r9] */
+    ldr r0, [r5, #0]
+    str r0, [r6, #0]
+    ldr r0, [r5, #4]
+    str r0, [r6, #4]
+    ldr r0, [r5, #8]
+    str r0, [r6, #8]
+    ldr r0, [r5, #12]
+    str r0, [r6, #12]
+    ldr r0, [r5, #16]
+    str r0, [r6, #16]
+    add r9, r9, #1
+    b resume_pc_sentinel_ring_dump_loop
+resume_pc_sentinel_ring_dump_done:
+    mov r2, r10
+    ldr r0, =8227
+    mov r1, #0
+    bl sdhost_write_block_once
 resume_pc_sentinel_halt:
     b resume_pc_sentinel_halt
+
+/* Fourth .ltorg this file has needed (task #357 follow-up, 2026-10-19):
+ * same "pool needs to be closer" reason as the first three -- the raw
+ * SD dump added above (sd_wedge_ckpt_scratch_get/sdhost_write_block_
+ * once calls) pushed the 3rd .ltorg's own covered span out of range
+ * for the earlier `ldr =sleep_until_table` et al. Placed right after
+ * the halt loop's own single `b` instruction -- never reached as
+ * code, safe to drop a literal pool here. */
+.ltorg
 
 .section ".rodata"
 resume_pc_sentinel_msg_spsr:
@@ -2335,6 +2545,8 @@ resume_pc_sentinel_msg1:
     .asciz "\nSENTINEL: corrupted resume state, refusing to jump! resume_pc="
 resume_pc_sentinel_msg2:
     .asciz " true_lr="
+resume_pc_sentinel_msg_ring:
+    .asciz "\nSENTINEL: lr_capture_ring (tag true_lr spsr timer_clo task):\n"
 .section ".text"
 
 /* void sleep_ticks_diag_print(r0 = outgoing task index) -- prints

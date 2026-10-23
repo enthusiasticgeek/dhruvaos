@@ -49,6 +49,16 @@ dharafs_sd_scratch_addr:
                          * shared by every FS primitive that reads or
                          * builds exactly one raw SD block for its own
                          * internal use */
+// TASK #357 follow-up (2026-10-18/19, real-HW SENTINEL corruption
+// investigation): dedicated, NOT shared with dharafs_sd_scratch above
+// -- this one gets written from inside the SD read/write wedge-retry
+// path itself (sdhost_read_block/sdhost_write_block, kernel_main.vani),
+// which runs CONCURRENTLY with whatever outer DharaFS call is already
+// using dharafs_sd_scratch for the actual block being read/written.
+// Reusing that buffer here would clobber the in-flight operation's own
+// data mid-retry -- a separate 512-byte block is the only safe choice.
+sd_wedge_ckpt_scratch_addr:
+    .word 0             /* 512 bytes */
 dharafs_path_scratch_addr:
     .word 0             /* 32 bytes: one path's worth */
 dharafs_data_scratch_addr:
@@ -635,6 +645,20 @@ dharafs_sd_scratch_set:
 .global dharafs_sd_scratch_get
 dharafs_sd_scratch_get:
     ldr r0, =dharafs_sd_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global sd_wedge_ckpt_scratch_set
+sd_wedge_ckpt_scratch_set:
+    ldr r1, =sd_wedge_ckpt_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global sd_wedge_ckpt_scratch_get
+sd_wedge_ckpt_scratch_get:
+    ldr r0, =sd_wedge_ckpt_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
