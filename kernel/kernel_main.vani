@@ -14087,6 +14087,29 @@ fn irq_dispatch() -> i64 {
     // (no sleep) while streaming instead of its usual idle-sleep --
     // see task_f's own comment for why that's safe and necessary here.
     if kernelupload_stream_active_get() == (1 as u32) {
+      // ROUND (2026-10-23, real-HW kernelupload-stream stall
+      // investigation): clear RXIC|RTIC BEFORE draining, not after --
+      // matching real Linux's own fix for this exact hazard (amba-
+      // pl011.c, "tty: pl011: Avoid spuriously stuck-off interrupts",
+      // Dave Martin 2018, backported to stable 4.16). Draining first
+      // and acking after (the old order here) leaves a race: a byte
+      // landing in the FIFO in the narrow window between the drain
+      // loop's last empty FR check and the old trailing ack gets
+      // silently cleared away unread -- and since the receive-timeout
+      // condition only re-latches on a FRESH byte arrival, a byte lost
+      // this way, with no further bytes ever coming (exactly a
+      // stream's own final byte), is stuck in the FIFO forever with no
+      // further interrupt. Live-captured via a real-HW stall: STALL
+      // DIAG showed FR=0x81 (RXFE clear -- a byte genuinely still
+      // sitting there) with RIS=0x20 (neither RXRIS nor RTRIS
+      // asserting) while IMSC/IC_ENABLE2 both still correctly enabled
+      // -- confirming the interrupt path itself, not the byte, had
+      // gone quiet. Clearing first means any byte arriving at or after
+      // this point (including one that would have raced the old ack)
+      // correctly (re-)asserts on its own; the drain loop below still
+      // reads out everything currently queued regardless of ack
+      // timing, so this changes nothing about the normal/common case.
+      let _ = mmio_write_u32(uart_icr, 0x50 as u32);
       for i from 0 to 32 {
         let fr: u32 = mmio_read_u32(uart_fr);
         if (fr & (0x10 as u32)) == (0 as u32) {
@@ -14094,7 +14117,6 @@ fn irq_dispatch() -> i64 {
           let _ = kernelupload_rx_ring_push(c);
         }
       }
-      let _ = mmio_write_u32(uart_icr, 0x50 as u32);
       // TASK #355/#356 follow-up (2026-10-15, real-HW overrun find):
       // a sustained, near-line-rate stream can overrun the PL011's
       // own 16-byte RX FIFO faster than this 32-iteration drain loop
@@ -14119,6 +14141,16 @@ fn irq_dispatch() -> i64 {
     } else {
     let rx_budget: u32 = uart_rx_irq_budget_get();
     if rx_budget > (0 as u32) {
+      // ROUND (2026-10-23): same clear-before-drain reorder as the
+      // streaming branch above -- see that branch's own header comment
+      // for the full "why" (real Linux amba-pl011.c precedent) and the
+      // live-captured real-HW evidence that motivated it. Interactive
+      // typing has never been fast enough to land a keystroke in the
+      // old ordering's race window AND have it be the last byte ever
+      // sent on top of that, but the hazard is structurally identical,
+      // so it gets the identical fix rather than leaving a known-bad
+      // ordering in a sibling branch.
+      let _ = mmio_write_u32(uart_icr, 0x50 as u32);
       for i from 0 to 128 {
         let fr: u32 = mmio_read_u32(uart_fr);
         if (fr & (0x10 as u32)) == (0 as u32) {
@@ -14134,13 +14166,6 @@ fn irq_dispatch() -> i64 {
         }
       }
       let _ = uart_rx_irq_budget_set(rx_budget - (1 as u32));
-      // Draining the FIFO above is what actually de-asserts this
-      // level-triggered condition; this just clears any stale raw
-      // status defensively, same pattern as the timer branch above.
-      // 0x50 (RXIC|RTIC), not just 0x10 (RXIC) -- task #324 now enables
-      // RTIM alongside RXIM in UART_IMSC, so a timeout-triggered entry
-      // needs its own status bit acknowledged too, not just RXIM's.
-      let _ = mmio_write_u32(uart_icr, 0x50 as u32);
       // Same overrun-clear as the streaming branch above (task #355/
       // #356 follow-up) -- interactive typing has never sustained
       // enough throughput to actually hit this in practice, but
