@@ -2178,17 +2178,47 @@ extern "C" fn uart_rx_deferred_set(v: u32) -> i64;
 // the "permanently wedged, no amount of waiting recovers it" symptom
 // observed, as opposed to a merely slow one.
 //
-// Raised from 4 to 8: covers shell_line_buf's own full 128-byte worst-
-// case line length in one tick (8 * 16 = 128) with no slack, rather
-// than an arbitrary larger number -- tied to an already-accepted
-// existing bound, not a new guess. This DOES double the worst-case
-// per-tick time this RX path can consume (each service call's own
-// fixed 128-iteration-poll cost is unchanged; only how many times per
-// tick it can fire goes up) -- re-run this project's own formal
-// schedulability analysis (task #190) against the new figure before
-// trusting real-time guarantees under worst-case RX load; not done
-// as part of this fix, flagged here instead of silently assumed fine.
-const UART_RX_IRQ_BUDGET_PER_TICK: i64 = 8;
+// ROOT-CAUSE FIX (2026-10-24, first-ever real-HW `wifikey chunk` test):
+// the "8 * 16 = 128, with no slack" sizing above was wrong about what
+// each entry actually drains. uart_rx_irq_init's own comment (above)
+// documents the REAL configured trigger level: RXIM fires at the
+// PL011's default of 1/8 FIFO = 2 bytes, not a full 16-byte FIFO --
+// 16 bytes/entry only happens if the CPU is slow enough to let the
+// FIFO fill further before the ISR actually runs, not the general
+// case for a fast-responding system draining a continuous burst. Live-
+// confirmed: a single 110-byte `wifikey chunk <96 hex chars>` command
+// (exactly the line length docs/HARDWARE_IN_LOOP.md's own chunk-size
+// choice was designed around) sent in one host-side burst silently
+// lost most of its bytes -- echo stopped dead partway through, no
+// terminating newline ever arrived, shell_line_ready never set, the
+// command never dispatched -- reproduced identically with
+// UART_DMA_ADOPT_FOR_REAL_HARDWARE at both 0 and 1, ruling out DMA and
+// confirming this budget as the real mechanism. The prior round's own
+// comment explicitly flagged this exact risk ("re-run schedulability
+// analysis... not done as part of this fix") and it was never
+// followed up on until this real-HW test finally exercised a line
+// long enough to expose it -- every earlier real-HW interactive
+// command this project ever typed was short enough (well under the
+// ~16-24 byte margin the flawed assumption accidentally still covered)
+// to never trip this gap.
+//
+// Corrected sizing: shell_line_buf's real 128-byte worst-case line, at
+// the REAL 2-byte trigger granularity, needs up to 128/2=64 entries in
+// the worst case (every entry draining only the trigger minimum,
+// never catching up to a full FIFO) -- 80 keeps that exact margin this
+// constant's own history already established (25% headroom over a
+// computed floor, not an arbitrary round number). Each entry's own
+// WCET stays fixed (irq_dispatch's `#[wcet(cycles=130000)]`, ~520us at
+// 250MHz, unchanged by this constant) -- worst-case aggregate RX-IRQ
+// time per 500ms tick rises from 8*520us=4.16ms to 80*520us=41.6ms,
+// still under 10% of the tick period and nowhere near HIGH/MEDIUM/
+// LOW's own declared deadlines (1500/500/1000ms) -- test/
+// schedulability_analysis.py's own real DhruvaOS task-set check
+// doesn't model this constant at all (it tracks GC/SD-write blocking
+// terms for HIGH/MEDIUM/LOW, not UART-IRQ entry count), so this bound
+// is argued directly here rather than re-asserted against a tool that
+// was never wired to it.
+const UART_RX_IRQ_BUDGET_PER_TICK: i64 = 80;
 // Round 192: opens every ARMv6 domain (kernel-context escape hatch) --
 // see dacr_open_all's own comment in context_switch.S for why
 // irq_dispatch needs this (stack_canary_check_all's own cross-task

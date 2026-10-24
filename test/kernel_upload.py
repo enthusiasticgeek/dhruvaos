@@ -283,10 +283,30 @@ class ShellSession:
                     raise IOError(f"no ACK covering {total}/{len(mv)} bytes within {ack_timeout}s -- "
                                   f"board stalled (SD write stuck?) or connection lost")
 
-    def wait_until_ready(self, overall_timeout: float = 30, poll_interval: float = 1.0) -> bool:
+    def wait_until_ready(self, overall_timeout: float = 30, poll_interval: float = 5.0) -> bool:
         """Same attach-at-any-time handshake as wifikey_upload.py's own
         -- this tool targets an ALREADY-booted board, not a fresh
-        reset, so there's no 'PASS' marker to wait for at all."""
+        reset, so there's no 'PASS' marker to wait for at all.
+
+        2026-10-24 fix: the old version re-sent 'ready' every single
+        poll_interval (originally 1.0s) regardless of whether the
+        PRIOR 'ready' had actually been answered yet -- a real round
+        trip that happens to take just over that window (confirmed
+        live: ordinary interactive commands occasionally do, no
+        regression, just real variance) left a stray unconsumed
+        'ready'/'READY' pair sitting in the buffer past self.consumed.
+        The NEXT command's own read_until (for 'GO ') then scans
+        forward from there and can land behind that leftover pair's
+        own echo/response text with no 'GO ' substring anywhere in it
+        -- confirmed live, twice in a row: a direct, single manual
+        'kernelupload stream' command (skipping this polling loop
+        entirely) got 'GO <len>' back immediately both times, proving
+        the board itself was never the problem. Fixed by raising the
+        per-attempt window to 5.0s (comfortably over any real round
+        trip this project has ever measured) so a resend only ever
+        fires after a genuine silence, not a slightly-slow-but-still-
+        in-flight response -- same principle as every other timeout in
+        this file, sized against real measured latency, not a guess."""
         deadline = time.time() + overall_timeout
         while time.time() < deadline:
             self.send("ready")

@@ -14711,3 +14711,48 @@ building/testing under QEMU, same dance as the watchdog flag). Not yet measured:
 reduces wall-clock boot time or `kernelupload`-adjacent diagnostic-print overhead in any measurable way (the
 ORIGINAL motivation, per task #357's own busy-wait-removal history) — this round only confirms correctness,
 not a before/after performance delta.
+
+### First-ever real-HW `wifikey chunk` test finds and fixes a genuine UART RX budget gap (2026-10-24)
+
+Continuation of the DMA TX adoption above, working toward loading the real RTL8192CU firmware (never
+done on real hardware before) per `docs/HARDWARE_IN_LOOP.md` §6.1. The real first chunk command is 110
+bytes (`"wifikey chunk "` + 96 hex chars) -- sending it froze the shell's echo dead partway through, no
+`"ok, N bytes accumulated"` response, no terminating newline ever processed. Reproduced identically with
+`UART_DMA_ADOPT_FOR_REAL_HARDWARE` at both 0 and 1, ruling DMA out despite it being the most recently
+changed thing.
+
+**Real root cause**: `UART_RX_IRQ_BUDGET_PER_TICK` (the sporadic-server budget protecting `irq_dispatch`'s
+own WCET, task #242) was sized on a flawed assumption. Its own prior-round comment computed `8 * 16 = 128`
+("covers shell_line_buf's own full 128-byte worst-case line... with no slack") -- assuming every IRQ entry
+drains a full 16-byte hardware FIFO. But `uart_rx_irq_init`'s own comment (same file) documents the REAL
+configured RXIM trigger level: the PL011 default of 1/8 FIFO = **2 bytes**, not 16 -- a fast-responding CPU
+services the FIFO as soon as it crosses 2 bytes, not waits for it to fill. Real worst case for a 128-byte
+line: up to 128/2=64 entries, not 8. The prior round's own comment explicitly flagged this as an open risk
+("re-run schedulability analysis... not done as part of this fix") and it was never followed up on --
+every real-HW interactive command this entire project has ever typed happened to be short enough (under
+the ~16-24-byte margin the flawed assumption accidentally still covered) to never expose it, until this
+first-ever `wifikey` real-HW test finally sent something long enough.
+
+**Fix**: raised to 80 (64 + 25% margin). Each IRQ entry's own WCET is unchanged (`irq_dispatch`'s
+`#[wcet(cycles=130000)]`, ~520us at 250MHz) -- worst-case aggregate RX-IRQ time per 500ms tick rises from
+8*520us=4.16ms to 80*520us=41.6ms, still under 10% of the tick period and nowhere near HIGH/MEDIUM/LOW's
+own declared deadlines (1500/500/1000ms). `test/schedulability_analysis.py`'s own real DhruvaOS task-set
+check doesn't model this constant at all (it tracks GC/SD-write blocking terms, not UART-IRQ entry count),
+so the bound is argued directly in the source comment rather than re-run against a tool that was never
+wired to it.
+
+**Second, independent bug found along the way** (host tooling, not the kernel): `test/kernel_upload.py`'s
+`wait_until_ready()` resent `"ready"` every 1.0s regardless of whether the prior one had actually been
+answered yet. A real round trip that happens to take just over 1s (no regression -- real, ordinary
+variance) left a stray unconsumed `"ready"`/`"READY"` pair in the buffer; the next `read_until("GO ", ...)`
+call could then land behind that leftover pair's own echo/response text, which contains no `"GO "`
+substring, and time out even though the board had already answered the REAL command correctly and quickly
+(confirmed directly: a manual, single `kernelupload stream` command, skipping the polling loop entirely,
+got `GO <len>` back immediately, both times this was hit). Fixed by raising the per-attempt window to 5.0s
+-- comfortably over any measured real round trip -- so a resend only fires after genuine silence.
+
+**Verified on real hardware, both fixes together**: rebuilt with `UART_RX_IRQ_BUDGET_PER_TICK=80` AND
+`UART_DMA_ADOPT_FOR_REAL_HARDWARE=1`, uploaded via the (fixed) `kernel_upload.py` to the inactive slot,
+activated, rebooted, and sent the exact 110-byte `wifikey chunk` command that originally froze: `"ok, 48
+bytes accumulated"`, clean, first try. Full QEMU regression (18/18) re-confirmed with the RX-budget change
+alone (DMA stays off under QEMU regardless, per its own pre-existing real-HW-only gate).
