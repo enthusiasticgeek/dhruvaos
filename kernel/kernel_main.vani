@@ -8887,7 +8887,10 @@ fn dharafs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
 // hard-real-time-adjacent append/read path). Block 0 is reserved
 // (unused for now -- a natural home for a future superblock, not
 // needed yet since dharafs_init's recovery scan reconstructs everything
-// from the log itself).
+// from the log itself). dharafs_init's own recovery scan tolerates an
+// isolated bad block anywhere in 1..2047 (see its own ROOT-CAUSE FIX
+// comment, 2026-10-24) rather than assuming every block in this range
+// is reliable.
 //
 // Record layout (512 bytes):
 //   [0:4)   checksum   -- covers [4:512) only, computed fresh on
@@ -9151,6 +9154,13 @@ fn dharafs_dirindex_upsert_raw(path_buf: mut ref i64, path_len: i64, block: i64)
   return dharafs_dirindex_upsert(path_buf, 0, path_len, block);
 }
 
+// See dharafs_init's own ROOT-CAUSE FIX comment (2026-10-24) for the
+// full "why" -- how many consecutive checksum/read failures recovery
+// tolerates before concluding it has genuinely reached the end of the
+// log, rather than hit one isolated bad block with real data behind
+// it.
+const DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS: i64 = 4;
+
 fn dharafs_init() -> i64 {
   let _ = dharafs_dirindex_reset();
   let _ = dharafs_snapshot_reset();
@@ -9161,6 +9171,32 @@ fn dharafs_init() -> i64 {
                             // bounded rather than reading the whole
                             // disk looking for the first free block.
   let highest_seq: u32 = 0 as u32;
+  // ROOT-CAUSE FIX (2026-10-24, real-HW cross-reboot DharaFS
+  // persistence investigation): this scan used to stop at the FIRST
+  // checksum failure or SD read error, treating it as "this must be
+  // the end of the log" -- correct for genuine unwritten/erased flash
+  // (which reads back the same fixed bit pattern for every block from
+  // here to the device's own end), but wrong for an ISOLATED bad
+  // block with real, valid data sitting right behind it. Live-
+  // confirmed real-HW case: block 1 reads back checksum-invalid on
+  // every single boot (a consistent one-byte-shifted pattern -- a
+  // real hardware/controller quirk isolated to that one block, not a
+  // timing/race issue -- an earlier fix taking task_e's own ceiling
+  // lock around `reboot` made zero difference), while blocks 2-20
+  // were ALL perfectly intact with clean, sequential seq numbers --
+  // real data this scan's own early-break logic was hiding, not data
+  // that was ever actually lost. A point-fix reserving block 1
+  // specifically (like block 0 already is) would have "fixed" only
+  // this one observed case, not the general problem -- a single
+  // isolated bad block ANYWHERE in the log, from any cause, deserves
+  // the same tolerance. DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS
+  // (4) distinguishes the two cases: skip forward past up to that
+  // many consecutive failures before giving up, resetting the count
+  // back to 0 the moment a genuinely valid block is found again --
+  // comfortably more than one isolated blip, nowhere close to the
+  // hundreds/thousands of blocks a real run of unwritten flash would
+  // span, so genuine end-of-log detection is unaffected.
+  let consecutive_bad: i64 = 0;
   while blk < max_blk {
     // TASK #353 REAL-HW FOLLOW-UP (2026-10-16): found live -- this
     // scan reads sequentially from block 1 on EVERY boot (no
@@ -9187,12 +9223,6 @@ fn dharafs_init() -> i64 {
       let _ = watchdog_kick();
     }
     let rd_status: i64 = dharafs_block_read(blk, buf);
-    if rd_status != 0 {
-      break;
-    }
-    let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
-    let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
-    let this_seq: u32 = buf_read_u32(buf, 4 as u32);
     // A checksum match ALONE isn't enough: buf_checksum's rotate-mix
     // of an all-zero region is itself exactly 0, matching the
     // all-zero stored-checksum field a genuinely unwritten (fresh
@@ -9209,10 +9239,18 @@ fn dharafs_init() -> i64 {
     // test (task #3's SD round-trip sweep) happens to write raw,
     // non-record data, which is what finally failed the checksum
     // check and looked like where the log "ended."
-    if (stored_checksum != computed_checksum) || (this_seq == (0 as u32)) {
-      break;
-    }
-
+    let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+    let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let this_seq: u32 = buf_read_u32(buf, 4 as u32);
+    let block_ok: i64 = if (rd_status != 0) || (stored_checksum != computed_checksum) || (this_seq == (0 as u32)) { 0 } else { 1 };
+    if block_ok == 0 {
+      consecutive_bad = consecutive_bad + 1;
+      if consecutive_bad >= DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS {
+        break;
+      }
+      blk = blk + 1;
+    } else {
+    consecutive_bad = 0;
     let this_path_len: u32 = buf_read_u32(buf, 8 as u32);
     if this_path_len == dharafs_tx_begin_sentinel() {
       // Round 52: a transaction marker -- see dharafs_tx_begin_raw's
@@ -9282,6 +9320,7 @@ fn dharafs_init() -> i64 {
       }
       let _ = dharafs_dirindex_upsert(buf, 12, this_path_len as i64, blk);
       blk = blk + 1;
+    }
     }
   }
   let _ = dharafs_state_set(blk as u32, highest_seq + (1 as u32));
@@ -34304,6 +34343,35 @@ fn shell_dispatch() -> i64 {
   // requested reboot the way watchdog_init/_kick's own 2-second
   // supervision timeout needs to.
   if shell_word_matches(line_buf, 0, cmd_end, "reboot") == 1 {
+    // ROOT-CAUSE FIX (2026-10-24, real-HW cross-reboot DharaFS
+    // persistence investigation): this command used to arm the
+    // watchdog with NO guarantee that task_e's own periodic GC/
+    // DharaFS-compact critical section (dhruva_prio_lock(2), wakes
+    // every 20 ticks) wasn't genuinely mid-write at that exact
+    // instant -- a write torn by the hard PM_RSTC reset firing a
+    // fixed 1 tick later. Live-confirmed as the real mechanism: an
+    // immediate read-back of block 1 right after writing it was
+    // byte-perfect every time (checksum match, clean seq), but the
+    // VERY NEXT boot's own recovery scan found that same block
+    // checksum-invalid 100% of the time -- not a write-path bug, a
+    // reboot-timing one. `/config/mode` (GC's own most frequently
+    // rewritten path, "post-compact-1"/"post-compact-2" every 20-tick
+    // wake) is exactly the record most likely to be mid-flight at any
+    // given instant, explaining why recovery NEVER found it. Taking
+    // the SAME ceiling task_e's own critical section already uses
+    // guarantees mutual exclusion the way `shutdown`'s own "no further
+    // writes will occur" guarantee gets for the operator-driven power-
+    // off path above -- if task_e is already inside its critical
+    // section, this blocks here until it genuinely finishes (flushing
+    // the write) before the record below is even read, let alone the
+    // watchdog armed; if task_e wakes AFTER this point, scheduler_
+    // pick_next's own existing ceiling gate keeps it off the CPU until
+    // this command returns (which never releases the lock -- the
+    // reset fires before that would ever matter). maintenance_mode
+    // alone (kernelupload/wifikey's own mechanism) is NOT equivalent
+    // here: it only stops a NEW pass from starting, never waits out
+    // one already in progress, exactly the risk window this closes.
+    let _ = dhruva_prio_lock(2);
     // Task #308 follow-up ("I need unattended debugging"/"reset
     // reason"): record that this reset was deliberate BEFORE arming
     // the watchdog -- watchdog_arm's own first write (PM_WDOG) is

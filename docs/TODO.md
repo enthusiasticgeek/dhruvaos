@@ -14756,3 +14756,57 @@ got `GO <len>` back immediately, both times this was hit). Fixed by raising the 
 activated, rebooted, and sent the exact 110-byte `wifikey chunk` command that originally froze: `"ok, 48
 bytes accumulated"`, clean, first try. Full QEMU regression (18/18) re-confirmed with the RX-budget change
 alone (DMA stays off under QEMU regardless, per its own pre-existing real-HW-only gate).
+
+### DharaFS cross-reboot persistence bug: root-caused and fixed, verified across real reboots (2026-10-24)
+
+Found as a side effect of the WiFi firmware upload work above: an ordinary `write /path data` command,
+confirmed readable within the same boot session, was gone after every single clean reboot. Not specific to
+WiFi or any new code this session touched -- a genuine, previously-undiscovered gap in `dharafs_init`'s own
+recovery scan that had likely been silently losing data across reboots for a long time, just never directly
+tested this way before (every earlier real-HW verification happened to check state that gets freshly
+rewritten every boot by the boot-time self-test itself, like `/config/mode`, never a genuinely new path
+written once and checked only after a later reboot).
+
+**First hypothesis (disproven by direct test)**: the `reboot` shell command arms the watchdog for an
+immediate hard reset with no guarantee that task_e's own periodic GC/DharaFS-compact critical section wasn't
+genuinely mid-write at that exact instant. Fixed by having `reboot` take the same ceiling lock (`dhruva_prio_
+lock(2)`) before writing its own slot-state record and arming the watchdog. Full QEMU regression passed, but
+a real-HW reboot-and-check-test showed **zero change** -- the exact same failure. This cleanly disproved
+timing/scheduling as the mechanism, since the fix, by construction, guarantees no DharaFS write can be
+in-flight when the reset fires.
+
+**Real root cause, found via direct diagnostics**: added a temporary recovery-scan print and a same-boot
+immediate-readback check. The immediate readback of block 1 right after writing it was byte-perfect every
+time (clean checksum match, `seq=1`) -- proving the write path itself was never the problem. But `dharafs_
+init`'s own recovery scan, which stops at the FIRST checksum failure (treating it as "this must be the end
+of the log" -- correct for genuine unwritten flash, which would fail identically for hundreds of blocks in a
+row), found block 1 checksum-invalid on every single real-HW boot, with a consistent one-byte-shifted
+pattern (`stored_csum=0x80350200` / `seq=0x01803502` -- shifting the first value right 8 bits gives almost
+exactly the second) -- a real hardware/SD-controller quirk isolated to that one specific block, not
+something software-level timing could ever explain.
+
+**User's own pushback on the first fix attempt** ("should file system be not resilient to bad blocks or
+errors") caught a real design gap before it shipped: the first version of this fix just reserved block 1
+(like block 0 already is) -- a point-fix for the ONE bad block this investigation happened to find, not
+general resilience against an isolated bad block ANYWHERE in the log, from any cause. Revised: `dharafs_
+init`'s recovery scan now tolerates up to `DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS` (4) consecutive
+checksum/read failures before concluding it has genuinely reached the end of the log, skipping forward past
+an isolated bad block and resetting the count the moment a valid block is found again. 4 is comfortably more
+than one isolated blip, nowhere close to the hundreds/thousands of blocks a real run of unwritten flash
+would span, so genuine end-of-log detection is unaffected.
+
+**Verified on real hardware**: an unconditional diagnostic scan of blocks 1-20 (bypassing the scan's own
+early-break rule) showed block 1 alone failing its checksum on every boot, with blocks 2-20 ALL perfectly
+intact -- clean, sequential `seq=2..20`, real path lengths. This was real, substantial DharaFS log data that
+had been sitting on the card the whole time, just permanently hidden by the recovery scan's own
+early-break logic treating one bad block as the definitive end. After the fix: `ls` immediately showed
+kernlog files from boot #2, #44, #45, #46 -- data from many prior sessions, visible for the first time.
+Two separate fresh writes (`/persistfinal`, `/persistfinal2`), each followed by a real reboot, both survived
+and read back correctly -- the first genuine cross-reboot DharaFS persistence confirmation this entire
+investigation. (Two OLDER test files written before the fix, `/testpersist`/`/testpersist2`/`/persisttest3`,
+did not reappear -- expected collateral loss: every one of the many reboots that happened under the old bug
+believed the log was empty and legitimately overwrote those same low block numbers with its own fresh
+self-test sequence, before this fix ever existed to prevent it.)
+
+Full QEMU regression (18/18) re-confirmed clean both for the (superseded) ceiling-lock attempt and the
+final generalized fix.
