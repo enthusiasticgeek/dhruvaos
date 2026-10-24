@@ -14677,3 +14677,37 @@ upload protocol's own per-chunk overhead) against.
 
 Full QEMU regression (18/18) and `schedulability_analysis.py` both re-confirmed clean after this fix, before
 the real-HW retest.
+
+### Task #357: DMA UART TX adopted as the lasting real-HW default (2026-10-24)
+
+Follow-up to "DMA UART TX real-HW trial PASSED" (2026-10-23) and the kernelupload-stream stall fix above.
+`UART_DMA_ADOPT_FOR_REAL_HARDWARE` had stayed at its checked-in default of 0 after that trial, same
+off-by-default convention as `WATCHDOG_ENABLE_FOR_REAL_HARDWARE` — this round flips it to 1 for a real-HW
+build and confirms it holds up as the new lasting default rather than a one-off test.
+
+Flipped, rebuilt (QEMU regression intentionally skipped for this specific flag — the driver's own header
+comment already root-caused why QEMU's `bcm2835-dma` model hits "Blocked re-entrant IO on MemoryRegion" when
+`uart_puts`'s own call path triggers a transfer, same real-HW-only class as `WATCHDOG_ENABLE_FOR_REAL_HARDWARE`
+and SDHOST/GPIO-pull before it), uploaded via the now-fixed `kernelupload stream`/`commit` path to slot A
+(zero stalls, same baseline timing as the heartbeat-fix confirmation: 983.3s/3072 bytes/sec), activated, and
+rebooted into it.
+
+Verified on real hardware, not just "it booted":
+
+- No `"DMA: no VideoCore-firmware-safe UART-TX channel found, staying on PIO"` fallback message anywhere in
+  the boot capture — `dma_uart_init()` found a safe channel and `uart_dma_ready` is genuinely 1, not silently
+  degraded back to PIO.
+- Zero garbled/corrupted output across the full boot sequence (USB enumeration, DharaFS self-tests, task
+  creation) and a dense `diagnose` dump — the same rapid back-to-back-uart_puts-calls shape that caught the
+  original scratch-buffer-clobber bug (2026-10-17) during this project's own earlier DMA adoption attempts.
+  Both of this project's two previously-fixed real-HW DMA corruption bugs (the 4-byte-per-beat/byte-width
+  bug, and the shared-scratch-buffer race between back-to-back calls) stayed fixed under this exact
+  workload.
+- `diagnose`'s own stuck-task/WCET-enforcement counters read `0/0` across the board, confirming the
+  heartbeat-liveness fix above still holds in combination with DMA TX active.
+
+`UART_DMA_ADOPT_FOR_REAL_HARDWARE=1` is now the real-HW build's lasting state (flipped back to 0 only when
+building/testing under QEMU, same dance as the watchdog flag). Not yet measured: whether DMA actually
+reduces wall-clock boot time or `kernelupload`-adjacent diagnostic-print overhead in any measurable way (the
+ORIGINAL motivation, per task #357's own busy-wait-removal history) — this round only confirms correctness,
+not a before/after performance delta.

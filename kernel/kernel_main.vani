@@ -5044,7 +5044,7 @@ fn uart_capture_end() -> i64 {
 // this codebase (WATCHDOG_ENABLE_FOR_REAL_HARDWARE etc.) rather than
 // risking the QEMU regression baseline chasing a QEMU-specific
 // dispatch quirk further.
-const UART_DMA_ADOPT_FOR_REAL_HARDWARE: i64 = 0;
+const UART_DMA_ADOPT_FOR_REAL_HARDWARE: i64 = 1;
 const UART_DMA_MIN_LEN: i64 = 8;
 const UART_DMA_SCRATCH_CAP: i64 = 512;
 
