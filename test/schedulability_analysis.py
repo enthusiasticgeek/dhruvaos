@@ -421,8 +421,32 @@ def dhruvaos_demo_task_set_analysis() -> int:
     # dharafs_compact_resumable_self_test does), was 7.689ms at
     # budget=8.
     gc_dharafs_healthy_ms = 4.616  # measured max, 18 real passes, budget=1
-    sd_fill_fifo_worst_case_wedge_ms = 22.272  # measured+computed, 32nd SD round
-    gc_dharafs_critical_section_ms = gc_dharafs_healthy_ms + sd_fill_fifo_worst_case_wedge_ms
+    sd_fill_fifo_worst_case_wedge_ms = 22.272  # SINGLE-ATTEMPT masked window, measured+computed, 32nd SD round
+    # 2026-10-23 real-HW finding (kernelupload stall investigation,
+    # aged/worn SD cards): sdhost_write_block (kernel_main.vani) does
+    # NOT call the masked fill loop once -- it retries up to
+    # SD_MAX_ATTEMPTS (kernel_main.vani's own const, =3) times whenever
+    # the wedge-detection heuristic fires, with a full (unmasked)
+    # controller reinit between attempts but each attempt re-entering
+    # its OWN masked fill loop. The single-attempt figure above was the
+    # only number ever fed into this model -- correct for a healthy
+    # card where wedges are rare, but a direct real-HW measurement
+    # (rxdiag's new sd_write_worst_us counter, TIMER_CLO-bracketed
+    # around the whole sdhost_write_block call) on a 13-year-old card
+    # showed 139423us for ONE write -- consistent with 2-3 consecutive
+    # masked windows, not one. Aged flash's slower/more variable
+    # program-time response trips this driver's own wedge heuristic far
+    # more often than the healthy card this figure was originally
+    # measured against, so the TRUE worst case this model must assume
+    # is every attempt wedging: SD_MAX_ATTEMPTS back-to-back masked
+    # windows, not one. Scaled linearly from the honestly-measured
+    # single-attempt figure by the exact, known retry-count constant --
+    # same technique sd_drain_fifo_worst_case_wedge_ms's own history
+    # above already used ("scaled linearly from the write side's own
+    # measured 400-cap figure"), not a fabricated number.
+    sd_write_max_attempts = 3  # mirrors kernel_main.vani's SD_MAX_ATTEMPTS
+    sd_write_worst_case_total_masked_ms = sd_write_max_attempts * sd_fill_fifo_worst_case_wedge_ms
+    gc_dharafs_critical_section_ms = gc_dharafs_healthy_ms + sd_write_worst_case_total_masked_ms
 
     # 42nd SD round, 4th follow-up (2026-09-27): the READ side's own
     # masked window (syscall #6, sdhost_drain_fifo_to_buffer_impl, added
@@ -465,12 +489,42 @@ def dhruvaos_demo_task_set_analysis() -> int:
     # confirmation is exactly the mistake this project has learned not
     # to make.
     sd_drain_fifo_worst_case_wedge_ms = 1.0  # conservative estimate, 42nd SD round, 6th follow-up
+    # 2026-10-23 (real-HW kernelupload-stream stall investigation,
+    # broader critical-section WCET audit per user request): `ping`
+    # (kernel_main.vani's shell_dispatch, under task_f's own blanket
+    # dhruva_prio_lock(2) wrap around the whole dispatch) runs up to
+    # THREE retry loops -- dns_resolve (hostname form only),
+    # arp_resolve_poll, and icmp_poll -- each delay(161000) per retry,
+    # confirmed (dwc2_core_soft_reset's own comment, cross-checked
+    # live) at ~50ms real on this hardware, not the ~15.5ms an earlier
+    # miscalibration gave. All three call netif_recv_frame directly,
+    # the SAME shared DWC2 channel-0 hardware dhcp_client_poll/sshd's
+    # own ceiling=2 already protects against (Round 182) -- a real,
+    # load-bearing lock, not an accidental side effect of task_f's
+    # "wrap the whole dispatch" design.
+    #
+    # FIRST PASS at this figure used 3*20*50ms=3000ms (all three loops
+    # held under ONE continuous outer lock, worst case all three
+    # maxing out) -- confirmed via this exact script that it blows
+    # LOW's own 1000ms deadline outright. FIXED at the root (kernel_
+    # main.vani's own ping handler, same round): ping now drops the
+    # outer lock on entry and takes three independent, phase-scoped
+    # relocks (one per loop) instead of one continuous hold -- per
+    # Sha/Rajkumar/Lehoczky's own "at most one lower-priority critical
+    # section blocks a task per activation" (the same max()-not-sum()
+    # treatment gc_worst_blocking_ms's own two GC candidates already
+    # use), the real candidate is now the SINGLE largest phase, not
+    # their sum. Each phase's own iteration cap was ALSO reduced 20->8
+    # the same round (every single phase alone, at the old 20x~50ms,
+    # independently exceeded budget) -- 8*50ms=400ms.
+    ping_ceiling2_worst_case_ms = 400.0
     # ROUND 2026-09-17 (gap #238): was 325.62ms (dwc2_wait_chan0_done's
     # own shared-primitive worst case) -- now the real measured worst
     # case of dwc2_net_bulk_in_poll_wcet_measure_self_test's own
     # NET_BULK_IN_POLL_CAP-bounded poll, ~48x smaller, not a guess.
     gc_dhcp_poll_worst_case_ms = 6.584
-    gc_worst_blocking_ms = max(gc_dharafs_critical_section_ms, gc_dhcp_poll_worst_case_ms)
+    gc_worst_blocking_ms = max(gc_dharafs_critical_section_ms, gc_dhcp_poll_worst_case_ms,
+                               ping_ceiling2_worst_case_ms)
 
     # ROUND 2026-09-25 (task #285) correctness fix: HIGH/MEDIUM's own
     # blocking term below used to be JUST LOW's ceiling-0 section,
@@ -498,7 +552,7 @@ def dhruvaos_demo_task_set_analysis() -> int:
     # incomplete, not because today's numbers demanded it; if either
     # figure moves in a future round, this is what keeps the bound
     # honest instead of silently stale.
-    high_medium_blocking_ms = max(measured_low_critical_section_ms, sd_fill_fifo_worst_case_wedge_ms,
+    high_medium_blocking_ms = max(measured_low_critical_section_ms, sd_write_worst_case_total_masked_ms,
                                    sd_drain_fifo_worst_case_wedge_ms)
 
     tasks = [
@@ -554,13 +608,18 @@ def dhruvaos_demo_task_set_analysis() -> int:
         print("VERDICT: schedulable with real measured blocking data, comfortable margin.")
         print("CAVEAT: 'other_body_estimate_ms' (5ms/task) is a conservative round-up,")
         print("not independently measured to the same rigor as the other figures. LOW's own")
-        print(f"B_LOW ({gc_worst_blocking_ms:.3f}ms) now uses GC's real measured worst case --")
-        print(f"as of task #285 that's the DharaFS/SD-write path (healthy {gc_dharafs_healthy_ms:.3f}ms +")
-        print(f"worst-case-wedge {sd_fill_fifo_worst_case_wedge_ms:.3f}ms), not the smaller dwc2 USB-poll")
-        print("figure (6.584ms) or the even smaller healthy-path-only DharaFS average actually")
-        print("observed across 10 real test passes -- a rigorous bound has to assume the")
-        print("pessimistic case can happen. Re-run with real numbers before trusting this")
-        print("for any actual production workload, not just this demonstration task set.")
+        candidates = {
+            "GC's DharaFS/SD-write critical section": gc_dharafs_critical_section_ms,
+            "GC's DHCP/USB-hotplug poll": gc_dhcp_poll_worst_case_ms,
+            "ping's own largest single phase (DNS/ARP/ICMP)": ping_ceiling2_worst_case_ms,
+        }
+        winner = max(candidates, key=candidates.get)
+        print(f"B_LOW ({gc_worst_blocking_ms:.3f}ms) is currently dominated by: {winner}")
+        print("(the other candidates, for reference: " +
+              ", ".join(f"{name}={val:.3f}ms" for name, val in candidates.items() if name != winner) + ")")
+        print("-- a rigorous bound has to assume the pessimistic case can happen for whichever")
+        print("candidate is largest. Re-run with real numbers before trusting this for any")
+        print("actual production workload, not just this demonstration task set.")
         return 0
     else:
         print("VERDICT: NOT schedulable with real measured blocking data.")

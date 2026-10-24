@@ -39,6 +39,7 @@ Usage:
 import argparse
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import termios
@@ -54,11 +55,15 @@ BAUD_MAP = {
 }
 
 # How often (in received bytes) the board sends an ACK line -- must
-# match kernel_main.vani's own 65536 boundary (scheduling_decision_
-# prelude has nothing to do with this; it's task_f's new streaming
-# branch). Only used here to size the stall-detection timeout
-# sensibly, not to validate the board's own cadence.
-ACK_INTERVAL_BYTES = 65536
+# match kernel_main.vani's own task_f streaming branch threshold.
+# 2026-10-23 (aged-SD-card stall investigation): reduced from 65536 to
+# 512 (one SD block) specifically so this can double as the real ACK-
+# driven flow-control window below, not just a progress heartbeat --
+# see send_raw_ack_paced's own docstring for why that granularity
+# matters, not merely how often it previously fired.
+ACK_INTERVAL_BYTES = 512
+
+ACK_LINE_RE = re.compile(rb"ACK ([0-9A-Fa-f]{8}) ")
 
 
 def open_serial(path: str, baud: int) -> int:
@@ -75,6 +80,20 @@ def open_serial(path: str, baud: int) -> int:
     cc[termios.VMIN] = 0
     cc[termios.VTIME] = 1
     termios.tcsetattr(fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, baud_const, baud_const, cc])
+    # Root-cause fix (2026-10-23): this was missing entirely. Any bytes the
+    # board already sent before this process opened the device -- e.g. a
+    # prior attempt's own late DONE/STALL-DIAG text, queued in the kernel's
+    # TTY input buffer because the previous process was killed (a `timeout`
+    # wrapper, Ctrl-C, etc.) before its own reader thread drained them --
+    # stay sitting there across the close/reopen and get silently replayed
+    # into THIS session's buffer the instant its reader thread starts
+    # reading. That contaminates every read_until() match with a mix of
+    # stale and fresh board output, which is indistinguishable from a real
+    # protocol failure without tracing byte-for-byte -- exactly what made
+    # several real-HW stream failures this session look inconsistent
+    # (sometimes garbled, sometimes a stray "DONE" from nowhere). Flush
+    # unconditionally on every open, not just after a detected failure.
+    termios.tcflush(fd, termios.TCIFLUSH)
     return fd
 
 
@@ -197,6 +216,73 @@ class ShellSession:
                                f"({total}/{len(mv)} bytes sent so far)")
             total += n
 
+    def wait_for_ack_at_least(self, min_len: int, timeout: float) -> bool:
+        """Blocks until an `ACK <hex_len> ...` line whose hex_len already
+        covers min_len appears, advancing self.consumed past every ACK
+        line scanned (matched or not) so later read_until calls (DONE,
+        the commit needle) never re-see them. Returns False on timeout --
+        the caller treats that as a real stall, not a transient gap."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                while True:
+                    m = ACK_LINE_RE.search(self.buf, self.consumed)
+                    if not m:
+                        break
+                    total_len = int(m.group(1), 16)
+                    self.consumed = m.end()
+                    if total_len >= min_len:
+                        return True
+            time.sleep(0.01)
+        return False
+
+    def send_raw_ack_paced(self, data: bytes, window_size: int, ack_timeout: float, on_progress=None):
+        """True ACK-driven flow control (2026-10-23, aged-SD-card stall
+        investigation -- see docs/TODO.md for the full writeup). The
+        earlier fix here was a fixed host-side delay after each chunk
+        (see git history), sized against this driver's documented
+        ~50ms worst-case IRQ+FIQ-masked SD-write window (boot/
+        sdcard_state.S). Direct real-HW measurement on a 13-year-old
+        card (kernelupload_state.S's own sd_write_worst_us, read back
+        via the `rxdiag` shell command) found 139ms for a single write
+        -- sdhost_write_block retries up to SD_MAX_ATTEMPTS(3) times on
+        a wedge, each retry re-entering its own masked fill loop, and
+        aged flash's slower/more variable program time trips that
+        wedge heuristic far more often than the healthy card the fixed
+        delay was tuned against. No fixed delay is a real guarantee
+        against a card that is, or becomes, slower still.
+
+        This replaces the guess with a guarantee: window_size MUST be
+        <=512 (one SD block -- kernel_main.vani's task_f streaming
+        branch only triggers a write, and only emits its ACK, once
+        total_len crosses a 512-byte boundary and that write has
+        already completed). Sending one window, then blocking until
+        the board's own ACK confirms it was fully absorbed, means zero
+        bytes are ever in flight while a masked write (how many
+        retries, however long) is in progress -- correctness no longer
+        depends on how long that window is, only throughput does. The
+        board reports DONE instead of a trailing ACK for the final
+        window once total_len reaches the declared length -- that's
+        deliberately NOT matched here (the caller's own existing DONE
+        read_until, run after this method returns, is left to see it;
+        matching it here would consume it out from under that wait)."""
+        if window_size > 512:
+            raise ValueError("window_size must be <=512 (the board's own SD block size) -- "
+                              "see this method's own docstring for why a larger window "
+                              "reopens the exact overrun risk this flow control exists to close")
+        mv = memoryview(data)
+        total = 0
+        while total < len(mv):
+            end = min(total + window_size, len(mv))
+            self.send_raw(mv[total:end])
+            total = end
+            if on_progress is not None:
+                on_progress(total, len(mv))
+            if total < len(mv):
+                if not self.wait_for_ack_at_least(total, ack_timeout):
+                    raise IOError(f"no ACK covering {total}/{len(mv)} bytes within {ack_timeout}s -- "
+                                  f"board stalled (SD write stuck?) or connection lost")
+
     def wait_until_ready(self, overall_timeout: float = 30, poll_interval: float = 1.0) -> bool:
         """Same attach-at-any-time handshake as wifikey_upload.py's own
         -- this tool targets an ALREADY-booted board, not a fresh
@@ -228,10 +314,24 @@ def main() -> int:
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--go-timeout", type=float, default=10, help="seconds to wait for the board's 'GO <len>' response")
     ap.add_argument("--stall-timeout", type=float, default=30,
-                     help="abort if no new ACK/DONE arrives for this many seconds once streaming (a stall, not normal per-chunk pacing -- there is no per-chunk pacing anymore)")
+                     help="abort if the final DONE doesn't arrive within this many seconds of the last window's ACK")
     ap.add_argument("--commit-timeout", type=float, default=60, help="commit does a full SD readback+re-hash, give it real time")
     ap.add_argument("--ready-timeout", type=float, default=30, help="seconds to wait for the board to answer 'ready' at all")
     ap.add_argument("--log", default="/tmp/kernel_upload_full.log", help="path to write the raw captured serial log")
+    ap.add_argument("--window-size", type=int, default=512,
+                     help="2026-10-23 (replaces the old fixed-delay --chunk-size/--chunk-delay pacing, which "
+                          "assumed a bounded ~50ms SD-write worst case that a 13-year-old test card blew past at "
+                          "139ms): send this many bytes, then BLOCK for a real ACK from the board confirming they "
+                          "were fully absorbed, before sending more. MUST stay <=512 (the board's own SD block "
+                          "size) -- see send_raw_ack_paced's own docstring for why a larger window reopens the "
+                          "overrun risk this flow control exists to close.")
+    ap.add_argument("--ack-timeout", type=float, default=5.0,
+                     help="seconds to wait for each window's own ACK before declaring a real stall. Covers both "
+                          "the worst single SD-write duration measured so far (139ms on an aged card) and the "
+                          "residual task_e/GC ceiling-2 contention window (kernel_main.vani's maintenance_mode "
+                          "precedence checks close most of this, but not a race already in progress when a "
+                          "stream starts -- dhcp_client_poll's own measured worst case, 325620us, is the largest "
+                          "remaining piece) -- generous margin over real measured numbers, not a tight bound.")
     args = ap.parse_args()
 
     data = open(args.kernel_img, "rb").read()
@@ -260,34 +360,36 @@ def main() -> int:
             print("---last output---")
             print(session.tail_text())
             return 1
-        print("[board is GO] blasting the whole image as one raw write -- no hex, no per-chunk wait...")
+        print(f"[board is GO] sending in {args.window_size}-byte windows, blocking for a real ACK after each "
+              f"(~{real_len / (args.baud / 10):.0f}s of wire time, plus however long the board's own SD writes "
+              f"actually take -- no longer a fixed guess)...")
 
         t0 = time.time()
-        session.send_raw(data)
-        print(f"  ...all {real_len} bytes handed to the OS write() call, waiting for the board to "
-              f"drain + ack as it goes")
+        last_print = [0]
 
-        last_progress_bytes = 0
-        deadline = time.time() + args.stall_timeout
-        done = False
-        while time.time() < deadline:
-            if session.read_until("DONE ", timeout=0.5):
-                done = True
-                break
-            with session.lock:
-                buf_copy = bytes(session.buf)
-            # Count how many "ACK " lines have appeared so far, purely
-            # to decide whether real progress is happening (and reset
-            # the stall deadline) -- not parsing the exact byte count
-            # out of them, since DONE's own arrival is the real signal
-            # this loop is waiting for.
-            ack_count = buf_copy.count(b"ACK ")
-            if ack_count > last_progress_bytes:
-                last_progress_bytes = ack_count
-                print(f"  ...progress: {ack_count} ACK(s) seen so far ({(time.time() - t0):.1f}s elapsed)")
-                deadline = time.time() + args.stall_timeout
-        if not done:
-            print(f"[FAIL] stream stalled -- no DONE within {args.stall_timeout}s of the last progress ACK")
+        def _progress(sent, total):
+            if sent - last_print[0] >= 262144 or sent == total:
+                last_print[0] = sent
+                print(f"  ...host-side sent {sent}/{total} bytes ({time.time() - t0:.1f}s elapsed)", flush=True)
+
+        try:
+            session.send_raw_ack_paced(data, args.window_size, args.ack_timeout, on_progress=_progress)
+        except IOError as e:
+            print(f"[FAIL] {e}")
+            print("---last output---")
+            print(session.tail_text())
+            return 1
+        print(f"  ...all {real_len} bytes sent, each window ACK-confirmed as it went -- "
+              f"waiting for the final DONE")
+
+        # Every byte up to real_len was already individually ACK-confirmed
+        # above -- the only thing left unconfirmed is the final DONE the
+        # board sends instead of a trailing ACK once total_len reaches the
+        # declared length (see send_raw_ack_paced's own docstring for why
+        # that line is deliberately left for this read_until, not consumed
+        # inside the ack-wait loop).
+        if not session.read_until("DONE ", timeout=args.stall_timeout):
+            print(f"[FAIL] stream finished sending but no DONE within {args.stall_timeout}s")
             print("---last output---")
             print(session.tail_text())
             return 1

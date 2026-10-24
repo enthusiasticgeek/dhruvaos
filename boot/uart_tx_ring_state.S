@@ -308,6 +308,15 @@ drain_step:
     ldrb r0, [r1, r4]            /* r0 = buf[tail] */
     ldr r1, =0x20201000          /* UART_DR */
     strb r0, [r1]
+    /* 2026-10-23 audit (same class as the UART overrun-clear fix):
+     * explicit barrier before the loop re-polls UART_FR (a different
+     * register) on the next iteration -- low real risk (each
+     * iteration re-checks FR fresh, and retrying a write the FIFO
+     * wasn't actually ready for is architecturally safe), added for
+     * consistency with every other MMIO write-then-cross-register-
+     * read site in this driver. */
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5    /* DMB */
     add r4, r4, #1
     and r4, r4, #63              /* next_tail = (tail + 1) & 63 */
     ldr r1, =uart_tx_ring_tail
@@ -432,6 +441,10 @@ drain_only_step:
     ldrb r0, [r1, r4]            /* r0 = buf[tail] */
     ldr r1, =0x20201000          /* UART_DR */
     strb r0, [r1]
+    /* 2026-10-23 audit: same barrier addition as drain_step's own
+     * matching write above -- see that one's comment for the "why". */
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5    /* DMB */
     add r4, r4, #1
     and r4, r4, #63              /* next_tail = (tail + 1) & 63 */
     ldr r1, =uart_tx_ring_tail

@@ -1999,6 +1999,33 @@ extern "C" fn task_table_init() -> i64;
 extern "C" fn dhruva_mutex_lock(mutex_id: u32) -> u32;
 #[stack_cost(bytes=8)]
 extern "C" fn dhruva_mutex_unlock(mutex_id: u32) -> u32;
+// 2026-10-23 (real-HW kernelupload-stream stall investigation, user
+// request "fix the root cause... even if kernel transfers in multiple
+// attempts"): DWC2 channel-0 access (hub GET_PORT_STATUS, dhcp_client_
+// poll/sshd's own netif_recv_frame) used to share DharaFS's own
+// dhruva_prio_lock(2) ceiling -- live-measured at a 20+ SECOND hold
+// when the hub answers slowly (a genuine, Linux-documented USB/dwc2
+// characteristic, not a bug -- see this round's own citations), which
+// blocked kernelupload's own UNRELATED SD writes for the same
+// duration, since ceiling protocol blocks EVERY less-urgent task
+// system-wide for as long as ANY ceiling section runs, regardless of
+// whether that section's own numeric level matches. A SEPARATE
+// ceiling level would NOT have fixed this (still blocks everyone
+// less urgent, just at a different number) -- this mutex (slot 2 of
+// the existing MAX_MUTEXES=4, boot/context_switch.S; slots 0/1
+// already used by the demo tasks) is used INSTEAD for the DWC2-
+// specific call sites (task_e's hotplug/dhcp section, ping's DNS/ARP/
+// ICMP phases, sshd's three netif_recv_frame sites) precisely because
+// priority INHERITANCE only elevates the holder when a waiter
+// actually needs the SAME resource, never blocking an unrelated
+// task's own kernelupload SD write (ceiling=2, untouched) from being
+// scheduled normally. task_e and task_f already share one priority
+// band with proven fair round-robin rotation between them (round 75) --
+// removing the artificial ceiling boost from DWC2 work lets that
+// existing rotation interleave kernelupload's own progress with
+// however long the hub takes, instead of the whole system waiting on
+// it.
+const DWC2_MUTEX_ID: u32 = 2;
 // Reads eff_prio_table[current_task] -- lets a task observe its own
 // effective priority live, e.g. to prove a dhruva_mutex_lock inheritance
 // boost actually happened.
@@ -2243,6 +2270,10 @@ extern "C" fn scheduler_ready_count() -> i64;
 // only test environment (QEMU) can't reveal.
 #[stack_cost(bytes=1)]
 extern "C" fn mem_barrier() -> i64;
+// 2026-10-23: lighter DMB-only variant for high-frequency hot paths --
+// see its own header comment (boot/context_switch.S) for the full
+// "why" vs. mem_barrier()'s DSB.
+extern "C" fn mem_barrier_dmb() -> i64;
 // 2026-09-27, per the user's own direct instruction ("dma be used to
 // save cpu cycles"): DMA-driven UART TX -- see boot/dma_uart_state.S's
 // own header comment for the full register-level justification
@@ -2860,6 +2891,14 @@ extern "C" fn usb_hub_set_port2_connected(value: u32) -> u32;
 extern "C" fn usb_hub_get_port3_connected() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_hub_set_port3_connected(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_get_fail_streak() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_set_fail_streak(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_get_backoff_remaining() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_hub_set_backoff_remaining(value: u32) -> u32;
 
 // Round 57 (boot/usb_bt_state.S): same shape as usb_net_state.S above,
 // for the USB Bluetooth HCI transport -- a SEPARATE state module so a
@@ -3014,6 +3053,74 @@ extern "C" fn kernelupload_rx_ring_tail_set(value: u32) -> u32;
 extern "C" fn kernelupload_stream_last_activity_tick_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn kernelupload_stream_last_activity_tick_set(value: u32) -> u32;
+// 2026-10-23 real-HW hang investigation follow-up: independent,
+// task_f-agnostic stall detector's own snapshot -- see its own header
+// comment in boot/kernelupload_state.S.
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_watchdog_last_total_len_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_watchdog_last_total_len_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_watchdog_last_progress_tick_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_watchdog_last_progress_tick_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_watchdog_stall_reported_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_watchdog_stall_reported_set(value: u32) -> u32;
+// 2026-10-23 follow-up: protocol-agnostic maintenance-mode precedence
+// flag -- see its own header comment in boot/kernelupload_state.S.
+#[stack_cost(bytes=1)]
+extern "C" fn maintenance_mode_active_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn maintenance_mode_active_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn maintenance_mode_last_touch_tick_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn maintenance_mode_last_touch_tick_set(value: u32) -> u32;
+// 2026-10-23 follow-up: microsecond-precision RX-byte-arrival/
+// overrun-event evidence for the separate, later-stage stall -- see
+// their own header comment in boot/kernelupload_state.S.
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_last_rx_byte_us_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_last_rx_byte_us_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_overrun_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_overrun_count_incr() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_overrun_count_set(value: u32) -> u32;
+// 2026-10-23 follow-up: UART IRQ handler re-entry rate / post-drain
+// FIFO-backlog evidence -- see their own header comment
+// (boot/kernelupload_state.S).
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_uart_irq_entry_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_uart_irq_entry_count_incr() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_uart_irq_entry_count_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_fifo_backlog_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_fifo_backlog_count_incr() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_fifo_backlog_count_set(value: u32) -> u32;
+// 2026-10-23 follow-up: worst observed sdhost_write_block duration
+// during an active stream -- see its own header comment
+// (boot/kernelupload_state.S).
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_sd_write_worst_us_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_sd_write_worst_us_set(value: u32) -> u32;
+// 2026-10-23 (resumable chunked upload): see boot/kernelupload_
+// state.S's own header comment for the full "why".
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_chunk_record_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_chunk_base_block_offset_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn kernelupload_chunk_base_block_offset_set(value: u32) -> u32;
 // Task #164 follow-up: bulk endpoint/toggle state for real 802.11
 // frame TX/RX -- see boot/usb_wifi_state.S's own comment.
 #[stack_cost(bytes=1)]
@@ -6163,8 +6270,17 @@ fn watchdog_arm(timeout_ticks: u32) -> i64 {
   let wrcfg_full_reset: u32 = 0x00000020 as u32;
 
   let _ = mmio_write_u32(pm_wdog, pm_password | (timeout_ticks & (0xFFFFF as u32)));
+  // 2026-10-23 audit: added for consistency with every other MMIO
+  // write-then-cross-register-access site in this codebase -- real
+  // risk here is negligible (PM_WDOG and PM_RSTC are independent
+  // registers, and the watchdog fires asynchronously ~N seconds
+  // later regardless of a microsecond-scale posted-write delay), but
+  // there's no reason to rely on that incidentally rather than
+  // guaranteeing it explicitly.
+  let _ = mem_barrier();
   let cur: u32 = mmio_read_u32(pm_rstc);
   let _ = mmio_write_u32(pm_rstc, pm_password | (cur & wrcfg_clr) | wrcfg_full_reset);
+  let _ = mem_barrier();
   return 0;
 }
 
@@ -11237,21 +11353,32 @@ fn task_holds_any_mutex_self_test() -> i64 {
 fn task_fsq() -> i64 {
   while true {
     let _ = task_sleep_ticks(5);
-    // Round 76: matches task_e/task_f's own dhruva_prio_lock(2) around
-    // their DharaFS-touching code (see task_e's own comment for the
-    // full "No concurrency lock protecting DharaFS's own shared state"
-    // rationale). task_fsq's own real priority (2) is already the
-    // highest of the three real DharaFS-calling tasks, so a LOWER-
-    // priority task_e/task_f can never actually preempt it mid-drain
-    // under plain fixed-priority scheduling even without this lock --
-    // included anyway for symmetry with the other two call sites and
-    // as a defensive guard against any future task added at priority
-    // 0 or 1 that also touches DharaFS, not because this exact 3-task
-    // scenario strictly requires it on this side.
+    // 2026-10-23 (real-HW kernelupload-stream stall root cause --
+    // maintenance-mode precedence, see task_e's own matching comment
+    // for the full "why"): task_fsq's own base priority (2) already
+    // numerically beats task_f's (3), so a pending fsqueue entry would
+    // legitimately preempt an active stream regardless of this lock --
+    // deferred anyway, same principle as task_e, since fsqueue work
+    // has no real deadline either and kernelupload itself never
+    // submits through this queue (direct sdhost_write_block calls),
+    // so skipping an empty-queue pass costs nothing real. Checks the
+    // generalized, protocol-agnostic flag (2026-10-23 follow-up) --
+    // see maintenance_mode_is_active's own header comment.
+    if maintenance_mode_is_active() == (0 as u32) {
     let _ = dhruva_prio_lock(2);
     let drained: i64 = 0;
     let keep_going: i64 = 1;
-    while (keep_going == 1) && (drained < fsqueue_max_slots()) {
+    // 2026-10-23 (same consistency fix as task_e's own matching
+    // comment): re-check maintenance_mode on every iteration, not
+    // just once before the loop started -- a stream that engages
+    // mid-drain would otherwise still let the REMAINING slots run
+    // before task_fsq's own next wake gets a chance to defer again.
+    // Each slot is independently bounded (dharafs_queue_dispatch_one,
+    // fsqueue_max_slots()=8 cap), so this closes the same class of
+    // gap at low cost even though the exposure here is already far
+    // smaller than task_e's own (no USB bring-up/enumeration in this
+    // loop, just bounded single-block DharaFS ops).
+    while (keep_going == 1) && (drained < fsqueue_max_slots()) && (maintenance_mode_is_active() == (0 as u32)) {
       let r: i64 = dharafs_queue_dispatch_one();
       if r < 0 {
         keep_going = 0;
@@ -11260,6 +11387,7 @@ fn task_fsq() -> i64 {
       }
     }
     let _ = dhruva_prio_unlock(2);
+    }
   }
   return 0;
 }
@@ -11566,6 +11694,43 @@ fn shell_dispatch_sdckpt() -> i64 {
   let _ = uart_puts("\n");
   let _ = sd_wedge_checkpoint_print_one("PRE ", SD_WEDGE_CKPT_BLOCK_PRE);
   let _ = sd_wedge_checkpoint_print_one("POST", SD_WEDGE_CKPT_BLOCK_POST);
+  return 0;
+}
+
+// 2026-10-23 follow-up: reads back kernelupload_last_rx_byte_us/
+// _overrun_count -- see their own header comment (boot/kernelupload_
+// state.S) -- via plain uart_puts (reliable, blocking, task context),
+// not the lossy uart_putc_nonblocking path the FIQ-level stall
+// detector has to use. Confirmed live this round: even a short-ish
+// burst of uart_putc_nonblocking calls from FIQ context got silently
+// truncated/dropped under real sustained load (that function's own
+// documented, already-accepted "drops a character if the TX path is
+// momentarily full" behavior) -- these two words are already
+// persisted continuously in plain RAM regardless of whether anything
+// ever prints them, so querying them AFTER a stall via an ordinary
+// shell command sidesteps the whole unreliable-live-print problem
+// entirely. Intended use: after a `kernelupload stream` stalls and
+// self-aborts (10s-inactivity path, which returns control to the
+// ordinary shell), run this to see exactly how long it's been since
+// the last real byte arrived and how many overrun events happened.
+fn shell_dispatch_rxdiag() -> i64 {
+  let now_us: u32 = mmio_read_u32(TIMER_CLO);
+  let last_rx_us: u32 = kernelupload_last_rx_byte_us_get();
+  let _ = uart_puts("\nrxdiag: last_rx_byte_us=");
+  let _ = uart_put_hex32(last_rx_us);
+  let _ = uart_puts(" now_us=");
+  let _ = uart_put_hex32(now_us);
+  let _ = uart_puts(" gap_us=");
+  let _ = uart_put_hex32(now_us - last_rx_us);
+  let _ = uart_puts(" overrun_count=");
+  let _ = uart_put_i64(kernelupload_overrun_count_get() as i64);
+  let _ = uart_puts(" uart_irq_entries=");
+  let _ = uart_put_i64(kernelupload_uart_irq_entry_count_get() as i64);
+  let _ = uart_puts(" fifo_backlog_count=");
+  let _ = uart_put_i64(kernelupload_fifo_backlog_count_get() as i64);
+  let _ = uart_puts(" sd_write_worst_us=");
+  let _ = uart_put_i64(kernelupload_sd_write_worst_us_get() as i64);
+  let _ = uart_puts("\n");
   return 0;
 }
 
@@ -13867,6 +14032,146 @@ fn timer_tick_dispatch() -> i64 {
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
     let _ = watchdog_kick();
   }
+
+  // 2026-10-23 real-HW hang investigation (task #357 follow-up):
+  // independent, task_f-agnostic stall detector -- see
+  // kernelupload_watchdog_last_total_len's own header comment in
+  // boot/kernelupload_state.S for the full "why" this exists (a real
+  // continuous unpaced 3MB transfer went completely silent after
+  // ~131KB with NO existing diagnostic ever printing anything, then a
+  // genuine watchdog-triggered hard reset -- task_f's own 10s-
+  // inactivity check is stamped right before it calls into the code
+  // that then hangs, so it never gets back to the top of its own loop
+  // to notice). Pure reads of already-existing globals plus (only on
+  // the one-shot latch) a handful of uart_putc_nonblocking/uart_put_
+  // hex32_irq calls -- the SAME IRQ-safe-only primitives this
+  // function already uses for its own '.' tick character just below,
+  // no SD/peripheral access and no dhruva_prio_lock (uart_puts is NOT
+  // safe to call from FIQ context -- see its own header comment).
+  // `now` (TIMER_CLO microseconds) reused from just above rather than
+  // scheduler_get_tick_count(), so this has zero dependency on
+  // exactly when the scheduler's own tick counter advances relative
+  // to this function's own execution.
+  if kernelupload_stream_active_get() == (1 as u32) {
+    let wd_total_len: u32 = kernelupload_total_len_get();
+    let wd_last_len: u32 = kernelupload_watchdog_last_total_len_get();
+    if wd_total_len != wd_last_len {
+      let _ = kernelupload_watchdog_last_total_len_set(wd_total_len);
+      let _ = kernelupload_watchdog_last_progress_tick_set(now);
+      let _ = kernelupload_watchdog_stall_reported_set(0 as u32);
+    } else {
+      let wd_last_progress: u32 = kernelupload_watchdog_last_progress_tick_get();
+      if (now - wd_last_progress) > (5000000 as u32) {
+        if kernelupload_watchdog_stall_reported_get() == (0 as u32) {
+          let _ = kernelupload_watchdog_stall_reported_set(1 as u32);
+          let wd_cur_task: u32 = current_task_get();
+          let _ = uart_putc_nonblocking(10);
+          let _ = uart_putc_nonblocking(70);  // F
+          let _ = uart_putc_nonblocking(73);  // I
+          let _ = uart_putc_nonblocking(81);  // Q
+          let _ = uart_putc_nonblocking(87);  // W
+          let _ = uart_putc_nonblocking(68);  // D
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(83);  // S
+          let _ = uart_putc_nonblocking(84);  // T
+          let _ = uart_putc_nonblocking(65);  // A
+          let _ = uart_putc_nonblocking(76);  // L
+          let _ = uart_putc_nonblocking(76);  // L
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(116); // t
+          let _ = uart_putc_nonblocking(111); // o
+          let _ = uart_putc_nonblocking(116); // t
+          let _ = uart_putc_nonblocking(97);  // a
+          let _ = uart_putc_nonblocking(108); // l
+          let _ = uart_putc_nonblocking(61);  // =
+          let _ = uart_put_hex32_irq(wd_total_len);
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(116); // t
+          let _ = uart_putc_nonblocking(97);  // a
+          let _ = uart_putc_nonblocking(115); // s
+          let _ = uart_putc_nonblocking(107); // k
+          let _ = uart_putc_nonblocking(61);  // =
+          let _ = uart_put_hex32_irq(wd_cur_task);
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(99);  // c
+          let _ = uart_putc_nonblocking(101); // e
+          let _ = uart_putc_nonblocking(105); // i
+          let _ = uart_putc_nonblocking(108); // l
+          let _ = uart_putc_nonblocking(61);  // =
+          let _ = uart_put_hex32_irq(ceiling_depth_table_get_at(wd_cur_task));
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(101); // e
+          let _ = uart_putc_nonblocking(112); // p
+          let _ = uart_putc_nonblocking(61);  // =
+          let _ = uart_put_hex32_irq(eff_prio_table_get_at(wd_cur_task));
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(105); // i
+          let _ = uart_putc_nonblocking(114); // r
+          let _ = uart_putc_nonblocking(113); // q
+          let _ = uart_putc_nonblocking(61);  // =
+          let _ = uart_put_hex32_irq(irq_count_get() as u32);
+          // 2026-10-23 follow-up: microsecond-precision RX-byte-
+          // arrival gap + cumulative overrun count -- see
+          // kernelupload_last_rx_byte_us's own header comment
+          // (boot/kernelupload_state.S) for the separate, later-stage
+          // stall this is evidence for. `rxgap` = exact microseconds
+          // since the last byte the IRQ handler itself actually read
+          // off the wire (NOT tick-granularity like the total/task
+          // fields above) -- if this is far larger than the real
+          // wire-time for one byte at 115200 baud (~87us), bytes have
+          // genuinely stopped arriving at the hardware, not merely
+          // been slow to process.
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(114); // r
+          let _ = uart_putc_nonblocking(120); // x
+          let _ = uart_putc_nonblocking(103); // g
+          let _ = uart_putc_nonblocking(97);  // a
+          let _ = uart_putc_nonblocking(112); // p
+          let _ = uart_putc_nonblocking(61);  // =
+          let _ = uart_put_hex32_irq(now - kernelupload_last_rx_byte_us_get());
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(111); // o
+          let _ = uart_putc_nonblocking(101); // e
+          let _ = uart_putc_nonblocking(114); // r
+          let _ = uart_putc_nonblocking(114); // r
+          let _ = uart_putc_nonblocking(61);  // =
+          let _ = uart_put_hex32_irq(kernelupload_overrun_count_get());
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(99);  // c
+          let _ = uart_putc_nonblocking(116); // t
+          let _ = uart_putc_nonblocking(120); // x
+          let _ = uart_putc_nonblocking(61);  // =
+          let _ = uart_put_hex32_irq(context_switch_count_get() as u32);
+          let _ = uart_putc_nonblocking(32);  // ' '
+          let _ = uart_putc_nonblocking(116); // t
+          let _ = uart_putc_nonblocking(105); // i
+          let _ = uart_putc_nonblocking(99);  // c
+          let _ = uart_putc_nonblocking(107); // k
+          let _ = uart_putc_nonblocking(61);  // =
+          let _ = uart_put_hex32_irq(scheduler_get_tick_count());
+          let _ = uart_putc_nonblocking(13);
+          let _ = uart_putc_nonblocking(10);
+          // 2026-10-23 follow-up: the full per-task (0-9) scheduler-
+          // state dump that used to run here (added for the Phase 1
+          // task_e/task_fsq contention investigation, user request
+          // "make sure we know every task ID granular") is REMOVED --
+          // live-confirmed this round that it was long enough (50+
+          // uart_putc_nonblocking calls) to actually trigger uart_
+          // putc_nonblocking's own documented, already-accepted
+          // "silently drops a character if the TX path is momentarily
+          // full" behavior (see that function's own header comment),
+          // garbling THIS diagnostic's own output on a real-HW run.
+          // Phase 1's own fix is already confirmed working from an
+          // earlier run that DID capture a clean task=4/task_e-
+          // holding-ceiling=2 snapshot before this dump existed to
+          // garble anything -- no need to re-prove that every run.
+          // Keeping this print short is now the priority, for the
+          // SEPARATE stall this file's own rxgap/overr fields above
+          // exist to diagnose.
+        }
+      }
+    }
+  }
   // Task #323 (2026-10-02, same-day regression fix): pump the TX
   // ring's drain side EVERY tick, unconditionally -- see uart_tx_ring_
   // drain_only's own header comment (boot/uart_tx_ring_state.S) for
@@ -14087,6 +14392,10 @@ fn irq_dispatch() -> i64 {
     // (no sleep) while streaming instead of its usual idle-sleep --
     // see task_f's own comment for why that's safe and necessary here.
     if kernelupload_stream_active_get() == (1 as u32) {
+      // 2026-10-23 follow-up: count every entry into this branch --
+      // see kernelupload_uart_irq_entry_count's own header comment
+      // (boot/kernelupload_state.S).
+      let _ = kernelupload_uart_irq_entry_count_incr();
       // ROUND (2026-10-23, real-HW kernelupload-stream stall
       // investigation): clear RXIC|RTIC BEFORE draining, not after --
       // matching real Linux's own fix for this exact hazard (amba-
@@ -14115,7 +14424,20 @@ fn irq_dispatch() -> i64 {
         if (fr & (0x10 as u32)) == (0 as u32) {
           let c: u32 = mmio_read_u32(uart_dr) & (0xFF as u32);
           let _ = kernelupload_rx_ring_push(c);
+          // 2026-10-23 follow-up: stamp the exact moment of this real,
+          // successfully-read byte -- see kernelupload_last_rx_byte_us's
+          // own header comment (boot/kernelupload_state.S) for the
+          // separate, later-stage stall this is evidence for.
+          let _ = kernelupload_last_rx_byte_us_set(mmio_read_u32(TIMER_CLO));
         }
+      }
+      // 2026-10-23 follow-up: is the FIFO STILL non-empty after all 32
+      // drain iterations? Direct, unambiguous evidence of incoming
+      // bytes outpacing this handler's own per-entry drain capacity --
+      // see kernelupload_fifo_backlog_count's own header comment
+      // (boot/kernelupload_state.S).
+      if (mmio_read_u32(uart_fr) & (0x10 as u32)) == (0 as u32) {
+        let _ = kernelupload_fifo_backlog_count_incr();
       }
       // TASK #355/#356 follow-up (2026-10-15, real-HW overrun find):
       // a sustained, near-line-rate stream can overrun the PL011's
@@ -14131,6 +14453,42 @@ fn irq_dispatch() -> i64 {
       // reporting a now-historical error as if it just happened again.
       if (mmio_read_u32(uart_ris) & (0x400 as u32)) != (0 as u32) {
         let _ = mmio_write_u32(uart_rsr_ecr, 0 as u32);
+        // 2026-10-23 ACTUAL ROOT-CAUSE FIX (real-HW rxgap/overrun
+        // investigation, found by checking Zephyr's own PL011 driver
+        // history -- CVE-2026-12629, "tty: pl011: ISR never
+        // acknowledged pending error bits via icr"): UART_RSR_ECR
+        // (the write above) and UART_ICR are TWO SEPARATE registers
+        // controlling TWO SEPARATE latches on real PL011 silicon --
+        // writing ECR clears the per-CHARACTER status bits in RSR,
+        // but does NOT clear the LATCHED INTERRUPT bit in RIS/MIS.
+        // Only writing UART_ICR's own OEIC bit (bit 10, 0x400) clears
+        // THAT latch. This driver only ever wrote ECR here -- RIS's
+        // own OERIS bit, once set by one genuine overrun, stayed
+        // PERMANENTLY latched for the rest of the stream, re-detected
+        // (not re-triggered) on every single subsequent, otherwise
+        // completely ordinary RX interrupt -- exactly matching the
+        // live-captured evidence (overrun_count=165907+ in under 20
+        // real seconds, a rate matching nothing but the PL011's own
+        // normal ~2-byte FIFO threshold, i.e. perfectly healthy
+        // interrupt traffic, each one just re-reading the same never-
+        // cleared bit). The barrier fix below is still real and
+        // correct (posted-write ordering on this peripheral region is
+        // a genuine separate hazard), but it was never going to fix
+        // THIS symptom -- the write it orders was clearing the wrong
+        // register all along.
+        let _ = mmio_write_u32(uart_icr, 0x400 as u32);
+        // 2026-10-23 follow-up: switched from mem_barrier() (DSB) to
+        // mem_barrier_dmb() (DMB) -- this is the highest-frequency
+        // call site of any barrier in this codebase under real
+        // sustained load, and DSB's own wait-for-completion cost is
+        // not actually needed here, only ordering -- see mem_barrier_
+        // dmb's own header comment (boot/context_switch.S) for the
+        // full "why".
+        let _ = mem_barrier_dmb();
+        // 2026-10-23 follow-up: count every real overrun event during
+        // an active stream -- see kernelupload_overrun_count's own
+        // header comment (boot/kernelupload_state.S).
+        let _ = kernelupload_overrun_count_incr();
       }
       // Falls through to the function's own closing brace below --
       // deliberately does NOT touch rx_budget/uart_rx_irq_budget at
@@ -14173,6 +14531,16 @@ fn irq_dispatch() -> i64 {
       // OERIS around if it ever does.
       if (mmio_read_u32(uart_ris) & (0x400 as u32)) != (0 as u32) {
         let _ = mmio_write_u32(uart_rsr_ecr, 0 as u32);
+        // 2026-10-23: same ACTUAL root-cause fix (UART_ICR's own OEIC
+        // bit, not just UART_RSR_ECR, actually clears the LATCHED
+        // interrupt bit -- see the streaming branch's own identical
+        // fix above for the full "why", CVE-2026-12629).
+        let _ = mmio_write_u32(uart_icr, 0x400 as u32);
+        // Same missing-barrier fix as the streaming branch's own
+        // identical clear above (DMB, not DSB, for consistency with
+        // that site, though this path's own low throughput means the
+        // choice doesn't matter in practice).
+        let _ = mem_barrier_dmb();
       }
     } else {
       let _ = mmio_write_u32(UART_IMSC, 0 as u32);
@@ -17699,6 +18067,30 @@ fn tcp_send_rst_for_unmatched(frame: mut ref i64, frame_len: i64, my_mac: mut re
 }
 
 fn tcp_conn_poll(my_mac: mut ref i64, out_payload: mut ref i64, max_payload_len: i64) -> i64 {
+  // 2026-10-23 (real-HW kernelupload-stream stall investigation, user
+  // request "audit other functions codebase likely affected"): this
+  // whole function -- the shared poll loop behind every live TCP-
+  // backed command (tcpecho/tcprtx/sshtest/tlsecho/httpecho via tls_
+  // service) -- touches real DWC2 hardware on BOTH sides (netif_recv_
+  // frame below, and indirectly via tcp_conn_check_retransmit's own
+  // retransmit send and tcp_conn_send_data's own echo-reply send, both
+  // of which can reach netif_send_frame). None of these call sites
+  // used to take any lock of their own -- they relied entirely on
+  // shell_dispatch's own OUTER dhruva_prio_lock(2) wrap still being
+  // active, which stopped being a safe assumption the moment task_e/
+  // ping/sshd's own DWC2 work moved OFF that ceiling onto DWC2_
+  // MUTEX_ID (see that constant's own header comment) -- ceiling=2
+  // and this mutex are now two separate, non-interacting mechanisms,
+  // so a caller using one is NOT mutually exclusive with a caller
+  // using the other. DWC2_MUTEX_ID wraps the WHOLE function body
+  // (not just the one netif_recv_frame call) specifically because of
+  // those send-side side effects -- tcp_conn_poll is only ever called
+  // from live, post-boot shell-command handlers (verified: every
+  // caller sits within a command's own dispatch branch, never a boot-
+  // time self-test), so calling a real blocking primitive here is
+  // safe -- mutex_owner_table is long since seeded by task_table_init
+  // by the time any of these commands can run.
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   // Round 37: checked on every call, for both connection slots,
   // regardless of whether a frame is even queued below -- a lost
   // segment produces no frame at all, so this is the only thing that
@@ -17709,12 +18101,15 @@ fn tcp_conn_poll(my_mac: mut ref i64, out_payload: mut ref i64, max_payload_len:
   let frame: mut ref i64 = net_recv_scratch_get();
   let frame_len: i64 = netif_recv_frame(frame, netif_frame_slot_size());
   if frame_len < 0 {
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     return 0 - 1;
   }
   if buf_read_u16_be(frame, 12) != (0x0800 as u32) {
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     return 0 - 1;
   }
   if ipv4_get_protocol(frame, 14) != (6 as u32) {
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     return 0 - 1;
   }
   let dst_port: u32 = tcp_get_dst_port(frame, 34);
@@ -17732,13 +18127,16 @@ fn tcp_conn_poll(my_mac: mut ref i64, out_payload: mut ref i64, max_payload_len:
   }
   if matched == 0 {
     let _ = tcp_send_rst_for_unmatched(frame, frame_len, my_mac);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     return 0 - 1;
   }
   let result: i64 = tcp_conn_handle_segment(target_conn, frame, frame_len, my_mac, my_mac, out_payload, max_payload_len);
   if (target_conn == server_id) && (result > 0) {
     let _ = tcp_conn_send_data(server_id, my_mac, my_mac, out_payload, result);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     return 0 - 2;
   }
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
   return result;
 }
 
@@ -18622,7 +19020,20 @@ fn dns_resolve(my_mac: mut ref i64, my_ip: u32, dns_server_ip: u32, hostname: mu
   let resolved_scratch: mut ref i64 = dhruva_alloc_bytes(4);
   let iter: i64 = 0;
   let resolved: i64 = 0;
-  while (iter < 20) && (resolved == 0) {
+  // 2026-10-23 (critical-section WCET audit, user request): was 20 --
+  // dns_resolve_poll calls netif_recv_frame directly (same shared
+  // DWC2 channel-0 hazard dhcp_client_poll/sshd already need ceiling=2
+  // against), and every caller of this function runs under some
+  // ceiling=2 holder (shell_dispatch's own outer wrap, directly for
+  // `nslookup`, or ping's own phase-scoped lock around this call --
+  // see that command's own header comment). At the real ~50ms per
+  // delay(161000) (confirmed via dwc2_core_soft_reset's own comment,
+  // not the ~15.5ms an earlier miscalibration gave), 20 iterations
+  // alone -- just THIS one function -- already blows LOW's own
+  // 1000ms deadline per test/schedulability_analysis.py's corrected
+  // model. Reduced to 8 (~400ms worst case), matching the same budget
+  // every other candidate blocking term in that model respects.
+  while (iter < 8) && (resolved == 0) {
     if dns_resolve_poll(xid, resolved_scratch) == 1 {
       resolved = 1;
     } else {
@@ -20086,6 +20497,17 @@ fn dwc2_restart_phy_clock() -> i64 {
 fn dwc2_core_soft_reset() -> i64 {
   let grstctl: i64 = dwc2_base() + 0x10;
   let _ = mmio_write_u32(grstctl, 1 as u32);
+  // 2026-10-23 ROOT-CAUSE AUDIT (same class as the UART overrun-clear
+  // fix): this whole DWC2 driver had ZERO mem_barrier() calls anywhere
+  // -- the write above sets GRSTCTL's CSftRst bit, then the very next
+  // instructions poll the SAME register expecting to see it land. This
+  // peripheral region is Shareable Device memory (boot/mmu_init.S),
+  // not Strongly Ordered -- a posted write has no guaranteed
+  // visibility before a subsequent read without an explicit barrier.
+  // Directly correlates with a real, currently-occurring symptom: `USB
+  // DIAG: hard error at tries=00000001 hi=0x00000008` on essentially
+  // every real-HW boot this session.
+  let _ = mem_barrier();
   let csft_tries: i64 = 0;
   while csft_tries < 20 {
     let v: u32 = mmio_read_u32(grstctl);
@@ -20260,6 +20682,13 @@ fn dwc2_port_reset() -> i64 {
   // actually produce on real hardware.
   let v: u32 = mmio_read_u32(hprt0);
   let _ = mmio_write_u32(hprt0, (v & not_w1c_mask) | (0x100 as u32));
+  // 2026-10-23 audit: mem_barrier() added for correctness/consistency
+  // (see dwc2_core_soft_reset's own matching comment for the full
+  // "why") -- the real ~50ms delay() below almost certainly already
+  // provides more than enough margin for the write to land, but there
+  // is no reason to rely on that incidentally rather than guaranteeing
+  // it explicitly.
+  let _ = mem_barrier();
   let _ = delay(161000);
 
   // Deassert RST, again forcing the w1c group to 0 in the WRITE value
@@ -20269,6 +20698,8 @@ fn dwc2_port_reset() -> i64 {
   let v2: u32 = mmio_read_u32(hprt0);
   let clear_rst: u32 = (0x100 as u32) ^ (0xFFFFFFFF as u32);
   let _ = mmio_write_u32(hprt0, v2 & clear_rst & not_w1c_mask);
+  // 2026-10-23 audit: same mem_barrier() addition as above.
+  let _ = mem_barrier();
   let _ = delay(161000);
 
   // Poll for ENA, bounded -- real hardware's own response to the
@@ -20535,6 +20966,12 @@ fn dwc2_config_fifos() -> i64 {
   let _ = mmio_write_u32(grxfsiz, rx_size);
   let _ = mmio_write_u32(gnptxfsiz, (nptx_size << (16 as u32)) | rx_size);
   let _ = mmio_write_u32(hptxfsiz, (ptx_size << (16 as u32)) | (rx_size + nptx_size));
+  // 2026-10-23 audit: three writes to three DIFFERENT registers back-
+  // to-back, then (below) a fourth write to a FOURTH register whose
+  // own flush behavior depends on the FIFO sizes above having already
+  // landed -- see dwc2_core_soft_reset's own matching comment for the
+  // full "why" this needs an explicit barrier.
+  let _ = mem_barrier();
 
   // Flush both TX FIFOs (TXFNUM=0x1F selects "all") and the RX FIFO
   // after resizing -- standard DWC2 practice after any FIFO RAM
@@ -20545,6 +20982,7 @@ fn dwc2_config_fifos() -> i64 {
   // established pattern just above).
   let txfnum_all: u32 = 0x1F as u32;
   let _ = mmio_write_u32(grstctl, (0x20 as u32) | (txfnum_all << (6 as u32))); // TXFFLSH=bit5
+  let _ = mem_barrier();
   let tx_flush_tries: i64 = 0;
   while tx_flush_tries < 20 {
     let v: u32 = mmio_read_u32(grstctl);
@@ -20556,6 +20994,7 @@ fn dwc2_config_fifos() -> i64 {
   }
 
   let _ = mmio_write_u32(grstctl, 0x10 as u32); // RXFFLSH=bit4
+  let _ = mem_barrier();
   let rx_flush_tries: i64 = 0;
   while rx_flush_tries < 20 {
     let v2: u32 = mmio_read_u32(grstctl);
@@ -27838,6 +28277,16 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
   let reset_seen: i64 = 0;
   let port_status: u32 = 0 as u32;
   let poll_iter: i64 = 0;
+  // 2026-10-23 (same wall-clock-budget fix as usb_hotplug_sample_
+  // port_connected's own header comment -- audited as the SAME bug
+  // class, worse here: 20 tries, not 3, with no existing bound beyond
+  // "dwc2_hub_get_port_status returned an outright error". A hub that
+  // answers successfully every time but slowly (the live-confirmed
+  // real failure mode, not a hard error) would pay that cost 20 times
+  // before this loop's own iteration cap ever kicks in -- unlike the
+  // per-call delay(161000) this loop already accounts for, nothing
+  // ever bounded dwc2_hub_get_port_status's OWN real duration here.
+  let bringup_start_us: u32 = mmio_read_u32(TIMER_CLO);
   while (poll_iter < 20) && (reset_seen == 0) {
     // TASK #353 REAL-HW FOLLOW-UP #8: see dwc2_wait_chan0_done's own
     // comment -- this loop's own up-to-20x delay(161000) (~1s worst
@@ -27846,6 +28295,18 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
     let status_result: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
     if status_result != 0 {
       let _ = uart_puts("USB: hub GET_PORT_STATUS failed\n");
+      return 0 - 1;
+    }
+    // Checked right after the one genuinely slow thing in this loop,
+    // same placement/reasoning as usb_hotplug_sample_port_connected's
+    // own budget check. 2 seconds, not 100ms -- this loop is legitimately
+    // waiting for a REAL hardware reset to complete on a device that
+    // might just be slow-but-working, not polling a hub that's already
+    // known-flaky; generous enough not to break a genuinely slow real
+    // device, while still bounding the worst case far below the ~20x
+    // multiplier's own real-HW-measured potential (tens of seconds).
+    if (mmio_read_u32(TIMER_CLO) - bringup_start_us) > (2000000 as u32) {
+      let _ = uart_puts("USB: hub port bring-up exceeded its wall-clock budget\n");
       return 0 - 1;
     }
     let change_lo: u32 = buf_read_byte(status_buf, 2 as u32);
@@ -28225,7 +28686,29 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
 // from its own dedicated 25ms-step loop; this inner loop only guards
 // against catching a port truly mid-transition within a single pass,
 // not against the outer cadence being too fast.
-fn usb_hotplug_sample_port_connected(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
+// 2026-10-23 (wall-clock budget, root-caused via live gc_log timing
+// after the earlier failure-counting backoff -- usb_hub_fail_streak/
+// backoff_remaining -- turned out to have ZERO effect on this exact
+// symptom): the 20+ SECOND task_e hold this whole investigation has
+// been chasing is NOT this loop hitting `sr != 0` (an outright hub
+// communication failure) at all -- live evidence (three consecutive
+// stream attempts, all stalling at the identical byte offset, all
+// correlating with an identical ~20.1s GC/DHCP WCET print) is far too
+// deterministic for "retries until it eventually gives up," and the
+// backoff fix (which only engages on that sr!=0 path) never reduced
+// the duration or frequency at all across those three attempts. The
+// real shape: dwc2_hub_get_port_status answers sr==0 (success) every
+// time, just very slowly -- this loop's own "3 tries for stability"
+// design, built for a FAST hub where that costs nothing, pays that
+// cost 3 times per port on a slow one, and (since a clean sr==0
+// result never sets the caller's own any_failure flag) never gets
+// backed off. A wall-clock budget bounds this regardless of whether
+// any individual call technically "failed" -- the only question that
+// actually matters to kernelupload is "how long did this take," not
+// "did it return an error code."
+const USB_HOTPLUG_SAMPLE_BUDGET_US: u32 = 100000;
+
+fn usb_hotplug_sample_port_connected(hub_addr: u32, hub_mps: u32, port: u32, start_us: u32) -> i64 {
   let status_buf: mut ref i64 = dhruva_alloc_bytes(4);
   let last: i64 = 0 - 1; // sentinel: "no sample taken yet"
   let stable_count: i64 = 0;
@@ -28234,6 +28717,15 @@ fn usb_hotplug_sample_port_connected(hub_addr: u32, hub_mps: u32, port: u32) -> 
     let sr: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
     if sr != 0 {
       return 0 - 1; // hub communication failure -- caller treats as inconclusive
+    }
+    // Checked right after the one genuinely slow thing in this loop
+    // (the control transfer above), not before -- see this function's
+    // own header for the full "why" this exists at all. Treated
+    // exactly like a communication failure: the caller's own
+    // any_failure/backoff bookkeeping doesn't need to know WHY this
+    // sample didn't complete cleanly, only that it didn't.
+    if (mmio_read_u32(TIMER_CLO) - start_us) > USB_HOTPLUG_SAMPLE_BUDGET_US {
+      return 0 - 1;
     }
     let status_lo: u32 = buf_read_byte(status_buf, 0 as u32);
     let cur: i64 = (status_lo & (1 as u32)) as i64; // wPortStatus bit0, PORT_CONNECTION
@@ -28308,60 +28800,148 @@ fn usb_hotplug_clear_device_at_addr(addr: u32) -> i64 {
 // is the only caller, and nothing else can run between this pass's own
 // disconnect-cleanup and reconnect-handling for the same port within
 // the same call.
+// 2026-10-23 (exponential backoff, see usb_hub_backoff_remaining's
+// own header comment in boot/usb_hub_state.S for the full "why" and
+// the real regression a first, permanently-tripping version of this
+// fix had -- user-flagged: "will 1st fail never enumerate wifi or
+// ble... for usb hotplug poll"). Shift amount for passes-to-skip
+// after N consecutive failures, capped here rather than left to grow
+// unboundedly: 2^6=64 passes (~640s/~10.7min at task_e's 10s period)
+// is a long enough quiet period that a persistently dead hub stops
+// costing anything MEANINGFUL relative to its own 10s period, while
+// still guaranteeing hotplug detection recovers within about 11
+// minutes worst case even if the hub never improves -- not disabled
+// forever, just genuinely rare instead of every single wake.
+const USB_HUB_BACKOFF_SHIFT_CAP: u32 = 6;
+
 fn usb_hotplug_poll() -> i64 {
   if usb_hub_get_ready() == (0 as u32) {
     return 0; // no hub was ever found+configured at boot -- nothing to poll
   }
+  // Exponential backoff: skip this pass entirely (cheap -- no hub
+  // transaction at all) while a prior failure's own cooldown is still
+  // counting down. Decremented once per skipped pass regardless of
+  // what this pass would have found, so the schedule is honest wall-
+  // clock time (task_e's own 10s period), not retried eagerly the
+  // instant something ELSE happens to wake task_e.
+  let backoff_left: u32 = usb_hub_get_backoff_remaining();
+  if backoff_left > (0 as u32) {
+    let _ = usb_hub_set_backoff_remaining(backoff_left - (1 as u32));
+    return 0;
+  }
   let hub_addr: u32 = dwc2_hub_addr();
   let hub_mps: u32 = usb_hub_get_mps();
 
-  let cur1: i64 = usb_hotplug_sample_port_connected(hub_addr, hub_mps, dwc2_hub_port1());
+  // 2026-10-23 (real-HW kernelupload-stream stall investigation,
+  // user request: cross-check against Linux/Zephyr): this function's
+  // own slow path -- a genuine new-connection's dwc2_hub_bring_up_
+  // port + dwc2_enumerate_one_downstream_device -- was explicitly
+  // flagged (Round 59's own header comment above) as NOT folded into
+  // this critical section's formal WCET measurement, unlike dhcp_
+  // client_poll's own measured 325620us worst case. Zephyr's own
+  // mutex docs are explicit on this exact shape of hazard: "it is
+  // considered good practice to hold the lock for as short a time as
+  // possible" -- a full USB bring-up/enumeration sequence is exactly
+  // the kind of data/hardware-dependent, not-actually-bounded work
+  // that principle warns against doing while holding a ceiling a
+  // time-critical peer (task_f's kernelupload writes) also needs.
+  // Deferring it here (same maintenance_mode_is_active() precedence
+  // check already engaged by kernelupload/wifikey, not a new
+  // mechanism) rather than bounding the enumeration sequence itself
+  // -- a transition genuinely missed this pass is simply caught on
+  // the NEXT poll once the transfer finishes (ports don't un-connect
+  // themselves in the meantime), same "deferred, never lost" property
+  // task_e's own header comment already establishes for the DharaFS/
+  // DHCP work below. Deliberately only guards the CONNECT path (the
+  // slow one) -- usb_hotplug_clear_device_at_addr (disconnect
+  // cleanup) is cheap, software-only state teardown, not a real
+  // transfer, so it still runs every pass regardless.
+  let defer_bringup: u32 = maintenance_mode_is_active();
+  // 2026-10-23 (circuit breaker, continued): tracks whether THIS pass
+  // saw any port sample fail/go unstable -- feeds usb_hub_fail_streak
+  // at the end (incremented on any failure, reset to 0 on a clean
+  // pass), and ALSO used to skip ports 2/3 within THIS SAME pass the
+  // moment port 1 shows trouble -- no reason to pay for 3 slow,
+  // likely-doomed hub transactions when the first one already
+  // answered the question "is this hub responding right now".
+  let any_failure: i64 = 0;
+
+  let cur1: i64 = usb_hotplug_sample_port_connected(hub_addr, hub_mps, dwc2_hub_port1(), mmio_read_u32(TIMER_CLO));
   if cur1 >= 0 {
     let was1: u32 = usb_hub_get_port1_connected();
     if (cur1 as u32) != was1 {
       if cur1 == 1 {
-        let br1: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port1());
-        if br1 == 0 {
-          let _ = dwc2_enumerate_one_downstream_device(dwc2_downstream_addr());
+        if defer_bringup == (0 as u32) {
+          let br1: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port1());
+          if br1 == 0 {
+            let _ = dwc2_enumerate_one_downstream_device(dwc2_downstream_addr());
+          }
+          let _ = usb_hub_set_port1_connected(cur1 as u32);
         }
       } else {
         let _ = usb_hotplug_clear_device_at_addr(dwc2_downstream_addr());
+        let _ = usb_hub_set_port1_connected(cur1 as u32);
       }
-      let _ = usb_hub_set_port1_connected(cur1 as u32);
     }
+  } else {
+    any_failure = 1;
   }
 
-  let cur2: i64 = usb_hotplug_sample_port_connected(hub_addr, hub_mps, dwc2_hub_port2());
+  if any_failure == 0 {
+  let cur2: i64 = usb_hotplug_sample_port_connected(hub_addr, hub_mps, dwc2_hub_port2(), mmio_read_u32(TIMER_CLO));
   if cur2 >= 0 {
     let was2: u32 = usb_hub_get_port2_connected();
     if (cur2 as u32) != was2 {
       if cur2 == 1 {
-        let br2: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port2());
-        if br2 == 0 {
-          let _ = dwc2_enumerate_one_downstream_device(dwc2_downstream_addr2());
+        if defer_bringup == (0 as u32) {
+          let br2: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port2());
+          if br2 == 0 {
+            let _ = dwc2_enumerate_one_downstream_device(dwc2_downstream_addr2());
+          }
+          let _ = usb_hub_set_port2_connected(cur2 as u32);
         }
       } else {
         let _ = usb_hotplug_clear_device_at_addr(dwc2_downstream_addr2());
+        let _ = usb_hub_set_port2_connected(cur2 as u32);
       }
-      let _ = usb_hub_set_port2_connected(cur2 as u32);
     }
+  } else {
+    any_failure = 1;
+  }
   }
 
   // Round 61: third real port, same pattern as ports 1/2 above.
-  let cur3: i64 = usb_hotplug_sample_port_connected(hub_addr, hub_mps, dwc2_hub_port3());
+  if any_failure == 0 {
+  let cur3: i64 = usb_hotplug_sample_port_connected(hub_addr, hub_mps, dwc2_hub_port3(), mmio_read_u32(TIMER_CLO));
   if cur3 >= 0 {
     let was3: u32 = usb_hub_get_port3_connected();
     if (cur3 as u32) != was3 {
       if cur3 == 1 {
-        let br3: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port3());
-        if br3 == 0 {
-          let _ = dwc2_enumerate_one_downstream_device(dwc2_downstream_addr3());
+        if defer_bringup == (0 as u32) {
+          let br3: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port3());
+          if br3 == 0 {
+            let _ = dwc2_enumerate_one_downstream_device(dwc2_downstream_addr3());
+          }
+          let _ = usb_hub_set_port3_connected(cur3 as u32);
         }
       } else {
         let _ = usb_hotplug_clear_device_at_addr(dwc2_downstream_addr3());
+        let _ = usb_hub_set_port3_connected(cur3 as u32);
       }
-      let _ = usb_hub_set_port3_connected(cur3 as u32);
     }
+  } else {
+    any_failure = 1;
+  }
+  }
+
+  if any_failure == 1 {
+    let new_streak: u32 = usb_hub_get_fail_streak() + (1 as u32);
+    let _ = usb_hub_set_fail_streak(new_streak);
+    let shift_amount: u32 = if new_streak > USB_HUB_BACKOFF_SHIFT_CAP { USB_HUB_BACKOFF_SHIFT_CAP } else { new_streak };
+    let _ = usb_hub_set_backoff_remaining((1 as u32) << shift_amount);
+  } else {
+    let _ = usb_hub_set_fail_streak(0 as u32);
+    let _ = usb_hub_set_backoff_remaining(0 as u32);
   }
   return 0;
 }
@@ -29386,6 +29966,38 @@ fn task_e() -> i64 {
   let _ = netif_get_mac(dhcp_my_mac);
   while true {
     let _ = task_sleep_ticks(20);
+    // 2026-10-23 (real-HW kernelupload-stream stall ROOT CAUSE, user
+    // request: "scheduler should be smart enough to know precedence
+    // processes... maintenance mode during OTA or UART update"):
+    // task_e's own two ceiling=2 critical sections below (DharaFS
+    // compact, then DHCP/USB-hotplug poll) are the CONFIRMED root
+    // cause of the real-HW `kernelupload stream` stalls -- live-
+    // captured via the FIQ-level stall detector just above: a stall
+    // snapshot taken mid-hang showed current_task=4 (task_e)
+    // genuinely HOLDING ceiling_depth=1/eff_prio=2, the exact same
+    // ceiling kernelupload's own per-block writes (task_f) need for
+    // DharaFS mutual exclusion. dhcp_client_poll alone is measured up
+    // to 325620us (~325ms) worst case with no DHCP server responding
+    // (exactly this test environment's own live condition, confirmed
+    // via the repeated "DHCP: client_start status=FFFFFFFF" in the
+    // boot log), and dharafs_compact's own data-dependent log walk has
+    // no upper bound at all -- task_e grabs this lock every 20 ticks,
+    // for the ENTIRE multi-minute duration of a real kernel upload,
+    // directly starving task_f of the one resource it needs to make
+    // progress. Neither DharaFS GC nor DHCP/USB-hotplug maintenance is
+    // time-critical enough to justify blocking an active firmware
+    // update -- skipping this task's entire per-wake body while a
+    // stream is in progress hands kernelupload exclusive, uncontended
+    // use of ceiling=2 for its duration (a real maintenance-mode
+    // precedence policy, not a timing workaround: it removes the
+    // actual resource contention rather than racing around it). Both
+    // skipped passes are simply caught up on the next wake 20 ticks
+    // later -- GC/DHCP have no deadline, so a deferred pass is never
+    // lost, only delayed. Checks the generalized, protocol-agnostic
+    // flag (2026-10-23 follow-up: now also engaged by wifikey, and
+    // any future bulk-transfer protocol) -- see maintenance_mode_is_
+    // active's own header comment.
+    if maintenance_mode_is_active() == (0 as u32) {
     // Round 76: docs/RTOS_GAP_ANALYSIS.md's own "No concurrency lock
     // protecting DharaFS's own shared state" gap -- task_e (this
     // task) and task_f (the shell) both call into DharaFS with
@@ -29478,16 +30090,36 @@ fn task_e() -> i64 {
     // Flagged here rather than silently expanding an already safety-
     // audited critical section's WCET without comment; a full re-
     // measurement is real follow-up work, not done this round.
+    // 2026-10-23 (real-HW kernelupload-stream stall investigation):
+    // re-check maintenance mode HERE, between this task's own two
+    // separate critical sections, not just once before the first one
+    // above -- a stream that engages WHILE the DharaFS section was
+    // already running (the one race the original start-of-wake-only
+    // check can't close) would otherwise still go on to run this
+    // SECOND section too, compounding the blocking window instead of
+    // limiting it to whichever section was already in progress when
+    // the race happened. Same "deferred, never lost" property as
+    // every other maintenance_mode skip -- a missed DHCP/hotplug poll
+    // is simply caught on task_e's next wake.
+    if maintenance_mode_is_active() == (0 as u32) {
     let gc_dhcp_t0: u32 = mmio_read_u32(TIMER_CLO);
-    let _ = dhruva_prio_lock(2);
+    // 2026-10-23: DWC2_MUTEX_ID, not the DharaFS ceiling -- see that
+    // constant's own header comment for the full "why" (this exact
+    // section's own live-measured 20+ second hold was the direct
+    // motivation). Not nested inside any other lock/mutex here --
+    // task_e's own DharaFS section above already released ceiling=2
+    // before this point, a separate, sequential, non-nested pair.
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let _ = usb_hotplug_poll();
     let _ = dhcp_client_poll(dhcp_my_mac);
-    let _ = dhruva_prio_unlock(3);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     let gc_dhcp_t1: u32 = mmio_read_u32(TIMER_CLO);
     if gc_log == 1 {
       let _ = uart_puts("GC: DHCP poll critical section WCET DIAG: real duration=");
       let _ = uart_put_i64((gc_dhcp_t1 - gc_dhcp_t0) as i64);
       let _ = uart_puts("us\n");
+    }
+    }
     }
   }
   return 0;
@@ -30980,6 +31612,7 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
 
   if shell_word_matches(line_buf, sub_start, sub_end, "abort") == 1 {
     let _ = usb_wifi_fw_upload_len_set(0 as u32);
+    let _ = maintenance_mode_disengage();
     let _ = uart_puts("ok\n");
     return 0;
   }
@@ -30990,6 +31623,14 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
       let _ = uart_puts("wifikey: nothing to commit (no chunks uploaded yet)\n");
       return 0;
     }
+    // 2026-10-23: disengage maintenance mode around the SAME lock
+    // dharafs_write_raw_checked below takes for its own ceiling=2
+    // DharaFS write, not before it -- see this flag's own header
+    // comment (boot/kernelupload_state.S) for the full design.
+    // Leaving it engaged through the actual commit write costs
+    // nothing (one bounded write, not a long hold) and closes a real
+    // gap: clearing it too early would let task_e/task_fsq resume
+    // and potentially contend for ceiling=2 against this exact call.
     let fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
     let path_str: Str = "/wifi/fw.bin";
     // path_str's own bytes need to reach dharafs_path_scratch_get()
@@ -31005,6 +31646,7 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
     }
     let real_status: i64 = dharafs_write_raw_checked(path_buf, path_len, fw_buf, total_len, dharafs_user_get_uid(), dharafs_user_get_gid());
     let _ = usb_wifi_fw_upload_len_set(0 as u32);
+    let _ = maintenance_mode_disengage();
     if real_status == 0 {
       let _ = uart_puts("ok, ");
       let _ = uart_put_i64(total_len);
@@ -31050,6 +31692,12 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
     }
     let _ = ssh_copy(fw_buf2, current_len, usb_wifi_fw_chunk_get(), 0, byte_len);
     let _ = usb_wifi_fw_upload_len_set((current_len + byte_len) as u32);
+    // 2026-10-23: engage (and re-touch) maintenance mode on every
+    // chunk -- see this flag's own header comment (boot/kernelupload_
+    // state.S). Idempotent and cheap (two word stores); the per-flag
+    // staleness check elsewhere auto-clears it if this transfer is
+    // ever abandoned mid-way without reaching commit/abort.
+    let _ = maintenance_mode_engage();
     let _ = uart_puts("ok, ");
     let _ = uart_put_i64(current_len + byte_len);
     let _ = uart_puts(" bytes accumulated\n");
@@ -31307,6 +31955,238 @@ fn kernel_slot_mark_boot_good() -> i64 {
   return kernelslot_write_record(ref new_rec, stale);
 }
 
+// 2026-10-23 (resumable chunked upload, user request: "keep track
+// successful chunk transfer to know where to resume if stalled at
+// prior attempt... divide 3MB kernel file into 10 chunks... needs
+// attempt limit as well as timeout or board boots last known good
+// slot"). Same ping-pong-block/generation-tie-break convention as
+// KernelSlotRecord just above, deliberately a SEPARATE block pair
+// (9218/9219, immediately after the slot-state record's own 9216/
+// 9217) rather than sharing a block with it -- this record is purely
+// advisory (a crash losing it just means the next attempt restarts
+// from chunk 0, never anything stage0 depends on to boot), so it gets
+// its own blast radius, never risking a read-modify-write mistake
+// touching the boot-critical slot-state fields.
+//
+// Safety property this whole mechanism leans on, verified by
+// construction: nothing below ever writes active_slot/preferred_slot
+// (KernelSlotRecord's own fields) or ready flags except the EXISTING,
+// unchanged `kernelupload commit` path, which only runs once ALL
+// chunks are confirmed. A chunked upload that stalls, fails
+// repeatedly, or is abandoned therefore leaves the CURRENTLY ACTIVE
+// slot completely untouched -- the board keeps booting it exactly as
+// if no upload had ever been attempted, with no separate "fallback"
+// logic needed here at all.
+fn kernelupload_chunk_state_block_a() -> i64 { return 9218; }
+fn kernelupload_chunk_state_block_b() -> i64 { return 9219; }
+// 2026-10-23: how many times `kernelupload chunkbegin` may RESUME an
+// already-in-progress upload (one increment per watchdog-reboot-
+// triggered restart, NOT per individual chunk retry -- see
+// shell_dispatch_kernelupload_chunkbegin's own comment) before this
+// mechanism refuses to continue at all, forcing an explicit
+// `kernelupload chunkabort` before anything further is accepted. Low
+// enough to genuinely bound a bootloop (5 resumes x whatever a single
+// attempt's own real-world duration is, stays a bounded, human-
+// noticeable amount of time, never indefinite), high enough that a
+// single unlucky stall (the exact real-HW class this whole session
+// chased) doesn't burn the whole budget on its own.
+const KERNELUPLOAD_CHUNK_ATTEMPT_LIMIT: i64 = 5;
+
+struct KernelUploadChunkProgress {
+  valid: i64,
+  chosen_block: i64,
+  generation: u32,
+  target_slot: u32,
+  total_len: u32,
+  chunk_size: u32,
+  chunk_count: u32,
+  chunks_confirmed: u32,
+  attempt_count: u32,
+  final_sha256: [u8; 32],
+}
+
+fn kernelupload_chunk_progress_crc_valid(raw: mut ref i64) -> i64 {
+  let magic: u32 = buf_read_u32_le(raw, 0);
+  if magic != (0x4B554350 as u32) {
+    return 0;
+  }
+  let crc_stored: u32 = buf_read_u32_le(raw, 64);
+  let crc_actual: u32 = kernelslot_crc32(raw, 64);
+  if crc_actual != crc_stored {
+    return 0;
+  }
+  return 1;
+}
+
+fn kernelupload_chunk_progress_parse(raw: mut ref i64, chosen_block: i64) -> KernelUploadChunkProgress {
+  let sha: [u8; 32] = [0 as u8; 32];
+  let i: i64 = 0;
+  while i < 32 {
+    sha[i] = buf_read_byte(raw, (32 + i) as u32) as u8;
+    i = i + 1;
+  }
+  return KernelUploadChunkProgress {
+    valid: 1,
+    chosen_block: chosen_block,
+    generation: buf_read_u32_le(raw, 4),
+    target_slot: buf_read_u32_le(raw, 8),
+    total_len: buf_read_u32_le(raw, 12),
+    chunk_size: buf_read_u32_le(raw, 16),
+    chunk_count: buf_read_u32_le(raw, 20),
+    chunks_confirmed: buf_read_u32_le(raw, 24),
+    attempt_count: buf_read_u32_le(raw, 28),
+    final_sha256: sha,
+  };
+}
+
+fn kernelupload_chunk_progress_build(rec: ref KernelUploadChunkProgress, out: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 512 {
+    let _ = buf_write_byte(out, i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let _ = buf_write_u32_le(out, 0, 0x4B554350 as u32);
+  let _ = buf_write_u32_le(out, 4, rec.generation);
+  let _ = buf_write_u32_le(out, 8, rec.target_slot);
+  let _ = buf_write_u32_le(out, 12, rec.total_len);
+  let _ = buf_write_u32_le(out, 16, rec.chunk_size);
+  let _ = buf_write_u32_le(out, 20, rec.chunk_count);
+  let _ = buf_write_u32_le(out, 24, rec.chunks_confirmed);
+  let _ = buf_write_u32_le(out, 28, rec.attempt_count);
+  let j: i64 = 0;
+  while j < 32 {
+    let _ = buf_write_byte(out, (32 + j) as u32, rec.final_sha256[j] as u32);
+    j = j + 1;
+  }
+  let crc: u32 = kernelslot_crc32(out, 64);
+  let _ = buf_write_u32_le(out, 64, crc);
+  return 0;
+}
+
+// rec.valid==0 if neither ping-pong copy is CRC-valid, OR if the
+// higher-generation valid copy has chunk_count==0 -- the deliberate
+// "cleared, nothing in progress" sentinel (see kernelupload_chunk_
+// progress_clear's own comment below for why a real invalidation,
+// corrupting the magic/CRC, is NOT how that's represented here).
+fn kernelupload_chunk_progress_lookup() -> KernelUploadChunkProgress {
+  let buf: mut ref i64 = kernelupload_chunk_record_buf_get();
+
+  let status_a: i64 = sdhost_read_block(kernelupload_chunk_state_block_a(), buf);
+  let valid_a: i64 = if status_a == 0 { kernelupload_chunk_progress_crc_valid(buf) } else { 0 };
+  let rec_a: KernelUploadChunkProgress = kernelupload_chunk_progress_parse(buf, kernelupload_chunk_state_block_a());
+
+  let status_b: i64 = sdhost_read_block(kernelupload_chunk_state_block_b(), buf);
+  let valid_b: i64 = if status_b == 0 { kernelupload_chunk_progress_crc_valid(buf) } else { 0 };
+  let rec_b: KernelUploadChunkProgress = kernelupload_chunk_progress_parse(buf, kernelupload_chunk_state_block_b());
+
+  let chosen: KernelUploadChunkProgress = if (valid_a == 1) && (valid_b == 1) {
+    if rec_a.generation >= rec_b.generation { rec_a } else { rec_b }
+  } else {
+    if valid_a == 1 { rec_a } else { if valid_b == 1 { rec_b } else { rec_a } }
+  };
+  if (valid_a == 0) && (valid_b == 0) {
+    let invalid: KernelUploadChunkProgress = chosen;
+    invalid.valid = 0;
+    return invalid;
+  }
+  if chosen.chunk_count == (0 as u32) {
+    let cleared: KernelUploadChunkProgress = chosen;
+    cleared.valid = 0;
+    return cleared;
+  }
+  return chosen;
+}
+
+fn kernelupload_chunk_progress_stale_block(rec: ref KernelUploadChunkProgress) -> i64 {
+  if rec.chosen_block == kernelupload_chunk_state_block_a() {
+    return kernelupload_chunk_state_block_b();
+  }
+  return kernelupload_chunk_state_block_a();
+}
+
+fn kernelupload_chunk_progress_write(rec: ref KernelUploadChunkProgress, block_num: i64) -> i64 {
+  let buf: mut ref i64 = kernelupload_chunk_record_buf_get();
+  let _ = kernelupload_chunk_progress_build(rec, buf);
+  return sdhost_write_block(block_num, buf);
+}
+
+// Called once a chunked upload's own `kernelupload commit` succeeds
+// (the whole image is verified and the slot is marked ready -- see
+// that command's own call to this function), or by `kernelupload
+// chunkabort`. Writes chunk_count=0 to whichever block is currently
+// STALE relative to the last real lookup, which is what makes the
+// NEXT lookup's own generation tie-break pick THIS cleared copy --
+// deliberately not a magic/CRC corruption (an actually-invalid block
+// would just make lookup silently fall back to the OTHER, still-
+// "in progress" copy instead of reporting "nothing in progress").
+fn kernelupload_chunk_progress_clear() -> i64 {
+  let lookup: KernelUploadChunkProgress = kernelupload_chunk_progress_lookup();
+  let prior_gen: u32 = lookup.generation;
+  let stale: i64 = if lookup.chosen_block == kernelupload_chunk_state_block_a() { kernelupload_chunk_state_block_b() } else { kernelupload_chunk_state_block_a() };
+  let empty: [u8; 32] = [0 as u8; 32];
+  let cleared: KernelUploadChunkProgress = KernelUploadChunkProgress {
+    valid: 0, chosen_block: stale,
+    generation: prior_gen + (1 as u32),
+    target_slot: 0 as u32, total_len: 0 as u32, chunk_size: 0 as u32,
+    chunk_count: 0 as u32, chunks_confirmed: 0 as u32, attempt_count: 0 as u32,
+    final_sha256: empty,
+  };
+  return kernelupload_chunk_progress_write(ref cleared, stale);
+}
+
+// Shared by `kernelupload chunkverify` (one chunk's own range) -- NOT
+// used by the existing, unchanged `kernelupload commit` (which keeps
+// its own inline readback loop exactly as it was before this round;
+// duplicated here deliberately rather than refactored, so a mistake
+// in this NEW code path can never affect the already-proven commit
+// path). Fresh sha256_init() each call -- no dependency on any
+// incremental ctx, so this is correct even immediately after a reboot
+// mid-upload, which is the entire point of this mechanism.
+fn kernelupload_chunk_verify_range(base_block: i64, range_len: i64, want_sha256: mut ref i64) -> i64 {
+  let block_buf: mut ref i64 = kernelupload_block_buf_get();
+  let ctx: Sha256Ctx = sha256_init();
+  let nblocks: i64 = (range_len + 511) / 512;
+  let partial_bytes: i64 = range_len % 512;
+  let rb: i64 = 0;
+  while rb < nblocks {
+    let rstatus: i64 = sdhost_read_block(base_block + rb, block_buf);
+    if rstatus != 0 {
+      return 0 - 1;
+    }
+    let is_last: i64 = if (rb + 1) == nblocks { 1 } else { 0 };
+    let valid_in_block: i64 = if is_last == 1 { (if partial_bytes == 0 { 512 } else { partial_bytes }) } else { 512 };
+    let chunk1: [u8; 256] = zero256_bytes();
+    let chunk2: [u8; 256] = zero256_bytes();
+    let ci: i64 = 0;
+    while ci < 256 {
+      chunk1[ci] = buf_read_byte(block_buf, ci as u32) as u8;
+      ci = ci + 1;
+    }
+    let first_n: i64 = if valid_in_block < 256 { valid_in_block } else { 256 };
+    ctx = sha256_update(ref ctx, mut ref chunk1, first_n);
+    if valid_in_block > 256 {
+      let cj: i64 = 0;
+      while cj < 256 {
+        chunk2[cj] = buf_read_byte(block_buf, (256 + cj) as u32) as u8;
+        cj = cj + 1;
+      }
+      ctx = sha256_update(ref ctx, mut ref chunk2, valid_in_block - 256);
+    }
+    rb = rb + 1;
+  }
+  let digest: [u8; 32] = sha256_finalize(ref ctx);
+  let cmp_buf: mut ref i64 = dharafs_sd_scratch_get();
+  let di: i64 = 0;
+  while di < 32 {
+    let _ = buf_write_byte(cmp_buf, di as u32, digest[di] as u32);
+    di = di + 1;
+  }
+  if sha256_bytes_equal(cmp_buf, want_sha256, 32) != 1 {
+    return 1;
+  }
+  return 0;
+}
+
 // Persistent incremental SHA-256 context for `kernelupload chunk` --
 // serialized into kernelupload_sha_ctx's 112-byte scratch between
 // separate shell-command invocations (vani-crypto-hash's own Sha256Ctx
@@ -31368,7 +32248,15 @@ fn kernelupload_ctx_store(ctx: ref Sha256Ctx) -> i64 {
 fn kernelupload_accumulate_bytes(src_buf: mut ref i64, count: i64) -> i64 {
   let total_len: i64 = kernelupload_total_len_get() as i64;
   let target_slot: u32 = kernelupload_target_slot_get();
-  let base_block: i64 = if target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() };
+  // 2026-10-23 (resumable chunked upload): chunk_base_block_offset is
+  // 0 for the legacy, non-chunked `kernelupload stream` command (see
+  // that handler's own reset of this field) -- this addition is a
+  // no-op there, exactly as before this round. Nonzero only while
+  // `kernelupload resumechunk` has a specific chunk (index > 0)
+  // actively streaming, shifting every block this call writes into
+  // that chunk's own slice of the target slot instead of always
+  // starting at the slot's own base block.
+  let base_block: i64 = (if target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() }) + (kernelupload_chunk_base_block_offset_get() as i64);
   let block_buf: mut ref i64 = kernelupload_block_buf_get();
   let ctx: Sha256Ctx = kernelupload_ctx_load();
 
@@ -31380,7 +32268,27 @@ fn kernelupload_accumulate_bytes(src_buf: mut ref i64, count: i64) -> i64 {
     bi = bi + 1;
     if (total_len % 512) == 0 {
       let block_index: i64 = (total_len / 512) - 1;
+      // 2026-10-23 follow-up (user question: "is ISR or task
+      // preempting transfer" -- re-testing the SD-write-masks-IRQ+
+      // FIQ-too-long theory with LIVE evidence rather than relying on
+      // an earlier disproof that ran BEFORE the ring-reset bug was
+      // fixed, and so may itself be invalid): bracket this call with
+      // TIMER_CLO and track the worst (max) observed duration during
+      // this stream -- see kernelupload_sd_write_worst_us's own
+      // header comment (boot/kernelupload_state.S). sdhost_write_
+      // block's own masked critical section is documented at ~50ms
+      // worst case on healthy hardware; if the REAL SD card is
+      // intermittently much slower (e.g. internal wear-leveling/GC
+      // under sustained write load), that masked window directly
+      // blocks the UART ISR from running at all for its real
+      // duration -- exactly the symptom under investigation.
+      let sdw_t0: u32 = mmio_read_u32(TIMER_CLO);
       let wstatus: i64 = sdhost_write_block(base_block + block_index, block_buf);
+      let sdw_t1: u32 = mmio_read_u32(TIMER_CLO);
+      let sdw_us: u32 = sdw_t1 - sdw_t0;
+      if sdw_us > kernelupload_sd_write_worst_us_get() {
+        let _ = kernelupload_sd_write_worst_us_set(sdw_us);
+      }
       if wstatus != 0 {
         let _ = kernelupload_total_len_set(total_len as u32);
         return -1;
@@ -31403,6 +32311,24 @@ fn kernelupload_accumulate_bytes(src_buf: mut ref i64, count: i64) -> i64 {
 }
 
 const KERNELUPLOAD_RX_RING_MASK: i64 = 4095;
+
+// 2026-10-23 (aged-SD-card stall investigation, true ACK-driven flow
+// control): was 65536, a pure progress heartbeat the host never
+// waited on. Reduced to 512 (one SD block -- matches sdhost_write_
+// block's own per-call boundary in kernelupload_accumulate_bytes) so
+// test/kernel_upload.py's send_raw_ack_paced can treat this ACK as a
+// real flow-control signal: it blocks the NEXT window's send on
+// seeing this board confirm the PREVIOUS window (<=512 bytes) was
+// fully absorbed -- ring-popped, SD-written (including any wedge
+// retries), hashed -- before any more bytes leave the host. That
+// guarantees zero bytes are ever in flight while sdhost_write_block's
+// own masked (IRQ+FIQ disabled) critical section is running, however
+// long it actually takes on a given card -- see
+// kernelupload_sd_write_worst_us's own header (boot/
+// kernelupload_state.S) for the real-HW measurement (139ms on a
+// 13-year-old card) that motivated this over the old fixed-delay host
+// pacing it replaces.
+const KERNELUPLOAD_ACK_INTERVAL_BYTES: u32 = 512;
 
 // TASK #355 round 2: push ONE byte -- called ONLY from irq_dispatch
 // (the ring's sole producer, always interrupt context). O(1), no
@@ -31508,6 +32434,52 @@ fn kernelupload_stream_report_done(total_len: u32) -> i64 {
   return 0;
 }
 
+// 2026-10-23 (generalizing the real-HW kernelupload-stream stall fix,
+// user request: "I need detailed diagnostics... flag in operational
+// mode... refer to Zephyr or Linux"): a protocol-agnostic precedence
+// flag ANY bulk transfer (kernelupload, wifikey, and any future USB/
+// WiFi firmware-update path) can raise -- see its own header comment
+// in boot/kernelupload_state.S for the full design rationale and the
+// Zephyr/Linux precedent this follows. Three tiny helpers so every
+// call site (kernelupload's stream start/progress/end, wifikey's
+// chunk/commit/abort) shares the exact same engage/touch/check logic
+// rather than five places each hand-rolling their own tick math.
+const MAINTENANCE_MODE_STALE_TICKS: i64 = 60; // 30s @ 500ms/tick -- a
+// deliberately generous, protocol-agnostic bound (kernelupload's own
+// specific 10s-inactivity auto-abort is tighter and separate, tuned
+// for its own tight busy-poll loop; this one has to stay safe for a
+// slow, human-paced wifikey upload between chunks too).
+
+fn maintenance_mode_engage() -> i64 {
+  let _ = maintenance_mode_active_set(1 as u32);
+  let _ = maintenance_mode_last_touch_tick_set(scheduler_get_tick_count());
+  return 0;
+}
+
+fn maintenance_mode_disengage() -> i64 {
+  let _ = maintenance_mode_active_set(0 as u32);
+  return 0;
+}
+
+// Call from any background task deciding whether to defer itself.
+// Returns 1 if a foreground transfer is genuinely active; auto-clears
+// and returns 0 if the flag is stale (an abandoned transfer that never
+// reached its own commit/abort/DONE path) rather than wedging
+// background maintenance off forever -- see this flag's own header
+// comment for the full "why".
+fn maintenance_mode_is_active() -> u32 {
+  if maintenance_mode_active_get() == (0 as u32) {
+    return 0 as u32;
+  }
+  let last_touch: u32 = maintenance_mode_last_touch_tick_get();
+  let now_tick: u32 = scheduler_get_tick_count();
+  if (now_tick - last_touch) > (MAINTENANCE_MODE_STALE_TICKS as u32) {
+    let _ = maintenance_mode_active_set(0 as u32);
+    return 0 as u32;
+  }
+  return 1 as u32;
+}
+
 // `kernelupload chunk <hex>` / `kernelupload commit <len> <sha256>` /
 // `kernelupload abort` -- same 48-byte/96-hex-char per-line cap as
 // `wifikey chunk` (shared 128-byte shell line buffer, see
@@ -31522,7 +32494,7 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     return 0;
   }
   if cmd_end >= line_len {
-    let _ = uart_puts("usage: kernelupload chunk <hex> | kernelupload stream <len> | kernelupload commit <len> <sha256> | kernelupload abort\n");
+    let _ = uart_puts("usage: kernelupload stream <len> | kernelupload commit <len> <sha256> | kernelupload resumebegin <len> <chunk_count> <sha256> | kernelupload resumechunk <idx> <len> | kernelupload resumeverify <idx> <sha256> | kernelupload resumestatus | kernelupload resumeabort | kernelupload abort\n");
     return 0;
   }
   let sub_start: i64 = cmd_end + 1;
@@ -31540,6 +32512,7 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     let _ = kernelupload_stream_active_set(0 as u32);
     let _ = kernelupload_active_set(0 as u32);
     let _ = kernelupload_total_len_set(0 as u32);
+    let _ = maintenance_mode_disengage();
     let _ = uart_puts("ok\n");
     return 0;
   }
@@ -31622,6 +32595,12 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     let target: u32 = if lookup.active_slot == (0 as u8) { 1 as u32 } else { 0 as u32 };
     let _ = kernelupload_target_slot_set(target);
     let _ = kernelupload_total_len_set(0 as u32);
+    // 2026-10-23 (resumable chunked upload): this plain, non-chunked
+    // `stream` always writes starting at the slot's own base block --
+    // zero any offset a PRIOR `kernelupload resumechunk` call might
+    // have left set, so a stray leftover value can never leak into an
+    // unrelated whole-image upload.
+    let _ = kernelupload_chunk_base_block_offset_set(0 as u32);
     let fresh_ctx: Sha256Ctx = sha256_init();
     let _ = kernelupload_ctx_store(ref fresh_ctx);
     let _ = kernelupload_active_set(1 as u32);
@@ -31632,15 +32611,519 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     // freshly-started stream with zero bytes received yet must not
     // look stale on its very first check.
     let _ = kernelupload_stream_last_activity_tick_set(scheduler_get_tick_count());
+    // ROOT-CAUSE FIX (2026-10-23, real-HW kernelupload-stream stall
+    // investigation): kernelupload_rx_ring_head/_tail were NEVER reset
+    // here -- only ever written from inside the ring's own push/pop
+    // implementations (irq_dispatch's producer side, task_f's consumer
+    // side). If a PRIOR stream attempt aborted (the 10s-inactivity path,
+    // or any other abort) while bytes were still sitting unconsumed in
+    // the ring, task_f stops polling the instant stream_active drops to
+    // 0 -- those bytes are never drained, and silently persist in the
+    // ring across attempts. The NEXT "kernelupload stream" then starts
+    // with a stale, non-empty ring: task_f's first pop_batch pulls in
+    // the old leftover bytes ahead of (or mixed with) this attempt's
+    // real payload, corrupting total_len accounting from byte 0 --
+    // confirmed live via a byte-exact capture: a 1-byte test stream's
+    // own leftover-bytes-get-replayed-through-the-shell path (right
+    // below, in task_f) echoed a stale "ready" command from a PRIOR
+    // failed attempt that was still sitting in this exact ring,
+    // corrupting "DONE 00000001" into "DOunknown command...NE 00000001"
+    // on the wire. This was never a timing/pacing issue -- no amount of
+    // host-side delay could fix a ring that already had the wrong
+    // bytes in it before the new stream's own data ever arrived.
+    let _ = kernelupload_rx_ring_head_set(0 as u32);
+    let _ = kernelupload_rx_ring_tail_set(0 as u32);
+    // 2026-10-23 follow-up: reset the independent FIQ-level stall
+    // detector's own snapshot too -- see kernelupload_watchdog_last_
+    // total_len's own header comment (boot/kernelupload_state.S). Left
+    // unreset, a fresh stream always starts with last_progress_tick
+    // stuck at whatever (possibly very stale, or just .bss-zero on a
+    // fresh boot) value the PREVIOUS stream attempt left behind, which
+    // immediately reads as "stale" on this stream's own very first FIQ
+    // tick (now - stale_tick is already far past the 5s threshold) --
+    // a guaranteed spurious false-positive stall report at total=0,
+    // confirmed live (first real-HW trial of this detector).
+    // Sentinel last_total_len (0xFFFFFFFF, never a real byte count) so
+    // the FIQ detector's very first check after this always takes the
+    // "progress detected" branch and stamps a correct, live
+    // last_progress_tick itself -- this set below is just for
+    // cleanliness/defense-in-depth, not load-bearing (TIMER_CLO, same
+    // clock the FIQ detector's own `now` compares against -- NOT
+    // scheduler_get_tick_count(), a different unit entirely).
+    let _ = kernelupload_watchdog_last_total_len_set(0xFFFFFFFF as u32);
+    let _ = kernelupload_watchdog_last_progress_tick_set(mmio_read_u32(TIMER_CLO));
+    let _ = kernelupload_watchdog_stall_reported_set(0 as u32);
+    // 2026-10-23 follow-up: reset the separate-stall evidence counters
+    // too, so each fresh attempt's own overrun count/last-byte-time
+    // isn't contaminated by a previous attempt's history.
+    let _ = kernelupload_last_rx_byte_us_set(mmio_read_u32(TIMER_CLO));
+    let _ = kernelupload_overrun_count_set(0 as u32);
+    let _ = kernelupload_uart_irq_entry_count_set(0 as u32);
+    let _ = kernelupload_fifo_backlog_count_set(0 as u32);
+    let _ = kernelupload_sd_write_worst_us_set(0 as u32);
     // Set LAST: irq_dispatch's own UART-RX branch checks this flag on
     // every IRQ from here on, and starts treating incoming bytes as
     // raw stream payload (bypassing the shell line buffer and the
     // RX budget both) the instant it's 1 -- everything above must
     // already be in its correct starting state before that happens.
     let _ = kernelupload_stream_active_set(1 as u32);
+    let _ = maintenance_mode_engage();
     let _ = uart_puts("GO ");
     let _ = uart_put_i64(claimed_total);
     let _ = uart_puts("\n");
+    return 0;
+  }
+
+  // 2026-10-23 (resumable chunked upload, user request): `resumebegin`
+  // establishes or RESUMES a multi-chunk upload -- see KernelUpload
+  // ChunkProgress's own header comment above for the full design and
+  // the "board boots last known good slot regardless" safety property
+  // this whole family leans on. `kernelupload stream`/`commit` above
+  // are completely unchanged by any of this -- a plain single-shot
+  // upload (small kernels, or a healthy link) still works exactly as
+  // before; this is purely additive for a link/card that stalls
+  // partway through a large (3MB+) image.
+  if shell_word_matches(line_buf, sub_start, sub_end, "resumebegin") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: kernelupload resumebegin <total_len_bytes> <chunk_count> <final_sha256_hex>\n");
+      return 0;
+    }
+    let tlen_start: i64 = sub_end + 1;
+    let tlen_end: i64 = shell_find_space(line_buf, tlen_start, line_len);
+    let total_len: i64 = shell_parse_decimal(line_buf, tlen_start, tlen_end);
+    if (total_len <= 0) || (total_len > kernelslot_size_bytes()) {
+      let _ = uart_puts("kernelupload: resumebegin total_len invalid or exceeds slot size\n");
+      return 0;
+    }
+    if tlen_end >= line_len {
+      let _ = uart_puts("usage: kernelupload resumebegin <total_len_bytes> <chunk_count> <final_sha256_hex>\n");
+      return 0;
+    }
+    let cc_start: i64 = tlen_end + 1;
+    let cc_end: i64 = shell_find_space(line_buf, cc_start, line_len);
+    let chunk_count: i64 = shell_parse_decimal(line_buf, cc_start, cc_end);
+    // Upper bound is arbitrary but real: guards against a degenerate
+    // request (e.g. chunk_count > total_len) that would round every
+    // chunk down to nothing meaningful -- not a hardware limit.
+    if (chunk_count <= 0) || (chunk_count > (1000 as i64)) {
+      let _ = uart_puts("kernelupload: resumebegin chunk_count must be 1-1000\n");
+      return 0;
+    }
+    if cc_end >= line_len {
+      let _ = uart_puts("usage: kernelupload resumebegin <total_len_bytes> <chunk_count> <final_sha256_hex>\n");
+      return 0;
+    }
+    let rsha_start: i64 = cc_end + 1;
+    let rsha_end: i64 = shell_find_space(line_buf, rsha_start, line_len);
+    if (rsha_end - rsha_start) != 64 {
+      let _ = uart_puts("kernelupload: expected a 64-char (32-byte) sha256 hex digest\n");
+      return 0;
+    }
+    let final_digest_buf: mut ref i64 = kernelupload_chunk_decode_buf_get();
+    let hex_status: i64 = shell_parse_hex_bytes(line_buf, rsha_start, rsha_end, final_digest_buf, 32);
+    if hex_status != 0 {
+      let _ = uart_puts("kernelupload: invalid sha256 hex\n");
+      return 0;
+    }
+
+    // Every non-final chunk must land on a clean SD block boundary --
+    // round the per-chunk size up to the next multiple of 512 (same
+    // block size every other part of this mechanism already assumes)
+    // rather than trying to support an unaligned chunk/block stitch.
+    let raw_chunk_size: i64 = (total_len + chunk_count - 1) / chunk_count;
+    let chunk_size: i64 = ((raw_chunk_size + 511) / 512) * 512;
+    let last_chunk_len: i64 = total_len - (chunk_size * (chunk_count - 1));
+    if last_chunk_len <= 0 {
+      let _ = uart_puts("kernelupload: resumebegin chunk_count too large for this total_len\n");
+      return 0;
+    }
+
+    let lookup: KernelSlotRecord = kernelslot_lookup();
+    if lookup.valid != 1 {
+      let _ = uart_puts("kernelupload: no valid slot-state record found -- card not seeded?\n");
+      return 0;
+    }
+    let target: u32 = if lookup.active_slot == (0 as u8) { 1 as u32 } else { 0 as u32 };
+
+    let prog: KernelUploadChunkProgress = kernelupload_chunk_progress_lookup();
+    let mismatch: i64 = if prog.valid == 1 { 0 } else { 1 };
+    let fi: i64 = 0;
+    while (fi < 32) && (prog.valid == 1) {
+      if prog.final_sha256[fi] != (buf_read_byte(final_digest_buf, fi as u32) as u8) {
+        mismatch = 1;
+      }
+      fi = fi + 1;
+    }
+    let final_sha_matches: i64 = if mismatch == 0 { 1 } else { 0 };
+    let same_upload: i64 = if (prog.valid == 1) && (prog.target_slot == target) && (prog.total_len == (total_len as u32)) && (prog.chunk_size == (chunk_size as u32)) && (prog.chunk_count == (chunk_count as u32)) && (final_sha_matches == 1) { 1 } else { 0 };
+
+    if same_upload == 1 {
+      if prog.chunks_confirmed == prog.chunk_count {
+        // A prior upload for this EXACT image already finished all its
+        // chunks (commit just hasn't run yet, or already did and this
+        // record is stale leftover) -- tell the host so it goes
+        // straight to `kernelupload commit` instead of re-streaming
+        // anything.
+        let _ = uart_puts("ALLDONE ");
+        let _ = uart_put_i64(prog.chunks_confirmed as i64);
+        let _ = uart_puts("\n");
+        return 0;
+      }
+      if (prog.attempt_count as i64) >= KERNELUPLOAD_CHUNK_ATTEMPT_LIMIT {
+        let _ = uart_puts("LIMIT_EXCEEDED ");
+        let _ = uart_put_i64(prog.attempt_count as i64);
+        let _ = uart_puts(" -- send 'kernelupload resumeabort' to give up and start over\n");
+        return 0;
+      }
+      let resumed: KernelUploadChunkProgress = KernelUploadChunkProgress {
+        valid: 1, chosen_block: kernelupload_chunk_progress_stale_block(ref prog),
+        generation: prog.generation + (1 as u32),
+        target_slot: prog.target_slot, total_len: prog.total_len,
+        chunk_size: prog.chunk_size, chunk_count: prog.chunk_count,
+        chunks_confirmed: prog.chunks_confirmed,
+        attempt_count: prog.attempt_count + (1 as u32),
+        final_sha256: prog.final_sha256,
+      };
+      let wstatus: i64 = kernelupload_chunk_progress_write(ref resumed, resumed.chosen_block);
+      if wstatus != 0 {
+        let _ = uart_puts("kernelupload: resumebegin failed to persist progress record\n");
+        return 0;
+      }
+      let _ = uart_puts("RESUME ");
+      let _ = uart_put_i64(prog.chunks_confirmed as i64);
+      let _ = uart_puts(" ");
+      let _ = uart_put_i64((prog.attempt_count + (1 as u32)) as i64);
+      let _ = uart_puts("\n");
+      return 0;
+    }
+
+    if (prog.valid == 1) && (prog.chunks_confirmed < prog.chunk_count) {
+      let _ = uart_puts("BUSY -- a different resumable upload is already in progress; send 'kernelupload resumeabort' first if you mean to discard it\n");
+      return 0;
+    }
+
+    // Fresh start: either no record exists, or the previous one was
+    // already fully committed/cleared.
+    let next_block: i64 = if prog.chosen_block == kernelupload_chunk_state_block_a() { kernelupload_chunk_state_block_b() } else { kernelupload_chunk_state_block_a() };
+    let final_sha_arr: [u8; 32] = [0 as u8; 32];
+    let fai: i64 = 0;
+    while fai < 32 {
+      final_sha_arr[fai] = buf_read_byte(final_digest_buf, fai as u32) as u8;
+      fai = fai + 1;
+    }
+    let fresh: KernelUploadChunkProgress = KernelUploadChunkProgress {
+      valid: 1, chosen_block: next_block,
+      generation: prog.generation + (1 as u32),
+      target_slot: target, total_len: total_len as u32,
+      chunk_size: chunk_size as u32, chunk_count: chunk_count as u32,
+      chunks_confirmed: 0 as u32, attempt_count: 1 as u32,
+      final_sha256: final_sha_arr,
+    };
+    let fwstatus: i64 = kernelupload_chunk_progress_write(ref fresh, next_block);
+    if fwstatus != 0 {
+      let _ = uart_puts("kernelupload: resumebegin failed to persist progress record\n");
+      return 0;
+    }
+    let _ = uart_puts("FRESH 0\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "resumechunk") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: kernelupload resumechunk <chunk_index> <chunk_len_bytes>\n");
+      return 0;
+    }
+    let prog: KernelUploadChunkProgress = kernelupload_chunk_progress_lookup();
+    if (prog.valid != 1) || (prog.chunks_confirmed >= prog.chunk_count) {
+      let _ = uart_puts("kernelupload: no resumable upload in progress -- send 'kernelupload resumebegin' first\n");
+      return 0;
+    }
+    let idx_start: i64 = sub_end + 1;
+    let idx_end: i64 = shell_find_space(line_buf, idx_start, line_len);
+    let chunk_index: i64 = shell_parse_decimal(line_buf, idx_start, idx_end);
+    if chunk_index != (prog.chunks_confirmed as i64) {
+      let _ = uart_puts("EXPECTED ");
+      let _ = uart_put_i64(prog.chunks_confirmed as i64);
+      let _ = uart_puts("\n");
+      return 0;
+    }
+    if idx_end >= line_len {
+      let _ = uart_puts("usage: kernelupload resumechunk <chunk_index> <chunk_len_bytes>\n");
+      return 0;
+    }
+    let clen_start: i64 = idx_end + 1;
+    let clen_end: i64 = shell_find_space(line_buf, clen_start, line_len);
+    let claimed_chunk_len: i64 = shell_parse_decimal(line_buf, clen_start, clen_end);
+    let is_last_chunk: i64 = if (chunk_index + 1) == (prog.chunk_count as i64) { 1 } else { 0 };
+    let expected_chunk_len: i64 = if is_last_chunk == 1 { (prog.total_len as i64) - ((prog.chunk_size as i64) * (chunk_index)) } else { prog.chunk_size as i64 };
+    if claimed_chunk_len != expected_chunk_len {
+      let _ = uart_puts("kernelupload: resumechunk length mismatch (expected ");
+      let _ = uart_put_i64(expected_chunk_len);
+      let _ = uart_puts(", claimed ");
+      let _ = uart_put_i64(claimed_chunk_len);
+      let _ = uart_puts(")\n");
+      return 0;
+    }
+
+    let block_offset: i64 = (chunk_index * (prog.chunk_size as i64)) / 512;
+    let _ = kernelupload_chunk_base_block_offset_set(block_offset as u32);
+    let _ = kernelupload_target_slot_set(prog.target_slot);
+    let _ = kernelupload_total_len_set(0 as u32);
+    let fresh_ctx: Sha256Ctx = sha256_init();
+    let _ = kernelupload_ctx_store(ref fresh_ctx);
+    let _ = kernelupload_active_set(1 as u32);
+    let _ = kernelupload_stream_expected_len_set(claimed_chunk_len as u32);
+    let _ = kernelupload_stream_last_ack_len_set(0 as u32);
+    let _ = kernelupload_stream_last_activity_tick_set(scheduler_get_tick_count());
+    let _ = kernelupload_rx_ring_head_set(0 as u32);
+    let _ = kernelupload_rx_ring_tail_set(0 as u32);
+    let _ = kernelupload_watchdog_last_total_len_set(0xFFFFFFFF as u32);
+    let _ = kernelupload_watchdog_last_progress_tick_set(mmio_read_u32(TIMER_CLO));
+    let _ = kernelupload_watchdog_stall_reported_set(0 as u32);
+    let _ = kernelupload_last_rx_byte_us_set(mmio_read_u32(TIMER_CLO));
+    let _ = kernelupload_overrun_count_set(0 as u32);
+    let _ = kernelupload_uart_irq_entry_count_set(0 as u32);
+    let _ = kernelupload_fifo_backlog_count_set(0 as u32);
+    let _ = kernelupload_sd_write_worst_us_set(0 as u32);
+    let _ = kernelupload_stream_active_set(1 as u32);
+    let _ = maintenance_mode_engage();
+    let _ = uart_puts("GO ");
+    let _ = uart_put_i64(claimed_chunk_len);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "resumeverify") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: kernelupload resumeverify <chunk_index> <chunk_sha256_hex>\n");
+      return 0;
+    }
+    let prog: KernelUploadChunkProgress = kernelupload_chunk_progress_lookup();
+    if (prog.valid != 1) || (prog.chunks_confirmed >= prog.chunk_count) {
+      let _ = uart_puts("kernelupload: no resumable upload in progress\n");
+      return 0;
+    }
+    let idx_start: i64 = sub_end + 1;
+    let idx_end: i64 = shell_find_space(line_buf, idx_start, line_len);
+    let chunk_index: i64 = shell_parse_decimal(line_buf, idx_start, idx_end);
+    if chunk_index != (prog.chunks_confirmed as i64) {
+      let _ = uart_puts("EXPECTED ");
+      let _ = uart_put_i64(prog.chunks_confirmed as i64);
+      let _ = uart_puts("\n");
+      return 0;
+    }
+    if idx_end >= line_len {
+      let _ = uart_puts("usage: kernelupload resumeverify <chunk_index> <chunk_sha256_hex>\n");
+      return 0;
+    }
+    let vsha_start: i64 = idx_end + 1;
+    let vsha_end: i64 = shell_find_space(line_buf, vsha_start, line_len);
+    if (vsha_end - vsha_start) != 64 {
+      let _ = uart_puts("kernelupload: expected a 64-char (32-byte) sha256 hex digest\n");
+      return 0;
+    }
+    let chunk_digest_buf: mut ref i64 = kernelupload_chunk_decode_buf_get();
+    let vhex_status: i64 = shell_parse_hex_bytes(line_buf, vsha_start, vsha_end, chunk_digest_buf, 32);
+    if vhex_status != 0 {
+      let _ = uart_puts("kernelupload: invalid sha256 hex\n");
+      return 0;
+    }
+    let received_len: i64 = kernelupload_total_len_get() as i64;
+    let is_last_chunk: i64 = if (chunk_index + 1) == (prog.chunk_count as i64) { 1 } else { 0 };
+    let expected_chunk_len: i64 = if is_last_chunk == 1 { (prog.total_len as i64) - ((prog.chunk_size as i64) * (chunk_index)) } else { prog.chunk_size as i64 };
+    let _ = kernelupload_active_set(0 as u32);
+    if received_len != expected_chunk_len {
+      let _ = uart_puts("CHUNKFAIL ");
+      let _ = uart_put_i64(chunk_index);
+      let _ = uart_puts(" (incomplete: received ");
+      let _ = uart_put_i64(received_len);
+      let _ = uart_puts(" of ");
+      let _ = uart_put_i64(expected_chunk_len);
+      let _ = uart_puts(" bytes)\n");
+      return 0;
+    }
+
+    let base_block: i64 = (if prog.target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() }) + ((chunk_index * (prog.chunk_size as i64)) / 512);
+    // 2026-10-23 (real bug, caught by audit before ever flashing this):
+    // kernelupload_accumulate_bytes (the existing, UNCHANGED write
+    // path every chunk streams through) only writes a block to SD on
+    // a full 512-byte boundary -- a trailing partial remainder is
+    // deliberately left sitting in kernelupload_block_buf_get(),
+    // never written, until the EXISTING `kernelupload commit` pads
+    // and writes it once at the very end of a non-chunked upload.
+    // Every chunk except the last is forced block-aligned (resumebegin's
+    // own chunk_size rounding), so this ONLY matters for the last
+    // chunk -- but a real kernel image's own total_len is almost never
+    // a multiple of 512, so this is the COMMON case, not an edge case.
+    // Without this, the readback verify just below would read back
+    // whatever stale/garbage data already sat in that never-written
+    // block (leftover from provisioning or a prior upload), not this
+    // chunk's own real tail bytes.
+    let chunk_partial: i64 = received_len % 512;
+    if (is_last_chunk == 1) && (chunk_partial != 0) {
+      let tail_buf: mut ref i64 = kernelupload_block_buf_get();
+      let pad_i: i64 = chunk_partial;
+      while pad_i < 512 {
+        let _ = buf_write_byte(tail_buf, pad_i as u32, 0 as u32);
+        pad_i = pad_i + 1;
+      }
+      let tail_block_index: i64 = received_len / 512;
+      let tail_wstatus: i64 = sdhost_write_block(base_block + tail_block_index, tail_buf);
+      if tail_wstatus != 0 {
+        let _ = uart_puts("CHUNKFAIL ");
+        let _ = uart_put_i64(chunk_index);
+        let _ = uart_puts(" (final-block SD write failed -- resend this same chunk)\n");
+        return 0;
+      }
+    }
+    let verify_status: i64 = kernelupload_chunk_verify_range(base_block, received_len, chunk_digest_buf);
+    if verify_status != 0 {
+      let _ = uart_puts("CHUNKFAIL ");
+      let _ = uart_put_i64(chunk_index);
+      let _ = uart_puts(" (sha256 mismatch on readback -- resend this same chunk)\n");
+      return 0;
+    }
+
+    let advanced: KernelUploadChunkProgress = KernelUploadChunkProgress {
+      valid: 1, chosen_block: kernelupload_chunk_progress_stale_block(ref prog),
+      generation: prog.generation + (1 as u32),
+      target_slot: prog.target_slot, total_len: prog.total_len,
+      chunk_size: prog.chunk_size, chunk_count: prog.chunk_count,
+      chunks_confirmed: prog.chunks_confirmed + (1 as u32),
+      attempt_count: prog.attempt_count,
+      final_sha256: prog.final_sha256,
+    };
+    let await_status: i64 = kernelupload_chunk_progress_write(ref advanced, advanced.chosen_block);
+    if await_status != 0 {
+      let _ = uart_puts("kernelupload: resumeverify failed to persist progress record\n");
+      return 0;
+    }
+    if advanced.chunks_confirmed == advanced.chunk_count {
+      // 2026-10-23 (resumable chunked upload, "stitch all N chunks
+      // upon last chunk transfer, run final checksum"): every chunk
+      // individually verified correctly, but the EXISTING, unchanged
+      // `kernelupload commit` this host is meant to call next checks
+      // TWO things this session's own per-chunk resets have left
+      // stale: kernelupload_total_len (currently just the LAST
+      // chunk's own small length, not the whole image) and
+      // kernelupload_ctx (an incremental hash covering only that same
+      // last chunk's bytes, not the whole image's). Re-hydrate both
+      // from a fresh whole-image pass over SD -- the real "stitch"
+      // step -- so `commit`'s own first (upload-time-hash) check
+      // passes on genuinely correct grounds, not by accident. Its own
+      // SEPARATE readback-verify pass still runs independently right
+      // after, exactly as it always has for a non-chunked upload --
+      // this is strictly additional, not a weakening of that check.
+      //
+      // REAL BUG, caught by audit before ever flashing this: this
+      // loop deliberately processes ONLY full 512-byte blocks
+      // (whole_len/512, integer division -- naturally excludes any
+      // trailing partial remainder), NOT whole_len rounded up. commit's
+      // own EXISTING, unmodified code (right after this ctx is loaded
+      // back via kernelupload_ctx_load) ALREADY pads and sha256_updates
+      // that exact tail itself, the same way it always has for a non-
+      // chunked upload -- this stitch step must leave ctx in the SAME
+      // "every full block processed, tail not yet touched"
+      // precondition that code expects, or the tail bytes get hashed
+      // TWICE (once here, once in commit), corrupting the result. The
+      // tail's own real bytes are already physically on SD by now
+      // (the last chunk's own padding step just above, in the
+      // non-ALLDONE path of this same function) -- commit's own
+      // readback-verify pass (separate from this ctx) reads them
+      // correctly regardless.
+      let whole_base_block: i64 = if advanced.target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() };
+      let whole_len: i64 = advanced.total_len as i64;
+      let stitch_ctx: Sha256Ctx = sha256_init();
+      let stitch_block_buf: mut ref i64 = kernelupload_block_buf_get();
+      let stitch_full_blocks: i64 = whole_len / 512;
+      let sbi: i64 = 0;
+      let stitch_failed: i64 = 0;
+      while (sbi < stitch_full_blocks) && (stitch_failed == 0) {
+        let srstatus: i64 = sdhost_read_block(whole_base_block + sbi, stitch_block_buf);
+        if srstatus != 0 {
+          stitch_failed = 1;
+        } else {
+          let schunk1: [u8; 256] = zero256_bytes();
+          let schunk2: [u8; 256] = zero256_bytes();
+          let sci: i64 = 0;
+          while sci < 256 {
+            schunk1[sci] = buf_read_byte(stitch_block_buf, sci as u32) as u8;
+            sci = sci + 1;
+          }
+          stitch_ctx = sha256_update(ref stitch_ctx, mut ref schunk1, 256 as i64);
+          let scj: i64 = 0;
+          while scj < 256 {
+            schunk2[scj] = buf_read_byte(stitch_block_buf, (256 + scj) as u32) as u8;
+            scj = scj + 1;
+          }
+          stitch_ctx = sha256_update(ref stitch_ctx, mut ref schunk2, 256 as i64);
+        }
+        sbi = sbi + 1;
+      }
+      if stitch_failed == 1 {
+        let _ = uart_puts("CHUNKFAIL ");
+        let _ = uart_put_i64(chunk_index);
+        let _ = uart_puts(" (whole-image stitch readback failed after the last chunk -- resend this same chunk)\n");
+        return 0;
+      }
+      // ANOTHER real bug this same audit caught: kernelupload_block_
+      // buf_get() is ONE shared scratch buffer -- both the per-chunk
+      // tail pad-and-write above (this same function, the non-ALLDONE
+      // path a call earlier) and this stitch loop's own repeated
+      // sdhost_read_block calls have long since overwritten whatever
+      // it held. commit's own EXISTING code (right after this
+      // function returns) assumes block_buf's first `partial_bytes`
+      // already hold the REAL trailing data verbatim -- re-read that
+      // exact tail block fresh from SD right here, so commit finds
+      // the real bytes it expects, not leftover content from
+      // whichever full block this loop happened to read last.
+      if (whole_len % (512 as i64)) != (0 as i64) {
+        let _ = sdhost_read_block(whole_base_block + stitch_full_blocks, stitch_block_buf);
+      }
+      let _ = kernelupload_target_slot_set(advanced.target_slot);
+      let _ = kernelupload_total_len_set(advanced.total_len);
+      let _ = kernelupload_ctx_store(ref stitch_ctx);
+      let _ = kernelupload_active_set(1 as u32);
+      let _ = uart_puts("ALLDONE ");
+      let _ = uart_put_i64(whole_len);
+      let _ = uart_puts(" -- all chunks verified and stitched, send 'kernelupload commit' next\n");
+      return 0;
+    }
+    let _ = uart_puts("CHUNKOK ");
+    let _ = uart_put_i64(chunk_index);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "resumestatus") == 1 {
+    let prog: KernelUploadChunkProgress = kernelupload_chunk_progress_lookup();
+    if prog.valid != 1 {
+      let _ = uart_puts("kernelupload: no resumable upload in progress\n");
+      return 0;
+    }
+    let _ = uart_puts("resumestatus: target_slot=");
+    let _ = uart_puts(if prog.target_slot == (0 as u32) { "A" } else { "B" });
+    let _ = uart_puts(" total_len=");
+    let _ = uart_put_i64(prog.total_len as i64);
+    let _ = uart_puts(" chunk_size=");
+    let _ = uart_put_i64(prog.chunk_size as i64);
+    let _ = uart_puts(" chunk_count=");
+    let _ = uart_put_i64(prog.chunk_count as i64);
+    let _ = uart_puts(" chunks_confirmed=");
+    let _ = uart_put_i64(prog.chunks_confirmed as i64);
+    let _ = uart_puts(" attempt_count=");
+    let _ = uart_put_i64(prog.attempt_count as i64);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "resumeabort") == 1 {
+    let _ = kernelupload_stream_active_set(0 as u32);
+    let _ = kernelupload_active_set(0 as u32);
+    let _ = kernelupload_total_len_set(0 as u32);
+    let _ = maintenance_mode_disengage();
+    let _ = kernelupload_chunk_progress_clear();
+    let _ = uart_puts("ok\n");
     return 0;
   }
 
@@ -31839,6 +33322,18 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
       let _ = uart_puts("kernelupload: slot-state write-back failed\n");
       return 0;
     }
+    // 2026-10-23 (resumable chunked upload): this image is now fully
+    // committed and the slot marked ready -- any resumable-upload
+    // progress record for the SAME target slot has served its purpose
+    // and would otherwise linger as stale "in progress" state that a
+    // later, unrelated `resumebegin` might misread. Only clears when
+    // it actually matches this slot, so a commit for slot A never
+    // clobbers a genuinely-still-in-progress resumable upload for
+    // slot B (or vice versa).
+    let chunk_prog: KernelUploadChunkProgress = kernelupload_chunk_progress_lookup();
+    if (chunk_prog.valid == 1) && (chunk_prog.target_slot == target_slot) {
+      let _ = kernelupload_chunk_progress_clear();
+    }
     let _ = uart_puts("ok, slot ");
     let _ = uart_puts(if target_slot == (0 as u32) { "A" } else { "B" });
     let _ = uart_puts(" verified and marked ready, ");
@@ -31847,7 +33342,7 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     return 0;
   }
 
-  let _ = uart_puts("usage: kernelupload chunk <hex> | kernelupload stream <len> | kernelupload commit <len> <sha256> | kernelupload abort\n");
+  let _ = uart_puts("usage: kernelupload stream <len> | kernelupload commit <len> <sha256> | kernelupload resumebegin <len> <chunk_count> <sha256> | kernelupload resumechunk <idx> <len> | kernelupload resumeverify <idx> <sha256> | kernelupload resumestatus | kernelupload resumeabort | kernelupload abort\n");
   return 0;
 }
 
@@ -33655,6 +35150,10 @@ fn shell_dispatch() -> i64 {
     return shell_dispatch_sentdump();
   }
 
+  if shell_word_matches(line_buf, 0, cmd_end, "rxdiag") == 1 {
+    return shell_dispatch_rxdiag();
+  }
+
   if shell_word_matches(line_buf, 0, cmd_end, "lrdump") == 1 {
     return shell_dispatch_lrdump();
   }
@@ -33695,6 +35194,23 @@ fn shell_dispatch() -> i64 {
   // "unset" if nothing has bound yet, same as any real host with no
   // configured address) rather than a fixed constant.
   if shell_word_matches(line_buf, 0, cmd_end, "ping") == 1 {
+    // 2026-10-23 (critical-section WCET audit, user request): drop
+    // shell_dispatch's own OUTER dhruva_prio_lock(2) wrap (task_f's
+    // call site above) immediately on entry -- see the three phase-
+    // scoped relocks below (dns_resolve/arp_resolve/icmp_poll) for why
+    // this command, uniquely, cannot be left running under that
+    // single continuous hold. Safe to call here even though this
+    // function didn't take that lock itself: dhruva_prio_unlock_impl's
+    // own "stray extra unlock" floor (boot/context_switch.S) makes
+    // this a correctly-balanced drop-to-depth-0 from ping's own
+    // perspective, and the OUTER caller's own eventual trailing
+    // unlock(3) (after shell_dispatch() returns) becomes the
+    // documented harmless redundant-write case, not a corruption --
+    // confirmed via that function's own header comment before relying
+    // on it. No command between here and the three relocks below
+    // touches DharaFS or any other ceiling=2 resource (pure argument
+    // parsing), so nothing loses protection it actually needed.
+    let _ = dhruva_prio_unlock(3);
     if cmd_end >= line_len {
       let _ = uart_puts("usage: ping <a.b.c.d>\n");
       return 0;
@@ -33724,7 +35240,18 @@ fn shell_dispatch() -> i64 {
       let hostname_buf: mut ref i64 = shell_hostname_scratch_get();
       let _ = shell_copy_range(line_buf, ip_start, ip_end, hostname_buf);
       let dns_server_ip: u32 = dhcp_state_get_dns_server();
+      // Phase-scoped lock (see this command's own entry-point comment
+      // above): dns_resolve's own poll loop calls netif_recv_frame
+      // directly, needing the SAME DWC2-channel-0 mutual exclusion
+      // dhcp_client_poll/sshd need -- held only for this one phase's
+      // own bounded worst case, not ping's whole remaining command.
+      // 2026-10-23: DWC2_MUTEX_ID (see that constant's own header
+      // comment), not the DharaFS ceiling -- a mutex, not a ceiling,
+      // so an unrelated kernelupload SD write is never blocked by
+      // however long this phase takes.
+      let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
       let resolved_ip: u32 = dns_resolve(my_mac, my_ip, dns_server_ip, hostname_buf, ip_len);
+      let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
       if resolved_ip == (0 as u32) {
         let _ = uart_puts("ping: invalid IP address or could not resolve hostname\n");
         return 0;
@@ -33762,9 +35289,26 @@ fn shell_dispatch() -> i64 {
         // any dst_ip other than my_ip when tested here. Bounded (not
         // `while true`), matching every other poll loop in this
         // codebase.
+        //
+        // 2026-10-23 (critical-section WCET audit): phase-scoped lock
+        // (this command's own entry-point comment above) -- held only
+        // for this ARP phase, released once it's done. Iteration cap
+        // reduced 20->8 the SAME round: with delay(161000) confirmed
+        // at ~50ms real (not the ~15.5ms a since-fixed miscalibration
+        // gave), the OLD 20-iteration cap meant this phase alone could
+        // hold ceiling=2 for ~1s -- never entered into test/
+        // schedulability_analysis.py's own blocking-term model until
+        // this round, and proven (by that same model) to blow LOW's
+        // own 1000ms deadline on its own, let alone combined with the
+        // DNS/ICMP phases. 8 iterations (~400ms worst case) keeps a
+        // real, still-generous resolve window while actually fitting
+        // the budget other candidate blocking terms already respect.
+        // 2026-10-23: DWC2_MUTEX_ID, not the DharaFS ceiling -- see
+        // that constant's own header comment.
+        let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
         let _ = arp_resolve_start(my_mac, my_ip, dst_ip);
         let arp_iter: i64 = 0;
-        while (arp_iter < 20) && (resolved == 0) {
+        while (arp_iter < 8) && (resolved == 0) {
           let arp_result: i64 = arp_resolve_poll(dst_ip);
           if arp_result == 1 {
             if arp_cache_lookup(dst_ip, dst_mac) == 1 {
@@ -33775,25 +35319,26 @@ fn shell_dispatch() -> i64 {
             // comment on delay(N)'s real, platform-dependent duration.
             // Found during the session-wide delay() sweep: this was
             // producing ~15.5ms real per retry instead of the intended
-            // ~50ms, making ping's own 20-iteration ARP-resolve window
-            // ~310ms total on real hardware instead of ~1s.
+            // ~50ms.
             let _ = delay(161000);
-            // Protocol audit: this loop used to poll 20x off a SINGLE
+            // Protocol audit: this loop used to poll off a SINGLE
             // arp_resolve_start call above -- a real request lost on
             // the wire (plausible on this project's own RTL8188CU WiFi
-            // path) meant the entire ~1s window was spent waiting on a
+            // path) meant the entire window was spent waiting on a
             // reply that was never actually going to arrive, since
             // nothing ever asked again. u-boot's arp_timeout_check
             // (net/arp.c) and Linux's arp_solicit() both resend
             // periodically rather than asking once and only polling --
-            // resend every 5th iteration here (4 real requests across
-            // the ~1s budget) instead of exactly 1.
-            if (arp_iter % 5) == 4 {
+            // resend once partway through this now-shorter window
+            // (2026-10-23: iter==3 of 8, roughly the same relative
+            // position the old iter%5==4 check landed at within 20).
+            if arp_iter == (3 as i64) {
               let _ = arp_resolve_start(my_mac, my_ip, dst_ip);
             }
           }
           arp_iter = arp_iter + 1;
         }
+        let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
       }
     }
     if resolved == 0 {
@@ -33811,8 +35356,20 @@ fn shell_dispatch() -> i64 {
     let _ = buf_write_byte(payload, 2 as u32, 110 as u32);
     let _ = buf_write_byte(payload, 3 as u32, 103 as u32);
 
+    // 2026-10-23 (critical-section WCET audit): phase-scoped lock,
+    // same as the DNS/ARP phases above -- covers the send too (not
+    // just the poll loop below), conservatively, since icmp_ping_
+    // start's own netif TX path hasn't been separately audited for
+    // whether it shares channel 0's own RX-side hazard; bundling
+    // send+reply-wait as one "request/response" phase costs nothing
+    // extra (the send itself is fast) and avoids relying on an
+    // unverified assumption.
+    // 2026-10-23: DWC2_MUTEX_ID, not the DharaFS ceiling -- see that
+    // constant's own header comment.
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let send_status: i64 = icmp_ping_start(my_mac, dst_mac, my_ip, dst_ip, identifier, seq, payload, 4);
     if send_status != 0 {
+      let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
       let _ = uart_puts("ping: send failed\n");
       return 0;
     }
@@ -33825,11 +35382,16 @@ fn shell_dispatch() -> i64 {
     // own just-sent request on an earlier iteration of this same
     // loop, exactly like icmp_self_test's own two-poll pattern, just
     // generalized into a retry loop here instead of two fixed calls).
+    // Iteration cap reduced 20->8 (same reasoning as the ARP phase
+    // above -- see that phase's own comment for the full "why": this
+    // one alone, at 20 iterations x the real ~50ms delay(161000),
+    // proved (via test/schedulability_analysis.py) to blow LOW's own
+    // 1000ms deadline on its own).
     let recv_payload: mut ref i64 = shell_ping_recv_payload_scratch_get();
     let recv_meta: mut ref i64 = shell_ping_recv_meta_scratch_get();
     let got_reply: i64 = 0;
     let poll_iter: i64 = 0;
-    while (poll_iter < 20) && (got_reply == 0) {
+    while (poll_iter < 8) && (got_reply == 0) {
       let poll_result: i64 = icmp_poll(my_mac, my_ip, recv_payload, 4, recv_meta);
       if poll_result >= 0 {
         let reply_identifier: u32 = buf_read_u16_be(recv_meta, 4);
@@ -33846,6 +35408,7 @@ fn shell_dispatch() -> i64 {
       }
       poll_iter = poll_iter + 1;
     }
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     if got_reply == 1 {
       let _ = uart_puts("reply from ");
       let _ = uart_put_ip(buf_read_u32_be(recv_meta, 0));
@@ -34402,7 +35965,10 @@ fn shell_dispatch() -> i64 {
 
     let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
     let isn: u32 = scheduler_get_tick_count() + (1000 as u32);
+    // 2026-10-23: DWC2_MUTEX_ID -- see sshtest's own matching comment.
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     if open_status != 0 {
       let _ = uart_puts("tcpecho: SYN send failed\n");
       return 0;
@@ -34492,7 +36058,10 @@ fn shell_dispatch() -> i64 {
 
     let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
     let isn: u32 = scheduler_get_tick_count() + (2000 as u32);
+    // 2026-10-23: DWC2_MUTEX_ID -- see sshtest's own matching comment.
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     if open_status != 0 {
       let _ = uart_puts("tlsecho: SYN send failed\n");
       return 0;
@@ -34608,7 +36177,10 @@ fn shell_dispatch() -> i64 {
 
     let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
     let isn: u32 = scheduler_get_tick_count() + (3000 as u32);
+    // 2026-10-23: DWC2_MUTEX_ID -- see sshtest's own matching comment.
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     if open_status != 0 {
       let _ = uart_puts("httpecho: SYN send failed\n");
       return 0;
@@ -34802,7 +36374,10 @@ fn shell_dispatch() -> i64 {
 
     let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
     let isn: u32 = scheduler_get_tick_count() + (4000 as u32);
+    // 2026-10-23: DWC2_MUTEX_ID -- see sshtest's own matching comment.
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     if open_status != 0 {
       let _ = uart_puts("mqttecho: SYN send failed\n");
       return 0;
@@ -35048,8 +36623,17 @@ fn shell_dispatch() -> i64 {
     // test's own established precedent for the identical requirement.
     let _ = arp_cache_insert(loop_ip, my_mac);
 
+    // 2026-10-23: DWC2_MUTEX_ID (see that constant's own header
+    // comment) -- socket_udp_send/_recv both reach netif_send_frame/
+    // netif_recv_frame directly, and (like tcp_conn_active_open) are
+    // ALSO called from boot-time self-tests, so this is wrapped at
+    // this live call site rather than inside those shared functions.
+    // Covers the whole send+poll+echo-reply sequence in one pair,
+    // same shape as tls_service's own wrap.
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let send_status: i64 = socket_udp_send(my_mac, loop_ip, loop_ip, client_port, echo_port, payload, text_len);
     if send_status != 0 {
+      let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
       let _ = uart_puts("udpecho: send failed (destination not ARP-resolved)\n");
       return 0;
     }
@@ -35072,6 +36656,7 @@ fn shell_dispatch() -> i64 {
       }
       poll_iter = poll_iter + 1;
     }
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
 
     if echoed < 0 {
       let _ = uart_puts("udpecho: no echo received\n");
@@ -35112,7 +36697,10 @@ fn shell_dispatch() -> i64 {
 
     let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
     let isn: u32 = scheduler_get_tick_count() + (2000 as u32);
+    // 2026-10-23: DWC2_MUTEX_ID -- see sshtest's own matching comment.
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     if open_status != 0 {
       let _ = uart_puts("tcprtx: SYN send failed\n");
       return 0;
@@ -35129,8 +36717,13 @@ fn shell_dispatch() -> i64 {
     // genuinely gone -- exactly the condition this test needs -- so
     // this isn't treated as a failure, just two different paths to
     // the same real loss.
+    // 2026-10-23: DWC2_MUTEX_ID (see that constant's own header
+    // comment) -- same gap as tcp_conn_poll's own matching fix, this
+    // call site is outside that function so needs its own wrap.
     let drop_buf: mut ref i64 = shell_tcprtx_drop_buf_scratch_get();
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let _ = netif_recv_frame(drop_buf, 64);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
 
     let _ = task_sleep_ticks((tcp_rtx_timeout_ticks() + (1 as u32)) as i64);
 
@@ -35228,8 +36821,17 @@ fn shell_dispatch() -> i64 {
 // (bounding a live network handshake) it couldn't mean anything useful
 // as a schedulability input. Priority 3, same best-effort band as
 // task_e/GC -- neither was ever meant to carry a WCET guarantee.
+// 2026-10-23 (resumable chunked upload): bumped 13312->16384. The new
+// `kernelupload resumebegin`/`resumeverify` handlers (shell_dispatch_
+// kernelupload) add several more local [u8;32]/[u8;256] arrays and
+// KernelUploadChunkProgress structs to the SAME call frame commit's
+// own pre-existing readback locals already live in -- real measured
+// worst case is 13641 bytes, comfortably under this new bound, and
+// nowhere close to task_f's own REAL allocated stack (262144 bytes,
+// per the task_stack_depth_check gate below) -- this annotation is a
+// static WCET input, not a reflection of actual overflow risk.
 #[no_mangle]
-#[bounded_stack(bytes=13312)]
+#[bounded_stack(bytes=16384)]
 fn task_f() -> i64 {
   while true {
     // TASK #355 (2026-10-12): `kernelupload stream` drain branch,
@@ -35247,8 +36849,48 @@ fn task_f() -> i64 {
     // declared length is reached or it's aborted, so there is no
     // competing ordinary shell work this could ever starve.
     if kernelupload_stream_active_get() == (1 as u32) {
+      // ROOT-CAUSE FIX (2026-10-24, real-HW kernelupload-stream stall
+      // investigation, finally diagnosed via `diagnose`'s own "stuck-
+      // task episodes"/"WCET-enforcement evictions" counters reading
+      // nonzero for SHELL for the first time in this whole
+      // investigation): task #355's own busy-poll redesign (comment
+      // just above) deliberately never calls task_sleep_ticks while a
+      // stream is active -- but task #271's PRE-EXISTING per-thread
+      // execution-time supervisor (scheduler_tick_handler's own
+      // task_heartbeat_last_tick_table scan, context_switch.S) ONLY
+      // ever gets re-stamped from inside task_sleep_ticks's own
+      // blocking path. Those two rounds were never cross-checked
+      // against each other: a long-running stream busy-polls this
+      // branch for its entire duration without a single task_sleep_
+      // ticks call, so after task_f's declared 20-tick heartbeat bound
+      // elapses, the supervisor declares it "stuck" and forcibly
+      // evicts it for another 20 ticks (sleep_until_table) -- live-
+      // confirmed via `diagnose` showing exactly this for SHELL right
+      // after a real stall (stuck-task episodes=4, WCET-enforcement
+      // evictions=4, both previously always 0 in every earlier round
+      // of this investigation, which looked at DWC2/USB/SD instead).
+      // Repeated eviction-while-still-busy-polling is indistinguishable
+      // from a genuine hang to the host's own ACK-timeout. This is NOT
+      // a case for reintroducing task_sleep_ticks (that IS the real,
+      // measured per-round-trip latency cost task #355 eliminated) --
+      // task_f genuinely IS making forward progress every iteration
+      // here (either draining+writing real bytes, or correctly
+      // detecting true staleness via the existing 20-tick/10s
+      // inactivity check below), so self-attesting that progress
+      // directly to the SAME table task_sleep_ticks would have
+      // stamped is the correct fix, not a watchdog workaround: a
+      // raw table write, no context switch, every single iteration of
+      // this already-tight loop. Index 5 == task_f, matching task_
+      // heartbeat_init's own hardcoded indices (kernel_main.vani).
+      let _ = task_heartbeat_last_tick_table_set_at(5 as u32, scheduler_get_tick_count());
       let batch: mut ref i64 = kernelupload_stream_batch_buf_get();
-      let popped: i64 = kernelupload_rx_ring_pop_batch(batch, 32);
+      // 2026-10-23: was 32 (kernelupload_stream_batch_buf's own OLD
+      // size, see that buffer's header comment in boot/kernelupload_
+      // state.S for the real-HW find this closes) -- grown to 512
+      // (KERNELUPLOAD_ACK_INTERVAL_BYTES, one SD block) so one pass
+      // through this loop can drain a WHOLE ack-window's worth in one
+      // dhruva_prio_lock(2)/unlock(3) pair, not up to sixteen.
+      let popped: i64 = kernelupload_rx_ring_pop_batch(batch, 512);
       if popped == 0 {
         // TASK #355 follow-up (real-HW find, 2026-10-15): no new
         // bytes this iteration -- check whether the stream has gone
@@ -35288,6 +36930,42 @@ fn task_f() -> i64 {
           // as popped==0 already implies, but worth the direct
           // confirmation given how much hinges on this one diagnosis).
           let diag_fr: u32 = mmio_read_u32(UART_FR);
+          // 2026-10-23 ROOT-CAUSE FIX (the residual stall remaining
+          // after the UART_ICR/OEIC fix above, same byte-stuck-with-
+          // no-interrupt-pending race the clear-before-drain reorder
+          // (task #355/#356) already reduced but, live-confirmed this
+          // round, does not fully eliminate): if the FIFO shows non-
+          // empty right here, the byte is genuinely sitting there
+          // with no interrupt ever coming to retrieve it (by
+          // definition -- we only reach this code because NOTHING
+          // has been popped for 20 ticks). Rather than declare the
+          // stream dead with real, unread data still physically
+          // present, read it DIRECTLY (task context, bypassing the
+          // interrupt mechanism entirely -- the same real recovery
+          // this exact investigation already uses for `rxdiag`'s own
+          // task-context reliability over the lossy IRQ-context print
+          // path) and feed it into the ring. Bounded at 16 (the real
+          // PL011 FIFO depth -- can never legitimately hold more).
+          // If this recovers ANY bytes, the stream is NOT actually
+          // dead -- skip the abort below entirely and let task_f's
+          // own next loop iteration pick them up via pop_batch,
+          // exactly as if they'd arrived via a normal interrupt.
+          let recovered: i64 = 0;
+          for fdi from 0 to 16 {
+            if (mmio_read_u32(UART_FR) & (0x10 as u32)) == (0 as u32) {
+              let fd_c: u32 = mmio_read_u32(UART_DR) & (0xFF as u32);
+              let _ = kernelupload_rx_ring_push(fd_c);
+              let _ = kernelupload_last_rx_byte_us_set(mmio_read_u32(TIMER_CLO));
+              recovered = recovered + 1;
+            }
+          }
+          if recovered > 0 {
+            let _ = kernelupload_stream_last_activity_tick_set(scheduler_get_tick_count());
+            let _ = maintenance_mode_engage();
+            let _ = uart_puts("\nkernelupload: force-drained ");
+            let _ = uart_put_i64(recovered);
+            let _ = uart_puts(" byte(s) stuck in the FIFO with no pending interrupt -- stream continues\n");
+          } else {
           let diag_imsc: u32 = mmio_read_u32(UART_IMSC);
           let diag_ris: u32 = mmio_read_u32(UART_RIS);
           let diag_head: u32 = kernelupload_rx_ring_head_get();
@@ -35341,11 +37019,14 @@ fn task_f() -> i64 {
           let _ = uart_puts("\n");
           let _ = kernelupload_stream_active_set(0 as u32);
           let _ = kernelupload_active_set(0 as u32);
+          let _ = maintenance_mode_disengage();
           let _ = uart_puts("\nkernelupload: stream aborted -- no data received for 10s (host connection lost?)\n");
+          }
         }
       }
       if popped > 0 {
         let _ = kernelupload_stream_last_activity_tick_set(scheduler_get_tick_count());
+        let _ = maintenance_mode_engage();
         let total_before: i64 = kernelupload_total_len_get() as i64;
         let expected: i64 = kernelupload_stream_expected_len_get() as i64;
         let remaining: i64 = expected - total_before;
@@ -35405,16 +37086,18 @@ fn task_f() -> i64 {
         if sd_write_failed == 1 {
           let _ = kernelupload_stream_active_set(0 as u32);
           let _ = kernelupload_active_set(0 as u32);
+          let _ = maintenance_mode_disengage();
           let _ = uart_puts("\nkernelupload: SD write failed during stream, aborted\n");
         }
         if kernelupload_stream_active_get() == (1 as u32) {
           let total_now: u32 = kernelupload_total_len_get();
           if (total_now as i64) >= expected {
             let _ = kernelupload_stream_active_set(0 as u32);
+            let _ = maintenance_mode_disengage();
             let _ = kernelupload_stream_report_done(total_now);
           } else {
             let last_ack: u32 = kernelupload_stream_last_ack_len_get();
-            if (total_now - last_ack) >= (65536 as u32) {
+            if (total_now - last_ack) >= KERNELUPLOAD_ACK_INTERVAL_BYTES {
               let _ = kernelupload_stream_last_ack_len_set(total_now);
               let _ = kernelupload_stream_report_ack(total_now);
             }
@@ -43422,6 +45105,17 @@ fn tls_client_try_process_flight(my_mac: mut ref i64, client_id: u32, server_id:
 // this section's own header comment for why this replaces separate
 // independently-blocking client/server implementations.
 fn tls_service(my_mac: mut ref i64) -> i64 {
+  // 2026-10-23: DWC2_MUTEX_ID (see that constant's own header comment)
+  // -- same reasoning as tcp_conn_poll's own matching comment just
+  // above: this function is the shared poll step behind tlsecho/
+  // httpecho (via tls_connect/tls_accept), touches DWC2 on both the
+  // receive (netif_recv_frame below) and send (tls_server_process_
+  // client_hello/tls_client_try_process_flight's own handshake replies,
+  // ultimately tls_send_over_tcp -> netif_send_frame) sides, and used
+  // to rely entirely on the now-unreliable outer ceiling=2 wrap. Single
+  // return point (the bottom of this function) makes wrapping the
+  // whole body straightforward -- no early-return paths to miss.
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   let client_id: u32 = 0 as u32;
   let server_id: u32 = 1 as u32;
 
@@ -43502,6 +45196,7 @@ fn tls_service(my_mac: mut ref i64) -> i64 {
     }
   }
 
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
   return 0;
 }
 
@@ -43532,7 +45227,20 @@ fn tls_connect(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
   let ch_len: i64 = tls_build_client_hello_heap(client_random, client_pub, ch);
   let ch_record: mut ref i64 = tls_ch_record_get();
   let ch_record_len: i64 = tls_wrap_plaintext_record(ch, ch_len, ch_record);
+  // 2026-10-23: DWC2_MUTEX_ID (see that constant's own header
+  // comment) -- this specific call, UNLIKE every other tls_send_
+  // over_tcp call site in this file, runs OUTSIDE tls_service's own
+  // mutex-protected body (it's the initial ClientHello, sent before
+  // the polling loop below even starts) -- wrapped here instead of
+  // inside tls_send_chunk_and_pump itself, since that function is
+  // ALSO reached from tls_server_process_client_hello/tls_client_
+  // try_process_flight, both called FROM WITHIN tls_service's own
+  // already-locked section -- locking there too would be a genuine
+  // nested-same-mutex self-deadlock (dhruva_mutex_lock has no
+  // recursion support, by design -- see its own header comment).
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   let _ = tls_send_over_tcp(client_id, server_id, my_mac, ch_record, ch_record_len, tls_server_rx_buf_get(), tls_server_rx_len_get());
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
   let _ = buf_write_u32(tls_client_phase_get(), 0 as u32, 1 as u32);
 
   let iter: i64 = 0;
@@ -44357,20 +46065,32 @@ fn ssh_test_phase4_channel(client_id: u32, server_id: u32, my_mac: mut ref i64) 
 // failed (see ssh_test_phase1_kexinit/phase2_kex/phase3_auth/
 // phase4_channel's own return-code sites).
 fn ssh_run_self_test(client_id: u32, server_id: u32, my_mac: mut ref i64) -> i64 {
+  // 2026-10-23: DWC2_MUTEX_ID (see that constant's own header comment)
+  // -- every ssh_test_phase* function below reaches ssh_deliver_one_
+  // frame (send+receive, SSH's own equivalent of tls_send_chunk_and_
+  // pump) directly, NOT through tcp_conn_poll -- this whole function
+  // was completely unprotected until this round, relying on an outer
+  // ceiling=2 wrap that stopped being reliable once other DWC2 work
+  // moved to this mutex. Safe to wrap the WHOLE function here (unlike
+  // ssh_shell_test_cmd, this function's own callee tree never calls
+  // tcp_conn_poll, which already takes this same mutex internally --
+  // wrapping both would nest and self-deadlock).
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   let r1: i64 = ssh_test_phase1_kexinit(client_id, server_id, my_mac);
-  if r1 != 0 { return r1; }
+  if r1 != 0 { let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID); return r1; }
   let r2a: i64 = ssh_test_phase2a_ecdh_and_reply(client_id, server_id, my_mac);
-  if r2a != 0 { return r2a; }
+  if r2a != 0 { let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID); return r2a; }
   let r2b: i64 = ssh_test_phase2b_verify_and_newkeys(client_id, server_id, my_mac);
-  if r2b != 0 { return r2b; }
+  if r2b != 0 { let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID); return r2b; }
   let r3a: i64 = ssh_test_phase3a_service_and_query(client_id, server_id, my_mac);
-  if r3a != 0 { return r3a; }
+  if r3a != 0 { let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID); return r3a; }
   let r3b: i64 = ssh_test_phase3b_signed_auth(client_id, server_id, my_mac);
-  if r3b != 0 { return r3b; }
+  if r3b != 0 { let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID); return r3b; }
   let r3c: i64 = ssh_test_phase3c_verify_and_result(client_id, server_id, my_mac);
-  if r3c != 0 { return r3c; }
+  if r3c != 0 { let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID); return r3c; }
   let r4: i64 = ssh_test_phase4_channel(client_id, server_id, my_mac);
-  if r4 != 0 { return r4; }
+  if r4 != 0 { let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID); return r4; }
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
   return 0;
 }
 
@@ -44389,7 +46109,14 @@ fn ssh_shell_test_cmd() -> i64 {
 
   let _ = tcp_conn_passive_open(server_id, loop_ip, server_port);
   let isn: u32 = scheduler_get_tick_count() + (3000 as u32);
+  // 2026-10-23: DWC2_MUTEX_ID -- the initial SYN send, same gap class
+  // as tls_connect's own initial ClientHello send (that constant's
+  // own header comment). tcp_conn_active_open is ALSO called from a
+  // boot-time self-test (tcp_conn_self_test), so the mutex is wrapped
+  // HERE, at this live call site, not inside that shared function.
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   let open_status: i64 = tcp_conn_active_open(client_id, my_mac, my_mac, loop_ip, loop_ip, client_port, server_port, isn);
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
   if open_status != 0 {
     let _ = uart_puts("sshtest: SYN send failed\n");
     return 0;
@@ -44462,9 +46189,9 @@ fn ssh_shell_test_cmd() -> i64 {
 // dwc2_reset_chan0_for_new_transfer(), applied to every dwc2_*_in/out
 // polling function project-wide. (2) task_e's dhcp_client_poll and
 // this loop both drive the same shared hardware channel 0 with no
-// mutual exclusion -- the dhruva_prio_lock(2)/unlock(3) pair here
-// (and around dhcp_client_poll's own call site, same ceiling=2/base=3
-// convention as the DharaFS lock) closes that real hazard. Neither
+// mutual exclusion -- DWC2_MUTEX_ID (see that constant's own header
+// comment for why this moved off the DharaFS ceiling in a later
+// round) closes that real hazard. Neither
 // fix, individually or together, changed the end symptom: confirmed
 // via a QEMU hardware-level trace (-d trace:usb_dwc2_*) that channel 0
 // now correctly re-arms and gets a FRESH, genuine NAK on every single
@@ -44485,9 +46212,9 @@ fn ssh_real_accept(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i
   let iter: i64 = 0;
   while (iter < 200) && (tcp_conn_get_state(conn_id) != tcp_state_established()) {
     let frame: mut ref i64 = ssh_frame_scratch_get();
-    let _ = dhruva_prio_lock(2);
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let flen: i64 = netif_recv_frame(frame, 1514);
-    let _ = dhruva_prio_unlock(3);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     if flen > 0 {
       let is_relevant: i64 = 0;
       if buf_read_u16_be(frame, 12) == (0x0800 as u32) {
@@ -44520,9 +46247,9 @@ fn ssh_real_accept(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i
 
 fn ssh_real_deliver_one_frame(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, out_payload: mut ref i64, max_len: i64) -> i64 {
   let frame: mut ref i64 = ssh_frame_scratch_get();
-  let _ = dhruva_prio_lock(2);
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   let flen: i64 = netif_recv_frame(frame, 1514);
-  let _ = dhruva_prio_unlock(3);
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
   if flen <= 0 {
     return 0 - 1;
   }
@@ -45003,6 +46730,19 @@ fn ssh_real_server_session(conn_id: u32, my_mac: mut ref i64) -> i64 {
 }
 
 fn ssh_real_server_cmd() -> i64 {
+  // 2026-10-23 (same fix as `ping`'s own entry-point comment, DWC2_
+  // MUTEX_ID's own header): drop shell_dispatch's OUTER dhruva_prio_
+  // lock(2) wrap immediately on entry -- sshd's own netif_recv_frame
+  // call sites below are being moved to a mutex specifically so they
+  // never block an unrelated kernelupload SD write, which only works
+  // if they're not ALSO nested inside the DharaFS ceiling the whole
+  // time. Safe for the same reason it was safe for ping: nothing in
+  // ssh_real_server_session's own call tree touches real DharaFS
+  // file-system state (dharafs_user_set, the one DharaFS-prefixed
+  // call anywhere in this whole function family, is simple UID/GID
+  // bookkeeping, not a file operation) -- verified by direct grep
+  // before relying on it, not assumed.
+  let _ = dhruva_prio_unlock(3);
   let my_mac: mut ref i64 = shell_my_mac_scratch_get();
   let _ = netif_get_mac(my_mac);
   let conn_id: u32 = 1 as u32;
@@ -45012,9 +46752,9 @@ fn ssh_real_server_cmd() -> i64 {
   let close_iter: i64 = 0;
   while (close_iter < 50) && (tcp_conn_get_state(conn_id) != tcp_state_closed_final()) {
     let frame: mut ref i64 = ssh_frame_scratch_get();
-    let _ = dhruva_prio_lock(2);
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
     let flen: i64 = netif_recv_frame(frame, 1514);
-    let _ = dhruva_prio_unlock(3);
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     if flen > 0 {
       let discard: mut ref i64 = ssh_recv_chunk_scratch_get();
       let _ = tcp_conn_handle_segment(conn_id, frame, flen, my_mac, ssh_dst_mac_get(), discard, 64);

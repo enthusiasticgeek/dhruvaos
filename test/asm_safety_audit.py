@@ -56,11 +56,53 @@ def regs_in(line: str):
     it. Kept as a free function so there is exactly one place this can
     go wrong again."""
     return [m.group(0) for m in REG_RE.finditer(line)]
-PUSH_RE = re.compile(r"^\s*push\s*\{([^}]*)\}")
-POP_RE = re.compile(r"^\s*pop\s*\{([^}]*)\}")
+PUSH_RE = re.compile(r"^\s*(?:push\s*\{([^}]*)\}|stmdb\s+sp!\s*,\s*\{([^}]*)\})")
+POP_RE = re.compile(r"^\s*(?:pop\s*\{([^}]*)\}|ldmia\s+sp!\s*,\s*\{([^}]*)\})")
 BL_RE = re.compile(r"^\s*bl\s+([A-Za-z_][A-Za-z0-9_]*)")
 LABEL_RE = re.compile(r"^([A-Za-z_.][A-Za-z0-9_.]*):\s*$")
 GLOBAL_RE = re.compile(r"^\s*\.global\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def push_pop_reglist(m):
+    """2026-10-23 audit fix: PUSH_RE/POP_RE now match TWO mnemonic
+    forms each (push/stmdb-sp! and pop/ldmia-sp! respectively) --
+    `stmdb sp!, {...}`/`ldmia sp!, {...}` is ARM's other, equally
+    common full-descending-stack idiom for exactly the same save/
+    restore role as the push/pop pseudo-instructions, used throughout
+    this codebase's own mailbox-protocol functions and others, but
+    NEVER recognized by either regex before this fix -- every one of
+    those functions was silently invisible to scan_stack_balance AND
+    (once added, same round) scan_unsaved_callee_saved_clobber, both
+    of which only skip a function when there is NOTHING to check,
+    which is exactly the wrong failure mode for a safety tool. Each
+    regex now has two alternate capture groups (one per mnemonic
+    form); exactly one is ever populated per match. This helper picks
+    whichever one matched."""
+    return m.group(1) if m.group(1) is not None else m.group(2)
+
+
+def expand_reglist(raw: str):
+    """Expand a push/pop/stmdb/ldmia register-list string into the
+    individual register names it covers, including ARM's own range
+    shorthand (`r4-r8` means r4,r5,r6,r7,r8) -- 2026-10-23 audit fix,
+    added alongside the stmdb/ldmia recognition above: several real
+    reglists in this codebase use range notation (e.g. `{r4-r8, lr}`),
+    which a naive comma-split would treat as one opaque token instead
+    of the 5 individual registers it actually covers, defeating any
+    later per-register membership check (exactly what scan_unsaved_
+    callee_saved_clobber needs to get right)."""
+    regs = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        rng = re.match(r"^r(\d+)\s*-\s*r(\d+)$", tok)
+        if rng:
+            lo, hi = int(rng.group(1)), int(rng.group(2))
+            regs.extend(f"r{n}" for n in range(lo, hi + 1))
+        else:
+            regs.append(tok)
+    return frozenset(regs)
 
 # Functions whose full register-clobber contract is directly known (read
 # from their own source, not guessed) -- extend this table deliberately,
@@ -69,6 +111,9 @@ GLOBAL_RE = re.compile(r"^\s*\.global\s+([A-Za-z_][A-Za-z0-9_]*)")
 # unpredictable values) on return.
 KNOWN_CLOBBERERS = {
     "mem_barrier": {"r0", "r1"},
+    "mem_barrier_dmb": {"r0", "r1"},  # 2026-10-23, same r0/r1-only
+    # contract as mem_barrier -- verified by reading its own
+    # definition (boot/context_switch.S), not guessed.
 }
 
 # Per-mnemonic operand read/write roles. This replaced a first attempt
@@ -115,8 +160,9 @@ def instr_reads_register(line: str, reg: str) -> bool:
     operand_text_no_brackets = re.sub(r"\[[^\]]*\]", "", operand_text)
     operands = [o.strip() for o in operand_text_no_brackets.split(",") if o.strip()]
 
-    if PUSH_RE.match(stripped):
-        return reg in [r.strip() for r in PUSH_RE.match(stripped).group(1).split(",")]
+    pushm = PUSH_RE.match(stripped)
+    if pushm:
+        return reg in expand_reglist(push_pop_reglist(pushm))
     if POP_RE.match(stripped):
         return False  # pop only WRITES registers
 
@@ -199,6 +245,35 @@ def get_function_blocks(lines):
     return blocks
 
 
+def get_function_body_lines(lines, name, start, end):
+    """Shared function-extent walker, factored out of scan_stack_balance
+    (2026-10-23, same audit round that found this tool's own
+    KNOWN_CLOBBERERS/stack-balance coverage gap for brand-new hand-
+    written functions) so scan_unsaved_callee_saved_clobber below can
+    reuse the exact same, carefully-reasoned scope instead of a cruder
+    .global-to-next-.global span. See scan_stack_balance's own
+    (unchanged) header comment for the full "why" of this exact
+    scoping rule."""
+    idx = start
+    included = []
+    while idx < end:
+        included.append(idx)
+        stripped = lines[idx].strip()
+        if stripped == "bx lr" or re.match(r"^mov\s+pc\s*,\s*lr$", stripped):
+            idx += 1
+            j = idx
+            while j < end and not lines[j].strip():
+                j += 1
+            if j < end:
+                lm = LABEL_RE.match(lines[j].strip())
+                if lm and lm.group(1).startswith(name + "_"):
+                    idx = j
+                    continue
+            break
+        idx += 1
+    return included
+
+
 def scan_stack_balance(lines, fname):
     """Push/pop balance, scoped to a function's OWN extent -- caught by
     this tool's own self-test: the naive .global-to-next-.global span
@@ -222,32 +297,14 @@ def scan_stack_balance(lines, fname):
     for name, start, end in get_function_blocks(lines):
         pushes = []
         pops = []
-        idx = start
-        included = []
-        while idx < end:
-            included.append(idx)
-            stripped = lines[idx].strip()
-            if stripped == "bx lr" or re.match(r"^mov\s+pc\s*,\s*lr$", stripped):
-                idx += 1
-                j = idx
-                while j < end and not lines[j].strip():
-                    j += 1
-                if j < end:
-                    lm = LABEL_RE.match(lines[j].strip())
-                    if lm and lm.group(1).startswith(name + "_"):
-                        idx = j
-                        continue
-                break
-            idx += 1
+        included = get_function_body_lines(lines, name, start, end)
         for i in included:
             pm = PUSH_RE.match(lines[i])
             if pm:
-                regs = frozenset(x.strip() for x in pm.group(1).split(","))
-                pushes.append((i + 1, regs))
+                pushes.append((i + 1, expand_reglist(push_pop_reglist(pm))))
             pom = POP_RE.match(lines[i])
             if pom:
-                regs = frozenset(x.strip() for x in pom.group(1).split(","))
-                pops.append((i + 1, regs))
+                pops.append((i + 1, expand_reglist(push_pop_reglist(pom))))
         if not pushes and not pops:
             continue
         push_regsets = {r for _, r in pushes}
@@ -269,6 +326,92 @@ def scan_stack_balance(lines, fname):
     return findings
 
 
+CALLEE_SAVED_REGS = ("r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11")
+
+
+def instr_writes_register(line: str, reg: str) -> bool:
+    """Does this instruction WRITE a fresh value into `reg` (as its
+    destination)? Built for scan_unsaved_callee_saved_clobber below --
+    deliberately the OPPOSITE conservative bias from instr_reads_
+    register: that function defaults unclassified mnemonics to "yes,
+    treat as a read" (a false negative there hides a real bug);
+    defaulting unclassified mnemonics to "yes, this writes it" HERE
+    would instead flood the REVIEW list with noise on every harmless
+    `cmp`/`tst`/`bl`/`b` line that never touches r4-r11 as a
+    destination at all, drowning out the real findings -- so this one
+    defaults to NO for anything not an explicitly recognized
+    destination-writing mnemonic."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("/*", "*", "//", ".")):
+        return False
+    pom = POP_RE.match(stripped)
+    if pom:
+        return reg in expand_reglist(push_pop_reglist(pom))
+    parts = stripped.split(None, 1)
+    if not parts:
+        return False
+    mnemonic = parts[0]
+    base_mnemonic = mnemonic.rstrip("s")
+    operand_text = parts[1] if len(parts) > 1 else ""
+    operand_text_no_brackets = re.sub(r"\[[^\]]*\]", "", operand_text)
+    operands = [o.strip() for o in operand_text_no_brackets.split(",") if o.strip()]
+    if not operands:
+        return False
+    if (mnemonic in WRITE_FIRST_ONLY_MNEMONICS or base_mnemonic in WRITE_FIRST_ONLY_MNEMONICS
+            or mnemonic in WRITE_FIRST_THEN_READ_MNEMONICS or base_mnemonic in WRITE_FIRST_THEN_READ_MNEMONICS):
+        return operands[0] == reg
+    if mnemonic in ("ldmia", "ldmdb", "ldm", "ldmfd"):
+        m = re.search(r"\{([^}]*)\}", stripped)
+        if m:
+            return reg in [r.strip() for r in m.group(1).split(",")]
+    return False
+
+
+def scan_unsaved_callee_saved_clobber(lines, fname):
+    """2026-10-23 audit fix: the exact gap scan_stack_balance's own
+    `if not pushes and not pops: continue` line leaves open -- a
+    function with ZERO push/pop ANYWHERE gets no stack-balance finding
+    at all, regardless of what it does to r4-r11, because there is
+    nothing for that check to compare against. This project has hit
+    exactly this shape of AAPCS violation (hand-written asm clobbers a
+    callee-saved register a vani/LLVM-compiled caller keeps a live
+    value in, with no save/restore) at least three times (round 53:
+    dhruva_prio_lock; round 72: fw_add_rule; round 75: scheduler_pick_
+    next) -- all three were functions that DID push/pop something,
+    just not the SPECIFIC register that turned out to be live; this
+    check targets the narrower but equally real sibling: a brand-new
+    function with NO save/restore convention at all. mem_barrier/
+    mem_barrier_dmb are the deliberate, correct, already-verified
+    exception -- they use ONLY r0/r1 (caller-saved under AAPCS, safe
+    to clobber with no save) -- so only r4-r11 are checked here."""
+    findings = []
+    for name, start, end in get_function_blocks(lines):
+        included = get_function_body_lines(lines, name, start, end)
+        if any(PUSH_RE.match(lines[i]) or POP_RE.match(lines[i]) for i in included):
+            continue  # scan_stack_balance already covers this function
+        reported = set()
+        for i in included:
+            for reg in CALLEE_SAVED_REGS:
+                if reg in reported:
+                    continue
+                if instr_writes_register(lines[i], reg):
+                    reported.add(reg)
+                    findings.append({
+                        "file": fname,
+                        "line": i + 1,
+                        "confidence": "REVIEW",
+                        "summary": (
+                            f"function '{name}' writes callee-saved {reg} with NO "
+                            f"push/pop anywhere in the function -- verify this is an "
+                            f"intentional, documented scratch-register convention "
+                            f"(like mem_barrier's own r0/r1-only contract) or add the "
+                            f"missing save/restore (AAPCS requires r4-r11 to survive "
+                            f"a call unless the caller is proven not to rely on it)"
+                        ),
+                    })
+    return findings
+
+
 def compute_stack_cost_bytes(lines, fname_hint=None):
     """Real byte cost of the FIRST push{...} seen (matching this
     project's own established convention: declared cost = the pushed
@@ -285,8 +428,13 @@ def compute_stack_cost_bytes(lines, fname_hint=None):
         stripped = raw.strip()
         pm = PUSH_RE.match(raw)
         if pm:
-            regs = [x.strip() for x in pm.group(1).split(",") if x.strip()]
-            return len(regs) * 4
+            # 2026-10-23 audit fix: expand_reglist (not a bare comma
+            # split) so a range-notation push like `{r4-r8, lr}`
+            # correctly counts as 6 registers (24 bytes), not 2 (the
+            # literal "r4-r8"/"lr" token count) -- the bare split was
+            # silently undercounting every such push's real stack
+            # cost before this fix.
+            return len(expand_reglist(push_pop_reglist(pm))) * 4
         if stripped == "bx lr" or re.match(r"^mov\s+pc\s*,\s*lr$", stripped):
             return 0
     return 0
@@ -361,6 +509,7 @@ def main():
         rel = os.path.relpath(fp, os.path.dirname(args.boot_dir))
         all_findings.extend(scan_clobber_after_call(lines, rel))
         all_findings.extend(scan_stack_balance(lines, rel))
+        all_findings.extend(scan_unsaved_callee_saved_clobber(lines, rel))
 
     if os.path.exists(args.vani):
         all_findings.extend(scan_stack_cost_mismatches(args.vani, boot_files_cache))

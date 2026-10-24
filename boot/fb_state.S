@@ -182,6 +182,16 @@ mpc_wait_write:
 mpc_write_ready:
     ldr r1, =0x2000B8A0                /* MAILBOX_WRITE */
     str r8, [r1]
+    /* 2026-10-23 audit (same class as the UART overrun-clear fix):
+     * this peripheral region is Shareable Device memory, not
+     * Strongly Ordered -- the write above has no guaranteed
+     * visibility before the poll of MAILBOX_STATUS (a DIFFERENT
+     * register) just below without an explicit barrier. The DMB at
+     * this function's own entry guards RAM-buffer visibility to the
+     * GPU, a different hazard -- this one specifically orders this
+     * write against the read that follows it. */
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5         /* DMB */
 
     mov r0, #0
 mpc_wait_read:

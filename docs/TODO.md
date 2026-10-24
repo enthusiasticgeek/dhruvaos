@@ -14528,3 +14528,152 @@ revert is ever required.
 separate, manual `kernelslot activate b`). Source tree's own `UART_DMA_ADOPT_FOR_REAL_HARDWARE` stays
 committed as `0` per this project's real-HW-only-flag convention; only the already-built, already-flashed
 artifact carries `1`.
+
+### Task #357 follow-up: real-HW `kernelupload stream` hang, ROOT-CAUSED + Phase 1 fixed (2026-10-23)
+
+Real-HW-only bug, never reproducible under QEMU (`phase4_milestone.py`'s own SD drive is too fast/
+deterministic to expose it) -- a full, continuous, unpaced 3MB `kernelupload stream` reliably stalled
+partway through and, in the worst case, ran long enough to trip the 15s hardware watchdog into a full
+PM_RSTC reset (confirmed via the GPU firmware's own "Raspberry Pi Bootcode"/`config.txt` boot messages
+re-appearing on the wire -- only a genuine hardware reset re-runs those, a software fault/reboot wouldn't).
+Three genuinely separate bugs were found and fixed along the way, each confirmed via live register-level
+evidence, not guessed:
+
+1. **RX ring never reset at stream start.** `kernelupload_rx_ring_head`/`_tail` were only ever written from
+   the ring's own push/pop implementations, never reset when a NEW `kernelupload stream` command started --
+   a previously-aborted attempt's stale, unconsumed bytes got replayed into the next attempt's own byte
+   accounting from byte 0, confirmed via a byte-exact capture showing a stale echoed `ready` + "unknown
+   command" response interleaved into a fresh 1-byte test stream's own `DONE 00000001`. This was the
+   original, intermittent-looking failure mode -- never a timing/pacing issue, which an earlier (wrong)
+   theory assumed. Fixed by resetting both pointers right before `kernelupload_stream_active_set(1)`.
+
+2. **Root cause of the hang itself: unbounded background-task critical sections contending for the same
+   priority-ceiling lock kernelupload's own writes need.** `task_e` (GC/DharaFS-compaction + DHCP/USB-
+   hotplug maintenance, wakes every 20 ticks) and `task_fsq` (fsqueue dispatcher, wakes every 5 ticks) both
+   take `dhruva_prio_lock(2)` -- the SAME ceiling `kernelupload`'s own per-block writes (via `task_f`) need
+   for DharaFS mutual exclusion -- and hold it across an entire unbounded pass: `dhcp_client_poll` alone is
+   measured up to 325620us (~325ms) worst case with no DHCP server responding (exactly this test
+   environment's own live condition -- `DHCP: client_start status=FFFFFFFF` repeating throughout every real-
+   HW boot log), and `dharafs_compact`'s own data-dependent log walk has no upper bound at all. Live-captured
+   via a new independent, `task_f`-agnostic FIQ-level stall detector (runs from `timer_tick_dispatch`, so it
+   keeps working even if `task_f` itself stops making progress -- the existing 10s-inactivity check lives
+   INSIDE `task_f`'s own loop and is useless for a hang `task_f` falls into mid-batch): one stall snapshot
+   showed `current_task=4` (`task_e`) genuinely holding `ceiling_depth=1`/`eff_prio=2` for 5+ continuous
+   seconds while `task_f` sat starved. **Fixed (Phase 1, shipped this round):** a new, protocol-agnostic
+   `maintenance_mode_active` flag (`boot/kernelupload_state.S`) -- modeled on the real precedent both Zephyr
+   (`k_work` deferring long operations out of latency-critical context) and Linux (a scheduling-class/
+   bandwidth-reservation idea, e.g. `SCHED_DEADLINE`'s "this class gets guaranteed precedence") use for
+   exactly this problem. `task_e`/`task_fsq` now skip their entire per-wake body while it's engaged;
+   `kernelupload`'s own stream start/progress/end AND `wifikey`'s `chunk`/`commit`/`abort` all engage/
+   disengage it (not just `kernelupload` -- `sshkey` is a single-line command, not a bulk transfer, so it
+   was never exposed). A generous 60-tick (30s) staleness auto-clear guards against an abandoned transfer
+   (host crashed mid-upload, never reached its own commit/abort) permanently wedging background maintenance
+   off. Verified on real HW: before the fix, a continuous unpaced 3MB transfer stalled after ~2 ACKs
+   (~131KB); after Phase 1, the same transfer reached 18 ACKs (~1.19MB, a 9x improvement) before a *different*,
+   not-yet-understood stall (see below) -- and critically, the existing 10s-inactivity path now recovers
+   gracefully on its own instead of needing a hard watchdog reset.
+
+3. **Separate, still-open finding: a later-stage stall with a different signature.** After Phase 1, the
+   same test run stalled again around ~1.19MB with `current_task=5` (`task_f` itself, not idle/`task_e`),
+   `ceiling_depth=0`/`eff_prio=3` (unboosted -- not blocked by anyone), and the RX ring genuinely empty
+   (`ring_head==ring_tail`) at the moment of the 10s-inactivity abort. The system was otherwise healthy
+   (IRQ count and context-switch count both still climbing normally) -- this does NOT look like the same
+   scheduler-contention bug; it looks like the board simply stopped receiving new bytes over the wire for
+   10+ seconds during a very long (~260s), fully continuous, unpaced transfer, which is consistent with a
+   USB-to-serial-adapter or host-side buffering limitation under sustained load rather than a DhruvaOS bug.
+   Not yet investigated -- next step would be checking host-side `dmesg`/USB error counters during a repro,
+   and/or testing whether a small forced pause every N megabytes (host-side, orthogonal to the maintenance-
+   mode fix) avoids it, before assuming it's software-side at all.
+
+**Phase 2, deliberately scoped OUT of this round (user-requested, grounded in Zephyr/Linux precedent --
+see this round's own session writeup for the "why" of the phasing):** the flag above is the SECONDARY
+defense in both reference OSes' own design, not the primary one. The real structural fix is making
+`task_e`'s two critical sections genuinely BOUNDED, the way Linux's `cond_resched()` convention (do a
+bounded unit of work, drop the lock, let the scheduler run anything that needs in, resume from an explicit
+cursor next pass) and NAPI (process a bounded packet budget, yield, resume) both do for exactly this class
+of "background work with no natural stopping point" problem:
+
+- `dharafs_compact`: give it a persisted resume cursor (which log record it last processed) instead of
+  walking the entire log in one lock-held pass; process a small, bounded batch per wake, release the lock,
+  pick the cursor back up next time. Needs real care: must not break compact's own correctness invariants
+  (a compact pass currently assumes it sees a consistent view of the log from start to finish) -- this is
+  genuine design work, not a mechanical chunking exercise.
+- `dhcp_client_poll`/`usb_hotplug_poll`: similarly bound each poll call's own worst case rather than
+  accepting whatever `dwc2_wait_chan0_done` happens to take that call.
+- `task_f`'s own kernelupload consumption should also move away from busy-polling the ring at full priority
+  toward an event/budget-driven model (Zephyr's UART async API -- DMA/interrupt fills a buffer, a completion
+  callback wakes the consumer thread on a MEANINGFUL event, not a tight spin loop) -- this independently
+  reduces how aggressively kernelupload itself competes for the scheduler, regardless of what `task_e` does.
+
+Done right, (2) makes the maintenance-mode flag a true backstop (belt-and-suspenders) rather than the
+primary defense, matching how `rt_mutex`/priority inheritance is meant to be used in both reference OSes --
+bounding an ALREADY-short section, never a substitute for making it short in the first place. Not attempted
+this round given the real risk of touching `dharafs_compact`'s own correctness invariants without a
+dedicated design+test pass.
+
+### Task #357 follow-up: real-HW `kernelupload stream` hang, TRUE ROOT CAUSE FOUND + FIXED, full real-HW confirmation (2026-10-24)
+
+Continuation of the 2026-10-23 entry above. Two further rounds happened before the real fix was found:
+
+**Round A (DWC2/ceiling-vs-mutex decoupling, genuine fix for a genuine but DIFFERENT bug).** The priority-
+ceiling-renumbering plan considered first (give DWC2 its own ceiling level) was proven ineffective by
+scheduler-mechanics analysis before being implemented — boosting to ANY ceiling above a task's base priority
+blocks that task regardless of the specific numeric level, so renumbering alone can't decouple DWC2 work from
+DharaFS/SD work. Replaced with `dhruva_mutex_lock(DWC2_MUTEX_ID)` (priority-inheritance mutex, only blocks a
+task wanting the SAME resource) at every DWC2-touching call site project-wide: `task_e`'s
+`usb_hotplug_poll`/`dhcp_client_poll`, ping's DNS/ARP/ICMP phases, sshd's accept/deliver/server-cmd paths,
+`tcp_conn_poll` (shared by tcpecho/tcprtx/sshtest/mqttecho), `tls_service` (tlsecho/httpecho),
+`tcp_conn_active_open`'s 6 live call sites, `tls_connect`'s initial ClientHello send, `udpecho`, and
+`ssh_run_self_test`. Full QEMU regression (18/18) passed after this change. Real-HW re-test afterward showed
+the IDENTICAL stall at the IDENTICAL byte offset (28160/3021084) — this was a real, worthwhile architectural
+fix (removes genuine DharaFS/DWC2 coupling) but NOT the cause of this specific hang.
+
+**Round B (the real root cause, finally found via `diagnose`'s own counters).** `rxdiag` after the
+identical-looking stall showed `overrun_count=0 fifo_backlog_count=0 sd_write_worst_us=24657` — clean, no
+longer matching the SD-write-time/overrun profile Round A targeted. `diagnose` showed something NEW:
+`stuck-task episodes (.../SHELL/...)=4` and `WCET-enforcement evictions (.../SHELL/...)=4` — both always 0 in
+every earlier round of this entire investigation. Root cause: task #355's own busy-poll redesign for
+`kernelupload stream`'s drain branch in `task_f` (2026-10-12, see that entry above) deliberately never calls
+`task_sleep_ticks` for the ENTIRE duration of an active stream — but task #271's PRE-EXISTING per-thread
+execution-time supervisor (`scheduler_tick_handler`'s `task_heartbeat_last_tick_table` scan,
+`context_switch.S`, added 2026-09-20, well before task #355 existed) only ever gets re-stamped from inside
+`task_sleep_ticks`'s own blocking path. The two rounds were never cross-checked against each other: a
+long-running stream busy-polls this branch continuously, so after `task_f`'s declared 20-tick heartbeat bound
+elapses, the supervisor declares it "stuck" (not holding a ceiling or mutex at that instant, since the
+ceiling is only held briefly around each `kernelupload_accumulate_bytes` call) and forcibly evicts it via
+`sleep_until_table` for another 20 ticks. Repeated eviction while genuinely still busy-polling is
+indistinguishable from a real hang to the host's 5s ACK timeout — and explains the "FIQWD STALL total=0"
+print being cut off mid-character (the system-wide freeze window from a chain of back-to-back evictions, not
+a DWC2/SD issue at all).
+
+**Fix**: `task_f`'s stream-active branch now self-attests its own liveness directly, once per loop iteration
+(`task_heartbeat_last_tick_table_set_at(5, scheduler_get_tick_count())`, index 5 == `task_f`) — a raw table
+write, no context switch, costs nothing measurable. This is NOT a watchdog workaround: `task_f` genuinely IS
+making forward progress every iteration here (draining+writing real bytes, or correctly detecting true
+staleness via the existing 20-tick/10s inactivity check), so self-attesting that progress to the exact same
+table `task_sleep_ticks` would have stamped is the correct fix — reintroducing `task_sleep_ticks` itself would
+have undone task #355's own measured latency fix.
+
+**Audit of every other heartbeat-supervised task** (same class of bug: a loop running many ticks without
+either sleeping or holding a ceiling/mutex) found no other gap: `task_e` holds a ceiling or the DWC2 mutex for
+its entire GC/DHCP/hotplug work and otherwise sleeps 20 ticks/pass; `task_fsq` is bounded to 8 queue slots
+under ceiling=2 and sleeps 5 ticks/pass; `task_a`/`task_b` sleep every pass; `task_c` holds ceiling=0 for its
+whole body (its "stuck ceiling" branch is task #280's OWN deliberate fault-injection test of that exemption,
+not a bug); `task_d`/IDLE is intentionally excluded from heartbeat supervision; `task_custom_demo` and
+`task_mutex_demo_low/high`'s "stuck"/mutex-hold-across-sleep branches are deliberate fault-injection/
+priority-inheritance demos that exercise this very mechanism.
+
+**Real-HW confirmation, full baseline for future comparison**: uploaded the fixed kernel rebuild
+(`sha256=9d4fbb256fbe004732eb7e810bd2f7c43fe0d679c711fc11be943ec8eaae9f33`, 3021084 bytes as a flat image) to
+the board's inactive slot via the exact `kernelupload stream`/`commit` path that
+had failed 100% of the time at byte 28160 across every prior attempt this investigation. Result: **zero
+stalls across the full transfer**. Stream phase: 983.3s wall-clock for all 3,021,084 bytes (3072 bytes/sec
+effective, 512-byte ACK-paced windows, 115200 baud UART). Commit (full independent SD readback + re-hash of
+all 5901 blocks, both upload-time and readback SHA-256 checked against the host-supplied digest) completed
+within its 60s timeout, both checks passing. Total real-HW transfer-and-verify time: ~983s stream + commit,
+roughly 17 minutes end-to-end for a ~2.9 MB kernel image over UART at 115200 baud — this is the baseline
+figure for comparing any future transfer-speed work (e.g. a higher UART baud rate, or the resumable chunked-
+upload protocol's own per-chunk overhead) against.
+
+Full QEMU regression (18/18) and `schedulability_analysis.py` both re-confirmed clean after this fix, before
+the real-HW retest.

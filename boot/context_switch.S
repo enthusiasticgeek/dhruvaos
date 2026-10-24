@@ -2956,13 +2956,32 @@ dhruva_mutex_unlock_impl:
     ldr r4, =current_task
     ldr r4, [r4]                     /* r4 = current_task (outgoing owner) */
 
-    /* Restore the outgoing owner's own true priority unconditionally
-     * -- undoes any inheritance boost. No nested-mutex stacking (see
-     * dhruva_mutex_lock's own header comment). */
+    /* Restore the outgoing owner's own true priority -- undoes any
+     * inheritance boost. No nested-mutex stacking (see dhruva_mutex_
+     * lock's own header comment), but this write used to be
+     * UNCONDITIONAL regardless of whether this same task was ALSO
+     * mid-way through an active dhruva_prio_lock ceiling section --
+     * exactly the bug class dhruva_prio_unlock_impl's own 2026-10-17
+     * nesting fix closed for ITS sibling unconditional restore
+     * (ssh_real_accept/_deliver_one_frame/_server_cmd's inner lock
+     * nested inside shell_dispatch's outer one, silently defeating
+     * the outer lock's own mutual exclusion for however long
+     * remained). 2026-10-23 audit: this function never got the
+     * equivalent check. NOT currently exploitable -- no caller today
+     * holds a ceiling section across a dhruva_mutex_lock/_unlock call
+     * (only task_mutex_demo_low/_high ever call mutex_lock(0), and
+     * neither also calls dhruva_prio_lock) -- but hardening
+     * proactively rather than waiting for a second live incident of
+     * the exact same root cause. */
+    ldr r8, =ceiling_depth_table
+    ldr r9, [r8, r4, lsl #2]
+    cmp r9, #0
+    bne dmu_skip_base_restore
     ldr r5, =base_prio_table
     ldr r6, [r5, r4, lsl #2]
     ldr r5, =eff_prio_table
     str r6, [r5, r4, lsl #2]
+dmu_skip_base_restore:
 
     ldr r2, =mutex_waiters_table
     ldr r3, [r2, r0, lsl #2]
@@ -3175,6 +3194,31 @@ cpu_wfi:
 mem_barrier:
     mov r0, #0
     mcr p15, 0, r0, c7, c10, 4
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+/* void mem_barrier_dmb(void) -- 2026-10-23, real-HW overrun-clear
+ * investigation: mem_barrier() above is a DSB (opc2=4), which waits
+ * for ALL outstanding memory transactions system-wide to complete --
+ * correct but genuinely expensive, fine for the boot-time/low-
+ * frequency mailbox and DWC2 sites this same round also fixed, but
+ * placed in the UART RX IRQ handler's own per-overrun-detected path
+ * (which, under real sustained saturation, can be entered at a rate
+ * the physical byte-arrival rate alone can't explain -- live-captured
+ * evidence this same investigation), DSB's own wait-for-completion
+ * cost could plausibly be the difference between "barely keeping up"
+ * and "falling behind enough to cascade into more overruns". DMB
+ * (opc2=5) only ORDERS the write before any later access, without
+ * waiting for it to fully complete -- the actual guarantee this exact
+ * write-then-cross-register-read hazard needs, matching the SD
+ * driver's own already-established convention (sdhost_fill_loop's own
+ * DMB-after-SDEDM-read, boot/sdcard_state.S) for this identical
+ * problem class. */
+.global mem_barrier_dmb
+mem_barrier_dmb:
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5
     mov r0, #0
     mov r1, #0
     bx lr

@@ -1519,6 +1519,11 @@ sgcc_wait_write:
 sgcc_write_ready:
     ldr r1, =0x2000B8A0              /* MAILBOX_WRITE */
     str r8, [r1]
+    /* 2026-10-23 audit (same class as the UART overrun-clear fix):
+     * explicit barrier before polling MAILBOX_STATUS -- see
+     * boot/fb_state.S's own matching comment for the full "why". */
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5       /* DMB */
 
     mov r0, #0
 sgcc_wait_read:

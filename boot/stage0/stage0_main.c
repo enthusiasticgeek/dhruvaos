@@ -107,8 +107,18 @@ static void stage0_arm_watchdog(void) {
     unsigned int fifteen_seconds_in_ticks = 983040u; /* 15 << 16 */
     unsigned int cur;
     *wdog = password | (fifteen_seconds_in_ticks & 0xFFFFFu);
+    /* 2026-10-23 audit (same class as the UART overrun-clear fix in
+     * kernel_main.vani): `volatile` here only orders the compiler,
+     * not the hardware -- this peripheral region is Shareable
+     * Device memory, not Strongly Ordered. Negligible real risk
+     * (PM_WDOG/PM_RSTC are independent registers and the watchdog
+     * fires asynchronously seconds later regardless), added for
+     * consistency with every other MMIO write-then-cross-register-
+     * access site fixed this round. */
+    __asm__ volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
     cur = *rstc;
     *rstc = password | (cur & wrcfg_clr) | wrcfg_full_reset;
+    __asm__ volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
 }
 #endif
 
