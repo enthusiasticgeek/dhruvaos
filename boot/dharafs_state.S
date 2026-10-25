@@ -275,3 +275,50 @@ dharafs_commit_count_get:
 dharafs_checkpoint_buf_get:
     ldr r0, =dharafs_checkpoint_buf
     bx lr
+
+/* DharaFS Phase 2 (2026-10-25): persisted bad-block bitmap -- see
+ * dharafs_init's own header comment for the full "why" this replaces
+ * the old DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS tolerance
+ * entirely rather than just raising the number again (the number
+ * itself was proven live to be the actual bug: a real run of bad
+ * blocks reached exactly that tolerance and silently truncated
+ * everything written after it, including this same investigation's
+ * own WiFi firmware re-upload).
+ *
+ * 1024 bytes = 8192 bits -- covers block numbers 0..8191, comfortably
+ * past max_blk (7600) with margin to spare, one bit per block number
+ * (bit N of byte N/8, same convention as literally everything else in
+ * this codebase that packs flags into bytes). RAM-only across a
+ * boot's own recovery scan; dharafs_badblock_bitmap_dirty tracks
+ * whether anything changed since the last persist, so dharafs_init
+ * only writes the (up to two) backing SD blocks back once at the end
+ * of its own scan, not on every single newly-discovered bad block --
+ * same "don't pay a real SD write for every single classification"
+ * reasoning dharafs_dirindex's own upsert-on-success-only design
+ * already uses elsewhere in this file. */
+.section ".bss"
+.align 4
+dharafs_badblock_bitmap:
+    .space 1024
+dharafs_badblock_bitmap_dirty:
+    .word 0
+
+.section ".text"
+
+.global dharafs_badblock_bitmap_buf_get
+dharafs_badblock_bitmap_buf_get:
+    ldr r0, =dharafs_badblock_bitmap
+    bx lr
+
+.global dharafs_badblock_bitmap_dirty_get
+dharafs_badblock_bitmap_dirty_get:
+    ldr r0, =dharafs_badblock_bitmap_dirty
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_badblock_bitmap_dirty_set
+dharafs_badblock_bitmap_dirty_set:
+    ldr r1, =dharafs_badblock_bitmap_dirty
+    str r0, [r1]
+    mov r0, #0
+    bx lr

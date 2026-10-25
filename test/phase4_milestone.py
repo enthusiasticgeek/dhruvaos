@@ -26,6 +26,7 @@ this project's history produced a real false positive from exactly
 that message) -- anchoring each check to start searching only after
 the previous one matched is what actually rules that out.
 """
+import select
 import subprocess
 import sys
 import time
@@ -109,6 +110,52 @@ SETTLE_S = 14  # inter-command delay; a 6s value missed the final "eval"
                # same pre-existing noise band as mqttecho/ls/diagnose.
 
 
+# DharaFS Phase 2 regression (2026-10-25): this file's FIRST send() used
+# to be anchored to a fixed time.sleep(SETTLE_S) from PROCESS LAUNCH, not
+# to an observed "PASS" marker -- the exact blind-timing fragility this
+# file's own SETTLE_S comment history already documents repeatedly
+# recurring whenever boot gets measurably slower. DharaFS's new
+# persisted bad-block-bitmap recovery scan (kernel_main.vani's
+# dharafs_init) made that true again, badly: on a genuinely fresh SD
+# image -- which this function creates, from scratch, every single run
+# -- the bitmap starts empty, so recovery must real-SD-read all the way
+# to dharafs_log_max_blk() (7600 blocks) before concluding the device is
+# blank, measured live at ~33s to reach PASS (vs. well under 14s before).
+# With SETTLE_S=14, both the first ("write") and second ("cat") sends
+# landed in QEMU's stdin pipe/UART FIFO before boot had even reached
+# PASS, so both commands' keystrokes sat buffered until the shell's own
+# UART-RX path finally started draining them -- back-to-back, not 14
+# real seconds apart from the guest's perspective. "write" got consumed
+# first and its line stayed marked ready-but-not-yet-dispatched for just
+# long enough that "cat"'s own bytes (including its own trailing \r)
+# arrived while shell_rx_push_char's deliberate "drop new input rather
+# than corrupt a line the shell hasn't read yet" guard (boot/shell_
+# state.S) was still in effect -- silently discarding the entire "cat"
+# command, never buffered, never dispatched, no crash, no corruption.
+# Fixed at the root: wait for an actual observed PASS marker (same
+# event-driven approach test/wifikey_upload.py's own boot-ready wait
+# already uses) instead of a blind, boot-time-blind sleep, so this harness
+# stays correct regardless of how boot time changes in the future.
+BOOT_READY_TIMEOUT_S = 90
+
+
+def _wait_for_boot_ready(proc: "subprocess.Popen[bytes]", timeout_s: float) -> bytes:
+    buf = b""
+    deadline = time.time() + timeout_s
+    while b"PASS" not in buf:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not ready:
+            break
+        chunk = proc.stdout.read(1)
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
 def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     with open(sd_image_path, "wb") as f:
         f.truncate(64 * 1024 * 1024)
@@ -128,7 +175,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         proc.stdin.write((line + "\r").encode())
         proc.stdin.flush()
 
-    time.sleep(SETTLE_S)
+    boot_prefix = _wait_for_boot_ready(proc, BOOT_READY_TIMEOUT_S)
     send("write /milestone/note hello-dhruva")
     time.sleep(SETTLE_S)
     send("cat /milestone/note")
@@ -273,7 +320,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         proc.kill()
         out, _ = proc.communicate()
-    output = out.decode("utf-8", "replace")
+    output = (boot_prefix + out).decode("utf-8", "replace")
     # ROUND 2026-09-16: uart_putc now emits a real CR before every LF
     # (fixes a real "staircase" indentation bug on a live picocom
     # terminal -- invisible in any saved log, since ordinary text
