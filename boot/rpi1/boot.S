@@ -130,6 +130,69 @@ boot_entry:
      * stage-0-handoff contract this function already relies on). */
     ldr r1, =_boot_slot_index
     str r0, [r1]
+
+    /* 2026-10-25 follow-up (real-HW stage0-chain-load instant-crash
+     * investigation): moved the SVC-mode-force + vector-table-copy
+     * block (originally much further down, after RAW_DIAG_PUTC 'B'/
+     * SNAP_TIMER 0) up to here -- immediately after the slot-index
+     * stash, before anything else. This file's own 2026-09-13 comment
+     * (preserved below, now describing a risk this reorder closes
+     * further) already identified that a handoff via a plain branch
+     * from a still-running context -- exactly what stage-0's own
+     * entry()-call handoff is, task #308's whole premise -- cannot be
+     * trusted to arrive with a clean vector table, and fixed the IRQ/
+     * FIQ half of that risk (the CPSR mask bits). It did NOT close the
+     * SYNCHRONOUS half: a data abort, prefetch abort, or undefined
+     * instruction is not maskable by CPSR I/F at all, and until the
+     * vector table copy below actually runs, ANY such exception
+     * vectors through whatever table was already active -- for a
+     * stage-0 handoff specifically, that is stage-0's OWN table
+     * (boot/stage0/stage0_entry.S), whose synchronous-fault entries
+     * all point at stage0_fault(), a bare `for(;;){}` with no watchdog
+     * kick of its own. Live real-HW evidence motivating this: slot B
+     * (stage-0 chain-load) printed "verified, jumping to 0x00200000"
+     * then produced ZERO further bytes -- not even this function's own
+     * very first RAW_DIAG_PUTC 'A', which already executes before this
+     * point -- followed by a full hardware reset, reproduced
+     * identically across multiple attempts with two different kernel
+     * builds and a fresh re-upload+re-verify cycle (ruling out data
+     * corruption and build-content as the cause). Slot A (direct
+     * firmware load, not a stage-0 branch-handoff) never reproduced
+     * this once, across many more boots. A synchronous exception
+     * landing in stage-0's stale table during this exact window,
+     * eventually caught by this project's own newly-widened stage-0
+     * watchdog (which stage0_fault() never learned to kick) forcing a
+     * full reset with nothing printed in between, is the only
+     * mechanism found during this audit that fits every one of those
+     * symptoms at once. Not yet proven with certainty (real hardware
+     * access to add stage-0-side instrumentation would confirm it
+     * conclusively), but minimizing this window is correct regardless
+     * of whether it is THE cause or merely A cause -- every mature A/B
+     * bootloader (Zephyr/MCUboot, Android's boot_control+AVB, the
+     * U-Boot bootcount/bootlimit mechanism RAUC and Mender both build
+     * on) either does a full hardware reset between "bootloader
+     * decided" and "new image runs," or, where it instead branches
+     * directly like stage-0 does here, re-establishes the new image's
+     * own exception/fault handling before anything else -- never after
+     * diagnostic work that could itself fault. This reorder makes
+     * boot_entry match that same discipline: r0 stash (must stay
+     * absolutely first, see its own comment above) is the only thing
+     * that may run before the new image's own vector table is live. */
+    mrs r0, cpsr
+    bic r0, r0, #0x1F      /* clear mode bits */
+    orr r0, r0, #0xD3      /* SVC mode (0x13) | I mask (0x80) | F mask (0x40) */
+    msr cpsr_c, r0
+
+    ldr r0, =_start
+    mov r1, #0
+    ldmia r0!, {r2, r3, r4, r5, r6, r7, r8, r9}
+    stmia r1!, {r2, r3, r4, r5, r6, r7, r8, r9}
+    ldmia r0!, {r2, r3, r4, r5, r6, r7, r8, r9}
+    stmia r1!, {r2, r3, r4, r5, r6, r7, r8, r9}
+    RAW_DIAG_PUTC 'C'   /* vector table copied -- this image's own
+                          * synchronous-fault handling is live from here
+                          * on, regardless of how boot_entry was reached */
+
     RAW_DIAG_PUTC 'B'   /* r0 stashed */
 
     SNAP_TIMER 0    /* checkpoint 0: boot_entry's own first instruction --
@@ -171,37 +234,21 @@ boot_entry:
      * clean, fully-masked SVC-mode state), matching every other real-
      * hardware-only bug found this investigation.
      *
+     * 2026-10-25 follow-up: the actual SVC-mode-force + vector-table-
+     * copy code this comment originally introduced here now runs much
+     * earlier -- immediately after the slot-index stash, before
+     * RAW_DIAG_PUTC 'B'/SNAP_TIMER 0 above -- see that code's own
+     * comment for why (closing the same class of risk this comment
+     * already identified, just for a stage-0 branch-handoff rather
+     * than only firmware's own). Left this comment here, where the
+     * original investigation happened, rather than deleting it.
+     *
      * Fixed the same way Linux's own macro does for a pre-Hyp-mode
      * core (its own "#else" branch, since ARM1176 has no Hyp mode to
      * check for): read CPSR, force mode=SVC and set both I and F mask
      * bits, unconditionally, as literally the first instructions this
      * function executes -- before even the vector-table copy, since
      * that copy itself must not be interruptible either. */
-    mrs r0, cpsr
-    bic r0, r0, #0x1F      /* clear mode bits */
-    orr r0, r0, #0xD3      /* SVC mode (0x13) | I mask (0x80) | F mask (0x40) */
-    msr cpsr_c, r0
-
-    /* TASK #163 FIX (2026-09-12): copy the vector table (vectors.S's
-     * own `_start`/`_vectors`, now linked immediately before this
-     * function at the REAL entry point, 0x8000 -- see link.ld's own
-     * `.vectors` comment for the full reasoning) down to address
-     * 0x00000000, where the ARM core's own hardware actually reads
-     * exception vectors from (ARMv6 has no VBAR). This function used
-     * to BE `_start` itself, before this fix moved the vector table
-     * to the real entry point and renamed this to `boot_entry` --
-     * confirmed against dwelch67/raspberrypi's own well-known,
-     * PROVEN blinker05 example, which does exactly this same 16-word
-     * (64-byte) copy for exactly this same reason. Must happen before
-     * ANYTHING that could plausibly take an exception -- literally the
-     * first real work this function does. */
-    ldr r0, =_start
-    mov r1, #0
-    ldmia r0!, {r2, r3, r4, r5, r6, r7, r8, r9}
-    stmia r1!, {r2, r3, r4, r5, r6, r7, r8, r9}
-    ldmia r0!, {r2, r3, r4, r5, r6, r7, r8, r9}
-    stmia r1!, {r2, r3, r4, r5, r6, r7, r8, r9}
-    RAW_DIAG_PUTC 'C'   /* vector table copied */
 
     /* Task #163 (first real-hardware boot, 2026-09-12): force a known-
      * clean cache/MMU/TLB/branch-predictor state before ANYTHING else
