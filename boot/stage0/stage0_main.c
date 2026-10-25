@@ -83,19 +83,43 @@
 #endif
 
 #if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
-/* Same BCM2835 PM_WDOG/PM_RSTC register protocol as kernel_main.vani's
+/* 2026-10-24 follow-up (real-HW SHA-mismatch halt investigation): this
+ * used to be armed exactly once, right before the final jump -- it
+ * only ever covered a hang in the JUMPED-TO kernel, never any failure
+ * inside stage0_main() itself. Every stage0_fault() call site (SD init
+ * failure, missing/corrupt slot-state, invalid length, a real SD read
+ * failure, or a SHA-256 mismatch -- this file's own header comment's
+ * step 5 already notes a mismatch is "treated exactly like a failed
+ * boot attempt") used to halt with `for(;;){}` and NOTHING armed,
+ * because the attempt_count/bootlimit write-back in step 4 already
+ * happens BEFORE any of those checks -- so the one thing missing for
+ * every one of them to converge to the other slot automatically,
+ * exactly like a hung kernel already does, was a reset. Now called at
+ * the very top of stage0_main() (covering SD init + both slot-state
+ * reads) and re-armed again right before the kernel block-read loop
+ * and right before the SHA-256 compute -- same "kick at every real
+ * phase boundary instead of guessing one combined worst-case" lesson
+ * kernel_main.vani's own watchdog_kick() history already learned the
+ * hard way (see WATCHDOG_ENABLE_FOR_REAL_HARDWARE's 2->10 second
+ * widening comment there), applied here from the start instead of
+ * discovering each gap one real-HW boot at a time.
+ *
+ * Same BCM2835 PM_WDOG/PM_RSTC register protocol as kernel_main.vani's
  * own watchdog_arm (PM_RSTC=0x2010001C, PM_WDOG=0x20100024, password
  * 0x5A000000 required in the top byte of every write to either
  * register or the write is silently ignored, ticks run at a fixed
  * 65536Hz independent of any scheduler tick period) -- reusing the
  * exact proven sequence, not re-deriving it. 15 seconds (983040 =
  * 15<<16 ticks) is comfortably under the register's own 0xFFFFF-tick
- * (~16s) ceiling, generous margin above the ~200ms this file's own
- * real-HW logs show boot.S's prologue + mmu_init + sdhost_init
- * actually take (the one gap this specific arm needs to cover: from
- * here to kernel_main's own first watchdog_kick() call) while still
- * short enough that a genuinely bad/hung jump target gets caught
- * quickly rather than left spinning for a long time unattended. */
+ * (~16s) ceiling -- generous margin above the ~200ms this file's own
+ * real-HW logs show boot.S's prologue + mmu_init + sdhost_init take,
+ * and (new) each of the SD-block-read-loop and SHA-256-compute phases
+ * individually, even though none of those three has been directly
+ * measured on real hardware yet -- the same honest gap this comment's
+ * own prior version had for the original single phase it covered,
+ * closed the same way: re-arming per phase means a real measurement
+ * proving one phase needs more than 15s only requires widening that
+ * phase's own window, not re-deriving a new combined ceiling. */
 #define PM_RSTC 0x2010001Cu
 #define PM_WDOG 0x20100024u
 static void stage0_arm_watchdog(void) {
@@ -270,6 +294,10 @@ void stage0_main(void) {
 
     u_puts("\nstage0: A/B kernel-slot loader starting\n");
 
+#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
+    stage0_arm_watchdog();
+#endif
+
     rc = stage0_sd_init();
     if (rc != 0) {
         u_puts("stage0: SD init failed, stage=");
@@ -408,9 +436,39 @@ void stage0_main(void) {
     u_hex32(len_bytes);
     u_puts("\n");
 
+#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
+    stage0_arm_watchdog();
+#endif
+
+    /* 2026-10-24 follow-up (real-HW reboot-loop found live, same day as
+     * the fix below's own predecessor): arming once before this loop
+     * and once before the SHA-256 compute, each with a single fixed
+     * 15-second budget, was the SAME "guess one combined worst-case"
+     * mistake kernel_main.vani's own watchdog_kick() history already
+     * made and fixed once (see stage0_arm_watchdog's own comment) --
+     * just one level more specific this time: a real-HW boot with this
+     * exact fix armed came back attempt_count climbing every few
+     * seconds, dying silently after "loading len=..." with NO error
+     * ever printed (not a stage0_fault() -- those always print first),
+     * which only fits the watchdog itself firing mid-read/mid-hash,
+     * before either phase could finish OR legitimately fail with a
+     * message. Neither phase's real duration on this hardware has
+     * ever been directly measured (this file's own prior comment
+     * already admitted that gap) -- rather than guess a second,
+     * larger number and risk being wrong again, re-arm every 512
+     * blocks (256KiB) here and every chunk in the SHA-256 loop below,
+     * so no single uninterrupted stretch between kicks depends on a
+     * guess about total throughput at all, the same fix shape as
+     * kernel_main.vani's own many watchdog_kick() call sites threaded
+     * through its own long phases rather than one upfront arm. */
     nblocks = (len_bytes + BLOCK_SIZE - 1u) / BLOCK_SIZE;
     dest = (unsigned char *)REAL_KERNEL_LOAD_ADDR;
     for (i = 0; i < nblocks; i = i + 1) {
+#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
+        if ((i & 511u) == 0u) {
+            stage0_arm_watchdog();
+        }
+#endif
         rc = stage0_sd_read_block(base_block + i, block_buf);
         if (rc != 0) {
             u_puts("stage0: read failed at block offset ");
@@ -427,12 +485,39 @@ void stage0_main(void) {
         dest = dest + BLOCK_SIZE;
     }
 
+#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
+    stage0_arm_watchdog();
+#endif
+
     {
         struct sha256_ctx ctx;
         unsigned char actual[32];
         int match;
+        unsigned int sha_chunk = 262144u; /* 256KiB -- see this block's
+                                            * own re-arm comment above;
+                                            * sha256_update is a real
+                                            * streaming/incremental API
+                                            * (sha256_finalize's own
+                                            * padding already calls it
+                                            * multiple times), so
+                                            * chunking the real payload
+                                            * through it here changes
+                                            * nothing about the digest,
+                                            * only how often this loop
+                                            * gets a chance to re-arm. */
+        unsigned int sha_off = 0u;
         sha256_init(&ctx);
-        sha256_update(&ctx, (const unsigned char *)(unsigned long)REAL_KERNEL_LOAD_ADDR, len_bytes);
+        while (sha_off < len_bytes) {
+            unsigned int this_len = len_bytes - sha_off;
+            if (this_len > sha_chunk) {
+                this_len = sha_chunk;
+            }
+#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
+            stage0_arm_watchdog();
+#endif
+            sha256_update(&ctx, (const unsigned char *)(unsigned long)(REAL_KERNEL_LOAD_ADDR + sha_off), this_len);
+            sha_off = sha_off + this_len;
+        }
         sha256_finalize(&ctx, actual);
         match = 1;
         for (i = 0; i < 32; i = i + 1) {

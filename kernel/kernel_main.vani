@@ -3632,6 +3632,9 @@ extern "C" fn dharafs_commit_count_increment() -> u32;
 extern "C" fn dharafs_commit_count_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_user_get_gid() -> u32;
+// DharaFS persisted-checkpoint plan, Phase 1 (2026-10-24): dedicated
+// scratch buffer, see its own header comment in boot/dharafs_state.S.
+extern "C" fn dharafs_checkpoint_buf_get() -> mut ref i64;
 
 // Phase 4 -- boot/shell_state.S: the interactive shell's line buffer,
 // filled one byte at a time from irq_dispatch's new UART-RX branch
@@ -7040,7 +7043,18 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let _ = uart_puts("SD: CMD0 (GO_IDLE_STATE) timed out\n");
     return 0 - 1;
   }
-  let diag_t_cmd0: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
+  // 2026-10-24 fix (real-HW panic, "integer overflow in u32 sub"):
+  // TIMER_CLO is a free-running 32-bit microsecond counter that wraps
+  // every ~71.58 minutes -- a board that stays up longer than that and
+  // then hits any of this function's own diagnostic deltas computes a
+  // negative-looking plain `-` and traps. wrapping_sub is the
+  // established fix for exactly this pattern elsewhere in this file
+  // (see its own call site's header comment: "plain u32 `-` traps on
+  // [overflow]") -- live-reproduced here for the first time only
+  // because tonight's SD-wedge investigation kept a board running
+  // continuously past that threshold, something no earlier round's
+  // own real-HW session happened to do.
+  let diag_t_cmd0: u32 = wrapping_sub(sd_mmio_read_u32(TIMER_CLO), diag_t0);
   if boot_debug_enabled() == 1 {
     let _ = uart_puts("SD DIAG: CMD0 done, t=");
     let _ = uart_put_i64(diag_t_cmd0 as i64);
@@ -7078,7 +7092,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   // vector-table bug (docs/TODO.md, project memory
   // project_dhruva_pi1b_real_boot_investigation_2026_09_12).
   let cmd8_status: u32 = sdhost_cmd(8 as u32, 0x1AA as u32);
-  let diag_t_cmd8: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
+  let diag_t_cmd8: u32 = wrapping_sub(sd_mmio_read_u32(TIMER_CLO), diag_t0);
   if boot_debug_enabled() == 1 {
     let _ = uart_puts("SD DIAG: CMD8 done, t=");
     let _ = uart_put_i64(diag_t_cmd8 as i64);
@@ -7128,7 +7142,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
         acmd_iter = acmd_iter + 1;
       }
     }
-    let diag_t_acmd41: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
+    let diag_t_acmd41: u32 = wrapping_sub(sd_mmio_read_u32(TIMER_CLO), diag_t0);
     if boot_debug_enabled() == 1 {
       let _ = uart_puts("SD DIAG: ACMD41 loop exited, t=");
       let _ = uart_put_i64(diag_t_acmd41 as i64);
@@ -7144,18 +7158,30 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
       let _ = uart_puts("SD: ACMD41 (CMD55/CMD41) timed out\n");
       return 0 - 1;
     }
-    // TEMPORARY DIAGNOSTIC: the loop above exits when EITHER the OCR
-    // busy bit is seen (real success) OR acmd_iter hits its 1000 cap
-    // (a real card that genuinely never became ready) OR wedged is set
-    // (handled above) -- but only the wedged case was previously
-    // treated as failure. A card that never sets its own busy bit
-    // within 1000 iterations was silently treated as "done" with a
-    // stale, still-not-ready OCR value. Flagged here, not yet changed
-    // to a hard failure, pending confirmation this is actually what's
-    // happening on real hardware (vs. the delay being somewhere else
-    // entirely) -- see this function's own diagnostic header comment.
+    // CONFIRMED REAL BUG (2026-10-24, live real-HW capture): this
+    // function's own prior comment flagged "proceeding anyway" here as
+    // a suspected bug but left it unconfirmed. Live evidence now
+    // exists: a boot captured the ACMD41 loop exhausting its full 1000-
+    // iteration cap with the OCR busy bit never set (logged "ACMD41
+    // done, OCR=0x00FF8000" -- note: no 0x80000000 bit, i.e. the SAME
+    // stale voltage_window value fed into CMD41, never actually
+    // updated by a real ready response), immediately followed by CMD2/
+    // CMD17/CMD24 ALL failing with SDCMD_FAIL_FLAG on every single
+    // subsequent command for the rest of that boot -- exactly what
+    // issuing card-identification/read/write commands against a card
+    // that never finished its own power-up sequence produces. Every
+    // real reference driver treats this the same way the sibling
+    // acmd41_wedged branch above already does: Linux's own
+    // mmc_send_app_op_cond (drivers/mmc/core/mmc_ops.c) returns
+    // -ETIMEDOUT if the busy bit never sets within its own retry
+    // budget, and mmc_attach_sd aborts the whole attach on that error
+    // -- it never proceeds to CMD2 with a stale OCR. U-Boot's
+    // sd_send_op_cond (mmc/mmc.c) does the same. Fixed to match: a
+    // hard failure, same shape and same return value as acmd41_wedged,
+    // instead of silently treating a not-ready card as initialized.
     if (ocr & ocr_busy) == (0 as u32) {
-      let _ = uart_puts("SD DIAG: WARNING -- ACMD41 loop exhausted its iteration cap WITHOUT the card ever reporting ready (OCR busy bit never set) -- proceeding anyway, matching this function's own PRE-EXISTING behavior, but this is likely the real bug\n");
+      let _ = uart_puts("SD: ACMD41 exhausted its iteration cap without the card ever reporting ready (OCR busy bit never set) -- treating as a hard failure, not proceeding\n");
+      return 0 - 1;
     }
     let _ = uart_puts("SD: ACMD41 done, OCR=0x");
     let _ = uart_put_hex32(ocr);
@@ -7586,7 +7612,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
   let _ = uart_puts(" SDEDM=0x");
   let _ = uart_put_hex32(sd_mmio_read_u32(sdedm));
   let _ = uart_puts("\n");
-  let diag_t_end: u32 = sd_mmio_read_u32(TIMER_CLO) - diag_t0;
+  let diag_t_end: u32 = wrapping_sub(sd_mmio_read_u32(TIMER_CLO), diag_t0);
   let _ = uart_puts("SD DIAG: sdhost_init total elapsed t=");
   let _ = uart_put_i64(diag_t_end as i64);
   let _ = uart_puts("us\n");
@@ -7844,7 +7870,7 @@ fn sdhost_wait_transfer_complete(alternate_idle: u32) -> i64 {
   let sdedm: i64 = SDEDM;
   let wtc_timeout_us: u32 = 1000000 as u32;
   let wtc_t0: u32 = sd_mmio_read_u32(TIMER_CLO);
-  while (sd_mmio_read_u32(TIMER_CLO) - wtc_t0) < wtc_timeout_us {
+  while wrapping_sub(sd_mmio_read_u32(TIMER_CLO), wtc_t0) < wtc_timeout_us {
     let edm: u32 = sd_mmio_read_u32(sdedm);
     let fsm: u32 = edm & (0xF as u32);
     if (fsm == (0 as u32)) || (fsm == (1 as u32)) {
@@ -9159,17 +9185,200 @@ fn dharafs_dirindex_upsert_raw(path_buf: mut ref i64, path_len: i64, block: i64)
 // tolerates before concluding it has genuinely reached the end of the
 // log, rather than hit one isolated bad block with real data behind
 // it.
-const DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS: i64 = 4;
+const DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS: i64 = 64;
+
+// DharaFS persisted-checkpoint plan, Phase 1 (2026-10-24): recovery
+// always rescanning from block 1 on every boot is the single biggest
+// lever on boot-time cost, independent of whether compaction ever
+// reclaims PHYSICAL space (Phase 2, real follow-up work) -- a
+// checkpoint recording where compaction has already PROVEN there is
+// nothing live before lets recovery skip straight there. Same ping-
+// pong + generation + CRC32 convention already proven for
+// KernelSlotRecord (kernelslot_build/_parse/_lookup/_write_record,
+// ~line 31920+) and KernelUploadChunkProgress -- literally the same
+// shape, not new mechanics, reusing kernelslot_crc32 directly since
+// it's already generic (buf + length, not kernel-slot-specific).
+// Given its own dedicated block pair (8101/8102, in the same
+// relocated margin as the crypto-metadata/self-check blocks above --
+// see dharafs_init's own ROOT-CAUSE FIX comment for the full block-map
+// picture) rather than sharing kernelslot's, for the exact same
+// "a second persisted record never risks a read-modify-write mistake
+// on an unrelated one" reasoning KernelUploadChunkProgress's own
+// header comment already gives.
+fn dharafs_checkpoint_block_a() -> i64 { return 8101; }
+fn dharafs_checkpoint_block_b() -> i64 { return 8102; }
+
+// Correctness invariant this record exists to capture, load-bearing
+// for why skipping [1, log_start) during recovery is safe: everything
+// in that range is guaranteed to have an equivalent (newer-seq) live
+// copy at or after log_start by the time this checkpoint is written --
+// that's the definition of what dharafs_compact() just proved before
+// calling the write path below. A missing/CRC-invalid checkpoint
+// (fresh card, or this feature predates it) falls back to exactly
+// today's behavior: scan from block 1, trust nothing persisted, the
+// same "no persisted log_start, assume block 1" philosophy the
+// un-checkpointed path has always used.
+struct DharaFsCheckpoint {
+  valid: i64,
+  chosen_block: i64,
+  generation: u32,
+  log_start: u32,
+  log_end: u32,
+}
+
+fn dharafs_checkpoint_crc_valid(raw: mut ref i64) -> i64 {
+  let magic: u32 = buf_read_u32_le(raw, 0);
+  if magic != (0x44434B50 as u32) { // "DCKP"
+    return 0;
+  }
+  let crc_stored: u32 = buf_read_u32_le(raw, 16);
+  let crc_actual: u32 = kernelslot_crc32(raw, 16);
+  if crc_actual != crc_stored {
+    return 0;
+  }
+  return 1;
+}
+
+fn dharafs_checkpoint_parse(raw: mut ref i64, chosen_block: i64) -> DharaFsCheckpoint {
+  return DharaFsCheckpoint {
+    valid: 1,
+    chosen_block: chosen_block,
+    generation: buf_read_u32_le(raw, 4),
+    log_start: buf_read_u32_le(raw, 8),
+    log_end: buf_read_u32_le(raw, 12),
+  };
+}
+
+fn dharafs_checkpoint_build(rec: ref DharaFsCheckpoint, out: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 512 {
+    let _ = buf_write_byte(out, i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let _ = buf_write_u32_le(out, 0, 0x44434B50 as u32);
+  let _ = buf_write_u32_le(out, 4, rec.generation);
+  let _ = buf_write_u32_le(out, 8, rec.log_start);
+  let _ = buf_write_u32_le(out, 12, rec.log_end);
+  let crc: u32 = kernelslot_crc32(out, 16);
+  let _ = buf_write_u32_le(out, 16, crc);
+  return 0;
+}
+
+// Same tie-break shape as kernelslot_lookup: higher generation wins
+// when both copies are CRC-valid; falls back to whichever one copy is
+// valid; valid=0 (caller must check before trusting any other field)
+// if neither is.
+fn dharafs_checkpoint_lookup() -> DharaFsCheckpoint {
+  let buf: mut ref i64 = dharafs_checkpoint_buf_get();
+
+  let status_a: i64 = sdhost_read_block(dharafs_checkpoint_block_a(), buf);
+  let valid_a: i64 = if status_a == 0 { dharafs_checkpoint_crc_valid(buf) } else { 0 };
+  let rec_a: DharaFsCheckpoint = dharafs_checkpoint_parse(buf, dharafs_checkpoint_block_a());
+
+  let status_b: i64 = sdhost_read_block(dharafs_checkpoint_block_b(), buf);
+  let valid_b: i64 = if status_b == 0 { dharafs_checkpoint_crc_valid(buf) } else { 0 };
+  let rec_b: DharaFsCheckpoint = dharafs_checkpoint_parse(buf, dharafs_checkpoint_block_b());
+
+  if (valid_a == 1) && (valid_b == 1) {
+    if rec_a.generation >= rec_b.generation {
+      return rec_a;
+    } else {
+      return rec_b;
+    }
+  }
+  if valid_a == 1 {
+    return rec_a;
+  }
+  if valid_b == 1 {
+    return rec_b;
+  }
+  let invalid: DharaFsCheckpoint = rec_a;
+  invalid.valid = 0;
+  return invalid;
+}
+
+fn dharafs_checkpoint_stale_block(rec: ref DharaFsCheckpoint) -> i64 {
+  if rec.chosen_block == dharafs_checkpoint_block_a() {
+    return dharafs_checkpoint_block_b();
+  }
+  return dharafs_checkpoint_block_a();
+}
+
+// Caller's own responsibility: only call this once a pass has proven
+// [new_log_start, log_end) is the complete, correct live state -- this
+// function just serializes and writes, same division of labor as
+// kernelslot_write_record.
+fn dharafs_checkpoint_write(generation: u32, log_start: u32, log_end: u32, block_num: i64) -> i64 {
+  let rec: DharaFsCheckpoint = DharaFsCheckpoint {
+    valid: 1, chosen_block: block_num, generation: generation,
+    log_start: log_start, log_end: log_end,
+  };
+  let buf: mut ref i64 = dharafs_checkpoint_buf_get();
+  let _ = dharafs_checkpoint_build(ref rec, buf);
+  return sdhost_write_block(block_num, buf);
+}
 
 fn dharafs_init() -> i64 {
   let _ = dharafs_dirindex_reset();
   let _ = dharafs_snapshot_reset();
   let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  // DharaFS persisted-checkpoint plan, Phase 1 (2026-10-24): a valid
+  // checkpoint means a prior compaction pass already PROVED nothing
+  // live exists before its own log_start -- safe to start scanning
+  // there directly instead of always rescanning from block 1 (see
+  // DharaFsCheckpoint's own header comment for the full correctness
+  // argument). No checkpoint, or a CRC-invalid one (fresh card, torn
+  // write, or this feature simply predates the card's own history):
+  // fall back to exactly today's behavior, scan from block 1, trust
+  // nothing persisted.
+  let checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+  // TEMP DIAGNOSTIC A/B (2026-10-24): forced to 1 for now, same round
+  // as the matching disable in dharafs_compact -- see that comment.
+  // A checkpoint written by the disabled code above (including from
+  // the corrupted test run before this round) must never be trusted
+  // until the real mechanism is understood.
   let blk: i64 = 1;
-  let max_blk: i64 = 2048; // 1MB log region for this v1 -- keeps a
-                            // fresh/large device's recovery scan
-                            // bounded rather than reading the whole
-                            // disk looking for the first free block.
+  let scan_start_blk: u32 = blk as u32;
+  // ROOT-CAUSE FIX (2026-10-24, round 3 -- why a fresh write stopped
+  // surviving a reboot even with the bad-block tolerance raised to
+  // 64): the diagnostic summary just below showed final_blk=2048
+  // (==the OLD max_blk exactly) with max_run only 3 -- the scan never
+  // found a genuine end-of-log at all; it hit this hard cap first,
+  // meaning the real, accumulated log (highest_seq=2026 that same
+  // boot) has grown to nearly fill the entire original 1MB budget.
+  // dharafs_compact() only ever reclaimed LOGICAL visibility via
+  // dirindex (see this function's own loop comment below), never the
+  // physical footprint -- dead/superseded copies are never actually
+  // overwritten, so the real on-disk size only grows, boot over boot,
+  // now that persistence genuinely works instead of resetting itself
+  // every boot under the old bug. Once next_block reaches/exceeds
+  // max_blk, any NEW write lands at a block position the scan's own
+  // `while blk < max_blk` bound can structurally never examine again
+  // on a later boot -- invisible, with no error, not even a bad-block
+  // skip. Widened from 2048 -- real headroom reusing already-
+  // reserved-but-unused slack between this log region and
+  // rtl8188cu_fw_raw_sd_base_block()'s own 8192 (WiFi firmware
+  // fallback never moves).
+  //
+  // FOLLOW-UP CORRECTION (same day): the first widening picked 8128 --
+  // a round number chosen without checking what else lived past 2048.
+  // It genuinely collided with dharafs_crypto_meta_sector_for's own
+  // base (4000, metadata for a 2048-block log never needed to reach
+  // that far) and dharafs_encryption_self_check's hardcoded test_block
+  // (3000) -- both now relocated (see their own comments) to sit
+  // AFTER this log's own new upper bound instead. 7600 is the real,
+  // checked boundary: the relocated metadata region now starts
+  // exactly here and needs ceil(7599/16)=474 sectors, fitting
+  // comfortably before the relocated self-check block (8100) and
+  // rtl8188cu_fw_raw_sd_base_block (8192) -- still ~3.7x the original
+  // 2048 runway, with every neighboring region's own real position
+  // checked instead of assumed. A real fix (a persisted checkpoint so
+  // recovery doesn't always rescan from block 1, and dharafs_compact()
+  // that physically reclaims space instead of only ever appending live
+  // copies to the tail) is scoped, separate follow-up work -- see
+  // docs/TODO.md's own writeup of this round for the full plan; not
+  // attempted here.
+  let max_blk: i64 = 7600;
   let highest_seq: u32 = 0 as u32;
   // ROOT-CAUSE FIX (2026-10-24, real-HW cross-reboot DharaFS
   // persistence investigation): this scan used to stop at the FIRST
@@ -9190,13 +9399,39 @@ fn dharafs_init() -> i64 {
   // this one observed case, not the general problem -- a single
   // isolated bad block ANYWHERE in the log, from any cause, deserves
   // the same tolerance. DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS
-  // (4) distinguishes the two cases: skip forward past up to that
-  // many consecutive failures before giving up, resetting the count
-  // back to 0 the moment a genuinely valid block is found again --
-  // comfortably more than one isolated blip, nowhere close to the
-  // hundreds/thousands of blocks a real run of unwritten flash would
-  // span, so genuine end-of-log detection is unaffected.
+  // distinguishes the two cases: skip forward past up to that many
+  // consecutive failures before giving up, resetting the count back
+  // to 0 the moment a genuinely valid block is found again.
+  //
+  // FOLLOW-UP (same day, real-HW wifi-credentials test): 4 wasn't
+  // enough -- /config/wifi_ssid and /config/wifi_password, written
+  // back to back in the same live session, showed the SAME
+  // inconsistency between a cold boot-time recovery read and a later
+  // interactive `cat` of the identical path (the live read succeeded
+  // for the SSID; the boot-time cached copy wifi_config_init() took
+  // read 0, even though nothing else ever resets that cache --
+  // dharafs_compact() was ruled out as the explanation, since it only
+  // ever walks the SAME [log_start, next_block) range recovery itself
+  // already established, never an independent rediscovery pass). This
+  // points to something broader than one permanently-bad block:
+  // reads taken very early in boot, right after sdhost_init, appear
+  // to be transiently less reliable in general (a real SD/controller
+  // warm-up effect, not strictly confined to block 1) than the exact
+  // same read taken moments later once the system has settled. Raised
+  // to 64 -- real margin against that broader effect, still nowhere
+  // close to the hundreds/thousands of blocks a genuine run of
+  // unwritten flash would span, so end-of-log detection stays correct
+  // on a fresh/empty device (worst case: 64 extra block reads before
+  // concluding there's nothing there, a one-time, cheap cost).
   let consecutive_bad: i64 = 0;
+  // TEMP DIAGNOSTIC (2026-10-24, round 2 -- why did raising the
+  // tolerance from 4 to 64 make a FRESH, trivial write fail to survive
+  // a software `reboot` when it had survived fine under the OLD,
+  // tighter tolerance?): track totals across the whole scan so the
+  // real shape of what's failing is visible, not just where the scan
+  // finally gives up. Remove once root-caused.
+  let diag_total_bad: i64 = 0;
+  let diag_max_run: i64 = 0;
   while blk < max_blk {
     // TASK #353 REAL-HW FOLLOW-UP (2026-10-16): found live -- this
     // scan reads sequentially from block 1 on EVERY boot (no
@@ -9245,6 +9480,10 @@ fn dharafs_init() -> i64 {
     let block_ok: i64 = if (rd_status != 0) || (stored_checksum != computed_checksum) || (this_seq == (0 as u32)) { 0 } else { 1 };
     if block_ok == 0 {
       consecutive_bad = consecutive_bad + 1;
+      diag_total_bad = diag_total_bad + 1;
+      if consecutive_bad > diag_max_run {
+        diag_max_run = consecutive_bad;
+      }
       if consecutive_bad >= DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS {
         break;
       }
@@ -9323,14 +9562,27 @@ fn dharafs_init() -> i64 {
     }
     }
   }
+  let _ = uart_puts("RECOVERY SUMMARY final_blk=");
+  let _ = uart_put_hex32(blk as u32);
+  let _ = uart_puts(" total_bad=");
+  let _ = uart_put_hex32(diag_total_bad as u32);
+  let _ = uart_puts(" max_run=");
+  let _ = uart_put_hex32(diag_max_run as u32);
+  let _ = uart_puts(" highest_seq=");
+  let _ = uart_put_hex32(highest_seq);
+  let _ = uart_puts("\n");
   let _ = dharafs_state_set(blk as u32, highest_seq + (1 as u32));
-  // log_start always resets to 1 on boot -- it's an in-RAM-only
-  // optimization task #5's compaction earns back within a session
-  // (fewer blocks to scan), not something persisted across reboots.
-  // Recovery has no other safe starting point to trust anyway: with
-  // nothing on the card recording where a prior compaction left off,
-  // block 1 is the only assumption that can't be wrong.
-  let _ = dharafs_state_set_log_start(1 as u32);
+  // DharaFS persisted-checkpoint plan, Phase 1 (2026-10-24): log_start
+  // used to always reset to 1 on boot -- now it resets to wherever
+  // THIS scan actually started (block 1 with no valid checkpoint,
+  // exactly as before; the checkpoint's own log_start when one was
+  // trusted), not a hardcoded 1 that would silently throw away the
+  // whole point of skipping a scanned-and-proven-dead prefix. Either
+  // way this stays an in-RAM-only value for the REST of this boot --
+  // only dharafs_compact() advancing it further, and persisting that
+  // advance via a new checkpoint write, is what lets a FUTURE boot
+  // start even later than this one did.
+  let _ = dharafs_state_set_log_start(scan_start_blk);
   return 0;
 }
 
@@ -9386,6 +9638,39 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
     if wr_status != 0 {
       return 1;
     }
+
+    // TEMP DIAGNOSTIC (2026-10-24, real-HW DharaFS data-loss
+    // investigation, final round -- a clean "ok" response followed by
+    // BOTH `ls` and `cat` failing to find the file moments later,
+    // same boot, no reboot, no compact() activity (confirmed via the
+    // now-disabled COMPACT CARRY print never firing): show exactly
+    // what this append wrote and immediately verify it reads back
+    // correctly, right here, every single call -- the same immediate-
+    // readback technique that found the real mechanism earlier in
+    // this session's own block-1 investigation. Remove once root-
+    // caused.
+    let diag_rb: mut ref i64 = dhruva_alloc_bytes(512);
+    let diag_rb_status: i64 = dharafs_block_read_raw(next_block as i64, diag_rb);
+    let diag_rb_csum: u32 = buf_read_u32(diag_rb, 0 as u32);
+    let diag_rb_computed: u32 = buf_checksum(diag_rb, 4 as u32, 508 as u32);
+    let diag_rb_pathlen: u32 = buf_read_u32(diag_rb, 8 as u32);
+    let _ = uart_puts("APPEND blk=");
+    let _ = uart_put_hex32(next_block);
+    let _ = uart_puts(" seq=");
+    let _ = uart_put_hex32(next_seq);
+    let _ = uart_puts(" path=\"");
+    let _ = dharafs_print_data(path_buf, path_len);
+    let _ = uart_puts("\" path_len=");
+    let _ = uart_put_hex32(path_len as u32);
+    let _ = uart_puts(" wr_status=");
+    let _ = uart_put_hex32(wr_status as u32);
+    let _ = uart_puts(" rb_status=");
+    let _ = uart_put_hex32(diag_rb_status as u32);
+    let _ = uart_puts(" rb_match=");
+    let _ = uart_puts(if diag_rb_csum == diag_rb_computed { "1" } else { "0" });
+    let _ = uart_puts(" rb_pathlen=");
+    let _ = uart_put_hex32(diag_rb_pathlen);
+    let _ = uart_puts("\n");
 
     let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
     let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, next_block as i64);
@@ -10594,7 +10879,32 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
               let rec_uid: u32 = buf_read_u32(buf, 52 as u32);
               let rec_gid: u32 = buf_read_u32(buf, 56 as u32);
               let rec_mode: u32 = buf_read_u32(buf, 60 as u32);
+              // TEMP DIAGNOSTIC (2026-10-24, real-HW DharaFS corruption
+              // investigation, round 2 -- confirmed real via a 15s-
+              // spaced clean test, NOT host-timing, NOT Phase 1 (fully
+              // disabled during this diagnostic)): show exactly what
+              // compact's own carry-forward is about to do, every
+              // time, so the next real-HW run shows the real mechanism
+              // instead of more guessing. Remove once root-caused.
+              let diag_target_before: u32 = dharafs_state_get_next_block();
+              let _ = uart_puts("COMPACT CARRY from_blk=");
+              let _ = uart_put_hex32(blk as u32);
+              let _ = uart_puts(" path=\"");
+              let _ = dharafs_print_data(path_buf, rec_path_len as i64);
+              let _ = uart_puts("\" path_len=");
+              let _ = uart_put_hex32(rec_path_len);
+              let _ = uart_puts(" full_len=");
+              let _ = uart_put_hex32(full_len as u32);
+              let _ = uart_puts(" target_before=");
+              let _ = uart_put_hex32(diag_target_before);
+              let _ = uart_puts("\n");
               let append_status: i64 = dharafs_append_raw(path_buf, rec_path_len as i64, data_buf, full_len, rec_uid, rec_gid, rec_mode);
+              let diag_target_after: u32 = dharafs_state_get_next_block();
+              let _ = uart_puts("COMPACT CARRY DONE status=");
+              let _ = uart_put_hex32(append_status as u32);
+              let _ = uart_puts(" target_after=");
+              let _ = uart_put_hex32(diag_target_after);
+              let _ = uart_puts("\n");
               if append_status != 0 {
                 all_ok = 0;
               }
@@ -10628,6 +10938,25 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     // one.
     if all_ok == 1 {
       let _ = dharafs_state_set_log_start(old_next_block);
+      // TEMP DIAGNOSTIC A/B (2026-10-24): real-HW corruption appeared
+      // the FIRST boot this checkpoint-write code ever ran (garbled,
+      // merged filenames in `ls` -- e.g. an existing /config/mode
+      // record's bytes bleeding into a freshly-written path's own
+      // record). The checkpoint itself writes to blocks 8101/8102,
+      // physically disjoint from the 1-7599 log region, so it cannot
+      // DIRECTLY corrupt another block's on-disk bytes -- disabling
+      // this call isolates whether the mechanism is here (a vani/
+      // codegen issue from adding this call inside dharafs_compact's
+      // own already-deep call graph) or in something this session's
+      // other changes (Phase 0's widened max_blk, or the pre-existing
+      // DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS tolerance) simply
+      // exposed for the first time by finally letting compact() do
+      // real, substantial carry-forward work on a real, large log.
+      // Re-enable once root-caused.
+      // let old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+      // let checkpoint_target: i64 = if old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref old_checkpoint) } else { dharafs_checkpoint_block_a() };
+      // let checkpoint_generation: u32 = if old_checkpoint.valid == 1 { old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
+      // let _ = dharafs_checkpoint_write(checkpoint_generation, old_next_block, dharafs_state_get_next_block(), checkpoint_target);
     }
     let _ = dharafs_compact_set_resume_block(0 as u32);
     let _ = dharafs_compact_set_failed(0 as u32);
@@ -23090,8 +23419,11 @@ fn rtl8188cu_load_firmware() -> i64 {
 // needed at all) while that UART path keeps getting exercised too.
 //
 // Block 8192 (4MB): comfortable margin past both DharaFS's own log
-// region (blocks 1-2048) and its crypto-metadata region (blocks 4000+,
-// dharafs_crypto_meta_sector_for's own comment), and well clear of
+// region (blocks 1-7599, widened + the crypto-metadata/self-check
+// relocation that went with it, 2026-10-24 -- see dharafs_init's own
+// comment) and its crypto-metadata region (blocks 7600-8074,
+// dharafs_crypto_meta_sector_for's own comment) and the relocated
+// self-check test block (8100), and well clear of
 // flash_sd_card.sh's own FAT boot partition (starts at sector 36864,
 // 18MiB as of the A/B kernel-slot feature -- was 8MiB) -- entirely
 // unused raw space on every card this project's own
@@ -28374,7 +28706,7 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
     // known-flaky; generous enough not to break a genuinely slow real
     // device, while still bounding the worst case far below the ~20x
     // multiplier's own real-HW-measured potential (tens of seconds).
-    if (mmio_read_u32(TIMER_CLO) - bringup_start_us) > (2000000 as u32) {
+    if wrapping_sub(mmio_read_u32(TIMER_CLO), bringup_start_us) > (2000000 as u32) {
       let _ = uart_puts("USB: hub port bring-up exceeded its wall-clock budget\n");
       return 0 - 1;
     }
@@ -28793,7 +29125,7 @@ fn usb_hotplug_sample_port_connected(hub_addr: u32, hub_mps: u32, port: u32, sta
     // exactly like a communication failure: the caller's own
     // any_failure/backoff bookkeeping doesn't need to know WHY this
     // sample didn't complete cleanly, only that it didn't.
-    if (mmio_read_u32(TIMER_CLO) - start_us) > USB_HOTPLUG_SAMPLE_BUDGET_US {
+    if wrapping_sub(mmio_read_u32(TIMER_CLO), start_us) > USB_HOTPLUG_SAMPLE_BUDGET_US {
       return 0 - 1;
     }
     let status_lo: u32 = buf_read_byte(status_buf, 0 as u32);
@@ -34306,6 +34638,32 @@ fn shell_dispatch() -> i64 {
   // local copy. task_f's own former post-dispatch call is now redundant
   // and was removed there.
   let _ = shell_clear_line();
+  // TEMP DIAGNOSTIC (2026-10-24, real-HW DharaFS data-loss
+  // investigation, final round): show the RAW, freshly-copied
+  // line_buf content for EVERY dispatch, one level earlier than any
+  // previous diagnostic in this round -- directly reveals whether
+  // dispatch is ever processing a DIFFERENT line than what was
+  // actually just typed/echoed. Moved to run AFTER shell_clear_line()
+  // (2026-10-24 follow-up): this print was ORIGINALLY inserted before
+  // shell_clear_line(), which re-opened the exact "WIFIKEY-UPLOAD RACE
+  // FIX" ordering bug this function's own header comment above already
+  // documents and fixed once (2026-09-14) -- shell_rx_push_char drops
+  // every incoming byte while shell_line_ready stays 1, and these 4
+  // uart_puts calls (several ms of blocking per-byte TX at 115200 baud)
+  // extended that window far past what any human typist would ever
+  // hit, but well within range of a scripted host sending the next
+  // command every few seconds. This is the real, confirmed mechanism
+  // behind this entire session's "intermittent data loss" investigation
+  // -- line_buf here is the SAFE local scratch copy (shell_line_scratch_
+  // get(), a different buffer from the global shell_line_buf the ISR
+  // writes into), so printing from it after clear_line() is fully safe
+  // regardless of how long the print takes. Remove this block entirely
+  // once root-caused/confirmed fixed.
+  let _ = uart_puts("DISPATCH line_len=");
+  let _ = uart_put_hex32(line_len as u32);
+  let _ = uart_puts(" line=\"");
+  let _ = dharafs_print_data(line_buf, line_len);
+  let _ = uart_puts("\"\n");
 
   let cmd_end: i64 = shell_find_space(line_buf, 0, line_len);
 
@@ -47605,22 +47963,28 @@ fn poly1305_self_test() -> i64 {
 // round 36's own dharafs_block_dev toggle precedent.
 
 // Per-block AEAD metadata (write-counter + Poly1305 tag): fixes both
-// weaknesses above at once. A dedicated region starting at block 4000
-// (clear of DharaFS's own log region, blocks 1-2048, and the pre-
-// existing self-check's own test_block=3000), 16 fixed 32-byte
-// entries packed per 512-byte sector -- one entry per tracked data
-// block: 4-byte write-counter (big-endian) + 4-byte magic ("DHAC",
-// distinguishes a real entry from an uninitialized/garbage sector on
-// a fresh or foreign SD card) + 16-byte tag + 8 reserved bytes. A
-// missing/absent-magic entry means "this block has never been AEAD-
-// protected" (predates encryption being turned on, or was written
-// while it was off) -- the read path falls through to plain
-// passthrough for it rather than rejecting genuine, pre-existing
-// plaintext. This metadata is itself stored in the clear (it holds no
-// secret, only a public counter and a MAC tag) -- keeping it
-// unencrypted avoids a chicken-and-egg dependency on itself.
+// weaknesses above at once. A dedicated region starting at block 7600
+// (clear of DharaFS's own log region, blocks 1-7599 -- see dharafs_
+// init's own "ROOT-CAUSE FIX" comment, 2026-10-24, for why the log was
+// widened and why this metadata region had to move to stay clear of
+// it -- and clear of the self-check's own test_block, relocated to
+// 8100 in the same round), 16 fixed 32-byte entries packed per
+// 512-byte sector -- one entry per tracked data block: 4-byte write-
+// counter (big-endian) + 4-byte magic ("DHAC", distinguishes a real
+// entry from an uninitialized/garbage sector on a fresh or foreign SD
+// card) + 16-byte tag + 8 reserved bytes. A missing/absent-magic entry
+// means "this block has never been AEAD-protected" (predates
+// encryption being turned on, or was written while it was off) -- the
+// read path falls through to plain passthrough for it rather than
+// rejecting genuine, pre-existing plaintext. This metadata is itself
+// stored in the clear (it holds no secret, only a public counter and
+// a MAC tag) -- keeping it unencrypted avoids a chicken-and-egg
+// dependency on itself. ceil(7599/16)=474 sectors, spanning 7600-8074,
+// comfortably clear of both the log below it and the relocated
+// self-check block (8100) and rtl8188cu_fw_raw_sd_base_block (8192)
+// above it.
 fn dharafs_crypto_meta_sector_for(block_num: i64) -> i64 {
-  return 4000 + (block_num / 16);
+  return 7600 + (block_num / 16);
 }
 
 fn dharafs_crypto_meta_offset_for(block_num: i64) -> i64 {
@@ -47815,7 +48179,12 @@ fn dharafs_crypto_decrypt_block(block_num: i64, ciphertext: mut ref i64, out_pla
 // unaffected once this self-check returns.
 fn dharafs_encryption_self_check() -> i64 {
   let ok: i64 = 1;
-  let test_block: i64 = 3000;
+  // ROOT-CAUSE FIX (2026-10-24): relocated from 3000 -- that block now
+  // falls inside DharaFS's own widened log region (1-7599, see dharafs_
+  // init's own comment). 8100 sits in the real gap between the
+  // relocated crypto-metadata region (7600-8074) and
+  // rtl8188cu_fw_raw_sd_base_block (8192).
+  let test_block: i64 = 8100;
   let plaintext: mut ref i64 = dhruva_alloc_bytes(512);
   let i: i64 = 0;
   while i < 512 {
@@ -48665,9 +49034,41 @@ fn kernel_main() -> i64 {
   // brought up, with nothing in the log to explain why every later SD
   // operation was failing. Reported the same way dwc2_init's own
   // status already is, just below.
+  // 2026-10-24 follow-up: a single bare sdhost_init() call with no
+  // retry here used to mean one bad identification attempt (now that
+  // the ACMD41 "proceed anyway" bug right above this call site is
+  // fixed to actually report failure) just logged an error and fell
+  // straight through into dharafs_init() and beyond against a card
+  // that was never brought up -- functionally the same "proceed
+  // anyway" outcome as before the ACMD41 fix, just with a clearer
+  // message. sdhost_read_block/sdhost_write_block already retry their
+  // OWN wedge recovery up to SD_MAX_ATTEMPTS times with a backoff
+  // speed step (see their own header comments) -- this is the one
+  // sdhost_init call site that never got the same treatment, even
+  // though it's the single most real-hardware-timing-sensitive phase
+  // in this driver (every existing speed-reduction round's own
+  // comment agrees). Same shape, reused rather than reinvented: retry
+  // at the backoff speed, then at the base 1MHz again, before finally
+  // giving up and logging -- still bounded, still proceeds afterward
+  // either way (no retry budget here can prove the card will ever
+  // come up), but gives a genuinely marginal card the same real chance
+  // every other SD call site in this file already gets.
   let sd_status: i64 = sdhost_init();
+  let sd_init_attempt: i64 = 1;
+  while (sd_status < 0) && (sd_init_attempt < SD_MAX_ATTEMPTS) {
+    let _ = uart_puts("SD: sdhost_init FAILED (see the timeout message above for which command) -- retrying, attempt ");
+    let _ = uart_put_i64(sd_init_attempt + 1);
+    let _ = uart_puts("/");
+    let _ = uart_put_i64(SD_MAX_ATTEMPTS);
+    let _ = uart_puts("\n");
+    let backoff_hz: i64 = if sd_init_attempt == 1 { SD_SPEED_BACKOFF_HZ } else { 1000000 };
+    sd_status = sdhost_init_at_speed(backoff_hz);
+    sd_init_attempt = sd_init_attempt + 1;
+  }
   if sd_status < 0 {
-    let _ = uart_puts("SD: sdhost_init FAILED (see the timeout message above for which command)\n");
+    let _ = uart_puts("SD: sdhost_init FAILED after ");
+    let _ = uart_put_i64(SD_MAX_ATTEMPTS);
+    let _ = uart_puts(" attempts (see the timeout messages above) -- proceeding anyway, every later SD operation will fail\n");
   }
   // Task #308 follow-up: kick after the SD bring-up phase -- a board
   // that hangs INSIDE sdhost_init's own identification sequence (the

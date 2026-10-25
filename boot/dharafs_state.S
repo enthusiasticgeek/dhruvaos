@@ -133,6 +133,20 @@ dharafs_compact_pass_target:
                      * alongside resume_block/failed once a pass
                      * genuinely finishes. */
 
+/* ROOT-CAUSE FIX (2026-10-24, DharaFS persisted-checkpoint plan,
+ * Phase 1): scratch buffer for building/parsing the new DharaFS
+ * checkpoint record (magic/generation/log_start/log_end/crc32) -- same
+ * ping-pong + generation + CRC32 convention already proven for
+ * KernelSlotRecord (kernelslot_record_buf, boot/kernelupload_state.S)
+ * and KernelUploadChunkProgress, given its OWN dedicated buffer here
+ * for the exact same reason those two don't share one: a second
+ * persisted record sharing a scratch buffer with an unrelated one
+ * risks a read-modify-write mistake stomping the wrong record. */
+.section ".bss"
+.align 4
+dharafs_checkpoint_buf:
+    .space 512
+
 .section ".text"
 
 .global dharafs_state_set
@@ -255,4 +269,9 @@ dharafs_commit_count_increment:
 dharafs_commit_count_get:
     ldr r0, =dharafs_commit_count
     ldr r0, [r0]
+    bx lr
+
+.global dharafs_checkpoint_buf_get
+dharafs_checkpoint_buf_get:
+    ldr r0, =dharafs_checkpoint_buf
     bx lr
