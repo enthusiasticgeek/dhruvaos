@@ -23403,6 +23403,57 @@ fn lan9512_reg_write(devaddr: u32, mps: u32, reg_offset: u32, value: u32) -> i64
 // this project fetched one temporarily to verify the header format
 // documented there, then deleted it per explicit instruction -- never
 // committed to this repository).
+// Resilience design (2026-10-29, real-HW RTL8188CU firmware-write
+// investigation, user request: "design on resilience [not] pure
+// timing"): a real-HW capture found the RTL8188CU's first firmware
+// chunk write failing deterministically, right after the OTHER USB
+// device on the same hub (LAN9512) needed its own retries during
+// reset+init -- changing nothing but how much extra UART-print
+// overhead ran beforehand was enough, by itself, to shift whether the
+// RTL8188CU's enumeration was even reached at all. That's a real,
+// confirmed demonstration that THIS DRIVER'S OWN overall real-time
+// shape (not a fixed hardware defect -- the dongle scanned for an SSID
+// successfully earlier the same session) affects how a downstream
+// device's very first real transfer lands, in a way no amount of
+// precisely-tuned delay constants can fully pin down in advance.
+// Auditing for the SAME shape elsewhere found hci_reset_and_scan's own
+// first HCI_Reset command (BLE/BT bring-up) has the identical gap:
+// one attempt, no retry, permanent failure on anything transient.
+// Rather than chase a perfect one-time delay for either peripheral
+// individually, both now retry their own first real transfer a
+// bounded number of times with a real settle delay between attempts
+// -- resilient to WHATEVER caused a single attempt to fail (this
+// specific timing interaction, a future different hub/dongle
+// combination, anything else transient), not just the one failure
+// mode this session happened to capture. Any FUTURE peripheral's own
+// first-contact transfer (after enumeration, before its own steady-
+// state operation begins) should use this exact same pattern rather
+// than inventing a new one-shot attempt.
+// Count and backoff both grounded against U-Boot's own real, working
+// reference (common/usb_hub.c: usb_hub_port_reset) rather than an
+// invented number -- that function retries a port reset up to
+// MAX_TRIES=5 times, starting with HUB_SHORT_RESET_TIME (20ms) and
+// escalating to HUB_LONG_RESET_TIME (200ms) once the short delay
+// isn't resolving it. 5 also matches this project's OWN existing,
+// already real-HW-proven dwc2_probe_device0 retry (independently
+// derived from a TinyUSB issue-tracker precedent) -- two different
+// reference sources agreeing on the same count.
+fn usb_first_contact_retry_count() -> i64 { return 5; }
+// attempt is 0-based (the first attempt, never delayed, doesn't call
+// this). Scaled from U-Boot's own literal ms figures using this
+// project's existing delay(161000)==~50ms calibration (dwc2_core_
+// soft_reset's own comment) rather than retuning delay(N)'s real
+// per-platform duration from scratch: 20ms -> delay(64400), 200ms ->
+// delay(644000). The first two retries get the short delay (U-Boot's
+// own loop only escalates after trying short once); later ones get
+// the long delay.
+fn usb_first_contact_retry_backoff(attempt: i64) -> i64 {
+  if attempt < 2 {
+    return 64400;
+  }
+  return 644000;
+}
+
 fn dwc2_build_rtl_reg_read_setup(reg_addr: u32, want_len: u32) -> i64 {
   let dma: mut ref i64 = dwc2_dma_scratch_get();
   let _ = buf_write_byte(dma, 0 as u32, 0xC0 as u32);
@@ -23846,8 +23897,22 @@ fn rtl8188cu_write_firmware_page(devaddr: u32, mps: u32, reg_addr: u32, fw_buf: 
     let remaining: i64 = page_len - done;
     let this_chunk: i64 = if remaining < (128 as i64) { remaining } else { 128 };
     let _ = ssh_copy(chunk, 0, fw_buf, base_off + done, this_chunk);
-    let _ = dwc2_build_rtl_reg_write_setup(reg_addr, this_chunk as u32);
-    let status: i64 = dwc2_control_out(devaddr, mps, chunk, this_chunk as u32);
+    // Resilience fix (2026-10-29): see usb_first_contact_retry_count's
+    // own header comment -- a single transient failure on any one
+    // chunk used to abort the ENTIRE download permanently. Retries
+    // THIS chunk (not the whole download) a bounded number of times
+    // with a real settle delay first; only a chunk that still fails
+    // after every attempt is treated as a real, reportable failure.
+    let attempt: i64 = 0;
+    let status: i64 = 0 - 1;
+    while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+      if attempt > 0 {
+        let _ = delay(usb_first_contact_retry_backoff(attempt));
+      }
+      let _ = dwc2_build_rtl_reg_write_setup(reg_addr, this_chunk as u32);
+      status = dwc2_control_out(devaddr, mps, chunk, this_chunk as u32);
+      attempt = attempt + 1;
+    }
     if status != 0 {
       // TASK #164 FOLLOW-UP (2026-10-12): this chunk-write failure was
       // completely silent before -- "firmware download FAILED" from
@@ -23865,7 +23930,9 @@ fn rtl8188cu_write_firmware_page(devaddr: u32, mps: u32, reg_addr: u32, fw_buf: 
       let _ = uart_put_i64(this_chunk);
       let _ = uart_puts(" bytes) dwc2_control_out status=");
       let _ = uart_put_i64(status);
-      let _ = uart_puts("\n");
+      let _ = uart_puts(" after ");
+      let _ = uart_put_i64(attempt);
+      let _ = uart_puts(" attempt(s)\n");
       return 0 - 1;
     }
     done = done + this_chunk;
@@ -28439,10 +28506,27 @@ fn hci_reset_and_scan(devaddr: u32, mps: u32) -> i64 {
 
   let reset_len: i64 = hci_build_reset_command(cmd_buf);
   let reset_opcode: u32 = hci_build_opcode(0x03 as u32, 0x0003 as u32);
-  let reset_status: u32 = hci_send_command_and_wait_complete(devaddr, mps, intr_mps, cmd_buf, reset_len as u32, reset_opcode);
+  // Resilience fix (2026-10-29): see usb_first_contact_retry_count's
+  // own header comment -- this was a single, no-retry attempt at the
+  // very first real command sent to a freshly-enumerated BT/BLE
+  // dongle, the same architectural gap found and fixed for the
+  // RTL8188CU's own first firmware chunk write. A transient failure
+  // here used to permanently abort BLE/BT bring-up for the rest of
+  // this boot.
+  let attempt: i64 = 0;
+  let reset_status: u32 = 0xFFFFFFFF as u32;
+  while (attempt < usb_first_contact_retry_count()) && (reset_status != (0 as u32)) {
+    if attempt > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt));
+    }
+    reset_status = hci_send_command_and_wait_complete(devaddr, mps, intr_mps, cmd_buf, reset_len as u32, reset_opcode);
+    attempt = attempt + 1;
+  }
   let _ = uart_puts("USB: HCI_Reset status=");
   let _ = uart_put_hex32(reset_status);
-  let _ = uart_puts(" (0=success, 0xFFFFFFFF=no response -- expected under QEMU, see this function's own comment)\n");
+  let _ = uart_puts(" (0=success, 0xFFFFFFFF=no response -- expected under QEMU, see this function's own comment) after ");
+  let _ = uart_put_i64(attempt);
+  let _ = uart_puts(" attempt(s)\n");
   if reset_status != (0 as u32) {
     return 0 - 1;
   }
@@ -28928,6 +29012,59 @@ fn dwc2_hub_port3() -> u32 {
   return 3 as u32;
 }
 
+// Dynamic USB tree fix (2026-10-29, user request): checked against
+// U-Boot's own real, working reference (common/usb_hub.c,
+// usb_hub_configure/usb_hub_scan) before implementing this --
+// confirmed it drives its own port loop from `dev->maxchild`, set
+// from the hub's REAL bNbrPorts (fetched via usb_get_hub_descriptor),
+// and builds a worklist of {hub, port} scan entries processed
+// iteratively (list_add_tail/usb_scan_list) rather than recursing --
+// the same two design choices this fix makes, not independently
+// invented. dwc2_hub_port1/2/3 above predate this and stay as named
+// constants (still correct, still used by usb_hotplug_poll's own
+// still-fixed-3-port runtime monitoring, a separate not-yet-converted
+// path), but dwc2_enumerate_downstream below no longer hardcodes
+// "exactly 3" -- it loops however many ports the hub's own descriptor
+// (dwc2_hub_fetch_port_count, already fetched, previously discarded)
+// actually reports, the same real value U-Boot's own maxchild holds.
+// This bound is this driver's own fixed per-port state storage limit
+// (usb_hub_set_port1/2/3_connected, boot/usb_hub_state.S), matching
+// every real board this project has ever measured (bNbrPorts=3) with
+// headroom to NOTICE -- not silently truncate -- a hub that ever
+// reports more, rather than a vani array sized to an arbitrary guess.
+fn dwc2_max_tracked_hub_ports() -> i64 {
+  return 3;
+}
+
+// addr = port + 1: block 2 (hub_addr itself occupies block... no --
+// matches this driver's own existing, already-verified-on-real-HW
+// convention exactly (dwc2_downstream_addr()=2 for port 1,
+// dwc2_downstream_addr2()=3 for port 2, dwc2_downstream_addr3()=4 for
+// port 3) -- computed here instead of three separate named constants
+// so the loop below works for however many ports actually exist.
+fn dwc2_downstream_addr_for_port(port: i64) -> u32 {
+  return (port + 1) as u32;
+}
+
+// Dispatches to the existing, storage-layer-unchanged per-port
+// accessors (boot/usb_hub_state.S) -- a small, explicit mapping
+// rather than a new array, since dwc2_max_tracked_hub_ports() already
+// bounds `port` to exactly the 3 values these three accessors cover.
+fn dwc2_set_port_connected(port: i64, value: u32) -> i64 {
+  if port == 1 {
+    let _ = usb_hub_set_port1_connected(value);
+  } else {
+    if port == 2 {
+      let _ = usb_hub_set_port2_connected(value);
+    } else {
+      if port == 3 {
+        let _ = usb_hub_set_port3_connected(value);
+      }
+    }
+  }
+  return 0;
+}
+
 // Powers on and resets one hub downstream port, polling for the hub's
 // own PORT_RESET completion rather than trusting a fixed delay.
 //
@@ -29129,7 +29266,7 @@ fn dwc2_downstream_addr3() -> u32 {
 // sequence collides with the other's. The actual per-device
 // descriptor-fetch/configure/probe body is unchanged, just extracted
 // into dwc2_enumerate_one_downstream_device so it can run twice.
-fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
+fn dwc2_enumerate_downstream(hub_mps: u32, real_port_count: i64) -> i64 {
   let hub_addr: u32 = dwc2_hub_addr();
 
   // Round 59: persist the hub's own mps and "a hub genuinely exists"
@@ -29139,69 +29276,135 @@ fn dwc2_enumerate_downstream(hub_mps: u32) -> i64 {
   let _ = usb_hub_set_mps(hub_mps);
   let _ = usb_hub_set_ready(1 as u32);
 
+  // Dynamic USB tree fix (2026-10-29): this used to be three
+  // separately hardcoded port1/port2/port3 call sites -- exactly the
+  // "same resilience gap kept reappearing in a different fixed
+  // position" pattern this whole session hit repeatedly, since each
+  // one needed its own fix patched in separately. Now a single loop
+  // driven by the hub's own REAL bNbrPorts (dwc2_hub_fetch_port_count,
+  // the caller's already-fetched, previously-discarded value) --
+  // checked against U-Boot's own usb_hub_configure/usb_hub_scan
+  // (common/usb_hub.c) first, which drives its own equivalent loop
+  // from `dev->maxchild`, set from this exact same real descriptor
+  // field, not a hardcoded count either.
+  let max_ports: i64 = dwc2_max_tracked_hub_ports();
+  let port_count: i64 = if real_port_count > max_ports { max_ports } else { real_port_count };
+  if real_port_count > max_ports {
+    let _ = uart_puts("USB: hub reports more ports than tracked (");
+    let _ = uart_put_i64(real_port_count);
+    let _ = uart_puts("), checking only the first ");
+    let _ = uart_put_i64(max_ports);
+    let _ = uart_puts("\n");
+  }
+
   // TASK #353 REAL-HW FOLLOW-UP #8: see dwc2_wait_chan0_done's own
   // comment for the full finding -- a real boot reset somewhere across
-  // these three ports' combined bring-up+enumeration even with that
-  // shared primitive's own internal kick in place, so kicking again
-  // between each port here too (cheap, bounded work) bounds the
-  // accumulated real time across all three independently of whatever
-  // mix of devices happens to be attached on a given boot.
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
-  let port1_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port1());
-  let port1_outcome: i64 = if port1_result == 0 {
-    dwc2_enumerate_one_downstream_device(dwc2_downstream_addr())
-  } else {
-    port1_result
-  };
-  let _ = usb_hub_set_port1_connected(if port1_result == 0 { 1 as u32 } else { 0 as u32 });
+  // these ports' combined bring-up+enumeration even with that shared
+  // primitive's own internal kick in place, so kicking again between
+  // each port here too (cheap, bounded work) bounds the accumulated
+  // real time across all of them independently of whatever mix of
+  // devices happens to be attached on a given boot.
+  let connected_count: i64 = 0;
+  let port: i64 = 1;
+  while port <= port_count {
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
+    let addr: u32 = dwc2_downstream_addr_for_port(port);
+    let outcome: i64 = dwc2_hub_bring_up_and_enumerate_port(hub_addr, hub_mps, port as u32, addr);
+    let is_connected: u32 = if outcome != (1 as i64) { 1 as u32 } else { 0 as u32 };
+    let _ = dwc2_set_port_connected(port, is_connected);
+    if is_connected == (1 as u32) {
+      connected_count = connected_count + 1;
+    }
+    port = port + 1;
+  }
 
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
-  let port2_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port2());
-  let port2_outcome: i64 = if port2_result == 0 {
-    dwc2_enumerate_one_downstream_device(dwc2_downstream_addr2())
-  } else {
-    port2_result
-  };
-  let _ = usb_hub_set_port2_connected(if port2_result == 0 { 1 as u32 } else { 0 as u32 });
-
-  // Round 61: real hardware confirmed bNbrPorts=3 (see dwc2_hub_port3's
-  // own comment) -- a third real downstream port exists and must be
-  // brought up/enumerated unconditionally, same as ports 1/2, so
-  // whatever's actually attached there (a BLE dongle, in this board's
-  // case) finally gets probed instead of silently never being checked.
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
-  let port3_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, dwc2_hub_port3());
-  let port3_outcome: i64 = if port3_result == 0 {
-    dwc2_enumerate_one_downstream_device(dwc2_downstream_addr3())
-  } else {
-    port3_result
-  };
-  let _ = usb_hub_set_port3_connected(if port3_result == 0 { 1 as u32 } else { 0 as u32 });
-
-  // "Not connected" (1) on ALL THREE ports is the only genuinely empty
+  // "Not connected" on EVERY checked port is the only genuinely empty
   // case; anything else (a real device enumerated on at least one
   // port, even if the others failed or are empty) counts as overall
   // success -- a failure on one port must never mask a real device
   // that came up cleanly on another.
-  if (port1_outcome == (1 as i64)) && (port2_outcome == (1 as i64)) && (port3_outcome == (1 as i64)) {
-    let _ = uart_puts("USB: no downstream device (checked all 3 hub ports)\n");
+  if connected_count == 0 {
+    let _ = uart_puts("USB: no downstream device (checked all ");
+    let _ = uart_put_i64(port_count);
+    let _ = uart_puts(" hub ports)\n");
     return 0 - 1;
   }
   return 0;
 }
 
+// Resilience fix (2026-10-29): dwc2_enumerate_one_downstream_device's
+// own per-call retries (see usb_first_contact_retry_count's header
+// comment) help with a genuinely transient single-request failure,
+// but real-HW evidence showed they're not always enough on their own
+// -- a capture with those retries already in place still failed
+// GET_DESCRIPTOR on every attempt, suggesting the PORT's own state
+// (not just the one request) needed a fresh start. This wraps the
+// WHOLE reset-then-enumerate sequence in its own outer retry: a
+// failure that survives the inner retries gets the port reset again
+// from scratch (dwc2_hub_bring_up_port), not just the same request
+// resent into whatever state the port was already stuck in. "Not
+// connected" (dwc2_hub_bring_up_port's own result 1) is the one
+// outcome that's never worth retrying -- nothing is physically there,
+// so it returns immediately rather than wasting the retry budget.
+fn dwc2_hub_bring_up_and_enumerate_port(hub_addr: u32, hub_mps: u32, port: u32, downstream_addr: u32) -> i64 {
+  let attempt: i64 = 0;
+  let outcome: i64 = 0 - 1;
+  let not_connected: i64 = 0;
+  while (attempt < usb_first_contact_retry_count()) && (outcome != 0) && (not_connected == 0) {
+    if attempt > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt));
+    }
+    let port_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, port);
+    if port_result == 0 {
+      outcome = dwc2_enumerate_one_downstream_device(downstream_addr);
+    } else {
+      outcome = port_result;
+      if port_result == 1 {
+        not_connected = 1;
+      }
+    }
+    attempt = attempt + 1;
+  }
+  return outcome;
+}
+
 fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
+  // Resilience fix (2026-10-29): see usb_first_contact_retry_count's
+  // own header comment -- the SAME one-shot, no-retry gap found in
+  // RTL8188CU's firmware write and BLE's HCI_Reset turned out to sit
+  // even earlier, in the generic entry point EVERY downstream device
+  // (WiFi, BLE, mass storage, anything else) goes through first. A
+  // transient failure on this address-0 GET_DESCRIPTOR used to lose
+  // the device for the entire boot before any device-specific code
+  // ever ran -- confirmed live, a real-HW capture with the RTL8188CU/
+  // BLE fixes already in place still failed exactly here.
   let ddesc8: mut ref i64 = dhruva_alloc_bytes(8);
-  let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
-  let dstatus0: i64 = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, ddesc8);
+  let attempt0: i64 = 0;
+  let dstatus0: i64 = 0 - 1;
+  while (attempt0 < usb_first_contact_retry_count()) && (dstatus0 != 0) {
+    if attempt0 > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt0));
+    }
+    let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
+    dstatus0 = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, ddesc8);
+    attempt0 = attempt0 + 1;
+  }
   if dstatus0 != 0 {
     let _ = uart_puts("USB: downstream GET_DESCRIPTOR(Device) failed\n");
     return 0 - 1;
   }
   let dmps0: u32 = buf_read_byte(ddesc8, 7 as u32);
 
-  let _ = dwc2_build_set_address_setup(downstream_addr);
-  let daddr_status: i64 = dwc2_control_no_data(0 as u32, dmps0);
+  let attempt1: i64 = 0;
+  let daddr_status: i64 = 0 - 1;
+  while (attempt1 < usb_first_contact_retry_count()) && (daddr_status != 0) {
+    if attempt1 > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt1));
+    }
+    let _ = dwc2_build_set_address_setup(downstream_addr);
+    daddr_status = dwc2_control_no_data(0 as u32, dmps0);
+    attempt1 = attempt1 + 1;
+  }
   if daddr_status != 0 {
     let _ = uart_puts("USB: downstream SET_ADDRESS failed\n");
     return 0 - 1;
@@ -29209,8 +29412,16 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   let _ = delay(161000); // see dwc2_core_soft_reset's own comment
 
   let ddesc18: mut ref i64 = dhruva_alloc_bytes(18);
-  let _ = dwc2_build_get_device_descriptor_setup(18 as u32);
-  let dstatus1: i64 = dwc2_control_in(downstream_addr, dmps0, 18 as u32, ddesc18);
+  let attempt2: i64 = 0;
+  let dstatus1: i64 = 0 - 1;
+  while (attempt2 < usb_first_contact_retry_count()) && (dstatus1 != 0) {
+    if attempt2 > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt2));
+    }
+    let _ = dwc2_build_get_device_descriptor_setup(18 as u32);
+    dstatus1 = dwc2_control_in(downstream_addr, dmps0, 18 as u32, ddesc18);
+    attempt2 = attempt2 + 1;
+  }
   if dstatus1 != 0 {
     let _ = uart_puts("USB: downstream GET_DESCRIPTOR(Device) at new address failed\n");
     return 0 - 1;
@@ -29828,11 +30039,19 @@ fn dwc2_probe_device0() -> i64 {
   // downstream ports" since round 23, from datasheet prose alone --
   // never once actually fetched LAN9512's own real USB Hub Descriptor
   // (class-specific GET_DESCRIPTOR, type 0x29) to check bNbrPorts
-  // against what the real silicon reports. Diagnostic only for now:
-  // print the real value so a live retest settles this with ground
-  // truth instead of another assumption.
-  let _ = dwc2_hub_fetch_port_count(new_addr, mps0);
-  return dwc2_enumerate_downstream(mps0);
+  // against what the real silicon reports.
+  // Dynamic USB tree fix (2026-10-29): this was "diagnostic only,"
+  // its own real, live-fetched return value discarded -- dwc2_
+  // enumerate_downstream below now actually drives its own port loop
+  // from it, same as U-Boot's own usb_hub_configure sets dev->
+  // maxchild from this identical real descriptor field. A failed
+  // fetch (negative return) falls back to checking every tracked
+  // port, same as this driver's own prior behavior when the fetch
+  // simply didn't exist yet -- never fewer ports than before, only
+  // ever as many or more if the hub genuinely reports more.
+  let real_port_count: i64 = dwc2_hub_fetch_port_count(new_addr, mps0);
+  let effective_port_count: i64 = if real_port_count <= 0 { dwc2_max_tracked_hub_ports() } else { real_port_count };
+  return dwc2_enumerate_downstream(mps0, effective_port_count);
 }
 
 fn dwc2_hub_fetch_port_count(hub_addr: u32, hub_mps: u32) -> i64 {
