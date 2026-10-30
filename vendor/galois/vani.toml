@@ -1,0 +1,13 @@
+[package]
+name        = "galois"
+version     = "0.1.0"
+entry       = "src/lib.vani"
+authors     = "enthusiasticgeek"
+license     = "Apache-2.0"
+description = "Generic GF(2^m) finite-field arithmetic (caller-supplied degree and primitive polynomial, not hardcoded to one field) plus a binary BCH encoder/decoder with real bit-flip correction built on top. Pure vani, hardware-agnostic, heap-free -- fixed-size array parameters only."
+registry    = "kosh"
+
+[deps]
+# No external deps -- built entirely on vani builtins (wrapping_sub,
+# fixed [T; N] arrays, u8/u32/i64 arithmetic), same convention as
+# vani-aes and vani-crypto-hash.

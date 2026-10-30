@@ -1,0 +1,155 @@
+// Host-runnable validation for vani-galois. Run with:
+//   vanic run test/host_core_test.vani
+//
+// Exercises the exact (m=13, t=8) BCH parameters this package's own
+// motivating consumer (DhruvaOS's DharaFS NAND-FTL ECC layer) uses --
+// primitive polynomial 0x1B (x^13+x^4+x^3+x+1, verified irreducible,
+// and therefore primitive since 2^13-1=8191 is itself prime so every
+// nonzero non-unity field element already has full order 8191) and a
+// generator polynomial independently derived (minimal polynomials of
+// alpha^1..alpha^16, LCM'd together) and cross-checked against this
+// SAME test's own results via an independent from-scratch Python
+// reference implementation before this file was written (see this
+// package's README for the derivation recipe).
+
+use "../src/lib.vani";
+
+fn galois_fill_pattern(buf: mut ref [u8; 512]) -> i64 {
+  let i: i64 = 0;
+  while i < 512 {
+    buf[i] = ((i * 167) + 13) as u8;
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn galois_buffers_equal_512(a: ref [u8; 512], b: ref [u8; 512]) -> i64 {
+  let i: i64 = 0;
+  while i < 512 {
+    if a[i] != b[i] {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn galois_buffers_equal_32(a: ref [u8; 32], b: ref [u8; 32]) -> i64 {
+  let i: i64 = 0;
+  while i < 32 {
+    if a[i] != b[i] {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn main() -> i64 {
+  let prim_poly: u32 = 0x1b as u32;
+  let deg: i64 = 13;
+
+  print "=== GF(2^13) sanity ===";
+  // alpha = 2 must have multiplicative order exactly 8191 (field_mask(13)).
+  let n: u32 = galois_field_mask(deg);
+  let alpha_to_n: u32 = galois_pow(2 as u32, n, prim_poly, deg);
+  print "alpha^8191 =", alpha_to_n, " (expect 1)";
+  let alpha_to_1: u32 = galois_pow(2 as u32, 1 as u32, prim_poly, deg);
+  print "alpha^1 =", alpha_to_1, " (expect 2, not 1)";
+  // a * inv(a) == 1 for a few sample elements.
+  let sample: [u32; 4] = [3 as u32, 100 as u32, 5000 as u32, 8190 as u32];
+  let si: i64 = 0;
+  let gf_ok: i64 = 1;
+  while si < 4 {
+    let a: u32 = sample[si];
+    let inv_a: u32 = galois_inv(a, prim_poly, deg);
+    let prod: u32 = galois_mul(a, inv_a, prim_poly, deg);
+    if prod != (1 as u32) {
+      gf_ok = 0;
+      print "FAIL: a * inv(a) != 1 for a=", a, " got", prod;
+    }
+    si = si + 1;
+  }
+  print "a*inv(a)==1 for all samples:", gf_ok, " (expect 1)";
+
+  print "";
+  print "=== BCH(8191-ish, t=8) over GF(2^13) ===";
+  let gen_poly: [u8; 32] = [
+    0x23 as u8, 0xfb as u8, 0xc4 as u8, 0xc5 as u8, 0x41 as u8, 0x87 as u8, 0x13 as u8, 0x0c as u8,
+    0x7b as u8, 0xe0 as u8, 0x14 as u8, 0xf9 as u8, 0x15 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+  let data_bits: i64 = 512 * 8;
+  let parity_bits: i64 = 104;
+  let t: i64 = 8;
+
+  let original: [u8; 512] = [0 as u8; 512];
+  let _ = galois_fill_pattern(mut ref original);
+  let data: [u8; 512] = original;
+  let parity: [u8; 32] = bch_zero32_bytes();
+  let _ = bch_encode(ref data, data_bits, ref gen_poly, parity_bits, mut ref parity);
+
+  // Test 1: clean round trip, zero errors.
+  let data1: [u8; 512] = data;
+  let parity1: [u8; 32] = parity;
+  let nu1: i64 = bch_decode_correct(mut ref data1, data_bits, mut ref parity1, parity_bits, prim_poly, deg, t);
+  let match1: i64 = galois_buffers_equal_512(ref data1, ref original);
+  print "0 errors -> corrected=", nu1, " data unchanged=", match1, " (expect 0, 1)";
+
+  // Test 2: inject 1 bit error in the data portion, must correct back exactly.
+  let data2: [u8; 512] = data;
+  let parity2: [u8; 32] = parity;
+  let _ = bch_data_set_bit(mut ref data2, 777, bch_data_get_bit(ref data2, 777) ^ (1 as u32));
+  let nu2: i64 = bch_decode_correct(mut ref data2, data_bits, mut ref parity2, parity_bits, prim_poly, deg, t);
+  let match2: i64 = galois_buffers_equal_512(ref data2, ref original);
+  let pmatch2: i64 = galois_buffers_equal_32(ref parity2, ref parity);
+  print "1 error -> corrected=", nu2, " data restored=", match2, " parity restored=", pmatch2, " (expect 1, 1, 1)";
+
+  // Test 3: inject exactly t=8 simultaneous errors spread across data AND parity.
+  let data3: [u8; 512] = data;
+  let parity3: [u8; 32] = parity;
+  let positions3: [i64; 8] = [12 as i64, 403 as i64, 1999 as i64, 2750 as i64, 3333 as i64, 4001 as i64, 4050 as i64, 4090 as i64];
+  let pi3: i64 = 0;
+  while pi3 < 8 {
+    let pos: i64 = positions3[pi3];
+    // positions3 are within the full word's bit index (0..4199); first
+    // parity_bits=104 bits belong to parity, the rest to data.
+    if pos < parity_bits {
+      let cur: u32 = bch_small_get_bit(ref parity3, pos);
+      let _ = bch_small_set_bit(mut ref parity3, pos, cur ^ (1 as u32));
+    } else {
+      let dpos: i64 = pos - parity_bits;
+      let cur2: u32 = bch_data_get_bit(ref data3, dpos);
+      let _ = bch_data_set_bit(mut ref data3, dpos, cur2 ^ (1 as u32));
+    }
+    pi3 = pi3 + 1;
+  }
+  let nu3: i64 = bch_decode_correct(mut ref data3, data_bits, mut ref parity3, parity_bits, prim_poly, deg, t);
+  let match3: i64 = galois_buffers_equal_512(ref data3, ref original);
+  let pmatch3: i64 = galois_buffers_equal_32(ref parity3, ref parity);
+  print "8 errors -> corrected=", nu3, " data restored=", match3, " parity restored=", pmatch3, " (expect 8, 1, 1)";
+
+  // Test 4: inject t+1=9 errors -- must be detected as uncorrectable
+  // (return -1), never silently miscorrected.
+  let data4: [u8; 512] = data;
+  let parity4: [u8; 32] = parity;
+  let positions4: [i64; 9] = [5 as i64, 300 as i64, 900 as i64, 1500 as i64, 2100 as i64, 2800 as i64, 3400 as i64, 3900 as i64, 4150 as i64];
+  let pi4: i64 = 0;
+  while pi4 < 9 {
+    let pos: i64 = positions4[pi4];
+    if pos < parity_bits {
+      let cur: u32 = bch_small_get_bit(ref parity4, pos);
+      let _ = bch_small_set_bit(mut ref parity4, pos, cur ^ (1 as u32));
+    } else {
+      let dpos: i64 = pos - parity_bits;
+      let cur2: u32 = bch_data_get_bit(ref data4, dpos);
+      let _ = bch_data_set_bit(mut ref data4, dpos, cur2 ^ (1 as u32));
+    }
+    pi4 = pi4 + 1;
+  }
+  let nu4: i64 = bch_decode_correct(mut ref data4, data_bits, mut ref parity4, parity_bits, prim_poly, deg, t);
+  print "9 errors -> result=", nu4, " (expect -1, detected uncorrectable)";
+
+  return 0;
+}

@@ -287,6 +287,22 @@ extern "C" fn dharafs_catchup_path_buf_get() -> mut ref i64;
 extern "C" fn dharafs_catchup_data_buf_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_catchup_data_buf_get() -> mut ref i64;
+// NAND-FTL ECC side-table one-sector RAM cache (boot/dharafs_ecc_
+// state.S) -- see its own header comment for why this is a single
+// cached sector, not the whole 577-sector table, and why it must be
+// explicitly flushed at well-known points rather than on every write.
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_ecc_cache_set_sector_num(n: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_ecc_cache_get_sector_num() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_ecc_cache_set_dirty(d: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_ecc_cache_get_dirty() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_ecc_cache_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_ecc_cache_buf_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_stat_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -8468,6 +8484,20 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = watchdog_kick();
     }
     let result: i64 = sdhost_read_block_once(block_num, buf);
+    // NAND-FTL ECC: only reached once the hardware transfer itself
+    // already succeeded -- buf now holds whatever the card actually
+    // returned, this verifies/corrects it against the stored BCH
+    // parity. Hooked at this retry-wrapper level (not inside sdhost_
+    // read_block_once itself) deliberately: several raw diagnostic
+    // paths -- sd_wedge_checkpoint_print_one, shell_dispatch_sentdump/
+    // lrdump -- call sdhost_read_block_once directly, bypassing this
+    // wrapper, specifically so they still work even when the SD
+    // controller itself is wedged; entangling new ECC logic with that
+    // emergency-diagnostic path would be exactly backwards. A result
+    // of 9 (uncorrectable -- more than dharafs_ecc_param_t() bit
+    // errors) falls through the same retry-then-report-failure path
+    // every other nonzero result below already uses.
+    let result: i64 = if result == 0 { dharafs_ecc_verify_on_read(block_num, buf) } else { result };
     if result == 0 {
       return 0;
     }
@@ -8478,7 +8508,7 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
     if attempt < SD_MAX_ATTEMPTS {
       let backoff_hz: i64 = if attempt == 1 { SD_SPEED_BACKOFF_HZ } else { 0 };
       let _ = uart_puts("SD: read wedge detected (");
-      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { if result == 9 { "ECC uncorrectable" } else { "FSM stuck" } } });
       let _ = uart_puts(") -- resetting controller and retrying, attempt ");
       let _ = uart_put_i64(attempt + 1);
       let _ = uart_puts("/");
@@ -8491,7 +8521,7 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = sd_wedge_checkpoint(SD_WEDGE_CKPT_BLOCK_POST, 2 as u32, attempt as u32, result as u32);
     } else {
       let _ = uart_puts("SD: read wedge detected (");
-      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { if result == 9 { "ECC uncorrectable" } else { "FSM stuck" } } });
       let _ = uart_puts(") -- resetting controller, giving up after ");
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
       let _ = uart_puts(" attempts\n");
@@ -8835,6 +8865,19 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
     }
     let result: i64 = sdhost_write_block_once(block_num, buf);
     if result == 0 {
+      // NAND-FTL ECC: only reached once the hardware write itself
+      // already succeeded durably -- compute and cache this block's
+      // BCH parity against the data actually written, never against
+      // data that might still be retried with different bytes. Best-
+      // effort: a failure persisting/loading the ECC table sector
+      // itself never fails the primary write (dharafs_ecc_cache_
+      // ensure already falls back to a zeroed sector on its own read
+      // failure) -- same posture as dharafs_badblock_bitmap_persist.
+      // Hooked here, not inside sdhost_write_block_once, for the same
+      // emergency-diagnostic-path reason given on the read side (sd_
+      // wedge_checkpoint itself writes via sdhost_write_block_once
+      // directly, specifically so it still works mid-wedge).
+      let _ = dharafs_ecc_protect_on_write(block_num, buf);
       return 0;
     }
     if result == 3 {
@@ -8844,7 +8887,7 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
     if attempt < SD_MAX_ATTEMPTS {
       let backoff_hz: i64 = if attempt == 1 { SD_SPEED_BACKOFF_HZ } else { 0 };
       let _ = uart_puts("SD: write wedge detected (");
-      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { if result == 9 { "ECC uncorrectable" } else { "FSM stuck" } } });
       let _ = uart_puts(") -- resetting controller and retrying, attempt ");
       let _ = uart_put_i64(attempt + 1);
       let _ = uart_puts("/");
@@ -8857,7 +8900,7 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = sd_wedge_checkpoint(SD_WEDGE_CKPT_BLOCK_POST, 4 as u32, attempt as u32, result as u32);
     } else {
       let _ = uart_puts("SD: write wedge detected (");
-      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { "FSM stuck" } });
+      let _ = uart_puts(if result == 1 { "NEW_FLAG stuck" } else { if result == 4 { "FAIL_FLAG set" } else { if result == 9 { "ECC uncorrectable" } else { "FSM stuck" } } });
       let _ = uart_puts(") -- resetting controller, giving up after ");
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
       let _ = uart_puts(" attempts\n");
@@ -8866,6 +8909,270 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
     }
   }
   return 2;
+}
+
+// DharaFS NAND-FTL: software error-correction layer (ECC). vani-galois
+// (vendored at ../vendor/galois) supplies the generic GF(2^m) and BCH
+// math; everything below is DharaFS's own specific parameters, address
+// map, and RAM-cache wiring around it.
+use "../vendor/galois/src/lib.vani";
+
+// Real per-page NAND ECC needs genuine multi-bit correction, not just
+// torn-write detection -- modern (2026+) TLC/QLC flash has a much
+// higher raw bit-error rate than the classic single-bit-correcting
+// Hamming codes this project's own buf_checksum (boot/dharafs_buf.S)
+// was ever designed for. buf_checksum stays exactly as it is (a real,
+// load-bearing crash-consistency signal this project's recovery logic
+// already depends on) -- this ECC layer is additive, underneath it, at
+// the one true SD-driver chokepoint (sdhost_read_block_once/write_
+// block_once) rather than dharafs_block_read_raw/write_raw, because
+// checkpoint/badblock-bitmap/KernelSlotRecord/KernelUploadChunkProgress/
+// rtl8188cu-firmware I/O all bypass that higher layer and call
+// sdhost_read_block/write_block directly -- hooking in here is the
+// only way to cover all of them without six separate call-site edits.
+//
+// m=13, t=8: GF(2^13) (2^13-1=8191 is itself prime, so this field's
+// primitive polynomial 0x1B/x^13+x^4+x^3+x+1 is automatically primitive
+// too -- every nonzero non-unity element already has the full order
+// 8191, nothing else to check) with a BCH code correcting up to 8 bits
+// per 512-byte block. LDPC (the real answer for very high-density QLC
+// in production SSD controllers) is explicitly out of scope -- normally
+// hardware-accelerated, not realistic in software on this CPU with no
+// ECC engine. See vendor/galois/README.md's "Deriving a generator
+// polynomial" section for exactly how this generator was derived and
+// verified (independently cross-checked against a from-scratch Python
+// reference, including two real bugs that reference caught before this
+// code was ever trusted -- see that README for both).
+fn dharafs_ecc_param_prim_poly() -> u32 { return 0x1b as u32; }
+fn dharafs_ecc_param_m() -> i64 { return 13; }
+fn dharafs_ecc_param_t() -> i64 { return 8; }
+fn dharafs_ecc_param_data_bits() -> i64 { return 512 * 8; }
+fn dharafs_ecc_param_parity_bits() -> i64 { return 104; }
+
+fn dharafs_ecc_gen_poly() -> [u8; 32] {
+  return [
+    0x23 as u8, 0xfb as u8, 0xc4 as u8, 0xc5 as u8, 0x41 as u8, 0x87 as u8, 0x13 as u8, 0x0c as u8,
+    0x7b as u8, 0xe0 as u8, 0x14 as u8, 0xf9 as u8, 0x15 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8
+  ];
+}
+
+// Protected range: the DharaFS log and its own metadata (blocks
+// 0-9219: log 1-7599, crypto-meta 7600-8074, self-check 8100,
+// checkpoint 8101/8102, badblock bitmap 8103/8104, rtl8188cu firmware
+// 8192-8223, kernelslot 9216/9217, kernelupload-chunk-progress
+// 9218/9219) -- EXCLUDING kernel slots A/B (10240-34815) and the FAT32
+// boot partition (36864+). Kernel slots are flashed by PC-side tooling
+// (deploy_realhw_watchdog.sh -> update_kernel.sh/kernel_slot_layout.py)
+// writing raw bytes straight to the SD block device from Linux,
+// completely bypassing this ARM kernel's own sdhost_read_block/
+// write_block -- this ECC table would never get updated on a flash, so
+// protecting that range would silently go stale the moment a new
+// kernel image is deployed. Kernel slots already get a whole-image
+// SHA256 check at deploy time anyway (a stronger guarantee than
+// per-block BCH). The FAT32 partition is read entirely by the Pi's own
+// closed-source VideoCore bootloader before this kernel even runs; this
+// driver never touches it at all.
+fn dharafs_ecc_scope_end() -> i64 { return 9220; }
+// The ECC table's own backing blocks must be excluded from self-
+// coverage, or encoding/decoding a block of the table would recurse
+// into protecting the table itself.
+//
+// Base is 8228, NOT the start of the free gap found during this
+// round's own research (8224) -- that research missed four already-
+// in-use diagnostic blocks hiding as raw integer literals rather than
+// named constants: SD_WEDGE_CKPT_BLOCK_PRE/_POST (8224/8225, this same
+// file) and resume_pc_sentinel_bad's/lr_capture_ring's raw dumps
+// (8226/8227, written directly from boot/context_switch.S). Found by
+// widening the block-map search from named sector-accessor functions
+// to every raw numeric literal in the file before trusting "free" --
+// exactly the kind of near-miss that's worth it.
+fn dharafs_ecc_table_base() -> i64 { return 8228; }
+fn dharafs_ecc_table_sector_count() -> i64 { return 577; } // ceil(9220/16)
+
+fn dharafs_ecc_in_scope(block_num: i64) -> i64 {
+  if block_num < 0 {
+    return 0;
+  }
+  if block_num >= dharafs_ecc_scope_end() {
+    return 0;
+  }
+  if (block_num >= dharafs_ecc_table_base()) && (block_num < (dharafs_ecc_table_base() + dharafs_ecc_table_sector_count())) {
+    return 0;
+  }
+  return 1;
+}
+
+// 16 packed 32-byte entries per 512-byte sector, same convention as
+// dharafs_crypto_meta_sector_for/_offset_for (the existing side-table
+// precedent this mirrors) -- entry layout: [0:4) magic "DECC" /
+// [4:5) t / [5:6) m / [6:8) reserved / [8:32) parity (24-byte budget,
+// only the low 13 are ever nonzero at t=8/m=13; the rest is headroom
+// for a stronger t later without resizing the table).
+fn dharafs_ecc_table_sector_for(block_num: i64) -> i64 {
+  return dharafs_ecc_table_base() + (block_num / 16);
+}
+
+fn dharafs_ecc_table_offset_for(block_num: i64) -> i64 {
+  return (block_num % 16) * 32;
+}
+
+// Ensures the one-sector RAM cache (boot/dharafs_ecc_state.S) holds
+// `sector_num`, flushing whatever was cached before it if that sector
+// differs and is dirty. Sector 0 is never a real ECC-table sector (the
+// table starts at block 8228), so it doubles safely as the cache's own
+// "nothing loaded yet" sentinel.
+//
+// Uses sdhost_read_block_once/write_block_once directly -- NOT the
+// sdhost_read_block/write_block retry wrappers this whole ECC layer is
+// itself hooked into (see sdhost_read_block's own comment on its ECC
+// call site). Calling back into the wrapper here would be a genuine
+// self-recursive cycle (confirmed by vanic's own stack-depth checker,
+// which correctly rejected the first draft of this function for
+// exactly that reason: sdhost_write_block -> dharafs_ecc_protect_on_
+// write -> dharafs_ecc_cache_ensure -> sdhost_write_block again, an
+// unbounded-worst-case call graph regardless of the runtime dharafs_
+// ecc_in_scope() guard that happens to make it never actually loop --
+// the checker has no way to know that guard holds). Losing the retry
+// wrapper's reliability for the table's OWN I/O is an accepted,
+// bounded tradeoff: a failed table read/write only degrades to "can't
+// correct this sector's blocks until next successful access," never a
+// correctness bug (same posture as every other failure mode here).
+fn dharafs_ecc_cache_ensure(sector_num: i64) -> i64 {
+  let cur: u32 = dharafs_ecc_cache_get_sector_num();
+  if (cur as i64) == sector_num {
+    return 0;
+  }
+  if (cur != (0 as u32)) && (dharafs_ecc_cache_get_dirty() == (1 as u32)) {
+    let _ = sdhost_write_block_once(cur as i64, dharafs_ecc_cache_buf_get());
+  }
+  let cache_buf: mut ref i64 = dharafs_ecc_cache_buf_get();
+  let read_status: i64 = sdhost_read_block_once(sector_num, cache_buf);
+  if read_status != 0 {
+    let z: i64 = 0;
+    while z < 512 {
+      let _ = buf_write_byte(cache_buf, z as u32, 0 as u32);
+      z = z + 1;
+    }
+  }
+  let _ = dharafs_ecc_cache_set_sector_num(sector_num as u32);
+  let _ = dharafs_ecc_cache_set_dirty(0 as u32);
+  return 0;
+}
+
+// Flushes the currently-cached sector if dirty. Called from the same
+// three points dharafs_badblock_bitmap_persist() already is (compaction
+// completion, `reboot`, `shutdown`) -- same reasoning: a RAM cache that
+// only ever persists at well-known points, not after every mutation.
+// A crash before this runs only means blocks sharing the still-dirty
+// sector can't be CORRECTED if later found corrupted (falls back to
+// today's plain checksum-failure behavior) -- never that wrong data is
+// trusted. Uses sdhost_write_block_once directly, same cycle-avoidance
+// reasoning as dharafs_ecc_cache_ensure above.
+fn dharafs_ecc_cache_flush() -> i64 {
+  let cur: u32 = dharafs_ecc_cache_get_sector_num();
+  if (cur != (0 as u32)) && (dharafs_ecc_cache_get_dirty() == (1 as u32)) {
+    let _ = sdhost_write_block_once(cur as i64, dharafs_ecc_cache_buf_get());
+    let _ = dharafs_ecc_cache_set_dirty(0 as u32);
+  }
+  return 0;
+}
+
+// Computes this block's BCH parity and stores it in the ECC table's
+// RAM cache (marking it dirty -- persisted later by dharafs_ecc_cache_
+// flush(), not synchronously here, so an in-scope write never pays a
+// second physical SD round trip on the common case of writing several
+// blocks that share one table sector). Called from sdhost_write_block_
+// once, before any hardware register is touched.
+fn dharafs_ecc_protect_on_write(block_num: i64, buf: mut ref i64) -> i64 {
+  if dharafs_ecc_in_scope(block_num) == 0 {
+    return 0;
+  }
+  let plain: [u8; 512] = [0 as u8; 512];
+  let i: i64 = 0;
+  while i < 512 {
+    plain[i] = buf_read_byte(buf, i as u32) as u8;
+    i = i + 1;
+  }
+  let gen: [u8; 32] = dharafs_ecc_gen_poly();
+  let parity: [u8; 32] = bch_zero32_bytes();
+  let _ = bch_encode(ref plain, dharafs_ecc_param_data_bits(), ref gen, dharafs_ecc_param_parity_bits(), mut ref parity);
+
+  let sector_num: i64 = dharafs_ecc_table_sector_for(block_num);
+  let _ = dharafs_ecc_cache_ensure(sector_num);
+  let cache_buf: mut ref i64 = dharafs_ecc_cache_buf_get();
+  let off: i64 = dharafs_ecc_table_offset_for(block_num);
+  let _ = buf_write_u32_be(cache_buf, off as u32, 0x44454343 as u32); // "DECC"
+  let _ = buf_write_byte(cache_buf, (off + 4) as u32, dharafs_ecc_param_t() as u32);
+  let _ = buf_write_byte(cache_buf, (off + 5) as u32, dharafs_ecc_param_m() as u32);
+  let _ = buf_write_byte(cache_buf, (off + 6) as u32, 0 as u32);
+  let _ = buf_write_byte(cache_buf, (off + 7) as u32, 0 as u32);
+  let pi: i64 = 0;
+  while pi < 24 {
+    let _ = buf_write_byte(cache_buf, (off + 8 + pi) as u32, parity[pi] as u32);
+    pi = pi + 1;
+  }
+  let _ = dharafs_ecc_cache_set_dirty(1 as u32);
+  return 0;
+}
+
+// Verifies this block against its stored ECC parity, correcting it in
+// place if within the t=8 budget. Returns 0 (clean, or no stored entry
+// to check against -- a block written before ECC existed, or outside
+// this driver's own scope) or 9 (uncorrectable: more than t bit errors
+// -- never silently returns corrupted bytes as if they were good,
+// matching this driver's own existing checksum-failure error-reporting
+// convention). Called from sdhost_read_block_once, after a successful
+// hardware transfer, before its own final `return 0`.
+fn dharafs_ecc_verify_on_read(block_num: i64, buf: mut ref i64) -> i64 {
+  if dharafs_ecc_in_scope(block_num) == 0 {
+    return 0;
+  }
+  let sector_num: i64 = dharafs_ecc_table_sector_for(block_num);
+  let _ = dharafs_ecc_cache_ensure(sector_num);
+  let cache_buf: mut ref i64 = dharafs_ecc_cache_buf_get();
+  let off: i64 = dharafs_ecc_table_offset_for(block_num);
+  let magic: u32 = buf_read_u32_be(cache_buf, off as u32);
+  if magic != (0x44454343 as u32) {
+    return 0;
+  }
+  let plain: [u8; 512] = [0 as u8; 512];
+  let i: i64 = 0;
+  while i < 512 {
+    plain[i] = buf_read_byte(buf, i as u32) as u8;
+    i = i + 1;
+  }
+  let parity: [u8; 32] = bch_zero32_bytes();
+  let pi: i64 = 0;
+  while pi < 24 {
+    parity[pi] = buf_read_byte(cache_buf, (off + 8 + pi) as u32) as u8;
+    pi = pi + 1;
+  }
+  let corrected: i64 = bch_decode_correct(mut ref plain, dharafs_ecc_param_data_bits(), mut ref parity, dharafs_ecc_param_parity_bits(),
+                                          dharafs_ecc_param_prim_poly(), dharafs_ecc_param_m(), dharafs_ecc_param_t());
+  if corrected > 0 {
+    let j: i64 = 0;
+    while j < 512 {
+      let _ = buf_write_byte(buf, j as u32, plain[j] as u32);
+      j = j + 1;
+    }
+    let _ = uart_puts("DharaFS ECC: corrected ");
+    let _ = uart_put_hex32(corrected as u32);
+    let _ = uart_puts(" bit(s) in block ");
+    let _ = uart_put_hex32(block_num as u32);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+  if corrected < 0 {
+    let _ = uart_puts("DharaFS ECC: UNCORRECTABLE error in block ");
+    let _ = uart_put_hex32(block_num as u32);
+    let _ = uart_puts(" (more than ");
+    let _ = uart_put_hex32(dharafs_ecc_param_t() as u32);
+    let _ = uart_puts(" bit errors)\n");
+    return 9;
+  }
+  return 0;
 }
 
 // Round 36: block-device abstraction the FS layer's own raw block I/O
@@ -11271,6 +11578,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
       // check already makes this a no-op on any pass that cleared
       // nothing.
       let _ = dharafs_badblock_bitmap_persist();
+      let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
       // Re-enabled (2026-10-30): see dharafs_init's own matching
       // comment for why the 2026-10-24 A/B disable's suspicion of THIS
       // call was almost certainly misdirected -- the real mechanism
@@ -34783,6 +35091,7 @@ fn shell_dispatch_shutdown() -> i64 {
   // "no further writes will occur" claim becomes true. No-op if
   // nothing's dirty.
   let _ = dharafs_badblock_bitmap_persist();
+  let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
   let _ = uart_puts("\n");
   let _ = uart_puts("Dhruva: halting. No further writes will occur.\n");
   let _ = uart_puts("*** SAFE TO POWER OFF NOW ***\n");
@@ -35598,6 +35907,7 @@ fn shell_dispatch() -> i64 {
     // holds the ceiling lock above, so no concurrent writer can dirty
     // it again before the reset fires. A no-op if nothing's dirty.
     let _ = dharafs_badblock_bitmap_persist();
+    let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
     let _ = uart_puts("rebooting...\n");
     let _ = watchdog_arm(1 as u32);
     return 0;
@@ -49733,6 +50043,9 @@ fn kernel_main() -> i64 {
   let _ = dharafs_catchup_buf_set(dhruva_alloc_bytes(512));
   let _ = dharafs_catchup_path_buf_set(dhruva_alloc_bytes(32));
   let _ = dharafs_catchup_data_buf_set(dhruva_alloc_bytes(20480));
+  // NAND-FTL ECC side-table's one-sector RAM cache -- see boot/
+  // dharafs_ecc_state.S's own header comment.
+  let _ = dharafs_ecc_cache_buf_set(dhruva_alloc_bytes(512));
   let _ = dharafs_stat_scratch_set(dhruva_alloc_bytes(12));
   let _ = dharafs_dir_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_log_path_scratch_set(dhruva_alloc_bytes(32));

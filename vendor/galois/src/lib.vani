@@ -1,0 +1,425 @@
+// vani-galois v0.1.0 -- generic GF(2^m) finite-field arithmetic and a
+// binary BCH codec built on top of it, pure vani, hardware-agnostic
+// and heap-free (fixed-size array parameters only, no allocator, no
+// extern "C" dependency).
+//
+// Unlike vani-aes's `gf256_mul` (deliberately hardcoded to GF(2^8)
+// with AES's own fixed reduction polynomial, because AES's field never
+// varies) this package takes the field's degree and primitive
+// polynomial as plain function arguments -- the actual parameters that
+// DO vary across different consumers of finite-field math (a BCH ECC
+// scheme over GF(2^13), a different consumer needing GF(2^16), etc).
+// See README.md for the full scope decisions and how the multiply
+// algorithm itself is a direct, verified generalization of vani-aes's
+// own GF(2^8) carry-less-multiply-with-reduction loop to an arbitrary
+// degree.
+//
+// The BCH generator polynomial for a given (field degree, t) is NOT
+// computed by this package at runtime -- deriving it (minimal
+// polynomials of 2t consecutive field elements, LCM'd together) is a
+// one-time, per-(m,t) offline derivation, not something any embedded
+// consumer should pay for on every boot. Callers precompute their own
+// generator polynomial's coefficient bytes once (see README.md for the
+// exact offline recipe) and pass them in as a parameter, the same way
+// `bch_encode`/`bch_decode_correct` take the field's own primitive
+// polynomial as a parameter rather than deriving irreducible
+// polynomials at runtime.
+
+// ---------------------------------------------------------------------
+// Generic GF(2^m) arithmetic
+// ---------------------------------------------------------------------
+
+// Mask selecting the low `deg` bits -- i.e. 2^deg - 1, the field's own
+// element range [0, 2^deg).
+fn galois_field_mask(deg: i64) -> u32 {
+  return ((1 as u32) << (deg as u32)) - (1 as u32);
+}
+
+// Multiply two elements of GF(2^deg), reducing modulo the primitive
+// polynomial `prim_poly` (its own leading x^deg term is implicit --
+// `prim_poly` holds only the lower-degree terms, exactly how vani-aes's
+// `gf256_mul` already encodes AES's own x^8+x^4+x^3+x+1 as the bare
+// constant 27/0x1B). `deg` must be in [1, 31] (so a field element and
+// the mask both fit in u32 with no overflow).
+fn galois_mul(a: u32, b: u32, prim_poly: u32, deg: i64) -> u32 {
+  let mask: u32 = galois_field_mask(deg);
+  let hibit_shift: u32 = (deg as u32) - (1 as u32);
+  let result: u32 = 0 as u32;
+  let av: u32 = a & mask;
+  let i: i64 = 0;
+  while i < deg {
+    let bit: u32 = (b >> (i as u32)) & (1 as u32);
+    let bmask: u32 = wrapping_sub(0 as u32, bit) & mask;
+    result = result ^ (av & bmask);
+    let hibit: u32 = (av >> hibit_shift) & (1 as u32);
+    let hmask: u32 = wrapping_sub(0 as u32, hibit) & mask;
+    av = ((av << (1 as u32)) ^ (prim_poly & hmask)) & mask;
+    i = i + 1;
+  }
+  return result;
+}
+
+// a^e in GF(2^deg), via square-and-multiply.
+fn galois_pow(a: u32, e: u32, prim_poly: u32, deg: i64) -> u32 {
+  let result: u32 = 1 as u32;
+  let base: u32 = a;
+  let exp: u32 = e;
+  while exp > (0 as u32) {
+    if (exp & (1 as u32)) == (1 as u32) {
+      result = galois_mul(result, base, prim_poly, deg);
+    }
+    base = galois_mul(base, base, prim_poly, deg);
+    exp = exp >> (1 as u32);
+  }
+  return result;
+}
+
+// Multiplicative inverse of a nonzero element of GF(2^deg): a^(2^deg-2),
+// since every nonzero element satisfies a^(2^deg-1) = 1.
+fn galois_inv(a: u32, prim_poly: u32, deg: i64) -> u32 {
+  let order_minus2: u32 = galois_field_mask(deg) - (1 as u32);
+  return galois_pow(a, order_minus2, prim_poly, deg);
+}
+
+// ---------------------------------------------------------------------
+// Fixed-size bit-array helpers. Bit index j (0-indexed) means the
+// coefficient of x^j throughout this package -- byte j/8, bit (j%8)
+// within that byte, consistently for every buffer below. This choice
+// is purely internal to this package's own encode/decode pair and
+// carries no significance outside it.
+// ---------------------------------------------------------------------
+
+fn bch_data_get_bit(buf: ref [u8; 512], bit_index: i64) -> u32 {
+  let byte_idx: i64 = bit_index / 8;
+  let bit_in_byte: i64 = bit_index % 8;
+  return ((buf[byte_idx] as u32) >> (bit_in_byte as u32)) & (1 as u32);
+}
+
+fn bch_data_set_bit(buf: mut ref [u8; 512], bit_index: i64, value: u32) -> i64 {
+  let byte_idx: i64 = bit_index / 8;
+  let bit_in_byte: i64 = bit_index % 8;
+  let bmask: u8 = ((1 as u32) << (bit_in_byte as u32)) as u8;
+  if value == (1 as u32) {
+    buf[byte_idx] = buf[byte_idx] | bmask;
+  } else {
+    buf[byte_idx] = buf[byte_idx] & ((255 as u8) ^ bmask);
+  }
+  return 0;
+}
+
+fn bch_small_get_bit(buf: ref [u8; 32], bit_index: i64) -> u32 {
+  let byte_idx: i64 = bit_index / 8;
+  let bit_in_byte: i64 = bit_index % 8;
+  return ((buf[byte_idx] as u32) >> (bit_in_byte as u32)) & (1 as u32);
+}
+
+fn bch_small_set_bit(buf: mut ref [u8; 32], bit_index: i64, value: u32) -> i64 {
+  let byte_idx: i64 = bit_index / 8;
+  let bit_in_byte: i64 = bit_index % 8;
+  let bmask: u8 = ((1 as u32) << (bit_in_byte as u32)) as u8;
+  if value == (1 as u32) {
+    buf[byte_idx] = buf[byte_idx] | bmask;
+  } else {
+    buf[byte_idx] = buf[byte_idx] & ((255 as u8) ^ bmask);
+  }
+  return 0;
+}
+
+fn bch_zero32_bytes() -> [u8; 32] {
+  return [0 as u8; 32];
+}
+
+// A bit at overall position j (0 = lowest degree) in the logical
+// (parity ++ data) word: positions [0, parity_bits) come from `parity`
+// (its own degree j), positions [parity_bits, parity_bits+data_bits)
+// come from `data` (degree j - parity_bits within data). This mirrors
+// the codeword c(x) = message(x)*x^parity_bits + remainder(x): the
+// remainder occupies the low-degree end, the message the high end.
+fn bch_word_get_bit(data: ref [u8; 512], parity: ref [u8; 32], parity_bits: i64, j: i64) -> u32 {
+  if j < parity_bits {
+    return bch_small_get_bit(parity, j);
+  }
+  return bch_data_get_bit(data, j - parity_bits);
+}
+
+fn bch_word_flip_bit(data: mut ref [u8; 512], parity: mut ref [u8; 32], parity_bits: i64, j: i64) -> i64 {
+  if j < parity_bits {
+    let cur: u32 = bch_small_get_bit(parity, j);
+    return bch_small_set_bit(parity, j, cur ^ (1 as u32));
+  }
+  let cur2: u32 = bch_data_get_bit(data, j - parity_bits);
+  return bch_data_set_bit(data, j - parity_bits, cur2 ^ (1 as u32));
+}
+
+// ---------------------------------------------------------------------
+// BCH systematic encode: parity_out(x) = (data(x) * x^parity_bits) mod
+// gen_poly(x), computed via the standard LFSR/shift-register binary
+// polynomial division (the same mechanism a hardware CRC uses, just
+// with a wider register and a BCH generator instead of a CRC
+// polynomial). `gen_poly` holds the generator's own low-degree terms
+// (its implicit leading coefficient at degree `parity_bits` is NOT
+// included, same convention as `prim_poly` above).
+//
+// `data_bits` may be less than 512*8 -- this naturally implements a
+// SHORTENED BCH code (the standard technique for a message length that
+// isn't exactly 2^deg-1): the "missing" high-degree message bits are
+// implicitly zero and never computed or transmitted, which is exactly
+// what omitting them from this loop already does.
+// ---------------------------------------------------------------------
+
+fn bch_encode(data: ref [u8; 512], data_bits: i64,
+              gen_poly: ref [u8; 32], parity_bits: i64,
+              parity_out: mut ref [u8; 32]) -> i64 {
+  let register: [u8; 32] = bch_zero32_bytes();
+  // Feed the data MSB-first (degree data_bits-1 down to degree 0) --
+  // exactly `data_bits` clocks, NOT data_bits+parity_bits. The virtual
+  // x^parity_bits shift (making this compute data(x)*x^parity_bits mod
+  // gen_poly(x), not just data(x) mod gen_poly(x)) is already implicit
+  // in this feedback structure across those `data_bits` clocks alone;
+  // an earlier draft of this function added `parity_bits` more
+  // zero-input "flush" clocks after the data, which does NOT belong
+  // here -- that doubles the effective shift and was caught by cross-
+  // checking this exact loop, by hand, against a direct polynomial
+  // (data(x) << parity_bits) mod gen_poly(x) computation before ever
+  // trusting it (see README.md's "Verifying this package" section).
+  let i: i64 = data_bits - 1;
+  while i >= 0 {
+    let input_bit: u32 = bch_data_get_bit(data, i);
+    let msb: u32 = bch_small_get_bit(ref register, parity_bits - 1);
+    let feedback: u32 = msb ^ input_bit;
+    let k: i64 = parity_bits - 1;
+    while k > 0 {
+      let prev: u32 = bch_small_get_bit(ref register, k - 1);
+      let _ = bch_small_set_bit(mut ref register, k, prev);
+      k = k - 1;
+    }
+    let _ = bch_small_set_bit(mut ref register, 0, 0 as u32);
+    if feedback == (1 as u32) {
+      let j: i64 = 0;
+      while j < parity_bits {
+        let a: u32 = bch_small_get_bit(ref register, j);
+        let b: u32 = bch_small_get_bit(gen_poly, j);
+        let _ = bch_small_set_bit(mut ref register, j, a ^ b);
+        j = j + 1;
+      }
+    }
+    i = i - 1;
+  }
+  let m: i64 = 0;
+  while m < 32 {
+    parity_out[m] = register[m];
+    m = m + 1;
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------
+// BCH decode with correction.
+//
+// Evaluates the received (data ++ parity) word at alpha^1 .. alpha^2t
+// (the syndromes); if all are zero, the word is unchanged -- no errors
+// detected. Otherwise runs Peterson-Gorenstein-Zierler: try locating
+// exactly nu errors for nu = t, t-1, ... 1 (the largest nu for which
+// the syndrome matrix is non-singular AND the resulting error-locator
+// polynomial's roots, found via Chien search over every real bit
+// position, number exactly nu AND make every syndrome of the corrected
+// word vanish -- this last re-verification is what turns "a
+// mathematically consistent nu-error hypothesis" into "confirmed
+// correct," rejecting the rare miscorrection a search beyond the true
+// error count can otherwise produce).
+//
+// Returns the number of bits corrected (0 if already clean, up to
+// `t`), or -1 if the word has more than `t` errors (detected, NOT
+// silently miscorrected -- `data`/`parity` are left untouched in this
+// case).
+//
+// `t` must be <= galois_bch_max_t() (8, matching the only real
+// consumer's own t=8 need as of v0.1.0 -- this package's fixed
+// internal buffer sizes are the limit, not any property of BCH
+// itself). Raise galois_bch_max_t() and the three buffer sizes below
+// together (syn to 2t+1, sigma to t+1, the aug matrix to t*(t+1)) if a
+// future consumer genuinely needs stronger correction than that --
+// each one was deliberately sized to exactly t=8's own need, not
+// padded with untested headroom, so this is a real resize, not just
+// flipping a constant.
+// ---------------------------------------------------------------------
+
+fn galois_bch_max_t() -> i64 { return 8; }
+
+fn bch_syndrome(data: ref [u8; 512], parity: ref [u8; 32], parity_bits: i64, total_bits: i64,
+                power: i64, prim_poly: u32, deg: i64) -> u32 {
+  let n: u32 = galois_field_mask(deg);
+  let alpha_power: u32 = galois_pow(2 as u32, (power as u32) % (n + (1 as u32)), prim_poly, deg);
+  let result: u32 = 0 as u32;
+  let k: i64 = total_bits - 1;
+  while k >= 0 {
+    let bit: u32 = bch_word_get_bit(data, parity, parity_bits, k);
+    result = galois_mul(result, alpha_power, prim_poly, deg) ^ bit;
+    k = k - 1;
+  }
+  return result;
+}
+
+// Solves the nu x nu Peterson-Gorenstein-Zierler linear system for the
+// error-locator coefficients sigma_1..sigma_nu (sigma_0 == 1 always).
+// mat[r][c] = syn[nu+r-c], rhs[r] = syn[nu+r+1] (both 0-indexed r,c),
+// stored as one flat row-major array -- the same "no native 2D array,
+// flatten row-major" convention vani-discrete's own adjacency matrix
+// already uses. Returns 1 if the system is singular (try a smaller
+// nu), 0 on success with sigma_out[0..nu] filled in.
+fn galois_pgz_solve(syn: ref [u32; 17], nu: i64, prim_poly: u32, deg: i64,
+                     sigma_out: mut ref [u32; 9]) -> i64 {
+  let width: i64 = nu + 1;
+  let aug: [u32; 72] = [0 as u32; 72];
+  let r: i64 = 0;
+  while r < nu {
+    let c: i64 = 0;
+    while c < nu {
+      aug[r * width + c] = syn[nu + r - c];
+      c = c + 1;
+    }
+    aug[r * width + nu] = syn[nu + r + 1];
+    r = r + 1;
+  }
+  let col: i64 = 0;
+  while col < nu {
+    let piv: i64 = -1;
+    let row: i64 = col;
+    while row < nu {
+      if aug[row * width + col] != (0 as u32) {
+        piv = row;
+        break;
+      }
+      row = row + 1;
+    }
+    if piv < 0 {
+      return 1;
+    }
+    if piv != col {
+      let k: i64 = 0;
+      while k < width {
+        let tmp: u32 = aug[col * width + k];
+        aug[col * width + k] = aug[piv * width + k];
+        aug[piv * width + k] = tmp;
+        k = k + 1;
+      }
+    }
+    let inv: u32 = galois_inv(aug[col * width + col], prim_poly, deg);
+    let k2: i64 = 0;
+    while k2 < width {
+      aug[col * width + k2] = galois_mul(aug[col * width + k2], inv, prim_poly, deg);
+      k2 = k2 + 1;
+    }
+    let row2: i64 = 0;
+    while row2 < nu {
+      if row2 != col {
+        let factor: u32 = aug[row2 * width + col];
+        if factor != (0 as u32) {
+          let k3: i64 = 0;
+          while k3 < width {
+            aug[row2 * width + k3] = aug[row2 * width + k3] ^ galois_mul(factor, aug[col * width + k3], prim_poly, deg);
+            k3 = k3 + 1;
+          }
+        }
+      }
+      row2 = row2 + 1;
+    }
+    col = col + 1;
+  }
+  sigma_out[0] = 1 as u32;
+  let i: i64 = 0;
+  while i < nu {
+    sigma_out[i + 1] = aug[i * width + nu];
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Evaluates sigma(x) = sigma_out[0] + sigma_out[1]*x + ... at
+// x = alpha^(-j), returning 1 if that's a root (i.e. position j is an
+// error location).
+fn galois_pgz_is_root_at(sigma: ref [u32; 9], nu: i64, j: i64, n: u32, prim_poly: u32, deg: i64) -> i64 {
+  let neg_j: u32 = n - ((j as u32) % (n + (1 as u32)));
+  let xe: u32 = galois_pow(2 as u32, neg_j, prim_poly, deg);
+  let val: u32 = 0 as u32;
+  let xek: u32 = 1 as u32;
+  let k: i64 = 0;
+  while k <= nu {
+    val = val ^ galois_mul(sigma[k], xek, prim_poly, deg);
+    xek = galois_mul(xek, xe, prim_poly, deg);
+    k = k + 1;
+  }
+  if val == (0 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+fn bch_decode_correct(data: mut ref [u8; 512], data_bits: i64,
+                       parity: mut ref [u8; 32], parity_bits: i64,
+                       prim_poly: u32, deg: i64, t: i64) -> i64 {
+  let total_bits: i64 = data_bits + parity_bits;
+  let n: u32 = galois_field_mask(deg);
+  let syn: [u32; 17] = [0 as u32; 17];
+  let all_zero: i64 = 1;
+  let p: i64 = 1;
+  while p <= (2 * t) {
+    syn[p] = bch_syndrome(data, parity, parity_bits, total_bits, p, prim_poly, deg);
+    if syn[p] != (0 as u32) {
+      all_zero = 0;
+    }
+    p = p + 1;
+  }
+  if all_zero == 1 {
+    return 0;
+  }
+
+  let nu: i64 = t;
+  while nu >= 1 {
+    let sigma: [u32; 9] = [0 as u32; 9];
+    let singular: i64 = galois_pgz_solve(ref syn, nu, prim_poly, deg, mut ref sigma);
+    if singular == 0 {
+      let positions: [i64; 8] = [0 as i64; 8];
+      let found: i64 = 0;
+      let j: i64 = 0;
+      while j < total_bits {
+        if found <= nu {
+          let is_root: i64 = galois_pgz_is_root_at(ref sigma, nu, j, n, prim_poly, deg);
+          if is_root == 1 {
+            if found < nu {
+              positions[found] = j;
+            }
+            found = found + 1;
+          }
+        }
+        j = j + 1;
+      }
+      if found == nu {
+        let f: i64 = 0;
+        while f < nu {
+          let _ = bch_word_flip_bit(data, parity, parity_bits, positions[f]);
+          f = f + 1;
+        }
+        let verify_ok: i64 = 1;
+        let vp: i64 = 1;
+        while vp <= (2 * t) {
+          let vs: u32 = bch_syndrome(data, parity, parity_bits, total_bits, vp, prim_poly, deg);
+          if vs != (0 as u32) {
+            verify_ok = 0;
+          }
+          vp = vp + 1;
+        }
+        if verify_ok == 1 {
+          return nu;
+        }
+        let f2: i64 = 0;
+        while f2 < nu {
+          let _ = bch_word_flip_bit(data, parity, parity_bits, positions[f2]);
+          f2 = f2 + 1;
+        }
+      }
+    }
+    nu = nu - 1;
+  }
+  return -1;
+}

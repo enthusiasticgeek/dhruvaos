@@ -13572,15 +13572,23 @@ DHDL peripheral in the same sense.
   existing DWC2 USB stack. Needs its own research-fork scoping pass first — these two paths share almost
   nothing protocol-wise, so which one applies depends entirely on the specific hardware being targeted.
 
-- **DharaFS raw NAND flash backend** (task #346) — DharaFS currently only targets SD/MMC via `sdhost`
-  (block-level, with the card's own onboard FTL handling wear-leveling/bad-block management
-  transparently). Raw NAND flash has no onboard FTL — ECC (bit-flip correction), wear-leveling, and
-  bad-block management would all need to live in this driver instead. DharaFS's own log-structured
-  append-only design is actually a reasonable philosophical fit (NAND already wants sequential writes,
-  not in-place rewrites), but `dharafs_block_read`/`dharafs_block_write`'s current SD-specific
-  implementation underneath that log format would need a genuinely new NAND-specific backend, not just a
-  new board target. Needs a research-fork scoping pass (real NAND controller on whatever target board,
-  ECC scheme, bad-block table format) before any implementation starts.
+- **DharaFS raw NAND flash backend** (task #346) — **ECC sub-piece DONE (2026-10-30)**: real per-block
+  BCH(GF(2^13), t=8) error correction, with correction strength genuinely configurable (not a fixed
+  single-bit Hamming code), is live and QEMU-proven (`test/ecc_bit_flip_test.py`: 1-8 simultaneous bit
+  errors corrected exactly, 9 correctly detected as uncorrectable with no miscorrection). The real
+  insertion point turned out to be one level lower than this note originally guessed:
+  `sdhost_read_block`/`sdhost_write_block` (the retry wrappers), not `dharafs_block_read`/
+  `dharafs_block_write` — several subsystems (checkpoint, badblock bitmap, `KernelSlotRecord`,
+  `KernelUploadChunkProgress`, rtl8188cu firmware) bypass the higher layer and call the retry wrappers
+  directly, so hooking there was the only way to cover all of them without six separate call-site edits.
+  The generic GF(2^m)/BCH math lives in a new, independently reusable kosh package (`vani-galois`,
+  vendored at `vendor/galois`) rather than inline in `kernel_main.vani` — field degree/primitive
+  polynomial/correction strength are all caller-supplied parameters, not hardcoded to this one consumer.
+  **Still open**: wear-leveling and real erase-unit (program/erase, not freely-overwritable) discipline —
+  scoped in `~/.claude/plans/silly-questing-pie.md` as Rounds D/E, sequenced after the real space-
+  reclaiming compaction work (Round B) those two rounds build on. Needs a real NAND controller target
+  board before any of this can be tested beyond the SD-card software stand-in this round proved the
+  algorithm against.
 
 ## A/B kernel slots (task #352): real-HW dress rehearsal found and fixed three QEMU-invisible bugs; one gap remains, needs a physical reflash (2026-10-12)
 
