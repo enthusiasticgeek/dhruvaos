@@ -29396,26 +29396,6 @@ fn dwc2_enumerate_downstream(hub_mps: u32, real_port_count: i64) -> i64 {
     port = port + 1;
   }
 
-  // TEMP DIAGNOSTIC (2026-10-29, user: "can you not shutdown power to
-  // 1 of the two usb ports via lan9512 chipset?"): both external ports
-  // (2 and 3) fail GET_DESCRIPTOR identically on every attempt even
-  // after a real power-cycle, with two totally unrelated chipsets
-  // (WiFi + BLE dongles, both LEDs confirmed lit -- VBUS present)
-  // seated -- ruling out a device-specific quirk. This isolates
-  // "both external ports are broken regardless of load" from "the
-  // external rail can't supply two simultaneously-attached devices,
-  // each works fine alone" by forcing one port's VBUS off via
-  // CLEAR_PORT_FEATURE(PORT_POWER) (the same primitive dwc2_hub_
-  // power_cycle_port already uses) and re-attempting the other alone,
-  // then swapping which one is powered -- all in one boot, no
-  // physical access needed. Only meaningful if wHubCharacteristics'
-  // LPSM (see dwc2_hub_fetch_port_count's own print) reports
-  // individual switching (01); gated on port_count>=3 since it
-  // targets ports 2 and 3 specifically. Remove once root-caused.
-  if port_count >= 3 {
-    let _ = dwc2_single_port_power_experiment(hub_addr, hub_mps);
-  }
-
   // "Not connected" on EVERY checked port is the only genuinely empty
   // case; anything else (a real device enumerated on at least one
   // port, even if the others failed or are empty) counts as overall
@@ -29427,43 +29407,6 @@ fn dwc2_enumerate_downstream(hub_mps: u32, real_port_count: i64) -> i64 {
     let _ = uart_puts(" hub ports)\n");
     return 0 - 1;
   }
-  return 0;
-}
-
-// TEMP DIAGNOSTIC (2026-10-29): see the call site's own comment in
-// dwc2_enumerate_downstream for the full rationale. Forces port 3's
-// VBUS off, brings port 2 up and enumerates it alone, then forces
-// port 2's VBUS off and port 3's back on and enumerates port 3 alone
-// -- a controlled, same-boot A/B test of whether either external port
-// can enumerate successfully when it isn't sharing the rail with the
-// other. Restores port 2's power afterward so the rest of boot isn't
-// left with a port deliberately depowered.
-fn dwc2_single_port_power_experiment(hub_addr: u32, hub_mps: u32) -> i64 {
-  let port2: u32 = 2 as u32;
-  let port3: u32 = 3 as u32;
-  let addr2: u32 = dwc2_downstream_addr_for_port(2);
-  let addr3: u32 = dwc2_downstream_addr_for_port(3);
-
-  let _ = uart_puts("USB DIAG: single-port power experiment starting\n");
-
-  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port3, hub_feature_port_power());
-  let _ = delay(161000);
-  let outcome2: i64 = dwc2_hub_bring_up_and_enumerate_port(hub_addr, hub_mps, port2, addr2);
-  let _ = uart_puts("USB DIAG: port2 alone (port3 powered off) outcome=");
-  let _ = uart_put_i64(outcome2);
-  let _ = uart_puts("\n");
-
-  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port2, hub_feature_port_power());
-  let _ = delay(161000);
-  let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port3, hub_feature_port_power());
-  let _ = delay(161000);
-  let outcome3: i64 = dwc2_hub_bring_up_and_enumerate_port(hub_addr, hub_mps, port3, addr3);
-  let _ = uart_puts("USB DIAG: port3 alone (port2 powered off) outcome=");
-  let _ = uart_put_i64(outcome3);
-  let _ = uart_puts("\n");
-
-  let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port2, hub_feature_port_power());
-  let _ = delay(161000);
   return 0;
 }
 
