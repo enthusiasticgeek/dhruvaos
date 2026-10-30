@@ -102,6 +102,53 @@ dharafs_compact_failed:
                      * when a genuinely FRESH pass starts (resume
                      * cursor was 0), so an old pass's failure can
                      * never leak into a new one. */
+dharafs_gc_erase_cursor:
+    .word 0        /* Round B: 0 = not in the erase phase (either no
+                     * pass in progress, or still in the SCAN phase --
+                     * see dharafs_compact_resume_block for that case).
+                     * Nonzero = the scan phase already finished
+                     * cleanly and this pass is now zeroing the vacated
+                     * range [this cursor, dharafs_compact_pass_target)
+                     * one dharafs_compact_blocks_per_call()-sized chunk
+                     * at a time, same per-call WCET budget as the scan
+                     * phase and the same reason: an unbounded single-
+                     * call erase sweep would reopen the exact
+                     * unbounded-cost gap Round 77 fixed for the scan
+                     * itself. Set to dharafs_gc_write_cursor's own
+                     * final value the moment the scan phase completes
+                     * successfully; reset to 0 (alongside write_cursor
+                     * and the three scan-phase fields) either once the
+                     * erase phase itself finishes and commits, or
+                     * immediately if any single erase/verify step
+                     * fails -- the latter abandons this pass entirely
+                     * rather than trying to resume erase from the
+                     * exact failure point, same "this pass is over,
+                     * log_start never moved, a future fresh pass
+                     * naturally retries the whole thing" philosophy
+                     * the scan phase's own failure handling already
+                     * uses. */
+dharafs_gc_write_cursor:
+    .word 0        /* Round B (real space-reclaiming compaction,
+                     * 2026-10-30): where this pass's own relocated
+                     * records physically land -- separate from
+                     * dharafs_next_block (the real append frontier
+                     * every OTHER writer targets). Reset to log_start
+                     * at the start of a genuinely FRESH pass (resume_
+                     * block was 0), same lifecycle as pass_target
+                     * below; persists across resumed calls otherwise.
+                     * Safe to write into [log_start, blk) at any point
+                     * during the scan: every block in that range has
+                     * already been examined by THIS pass and is either
+                     * already relocated earlier in this same cursor's
+                     * own output, or proven not needed by anything
+                     * live -- no other writer ever targets a block
+                     * below the real next_block, so nothing else can
+                     * collide with it. See dharafs_compact's own
+                     * header comment for why log_start itself must NOT
+                     * advance to cover this relocated range (unlike
+                     * the pre-Round-B design, where carried-forward
+                     * data moved BEYOND old_next_block, not within
+                     * it). */
 dharafs_compact_pass_target:
     .word 0        /* 43rd SD round (2026-09-27), found live under
                      * phase4_milestone.py once real SD I/O started
@@ -219,6 +266,32 @@ dharafs_compact_set_pass_target:
 .global dharafs_compact_get_pass_target
 dharafs_compact_get_pass_target:
     ldr r0, =dharafs_compact_pass_target
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_gc_set_write_cursor
+dharafs_gc_set_write_cursor:
+    ldr r1, =dharafs_gc_write_cursor
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_gc_get_write_cursor
+dharafs_gc_get_write_cursor:
+    ldr r0, =dharafs_gc_write_cursor
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_gc_set_erase_cursor
+dharafs_gc_set_erase_cursor:
+    ldr r1, =dharafs_gc_erase_cursor
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_gc_get_erase_cursor
+dharafs_gc_get_erase_cursor:
+    ldr r0, =dharafs_gc_erase_cursor
     ldr r0, [r0]
     bx lr
 

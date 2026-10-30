@@ -3500,6 +3500,16 @@ extern "C" fn dharafs_compact_get_failed() -> u32;
 extern "C" fn dharafs_compact_set_pass_target(target: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_compact_get_pass_target() -> u32;
+// Round B (real space-reclaiming compaction) -- see boot/dharafs_
+// state.S's own header comment on dharafs_gc_write_cursor.
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_gc_set_write_cursor(cursor: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_gc_get_write_cursor() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_gc_set_erase_cursor(cursor: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_gc_get_erase_cursor() -> u32;
 // Hashed directory index (boot/dirindex_state.S) -- see that file's own
 // header comment. Pure RAM-only lookup accelerator for
 // dharafs_find_latest_block_raw, never a correctness authority by
@@ -10345,6 +10355,200 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
   return 0;
 }
 
+// Round B (real space-reclaiming compaction): a relocation-aware
+// sibling of dharafs_append_raw above, for dharafs_compact's own
+// carry-forward writes. Differs in exactly three ways, each load-
+// bearing:
+//
+// 1. Writes at an explicit `target_block`/`preserve_seq` instead of
+//    implicitly drawing dharafs_state_get_next_block()/get_next_seq()
+//    -- dharafs_compact's own write_cursor is a position WITHIN the
+//    range still being scanned, not the real append frontier every
+//    other writer in the system targets; drawing from the real
+//    frontier here would silently write this pass's own relocated
+//    data OUTSIDE its intended write_cursor position.
+// 2. Never calls dharafs_state_set to advance the global next_block/
+//    next_seq -- those belong to every OTHER writer in the system;
+//    this function's own caller tracks write_cursor's advancement
+//    itself, by this function's own return value (see below), not by
+//    reading back global state.
+// 3. `preserve_seq` keeps the record's ORIGINAL sequence number
+//    rather than drawing a fresh one -- essential for dharafs_find_
+//    block_as_of_raw (a live snapshot's own lookup) to keep finding
+//    the exact same logical version after relocation, not a record
+//    that's silently aged to look newer than it really is. `update_
+//    dirindex` (1 or 0) must be 1 only when relocating a path's
+//    CURRENT latest copy -- relocating an older, snapshot-only-needed
+//    version must NOT point the fast-path cache at it, or ordinary
+//    (non-snapshot) lookups for that path would start returning stale
+//    data instead of the real latest version.
+//
+// Returns the number of blocks written on success (>= 1 -- the
+// caller advances write_cursor by exactly this much), or 0 on
+// failure. Never touches target_block's own log_max_blk bound beyond
+// a defensive check -- dharafs_compact's own write_cursor invariant
+// (never ahead of the scan position, which is always < old_next_block
+// < dharafs_log_max_blk()) already guarantees this can't overflow in
+// practice.
+fn dharafs_append_raw_relocate(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64,
+                                owner_uid: u32, owner_gid: u32, mode: u32,
+                                target_block: i64, preserve_seq: u32, update_dirindex: i64) -> i64 {
+  if path_len <= 0 {
+    return 0;
+  }
+  if path_len > 32 {
+    return 0;
+  }
+  if data_len > dharafs_file_max_len() {
+    return 0;
+  }
+
+  let cap: i64 = dharafs_block_payload_cap();
+  if data_len <= cap {
+    let buf: mut ref i64 = dharafs_sd_scratch_get();
+    if (target_block + 1) > dharafs_log_max_blk() {
+      return 0;
+    }
+    let _ = buf_write_u32(buf, 4 as u32, preserve_seq);
+    let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+    let i: i64 = 0;
+    while i < path_len {
+      let b: u32 = buf_read_byte(path_buf, i as u32);
+      let _ = buf_write_byte(buf, (12 + i) as u32, b);
+      i = i + 1;
+    }
+    let _ = buf_write_u32(buf, 44 as u32, data_len as u32);
+    let _ = buf_write_u32(buf, 48 as u32, 0 as u32);
+    let _ = buf_write_u32(buf, 52 as u32, owner_uid);
+    let _ = buf_write_u32(buf, 56 as u32, owner_gid);
+    let _ = buf_write_u32(buf, 60 as u32, mode);
+    let _ = buf_copy_bytes(buf, 64 as u32, data_buf, 0 as u32, data_len as u32);
+
+    let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+    let wr_status: i64 = dharafs_block_write(target_block, buf);
+    if wr_status != 0 {
+      return 0;
+    }
+    let _ = dharafs_badblock_clear(target_block);
+    if update_dirindex == 1 {
+      let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, target_block);
+    }
+    return 1;
+  }
+
+  let num_chunks: i64 = (data_len + cap - 1) / cap;
+  let base_block: i64 = target_block;
+  let base_seq: u32 = preserve_seq;
+  if (base_block + num_chunks) > dharafs_log_max_blk() {
+    return 0;
+  }
+
+  let chunk_idx: i64 = num_chunks - 1;
+  while chunk_idx >= 0 {
+    let this_block: i64 = base_block + chunk_idx;
+    let this_seq: u32 = base_seq + (chunk_idx as u32);
+    let is_head: i64 = if chunk_idx == 0 { 1 } else { 0 };
+    let chunk_offset: i64 = chunk_idx * cap;
+    let remaining_from_here: i64 = data_len - chunk_offset;
+    let chunk_len: i64 = if remaining_from_here < cap { remaining_from_here } else { cap };
+    let is_last_chunk: i64 = if chunk_idx == (num_chunks - 1) { 1 } else { 0 };
+    let next_block_field: u32 = if is_last_chunk == 1 { 0 as u32 } else { (base_block + chunk_idx + 1) as u32 };
+
+    let buf: mut ref i64 = dharafs_sd_scratch_get();
+    let _ = buf_write_u32(buf, 4 as u32, this_seq);
+    if is_head == 1 {
+      let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+      let i: i64 = 0;
+      while i < path_len {
+        let b: u32 = buf_read_byte(path_buf, i as u32);
+        let _ = buf_write_byte(buf, (12 + i) as u32, b);
+        i = i + 1;
+      }
+      let _ = buf_write_u32(buf, 44 as u32, data_len as u32);
+      let _ = buf_write_u32(buf, 52 as u32, owner_uid);
+      let _ = buf_write_u32(buf, 56 as u32, owner_gid);
+      let _ = buf_write_u32(buf, 60 as u32, mode);
+    } else {
+      let _ = buf_write_u32(buf, 8 as u32, 0 as u32);
+      let z: i64 = 0;
+      while z < 32 {
+        let _ = buf_write_byte(buf, (12 + z) as u32, 0 as u32);
+        z = z + 1;
+      }
+      let _ = buf_write_u32(buf, 44 as u32, chunk_len as u32);
+      let _ = buf_write_u32(buf, 52 as u32, 0 as u32);
+      let _ = buf_write_u32(buf, 56 as u32, 0 as u32);
+      let _ = buf_write_u32(buf, 60 as u32, 0 as u32);
+    }
+    let _ = buf_write_u32(buf, 48 as u32, next_block_field);
+    let _ = buf_copy_bytes(buf, 64 as u32, data_buf, chunk_offset as u32, chunk_len as u32);
+
+    let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+    let wr_status: i64 = dharafs_block_write(this_block, buf);
+    if wr_status != 0 {
+      return 0;
+    }
+    let _ = dharafs_badblock_clear(this_block);
+    chunk_idx = chunk_idx - 1;
+  }
+
+  if update_dirindex == 1 {
+    let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, base_block);
+  }
+  return num_chunks;
+}
+
+// Round B: same relocation-aware adaptation as dharafs_append_raw_
+// relocate above, for dharafs_delete_raw's own tombstone writes (a
+// tombstone never chains, so this is always exactly one block).
+// Returns 0 on success, nonzero on failure -- matching dharafs_
+// delete_raw's own convention, unlike the append sibling above (a
+// tombstone's block count is always and trivially 1, so there's no
+// ambiguity a richer return value would need to resolve).
+fn dharafs_delete_raw_relocate(path_buf: mut ref i64, path_len: i64, target_block: i64, preserve_seq: u32, update_dirindex: i64) -> i64 {
+  if path_len <= 0 {
+    return 1;
+  }
+  if path_len > 32 {
+    return 1;
+  }
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  if (target_block + 1) > dharafs_log_max_blk() {
+    return 1;
+  }
+
+  let _ = buf_write_u32(buf, 4 as u32, preserve_seq);
+  let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+  let i: i64 = 0;
+  while i < path_len {
+    let b: u32 = buf_read_byte(path_buf, i as u32);
+    let _ = buf_write_byte(buf, (12 + i) as u32, b);
+    i = i + 1;
+  }
+  let _ = buf_write_u32(buf, 44 as u32, 0xFFFFFFFF as u32);
+  let _ = buf_write_u32(buf, 48 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 52 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 56 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 60 as u32, 0 as u32);
+
+  let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+  let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+  let wr_status: i64 = dharafs_block_write(target_block, buf);
+  if wr_status != 0 {
+    return 1;
+  }
+  let _ = dharafs_badblock_clear(target_block);
+  if update_dirindex == 1 {
+    let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, target_block);
+  }
+  return 0;
+}
+
 // Round 42: preserve-on-overwrite semantics, matching ordinary Unix
 // behavior -- writing to an existing file doesn't change its owner/
 // group/mode. Looks up the file's current metadata first (dharafs_stat);
@@ -11143,6 +11347,90 @@ fn dharafs_snapshot_pinned_seq_raw(name_buf: mut ref i64, name_len: i64) -> i64 
   return snapshot_pinned_seq_get_at(slot as u32);
 }
 
+// Round B (real space-reclaiming compaction): the sibling query
+// dharafs_find_block_as_of_raw doesn't provide -- "what's the NEXT
+// (smallest) real sequence number for this path strictly after
+// `after_seq`," rather than "the latest one at or below a horizon."
+// Same full-scan shape (deliberately not dirindex-accelerated, same
+// reasoning as dharafs_find_block_as_of_raw's own comment: dirindex
+// only ever tracks the current latest block, never historical
+// versions). Returns -1 if no such record exists (after_seq's record
+// is still the newest one for this path).
+fn dharafs_find_next_seq_for_path_raw(path_buf: mut ref i64, path_len: i64, after_seq: u32) -> i64 {
+  let next_block: u32 = dharafs_state_get_next_block();
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let found: i64 = 0;
+  let best_seq: u32 = 0 as u32;
+  let blk: i64 = 1;
+  while (blk as u32) < next_block {
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
+    let rd_status: i64 = dharafs_block_read(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) && (rec_seq > after_seq) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        if (rec_path_len as i64) == path_len {
+          let matches: i64 = 1;
+          let k: i64 = 0;
+          while k < path_len {
+            let want: u32 = buf_read_byte(path_buf, k as u32);
+            let got: u32 = buf_read_byte(buf, (12 + k) as u32);
+            if got != want {
+              matches = 0;
+            }
+            k = k + 1;
+          }
+          if matches == 1 {
+            if (found == 0) || (rec_seq < best_seq) {
+              best_seq = rec_seq;
+              found = 1;
+            }
+          }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  if found == 1 {
+    return best_seq as i64;
+  }
+  return 0 - 1;
+}
+
+// Round B: is a record at (path, rec_seq) still needed by SOME live
+// snapshot, even though it's not the path's current latest copy?
+// True exactly when some live snapshot's pinned horizon is >= rec_seq
+// AND there is no OTHER record for this same path with a seq strictly
+// between rec_seq and that horizon (inclusive) -- i.e. rec_seq is
+// genuinely "the latest version as of that snapshot's own moment,"
+// the exact answer dharafs_find_block_as_of_raw would need to
+// reconstruct for it. Cheap (8 flag checks) when no snapshot is live
+// at all; the expensive part (a full-log scan per check, via
+// dharafs_find_next_seq_for_path_raw) only runs per live snapshot
+// whose horizon could plausibly need THIS specific record -- compaction
+// already throttles to one scanned block per call (dharafs_compact_
+// blocks_per_call), so this is bounded, not unbounded, even then.
+fn dharafs_gc_record_needed_by_live_snapshot(path_buf: mut ref i64, path_len: i64, rec_seq: u32) -> i64 {
+  let i: i64 = 0;
+  while i < snapshot_max_slots() {
+    if snapshot_valid_get_at(i as u32) == 1 {
+      let pinned: i64 = snapshot_pinned_seq_get_at(i as u32);
+      if (rec_seq as i64) <= pinned {
+        let next: i64 = dharafs_find_next_seq_for_path_raw(path_buf, path_len, rec_seq);
+        if (next < 0) || (next > pinned) {
+          return 1;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
 // Reads `path`'s content exactly AS OF the moment `name` was created
 // -- -1 if the snapshot name is unknown, or if `path` had no live
 // (non-tombstoned) record for it at that moment (never written yet
@@ -11316,7 +11604,162 @@ fn dharafs_compact_blocks_per_call() -> i64 {
   return 1;
 }
 
+// Round B's own bounded, resumable ERASE phase -- zeroes and read-back-
+// verifies [cursor, target) one dharafs_compact_blocks_per_call()-sized
+// chunk at a time, same per-call WCET budget and reasoning as the scan
+// phase (an unbounded single-call sweep here would reopen the exact
+// gap Round 77 closed for the scan). Returns 1 if the WHOLE range
+// [cursor, target) is now confirmed zeroed (caller may advance past
+// it), 0 if this call's own budget ran out first (call again later),
+// or -1 if a write/read-back/verify failed anywhere (caller must
+// abandon the pass, not retry from the failure point -- see this
+// function's own caller for why that's the right posture here).
+fn dharafs_gc_erase_range_step(buf: mut ref i64, cursor: i64, target: i64) -> i64 {
+  let c: i64 = cursor;
+  let budget: i64 = dharafs_compact_blocks_per_call();
+  let done: i64 = 0;
+  while ((c as u32) < (target as u32)) && (done < budget) {
+    let z: i64 = 0;
+    while z < 512 {
+      let _ = buf_write_byte(buf, z as u32, 0 as u32);
+      z = z + 1;
+    }
+    let wr_status: i64 = dharafs_block_write(c, buf);
+    if wr_status != 0 {
+      return 0 - 1;
+    }
+    let rd_status: i64 = dharafs_block_read(c, buf);
+    if rd_status != 0 {
+      return 0 - 1;
+    }
+    let zz: i64 = 0;
+    let all_zero: i64 = 1;
+    while zz < 512 {
+      if buf_read_byte(buf, zz as u32) != (0 as u32) {
+        all_zero = 0;
+      }
+      zz = zz + 1;
+    }
+    if all_zero == 0 {
+      return 0 - 1;
+    }
+    let _ = dharafs_gc_set_erase_cursor((c + 1) as u32);
+    c = c + 1;
+    done = done + 1;
+  }
+  if (c as u32) >= (target as u32) {
+    return 1;
+  }
+  return 0;
+}
+
 fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) -> i64 {
+  // Round B: the scan phase below already finished (cleanly) on a
+  // prior call, and this pass is now working through the bounded
+  // erase phase that comes after it -- see boot/dharafs_state.S's own
+  // header comment on dharafs_gc_erase_cursor for the full state-
+  // machine shape. Checked before anything else (including the "not
+  // worth the SD traffic" short-circuit just below, which only makes
+  // sense for a FRESH pass decision) since an in-progress erase phase
+  // must always be allowed to continue regardless of how short the
+  // log currently looks.
+  let erase_cursor: u32 = dharafs_gc_get_erase_cursor();
+  if erase_cursor != (0 as u32) {
+    let erase_target: i64 = dharafs_compact_get_pass_target() as i64;
+    let erase_step_result: i64 = dharafs_gc_erase_range_step(buf, erase_cursor as i64, erase_target);
+    if erase_step_result < 0 {
+      // Abandon this pass entirely -- log_start was never advanced for
+      // this pass, so a future fresh pass naturally retries the same
+      // region from scratch. Same posture the scan phase's own
+      // failure handling already uses, not a resume-from-failure.
+      let _ = dharafs_gc_set_erase_cursor(0 as u32);
+      let _ = dharafs_gc_set_write_cursor(0 as u32);
+      let _ = dharafs_compact_set_resume_block(0 as u32);
+      let _ = dharafs_compact_set_failed(0 as u32);
+      let _ = dharafs_compact_set_pass_target(0 as u32);
+      return 0;
+    }
+    if erase_step_result == 0 {
+      // Hit this call's own erase budget -- dharafs_gc_erase_range_step
+      // already persisted the new cursor position internally.
+      return 0;
+    }
+    // The whole vacated range is now zeroed and confirmed blank --
+    // commit: shrink next_block to where this pass's own relocated
+    // output actually ends, persist the badblock bitmap/ECC cache (the
+    // exact same "batch up, flush at a durable commit point" cadence
+    // as everything else committed here), and write a fresh checkpoint.
+    //
+    // log_start is deliberately NOT advanced here, unlike the pre-
+    // Round-B design (which used to set it to old_next_block): THIS
+    // pass's own relocated data lives WITHIN [log_start, old_next_
+    // block), not beyond it like the old tail-appending design -- the
+    // live/needed records this pass just carried forward physically
+    // sit between log_start and the new (shrunk) next_block, so a
+    // future boot's recovery scan still needs to start at log_start to
+    // find them. The actual win is next_block shrinking: the vacated
+    // range just zeroed becomes badblock-bitmap-cacheable as blank on
+    // every FUTURE boot (cheap, no real SD read) instead of forever
+    // costing a real read as genuinely-written-but-superseded data
+    // would have under the old design, which never physically reclaimed
+    // anything.
+    //
+    // ROOT-CAUSE FIX (found live, via a real phase4_milestone.py
+    // regression -- /milestone/note vanished from `ls` after a GC
+    // pass): next_block only shrinks to write_cursor_final when
+    // old_next_block (erase_target -- this pass's own frozen scan
+    // boundary) is STILL the real current next_block at commit time.
+    // A pass can run across many calls and real wall-clock time
+    // (bounded per call, not per pass); other writers keep appending
+    // to the real frontier the whole time, landing at and beyond
+    // old_next_block, completely unrelated to this pass's own work.
+    // Unconditionally setting next_block = write_cursor_final (the
+    // first version of this fix) silently discarded every single one
+    // of those real, valid, already-durably-written records -- this
+    // function has no way to "know" about them without checking
+    // first. When something WAS appended in the meantime, this pass
+    // still zeroed a perfectly real dead range (safe and worth
+    // keeping -- the erase phase already committed that, not reverted
+    // here) but must leave next_block exactly where it really is,
+    // leaving a badblock-bitmap-cacheable "hole" in the middle of the
+    // log rather than at its tail; a LATER pass, whenever the hole
+    // does happen to reach the real tail, shrinks it for real then.
+    let write_cursor_final: u32 = dharafs_gc_get_write_cursor();
+    let real_next_block_now: u32 = dharafs_state_get_next_block();
+    if erase_target == (real_next_block_now as i64) {
+      let _ = dharafs_state_set(write_cursor_final, dharafs_state_get_next_seq());
+    }
+    let _ = dharafs_badblock_bitmap_persist();
+    let _ = dharafs_ecc_cache_flush();
+    let current_log_start: u32 = dharafs_state_get_log_start();
+    let old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+    let checkpoint_target: i64 = if old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref old_checkpoint) } else { dharafs_checkpoint_block_a() };
+    let checkpoint_generation: u32 = if old_checkpoint.valid == 1 { old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
+    let checkpoint_log_end: u32 = dharafs_state_get_next_block();
+    let _ = dharafs_checkpoint_write(checkpoint_generation, current_log_start, checkpoint_log_end, checkpoint_target);
+    let verify: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+    let verify_ok: i64 = if (verify.valid == 1) && (verify.generation == checkpoint_generation) && (verify.log_start == current_log_start) && (verify.log_end == checkpoint_log_end) { 1 } else { 0 };
+    let _ = uart_puts("DharaFS: checkpoint write gen=");
+    let _ = uart_put_hex32(checkpoint_generation);
+    let _ = uart_puts(" log_start=");
+    let _ = uart_put_hex32(current_log_start);
+    let _ = uart_puts(" log_end=");
+    let _ = uart_put_hex32(checkpoint_log_end);
+    let _ = uart_puts(" target_block=");
+    let _ = uart_put_hex32(checkpoint_target as u32);
+    if verify_ok == 1 {
+      let _ = uart_puts(" (readback OK)\n");
+    } else {
+      let _ = uart_puts(" (READBACK MISMATCH)\n");
+    }
+    let _ = dharafs_gc_set_erase_cursor(0 as u32);
+    let _ = dharafs_gc_set_write_cursor(0 as u32);
+    let _ = dharafs_compact_set_resume_block(0 as u32);
+    let _ = dharafs_compact_set_failed(0 as u32);
+    let _ = dharafs_compact_set_pass_target(0 as u32);
+    return 0;
+  }
+
   let log_start: u32 = dharafs_state_get_log_start();
   let current_next_block: u32 = dharafs_state_get_next_block();
 
@@ -11385,6 +11828,14 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     let _ = dharafs_compact_set_failed(0 as u32);
   }
   let start_blk: u32 = if resume_block == (0 as u32) { log_start } else { resume_block };
+  // Round B: where THIS pass's own relocated records land. Reset to
+  // log_start at the start of a genuinely fresh pass (same lifecycle
+  // as pass_target just above); carried over from the prior call's own
+  // persisted value otherwise. Safe to write into [log_start, blk) at
+  // any point -- see dharafs_gc_write_cursor's own header comment
+  // (boot/dharafs_state.S) for why nothing else in the system can ever
+  // target a block in that range.
+  let write_cursor: i64 = if resume_block == (0 as u32) { log_start as i64 } else { dharafs_gc_get_write_cursor() as i64 };
 
   // BUG (round 7 audit, 2026-08-27): every carry-forward write below
   // used to discard its own return status (`let _ = dharafs_append_raw(...)`
@@ -11448,29 +11899,38 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
           k = k + 1;
         }
         let latest_blk: i64 = dharafs_find_latest_block_raw(path_buf, rec_path_len as i64);
-        if latest_blk == blk {
-          // This IS the live copy for its path -- carry it forward.
-          // dharafs_append_raw always targets dharafs_state_get_next_block(),
-          // which by now is already past old_next_block (every
-          // earlier iteration's re-append only ever grows it), so
-          // this can never write back into the region still being
-          // scanned.
+        let is_latest: i64 = if latest_blk == blk { 1 } else { 0 };
+        // Round B: a record that's NOT the path's current latest copy
+        // used to be unconditionally dropped here (never re-appended,
+        // never erased either under the old design -- just left behind
+        // for log_start to eventually skip over). Now that this
+        // function physically reclaims the space a dead record used to
+        // sit in, dropping it for real would silently break any live
+        // snapshot still depending on seeing EXACTLY this historical
+        // version via dharafs_find_block_as_of_raw. Checking every
+        // snapshot slot is cheap when none is live (dharafs_gc_record_
+        // needed_by_live_snapshot's own header comment); the real cost
+        // only applies when a snapshot genuinely exists.
+        let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+        let needed_by_snapshot: i64 = if is_latest == 1 { 0 } else { dharafs_gc_record_needed_by_live_snapshot(path_buf, rec_path_len as i64, rec_seq) };
+        if (is_latest == 1) || (needed_by_snapshot == 1) {
+          // Relocate into this pass's own write_cursor -- NEVER into
+          // dharafs_state_get_next_block() (today's real append
+          // frontier, which every OTHER writer in the system targets).
+          // update_dirindex is 1 only for the path's true latest copy;
+          // a historical, snapshot-only-needed version must never make
+          // the fast-path cache point at it (see dharafs_append_raw_
+          // relocate's own header comment).
           let rec_data_len: u32 = buf_read_u32(buf, 44 as u32);
           if rec_data_len == (0xFFFFFFFF as u32) {
-            // A live tombstone (dharafs_delete's newest record for this
-            // path) -- carry it forward AS a tombstone, not as a
-            // 4-billion-byte "data" copy. Missing this case doesn't
-            // just mis-handle a delete: rec_data_len is read directly
-            // into the loop bound below when it's a real record, so
-            // treating the sentinel as a genuine length turns this
-            // into an unbounded copy loop that reads/writes far past
-            // data_buf's real allocation -- a real hang (found by GC
-            // silently never completing a pass again once this path
-            // was ever exercised), not merely a logic error that
-            // happens to still terminate wrong.
-            let del_status: i64 = dharafs_delete_raw(path_buf, rec_path_len as i64);
+            // A tombstone -- relocate it AS a tombstone, not as a
+            // 4-billion-byte "data" copy. See the pre-Round-B version
+            // of this function for why that distinction matters.
+            let del_status: i64 = dharafs_delete_raw_relocate(path_buf, rec_path_len as i64, write_cursor, rec_seq, is_latest);
             if del_status != 0 {
               all_ok = 0;
+            } else {
+              write_cursor = write_cursor + 1;
             }
           } else {
             // Round 39: this HEAD block may chain across several
@@ -11497,34 +11957,11 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
               let rec_uid: u32 = buf_read_u32(buf, 52 as u32);
               let rec_gid: u32 = buf_read_u32(buf, 56 as u32);
               let rec_mode: u32 = buf_read_u32(buf, 60 as u32);
-              // TEMP DIAGNOSTIC (2026-10-24, real-HW DharaFS corruption
-              // investigation, round 2 -- confirmed real via a 15s-
-              // spaced clean test, NOT host-timing, NOT Phase 1 (fully
-              // disabled during this diagnostic)): show exactly what
-              // compact's own carry-forward is about to do, every
-              // time, so the next real-HW run shows the real mechanism
-              // instead of more guessing. Remove once root-caused.
-              let diag_target_before: u32 = dharafs_state_get_next_block();
-              let _ = uart_puts("COMPACT CARRY from_blk=");
-              let _ = uart_put_hex32(blk as u32);
-              let _ = uart_puts(" path=\"");
-              let _ = dharafs_print_data(path_buf, rec_path_len as i64);
-              let _ = uart_puts("\" path_len=");
-              let _ = uart_put_hex32(rec_path_len);
-              let _ = uart_puts(" full_len=");
-              let _ = uart_put_hex32(full_len as u32);
-              let _ = uart_puts(" target_before=");
-              let _ = uart_put_hex32(diag_target_before);
-              let _ = uart_puts("\n");
-              let append_status: i64 = dharafs_append_raw(path_buf, rec_path_len as i64, data_buf, full_len, rec_uid, rec_gid, rec_mode);
-              let diag_target_after: u32 = dharafs_state_get_next_block();
-              let _ = uart_puts("COMPACT CARRY DONE status=");
-              let _ = uart_put_hex32(append_status as u32);
-              let _ = uart_puts(" target_after=");
-              let _ = uart_put_hex32(diag_target_after);
-              let _ = uart_puts("\n");
-              if append_status != 0 {
+              let blocks_written: i64 = dharafs_append_raw_relocate(path_buf, rec_path_len as i64, data_buf, full_len, rec_uid, rec_gid, rec_mode, write_cursor, rec_seq, is_latest);
+              if blocks_written <= 0 {
                 all_ok = 0;
+              } else {
+                write_cursor = write_cursor + blocks_written;
               }
             }
           }
@@ -11542,81 +11979,42 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
 
   if (blk as u32) >= old_next_block {
     // The whole [log_start, old_next_block) range has now been
-    // scanned -- possibly across several resumed calls. Everything
-    // before old_next_block now has an equivalent live copy at or
-    // beyond it (or was already dead) -- safe to stop scanning. Only
-    // true if every carry-forward across the WHOLE pass actually
-    // succeeded (dharafs_compact_failed, not just this one call's own
-    // all_ok) -- a single failure anywhere in the pass leaves its only
-    // copy in the region about to be abandoned, so log_start must stay
-    // put in that case rather than orphan it. Either way, the pass is
-    // now genuinely done: reset all three persisted fields so the next
-    // dharafs_compact call starts a fresh pass (re-reading next_block
-    // for a brand new pass_target) rather than "resuming" a finished
-    // one.
+    // scanned -- possibly across several resumed calls. Only true if
+    // every relocation across the WHOLE pass actually succeeded
+    // (dharafs_compact_failed, not just this one call's own all_ok) --
+    // a single failure anywhere in the pass leaves its only copy
+    // un-relocated, so nothing may be erased or shrunk in that case.
     if all_ok == 1 {
-      let _ = dharafs_state_set_log_start(old_next_block);
-      // ROOT-CAUSE FIX (2026-10-30): dharafs_badblock_bitmap_persist()
-      // was only ever called once, inside dharafs_init's own one-time
-      // recovery scan -- every dharafs_badblock_clear() this pass's
-      // carry-forward writes just made (a block that was blank at
-      // boot-time, now holding a real record) only updated the RAM
-      // copy, never flushed back to SD. Confirmed live: a QEMU boot-2
-      // read of /config/mode came back "(not found)" even though the
-      // trace showed its carried-forward copy landing cleanly inside
-      // the new checkpoint's own trusted range -- the record was
-      // genuinely there, but boot 2's recovery scan skipped its block
-      // with zero real SD I/O because the PERSISTED bitmap (loaded
-      // fresh from SD, never updated past boot 1's own initial pass)
-      // still marked it bad from when it was blank. Not specific to
-      // the checkpoint work above -- this silently drops ANY record
-      // written, during normal runtime, into a block any earlier full
-      // scan had classified bad/blank, on literally the next reboot,
-      // with or without a checkpoint ever existing. Same natural
-      // "batch up changes, flush at a durable commit point" cadence as
-      // the checkpoint write just below -- persist's own dirty-flag
-      // check already makes this a no-op on any pass that cleared
-      // nothing.
-      let _ = dharafs_badblock_bitmap_persist();
-      let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
-      // Re-enabled (2026-10-30): see dharafs_init's own matching
-      // comment for why the 2026-10-24 A/B disable's suspicion of THIS
-      // call was almost certainly misdirected -- the real mechanism
-      // (dharafs_append_raw writing past dharafs_log_max_blk() with no
-      // bound) already has a real fix (Phase 3, 2026-10-25). Read-back
-      // verification below so a recurrence is caught immediately,
-      // loudly, instead of silently trusted a second time.
-      let old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
-      let checkpoint_target: i64 = if old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref old_checkpoint) } else { dharafs_checkpoint_block_a() };
-      let checkpoint_generation: u32 = if old_checkpoint.valid == 1 { old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
-      let checkpoint_log_end: u32 = dharafs_state_get_next_block();
-      let _ = dharafs_checkpoint_write(checkpoint_generation, old_next_block, checkpoint_log_end, checkpoint_target);
-      let verify: DharaFsCheckpoint = dharafs_checkpoint_lookup();
-      let verify_ok: i64 = if (verify.valid == 1) && (verify.generation == checkpoint_generation) && (verify.log_start == old_next_block) && (verify.log_end == checkpoint_log_end) { 1 } else { 0 };
-      let _ = uart_puts("DharaFS: checkpoint write gen=");
-      let _ = uart_put_hex32(checkpoint_generation);
-      let _ = uart_puts(" log_start=");
-      let _ = uart_put_hex32(old_next_block);
-      let _ = uart_puts(" log_end=");
-      let _ = uart_put_hex32(checkpoint_log_end);
-      let _ = uart_puts(" target_block=");
-      let _ = uart_put_hex32(checkpoint_target as u32);
-      if verify_ok == 1 {
-        let _ = uart_puts(" (readback OK)\n");
-      } else {
-        let _ = uart_puts(" (READBACK MISMATCH)\n");
-      }
+      // Round B: hand off to the bounded erase phase (checked at the
+      // very top of this function) instead of committing immediately
+      // -- erasing [write_cursor, old_next_block) in one unbounded
+      // sweep here would reopen the exact unbounded-per-call-cost gap
+      // Round 77 closed for the scan above. pass_target (already =
+      // old_next_block) and write_cursor's own final value are both
+      // deliberately NOT reset here -- the erase phase still needs
+      // them (as its own target and starting cursor respectively).
+      let _ = dharafs_gc_set_write_cursor(write_cursor as u32);
+      let _ = dharafs_gc_set_erase_cursor(write_cursor as u32);
+      let _ = dharafs_compact_set_resume_block(0 as u32);
+    } else {
+      // A failure anywhere in the scan -- abandon this pass entirely,
+      // same as the pre-Round-B design already did: log_start was
+      // never touched, so a future fresh pass naturally retries the
+      // whole region from scratch.
+      let _ = dharafs_compact_set_resume_block(0 as u32);
+      let _ = dharafs_compact_set_failed(0 as u32);
+      let _ = dharafs_compact_set_pass_target(0 as u32);
+      let _ = dharafs_gc_set_write_cursor(0 as u32);
     }
-    let _ = dharafs_compact_set_resume_block(0 as u32);
-    let _ = dharafs_compact_set_failed(0 as u32);
-    let _ = dharafs_compact_set_pass_target(0 as u32);
   } else {
     // Hit this call's own block budget before reaching old_next_block
-    // -- remember exactly where to pick up next time. log_start does
+    // -- remember exactly where to pick up next time, both the scan
+    // cursor and this pass's own relocation cursor. log_start does
     // NOT move yet; dharafs_compact_failed already persisted above if
     // this call found a problem, so a later call's own success can't
     // paper over it.
     let _ = dharafs_compact_set_resume_block(blk as u32);
+    let _ = dharafs_gc_set_write_cursor(write_cursor as u32);
   }
   return 0;
 }
@@ -11657,8 +12055,13 @@ fn dharafs_compact_resumable_self_test() -> i64 {
   // of what ran earlier in boot -- bounded generously (500 calls, i.e.
   // up to 4000 blocks of pre-existing backlog) so a genuine non-
   // progress bug still fails loudly instead of hanging boot forever.
+  // Round B: also drains a dangling erase phase (resume_block==0 but
+  // erase_cursor!=0) left behind by any unrelated prior pass -- the
+  // original resume_block-only check would otherwise see "nothing in
+  // progress" and skip straight past it, letting this self-test's own
+  // writes land while a stale erase phase is still live.
   let drain_calls: i64 = 0;
-  while (dharafs_compact_get_resume_block() != (0 as u32)) && (drain_calls < 500) {
+  while ((dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32))) && (drain_calls < 500) {
     let _ = dharafs_compact(buf, path_buf, data_buf);
     drain_calls = drain_calls + 1;
   }
@@ -11670,19 +12073,24 @@ fn dharafs_compact_resumable_self_test() -> i64 {
   }
   let target_next_block: u32 = dharafs_state_get_next_block();
 
-  // First call: with >= 20 blocks of range and an 8-block budget, this
+  // First call: with >= 20 blocks of range and a 1-block budget, this
   // must NOT finish the whole pass in one call.
   let _ = dharafs_compact(buf, path_buf, data_buf);
-  if dharafs_compact_get_resume_block() == (0 as u32) {
+  if (dharafs_compact_get_resume_block() == (0 as u32)) && (dharafs_gc_get_erase_cursor() == (0 as u32)) {
     ok = 0; // finished in one call -- the budget isn't actually enforced
   }
-  if dharafs_state_get_log_start() == target_next_block {
-    ok = 0; // log_start shouldn't have reached the final target yet
-  }
+  // Round B: log_start is deliberately NOT advanced by a successful
+  // pass anymore (see dharafs_compact's own header comment on why) --
+  // the real completion signal is next_block, which only moves at the
+  // very end of the erase phase, checked below once the pass is done.
 
-  // Keep calling until the pass genuinely finishes (resume cursor
-  // returns to 0), bounded generously so a real non-progress bug fails
-  // this self-test instead of hanging boot forever.
+  // Keep calling until the pass genuinely finishes -- Round B: "finished"
+  // now means BOTH the scan cursor (resume_block) AND the erase cursor
+  // are back to 0, not just resume_block alone -- the scan finishing
+  // only hands off to a separate, equally bounded erase phase (see
+  // dharafs_compact's own header comment), which resume_block alone
+  // doesn't observe. Bounded generously so a genuine non-progress bug
+  // still fails loudly instead of hanging boot forever.
   //
   // TASK #288 FOLLOW-UP (2026-10-15): 10 -> 50. This cap used to be
   // sized for dharafs_compact_blocks_per_call()'s own old budget of 8
@@ -11694,21 +12102,61 @@ fn dharafs_compact_resumable_self_test() -> i64 {
   // even though every call still made real, correct progress. Not
   // caught by phase4_milestone.py (this self-test is gated behind
   // boot_debug_enabled(), which that harness never sets) -- only found
-  // by actually running it. 50 stays generous relative to the known,
-  // fixed 20-write range regardless of whatever the budget constant
-  // is tuned to next, rather than re-coupling this cap to today's
-  // specific value the same way 10 was coupled to yesterday's.
+  // by actually running it.
+  //
+  // Round B follow-up (found live, via this exact self-test FAILING
+  // again at the 50->90 guess): this pass's own scan range is NOT just
+  // the 20 blocks this self-test itself writes -- log_start never
+  // advances under Round B's design (see dharafs_compact's own header
+  // comment for why), and task_e has not run even once yet at this
+  // point in boot (this self-test runs pre-start_multitasking), so
+  // THIS pass is the first-ever compaction and must scan+relocate+
+  // erase the ENTIRE accumulated history of every earlier boot self-
+  // test that touched DharaFS too, not just this test's own 20 writes.
+  // A live GC DIAG capture (see the diagnostic just below) showed a
+  // real 57-block scan range needing 57 scan calls + 45 erase calls =
+  // 102 total, comfortably blowing through 90. 90 -> 300: generous
+  // relative to how much boot-self-test history could plausibly
+  // accumulate before this point, not coupled to today's specific
+  // figure the same way 50 was coupled to yesterday's.
   let calls: i64 = 1;
-  while (dharafs_compact_get_resume_block() != (0 as u32)) && (calls < 50) {
+  while ((dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32))) && (calls < 300) {
     let _ = dharafs_compact(buf, path_buf, data_buf);
     calls = calls + 1;
   }
-  if dharafs_compact_get_resume_block() != (0 as u32) {
+  if (dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32)) {
     ok = 0; // never finished within a generous call budget
+    let _ = uart_puts("GC DIAG: resumable self-test out of budget, calls=");
+    let _ = uart_put_hex32(calls as u32);
+    let _ = uart_puts(" resume_block=");
+    let _ = uart_put_hex32(dharafs_compact_get_resume_block());
+    let _ = uart_puts(" erase_cursor=");
+    let _ = uart_put_hex32(dharafs_gc_get_erase_cursor());
+    let _ = uart_puts(" pass_target=");
+    let _ = uart_put_hex32(dharafs_compact_get_pass_target());
+    let _ = uart_puts(" write_cursor=");
+    let _ = uart_put_hex32(dharafs_gc_get_write_cursor());
+    let _ = uart_puts(" next_block=");
+    let _ = uart_put_hex32(dharafs_state_get_next_block());
+    let _ = uart_puts(" target_next_block=");
+    let _ = uart_put_hex32(target_next_block);
+    let _ = uart_puts("\n");
   }
   if calls <= 1 {
     ok = 0; // sanity: this whole test is meaningless if it somehow
             // only took the one call already checked above
+  }
+
+  // Round B's own real point: next_block must have genuinely SHRUNK
+  // below where it stood right after the 20 writes landed -- not just
+  // that dharafs_read/ls still see the right logical content (checked
+  // below too), which the pre-Round-B version of this self-test
+  // already covered and said nothing about physical reclaim. 19 of
+  // the 20 writes are immediately dead the instant the next one lands
+  // (same path, "latest wins"), so a real reclaim must recover real
+  // physical space here, not just advance a logical cursor.
+  if dharafs_state_get_next_block() >= target_next_block {
+    ok = 0; // no physical shrinkage at all
   }
 
   // Data must still be correct after a multi-call compaction pass --
@@ -11725,7 +12173,131 @@ fn dharafs_compact_resumable_self_test() -> i64 {
     }
   }
 
-  let _ = uart_puts("DharaFS: dharafs_compact resumes across multiple bounded calls for a log larger than its per-call budget");
+  let _ = uart_puts("DharaFS: dharafs_compact resumes across multiple bounded calls, and genuinely shrinks next_block, for a log larger than its per-call budget");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round B's own real correctness risk, made concrete: a record that's
+// no longer a path's current latest copy can still be the exact
+// version a live snapshot needs (dharafs_find_block_as_of_raw's own
+// "latest AS OF a horizon" query) -- physically reclaiming it the
+// instant something newer supersedes it, the way dharafs_compact
+// already does for ordinary dead records, would silently corrupt
+// every snapshot that still depends on it. Writes one version, pins a
+// snapshot to exactly that version, supersedes it 20 more times (far
+// past dharafs_compact_blocks_per_call()'s own budget, forcing a real
+// multi-call pass), drains compaction to completion, then checks BOTH
+// that the snapshot still reads the OLD version correctly and that an
+// ordinary read still sees the newest one -- the same two assertions
+// the plan behind this round named as the direct regression test for
+// its own snapshot-safety design. No shell command exposes snapshots
+// today (they're an internal-only feature so far), so this lives here
+// as a self-test rather than a QEMU-interactive script, same
+// convention as dharafs_compact_resumable_self_test just above.
+fn dharafs_gc_snapshot_safety_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let data_buf: mut ref i64 = dhruva_alloc_bytes(20480);
+
+  // Same drain-first discipline as the resumable self-test -- never
+  // inherit an unrelated already-in-progress pass.
+  let drain_calls: i64 = 0;
+  while ((dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32))) && (drain_calls < 500) {
+    let _ = dharafs_compact(buf, path_buf, data_buf);
+    drain_calls = drain_calls + 1;
+  }
+
+  let _ = dharafs_append("/snaptest/file", "version-one");
+
+  let snap_name: Str = "gctest_snap";
+  let name_len: i64 = str_len_bytes(snap_name);
+  let name_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let ni: i64 = 0;
+  while ni < name_len {
+    let _ = buf_write_byte(name_buf, ni as u32, str_byte_at(snap_name, ni) as u32);
+    ni = ni + 1;
+  }
+  let snap_slot: i64 = dharafs_snapshot_create_raw(name_buf, name_len);
+  if snap_slot < 0 {
+    ok = 0;
+  }
+
+  // Supersede it 20 more times -- "version-one" is now dead by the
+  // ordinary latest-wins rule, but the snapshot above is pinned to
+  // exactly its own sequence number.
+  let w: i64 = 0;
+  while w < 20 {
+    let _ = dharafs_append("/snaptest/file", "superseded");
+    w = w + 1;
+  }
+
+  // Drain compaction to completion -- this is where dharafs_gc_record_
+  // needed_by_live_snapshot either does or doesn't save "version-one"
+  // from the erase phase that follows.
+  let calls: i64 = 1;
+  while ((dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32))) && (calls < 300) {
+    let _ = dharafs_compact(buf, path_buf, data_buf);
+    calls = calls + 1;
+  }
+  if (dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32)) {
+    ok = 0; // never finished within a generous call budget
+  }
+
+  // The snapshot must still read "version-one" -- the one record this
+  // whole self-test exists to protect.
+  let snap_path_str: Str = "/snaptest/file";
+  let snap_path_len: i64 = str_len_bytes(snap_path_str);
+  let snap_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let pi: i64 = 0;
+  while pi < snap_path_len {
+    let _ = buf_write_byte(snap_path_buf, pi as u32, str_byte_at(snap_path_str, pi) as u32);
+    pi = pi + 1;
+  }
+  let out_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let snap_read_len: i64 = dharafs_snapshot_read_raw(snap_path_buf, snap_path_len, name_buf, name_len, out_buf);
+  let expect_old: Str = "version-one";
+  let expect_old_len: i64 = str_len_bytes(expect_old);
+  if snap_read_len != expect_old_len {
+    ok = 0;
+  } else {
+    let ci: i64 = 0;
+    while ci < expect_old_len {
+      if buf_read_byte(out_buf, ci as u32) != (str_byte_at(expect_old, ci) as u32) {
+        ok = 0;
+      }
+      ci = ci + 1;
+    }
+  }
+
+  // An ordinary (non-snapshot) read must still see the LATEST content,
+  // completely unaffected by the snapshot pinning an older version.
+  let cur_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let cur_len: i64 = dharafs_read("/snaptest/file", cur_buf);
+  let expect_new: Str = "superseded";
+  let expect_new_len: i64 = str_len_bytes(expect_new);
+  if cur_len != expect_new_len {
+    ok = 0;
+  } else {
+    let cj: i64 = 0;
+    while cj < expect_new_len {
+      if buf_read_byte(cur_buf, cj as u32) != (str_byte_at(expect_new, cj) as u32) {
+        ok = 0;
+      }
+      cj = cj + 1;
+    }
+  }
+
+  // Don't leave a live snapshot pinned for the rest of boot.
+  let _ = dharafs_snapshot_delete_raw(name_buf, name_len);
+
+  let _ = uart_puts("DharaFS: a snapshot-pinned historical record survives dharafs_compact's real physical reclaim, ordinary reads still see the latest version");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -50577,6 +51149,7 @@ fn kernel_main() -> i64 {
 
   // Round 77: dharafs_compact's own resumable, per-call-bounded pass.
   if boot_debug_enabled() == 1 { let _ = dharafs_compact_resumable_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dharafs_gc_snapshot_safety_self_test(); }
 
   // Round 42: directory hierarchy + owner/group/other rwx permissions.
   if boot_debug_enabled() == 1 { let _ = dharafs_permissions_self_test(); }
