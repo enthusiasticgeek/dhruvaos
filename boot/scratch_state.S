@@ -65,6 +65,28 @@ dharafs_data_scratch_addr:
     .word 0             /* 464 bytes: one record's data payload, or
                          * (shared, never at the same time) one eval
                          * expression's source text */
+// DharaFS persisted-checkpoint plan, foreground catch-up (2026-10-30):
+// dedicated, NOT shared with compact_buf/compact_path_buf/compact_
+// data_buf (task_e's own, kernel_main.vani) or with dharafs_sd_
+// scratch/path_scratch/data_scratch above -- this file's own header
+// comment already establishes why dharafs_compact's three buffer
+// parameters must be separate from the generic FS scratch buffers
+// (dharafs_read_raw's internal use of dharafs_sd_scratch would clobber
+// a caller-owned `buf` of the same identity mid-call). The `dharafs
+// catchup` shell command calls dharafs_compact() many times back to
+// back from task_f, a genuinely different caller than task_e's own
+// periodic wake -- reusing task_e's buffers isn't an option (they're
+// task_e's own locals, no accessor exists), and reusing the generic
+// scratch buffers would hit the exact aliasing hazard this file's own
+// header already warns about.
+dharafs_catchup_buf_addr:
+    .word 0             /* 512 bytes, matches dharafs_sd_scratch's own
+                         * sizing rationale (one on-disk block) */
+dharafs_catchup_path_buf_addr:
+    .word 0             /* 32 bytes, matches dharafs_path_scratch */
+dharafs_catchup_data_buf_addr:
+    .word 0             /* 20480 bytes, matches task_e's own compact_
+                         * data_buf (dharafs_file_max_len(), task #164) */
 dharafs_stat_scratch_addr:
     .word 0             /* Round 42: 12 bytes -- dharafs_stat_raw's output
                          * (owner_uid/owner_gid/mode, 4 bytes each) */
@@ -687,6 +709,48 @@ dharafs_data_scratch_set:
 .global dharafs_data_scratch_get
 dharafs_data_scratch_get:
     ldr r0, =dharafs_data_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_catchup_buf_set
+dharafs_catchup_buf_set:
+    ldr r1, =dharafs_catchup_buf_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_catchup_buf_get
+dharafs_catchup_buf_get:
+    ldr r0, =dharafs_catchup_buf_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_catchup_path_buf_set
+dharafs_catchup_path_buf_set:
+    ldr r1, =dharafs_catchup_path_buf_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_catchup_path_buf_get
+dharafs_catchup_path_buf_get:
+    ldr r0, =dharafs_catchup_path_buf_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_catchup_data_buf_set
+dharafs_catchup_data_buf_set:
+    ldr r1, =dharafs_catchup_data_buf_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_catchup_data_buf_get
+dharafs_catchup_data_buf_get:
+    ldr r0, =dharafs_catchup_data_buf_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr

@@ -270,6 +270,23 @@ extern "C" fn dharafs_path_scratch_get() -> mut ref i64;
 extern "C" fn dharafs_data_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_data_scratch_get() -> mut ref i64;
+// DharaFS persisted-checkpoint plan, foreground catch-up (2026-10-30):
+// dedicated buffers for the `dharafs catchup` shell command's own
+// dharafs_compact() calls -- see scratch_state.S's own comment on
+// dharafs_catchup_buf_addr for why these can't share the generic
+// scratch buffers above or task_e's own compact_buf/etc.
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_catchup_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_catchup_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_catchup_path_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_catchup_path_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_catchup_data_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_catchup_data_buf_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_stat_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -6357,15 +6374,33 @@ fn watchdog_arm(timeout_ticks: u32) -> i64 {
 // well within what "unattended recovery, no physical reflash" needs,
 // with real margin for whatever boot-time phase hasn't been
 // individually measured yet.
+//
+// Widened 10 -> 15 seconds (2026-10-30): dharafs_init()'s own recovery
+// scan was re-measured live at 8.3s on the real card (up from the
+// 3.8s baseline above -- more accumulated history, same already-kicks-
+// every-iteration loop), 83% of the old 10s window with no margin left
+// for further growth. This is now the rare path (the checkpoint +
+// badblock-bitmap-persist fixes landing the same day make a FULL
+// rescan something that should only happen once per card, not every
+// boot -- see DharaFsCheckpoint's own header comment), but "rare"
+// still needs real headroom, not just whatever happened to pass once.
+// watchdog_arm's own 20-bit PM_WDOG field (timeout_ticks & 0xFFFFF)
+// hard-caps any value here at 0xFFFFF ticks = ~16.0s -- confirmed by
+// re-deriving it directly from that mask, not assumed -- so 15s is
+// the real practical ceiling with a small margin below it, not an
+// arbitrary round number. (This also means the earlier, never-flashed
+// "30-second" test build never actually armed 30s at all: 30<<16
+// truncated under this same mask to roughly 14s, silently -- caught
+// here before it was ever relied on.)
 fn watchdog_init() -> i64 {
-  let ten_seconds_in_ticks: u32 = 655360 as u32; // 10 << 16
-  let _ = watchdog_arm(ten_seconds_in_ticks);
+  let fifteen_seconds_in_ticks: u32 = 983040 as u32; // 15 << 16, see this fn's own header comment for the 16.0s hardware ceiling
+  let _ = watchdog_arm(fifteen_seconds_in_ticks);
   return 0;
 }
 
 fn watchdog_kick() -> i64 {
-  let ten_seconds_in_ticks: u32 = 655360 as u32;
-  let _ = watchdog_arm(ten_seconds_in_ticks);
+  let fifteen_seconds_in_ticks: u32 = 983040 as u32;
+  let _ = watchdog_arm(fifteen_seconds_in_ticks);
   return 0;
 }
 
@@ -9284,7 +9319,17 @@ struct DharaFsCheckpoint {
 
 fn dharafs_checkpoint_crc_valid(raw: mut ref i64) -> i64 {
   let magic: u32 = buf_read_u32_le(raw, 0);
-  if magic != (0x44434B50 as u32) { // "DCKP"
+  // Magic bumped (2026-10-30) from the original "DCKP" specifically to
+  // invalidate any leftover real-HW checkpoint from the 2026-10-24
+  // write that was disabled right after -- that record predates both
+  // Phase 3's append-bounds fix and this round's badblock-bitmap-
+  // persist fix (see this struct's own write-site comment), so it must
+  // never be trusted again even though it would still pass its own
+  // CRC. A magic mismatch falls back to exactly the safe "no
+  // checkpoint" behavior (full scan from block 1), same as a genuinely
+  // fresh card -- the real card's very first boot under this fix pays
+  // for one full rescan, then checkpoints normally from then on.
+  if magic != (0x44434B51 as u32) { // "DCKQ"
     return 0;
   }
   let crc_stored: u32 = buf_read_u32_le(raw, 16);
@@ -9311,7 +9356,7 @@ fn dharafs_checkpoint_build(rec: ref DharaFsCheckpoint, out: mut ref i64) -> i64
     let _ = buf_write_byte(out, i as u32, 0 as u32);
     i = i + 1;
   }
-  let _ = buf_write_u32_le(out, 0, 0x44434B50 as u32);
+  let _ = buf_write_u32_le(out, 0, 0x44434B51 as u32); // "DCKQ" -- see dharafs_checkpoint_crc_valid's own comment
   let _ = buf_write_u32_le(out, 4, rec.generation);
   let _ = buf_write_u32_le(out, 8, rec.log_start);
   let _ = buf_write_u32_le(out, 12, rec.log_end);
@@ -9565,12 +9610,24 @@ fn dharafs_init() -> i64 {
   // fall back to exactly today's behavior, scan from block 1, trust
   // nothing persisted.
   let checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
-  // TEMP DIAGNOSTIC A/B (2026-10-24): forced to 1 for now, same round
-  // as the matching disable in dharafs_compact -- see that comment.
-  // A checkpoint written by the disabled code above (including from
-  // the corrupted test run before this round) must never be trusted
-  // until the real mechanism is understood.
-  let blk: i64 = 1;
+  // Re-enabled (2026-10-30): the 2026-10-24 A/B disable's own suspect
+  // (the checkpoint-write call in dharafs_compact, see that site's
+  // comment) was isolated from a SEPARATE bug independently found and
+  // fixed the very next day -- Phase 3's dharafs_log_max_blk() bounds
+  // check, added to dharafs_append_raw's write paths because a scan of
+  // a blank device could leave next_block sitting at EXACTLY max_blk,
+  // and an unchecked append would then write straight into the
+  // metadata region just past the log. dharafs_compact's own carry-
+  // forward calls that exact same dharafs_append_raw path, with no
+  // bound of its own before Phase 3 -- a far more likely culprit for
+  // "an existing /config/mode record's bytes bleeding into a freshly-
+  // written path's own record" than the checkpoint write itself, which
+  // only ever touches its own two dedicated, disjoint blocks
+  // (8101/8102). Re-enabling now that the actual out-of-bounds-write
+  // mechanism has a real fix, with read-back verification on the write
+  // side (see dharafs_compact) so a recurrence is caught immediately
+  // instead of silently trusted.
+  let blk: i64 = if checkpoint.valid == 1 { checkpoint.log_start as i64 } else { 1 };
   let scan_start_blk: u32 = blk as u32;
   // ROOT-CAUSE FIX (2026-10-24, round 3 -- why a fresh write stopped
   // surviving a reboot even with the bad-block tolerance raised to
@@ -9796,6 +9853,16 @@ fn dharafs_init() -> i64 {
   // nothing changed, see dharafs_badblock_bitmap_persist's own header
   // comment.
   let _ = dharafs_badblock_bitmap_persist();
+  let _ = uart_puts("DharaFS: checkpoint ");
+  if checkpoint.valid == 1 {
+    let _ = uart_puts("TRUSTED gen=");
+    let _ = uart_put_hex32(checkpoint.generation);
+    let _ = uart_puts(" scan_start=");
+  } else {
+    let _ = uart_puts("not present/invalid, full scan_start=");
+  }
+  let _ = uart_put_hex32(scan_start_blk);
+  let _ = uart_puts("\n");
   let _ = uart_puts("RECOVERY SUMMARY final_blk=");
   let _ = uart_put_hex32(blk as u32);
   let _ = uart_puts(" total_bad=");
@@ -11182,25 +11249,55 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     // one.
     if all_ok == 1 {
       let _ = dharafs_state_set_log_start(old_next_block);
-      // TEMP DIAGNOSTIC A/B (2026-10-24): real-HW corruption appeared
-      // the FIRST boot this checkpoint-write code ever ran (garbled,
-      // merged filenames in `ls` -- e.g. an existing /config/mode
-      // record's bytes bleeding into a freshly-written path's own
-      // record). The checkpoint itself writes to blocks 8101/8102,
-      // physically disjoint from the 1-7599 log region, so it cannot
-      // DIRECTLY corrupt another block's on-disk bytes -- disabling
-      // this call isolates whether the mechanism is here (a vani/
-      // codegen issue from adding this call inside dharafs_compact's
-      // own already-deep call graph) or in something this session's
-      // other changes (Phase 0's widened max_blk, or the pre-existing
-      // DHARAFS_RECOVERY_MAX_CONSECUTIVE_BAD_BLOCKS tolerance) simply
-      // exposed for the first time by finally letting compact() do
-      // real, substantial carry-forward work on a real, large log.
-      // Re-enable once root-caused.
-      // let old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
-      // let checkpoint_target: i64 = if old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref old_checkpoint) } else { dharafs_checkpoint_block_a() };
-      // let checkpoint_generation: u32 = if old_checkpoint.valid == 1 { old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
-      // let _ = dharafs_checkpoint_write(checkpoint_generation, old_next_block, dharafs_state_get_next_block(), checkpoint_target);
+      // ROOT-CAUSE FIX (2026-10-30): dharafs_badblock_bitmap_persist()
+      // was only ever called once, inside dharafs_init's own one-time
+      // recovery scan -- every dharafs_badblock_clear() this pass's
+      // carry-forward writes just made (a block that was blank at
+      // boot-time, now holding a real record) only updated the RAM
+      // copy, never flushed back to SD. Confirmed live: a QEMU boot-2
+      // read of /config/mode came back "(not found)" even though the
+      // trace showed its carried-forward copy landing cleanly inside
+      // the new checkpoint's own trusted range -- the record was
+      // genuinely there, but boot 2's recovery scan skipped its block
+      // with zero real SD I/O because the PERSISTED bitmap (loaded
+      // fresh from SD, never updated past boot 1's own initial pass)
+      // still marked it bad from when it was blank. Not specific to
+      // the checkpoint work above -- this silently drops ANY record
+      // written, during normal runtime, into a block any earlier full
+      // scan had classified bad/blank, on literally the next reboot,
+      // with or without a checkpoint ever existing. Same natural
+      // "batch up changes, flush at a durable commit point" cadence as
+      // the checkpoint write just below -- persist's own dirty-flag
+      // check already makes this a no-op on any pass that cleared
+      // nothing.
+      let _ = dharafs_badblock_bitmap_persist();
+      // Re-enabled (2026-10-30): see dharafs_init's own matching
+      // comment for why the 2026-10-24 A/B disable's suspicion of THIS
+      // call was almost certainly misdirected -- the real mechanism
+      // (dharafs_append_raw writing past dharafs_log_max_blk() with no
+      // bound) already has a real fix (Phase 3, 2026-10-25). Read-back
+      // verification below so a recurrence is caught immediately,
+      // loudly, instead of silently trusted a second time.
+      let old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+      let checkpoint_target: i64 = if old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref old_checkpoint) } else { dharafs_checkpoint_block_a() };
+      let checkpoint_generation: u32 = if old_checkpoint.valid == 1 { old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
+      let checkpoint_log_end: u32 = dharafs_state_get_next_block();
+      let _ = dharafs_checkpoint_write(checkpoint_generation, old_next_block, checkpoint_log_end, checkpoint_target);
+      let verify: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+      let verify_ok: i64 = if (verify.valid == 1) && (verify.generation == checkpoint_generation) && (verify.log_start == old_next_block) && (verify.log_end == checkpoint_log_end) { 1 } else { 0 };
+      let _ = uart_puts("DharaFS: checkpoint write gen=");
+      let _ = uart_put_hex32(checkpoint_generation);
+      let _ = uart_puts(" log_start=");
+      let _ = uart_put_hex32(old_next_block);
+      let _ = uart_puts(" log_end=");
+      let _ = uart_put_hex32(checkpoint_log_end);
+      let _ = uart_puts(" target_block=");
+      let _ = uart_put_hex32(checkpoint_target as u32);
+      if verify_ok == 1 {
+        let _ = uart_puts(" (readback OK)\n");
+      } else {
+        let _ = uart_puts(" (READBACK MISMATCH)\n");
+      }
     }
     let _ = dharafs_compact_set_resume_block(0 as u32);
     let _ = dharafs_compact_set_failed(0 as u32);
@@ -34680,10 +34777,102 @@ fn shell_dispatch_shutdown() -> i64 {
     let _ = uart_puts("shutdown: permission denied (root only)\n");
     return 0;
   }
+  // ROOT-CAUSE FIX (2026-10-30, same finding as dharafs_compact's own
+  // matching comment): flush any badblock-bitmap clears a write made
+  // since the last periodic compact pass, before this command's own
+  // "no further writes will occur" claim becomes true. No-op if
+  // nothing's dirty.
+  let _ = dharafs_badblock_bitmap_persist();
   let _ = uart_puts("\n");
   let _ = uart_puts("Dhruva: halting. No further writes will occur.\n");
   let _ = uart_puts("*** SAFE TO POWER OFF NOW ***\n");
   return shutdown_halt_forever();
+}
+
+// DharaFS persisted-checkpoint plan, foreground catch-up (2026-10-30):
+// a real card that has never been compacted has its ENTIRE history in
+// [1, next_block) waiting to be reclaimed, and task_e's own periodic
+// wake is deliberately throttled to 1 block every 20 ticks (10s) --
+// an WCET/schedulability constraint for continuous BACKGROUND
+// operation (see dharafs_compact_blocks_per_call's own header
+// comment), never meant to bound a one-time, explicit, operator-
+// invoked migration. At that rate, a real card with several thousand
+// blocks of never-compacted history needs HOURS before the first
+// checkpoint ever gets written -- live-confirmed: this card's own
+// first real catch-up needed 5204 blocks, which would be roughly 14.5
+// real hours at the background cadence. This command instead calls
+// dharafs_compact() back to back with NO artificial delay between
+// calls -- safe specifically because shell_dispatch's own OUTER
+// dhruva_prio_lock(2)/unlock(3) wrap (task_f's main loop) already
+// holds the ceiling for this whole command's duration, exactly like
+// every other DharaFS-touching shell command, just for longer; unlike
+// task_e's periodic wake, there's no need to ever release it mid-
+// command, since nothing here ever sleeps (this file's own scratch-
+// buffer header comment's load-bearing invariant: "neither the FS
+// layer nor shell_dispatch nor eval_expr_raw ever sleeps mid-call").
+// Each real dharafs_compact() call is still cheap (at most one real
+// SD block read plus, rarely, one carry-forward write) -- the whole
+// backlog converges in well under a minute of real wall-clock time,
+// not hours, purely by removing the artificial inter-call delay that
+// background operation needs and a deliberate foreground migration
+// doesn't.
+fn shell_dispatch_dharafs_catchup() -> i64 {
+  if dharafs_user_get_uid() != (0 as u32) {
+    let _ = uart_puts("catchup: permission denied (root only)\n");
+    return 0;
+  }
+  let buf: mut ref i64 = dharafs_catchup_buf_get();
+  let path_buf: mut ref i64 = dharafs_catchup_path_buf_get();
+  let data_buf: mut ref i64 = dharafs_catchup_data_buf_get();
+  // Generous safety net, not the expected path -- covers even a full
+  // dharafs_log_max_blk() (7600) range with margin for carry-forward-
+  // added blocks, same "fails loudly instead of hanging forever"
+  // philosophy as dharafs_compact_resumable_self_test's own 500-call
+  // cap (scaled up here for a real card's backlog instead of a
+  // synthetic 20-block self-test range).
+  let max_calls: i64 = 10000;
+  let calls: i64 = 0;
+  let _ = uart_puts("dharafs catchup: starting, log_start=");
+  let _ = uart_put_hex32(dharafs_state_get_log_start());
+  let _ = uart_puts(" next_block=");
+  let _ = uart_put_hex32(dharafs_state_get_next_block());
+  let _ = uart_puts("\n");
+  while calls < max_calls {
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
+    let _ = dharafs_compact(buf, path_buf, data_buf);
+    calls = calls + 1;
+    if (calls % 200) == 0 {
+      let _ = uart_puts("dharafs catchup: calls=");
+      let _ = uart_put_i64(calls);
+      let _ = uart_puts(" resume_block=");
+      let _ = uart_put_hex32(dharafs_compact_get_resume_block());
+      let _ = uart_puts(" log_start=");
+      let _ = uart_put_hex32(dharafs_state_get_log_start());
+      let _ = uart_puts(" next_block=");
+      let _ = uart_put_hex32(dharafs_state_get_next_block());
+      let _ = uart_puts("\n");
+    }
+    if dharafs_compact_get_resume_block() == (0 as u32) {
+      // No pass left in progress -- either this call found nothing
+      // worth reclaiming (already caught up), or it just finished the
+      // one that was running. Either way, nothing more to do right now.
+      break;
+    }
+  }
+  let _ = uart_puts("dharafs catchup: finished after ");
+  let _ = uart_put_i64(calls);
+  let _ = uart_puts(" call(s), log_start=");
+  let _ = uart_put_hex32(dharafs_state_get_log_start());
+  let _ = uart_puts(" next_block=");
+  let _ = uart_put_hex32(dharafs_state_get_next_block());
+  if dharafs_compact_get_resume_block() == (0 as u32) {
+    let _ = uart_puts(" (pass complete)\n");
+  } else {
+    let _ = uart_puts(" (pass NOT complete -- run 'catchup' again)\n");
+  }
+  return 0;
 }
 
 // Round 71: shell front end for general-purpose GPIO (see the driver
@@ -35403,6 +35592,12 @@ fn shell_dispatch() -> i64 {
       };
       let _ = kernelslot_write_record(ref reboot_new_rec, reboot_stale);
     }
+    // ROOT-CAUSE FIX (2026-10-30, same finding as dharafs_compact's own
+    // matching comment): flush any badblock-bitmap clears a write made
+    // since the last periodic compact pass -- this command already
+    // holds the ceiling lock above, so no concurrent writer can dirty
+    // it again before the reset fires. A no-op if nothing's dirty.
+    let _ = dharafs_badblock_bitmap_persist();
     let _ = uart_puts("rebooting...\n");
     let _ = watchdog_arm(1 as u32);
     return 0;
@@ -36236,6 +36431,10 @@ fn shell_dispatch() -> i64 {
 
   if shell_word_matches(line_buf, 0, cmd_end, "shutdown") == 1 {
     return shell_dispatch_shutdown();
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "catchup") == 1 {
+    return shell_dispatch_dharafs_catchup();
   }
 
   if shell_word_matches(line_buf, 0, cmd_end, "crashlog") == 1 {
@@ -49527,6 +49726,13 @@ fn kernel_main() -> i64 {
   let _ = kernlog_line_scratch_set(dhruva_alloc_bytes(512));
   let _ = dharafs_path_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_data_scratch_set(dhruva_alloc_bytes(20480)); // matches dharafs_file_max_len(), task #164 follow-up
+  // `dharafs catchup` shell command's own dedicated dharafs_compact()
+  // buffers -- see scratch_state.S's own comment for why these can't
+  // share the generic FS scratch buffers just above or task_e's own
+  // compact_buf/compact_path_buf/compact_data_buf.
+  let _ = dharafs_catchup_buf_set(dhruva_alloc_bytes(512));
+  let _ = dharafs_catchup_path_buf_set(dhruva_alloc_bytes(32));
+  let _ = dharafs_catchup_data_buf_set(dhruva_alloc_bytes(20480));
   let _ = dharafs_stat_scratch_set(dhruva_alloc_bytes(12));
   let _ = dharafs_dir_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_log_path_scratch_set(dhruva_alloc_bytes(32));
