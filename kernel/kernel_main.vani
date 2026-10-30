@@ -21609,6 +21609,25 @@ fn dwc2_force_host_mode() -> i64 {
   return 0;
 }
 
+// TEMP DIAGNOSTIC (2026-10-30, user: "btw host mode or device mode
+// checked?"): GINTSTS.CURMODE (bit0, RO: 0=device, 1=host) was only
+// ever confirmed ONCE, right after dwc2_force_host_mode()'s own boot-
+// time call -- never re-checked later in the same boot, including
+// right before the port2/port3 attempts that fail every time (while
+// port1, which runs first with the least elapsed time/register-
+// access history behind it, never fails). Given this exact silicon
+// has ALREADY been confirmed (rounds 9/29) to silently revert OTHER
+// GUSBCFG bits (PHYSEL/PHYLPWRCLKSEL/TOUTCAL) during long waits, and
+// dwc2_reassert_core_config_post_port_reset() never included
+// FORCEHOSTMODE (bit29) among what it restores, a parallel drift of
+// the force-host bit was a real, previously-unchecked gap -- this
+// reads the live bit directly rather than assuming it's still set.
+fn dwc2_curmode_is_host() -> u32 {
+  let gintsts: i64 = dwc2_base() + 0x14;
+  let s: u32 = mmio_read_u32(gintsts);
+  return s & (1 as u32);
+}
+
 // Task #325 (2026-10-02, real-HW USB bring-up investigation, user:
 // "keep digging on FIFO sizing"): this driver never once programmed
 // GRXFSIZ/GNPTXFSIZ/HPTXFSIZ (the RX/non-periodic-TX/periodic-TX FIFO
@@ -21935,8 +21954,22 @@ fn dwc2_reassert_core_config_post_port_reset() -> i64 {
   let phylpwrclksel_bit: u32 = (1 as u32) << (15 as u32);
   let toutcal_mask: u32 = (0x7 as u32) ^ (0xFFFFFFFF as u32);
   let toutcal_max: u32 = 7 as u32;
+  // Fix (2026-10-30, user: "btw host mode or device mode checked?"):
+  // FORCEHOSTMODE (bit29) was never part of what this function
+  // restores, even though it lives in this exact same register
+  // (GUSBCFG) as PHYSEL/PHYLPWRCLKSEL/TOUTCAL -- all three of which
+  // this same function already had to restore specifically because
+  // they're CONFIRMED to silently revert on this silicon during long
+  // waits (rounds 9/29's own real-HW captures). There was never a
+  // reason to assume bit29 is immune to the same hardware behavior
+  // while its neighbors in the same register aren't. Also clears
+  // FORCEDEVMODE (bit30) first, mirroring dwc2_force_host_mode()'s
+  // own "never leave both force bits set" discipline, rather than
+  // assuming it's already 0.
+  let force_host_bit: u32 = (1 as u32) << (29 as u32);
+  let force_dev_clear: u32 = ((1 as u32) << (30 as u32)) ^ (0xFFFFFFFF as u32);
   let v: u32 = mmio_read_u32(gusbcfg);
-  let new_v: u32 = ((v | physel_bit | phylpwrclksel_bit) & toutcal_mask) | toutcal_max;
+  let new_v: u32 = (((v | physel_bit | phylpwrclksel_bit | force_host_bit) & force_dev_clear) & toutcal_mask) | toutcal_max;
   let _ = mmio_write_u32(gusbcfg, new_v);
 
   // Round 26 correction (see dwc2_enable_dma_mode's own header
@@ -22886,6 +22919,14 @@ fn dwc2_control_no_data(devaddr: u32, mps: u32) -> i64 {
   let hctsiz0: i64 = dwc2_hctsiz0_addr();
   let hcdma0: i64 = dwc2_hcdma0_addr();
 
+  // Resilience fix (2026-10-29): same gap as dwc2_control_out's own
+  // identical fix -- see its header comment for the full "why". This
+  // function is SET_ADDRESS/SET_CONFIGURATION/SET_INTERFACE's own
+  // transport -- SET_ADDRESS specifically runs immediately before the
+  // next GET_DESCRIPTOR in every downstream-enumeration call, exactly
+  // the real sequence a live capture showed failing.
+  let _ = dwc2_reassert_core_config_post_port_reset();
+  let _ = dwc2_reset_chan0_for_new_transfer();
   // Same real-hardware DMA-coherency gap dwc2_control_in's own comment
   // explains in full -- the caller already wrote the SETUP packet into
   // dwc2_dma_scratch via plain stores before calling this function.
@@ -22900,6 +22941,7 @@ fn dwc2_control_no_data(devaddr: u32, mps: u32) -> i64 {
   }
 
   // STATUS stage (IN, zero-length, DATA1).
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
@@ -22935,6 +22977,26 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   let hctsiz0: i64 = dwc2_hctsiz0_addr();
   let hcdma0: i64 = dwc2_hcdma0_addr();
 
+  // Resilience fix (2026-10-29, user: "have you compared this with
+  // zephyr or uboot or linux"): dwc2_control_in has called dwc2_
+  // reassert_core_config_post_port_reset + dwc2_reset_chan0_for_new_
+  // transfer before EVERY phase since round 18's own real-HW
+  // investigation (6 painful rounds pinning down exactly why a stale
+  // channel state silently swallows the next transfer) -- dwc2_
+  // control_out never got the identical fix, despite sharing the
+  // exact same channel 0 and the exact same real failure mode this
+  // whole chain's own hard-won history already root-caused. Checked
+  // against Linux's own drivers/usb/dwc2/hcd.c dwc2_hc_halt(): even
+  // though hardware auto-halts a channel on most terminal conditions
+  // (CHHLTD), Linux still explicitly writes HCCHAR with CHDIS to
+  // force a clean, reusable state before the channel's next use --
+  // the same thing dwc2_reset_chan0_for_new_transfer already does,
+  // adapted for a polling (non-interrupt) driver, just never called
+  // from here. SET_ADDRESS (dwc2_control_no_data, same gap, fixed
+  // below) running immediately before a GET_DESCRIPTOR is exactly
+  // the real sequence a live capture showed failing.
+  let _ = dwc2_reassert_core_config_post_port_reset();
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mem_barrier();
   let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_setup(), 1 as u32, 8 as u32));
@@ -22953,6 +23015,7 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   }
   let _ = mem_barrier();
 
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let pktcnt: u32 = if out_len == (0 as u32) { 1 as u32 } else { (out_len + mps - (1 as u32)) / mps };
   let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), pktcnt, out_len));
@@ -22962,6 +23025,7 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
     return 0 - 1;
   }
 
+  let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
@@ -29309,13 +29373,47 @@ fn dwc2_enumerate_downstream(hub_mps: u32, real_port_count: i64) -> i64 {
   while port <= port_count {
     if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
     let addr: u32 = dwc2_downstream_addr_for_port(port);
+    // TEMP DIAGNOSTIC (2026-10-29): bracket each port's own attempt so
+    // a real-HW capture can tell which specific port succeeded/failed,
+    // not just that "a" downstream GET_DESCRIPTOR failed somewhere.
+    // Remove once root-caused.
+    let _ = uart_puts("USB DIAG: trying port ");
+    let _ = uart_put_i64(port);
+    let _ = uart_puts(" (addr=");
+    let _ = uart_put_hex32(addr);
+    let _ = uart_puts(")\n");
     let outcome: i64 = dwc2_hub_bring_up_and_enumerate_port(hub_addr, hub_mps, port as u32, addr);
+    let _ = uart_puts("USB DIAG: port ");
+    let _ = uart_put_i64(port);
+    let _ = uart_puts(" outcome=");
+    let _ = uart_put_i64(outcome);
+    let _ = uart_puts("\n");
     let is_connected: u32 = if outcome != (1 as i64) { 1 as u32 } else { 0 as u32 };
     let _ = dwc2_set_port_connected(port, is_connected);
     if is_connected == (1 as u32) {
       connected_count = connected_count + 1;
     }
     port = port + 1;
+  }
+
+  // TEMP DIAGNOSTIC (2026-10-29, user: "can you not shutdown power to
+  // 1 of the two usb ports via lan9512 chipset?"): both external ports
+  // (2 and 3) fail GET_DESCRIPTOR identically on every attempt even
+  // after a real power-cycle, with two totally unrelated chipsets
+  // (WiFi + BLE dongles, both LEDs confirmed lit -- VBUS present)
+  // seated -- ruling out a device-specific quirk. This isolates
+  // "both external ports are broken regardless of load" from "the
+  // external rail can't supply two simultaneously-attached devices,
+  // each works fine alone" by forcing one port's VBUS off via
+  // CLEAR_PORT_FEATURE(PORT_POWER) (the same primitive dwc2_hub_
+  // power_cycle_port already uses) and re-attempting the other alone,
+  // then swapping which one is powered -- all in one boot, no
+  // physical access needed. Only meaningful if wHubCharacteristics'
+  // LPSM (see dwc2_hub_fetch_port_count's own print) reports
+  // individual switching (01); gated on port_count>=3 since it
+  // targets ports 2 and 3 specifically. Remove once root-caused.
+  if port_count >= 3 {
+    let _ = dwc2_single_port_power_experiment(hub_addr, hub_mps);
   }
 
   // "Not connected" on EVERY checked port is the only genuinely empty
@@ -29329,6 +29427,43 @@ fn dwc2_enumerate_downstream(hub_mps: u32, real_port_count: i64) -> i64 {
     let _ = uart_puts(" hub ports)\n");
     return 0 - 1;
   }
+  return 0;
+}
+
+// TEMP DIAGNOSTIC (2026-10-29): see the call site's own comment in
+// dwc2_enumerate_downstream for the full rationale. Forces port 3's
+// VBUS off, brings port 2 up and enumerates it alone, then forces
+// port 2's VBUS off and port 3's back on and enumerates port 3 alone
+// -- a controlled, same-boot A/B test of whether either external port
+// can enumerate successfully when it isn't sharing the rail with the
+// other. Restores port 2's power afterward so the rest of boot isn't
+// left with a port deliberately depowered.
+fn dwc2_single_port_power_experiment(hub_addr: u32, hub_mps: u32) -> i64 {
+  let port2: u32 = 2 as u32;
+  let port3: u32 = 3 as u32;
+  let addr2: u32 = dwc2_downstream_addr_for_port(2);
+  let addr3: u32 = dwc2_downstream_addr_for_port(3);
+
+  let _ = uart_puts("USB DIAG: single-port power experiment starting\n");
+
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port3, hub_feature_port_power());
+  let _ = delay(161000);
+  let outcome2: i64 = dwc2_hub_bring_up_and_enumerate_port(hub_addr, hub_mps, port2, addr2);
+  let _ = uart_puts("USB DIAG: port2 alone (port3 powered off) outcome=");
+  let _ = uart_put_i64(outcome2);
+  let _ = uart_puts("\n");
+
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port2, hub_feature_port_power());
+  let _ = delay(161000);
+  let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port3, hub_feature_port_power());
+  let _ = delay(161000);
+  let outcome3: i64 = dwc2_hub_bring_up_and_enumerate_port(hub_addr, hub_mps, port3, addr3);
+  let _ = uart_puts("USB DIAG: port3 alone (port2 powered off) outcome=");
+  let _ = uart_put_i64(outcome3);
+  let _ = uart_puts("\n");
+
+  let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port2, hub_feature_port_power());
+  let _ = delay(161000);
   return 0;
 }
 
@@ -29346,13 +29481,37 @@ fn dwc2_enumerate_downstream(hub_mps: u32, real_port_count: i64) -> i64 {
 // connected" (dwc2_hub_bring_up_port's own result 1) is the one
 // outcome that's never worth retrying -- nothing is physically there,
 // so it returns immediately rather than wasting the retry budget.
+// Port power-cycle recovery (2026-10-29, user: "check raspbian code
+// usb" / Linux reference): checked Linux's own drivers/usb/core/
+// hub.c, hub_port_connect() -- its outer PORT_INIT_TRIES retry loop
+// (4 attempts) isn't just "the same reset again, slower." At the
+// MIDPOINT attempt specifically (i == (PORT_INIT_TRIES-1)/2), it
+// explicitly powers the port OFF then back ON before retrying --
+// neither this driver's own prior retry logic nor U-Boot's simpler
+// bootloader-stage usb_hub_port_reset() ever does this; both only
+// ever re-reset an already-powered port. A device that's wedged in a
+// way a bus reset alone can't clear (but a real power interruption
+// can) is exactly the gap this closes. hub_feature_port_power's own
+// SET done by dwc2_hub_bring_up_port's first line already re-asserts
+// power every call -- this just adds the missing CLEAR first,
+// matching Linux's actual sequence instead of only ever setting.
+fn dwc2_hub_power_cycle_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port, hub_feature_port_power());
+  let _ = delay(161000);
+  return 0;
+}
+
 fn dwc2_hub_bring_up_and_enumerate_port(hub_addr: u32, hub_mps: u32, port: u32, downstream_addr: u32) -> i64 {
   let attempt: i64 = 0;
   let outcome: i64 = 0 - 1;
   let not_connected: i64 = 0;
+  let power_cycle_attempt: i64 = (usb_first_contact_retry_count() - 1) / 2;
   while (attempt < usb_first_contact_retry_count()) && (outcome != 0) && (not_connected == 0) {
     if attempt > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt));
+    }
+    if attempt == power_cycle_attempt {
+      let _ = dwc2_hub_power_cycle_port(hub_addr, hub_mps, port);
     }
     let port_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, port);
     if port_result == 0 {
@@ -30068,20 +30227,28 @@ fn dwc2_hub_fetch_port_count(hub_addr: u32, hub_mps: u32) -> i64 {
   let b_nbr_ports: u32 = buf_read_byte(hubdesc, 2 as u32);
   let w_hub_char_lo: u32 = buf_read_byte(hubdesc, 3 as u32);
   let w_hub_char_hi: u32 = buf_read_byte(hubdesc, 4 as u32);
-  // Round 61's own "diagnostic only for now" print -- the mystery it
-  // existed to settle (real bNbrPorts) was confirmed (=3) and already
-  // hardcoded into dwc2_enumerate_downstream/usb_hotplug_poll this
-  // same session, so gated behind boot_debug_enabled() now rather
-  // than printed on every boot.
-  if boot_debug_enabled() == 1 {
-    let _ = uart_puts("USB DIAG: real Hub Descriptor bDescLength=");
-    let _ = uart_put_hex32(b_desc_length);
-    let _ = uart_puts(" bNbrPorts=");
-    let _ = uart_put_hex32(b_nbr_ports);
-    let _ = uart_puts(" wHubCharacteristics=0x");
-    let _ = uart_put_hex32(w_hub_char_lo | (w_hub_char_hi << (8 as u32)));
-    let _ = uart_puts("\n");
-  }
+  // TEMP DIAGNOSTIC (2026-10-29): unconditional (not gated behind
+  // boot_debug_enabled() like round 61's original print) specifically
+  // to learn wHubCharacteristics bits 1:0 (Logical Power Switching
+  // Mode, USB 2.0 spec Table 11-13 / Linux ch11.h HUB_CHAR_LPSM) on
+  // the very next real-HW boot without needing debug mode on: 00 =
+  // ganged (one switch controls all ports -- CLEAR_PORT_FEATURE(PORT_
+  // POWER) on a single port would affect both external ports at
+  // once), 01 = individual (the single-port-power experiment below is
+  // meaningful), 1X = no power switching hardware at all (CLEAR_PORT_
+  // FEATURE(PORT_POWER) is a silent no-op -- would also explain why
+  // this session's earlier port-power-cycle fix made zero observed
+  // difference). Remove once root-caused.
+  let w_hub_char: u32 = w_hub_char_lo | (w_hub_char_hi << (8 as u32));
+  let _ = uart_puts("USB DIAG: real Hub Descriptor bDescLength=");
+  let _ = uart_put_hex32(b_desc_length);
+  let _ = uart_puts(" bNbrPorts=");
+  let _ = uart_put_hex32(b_nbr_ports);
+  let _ = uart_puts(" wHubCharacteristics=0x");
+  let _ = uart_put_hex32(w_hub_char);
+  let _ = uart_puts(" LPSM=");
+  let _ = uart_put_hex32(w_hub_char & (0x3 as u32));
+  let _ = uart_puts("\n");
   return b_nbr_ports as i64;
 }
 
