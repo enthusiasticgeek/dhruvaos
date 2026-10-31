@@ -9077,7 +9077,30 @@ fn dharafs_ecc_gen_poly() -> [u8; 32] {
 // per-block BCH). The FAT32 partition is read entirely by the Pi's own
 // closed-source VideoCore bootloader before this kernel even runs; this
 // driver never touches it at all.
-fn dharafs_ecc_scope_end() -> i64 { return 9220; }
+// 2026-10-31 fix (real-HW, found live): was 9220, which put blocks
+// 9216-9219 -- kernelslot_state_block_a()/_b() (9216/9217) and
+// kernelupload_chunk_state_block_a()/_b() (9218/9219) -- inside ECC
+// scope. All four are written DIRECTLY by stage0 (boot/stage0/
+// stage0_main.c's own stage0_sd_write_block, a separate bare-metal
+// program with zero knowledge of this ECC table) or by kernel_slot_
+// layout.py's own raw writes from the PC side -- the EXACT "written
+// by non-ECC-aware tooling" situation this function's own header
+// comment already excludes kernel slots A/B (10240+) for. A stale
+// ECC parity entry left over from any earlier KERNEL-side write to
+// one of these 4 blocks never gets updated when stage0/kernel_slot_
+// layout.py later overwrites the same block's real content (a new
+// slot-state generation, an incremented attempt_count) -- the next
+// kernel-side read then BCH-decodes CURRENT content against a parity
+// computed for completely different, long-gone bytes, and reliably
+// finds >8 bit differences: a false "UNCORRECTABLE" on a block whose
+// own CRC32 (kernelslot_lookup's real validity check) is perfectly
+// fine. Confirmed live: exactly this sequence made kernelslot_lookup
+// report "no valid slot-state record found -- card not seeded?" on a
+// card whose slot-state was never actually invalid, just wrongly
+// vetoed by ECC before its own real CRC32 check ever ran. 8801-9215
+// was already documented spare/unused (this round's own research),
+// so narrowing scope here protects nothing real that it used to.
+fn dharafs_ecc_scope_end() -> i64 { return 9216; }
 // The ECC table's own backing blocks must be excluded from self-
 // coverage, or encoding/decoding a block of the table would recurse
 // into protecting the table itself.
@@ -9318,8 +9341,9 @@ fn nand_read_page(block_num: i64, buf: mut ref i64) -> i64 {
 // the existing free gap 9220-10239 (875 blocks spare) -- at today's
 // real default (16) only 10 sectors are ever actually touched.
 // Deliberately NOT inside dharafs_ecc_in_scope's own protected range
-// (dharafs_ecc_scope_end()==9220, strictly below this table's own
-// base) -- no self-reference risk the way the ECC table itself had to
+// (dharafs_ecc_scope_end()==9216 as of this file's own 2026-10-31 fix,
+// still strictly below this table's own base) -- no self-reference
+// risk the way the ECC table itself had to
 // guard against, so this table's own I/O goes through the normal
 // ECC+retry-wrapped sdhost_read_block/write_block directly (verified
 // harmless: dharafs_ecc_verify_on_read/protect_on_write both already
