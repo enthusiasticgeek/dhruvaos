@@ -6622,8 +6622,25 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   // response if any, complete) or the iteration cap is hit -- capped,
   // not `while true`, specifically so a wedged card can never hang
   // the caller forever the way an unbounded wait would.
+  //
+  // 2026-10-31: this loop had NO watchdog_kick() at all, in the ONE
+  // function every single SD command in this driver funnels through
+  // -- found only after the FIFO-drain loop's own every-65536 kick
+  // (sdhost_write_block_once, same day) still didn't fully close a
+  // real-HW reset loop with near-perfectly repeatable ~18s-from-
+  // checkpoint-7 timing (two cycles measured within 2ms of each
+  // other). This is the more fundamental gap: every bad block the
+  // recovery scan's retry ladder encounters issues a CMD16/CMD17 (or
+  // CMD16/CMD24 for a wedge-checkpoint write) that funnels through
+  // here FIRST, before the FIFO-drain loop is ever reached -- a
+  // genuinely wedged controller could exhaust its entire 15s budget
+  // right here, with zero chance for the FIFO-drain loop's own fix to
+  // even matter.
   let iter: i64 = 0;
   while iter < 1000000 {
+    if (WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1) && ((iter & 4095) == 0) {
+      let _ = watchdog_kick();
+    }
     let v: u32 = sd_mmio_read_u32(sdcmd);
     if (v & sdcmd_new_flag) == (0 as u32) {
       break;
@@ -8838,17 +8855,23 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // phenomenon, narrowing the search further.
   let fifo_drain_iter: i64 = 0;
   while fifo_drain_iter < 1000000 {
-    // 2026-10-31: this loop's own 1,000,000-iteration cap was never
-    // itself watchdog-kicked -- found live, a genuinely wedged
-    // controller spent real wall-clock time here (plus this
-    // function's own caller, sd_wedge_checkpoint, being invoked
-    // AGAIN right after via the exact same no-kick path) close
-    // enough to the 15s window to matter. Matches this file's own
-    // established "no single uninterrupted stretch between kicks"
-    // discipline (sdhost_init_at_speed's per-iteration kicks,
-    // stage0's own "re-arm every 512 blocks") rather than trusting
-    // one upfront arm to cover an unmeasured worst case.
-    if (WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1) && ((fifo_drain_iter & 65535) == 0) {
+    // 2026-10-31, tightened further the same day: the every-65536
+    // granularity added earlier was confirmed LIVE to still be
+    // insufficient -- a real card now resets with near-perfectly
+    // repeatable ~18s-from-checkpoint-7 timing (two independent
+    // cycles measured at 18.156s and 18.158s wall-clock, nowhere
+    // near the randomness real hardware wear would produce), i.e.
+    // deterministically hitting the 15s watchdog window inside THIS
+    // exact loop on the very first wedged block the recovery scan's
+    // retry ladder encounters (which routes through sd_wedge_
+    // checkpoint -> this function). A genuinely wedged controller's
+    // own per-iteration SDEDM read apparently costs far more real
+    // time under worse wedge conditions than whatever was true when
+    // 65536 was chosen -- 16x tighter closes that margin without
+    // meaningfully increasing kick overhead (a watchdog_kick() is a
+    // couple of cheap MMIO writes, negligible even every 4096
+    // iterations of a loop that already runs up to 1,000,000 times).
+    if (WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1) && ((fifo_drain_iter & 4095) == 0) {
       let _ = watchdog_kick();
     }
     let edm_drain: u32 = sd_mmio_read_u32(SDEDM);
