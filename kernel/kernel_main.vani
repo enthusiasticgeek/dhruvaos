@@ -319,6 +319,10 @@ extern "C" fn dharafs_ecc_cache_get_dirty() -> u32;
 extern "C" fn dharafs_ecc_cache_buf_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_ecc_cache_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_ecc_skip_next_protect_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_ecc_skip_next_protect_get_and_clear() -> u32;
 // DharaFS NAND-FTL wear-leveling table one-sector RAM cache
 // (boot/dharafs_wear_state.S) -- same shape/reasoning as the ECC cache
 // above.
@@ -8606,6 +8610,21 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
       let _ = uart_puts(" attempts\n");
       let _ = sdhost_init();
+      // 2026-10-31: mark bad right here, not just during dharafs_
+      // init's own boot-time scan -- dharafs_badblock_mark's ONE
+      // call site used to be that scan loop, which only ever covers
+      // [scan_start_blk, max_blk) (the DharaFS log itself). Every
+      // block from max_blk upward -- crypto metadata, the checkpoint,
+      // the badblock bitmap's own backing blocks, the ECC/wear tables
+      // -- could physically go bad and pay this exact 3-attempt
+      // retry-with-reinit cost FOREVER, on every single access, with
+      // no way to ever skip it, since it could never get marked. This
+      // is also a CLEANER signal than the scan's own criteria (which
+      // conflates a real I/O failure with "content doesn't look like
+      // a valid log record," a weaker proxy that would wrongly flag a
+      // blank-but-healthy block): a genuine multi-attempt I/O failure,
+      // independent of what the block is supposed to contain.
+      let _ = dharafs_badblock_mark(block_num);
       return result;
     }
   }
@@ -8968,6 +8987,19 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
 }
 
 fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
+  // 2026-10-31: captured ONCE, right here, before any early-return
+  // path (fault injection below, a retry-exhausted give-up, etc.)
+  // could ever skip past the one place (the result==0 success branch
+  // further down) that would otherwise consume it. dharafs_ecc_skip_
+  // next_protect_get_and_clear() is one-shot by design (same pattern
+  // as fault_write_maybe_inject's own countdown, right below) -- if it
+  // were only read deep inside the success branch, a failed write
+  // would leave it sitting at 1, silently skipping ECC protection on
+  // the NEXT, unrelated write too. Capturing into a local here
+  // guarantees exactly one consumption per call, regardless of
+  // outcome. See dharafs_ecc_protect_on_write's own header comment
+  // for the full "why" this flag exists.
+  let skip_protect_this_write: u32 = dharafs_ecc_skip_next_protect_get_and_clear();
   // Round 62 (fault injection): `fault write <n>` -- see
   // fault_write_maybe_inject's own comment. Checked before touching
   // any hardware register at all, so an injected failure has zero
@@ -9003,7 +9035,7 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
       // emergency-diagnostic-path reason given on the read side (sd_
       // wedge_checkpoint itself writes via sdhost_write_block_once
       // directly, specifically so it still works mid-wedge).
-      let _ = dharafs_ecc_protect_on_write(block_num, buf);
+      let _ = dharafs_ecc_protect_on_write(block_num, buf, skip_protect_this_write);
       return 0;
     }
     if result == 3 {
@@ -9031,6 +9063,9 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
       let _ = uart_puts(" attempts\n");
       let _ = sdhost_init();
+      // See sdhost_read_block's own matching comment -- same real-time
+      // mark-on-confirmed-failure extension, write side.
+      let _ = dharafs_badblock_mark(block_num);
       return result;
     }
   }
@@ -9234,8 +9269,34 @@ fn dharafs_ecc_cache_flush() -> i64 {
 // second physical SD round trip on the common case of writing several
 // blocks that share one table sector). Called from sdhost_write_block_
 // once, before any hardware register is touched.
-fn dharafs_ecc_protect_on_write(block_num: i64, buf: mut ref i64) -> i64 {
+fn dharafs_ecc_protect_on_write(block_num: i64, buf: mut ref i64, skip_protect: u32) -> i64 {
   if dharafs_ecc_in_scope(block_num) == 0 {
+    return 0;
+  }
+  // DharaFS NAND-FTL ECC erase-cost fix (2026-10-31): a caller that
+  // already knows this write is a known-blank erase pattern (Round
+  // B's own dharafs_gc_erase_range_step, Round D's nand_erase_block)
+  // sets dharafs_ecc_skip_next_protect_set(1) right before the write
+  // -- there's nothing in all-zero content worth a ~140ms BCH encode
+  // to protect, and the PRIOR entry (if any) would otherwise still
+  // claim this now-blank block holds whatever the LAST real record
+  // there looked like, a stale-parity hazard identical in kind to the
+  // one dharafs_ecc_scope_end's own 9216 narrowing already fixed for
+  // non-ECC-aware tooling. Clearing the entry (magic=0) is also
+  // exactly what dharafs_ecc_verify_on_read's own early-exit already
+  // treats as "nothing to check" -- same cost as a block that's never
+  // been ECC-protected at all, skipping the read-side decode too.
+  // Caller (sdhost_write_block) captures-and-clears the one-shot flag
+  // itself, before any early-return path could skip this function
+  // entirely and leak it into an unrelated later write -- see that
+  // function's own comment.
+  if skip_protect == (1 as u32) {
+    let sector_num: i64 = dharafs_ecc_table_sector_for(block_num);
+    let _ = dharafs_ecc_cache_ensure(sector_num);
+    let cache_buf: mut ref i64 = dharafs_ecc_cache_buf_get();
+    let off: i64 = dharafs_ecc_table_offset_for(block_num);
+    let _ = buf_write_u32_be(cache_buf, off as u32, 0 as u32);
+    let _ = dharafs_ecc_cache_set_dirty(1 as u32);
     return 0;
   }
   let plain: [u8; 512] = [0 as u8; 512];
@@ -9504,6 +9565,13 @@ fn nand_erase_block(erase_unit_num: i64, scratch_buf: mut ref i64) -> i64 {
       let _ = buf_write_byte(scratch_buf, z as u32, 0 as u32);
       z = z + 1;
     }
+    // See dharafs_ecc_protect_on_write's own comment -- nand_program_
+    // page goes straight to sdhost_write_block, bypassing dharafs_
+    // block_write's own crypto layer entirely, so unlike dharafs_gc_
+    // erase_range_step's matching call site, this content is ALWAYS
+    // genuinely all-zero on disk regardless of dharafs_crypto_get_
+    // enabled() -- no gate needed here.
+    let _ = dharafs_ecc_skip_next_protect_set(1 as u32);
     let wr_status: i64 = nand_program_page(base + i, scratch_buf);
     if wr_status != 0 {
       return 0 - 1;
@@ -11659,6 +11727,23 @@ fn dharafs_get_attr_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
 // read out of someone else's record, with no Str form to construct
 // from arbitrary bytes.  The block number of the newest valid record
 // matching the path at path_buf[0:path_len), or -1 if none exists.
+// A path that's never been written (or whose dirindex entry was
+// evicted by dharafs_dirindex_evict_lru) used to re-pay the FULL
+// linear scan below on every single lookup, forever -- dirindex only
+// ever cached a HIT, never a confirmed miss. Live-confirmed as a real
+// cost on a degraded card with a long history (wifi_config_init/ble_
+// config_init/etc. each probe a handful of /config/* keys that may
+// never have been written on a given board, and NONE of those misses
+// were ever cached). Storing this exact sentinel as the "block"
+// closes that gap: dirindex_get_block_at always zero-extends its
+// stored 32-bit word to an i64 (see boot/dirindex_state.S, r1 is
+// hard-set to 0 on every return) -- a stored value can therefore
+// never come back negative, so a NEGATIVE sentinel would never
+// round-trip correctly. This value is comfortably outside any real
+// block number this project will ever reach (kernel slots, the
+// highest-numbered real region, top out in the tens of thousands).
+fn dharafs_dirindex_confirmed_absent_sentinel() -> i64 { return 4294967294; }
+
 fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   // Fast path: the hashed directory index (boot/dirindex_state.S) is
   // kept exactly in sync with every write that reaches this path
@@ -11667,8 +11752,15 @@ fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   // returned directly, no scan needed. A MISS falls through to the
   // exact same linear scan this function has always done (never a
   // regression), which then self-heals the index below so the same
-  // path is fast on every subsequent lookup.
+  // path is fast on every subsequent lookup. A cached CONFIRMED-ABSENT
+  // sentinel skips the scan too -- self-correcting the moment a real
+  // write for this exact path ever happens, since dharafs_append_raw's
+  // own upsert-on-success always overwrites whatever was here
+  // (sentinel or real block) with the new real block number.
   let cached_block: i64 = dharafs_dirindex_lookup_raw(path_buf, path_len);
+  if cached_block == dharafs_dirindex_confirmed_absent_sentinel() {
+    return 0 - 1;
+  }
   if cached_block >= 0 {
     return cached_block;
   }
@@ -11732,6 +11824,12 @@ fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
     // simply never written through a hook that upserts) -- now that
     // the scan found it the honest way, index it so next time is fast.
     let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, best_block);
+  } else {
+    // See dharafs_dirindex_confirmed_absent_sentinel's own comment --
+    // cache the negative result too, so a path that genuinely doesn't
+    // exist (e.g. an unconfigured /config/* key) doesn't pay this same
+    // full scan again on every future lookup.
+    let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, dharafs_dirindex_confirmed_absent_sentinel());
   }
   return best_block;
 }
@@ -12185,6 +12283,14 @@ fn dharafs_gc_erase_range_step(buf: mut ref i64, cursor: i64, target: i64) -> i6
     while z < 512 {
       let _ = buf_write_byte(buf, z as u32, 0 as u32);
       z = z + 1;
+    }
+    // See dharafs_ecc_protect_on_write's own comment -- only safe to
+    // skip BCH-encoding this write when encryption is off, since an
+    // encrypted "blank" page is NOT actually all-zero ciphertext on
+    // disk (the AEAD nonce/tag mixing means there's real content
+    // worth protecting even for all-zero plaintext).
+    if dharafs_crypto_get_enabled() == (0 as u32) {
+      let _ = dharafs_ecc_skip_next_protect_set(1 as u32);
     }
     let wr_status: i64 = dharafs_block_write(c, buf);
     if wr_status != 0 {

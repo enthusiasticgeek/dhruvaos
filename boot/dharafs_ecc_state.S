@@ -37,6 +37,17 @@ dharafs_ecc_cache_buf_addr:
     .word 0        /* set once at boot via dharafs_ecc_cache_buf_set,
                      * to a 512-byte dhruva_alloc_bytes buffer -- the
                      * cached sector's own raw bytes */
+dharafs_ecc_skip_next_protect:
+    .word 0        /* one-shot flag (2026-10-31), same pattern as
+                     * fault_write_maybe_inject's own one-shot
+                     * countdown: a caller that already KNOWS the next
+                     * sdhost_write_block call is a known-blank erase
+                     * pattern sets this right before that call, so
+                     * dharafs_ecc_protect_on_write clears the block's
+                     * ECC entry instead of paying a full BCH encode
+                     * for content with nothing worth protecting --
+                     * see that function's own header comment for the
+                     * full "why" (erase cost discovery, same day). */
 
 .section ".text"
 .align 4
@@ -79,4 +90,19 @@ dharafs_ecc_cache_buf_get:
     ldr r0, =dharafs_ecc_cache_buf_addr
     ldr r0, [r0]
     mov r1, #0
+    bx lr
+
+.global dharafs_ecc_skip_next_protect_set
+dharafs_ecc_skip_next_protect_set:
+    ldr r1, =dharafs_ecc_skip_next_protect
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_ecc_skip_next_protect_get_and_clear
+dharafs_ecc_skip_next_protect_get_and_clear:
+    ldr r1, =dharafs_ecc_skip_next_protect
+    ldr r0, [r1]
+    mov r2, #0
+    str r2, [r1]
     bx lr
