@@ -87,6 +87,24 @@ dharafs_catchup_path_buf_addr:
 dharafs_catchup_data_buf_addr:
     .word 0             /* 20480 bytes, matches task_e's own compact_
                          * data_buf (dharafs_file_max_len(), task #164) */
+// DharaFS Phase 3 (Round C, 2026-10-30): dedicated buffers for the
+// honest-ENOSPC reclaim-then-retry's own dharafs_compact() calls (see
+// dharafs_compact_drain_one_pass's header comment, kernel_main.vani).
+// Not shared with dharafs_catchup_buf/etc above for the exact same
+// reason those aren't shared with task_e's own compact_buf: this is a
+// genuinely different caller (dharafs_write_raw_checked/dharafs_
+// delete_raw_checked, reached from task_f's shell dispatch), and
+// dharafs_compact's own internal use of a caller-owned `buf` parameter
+// means two logically-concurrent callers can never safely share one
+// instance.
+dharafs_reclaim_buf_addr:
+    .word 0             /* 512 bytes, matches dharafs_sd_scratch's own
+                         * sizing rationale (one on-disk block) */
+dharafs_reclaim_path_buf_addr:
+    .word 0             /* 32 bytes, matches dharafs_path_scratch */
+dharafs_reclaim_data_buf_addr:
+    .word 0             /* 20480 bytes, matches task_e's own compact_
+                         * data_buf (dharafs_file_max_len(), task #164) */
 dharafs_stat_scratch_addr:
     .word 0             /* Round 42: 12 bytes -- dharafs_stat_raw's output
                          * (owner_uid/owner_gid/mode, 4 bytes each) */
@@ -751,6 +769,48 @@ dharafs_catchup_data_buf_set:
 .global dharafs_catchup_data_buf_get
 dharafs_catchup_data_buf_get:
     ldr r0, =dharafs_catchup_data_buf_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_reclaim_buf_set
+dharafs_reclaim_buf_set:
+    ldr r1, =dharafs_reclaim_buf_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_reclaim_buf_get
+dharafs_reclaim_buf_get:
+    ldr r0, =dharafs_reclaim_buf_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_reclaim_path_buf_set
+dharafs_reclaim_path_buf_set:
+    ldr r1, =dharafs_reclaim_path_buf_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_reclaim_path_buf_get
+dharafs_reclaim_path_buf_get:
+    ldr r0, =dharafs_reclaim_path_buf_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global dharafs_reclaim_data_buf_set
+dharafs_reclaim_data_buf_set:
+    ldr r1, =dharafs_reclaim_data_buf_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_reclaim_data_buf_get
+dharafs_reclaim_data_buf_get:
+    ldr r0, =dharafs_reclaim_data_buf_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
