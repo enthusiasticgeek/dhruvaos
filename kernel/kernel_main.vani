@@ -9201,6 +9201,178 @@ fn dharafs_ecc_verify_on_read(block_num: i64, buf: mut ref i64) -> i64 {
   return 0;
 }
 
+// DharaFS NAND-FTL, Round D (2026-10-30): the real geometry/primitive
+// boundary a future real NAND chip driver would need -- SD has no
+// erase-before-reprogram constraint at all, but this project wants the
+// FTL/GC logic itself to already be written and tested against that
+// constraint, so swapping a real chip driver in later is "new bodies
+// for these three functions," never a rewrite of the logic above them
+// (nand_erase_unit_relocating_live_pages below, Round B's own compact
+// loop, etc.). erase_unit_blocks=16 is a config point, not a property
+// of any real chip -- picked arbitrarily, deliberately not == 1 (which
+// would make unit-level discipline trivially a no-op and prove
+// nothing).
+fn nand_geometry_erase_unit_blocks() -> i64 { return 16; }
+fn nand_geometry_page_size_blocks() -> i64 { return 1; }
+
+// Page-granular primitives. SD stand-in: straight through to the real,
+// ECC-wrapped sdhost_read_block/write_block (NOT sdhost_read_block_
+// once/write_block_once -- that level deliberately sits below Round
+// A's own ECC hook, see dharafs_ecc_verify_on_read/dharafs_ecc_
+// protect_on_write's own call sites). A real NAND chip driver's
+// replacement bodies would talk to real chip registers instead; every
+// caller above this pair stays unchanged either way.
+fn nand_program_page(block_num: i64, buf: mut ref i64) -> i64 {
+  return sdhost_write_block(block_num, buf);
+}
+fn nand_read_page(block_num: i64, buf: mut ref i64) -> i64 {
+  return sdhost_read_block(block_num, buf);
+}
+
+// Erases one whole unit (nand_geometry_erase_unit_blocks() pages),
+// zeroing and read-back-verifying each one -- the real, atomic
+// hardware operation this is a stand-in for doesn't exist on SD, so
+// this models it as a sequence of per-page zero+verify steps instead.
+// NOT WCET-bounded/resumable the way dharafs_compact's own erase phase
+// is: this is standalone, non-hot-path infrastructure (see this
+// round's own plan writeup for why), never called from task_e's
+// periodic wake, so there's no per-tick budget to respect here.
+// Caller-owned scratch_buf, same discipline as every other DharaFS
+// primitive that needs one. Wear-cycle accounting is deliberately NOT
+// done here -- Round E's own wear table (not yet built) is where a
+// real P/E-cycle count would be bumped; erasing today just erases.
+fn nand_erase_block(erase_unit_num: i64, scratch_buf: mut ref i64) -> i64 {
+  let base: i64 = erase_unit_num * nand_geometry_erase_unit_blocks();
+  let i: i64 = 0;
+  while i < nand_geometry_erase_unit_blocks() {
+    let z: i64 = 0;
+    while z < 512 {
+      let _ = buf_write_byte(scratch_buf, z as u32, 0 as u32);
+      z = z + 1;
+    }
+    let wr_status: i64 = nand_program_page(base + i, scratch_buf);
+    if wr_status != 0 {
+      return 0 - 1;
+    }
+    let rd_status: i64 = nand_read_page(base + i, scratch_buf);
+    if rd_status != 0 {
+      return 0 - 1;
+    }
+    let zz: i64 = 0;
+    let all_zero: i64 = 1;
+    while zz < 512 {
+      if buf_read_byte(scratch_buf, zz as u32) != (0 as u32) {
+        all_zero = 0;
+      }
+      zz = zz + 1;
+    }
+    if all_zero == 0 {
+      return 0 - 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Makes one whole erase unit genuinely, safely erasable: any block in
+// it that's still live (the path's current copy, or a version a live
+// snapshot still needs -- the exact same two conditions Round B's own
+// compact loop checks) is relocated to the ordinary write frontier
+// FIRST, through the exact same dharafs_append_raw_relocate/dharafs_
+// delete_raw_relocate Round B already built and proved (preserving
+// each record's original sequence number, exactly like Round B's own
+// relocation -- a live snapshot pinned to an older seq would otherwise
+// stop finding the record it depends on the instant this gives it a
+// fresh one). Only once every live block in the unit has somewhere
+// else to live does the whole unit get erased via nand_erase_block --
+// never partially, since a real NAND erase can't be partial either.
+//
+// Deliberately NOT wired into dharafs_append_raw's own hot path: this
+// project's write pattern already always targets either the genuinely
+// fresh tail (dharafs_state_get_next_block()) or a range Round B's own
+// erase phase already confirmed blank before any write reuses it --
+// by construction, no real write today ever needs to reprogram a page
+// whose unit still has OTHER live neighbors, so there is currently no
+// call site that legitimately needs this. It exists as tested,
+// standalone infrastructure instead -- for a real NAND chip's own
+// factory bad-block remapping (which can force a write to a specific
+// physical location rather than a clean append frontier) or any
+// future round that does, verified directly by nand_erase_unit_
+// discipline_self_test below rather than through the normal write
+// path. Guards against being asked to erase a unit that ISN'T
+// entirely behind the real frontier -- erasing (or relocating INTO)
+// anything at or past dharafs_state_get_next_block() would corrupt
+// space every other writer still considers live/reserved.
+fn nand_erase_unit_relocating_live_pages(erase_unit_num: i64, scratch_buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) -> i64 {
+  let base: i64 = erase_unit_num * nand_geometry_erase_unit_blocks();
+  let unit_end: i64 = base + nand_geometry_erase_unit_blocks();
+  let next_block_now: i64 = dharafs_state_get_next_block() as i64;
+  if unit_end > next_block_now {
+    return 0 - 1;
+  }
+  let target_cursor: i64 = next_block_now;
+  let moved_any: i64 = 0;
+  let i: i64 = 0;
+  while i < nand_geometry_erase_unit_blocks() {
+    let blk: i64 = base + i;
+    let rd_status: i64 = dharafs_block_read(blk, scratch_buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(scratch_buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(scratch_buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(scratch_buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
+        let rec_path_len: u32 = buf_read_u32(scratch_buf, 8 as u32);
+        if (rec_path_len > (0 as u32)) && (rec_path_len <= (32 as u32)) {
+          let k: i64 = 0;
+          while (k as u32) < rec_path_len {
+            let pb: u32 = buf_read_byte(scratch_buf, (12 + k) as u32);
+            let _ = buf_write_byte(path_buf, k as u32, pb);
+            k = k + 1;
+          }
+          let latest_blk: i64 = dharafs_find_latest_block_raw(path_buf, rec_path_len as i64);
+          let is_latest: i64 = if latest_blk == blk { 1 } else { 0 };
+          let needed_by_snapshot: i64 = if is_latest == 1 { 0 } else { dharafs_gc_record_needed_by_live_snapshot(path_buf, rec_path_len as i64, rec_seq) };
+          if (is_latest == 1) || (needed_by_snapshot == 1) {
+            let rec_data_len: u32 = buf_read_u32(scratch_buf, 44 as u32);
+            if rec_data_len == (0xFFFFFFFF as u32) {
+              let del_status: i64 = dharafs_delete_raw_relocate(path_buf, rec_path_len as i64, target_cursor, rec_seq, is_latest);
+              if del_status != 0 {
+                return 0 - 1;
+              }
+              target_cursor = target_cursor + 1;
+              moved_any = 1;
+            } else {
+              // Reads THIS block's own content (see dharafs_compact's
+              // own matching fix, found via this exact self-test, for
+              // why dharafs_read_raw(path_buf, ...) -- always "the
+              // path's current latest" -- would be wrong here for the
+              // needed_by_snapshot==1 case).
+              let full_len: i64 = dharafs_read_from_block_raw(blk, data_buf);
+              if full_len < 0 {
+                return 0 - 1;
+              }
+              let rec_uid: u32 = buf_read_u32(scratch_buf, 52 as u32);
+              let rec_gid: u32 = buf_read_u32(scratch_buf, 56 as u32);
+              let rec_mode: u32 = buf_read_u32(scratch_buf, 60 as u32);
+              let blocks_written: i64 = dharafs_append_raw_relocate(path_buf, rec_path_len as i64, data_buf, full_len, rec_uid, rec_gid, rec_mode, target_cursor, rec_seq, is_latest);
+              if blocks_written <= 0 {
+                return 0 - 1;
+              }
+              target_cursor = target_cursor + blocks_written;
+              moved_any = 1;
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  if moved_any == 1 {
+    let _ = dharafs_state_set(target_cursor as u32, dharafs_state_get_next_seq());
+  }
+  return nand_erase_block(erase_unit_num, scratch_buf);
+}
+
 // Round 36: block-device abstraction the FS layer's own raw block I/O
 // goes through, rather than calling sdhost_read_block/write_block
 // directly -- the "block-device abstraction" docs/TODO.md called for,
@@ -9223,7 +9395,7 @@ fn dharafs_block_read_raw(block_num: i64, buf: mut ref i64) -> i64 {
   if dharafs_state_get_block_dev() == (1 as u32) {
     return usb_msd_read10(dwc2_downstream_addr(), block_num as u32, buf);
   }
-  return sdhost_read_block(block_num, buf);
+  return nand_read_page(block_num, buf);
 }
 
 fn dharafs_block_write_raw(block_num: i64, buf: mut ref i64) -> i64 {
@@ -9233,7 +9405,7 @@ fn dharafs_block_write_raw(block_num: i64, buf: mut ref i64) -> i64 {
     if dharafs_state_get_block_dev() == (1 as u32) {
       usb_msd_write10(dwc2_downstream_addr(), block_num as u32, buf)
     } else {
-      sdhost_write_block(block_num, buf)
+      nand_program_page(block_num, buf)
     }
   };
   // Round 51: counts every successful commit, across all three
@@ -11976,15 +12148,42 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
           } else {
             // Round 39: this HEAD block may chain across several
             // blocks now -- reconstruct the FULL logical content via
-            // dharafs_read_raw (the same chain-following, checksum-
-            // verifying logic every other caller uses) rather than
-            // copying just this one block's own up-to-448-byte chunk,
-            // which would silently truncate any multi-block record.
-            // dharafs_read_raw's own internal dharafs_sd_scratch use doesn't
-            // conflict with `buf` here -- separate, caller-owned
-            // buffers, and this block's own fields have already been
-            // read out above before this call.
-            let full_len: i64 = dharafs_read_raw(path_buf, rec_path_len as i64, data_buf);
+            // dharafs_read_from_block_raw (the same chain-following,
+            // checksum-verifying logic dharafs_snapshot_read_raw already
+            // uses for a historical block) rather than copying just this
+            // one block's own up-to-448-byte chunk, which would silently
+            // truncate any multi-block record.
+            //
+            // BUG FIX (found live, 2026-10-30, while building Round D's
+            // own nand_erase_unit_relocating_live_pages -- which copied
+            // this exact pattern and failed its own self-test the moment
+            // it genuinely exercised the needed_by_snapshot==1 branch):
+            // this used to call dharafs_read_raw(path_buf, ...) instead,
+            // which doesn't take a block number at all -- it always
+            // resolves to the PATH'S CURRENT LATEST copy via dirindex,
+            // regardless of which block this scan iteration is actually
+            // looking at. For is_latest==1 that's harmless (blk IS the
+            // current latest, so both calls agree) -- but for the
+            // needed_by_snapshot==1 case (relocating an OLDER version a
+            // live snapshot still pins), it silently copied the path's
+            // CURRENT content instead of this specific historical
+            // record's own content, while still preserving the OLD
+            // record's seq number -- corrupting exactly the data this
+            // round's whole snapshot-safety guarantee depends on.
+            // dharafs_gc_snapshot_safety_self_test never caught this
+            // because its own "drain compaction to completion" step only
+            // RESUMES an already-in-progress pass (same shape as the
+            // drain-first loop above it) and never actually STARTS one --
+            // unlike dharafs_compact_resumable_self_test's matching step,
+            // it has no unconditional kickoff call, so with nothing else
+            // triggering compaction yet at that point in boot, it was a
+            // silent no-op: the test's own "version-one" was simply never
+            // touched by compaction at all, so it trivially read back
+            // correctly regardless of this bug. Fixed by reading THIS
+            // block's own content directly (dharafs_read_from_block_raw
+            // already needs no path lookup at all, so it's both the
+            // correct fix and a simpler call).
+            let full_len: i64 = dharafs_read_from_block_raw(blk, data_buf);
             if full_len < 0 {
               all_ok = 0;
             } else {
@@ -12332,6 +12531,22 @@ fn dharafs_gc_snapshot_safety_self_test() -> i64 {
   // Drain compaction to completion -- this is where dharafs_gc_record_
   // needed_by_live_snapshot either does or doesn't save "version-one"
   // from the erase phase that follows.
+  //
+  // BUG FIX (found live, 2026-10-30, while building Round D): this used
+  // to be ONLY the while loop below, with no call to kick off a FRESH
+  // pass first -- that loop's own condition (resume_block!=0 ||
+  // erase_cursor!=0) is only ever true once a pass is ALREADY in
+  // progress, so with nothing else having triggered compaction yet at
+  // this point in boot (task_e doesn't exist until start_multitasking),
+  // the loop body never ran at all: this self-test's own "real"
+  // compaction pass was a silent no-op every single time it ran.
+  // "version-one" read back correctly afterward not because snapshot-
+  // safety worked, but because compaction never touched it in the
+  // first place -- this self-test never actually exercised what it
+  // claims to. See dharafs_compact_resumable_self_test's own matching
+  // step, just above, for the unconditional kickoff call this one was
+  // missing.
+  let _ = dharafs_compact(buf, path_buf, data_buf);
   let calls: i64 = 1;
   while ((dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32))) && (calls < 300) {
     let _ = dharafs_compact(buf, path_buf, data_buf);
@@ -12534,6 +12749,182 @@ fn dharafs_enospc_reclaim_self_test() -> i64 {
   let _ = dharafs_state_set(next_block_before_jump, dharafs_state_get_next_seq());
 
   let _ = uart_puts("DharaFS: dharafs_write_raw_checked's honest-ENOSPC reclaim-then-retry engages real compaction and degrades safely (no hang/crash) when one bounded pass can't finish");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round D (2026-10-30): the direct regression test for nand_erase_
+// unit_relocating_live_pages -- manufactures a single erase unit
+// holding a genuine mix (one plain live file, one path with a
+// snapshot-pinned older version AND a current newer version, plus one
+// genuinely dead copy in between), confirms the erase-unit function
+// relocates exactly the two still-needed copies (not the dead one),
+// leaves the WHOLE unit (all 16 blocks, not just the ones that held
+// real data) genuinely zeroed, and that both the live path and the
+// snapshot still read back correctly afterward.
+fn nand_erase_unit_discipline_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let drain_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let drain_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let drain_data_buf: mut ref i64 = dhruva_alloc_bytes(20480);
+  let drain_calls: i64 = 0;
+  while ((dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32))) && (drain_calls < 500) {
+    let _ = dharafs_compact(drain_buf, drain_path_buf, drain_data_buf);
+    drain_calls = drain_calls + 1;
+  }
+
+  // Cheap jump to a fresh, unit-aligned starting point -- see dharafs_
+  // enospc_reclaim_self_test's own header comment for why this is the
+  // honest, affordable way to reach a specific block position instead
+  // of writing filler blocks to get there for real.
+  let cur_next: i64 = dharafs_state_get_next_block() as i64;
+  let unit_base: i64 = ((cur_next + 15) / 16) * 16;
+  let unit_num: i64 = unit_base / 16;
+  let _ = dharafs_state_set(unit_base as u32, dharafs_state_get_next_seq());
+
+  // unit_base+0: a plain file, stays live the whole time.
+  let _ = dharafs_append("/nandtest/alive", "keep-me");
+  // unit_base+1: first version of a second path -- about to be
+  // superseded, but a snapshot below pins exactly this version.
+  let _ = dharafs_append("/nandtest/churn", "v1");
+
+  let snap_name: Str = "nand_snap";
+  let name_len: i64 = str_len_bytes(snap_name);
+  let name_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let ni: i64 = 0;
+  while ni < name_len {
+    let _ = buf_write_byte(name_buf, ni as u32, str_byte_at(snap_name, ni) as u32);
+    ni = ni + 1;
+  }
+  let snap_slot: i64 = dharafs_snapshot_create_raw(name_buf, name_len);
+  if snap_slot < 0 {
+    ok = 0;
+  }
+
+  // unit_base+2: second version -- supersedes v1 (now genuinely dead,
+  // the snapshot above pins v1, not this) and is itself about to be
+  // superseded by v3 below.
+  let _ = dharafs_append("/nandtest/churn", "v2");
+  // unit_base+3: third version -- the real latest/live copy.
+  let _ = dharafs_append("/nandtest/churn", "v3");
+
+  let next_block_after_test_data: u32 = dharafs_state_get_next_block();
+  if (next_block_after_test_data as i64) != (unit_base + 4) {
+    ok = 0; // the 4 writes above didn't land exactly where expected --
+            // every assertion below assumes this layout
+  }
+
+  // Advance the real frontier past the WHOLE unit (as if some other
+  // writer had already done so) -- nand_erase_unit_relocating_live_
+  // pages refuses to touch a unit that isn't entirely behind the real
+  // frontier, for exactly the reason its own header comment gives.
+  let _ = dharafs_state_set((unit_base + 16) as u32, dharafs_state_get_next_seq());
+
+  let scratch_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let data_buf: mut ref i64 = dhruva_alloc_bytes(20480);
+  let erase_status: i64 = nand_erase_unit_relocating_live_pages(unit_num, scratch_buf, path_buf, data_buf);
+  if erase_status != 0 {
+    ok = 0;
+  }
+
+  // next_block must have advanced by exactly 3 (alive, churn-v1 for
+  // the snapshot, churn-v3 as latest) past unit_base+16 -- churn-v2
+  // was genuinely dead and must NOT have been relocated.
+  let expect_next_block: u32 = (unit_base + 16 + 3) as u32;
+  if dharafs_state_get_next_block() != expect_next_block {
+    ok = 0;
+  }
+
+  // Every one of the unit's 16 blocks must now be genuinely zeroed --
+  // the real point of this whole function, not just that the live
+  // data happened to survive somewhere.
+  let verify_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let vi: i64 = 0;
+  while vi < 16 {
+    let rd: i64 = dharafs_block_read_raw(unit_base + vi, verify_buf);
+    if rd != 0 {
+      ok = 0;
+    } else {
+      let vz: i64 = 0;
+      while vz < 512 {
+        if buf_read_byte(verify_buf, vz as u32) != (0 as u32) {
+          ok = 0;
+        }
+        vz = vz + 1;
+      }
+    }
+    vi = vi + 1;
+  }
+
+  // The relocated live data must still be exactly correct.
+  let alive_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let alive_len: i64 = dharafs_read("/nandtest/alive", alive_buf);
+  let expect_alive: Str = "keep-me";
+  let expect_alive_len: i64 = str_len_bytes(expect_alive);
+  if alive_len != expect_alive_len {
+    ok = 0;
+  } else {
+    let ai: i64 = 0;
+    while ai < expect_alive_len {
+      if buf_read_byte(alive_buf, ai as u32) != (str_byte_at(expect_alive, ai) as u32) {
+        ok = 0;
+      }
+      ai = ai + 1;
+    }
+  }
+
+  let churn_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let churn_len: i64 = dharafs_read("/nandtest/churn", churn_buf);
+  let expect_churn: Str = "v3";
+  let expect_churn_len: i64 = str_len_bytes(expect_churn);
+  if churn_len != expect_churn_len {
+    ok = 0;
+  } else {
+    let ci: i64 = 0;
+    while ci < expect_churn_len {
+      if buf_read_byte(churn_buf, ci as u32) != (str_byte_at(expect_churn, ci) as u32) {
+        ok = 0;
+      }
+      ci = ci + 1;
+    }
+  }
+
+  // And the snapshot must still see "v1" -- the one record this whole
+  // test exists to prove survives even though it's long since stopped
+  // being any path's current latest copy.
+  let churn_path_str: Str = "/nandtest/churn";
+  let churn_path_len: i64 = str_len_bytes(churn_path_str);
+  let churn_path_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let cpi: i64 = 0;
+  while cpi < churn_path_len {
+    let _ = buf_write_byte(churn_path_buf, cpi as u32, str_byte_at(churn_path_str, cpi) as u32);
+    cpi = cpi + 1;
+  }
+  let snap_out_buf: mut ref i64 = dhruva_alloc_bytes(32);
+  let snap_read_len: i64 = dharafs_snapshot_read_raw(churn_path_buf, churn_path_len, name_buf, name_len, snap_out_buf);
+  let expect_v1: Str = "v1";
+  let expect_v1_len: i64 = str_len_bytes(expect_v1);
+  if snap_read_len != expect_v1_len {
+    ok = 0;
+  } else {
+    let si: i64 = 0;
+    while si < expect_v1_len {
+      if buf_read_byte(snap_out_buf, si as u32) != (str_byte_at(expect_v1, si) as u32) {
+        ok = 0;
+      }
+      si = si + 1;
+    }
+  }
+
+  let _ = dharafs_snapshot_delete_raw(name_buf, name_len);
+
+  let _ = uart_puts("DharaFS: nand_erase_unit_relocating_live_pages relocates every still-needed page (latest + snapshot-pinned) and leaves the rest of the unit genuinely erased");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -51394,6 +51785,7 @@ fn kernel_main() -> i64 {
   if boot_debug_enabled() == 1 { let _ = dharafs_compact_resumable_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dharafs_gc_snapshot_safety_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dharafs_enospc_reclaim_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = nand_erase_unit_discipline_self_test(); }
 
   // Round 42: directory hierarchy + owner/group/other rwx permissions.
   if boot_debug_enabled() == 1 { let _ = dharafs_permissions_self_test(); }
