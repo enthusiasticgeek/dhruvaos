@@ -10187,6 +10187,21 @@ fn dharafs_checkpoint_write(generation: u32, log_start: u32, log_end: u32, block
 // every single boot forever).
 fn dharafs_badblock_bitmap_block_0() -> i64 { return 8103; }
 fn dharafs_badblock_bitmap_block_1() -> i64 { return 8104; }
+// Real-HW mirrors, added 2026-10-31 after a live card showed block
+// 8103 (half 0's own sole backing block) permanently ECC-uncorrectable:
+// dharafs_badblock_bitmap_load's single-attempt bootstrap read is the
+// right call for a block that's already KNOWN bad (retrying changes
+// nothing), but 8103/8104 were never actually "known bad" in that
+// sense -- they're the bitmap's OWN storage, and a disjoint-halves
+// layout (unlike the checkpoint's proven ping-pong at 8101/8102) has
+// no redundancy at all: losing either backing block permanently blinds
+// the skip-optimization for that half's entire block range, forcing
+// every boot back into the exact multi-minute real-read-every-block
+// storm the bitmap exists to prevent. Free gap 8105-8223 (119 blocks,
+// between this bitmap and SD_WEDGE_CKPT_BLOCK_PRE at 8224) has room to
+// spare for one mirror per half.
+fn dharafs_badblock_bitmap_block_0_mirror() -> i64 { return 8105; }
+fn dharafs_badblock_bitmap_block_1_mirror() -> i64 { return 8106; }
 
 // DharaFS Phase 3 (2026-10-25): the log's own upper bound -- shared
 // between dharafs_init's recovery scan (which must never examine a
@@ -10229,13 +10244,17 @@ fn dharafs_badblock_bitmap_load() -> i64 {
   let half: i64 = 0;
   while half < 2 {
     let blk: i64 = if half == 0 { dharafs_badblock_bitmap_block_0() } else { dharafs_badblock_bitmap_block_1() };
+    let mirror_blk: i64 = if half == 0 { dharafs_badblock_bitmap_block_0_mirror() } else { dharafs_badblock_bitmap_block_1_mirror() };
     let ram_off: u32 = (half * 508) as u32;
     // 2026-10-31: bare single-attempt read, not the full retry
     // ladder -- see dharafs_block_read_once_with_ecc's own header
     // comment for why re-trying this specific bootstrap read is pure
     // waste (confirmed live: block 8103 permanently ECC-uncorrectable
     // on a real card, costing a multi-minute retry storm on every
-    // single boot before this fix).
+    // single boot before this fix). Same reasoning applies to the
+    // mirror fallback below -- it's a different physical block, so
+    // still worth one bare attempt, but never worth its own retry
+    // ladder either.
     let rd_status: i64 = dharafs_block_read_once_with_ecc(blk, sd_scratch);
     let loaded: i64 = 0;
     if rd_status == 0 {
@@ -10244,6 +10263,24 @@ fn dharafs_badblock_bitmap_load() -> i64 {
       if stored == computed {
         let _ = buf_copy_bytes(ram, ram_off, sd_scratch, 4 as u32, 508 as u32);
         loaded = 1;
+      }
+    }
+    // Primary backing block unreadable or corrupt -- try this half's
+    // mirror before giving up and zero-filling. Added 2026-10-31: a
+    // disjoint-halves layout with no redundancy meant a single dead
+    // backing block (8103, live-confirmed) permanently blinded the
+    // skip-optimization for its whole half's range, forcing every boot
+    // back into the real per-block retry storm this bitmap exists to
+    // avoid. See dharafs_badblock_bitmap_block_0_mirror's own comment.
+    if loaded == 0 {
+      let mirror_status: i64 = dharafs_block_read_once_with_ecc(mirror_blk, sd_scratch);
+      if mirror_status == 0 {
+        let mirror_stored: u32 = buf_read_u32(sd_scratch, 0 as u32);
+        let mirror_computed: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
+        if mirror_stored == mirror_computed {
+          let _ = buf_copy_bytes(ram, ram_off, sd_scratch, 4 as u32, 508 as u32);
+          loaded = 1;
+        }
       }
     }
     if loaded == 0 {
@@ -10264,7 +10301,32 @@ fn dharafs_badblock_bitmap_load() -> i64 {
 // boot/dharafs_state.S's own header comment for why this matters
 // (avoid paying a real SD write for every single newly-classified
 // block during a scan that might classify hundreds of them).
-fn dharafs_badblock_bitmap_persist() -> i64 {
+//
+// sync_mirror: 0 skips the two extra mirror writes this call, 1
+// includes them. Added 2026-10-31 alongside the mirror blocks
+// themselves: the mirror only needs to catch up with the primary
+// at least once before the next reboot (its whole job is "give the
+// NEXT boot a second chance if the primary backing block is
+// physically dead"), not on every one of this scan's own every-64
+// periodic flushes -- unlike the primary, which genuinely needs that
+// frequency to bound data loss from a mid-scan watchdog reset (see
+// this function's own call site in dharafs_init). Doubling every
+// periodic flush's write count was confirmed live to be the actual
+// cause of a real QEMU regression (phase4_milestone.py's cat-after-
+// write race flipping deterministically): on a from-scratch disk
+// image, EVERY block in the scan range is "blank" (seq_num==0), which
+// dharafs_init's own block_ok check already treats as badblock-
+// markable -- so the periodic flush fires roughly once every 64
+// blocks across the WHOLE log range, not just for a real card's
+// actual bad-block population, and doubling that write cost shifted
+// boot timing enough to break the test's own write/cat timing
+// assumption (same class of problem this project has hit before, see
+// the "boot marker destabilized QEMU timing" precedent). Every
+// non-hot call site (dharafs_init's own post-scan flush, compact,
+// shutdown, reboot) passes 1 -- the mirror still gets a real chance to
+// catch up at least once per boot and at every explicit flush point,
+// just not hundreds of times mid-scan.
+fn dharafs_badblock_bitmap_persist(sync_mirror: u32) -> i64 {
   if dharafs_badblock_bitmap_dirty_get() == (0 as u32) {
     return 0;
   }
@@ -10273,11 +10335,18 @@ fn dharafs_badblock_bitmap_persist() -> i64 {
   let half: i64 = 0;
   while half < 2 {
     let blk: i64 = if half == 0 { dharafs_badblock_bitmap_block_0() } else { dharafs_badblock_bitmap_block_1() };
+    let mirror_blk: i64 = if half == 0 { dharafs_badblock_bitmap_block_0_mirror() } else { dharafs_badblock_bitmap_block_1_mirror() };
     let ram_off: u32 = (half * 508) as u32;
     let _ = buf_copy_bytes(sd_scratch, 4 as u32, ram, ram_off, 508 as u32);
     let computed: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
     let _ = buf_write_u32(sd_scratch, 0 as u32, computed);
     let _ = sdhost_write_block(blk, sd_scratch);
+    if sync_mirror == (1 as u32) {
+      // Keep the mirror in sync too -- see dharafs_badblock_bitmap_
+      // block_0_mirror's own comment for why this half needs real
+      // redundancy, not just a single backing block.
+      let _ = sdhost_write_block(mirror_blk, sd_scratch);
+    }
     half = half + 1;
   }
   let _ = dharafs_badblock_bitmap_dirty_set(0 as u32);
@@ -10530,7 +10599,7 @@ fn dharafs_init() -> i64 {
       // bad-block-table practice (nand_update_bbt commits promptly on
       // a newly-found failure, not deferred indefinitely).
       if (diag_total_bad % 64) == 0 {
-        let _ = dharafs_badblock_bitmap_persist();
+        let _ = dharafs_badblock_bitmap_persist(0 as u32);
       }
       blk = blk + 1;
     } else {
@@ -10614,7 +10683,7 @@ fn dharafs_init() -> i64 {
   // blocks from this scan back to SD -- a no-op (no write at all) if
   // nothing changed, see dharafs_badblock_bitmap_persist's own header
   // comment.
-  let _ = dharafs_badblock_bitmap_persist();
+  let _ = dharafs_badblock_bitmap_persist(1 as u32);
   let _ = uart_puts("DharaFS: checkpoint ");
   if checkpoint.valid == 1 {
     let _ = uart_puts("TRUSTED gen=");
@@ -12199,7 +12268,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     if erase_target == (real_next_block_now as i64) {
       let _ = dharafs_state_set(write_cursor_final, dharafs_state_get_next_seq());
     }
-    let _ = dharafs_badblock_bitmap_persist();
+    let _ = dharafs_badblock_bitmap_persist(1 as u32);
     let _ = dharafs_ecc_cache_flush();
     let _ = dharafs_wear_cache_flush();
     let current_log_start: u32 = dharafs_state_get_log_start();
@@ -36669,7 +36738,7 @@ fn shell_dispatch_shutdown() -> i64 {
   // since the last periodic compact pass, before this command's own
   // "no further writes will occur" claim becomes true. No-op if
   // nothing's dirty.
-  let _ = dharafs_badblock_bitmap_persist();
+  let _ = dharafs_badblock_bitmap_persist(1 as u32);
   let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
   let _ = dharafs_wear_cache_flush(); // NAND-FTL wear table: same persist-point discipline
   let _ = uart_puts("\n");
@@ -37486,7 +37555,7 @@ fn shell_dispatch() -> i64 {
     // since the last periodic compact pass -- this command already
     // holds the ceiling lock above, so no concurrent writer can dirty
     // it again before the reset fires. A no-op if nothing's dirty.
-    let _ = dharafs_badblock_bitmap_persist();
+    let _ = dharafs_badblock_bitmap_persist(1 as u32);
     let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
     let _ = dharafs_wear_cache_flush(); // NAND-FTL wear table: same persist-point discipline
     let _ = uart_puts("rebooting...\n");
