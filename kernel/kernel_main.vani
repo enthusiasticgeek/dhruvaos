@@ -319,6 +319,21 @@ extern "C" fn dharafs_ecc_cache_get_dirty() -> u32;
 extern "C" fn dharafs_ecc_cache_buf_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_ecc_cache_buf_get() -> mut ref i64;
+// DharaFS NAND-FTL wear-leveling table one-sector RAM cache
+// (boot/dharafs_wear_state.S) -- same shape/reasoning as the ECC cache
+// above.
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_wear_cache_set_sector_num(n: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_wear_cache_get_sector_num() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_wear_cache_set_dirty(d: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_wear_cache_get_dirty() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_wear_cache_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_wear_cache_buf_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_stat_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -9229,6 +9244,137 @@ fn nand_read_page(block_num: i64, buf: mut ref i64) -> i64 {
   return sdhost_read_block(block_num, buf);
 }
 
+// DharaFS NAND-FTL, Round E (2026-10-30): P/E-cycle counts and
+// factory-bad status apply to a whole erase-unit, not a block --
+// tracking per-block would waste space and be semantically wrong
+// (erasing is already always whole-unit, per Round D). Same side-table
+// shape as Round A's own ECC table (dharafs_ecc_table_sector_for's own
+// precedent): 8 bytes/entry (pe_cycle_count: u32, factory_bad: u8,
+// reserved: u8[3]), 64 entries/sector. Sized for the WORST case
+// (erase_unit_blocks()==1) so a future geometry change never needs to
+// relocate this table: ceil(9220/64)=145 sectors at 9220-9364, inside
+// the existing free gap 9220-10239 (875 blocks spare) -- at today's
+// real default (16) only 10 sectors are ever actually touched.
+// Deliberately NOT inside dharafs_ecc_in_scope's own protected range
+// (dharafs_ecc_scope_end()==9220, strictly below this table's own
+// base) -- no self-reference risk the way the ECC table itself had to
+// guard against, so this table's own I/O goes through the normal
+// ECC+retry-wrapped sdhost_read_block/write_block directly (verified
+// harmless: dharafs_ecc_verify_on_read/protect_on_write both already
+// no-op outside dharafs_ecc_in_scope).
+fn dharafs_wear_table_sector_for(erase_unit_num: i64) -> i64 { return 9220 + (erase_unit_num / 64); }
+fn dharafs_wear_table_offset_for(erase_unit_num: i64) -> i64 { return (erase_unit_num % 64) * 8; }
+fn dharafs_wear_table_sector_count() -> i64 { return 145; } // ceil(9220/64)
+
+// Same one-sector-cache shape as dharafs_ecc_cache_ensure/_flush, same
+// reasoning (sparse table, mostly-sequential real access pattern).
+fn dharafs_wear_cache_ensure(sector_num: i64) -> i64 {
+  let cur: u32 = dharafs_wear_cache_get_sector_num();
+  if (cur as i64) == sector_num {
+    return 0;
+  }
+  if (cur != (0 as u32)) && (dharafs_wear_cache_get_dirty() == (1 as u32)) {
+    let _ = sdhost_write_block(cur as i64, dharafs_wear_cache_buf_get());
+  }
+  let cache_buf: mut ref i64 = dharafs_wear_cache_buf_get();
+  let read_status: i64 = sdhost_read_block(sector_num, cache_buf);
+  if read_status != 0 {
+    let z: i64 = 0;
+    while z < 512 {
+      let _ = buf_write_byte(cache_buf, z as u32, 0 as u32);
+      z = z + 1;
+    }
+  }
+  let _ = dharafs_wear_cache_set_sector_num(sector_num as u32);
+  let _ = dharafs_wear_cache_set_dirty(0 as u32);
+  return 0;
+}
+
+// Called from the same three points dharafs_ecc_cache_flush()/dharafs_
+// badblock_bitmap_persist() already are (compaction completion,
+// `reboot`, `shutdown`).
+fn dharafs_wear_cache_flush() -> i64 {
+  let cur: u32 = dharafs_wear_cache_get_sector_num();
+  if (cur != (0 as u32)) && (dharafs_wear_cache_get_dirty() == (1 as u32)) {
+    let _ = sdhost_write_block(cur as i64, dharafs_wear_cache_buf_get());
+    let _ = dharafs_wear_cache_set_dirty(0 as u32);
+  }
+  return 0;
+}
+
+fn dharafs_wear_get_cycle_count(erase_unit_num: i64) -> i64 {
+  let sector_num: i64 = dharafs_wear_table_sector_for(erase_unit_num);
+  let _ = dharafs_wear_cache_ensure(sector_num);
+  let cache_buf: mut ref i64 = dharafs_wear_cache_buf_get();
+  let off: i64 = dharafs_wear_table_offset_for(erase_unit_num);
+  return buf_read_u32(cache_buf, off as u32) as i64;
+}
+
+// Called from nand_erase_block below, once per real erase. Returns the
+// new count (not just success/failure) so a caller/self-test can
+// observe it without a separate read.
+fn dharafs_wear_increment_cycle_count(erase_unit_num: i64) -> i64 {
+  let sector_num: i64 = dharafs_wear_table_sector_for(erase_unit_num);
+  let _ = dharafs_wear_cache_ensure(sector_num);
+  let cache_buf: mut ref i64 = dharafs_wear_cache_buf_get();
+  let off: i64 = dharafs_wear_table_offset_for(erase_unit_num);
+  let cur: u32 = buf_read_u32(cache_buf, off as u32);
+  let next: u32 = cur + (1 as u32);
+  let _ = buf_write_u32(cache_buf, off as u32, next);
+  let _ = dharafs_wear_cache_set_dirty(1 as u32);
+  return next as i64;
+}
+
+// SD stand-in: always reads back 0 today, since dharafs_wear_set_
+// factory_bad is never actually called by anything yet (unused today;
+// exists so a real NAND driver has somewhere to record a factory-bad
+// unit it discovers). Reads the real table rather than hardcoding 0 --
+// that's what makes it correct plumbing for that future driver instead
+// of a value this function would need to stop lying about later.
+fn dharafs_wear_get_factory_bad(erase_unit_num: i64) -> i64 {
+  let sector_num: i64 = dharafs_wear_table_sector_for(erase_unit_num);
+  let _ = dharafs_wear_cache_ensure(sector_num);
+  let cache_buf: mut ref i64 = dharafs_wear_cache_buf_get();
+  let off: i64 = dharafs_wear_table_offset_for(erase_unit_num);
+  return buf_read_byte(cache_buf, (off + 4) as u32) as i64;
+}
+
+fn dharafs_wear_set_factory_bad(erase_unit_num: i64, value: u32) -> i64 {
+  let sector_num: i64 = dharafs_wear_table_sector_for(erase_unit_num);
+  let _ = dharafs_wear_cache_ensure(sector_num);
+  let cache_buf: mut ref i64 = dharafs_wear_cache_buf_get();
+  let off: i64 = dharafs_wear_table_offset_for(erase_unit_num);
+  let _ = buf_write_byte(cache_buf, (off + 4) as u32, value);
+  let _ = dharafs_wear_cache_set_dirty(1 as u32);
+  return 0;
+}
+
+// Biases reuse toward the least-worn, non-factory-bad unit in a range
+// -- standalone, tested infrastructure for the same reason Round D's
+// own nand_erase_unit_relocating_live_pages is: nothing in this
+// project's current write pattern yet NEEDS to choose which unit to
+// reuse next (Round D's own function takes an explicit unit number;
+// this exists for a future caller -- a real NAND driver's own wear-
+// leveling policy, or a future round that wires one in). Returns -1
+// if every unit in [start_unit, end_unit) is factory-bad (or the range
+// is empty) -- never silently picks a known-bad unit.
+fn dharafs_wear_least_worn_unit_in_range(start_unit: i64, end_unit: i64) -> i64 {
+  let best_unit: i64 = 0 - 1;
+  let best_count: i64 = 0 - 1;
+  let u: i64 = start_unit;
+  while u < end_unit {
+    if dharafs_wear_get_factory_bad(u) == 0 {
+      let count: i64 = dharafs_wear_get_cycle_count(u);
+      if (best_unit < 0) || (count < best_count) {
+        best_unit = u;
+        best_count = count;
+      }
+    }
+    u = u + 1;
+  }
+  return best_unit;
+}
+
 // Erases one whole unit (nand_geometry_erase_unit_blocks() pages),
 // zeroing and read-back-verifying each one -- the real, atomic
 // hardware operation this is a stand-in for doesn't exist on SD, so
@@ -9238,9 +9384,8 @@ fn nand_read_page(block_num: i64, buf: mut ref i64) -> i64 {
 // round's own plan writeup for why), never called from task_e's
 // periodic wake, so there's no per-tick budget to respect here.
 // Caller-owned scratch_buf, same discipline as every other DharaFS
-// primitive that needs one. Wear-cycle accounting is deliberately NOT
-// done here -- Round E's own wear table (not yet built) is where a
-// real P/E-cycle count would be bumped; erasing today just erases.
+// primitive that needs one. Bumps the real wear table (Round E, above)
+// once per successful erase.
 fn nand_erase_block(erase_unit_num: i64, scratch_buf: mut ref i64) -> i64 {
   let base: i64 = erase_unit_num * nand_geometry_erase_unit_blocks();
   let i: i64 = 0;
@@ -9271,6 +9416,7 @@ fn nand_erase_block(erase_unit_num: i64, scratch_buf: mut ref i64) -> i64 {
     }
     i = i + 1;
   }
+  let _ = dharafs_wear_increment_cycle_count(erase_unit_num);
   return 0;
 }
 
@@ -11944,6 +12090,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     }
     let _ = dharafs_badblock_bitmap_persist();
     let _ = dharafs_ecc_cache_flush();
+    let _ = dharafs_wear_cache_flush();
     let current_log_start: u32 = dharafs_state_get_log_start();
     let old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
     let checkpoint_target: i64 = if old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref old_checkpoint) } else { dharafs_checkpoint_block_a() };
@@ -12925,6 +13072,98 @@ fn nand_erase_unit_discipline_self_test() -> i64 {
   let _ = dharafs_snapshot_delete_raw(name_buf, name_len);
 
   let _ = uart_puts("DharaFS: nand_erase_unit_relocating_live_pages relocates every still-needed page (latest + snapshot-pinned) and leaves the rest of the unit genuinely erased");
+  if ok == 1 {
+    let _ = uart_puts(" (PASS)\n");
+  } else {
+    let _ = uart_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+// Round E (2026-10-30): the direct regression test for the wear table
+// and dharafs_wear_least_worn_unit_in_range -- forces a narrow 3-unit
+// range to accumulate very different P/E-cycle counts (one unit erased
+// 6 times, the other two just once), confirms the least-worn picker
+// correctly biases away from the hot unit, then confirms the counts
+// genuinely reached SD (not just RAM) by flushing, forcing the one-
+// sector cache to evict by touching a different sector, and reading
+// them back.
+//
+// Picks its own 3-unit range safely ahead of the real log frontier
+// (same cheap, no-side-effect reasoning as the other NAND self-tests
+// above) -- nand_erase_block/nand_program_page/nand_read_page are pure
+// SD primitives with no DharaFS bookkeeping of their own, so erasing
+// blank space well past dharafs_state_get_next_block() can never
+// disturb anything a real write already depends on.
+fn nand_wear_leveling_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  let scratch_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let base_unit: i64 = ((dharafs_state_get_next_block() as i64) / 16) + 4;
+
+  // Baseline: every unit in the range erased exactly once.
+  let u: i64 = 0;
+  while u < 3 {
+    let status: i64 = nand_erase_block(base_unit + u, scratch_buf);
+    if status != 0 {
+      ok = 0;
+    }
+    u = u + 1;
+  }
+
+  // Make the MIDDLE unit hot -- 5 more erases (cycle count 6), the
+  // other two stay at 1.
+  let w: i64 = 0;
+  while w < 5 {
+    let status: i64 = nand_erase_block(base_unit + 1, scratch_buf);
+    if status != 0 {
+      ok = 0;
+    }
+    w = w + 1;
+  }
+
+  let count_cold_a: i64 = dharafs_wear_get_cycle_count(base_unit);
+  let count_hot: i64 = dharafs_wear_get_cycle_count(base_unit + 1);
+  let count_cold_c: i64 = dharafs_wear_get_cycle_count(base_unit + 2);
+  if count_cold_a != 1 {
+    ok = 0;
+  }
+  if count_hot != 6 {
+    ok = 0;
+  }
+  if count_cold_c != 1 {
+    ok = 0;
+  }
+
+  // The real point: least-worn must bias AWAY from the hot unit, and
+  // must stay within the requested range.
+  let chosen: i64 = dharafs_wear_least_worn_unit_in_range(base_unit, base_unit + 3);
+  if chosen == (base_unit + 1) {
+    ok = 0; // picked the hottest unit -- wear leveling's whole point
+            // just failed
+  }
+  if (chosen != base_unit) && (chosen != (base_unit + 2)) {
+    ok = 0; // picked something outside the requested range
+  }
+
+  // Persistence ("survives a simulated reboot"): flush the one-sector
+  // cache, then force it to evict by touching a unit guaranteed to map
+  // to a DIFFERENT table sector (exactly 64 units away always lands in
+  // the next sector, regardless of base_unit's own position within
+  // its sector), then confirm the original counts read back identical
+  // -- proving they actually reached SD, not just RAM.
+  let _ = dharafs_wear_cache_flush();
+  let _ = dharafs_wear_get_cycle_count(base_unit + 64);
+  let count_cold_a_after: i64 = dharafs_wear_get_cycle_count(base_unit);
+  let count_hot_after: i64 = dharafs_wear_get_cycle_count(base_unit + 1);
+  if count_cold_a_after != count_cold_a {
+    ok = 0;
+  }
+  if count_hot_after != count_hot {
+    ok = 0;
+  }
+
+  let _ = uart_puts("DharaFS: dharafs_wear_least_worn_unit_in_range biases away from a hot unit, and P/E-cycle counts survive a cache eviction (simulated reboot)");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -36291,6 +36530,7 @@ fn shell_dispatch_shutdown() -> i64 {
   // nothing's dirty.
   let _ = dharafs_badblock_bitmap_persist();
   let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
+  let _ = dharafs_wear_cache_flush(); // NAND-FTL wear table: same persist-point discipline
   let _ = uart_puts("\n");
   let _ = uart_puts("Dhruva: halting. No further writes will occur.\n");
   let _ = uart_puts("*** SAFE TO POWER OFF NOW ***\n");
@@ -37107,6 +37347,7 @@ fn shell_dispatch() -> i64 {
     // it again before the reset fires. A no-op if nothing's dirty.
     let _ = dharafs_badblock_bitmap_persist();
     let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
+    let _ = dharafs_wear_cache_flush(); // NAND-FTL wear table: same persist-point discipline
     let _ = uart_puts("rebooting...\n");
     let _ = watchdog_arm(1 as u32);
     return 0;
@@ -51252,6 +51493,9 @@ fn kernel_main() -> i64 {
   // NAND-FTL ECC side-table's one-sector RAM cache -- see boot/
   // dharafs_ecc_state.S's own header comment.
   let _ = dharafs_ecc_cache_buf_set(dhruva_alloc_bytes(512));
+  // NAND-FTL wear-leveling table's one-sector RAM cache -- see boot/
+  // dharafs_wear_state.S's own header comment.
+  let _ = dharafs_wear_cache_buf_set(dhruva_alloc_bytes(512));
   let _ = dharafs_stat_scratch_set(dhruva_alloc_bytes(12));
   let _ = dharafs_dir_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_log_path_scratch_set(dhruva_alloc_bytes(32));
@@ -51786,6 +52030,7 @@ fn kernel_main() -> i64 {
   if boot_debug_enabled() == 1 { let _ = dharafs_gc_snapshot_safety_self_test(); }
   if boot_debug_enabled() == 1 { let _ = dharafs_enospc_reclaim_self_test(); }
   if boot_debug_enabled() == 1 { let _ = nand_erase_unit_discipline_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = nand_wear_leveling_self_test(); }
 
   // Round 42: directory hierarchy + owner/group/other rwx permissions.
   if boot_debug_enabled() == 1 { let _ = dharafs_permissions_self_test(); }
