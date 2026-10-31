@@ -8573,6 +8573,33 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
   return 2;
 }
 
+// Bootstrap-only sibling of sdhost_read_block: ONE raw attempt plus
+// the same ECC verify/correct step, but deliberately NO retry ladder
+// (no reinit, no sd_wedge_checkpoint diagnostic write). Added
+// 2026-10-31 after a real-HW card showed block
+// dharafs_badblock_bitmap_block_0() (8103) uncorrectably bad: every
+// single boot was paying the FULL 3-attempt retry ladder (each
+// attempt a ~150ms+ sdhost_init_at_speed reinit PLUS a
+// sd_wedge_checkpoint diagnostic write, whose own FIFO-drain-to-empty
+// poll can itself run up to 1,000,000 iterations against an already-
+// wedged controller) to read a block whose caller -- dharafs_badblock_
+// bitmap_load -- already treats ANY failure identically (zero-fill
+// that half, "assume not known bad", same tolerant philosophy as a
+// torn checkpoint) and can never get a different answer from retrying
+// the same physically-dead media. Confirmed against real Linux MTD
+// (drivers/mtd/nand/nand_bbt.c): its own read_bbt()/scan_read_raw()
+// bootstrap reads are each exactly ONE attempt, no retry loop,
+// tolerating an ECC-uncorrectable result and moving on -- a bad
+// block's own table/bitmap entry is deliberately read via the
+// cheapest possible path, precisely because retrying a dead physical
+// block can't change the outcome. ECC correction is kept (it's a
+// free, RAM-only decode, no extra real SD I/O) -- only the expensive
+// reinit+diagnostic-write retry ladder is dropped.
+fn dharafs_block_read_once_with_ecc(block_num: i64, buf: mut ref i64) -> i64 {
+  let result: i64 = sdhost_read_block_once(block_num, buf);
+  return if result == 0 { dharafs_ecc_verify_on_read(block_num, buf) } else { result };
+}
+
 // See sdhost_read_block_once's own header comment for the SDHCFG
 // reasoning (the original 0x510 IRQ-enable bits, the 2026-09-18
 // SDHCFG_SLOW_CARD addition 0x510 -> 0x518, and the 2026-09-19
@@ -8789,6 +8816,19 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // phenomenon, narrowing the search further.
   let fifo_drain_iter: i64 = 0;
   while fifo_drain_iter < 1000000 {
+    // 2026-10-31: this loop's own 1,000,000-iteration cap was never
+    // itself watchdog-kicked -- found live, a genuinely wedged
+    // controller spent real wall-clock time here (plus this
+    // function's own caller, sd_wedge_checkpoint, being invoked
+    // AGAIN right after via the exact same no-kick path) close
+    // enough to the 15s window to matter. Matches this file's own
+    // established "no single uninterrupted stretch between kicks"
+    // discipline (sdhost_init_at_speed's per-iteration kicks,
+    // stage0's own "re-arm every 512 blocks") rather than trusting
+    // one upfront arm to cover an unmeasured worst case.
+    if (WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1) && ((fifo_drain_iter & 65535) == 0) {
+      let _ = watchdog_kick();
+    }
     let edm_drain: u32 = sd_mmio_read_u32(SDEDM);
     let fifo_occupancy: u32 = (edm_drain >> (4 as u32)) & (0x1F as u32);
     if fifo_occupancy == (0 as u32) {
@@ -10144,7 +10184,13 @@ fn dharafs_badblock_bitmap_load() -> i64 {
   while half < 2 {
     let blk: i64 = if half == 0 { dharafs_badblock_bitmap_block_0() } else { dharafs_badblock_bitmap_block_1() };
     let ram_off: u32 = (half * 508) as u32;
-    let rd_status: i64 = sdhost_read_block(blk, sd_scratch);
+    // 2026-10-31: bare single-attempt read, not the full retry
+    // ladder -- see dharafs_block_read_once_with_ecc's own header
+    // comment for why re-trying this specific bootstrap read is pure
+    // waste (confirmed live: block 8103 permanently ECC-uncorrectable
+    // on a real card, costing a multi-minute retry storm on every
+    // single boot before this fix).
+    let rd_status: i64 = dharafs_block_read_once_with_ecc(blk, sd_scratch);
     let loaded: i64 = 0;
     if rd_status == 0 {
       let stored: u32 = buf_read_u32(sd_scratch, 0 as u32);
@@ -10420,6 +10466,25 @@ fn dharafs_init() -> i64 {
       diag_total_bad = diag_total_bad + 1;
       if consecutive_bad > diag_max_run {
         diag_max_run = consecutive_bad;
+      }
+      // 2026-10-31: periodic flush of newly-discovered bad blocks,
+      // every 64 (not every single one -- dharafs_badblock_bitmap_
+      // persist() is a real SD write per dirty half, and this scan
+      // can discover hundreds in one pass on a genuinely degrading
+      // card; flushing after literally every mark would multiply
+      // this boot's own write cost by that same hundreds factor).
+      // Root-cause fix for a real vicious cycle hit live tonight: a
+      // newly-discovered bad block was previously only persisted at
+      // the 3 existing flush points (compact/shutdown/reboot) -- a
+      // watchdog reset mid-scan (exactly what a slow, bad-block-heavy
+      // scan risks) lost EVERY discovery since the last flush, forcing
+      // full real-SD-retry-cost rediscovery of all of them again next
+      // boot. Bounding the loss to at most 64 blocks' worth, at the
+      // cost of ~(total_bad/64) extra writes total, matches real NAND
+      // bad-block-table practice (nand_update_bbt commits promptly on
+      // a newly-found failure, not deferred indefinitely).
+      if (diag_total_bad % 64) == 0 {
+        let _ = dharafs_badblock_bitmap_persist();
       }
       blk = blk + 1;
     } else {
@@ -14216,7 +14281,9 @@ fn shell_dispatch_rxdiag() -> i64 {
   let _ = uart_puts(" now_us=");
   let _ = uart_put_hex32(now_us);
   let _ = uart_puts(" gap_us=");
-  let _ = uart_put_hex32(now_us - last_rx_us);
+  // Same TIMER_CLO-wraparound fix as timer_tick_dispatch's own matching
+  // sites -- both operands are raw TIMER_CLO microsecond snapshots.
+  let _ = uart_put_hex32(wrapping_sub(now_us, last_rx_us));
   let _ = uart_puts(" overrun_count=");
   let _ = uart_put_i64(kernelupload_overrun_count_get() as i64);
   let _ = uart_puts(" uart_irq_entries=");
@@ -16582,7 +16649,19 @@ fn timer_tick_dispatch() -> i64 {
       let _ = kernelupload_watchdog_stall_reported_set(0 as u32);
     } else {
       let wd_last_progress: u32 = kernelupload_watchdog_last_progress_tick_get();
-      if (now - wd_last_progress) > (5000000 as u32) {
+      // BUG FIX (found live, 2026-10-31, via a real ~2.5MB-in kernelupload
+      // panic on real hardware -- "integer overflow in u32 add" at this
+      // function's own LR, confirmed by rebuilding the exact commit the
+      // board was running and matching the address): now/wd_last_progress
+      // are both raw TIMER_CLO microsecond snapshots, which wrap every
+      // ~71.6 minutes -- plain `-` traps in vani (see e.g. the TCP
+      // retransmission math above, or the SD/USB bringup timeouts, which
+      // already use wrapping_sub for exactly this reason). This specific
+      // call site (added 2026-10-23 for the stall watchdog) was the one
+      // place that still used plain `-`, latent since then because
+      // nothing in QEMU ever runs long enough to cross a real wrap, and no
+      // real-HW kernelupload stream had previously spanned one either.
+      if wrapping_sub(now, wd_last_progress) > (5000000 as u32) {
         if kernelupload_watchdog_stall_reported_get() == (0 as u32) {
           let _ = kernelupload_watchdog_stall_reported_set(1 as u32);
           let wd_cur_task: u32 = current_task_get();
@@ -16649,7 +16728,9 @@ fn timer_tick_dispatch() -> i64 {
           let _ = uart_putc_nonblocking(97);  // a
           let _ = uart_putc_nonblocking(112); // p
           let _ = uart_putc_nonblocking(61);  // =
-          let _ = uart_put_hex32_irq(now - kernelupload_last_rx_byte_us_get());
+          // Same wraparound fix as the stall check above -- both operands
+          // are raw TIMER_CLO microsecond snapshots.
+          let _ = uart_put_hex32_irq(wrapping_sub(now, kernelupload_last_rx_byte_us_get()));
           let _ = uart_putc_nonblocking(32);  // ' '
           let _ = uart_putc_nonblocking(111); // o
           let _ = uart_putc_nonblocking(101); // e
