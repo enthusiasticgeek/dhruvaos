@@ -52171,10 +52171,23 @@ fn kernel_main() -> i64 {
   let _ = uart_put_hex32(missing_len as u32);
   let _ = uart_puts(" (expect FFFFFFFF, i.e. -1, not found)\n");
 
-  // Task #5 verification: pile up several more dead versions of the
-  // same path, run one compaction pass, confirm reads still see the
-  // correct latest value afterward and log_start actually advanced
-  // (i.e. compaction did real work, not a no-op).
+  // Task #5/#8 verification below (override/compact/ls/delete) is pure
+  // self-test noise -- NOT depended on by power_yank.py (which only
+  // ever checks the "post-recovery /config/mode"/"/config/mode" lines
+  // above, confirmed by grepping its own extract_*_value call sites)
+  // or by phase4_milestone.py (which explicitly anchors past boot-time
+  // self-test output as noise, see that script's own module docstring).
+  // Gated 2026-10-31: live-confirmed on real hardware as a genuinely
+  // massive cost on a degraded card -- this single block (pile up dead
+  // versions, manual compact, ls, tombstone delete) measured 190s+ on
+  // checkpoint 9->10 alone (8 real DharaFS ops at ~24s/op average on a
+  // card with 1000+ bad blocks), on top of the even larger wall of
+  // already-gated self-tests immediately below this one. Unlike those,
+  // this block was never gated in the first place -- an oversight, not
+  // a deliberate "must always run" choice; nothing outside this block
+  // reads log_start_before/_after, next_block_before/_after, or any of
+  // compact_buf/compact_path_buf/compact_data_buf/deleted_len.
+  if boot_debug_enabled() == 1 {
   let _ = dharafs_append("/config/mode", "override1");
   let _ = dharafs_append("/config/mode", "override2");
   let _ = dharafs_append("/config/mode", "final");
@@ -52228,6 +52241,7 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("DharaFS: read of deleted /config/name result=");
   let _ = uart_put_hex32(deleted_len as u32);
   let _ = uart_puts(" (expect FFFFFFFF, i.e. -1, not found)\n");
+  }
 
   // Round 39: multi-block files + journaling hardening.
   if boot_debug_enabled() == 1 { let _ = dharafs_multiblock_self_test(); }
