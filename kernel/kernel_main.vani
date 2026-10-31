@@ -8503,6 +8503,28 @@ fn sd_wedge_checkpoint(block_num: i64, tag: u32, attempt: u32, result: u32) -> i
 }
 
 fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
+  // 2026-10-31: dharafs_badblock_is_marked's own "skip with no real
+  // SD read at all" optimization (dharafs_init's comment on its own
+  // scan-loop call site) was, until now, ONLY ever consulted by that
+  // one boot-time scan -- every other reader in the system (wifikey/
+  // config reads during wifi_config_init/ble_config_init/dhdl_init,
+  // any shell `cat`, any production dharafs_read/write) called
+  // straight into this function with zero benefit from knowledge
+  // DharaFS already has. Found live: a real card with 1164/1353
+  // blocks already known-bad in its log region turned the ~20s this
+  // project's own history documents for "configs+crashlog_boot_
+  // increment" into ~14.5 minutes, because EACH of those config
+  // reads that happened to land on an already-known-dead block paid
+  // the full retry-ladder cost below (reinit + wedge-checkpoint
+  // write) all over again, for a block whose fate is already known
+  // and can't change. dharafs_badblock_is_marked's own bounds check
+  // (0..8191 only) makes this safe to consult unconditionally here --
+  // any caller reading outside the DharaFS log region (kernel slots,
+  // crypto metadata, the ECC/wear tables themselves) always gets
+  // "not marked" and falls through to the real read below, unchanged.
+  if dharafs_badblock_is_marked(block_num) == 1 {
+    return 9;
+  }
   let attempt: i64 = 0;
   while attempt < SD_MAX_ATTEMPTS {
     // TASK #353 REAL-HW FOLLOW-UP #2 (2026-10-16): a wedged read here
@@ -31970,13 +31992,27 @@ fn dwc2_probe_device0() -> i64 {
   // retry rebuilds the SETUP packet fresh (clearing any STALL latch)
   // and waits another TRSTRCY-style settle (161000, the same constant
   // already proven on real HW throughout this driver's other post-
-  // reset/post-SET_ADDRESS delays) before trying again. 5 attempts ->
-  // up to ~250ms total extra worst-case latency for a ONE-TIME boot
-  // enumeration step, matching the order of magnitude both the generic
-  // USB-spec TRSTRCY margin and the TinyUSB real-device precedent use.
+  // reset/post-SET_ADDRESS delays) before trying again.
+  //
+  // 2026-10-31 correction: the attempt count here (5) didn't actually
+  // match its own cited rationale. Each attempt's OWN inner wait
+  // (dwc2_control_in -> dwc2_wait_chan0_done) already tolerates up to
+  // ~500ms of continuous NAK/XACTERR retry before giving up (that
+  // function's own 1,000,000-iteration bound) -- a cost this
+  // function's old comment never counted, only the 161000 (~50ms)
+  // inter-attempt settle. Real worst case was 5 * (500ms + 50ms) ~=
+  // 2.75s, barely half of the 5-SECOND tolerance the very TinyUSB
+  // precedent cited above documents some real devices genuinely
+  // need. Found live, tonight, on real hardware: this exact step
+  // failed twice in a row across two independent fresh boots on a
+  // board that had just been through extensive hard power-cycling --
+  // consistent with a slow-to-wake device needing more of that
+  // 5-second real-world budget than this loop was actually giving it.
+  // 10 attempts -> ~5.5s worst case, comfortably covering the cited
+  // precedent instead of falling short of it by half.
   let attempt: i64 = 0;
   let result_status: i64 = 0 - 1;
-  while attempt < 5 {
+  while attempt < 10 {
     let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
     result_status = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, desc64);
     if result_status == 0 {
