@@ -38,18 +38,64 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kernel_upload import ShellSession, open_serial, check_device_exclusive
 
 
-def read_line_response(session: ShellSession, timeout: float):
-    """Blocks until the next newline-terminated line arrives, returning
-    exactly the text produced since the call started (not tail_text's
-    whole-buffer-tail semantics) -- lets the caller treat each `kernelupload
-    resume*` reply as one discrete, parseable response instead of having
-    to re-scan an ever-growing buffer by hand."""
-    start = session.consumed
-    if not session.read_until("\n", timeout=timeout):
-        return None
-    with session.lock:
-        text = bytes(session.buf[start:session.consumed]).decode(errors="replace")
-    return text.strip()
+def read_line_response(session: ShellSession, timeout: float, expect_prefixes, sent_line: str = None):
+    """Blocks until a line matching one of `expect_prefixes` arrives,
+    returning exactly that line's text -- lets the caller treat each
+    `kernelupload resume*` reply as one discrete, parseable response
+    instead of having to re-scan an ever-growing buffer by hand.
+
+    2026-10-31 fix: an earlier version of this function just returned
+    whatever the next newline-terminated line was, denylisting a
+    SPECIFIC small set of known-noise shapes as they were found live,
+    one real-HW capture at a time:
+      1. A leftover, never-consumed trailing "\\n" from whatever
+         read_until(SUBSTRING, ...) call preceded this one (e.g.
+         wait_until_ready's own read_until("READY", ...), which
+         matches mid-line and never consumes the rest of that line).
+      2. The board's own character-echo of the line we just sent.
+      3. shell_dispatch's own unconditional `DISPATCH line_len=...
+         line="..."` debug print (kernel_main.vani, explicitly
+         labeled "remove once root-caused/confirmed fixed" -- still
+         present on this build).
+      4. Unrelated real-time SD diagnostic chatter (DharaFS ECC error
+         reports, wedge-retry messages, raw register dumps) from
+         kernelslot_lookup/kernelupload_chunk_progress_lookup's own
+         real SD reads of blocks that happen to be degraded on this
+         specific card -- an open-ended set impossible to enumerate
+         in advance; a fifth real-HW capture tonight found yet
+         another new shape (a DharaFS ECC uncorrectable report) that
+         no denylist written for the first four would have covered.
+    Denylisting one new noise shape at a time was always going to
+    keep losing to this card's own open-ended variety of diagnostic
+    output. Allowlisting the handful of responses THIS protocol can
+    actually produce is the fix that generalizes: skip anything that
+    doesn't start with one of `expect_prefixes` (bounded by `timeout`
+    overall, via a real deadline rather than a fixed iteration count,
+    since an open-ended noise source has no knowable worst-case line
+    count) -- a genuinely silent/dead board still exhausts the real
+    time budget and returns None exactly as before."""
+    sent_stripped = sent_line.strip() if sent_line else None
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None
+        start = session.consumed
+        if not session.read_until("\n", timeout=remaining):
+            return None
+        with session.lock:
+            text = bytes(session.buf[start:session.consumed]).decode(errors="replace")
+        text = text.strip()
+        if text == "":
+            continue
+        if sent_stripped is not None and text == sent_stripped:
+            continue
+        if any(text.startswith(p) for p in expect_prefixes):
+            return text
+        # Anything else is noise from this card's own open-ended
+        # diagnostic output (see this function's own docstring) --
+        # keep waiting for a real token rather than reporting the
+        # first unrecognized line as if it were the board's answer.
 
 
 def compute_chunk_layout(total_len: int, chunk_count: int):
@@ -112,8 +158,25 @@ def main() -> int:
             return 1
         print("[board ready]")
 
-        session.send(f"kernelupload resumebegin {real_len} {args.chunks} {final_sha256}")
-        resp = read_line_response(session, timeout=10)
+        # 2026-10-31: resumebegin does 4 real SD reads of its own
+        # (kernelslot_lookup's 2-block ping-pong + kernelupload_chunk_
+        # progress_lookup's 2-block ping-pong, blocks 9216-9219) before
+        # it can answer at all -- blocks 9218/9219 sit just outside the
+        # bad-block bitmap's own tracked range (0-8191), so a slow/
+        # degraded card pays the full real sdhost_read_block retry
+        # ladder for them with none of this project's own skip-known-
+        # bad-block optimization. Confirmed live: a hardcoded 10s
+        # budget genuinely wasn't enough on tonight's card (unrelated
+        # SD diagnostic chatter was still arriving well past that
+        # window). args.commit_timeout already exists for exactly this
+        # "real SD work, give it real time" reasoning (commit does a
+        # full SD readback+re-hash) -- reusing it here instead of a
+        # second hardcoded guess.
+        resumebegin_cmd = f"kernelupload resumebegin {real_len} {args.chunks} {final_sha256}"
+        session.send(resumebegin_cmd)
+        resp = read_line_response(session, timeout=args.commit_timeout,
+                                   expect_prefixes=("FRESH", "RESUME", "ALLDONE", "BUSY", "LIMIT_EXCEEDED"),
+                                   sent_line=resumebegin_cmd)
         if resp is None:
             print("[FAIL] no response to resumebegin")
             print(session.tail_text())
@@ -157,8 +220,10 @@ def main() -> int:
                 for attempt_i in range(1, args.chunk_retry_limit + 1):
                     print(f"  chunk {chunk_index}/{args.chunks - 1}: {this_len} bytes, "
                           f"attempt {attempt_i}/{args.chunk_retry_limit} ({time.time() - t0:.1f}s elapsed)")
-                    session.send(f"kernelupload resumechunk {chunk_index} {this_len}")
-                    go_resp = read_line_response(session, timeout=args.go_timeout)
+                    resumechunk_cmd = f"kernelupload resumechunk {chunk_index} {this_len}"
+                    session.send(resumechunk_cmd)
+                    go_resp = read_line_response(session, timeout=args.go_timeout,
+                                                  expect_prefixes=("GO", "EXPECTED"), sent_line=resumechunk_cmd)
                     if go_resp is None:
                         print("    [retry] no response to resumechunk")
                         continue
@@ -190,8 +255,11 @@ def main() -> int:
                         print(f"    [retry] no DONE within {args.stall_timeout}s of sending all chunk bytes")
                         continue
 
-                    session.send(f"kernelupload resumeverify {chunk_index} {chunk_sha}")
-                    verify_resp = read_line_response(session, timeout=args.commit_timeout)
+                    resumeverify_cmd = f"kernelupload resumeverify {chunk_index} {chunk_sha}"
+                    session.send(resumeverify_cmd)
+                    verify_resp = read_line_response(session, timeout=args.commit_timeout,
+                                                      expect_prefixes=("ALLDONE", "CHUNKOK", "EXPECTED"),
+                                                      sent_line=resumeverify_cmd)
                     if verify_resp is None:
                         print("    [retry] no response to resumeverify")
                         continue
