@@ -338,6 +338,21 @@ extern "C" fn dharafs_wear_cache_get_dirty() -> u32;
 extern "C" fn dharafs_wear_cache_buf_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_wear_cache_buf_get() -> mut ref i64;
+// DharaFS two-tier bad-block classification (2026-10-31, boot/dharafs_
+// suspect_state.S) -- see dharafs_badblock_report_failure's own header
+// comment for the full policy.
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_dirty_set(d: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_dirty_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_count_set(n: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_count_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_stat_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -8583,6 +8598,13 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
     // every other nonzero result below already uses.
     let result: i64 = if result == 0 { dharafs_ecc_verify_on_read(block_num, buf) } else { result };
     if result == 0 {
+      // Matches UBI's own "torture test passed" precedent -- a
+      // genuinely fresh controller reset (this exact boot) cleared
+      // whatever wedged this block last time, so forgive it rather
+      // than leave it sitting in the suspect table forever. See
+      // dharafs_suspect_forgive_on_success's own comment; O(1) in the
+      // overwhelmingly common zero-suspects case.
+      let _ = dharafs_suspect_forgive_on_success(block_num);
       return 0;
     }
     if result == 3 {
@@ -8610,21 +8632,28 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
       let _ = uart_puts(" attempts\n");
       let _ = sdhost_init();
-      // 2026-10-31: mark bad right here, not just during dharafs_
-      // init's own boot-time scan -- dharafs_badblock_mark's ONE
-      // call site used to be that scan loop, which only ever covers
-      // [scan_start_blk, max_blk) (the DharaFS log itself). Every
-      // block from max_blk upward -- crypto metadata, the checkpoint,
-      // the badblock bitmap's own backing blocks, the ECC/wear tables
-      // -- could physically go bad and pay this exact 3-attempt
-      // retry-with-reinit cost FOREVER, on every single access, with
-      // no way to ever skip it, since it could never get marked. This
-      // is also a CLEANER signal than the scan's own criteria (which
-      // conflates a real I/O failure with "content doesn't look like
-      // a valid log record," a weaker proxy that would wrongly flag a
-      // blank-but-healthy block): a genuine multi-attempt I/O failure,
+      // 2026-10-31: report (not immediately mark) bad right here, not
+      // just during dharafs_init's own boot-time scan -- dharafs_
+      // badblock_mark's ONE call site used to be that scan loop, which
+      // only ever covers [scan_start_blk, max_blk) (the DharaFS log
+      // itself). Every block from max_blk upward -- crypto metadata,
+      // the checkpoint, the badblock bitmap's own backing blocks, the
+      // ECC/wear tables -- could physically go bad and pay this exact
+      // 3-attempt retry-with-reinit cost FOREVER, on every single
+      // access, with no way to ever skip it. This is also a CLEANER
+      // signal than the scan's own criteria (which conflates a real
+      // I/O failure with "content doesn't look like a valid log
+      // record," a weaker proxy that would wrongly flag a blank-but-
+      // healthy block): a genuine multi-attempt I/O failure,
       // independent of what the block is supposed to contain.
-      let _ = dharafs_badblock_mark(block_num);
+      // dharafs_badblock_report_failure (not a direct mark) is the
+      // real policy here -- see its own header comment: this
+      // project's own 42-round SD-wedge-saga history makes a one-shot
+      // permanent blacklist on the FIRST failure too aggressive on
+      // this specific hardware, where the dominant real failure mode
+      // has repeatedly turned out to be a controller/driver wedge a
+      // fresh boot's own reinit clears, not genuine media damage.
+      let _ = dharafs_badblock_report_failure(block_num);
       return result;
     }
   }
@@ -9036,6 +9065,9 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
       // wedge_checkpoint itself writes via sdhost_write_block_once
       // directly, specifically so it still works mid-wedge).
       let _ = dharafs_ecc_protect_on_write(block_num, buf, skip_protect_this_write);
+      // See sdhost_read_block's own matching comment -- same forgive-
+      // on-success policy, write side.
+      let _ = dharafs_suspect_forgive_on_success(block_num);
       return 0;
     }
     if result == 3 {
@@ -9063,9 +9095,9 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
       let _ = uart_put_i64(SD_MAX_ATTEMPTS);
       let _ = uart_puts(" attempts\n");
       let _ = sdhost_init();
-      // See sdhost_read_block's own matching comment -- same real-time
-      // mark-on-confirmed-failure extension, write side.
-      let _ = dharafs_badblock_mark(block_num);
+      // See sdhost_read_block's own matching comment -- same
+      // report-not-immediately-mark two-tier policy, write side.
+      let _ = dharafs_badblock_report_failure(block_num);
       return result;
     }
   }
@@ -10471,6 +10503,284 @@ fn dharafs_badblock_mark(blk: i64) -> i64 {
   return 0;
 }
 
+// Two-tier bad-block classification (2026-10-31): a "suspect" table,
+// separate from the CONFIRMED bitmap above -- see boot/dharafs_
+// suspect_state.S's own header comment for the full design rationale
+// (modeled on Linux UBI's own torture-test-before-confirming
+// precedent, specifically because this project's own 42-round "SD
+// wedge saga" found the dominant real failure mode on this hardware
+// was controller/driver bugs a reinit clears, not genuine media wear
+// -- blacklisting permanently on the very first failure risks
+// needlessly shrinking a card over transient wedges). 120 entries
+// (one u32 block number each) comfortably exceeds any realistic
+// simultaneous-suspect count on a healthy card; if it's ever full,
+// dharafs_badblock_report_failure below escalates immediately rather
+// than silently losing track of a real, current failure.
+fn dharafs_suspect_max_entries() -> i64 { return 120; }
+fn dharafs_suspect_table_block() -> i64 { return 8107; }
+
+fn dharafs_suspect_find_slot(blk: i64) -> i64 {
+  let buf: mut ref i64 = dharafs_suspect_buf_get();
+  let i: i64 = 0;
+  while i < dharafs_suspect_max_entries() {
+    let stored: u32 = buf_read_u32(buf, (4 + i * 4) as u32);
+    if (stored as i64) == blk {
+      return i;
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+// Cheap, O(1) in the common (healthy-card) case: a real caller checks
+// this on EVERY successful read/write (see dharafs_suspect_forgive_
+// on_success below), so the zero-suspects case must never pay the
+// 120-entry linear scan dharafs_suspect_find_slot would otherwise
+// cost on every single access.
+fn dharafs_suspect_is_pending(blk: i64) -> i64 {
+  if dharafs_suspect_count_get() == (0 as u32) {
+    return 0;
+  }
+  return if dharafs_suspect_find_slot(blk) >= 0 { 1 } else { 0 };
+}
+
+// Returns 0 on success, -1 if the table is already full (every slot
+// occupied by a DIFFERENT block) -- caller must escalate immediately
+// in that case rather than silently lose tracking of a real failure.
+fn dharafs_suspect_add(blk: i64) -> i64 {
+  if dharafs_suspect_find_slot(blk) >= 0 {
+    return 0;
+  }
+  let buf: mut ref i64 = dharafs_suspect_buf_get();
+  let i: i64 = 0;
+  while i < dharafs_suspect_max_entries() {
+    let stored: u32 = buf_read_u32(buf, (4 + i * 4) as u32);
+    if stored == (0 as u32) {
+      let _ = buf_write_u32(buf, (4 + i * 4) as u32, blk as u32);
+      let _ = dharafs_suspect_count_set(dharafs_suspect_count_get() + (1 as u32));
+      let _ = dharafs_suspect_dirty_set(1 as u32);
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+fn dharafs_suspect_remove(blk: i64) -> i64 {
+  let slot: i64 = dharafs_suspect_find_slot(blk);
+  if slot < 0 {
+    return 0;
+  }
+  let buf: mut ref i64 = dharafs_suspect_buf_get();
+  let _ = buf_write_u32(buf, (4 + slot * 4) as u32, 0 as u32);
+  let cur: u32 = dharafs_suspect_count_get();
+  if cur > (0 as u32) {
+    let _ = dharafs_suspect_count_set(cur - (1 as u32));
+  }
+  let _ = dharafs_suspect_dirty_set(1 as u32);
+  return 0;
+}
+
+// The real policy entry point: call this (not dharafs_badblock_mark
+// directly) from a genuine, confirmed I/O failure. A block NOT
+// already suspect is given the benefit of the doubt (just suspected,
+// not yet skippable) -- only a SECOND independent failure, found via
+// this exact block's entry having SURVIVED from an earlier boot's own
+// persisted suspect table (never just a second attempt within the
+// same boot -- those already get the normal 3-attempt ladder's own
+// backoff/reinit, which this policy's whole premise is that it isn't
+// always enough), promotes it to confirmed-bad for real.
+fn dharafs_badblock_report_failure(blk: i64) -> i64 {
+  if dharafs_suspect_is_pending(blk) == 1 {
+    let _ = dharafs_suspect_remove(blk);
+    let _ = dharafs_badblock_mark(blk);
+    return 1;
+  }
+  let add_status: i64 = dharafs_suspect_add(blk);
+  if add_status < 0 {
+    let _ = dharafs_badblock_mark(blk);
+    return 1;
+  }
+  return 0;
+}
+
+// Matches UBI's own "torture test passed -> stays in the free pool,
+// not marked bad" precedent: a suspect block that's since been
+// accessed successfully (a genuinely fresh controller reset, i.e. a
+// real reboot, cleared whatever wedged it last time) is forgiven
+// rather than left to sit in the suspect table until a second failure
+// that may never actually come.
+fn dharafs_suspect_forgive_on_success(blk: i64) -> i64 {
+  if dharafs_suspect_is_pending(blk) == 1 {
+    let _ = dharafs_suspect_remove(blk);
+  }
+  return 0;
+}
+
+fn dharafs_suspect_table_load() -> i64 {
+  let buf: mut ref i64 = dharafs_suspect_buf_get();
+  let sd_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  // Same bare-single-attempt philosophy as dharafs_badblock_bitmap_
+  // load's own bootstrap read -- losing this on a bad read is the
+  // SAFE direction to fail in (every suspect just gets a fresh
+  // benefit of the doubt), never worth a real retry-ladder cost.
+  let rd_status: i64 = dharafs_block_read_once_with_ecc(dharafs_suspect_table_block(), sd_scratch);
+  let loaded: i64 = 0;
+  if rd_status == 0 {
+    let stored: u32 = buf_read_u32(sd_scratch, 0 as u32);
+    let computed: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
+    if stored == computed {
+      let _ = buf_copy_bytes(buf, 0 as u32, sd_scratch, 0 as u32, 512 as u32);
+      loaded = 1;
+    }
+  }
+  if loaded == 0 {
+    let i: i64 = 0;
+    while i < 512 {
+      let _ = buf_write_byte(buf, i as u32, 0 as u32);
+      i = i + 1;
+    }
+  }
+  // dharafs_suspect_count is a cache of what's actually in the RAM
+  // buffer right now -- recompute it here rather than trust whatever
+  // was true before this load (a fresh boot's own RAM starts zeroed
+  // regardless, but this keeps the invariant explicit either way).
+  let count: u32 = 0 as u32;
+  let i2: i64 = 0;
+  while i2 < dharafs_suspect_max_entries() {
+    let stored2: u32 = buf_read_u32(buf, (4 + i2 * 4) as u32);
+    if stored2 != (0 as u32) {
+      count = count + (1 as u32);
+    }
+    i2 = i2 + 1;
+  }
+  let _ = dharafs_suspect_count_set(count);
+  let _ = dharafs_suspect_dirty_set(0 as u32);
+  return 0;
+}
+
+fn dharafs_suspect_table_persist() -> i64 {
+  if dharafs_suspect_dirty_get() == (0 as u32) {
+    return 0;
+  }
+  let buf: mut ref i64 = dharafs_suspect_buf_get();
+  let computed: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+  let _ = buf_write_u32(buf, 0 as u32, computed);
+  let _ = sdhost_write_block(dharafs_suspect_table_block(), buf);
+  let _ = dharafs_suspect_dirty_set(0 as u32);
+  return 0;
+}
+
+// Boot-debug self-test for the two-tier classification itself -- pure
+// RAM-table mechanics, no real SD I/O needed (dharafs_badblock_report_
+// failure/dharafs_suspect_forgive_on_success are exactly what a real
+// I/O failure/success would call, just invoked directly here with
+// synthetic block numbers instead of needing a real wedge to trigger
+// one). Uses block numbers in 8150-8191 specifically: above
+// dharafs_log_max_blk() (7600, so dharafs_init's own real scan never
+// touches them and could never organically mark one bad or suspect
+// first) and below the badblock bitmap's own 8192 bounds check (so
+// dharafs_badblock_mark/_is_marked genuinely engage, not silently
+// no-op on an out-of-range block). Cleans up every mark/suspect entry
+// it creates before returning, so this is safe to run on a real card
+// without leaving synthetic state behind.
+fn dharafs_suspect_classification_self_test() -> i64 {
+  let any_fail: i64 = 0;
+  let test_blk: i64 = 8150;
+
+  // Case 1: first failure -- suspected, NOT yet confirmed bad.
+  let r1: i64 = dharafs_badblock_report_failure(test_blk);
+  if r1 != 0 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: first failure already escalated (expected 0)\n");
+    any_fail = 1;
+  }
+  if dharafs_suspect_is_pending(test_blk) != 1 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: not pending after first failure\n");
+    any_fail = 1;
+  }
+  if dharafs_badblock_is_marked(test_blk) != 0 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: confirmed bad after only one failure\n");
+    any_fail = 1;
+  }
+
+  // Case 2: a SECOND independent failure on the same block -- this is
+  // the real policy (see dharafs_badblock_report_failure's own header
+  // comment): now escalates to confirmed-bad, and is removed from the
+  // suspect table (it's not "suspect" anymore, it's confirmed).
+  let r2: i64 = dharafs_badblock_report_failure(test_blk);
+  if r2 != 1 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: second failure did not escalate (expected 1)\n");
+    any_fail = 1;
+  }
+  if dharafs_badblock_is_marked(test_blk) != 1 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: not confirmed bad after second failure\n");
+    any_fail = 1;
+  }
+  if dharafs_suspect_is_pending(test_blk) != 0 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: still pending after escalation (should be removed)\n");
+    any_fail = 1;
+  }
+  let _ = dharafs_badblock_clear(test_blk);
+
+  // Case 3: forgiveness -- a suspect block that's since succeeded
+  // (matches UBI's own "torture test passed" precedent) is cleared,
+  // not left to wait indefinitely for a second failure that may never
+  // come.
+  let forgive_blk: i64 = 8151;
+  let _ = dharafs_badblock_report_failure(forgive_blk);
+  if dharafs_suspect_is_pending(forgive_blk) != 1 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: forgive-case block not pending before forgiveness\n");
+    any_fail = 1;
+  }
+  let _ = dharafs_suspect_forgive_on_success(forgive_blk);
+  if dharafs_suspect_is_pending(forgive_blk) != 0 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: still pending after forgiveness\n");
+    any_fail = 1;
+  }
+  if dharafs_badblock_is_marked(forgive_blk) != 0 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: forgiven block wrongly confirmed bad\n");
+    any_fail = 1;
+  }
+
+  // Case 4: table-full escalates immediately instead of silently
+  // losing track of a real, current failure. Fill every slot with
+  // DISTINCT, deliberately out-of-range synthetic block numbers (the
+  // suspect table itself has no bounds check -- it never does any
+  // real SD I/O, it's just a RAM tracking table -- so these never
+  // collide with any real block, unlike test_blk/forgive_blk/
+  // overflow_blk above which deliberately stay under 8192 so
+  // dharafs_badblock_mark/_is_marked genuinely engage), then confirm
+  // one more failure (on an in-range block) escalates immediately
+  // despite never having failed before.
+  let fill_base: i64 = 500000;
+  let i: i64 = 0;
+  while i < dharafs_suspect_max_entries() {
+    let _ = dharafs_suspect_add(fill_base + i);
+    i = i + 1;
+  }
+  let overflow_blk: i64 = 8149;
+  let r4: i64 = dharafs_badblock_report_failure(overflow_blk);
+  if r4 != 1 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: full-table case did not escalate immediately (expected 1)\n");
+    any_fail = 1;
+  }
+  if dharafs_badblock_is_marked(overflow_blk) != 1 {
+    let _ = uart_puts("SUSPECT SELF-TEST FAIL: full-table escalation didn't actually confirm bad\n");
+    any_fail = 1;
+  }
+  let _ = dharafs_badblock_clear(overflow_blk);
+  let j: i64 = 0;
+  while j < dharafs_suspect_max_entries() {
+    let _ = dharafs_suspect_remove(fill_base + j);
+    j = j + 1;
+  }
+
+  if any_fail == 0 {
+    let _ = uart_puts("SUSPECT SELF-TEST: all cases passed (first-failure=suspect-only, second-failure=escalate, forgive-on-success, full-table=immediate-escalate)\n");
+  }
+  return any_fail;
+}
+
 // Called whenever a block is freshly written with real, verified
 // data (dharafs_append_raw and its transaction-group sibling) -- a
 // block previously classified "bad" only because it was genuinely
@@ -10502,6 +10812,9 @@ fn dharafs_init() -> i64 {
   // before the scan below -- see dharafs_badblock_bitmap_load's own
   // header comment.
   let _ = dharafs_badblock_bitmap_load();
+  // Two-tier classification's own suspect table -- same "load before
+  // the scan" timing, see dharafs_suspect_table_load's own comment.
+  let _ = dharafs_suspect_table_load();
   let buf: mut ref i64 = dhruva_alloc_bytes(512);
   // DharaFS persisted-checkpoint plan, Phase 1 (2026-10-24): a valid
   // checkpoint means a prior compaction pass already PROVED nothing
@@ -10775,6 +11088,7 @@ fn dharafs_init() -> i64 {
   // nothing changed, see dharafs_badblock_bitmap_persist's own header
   // comment.
   let _ = dharafs_badblock_bitmap_persist(1 as u32);
+  let _ = dharafs_suspect_table_persist();
   let _ = uart_puts("DharaFS: checkpoint ");
   if checkpoint.valid == 1 {
     let _ = uart_puts("TRUSTED gen=");
@@ -12398,6 +12712,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
       let _ = dharafs_state_set(write_cursor_final, dharafs_state_get_next_seq());
     }
     let _ = dharafs_badblock_bitmap_persist(1 as u32);
+    let _ = dharafs_suspect_table_persist();
     let _ = dharafs_ecc_cache_flush();
     let _ = dharafs_wear_cache_flush();
     let current_log_start: u32 = dharafs_state_get_log_start();
@@ -36868,6 +37183,7 @@ fn shell_dispatch_shutdown() -> i64 {
   // "no further writes will occur" claim becomes true. No-op if
   // nothing's dirty.
   let _ = dharafs_badblock_bitmap_persist(1 as u32);
+  let _ = dharafs_suspect_table_persist();
   let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
   let _ = dharafs_wear_cache_flush(); // NAND-FTL wear table: same persist-point discipline
   let _ = uart_puts("\n");
@@ -37685,6 +38001,7 @@ fn shell_dispatch() -> i64 {
     // holds the ceiling lock above, so no concurrent writer can dirty
     // it again before the reset fires. A no-op if nothing's dirty.
     let _ = dharafs_badblock_bitmap_persist(1 as u32);
+    let _ = dharafs_suspect_table_persist();
     let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
     let _ = dharafs_wear_cache_flush(); // NAND-FTL wear table: same persist-point discipline
     let _ = uart_puts("rebooting...\n");
@@ -51835,6 +52152,9 @@ fn kernel_main() -> i64 {
   // NAND-FTL wear-leveling table's one-sector RAM cache -- see boot/
   // dharafs_wear_state.S's own header comment.
   let _ = dharafs_wear_cache_buf_set(dhruva_alloc_bytes(512));
+  // Two-tier bad-block classification's suspect table -- see boot/
+  // dharafs_suspect_state.S's own header comment.
+  let _ = dharafs_suspect_buf_set(dhruva_alloc_bytes(512));
   let _ = dharafs_stat_scratch_set(dhruva_alloc_bytes(12));
   let _ = dharafs_dir_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_log_path_scratch_set(dhruva_alloc_bytes(32));
@@ -52384,6 +52704,7 @@ fn kernel_main() -> i64 {
   if boot_debug_enabled() == 1 { let _ = dharafs_enospc_reclaim_self_test(); }
   if boot_debug_enabled() == 1 { let _ = nand_erase_unit_discipline_self_test(); }
   if boot_debug_enabled() == 1 { let _ = nand_wear_leveling_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = dharafs_suspect_classification_self_test(); }
 
   // Round 42: directory hierarchy + owner/group/other rwx permissions.
   if boot_debug_enabled() == 1 { let _ = dharafs_permissions_self_test(); }
