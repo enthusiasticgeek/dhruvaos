@@ -34,7 +34,46 @@
 usb_power_mbox_buf:
     .space 32    /* 8 words -- see the layout comment in usb_power_on */
 
+/* RTOS-boot-time hardening, USB follow-up (2026-11-01): live real-HW
+ * evidence (checkpoint13->14 measured at 117s on one boot, still not
+ * complete after 7+ minutes on a later boot) confirms USB device0
+ * enumeration -- not just controller/port bring-up -- can take far
+ * longer than any reasonable boot-path budget, exactly the same
+ * "background-shaped concern must not block boot" problem DharaFS's
+ * own Tier 3 recovery scan already had (see dharafs_recovery_active's
+ * own header comment, boot/dharafs_state.S, for the full reasoning
+ * this mirrors). dwc2_init() now stops at a connected+enabled port --
+ * fast, bounded, real controller-register work -- and sets this flag
+ * instead of calling dwc2_probe_device0() (the slow, device-dependent
+ * part) inline. task_e picks it up from its own existing DWC2_MUTEX_ID
+ * critical section (already used for usb_hotplug_poll/dhcp_client_
+ * poll) and runs the probe to completion in the background, however
+ * long the real device actually needs. RAM-only, like dharafs_
+ * recovery_active -- a reboot mid-probe just restarts the attempt
+ * cleanly next boot; there is no persisted state to corrupt or wear
+ * out here. */
+.align 4
+usb_probe0_pending:
+    .word 0        /* 0 = no device0 probe owed (either no device was
+                     * ever connected/enabled, or task_e already ran
+                     * it to completion); 1 = dwc2_init() found a
+                     * connected+enabled port and is deferring the
+                     * actual enumeration attempt to task_e. */
+
 .section ".text"
+
+.global usb_probe0_pending_get
+usb_probe0_pending_get:
+    ldr r0, =usb_probe0_pending
+    ldr r0, [r0]
+    bx lr
+
+.global usb_probe0_pending_set
+usb_probe0_pending_set:
+    ldr r1, =usb_probe0_pending
+    str r0, [r1]
+    mov r0, #0
+    bx lr
 
 /* i64 usb_power_on() -- returns 0 on VideoCore-reported success, 1 on
  * timeout or a reported failure. Must be called before dwc2_init

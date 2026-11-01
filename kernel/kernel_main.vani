@@ -1925,6 +1925,14 @@ extern "C" fn dwc2_dma_scratch_get() -> mut ref i64;
 // never power-gates the DWC2 block at all).
 #[stack_cost(bytes=28)]
 extern "C" fn usb_power_on() -> i64;
+// RTOS-boot-time hardening, USB follow-up (2026-11-01) -- see that same
+// file's own matching header comment for usb_probe0_pending's full
+// "why" (mirrors dharafs_recovery_active's own RAM-only deferred-work
+// pattern, just for USB device0 enumeration instead of DharaFS Tier 3).
+#[stack_cost(bytes=1)]
+extern "C" fn usb_probe0_pending_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_probe0_pending_set(value: u32) -> i64;
 // Round 35 (boot/scratch_state.S): dwc2_bulk_out/dwc2_bulk_in's own
 // dedicated 512-byte DMA buffer, separate from dwc2_dma_scratch (64
 // bytes, control transfers only) -- see that state file's own comment
@@ -25252,7 +25260,28 @@ fn dwc2_init() -> i64 {
     return 0 - 1;
   }
   let _ = dwc2_reassert_core_config_post_port_reset();
-  return dwc2_probe_device0();
+  // RTOS-boot-time hardening, USB follow-up (2026-11-01): dwc2_probe_
+  // device0() (GET_DESCRIPTOR + SET_ADDRESS, the actual enumeration)
+  // used to run right here, inline, on the boot path -- live real-HW
+  // evidence this round: checkpoint13->14 (this whole function's own
+  // boot-path cost) measured at 117s on one boot and still hadn't
+  // completed after 7+ minutes on a later one, the exact same
+  // "background-shaped concern blocking boot" problem DharaFS's own
+  // Tier 3 scan had (see dharafs_init's own matching comment, and
+  // usb_probe0_pending's header, boot/usb_power_state.S, for the full
+  // reasoning this mirrors). Everything above this point (power-on,
+  // core reset/config, port power/connect/reset/enable) is fast,
+  // bounded, real controller-register work -- only the device's OWN
+  // response time is unbounded, so only THAT part gets deferred.
+  // Flagging the pending probe and returning success here means
+  // dwc2_init() now reports "controller ready, a connected+enabled
+  // port exists" rather than "device fully enumerated" -- task_e runs
+  // the real probe to completion in the background (see its own new
+  // branch), under the exact same DWC2_MUTEX_ID this project's other
+  // DWC2-touching background work (usb_hotplug_poll/dhcp_client_poll)
+  // already coordinates through.
+  let _ = usb_probe0_pending_set(1 as u32);
+  return 0;
 }
 
 // Task #325 real-HW diagnostic (round 9): the immediate-readback
@@ -34345,8 +34374,20 @@ fn task_d() -> i64 {
 // pass, and that measured worst case is what's fed into
 // test/schedulability_analysis.py as LOW's own blocking term, not a
 // static estimate this task's own structure can't honestly produce.
+// BUG (RTOS-boot-time hardening, USB follow-up, 2026-11-01): same class
+// of thing as every prior raise above -- moving the deferred device0
+// probe (dwc2_probe_device0, see this task's own new DWC2_MUTEX_ID
+// branch below) into this task's own call graph pushed the compiler's
+// static worst-case chain through dwc2_probe_device0 -> dwc2_
+// enumerate_downstream -> ... -> lan9512_reg_read -> dwc2_control_in
+// -> kernlog_write_usb_regs -> kernlog_flush -> dharafs_log_append_raw
+// -> ... -> chacha20_poly1305_decrypt_heap (DharaFS media encryption,
+// on the kernel-log's own write path) to 6320 bytes, past the 6144
+// budget. Raised to 7168 for real headroom against the next addition
+// to this same chain, not the bare 176 bytes actually needed today --
+// matches every prior raise's own stated reasoning.
 #[no_mangle]
-#[bounded_stack(bytes=6144)]
+#[bounded_stack(bytes=7168)]
 fn task_e() -> i64 {
   let gc_buf: mut ref i64 = dhruva_alloc_bytes(512);
   let compact_buf: mut ref i64 = dhruva_alloc_bytes(512);
@@ -34529,6 +34570,50 @@ fn task_e() -> i64 {
     // task_e's own DharaFS section above already released ceiling=2
     // before this point, a separate, sequential, non-nested pair.
     let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+    // RTOS-boot-time hardening, USB follow-up (2026-11-01): the one-
+    // time deferred device0 enumeration -- see dwc2_init's own matching
+    // comment and usb_probe0_pending's header (boot/usb_power_state.S)
+    // for the full "why" this moved off the boot path. Runs before
+    // usb_hotplug_poll/dhcp_client_poll below so a freshly-connected
+    // boot-time device gets probed on task_e's very first opportunity.
+    //
+    // HONEST SCHEDULABILITY CAVEAT, not silently glossed over: this
+    // call can genuinely take 100+ real seconds for a slow-to-wake
+    // device (live-measured this round: one boot's checkpoint13->14
+    // alone was 117s; a later boot exceeded 7 minutes). Holding DWC2_
+    // MUTEX_ID for that long DOES block every other task that needs
+    // it (HIGH/MEDIUM/LOW if they ever touch DWC2 work, sshd, ping,
+    // dhcp_client_poll) for the same duration -- test/schedulability_
+    // analysis.py's own gc_dhcp_poll_worst_case_ms (6.584ms) models
+    // this mutex's STEADY-STATE recurring hold time, not this one-time
+    // outlier, and was deliberately NOT changed to try to cover it:
+    // this event has no period and no deadline, so it doesn't fit that
+    // model's own periodic-task RTA framing, and forcing a number in
+    // would either wrongly reject an otherwise-fine steady-state
+    // design or require a genuinely different one-shot-event model
+    // this round didn't build. The honest comparison is against what
+    // ALREADY shipped, not against a theoretical zero-cost ideal: the
+    // OLD (just-replaced) design paid this exact same real-world delay
+    // synchronously on the boot path, before any task -- including
+    // HIGH/MEDIUM/LOW -- had even been created yet, so no periodic
+    // deadline existed to violate; moving it here is a net improvement
+    // for every part of the system that does NOT need DWC2_MUTEX_ID
+    // during this one-time window (boot reaches PASS immediately,
+    // DharaFS/shell/most commands work normally), at the cost of a
+    // real, acknowledged, boot-adjacent exception for the few that do.
+    // A fully rigorous fix would restructure dwc2_wait_chan0_done's own
+    // poll loop to release and reacquire this mutex between bounded
+    // chunks (mirroring dharafs_recovery_scan_continue's own pattern)
+    // -- scoped out this round as materially riskier surgery inside
+    // the already-tuned, 18+-round-hardened transfer-wait primitive;
+    // flagged here for a future round, not silently left undocumented.
+    if usb_probe0_pending_get() == (1 as u32) {
+      let probe_status: i64 = dwc2_probe_device0();
+      let _ = uart_puts("USB: background device0 probe complete, status=");
+      let _ = uart_put_hex32(probe_status as u32);
+      let _ = uart_puts(" (0=enumerated, nonzero=no response)\n");
+      let _ = usb_probe0_pending_set(0 as u32);
+    }
     let _ = usb_hotplug_poll();
     let _ = dhcp_client_poll(dhcp_my_mac);
     let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
@@ -54002,7 +54087,13 @@ fn kernel_main() -> i64 {
   let usb_status: i64 = dwc2_init();
   let _ = uart_puts("USB: dwc2_init status=");
   let _ = uart_put_hex32(usb_status as u32);
-  let _ = uart_puts(" (0=device attached+port enabled, nonzero=no device attached)\n");
+  // RTOS-boot-time hardening, USB follow-up (2026-11-01): dwc2_init's
+  // own return no longer means "device fully enumerated" -- see that
+  // function's own matching comment. 0 now means "controller ready,
+  // port connected+enabled" (device probe deferred to task_e, result
+  // reported separately when it completes); nonzero still means no
+  // device was ever connected/enabled, exactly as before.
+  let _ = uart_puts(" (0=controller ready, port connected+enabled (device probe deferred to background), nonzero=no device attached)\n");
   if usb_status != 0 {
     let _ = kernlog_write_simple("USB dwc2_init status", usb_status as u32);
   }
