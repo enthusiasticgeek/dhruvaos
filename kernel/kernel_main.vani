@@ -4816,17 +4816,39 @@ fn fb_self_check() -> i64 {
   // bug was found. See project memory for the fuller writeup and the
   // sweep this prompted across the rest of the codebase for the same
   // bug class.
+  // BUG FIX (2026-11-01, real-HW crash): this whole pixel-write round
+  // trip used to run unconditionally, even when fb_init() above
+  // already failed (ok == 0) -- fb_base_get()/fb_pitch_get()/fb_size_
+  // get() are only ever validly set by fb_init's own success path
+  // (fb_base_set/_pitch_set/_size_set, right before its `return 0`),
+  // so a failed mailbox call leaves them at whatever they were before
+  // (0 on a cold boot, a sentinel, or stale garbage). Writing/reading
+  // through mmio_write_u32/mmio_read_u32 at an address built from
+  // those unset values is a real, unguarded wild memory access -- a
+  // genuinely-failed mailbox call (confirmed live: real hardware, this
+  // round, right after dwc2_init's own VideoCore mailbox USB power-on
+  // call -- plausibly the SAME shared mailbox property interface
+  // being asked for a second request sooner, in real wall-clock time,
+  // than it used to be once USB enumeration moved off the boot path)
+  // escalated what should have been an honest "(FAIL)" report into a
+  // Data Abort that took the whole system down. Gated on `ok` so a
+  // real FB-init failure is reported, safely, as a failure -- never
+  // a crash.
   let pix_ok: i64 = 1;
-  let _ = fb_fill_pixel(0, 0, 0x00112233 as u32);
-  let corner_addr: i64 = fb_base_get();
-  if mmio_read_u32(corner_addr) != (0x00112233 as u32) {
-    pix_ok = 0;
-  }
-  let last_x: i64 = (fb_pitch_get() / 4) - 1;
-  let last_y: i64 = 479;
-  let _ = fb_fill_pixel(last_x, last_y, 0x00445566 as u32);
-  let far_addr: i64 = fb_base_get() + (last_y * fb_pitch_get()) + (last_x * 4);
-  if mmio_read_u32(far_addr) != (0x00445566 as u32) {
+  if ok == 1 {
+    let _ = fb_fill_pixel(0, 0, 0x00112233 as u32);
+    let corner_addr: i64 = fb_base_get();
+    if mmio_read_u32(corner_addr) != (0x00112233 as u32) {
+      pix_ok = 0;
+    }
+    let last_x: i64 = (fb_pitch_get() / 4) - 1;
+    let last_y: i64 = 479;
+    let _ = fb_fill_pixel(last_x, last_y, 0x00445566 as u32);
+    let far_addr: i64 = fb_base_get() + (last_y * fb_pitch_get()) + (last_x * 4);
+    if mmio_read_u32(far_addr) != (0x00445566 as u32) {
+      pix_ok = 0;
+    }
+  } else {
     pix_ok = 0;
   }
 
@@ -54138,6 +54160,30 @@ fn kernel_main() -> i64 {
   // falsified with real evidence (same discipline as every other
   // ruled-out lead this investigation has kept, not silently dropped);
   // if it changes, that's a real, actionable finding.
+  // RTOS-boot-time hardening, real-HW follow-up (2026-11-01): this
+  // round's own USB redesign (dwc2_init no longer runs the full,
+  // slow device0 enumeration inline) shrank the real elapsed gap
+  // between usb_power_on()'s own mailbox call and THIS function's
+  // own fb_init() mailbox call from 100+ real seconds down to ~7s --
+  // and on the very next real-hardware boot after that redesign
+  // shipped, fb_init() failed for the first time ever observed on
+  // this board, with fb_self_check()'s own unguarded pixel-write
+  // round trip (now fixed, see that function's own matching comment)
+  // escalating the failure into a Data Abort. Directly supports the
+  // shared-VideoCore-mailbox-contention hypothesis this round's own
+  // header comment above already flagged (GPU-side work triggered by
+  // one mailbox response plausibly still running when the next
+  // request lands) -- not confirmed via a live register capture, but
+  // the correlation (gap shrinks 15x, first-ever failure, same boot)
+  // is strong enough to act on. A modest settle delay, matching this
+  // driver's own already-proven 161000 (~50ms) constant used
+  // throughout its other post-hardware-action waits, costs nothing
+  // meaningful against the "boot target max 1 min" budget and may be
+  // the real fix; the crash-safety guard above is what actually
+  // matters regardless of whether this delay turns out sufficient --
+  // a future genuine FB failure now reports cleanly instead of
+  // crashing either way.
+  let _ = delay(161000);
   // Round 71: HDMI framebuffer (mailbox property-channel interface).
   let _ = fb_self_check();
 
