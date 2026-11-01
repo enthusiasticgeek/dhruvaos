@@ -3568,6 +3568,24 @@ extern "C" fn dharafs_gc_get_write_cursor() -> u32;
 extern "C" fn dharafs_gc_set_erase_cursor(cursor: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_gc_get_erase_cursor() -> u32;
+// RTOS-boot-time hardening round (2026-11-01) -- see boot/dharafs_
+// state.S's own header comment on dharafs_recovery_active.
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_active_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_active_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_scan_cursor_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_scan_cursor_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_next_free_blk_found_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_next_free_blk_found_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_highest_seq_found_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_highest_seq_found_set(v: u32) -> u32;
 // Hashed directory index (boot/dirindex_state.S) -- see that file's own
 // header comment. Pure RAM-only lookup accelerator for
 // dharafs_find_latest_block_raw, never a correctness authority by
@@ -10485,10 +10503,23 @@ fn dharafs_checkpoint_lookup() -> DharaFsCheckpoint {
     valid: 0, chosen_slot: 0, generation: 0 as u32, log_start: 0 as u32, log_end: 0 as u32,
     clean_shutdown: 0 as u32, next_seq: 0 as u32, cursor_generation: 0 as u32,
   };
+  // Card-wear hardening round (2026-11-01): bare single-attempt read
+  // per slot, not the full sdhost_read_block retry ladder -- same
+  // "re-trying this specific bootstrap read is pure waste" reasoning
+  // dharafs_badblock_bitmap_load/dharafs_suspect_table_load already
+  // use (see dharafs_block_read_once_with_ecc's own header comment).
+  // This matters far more now than it did for the old A/B pair: 6 of
+  // these 8 slots are BRAND NEW physical blocks this exact card has
+  // never been probed at before, and SD_MAX_ATTEMPTS retries each do
+  // a real controller reinit -- on a severely degraded card (live-
+  // confirmed: reinit cost has grown far past its original ~150ms
+  // baseline), even one bad new slot could cost whole minutes before
+  // this fix, repeated across every one of the 4 generalized
+  // structures' own lookups every single boot.
   let i: i64 = 0;
   while i < dharafs_checkpoint_pool_size() {
     let blk: i64 = dharafs_checkpoint_block_at(i);
-    let status: i64 = sdhost_read_block(blk, buf);
+    let status: i64 = dharafs_block_read_once_with_ecc(blk, buf);
     let ok: i64 = if status == 0 { dharafs_checkpoint_crc_valid(buf) } else { 0 };
     if ok == 1 {
       let rec: DharaFsCheckpoint = dharafs_checkpoint_parse(buf, i);
@@ -10630,10 +10661,15 @@ fn dharafs_write_cursor_lookup() -> DharaFsWriteCursor {
   let best: DharaFsWriteCursor = DharaFsWriteCursor {
     valid: 0, chosen_slot: 0, generation: 0 as u32, next_block: 0 as u32, next_seq: 0 as u32,
   };
+  // See dharafs_checkpoint_lookup's own matching comment -- same
+  // reasoning, same fix. Matters even more here: write-cursor is the
+  // highest-write-frequency structure in the system, and its own
+  // lookup runs during dharafs_init every single boot regardless of
+  // which tier ends up handling recovery.
   let i: i64 = 0;
   while i < dharafs_write_cursor_pool_size() {
     let blk: i64 = dharafs_write_cursor_block_at(i);
-    let status: i64 = sdhost_read_block(blk, buf);
+    let status: i64 = dharafs_block_read_once_with_ecc(blk, buf);
     let ok: i64 = if status == 0 { dharafs_write_cursor_crc_valid(buf) } else { 0 };
     if ok == 1 {
       let rec: DharaFsWriteCursor = dharafs_write_cursor_parse(buf, i);
@@ -11403,7 +11439,6 @@ fn dharafs_init() -> i64 {
   // Two-tier classification's own suspect table -- same "load before
   // the scan" timing, see dharafs_suspect_table_load's own comment.
   let _ = dharafs_suspect_table_load();
-  let buf: mut ref i64 = dhruva_alloc_bytes(512);
   // DharaFS persisted-checkpoint plan, Phase 1 (2026-10-24): a valid
   // checkpoint means a prior compaction pass already PROVED nothing
   // live exists before its own log_start -- safe to start scanning
@@ -11569,138 +11604,145 @@ fn dharafs_init() -> i64 {
   // copies to the tail) is scoped, separate follow-up work -- see
   // docs/TODO.md's own writeup of this round for the full plan; not
   // attempted here.
+  // RTOS-boot-time + card-wear hardening round (2026-11-01): Tier 3
+  // (the exhaustive scan that used to run right here, inline,
+  // unconditionally whenever Tier 1/2 don't apply) NEVER runs inline
+  // during boot anymore. A safety-critical RTOS boot path must not
+  // block on a background-shaped concern -- not even for a bounded
+  // time BUDGET, which was the first design considered and rejected:
+  // a severely degraded real card took 10+ minutes for this exact
+  // scan with no ceiling at all, and ANY exhaustive scan can be made
+  // arbitrarily slow by a bad enough card, so a budget only bounds
+  // how long boot is willing to wait, not how long recovery actually
+  // takes. The real fix is this scan never being on the boot path's
+  // own critical path at all -- see dharafs_recovery_scan_continue's
+  // own header comment (right below this function) for the full
+  // background-task mechanism, matching real precedent confirmed via
+  // research: UBIFS does not try to "always eventually succeed" via
+  // unbounded scanning on its own mount path either.
+  //
+  // next_block/next_seq go to dharafs_log_max_blk() -- a conservative
+  // placeholder, never a real block/seq any genuine record could
+  // collide with (this project's own append-forward design keeps
+  // next_block/next_seq numerically equal at every real append,
+  // confirmed live, so this preserves that invariant even as a
+  // placeholder) -- until the background task proves the real tail
+  // and shrinks this back down.
+  let scan_max_blk: u32 = dharafs_log_max_blk() as u32;
+  let _ = dharafs_state_set(scan_max_blk, scan_max_blk);
+  let _ = dharafs_state_set_log_start(scan_start_blk);
+  let _ = dharafs_recovery_scan_cursor_set(scan_start_blk);
+  let _ = dharafs_recovery_next_free_blk_found_set(scan_start_blk);
+  let _ = dharafs_recovery_highest_seq_found_set(0 as u32);
+  let _ = dharafs_recovery_active_set(1 as u32);
+  let _ = uart_puts("DharaFS: checkpoint ");
+  if checkpoint.valid == 1 {
+    let _ = uart_puts("valid but Tier 2 forward-scan unavailable, gen=");
+    let _ = uart_put_hex32(checkpoint.generation);
+    let _ = uart_puts(" scan_start=");
+  } else {
+    let _ = uart_puts("not present/invalid, scan_start=");
+  }
+  let _ = uart_put_hex32(scan_start_blk);
+  let _ = uart_puts("\n");
+  // User-facing ask, answered plainly rather than left implicit: what
+  // this degraded state actually permits. The most important single
+  // fact is that a "not found" read during this window is NOT merely
+  // slow -- dirindex starts genuinely empty and only grows as the
+  // background scan reaches each record, so it is a WRONG answer for
+  // anything not yet reached, not an honest "still working on it."
+  let _ = uart_puts("DharaFS: WARNING -- recovery is running in the background, not complete yet.\n");
+  let _ = uart_puts("  CAN: read any path the background scan has already reached (grows over time).\n");
+  let _ = uart_puts("  CANNOT until recovery completes: write/delete/rename ANYTHING (refused with a\n");
+  let _ = uart_puts("  clear error, never silently skipped); trust a \"not found\" read of a path that\n");
+  let _ = uart_puts("  may simply not have been reached by the scan yet. Check 'diagnose' for progress.\n");
+  return 0;
+}
+
+fn dharafs_recovery_scan_real_reads_per_call() -> i64 { return 2048; }
+
+// RTOS-boot-time hardening, follow-up (2026-11-01): the real per-call
+// bound is TIME, not a fixed read count -- see dharafs_recovery_scan_
+// continue's own while-loop header. A fixed count sized for a severely
+// degraded real card (where each real read can cost a full controller
+// reinit) turned into a catastrophic regression for the common case this
+// same card doesn't have yet: a healthy/QEMU card where every real read
+// is cheap, so the SAME small fixed count just wastes most of each call
+// doing almost nothing, forcing thousands of calls (at task_e's own
+// cadence) to get through a large blank region. A time budget self-
+// adapts: a healthy card finishes a huge blank region in one or two
+// calls (each real read costs microseconds, so the loop keeps going
+// until the time ceiling, not the old low read-count ceiling), while a
+// genuinely slow card still only manages a handful of reads per call,
+// exactly like the fixed-count version intended -- same real-world
+// behavior as the original design's own goal, just correctly bounded by
+// the thing that actually varies (I/O cost) instead of a count that
+// doesn't. 200ms matches this same critical section's own already-
+// tolerated worst case elsewhere (DHCP/USB-hotplug's live-measured
+// ~325ms under this identical ceiling=2 lock, task_e's dhcp poll section
+// below) -- comfortably within schedulability, nowhere near starving
+// anything at the 500ms tick. dharafs_recovery_scan_real_reads_per_call's
+// own 2048 is now just a hard backstop against a runaway loop if TIMER_
+// CLO ever misbehaves, not the real governor.
+fn dharafs_recovery_scan_budget_us() -> u32 { return 200000 as u32; }
+
+// RTOS-boot-time + card-wear hardening round (2026-11-01): the
+// background continuation of what used to be dharafs_init's own
+// inline Tier 3 scan -- see that function's own matching comment for
+// the full "why" this moved out of the boot path. Called from task_e
+// every 10s, for as long as dharafs_recovery_active_get() stays 1.
+// Reuses the EXACT validity criteria the old inline scan used
+// (checksum + seq != 0 + tx_begin-group completion proof) --
+// correctness is unchanged, only WHEN the work happens moved.
+//
+// Bounded by REAL reads, not raw block count: a known-bad block
+// (dharafs_badblock_is_marked) costs zero real SD I/O to skip, so
+// walking through a long already-classified run inside one call is
+// free and doesn't count against the budget -- only blocks that
+// actually need a fresh read (new/unclassified, or genuinely live
+// data) do. This bounds this call's own real-world duration
+// regardless of how sparse or dense live data is in the remaining
+// range -- same reasoning dharafs_compact_blocks_per_call's own
+// header comment already established for compaction's own budget,
+// just sized for recovery's own urgency (restoring full read/write
+// capability as soon as possible) rather than compaction's low-
+// urgency background maintenance (1 block per 10s -- at that rate
+// 7600 blocks would take over 21 hours, nowhere near acceptable for
+// what's blocking every write in the system).
+fn dharafs_recovery_scan_continue(buf: mut ref i64, budget_us: u32) -> i64 {
+  if dharafs_recovery_active_get() == (0 as u32) {
+    return 0;
+  }
   let max_blk: i64 = dharafs_log_max_blk();
-  let highest_seq: u32 = 0 as u32;
-  // DharaFS Phase 2 (2026-10-25): replaced the old consecutive-bad-
-  // block TOLERANCE (which used to break out of this scan early,
-  // guessing "this must be the unwritten tail") with the persisted
-  // bad-block bitmap loaded above. No early exit at all now -- this
-  // scan always covers the full [scan_start_blk, max_blk) range,
-  // every boot, with a known-bad block skipped at zero real SD I/O
-  // cost (see dharafs_badblock_is_marked's own call site below) and
-  // only genuinely new blocks (unclassified since the last boot)
-  // paying for a real read. See dharafs_badblock_bitmap_block_0's own
-  // header comment for the full "why" and the live evidence that the
-  // old tolerance-number approach was never going to be safe at any
-  // value. consecutive_bad/diag_max_run are now pure diagnostics (the
-  // RECOVERY SUMMARY print below still reports the longest run seen),
-  // no longer control-flow.
-  let consecutive_bad: i64 = 0;
+  let blk: i64 = dharafs_recovery_scan_cursor_get() as i64;
+  let next_free_blk: i64 = dharafs_recovery_next_free_blk_found_get() as i64;
+  let highest_seq: u32 = dharafs_recovery_highest_seq_found_get();
+  let real_reads: i64 = 0;
   let diag_total_bad: i64 = 0;
-  let diag_max_run: i64 = 0;
-  // DharaFS Phase 3 (2026-10-25): tracks "one past the last GENUINELY
-  // LIVE record this scan found" -- separate from `blk`, which is just
-  // the scan's own cursor and keeps advancing through bad/blank blocks
-  // all the way to max_blk regardless of whether anything live was
-  // ever found. Before this, dharafs_state_set below used `blk`
-  // directly, so a scan of a totally blank device (every real QEMU
-  // regression run creates a brand-new, all-zero disk image every
-  // time) left next_block sitting at max_blk itself -- max_blk being
-  // dharafs_crypto_meta_sector_for(0), the first block of the region
-  // just past the log -- instead of at block 1, where a blank device's
-  // very first write actually belongs. Confirmed live: the very first
-  // boot-time self-test write on a blank image landed at block
-  // max_blk, not block scan_start_blk. Only updated at the two places
-  // below where a real, verified record (or completed transaction
-  // group) is actually found -- a bad-block skip never advances it.
-  let next_free_blk: i64 = scan_start_blk as i64;
-  while blk < max_blk {
-    // TASK #353 REAL-HW FOLLOW-UP (2026-10-16): found live -- this
-    // scan reads sequentially from block 1 on EVERY boot (no
-    // persisted log_start, see this function's own comment below on
-    // why), one real SD block per iteration, up to max_blk=2048 --
-    // cost that only grows, boot over boot, as more of the log gets
-    // written (compaction reclaims VISIBILITY via dirindex, not the
-    // raw block-number high-water mark this loop walks). The ONE
-    // existing kick before this call (task #308 follow-up, right
-    // after sdhost_init) and the ONE right after it never protected
-    // the scan itself -- fine under QEMU (PM_RSTC writes reset the
-    // whole machine there, so this path was never exercisable at
-    // all) but a real, reproducible watchdog-reset boot-loop once
-    // this scan's own real-SD-I/O cost crossed the 2-second
-    // watchdog_init()/watchdog_kick() window on actual hardware,
-    // confirmed live: boots 1-2 reached PASS fine, boot 3 onward hung
-    // in exactly this phase every time, growing worse (never better)
-    // as each attempt's own partial writes before the reset only
-    // added to what the NEXT boot has to re-scan. Kicking every
-    // iteration here is cheap (two MMIO writes next to a real SD
-    // block read) and keeps this scan safe regardless of how close
-    // to max_blk it ever needs to go.
+  let call_t0: u32 = mmio_read_u32(TIMER_CLO);
+  while (blk < max_blk) && (real_reads < dharafs_recovery_scan_real_reads_per_call()) && (wrapping_sub(mmio_read_u32(TIMER_CLO), call_t0) < budget_us) {
     if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
       let _ = watchdog_kick();
     }
     if dharafs_badblock_is_marked(blk) == 1 {
-      // Already classified bad (real media damage OR genuinely blank
-      // space from an earlier full pass) -- skip with no real SD
-      // read at all. This is the actual speed/power win: after the
-      // first full pass over a given card's history, almost every
-      // boot's own scan is this branch for the vast majority of the
-      // range, not a real flash access.
-      consecutive_bad = consecutive_bad + 1;
-      diag_total_bad = diag_total_bad + 1;
-      if consecutive_bad > diag_max_run {
-        diag_max_run = consecutive_bad;
-      }
       blk = blk + 1;
     } else {
+    real_reads = real_reads + 1;
     let rd_status: i64 = dharafs_block_read(blk, buf);
-    // A checksum match ALONE isn't enough: buf_checksum's rotate-mix
-    // of an all-zero region is itself exactly 0, matching the
-    // all-zero stored-checksum field a genuinely unwritten (fresh
-    // device, never appended to) block already has -- so an empty
-    // block would otherwise look like a perfectly valid, trivially
-    // empty record, and recovery would silently scan straight past
-    // every real free block instead of stopping at the first one.
-    // Every genuine record's sequence number is >= 1 (dharafs_append never
-    // hands out 0), so requiring seq_num != 0 too is what actually
-    // distinguishes "real record" from "blank space that happens to
-    // checksum-match its own all-zero checksum field." Found by the
-    // append cursor landing at block 2040 on a device where nothing
-    // had ever been written below that -- exactly where an unrelated
-    // test (task #3's SD round-trip sweep) happens to write raw,
-    // non-record data, which is what finally failed the checksum
-    // check and looked like where the log "ended."
     let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
     let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
     let this_seq: u32 = buf_read_u32(buf, 4 as u32);
     let block_ok: i64 = if (rd_status != 0) || (stored_checksum != computed_checksum) || (this_seq == (0 as u32)) { 0 } else { 1 };
     if block_ok == 0 {
       let _ = dharafs_badblock_mark(blk);
-      consecutive_bad = consecutive_bad + 1;
       diag_total_bad = diag_total_bad + 1;
-      if consecutive_bad > diag_max_run {
-        diag_max_run = consecutive_bad;
-      }
-      // 2026-10-31: periodic flush of newly-discovered bad blocks,
-      // every 64 (not every single one -- dharafs_badblock_bitmap_
-      // persist() is a real SD write per dirty half, and this scan
-      // can discover hundreds in one pass on a genuinely degrading
-      // card; flushing after literally every mark would multiply
-      // this boot's own write cost by that same hundreds factor).
-      // Root-cause fix for a real vicious cycle hit live tonight: a
-      // newly-discovered bad block was previously only persisted at
-      // the 3 existing flush points (compact/shutdown/reboot) -- a
-      // watchdog reset mid-scan (exactly what a slow, bad-block-heavy
-      // scan risks) lost EVERY discovery since the last flush, forcing
-      // full real-SD-retry-cost rediscovery of all of them again next
-      // boot. Bounding the loss to at most 64 blocks' worth, at the
-      // cost of ~(total_bad/64) extra writes total, matches real NAND
-      // bad-block-table practice (nand_update_bbt commits promptly on
-      // a newly-found failure, not deferred indefinitely).
       if (diag_total_bad % 64) == 0 {
         let _ = dharafs_badblock_bitmap_persist(0 as u32);
       }
       blk = blk + 1;
     } else {
-    consecutive_bad = 0;
     let this_path_len: u32 = buf_read_u32(buf, 8 as u32);
     if this_path_len == dharafs_tx_begin_sentinel() {
-      // Round 52: a transaction marker -- see dharafs_tx_begin_raw's
-      // own comment for why "are the next block_count blocks all
-      // present and checksum-valid" is a complete completion proof.
-      // buf's own contents (this_seq, block_count) are already
-      // captured into locals below before this loop starts reusing
-      // buf for each follow-up block's own read.
       let block_count: i64 = buf_read_u32(buf, 44 as u32) as i64;
       let tx_ok: i64 = 1;
       let j: i64 = 1;
@@ -11724,18 +11766,7 @@ fn dharafs_init() -> i64 {
         j = j + 1;
       }
       if tx_ok == 1 {
-        // Every block's seq is assigned sequentially (dharafs_state_
-        // set always advances by exactly the number of blocks just
-        // written), so the group's own highest seq is this_seq +
-        // block_count without needing to re-read each one.
         highest_seq = this_seq + (block_count as u32);
-        // Index every block this confirmed-complete transaction
-        // covers -- these are real file records too (e.g. dharafs_
-        // rename's own append+tombstone pair), just as eligible for
-        // the fast lookup path as any standalone record. Re-read
-        // rather than reuse buf from the verification loop above,
-        // since that loop only left the LAST checked block's bytes
-        // in buf, not every one of them.
         let jj: i64 = 1;
         while jj <= block_count {
           let idx_blk: i64 = blk + jj;
@@ -11749,13 +11780,11 @@ fn dharafs_init() -> i64 {
         blk = blk + 1 + block_count;
         next_free_blk = blk;
       } else {
-        // Incomplete -- stop scanning HERE, before even counting the
-        // tx_begin record itself. Nothing after this point in the log
-        // can be trusted (a crash stops everything; no further real
-        // append could have happened after an incomplete transaction
-        // within this same boot), so this is also just where the scan
-        // would need to stop anyway, not an extra restriction.
-        break;
+        // Same as the old inline scan's own "incomplete group" case:
+        // nothing past this point can be trusted (a crash stops
+        // everything). This IS the true end of the log -- treat it
+        // exactly like reaching max_blk, below.
+        blk = max_blk;
       }
     } else {
       if this_seq > highest_seq {
@@ -11768,43 +11797,33 @@ fn dharafs_init() -> i64 {
     }
     }
   }
-  // DharaFS Phase 2 (2026-10-25): persist any newly-discovered bad
-  // blocks from this scan back to SD -- a no-op (no write at all) if
-  // nothing changed, see dharafs_badblock_bitmap_persist's own header
-  // comment.
-  let _ = dharafs_badblock_bitmap_persist(1 as u32);
-  let _ = dharafs_suspect_table_persist();
-  let _ = uart_puts("DharaFS: checkpoint ");
-  if checkpoint.valid == 1 {
-    let _ = uart_puts("TRUSTED gen=");
-    let _ = uart_put_hex32(checkpoint.generation);
-    let _ = uart_puts(" scan_start=");
-  } else {
-    let _ = uart_puts("not present/invalid, full scan_start=");
+  let _ = dharafs_recovery_scan_cursor_set(blk as u32);
+  let _ = dharafs_recovery_next_free_blk_found_set(next_free_blk as u32);
+  let _ = dharafs_recovery_highest_seq_found_set(highest_seq);
+  if blk >= max_blk {
+    let _ = dharafs_badblock_bitmap_persist(1 as u32);
+    let _ = dharafs_suspect_table_persist();
+    let _ = dharafs_state_set(next_free_blk as u32, highest_seq + (1 as u32));
+    let _ = dharafs_recovery_active_set(0 as u32);
+    let _ = uart_puts("DharaFS: background recovery scan complete. next_block=");
+    let _ = uart_put_hex32(next_free_blk as u32);
+    let _ = uart_puts(" highest_seq=");
+    let _ = uart_put_hex32(highest_seq);
+    let _ = uart_puts(" -- reads/writes/deletes/renames fully available.\n");
+    // Establish a fresh (not clean -- this boot never reached a clean
+    // shutdown/reboot) checkpoint now that the true tail is finally
+    // known, same write shape dharafs_compact's own pass-completion
+    // step already uses. This is what actually breaks the catch-22 a
+    // checkpoint-less card is otherwise stuck in (no checkpoint ->
+    // always full recovery -> never finishes long enough to run
+    // `shutdown` and finally get one): the VERY NEXT boot, even with
+    // no explicit shutdown/reboot in between, now gets Tier 2 instead
+    // of another full background scan.
+    let ckpt_lookup: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+    let ckpt_slot: i64 = if ckpt_lookup.valid == 1 { dharafs_checkpoint_next_slot(ref ckpt_lookup) } else { 0 };
+    let ckpt_gen: u32 = if ckpt_lookup.valid == 1 { ckpt_lookup.generation + (1 as u32) } else { 1 as u32 };
+    let _ = dharafs_checkpoint_write(ckpt_gen, dharafs_state_get_log_start(), next_free_blk as u32, ckpt_slot, 0 as u32, highest_seq + (1 as u32), dharafs_write_cursor_last_generation_get());
   }
-  let _ = uart_put_hex32(scan_start_blk);
-  let _ = uart_puts("\n");
-  let _ = uart_puts("RECOVERY SUMMARY final_blk=");
-  let _ = uart_put_hex32(blk as u32);
-  let _ = uart_puts(" total_bad=");
-  let _ = uart_put_hex32(diag_total_bad as u32);
-  let _ = uart_puts(" max_run=");
-  let _ = uart_put_hex32(diag_max_run as u32);
-  let _ = uart_puts(" highest_seq=");
-  let _ = uart_put_hex32(highest_seq);
-  let _ = uart_puts("\n");
-  let _ = dharafs_state_set(next_free_blk as u32, highest_seq + (1 as u32));
-  // DharaFS persisted-checkpoint plan, Phase 1 (2026-10-24): log_start
-  // used to always reset to 1 on boot -- now it resets to wherever
-  // THIS scan actually started (block 1 with no valid checkpoint,
-  // exactly as before; the checkpoint's own log_start when one was
-  // trusted), not a hardcoded 1 that would silently throw away the
-  // whole point of skipping a scanned-and-proven-dead prefix. Either
-  // way this stays an in-RAM-only value for the REST of this boot --
-  // only dharafs_compact() advancing it further, and persisting that
-  // advance via a new checkpoint write, is what lets a FUTURE boot
-  // start even later than this one did.
-  let _ = dharafs_state_set_log_start(scan_start_blk);
   return 0;
 }
 
@@ -12450,6 +12469,20 @@ fn dharafs_attr_check_write(path_buf: mut ref i64, path_len: i64, data_buf: mut 
 }
 
 fn dharafs_write_raw_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  // RTOS-boot-time hardening round (2026-11-01): checked BEFORE
+  // anything else, including the stat lookup just below -- dirindex
+  // may not have reached this exact path yet while a background
+  // recovery scan is still running (see dharafs_init's own matching
+  // comment), so a stat "not found" during this window could be
+  // genuinely wrong (the file exists, just not yet discovered), not
+  // a real absence. Refusing outright rather than risking silently
+  // treating an existing file as brand new is the whole point of this
+  // gate -- see dharafs_recovery_active's own header comment
+  // (boot/dharafs_state.S) for why ALL writes, not a subset, are
+  // refused during this window.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0 - 3;
+  }
   let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
   let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
   let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { req_uid };
@@ -12485,6 +12518,11 @@ fn dharafs_write_raw_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut
 }
 
 fn dharafs_delete_raw_checked(path_buf: mut ref i64, path_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  // See dharafs_write_raw_checked's own matching comment -- same
+  // reasoning, same fix.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0 - 3;
+  }
   let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
   let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
   if stat_status != 0 {
@@ -12530,6 +12568,14 @@ fn dharafs_delete_raw_checked(path_buf: mut ref i64, path_len: i64, req_uid: u32
 // rename_source/dharafs_mode_blocks_overwrite's own comments for
 // exactly which attribute blocks which side of a rename.
 fn dharafs_rename_raw_checked(old_path_buf: mut ref i64, old_path_len: i64, new_path_buf: mut ref i64, new_path_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  // See dharafs_write_raw_checked's own matching comment -- same
+  // reasoning. Checked here too, not just inside dharafs_tx_begin_raw
+  // below: the stat lookups just below this gate could ALSO be wrong
+  // during incomplete recovery (an existing destination path looking
+  // like it doesn't exist yet), not just the final tx_begin write.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0 - 3;
+  }
   let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
   let stat_status: i64 = dharafs_stat_raw(old_path_buf, old_path_len, meta_buf);
   if stat_status != 0 {
@@ -12631,6 +12677,12 @@ fn dharafs_chown(path: Str, uid: u32, gid: u32) -> i64 {
 // write permission says nothing about who may change ITS permission
 // bits).
 fn dharafs_chmod_checked(path_buf: mut ref i64, path_len: i64, new_mode: u32, req_uid: u32, _req_gid: u32) -> i64 {
+  // See dharafs_write_raw_checked's own matching comment -- same
+  // reasoning (this function reads-then-re-appends via dharafs_
+  // append_raw below, a real write-shaped operation).
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0 - 3;
+  }
   let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
   let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
   if stat_status != 0 {
@@ -12654,6 +12706,11 @@ fn dharafs_chmod_checked(path_buf: mut ref i64, path_len: i64, new_mode: u32, re
 // else or claim someone else's file, so there's no owner exemption
 // here the way chmod has one.
 fn dharafs_chown_checked(path_buf: mut ref i64, path_len: i64, new_uid: u32, new_gid: u32, req_uid: u32, _req_gid: u32) -> i64 {
+  // See dharafs_write_raw_checked's own matching comment -- same
+  // reasoning.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0 - 3;
+  }
   let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
   let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
   if stat_status != 0 {
@@ -15694,6 +15751,13 @@ fn dharafs_tx_begin_sentinel() -> u32 {
 }
 
 fn dharafs_tx_begin_raw(block_count: i64) -> i64 {
+  // See dharafs_write_raw_checked's own matching comment -- same
+  // reasoning. This raw primitive's own existing convention is a
+  // plain `1` generic failure (not the checked family's -1/-2/-3/-4),
+  // matched here rather than introducing a mismatched code.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 1;
+  }
   let buf: mut ref i64 = dharafs_sd_scratch_get();
   let next_block: u32 = dharafs_state_get_next_block();
   let next_seq: u32 = dharafs_state_get_next_seq();
@@ -15921,6 +15985,11 @@ fn dharafs_write_verified_raw(path_buf: mut ref i64, path_len: i64, data_buf: mu
 // and write-permission logic to dharafs_write_raw_checked, just also
 // carrying the digest write through dharafs_write_verified_raw above.
 fn dharafs_write_verified_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  // See dharafs_write_raw_checked's own matching comment -- same
+  // reasoning.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0 - 3;
+  }
   let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
   let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
   let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { req_uid };
@@ -34199,7 +34268,22 @@ fn task_e() -> i64 {
   let dhcp_my_mac: mut ref i64 = dhruva_alloc_bytes(8);
   let _ = netif_get_mac(dhcp_my_mac);
   while true {
-    let _ = task_sleep_ticks(20);
+    // RTOS-boot-time hardening, follow-up (2026-11-01): while a
+    // background recovery scan is active, this task's own normal 20-
+    // tick (10s) maintenance cadence -- fine for compaction's low
+    // urgency -- would otherwise delay EVERY recovery continuation call
+    // by up to 10s each, including the very first one right after boot,
+    // when nothing has actually started scanning yet and every write in
+    // the system is blocked waiting on it. Recovery is urgent (see
+    // dharafs_init's own write-gating comment); drop to the scheduler's
+    // own minimum sleep (1 tick) for as long as recovery_active stays
+    // set, so the time-bounded dharafs_recovery_scan_continue calls
+    // (see that function's own budget comment) run back-to-back instead
+    // of 10 seconds apart. Reverts to the normal 20-tick cadence the
+    // moment recovery completes -- this never changes compaction's own
+    // behavior or cost.
+    let task_e_sleep_ticks: i64 = if dharafs_recovery_active_get() == (1 as u32) { 1 } else { 20 };
+    let _ = task_sleep_ticks(task_e_sleep_ticks);
     // 2026-10-23 (real-HW kernelupload-stream stall ROOT CAUSE, user
     // request: "scheduler should be smart enough to know precedence
     // processes... maintenance mode during OTA or UART update"):
@@ -34272,12 +34356,26 @@ fn task_e() -> i64 {
       let _ = uart_put_hex32(current_eff_prio());
       let _ = uart_puts("\n");
     }
+    // RTOS-boot-time hardening round (2026-11-01): while a background
+    // recovery scan is active (Tier 1/2 both failed to apply at boot,
+    // see dharafs_init's own matching comment), this slot does a
+    // bounded chunk of THAT instead of compaction -- compacting a log
+    // whose own true tail isn't known yet doesn't mean anything, and
+    // would fight over next_block/log_start with the scan still in
+    // progress. The /config/mode diagnostic read below is skipped too
+    // for the same reason: dirindex may not have reached that path
+    // yet, and a "not found" here would be a confusing false negative,
+    // not a real diagnostic signal.
+    if dharafs_recovery_active_get() == (1 as u32) {
+      let _ = dharafs_recovery_scan_continue(gc_buf, dharafs_recovery_scan_budget_us());
+    } else {
     let _ = dharafs_compact(compact_buf, compact_path_buf, compact_data_buf);
     let gc_mode_len: i64 = dharafs_read("/config/mode", gc_buf);
     if gc_log == 1 {
       let _ = uart_puts("GC: compaction pass, /config/mode = \"");
       let _ = dharafs_print_data(gc_buf, gc_mode_len);
       let _ = uart_puts("\"\n");
+    }
     }
     let gc_dharafs_t1: u32 = mmio_read_u32(TIMER_CLO);
     let _ = dhruva_prio_unlock(3);
@@ -39027,6 +39125,9 @@ fn shell_dispatch() -> i64 {
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
+      if status == (0 - 3) {
+        let _ = uart_puts("error: recovery scan still in progress, try again shortly\n");
+      } else {
       if status == (0 - 2) {
         let _ = uart_puts("permission denied\n");
       } else {
@@ -39035,6 +39136,7 @@ fn shell_dispatch() -> i64 {
         } else {
           let _ = uart_puts("error\n");
         }
+      }
       }
     }
     return 0;
@@ -39088,6 +39190,9 @@ fn shell_dispatch() -> i64 {
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
+      if status == (0 - 3) {
+        let _ = uart_puts("error: recovery scan still in progress, try again shortly\n");
+      } else {
       if status == (0 - 2) {
         let _ = uart_puts("permission denied\n");
       } else {
@@ -39096,6 +39201,7 @@ fn shell_dispatch() -> i64 {
         } else {
           let _ = uart_puts("error\n");
         }
+      }
       }
     }
     return 0;
@@ -39177,6 +39283,9 @@ fn shell_dispatch() -> i64 {
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
+      if status == (0 - 3) {
+        let _ = uart_puts("error: recovery scan still in progress, try again shortly\n");
+      } else {
       if status == (0 - 2) {
         let _ = uart_puts("permission denied\n");
       } else {
@@ -39185,6 +39294,7 @@ fn shell_dispatch() -> i64 {
         } else {
           let _ = uart_puts("error\n");
         }
+      }
       }
     }
     return 0;
@@ -39228,6 +39338,9 @@ fn shell_dispatch() -> i64 {
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
+      if status == (0 - 3) {
+        let _ = uart_puts("error: recovery scan still in progress, try again shortly\n");
+      } else {
       if status == (0 - 2) {
         let _ = uart_puts("permission denied\n");
       } else {
@@ -39240,6 +39353,7 @@ fn shell_dispatch() -> i64 {
             let _ = uart_puts("error\n");
           }
         }
+      }
       }
     }
     return 0;
@@ -39387,6 +39501,9 @@ fn shell_dispatch() -> i64 {
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
+      if status == (0 - 3) {
+        let _ = uart_puts("error: recovery scan still in progress, try again shortly\n");
+      } else {
       if status == (0 - 2) {
         let _ = uart_puts("permission denied\n");
       } else {
@@ -39395,6 +39512,7 @@ fn shell_dispatch() -> i64 {
         } else {
           let _ = uart_puts("error\n");
         }
+      }
       }
     }
     return 0;
@@ -39439,6 +39557,9 @@ fn shell_dispatch() -> i64 {
     if status == 0 {
       let _ = uart_puts("ok\n");
     } else {
+      if status == (0 - 3) {
+        let _ = uart_puts("error: recovery scan still in progress, try again shortly\n");
+      } else {
       if status == (0 - 2) {
         let _ = uart_puts("permission denied\n");
       } else {
@@ -39447,6 +39568,7 @@ fn shell_dispatch() -> i64 {
         } else {
           let _ = uart_puts("error\n");
         }
+      }
       }
     }
     return 0;
@@ -40114,6 +40236,23 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("  FS commits: ");
     let _ = uart_put_i64(dharafs_commit_count_get() as i64);
     let _ = uart_puts(" total (successful dharafs_block_write calls)\n");
+
+    // RTOS-boot-time hardening round (2026-11-01): the one place other
+    // code (or a human) can check the status the "CAN/CANNOT" boot
+    // warning already promised was queryable -- see dharafs_init's own
+    // matching comment. Style-matches shell_dispatch_dharafs_catchup's
+    // own "calls=.../resume_block=..." progress line above.
+    let _ = uart_puts("  recovery: ");
+    if dharafs_recovery_active_get() == (1 as u32) {
+      let _ = uart_puts("IN PROGRESS (scanned ");
+      let _ = uart_put_hex32(dharafs_recovery_scan_cursor_get());
+      let _ = uart_puts(" / ");
+      let _ = uart_put_i64(dharafs_log_max_blk());
+      let _ = uart_puts(" blocks) -- reads of not-yet-scanned paths may return \"not found\";\n");
+      let _ = uart_puts("    all writes/deletes/renames refused until complete\n");
+    } else {
+      let _ = uart_puts("complete\n");
+    }
 
     // Round 53: real scheduler/interrupt activity counters -- see
     // docs/TODO.md for why a deadline/priority-inversion model isn't

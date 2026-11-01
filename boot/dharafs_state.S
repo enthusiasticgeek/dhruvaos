@@ -517,3 +517,99 @@ dharafs_badblock_bitmap_half1_last_pool_slot_set:
     str r0, [r1]
     mov r0, #0
     bx lr
+
+/* RTOS-boot-time hardening round (2026-11-01): dharafs_init's own
+ * Tier 3 (full exhaustive scan) no longer runs inline during boot at
+ * all -- a safety-critical RTOS boot path must not block on a
+ * background-shaped concern, not even for a bounded "budget" (a
+ * severely degraded real card took 10+ minutes for this scan with no
+ * ceiling at all before this round). This state is what makes the
+ * scan resumable as a background task (task_e, every 10s) instead.
+ * Deliberately RAM-only, never persisted to SD -- per this project's
+ * own "fs should be resilient to wear" standing directive, a reboot
+ * mid-background-scan just restarts the scan cleanly next boot; this
+ * is pure bookkeeping, not data, and persisting it would just be
+ * another hot, frequently-rewritten block waiting to wear out like
+ * the ones this same round's own earlier wear-leveling fix closed. */
+.section ".bss"
+.align 4
+dharafs_recovery_active:
+    .word 0        /* 0 = no background recovery scan in progress
+                     * (either never needed -- Tier 1/2 applied -- or
+                     * already completed); 1 = Tier 1/2 both failed to
+                     * apply and dharafs_recovery_scan_continue is
+                     * still working through the log in the
+                     * background. Checked by dharafs_write_raw_
+                     * checked/dharafs_delete_raw_checked/dharafs_tx_
+                     * begin_raw (refuse with a clear error while 1)
+                     * and by task_e (skip dharafs_compact, run the
+                     * recovery continuation instead, while 1). */
+dharafs_recovery_scan_cursor:
+    .word 0        /* Next block dharafs_recovery_scan_continue should
+                     * examine -- the exact same role `blk` played as a
+                     * plain local in the old inline scan loop, just
+                     * now surviving across many bounded task_e calls
+                     * instead of one single-shot function call. */
+dharafs_recovery_next_free_blk_found:
+    .word 0        /* Mirrors `next_free_blk` from the old inline scan
+                     * loop: one past the last GENUINELY LIVE record
+                     * found so far, never advanced by a bad-block
+                     * skip. Becomes the real dharafs_next_block once
+                     * the scan completes. */
+dharafs_recovery_highest_seq_found:
+    .word 0        /* Mirrors `highest_seq` from the old inline scan
+                     * loop likewise. */
+
+.section ".text"
+
+.global dharafs_recovery_active_get
+dharafs_recovery_active_get:
+    ldr r0, =dharafs_recovery_active
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_recovery_active_set
+dharafs_recovery_active_set:
+    ldr r1, =dharafs_recovery_active
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_recovery_scan_cursor_get
+dharafs_recovery_scan_cursor_get:
+    ldr r0, =dharafs_recovery_scan_cursor
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_recovery_scan_cursor_set
+dharafs_recovery_scan_cursor_set:
+    ldr r1, =dharafs_recovery_scan_cursor
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_recovery_next_free_blk_found_get
+dharafs_recovery_next_free_blk_found_get:
+    ldr r0, =dharafs_recovery_next_free_blk_found
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_recovery_next_free_blk_found_set
+dharafs_recovery_next_free_blk_found_set:
+    ldr r1, =dharafs_recovery_next_free_blk_found
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_recovery_highest_seq_found_get
+dharafs_recovery_highest_seq_found_get:
+    ldr r0, =dharafs_recovery_highest_seq_found
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_recovery_highest_seq_found_set
+dharafs_recovery_highest_seq_found_set:
+    ldr r1, =dharafs_recovery_highest_seq_found
+    str r0, [r1]
+    mov r0, #0
+    bx lr

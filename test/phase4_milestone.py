@@ -156,6 +156,45 @@ def _wait_for_boot_ready(proc: "subprocess.Popen[bytes]", timeout_s: float) -> b
     return buf
 
 
+# RTOS-boot-time hardening round (2026-11-01): kernel_main.vani's
+# dharafs_init no longer runs Tier 3's exhaustive scan inline during
+# boot at all (see that function's own header comment) -- boot now
+# reaches PASS almost immediately even on a genuinely fresh SD image,
+# which this function creates from scratch every run. The SAME total
+# recovery work that used to make boot itself slow (see this file's own
+# "DharaFS Phase 2 regression" comment above, ~33s to PASS on a fresh
+# image under the OLD design) still has to happen -- it just happens in
+# the BACKGROUND (task_e) now, with writes/deletes/renames correctly
+# refused (status -3, "recovery scan still in progress") until it
+# finishes. This is the new design's own explicit, approved behavior,
+# not a bug: the single most important thing it set out to prove is that
+# the OLD cost doesn't block BOOT anymore, not that it vanished. Exactly
+# the same "wait for a real event instead of a blind sleep" fix this
+# file's own history already applied to boot-readiness now applies here
+# too -- wait for the kernel's own "background recovery scan complete"
+# marker (only printed at all if the warning was seen, i.e. Tier 1/2
+# didn't apply) before issuing the write this milestone depends on.
+def _wait_for_recovery_complete(proc: "subprocess.Popen[bytes]", prefix: bytes, timeout_s: float) -> bytes:
+    buf = prefix
+    if b"background recovery scan complete" in buf:
+        return buf
+    if b"recovery is running in the background" not in buf:
+        return buf  # Tier 1/2 applied -- no recovery window to wait out
+    deadline = time.time() + timeout_s
+    while b"background recovery scan complete" not in buf:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not ready:
+            break
+        chunk = proc.stdout.read(1)
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
 def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
     with open(sd_image_path, "wb") as f:
         f.truncate(64 * 1024 * 1024)
@@ -176,6 +215,7 @@ def run_milestone(elf_path: str, sd_image_path: str) -> tuple[bool, str]:
         proc.stdin.flush()
 
     boot_prefix = _wait_for_boot_ready(proc, BOOT_READY_TIMEOUT_S)
+    boot_prefix = _wait_for_recovery_complete(proc, boot_prefix, BOOT_READY_TIMEOUT_S)
     send("write /milestone/note hello-dhruva")
     time.sleep(SETTLE_S)
     send("cat /milestone/note")
