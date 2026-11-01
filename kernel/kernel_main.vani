@@ -26269,6 +26269,23 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
     let _ = kernlog_write_usb_regs("USB DATA stage failed", data_result);
     return 0 - 1;
   }
+  // BUG FIX (2026-11-01, real-HW root cause of LAN9512 register reads
+  // never observing a bit change): dwc2_control_out carefully places
+  // mem_barrier() around every DMA-touching write in this same file,
+  // but this DATA-stage READ path never had the opposite-direction
+  // equivalent -- the DWC2 controller's own DMA engine writes the
+  // device's response INTO `dma` as a separate bus master, and
+  // nothing synchronized that write with this function's own
+  // immediately-following CPU read of the same memory. Confirmed live
+  // on real hardware: lan9512_reg_read's own HW_CFG lite-reset poll
+  // read back the SAME value (reset bit still set) across every
+  // single attempt, through multiple separate control-transfer calls,
+  // never converging -- consistent with the CPU reading stale/cached
+  // memory instead of the DMA engine's own freshly-written response.
+  // Same mem_barrier() (DSB) this file already uses for the opposite
+  // (CPU-write-before-DMA-read) direction, matching dwc2_control_out's
+  // own already-correct precedent.
+  let _ = mem_barrier();
   let i: i64 = 0;
   let want_len_i: i64 = want_len as i64;
   while i < want_len_i {
@@ -28609,6 +28626,12 @@ fn dwc2_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> 
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
+  // BUG FIX (2026-11-01): sibling of dwc2_control_in's own matching
+  // fix -- see that function's own comment for the full "why" (a
+  // missing mem_barrier() between the DMA engine's write of the
+  // device's response and this function's own CPU read of the same
+  // memory).
+  let _ = mem_barrier();
   let i: i64 = 0;
   while i < want_len {
     let b: u32 = buf_read_byte(dma, i as u32);
@@ -28860,6 +28883,9 @@ fn dwc2_net_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64)
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
+  // BUG FIX (2026-11-01): sibling of dwc2_control_in's own matching
+  // fix -- see that function's own comment for the full "why".
+  let _ = mem_barrier();
   // dwc2_control_in never needed this (every control transfer it
   // issues asks for an exact, already-known length and trusts
   // XFERCOMPL alone) -- this is this driver's first genuine short-read
@@ -28958,6 +28984,9 @@ fn dwc2_wifi_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
+  // BUG FIX (2026-11-01): sibling of dwc2_control_in's own matching
+  // fix -- see that function's own comment for the full "why".
+  let _ = mem_barrier();
   let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
   let bytes_left: u32 = hctsiz_after & (0x7FFFF as u32);
   let actual_len: i64 = want_len - (bytes_left as i64);
@@ -29654,6 +29683,9 @@ fn dwc2_bt_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) 
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
+  // BUG FIX (2026-11-01): sibling of dwc2_control_in's own matching
+  // fix -- see that function's own comment for the full "why".
+  let _ = mem_barrier();
   let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
   let bytes_left: u32 = hctsiz_after & (0x7FFFF as u32);
   let actual_len: i64 = want_len - (bytes_left as i64);
@@ -31376,6 +31408,9 @@ fn dwc2_hci_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len:
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
+  // BUG FIX (2026-11-01): sibling of dwc2_control_in's own matching
+  // fix -- see that function's own comment for the full "why".
+  let _ = mem_barrier();
   let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
   let bytes_left: u32 = hctsiz_after & (0x7FFFF as u32);
   let actual_len: i64 = want_len - (bytes_left as i64);
@@ -31426,6 +31461,9 @@ fn dwc2_hid_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len:
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
+  // BUG FIX (2026-11-01): sibling of dwc2_control_in's own matching
+  // fix -- see that function's own comment for the full "why".
+  let _ = mem_barrier();
   let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
   let bytes_left: u32 = hctsiz_after & (0x7FFFF as u32);
   let actual_len: i64 = want_len - (bytes_left as i64);
