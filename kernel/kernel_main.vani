@@ -12961,6 +12961,16 @@ fn dharafs_find_latest_block(path: Str) -> i64 {
 // scan, which is fine for a cold, infrequent snapshot-query
 // operation, unlike the hot path dirindex accelerates.
 fn dharafs_find_block_as_of_raw(path_buf: mut ref i64, path_len: i64, max_seq: u32) -> i64 {
+  // RTOS-boot-time hardening round (2026-11-01), sibling audit: same
+  // bug class as dharafs_find_latest_block_raw's own matching fix --
+  // next_block sits at a deliberate placeholder while a background
+  // recovery scan is active, so this would otherwise pay a full
+  // unbounded scan of the entire as-yet-unscanned range. A snapshot
+  // query during this window can't give a trustworthy answer anyway
+  // (the full history isn't known yet), so fail fast the same way.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0 - 1;
+  }
   let next_block: u32 = dharafs_state_get_next_block();
   let buf: mut ref i64 = dharafs_sd_scratch_get();
   let best_block: i64 = 0 - 1;
@@ -13111,6 +13121,12 @@ fn dharafs_snapshot_pinned_seq_raw(name_buf: mut ref i64, name_len: i64) -> i64 
 // versions). Returns -1 if no such record exists (after_seq's record
 // is still the newest one for this path).
 fn dharafs_find_next_seq_for_path_raw(path_buf: mut ref i64, path_len: i64, after_seq: u32) -> i64 {
+  // RTOS-boot-time hardening round (2026-11-01), sibling audit: same
+  // reasoning and fix as dharafs_find_block_as_of_raw's own matching
+  // guard just above -- see that one for the full "why."
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0 - 1;
+  }
   let next_block: u32 = dharafs_state_get_next_block();
   let buf: mut ref i64 = dharafs_sd_scratch_get();
   let found: i64 = 0;
@@ -16573,6 +16589,14 @@ fn dharafs_dirlist_segment_equals(query_buf: mut ref i64, query_len: i64, path_b
 // (see dharafs_read's own doc comment on why it got consolidated).
 // Returns (query mode only): 0 = no match, 1 = file, 2 = directory.
 fn dharafs_list_dir_raw(dir_buf: mut ref i64, dir_len: i64, query_buf: mut ref i64, query_len: i64) -> i64 {
+  // RTOS-boot-time hardening round (2026-11-01), sibling audit: same
+  // bug class and fix as dharafs_find_latest_block_raw's own matching
+  // guard -- a classification query during active recovery can't be
+  // trusted anyway (not everything has been scanned yet), so return
+  // the honest "no match" rather than pay a full unbounded scan.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0;
+  }
   let skip_len: i64 = if dir_len == 0 { 1 } else { dir_len + 1 };
   let next_block: u32 = dharafs_state_get_next_block();
   let log_start: u32 = dharafs_state_get_log_start();
@@ -16971,6 +16995,16 @@ fn dharafs_directory_hierarchy_self_test() -> i64 {
 }
 
 fn dharafs_list(prefix: Str) -> i64 {
+  // RTOS-boot-time hardening round (2026-11-01), sibling audit: same
+  // bug class and fix as dharafs_find_latest_block_raw's own matching
+  // guard -- a listing during active recovery can't be trusted anyway
+  // (not everything has been scanned yet), so say so plainly and skip
+  // the otherwise-unbounded full scan rather than silently return an
+  // incomplete list (or, on a degraded card, stall for a long time).
+  if dharafs_recovery_active_get() == (1 as u32) {
+    let _ = uart_puts("  (recovery scan in progress -- listing unavailable until complete; see 'diagnose')\n");
+    return 0;
+  }
   let prefix_len: i64 = str_len_bytes(prefix);
   let next_block: u32 = dharafs_state_get_next_block();
   let log_start: u32 = dharafs_state_get_log_start();
@@ -17739,7 +17773,17 @@ fn scheduling_decision_prelude() -> i64 {
     let spn_pending: u32 = spn_shadow_predicted_task_get();
     let spn_ctxsw_now: u32 = context_switch_count_get() as u32;
     let spn_ctxsw_baseline: u32 = spn_shadow_ctxsw_baseline_get();
-    let spn_delta: u32 = spn_ctxsw_now - spn_ctxsw_baseline;
+    // BUG FIX (2026-11-01): same sibling bug class as the TIMER_CLO
+    // sites fixed this round, applied here too for consistency -- a
+    // plain `-` on a monotonically-growing u32 counter (context_
+    // switch_count) traps if the counter ever wraps between baseline
+    // and now. Called on every scheduling decision for the system's
+    // entire uptime; a ~4.29 billion-context-switch wrap is a much
+    // longer-period risk than the TIMER_CLO sites (plausible only
+    // after a very long deployment, not within any realistic test
+    // session), but this project's own standing policy is wrapping_sub
+    // for any such delta, not just the ones already observed to fail.
+    let spn_delta: u32 = wrapping_sub(spn_ctxsw_now, spn_ctxsw_baseline);
     // ROUND 2026-09-20 (task #273): real, live-observed false-positive
     // fixed here -- a genuine timer FIQ can preempt an in-progress
     // irq_dispatch (UART RX) mid-flight, since taking an ordinary IRQ
@@ -17852,7 +17896,13 @@ fn scheduling_decision_prelude() -> i64 {
     if hb_bound != (0 as u32) {
       let hb_now: u32 = scheduler_get_tick_count();
       let hb_last: u32 = task_heartbeat_last_tick_table_get_at(hb_i as u32);
-      let hb_elapsed: u32 = hb_now - hb_last;
+      // BUG FIX (2026-11-01): same sibling bug class, applied for
+      // consistency -- scheduler_get_tick_count() is a 500ms-tick u32
+      // counter, wrapping only after ~34 years of uptime (far beyond
+      // any realistic risk), but this project's own standing policy is
+      // wrapping_sub for any such delta rather than relying on the
+      // wrap period alone to argue safety.
+      let hb_elapsed: u32 = wrapping_sub(hb_now, hb_last);
       if hb_elapsed >= hb_bound {
         let _ = task_heartbeat_stuck_count_table_increment_at(hb_i as u32);
         let _ = task_heartbeat_last_tick_table_set_at(hb_i as u32, hb_now);
@@ -18238,7 +18288,16 @@ fn timer_tick_dispatch() -> i64 {
   }
 
   let irq_t1: u32 = mmio_read_u32(TIMER_CLO);
-  let irq_elapsed: u32 = irq_t1 - irq_t0;
+  // BUG FIX (2026-11-01): same sibling bug class as kernelupload_
+  // accumulate_bytes's own matching fix -- plain `-` on two TIMER_CLO
+  // microsecond snapshots, here on EVERY SINGLE IRQ for the system's
+  // entire uptime, not just during a kernelupload stream. The single
+  // highest-exposure site of this whole bug class: any board left
+  // running past a ~71.6-minute TIMER_CLO wrap boundary would
+  // eventually take an ordinary interrupt whose irq_t0/irq_t1 straddle
+  // it and panic, completely unrelated to whatever that interrupt
+  // actually was.
+  let irq_elapsed: u32 = wrapping_sub(irq_t1, irq_t0);
   let irq_worst: u32 = irq_tick_worst_us_get();
   if irq_elapsed > irq_worst {
     let _ = irq_tick_worst_us_set(irq_elapsed);
@@ -36645,7 +36704,19 @@ fn kernelupload_accumulate_bytes(src_buf: mut ref i64, count: i64) -> i64 {
       let sdw_t0: u32 = mmio_read_u32(TIMER_CLO);
       let wstatus: i64 = sdhost_write_block(base_block + block_index, block_buf);
       let sdw_t1: u32 = mmio_read_u32(TIMER_CLO);
-      let sdw_us: u32 = sdw_t1 - sdw_t0;
+      // BUG FIX (2026-11-01, real-HW kernelupload panic root-cause):
+      // sibling of the already-fixed f1aae2c bug (kernelupload's own
+      // FIQ-level stall-watchdog TIMER_CLO subtraction) -- same plain
+      // `-` on two TIMER_CLO microsecond snapshots, never converted to
+      // wrapping_sub here. TIMER_CLO wraps every ~71.6 minutes; this
+      // call runs on EVERY SD block write during a stream (once per
+      // 512 bytes), so a sufficiently long real transfer (or simply
+      // enough prior board uptime before the transfer even starts)
+      // will eventually have sdw_t0/sdw_t1 straddle a wrap boundary,
+      // tripping vani's unsigned-subtraction-underflow trap and
+      // panicking mid-upload with exactly the same "integer overflow
+      // in u32 add" message the already-fixed sibling produced.
+      let sdw_us: u32 = wrapping_sub(sdw_t1, sdw_t0);
       if sdw_us > kernelupload_sd_write_worst_us_get() {
         let _ = kernelupload_sd_write_worst_us_set(sdw_us);
       }
@@ -41538,7 +41609,12 @@ fn task_f() -> i64 {
         // bounding how long a dead connection can wedge the shell.
         let now_tick: u32 = scheduler_get_tick_count();
         let last_tick: u32 = kernelupload_stream_last_activity_tick_get();
-        if (now_tick - last_tick) > (20 as u32) {
+        // BUG FIX (2026-11-01): same sibling bug class fixed elsewhere
+        // this round -- plain `-` on a tick counter (same reasoning
+        // and same practically-34-year wrap period as task_heartbeat's
+        // own matching fix, kept consistent per this project's
+        // standing wrapping_sub policy).
+        if wrapping_sub(now_tick, last_tick) > (20 as u32) {
           // TASK #355/#356 follow-up (2026-10-15): live register dump
           // BEFORE declaring the abort, to root-cause a real-HW find --
           // a continuous, full-line-rate host transmission (confirmed
@@ -42009,7 +42085,13 @@ fn task_mutex_demo_high_wake_body() -> i64 {
   if t0 != (0 as u32) {
     let _ = mutex_handoff_t0_set(0 as u32);
     let t1: u32 = mmio_read_u32(TIMER_CLO);
-    let latency: u32 = t1 - t0;
+    // BUG FIX (2026-11-01): same sibling bug class -- plain `-` on two
+    // TIMER_CLO microsecond snapshots. This handoff-latency window is
+    // normally tiny (microseconds), but the mutex demo tasks run for
+    // the system's entire uptime, so a contended acquisition that
+    // happens to straddle a ~71.6-minute TIMER_CLO wrap boundary would
+    // still trap even though the real elapsed time is small.
+    let latency: u32 = wrapping_sub(t1, t0);
     let worst: u32 = mutex_handoff_worst_us_get();
     if latency > worst {
       let _ = mutex_handoff_worst_us_set(latency);
