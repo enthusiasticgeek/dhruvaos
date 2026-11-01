@@ -34577,38 +34577,36 @@ fn task_e() -> i64 {
     // usb_hotplug_poll/dhcp_client_poll below so a freshly-connected
     // boot-time device gets probed on task_e's very first opportunity.
     //
-    // HONEST SCHEDULABILITY CAVEAT, not silently glossed over: this
-    // call can genuinely take 100+ real seconds for a slow-to-wake
-    // device (live-measured this round: one boot's checkpoint13->14
-    // alone was 117s; a later boot exceeded 7 minutes). Holding DWC2_
-    // MUTEX_ID for that long DOES block every other task that needs
-    // it (HIGH/MEDIUM/LOW if they ever touch DWC2 work, sshd, ping,
-    // dhcp_client_poll) for the same duration -- test/schedulability_
-    // analysis.py's own gc_dhcp_poll_worst_case_ms (6.584ms) models
-    // this mutex's STEADY-STATE recurring hold time, not this one-time
-    // outlier, and was deliberately NOT changed to try to cover it:
-    // this event has no period and no deadline, so it doesn't fit that
-    // model's own periodic-task RTA framing, and forcing a number in
-    // would either wrongly reject an otherwise-fine steady-state
-    // design or require a genuinely different one-shot-event model
-    // this round didn't build. The honest comparison is against what
-    // ALREADY shipped, not against a theoretical zero-cost ideal: the
-    // OLD (just-replaced) design paid this exact same real-world delay
-    // synchronously on the boot path, before any task -- including
-    // HIGH/MEDIUM/LOW -- had even been created yet, so no periodic
-    // deadline existed to violate; moving it here is a net improvement
-    // for every part of the system that does NOT need DWC2_MUTEX_ID
-    // during this one-time window (boot reaches PASS immediately,
-    // DharaFS/shell/most commands work normally), at the cost of a
-    // real, acknowledged, boot-adjacent exception for the few that do.
-    // A fully rigorous fix would restructure dwc2_wait_chan0_done's own
-    // poll loop to release and reacquire this mutex between bounded
-    // chunks (mirroring dharafs_recovery_scan_continue's own pattern)
-    // -- scoped out this round as materially riskier surgery inside
-    // the already-tuned, 18+-round-hardened transfer-wait primitive;
-    // flagged here for a future round, not silently left undocumented.
+    // CORRECTED schedulability note (2026-11-01, follow-up to this
+    // same day's own first-pass comment, which overstated the risk):
+    // this call can genuinely take 100+ real seconds for a slow-to-
+    // wake device (live-measured: one boot's checkpoint13->14 alone
+    // was 117s; a later boot exceeded 7 minutes). Holding DWC2_MUTEX_
+    // ID that long is NOT a hard-real-time violation, though -- HIGH/
+    // MEDIUM/LOW (task_a/b/c, the only tasks test/schedulability_
+    // analysis.py actually models with deadlines) never touch DWC2_
+    // MUTEX_ID at all, confirmed by grepping every lock site. The only
+    // real consequence is a bounded, honest UX wait for a user-invoked,
+    // best-effort command that DOES need this same hardware (ping,
+    // sshtest, tcpecho -- task_f, deliberately never given a #[wcet]
+    // tag, so this was never a formally-guaranteed-fast path anyway).
+    // That's still worth being honest about, not silently accepted:
+    // maintenance_mode_engage()/_disengage() -- the exact mechanism
+    // this project already built for "a long exclusive hardware
+    // operation is in progress, defer around it" (kernelupload's own
+    // stream mode) -- is the right, already-proven tool for exactly
+    // this shape of problem, reused here rather than inventing a new
+    // one. It only gates background maintenance (task_e's own DHCP/
+    // hotplug poll, by its own header comment), not foreground shell
+    // commands -- but a foreground command blocking on a mutex for a
+    // bounded, one-time, clearly-announced reason is an honest wait,
+    // not a silent hang, which is what the print below exists for.
     if usb_probe0_pending_get() == (1 as u32) {
+      let _ = uart_puts("USB: background device0 probe starting -- ping/sshtest/tcpecho and\n");
+      let _ = uart_puts("  other USB-hardware commands may be delayed until it completes (see 'diagnose').\n");
+      let _ = maintenance_mode_engage();
       let probe_status: i64 = dwc2_probe_device0();
+      let _ = maintenance_mode_disengage();
       let _ = uart_puts("USB: background device0 probe complete, status=");
       let _ = uart_put_hex32(probe_status as u32);
       let _ = uart_puts(" (0=enumerated, nonzero=no response)\n");
@@ -36989,7 +36987,11 @@ fn maintenance_mode_is_active() -> u32 {
   }
   let last_touch: u32 = maintenance_mode_last_touch_tick_get();
   let now_tick: u32 = scheduler_get_tick_count();
-  if (now_tick - last_touch) > (MAINTENANCE_MODE_STALE_TICKS as u32) {
+  // BUG FIX (2026-11-01): same sibling bug class fixed elsewhere this
+  // round -- plain `-` on a tick counter, same ~34-year practical wrap
+  // period as task_heartbeat's own matching fix, kept consistent with
+  // this project's standing wrapping_sub policy.
+  if wrapping_sub(now_tick, last_touch) > (MAINTENANCE_MODE_STALE_TICKS as u32) {
     let _ = maintenance_mode_active_set(0 as u32);
     return 0 as u32;
   }
@@ -40436,6 +40438,17 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts("    all writes/deletes/renames refused until complete\n");
     } else {
       let _ = uart_puts("complete\n");
+    }
+
+    // RTOS-boot-time hardening round (2026-11-01), USB follow-up: same
+    // queryable-status treatment as DharaFS recovery just above --
+    // see usb_probe0_pending's own header (boot/usb_power_state.S).
+    let _ = uart_puts("  usb device0 probe: ");
+    if usb_probe0_pending_get() == (1 as u32) {
+      let _ = uart_puts("IN PROGRESS -- ping/sshtest/tcpecho and other USB-hardware commands\n");
+      let _ = uart_puts("    may be delayed until it completes\n");
+    } else {
+      let _ = uart_puts("complete (or no device was ever connected)\n");
     }
 
     // Round 53: real scheduler/interrupt activity counters -- see
