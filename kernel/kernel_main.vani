@@ -354,6 +354,14 @@ extern "C" fn dharafs_suspect_count_set(n: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_suspect_count_get() -> u32;
 #[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_last_generation_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_last_generation_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_last_pool_slot_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_suspect_last_pool_slot_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_stat_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_stat_scratch_get() -> mut ref i64;
@@ -3742,9 +3750,9 @@ extern "C" fn dharafs_write_cursor_last_generation_set(v: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_write_cursor_last_generation_get() -> u32;
 #[stack_cost(bytes=1)]
-extern "C" fn dharafs_write_cursor_last_block_set(v: u32) -> u32;
+extern "C" fn dharafs_write_cursor_last_slot_set(v: u32) -> u32;
 #[stack_cost(bytes=1)]
-extern "C" fn dharafs_write_cursor_last_block_get() -> u32;
+extern "C" fn dharafs_write_cursor_last_slot_get() -> u32;
 // DharaFS Phase 2 (2026-10-25): persisted bad-block bitmap, see its own
 // header comment in boot/dharafs_state.S.
 #[stack_cost(bytes=1)]
@@ -3753,6 +3761,22 @@ extern "C" fn dharafs_badblock_bitmap_buf_get() -> mut ref i64;
 extern "C" fn dharafs_badblock_bitmap_dirty_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_badblock_bitmap_dirty_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_badblock_bitmap_half0_last_generation_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_badblock_bitmap_half0_last_generation_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_badblock_bitmap_half0_last_pool_slot_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_badblock_bitmap_half0_last_pool_slot_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_badblock_bitmap_half1_last_generation_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_badblock_bitmap_half1_last_generation_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_badblock_bitmap_half1_last_pool_slot_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_badblock_bitmap_half1_last_pool_slot_set(v: u32) -> u32;
 
 // Phase 4 -- boot/shell_state.S: the interactive shell's line buffer,
 // filled one byte at a time from irq_dispatch's new UART-RX branch
@@ -10336,8 +10360,19 @@ fn dharafs_dirindex_upsert_raw(path_buf: mut ref i64, path_len: i64, block: i64)
 // "a second persisted record never risks a read-modify-write mistake
 // on an unrelated one" reasoning KernelUploadChunkProgress's own
 // header comment already gives.
-fn dharafs_checkpoint_block_a() -> i64 { return 8101; }
-fn dharafs_checkpoint_block_b() -> i64 { return 8102; }
+// Card-wear hardening round (2026-10-31): generalized from a plain
+// A/B pair to an N-slot rotating pool -- see dharafs_write_cursor_
+// pool_size's own header comment for the full "why" (real evidence:
+// exactly 2 fixed, high-frequency-rewrite metadata blocks have ever
+// gone permanently ECC-uncorrectable on this card's whole recorded
+// history, zero failures anywhere else). Slots 0/1 stay at the
+// original 8101/8102 for backward compatibility.
+fn dharafs_checkpoint_pool_size() -> i64 { return 8; }
+fn dharafs_checkpoint_block_at(slot: i64) -> i64 {
+  if slot == 0 { return 8101; }
+  if slot == 1 { return 8102; }
+  return 8807 + (slot - 2);
+}
 
 // Correctness invariant this record exists to capture, load-bearing
 // for why skipping [1, log_start) during recovery is safe: everything
@@ -10351,7 +10386,7 @@ fn dharafs_checkpoint_block_b() -> i64 { return 8102; }
 // un-checkpointed path has always used.
 struct DharaFsCheckpoint {
   valid: i64,
-  chosen_block: i64,
+  chosen_slot: i64,
   generation: u32,
   log_start: u32,
   log_end: u32,
@@ -10406,10 +10441,10 @@ fn dharafs_checkpoint_crc_valid(raw: mut ref i64) -> i64 {
   return 1;
 }
 
-fn dharafs_checkpoint_parse(raw: mut ref i64, chosen_block: i64) -> DharaFsCheckpoint {
+fn dharafs_checkpoint_parse(raw: mut ref i64, chosen_slot: i64) -> DharaFsCheckpoint {
   return DharaFsCheckpoint {
     valid: 1,
-    chosen_block: chosen_block,
+    chosen_slot: chosen_slot,
     generation: buf_read_u32_le(raw, 4),
     log_start: buf_read_u32_le(raw, 8),
     log_end: buf_read_u32_le(raw, 12),
@@ -10437,58 +10472,73 @@ fn dharafs_checkpoint_build(rec: ref DharaFsCheckpoint, out: mut ref i64) -> i64
   return 0;
 }
 
-// Same tie-break shape as kernelslot_lookup: higher generation wins
-// when both copies are CRC-valid; falls back to whichever one copy is
-// valid; valid=0 (caller must check before trusting any other field)
-// if neither is.
+// Same tie-break shape as kernelslot_lookup, generalized from 2
+// positions to N (dharafs_checkpoint_pool_size): the slot with the
+// highest valid generation wins (ties keep the lowest slot found,
+// scanned in order); valid=0 (caller must check before trusting any
+// other field) if no slot is CRC-valid at all.
 fn dharafs_checkpoint_lookup() -> DharaFsCheckpoint {
   let buf: mut ref i64 = dharafs_checkpoint_buf_get();
 
-  let status_a: i64 = sdhost_read_block(dharafs_checkpoint_block_a(), buf);
-  let valid_a: i64 = if status_a == 0 { dharafs_checkpoint_crc_valid(buf) } else { 0 };
-  let rec_a: DharaFsCheckpoint = dharafs_checkpoint_parse(buf, dharafs_checkpoint_block_a());
-
-  let status_b: i64 = sdhost_read_block(dharafs_checkpoint_block_b(), buf);
-  let valid_b: i64 = if status_b == 0 { dharafs_checkpoint_crc_valid(buf) } else { 0 };
-  let rec_b: DharaFsCheckpoint = dharafs_checkpoint_parse(buf, dharafs_checkpoint_block_b());
-
-  if (valid_a == 1) && (valid_b == 1) {
-    if rec_a.generation >= rec_b.generation {
-      return rec_a;
-    } else {
-      return rec_b;
+  let best_valid: i64 = 0;
+  let best: DharaFsCheckpoint = DharaFsCheckpoint {
+    valid: 0, chosen_slot: 0, generation: 0 as u32, log_start: 0 as u32, log_end: 0 as u32,
+    clean_shutdown: 0 as u32, next_seq: 0 as u32, cursor_generation: 0 as u32,
+  };
+  let i: i64 = 0;
+  while i < dharafs_checkpoint_pool_size() {
+    let blk: i64 = dharafs_checkpoint_block_at(i);
+    let status: i64 = sdhost_read_block(blk, buf);
+    let ok: i64 = if status == 0 { dharafs_checkpoint_crc_valid(buf) } else { 0 };
+    if ok == 1 {
+      let rec: DharaFsCheckpoint = dharafs_checkpoint_parse(buf, i);
+      if (best_valid == 0) || (rec.generation > best.generation) {
+        best = rec;
+        best_valid = 1;
+      }
     }
+    i = i + 1;
   }
-  if valid_a == 1 {
-    return rec_a;
-  }
-  if valid_b == 1 {
-    return rec_b;
-  }
-  let invalid: DharaFsCheckpoint = rec_a;
-  invalid.valid = 0;
-  return invalid;
+  return best;
 }
 
-fn dharafs_checkpoint_stale_block(rec: ref DharaFsCheckpoint) -> i64 {
-  if rec.chosen_block == dharafs_checkpoint_block_a() {
-    return dharafs_checkpoint_block_b();
-  }
-  return dharafs_checkpoint_block_a();
+// Generalizes the old A/B dharafs_checkpoint_stale_block (which just
+// returned "the other one") to an N-slot round-robin: the next write
+// always targets the slot one past whichever slot the CURRENT valid
+// checkpoint is sitting in, so repeated compact/reboot/shutdown
+// writes rotate through all N slots instead of re-hitting the same 2
+// forever.
+fn dharafs_checkpoint_next_slot(rec: ref DharaFsCheckpoint) -> i64 {
+  return (rec.chosen_slot + 1) % dharafs_checkpoint_pool_size();
 }
 
 // Caller's own responsibility: only call this once a pass has proven
 // [new_log_start, log_end) is the complete, correct live state -- this
 // function just serializes and writes, same division of labor as
-// kernelslot_write_record.
-fn dharafs_checkpoint_write(generation: u32, log_start: u32, log_end: u32, block_num: i64, clean_shutdown: u32, next_seq: u32, cursor_generation: u32) -> i64 {
+// kernelslot_write_record. `slot` (not a raw block number anymore --
+// see dharafs_checkpoint_pool_size's own header comment) is resolved
+// to its real block number here.
+fn dharafs_checkpoint_write(generation: u32, log_start: u32, log_end: u32, slot: i64, clean_shutdown: u32, next_seq: u32, cursor_generation: u32) -> i64 {
+  let block_num: i64 = dharafs_checkpoint_block_at(slot);
   let rec: DharaFsCheckpoint = DharaFsCheckpoint {
-    valid: 1, chosen_block: block_num, generation: generation,
+    valid: 1, chosen_slot: slot, generation: generation,
     log_start: log_start, log_end: log_end, clean_shutdown: clean_shutdown,
     next_seq: next_seq, cursor_generation: cursor_generation,
   };
   let buf: mut ref i64 = dharafs_checkpoint_buf_get();
   let _ = dharafs_checkpoint_build(ref rec, buf);
+  // Card-wear hardening round (2026-11-01): skip BCH ECC protection on
+  // this write -- its own CRC32 (dharafs_checkpoint_crc_valid) already
+  // detects a torn write and correctly falls back to another slot, so
+  // the extra ~140ms BCH encode protects nothing a crash could ever
+  // make matter (a corrected-but-still-this-generation record is
+  // never trusted over a clean one anyway). Found live: rotating
+  // across N slots (rather than always hitting the same cached ECC
+  // table sector the old fixed A/B pair did) turned every one of
+  // these writes into a real cache-sector flush+reload, widening the
+  // always-present "crash between RAM clear and flush" race just
+  // enough to newly fail a repro that passed before this round.
+  let _ = dharafs_ecc_skip_next_protect_set(1 as u32);
   return sdhost_write_block(block_num, buf);
 }
 
@@ -10513,12 +10563,32 @@ fn dharafs_checkpoint_write(generation: u32, log_start: u32, log_end: u32, block
 // and real SD cards already wear-level this pair of logical addresses
 // internally (see the three-tier plan's own research on SD controller
 // FTLs), so there's no hot-spot-wear concern to design around either.
-fn dharafs_write_cursor_block_a() -> i64 { return 8135; }
-fn dharafs_write_cursor_block_b() -> i64 { return 8136; }
+// Card-wear hardening round (2026-10-31): a plain A/B ping-pong still
+// rewrites the SAME 2 physical blocks forever -- confirmed live, this
+// exact structure is the single most frequently rewritten thing in
+// the whole system (one persist per real append). Grepping this
+// card's own entire recorded UART history found exactly 2 blocks ever
+// went permanently ECC-uncorrectable (8103, the bad-block bitmap's
+// own primary, and 9216, the kernel-slot-state record) -- both fixed-
+// location, high-frequency-rewrite metadata blocks, zero failures
+// anywhere else on the device. Generalizing A/B to an N-slot rotating
+// pool spreads this structure's own write load N/2x thinner than
+// today, the direct, lowest-risk fix for the actual, evidenced cause
+// (not a guess) of two real cards dying within two months. Slots 0/1
+// stay at the original 8135/8136 for backward compatibility -- a
+// card already carrying valid data there (pre-this-round) is still
+// found by dharafs_write_cursor_lookup's own all-slots scan below;
+// slots 2..N-1 are new, in the documented spare gap (8801-9215).
+fn dharafs_write_cursor_pool_size() -> i64 { return 8; }
+fn dharafs_write_cursor_block_at(slot: i64) -> i64 {
+  if slot == 0 { return 8135; }
+  if slot == 1 { return 8136; }
+  return 8801 + (slot - 2);
+}
 
 struct DharaFsWriteCursor {
   valid: i64,
-  chosen_block: i64,
+  chosen_slot: i64,
   generation: u32,
   next_block: u32,
   next_seq: u32,
@@ -10537,10 +10607,10 @@ fn dharafs_write_cursor_crc_valid(raw: mut ref i64) -> i64 {
   return 1;
 }
 
-fn dharafs_write_cursor_parse(raw: mut ref i64, chosen_block: i64) -> DharaFsWriteCursor {
+fn dharafs_write_cursor_parse(raw: mut ref i64, chosen_slot: i64) -> DharaFsWriteCursor {
   return DharaFsWriteCursor {
     valid: 1,
-    chosen_block: chosen_block,
+    chosen_slot: chosen_slot,
     generation: buf_read_u32_le(raw, 4),
     next_block: buf_read_u32_le(raw, 8),
     next_seq: buf_read_u32_le(raw, 12),
@@ -10556,37 +10626,30 @@ fn dharafs_write_cursor_lookup() -> DharaFsWriteCursor {
   // a lookup that only ever runs once per boot.
   let buf: mut ref i64 = dharafs_checkpoint_buf_get();
 
-  let status_a: i64 = sdhost_read_block(dharafs_write_cursor_block_a(), buf);
-  let valid_a: i64 = if status_a == 0 { dharafs_write_cursor_crc_valid(buf) } else { 0 };
-  let rec_a: DharaFsWriteCursor = dharafs_write_cursor_parse(buf, dharafs_write_cursor_block_a());
-
-  let status_b: i64 = sdhost_read_block(dharafs_write_cursor_block_b(), buf);
-  let valid_b: i64 = if status_b == 0 { dharafs_write_cursor_crc_valid(buf) } else { 0 };
-  let rec_b: DharaFsWriteCursor = dharafs_write_cursor_parse(buf, dharafs_write_cursor_block_b());
-
-  if (valid_a == 1) && (valid_b == 1) {
-    if rec_a.generation >= rec_b.generation {
-      return rec_a;
-    } else {
-      return rec_b;
+  let best_valid: i64 = 0;
+  let best: DharaFsWriteCursor = DharaFsWriteCursor {
+    valid: 0, chosen_slot: 0, generation: 0 as u32, next_block: 0 as u32, next_seq: 0 as u32,
+  };
+  let i: i64 = 0;
+  while i < dharafs_write_cursor_pool_size() {
+    let blk: i64 = dharafs_write_cursor_block_at(i);
+    let status: i64 = sdhost_read_block(blk, buf);
+    let ok: i64 = if status == 0 { dharafs_write_cursor_crc_valid(buf) } else { 0 };
+    if ok == 1 {
+      let rec: DharaFsWriteCursor = dharafs_write_cursor_parse(buf, i);
+      // Strict > (not >=) matches the old A/B tiebreak's own "a tie
+      // keeps the first one found" convention (slots scanned low to
+      // high) -- best_valid==0 already takes the very first valid
+      // slot unconditionally, so this only ever replaces it with a
+      // STRICTLY newer generation.
+      if (best_valid == 0) || (rec.generation > best.generation) {
+        best = rec;
+        best_valid = 1;
+      }
     }
+    i = i + 1;
   }
-  if valid_a == 1 {
-    return rec_a;
-  }
-  if valid_b == 1 {
-    return rec_b;
-  }
-  let invalid: DharaFsWriteCursor = rec_a;
-  invalid.valid = 0;
-  return invalid;
-}
-
-fn dharafs_write_cursor_stale_block(rec: ref DharaFsWriteCursor) -> i64 {
-  if rec.chosen_block == dharafs_write_cursor_block_a() {
-    return dharafs_write_cursor_block_b();
-  }
-  return dharafs_write_cursor_block_a();
+  return best;
 }
 
 // Called from dharafs_append_raw's own two success points, reusing
@@ -10610,12 +10673,17 @@ fn dharafs_write_cursor_persist(buf: mut ref i64, generation: u32, next_block: u
   let _ = buf_write_u32_le(buf, 12, next_seq);
   let crc: u32 = kernelslot_crc32(buf, 16);
   let _ = buf_write_u32_le(buf, 16, crc);
+  // See dharafs_checkpoint_write's own matching comment -- same
+  // reasoning, same fix, highest-write-frequency structure in the
+  // whole system so the cache-thrashing cost this closes matters most
+  // right here.
+  let _ = dharafs_ecc_skip_next_protect_set(1 as u32);
   return sdhost_write_block(block_num, buf);
 }
 
 // The actual per-append hot-path entry point: zero SD reads, exactly
 // one SD write (reusing the caller's own scratch buffer) -- generation
-// increments and the A/B target alternates purely in RAM, seeded once
+// increments and the pool slot rotates purely in RAM, seeded once
 // at boot by dharafs_write_cursor_lookup's own real read. A failed
 // write here is deliberately NOT propagated to the caller as the
 // append's own failure -- the real data (already durably written) is
@@ -10626,11 +10694,12 @@ fn dharafs_write_cursor_persist(buf: mut ref i64, generation: u32, next_block: u
 // side channel never fails the primary write" posture.
 fn dharafs_write_cursor_persist_fast(buf: mut ref i64, next_block: u32, next_seq: u32) -> i64 {
   let next_gen: u32 = dharafs_write_cursor_last_generation_get() + (1 as u32);
-  let last_block: u32 = dharafs_write_cursor_last_block_get();
-  let target: i64 = if (last_block as i64) == dharafs_write_cursor_block_a() { dharafs_write_cursor_block_b() } else { dharafs_write_cursor_block_a() };
+  let last_slot: i64 = dharafs_write_cursor_last_slot_get() as i64;
+  let next_slot: i64 = (last_slot + 1) % dharafs_write_cursor_pool_size();
+  let target: i64 = dharafs_write_cursor_block_at(next_slot);
   let _ = dharafs_write_cursor_persist(buf, next_gen, next_block, next_seq, target);
   let _ = dharafs_write_cursor_last_generation_set(next_gen);
-  let _ = dharafs_write_cursor_last_block_set(target as u32);
+  let _ = dharafs_write_cursor_last_slot_set(next_slot as u32);
   return 0;
 }
 
@@ -10663,23 +10732,57 @@ fn dharafs_write_cursor_persist_fast(buf: mut ref i64, next_block: u32, next_seq
 // distributed), and more power-efficient (strictly fewer real flash
 // reads over the life of the card than re-probing the same bad blocks
 // every single boot forever).
-fn dharafs_badblock_bitmap_block_0() -> i64 { return 8103; }
-fn dharafs_badblock_bitmap_block_1() -> i64 { return 8104; }
-// Real-HW mirrors, added 2026-10-31 after a live card showed block
-// 8103 (half 0's own sole backing block) permanently ECC-uncorrectable:
-// dharafs_badblock_bitmap_load's single-attempt bootstrap read is the
-// right call for a block that's already KNOWN bad (retrying changes
-// nothing), but 8103/8104 were never actually "known bad" in that
-// sense -- they're the bitmap's OWN storage, and a disjoint-halves
-// layout (unlike the checkpoint's proven ping-pong at 8101/8102) has
-// no redundancy at all: losing either backing block permanently blinds
-// the skip-optimization for that half's entire block range, forcing
-// every boot back into the exact multi-minute real-read-every-block
-// storm the bitmap exists to prevent. Free gap 8105-8223 (119 blocks,
-// between this bitmap and SD_WEDGE_CKPT_BLOCK_PRE at 8224) has room to
-// spare for one mirror per half.
-fn dharafs_badblock_bitmap_block_0_mirror() -> i64 { return 8105; }
-fn dharafs_badblock_bitmap_block_1_mirror() -> i64 { return 8106; }
+// Card-wear hardening round (2026-10-31): a primary+mirror pair (the
+// very next round after the one that added the mirrors below) still
+// writes the SAME primary block on EVERY flush -- the mirror only
+// ever catches up periodically -- so 8103 going permanently ECC-
+// uncorrectable on a real card was never actually fixed by adding a
+// mirror, just given a read-side fallback. Generalized to a real
+// N-slot rotating pool per half instead, same pattern as
+// dharafs_write_cursor_pool_size/dharafs_checkpoint_pool_size's own
+// header comments (kernel_main.vani) -- see those for the full "why".
+// Slots 0/1 of each half stay at the original primary/mirror block
+// numbers for backward compatibility.
+fn dharafs_badblock_bitmap_pool_size() -> i64 { return 8; }
+fn dharafs_badblock_bitmap_block_at(half: i64, pool_idx: i64) -> i64 {
+  if half == 0 {
+    if pool_idx == 0 { return 8103; }
+    if pool_idx == 1 { return 8105; }
+    return 8820 + (pool_idx - 2);
+  }
+  if pool_idx == 0 { return 8104; }
+  if pool_idx == 1 { return 8106; }
+  return 8826 + (pool_idx - 2);
+}
+// 504, not 508: 4 bytes of this half's own on-disk payload are given
+// up to a new generation field (needed for the same highest-
+// generation-wins tiebreak every other generalized structure this
+// round uses -- a plain primary/mirror pair never needed one, since
+// there was only ever one "other" copy to fall back to, never a
+// choice between several VALID-but-different copies to disambiguate).
+// Safe to shrink: the lost 4 bytes/half (32 bits = 32 blocks) come
+// from the tail of each half's own already-existing, already-
+// accepted persistence gap (the RAM buffer is 1024 bytes = 8192 bits,
+// but only 2*508=1016 of those bytes were ever persisted even before
+// this round -- the last 8 bytes, blocks 8128-8191, already silently
+// never survived a reboot). Every block that actually matters (the
+// real log is 7600 blocks, dharafs_log_max_blk()) sits nowhere near
+// this already-slack tail.
+fn dharafs_badblock_bitmap_data_bytes_per_half() -> u32 { return 504 as u32; }
+fn dharafs_badblock_bitmap_generation_offset() -> u32 { return 508 as u32; }
+
+fn dharafs_badblock_bitmap_half_last_generation_get(half: i64) -> u32 {
+  return if half == 0 { dharafs_badblock_bitmap_half0_last_generation_get() } else { dharafs_badblock_bitmap_half1_last_generation_get() };
+}
+fn dharafs_badblock_bitmap_half_last_generation_set(half: i64, v: u32) -> u32 {
+  return if half == 0 { dharafs_badblock_bitmap_half0_last_generation_set(v) } else { dharafs_badblock_bitmap_half1_last_generation_set(v) };
+}
+fn dharafs_badblock_bitmap_half_last_pool_slot_get(half: i64) -> u32 {
+  return if half == 0 { dharafs_badblock_bitmap_half0_last_pool_slot_get() } else { dharafs_badblock_bitmap_half1_last_pool_slot_get() };
+}
+fn dharafs_badblock_bitmap_half_last_pool_slot_set(half: i64, v: u32) -> u32 {
+  return if half == 0 { dharafs_badblock_bitmap_half0_last_pool_slot_set(v) } else { dharafs_badblock_bitmap_half1_last_pool_slot_set(v) };
+}
 
 // DharaFS Phase 3 (2026-10-25): the log's own upper bound -- shared
 // between dharafs_init's recovery scan (which must never examine a
@@ -10721,90 +10824,69 @@ fn dharafs_badblock_bitmap_load() -> i64 {
   let sd_scratch: mut ref i64 = dhruva_alloc_bytes(512);
   let half: i64 = 0;
   while half < 2 {
-    let blk: i64 = if half == 0 { dharafs_badblock_bitmap_block_0() } else { dharafs_badblock_bitmap_block_1() };
-    let mirror_blk: i64 = if half == 0 { dharafs_badblock_bitmap_block_0_mirror() } else { dharafs_badblock_bitmap_block_1_mirror() };
-    let ram_off: u32 = (half * 508) as u32;
-    // 2026-10-31: bare single-attempt read, not the full retry
-    // ladder -- see dharafs_block_read_once_with_ecc's own header
-    // comment for why re-trying this specific bootstrap read is pure
-    // waste (confirmed live: block 8103 permanently ECC-uncorrectable
-    // on a real card, costing a multi-minute retry storm on every
-    // single boot before this fix). Same reasoning applies to the
-    // mirror fallback below -- it's a different physical block, so
-    // still worth one bare attempt, but never worth its own retry
-    // ladder either.
-    let rd_status: i64 = dharafs_block_read_once_with_ecc(blk, sd_scratch);
-    let loaded: i64 = 0;
-    if rd_status == 0 {
-      let stored: u32 = buf_read_u32(sd_scratch, 0 as u32);
-      let computed: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
-      if stored == computed {
-        let _ = buf_copy_bytes(ram, ram_off, sd_scratch, 4 as u32, 508 as u32);
-        loaded = 1;
-      }
-    }
-    // Primary backing block unreadable or corrupt -- try this half's
-    // mirror before giving up and zero-filling. Added 2026-10-31: a
-    // disjoint-halves layout with no redundancy meant a single dead
-    // backing block (8103, live-confirmed) permanently blinded the
-    // skip-optimization for its whole half's range, forcing every boot
-    // back into the real per-block retry storm this bitmap exists to
-    // avoid. See dharafs_badblock_bitmap_block_0_mirror's own comment.
-    if loaded == 0 {
-      let mirror_status: i64 = dharafs_block_read_once_with_ecc(mirror_blk, sd_scratch);
-      if mirror_status == 0 {
-        let mirror_stored: u32 = buf_read_u32(sd_scratch, 0 as u32);
-        let mirror_computed: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
-        if mirror_stored == mirror_computed {
-          let _ = buf_copy_bytes(ram, ram_off, sd_scratch, 4 as u32, 508 as u32);
-          loaded = 1;
+    let ram_off: u32 = (half * (dharafs_badblock_bitmap_data_bytes_per_half() as i64)) as u32;
+    // Bare single-attempt read PER POOL SLOT, not a real retry ladder
+    // -- see dharafs_block_read_once_with_ecc's own header comment for
+    // why re-trying this specific bootstrap read is pure waste
+    // (confirmed live: block 8103 permanently ECC-uncorrectable on a
+    // real card, costing a multi-minute retry storm on every single
+    // boot before the original mirror fix). Scans every slot in this
+    // half's own pool and keeps whichever CRC-valid slot has the
+    // highest generation -- same tiebreak every other generalized
+    // structure this round uses.
+    let best_valid: i64 = 0;
+    let best_generation: u32 = 0 as u32;
+    let best_pool_slot: i64 = 0;
+    let p: i64 = 0;
+    while p < dharafs_badblock_bitmap_pool_size() {
+      let blk: i64 = dharafs_badblock_bitmap_block_at(half, p);
+      let rd_status: i64 = dharafs_block_read_once_with_ecc(blk, sd_scratch);
+      if rd_status == 0 {
+        let stored: u32 = buf_read_u32(sd_scratch, 0 as u32);
+        let computed: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
+        if stored == computed {
+          let gen: u32 = buf_read_u32(sd_scratch, dharafs_badblock_bitmap_generation_offset());
+          if (best_valid == 0) || (gen > best_generation) {
+            let _ = buf_copy_bytes(ram, ram_off, sd_scratch, 4 as u32, dharafs_badblock_bitmap_data_bytes_per_half());
+            best_generation = gen;
+            best_pool_slot = p;
+            best_valid = 1;
+          }
         }
       }
+      p = p + 1;
     }
-    if loaded == 0 {
+    if best_valid == 0 {
       let i: i64 = 0;
-      while i < 508 {
+      while i < (dharafs_badblock_bitmap_data_bytes_per_half() as i64) {
         let _ = buf_write_byte(ram, (ram_off as i64 + i) as u32, 0 as u32);
         i = i + 1;
       }
     }
+    let _ = dharafs_badblock_bitmap_half_last_generation_set(half, best_generation);
+    let _ = dharafs_badblock_bitmap_half_last_pool_slot_set(half, best_pool_slot as u32);
     half = half + 1;
   }
   let _ = dharafs_badblock_bitmap_dirty_set(0 as u32);
   return 0;
 }
 
-// Writes both backing SD blocks from the RAM cache, but ONLY if
-// something actually changed since the last load/persist -- see
-// boot/dharafs_state.S's own header comment for why this matters
+// Writes the RAM cache for each half to ONE rotating pool slot, but
+// only if something actually changed since the last load/persist --
+// see boot/dharafs_state.S's own header comment for why this matters
 // (avoid paying a real SD write for every single newly-classified
 // block during a scan that might classify hundreds of them).
 //
-// sync_mirror: 0 skips the two extra mirror writes this call, 1
-// includes them. Added 2026-10-31 alongside the mirror blocks
-// themselves: the mirror only needs to catch up with the primary
-// at least once before the next reboot (its whole job is "give the
-// NEXT boot a second chance if the primary backing block is
-// physically dead"), not on every one of this scan's own every-64
-// periodic flushes -- unlike the primary, which genuinely needs that
-// frequency to bound data loss from a mid-scan watchdog reset (see
-// this function's own call site in dharafs_init). Doubling every
-// periodic flush's write count was confirmed live to be the actual
-// cause of a real QEMU regression (phase4_milestone.py's cat-after-
-// write race flipping deterministically): on a from-scratch disk
-// image, EVERY block in the scan range is "blank" (seq_num==0), which
-// dharafs_init's own block_ok check already treats as badblock-
-// markable -- so the periodic flush fires roughly once every 64
-// blocks across the WHOLE log range, not just for a real card's
-// actual bad-block population, and doubling that write cost shifted
-// boot timing enough to break the test's own write/cat timing
-// assumption (same class of problem this project has hit before, see
-// the "boot marker destabilized QEMU timing" precedent). Every
-// non-hot call site (dharafs_init's own post-scan flush, compact,
-// shutdown, reboot) passes 1 -- the mirror still gets a real chance to
-// catch up at least once per boot and at every explicit flush point,
-// just not hundreds of times mid-scan.
-fn dharafs_badblock_bitmap_persist(sync_mirror: u32) -> i64 {
+// extra_rotation: 0 does exactly one rotating write per half (the
+// cheap, hot path); 1 immediately advances and writes a SECOND slot
+// too, so the big, deliberate flush points (compact completion,
+// shutdown, reboot) leave at least 2 slots freshly valid right away,
+// not just whichever one slot the rotation happened to land on --
+// generalizes the old sync_mirror flag's own "big moments get extra
+// effort" intent (previously: also write the fixed mirror block) to
+// the new rotating-pool design. Every non-hot call site passes 1,
+// matching that flag's own prior callers exactly.
+fn dharafs_badblock_bitmap_persist(extra_rotation: u32) -> i64 {
   if dharafs_badblock_bitmap_dirty_get() == (0 as u32) {
     return 0;
   }
@@ -10812,18 +10894,31 @@ fn dharafs_badblock_bitmap_persist(sync_mirror: u32) -> i64 {
   let sd_scratch: mut ref i64 = dhruva_alloc_bytes(512);
   let half: i64 = 0;
   while half < 2 {
-    let blk: i64 = if half == 0 { dharafs_badblock_bitmap_block_0() } else { dharafs_badblock_bitmap_block_1() };
-    let mirror_blk: i64 = if half == 0 { dharafs_badblock_bitmap_block_0_mirror() } else { dharafs_badblock_bitmap_block_1_mirror() };
-    let ram_off: u32 = (half * 508) as u32;
-    let _ = buf_copy_bytes(sd_scratch, 4 as u32, ram, ram_off, 508 as u32);
+    let ram_off: u32 = (half * (dharafs_badblock_bitmap_data_bytes_per_half() as i64)) as u32;
+    let _ = buf_copy_bytes(sd_scratch, 4 as u32, ram, ram_off, dharafs_badblock_bitmap_data_bytes_per_half());
+    let next_gen: u32 = dharafs_badblock_bitmap_half_last_generation_get(half) + (1 as u32);
+    let next_pool_slot: i64 = (dharafs_badblock_bitmap_half_last_pool_slot_get(half) as i64 + 1) % dharafs_badblock_bitmap_pool_size();
+    let _ = buf_write_u32(sd_scratch, dharafs_badblock_bitmap_generation_offset(), next_gen);
     let computed: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
     let _ = buf_write_u32(sd_scratch, 0 as u32, computed);
-    let _ = sdhost_write_block(blk, sd_scratch);
-    if sync_mirror == (1 as u32) {
-      // Keep the mirror in sync too -- see dharafs_badblock_bitmap_
-      // block_0_mirror's own comment for why this half needs real
-      // redundancy, not just a single backing block.
-      let _ = sdhost_write_block(mirror_blk, sd_scratch);
+    // See dharafs_checkpoint_write's own matching comment -- same
+    // reasoning, same fix. Matters most here: this is the structure
+    // where the live repro actually caught the widened race (see this
+    // function's own header comment).
+    let _ = dharafs_ecc_skip_next_protect_set(1 as u32);
+    let _ = sdhost_write_block(dharafs_badblock_bitmap_block_at(half, next_pool_slot), sd_scratch);
+    let _ = dharafs_badblock_bitmap_half_last_generation_set(half, next_gen);
+    let _ = dharafs_badblock_bitmap_half_last_pool_slot_set(half, next_pool_slot as u32);
+    if extra_rotation == (1 as u32) {
+      let next_gen2: u32 = next_gen + (1 as u32);
+      let next_pool_slot2: i64 = (next_pool_slot + 1) % dharafs_badblock_bitmap_pool_size();
+      let _ = buf_write_u32(sd_scratch, dharafs_badblock_bitmap_generation_offset(), next_gen2);
+      let computed2: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
+      let _ = buf_write_u32(sd_scratch, 0 as u32, computed2);
+      let _ = dharafs_ecc_skip_next_protect_set(1 as u32);
+      let _ = sdhost_write_block(dharafs_badblock_bitmap_block_at(half, next_pool_slot2), sd_scratch);
+      let _ = dharafs_badblock_bitmap_half_last_generation_set(half, next_gen2);
+      let _ = dharafs_badblock_bitmap_half_last_pool_slot_set(half, next_pool_slot2 as u32);
     }
     half = half + 1;
   }
@@ -10873,7 +10968,20 @@ fn dharafs_badblock_mark(blk: i64) -> i64 {
 // dharafs_badblock_report_failure below escalates immediately rather
 // than silently losing track of a real, current failure.
 fn dharafs_suspect_max_entries() -> i64 { return 120; }
-fn dharafs_suspect_table_block() -> i64 { return 8107; }
+// Card-wear hardening round (2026-10-31): this table had ZERO
+// redundancy before this round -- a single fixed block, no ping-pong
+// even -- making it, alongside the badblock bitmap and write-cursor,
+// one of the structures this round's own real evidence (see
+// dharafs_write_cursor_pool_size's header comment) says is actually
+// at risk of wearing out a card. "pool" here, not "slot", on purpose
+// -- dharafs_suspect_find_slot's own "slot" already means an ENTRY
+// index (0..119) inside the table; this is a different axis (WHICH
+// of N physical copies of the whole table).
+fn dharafs_suspect_pool_size() -> i64 { return 8; }
+fn dharafs_suspect_table_block_at(pool_idx: i64) -> i64 {
+  if pool_idx == 0 { return 8107; }
+  return 8813 + (pool_idx - 1);
+}
 
 fn dharafs_suspect_find_slot(blk: i64) -> i64 {
   let buf: mut ref i64 = dharafs_suspect_buf_get();
@@ -10973,24 +11081,46 @@ fn dharafs_suspect_forgive_on_success(blk: i64) -> i64 {
   return 0;
 }
 
+// New field, added this round to generalize a single fixed block into
+// an N-slot pool: 120 entries * 4 bytes = 480 bytes of data start at
+// offset 4, ending at offset 484 -- this sits in the already-
+// checksummed [4,512) region's own previously-unused tail, so no
+// existing byte moves and the checksum computation below is unchanged.
+fn dharafs_suspect_table_generation_offset() -> u32 { return 484 as u32; }
+
 fn dharafs_suspect_table_load() -> i64 {
   let buf: mut ref i64 = dharafs_suspect_buf_get();
   let sd_scratch: mut ref i64 = dhruva_alloc_bytes(512);
-  // Same bare-single-attempt philosophy as dharafs_badblock_bitmap_
-  // load's own bootstrap read -- losing this on a bad read is the
-  // SAFE direction to fail in (every suspect just gets a fresh
-  // benefit of the doubt), never worth a real retry-ladder cost.
-  let rd_status: i64 = dharafs_block_read_once_with_ecc(dharafs_suspect_table_block(), sd_scratch);
-  let loaded: i64 = 0;
-  if rd_status == 0 {
-    let stored: u32 = buf_read_u32(sd_scratch, 0 as u32);
-    let computed: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
-    if stored == computed {
-      let _ = buf_copy_bytes(buf, 0 as u32, sd_scratch, 0 as u32, 512 as u32);
-      loaded = 1;
+  // Same bare-single-attempt-per-slot philosophy as dharafs_badblock_
+  // bitmap_load's own bootstrap read -- losing this on a bad read is
+  // the SAFE direction to fail in (every suspect just gets a fresh
+  // benefit of the doubt), never worth a real retry-ladder cost. Scans
+  // every pool slot (not just one) and keeps whichever CRC-valid slot
+  // has the highest generation, same tiebreak dharafs_checkpoint_
+  // lookup/dharafs_write_cursor_lookup already use.
+  let best_valid: i64 = 0;
+  let best_generation: u32 = 0 as u32;
+  let best_pool_slot: i64 = 0;
+  let p: i64 = 0;
+  while p < dharafs_suspect_pool_size() {
+    let blk: i64 = dharafs_suspect_table_block_at(p);
+    let rd_status: i64 = dharafs_block_read_once_with_ecc(blk, sd_scratch);
+    if rd_status == 0 {
+      let stored: u32 = buf_read_u32(sd_scratch, 0 as u32);
+      let computed: u32 = buf_checksum(sd_scratch, 4 as u32, 508 as u32);
+      if stored == computed {
+        let gen: u32 = buf_read_u32(sd_scratch, dharafs_suspect_table_generation_offset());
+        if (best_valid == 0) || (gen > best_generation) {
+          let _ = buf_copy_bytes(buf, 0 as u32, sd_scratch, 0 as u32, 512 as u32);
+          best_generation = gen;
+          best_pool_slot = p;
+          best_valid = 1;
+        }
+      }
     }
+    p = p + 1;
   }
-  if loaded == 0 {
+  if best_valid == 0 {
     let i: i64 = 0;
     while i < 512 {
       let _ = buf_write_byte(buf, i as u32, 0 as u32);
@@ -11012,6 +11142,12 @@ fn dharafs_suspect_table_load() -> i64 {
   }
   let _ = dharafs_suspect_count_set(count);
   let _ = dharafs_suspect_dirty_set(0 as u32);
+  // Seed the RAM-cached rotation state from whatever this load just
+  // found (0/0 if nothing was valid, a harmless default -- the first
+  // real persist this boot then lands on pool slot 1, identical in
+  // spirit to every other structure's own fresh-card default).
+  let _ = dharafs_suspect_last_generation_set(best_generation);
+  let _ = dharafs_suspect_last_pool_slot_set(best_pool_slot as u32);
   return 0;
 }
 
@@ -11020,9 +11156,17 @@ fn dharafs_suspect_table_persist() -> i64 {
     return 0;
   }
   let buf: mut ref i64 = dharafs_suspect_buf_get();
+  let next_gen: u32 = dharafs_suspect_last_generation_get() + (1 as u32);
+  let next_pool_slot: i64 = (dharafs_suspect_last_pool_slot_get() as i64 + 1) % dharafs_suspect_pool_size();
+  let _ = buf_write_u32(buf, dharafs_suspect_table_generation_offset(), next_gen);
   let computed: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
   let _ = buf_write_u32(buf, 0 as u32, computed);
-  let _ = sdhost_write_block(dharafs_suspect_table_block(), buf);
+  // See dharafs_checkpoint_write's own matching comment -- same
+  // reasoning, same fix.
+  let _ = dharafs_ecc_skip_next_protect_set(1 as u32);
+  let _ = sdhost_write_block(dharafs_suspect_table_block_at(next_pool_slot), buf);
+  let _ = dharafs_suspect_last_generation_set(next_gen);
+  let _ = dharafs_suspect_last_pool_slot_set(next_pool_slot as u32);
   let _ = dharafs_suspect_dirty_set(0 as u32);
   return 0;
 }
@@ -11284,7 +11428,7 @@ fn dharafs_init() -> i64 {
   let write_cursor: DharaFsWriteCursor = dharafs_write_cursor_lookup();
   if write_cursor.valid == 1 {
     let _ = dharafs_write_cursor_last_generation_set(write_cursor.generation);
-    let _ = dharafs_write_cursor_last_block_set(write_cursor.chosen_block as u32);
+    let _ = dharafs_write_cursor_last_slot_set(write_cursor.chosen_slot as u32);
   }
   // Three-tier recovery plan, Tier 1 (2026-10-31): a checkpoint
   // written by a CLEAN shutdown (`shutdown`/`reboot`, never
@@ -13268,10 +13412,10 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     let _ = dharafs_wear_cache_flush();
     let current_log_start: u32 = dharafs_state_get_log_start();
     let old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
-    let checkpoint_target: i64 = if old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref old_checkpoint) } else { dharafs_checkpoint_block_a() };
+    let checkpoint_target_slot: i64 = if old_checkpoint.valid == 1 { dharafs_checkpoint_next_slot(ref old_checkpoint) } else { 0 };
     let checkpoint_generation: u32 = if old_checkpoint.valid == 1 { old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
     let checkpoint_log_end: u32 = dharafs_state_get_next_block();
-    let _ = dharafs_checkpoint_write(checkpoint_generation, current_log_start, checkpoint_log_end, checkpoint_target, 0 as u32, dharafs_state_get_next_seq(), dharafs_write_cursor_last_generation_get());
+    let _ = dharafs_checkpoint_write(checkpoint_generation, current_log_start, checkpoint_log_end, checkpoint_target_slot, 0 as u32, dharafs_state_get_next_seq(), dharafs_write_cursor_last_generation_get());
     let verify: DharaFsCheckpoint = dharafs_checkpoint_lookup();
     let verify_ok: i64 = if (verify.valid == 1) && (verify.generation == checkpoint_generation) && (verify.log_start == current_log_start) && (verify.log_end == checkpoint_log_end) { 1 } else { 0 };
     let _ = uart_puts("DharaFS: checkpoint write gen=");
@@ -13281,7 +13425,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     let _ = uart_puts(" log_end=");
     let _ = uart_put_hex32(checkpoint_log_end);
     let _ = uart_puts(" target_block=");
-    let _ = uart_put_hex32(checkpoint_target as u32);
+    let _ = uart_put_hex32(dharafs_checkpoint_block_at(checkpoint_target_slot) as u32);
     if verify_ok == 1 {
       let _ = uart_puts(" (readback OK)\n");
     } else {
@@ -37755,11 +37899,11 @@ fn shell_dispatch_shutdown() -> i64 {
   let shutdown_next_block: u32 = dharafs_state_get_next_block();
   let shutdown_next_seq: u32 = dharafs_state_get_next_seq();
   let shutdown_old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
-  let shutdown_ckpt_target: i64 = if shutdown_old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref shutdown_old_checkpoint) } else { dharafs_checkpoint_block_a() };
+  let shutdown_ckpt_target_slot: i64 = if shutdown_old_checkpoint.valid == 1 { dharafs_checkpoint_next_slot(ref shutdown_old_checkpoint) } else { 0 };
   let shutdown_ckpt_generation: u32 = if shutdown_old_checkpoint.valid == 1 { shutdown_old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
   let shutdown_snapshot_status: i64 = dharafs_dirindex_snapshot_persist(shutdown_ckpt_generation);
   let shutdown_clean: u32 = if shutdown_snapshot_status == 0 { 1 as u32 } else { 0 as u32 };
-  let _ = dharafs_checkpoint_write(shutdown_ckpt_generation, shutdown_log_start, shutdown_next_block, shutdown_ckpt_target, shutdown_clean, shutdown_next_seq, dharafs_write_cursor_last_generation_get());
+  let _ = dharafs_checkpoint_write(shutdown_ckpt_generation, shutdown_log_start, shutdown_next_block, shutdown_ckpt_target_slot, shutdown_clean, shutdown_next_seq, dharafs_write_cursor_last_generation_get());
   let _ = uart_puts("\n");
   let _ = uart_puts("Dhruva: halting. No further writes will occur.\n");
   let _ = uart_puts("*** SAFE TO POWER OFF NOW ***\n");
@@ -38590,11 +38734,11 @@ fn shell_dispatch() -> i64 {
     let reboot_next_block: u32 = dharafs_state_get_next_block();
     let reboot_next_seq: u32 = dharafs_state_get_next_seq();
     let reboot_old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
-    let reboot_ckpt_target: i64 = if reboot_old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref reboot_old_checkpoint) } else { dharafs_checkpoint_block_a() };
+    let reboot_ckpt_target_slot: i64 = if reboot_old_checkpoint.valid == 1 { dharafs_checkpoint_next_slot(ref reboot_old_checkpoint) } else { 0 };
     let reboot_ckpt_generation: u32 = if reboot_old_checkpoint.valid == 1 { reboot_old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
     let reboot_snapshot_status: i64 = dharafs_dirindex_snapshot_persist(reboot_ckpt_generation);
     let reboot_clean: u32 = if reboot_snapshot_status == 0 { 1 as u32 } else { 0 as u32 };
-    let _ = dharafs_checkpoint_write(reboot_ckpt_generation, reboot_log_start, reboot_next_block, reboot_ckpt_target, reboot_clean, reboot_next_seq, dharafs_write_cursor_last_generation_get());
+    let _ = dharafs_checkpoint_write(reboot_ckpt_generation, reboot_log_start, reboot_next_block, reboot_ckpt_target_slot, reboot_clean, reboot_next_seq, dharafs_write_cursor_last_generation_get());
     let _ = uart_puts("rebooting...\n");
     let _ = watchdog_arm(1 as u32);
     return 0;

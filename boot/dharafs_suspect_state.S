@@ -43,6 +43,22 @@ dharafs_suspect_dirty:
     .word 0
 dharafs_suspect_count:
     .word 0
+dharafs_suspect_last_generation:
+    .word 0        /* Card-wear hardening round (2026-10-31): this
+                     * table went from a single fixed block (ZERO
+                     * redundancy) to an N-slot rotating pool, same
+                     * pattern as dharafs_write_cursor_last_generation/
+                     * _slot -- see dharafs_write_cursor_pool_size's
+                     * own header comment (kernel_main.vani) for the
+                     * full "why". Seeded once at boot from whichever
+                     * slot dharafs_suspect_table_load finds with the
+                     * highest valid generation; incremented in RAM on
+                     * every persist. */
+dharafs_suspect_last_pool_slot:
+    .word 0        /* Which pool slot the last persist targeted (an
+                     * index, not a raw block number) -- same zero-
+                     * init-is-a-harmless-default reasoning as
+                     * dharafs_write_cursor_last_slot's own comment. */
 
 .section ".text"
 .align 4
@@ -84,5 +100,31 @@ dharafs_suspect_count_set:
 .global dharafs_suspect_count_get
 dharafs_suspect_count_get:
     ldr r0, =dharafs_suspect_count
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_suspect_last_generation_set
+dharafs_suspect_last_generation_set:
+    ldr r1, =dharafs_suspect_last_generation
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_suspect_last_generation_get
+dharafs_suspect_last_generation_get:
+    ldr r0, =dharafs_suspect_last_generation
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_suspect_last_pool_slot_set
+dharafs_suspect_last_pool_slot_set:
+    ldr r1, =dharafs_suspect_last_pool_slot
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_suspect_last_pool_slot_get
+dharafs_suspect_last_pool_slot_get:
+    ldr r0, =dharafs_suspect_last_pool_slot
     ldr r0, [r0]
     bx lr

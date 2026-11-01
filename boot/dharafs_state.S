@@ -204,14 +204,20 @@ dharafs_write_cursor_last_generation:
                      * point of this mechanism is minimal added per-
                      * write delay, not trading an extra write for an
                      * extra read too. */
-dharafs_write_cursor_last_block:
-    .word 0        /* RAM-cached "which of the two ping-pong blocks did
-                     * the LAST persist target" -- toggled in RAM each
-                     * time, same reasoning as generation above. 0 means
-                     * "not yet initialized this boot" (neither real
-                     * cursor block is ever a valid value here, both are
-                     * >= 8135), matching dharafs_compact_resume_block's
-                     * own "0 is a safe sentinel" convention. */
+dharafs_write_cursor_last_slot:
+    .word 0        /* RAM-cached "which of the N rotation-pool slots did
+                     * the LAST persist target" (an index 0..N-1 into
+                     * dharafs_write_cursor_block_at, not a raw block
+                     * number -- see that round's own header comment for
+                     * why N fixed slots now exist instead of a plain
+                     * A/B pair), toggled in RAM each time, same
+                     * reasoning as generation above. The .bss zero-init
+                     * default (slot 0) is never specially treated as
+                     * "uninitialized" -- an uninitialized boot's first
+                     * real persist just lands on slot 1 (0+1 mod N),
+                     * identical in effect to the old A/B code's own
+                     * fresh-card default, so no sentinel logic is
+                     * needed here at all. */
 
 .section ".text"
 
@@ -381,16 +387,16 @@ dharafs_write_cursor_last_generation_get:
     ldr r0, [r0]
     bx lr
 
-.global dharafs_write_cursor_last_block_set
-dharafs_write_cursor_last_block_set:
-    ldr r1, =dharafs_write_cursor_last_block
+.global dharafs_write_cursor_last_slot_set
+dharafs_write_cursor_last_slot_set:
+    ldr r1, =dharafs_write_cursor_last_slot
     str r0, [r1]
     mov r0, #0
     bx lr
 
-.global dharafs_write_cursor_last_block_get
-dharafs_write_cursor_last_block_get:
-    ldr r0, =dharafs_write_cursor_last_block
+.global dharafs_write_cursor_last_slot_get
+dharafs_write_cursor_last_slot_get:
+    ldr r0, =dharafs_write_cursor_last_slot
     ldr r0, [r0]
     bx lr
 
@@ -420,6 +426,25 @@ dharafs_badblock_bitmap:
     .space 1024
 dharafs_badblock_bitmap_dirty:
     .word 0
+/* Card-wear hardening round (2026-10-31): this bitmap's own primary
+ * backing block (8103) is the single block LIVE-CONFIRMED permanently
+ * ECC-uncorrectable on a real card -- see dharafs_write_cursor_pool_
+ * size's own header comment (kernel_main.vani) for the full evidence.
+ * A primary+mirror pair still always writes the SAME primary block on
+ * every flush (the mirror only gets occasional catch-up writes), so
+ * it inherits none of the wear protection a true rotating pool gives
+ * -- these 4 words generalize each half to its own N-slot pool,
+ * mirroring dharafs_write_cursor_last_generation/_pool_slot exactly,
+ * just duplicated per half since this project's own house style is
+ * named words, not an indexed array, for small fixed state like this. */
+dharafs_badblock_bitmap_half0_last_generation:
+    .word 0
+dharafs_badblock_bitmap_half0_last_pool_slot:
+    .word 0
+dharafs_badblock_bitmap_half1_last_generation:
+    .word 0
+dharafs_badblock_bitmap_half1_last_pool_slot:
+    .word 0
 
 .section ".text"
 
@@ -437,6 +462,58 @@ dharafs_badblock_bitmap_dirty_get:
 .global dharafs_badblock_bitmap_dirty_set
 dharafs_badblock_bitmap_dirty_set:
     ldr r1, =dharafs_badblock_bitmap_dirty
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_badblock_bitmap_half0_last_generation_get
+dharafs_badblock_bitmap_half0_last_generation_get:
+    ldr r0, =dharafs_badblock_bitmap_half0_last_generation
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_badblock_bitmap_half0_last_generation_set
+dharafs_badblock_bitmap_half0_last_generation_set:
+    ldr r1, =dharafs_badblock_bitmap_half0_last_generation
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_badblock_bitmap_half0_last_pool_slot_get
+dharafs_badblock_bitmap_half0_last_pool_slot_get:
+    ldr r0, =dharafs_badblock_bitmap_half0_last_pool_slot
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_badblock_bitmap_half0_last_pool_slot_set
+dharafs_badblock_bitmap_half0_last_pool_slot_set:
+    ldr r1, =dharafs_badblock_bitmap_half0_last_pool_slot
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_badblock_bitmap_half1_last_generation_get
+dharafs_badblock_bitmap_half1_last_generation_get:
+    ldr r0, =dharafs_badblock_bitmap_half1_last_generation
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_badblock_bitmap_half1_last_generation_set
+dharafs_badblock_bitmap_half1_last_generation_set:
+    ldr r1, =dharafs_badblock_bitmap_half1_last_generation
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_badblock_bitmap_half1_last_pool_slot_get
+dharafs_badblock_bitmap_half1_last_pool_slot_get:
+    ldr r0, =dharafs_badblock_bitmap_half1_last_pool_slot
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_badblock_bitmap_half1_last_pool_slot_set
+dharafs_badblock_bitmap_half1_last_pool_slot_set:
+    ldr r1, =dharafs_badblock_bitmap_half1_last_pool_slot
     str r0, [r1]
     mov r0, #0
     bx lr
