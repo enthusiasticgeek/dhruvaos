@@ -12831,6 +12831,34 @@ fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
     return cached_block;
   }
 
+  // RTOS-boot-time hardening round (2026-11-01), real-HW follow-up
+  // (found live: boot stalled for minutes right after dharafs_init's
+  // own near-instant bail-out, on exactly the FIRST config read after
+  // it). While a background recovery scan is active, next_block sits
+  // at a deliberate placeholder (dharafs_log_max_blk(), see dharafs_
+  // init's own comment) and the dirindex is still genuinely empty --
+  // which means EVERY dirindex miss during this window (i.e. every
+  // single read of a path the background scan hasn't reached yet)
+  // would otherwise fall through to the full linear scan below, over
+  // the ENTIRE as-yet-unscanned [log_start, next_block) range, with a
+  // real per-block SD read each time. That's the exact same unbounded
+  // cost dharafs_init's own bail-out exists to avoid -- just moved to
+  // the first read instead of boot, and paid AGAIN by every distinct
+  // path looked up before the background scan catches up (log_level_
+  // init, wifi_config_init, ble_config_init, dhdl_init, and anything
+  // else reading config this early all hit a DIFFERENT path each,
+  // so the dirindex's own per-path negative-result caching below never
+  // helps). The boot-time CAN/CANNOT warning already documents the
+  // correct, honest answer for this exact case -- "not found" (never a
+  // slow scan) for a path the scan hasn't reached yet -- so return it
+  // immediately. Deliberately NOT cached via the confirmed-absent
+  // sentinel below: this path may turn out to genuinely exist once the
+  // background scan actually reaches it, unlike a real confirmed-
+  // absent result.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    return 0 - 1;
+  }
+
   let next_block: u32 = dharafs_state_get_next_block();
   let log_start: u32 = dharafs_state_get_log_start();
   let buf: mut ref i64 = dharafs_sd_scratch_get();
