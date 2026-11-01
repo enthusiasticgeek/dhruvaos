@@ -3734,6 +3734,17 @@ extern "C" fn dharafs_user_get_gid() -> u32;
 // DharaFS persisted-checkpoint plan, Phase 1 (2026-10-24): dedicated
 // scratch buffer, see its own header comment in boot/dharafs_state.S.
 extern "C" fn dharafs_checkpoint_buf_get() -> mut ref i64;
+// Three-tier recovery plan, Tier 2 (2026-10-31): RAM-cached write-
+// cursor generation/block, see their own header comments in
+// boot/dharafs_state.S.
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_write_cursor_last_generation_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_write_cursor_last_generation_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_write_cursor_last_block_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_write_cursor_last_block_get() -> u32;
 // DharaFS Phase 2 (2026-10-25): persisted bad-block bitmap, see its own
 // header comment in boot/dharafs_state.S.
 #[stack_cost(bytes=1)]
@@ -9979,6 +9990,175 @@ fn dharafs_dirindex_reset() -> i64 {
   return 0;
 }
 
+// Three-tier recovery plan, Tier 1 (2026-10-31): a persisted snapshot
+// of the live dirindex, written ONLY by `shutdown`/`reboot` (never by
+// compaction's own checkpoint write, which has no business claiming
+// "this is the final state" -- see DharaFsCheckpoint's own
+// clean_shutdown field comment for the full "why"). Stamped with the
+// SAME checkpoint generation number it was taken alongside, so
+// dharafs_init can cross-check "this snapshot and the checkpoint I'm
+// about to fully trust actually belong together" before using either.
+//
+// Per-slot persisted record (44 bytes): [0:1) valid, [1:5) hash,
+// [5:6) pathlen, [6:38) path bytes (zero-padded), [38:42) block,
+// [42:44) reserved. 11 slots fit per 512-byte block after its own
+// 4-byte checksum header (11*44=484 of 508 usable bytes) -- 256 slots
+// need ceil(256/11)=24 data blocks, each with its OWN embedded
+// checksum (same convention as every other multi-block DharaFS
+// metadata region). A SINGLE data block's checksum failing invalidates
+// the WHOLE snapshot, not just that block's own slots -- dirindex is
+// purely a lookup accelerator (a load failure just means "take the
+// slower, always-correct path this boot," never incorrect behavior),
+// so there's no value in trying to partially salvage a torn write.
+fn dharafs_dirindex_snapshot_slot_bytes() -> i64 { return 44; }
+fn dharafs_dirindex_snapshot_slots_per_block() -> i64 { return 11; }
+fn dharafs_dirindex_snapshot_data_blocks() -> i64 { return 24; }
+fn dharafs_dirindex_snapshot_header_block() -> i64 { return 8108; }
+fn dharafs_dirindex_snapshot_data_base() -> i64 { return 8109; }
+fn dharafs_dirindex_snapshot_block_for(slot: i64) -> i64 {
+  return dharafs_dirindex_snapshot_data_base() + (slot / dharafs_dirindex_snapshot_slots_per_block());
+}
+fn dharafs_dirindex_snapshot_offset_for(slot: i64) -> i64 {
+  return 4 + (slot % dharafs_dirindex_snapshot_slots_per_block()) * dharafs_dirindex_snapshot_slot_bytes();
+}
+
+// Returns 0 on success, -1 on any write/read-back failure -- caller
+// (shutdown/reboot) must NOT then write a clean_shutdown=1 checkpoint,
+// exactly the same "only promise what actually committed" discipline
+// badblock-bitmap-persist-before-checkpoint-write already uses.
+fn dharafs_dirindex_snapshot_persist(generation: u32) -> i64 {
+  let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let blk: i64 = 0;
+  while blk < dharafs_dirindex_snapshot_data_blocks() {
+    let z: i64 = 0;
+    while z < 512 {
+      let _ = buf_write_byte(scratch, z as u32, 0 as u32);
+      z = z + 1;
+    }
+    let base_slot: i64 = blk * dharafs_dirindex_snapshot_slots_per_block();
+    let s: i64 = 0;
+    while s < dharafs_dirindex_snapshot_slots_per_block() {
+      let slot: i64 = base_slot + s;
+      if slot < dirindex_max_slots() {
+        if dirindex_get_valid_at(slot as u32) == 1 {
+          let off: i64 = 4 + s * dharafs_dirindex_snapshot_slot_bytes();
+          let path_len: i64 = dirindex_get_pathlen_at(slot as u32);
+          let _ = buf_write_byte(scratch, off as u32, 1 as u32);
+          let _ = buf_write_u32(scratch, (off + 1) as u32, dirindex_get_hash_at(slot as u32) as u32);
+          let _ = buf_write_byte(scratch, (off + 5) as u32, path_len as u32);
+          let k: i64 = 0;
+          while k < path_len {
+            let pb: u32 = dirindex_get_path_byte((slot * dirindex_max_path_bytes() + k) as u32) as u32;
+            let _ = buf_write_byte(scratch, (off + 6 + k) as u32, pb);
+            k = k + 1;
+          }
+          let _ = buf_write_u32(scratch, (off + 38) as u32, dirindex_get_block_at(slot as u32) as u32);
+        }
+      }
+      s = s + 1;
+    }
+    let computed: u32 = buf_checksum(scratch, 4 as u32, 508 as u32);
+    let _ = buf_write_u32(scratch, 0 as u32, computed);
+    let wr_status: i64 = sdhost_write_block(dharafs_dirindex_snapshot_block_for(base_slot), scratch);
+    if wr_status != 0 {
+      return 0 - 1;
+    }
+    blk = blk + 1;
+  }
+  // Header last -- see dharafs_dirindex_snapshot_load's own comment
+  // for why it's read FIRST but written LAST (the generation stamp
+  // only becomes trustworthy once every data block it refers to has
+  // already committed successfully).
+  let header: mut ref i64 = dhruva_alloc_bytes(512);
+  let hz: i64 = 0;
+  while hz < 512 {
+    let _ = buf_write_byte(header, hz as u32, 0 as u32);
+    hz = hz + 1;
+  }
+  let _ = buf_write_u32(header, 0 as u32, 0x44584944 as u32); // "DXID"
+  let _ = buf_write_u32(header, 4 as u32, generation);
+  let header_checksum: u32 = buf_checksum(header, 8 as u32, 504 as u32);
+  let _ = buf_write_u32(header, 504 as u32, header_checksum);
+  let header_wr_status: i64 = sdhost_write_block(dharafs_dirindex_snapshot_header_block(), header);
+  if header_wr_status != 0 {
+    return 0 - 1;
+  }
+  return 0;
+}
+
+// Returns 1 if a valid, generation-matching snapshot was loaded into
+// the (already-reset) RAM dirindex, 0 otherwise -- a 0 return means
+// "proceed exactly as if this function didn't exist," never a
+// correctness risk, since dharafs_dirindex_reset() already left
+// every slot invalid and dharafs_find_latest_block_raw's own miss
+// path always falls back to a real scan regardless.
+fn dharafs_dirindex_snapshot_load(expect_generation: u32) -> i64 {
+  let header: mut ref i64 = dhruva_alloc_bytes(512);
+  // Bare single-attempt reads throughout -- same bootstrap philosophy
+  // as dharafs_badblock_bitmap_load/dharafs_suspect_table_load: a
+  // failure here just means "take the slower path," never worth a
+  // real retry-ladder cost.
+  let header_rd: i64 = dharafs_block_read_once_with_ecc(dharafs_dirindex_snapshot_header_block(), header);
+  if header_rd != 0 {
+    return 0;
+  }
+  let magic: u32 = buf_read_u32(header, 0 as u32);
+  if magic != (0x44584944 as u32) {
+    return 0;
+  }
+  let gen_stored: u32 = buf_read_u32(header, 4 as u32);
+  if gen_stored != expect_generation {
+    return 0;
+  }
+  let header_computed: u32 = buf_checksum(header, 8 as u32, 504 as u32);
+  let header_stored_checksum: u32 = buf_read_u32(header, 504 as u32);
+  if header_computed != header_stored_checksum {
+    return 0;
+  }
+
+  let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let blk: i64 = 0;
+  while blk < dharafs_dirindex_snapshot_data_blocks() {
+    let base_slot: i64 = blk * dharafs_dirindex_snapshot_slots_per_block();
+    let rd_status: i64 = dharafs_block_read_once_with_ecc(dharafs_dirindex_snapshot_block_for(base_slot), scratch);
+    if rd_status != 0 {
+      let _ = dharafs_dirindex_reset();
+      return 0;
+    }
+    let stored: u32 = buf_read_u32(scratch, 0 as u32);
+    let computed: u32 = buf_checksum(scratch, 4 as u32, 508 as u32);
+    if stored != computed {
+      let _ = dharafs_dirindex_reset();
+      return 0;
+    }
+    let s: i64 = 0;
+    while s < dharafs_dirindex_snapshot_slots_per_block() {
+      let slot: i64 = base_slot + s;
+      if slot < dirindex_max_slots() {
+        let off: i64 = 4 + s * dharafs_dirindex_snapshot_slot_bytes();
+        let slot_valid: u32 = buf_read_byte(scratch, off as u32);
+        if slot_valid == (1 as u32) {
+          let path_len: i64 = buf_read_byte(scratch, (off + 5) as u32) as i64;
+          let _ = dirindex_set_valid_at(slot as u32, 1 as u32);
+          let _ = dirindex_set_hash_at(slot as u32, buf_read_u32(scratch, (off + 1) as u32));
+          let _ = dirindex_set_pathlen_at(slot as u32, path_len as u32);
+          let k: i64 = 0;
+          while k < path_len {
+            let pb: u32 = buf_read_byte(scratch, (off + 6 + k) as u32);
+            let _ = dirindex_set_path_byte((slot * dirindex_max_path_bytes() + k) as u32, pb);
+            k = k + 1;
+          }
+          let _ = dirindex_set_block_at(slot as u32, buf_read_u32(scratch, (off + 38) as u32));
+          let _ = dirindex_set_last_used_at(slot as u32, dirindex_clock_tick());
+        }
+      }
+      s = s + 1;
+    }
+    blk = blk + 1;
+  }
+  return 1;
+}
+
 // FNV-1a over path bytes read from `buf` starting at `path_offset` --
 // callers pass path_offset=0 for a bare path_buf (dharafs_append_raw's
 // own convention) or path_offset=12 to hash a path embedded directly
@@ -10175,25 +10355,51 @@ struct DharaFsCheckpoint {
   generation: u32,
   log_start: u32,
   log_end: u32,
+  clean_shutdown: u32,
+  next_seq: u32,
+  cursor_generation: u32,
 }
 
+// Three-tier recovery plan (2026-10-31): clean_shutdown is the field
+// set to 1 ONLY by the `shutdown`/`reboot` commands' own checkpoint
+// write, AFTER everything else (badblock bitmap, suspect table,
+// ECC/wear caches, dirindex snapshot) has already persisted
+// successfully. Every OTHER checkpoint write (compaction's own
+// completion step) sets it to 0 -- matching ext4's needs_recovery
+// flag and NTFS's own dirty bit.
+//
+// cursor_generation closes a REAL bug found during this round's own
+// testing, not a hypothetical: clean_shutdown=1 only proves "nothing
+// was written AT THE MOMENT this checkpoint was taken" -- it says
+// NOTHING about writes that happen in the normal session AFTER that
+// reboot but BEFORE a later, unclean crash (the ordinary case: reboot
+// once, then keep using the system for a while). Without this field,
+// Tier 1 would still see the OLD checkpoint's stale clean_shutdown=1
+// and incorrectly trust its now-superseded log_end/dirindex snapshot,
+// silently losing every write that happened in between -- exactly
+// the failure mode ext4/NTFS avoid by making their own dirty bit
+// ACTIVELY re-set on the very next write, not just written once and
+// left stale. Reusing a dedicated "re-mark dirty on every write" flag
+// would cost a THIRD SD write per append on top of the real data
+// write and the write-cursor persist; cursor_generation avoids that
+// entirely by cross-checking against state the write-cursor mechanism
+// ALREADY maintains for free: shutdown/reboot stamp the checkpoint
+// with the write-cursor's OWN generation at that exact moment (read
+// from the RAM cache, zero extra I/O), and dharafs_init's Tier 1
+// check (see its own call site) only trusts clean_shutdown=1 when a
+// FRESH write-cursor lookup's generation still matches exactly -- any
+// write after the reboot bumps the live cursor generation past what
+// the checkpoint recorded, correctly invalidating the fast path.
 fn dharafs_checkpoint_crc_valid(raw: mut ref i64) -> i64 {
   let magic: u32 = buf_read_u32_le(raw, 0);
-  // Magic bumped (2026-10-30) from the original "DCKP" specifically to
-  // invalidate any leftover real-HW checkpoint from the 2026-10-24
-  // write that was disabled right after -- that record predates both
-  // Phase 3's append-bounds fix and this round's badblock-bitmap-
-  // persist fix (see this struct's own write-site comment), so it must
-  // never be trusted again even though it would still pass its own
-  // CRC. A magic mismatch falls back to exactly the safe "no
-  // checkpoint" behavior (full scan from block 1), same as a genuinely
-  // fresh card -- the real card's very first boot under this fix pays
-  // for one full rescan, then checkpoints normally from then on.
-  if magic != (0x44434B51 as u32) { // "DCKQ"
+  // Magic bumped AGAIN (2026-10-31, "DCK2" -> "DCK3") for the new
+  // cursor_generation field -- same "invalidate any leftover old-
+  // format record, exactly once" precedent as the two prior bumps.
+  if magic != (0x44434B33 as u32) { // "DCK3"
     return 0;
   }
-  let crc_stored: u32 = buf_read_u32_le(raw, 16);
-  let crc_actual: u32 = kernelslot_crc32(raw, 16);
+  let crc_stored: u32 = buf_read_u32_le(raw, 28);
+  let crc_actual: u32 = kernelslot_crc32(raw, 28);
   if crc_actual != crc_stored {
     return 0;
   }
@@ -10207,6 +10413,9 @@ fn dharafs_checkpoint_parse(raw: mut ref i64, chosen_block: i64) -> DharaFsCheck
     generation: buf_read_u32_le(raw, 4),
     log_start: buf_read_u32_le(raw, 8),
     log_end: buf_read_u32_le(raw, 12),
+    clean_shutdown: buf_read_u32_le(raw, 16),
+    next_seq: buf_read_u32_le(raw, 20),
+    cursor_generation: buf_read_u32_le(raw, 24),
   };
 }
 
@@ -10216,12 +10425,15 @@ fn dharafs_checkpoint_build(rec: ref DharaFsCheckpoint, out: mut ref i64) -> i64
     let _ = buf_write_byte(out, i as u32, 0 as u32);
     i = i + 1;
   }
-  let _ = buf_write_u32_le(out, 0, 0x44434B51 as u32); // "DCKQ" -- see dharafs_checkpoint_crc_valid's own comment
+  let _ = buf_write_u32_le(out, 0, 0x44434B33 as u32); // "DCK3" -- see dharafs_checkpoint_crc_valid's own comment
   let _ = buf_write_u32_le(out, 4, rec.generation);
   let _ = buf_write_u32_le(out, 8, rec.log_start);
   let _ = buf_write_u32_le(out, 12, rec.log_end);
-  let crc: u32 = kernelslot_crc32(out, 16);
-  let _ = buf_write_u32_le(out, 16, crc);
+  let _ = buf_write_u32_le(out, 16, rec.clean_shutdown);
+  let _ = buf_write_u32_le(out, 20, rec.next_seq);
+  let _ = buf_write_u32_le(out, 24, rec.cursor_generation);
+  let crc: u32 = kernelslot_crc32(out, 28);
+  let _ = buf_write_u32_le(out, 28, crc);
   return 0;
 }
 
@@ -10269,14 +10481,157 @@ fn dharafs_checkpoint_stale_block(rec: ref DharaFsCheckpoint) -> i64 {
 // [new_log_start, log_end) is the complete, correct live state -- this
 // function just serializes and writes, same division of labor as
 // kernelslot_write_record.
-fn dharafs_checkpoint_write(generation: u32, log_start: u32, log_end: u32, block_num: i64) -> i64 {
+fn dharafs_checkpoint_write(generation: u32, log_start: u32, log_end: u32, block_num: i64, clean_shutdown: u32, next_seq: u32, cursor_generation: u32) -> i64 {
   let rec: DharaFsCheckpoint = DharaFsCheckpoint {
     valid: 1, chosen_block: block_num, generation: generation,
-    log_start: log_start, log_end: log_end,
+    log_start: log_start, log_end: log_end, clean_shutdown: clean_shutdown,
+    next_seq: next_seq, cursor_generation: cursor_generation,
   };
   let buf: mut ref i64 = dharafs_checkpoint_buf_get();
   let _ = dharafs_checkpoint_build(ref rec, buf);
   return sdhost_write_block(block_num, buf);
+}
+
+// Three-tier recovery plan, Tier 2 (2026-10-31): a small, frequently-
+// updated ping-pong record (same proven shape as DharaFsCheckpoint,
+// just its own dedicated block pair -- updated on every single real
+// append, which the checkpoint itself only ever is at compact/
+// shutdown/reboot) letting an UNCLEAN exit's own recovery establish
+// the true next_block/next_seq via a short, bounded forward-scan from
+// this hint instead of a full scan of the whole log. Written strictly
+// AFTER the real data write it accompanies already succeeded -- it
+// can therefore only ever lag the true state by at most the ONE write
+// that was in flight at a crash, never run ahead of it. Real-HW cost:
+// one extra SD block write per append (~1-7ms typical per public
+// single-block-write benchmarks, occasionally more during the card's
+// own housekeeping) -- same per-write cost class this driver already
+// pays for the real data write itself, not a new order of magnitude.
+// Ping-ponged (not a single block) for the same reason the checkpoint
+// is: a torn write on one copy leaves the other, still-valid-and-CRC-
+// checked copy intact, at no extra bandwidth cost (still one write per
+// append, just alternating which of the two blocks it targets) --
+// and real SD cards already wear-level this pair of logical addresses
+// internally (see the three-tier plan's own research on SD controller
+// FTLs), so there's no hot-spot-wear concern to design around either.
+fn dharafs_write_cursor_block_a() -> i64 { return 8135; }
+fn dharafs_write_cursor_block_b() -> i64 { return 8136; }
+
+struct DharaFsWriteCursor {
+  valid: i64,
+  chosen_block: i64,
+  generation: u32,
+  next_block: u32,
+  next_seq: u32,
+}
+
+fn dharafs_write_cursor_crc_valid(raw: mut ref i64) -> i64 {
+  let magic: u32 = buf_read_u32_le(raw, 0);
+  if magic != (0x44435552 as u32) { // "DCUR"
+    return 0;
+  }
+  let crc_stored: u32 = buf_read_u32_le(raw, 16);
+  let crc_actual: u32 = kernelslot_crc32(raw, 16);
+  if crc_actual != crc_stored {
+    return 0;
+  }
+  return 1;
+}
+
+fn dharafs_write_cursor_parse(raw: mut ref i64, chosen_block: i64) -> DharaFsWriteCursor {
+  return DharaFsWriteCursor {
+    valid: 1,
+    chosen_block: chosen_block,
+    generation: buf_read_u32_le(raw, 4),
+    next_block: buf_read_u32_le(raw, 8),
+    next_seq: buf_read_u32_le(raw, 12),
+  };
+}
+
+fn dharafs_write_cursor_lookup() -> DharaFsWriteCursor {
+  // Reuses the checkpoint's own scratch buffer -- by the time this is
+  // ever called (dharafs_init, strictly after checkpoint_lookup's own
+  // read), whatever that read returned has already been fully parsed
+  // into a DharaFsCheckpoint value, so there's nothing left to
+  // preserve in the buffer itself. Avoids a dedicated allocation for
+  // a lookup that only ever runs once per boot.
+  let buf: mut ref i64 = dharafs_checkpoint_buf_get();
+
+  let status_a: i64 = sdhost_read_block(dharafs_write_cursor_block_a(), buf);
+  let valid_a: i64 = if status_a == 0 { dharafs_write_cursor_crc_valid(buf) } else { 0 };
+  let rec_a: DharaFsWriteCursor = dharafs_write_cursor_parse(buf, dharafs_write_cursor_block_a());
+
+  let status_b: i64 = sdhost_read_block(dharafs_write_cursor_block_b(), buf);
+  let valid_b: i64 = if status_b == 0 { dharafs_write_cursor_crc_valid(buf) } else { 0 };
+  let rec_b: DharaFsWriteCursor = dharafs_write_cursor_parse(buf, dharafs_write_cursor_block_b());
+
+  if (valid_a == 1) && (valid_b == 1) {
+    if rec_a.generation >= rec_b.generation {
+      return rec_a;
+    } else {
+      return rec_b;
+    }
+  }
+  if valid_a == 1 {
+    return rec_a;
+  }
+  if valid_b == 1 {
+    return rec_b;
+  }
+  let invalid: DharaFsWriteCursor = rec_a;
+  invalid.valid = 0;
+  return invalid;
+}
+
+fn dharafs_write_cursor_stale_block(rec: ref DharaFsWriteCursor) -> i64 {
+  if rec.chosen_block == dharafs_write_cursor_block_a() {
+    return dharafs_write_cursor_block_b();
+  }
+  return dharafs_write_cursor_block_a();
+}
+
+// Called from dharafs_append_raw's own two success points, reusing
+// its ALREADY-allocated `buf` (dharafs_sd_scratch_get()) -- the real
+// data write that just completed no longer needs that buffer's
+// content, so this costs zero new allocation, only the one extra real
+// SD write. generation/chosen_block come from a lookup done ONCE by
+// the caller (not re-done here) specifically so a hot, frequent path
+// never pays two SD reads (the lookup) for every one SD write (this
+// function) -- the caller already has last_cursor from its own prior
+// call or boot-time initialization.
+fn dharafs_write_cursor_persist(buf: mut ref i64, generation: u32, next_block: u32, next_seq: u32, block_num: i64) -> i64 {
+  let i: i64 = 0;
+  while i < 512 {
+    let _ = buf_write_byte(buf, i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let _ = buf_write_u32_le(buf, 0, 0x44435552 as u32); // "DCUR"
+  let _ = buf_write_u32_le(buf, 4, generation);
+  let _ = buf_write_u32_le(buf, 8, next_block);
+  let _ = buf_write_u32_le(buf, 12, next_seq);
+  let crc: u32 = kernelslot_crc32(buf, 16);
+  let _ = buf_write_u32_le(buf, 16, crc);
+  return sdhost_write_block(block_num, buf);
+}
+
+// The actual per-append hot-path entry point: zero SD reads, exactly
+// one SD write (reusing the caller's own scratch buffer) -- generation
+// increments and the A/B target alternates purely in RAM, seeded once
+// at boot by dharafs_write_cursor_lookup's own real read. A failed
+// write here is deliberately NOT propagated to the caller as the
+// append's own failure -- the real data (already durably written) is
+// what matters; losing this hint just means the NEXT boot's Tier 2
+// recovery falls back to a slightly larger forward-scan (or, in the
+// worst case, the full exhaustive scan), never incorrect behavior,
+// matching dharafs_ecc_cache_ensure's own established "best-effort
+// side channel never fails the primary write" posture.
+fn dharafs_write_cursor_persist_fast(buf: mut ref i64, next_block: u32, next_seq: u32) -> i64 {
+  let next_gen: u32 = dharafs_write_cursor_last_generation_get() + (1 as u32);
+  let last_block: u32 = dharafs_write_cursor_last_block_get();
+  let target: i64 = if (last_block as i64) == dharafs_write_cursor_block_a() { dharafs_write_cursor_block_b() } else { dharafs_write_cursor_block_a() };
+  let _ = dharafs_write_cursor_persist(buf, next_gen, next_block, next_seq, target);
+  let _ = dharafs_write_cursor_last_generation_set(next_gen);
+  let _ = dharafs_write_cursor_last_block_set(target as u32);
+  return 0;
 }
 
 // DharaFS Phase 2 (2026-10-25): persisted bad-block bitmap -- replaces
@@ -10502,6 +10857,7 @@ fn dharafs_badblock_mark(blk: i64) -> i64 {
   }
   return 0;
 }
+
 
 // Two-tier bad-block classification (2026-10-31): a "suspect" table,
 // separate from the CONFIRMED bitmap above -- see boot/dharafs_
@@ -10789,6 +11145,28 @@ fn dharafs_suspect_classification_self_test() -> i64 {
 // log reaches it. Without this, a block that was blank (and so
 // bitmap-marked during some earlier full scan) would stay wrongly
 // skipped forever even after holding a real record.
+//
+// Root-cause fix (2026-10-31): this clear was previously RAM-only
+// until the next of the 3 big flush points (compact/reboot/shutdown)
+// -- fine for a newly-discovered BAD block (losing that on a crash
+// just means slower rediscovery next boot, never wrong data, see
+// dharafs_badblock_bitmap_persist's own comment), but NOT fine here:
+// losing a clear to a crash means dharafs_init's own Tier-3 scan
+// trusts the STALE "still bad" bit and skips a block that now holds
+// real, durable, successfully-written user data with ZERO real I/O
+// and no fallback verification -- an actual, confirmed, 100%-
+// reproducible data-loss bug (three-boot repro: write, clean reboot,
+// write again, simulated crash, reboot -- the second write's own
+// blocks never appeared in RECOVERY SUMMARY's highest_seq even though
+// dharafs_append_raw's own diagnostics confirmed they were written
+// correctly and sequentially). Flushing synchronously here, rather
+// than deferring, is deliberately cost-proportional-to-risk: the `if`
+// above already means this only does real work on an actual bad->good
+// transition, which only ever happens for a block an EARLIER full
+// scan marked bad before this exact block was ever written -- the
+// common steady-state case (same boot, or Tier 1/2 skipping the full
+// scan entirely) never marked this block in the first place, so this
+// stays a free no-op for every ordinary append.
 fn dharafs_badblock_clear(blk: i64) -> i64 {
   if (blk < 0) || (blk >= 8192) {
     return 0;
@@ -10801,8 +11179,74 @@ fn dharafs_badblock_clear(blk: i64) -> i64 {
   if (b & bit) != (0 as u32) {
     let _ = buf_write_byte(ram, byte_idx, b & (bit ^ (0xFFFFFFFF as u32)));
     let _ = dharafs_badblock_bitmap_dirty_set(1 as u32);
+    let _ = dharafs_badblock_bitmap_persist(0 as u32);
   }
   return 0;
+}
+
+// Three-tier recovery plan, Tier 2 (2026-10-31): bounded, not an
+// arbitrary number -- comfortably exceeds how far a write-cursor hint
+// could ever realistically lag (normally 0, at most 1 write in flight
+// at a crash, since every real writer holds the ceiling lock for its
+// whole call), while still being orders of magnitude cheaper than a
+// full exhaustive scan of a multi-thousand-block log.
+fn dharafs_write_cursor_forward_scan_max_blocks() -> i64 { return 1024; }
+
+struct DharaFsForwardScanResult {
+  ok: i64,
+  next_block: u32,
+  next_seq: u32,
+}
+
+// Establishes the TRUE next_block/next_seq by walking FORWARD from a
+// write-cursor hint -- safe because the cursor is written strictly
+// AFTER the real data write it accompanies already succeeded (see
+// dharafs_write_cursor_persist_fast's own header comment), so it can
+// only ever lag the truth, never run ahead of it. Mirrors the full
+// scan's own record-validity criteria exactly (checksum + seq != 0),
+// upserting dirindex for anything it finds the cursor hadn't caught
+// up to yet. Deliberately conservative: ANYTHING unexpected here
+// (a genuinely unreadable block, a transaction marker, a continuation
+// block, hitting the iteration bound without finding blank space)
+// returns ok=0 rather than guess -- per this round's own "safety over
+// speed" directive, the caller must fall back to the full exhaustive
+// scan in every one of those cases, never trust a half-verified hint.
+fn dharafs_write_cursor_forward_scan(hint_next_block: u32, hint_next_seq: u32, max_blk: i64) -> DharaFsForwardScanResult {
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let blk: i64 = hint_next_block as i64;
+  let seq: u32 = hint_next_seq;
+  let iter: i64 = 0;
+  while iter < dharafs_write_cursor_forward_scan_max_blocks() {
+    if blk >= max_blk {
+      return DharaFsForwardScanResult { ok: 1, next_block: blk as u32, next_seq: seq };
+    }
+    let rd_status: i64 = dharafs_block_read(blk, buf);
+    if rd_status != 0 {
+      return DharaFsForwardScanResult { ok: 0, next_block: 0 as u32, next_seq: 0 as u32 };
+    }
+    let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+    let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let this_seq: u32 = buf_read_u32(buf, 4 as u32);
+    if (stored_checksum != computed_checksum) || (this_seq == (0 as u32)) {
+      // Genuinely blank -- this is where the real log actually ends.
+      return DharaFsForwardScanResult { ok: 1, next_block: blk as u32, next_seq: seq };
+    }
+    let this_path_len: u32 = buf_read_u32(buf, 8 as u32);
+    if (this_path_len == dharafs_tx_begin_sentinel()) || (this_path_len == (0 as u32)) || (this_path_len > (32 as u32)) {
+      // A transaction marker or continuation block this close to the
+      // live frontier is unusual enough to not guess about -- fall
+      // back to the full scan, which already handles every shape
+      // correctly.
+      return DharaFsForwardScanResult { ok: 0, next_block: 0 as u32, next_seq: 0 as u32 };
+    }
+    if this_seq >= seq {
+      seq = this_seq + (1 as u32);
+    }
+    let _ = dharafs_dirindex_upsert(buf, 12, this_path_len as i64, blk);
+    blk = blk + 1;
+    iter = iter + 1;
+  }
+  return DharaFsForwardScanResult { ok: 0, next_block: 0 as u32, next_seq: 0 as u32 };
 }
 
 fn dharafs_init() -> i64 {
@@ -10826,6 +11270,103 @@ fn dharafs_init() -> i64 {
   // fall back to exactly today's behavior, scan from block 1, trust
   // nothing persisted.
   let checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+  // Three-tier recovery plan, Tier 2 (2026-10-31): look up the write-
+  // cursor ONCE here (regardless of which tier ends up handling this
+  // boot) and seed the RAM-cached generation/block dharafs_write_
+  // cursor_persist_fast's own hot path relies on -- without this, the
+  // FIRST real append after boot would restart generation numbering
+  // from 0, which could make a genuinely newer persisted cursor copy
+  // look OLDER than a stale one still sitting on disk the next time
+  // this boot's own lookup tie-break runs. A missing/invalid cursor
+  // (fresh card, or this feature predates the card's own history)
+  // correctly leaves the RAM cache at its .bss zero-init default,
+  // matching "no real cursor has ever been written yet."
+  let write_cursor: DharaFsWriteCursor = dharafs_write_cursor_lookup();
+  if write_cursor.valid == 1 {
+    let _ = dharafs_write_cursor_last_generation_set(write_cursor.generation);
+    let _ = dharafs_write_cursor_last_block_set(write_cursor.chosen_block as u32);
+  }
+  // Three-tier recovery plan, Tier 1 (2026-10-31): a checkpoint
+  // written by a CLEAN shutdown (`shutdown`/`reboot`, never
+  // compaction's own mid-session write -- see DharaFsCheckpoint's own
+  // clean_shutdown field comment) can be trusted COMPLETELY, not just
+  // as a lower bound to rescan from. Matches ext4's needs_recovery
+  // flag and NTFS's dirty bit: skip the scan outright on a clean
+  // exit, same as those filesystems skip journal replay/chkdsk on a
+  // clean unmount. Requires the persisted dirindex snapshot to ALSO
+  // load successfully (and match this exact checkpoint generation) --
+  // trusting log_end/next_seq without the dirindex that makes
+  // trusting them safe would defeat the whole point; dharafs_find_
+  // latest_block_raw's own dirindex hits are returned directly, with
+  // no re-verification, so dirindex coverage is exactly as load-
+  // bearing for correctness here as it already is during a live boot.
+  //
+  // ALSO requires write_cursor.valid==1 and its generation to STILL
+  // exactly match checkpoint.cursor_generation -- see DharaFsCheckpoint's
+  // own cursor_generation comment for the real bug this closes: a
+  // clean_shutdown=1 checkpoint only proves nothing was written AT
+  // THAT MOMENT, not that nothing was written in the normal session
+  // afterward before a later crash. Any write after the clean exit
+  // bumps the live write-cursor's own generation past what the
+  // checkpoint recorded, correctly falling through to Tier 2 instead
+  // of trusting now-superseded state.
+  if (checkpoint.valid == 1) && (checkpoint.clean_shutdown == 1) && (write_cursor.valid == 1) && (checkpoint.cursor_generation == write_cursor.generation) {
+    let snapshot_loaded: i64 = dharafs_dirindex_snapshot_load(checkpoint.generation);
+    if snapshot_loaded == 1 {
+      let _ = dharafs_state_set(checkpoint.log_end, checkpoint.next_seq);
+      let _ = dharafs_state_set_log_start(checkpoint.log_start);
+      let _ = uart_puts("DharaFS: checkpoint CLEAN gen=");
+      let _ = uart_put_hex32(checkpoint.generation);
+      let _ = uart_puts(" log_start=");
+      let _ = uart_put_hex32(checkpoint.log_start);
+      let _ = uart_puts(" log_end=");
+      let _ = uart_put_hex32(checkpoint.log_end);
+      let _ = uart_puts(" next_seq=");
+      let _ = uart_put_hex32(checkpoint.next_seq);
+      let _ = uart_puts(" -- scan skipped entirely (Tier 1 fast path)\n");
+      return 0;
+    }
+    // Snapshot load failed (torn/missing write, or it simply predates
+    // this feature) -- fall through to Tier 2's own bounded scan
+    // below exactly as if clean_shutdown had been 0. Never trust
+    // log_end/next_seq without the matching dirindex.
+  }
+  // Three-tier recovery plan, Tier 2 (2026-10-31): an UNCLEAN exit
+  // (crash/watchdog/power-loss -- Tier 1 didn't apply or its own
+  // snapshot didn't load) with a valid checkpoint AND a valid write-
+  // cursor can still skip the full exhaustive scan: checkpoint.
+  // log_start is ALREADY safe to trust as a lower bound regardless of
+  // clean_shutdown (proven by compaction itself, not by how the
+  // session ended -- see DharaFsCheckpoint's own original Phase-1
+  // argument), and the write-cursor's own hint plus a short bounded
+  // forward-scan establishes the true next_block/next_seq without
+  // walking the whole log. dirindex stays empty here (no snapshot to
+  // trust) and populates lazily via the existing on-demand fallback,
+  // exactly as it already does on any dirindex miss today -- not a
+  // new behavior, just not eagerly pre-warmed for this boot.
+  if checkpoint.valid == 1 {
+    if write_cursor.valid == 1 {
+      let scan_result: DharaFsForwardScanResult = dharafs_write_cursor_forward_scan(write_cursor.next_block, write_cursor.next_seq, dharafs_log_max_blk());
+      if scan_result.ok == 1 {
+        let _ = dharafs_state_set(scan_result.next_block, scan_result.next_seq);
+        let _ = dharafs_state_set_log_start(checkpoint.log_start);
+        let _ = uart_puts("DharaFS: checkpoint TRUSTED (Tier 2 cursor fast path) gen=");
+        let _ = uart_put_hex32(checkpoint.generation);
+        let _ = uart_puts(" log_start=");
+        let _ = uart_put_hex32(checkpoint.log_start);
+        let _ = uart_puts(" next_block=");
+        let _ = uart_put_hex32(scan_result.next_block);
+        let _ = uart_puts(" -- exhaustive scan skipped, short forward-scan from write-cursor hint=");
+        let _ = uart_put_hex32(write_cursor.next_block);
+        let _ = uart_puts("\n");
+        return 0;
+      }
+      // Forward scan hit something unexpected or exceeded its bound --
+      // per this round's own "safety over speed" directive, fall
+      // through to the full exhaustive scan below rather than trust a
+      // half-verified hint.
+    }
+  }
   // Re-enabled (2026-10-30): the 2026-10-24 A/B disable's own suspect
   // (the checkpoint-write call in dharafs_compact, see that site's
   // comment) was isolated from a SEPARATE bug independently found and
@@ -11190,6 +11731,10 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
     let _ = dharafs_badblock_clear(next_block as i64);
 
     let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+    // Three-tier recovery plan, Tier 2 (2026-10-31): see dharafs_write_
+    // cursor_persist_fast's own header comment. Reuses `buf` (the just-
+    // completed real write no longer needs its content).
+    let _ = dharafs_write_cursor_persist_fast(buf, next_block + (1 as u32), next_seq + (1 as u32));
     let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, next_block as i64);
     return 0;
   }
@@ -11270,6 +11815,12 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
   }
 
   let _ = dharafs_state_set(base_block + (num_chunks as u32), base_seq + (num_chunks as u32));
+  // Three-tier recovery plan, Tier 2 (2026-10-31): see dharafs_write_
+  // cursor_persist_fast's own header comment. dharafs_sd_scratch_get()
+  // is a pure pointer getter (no allocation) -- safe to call again
+  // here even though the loop above's own `buf` binding is out of
+  // scope, it's the exact same persistent buffer either way.
+  let _ = dharafs_write_cursor_persist_fast(dharafs_sd_scratch_get(), base_block + (num_chunks as u32), base_seq + (num_chunks as u32));
   let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, base_block as i64);
   return 0;
 }
@@ -12720,7 +13271,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     let checkpoint_target: i64 = if old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref old_checkpoint) } else { dharafs_checkpoint_block_a() };
     let checkpoint_generation: u32 = if old_checkpoint.valid == 1 { old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
     let checkpoint_log_end: u32 = dharafs_state_get_next_block();
-    let _ = dharafs_checkpoint_write(checkpoint_generation, current_log_start, checkpoint_log_end, checkpoint_target);
+    let _ = dharafs_checkpoint_write(checkpoint_generation, current_log_start, checkpoint_log_end, checkpoint_target, 0 as u32, dharafs_state_get_next_seq(), dharafs_write_cursor_last_generation_get());
     let verify: DharaFsCheckpoint = dharafs_checkpoint_lookup();
     let verify_ok: i64 = if (verify.valid == 1) && (verify.generation == checkpoint_generation) && (verify.log_start == current_log_start) && (verify.log_end == checkpoint_log_end) { 1 } else { 0 };
     let _ = uart_puts("DharaFS: checkpoint write gen=");
@@ -14038,6 +14589,10 @@ fn dharafs_delete_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   // verified data (a tombstone record is still a real record).
   let _ = dharafs_badblock_clear(next_block as i64);
   let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+  // Three-tier recovery plan, Tier 2 (2026-10-31): see dharafs_write_
+  // cursor_persist_fast's own header comment -- a tombstone advances
+  // the real frontier exactly like any other append.
+  let _ = dharafs_write_cursor_persist_fast(buf, next_block + (1 as u32), next_seq + (1 as u32));
   let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, next_block as i64);
   return 0;
 }
@@ -15029,6 +15584,12 @@ fn dharafs_tx_begin_raw(block_count: i64) -> i64 {
   // verified data.
   let _ = dharafs_badblock_clear(next_block as i64);
   let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+  // Three-tier recovery plan, Tier 2 (2026-10-31): see dharafs_write_
+  // cursor_persist_fast's own header comment -- a tx_begin marker
+  // advances the real frontier exactly like any other append (the
+  // transaction group's own follow-up blocks are each written through
+  // dharafs_append_raw, already covered there).
+  let _ = dharafs_write_cursor_persist_fast(buf, next_block + (1 as u32), next_seq + (1 as u32));
   return 0;
 }
 
@@ -37186,6 +37747,19 @@ fn shell_dispatch_shutdown() -> i64 {
   let _ = dharafs_suspect_table_persist();
   let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
   let _ = dharafs_wear_cache_flush(); // NAND-FTL wear table: same persist-point discipline
+  // Three-tier recovery plan, Tier 1 (2026-10-31): see `reboot`'s own
+  // matching comment -- same fresh checkpoint + dirindex snapshot,
+  // same ordering discipline (only claim clean_shutdown=1 if the
+  // snapshot actually committed).
+  let shutdown_log_start: u32 = dharafs_state_get_log_start();
+  let shutdown_next_block: u32 = dharafs_state_get_next_block();
+  let shutdown_next_seq: u32 = dharafs_state_get_next_seq();
+  let shutdown_old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+  let shutdown_ckpt_target: i64 = if shutdown_old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref shutdown_old_checkpoint) } else { dharafs_checkpoint_block_a() };
+  let shutdown_ckpt_generation: u32 = if shutdown_old_checkpoint.valid == 1 { shutdown_old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
+  let shutdown_snapshot_status: i64 = dharafs_dirindex_snapshot_persist(shutdown_ckpt_generation);
+  let shutdown_clean: u32 = if shutdown_snapshot_status == 0 { 1 as u32 } else { 0 as u32 };
+  let _ = dharafs_checkpoint_write(shutdown_ckpt_generation, shutdown_log_start, shutdown_next_block, shutdown_ckpt_target, shutdown_clean, shutdown_next_seq, dharafs_write_cursor_last_generation_get());
   let _ = uart_puts("\n");
   let _ = uart_puts("Dhruva: halting. No further writes will occur.\n");
   let _ = uart_puts("*** SAFE TO POWER OFF NOW ***\n");
@@ -38004,6 +38578,23 @@ fn shell_dispatch() -> i64 {
     let _ = dharafs_suspect_table_persist();
     let _ = dharafs_ecc_cache_flush(); // NAND-FTL ECC: same persist-point discipline as the badblock bitmap above
     let _ = dharafs_wear_cache_flush(); // NAND-FTL wear table: same persist-point discipline
+    // Three-tier recovery plan, Tier 1 (2026-10-31): a fresh,
+    // accurate checkpoint with clean_shutdown=1, so the NEXT boot can
+    // trust it completely and skip the recovery scan entirely -- see
+    // DharaFsCheckpoint's own clean_shutdown field comment. Persist
+    // the dirindex snapshot FIRST (same ceiling lock already held
+    // above protects this write too, no new race); only claim
+    // clean_shutdown=1 if that actually committed -- never promise
+    // what didn't.
+    let reboot_log_start: u32 = dharafs_state_get_log_start();
+    let reboot_next_block: u32 = dharafs_state_get_next_block();
+    let reboot_next_seq: u32 = dharafs_state_get_next_seq();
+    let reboot_old_checkpoint: DharaFsCheckpoint = dharafs_checkpoint_lookup();
+    let reboot_ckpt_target: i64 = if reboot_old_checkpoint.valid == 1 { dharafs_checkpoint_stale_block(ref reboot_old_checkpoint) } else { dharafs_checkpoint_block_a() };
+    let reboot_ckpt_generation: u32 = if reboot_old_checkpoint.valid == 1 { reboot_old_checkpoint.generation + (1 as u32) } else { 1 as u32 };
+    let reboot_snapshot_status: i64 = dharafs_dirindex_snapshot_persist(reboot_ckpt_generation);
+    let reboot_clean: u32 = if reboot_snapshot_status == 0 { 1 as u32 } else { 0 as u32 };
+    let _ = dharafs_checkpoint_write(reboot_ckpt_generation, reboot_log_start, reboot_next_block, reboot_ckpt_target, reboot_clean, reboot_next_seq, dharafs_write_cursor_last_generation_get());
     let _ = uart_puts("rebooting...\n");
     let _ = watchdog_arm(1 as u32);
     return 0;

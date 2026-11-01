@@ -193,6 +193,25 @@ dharafs_compact_pass_target:
 .align 4
 dharafs_checkpoint_buf:
     .space 512
+dharafs_write_cursor_last_generation:
+    .word 0        /* Three-tier recovery plan, Tier 2 (2026-10-31):
+                     * RAM-cached "what generation did the LAST write-
+                     * cursor persist use" -- set once at boot from
+                     * DharaFsWriteCursor's own lookup, then just
+                     * incremented in RAM on every subsequent persist.
+                     * Avoids a real SD read before every single real
+                     * append's own cursor-persist write -- the whole
+                     * point of this mechanism is minimal added per-
+                     * write delay, not trading an extra write for an
+                     * extra read too. */
+dharafs_write_cursor_last_block:
+    .word 0        /* RAM-cached "which of the two ping-pong blocks did
+                     * the LAST persist target" -- toggled in RAM each
+                     * time, same reasoning as generation above. 0 means
+                     * "not yet initialized this boot" (neither real
+                     * cursor block is ever a valid value here, both are
+                     * >= 8135), matching dharafs_compact_resume_block's
+                     * own "0 is a safe sentinel" convention. */
 
 .section ".text"
 
@@ -347,6 +366,32 @@ dharafs_commit_count_get:
 .global dharafs_checkpoint_buf_get
 dharafs_checkpoint_buf_get:
     ldr r0, =dharafs_checkpoint_buf
+    bx lr
+
+.global dharafs_write_cursor_last_generation_set
+dharafs_write_cursor_last_generation_set:
+    ldr r1, =dharafs_write_cursor_last_generation
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_write_cursor_last_generation_get
+dharafs_write_cursor_last_generation_get:
+    ldr r0, =dharafs_write_cursor_last_generation
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_write_cursor_last_block_set
+dharafs_write_cursor_last_block_set:
+    ldr r1, =dharafs_write_cursor_last_block
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_write_cursor_last_block_get
+dharafs_write_cursor_last_block_get:
+    ldr r0, =dharafs_write_cursor_last_block
+    ldr r0, [r0]
     bx lr
 
 /* DharaFS Phase 2 (2026-10-25): persisted bad-block bitmap -- see
