@@ -27814,13 +27814,38 @@ fn lan9512_reset_and_init(devaddr: u32, mps: u32) -> i64 {
   // HW_CFG Lite Reset, then poll until the chip clears the bit itself
   // (bounded, not `while true`, matching this project's own
   // established hardware-poll discipline).
+  //
+  // BUG FIX (2026-11-01, real-HW root cause of a 100+ real-second USB
+  // enumeration stall, found live via loglevel=16 diagnostics): this
+  // loop's own "1000, bounded" cap was sized assuming each `tries`
+  // iteration is a cheap, fast memory-mapped register poll -- but
+  // lan9512_reg_read() is a FULL USB control transfer (SETUP+DATA+
+  // STATUS, each stage its own dwc2_wait_chan0_done call) issued over
+  // the wire to the chip, not a local register read. Confirmed against
+  // Linux's real in-tree smsc95xx.c (`smsc95xx_reset`): its own
+  // equivalent wait is `for (timeout = 0; timeout < 500; timeout++) {
+  // ret = smsc95xx_read_reg(dev, HW_CFG, &val); if (!(val &
+  // HW_CFG_LRST_)) break; msleep(10); }` -- Linux explicitly PACES
+  // this wait with a 10ms sleep between read attempts (capping the
+  // real worst case at ~5s), never spins back-to-back USB transfers
+  // unthrottled. This driver had no such pacing at all, so a chip that
+  // needs even its ordinary, real (sub-millisecond-to-low-millisecond)
+  // internal reset time ends up polled hundreds of times over the
+  // wire with zero breathing room -- live-observed on real hardware as
+  // a continuous flood of control transfers for 100+ real seconds
+  // (and still running past 7+ minutes in a later capture) without the
+  // reset bit ever being observed clear. Fixed by adding the same
+  // 10ms pacing Linux uses and matching its own 500-iteration cap
+  // (same real ~5s worst-case budget, not an arbitrary new guess).
   let _ = lan9512_reg_write(devaddr, mps, 0x14 as u32, 0x00000008 as u32);
   let tries: i64 = 0;
   let reset_done: i64 = 0;
-  while (tries < 1000) && (reset_done == 0) {
+  while (tries < 500) && (reset_done == 0) {
     let hw_cfg: u32 = lan9512_reg_read(devaddr, mps, 0x14 as u32);
     if (hw_cfg & (0x00000008 as u32)) == (0 as u32) {
       reset_done = 1;
+    } else {
+      let _ = delay(10000); // 10ms, matching Linux's own msleep(10)
     }
     tries = tries + 1;
   }
