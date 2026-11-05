@@ -27859,6 +27859,20 @@ fn lan9512_reset_and_init(devaddr: u32, mps: u32) -> i64 {
   let reset_done: i64 = 0;
   while (tries < 500) && (reset_done == 0) {
     let hw_cfg: u32 = lan9512_reg_read(devaddr, mps, 0x14 as u32);
+    // TEMP DIAG (2026-11-05, live root-cause capture): direct, per-
+    // iteration evidence of what this loop actually observes -- not
+    // yet known whether it's this exact loop producing the live-
+    // observed continuous control-transfer flood, or a different one.
+    // Printed every 20th iteration (not every one) to keep the trace
+    // readable instead of just as voluminous as the thing it's meant
+    // to diagnose.
+    if (boot_debug_enabled() == 1) && ((tries % 20) == 0) {
+      let _ = uart_puts("USB DIAG: LAN9512 reset poll tries=");
+      let _ = uart_put_hex32(tries as u32);
+      let _ = uart_puts(" hw_cfg=0x");
+      let _ = uart_put_hex32(hw_cfg);
+      let _ = uart_puts("\n");
+    }
     if (hw_cfg & (0x00000008 as u32)) == (0 as u32) {
       reset_done = 1;
     } else {
@@ -27867,7 +27881,9 @@ fn lan9512_reset_and_init(devaddr: u32, mps: u32) -> i64 {
     tries = tries + 1;
   }
   if reset_done == 0 {
-    let _ = uart_puts("USB: LAN9512 lite reset timed out\n");
+    let _ = uart_puts("USB: LAN9512 lite reset timed out, final tries=");
+    let _ = uart_put_hex32(tries as u32);
+    let _ = uart_puts("\n");
     return 0 - 1;
   }
 
@@ -32914,6 +32930,16 @@ fn dwc2_hub_bring_up_and_enumerate_port(hub_addr: u32, hub_mps: u32, port: u32, 
     if attempt == power_cycle_attempt {
       let _ = dwc2_hub_power_cycle_port(hub_addr, hub_mps, port);
     }
+    // TEMP DIAG (2026-11-05, live root-cause capture): is this outer
+    // retry wrapper the thing cycling, vs a single inner loop (e.g.
+    // lan9512_reset_and_init's own poll) never returning at all.
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("USB DIAG: hub port bring-up attempt=");
+      let _ = uart_put_hex32(attempt as u32);
+      let _ = uart_puts(" port=");
+      let _ = uart_put_hex32(port);
+      let _ = uart_puts("\n");
+    }
     let port_result: i64 = dwc2_hub_bring_up_port(hub_addr, hub_mps, port);
     if port_result == 0 {
       outcome = dwc2_enumerate_one_downstream_device(downstream_addr);
@@ -32924,6 +32950,13 @@ fn dwc2_hub_bring_up_and_enumerate_port(hub_addr: u32, hub_mps: u32, port: u32, 
       }
     }
     attempt = attempt + 1;
+  }
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("USB DIAG: hub port bring-up loop exited, final attempt=");
+    let _ = uart_put_hex32(attempt as u32);
+    let _ = uart_puts(" outcome=");
+    let _ = uart_put_hex32(outcome as u32);
+    let _ = uart_puts("\n");
   }
   return outcome;
 }
