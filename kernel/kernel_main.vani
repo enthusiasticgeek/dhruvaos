@@ -6312,7 +6312,10 @@ fn timer_ic_init() -> i64 {
   // Arm the first compare match one tick out.
   let now: u32 = mmio_read_u32(timer_clo);
   let interval: u32 = scheduler_tick_interval_us();
-  let first: u32 = now + interval;
+  // Same wraparound fix as timer_tick_dispatch's own matching site
+  // (2026-11-06) -- `now` is a raw TIMER_CLO microsecond snapshot and
+  // legitimately wraps near 0xFFFFFFFF; plain `+` traps in vani.
+  let first: u32 = wrapping_add(now, interval);
   let _ = mmio_write_u32(timer_c1, first);
 
   // Clear any stale match flag for channel 1 before enabling its IRQ.
@@ -6413,7 +6416,10 @@ fn timer_clear_stale_match_before_handoff() -> i64 {
   let timer_c1: i64 = TIMER_C1;
   let now: u32 = mmio_read_u32(timer_clo);
   let interval: u32 = scheduler_tick_interval_us();
-  let fresh: u32 = now + interval;
+  // Same wraparound fix as timer_tick_dispatch's own matching site
+  // (2026-11-06) -- `now` is a raw TIMER_CLO microsecond snapshot and
+  // legitimately wraps near 0xFFFFFFFF; plain `+` traps in vani.
+  let fresh: u32 = wrapping_add(now, interval);
   let _ = mmio_write_u32(timer_c1, fresh);
   let _ = mmio_write_u32(timer_cs, 2 as u32);
   let _ = mem_barrier();
@@ -18029,7 +18035,18 @@ fn timer_tick_dispatch() -> i64 {
   let _ = mmio_write_u32(timer_cs, 2 as u32);
   let now: u32 = mmio_read_u32(timer_clo);
   let interval: u32 = scheduler_tick_interval_us();
-  let next: u32 = now + interval;
+  // BUG FIX (2026-11-06, real-HW kernelupload panic root-cause): `now`
+  // is a raw TIMER_CLO microsecond snapshot, which wraps every ~71.6
+  // minutes -- plain `+` traps in vani on that legitimate rollover
+  // (same reasoning as the TCP sequence-number wraparound fix above,
+  // rst_ack = wrapping_add(seg_seq, seg_len)). This call site runs on
+  // EVERY timer tick regardless of what else the system is doing, so
+  // it panics the whole board once per wrap, independent of USB/SD/
+  // kernelupload -- confirmed live via two real-HW kernelupload
+  // transfers that each panicked here after ~60-65 minutes of uptime,
+  // both resolving to this exact LR after rebuilding the exact commit
+  // the board was running.
+  let next: u32 = wrapping_add(now, interval);
   let _ = mmio_write_u32(timer_c1, next);
 
   // ROUND 2026-09-18 (RTOS true-compliance pass, task #242): replenish
