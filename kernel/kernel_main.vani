@@ -3833,6 +3833,32 @@ fn delay(count: i64) -> i64 {
   return 0;
 }
 
+// BUG FIX (2026-11-06, real-HW kernelupload slowdown + MEDIUM deadline-
+// miss root cause): `delay(count)`'s loop is a raw CPU-cycle count, not
+// a wall-clock duration -- every existing call site's own magic number
+// is calibrated against whatever CPU clock was live when it was tuned
+// (see e.g. delay(161000)'s own ~50ms-at-700MHz recalibration history
+// just below). That calibration silently breaks whenever this board's
+// own DVFS governor (Phase 5, governor_apply) throttles down -- live-
+// confirmed via `diagnose` showing "cpu freq: 250 MHz" while task_c's
+// own delay(161000) critical section (held at ceiling 0, blocking
+// EVERY other task) was taking close to a full second in practice, not
+// the documented ~50ms, which both stalled kernelupload (task_f
+// couldn't run at all for that whole window) and made MEDIUM miss its
+// own 500ms deadline repeatedly. Not a fix to `delay()` itself --
+// changing its unit would silently break every other call site's own
+// already-tuned magic number -- this is a NEW, separate, frequency-
+// INDEPENDENT primitive for call sites (task_c's own critical section,
+// specifically) where the real-time BOUND is the actual point, not an
+// approximate busy-wait. TIMER_CLO is a real free-running 1MHz hardware
+// counter, unaffected by ARM core clock scaling.
+fn delay_us_wallclock(target_us: u32) -> i64 {
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  while wrapping_sub(mmio_read_u32(TIMER_CLO), t0) < target_us {
+  }
+  return 0;
+}
+
 // ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit): real,
 // measured cost of delay(N) at the current CPU clock, via TIMER_CLO
 // (a real free-running 1MHz hardware counter, same one every other
@@ -6727,25 +6753,42 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   let _ = sd_mmio_write_u32(sdcmd, sdcmd_new_flag | cmd_and_flags);
 
   // Poll until the controller clears NEW_FLAG (command, and its
-  // response if any, complete) or the iteration cap is hit -- capped,
-  // not `while true`, specifically so a wedged card can never hang
-  // the caller forever the way an unbounded wait would.
+  // response if any, complete) or the timeout is hit.
   //
-  // 2026-10-31: this loop had NO watchdog_kick() at all, in the ONE
-  // function every single SD command in this driver funnels through
-  // -- found only after the FIFO-drain loop's own every-65536 kick
-  // (sdhost_write_block_once, same day) still didn't fully close a
-  // real-HW reset loop with near-perfectly repeatable ~18s-from-
-  // checkpoint-7 timing (two cycles measured within 2ms of each
-  // other). This is the more fundamental gap: every bad block the
-  // recovery scan's retry ladder encounters issues a CMD16/CMD17 (or
-  // CMD16/CMD24 for a wedge-checkpoint write) that funnels through
-  // here FIRST, before the FIFO-drain loop is ever reached -- a
-  // genuinely wedged controller could exhaust its entire 15s budget
-  // right here, with zero chance for the FIFO-drain loop's own fix to
-  // even matter.
+  // 2026-11-06 ROOT-CAUSE FIX (real-HW silent post-reboot hang, first
+  // boot with real /config/wifi_ssid+wifi_password+/wifi/fw.bin
+  // content): this loop used to be bounded by a bare 1,000,000-
+  // iteration count, not real elapsed time -- EXACTLY the bug class
+  // this file's own sdhost_wait_transfer_complete already found and
+  // fixed on 2026-09-19/20 (see that function's header comment: a U-
+  // Boot forum thread documents an iteration count "calibrated to
+  // APPEAR like ~1 second" that actually only covered ~12ms on real
+  // silicon, and this project independently measured a ~18.6x rate
+  // difference between QEMU and real Pi 1B silicon for the same tight
+  // loop shape in tasks #274/#275). sdhost_cmd is the ONE function
+  // every single SD command in this driver funnels through, so this
+  // was the single most consequential place to still have the
+  // unfixed version of that same bug: on a severely degraded card
+  // (confirmed via this card's own ECC-uncorrectable history), each
+  // iteration's real MMIO-read cost under a genuinely wedged
+  // controller is unmeasured and apparently far larger than assumed
+  // -- a prior incident already measured this exact loop taking
+  // ~18 real seconds before a 15s watchdog cut it off mid-poll, nowhere
+  // near what 1,000,000 fast register reads "should" cost. With the
+  // watchdog disabled (WATCHDOG_ENABLE_FOR_REAL_HARDWARE=0, the real-
+  // HW default), nothing bounded this loop's real wall-clock duration
+  // at all, producing a silent multi-minute-plus hang with zero
+  // intervening output -- exactly what was observed live. Fixed the
+  // same way sdhost_wait_transfer_complete already was: TIMER_CLO (the
+  // BCM2835 free-running 1MHz timer, correctly emulated at 1MHz under
+  // QEMU too) bounds real elapsed time directly, giving the SAME
+  // worst-case duration in both environments regardless of per-
+  // iteration register-read cost. 1 second (1000000us), matching
+  // sdhost_wait_transfer_complete's own already-validated choice.
+  let cmd_poll_t0: u32 = sd_mmio_read_u32(TIMER_CLO);
+  let cmd_poll_timeout_us: u32 = 1000000 as u32;
   let iter: i64 = 0;
-  while iter < 1000000 {
+  while wrapping_sub(sd_mmio_read_u32(TIMER_CLO), cmd_poll_t0) < cmd_poll_timeout_us {
     if (WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1) && ((iter & 4095) == 0) {
       let _ = watchdog_kick();
     }
@@ -6773,7 +6816,11 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   // every single command issued by this driver, so an unconditional
   // print here would be the same UART-timing-confound mistake already
   // documented and avoided elsewhere in this file.
-  if iter >= 1000000 {
+  //
+  // 2026-11-06: checks NEW_FLAG directly rather than the loop's own
+  // exit reason (iter count vs. elapsed time) -- correct regardless of
+  // which bound the loop above exits on.
+  if (sd_mmio_read_u32(sdcmd) & sdcmd_new_flag) != (0 as u32) {
     let _ = uart_puts("SD DIAG: sdhost_cmd NEW_FLAG poll timed out cmd_and_flags=0x");
     let _ = uart_put_hex32(cmd_and_flags);
     let _ = uart_puts(" arg=0x");
@@ -8990,24 +9037,24 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   // that's still new, real information: it rules out "FIFO itself
   // stuck non-empty" and confirms the wedge is purely an FSM-state
   // phenomenon, narrowing the search further.
+  // 2026-11-06 ROOT-CAUSE FIX (real-HW silent post-reboot hang,
+  // companion to sdhost_cmd's own identical fix above -- see that
+  // function's header comment for the full writeup): this loop's
+  // 1,000,000-iteration cap had no real wall-clock bound either, the
+  // exact bug class this project's own earlier measurement (two
+  // independent cycles at 18.156s/18.158s to hit a 15s watchdog window
+  // INSIDE this same loop, on a less-degraded card than today's) had
+  // already shown can run for many real seconds without the watchdog
+  // enabled to ever cut it off -- on today's more-degraded card,
+  // easily minutes, with zero output until (if ever) it completes all
+  // 1,000,000 iterations. Fixed with the same TIMER_CLO wall-clock
+  // bound as sdhost_cmd and sdhost_wait_transfer_complete (1 second,
+  // same already-validated magnitude) -- a real elapsed-time limit
+  // regardless of this card's own per-iteration SDEDM-read cost.
+  let fifo_drain_t0: u32 = sd_mmio_read_u32(TIMER_CLO);
+  let fifo_drain_timeout_us: u32 = 1000000 as u32;
   let fifo_drain_iter: i64 = 0;
-  while fifo_drain_iter < 1000000 {
-    // 2026-10-31, tightened further the same day: the every-65536
-    // granularity added earlier was confirmed LIVE to still be
-    // insufficient -- a real card now resets with near-perfectly
-    // repeatable ~18s-from-checkpoint-7 timing (two independent
-    // cycles measured at 18.156s and 18.158s wall-clock, nowhere
-    // near the randomness real hardware wear would produce), i.e.
-    // deterministically hitting the 15s watchdog window inside THIS
-    // exact loop on the very first wedged block the recovery scan's
-    // retry ladder encounters (which routes through sd_wedge_
-    // checkpoint -> this function). A genuinely wedged controller's
-    // own per-iteration SDEDM read apparently costs far more real
-    // time under worse wedge conditions than whatever was true when
-    // 65536 was chosen -- 16x tighter closes that margin without
-    // meaningfully increasing kick overhead (a watchdog_kick() is a
-    // couple of cheap MMIO writes, negligible even every 4096
-    // iterations of a loop that already runs up to 1,000,000 times).
+  while wrapping_sub(sd_mmio_read_u32(TIMER_CLO), fifo_drain_t0) < fifo_drain_timeout_us {
     if (WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1) && ((fifo_drain_iter & 4095) == 0) {
       let _ = watchdog_kick();
     }
@@ -9018,7 +9065,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     }
     fifo_drain_iter = fifo_drain_iter + 1;
   }
-  if fifo_drain_iter >= 1000000 {
+  if ((sd_mmio_read_u32(SDEDM) >> (4 as u32)) & (0x1F as u32)) != (0 as u32) {
     let _ = uart_puts("SD DIAG: FIFO-drain-to-empty poll timed out (new signal, never checked before) SDEDM=0x");
     let _ = uart_put_hex32(sd_mmio_read_u32(SDEDM));
     let _ = uart_puts("\n");
@@ -33578,7 +33625,21 @@ fn dwc2_probe_device0() -> i64 {
     let _ = dwc2_build_get_device_descriptor_setup(8 as u32);
     result_status = dwc2_control_in(0 as u32, 8 as u32, 8 as u32, desc64);
     if result_status == 0 {
-      attempt = 5;
+      // BUG FIX (2026-11-06, real-HW task_e/USB hang root cause): this
+      // used to be `attempt = 5`, correct back when the loop above was
+      // `while attempt < 5` (5 fails that test, so success exited the
+      // loop). 3f3d1b7 bumped the bound to 10 attempts without updating
+      // this sentinel to match -- 5 < 10 is still true, so a SUCCESSFUL
+      // GET_DESCRIPTOR(8) never actually left this loop: it just kept
+      // reissuing the same already-answered transfer forever. Confirmed
+      // live: a real board stuck here for 20+ minutes, dwc2_control_in's
+      // own 3-stage transfer completing successfully hundreds of times in
+      // a 15s capture window with zero progress and no failure
+      // diagnostics (none of which would print on a success path),
+      // because dwc2_probe_device0 -- and therefore task_e's background
+      // USB probe, and everything task_e is gated behind via maintenance_
+      // mode -- never returned. 10, not 5, actually exits this loop.
+      attempt = 10;
     } else {
       if boot_debug_enabled() == 1 {
         let _ = uart_puts("USB DIAG: GET_DESCRIPTOR(Device) attempt failed, retrying after settle\n");
@@ -33878,6 +33939,17 @@ fn task_b() -> i64 {
 #[bounded_stack(bytes=512)]
 fn task_c() -> i64 {
   while true {
+    // BUG FIX (2026-11-06, real-HW kernelupload slowdown root cause):
+    // this demo task previously acquired ceiling 0 (HIGH's own
+    // priority -- the system's highest, blocking literally every other
+    // task) unconditionally, every single wake, with no awareness that
+    // a long exclusive transfer (kernelupload) might be in progress --
+    // unlike task_e/task_fsq, which both already defer to
+    // maintenance_mode_is_active() for exactly this reason (see either
+    // one's own matching comment). Still wakes and sleeps on schedule
+    // either way (cheap, no real cost to skipping an idle pass); only
+    // the ceiling-0 critical section itself is deferred.
+    if maintenance_mode_is_active() == (0 as u32) {
     let _ = dhruva_prio_lock(0);
     let log_demo: i64 = if (log_state_get_mask() & (4 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_DEMO
     if log_demo == 1 {
@@ -33901,12 +33973,23 @@ fn task_c() -> i64 {
         let _ = uart_puts("LOW: stuck spin finished, unlocking normally\n");
       }
     } else {
-      let _ = delay(161000);
+      // BUG FIX (2026-11-06): was delay(161000) -- a raw CPU-cycle
+      // count, calibrated to ~50ms only at the specific clock speed
+      // active when it was tuned (see that constant's own 2026-09-20
+      // recalibration history above). Wall-clock-bound instead, so
+      // this critical section's real duration stays ~49.92ms regardless
+      // of the DVFS governor's current frequency -- see delay_us_
+      // wallclock's own header comment for the full real-HW finding
+      // this closes (board running the governor's 250MHz step made
+      // this take close to a full second, not ~50ms, stalling
+      // kernelupload and making MEDIUM miss its own deadline).
+      let _ = delay_us_wallclock(49920 as u32);
     }
     if log_demo == 1 {
       let _ = uart_puts("LOW: leaving critical section, unlocking\n");
     }
     let _ = dhruva_prio_unlock(2);
+    }
     let _ = task_sleep_ticks(2);
   }
   return 0;
@@ -41764,6 +41847,12 @@ fn shell_dispatch() -> i64 {
 #[no_mangle]
 #[bounded_stack(bytes=16384)]
 fn task_f() -> i64 {
+  // TEMP DIAG (2026-11-06): root-causing the real-HW kernelupload
+  // per-512-byte-window stall (~2.3s/window observed, 16ms SD write
+  // confirmed via rxdiag -- something ELSE between ACKs is slow).
+  // Persists across while-loop iterations within this one never-
+  // returning call frame; 0 means "no prior ACK yet this stream."
+  let kup_last_ack_us: u32 = 0 as u32;
   while true {
     // TASK #355 (2026-10-12): `kernelupload stream` drain branch,
     // checked FIRST, before the ordinary ready/sleep/dispatch logic
@@ -41961,6 +42050,7 @@ fn task_f() -> i64 {
         }
       }
       if popped > 0 {
+        let temp_diag_t_entry: u32 = mmio_read_u32(TIMER_CLO);
         let _ = kernelupload_stream_last_activity_tick_set(scheduler_get_tick_count());
         let _ = maintenance_mode_engage();
         let total_before: i64 = kernelupload_total_len_get() as i64;
@@ -41989,6 +42079,7 @@ fn task_f() -> i64 {
             sd_write_failed = 1;
           }
         }
+        let temp_diag_t_after_accum: u32 = mmio_read_u32(TIMER_CLO);
         // TASK #357 follow-up (2026-10-16, systematic concurrency
         // audit per user request): this drain loop MUST run, and
         // finish, before kernelupload_stream_active is ever cleared --
@@ -42035,6 +42126,40 @@ fn task_f() -> i64 {
             let last_ack: u32 = kernelupload_stream_last_ack_len_get();
             if (total_now - last_ack) >= KERNELUPLOAD_ACK_INTERVAL_BYTES {
               let _ = kernelupload_stream_last_ack_len_set(total_now);
+              // TEMP DIAG (2026-11-06): see task_f's own header comment.
+              // gap_us = time since the PREVIOUS ack was sent (covers
+              // host round-trip + any time this task spent not running
+              // at all, e.g. preempted/evicted) -- 0 on the very first
+              // ack of a stream (nothing to compare against yet).
+              // entry_to_accum_us = how long THIS iteration spent
+              // between noticing popped>0 and finishing the SD-write/
+              // hash accumulation -- isolates real on-board processing
+              // cost from everything else.
+              // FIX (2026-11-06): was uart_puts/uart_put_hex32 (the
+              // DMA-eligible, blocking-on-DMA-busy path) -- every call
+              // here kicked off a real DMA transfer (uart_puts's own
+              // string is 19-33 bytes, well over UART_DMA_MIN_LEN=8),
+              // and EVERY following uart_putc call (inside uart_put_
+              // hex32's digit loop, and uart_puts's own internal "\n"
+              // fallback) busy-waits at its own top until dma_uart_tx_
+              // busy() clears -- live-confirmed this round: switching
+              // to this ring-based, non-DMA pair (the SAME primitives
+              // kernelupload_stream_report_ack already correctly uses
+              // for the real ACK line) is what finally isolates whether
+              // the remaining ~481-508ms per-window gap is a real
+              // board/scheduling bug or an artifact of this diagnostic
+              // itself measuring its own DMA-busy-wait cost. Matches
+              // this project's own standing finding (feedback_dhruva_
+              // uart_diag_timing_confound): diagnostic prints can
+              // perturb the exact timing they're trying to observe.
+              if kup_last_ack_us != (0 as u32) {
+                let _ = uart_puts_bounded("TEMPDIAG2: gap_since_last_ack_us=");
+                let _ = uart_put_hex32_irq(wrapping_sub(temp_diag_t_entry, kup_last_ack_us));
+                let _ = uart_puts_bounded(" entry_to_accum_us=");
+                let _ = uart_put_hex32_irq(wrapping_sub(temp_diag_t_after_accum, temp_diag_t_entry));
+                let _ = uart_puts_bounded("\n");
+              }
+              kup_last_ack_us = mmio_read_u32(TIMER_CLO);
               let _ = kernelupload_stream_report_ack(total_now);
             }
           }
