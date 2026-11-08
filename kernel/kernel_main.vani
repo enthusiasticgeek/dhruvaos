@@ -3250,6 +3250,26 @@ extern "C" fn kernelupload_chunk_record_buf_get() -> mut ref i64;
 extern "C" fn kernelupload_chunk_base_block_offset_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn kernelupload_chunk_base_block_offset_set(value: u32) -> u32;
+// Critical Config Store (2026-11-07): boot-critical small config/
+// credentials, independent of DharaFS Tier 1/2/3 recovery state -- see
+// boot/critical_config_state.S's own header comment, and critical_
+// config_find_slot/_read_raw/_write_raw's own comments below.
+#[stack_cost(bytes=1)]
+extern "C" fn critical_config_table_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn critical_config_key_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn critical_config_crypto_key_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn critical_config_crypto_key_ready_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn critical_config_crypto_key_ready_set(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn critical_config_nonce_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn critical_config_aad_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn critical_config_plain_scratch_get() -> mut ref i64;
 // Task #164 follow-up: bulk endpoint/toggle state for real 802.11
 // frame TX/RX -- see boot/usb_wifi_state.S's own comment.
 #[stack_cost(bytes=1)]
@@ -3582,10 +3602,22 @@ extern "C" fn dharafs_gc_get_erase_cursor() -> u32;
 extern "C" fn dharafs_recovery_active_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_recovery_active_set(v: u32) -> u32;
+// Tier-1 boot-hang follow-up (2026-11-07) -- see boot/dharafs_state.S's
+// own header comment on dharafs_dirindex_complete.
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_dirindex_complete_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_dirindex_complete_set(v: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_recovery_scan_cursor_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_recovery_scan_cursor_set(v: u32) -> u32;
+// Tier-2 boot-hang follow-up (2026-11-07) -- see dharafs_recovery_scan_
+// target_blk's own header comment in boot/dharafs_state.S.
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_scan_target_blk_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_recovery_scan_target_blk_set(v: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_recovery_next_free_blk_found_get() -> u32;
 #[stack_cost(bytes=1)]
@@ -11515,6 +11547,7 @@ fn dharafs_write_cursor_forward_scan(hint_next_block: u32, hint_next_seq: u32, m
 fn dharafs_init() -> i64 {
   let _ = dharafs_dirindex_reset();
   let _ = dharafs_snapshot_reset();
+  let _ = dharafs_dirindex_complete_set(0 as u32);
   // DharaFS Phase 2 (2026-10-25): load the persisted bad-block bitmap
   // before the scan below -- see dharafs_badblock_bitmap_load's own
   // header comment.
@@ -11577,6 +11610,11 @@ fn dharafs_init() -> i64 {
     if snapshot_loaded == 1 {
       let _ = dharafs_state_set(checkpoint.log_end, checkpoint.next_seq);
       let _ = dharafs_state_set_log_start(checkpoint.log_start);
+      // Tier-1 boot-hang follow-up (2026-11-07): the snapshot we just
+      // loaded IS the complete, authoritative dirindex -- see
+      // dharafs_dirindex_complete's own header comment in boot/dharafs_
+      // state.S for the hang this closes.
+      let _ = dharafs_dirindex_complete_set(1 as u32);
       let _ = uart_puts("DharaFS: checkpoint CLEAN gen=");
       let _ = uart_put_hex32(checkpoint.generation);
       let _ = uart_puts(" log_start=");
@@ -11602,16 +11640,42 @@ fn dharafs_init() -> i64 {
   // session ended -- see DharaFsCheckpoint's own original Phase-1
   // argument), and the write-cursor's own hint plus a short bounded
   // forward-scan establishes the true next_block/next_seq without
-  // walking the whole log. dirindex stays empty here (no snapshot to
-  // trust) and populates lazily via the existing on-demand fallback,
-  // exactly as it already does on any dirindex miss today -- not a
-  // new behavior, just not eagerly pre-warmed for this boot.
+  // walking the whole log.
+  //
+  // Boot-hang follow-up (2026-11-07): the dirindex is still genuinely
+  // empty at this point (no snapshot to trust, unlike Tier 1) -- this
+  // USED to leave it to populate lazily via dharafs_find_latest_block_
+  // raw's own on-demand miss fallback, which is exactly the unbounded-
+  // scan-on-first-miss hang Tier 1 was found to have tonight, just
+  // gated by a narrower (unclean-shutdown) trigger: not actually a
+  // different, safer "lazy" design, the same hazard with worse odds.
+  // Now bootstraps the SAME background scan Tier 3 already uses to
+  // build the dirindex safely, just bounded to [log_start, next_block)
+  // instead of the whole log, since the tail here is already known and
+  // trusted (just proved by the forward-scan below) -- no need to
+  // rediscover it, only to walk the range once to populate dirindex
+  // entries. recovery_active==1 for the duration means every other
+  // dirindex-miss guard already protects reads/writes exactly like it
+  // does during a real Tier 3 scan.
   if checkpoint.valid == 1 {
     if write_cursor.valid == 1 {
       let scan_result: DharaFsForwardScanResult = dharafs_write_cursor_forward_scan(write_cursor.next_block, write_cursor.next_seq, dharafs_log_max_blk());
       if scan_result.ok == 1 {
         let _ = dharafs_state_set(scan_result.next_block, scan_result.next_seq);
         let _ = dharafs_state_set_log_start(checkpoint.log_start);
+        let _ = dharafs_recovery_scan_cursor_set(checkpoint.log_start);
+        let _ = dharafs_recovery_next_free_blk_found_set(checkpoint.log_start);
+        // Seed the floor with the ALREADY-trusted next_seq (minus 1,
+        // since completion below adds 1 back) rather than 0 -- never
+        // higher than any real record's seq in this bounded range
+        // (scan_result.next_seq already bounds that), so the degenerate
+        // case of an empty scan range (log_start == next_block, nothing
+        // live in between) can't regress the trusted sequence counter
+        // backward to 1 once the background scan "completes" having
+        // found nothing.
+        let _ = dharafs_recovery_highest_seq_found_set(scan_result.next_seq - (1 as u32));
+        let _ = dharafs_recovery_scan_target_blk_set(scan_result.next_block);
+        let _ = dharafs_recovery_active_set(1 as u32);
         let _ = uart_puts("DharaFS: checkpoint TRUSTED (Tier 2 cursor fast path) gen=");
         let _ = uart_put_hex32(checkpoint.generation);
         let _ = uart_puts(" log_start=");
@@ -11620,7 +11684,7 @@ fn dharafs_init() -> i64 {
         let _ = uart_put_hex32(scan_result.next_block);
         let _ = uart_puts(" -- exhaustive scan skipped, short forward-scan from write-cursor hint=");
         let _ = uart_put_hex32(write_cursor.next_block);
-        let _ = uart_puts("\n");
+        let _ = uart_puts(", background dirindex build now running (bounded)\n");
         return 0;
       }
       // Forward scan hit something unexpected or exceeded its bound --
@@ -11717,6 +11781,10 @@ fn dharafs_init() -> i64 {
   let _ = dharafs_recovery_scan_cursor_set(scan_start_blk);
   let _ = dharafs_recovery_next_free_blk_found_set(scan_start_blk);
   let _ = dharafs_recovery_highest_seq_found_set(0 as u32);
+  // Tier 3's own tail is genuinely unknown -- scan all the way to the
+  // real end of the log, same as always (dharafs_recovery_scan_continue
+  // used to hardcode exactly this).
+  let _ = dharafs_recovery_scan_target_blk_set(scan_max_blk);
   let _ = dharafs_recovery_active_set(1 as u32);
   let _ = uart_puts("DharaFS: checkpoint ");
   if checkpoint.valid == 1 {
@@ -11796,7 +11864,16 @@ fn dharafs_recovery_scan_continue(buf: mut ref i64, budget_us: u32) -> i64 {
   if dharafs_recovery_active_get() == (0 as u32) {
     return 0;
   }
-  let max_blk: i64 = dharafs_log_max_blk();
+  // Tier-2 boot-hang follow-up (2026-11-07): this used to always be
+  // dharafs_log_max_blk() directly -- the real, physical end of the log,
+  // appropriate for Tier 3's own "tail is genuinely unknown" scan. Tier 2
+  // now also drives this same loop, but its own tail is ALREADY known
+  // (the short write-cursor forward-scan already proved it) -- scanning
+  // past that point would just be redundant work over blank space, with
+  // no further writes to find. dharafs_init sets the target to match
+  // whichever tier is running: dharafs_log_max_blk() for Tier 3 (no
+  // behavior change there), the already-trusted next_block for Tier 2.
+  let max_blk: i64 = dharafs_recovery_scan_target_blk_get() as i64;
   let blk: i64 = dharafs_recovery_scan_cursor_get() as i64;
   let next_free_blk: i64 = dharafs_recovery_next_free_blk_found_get() as i64;
   let highest_seq: u32 = dharafs_recovery_highest_seq_found_get();
@@ -11888,6 +11965,11 @@ fn dharafs_recovery_scan_continue(buf: mut ref i64, budget_us: u32) -> i64 {
     let _ = dharafs_suspect_table_persist();
     let _ = dharafs_state_set(next_free_blk as u32, highest_seq + (1 as u32));
     let _ = dharafs_recovery_active_set(0 as u32);
+    // Same reasoning as the Tier-1 snapshot-load site above: the scan
+    // that just finished covered the whole log, so the dirindex it built
+    // along the way is now complete/authoritative too -- any lookup miss
+    // after this point is real, never worth another scan.
+    let _ = dharafs_dirindex_complete_set(1 as u32);
     let _ = uart_puts("DharaFS: background recovery scan complete. next_block=");
     let _ = uart_put_hex32(next_free_blk as u32);
     let _ = uart_puts(" highest_seq=");
@@ -12938,7 +13020,19 @@ fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
   // sentinel below: this path may turn out to genuinely exist once the
   // background scan actually reaches it, unlike a real confirmed-
   // absent result.
-  if dharafs_recovery_active_get() == (1 as u32) {
+  //
+  // Follow-up (2026-11-07): recovery_active==0 is ambiguous on its own --
+  // it's also the value at the very start of a Tier-1 boot, before any
+  // scan ever ran, because Tier 1 trusts a persisted snapshot instead.
+  // Live-reproduced on real HW: a Tier-1 boot's first config-key miss
+  // (wifi_config_init/ble_config_init) fell through to the SAME unguarded
+  // full scan this block already exists to prevent, just via the other
+  // branch. dharafs_dirindex_complete_get() covers that case (and the
+  // post-Tier-3-scan-completion case) -- see its own header comment in
+  // boot/dharafs_state.S. Tier 2's own fast path deliberately leaves the
+  // dirindex empty and is NOT covered by this flag -- same hazard, not
+  // yet closed, tracked separately.
+  if (dharafs_recovery_active_get() == (1 as u32)) || (dharafs_dirindex_complete_get() == (1 as u32)) {
     return 0 - 1;
   }
 
@@ -18204,77 +18298,22 @@ fn timer_tick_dispatch() -> i64 {
           let _ = uart_putc_nonblocking(108); // l
           let _ = uart_putc_nonblocking(61);  // =
           let _ = uart_put_hex32_irq(ceiling_depth_table_get_at(wd_cur_task));
-          let _ = uart_putc_nonblocking(32);  // ' '
-          let _ = uart_putc_nonblocking(101); // e
-          let _ = uart_putc_nonblocking(112); // p
-          let _ = uart_putc_nonblocking(61);  // =
-          let _ = uart_put_hex32_irq(eff_prio_table_get_at(wd_cur_task));
-          let _ = uart_putc_nonblocking(32);  // ' '
-          let _ = uart_putc_nonblocking(105); // i
-          let _ = uart_putc_nonblocking(114); // r
-          let _ = uart_putc_nonblocking(113); // q
-          let _ = uart_putc_nonblocking(61);  // =
-          let _ = uart_put_hex32_irq(irq_count_get() as u32);
-          // 2026-10-23 follow-up: microsecond-precision RX-byte-
-          // arrival gap + cumulative overrun count -- see
-          // kernelupload_last_rx_byte_us's own header comment
-          // (boot/kernelupload_state.S) for the separate, later-stage
-          // stall this is evidence for. `rxgap` = exact microseconds
-          // since the last byte the IRQ handler itself actually read
-          // off the wire (NOT tick-granularity like the total/task
-          // fields above) -- if this is far larger than the real
-          // wire-time for one byte at 115200 baud (~87us), bytes have
-          // genuinely stopped arriving at the hardware, not merely
-          // been slow to process.
-          let _ = uart_putc_nonblocking(32);  // ' '
-          let _ = uart_putc_nonblocking(114); // r
-          let _ = uart_putc_nonblocking(120); // x
-          let _ = uart_putc_nonblocking(103); // g
-          let _ = uart_putc_nonblocking(97);  // a
-          let _ = uart_putc_nonblocking(112); // p
-          let _ = uart_putc_nonblocking(61);  // =
-          // Same wraparound fix as the stall check above -- both operands
-          // are raw TIMER_CLO microsecond snapshots.
-          let _ = uart_put_hex32_irq(wrapping_sub(now, kernelupload_last_rx_byte_us_get()));
-          let _ = uart_putc_nonblocking(32);  // ' '
-          let _ = uart_putc_nonblocking(111); // o
-          let _ = uart_putc_nonblocking(101); // e
-          let _ = uart_putc_nonblocking(114); // r
-          let _ = uart_putc_nonblocking(114); // r
-          let _ = uart_putc_nonblocking(61);  // =
-          let _ = uart_put_hex32_irq(kernelupload_overrun_count_get());
-          let _ = uart_putc_nonblocking(32);  // ' '
-          let _ = uart_putc_nonblocking(99);  // c
-          let _ = uart_putc_nonblocking(116); // t
-          let _ = uart_putc_nonblocking(120); // x
-          let _ = uart_putc_nonblocking(61);  // =
-          let _ = uart_put_hex32_irq(context_switch_count_get() as u32);
-          let _ = uart_putc_nonblocking(32);  // ' '
-          let _ = uart_putc_nonblocking(116); // t
-          let _ = uart_putc_nonblocking(105); // i
-          let _ = uart_putc_nonblocking(99);  // c
-          let _ = uart_putc_nonblocking(107); // k
-          let _ = uart_putc_nonblocking(61);  // =
-          let _ = uart_put_hex32_irq(scheduler_get_tick_count());
+          // TRIMMED (2026-11-07, sibling of the TEMPDIAG2 ring-overflow
+          // find this round): this print had grown back to ~140 bytes
+          // (9 full 32-bit hex fields alone are 72 bytes, more than the
+          // 64-byte TX ring, before any label text) despite the SAME
+          // function's own 2026-10-23 comment already once trimming it
+          // for this exact reason and declaring "keeping this print
+          // short is now the priority" -- ep/irq/rxgap/overr/ctx/tick
+          // were added back afterward and blew back through that
+          // budget. Cut back to the 3 fields that most directly answer
+          // "why is kernelupload stalled" (total/task/ceil: is the
+          // transfer stuck, which task was running, is it holding a
+          // lock) -- rather than re-trim-and-hope, since this
+          // diagnostic only ever gets ONE shot (one-shot latch) and
+          // needs to survive intact exactly when a real stall happens.
           let _ = uart_putc_nonblocking(13);
           let _ = uart_putc_nonblocking(10);
-          // 2026-10-23 follow-up: the full per-task (0-9) scheduler-
-          // state dump that used to run here (added for the Phase 1
-          // task_e/task_fsq contention investigation, user request
-          // "make sure we know every task ID granular") is REMOVED --
-          // live-confirmed this round that it was long enough (50+
-          // uart_putc_nonblocking calls) to actually trigger uart_
-          // putc_nonblocking's own documented, already-accepted
-          // "silently drops a character if the TX path is momentarily
-          // full" behavior (see that function's own header comment),
-          // garbling THIS diagnostic's own output on a real-HW run.
-          // Phase 1's own fix is already confirmed working from an
-          // earlier run that DID capture a clean task=4/task_e-
-          // holding-ceiling=2 snapshot before this dump existed to
-          // garble anything -- no need to re-prove that every run.
-          // Keeping this print short is now the priority, for the
-          // SEPARATE stall this file's own rxgap/overr fields above
-          // exist to diagnose.
         }
       }
     }
@@ -27392,6 +27431,397 @@ fn rtl8188cu_load_firmware_from_sd_raw() -> i64 {
   return hdr.ramcodesize;
 }
 
+// Critical Config Store (2026-11-07, real-HW "wifi join" investigation):
+// small boot-critical config/credentials (WiFi SSID/password, BLE target
+// name, and future additions), stored OUTSIDE DharaFS's append-only log
+// entirely -- so reading them never depends on DharaFS Tier 1/2/3
+// recovery state the way dharafs_find_latest_block_raw's own reads do
+// (see that function's own comment on why it deliberately returns "not
+// found" for everything the background scan hasn't reached yet, rather
+// than a slow unbounded scan). Same architectural move this project
+// already made once for kernel-slot state (kernelslot_record_buf,
+// blocks 9216/9217) and once, less formally, for WiFi firmware itself
+// (rtl8188cu_fw_raw_sd_base_block above, block 8192) -- this promotes
+// that pattern into a real, general, extensible key/value store.
+//
+// Layout: blocks 8224-8255 (32 blocks, comfortably past the firmware
+// raw region above and well clear of kernel-slot state at 9216+), two
+// full copies for ping-pong redundancy (same "higher generation wins"
+// convention as kernelslot's own A/B pair, which is itself "the same
+// redundancy convention U-Boot's own env storage uses"):
+//   blocks 8224-8239   copy A (16 blocks = 8192 bytes)
+//   blocks 8240-8255   copy B (same shape, ping-pong pair with A)
+// Each 8192-byte copy is 32 slots x 256 bytes. Slot 0 is reserved as
+// the copy's own header (magic + generation + header_crc32, 12 bytes,
+// rest zeroed) -- NOT a key/value record -- leaving 31 usable slots,
+// deliberately generous headroom over today's ~5 keys (wifi_ssid,
+// wifi_password, ble_target_name, config/mode, config/name). A new
+// config/credential type just claims the first unoccupied slot (same
+// first-fit shape as this codebase's own suspect-table find_slot) --
+// no layout/version migration needed, up to that 31-slot ceiling.
+//
+// Per-slot record (slots 1-31), 256 bytes:
+//   key[24]      null-padded ASCII path/name, e.g. "/wifi/ssid"
+//   flags(u32)   bit0=occupied, bit1=encrypted
+//   value_len(u32)  plaintext length, 0 if slot empty
+//   counter(u32)    AEAD nonce input when encrypted (mirrors dharafs_
+//                   crypto_encrypt_block's own "store a small counter,
+//                   not a full nonce" convention)
+//   tag[16]      AEAD authentication tag (encrypted slots only)
+//   crc32(u32)   covers key+flags+value_len+counter even for
+//                unencrypted slots, so corruption is always detectable
+//   value[200]   ciphertext (if encrypted) or plaintext
+//
+// Encryption deliberately reuses the SAME cipher call (chacha20_
+// poly1305_encrypt_heap/_decrypt_heap) and the same KDF (pbkdf2_hmac_
+// sha256) that DharaFS's own media encryption uses, but derives and
+// caches its OWN independent key (critical_config_crypto_key, boot/
+// critical_config_state.S) rather than sharing dharafs_crypto_key_ptr
+// -- dharafs_crypto_key_init() runs AFTER wifi_config_init()/ble_
+// config_init() in the boot sequence (kernel_main.vani's own task_main
+// call order), and this store's whole point is working correctly
+// regardless of DharaFS-related boot ordering, so it can't depend on
+// that key being ready yet.
+//
+// Torn-write safety: a flush to one copy writes its 31 data slots
+// FIRST, then its header (magic+generation) LAST -- a crash mid-flush
+// leaves that copy's header at its OLD generation (so a later load
+// correctly treats it as stale/untouched and falls back to the other,
+// still-fully-valid copy), never a torn mix of old header + new data
+// or vice versa.
+fn critical_config_base_block_copy_a() -> i64 { return 8224; }
+fn critical_config_base_block_copy_b() -> i64 { return 8240; }
+fn critical_config_blocks_per_copy() -> i64 { return 16; }
+fn critical_config_slot_count() -> i64 { return 32; } // includes header slot 0
+fn critical_config_slot_size() -> i64 { return 256; }
+fn critical_config_magic() -> u32 { return 0x43524346 as u32; } // "CRCF"
+
+// Reads one copy's header block (slot 0 only, 512 bytes) into a fresh
+// scratch buffer and returns its generation if magic+crc32 both check
+// out, or -1 if the copy is absent/corrupt/foreign. Cheap (one block
+// read) specifically so critical_config_table_load can compare both
+// copies' generations before committing to a full 16-block read of
+// the chosen one.
+fn critical_config_header_generation(base_block: i64) -> i64 {
+  let hdr_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let rd_status: i64 = sdhost_read_block(base_block, hdr_buf);
+  if rd_status != 0 {
+    return 0 - 1;
+  }
+  let magic: u32 = buf_read_u32_be(hdr_buf, 0);
+  if magic != critical_config_magic() {
+    return 0 - 1;
+  }
+  let generation: u32 = buf_read_u32_be(hdr_buf, 4);
+  let stored_crc: u32 = buf_read_u32_be(hdr_buf, 8);
+  let computed_crc: u32 = kernelslot_crc32(hdr_buf, 8);
+  if stored_crc != computed_crc {
+    return 0 - 1;
+  }
+  return generation as i64;
+}
+
+// Loads the table (both copies compared, higher valid generation
+// wins) into critical_config_table_scratch. Returns the generation
+// loaded, or -1 if neither copy is valid (fresh/foreign card -- every
+// slot in critical_config_table_scratch is then left zeroed by this
+// function, i.e. correctly reads back as "not found" for every key
+// rather than stale/undefined memory).
+fn critical_config_table_load() -> i64 {
+  let gen_a: i64 = critical_config_header_generation(critical_config_base_block_copy_a());
+  let gen_b: i64 = critical_config_header_generation(critical_config_base_block_copy_b());
+  let chosen_base: i64 = 0 - 1;
+  let chosen_gen: i64 = 0 - 1;
+  if (gen_a >= 0) && (gen_a >= gen_b) {
+    chosen_base = critical_config_base_block_copy_a();
+    chosen_gen = gen_a;
+  } else {
+    if gen_b >= 0 {
+      chosen_base = critical_config_base_block_copy_b();
+      chosen_gen = gen_b;
+    }
+  }
+  let table: mut ref i64 = critical_config_table_scratch_get();
+  if chosen_base < 0 {
+    let z: i64 = 0;
+    while z < 8192 {
+      let _ = buf_write_byte(table, z as u32, 0 as u32);
+      z = z + 1;
+    }
+    return 0 - 1;
+  }
+  // sdhost_read_block always fills a bare, offset-0 buffer -- read
+  // each block into a throwaway 512-byte scratch, then ssh_copy it
+  // into the right spot inside the full table (same (dst,dst_off,
+  // src,src_off,len) shape this codebase already uses everywhere
+  // else a sub-buffer-at-an-offset is needed, e.g. dharafs_read_raw's
+  // own multi-block assembly).
+  let block_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let blk: i64 = 0;
+  while blk < critical_config_blocks_per_copy() {
+    let _ = sdhost_read_block(chosen_base + blk, block_scratch);
+    let _ = ssh_copy(table, blk * (512 as i64), block_scratch, 0, 512);
+    blk = blk + 1;
+  }
+  return chosen_gen;
+}
+
+// Flushes critical_config_table_scratch's current in-RAM content to
+// ONE on-disk copy: data slots (1-31) first, header (slot 0, with
+// new_generation stamped in) LAST -- see this section's own "torn-
+// write safety" comment above for why that order matters.
+fn critical_config_table_flush_one_copy(base_block: i64, new_generation: u32) -> i64 {
+  let table: mut ref i64 = critical_config_table_scratch_get();
+  let block_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let blk: i64 = 1;
+  while blk < critical_config_blocks_per_copy() {
+    let _ = ssh_copy(block_scratch, 0, table, blk * (512 as i64), 512);
+    let wr_status: i64 = sdhost_write_block(base_block + blk, block_scratch);
+    if wr_status != 0 {
+      return wr_status;
+    }
+    blk = blk + 1;
+  }
+  let _ = buf_write_u32_be(table, 0, critical_config_magic());
+  let _ = buf_write_u32_be(table, 4, new_generation);
+  let header_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let _ = ssh_copy(header_scratch, 0, table, 0, 512);
+  let header_crc: u32 = kernelslot_crc32(header_scratch, 8);
+  let _ = buf_write_u32_be(header_scratch, 8, header_crc);
+  let _ = buf_write_u32_be(table, 8, header_crc); // keep in-RAM copy consistent too
+  return sdhost_write_block(base_block, header_scratch);
+}
+
+// Flushes to BOTH copies (same final content/generation once both
+// succeed) -- order between the two copies doesn't matter for
+// correctness, since each copy is independently made crash-safe by
+// critical_config_table_flush_one_copy's own data-then-header
+// ordering.
+fn critical_config_table_flush(new_generation: u32) -> i64 {
+  let status_a: i64 = critical_config_table_flush_one_copy(critical_config_base_block_copy_a(), new_generation);
+  if status_a != 0 {
+    return status_a;
+  }
+  return critical_config_table_flush_one_copy(critical_config_base_block_copy_b(), new_generation);
+}
+
+// Linear scan of the 31 usable slots (1-31) for a matching, occupied
+// key. Returns the slot index (1-31) or -1 if not found -- same
+// first-fit-lookup shape as this codebase's own suspect-table find_
+// slot. Assumes critical_config_table_scratch already holds the
+// loaded table (caller's job, via critical_config_table_load).
+fn critical_config_find_slot(key_buf: mut ref i64, key_len: i64) -> i64 {
+  if (key_len <= 0) || (key_len > 24) {
+    return 0 - 1;
+  }
+  let table: mut ref i64 = critical_config_table_scratch_get();
+  let slot: i64 = 1;
+  while slot < critical_config_slot_count() {
+    let slot_off: i64 = slot * critical_config_slot_size();
+    let flags: u32 = buf_read_u32_be(table, slot_off + 24);
+    if (flags & (1 as u32)) != (0 as u32) {
+      let matches_mut: i64 = 1;
+      let i: i64 = 0;
+      while i < 24 {
+        let stored_b: u32 = buf_read_byte(table, (slot_off + i) as u32);
+        let want_b: u32 = if i < key_len { buf_read_byte(key_buf, i as u32) } else { 0 as u32 };
+        if stored_b != want_b {
+          matches_mut = 0;
+        }
+        i = i + 1;
+      }
+      if matches_mut == 1 {
+        return slot;
+      }
+    }
+    slot = slot + 1;
+  }
+  return 0 - 1;
+}
+
+// Finds the first UNOCCUPIED usable slot (1-31), or -1 if the table
+// is full (31 distinct keys already in use -- raise critical_config_
+// slot_count if this is ever genuinely hit; today's ~5 real keys
+// leave wide headroom).
+fn critical_config_find_free_slot() -> i64 {
+  let table: mut ref i64 = critical_config_table_scratch_get();
+  let slot: i64 = 1;
+  while slot < critical_config_slot_count() {
+    let slot_off: i64 = slot * critical_config_slot_size();
+    let flags: u32 = buf_read_u32_be(table, slot_off + 24);
+    if (flags & (1 as u32)) == (0 as u32) {
+      return slot;
+    }
+    slot = slot + 1;
+  }
+  return 0 - 1;
+}
+
+// Lazily derives and caches this store's own independent AEAD key
+// (see this section's own header comment for why it's independent of
+// dharafs_crypto_key_ptr -- boot-ordering, not a security property).
+fn critical_config_crypto_key_ensure() -> i64 {
+  if critical_config_crypto_key_ready_get() == (1 as u32) {
+    return 0;
+  }
+  let passphrase: mut ref i64 = critical_config_key_scratch_get();
+  let pass_len: i64 = str_len_bytes("dhruva-critical-config-key-v1");
+  let _ = str_copy_to_buf("dhruva-critical-config-key-v1", passphrase);
+  let salt: mut ref i64 = critical_config_plain_scratch_get(); // scratch; overwritten on first real use
+  let salt_len: i64 = str_len_bytes("dhruva-critical-config-salt");
+  let _ = str_copy_to_buf("dhruva-critical-config-salt", salt);
+  let key: mut ref i64 = critical_config_crypto_key_get();
+  let _ = pbkdf2_hmac_sha256(passphrase, pass_len, salt, salt_len, 10000, key);
+  let _ = critical_config_crypto_key_ready_set(1 as u32);
+  return 0;
+}
+
+// Reads key_buf/key_len's value into out_buf (caller-allocated,
+// >=200 bytes). Returns the plaintext length, -1 if the key isn't
+// present (including "the whole table is fresh/foreign," from
+// critical_config_table_load's own -1 case -- an all-zeroed table has
+// every slot's occupied bit clear, so find_slot correctly reports
+// "not found" either way, no special-casing needed here), or -2 if
+// the stored record is corrupt (crc32 mismatch) or, for an encrypted
+// slot, the AEAD tag fails to verify (tamper or corruption -- fails
+// closed, same posture as dharafs_crypto_decrypt_block's own).
+fn critical_config_read_raw(key_buf: mut ref i64, key_len: i64, out_buf: mut ref i64) -> i64 {
+  let _ = critical_config_table_load();
+  let slot: i64 = critical_config_find_slot(key_buf, key_len);
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let table: mut ref i64 = critical_config_table_scratch_get();
+  let slot_off: i64 = slot * critical_config_slot_size();
+  let stored_crc: u32 = buf_read_u32_be(table, slot_off + 52);
+  let crc_scratch: mut ref i64 = dhruva_alloc_bytes(52);
+  let _ = ssh_copy(crc_scratch, 0, table, slot_off, 52);
+  let computed_crc: u32 = kernelslot_crc32(crc_scratch, 52);
+  if stored_crc != computed_crc {
+    return 0 - 2;
+  }
+  let value_len: i64 = buf_read_u32_be(table, slot_off + 28) as i64;
+  let flags: u32 = buf_read_u32_be(table, slot_off + 24);
+  if (flags & (2 as u32)) == (0 as u32) {
+    let _ = ssh_copy(out_buf, 0, table, slot_off + 56, value_len);
+    return value_len;
+  }
+  let _ = critical_config_crypto_key_ensure();
+  let counter: u32 = buf_read_u32_be(table, slot_off + 32);
+  let nonce: mut ref i64 = critical_config_nonce_scratch_get();
+  let _ = buf_write_u32_be(nonce, 0, slot as u32);
+  let _ = buf_write_u32_be(nonce, 4, counter);
+  let _ = buf_write_u32_be(nonce, 8, 0 as u32);
+  let aad: mut ref i64 = critical_config_aad_scratch_get();
+  let _ = buf_write_u32_be(aad, 0, 0 as u32);
+  let _ = buf_write_u32_be(aad, 4, slot as u32);
+  let value_scratch: mut ref i64 = dhruva_alloc_bytes(200);
+  let _ = ssh_copy(value_scratch, 0, table, slot_off + 56, value_len);
+  let tag_scratch: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = ssh_copy(tag_scratch, 0, table, slot_off + 36, 16);
+  let key: mut ref i64 = critical_config_crypto_key_get();
+  let dec_status: i64 = chacha20_poly1305_decrypt_heap(key, nonce, aad, 8, value_scratch, value_len, tag_scratch, out_buf);
+  if dec_status != 0 {
+    return 0 - 2;
+  }
+  return value_len;
+}
+
+// Writes key_buf/key_len = value_buf/value_len (<=200 bytes), either
+// updating an existing matching slot in place or claiming the first
+// free one. encrypted!=0 AEAD-protects the value with this store's
+// own key (see critical_config_crypto_key_ensure); encrypted==0
+// stores it in the clear (e.g. /config/mode, not a secret). Returns
+// 0 on success, -1 on a bad key/value length, -2 if the table is
+// full (no free slot for a genuinely new key), or a nonzero SD-write
+// status on a real I/O failure.
+fn critical_config_write_raw(key_buf: mut ref i64, key_len: i64, value_buf: mut ref i64, value_len: i64, encrypted: u32) -> i64 {
+  if (key_len <= 0) || (key_len > 24) || (value_len < 0) || (value_len > 200) {
+    return 0 - 1;
+  }
+  let loaded_gen: i64 = critical_config_table_load();
+  let slot: i64 = critical_config_find_slot(key_buf, key_len);
+  if slot < 0 {
+    slot = critical_config_find_free_slot();
+    if slot < 0 {
+      return 0 - 2;
+    }
+  }
+  let table: mut ref i64 = critical_config_table_scratch_get();
+  let slot_off: i64 = slot * critical_config_slot_size();
+  let i: i64 = 0;
+  while i < 24 {
+    let b: u32 = if i < key_len { buf_read_byte(key_buf, i as u32) } else { 0 as u32 };
+    let _ = buf_write_byte(table, (slot_off + i) as u32, b);
+    i = i + 1;
+  }
+  let prior_counter: u32 = buf_read_u32_be(table, slot_off + 32);
+  let new_counter: u32 = prior_counter + (1 as u32);
+  if encrypted == (0 as u32) {
+    let _ = ssh_copy(table, slot_off + 56, value_buf, 0, value_len);
+    let z: i64 = 0;
+    while z < 16 {
+      let _ = buf_write_byte(table, (slot_off + 36 + z) as u32, 0 as u32);
+      z = z + 1;
+    }
+  } else {
+    let _ = critical_config_crypto_key_ensure();
+    let nonce: mut ref i64 = critical_config_nonce_scratch_get();
+    let _ = buf_write_u32_be(nonce, 0, slot as u32);
+    let _ = buf_write_u32_be(nonce, 4, new_counter);
+    let _ = buf_write_u32_be(nonce, 8, 0 as u32);
+    let aad: mut ref i64 = critical_config_aad_scratch_get();
+    let _ = buf_write_u32_be(aad, 0, 0 as u32);
+    let _ = buf_write_u32_be(aad, 4, slot as u32);
+    let cipher_scratch: mut ref i64 = dhruva_alloc_bytes(200);
+    let tag_scratch: mut ref i64 = dhruva_alloc_bytes(16);
+    let key: mut ref i64 = critical_config_crypto_key_get();
+    let _ = chacha20_poly1305_encrypt_heap(key, nonce, aad, 8, value_buf, value_len, cipher_scratch, tag_scratch);
+    let _ = ssh_copy(table, slot_off + 56, cipher_scratch, 0, value_len);
+    let _ = ssh_copy(table, slot_off + 36, tag_scratch, 0, 16);
+  }
+  let _ = buf_write_u32_be(table, slot_off + 32, new_counter);
+  let flags: u32 = (1 as u32) | (if encrypted != (0 as u32) { 2 as u32 } else { 0 as u32 });
+  let _ = buf_write_u32_be(table, slot_off + 24, flags);
+  let _ = buf_write_u32_be(table, slot_off + 28, value_len as u32);
+  let crc_scratch: mut ref i64 = dhruva_alloc_bytes(52);
+  let _ = ssh_copy(crc_scratch, 0, table, slot_off, 52);
+  let record_crc: u32 = kernelslot_crc32(crc_scratch, 52);
+  let _ = buf_write_u32_be(table, slot_off + 52, record_crc);
+  let next_gen: u32 = (if loaded_gen >= 0 { loaded_gen as u32 } else { 0 as u32 }) + (1 as u32);
+  return critical_config_table_flush(next_gen);
+}
+
+// Str-literal convenience wrappers -- same shape as dharafs_read's
+// own Str overload over dharafs_read_raw.
+fn critical_config_read(key: Str, out_buf: mut ref i64) -> i64 {
+  let key_len: i64 = str_len_bytes(key);
+  if (key_len <= 0) || (key_len > 24) {
+    return 0 - 1;
+  }
+  let key_buf: mut ref i64 = critical_config_key_scratch_get();
+  let i: i64 = 0;
+  while i < key_len {
+    let _ = buf_write_byte(key_buf, i as u32, str_byte_at(key, i) as u32);
+    i = i + 1;
+  }
+  return critical_config_read_raw(key_buf, key_len, out_buf);
+}
+
+fn critical_config_write(key: Str, value_buf: mut ref i64, value_len: i64, encrypted: u32) -> i64 {
+  let key_len: i64 = str_len_bytes(key);
+  if (key_len <= 0) || (key_len > 24) {
+    return 0 - 1;
+  }
+  let key_buf: mut ref i64 = dhruva_alloc_bytes(24);
+  let i: i64 = 0;
+  while i < key_len {
+    let _ = buf_write_byte(key_buf, i as u32, str_byte_at(key, i) as u32);
+    i = i + 1;
+  }
+  return critical_config_write_raw(key_buf, key_len, value_buf, value_len, encrypted);
+}
+
 // TASK #164 FOLLOW-UP: the 8051 MCU reset sequence, verified against
 // Linux's real driver (rtl8xxxu_reset_8051 in core.c) -- shared by
 // both the "firmware already running" recovery path in
@@ -33581,6 +34011,26 @@ fn usb_hotplug_poll() -> i64 {
 // intermittency unrelated to any of rounds 29-31's own changes, not
 // a regression this driver's code caused at all.
 fn dwc2_probe_device0() -> i64 {
+  // BUG FIX (2026-11-07, real-HW intermittent enumeration failure):
+  // dwc2_init()'s own dwc2_reassert_core_config_post_port_reset() call
+  // used to immediately precede this function's first real transfer --
+  // back when this driver ran inline, on the boot path. Since the
+  // 2026-11-01 deferral (this function now runs from task_e's own
+  // background wake, see usb_probe0_pending's header), an often-multi-
+  // second gap opened up between that one-time reassert and the first
+  // GET_DESCRIPTOR attempt below: checkpoint14, the framebuffer self-
+  // test, task_create calls, checkpoint15/PASS, and DHCP client_start
+  // all run first. Rounds 9/29's own real-HW finding was specifically
+  // that GUSBCFG/GAHBCFG (PHYSEL/PHYLPWRCLKSEL/TOUTCAL/FORCEHOSTMODE,
+  // HBURSTLEN/DMAEN) silently revert on this silicon during exactly
+  // this kind of long wait -- confirmed live: two consecutive reboots
+  // produced "USB: background device0 probe complete, status=FFFFFFFF"
+  // alternating with status=00000000, correlating with how long task_e
+  // took to reach its first wake, not with anything device-side. Re-
+  // asserting here, immediately before the actual transfer loop,
+  // restores the original invariant regardless of how long the
+  // deferral took.
+  let _ = dwc2_reassert_core_config_post_port_reset();
   let desc64: mut ref i64 = dhruva_alloc_bytes(64);
   // Task #325 round 36: the very first GET_DESCRIPTOR(Device) this
   // driver ever issues used to get exactly ONE attempt -- any failure
@@ -38185,6 +38635,153 @@ fn shell_dispatch_kernelslot(line_buf: mut ref i64, cmd_end: i64, line_len: i64)
   return 0;
 }
 
+// Operator-facing front end for the Critical Config Store (see its
+// own design comment next to rtl8188cu_fw_raw_sd_base_block above).
+// `critconfig get <key>` / `critconfig set <key> <value> [--encrypted]`
+// are root-only (same posture as `wifikey`'s own credential-adjacent
+// commands) since this store exists specifically to hold things like
+// WiFi passwords; `critconfig list` only ever shows keys/metadata,
+// never values, so it stays unrestricted.
+fn shell_dispatch_critconfig(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  if cmd_end >= line_len {
+    let _ = uart_puts("usage: critconfig get <key> | critconfig set <key> <value> [--encrypted] | critconfig list\n");
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "list") == 1 {
+    let _ = critical_config_table_load();
+    let slot: i64 = 1;
+    let any: i64 = 0;
+    while slot < critical_config_slot_count() {
+      let table: mut ref i64 = critical_config_table_scratch_get();
+      let slot_off: i64 = slot * critical_config_slot_size();
+      let flags: u32 = buf_read_u32_be(table, slot_off + 24);
+      if (flags & (1 as u32)) != (0 as u32) {
+        any = 1;
+        let _ = uart_puts("  ");
+        let i: i64 = 0;
+        while i < 24 {
+          let b: u32 = buf_read_byte(table, (slot_off + i) as u32);
+          if b == (0 as u32) {
+            i = 24;
+          } else {
+            let _ = uart_putc(b as i64);
+            i = i + 1;
+          }
+        }
+        let value_len: i64 = buf_read_u32_be(table, slot_off + 28) as i64;
+        let _ = uart_puts(if (flags & (2 as u32)) != (0 as u32) { " (encrypted, " } else { " (plain, " });
+        let _ = uart_put_i64(value_len);
+        let _ = uart_puts(" bytes)\n");
+      }
+      slot = slot + 1;
+    }
+    if any == 0 {
+      let _ = uart_puts("  (empty)\n");
+    }
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "get") == 1 {
+    if dharafs_user_get_uid() != (0 as u32) {
+      let _ = uart_puts("critconfig: permission denied (root only)\n");
+      return 0;
+    }
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: critconfig get <key>\n");
+      return 0;
+    }
+    let key_start: i64 = sub_end + 1;
+    let key_end: i64 = shell_find_space(line_buf, key_start, line_len);
+    let key_len: i64 = key_end - key_start;
+    if (key_len <= 0) || (key_len > 24) {
+      let _ = uart_puts("critconfig: key must be 1-24 characters\n");
+      return 0;
+    }
+    let key_buf: mut ref i64 = dhruva_alloc_bytes(24);
+    let _ = shell_copy_range(line_buf, key_start, key_end, key_buf);
+    let out_buf: mut ref i64 = dhruva_alloc_bytes(200);
+    let read_len: i64 = critical_config_read_raw(key_buf, key_len, out_buf);
+    if read_len == (0 - 1) {
+      let _ = uart_puts("critconfig: not found\n");
+      return 0;
+    }
+    if read_len == (0 - 2) {
+      let _ = uart_puts("critconfig: corrupt (crc/tag mismatch) -- do not trust this value\n");
+      return 0;
+    }
+    let i: i64 = 0;
+    while i < read_len {
+      let _ = uart_putc(buf_read_byte(out_buf, i as u32) as i64);
+      i = i + 1;
+    }
+    let _ = uart_puts("\n");
+    return 0;
+  }
+
+  if shell_word_matches(line_buf, sub_start, sub_end, "set") == 1 {
+    if dharafs_user_get_uid() != (0 as u32) {
+      let _ = uart_puts("critconfig: permission denied (root only)\n");
+      return 0;
+    }
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: critconfig set <key> <value> [--encrypted]\n");
+      return 0;
+    }
+    let key_start: i64 = sub_end + 1;
+    let key_end: i64 = shell_find_space(line_buf, key_start, line_len);
+    let key_len: i64 = key_end - key_start;
+    if (key_len <= 0) || (key_len > 24) {
+      let _ = uart_puts("critconfig: key must be 1-24 characters\n");
+      return 0;
+    }
+    if key_end >= line_len {
+      let _ = uart_puts("usage: critconfig set <key> <value> [--encrypted]\n");
+      return 0;
+    }
+    let key_buf: mut ref i64 = dhruva_alloc_bytes(24);
+    let _ = shell_copy_range(line_buf, key_start, key_end, key_buf);
+    let value_start: i64 = key_end + 1;
+    let value_end: i64 = line_len;
+    let encrypted: u32 = 0 as u32;
+    // Optional trailing " --encrypted" flag -- same rest-of-line value
+    // shape ordinary `write` uses, just with one recognized suffix
+    // stripped back off if present.
+    let flag_str_len: i64 = 12; // " --encrypted"
+    let flag_start: i64 = value_end - flag_str_len;
+    if flag_start > value_start {
+      let flag_matches: i64 = shell_word_matches(line_buf, flag_start + 1, value_end, "--encrypted");
+      if (flag_matches == 1) && (buf_read_byte(line_buf, flag_start as u32) == (0x20 as u32)) {
+        value_end = flag_start;
+        encrypted = 1 as u32;
+      }
+    }
+    let value_len: i64 = value_end - value_start;
+    if (value_len < 0) || (value_len > 200) {
+      let _ = uart_puts("critconfig: value must be 0-200 characters\n");
+      return 0;
+    }
+    let value_buf: mut ref i64 = dhruva_alloc_bytes(200);
+    let _ = shell_copy_range(line_buf, value_start, value_end, value_buf);
+    let status: i64 = critical_config_write_raw(key_buf, key_len, value_buf, value_len, encrypted);
+    if status == 0 {
+      let _ = uart_puts("ok\n");
+    } else {
+      if status == (0 - 2) {
+        let _ = uart_puts("critconfig: table full (no free slot for a new key)\n");
+      } else {
+        let _ = uart_puts("critconfig: write failed\n");
+      }
+    }
+    return 0;
+  }
+
+  let _ = uart_puts("usage: critconfig get <key> | critconfig set <key> <value> [--encrypted] | critconfig list\n");
+  return 0;
+}
+
 // Round 51/62: shell front end for every fault-injection type this
 // project has. `fault alloc <n>` (round 51) deliberately triggers the
 // SAME real, unrecoverable dhruva_alloc_bytes OOM-fatal halt a genuine
@@ -39863,6 +40460,9 @@ fn shell_dispatch() -> i64 {
   }
   if shell_word_matches(line_buf, 0, cmd_end, "kernelslot") == 1 {
     return shell_dispatch_kernelslot(line_buf, cmd_end, line_len);
+  }
+  if shell_word_matches(line_buf, 0, cmd_end, "critconfig") == 1 {
+    return shell_dispatch_critconfig(line_buf, cmd_end, line_len);
   }
 
   // Round 42: change an existing file's permission bits. Mode is a
@@ -41853,6 +42453,17 @@ fn task_f() -> i64 {
   // Persists across while-loop iterations within this one never-
   // returning call frame; 0 means "no prior ACK yet this stream."
   let kup_last_ack_us: u32 = 0 as u32;
+  // TEMP DIAG (2026-11-07, real-HW per-window gap investigation
+  // follow-up): counts EVERY pass through the stream-active busy-poll
+  // branch below, regardless of whether it found any bytes -- isolates
+  // whether this loop is genuinely spinning at full rate between acks
+  // (iters_since_last_ack would be large, thousands+) or whether
+  // task_f itself is going mostly unscheduled for real stretches
+  // despite the "busy-poll, no sleep" design (iters_since_last_ack
+  // would stay small, single/low-double-digit) -- something diagnose's
+  // own tick-granularity ctxsw/irq counters can't distinguish.
+  let kup_iter_count: u32 = 0 as u32;
+  let kup_last_ack_iter: u32 = 0 as u32;
   while true {
     // TASK #355 (2026-10-12): `kernelupload stream` drain branch,
     // checked FIRST, before the ordinary ready/sleep/dispatch logic
@@ -41902,7 +42513,30 @@ fn task_f() -> i64 {
       // raw table write, no context switch, every single iteration of
       // this already-tight loop. Index 5 == task_f, matching task_
       // heartbeat_init's own hardcoded indices (kernel_main.vani).
-      let _ = task_heartbeat_last_tick_table_set_at(5 as u32, scheduler_get_tick_count());
+      let task_f_loop_tick: u32 = scheduler_get_tick_count();
+      let _ = task_heartbeat_last_tick_table_set_at(5 as u32, task_f_loop_tick);
+      kup_iter_count = kup_iter_count + (1 as u32);
+      // BUG FIX (2026-11-07, real-HW resumable-upload slowdown root
+      // cause): maintenance_mode_engage() (called once at the START of
+      // each resumechunk/stream command) stamps maintenance_mode_last_
+      // touch_tick exactly once and nothing ever re-touches it during
+      // the transfer that follows -- maintenance_mode_is_active() auto-
+      // expires it after MAINTENANCE_MODE_STALE_TICKS (30s), by design,
+      // to recover a genuinely abandoned transfer. But a single chunk
+      // at any real-HW-measured throughput takes well over 30s, so
+      // task_c/task_e/task_fsq (all correctly gated on maintenance_
+      // mode_is_active() per the 2026-11-06 round) silently resume
+      // their own dhruva_prio_lock(2)-held background work less than a
+      // third of the way into nearly every chunk -- contending with
+      // THIS loop's own accumulate/write for the exact same lock for
+      // almost the entire transfer. Live-measured effect: ~1.5-2s per
+      // 512-byte ACK window despite kernelupload_accumulate_bytes's own
+      // entry-to-accum cost being ~10ms -- the gap is lock-wait, not
+      // SD-write or protocol cost. Same self-attestation pattern as the
+      // task_heartbeat touch just above: re-stamp every iteration this
+      // loop is genuinely live, so a long transfer never goes stale
+      // mid-flight the way a dead/abandoned one correctly still does.
+      let _ = maintenance_mode_last_touch_tick_set(task_f_loop_tick);
       let batch: mut ref i64 = kernelupload_stream_batch_buf_get();
       // 2026-10-23: was 32 (kernelupload_stream_batch_buf's own OLD
       // size, see that buffer's header comment in boot/kernelupload_
@@ -42152,15 +42786,68 @@ fn task_f() -> i64 {
               // this project's own standing finding (feedback_dhruva_
               // uart_diag_timing_confound): diagnostic prints can
               // perturb the exact timing they're trying to observe.
-              if kup_last_ack_us != (0 as u32) {
-                let _ = uart_puts_bounded("TEMPDIAG2: gap_since_last_ack_us=");
-                let _ = uart_put_hex32_irq(wrapping_sub(temp_diag_t_entry, kup_last_ack_us));
-                let _ = uart_puts_bounded(" entry_to_accum_us=");
+              // REMOVED (2026-11-07, real-HW kernelupload throughput
+              // investigation): this used to print a multi-field
+              // TEMPDIAG2 line here, every ACK window, via the same
+              // nonblocking-ring primitives kernelupload_stream_report_
+              // ack itself uses. Live-captured proof this round: the
+              // string is long enough (~100 bytes) to overflow the
+              // 64-byte TX ring (boot/uart_tx_ring_state.S's own
+              // documented saturation/splicing failure mode) *by
+              // itself*, with no second writer needed -- its own tail
+              // and the immediately-following real ACK line got spliced
+              // together on the wire ("...iters_since_last0CK 00000200
+              // A...", losing the hex value, the newline, and "ACK"'s
+              // own "A"/"C"/"K" bytes), which is exactly what made the
+              // host's strict `ACK ` regex match fail and abort the
+              // transfer after the very first window. A diagnostic that
+              // corrupts the protocol it's trying to observe is worse
+              // than no diagnostic -- removed rather than shortened,
+              // since several rounds of live testing with it already
+              // found no anomaly in entry_to_accum_us or iters_since_
+              // last_ack before this was caught (see feedback_dhruva_
+              // uart_diag_timing_confound -- same standing finding,
+              // now with a correctness consequence, not just a timing
+              // one). The gap/iter bookkeeping below is harmless to
+              // keep (pure arithmetic, no I/O) in case this is revived
+              // later with a short, single-line, ring-safe format.
+              let temp_diag_prev_ack_us: u32 = kup_last_ack_us;
+              kup_last_ack_us = mmio_read_u32(TIMER_CLO);
+              kup_last_ack_iter = kup_iter_count;
+              let _ = kernelupload_stream_report_ack(total_now);
+              // TEMP DIAG 3 (2026-11-07, throughput-floor investigation,
+              // user request "CANNOT achieve faster speeds?"): placed
+              // AFTER report_ack on purpose -- this round's own TEMPDIAG2
+              // finding proved a diagnostic placed BEFORE the ack can
+              // wedge/corrupt the ack itself by overflowing the 64-byte
+              // TX ring. Printing here means even a worst-case overflow
+              // of THIS text only ever loses THIS text, never the
+              // protocol-critical ack line already on the wire. Kept
+              // deliberately short (~44 bytes, well under the ring's own
+              // budget) -- see this file's own TEMPDIAG2 removal comment
+              // just above for the exact overflow math that makes this
+              // margin matter, not just a style preference.
+              // gap = wall-clock between consecutive ack-send moments
+              // (what the host actually measures per window -- includes
+              // wire time for this window's bytes to arrive). acc = SD-
+              // write/accumulate cost alone (temp_diag_t_entry to
+              // temp_diag_t_after_accum, already computed above). ack =
+              // cost of the report_ack call itself (accum-done to ack-
+              // sent) -- isolates whether the remaining, still-
+              // unexplained gap (gap - acc - ~44ms wire time) is spent
+              // AFTER the SD write finishes but BEFORE the ack leaves,
+              // i.e. scheduling/lock delay this task_f iteration itself
+              // incurs, not SD or wire cost.
+              if temp_diag_prev_ack_us != (0 as u32) {
+                let temp_diag_t_after_ack: u32 = mmio_read_u32(TIMER_CLO);
+                let _ = uart_puts_bounded("TD3 gap=");
+                let _ = uart_put_hex32_irq(wrapping_sub(temp_diag_t_entry, temp_diag_prev_ack_us));
+                let _ = uart_puts_bounded(" acc=");
                 let _ = uart_put_hex32_irq(wrapping_sub(temp_diag_t_after_accum, temp_diag_t_entry));
+                let _ = uart_puts_bounded(" ack=");
+                let _ = uart_put_hex32_irq(wrapping_sub(temp_diag_t_after_ack, temp_diag_t_after_accum));
                 let _ = uart_puts_bounded("\n");
               }
-              kup_last_ack_us = mmio_read_u32(TIMER_CLO);
-              let _ = kernelupload_stream_report_ack(total_now);
             }
           }
         }
@@ -42310,10 +42997,26 @@ fn task_custom_demo() -> i64 {
 #[no_heap]
 #[wcet(cycles=100000)]
 fn task_mutex_demo_low_wake_body() -> i64 {
-  // 2026-10-23 (real-HW kernelupload-stream stall investigation): also
-  // require the stream to be inactive, not just LOG_CAT_DEMO -- see
-  // task_mutex_demo_high_wake_body's own matching comment for why.
-  let mlow_log: i64 = if ((log_state_get_mask() & (4 as u32)) != (0 as u32)) && (kernelupload_stream_active_get() == (0 as u32)) { 1 } else { 0 }; // LOG_CAT_DEMO
+  // BUG FIX (2026-11-07, real-HW kernelupload throughput investigation):
+  // the 2026-10-23 round below only ever gated this demo's PRINTS behind
+  // kernelupload_stream_active -- never the real dhruva_mutex_lock/sleep/
+  // unlock cycle itself, which runs completely unconditionally, every
+  // 7 real ticks (2+5), 24/7, including during an active kernelupload.
+  // task_mutex_demo_high (priority 0, the system's highest) wakes every
+  // 2 ticks and, by this pair's own design, is pigeonhole-GUARANTEED to
+  // contend on close to every attempt while this task holds the mutex
+  // across its own 5-tick sleep -- real, periodic, higher-than-task_f
+  // (priority 3) scheduling activity with no functional purpose beyond
+  // demonstrating priority inheritance, live-measured this session to
+  // land in roughly the same multi-second range as a real-HW kernel-
+  // upload's own per-window ACK gap. Same "maintenance-mode precedence"
+  // treatment task_c/task_e/task_fsq already got on 2026-10-23/2026-11-06
+  // for exactly this reason -- skipping the WHOLE cycle while a stream is
+  // active costs nothing real (deferred, never lost, same as those three),
+  // and removes a genuine contention source this round's own audit never
+  // actually closed, only reduced to "prints only."
+  if kernelupload_stream_active_get() == (0 as u32) {
+  let mlow_log: i64 = if (log_state_get_mask() & (4 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_DEMO
   if mlow_log == 1 {
     let _ = uart_puts_bounded("MUTEX-LOW: requesting demo mutex (own base prio=2)\n");
   }
@@ -42336,6 +43039,7 @@ fn task_mutex_demo_low_wake_body() -> i64 {
   // returns, giving a real measured unlock-to-running latency.
   let _ = mutex_handoff_t0_set(mmio_read_u32(TIMER_CLO));
   let _ = dhruva_mutex_unlock(0 as u32);
+  }
   return 0;
 }
 
@@ -42415,7 +43119,19 @@ fn task_mutex_demo_high_wake_body() -> i64 {
   // captured boot log), but gating them here removes a real contention
   // source for any config where LOG_CAT_DEMO is on, rather than relying
   // on it happening to be off.
-  let mhigh_log: i64 = if ((log_state_get_mask() & (4 as u32)) != (0 as u32)) && (kernelupload_stream_active_get() == (0 as u32)) { 1 } else { 0 }; // LOG_CAT_DEMO
+  //
+  // BUG FIX (2026-11-07, real-HW kernelupload throughput investigation):
+  // the round above only ever gated the PRINTS -- the real dhruva_mutex_
+  // lock/unlock pair just below ran unconditionally regardless, every 2
+  // ticks, 24/7. See task_mutex_demo_low_wake_body's own matching fix
+  // (same round) for the full "why" -- this task is the HIGH side of
+  // that exact pigeonhole-guaranteed contention, so it gets the same
+  // treatment, gated together (LOW already skips its own lock/unlock
+  // whenever a stream is active, so neither side can ever block waiting
+  // on the other while this guard is up -- no deadlock/orphaned-wait
+  // risk from gating only one side).
+  if kernelupload_stream_active_get() == (0 as u32) {
+  let mhigh_log: i64 = if (log_state_get_mask() & (4 as u32)) != (0 as u32) { 1 } else { 0 }; // LOG_CAT_DEMO
   if mhigh_log == 1 {
     let _ = uart_puts_bounded("MUTEX-HIGH: requesting demo mutex\n");
   }
@@ -42468,6 +43184,7 @@ fn task_mutex_demo_high_wake_body() -> i64 {
   let _ = dhruva_mutex_unlock(0 as u32);
   if mhigh_log == 1 {
     let _ = uart_puts_bounded("MUTEX-HIGH: released demo mutex\n");
+  }
   }
   return 0;
 }

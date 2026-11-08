@@ -550,6 +550,25 @@ dharafs_recovery_scan_cursor:
                      * plain local in the old inline scan loop, just
                      * now surviving across many bounded task_e calls
                      * instead of one single-shot function call. */
+dharafs_recovery_scan_target_blk:
+    .word 0        /* Tier-2 boot-hang follow-up (2026-11-07): where
+                     * dharafs_recovery_scan_continue's own loop stops.
+                     * Tier 3 (unknown tail, genuinely exhaustive) sets
+                     * this to dharafs_log_max_blk() -- identical to this
+                     * function's old hardcoded behavior, no change there.
+                     * Tier 2 (tail ALREADY known and trusted via its own
+                     * short write-cursor forward-scan) sets this to that
+                     * already-known next_block instead of the full log's
+                     * end -- Tier 2 used to leave the dirindex permanently
+                     * empty and rely on dharafs_find_latest_block_raw's
+                     * on-demand miss-scan to populate it lazily, which is
+                     * the exact same unbounded-scan-on-first-miss hazard
+                     * Tier 1 was found to have tonight, just gated by a
+                     * narrower (unclean-shutdown) trigger. Reusing the
+                     * SAME background scan machinery Tier 3 already has,
+                     * just bounded to a smaller, already-trusted range,
+                     * closes it the same way -- see dharafs_init's own
+                     * Tier 2 comment for where this gets set. */
 dharafs_recovery_next_free_blk_found:
     .word 0        /* Mirrors `next_free_blk` from the old inline scan
                      * loop: one past the last GENUINELY LIVE record
@@ -559,6 +578,34 @@ dharafs_recovery_next_free_blk_found:
 dharafs_recovery_highest_seq_found:
     .word 0        /* Mirrors `highest_seq` from the old inline scan
                      * loop likewise. */
+dharafs_dirindex_complete:
+    .word 0        /* Tier-1/Tier-3 boot-hang follow-up (2026-11-07):
+                     * dharafs_recovery_active==0 is ambiguous -- it means
+                     * BOTH "scan never needed to start" (Tier 1's own
+                     * snapshot-trusted fast path) AND "scan finished, index
+                     * now fully populated" (Tier 3 completion). The
+                     * dirindex-miss guard in dharafs_find_latest_block_raw
+                     * only ever checked recovery_active==1 (background scan
+                     * IN PROGRESS), so a Tier-1 boot -- which never sets
+                     * recovery_active to 1 at all -- left every genuinely-
+                     * absent config key's FIRST lookup (wifi_config_init/
+                     * ble_config_init, right after dharafs_init returns)
+                     * falling through to the full unguarded linear scan
+                     * this round's own 2026-11-01 comment already warned
+                     * about, live-reproduced twice on real HW tonight.
+                     * This flag disambiguates: 1 means the in-memory
+                     * dirindex is a known-COMPLETE, authoritative picture
+                     * of the whole log (set after Tier 1's snapshot load
+                     * succeeds, and after Tier 3's background scan
+                     * finishes) -- a miss against it is a real miss, never
+                     * worth a scan. Tier 2's own forward-scan fast path
+                     * does NOT set this directly (its own dirindex really
+                     * is still empty when it returns) -- instead it now
+                     * bootstraps the same background scan Tier 3 uses
+                     * (see dharafs_recovery_scan_target_blk below), which
+                     * sets this flag itself once THAT finishes. RAM-only
+                     * like recovery_active itself, same "resets cleanly
+                     * every boot, nothing to persist" reasoning. */
 
 .section ".text"
 
@@ -575,6 +622,19 @@ dharafs_recovery_active_set:
     mov r0, #0
     bx lr
 
+.global dharafs_dirindex_complete_get
+dharafs_dirindex_complete_get:
+    ldr r0, =dharafs_dirindex_complete
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_dirindex_complete_set
+dharafs_dirindex_complete_set:
+    ldr r1, =dharafs_dirindex_complete
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
 .global dharafs_recovery_scan_cursor_get
 dharafs_recovery_scan_cursor_get:
     ldr r0, =dharafs_recovery_scan_cursor
@@ -584,6 +644,19 @@ dharafs_recovery_scan_cursor_get:
 .global dharafs_recovery_scan_cursor_set
 dharafs_recovery_scan_cursor_set:
     ldr r1, =dharafs_recovery_scan_cursor
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dharafs_recovery_scan_target_blk_get
+dharafs_recovery_scan_target_blk_get:
+    ldr r0, =dharafs_recovery_scan_target_blk
+    ldr r0, [r0]
+    bx lr
+
+.global dharafs_recovery_scan_target_blk_set
+dharafs_recovery_scan_target_blk_set:
+    ldr r1, =dharafs_recovery_scan_target_blk
     str r0, [r1]
     mov r0, #0
     bx lr
