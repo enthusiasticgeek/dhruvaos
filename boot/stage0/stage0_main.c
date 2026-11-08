@@ -194,6 +194,30 @@ static void write_u32_le(unsigned char *buf, unsigned int off, unsigned int v) {
     buf[off + 3] = (unsigned char)(v >> 24);
 }
 
+/* 2026-11-08 (SD-wedge/crash-loop investigation follow-up): PM_RSTS is
+ * PM_RSTC's sibling status register (same BCM2835 PM block, one word
+ * apart -- 0x2010001C/0x20100020/0x20100024 are PM_RSTC/PM_RSTS/PM_WDOG
+ * in that order), read-only here, no password needed. Its even-numbered
+ * "partition" bits only ever get SET by a prior PM_RSTC write (ours or
+ * the firmware's) -- a real power-on/brown-out clears the whole PM
+ * block, including this register, back to 0, since it lives in the
+ * core power domain that a brown-out actually removes power from. So a
+ * nonzero value here means SOME software PM_RSTC write happened before
+ * this boot (this project's own watchdog, when armed, or the firmware's
+ * own reset-to-partition convention); an all-zero value is consistent
+ * with a genuine power-on/brown-out, which this codebase previously had
+ * no way to distinguish from a software-triggered reset at all (see
+ * project_dhruva_sd_wedge_sentinel_correlation_2026_10_18's own "NEW
+ * DATA POINT" entry -- this read is that entry's recommended next
+ * diagnostic step). Diagnostic only: printed, not acted on -- the
+ * existing attempt_count/bootlimit/last_reset_reason heuristic below is
+ * unchanged by this. */
+#define PM_RSTS 0x20100020u
+static unsigned int stage0_read_pm_rsts(void) {
+    volatile unsigned int *rsts = (volatile unsigned int *)PM_RSTS;
+    return *rsts;
+}
+
 /* Task #308 follow-up ("I need unattended debugging"/"reset reason"):
  * REASON_* values for last_reset_reason below -- see test/kernel_
  * slot_layout.py's own matching struct comment for the on-disk byte
@@ -293,6 +317,10 @@ void stage0_main(void) {
     int rc;
 
     u_puts("\nstage0: A/B kernel-slot loader starting\n");
+
+    u_puts("stage0: PM_RSTS=0x");
+    u_hex32(stage0_read_pm_rsts());
+    u_puts(" (nonzero implies a prior software PM_RSTC write; all-zero is consistent with a real power-on/brown-out)\n");
 
 #if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
     stage0_arm_watchdog();
