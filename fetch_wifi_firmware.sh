@@ -9,7 +9,7 @@
 #   ./fetch_wifi_firmware.sh [cache-dir]
 #
 # Prints the resolved firmware file path on stdout's last line on
-# success (so callers like flash_sd_card.sh/update_kernel.sh can
+# success (so callers like flash_sd_card.sh/update_stage0.sh can
 # capture it) -- everything else goes to stderr.
 set -euo pipefail
 

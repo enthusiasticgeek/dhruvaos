@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Updates config.txt on an already-flashed Dhruva OS SD card (see
 # flash_sd_card.sh for the original, destructive full-card setup this
-# does NOT repeat). Mirrors update_kernel.sh's own safety pattern --
+# does NOT repeat). Mirrors update_stage0.sh's own safety pattern --
 # same existing-boot-files/partition check -- but touches config.txt
 # instead of kernel.img. Use this when only a config.txt setting
 # changed (e.g. adding a diagnostic flag, or reverting a config.txt
@@ -14,7 +14,7 @@
 # Safety: never partitions or formats anything -- worst case here is
 # overwriting the wrong device's own config.txt file. No longer gated
 # on a specific card size (2026-09-26: dropped the old 55-68GB/"the
-# one known 64GB card" range check to match update_kernel.sh's own
+# one known 64GB card" range check to match update_stage0.sh's own
 # already-approved 2026-09-25 fix -- media in use varies, e.g. the
 # 14.9GB card in active use this session; a same-sized WRONG device
 # would have passed the old check too). The real safety net is the

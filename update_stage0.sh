@@ -1,20 +1,28 @@
 #!/usr/bin/env bash
-# Updates kernel.img on an already-flashed Dhruva OS SD card (see
+# Updates stage-0 (the file named kernel.img on the card's own FAT32
+# boot partition -- a GPU-firmware naming requirement, not a choice
+# this project made) on an already-flashed Dhruva OS SD card (see
 # flash_sd_card.sh for the original, destructive full-card setup this
 # does NOT repeat -- partition table, FAT32 format, and firmware files
 # are left completely untouched here).
 #
-# A/B kernel slots (task #308): the file named kernel.img on the card
-# is now permanently stage-0, NOT the real DhruvaOS kernel -- that's
-# what GPU firmware loads at the fixed physical address 0x8000, and
-# stage-0 is the one piece of this feature that genuinely still needs
-# the physical card-swap dance to update (expected to be extremely
-# rare once proven). Routine kernel_main.vani/kernel_main_rpi4.vani
-# changes go over UART instead (`kernelupload`/`kernelslot`, see
-# test/kernel_upload.py) -- never through this script anymore.
+# RENAMED 2026-11-09 (from update_kernel.sh) -- the name itself used
+# to be the exact confusion this script's own header already warned
+# about: A/B kernel slots (task #308) made the file literally named
+# kernel.img on the card permanently stage-0, NOT the real DhruvaOS
+# kernel -- that's what GPU firmware loads at the fixed physical
+# address 0x8000, and stage-0 is the one piece of this feature that
+# genuinely still needs the physical card-swap dance to update
+# (expected to be extremely rare once proven). Routine kernel_main.
+# vani/kernel_main_rpi4.vani changes go over UART instead
+# (`kernelupload`/`kernelslot`, see test/kernel_upload.py) -- never
+# through this script. A real-HW incident this same day (a board
+# hung with no watchdog recovery because this project's own build
+# tooling for "the kernel" and "stage0" never got run together) made
+# this worth actually fixing instead of just living with the warning.
 #
 # Usage:
-#   ./update_kernel.sh /dev/sdX [--with-wifi-firmware /dev/ttyUSB0]
+#   ./update_stage0.sh /dev/sdX [--with-wifi-firmware /dev/ttyUSB0]
 #
 # --with-wifi-firmware <serial-device> / --with-wifi-creds <ssid-file>
 # <pwd-file> (optional, 2026-10-10): same flags/behavior as

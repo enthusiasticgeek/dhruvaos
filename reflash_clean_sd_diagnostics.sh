@@ -10,7 +10,7 @@
 # has already accumulated across many prior real-hardware test boots.
 #
 # WHY this extra step, beyond what flash_sd_card.sh already does:
-# flash_sd_card.sh (and update_kernel.sh) only ever touch the FAT32
+# flash_sd_card.sh (and update_stage0.sh) only ever touch the FAT32
 # boot partition (starting at sector 16384, per docs/HARDWARE_IN_
 # LOOP.md's own partitioning). DharaFS's own log region (blocks
 # 1-2048), this project's crypto-metadata region (blocks 4000+), and

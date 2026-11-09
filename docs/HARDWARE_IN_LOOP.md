@@ -291,12 +291,26 @@ Copy `bootcode.bin`, `start.elf`, `fixup.dat` (§4.1), `config.txt`
 partition's root. Unmount cleanly, remove the card, insert it in the
 Pi (powered off).
 
-### 4.5 Updating just the kernel on an already-flashed card
+### 4.5 Updating stage0 on an already-flashed card (rare)
 
-Once a card has been through §4.2-§4.4 once, don't re-run
-`flash_sd_card.sh` for every `kernel_main.vani` change — it
-reformats the whole card from scratch. Use `update_kernel.sh` (repo
-root) instead: it rebuilds `kernel.img`, mounts the existing boot
+**This is NOT how routine `kernel_main.vani` changes get deployed.**
+Once a card has been through §4.2-§4.4 once, the A/B kernel-slot
+system means ordinary kernel changes go over UART instead
+(`kernelupload`/`kernelslot`, see `test/kernel_upload.py`) — never
+through a card-reader step at all. The only thing that still lives on
+the FAT32 boot partition, and therefore still needs the physical
+card-swap dance to update, is **stage0** — the tiny A/B loader the
+GPU firmware loads at the fixed address 0x8000 before the real kernel
+ever runs. The file is still literally named `kernel.img` on the card
+(a GPU-firmware naming requirement, not a choice this project made),
+which is exactly why the script that updates it used to be named
+`update_kernel.sh` — renamed to `update_stage0.sh` (2026-11-09) once
+that name collision caused a real mix-up (see `build_real_hw.sh`'s
+own header for the incident this fixed).
+
+Don't re-run `flash_sd_card.sh` to update stage0 — it reformats the
+whole card from scratch. Use `update_stage0.sh` (repo root) instead:
+it rebuilds stage0 as `kernel.img`, mounts the existing boot
 partition, verifies `bootcode.bin`/`start.elf`/`fixup.dat`/
 `config.txt` are already present (aborting without writing anything
 if not — it never fetches or writes firmware itself), and overwrites
@@ -304,8 +318,8 @@ only `kernel.img`.
 
 ```sh
 cd /path/to/dhruvaos
-./build.sh
-./update_kernel.sh /dev/sdX   # whole device, not a partition
+./build_stage0.sh
+./update_stage0.sh /dev/sdX   # whole device, not a partition
 ```
 
 It requires the device path explicitly (same convention as
@@ -442,7 +456,7 @@ real fidelity gaps:
 ### 6.1 Loading the RTL8188CU/RTL8188CUS WiFi firmware
 
 **Automated path (2026-10-10)**: pass `--with-wifi-firmware /dev/ttyUSB0`
-to either `flash_sd_card.sh` or `update_kernel.sh` -- after that
+to either `flash_sd_card.sh` or `update_stage0.sh` -- after that
 script's own card-prep work finishes, it fetches the firmware below
 via `fetch_wifi_firmware.sh` (if not already cached in `~/wifi-
 firmware/`, never committed to this repo either way), prompts you to

@@ -9403,7 +9403,7 @@ fn dharafs_ecc_gen_poly() -> [u8; 32] {
 // 8192-8223, kernelslot 9216/9217, kernelupload-chunk-progress
 // 9218/9219) -- EXCLUDING kernel slots A/B (10240-34815) and the FAT32
 // boot partition (36864+). Kernel slots are flashed by PC-side tooling
-// (deploy_realhw_watchdog.sh -> update_kernel.sh/kernel_slot_layout.py)
+// (deploy_realhw_watchdog.sh -> update_stage0.sh/kernel_slot_layout.py)
 // writing raw bytes straight to the SD block device from Linux,
 // completely bypassing this ARM kernel's own sdhost_read_block/
 // write_block -- this ECC table would never get updated on a flash, so
@@ -10160,7 +10160,7 @@ fn dharafs_block_payload_cap() -> i64 {
 // hardcoded bound -- so this was genuinely just a validation ceiling,
 // not a structural limit. 20480 (20KB) gives real margin over the
 // 16126-byte firmware, matching this project's own "give real margin,
-// not the bare minimum" convention (e.g. update_kernel.sh's device
+// not the bare minimum" convention (e.g. update_stage0.sh's device
 // size check, round 108's RAM extension). Swept and fixed every
 // buffer whose size was tied to the OLD 4096 value: dharafs_data_
 // scratch, dharafs_appendonly_check_scratch, and both dharafs_compact

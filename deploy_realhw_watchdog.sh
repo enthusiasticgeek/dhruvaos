@@ -5,7 +5,7 @@
 # kernel with its own matching watchdog enabled
 # (WATCHDOG_ENABLE_FOR_REAL_HARDWARE=1,
 # STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE=1), then runs
-# update_kernel.sh (non-destructive stage0.img swap) and
+# update_stage0.sh (non-destructive stage0.img swap) and
 # test/kernel_slot_layout.py's seed command (writes the watchdog-
 # enabled kernel into slot A with a fresh generation-1 slot-state
 # record) -- the exact three steps from docs/TODO.md's own task #353
@@ -16,7 +16,7 @@
 #   Defaults to /dev/sdb (this project's own reader device this
 #   session). Card must already be a first-time-flashed Dhruva card
 #   (flash_sd_card.sh already run on it once) -- same precondition
-#   update_kernel.sh itself already checks for.
+#   update_stage0.sh itself already checks for.
 #
 # vani has no preprocessor, so kernel_main.vani's two watchdog
 # constants need a real (scripted, not hand-tracked) temporary edit-
@@ -24,7 +24,7 @@
 # tree always ends up back at its checked-in flags=0 state, even if
 # a step fails partway through.
 #
-# Needs sudo for update_kernel.sh's own mount/cp and for
+# Needs sudo for update_stage0.sh's own mount/cp and for
 # kernel_slot_layout.py's raw block-device open (confirmed this
 # session: /dev/sdb is root:disk 0660, and this user isn't in the
 # disk group) -- prompts interactively, never stores a password.
@@ -78,10 +78,10 @@ rm -f "$ROOT/build/dhruva.elf"
 # this script returns control.
 trap 'cleanup; "$ROOT/build.sh" >/dev/null' EXIT
 
-echo "=== Step 3/4: update_kernel.sh -- stage0.img swap on $DEVICE (sudo) ==="
+echo "=== Step 3/4: update_stage0.sh -- stage0.img swap on $DEVICE (sudo) ==="
 sudo -v
 cp "$ROOT/build/stage0_realhw.elf" "$ROOT/build/stage0.elf"
-"$ROOT/update_kernel.sh" "$DEVICE"
+"$ROOT/update_stage0.sh" "$DEVICE"
 "$ROOT/build_stage0.sh" >/dev/null   # restore build/stage0.elf to flags=0 too
 
 echo "=== Step 4/4: seeding slot A with the watchdog-enabled kernel (sudo) ==="

@@ -26,7 +26,7 @@
 #   build/dhruva_real_hw.img  -- kernel image for the A/B kernel-slot
 #                                 serial upload path (test/kernel_upload.py)
 #   build/stage0.img          -- stage0 for the FAT32 boot partition
-#                                 (./update_kernel.sh /dev/sdX -- needs
+#                                 (./update_stage0.sh /dev/sdX -- needs
 #                                 physical SD card access, NOT reachable
 #                                 over the serial kernel-slot path at all)
 #   build/dhruva.elf          -- left rebuilt at the checked-in-default
@@ -89,4 +89,4 @@ echo "Built build/stage0.img (watchdog ON): $(sha256sum build/stage0.img)"
 echo
 echo "=== Done. Deploy: ==="
 echo "  Kernel (over serial, A/B slot): test/kernel_upload.py ... build/dhruva_real_hw.img"
-echo "  Stage0 (needs physical SD card access): ./update_kernel.sh /dev/sdX"
+echo "  Stage0 (needs physical SD card access): ./update_stage0.sh /dev/sdX"
