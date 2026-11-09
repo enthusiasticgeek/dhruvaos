@@ -35407,24 +35407,45 @@ fn log_level_init() -> i64 {
   return 0;
 }
 
-// WiFi credentials config (task #197 follow-up, 2026-10-01): reads
-// /config/wifi_ssid and /config/wifi_password, same dharafs_read()-
-// then-copy shape log_level_init() above already established. Two
-// separate files rather than one two-line file -- see boot/wifi_
-// config_state.S's own header comment for why. Missing/unreadable
-// file leaves that credential unset (buf stays zeroed, len stays 0)
-// -- quiet-by-default, matching every other config file in this
-// project, not an error (there's no WiFi hardware attached on every
-// boot this kernel runs, QEMU included, so "unconfigured" is the
-// common case, not a failure one). Truncates silently at the real
-// buffer capacity (32/64 bytes) rather than rejecting an oversized
-// file outright -- the 802.11 SSID field and WPA2-PSK passphrase
-// both have their own hard protocol-level maximums anyway (32, 63
-// bytes), so anything longer than this project's own buffers could
-// never have been a valid credential in the first place.
+// WiFi credentials config (task #197, 2026-10-01; migrated 2026-11-08
+// to the Critical Config Store -- see that store's own header comment
+// above rtl8188cu_fw_raw_sd_base_block's, and [[project_dhruva_sd_wedge_
+// sentinel_correlation_2026_10_18]]'s real-HW "wifi join" repro: this
+// used to read "/config/wifi_ssid"/"/config/wifi_password" via
+// dharafs_read, a ONE-SHOT call made early in boot that silently lost
+// the race against DharaFS's own Tier 3 background recovery scan --
+// a dirindex MISS during active recovery returns "not found"
+// immediately (by design, see dharafs_find_latest_block_raw's own
+// comment), and nothing here ever retried, so a boot that took Tier 3
+// had NO WiFi credentials for its entire session even though they
+// were genuinely on disk. critical_config_read has no DharaFS
+// dependency at all -- its own raw block range (8224-8255) sits
+// outside the recovery scan entirely, so this is correct on every
+// boot regardless of which DharaFS recovery tier it took.
+//
+// Deliberately NOT a dual-path (critical-config-first, dharafs-
+// fallback) shim -- this project's own standing preference against
+// backwards-compat hacks, and the Critical Config Store's own design
+// doc already calls for "no silent auto-migration": an operator with
+// credentials still only in the old DharaFS files needs to re-
+// provision them once via `critconfig set wifi_ssid <ssid>` /
+// `critconfig set wifi_password <password> --encrypted`, not have
+// them silently copied over. Missing/unreadable key leaves that
+// credential unset (buf stays zeroed, len stays 0) -- quiet-by-
+// default, matching every other config file in this project, not an
+// error. Truncates silently at the real buffer capacity (32/64 bytes)
+// rather than rejecting an oversized value outright -- the 802.11
+// SSID field and WPA2-PSK passphrase both have their own hard
+// protocol-level maximums anyway (32, 63 bytes), so anything longer
+// than this project's own buffers could never have been a valid
+// credential in the first place. critical_config_read's own out_buf
+// contract requires a >=200-byte scratch buffer (a slot's value field
+// is up to 200 bytes) -- allocated here and truncated into the real
+// 32/64-byte destination buffer afterward, same shape the old
+// dharafs_read call already used.
 fn wifi_config_init() -> i64 {
-  let ssid_heap: mut ref i64 = dhruva_alloc_bytes(32);
-  let ssid_read_len: i64 = dharafs_read("/config/wifi_ssid", ssid_heap);
+  let ssid_heap: mut ref i64 = dhruva_alloc_bytes(200);
+  let ssid_read_len: i64 = critical_config_read("wifi_ssid", ssid_heap);
   if ssid_read_len > 0 {
     let ssid_cap: i64 = if ssid_read_len > 32 { 32 } else { ssid_read_len };
     let ssid_dst: mut ref i64 = wifi_config_ssid_buf_ptr();
@@ -35437,8 +35458,8 @@ fn wifi_config_init() -> i64 {
     let _ = wifi_config_ssid_len_set(ssid_cap as u32);
   }
 
-  let pwd_heap: mut ref i64 = dhruva_alloc_bytes(64);
-  let pwd_read_len: i64 = dharafs_read("/config/wifi_password", pwd_heap);
+  let pwd_heap: mut ref i64 = dhruva_alloc_bytes(200);
+  let pwd_read_len: i64 = critical_config_read("wifi_password", pwd_heap);
   if pwd_read_len > 0 {
     let pwd_cap: i64 = if pwd_read_len > 64 { 64 } else { pwd_read_len };
     let pwd_dst: mut ref i64 = wifi_config_password_buf_ptr();
@@ -35453,14 +35474,14 @@ fn wifi_config_init() -> i64 {
   return 0;
 }
 
-// BLE target device name config (task #311 follow-up, "do same ble
-// too", 2026-10-01) -- same dharafs_read()-then-parse shape as
-// wifi_config_init above, just a single field (see boot/ble_config_
-// state.S's own header comment for why BLE has no password-equivalent
-// second field here).
+// BLE target device name config (task #311, 2026-10-01; migrated
+// 2026-11-08 to the Critical Config Store -- same dharafs-recovery-
+// race rationale as wifi_config_init above, just a single field (see
+// boot/ble_config_state.S's own header comment for why BLE has no
+// password-equivalent second field here).
 fn ble_config_init() -> i64 {
-  let name_heap: mut ref i64 = dhruva_alloc_bytes(32);
-  let name_read_len: i64 = dharafs_read("/config/ble_target_name", name_heap);
+  let name_heap: mut ref i64 = dhruva_alloc_bytes(200);
+  let name_read_len: i64 = critical_config_read("ble_target_name", name_heap);
   if name_read_len > 0 {
     let name_cap: i64 = if name_read_len > 32 { 32 } else { name_read_len };
     let name_dst: mut ref i64 = ble_config_target_name_buf_ptr();
@@ -37500,8 +37521,9 @@ const KERNELUPLOAD_RX_RING_MASK: i64 = 4095;
 // block's own per-call boundary in kernelupload_accumulate_bytes) so
 // test/kernel_upload.py's send_raw_ack_paced can treat this ACK as a
 // real flow-control signal: it blocks the NEXT window's send on
-// seeing this board confirm the PREVIOUS window (<=512 bytes) was
-// fully absorbed -- ring-popped, SD-written (including any wedge
+// seeing this board confirm the PREVIOUS window (<=KERNELUPLOAD_ACK_
+// INTERVAL_BYTES, grown past 512 since -- see that constant's own
+// header below) was fully absorbed -- ring-popped, SD-written (including any wedge
 // retries), hashed -- before any more bytes leave the host. That
 // guarantees zero bytes are ever in flight while sdhost_write_block's
 // own masked (IRQ+FIQ disabled) critical section is running, however
@@ -37510,7 +37532,30 @@ const KERNELUPLOAD_RX_RING_MASK: i64 = 4095;
 // kernelupload_state.S) for the real-HW measurement (139ms on a
 // 13-year-old card) that motivated this over the old fixed-delay host
 // pacing it replaces.
-const KERNELUPLOAD_ACK_INTERVAL_BYTES: u32 = 512;
+//
+// 2026-11-08 (real-HW throughput investigation, user request "needs
+// solution for faster transfer -- bulk write or burst transfer"):
+// grown 512 -> 2048 (4 SD blocks/ACK window instead of 1), same
+// "fewer unlock() points = fewer scheduling-escape windows" lesson
+// the 32->512 growth already applied (see kernelupload_stream_batch_
+// buf's own header, boot/kernelupload_state.S) -- this round's own
+// live measurement found ~0.5-1.5s of dhruva_prio_lock(2) contention
+// per 512-byte window despite kernelupload_accumulate_bytes's own
+// entry-to-accum cost being ~10ms (the maintenance_mode continuous-
+// restamp fix from 2026-11-07 did NOT fully eliminate this on a
+// retest -- recorded as a new, still-open data point, not re-solved
+// here). kernelupload_accumulate_bytes already loops over however
+// many bytes it's given, writing one SD block per 512 -- no change
+// needed there, just how much task_f hands it per lock/unlock pair.
+// Deliberately NOT raised to 4096 (kernelupload_rx_ring_buf's own
+// full capacity): that ring's own header comment already sizes its
+// margin as "generous" against task_f scheduling delay at today's
+// 512-byte window; spending the WHOLE ring on one window would zero
+// out that margin right when scheduling delay is the active problem
+// being worked around. 2048 leaves half the ring (≈177ms of
+// continuous full-rate 115200-baud arrival) as headroom while still
+// cutting the number of lock-acquisition/ACK round trips 4x.
+const KERNELUPLOAD_ACK_INTERVAL_BYTES: u32 = 2048;
 
 // TASK #355 round 2: push ONE byte -- called ONLY from irq_dispatch
 // (the ring's sole producer, always interrupt context). O(1), no
@@ -39691,33 +39736,20 @@ fn shell_dispatch() -> i64 {
   // local copy. task_f's own former post-dispatch call is now redundant
   // and was removed there.
   let _ = shell_clear_line();
-  // TEMP DIAGNOSTIC (2026-10-24, real-HW DharaFS data-loss
-  // investigation, final round): show the RAW, freshly-copied
-  // line_buf content for EVERY dispatch, one level earlier than any
-  // previous diagnostic in this round -- directly reveals whether
-  // dispatch is ever processing a DIFFERENT line than what was
-  // actually just typed/echoed. Moved to run AFTER shell_clear_line()
-  // (2026-10-24 follow-up): this print was ORIGINALLY inserted before
-  // shell_clear_line(), which re-opened the exact "WIFIKEY-UPLOAD RACE
-  // FIX" ordering bug this function's own header comment above already
-  // documents and fixed once (2026-09-14) -- shell_rx_push_char drops
-  // every incoming byte while shell_line_ready stays 1, and these 4
-  // uart_puts calls (several ms of blocking per-byte TX at 115200 baud)
-  // extended that window far past what any human typist would ever
-  // hit, but well within range of a scripted host sending the next
-  // command every few seconds. This is the real, confirmed mechanism
-  // behind this entire session's "intermittent data loss" investigation
-  // -- line_buf here is the SAFE local scratch copy (shell_line_scratch_
-  // get(), a different buffer from the global shell_line_buf the ISR
-  // writes into), so printing from it after clear_line() is fully safe
-  // regardless of how long the print takes. Remove this block entirely
-  // once root-caused/confirmed fixed.
-  let _ = uart_puts("DISPATCH line_len=");
-  let _ = uart_put_hex32(line_len as u32);
-  let _ = uart_puts(" line=\"");
-  let _ = dharafs_print_data(line_buf, line_len);
-  let _ = uart_puts("\"\n");
-
+  // 2026-11-08: removed the 2026-10-24 "TEMP DIAGNOSTIC" block that used
+  // to sit here (unconditional uart_puts of the raw, freshly-copied
+  // line_buf for EVERY dispatch -- see git history for the original
+  // comment). That data-loss investigation is long closed, and the print
+  // was explicitly marked "remove once root-caused/confirmed fixed" but
+  // never removed. Left in place, it's a real credential-leak vector:
+  // it echoes the full command line -- including `critconfig set
+  // wifi_password <pw> --encrypted`'s own plaintext argument -- back
+  // over UART on every single command, which a running uart-logger
+  // lands straight into ~/dhruva_uart.log regardless of what any host
+  // script does to avoid printing it client-side. Discovered while
+  // building the host-side tool for re-provisioning wifi_password into
+  // the new Critical Config Store; removed rather than special-cased
+  // per this project's standing anti-workaround policy.
   let cmd_end: i64 = shell_find_space(line_buf, 0, line_len);
 
   // Host-side real-HW test tooling (test/wifikey_upload.py and this
@@ -42447,23 +42479,16 @@ fn shell_dispatch() -> i64 {
 #[no_mangle]
 #[bounded_stack(bytes=16384)]
 fn task_f() -> i64 {
-  // TEMP DIAG (2026-11-06): root-causing the real-HW kernelupload
-  // per-512-byte-window stall (~2.3s/window observed, 16ms SD write
-  // confirmed via rxdiag -- something ELSE between ACKs is slow).
-  // Persists across while-loop iterations within this one never-
-  // returning call frame; 0 means "no prior ACK yet this stream."
-  let kup_last_ack_us: u32 = 0 as u32;
-  // TEMP DIAG (2026-11-07, real-HW per-window gap investigation
-  // follow-up): counts EVERY pass through the stream-active busy-poll
-  // branch below, regardless of whether it found any bytes -- isolates
-  // whether this loop is genuinely spinning at full rate between acks
-  // (iters_since_last_ack would be large, thousands+) or whether
-  // task_f itself is going mostly unscheduled for real stretches
-  // despite the "busy-poll, no sleep" design (iters_since_last_ack
-  // would stay small, single/low-double-digit) -- something diagnose's
-  // own tick-granularity ctxsw/irq counters can't distinguish.
-  let kup_iter_count: u32 = 0 as u32;
-  let kup_last_ack_iter: u32 = 0 as u32;
+  // 2026-11-08: removed the 2026-11-06/2026-11-07 TEMP DIAG machinery
+  // that used to live here (kup_last_ack_us/kup_iter_count/
+  // kup_last_ack_iter, feeding the "TD3 gap=... acc=... ack=..." print
+  // below) -- see that print's own removal site further down for the
+  // real-HW-confirmed root cause (uart_tx_ring overflow, not a
+  // scheduler-contention finding this diagnostic was ever able to
+  // measure safely). kup_iter_count/kup_last_ack_iter were already
+  // fully dead by the time this was found (leftover from the earlier,
+  // separately-removed TEMPDIAG2's own "iters_since_last_ack" field --
+  // nothing ever read kup_last_ack_iter back).
   while true {
     // TASK #355 (2026-10-12): `kernelupload stream` drain branch,
     // checked FIRST, before the ordinary ready/sleep/dispatch logic
@@ -42515,7 +42540,6 @@ fn task_f() -> i64 {
       // heartbeat_init's own hardcoded indices (kernel_main.vani).
       let task_f_loop_tick: u32 = scheduler_get_tick_count();
       let _ = task_heartbeat_last_tick_table_set_at(5 as u32, task_f_loop_tick);
-      kup_iter_count = kup_iter_count + (1 as u32);
       // BUG FIX (2026-11-07, real-HW resumable-upload slowdown root
       // cause): maintenance_mode_engage() (called once at the START of
       // each resumechunk/stream command) stamps maintenance_mode_last_
@@ -42541,10 +42565,15 @@ fn task_f() -> i64 {
       // 2026-10-23: was 32 (kernelupload_stream_batch_buf's own OLD
       // size, see that buffer's header comment in boot/kernelupload_
       // state.S for the real-HW find this closes) -- grown to 512
-      // (KERNELUPLOAD_ACK_INTERVAL_BYTES, one SD block) so one pass
-      // through this loop can drain a WHOLE ack-window's worth in one
-      // dhruva_prio_lock(2)/unlock(3) pair, not up to sixteen.
-      let popped: i64 = kernelupload_rx_ring_pop_batch(batch, 512);
+      // (one SD block) so one pass through this loop can drain a
+      // WHOLE ack-window's worth in one dhruva_prio_lock(2)/
+      // unlock(3) pair, not up to sixteen. 2026-11-08: grown again to
+      // match KERNELUPLOAD_ACK_INTERVAL_BYTES's own 512->2048 growth
+      // (that constant's own header comment has the full rationale)
+      // -- this cap and the ack interval must always match, since
+      // this is what decides how much of one ack-window actually
+      // lands in `batch` per call.
+      let popped: i64 = kernelupload_rx_ring_pop_batch(batch, 2048);
       if popped == 0 {
         // TASK #355 follow-up (real-HW find, 2026-10-15): no new
         // bytes this iteration -- check whether the stream has gone
@@ -42684,7 +42713,6 @@ fn task_f() -> i64 {
         }
       }
       if popped > 0 {
-        let temp_diag_t_entry: u32 = mmio_read_u32(TIMER_CLO);
         let _ = kernelupload_stream_last_activity_tick_set(scheduler_get_tick_count());
         let _ = maintenance_mode_engage();
         let total_before: i64 = kernelupload_total_len_get() as i64;
@@ -42713,7 +42741,6 @@ fn task_f() -> i64 {
             sd_write_failed = 1;
           }
         }
-        let temp_diag_t_after_accum: u32 = mmio_read_u32(TIMER_CLO);
         // TASK #357 follow-up (2026-10-16, systematic concurrency
         // audit per user request): this drain loop MUST run, and
         // finish, before kernelupload_stream_active is ever cleared --
@@ -42760,94 +42787,44 @@ fn task_f() -> i64 {
             let last_ack: u32 = kernelupload_stream_last_ack_len_get();
             if (total_now - last_ack) >= KERNELUPLOAD_ACK_INTERVAL_BYTES {
               let _ = kernelupload_stream_last_ack_len_set(total_now);
-              // TEMP DIAG (2026-11-06): see task_f's own header comment.
-              // gap_us = time since the PREVIOUS ack was sent (covers
-              // host round-trip + any time this task spent not running
-              // at all, e.g. preempted/evicted) -- 0 on the very first
-              // ack of a stream (nothing to compare against yet).
-              // entry_to_accum_us = how long THIS iteration spent
-              // between noticing popped>0 and finishing the SD-write/
-              // hash accumulation -- isolates real on-board processing
-              // cost from everything else.
-              // FIX (2026-11-06): was uart_puts/uart_put_hex32 (the
-              // DMA-eligible, blocking-on-DMA-busy path) -- every call
-              // here kicked off a real DMA transfer (uart_puts's own
-              // string is 19-33 bytes, well over UART_DMA_MIN_LEN=8),
-              // and EVERY following uart_putc call (inside uart_put_
-              // hex32's digit loop, and uart_puts's own internal "\n"
-              // fallback) busy-waits at its own top until dma_uart_tx_
-              // busy() clears -- live-confirmed this round: switching
-              // to this ring-based, non-DMA pair (the SAME primitives
-              // kernelupload_stream_report_ack already correctly uses
-              // for the real ACK line) is what finally isolates whether
-              // the remaining ~481-508ms per-window gap is a real
-              // board/scheduling bug or an artifact of this diagnostic
-              // itself measuring its own DMA-busy-wait cost. Matches
-              // this project's own standing finding (feedback_dhruva_
-              // uart_diag_timing_confound): diagnostic prints can
-              // perturb the exact timing they're trying to observe.
-              // REMOVED (2026-11-07, real-HW kernelupload throughput
-              // investigation): this used to print a multi-field
-              // TEMPDIAG2 line here, every ACK window, via the same
-              // nonblocking-ring primitives kernelupload_stream_report_
-              // ack itself uses. Live-captured proof this round: the
-              // string is long enough (~100 bytes) to overflow the
-              // 64-byte TX ring (boot/uart_tx_ring_state.S's own
-              // documented saturation/splicing failure mode) *by
-              // itself*, with no second writer needed -- its own tail
-              // and the immediately-following real ACK line got spliced
-              // together on the wire ("...iters_since_last0CK 00000200
-              // A...", losing the hex value, the newline, and "ACK"'s
-              // own "A"/"C"/"K" bytes), which is exactly what made the
-              // host's strict `ACK ` regex match fail and abort the
-              // transfer after the very first window. A diagnostic that
-              // corrupts the protocol it's trying to observe is worse
-              // than no diagnostic -- removed rather than shortened,
-              // since several rounds of live testing with it already
-              // found no anomaly in entry_to_accum_us or iters_since_
-              // last_ack before this was caught (see feedback_dhruva_
-              // uart_diag_timing_confound -- same standing finding,
-              // now with a correctness consequence, not just a timing
-              // one). The gap/iter bookkeeping below is harmless to
-              // keep (pure arithmetic, no I/O) in case this is revived
-              // later with a short, single-line, ring-safe format.
-              let temp_diag_prev_ack_us: u32 = kup_last_ack_us;
-              kup_last_ack_us = mmio_read_u32(TIMER_CLO);
-              kup_last_ack_iter = kup_iter_count;
+              // 2026-11-08: removed the "TD3 gap=... acc=... ack=..."
+              // diagnostic that used to print here (2026-11-06/
+              // 2026-11-07 throughput investigation; a still-earlier
+              // TEMPDIAG2 at this same call site was already removed
+              // for the identical reason -- see git history). Root
+              // cause, confirmed by direct arithmetic plus two live
+              // real-HW repros: the real ACK line (kernelupload_
+              // stream_report_ack, just below) is exactly 23 bytes
+              // ("ACK " + 8 hex + " " + 8 hex + "\r\n"); the removed
+              // TD3 line was 43 bytes. 23+43 = 66 bytes, pushed back-
+              // to-back at CPU speed with no wait in between, into
+              // uart_tx_ring_buf's 64-byte capacity (63 usable --
+              // boot/uart_tx_ring_state.S's own header comment) --
+              // already over budget by 3 bytes even in the BEST case
+              // where the ring starts completely empty. Whether this
+              // actually corrupts the wire depends on how much of that
+              // 63 bytes was already free when the pair started
+              // printing: with generous multi-hundred-ms gaps between
+              // ACKs (the common case, and why this ran for a full
+              // 98-minute real-HW transfer earlier this session with
+              // readable TD3 output the whole time) the ring has
+              // already drained to real wire output between windows
+              // and mostly absorbs the overshoot; but after any long
+              // stall, several pending windows get processed back-to-
+              // back with near-zero gap, and the SAME 66-byte-per-pair
+              // push repeats with no drain time in between -- confirmed
+              // live twice this session, each time garbling the ACK
+              // line itself ("ACK" losing its leading "A", two lines
+              // splicing into each other) and aborting the transfer.
+              // Not a hang, not a new "FIQWD STALL" condition (that
+              // exact text appears nowhere in this codebase's history;
+              // it was corrupted wire output from this same overflow,
+              // not a real print). Same fix precedent as TEMPDIAG2's
+              // own removal: a diagnostic that corrupts the protocol
+              // it's trying to observe is worse than no diagnostic --
+              // and the two prints can never jointly exceed the ring
+              // again once there's only one of them.
               let _ = kernelupload_stream_report_ack(total_now);
-              // TEMP DIAG 3 (2026-11-07, throughput-floor investigation,
-              // user request "CANNOT achieve faster speeds?"): placed
-              // AFTER report_ack on purpose -- this round's own TEMPDIAG2
-              // finding proved a diagnostic placed BEFORE the ack can
-              // wedge/corrupt the ack itself by overflowing the 64-byte
-              // TX ring. Printing here means even a worst-case overflow
-              // of THIS text only ever loses THIS text, never the
-              // protocol-critical ack line already on the wire. Kept
-              // deliberately short (~44 bytes, well under the ring's own
-              // budget) -- see this file's own TEMPDIAG2 removal comment
-              // just above for the exact overflow math that makes this
-              // margin matter, not just a style preference.
-              // gap = wall-clock between consecutive ack-send moments
-              // (what the host actually measures per window -- includes
-              // wire time for this window's bytes to arrive). acc = SD-
-              // write/accumulate cost alone (temp_diag_t_entry to
-              // temp_diag_t_after_accum, already computed above). ack =
-              // cost of the report_ack call itself (accum-done to ack-
-              // sent) -- isolates whether the remaining, still-
-              // unexplained gap (gap - acc - ~44ms wire time) is spent
-              // AFTER the SD write finishes but BEFORE the ack leaves,
-              // i.e. scheduling/lock delay this task_f iteration itself
-              // incurs, not SD or wire cost.
-              if temp_diag_prev_ack_us != (0 as u32) {
-                let temp_diag_t_after_ack: u32 = mmio_read_u32(TIMER_CLO);
-                let _ = uart_puts_bounded("TD3 gap=");
-                let _ = uart_put_hex32_irq(wrapping_sub(temp_diag_t_entry, temp_diag_prev_ack_us));
-                let _ = uart_puts_bounded(" acc=");
-                let _ = uart_put_hex32_irq(wrapping_sub(temp_diag_t_after_accum, temp_diag_t_entry));
-                let _ = uart_puts_bounded(" ack=");
-                let _ = uart_put_hex32_irq(wrapping_sub(temp_diag_t_after_ack, temp_diag_t_after_accum));
-                let _ = uart_puts_bounded("\n");
-              }
             }
           }
         }
@@ -47397,11 +47374,11 @@ fn wifi_real_join() -> i64 {
   let ssid_len: i64 = wifi_config_ssid_len_get() as i64;
   let password_len: i64 = wifi_config_password_len_get() as i64;
   if ssid_len == 0 {
-    let _ = uart_puts("wifi join: no SSID configured (write /config/wifi_ssid <name>, reboot, then retry)\n");
+    let _ = uart_puts("wifi join: no SSID configured (critconfig set wifi_ssid <name>, reboot, then retry)\n");
     return 0 - 1;
   }
   if password_len == 0 {
-    let _ = uart_puts("wifi join: no password configured (write /config/wifi_password <pw>, reboot, then retry)\n");
+    let _ = uart_puts("wifi join: no password configured (critconfig set wifi_password <pw> --encrypted, reboot, then retry)\n");
     return 0 - 1;
   }
   if wifi_radio_init_rtl8188cu() == 0 {
@@ -47744,7 +47721,7 @@ fn ble_scan_for_target(devaddr: u32, mps_intr: u32, target_name: mut ref i64, ta
 fn ble_real_connect() -> i64 {
   let name_len: i64 = ble_config_target_name_len_get() as i64;
   if name_len == 0 {
-    let _ = uart_puts("ble connect: no target device name configured (write /config/ble_target_name <name>, reboot, then retry)\n");
+    let _ = uart_puts("ble connect: no target device name configured (critconfig set ble_target_name <name>, reboot, then retry)\n");
     return 0 - 1;
   }
   if ble_radio_init_generic_hci() == 0 {

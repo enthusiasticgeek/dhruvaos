@@ -94,7 +94,16 @@ kernelslot_record_buf:
  * path encodes: drain the WHOLE accumulated buffer in one upcall,
  * not an arbitrary small fixed batch -- the old 32-byte constant was
  * never wrong for the workload it was sized against, just silently
- * wrong for this new one. */
+ * wrong for this new one.
+ *
+ * 2026-11-08: grown again, 512 -> 2048 bytes, matching kernel_main.
+ * vani's own KERNELUPLOAD_ACK_INTERVAL_BYTES growth (that constant's
+ * own header has the full real-HW throughput rationale) -- same
+ * "fewer unlock() points" lesson taken one step further: 4 SD
+ * blocks drained/written/hashed per dhruva_prio_lock(2)/unlock(3)
+ * pair instead of 1. Stops at 2048, not kernelupload_rx_ring_buf's
+ * own full 4096-byte capacity -- see that buffer's own header for
+ * why spending the WHOLE ring on one window isn't the move here. */
 kernelupload_stream_active:
     .space 4
 kernelupload_stream_expected_len:
@@ -102,7 +111,7 @@ kernelupload_stream_expected_len:
 kernelupload_stream_last_ack_len:
     .space 4
 kernelupload_stream_batch_buf:
-    .space 512
+    .space 2048
 /* TASK #355, round 2: kernelupload_rx_ring is a lock-free single-
  * producer/single-consumer byte ring -- irq_dispatch (interrupt
  * context) is its ONLY producer, task_f (its own new streaming

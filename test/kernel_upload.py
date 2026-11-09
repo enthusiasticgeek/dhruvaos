@@ -55,13 +55,21 @@ BAUD_MAP = {
 }
 
 # How often (in received bytes) the board sends an ACK line -- must
-# match kernel_main.vani's own task_f streaming branch threshold.
+# match kernel_main.vani's own task_f streaming branch threshold
+# (KERNELUPLOAD_ACK_INTERVAL_BYTES there).
 # 2026-10-23 (aged-SD-card stall investigation): reduced from 65536 to
 # 512 (one SD block) specifically so this can double as the real ACK-
 # driven flow-control window below, not just a progress heartbeat --
 # see send_raw_ack_paced's own docstring for why that granularity
 # matters, not merely how often it previously fired.
-ACK_INTERVAL_BYTES = 512
+# 2026-11-08 (real-HW throughput investigation): grown 512 -> 2048 --
+# a live transfer measured ~0.5-1.5s of unrelated scheduler lock
+# contention PER 512-byte window (see KERNELUPLOAD_ACK_INTERVAL_BYTES's
+# own kernel-side header for the full rationale); batching 4 SD blocks
+# per ACK round trip cuts the number of times that contention can be
+# hit roughly 4x, without touching the ACK-driven flow-control
+# guarantee itself (still zero bytes in flight during any SD write).
+ACK_INTERVAL_BYTES = 2048
 
 ACK_LINE_RE = re.compile(rb"ACK ([0-9A-Fa-f]{8}) ")
 
@@ -253,23 +261,34 @@ class ShellSession:
         against a card that is, or becomes, slower still.
 
         This replaces the guess with a guarantee: window_size MUST be
-        <=512 (one SD block -- kernel_main.vani's task_f streaming
-        branch only triggers a write, and only emits its ACK, once
-        total_len crosses a 512-byte boundary and that write has
-        already completed). Sending one window, then blocking until
-        the board's own ACK confirms it was fully absorbed, means zero
-        bytes are ever in flight while a masked write (how many
-        retries, however long) is in progress -- correctness no longer
-        depends on how long that window is, only throughput does. The
-        board reports DONE instead of a trailing ACK for the final
-        window once total_len reaches the declared length -- that's
-        deliberately NOT matched here (the caller's own existing DONE
-        read_until, run after this method returns, is left to see it;
-        matching it here would consume it out from under that wait)."""
-        if window_size > 512:
-            raise ValueError("window_size must be <=512 (the board's own SD block size) -- "
-                              "see this method's own docstring for why a larger window "
-                              "reopens the exact overrun risk this flow control exists to close")
+        <=ACK_INTERVAL_BYTES (kernel_main.vani's task_f streaming
+        branch only emits its ACK once total_len crosses an ack-
+        interval boundary, and every SD block write inside that
+        interval -- kernelupload_accumulate_bytes writes one per 512
+        bytes, looping internally -- has already completed by then,
+        synchronously, before task_f ever checks that boundary).
+        Sending one window, then blocking until the board's own ACK
+        confirms it was fully absorbed, means zero bytes are ever in
+        flight while a masked write (how many retries, however long)
+        is in progress -- correctness no longer depends on how long
+        that window is, only throughput does. 2026-11-08: the interval
+        itself grew 512->2048 (4 SD blocks/window now, not 1) to cut
+        how often a real scheduler-contention stall (separate issue,
+        see kernel_main.vani's own KERNELUPLOAD_ACK_INTERVAL_BYTES
+        header) can land per byte transferred -- this guarantee is
+        unaffected either way, since it only depends on window_size
+        never exceeding the board's own ack-interval, not on what that
+        interval's absolute value is. The board reports DONE instead
+        of a trailing ACK for the final window once total_len reaches
+        the declared length -- that's deliberately NOT matched here
+        (the caller's own existing DONE read_until, run after this
+        method returns, is left to see it; matching it here would
+        consume it out from under that wait)."""
+        if window_size > ACK_INTERVAL_BYTES:
+            raise ValueError(f"window_size must be <={ACK_INTERVAL_BYTES} (the board's own "
+                              "ack-interval, ACK_INTERVAL_BYTES) -- see this method's own "
+                              "docstring for why a larger window reopens the exact overrun "
+                              "risk this flow control exists to close")
         mv = memoryview(data)
         total = 0
         while total < len(mv):
@@ -338,20 +357,25 @@ def main() -> int:
     ap.add_argument("--commit-timeout", type=float, default=60, help="commit does a full SD readback+re-hash, give it real time")
     ap.add_argument("--ready-timeout", type=float, default=30, help="seconds to wait for the board to answer 'ready' at all")
     ap.add_argument("--log", default="/tmp/kernel_upload_full.log", help="path to write the raw captured serial log")
-    ap.add_argument("--window-size", type=int, default=512,
+    ap.add_argument("--window-size", type=int, default=ACK_INTERVAL_BYTES,
                      help="2026-10-23 (replaces the old fixed-delay --chunk-size/--chunk-delay pacing, which "
                           "assumed a bounded ~50ms SD-write worst case that a 13-year-old test card blew past at "
                           "139ms): send this many bytes, then BLOCK for a real ACK from the board confirming they "
-                          "were fully absorbed, before sending more. MUST stay <=512 (the board's own SD block "
-                          "size) -- see send_raw_ack_paced's own docstring for why a larger window reopens the "
-                          "overrun risk this flow control exists to close.")
-    ap.add_argument("--ack-timeout", type=float, default=5.0,
-                     help="seconds to wait for each window's own ACK before declaring a real stall. Covers both "
-                          "the worst single SD-write duration measured so far (139ms on an aged card) and the "
-                          "residual task_e/GC ceiling-2 contention window (kernel_main.vani's maintenance_mode "
-                          "precedence checks close most of this, but not a race already in progress when a "
-                          "stream starts -- dhcp_client_poll's own measured worst case, 325620us, is the largest "
-                          "remaining piece) -- generous margin over real measured numbers, not a tight bound.")
+                          f"were fully absorbed, before sending more. MUST stay <={ACK_INTERVAL_BYTES} (the "
+                          "board's own ack-interval, grown from 512 on 2026-11-08 to batch 4 SD blocks per round "
+                          "trip and cut how often real-HW scheduler contention is hit per byte transferred -- see "
+                          "ACK_INTERVAL_BYTES's own header) -- see send_raw_ack_paced's own docstring for why a "
+                          "larger window reopens the overrun risk this flow control exists to close.")
+    ap.add_argument("--ack-timeout", type=float, default=10.0,
+                     help="seconds to wait for each window's own ACK before declaring a real stall. Covers the "
+                          "worst single SD-write duration measured so far (139ms on an aged card, now up to 4x "
+                          "per window since --window-size batches 4 SD blocks) plus the residual task_e/GC "
+                          "ceiling-2 contention window (kernel_main.vani's maintenance_mode precedence checks "
+                          "close most of this, but a live 2026-11-08 retest still measured 0.5-1.5s of it "
+                          "recurring per window despite that fix -- still open, see KERNELUPLOAD_ACK_INTERVAL_"
+                          "BYTES's own header). Raised from 5.0 to 10.0 on the same date for margin against that "
+                          "contention possibly also scaling with the bigger window, not just recurring at the "
+                          "same magnitude -- not yet confirmed which, so sized generously rather than tightly.")
     args = ap.parse_args()
 
     data = open(args.kernel_img, "rb").read()
