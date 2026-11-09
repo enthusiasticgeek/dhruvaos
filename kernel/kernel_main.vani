@@ -5049,9 +5049,19 @@ fn uart_putc(c: i64) -> i64 {
   // (one cheap, already-false condition check) whenever DMA adoption
   // itself is off, including every QEMU regression run.
   if (UART_DMA_ADOPT_FOR_REAL_HARDWARE == 1) && (uart_dma_ready_get() == (1 as u32)) {
-    let putc_pre_busy_iter: i64 = 0;
-    while (dma_uart_tx_busy() == (1 as u32)) && (putc_pre_busy_iter < 20000000) {
-      putc_pre_busy_iter = putc_pre_busy_iter + 1;
+    // 2026-11-09: same root-cause fix as uart_puts's own matching wait
+    // (see that function's own header comment for the full "why") --
+    // this call site is reached from every PIO write path, typically
+    // while a caller higher up (uart_puts, for its CRLF-then-byte
+    // writes; uart_put_hex32's own digit loop, called while ITS caller
+    // already holds ceiling=0) is holding the same most-restrictive
+    // ceiling. An uncapped-in-real-time, zero-kick spin here is exactly
+    // as dangerous as the one already fixed in uart_puts.
+    let putc_pre_busy_t0: u32 = mmio_read_u32(TIMER_CLO);
+    while (dma_uart_tx_busy() == (1 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), putc_pre_busy_t0) < (200000 as u32)) {
+      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+        let _ = watchdog_kick();
+      }
     }
   }
   let uart_fr: i64 = UART_FR;
@@ -5356,9 +5366,53 @@ fn uart_puts(s: Str) -> i64 {
     // signature of the scratch buffer being clobbered mid-DMA-read.
     // Wait for the buffer to be genuinely free FIRST, same iteration
     // cap reasoning as the post-start wait below.
-    let pre_busy_iter: i64 = 0;
-    while (dma_uart_tx_busy() == (1 as u32)) && (pre_busy_iter < 20000000) {
-      pre_busy_iter = pre_busy_iter + 1;
+    //
+    // ROOT-CAUSE FIX (2026-11-09, real-HW kernelupload-stream stall +
+    // critconfig watchdog-reset investigation): this used to be a bare
+    // 20,000,000-iteration spin cap, no wall-clock bound, no watchdog
+    // kick -- and it runs INSIDE this function's own dhruva_prio_lock(0)
+    // hold (line above), ceiling=0, the single most restrictive level
+    // in the system: literally every other ceiling-protected section
+    // (including kernelupload's own ceiling=2 SD writes) blocks for as
+    // long as this wait runs, regardless of how unrelated the two are.
+    // uart_puts is called from EVERYWHERE in this codebase, completely
+    // unaware of maintenance_mode (unlike task_c/task_e/task_fsq, which
+    // all already defer to it for exactly this class of risk) -- it was
+    // never a candidate for that treatment because nobody expected a
+    // plain print to become a multi-second blocker. Normal case: the
+    // previous DMA transfer finishes within its own real wire time
+    // (worst case ~44.4ms for the longest string this driver ever DMAs,
+    // UART_DMA_SCRATCH_CAP(512) bytes at 115200 baud) -- comfortably
+    // inside a few hundred iterations. But if the DMA engine itself
+    // ever genuinely stops making progress (CS.ACTIVE never clears --
+    // a real hardware-level stall, plausible once real USB/SD traffic
+    // shares the same AHB bus with this engine, which this driver never
+    // had to contend with before real WiFi/BT/Ethernet hardware was
+    // attached this session), the OLD cap had no real-time meaning at
+    // all (20,000,000 iterations could be under a second or many
+    // seconds depending on CPU clock -- this board's own DVFS governor
+    // was separately found this session to throttle to 250MHz) and
+    // fired zero watchdog kicks the entire time -- live-reproduced
+    // twice: kernelupload stream stalls that correlate with nothing in
+    // DharaFS/SD (sd_write_worst_us measured a healthy 10232us during
+    // one such stall -- the SD card itself was never the bottleneck),
+    // and a real hardware watchdog reset during the very first
+    // encrypted critconfig write (heavy, boot-diagnostic-adjacent
+    // uart_puts traffic at the time). Fixed the same way every other
+    // potentially-long masked/spinning loop in this codebase already
+    // is (sdhost_wait_transfer_complete, the SD fifo-drain loop): a
+    // real TIMER_CLO wall-clock bound, generous but finite (200ms,
+    // ~4.5x the worst-case genuine completion time), with the watchdog
+    // kicked every iteration -- this loop is expected to exit almost
+    // immediately in the overwhelming common case, so the extra read
+    // costs nothing there, and it buys a hard ceiling on how long
+    // ceiling=0 can ever be held here instead of an unbounded, clock-
+    // speed-dependent guess.
+    let pre_busy_t0: u32 = mmio_read_u32(TIMER_CLO);
+    while (dma_uart_tx_busy() == (1 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), pre_busy_t0) < (200000 as u32)) {
+      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+        let _ = watchdog_kick();
+      }
     }
     // TASK #357 real-HW follow-up (2026-10-17), seventh attempt: THE
     // actual data-corruption root cause, found via the D0/D1
@@ -25773,6 +25827,25 @@ fn dwc2_wait_chan0_done() -> u32 {
   let transient_mask: u32 = (0x10 as u32) | (0x20 as u32); // NAK|ACK
   let xacterr_count: i64 = 0;
   let tries: i64 = 0;
+  // 2026-11-09 (holistic real-HW timeout-alignment audit, following
+  // the uart_puts/uart_putc DMA-busy-wait fix this same round): this
+  // loop's own 1,000,000-iteration cap is exactly the same class of
+  // bug already fixed there -- "~500ms real worst case" is an
+  // iteration-count assumption, not a real-time guarantee, and this
+  // board's own DVFS governor was separately confirmed this session to
+  // throttle to 250MHz, which stretches every iteration's real cost
+  // with no corresponding change to the cap. Added as a SECOND,
+  // wall-clock condition alongside the existing iteration cap (belt
+  // and suspenders -- the iteration cap still protects against a
+  // clock-source fault) rather than replacing it. 2 seconds: generous
+  // over the documented ~500ms assumption (a real USB transaction can
+  // legitimately take a bit longer than this driver's own SD-side
+  // waits, which use 1s), while staying safely inside the FIQ-level
+  // kernelupload stall diagnostic (5s) and the kernelupload stream's
+  // own inactivity self-abort (10s) -- this function is the shared
+  // primitive every USB control/bulk transfer in the system goes
+  // through, so a tighter bound here protects every caller at once.
+  let wcd_t0: u32 = mmio_read_u32(TIMER_CLO);
 
   // Round 15 real-HW finding: all 5 round-14 checkpoints (every
   // 200000 iterations, ~100ms apart) showed GAHBCFG/GUSBCFG ALREADY
@@ -25827,7 +25900,7 @@ fn dwc2_wait_chan0_done() -> u32 {
   // call site, closes the gap for this entire subsystem at once,
   // present and future (a WiFi/BLE/mass-storage driver not written yet
   // goes through this same function).
-  while tries < 1000000 {
+  while (tries < 1000000) && (wrapping_sub(mmio_read_u32(TIMER_CLO), wcd_t0) < (2000000 as u32)) {
     if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
       if (tries % 50000) == 0 {
         let _ = watchdog_kick();
@@ -27162,7 +27235,29 @@ fn rtl_reg_write32(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
 // does any of the 802.11 MAC-layer/WPA2 work in TODO.md's own next
 // item become reachable at all.
 fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
-  let _ = usb_wifi_set_kind(1 as u32);
+  // 2026-11-08 (real-HW `wifi join` hang, root-caused via a Linux
+  // rtl8xxxu comparison): usb_wifi_set_kind(1) used to be set HERE,
+  // unconditionally, before firmware was even attempted, and nothing
+  // below ever cleared it on any of this function's own early-return
+  // failure paths (no firmware found, download failed, start failed).
+  // wifi_radio_init_rtl8188cu()'s only readiness gate is usb_wifi_
+  // get_kind()!=0 -- so on a card with no firmware loaded (confirmed
+  // live: "USB: RTL8188CU firmware not found... radio inert"), `wifi
+  // join` sailed straight past its only gate and issued real USB
+  // register/bulk operations against a chip that was never brought up,
+  // each individually bounded but compounding into 1-2+ minutes of
+  // real wedged time (dwc2_wait_chan0_done's own worst case, repeated
+  // across set_channel's ~9 ops x 3 channels and up to WIFI_RX_POLL_
+  // CAP(50) RX polls x 3 channels) before finally giving up -- live-
+  // reproduced: shell_dispatch stuck holding its ceiling, zero
+  // response to ANY command, for well over a minute. Linux's own
+  // rtl8xxxu_probe (drivers/net/wireless/realtek/rtl8xxxu/core.c)
+  // never reaches ieee80211_register_hw() on an equivalent failure --
+  // the interface simply never exists for userspace to use. Matching
+  // that here: usb_wifi_set_kind(1) now only happens on full success,
+  // moved to just before this function's own final return, so a
+  // missing/failed firmware load reports "no USB WiFi device
+  // enumerated" in milliseconds instead of hanging the shell.
   let _ = usb_wifi_set_devaddr(devaddr);
   let iso_ctrl: u32 = rtl_reg_read16(devaddr, mps, 0x0000 as u32); // REG_SYS_ISO_CTRL
   let sys_func: u32 = rtl_reg_read16(devaddr, mps, 0x0002 as u32); // REG_SYS_FUNC
@@ -27203,7 +27298,11 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
     return 0 - 1;
   }
   let _ = uart_puts("USB: RTL8188CU firmware loaded and started\n");
-  return rtl8188cu_mac_bringup(devaddr, mps);
+  let bringup_status: i64 = rtl8188cu_mac_bringup(devaddr, mps);
+  if bringup_status == 0 {
+    let _ = usb_wifi_set_kind(1 as u32);
+  }
+  return bringup_status;
 }
 
 // Firmware file header this chip family's own firmware images use
