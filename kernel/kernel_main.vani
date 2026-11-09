@@ -35197,36 +35197,41 @@ fn governor_desired_freq_mhz_v2(h0: i64, h1: i64, h2: i64, h3: i64) -> i64 {
 // entirely when nothing changed.
 fn governor_step() -> i64 {
   // BUG FOUND 2026-11-09 (real-HW kernelupload-stream stall
-  // investigation, root cause): while a `kernelupload stream` is
-  // active, task_f is the ONLY task genuinely doing anything (busy-
-  // polling, no sleep -- see task_f's own header comment) -- every
-  // other real task (HIGH/MEDIUM/LOW/GC) is typically idle/sleeping
-  // the whole time, so `scheduler_ready_count()` reads <=1 for the
-  // ENTIRE transfer. `governor_desired_freq_mhz`'s own ready_count<=1
+  // investigation): `governor_desired_freq_mhz`'s own ready_count<=1
   // branch picks governor_freq_low() (250MHz) -- the single WORST
-  // frequency this governor can ever pick, landing EXACTLY during the
-  // one operation in this entire codebase most sensitive to real IRQ-
-  // servicing latency (the PL011's 16-byte hardware RX FIFO drains in
-  // ~1.4ms at 115200 baud; every real-time cost in the UART RX IRQ
-  // path -- the 32-iteration drain loop, the overrun-clear sequence --
-  // scales directly with clock speed). Confirmed live: a real-HW
-  // `diagnose` immediately after a string of stream stalls read "cpu
-  // freq: 250 MHz", and `rxdiag`'s own overrun_count (reset to 0 at
-  // the start of every stream -- see kernelupload_overrun_count_set's
-  // own call site) read nonzero after that string of failures --
-  // direct evidence of genuine PL011 hardware RX FIFO overflow, something
-  // an EARLIER check in this same investigation (a clean, non-
-  // throttled run) had found reading exactly 0. The governor's own
-  // ready-count heuristic has no concept of "a byte stream is actively
-  // in flight and latency now matters more than power" -- it just sees
-  // low apparent CPU demand and throttles down, exactly backwards for
-  // this one case. Pinned to governor_freq_high() (700MHz) for the
-  // stream's entire duration, skipping the normal history-based
-  // decision below entirely (not just overriding it once at the
-  // stream's start, which the very next tick's own reassessment would
-  // otherwise immediately undo) -- resumes normal ready-count-driven
-  // behavior the instant the stream ends (active flag clears), via
-  // this same check simply no longer taking this branch.
+  // frequency this governor can ever pick -- exactly whenever a
+  // `kernelupload stream` is the only real work happening (task_f busy-
+  // polls, no sleep; everything else is typically idle), landing on
+  // the one operation in this whole codebase most sensitive to real
+  // IRQ-servicing latency (the PL011's 16-byte hardware RX FIFO drains
+  // in ~1.4ms at 115200 baud). Confirmed live via `diagnose` (cpu freq:
+  // 250 MHz) and `rxdiag` (nonzero overrun_count) immediately after a
+  // string of stream stalls, vs. 0 on an earlier clean run.
+  //
+  // CORRECTION, same day, same investigation: this function's own
+  // check below (added as the first attempted fix) is real but
+  // insufficient ON ITS OWN -- `governor_step` is called from exactly
+  // ONE place, `task_d_wake_body` (the IDLE task's own wake body, see
+  // its own header comment). Task_f's busy-poll loop never sleeps
+  // while a stream is active, so it never yields the CPU to idle --
+  // meaning this whole function, including the check below, almost
+  // never actually RUNS during an active stream at all. Live-confirmed
+  // the hard way: a stream fired immediately after boot (before idle
+  // had any chance to throttle the clock down) ran clean end-to-end
+  // twice in a row; a stream started after even a short idle wait (or
+  // retried mid-session without a fresh reboot) kept stalling -- not
+  // because this check was wrong, but because once idle stops running
+  // (the moment task_f's busy-poll begins), whatever frequency was
+  // already set is what the ENTIRE transfer is stuck with, since
+  // nothing in this function can run again to change it. The real,
+  // authoritative fix is a ONE-TIME boost at the exact moment a stream
+  // actually starts (shell_dispatch_kernelupload's own `stream`/
+  // `resumechunk` call sites, right before kernelupload_stream_active_
+  // set(1)) -- see those call sites' own matching comment. Left here
+  // too, unconditionally harmless, as a secondary catch for the rare
+  // case idle DOES get a chance to run mid-stream (e.g. a transient
+  // gap in task_f's own scheduling) -- but the call sites are what
+  // actually matters now, not this.
   if kernelupload_stream_active_get() == (1 as u32) {
     let last_mhz: i64 = governor_get_last_applied_mhz();
     if last_mhz != governor_freq_high() {
@@ -38813,6 +38818,23 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     // raw stream payload (bypassing the shell line buffer and the
     // RX budget both) the instant it's 1 -- everything above must
     // already be in its correct starting state before that happens.
+    // BUG FOUND 2026-11-09 (real-HW kernelupload-stream stall
+    // investigation, REAL root cause -- see governor_step's own
+    // corrected comment for the full "why" the fix that used to live
+    // there alone wasn't enough): task_f's busy-poll loop never
+    // sleeps while a stream is active, so idle (the only task that
+    // ever calls governor_step) never runs again until this stream
+    // ends -- whatever CPU frequency is set at this exact moment is
+    // what the ENTIRE transfer is stuck with. A one-time boost HERE,
+    // at the moment the stream actually starts, is what matters now,
+    // not governor_step's own per-tick reassessment (which can't run
+    // during the stream at all). Return value deliberately ignored,
+    // matching this project's own established pattern for a real,
+    // bounded hardware call whose failure here would only mean "stay
+    // at whatever frequency was already set" -- not a reason to abort
+    // an otherwise-healthy upload.
+    let _ = governor_apply_freq_mhz(governor_freq_high());
+    let _ = governor_set_last_applied_mhz(governor_freq_high());
     let _ = kernelupload_stream_active_set(1 as u32);
     let _ = maintenance_mode_engage();
     let _ = uart_puts("GO ");
@@ -39032,6 +39054,23 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     let _ = kernelupload_uart_irq_entry_count_set(0 as u32);
     let _ = kernelupload_fifo_backlog_count_set(0 as u32);
     let _ = kernelupload_sd_write_worst_us_set(0 as u32);
+    // BUG FOUND 2026-11-09 (real-HW kernelupload-stream stall
+    // investigation, REAL root cause -- see governor_step's own
+    // corrected comment for the full "why" the fix that used to live
+    // there alone wasn't enough): task_f's busy-poll loop never
+    // sleeps while a stream is active, so idle (the only task that
+    // ever calls governor_step) never runs again until this stream
+    // ends -- whatever CPU frequency is set at this exact moment is
+    // what the ENTIRE transfer is stuck with. A one-time boost HERE,
+    // at the moment the stream actually starts, is what matters now,
+    // not governor_step's own per-tick reassessment (which can't run
+    // during the stream at all). Return value deliberately ignored,
+    // matching this project's own established pattern for a real,
+    // bounded hardware call whose failure here would only mean "stay
+    // at whatever frequency was already set" -- not a reason to abort
+    // an otherwise-healthy upload.
+    let _ = governor_apply_freq_mhz(governor_freq_high());
+    let _ = governor_set_last_applied_mhz(governor_freq_high());
     let _ = kernelupload_stream_active_set(1 as u32);
     let _ = maintenance_mode_engage();
     let _ = uart_puts("GO ");
