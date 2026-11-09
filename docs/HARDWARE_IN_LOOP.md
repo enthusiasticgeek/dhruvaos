@@ -497,11 +497,30 @@ already using, as hex-encoded chunks via the `wifikey` command (root
 only):
 
 ```
+wifikey begin <total_len_bytes>
 wifikey chunk <96 hex chars, i.e. 48 bytes, per line>
 wifikey chunk <next 48 bytes>
 ... (~337 lines for the real 16126-byte file)
-wifikey commit
+wifikey commit <total_len_bytes> <sha256_hex>
 ```
+
+(`begin` is a fast, optional-but-recommended pre-flight check --
+fails immediately if DharaFS obviously doesn't have room for
+`total_len_bytes` right now, instead of discovering that only after
+sending all ~337 chunks. See `dharafs_space_available_check`'s own
+header comment in `kernel_main.vani` for the full "why" and its
+limits -- it's a fast estimate, not a guarantee; the real,
+authoritative check still happens at `commit`.)
+
+(`commit` takes the real total length and a sha256 of the whole
+reconstructed file, checked against the accumulated buffer BEFORE
+anything is written to DharaFS -- see `uart_upload_verify_sha256`'s
+own header comment in `kernel_main.vani` for why this exists and why
+it's written as a reusable, protocol-agnostic function rather than
+wifikey-specific logic. Not idempotent: a failed commit for ANY
+reason clears the accumulated upload, so don't retry the bare command
+blind -- `test/wifikey_upload.py` sends it exactly once and reports
+the board's own real response text on a mismatch.)
 
 (48 bytes/96 hex chars per chunk, not a rounder-looking 64 -- the
 `"wifikey chunk "` prefix plus the hex data both have to fit inside

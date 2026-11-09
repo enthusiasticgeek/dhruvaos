@@ -7485,6 +7485,19 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let acmd_iter: i64 = 0;
     let acmd41_wedged: i64 = 0;
     while (acmd_iter < 1000) && (acmd41_wedged == 0) {
+      // 2026-11-09 (sibling sweep, same round as the RNG/DMA/dwc2
+      // wait-loop fixes): this is a real sdhost_cmd round trip, not a
+      // bare register read like sdhost_force_data_mode_settle's own
+      // 1000-iteration loop just below in this file -- a card that's
+      // genuinely slow to power up (not wedged/timed-out, just legitimately
+      // not ready yet, which real SD cards can be) could cost real time
+      // here with zero watchdog kicks otherwise. This is boot-time-only
+      // (unlike uart_puts/dwc2_wait_chan0_done/bcm2835_rng_read_word,
+      // never reached during a live kernelupload stream), but still a
+      // real watchdog-reset risk during boot's own SD bring-up.
+      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+        let _ = watchdog_kick();
+      }
       let cmd55_status: u32 = sdhost_cmd(55 as u32, 0 as u32);
       let cmd41_status: u32 = sdhost_cmd(41 as u32, hcs | voltage_window);
       // A software-level timeout on either command here is a
@@ -7575,6 +7588,11 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     let mmc_iter: i64 = 0;
     let mmc_wedged: i64 = 0;
     while (mmc_iter < 1000) && (mmc_wedged == 0) {
+      // 2026-11-09: same sibling fix as the ACMD41 loop just above --
+      // see that loop's own comment for the full "why".
+      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+        let _ = watchdog_kick();
+      }
       let cmd1_arg: u32 = if mmc_iter == 0 { 0 as u32 } else { hcs | voltage_window };
       let cmd1_status: u32 = sdhost_cmd(1 as u32, cmd1_arg);
       if sdhost_cmd_timed_out(cmd1_status) == 1 {
@@ -12685,6 +12703,40 @@ fn dharafs_attr_check_write(path_buf: mut ref i64, path_len: i64, data_buf: mut 
     }
   }
   return 0;
+}
+
+// Generic, fast (no compaction attempt) check for whether DharaFS
+// plausibly has room, right now, for an append of `data_len` bytes --
+// same "fail fast before any data moves" principle as kernelupload's
+// own `stream <len>` upfront claimed_len<=kernelslot_size_bytes()
+// check, generalized to DharaFS's own dynamic, compactable log
+// (kernelslot's own raw regions are fixed-size, so that check is
+// already sufficient there and needs no DharaFS-style space check at
+// all). 2026-11-09 (user question: "should there not be a check to
+// verify disk space on the target before file transfer" -- found
+// live, the hard way: a full `wifikey` upload reached its OWN final
+// commit only to discover DharaFS's log was already at its 7600-block
+// ceiling, AFTER sending all 336 chunks for nothing).
+//
+// A conservative ESTIMATE, not a guarantee: free space can change
+// between this check and the real commit (another writer appends, OR
+// a background dharafs_compact pass -- task_e's own periodic one, or
+// a manual `catchup` run -- frees more room than this snapshot saw).
+// The real, authoritative check stays exactly where it already is
+// (dharafs_write_raw_checked -> dharafs_append_raw, with its own
+// automatic one-pass compact-and-retry) -- this is purely a fast-fail
+// optimization for the common "it's obviously not going to fit" case,
+// generic across any current or future upload protocol that targets
+// DharaFS (today: wifikey's own `begin` command, below).
+fn dharafs_space_available_check(data_len: i64) -> i64 {
+  let next_block: i64 = dharafs_state_get_next_block() as i64;
+  if data_len <= dharafs_block_payload_cap() {
+    // Single-block path -- matches dharafs_append_raw's own
+    // `data_len <= cap` branch exactly: one block needed.
+    return if next_block < dharafs_log_max_blk() { 1 } else { 0 };
+  }
+  let blocks_needed: i64 = (data_len + dharafs_block_payload_cap() - 1) / dharafs_block_payload_cap();
+  return if (next_block + blocks_needed) <= dharafs_log_max_blk() { 1 } else { 0 };
 }
 
 fn dharafs_write_raw_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, req_uid: u32, req_gid: u32) -> i64 {
@@ -36929,17 +36981,111 @@ fn shell_dispatch_sshkey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> 
 // HARDWARE_IN_LOOP.md's own new section for the manual process this
 // enables today) -- a reasonable, clearly-scoped follow-up, not a
 // silent gap.
+
+// Generic data-integrity check for a file reconstructed in RAM from
+// ANY chunked upload protocol over ANY interface (UART today -- the
+// only transport this codebase has; a future USB-mass-storage or
+// network-based upload path would use this exact same function
+// unchanged, since nothing here is UART-specific). 2026-11-09 (user
+// request: "any file sent uart whether kernel or vendor firmware or
+// something else should have data integrity verification at final
+// step of reconstruction... make validation check generic"):
+// factored out of wifikey's own commit handler (its first real user)
+// rather than left inline, so the NEXT chunked-upload command this
+// project ever adds -- a different vendor blob, a config bundle,
+// anything accumulated into a contiguous RAM buffer before being
+// committed somewhere -- gets this for free by calling it, instead of
+// re-deriving the same hash-and-compare loop (or, worse, skipping
+// verification entirely because nobody remembered to copy it).
+//
+// Deliberately NOT a replacement for kernelupload's own existing
+// upload-time/readback sha256 checks (shell_dispatch_kernelupload's
+// "commit" branch): those hash data as it streams in and re-hash it
+// from SD after writing, two structurally different shapes (streaming
+// accumulation; block-device readback) that this function's own
+// "hash one already-fully-assembled contiguous RAM buffer" contract
+// doesn't fit. This covers the OTHER real shape -- a protocol that
+// accumulates a whole file in RAM first (wifikey's own fixed-size
+// firmware buffer today) -- the one case in this codebase that had NO
+// verification at all before this round.
+//
+// buf/total_len: the reconstructed data and its real length.
+// claimed_digest_buf: 32 raw bytes, the sha256 the far end claims this
+// data should hash to (already hex-decoded by the caller). Returns 1
+// if they match, 0 if they don't -- never partial-credits a mismatch;
+// the caller's own job is to refuse to commit on a 0.
+fn uart_upload_verify_sha256(buf: mut ref i64, total_len: i64, claimed_digest_buf: mut ref i64) -> i64 {
+  let ctx: Sha256Ctx = sha256_init();
+  let window: [u8; 256] = zero256_bytes();
+  let offset: i64 = 0;
+  while offset < total_len {
+    let take: i64 = if (total_len - offset) < 256 { total_len - offset } else { 256 };
+    let wi: i64 = 0;
+    while wi < take {
+      window[wi] = buf_read_byte(buf, (offset + wi) as u32) as u8;
+      wi = wi + 1;
+    }
+    ctx = sha256_update(ref ctx, mut ref window, take);
+    offset = offset + take;
+  }
+  let digest: [u8; 32] = sha256_finalize(ref ctx);
+  let digest_buf: mut ref i64 = dharafs_sd_scratch_get();
+  let di: i64 = 0;
+  while di < 32 {
+    let _ = buf_write_byte(digest_buf, di as u32, digest[di] as u32);
+    di = di + 1;
+  }
+  return sha256_bytes_equal(digest_buf, claimed_digest_buf, 32);
+}
+
 fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
   if dharafs_user_get_uid() != (0 as u32) {
     let _ = uart_puts("wifikey: permission denied (root only)\n");
     return 0;
   }
   if cmd_end >= line_len {
-    let _ = uart_puts("usage: wifikey chunk <hex> | wifikey commit | wifikey abort\n");
+    let _ = uart_puts("usage: wifikey begin <total_len_bytes> | wifikey chunk <hex> | wifikey commit <total_len_bytes> <sha256_hex> | wifikey abort\n");
     return 0;
   }
   let sub_start: i64 = cmd_end + 1;
   let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+
+  // 2026-11-09 (user question: "should there not be a check to verify
+  // disk space on the target before file transfer" -- see dharafs_
+  // space_available_check's own header comment for the full "why"):
+  // optional but recommended first command -- resets any stale upload
+  // state (same as `abort`) and fails fast, before a single `chunk`
+  // is ever sent, if the claimed total_len obviously won't fit right
+  // now. Not required by `chunk`/`commit` themselves (a host that
+  // skips it just gets the same real commit-time check as before,
+  // same backward-compatible shape every other optional-but-safer
+  // command in this codebase keeps).
+  if shell_word_matches(line_buf, sub_start, sub_end, "begin") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: wifikey begin <total_len_bytes>\n");
+      return 0;
+    }
+    let begin_len_start: i64 = sub_end + 1;
+    let begin_len_end: i64 = shell_find_space(line_buf, begin_len_start, line_len);
+    let begin_total_len: i64 = shell_parse_decimal(line_buf, begin_len_start, begin_len_end);
+    if (begin_total_len <= 0) || (begin_total_len > (16384 as i64)) {
+      let _ = uart_puts("wifikey: total_len must be 1-16384 bytes\n");
+      return 0;
+    }
+    if dharafs_space_available_check(begin_total_len) != 1 {
+      let _ = uart_puts("wifikey: DharaFS likely doesn't have room for ");
+      let _ = uart_put_i64(begin_total_len);
+      let _ = uart_puts(" bytes right now (log_end=");
+      let _ = uart_put_hex32(dharafs_state_get_next_block());
+      let _ = uart_puts(", max=");
+      let _ = uart_put_hex32(dharafs_log_max_blk() as u32);
+      let _ = uart_puts(") -- run 'catchup' to reclaim space, then retry\n");
+      return 0;
+    }
+    let _ = usb_wifi_fw_upload_len_set(0 as u32);
+    let _ = uart_puts("ok, room available, send chunks now\n");
+    return 0;
+  }
 
   if shell_word_matches(line_buf, sub_start, sub_end, "abort") == 1 {
     let _ = usb_wifi_fw_upload_len_set(0 as u32);
@@ -36954,6 +37100,68 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
       let _ = uart_puts("wifikey: nothing to commit (no chunks uploaded yet)\n");
       return 0;
     }
+    // 2026-11-09 (user request: "any file sent uart ... should have
+    // data integrity verification at final step of reconstruction"):
+    // this command used to commit straight to DharaFS with NO integrity
+    // check at all -- unlike kernelupload's own `commit <len> <sha256>`,
+    // which has always verified both the upload-time hash and a full
+    // SD readback hash. A real UART bit error or a dropped/duplicated
+    // `wifikey chunk` call would previously have been written to
+    // DharaFS undetected, discoverable (if ever) only much later when
+    // the radio failed to initialize -- with no way to tell "bad
+    // firmware file" apart from "bad transfer" after the fact. Same
+    // <total_len> <sha256_hex> shape as kernelupload's own commit, for
+    // the same reason: this is the one shell command in this codebase
+    // that reconstructs an arbitrary uploaded file (today, WiFi
+    // firmware; any future vendor-blob upload that reuses `wifikey`
+    // gets this for free) with zero verification of what it assembled.
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: wifikey commit <total_len_bytes> <sha256_hex>\n");
+      return 0;
+    }
+    let wk_len_start: i64 = sub_end + 1;
+    let wk_len_end: i64 = shell_find_space(line_buf, wk_len_start, line_len);
+    if wk_len_end >= line_len {
+      let _ = uart_puts("usage: wifikey commit <total_len_bytes> <sha256_hex>\n");
+      return 0;
+    }
+    let wk_claimed_len: i64 = shell_parse_decimal(line_buf, wk_len_start, wk_len_end);
+    if wk_claimed_len != total_len {
+      let _ = uart_puts("wifikey: total_len mismatch (claimed ");
+      let _ = uart_put_i64(wk_claimed_len);
+      let _ = uart_puts(", accumulated ");
+      let _ = uart_put_i64(total_len);
+      let _ = uart_puts(") -- not committing\n");
+      return 0;
+    }
+    let wk_sha_start: i64 = wk_len_end + 1;
+    let wk_sha_end: i64 = shell_find_space(line_buf, wk_sha_start, line_len);
+    if (wk_sha_end - wk_sha_start) != 64 {
+      let _ = uart_puts("wifikey: expected a 64-char (32-byte) sha256 hex digest\n");
+      return 0;
+    }
+    // Reuses kernelupload's own 32-byte decoded-digest scratch -- the
+    // two upload protocols are never active at once, and this is
+    // exactly what that buffer already exists to hold.
+    let wk_claimed_digest: mut ref i64 = kernelupload_chunk_decode_buf_get();
+    let wk_hex_status: i64 = shell_parse_hex_bytes(line_buf, wk_sha_start, wk_sha_end, wk_claimed_digest, 32);
+    if wk_hex_status != 0 {
+      let _ = uart_puts("wifikey: invalid sha256 hex\n");
+      return 0;
+    }
+
+    let fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
+
+    // Generic reconstruction-integrity check (see that function's own
+    // header comment) -- hash the reconstructed buffer BEFORE ever
+    // touching DharaFS.
+    if uart_upload_verify_sha256(fw_buf, total_len, wk_claimed_digest) != 1 {
+      let _ = uart_puts("wifikey: reconstructed data does not match the claimed sha256 -- not committing\n");
+      let _ = usb_wifi_fw_upload_len_set(0 as u32);
+      let _ = maintenance_mode_disengage();
+      return 0;
+    }
+
     // 2026-10-23: disengage maintenance mode around the SAME lock
     // dharafs_write_raw_checked below takes for its own ceiling=2
     // DharaFS write, not before it -- see this flag's own header
@@ -36962,7 +37170,6 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
     // nothing (one bounded write, not a long hold) and closes a real
     // gap: clearing it too early would let task_e/task_fsq resume
     // and potentially contend for ceiling=2 against this exact call.
-    let fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
     let path_str: Str = "/wifi/fw.bin";
     // path_str's own bytes need to reach dharafs_path_scratch_get()
     // first -- dharafs_write_raw_checked takes a raw buffer, not Str,
@@ -36983,7 +37190,18 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
       let _ = uart_put_i64(total_len);
       let _ = uart_puts(" bytes written to /wifi/fw.bin\n");
     } else {
-      let _ = uart_puts("wifikey: commit failed\n");
+      // 2026-11-09: report the real dharafs_write_raw_checked status
+      // code instead of a bare "commit failed" -- found live that this
+      // generic message left a real failure ambiguous between several
+      // genuinely different causes (recovery still active/-3,
+      // permission denied/-2, attr_check_write rejection/-1, or a real
+      // ENOSPC-after-compact-retry failure from dharafs_append_raw) --
+      // guessing which one happened from timing alone, after the fact,
+      // isn't good enough; this is the one shell command in this
+      // codebase that prints a write failure with no code at all.
+      let _ = uart_puts("wifikey: commit failed, dharafs_write_raw_checked status=");
+      let _ = uart_put_i64(real_status);
+      let _ = uart_puts(" (-1=attr/content check rejected, -2=permission denied, -3=DharaFS recovery still active -- retry once diagnose shows 'recovery: complete', other=dharafs_append_raw failure even after one compact retry)\n");
     }
     return 0;
   }

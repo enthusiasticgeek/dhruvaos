@@ -135,6 +135,10 @@ class ShellSession:
     def send(self, line: str):
         os.write(self.fd, (line + "\r").encode())
 
+    def tail_text(self, n: int = 500) -> str:
+        with self.lock:
+            return bytes(self.buf[-n:]).decode(errors="replace")
+
     def wait_until_ready(self, overall_timeout: float = 30, poll_interval: float = 1.0) -> bool:
         """Attach-at-any-time readiness handshake (task #306 follow-up,
         2026-10-01): the boot-time 'PASS' marker this class's own
@@ -248,6 +252,22 @@ def main() -> int:
                 return 1
         print("[boot ready]")
 
+        # 2026-11-09 (user question: "should there not be a check to
+        # verify disk space on the target before file transfer" -- see
+        # dharafs_space_available_check's own header comment in
+        # kernel_main.vani for the full "why"): fail fast here instead
+        # of discovering DharaFS is full only after sending every chunk
+        # -- found live, the hard way, the exact way this is meant to
+        # prevent. Sent once, not retried: like commit, a real "not
+        # enough room" response is informative and shouldn't be masked
+        # by blindly resending the same command.
+        session.send(f"wifikey begin {real_len}")
+        begin_ok = session.read_until("ok, room available", timeout=args.chunk_timeout)
+        if not begin_ok:
+            print("[FAIL] 'wifikey begin' did not report room available")
+            print(f"       actual board response (last 300 chars): {session.tail_text(300)!r}")
+            return 1
+
         for idx, c in enumerate(chunks):
             ok = session.step(f"wifikey chunk {c.hex()}", "bytes accumulated",
                                timeout=args.chunk_timeout, attempts=args.chunk_attempts)
@@ -257,9 +277,24 @@ def main() -> int:
             if idx % 20 == 0 or idx == len(chunks) - 1:
                 print(f"  ...chunk {idx + 1}/{len(chunks)} ok", flush=True)
 
+        # 2026-11-09 (protocol change: commit now takes <total_len>
+        # <sha256_hex> and verifies the reconstructed buffer against it
+        # before ever writing to DharaFS -- see shell_dispatch_wifikey's
+        # own "commit" branch and uart_upload_verify_sha256's header
+        # comment for the full "why"). Sent ONCE, not via session.step's
+        # own retry-on-timeout loop: commit is NOT idempotent on this
+        # board -- a failure (hash mismatch, permission, DharaFS
+        # recovery still active, ENOSPC) clears the accumulated-length
+        # counter regardless of outcome, so a blind resend of the exact
+        # same command would just get "nothing to commit" and mask
+        # whatever the real first-attempt failure reason was -- found
+        # live, the hard way, chasing a wrong "recovery still active"
+        # guess that a RETRY's own misleading response reinforced.
         commit_needle = f"ok, {real_len} bytes written to /wifi/fw.bin"
-        if not session.step("wifikey commit", commit_needle, timeout=args.commit_timeout, attempts=args.chunk_attempts):
+        session.send(f"wifikey commit {real_len} {real_sha256}")
+        if not session.read_until(commit_needle, timeout=args.commit_timeout):
             print(f"[FAIL] commit did not report the expected line: {commit_needle!r}")
+            print(f"       actual board response (last 300 chars): {session.tail_text(300)!r}")
             return 1
 
         print(f"[PASS] uploaded {real_len} bytes to /wifi/fw.bin (sha256={real_sha256})")
