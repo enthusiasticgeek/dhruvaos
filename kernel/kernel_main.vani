@@ -46594,8 +46594,38 @@ fn bcm2835_rng_init() -> i64 {
 
 // Blocks until at least one word is available (RNG_STATUS bits
 // [31:24] != 0), then pops and returns it.
+//
+// ROOT-CAUSE FIX (2026-11-09, real-HW intermittent boot hang): this
+// was a genuinely UNBOUNDED spin -- no iteration cap, no wall-clock
+// bound, and (unlike every other potentially-long loop already fixed
+// this same round) not even a single watchdog_kick() call. Called 8
+// times, unconditionally, on EVERY boot (csprng_init(), right before
+// dharafs_crypto_key_init()'s own PBKDF2 call) -- if the hardware ring-
+// oscillator RNG is ever genuinely slow to produce its first word
+// (real entropy-accumulation timing varies boot to boot by design,
+// especially this soon after bcm2835_rng_init()'s own enable write),
+// this loop would spin with zero chance for the FIQ-driven watchdog
+// kick's own usual safety net to matter -- it doesn't need to, since
+// NOTHING here masks interrupts, but a genuinely stuck loop still
+// needs its OWN kick, same as pbkdf2_hmac_sha256's already-fixed
+// 10000-iteration loop (see that function's own "follow-up #7"
+// comment) and dwc2_wait_chan0_done (this same round). Live-reproduced:
+// boot hangs at a variable point around this exact call (BOOT DIAG
+// checkpoint 12, before checkpoint 13 ever prints) on some boots but
+// not others -- exactly the signature of a hardware-timing-dependent
+// stall with no bound, not a deterministic code bug. 2 seconds is
+// generous (a healthy RNG produces a word in microseconds); on
+// timeout, returns whatever RNG_DATA currently holds rather than
+// looping forever -- boot-time entropy seeding from 8 words, one
+// timed-out word degrades the seed's own entropy slightly in the
+// most pathological case, which is a vastly better outcome than an
+// unbounded hang or a real-HW watchdog reset.
 fn bcm2835_rng_read_word() -> u32 {
-  while (mmio_read_u32(RNG_STATUS) >> (24 as u32)) == (0 as u32) {
+  let rng_t0: u32 = mmio_read_u32(TIMER_CLO);
+  while ((mmio_read_u32(RNG_STATUS) >> (24 as u32)) == (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), rng_t0) < (2000000 as u32)) {
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
   }
   return mmio_read_u32(RNG_DATA);
 }

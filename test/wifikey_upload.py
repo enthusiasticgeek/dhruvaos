@@ -187,6 +187,20 @@ def main() -> int:
     ap.add_argument("--chunk-attempts", type=int, default=3, help="retries per chunk before giving up")
     ap.add_argument("--commit-timeout", type=float, default=15)
     ap.add_argument("--log", default="/tmp/wifikey_upload_full.log", help="path to write the raw captured serial log")
+    ap.add_argument("--reboot-first", action="store_true",
+                     help="send 'reboot' over this same connection before waiting for PASS, instead of "
+                          "assuming the board is mid-boot already -- avoids a real gap (found live, "
+                          "2026-11-09) between a separately-sent reboot and this script's own connect, "
+                          "where open_serial()'s unconditional tcflush on open can discard an already-"
+                          "arrived PASS marker before this script ever sees it")
+    ap.add_argument("--skip-boot-wait", action="store_true",
+                     help="assume the board is already sitting at a live shell (e.g. you rebooted and "
+                          "confirmed PASS yourself, separately) and go straight to sending chunks, "
+                          "skipping both --reboot-first's own reboot and the PASS wait entirely -- "
+                          "useful on real hardware where boot itself has been observed to occasionally "
+                          "stall at a different point each time (2026-11-09), unrelated to this script, "
+                          "so retrying the reboot+PASS-wait HERE just repeats a real-HW flakiness risk "
+                          "instead of avoiding it")
     args = ap.parse_args()
 
     data = open(args.firmware, "rb").read()
@@ -200,32 +214,38 @@ def main() -> int:
     session = ShellSession(fd, args.log)
 
     try:
-        print("waiting for boot to reach the shell (PASS marker)...")
-        # BUG (found live against a real Pi 1B, 2026-10-10): a bare
-        # "PASS" substring match fires on the FIRST of this project's
-        # many self-test "(PASS)" annotations (EVAL/GOVERNOR/CRYPTO/
-        # USB, all printed well before the shell is actually listening)
-        # rather than the real standalone boot-complete marker
-        # (`uart_puts("PASS\n")`, kernel_main.vani) -- QEMU's own stub-
-        # shell validation never caught this because a stub shell
-        # doesn't also print dozens of earlier "(PASS)"-suffixed self-
-        # test lines first.
-        #
-        # SECOND BUG (found live, same session, immediately after
-        # "fixing" the above as "\nPASS\n"): `uart_putc` (kernel_main.
-        # vani) inserts a CR *before* every LF on the wire (task #208 --
-        # a raw terminal doesn't do onlcr itself, so every `uart_puts`
-        # call's own "\n" actually transmits as "\r\n") -- meaning the
-        # real marker's own wire bytes are "...\r\nPASS\r\n...", not
-        # "...\nPASS\n...". The first fix's own match string could
-        # never fire against real hardware for exactly the same reason
-        # the ORIGINAL bare-"PASS" bug couldn't be seen under a stub
-        # shell: nothing in this project's QEMU-stub validation path
-        # exercises the real uart_putc CR-insertion at all. Matching the
-        # marker's actual on-wire shape this time.
-        if not session.read_until("\r\nPASS\r\n", timeout=args.boot_timeout):
-            print("[FAIL] boot never reached PASS -- is the device powered on and freshly reset?")
-            return 1
+        if args.skip_boot_wait:
+            print("--skip-boot-wait: assuming the board is already at a live shell, sending chunks directly...")
+        else:
+            if args.reboot_first:
+                print("sending 'reboot' over this connection, then waiting for PASS...")
+                session.send("reboot")
+            print("waiting for boot to reach the shell (PASS marker)...")
+            # BUG (found live against a real Pi 1B, 2026-10-10): a bare
+            # "PASS" substring match fires on the FIRST of this project's
+            # many self-test "(PASS)" annotations (EVAL/GOVERNOR/CRYPTO/
+            # USB, all printed well before the shell is actually listening)
+            # rather than the real standalone boot-complete marker
+            # (`uart_puts("PASS\n")`, kernel_main.vani) -- QEMU's own stub-
+            # shell validation never caught this because a stub shell
+            # doesn't also print dozens of earlier "(PASS)"-suffixed self-
+            # test lines first.
+            #
+            # SECOND BUG (found live, same session, immediately after
+            # "fixing" the above as "\nPASS\n"): `uart_putc` (kernel_main.
+            # vani) inserts a CR *before* every LF on the wire (task #208 --
+            # a raw terminal doesn't do onlcr itself, so every `uart_puts`
+            # call's own "\n" actually transmits as "\r\n") -- meaning the
+            # real marker's own wire bytes are "...\r\nPASS\r\n...", not
+            # "...\nPASS\n...". The first fix's own match string could
+            # never fire against real hardware for exactly the same reason
+            # the ORIGINAL bare-"PASS" bug couldn't be seen under a stub
+            # shell: nothing in this project's QEMU-stub validation path
+            # exercises the real uart_putc CR-insertion at all. Matching the
+            # marker's actual on-wire shape this time.
+            if not session.read_until("\r\nPASS\r\n", timeout=args.boot_timeout):
+                print("[FAIL] boot never reached PASS -- is the device powered on and freshly reset?")
+                return 1
         print("[boot ready]")
 
         for idx, c in enumerate(chunks):
