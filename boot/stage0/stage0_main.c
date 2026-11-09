@@ -320,10 +320,32 @@ void stage0_fault(unsigned int code) {
  * repeatedly) between failures -- no backoff/speed-stepping, this
  * loader has no clock-speed concept to step down unlike sdhost_init_
  * at_speed. Returns the last attempt's own result code (0 or -9). */
+/* BUG FOUND 2026-11-09 (live real-HW retest, same day, right after
+ * this function's own first deployment): the FIRST version of this
+ * retry loop never re-armed the watchdog between attempts -- the
+ * outer load loop's own re-arm only fires every 512 blocks (~every
+ * 256KiB), not on every iteration, so a single block whose OWN retry
+ * ladder runs long (stage0_sd_init() is a full card reinit; a
+ * genuinely wedged FIFO can burn through stage0_sd_read_block's own
+ * 20-million-iteration room_wait_iters busy-spin for real, non-
+ * trivial wall-clock time) could spend more than the watchdog's 15s
+ * window entirely INSIDE this one retry loop, between re-arm
+ * checkpoints -- the watchdog would then fire and reset the board
+ * PRECISELY BECAUSE this retry logic was given more total time-at-
+ * risk without more watchdog coverage to match, the opposite of what
+ * a resilience fix should do. Confirmed live: adding this retry loop
+ * made a previously-recoverable-in-practice stall into a reproducible
+ * reset-into-stuck-reload loop on the very next real-HW test. Re-arm
+ * before every attempt (including the first -- matches the outer
+ * loop's own "kick before risk" ordering, not "kick after already
+ * spending time"), not just between them. */
 static int stage0_sd_read_block_retry(unsigned int block_num, void *buf) {
     int rc = -9;
     int attempt;
     for (attempt = 0; attempt < 3 && rc != 0; attempt = attempt + 1) {
+#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
+        stage0_arm_watchdog();
+#endif
         if (attempt > 0) {
             stage0_sd_init();
         }
