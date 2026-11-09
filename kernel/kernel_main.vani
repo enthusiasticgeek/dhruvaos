@@ -27286,6 +27286,207 @@ fn rtl_reg_write32(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
 // writes, verify a checksum, disable download mode), (3) only then
 // does any of the 802.11 MAC-layer/WPA2 work in TODO.md's own next
 // item become reachable at all.
+// 2026-11-09 (real-HW firmware-download investigation, root-caused via
+// a direct Linux rtl8xxxu comparison): this chip's own MAC/baseband
+// power domain was never actually turned on anywhere in this driver --
+// USB enumeration succeeding only means the chip's always-on USB MCU
+// answered, which is a completely separate power domain from the WLAN
+// MAC/8051 the firmware actually runs on. Live-reproduced: firmware
+// pages all wrote successfully (no chunk-write error), yet the
+// checksum-report bit never set within 1000 iterations ("USB:
+// RTL8188CU firmware checksum poll timed out") -- consistent with the
+// 8051 having no power/clock to run at all, not a data/transport
+// problem. Confirmed by direct comparison against Linux's real
+// rtl8192cu_power_on (drivers/net/wireless/realtek/rtl8xxxu/8192c.c,
+// fetched fresh from github.com/torvalds/linux, register addresses
+// cross-checked against that same tree's regs.h) -- rtl8xxxu_init_
+// device calls fops->power_on() BEFORE rtl8xxxu_download_firmware,
+// every single time, on every chip variant; this driver had no
+// equivalent call anywhere. Transcribed verbatim (same register
+// addresses, bit masks, and iteration caps as the reference -- not
+// reasoned from datasheets alone, per this project's own "escalate to
+// a proven reference" convention). Scoped to exactly what this symptom
+// needs: the reference's own init_device also does queue-priority/
+// RX-boundary/hw-feature setup between power_on and download_firmware,
+// but those affect normal radio operation after firmware is already
+// running, not whether the 8051 can power up and checksum its own
+// download -- left for whatever the NEXT real-HW symptom turns out to
+// require, rather than ported wholesale on spec alone.
+fn rtl8188cu_power_on(devaddr: u32, mps: u32) -> i64 {
+  let reg_sys_iso_ctrl: u32 = 0x0000 as u32;
+  let reg_aps_fsmco: u32 = 0x0004 as u32;
+  let reg_sps0_ctrl: u32 = 0x0011 as u32;
+  let reg_rsv_ctrl: u32 = 0x001C as u32;
+  let reg_ldov12d_ctrl: u32 = 0x0021 as u32;
+  let reg_apsd_ctrl: u32 = 0x0600 as u32;
+  let reg_cr: u32 = 0x0100 as u32;
+  let aps_fsmco_pfm_aldn: u32 = 0x02 as u32; // BIT(1)
+  let aps_fsmco_enable_powerdown: u32 = 0x10 as u32; // BIT(4)
+  let aps_fsmco_mac_enable: u32 = 0x100 as u32; // BIT(8)
+  let aps_fsmco_hw_suspend: u32 = 0x800 as u32; // BIT(11)
+  let ldov12d_enable: u32 = 0x01 as u32; // BIT(0)
+  let sys_iso_md2pp: u32 = 0x01 as u32; // BIT(0)
+  let sys_iso_dior: u32 = 0x0200 as u32; // BIT(9)
+  let apsd_ctrl_off: u32 = 0x40 as u32; // BIT(6)
+  let apsd_ctrl_off_status: u32 = 0x80 as u32; // BIT(7)
+  let cr_enable_mask: u32 = 0xFF as u32; // CR_HCI_TXDMA/RXDMA|TXDMA|RXDMA|PROTOCOL|SCHEDULE|MAC_TX|MAC_RX_ENABLE, bits 0-7
+
+  let poll1_ok: i64 = 0;
+  let poll1: i64 = 0;
+  while poll1 < 100 {
+    let v: u32 = rtl_reg_read8(devaddr, mps, reg_aps_fsmco);
+    if (v & aps_fsmco_pfm_aldn) != (0 as u32) {
+      poll1_ok = 1;
+      break;
+    }
+    poll1 = poll1 + 1;
+  }
+  if poll1_ok != 1 {
+    let _ = uart_puts("USB: RTL8188CU power-on: APS_FSMCO_PFM_ALDN poll timed out\n");
+    return 0 - 1;
+  }
+
+  let _ = rtl_reg_write8(devaddr, mps, reg_rsv_ctrl, 0 as u32);
+  let _ = rtl_reg_write8(devaddr, mps, reg_sps0_ctrl, 0x2B as u32);
+  let _ = delay(100);
+
+  let ldo: u32 = rtl_reg_read8(devaddr, mps, reg_ldov12d_ctrl);
+  if (ldo & ldov12d_enable) == (0 as u32) {
+    let _ = rtl_reg_write8(devaddr, mps, reg_ldov12d_ctrl, ldo | ldov12d_enable);
+    let _ = delay(100);
+    let iso8: u32 = rtl_reg_read8(devaddr, mps, reg_sys_iso_ctrl);
+    let not_md2pp: u32 = sys_iso_md2pp ^ (0xFFFFFFFF as u32);
+    let _ = rtl_reg_write8(devaddr, mps, reg_sys_iso_ctrl, iso8 & not_md2pp);
+  }
+
+  // Auto-enable WLAN.
+  let fsmco1: u32 = rtl_reg_read16(devaddr, mps, reg_aps_fsmco);
+  let _ = rtl_reg_write16(devaddr, mps, reg_aps_fsmco, fsmco1 | aps_fsmco_mac_enable);
+  let poll2_ok: i64 = 0;
+  let poll2: i64 = 0;
+  while poll2 < 1000 {
+    let v2: u32 = rtl_reg_read16(devaddr, mps, reg_aps_fsmco);
+    if (v2 & aps_fsmco_mac_enable) == (0 as u32) {
+      poll2_ok = 1;
+      break;
+    }
+    poll2 = poll2 + 1;
+  }
+  if poll2_ok != 1 {
+    let _ = uart_puts("USB: RTL8188CU power-on: APS_FSMCO_MAC_ENABLE poll timed out\n");
+    return 0 - 1;
+  }
+
+  // Enable radio, GPIO, LED.
+  let fsmco2: u32 = aps_fsmco_hw_suspend | aps_fsmco_enable_powerdown | aps_fsmco_pfm_aldn;
+  let _ = rtl_reg_write16(devaddr, mps, reg_aps_fsmco, fsmco2);
+
+  // Release RF digital isolation.
+  let iso16: u32 = rtl_reg_read16(devaddr, mps, reg_sys_iso_ctrl);
+  let not_dior: u32 = sys_iso_dior ^ (0xFFFFFFFF as u32);
+  let _ = rtl_reg_write16(devaddr, mps, reg_sys_iso_ctrl, iso16 & not_dior);
+
+  let apsd1: u32 = rtl_reg_read8(devaddr, mps, reg_apsd_ctrl);
+  let not_off: u32 = apsd_ctrl_off ^ (0xFFFFFFFF as u32);
+  let _ = rtl_reg_write8(devaddr, mps, reg_apsd_ctrl, apsd1 & not_off);
+  let poll3_ok: i64 = 0;
+  let poll3: i64 = 0;
+  while poll3 < 200 {
+    let v3: u32 = rtl_reg_read8(devaddr, mps, reg_apsd_ctrl);
+    if (v3 & apsd_ctrl_off_status) == (0 as u32) {
+      poll3_ok = 1;
+      break;
+    }
+    poll3 = poll3 + 1;
+  }
+  if poll3_ok != 1 {
+    let _ = uart_puts("USB: RTL8188CU power-on: APSD_CTRL_OFF_STATUS poll timed out\n");
+    return 0 - 1;
+  }
+
+  // Enable MAC DMA/WMAC/SCHEDULE/SEC block.
+  let cr: u32 = rtl_reg_read16(devaddr, mps, reg_cr);
+  let _ = rtl_reg_write16(devaddr, mps, reg_cr, cr | cr_enable_mask);
+
+  let _ = rtl_reg_write8(devaddr, mps, 0xFE10 as u32, 0x19 as u32);
+
+  let _ = uart_puts("USB: RTL8188CU power-on sequence complete\n");
+  return 0;
+}
+
+// 2026-11-09 (real-HW `wifi join` firmware-start follow-up): the
+// power-on fix above got the chip past the firmware checksum poll,
+// but a NEW real-HW symptom appeared right after it: "WINT_INIT_READY
+// poll timed out" -- the 8051 resets and executes the downloaded
+// firmware, but the firmware itself never signals it finished
+// initializing. Compared this gap directly against Linux's real
+// rtl8xxxu_init_device (core.c, fetched fresh): between fops->
+// power_on() and rtl8xxxu_download_firmware(), it ALWAYS (unconditional
+// on this chip, not gated behind any quirk) calls
+// rtl8xxxu_init_queue_reserved_page (skipped only if the MAC was
+// already powered on from a previous session -- never true right
+// after our own cold power_on), rtl8xxxu_init_queue_priority, and
+// writes REG_TRXFF_BNDY+2. All three configure the chip's internal
+// TX/RX page allocator (REG_RQPN/REG_RQPN_NPQ reserve FIFO pages per
+// priority queue; REG_TRXDMA_CTRL routes each queue to a USB
+// endpoint; REG_TRXFF_BNDY sets the RX FIFO page boundary) -- exactly
+// the kind of on-chip resource the embedded 8051 firmware itself
+// depends on during its own init, which is a mechanistically
+// plausible explanation for "checksum verified fine (pure download
+// integrity), but the firmware never reaches its own ready state
+// (needs these allocator registers sane to get there)".
+//
+// This project's own USB enumeration (see rtl8188cu_probe's own log:
+// "RTL8188CU/RTL8192CU family detected") confirms exactly ONE bulk-OUT
+// endpoint for this chip, matching Linux's own rtl8xxxu_config_
+// endpoints_no_sie's nr_out_eps==1 case: ep_tx_high_queue=1, ep_tx_
+// count=1, and (in rtl8xxxu_init_queue_priority's own ep_tx_count==1
+// branch) every priority queue (voq/viq/beq/bkq/mgq/hiq) maps to
+// TRXDMA_QUEUE_HIGH (3) -- the only queue-routing case that actually
+// applies to this hardware, so that's the only case ported here (the
+// 2-endpoint and 3+-endpoint branches don't apply and aren't needed).
+// rtl8xxxu_request_hw_feature is a real no-op for this exact chip
+// (rtl8192cu_fops.hw_feature_report == 0, confirmed in 8192c.c's own
+// fops table) -- deliberately NOT ported, it would do nothing.
+// pipe_out[] endpoint-routing assignment is host-side USB driver
+// bookkeeping only (which struct field tracks which pipe), not a
+// hardware register write -- also not applicable here since this
+// driver already always targets its one known bulk-out endpoint
+// directly.
+fn rtl8188cu_mac_queue_setup(devaddr: u32, mps: u32) -> i64 {
+  let reg_trxdma_ctrl: u32 = 0x010C as u32;
+  let reg_rqpn_npq: u32 = 0x0214 as u32;
+  let reg_rqpn: u32 = 0x0200 as u32;
+  let reg_trxff_bndy: u32 = 0x0114 as u32;
+
+  // rtl8xxxu_init_queue_reserved_page, ep_tx_count==1/ep_tx_high_queue
+  // case: hq=page_num_hi (0x0c for rtl8192cu_fops), lq=nq=eq=0 (no low/
+  // normal-priority endpoint exists on this hardware), pubq=total_
+  // page_num(0xf8) - hq - lq - nq - 1 = 0xf8 - 0x0c - 1 = 0xEB.
+  let hq: u32 = 0x0C as u32;
+  let pubq: u32 = 0xEB as u32;
+  let _ = rtl_reg_write32(devaddr, mps, reg_rqpn_npq, 0 as u32);
+  let rqpn_load_bit: u32 = 0x80000000 as u32;
+  let rqpn_val: u32 = rqpn_load_bit | hq | (pubq << (16 as u32));
+  let _ = rtl_reg_write32(devaddr, mps, reg_rqpn, rqpn_val);
+
+  // rtl8xxxu_init_queue_priority, ep_tx_count==1/ep_tx_high_queue case:
+  // every queue (voq/viq/beq/bkq/mgq/hiq) maps to TRXDMA_QUEUE_HIGH(3),
+  // shifted into REG_TRXDMA_CTRL's own 6 two-bit fields (bits 4-15);
+  // bits 0-2 (the beacon queue, per that function's own "none of the
+  // vendor drivers configure the beacon queue here" comment) are left
+  // exactly as the hardware already has them.
+  let existing_dma_ctrl: u32 = rtl_reg_read16(devaddr, mps, reg_trxdma_ctrl);
+  let dma_ctrl_val: u32 = (existing_dma_ctrl & (0x7 as u32)) | (0xFFF0 as u32);
+  let _ = rtl_reg_write16(devaddr, mps, reg_trxdma_ctrl, dma_ctrl_val);
+
+  // REG_TRXFF_BNDY+2 = fops->trxff_boundary (0x27ff for rtl8192cu_fops).
+  let _ = rtl_reg_write16(devaddr, mps, reg_trxff_bndy + (2 as u32), 0x27FF as u32);
+
+  let _ = uart_puts("USB: RTL8188CU MAC queue/page setup complete\n");
+  return 0;
+}
+
 fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
   // 2026-11-08 (real-HW `wifi join` hang, root-caused via a Linux
   // rtl8xxxu comparison): usb_wifi_set_kind(1) used to be set HERE,
@@ -27338,6 +27539,21 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
     let _ = uart_puts("USB: RTL8188CU firmware not found at /wifi/fw.bin or the raw-SD fallback block -- radio inert until it's loaded (see docs/HARDWARE_IN_LOOP.md)\n");
     return 0;
   }
+  // 2026-11-09: power on the MAC/baseband domain BEFORE attempting a
+  // firmware download -- see rtl8188cu_power_on's own header comment
+  // for the full "why" (matches Linux's real rtl8xxxu_init_device
+  // call order exactly: fops->power_on() always runs immediately
+  // before rtl8xxxu_download_firmware(), never after).
+  let pwr_status: i64 = rtl8188cu_power_on(devaddr, mps);
+  if pwr_status != 0 {
+    let _ = uart_puts("USB: RTL8188CU power-on sequence FAILED -- not attempting firmware download\n");
+    return 0 - 1;
+  }
+  // 2026-11-09: see rtl8188cu_mac_queue_setup's own header comment --
+  // matches Linux's real rtl8xxxu_init_device call order exactly
+  // (queue-reserved-page + queue-priority + REG_TRXFF_BNDY, always
+  // run between power_on() and download_firmware(), never after).
+  let _ = rtl8188cu_mac_queue_setup(devaddr, mps);
   let fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
   let dl_status: i64 = rtl8188cu_download_firmware(devaddr, mps, fw_buf, fw_len);
   if dl_status != 0 {
@@ -30078,8 +30294,25 @@ fn rtl8188cu_set_channel(devaddr: u32, mps: u32, channel: u32) -> i64 {
 
   // REG_R2T_SIFS (0x063c) / REG_T2T_SIFS (0x063e): fixed 16-bit values,
   // not conditional on HT.
-  let _ = rtl_reg_write32(devaddr, mps, 0x063c as u32, 0x0808 as u32);
-  let _ = rtl_reg_write32(devaddr, mps, 0x063e as u32, 0x0a0a as u32);
+  //
+  // BUG FOUND 2026-11-09 (thorough WiFi-FSM audit vs Linux core.c's
+  // rtl8xxxu_gen1_config_channel): these were 32-bit writes on what
+  // the reference driver always writes as 16-bit (`rtl8xxxu_write16`).
+  // REG_R2T_SIFS and REG_T2T_SIFS are only 2 bytes apart (regs.h), so
+  // the first 32-bit write's own upper 16 bits landed ON TOP of
+  // REG_T2T_SIFS (zeroing it, later overwritten correctly by the
+  // second write -- harmless by luck) and the SECOND 32-bit write's
+  // own upper 16 bits landed on REG_ACKTO/REG_CTS2TO (0x0640/0x0641,
+  // the very next registers past REG_T2T_SIFS) -- those are the real
+  // ACK-timeout/CTS-timeout registers, left SILENTLY ZEROED by this
+  // call every single time channel selection ran, with no self-test
+  // or QEMU model able to catch it (no RTL8188CU device model exists
+  // under QEMU). A zeroed ACK timeout is exactly the kind of bug that
+  // can make TX appear to "go out" while the real 802.11 handshake
+  // (association/4-way) never completes -- fixed to match source
+  // exactly (16-bit writes only).
+  let _ = rtl_reg_write16(devaddr, mps, 0x063c as u32, 0x0808 as u32);
+  let _ = rtl_reg_write16(devaddr, mps, 0x063e as u32, 0x0a0a as u32);
 
   // Second RF6052_REG_MODE_AG pass: clear MODE_AG_BW_MASK, set
   // MODE_AG_CHANNEL_20MHZ (this driver never takes the 40MHz branch, so
@@ -33600,7 +33833,39 @@ fn dwc2_enumerate_downstream(hub_mps: u32, real_port_count: i64) -> i64 {
 // matching Linux's actual sequence instead of only ever setting.
 fn dwc2_hub_power_cycle_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
   let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port, hub_feature_port_power());
-  let _ = delay(161000);
+  // BUG FOUND 2026-11-09 (real-HW "both downstream devices wedged
+  // after a failed RTL8188CU firmware write, survives a full reboot"
+  // investigation): this was delay(161000) -- the SAME ~50ms constant
+  // (see delay_wcet_measure_self_test's own real-HW calibration,
+  // ~0.310044us/iteration) used throughout this file for a RESET/
+  // SIGNALING wait (TRSTRCY, debounce, etc.), copy-pasted here without
+  // re-deriving it for what this specific call actually needs: a real
+  // VBUS power-OFF long enough to cause an actual brownout. A 50ms
+  // blip is exactly the kind of transient many USB devices' own
+  // onboard bulk capacitors/LDO regulators are *designed* to ride
+  // through without ever losing power at all -- so this "power cycle"
+  // could have been a no-op on real hardware the whole time, never
+  // falsified because this file had no live-HW test that specifically
+  // forced a device into the post-bad-transfer wedge this exists to
+  // recover from. Confirmed live: a real-HW boot where RTL8188CU
+  // firmware download failed mid-chunk left BOTH downstream devices on
+  // the same hub (WiFi dongle AND the separate BT dongle) completely
+  // unresponsive to GET_DESCRIPTOR -- including an explicit protocol-
+  // level STALL on the very first try -- and this stayed true across
+  // a full ARM reboot (fresh dwc2_init, fresh hub PORT_RESET with its
+  // own confirmed-correct TRSTRCY wait every single retry). A genuine
+  // electrical bus reset (PORT_RESET) not recovering a device that a
+  // real power interruption reportedly can is the strongest live
+  // evidence yet that the power-off window itself was too short to be
+  // a real power interruption at all. ~1.02s (3300000 iterations),
+  // not 161000 -- long enough that no realistic onboard cap/regulator
+  // rides through it, while still short next to this driver's overall
+  // per-port retry budget (already bounded at 2s wall-clock per
+  // dwc2_hub_bring_up_port's own budget check, with watchdog_kick()
+  // already threaded through every outer retry attempt around this
+  // call, so one extra ~1s hold here doesn't introduce a new
+  // starvation risk).
+  let _ = delay(3300000);
   return 0;
 }
 

@@ -261,6 +261,21 @@ def main() -> int:
                 return 1
         print("[boot ready]")
 
+        # 2026-11-09 (found live: a prior failed attempt that timed out
+        # mid-chunk-loop, under --raw, left the board's accumulated-
+        # length state non-zero with no way to clear it, since `begin`
+        # -- the only other thing that resets it -- is skipped entirely
+        # under --raw below. `abort` is idempotent and side-effect-free
+        # on a clean board, so sending it unconditionally here, before
+        # either path, guarantees every upload starts from a known-zero
+        # accumulation regardless of what a previous run left behind --
+        # decouples "reset upload state" from "check DharaFS space"
+        # (only the latter is skipped under --raw).
+        if not session.step("wifikey abort", "ok", timeout=args.chunk_timeout, attempts=args.chunk_attempts):
+            print("[FAIL] 'wifikey abort' (pre-upload state reset) never confirmed")
+            print(f"       actual board response (last 300 chars): {session.tail_text(300)!r}")
+            return 1
+
         # 2026-11-09 (user question: "should there not be a check to
         # verify disk space on the target before file transfer" -- see
         # dharafs_space_available_check's own header comment in
@@ -270,23 +285,31 @@ def main() -> int:
         # prevent. Sent once, not retried: like commit, a real "not
         # enough room" response is informative and shouldn't be masked
         # by blindly resending the same command.
-        session.send(f"wifikey begin {real_len}")
-        begin_ok = session.read_until("ok, room available", timeout=args.chunk_timeout)
-        if not begin_ok:
-            tail = session.tail_text(300)
-            if "usage: wifikey" in tail:
-                # Older board build, no `begin` support yet -- degrade
-                # gracefully (this command is documented as optional-
-                # but-recommended, not required) rather than hard-fail
-                # on a perfectly good board just because it predates
-                # this one host-side convenience check. The real,
-                # authoritative space check still happens at commit.
-                print("[info] board doesn't support 'wifikey begin' yet (older build) -- "
-                      "skipping the pre-flight space check, proceeding with chunks")
-            else:
-                print("[FAIL] 'wifikey begin' did not report room available")
-                print(f"       actual board response (last 300 chars): {tail!r}")
-                return 1
+        #
+        # Skipped entirely under --raw: `begin` checks DharaFS's own
+        # space, which `commitraw` never touches at all -- found live,
+        # immediately, the obvious way: sending it unconditionally made
+        # a --raw upload fail on a DharaFS-full board even though the
+        # raw fallback region it's actually targeting has nothing to
+        # do with that space.
+        if not args.raw:
+            session.send(f"wifikey begin {real_len}")
+            begin_ok = session.read_until("ok, room available", timeout=args.chunk_timeout)
+            if not begin_ok:
+                tail = session.tail_text(300)
+                if "usage: wifikey" in tail:
+                    # Older board build, no `begin` support yet -- degrade
+                    # gracefully (this command is documented as optional-
+                    # but-recommended, not required) rather than hard-fail
+                    # on a perfectly good board just because it predates
+                    # this one host-side convenience check. The real,
+                    # authoritative space check still happens at commit.
+                    print("[info] board doesn't support 'wifikey begin' yet (older build) -- "
+                          "skipping the pre-flight space check, proceeding with chunks")
+                else:
+                    print("[FAIL] 'wifikey begin' did not report room available")
+                    print(f"       actual board response (last 300 chars): {tail!r}")
+                    return 1
 
         for idx, c in enumerate(chunks):
             ok = session.step(f"wifikey chunk {c.hex()}", "bytes accumulated",
