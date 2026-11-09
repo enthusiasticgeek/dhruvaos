@@ -205,6 +205,15 @@ def main() -> int:
                           "stall at a different point each time (2026-11-09), unrelated to this script, "
                           "so retrying the reboot+PASS-wait HERE just repeats a real-HW flakiness risk "
                           "instead of avoiding it")
+    ap.add_argument("--raw", action="store_true",
+                     help="commit to rtl8188cu_fw_raw_sd_base_block()'s own fixed 32-block raw SD region "
+                          "('wifikey commitraw') instead of DharaFS's own /wifi/fw.bin ('wifikey commit') -- "
+                          "use this when DharaFS's log doesn't have room (found live, 2026-11-09: the log "
+                          "was genuinely at its block ceiling, and even an aggressive multi-pass 'catchup' "
+                          "run didn't free enough in a reasonable time). The raw region is this project's "
+                          "own pre-existing, deliberately-reserved fallback for exactly this file, "
+                          "previously only reachable by writing the SD card directly (dd, offline) -- same "
+                          "chunk-accumulation protocol either way, just a different final destination.")
     args = ap.parse_args()
 
     data = open(args.firmware, "rb").read()
@@ -301,14 +310,16 @@ def main() -> int:
         # whatever the real first-attempt failure reason was -- found
         # live, the hard way, chasing a wrong "recovery still active"
         # guess that a RETRY's own misleading response reinforced.
-        commit_needle = f"ok, {real_len} bytes written to /wifi/fw.bin"
-        session.send(f"wifikey commit {real_len} {real_sha256}")
+        commit_word = "commitraw" if args.raw else "commit"
+        destination = "the raw SD fallback region" if args.raw else "/wifi/fw.bin"
+        commit_needle = "bytes written to" if args.raw else f"ok, {real_len} bytes written to /wifi/fw.bin"
+        session.send(f"wifikey {commit_word} {real_len} {real_sha256}")
         if not session.read_until(commit_needle, timeout=args.commit_timeout):
             print(f"[FAIL] commit did not report the expected line: {commit_needle!r}")
             print(f"       actual board response (last 300 chars): {session.tail_text(300)!r}")
             return 1
 
-        print(f"[PASS] uploaded {real_len} bytes to /wifi/fw.bin (sha256={real_sha256})")
+        print(f"[PASS] uploaded {real_len} bytes to {destination} (sha256={real_sha256})")
         return 0
     finally:
         session.close()

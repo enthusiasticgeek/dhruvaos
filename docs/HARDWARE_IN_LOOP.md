@@ -512,6 +512,19 @@ header comment in `kernel_main.vani` for the full "why" and its
 limits -- it's a fast estimate, not a guarantee; the real,
 authoritative check still happens at `commit`.)
 
+If `begin`/`commit` report DharaFS genuinely doesn't have room (found
+live, 2026-11-09: the log was at its real 7600-block ceiling, and
+even an aggressive multi-pass `catchup` run didn't free enough in a
+reasonable time), use `wifikey commitraw <total_len_bytes>
+<sha256_hex>` instead of `commit` as the final step -- writes the
+SAME already-accumulated chunks to `rtl8188cu_fw_raw_sd_base_block()`'s
+own fixed 32-block raw region instead of DharaFS, with the same
+integrity check. This is this project's own pre-existing, deliberately
+-reserved fallback for exactly this file (previously only reachable by
+writing the SD card directly, offline), now reachable over this same
+live chunked-upload protocol. `test/wifikey_upload.py`'s own `--raw`
+flag drives this.
+
 (`commit` takes the real total length and a sha256 of the whole
 reconstructed file, checked against the accumulated buffer BEFORE
 anything is written to DharaFS -- see `uart_upload_verify_sha256`'s

@@ -37044,7 +37044,7 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
     return 0;
   }
   if cmd_end >= line_len {
-    let _ = uart_puts("usage: wifikey begin <total_len_bytes> | wifikey chunk <hex> | wifikey commit <total_len_bytes> <sha256_hex> | wifikey abort\n");
+    let _ = uart_puts("usage: wifikey begin <total_len_bytes> | wifikey chunk <hex> | wifikey commit <total_len_bytes> <sha256_hex> | wifikey commitraw <total_len_bytes> <sha256_hex> | wifikey abort\n");
     return 0;
   }
   let sub_start: i64 = cmd_end + 1;
@@ -37206,6 +37206,120 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
     return 0;
   }
 
+  // 2026-11-09 (found live, real-HW: DharaFS's own log was genuinely
+  // at its 7600-block ceiling, and even an aggressive multi-pass
+  // `catchup` run didn't reclaim enough for a 36-block firmware write
+  // in a reasonable time): writes the SAME already-accumulated chunk
+  // buffer to rtl8188cu_fw_raw_sd_base_block()'s own fixed 32-block
+  // (16384-byte) raw region instead of DharaFS -- this project's own
+  // pre-existing, deliberately-reserved fallback for exactly this file
+  // (see that function's own header comment: "flash_sd_card.sh's own
+  // FAT boot partition... entirely unused raw space on every card this
+  // project's own scripts already produce"), previously only reachable
+  // by writing the SD card directly (dd, offline, before boot) -- this
+  // is the same path made reachable live, over this same chunked-
+  // upload protocol, with no DharaFS log-space dependency at all.
+  // Shares every other `wifikey` command's accumulation/abort state
+  // and the SAME generic integrity check as `commit` -- the only real
+  // difference is the destination.
+  if shell_word_matches(line_buf, sub_start, sub_end, "commitraw") == 1 {
+    let wkr_total_len: i64 = usb_wifi_fw_upload_len_get() as i64;
+    if wkr_total_len <= 0 {
+      let _ = uart_puts("wifikey: nothing to commit (no chunks uploaded yet)\n");
+      return 0;
+    }
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: wifikey commitraw <total_len_bytes> <sha256_hex>\n");
+      return 0;
+    }
+    let wkr_len_start: i64 = sub_end + 1;
+    let wkr_len_end: i64 = shell_find_space(line_buf, wkr_len_start, line_len);
+    if wkr_len_end >= line_len {
+      let _ = uart_puts("usage: wifikey commitraw <total_len_bytes> <sha256_hex>\n");
+      return 0;
+    }
+    let wkr_claimed_len: i64 = shell_parse_decimal(line_buf, wkr_len_start, wkr_len_end);
+    if wkr_claimed_len != wkr_total_len {
+      let _ = uart_puts("wifikey: total_len mismatch (claimed ");
+      let _ = uart_put_i64(wkr_claimed_len);
+      let _ = uart_puts(", accumulated ");
+      let _ = uart_put_i64(wkr_total_len);
+      let _ = uart_puts(") -- not committing\n");
+      return 0;
+    }
+    let raw_block_count: i64 = rtl8188cu_fw_raw_sd_block_count();
+    let raw_cap_bytes: i64 = raw_block_count * (512 as i64);
+    if wkr_total_len > raw_cap_bytes {
+      let _ = uart_puts("wifikey: total_len exceeds the raw fallback region's own ");
+      let _ = uart_put_i64(raw_cap_bytes);
+      let _ = uart_puts("-byte capacity -- not committing\n");
+      return 0;
+    }
+    let wkr_sha_start: i64 = wkr_len_end + 1;
+    let wkr_sha_end: i64 = shell_find_space(line_buf, wkr_sha_start, line_len);
+    if (wkr_sha_end - wkr_sha_start) != 64 {
+      let _ = uart_puts("wifikey: expected a 64-char (32-byte) sha256 hex digest\n");
+      return 0;
+    }
+    let wkr_claimed_digest: mut ref i64 = kernelupload_chunk_decode_buf_get();
+    let wkr_hex_status: i64 = shell_parse_hex_bytes(line_buf, wkr_sha_start, wkr_sha_end, wkr_claimed_digest, 32);
+    if wkr_hex_status != 0 {
+      let _ = uart_puts("wifikey: invalid sha256 hex\n");
+      return 0;
+    }
+
+    let wkr_fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
+    if uart_upload_verify_sha256(wkr_fw_buf, wkr_total_len, wkr_claimed_digest) != 1 {
+      let _ = uart_puts("wifikey: reconstructed data does not match the claimed sha256 -- not committing\n");
+      let _ = usb_wifi_fw_upload_len_set(0 as u32);
+      let _ = maintenance_mode_disengage();
+      return 0;
+    }
+
+    let raw_base: i64 = rtl8188cu_fw_raw_sd_base_block();
+    let raw_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+    let raw_blk: i64 = 0;
+    let raw_wr_status: i64 = 0;
+    while raw_blk < raw_block_count {
+      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+        let _ = watchdog_kick();
+      }
+      let raw_off: i64 = raw_blk * (512 as i64);
+      let raw_in_this_block: i64 = if raw_off < wkr_total_len {
+        (if (wkr_total_len - raw_off) < (512 as i64) { wkr_total_len - raw_off } else { 512 as i64 })
+      } else {
+        0
+      };
+      let raw_zi: i64 = 0;
+      while raw_zi < (512 as i64) {
+        let raw_b: u32 = if raw_zi < raw_in_this_block { buf_read_byte(wkr_fw_buf, (raw_off + raw_zi) as u32) } else { 0 as u32 };
+        let _ = buf_write_byte(raw_scratch, raw_zi as u32, raw_b);
+        raw_zi = raw_zi + 1;
+      }
+      let raw_this_status: i64 = sdhost_write_block(raw_base + raw_blk, raw_scratch);
+      if raw_this_status != 0 {
+        raw_wr_status = raw_this_status;
+        raw_blk = raw_block_count; // stop, same "don't keep writing after a real I/O failure" posture as every other raw-block writer in this file
+      } else {
+        raw_blk = raw_blk + 1;
+      }
+    }
+    let _ = usb_wifi_fw_upload_len_set(0 as u32);
+    let _ = maintenance_mode_disengage();
+    if raw_wr_status == 0 {
+      let _ = uart_puts("ok, ");
+      let _ = uart_put_i64(wkr_total_len);
+      let _ = uart_puts(" bytes written to the raw SD fallback region (base_block=");
+      let _ = uart_put_i64(raw_base);
+      let _ = uart_puts(")\n");
+    } else {
+      let _ = uart_puts("wifikey: commitraw failed, sdhost_write_block status=");
+      let _ = uart_put_i64(raw_wr_status);
+      let _ = uart_puts("\n");
+    }
+    return 0;
+  }
+
   if shell_word_matches(line_buf, sub_start, sub_end, "chunk") == 1 {
     if sub_end >= line_len {
       let _ = uart_puts("usage: wifikey chunk <hex, up to 96 hex chars/48 bytes per call>\n");
@@ -37253,7 +37367,7 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
     return 0;
   }
 
-  let _ = uart_puts("usage: wifikey begin <total_len_bytes> | wifikey chunk <hex> | wifikey commit <total_len_bytes> <sha256_hex> | wifikey abort\n");
+  let _ = uart_puts("usage: wifikey begin <total_len_bytes> | wifikey chunk <hex> | wifikey commit <total_len_bytes> <sha256_hex> | wifikey commitraw <total_len_bytes> <sha256_hex> | wifikey abort\n");
   return 0;
 }
 
