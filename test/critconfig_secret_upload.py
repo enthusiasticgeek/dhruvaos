@@ -90,14 +90,22 @@ def main() -> int:
         print("error: key must be 1-24 characters", file=sys.stderr)
         return 1
 
-    if not check_device_exclusive(args.device):
-        return 1
-
+    # Stop the logger BEFORE the exclusivity check, not after -- it's
+    # this project's own expected, known holder of the device day to
+    # day (see check_device_exclusive's own KNOWN_HOLDER_HINTS), so
+    # checking first just refuses every single time with a message
+    # telling the caller to do exactly what this script already does
+    # next anyway.
     stopped_logger = False
     if logger_is_active():
         print(f"stopping {UART_LOGGER_UNIT} for the duration of this write (secret echo must not land in ~/dhruva_uart.log)...")
         subprocess.run(["systemctl", "--user", "stop", UART_LOGGER_UNIT], timeout=10)
         stopped_logger = True
+
+    if not check_device_exclusive(args.device):
+        if stopped_logger:
+            subprocess.run(["systemctl", "--user", "start", UART_LOGGER_UNIT], timeout=10)
+        return 1
 
     result = 1
     try:

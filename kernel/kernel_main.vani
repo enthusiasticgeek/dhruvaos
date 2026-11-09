@@ -27559,6 +27559,35 @@ fn critical_config_table_load() -> i64 {
   let block_scratch: mut ref i64 = dhruva_alloc_bytes(512);
   let blk: i64 = 0;
   while blk < critical_config_blocks_per_copy() {
+    // 2026-11-08 (real-HW watchdog reset investigation): sdhost_write_
+    // block/sdhost_read_block's own per-ATTEMPT kick (see either one's
+    // header comment) only fires if a block actually needs a retry --
+    // on a healthy run it's silent, and this whole function's own
+    // caller (critical_config_write_raw) chains table_load (here, up
+    // to 18 raw block reads) directly into table_flush (32 more raw
+    // writes) with nothing else in between. Measured live on this
+    // exact card: a single critconfig write already costs ~10.2s of
+    // real SD time on its own (see docs/TODO.md), comfortably within
+    // the 15s real-HW watchdog window on a healthy run -- but with no
+    // margin left for the FIRST `--encrypted` write in a boot session,
+    // which also pays a one-time, uncached PBKDF2-10000-iteration key
+    // derivation (critical_config_crypto_key_ensure) on top: live-
+    // confirmed to tip the real total past 15s and trigger a genuine
+    // hardware watchdog reset (survived safely -- the two-copy ping-
+    // pong design means a torn write from exactly this reset still
+    // read back correctly on the next boot -- but real nonetheless).
+    // Not a missed-kick bug in the strict sense (the FIQ-driven timer-
+    // tick kick keeps firing throughout; this is a genuine real-time
+    // MARGIN problem, confirmed by direct measurement, not a masked-
+    // interrupt blind spot) -- an explicit kick here, matching every
+    // other multi-block SD loop in this codebase's own established
+    // self-attestation pattern, removes the margin problem directly
+    // rather than just hoping no future caller ever adds enough extra
+    // work (a slower card, a larger value, more AEAD overhead) to
+    // cross 15s again.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
     let _ = sdhost_read_block(chosen_base + blk, block_scratch);
     let _ = ssh_copy(table, blk * (512 as i64), block_scratch, 0, 512);
     blk = blk + 1;
@@ -27575,12 +27604,24 @@ fn critical_config_table_flush_one_copy(base_block: i64, new_generation: u32) ->
   let block_scratch: mut ref i64 = dhruva_alloc_bytes(512);
   let blk: i64 = 1;
   while blk < critical_config_blocks_per_copy() {
+    // 2026-11-08: see critical_config_table_load's own matching kick
+    // for the full "why" (real-HW watchdog reset, confirmed root
+    // cause). This function's own 2 calls (copy A then copy B) chain
+    // directly after table_load's up to 18 reads with nothing else in
+    // between -- the single biggest contributor to this call's own
+    // ~10s+ real SD time.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
     let _ = ssh_copy(block_scratch, 0, table, blk * (512 as i64), 512);
     let wr_status: i64 = sdhost_write_block(base_block + blk, block_scratch);
     if wr_status != 0 {
       return wr_status;
     }
     blk = blk + 1;
+  }
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    let _ = watchdog_kick();
   }
   let _ = buf_write_u32_be(table, 0, critical_config_magic());
   let _ = buf_write_u32_be(table, 4, new_generation);
