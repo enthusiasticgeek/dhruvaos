@@ -376,6 +376,31 @@ def main() -> int:
                           "BYTES's own header). Raised from 5.0 to 10.0 on the same date for margin against that "
                           "contention possibly also scaling with the bigger window, not just recurring at the "
                           "same magnitude -- not yet confirmed which, so sized generously rather than tightly.")
+    ap.add_argument("--retries", type=int, default=3,
+                     help="2026-11-09 (real-HW resilience fix for an occasional full stream stall, root-caused "
+                          "by elimination via live instrumentation on BOTH ends, not guessed): host os.write() "
+                          "calls are always instantaneous (confirmed live, KUPLOAD_DEBUG_WRITES=1) -- rules out "
+                          "a slow/blocking host. The board's own UART_FR/RIS snapshot at the moment of the stall "
+                          "shows a genuinely empty hardware RX FIFO with IRQs still enabled and task_f still "
+                          "actively polling -- rules out both 'bytes stuck unprocessed' (there's a separate, "
+                          "already-proven task-context force-drain for exactly that case, and it finds nothing) "
+                          "and a dhruva_prio_lock(2) contention hang (that would leave task_f BLOCKED, never "
+                          "reaching this stall-diagnostic print's own code path at all, since it only runs from "
+                          "an actively-looping iteration). The board's own live `rxdiag` overrun_count reads 0 "
+                          "across this entire investigation -- rules out genuine PL011 hardware RX FIFO overrun "
+                          "too, the last mechanism either side's own code could still be blamed for. With every "
+                          "software-explainable cause on both ends directly ruled out by live evidence, not "
+                          "merely unconfirmed, what's left is a transient fault in the physical USB-to-serial "
+                          "link itself (the host's own adapter silently dropping bytes already accepted by the "
+                          "kernel's tty layer, outside any application's visibility on either end) -- this link "
+                          "has no hardware flow control either (confirmed via `stty -a`, -crtscts), so nothing "
+                          "upstream of the adapter could even detect it happening. Not fixable by retrying the "
+                          "SAME bytes differently, but empirically rare enough per 2048-byte window, and cleanly "
+                          "recoverable (the board's own 10s self-abort already leaves it in a clean, immediately-"
+                          "retryable state -- confirmed live, repeatedly: `kernelupload resumestatus` reports "
+                          "clean right after every stall this investigation captured), that simply re-running "
+                          "the whole already-aged-card-tolerant upload succeeds end-to-end essentially every "
+                          "time. Set to 1 to disable and fail on the first stall, matching the old behavior.")
     args = ap.parse_args()
 
     data = open(args.kernel_img, "rb").read()
@@ -386,6 +411,31 @@ def main() -> int:
     if not check_device_exclusive(args.device):
         return 1
 
+    attempt = 1
+    while True:
+        if attempt > 1:
+            print(f"--- retry {attempt}/{args.retries} ---")
+        status = _attempt_upload(args, data, real_len, real_sha256)
+        if status == 0:
+            return 0
+        if attempt >= args.retries:
+            print(f"[FAIL] giving up after {attempt} attempt(s) -- see --retries to change this")
+            return status
+        # The board's own 10s stream-inactivity self-abort (kernel_main.vani's
+        # task_f drain loop) already clears kernelupload_active/_stream_active
+        # by the time send_raw_ack_paced's own IOError reaches here -- no
+        # explicit `kernelupload abort` needed before the next attempt's
+        # fresh 'kernelupload stream' command, confirmed live (`kernelupload
+        # resumestatus` reports clean immediately after every stall this
+        # investigation captured). A short settle delay only, same spirit as
+        # every other post-hardware-action wait in this project, not a fixed
+        # guess at how long recovery takes (there's nothing here TO recover
+        # from on the board's side -- it already self-cleaned).
+        time.sleep(2)
+        attempt += 1
+
+
+def _attempt_upload(args, data: bytes, real_len: int, real_sha256: str) -> int:
     fd = open_serial(args.device, args.baud)
     session = ShellSession(fd, args.log)
 
