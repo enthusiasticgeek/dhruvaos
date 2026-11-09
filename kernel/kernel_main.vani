@@ -15979,12 +15979,23 @@ fn shell_dispatch_usbpowercycle() -> i64 {
   let _ = uart_puts("usbpowercycle: power-on mailbox status=");
   let _ = uart_put_hex32(on_status as u32);
   let _ = uart_puts(" (0=success)\n");
-  if on_status != 0 {
-    let _ = dhruva_prio_unlock(3);
-    let _ = uart_puts("usbpowercycle: aborting -- power-on failed, not touching the controller\n");
-    return 0;
-  }
-  // Real settle time before touching any DWC2 register, same
+  // BUG FOUND 2026-11-09 (live real-HW test, immediately after this
+  // command's own first deployment): this used to abort here on
+  // on_status!=0 -- but kernel_main.vani's own boot-time usb_power_on()
+  // call (checkpoint 13, "USB: power-on mailbox status=...") has
+  // printed exactly this same nonzero status on EVERY SINGLE real-HW
+  // boot this entire session, including every boot where USB then
+  // went on to enumerate correctly -- the boot path has never once
+  // gated on it, only logged it. usb_power_on's own strict success
+  // check (overall mailbox status AND response bit0 set AND bit1
+  // clear) is plausibly too strict for what this specific VideoCore
+  // firmware actually reports back for this exact call on this exact
+  // board -- a real, live-observed discrepancy between the function's
+  // documented contract and this hardware's actual behavior, not
+  // something to paper over by deleting the diagnostic, just by not
+  // treating it as fatal here either, matching the one real precedent
+  // (the boot path) this project already has for this exact call.
+  // Real elapsed settle time before touching any DWC2 register, same
   // reasoning (and same count) as the existing boot-path call's own
   // post-mailbox-response delay -- see kernel_main.vani's own
   // usb_power_on() call site comment for the full "why" (DWC2's
