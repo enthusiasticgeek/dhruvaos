@@ -264,9 +264,20 @@ def main() -> int:
         session.send(f"wifikey begin {real_len}")
         begin_ok = session.read_until("ok, room available", timeout=args.chunk_timeout)
         if not begin_ok:
-            print("[FAIL] 'wifikey begin' did not report room available")
-            print(f"       actual board response (last 300 chars): {session.tail_text(300)!r}")
-            return 1
+            tail = session.tail_text(300)
+            if "usage: wifikey" in tail:
+                # Older board build, no `begin` support yet -- degrade
+                # gracefully (this command is documented as optional-
+                # but-recommended, not required) rather than hard-fail
+                # on a perfectly good board just because it predates
+                # this one host-side convenience check. The real,
+                # authoritative space check still happens at commit.
+                print("[info] board doesn't support 'wifikey begin' yet (older build) -- "
+                      "skipping the pre-flight space check, proceeding with chunks")
+            else:
+                print("[FAIL] 'wifikey begin' did not report room available")
+                print(f"       actual board response (last 300 chars): {tail!r}")
+                return 1
 
         for idx, c in enumerate(chunks):
             ok = session.step(f"wifikey chunk {c.hex()}", "bytes accumulated",

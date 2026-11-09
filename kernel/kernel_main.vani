@@ -37253,7 +37253,7 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
     return 0;
   }
 
-  let _ = uart_puts("usage: wifikey chunk <hex> | wifikey commit | wifikey abort\n");
+  let _ = uart_puts("usage: wifikey begin <total_len_bytes> | wifikey chunk <hex> | wifikey commit <total_len_bytes> <sha256_hex> | wifikey abort\n");
   return 0;
 }
 
