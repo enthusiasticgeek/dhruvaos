@@ -188,3 +188,136 @@ upo_failed:
     mov r1, #0
     ldmia sp!, {r4-r9, lr}
     bx lr
+
+/* i64 usb_power_off() -- returns 0 on VideoCore-reported success
+ * (power domain confirmed OFF), 1 on timeout or a reported failure.
+ *
+ * 2026-11-09 (real-HW USB-device-wedge investigation): a confirmed-
+ * wedged downstream USB device (behind the LAN9512 hub -- see this
+ * file's own `usb_power_on` header for the device-id table) survived
+ * BOTH a hub-port-level power-cycle (ClearPortFeature/SetPortFeature
+ * (PORT_POWER), ~1s off) and a DWC2 root-port HPRT0.PRTPWR clear/set
+ * cycle (also ~1s) -- neither recovered it. Research this round
+ * (Linux's own device tree for this exact board, `bcm283x.dtsi`/
+ * `bcm283x-rpi-usb-host.dtsi`: no `vbus-supply`/regulator node at all,
+ * PHY is the literal `usb-nop-xceiv` "do-nothing" transceiver; and
+ * independently, the LAN9512's own `PRTCTL` pins on THIS board are
+ * wired as power-PRESENT inputs, not switch-driving outputs, per its
+ * own datasheet cross-checked against this board's schematic) found
+ * why: this specific Raspberry Pi 1 Model B has no real, software-
+ * controllable VBUS switch anywhere in the chain for its external USB
+ * port -- the hub chip's own `LPSM=01` ("individual" switching) in its
+ * USB hub descriptor is a property of its internal logic, with no
+ * physical switch transistor on this board for it to actually drive.
+ * Both power-cycle attempts above were therefore no-ops at the
+ * hardware level regardless of how long they held things "off."
+ *
+ * This is a DIFFERENT, SoC-internal gate: the VideoCore firmware's own
+ * power-domain state for the USB HCD block itself (same mailbox
+ * device id 3 as `usb_power_on`'s own call -- this project's own
+ * memory on the BCM2835 USB-power-domain register-loss erratum, a
+ * real Linux maintainer mailing-list thread "dwc2: Implement recovery
+ * after PM domain off", is DIRECT, independent confirmation that
+ * cycling THIS exact domain off/on is a genuine silicon-level power
+ * removal, not just a signaling bit -- it's documented to lose real
+ * DWC2 register state when it happens, which a no-op switch never
+ * could). Powering this domain off won't cut the external 5V rail
+ * (confirmed hardwired, above) but DOES depower the SoC's own USB PHY
+ * -- a real link-level disconnect from the hub's own perspective, a
+ * genuinely different and previously-untried recovery path, not
+ * merely a repeat of either already-ruled-out mechanism.
+ *
+ * State value 2 = bit1 (WAIT) only, bit0 (ON) cleared -- same "block
+ * for the firmware's own confirmation, not just request-accepted"
+ * discipline as usb_power_on's own call. Response validation is the
+ * mirror image of usb_power_on's own: success means the response's
+ * bit0 (powered on?) reads back 0 (confirmed OFF), not 1. */
+.global usb_power_off
+usb_power_off:
+    stmdb sp!, {r4-r9, lr}
+
+    ldr r4, =usb_power_mbox_buf
+    mov r7, #32
+    str r7, [r4, #0]                 /* buf[0]: total size (bytes) */
+    mov r7, #0
+    str r7, [r4, #4]                 /* buf[1]: request code */
+    ldr r7, =0x00028001
+    str r7, [r4, #8]                 /* buf[2]: tag = set power state */
+    mov r7, #8
+    str r7, [r4, #12]                /* buf[3]: value buffer size */
+    mov r7, #0
+    str r7, [r4, #16]                /* buf[4]: tag req/resp code */
+    mov r7, #3
+    str r7, [r4, #20]                /* buf[5]: device id (3 = USB HCD) */
+    mov r7, #2
+    str r7, [r4, #24]                /* buf[6]: state (bit0=off, bit1=wait) */
+    mov r7, #0
+    str r7, [r4, #28]                /* buf[7]: end tag */
+
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5
+
+    mov r8, r4
+    bic r8, r8, #0xF
+    orr r8, r8, #8                   /* channel 8: property tags */
+
+    ldr r9, =0x2000B898              /* MAILBOX_STATUS */
+    ldr r5, =100000                  /* bounded-poll iteration cap */
+
+    mov r0, #0
+upf_wait_write:
+    ldr r1, [r9]
+    tst r1, #0x80000000              /* FULL */
+    beq upf_write_ready
+    add r0, r0, #1
+    cmp r0, r5
+    blt upf_wait_write
+    mov r0, #1
+    mov r1, #0
+    ldmia sp!, {r4-r9, lr}
+    bx lr
+
+upf_write_ready:
+    ldr r1, =0x2000B8A0              /* MAILBOX_WRITE */
+    str r8, [r1]
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 5       /* DMB */
+
+    mov r0, #0
+upf_wait_read:
+    ldr r1, [r9]
+    tst r1, #0x40000000              /* EMPTY */
+    bne upf_read_not_ready
+    ldr r2, =0x2000B880              /* MAILBOX_READ */
+    ldr r2, [r2]
+    cmp r2, r8
+    beq upf_got_response
+upf_read_not_ready:
+    add r0, r0, #1
+    cmp r0, r5
+    blt upf_wait_read
+    mov r0, #1
+    mov r1, #0
+    ldmia sp!, {r4-r9, lr}
+    bx lr
+
+upf_got_response:
+    ldr r2, [r4, #4]                 /* buf[1]: overall response code */
+    ldr r3, =0x80000000
+    cmp r2, r3
+    bne upf_failed
+
+    ldr r2, [r4, #24]                /* buf[6]: response state */
+    tst r2, #1                       /* bit0: powered on? must be 0 (off) */
+    bne upf_failed
+
+    mov r0, #0
+    mov r1, #0
+    ldmia sp!, {r4-r9, lr}
+    bx lr
+
+upf_failed:
+    mov r0, #1
+    mov r1, #0
+    ldmia sp!, {r4-r9, lr}
+    bx lr

@@ -1925,6 +1925,12 @@ extern "C" fn dwc2_dma_scratch_get() -> mut ref i64;
 // never power-gates the DWC2 block at all).
 #[stack_cost(bytes=28)]
 extern "C" fn usb_power_on() -> i64;
+// 2026-11-09 -- see usb_power_off's own header comment (boot/
+// usb_power_state.S) for the full "why" (real-HW USB-device-wedge
+// investigation: a genuinely different, SoC-internal power gate from
+// either already-tried, already-ruled-out mechanism).
+#[stack_cost(bytes=28)]
+extern "C" fn usb_power_off() -> i64;
 // RTOS-boot-time hardening, USB follow-up (2026-11-01) -- see that same
 // file's own matching header comment for usb_probe0_pending's full
 // "why" (mirrors dharafs_recovery_active's own RAM-only deferred-work
@@ -15938,6 +15944,73 @@ fn shell_dispatch_rxdiag() -> i64 {
   return 0;
 }
 
+// 2026-11-09 (real-HW USB-device-wedge investigation): live-testable
+// shell command for the VideoCore-mailbox-mediated USB power-domain
+// cycle (usb_power_off/usb_power_on, boot/usb_power_state.S) -- see
+// usb_power_off's own header comment for the full "why" this is a
+// genuinely different mechanism from the two already-ruled-out power-
+// cycle attempts (hub-port PORT_POWER, DWC2 root-port HPRT0.PRTPWR).
+// Exposed as its own command (rather than only wired into the boot
+// path) specifically so this can be tried against an ALREADY-wedged
+// board over a live serial session, without needing a full rebuild/
+// reboot cycle to test each iteration.
+//
+// Same DWC2_MUTEX_ID (ceiling=2) every other DWC2-touching command/
+// background task already uses -- this is about as invasive a DWC2
+// operation as exists in this driver (depowers the whole controller),
+// so it must not run concurrently with task_e's own hotplug/DHCP poll
+// or an in-progress kernelupload/wifikey transfer.
+fn shell_dispatch_usbpowercycle() -> i64 {
+  let _ = dhruva_prio_lock(2);
+  let _ = uart_puts("usbpowercycle: depowering USB HCD domain...\n");
+  let off_status: i64 = usb_power_off();
+  let _ = uart_puts("usbpowercycle: power-off mailbox status=");
+  let _ = uart_put_hex32(off_status as u32);
+  let _ = uart_puts(" (0=success)\n");
+  // Real elapsed settle time, not a fixed guess at how long the GPU's
+  // own power-domain-off sequence needs internally -- same order of
+  // magnitude as dwc2_hub_power_cycle_port's own real-HW-derived
+  // power-off window (this round's own earlier fix, same file), long
+  // enough that no onboard regulator/cap still holding charge could
+  // plausibly matter.
+  let _ = delay(3300000);
+  let _ = uart_puts("usbpowercycle: repowering USB HCD domain...\n");
+  let on_status: i64 = usb_power_on();
+  let _ = uart_puts("usbpowercycle: power-on mailbox status=");
+  let _ = uart_put_hex32(on_status as u32);
+  let _ = uart_puts(" (0=success)\n");
+  if on_status != 0 {
+    let _ = dhruva_prio_unlock(3);
+    let _ = uart_puts("usbpowercycle: aborting -- power-on failed, not touching the controller\n");
+    return 0;
+  }
+  // Real settle time before touching any DWC2 register, same
+  // reasoning (and same count) as the existing boot-path call's own
+  // post-mailbox-response delay -- see kernel_main.vani's own
+  // usb_power_on() call site comment for the full "why" (DWC2's
+  // internal reset/sync logic needs real time after the rail itself
+  // is confirmed stable, not just immediately after the mailbox
+  // response).
+  let _ = delay(161000);
+  let _ = uart_puts("usbpowercycle: re-running dwc2_init()...\n");
+  let init_status: i64 = dwc2_init();
+  let _ = uart_puts("usbpowercycle: dwc2_init status=");
+  let _ = uart_put_hex32(init_status as u32);
+  let _ = uart_puts(" (0=controller ready, port connected+enabled)\n");
+  if init_status != 0 {
+    let _ = dhruva_prio_unlock(3);
+    let _ = uart_puts("usbpowercycle: no connected+enabled port after re-init -- stopping here\n");
+    return 0;
+  }
+  let _ = uart_puts("usbpowercycle: re-running device0 probe (hub + both downstream ports)...\n");
+  let probe_status: i64 = dwc2_probe_device0();
+  let _ = dhruva_prio_unlock(3);
+  let _ = uart_puts("usbpowercycle: device0 probe status=");
+  let _ = uart_put_hex32(probe_status as u32);
+  let _ = uart_puts(" (0=enumerated, nonzero=no response) -- see the per-port 'USB DIAG' lines above for which port(s), if any, now respond\n");
+  return 0;
+}
+
 // TASK #357 follow-up (2026-10-19): prints whatever resume_pc_sentinel_
 // bad's own raw dump (boot/context_switch.S) last wrote to block 8226
 // -- the second, UART-bypassing copy of the same register/SPSR/
@@ -24902,6 +24975,54 @@ fn dwc2_port_power_on() -> i64 {
   return 0;
 }
 
+// 2026-11-09 (real-HW USB-wedge investigation, user: "try usb sw
+// reset to get usb to respond"): HPRT0.PRTPWR gates the root port's
+// own VBUS output -- the SAME physical 5V rail the external hub (and
+// therefore every downstream device on it, including both the WiFi
+// dongle and the separate BT dongle this investigation's own captures
+// show wedged) is bus-powered from. dwc2_core_soft_reset's own GRSTCTL
+// CSftRst bit resets the controller's internal logic ONLY -- it has
+// never, on inspection, touched HPRT0 (and per the DWC2/dwc_otg IP's
+// own documented reset domains, a core soft reset is explicitly NOT
+// supposed to disconnect an attached device, i.e. NOT supposed to
+// clear PRTPWR). This driver's own dwc2_port_power_on() (above) has
+// ONLY EVER done a read-modify-write that OR's PRTPWR in -- every
+// single call site in this whole file, across the entire session,
+// including dwc2_init() on every one of the many reboots this
+// investigation has done -- NEVER clears it first. Net effect: VBUS to
+// the external hub has plausibly never actually been interrupted even
+// ONCE since boot, through any of dwc2_core_soft_reset, a full ARM
+// reboot, or the per-hub-port power-cycle fix earlier this same
+// investigation (dwc2_hub_power_cycle_port, which can only ever
+// control the HUB's OWN downstream switches -- confirmed via its
+// GET_DESCRIPTOR(Hub) capture as LPSM=01 real individual per-port
+// switching, not a no-op -- but never the hub's OWN upstream supply,
+// which is exactly this root port). Every prior recovery attempt this
+// investigation tried was therefore, at best, a USB-protocol-level
+// (D+/D- signaling) reset, never a genuine power interruption to the
+// hub+devices as a whole. This is the first thing in this whole
+// driver that actually clears PRTPWR before setting it again.
+// ~1.02s off (3300000 iterations, see dwc2_hub_power_cycle_port's own
+// matching real-HW-derived duration for why 161000/~50ms is too brief
+// to guarantee a real brownout past typical onboard bulk-cap holdup)
+// -- called unconditionally from dwc2_init() every single boot
+// (cheap: dwc2_init already costs seconds of real HW settle time by
+// its own existing comments, and a background-task-deferred one-time
+// ~1s add is not a new real-time risk) so every future boot gets a
+// REAL power cycle of the whole downstream USB tree, not just a
+// signaling reset, closing this specific gap regardless of whether
+// it's confirmed to be the actual root cause of THIS wedge or not.
+fn dwc2_root_vbus_power_cycle() -> i64 {
+  let hprt0: i64 = dwc2_hprt0_addr();
+  let w1c_mask: u32 = dwc2_hprt0_w1c_group_mask();
+  let not_w1c_mask: u32 = w1c_mask ^ (0xFFFFFFFF as u32);
+  let not_pwr_bit: u32 = dwc2_hprt0_pwr_bit() ^ (0xFFFFFFFF as u32);
+  let v: u32 = mmio_read_u32(hprt0);
+  let _ = mmio_write_u32(hprt0, (v & not_w1c_mask) & not_pwr_bit);
+  let _ = delay(3300000);
+  return 0;
+}
+
 // AUDITED (round 17, 2026-08-28) -- this function's own read/write/
 // read/write/read/write sequence against HPRT0, and the read/write
 // sequence dwc2_init() runs against GSNPSID/GAHBCFG/HPRT0 on the way
@@ -25470,6 +25591,12 @@ fn dwc2_init() -> i64 {
   // ever drives, unlike U-Boot which loops over every GHWCFG2-
   // reported channel).
   let _ = dwc2_flush_chan0_to_known_state();
+  // 2026-11-09: see dwc2_root_vbus_power_cycle's own header comment --
+  // a real VBUS off-then-on, not just the plain OR-in-PRTPWR below,
+  // so a wedged downstream device (hub or anything behind it) gets an
+  // actual power interruption every boot, not just a protocol-level
+  // reset.
+  let _ = dwc2_root_vbus_power_cycle();
   let _ = dwc2_port_power_on();
 
   let connected: i64 = dwc2_port_connected();
@@ -35058,6 +35185,47 @@ fn governor_desired_freq_mhz_v2(h0: i64, h1: i64, h2: i64, h3: i64) -> i64 {
 // gives a cheap way to skip the mailbox round-trip (and the log spam)
 // entirely when nothing changed.
 fn governor_step() -> i64 {
+  // BUG FOUND 2026-11-09 (real-HW kernelupload-stream stall
+  // investigation, root cause): while a `kernelupload stream` is
+  // active, task_f is the ONLY task genuinely doing anything (busy-
+  // polling, no sleep -- see task_f's own header comment) -- every
+  // other real task (HIGH/MEDIUM/LOW/GC) is typically idle/sleeping
+  // the whole time, so `scheduler_ready_count()` reads <=1 for the
+  // ENTIRE transfer. `governor_desired_freq_mhz`'s own ready_count<=1
+  // branch picks governor_freq_low() (250MHz) -- the single WORST
+  // frequency this governor can ever pick, landing EXACTLY during the
+  // one operation in this entire codebase most sensitive to real IRQ-
+  // servicing latency (the PL011's 16-byte hardware RX FIFO drains in
+  // ~1.4ms at 115200 baud; every real-time cost in the UART RX IRQ
+  // path -- the 32-iteration drain loop, the overrun-clear sequence --
+  // scales directly with clock speed). Confirmed live: a real-HW
+  // `diagnose` immediately after a string of stream stalls read "cpu
+  // freq: 250 MHz", and `rxdiag`'s own overrun_count (reset to 0 at
+  // the start of every stream -- see kernelupload_overrun_count_set's
+  // own call site) read nonzero after that string of failures --
+  // direct evidence of genuine PL011 hardware RX FIFO overflow, something
+  // an EARLIER check in this same investigation (a clean, non-
+  // throttled run) had found reading exactly 0. The governor's own
+  // ready-count heuristic has no concept of "a byte stream is actively
+  // in flight and latency now matters more than power" -- it just sees
+  // low apparent CPU demand and throttles down, exactly backwards for
+  // this one case. Pinned to governor_freq_high() (700MHz) for the
+  // stream's entire duration, skipping the normal history-based
+  // decision below entirely (not just overriding it once at the
+  // stream's start, which the very next tick's own reassessment would
+  // otherwise immediately undo) -- resumes normal ready-count-driven
+  // behavior the instant the stream ends (active flag clears), via
+  // this same check simply no longer taking this branch.
+  if kernelupload_stream_active_get() == (1 as u32) {
+    let last_mhz: i64 = governor_get_last_applied_mhz();
+    if last_mhz != governor_freq_high() {
+      let status: i64 = governor_apply_freq_mhz(governor_freq_high());
+      if status == 0 {
+        let _ = governor_set_last_applied_mhz(governor_freq_high());
+      }
+    }
+    return 0;
+  }
   let ready: i64 = scheduler_ready_count();
   // Step 2 live: push the real sample into the smoothing window and
   // decide from the smoothed score, not the raw instantaneous sample
@@ -41487,6 +41655,10 @@ fn shell_dispatch() -> i64 {
 
   if shell_word_matches(line_buf, 0, cmd_end, "rxdiag") == 1 {
     return shell_dispatch_rxdiag();
+  }
+
+  if shell_word_matches(line_buf, 0, cmd_end, "usbpowercycle") == 1 {
+    return shell_dispatch_usbpowercycle();
   }
 
   if shell_word_matches(line_buf, 0, cmd_end, "lrdump") == 1 {

@@ -306,6 +306,32 @@ void stage0_fault(unsigned int code) {
     for (;;) { }
 }
 
+/* BUG FOUND 2026-11-09 (real-HW board-hang incident) -- see this
+ * function's own call sites below for the full "why": stage0_sd_
+ * read_block has no retry of its own (a single transient CMD17 FAIL/
+ * FIFO-timeout/FSM-timeout/SDHSTS-error is an immediate, unretried
+ * -9), and every caller in this file used to treat that -9 as
+ * immediately fatal (or, for the slot-state reads, immediately fell
+ * back to the OTHER copy/a fresh blank state -- not wrong exactly, but
+ * needlessly pessimistic for a condition a bare reinit-and-retry
+ * clears most of the time on real hardware, per kernel_main.vani's own
+ * much more battle-tested sdhost_read_block). 3 attempts, re-running
+ * stage0_sd_init() (full card reinit, already proven safe to call
+ * repeatedly) between failures -- no backoff/speed-stepping, this
+ * loader has no clock-speed concept to step down unlike sdhost_init_
+ * at_speed. Returns the last attempt's own result code (0 or -9). */
+static int stage0_sd_read_block_retry(unsigned int block_num, void *buf) {
+    int rc = -9;
+    int attempt;
+    for (attempt = 0; attempt < 3 && rc != 0; attempt = attempt + 1) {
+        if (attempt > 0) {
+            stage0_sd_init();
+        }
+        rc = stage0_sd_read_block(block_num, buf);
+    }
+    return rc;
+}
+
 void stage0_main(void) {
     static unsigned char block_buf[BLOCK_SIZE];
     struct slot_state a_state, b_state, chosen;
@@ -334,9 +360,9 @@ void stage0_main(void) {
         stage0_fault(0xDEAD0001u);
     }
 
-    rc = stage0_sd_read_block(SLOT_STATE_BLOCK_A, block_buf);
+    rc = stage0_sd_read_block_retry(SLOT_STATE_BLOCK_A, block_buf);
     have_a = (rc == 0) && parse_slot_state(block_buf, &a_state);
-    rc = stage0_sd_read_block(SLOT_STATE_BLOCK_B, block_buf);
+    rc = stage0_sd_read_block_retry(SLOT_STATE_BLOCK_B, block_buf);
     have_b = (rc == 0) && parse_slot_state(block_buf, &b_state);
 
     have_chosen = 0;
@@ -497,7 +523,11 @@ void stage0_main(void) {
             stage0_arm_watchdog();
         }
 #endif
-        rc = stage0_sd_read_block(base_block + i, block_buf);
+        /* See stage0_sd_read_block_retry's own header comment for the
+         * full "why" -- this exact, unretried call was what a real
+         * board actually hit mid-session, halting with no recovery
+         * path short of a physical power cycle. */
+        rc = stage0_sd_read_block_retry(base_block + i, block_buf);
         if (rc != 0) {
             u_puts("stage0: read failed at block offset ");
             u_hex32(i);
