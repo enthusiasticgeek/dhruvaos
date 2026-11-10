@@ -2870,6 +2870,10 @@ extern "C" fn dhcp_state_set_lease_time(value: u32) -> u32;
 extern "C" fn dhcp_state_get_lease_start_tick() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dhcp_state_set_lease_start_tick(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dhcp_state_get_last_attempt_tick() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dhcp_state_set_last_attempt_tick(value: u32) -> u32;
 
 // Round 107 (boot/dhcp_server_state.S): DHCP SERVER persistent state
 // -- Pi 1 never had a server before this round; the accessor shape
@@ -23082,6 +23086,12 @@ fn dhcp_client_start(my_mac: mut ref i64, xid: u32) -> i64 {
   // for an address this client no longer holds.
   let _ = dhcp_state_set_lease_time(0 as u32);
   let _ = dhcp_state_set_lease_start_tick(0 as u32);
+  // BUG FOUND 2026-11-09 (real-HW DHCP investigation) -- see
+  // dhcp_client_check_discover_retry's own header for the full "why":
+  // stamp the retry clock at the same moment this DISCOVER actually
+  // goes out, so the retry check below has a real baseline instead of
+  // comparing against a stale/zero value from a previous cycle.
+  let _ = dhcp_state_set_last_attempt_tick(scheduler_get_tick_count());
 
   let payload: mut ref i64 = dhcp_payload_scratch_get();
   let payload_len: i64 = dhcp_build_discover(payload, 0, my_mac, xid);
@@ -23090,6 +23100,75 @@ fn dhcp_client_start(my_mac: mut ref i64, xid: u32) -> i64 {
   let no_ip: u32 = 0 as u32;
   let bcast_ip: u32 = 0xFFFFFFFF as u32;
   return udp_send(my_mac, bcast_mac, no_ip, bcast_ip, dhcp_client_port(), dhcp_server_port(), payload, payload_len);
+}
+
+// BUG FOUND 2026-11-09 (real-HW DHCP investigation): dhcp_client_start
+// (above) sends exactly ONE DISCOVER; dhcp_client_poll's own OFFER-
+// handling branch sends exactly ONE REQUEST -- neither has EVER had
+// any retransmission if nothing answers, a real gap against RFC 2131
+// s4.1 ("the client... SHOULD wait... retransmitting the DHCPDISCOVER
+// message"), invisible under this project's own self-test (which
+// manually injects a synthetic OFFER immediately, so SELECTING/
+// REQUESTING never sit unanswered for even one poll in that test).
+// Confirmed live on real hardware: the very first DISCOVER goes out
+// extremely early in boot (BOOT DIAG's own checkpoint ordering has it
+// well before USB/Ethernet even finishes enumerating), has no real
+// chance of ever being answered, and SELECTING then sat stuck at
+// ip=0.0.0.0 indefinitely -- confirmed via live `ifconfig`, unchanged
+// across multiple polls, with the real router sitting right there the
+// whole time and nothing in this client's own code ever asking it
+// again.
+//
+// Called alongside dhcp_client_check_lease (same task_e poll site,
+// same "periodic, not frame-driven" shape) -- that function's own
+// scope is deliberately just lease renewal/expiry (BOUND/RENEWING/
+// REBINDING); this one is deliberately just the initial-acquisition
+// retry (SELECTING/REQUESTING), kept separate rather than overloading
+// one function's name with two different RFC 2131 sections' worth of
+// timer logic.
+//
+// 8 ticks (~4s at this project's own 500ms/tick) matches RFC 2131
+// s4.1's own cited starting retransmission interval for DISCOVER. No
+// exponential backoff or give-up ceiling -- simpler than the RFC's
+// own full algorithm, deliberately: the real failure mode this closes
+// (sent before the link was ready) resolves itself within the first
+// one or two retries once the link comes up, and retrying forever
+// every ~4s costs nothing but an occasional harmless broadcast packet
+// if a server genuinely never answers.
+fn dhcp_client_check_discover_retry(my_mac: mut ref i64) -> i64 {
+  let client_state: u32 = dhcp_state_get_client_state();
+  if (client_state != dhcp_state_selecting()) && (client_state != dhcp_state_requesting()) {
+    return 0;
+  }
+  let retry_interval_ticks: u32 = 8 as u32; // ~4s, RFC 2131 s4.1
+  let now_tick: u32 = scheduler_get_tick_count();
+  let last_tick: u32 = dhcp_state_get_last_attempt_tick();
+  if wrapping_sub(now_tick, last_tick) < retry_interval_ticks {
+    return 0;
+  }
+  let _ = dhcp_state_set_last_attempt_tick(now_tick);
+  let xid: u32 = dhcp_state_get_xid();
+  let payload: mut ref i64 = dhcp_payload_scratch_get();
+  let bcast_mac: mut ref i64 = dhcp_bcast_mac_scratch_get();
+  let _ = dhcp_broadcast_mac(bcast_mac);
+  let no_ip: u32 = 0 as u32;
+  let bcast_ip: u32 = 0xFFFFFFFF as u32;
+  if client_state == dhcp_state_selecting() {
+    let payload_len: i64 = dhcp_build_discover(payload, 0, my_mac, xid);
+    let _ = udp_send(my_mac, bcast_mac, no_ip, bcast_ip, dhcp_client_port(), dhcp_server_port(), payload, payload_len);
+  } else {
+    // REQUESTING: re-send the same DHCPREQUEST for the same offered
+    // address -- offered_ip/server_ip are still exactly what the
+    // original OFFER carried (dhcp_client_poll's own OFFER branch set
+    // them once, on the SELECTING->REQUESTING transition, and nothing
+    // clears them again until either an ACK/NAK is actually processed
+    // or a fresh dhcp_client_start begins a whole new attempt).
+    let offered_ip: u32 = dhcp_state_get_offered_ip();
+    let server_ip: u32 = dhcp_state_get_server_ip();
+    let payload_len: i64 = dhcp_build_request(payload, 0, my_mac, xid, offered_ip, server_ip);
+    let _ = udp_send(my_mac, bcast_mac, no_ip, bcast_ip, dhcp_client_port(), dhcp_server_port(), payload, payload_len);
+  }
+  return 1;
 }
 
 // Dequeues and processes the next queued frame if it's a DHCP reply
@@ -23170,6 +23249,12 @@ fn dhcp_client_poll(my_mac: mut ref i64) -> i64 {
     let _ = dhcp_state_set_offered_ip(offered_ip);
     let _ = dhcp_state_set_server_ip(server_ip);
     let _ = dhcp_state_set_client_state(dhcp_state_requesting());
+    // See dhcp_client_check_discover_retry's own header -- stamp the
+    // retry clock at the moment THIS REQUEST goes out too, so a lost
+    // REQUEST gets the same real-timeout retry treatment a lost
+    // DISCOVER now does, not a stale baseline from the original
+    // DISCOVER several polls ago.
+    let _ = dhcp_state_set_last_attempt_tick(scheduler_get_tick_count());
 
     let payload: mut ref i64 = dhcp_payload_scratch_get();
     let xid: u32 = dhcp_state_get_xid();
@@ -35926,6 +36011,14 @@ fn task_e() -> i64 {
     }
     let _ = usb_hotplug_poll();
     let _ = dhcp_client_poll(dhcp_my_mac);
+    // See dhcp_client_check_discover_retry's own header for the full
+    // "why" -- this is the initial-acquisition retry half of DHCP's
+    // own periodic maintenance; the lease renewal/expiry half
+    // (dhcp_client_check_lease) already runs every poll too, from
+    // inside dhcp_client_poll itself (its own very first check) --
+    // kept as two separate functions for two separate RFC 2131
+    // concerns rather than one function doing both.
+    let _ = dhcp_client_check_discover_retry(dhcp_my_mac);
     let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     let gc_dhcp_t1: u32 = mmio_read_u32(TIMER_CLO);
     if gc_log == 1 {

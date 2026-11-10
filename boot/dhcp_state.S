@@ -64,6 +64,24 @@ dhcp_lease_start_tick:
                      * T1/T2/expiry are all measured as elapsed ticks
                      * from THIS point, per RFC 2131 s4.4, not reset at
                      * each RENEWING/REBINDING state change. */
+dhcp_last_attempt_tick:
+    .word 0        /* BUG FOUND 2026-11-09 (real-HW DHCP investigation):
+                     * dhcp_client_start sent exactly ONE DISCOVER, with
+                     * no retransmission of any kind if nothing ever
+                     * answers -- a real gap against RFC 2131 s4.1
+                     * ("the client... SHOULD wait... retransmitting the
+                     * DHCPDISCOVER message"), invisible under this
+                     * project's own self-test (which manually injects a
+                     * synthetic OFFER immediately, never exercising
+                     * "nobody answered yet" at all). On real hardware
+                     * the first DISCOVER goes out very early in boot,
+                     * typically before USB/Ethernet enumeration has
+                     * even finished -- it has no real chance of ever
+                     * being answered, and SELECTING then never recovers
+                     * on its own. scheduler_get_tick_count()'s value at
+                     * the moment the most recent DISCOVER or REQUEST was
+                     * (re)sent -- dhcp_client_check_lease's own matching
+                     * header has the retry logic this field feeds. */
 
 .section ".text"
 
@@ -167,6 +185,19 @@ dhcp_state_get_lease_start_tick:
 .global dhcp_state_set_lease_start_tick
 dhcp_state_set_lease_start_tick:
     ldr r1, =dhcp_lease_start_tick
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dhcp_state_get_last_attempt_tick
+dhcp_state_get_last_attempt_tick:
+    ldr r0, =dhcp_last_attempt_tick
+    ldr r0, [r0]
+    bx lr
+
+.global dhcp_state_set_last_attempt_tick
+dhcp_state_set_last_attempt_tick:
+    ldr r1, =dhcp_last_attempt_tick
     str r0, [r1]
     mov r0, #0
     bx lr
