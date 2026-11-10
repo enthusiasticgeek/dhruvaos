@@ -24986,53 +24986,28 @@ fn dwc2_port_power_on() -> i64 {
   return 0;
 }
 
-// 2026-11-09 (real-HW USB-wedge investigation, user: "try usb sw
-// reset to get usb to respond"): HPRT0.PRTPWR gates the root port's
-// own VBUS output -- the SAME physical 5V rail the external hub (and
-// therefore every downstream device on it, including both the WiFi
-// dongle and the separate BT dongle this investigation's own captures
-// show wedged) is bus-powered from. dwc2_core_soft_reset's own GRSTCTL
-// CSftRst bit resets the controller's internal logic ONLY -- it has
-// never, on inspection, touched HPRT0 (and per the DWC2/dwc_otg IP's
-// own documented reset domains, a core soft reset is explicitly NOT
-// supposed to disconnect an attached device, i.e. NOT supposed to
-// clear PRTPWR). This driver's own dwc2_port_power_on() (above) has
-// ONLY EVER done a read-modify-write that OR's PRTPWR in -- every
-// single call site in this whole file, across the entire session,
-// including dwc2_init() on every one of the many reboots this
-// investigation has done -- NEVER clears it first. Net effect: VBUS to
-// the external hub has plausibly never actually been interrupted even
-// ONCE since boot, through any of dwc2_core_soft_reset, a full ARM
-// reboot, or the per-hub-port power-cycle fix earlier this same
-// investigation (dwc2_hub_power_cycle_port, which can only ever
-// control the HUB's OWN downstream switches -- confirmed via its
-// GET_DESCRIPTOR(Hub) capture as LPSM=01 real individual per-port
-// switching, not a no-op -- but never the hub's OWN upstream supply,
-// which is exactly this root port). Every prior recovery attempt this
-// investigation tried was therefore, at best, a USB-protocol-level
-// (D+/D- signaling) reset, never a genuine power interruption to the
-// hub+devices as a whole. This is the first thing in this whole
-// driver that actually clears PRTPWR before setting it again.
-// ~1.02s off (3300000 iterations, see dwc2_hub_power_cycle_port's own
-// matching real-HW-derived duration for why 161000/~50ms is too brief
-// to guarantee a real brownout past typical onboard bulk-cap holdup)
-// -- called unconditionally from dwc2_init() every single boot
-// (cheap: dwc2_init already costs seconds of real HW settle time by
-// its own existing comments, and a background-task-deferred one-time
-// ~1s add is not a new real-time risk) so every future boot gets a
-// REAL power cycle of the whole downstream USB tree, not just a
-// signaling reset, closing this specific gap regardless of whether
-// it's confirmed to be the actual root cause of THIS wedge or not.
-fn dwc2_root_vbus_power_cycle() -> i64 {
-  let hprt0: i64 = dwc2_hprt0_addr();
-  let w1c_mask: u32 = dwc2_hprt0_w1c_group_mask();
-  let not_w1c_mask: u32 = w1c_mask ^ (0xFFFFFFFF as u32);
-  let not_pwr_bit: u32 = dwc2_hprt0_pwr_bit() ^ (0xFFFFFFFF as u32);
-  let v: u32 = mmio_read_u32(hprt0);
-  let _ = mmio_write_u32(hprt0, (v & not_w1c_mask) & not_pwr_bit);
-  let _ = delay(3300000);
-  return 0;
-}
+// 2026-11-09 (real-HW USB-wedge investigation): this file used to
+// have a dwc2_root_vbus_power_cycle() here, called unconditionally
+// from dwc2_init() every boot, added to test whether a real HPRT0.
+// PRTPWR clear-then-set (a genuine VBUS off-then-on, since every
+// existing call site in this driver only ever OR's PRTPWR in, never
+// clears it) could recover an already-wedged downstream device. Live-
+// tested both ways: it never recovered anything (three independent
+// power-cycle mechanisms tried this same investigation, this one
+// included), and it turned out to be a plausible source of a NEW
+// regression instead -- this project's own documented BCM2835 erratum
+// (see dwc2_reassert_core_config_post_port_reset's own header) is that
+// GUSBCFG/GAHBCFG spontaneously revert ~0.7s AFTER an HPRT0 PRTPWR/
+// PRTRST transition, which is the whole reason that one-time reassert
+// call exists post-reset. Adding an EXTRA, earlier PRTPWR transition
+// here meant its own delayed revert could land AFTER that one-time
+// reassert had already fired (the real device0 probe that would
+// actually notice runs even later, deferred to a background task) --
+// corrupting GUSBCFG again by the time a real control transfer was
+// attempted, while dwc2_init() itself still reported success. Removed
+// entirely rather than left as dead code once both halves (ineffective
+// at its own stated goal, plausibly harmful to the ordinary path) were
+// confirmed live.
 
 // AUDITED (round 17, 2026-08-28) -- this function's own read/write/
 // read/write/read/write sequence against HPRT0, and the read/write
@@ -25602,12 +25577,40 @@ fn dwc2_init() -> i64 {
   // ever drives, unlike U-Boot which loops over every GHWCFG2-
   // reported channel).
   let _ = dwc2_flush_chan0_to_known_state();
-  // 2026-11-09: see dwc2_root_vbus_power_cycle's own header comment --
-  // a real VBUS off-then-on, not just the plain OR-in-PRTPWR below,
-  // so a wedged downstream device (hub or anything behind it) gets an
-  // actual power interruption every boot, not just a protocol-level
-  // reset.
-  let _ = dwc2_root_vbus_power_cycle();
+  // BUG FOUND 2026-11-09 (real-HW regression, same day as this call's
+  // own addition): removed. This was added unconditionally into every
+  // single boot specifically to TEST whether a real VBUS off-then-on
+  // (not just the plain OR-in-PRTPWR dwc2_port_power_on() already
+  // does) could recover an already-wedged downstream device -- tested
+  // live via `usbpowercycle` and at boot, and confirmed NOT to help
+  // recover anything (three independent power-cycle mechanisms tried
+  // this same investigation, this one included, none worked). What
+  // was never checked is whether adding it here was actually SAFE for
+  // the ordinary, non-wedged boot path -- and there's a real,
+  // plausible mechanism for it not being: this project's own documented
+  // BCM2835 erratum (see dwc2_reassert_core_config_post_port_reset's
+  // own header) is that GUSBCFG/GAHBCFG spontaneously revert ~0.7s
+  // AFTER an HPRT0 PRTPWR/PRTRST transition -- that's the exact reason
+  // the one-time reassert call after dwc2_port_reset() below exists.
+  // This call added an EXTRA, EARLIER PRTPWR transition before that
+  // safeguard ever runs. If its own delayed revert lands AFTER the
+  // one-time reassert has already fired (very plausible: the real
+  // device0 probe that would actually notice a reverted GUSBCFG runs
+  // even later still, deferred to a background task) -- GUSBCFG would
+  // be corrupted again by the time a real control transfer is
+  // attempted, while dwc2_init() itself still reports success (its own
+  // connected/enabled checks happen before the delayed revert hits).
+  // Exactly matches a real-HW regression found live the same day this
+  // call was added: the on-board hub itself (not a removable device)
+  // stopped answering GET_DESCRIPTOR, surviving even a genuine physical
+  // power cycle with nothing else attached -- consistent with a
+  // software-corrupted register, not dead silicon, which should have
+  // been cleared by a real power-off if it were a device-side wedge.
+  // Already proven not to help; now also a plausible source of real
+  // harm. Removing rather than gating behind a flag -- this was never
+  // meant to be a permanent boot-path addition, only a one-time live
+  // test of a hypothesis that's now been tested and found both
+  // ineffective and possibly actively harmful.
   let _ = dwc2_port_power_on();
 
   let connected: i64 = dwc2_port_connected();
