@@ -36001,6 +36001,23 @@ fn task_e() -> i64 {
     if usb_probe0_pending_get() == (1 as u32) {
       let _ = uart_puts("USB: background device0 probe starting -- ping/sshtest/tcpecho and\n");
       let _ = uart_puts("  other USB-hardware commands may be delayed until it completes (see 'diagnose').\n");
+      // 2026-11-09 (same reasoning as kernelupload's own stream-start
+      // boost, see dhcp_client_check_discover_retry's neighboring fix
+      // for the unrelated DHCP half of this same investigation): this
+      // single call enumerates the root hub, every downstream port,
+      // AND (if a WiFi dongle is present) drives the RTL8188CU's own
+      // firmware download -- dozens of small, individually time-
+      // sensitive USB control transfers, no different in kind from
+      // kernelupload's own UART-IRQ-latency sensitivity. By the time
+      // task_e gets around to running this (its own first wake after
+      // boot, whatever that timing happens to be) the governor may
+      // already have throttled to 250MHz same as it does for an idle
+      // gap before any kernelupload stream. Boost once here, for the
+      // same reason and by the same mechanism -- resumes normal
+      // ready-count-driven behavior the instant idle next runs, same
+      // as every other governor_apply_freq_mhz call site.
+      let _ = governor_apply_freq_mhz(governor_freq_high());
+      let _ = governor_set_last_applied_mhz(governor_freq_high());
       let _ = maintenance_mode_engage();
       let probe_status: i64 = dwc2_probe_device0();
       let _ = maintenance_mode_disengage();
