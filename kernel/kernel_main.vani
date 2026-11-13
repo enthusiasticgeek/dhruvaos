@@ -27384,6 +27384,35 @@ fn usb_first_contact_retry_backoff(attempt: i64) -> i64 {
   return 644000;
 }
 
+// STRUCTURAL FIX (2026-11-12, "aufit carefully for any missing
+// pieces... check usb enumeration" -- recurring real-HW enumeration
+// failures): dwc2_enumerate_one_downstream_device's own three control-
+// transfer loops (GET_DESCRIPTOR@addr0, SET_ADDRESS, GET_DESCRIPTOR@
+// new-addr) each retried the SAME un-reset endpoint state up to
+// usb_first_contact_retry_count()(5) times, backing off between tries
+// but never re-resetting the port -- only the OUTER caller (dwc2_hub_
+// bring_up_and_enumerate_port) ever issues a fresh port reset, and
+// only after ALL THREE of these 5x-retry inner loops have already
+// exhausted themselves once. Compared directly against Linux's own
+// real hub_port_init (drivers/usb/core/hub.c, fetched fresh): its
+// GET_DESCRIPTOR_TRIES is only 1-2, deliberately small -- Linux's own
+// design philosophy here is "try once or twice, then get a FRESH port
+// reset" (hub_port_connect's own outer PORT_INIT_TRIES, which this
+// project's usb_first_contact_retry_count already matches at the
+// OUTER level), not "hammer the same potentially-wedged endpoint
+// repeatedly before ever resetting again." A device that doesn't
+// recover from a mere backoff-and-retry (this session's own live,
+// repeated real-HW evidence: identical failures across many
+// consecutive attempts, each exhausting all 5 inner tries) wastes
+// most of its total retry budget on the less effective approach,
+// delaying how soon it ever reaches the OUTER loop's own reset (and,
+// at its midpoint attempt, a real port power-cycle) that might
+// actually have recovered it. Scoped to ONLY these three inner, no-
+// reset loops -- the outer port-bring-up retry count is deliberately
+// left at 5, matching its own already-cited U-Boot/TinyUSB precedent
+// for how many times a FRESH reset is worth retrying.
+fn usb_first_contact_descriptor_retry_count() -> i64 { return 2; }
+
 fn dwc2_build_rtl_reg_read_setup(reg_addr: u32, want_len: u32) -> i64 {
   let dma: mut ref i64 = dwc2_dma_scratch_get();
   let _ = buf_write_byte(dma, 0 as u32, 0xC0 as u32);
@@ -27745,6 +27774,26 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
   let _ = uart_puts(" REG_SYS_FUNC=");
   let _ = uart_put_hex32(sys_func);
   let _ = uart_puts("\n");
+  // DIAGNOSTIC (2026-11-12, "wifi listen" heard zero frames on real
+  // hardware -- RX-path investigation): unlike LAN9512/BT, this chip's
+  // own captured bulk endpoint addresses have never once been printed
+  // anywhere, even though the generic descriptor-walk loop that fills
+  // them (kernel_main.vani's own `is_wifi` branch) has no visibility
+  // into whether it actually found a real bulk-IN endpoint among this
+  // device's 4 reported endpoints, or left usb_wifi_bulk_in_epaddr at
+  // its .bss zero default -- which dwc2_wifi_bulk_in's own `epnum =
+  // epaddr & 0x0F` would silently turn into endpoint 0 (the control
+  // endpoint), never a real data endpoint, exactly matching "RX always
+  // returns nothing" with no error anywhere to say why.
+  let _ = uart_puts("USB: RTL8188CU bulk_in_ep=");
+  let _ = uart_put_hex32(usb_wifi_get_bulk_in_epaddr());
+  let _ = uart_puts(" mps=");
+  let _ = uart_put_hex32(usb_wifi_get_bulk_in_mps());
+  let _ = uart_puts(" bulk_out_ep=");
+  let _ = uart_put_hex32(usb_wifi_get_bulk_out_epaddr());
+  let _ = uart_puts(" mps=");
+  let _ = uart_put_hex32(usb_wifi_get_bulk_out_mps());
+  let _ = uart_puts("\n");
 
   // TASK #164 FOLLOW-UP (2026-09-14): the actual MCU firmware-download
   // sequence round 58 explicitly left as this project's own documented
@@ -27781,14 +27830,54 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
   // run between power_on() and download_firmware(), never after).
   let _ = rtl8188cu_mac_queue_setup(devaddr, mps);
   let fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
-  let dl_status: i64 = rtl8188cu_download_firmware(devaddr, mps, fw_buf, fw_len);
-  if dl_status != 0 {
-    let _ = uart_puts("USB: RTL8188CU firmware download FAILED\n");
-    return 0 - 1;
+  // BUG FOUND 2026-11-10 (real-HW investigation, several boots in a
+  // row this session): rtl8188cu_start_firmware's own checksum-report
+  // and WINT_INIT_READY polls (1000 iterations each, no delay between
+  // reads -- matches Linux's rtl8xxxu_start_firmware exactly, verified
+  // byte-for-byte against drivers/net/wireless/realtek/rtl8xxxu/core.c
+  // fetched fresh; this is NOT a logic bug on either side) are a real,
+  // on-chip MCU-timing race: how long the embedded 8051 actually takes
+  // to finish verifying/booting the just-downloaded firmware blob is
+  // genuine hardware variance, not something either driver's own
+  // polling code controls. Linux tolerates this via udev/user-space
+  // retrying the whole modprobe when rtl8xxxu_start_firmware returns
+  // -EAGAIN (its own literal errno choice, "try again") -- there is no
+  // single-attempt guarantee anywhere in the reference driver either.
+  // This project's own established pattern for exactly this shape of
+  // problem (a rare, genuinely transient real-HW timing margin that a
+  // single retry resolves almost every time, documented identically
+  // for kernel_upload.py's own --retries and the DHCP DISCOVER/REQUEST
+  // retransmission fix) is a bounded retry, not a tighter poll bound --
+  // widening the iteration cap would only mask how marginal the real
+  // timing is without fixing anything, and this project's own policy
+  // is to fix root causes, not paper over them with a bigger number.
+  // Re-downloads the firmware fresh each attempt (not just a bare
+  // retry of start_firmware alone) since a failed start leaves the
+  // 8051's own internal state after a half-finished boot attempt
+  // genuinely unknown -- cheap insurance (the download itself has never
+  // once failed in this investigation) against compounding one
+  // uncertain state into the next attempt.
+  let fw_attempt: i64 = 0;
+  let fw_ok: i64 = 0;
+  while (fw_attempt < 3) && (fw_ok == 0) {
+    if fw_attempt > 0 {
+      let _ = uart_puts("USB: RTL8188CU firmware start retry (attempt ");
+      let _ = uart_put_i64(fw_attempt + 1);
+      let _ = uart_puts("/3)\n");
+    }
+    let dl_status: i64 = rtl8188cu_download_firmware(devaddr, mps, fw_buf, fw_len);
+    if dl_status != 0 {
+      let _ = uart_puts("USB: RTL8188CU firmware download FAILED\n");
+      return 0 - 1;
+    }
+    let start_status: i64 = rtl8188cu_start_firmware(devaddr, mps);
+    if start_status == 0 {
+      fw_ok = 1;
+    }
+    fw_attempt = fw_attempt + 1;
   }
-  let start_status: i64 = rtl8188cu_start_firmware(devaddr, mps);
-  if start_status != 0 {
-    let _ = uart_puts("USB: RTL8188CU firmware failed to start\n");
+  if fw_ok != 1 {
+    let _ = uart_puts("USB: RTL8188CU firmware failed to start (after 3 attempts)\n");
     return 0 - 1;
   }
   let _ = uart_puts("USB: RTL8188CU firmware loaded and started\n");
@@ -30174,8 +30263,8 @@ fn rtl8188cu_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len:
 
 struct RtlRxFrameResult { ok: i64, frame_len: i64 }
 
-// Top-level "receive one raw 802.11 frame" -- pulls one bulk IN
-// transfer, parses the 24-byte RX descriptor RTL8xxxu prepends, and
+// Top-level "receive one raw 802.11 frame" -- pulls bulk IN
+// transfers, parses the 24-byte RX descriptor RTL8xxxu prepends, and
 // copies just the real frame bytes (skipping the descriptor and any
 // PHY-stats/alignment padding rtl_rx_desc_parse's own frame_start_off
 // already accounts for) into `frame_out`. Rejects (ok=0) an FCS
@@ -30184,10 +30273,55 @@ struct RtlRxFrameResult { ok: i64, frame_len: i64 }
 // must have at least 512 - RTL_RXDESC_LEN bytes available (the largest
 // a single bulk IN transfer this driver ever issues could plausibly
 // contain).
+//
+// BUG FOUND 2026-11-10 (real-HW "wifi join never hears a Probe
+// Response" investigation, root-caused after cross-checking every
+// other piece of this driver against Linux's rtl8xxxu and finding
+// them all correct): this used to issue exactly ONE dwc2_wifi_bulk_in
+// call requesting only `mps` (64) bytes -- capping every RX "frame" at
+// one USB max-packet no matter how large the real 802.11 frame
+// actually was. The 24-byte RX descriptor plus drvinfo plus a real
+// Probe Response's own fixed fields/SSID/rates/RSN IEs routinely adds
+// up to well over 64 bytes, so every real frame was silently truncated
+// and then rejected by the `frame_start_off + pkt_len > got` bounds
+// check below -- a clean, silent "never heard anything" with no error
+// anywhere, exactly today's symptom, on the very first real RF/USB
+// round trip this driver ever attempted. netif_recv_frame (this file,
+// `fn netif_recv_frame`) already solves the identical problem for
+// Ethernet correctly: `dwc2_net_bulk_in` is also only ever asked for
+// one `mps` at a time, but that caller loops, reassembling chunks
+// until one shorter than `mps` arrives (the standard USB bulk
+// end-of-transfer signal), before treating the result as a complete
+// frame. This function never got that same loop -- mirrored here now.
 fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFrameResult {
   let raw: mut ref i64 = dhruva_alloc_bytes(512);
-  let want_len: i64 = if mps == (0 as u32) { 0 } else { mps as i64 };
-  let got: i64 = dwc2_wifi_bulk_in(devaddr, mps, raw, want_len);
+  let chunk_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  let total: i64 = 0;
+  let done: i64 = 0;
+  while done == 0 {
+    let got_chunk: i64 = dwc2_wifi_bulk_in(devaddr, mps, chunk_buf, if mps == (0 as u32) { 0 } else { mps as i64 });
+    if got_chunk < 0 {
+      if total == 0 {
+        return RtlRxFrameResult { ok: 0, frame_len: 0 };
+      }
+      done = 1;
+    } else {
+      if (total + got_chunk) > 512 {
+        return RtlRxFrameResult { ok: 0, frame_len: 0 };
+      }
+      let ci: i64 = 0;
+      while ci < got_chunk {
+        let b: u32 = buf_read_byte(chunk_buf, ci as u32);
+        let _ = buf_write_byte(raw, (total + ci) as u32, b);
+        ci = ci + 1;
+      }
+      total = total + got_chunk;
+      if (got_chunk as u32) < mps {
+        done = 1;
+      }
+    }
+  }
+  let got: i64 = total;
   if got < RTL_RXDESC_LEN {
     return RtlRxFrameResult { ok: 0, frame_len: 0 };
   }
@@ -30603,7 +30737,42 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   let _ = netif_get_mac(mac_buf);
   let _ = rtl8188cu_set_mac_addr(devaddr, mps, mac_buf);
   let _ = rtl8188cu_enable_rf(devaddr, mps);
-  let _ = uart_puts("USB: RTL8188CU MAC-layer bring-up complete (LLT/CR/RCR/MACID/RF-enable) -- caller must still call rtl8188cu_set_channel before expecting real traffic\n");
+  // BUG FOUND 2026-11-12 (real-HW investigation, "wifi listen" heard
+  // zero management frames across 300 polls on a clean, error-free
+  // boot -- firmware loaded, MAC bring-up reported complete, RCR/
+  // channel-select/RF-enable all independently verified byte-for-byte
+  // against Linux's rtl8xxxu_gen1_enable_rf/rtl8xxxu_set_rx_bssid_
+  // filter -- yet never a single received frame, not even a stray
+  // Beacon from a neighboring AP, which should arrive every ~100ms
+  // completely independent of our own TX or SSID matching if the
+  // receiver were actually decoding anything at all). Found by
+  // reading past where this project's own research stopped: Linux's
+  // real rtl8xxxu_init_device has an explicit, separate step -- "Enable
+  // CCK and OFDM block" -- setting FPGA_RF_MODE_CCK (BIT 24) and
+  // FPGA_RF_MODE_OFDM (BIT 25) in REG_FPGA0_RF_MODE (0x0800), fetched
+  // fresh from drivers/net/wireless/realtek/rtl8xxxu/{core.c,regs.h}.
+  // This is a COMPLETELY SEPARATE pair of bits from the two this
+  // register's other two callers already touch on this same address
+  // (rtl8188cu_set_channel's own bit0 20MHz-mode clear, rtl8188cu_
+  // enable_rf's own bit1 Japan-mode clear) -- never ported anywhere in
+  // this driver until now. Without it, the baseband's own CCK/OFDM
+  // demodulator blocks stay disabled at the hardware level: RF can be
+  // perfectly powered on and tuned to the exact right channel, the USB
+  // bulk IN transaction can complete cleanly every time, and the chip
+  // will still never successfully decode a single over-the-air frame,
+  // management or data, on any channel -- exactly matching today's
+  // symptom. Placed here (immediately after enable_rf, the natural
+  // "radio is now live" point in this driver's own call order) rather
+  // than copying init_device's own much later placement (after EDCA/
+  // beacon-parameter setup this driver doesn't implement at all) --
+  // nothing between enable_rf and this write in the real driver's own
+  // sequence touches this same register or any register this one's
+  // read-modify-write could race with.
+  let fpga_rf_mode: u32 = rtl_reg_read32(devaddr, mps, 0x0800 as u32);
+  let fpga_rf_mode_cck: u32 = (1 << 24) as u32;
+  let fpga_rf_mode_ofdm: u32 = (1 << 25) as u32;
+  let _ = rtl_reg_write32(devaddr, mps, 0x0800 as u32, fpga_rf_mode | fpga_rf_mode_cck | fpga_rf_mode_ofdm);
+  let _ = uart_puts("USB: RTL8188CU MAC-layer bring-up complete (LLT/CR/RCR/MACID/RF-enable/CCK+OFDM-enable) -- caller must still call rtl8188cu_set_channel before expecting real traffic\n");
   return 0;
 }
 
@@ -34151,7 +34320,7 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   let ddesc8: mut ref i64 = dhruva_alloc_bytes(8);
   let attempt0: i64 = 0;
   let dstatus0: i64 = 0 - 1;
-  while (attempt0 < usb_first_contact_retry_count()) && (dstatus0 != 0) {
+  while (attempt0 < usb_first_contact_descriptor_retry_count()) && (dstatus0 != 0) {
     if attempt0 > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt0));
     }
@@ -34167,7 +34336,7 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
 
   let attempt1: i64 = 0;
   let daddr_status: i64 = 0 - 1;
-  while (attempt1 < usb_first_contact_retry_count()) && (daddr_status != 0) {
+  while (attempt1 < usb_first_contact_descriptor_retry_count()) && (daddr_status != 0) {
     if attempt1 > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt1));
     }
@@ -34184,7 +34353,7 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   let ddesc18: mut ref i64 = dhruva_alloc_bytes(18);
   let attempt2: i64 = 0;
   let dstatus1: i64 = 0 - 1;
-  while (attempt2 < usb_first_contact_retry_count()) && (dstatus1 != 0) {
+  while (attempt2 < usb_first_contact_descriptor_retry_count()) && (dstatus1 != 0) {
     if attempt2 > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt2));
     }
@@ -38567,29 +38736,51 @@ const KERNELUPLOAD_RX_RING_MASK: i64 = 4095;
 // 13-year-old card) that motivated this over the old fixed-delay host
 // pacing it replaces.
 //
-// 2026-11-08 (real-HW throughput investigation, user request "needs
-// solution for faster transfer -- bulk write or burst transfer"):
-// grown 512 -> 2048 (4 SD blocks/ACK window instead of 1), same
-// "fewer unlock() points = fewer scheduling-escape windows" lesson
-// the 32->512 growth already applied (see kernelupload_stream_batch_
-// buf's own header, boot/kernelupload_state.S) -- this round's own
-// live measurement found ~0.5-1.5s of dhruva_prio_lock(2) contention
-// per 512-byte window despite kernelupload_accumulate_bytes's own
-// entry-to-accum cost being ~10ms (the maintenance_mode continuous-
-// restamp fix from 2026-11-07 did NOT fully eliminate this on a
-// retest -- recorded as a new, still-open data point, not re-solved
-// here). kernelupload_accumulate_bytes already loops over however
-// many bytes it's given, writing one SD block per 512 -- no change
-// needed there, just how much task_f hands it per lock/unlock pair.
-// Deliberately NOT raised to 4096 (kernelupload_rx_ring_buf's own
-// full capacity): that ring's own header comment already sizes its
-// margin as "generous" against task_f scheduling delay at today's
-// 512-byte window; spending the WHOLE ring on one window would zero
-// out that margin right when scheduling delay is the active problem
-// being worked around. 2048 leaves half the ring (≈177ms of
-// continuous full-rate 115200-baud arrival) as headroom while still
-// cutting the number of lock-acquisition/ACK round trips 4x.
-const KERNELUPLOAD_ACK_INTERVAL_BYTES: u32 = 2048;
+// REVERTED 2026-11-10 (real-HW investigation, recurring kernelupload
+// stream overruns: "RXDIAG: overrun_count" genuinely incrementing,
+// not the rare physical-adapter-drop class an earlier investigation
+// characterized -- that one specifically measured overrun_count==0
+// throughout; this one doesn't). Root-caused to exactly the race the
+// 2026-11-08 growth below (512->2048) introduced and never checked
+// for: kernelupload_rx_ring_pop_batch is NON-BLOCKING (returns
+// whatever's in the ring right now, up to max_count, not "wait for
+// the full amount") -- see its own header. task_f's streaming loop
+// busy-polls it in a tight loop and hands WHATEVER it gets straight
+// to kernelupload_accumulate_bytes, which fires an IRQ+FIQ-masked
+// sdhost_write_block (measured up to ~140ms on this hardware, see
+// kernelupload_sd_write_worst_us's own header) the instant its own
+// running total crosses ANY 512-byte boundary -- it does not wait for
+// a full ACK-interval's worth of bytes first. With the interval at
+// 2048 (4 blocks), the host's own send_raw_ack_paced sends all 2048
+// bytes of one window in a single continuous burst with NO pause
+// until the window's own trailing ACK -- so on an early poll, before
+// the LATER 3 blocks of that same window have even finished arriving
+// over the wire, task_f can already be deep inside block 1's masked
+// write. Any UART bytes arriving during that mask (for blocks 2-4 of
+// the SAME in-flight window) overflow the PL011's 16-byte hardware
+// FIFO (which drains in ~1.4ms at 115200 baud, nowhere close to a
+// ~140ms mask) and are silently lost -- not a rare edge case, close
+// to guaranteed whenever any one block's write is slow relative to
+// how fast the REST of that window arrives, which this card's own
+// measured timings make common, not rare. The send_raw_ack_paced
+// docstring's own "zero bytes ever in flight while a masked write is
+// in progress... unaffected either way [by the interval's value]"
+// claim was simply wrong for any interval > 512: it reasoned about
+// the gap BETWEEN windows (correctly protected, host blocks for the
+// ACK) and never accounted for task_f's own incremental, early-write-
+// as-soon-as-one-block-is-ready behavior WITHIN a window. The ONLY
+// value of this constant that is actually safe is one SD block (512):
+// with exactly one write per ACK interval, the single write that
+// CAN happen has, by construction, already consumed every byte of
+// its own interval -- there is no "rest of the window" still arriving
+// over the wire for it to race against. This closes that gap, trading
+// back the 2026-11-08 throughput win (fewer round trips) for
+// correctness -- the lock-contention problem that growth was chasing
+// (~0.5-1.5s of dhruva_prio_lock(2) contention per window, see this
+// constant's own prior header, preserved in git history) is real but
+// separate, and needs its own fix that doesn't reopen this race --
+// not yet attempted.
+const KERNELUPLOAD_ACK_INTERVAL_BYTES: u32 = 512;
 
 // TASK #355 round 2: push ONE byte -- called ONLY from irq_dispatch
 // (the ring's sole producer, always interrupt context). O(1), no
@@ -40964,7 +41155,7 @@ fn shell_dispatch() -> i64 {
   // real AP as of this commit.
   if shell_word_matches(line_buf, 0, cmd_end, "wifi") == 1 {
     if cmd_end >= line_len {
-      let _ = uart_puts("usage: wifi join\n");
+      let _ = uart_puts("usage: wifi join | wifi listen <channel>\n");
       return 0;
     }
     let sub_start: i64 = cmd_end + 1;
@@ -40973,7 +41164,26 @@ fn shell_dispatch() -> i64 {
       let _ = wifi_real_join();
       return 0;
     }
-    let _ = uart_puts("usage: wifi join\n");
+    // Passive RX-only diagnostic (2026-11-10) -- see wifi_passive_
+    // listen's own header comment. Never transmits; isolates whether
+    // the receive path hears anything at all on a given channel,
+    // independent of the configured SSID or the TX path.
+    if shell_word_matches(line_buf, sub_start, sub_end, "listen") == 1 {
+      if sub_end >= line_len {
+        let _ = uart_puts("usage: wifi listen <channel 1-14>\n");
+        return 0;
+      }
+      let ch_start: i64 = sub_end + 1;
+      let ch_end: i64 = shell_find_space(line_buf, ch_start, line_len);
+      let channel: i64 = shell_parse_decimal(line_buf, ch_start, ch_end);
+      if (channel < 1) || (channel > 14) {
+        let _ = uart_puts("usage: wifi listen <channel 1-14>\n");
+        return 0;
+      }
+      let _ = wifi_passive_listen(channel as u32, 300);
+      return 0;
+    }
+    let _ = uart_puts("usage: wifi join | wifi listen <channel>\n");
     return 0;
   }
 
@@ -43639,13 +43849,16 @@ fn task_f() -> i64 {
       // state.S for the real-HW find this closes) -- grown to 512
       // (one SD block) so one pass through this loop can drain a
       // WHOLE ack-window's worth in one dhruva_prio_lock(2)/
-      // unlock(3) pair, not up to sixteen. 2026-11-08: grown again to
-      // match KERNELUPLOAD_ACK_INTERVAL_BYTES's own 512->2048 growth
-      // (that constant's own header comment has the full rationale)
-      // -- this cap and the ack interval must always match, since
-      // this is what decides how much of one ack-window actually
-      // lands in `batch` per call.
-      let popped: i64 = kernelupload_rx_ring_pop_batch(batch, 2048);
+      // unlock(3) pair, not up to sixteen. 2026-11-08's since-reverted
+      // 512->2048 growth (see KERNELUPLOAD_ACK_INTERVAL_BYTES's own
+      // header for the real-HW overrun race that growth introduced
+      // and this revert closes) briefly matched this cap to it; back
+      // to 512 now, matching that constant again -- this cap and the
+      // ack interval must always match, since this is what decides
+      // how much of one ack-window actually lands in `batch` per
+      // call, and pop_batch's own non-blocking nature is exactly what
+      // made anything larger than one SD block unsafe.
+      let popped: i64 = kernelupload_rx_ring_pop_batch(batch, 512);
       if popped == 0 {
         // TASK #355 follow-up (real-HW find, 2026-10-15): no new
         // bytes this iteration -- check whether the stream has gone
@@ -48470,6 +48683,112 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
     ci = ci + 1;
   }
   return 0;
+}
+
+// Passive RX-only diagnostic (2026-11-10, "dig deeper" real-HW
+// investigation): never transmits anything -- no probe request, no
+// channel-hop TX -- so a result here isolates the RECEIVE path from
+// the SSID-matching and TX-path questions entirely. Deliberately
+// reports EVERY management frame it hears (any SSID, any BSSID, any
+// subtype: beacon/probe-response/probe-request/other), not just ones
+// matching the configured network -- a real AP's own beacons alone
+// should arrive roughly every 100ms, far more often than a solicited
+// probe response, so even a short listen should catch several if the
+// RX chain is actually receiving anything at all on this channel.
+// Reuses probe_response_parse's own fixed-field/IE walk to pull the
+// SSID back out even though most of what arrives here won't literally
+// be a Probe Response -- structurally valid for any management frame
+// whose first 12 bytes past the MAC header are Timestamp/Beacon-
+// Interval/Capability-Info (beacons share that exact layout), which is
+// the whole reason wifi_scan_for_ssid's own matching logic never
+// needed a frame-type check to begin with.
+fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
+  if wifi_radio_init_rtl8188cu() == 0 {
+    let _ = uart_puts("wifi listen: no USB WiFi device enumerated\n");
+    return 0 - 1;
+  }
+  let devaddr: u32 = wifi_radio_get_devaddr();
+  let mps_in: u32 = wifi_radio_get_mps_in();
+  let mps_out: u32 = wifi_radio_get_mps_out();
+  let _ = wifi_radio_set_channel(devaddr, mps_out, channel);
+
+  let _ = uart_puts("wifi listen: passive, RX-only, channel=");
+  let _ = uart_put_i64(channel as i64);
+  let _ = uart_puts(", no transmit -- listening for ");
+  let _ = uart_put_i64(poll_cap);
+  let _ = uart_puts(" polls...\n");
+
+  let rx_heap: mut ref i64 = dhruva_alloc_bytes(512);
+  let rx_fixed: [u8; 256] = [0 as u8; 256];
+  let ssid_echo: [u8; 32] = [0 as u8; 32];
+  let heard_count: i64 = 0;
+  // DIAGNOSTIC (2026-11-12): raw USB-transaction-level visibility,
+  // bypassing rtl8188cu_rx_frame's own FCS/report/bounds checks
+  // entirely -- distinguishes "the bulk IN transaction itself never
+  // succeeds" (dwc2_wifi_bulk_in returning negative on every single
+  // poll, a USB-protocol-level problem, same fragility class already
+  // found elsewhere in this driver today) from "transactions complete
+  // fine, genuinely nothing to report" (raw_ok_count>0 but heard_count
+  // stays 0 -- real NAKs, not a transport failure, pointing instead at
+  // RF/air-interface).
+  let raw_scratch: mut ref i64 = dhruva_alloc_bytes(64);
+  let raw_ok_count: i64 = 0;
+  let raw_max_len: i64 = 0 - 1;
+  let poll: i64 = 0;
+  while poll < poll_cap {
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
+    let raw_status: i64 = dwc2_wifi_bulk_in(devaddr, mps_in, raw_scratch, mps_in as i64);
+    if raw_status >= 0 {
+      raw_ok_count = raw_ok_count + 1;
+      if raw_status > raw_max_len { raw_max_len = raw_status; }
+    }
+    let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
+    if rx_len >= 0 {
+      let _ = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
+      let dummy_a1: [u8; 6] = [0 as u8; 6];
+      let dummy_a2: [u8; 6] = [0 as u8; 6];
+      let dummy_a3: [u8; 6] = [0 as u8; 6];
+      let hdr: Mac80211Hdr = mac_header_parse(ref rx_fixed, mut ref dummy_a1, mut ref dummy_a2, mut ref dummy_a3);
+      let stype: i64 = hdr.frame_control & (0xFC as i64);
+      let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, rx_len, mut ref ssid_echo);
+      heard_count = heard_count + 1;
+      let _ = uart_puts("wifi listen: heard frame #");
+      let _ = uart_put_i64(heard_count);
+      let _ = uart_puts(" len=");
+      let _ = uart_put_i64(rx_len);
+      let _ = uart_puts(" stype=0x");
+      let _ = uart_put_hex32(stype as u32);
+      if stype == FC_STYPE_BEACON { let _ = uart_puts(" (beacon)"); }
+      if stype == FC_STYPE_PROBE_RESP { let _ = uart_puts(" (probe-response)"); }
+      if stype == FC_STYPE_PROBE_REQ { let _ = uart_puts(" (probe-request)"); }
+      if info.ok == 1 {
+        let _ = uart_puts(" ssid=\"");
+        let si: i64 = 0;
+        while si < info.ssid_len {
+          let _ = uart_putc(ssid_echo[si] as i64);
+          si = si + 1;
+        }
+        let _ = uart_puts("\"");
+      }
+      let _ = uart_puts("\n");
+    }
+    poll = poll + 1;
+  }
+  let _ = uart_puts("wifi listen: done, heard ");
+  let _ = uart_put_i64(heard_count);
+  let _ = uart_puts(" management frame(s) total on channel ");
+  let _ = uart_put_i64(channel as i64);
+  let _ = uart_puts("\n");
+  let _ = uart_puts("wifi listen: raw bulk-IN diagnostic -- ");
+  let _ = uart_put_i64(raw_ok_count);
+  let _ = uart_puts("/");
+  let _ = uart_put_i64(poll_cap);
+  let _ = uart_puts(" polls completed the USB transaction successfully (raw_max_len=");
+  let _ = uart_put_i64(raw_max_len);
+  let _ = uart_puts(")\n");
+  return heard_count;
 }
 
 fn wifi_real_join() -> i64 {

@@ -62,14 +62,20 @@ BAUD_MAP = {
 # driven flow-control window below, not just a progress heartbeat --
 # see send_raw_ack_paced's own docstring for why that granularity
 # matters, not merely how often it previously fired.
-# 2026-11-08 (real-HW throughput investigation): grown 512 -> 2048 --
-# a live transfer measured ~0.5-1.5s of unrelated scheduler lock
-# contention PER 512-byte window (see KERNELUPLOAD_ACK_INTERVAL_BYTES's
-# own kernel-side header for the full rationale); batching 4 SD blocks
-# per ACK round trip cuts the number of times that contention can be
-# hit roughly 4x, without touching the ACK-driven flow-control
-# guarantee itself (still zero bytes in flight during any SD write).
-ACK_INTERVAL_BYTES = 2048
+# REVERTED 2026-11-10: the 2026-11-08 512->2048 growth (batching 4 SD
+# blocks per ACK round trip, for throughput) broke the "zero bytes in
+# flight during any SD write" guarantee this constant exists to
+# provide -- see KERNELUPLOAD_ACK_INTERVAL_BYTES's own kernel-side
+# header for the full real-HW root cause (kernelupload_rx_ring_pop_
+# batch is non-blocking, so task_f can start a masked SD write for an
+# early block in a window while later blocks of that SAME window are
+# still arriving over the wire; only interval==512==one block closes
+# that race). Confirmed live: real, reproducible rxdiag overrun_count
+# increments during 2048-byte-window transfers, not a rare adapter
+# flake. The lock-contention problem this growth was chasing is real
+# but separate and still open -- needs its own fix that doesn't
+# reopen this race.
+ACK_INTERVAL_BYTES = 512
 
 ACK_LINE_RE = re.compile(rb"ACK ([0-9A-Fa-f]{8}) ")
 
