@@ -31337,7 +31337,7 @@ fn rtl8188cu_set_mac_addr(devaddr: u32, mps: u32, mac: mut ref i64) -> i64 {
 // back may itself be what pushed channel 0 into the new flat-silent state.
 // Now returns a fail count instead of a constant 0 so the caller can log
 // real pass/fail evidence instead of assuming success.
-fn rtl8188cu_load_bb_table(devaddr: u32, mps: u32) -> i64 {
+fn rtl8188cu_load_bb_table_part1(devaddr: u32, mps: u32) -> i64 {
   let fail_count: i64 = 0;
   if rtl_reg_write32(devaddr, mps, 0x800 as u32, 0x80040000 as u32) != 0 { fail_count = fail_count + 1; }
   if rtl_reg_write32(devaddr, mps, 0x804 as u32, 0x00000003 as u32) != 0 { fail_count = fail_count + 1; }
@@ -31400,6 +31400,21 @@ fn rtl8188cu_load_bb_table(devaddr: u32, mps: u32) -> i64 {
   if rtl_reg_write32(devaddr, mps, 0xa78 as u32, 0x00000900 as u32) != 0 { fail_count = fail_count + 1; }
   if rtl_reg_write32(devaddr, mps, 0xc00 as u32, 0x48071d40 as u32) != 0 { fail_count = fail_count + 1; }
   if rtl_reg_write32(devaddr, mps, 0xc04 as u32, 0x03a05611 as u32) != 0 { fail_count = fail_count + 1; }
+  return fail_count;
+}
+
+// Second half of the BB table, split from the function above purely to
+// let the CALLER take an immediate readback of 0xc04 between the two
+// halves without this function itself calling rtl_reg_read32 -- doing
+// the read from inside the loader pushed a real chain (rtl_reg_read32 ->
+// dwc2_control_in -> kernlog_write_usb_regs -> ... -> chacha20_poly1305_
+// decrypt_heap's own poly1305 inner loop) past task_e's stack-depth
+// budget (vanic caught this immediately, 7216 vs 7168 bytes) -- the
+// EXISTING readback the caller already does right after the full table
+// load does NOT hit this, since task_e's call graph already accounts
+// for that one call site.
+fn rtl8188cu_load_bb_table_part2(devaddr: u32, mps: u32) -> i64 {
+  let fail_count: i64 = 0;
   if rtl_reg_write32(devaddr, mps, 0xc08 as u32, 0x000000e4 as u32) != 0 { fail_count = fail_count + 1; }
   if rtl_reg_write32(devaddr, mps, 0xc0c as u32, 0x6c6c6c6c as u32) != 0 { fail_count = fail_count + 1; }
   if rtl_reg_write32(devaddr, mps, 0xc10 as u32, 0x08800000 as u32) != 0 { fail_count = fail_count + 1; }
@@ -32102,18 +32117,22 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   // init immediately above) and well BEFORE RCR/enable_rf/aggregation --
   // placed here to match that exact ordering, see rtl8188cu_load_bb_table's
   // own header comment for the full finding.
-  let bb_fail: i64 = rtl8188cu_load_bb_table(devaddr, mps);
-  let bb_readback: u32 = rtl_reg_read32(devaddr, mps, 0x0c04 as u32);
+  let bb_fail1: i64 = rtl8188cu_load_bb_table_part1(devaddr, mps);
+  let bb_readback_immediate: u32 = rtl_reg_read32(devaddr, mps, 0x0c04 as u32);
+  let bb_fail2: i64 = rtl8188cu_load_bb_table_part2(devaddr, mps);
+  let bb_readback_later: u32 = rtl_reg_read32(devaddr, mps, 0x0c04 as u32);
   let agc_fail: i64 = rtl8188cu_load_agc_table(devaddr, mps);
   let rf_fail: i64 = rtl8188cu_load_rf_table(devaddr, mps);
   let _ = uart_puts("USB: RTL8188CU BB/AGC/RF phy tables loaded, bb_fail=");
-  let _ = uart_put_i64(bb_fail);
+  let _ = uart_put_i64(bb_fail1 + bb_fail2);
   let _ = uart_puts(" agc_fail=");
   let _ = uart_put_i64(agc_fail);
   let _ = uart_puts(" rf_fail=");
   let _ = uart_put_i64(rf_fail);
-  let _ = uart_puts(" bb_readback(0x0c04, expect ~0x03a05611)=0x");
-  let _ = uart_put_hex32(bb_readback);
+  let _ = uart_puts(" bb_readback_immediate(0x0c04, expect 0x03a05611)=0x");
+  let _ = uart_put_hex32(bb_readback_immediate);
+  let _ = uart_puts(" bb_readback_later=0x");
+  let _ = uart_put_hex32(bb_readback_later);
   let _ = uart_puts("\n");
   let _ = rtl8188cu_enable_engines(devaddr, mps);
   let _ = rtl8188cu_set_rcr(devaddr, mps);
