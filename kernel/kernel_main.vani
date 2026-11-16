@@ -51091,8 +51091,20 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
       }
       let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
       if rx_len >= 0 {
-        let _ = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
-        let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, rx_len, mut ref ssid_echo);
+        // BUG FOUND 2026-11-16 (live panic, "index out of bounds: 295,
+        // len 256", first real frame >256 bytes ever received this
+        // whole investigation -- RX was 0/300 right up until this same
+        // session's baseband-reset fix): wifi_heap_to_fixed256 copies
+        // at most 256 bytes into rx_fixed and returns that TRUNCATED
+        // length, but every call site discarded the return value and
+        // kept using the ORIGINAL untruncated rx_len for every
+        // subsequent parse -- telling probe_response_parse/ie_find the
+        // frame was still e.g. 295 bytes long when only the first 256
+        // actually exist in rx_fixed, so IE-walk logic indexed straight
+        // past the buffer's real end. Use the truncated length from here
+        // on, matching what's actually IN rx_fixed.
+        let fixed_len: i64 = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
+        let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, fixed_len, mut ref ssid_echo);
         if info.ok == 1 {
           let matches: i64 = if info.ssid_len == ssid_len { 1 } else { 0 };
           let si: i64 = 0;
@@ -51335,13 +51347,16 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
     }
     let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
     if rx_len >= 0 {
-      let _ = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
+      // See wifi_scan_for_ssid's own identical 2026-11-16 fix comment:
+      // use the TRUNCATED length wifi_heap_to_fixed256 returns, not the
+      // original rx_len -- rx_fixed only ever has 256 real bytes in it.
+      let fixed_len: i64 = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
       let dummy_a1: [u8; 6] = [0 as u8; 6];
       let dummy_a2: [u8; 6] = [0 as u8; 6];
       let dummy_a3: [u8; 6] = [0 as u8; 6];
       let hdr: Mac80211Hdr = mac_header_parse(ref rx_fixed, mut ref dummy_a1, mut ref dummy_a2, mut ref dummy_a3);
       let stype: i64 = hdr.frame_control & (0xFC as i64);
-      let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, rx_len, mut ref ssid_echo);
+      let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, fixed_len, mut ref ssid_echo);
       heard_count = heard_count + 1;
       let _ = uart_puts("wifi listen: heard frame #");
       let _ = uart_put_i64(heard_count);
@@ -51472,8 +51487,13 @@ fn wifi_real_join() -> i64 {
     let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
     if rx_len >= 0 {
       rx_seen_count = rx_seen_count + 1;
-      let _ = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
-      let r: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref rx_fixed, rx_len, mut ref mgmt_out);
+      // See wifi_scan_for_ssid's own identical 2026-11-16 fix comment:
+      // use the TRUNCATED length, not the original rx_len -- this is
+      // the exact call site the live panic ("index out of bounds: 295,
+      // len 256") happened in, on the very first real Beacon/Probe-Resp
+      // over 256 bytes this driver ever actually received.
+      let fixed_len: i64 = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
+      let r: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref rx_fixed, fixed_len, mut ref mgmt_out);
       if r.failed == 1 {
         let _ = uart_puts("wifi join: authentication/association refused by the AP\n");
         return 0 - 1;
@@ -51552,8 +51572,10 @@ fn wifi_real_join() -> i64 {
     }
     let rx2_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
     if rx2_len >= 0 {
-      let _ = wifi_heap_to_fixed256(rx_heap, rx2_len, mut ref rx_fixed);
-      let dinfo: DataFrameEapolResult = data_frame_parse_eapol(ref rx_fixed, rx2_len, mut ref eapol_payload);
+      // See wifi_scan_for_ssid's own identical 2026-11-16 fix comment:
+      // use the TRUNCATED length, not the original rx2_len.
+      let fixed2_len: i64 = wifi_heap_to_fixed256(rx_heap, rx2_len, mut ref rx_fixed);
+      let dinfo: DataFrameEapolResult = data_frame_parse_eapol(ref rx_fixed, fixed2_len, mut ref eapol_payload);
       if dinfo.ok == 1 {
         let ei: i64 = 0;
         while ei < dinfo.payload_len {
