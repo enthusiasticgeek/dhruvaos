@@ -2687,6 +2687,8 @@ extern "C" fn wifi_radio_set_present(present: u32) -> i64;
 extern "C" fn wifi_radio_set_tx_fn(tx_fn: fn(u32, u32, mut ref i64, i64, i64, i64) -> i64) -> i64;
 extern "C" fn wifi_radio_set_rx_fn(rx_fn: fn(u32, u32, mut ref i64) -> i64) -> i64;
 extern "C" fn wifi_radio_set_channel_fn(channel_fn: fn(u32, u32, u32) -> i64) -> i64;
+extern "C" fn wifi_radio_set_report_connect_fn(report_connect_fn: fn(u32, u32, mut ref i64) -> i64) -> i64;
+extern "C" fn wifi_radio_report_connect(devaddr: u32, mps: u32, bssid: mut ref i64) -> i64;
 extern "C" fn wifi_radio_get_devaddr() -> u32;
 extern "C" fn wifi_radio_get_mps_in() -> u32;
 extern "C" fn wifi_radio_get_mps_out() -> u32;
@@ -28180,25 +28182,50 @@ fn rtl8188cu_mac_queue_setup(devaddr: u32, mps: u32) -> i64 {
   let reg_rqpn: u32 = 0x0200 as u32;
   let reg_trxff_bndy: u32 = 0x0114 as u32;
 
-  // rtl8xxxu_init_queue_reserved_page, ep_tx_count==1/ep_tx_high_queue
-  // case: hq=page_num_hi (0x0c for rtl8192cu_fops), lq=nq=eq=0 (no low/
-  // normal-priority endpoint exists on this hardware), pubq=total_
-  // page_num(0xf8) - hq - lq - nq - 1 = 0xf8 - 0x0c - 1 = 0xEB.
+  // BUG FOUND 2026-11-16 (real-HW queue-routing audit, after the RX
+  // baseband-reset fix): this used to unconditionally port Linux's
+  // ep_tx_count==1/ep_tx_high_queue-only case (no low/normal-priority
+  // endpoint). That's wrong for THIS actual dongle -- its own raw config
+  // descriptor (see usb_wifi_set_bulk_out_epaddr's own call site, this
+  // same file) shows TWO bulk-OUT endpoints, which is exactly Linux's
+  // rtl8xxxu_config_endpoints_no_sie nr_out_eps==2 case: ep_tx_high_queue
+  // AND ep_tx_normal_queue both set (ep_tx_low_queue stays 0), matching
+  // rtl8xxxu_init_queue_priority's "ep_tx_high_queue && ep_tx_normal_
+  // queue" branch (hi=TRXDMA_QUEUE_HIGH=3, lo=TRXDMA_QUEUE_NORMAL=2), not
+  // the ep_tx_count==1 branch ported here before.
+  //
+  // rtl8xxxu_init_queue_reserved_page for this case: hq=fops->page_num_hi
+  // (0x0c), nq=fops->page_num_norm (0x02), lq=eq=0 (page_num_lo for
+  // rtl8192cu_fops exists but ep_tx_low_queue is 0 for THIS endpoint
+  // count, so lq stays 0 exactly as Linux's own `if (priv->ep_tx_low_
+  // queue)` guard leaves it), pubq = total_page_num(0xf8) - hq - lq - nq
+  // - 1 = 0xf8 - 0x0c - 0x02 - 1 = 0xE9.
   let hq: u32 = 0x0C as u32;
-  let pubq: u32 = 0xEB as u32;
-  let _ = rtl_reg_write32(devaddr, mps, reg_rqpn_npq, 0 as u32);
+  let nq: u32 = 0x02 as u32;
+  let pubq: u32 = 0xE9 as u32;
+  let rqpn_npq_val: u32 = nq as u32; // (nq << RQPN_NPQ_SHIFT(0)) | (eq(0) << RQPN_EPQ_SHIFT)
+  let _ = rtl_reg_write32(devaddr, mps, reg_rqpn_npq, rqpn_npq_val);
   let rqpn_load_bit: u32 = 0x80000000 as u32;
-  let rqpn_val: u32 = rqpn_load_bit | hq | (pubq << (16 as u32));
+  let rqpn_val: u32 = rqpn_load_bit | hq | (pubq << (16 as u32)); // lq=0, RQPN_LO_PQ_SHIFT(8) term is 0
   let _ = rtl_reg_write32(devaddr, mps, reg_rqpn, rqpn_val);
 
-  // rtl8xxxu_init_queue_priority, ep_tx_count==1/ep_tx_high_queue case:
-  // every queue (voq/viq/beq/bkq/mgq/hiq) maps to TRXDMA_QUEUE_HIGH(3),
-  // shifted into REG_TRXDMA_CTRL's own 6 two-bit fields (bits 4-15);
-  // bits 0-2 (the beacon queue, per that function's own "none of the
-  // vendor drivers configure the beacon queue here" comment) are left
-  // exactly as the hardware already has them.
+  // rtl8xxxu_init_queue_priority, ep_tx_high_queue && ep_tx_normal_queue
+  // case: hiq=mgq=viq=voq=TRXDMA_QUEUE_HIGH(3) (unchanged from the
+  // single-endpoint case -- this driver only ever sends MGNT-tagged
+  // frames so far, which is why the single-out-endpoint bug never
+  // visibly broke RX/TX completion), but bkq=beq=TRXDMA_QUEUE_NORMAL(2),
+  // not HIGH(3) -- matters once any data-queue (BK/BE) traffic exists.
+  // Bits 0-2 (beacon queue, left as-is per that function's own "none of
+  // the vendor drivers configure the beacon queue here" comment) are
+  // untouched, same as before.
   let existing_dma_ctrl: u32 = rtl_reg_read16(devaddr, mps, reg_trxdma_ctrl);
-  let dma_ctrl_val: u32 = (existing_dma_ctrl & (0x7 as u32)) | (0xFFF0 as u32);
+  let voq: u32 = 3 as u32;
+  let viq: u32 = 3 as u32;
+  let beq: u32 = 2 as u32;
+  let bkq: u32 = 2 as u32;
+  let mgq: u32 = 3 as u32;
+  let hiq: u32 = 3 as u32;
+  let dma_ctrl_val: u32 = (existing_dma_ctrl & (0x7 as u32)) | (voq << (4 as u32)) | (viq << (6 as u32)) | (beq << (8 as u32)) | (bkq << (10 as u32)) | (mgq << (12 as u32)) | (hiq << (14 as u32));
   let _ = rtl_reg_write16(devaddr, mps, reg_trxdma_ctrl, dma_ctrl_val);
 
   // REG_TRXFF_BNDY+2 = fops->trxff_boundary (0x27ff for rtl8192cu_fops).
@@ -29888,6 +29915,26 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
   let cdc_mac_string_index: u32 = 0 as u32;
   let found_cdc_control: i64 = 0;
   let found_net_bulk_eps: i64 = 0;
+  // 2026-11-16 (real-HW `wifi join`/queue-routing audit, after the RX
+  // baseband-reset fix): this chip's own raw config descriptor has TWO
+  // bulk-OUT endpoints (0x02, 0x03), not one -- confirmed live
+  // ("RTL8188CU raw config descriptor" dump: ...07 05 02 02 40 00 00 07
+  // 05 03 02 40 00 00...). Verified against Linux's real
+  // rtl8xxxu_config_endpoints_no_sie's nr_out_eps==2 case plus
+  // rtl8xxxu_init_queue_priority's own case-2 branch
+  // (ep_tx_high_queue && ep_tx_normal_queue): out_ep[0] (the FIRST
+  // bulk-OUT endpoint found in descriptor order) is what the MGNT/HIGH/
+  // VI/VO/BEACON/CMD queues all map to; out_ep[1] (the second) is only
+  // for BK/BE background data. Every frame rtl_tx_desc_write builds is
+  // tagged RTL_TXDESC_QUEUE_MGNT (this driver sends no data frames yet)
+  // -- so out_ep[0], the FIRST bulk-OUT endpoint, is the only one this
+  // driver should ever use. Previously kept the LAST one seen instead
+  // (deliberate simplification for the single-endpoint case, wrong for
+  // this actual 2-endpoint dongle): every management frame (every probe
+  // request/auth/assoc this driver has ever sent) went out via EP 0x03,
+  // the real chip's own BK/BE-only endpoint, not EP 0x02 where its
+  // firmware/queue-priority config actually expects MGNT traffic.
+  let found_wifi_bulk_out: i64 = 0;
   // Round 57: USB Bluetooth HCI (interface class 0xE0, subclass 0x01,
   // protocol 0x01) -- an OFFICIAL, STANDARDIZED USB class, detected the
   // same way BOT's own 0x08/0x06/0x50 check already works, unlike
@@ -30090,7 +30137,12 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
               if (wifi_ep_addr & (0x80 as u32)) != (0 as u32) {
                 let _ = usb_wifi_set_bulk_in_epaddr(wifi_ep_addr);
                 let _ = usb_wifi_set_bulk_in_mps(wifi_ep_mps);
-              } else {
+              } else if found_wifi_bulk_out == 0 {
+                // FIRST bulk-OUT only (out_ep[0] -- see this block's own
+                // header comment above): a second bulk-OUT endpoint, if
+                // present, is out_ep[1] (BK/BE-only on this chip) and
+                // must not overwrite this one.
+                found_wifi_bulk_out = 1;
                 let _ = usb_wifi_set_bulk_out_epaddr(wifi_ep_addr);
                 let _ = usb_wifi_set_bulk_out_mps(wifi_ep_mps);
               }
@@ -50785,6 +50837,20 @@ fn rtl8188cu_rx_frame_adapter(devaddr: u32, mps: u32, frame_out: mut ref i64) ->
   return 0 - 1;
 }
 
+// BUG FOUND 2026-11-16 ("is bssid accounted?" audit): wifi_real_join
+// (STA-mode join) never told the chip it had associated at all -- see
+// wifi_radio_set_report_connect_fn's own header comment (boot/wifi_
+// radio_state.S) for the Linux cross-check. rtl8188cu_ap_set_bssid/
+// _h2c_join_bss_report already existed (ported for AP mode) and are
+// exactly rtl8xxxu_set_bssid/_gen1_report_connect -- this just wires
+// the SAME two calls into the vendor-agnostic report_connect hook so
+// the STA join path can reach them without wifi_real_join itself
+// knowing it's talking to an RTL8188CU.
+fn rtl8188cu_report_connect_adapter(devaddr: u32, mps: u32, bssid: mut ref i64) -> i64 {
+  let _ = rtl8188cu_ap_set_bssid(devaddr, mps, bssid);
+  return rtl8188cu_h2c_join_bss_report(devaddr, mps, 1 as u32);
+}
+
 // Detects a real RTL8188CU and registers it as the active radio.
 // Returns 1 if a device was found and registered, 0 otherwise (no
 // USB WiFi device enumerated -- the expected, ordinary state on any
@@ -50802,6 +50868,7 @@ fn wifi_radio_init_rtl8188cu() -> i64 {
   let _ = wifi_radio_set_tx_fn(rtl8188cu_tx_frame);
   let _ = wifi_radio_set_rx_fn(rtl8188cu_rx_frame_adapter);
   let _ = wifi_radio_set_channel_fn(rtl8188cu_set_channel);
+  let _ = wifi_radio_set_report_connect_fn(rtl8188cu_report_connect_adapter);
   let _ = wifi_radio_set_present(1 as u32);
   return 1;
 }
@@ -51393,6 +51460,21 @@ fn wifi_real_join() -> i64 {
   }
 
   if connected == 1 {
+    // BUG FOUND 2026-11-16 ("is bssid accounted?" audit): report the
+    // completed association to the chip/firmware -- REG_BSSID write +
+    // H2C_JOIN_BSS_REPORT/CONNECT, matching Linux's real rtl8xxxu_bss_
+    // info_changed(BSS_CHANGED_BSSID) + report_connect(..., true) on a
+    // successful STA association. Never done before this fix (see
+    // wifi_radio_set_report_connect_fn's own header comment) -- the
+    // handshake itself completes in software either way, but the
+    // hardware/firmware was never told the link was up.
+    let bssid_heap: mut ref i64 = dhruva_alloc_bytes(6);
+    let bi2: i64 = 0;
+    while bi2 < 6 {
+      let _ = buf_write_byte(bssid_heap, bi2 as u32, bssid[bi2] as u32);
+      bi2 = bi2 + 1;
+    }
+    let _ = wifi_radio_report_connect(devaddr, mps_out, bssid_heap);
     let _ = uart_puts("wifi join: CONNECTED (4-way handshake complete, TK/GTK installed)\n");
     return 0;
   }

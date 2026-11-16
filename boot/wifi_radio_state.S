@@ -57,6 +57,8 @@ wifi_radio_rx_fn_ptr:
     .word 0
 wifi_radio_channel_fn_ptr:
     .word 0
+wifi_radio_report_connect_fn_ptr:
+    .word 0
 
 .section ".text"
 
@@ -99,6 +101,21 @@ wifi_radio_set_rx_fn:
 .global wifi_radio_set_channel_fn
 wifi_radio_set_channel_fn:
     ldr r1, =wifi_radio_channel_fn_ptr
+    str r0, [r1]
+    bx lr
+
+/* 2026-11-16 ("is bssid accounted?" audit, after the RX baseband-reset
+ * fix): the join orchestrator never told the chip/firmware it had
+ * associated at all -- Linux's real rtl8xxxu_bss_info_changed writes
+ * REG_BSSID (BSS_CHANGED_BSSID) and sends H2C_JOIN_BSS_REPORT/CONNECT
+ * (report_connect) once a STA association completes, same as it does
+ * for AP mode; this driver already had both primitives (rtl8188cu_ap_
+ * set_bssid/_h2c_join_bss_report) but only ever called them from AP
+ * start, never from the STA join path. Same vendor-agnostic function-
+ * pointer shape as _set_channel_fn above. */
+.global wifi_radio_set_report_connect_fn
+wifi_radio_set_report_connect_fn:
+    ldr r1, =wifi_radio_report_connect_fn_ptr
     str r0, [r1]
     bx lr
 
@@ -155,5 +172,12 @@ wifi_radio_rx_frame:
 .global wifi_radio_set_channel
 wifi_radio_set_channel:
     ldr r12, =wifi_radio_channel_fn_ptr
+    ldr r12, [r12]
+    bx r12
+
+/* i64 wifi_radio_report_connect(devaddr: u32, mps: u32, bssid: mut ref i64) -> i64 */
+.global wifi_radio_report_connect
+wifi_radio_report_connect:
+    ldr r12, =wifi_radio_report_connect_fn_ptr
     ldr r12, [r12]
     bx r12
