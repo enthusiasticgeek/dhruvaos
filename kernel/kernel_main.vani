@@ -32282,8 +32282,35 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   }
   let _ = rtl8188cu_enable_engines(devaddr, mps);
   let _ = rtl8188cu_set_rcr(devaddr, mps);
+  // BUG FOUND 2026-11-16 (live, after an exhaustive TX-descriptor/
+  // queue-select/rate-mask/addressing audit against Linux found no
+  // remaining asymmetry in anything WE transmit): this programmed the
+  // chip's own hardware station-address register (REG_MACID, used by
+  // RCR's APM "accept physical match" bit to decide whether an
+  // incoming unicast frame is really addressed to us) with netif_get_
+  // mac()'s value -- the WIRED Ethernet interface's own MAC -- while
+  // every 802.11 frame this driver actually transmits (every Probe/
+  // Auth/Assoc Request) claims wifi_real_own_mac()'s completely
+  // different value as its OWN source address. Those two MACs have
+  // never matched. An AP replying to our Auth Request addresses its
+  // response to whatever source address OUR OWN frame claimed
+  // (wifi_real_own_mac) -- but the chip's hardware RX filter checks
+  // incoming unicast frames against REG_MACID (netif_get_mac's wired
+  // MAC), which never matches, so the chip silently drops the AP's
+  // genuine reply before it ever reaches software RX. This exactly
+  // explains "zero response ever, not even a Deauth" despite the AP
+  // almost certainly replying normally: broadcast frames (the Probe
+  // Response we DO receive) aren't gated by this address match at all,
+  // which is why only the first, broadcast-only stage of the join ever
+  // worked. Use wifi_real_own_mac() here too, so the hardware filter
+  // and every frame's own claimed source address finally agree.
   let mac_buf: mut ref i64 = dhruva_alloc_bytes(6);
-  let _ = netif_get_mac(mac_buf);
+  let own_mac_for_filter: [u8; 6] = wifi_real_own_mac();
+  let mbi: i64 = 0;
+  while mbi < 6 {
+    let _ = buf_write_byte(mac_buf, mbi as u32, own_mac_for_filter[mbi] as u32);
+    mbi = mbi + 1;
+  }
   let _ = rtl8188cu_set_mac_addr(devaddr, mps, mac_buf);
   let _ = rtl8188cu_enable_rf(devaddr, mps);
   // BUG FOUND 2026-11-13: see rtl8188cu_init_aggregation's own header
