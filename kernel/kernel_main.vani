@@ -51454,6 +51454,15 @@ fn wifi_real_join() -> i64 {
   let mgmt_iter: i64 = 0;
   let in_eapol: i64 = 0;
   let mgmt_state_before: i64 = WPA2_JOIN_WAIT_PROBE_RESP;
+  // DIAGNOSTIC (2026-11-16): if this loop still gives up, report how
+  // many real bulk-IN frames were actually seen and which state it was
+  // stuck in -- distinguishes "genuinely nothing arrived" (rx_seen_
+  // count stays near 0, points at a TX/RF-level problem with our own
+  // auth/assoc request never reaching the AP or the AP never replying
+  // at all) from "frames arrived but kept getting filtered out" (high
+  // rx_seen_count, points at a remaining bug in the BSSID/subtype match
+  // itself, e.g. the stored BSSID or the frame's own addressing).
+  let rx_seen_count: i64 = 0;
   while (in_eapol == 0) && (mgmt_iter < WIFI_RX_POLL_CAP) {
     // 2026-10-25 fix: same gap, same reason -- see wifi_scan_for_ssid's
     // own identical fix's header comment above for the full "why".
@@ -51462,6 +51471,7 @@ fn wifi_real_join() -> i64 {
     }
     let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
     if rx_len >= 0 {
+      rx_seen_count = rx_seen_count + 1;
       let _ = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
       let r: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref rx_fixed, rx_len, mut ref mgmt_out);
       if r.failed == 1 {
@@ -51508,6 +51518,13 @@ fn wifi_real_join() -> i64 {
     mgmt_iter = mgmt_iter + 1;
   }
   if in_eapol == 0 {
+    let _ = uart_puts("wifi join DIAG: gave up in state=");
+    let _ = uart_put_i64(mgmt_state_before);
+    let _ = uart_puts(" (1=wait probe-resp 2=wait auth-resp 3=wait assoc-resp) rx_seen_count=");
+    let _ = uart_put_i64(rx_seen_count);
+    let _ = uart_puts(" over the last ");
+    let _ = uart_put_i64(mgmt_iter);
+    let _ = uart_puts(" polls\n");
     let _ = uart_puts("wifi join: association never completed (no response from the AP)\n");
     return 0 - 1;
   }
