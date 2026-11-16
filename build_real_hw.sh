@@ -71,7 +71,11 @@ set_flag "$DISARM_PATTERN" 1
 grep -n "^${WD_PATTERN}\|^${DISARM_PATTERN}" "$VANI_FILE"
 
 rm -f build/dhruva.elf
-./build.sh
+# 2026-11-16: last-resort watchdog arm inside runtime_stubs.c's own
+# exit() (see that function's own header comment) -- same real-HW-only
+# compile-time gate convention as STAGE0_CFLAGS below, not a runtime
+# check, since QEMU resets immediately on any PM_RSTC write.
+RUNTIME_STUBS_CFLAGS="-DEXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE=1" ./build.sh
 arm-none-eabi-objcopy -O binary build/dhruva.elf build/dhruva_real_hw.img
 echo "Built build/dhruva_real_hw.img: $(sha256sum build/dhruva_real_hw.img)"
 

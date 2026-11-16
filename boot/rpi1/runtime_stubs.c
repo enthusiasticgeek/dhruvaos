@@ -170,6 +170,61 @@ int dprintf(int fd, const char *fmt, ...) {
  * second time: __intent_trap's post-push sp = exit()'s own fp + 4;
  * __intent_trap's saved lr lives at (that sp) + 4 = exit()'s fp + 8.
  * That is the address actually read below. */
+/* 2026-11-16 real-HW incident: a real panic here (an out-of-bounds
+ * bounds-check trap, now fixed at its own source -- see kernel_main.
+ * vani's wifi_heap_to_fixed256 callers) left the board completely
+ * unresponsive to UART for several minutes with no auto-recovery, even
+ * though kernel_main.vani's own periodic watchdog_kick() calls (gated
+ * by WATCHDOG_ENABLE_FOR_REAL_HARDWARE) should have left a 15-second
+ * countdown already running right up to the crash. The exact reason
+ * that countdown never fired was not conclusively found (every
+ * register/address/protocol involved matches Linux's own bcm2835_wdt
+ * driver exactly, confirmed line-for-line) -- but relying ENTIRELY on
+ * "whatever the last periodic kick from normal, now-abandoned vani
+ * code happened to arm" is fragile by construction: it depends on
+ * nothing having gone wrong anywhere in that call chain, for an event
+ * (a panic) that by definition means something already has. This
+ * halt loop is the one place EVERY possible panic in this whole kernel
+ * funnels through, so it's also the one place a LAST, independent,
+ * minimal recovery attempt can cover every panic uniformly rather than
+ * depending on each panic site's own surrounding code having kicked
+ * recently enough.
+ *
+ * Duplicates watchdog_arm's own PM_WDOG/PM_RSTC register protocol
+ * directly in C (same reasoning as dhruva_dprintf_putc's own raw UART
+ * access above: this must work even when vani's own generated code is
+ * in a state too corrupted to trust calling back into) rather than
+ * calling the vani-side watchdog_arm, with a SHORT 2-second timeout --
+ * once a panic has already happened there is no boot-phase grace
+ * period left to protect, so faster recovery is strictly better than
+ * the 15-second budget normal operation needs.
+ *
+ * Gated by EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE (a -D compile flag, see
+ * build.sh's own ${RUNTIME_STUBS_CFLAGS:-} and build_real_hw.sh's own
+ * matching STAGE0_CFLAGS convention) rather than a runtime check
+ * against kernel_main.vani's WATCHDOG_ENABLE_FOR_REAL_HARDWARE -- this
+ * is a plain C file with no visibility into that vani-side constant,
+ * and QEMU's raspi1ap resets the whole emulated machine immediately on
+ * ANY PM_RSTC write (same reason every other real-HW-only watchdog
+ * write in this codebase is compile-time gated, not runtime-gated),
+ * so this must default OFF and only compile in for an actual real-HW
+ * build. */
+#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
+static void exit_panic_watchdog_arm(void) {
+    volatile unsigned int *pm_rstc = (volatile unsigned int *)0x2010001C;
+    volatile unsigned int *pm_wdog = (volatile unsigned int *)0x20100024;
+    unsigned int pm_password = 0x5A000000u;
+    unsigned int wrcfg_clr = 0xFFFFFFCFu;
+    unsigned int wrcfg_full_reset = 0x00000020u;
+    unsigned int two_seconds_in_ticks = 2u << 16; /* 65536 Hz, same tick rate as watchdog_arm's own header comment */
+    unsigned int cur;
+
+    *pm_wdog = pm_password | (two_seconds_in_ticks & 0xFFFFFu);
+    cur = *pm_rstc;
+    *pm_rstc = pm_password | (cur & wrcfg_clr) | wrcfg_full_reset;
+}
+#endif
+
 void exit(int code) {
     (void)code;
     unsigned int exit_fp;
@@ -186,8 +241,13 @@ void exit(int code) {
         }
     }
     dhruva_dprintf_putc('\n');
+#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
+    dhruva_dprintf_puts("panic: arming a last-resort 2s watchdog reset before halting\n");
+    exit_panic_watchdog_arm();
+#endif
     while (1) {
-        /* halt -- there is no OS to return to */
+        /* halt -- there is no OS to return to (unless the watchdog
+         * arm above fires first on a real-HW build) */
     }
 }
 

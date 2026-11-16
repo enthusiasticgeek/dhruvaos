@@ -332,7 +332,7 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm ${DMA_UART_STATE_CFLAGS:-} \
   "${ROOT}/boot/dma_uart_state.S" -o "${BUILD_DIR}/dma_uart_state.o"
 
-arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding ${RUNTIME_STUBS_CFLAGS:-} \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
 # kernel_main.ll was already produced by the merged `vanic emit
