@@ -32303,6 +32303,18 @@ fn rtl8188cu_set_channel_self_test() -> i64 {
 // None of RTL8188CU/RTL8192CU's various per-chip exclusion lists in the
 // real function apply to this chip for any of these.
 fn rtl8188cu_init_sta_mac_params(devaddr: u32, mps: u32) -> i64 {
+  // REG_RX_DRVINFO_SZ (0x060f): tells the hardware how many 8-byte
+  // units of PHY-status (RSSI/SNR/etc) to prepend to every received
+  // frame, ahead of the real 802.11 payload. Never configured anywhere
+  // in this driver before now -- confirmed live (rtl_rx_desc_parse's
+  // own drvinfo_sz_units always read 0, so the RSSI diagnostic added
+  // this same round never had anything to print) despite RCR's own
+  // APP_PHYST_RXFF bit already being set; that bit alone doesn't
+  // control the SIZE of the block, this register does. Linux writes 4
+  // (32 bytes, matching struct rtl8723au_phy_stats's own real size)
+  // unconditionally for every chip in this family.
+  let _ = rtl_reg_write8(devaddr, mps, 0x060f as u32, 4 as u32);
+
   // REG_RESPONSE_RATE_SET (0x0440): clear RESPONSE_RATE_BITMAP_ALL
   // (0xfffff), set RESPONSE_RATE_RRSR_CCK_ONLY_1M (0xffff1).
   let rrsr: u32 = rtl_reg_read32(devaddr, mps, 0x0440 as u32);
