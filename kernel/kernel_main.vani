@@ -29560,8 +29560,30 @@ const RTL_RXDESC_LEN: i64 = 24;
 // explicitly rather than assumed away, since treating a C2H event as
 // frame data would misparse garbage as if it were a real received
 // packet.
-struct RtlRxDescInfo { fcs_ok: i64, pkt_len: i64, frame_start_off: i64, is_report: i64 }
+struct RtlRxDescInfo { fcs_ok: i64, pkt_len: i64, frame_start_off: i64, is_report: i64, rssi_dbm: i64, has_phystats: i64 }
 
+// DIAGNOSTIC (2026-11-16, "use something non-disruptive" -- after the
+// monitor-mode over-the-air capture plan turned out to risk cutting off
+// the host machine's own WiFi, since it shares the one dongle this PC
+// uses for its own connectivity): this chip ALREADY prepends a PHY-
+// status block (`struct rtl8723au_phy_stats`, Linux core.c/`.h`) right
+// after the 24-byte RX descriptor, whenever RCR's APP_PHYST_RXFF bit is
+// set -- which it already is, in this driver's own rtl8188cu_set_rcr.
+// `drvinfo_sz` (computed below) already correctly SKIPS past this
+// block to find the real frame, but nothing ever READ it -- real,
+// free, already-arriving signal-quality data (RSSI) was being
+// discarded on every single received frame this whole investigation.
+// Byte offset 4 within that block is `cck_sig_qual_ofdm_pwdb_all`
+// (confirmed against the real struct layout: path_agc[2] (2 bytes) +
+// ch_corr[2] (2 bytes) = offset 4) -- Linux's own rtl8723a_signal_scale_
+// mapping/rx_parse_phystats formula for the OFDM path is exactly
+// `(byte >> 1) - 110` dBm. No new hardware interaction, no risk to
+// this host machine at all -- purely decoding bytes already present in
+// every RX buffer, to answer "is the link actually healthy in the
+// receive direction" (a strong received signal from this exact AP
+// would mean antenna/RF-path quality isn't the explanation for the TX-
+// side symptom; a weak one would point back at antenna/RF margin after
+// all, consistent across both directions).
 fn rtl_rx_desc_parse(buf: mut ref i64) -> RtlRxDescInfo {
   let dword0: i64 = buf_read_u32_le(buf, 0) as i64;
   let pkt_len: i64 = dword0 & 0x3fff;
@@ -29577,7 +29599,14 @@ fn rtl_rx_desc_parse(buf: mut ref i64) -> RtlRxDescInfo {
   let drvinfo_sz: i64 = drvinfo_sz_units * 8;
   let frame_start_off: i64 = RTL_RXDESC_LEN + drvinfo_sz + shift;
 
-  return RtlRxDescInfo { fcs_ok: fcs_ok, pkt_len: pkt_len, frame_start_off: frame_start_off, is_report: is_report };
+  let has_phystats: i64 = if drvinfo_sz >= 8 { 1 } else { 0 };
+  let rssi_dbm: i64 = 0 - 1000;
+  if has_phystats == 1 {
+    let pwdb_byte: i64 = buf_read_byte(buf, (RTL_RXDESC_LEN + 4) as u32) as i64;
+    rssi_dbm = (pwdb_byte / 2) - 110;
+  }
+
+  return RtlRxDescInfo { fcs_ok: fcs_ok, pkt_len: pkt_len, frame_start_off: frame_start_off, is_report: is_report, rssi_dbm: rssi_dbm, has_phystats: has_phystats };
 }
 
 fn rtl_rx_desc_self_test() -> i64 {
@@ -31026,6 +31055,17 @@ fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFr
     let b: u32 = buf_read_byte(raw, (info.frame_start_off + i) as u32);
     let _ = buf_write_byte(frame_out, i as u32, b);
     i = i + 1;
+  }
+  // DIAGNOSTIC (2026-11-16): see rtl_rx_desc_parse's own header comment
+  // -- free RSSI from the PHY-status block every received frame
+  // already carries, never read before now. Printed here (the single
+  // choke point every real received frame passes through, regardless
+  // of which shell command triggered the read) so wifi listen/scan/
+  // join all report it without duplicating this at each call site.
+  if info.has_phystats == 1 {
+    let _ = uart_puts("wifi rx DIAG: rssi=");
+    let _ = uart_put_i64(info.rssi_dbm);
+    let _ = uart_puts("dBm\n");
   }
   return RtlRxFrameResult { ok: 1, frame_len: info.pkt_len };
 }
