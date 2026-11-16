@@ -50497,6 +50497,58 @@ fn wpa2_join_start(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], s
   return probe_request_build(own_mac, ssid, ssid_len, out);
 }
 
+// BUG FOUND 2026-11-16 (live, twice in a row on real HW): wifi_real_join
+// always sent a SECOND, redundant probe request via wpa2_join_start
+// (wpa2_join_start's own, after wifi_scan_for_ssid already got a real,
+// RSN-confirmed Probe Response from this exact BSSID moments earlier)
+// and then waited up to 50 polls for a second Probe Response to that
+// one. Live diagnostic (this same round): on a real, busy channel,
+// EVERY discarded frame during that wait was confirmed from_bss=1 (the
+// right AP) but a Data/Control subtype, not FC_STYPE_PROBE_RESP -- the
+// AP has far more ordinary data/control traffic to other already-
+// connected stations than spare probe-response opportunities, and
+// evidently doesn't always bother answering a second probe request
+// moments after already answering the first. Real wpa_supplicant
+// doesn't re-probe before joining when it already has fresh BSS info
+// from a recent scan either -- it goes straight to Authentication.
+// This variant does the same: builds the ctx exactly like wpa2_join_
+// start (same BSSID/own_mac/SSID/RSN fields), but skips straight to
+// WPA2_JOIN_WAIT_AUTH_RESP and returns an Authentication Request
+// (auth_request_build, the same one wpa2_join_step_mgmt's own WAIT_
+// PROBE_RESP->WAIT_AUTH_RESP transition already builds) instead of
+// another Probe Request. wpa2_join_start itself is left completely
+// unchanged -- wpa2_join_orchestrator_self_test's own call site still
+// needs the original probe-first state machine, since nothing handed
+// it a prior scan's own already-confirmed BSS info the way a real join
+// always has one available.
+fn wpa2_join_start_skip_probe(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, out: mut ref [u8; 64]) -> i64 {
+  let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_AUTH_RESP as u32);
+  let _ = buf_write_byte(ctx, WPA2_JOIN_SSID_LEN_OFF as u32, ssid_len as u32);
+  let i: i64 = 0;
+  while i < 6 {
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_BSSID_OFF + i) as u32, bssid[i] as u32);
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_OWN_MAC_OFF + i) as u32, own_mac[i] as u32);
+    i = i + 1;
+  }
+  i = 0;
+  while i < ssid_len {
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_SSID_OFF + i) as u32, ssid[i] as u32);
+    i = i + 1;
+  }
+  let rsn: [u8; 22] = [0 as u8; 22];
+  let _ = rsn_ie_build_wpa2_psk_ccmp(mut ref rsn);
+  i = 0;
+  while i < 22 {
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_RSN_OFF + i) as u32, rsn[i] as u32);
+    i = i + 1;
+  }
+  let auth_frame: [u8; 30] = [0 as u8; 30];
+  let alen: i64 = auth_request_build(bssid, own_mac, mut ref auth_frame);
+  let j: i64 = 0;
+  while j < alen { out[j] = auth_frame[j]; j = j + 1; }
+  return alen;
+}
+
 // Advances the management-frame phase (Probe Response -> Open System
 // Auth -> Association Response) given one received management frame.
 // `out` is sized for the largest frame this phase ever builds
@@ -51463,16 +51515,21 @@ fn wifi_real_join() -> i64 {
   }
   let _ = uart_puts("wifi join: found AP, starting join sequence\n");
 
+  // 2026-11-16: wifi_scan_for_ssid just above already got a real,
+  // RSN-confirmed Probe Response from this exact BSSID -- skip the
+  // redundant second probe request (see wpa2_join_start_skip_probe's
+  // own header comment for the live diagnostic that found this) and go
+  // straight to Authentication.
   let ctx: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_CTX_SIZE as u32);
   let preq: [u8; 64] = [0 as u8; 64];
-  let preq_len: i64 = wpa2_join_start(ctx, ref bssid, ref own_mac, ref ssid, ssid_len, mut ref preq);
+  let preq_len: i64 = wpa2_join_start_skip_probe(ctx, ref bssid, ref own_mac, ref ssid, ssid_len, mut ref preq);
   let preq_heap: mut ref i64 = dhruva_alloc_bytes(64);
   let p1i: i64 = 0;
   while p1i < preq_len {
     let _ = buf_write_byte(preq_heap, p1i as u32, preq[p1i] as u32);
     p1i = p1i + 1;
   }
-  let _ = wifi_radio_tx_frame(devaddr, mps_out, preq_heap, preq_len, 1, 1);
+  let _ = wifi_radio_tx_frame(devaddr, mps_out, preq_heap, preq_len, 0, 1);
 
   let rx_heap: mut ref i64 = dhruva_alloc_bytes(512);
   let rx_fixed: [u8; 256] = [0 as u8; 256];
@@ -51482,7 +51539,11 @@ fn wifi_real_join() -> i64 {
   let seq: i64 = 2;
   let mgmt_iter: i64 = 0;
   let in_eapol: i64 = 0;
-  let mgmt_state_before: i64 = WPA2_JOIN_WAIT_PROBE_RESP;
+  // 2026-11-16: starting state is now WAIT_AUTH_RESP (wpa2_join_start_
+  // skip_probe), not WAIT_PROBE_RESP -- must match or the very first
+  // real transition's own budget-reset check below compares against
+  // the wrong baseline.
+  let mgmt_state_before: i64 = WPA2_JOIN_WAIT_AUTH_RESP;
   // DIAGNOSTIC (2026-11-16): if this loop still gives up, report how
   // many real bulk-IN frames were actually seen and which state it was
   // stuck in -- distinguishes "genuinely nothing arrived" (rx_seen_
