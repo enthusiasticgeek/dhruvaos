@@ -30993,6 +30993,9 @@ const RTL_REG_USB_SPECIAL_OPTION: u32 = 0xfe55;
 const RTL_REG_RXFLTMAP0: u32 = 0x06a0; // management-frame per-subtype RX filter
 const RTL_REG_RXFLTMAP2: u32 = 0x06a4; // data-frame per-subtype RX filter
 const RTL_REG_OFDM0_XA_AGC_CORE1: u32 = 0x0c50; // RX path-A AGC initial-gain index, bits[6:0]
+// 2026-11-16: causality-test gate for the BB/AGC/RF phy table load -- see
+// rtl8188cu_mac_bringup's own call-site comment for the full "why".
+const WIFI_PHY_TABLE_LOAD_ENABLED: u32 = 0;
 
 // IQ calibration (IQK) register set, ported from Linux's real
 // rtl8xxxu_gen1_phy_iq_calibrate/rtl8xxxu_phy_iqcalibrate/rtl8xxxu_
@@ -32117,23 +32120,45 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   // init immediately above) and well BEFORE RCR/enable_rf/aggregation --
   // placed here to match that exact ordering, see rtl8188cu_load_bb_table's
   // own header comment for the full finding.
-  let bb_fail1: i64 = rtl8188cu_load_bb_table_part1(devaddr, mps);
-  let bb_readback_immediate: u32 = rtl_reg_read32(devaddr, mps, 0x0c04 as u32);
-  let bb_fail2: i64 = rtl8188cu_load_bb_table_part2(devaddr, mps);
-  let bb_readback_later: u32 = rtl_reg_read32(devaddr, mps, 0x0c04 as u32);
-  let agc_fail: i64 = rtl8188cu_load_agc_table(devaddr, mps);
-  let rf_fail: i64 = rtl8188cu_load_rf_table(devaddr, mps);
-  let _ = uart_puts("USB: RTL8188CU BB/AGC/RF phy tables loaded, bb_fail=");
-  let _ = uart_put_i64(bb_fail1 + bb_fail2);
-  let _ = uart_puts(" agc_fail=");
-  let _ = uart_put_i64(agc_fail);
-  let _ = uart_puts(" rf_fail=");
-  let _ = uart_put_i64(rf_fail);
-  let _ = uart_puts(" bb_readback_immediate(0x0c04, expect 0x03a05611)=0x");
-  let _ = uart_put_hex32(bb_readback_immediate);
-  let _ = uart_puts(" bb_readback_later=0x");
-  let _ = uart_put_hex32(bb_readback_later);
-  let _ = uart_puts("\n");
+  //
+  // 2026-11-16 CAUSALITY TEST: gated off (WIFI_PHY_TABLE_LOAD_ENABLED=0)
+  // to directly test whether this table load is itself responsible for
+  // the new "nak_count=0" (flat bulk-IN silence) regression observed live
+  // after it was added -- every prior build WITHOUT this load showed real
+  // NAK activity (nak_count>500/5000 tries); every build WITH it shows
+  // zero, on both channels tested, reproducibly. A live register readback
+  // (both immediately after this table's own 0x0c04 write and later)
+  // never showed the table's own intended value taking effect either,
+  // despite every write reporting USB-level success -- genuinely
+  // unresolved whether that register is unreadable-by-design (chip/
+  // firmware-driven in real time) or the writes really aren't landing,
+  // but the NAK-activity regression is independently measured and real
+  // regardless of that readback's reliability. Flip back to 1 once the
+  // actual interaction is understood -- the table itself is very likely
+  // still a real, necessary gap (Linux ports it unconditionally), so this
+  // is a deliberate temporary disable for isolation, not a permanent
+  // revert.
+  if WIFI_PHY_TABLE_LOAD_ENABLED == (1 as u32) {
+    let bb_fail1: i64 = rtl8188cu_load_bb_table_part1(devaddr, mps);
+    let bb_readback_immediate: u32 = rtl_reg_read32(devaddr, mps, 0x0c04 as u32);
+    let bb_fail2: i64 = rtl8188cu_load_bb_table_part2(devaddr, mps);
+    let bb_readback_later: u32 = rtl_reg_read32(devaddr, mps, 0x0c04 as u32);
+    let agc_fail: i64 = rtl8188cu_load_agc_table(devaddr, mps);
+    let rf_fail: i64 = rtl8188cu_load_rf_table(devaddr, mps);
+    let _ = uart_puts("USB: RTL8188CU BB/AGC/RF phy tables loaded, bb_fail=");
+    let _ = uart_put_i64(bb_fail1 + bb_fail2);
+    let _ = uart_puts(" agc_fail=");
+    let _ = uart_put_i64(agc_fail);
+    let _ = uart_puts(" rf_fail=");
+    let _ = uart_put_i64(rf_fail);
+    let _ = uart_puts(" bb_readback_immediate(0x0c04, expect 0x03a05611)=0x");
+    let _ = uart_put_hex32(bb_readback_immediate);
+    let _ = uart_puts(" bb_readback_later=0x");
+    let _ = uart_put_hex32(bb_readback_later);
+    let _ = uart_puts("\n");
+  } else {
+    let _ = uart_puts("USB: RTL8188CU BB/AGC/RF phy tables SKIPPED (WIFI_PHY_TABLE_LOAD_ENABLED=0, causality test)\n");
+  }
   let _ = rtl8188cu_enable_engines(devaddr, mps);
   let _ = rtl8188cu_set_rcr(devaddr, mps);
   let mac_buf: mut ref i64 = dhruva_alloc_bytes(6);
