@@ -51572,7 +51572,17 @@ fn wifi_real_join() -> i64 {
     let _ = buf_write_byte(preq_heap, p1i as u32, preq[p1i] as u32);
     p1i = p1i + 1;
   }
-  let _ = wifi_radio_tx_frame(devaddr, mps_out, preq_heap, preq_len, 0, 1);
+  // DIAGNOSTIC (2026-11-16): unlike wifi_scan_for_ssid's own probe-
+  // request TX (which explicitly captures and prints its result), this
+  // Auth Request TX's return value was silently discarded -- if THIS
+  // transfer itself never completes at the USB/chip level, we'd wait
+  // pointlessly for a response to a frame that was never really sent,
+  // indistinguishable from "sent fine, AP just never replied" in every
+  // diagnostic gathered so far.
+  let auth_tx_result: i64 = wifi_radio_tx_frame(devaddr, mps_out, preq_heap, preq_len, 0, 1);
+  let _ = uart_puts("wifi join DIAG: Auth Request TX result=");
+  let _ = uart_put_i64(auth_tx_result);
+  let _ = uart_puts(" (0=XFERCOMPL confirmed, -1=channel-0 never completed)\n");
 
   let rx_heap: mut ref i64 = dhruva_alloc_bytes(512);
   let rx_fixed: [u8; 256] = [0 as u8; 256];
