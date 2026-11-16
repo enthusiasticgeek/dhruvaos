@@ -51052,8 +51052,24 @@ fn wifi_radio_init_rtl8188cu() -> i64 {
 // WPA2 self-test's own 0x02:...:02 example, so a real capture is
 // never ambiguous with test traffic if both ever end up in the same
 // log.
+//
+// EXPERIMENT (2026-11-16, cheap test after real-HW Auth Requests got
+// zero response -- not even a Deauth -- across every attempt, despite
+// an exhaustive TX-descriptor/queue-select/rate-mask comparison against
+// Linux's real driver finding no remaining software asymmetry between
+// the working broadcast TX path and the failing unicast one): the old
+// value (0x02:44:48:52:55:01) spells "DHRU" in its bytes -- locally-
+// administered per spec, but an obviously non-random, synthetic-looking
+// pattern. Some modern ISP gateways (this exact network, "Verizon_
+// V7C49F", is a Verizon-branded one) have anti-spoofing/MAC-
+// randomization heuristics that can silently drop an association
+// attempt from an address that looks synthetic rather than genuinely
+// random, with no rejection frame at all -- which would exactly match
+// the observed symptom. Low-confidence, but a one-line, free thing to
+// rule out before chasing anything deeper. Same locally-administered
+// bit, deliberately non-patterned remaining bytes.
 fn wifi_real_own_mac() -> [u8; 6] {
-  return [0x02 as u8, 0x44 as u8, 0x48 as u8, 0x52 as u8, 0x55 as u8, 0x01 as u8];
+  return [0x02 as u8, 0x7B as u8, 0x9D as u8, 0x1A as u8, 0xC4 as u8, 0x3E as u8];
 }
 
 const WIFI_RX_POLL_CAP: i64 = 50;
