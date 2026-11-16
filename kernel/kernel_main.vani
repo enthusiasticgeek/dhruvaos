@@ -50572,6 +50572,20 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out
     let stype: i64 = hdr.frame_control & (0xFC as i64);
     let want_stype: i64 = if state == WPA2_JOIN_WAIT_PROBE_RESP { FC_STYPE_PROBE_RESP } else if state == WPA2_JOIN_WAIT_AUTH_RESP { FC_STYPE_AUTH } else { FC_STYPE_ASSOC_RESP };
     if (from_bss == 0) || (stype != want_stype) {
+      // DIAGNOSTIC (2026-11-16): distinguishes "frames from the target
+      // AP are arriving but with the wrong subtype" (from_bss=1,
+      // stype!=want_stype -- the AP IS there and talking, something
+      // else is the gap) from "nothing from the target AP at all, just
+      // ambient traffic from elsewhere" (from_bss=0) -- the two
+      // candidate explanations for "gave up in state=1, rx_seen_count
+      // high, zero matches" from the prior run.
+      let _ = uart_puts("wifi join DIAG: ignored frame from_bss=");
+      let _ = uart_put_i64(from_bss);
+      let _ = uart_puts(" stype=0x");
+      let _ = uart_put_hex32(stype as u32);
+      let _ = uart_puts(" want_stype=0x");
+      let _ = uart_put_hex32(want_stype as u32);
+      let _ = uart_puts("\n");
       return Wpa2JoinResult { state: state, tx_len: 0, done: 0, failed: 0 };
     }
   }
