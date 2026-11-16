@@ -30994,8 +30994,12 @@ const RTL_REG_RXFLTMAP0: u32 = 0x06a0; // management-frame per-subtype RX filter
 const RTL_REG_RXFLTMAP2: u32 = 0x06a4; // data-frame per-subtype RX filter
 const RTL_REG_OFDM0_XA_AGC_CORE1: u32 = 0x0c50; // RX path-A AGC initial-gain index, bits[6:0]
 // 2026-11-16: causality-test gate for the BB/AGC/RF phy table load -- see
-// rtl8188cu_mac_bringup's own call-site comment for the full "why".
-const WIFI_PHY_TABLE_LOAD_ENABLED: u32 = 0;
+// rtl8188cu_mac_bringup's own call-site comment for the full "why". The
+// causality test itself turned out invalid (see wifi_rx_poll_diag's own
+// 2026-11-16 fix comment -- the "nak_count=0" symptom this test was
+// chasing was a diagnostic bug unrelated to this table, present
+// identically whether this flag was 0 or 1). Re-enabled.
+const WIFI_PHY_TABLE_LOAD_ENABLED: u32 = 1;
 
 // IQ calibration (IQK) register set, ported from Linux's real
 // rtl8xxxu_gen1_phy_iq_calibrate/rtl8xxxu_phy_iqcalibrate/rtl8xxxu_
@@ -50979,23 +50983,28 @@ fn wifi_rx_poll_diag(devaddr: u32, mps: u32) -> i64 {
   let _ = uart_put_i64(pid as i64);
   let _ = uart_puts(" hctsiz=0x");
   let _ = uart_put_hex32(mmio_read_u32(hctsiz0));
-  // TEMPORARY DIAGNOSTIC (2026-11-15 continued): rtl8188cu_enable_rf
-  // (ported from rtl8xxxu_gen1_enable_rf) only ever touches
-  // OFDM_RF_PATH_TX_MASK (bits[7:4]) in REG_OFDM0_TRX_PATH_ENABLE
-  // (0x0c04) -- confirmed faithful to the real driver, which ALSO never
-  // explicitly sets OFDM_RF_PATH_RX_A (bit0, RX path A enable) anywhere
-  // in its own enable_rf. Whether RX actually works at all hinges on
-  // this bit's power-on-reset default, which this driver has never
-  // once read back and printed -- checking directly rather than
-  // guessing from the datasheet or the reference driver's silence on
-  // it (silence that's equally consistent with "already enabled at
-  // reset, nothing to do" and "needs fops->iqk to transiently touch it,
-  // which runs once and this driver's own IQK port may or may not
-  // preserve correctly").
-  let _ = uart_puts(" trx_path_enable=0x");
-  let _ = uart_put_hex32(rtl_reg_read32(devaddr, mps, 0x0c04 as u32));
   let _ = uart_puts("\n");
-
+  // BUG FOUND 2026-11-16 (real-HW investigation): this diagnostic used to
+  // print a live readback of REG_OFDM0_TRX_PATH_ENABLE (0x0c04) right
+  // here, via rtl_reg_read32 -- a CONTROL transfer that reuses this same
+  // physical channel 0 (dwc2_control_in calls dwc2_reset_chan0_for_new_
+  // transfer + reprograms HCCHAR/HCTSIZ/HCDMA for its own SETUP/DATA/
+  // STATUS stages). Running it HERE, between arming the bulk-IN transfer
+  // above and the NAK-polling loop below, silently clobbered the very
+  // transfer this function exists to observe: by the time the loop below
+  // started polling HCINT, channel 0 had already been reprogrammed for
+  // the register read's own control transfer, so the bulk-IN transfer
+  // this function armed was never actually issued -- explaining the
+  // "nak_count=0, flat silence" seen in every build that had this print,
+  // which a dedicated causality test (gating the unrelated BB/AGC/RF phy
+  // table load on/off) proved had NOTHING to do with that table: BOTH
+  // the table-enabled and table-disabled builds showed identical
+  // nak_count=0, because this same diagnostic bug was present in both,
+  // unconditionally. The underlying readback finding (TRX_PATH_ENABLE's
+  // TX_MASK bits reading back 0 after enable_rf's own write intended to
+  // set them) may still be real, but it was never safe to check from
+  // inside this specific function -- removed here; re-add from a context
+  // that doesn't sit between an arm and its own poll if that's revisited.
   let chena_bit: u32 = (1 as u32) << (31 as u32);
   let tries: i64 = 0;
   let nak_count: i64 = 0;
