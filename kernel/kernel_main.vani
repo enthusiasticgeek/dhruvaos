@@ -51034,7 +51034,7 @@ fn wifi_rx_poll_diag(devaddr: u32, mps: u32) -> i64 {
           let _ = uart_puts("WIFI RX DIAG: first NAK extras -- GINTSTS=0x");
           let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x14));
           let _ = uart_puts(" HFNUM=0x");
-          let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x414));
+          let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x408));
           let _ = uart_puts(" GRXSTSR=0x");
           let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x1C));
           let _ = uart_puts("\n");
