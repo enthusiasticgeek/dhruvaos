@@ -1917,6 +1917,34 @@ extern "C" fn uart_digits_scratch_get() -> mut ref i64;
 extern "C" fn dwc2_dma_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dwc2_dma_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_downstream_desc_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_downstream_desc_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn hub_port_status_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn hub_port_status_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_lan_reg_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_lan_reg_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_tx_wrap_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_tx_wrap_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_tx_chunk_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_tx_chunk_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_rx_raw_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_rx_raw_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_rx_chunk_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn netif_rx_chunk_scratch_get() -> mut ref i64;
 // boot/usb_power_state.S (task #197 follow-up, real-HW USB bring-up
 // investigation, 2026-10-02) -- see that file's own header comment
 // for the full "why" (VideoCore mailbox SET_POWER_STATE for the USB
@@ -15999,14 +16027,53 @@ fn shell_dispatch_usbpowercycle() -> i64 {
   // something to paper over by deleting the diagnostic, just by not
   // treating it as fatal here either, matching the one real precedent
   // (the boot path) this project already has for this exact call.
-  // Real elapsed settle time before touching any DWC2 register, same
-  // reasoning (and same count) as the existing boot-path call's own
-  // post-mailbox-response delay -- see kernel_main.vani's own
-  // usb_power_on() call site comment for the full "why" (DWC2's
-  // internal reset/sync logic needs real time after the rail itself
-  // is confirmed stable, not just immediately after the mailbox
-  // response).
-  let _ = delay(161000);
+  //
+  // BUG FOUND 2026-11-14 (real-HW investigation, user: "implement
+  // better approach reliable... research online"): this delay used to
+  // be 161000 (~50ms, copy-pasted from the boot-path's own post-
+  // mailbox-response settle, which only needs to cover ordinary rail
+  // rise time). It was NOT enough here, and a live test proved it:
+  // running this command against an already-wedged board corrupted
+  // the ROOT HUB itself (not just the previously-wedged downstream
+  // device) -- GET_DESCRIPTOR started failing even at address 1, and
+  // the corruption survived a full ARM `reboot` (expected: the
+  // VideoCore GPU firmware's own power-domain state machine is
+  // independent of the ARM core, so an ARM-only reset can't re-settle
+  // it; only a genuine physical power cycle, which resets the GPU
+  // firmware too, cleared it).
+  //
+  // Root cause, confirmed against both this project's OWN prior
+  // finding and real Linux dwc2 source (drivers/usb/dwc2/core.c,
+  // dwc2_exit_partial_power_down -- fetched fresh this round): this
+  // driver's own dwc2_reassert_core_config_post_port_reset has a
+  // documented BCM2835 erratum already pinned down earlier this same
+  // investigation -- GUSBCFG/GAHBCFG spontaneously revert ~0.7s AFTER
+  // an HPRT0 PRTPWR/PRTRST-class transition, which is exactly why that
+  // reassert call exists at all post-port-reset. A full USB_HCD power-
+  // domain SET_POWER_STATE transition (this function's own
+  // usb_power_on() call, two lines up) is itself a PRTPWR-class event
+  // for this same purpose -- real Linux independently confirms the
+  // general principle (GAHBCFG/GUSBCFG are explicitly saved/restored
+  // around every power-domain-affecting transition in dwc2_exit_
+  // partial_power_down, never assumed to survive one). A mere 50ms
+  // settle before calling dwc2_init() left this mailbox-level
+  // transition's own ~0.7s revert timer still pending when dwc2_init's
+  // OWN final reassert call (inside dwc2_port_reset_and_enable, fired
+  // for ITS OWN internal PRTPWR/PRTRST transition) ran and returned --
+  // so the EARLIER mailbox event's delayed revert still landed
+  // afterward, overwriting config again before the synchronous device0
+  // probe four lines below ever got to run. (The ordinary cold-boot
+  // path never hits this: its own post-reset reassert is the ONLY
+  // PRTPWR-class transition in play, and real enumeration is deferred
+  // to a background task, 2026-11-01's own fix, giving ample slack
+  // past 0.7s before anything depends on the config being correct.)
+  // Fix: wait a real ~1.02s (3300000 iterations, the same real-HW-
+  // derived "genuinely exceeds the ~0.7s revert window" constant
+  // dwc2_hub_power_cycle_port already uses for the identical reasoning)
+  // before dwc2_init() ever touches a DWC2 register here, so THIS
+  // event's own revert has already fired and settled before dwc2_init's
+  // internal reassert becomes the last word -- not racing it.
+  let _ = delay(3300000);
   let _ = uart_puts("usbpowercycle: re-running dwc2_init()...\n");
   let init_status: i64 = dwc2_init();
   let _ = uart_puts("usbpowercycle: dwc2_init status=");
@@ -16017,10 +16084,109 @@ fn shell_dispatch_usbpowercycle() -> i64 {
     let _ = uart_puts("usbpowercycle: no connected+enabled port after re-init -- stopping here\n");
     return 0;
   }
+  // 2026-11-14 (same investigation as the delay(3300000) fix above):
+  // dwc2_init() calls dwc2_reassert_core_config_post_port_reset() as
+  // its own last step, correctly timed for the PRTPWR/PRTRST
+  // transition INSIDE dwc2_init() itself -- but the ordinary cold-boot
+  // path never calls dwc2_probe_device0() synchronously right after
+  // that reassert the way this command does two lines below; it defers
+  // the real probe to a background task, which real boot-sequence work
+  // (DharaFS init, self-tests, etc.) naturally delays well past the
+  // ~0.7s revert window before anything depends on the config being
+  // correct. This command has no such naturally-occurring gap, so it
+  // has to manufacture one explicitly: wait the same real ~1.02s
+  // settle, then reassert ONE MORE TIME, immediately before the real
+  // transfer -- guaranteeing the last register write this function
+  // makes is also the most recent one, with nothing left pending that
+  // could still revert it out from under the probe that follows.
+  let _ = delay(3300000);
+  let _ = dwc2_reassert_core_config_post_port_reset();
   let _ = uart_puts("usbpowercycle: re-running device0 probe (hub + both downstream ports)...\n");
   let probe_status: i64 = dwc2_probe_device0();
+  // BUG FOUND 2026-11-15 (real-HW investigation, same boot that
+  // confirmed the firmware chunk-write address fix above): dwc2_init()
+  // two calls up unconditionally sets usb_probe0_pending=1 as its own
+  // side effect (see its own header comment -- normally correct, since
+  // the ordinary cold-boot path relies on that flag to defer the real
+  // probe to task_e's background poll). This function then runs its
+  // OWN synchronous probe immediately, bypassing that deferred path
+  // entirely -- but never cleared the flag it left set. A live capture
+  // caught the result: this command's own probe succeeded (RTL8188CU
+  // firmware genuinely loaded and started), then task_e's background
+  // poll saw the still-set flag on its own next turn and redundantly
+  // re-ran dwc2_probe_device0() from scratch against a device that had
+  // already moved on, printing a confusing "GET_DESCRIPTOR(Device)
+  // transfer failed" / "no response" right after a real success.
+  // Clearing it here, exactly like the background path's own matching
+  // clear (task_e's branch, right after ITS probe call), tells task_e
+  // there is nothing left pending -- this command already did the job.
+  let _ = usb_probe0_pending_set(0 as u32);
   let _ = dhruva_prio_unlock(3);
   let _ = uart_puts("usbpowercycle: device0 probe status=");
+  let _ = uart_put_hex32(probe_status as u32);
+  let _ = uart_puts(" (0=enumerated, nonzero=no response) -- see the per-port 'USB DIAG' lines above for which port(s), if any, now respond\n");
+  return 0;
+}
+
+// 2026-11-15 (real-HW investigation, user: "why dont you make usb
+// handling more resilient like linux or cutoff power to all usb
+// devices during reset (reset whole hub)"): live-testable sibling of
+// usbpowercycle (above), for the SAME already-wedged-device recovery
+// goal, but via dwc2_root_vbus_power_cycle()'s own header comment for
+// why this is a genuinely different mechanism from BOTH prior
+// attempts (the per-port hub PORT_POWER toggle already wired into
+// automatic retry, and usbpowercycle's own GPU-mailbox USB_HCD power
+// domain) -- a direct HPRT0.PRTPWR VBUS cut at the SoC's own DWC2
+// root port, which supplies power to the entire onboard hub and
+// therefore every downstream device behind it, not just the one
+// already-wedged port.
+//
+// Built already applying the exact timing lesson usbpowercycle's own
+// 2026-11-14 header comment records (the real ~1.02s settle before
+// touching any DWC2 register, and a final reassert immediately before
+// the real probe) -- not re-discovering that bug a second time.
+//
+// Deliberately NOT wired into dwc2_hub_bring_up_and_enumerate_port's
+// own automatic per-port retry: a real VBUS interruption here also
+// drops whatever is currently working on the OTHER downstream port
+// (this board's onboard LAN9512 Ethernet shares the same upstream
+// VBUS), so this stays an operator-invoked, deliberate last resort --
+// same reasoning this project already applies to usbpowercycle itself
+// (never run silently from inside an ordinary retry loop).
+fn shell_dispatch_usbhubpowercycle() -> i64 {
+  let _ = dhruva_prio_lock(2);
+  let _ = uart_puts("usbhubpowercycle: cutting root-port VBUS (whole onboard hub + every downstream device)...\n");
+  let _ = dwc2_root_vbus_power_cycle();
+  let _ = uart_puts("usbhubpowercycle: VBUS restored, re-running dwc2_init()...\n");
+  let init_status: i64 = dwc2_init();
+  let _ = uart_puts("usbhubpowercycle: dwc2_init status=");
+  let _ = uart_put_hex32(init_status as u32);
+  let _ = uart_puts(" (0=controller ready, port connected+enabled)\n");
+  if init_status != 0 {
+    let _ = dhruva_prio_unlock(3);
+    let _ = uart_puts("usbhubpowercycle: no connected+enabled port after re-init -- stopping here\n");
+    return 0;
+  }
+  // Same ~1.02s settle + final reassert immediately before the real
+  // probe as usbpowercycle's own matching 2026-11-14 fix -- see that
+  // function's own comment for the full "why" (dwc2_init()'s internal
+  // reassert is correctly timed for ITS OWN PRTPWR transition, not for
+  // this function's own earlier dwc2_root_vbus_power_cycle() call, and
+  // this command has no naturally-occurring gap before the real
+  // transfer the way the deferred-to-background-task boot path does).
+  let _ = delay(3300000);
+  let _ = dwc2_reassert_core_config_post_port_reset();
+  let _ = uart_puts("usbhubpowercycle: re-running device0 probe (hub + both downstream ports)...\n");
+  let probe_status: i64 = dwc2_probe_device0();
+  // Same stale-pending-flag fix as shell_dispatch_usbpowercycle's own
+  // matching 2026-11-15 comment -- dwc2_init() above already armed
+  // usb_probe0_pending=1 as a side effect; this function's own
+  // synchronous probe (just completed) already did the job task_e's
+  // background poll would otherwise redundantly redo against a device
+  // that's since moved on.
+  let _ = usb_probe0_pending_set(0 as u32);
+  let _ = dhruva_prio_unlock(3);
+  let _ = uart_puts("usbhubpowercycle: device0 probe status=");
   let _ = uart_put_hex32(probe_status as u32);
   let _ = uart_puts(" (0=enumerated, nonzero=no response) -- see the per-port 'USB DIAG' lines above for which port(s), if any, now respond\n");
   return 0;
@@ -19175,7 +19341,13 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
   if usb_net_get_kind() == (1 as u32) {
     let mps: u32 = usb_net_get_bulk_out_mps();
     let devaddr: u32 = usb_net_get_devaddr();
-    let chunk_buf: mut ref i64 = dhruva_alloc_bytes(64);
+    // BUG FOUND 2026-11-13 (live real-HW crash, matches "FATAL:
+    // dhruva_alloc_bytes out of memory -- requested 520 bytes" exactly
+    // -- see netif_tx_wrap_scratch_addr's own comment in boot/
+    // scratch_state.S): netif_send_frame is the single egress choke
+    // point for every outgoing frame, so a fresh per-call alloc here
+    // leaks on every DHCP retry/ARP/etc.
+    let chunk_buf: mut ref i64 = netif_tx_chunk_scratch_get();
     let sent: i64 = 0;
     let frame_len_u: u32 = frame_len as u32;
     while sent < frame_len {
@@ -19216,7 +19388,10 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
     let devaddr2: u32 = usb_net_get_devaddr();
     let frame_len_u2: u32 = frame_len as u32;
     let total_len: i64 = frame_len + 8;
-    let wrapped_buf: mut ref i64 = dhruva_alloc_bytes(520);
+    // BUG FOUND 2026-11-13 -- see netif_tx_wrap_scratch_addr's own
+    // comment in boot/scratch_state.S: this exact call site is the
+    // one whose 520-byte request matches the live FATAL's own message.
+    let wrapped_buf: mut ref i64 = netif_tx_wrap_scratch_get();
     let _ = lan9512_build_tx_header(wrapped_buf, frame_len_u2);
     let wi: i64 = 0;
     while wi < frame_len {
@@ -19224,7 +19399,7 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
       let _ = buf_write_byte(wrapped_buf, (8 + wi) as u32, wb);
       wi = wi + 1;
     }
-    let chunk_buf2: mut ref i64 = dhruva_alloc_bytes(64);
+    let chunk_buf2: mut ref i64 = netif_tx_chunk_scratch_get();
     let sent2: i64 = 0;
     while sent2 < total_len {
       let remaining2: i64 = total_len - sent2;
@@ -19483,7 +19658,11 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   if usb_net_get_kind() == (1 as u32) {
     let mps: u32 = usb_net_get_bulk_in_mps();
     let devaddr: u32 = usb_net_get_devaddr();
-    let chunk_buf: mut ref i64 = dhruva_alloc_bytes(64);
+    // BUG FOUND 2026-11-13 -- see netif_rx_chunk_scratch_addr's own
+    // comment in boot/scratch_state.S: netif_recv_frame is the single
+    // ingress funnel, polled continuously, so a fresh per-call alloc
+    // here leaks even faster than the TX-side leak in netif_send_frame.
+    let chunk_buf: mut ref i64 = netif_rx_chunk_scratch_get();
     let total: i64 = 0;
     let done: i64 = 0;
     while done == 0 {
@@ -19538,8 +19717,13 @@ fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
   if usb_net_get_kind() == (2 as u32) {
     let mps3: u32 = usb_net_get_bulk_in_mps();
     let devaddr3: u32 = usb_net_get_devaddr();
-    let chunk_buf3: mut ref i64 = dhruva_alloc_bytes(64);
-    let raw_buf: mut ref i64 = dhruva_alloc_bytes(520);
+    // BUG FOUND 2026-11-13 -- see netif_rx_raw_scratch_addr's own
+    // comment in boot/scratch_state.S: this 520-byte call site is the
+    // likely DOMINANT contributor to the live "FATAL: dhruva_alloc_
+    // bytes out of memory -- requested 520 bytes" crash, since RX
+    // polling runs continuously regardless of whether a frame arrived.
+    let chunk_buf3: mut ref i64 = netif_rx_chunk_scratch_get();
+    let raw_buf: mut ref i64 = netif_rx_raw_scratch_get();
     let raw_total: i64 = 0;
     let done3: i64 = 0;
     while done3 == 0 {
@@ -25071,6 +25255,83 @@ fn dwc2_port_power_on() -> i64 {
   return 0;
 }
 
+// 2026-11-15 (real-HW investigation, user: "why dont you make usb
+// handling more resilient like linux or cutoff power to all usb
+// devices during reset (reset whole hub)"): a genuine root-port VBUS
+// clear-then-set, same request the removed dwc2_root_vbus_power_cycle
+// made on 2026-11-09 -- but that attempt was tested under a confound
+// this same investigation has since root-caused and fixed (see
+// shell_dispatch_usbpowercycle's own 2026-11-14 header comment): it
+// gave dwc2_init() only ~50ms to settle afterward, nowhere near the
+// documented ~0.7s BCM2835 GUSBCFG/GAHBCFG revert window following a
+// PRTPWR-class transition, so the "ineffective AND harmful" verdict
+// recorded back then was never a clean test of whether cutting root
+// VBUS itself can recover a wedged downstream device -- it was a test
+// of a timing bug this driver didn't understand yet. Reintroducing it
+// now with the SAME real ~1.02s off-hold and ~1.02s pre-register-touch
+// settle already proven (dwc2_hub_power_cycle_port, shell_dispatch_
+// usbpowercycle) removes that confound, giving this idea the fair
+// test it never got.
+//
+// Distinct from BOTH other power-cycle mechanisms this investigation
+// has tried: dwc2_hub_power_cycle_port only toggles ONE downstream
+// hub port's claimed (LPSM=1) per-port switch -- real-world evidence
+// (a Raspberry Pi forum report of the same SMSC hub family claiming
+// per-port switching while actually behaving ganged) makes it
+// plausible that bit is aspirational on this exact chip, not a real
+// circuit. usb_power_off/on (shell_dispatch_usbpowercycle) goes
+// through the VideoCore GPU firmware's own mailbox-mediated power
+// domain -- a layer already shown this session to have its own
+// unreliable success-reporting and recovery behavior. This function
+// instead toggles HPRT0.PRTPWR, the SoC's own DWC2 host-controller
+// register that supplies VBUS to WHATEVER is attached to the root
+// port (this board's onboard LAN9512 hub, and therefore every
+// downstream port behind it) -- no GPU firmware round trip, no
+// dependency on the downstream hub's own power-switching circuitry
+// actually working, the most direct real power control this driver
+// has over anything past the SoC's own USB PHY.
+//
+// A real VBUS interruption here is more disruptive than the per-port
+// cycle: it also drops whatever is currently working on the OTHER
+// downstream port (e.g. the onboard LAN9512 Ethernet function shares
+// this same upstream VBUS), so this is deliberately NOT wired into
+// the automatic per-port retry ladder -- it's a last-resort, operator-
+// invoked recovery action (shell_dispatch_usbhubpowercycle below),
+// exactly the "cutoff power to all usb devices... reset whole hub"
+// the user asked for, used only when a single wedged port has already
+// exhausted its own lighter-weight, narrower recovery attempts.
+fn dwc2_root_vbus_power_cycle() -> i64 {
+  let hprt0: i64 = dwc2_hprt0_addr();
+  let w1c_mask: u32 = dwc2_hprt0_w1c_group_mask();
+  let not_w1c_mask: u32 = w1c_mask ^ (0xFFFFFFFF as u32);
+  let not_pwr_bit: u32 = dwc2_hprt0_pwr_bit() ^ (0xFFFFFFFF as u32);
+  // Clear PRTPWR -- a genuine VBUS OFF, not just "don't bother setting
+  // it" (every pre-existing call site in this driver only ever ORs
+  // PRTPWR in, never clears it -- this is the one exception, same
+  // reasoning dwc2_hub_power_cycle_port already established for the
+  // per-port case).
+  let v1: u32 = mmio_read_u32(hprt0);
+  let _ = mmio_write_u32(hprt0, (v1 & not_w1c_mask) & not_pwr_bit);
+  // Real ~1.02s off-hold (3300000 iterations) -- the same real-HW-
+  // derived constant dwc2_hub_power_cycle_port and shell_dispatch_
+  // usbpowercycle both already converged on independently: long enough
+  // that no onboard cap/LDO on anything downstream could plausibly
+  // ride through it without a real brownout.
+  let _ = delay(3300000);
+  // Set PRTPWR again -- VBUS ON.
+  let v2: u32 = mmio_read_u32(hprt0);
+  let _ = mmio_write_u32(hprt0, (v2 & not_w1c_mask) | dwc2_hprt0_pwr_bit());
+  // Same ~1.02s settle BEFORE touching any other DWC2 register -- the
+  // exact fix 2026-11-14's shell_dispatch_usbpowercycle investigation
+  // found missing for the mailbox-level power-on: this PRTPWR
+  // transition has the SAME documented ~0.7s delayed GUSBCFG/GAHBCFG
+  // revert, and the caller is about to run dwc2_init() (whose own
+  // final reassert must be the LAST register write, not raced by a
+  // still-pending revert from THIS transition).
+  let _ = delay(3300000);
+  return 0;
+}
+
 // 2026-11-09 (real-HW USB-wedge investigation): this file used to
 // have a dwc2_root_vbus_power_cycle() here, called unconditionally
 // from dwc2_init() every boot, added to test whether a real HPRT0.
@@ -26499,14 +26760,110 @@ fn dwc2_wait_chan0_done() -> u32 {
 // below, not assumed from a linear scaling guess.
 const NET_BULK_IN_POLL_CAP: i64 = 20000;
 
+// BUG FOUND 2026-11-15 (user: "there should be timeout for scan ... apply
+// to all tools peripherals ... linux scans under 30 sec"): this loop never
+// got the same wall-clock belt-and-suspenders bound dwc2_wait_chan0_done's
+// own 1,000,000-iteration cap got on 2026-11-09 (see that function's header
+// comment) after this board's DVFS governor was confirmed to throttle to
+// 250MHz -- an iteration count alone is not a real-time guarantee once
+// clock speed can change under the loop. Every caller here is a
+// speculative poll inside a larger bounded outer loop (wifi_passive_
+// listen's 300-poll scan, wifi_scan_for_ssid's 150-poll scan, dwc2_net_
+// bulk_in's netif_recv_frame poll) whose own real-world completion time is
+// the SUM of this inner wait's per-call worst case -- without a wall-clock
+// floor here too, throttling can silently blow out every one of those
+// outer budgets the exact same way it would have for the unbounded
+// primitive. Scaled proportionally to max_tries (2us/iteration, the same
+// ratio as the plain function's own 1000000-iters/2000000us budget) so any
+// current or future caller passing a different cap still gets a matching
+// wall-clock floor automatically, rather than a second cap value to keep
+// in sync by hand.
+//
+// BUG FOUND 2026-11-15 continued (THE real-HW "wifi listen" 0/300 root
+// cause, user: "trust me hardware good ... you are missing something"):
+// this function has NEVER had the NAK/ACK-tolerant retry logic its own
+// sibling dwc2_wait_chan0_done got in Task #325 (2026-10-03, see that
+// function's own header comment in full) -- it predates that fix (created
+// 2026-09-17, "Gap F") and was never swept when the fix landed, exactly
+// the gap this project's own "sweep sibling functions after a bugfix"
+// policy exists to catch. Before this fix: ANY nonzero HCINT -- including
+// a lone NAK (bit4) alone, with neither XFERCOMPL nor a hard-error bit set
+// -- made this loop clear the bit and return immediately, which the
+// caller's `(result & 1) == 0` check treats as a hard failure. A NAK on a
+// bulk-IN endpoint is the NORMAL, EXPECTED response when the device has no
+// data queued yet (true on almost every poll of a real radio not
+// synchronized to the exact instant a frame lands in its FIFO) -- so
+// dwc2_wifi_bulk_in's and dwc2_net_bulk_in's "poll" was never actually
+// waiting at all: it issued one IN token, got NAK'd (a sub-microsecond
+// real-bus turnaround), and bailed, over and over, 300 times, without the
+// channel ever being re-armed to retry within that same call. This
+// explains "0/300 raw bulk-IN successes" perfectly and completely
+// independently of the separate dwc2_bulk_pid_data1() encoding bug fixed
+// this same round (that bug affected OUT-direction toggle advancement;
+// this one meant IN never got a real chance to succeed even at the
+// correct initial DATA0=0/PID=0). Confirmed real by the fact that mass
+// storage's/control transfers' bulk-IN -- which goes through the
+// UNBOUNDED dwc2_wait_chan0_done, which DOES retry NAK -- already works on
+// this same board. Ported the exact same classification/retry logic from
+// that sibling (NAK/ACK -> clear+re-arm CHENA+continue; XACTERR -> same,
+// capped at 3 retries same as the sibling; DATATGLERR -> non-fatal re-arm,
+// matching both Linux and RPi's own dwc_otg driver per that sibling's own
+// extensively-cited comment; STALL/AHBERR/BBLERR or any other unrecognized
+// nonzero bit pattern -> genuinely terminal, return immediately), just
+// bounded by THIS function's own caller-supplied max_tries/wall-clock
+// budget instead of the sibling's hardcoded 1,000,000/2s -- a real NAK-
+// retry window (e.g. WIFI_BULK_IN_POLL_CAP's own 20000 tries/~40ms) is now
+// actually spent waiting for a real frame instead of being abandoned on
+// the very first NAK.
 fn dwc2_wait_chan0_done_bounded(max_tries: i64) -> u32 {
   let hcint0: i64 = dwc2_hcint0_addr();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hard_error_mask: u32 = (0x8 as u32) | (0x4 as u32) | (0x80 as u32) | (0x100 as u32); // STALL|AHBERR|XACTERR|BBLERR
+  let xacterr_bit: u32 = 0x80 as u32;
+  let datatglerr_bit: u32 = 0x400 as u32;
+  let chena_bit: u32 = (1 as u32) << (31 as u32);
+  let transient_mask: u32 = (0x10 as u32) | (0x20 as u32); // NAK|ACK
+  let xacterr_count: i64 = 0;
   let tries: i64 = 0;
-  while tries < max_tries {
+  let wcb_t0: u32 = mmio_read_u32(TIMER_CLO);
+  let wcb_budget_us: u32 = (max_tries * 2) as u32;
+  while (tries < max_tries) && (wrapping_sub(mmio_read_u32(TIMER_CLO), wcb_t0) < wcb_budget_us) {
     let hi: u32 = mmio_read_u32(hcint0);
     if hi != (0 as u32) {
-      let _ = mmio_write_u32(hcint0, hi);
-      return hi;
+      if (hi & (1 as u32)) != (0 as u32) {
+        let _ = mmio_write_u32(hcint0, hi);
+        return hi;
+      }
+      if (hi & hard_error_mask) != (0 as u32) {
+        if (hi & hard_error_mask) == xacterr_bit {
+          xacterr_count = xacterr_count + 1;
+          let _ = mmio_write_u32(hcint0, hi);
+          if xacterr_count >= 3 {
+            return hi;
+          }
+          let rearm: u32 = mmio_read_u32(hcchar0) | chena_bit;
+          let _ = mmio_write_u32(hcchar0, rearm);
+        } else {
+          let _ = mmio_write_u32(hcint0, hi);
+          return hi;
+        }
+      } else {
+        if (hi & transient_mask) != (0 as u32) {
+          let _ = mmio_write_u32(hcint0, hi & transient_mask);
+          let rearm_nak: u32 = mmio_read_u32(hcchar0) | chena_bit;
+          let _ = mmio_write_u32(hcchar0, rearm_nak);
+        } else {
+          if (hi & datatglerr_bit) != (0 as u32) {
+            xacterr_count = 0;
+            let _ = mmio_write_u32(hcint0, hi);
+            let rearm_dtg: u32 = mmio_read_u32(hcchar0) | chena_bit;
+            let _ = mmio_write_u32(hcchar0, rearm_dtg);
+          } else {
+            let _ = mmio_write_u32(hcint0, hi);
+            return hi;
+          }
+        }
+      }
     }
     tries = tries + 1;
   }
@@ -26869,6 +27226,22 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let setup_result: u32 = dwc2_wait_chan0_done();
   if (setup_result & (1 as u32)) == (0 as u32) {
+    // 2026-11-15 (real-HW investigation, user: "surely you must be
+    // missing something"): every phase of this function used to
+    // collapse to the same blind `return 0 - 1` on failure -- the
+    // caller-visible "dwc2_control_out status=-1" told us NOTHING
+    // about which of the three phases (SETUP/DATA/STATUS) actually
+    // failed or what the real HCINT bit pattern was. A real-HW capture
+    // showed this chunk-write path failing 5-for-5 on an outer retry
+    // right at a firmware page boundary (offset 4096) with cable and
+    // supply both already confirmed adequate -- this project's own
+    // established "add a diagnostic, capture a real log" discipline
+    // (same one used for every other real-HW-only bug this session)
+    // applies directly: stop guessing from the outside, make the next
+    // failure self-report exactly where and why.
+    let _ = uart_puts("USB DIAG: dwc2_control_out SETUP phase failed, hi=0x");
+    let _ = uart_put_hex32(setup_result);
+    let _ = uart_puts("\n");
     return 0 - 1;
   }
 
@@ -26888,6 +27261,11 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let data_result: u32 = dwc2_wait_chan0_done();
   if (data_result & (1 as u32)) == (0 as u32) {
+    let _ = uart_puts("USB DIAG: dwc2_control_out DATA phase failed, hi=0x");
+    let _ = uart_put_hex32(data_result);
+    let _ = uart_puts(" out_len=");
+    let _ = uart_put_hex32(out_len);
+    let _ = uart_puts("\n");
     return 0 - 1;
   }
 
@@ -26897,6 +27275,9 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
   let status_result: u32 = dwc2_wait_chan0_done();
   if (status_result & (1 as u32)) == (0 as u32) {
+    let _ = uart_puts("USB DIAG: dwc2_control_out STATUS phase failed, hi=0x");
+    let _ = uart_put_hex32(status_result);
+    let _ = uart_puts("\n");
     return 0 - 1;
   }
   return 0;
@@ -26929,9 +27310,13 @@ fn dwc2_build_setup(bm_request_type: u32, b_request: u32, w_value: u32, w_index:
 // where one exists" reasoning as this project's own IPCP/scheduler
 // code, just applied to a hub port instead of a task).
 fn hub_feature_port_enable() -> u32 { return 1 as u32; }
+fn hub_feature_port_suspend() -> u32 { return 2 as u32; }
 fn hub_feature_port_reset() -> u32 { return 4 as u32; }
 fn hub_feature_port_power() -> u32 { return 8 as u32; }
 fn hub_feature_c_port_connection() -> u32 { return 16 as u32; }
+fn hub_feature_c_port_enable() -> u32 { return 17 as u32; }
+fn hub_feature_c_port_suspend() -> u32 { return 18 as u32; }
+fn hub_feature_c_port_over_current() -> u32 { return 19 as u32; }
 fn hub_feature_c_port_reset() -> u32 { return 20 as u32; }
 
 // SET_PORT_FEATURE / CLEAR_PORT_FEATURE / GET_PORT_STATUS -- class-
@@ -27272,7 +27657,7 @@ fn lan9512_reg_read(devaddr: u32, mps: u32, reg_offset: u32) -> u32 {
   let _ = buf_write_byte(dma, 5 as u32, (reg_offset >> (8 as u32)) & (0xFF as u32));
   let _ = buf_write_byte(dma, 6 as u32, 4 as u32);
   let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
-  let out_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let out_buf: mut ref i64 = rtl_lan_reg_scratch_get();
   let status: i64 = dwc2_control_in(devaddr, mps, 4 as u32, out_buf);
   if status != 0 {
     return 0xFFFFFFFF as u32; // sentinel: no real LAN9512 register
@@ -27300,7 +27685,7 @@ fn lan9512_reg_write(devaddr: u32, mps: u32, reg_offset: u32, value: u32) -> i64
   let _ = buf_write_byte(dma, 5 as u32, (reg_offset >> (8 as u32)) & (0xFF as u32));
   let _ = buf_write_byte(dma, 6 as u32, 4 as u32);
   let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
-  let val_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let val_buf: mut ref i64 = rtl_lan_reg_scratch_get();
   let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
   let _ = buf_write_byte(val_buf, 1 as u32, (value >> (8 as u32)) & (0xFF as u32));
   let _ = buf_write_byte(val_buf, 2 as u32, (value >> (16 as u32)) & (0xFF as u32));
@@ -27439,22 +27824,68 @@ fn dwc2_build_rtl_reg_write_setup(reg_addr: u32, data_len: u32) -> i64 {
   return 0;
 }
 
+// BUG FOUND 2026-11-14 (real-HW investigation, user: "i cannot believe
+// this is just hardware issue... 99.99% sure can be fixed in
+// software"): every one of these six functions used to make exactly
+// ONE control-transfer attempt per register access, with the status
+// either discarded entirely by the caller (every write call site in
+// the whole RTL8188CU bring-up path is `let _ = rtl_reg_write...`) or,
+// for reads, collapsed into a 0xFFFFFFFF "failure" sentinel that
+// ALIASES with "every bit set" -- indistinguishable from a genuine
+// all-ones register value to any single-bit poll (`(v & BIT) != 0`).
+// Real-HW sessions this same night saw the RTL8188CU firmware
+// consistently fail to reach WINT_INIT_READY (or even the download
+// checksum) across MULTIPLE consecutive full power-cycles, each one
+// re-running the entire ~15-20-register-write bring-up sequence from
+// scratch with no improvement -- the shape of "one silently-dropped
+// write anywhere in a long unretried sequence leaves the chip
+// half-configured, so it legitimately never reaches readiness," not
+// noise that a bigger timeout would fix. Linux's equivalent path
+// doesn't need per-call retry because its host-controller driver
+// retries transient NAK/bus errors in HARDWARE, transparently, before
+// a failure ever reaches the class driver -- this project's own
+// dwc2_wait_chan0_done has no such transparent layer, so software has
+// to supply the retry instead. The project already found and fixed
+// this exact class of bug once, narrowly, in rtl8188cu_write_firmware_
+// page's own per-chunk retry (2026-10-29) -- that fix was never
+// generalized to the dozens of OTHER single-shot register accesses
+// elsewhere in the same bring-up sequence (power-on, MAC queue setup,
+// 8051 reset/firmware-start, MAC bring-up, channel set). Fixing it
+// here, at the lowest choke point, reusing the exact same already-
+// validated usb_first_contact_retry_count()/_backoff() bounded-retry
+// pattern, covers every call site in the driver at once.
 fn rtl_reg_read8(devaddr: u32, mps: u32, addr: u32) -> u32 {
-  let _ = dwc2_build_rtl_reg_read_setup(addr, 1 as u32);
-  let out_buf: mut ref i64 = dhruva_alloc_bytes(1);
-  let status: i64 = dwc2_control_in(devaddr, mps, 1 as u32, out_buf);
+  let out_buf: mut ref i64 = rtl_lan_reg_scratch_get();
+  let attempt: i64 = 0;
+  let status: i64 = 0 - 1;
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+    if attempt > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt));
+    }
+    let _ = dwc2_build_rtl_reg_read_setup(addr, 1 as u32);
+    status = dwc2_control_in(devaddr, mps, 1 as u32, out_buf);
+    attempt = attempt + 1;
+  }
   if status != 0 {
-    return 0xFFFFFFFF as u32;
+    return 0 as u32;
   }
   return buf_read_byte(out_buf, 0 as u32);
 }
 
 fn rtl_reg_read16(devaddr: u32, mps: u32, addr: u32) -> u32 {
-  let _ = dwc2_build_rtl_reg_read_setup(addr, 2 as u32);
-  let out_buf: mut ref i64 = dhruva_alloc_bytes(2);
-  let status: i64 = dwc2_control_in(devaddr, mps, 2 as u32, out_buf);
+  let out_buf: mut ref i64 = rtl_lan_reg_scratch_get();
+  let attempt: i64 = 0;
+  let status: i64 = 0 - 1;
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+    if attempt > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt));
+    }
+    let _ = dwc2_build_rtl_reg_read_setup(addr, 2 as u32);
+    status = dwc2_control_in(devaddr, mps, 2 as u32, out_buf);
+    attempt = attempt + 1;
+  }
   if status != 0 {
-    return 0xFFFFFFFF as u32;
+    return 0 as u32;
   }
   let b0: u32 = buf_read_byte(out_buf, 0 as u32);
   let b1: u32 = buf_read_byte(out_buf, 1 as u32);
@@ -27462,11 +27893,19 @@ fn rtl_reg_read16(devaddr: u32, mps: u32, addr: u32) -> u32 {
 }
 
 fn rtl_reg_read32(devaddr: u32, mps: u32, addr: u32) -> u32 {
-  let _ = dwc2_build_rtl_reg_read_setup(addr, 4 as u32);
-  let out_buf: mut ref i64 = dhruva_alloc_bytes(4);
-  let status: i64 = dwc2_control_in(devaddr, mps, 4 as u32, out_buf);
+  let out_buf: mut ref i64 = rtl_lan_reg_scratch_get();
+  let attempt: i64 = 0;
+  let status: i64 = 0 - 1;
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+    if attempt > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt));
+    }
+    let _ = dwc2_build_rtl_reg_read_setup(addr, 4 as u32);
+    status = dwc2_control_in(devaddr, mps, 4 as u32, out_buf);
+    attempt = attempt + 1;
+  }
   if status != 0 {
-    return 0xFFFFFFFF as u32;
+    return 0 as u32;
   }
   let b0: u32 = buf_read_byte(out_buf, 0 as u32);
   let b1: u32 = buf_read_byte(out_buf, 1 as u32);
@@ -27476,28 +27915,55 @@ fn rtl_reg_read32(devaddr: u32, mps: u32, addr: u32) -> u32 {
 }
 
 fn rtl_reg_write8(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
-  let _ = dwc2_build_rtl_reg_write_setup(addr, 1 as u32);
-  let val_buf: mut ref i64 = dhruva_alloc_bytes(1);
-  let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
-  return dwc2_control_out(devaddr, mps, val_buf, 1 as u32);
+  let val_buf: mut ref i64 = rtl_lan_reg_scratch_get();
+  let attempt: i64 = 0;
+  let status: i64 = 0 - 1;
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+    if attempt > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt));
+    }
+    let _ = dwc2_build_rtl_reg_write_setup(addr, 1 as u32);
+    let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
+    status = dwc2_control_out(devaddr, mps, val_buf, 1 as u32);
+    attempt = attempt + 1;
+  }
+  return status;
 }
 
 fn rtl_reg_write16(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
-  let _ = dwc2_build_rtl_reg_write_setup(addr, 2 as u32);
-  let val_buf: mut ref i64 = dhruva_alloc_bytes(2);
-  let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
-  let _ = buf_write_byte(val_buf, 1 as u32, (value >> (8 as u32)) & (0xFF as u32));
-  return dwc2_control_out(devaddr, mps, val_buf, 2 as u32);
+  let val_buf: mut ref i64 = rtl_lan_reg_scratch_get();
+  let attempt: i64 = 0;
+  let status: i64 = 0 - 1;
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+    if attempt > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt));
+    }
+    let _ = dwc2_build_rtl_reg_write_setup(addr, 2 as u32);
+    let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
+    let _ = buf_write_byte(val_buf, 1 as u32, (value >> (8 as u32)) & (0xFF as u32));
+    status = dwc2_control_out(devaddr, mps, val_buf, 2 as u32);
+    attempt = attempt + 1;
+  }
+  return status;
 }
 
 fn rtl_reg_write32(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
-  let _ = dwc2_build_rtl_reg_write_setup(addr, 4 as u32);
-  let val_buf: mut ref i64 = dhruva_alloc_bytes(4);
-  let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
-  let _ = buf_write_byte(val_buf, 1 as u32, (value >> (8 as u32)) & (0xFF as u32));
-  let _ = buf_write_byte(val_buf, 2 as u32, (value >> (16 as u32)) & (0xFF as u32));
-  let _ = buf_write_byte(val_buf, 3 as u32, (value >> (24 as u32)) & (0xFF as u32));
-  return dwc2_control_out(devaddr, mps, val_buf, 4 as u32);
+  let val_buf: mut ref i64 = rtl_lan_reg_scratch_get();
+  let attempt: i64 = 0;
+  let status: i64 = 0 - 1;
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+    if attempt > 0 {
+      let _ = delay(usb_first_contact_retry_backoff(attempt));
+    }
+    let _ = dwc2_build_rtl_reg_write_setup(addr, 4 as u32);
+    let _ = buf_write_byte(val_buf, 0 as u32, value & (0xFF as u32));
+    let _ = buf_write_byte(val_buf, 1 as u32, (value >> (8 as u32)) & (0xFF as u32));
+    let _ = buf_write_byte(val_buf, 2 as u32, (value >> (16 as u32)) & (0xFF as u32));
+    let _ = buf_write_byte(val_buf, 3 as u32, (value >> (24 as u32)) & (0xFF as u32));
+    status = dwc2_control_out(devaddr, mps, val_buf, 4 as u32);
+    attempt = attempt + 1;
+  }
+  return status;
 }
 
 // Round 58: USB WiFi bring-up STOPS here, deliberately, right after
@@ -27867,12 +28333,85 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
     }
     let dl_status: i64 = rtl8188cu_download_firmware(devaddr, mps, fw_buf, fw_len);
     if dl_status != 0 {
-      let _ = uart_puts("USB: RTL8188CU firmware download FAILED\n");
-      return 0 - 1;
+      // BUG FOUND 2026-11-14 (real-HW investigation, user: "i cannot
+      // believe this is just hardware issue... 99.99% sure can be
+      // fixed in software"): this used to `return 0 - 1` here,
+      // bailing out of the surrounding 3-attempt retry loop entirely
+      // on the very first chunk-write failure. That defeated the
+      // retry this loop exists for -- a transient real-HW chunk-write
+      // glitch (dwc2_control_out status=-1 on one 128-byte chunk,
+      // confirmed via live capture at several different fw offsets
+      // across different boots/ports, never the same offset twice --
+      // i.e. genuinely transient, not a fixed deterministic failure
+      // point) was being treated as an immediate terminal failure
+      // instead of "try the next attempt," even though every other
+      // failure mode in this exact loop (a WINT_INIT_READY/checksum
+      // poll timeout) already got the full 3 attempts. Every single
+      // real-HW "firmware download FAILED" observed this session
+      // happened on attempt 2 of 3 for exactly this reason: attempt 3
+      // never got a chance to run. Falling through to the loop's own
+      // retry (fw_attempt increments below, fw_ok stays 0) instead of
+      // returning early gives a transient chunk-write glitch the same
+      // second and third chance every other transient failure here
+      // already gets.
+      let _ = uart_puts("USB: RTL8188CU firmware download FAILED (this attempt)\n");
+    } else {
+      let start_status: i64 = rtl8188cu_start_firmware(devaddr, mps);
+      if start_status == 0 {
+        fw_ok = 1;
+      }
     }
-    let start_status: i64 = rtl8188cu_start_firmware(devaddr, mps);
-    if start_status == 0 {
-      fw_ok = 1;
+    // BUG FOUND 2026-11-14 (real-HW investigation, same boot that
+    // finally exercised the attempt-3 fix above): burned through all 3
+    // attempts, and the failure mode got WORSE each time (checksum
+    // timeout -> WINT_INIT_READY timeout -> outright chunk-write
+    // failure) instead of being three independent fresh shots at the
+    // same odds -- the signature of each attempt compounding state the
+    // previous one left behind, not of three unrelated random glitches.
+    // rtl8188cu_download_firmware's own "already running" check (top of
+    // that function) only resets the 8051 when MCU_FW_RAM_SEL is
+    // already set -- true after a firmware that fully started, but
+    // NEVER true after a start_firmware failure (checksum or
+    // WINT_INIT_READY timeout), since the firmware never reached that
+    // state. A half-downloaded blob, or an 8051 left mid-reset by a
+    // start attempt that then timed out, was carrying forward into the
+    // next attempt's download with no cleanup at all. Explicitly
+    // disabling FW_DL and resetting the 8051 after ANY failed attempt
+    // (download OR start) forces every retry to begin from the same
+    // clean slate rtl8188cu_download_firmware already gets on the
+    // very first attempt, instead of layering on whatever the previous
+    // attempt left behind.
+    if fw_ok == 0 {
+      let reg_mcu_fw_dl_cleanup: u32 = 0x0080 as u32;
+      let _ = rtl8188cu_fw_dl_disable(devaddr, mps, reg_mcu_fw_dl_cleanup);
+      let _ = rtl8188cu_reset_8051(devaddr, mps);
+      // BUG FOUND 2026-11-15 (real-HW investigation, same session,
+      // hardware ruled out -- 2.4A supply, short/thick cable, known-
+      // good dongle all confirmed -- user: "there is no excuse now
+      // from hardware side"): this cleanup used to jump straight back
+      // into rtl8188cu_download_firmware() with zero settle time after
+      // reset_8051's own last register write. Real-HW capture showed
+      // the chunk-write failure point getting WORSE each retry (offset
+      // 1408 on attempt 2, offset 0 -- the very FIRST chunk -- on
+      // attempt 3, reproduced identically across two separate boots),
+      // which is the signature of the chip not actually being ready
+      // for USB control-OUT traffic yet, not of random transient
+      // noise. Linux's own equivalent retry is a full user-space
+      // modprobe/re-probe cycle (see this loop's own header comment),
+      // which implicitly re-runs rtl8xxxu_power_on() and the queue
+      // setup on every attempt -- our in-place retry never did either,
+      // relying solely on a bare reset_8051 to leave the chip in the
+      // same state a full fresh probe would. Re-running both here
+      // (both are idempotent on an already-powered chip -- confirmed
+      // by reading each poll condition in rtl8188cu_power_on, every
+      // one tolerates already-satisfied state) plus a real delay(100)
+      // settle (same magnitude this exact driver already uses after
+      // every other analog/CPU-enable transition, e.g. rtl8188cu_
+      // power_on's own delay(100) calls) makes every retry start from
+      // the same state attempt 1 gets, not a worse one.
+      let _ = delay(100);
+      let _ = rtl8188cu_power_on(devaddr, mps);
+      let _ = rtl8188cu_mac_queue_setup(devaddr, mps);
     }
     fw_attempt = fw_attempt + 1;
   }
@@ -28571,24 +29110,47 @@ fn rtl8188cu_reset_8051(devaddr: u32, mps: u32) -> i64 {
   return 0;
 }
 
-// Writes up to 4096 bytes (one "page") of firmware payload to
-// reg_addr, chunked into this chip family's own confirmed writeN_
+// Writes up to 4096 bytes (one "page") of firmware payload starting
+// at reg_addr, chunked into this chip family's own confirmed writeN_
 // block_size (128 bytes, rtl8192cu_fops in Linux's 8192c.c -- shared
 // by RTL8188CU/RTL8188CUS/RTL8191CU/RTL8192CU, confirmed via runtime
 // chip identification in that same source, not assumed from naming
-// alone) via repeated USB control-OUT transfers. EVERY chunk targets
-// the SAME register address -- confirmed directly from the real
-// driver's own rtl8xxxu_writeN call site (addr never incremented on
-// the host side): the chip auto-advances its own internal write
-// pointer after each chunk. usb_wifi_fw_chunk is persistent scratch
-// (boot/usb_wifi_state.S), not a fresh dhruva_alloc_bytes per chunk --
-// this loop runs up to 32 times per page.
+// alone) via repeated USB control-OUT transfers.
+//
+// BUG FOUND 2026-11-15 (real-HW investigation, user: "surely you must
+// be missing something" -- correct): this function used to target
+// the SAME fixed reg_addr for every chunk in the page, on the theory
+// that "the chip auto-advances its own internal write pointer after
+// each chunk." Re-fetching Linux's CURRENT rtl8xxxu_writeN (core.c)
+// directly disproves that: it explicitly does `addr += blocksize;
+// buf += blocksize;` after every successful usb_control_msg in its
+// own chunking loop -- the wValue field of this exact vendor write
+// request (bmRequestType=0x40/bRequest=0x05, matching dwc2_build_rtl_
+// reg_write_setup byte-for-byte) IS the real target byte address in
+// the chip's own FW RAM, which the HOST must advance itself; there is
+// no chip-side auto-increment at all. With the old fixed-address
+// code, every chunk after the first in a page silently overwrote the
+// SAME 128 bytes at reg_addr instead of advancing through the page --
+// the chip only ever received the page's FIRST 128 bytes (repeatedly
+// clobbered by each chunk's own differing data, the last write
+// "winning"), never the other ~3968 bytes of that page. This fully
+// explains every real-HW symptom this whole investigation chased
+// across many boots (checksum timeouts, WINT_INIT_READY timeouts, and
+// chunk-write failures at varying, non-reproducible offsets): the
+// embedded 8051 was never once receiving a correct firmware image, no
+// matter how clean the cable/supply/USB transport was -- a genuine
+// software bug, not hardware margin. Now tracks a running cur_addr,
+// advanced by this_chunk after each successful write, exactly
+// matching Linux's own addr += blocksize. usb_wifi_fw_chunk is
+// persistent scratch (boot/usb_wifi_state.S), not a fresh dhruva_
+// alloc_bytes per chunk -- this loop runs up to 32 times per page.
 fn rtl8188cu_write_firmware_page(devaddr: u32, mps: u32, reg_addr: u32, fw_buf: mut ref i64, base_off: i64, page_len: i64) -> i64 {
   let chunk: mut ref i64 = usb_wifi_fw_chunk_get();
   let done: i64 = 0;
   while done < page_len {
     let remaining: i64 = page_len - done;
     let this_chunk: i64 = if remaining < (128 as i64) { remaining } else { 128 };
+    let cur_addr: u32 = reg_addr + (done as u32);
     let _ = ssh_copy(chunk, 0, fw_buf, base_off + done, this_chunk);
     // Resilience fix (2026-10-29): see usb_first_contact_retry_count's
     // own header comment -- a single transient failure on any one
@@ -28602,7 +29164,7 @@ fn rtl8188cu_write_firmware_page(devaddr: u32, mps: u32, reg_addr: u32, fw_buf: 
       if attempt > 0 {
         let _ = delay(usb_first_contact_retry_backoff(attempt));
       }
-      let _ = dwc2_build_rtl_reg_write_setup(reg_addr, this_chunk as u32);
+      let _ = dwc2_build_rtl_reg_write_setup(cur_addr, this_chunk as u32);
       status = dwc2_control_out(devaddr, mps, chunk, this_chunk as u32);
       attempt = attempt + 1;
     }
@@ -29240,6 +29802,23 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
     let _ = uart_puts("USB: GET_DESCRIPTOR(Configuration) full fetch failed\n");
     return 0 - 1;
   }
+  // DIAGNOSTIC (2026-11-15, "fundamental issue" check): raw bytes,
+  // zero interpretation -- verifies this parser's own bulk_in_ep
+  // conclusion against the device's actual descriptor bytes directly,
+  // rather than trusting downstream behavior to infer whether
+  // identification was correct.
+  if is_wifi == (1 as u32) {
+    let _ = uart_puts("USB: RTL8188CU raw config descriptor (");
+    let _ = uart_put_i64(full_want_len as i64);
+    let _ = uart_puts(" bytes):");
+    let dbi: i64 = 0;
+    while dbi < (full_want_len as i64) {
+      let _ = uart_puts(" ");
+      let _ = uart_put_hex_byte(buf_read_byte(cfgfull, dbi as u32));
+      dbi = dbi + 1;
+    }
+    let _ = uart_puts("\n");
+  }
 
   // Standard USB descriptor-chain traversal: each descriptor names its
   // own bLength (byte 0), so an unrecognized bDescriptorType (a
@@ -29758,24 +30337,62 @@ fn dwc2_fetch_and_set_configuration(devaddr: u32, mps: u32, config_index: u32, i
 // Class Bulk-Only Transport spec) bring-up -- the first live caller
 // of real bulk transfers anywhere in this project. Every control
 // transfer above (dwc2_control_in/no_data) uses a fixed PID encoding
-// specific to endpoint 0/control (see dwc2_pid_setup/data1's own
-// comment); bulk endpoints use the GENERIC non-control PID/DATA-
-// toggle encoding instead (0=DATA0, 1=DATA1 -- not control's 2/3),
-// and unlike a control transfer's fixed per-stage toggle, a bulk
-// endpoint's toggle must keep alternating correctly across every
-// separate transfer for as long as the endpoint stays configured --
-// tracked persistently via usb_msd_state.S, reset to DATA0 the moment
-// SET_CONFIGURATION establishes the endpoint (see the detection block
-// above). Otherwise this reuses dwc2_control_in/no_data's own proven
-// channel-0/HCCHAR/HCTSIZ/HCDMA/dwc2_wait_chan0_done plumbing
-// unchanged -- the DWC2 controller doesn't care whether channel 0 was
-// last used for a control or bulk transfer, only what's programmed
-// into it for the transfer about to be kicked off.
+// specific to endpoint 0/control; bulk endpoints use the shared
+// HCTSIZ PID field's single real encoding instead -- see this
+// function's own 2026-11-15 fix comment below for what that encoding
+// actually is -- and unlike a control transfer's fixed per-stage
+// toggle, a bulk endpoint's toggle must keep alternating correctly
+// across every separate transfer for as long as the endpoint stays
+// configured -- tracked persistently via usb_msd_state.S, reset to
+// DATA0 the moment SET_CONFIGURATION establishes the endpoint (see the
+// detection block above). Otherwise this reuses dwc2_control_in/no_
+// data's own proven channel-0/HCCHAR/HCTSIZ/HCDMA/dwc2_wait_chan0_done
+// plumbing unchanged -- the DWC2 controller doesn't care whether
+// channel 0 was last used for a control or bulk transfer, only what's
+// programmed into it for the transfer about to be kicked off.
+//
+// BUG FOUND 2026-11-15 (real-HW investigation, user: "i feel
+// fundamental issue at play which you may be overlooking" -- found by
+// going back to first principles on the raw HCTSIZ PID field itself,
+// after exhausting every RTL8188CU-specific and WiFi-specific
+// hypothesis). This round's own earlier comment ("0=DATA0, 1=DATA1 --
+// not control's 2/3") was simply WRONG, apparently never actually
+// checked against the real register field encoding when round 33
+// wrote it. The real DWC2 HCTSIZ PID field (bits[30:29], confirmed
+// independently against BOTH Linux's drivers/usb/dwc2/hw.h
+// (TSIZ_SC_MC_PID_DATA0=0/DATA2=1/DATA1=2/MDATA=3) AND U-Boot's own
+// drivers/usb/host/dwc2.h (DWC2_HC_PID_DATA0=0/DATA2=1/DATA1=2) -- two
+// independent driver lineages, same silicon-level encoding, no
+// "control vs bulk" distinction at all) has exactly ONE encoding for
+// every endpoint type: 0=DATA0, 1=DATA2, 2=DATA1, 3=MDATA/SETUP.
+// DATA2/MDATA (values 1/3) are reserved for high-bandwidth
+// isochronous transfers this driver never uses -- a bulk endpoint only
+// ever legitimately toggles between DATA0(0) and DATA1(2). This
+// function's own DATA1 case returned 1 (DATA2's real encoding, not
+// DATA1's) -- every single bulk transfer in the ENTIRE system (this
+// helper has 10 call sites: mass storage, Ethernet, Bluetooth, and
+// WiFi, both IN and OUT) that ever advanced its toggle past the first
+// packet silently programmed an invalid PID for that endpoint class.
+// Confirmed live: a real-HW TX diagnostic this same investigation
+// added (wifi_scan_for_ssid's per-channel bulk-OUT result print)
+// showed channel 1's probe request (toggle still at its initial
+// DATA0/PID=0, correct) complete successfully via XFERCOMPL, then
+// channels 6 and 11 (toggle now flipped to DATA1 by channel 1's own
+// success, PID wrongly sent as 1 instead of 2) both fail outright --
+// toggle only ever advances on a *successful* transfer, so every
+// subsequent attempt stayed stuck on the same wrong PID with zero
+// chance to self-correct. Does not by itself explain every facet of
+// this investigation's separate "0/300 raw bulk-IN successes" result
+// (that poll loop's own toggle never advanced past its correct
+// initial DATA0 either, since it never once succeeded) -- but is a
+// real, independently-confirmed, system-wide correctness bug in its
+// own right, affecting every multi-packet bulk transfer this driver
+// has ever attempted on real hardware.
 fn dwc2_bulk_pid_data0() -> u32 {
   return 0 as u32;
 }
 fn dwc2_bulk_pid_data1() -> u32 {
-  return 1 as u32;
+  return 2 as u32;
 }
 
 // One bulk OUT transfer (host -> device), <= 512 bytes (usb_bulk_
@@ -30192,6 +30809,28 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
   return 0;
 }
 
+// BUG FOUND 2026-11-15 (real-HW investigation, user: "wow the scan
+// takes a very long time. not sure how linux does it quicker"): this
+// function's sibling, dwc2_net_bulk_in, was already fixed (2026-09-17,
+// "Gap F") to use dwc2_wait_chan0_done_bounded(NET_BULK_IN_POLL_CAP)
+// instead of the plain, unbounded dwc2_wait_chan0_done() -- see that
+// constant's own header comment for the full "why": a speculative "is
+// a frame ready right now" poll whose caller already has its own
+// retry-on-nothing-ready contract should NOT eat the full ~2-second/
+// 1,000,000-iteration worst-case wait on every single miss, since a
+// real in-flight transfer that's actually going to succeed completes
+// in microseconds -- the full worst-case budget only ever gets spent
+// on "genuinely nothing to receive," which is the COMMON case for a
+// speculative poll. This fix was never swept to this sibling function
+// (exactly the gap this project's own "sweep sibling functions after
+// a bugfix" policy exists to catch) -- every caller here (wifi_scan_
+// for_ssid's up to 150 polls across 3 channels, wifi_real_join's
+// EAPOL/mgmt poll, wifi_passive_listen) has the IDENTICAL speculative-
+// poll-with-its-own-retry-loop shape as dwc2_net_bulk_in's own callers,
+// so the same bound applies with the same justification. A WiFi AP's
+// probe-response timing is no different from an Ethernet peer's --
+// there was never a reason for this specific sibling to wait longer.
+const WIFI_BULK_IN_POLL_CAP: i64 = 20000; // same value/rationale as NET_BULK_IN_POLL_CAP, named separately since this is a different caller family
 fn dwc2_wifi_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> i64 {
   if mps == (0 as u32) {
     return 0 - 1;
@@ -30213,7 +30852,7 @@ fn dwc2_wifi_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64
   let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
-  let result: u32 = dwc2_wait_chan0_done();
+  let result: u32 = dwc2_wait_chan0_done_bounded(WIFI_BULK_IN_POLL_CAP);
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
@@ -30349,6 +30988,71 @@ const RTL_REG_CR: u32 = 0x0100;
 const RTL_REG_RCR: u32 = 0x0608;
 const RTL_REG_TXPAUSE: u32 = 0x0522;
 const RTL_REG_MACID: u32 = 0x0610;
+const RTL_REG_TRXDMA_CTRL: u32 = 0x010c;
+const RTL_REG_USB_SPECIAL_OPTION: u32 = 0xfe55;
+const RTL_REG_RXFLTMAP0: u32 = 0x06a0; // management-frame per-subtype RX filter
+const RTL_REG_RXFLTMAP2: u32 = 0x06a4; // data-frame per-subtype RX filter
+const RTL_REG_OFDM0_XA_AGC_CORE1: u32 = 0x0c50; // RX path-A AGC initial-gain index, bits[6:0]
+
+// IQ calibration (IQK) register set, ported from Linux's real
+// rtl8xxxu_gen1_phy_iq_calibrate/rtl8xxxu_phy_iqcalibrate/rtl8xxxu_
+// iqk_path_a/rtl8xxxu_fill_iqk_matrix_a (core.c, regs.h, fetched fresh
+// from github.com/torvalds/linux) -- see rtl8188cu_iq_calibrate's own
+// header comment for the full design and why this is scoped to this
+// chip's confirmed rf_paths==1/tx_paths==1 case only (every path-B-
+// only register/branch in the reference is simply never reached by
+// this chip, confirmed via rtl8192cu_identify_chip's own "8188CU"
+// branch setting rf_paths=1/tx_paths=1/rx_paths=1 unconditionally --
+// not an assumption carried over from the LC-calibration port).
+const RTL_REG_GPIO_MUXCFG: u32 = 0x0040;
+const RTL_REG_FPGA0_XA_HSSI_PARM1: u32 = 0x0820;
+const RTL_REG_FPGA0_XB_HSSI_PARM1: u32 = 0x0828;
+const RTL_REG_FPGA0_XA_LSSI_PARM: u32 = 0x0840;
+const RTL_REG_FPGA0_XA_RF_INT_OE: u32 = 0x0860;
+const RTL_REG_FPGA0_XB_RF_INT_OE: u32 = 0x0864;
+const RTL_REG_FPGA0_XCD_SWITCH_CTRL: u32 = 0x085c;
+const RTL_REG_FPGA0_XAB_RF_SW_CTRL: u32 = 0x0870;
+const RTL_REG_FPGA0_XCD_RF_SW_CTRL: u32 = 0x0874;
+const RTL_REG_FPGA0_RF_MODE: u32 = 0x0800;
+const RTL_REG_BEACON_CTRL: u32 = 0x0550;
+const RTL_REG_BEACON_CTRL_1: u32 = 0x0551;
+const RTL_REG_OFDM0_TRX_PATH_ENABLE: u32 = 0x0c04;
+const RTL_REG_OFDM0_TR_MUX_PAR: u32 = 0x0c08;
+const RTL_REG_OFDM0_XA_RX_IQ_IMBALANCE: u32 = 0x0c14;
+const RTL_REG_OFDM0_ENERGY_CCA_THRES: u32 = 0x0c4c;
+const RTL_REG_OFDM0_XA_TX_IQ_IMBALANCE: u32 = 0x0c80;
+const RTL_REG_OFDM0_XC_TX_AFE: u32 = 0x0c94;
+const RTL_REG_OFDM0_RX_IQ_EXT_ANTA: u32 = 0x0ca0;
+const RTL_REG_CONFIG_ANT_A: u32 = 0x0b68;
+const RTL_REG_CONFIG_ANT_B: u32 = 0x0b6c;
+const RTL_REG_FPGA0_IQK: u32 = 0x0e28;
+const RTL_REG_TX_IQK_TONE_A: u32 = 0x0e30;
+const RTL_REG_RX_IQK_TONE_A: u32 = 0x0e34;
+const RTL_REG_TX_IQK_PI_A: u32 = 0x0e38;
+const RTL_REG_RX_IQK_PI_A: u32 = 0x0e3c;
+const RTL_REG_TX_IQK: u32 = 0x0e40;
+const RTL_REG_RX_IQK: u32 = 0x0e44;
+const RTL_REG_IQK_AGC_PTS: u32 = 0x0e48;
+const RTL_REG_IQK_AGC_RSP: u32 = 0x0e4c;
+const RTL_REG_BLUETOOTH: u32 = 0x0e6c;
+const RTL_REG_RX_WAIT_CCA: u32 = 0x0e70;
+const RTL_REG_TX_CCK_RFON: u32 = 0x0e74;
+const RTL_REG_TX_CCK_BBON: u32 = 0x0e78;
+const RTL_REG_TX_OFDM_RFON: u32 = 0x0e7c;
+const RTL_REG_TX_OFDM_BBON: u32 = 0x0e80;
+const RTL_REG_TX_TO_RX: u32 = 0x0e84;
+const RTL_REG_TX_TO_TX: u32 = 0x0e88;
+const RTL_REG_RX_CCK: u32 = 0x0e8c;
+const RTL_REG_TX_POWER_BEFORE_IQK_A: u32 = 0x0e94;
+const RTL_REG_TX_POWER_AFTER_IQK_A: u32 = 0x0e9c;
+const RTL_REG_RX_POWER_BEFORE_IQK_A_2: u32 = 0x0ea4;
+const RTL_REG_RX_POWER_AFTER_IQK_A_2: u32 = 0x0eac;
+const RTL_REG_RX_OFDM: u32 = 0x0ed0;
+const RTL_REG_RX_WAIT_RIFS: u32 = 0x0ed4;
+const RTL_REG_RX_TO_RX: u32 = 0x0ed8;
+const RTL_REG_STANDBY: u32 = 0x0edc;
+const RTL_REG_SLEEP: u32 = 0x0ee0;
+const RTL_REG_PMPD_ANAEN: u32 = 0x0eec;
 const RTL_TX_TOTAL_PAGE_NUM: i64 = 0xf8;
 
 // One LLT (Link List Table) entry write -- the on-chip TX packet-
@@ -30437,12 +31141,17 @@ fn rtl8188cu_llt_table_init(devaddr: u32, mps: u32) -> i64 {
 // data. A single 32-bit write is the whole transaction (no separate
 // trigger/strobe bit for writes, unlike reads below), followed by
 // `udelay(1)` in the reference driver.
+// BUG FOUND 2026-11-15 (found while adding failure-counting to the new BB/
+// AGC/RF phy table loaders above -- this function's own inner write status
+// was being unconditionally discarded, so a real USB transfer failure here
+// could never be observed by any caller, including the new RF table loader
+// this same investigation just added. Now propagates the real status.
 fn rtl_rf_reg_write(devaddr: u32, mps: u32, reg: u32, data: u32) -> i64 {
   let data_masked: u32 = data & (0x000fffff as u32);
   let dataaddr: u32 = ((reg as i64) << 20) as u32 | data_masked;
-  let _ = rtl_reg_write32(devaddr, mps, 0x0840 as u32, dataaddr);
+  let status: i64 = rtl_reg_write32(devaddr, mps, 0x0840 as u32, dataaddr);
   let _ = delay(1);
-  return 0;
+  return status;
 }
 
 // Indirect RF-path register read (`rtl8xxxu_read_rfreg`, path A only,
@@ -30522,6 +31231,69 @@ fn rtl8188cu_clear_txpause(devaddr: u32, mps: u32) -> i64 {
   return 0;
 }
 
+// BUG FOUND 2026-11-13 (real-HW investigation continued after LC-cal
+// AND IQK both shipped and STILL 0/300 raw bulk-IN successes on
+// channel 11, with a real neighboring AP now CONFIRMED broadcasting
+// continuously on exactly that channel, SSID broadcast enabled,
+// antenna confirmed connected -- ruling out every environment-level
+// explanation this project could ask the user to check). Found by
+// going back to Linux's real rtl8xxxu_init_device (core.c) and
+// listing every step it takes that this driver had not yet ported,
+// rather than re-auditing steps already ported twice over: it calls
+// `fops->init_aggregation(priv)` (rtl8xxxu_gen1_init_aggregation for
+// every gen1 chip including this one, confirmed via rtl8192cu_fops's
+// own table) unconditionally, every single boot, regardless of
+// whether USB RX aggregation ends up enabled or disabled -- a step
+// this driver never had any equivalent of at all (confirmed by
+// grepping this entire file for RXDMA_AGG/TRXDMA_CTRL/
+// USB_SPECIAL_OPTION before writing this: zero hits anywhere).
+//
+// Why this plausibly explains a HARD zero rather than just degraded
+// throughput: REG_TRXDMA_CTRL's own RXDMA_AGG_EN bit (BIT(2)) and
+// REG_USB_SPECIAL_OPTION's own USB_AGG_ENABLE bit (BIT(3)) are never
+// written by any other function in this driver, so they sit at
+// whatever power-on-reset default this silicon has -- never verified
+// to be "aggregation off" by this project, and the reference driver
+// itself clearly does not trust that default either (it writes both
+// bits EVERY boot, even in the disabled-aggregation branch). If RX
+// aggregation is enabled at reset, the chip's own MAC/firmware holds
+// received frames in an internal buffer and only flushes them across
+// the bulk-IN endpoint once a page-count threshold or timeout fires
+// (REG_RXDMA_AGG_PG_TH and its own +1 timeout byte, REG_USB_DMA_AGG_
+// TO) -- registers this driver also never configures. A single
+// beacon or probe response is far too small to ever cross a
+// thresh-by-byte-count trigger on its own, and with no timeout
+// configured either, the chip would have no path to ever flush a
+// lone small frame to the host at all -- indistinguishable from "the
+// USB transaction never even started" at the dwc2_wait_chan0_done
+// level (hi stays 0x00000000 for the full ~500ms/poll budget), which
+// is exactly today's symptom, on every single poll, regardless of
+// real over-the-air traffic.
+//
+// Matches the upstream default rather than the aggregation-enabled
+// branch: `static bool rtl8xxxu_dma_aggregation;` (core.c) is an
+// uninitialized file-scope bool, which C zero-initializes to false --
+// the overwhelming real-world default (the module parameter exists
+// for an admin to opt IN, not something any distro enables by
+// default) -- so this ports ONLY rtl8xxxu_gen1_init_aggregation's own
+// `if (!rtl8xxxu_dma_aggregation) { ...; return; }` branch: clear
+// USB_SPEC_USB_AGG_ENABLE in REG_USB_SPECIAL_OPTION, clear RXDMA_AGG_
+// EN in REG_TRXDMA_CTRL, done -- the page-threshold/timeout math
+// further down that reference function is dead code on this path
+// (the early `return` skips it) and is not ported.
+fn rtl8188cu_init_aggregation(devaddr: u32, mps: u32) -> i64 {
+  let usb_agg_enable: u32 = (1 << 3) as u32;
+  let usb_spec: u32 = rtl_reg_read8(devaddr, mps, RTL_REG_USB_SPECIAL_OPTION);
+  let usb_spec_cleared: u32 = usb_spec & (usb_agg_enable ^ (0xFFFFFFFF as u32));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_USB_SPECIAL_OPTION, usb_spec_cleared);
+
+  let rxdma_agg_en: u32 = (1 << 2) as u32;
+  let agg_ctrl: u32 = rtl_reg_read8(devaddr, mps, RTL_REG_TRXDMA_CTRL);
+  let agg_ctrl_cleared: u32 = agg_ctrl & (rxdma_agg_en ^ (0xFFFFFFFF as u32));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_TRXDMA_CTRL, agg_ctrl_cleared);
+  return 0;
+}
+
 fn rtl8188cu_set_mac_addr(devaddr: u32, mps: u32, mac: mut ref i64) -> i64 {
   let i: i64 = 0;
   while i < 6 {
@@ -30531,6 +31303,572 @@ fn rtl8188cu_set_mac_addr(devaddr: u32, mps: u32, mac: mut ref i64) -> i64 {
   }
   return 0;
 }
+
+// Baseband register initialization table, ported VERBATIM from Linux's
+// rtl8723a_phy_1t_init_table (drivers/net/wireless/realtek/rtl8xxxu/core.c,
+// fetched fresh this session), applied by rtl8xxxu_gen1_init_phy_bb via
+// rtl8xxxu_init_phy_regs for every tx_paths==1, non-hi_pa chip -- this
+// chip's own confirmed configuration (rtl8192cu_identify_chip's "8188CU"
+// branch: rf_paths=1/tx_paths=1/rx_paths=1, hi_pa never set for this SKU).
+//
+// BUG FOUND 2026-11-15 (THE large real-HW finding this investigation was
+// missing entirely): this driver has NEVER called any equivalent of
+// rtl8xxxu_init_phy_bb/init_phy_rf at all (confirmed by grepping this whole
+// file for every symbol in those two reference functions before writing
+// this). Every baseband/RF register this project's own prior rounds
+// configured (RCR, RXFLTMAP, AGC-IGI, CCK/OFDM-enable, TX-path-enable bit,
+// channel/SIFS) were isolated, hand-picked patches layered on top of
+// whatever power-on-reset state the silicon happened to have for every
+// OTHER baseband register this table configures -- confirmed concretely by
+// a live register dump this same round: REG_OFDM0_TRX_PATH_ENABLE read back
+// as 0x0F00000F on real hardware, while this table's own entry for that
+// exact register is 0x03a05611 -- neither the upper 24 bits nor even the
+// low byte matches, proving this register (and by direct implication,
+// essentially every other one only this table touches) was never brought
+// to its real required operating value.
+//
+// 2026-11-15 FOLLOW-UP (same round): after porting this table + the AGC/RF
+// tables below and deploying, the live REG_OFDM0_TRX_PATH_ENABLE readback
+// STILL showed 0x0F00000F unchanged, and the bulk-IN NAK activity that was
+// previously observed (nak_count>500/5000 tries) dropped to a flat zero --
+// strong evidence these writes are silently failing (every rtl_reg_write32
+// call's own status return was being discarded with `let _ =`) rather than
+// actually landing, and that ~490 failing control transfers issued back to
+// back may itself be what pushed channel 0 into the new flat-silent state.
+// Now returns a fail count instead of a constant 0 so the caller can log
+// real pass/fail evidence instead of assuming success.
+fn rtl8188cu_load_bb_table(devaddr: u32, mps: u32) -> i64 {
+  let fail_count: i64 = 0;
+  if rtl_reg_write32(devaddr, mps, 0x800 as u32, 0x80040000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x804 as u32, 0x00000003 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x808 as u32, 0x0000fc00 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x80c as u32, 0x0000000a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x810 as u32, 0x10001331 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x814 as u32, 0x020c3d10 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x818 as u32, 0x02200385 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x81c as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x820 as u32, 0x01000100 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x824 as u32, 0x00390004 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x828 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x82c as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x830 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x834 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x838 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x83c as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x840 as u32, 0x00010000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x844 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x848 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x84c as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x850 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x854 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x858 as u32, 0x569a569a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x85c as u32, 0x001b25a4 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x860 as u32, 0x66f60110 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x864 as u32, 0x061f0130 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x868 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x86c as u32, 0x32323200 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x870 as u32, 0x07000760 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x874 as u32, 0x22004000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x878 as u32, 0x00000808 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x87c as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x880 as u32, 0xc0083070 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x884 as u32, 0x000004d5 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x888 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x88c as u32, 0xccc000c0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x890 as u32, 0x00000800 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x894 as u32, 0xfffffffe as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x898 as u32, 0x40302010 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x89c as u32, 0x00706050 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x900 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x904 as u32, 0x00000023 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x908 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0x90c as u32, 0x81121111 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa00 as u32, 0x00d047c8 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa04 as u32, 0x80ff000c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa08 as u32, 0x8c838300 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa0c as u32, 0x2e68120f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa10 as u32, 0x9500bb78 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa14 as u32, 0x11144028 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa18 as u32, 0x00881117 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa1c as u32, 0x89140f00 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa20 as u32, 0x1a1b0000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa24 as u32, 0x090e1317 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa28 as u32, 0x00000204 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa2c as u32, 0x00d30000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa70 as u32, 0x101fbf00 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa74 as u32, 0x00000007 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xa78 as u32, 0x00000900 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc00 as u32, 0x48071d40 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc04 as u32, 0x03a05611 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc08 as u32, 0x000000e4 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc0c as u32, 0x6c6c6c6c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc10 as u32, 0x08800000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc14 as u32, 0x40000100 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc18 as u32, 0x08800000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc1c as u32, 0x40000100 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc20 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc24 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc28 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc2c as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc30 as u32, 0x69e9ac44 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc34 as u32, 0x469652af as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc38 as u32, 0x49795994 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc3c as u32, 0x0a97971c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc40 as u32, 0x1f7c403f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc44 as u32, 0x000100b7 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc48 as u32, 0xec020107 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc4c as u32, 0x007f037f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc50 as u32, 0x69543420 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc54 as u32, 0x43bc0094 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc58 as u32, 0x69543420 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc5c as u32, 0x433c0094 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc60 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc64 as u32, 0x7112848b as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc68 as u32, 0x47c00bff as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc6c as u32, 0x00000036 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc70 as u32, 0x2c7f000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc74 as u32, 0x018610db as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x0000001f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc7c as u32, 0x00b91612 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc80 as u32, 0x40000100 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc84 as u32, 0x20f60000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc88 as u32, 0x40000100 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc8c as u32, 0x20200000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc90 as u32, 0x00121820 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc94 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc98 as u32, 0x00121820 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc9c as u32, 0x00007f7f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xca0 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xca4 as u32, 0x00000080 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xca8 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcac as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcb0 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcb4 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcb8 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcbc as u32, 0x28000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcc0 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcc4 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcc8 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xccc as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcd0 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcd4 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcd8 as u32, 0x64b22427 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcdc as u32, 0x00766932 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xce0 as u32, 0x00222222 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xce4 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xce8 as u32, 0x37644302 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xcec as u32, 0x2f97d40c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd00 as u32, 0x00080740 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd04 as u32, 0x00020401 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd08 as u32, 0x0000907f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd0c as u32, 0x20010201 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd10 as u32, 0xa0633333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd14 as u32, 0x3333bc43 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd18 as u32, 0x7a8f5b6b as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd2c as u32, 0xcc979975 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd30 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd34 as u32, 0x80608000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd38 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd3c as u32, 0x00027293 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd40 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd44 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd48 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd4c as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd50 as u32, 0x6437140a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd54 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd58 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd5c as u32, 0x30032064 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd60 as u32, 0x4653de68 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd64 as u32, 0x04518a3c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd68 as u32, 0x00002101 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd6c as u32, 0x2a201c16 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd70 as u32, 0x1812362e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd74 as u32, 0x322c2220 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xd78 as u32, 0x000e3c24 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe00 as u32, 0x2a2a2a2a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe04 as u32, 0x2a2a2a2a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe08 as u32, 0x03902a2a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe10 as u32, 0x2a2a2a2a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe14 as u32, 0x2a2a2a2a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe18 as u32, 0x2a2a2a2a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe1c as u32, 0x2a2a2a2a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe28 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe30 as u32, 0x1000dc1f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe34 as u32, 0x10008c1f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe38 as u32, 0x02140102 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe3c as u32, 0x681604c2 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe40 as u32, 0x01007c00 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe44 as u32, 0x01004800 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe48 as u32, 0xfb000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe4c as u32, 0x000028d1 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe50 as u32, 0x1000dc1f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe54 as u32, 0x10008c1f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe58 as u32, 0x02140102 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe5c as u32, 0x28160d05 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe60 as u32, 0x00000008 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe68 as u32, 0x001b25a4 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe6c as u32, 0x631b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe70 as u32, 0x631b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe74 as u32, 0x081b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe78 as u32, 0x081b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe7c as u32, 0x081b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe80 as u32, 0x081b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe84 as u32, 0x631b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe88 as u32, 0x081b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xe8c as u32, 0x631b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xed0 as u32, 0x631b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xed4 as u32, 0x631b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xed8 as u32, 0x631b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xedc as u32, 0x001b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xee0 as u32, 0x001b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xeec as u32, 0x6b1b25a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xf14 as u32, 0x00000003 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xf4c as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xf00 as u32, 0x00000300 as u32) != 0 { fail_count = fail_count + 1; }
+  return fail_count;
+}
+
+// AGC (Automatic Gain Control) RSSI-to-gain lookup table, ported VERBATIM
+// from Linux's rtl8xxxu_agc_standard_table (core.c) -- every entry targets
+// the SAME register, REG_OFDM0_AGCRSSITABLE (0x0c78), which acts as a
+// sequential "table write port": each write pushes one more row into an
+// internal gain-vs-RSSI curve the chip's own AGC hardware consults at
+// runtime, not a single static value -- this project's own earlier AGC-IGI
+// fix (a single masked write to REG_OFDM0_XA_AGC_CORE1, a DIFFERENT
+// register, 0x0c50) only ever set ONE starting gain index; it never loaded
+// this table at all, leaving the AGC's own full operating curve unconfigured.
+// Applied by rtl8xxxu_gen1_init_phy_bb immediately after the BB table above,
+// in the exact same order, for the non-hi_pa branch this chip always takes.
+// Returns a fail count -- see rtl8188cu_load_bb_table's own follow-up note.
+fn rtl8188cu_load_agc_table(devaddr: u32, mps: u32) -> i64 {
+  let fail_count: i64 = 0;
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b000001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b010001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b020001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b030001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b040001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b050001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7a060001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x79070001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x78080001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x77090001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x760a0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x750b0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x740c0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x730d0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x720e0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x710f0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x70100001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6f110001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6e120001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6d130001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6c140001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6b150001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6a160001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x69170001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x68180001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x67190001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x661a0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x651b0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x641c0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x631d0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x621e0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x611f0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x60200001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x49210001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x48220001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x47230001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x46240001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x45250001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x44260001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x43270001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x42280001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x41290001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x402a0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x262b0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x252c0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x242d0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x232e0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x222f0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x21300001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x20310001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x06320001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x05330001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x04340001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x03350001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x02360001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x01370001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x00380001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x00390001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x003a0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x003b0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x003c0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x003d0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x003e0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x003f0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b400001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b410001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b420001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b430001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b440001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7b450001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x7a460001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x79470001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x78480001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x77490001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x764a0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x754b0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x744c0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x734d0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x724e0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x714f0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x70500001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6f510001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6e520001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6d530001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6c540001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6b550001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6a560001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x69570001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x68580001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x67590001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x665a0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x655b0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x645c0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x635d0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x625e0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x615f0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x60600001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x49610001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x48620001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x47630001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x46640001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x45650001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x44660001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x43670001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x42680001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x41690001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x406a0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x266b0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x256c0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x246d0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x236e0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x226f0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x21700001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x20710001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x06720001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x05730001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x04740001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x03750001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x02760001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x01770001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x00780001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x00790001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x007a0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x007b0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x007c0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x007d0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x007e0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x007f0001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3800001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3801001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3802001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3803001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3804001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3805001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3806001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3807001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3808001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3c09001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x3e0a001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x400b001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x440c001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x480d001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x4c0e001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x500f001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x5210001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x5611001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x5a12001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x5e13001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6014001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6015001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6016001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6217001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6218001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x6219001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x621a001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x621b001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x621c001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x621d001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x621e001e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_reg_write32(devaddr, mps, 0xc78 as u32, 0x621f001e as u32) != 0 { fail_count = fail_count + 1; }
+  return fail_count;
+}
+
+// RF (RF6052 synthesizer/front-end) register initialization table for path
+// A, ported VERBATIM from Linux's rtl8192cu_radioa_1t_init_table
+// (drivers/net/wireless/realtek/rtl8xxxu/8192c.c, fetched fresh this
+// session) -- the table rtl8192cu_init_phy_rf selects for this exact chip
+// (RTL8188CU, rf_paths==1, not RTL8188R/hi_pa). Applied via rtl8xxxu_init_rf_
+// regs, which writes each (reg,val) pair through the SAME RF-register
+// write path this driver's rtl_rf_reg_write already implements and uses
+// elsewhere (channel select, LC calibration) -- confirmed correct and
+// working for those callers, so no new RF-access primitive is needed here.
+// Four entries in this exact table use the reference's own sentinel reg
+// value 0xfe ("msleep(50)", value ignored) instead of a real register --
+// translated to this project's own delay() convention (3220 units/ms,
+// matching rtl8188cu_lc_calibrate's and rtl8188cu_iqk_path_a's own already-
+// established mdelay/udelay scaling) rather than a real RF register write.
+// Returns a fail count -- see rtl8188cu_load_bb_table's own follow-up note
+// (rtl_rf_reg_write's own return convention mirrors rtl_reg_write32's).
+fn rtl8188cu_load_rf_table(devaddr: u32, mps: u32) -> i64 {
+  let fail_count: i64 = 0;
+  if rtl_rf_reg_write(devaddr, mps, 0x00 as u32, 0x00030159 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x01 as u32, 0x00031284 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x02 as u32, 0x00098000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x03 as u32, 0x00018c63 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x04 as u32, 0x000210e7 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x09 as u32, 0x0002044f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x0a as u32, 0x0001adb1 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x0b as u32, 0x00054867 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x0c as u32, 0x0008992e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x0d as u32, 0x0000e52c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x0e as u32, 0x00039ce7 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x0f as u32, 0x00000451 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x19 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x1a as u32, 0x00010255 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x1b as u32, 0x00060a00 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x1c as u32, 0x000fc378 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x1d as u32, 0x000a1250 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x1e as u32, 0x0004445f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x1f as u32, 0x00080001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x20 as u32, 0x0000b614 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x21 as u32, 0x0006c000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x22 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x23 as u32, 0x00001558 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x24 as u32, 0x00000060 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x25 as u32, 0x00000483 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x26 as u32, 0x0004f000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x27 as u32, 0x000ec7d9 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x28 as u32, 0x000577c0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x29 as u32, 0x00004783 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00021334 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00000054 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000001 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00000808 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00053333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000002 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00000808 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0005b333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000003 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00000808 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00063333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000004 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00000808 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0006b333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000005 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00000808 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00073333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000006 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00000709 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0005b333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000007 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00000709 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00063333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000008 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0000060a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0004b333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x00000009 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0000060a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00053333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x0000000a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0000060a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0005b333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x0000000b as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0000060a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00063333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x0000000c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0000060a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0006b333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0000060a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00073333 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000000d as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x0000000e as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x0000050b as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2b as u32, 0x00066666 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2c as u32, 0x0000001a as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x2a as u32, 0x000e0000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x10 as u32, 0x0004000f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x11 as u32, 0x000e31fc as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x10 as u32, 0x0006000f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x11 as u32, 0x000ff9f8 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x10 as u32, 0x0002000f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x11 as u32, 0x000203f9 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x10 as u32, 0x0003000f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x11 as u32, 0x000ff500 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x10 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x11 as u32, 0x00000000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x10 as u32, 0x0008000f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x11 as u32, 0x0003f100 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x10 as u32, 0x0009000f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x11 as u32, 0x00023100 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x12 as u32, 0x00032000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x12 as u32, 0x00071000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x12 as u32, 0x000b0000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x12 as u32, 0x000fc000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x000287b3 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x000244b7 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x000204ab as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x0001c49f as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x00018493 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x0001429b as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x00010299 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x0000c29c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x000081a0 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x000040ac as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x13 as u32, 0x00000020 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x14 as u32, 0x0001944c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x14 as u32, 0x00059444 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x14 as u32, 0x0009944c as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x14 as u32, 0x000d9444 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x15 as u32, 0x0000f405 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x15 as u32, 0x0004f405 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x15 as u32, 0x0008f405 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x15 as u32, 0x000cf405 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x16 as u32, 0x000e0330 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x16 as u32, 0x000a0330 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x16 as u32, 0x00060330 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x16 as u32, 0x00020330 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x00 as u32, 0x00010159 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x18 as u32, 0x0000f401 as u32) != 0 { fail_count = fail_count + 1; }
+  let _ = delay(161000); // msleep(50)
+  let _ = delay(161000); // msleep(50)
+  if rtl_rf_reg_write(devaddr, mps, 0x1f as u32, 0x00080003 as u32) != 0 { fail_count = fail_count + 1; }
+  let _ = delay(161000); // msleep(50)
+  let _ = delay(161000); // msleep(50)
+  if rtl_rf_reg_write(devaddr, mps, 0x1e as u32, 0x00044457 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x1f as u32, 0x00080000 as u32) != 0 { fail_count = fail_count + 1; }
+  if rtl_rf_reg_write(devaddr, mps, 0x00 as u32, 0x00030159 as u32) != 0 { fail_count = fail_count + 1; }
+  return fail_count;
+}
+
+
+
 
 // RF-path enable (`rtl8xxxu_gen1_enable_rf`) -- required before the
 // radio will pass any real signal on either TX or RX, in addition to
@@ -30722,21 +32060,73 @@ fn rtl8188cu_set_channel_self_test() -> i64 {
 // whatever channel the target BSSID is actually on (discovered via
 // scanning or supplied by the caller), not a value this function could
 // guess. Caller's own responsibility to call rtl8188cu_set_channel
-// after this returns, before expecting to see any real traffic. Still
-// deliberately NOT included: IQ/LC RF calibration, genuinely chip-
-// instance/efuse-dependent rather than a fixed public constant.
+// after this returns, before expecting to see any real traffic.
+//
+// CORRECTION 2026-11-13: the claim this comment used to make here --
+// "IQ/LC RF calibration... genuinely chip-instance/efuse-dependent
+// rather than a fixed public constant" -- does not hold up against
+// Linux's own rtl8723a_phy_lc_calibrate (core.c): it is a SELF-
+// CONTAINED runtime procedure (read RF6052_REG_MODE_AG, set the LC_
+// CAL bit, sleep 100ms, restore TXPAUSE) using only registers this
+// driver already has working read/write primitives for (rtl_rf_reg_
+// read/write, rtl_reg_read8/write8) -- no stored per-chip EFUSE table
+// is read anywhere in it. LC calibration is now ported below
+// (rtl8188cu_lc_calibrate) -- found, after the CCK/OFDM fix alone
+// still left `wifi listen` hearing zero frames on a clean boot, to be
+// the more likely remaining cause of total RX silence: an uncalibrated
+// LC tank can leave the local oscillator meaningfully off-frequency
+// (manufacturing variance per chip instance, which is EXACTLY why the
+// real driver always self-calibrates it at runtime rather than trusting
+// a fixed value), which would explain hearing NOTHING at all rather
+// than just degraded range -- unlike IQ calibration (also self-
+// contained, not yet ported, same correction to its own "efuse-
+// dependent" characterization applies) which mainly affects image-
+// rejection/EVM quality, a much less likely explanation for a hard
+// zero. IQK deliberately deferred pending this LC-cal result: it is
+// a substantially larger, two-path-aware port (ADDA/MAC/BB register
+// backup-restore, two full calibration passes, candidate selection)
+// that cannot be validated under QEMU (no RTL8188CU device model
+// exists there) and is costly to get wrong given each real-HW retest
+// costs a full reboot cycle -- worth doing next if LC cal alone
+// doesn't resolve the zero-reception symptom, not worth the
+// transcription risk before that result is in.
 fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   let llt_status: i64 = rtl8188cu_llt_table_init(devaddr, mps);
   if llt_status != 0 {
     let _ = uart_puts("USB: RTL8188CU LLT table init FAILED\n");
     return 0 - 1;
   }
+  // BUG FOUND 2026-11-15: real Linux calls rtl8xxxu_init_phy_bb/init_phy_rf
+  // (loading the BB/AGC/RF tables above) from init_device() right after its
+  // own init_mac step (LLT/queue setup, matching this driver's llt_table_
+  // init immediately above) and well BEFORE RCR/enable_rf/aggregation --
+  // placed here to match that exact ordering, see rtl8188cu_load_bb_table's
+  // own header comment for the full finding.
+  let bb_fail: i64 = rtl8188cu_load_bb_table(devaddr, mps);
+  let bb_readback: u32 = rtl_reg_read32(devaddr, mps, 0x0c04 as u32);
+  let agc_fail: i64 = rtl8188cu_load_agc_table(devaddr, mps);
+  let rf_fail: i64 = rtl8188cu_load_rf_table(devaddr, mps);
+  let _ = uart_puts("USB: RTL8188CU BB/AGC/RF phy tables loaded, bb_fail=");
+  let _ = uart_put_i64(bb_fail);
+  let _ = uart_puts(" agc_fail=");
+  let _ = uart_put_i64(agc_fail);
+  let _ = uart_puts(" rf_fail=");
+  let _ = uart_put_i64(rf_fail);
+  let _ = uart_puts(" bb_readback(0x0c04, expect ~0x03a05611)=0x");
+  let _ = uart_put_hex32(bb_readback);
+  let _ = uart_puts("\n");
   let _ = rtl8188cu_enable_engines(devaddr, mps);
   let _ = rtl8188cu_set_rcr(devaddr, mps);
   let mac_buf: mut ref i64 = dhruva_alloc_bytes(6);
   let _ = netif_get_mac(mac_buf);
   let _ = rtl8188cu_set_mac_addr(devaddr, mps, mac_buf);
   let _ = rtl8188cu_enable_rf(devaddr, mps);
+  // BUG FOUND 2026-11-13: see rtl8188cu_init_aggregation's own header
+  // comment -- disables USB RX DMA aggregation (never configured by
+  // this driver before now), the current leading candidate for "0/300
+  // raw bulk-IN successes" persisting even with a confirmed-live AP
+  // on the configured channel.
+  let _ = rtl8188cu_init_aggregation(devaddr, mps);
   // BUG FOUND 2026-11-12 (real-HW investigation, "wifi listen" heard
   // zero management frames across 300 polls on a clean, error-free
   // boot -- firmware loaded, MAC bring-up reported complete, RCR/
@@ -30772,7 +32162,680 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   let fpga_rf_mode_cck: u32 = (1 << 24) as u32;
   let fpga_rf_mode_ofdm: u32 = (1 << 25) as u32;
   let _ = rtl_reg_write32(devaddr, mps, 0x0800 as u32, fpga_rf_mode | fpga_rf_mode_cck | fpga_rf_mode_ofdm);
-  let _ = uart_puts("USB: RTL8188CU MAC-layer bring-up complete (LLT/CR/RCR/MACID/RF-enable/CCK+OFDM-enable) -- caller must still call rtl8188cu_set_channel before expecting real traffic\n");
+  let _ = rtl8188cu_lc_calibrate(devaddr, mps);
+  // BUG FOUND 2026-11-13 ("wifi listen" still 0/300 raw bulk-IN
+  // successes after LC calibration alone -- see rtl8188cu_iq_
+  // calibrate's own header comment for the full IQK port this adds).
+  let _ = rtl8188cu_iq_calibrate(devaddr, mps);
+  // BUG FOUND 2026-11-15 (real-HW investigation, continued: TX confirmed
+  // completing via HCINT XFERCOMPL on channel-0 bulk-OUT -- see the new
+  // dwc2_wifi_bulk_in TX diagnostic this same round -- yet bulk-IN
+  // stayed 0/300 on EVERY channel including the one TX just proved
+  // healthy on, ruling out a channel-switch or USB-transport-level
+  // cause and pointing squarely at something gating reception inside
+  // the chip's own MAC, after the frame is received over the air but
+  // before it ever reaches the USB-visible RX FIFO). Found by reading
+  // past rtl8xxxu_init_device() (already audited bit-for-bit this
+  // session, nothing missing there) into rtl8xxxu_start() -- the
+  // separate function Linux's mac80211 "start" callback runs once the
+  // radio is actually brought up for real use, as opposed to merely
+  // initialized. That function, fetched fresh from drivers/net/
+  // wireless/realtek/rtl8xxxu/core.c, unconditionally (every chip
+  // variant, no fops gate) writes:
+  //   rtl8xxxu_write16(priv, REG_RXFLTMAP2, 0xffff);
+  //   rtl8xxxu_write16(priv, REG_RXFLTMAP0, 0xffff);
+  // regs.h's own comment on these two registers explains why: "each
+  // bit corresponds to the numerical value of the subtype. If it is
+  // set the subtype frame type is passed" -- REG_RXFLTMAP0 gates
+  // management subtypes (beacon, probe-response, the exact frames
+  // wifi_passive_listen/wifi_scan_for_ssid are listening for) and
+  // REG_RXFLTMAP2 gates data subtypes. Neither register had ever been
+  // written anywhere in this driver (confirmed zero prior occurrences)
+  // -- both reset to 0x0000, meaning no subtype was ever mapped into
+  // an RX-visible queue, so the chip's own MAC would silently drop
+  // every received frame before it ever reached the USB bulk-IN FIFO,
+  // regardless of how correctly RF/channel/aggregation/calibration
+  // were configured -- matching this round's refined symptom (TX
+  // proven healthy, RX silent on every channel) far more precisely
+  // than any of the four earlier candidate fixes this same
+  // investigation already tried (aggregation-disable, CCK/OFDM-
+  // enable, LC-calibration, IQK -- all re-confirmed present and
+  // correct, none of them this specific gap). NOT the same register
+  // this project's own earlier research already ruled out: that was a
+  // DIFFERENT, conditional write inside rtl8xxxu_init_device() itself
+  // (gated by a chip-specific fops flag this chip family doesn't set,
+  // correctly not ported) -- this is rtl8xxxu_start()'s own separate,
+  // unconditional write, never previously found because the earlier
+  // audit never looked past init_device into the real driver's
+  // separate "radio start" function.
+  let _ = rtl_reg_write16(devaddr, mps, RTL_REG_RXFLTMAP2, 0xffff as u32);
+  let _ = rtl_reg_write16(devaddr, mps, RTL_REG_RXFLTMAP0, 0xffff as u32);
+  // BUG FOUND 2026-11-15 continued (same rtl8xxxu_start() function the
+  // RXFLTMAP writes above came from -- the earlier read of that
+  // function stopped right after those two lines and missed the very
+  // next statement): real Linux writes ONE more register here,
+  // unconditionally, every single radio start, no fops/chip gate --
+  //   rtl8xxxu_write32_mask(priv, REG_OFDM0_XA_AGC_CORE1,
+  //                        OFDM0_X_AGC_CORE1_IGI_MASK, 0x1e);
+  // REG_OFDM0_XA_AGC_CORE1 (0x0c50) bits[6:0] (OFDM0_X_AGC_CORE1_IGI_
+  // MASK = 0x7F) is RX path-A's AGC Initial Gain Index -- the baseband's
+  // own RX sensitivity/gain-staging setting, confirmed via regs.h's own
+  // naming and placement alongside the chip's documented dynamic-IGI
+  // RSSI-tracking mechanism (the real driver's background "ra_watchdog"
+  // keeps tuning this same field at runtime; this write is just the
+  // one-time starting value so the receiver isn't deaf before that
+  // watchdog -- which this driver doesn't implement -- ever runs a
+  // first pass). Never written anywhere else in this driver (confirmed
+  // zero prior occurrences of 0x0c50/OFDM0_XA_AGC), so it sits at
+  // whatever power-on-reset value this silicon has -- unlike RCR/
+  // RXFLTMAP (binary accept/reject gates, where an all-zero default is
+  // at least a well-defined "reject everything" state), an uninitialized
+  // AGC gain index is a continuous, unverified analog-front-end setting
+  // that could leave the ADC's input stage clipped or under-driven,
+  // which would prevent the baseband correlator from ever registering a
+  // valid frame-start on ANY incoming signal, on ANY channel --
+  // indistinguishable from "genuinely nothing on the air" at every
+  // level this driver can observe (RF/channel/CCK+OFDM-enable/
+  // calibration/aggregation/RXFLTMAP all independently re-confirmed
+  // correct and present this same investigation, raw USB bulk-IN
+  // mechanics independently verified bit-for-bit correct via a live
+  // register dump this same round) -- exactly today's remaining "0/300,
+  // device genuinely NAKing" symptom. Implemented as the equivalent
+  // read-modify-write by hand (this driver has no write32_mask helper
+  // yet): clear bits[6:0], OR in 0x1e, matching write32_mask(mask=0x7F,
+  // val=0x1e)'s own shift=__ffs(0x7F)=0 exactly.
+  let agc_core1: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_XA_AGC_CORE1);
+  let agc_igi_mask: u32 = 0x7F as u32;
+  let agc_core1_cleared: u32 = agc_core1 & (agc_igi_mask ^ (0xFFFFFFFF as u32));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_XA_AGC_CORE1, agc_core1_cleared | (0x1e as u32));
+  let _ = uart_puts("USB: RTL8188CU MAC-layer bring-up complete (LLT/CR/RCR/MACID/RF-enable/CCK+OFDM-enable/LC-calibrate/IQK/RXFLTMAP/AGC-IGI) -- caller must still call rtl8188cu_set_channel before expecting real traffic\n");
+  return 0;
+}
+
+// LC (local-oscillator tank) calibration, ported from Linux's real
+// rtl8723a_phy_lc_calibrate (core.c) -- see rtl8188cu_mac_bringup's
+// own header comment for why this is believed to be the actual
+// remaining cause of total RX silence, and why this was found to NOT
+// be the chip-instance/efuse-dependent step this project's own prior
+// research assumed.
+//
+// Simplified from the reference in two ways, both already-established
+// patterns for this single-RF-path chip elsewhere in this same file
+// (see rtl8188cu_enable_rf's own header comment, "rf_paths==1/
+// tx_paths==1"):
+//   1. Path-B (`priv->tx_paths > 1`) branches are dropped entirely --
+//      this chip has exactly one RF path, so that condition is always
+//      false and the reference driver itself never takes it for this
+//      chip.
+//   2. The `priv->fops->has_s0s1` RF6052_REG_S0S1 (0xb0) write/restore
+//      is dropped -- that register exists to select between dual
+//      analog front-ends on 2T2R designs; a single-RF-path chip has
+//      no second front-end to select, so the reference driver's own
+//      per-chip fops table does not set this flag for any single-path
+//      variant either.
+// Both simplifications remove reference-driver branches that are
+// unconditionally false for THIS chip, not shortcuts that skip real
+// behavior it would otherwise take.
+//
+// `delay(322000)`: this file's own established calibration is
+// delay(161000) == ~50ms real (see dwc2_core_soft_reset's own
+// comment, task #276's calibrated ~0.310044us/iteration) -- doubled
+// here to match the reference's own `msleep(100)` (100ms, not 50ms).
+fn rtl8188cu_lc_calibrate(devaddr: u32, mps: u32) -> i64 {
+  // REG_OFDM1_LSTF (0x0d00), OFDM_LSTF_MASK (0x70000000): a real boot
+  // never has continuous-TX test mode active, so this is expected to
+  // always take the `else` branch (REG_TXPAUSE=0xff) in practice --
+  // both branches implemented to match the reference exactly rather
+  // than assuming the common case, same discipline as rtl8188cu_set_
+  // channel's own header comment on its SIFS/BW writes.
+  let lstf: u32 = rtl_reg_read32(devaddr, mps, 0x0d00 as u32);
+  let lstf_mask: u32 = 0x70000000 as u32;
+  let continuous_tx: u32 = lstf & lstf_mask;
+  let rf_amode: u32 = 0 as u32;
+  if continuous_tx != (0 as u32) {
+    let lstf_cleared: u32 = lstf & (lstf_mask ^ (0xFFFFFFFF as u32));
+    let _ = rtl_reg_write32(devaddr, mps, 0x0d00 as u32, lstf_cleared);
+    rf_amode = rtl_rf_reg_read(devaddr, mps, 0x00 as u32); // RF6052_REG_AC
+    let rf_amode_standby: u32 = (rf_amode & (0x8ffff as u32)) | (0x10000 as u32);
+    let _ = rtl_rf_reg_write(devaddr, mps, 0x00 as u32, rf_amode_standby);
+  } else {
+    let _ = rtl_reg_write8(devaddr, mps, RTL_REG_TXPAUSE, 0xff as u32);
+  }
+
+  // Start LC calibration: RF6052_REG_MODE_AG (0x18), set the LC_CAL
+  // bit (BIT 15, 0x08000) -- triggers the chip's own internal LC-tank
+  // self-calibration in hardware; this call just has to request it
+  // and wait long enough for it to finish.
+  let mode_ag: u32 = rtl_rf_reg_read(devaddr, mps, 0x18 as u32);
+  let mode_ag_lc: u32 = mode_ag | (0x08000 as u32);
+  let _ = rtl_rf_reg_write(devaddr, mps, 0x18 as u32, mode_ag_lc);
+  let _ = delay(322000);
+
+  if continuous_tx != (0 as u32) {
+    let _ = rtl_reg_write32(devaddr, mps, 0x0d00 as u32, lstf);
+    let _ = rtl_rf_reg_write(devaddr, mps, 0x00 as u32, rf_amode);
+  } else {
+    let _ = rtl_reg_write8(devaddr, mps, RTL_REG_TXPAUSE, 0 as u32);
+  }
+  return 0;
+}
+
+// IQ calibration (IQK), ported from Linux's real rtl8xxxu_gen1_phy_iq_
+// calibrate/rtl8xxxu_phy_iqcalibrate/rtl8xxxu_iqk_path_a/rtl8xxxu_
+// fill_iqk_matrix_a (core.c, fetched fresh from github.com/torvalds/
+// linux) -- the next already-identified candidate fix after LC
+// calibration alone did not resolve "wifi listen" still reporting
+// 0/300 raw bulk-IN successes on a clean boot (chip enumerated,
+// firmware loaded, full MAC bring-up including LC-calibrate all
+// confirmed complete). IQK corrects I/Q amplitude and phase imbalance
+// in the analog front end -- a real, chip-instance-dependent analog
+// impairment LC calibration does not touch at all (LC calibrates the
+// LO tank's absolute frequency; IQK calibrates the two mixer paths'
+// relative balance) -- a plausible reason the RX chain could still
+// fail to lock onto/demodulate anything even with a correctly-tuned
+// LO.
+//
+// Simplified from the reference the same way rtl8188cu_lc_calibrate
+// already is, for the same confirmed reason (this chip's own
+// rtl8192cu_identify_chip "8188CU" branch sets rf_paths=1/tx_paths=1/
+// rx_paths=1 unconditionally -- not assumed, read directly):
+//   1. Every `priv->tx_paths > 1` branch in the reference (path-B
+//      calibration itself, path-B register save/restore entries'
+//      OWN gated writes, rtl8xxxu_fill_iqk_matrix_b, the path-B half
+//      of rtl8xxxu_simularity_compare) is unconditionally false for
+//      this chip and is dropped entirely, not ported as dead code.
+//   2. rtl8xxxu_simularity_compare's own generic bound=8 shape
+//      collapses to a fixed bound=4 for tx_paths==1 -- confirmed by
+//      direct analysis that its OWN "path B OK" branch becomes
+//      unreachable once bound=4 (simubitmap can only ever have bits
+//      0-3 set, so `!(simubitmap & 0xf0)` is always true but is also
+//      always gated by the same always-false tx_paths>1 check) --
+//      ported here as rtl8188cu_iqk_similar, the already-simplified
+//      shape, not a generic 8-wide function with dead branches kept
+//      in for fidelity's own sake.
+//   3. priv->rege94/rege9c/regeb4/regebc and priv->bb_recovery_backup
+//      are real Linux driver state that is written in this exact code
+//      path but, confirmed by grepping the ENTIRE reference driver,
+//      never read anywhere else in it -- dead state in the reference
+//      itself, not something this port is cutting a corner on by
+//      omitting.
+// Every remaining register write in rtl8xxxu_phy_iqcalibrate's own
+// body that is NOT inside a `tx_paths > 1` check runs unconditionally
+// regardless of path count (e.g. both FPGA0_XA_RF_INT_OE AND
+// FPGA0_XB_RF_INT_OE are touched even for this 1-path chip) -- ported
+// exactly as the reference has it, not pruned by analogy to the path
+// count.
+//
+// result_buf layout: 4 attempts x 8 i32 slots, matching the
+// reference's own `result[4][8]`, stored as 32 little-endian u32s
+// (128 bytes) via buf_read_u32_le/buf_write_u32_le -- slots 4-7 (the
+// path-B half) are never written by this port and stay at their
+// zero-initialized value from dhruva_alloc_bytes, which is exactly
+// what the reference's own dead path-B code would have left them at
+// on this chip too.
+fn rtl8188cu_iqk_result_get(buf: mut ref i64, t: i64, i: i64) -> u32 {
+  return buf_read_u32_le(buf, (t * 8 + i) * 4);
+}
+
+fn rtl8188cu_iqk_result_set(buf: mut ref i64, t: i64, i: i64, val: u32) -> i64 {
+  return buf_write_u32_le(buf, (t * 8 + i) * 4, val);
+}
+
+// rtl8xxxu_path_adda_on, tx_paths==1 case only: the `path_a_on`
+// parameter only affects the tx_paths>1 (2T) branch's choice between
+// adda_2t_path_on_a/_b -- for this 1T chip, behavior is identical
+// regardless of that argument, so it's dropped here (not an
+// approximation: the reference's own 1T branch never reads it
+// either). Constants are this chip's own fops table values
+// (rtl8192cu_fops: adda_1t_init=0x0b1b25a0, adda_1t_path_on=
+// 0x0bdb25a0, confirmed via direct grep of 8192c.c, not the 2T
+// variant's different fops table).
+fn rtl8188cu_iqk_path_adda_on(devaddr: u32, mps: u32) -> i64 {
+  let adda_1t_init: u32 = 0x0b1b25a0 as u32;
+  let adda_1t_path_on: u32 = 0x0bdb25a0 as u32;
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XCD_SWITCH_CTRL, adda_1t_init);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_BLUETOOTH, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_WAIT_CCA, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_CCK_RFON, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_CCK_BBON, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_OFDM_RFON, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_OFDM_BBON, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_TO_RX, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_TO_TX, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_CCK, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_OFDM, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_WAIT_RIFS, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_TO_RX, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_STANDBY, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_SLEEP, adda_1t_path_on);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_PMPD_ANAEN, adda_1t_path_on);
+  return 0;
+}
+
+fn rtl8188cu_iqk_save_adda(devaddr: u32, mps: u32, backup: mut ref i64) -> i64 {
+  let _ = buf_write_u32_le(backup, 0, rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_XCD_SWITCH_CTRL));
+  let _ = buf_write_u32_le(backup, 4, rtl_reg_read32(devaddr, mps, RTL_REG_BLUETOOTH));
+  let _ = buf_write_u32_le(backup, 8, rtl_reg_read32(devaddr, mps, RTL_REG_RX_WAIT_CCA));
+  let _ = buf_write_u32_le(backup, 12, rtl_reg_read32(devaddr, mps, RTL_REG_TX_CCK_RFON));
+  let _ = buf_write_u32_le(backup, 16, rtl_reg_read32(devaddr, mps, RTL_REG_TX_CCK_BBON));
+  let _ = buf_write_u32_le(backup, 20, rtl_reg_read32(devaddr, mps, RTL_REG_TX_OFDM_RFON));
+  let _ = buf_write_u32_le(backup, 24, rtl_reg_read32(devaddr, mps, RTL_REG_TX_OFDM_BBON));
+  let _ = buf_write_u32_le(backup, 28, rtl_reg_read32(devaddr, mps, RTL_REG_TX_TO_RX));
+  let _ = buf_write_u32_le(backup, 32, rtl_reg_read32(devaddr, mps, RTL_REG_TX_TO_TX));
+  let _ = buf_write_u32_le(backup, 36, rtl_reg_read32(devaddr, mps, RTL_REG_RX_CCK));
+  let _ = buf_write_u32_le(backup, 40, rtl_reg_read32(devaddr, mps, RTL_REG_RX_OFDM));
+  let _ = buf_write_u32_le(backup, 44, rtl_reg_read32(devaddr, mps, RTL_REG_RX_WAIT_RIFS));
+  let _ = buf_write_u32_le(backup, 48, rtl_reg_read32(devaddr, mps, RTL_REG_RX_TO_RX));
+  let _ = buf_write_u32_le(backup, 52, rtl_reg_read32(devaddr, mps, RTL_REG_STANDBY));
+  let _ = buf_write_u32_le(backup, 56, rtl_reg_read32(devaddr, mps, RTL_REG_SLEEP));
+  let _ = buf_write_u32_le(backup, 60, rtl_reg_read32(devaddr, mps, RTL_REG_PMPD_ANAEN));
+  return 0;
+}
+
+fn rtl8188cu_iqk_restore_adda(devaddr: u32, mps: u32, backup: mut ref i64) -> i64 {
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XCD_SWITCH_CTRL, buf_read_u32_le(backup, 0));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_BLUETOOTH, buf_read_u32_le(backup, 4));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_WAIT_CCA, buf_read_u32_le(backup, 8));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_CCK_RFON, buf_read_u32_le(backup, 12));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_CCK_BBON, buf_read_u32_le(backup, 16));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_OFDM_RFON, buf_read_u32_le(backup, 20));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_OFDM_BBON, buf_read_u32_le(backup, 24));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_TO_RX, buf_read_u32_le(backup, 28));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_TO_TX, buf_read_u32_le(backup, 32));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_CCK, buf_read_u32_le(backup, 36));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_OFDM, buf_read_u32_le(backup, 40));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_WAIT_RIFS, buf_read_u32_le(backup, 44));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_TO_RX, buf_read_u32_le(backup, 48));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_STANDBY, buf_read_u32_le(backup, 52));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_SLEEP, buf_read_u32_le(backup, 56));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_PMPD_ANAEN, buf_read_u32_le(backup, 60));
+  return 0;
+}
+
+// rtl8xxxu_save_mac_regs/rtl8xxxu_mac_calibration's own exact mixed
+// width: TXPAUSE/BEACON_CTRL/BEACON_CTRL_1 are read/written as 8-bit,
+// GPIO_MUXCFG is BACKED UP as 32-bit (save_mac_regs/restore_mac_regs)
+// but WRITTEN as 8-bit inside mac_calibration itself -- both ported
+// exactly as the reference has them, not "fixed" to be consistent.
+fn rtl8188cu_iqk_save_mac(devaddr: u32, mps: u32, backup: mut ref i64) -> i64 {
+  let _ = buf_write_u32_le(backup, 0, rtl_reg_read8(devaddr, mps, RTL_REG_TXPAUSE));
+  let _ = buf_write_u32_le(backup, 4, rtl_reg_read8(devaddr, mps, RTL_REG_BEACON_CTRL));
+  let _ = buf_write_u32_le(backup, 8, rtl_reg_read8(devaddr, mps, RTL_REG_BEACON_CTRL_1));
+  let _ = buf_write_u32_le(backup, 12, rtl_reg_read32(devaddr, mps, RTL_REG_GPIO_MUXCFG));
+  return 0;
+}
+
+fn rtl8188cu_iqk_restore_mac(devaddr: u32, mps: u32, backup: mut ref i64) -> i64 {
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_TXPAUSE, buf_read_u32_le(backup, 0));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_BEACON_CTRL, buf_read_u32_le(backup, 4));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_BEACON_CTRL_1, buf_read_u32_le(backup, 8));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_GPIO_MUXCFG, buf_read_u32_le(backup, 12));
+  return 0;
+}
+
+fn rtl8188cu_iqk_mac_calibration(devaddr: u32, mps: u32, backup: mut ref i64) -> i64 {
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_TXPAUSE, 0x3f as u32);
+  let beacon_ctrl: u32 = buf_read_u32_le(backup, 4);
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_BEACON_CTRL, beacon_ctrl & ((0x08 as u32) ^ (0xFFFFFFFF as u32)));
+  let beacon_ctrl_1: u32 = buf_read_u32_le(backup, 8);
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_BEACON_CTRL_1, beacon_ctrl_1 & ((0x08 as u32) ^ (0xFFFFFFFF as u32)));
+  let gpio_muxcfg: u32 = buf_read_u32_le(backup, 12);
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_GPIO_MUXCFG, gpio_muxcfg & ((0x20 as u32) ^ (0xFFFFFFFF as u32)));
+  return 0;
+}
+
+fn rtl8188cu_iqk_save_bb(devaddr: u32, mps: u32, backup: mut ref i64) -> i64 {
+  let _ = buf_write_u32_le(backup, 0, rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_TRX_PATH_ENABLE));
+  let _ = buf_write_u32_le(backup, 4, rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_TR_MUX_PAR));
+  let _ = buf_write_u32_le(backup, 8, rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_XCD_RF_SW_CTRL));
+  let _ = buf_write_u32_le(backup, 12, rtl_reg_read32(devaddr, mps, RTL_REG_CONFIG_ANT_A));
+  let _ = buf_write_u32_le(backup, 16, rtl_reg_read32(devaddr, mps, RTL_REG_CONFIG_ANT_B));
+  let _ = buf_write_u32_le(backup, 20, rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_XAB_RF_SW_CTRL));
+  let _ = buf_write_u32_le(backup, 24, rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_XA_RF_INT_OE));
+  let _ = buf_write_u32_le(backup, 28, rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_XB_RF_INT_OE));
+  let _ = buf_write_u32_le(backup, 32, rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_RF_MODE));
+  return 0;
+}
+
+fn rtl8188cu_iqk_restore_bb(devaddr: u32, mps: u32, backup: mut ref i64) -> i64 {
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_TRX_PATH_ENABLE, buf_read_u32_le(backup, 0));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_TR_MUX_PAR, buf_read_u32_le(backup, 4));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XCD_RF_SW_CTRL, buf_read_u32_le(backup, 8));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_CONFIG_ANT_A, buf_read_u32_le(backup, 12));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_CONFIG_ANT_B, buf_read_u32_le(backup, 16));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XAB_RF_SW_CTRL, buf_read_u32_le(backup, 20));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XA_RF_INT_OE, buf_read_u32_le(backup, 24));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XB_RF_INT_OE, buf_read_u32_le(backup, 28));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_RF_MODE, buf_read_u32_le(backup, 32));
+  return 0;
+}
+
+// rtl8xxxu_iqk_path_a, rf_paths==1 case: the path-B TX_IQK_TONE_B/
+// RX_IQK_TONE_B/TX_IQK_PI_B/RX_IQK_PI_B writes (gated by `rf_paths >
+// 1` in the reference) are dropped, and RX_IQK_PI_A always takes the
+// rf_paths==1 value (0x28160502, not the 2-path 0x28160202) --
+// confirmed via rtl8192cu_identify_chip, not assumed.
+fn rtl8188cu_iqk_path_a(devaddr: u32, mps: u32) -> i64 {
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_IQK_TONE_A, 0x10008c1f as u32);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_IQK_TONE_A, 0x10008c1f as u32);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_IQK_PI_A, 0x82140102 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_IQK_PI_A, 0x28160502 as u32);
+
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_IQK_AGC_RSP, 0x001028d1 as u32);
+
+  // One shot, path A LOK & IQK.
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_IQK_AGC_PTS, 0xf9000000 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_IQK_AGC_PTS, 0xf8000000 as u32);
+  let _ = delay(3220); // mdelay(1)
+
+  let reg_eac: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_RX_POWER_AFTER_IQK_A_2);
+  let reg_e94: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_TX_POWER_BEFORE_IQK_A);
+  let reg_e9c: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_TX_POWER_AFTER_IQK_A);
+  let reg_ea4: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_RX_POWER_BEFORE_IQK_A_2);
+
+  let result: u32 = 0 as u32;
+  if ((reg_eac & (0x10000000 as u32)) == (0 as u32))
+    && ((reg_e94 & (0x03ff0000 as u32)) != (0x01420000 as u32))
+    && ((reg_e9c & (0x03ff0000 as u32)) != (0x00420000 as u32)) {
+    result = result | (0x01 as u32);
+  } else {
+    return result as i64; // TX not OK, ignore RX
+  }
+
+  if ((reg_eac & (0x08000000 as u32)) == (0 as u32))
+    && ((reg_ea4 & (0x03ff0000 as u32)) != (0x01320000 as u32))
+    && ((reg_eac & (0x03ff0000 as u32)) != (0x00360000 as u32)) {
+    result = result | (0x02 as u32);
+  }
+  return result as i64;
+}
+
+// rtl8xxxu_fill_iqk_matrix_a verbatim (this chip's own only path --
+// matrix_b is unreachable, tx_paths==1).
+fn rtl8188cu_iqk_fill_matrix_a(devaddr: u32, mps: u32, iqk_ok: u32, result_buf: mut ref i64, candidate: i64, tx_only: u32) -> i64 {
+  if iqk_ok == (0 as u32) {
+    return 0;
+  }
+
+  let val32: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_XA_TX_IQ_IMBALANCE);
+  let oldval: u32 = val32 >> (22 as u32);
+
+  // Reference keeps x/y as raw 32-bit bit patterns throughout (C's
+  // `u32 x`/`int y` distinction doesn't change the actual bits
+  // produced here -- verified by tracing every later use of both
+  // through to a mask or an unsigned comparison, none of which is
+  // sign-sensitive) -- sign-extending the 10-bit field into the
+  // upper 22 bits via OR, exactly like the reference, then using
+  // wrapping_mul + a plain (logical) u32 `>>` for the multiply/shift
+  // so an overflowing product truncates to 32 bits exactly as the
+  // reference's own unsigned/wrapped C arithmetic does. A first
+  // attempt at this used signed i64 arithmetic as a "simplification"
+  // and was caught and reverted here before ever reaching real
+  // hardware: hand-verified against a concrete example (x bit
+  // pattern 0xfffffe00, oldval=3) that the two approaches produce
+  // completely different bit patterns (16777210 wrapped-u32 vs -6
+  // signed) -- this file's own register writes OR these values
+  // directly into specific bit fields with no masking of the upper
+  // bits first, so they must match the reference's actual bit
+  // pattern, not just its mathematical intent.
+  let x: u32 = rtl8188cu_iqk_result_get(result_buf, candidate, 0);
+  let x_ext: u32 = if (x & (0x200 as u32)) != (0 as u32) { x | (0xfffffc00 as u32) } else { x };
+  let tx0_a: u32 = wrapping_mul(x_ext, oldval) >> (8 as u32);
+
+  let v1: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_XA_TX_IQ_IMBALANCE);
+  let v1b: u32 = (v1 & ((0x3ff as u32) ^ (0xFFFFFFFF as u32))) | tx0_a;
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_XA_TX_IQ_IMBALANCE, v1b);
+
+  let cca1: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_ENERGY_CCA_THRES);
+  let cca1_cleared: u32 = cca1 & ((0x80000000 as u32) ^ (0xFFFFFFFF as u32));
+  let cca1_bit: u32 = (wrapping_mul(x_ext, oldval) >> (7 as u32)) & (1 as u32);
+  let cca1_final: u32 = if cca1_bit == (1 as u32) { cca1_cleared | (0x80000000 as u32) } else { cca1_cleared };
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_ENERGY_CCA_THRES, cca1_final);
+
+  let y: u32 = rtl8188cu_iqk_result_get(result_buf, candidate, 1);
+  let y_ext: u32 = if (y & (0x200 as u32)) != (0 as u32) { y | (0xfffffc00 as u32) } else { y };
+  let tx0_c: u32 = wrapping_mul(y_ext, oldval) >> (8 as u32);
+
+  let xc_tx_afe: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_XC_TX_AFE);
+  let xc_tx_afe_cleared: u32 = xc_tx_afe & ((0xf0000000 as u32) ^ (0xFFFFFFFF as u32));
+  let xc_bits: u32 = ((tx0_c & (0x3c0 as u32)) >> (6 as u32)) << (28 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_XC_TX_AFE, xc_tx_afe_cleared | xc_bits);
+
+  let v2: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_XA_TX_IQ_IMBALANCE);
+  let v2_cleared: u32 = v2 & ((0x003f0000 as u32) ^ (0xFFFFFFFF as u32));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_XA_TX_IQ_IMBALANCE, v2_cleared | ((tx0_c & (0x3f as u32)) << (16 as u32)));
+
+  let cca2: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_ENERGY_CCA_THRES);
+  let cca2_cleared: u32 = cca2 & ((0x20000000 as u32) ^ (0xFFFFFFFF as u32));
+  let cca2_bit: u32 = (wrapping_mul(y_ext, oldval) >> (7 as u32)) & (1 as u32);
+  let cca2_final: u32 = if cca2_bit == (1 as u32) { cca2_cleared | (0x20000000 as u32) } else { cca2_cleared };
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_ENERGY_CCA_THRES, cca2_final);
+
+  if tx_only == (1 as u32) {
+    return 0;
+  }
+
+  let reg2: u32 = rtl8188cu_iqk_result_get(result_buf, candidate, 2);
+  let rximb1: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_XA_RX_IQ_IMBALANCE);
+  let rximb1_cleared: u32 = rximb1 & ((0x3ff as u32) ^ (0xFFFFFFFF as u32));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_XA_RX_IQ_IMBALANCE, rximb1_cleared | (reg2 & (0x3ff as u32)));
+
+  let reg3: u32 = rtl8188cu_iqk_result_get(result_buf, candidate, 3) & (0x3f as u32);
+  let rximb2: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_XA_RX_IQ_IMBALANCE);
+  let rximb2_cleared: u32 = rximb2 & ((0xfc00 as u32) ^ (0xFFFFFFFF as u32));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_XA_RX_IQ_IMBALANCE, rximb2_cleared | ((reg3 << 10) & (0xfc00 as u32)));
+
+  let reg3b: u32 = (rtl8188cu_iqk_result_get(result_buf, candidate, 3) >> (6 as u32)) & (0xf as u32);
+  let extanta: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_OFDM0_RX_IQ_EXT_ANTA);
+  let extanta_cleared: u32 = extanta & ((0xf0000000 as u32) ^ (0xFFFFFFFF as u32));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_RX_IQ_EXT_ANTA, extanta_cleared | (reg3b << 28));
+  return 0;
+}
+
+// rtl8xxxu_simularity_compare, tx_paths==1 case: the reference's own
+// generic shape (bound=8, path-B-OK branch) is unreachable once
+// bound==4 -- see rtl8188cu_iq_calibrate's own header comment, point
+// 2, for the direct analysis confirming this, not an assumption.
+// Returns 1 (similar enough, no candidate substitution) or 0
+// (dissimilar, or a candidate was substituted into slot 3).
+fn rtl8188cu_iqk_similar(result_buf: mut ref i64, c1: i64, c2: i64) -> u32 {
+  let simubitmap: u32 = 0 as u32;
+  let candidate0: i64 = 0 - 1;
+  let i: i64 = 0;
+  while i < 4 {
+    let v1: u32 = rtl8188cu_iqk_result_get(result_buf, c1, i);
+    let v2: u32 = rtl8188cu_iqk_result_get(result_buf, c2, i);
+    let diff: u32 = if v1 > v2 { v1 - v2 } else { v2 - v1 };
+    if diff > (5 as u32) {
+      if (i == 2) && (simubitmap == (0 as u32)) {
+        let s1: u32 = rtl8188cu_iqk_result_get(result_buf, c1, 2) + rtl8188cu_iqk_result_get(result_buf, c1, 3);
+        let s2: u32 = rtl8188cu_iqk_result_get(result_buf, c2, 2) + rtl8188cu_iqk_result_get(result_buf, c2, 3);
+        if s1 == (0 as u32) {
+          candidate0 = c2;
+        } else if s2 == (0 as u32) {
+          candidate0 = c1;
+        } else {
+          simubitmap = simubitmap | (0x04 as u32);
+        }
+      } else {
+        simubitmap = simubitmap | ((1 << i) as u32);
+      }
+    }
+    i = i + 1;
+  }
+  if simubitmap == (0 as u32) {
+    if candidate0 >= 0 {
+      let _ = rtl8188cu_iqk_result_set(result_buf, 3, 0, rtl8188cu_iqk_result_get(result_buf, candidate0, 0));
+      let _ = rtl8188cu_iqk_result_set(result_buf, 3, 1, rtl8188cu_iqk_result_get(result_buf, candidate0, 1));
+      return 0 as u32;
+    }
+    return 1 as u32;
+  }
+  return 0 as u32;
+}
+
+// rtl8xxxu_phy_iqcalibrate, tx_paths==1 case -- see rtl8188cu_iq_
+// calibrate's own header comment for the full design. pi_enabled_buf
+// is a persistent (across the 3 calls this makes up one calibration
+// run) 1-u32 scratch slot allocated once by the caller, matching
+// priv->pi_enabled's own "set once at t==0, read at every t" lifetime
+// -- this chip's `no_pape` is always 0 (only ever set for the
+// RTL8188R high-PA variant this driver doesn't even parse the efuse
+// bit for), so that branch is ported unconditionally-taken rather
+// than threaded as another piece of state.
+fn rtl8188cu_phy_iqcalibrate(devaddr: u32, mps: u32, result_buf: mut ref i64, t: i64, pi_enabled_buf: mut ref i64, adda_backup: mut ref i64, mac_backup: mut ref i64, bb_backup: mut ref i64) -> i64 {
+  if t == 0 {
+    let _ = rtl8188cu_iqk_save_adda(devaddr, mps, adda_backup);
+    let _ = rtl8188cu_iqk_save_mac(devaddr, mps, mac_backup);
+    let _ = rtl8188cu_iqk_save_bb(devaddr, mps, bb_backup);
+  }
+
+  let _ = rtl8188cu_iqk_path_adda_on(devaddr, mps);
+
+  if t == 0 {
+    let hssi1: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_XA_HSSI_PARM1);
+    if (hssi1 & (0x100 as u32)) != (0 as u32) {
+      let _ = buf_write_u32_le(pi_enabled_buf, 0, 1 as u32);
+    }
+  }
+  let pi_enabled: u32 = buf_read_u32_le(pi_enabled_buf, 0);
+
+  if pi_enabled == (0 as u32) {
+    let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XA_HSSI_PARM1, 0x01000100 as u32);
+    let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XB_HSSI_PARM1, 0x01000100 as u32);
+  }
+
+  let rfmode: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_RF_MODE);
+  let rfmode_cleared: u32 = rfmode & ((0x01000000 as u32) ^ (0xFFFFFFFF as u32));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_RF_MODE, rfmode_cleared);
+
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_TRX_PATH_ENABLE, 0x03a05600 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_TR_MUX_PAR, 0x000800e4 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XCD_RF_SW_CTRL, 0x22204000 as u32);
+
+  // no_pape is always 0 for this chip variant -- branch always taken.
+  let swctrl: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_XAB_RF_SW_CTRL);
+  let pape_bits: u32 = (0x400 as u32) | ((0x400 as u32) << (16 as u32));
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XAB_RF_SW_CTRL, swctrl | pape_bits);
+
+  let intoe_a: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_XA_RF_INT_OE);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XA_RF_INT_OE, intoe_a & ((0x400 as u32) ^ (0xFFFFFFFF as u32)));
+  let intoe_b: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_FPGA0_XB_RF_INT_OE);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XB_RF_INT_OE, intoe_b & ((0x400 as u32) ^ (0xFFFFFFFF as u32)));
+
+  let _ = rtl8188cu_iqk_mac_calibration(devaddr, mps, mac_backup);
+
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_CONFIG_ANT_A, 0x00080000 as u32);
+
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_IQK, 0x80800000 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_TX_IQK, 0x01007c00 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_RX_IQK, 0x01004800 as u32);
+
+  let path_a_ok: i64 = 0;
+  let retry: i64 = 0;
+  while retry < 2 {
+    path_a_ok = rtl8188cu_iqk_path_a(devaddr, mps);
+    if path_a_ok == 3 {
+      let v0: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_TX_POWER_BEFORE_IQK_A);
+      let _ = rtl8188cu_iqk_result_set(result_buf, t, 0, (v0 >> (16 as u32)) & (0x3ff as u32));
+      let v1: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_TX_POWER_AFTER_IQK_A);
+      let _ = rtl8188cu_iqk_result_set(result_buf, t, 1, (v1 >> (16 as u32)) & (0x3ff as u32));
+      let v2: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_RX_POWER_BEFORE_IQK_A_2);
+      let _ = rtl8188cu_iqk_result_set(result_buf, t, 2, (v2 >> (16 as u32)) & (0x3ff as u32));
+      let v3: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_RX_POWER_AFTER_IQK_A_2);
+      let _ = rtl8188cu_iqk_result_set(result_buf, t, 3, (v3 >> (16 as u32)) & (0x3ff as u32));
+      retry = 2; // break
+    } else if (retry == 1) && (path_a_ok == 1) {
+      let v0b: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_TX_POWER_BEFORE_IQK_A);
+      let _ = rtl8188cu_iqk_result_set(result_buf, t, 0, (v0b >> (16 as u32)) & (0x3ff as u32));
+      let v1b: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_TX_POWER_AFTER_IQK_A);
+      let _ = rtl8188cu_iqk_result_set(result_buf, t, 1, (v1b >> (16 as u32)) & (0x3ff as u32));
+      retry = retry + 1;
+    } else {
+      retry = retry + 1;
+    }
+  }
+
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_IQK, 0 as u32);
+
+  if t != 0 {
+    if pi_enabled == (0 as u32) {
+      let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XA_HSSI_PARM1, 0x01000000 as u32);
+      let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XB_HSSI_PARM1, 0x01000000 as u32);
+    }
+    let _ = rtl8188cu_iqk_restore_adda(devaddr, mps, adda_backup);
+    let _ = rtl8188cu_iqk_restore_mac(devaddr, mps, mac_backup);
+    let _ = rtl8188cu_iqk_restore_bb(devaddr, mps, bb_backup);
+    let _ = rtl_reg_write32(devaddr, mps, RTL_REG_FPGA0_XA_LSSI_PARM, 0x00032ed3 as u32);
+  }
+  return path_a_ok;
+}
+
+// rtl8xxxu_gen1_phy_iq_calibrate, tx_paths==1 case -- top-level IQK
+// orchestrator, called once from rtl8188cu_mac_bringup right after LC
+// calibration. All scratch buffers here are allocated exactly once
+// per call (this function itself is called exactly once per boot, not
+// in a retry loop) -- this is the established "boot-time one-shot
+// allocation" pattern already used throughout this file (e.g.
+// rtl8188cu_mac_bringup's own mac_buf), not the "persistent .bss
+// scratch" pattern that repeatedly-called functions need (see
+// boot/scratch_state.S's own entries for that other case) -- no new
+// assembly state needed for this port.
+fn rtl8188cu_iq_calibrate(devaddr: u32, mps: u32) -> i64 {
+  let result_buf: mut ref i64 = dhruva_alloc_bytes(128); // 4x8 u32
+  let pi_enabled_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  let adda_backup: mut ref i64 = dhruva_alloc_bytes(64); // 16 u32
+  let mac_backup: mut ref i64 = dhruva_alloc_bytes(16); // 4 u32
+  let bb_backup: mut ref i64 = dhruva_alloc_bytes(36); // 9 u32
+
+  let candidate: i64 = 0 - 1;
+  let i: i64 = 0;
+  while i < 3 {
+    let _ = rtl8188cu_phy_iqcalibrate(devaddr, mps, result_buf, i, pi_enabled_buf, adda_backup, mac_backup, bb_backup);
+
+    if i == 1 {
+      if rtl8188cu_iqk_similar(result_buf, 0, 1) == (1 as u32) {
+        candidate = 0;
+        i = 3; // break
+      }
+    }
+    if i == 2 {
+      if rtl8188cu_iqk_similar(result_buf, 0, 2) == (1 as u32) {
+        candidate = 0;
+      } else if rtl8188cu_iqk_similar(result_buf, 1, 2) == (1 as u32) {
+        candidate = 1;
+      } else {
+        let reg_tmp: u32 = rtl8188cu_iqk_result_get(result_buf, 3, 0)
+          + rtl8188cu_iqk_result_get(result_buf, 3, 1)
+          + rtl8188cu_iqk_result_get(result_buf, 3, 2)
+          + rtl8188cu_iqk_result_get(result_buf, 3, 3)
+          + rtl8188cu_iqk_result_get(result_buf, 3, 4)
+          + rtl8188cu_iqk_result_get(result_buf, 3, 5)
+          + rtl8188cu_iqk_result_get(result_buf, 3, 6)
+          + rtl8188cu_iqk_result_get(result_buf, 3, 7);
+        if reg_tmp != (0 as u32) {
+          candidate = 3;
+        } else {
+          candidate = 0 - 1;
+        }
+      }
+    }
+    i = i + 1;
+  }
+
+  if candidate >= 0 {
+    let reg_e94: u32 = rtl8188cu_iqk_result_get(result_buf, candidate, 0);
+    let reg_ea4: u32 = rtl8188cu_iqk_result_get(result_buf, candidate, 2);
+    if reg_e94 != (0 as u32) {
+      let tx_only: u32 = if reg_ea4 == (0 as u32) { 1 as u32 } else { 0 as u32 };
+      let _ = rtl8188cu_iqk_fill_matrix_a(devaddr, mps, 1 as u32, result_buf, candidate, tx_only);
+    }
+    let _ = uart_puts("USB: RTL8188CU IQK complete, candidate=");
+    let _ = uart_put_i64(candidate);
+    let _ = uart_puts("\n");
+  } else {
+    let _ = uart_puts("USB: RTL8188CU IQK found no good candidate -- leaving stock IQ imbalance values\n");
+  }
   return 0;
 }
 
@@ -33947,11 +36010,97 @@ fn dwc2_set_port_connected(port: i64, value: u32) -> i64 {
 // observed set, bounded (not `while true`) like every other poll
 // loop in this codebase.
 //
+// BUG FOUND 2026-11-13 (real-HW audit after the LC-calibration fix,
+// comparing against Linux's hub_port_connect/hub_port_debounce_be_
+// connected, usb/core/hub.c): this driver's own port status/change
+// bits were never cleared at the START of a fresh bring-up attempt --
+// only after a reset that was actually OBSERVED complete (see the
+// clear-feature calls lower in this function). A port whose PREVIOUS
+// attempt timed out waiting for PORT_RESET (the `if reset_seen == 0`
+// early-return below) skipped those clear-feature calls entirely,
+// leaving stale change/status bits in the hub for the very next
+// attempt to read -- the leading candidate for this session's own
+// repeatedly-observed "hub port status=00000303" (PORT_ENABLE already
+// appearing set before a reset was ever issued THIS attempt) and the
+// port-2 "never reported PORT_RESET complete" failures recurring on
+// nearly every boot regardless of what's actually plugged in. Fixed
+// by unconditionally clearing every change bit before doing anything
+// else, matching Linux's own `clear_bit`-style cleanup at the top of
+// hub_port_connect.
+//
+// Also added: hub_port_debounce_connected below, ported from Linux's
+// hub_port_debounce_be_connected -- this driver used to go straight
+// from PORT_POWER to PORT_RESET with no check that the port's own
+// CONNECTION status was genuinely stable first. Resetting a port with
+// no (or a bouncing) connection is exactly what produces "never
+// reported PORT_RESET complete": there's nothing there to actually
+// finish a reset. Debouncing first lets a genuinely-empty or
+// marginal/bouncing port fail FAST as "not connected" (normal, the
+// caller already handles this outcome) instead of burning the full
+// up-to-2-second reset-poll budget on a doomed attempt.
+//
 // Returns 0 if the port came up connected+enabled, 1 if it's simply
 // not connected (a normal condition -- the caller may try another
 // port), -1 on a genuine hub communication failure (worth aborting
 // on, not worth trying another port for).
+fn dwc2_hub_clear_all_change_bits(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port, hub_feature_c_port_connection());
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port, hub_feature_c_port_enable());
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port, hub_feature_c_port_suspend());
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port, hub_feature_c_port_over_current());
+  let _ = dwc2_hub_clear_port_feature(hub_addr, hub_mps, port, hub_feature_c_port_reset());
+  return 0;
+}
+
+// Returns 1 if the port's CONNECTION status (wPortStatus bit0) is
+// observed stable (unchanged) for at least stable_threshold_us, 0 if
+// the port genuinely never reaches a stable connected state within
+// the overall budget (treat as "not connected," same as Linux's own
+// debounce timeout -- not an error), -1 on a hub communication
+// failure. Timing matches Linux's own HUB_DEBOUNCE_TIMEOUT (~1500ms
+// total budget) / HUB_DEBOUNCE_STABLE (~100ms required stable) /
+// HUB_DEBOUNCE_STEP (~25ms poll interval) constants (hub.c).
+fn dwc2_hub_port_debounce_connected(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
+  // BUG FOUND 2026-11-13: used to call dhruva_alloc_bytes(4) fresh here
+  // on every call -- this function runs once per outer port-retry
+  // attempt, same never-free leak class as usb_downstream_desc_scratch's
+  // own comment documents; now a shared persistent scratch buffer (see
+  // hub_port_status_scratch_addr's own comment in boot/scratch_state.S).
+  let status_buf: mut ref i64 = hub_port_status_scratch_get();
+  let total_budget_us: u32 = 1500000 as u32;
+  let stable_threshold_us: u32 = 100000 as u32;
+  let start_us: u32 = mmio_read_u32(TIMER_CLO);
+  let last_connected: u32 = 0xFFFFFFFF as u32; // sentinel: no reading yet
+  let stable_since_us: u32 = start_us;
+  let result: i64 = 0 - 2; // sentinel: loop exited without a verdict
+  while (wrapping_sub(mmio_read_u32(TIMER_CLO), start_us) < total_budget_us) && (result == (0 - 2)) {
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
+    let status_result: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
+    if status_result != 0 {
+      result = 0 - 1;
+    } else {
+      let status_lo: u32 = buf_read_byte(status_buf, 0 as u32);
+      let connected: u32 = status_lo & (1 as u32);
+      let now_us: u32 = mmio_read_u32(TIMER_CLO);
+      if connected != last_connected {
+        last_connected = connected;
+        stable_since_us = now_us;
+      }
+      if (connected == (1 as u32)) && (wrapping_sub(now_us, stable_since_us) >= stable_threshold_us) {
+        result = 1;
+      } else {
+        let _ = delay(80500); // ~25ms, matches Linux's HUB_DEBOUNCE_STEP
+      }
+    }
+  }
+  if result == (0 - 2) {
+    return 0; // budget exhausted, never saw a stable connect -- not an error
+  }
+  return result;
+}
+
 fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
+  let _ = dwc2_hub_clear_all_change_bits(hub_addr, hub_mps, port);
   // Task #197 follow-up (real-HW USB bring-up investigation, 2026-10-
   // 02): 161000, not 50000 -- see dwc2_core_soft_reset's own comment
   // on delay(N)'s real, platform-dependent duration. Every delay(N)
@@ -33961,10 +36110,24 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
   // that the root port is confirmed reachable on real hardware.
   let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port, hub_feature_port_power());
   let _ = delay(161000);
+
+  let debounce_result: i64 = dwc2_hub_port_debounce_connected(hub_addr, hub_mps, port);
+  if debounce_result == 0 {
+    return 1; // genuinely not connected (or never stabilized) -- normal
+  }
+  if debounce_result < 0 {
+    let _ = uart_puts("USB: hub GET_PORT_STATUS failed during debounce\n");
+    return 0 - 1;
+  }
+
   let _ = dwc2_hub_set_port_feature(hub_addr, hub_mps, port, hub_feature_port_reset());
   let _ = delay(161000);
 
-  let status_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  // BUG FOUND 2026-11-13: this was ALSO a fresh dhruva_alloc_bytes(4)
+  // per call, pre-existing (not introduced by the debounce fix above,
+  // but the same leak class, in the same retry loop) -- see hub_port_
+  // status_scratch_addr's own comment in boot/scratch_state.S.
+  let status_buf: mut ref i64 = hub_port_status_scratch_get();
   let c_port_reset_bit: u32 = 0x10 as u32; // wPortChange bit4
   let reset_seen: i64 = 0;
   let port_status: u32 = 0 as u32;
@@ -34317,7 +36480,14 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   // the device for the entire boot before any device-specific code
   // ever ran -- confirmed live, a real-HW capture with the RTL8188CU/
   // BLE fixes already in place still failed exactly here.
-  let ddesc8: mut ref i64 = dhruva_alloc_bytes(8);
+  // BUG FOUND 2026-11-12 (real-HW heap-exhaustion FATAL, see usb_
+  // downstream_desc_scratch_addr's own comment in scratch_state.S):
+  // this used to be dhruva_alloc_bytes(8) called fresh every time --
+  // this function runs once per OUTER port-retry attempt (up to 5x)
+  // per port, with nothing ever freeing those allocations. Now a
+  // persistent scratch buffer, same as every other repeatedly-used
+  // USB buffer in this file.
+  let ddesc8: mut ref i64 = usb_downstream_desc_scratch_get();
   let attempt0: i64 = 0;
   let dstatus0: i64 = 0 - 1;
   while (attempt0 < usb_first_contact_descriptor_retry_count()) && (dstatus0 != 0) {
@@ -34350,7 +36520,9 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   }
   let _ = delay(161000); // see dwc2_core_soft_reset's own comment
 
-  let ddesc18: mut ref i64 = dhruva_alloc_bytes(18);
+  // Same fix as ddesc8 above -- shares the one 18-byte persistent
+  // buffer (the two fetches are sequential, never concurrent).
+  let ddesc18: mut ref i64 = usb_downstream_desc_scratch_get();
   let attempt2: i64 = 0;
   let dstatus1: i64 = 0 - 1;
   while (attempt2 < usb_first_contact_descriptor_retry_count()) && (dstatus1 != 0) {
@@ -34562,7 +36734,10 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
 const USB_HOTPLUG_SAMPLE_BUDGET_US: u32 = 100000;
 
 fn usb_hotplug_sample_port_connected(hub_addr: u32, hub_mps: u32, port: u32, start_us: u32) -> i64 {
-  let status_buf: mut ref i64 = dhruva_alloc_bytes(4);
+  // BUG FOUND 2026-11-13: same pre-existing fresh-alloc-per-call leak
+  // as dwc2_hub_bring_up_port's own status_buf -- see hub_port_status_
+  // scratch_addr's own comment in boot/scratch_state.S.
+  let status_buf: mut ref i64 = hub_port_status_scratch_get();
   let last: i64 = 0 - 1; // sentinel: "no sample taken yet"
   let stable_count: i64 = 0;
   let tries: i64 = 0;
@@ -42034,6 +44209,10 @@ fn shell_dispatch() -> i64 {
     return shell_dispatch_usbpowercycle();
   }
 
+  if shell_word_matches(line_buf, 0, cmd_end, "usbhubpowercycle") == 1 {
+    return shell_dispatch_usbhubpowercycle();
+  }
+
   if shell_word_matches(line_buf, 0, cmd_end, "lrdump") == 1 {
     return shell_dispatch_lrdump();
   }
@@ -48596,7 +50775,22 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
   while ci < 3 {
     let channel: u32 = wifi_scan_channel_at(ci);
     let _ = wifi_radio_set_channel(devaddr, mps_out, channel);
-    let _ = wifi_radio_tx_frame(devaddr, mps_out, tx_heap, preq_len, 1, 0);
+    // DIAGNOSTIC (2026-11-15): TX-side counterpart of wifi_passive_
+    // listen's own raw bulk-IN diagnostic -- isolates whether bulk-OUT
+    // (TX) gets a genuine HCINT XFERCOMPL from the hardware (same
+    // shared dwc2_reset_chan0_for_new_transfer/dwc2_build_hcchar/
+    // dwc2_wait_chan0_done path, just epdir=0 instead of 1) while
+    // bulk-IN (RX) never does. A TX success here (previously never
+    // checked -- the return value was silently discarded) would prove
+    // channel-0 arming itself works and point the RX-silence bug at
+    // something IN-direction-specific; a TX failure here instead points
+    // back at the shared primitive affecting both directions.
+    let tx_result: i64 = wifi_radio_tx_frame(devaddr, mps_out, tx_heap, preq_len, 1, 0);
+    let _ = uart_puts("wifi scan: TX probe request on channel ");
+    let _ = uart_put_i64(channel as i64);
+    let _ = uart_puts(" result=");
+    let _ = uart_put_i64(tx_result);
+    let _ = uart_puts(" (0=XFERCOMPL confirmed, -1=channel-0 never completed)\n");
 
     let poll: i64 = 0;
     while poll < WIFI_RX_POLL_CAP {
@@ -48702,6 +50896,97 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
 // Interval/Capability-Info (beacons share that exact layout), which is
 // the whole reason wifi_scan_for_ssid's own matching logic never
 // needed a frame-type check to begin with.
+// TEMPORARY DIAGNOSTIC (2026-11-15): raw, print-every-step re-arm of
+// channel 0 for a single WiFi bulk-IN attempt, bypassing dwc2_wifi_
+// bulk_in/dwc2_wait_chan0_done_bounded entirely so every HCINT value
+// actually observed is visible, not just the final classified result --
+// isolates "genuinely nothing ever happens on the wire" (HCINT stays
+// 0x00000000 for the whole window, nak_count stays 0) from "a NAK
+// happens, something still misclassifies/mishandles it" (nak_count>0 but
+// still no XFERCOMPL) or "it actually completes here" (would mean the
+// bug is in dwc2_wifi_bulk_in's own post-wait bookkeeping, not the wait
+// primitive at all).
+fn wifi_rx_poll_diag(devaddr: u32, mps: u32) -> i64 {
+  let epaddr: u32 = usb_wifi_get_bulk_in_epaddr();
+  let epnum: u32 = epaddr & (0x0F as u32);
+  let dma: mut ref i64 = usb_bulk_data_scratch_get();
+  let hcchar0: i64 = dwc2_hcchar0_addr();
+  let hctsiz0: i64 = dwc2_hctsiz0_addr();
+  let hcdma0: i64 = dwc2_hcdma0_addr();
+  let hcint0: i64 = dwc2_hcint0_addr();
+
+  let toggle: u32 = usb_wifi_get_in_toggle();
+  let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
+  let want_len: i64 = mps as i64;
+  let pktcnt: u32 = 1 as u32;
+  let _ = dwc2_reset_chan0_for_new_transfer();
+  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
+  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
+  let hcchar_val: u32 = dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps);
+  let _ = mmio_write_u32(hcchar0, hcchar_val);
+
+  let _ = uart_puts("WIFI RX DIAG: armed hcchar=0x");
+  let _ = uart_put_hex32(hcchar_val);
+  let _ = uart_puts(" epnum=");
+  let _ = uart_put_i64(epnum as i64);
+  let _ = uart_puts(" devaddr=");
+  let _ = uart_put_i64(devaddr as i64);
+  let _ = uart_puts(" pid=");
+  let _ = uart_put_i64(pid as i64);
+  let _ = uart_puts(" hctsiz=0x");
+  let _ = uart_put_hex32(mmio_read_u32(hctsiz0));
+  // TEMPORARY DIAGNOSTIC (2026-11-15 continued): rtl8188cu_enable_rf
+  // (ported from rtl8xxxu_gen1_enable_rf) only ever touches
+  // OFDM_RF_PATH_TX_MASK (bits[7:4]) in REG_OFDM0_TRX_PATH_ENABLE
+  // (0x0c04) -- confirmed faithful to the real driver, which ALSO never
+  // explicitly sets OFDM_RF_PATH_RX_A (bit0, RX path A enable) anywhere
+  // in its own enable_rf. Whether RX actually works at all hinges on
+  // this bit's power-on-reset default, which this driver has never
+  // once read back and printed -- checking directly rather than
+  // guessing from the datasheet or the reference driver's silence on
+  // it (silence that's equally consistent with "already enabled at
+  // reset, nothing to do" and "needs fops->iqk to transiently touch it,
+  // which runs once and this driver's own IQK port may or may not
+  // preserve correctly").
+  let _ = uart_puts(" trx_path_enable=0x");
+  let _ = uart_put_hex32(rtl_reg_read32(devaddr, mps, 0x0c04 as u32));
+  let _ = uart_puts("\n");
+
+  let chena_bit: u32 = (1 as u32) << (31 as u32);
+  let tries: i64 = 0;
+  let nak_count: i64 = 0;
+  let last_hi: u32 = 0 as u32;
+  let stop: i64 = 0;
+  while (tries < (5000 as i64)) && (stop == 0) {
+    let hi: u32 = mmio_read_u32(hcint0);
+    if hi != (0 as u32) {
+      last_hi = hi;
+      if (hi & (0x10 as u32)) != (0 as u32) {
+        nak_count = nak_count + 1;
+        let _ = mmio_write_u32(hcint0, hi);
+        let rearm: u32 = mmio_read_u32(hcchar0) | chena_bit;
+        let _ = mmio_write_u32(hcchar0, rearm);
+      } else {
+        let _ = mmio_write_u32(hcint0, hi);
+        stop = 1;
+      }
+    }
+    tries = tries + 1;
+  }
+  let _ = uart_puts("WIFI RX DIAG: after poll tries=");
+  let _ = uart_put_i64(tries);
+  let _ = uart_puts(" nak_count=");
+  let _ = uart_put_i64(nak_count);
+  let _ = uart_puts(" last_hi=0x");
+  let _ = uart_put_hex32(last_hi);
+  let _ = uart_puts(" final_hcchar=0x");
+  let _ = uart_put_hex32(mmio_read_u32(hcchar0));
+  let _ = uart_puts(" final_hcint=0x");
+  let _ = uart_put_hex32(mmio_read_u32(hcint0));
+  let _ = uart_puts("\n");
+  return 0;
+}
+
 fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   if wifi_radio_init_rtl8188cu() == 0 {
     let _ = uart_puts("wifi listen: no USB WiFi device enumerated\n");
@@ -48738,6 +51023,14 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   while poll < poll_cap {
     if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
       let _ = watchdog_kick();
+    }
+    // TEMPORARY DIAGNOSTIC (2026-11-15, still chasing "0/300" after the
+    // NAK-retry fix to dwc2_wait_chan0_done_bounded): see this band's
+    // own print output for what this is isolating -- genuine hardware
+    // silence (HCINT never nonzero) vs. a NAK that something still
+    // mishandles.
+    if poll < (3 as i64) {
+      let _ = wifi_rx_poll_diag(devaddr, mps_in);
     }
     let raw_status: i64 = dwc2_wifi_bulk_in(devaddr, mps_in, raw_scratch, mps_in as i64);
     if raw_status >= 0 {
@@ -55842,6 +58135,13 @@ fn kernel_main() -> i64 {
   let _ = uart_digits_scratch_set(dhruva_alloc_bytes(24));
   let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(128));
   let _ = usb_bulk_data_scratch_set(dhruva_alloc_bytes(512));
+  let _ = usb_downstream_desc_scratch_set(dhruva_alloc_bytes(18));
+  let _ = hub_port_status_scratch_set(dhruva_alloc_bytes(4));
+  let _ = rtl_lan_reg_scratch_set(dhruva_alloc_bytes(4));
+  let _ = netif_tx_wrap_scratch_set(dhruva_alloc_bytes(520));
+  let _ = netif_tx_chunk_scratch_set(dhruva_alloc_bytes(64));
+  let _ = netif_rx_raw_scratch_set(dhruva_alloc_bytes(520));
+  let _ = netif_rx_chunk_scratch_set(dhruva_alloc_bytes(64));
   // Task #357: uart_puts's own DMA-path scratch buffer, allocated here
   // (same single "all persistent scratch buffers" spot every other
   // one in this project goes through) -- but unlike those, uart_puts

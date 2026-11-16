@@ -157,6 +157,132 @@ dwc2_dma_scratch_addr:
                          * yet, so it gets its own dedicated buffer
                          * rather than assuming sharing is safe without
                          * verifying it the way those were. */
+usb_downstream_desc_scratch_addr:
+    .word 0             /* 18 bytes: dwc2_enumerate_one_downstream_
+                         * device's own GET_DESCRIPTOR result buffer
+                         * (shared by its 8-byte address-0 fetch and its
+                         * later 18-byte post-SET_ADDRESS fetch -- 18
+                         * bytes covers both, and the two fetches are
+                         * sequential, never concurrent, so one buffer
+                         * is safe). BUG FOUND 2026-11-12 (real-HW heap-
+                         * exhaustion FATAL during WiFi-enumeration
+                         * investigation): this function used to call
+                         * dhruva_alloc_bytes(8)/dhruva_alloc_bytes(18)
+                         * fresh on every call -- and it's called once
+                         * per OUTER port-bring-up retry attempt (up to
+                         * usb_first_contact_retry_count()=5 times) for
+                         * EACH hub port checked, with nothing ever
+                         * freeing those allocations (this allocator has
+                         * no free at all). Exactly the same "never call
+                         * dhruva_alloc_bytes on every call" lesson
+                         * dwc2_dma_scratch's own comment above already
+                         * documents for this exact USB enumeration
+                         * code -- this function just didn't follow it.
+                         * Normally harmless (a few hundred bytes), but
+                         * a boot with several ports repeatedly failing
+                         * enumeration (seen live this session, chasing
+                         * an unrelated WiFi RX bug) burns through enough
+                         * of the already-thin boot-time heap headroom
+                         * to hit a real FATAL out-of-memory halt. */
+hub_port_status_scratch_addr:
+    .word 0             /* 4 bytes: GET_PORT_STATUS result buffer,
+                         * shared by dwc2_hub_bring_up_port, dwc2_hub_
+                         * port_debounce_connected and usb_hotplug_
+                         * sample_port_connected. BUG FOUND 2026-11-13
+                         * (same session, same class as usb_downstream_
+                         * desc_scratch above, found while that OTHER
+                         * fix's own fresh boot still hit the identical
+                         * FATAL): all three of these functions called
+                         * dhruva_alloc_bytes(4) fresh on every call, and
+                         * all three run once per port-retry attempt --
+                         * dwc2_hub_port_debounce_connected and dwc2_hub_
+                         * bring_up_port are even called from the SAME
+                         * outer retry loop, so a port that keeps failing
+                         * leaked two 4-byte blocks per attempt, not one.
+                         * None of the three calls overlap (each reads
+                         * its own result and returns before the next is
+                         * ever called), so one shared buffer is safe. */
+rtl_lan_reg_scratch_addr:
+    .word 0             /* 4 bytes: shared read/write scratch for
+                         * lan9512_reg_read/write and rtl_reg_read8/16/32
+                         * + rtl_reg_write8/16/32 -- the WORST instance
+                         * of this same bug class found this session.
+                         * These are the low-level register-access
+                         * primitives for RTL8188CU MAC bring-up (RF
+                         * table programming, CCK/OFDM enable, LC
+                         * calibration, firmware handshake, ...), called
+                         * from everywhere in that bring-up sequence --
+                         * easily 100+ times in a single boot's worth of
+                         * chip init, each one a fresh dhruva_alloc_
+                         * bytes(1/2/4) with nothing ever freed. This is
+                         * the real dominant contributor to the real-HW
+                         * "FATAL: dhruva_alloc_bytes out of memory"
+                         * halt that kept recurring even after the hub-
+                         * port-status leak (above) was fixed -- MAC
+                         * bring-up burns through far more heap per boot
+                         * than a few port-retry attempts ever could.
+                         * Safe to share one buffer across all 8 call
+                         * sites: every one of them completes its control
+                         * transfer and copies the result out to local
+                         * u32s before returning, and rtl_rf_reg_read/
+                         * write (which call these) do so sequentially,
+                         * never with two live at once. */
+netif_tx_wrap_scratch_addr:
+    .word 0             /* 520 bytes: netif_send_frame's own LAN9512
+                         * TX-framing wrapped_buf (8-byte TX_CMD_A/B
+                         * header + up to 512 bytes of frame). BUG FOUND
+                         * 2026-11-13 (real-HW live crash, not a QEMU
+                         * finding): this is THE call site that matches
+                         * the live FATAL's own "requested 520 bytes"
+                         * message exactly -- confirmed by direct grep
+                         * for dhruva_alloc_bytes(520), not inferred.
+                         * netif_send_frame is the single egress choke
+                         * point for every outgoing frame (ARP/IPv4/
+                         * ICMP/UDP/TCP, per its own header comment) --
+                         * a DHCP client endlessly retrying DISCOVER with
+                         * no server on the bench (exactly this session's
+                         * setup) calls it repeatedly, each call leaking
+                         * another 520 bytes with nothing ever freed.
+                         * Only live in the LAN9512 (usb_net_get_kind()
+                         * ==2) branch; the CDC-ECM branch never touches
+                         * it, so no overlap with netif_tx_chunk_scratch
+                         * below even though that one IS shared across
+                         * both branches. */
+netif_tx_chunk_scratch_addr:
+    .word 0             /* 64 bytes: netif_send_frame's per-USB-packet
+                         * chunk buffer -- chunk_buf (CDC-ECM branch,
+                         * kind==1) and chunk_buf2 (LAN9512 branch,
+                         * kind==2) are the SAME never-free bug, just in
+                         * mutually-exclusive branches (usb_net_get_kind()
+                         * is one fixed value for the whole boot), so one
+                         * shared buffer covers both. Within the kind==2
+                         * branch this chunk buffer and netif_tx_wrap_
+                         * scratch above are both alive at once (the
+                         * chunking loop re-reads wrap while filling
+                         * chunk), which is exactly why they need
+                         * separate storage, not one shared slot. */
+netif_rx_raw_scratch_addr:
+    .word 0             /* 520 bytes: netif_recv_frame's own LAN9512
+                         * RX-framing raw_buf (4-byte status + 2-byte
+                         * NET_IP_ALIGN pad + up to 514 bytes of frame+
+                         * FCS). Same bug, RX side: netif_recv_frame is
+                         * the single ingress funnel, polled continuously
+                         * by the network stack regardless of whether a
+                         * frame actually arrived, so this leak accrues
+                         * even faster than the TX side above -- the
+                         * likely dominant contributor to the live "520
+                         * bytes" FATAL, not just a contributor. */
+netif_rx_chunk_scratch_addr:
+    .word 0             /* 64 bytes: netif_recv_frame's per-USB-packet
+                         * chunk buffer -- chunk_buf (kind==1) and
+                         * chunk_buf3 (kind==2), same mutual-exclusion
+                         * reasoning as netif_tx_chunk_scratch above.
+                         * Separate from the TX-side scratch slots (not
+                         * reused across send/recv): the two functions
+                         * aren't documented as mutually exclusive in
+                         * time the way the hub-port and RF-register
+                         * call sites are, so each direction keeps its
+                         * own storage. */
 tcp_empty_payload_scratch_addr:
     .word 0             /* 1 byte: the placeholder payload pointer
                          * every TCP control segment (SYN, ACK, FIN,
@@ -907,6 +1033,104 @@ dwc2_dma_scratch_set:
 .global dwc2_dma_scratch_get
 dwc2_dma_scratch_get:
     ldr r0, =dwc2_dma_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_downstream_desc_scratch_set
+usb_downstream_desc_scratch_set:
+    ldr r1, =usb_downstream_desc_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global usb_downstream_desc_scratch_get
+usb_downstream_desc_scratch_get:
+    ldr r0, =usb_downstream_desc_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global hub_port_status_scratch_set
+hub_port_status_scratch_set:
+    ldr r1, =hub_port_status_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global hub_port_status_scratch_get
+hub_port_status_scratch_get:
+    ldr r0, =hub_port_status_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global rtl_lan_reg_scratch_set
+rtl_lan_reg_scratch_set:
+    ldr r1, =rtl_lan_reg_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global rtl_lan_reg_scratch_get
+rtl_lan_reg_scratch_get:
+    ldr r0, =rtl_lan_reg_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global netif_tx_wrap_scratch_set
+netif_tx_wrap_scratch_set:
+    ldr r1, =netif_tx_wrap_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global netif_tx_wrap_scratch_get
+netif_tx_wrap_scratch_get:
+    ldr r0, =netif_tx_wrap_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global netif_tx_chunk_scratch_set
+netif_tx_chunk_scratch_set:
+    ldr r1, =netif_tx_chunk_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global netif_tx_chunk_scratch_get
+netif_tx_chunk_scratch_get:
+    ldr r0, =netif_tx_chunk_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global netif_rx_raw_scratch_set
+netif_rx_raw_scratch_set:
+    ldr r1, =netif_rx_raw_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global netif_rx_raw_scratch_get
+netif_rx_raw_scratch_get:
+    ldr r0, =netif_rx_raw_scratch_addr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global netif_rx_chunk_scratch_set
+netif_rx_chunk_scratch_set:
+    ldr r1, =netif_rx_chunk_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global netif_rx_chunk_scratch_get
+netif_rx_chunk_scratch_get:
+    ldr r0, =netif_rx_chunk_scratch_addr
     ldr r0, [r0]
     mov r1, #0
     bx lr
