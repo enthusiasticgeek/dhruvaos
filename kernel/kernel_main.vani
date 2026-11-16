@@ -32280,6 +32280,59 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   } else {
     let _ = uart_puts("USB: RTL8188CU BB/AGC/RF phy tables SKIPPED (WIFI_PHY_TABLE_LOAD_ENABLED=0, causality test)\n");
   }
+  // BUG FOUND 2026-11-16 ("check Linux/other OS references, you may be
+  // missing something fundamental" -- correct): real Linux's
+  // rtl8xxxu_init_device() does three MORE register writes immediately
+  // after init_phy_bb/init_phy_rf (the BB/AGC/RF table load directly
+  // above) that this driver had never ported anywhere -- the real,
+  // PERMANENT RF front-end antenna TX/RX-switch + power-amplifier-
+  // enable configuration, as opposed to the TEMPORARY save/restore
+  // version rtl8188cu_iq_calibrate's own IQK sequence already does
+  // (confirmed separately, already correct -- this is a DIFFERENT,
+  // steady-state write that happens once, unconditionally, for every
+  // real boot, not an IQK-internal detail):
+  //   if (chip not in {8723B,8192E,8188E,8710B,8192F})
+  //     write32(REG_FPGA0_TX_INFO=0x0804, 0x00000003);
+  //   val32 = FPGA0_RF_TRSW(BIT5)|TRSWB(BIT6)|ANTSW(BIT8)|ANTSWB(BIT9)
+  //         | ((ANTSW|ANTSWB) << 16)
+  //         | (no_pape ? 0 : FPGA0_RF_PAPE(BIT10)|(PAPE<<16));
+  //   write32(REG_FPGA0_XAB_RF_SW_CTRL=0x0870, val32);
+  //   if (chip not in {8192E,8188E,8710B,8192F})
+  //     write32(REG_FPGA0_XA_RF_INT_OE=0x0860, 0x66f60210);
+  // RTL8188CU/RTL8192CU is excluded from NEITHER conditional (only the
+  // listed newer chip families are), and `no_pape` is only ever set for
+  // the separate hi-PA RTL8188R variant (confirmed in 8192c.c's own
+  // efuse-vendor detection) -- this exact chip always includes the PAPE
+  // bits. Without this, REG_FPGA0_XAB_RF_SW_CTRL was left at whatever
+  // the BB init table's own entry happened to set it to (0x03000300 --
+  // ANTSW/ANTSWB only, missing TRSW/TRSWB AND the PAPE -- power
+  // amplifier enable -- bits entirely), a real, previously-undiscovered
+  // gap: without PAPE, every frame this chip transmits leaves the
+  // antenna at drastically reduced power (the PA bypassed), plausibly
+  // explaining "a received Beacon/Probe-Response/data frame from the AP
+  // works fine (that's the AP's own, fully-amplified TX reaching OUR
+  // receiver), but the AP never acknowledges or responds to anything WE
+  // transmit" -- exactly tonight's remaining symptom, and consistent
+  // with the user's own real-world confirmation that this identical USB
+  // dongle/antenna already works correctly under Raspbian (ruling out
+  // hardware, leaving this exact software gap).
+  let fpga0_tx_info: u32 = rtl_reg_read32(devaddr, mps, 0x0804 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, 0x0804 as u32, 0x00000003 as u32);
+  let _ = uart_puts("USB: RTL8188CU REG_FPGA0_TX_INFO before=0x");
+  let _ = uart_put_hex32(fpga0_tx_info);
+  let _ = uart_puts(" after=0x00000003\n");
+  let rf_sw_ctrl_val: u32 = (0x20 as u32) | (0x40 as u32) | (0x100 as u32) | (0x200 as u32) | (0x400 as u32) | (0x03000000 as u32) | (0x04000000 as u32);
+  let rf_sw_ctrl_before: u32 = rtl_reg_read32(devaddr, mps, 0x0870 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, 0x0870 as u32, rf_sw_ctrl_val);
+  let rf_sw_ctrl_after: u32 = rtl_reg_read32(devaddr, mps, 0x0870 as u32);
+  let _ = uart_puts("USB: RTL8188CU REG_FPGA0_XAB_RF_SW_CTRL (antenna TX/RX switch + PA enable) before=0x");
+  let _ = uart_put_hex32(rf_sw_ctrl_before);
+  let _ = uart_puts(" wrote=0x");
+  let _ = uart_put_hex32(rf_sw_ctrl_val);
+  let _ = uart_puts(" readback=0x");
+  let _ = uart_put_hex32(rf_sw_ctrl_after);
+  let _ = uart_puts("\n");
+  let _ = rtl_reg_write32(devaddr, mps, 0x0860 as u32, 0x66f60210 as u32);
   let _ = rtl8188cu_enable_engines(devaddr, mps);
   let _ = rtl8188cu_set_rcr(devaddr, mps);
   // BUG FOUND 2026-11-16 (live, after an exhaustive TX-descriptor/
