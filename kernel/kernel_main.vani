@@ -30993,6 +30993,9 @@ const RTL_REG_USB_SPECIAL_OPTION: u32 = 0xfe55;
 const RTL_REG_RXFLTMAP0: u32 = 0x06a0; // management-frame per-subtype RX filter
 const RTL_REG_RXFLTMAP2: u32 = 0x06a4; // data-frame per-subtype RX filter
 const RTL_REG_OFDM0_XA_AGC_CORE1: u32 = 0x0c50; // RX path-A AGC initial-gain index, bits[6:0]
+const RTL_REG_AFE_PLL_CTRL: u32 = 0x0028;
+const RTL_REG_AFE_XTAL_CTRL: u32 = 0x0024;
+const RTL_REG_RF_CTRL: u32 = 0x001f;
 // 2026-11-16: causality-test gate for the BB/AGC/RF phy table load -- see
 // rtl8188cu_mac_bringup's own call-site comment for the full "why". The
 // causality test itself turned out invalid (see wifi_rx_poll_diag's own
@@ -31344,6 +31347,67 @@ fn rtl8188cu_set_mac_addr(devaddr: u32, mps: u32, mac: mut ref i64) -> i64 {
 // back may itself be what pushed channel 0 into the new flat-silent state.
 // Now returns a fail count instead of a constant 0 so the caller can log
 // real pass/fail evidence instead of assuming success.
+// BUG FOUND 2026-11-16 (real-HW investigation, user: "you are missing
+// something software-related" -- correct, again): found by reading past
+// where this project's own prior research stopped -- Linux's REAL
+// `rtl8xxxu_gen1_init_phy_bb` (core.c) does FIVE register writes
+// immediately before it calls `rtl8xxxu_init_phy_regs` to load the BB
+// table (this driver's own `rtl8188cu_load_bb_table_part1/2`) and the AGC
+// table (`rtl8188cu_load_agc_table`) -- none of which this driver has ever
+// ported anywhere:
+//   1. REG_AFE_PLL_CTRL (0x0028) bit1 (AFE_PLL_320_ENABLE) set -- turns on
+//      the 320MHz AFE PLL that clocks the whole baseband ADC/DAC pipeline.
+//   2. REG_AFE_PLL_CTRL+1 (0x0029) = 0xff.
+//   3. REG_SYS_FUNC (0x0002) bits 0/1 (SYS_FUNC_BBRSTB | SYS_FUNC_BB_GLB_
+//      RSTN) SET -- brings the baseband digital logic block out of reset.
+//      THIS is the one that matters most: every BB/AGC/RF-table register
+//      this driver writes lives inside that same reset domain. With it
+//      still held in reset, a register write can complete perfectly at
+//      the USB-transport level (vendor command ACKed) while the
+//      underlying digital logic silently ignores it -- exactly matching
+//      this session's own conclusively-reproduced finding, immediately
+//      above and in rtl8188cu_enable_rf's own TRX_PATH_ENABLE readback:
+//      REG_OFDM0_TRX_PATH_ENABLE reads back 0x0F00000F (this chip's real
+//      power-on-reset default for that register, confirmed against the
+//      datasheet reset pattern) no matter how many times this driver
+//      writes 0x03a05611 to it. A register that never leaves its own
+//      POR default despite successful writes is the signature of a
+//      write landing in a block still held in reset, not a transport
+//      failure (which the live NAK/HFNUM audit this same round already
+//      ruled out independently).
+//   4. REG_AFE_XTAL_CTRL (0x0024) bit14 (AFE_XTAL_RF_GATE) CLEARED --
+//      ungates the crystal clock to the RF front end. (bit20/AFE_XTAL_
+//      BT_GATE intentionally not touched -- no Bluetooth function on
+//      this chip's own driver path.)
+//   5. REG_RF_CTRL (0x001f) = RF_ENABLE|RF_RSTB|RF_SDMRSTB (0x07) -- the
+//      RF6052 synthesizer's own digital control/reset lines.
+// Without all five, the chip's own USB/MAC core (confirmed alive: real
+// NAKs, a genuinely incrementing HFNUM) can be completely correct while
+// the baseband+RF digital logic underneath it never leaves reset --
+// fully explaining "every register looks right on paper, TX transactions
+// complete at the USB level, RX is a hard 0/300" simultaneously. Placed
+// here, called once immediately before the BB table load (matching the
+// real driver's own exact ordering inside init_phy_bb), not folded into
+// enable_rf/mac_bringup's other steps -- those run AFTER the table load
+// in both this driver and the reference, and would still be writing into
+// a block already correctly out of reset by the time they run.
+fn rtl8188cu_bb_rf_leave_reset(devaddr: u32, mps: u32) -> i64 {
+  let afe_pll: u32 = rtl_reg_read8(devaddr, mps, RTL_REG_AFE_PLL_CTRL);
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_AFE_PLL_CTRL, afe_pll | (0x02 as u32)); // AFE_PLL_320_ENABLE
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_AFE_PLL_CTRL + (1 as u32), 0xff as u32);
+
+  let sys_func: u32 = rtl_reg_read16(devaddr, mps, 0x0002 as u32); // REG_SYS_FUNC
+  let _ = rtl_reg_write16(devaddr, mps, 0x0002 as u32, sys_func | (0x03 as u32)); // SYS_FUNC_BBRSTB | SYS_FUNC_BB_GLB_RSTN
+
+  let xtal: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_AFE_XTAL_CTRL);
+  let xtal_clear: u32 = xtal & (((1 << 14) as u32) ^ (0xFFFFFFFF as u32)); // clear AFE_XTAL_RF_GATE
+  let _ = rtl_reg_write32(devaddr, mps, RTL_REG_AFE_XTAL_CTRL, xtal_clear);
+
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_RF_CTRL, 0x07 as u32); // RF_ENABLE | RF_RSTB | RF_SDMRSTB
+  let _ = uart_puts("USB: RTL8188CU baseband/RF brought out of reset (AFE_PLL/SYS_FUNC_BBRSTB+BB_GLB_RSTN/XTAL_RF_GATE/RF_CTRL)\n");
+  return 0;
+}
+
 fn rtl8188cu_load_bb_table_part1(devaddr: u32, mps: u32) -> i64 {
   let fail_count: i64 = 0;
   if rtl_reg_write32(devaddr, mps, 0x800 as u32, 0x80040000 as u32) != 0 { fail_count = fail_count + 1; }
@@ -32143,6 +32207,7 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   // is a deliberate temporary disable for isolation, not a permanent
   // revert.
   if WIFI_PHY_TABLE_LOAD_ENABLED == (1 as u32) {
+    let _ = rtl8188cu_bb_rf_leave_reset(devaddr, mps);
     let bb_fail1: i64 = rtl8188cu_load_bb_table_part1(devaddr, mps);
     let bb_readback_immediate: u32 = rtl_reg_read32(devaddr, mps, 0x0c04 as u32);
     let bb_fail2: i64 = rtl8188cu_load_bb_table_part2(devaddr, mps);
