@@ -32268,6 +32268,89 @@ fn rtl8188cu_set_channel_self_test() -> i64 {
 // costs a full reboot cycle -- worth doing next if LC cal alone
 // doesn't resolve the zero-reception symptom, not worth the
 // transcription risk before that result is in.
+
+// BUG FOUND 2026-11-16 ("sure no other thing like handshake failure or
+// just some registers or gating missed" -- correct, a whole block was):
+// real Linux's rtl8xxxu_init_device() has a large section, right after
+// RCR/RXFLTMAP setup and before enable_rf, that this driver had NEVER
+// ported ANY of -- found by re-reading that function end to end instead
+// of re-checking already-ported pieces. The two most likely to matter
+// for "AP never ACKs/replies to our unicast Auth Request, but broadcast
+// (no-ACK-needed) frames work fine":
+//   - REG_RETRY_LIMIT (0x042a, set_retry(0x30,0x30)): the hardware's
+//     OWN short/long retry ceiling for ACK-required unicast frames.
+//     Never initialized -- sat at whatever power-on-reset default this
+//     silicon has, plausibly 0 or very low. A broadcast frame needs
+//     ZERO retries (never ACKed either way) so this gap was invisible
+//     for every TX this driver had confirmed working before now; a
+//     SINGLE-SHOT unicast frame on a real, busy channel (confirmed
+//     live: this exact antenna sees multiple Data/Control frames per
+//     second) has a real chance of simply never getting through with
+//     no retry margin at all, while Linux's own 0x30 (48) retries make
+//     eventual success overwhelmingly likely.
+//   - REG_ACKTO (0x0640, 0x40): how long OUR OWN hardware waits for the
+//     AP's ACK after transmitting before counting it a failure needing
+//     retry. Also never initialized.
+// Also ported in the same pass (same unported block, same real driver
+// section, unconditional for every chip of this family): REG_MSR
+// (0x0102, link-type state -- never told the hardware MAC it's
+// operating as an infrastructure STATION at all, sat at whatever
+// "no link" default exists), REG_RESPONSE_RATE_SET (0x0440, which
+// rates the hardware is allowed to use for its own auto-generated
+// responses), SIFS/EDCA/DARFRC-RARFRC timing+contention parameters,
+// REG_FWHW_TXQ_CTRL's AMPDU-retry bit, REG_HWSEQ_CTRL, REG_BAR_MODE_
+// CTRL, and REG_CAM_CMD's invalidate-all-entries housekeeping write.
+// None of RTL8188CU/RTL8192CU's various per-chip exclusion lists in the
+// real function apply to this chip for any of these.
+fn rtl8188cu_init_sta_mac_params(devaddr: u32, mps: u32) -> i64 {
+  // REG_RESPONSE_RATE_SET (0x0440): clear RESPONSE_RATE_BITMAP_ALL
+  // (0xfffff), set RESPONSE_RATE_RRSR_CCK_ONLY_1M (0xffff1).
+  let rrsr: u32 = rtl_reg_read32(devaddr, mps, 0x0440 as u32);
+  let rrsr_cleared: u32 = rrsr & ((0xfffff as u32) ^ (0xFFFFFFFF as u32));
+  let _ = rtl_reg_write32(devaddr, mps, 0x0440 as u32, rrsr_cleared | (0xffff1 as u32));
+
+  // REG_RETRY_LIMIT (0x042a): short retry (bits[15:8]) and long retry
+  // (bits[7:0]), both 0x30 (48) -- matches Linux's own set_retry(0x30,0x30).
+  let _ = rtl_reg_write16(devaddr, mps, 0x042a as u32, 0x3030 as u32);
+
+  // SIFS timing (steady-state values; the real driver's own transient
+  // double-write of a DIFFERENT spec-SIFS value around its own retry-
+  // limit write is a chip-timing nuance for that specific write
+  // sequence, not a steady-state requirement -- not ported).
+  let _ = rtl_reg_write16(devaddr, mps, 0x063a as u32, 0x100a as u32); // REG_MAC_SPEC_SIFS
+  let _ = rtl_reg_write16(devaddr, mps, 0x0514 as u32, 0x100a as u32); // REG_SIFS_CCK
+  let _ = rtl_reg_write16(devaddr, mps, 0x0516 as u32, 0x100a as u32); // REG_SIFS_OFDM
+
+  // EDCA (channel-access contention) parameters, one per access category.
+  let _ = rtl_reg_write32(devaddr, mps, 0x0508 as u32, 0x005ea42b as u32); // REG_EDCA_BE_PARAM
+  let _ = rtl_reg_write32(devaddr, mps, 0x050c as u32, 0x0000a44f as u32); // REG_EDCA_BK_PARAM
+  let _ = rtl_reg_write32(devaddr, mps, 0x0504 as u32, 0x005ea324 as u32); // REG_EDCA_VI_PARAM
+  let _ = rtl_reg_write32(devaddr, mps, 0x0500 as u32, 0x002fa226 as u32); // REG_EDCA_VO_PARAM
+
+  // Data/response auto-rate-fallback retry-count tables.
+  let _ = rtl_reg_write32(devaddr, mps, 0x0430 as u32, 0x00000000 as u32); // REG_DARFRC
+  let _ = rtl_reg_write32(devaddr, mps, 0x0434 as u32, 0x10080404 as u32); // REG_DARFRC+4
+  let _ = rtl_reg_write32(devaddr, mps, 0x0438 as u32, 0x04030201 as u32); // REG_RARFRC
+  let _ = rtl_reg_write32(devaddr, mps, 0x043c as u32, 0x08070605 as u32); // REG_RARFRC+4
+
+  let fwhw_txq: u32 = rtl_reg_read8(devaddr, mps, 0x0420 as u32); // REG_FWHW_TXQ_CTRL
+  let _ = rtl_reg_write8(devaddr, mps, 0x0420 as u32, fwhw_txq | (0x80 as u32)); // FWHW_TXQ_CTRL_AMPDU_RETRY
+
+  let _ = rtl_reg_write8(devaddr, mps, 0x0640 as u32, 0x40 as u32); // REG_ACKTO
+
+  let _ = rtl_reg_write8(devaddr, mps, 0x0423 as u32, 0xff as u32); // REG_HWSEQ_CTRL
+  let _ = rtl_reg_write32(devaddr, mps, 0x04cc as u32, 0x0201ffff as u32); // REG_BAR_MODE_CTRL
+  let _ = rtl_reg_write32(devaddr, mps, 0x0670 as u32, 0xC0000000 as u32); // REG_CAM_CMD (CAM_CMD_POLLING|BIT30)
+
+  // REG_MSR (0x0102): link-type state, bits[1:0] for port 0 -- set to
+  // MSR_LINKTYPE_STATION (0x2), preserving port 1's own bits (mask 0x0c).
+  let msr: u32 = rtl_reg_read8(devaddr, mps, 0x0102 as u32);
+  let msr_port0_cleared: u32 = msr & (0x0c as u32);
+  let _ = rtl_reg_write8(devaddr, mps, 0x0102 as u32, msr_port0_cleared | (0x02 as u32));
+
+  let _ = uart_puts("USB: RTL8188CU STA MAC params initialized (RRSR/RETRY_LIMIT/SIFS/EDCA/DARFRC-RARFRC/ACKTO/MSR=STATION)\n");
+  return 0;
+}
 fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   let llt_status: i64 = rtl8188cu_llt_table_init(devaddr, mps);
   if llt_status != 0 {
@@ -32405,6 +32488,7 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
     mbi = mbi + 1;
   }
   let _ = rtl8188cu_set_mac_addr(devaddr, mps, mac_buf);
+  let _ = rtl8188cu_init_sta_mac_params(devaddr, mps);
   let _ = rtl8188cu_enable_rf(devaddr, mps);
   // BUG FOUND 2026-11-13: see rtl8188cu_init_aggregation's own header
   // comment -- disables USB RX DMA aggregation (never configured by
