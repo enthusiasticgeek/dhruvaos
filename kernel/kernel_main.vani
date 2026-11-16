@@ -50516,10 +50516,56 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out
     i = i + 1;
   }
 
+  // BUG FOUND 2026-11-16 (live "wifi join: authentication/association
+  // refused by the AP" on the first real run after the RX fix made
+  // reception work at all): this never checked WHICH device a received
+  // management frame actually came from before feeding it into the
+  // join state machine as if it had to be the one awaited response.
+  // With other real APs/stations in range (confirmed live: this exact
+  // antenna hears multiple management frames per second on every
+  // channel tested, not just the target AP's own), any stray Beacon or
+  // other mgmt frame arriving first -- e.g. one with no RSN IE, from an
+  // unrelated AP -- was processed as THE Probe Response and failed the
+  // whole join immediately, non-deterministically depending purely on
+  // RF timing/arrival order. No hardware BSSID filter exists on this
+  // chip's own RCR config to rely on instead (RCR_CBSSID_* bits are
+  // never set -- confirmed, this driver does all frame-source filtering
+  // in software or nowhere at all). Real wpa_supplicant/mac80211 never
+  // have this problem because mac80211 already tags every RX frame with
+  // which BSS it belongs to before userspace ever sees it; this
+  // orchestrator has no such tagging, so it must filter by source
+  // address itself. Address 2 (source) is the AP's own address for
+  // every frame type this state machine ever waits on (Probe Response/
+  // Auth Response/Assoc Response are all AP-to-station unicast) --
+  // anything else is simply ignored (same state, nothing transmitted,
+  // not a failure), not failed.
+  if (state == WPA2_JOIN_WAIT_PROBE_RESP) || (state == WPA2_JOIN_WAIT_AUTH_RESP) || (state == WPA2_JOIN_WAIT_ASSOC_RESP) {
+    let addr1: [u8; 6] = [0 as u8; 6];
+    let addr2: [u8; 6] = [0 as u8; 6];
+    let addr3: [u8; 6] = [0 as u8; 6];
+    let _ = mac_header_parse(rx_buf, mut ref addr1, mut ref addr2, mut ref addr3);
+    let from_bss: i64 = 1;
+    let fi: i64 = 0;
+    while fi < 6 {
+      if addr2[fi] != bssid[fi] { from_bss = 0; }
+      fi = fi + 1;
+    }
+    if from_bss == 0 {
+      return Wpa2JoinResult { state: state, tx_len: 0, done: 0, failed: 0 };
+    }
+  }
+
   if state == WPA2_JOIN_WAIT_PROBE_RESP {
     let ssid_out: [u8; 32] = [0 as u8; 32];
     let info: ProbeRespInfo = probe_response_parse(rx_buf, rx_len, mut ref ssid_out);
     if (info.ok != 1) || (info.has_rsn != 1) {
+      let _ = uart_puts("wifi join DIAG: probe-response reject -- ok=");
+      let _ = uart_put_i64(info.ok);
+      let _ = uart_puts(" has_rsn=");
+      let _ = uart_put_i64(info.has_rsn);
+      let _ = uart_puts(" rx_len=");
+      let _ = uart_put_i64(rx_len);
+      let _ = uart_puts("\n");
       let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
       return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
     }
@@ -50533,6 +50579,22 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out
 
   if state == WPA2_JOIN_WAIT_AUTH_RESP {
     if auth_response_parse(rx_buf, rx_len) != 1 {
+      // Diagnostic-only re-read of the same fixed fields auth_response_
+      // parse itself checks (algorithm/transaction/status, buf[24..30))
+      // -- not a second parse decision, just visibility into which of
+      // the three it rejected on.
+      let diag_algorithm: i64 = (rx_buf[24] as i64) | ((rx_buf[25] as i64) << (8 as i64));
+      let diag_transaction: i64 = (rx_buf[26] as i64) | ((rx_buf[27] as i64) << (8 as i64));
+      let diag_status: i64 = (rx_buf[28] as i64) | ((rx_buf[29] as i64) << (8 as i64));
+      let _ = uart_puts("wifi join DIAG: auth-response reject -- algorithm=");
+      let _ = uart_put_i64(diag_algorithm);
+      let _ = uart_puts(" transaction=");
+      let _ = uart_put_i64(diag_transaction);
+      let _ = uart_puts(" status=");
+      let _ = uart_put_i64(diag_status);
+      let _ = uart_puts(" rx_len=");
+      let _ = uart_put_i64(rx_len);
+      let _ = uart_puts("\n");
       let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
       return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
     }
@@ -50551,6 +50613,11 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out
   if state == WPA2_JOIN_WAIT_ASSOC_RESP {
     let info2: AssocRespInfo = assoc_response_parse(rx_buf, rx_len);
     if info2.ok != 1 {
+      let _ = uart_puts("wifi join DIAG: assoc-response reject -- status_code=");
+      let _ = uart_put_i64(info2.status_code);
+      let _ = uart_puts(" rx_len=");
+      let _ = uart_put_i64(rx_len);
+      let _ = uart_puts("\n");
       let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
       return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
     }
