@@ -1,0 +1,16 @@
+[Unit]
+Description=Dhruva OS real-HW WiFi investigation: monitor-mode capture
+# Not enabled/started at boot -- this is a manual, on-demand diagnostic
+# tool, not a persistent service like dhruva-uart-logger.service. It
+# takes this host's own WiFi dongle out of normal (managed) use for the
+# duration, so it must never auto-start.
+
+[Service]
+Type=forking
+ExecStart=/home/virgo/source/dhruvaos/test/wifi_sniff.sh start 1
+ExecStop=/home/virgo/source/dhruvaos/test/wifi_sniff.sh stop
+PIDFile=/run/dhruva-wifi-sniff.pid
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
