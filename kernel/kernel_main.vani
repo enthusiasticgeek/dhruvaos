@@ -50543,14 +50543,35 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out
     let addr1: [u8; 6] = [0 as u8; 6];
     let addr2: [u8; 6] = [0 as u8; 6];
     let addr3: [u8; 6] = [0 as u8; 6];
-    let _ = mac_header_parse(rx_buf, mut ref addr1, mut ref addr2, mut ref addr3);
+    let hdr: Mac80211Hdr = mac_header_parse(rx_buf, mut ref addr1, mut ref addr2, mut ref addr3);
     let from_bss: i64 = 1;
     let fi: i64 = 0;
     while fi < 6 {
       if addr2[fi] != bssid[fi] { from_bss = 0; }
       fi = fi + 1;
     }
-    if from_bss == 0 {
+    // BUG FOUND 2026-11-16 continued (live, immediately after the
+    // BSSID-filter fix above): fixed the "stray frame from an
+    // UNRELATED device" case, but not "the right AP's own Beacon
+    // arrives while this state machine is waiting for a DIFFERENT
+    // frame type" -- the same AP sends a Beacon roughly every 100ms
+    // throughout the whole auth/assoc exchange, so a Beacon (passes
+    // the BSSID check above, since it's from the very AP we're
+    // talking to) was being fed into auth_response_parse as if it had
+    // to be the Authentication Response, producing garbage field
+    // values read from whatever bytes happened to sit at the auth
+    // frame's fixed offsets in a 228-byte Beacon (live: algorithm=0
+    // transaction=32768 status=0 -- transaction=2 is required, so this
+    // failed, but for the wrong reason: wrong frame type, not a real
+    // AP rejection). Real wpa_supplicant/mac80211 never hits this
+    // either, for the same underlying reason as the BSSID case: frames
+    // are already dispatched by subtype before userspace ever sees
+    // them (ieee80211_rx_mgmt_auth only ever receives STYPE_AUTH, never
+    // a Beacon). Added the matching subtype check here, same
+    // "ignore and keep waiting" treatment as a BSSID mismatch.
+    let stype: i64 = hdr.frame_control & (0xFC as i64);
+    let want_stype: i64 = if state == WPA2_JOIN_WAIT_PROBE_RESP { FC_STYPE_PROBE_RESP } else if state == WPA2_JOIN_WAIT_AUTH_RESP { FC_STYPE_AUTH } else { FC_STYPE_ASSOC_RESP };
+    if (from_bss == 0) || (stype != want_stype) {
       return Wpa2JoinResult { state: state, tx_len: 0, done: 0, failed: 0 };
     }
   }
