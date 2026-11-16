@@ -51010,12 +51010,35 @@ fn wifi_rx_poll_diag(devaddr: u32, mps: u32) -> i64 {
   let nak_count: i64 = 0;
   let last_hi: u32 = 0 as u32;
   let stop: i64 = 0;
+  // DIAGNOSTIC (2026-11-16): on the very FIRST NAK only (to avoid
+  // flooding the slow UART across hundreds of NAKs per poll), dump
+  // GINTSTS/HFNUM/GRXSTSR -- all plain MMIO reads of host-controller-
+  // wide status registers, NOT USB control transfers, so (unlike the
+  // 0x0c04 readback this same function's own 2026-11-16 fix comment
+  // above describes) this is safe to do mid-poll without disturbing
+  // channel 0's own in-flight bulk-IN state. GRXSTSR (offset 0x1C) is
+  // the non-popping peek of the top RX-FIFO status entry -- if the
+  // device ever DOES push a real packet into the RX FIFO at the
+  // hardware level (independent of whether channel 0's own transfer
+  // ever reports XFERCOMPL for it), this would be the first place
+  // that becomes visible.
+  let printed_extra: i64 = 0;
   while (tries < (5000 as i64)) && (stop == 0) {
     let hi: u32 = mmio_read_u32(hcint0);
     if hi != (0 as u32) {
       last_hi = hi;
       if (hi & (0x10 as u32)) != (0 as u32) {
         nak_count = nak_count + 1;
+        if printed_extra == 0 {
+          printed_extra = 1;
+          let _ = uart_puts("WIFI RX DIAG: first NAK extras -- GINTSTS=0x");
+          let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x14));
+          let _ = uart_puts(" HFNUM=0x");
+          let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x414));
+          let _ = uart_puts(" GRXSTSR=0x");
+          let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x1C));
+          let _ = uart_puts("\n");
+        }
         let _ = mmio_write_u32(hcint0, hi);
         let rearm: u32 = mmio_read_u32(hcchar0) | chena_bit;
         let _ = mmio_write_u32(hcchar0, rearm);
