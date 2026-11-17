@@ -79,6 +79,29 @@ ACK_INTERVAL_BYTES = 512
 
 ACK_LINE_RE = re.compile(rb"ACK ([0-9A-Fa-f]{8}) ")
 
+# 2026-11-17 (session kept forgetting to stop the logger before this
+# script, and kept misjudging how long a run would take -- a *process*
+# gap, not a one-off mistake, so it belongs in the tool, not in
+# "remember next time"): measured end-to-end across several real runs
+# tonight (988.2s/988.3s for a 3035340-byte image, consistently, not
+# an outlier) -- this is wall-clock over ACK round trips + real SD
+# writes, NOT wire bandwidth (`real_len / (baud/10)` below already
+# reports that separately and is ~3x too optimistic for an ETA).
+MEASURED_BYTES_PER_SEC = 3071.0
+
+UART_LOGGER_UNIT = "dhruva-uart-logger.service"
+
+
+def logger_is_active() -> bool:
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "is-active", UART_LOGGER_UNIT],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    return out.stdout.strip() == "active"
+
 
 def open_serial(path: str, baud: int) -> int:
     if baud not in BAUD_MAP:
@@ -412,33 +435,58 @@ def main() -> int:
     data = open(args.kernel_img, "rb").read()
     real_len = len(data)
     real_sha256 = hashlib.sha256(data).hexdigest()
+    eta_s = real_len / MEASURED_BYTES_PER_SEC
     print(f"kernel image: {real_len} bytes, sha256={real_sha256}")
+    print(f"ETA: ~{eta_s:.0f}s ({eta_s / 60:.1f} min) at this project's measured real-HW rate of "
+          f"{MEASURED_BYTES_PER_SEC:.0f} B/s end-to-end (ACK round trips + real SD writes included -- "
+          "NOT raw wire bandwidth, which would be a misleadingly low estimate here)")
 
-    if not check_device_exclusive(args.device):
-        return 1
+    # 2026-11-17: this script used to just refuse and print instructions
+    # if the logger held the device (see check_device_exclusive's own
+    # KNOWN_HOLDER_HINTS) -- correct, but relied on whoever's driving this
+    # script to remember the stop-upload-restart dance EVERY time, which
+    # this project's own real-HW sessions repeatedly failed to do. Matches
+    # test/critconfig_secret_upload.py's own already-established pattern:
+    # stop it unconditionally before the exclusivity check (so the check
+    # passes instead of just explaining how to make it pass), always
+    # restart in `finally` so it's never left down across a failure/
+    # exception either.
+    stopped_logger = False
+    if logger_is_active():
+        print(f"stopping {UART_LOGGER_UNIT} for the duration of this upload...")
+        subprocess.run(["systemctl", "--user", "stop", UART_LOGGER_UNIT], timeout=10)
+        stopped_logger = True
 
-    attempt = 1
-    while True:
-        if attempt > 1:
-            print(f"--- retry {attempt}/{args.retries} ---")
-        status = _attempt_upload(args, data, real_len, real_sha256)
-        if status == 0:
-            return 0
-        if attempt >= args.retries:
-            print(f"[FAIL] giving up after {attempt} attempt(s) -- see --retries to change this")
-            return status
-        # The board's own 10s stream-inactivity self-abort (kernel_main.vani's
-        # task_f drain loop) already clears kernelupload_active/_stream_active
-        # by the time send_raw_ack_paced's own IOError reaches here -- no
-        # explicit `kernelupload abort` needed before the next attempt's
-        # fresh 'kernelupload stream' command, confirmed live (`kernelupload
-        # resumestatus` reports clean immediately after every stall this
-        # investigation captured). A short settle delay only, same spirit as
-        # every other post-hardware-action wait in this project, not a fixed
-        # guess at how long recovery takes (there's nothing here TO recover
-        # from on the board's side -- it already self-cleaned).
-        time.sleep(2)
-        attempt += 1
+    try:
+        if not check_device_exclusive(args.device):
+            return 1
+
+        attempt = 1
+        while True:
+            if attempt > 1:
+                print(f"--- retry {attempt}/{args.retries} ---")
+            status = _attempt_upload(args, data, real_len, real_sha256)
+            if status == 0:
+                return 0
+            if attempt >= args.retries:
+                print(f"[FAIL] giving up after {attempt} attempt(s) -- see --retries to change this")
+                return status
+            # The board's own 10s stream-inactivity self-abort (kernel_main.vani's
+            # task_f drain loop) already clears kernelupload_active/_stream_active
+            # by the time send_raw_ack_paced's own IOError reaches here -- no
+            # explicit `kernelupload abort` needed before the next attempt's
+            # fresh 'kernelupload stream' command, confirmed live (`kernelupload
+            # resumestatus` reports clean immediately after every stall this
+            # investigation captured). A short settle delay only, same spirit as
+            # every other post-hardware-action wait in this project, not a fixed
+            # guess at how long recovery takes (there's nothing here TO recover
+            # from on the board's side -- it already self-cleaned).
+            time.sleep(2)
+            attempt += 1
+    finally:
+        if stopped_logger:
+            print(f"restarting {UART_LOGGER_UNIT}...")
+            subprocess.run(["systemctl", "--user", "start", UART_LOGGER_UNIT], timeout=10)
 
 
 def _attempt_upload(args, data: bytes, real_len: int, real_sha256: str) -> int:

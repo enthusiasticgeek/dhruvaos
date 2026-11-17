@@ -976,6 +976,46 @@ rtl8188cu_fw_load_scratch_addr:
                          * every WiFi command" reasoning as rtl8188cu_
                          * mac_buf_scratch above. */
 
+/* 2026-11-17 (remote diagnostic instrumentation, "wifi mgmtlog"/"wifi
+ * rxstats"): wifi_mgmtlog_record's own ring buffer (16 slots x 32
+ * bytes = 512 bytes) and running RX counters. Records EVERY
+ * management frame rtl8188cu_rx_frame successfully decodes, before
+ * any BSSID/subtype filtering a caller's own join/scan state machine
+ * applies afterward -- the whole point is independence from that
+ * state machine, so a real Authentication Response arriving but
+ * getting filtered out downstream is still visible here. */
+wifi_mgmtlog_scratch_addr:
+    .word 0             /* 512 bytes, the ring buffer itself */
+wifi_mgmtlog_cursor:
+    .word 0             /* next slot index to write, 0-15, wraps */
+wifi_mgmtlog_total_count:
+    .word 0             /* total mgmt frames ever recorded (unwrapped) */
+wifi_stat_beacon_count:
+    .word 0
+wifi_stat_probereq_count:
+    .word 0
+wifi_stat_proberesp_count:
+    .word 0
+wifi_stat_auth_count:
+    .word 0
+wifi_stat_assocresp_count:
+    .word 0
+wifi_stat_deauth_count:
+    .word 0
+wifi_stat_disassoc_count:
+    .word 0
+wifi_stat_other_mgmt_count:
+    .word 0
+wifi_stat_fcs_bad_count:
+    .word 0             /* rtl8188cu_rx_frame's own info.fcs_ok!=1 reject */
+wifi_stat_short_frame_count:
+    .word 0             /* rtl8188cu_rx_frame's own got<RTL_RXDESC_LEN reject */
+wifi_stat_report_frame_count:
+    .word 0             /* rtl8188cu_rx_frame's own info.is_report!=0 reject
+                         * -- a real, EXPECTED chip-generated report frame,
+                         * not a dropped 802.11 frame; counted separately
+                         * so it's never mistaken for one. */
+
 .section ".text"
 
 .global dharafs_sd_scratch_set
@@ -2460,6 +2500,188 @@ rtl8188cu_fw_load_scratch_set:
 .global rtl8188cu_fw_load_scratch_get
 rtl8188cu_fw_load_scratch_get:
     ldr r0, =rtl8188cu_fw_load_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_mgmtlog_scratch_set
+wifi_mgmtlog_scratch_set:
+    ldr r1, =wifi_mgmtlog_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_mgmtlog_scratch_get
+wifi_mgmtlog_scratch_get:
+    ldr r0, =wifi_mgmtlog_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_mgmtlog_cursor_set
+wifi_mgmtlog_cursor_set:
+    ldr r1, =wifi_mgmtlog_cursor
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_mgmtlog_cursor_get
+wifi_mgmtlog_cursor_get:
+    ldr r0, =wifi_mgmtlog_cursor
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_mgmtlog_total_count_set
+wifi_mgmtlog_total_count_set:
+    ldr r1, =wifi_mgmtlog_total_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_mgmtlog_total_count_get
+wifi_mgmtlog_total_count_get:
+    ldr r0, =wifi_mgmtlog_total_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_beacon_count_set
+wifi_stat_beacon_count_set:
+    ldr r1, =wifi_stat_beacon_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_beacon_count_get
+wifi_stat_beacon_count_get:
+    ldr r0, =wifi_stat_beacon_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_probereq_count_set
+wifi_stat_probereq_count_set:
+    ldr r1, =wifi_stat_probereq_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_probereq_count_get
+wifi_stat_probereq_count_get:
+    ldr r0, =wifi_stat_probereq_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_proberesp_count_set
+wifi_stat_proberesp_count_set:
+    ldr r1, =wifi_stat_proberesp_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_proberesp_count_get
+wifi_stat_proberesp_count_get:
+    ldr r0, =wifi_stat_proberesp_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_auth_count_set
+wifi_stat_auth_count_set:
+    ldr r1, =wifi_stat_auth_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_auth_count_get
+wifi_stat_auth_count_get:
+    ldr r0, =wifi_stat_auth_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_assocresp_count_set
+wifi_stat_assocresp_count_set:
+    ldr r1, =wifi_stat_assocresp_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_assocresp_count_get
+wifi_stat_assocresp_count_get:
+    ldr r0, =wifi_stat_assocresp_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_deauth_count_set
+wifi_stat_deauth_count_set:
+    ldr r1, =wifi_stat_deauth_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_deauth_count_get
+wifi_stat_deauth_count_get:
+    ldr r0, =wifi_stat_deauth_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_disassoc_count_set
+wifi_stat_disassoc_count_set:
+    ldr r1, =wifi_stat_disassoc_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_disassoc_count_get
+wifi_stat_disassoc_count_get:
+    ldr r0, =wifi_stat_disassoc_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_other_mgmt_count_set
+wifi_stat_other_mgmt_count_set:
+    ldr r1, =wifi_stat_other_mgmt_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_other_mgmt_count_get
+wifi_stat_other_mgmt_count_get:
+    ldr r0, =wifi_stat_other_mgmt_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_fcs_bad_count_set
+wifi_stat_fcs_bad_count_set:
+    ldr r1, =wifi_stat_fcs_bad_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_fcs_bad_count_get
+wifi_stat_fcs_bad_count_get:
+    ldr r0, =wifi_stat_fcs_bad_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_short_frame_count_set
+wifi_stat_short_frame_count_set:
+    ldr r1, =wifi_stat_short_frame_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_short_frame_count_get
+wifi_stat_short_frame_count_get:
+    ldr r0, =wifi_stat_short_frame_count
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_stat_report_frame_count_set
+wifi_stat_report_frame_count_set:
+    ldr r1, =wifi_stat_report_frame_count
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_stat_report_frame_count_get
+wifi_stat_report_frame_count_get:
+    ldr r0, =wifi_stat_report_frame_count
     ldr r0, [r0]
     bx lr
 

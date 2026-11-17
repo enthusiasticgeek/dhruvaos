@@ -375,6 +375,62 @@ extern "C" fn rtl8188cu_fw_load_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn rtl8188cu_fw_load_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
+extern "C" fn wifi_mgmtlog_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_mgmtlog_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_mgmtlog_cursor_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_mgmtlog_cursor_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_mgmtlog_total_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_mgmtlog_total_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_beacon_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_beacon_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_probereq_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_probereq_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_proberesp_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_proberesp_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_auth_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_auth_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_assocresp_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_assocresp_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_deauth_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_deauth_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_disassoc_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_disassoc_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_other_mgmt_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_other_mgmt_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_fcs_bad_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_fcs_bad_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_short_frame_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_short_frame_count_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_report_frame_count_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_stat_report_frame_count_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn dharafs_data_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_data_scratch_get() -> mut ref i64;
@@ -31150,6 +31206,87 @@ fn rtl8188cu_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len:
 
 struct RtlRxFrameResult { ok: i64, frame_len: i64 }
 
+// 2026-11-17 (remote diagnostic instrumentation, "wifi mgmtlog"/"wifi
+// rxstats"): records every management frame rtl8188cu_rx_frame itself
+// successfully decodes (FCS-good, not a chip report frame), into a
+// 16-slot ring buffer plus per-subtype running counters -- called
+// from rtl8188cu_rx_frame's own single RX choke point, BEFORE any
+// caller's BSSID/subtype filtering (wpa2_join_step_mgmt and friends)
+// gets a chance to discard it. The whole point is independence from
+// that filtering/state machine: if a real Authentication Response
+// ever arrives but gets filtered out downstream, `wifi mgmtlog` still
+// shows it arrived. 32 bytes/slot: tick(4) fc(2) subtype(1) pad(1)
+// addr1/2/3(18) seq_ctrl(2) rssi(2) frame_len(2) = 32.
+fn wifi_mgmtlog_record(frame_buf: mut ref i64, frame_len: i64, rssi_dbm: i64) -> i64 {
+  if frame_len < 24 {
+    return 0;
+  }
+  let fc_byte0: u32 = buf_read_byte(frame_buf, 0 as u32);
+  let fc_byte1: u32 = buf_read_byte(frame_buf, 1 as u32);
+  let frame_control: i64 = (fc_byte0 as i64) | ((fc_byte1 as i64) << 8);
+  // Type bits (2-3 of byte0, i.e. bits 2-3 of frame_control) must be 00
+  // (Management) -- data/control frames aren't what this log is for.
+  if (frame_control & 0x0c) != 0 {
+    return 0;
+  }
+  let subtype: i64 = frame_control & 0xfc;
+
+  if subtype == FC_STYPE_BEACON {
+    let _ = wifi_stat_beacon_count_set(wifi_stat_beacon_count_get() + (1 as u32));
+  } else {
+    if subtype == FC_STYPE_PROBE_REQ {
+      let _ = wifi_stat_probereq_count_set(wifi_stat_probereq_count_get() + (1 as u32));
+    } else {
+      if subtype == FC_STYPE_PROBE_RESP {
+        let _ = wifi_stat_proberesp_count_set(wifi_stat_proberesp_count_get() + (1 as u32));
+      } else {
+        if subtype == FC_STYPE_AUTH {
+          let _ = wifi_stat_auth_count_set(wifi_stat_auth_count_get() + (1 as u32));
+        } else {
+          if subtype == FC_STYPE_ASSOC_RESP {
+            let _ = wifi_stat_assocresp_count_set(wifi_stat_assocresp_count_get() + (1 as u32));
+          } else {
+            if subtype == FC_STYPE_DEAUTH {
+              let _ = wifi_stat_deauth_count_set(wifi_stat_deauth_count_get() + (1 as u32));
+            } else {
+              if subtype == (0x00a0 as i64) { // Disassociation -- no existing FC_STYPE_DISASSOC const
+                let _ = wifi_stat_disassoc_count_set(wifi_stat_disassoc_count_get() + (1 as u32));
+              } else {
+                let _ = wifi_stat_other_mgmt_count_set(wifi_stat_other_mgmt_count_get() + (1 as u32));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  let cursor: u32 = wifi_mgmtlog_cursor_get();
+  let slot_off: i64 = (cursor as i64) * 32;
+  let ring: mut ref i64 = wifi_mgmtlog_scratch_get();
+  let _ = buf_write_u32_le(ring, slot_off, scheduler_get_tick_count());
+  let _ = buf_write_u16_le(ring, slot_off + 4, frame_control as u32);
+  let _ = buf_write_byte(ring, (slot_off + 6) as u32, subtype as u32);
+  let _ = buf_write_byte(ring, (slot_off + 7) as u32, 0 as u32);
+  let i: i64 = 0;
+  while i < 18 {
+    let b: u32 = buf_read_byte(frame_buf, (4 + i) as u32);
+    let _ = buf_write_byte(ring, (slot_off + 8 + i) as u32, b);
+    i = i + 1;
+  }
+  let seq_lo: u32 = buf_read_byte(frame_buf, 22 as u32);
+  let seq_hi: u32 = buf_read_byte(frame_buf, 23 as u32);
+  let _ = buf_write_byte(ring, (slot_off + 26) as u32, seq_lo);
+  let _ = buf_write_byte(ring, (slot_off + 27) as u32, seq_hi);
+  let _ = buf_write_u16_le(ring, slot_off + 28, (rssi_dbm & 0xffff) as u32);
+  let _ = buf_write_u16_le(ring, slot_off + 30, frame_len as u32);
+
+  let next_cursor: u32 = (cursor + (1 as u32)) % (16 as u32);
+  let _ = wifi_mgmtlog_cursor_set(next_cursor);
+  let _ = wifi_mgmtlog_total_count_set(wifi_mgmtlog_total_count_get() + (1 as u32));
+  return 0;
+}
+
 // Top-level "receive one raw 802.11 frame" -- pulls bulk IN
 // transfers, parses the 24-byte RX descriptor RTL8xxxu prepends, and
 // copies just the real frame bytes (skipping the descriptor and any
@@ -31216,11 +31353,18 @@ fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFr
   }
   let got: i64 = total;
   if got < RTL_RXDESC_LEN {
+    let _ = wifi_stat_short_frame_count_set(wifi_stat_short_frame_count_get() + (1 as u32));
     return RtlRxFrameResult { ok: 0, frame_len: 0 };
   }
   let info: RtlRxDescInfo = rtl_rx_desc_parse(raw);
-  if info.fcs_ok != 1 { return RtlRxFrameResult { ok: 0, frame_len: 0 }; }
-  if info.is_report != 0 { return RtlRxFrameResult { ok: 0, frame_len: 0 }; }
+  if info.fcs_ok != 1 {
+    let _ = wifi_stat_fcs_bad_count_set(wifi_stat_fcs_bad_count_get() + (1 as u32));
+    return RtlRxFrameResult { ok: 0, frame_len: 0 };
+  }
+  if info.is_report != 0 {
+    let _ = wifi_stat_report_frame_count_set(wifi_stat_report_frame_count_get() + (1 as u32));
+    return RtlRxFrameResult { ok: 0, frame_len: 0 };
+  }
   if (info.frame_start_off + info.pkt_len) > got { return RtlRxFrameResult { ok: 0, frame_len: 0 }; }
 
   let i: i64 = 0;
@@ -31240,6 +31384,10 @@ fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFr
     let _ = uart_put_i64(info.rssi_dbm);
     let _ = uart_puts("dBm\n");
   }
+  // 2026-11-17: independent management-frame observation, before any
+  // caller's own BSSID/subtype filtering -- see wifi_mgmtlog_record's
+  // own header comment.
+  let _ = wifi_mgmtlog_record(frame_out, info.pkt_len, if info.has_phystats == 1 { info.rssi_dbm } else { 0 - 1000 });
   return RtlRxFrameResult { ok: 1, frame_len: info.pkt_len };
 }
 
@@ -43886,7 +44034,7 @@ fn shell_dispatch() -> i64 {
   // real AP as of this commit.
   if shell_word_matches(line_buf, 0, cmd_end, "wifi") == 1 {
     if cmd_end >= line_len {
-      let _ = uart_puts("usage: wifi join | wifi listen <channel>\n");
+      let _ = uart_puts("usage: wifi join | wifi listen <channel> | wifi rxstats | wifi mgmtlog\n");
       return 0;
     }
     let sub_start: i64 = cmd_end + 1;
@@ -43914,7 +44062,95 @@ fn shell_dispatch() -> i64 {
       let _ = wifi_passive_listen(channel as u32, 300);
       return 0;
     }
-    let _ = uart_puts("usage: wifi join | wifi listen <channel>\n");
+    // 2026-11-17 (remote diagnostic instrumentation): read-only, both
+    // reflect wifi_mgmtlog_record's own state -- see that function's
+    // header comment. Neither one touches the radio or transmits
+    // anything; safe to run at any time, including mid-join.
+    if shell_word_matches(line_buf, sub_start, sub_end, "rxstats") == 1 {
+      let _ = uart_puts("wifi rxstats: beacon=");
+      let _ = uart_put_i64(wifi_stat_beacon_count_get() as i64);
+      let _ = uart_puts(" probereq=");
+      let _ = uart_put_i64(wifi_stat_probereq_count_get() as i64);
+      let _ = uart_puts(" proberesp=");
+      let _ = uart_put_i64(wifi_stat_proberesp_count_get() as i64);
+      let _ = uart_puts(" auth=");
+      let _ = uart_put_i64(wifi_stat_auth_count_get() as i64);
+      let _ = uart_puts(" assocresp=");
+      let _ = uart_put_i64(wifi_stat_assocresp_count_get() as i64);
+      let _ = uart_puts(" deauth=");
+      let _ = uart_put_i64(wifi_stat_deauth_count_get() as i64);
+      let _ = uart_puts(" disassoc=");
+      let _ = uart_put_i64(wifi_stat_disassoc_count_get() as i64);
+      let _ = uart_puts(" other_mgmt=");
+      let _ = uart_put_i64(wifi_stat_other_mgmt_count_get() as i64);
+      let _ = uart_puts("\n");
+      let _ = uart_puts("wifi rxstats: fcs_bad=");
+      let _ = uart_put_i64(wifi_stat_fcs_bad_count_get() as i64);
+      let _ = uart_puts(" short_frame=");
+      let _ = uart_put_i64(wifi_stat_short_frame_count_get() as i64);
+      let _ = uart_puts(" report_frame=");
+      let _ = uart_put_i64(wifi_stat_report_frame_count_get() as i64);
+      let _ = uart_puts(" mgmtlog_total=");
+      let _ = uart_put_i64(wifi_mgmtlog_total_count_get() as i64);
+      let _ = uart_puts(" (ring holds last 16)\n");
+      return 0;
+    }
+    if shell_word_matches(line_buf, sub_start, sub_end, "mgmtlog") == 1 {
+      let total: u32 = wifi_mgmtlog_total_count_get();
+      let shown: i64 = if (total as i64) < 16 { total as i64 } else { 16 };
+      if shown == 0 {
+        let _ = uart_puts("wifi mgmtlog: (empty -- no management frame decoded yet)\n");
+        return 0;
+      }
+      let cursor: i64 = wifi_mgmtlog_cursor_get() as i64;
+      // Oldest-first: if the ring hasn't wrapped yet (total<16), slot 0
+      // is the oldest and cursor itself is the first never-written slot
+      // (nothing to skip). Once wrapped, cursor IS the oldest slot (the
+      // next one to be overwritten).
+      let start_slot: i64 = if (total as i64) < 16 { 0 } else { cursor };
+      let ring: mut ref i64 = wifi_mgmtlog_scratch_get();
+      let n: i64 = 0;
+      while n < shown {
+        let slot: i64 = (start_slot + n) % 16;
+        let slot_off: i64 = slot * 32;
+        let tick: u32 = buf_read_u32_le(ring, slot_off);
+        let subtype: u32 = buf_read_byte(ring, (slot_off + 6) as u32);
+        let seq: i64 = (buf_read_byte(ring, (slot_off + 26) as u32) as i64) | ((buf_read_byte(ring, (slot_off + 27) as u32) as i64) << 8);
+        let rssi: i64 = buf_read_u16_le(ring, slot_off + 28) as i64;
+        let rssi_signed: i64 = if rssi > 32767 { rssi - 65536 } else { rssi };
+        let flen: u32 = buf_read_u16_le(ring, slot_off + 30);
+        let _ = uart_puts("[");
+        let _ = uart_put_i64(n);
+        let _ = uart_puts("] tick=");
+        let _ = uart_put_i64(tick as i64);
+        let _ = uart_puts(" subtype=0x");
+        let _ = uart_put_hex_byte(subtype);
+        if subtype == (FC_STYPE_BEACON as u32) { let _ = uart_puts(" (Beacon)"); }
+        if subtype == (FC_STYPE_PROBE_REQ as u32) { let _ = uart_puts(" (ProbeReq)"); }
+        if subtype == (FC_STYPE_PROBE_RESP as u32) { let _ = uart_puts(" (ProbeResp)"); }
+        if subtype == (FC_STYPE_AUTH as u32) { let _ = uart_puts(" (Auth)"); }
+        if subtype == (FC_STYPE_ASSOC_RESP as u32) { let _ = uart_puts(" (AssocResp)"); }
+        if subtype == (FC_STYPE_DEAUTH as u32) { let _ = uart_puts(" (Deauth)"); }
+        if subtype == (0x00a0 as u32) { let _ = uart_puts(" (Disassoc)"); }
+        let _ = uart_puts(" addr2(src)=");
+        let ai: i64 = 0;
+        while ai < 6 {
+          if ai > 0 { let _ = uart_puts(":"); }
+          let _ = uart_put_hex_byte(buf_read_byte(ring, (slot_off + 14 + ai) as u32));
+          ai = ai + 1;
+        }
+        let _ = uart_puts(" seq=");
+        let _ = uart_put_i64(seq);
+        let _ = uart_puts(" rssi=");
+        let _ = uart_put_i64(rssi_signed);
+        let _ = uart_puts("dBm len=");
+        let _ = uart_put_i64(flen as i64);
+        let _ = uart_puts("\n");
+        n = n + 1;
+      }
+      return 0;
+    }
+    let _ = uart_puts("usage: wifi join | wifi listen <channel> | wifi rxstats | wifi mgmtlog\n");
     return 0;
   }
 
@@ -58959,6 +59195,7 @@ fn kernel_main() -> i64 {
   let _ = wifi_listen_rx_scratch_set(dhruva_alloc_bytes(512));
   let _ = rtl8188cu_mac_buf_scratch_set(dhruva_alloc_bytes(6));
   let _ = rtl8188cu_fw_load_scratch_set(dhruva_alloc_bytes(512));
+  let _ = wifi_mgmtlog_scratch_set(dhruva_alloc_bytes(512));
   let _ = netif_tx_wrap_scratch_set(dhruva_alloc_bytes(520));
   let _ = netif_tx_chunk_scratch_set(dhruva_alloc_bytes(64));
   let _ = netif_rx_raw_scratch_set(dhruva_alloc_bytes(520));
