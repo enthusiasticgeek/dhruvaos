@@ -798,6 +798,51 @@ uart_dma_scratch_addr:
                          * run concurrently today, but this buffer's
                          * whole reason to exist is per-subsystem
                          * isolation, not a shared pool. */
+rtl_rx_raw_scratch_addr:
+    .word 0             /* BUG FOUND 2026-11-16 (real-HW board HANG,
+                         * "wifi listen 11" -- confirmed the SAME bug
+                         * class rtl_lan_reg_scratch's own comment above
+                         * already documents for this exact RTL8188CU
+                         * bring-up code, just a different function):
+                         * rtl8188cu_rx_frame called dhruva_alloc_bytes
+                         * (512) fresh on EVERY call for its own raw USB-
+                         * transfer accumulation buffer, and this
+                         * function is the single receive choke point
+                         * polled every iteration of wifi_passive_
+                         * listen's/wifi_scan_for_ssid's/wifi_real_join's
+                         * loops -- regardless of whether a frame was
+                         * actually heard that poll. "wifi listen 1" and
+                         * "wifi listen 6" (300 polls each, lighter
+                         * traffic) left enough already-leaked headroom
+                         * that "wifi listen 11" (heaviest beacon traffic
+                         * of the three channels checked) tipped the
+                         * 768KB heap over into a genuine FATAL out-of-
+                         * memory halt -- with no exit() call on this
+                         * path (dhruva_oom_fatal's own raw `cpsid i;
+                         * while(1)`, see runtime_stubs.c), and the
+                         * real-HW watchdog not observed to recover it
+                         * either (separate, still-open investigation --
+                         * see project memory). 512 bytes: one max-size
+                         * RX USB-transfer accumulation buffer. */
+rtl_rx_chunk_scratch_addr:
+    .word 0             /* Same bug/fix as rtl_rx_raw_scratch above --
+                         * rtl8188cu_rx_frame's own per-USB-packet chunk
+                         * buffer, previously a fresh dhruva_alloc_bytes
+                         * (64) on every call. 64 bytes: one max packet
+                         * size (RTL8188CU's bulk-IN endpoint mps). */
+rtl_tx_buf_scratch_addr:
+    .word 0             /* Same bug class, TX side: rtl8188cu_tx_frame
+                         * called dhruva_alloc_bytes(RTL_TXDESC_LEN +
+                         * frame_len) fresh on every single TX (every
+                         * Probe/Auth/Assoc/EAPOL/data frame sent) --
+                         * found during the same 2026-11-16 sweep as
+                         * rtl_rx_raw_scratch above, after that RX-side
+                         * fix caused a real board hang and prompted a
+                         * sibling-function check. 512 bytes: that
+                         * function's own hard size cap (`if (RTL_
+                         * TXDESC_LEN + frame_len) > 512 { return -1; }`),
+                         * so this is already sized to the true worst
+                         * case, not an assumption. */
 
 .section ".text"
 
@@ -1958,6 +2003,45 @@ uart_dma_scratch_set:
 .global uart_dma_scratch_get
 uart_dma_scratch_get:
     ldr r0, =uart_dma_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global rtl_rx_raw_scratch_set
+rtl_rx_raw_scratch_set:
+    ldr r1, =rtl_rx_raw_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global rtl_rx_raw_scratch_get
+rtl_rx_raw_scratch_get:
+    ldr r0, =rtl_rx_raw_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global rtl_rx_chunk_scratch_set
+rtl_rx_chunk_scratch_set:
+    ldr r1, =rtl_rx_chunk_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global rtl_rx_chunk_scratch_get
+rtl_rx_chunk_scratch_get:
+    ldr r0, =rtl_rx_chunk_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global rtl_tx_buf_scratch_set
+rtl_tx_buf_scratch_set:
+    ldr r1, =rtl_tx_buf_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global rtl_tx_buf_scratch_get
+rtl_tx_buf_scratch_get:
+    ldr r0, =rtl_tx_buf_scratch_addr
     ldr r0, [r0]
     bx lr
 

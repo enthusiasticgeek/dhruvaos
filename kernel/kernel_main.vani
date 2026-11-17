@@ -266,6 +266,24 @@ extern "C" fn sd_wedge_ckpt_scratch_get() -> mut ref i64;
 extern "C" fn dharafs_path_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_path_scratch_get() -> mut ref i64;
+// BUG FOUND 2026-11-16 (real-HW board hang during "wifi listen 11") --
+// see scratch_state.S's own comment on rtl_rx_raw_scratch_addr for the
+// full story. rtl8188cu_rx_frame's own persistent RX scratch, replacing
+// a fresh dhruva_alloc_bytes call on every poll.
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_raw_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_raw_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_chunk_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_chunk_scratch_get() -> mut ref i64;
+// Same bug class, TX side -- see scratch_state.S's own comment on
+// rtl_tx_buf_scratch_addr. rtl8188cu_tx_frame's persistent TX buffer.
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_tx_buf_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_tx_buf_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_data_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -30970,7 +30988,11 @@ fn rtl8188cu_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len:
   if (RTL_TXDESC_LEN + frame_len) > (512 as i64) {
     return 0 - 1;
   }
-  let tx_buf: mut ref i64 = dhruva_alloc_bytes(RTL_TXDESC_LEN + frame_len);
+  // BUG FOUND 2026-11-16 (same sweep that found rtl8188cu_rx_frame's
+  // own identical leak -- see scratch_state.S's own comment on rtl_tx_
+  // buf_scratch_addr): this used to call dhruva_alloc_bytes fresh on
+  // every single TX.
+  let tx_buf: mut ref i64 = rtl_tx_buf_scratch_get();
   let _ = rtl_tx_desc_write(tx_buf, frame_len, is_broadcast, seq_num);
   let i: i64 = 0;
   while i < frame_len {
@@ -31014,8 +31036,14 @@ struct RtlRxFrameResult { ok: i64, frame_len: i64 }
 // end-of-transfer signal), before treating the result as a complete
 // frame. This function never got that same loop -- mirrored here now.
 fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFrameResult {
-  let raw: mut ref i64 = dhruva_alloc_bytes(512);
-  let chunk_buf: mut ref i64 = dhruva_alloc_bytes(64);
+  // BUG FOUND 2026-11-16 (real-HW board hang, confirmed root cause of a
+  // FATAL heap-exhaustion halt during "wifi listen 11" -- see scratch_
+  // state.S's own comment on rtl_rx_raw_scratch_addr): this used to call
+  // dhruva_alloc_bytes(512)/dhruva_alloc_bytes(64) fresh on EVERY call,
+  // and this function is the receive choke point polled on every single
+  // iteration of wifi listen/scan/join's loops, heard frame or not.
+  let raw: mut ref i64 = rtl_rx_raw_scratch_get();
+  let chunk_buf: mut ref i64 = rtl_rx_chunk_scratch_get();
   let total: i64 = 0;
   let done: i64 = 0;
   while done == 0 {
@@ -58840,6 +58868,9 @@ fn kernel_main() -> i64 {
   let _ = usb_downstream_desc_scratch_set(dhruva_alloc_bytes(18));
   let _ = hub_port_status_scratch_set(dhruva_alloc_bytes(4));
   let _ = rtl_lan_reg_scratch_set(dhruva_alloc_bytes(4));
+  let _ = rtl_rx_raw_scratch_set(dhruva_alloc_bytes(512));
+  let _ = rtl_rx_chunk_scratch_set(dhruva_alloc_bytes(64));
+  let _ = rtl_tx_buf_scratch_set(dhruva_alloc_bytes(512));
   let _ = netif_tx_wrap_scratch_set(dhruva_alloc_bytes(520));
   let _ = netif_tx_chunk_scratch_set(dhruva_alloc_bytes(64));
   let _ = netif_rx_raw_scratch_set(dhruva_alloc_bytes(520));
