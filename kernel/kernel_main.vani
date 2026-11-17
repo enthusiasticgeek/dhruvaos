@@ -58733,8 +58733,23 @@ fn kernel_main() -> i64 {
   // whose watchdog_init() print (just added) never flushed before a
   // crash. Never trust which image got flashed; read it back from the
   // image's own boot log instead.
+  // BUG FOUND 2026-11-16 (live QEMU repro of the real-HW crash loop
+  // this exact print just caused): uart_put_i64 reads uart_digits_
+  // scratch_get(), which is still null here -- that scratch buffer's
+  // own uart_digits_scratch_set() call doesn't run until much later in
+  // this same function, well after this print. Writing through that
+  // null pointer is a Data Abort; the abort handler's own reporting
+  // path (abort_report_data) ALSO calls uart_put_i64 for its "ctxsw="
+  // field, hitting the exact same null pointer and re-faulting
+  // immediately -- which is why this looped identically forever
+  // instead of halting once. WATCHDOG_ENABLE_FOR_REAL_HARDWARE is
+  // always exactly 0 or 1, so print it directly without uart_put_i64's
+  // scratch dependency at all, rather than reordering this early
+  // watchdog-arm block past the self-test battery it exists to cover
+  // (see this block's own "armed as early as UART diagnostics allow"
+  // comment above).
   let _ = uart_puts("BOOT DIAG: WATCHDOG_ENABLE_FOR_REAL_HARDWARE=");
-  let _ = uart_put_i64(WATCHDOG_ENABLE_FOR_REAL_HARDWARE);
+  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = uart_puts("1"); } else { let _ = uart_puts("0"); }
   let _ = uart_puts("\n");
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
     let _ = watchdog_init();
