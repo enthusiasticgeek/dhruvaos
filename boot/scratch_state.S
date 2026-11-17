@@ -843,6 +843,144 @@ rtl_tx_buf_scratch_addr:
                          * TXDESC_LEN + frame_len) > 512 { return -1; }`),
                          * so this is already sized to the true worst
                          * case, not an assumption. */
+// 2026-11-16 full heap-leak audit (triggered by the real board hang
+// above -- user asked to sweep every function, not just the one that
+// crashed). Two severity tiers below, both real, both fixed the same
+// way:
+//
+//   SEVERE (same shape as rtl_rx_raw_scratch -- allocated inside a
+//   function called repeatedly from a live, bounded RETRY loop, so
+//   each retry leaks again): icmp_poll (up to 8x per `ping`, see
+//   shell_dispatch's own ping command) and wpa2_join_step_eapol (up to
+//   WIFI_RX_POLL_CAP times per `wifi join`, once per genuinely-parsed
+//   EAPOL frame including ordinary Message-1 retransmissions -- see
+//   that function's own WAIT_EAPOL_MSG1 branch).
+//
+//   MINOR (allocated once per CALL, hoisted above any internal loop --
+//   not a per-poll leak, but still a real permanent leak every time the
+//   owning shell command runs, and WiFi commands were run many times
+//   during tonight's investigation): wifi_real_join, wifi_scan_for_ssid,
+//   wifi_passive_listen, rtl8188cu_mac_bringup, rtl8188cu_load_firmware_
+//   from_sd_raw -- these, plus rtl_rx_raw_scratch/rtl_tx_buf_scratch
+//   above, are the real contributors to the "baseline" heap usage that
+//   let wifi listen 11's per-poll leak tip the board over so much
+//   sooner than a clean-heap boot would have.
+//
+// A further BLE-side tier (l2cap_sig_poll, gatt_server_poll, every
+// gatt_discover_*/gatt_client_*/gatt_server_* function, every
+// hci_send_command_*, ble_real_connect, ble_scan_for_target) and a
+// fourth tier (critical_config_*, the three shell_dispatch_* command
+// handlers, the usb_msd_* SCSI commands, dwc2_probe_device0/dwc2_fetch_
+// and_set_configuration/dwc2_hub_fetch_port_count, dns_resolve) have
+// the SAME one-shot-per-call shape as the MINOR tier above -- found by
+// the same audit, reported alongside it, but NOT YET fixed here: BLE's
+// call sites are all currently unreachable (zero live callers today,
+// confirmed by direct grep -- a real bug the moment something wires
+// them into a live poll loop, but not an active leak today), and the
+// fourth tier is real but lower-frequency/not tonight's active focus.
+icmp_poll_src_mac_scratch_addr:
+    .word 0             /* 8 bytes -- icmp_poll's own copy of this
+                         * board's MAC (icmp_self_test's two fixed calls
+                         * and ping's 8-iteration retry loop both drive
+                         * this function repeatedly). */
+icmp_poll_echo_payload_scratch_addr:
+    .word 0             /* 56 bytes -- icmp_poll's own received-payload
+                         * scratch (same function, same reasoning). */
+wpa2_eapol_bssid_scratch_addr:
+    .word 0             /* 6 bytes -- wpa2_join_step_eapol's own BSSID
+                         * copy, WAIT_EAPOL_MSG1 branch only (re-entered
+                         * on every genuinely-parsed EAPOL frame seen
+                         * while still in that state, including ordinary
+                         * Message-1 retransmissions). */
+wpa2_eapol_own_mac_scratch_addr:
+    .word 0             /* 6 bytes -- same branch, this board's own MAC. */
+wpa2_eapol_snonce_scratch_addr:
+    .word 0             /* 32 bytes -- same branch, the fresh SNonce
+                         * wpa_nonce_generate_heap writes before
+                         * processing Message 1. */
+wifi_join_password_scratch_addr:
+    .word 0             /* 64 bytes -- wifi_real_join's own copy of the
+                         * configured WiFi password. One-shot per `wifi
+                         * join` call (hoisted above its own loops), not
+                         * a per-poll leak, but `wifi join` was run many
+                         * times tonight. */
+wifi_join_ssid_scratch_addr:
+    .word 0             /* 32 bytes -- wifi_real_join's own copy of the
+                         * configured SSID. */
+wifi_join_pmk_scratch_addr:
+    .word 0             /* 32 bytes -- wifi_real_join's own derived PMK. */
+wifi_join_ctx_scratch_addr:
+    .word 0             /* 169 bytes (WPA2_JOIN_CTX_SIZE) -- wifi_real_
+                         * join's own WPA2 join-state context. */
+wifi_join_preq_scratch_addr:
+    .word 0             /* 64 bytes -- wifi_real_join's own built Probe
+                         * Request frame. */
+wifi_join_rx_scratch_addr:
+    .word 0             /* 512 bytes -- wifi_real_join's own received-
+                         * frame scratch, shared sequentially by its
+                         * mgmt-wait and EAPOL-wait loops (never both
+                         * live at once -- the mgmt loop fully completes,
+                         * success or failure, before the EAPOL loop
+                         * ever starts). */
+wifi_join_mgmt_scratch_addr:
+    .word 0             /* 90 bytes -- wifi_real_join's own built mgmt
+                         * (Auth/Assoc Request) frame. */
+wifi_join_eapol_rx_scratch_addr:
+    .word 0             /* 140 bytes -- wifi_real_join's own copy of a
+                         * received EAPOL frame's payload. */
+wifi_join_eapol_tx_scratch_addr:
+    .word 0             /* 99 bytes -- wifi_real_join's own built EAPOL
+                         * response (Message 2/4). */
+wifi_join_gtk_scratch_addr:
+    .word 0             /* 32 bytes -- wifi_real_join's own decrypted GTK
+                         * output. */
+wifi_join_wrapped_scratch_addr:
+    .word 0             /* 140 bytes -- wifi_real_join's own built,
+                         * fully-wrapped outgoing EAPOL data frame. */
+wifi_join_bssid_scratch_addr:
+    .word 0             /* 6 bytes -- wifi_real_join's own copy of the
+                         * joined BSSID, used only in its final connected
+                         * -report call. */
+wifi_scan_tx_scratch_addr:
+    .word 0             /* 64 bytes -- wifi_scan_for_ssid's own built
+                         * Probe Request frame. Called once per channel
+                         * (1/6/11) from wifi_real_join, each call still
+                         * one-shot (hoisted above its own retry loop). */
+wifi_scan_rx_scratch_addr:
+    .word 0             /* 512 bytes -- wifi_scan_for_ssid's own
+                         * received-frame scratch. Not shared with
+                         * wifi_join_rx_scratch above even though neither
+                         * is ever concurrently live with the other
+                         * (wifi_scan_for_ssid fully returns before
+                         * wifi_real_join's own loops start) -- kept
+                         * separate for the same "a name that says what
+                         * actually uses it beats a borrowed one" reason
+                         * this whole file already follows elsewhere,
+                         * since wifi_scan_for_ssid is also callable on
+                         * its own (not just from inside wifi_real_join). */
+wifi_listen_rx_scratch_addr:
+    .word 0             /* 512 bytes -- wifi_passive_listen's own
+                         * received-frame scratch (`wifi listen`, the
+                         * RX-only diagnostic command -- not shared with
+                         * either WiFi-join scratch above for the same
+                         * reason wifi_scan_rx_scratch isn't). */
+wifi_listen_raw_scratch_addr:
+    .word 0             /* 64 bytes -- wifi_passive_listen's own raw USB-
+                         * transaction-level diagnostic scratch
+                         * (dwc2_wifi_bulk_in's own output, bypassing
+                         * rtl8188cu_rx_frame -- see that call site's own
+                         * header comment). */
+rtl8188cu_mac_buf_scratch_addr:
+    .word 0             /* 6 bytes -- rtl8188cu_mac_bringup's own copy of
+                         * the station MAC passed to rtl8188cu_set_mac_
+                         * addr. One-shot per radio bring-up, but the
+                         * radio gets fully re-initialized on every single
+                         * `wifi join`/`wifi listen`/`wifi scan` command. */
+rtl8188cu_fw_load_scratch_addr:
+    .word 0             /* 512 bytes -- rtl8188cu_load_firmware_from_sd_
+                         * raw's own SD-block read scratch. Same "re-run
+                         * every WiFi command" reasoning as rtl8188cu_
+                         * mac_buf_scratch above. */
 
 .section ".text"
 
@@ -2042,6 +2180,305 @@ rtl_tx_buf_scratch_set:
 .global rtl_tx_buf_scratch_get
 rtl_tx_buf_scratch_get:
     ldr r0, =rtl_tx_buf_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global icmp_poll_src_mac_scratch_set
+icmp_poll_src_mac_scratch_set:
+    ldr r1, =icmp_poll_src_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global icmp_poll_src_mac_scratch_get
+icmp_poll_src_mac_scratch_get:
+    ldr r0, =icmp_poll_src_mac_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global icmp_poll_echo_payload_scratch_set
+icmp_poll_echo_payload_scratch_set:
+    ldr r1, =icmp_poll_echo_payload_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global icmp_poll_echo_payload_scratch_get
+icmp_poll_echo_payload_scratch_get:
+    ldr r0, =icmp_poll_echo_payload_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wpa2_eapol_bssid_scratch_set
+wpa2_eapol_bssid_scratch_set:
+    ldr r1, =wpa2_eapol_bssid_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wpa2_eapol_bssid_scratch_get
+wpa2_eapol_bssid_scratch_get:
+    ldr r0, =wpa2_eapol_bssid_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wpa2_eapol_own_mac_scratch_set
+wpa2_eapol_own_mac_scratch_set:
+    ldr r1, =wpa2_eapol_own_mac_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wpa2_eapol_own_mac_scratch_get
+wpa2_eapol_own_mac_scratch_get:
+    ldr r0, =wpa2_eapol_own_mac_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wpa2_eapol_snonce_scratch_set
+wpa2_eapol_snonce_scratch_set:
+    ldr r1, =wpa2_eapol_snonce_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wpa2_eapol_snonce_scratch_get
+wpa2_eapol_snonce_scratch_get:
+    ldr r0, =wpa2_eapol_snonce_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_password_scratch_set
+wifi_join_password_scratch_set:
+    ldr r1, =wifi_join_password_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_password_scratch_get
+wifi_join_password_scratch_get:
+    ldr r0, =wifi_join_password_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_ssid_scratch_set
+wifi_join_ssid_scratch_set:
+    ldr r1, =wifi_join_ssid_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_ssid_scratch_get
+wifi_join_ssid_scratch_get:
+    ldr r0, =wifi_join_ssid_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_pmk_scratch_set
+wifi_join_pmk_scratch_set:
+    ldr r1, =wifi_join_pmk_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_pmk_scratch_get
+wifi_join_pmk_scratch_get:
+    ldr r0, =wifi_join_pmk_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_ctx_scratch_set
+wifi_join_ctx_scratch_set:
+    ldr r1, =wifi_join_ctx_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_ctx_scratch_get
+wifi_join_ctx_scratch_get:
+    ldr r0, =wifi_join_ctx_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_preq_scratch_set
+wifi_join_preq_scratch_set:
+    ldr r1, =wifi_join_preq_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_preq_scratch_get
+wifi_join_preq_scratch_get:
+    ldr r0, =wifi_join_preq_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_rx_scratch_set
+wifi_join_rx_scratch_set:
+    ldr r1, =wifi_join_rx_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_rx_scratch_get
+wifi_join_rx_scratch_get:
+    ldr r0, =wifi_join_rx_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_mgmt_scratch_set
+wifi_join_mgmt_scratch_set:
+    ldr r1, =wifi_join_mgmt_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_mgmt_scratch_get
+wifi_join_mgmt_scratch_get:
+    ldr r0, =wifi_join_mgmt_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_eapol_rx_scratch_set
+wifi_join_eapol_rx_scratch_set:
+    ldr r1, =wifi_join_eapol_rx_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_eapol_rx_scratch_get
+wifi_join_eapol_rx_scratch_get:
+    ldr r0, =wifi_join_eapol_rx_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_eapol_tx_scratch_set
+wifi_join_eapol_tx_scratch_set:
+    ldr r1, =wifi_join_eapol_tx_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_eapol_tx_scratch_get
+wifi_join_eapol_tx_scratch_get:
+    ldr r0, =wifi_join_eapol_tx_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_gtk_scratch_set
+wifi_join_gtk_scratch_set:
+    ldr r1, =wifi_join_gtk_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_gtk_scratch_get
+wifi_join_gtk_scratch_get:
+    ldr r0, =wifi_join_gtk_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_wrapped_scratch_set
+wifi_join_wrapped_scratch_set:
+    ldr r1, =wifi_join_wrapped_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_wrapped_scratch_get
+wifi_join_wrapped_scratch_get:
+    ldr r0, =wifi_join_wrapped_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_join_bssid_scratch_set
+wifi_join_bssid_scratch_set:
+    ldr r1, =wifi_join_bssid_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_join_bssid_scratch_get
+wifi_join_bssid_scratch_get:
+    ldr r0, =wifi_join_bssid_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_scan_tx_scratch_set
+wifi_scan_tx_scratch_set:
+    ldr r1, =wifi_scan_tx_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_scan_tx_scratch_get
+wifi_scan_tx_scratch_get:
+    ldr r0, =wifi_scan_tx_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_scan_rx_scratch_set
+wifi_scan_rx_scratch_set:
+    ldr r1, =wifi_scan_rx_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_scan_rx_scratch_get
+wifi_scan_rx_scratch_get:
+    ldr r0, =wifi_scan_rx_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_listen_rx_scratch_set
+wifi_listen_rx_scratch_set:
+    ldr r1, =wifi_listen_rx_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_listen_rx_scratch_get
+wifi_listen_rx_scratch_get:
+    ldr r0, =wifi_listen_rx_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_listen_raw_scratch_set
+wifi_listen_raw_scratch_set:
+    ldr r1, =wifi_listen_raw_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_listen_raw_scratch_get
+wifi_listen_raw_scratch_get:
+    ldr r0, =wifi_listen_raw_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global rtl8188cu_mac_buf_scratch_set
+rtl8188cu_mac_buf_scratch_set:
+    ldr r1, =rtl8188cu_mac_buf_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global rtl8188cu_mac_buf_scratch_get
+rtl8188cu_mac_buf_scratch_get:
+    ldr r0, =rtl8188cu_mac_buf_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global rtl8188cu_fw_load_scratch_set
+rtl8188cu_fw_load_scratch_set:
+    ldr r1, =rtl8188cu_fw_load_scratch_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global rtl8188cu_fw_load_scratch_get
+rtl8188cu_fw_load_scratch_get:
+    ldr r0, =rtl8188cu_fw_load_scratch_addr
     ldr r0, [r0]
     bx lr
 

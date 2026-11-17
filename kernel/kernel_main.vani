@@ -284,6 +284,100 @@ extern "C" fn rtl_rx_chunk_scratch_get() -> mut ref i64;
 extern "C" fn rtl_tx_buf_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn rtl_tx_buf_scratch_get() -> mut ref i64;
+// 2026-11-16 full heap-leak audit -- see scratch_state.S's own comment
+// on icmp_poll_src_mac_scratch_addr for the full severity-tiered list.
+#[stack_cost(bytes=1)]
+extern "C" fn icmp_poll_src_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn icmp_poll_src_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn icmp_poll_echo_payload_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn icmp_poll_echo_payload_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wpa2_eapol_bssid_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wpa2_eapol_bssid_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wpa2_eapol_own_mac_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wpa2_eapol_own_mac_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wpa2_eapol_snonce_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wpa2_eapol_snonce_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_password_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_password_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_ssid_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_ssid_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_pmk_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_pmk_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_ctx_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_ctx_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_preq_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_preq_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_rx_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_rx_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_mgmt_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_mgmt_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_eapol_rx_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_eapol_rx_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_eapol_tx_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_eapol_tx_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_gtk_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_gtk_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_wrapped_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_wrapped_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_bssid_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_join_bssid_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_scan_tx_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_scan_tx_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_scan_rx_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_scan_rx_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_listen_rx_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_listen_rx_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_listen_raw_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_listen_raw_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl8188cu_mac_buf_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl8188cu_mac_buf_scratch_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl8188cu_fw_load_scratch_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl8188cu_fw_load_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_data_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -21124,7 +21218,13 @@ fn icmp_poll(my_mac: mut ref i64, my_ip: u32, out_payload: mut ref i64, max_payl
       return 0 - 1; // not addressed to us -- not this project's to answer
     }
     let src_ip: u32 = ipv4_get_src_ip(frame, 14);
-    let src_mac: mut ref i64 = dhruva_alloc_bytes(8);
+    // BUG FOUND 2026-11-16 (full heap-leak audit, triggered by a real
+    // board hang elsewhere -- see scratch_state.S's own comment on
+    // icmp_poll_src_mac_scratch_addr): icmp_poll is called repeatedly
+    // from a real retry loop (`ping`'s own up-to-8-iteration wait), so
+    // a fresh dhruva_alloc_bytes here on every call leaked again on
+    // every retry.
+    let src_mac: mut ref i64 = icmp_poll_src_mac_scratch_get();
     let mi: i64 = 0;
     while mi < 6 {
       let mb: u32 = buf_read_byte(frame, (6 + mi) as u32); // Ethernet src MAC
@@ -21133,7 +21233,7 @@ fn icmp_poll(my_mac: mut ref i64, my_ip: u32, out_payload: mut ref i64, max_payl
     }
     let identifier: u32 = icmp_get_identifier(frame, 34);
     let seq: u32 = icmp_get_sequence(frame, 34);
-    let echo_payload: mut ref i64 = dhruva_alloc_bytes(56); // 64-byte real-hardware-typical ping payload minus the 8-byte header, generous headroom over anything this project's own self-test sends
+    let echo_payload: mut ref i64 = icmp_poll_echo_payload_scratch_get(); // 64-byte real-hardware-typical ping payload minus the 8-byte header, generous headroom over anything this project's own self-test sends
     let copy_len: i64 = if payload_len > (56 as i64) { 56 as i64 } else { payload_len };
     let ci: i64 = 0;
     while ci < copy_len {
@@ -28642,7 +28742,9 @@ fn rtl8188cu_fw_raw_sd_block_count() -> i64 { return 32; }
 // own BOOT_PART_START_SECTOR comment.
 fn rtl8188cu_load_firmware_from_sd_raw() -> i64 {
   let fw_buf: mut ref i64 = usb_wifi_fw_buf_get();
-  let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  // BUG FOUND 2026-11-16 (full heap-leak audit) -- see scratch_state.S's
+  // own comment on rtl8188cu_fw_load_scratch_addr.
+  let scratch: mut ref i64 = rtl8188cu_fw_load_scratch_get();
   let base: i64 = rtl8188cu_fw_raw_sd_base_block();
   let count: i64 = rtl8188cu_fw_raw_sd_block_count();
   let i: i64 = 0;
@@ -32520,7 +32622,9 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   // which is why only the first, broadcast-only stage of the join ever
   // worked. Use wifi_real_own_mac() here too, so the hardware filter
   // and every frame's own claimed source address finally agree.
-  let mac_buf: mut ref i64 = dhruva_alloc_bytes(6);
+  // BUG FOUND 2026-11-16 (full heap-leak audit) -- see scratch_state.S's
+  // own comment on rtl8188cu_mac_buf_scratch_addr.
+  let mac_buf: mut ref i64 = rtl8188cu_mac_buf_scratch_get();
   let own_mac_for_filter: [u8; 6] = wifi_real_own_mac();
   let mbi: i64 = 0;
   while mbi < 6 {
@@ -50979,8 +51083,16 @@ fn wpa2_join_step_eapol(ctx: mut ref i64, rx_buf: mut ref i64, rx_len: i64, pmk:
   let state: i64 = buf_read_byte(ctx, WPA2_JOIN_STATE_OFF as u32) as i64;
 
   if state == WPA2_JOIN_WAIT_EAPOL_MSG1 {
-    let bssid_h: mut ref i64 = dhruva_alloc_bytes(6);
-    let own_mac_h: mut ref i64 = dhruva_alloc_bytes(6);
+    // BUG FOUND 2026-11-16 (full heap-leak audit, triggered by a real
+    // board hang elsewhere -- see scratch_state.S's own comment on
+    // wpa2_eapol_bssid_scratch_addr): wifi_real_join's EAPOL loop calls
+    // this function once per genuinely-parsed EAPOL frame, which
+    // includes ordinary Message-1 retransmissions (a ordinary RF event,
+    // not an error -- see this function's own WAIT_EAPOL_MSG3 branch
+    // below) -- a fresh dhruva_alloc_bytes on every re-entry into this
+    // branch leaked again on every retransmission.
+    let bssid_h: mut ref i64 = wpa2_eapol_bssid_scratch_get();
+    let own_mac_h: mut ref i64 = wpa2_eapol_own_mac_scratch_get();
     let i: i64 = 0;
     while i < 6 {
       let _ = buf_write_byte(bssid_h, i as u32, buf_read_byte(ctx, (WPA2_JOIN_BSSID_OFF + i) as u32));
@@ -50988,7 +51100,7 @@ fn wpa2_join_step_eapol(ctx: mut ref i64, rx_buf: mut ref i64, rx_len: i64, pmk:
       i = i + 1;
     }
     let _ = wpa_hs_init(pmk, bssid_h, own_mac_h);
-    let snonce: mut ref i64 = dhruva_alloc_bytes(32);
+    let snonce: mut ref i64 = wpa2_eapol_snonce_scratch_get();
     let _ = wpa_nonce_generate_heap(snonce);
     if wpa_hs_process_msg1(rx_buf, rx_len, snonce, tx_out) != WPA_HS_OK {
       let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
@@ -51354,14 +51466,16 @@ fn wifi_scan_channel_at(i: i64) -> u32 {
 fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, bssid_out: mut ref [u8; 6]) -> i64 {
   let preq: [u8; 64] = [0 as u8; 64];
   let preq_len: i64 = probe_request_build(own_mac, ssid, ssid_len, mut ref preq);
-  let tx_heap: mut ref i64 = dhruva_alloc_bytes(64);
+  // BUG FOUND 2026-11-16 (full heap-leak audit) -- see scratch_state.S's
+  // own comment on wifi_scan_tx_scratch_addr.
+  let tx_heap: mut ref i64 = wifi_scan_tx_scratch_get();
   let pi: i64 = 0;
   while pi < preq_len {
     let _ = buf_write_byte(tx_heap, pi as u32, preq[pi] as u32);
     pi = pi + 1;
   }
 
-  let rx_heap: mut ref i64 = dhruva_alloc_bytes(512);
+  let rx_heap: mut ref i64 = wifi_scan_rx_scratch_get();
   let rx_fixed: [u8; 256] = [0 as u8; 256];
   let ssid_echo: [u8; 32] = [0 as u8; 32];
 
@@ -51637,7 +51751,9 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   let _ = uart_put_i64(poll_cap);
   let _ = uart_puts(" polls...\n");
 
-  let rx_heap: mut ref i64 = dhruva_alloc_bytes(512);
+  // BUG FOUND 2026-11-16 (full heap-leak audit) -- see scratch_state.S's
+  // own comment on wifi_listen_rx_scratch_addr.
+  let rx_heap: mut ref i64 = wifi_listen_rx_scratch_get();
   let rx_fixed: [u8; 256] = [0 as u8; 256];
   let ssid_echo: [u8; 32] = [0 as u8; 32];
   let heard_count: i64 = 0;
@@ -51650,7 +51766,7 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   // fine, genuinely nothing to report" (raw_ok_count>0 but heard_count
   // stays 0 -- real NAKs, not a transport failure, pointing instead at
   // RF/air-interface).
-  let raw_scratch: mut ref i64 = dhruva_alloc_bytes(64);
+  let raw_scratch: mut ref i64 = wifi_listen_raw_scratch_get();
   let raw_ok_count: i64 = 0;
   let raw_max_len: i64 = 0 - 1;
   let poll: i64 = 0;
@@ -51744,13 +51860,18 @@ fn wifi_real_join() -> i64 {
     si = si + 1;
   }
 
-  let password_heap: mut ref i64 = dhruva_alloc_bytes(64);
+  // BUG FOUND 2026-11-16 (full heap-leak audit): every dhruva_alloc_
+  // bytes call in this function leaked once per `wifi join` invocation
+  // (one-shot per call, not a per-poll leak, but `wifi join` was run
+  // many times tonight -- see scratch_state.S's own comment on
+  // wifi_join_password_scratch_addr).
+  let password_heap: mut ref i64 = wifi_join_password_scratch_get();
   let pwi: i64 = 0;
   while pwi < password_len {
     let _ = buf_write_byte(password_heap, pwi as u32, buf_read_byte(wifi_config_password_buf_ptr(), pwi as u32));
     pwi = pwi + 1;
   }
-  let ssid_heap: mut ref i64 = dhruva_alloc_bytes(32);
+  let ssid_heap: mut ref i64 = wifi_join_ssid_scratch_get();
   let shi: i64 = 0;
   while shi < ssid_len {
     let _ = buf_write_byte(ssid_heap, shi as u32, ssid[shi] as u32);
@@ -51759,7 +51880,7 @@ fn wifi_real_join() -> i64 {
   // Standard WPA2-PSK key derivation: PBKDF2-HMAC-SHA1, the SSID as
   // salt, 4096 iterations, 256-bit output -- IEEE 802.11-2020 Annex
   // J.4.1's own formula, the same one every real WPA2 client uses.
-  let pmk: mut ref i64 = dhruva_alloc_bytes(32);
+  let pmk: mut ref i64 = wifi_join_pmk_scratch_get();
   let _ = pbkdf2_hmac_sha1(password_heap, password_len, ssid_heap, ssid_len, 4096, pmk, 32);
 
   let devaddr: u32 = wifi_radio_get_devaddr();
@@ -51780,10 +51901,10 @@ fn wifi_real_join() -> i64 {
   // redundant second probe request (see wpa2_join_start_skip_probe's
   // own header comment for the live diagnostic that found this) and go
   // straight to Authentication.
-  let ctx: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_CTX_SIZE as u32);
+  let ctx: mut ref i64 = wifi_join_ctx_scratch_get();
   let preq: [u8; 64] = [0 as u8; 64];
   let preq_len: i64 = wpa2_join_start_skip_probe(ctx, ref bssid, ref own_mac, ref ssid, ssid_len, mut ref preq);
-  let preq_heap: mut ref i64 = dhruva_alloc_bytes(64);
+  let preq_heap: mut ref i64 = wifi_join_preq_scratch_get();
   let p1i: i64 = 0;
   while p1i < preq_len {
     let _ = buf_write_byte(preq_heap, p1i as u32, preq[p1i] as u32);
@@ -51801,10 +51922,10 @@ fn wifi_real_join() -> i64 {
   let _ = uart_put_i64(auth_tx_result);
   let _ = uart_puts(" (0=XFERCOMPL confirmed, -1=channel-0 never completed)\n");
 
-  let rx_heap: mut ref i64 = dhruva_alloc_bytes(512);
+  let rx_heap: mut ref i64 = wifi_join_rx_scratch_get();
   let rx_fixed: [u8; 256] = [0 as u8; 256];
   let mgmt_out: [u8; 90] = [0 as u8; 90];
-  let mgmt_heap: mut ref i64 = dhruva_alloc_bytes(90);
+  let mgmt_heap: mut ref i64 = wifi_join_mgmt_scratch_get();
 
   let seq: i64 = 2;
   let mgmt_iter: i64 = 0;
@@ -51896,12 +52017,12 @@ fn wifi_real_join() -> i64 {
   let _ = uart_puts("wifi join: associated, waiting for the 4-way handshake...\n");
 
   let eapol_payload: [u8; 140] = [0 as u8; 140];
-  let eapol_rx_heap: mut ref i64 = dhruva_alloc_bytes(140);
-  let eapol_tx_heap: mut ref i64 = dhruva_alloc_bytes(99);
+  let eapol_rx_heap: mut ref i64 = wifi_join_eapol_rx_scratch_get();
+  let eapol_tx_heap: mut ref i64 = wifi_join_eapol_tx_scratch_get();
   let eapol_tx_fixed: [u8; 140] = [0 as u8; 140];
-  let gtk_out: mut ref i64 = dhruva_alloc_bytes(32);
+  let gtk_out: mut ref i64 = wifi_join_gtk_scratch_get();
   let wrapped: [u8; 140] = [0 as u8; 140];
-  let wrapped_heap: mut ref i64 = dhruva_alloc_bytes(140);
+  let wrapped_heap: mut ref i64 = wifi_join_wrapped_scratch_get();
 
   let connected: i64 = 0;
   let eapol_iter: i64 = 0;
@@ -51975,7 +52096,7 @@ fn wifi_real_join() -> i64 {
     // wifi_radio_set_report_connect_fn's own header comment) -- the
     // handshake itself completes in software either way, but the
     // hardware/firmware was never told the link was up.
-    let bssid_heap: mut ref i64 = dhruva_alloc_bytes(6);
+    let bssid_heap: mut ref i64 = wifi_join_bssid_scratch_get();
     let bi2: i64 = 0;
     while bi2 < 6 {
       let _ = buf_write_byte(bssid_heap, bi2 as u32, bssid[bi2] as u32);
@@ -58871,6 +58992,29 @@ fn kernel_main() -> i64 {
   let _ = rtl_rx_raw_scratch_set(dhruva_alloc_bytes(512));
   let _ = rtl_rx_chunk_scratch_set(dhruva_alloc_bytes(64));
   let _ = rtl_tx_buf_scratch_set(dhruva_alloc_bytes(512));
+  let _ = icmp_poll_src_mac_scratch_set(dhruva_alloc_bytes(8));
+  let _ = icmp_poll_echo_payload_scratch_set(dhruva_alloc_bytes(56));
+  let _ = wpa2_eapol_bssid_scratch_set(dhruva_alloc_bytes(6));
+  let _ = wpa2_eapol_own_mac_scratch_set(dhruva_alloc_bytes(6));
+  let _ = wpa2_eapol_snonce_scratch_set(dhruva_alloc_bytes(32));
+  let _ = wifi_join_password_scratch_set(dhruva_alloc_bytes(64));
+  let _ = wifi_join_ssid_scratch_set(dhruva_alloc_bytes(32));
+  let _ = wifi_join_pmk_scratch_set(dhruva_alloc_bytes(32));
+  let _ = wifi_join_ctx_scratch_set(dhruva_alloc_bytes(169));
+  let _ = wifi_join_preq_scratch_set(dhruva_alloc_bytes(64));
+  let _ = wifi_join_rx_scratch_set(dhruva_alloc_bytes(512));
+  let _ = wifi_join_mgmt_scratch_set(dhruva_alloc_bytes(90));
+  let _ = wifi_join_eapol_rx_scratch_set(dhruva_alloc_bytes(140));
+  let _ = wifi_join_eapol_tx_scratch_set(dhruva_alloc_bytes(99));
+  let _ = wifi_join_gtk_scratch_set(dhruva_alloc_bytes(32));
+  let _ = wifi_join_wrapped_scratch_set(dhruva_alloc_bytes(140));
+  let _ = wifi_join_bssid_scratch_set(dhruva_alloc_bytes(6));
+  let _ = wifi_scan_tx_scratch_set(dhruva_alloc_bytes(64));
+  let _ = wifi_scan_rx_scratch_set(dhruva_alloc_bytes(512));
+  let _ = wifi_listen_rx_scratch_set(dhruva_alloc_bytes(512));
+  let _ = wifi_listen_raw_scratch_set(dhruva_alloc_bytes(64));
+  let _ = rtl8188cu_mac_buf_scratch_set(dhruva_alloc_bytes(6));
+  let _ = rtl8188cu_fw_load_scratch_set(dhruva_alloc_bytes(512));
   let _ = netif_tx_wrap_scratch_set(dhruva_alloc_bytes(520));
   let _ = netif_tx_chunk_scratch_set(dhruva_alloc_bytes(64));
   let _ = netif_rx_raw_scratch_set(dhruva_alloc_bytes(520));
