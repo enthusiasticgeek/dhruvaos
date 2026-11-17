@@ -367,10 +367,6 @@ extern "C" fn wifi_listen_rx_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn wifi_listen_rx_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
-extern "C" fn wifi_listen_raw_scratch_set(addr: mut ref i64) -> i64;
-#[stack_cost(bytes=1)]
-extern "C" fn wifi_listen_raw_scratch_get() -> mut ref i64;
-#[stack_cost(bytes=1)]
 extern "C" fn rtl8188cu_mac_buf_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn rtl8188cu_mac_buf_scratch_get() -> mut ref i64;
@@ -29729,17 +29725,48 @@ fn rtl_rx_desc_parse(buf: mut ref i64) -> RtlRxDescInfo {
 
   let dword3: i64 = buf_read_u32_le(buf, 12) as i64;
   let rpt_sel: i64 = (dword3 >> 14) & 0x3;
+  let rxmcs: i64 = dword3 & 0x3f;
 
   let fcs_ok: i64 = if crc32_bad == 0 { 1 } else { 0 };
   let is_report: i64 = if rpt_sel != 0 { 1 } else { 0 };
   let drvinfo_sz: i64 = drvinfo_sz_units * 8;
   let frame_start_off: i64 = RTL_RXDESC_LEN + drvinfo_sz + shift;
 
+  // BUG FIX (2026-11-17, cross-checked verbatim against Linux's real
+  // rtl8xxxu driver, core.c's rtl8723au_rx_parse_phystats + 8723a.c's
+  // rtl8723a_cck_rssi): the formula below (byte at phystats offset 4,
+  // `(byte>>1)-110`) is ONLY valid for OFDM/HT frames (rxmcs>=
+  // DESC_RATE_6M==4). Beacons/Probe Responses -- the overwhelming
+  // majority of what wifi listen/scan/join ever actually measures --
+  // are sent at a CCK basic rate (rxmcs<4), which Linux decodes from a
+  // COMPLETELY DIFFERENT byte (phystats offset 5, cck_agc_rpt_ofdm_
+  // cfosho_a) via a different formula entirely. This file used to
+  // apply the OFDM formula unconditionally to every frame regardless
+  // of rate -- reading the wrong byte at the wrong scale for CCK
+  // frames -- which systematically under-reported signal strength by
+  // tens of dB, confirmed live: this exact AP measured -100dBm+ here
+  // while a normal WiFi card (same dongle model, same location, same
+  // AP) saw a strong, healthy signal. rxmcs itself (dword3 bits 0-5)
+  // was never even read before this fix.
   let has_phystats: i64 = if drvinfo_sz >= 8 { 1 } else { 0 };
   let rssi_dbm: i64 = 0 - 1000;
   if has_phystats == 1 {
-    let pwdb_byte: i64 = buf_read_byte(buf, (RTL_RXDESC_LEN + 4) as u32) as i64;
-    rssi_dbm = (pwdb_byte / 2) - 110;
+    if rxmcs < 4 {
+      let cck_agc_rpt: i64 = buf_read_byte(buf, (RTL_RXDESC_LEN + 5) as u32) as i64;
+      let cck_base: i64 = cck_agc_rpt & 0xc0;
+      let cck_offset: i64 = cck_agc_rpt & 0x3e;
+      if cck_base == 0xc0 { rssi_dbm = (0 - 46) - cck_offset; }
+      else {
+        if cck_base == 0x80 { rssi_dbm = (0 - 26) - cck_offset; }
+        else {
+          if cck_base == 0x40 { rssi_dbm = (0 - 12) - cck_offset; }
+          else { rssi_dbm = 16 - cck_offset; }
+        }
+      }
+    } else {
+      let pwdb_byte: i64 = buf_read_byte(buf, (RTL_RXDESC_LEN + 4) as u32) as i64;
+      rssi_dbm = (pwdb_byte / 2) - 110;
+    }
   }
 
   return RtlRxDescInfo { fcs_ok: fcs_ok, pkt_len: pkt_len, frame_start_off: frame_start_off, is_report: is_report, rssi_dbm: rssi_dbm, has_phystats: has_phystats };
@@ -51632,125 +51659,17 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
 // Interval/Capability-Info (beacons share that exact layout), which is
 // the whole reason wifi_scan_for_ssid's own matching logic never
 // needed a frame-type check to begin with.
-// TEMPORARY DIAGNOSTIC (2026-11-15): raw, print-every-step re-arm of
-// channel 0 for a single WiFi bulk-IN attempt, bypassing dwc2_wifi_
-// bulk_in/dwc2_wait_chan0_done_bounded entirely so every HCINT value
-// actually observed is visible, not just the final classified result --
-// isolates "genuinely nothing ever happens on the wire" (HCINT stays
-// 0x00000000 for the whole window, nak_count stays 0) from "a NAK
-// happens, something still misclassifies/mishandles it" (nak_count>0 but
-// still no XFERCOMPL) or "it actually completes here" (would mean the
-// bug is in dwc2_wifi_bulk_in's own post-wait bookkeeping, not the wait
-// primitive at all).
-fn wifi_rx_poll_diag(devaddr: u32, mps: u32) -> i64 {
-  let epaddr: u32 = usb_wifi_get_bulk_in_epaddr();
-  let epnum: u32 = epaddr & (0x0F as u32);
-  let dma: mut ref i64 = usb_bulk_data_scratch_get();
-  let hcchar0: i64 = dwc2_hcchar0_addr();
-  let hctsiz0: i64 = dwc2_hctsiz0_addr();
-  let hcdma0: i64 = dwc2_hcdma0_addr();
-  let hcint0: i64 = dwc2_hcint0_addr();
-
-  let toggle: u32 = usb_wifi_get_in_toggle();
-  let pid: u32 = if toggle == (0 as u32) { dwc2_bulk_pid_data0() } else { dwc2_bulk_pid_data1() };
-  let want_len: i64 = mps as i64;
-  let pktcnt: u32 = 1 as u32;
-  let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
-  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
-  let hcchar_val: u32 = dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps);
-  let _ = mmio_write_u32(hcchar0, hcchar_val);
-
-  let _ = uart_puts("WIFI RX DIAG: armed hcchar=0x");
-  let _ = uart_put_hex32(hcchar_val);
-  let _ = uart_puts(" epnum=");
-  let _ = uart_put_i64(epnum as i64);
-  let _ = uart_puts(" devaddr=");
-  let _ = uart_put_i64(devaddr as i64);
-  let _ = uart_puts(" pid=");
-  let _ = uart_put_i64(pid as i64);
-  let _ = uart_puts(" hctsiz=0x");
-  let _ = uart_put_hex32(mmio_read_u32(hctsiz0));
-  let _ = uart_puts("\n");
-  // BUG FOUND 2026-11-16 (real-HW investigation): this diagnostic used to
-  // print a live readback of REG_OFDM0_TRX_PATH_ENABLE (0x0c04) right
-  // here, via rtl_reg_read32 -- a CONTROL transfer that reuses this same
-  // physical channel 0 (dwc2_control_in calls dwc2_reset_chan0_for_new_
-  // transfer + reprograms HCCHAR/HCTSIZ/HCDMA for its own SETUP/DATA/
-  // STATUS stages). Running it HERE, between arming the bulk-IN transfer
-  // above and the NAK-polling loop below, silently clobbered the very
-  // transfer this function exists to observe: by the time the loop below
-  // started polling HCINT, channel 0 had already been reprogrammed for
-  // the register read's own control transfer, so the bulk-IN transfer
-  // this function armed was never actually issued -- explaining the
-  // "nak_count=0, flat silence" seen in every build that had this print,
-  // which a dedicated causality test (gating the unrelated BB/AGC/RF phy
-  // table load on/off) proved had NOTHING to do with that table: BOTH
-  // the table-enabled and table-disabled builds showed identical
-  // nak_count=0, because this same diagnostic bug was present in both,
-  // unconditionally. The underlying readback finding (TRX_PATH_ENABLE's
-  // TX_MASK bits reading back 0 after enable_rf's own write intended to
-  // set them) may still be real, but it was never safe to check from
-  // inside this specific function -- removed here; re-add from a context
-  // that doesn't sit between an arm and its own poll if that's revisited.
-  let chena_bit: u32 = (1 as u32) << (31 as u32);
-  let tries: i64 = 0;
-  let nak_count: i64 = 0;
-  let last_hi: u32 = 0 as u32;
-  let stop: i64 = 0;
-  // DIAGNOSTIC (2026-11-16): on the very FIRST NAK only (to avoid
-  // flooding the slow UART across hundreds of NAKs per poll), dump
-  // GINTSTS/HFNUM/GRXSTSR -- all plain MMIO reads of host-controller-
-  // wide status registers, NOT USB control transfers, so (unlike the
-  // 0x0c04 readback this same function's own 2026-11-16 fix comment
-  // above describes) this is safe to do mid-poll without disturbing
-  // channel 0's own in-flight bulk-IN state. GRXSTSR (offset 0x1C) is
-  // the non-popping peek of the top RX-FIFO status entry -- if the
-  // device ever DOES push a real packet into the RX FIFO at the
-  // hardware level (independent of whether channel 0's own transfer
-  // ever reports XFERCOMPL for it), this would be the first place
-  // that becomes visible.
-  let printed_extra: i64 = 0;
-  while (tries < (5000 as i64)) && (stop == 0) {
-    let hi: u32 = mmio_read_u32(hcint0);
-    if hi != (0 as u32) {
-      last_hi = hi;
-      if (hi & (0x10 as u32)) != (0 as u32) {
-        nak_count = nak_count + 1;
-        if printed_extra == 0 {
-          printed_extra = 1;
-          let _ = uart_puts("WIFI RX DIAG: first NAK extras -- GINTSTS=0x");
-          let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x14));
-          let _ = uart_puts(" HFNUM=0x");
-          let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x408));
-          let _ = uart_puts(" GRXSTSR=0x");
-          let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x1C));
-          let _ = uart_puts("\n");
-        }
-        let _ = mmio_write_u32(hcint0, hi);
-        let rearm: u32 = mmio_read_u32(hcchar0) | chena_bit;
-        let _ = mmio_write_u32(hcchar0, rearm);
-      } else {
-        let _ = mmio_write_u32(hcint0, hi);
-        stop = 1;
-      }
-    }
-    tries = tries + 1;
-  }
-  let _ = uart_puts("WIFI RX DIAG: after poll tries=");
-  let _ = uart_put_i64(tries);
-  let _ = uart_puts(" nak_count=");
-  let _ = uart_put_i64(nak_count);
-  let _ = uart_puts(" last_hi=0x");
-  let _ = uart_put_hex32(last_hi);
-  let _ = uart_puts(" final_hcchar=0x");
-  let _ = uart_put_hex32(mmio_read_u32(hcchar0));
-  let _ = uart_puts(" final_hcint=0x");
-  let _ = uart_put_hex32(mmio_read_u32(hcint0));
-  let _ = uart_puts("\n");
-  return 0;
-}
-
+// REMOVED (2026-11-17): wifi_rx_poll_diag used to live here -- a
+// TEMPORARY DIAGNOSTIC (2026-11-15) that armed its own raw bulk-IN
+// transfer on channel 0, bypassing dwc2_wifi_bulk_in entirely. It had
+// the same frame-stealing problem as wifi_passive_listen's own raw
+// bulk-IN diagnostic (see that function's matching 2026-11-17 fix
+// comment): both read from the SAME hardware RX FIFO that the real
+// RX path reads from, so whichever one ran first silently consumed a
+// frame the other then never saw. Its only caller (wifi_passive_
+// listen, for the first 3 polls only) was removed for that reason,
+// leaving this function unused -- deleted rather than left as dead
+// code.
 fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   if wifi_radio_init_rtl8188cu() == 0 {
     let _ = uart_puts("wifi listen: no USB WiFi device enumerated\n");
@@ -51773,35 +51692,26 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   let rx_fixed: [u8; 256] = [0 as u8; 256];
   let ssid_echo: [u8; 32] = [0 as u8; 32];
   let heard_count: i64 = 0;
-  // DIAGNOSTIC (2026-11-12): raw USB-transaction-level visibility,
-  // bypassing rtl8188cu_rx_frame's own FCS/report/bounds checks
-  // entirely -- distinguishes "the bulk IN transaction itself never
-  // succeeds" (dwc2_wifi_bulk_in returning negative on every single
-  // poll, a USB-protocol-level problem, same fragility class already
-  // found elsewhere in this driver today) from "transactions complete
-  // fine, genuinely nothing to report" (raw_ok_count>0 but heard_count
-  // stays 0 -- real NAKs, not a transport failure, pointing instead at
-  // RF/air-interface).
-  let raw_scratch: mut ref i64 = wifi_listen_raw_scratch_get();
-  let raw_ok_count: i64 = 0;
-  let raw_max_len: i64 = 0 - 1;
+  // BUG FIX (2026-11-17): the two diagnostics that used to run here
+  // (wifi_rx_poll_diag for the first 3 polls, and a raw dwc2_wifi_
+  // bulk_in read on EVERY poll) each independently issued their own
+  // real USB bulk-IN transaction against the SAME hardware FIFO that
+  // wifi_radio_rx_frame below also reads from -- a FIFO is drained by
+  // whoever reads it first, so these diagnostics were silently
+  // STEALING frames before the real RX path ever saw them, on every
+  // single poll. Both were explicitly labeled TEMPORARY/DIAGNOSTIC,
+  // added while chasing an earlier "0/300, nothing ever received at
+  // all" bug that is long since fixed (this exact function routinely
+  // hears 90+ frames/300 polls now) -- they outlived their purpose and
+  // became actively harmful to the very measurement they were meant to
+  // help debug (a received-but-uncounted frame from a specific AP is
+  // indistinguishable, from this function's own output, from a frame
+  // that was never sent). Removed; wifi_radio_rx_frame below is now the
+  // only reader of this endpoint in this function.
   let poll: i64 = 0;
   while poll < poll_cap {
     if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
       let _ = watchdog_kick();
-    }
-    // TEMPORARY DIAGNOSTIC (2026-11-15, still chasing "0/300" after the
-    // NAK-retry fix to dwc2_wait_chan0_done_bounded): see this band's
-    // own print output for what this is isolating -- genuine hardware
-    // silence (HCINT never nonzero) vs. a NAK that something still
-    // mishandles.
-    if poll < (3 as i64) {
-      let _ = wifi_rx_poll_diag(devaddr, mps_in);
-    }
-    let raw_status: i64 = dwc2_wifi_bulk_in(devaddr, mps_in, raw_scratch, mps_in as i64);
-    if raw_status >= 0 {
-      raw_ok_count = raw_ok_count + 1;
-      if raw_status > raw_max_len { raw_max_len = raw_status; }
     }
     let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
     if rx_len >= 0 {
@@ -51843,13 +51753,6 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   let _ = uart_puts(" management frame(s) total on channel ");
   let _ = uart_put_i64(channel as i64);
   let _ = uart_puts("\n");
-  let _ = uart_puts("wifi listen: raw bulk-IN diagnostic -- ");
-  let _ = uart_put_i64(raw_ok_count);
-  let _ = uart_puts("/");
-  let _ = uart_put_i64(poll_cap);
-  let _ = uart_puts(" polls completed the USB transaction successfully (raw_max_len=");
-  let _ = uart_put_i64(raw_max_len);
-  let _ = uart_puts(")\n");
   return heard_count;
 }
 
@@ -59054,7 +58957,6 @@ fn kernel_main() -> i64 {
   let _ = wifi_scan_tx_scratch_set(dhruva_alloc_bytes(64));
   let _ = wifi_scan_rx_scratch_set(dhruva_alloc_bytes(512));
   let _ = wifi_listen_rx_scratch_set(dhruva_alloc_bytes(512));
-  let _ = wifi_listen_raw_scratch_set(dhruva_alloc_bytes(64));
   let _ = rtl8188cu_mac_buf_scratch_set(dhruva_alloc_bytes(6));
   let _ = rtl8188cu_fw_load_scratch_set(dhruva_alloc_bytes(512));
   let _ = netif_tx_wrap_scratch_set(dhruva_alloc_bytes(520));

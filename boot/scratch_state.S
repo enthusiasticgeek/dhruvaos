@@ -964,12 +964,6 @@ wifi_listen_rx_scratch_addr:
                          * RX-only diagnostic command -- not shared with
                          * either WiFi-join scratch above for the same
                          * reason wifi_scan_rx_scratch isn't). */
-wifi_listen_raw_scratch_addr:
-    .word 0             /* 64 bytes -- wifi_passive_listen's own raw USB-
-                         * transaction-level diagnostic scratch
-                         * (dwc2_wifi_bulk_in's own output, bypassing
-                         * rtl8188cu_rx_frame -- see that call site's own
-                         * header comment). */
 rtl8188cu_mac_buf_scratch_addr:
     .word 0             /* 6 bytes -- rtl8188cu_mac_bringup's own copy of
                          * the station MAC passed to rtl8188cu_set_mac_
@@ -2440,19 +2434,6 @@ wifi_listen_rx_scratch_set:
 .global wifi_listen_rx_scratch_get
 wifi_listen_rx_scratch_get:
     ldr r0, =wifi_listen_rx_scratch_addr
-    ldr r0, [r0]
-    bx lr
-
-.global wifi_listen_raw_scratch_set
-wifi_listen_raw_scratch_set:
-    ldr r1, =wifi_listen_raw_scratch_addr
-    str r0, [r1]
-    mov r0, #0
-    bx lr
-
-.global wifi_listen_raw_scratch_get
-wifi_listen_raw_scratch_get:
-    ldr r0, =wifi_listen_raw_scratch_addr
     ldr r0, [r0]
     bx lr
 
