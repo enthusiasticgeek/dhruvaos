@@ -44093,6 +44093,31 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts(" mgmtlog_total=");
       let _ = uart_put_i64(wifi_mgmtlog_total_count_get() as i64);
       let _ = uart_puts(" (ring holds last 16)\n");
+      // Live readback (2026-11-17): does the chip's own hardware
+      // station-address register still hold wifi_real_own_mac()'s
+      // value right now, or did something reset/never retain it? The
+      // 2026-11-16 fix made the WRITE self-consistent with the frames
+      // we transmit, but never confirmed the chip actually kept it --
+      // this reads REG_MACID (and REG_RCR) back from the live chip to
+      // settle that empirically instead of trusting the write alone.
+      let diag_devaddr: u32 = wifi_radio_get_devaddr();
+      let diag_mps: u32 = wifi_radio_get_mps_out();
+      let expect_mac: [u8; 6] = wifi_real_own_mac();
+      let _ = uart_puts("wifi rxstats: REG_MACID live=");
+      let dmi: i64 = 0;
+      while dmi < 6 {
+        let _ = uart_put_hex_byte(rtl_reg_read8(diag_devaddr, diag_mps, (RTL_REG_MACID as i64 + dmi) as u32) as u8);
+        dmi = dmi + 1;
+      }
+      let _ = uart_puts(" expect=");
+      let dmj: i64 = 0;
+      while dmj < 6 {
+        let _ = uart_put_hex_byte(expect_mac[dmj]);
+        dmj = dmj + 1;
+      }
+      let _ = uart_puts(" RCR=0x");
+      let _ = uart_put_hex32(rtl_reg_read32(diag_devaddr, diag_mps, RTL_REG_RCR));
+      let _ = uart_puts("\n");
       return 0;
     }
     if shell_word_matches(line_buf, sub_start, sub_end, "mgmtlog") == 1 {
