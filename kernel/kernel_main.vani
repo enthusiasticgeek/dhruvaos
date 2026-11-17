@@ -6824,6 +6824,22 @@ fn watchdog_arm(timeout_ticks: u32) -> i64 {
 fn watchdog_init() -> i64 {
   let fifteen_seconds_in_ticks: u32 = 983040 as u32; // 15 << 16, see this fn's own header comment for the 16.0s hardware ceiling
   let _ = watchdog_arm(fifteen_seconds_in_ticks);
+  // BUG FOUND 2026-11-16 (real-HW board hang, watchdog audit): this had
+  // NO diagnostic print at all -- no way to confirm after the fact,
+  // from the UART log alone, whether this function (and therefore the
+  // whole 15s safety-net watchdog) actually ran on a given boot, versus
+  // WATCHDOG_ENABLE_FOR_REAL_HARDWARE simply not being 1 in whatever
+  // image was actually flashed. A register readback right after the
+  // arm (not just trusting the write succeeded) matches this project's
+  // own established "verify, don't trust" discipline for exactly this
+  // kind of real-HW register write.
+  let pm_wdog_readback: u32 = mmio_read_u32(PM_WDOG);
+  let pm_rstc_readback: u32 = mmio_read_u32(PM_RSTC);
+  let _ = uart_puts("BOOT DIAG: watchdog_init armed (15s timeout), PM_WDOG readback=0x");
+  let _ = uart_put_hex32(pm_wdog_readback);
+  let _ = uart_puts(" PM_RSTC readback=0x");
+  let _ = uart_put_hex32(pm_rstc_readback);
+  let _ = uart_puts("\n");
   return 0;
 }
 
@@ -58709,6 +58725,17 @@ fn kernel_main() -> i64 {
   // IMMEDIATELY on the very first PM_RSTC write watchdog_arm makes,
   // regardless of the timeout value -- this entire mechanism can only
   // be validated on real hardware, never QEMU, by construction).
+  // BUG FOUND 2026-11-16 (watchdog audit, after a real hang the 15s
+  // safety-net watchdog never recovered): print which branch this boot
+  // actually took, unconditionally, regardless of the flag's value --
+  // previously, a boot with the flag at 0 printed nothing at all here,
+  // indistinguishable in the log from one that took this branch but
+  // whose watchdog_init() print (just added) never flushed before a
+  // crash. Never trust which image got flashed; read it back from the
+  // image's own boot log instead.
+  let _ = uart_puts("BOOT DIAG: WATCHDOG_ENABLE_FOR_REAL_HARDWARE=");
+  let _ = uart_put_i64(WATCHDOG_ENABLE_FOR_REAL_HARDWARE);
+  let _ = uart_puts("\n");
   if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
     let _ = watchdog_init();
   }

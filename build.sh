@@ -128,7 +128,7 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/swi_entry.S" -o "${BUILD_DIR}/swi_entry.o"
 
-arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm ${VECTORS_CFLAGS:-} \
   "${ROOT}/boot/rpi1/vectors.S" -o "${BUILD_DIR}/vectors.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \

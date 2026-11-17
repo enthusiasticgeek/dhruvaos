@@ -462,9 +462,24 @@ static void dhruva_oom_fatal(unsigned long requested, unsigned long used, int in
                          " instead, some runtime code path is allocating far"
                          " more than boot-time self-tests account for.\n");
     }
+    /* BUG FOUND 2026-11-16 (real board hang, confirmed never recovered):
+     * this halt is a raw `while(1)`, completely independent of exit()'s
+     * own halt loop below -- the EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE fix
+     * added to exit() (see that function's own header comment) never
+     * executes for an OOM halt reached straight from dhruva_alloc_bytes,
+     * which is exactly what happened: a real heap-exhaustion FATAL hung
+     * the board for 90+ seconds with no recovery, requiring a physical
+     * power cycle. Same fix, same gate, called directly here instead of
+     * relying on every possible halt path remembering to route through
+     * exit() first. */
+#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
+    dhruva_oom_puts("FATAL: arming a last-resort 2s watchdog reset before halting\n");
+    exit_panic_watchdog_arm();
+#endif
     while (1) {
         /* halt -- there is no safe way to continue with a request this
-         * function could not satisfy */
+         * function could not satisfy (unless the watchdog arm above
+         * fires first on a real-HW build) */
     }
 }
 

@@ -254,6 +254,30 @@ fault_data_abort:
      * show up in directly, not an approximation of it. */
     mrs r0, spsr
     bl abort_dump_task_stacks
+    /* BUG FOUND 2026-11-16 (real board hang, watchdog audit): this halt
+     * was a bare `b .` with zero recovery -- see kernel_main.vani's own
+     * WATCHDOG_ENABLE_FOR_REAL_HARDWARE header comment, which already
+     * documented this exact gap for every vectors.S fault handler, and
+     * runtime_stubs.c's own exit_panic_watchdog_arm/dhruva_oom_fatal,
+     * the C-side halt paths that got the identical fix for the same
+     * reason. Same register protocol, written directly here (not a
+     * call out to the C helper) since that function is `static` and
+     * this halt must work standalone, consistent with this file's own
+     * "must work even in a corrupted state" philosophy. Gated the same
+     * way as runtime_stubs.c's own fix (EXIT_WATCHDOG_ARM_FOR_REAL_
+     * HARDWARE, see build.sh's VECTORS_CFLAGS and build_real_hw.sh). */
+#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
+    ldr r0, =0x20100024 /* PM_WDOG */
+    ldr r1, =0x5A020000 /* password | 2-second timeout (2 << 16) */
+    str r1, [r0]
+    ldr r0, =0x2010001C /* PM_RSTC */
+    ldr r1, [r0]
+    bic r1, r1, #0x30 /* clears the same bits as C's wrcfg_clr=0xFFFFFFCF */
+    orr r1, r1, #0x20
+    ldr r2, =0x5A000000
+    orr r1, r1, r2
+    str r1, [r0]
+#endif
     b .
 
 .global fault_prefetch_abort
@@ -313,4 +337,18 @@ fault_prefetch_abort:
      * of trying to live-read sp_usr). */
     mrs r0, spsr
     bl abort_dump_task_stacks
+    /* Same 2026-11-16 fix as fault_data_abort's own identical halt --
+     * see that call site's own header comment for the full "why". */
+#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
+    ldr r0, =0x20100024 /* PM_WDOG */
+    ldr r1, =0x5A020000 /* password | 2-second timeout (2 << 16) */
+    str r1, [r0]
+    ldr r0, =0x2010001C /* PM_RSTC */
+    ldr r1, [r0]
+    bic r1, r1, #0x30 /* clears the same bits as C's wrcfg_clr=0xFFFFFFCF */
+    orr r1, r1, #0x20
+    ldr r2, =0x5A000000
+    orr r1, r1, r2
+    str r1, [r0]
+#endif
     b .
