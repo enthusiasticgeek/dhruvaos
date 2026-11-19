@@ -824,6 +824,27 @@ rtl_rx_raw_scratch_addr:
                          * either (separate, still-open investigation --
                          * see project memory). 512 bytes: one max-size
                          * RX USB-transfer accumulation buffer. */
+
+/* BUG FOUND 2026-11-19 (methodical full-stack audit): this chip can
+ * bundle multiple received frames into one USB bulk-IN transfer
+ * (confirmed against the real driver's own pkt_cnt field); rtl8188cu_
+ * rx_frame used to always parse only the FIRST frame at a fixed
+ * buffer offset and silently discard any others. These three words
+ * let it "remember" an unfinished bundle across calls: how many more
+ * frames remain, and the byte offset in rtl_rx_raw_scratch where the
+ * next one starts, so the next caller drains it (no new USB read)
+ * instead of the data being lost the moment this function returns.
+ * rtl_rx_bundle_total_len is the bundle's own total valid length
+ * (`got` from the original read), needed to know when there's no
+ * longer enough remaining data for another real descriptor. */
+.align 4
+rtl_rx_bundle_remaining:
+    .word 0
+rtl_rx_bundle_offset:
+    .word 0
+rtl_rx_bundle_total_len:
+    .word 0
+
 rtl_rx_chunk_scratch_addr:
     .word 0             /* Same bug/fix as rtl_rx_raw_scratch above --
                          * rtl8188cu_rx_frame's own per-USB-packet chunk
@@ -2207,6 +2228,45 @@ rtl_rx_raw_scratch_set:
 .global rtl_rx_raw_scratch_get
 rtl_rx_raw_scratch_get:
     ldr r0, =rtl_rx_raw_scratch_addr
+    ldr r0, [r0]
+    bx lr
+
+.global rtl_rx_bundle_remaining_set
+rtl_rx_bundle_remaining_set:
+    ldr r1, =rtl_rx_bundle_remaining
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global rtl_rx_bundle_remaining_get
+rtl_rx_bundle_remaining_get:
+    ldr r0, =rtl_rx_bundle_remaining
+    ldr r0, [r0]
+    bx lr
+
+.global rtl_rx_bundle_offset_set
+rtl_rx_bundle_offset_set:
+    ldr r1, =rtl_rx_bundle_offset
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global rtl_rx_bundle_offset_get
+rtl_rx_bundle_offset_get:
+    ldr r0, =rtl_rx_bundle_offset
+    ldr r0, [r0]
+    bx lr
+
+.global rtl_rx_bundle_total_len_set
+rtl_rx_bundle_total_len_set:
+    ldr r1, =rtl_rx_bundle_total_len
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global rtl_rx_bundle_total_len_get
+rtl_rx_bundle_total_len_get:
+    ldr r0, =rtl_rx_bundle_total_len
     ldr r0, [r0]
     bx lr
 

@@ -275,6 +275,18 @@ extern "C" fn rtl_rx_raw_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn rtl_rx_raw_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_bundle_remaining_set(value: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_bundle_remaining_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_bundle_offset_set(value: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_bundle_offset_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_bundle_total_len_set(value: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn rtl_rx_bundle_total_len_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn rtl_rx_chunk_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn rtl_rx_chunk_scratch_get() -> mut ref i64;
@@ -29860,7 +29872,7 @@ const RTL_RXDESC_LEN: i64 = 24;
 // explicitly rather than assumed away, since treating a C2H event as
 // frame data would misparse garbage as if it were a real received
 // packet.
-struct RtlRxDescInfo { fcs_ok: i64, pkt_len: i64, frame_start_off: i64, is_report: i64, rssi_dbm: i64, has_phystats: i64 }
+struct RtlRxDescInfo { fcs_ok: i64, pkt_len: i64, frame_start_off: i64, is_report: i64, rssi_dbm: i64, has_phystats: i64, pkt_cnt: i64, pkt_offset: i64 }
 
 // DIAGNOSTIC (2026-11-16, "use something non-disruptive" -- after the
 // monitor-mode over-the-air capture plan turned out to risk cutting off
@@ -29884,21 +29896,51 @@ struct RtlRxDescInfo { fcs_ok: i64, pkt_len: i64, frame_start_off: i64, is_repor
 // would mean antenna/RF-path quality isn't the explanation for the TX-
 // side symptom; a weak one would point back at antenna/RF margin after
 // all, consistent across both directions).
-fn rtl_rx_desc_parse(buf: mut ref i64) -> RtlRxDescInfo {
-  let dword0: i64 = buf_read_u32_le(buf, 0) as i64;
+// BUG FOUND 2026-11-19 (methodical full-stack audit): this chip can
+// (and does, on a busy channel -- confirmed live all session, 100+
+// beacons/scan) bundle MULTIPLE received frames into a single USB
+// bulk-IN transfer, exactly matching the real driver's own `pkt_cnt`
+// field and 128-byte-rounded `pkt_offset` advance between bundled
+// frames (`rtl8xxxu_parse_rxdesc16` in core.c). This function used to
+// always parse at a fixed buf offset 0 and never read pkt_cnt at
+// all -- every frame after the first in any bundle was silently
+// discarded on every single poll, invisibly, since the caller never
+// even knew a bundle existed. Added an `off` byte offset parameter
+// (every existing call site passes 0, unchanged behavior for the
+// first/only frame in a transfer) plus pkt_cnt/pkt_offset in the
+// returned struct, so a caller can now walk every frame in a bundle
+// instead of only ever seeing the first.
+fn rtl_rx_desc_parse(buf: mut ref i64, off: i64) -> RtlRxDescInfo {
+  let dword0: i64 = buf_read_u32_le(buf, off as u32) as i64;
   let pkt_len: i64 = dword0 & 0x3fff;
   let crc32_bad: i64 = (dword0 >> 14) & 1;
   let drvinfo_sz_units: i64 = (dword0 >> 16) & 0xf;
   let shift: i64 = (dword0 >> 24) & 0x3;
 
-  let dword3: i64 = buf_read_u32_le(buf, 12) as i64;
+  // dword2 (byte offset +8 from this descriptor's own start): pkt_cnt
+  // lives at bits[23:16] -- confirmed against rtl8xxxu.h's own
+  // `struct rtl8xxxu_rxdesc16` bitfield layout (seq:12, frag:4,
+  // pkt_cnt:8, ...). Only meaningful on the FIRST frame of a bundle --
+  // callers walking frames 2..N must remember the value from frame 1,
+  // never re-read it (matches the reference's own "if (!pkt_cnt)
+  // pkt_cnt = rx_desc->pkt_cnt" -- it only trusts this field once).
+  let dword2: i64 = buf_read_u32_le(buf, (off + 8) as u32) as i64;
+  let pkt_cnt: i64 = (dword2 >> 16) & 0xff;
+
+  let dword3: i64 = buf_read_u32_le(buf, (off + 12) as u32) as i64;
   let rpt_sel: i64 = (dword3 >> 14) & 0x3;
   let rxmcs: i64 = dword3 & 0x3f;
 
   let fcs_ok: i64 = if crc32_bad == 0 { 1 } else { 0 };
   let is_report: i64 = if rpt_sel != 0 { 1 } else { 0 };
   let drvinfo_sz: i64 = drvinfo_sz_units * 8;
-  let frame_start_off: i64 = RTL_RXDESC_LEN + drvinfo_sz + shift;
+  let frame_start_off: i64 = off + RTL_RXDESC_LEN + drvinfo_sz + shift;
+  // Reference driver: `roundup(pkt_len + drvinfo_sz + shift +
+  // sizeof(rxdesc16), 128)` -- the real on-wire gap to the NEXT
+  // bundled frame's own descriptor, rounded up to the chip's own
+  // 128-byte DMA alignment.
+  let this_frame_total: i64 = pkt_len + drvinfo_sz + shift + RTL_RXDESC_LEN;
+  let pkt_offset: i64 = ((this_frame_total + 127) / 128) * 128;
 
   // BUG FIX (2026-11-17, cross-checked verbatim against Linux's real
   // rtl8xxxu driver, core.c's rtl8723au_rx_parse_phystats + 8723a.c's
@@ -29920,7 +29962,7 @@ fn rtl_rx_desc_parse(buf: mut ref i64) -> RtlRxDescInfo {
   let rssi_dbm: i64 = 0 - 1000;
   if has_phystats == 1 {
     if rxmcs < 4 {
-      let cck_agc_rpt: i64 = buf_read_byte(buf, (RTL_RXDESC_LEN + 5) as u32) as i64;
+      let cck_agc_rpt: i64 = buf_read_byte(buf, (off + RTL_RXDESC_LEN + 5) as u32) as i64;
       let cck_base: i64 = cck_agc_rpt & 0xc0;
       let cck_offset: i64 = cck_agc_rpt & 0x3e;
       if cck_base == 0xc0 { rssi_dbm = (0 - 46) - cck_offset; }
@@ -29932,12 +29974,12 @@ fn rtl_rx_desc_parse(buf: mut ref i64) -> RtlRxDescInfo {
         }
       }
     } else {
-      let pwdb_byte: i64 = buf_read_byte(buf, (RTL_RXDESC_LEN + 4) as u32) as i64;
+      let pwdb_byte: i64 = buf_read_byte(buf, (off + RTL_RXDESC_LEN + 4) as u32) as i64;
       rssi_dbm = (pwdb_byte / 2) - 110;
     }
   }
 
-  return RtlRxDescInfo { fcs_ok: fcs_ok, pkt_len: pkt_len, frame_start_off: frame_start_off, is_report: is_report, rssi_dbm: rssi_dbm, has_phystats: has_phystats };
+  return RtlRxDescInfo { fcs_ok: fcs_ok, pkt_len: pkt_len, frame_start_off: frame_start_off, is_report: is_report, rssi_dbm: rssi_dbm, has_phystats: has_phystats, pkt_cnt: pkt_cnt, pkt_offset: pkt_offset };
 }
 
 fn rtl_rx_desc_self_test() -> i64 {
@@ -29955,16 +29997,18 @@ fn rtl_rx_desc_self_test() -> i64 {
   let dword0: i64 = 100 | (0 << 14) | (2 << 16) | (1 << 24);
   let _ = buf_write_u32_le(buf, 0, dword0 as u32);
 
-  let info: RtlRxDescInfo = rtl_rx_desc_parse(buf);
+  let info: RtlRxDescInfo = rtl_rx_desc_parse(buf, 0);
   if info.fcs_ok != 1 { ok = 0; }
   if info.pkt_len != 100 { ok = 0; }
   if info.frame_start_off != (24 + 16 + 1) { ok = 0; }
   if info.is_report != 0 { ok = 0; }
+  // this_frame_total = 100 + 16 + 1 + 24 = 141, rounds up to 256.
+  if info.pkt_offset != 256 { ok = 0; }
 
   // FCS failure: crc32 bit set.
   let dword0_bad_fcs: i64 = 100 | (1 << 14);
   let _ = buf_write_u32_le(buf, 0, dword0_bad_fcs as u32);
-  let info_bad: RtlRxDescInfo = rtl_rx_desc_parse(buf);
+  let info_bad: RtlRxDescInfo = rtl_rx_desc_parse(buf, 0);
   if info_bad.fcs_ok != 0 { ok = 0; }
 
   // Firmware C2H report, not a real frame: rpt_sel nonzero (dword3
@@ -29972,10 +30016,34 @@ fn rtl_rx_desc_self_test() -> i64 {
   let _ = buf_write_u32_le(buf, 0, 100 as u32);
   let dword3_report: i64 = 1 << 14;
   let _ = buf_write_u32_le(buf, 12, dword3_report as u32);
-  let info_report: RtlRxDescInfo = rtl_rx_desc_parse(buf);
+  let info_report: RtlRxDescInfo = rtl_rx_desc_parse(buf, 0);
   if info_report.is_report != 1 { ok = 0; }
 
-  let _ = uart_puts("USB: RTL8188CU RX descriptor parse (pkt_len/frame-start-offset/FCS-fail/firmware-report detection) vs a synthetic descriptor built to the real bit layout");
+  // BUG FOUND 2026-11-19 (methodical full-stack audit): bundled-frame
+  // support -- pkt_cnt lives in dword2 bits[23:16], and a second
+  // frame's own descriptor must be readable at a non-zero `off`.
+  let _ = buf_write_u32_le(buf, 12, 0 as u32); // clear the report bit from the test above
+  let dword2_pkt_cnt2: i64 = 2 << 16;
+  let _ = buf_write_u32_le(buf, 8, dword2_pkt_cnt2 as u32);
+  let info_bundle: RtlRxDescInfo = rtl_rx_desc_parse(buf, 0);
+  if info_bundle.pkt_cnt != 2 { ok = 0; }
+
+  // A second descriptor, at a non-zero offset, with its own distinct
+  // pkt_len -- confirms `off` genuinely shifts every field read, not
+  // just the ones touched incidentally by the first assertions above.
+  let buf2: mut ref i64 = dhruva_alloc_bytes(512);
+  let bi: i64 = 0;
+  while bi < 512 {
+    let _ = buf_write_byte(buf2, bi as u32, 0 as u32);
+    bi = bi + 1;
+  }
+  let second_dword0: i64 = 50 | (0 << 16) | (0 << 24); // pkt_len=50, drvinfo_sz=0, shift=0
+  let _ = buf_write_u32_le(buf2, 256, second_dword0 as u32);
+  let info_second: RtlRxDescInfo = rtl_rx_desc_parse(buf2, 256);
+  if info_second.pkt_len != 50 { ok = 0; }
+  if info_second.frame_start_off != (256 + 24) { ok = 0; }
+
+  let _ = uart_puts("USB: RTL8188CU RX descriptor parse (pkt_len/frame-start-offset/FCS-fail/firmware-report/bundled-frame pkt_cnt+pkt_offset+offset-parsing detection) vs a synthetic descriptor built to the real bit layout");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -31440,46 +31508,13 @@ fn wifi_mgmtlog_record(frame_buf: mut ref i64, frame_len: i64, rssi_dbm: i64) ->
 // until one shorter than `mps` arrives (the standard USB bulk
 // end-of-transfer signal), before treating the result as a complete
 // frame. This function never got that same loop -- mirrored here now.
-fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFrameResult {
-  // BUG FOUND 2026-11-16 (real-HW board hang, confirmed root cause of a
-  // FATAL heap-exhaustion halt during "wifi listen 11" -- see scratch_
-  // state.S's own comment on rtl_rx_raw_scratch_addr): this used to call
-  // dhruva_alloc_bytes(512)/dhruva_alloc_bytes(64) fresh on EVERY call,
-  // and this function is the receive choke point polled on every single
-  // iteration of wifi listen/scan/join's loops, heard frame or not.
-  let raw: mut ref i64 = rtl_rx_raw_scratch_get();
-  let chunk_buf: mut ref i64 = rtl_rx_chunk_scratch_get();
-  let total: i64 = 0;
-  let done: i64 = 0;
-  while done == 0 {
-    let got_chunk: i64 = dwc2_wifi_bulk_in(devaddr, mps, chunk_buf, if mps == (0 as u32) { 0 } else { mps as i64 });
-    if got_chunk < 0 {
-      if total == 0 {
-        return RtlRxFrameResult { ok: 0, frame_len: 0 };
-      }
-      done = 1;
-    } else {
-      if (total + got_chunk) > 512 {
-        return RtlRxFrameResult { ok: 0, frame_len: 0 };
-      }
-      let ci: i64 = 0;
-      while ci < got_chunk {
-        let b: u32 = buf_read_byte(chunk_buf, ci as u32);
-        let _ = buf_write_byte(raw, (total + ci) as u32, b);
-        ci = ci + 1;
-      }
-      total = total + got_chunk;
-      if (got_chunk as u32) < mps {
-        done = 1;
-      }
-    }
-  }
-  let got: i64 = total;
-  if got < RTL_RXDESC_LEN {
-    let _ = wifi_stat_short_frame_count_set(wifi_stat_short_frame_count_get() + (1 as u32));
-    return RtlRxFrameResult { ok: 0, frame_len: 0 };
-  }
-  let info: RtlRxDescInfo = rtl_rx_desc_parse(raw);
+// Shared by both the fresh-USB-read path and the bundled-frame-
+// continuation path below: process one already-parsed descriptor,
+// copy its frame out, record it, and return the result. Never touches
+// USB -- `raw`/`got` are whatever buffer+valid-length the caller
+// already has in hand (either this poll's fresh transfer, or a
+// previous poll's still-unconsumed bundle).
+fn rtl8188cu_rx_frame_from_desc(raw: mut ref i64, got: i64, info: RtlRxDescInfo, frame_out: mut ref i64) -> RtlRxFrameResult {
   if info.fcs_ok != 1 {
     let _ = wifi_stat_fcs_bad_count_set(wifi_stat_fcs_bad_count_get() + (1 as u32));
     return RtlRxFrameResult { ok: 0, frame_len: 0 };
@@ -31519,6 +31554,83 @@ fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFr
   // own header comment.
   let _ = wifi_mgmtlog_record(frame_out, info.pkt_len, if info.has_phystats == 1 { info.rssi_dbm } else { 0 - 1000 });
   return RtlRxFrameResult { ok: 1, frame_len: info.pkt_len };
+}
+
+fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFrameResult {
+  // BUG FOUND 2026-11-16 (real-HW board hang, confirmed root cause of a
+  // FATAL heap-exhaustion halt during "wifi listen 11" -- see scratch_
+  // state.S's own comment on rtl_rx_raw_scratch_addr): this used to call
+  // dhruva_alloc_bytes(512)/dhruva_alloc_bytes(64) fresh on EVERY call,
+  // and this function is the receive choke point polled on every single
+  // iteration of wifi listen/scan/join's loops, heard frame or not.
+  let raw: mut ref i64 = rtl_rx_raw_scratch_get();
+
+  // BUG FOUND 2026-11-19 (methodical full-stack audit): this chip can
+  // bundle multiple received frames into one USB bulk-IN transfer --
+  // see rtl_rx_bundle_remaining's own header comment in scratch_
+  // state.S. If a previous call left frames unconsumed in `raw`, drain
+  // the next one from there directly, with NO new USB transfer at
+  // all -- exactly what a bundle existing in the first place is for.
+  let bundle_remaining: u32 = rtl_rx_bundle_remaining_get();
+  if bundle_remaining > (0 as u32) {
+    let bundle_off: i64 = rtl_rx_bundle_offset_get() as i64;
+    let bundle_total: i64 = rtl_rx_bundle_total_len_get() as i64;
+    if (bundle_total - bundle_off) >= RTL_RXDESC_LEN {
+      let info: RtlRxDescInfo = rtl_rx_desc_parse(raw, bundle_off);
+      let _ = rtl_rx_bundle_remaining_set(bundle_remaining - (1 as u32));
+      let _ = rtl_rx_bundle_offset_set((bundle_off + info.pkt_offset) as u32);
+      return rtl8188cu_rx_frame_from_desc(raw, bundle_total, info, frame_out);
+    }
+    // Not enough data left for even one more real descriptor -- the
+    // bundle's own pkt_cnt was wrong, or this is the last partial
+    // remainder. Give up on it rather than misparse garbage.
+    let _ = rtl_rx_bundle_remaining_set(0 as u32);
+  }
+
+  let chunk_buf: mut ref i64 = rtl_rx_chunk_scratch_get();
+  let total: i64 = 0;
+  let done: i64 = 0;
+  while done == 0 {
+    let got_chunk: i64 = dwc2_wifi_bulk_in(devaddr, mps, chunk_buf, if mps == (0 as u32) { 0 } else { mps as i64 });
+    if got_chunk < 0 {
+      if total == 0 {
+        return RtlRxFrameResult { ok: 0, frame_len: 0 };
+      }
+      done = 1;
+    } else {
+      if (total + got_chunk) > 512 {
+        return RtlRxFrameResult { ok: 0, frame_len: 0 };
+      }
+      let ci: i64 = 0;
+      while ci < got_chunk {
+        let b: u32 = buf_read_byte(chunk_buf, ci as u32);
+        let _ = buf_write_byte(raw, (total + ci) as u32, b);
+        ci = ci + 1;
+      }
+      total = total + got_chunk;
+      if (got_chunk as u32) < mps {
+        done = 1;
+      }
+    }
+  }
+  let got: i64 = total;
+  if got < RTL_RXDESC_LEN {
+    let _ = wifi_stat_short_frame_count_set(wifi_stat_short_frame_count_get() + (1 as u32));
+    return RtlRxFrameResult { ok: 0, frame_len: 0 };
+  }
+  let info: RtlRxDescInfo = rtl_rx_desc_parse(raw, 0);
+  // Remember this bundle's own remaining frames (if any) BEFORE acting
+  // on frame 1's own accept/reject outcome below -- frame 1 being bad
+  // (FCS/report/bounds) says nothing about frames 2..N, which are each
+  // independently real frames the chip genuinely received.
+  if info.pkt_cnt > 1 {
+    let _ = rtl_rx_bundle_remaining_set((info.pkt_cnt - 1) as u32);
+    let _ = rtl_rx_bundle_offset_set(info.pkt_offset as u32);
+    let _ = rtl_rx_bundle_total_len_set(got as u32);
+  } else {
+    let _ = rtl_rx_bundle_remaining_set(0 as u32);
+  }
+  return rtl8188cu_rx_frame_from_desc(raw, got, info, frame_out);
 }
 
 // TASK #164 FOLLOW-UP: minimal MAC-layer bring-up, run once after
