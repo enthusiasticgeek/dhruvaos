@@ -32855,15 +32855,30 @@ fn rtl8188cu_set_channel(devaddr: u32, mps: u32, channel: u32) -> i64 {
   let _ = rtl_reg_write8(devaddr, mps, 0x0515 as u32, 0x0a as u32);
   let _ = rtl_reg_write8(devaddr, mps, 0x0517 as u32, 0x0a as u32);
 
-  // REG_SLOT (0x051b) short-slot switch -- see rtl8188cu_mac_bringup's
-  // own header comment for the full "why" (confirmed via real-HW
-  // usbmon capture: the real driver writes legacy-safe 0x14 at
-  // bring-up, then 0x09 right before real operation on an OFDM/ERP-
-  // capable BSS). This driver has no legacy-BSS detection at all, and
-  // every real AP this project has ever tested against is modern/OFDM-
-  // capable, so this is unconditional here rather than gated on a
-  // beacon capability check this driver doesn't parse.
-  let _ = rtl_reg_write8(devaddr, mps, 0x051b as u32, 0x09 as u32);
+  // BUG FOUND 2026-11-19 (re-examined the SAME usbmon capture this
+  // round's own comment above cited, this time decoding chronological
+  // CONTROL transfers, not just bulk frame payloads -- see find_slot_
+  // writes.py in this round's own scratchpad work): the earlier read
+  // of this capture was wrong about WHEN the real driver switches to
+  // short slot. REG_SLOT(0x051b) is written 0x14 *repeatedly*
+  // throughout the entire scan, and the real driver's own Authentication
+  // Request is transmitted only 1.3ms after the LAST 0x14 write --
+  // 0x09 (short slot) is written exactly ONCE in the whole capture,
+  // 77ms AFTER that Auth Request already went out, not before it.
+  // Writing 0x09 here (called from the scan/join path, before Auth)
+  // directly contradicts the real, working sequence: this station has
+  // no business claiming short-slot timing before it has ever
+  // associated and confirmed the BSS supports it. A wrong slot-time
+  // value feeding this chip's own CSMA/backoff state machine during
+  // the actual Auth transmission is a real candidate for "frame
+  // handed to hardware over USB, never actually scheduled onto the
+  // air" (zero retries ever observed in an independent RF capture --
+  // see this round's own session notes). Removed; REG_SLOT stays at
+  // the legacy-safe 0x14 written during rtl8188cu_mac_bringup for the
+  // entire scan/join sequence, matching the real capture exactly.
+  // NOT YET TESTED on real hardware -- board unreachable at the time
+  // this fix was written; verify on the next real-HW session before
+  // trusting it fixes anything.
 
   // REG_R2T_SIFS (0x063c) / REG_T2T_SIFS (0x063e): fixed 16-bit values,
   // not conditional on HT.
