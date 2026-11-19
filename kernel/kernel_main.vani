@@ -33081,9 +33081,69 @@ fn rtl8188cu_init_sta_mac_params(devaddr: u32, mps: u32) -> i64 {
 
   let _ = rtl_reg_write8(devaddr, mps, 0x0640 as u32, 0x40 as u32); // REG_ACKTO
 
+  // BUG FOUND 2026-11-19 (methodical full-stack audit, triggered by a
+  // real-HW stage0 hang pausing testing): REG_NAV_UPPER (0x0652) is
+  // written unconditionally for every chip in this family in the real
+  // driver's own init_device -- "Set NAV_UPPER to 30000us" -- and was
+  // never written anywhere in this codebase (confirmed by grep, zero
+  // references). NAV (Network Allocation Vector) is this chip's own
+  // internal virtual-carrier-sense timer: every station extends its
+  // own NAV on hearing ANY frame's Duration field, not just frames
+  // addressed to it, and this register caps how long any single frame
+  // can extend it by. Left unwritten, this cap sits at an undocumented
+  // hardware-reset default -- on a channel this busy (hundreds of
+  // beacons/other frames per scan, confirmed live all session), if
+  // that default under-caps or fails to cap NAV at all, the chip's own
+  // CSMA/CA engine could perpetually treat the medium as virtually
+  // busy and simply never schedule a real transmission attempt onto
+  // the air -- invisible to every static register read used so far,
+  // since NAV is live, dynamic state driven by real-time RF traffic,
+  // not a value that "looks right" when read back at rest. This
+  // matches the exact standing mystery: USB XFERCOMPL confirms the
+  // frame reaches the chip, an independent RF capture on the AP's own
+  // real channel shows zero evidence it was ever transmitted -- not
+  // even as an unacknowledged retry. (30000 + 128 - 1) / 128 = 235 =
+  // 0xeb, matching the reference driver's own NAV_UPPER_UNIT=128 math
+  // exactly. NOT YET VERIFIED on real hardware -- board hung at stage0
+  // (unrelated SD read failure) when this was written.
+  let _ = rtl_reg_write8(devaddr, mps, 0x0652 as u32, 0xeb as u32); // REG_NAV_UPPER (30000us cap)
+
   let _ = rtl_reg_write8(devaddr, mps, 0x0423 as u32, 0xff as u32); // REG_HWSEQ_CTRL
   let _ = rtl_reg_write32(devaddr, mps, 0x04cc as u32, 0x0201ffff as u32); // REG_BAR_MODE_CTRL
   let _ = rtl_reg_write32(devaddr, mps, 0x0670 as u32, 0xC0000000 as u32); // REG_CAM_CMD (CAM_CMD_POLLING|BIT30)
+
+  // BUG FOUND 2026-11-19 (same full-stack audit as REG_NAV_UPPER above):
+  // the real driver's "Initialize beacon parameters" block is entirely
+  // unconditional for every chip in this family -- not gated on vif
+  // type, STA vs AP -- and this codebase's own existing AP-mode-only
+  // constant RTL_AP_REG_TBTT_PROHIBIT(0x0540) confirms this exact
+  // register was already known about, just never wired into the
+  // STATION init path at all. BEACON_CTRL's existing use in this file
+  // (rtl8188cu_beacon_ctrl_disable/_restore, a TEMPORARY clear-bit-0x08
+  // used around calibration) backs up and restores whatever undefined
+  // hardware-reset value sits here, since this persistent BIT(4)
+  // TSF-update-disable default was never established in the first
+  // place. REG_TBTT_PROHIBIT in particular governs a timing window
+  // around the Target Beacon Transmission Time; an unconfigured
+  // default here is a real candidate for an unexpected TX-scheduling
+  // restriction a station would never otherwise see documented.
+  // NOT YET VERIFIED on real hardware -- board hung at stage0
+  // (unrelated SD read failure) when this was written.
+  let _ = rtl_reg_write16(devaddr, mps, 0x0550 as u32, 0x1010 as u32); // REG_BEACON_CTRL (both ports): BEACON_DISABLE_TSF_UPDATE=BIT(4)
+  let _ = rtl_reg_write16(devaddr, mps, 0x0540 as u32, 0x6404 as u32); // REG_TBTT_PROHIBIT
+  let _ = rtl_reg_write8(devaddr, mps, 0x0558 as u32, 5 as u32); // REG_DRIVER_EARLY_INT (DRIVER_EARLY_INT_TIME)
+  let _ = rtl_reg_write8(devaddr, mps, 0x0559 as u32, 2 as u32); // REG_BEACON_DMA_TIME (BEACON_DMA_ATIME_INT_TIME)
+  let _ = rtl_reg_write16(devaddr, mps, 0x0510 as u32, 0x660f as u32); // REG_BEACON_TCFG
+
+  // Same audit pass: REG_MAR (0x0620, multicast address filter bitmap)
+  // was never written -- RCR_ACCEPT_MCAST being set alone only enables
+  // multicast acceptance in general; this per-address bitmap still
+  // gates which specific multicast addresses pass. Not relevant to the
+  // standing Auth-TX mystery (Beacon is broadcast, Auth is unicast),
+  // but a real, unconditional gap vs the reference driver -- fixed for
+  // completeness while auditing.
+  let _ = rtl_reg_write32(devaddr, mps, 0x0620 as u32, 0xffffffff as u32); // REG_MAR
+  let _ = rtl_reg_write32(devaddr, mps, 0x0624 as u32, 0xffffffff as u32); // REG_MAR+4
 
   // REG_MSR (0x0102): link-type state, bits[1:0] for port 0 -- set to
   // MSR_LINKTYPE_STATION (0x2), preserving port 1's own bits (mask 0x0c).
