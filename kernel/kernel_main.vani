@@ -33078,6 +33078,20 @@ fn rtl8188cu_init_sta_mac_params(devaddr: u32, mps: u32) -> i64 {
 
   let fwhw_txq: u32 = rtl_reg_read8(devaddr, mps, 0x0420 as u32); // REG_FWHW_TXQ_CTRL
   let _ = rtl_reg_write8(devaddr, mps, 0x0420 as u32, fwhw_txq | (0x80 as u32)); // FWHW_TXQ_CTRL_AMPDU_RETRY
+  // BUG FOUND 2026-11-19 (same full-stack audit): REG_FWHW_TXQ_CTRL is
+  // a 32-bit register, but the write above only ever touched its low
+  // 8 bits (where AMPDU_RETRY=BIT(7) lives). The reference driver also
+  // unconditionally sets FWHW_TXQ_CTRL_XMIT_MGMT_ACK=BIT(12) -- in the
+  // register's SECOND byte, bits[15:8], which that 8-bit RMW could
+  // never reach -- commented there as "ack for xmit mgmt frames". This
+  // bit was sitting at whatever undefined hardware-reset value exists
+  // for that byte, directly on the one register governing how the
+  // hardware's own TX-queue engine schedules the exact frame type
+  // (management) this driver has been unable to get transmitted.
+  // NOT YET VERIFIED on real hardware -- board hung at stage0
+  // (unrelated SD read failure) when this was written.
+  let fwhw_txq_hi: u32 = rtl_reg_read8(devaddr, mps, 0x0421 as u32); // REG_FWHW_TXQ_CTRL+1 (bits[15:8])
+  let _ = rtl_reg_write8(devaddr, mps, 0x0421 as u32, fwhw_txq_hi | (0x10 as u32)); // FWHW_TXQ_CTRL_XMIT_MGMT_ACK=BIT(12), bit4 of this byte
 
   let _ = rtl_reg_write8(devaddr, mps, 0x0640 as u32, 0x40 as u32); // REG_ACKTO
 
