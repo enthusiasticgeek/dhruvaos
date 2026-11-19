@@ -391,6 +391,10 @@ extern "C" fn wifi_stat_beacon_count_set(v: u32) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn wifi_stat_beacon_count_get() -> u32;
 #[stack_cost(bytes=1)]
+extern "C" fn usb_wifi_ctrl_fail_streak_set(v: u32) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_wifi_ctrl_fail_streak_get() -> u32;
+#[stack_cost(bytes=1)]
 extern "C" fn wifi_stat_probereq_count_set(v: u32) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn wifi_stat_probereq_count_get() -> u32;
@@ -3328,6 +3332,19 @@ extern "C" fn usb_wifi_fw_chunk_get() -> mut ref i64;
 extern "C" fn usb_wifi_fw_upload_len_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_fw_upload_len_set(value: u32) -> u32;
+
+// Round 2026-11-18: EFUSE-derived per-channel-group TX power state --
+// see boot/wifi_efuse_state.S's own comment.
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_efuse_get_parsed_ok() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_efuse_set_parsed_ok(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_efuse_cck_a_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_efuse_ofdmbase_a_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_efuse_mcsbase_a_get() -> mut ref i64;
 // A/B kernel slots (task #308): persistent scratch for `kernelupload`/
 // `kernelslot` -- see boot/kernelupload_state.S's own header comment.
 #[stack_cost(bytes=1)]
@@ -27221,6 +27238,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
       let _ = uart_puts("\n");
     }
     let _ = kernlog_write_usb_regs("USB SETUP stage failed", setup_result);
+    let _ = usb_wifi_ctrl_fail_streak_set(usb_wifi_ctrl_fail_streak_get() + (1 as u32));
     return 0 - 1; // XFERCOMPL (bit0) never set -- timeout or error
   }
 
@@ -27266,6 +27284,7 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
       let _ = uart_puts("\n");
     }
     let _ = kernlog_write_usb_regs("USB DATA stage failed", data_result);
+    let _ = usb_wifi_ctrl_fail_streak_set(usb_wifi_ctrl_fail_streak_get() + (1 as u32));
     return 0 - 1;
   }
   // BUG FIX (2026-11-01, real-HW root cause of LAN9512 register reads
@@ -27313,8 +27332,10 @@ fn dwc2_control_in(devaddr: u32, mps: u32, want_len: u32, out_buf: mut ref i64) 
       let _ = uart_puts("\n");
     }
     let _ = kernlog_write_usb_regs("USB STATUS stage failed", status_result);
+    let _ = usb_wifi_ctrl_fail_streak_set(usb_wifi_ctrl_fail_streak_get() + (1 as u32));
     return 0 - 1;
   }
+  let _ = usb_wifi_ctrl_fail_streak_set(0 as u32);
   return 0;
 }
 
@@ -27430,6 +27451,7 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
     let _ = uart_puts("USB DIAG: dwc2_control_out SETUP phase failed, hi=0x");
     let _ = uart_put_hex32(setup_result);
     let _ = uart_puts("\n");
+    let _ = usb_wifi_ctrl_fail_streak_set(usb_wifi_ctrl_fail_streak_get() + (1 as u32));
     return 0 - 1;
   }
 
@@ -27454,6 +27476,7 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
     let _ = uart_puts(" out_len=");
     let _ = uart_put_hex32(out_len);
     let _ = uart_puts("\n");
+    let _ = usb_wifi_ctrl_fail_streak_set(usb_wifi_ctrl_fail_streak_get() + (1 as u32));
     return 0 - 1;
   }
 
@@ -27466,8 +27489,10 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
     let _ = uart_puts("USB DIAG: dwc2_control_out STATUS phase failed, hi=0x");
     let _ = uart_put_hex32(status_result);
     let _ = uart_puts("\n");
+    let _ = usb_wifi_ctrl_fail_streak_set(usb_wifi_ctrl_fail_streak_get() + (1 as u32));
     return 0 - 1;
   }
+  let _ = usb_wifi_ctrl_fail_streak_set(0 as u32);
   return 0;
 }
 
@@ -27942,6 +27967,26 @@ fn lan9512_reg_write(devaddr: u32, mps: u32, reg_offset: u32, value: u32) -> i64
 // derived from a TinyUSB issue-tracker precedent) -- two different
 // reference sources agreeing on the same count.
 fn usb_first_contact_retry_count() -> i64 { return 5; }
+
+// 2026-11-17 (real-HW incident: a WiFi dongle that went fully silent
+// at the USB control-transfer level mid-session -- every subsequent
+// register read/write's own 5-attempt retry loop below kept running
+// to completion anyway, and rtl8188cu_download_firmware's outer
+// 3-attempt loop plus its power_on/mac_queue_setup/reset_8051 cleanup
+// each call MANY of those -- several real minutes spent reconfirming
+// the same "gone" fact over and over, during which the board looked
+// hung). usb_wifi_ctrl_fail_streak (boot/scratch_state.S) is
+// incremented by dwc2_control_in/dwc2_control_out on every SETUP/
+// DATA/STATUS phase failure and reset to 0 on any success. This is
+// the trip point rtl_reg_read8/16/32 and rtl_reg_write8/16/32's own
+// retry loops below check before each attempt: 8 requires at least
+// one FULLY exhausted 5-attempt call (proving it's not the single-
+// call transient glitch this project's own retry loops were built
+// for and have genuinely seen recover -- see usb_first_contact_
+// retry_count's own call sites' history) plus partial failure on a
+// second, before concluding the device is truly gone rather than
+// just having a bad moment.
+const USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD: u32 = 8;
 // attempt is 0-based (the first attempt, never delayed, doesn't call
 // this). Scaled from U-Boot's own literal ms figures using this
 // project's existing delay(161000)==~50ms calibration (dwc2_core_
@@ -28046,7 +28091,7 @@ fn rtl_reg_read8(devaddr: u32, mps: u32, addr: u32) -> u32 {
   let out_buf: mut ref i64 = rtl_lan_reg_scratch_get();
   let attempt: i64 = 0;
   let status: i64 = 0 - 1;
-  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) && (usb_wifi_ctrl_fail_streak_get() < USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD) {
     if attempt > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt));
     }
@@ -28064,7 +28109,7 @@ fn rtl_reg_read16(devaddr: u32, mps: u32, addr: u32) -> u32 {
   let out_buf: mut ref i64 = rtl_lan_reg_scratch_get();
   let attempt: i64 = 0;
   let status: i64 = 0 - 1;
-  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) && (usb_wifi_ctrl_fail_streak_get() < USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD) {
     if attempt > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt));
     }
@@ -28084,7 +28129,7 @@ fn rtl_reg_read32(devaddr: u32, mps: u32, addr: u32) -> u32 {
   let out_buf: mut ref i64 = rtl_lan_reg_scratch_get();
   let attempt: i64 = 0;
   let status: i64 = 0 - 1;
-  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) && (usb_wifi_ctrl_fail_streak_get() < USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD) {
     if attempt > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt));
     }
@@ -28106,7 +28151,7 @@ fn rtl_reg_write8(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
   let val_buf: mut ref i64 = rtl_lan_reg_scratch_get();
   let attempt: i64 = 0;
   let status: i64 = 0 - 1;
-  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) && (usb_wifi_ctrl_fail_streak_get() < USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD) {
     if attempt > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt));
     }
@@ -28122,7 +28167,7 @@ fn rtl_reg_write16(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
   let val_buf: mut ref i64 = rtl_lan_reg_scratch_get();
   let attempt: i64 = 0;
   let status: i64 = 0 - 1;
-  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) && (usb_wifi_ctrl_fail_streak_get() < USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD) {
     if attempt > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt));
     }
@@ -28139,7 +28184,7 @@ fn rtl_reg_write32(devaddr: u32, mps: u32, addr: u32, value: u32) -> i64 {
   let val_buf: mut ref i64 = rtl_lan_reg_scratch_get();
   let attempt: i64 = 0;
   let status: i64 = 0 - 1;
-  while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+  while (attempt < usb_first_contact_retry_count()) && (status != 0) && (usb_wifi_ctrl_fail_streak_get() < USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD) {
     if attempt > 0 {
       let _ = delay(usb_first_contact_retry_backoff(attempt));
     }
@@ -28538,7 +28583,7 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
   // uncertain state into the next attempt.
   let fw_attempt: i64 = 0;
   let fw_ok: i64 = 0;
-  while (fw_attempt < 3) && (fw_ok == 0) {
+  while (fw_attempt < 3) && (fw_ok == 0) && (usb_wifi_ctrl_fail_streak_get() < USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD) {
     if fw_attempt > 0 {
       let _ = uart_puts("USB: RTL8188CU firmware start retry (attempt ");
       let _ = uart_put_i64(fw_attempt + 1);
@@ -28629,7 +28674,20 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
     fw_attempt = fw_attempt + 1;
   }
   if fw_ok != 1 {
-    let _ = uart_puts("USB: RTL8188CU firmware failed to start (after 3 attempts)\n");
+    if usb_wifi_ctrl_fail_streak_get() >= USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD {
+      // 2026-11-17 real-HW incident: distinguishes "every register
+      // access just stopped getting any USB response at all" (this
+      // case -- bail fast, nothing further on this bus will work
+      // either) from the ordinary "3 attempts, each a real but
+      // ultimately failed try" case below, which is still worth
+      // reporting differently since it implies the device WAS there
+      // and answering, just never got firmware running cleanly.
+      let _ = uart_puts("USB: RTL8188CU stopped answering ANY control transfer (streak=");
+      let _ = uart_put_i64(usb_wifi_ctrl_fail_streak_get() as i64);
+      let _ = uart_puts(") -- giving up on WiFi for this boot rather than grinding through more doomed retries\n");
+    } else {
+      let _ = uart_puts("USB: RTL8188CU firmware failed to start (after 3 attempts)\n");
+    }
     return 0 - 1;
   }
   let _ = uart_puts("USB: RTL8188CU firmware loaded and started\n");
@@ -29375,7 +29433,7 @@ fn rtl8188cu_write_firmware_page(devaddr: u32, mps: u32, reg_addr: u32, fw_buf: 
     // after every attempt is treated as a real, reportable failure.
     let attempt: i64 = 0;
     let status: i64 = 0 - 1;
-    while (attempt < usb_first_contact_retry_count()) && (status != 0) {
+    while (attempt < usb_first_contact_retry_count()) && (status != 0) && (usb_wifi_ctrl_fail_streak_get() < USB_WIFI_CTRL_FAIL_BREAKER_THRESHOLD) {
       if attempt > 0 {
         let _ = delay(usb_first_contact_retry_backoff(attempt));
       }
@@ -29662,10 +29720,33 @@ fn rtl_tx_desc_write(out: mut ref i64, frame_len: i64, is_broadcast: i64, seq_nu
   let txdw4: i64 = 0x100; // TXDESC32_USE_DRIVER_RATE
   let _ = buf_write_u32_le(out, 16, txdw4 as u32);
 
-  let retry_limit_enable: i64 = 0x20000;
-  let retry_limit_6: i64 = 6 << 18;
+  // BUG FOUND 2026-11-18 (real-HW usbmon capture of a genuine Auth
+  // Request TX descriptor from the actual driver bound to this exact
+  // chip, rtlwifi's rtl8192cu -- not rtl8xxxu, which this port had
+  // been checked against until now): this used to set RETRY_LIMIT_
+  // ENABLE (bit17) with a per-descriptor override of only 6 retries,
+  // taking precedence over the global REG_RETRY_LIMIT register (0x30=
+  // 48 retries, already set correctly during MAC bring-up). The real
+  // driver's own rtl92cu_tx_fill_desc (trx.c) never sets a per-
+  // descriptor retry override at all for this frame class -- it
+  // relies on the global register's much larger 48-retry budget
+  // instead. On a real, measurably crowded 2.4GHz channel (confirmed
+  // this same investigation: beacons from -46dBm up through -98dBm
+  // mixed together), giving up after only 6 hardware-level retries
+  // instead of 48 is a plausible reason a frame that genuinely left
+  // the antenna still never completed a round trip. Replaced with the
+  // two fields the real descriptor's own captured dword actually had
+  // set instead (data_rate_fb_limit bits[12:8]=0x1F, rts_rate_fb_limit
+  // bits[16:13]=0xF, matching Linux's own unconditional set_tx_desc_
+  // data_rate_fb_limit(txdesc, 0x1F)/set_tx_desc_rts_rate_fb_limit(
+  // txdesc, 0xF) -- harmless either way since USE_DRIVER_RATE forces a
+  // single fixed rate throughout, making rate-fallback moot, but
+  // matching the real, confirmed-working descriptor exactly rather
+  // than guessing these bits don't matter).
+  let data_rate_fb_limit: i64 = 0x1F << 8;
+  let rts_rate_fb_limit: i64 = 0xF << 13;
   let rate_1mbps_cck: i64 = 0;
-  let txdw5: i64 = rate_1mbps_cck | retry_limit_enable | retry_limit_6;
+  let txdw5: i64 = rate_1mbps_cck | data_rate_fb_limit | rts_rate_fb_limit;
   let _ = buf_write_u32_le(out, 20, txdw5 as u32);
 
   let _ = buf_write_u32_le(out, 24, 0 as u32);
@@ -29697,7 +29778,7 @@ fn rtl_tx_desc_self_test() -> i64 {
   if buf_read_u32_le(out, 4) != (((0x12 << 8) | 0x40) as u32) { ok = 0; } // QUEUE_MGNT | AGG_BREAK
   if buf_read_u32_le(out, 12) != ((1 << 16) as u32) { ok = 0; }
   if buf_read_u32_le(out, 16) != (0x100 as u32) { ok = 0; }
-  if buf_read_u32_le(out, 20) != ((0x20000 | (6 << 18)) as u32) { ok = 0; }
+  if buf_read_u32_le(out, 20) != (((0x1F << 8) | (0xF << 13)) as u32) { ok = 0; }
 
   // Independently recompute the expected checksum (XOR of all sixteen
   // 16-bit LE words, csum word itself zero) rather than trusting the
@@ -30982,6 +31063,17 @@ fn dwc2_reset_chan0_for_new_transfer() -> i64 {
   let chhltd_bit_local: u32 = (1 as u32) << (1 as u32);
   let current: u32 = mmio_read_u32(hcchar0);
   if (current & chena_bit_local) != (0 as u32) {
+    // REVERTED 2026-11-19: a diagnostic counter pair (dwc2_chan_reset_
+    // slow_hits/slow_iters_total) was added here to measure this slow
+    // path's own real-world frequency, but real-HW testing immediately
+    // afterward showed 3 STRAIGHT firmware-download failures (this
+    // exact function is also called from dwc2_control_out, firmware
+    // download's own control-OUT path, hundreds of times per 16KB
+    // download) -- strong evidence of a real regression from adding
+    // extern calls inside this specific hot path, not coincidental
+    // flakiness. Reverted immediately rather than kept for the sake of
+    // the data: a possible regression is not an acceptable price for a
+    // diagnostic, especially not one in a path this widely shared.
     let _ = mmio_write_u32(hcchar0, current | chena_bit_local | chdis_bit_local);
     let halt_tries: i64 = 0;
     while halt_tries < 50 {
@@ -31379,7 +31471,14 @@ fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFr
   // choke point every real received frame passes through, regardless
   // of which shell command triggered the read) so wifi listen/scan/
   // join all report it without duplicating this at each call site.
-  if info.has_phystats == 1 {
+  // BUG FOUND 2026-11-19: see wpa2_join_step_mgmt's own matching fix
+  // (its "ignored frame" diagnostic) for the full "why" -- this is the
+  // SHARED choke point every real received frame passes through
+  // regardless of caller (wifi listen/scan/join all hit this), so an
+  // unconditional print here is the single biggest per-poll-iteration
+  // cost in the whole RX path on a busy channel. Same gate, same
+  // reasoning: full speed by default, still available via loglevel.
+  if (info.has_phystats == 1) && (boot_debug_enabled() == 1) {
     let _ = uart_puts("wifi rx DIAG: rssi=");
     let _ = uart_put_i64(info.rssi_dbm);
     let _ = uart_puts("dBm\n");
@@ -32436,6 +32535,273 @@ fn rtl8188cu_enable_rf(devaddr: u32, mps: u32) -> i64 {
   return 0;
 }
 
+// Round 2026-11-18 (real-HW usbmon ground-truth capture of a working
+// Linux client, after an exhaustive register/firmware/MAC-address/
+// hardware-swap audit this same session found no other explanation
+// for "USB confirms every TX, AP never responds"): this driver has
+// never once read this chip's EFUSE (confirmed via grep -- zero
+// accesses to REG_EFUSE_CTRL anywhere) and has always used the stock
+// PHY_REG table's generic TX-power index for every channel. The real
+// driver on this exact chip reads EFUSE in full before ever setting a
+// channel and applies a per-channel-group, per-unit calibrated index
+// on top of that stock baseline instead. See boot/wifi_efuse_state.S's
+// own header comment for why the formula ported here (direct
+// broadcast of the EFUSE value, no additive base table) is the one
+// actually confirmed against captured real register writes, not the
+// one found in rtl8xxxu's own (CONFIG_RTL8XXXU_UNTESTED-gated, and not
+// even the driver this exact dongle turned out to be bound to) source.
+//
+// Single physical-EFUSE-byte read (`rtl8xxxu_read_efuse8`, confirmed
+// byte-for-byte against regs.h's own REG_EFUSE_CTRL field layout):
+// write the low 8 bits of the address to EFUSE_CTRL+1, OR the high 2
+// bits into EFUSE_CTRL+2 (preserving its other bits), clear bit7 of
+// EFUSE_CTRL+3, then poll the full 32-bit EFUSE_CTRL for bit31 (data
+// ready) and return its low byte. Returns -1 (not a valid byte value)
+// on a poll timeout, matching this project's own "0 on timeout" vs
+// "real value" convention used throughout dwc2_wait_chan0_done.
+const RTL_REG_EFUSE_CTRL: u32 = 0x0030;
+const RTL_EFUSE_MAX_REG_POLL: i64 = 500;
+fn rtl_read_efuse8(devaddr: u32, mps: u32, offset: u32) -> i64 {
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_EFUSE_CTRL + (1 as u32), offset & (0xff as u32));
+
+  let v2: u32 = rtl_reg_read8(devaddr, mps, RTL_REG_EFUSE_CTRL + (2 as u32));
+  let v2_clear: u32 = v2 & (0xfc as u32);
+  let v2_new: u32 = v2_clear | ((offset >> (8 as u32)) & (0x03 as u32));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_EFUSE_CTRL + (2 as u32), v2_new);
+
+  let v3: u32 = rtl_reg_read8(devaddr, mps, RTL_REG_EFUSE_CTRL + (3 as u32));
+  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_EFUSE_CTRL + (3 as u32), v3 & (0x7f as u32));
+
+  let tries: i64 = 0;
+  let ready: i64 = 0;
+  let val32: u32 = 0 as u32;
+  while tries < RTL_EFUSE_MAX_REG_POLL {
+    val32 = rtl_reg_read32(devaddr, mps, RTL_REG_EFUSE_CTRL);
+    if (val32 & (0x80000000 as u32)) != (0 as u32) {
+      ready = 1;
+      break;
+    }
+    tries = tries + 1;
+  }
+  if ready == 0 {
+    return 0 - 1;
+  }
+  let _ = delay(161); // ~50us real, same per-iteration calibration as this file's own established udelay-equivalents
+  let final_val: u32 = rtl_reg_read32(devaddr, mps, RTL_REG_EFUSE_CTRL);
+  return (final_val & (0xff as u32)) as i64;
+}
+
+// Sign-extends a 4-bit field (the EFUSE diff tables' own packed
+// half-byte signed values, confirmed against rtl8xxxu.h's own
+// `struct rtl8723au_idx` bitfield: `int a:4; int b:4;` on little-
+// endian -- a real signed C bitfield, range -8..7, not an unsigned
+// nibble).
+fn rtl_efuse_sign_extend4(nibble: u32) -> i64 {
+  if (nibble & (0x8 as u32)) != (0 as u32) {
+    return (nibble as i64) - 16;
+  }
+  return nibble as i64;
+}
+
+// Reads and unpacks the full EFUSE logical map (Realtek's own header+
+// word-mask sparse encoding, confirmed byte-for-byte against the real
+// rtl8xxxu_read_efuse's own unpacking loop -- this part IS hardware-
+// level, not driver-specific, confirmed by this exact algorithm
+// correctly reconstructing a real captured chip's own factory MAC
+// address from its raw EFUSE bytes during this investigation), then
+// extracts just the 3 per-channel-group TX-power fields this driver
+// actually needs (boot/wifi_efuse_state.S's own small persistent
+// arrays) -- not the full 512-byte map, which only needs scratch
+// space during this one-shot parse itself (same "called exactly once
+// per boot" allocation precedent as rtl8188cu_iq_calibrate's own
+// scratch).
+//
+// On any failure (poll timeout, corrupt map_addr, or the rtl_id magic
+// (0x8129, confirmed against rtl8192cu_parse_efuse's own sanity check)
+// not matching) this leaves wifi_efuse_parsed_ok at 0 and returns --
+// callers must then leave the existing stock PHY_REG defaults
+// untouched rather than apply unparsed/garbage values.
+fn rtl8188cu_efuse_read_and_parse(devaddr: u32, mps: u32) -> i64 {
+  // Preconditions (rtl8xxxu_read_efuse's own "default valid" bits,
+  // only written if not already set, matching source exactly).
+  let iso: u32 = rtl_reg_read16(devaddr, mps, 0x0000 as u32); // REG_SYS_ISO_CTRL
+  if (iso & (0x8000 as u32)) == (0 as u32) { // SYS_ISO_PWC_EV12V = BIT(15)
+    let _ = rtl_reg_write16(devaddr, mps, 0x0000 as u32, iso | (0x8000 as u32));
+  }
+  let sf: u32 = rtl_reg_read16(devaddr, mps, 0x0002 as u32); // REG_SYS_FUNC
+  if (sf & (0x1000 as u32)) == (0 as u32) { // SYS_FUNC_ELDR = BIT(12)
+    let _ = rtl_reg_write16(devaddr, mps, 0x0002 as u32, sf | (0x1000 as u32));
+  }
+  let clk: u32 = rtl_reg_read16(devaddr, mps, 0x0008 as u32); // REG_SYS_CLKR
+  let need_ana8m: u32 = clk & (0x02 as u32); // SYS_CLK_ANA8M = BIT(1)
+  let need_loader: u32 = clk & (0x20 as u32); // SYS_CLK_LOADER_ENABLE = BIT(5)
+  if (need_ana8m == (0 as u32)) || (need_loader == (0 as u32)) {
+    let _ = rtl_reg_write16(devaddr, mps, 0x0008 as u32, clk | (0x02 as u32) | (0x20 as u32));
+  }
+
+  let _ = rtl_reg_write8(devaddr, mps, 0x00cf as u32, 0x69 as u32); // REG_EFUSE_ACCESS enable
+
+  let logical: mut ref i64 = dhruva_alloc_bytes(512);
+  let li: i64 = 0;
+  while li < 512 {
+    let _ = buf_write_byte(logical, li as u32, 0xff as u32);
+    li = li + 1;
+  }
+
+  let phys_addr: i64 = 0;
+  let parse_ok: i64 = 1;
+  while phys_addr < 512 {
+    let header: i64 = rtl_read_efuse8(devaddr, mps, phys_addr as u32);
+    phys_addr = phys_addr + 1;
+    if header < 0 { parse_ok = 0; break; }
+    if header == 255 { break; } // 0xff: no more PG sections
+
+    let offset: i64 = 0;
+    let word_mask: i64 = 0;
+    if (header & 0x1f) == 0x0f {
+      let off_lo: i64 = (header & 0xe0) >> 5;
+      let extheader: i64 = rtl_read_efuse8(devaddr, mps, phys_addr as u32);
+      phys_addr = phys_addr + 1;
+      if extheader < 0 { parse_ok = 0; break; }
+      if (extheader & 0x0f) == 0x0f { continue; } // all words disabled this section
+      offset = off_lo | ((extheader & 0xf0) >> 1);
+      word_mask = extheader & 0x0f;
+    } else {
+      offset = (header >> 4) & 0x0f;
+      word_mask = header & 0x0f;
+    }
+
+    let map_addr: i64 = offset * 8;
+    let wi: i64 = 0;
+    let word_fail: i64 = 0;
+    while wi < 4 {
+      if (word_mask & (1 << wi)) != 0 {
+        map_addr = map_addr + 2;
+        wi = wi + 1;
+      } else {
+        if map_addr >= 511 { word_fail = 1; break; }
+        let b0: i64 = rtl_read_efuse8(devaddr, mps, phys_addr as u32);
+        phys_addr = phys_addr + 1;
+        if b0 < 0 { word_fail = 1; break; }
+        let _ = buf_write_byte(logical, map_addr as u32, b0 as u32);
+        map_addr = map_addr + 1;
+        let b1: i64 = rtl_read_efuse8(devaddr, mps, phys_addr as u32);
+        phys_addr = phys_addr + 1;
+        if b1 < 0 { word_fail = 1; break; }
+        let _ = buf_write_byte(logical, map_addr as u32, b1 as u32);
+        map_addr = map_addr + 1;
+        wi = wi + 1;
+      }
+    }
+    if word_fail == 1 { parse_ok = 0; break; }
+  }
+
+  let _ = rtl_reg_write8(devaddr, mps, 0x00cf as u32, 0x00 as u32); // REG_EFUSE_ACCESS disable
+
+  if parse_ok == 1 {
+    let rtl_id: i64 = (buf_read_byte(logical, 0) as i64) | ((buf_read_byte(logical, 1) as i64) << 8);
+    if rtl_id != 0x8129 {
+      parse_ok = 0;
+    }
+  }
+
+  if parse_ok == 0 {
+    let _ = wifi_efuse_set_parsed_ok(0 as u32);
+    let _ = uart_puts("USB: RTL8188CU EFUSE read/parse failed or rtl_id mismatch -- leaving stock PHY_REG TX-power defaults in place\n");
+    return 0 - 1;
+  }
+
+  // Per-group field extraction (struct rtl8192cu_efuse's own offsets,
+  // confirmed against the real captured EFUSE dump this same round --
+  // it correctly reconstructed that dongle's own real factory MAC at
+  // logical offset 0x16).
+  let cck_a: mut ref i64 = wifi_efuse_cck_a_get();
+  let ofdmbase_a: mut ref i64 = wifi_efuse_ofdmbase_a_get();
+  let mcsbase_a: mut ref i64 = wifi_efuse_mcsbase_a_get();
+  let g: i64 = 0;
+  while g < 3 {
+    let cck_idx: i64 = buf_read_byte(logical, (0x5a + g) as u32) as i64;
+    let ofdm_idx: i64 = buf_read_byte(logical, (0x60 + g) as u32) as i64;
+    let ofdm_diff_byte: i64 = buf_read_byte(logical, (0x6c + g) as u32) as i64;
+    let ht20_diff_byte: i64 = buf_read_byte(logical, (0x69 + g) as u32) as i64;
+    let ofdm_diff_a: i64 = rtl_efuse_sign_extend4((ofdm_diff_byte as u32) & (0x0f as u32));
+    let ht20_diff_a: i64 = rtl_efuse_sign_extend4((ht20_diff_byte as u32) & (0x0f as u32));
+
+    let cck_final: i64 = if cck_idx > 0x3f { 0x3f } else { cck_idx };
+    let ofdmbase_final_raw: i64 = ofdm_idx + ofdm_diff_a;
+    let ofdmbase_final: i64 = if ofdmbase_final_raw > 0x3f { 0x3f } else if ofdmbase_final_raw < 0 { 0 } else { ofdmbase_final_raw };
+    let mcsbase_final_raw: i64 = ofdm_idx + ht20_diff_a;
+    let mcsbase_final: i64 = if mcsbase_final_raw > 0x3f { 0x3f } else if mcsbase_final_raw < 0 { 0 } else { mcsbase_final_raw };
+
+    let _ = buf_write_byte(cck_a, g as u32, cck_final as u32);
+    let _ = buf_write_byte(ofdmbase_a, g as u32, ofdmbase_final as u32);
+    let _ = buf_write_byte(mcsbase_a, g as u32, mcsbase_final as u32);
+    g = g + 1;
+  }
+
+  let _ = wifi_efuse_set_parsed_ok(1 as u32);
+  let _ = uart_puts("USB: RTL8188CU EFUSE read+parsed OK, per-group TX power (cck/ofdmbase/mcsbase): g0=");
+  let _ = uart_put_hex_byte(buf_read_byte(cck_a, 0));
+  let _ = uart_puts("/");
+  let _ = uart_put_hex_byte(buf_read_byte(ofdmbase_a, 0));
+  let _ = uart_puts("/");
+  let _ = uart_put_hex_byte(buf_read_byte(mcsbase_a, 0));
+  let _ = uart_puts(" g1=");
+  let _ = uart_put_hex_byte(buf_read_byte(cck_a, 1));
+  let _ = uart_puts("/");
+  let _ = uart_put_hex_byte(buf_read_byte(ofdmbase_a, 1));
+  let _ = uart_puts("/");
+  let _ = uart_put_hex_byte(buf_read_byte(mcsbase_a, 1));
+  let _ = uart_puts(" g2=");
+  let _ = uart_put_hex_byte(buf_read_byte(cck_a, 2));
+  let _ = uart_puts("/");
+  let _ = uart_put_hex_byte(buf_read_byte(ofdmbase_a, 2));
+  let _ = uart_puts("/");
+  let _ = uart_put_hex_byte(buf_read_byte(mcsbase_a, 2));
+  let _ = uart_puts("\n");
+  return 0;
+}
+
+// Applies the EFUSE-derived per-channel-group TX power (see this
+// section's own header comment) for the given channel -- a no-op if
+// rtl8188cu_efuse_read_and_parse never ran or failed, leaving the
+// existing stock PHY_REG defaults (rtl8188cu_load_bb_table_part1's own
+// 0x2a2a2a2a/etc) in place exactly as they were before this round.
+// Channel-to-group matches rtl8xxxu_gen1_channel_to_group exactly
+// (ch<4 -> 0, ch<10 -> 1, else -> 2) -- channels 1/6/11 (this driver's
+// own WIFI_SCAN channel set) land in groups 0/1/2 respectively.
+fn rtl8188cu_apply_tx_power(devaddr: u32, mps: u32, channel: u32) -> i64 {
+  if wifi_efuse_get_parsed_ok() == (0 as u32) {
+    return 0;
+  }
+  let group: i64 = if channel < (4 as u32) { 0 } else if channel < (10 as u32) { 1 } else { 2 };
+  let cck_a: mut ref i64 = wifi_efuse_cck_a_get();
+  let ofdmbase_a: mut ref i64 = wifi_efuse_ofdmbase_a_get();
+  let mcsbase_a: mut ref i64 = wifi_efuse_mcsbase_a_get();
+  let cck0: u32 = buf_read_byte(cck_a, group as u32);
+  let ofdmbase0: u32 = buf_read_byte(ofdmbase_a, group as u32);
+  let mcsbase0: u32 = buf_read_byte(mcsbase_a, group as u32);
+
+  // REG_TX_AGC_A_CCK1_MCS32 (0x0e08): read-modify-write, only bits
+  // [15:8] change (confirmed against the real captured write: stock
+  // 0x03902a2a -> 0x0390282a when cck0=0x28).
+  let e08: u32 = rtl_reg_read32(devaddr, mps, 0x0e08 as u32);
+  let e08_cleared: u32 = e08 & (0xffff00ff as u32);
+  let e08_new: u32 = e08_cleared | (cck0 << (8 as u32));
+  let _ = rtl_reg_write32(devaddr, mps, 0x0e08 as u32, e08_new);
+
+  let ofdm_bcast: u32 = ofdmbase0 | (ofdmbase0 << (8 as u32)) | (ofdmbase0 << (16 as u32)) | (ofdmbase0 << (24 as u32));
+  let _ = rtl_reg_write32(devaddr, mps, 0x0e00 as u32, ofdm_bcast); // REG_TX_AGC_A_RATE18_06
+  let _ = rtl_reg_write32(devaddr, mps, 0x0e04 as u32, ofdm_bcast); // REG_TX_AGC_A_RATE54_24
+
+  let mcs_bcast: u32 = mcsbase0 | (mcsbase0 << (8 as u32)) | (mcsbase0 << (16 as u32)) | (mcsbase0 << (24 as u32));
+  let _ = rtl_reg_write32(devaddr, mps, 0x0e10 as u32, mcs_bcast); // REG_TX_AGC_A_MCS03_MCS00
+  let _ = rtl_reg_write32(devaddr, mps, 0x0e14 as u32, mcs_bcast); // REG_TX_AGC_A_MCS07_MCS04
+  let _ = rtl_reg_write32(devaddr, mps, 0x0e18 as u32, mcs_bcast); // REG_TX_AGC_A_MCS11_MCS08
+  let _ = rtl_reg_write32(devaddr, mps, 0x0e1c as u32, mcs_bcast); // REG_TX_AGC_A_MCS15_MCS12
+  return 0;
+}
+
 // Channel selection (`rtl8xxxu_gen1_config_channel`, 20MHz/non-HT and
 // HT20 path only -- this driver has no 40MHz/HT40 support anywhere
 // else in this section, so that branch of the reference function is
@@ -32489,6 +32855,16 @@ fn rtl8188cu_set_channel(devaddr: u32, mps: u32, channel: u32) -> i64 {
   let _ = rtl_reg_write8(devaddr, mps, 0x0515 as u32, 0x0a as u32);
   let _ = rtl_reg_write8(devaddr, mps, 0x0517 as u32, 0x0a as u32);
 
+  // REG_SLOT (0x051b) short-slot switch -- see rtl8188cu_mac_bringup's
+  // own header comment for the full "why" (confirmed via real-HW
+  // usbmon capture: the real driver writes legacy-safe 0x14 at
+  // bring-up, then 0x09 right before real operation on an OFDM/ERP-
+  // capable BSS). This driver has no legacy-BSS detection at all, and
+  // every real AP this project has ever tested against is modern/OFDM-
+  // capable, so this is unconditional here rather than gated on a
+  // beacon capability check this driver doesn't parse.
+  let _ = rtl_reg_write8(devaddr, mps, 0x051b as u32, 0x09 as u32);
+
   // REG_R2T_SIFS (0x063c) / REG_T2T_SIFS (0x063e): fixed 16-bit values,
   // not conditional on HT.
   //
@@ -32518,6 +32894,8 @@ fn rtl8188cu_set_channel(devaddr: u32, mps: u32, channel: u32) -> i64 {
   let mode_ag2_clear: u32 = mode_ag2 & ((((1 << 10) | (1 << 11)) as u32) ^ (0xFFFFFFFF as u32));
   let mode_ag2_bw: u32 = mode_ag2_clear | ((1 << 10) as u32);
   let _ = rtl_rf_reg_write(devaddr, mps, 0x18 as u32, mode_ag2_bw);
+
+  let _ = rtl8188cu_apply_tx_power(devaddr, mps, channel);
 
   return 0;
 }
@@ -32653,6 +33031,23 @@ fn rtl8188cu_init_sta_mac_params(devaddr: u32, mps: u32) -> i64 {
   let _ = rtl_reg_write16(devaddr, mps, 0x063a as u32, 0x100a as u32); // REG_MAC_SPEC_SIFS
   let _ = rtl_reg_write16(devaddr, mps, 0x0514 as u32, 0x100a as u32); // REG_SIFS_CCK
   let _ = rtl_reg_write16(devaddr, mps, 0x0516 as u32, 0x100a as u32); // REG_SIFS_OFDM
+
+  // Round 2026-11-18 (real-HW usbmon ground-truth capture, structural
+  // trace of a complete real connect sequence): REG_SLOT (0x051b, the
+  // CSMA/CA backoff slot-time register) is never written anywhere in
+  // this driver -- confirmed by grep, zero references -- while the
+  // real driver always writes it explicitly (legacy-safe 20us/0x14
+  // during bring-up, confirmed live in the capture; see rtl8188cu_set_
+  // channel's own matching write for the short-slot/9us/0x09 switch
+  // right before real operation). No defined hardware reset value for
+  // this register is documented anywhere this project's own research
+  // has found -- leaving it unwritten means every TX attempt's own
+  // internal CSMA/CA backoff timing is computed against an unknown,
+  // possibly nonsensical slot duration, which is exactly the kind of
+  // thing that could make a real transmission attempt wait
+  // indefinitely for a "clear channel" condition that never actually
+  // arrives on the real timescale the chip is actually using.
+  let _ = rtl_reg_write8(devaddr, mps, 0x051b as u32, 0x14 as u32); // REG_SLOT (legacy-safe 20us, pre-join default)
 
   // EDCA (channel-access contention) parameters, one per access category.
   let _ = rtl_reg_write32(devaddr, mps, 0x0508 as u32, 0x005ea42b as u32); // REG_EDCA_BE_PARAM
@@ -32952,6 +33347,15 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   let agc_igi_mask: u32 = 0x7F as u32;
   let agc_core1_cleared: u32 = agc_core1 & (agc_igi_mask ^ (0xFFFFFFFF as u32));
   let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_XA_AGC_CORE1, agc_core1_cleared | (0x1e as u32));
+
+  // Round 2026-11-18: one-shot EFUSE read -- see rtl8188cu_efuse_read_
+  // and_parse's own header comment. Must run before the caller's first
+  // rtl8188cu_set_channel (which is what actually applies the result),
+  // so here, at the very end of bring-up, not inside set_channel
+  // itself (which real joins call repeatedly per retune -- this only
+  // ever needs to run once per boot).
+  let _ = rtl8188cu_efuse_read_and_parse(devaddr, mps);
+
   let _ = uart_puts("USB: RTL8188CU MAC-layer bring-up complete (LLT/CR/RCR/MACID/RF-enable/CCK+OFDM-enable/LC-calibrate/IQK/RXFLTMAP/AGC-IGI) -- caller must still call rtl8188cu_set_channel before expecting real traffic\n");
   return 0;
 }
@@ -44039,8 +44443,29 @@ fn shell_dispatch() -> i64 {
     }
     let sub_start: i64 = cmd_end + 1;
     let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+    // ROOT-CAUSE FIX (2026-11-17, real-HW incident: a clean, fully-
+    // successful boot's own WiFi bring-up read back all-zero on every
+    // single register moments later via a manually-issued shell
+    // command): every "wifi" subcommand here touches the SAME shared
+    // DWC2 channel-0 hardware dwc2_probe_device0() uses (confirmed:
+    // that call already runs inside task_e's own DWC2_MUTEX_ID section
+    // above, exactly BECAUSE concurrent channel-0 access corrupts the
+    // shared HCDMA/HCTSIZ/HCCHAR state -- see that mutex's own header
+    // comment, "ping's DNS/ARP/ICMP phases, sshd's three netif_recv_
+    // frame sites" already learned this the hard way for Ethernet).
+    // None of "wifi join"/"wifi listen"/"wifi rxstats"'s own live
+    // register readback ever took this same mutex -- task_e wakes on
+    // its own independent 20-tick timer, completely unsynchronized
+    // with whenever a human happens to run one of these commands, so
+    // the two were always free to race on the exact same hardware
+    // registers. Wrapping each one here, matching the exact convention
+    // ping/sshtest/tcpecho/sshd already use, rather than threading the
+    // lock through wifi_real_join/wifi_passive_listen's own many
+    // internal call sites individually.
     if shell_word_matches(line_buf, sub_start, sub_end, "join") == 1 {
+      let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
       let _ = wifi_real_join();
+      let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
       return 0;
     }
     // Passive RX-only diagnostic (2026-11-10) -- see wifi_passive_
@@ -44059,7 +44484,9 @@ fn shell_dispatch() -> i64 {
         let _ = uart_puts("usage: wifi listen <channel 1-14>\n");
         return 0;
       }
+      let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
       let _ = wifi_passive_listen(channel as u32, 300);
+      let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
       return 0;
     }
     // 2026-11-17 (remote diagnostic instrumentation): read-only, both
@@ -44100,8 +44527,33 @@ fn shell_dispatch() -> i64 {
       // we transmit, but never confirmed the chip actually kept it --
       // this reads REG_MACID (and REG_RCR) back from the live chip to
       // settle that empirically instead of trusting the write alone.
-      let diag_devaddr: u32 = wifi_radio_get_devaddr();
-      let diag_mps: u32 = wifi_radio_get_mps_out();
+      // ROOT-CAUSE FIX (2026-11-17): this whole live-readback section
+      // touches the SAME shared DWC2 channel-0 hardware task_e's own
+      // DHCP/hotplug/device0-probe critical section protects with
+      // DWC2_MUTEX_ID -- see the "wifi join"/"wifi listen" branches'
+      // own matching comment above for the full incident.
+      // REAL ROOT CAUSE FOUND (2026-11-18, live real-HW readback still
+      // all-zero even WITH the mutex above held): this diag block was
+      // reading devaddr/mps from wifi_radio_get_devaddr()/_get_mps_out(),
+      // which stay at their boot .bss default of 0 until wifi_radio_
+      // init_rtl8188cu() runs -- and that function is only ever called
+      // from wifi_real_join()/wifi_passive_listen() (kernel_main.vani
+      // ~52034/52130), NOT from device0's own background USB probe. So
+      // on a boot where `wifi join`/`wifi listen` hasn't been run yet,
+      // every read here targeted USB device address 0 (the undefined
+      // default control address), which is exactly why it came back
+      // all-zero -- a real bug independent of, and found while hunting
+      // for, the mutex race above. rtl8188cu_probe() itself calls usb_
+      // wifi_set_devaddr(devaddr) unconditionally before any firmware
+      // attempt (kernel_main.vani:28480), and the generic endpoint walk
+      // calls usb_wifi_set_bulk_out_mps() unconditionally too (~30440)
+      // -- both populated by device0's own probe, with no dependency on
+      // `wifi join`/`listen` ever having run. Switching to those fixes
+      // this diag block for every boot, not just ones that happened to
+      // run `wifi join` first.
+      let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+      let diag_devaddr: u32 = usb_wifi_get_devaddr();
+      let diag_mps: u32 = usb_wifi_get_bulk_out_mps();
       let expect_mac: [u8; 6] = wifi_real_own_mac();
       let _ = uart_puts("wifi rxstats: REG_MACID live=");
       let dmi: i64 = 0;
@@ -44118,6 +44570,63 @@ fn shell_dispatch() -> i64 {
       let _ = uart_puts(" RCR=0x");
       let _ = uart_put_hex32(rtl_reg_read32(diag_devaddr, diag_mps, RTL_REG_RCR));
       let _ = uart_puts("\n");
+      // Live readback (2026-11-17, user: "confirm the antenna-switch
+      // register readback on the real board"): the 2026-11-16 PAPE/
+      // antenna-TX-RX-switch fix (REG_FPGA0_XAB_RF_SW_CTRL=0x0870,
+      // expect 0x07000760 -- TRSW|TRSWB|ANTSW|ANTSWB|PAPE bits plus
+      // their own ANTSW/ANTSWB/PAPE<<16 echo) was only ever confirmed
+      // via its own write-time before/after print in the boot log, not
+      // re-checked independently later in a run the way REG_MACID/RCR
+      // now are above -- this closes that gap, confirming the chip
+      // still holds it live rather than trusting the boot-time write
+      // alone. Also reads REG_FPGA0_TX_INFO (0x0804, expect
+      // 0x00000003) and REG_FPGA0_XA_RF_INT_OE (0x0860, expect
+      // 0x66f60210), the other two writes from that same fix.
+      let _ = uart_puts("wifi rxstats: REG_FPGA0_TX_INFO(0x0804) live=0x");
+      let _ = uart_put_hex32(rtl_reg_read32(diag_devaddr, diag_mps, 0x0804 as u32));
+      let _ = uart_puts(" expect=0x00000003");
+      let _ = uart_puts(" REG_FPGA0_XAB_RF_SW_CTRL(0x0870) live=0x");
+      let _ = uart_put_hex32(rtl_reg_read32(diag_devaddr, diag_mps, 0x0870 as u32));
+      let _ = uart_puts(" expect=0x07000760");
+      let _ = uart_puts(" REG_FPGA0_XA_RF_INT_OE(0x0860) live=0x");
+      let _ = uart_put_hex32(rtl_reg_read32(diag_devaddr, diag_mps, 0x0860 as u32));
+      let _ = uart_puts(" expect=0x66f60210\n");
+      // DIAGNOSTIC (2026-11-18, real-HW investigation after exhaustive
+      // register/firmware-independent auditing found no other
+      // explanation for "USB confirms every TX, AP never responds"):
+      // this driver has never once read REG_SYS_CFG (0x00f0) or checked
+      // its VENDOR_ID bit (BIT(19), confirmed against the real Linux
+      // rtl8xxxu driver's `rtl8xxxu_identify_vendor_1bit`/regs.h) --
+      // it always loads the TSMC-foundry firmware variant
+      // unconditionally, regardless of which foundry actually
+      // fabricated THIS physical chip. A UMC-fabricated chip needs a
+      // genuinely different firmware binary; running the wrong one is
+      // a textbook explanation for "RX works, TX silently does
+      // nothing" (RX is mostly PHY/baseband hardware, TX sequencing is
+      // firmware-mediated). Read-only diagnostic -- does not change
+      // firmware selection yet, just confirms which foundry this exact
+      // unit's silicon actually reports before deciding whether to act
+      // on it.
+      let diag_sys_cfg: u32 = rtl_reg_read32(diag_devaddr, diag_mps, 0x00f0 as u32);
+      let diag_vendor_bit: u32 = diag_sys_cfg & (0x00080000 as u32); // BIT(19)
+      let _ = uart_puts("wifi rxstats: REG_SYS_CFG(0x00f0) live=0x");
+      let _ = uart_put_hex32(diag_sys_cfg);
+      let _ = uart_puts(" VENDOR_ID(BIT19)=");
+      let _ = uart_puts(if diag_vendor_bit != (0 as u32) { "UMC (firmware MISMATCH -- this driver always loads the TSMC variant)" } else { "TSMC (matches firmware this driver always loads)" });
+      let _ = uart_puts("\n");
+      // DIAGNOSTIC (2026-11-18, forum research hit: a real rtl8xxxu
+      // fix for a DIFFERENT chip, RTL8192EU, found "authentication
+      // timed out" caused by REG_TXPAUSE stuck at 0xff from a stop/
+      // start cycle that left it unrestored -- doesn't structurally
+      // apply here (this driver never stops/restarts within one boot
+      // session), but the symptom match (TX silently blocked, Auth
+      // specifically timing out) is close enough to verify directly
+      // rather than trust the earlier static-code read that it's 0).
+      let diag_txpause: u32 = rtl_reg_read8(diag_devaddr, diag_mps, RTL_REG_TXPAUSE);
+      let _ = uart_puts("wifi rxstats: REG_TXPAUSE(0x0522) live=0x");
+      let _ = uart_put_hex_byte(diag_txpause);
+      let _ = uart_puts(" expect=0x00\n");
+      let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
       return 0;
     }
     if shell_word_matches(line_buf, sub_start, sub_end, "mgmtlog") == 1 {
@@ -51283,13 +51792,46 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out
       // ambient traffic from elsewhere" (from_bss=0) -- the two
       // candidate explanations for "gave up in state=1, rx_seen_count
       // high, zero matches" from the prior run.
-      let _ = uart_puts("wifi join DIAG: ignored frame from_bss=");
-      let _ = uart_put_i64(from_bss);
-      let _ = uart_puts(" stype=0x");
-      let _ = uart_put_hex32(stype as u32);
-      let _ = uart_puts(" want_stype=0x");
-      let _ = uart_put_hex32(want_stype as u32);
-      let _ = uart_puts("\n");
+      //
+      // BUG FOUND 2026-11-19 (OS/timing audit, user's own "os specific
+      // or timing" instinct after hardware was conclusively ruled out
+      // and the register/descriptor layer was matched against a real
+      // ground-truth capture as closely as practically possible): this
+      // diagnostic -- added DURING this same investigation -- prints
+      // unconditionally on every single ignored frame, which on this
+      // measurably crowded 2.4GHz channel is nearly every poll
+      // iteration (beacons arriving continuously). Each uart_puts call
+      // either blocks on real UART wire time or, even with DMA
+      // adoption, serializes behind the PREVIOUS call's own wire-time
+      // drain (uart_puts's own header comment: "wait for the buffer to
+      // be genuinely free FIRST") -- across the ~6 separate print calls
+      // this one diagnostic makes, repeated on up to 50 poll
+      // iterations, this can measurably stretch what should be a
+      // sub-millisecond poll loop into hundreds of milliseconds of
+      // real wall-clock time. On a chip whose own internal RX FIFO has
+      // limited depth, that self-inflicted slowdown is exactly the
+      // kind of thing that could let a genuine but transient Auth/
+      // Assoc Response get evicted by subsequent beacon traffic before
+      // this driver ever gets back around to draining it via USB --
+      // a problem that would never appear in a real OS (interrupt-
+      // driven RX buffering, completely decoupled from any print
+      // statement's cost), so it is capable of being invisible to this
+      // project's own prior static/register-level audits while still
+      // being a genuine, OS-specific root cause. Gated behind boot_
+      // debug_enabled() (this codebase's own established convention
+      // for optional verbosity, e.g. rtl8188cu_probe's own DIAG prints)
+      // so the hot path runs at full, undelayed speed by default and
+      // this diagnostic is still available on demand (`write /config/
+      // loglevel 16` or `dhdl set loglevel 16`) when actually needed.
+      if boot_debug_enabled() == 1 {
+        let _ = uart_puts("wifi join DIAG: ignored frame from_bss=");
+        let _ = uart_put_i64(from_bss);
+        let _ = uart_puts(" stype=0x");
+        let _ = uart_put_hex32(stype as u32);
+        let _ = uart_puts(" want_stype=0x");
+        let _ = uart_put_hex32(want_stype as u32);
+        let _ = uart_puts("\n");
+      }
       return Wpa2JoinResult { state: state, tx_len: 0, done: 0, failed: 0 };
     }
   }
@@ -51728,8 +52270,19 @@ fn wifi_radio_init_rtl8188cu() -> i64 {
 // the observed symptom. Low-confidence, but a one-line, free thing to
 // rule out before chasing anything deeper. Same locally-administered
 // bit, deliberately non-patterned remaining bytes.
+// EXPERIMENT 2 (2026-11-18, after the 2026-11-16 "non-patterned
+// locally-administered address" test above did NOT fix Auth getting
+// zero response): going one step further this time -- a real vendor
+// OUI, no locally-administered bit at all, removing all ambiguity
+// about whether this AP (or its anti-spoofing heuristics) specifically
+// distrusts ANY 0x02-prefixed address regardless of pattern.
+// 80:1f:02 is Edimax's real OUI (confirmed live on two actual EW-7811Un
+// units used elsewhere this same session) -- :AA:99:99 is a distinct
+// suffix from both of those real units' own addresses
+// (80:1f:02:aa:35:11 and 80:1f:02:aa:14:60) so this can't collide with
+// either while they're on the same network.
 fn wifi_real_own_mac() -> [u8; 6] {
-  return [0x02 as u8, 0x7B as u8, 0x9D as u8, 0x1A as u8, 0xC4 as u8, 0x3E as u8];
+  return [0x80 as u8, 0x1F as u8, 0x02 as u8, 0xAA as u8, 0x99 as u8, 0x99 as u8];
 }
 
 const WIFI_RX_POLL_CAP: i64 = 50;
@@ -51783,6 +52336,57 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
   let rx_fixed: [u8; 256] = [0 as u8; 256];
   let ssid_echo: [u8; 32] = [0 as u8; 32];
 
+  // BUG FOUND 2026-11-18 (real-HW usbmon ground-truth capture of a
+  // genuinely working Linux client re-associating to this exact AP,
+  // taken directly off the chip's own USB bus): the real driver sent
+  // the same wildcard Probe Request ~24 times over ~2 seconds and
+  // NEVER received a single Probe Response, then proceeded straight to
+  // Authentication anyway using the AP's already-known BSSID -- and
+  // that join succeeded immediately. This AP, for whatever reason
+  // (rate-limiting unsolicited probe answers, a firmware quirk,
+  // deprioritizing probes from a device it's already seen), simply
+  // does not reliably answer Probe Requests at all, for ANY client, not
+  // just this one -- a real, working client treats a probe-response
+  // timeout as routine, not fatal, and falls back to whatever BSSID it
+  // already has (from a saved profile, or from the Beacons it's
+  // continuously receiving regardless). This function's own prior
+  // "never heard a Probe Response" return-0 never had that fallback --
+  // it required a genuine solicited round trip this AP apparently never
+  // guarantees, even though this driver's own RX path proves (100+
+  // beacons/scan, confirmed earlier this session) that Beacons
+  // containing this exact SSID arrive constantly and are trivially
+  // sufficient to learn the BSSID on their own. Tracking the best
+  // Beacon match seen across the whole scan and using it if no genuine
+  // Probe Response ever arrives closes this gap, matching the real
+  // client's own demonstrated-working behavior exactly.
+  let beacon_bssid_found: i64 = 0;
+  let beacon_bssid: [u8; 6] = [0 as u8; 6];
+  // BUG FOUND 2026-11-19 (real-HW join investigation, every single run
+  // this session has hit this exact path): the beacon-fallback match
+  // below ("never heard a genuine Probe Response, but a matching
+  // Beacon was seen") does NOT return immediately when it fires -- the
+  // outer `ci` loop keeps scanning the REMAINING channels regardless,
+  // so by the time this function returns, the radio is left on
+  // whatever channel the loop happened to END on (always channel 11,
+  // wifi_scan_channel_at(2)), not the channel the actual match was
+  // heard on. The genuine-Probe-Response path just above does `return
+  // 1` immediately from inside its own channel's poll loop, so it
+  // never has this problem -- only the fallback path does, and the
+  // fallback path is the ONLY one this AP has ever actually taken in
+  // every real-HW run this session (it never answers Probe Requests).
+  // wifi_real_join never calls wifi_radio_set_channel itself (grep
+  // confirms its only two call sites are here and in the unrelated
+  // wifi_passive_listen) -- it relies entirely on whatever channel
+  // this function leaves the radio on. Recording the channel at match
+  // time and explicitly restoring it before returning closes the gap:
+  // without this, every join attempt whose matching beacon came from
+  // channel 1 or 6 would transmit Auth/listen for Auth-Response on
+  // channel 11 instead -- a silent channel mismatch that would produce
+  // exactly the "Auth Request sent, AP never responds" symptom this
+  // whole investigation has been chasing, with no register or timing
+  // bug required to explain it.
+  let beacon_bssid_channel: u32 = 0 as u32;
+
   let ci: i64 = 0;
   while ci < 3 {
     let channel: u32 = wifi_scan_channel_at(ci);
@@ -51798,11 +52402,16 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
     // something IN-direction-specific; a TX failure here instead points
     // back at the shared primitive affecting both directions.
     let tx_result: i64 = wifi_radio_tx_frame(devaddr, mps_out, tx_heap, preq_len, 1, 0);
-    let _ = uart_puts("wifi scan: TX probe request on channel ");
-    let _ = uart_put_i64(channel as i64);
-    let _ = uart_puts(" result=");
-    let _ = uart_put_i64(tx_result);
-    let _ = uart_puts(" (0=XFERCOMPL confirmed, -1=channel-0 never completed)\n");
+    // BUG FOUND 2026-11-19: sibling of wpa2_join_start's own matching
+    // fix (see that call site's header comment) -- same gap, right
+    // before this channel's own poll loop starts.
+    if boot_debug_enabled() == 1 {
+      let _ = uart_puts("wifi scan: TX probe request on channel ");
+      let _ = uart_put_i64(channel as i64);
+      let _ = uart_puts(" result=");
+      let _ = uart_put_i64(tx_result);
+      let _ = uart_puts(" (0=XFERCOMPL confirmed, -1=channel-0 never completed)\n");
+    }
 
     let poll: i64 = 0;
     while poll < WIFI_RX_POLL_CAP {
@@ -51848,8 +52457,34 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
         // past the buffer's real end. Use the truncated length from here
         // on, matching what's actually IN rx_fixed.
         let fixed_len: i64 = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
+        // BUG FOUND 2026-11-18 (live real-HW diagnostic, clean single-
+        // reader capture of `wifi join`): unlike its sibling wpa2_join_
+        // step_mgmt (which correctly gates on `stype != want_stype`,
+        // kernel_main.vani's own WAIT_AUTH_RESP/WAIT_ASSOC_RESP branches
+        // above), this scan loop never checked the received frame's own
+        // subtype before trusting probe_response_parse's verdict.
+        // probe_response_parse itself only checks frame_len>=36 and then
+        // walks IEs from offset 36 -- it never looks at frame_control at
+        // all. A Beacon's body (Timestamp+Interval+CapInfo+SSID/RSN IEs)
+        // is byte-for-byte identical in layout to a Probe Response's (by
+        // this package's own deliberate design, see its header comment),
+        // so the target AP's ordinary, UNSOLICITED, continuously-
+        // broadcast Beacon (every ~100ms, regardless of whether our own
+        // Probe Request ever left the antenna) was passing this exact
+        // check just as readily as a genuine solicited Probe Response --
+        // meaning "wifi join: found AP, starting join sequence" never
+        // actually proved the AP received anything we transmitted. Live
+        // data makes this very likely what was happening: on channel 11,
+        // only 2 RX frames arrived before "found AP" declared success --
+        // consistent with simply catching the AP's own beacon, not a
+        // real round trip. Gating on the real subtype here (matching
+        // wpa2_join_step_mgmt's own convention exactly) closes the gap:
+        // now a match only counts if the frame is REALLY a Probe
+        // Response, not any frame that happens to parse like one.
+        let scan_fc: i64 = (rx_fixed[0] as i64) | ((rx_fixed[1] as i64) << (8 as i64));
+        let scan_stype: i64 = scan_fc & (0xFC as i64);
         let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, fixed_len, mut ref ssid_echo);
-        if info.ok == 1 {
+        if (info.ok == 1) && (scan_stype == FC_STYPE_PROBE_RESP) {
           let matches: i64 = if info.ssid_len == ssid_len { 1 } else { 0 };
           let si: i64 = 0;
           while si < ssid_len {
@@ -51867,6 +52502,34 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
               bi = bi + 1;
             }
             return 1;
+          }
+        } else if (info.ok == 1) && (scan_stype == FC_STYPE_BEACON) && (beacon_bssid_found == 0) {
+          // Fallback target (see this function's own header comment,
+          // 2026-11-18): a real Probe Response may never arrive from
+          // this AP at all. Remember the first Beacon that matches our
+          // target SSID so the scan still has something to act on if
+          // the whole 3-channel loop finishes without ever hearing a
+          // genuine solicited response -- only saved once (first match
+          // wins) since any later Beacon from the same AP would give an
+          // identical BSSID anyway.
+          let matches: i64 = if info.ssid_len == ssid_len { 1 } else { 0 };
+          let si: i64 = 0;
+          while si < ssid_len {
+            if ssid_echo[si] != ssid[si] { matches = 0; }
+            si = si + 1;
+          }
+          if matches == 1 {
+            let ba1: [u8; 6] = [0 as u8; 6];
+            let ba2: [u8; 6] = [0 as u8; 6];
+            let ba3: [u8; 6] = [0 as u8; 6];
+            let _ = mac_header_parse(ref rx_fixed, mut ref ba1, mut ref ba2, mut ref ba3);
+            let bi: i64 = 0;
+            while bi < 6 {
+              beacon_bssid[bi] = ba2[bi];
+              bi = bi + 1;
+            }
+            beacon_bssid_found = 1;
+            beacon_bssid_channel = channel;
           }
         }
       }
@@ -51899,6 +52562,19 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
       poll = poll + 1;
     }
     ci = ci + 1;
+  }
+  if beacon_bssid_found == 1 {
+    let _ = uart_puts("wifi scan: never heard a genuine Probe Response, but a matching Beacon was seen -- using its BSSID (matches real-HW-confirmed Linux client behavior against this AP)\n");
+    let _ = uart_puts("wifi scan: restoring radio to channel ");
+    let _ = uart_put_i64(beacon_bssid_channel as i64);
+    let _ = uart_puts(" (where that Beacon was actually heard) before join proceeds\n");
+    let _ = wifi_radio_set_channel(devaddr, mps_out, beacon_bssid_channel);
+    let bi: i64 = 0;
+    while bi < 6 {
+      bssid_out[bi] = beacon_bssid[bi];
+      bi = bi + 1;
+    }
+    return 1;
   }
   return 0;
 }
@@ -52098,9 +52774,20 @@ fn wifi_real_join() -> i64 {
   // indistinguishable from "sent fine, AP just never replied" in every
   // diagnostic gathered so far.
   let auth_tx_result: i64 = wifi_radio_tx_frame(devaddr, mps_out, preq_heap, preq_len, 0, 1);
-  let _ = uart_puts("wifi join DIAG: Auth Request TX result=");
-  let _ = uart_put_i64(auth_tx_result);
-  let _ = uart_puts(" (0=XFERCOMPL confirmed, -1=channel-0 never completed)\n");
+  // BUG FOUND 2026-11-19: see wpa2_join_step_mgmt's own matching fix
+  // for the full "why" -- this specific gap (between TX completing and
+  // the very first RX poll below) is the single most time-critical one
+  // in the whole join sequence: a real Auth Response is SIFS-timed,
+  // arriving within microseconds to low-single-digit milliseconds of
+  // the AP finishing reception of our frame. Printing here first, even
+  // once, pushes the first poll back by however long these ~3 uart_
+  // puts/put_i64 calls take -- gated the same way as the hot-path
+  // prints so this starts polling as fast as this driver can manage.
+  if boot_debug_enabled() == 1 {
+    let _ = uart_puts("wifi join DIAG: Auth Request TX result=");
+    let _ = uart_put_i64(auth_tx_result);
+    let _ = uart_puts(" (0=XFERCOMPL confirmed, -1=channel-0 never completed)\n");
+  }
 
   let rx_heap: mut ref i64 = wifi_join_rx_scratch_get();
   let rx_fixed: [u8; 256] = [0 as u8; 256];

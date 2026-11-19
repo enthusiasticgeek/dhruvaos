@@ -1016,6 +1016,25 @@ wifi_stat_report_frame_count:
                          * not a dropped 802.11 frame; counted separately
                          * so it's never mistaken for one. */
 
+/* 2026-11-17 (real-HW incident: a WiFi dongle that stopped answering
+ * ANY USB control transfer -- SETUP phase failing on every single
+ * subsequent register read/write -- made rtl8188cu_download_firmware's
+ * own 3-attempt retry loop grind through dozens of doomed register
+ * pokes per attempt (rtl8188cu_power_on/mac_queue_setup/reset_8051's
+ * own cleanup sequence, repeated on every attempt), each individually
+ * bounded (dwc2_wait_chan0_done's own ~2s cap) but with NO overall
+ * circuit breaker once the device is truly gone -- several minutes of
+ * real wall-clock time spent reconfirming the same "gone" fact over
+ * and over, during which the board looked completely hung. dwc2_
+ * control_out/_in (kernel_main.vani) increment this on every SETUP/
+ * DATA/STATUS phase failure and reset it to 0 on any success; callers
+ * doing a multi-attempt retry (rtl8188cu_download_firmware's own
+ * fw_attempt loop) check it between attempts and bail immediately
+ * once it's clearly not transient, instead of trusting that "it's
+ * only ~2s per call" stays true in aggregate. */
+usb_wifi_ctrl_fail_streak:
+    .word 0
+
 .section ".text"
 
 .global dharafs_sd_scratch_set
@@ -2656,6 +2675,19 @@ wifi_stat_fcs_bad_count_set:
 .global wifi_stat_fcs_bad_count_get
 wifi_stat_fcs_bad_count_get:
     ldr r0, =wifi_stat_fcs_bad_count
+    ldr r0, [r0]
+    bx lr
+
+.global usb_wifi_ctrl_fail_streak_set
+usb_wifi_ctrl_fail_streak_set:
+    ldr r1, =usb_wifi_ctrl_fail_streak
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global usb_wifi_ctrl_fail_streak_get
+usb_wifi_ctrl_fail_streak_get:
+    ldr r0, =usb_wifi_ctrl_fail_streak
     ldr r0, [r0]
     bx lr
 
