@@ -33126,6 +33126,19 @@ fn rtl8188cu_init_sta_mac_params(devaddr: u32, mps: u32) -> i64 {
 
   let _ = rtl_reg_write8(devaddr, mps, 0x0640 as u32, 0x40 as u32); // REG_ACKTO
 
+  // BUG FOUND 2026-11-19 (same full-stack audit): REG_FAST_EDCA_CTRL
+  // (0x0460) is written 0 (disabled) unconditionally in the reference
+  // driver for every chip in this family EXCEPT the three newest ones
+  // (RTL8188F/RTL8192F/RTL8710B, none of which this chip is) -- never
+  // written anywhere in this codebase. "Fast EDCA" is a contention-
+  // window-reduction optimization; left at an undocumented hardware-
+  // reset default rather than explicitly disabled, it could let some
+  // frames use a different contention window than the one this driver
+  // explicitly configures via the EDCA_xx_PARAM registers above --
+  // same general theme as the REG_SLOT/NAV_UPPER/TBTT_PROHIBIT gaps
+  // already found and fixed this same audit.
+  let _ = rtl_reg_write16(devaddr, mps, 0x0460 as u32, 0 as u32); // REG_FAST_EDCA_CTRL (disabled)
+
   // BUG FOUND 2026-11-19 (methodical full-stack audit, triggered by a
   // real-HW stage0 hang pausing testing): REG_NAV_UPPER (0x0652) is
   // written unconditionally for every chip in this family in the real
