@@ -10585,6 +10585,21 @@ fn dharafs_dirindex_snapshot_load(expect_generation: u32) -> i64 {
   let scratch: mut ref i64 = dhruva_alloc_bytes(512);
   let blk: i64 = 0;
   while blk < dharafs_dirindex_snapshot_data_blocks() {
+    // BUG FOUND 2026-11-19 (watchdog-coverage audit prompted by the
+    // real-HW stage0 hang this session, investigating whether stage0's
+    // own disabled-by-default pre-jump watchdog could safely be
+    // enabled): this loop does one real SD block read with ECC per
+    // iteration and had zero watchdog_kick() coverage, despite running
+    // synchronously inside dharafs_init()'s own direct call chain --
+    // measured real-HW timing shows checkpoint7->8 (which wraps this
+    // entire call) at 23s, already at the hardware watchdog's own
+    // ~15-16s single-arm ceiling, with this snapshot load (potentially
+    // many blocks, proportional to directory history) a real
+    // contributor. Kicking once per iteration, same convention this
+    // codebase already uses for every other slow SD-I/O loop.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
     let base_slot: i64 = blk * dharafs_dirindex_snapshot_slots_per_block();
     let rd_status: i64 = dharafs_block_read_once_with_ecc(dharafs_dirindex_snapshot_block_for(base_slot), scratch);
     if rd_status != 0 {
@@ -11299,6 +11314,14 @@ fn dharafs_badblock_bitmap_load() -> i64 {
     let best_pool_slot: i64 = 0;
     let p: i64 = 0;
     while p < dharafs_badblock_bitmap_pool_size() {
+      // BUG FOUND 2026-11-19 (same watchdog-coverage audit as dharafs_
+      // dirindex_snapshot_load's own matching fix) -- one real SD block
+      // read with ECC per iteration (this loop runs twice, once per
+      // half), zero watchdog_kick() coverage, running synchronously
+      // inside dharafs_init()'s own direct call chain.
+      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+        let _ = watchdog_kick();
+      }
       let blk: i64 = dharafs_badblock_bitmap_block_at(half, p);
       let rd_status: i64 = dharafs_block_read_once_with_ecc(blk, sd_scratch);
       if rd_status == 0 {
@@ -11563,6 +11586,14 @@ fn dharafs_suspect_table_load() -> i64 {
   let best_pool_slot: i64 = 0;
   let p: i64 = 0;
   while p < dharafs_suspect_pool_size() {
+    // BUG FOUND 2026-11-19 (same watchdog-coverage audit as dharafs_
+    // dirindex_snapshot_load's own matching fix above) -- one real SD
+    // block read with ECC per iteration, zero watchdog_kick() coverage,
+    // running synchronously inside dharafs_init()'s own direct call
+    // chain.
+    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      let _ = watchdog_kick();
+    }
     let blk: i64 = dharafs_suspect_table_block_at(p);
     let rd_status: i64 = dharafs_block_read_once_with_ecc(blk, sd_scratch);
     if rd_status == 0 {
