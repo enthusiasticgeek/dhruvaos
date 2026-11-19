@@ -52565,6 +52565,16 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
   }
   if beacon_bssid_found == 1 {
     let _ = uart_puts("wifi scan: never heard a genuine Probe Response, but a matching Beacon was seen -- using its BSSID (matches real-HW-confirmed Linux client behavior against this AP)\n");
+    let _ = uart_puts("wifi scan: matched BSSID=");
+    let bpi: i64 = 0;
+    while bpi < 6 {
+      if bpi > 0 { let _ = uart_puts(":"); }
+      let _ = uart_put_hex_byte(beacon_bssid[bpi] as u32);
+      bpi = bpi + 1;
+    }
+    let _ = uart_puts(" on channel ");
+    let _ = uart_put_i64(beacon_bssid_channel as i64);
+    let _ = uart_puts(" -- this is the AP we are about to Auth/Assoc against\n");
     let _ = uart_puts("wifi scan: restoring radio to channel ");
     let _ = uart_put_i64(beacon_bssid_channel as i64);
     let _ = uart_puts(" (where that Beacon was actually heard) before join proceeds\n");
