@@ -29856,7 +29856,48 @@ fn rtl_tx_desc_write(out: mut ref i64, frame_len: i64, is_broadcast: i64, seq_nu
   let txdw0: i64 = RTL_TXDESC_OWN | RTL_TXDESC_FIRST_SEGMENT | RTL_TXDESC_LAST_SEGMENT | (if is_broadcast != 0 { RTL_TXDESC_BROADMULTICAST } else { 0 });
   let _ = buf_write_byte(out, 3 as u32, txdw0 as u32);
 
-  let txdw1: i64 = (RTL_TXDESC_QUEUE_MGNT << 8) | RTL_TXDESC32_AGG_BREAK;
+  // BUG FOUND 2026-11-20 (user: "did you traverse the full call stack and
+  // not find the gap?" -- prompted redoing this against rtl8192cu_trx.c/
+  // .h directly, the actual driver `.230`'s own `lsusb -t` confirmed this
+  // exact chip binds to, rather than trusting the earlier spot-checks that
+  // had mostly compared against rtl8xxxu, a DIFFERENT driver family this
+  // chip does not use): dword1 bits[4:0] (MACID) and bits[19:16] (RATE_ID)
+  // were never written at all -- left at their zero-init value every
+  // single TX. The real `rtl92cu_tx_fill_desc` (trx.c) ALWAYS sets both,
+  // unconditionally, for every frame: `set_tx_desc_rate_id(txdesc, 0xC +
+  // tcb_desc->ratr_index); set_tx_desc_macid(txdesc, tcb_desc->ratr_
+  // index);` (the non-useramask branch, the one this older chip family
+  // actually takes). `ratr_index` itself comes from `rtl_get_tcb_desc`
+  // (rtlwifi/base.c, not in this project's downloaded reference set, so
+  // not independently confirmed byte-for-byte) -- but `wifi.h`'s own
+  // `RATR_INX_WIRELESS_MC = 7` is the conventional "no associated STA yet"
+  // index this whole driver family uses for exactly this frame class
+  // (pre-association management traffic), giving RATE_ID=0xC+7=0x13 and
+  // MACID=7 as the best-evidenced real values -- not a captured byte dump
+  // (none was saved from the prior round's usbmon session), so flagged
+  // here as inference from source, not proof, same honesty standard as
+  // every other real-HW finding this investigation has used. Rate_id
+  // selects which firmware-internal RA (rate-adaptation) table entry
+  // governs this frame's actual over-the-air rate/power parameters --
+  // leaving it at 0 (an index the firmware may never have populated,
+  // since nothing in this driver's own init sequence configures per-macid
+  // rate tables at all) is a mechanistically plausible explanation for
+  // "USB accepted the descriptor fine, nothing reaches the air, zero error
+  // reported anywhere" -- exactly this investigation's standing symptom.
+  // RATE_ID is only a 4-bit field (bits[19:16] -- bit20 is a DIFFERENT
+  // field, NAV_USE_HDR, confirmed in rtl8192cu_trx.h's own
+  // set_tx_desc_nav_use_hdr=BIT(20)). The real driver's own "0xC +
+  // ratr_index" formula overflows this 4-bit field for ratr_index=7
+  // (0xC+7=0x13=19 > 15) -- real hardware's bitfield-insert macro
+  // (`le32p_replace_bits`) masks any value to its field's width before
+  // inserting, so what real silicon actually stores is 0x13 & 0xF = 3,
+  // not 19. Masking explicitly here, not just relying on the shift
+  // alone, to avoid silently setting bit20 (NAV_USE_HDR) by accident --
+  // that would be a self-inflicted bug distinct from the real one this
+  // fix is chasing.
+  let txdesc_macid: i64 = 7; // RATR_INX_WIRELESS_MC
+  let txdesc_rate_id: i64 = (0xC + 7) & 0xF; // 3 (0x13 masked to the real 4-bit field width)
+  let txdw1: i64 = txdesc_macid | (RTL_TXDESC_QUEUE_MGNT << 8) | RTL_TXDESC32_AGG_BREAK | (txdesc_rate_id << 16);
   let _ = buf_write_u32_le(out, 4, txdw1 as u32);
 
   let _ = buf_write_u32_le(out, 8, 0 as u32);
@@ -29922,7 +29963,7 @@ fn rtl_tx_desc_self_test() -> i64 {
   if buf_read_u16_le(out, 0) != (30 as u32) { ok = 0; }
   if buf_read_byte(out, 2 as u32) != (32 as u32) { ok = 0; }
   if buf_read_byte(out, 3 as u32) != (0x8c as u32) { ok = 0; } // OWN|FS|LS, no broadcast bit
-  if buf_read_u32_le(out, 4) != (((0x12 << 8) | 0x40) as u32) { ok = 0; } // QUEUE_MGNT | AGG_BREAK
+  if buf_read_u32_le(out, 4) != ((7 | (0x12 << 8) | 0x40 | (3 << 16)) as u32) { ok = 0; } // MACID=7 | QUEUE_MGNT | AGG_BREAK | RATE_ID=3 (0xC+7 masked to the real 4-bit field)
   if buf_read_u32_le(out, 12) != ((1 << 16) as u32) { ok = 0; }
   if buf_read_u32_le(out, 16) != (0x100 as u32) { ok = 0; }
   if buf_read_u32_le(out, 20) != (((0x1F << 8) | (0xF << 13)) as u32) { ok = 0; }
@@ -33006,6 +33047,33 @@ fn rtl8188cu_efuse_read_and_parse(devaddr: u32, mps: u32) -> i64 {
   let _ = uart_puts("/");
   let _ = uart_put_hex_byte(buf_read_byte(mcsbase_a, 2));
   let _ = uart_puts("\n");
+
+  // BUG FOUND 2026-11-20 (call-stack trace of rtl8192cu/hw.c's real
+  // `_initpabias`, fetched verbatim): a genuine Power Amplifier bias fix,
+  // never ported anywhere in this driver, gated on EFUSE logical offset
+  // 0x1FA (already sitting in `logical` above -- this chip has only RF
+  // path A, so path B's gate, which also requires a dual-path chip
+  // variant this part isn't, is correctly never taken). PA bias is the
+  // actual analog output stage -- a wrong/uninitialized bias point is a
+  // mechanistically direct explanation for "USB/MAC reports a clean TX,
+  // independent monitor-mode RF capture shows zero energy ever left the
+  // antenna" (this investigation's own confirmed, standing symptom),
+  // more directly than any digital/descriptor-level gap could be.
+  let pa_setting: i64 = buf_read_byte(logical, 0x1FA as u32) as i64;
+  if (pa_setting & 0x01) == 0 {
+    let _ = rtl_rf_reg_write(devaddr, mps, 0x15 as u32, 0x0F406 as u32);
+    let _ = rtl_rf_reg_write(devaddr, mps, 0x15 as u32, 0x4F406 as u32);
+    let _ = rtl_rf_reg_write(devaddr, mps, 0x15 as u32, 0x8F406 as u32);
+    let _ = rtl_rf_reg_write(devaddr, mps, 0x15 as u32, 0xCF406 as u32);
+  }
+  if (pa_setting & 0x10) == 0 {
+    let reg16_before: i64 = rtl_reg_read8(devaddr, mps, 0x0016 as u32) as i64;
+    let reg16_low_nibble: i64 = reg16_before & 0x0F;
+    let _ = rtl_reg_write8(devaddr, mps, 0x0016 as u32, (reg16_low_nibble | 0x90) as u32);
+  }
+  let _ = uart_puts("USB: RTL8188CU PA bias fix applied, EFUSE 0x1FA=0x");
+  let _ = uart_put_hex_byte(pa_setting as u32);
+  let _ = uart_puts("\n");
   return 0;
 }
 
@@ -33697,12 +33765,45 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   let agc_core1_cleared: u32 = agc_core1 & (agc_igi_mask ^ (0xFFFFFFFF as u32));
   let _ = rtl_reg_write32(devaddr, mps, RTL_REG_OFDM0_XA_AGC_CORE1, agc_core1_cleared | (0x1e as u32));
 
+  // BUG FOUND 2026-11-20 (user: "did you traverse the full call stack and
+  // not find the gap?" -- prompted fetching rtl8192cu/hw.c's own
+  // rtl92cu_hw_init directly, step by step, rather than trusting earlier
+  // spot-checks). Two late-stage, completely unconditional register
+  // blocks this driver never ported at all: `_rtl92cu_hw_configure`
+  // ("To Fix MAC loopback mode fail" / "fixed USB interface interference
+  // issue", the real driver's own comments) and `_initpabias` (below, via
+  // rtl8188cu_efuse_read_and_parse). Confirmed verbatim from the real
+  // source (hw.c), called in this exact order right after LC/IQK
+  // calibration -- the same point in THIS driver's own sequence, since
+  // LC-calibrate/IQK already just ran immediately above.
+  let _ = rtl_reg_write8(devaddr, mps, 0x0022 as u32, 0x0f as u32); // REG_LDOHCI12_CTRL
+  let _ = rtl_reg_write8(devaddr, mps, 0x0015 as u32, 0xe9 as u32); // plain MAC-space byte, not an RF register
+  let _ = rtl_reg_write8(devaddr, mps, 0x0423 as u32, 0xff as u32); // REG_HWSEQ_CTRL, enable HW sequence numbering
+  // "fixed USB interface interference issue" -- three unconditional
+  // byte writes, no chip/version gate in the real source.
+  let _ = rtl_reg_write8(devaddr, mps, 0xfe40 as u32, 0xe0 as u32);
+  let _ = rtl_reg_write8(devaddr, mps, 0xfe41 as u32, 0x8d as u32);
+  let _ = rtl_reg_write8(devaddr, mps, 0xfe42 as u32, 0x80 as u32);
+  // REG_BCN_CTRL (the same 0x0550 this driver's own init_sta_mac_params
+  // already wrote as part of a 16-bit 0x1010 beacon-parameters write) --
+  // the real driver's hw_configure step is the LAST word on this
+  // register's low byte, happening well after that earlier beacon-
+  // parameters step in its own sequence, same relative ordering as here.
+  // Finalizing it to the real driver's own confirmed value rather than
+  // leaving our earlier 0x10 as the final state (only the low byte
+  // changes -- the high byte, REG_BEACON_CTRL_1/0x0551, is untouched).
+  let _ = rtl_reg_write8(devaddr, mps, 0x0550 as u32, 0x18 as u32);
+
   // Round 2026-11-18: one-shot EFUSE read -- see rtl8188cu_efuse_read_
   // and_parse's own header comment. Must run before the caller's first
   // rtl8188cu_set_channel (which is what actually applies the result),
   // so here, at the very end of bring-up, not inside set_channel
   // itself (which real joins call repeatedly per retune -- this only
-  // ever needs to run once per boot).
+  // ever needs to run once per boot). Also now does the real driver's
+  // own `_initpabias` PA-bias fix (see that function's own header
+  // comment inside rtl8188cu_efuse_read_and_parse) -- naturally placed
+  // here since it needs the same EFUSE logical map this call already
+  // reads, and the real driver runs it at this same late stage too.
   let _ = rtl8188cu_efuse_read_and_parse(devaddr, mps);
 
   let _ = uart_puts("USB: RTL8188CU MAC-layer bring-up complete (LLT/CR/RCR/MACID/RF-enable/CCK+OFDM-enable/LC-calibrate/IQK/RXFLTMAP/AGC-IGI) -- caller must still call rtl8188cu_set_channel before expecting real traffic\n");
