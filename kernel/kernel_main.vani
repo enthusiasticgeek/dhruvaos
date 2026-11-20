@@ -25124,13 +25124,32 @@ fn dwc2_enable_global_intr() -> i64 {
 // FSLSSUPP` (bit 2, "FS/LS-Only Support") right after -- both programmed
 // together as a pair in the one real reference closest to this
 // project's own bare-metal, polling-based driver shape.
-fn dwc2_init_fs_ls_pclk_sel() -> i64 {
+// 2026-11-20 (real USB2.0 high-speed bring-up): this used to
+// unconditionally write FSLSPCLKSEL=1 (48MHz, dedicated FS-only PHY
+// clock) AND set HCFG bit2 (FSLSSUPP, "FS/LS Support Only") -- a
+// SECOND, independent force-full-speed mechanism beyond GUSBCFG.PHYSEL
+// (dwc2_select_fs_phy()'s own bit): FSLSSUPP alone keeps this core
+// FS/LS-only regardless of what PHY is actually selected, confirmed
+// against the Synopsys DWC_otg/DWC2 HCFG bit layout (same register
+// Linux's dwc2_init_fs_ls_pclk_sel() programs). Now takes the same
+// is_hs flag dwc2_select_phy_mode() already computed: when an HS PHY
+// was actually selected, program FSLSPCLKSEL=0 (30-60MHz, the HS-
+// capable-PHY clock value) and leave FSLSSUPP clear; otherwise keep
+// the exact previous FS-only behavior unchanged (this core reporting
+// no HS PHY at all via GHWCFG2, or any future board where that's
+// genuinely true).
+fn dwc2_init_fs_ls_pclk_sel(is_hs: i64) -> i64 {
   let hcfg: i64 = dwc2_base() + 0x400;
   let fslspclksel_48mhz: u32 = 1 as u32;
+  let fslspclksel_30_60mhz: u32 = 0 as u32;
   let fslssupp: u32 = (1 as u32) << (2 as u32);
   let v: u32 = mmio_read_u32(hcfg);
   let cleared: u32 = v & (0xFFFFFFFC as u32);
-  let _ = mmio_write_u32(hcfg, cleared | fslspclksel_48mhz | fslssupp);
+  if is_hs != 0 {
+    let _ = mmio_write_u32(hcfg, (cleared & (fslssupp ^ (0xFFFFFFFF as u32))) | fslspclksel_30_60mhz);
+  } else {
+    let _ = mmio_write_u32(hcfg, cleared | fslspclksel_48mhz | fslssupp);
+  }
   return 0;
 }
 
@@ -25476,6 +25495,91 @@ fn dwc2_select_fs_phy() -> i64 {
     let immediate_after: u32 = mmio_read_u32(gusbcfg);
     let _ = kernlog_write_simple("USB DIAG PHYSEL immediately after core soft reset", immediate_after);
   }
+  return 0;
+}
+
+// 2026-11-20 (real-HW `wifi join` investigation): this chip's own TX
+// descriptor/queue/LLT/RQPN setup was verified byte-for-byte against
+// the real Linux rtl8xxxu reference and found correct, yet an
+// independent monitor-mode RF capture proved our Auth Request frame
+// never reaches the air despite a confirmed-successful USB bulk-OUT
+// completion. The one concrete, verified difference against a real PC
+// (where the identical physical dongle associates fine): this driver
+// has always forced the dongle to USB full-speed (12Mbps, mps=64) via
+// dwc2_select_fs_phy() above, while the PC negotiates real USB2.0
+// high-speed (480Mbps, mps=512) -- confirmed via `lsusb -t` showing
+// 480M/rtl8192cu there. dwc2_select_fs_phy()'s own header comment's
+// justification ("no external USB PHY chip wired up at all -- only
+// the embedded FS transceiver exists on this silicon") is factually
+// wrong: a live GHWCFG2 dump already pulled from this exact board
+// during the FIFO-sizing investigation (dwc2_config_fifos's own
+// header comment, GHWCFG2=0x228ddd50) decodes bits[7:6] (HS_PHY_TYPE)
+// to 0b01=1=UTMI -- this exact silicon self-reports a genuine on-chip
+// high-speed UTMI PHY, matching Linux's own `brcm,bcm2835-usb`
+// platform quirk table (which never overrides phy_type/speed at all,
+// trusting this same GHWCFG2 autodetection to reach HS by default) and
+// NetBSD's bcm2835_dwctwo.c (hardcodes `phy_type=UTMI, speed=High
+// Speed` for this identical Synopsys core integration). Forcing FS was
+// a from-scratch-driver simplification choice, not a hardware
+// necessity.
+//
+// Mirror image of dwc2_select_fs_phy() above: GUSBCFG.PHYSEL (bit6)
+// CLEARED selects the UTMI/ULPI high-speed PHY path instead of the
+// embedded FS/LS serial transceiver; GUSBCFG.ULPI_UTMI_SEL (bit4)
+// CLEARED selects UTMI specifically (not ULPI -- this chip has no
+// external ULPI PHY chip either); GUSBCFG.PHYIF16 (bit3) CLEARED
+// selects the 8-bit UTMI data width (`phy_utmi_width=8` in the same
+// Linux platform table -- a 16-bit-vs-8-bit width mismatch is a
+// documented common dwc2 HS bring-up bug, silently working at FS and
+// corrupting/stalling only once HS is actually attempted). Same "only
+// write + reset if something actually needs to change" idiom as the FS
+// version (a PHY-mode change only latches cleanly via the core soft
+// reset that must immediately follow it -- confirmed against both
+// Linux's dwc2_hs_phy_init/dwc2_fs_phy_init and U-Boot's own inlined
+// equivalent, both of which always pair a PHYSEL/ULPI_UTMI_SEL change
+// with an immediate re-reset).
+fn dwc2_select_hs_phy() -> i64 {
+  let gusbcfg: i64 = dwc2_base() + 0x0C;
+  let physel_bit: u32 = (1 as u32) << (6 as u32);
+  let ulpi_utmi_sel_bit: u32 = (1 as u32) << (4 as u32);
+  let phyif16_bit: u32 = (1 as u32) << (3 as u32);
+  let hs_bits_mask: u32 = physel_bit | ulpi_utmi_sel_bit | phyif16_bit;
+  let v: u32 = mmio_read_u32(gusbcfg);
+  if (v & hs_bits_mask) != (0 as u32) {
+    let cleared: u32 = v & (hs_bits_mask ^ (0xFFFFFFFF as u32));
+    let _ = mmio_write_u32(gusbcfg, cleared);
+    let immediate_before: u32 = mmio_read_u32(gusbcfg);
+    let _ = kernlog_write_simple("USB DIAG PHYSEL/ULPI_UTMI_SEL/PHYIF16 immediately after write (HS select), before reset", immediate_before);
+    let _ = dwc2_core_soft_reset();
+    let immediate_after: u32 = mmio_read_u32(gusbcfg);
+    let _ = kernlog_write_simple("USB DIAG PHYSEL/ULPI_UTMI_SEL/PHYIF16 immediately after core soft reset (HS select)", immediate_after);
+  }
+  return 0;
+}
+
+// Dispatcher (2026-11-20): reads GHWCFG2.HS_PHY_TYPE (bits[7:6], 0=not
+// supported/1=UTMI/2=ULPI/3=UTMI+ULPI) live from this core's own
+// hardware-configuration register rather than hardcoding a per-board
+// assumption -- same "no trust, validate everything" discipline this
+// project applies everywhere else, and keeps this driver's USB bring-
+// up correct on any future board whose DWC2 integration genuinely
+// lacks an HS PHY (where forcing HS would be wrong), not just this
+// one. GHWCFG2 lives at the standard Synopsys offset 0x48 (confirmed
+// against the same real-hardware dump this project already decoded
+// for the ARCHITECTURE and DYNAMIC_FIFO fields elsewhere -- see
+// dwc2_enable_dma_mode's and dwc2_config_fifos's own header comments).
+// Returns 1 if the HS PHY path was selected, 0 if this core reports no
+// HS PHY at all and the FS-only path was used instead.
+fn dwc2_select_phy_mode() -> i64 {
+  let ghwcfg2: i64 = dwc2_base() + 0x48;
+  let v: u32 = mmio_read_u32(ghwcfg2);
+  let hs_phy_type: u32 = (v >> (6 as u32)) & (0x3 as u32);
+  let _ = kernlog_write_simple("USB DIAG GHWCFG2 HS_PHY_TYPE (0=none,1=UTMI,2=ULPI,3=UTMI+ULPI)", hs_phy_type);
+  if hs_phy_type != (0 as u32) {
+    let _ = dwc2_select_hs_phy();
+    return 1;
+  }
+  let _ = dwc2_select_fs_phy();
   return 0;
 }
 
@@ -26126,7 +26230,7 @@ fn dwc2_init() -> i64 {
   let _ = mmio_write_u32(gotgint, 0xFFFFFFFF as u32);
   let _ = mmio_write_u32(gintsts, 0xFFFFFFFF as u32);
 
-  let _ = dwc2_select_fs_phy();
+  let phy_is_hs: i64 = dwc2_select_phy_mode();
   // Task #325 retest finding: U-Boot's dwc_otg_core_init sets
   // HCFG.FSLSPclkSel/FSLSSupp IMMEDIATELY after PHYSEL+reset, still
   // inside the same "this programming sequence needs to happen in FS
@@ -26136,7 +26240,7 @@ fn dwc2_init() -> i64 {
   // ordering bug: real-HW retest with that ordering regressed from a
   // genuine XACTERR back to full silence (HCINT=0x00000000), matching
   // the pre-DMAEN-fix symptom exactly.
-  let _ = dwc2_init_fs_ls_pclk_sel();
+  let _ = dwc2_init_fs_ls_pclk_sel(phy_is_hs);
   let _ = dwc2_force_host_mode();
   // Task #325: FIFO RAM partition -- must happen once we're definitely
   // in host mode (matching U-Boot's own relative ordering: core host
@@ -37544,6 +37648,36 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
   // PORT_CONNECTION=bit0, PORT_ENABLE=bit1.
   if (port_status & (0x3 as u32)) != (0x3 as u32) {
     return 1;
+  }
+
+  // 2026-11-20 (real USB2.0 high-speed bring-up): PORT_HIGH_SPEED=
+  // bit10, PORT_LOW_SPEED=bit9 (neither set = full-speed) -- confirmed
+  // against the USB 2.0 hub class spec's wPortStatus layout, the same
+  // register this function already decoded PORT_CONNECTION/PORT_ENABLE
+  // from above. Once dwc2_select_phy_mode() lets the root port
+  // negotiate real high-speed, this onboard LAN9512 hub itself becomes
+  // an HS hub (confirmed live on a real PC via `lsusb -t`: both the
+  // hub and the RTL8188CU dongle behind it show 480M) -- any device
+  // that still negotiates FS/LS behind an HS hub needs Transaction-
+  // Translator split-transaction support (HCSPLT: SPLTENA/COMPSPLT/
+  // XACTPOS/HUBADDR/PRTADDR) to talk to at all, which this driver does
+  // not implement (confirmed via research: there is no safe way to
+  // skip this once the hub itself is genuinely HS -- the host
+  // controller's own non-split per-channel transaction logic simply
+  // does not work across a real HS hub to a non-HS device). Both
+  // devices this board actually has today (the LAN9512's own Ethernet
+  // function, and the RTL8188CU WiFi dongle) are expected to negotiate
+  // HS themselves, so this should never fire in practice -- but failing
+  // loudly and explicitly here, rather than silently feeding today's
+  // non-split channel logic to a topology it was never built for, is
+  // the honest thing to do if that assumption is ever wrong.
+  let root_speed: u32 = (mmio_read_u32(dwc2_hprt0_addr()) >> (17 as u32)) & (0x3 as u32);
+  let port_high_speed: u32 = (port_status >> (10 as u32)) & (1 as u32);
+  if (root_speed == (0 as u32)) && (port_high_speed == (0 as u32)) {
+    let _ = uart_puts("USB: downstream device on hub port ");
+    let _ = uart_put_hex32(port);
+    let _ = uart_puts(" negotiated full/low-speed behind a high-speed hub -- split-transaction support not yet implemented, declining to drive this device\n");
+    return 0 - 2;
   }
 
   // Task #325 (2026-10-02): same reset recovery time (TRSTRCY) fix as
