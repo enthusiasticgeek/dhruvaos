@@ -61834,10 +61834,21 @@ fn kernel_main() -> i64 {
   let _ = wifi_join_password_scratch_set(dhruva_alloc_bytes(64));
   let _ = wifi_join_ssid_scratch_set(dhruva_alloc_bytes(32));
   let _ = wifi_join_pmk_scratch_set(dhruva_alloc_bytes(32));
-  let _ = wifi_join_ctx_scratch_set(dhruva_alloc_bytes(169));
-  let _ = wifi_join_preq_scratch_set(dhruva_alloc_bytes(64));
+  // Round 2026-11-22: sized via the same symbolic constants
+  // assoc_request_build/probe_request_build/the WPA2_JOIN_* ctx
+  // offsets themselves use, not hardcoded literals -- these three
+  // were previously stuck at the OLD sizes (169/64/90) after those
+  // constants grew (188/80/110), silently overflowing this persistent
+  // scratch by as much as 19 bytes into whatever heap allocation
+  // happened to follow it on real hardware (QEMU happened not to
+  // surface it; see this project's own established never-free-heap-
+  // pattern convention -- these are allocated once at boot, reused
+  // every call, never through a per-call dhruva_alloc_bytes that a
+  // size mismatch would make merely wasteful instead of corrupting).
+  let _ = wifi_join_ctx_scratch_set(dhruva_alloc_bytes(WPA2_JOIN_CTX_SIZE as u32));
+  let _ = wifi_join_preq_scratch_set(dhruva_alloc_bytes(PROBE_REQ_MAX_LEN as u32));
   let _ = wifi_join_rx_scratch_set(dhruva_alloc_bytes(512));
-  let _ = wifi_join_mgmt_scratch_set(dhruva_alloc_bytes(90));
+  let _ = wifi_join_mgmt_scratch_set(dhruva_alloc_bytes(ASSOC_REQ_MAX_LEN as u32));
   let _ = wifi_join_eapol_rx_scratch_set(dhruva_alloc_bytes(140));
   let _ = wifi_join_eapol_tx_scratch_set(dhruva_alloc_bytes(99));
   let _ = wifi_join_gtk_scratch_set(dhruva_alloc_bytes(32));
