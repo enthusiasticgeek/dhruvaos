@@ -53355,9 +53355,25 @@ fn wpa2_join_start(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], s
 // needs the original probe-first state machine, since nothing handed
 // it a prior scan's own already-confirmed BSS info the way a real join
 // always has one available.
-fn wpa2_join_start_skip_probe(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, out: mut ref [u8; 80]) -> i64 {
+// Round 2026-11-22: this is the real wifi_real_join path's own entry
+// point into the ctx state machine, and it starts straight at
+// WAIT_AUTH_RESP (see this function's own header comment below for
+// why) -- meaning wpa2_join_step_mgmt's WAIT_PROBE_RESP handler,
+// where ap_cap_info/ap_rates normally get persisted into ctx, is
+// NEVER reached on this path. Without ap_cap_info/ap_rates threaded
+// through here too, assoc_request_build always saw a zeroed AP rate
+// set and failed every real-HW join with "no rate in common with the
+// AP" -- confirmed live. The caller gets these from wifi_scan_for_
+// ssid's own WifiScanResult (the real Probe Response or Beacon match
+// that found this AP in the first place already carried them).
+fn wpa2_join_start_skip_probe(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, ap_cap_info: i64, ap_rates: ref [u8; 16], ap_rates_len: i64, out: mut ref [u8; 80]) -> i64 {
   let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_AUTH_RESP as u32);
   let _ = buf_write_byte(ctx, WPA2_JOIN_SSID_LEN_OFF as u32, ssid_len as u32);
+  let _ = buf_write_byte(ctx, WPA2_JOIN_AP_CAPINFO_OFF as u32, (ap_cap_info & 0xff) as u32);
+  let _ = buf_write_byte(ctx, (WPA2_JOIN_AP_CAPINFO_OFF + 1) as u32, ((ap_cap_info >> 8) & 0xff) as u32);
+  let _ = buf_write_byte(ctx, WPA2_JOIN_AP_RATES_LEN_OFF as u32, ap_rates_len as u32);
+  let ari: i64 = 0;
+  while ari < ap_rates_len { let _ = buf_write_byte(ctx, (WPA2_JOIN_AP_RATES_OFF + ari) as u32, ap_rates[ari] as u32); ari = ari + 1; }
   let i: i64 = 0;
   while i < 6 {
     let _ = buf_write_byte(ctx, (WPA2_JOIN_BSSID_OFF + i) as u32, bssid[i] as u32);
@@ -54058,7 +54074,19 @@ fn wifi_scan_channel_at(i: i64) -> u32 {
 // on any of the 3 channels -- an expected, non-alarming outcome if the
 // AP is on a different channel, out of range, or simply didn't
 // respond to this particular probe, not a parse or protocol failure.
-fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, bssid_out: mut ref [u8; 6]) -> i64 {
+struct WifiScanResult { found: i64, cap_info: i64, rates_len: i64 }
+
+// Round 2026-11-22: previously returned a plain found/not-found i64,
+// with only bssid_out as an out-parameter. assoc_request_build now
+// needs the AP's own real Capability Information and Supported Rates
+// too (see its own header comment) -- rates_out2 is the same kind of
+// array out-parameter bssid_out/ssid_echo/rates_echo already are;
+// cap_info/rates_len are scalars, returned via WifiScanResult instead
+// of a mut-ref scalar out-parameter (this codebase has no established
+// pattern for the latter -- every existing `mut ref i64` parameter
+// elsewhere is a heap/buffer pointer, not a single written-through
+// scalar, so this avoids depending on something unverified).
+fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, bssid_out: mut ref [u8; 6], rates_out2: mut ref [u8; 16]) -> WifiScanResult {
   let preq: [u8; 80] = [0 as u8; 80];
   // seq_num=0: matches the literal `0` this function's own TX call for
   // this exact frame already passes to the TX descriptor below -- see
@@ -54129,6 +54157,9 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
   // whole investigation has been chasing, with no register or timing
   // bug required to explain it.
   let beacon_bssid_channel: u32 = 0 as u32;
+  let beacon_cap_info: i64 = 0;
+  let beacon_rates: [u8; 16] = [0 as u8; 16];
+  let beacon_rates_len: i64 = 0;
 
   let ci: i64 = 0;
   while ci < 3 {
@@ -54244,7 +54275,9 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
               bssid_out[bi] = a2[bi];
               bi = bi + 1;
             }
-            return 1;
+            let roi: i64 = 0;
+            while roi < info.rates_len { rates_out2[roi] = rates_echo[roi]; roi = roi + 1; }
+            return WifiScanResult { found: 1, cap_info: info.cap_info, rates_len: info.rates_len };
           }
         } else if (info.ok == 1) && (scan_stype == FC_STYPE_BEACON) && (beacon_bssid_found == 0) {
           // Fallback target (see this function's own header comment,
@@ -54271,6 +54304,10 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
               beacon_bssid[bi] = ba2[bi];
               bi = bi + 1;
             }
+            beacon_cap_info = info.cap_info;
+            beacon_rates_len = info.rates_len;
+            let bri: i64 = 0;
+            while bri < info.rates_len { beacon_rates[bri] = rates_echo[bri]; bri = bri + 1; }
             beacon_bssid_found = 1;
             beacon_bssid_channel = channel;
           }
@@ -54327,9 +54364,11 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
       bssid_out[bi] = beacon_bssid[bi];
       bi = bi + 1;
     }
-    return 1;
+    let bro: i64 = 0;
+    while bro < beacon_rates_len { rates_out2[bro] = beacon_rates[bro]; bro = bro + 1; }
+    return WifiScanResult { found: 1, cap_info: beacon_cap_info, rates_len: beacon_rates_len };
   }
-  return 0;
+  return WifiScanResult { found: 0, cap_info: 0, rates_len: 0 };
 }
 
 // Passive RX-only diagnostic (2026-11-10, "dig deeper" real-HW
@@ -54516,7 +54555,9 @@ fn wifi_real_join() -> i64 {
 
   let _ = uart_puts("wifi join: scanning for configured SSID on channels 1/6/11...\n");
   let bssid: [u8; 6] = [0 as u8; 6];
-  if wifi_scan_for_ssid(devaddr, mps_out, mps_in, ref own_mac, ref ssid, ssid_len, mut ref bssid) != 1 {
+  let scan_rates: [u8; 16] = [0 as u8; 16];
+  let scan_result: WifiScanResult = wifi_scan_for_ssid(devaddr, mps_out, mps_in, ref own_mac, ref ssid, ssid_len, mut ref bssid, mut ref scan_rates);
+  if scan_result.found != 1 {
     let _ = uart_puts("wifi join: never heard a Probe Response for the configured SSID\n");
     return 0 - 1;
   }
@@ -54529,7 +54570,7 @@ fn wifi_real_join() -> i64 {
   // straight to Authentication.
   let ctx: mut ref i64 = wifi_join_ctx_scratch_get();
   let preq: [u8; 80] = [0 as u8; 80];
-  let preq_len: i64 = wpa2_join_start_skip_probe(ctx, ref bssid, ref own_mac, ref ssid, ssid_len, mut ref preq);
+  let preq_len: i64 = wpa2_join_start_skip_probe(ctx, ref bssid, ref own_mac, ref ssid, ssid_len, scan_result.cap_info, ref scan_rates, scan_result.rates_len, mut ref preq);
   let preq_heap: mut ref i64 = wifi_join_preq_scratch_get();
   let p1i: i64 = 0;
   while p1i < preq_len {

@@ -476,15 +476,33 @@ const ASSOC_REQ_MAX_LEN: i64 = 110;
 // 0x0000 -- see probe_request_build's own header comment for the full
 // "why" (same bug, same fix, same investigation).
 //
-// ap_cap_info (round 2026-11-22): the Capability Information value the
-// AP itself advertised in its Probe Response (ProbeRespInfo.cap_info).
-// Short Preamble (bit 5, 0x0020) and Short Slot Time (bit 10, 0x0400)
-// are mirrored from it -- real driver stacks (wpa_supplicant/mac80211)
-// echo these two optional-capability bits back from the AP rather than
-// hardcoding them, and at least one real AP in this project's own
-// testing (status_code=19, "does not support short preamble") strictly
-// enforces the match. ESS/Privacy stay fixed: they describe this STA's
-// own request, not something to mirror.
+// ap_cap_info (round 2026-11-22, corrected): the Capability
+// Information value the AP itself advertised in its Probe Response
+// (ProbeRespInfo.cap_info). An earlier version of this fix copied it
+// verbatim, reasoning from the 2013 Realtek vendor driver's own
+// issue_assocreq (`_rtw_memcpy(pframe, rtw_get_capability_from_ie(...),
+// 2)`) -- but ground-truthing against the real, current Linux
+// mac80211 stack (net/mac80211/mlme.c, ieee80211_add_link_elems)
+// shows that is NOT how a modern, broadly-interoperable client
+// actually builds this field: mac80211 assembles it bit-by-bit from
+// local state instead of copying the AP's value --
+//   if (sband->band == NL80211_BAND_2GHZ) {
+//     *capab |= WLAN_CAPABILITY_SHORT_SLOT_TIME;
+//     *capab |= WLAN_CAPABILITY_SHORT_PREAMBLE;
+//   }
+// -- Short Preamble and Short Slot Time are set UNCONDITIONALLY for
+// 2.4GHz (this chip's only band), never mirrored from the AP; ESS is
+// unconditional (`capab |= WLAN_CAPABILITY_ESS` for pre-EHT
+// connections); only Privacy is actually taken from the AP's own
+// scanned capability
+// (`if (cbss->capability & WLAN_CAPABILITY_PRIVACY) capab |=
+// WLAN_CAPABILITY_PRIVACY;`); Spectrum Management and Radio
+// Measurement are both gated on local hardware/feature flags this
+// chip doesn't have, so neither is ever set. That is what this
+// function now does, matching mac80211 exactly rather than the older
+// vendor driver's different (and, per a real AP's status_code=19
+// rejection in this project's own testing, less correct for this
+// specific interop case) convention.
 fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, rsn_ie: ref [u8; 22], seq_num: i64, ap_cap_info: i64, ap_rates: ref [u8; 16], ap_rates_len: i64, out: mut ref [u8; 110]) -> i64 {
   out[0] = (FC_STYPE_ASSOC_REQ & (255 as i64)) as u8;
   out[1] = ((FC_STYPE_ASSOC_REQ >> 8) & (255 as i64)) as u8;
@@ -501,7 +519,7 @@ fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 
   out[22] = (seq_ctrl & (255 as i64)) as u8;
   out[23] = ((seq_ctrl >> 8) & (255 as i64)) as u8;
 
-  let capab_info: i64 = ap_cap_info;
+  let capab_info: i64 = 0x0001 | (ap_cap_info & 0x0010) | 0x0020 | 0x0400;
   out[24] = (capab_info & (255 as i64)) as u8;
   out[25] = ((capab_info >> 8) & (255 as i64)) as u8;
   let listen_interval: i64 = 10;
