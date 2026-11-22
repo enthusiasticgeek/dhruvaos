@@ -53540,6 +53540,14 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, seq
     let _ = buf_write_byte(ctx, WPA2_JOIN_AP_RATES_LEN_OFF as u32, info.rates_len as u32);
     let ri: i64 = 0;
     while ri < info.rates_len { let _ = buf_write_byte(ctx, (WPA2_JOIN_AP_RATES_OFF + ri) as u32, rates_out[ri] as u32); ri = ri + 1; }
+    let _ = uart_puts("wifi join DIAG: parsed probe-response cap_info=0x");
+    let _ = uart_put_hex32(info.cap_info as u32);
+    let _ = uart_puts(" rates_len=");
+    let _ = uart_put_i64(info.rates_len);
+    let _ = uart_puts(" rates=");
+    let rdi: i64 = 0;
+    while rdi < info.rates_len { let _ = uart_put_hex32(rates_out[rdi] as u32); let _ = uart_puts(" "); rdi = rdi + 1; }
+    let _ = uart_puts("\n");
     let auth_frame: [u8; 30] = [0 as u8; 30];
     let alen: i64 = auth_request_build(ref bssid, ref own_mac, seq_num, mut ref auth_frame);
     let j: i64 = 0;
@@ -53581,6 +53589,14 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, seq
     let ap_rates: [u8; 16] = [0 as u8; 16];
     k = 0;
     while k < ap_rates_len { ap_rates[k] = buf_read_byte(ctx, (WPA2_JOIN_AP_RATES_OFF + k) as u32) as u8; k = k + 1; }
+    let _ = uart_puts("wifi join DIAG: read back ap_cap_info=0x");
+    let _ = uart_put_hex32(ap_cap_info as u32);
+    let _ = uart_puts(" ap_rates_len=");
+    let _ = uart_put_i64(ap_rates_len);
+    let _ = uart_puts(" ap_rates=");
+    let rdj: i64 = 0;
+    while rdj < ap_rates_len { let _ = uart_put_hex32(ap_rates[rdj] as u32); let _ = uart_puts(" "); rdj = rdj + 1; }
+    let _ = uart_puts("\n");
     let alen2: i64 = assoc_request_build(ref bssid, ref own_mac, ref ssid, ssid_len, ref rsn, seq_num, ap_cap_info, ref ap_rates, ap_rates_len, out);
     if alen2 == 0 {
       let _ = uart_puts("wifi join DIAG: no rate in common with the AP -- cannot build Association Request\n");
