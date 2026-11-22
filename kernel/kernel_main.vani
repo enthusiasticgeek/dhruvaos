@@ -54547,6 +54547,21 @@ fn wifi_real_join() -> i64 {
   // same field data_frame_parse_eapol itself reads) before calling that
   // parser, so the next real-HW run says which of these it actually is.
   let eapol_data_type_count: i64 = 0;
+  // BUG CANDIDATE 2026-11-22 (eapol_state_before=5/wait-msg3 live data:
+  // MSG1 now processed and MSG2 sent, yet MSG3 never arrives within
+  // the full WIFI_RX_POLL_CAP(50) budget this phase gets reset to).
+  // dwc2_wait_chan0_done_bounded's own timeout is wall-clock (TIMER_
+  // CLO-based, max_tries*2us), but if the chip NAKs an empty bulk-IN
+  // fast, each of these 50 outer polls could complete in microseconds
+  // -- the WHOLE phase could finish in well under the real time any
+  // AP needs to process a Message 2 and reply, exactly the same "we
+  // didn't actually wait" shape as the already-reverted 2026-10-25
+  // "500ms-per-miss sleep... had nothing to do with the AP's real
+  // response time" fix elsewhere in this same function -- that fix
+  // removed a WRONG-SHAPED delay; it did not prove zero delay is
+  // enough. Measuring real elapsed time directly rather than guessing
+  // again.
+  let eapol_phase_t0: u32 = mmio_read_u32(TIMER_CLO);
   while (connected == 0) && (eapol_iter < WIFI_RX_POLL_CAP) {
     // 2026-10-25 fix: same gap, same reason -- see wifi_scan_for_ssid's
     // own identical fix's header comment above for the full "why". This
@@ -54626,6 +54641,7 @@ fn wifi_real_join() -> i64 {
         if er.state != eapol_state_before {
           eapol_iter = 0 - 1;
           eapol_state_before = er.state;
+          eapol_phase_t0 = mmio_read_u32(TIMER_CLO);
         }
       }
     }
@@ -54653,6 +54669,12 @@ fn wifi_real_join() -> i64 {
     let _ = uart_puts("wifi join: CONNECTED (4-way handshake complete, TK/GTK installed)\n");
     return 0;
   }
+  let eapol_phase_elapsed_us: u32 = wrapping_sub(mmio_read_u32(TIMER_CLO), eapol_phase_t0);
+  let _ = uart_puts("wifi join DIAG: EAPOL current-phase real elapsed time=");
+  let _ = uart_put_i64(eapol_phase_elapsed_us as i64);
+  let _ = uart_puts(" us over ");
+  let _ = uart_put_i64(eapol_iter);
+  let _ = uart_puts(" polls (near-zero means the loop spun through without giving the AP any real response time)\n");
   let _ = uart_puts("wifi join: 4-way handshake never completed, eapol_state_before=");
   let _ = uart_put_i64(eapol_state_before);
   let _ = uart_puts(" (");
