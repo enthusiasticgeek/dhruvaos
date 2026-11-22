@@ -48,38 +48,24 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KMAIN="$ROOT/kernel/kernel_main.vani"
 
 # 2026-10-31: this script used to just trust whatever build/dhruva.elf
 # and build/stage0.elf already happened to be sitting on disk -- which
 # meant a card from this, the project's own "first full real-hardware
-# setup" script, shipped with WATCHDOG_ENABLE_FOR_REAL_HARDWARE off
-# unless someone remembered to separately run deploy_realhw_
-# watchdog.sh afterward (exactly what happened, by hand, more than
-# once in a single real-HW session before this fix). Builds its own
-# watchdog-armed artifacts now, every time, the same flip-build-revert-
-# via-trap shape deploy_realhw_watchdog.sh already uses -- so a fresh
-# card from this script is never unprotected by omission. The checked-
-# in default stays 0 (QEMU's raspi1ap machine model does not honor
-# PM_WDOG's timeout field and resets immediately if it's ever armed --
-# see kernel_main.vani's own header comment on these two constants --
-# so test/phase4_milestone.py's regression needs them off); this
-# script flips them on only for the real-hardware artifacts it builds
-# here, then reverts the working tree on exit regardless of outcome.
-cleanup_watchdog_flags() {
-    echo "=== Restoring kernel_main.vani's watchdog flags to their checked-in 0 ==="
-    sed -i 's/^const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 1;/const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 0;/' "$KMAIN"
-    sed -i 's/^const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 1;/const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 0;/' "$KMAIN"
-    if grep -q '^const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 1;' "$KMAIN" || \
-       grep -q '^const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 1;' "$KMAIN"; then
-        echo "WARNING: kernel_main.vani's watchdog flags did NOT revert to 0 -- check by hand:" >&2
-        grep -n '^const WATCHDOG_ENABLE_FOR_REAL_HARDWARE\|^const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE' "$KMAIN" >&2
-    fi
-    echo "=== Rebuilding the normal (flags=0) build/dhruva.elf + build/stage0.elf so they match checked-in source ==="
-    "$ROOT/build.sh" >/tmp/flash_sd_card_revert_build.log 2>&1 || echo "WARNING: revert build failed, see /tmp/flash_sd_card_revert_build.log" >&2
-    "$ROOT/build_stage0.sh" >/tmp/flash_sd_card_revert_build_stage0.log 2>&1 || echo "WARNING: revert build_stage0 failed, see /tmp/flash_sd_card_revert_build_stage0.log" >&2
-}
-trap cleanup_watchdog_flags EXIT
+# setup" script, shipped with the watchdog off unless someone
+# remembered to separately run a real-HW-flagged build afterward
+# (exactly what happened, by hand, more than once in a single real-HW
+# session before this fix).
+#
+# REVISED 2026-11-21: used to fix that by sed-patching kernel_main.
+# vani's two watchdog consts to 1, building, then reverting on exit via
+# a trap -- both binaries now detect real hardware vs QEMU themselves
+# at runtime instead (kernel_main.vani's hardware_is_real_hw_get(),
+# boot/hwdetect_state.S; stage0_main.c's own matching stage0_detect_
+# real_hardware() -- see either call site's own comment for the
+# verified detection mechanism and its fail-safe-to-0 default), so a
+# plain build below is already correct for both QEMU and real
+# hardware -- nothing to patch, nothing to revert, no trap needed.
 # 18MiB (was 8MiB until the A/B kernel-slot feature, 2026-10-11): widened
 # to make room for the new slot-state record + two 6MiB kernel payload
 # slots (blocks 9216-34815) below the partition, alongside DharaFS's own
@@ -149,11 +135,8 @@ done
 # would crash immediately if loaded at 0x8000 directly (every absolute/
 # PC-relative reference in it is baked in for the relocated address).
 
-echo "=== Building stage0 (pre-jump watchdog armed) and the real kernel (its own watchdog enabled) ==="
-STAGE0_CFLAGS="-DSTAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE=1" "$ROOT/build_stage0.sh"
-sed -i 's/^const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 0;/const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 1;/' "$KMAIN"
-sed -i 's/^const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 0;/const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 1;/' "$KMAIN"
-grep -n '^const WATCHDOG_ENABLE_FOR_REAL_HARDWARE\|^const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE' "$KMAIN"
+echo "=== Building stage0 and the real kernel (both self-detect real hardware at runtime) ==="
+"$ROOT/build_stage0.sh"
 "$ROOT/build.sh"
 
 echo "=== Target device details (VERIFY this is your SD card, not a disk you care about) ==="

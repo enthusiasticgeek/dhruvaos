@@ -44,7 +44,7 @@
  * drilling): stage0 used to jump to the chosen slot with NOTHING
  * armed to recover it if that slot hangs before the real kernel's own
  * watchdog_kick() calls ever run (kernel/kernel_main.vani's own
- * WATCHDOG_ENABLE_FOR_REAL_HARDWARE, gated off by default) -- exactly
+ * hardware_is_real_hw_get(), fail-safe-off by default) -- exactly
  * the case for a deliberately-bad kernel (boot/badkernel/bad_entry.S,
  * a bare infinite self-branch) used to drill the auto-revert path,
  * and for any of the three real, QEMU-invisible hangs this same round
@@ -53,36 +53,99 @@
  * no one physically at the board, a hang here has NO recovery path at
  * all except a physical power cycle.
  *
- * Off (0) by default, same convention as WATCHDOG_ENABLE_FOR_REAL_
- * HARDWARE -- QEMU's raspi1ap resets the WHOLE emulated machine
- * IMMEDIATELY on the very first PM_RSTC write regardless of the
- * timeout value actually requested (this file's own sibling comment
- * in kernel_main.vani documents this, confirmed against QEMU's own
- * source), so leaving this unconditionally on would make every
- * existing QEMU-driven regression test (phase4_milestone.py,
- * phase5_markbootgood_test.py, ...) immediately "reset" the instant
- * this code ran, long before any of them could reach PASS. A real
- * preprocessor #if (unlike kernel_main.vani's own runtime `if const
- * == 1`, forced by vani having no conditional compilation) means this
- * compiles out to literally nothing when off -- flip to 1 and rebuild
- * stage0.img specifically before a real, unattended deployment (and
- * flip kernel_main.vani's own matching
- * STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE to 1 too, so a
- * healthy boot disarms this at PASS instead of getting reset by its
- * own safety net mid-session).
- *
- * TASK #353 FOLLOW-UP (2026-10-15): made build-time overridable via
- * -D on the command line (build_stage0.sh's own STAGE0_CFLAGS env
- * var) instead of only a hand-edit-build-revert cycle on this literal
- * -- same real deployment this was always meant for, just without the
- * risk of forgetting to revert a hand edit to the checked-in default
- * before the next ordinary QEMU-driven build. Checked-in default
- * stays 0, unchanged. */
-#ifndef STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
-#define STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE 0
-#endif
+ * REVISED 2026-11-21 (user: "auto detect qemu or real hw... this
+ * should be true stage0 and kernel"): this used to be a compile-time
+ * `#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE`, overridable via
+ * build_stage0.sh's own STAGE0_CFLAGS -D (task #353 follow-up,
+ * 2026-10-15) specifically to avoid a hand-edit-build-revert cycle on
+ * the literal -- but that was still a second, separately-tracked
+ * build variant someone has to remember to invoke. stage0_detect_
+ * real_hardware() below replaces it with the same runtime mailbox
+ * probe kernel_main.vani's hardware_is_real_hw_get() uses (GET_
+ * FIRMWARE_REVISION, tag 0x00000001 -- QEMU's own real source,
+ * hw/misc/bcm2835_property.c, answers this exact tag with an
+ * unconditional hardcoded 346337 regardless of machine-model config;
+ * real Pi firmware answers with its own genuine build revision
+ * instead, so "exactly 346337" is a QEMU fingerprint, not a guess).
+ * Same fail-safe direction as the kernel side: any mailbox timeout or
+ * unexpected response also resolves to "not real" (0) -- QEMU's
+ * raspi1ap still resets the WHOLE emulated machine IMMEDIATELY on the
+ * very first PM_RSTC write regardless of timeout value (confirmed
+ * against QEMU's own source), so a wrong "real" verdict here would
+ * make every existing QEMU-driven regression test (phase4_milestone.py,
+ * phase5_markbootgood_test.py, ...) immediately "reset" instead of
+ * reaching PASS -- the exact failure mode this gate has always existed
+ * to prevent, just now avoided by a verified runtime check instead of
+ * a second binary nobody has to remember to build. */
+#define MBOX_READ_REG   0x2000B880u
+#define MBOX_STATUS_REG 0x2000B898u
+#define MBOX_WRITE_REG  0x2000B8A0u
+#define MBOX_FULL_BIT   0x80000000u
+#define MBOX_EMPTY_BIT  0x40000000u
+#define QEMU_FIRMWARE_REVISION_FINGERPRINT 346337u
 
-#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
+static unsigned int stage0_mbox_probe_is_real_hardware(void) {
+    static unsigned int mbox_buf[8] __attribute__((aligned(16)));
+    volatile unsigned int *status_reg = (volatile unsigned int *)MBOX_STATUS_REG;
+    volatile unsigned int *write_reg = (volatile unsigned int *)MBOX_WRITE_REG;
+    volatile unsigned int *read_reg = (volatile unsigned int *)MBOX_READ_REG;
+    unsigned int msg, i;
+
+    mbox_buf[0] = 28;                   /* total size (bytes) */
+    mbox_buf[1] = 0;                    /* request code */
+    mbox_buf[2] = 0x00000001u;          /* tag: get firmware revision */
+    mbox_buf[3] = 4;                    /* value buffer size */
+    mbox_buf[4] = 0;                    /* tag req/resp code */
+    mbox_buf[5] = 0;                    /* response word (VC fills this in) */
+    mbox_buf[6] = 0;                    /* end tag */
+
+    /* Same DMB-before-handoff reasoning as every other mailbox call in
+     * this codebase (boot/governor_state.S's own header comment has
+     * the full "why") -- a genuinely separate hardware bus master
+     * reads this buffer via its own path. */
+    __asm__ volatile ("mcr p15, 0, %0, c7, c10, 5" :: "r"(0) : "memory");
+
+    msg = ((unsigned int)mbox_buf & ~0xFu) | 8u; /* channel 8: property tags */
+
+    for (i = 0; i < 100000u; i = i + 1) {
+        if ((*status_reg & MBOX_FULL_BIT) == 0) {
+            break;
+        }
+    }
+    if (i == 100000u) {
+        return 0u; /* timed out -- fail-safe: treat as not real */
+    }
+
+    *write_reg = msg;
+    __asm__ volatile ("mcr p15, 0, %0, c7, c10, 5" :: "r"(0) : "memory");
+
+    for (i = 0; i < 100000u; i = i + 1) {
+        if (((*status_reg & MBOX_EMPTY_BIT) == 0) && (*read_reg == msg)) {
+            break;
+        }
+    }
+    if (i == 100000u) {
+        return 0u; /* timed out -- fail-safe: treat as not real */
+    }
+
+    if (mbox_buf[1] != 0x80000000u) {
+        return 0u; /* overall call itself failed -- fail-safe: treat as not real */
+    }
+    return (mbox_buf[5] != QEMU_FIRMWARE_REVISION_FINGERPRINT) ? 1u : 0u;
+}
+
+/* Probes once (the mailbox round trip costs real time -- no reason to
+ * repeat it across this file's 3 call sites), caches the result. */
+static unsigned int stage0_detect_real_hardware(void) {
+    static unsigned int done = 0;
+    static unsigned int result = 0;
+    if (!done) {
+        result = stage0_mbox_probe_is_real_hardware();
+        done = 1;
+    }
+    return result;
+}
+
 /* 2026-10-24 follow-up (real-HW SHA-mismatch halt investigation): this
  * used to be armed exactly once, right before the final jump -- it
  * only ever covered a hang in the JUMPED-TO kernel, never any failure
@@ -144,7 +207,6 @@ static void stage0_arm_watchdog(void) {
     *rstc = password | (cur & wrcfg_clr) | wrcfg_full_reset;
     __asm__ volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r"(0) : "memory");
 }
-#endif
 
 extern void u_putc(char c);
 extern void u_puts(const char *s);
@@ -343,9 +405,9 @@ static int stage0_sd_read_block_retry(unsigned int block_num, void *buf) {
     int rc = -9;
     int attempt;
     for (attempt = 0; attempt < 3 && rc != 0; attempt = attempt + 1) {
-#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
-        stage0_arm_watchdog();
-#endif
+        if (stage0_detect_real_hardware()) {
+            stage0_arm_watchdog();
+        }
         if (attempt > 0) {
             stage0_sd_init();
         }
@@ -370,9 +432,9 @@ void stage0_main(void) {
     u_hex32(stage0_read_pm_rsts());
     u_puts(" (nonzero implies a prior software PM_RSTC write; all-zero is consistent with a real power-on/brown-out)\n");
 
-#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
-    stage0_arm_watchdog();
-#endif
+    if (stage0_detect_real_hardware()) {
+        stage0_arm_watchdog();
+    }
 
     rc = stage0_sd_init();
     if (rc != 0) {
@@ -512,9 +574,9 @@ void stage0_main(void) {
     u_hex32(len_bytes);
     u_puts("\n");
 
-#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
-    stage0_arm_watchdog();
-#endif
+    if (stage0_detect_real_hardware()) {
+        stage0_arm_watchdog();
+    }
 
     /* 2026-10-24 follow-up (real-HW reboot-loop found live, same day as
      * the fix below's own predecessor): arming once before this loop
@@ -540,11 +602,11 @@ void stage0_main(void) {
     nblocks = (len_bytes + BLOCK_SIZE - 1u) / BLOCK_SIZE;
     dest = (unsigned char *)REAL_KERNEL_LOAD_ADDR;
     for (i = 0; i < nblocks; i = i + 1) {
-#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
-        if ((i & 511u) == 0u) {
-            stage0_arm_watchdog();
+        if (stage0_detect_real_hardware()) {
+            if ((i & 511u) == 0u) {
+                stage0_arm_watchdog();
+            }
         }
-#endif
         /* See stage0_sd_read_block_retry's own header comment for the
          * full "why" -- this exact, unretried call was what a real
          * board actually hit mid-session, halting with no recovery
@@ -565,9 +627,9 @@ void stage0_main(void) {
         dest = dest + BLOCK_SIZE;
     }
 
-#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
-    stage0_arm_watchdog();
-#endif
+    if (stage0_detect_real_hardware()) {
+        stage0_arm_watchdog();
+    }
 
     {
         struct sha256_ctx ctx;
@@ -592,9 +654,9 @@ void stage0_main(void) {
             if (this_len > sha_chunk) {
                 this_len = sha_chunk;
             }
-#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
-            stage0_arm_watchdog();
-#endif
+            if (stage0_detect_real_hardware()) {
+                stage0_arm_watchdog();
+            }
             sha256_update(&ctx, (const unsigned char *)(unsigned long)(REAL_KERNEL_LOAD_ADDR + sha_off), this_len);
             sha_off = sha_off + this_len;
         }
@@ -658,9 +720,9 @@ void stage0_main(void) {
 
     u_puts("stage0: verified, jumping to 0x00200000\n");
 
-#if STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE
-    stage0_arm_watchdog();
-#endif
+    if (stage0_detect_real_hardware()) {
+        stage0_arm_watchdog();
+    }
 
     {
         /* Task #308 follow-up: pack the reset reason into the upper

@@ -38,6 +38,21 @@ wifi_efuse_ofdmbase_a:
 wifi_efuse_mcsbase_a:
     .space 3
 
+/* Round 2026-11-21: the dongle's own real, factory-burned MAC address
+ * (EFUSE logical offset 0x16, 6 bytes) -- this parse already proved it
+ * reconstructs this field correctly during development (it matched a
+ * real captured chip's own known MAC), but nothing ever stored or used
+ * it: wifi_real_own_mac() has always returned a synthetic, invented
+ * address instead (two prior round's own "is this AP's anti-spoofing
+ * heuristic rejecting a synthetic-looking MAC" experiments, neither of
+ * which used the dongle's own TRUE individual address -- see that
+ * function's own header comment). Same "ground truth" principle as
+ * everywhere else this investigation already applies: the one real
+ * Linux client that's ever actually associated with this AP used
+ * exactly this address, not an invented one. */
+wifi_efuse_mac:
+    .space 6
+
 .section ".text"
 .global wifi_efuse_get_parsed_ok
 wifi_efuse_get_parsed_ok:
@@ -69,5 +84,11 @@ wifi_efuse_ofdmbase_a_get:
 .global wifi_efuse_mcsbase_a_get
 wifi_efuse_mcsbase_a_get:
     ldr r0, =wifi_efuse_mcsbase_a
+    mov r1, #0
+    bx lr
+
+.global wifi_efuse_mac_get
+wifi_efuse_mac_get:
+    ldr r0, =wifi_efuse_mac
     mov r1, #0
     bx lr

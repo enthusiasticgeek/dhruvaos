@@ -199,17 +199,24 @@ int dprintf(int fd, const char *fmt, ...) {
  * period left to protect, so faster recovery is strictly better than
  * the 15-second budget normal operation needs.
  *
- * Gated by EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE (a -D compile flag, see
- * build.sh's own ${RUNTIME_STUBS_CFLAGS:-} and build_real_hw.sh's own
- * matching STAGE0_CFLAGS convention) rather than a runtime check
- * against kernel_main.vani's WATCHDOG_ENABLE_FOR_REAL_HARDWARE -- this
- * is a plain C file with no visibility into that vani-side constant,
- * and QEMU's raspi1ap resets the whole emulated machine immediately on
- * ANY PM_RSTC write (same reason every other real-HW-only watchdog
- * write in this codebase is compile-time gated, not runtime-gated),
- * so this must default OFF and only compile in for an actual real-HW
- * build. */
-#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
+ * REVISED 2026-11-21 (user: "auto detect qemu or real hw... so you
+ * dont have to track manually"): used to be gated by a -D compile flag
+ * (EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE, build.sh's own
+ * ${RUNTIME_STUBS_CFLAGS:-} and build_real_hw.sh's own matching
+ * STAGE0_CFLAGS convention), specifically BECAUSE this plain C file
+ * had no visibility into kernel_main.vani's own WATCHDOG_ENABLE_FOR_
+ * REAL_HARDWARE constant. That's no longer the blocker: the detection
+ * now lives in boot/hwdetect_state.S, a separate assembly translation
+ * unit this file already links against, so a plain `extern` call
+ * works across that boundary same as any other cross-TU C call. QEMU's
+ * raspi1ap still resets the whole emulated machine immediately on ANY
+ * PM_RSTC write (unchanged reason this must still default OFF under
+ * QEMU) -- hardware_is_real_hw_get() reads a flag kernel_main.vani set
+ * once, early in boot, from a verified-against-QEMU's-real-source
+ * mailbox probe (see that call site's own comment), fail-safe to 0
+ * (don't arm) on any doubt. */
+extern unsigned int hardware_is_real_hw_get(void);
+
 static void exit_panic_watchdog_arm(void) {
     volatile unsigned int *pm_rstc = (volatile unsigned int *)0x2010001C;
     volatile unsigned int *pm_wdog = (volatile unsigned int *)0x20100024;
@@ -223,7 +230,6 @@ static void exit_panic_watchdog_arm(void) {
     cur = *pm_rstc;
     *pm_rstc = pm_password | (cur & wrcfg_clr) | wrcfg_full_reset;
 }
-#endif
 
 void exit(int code) {
     (void)code;
@@ -241,10 +247,10 @@ void exit(int code) {
         }
     }
     dhruva_dprintf_putc('\n');
-#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
-    dhruva_dprintf_puts("panic: arming a last-resort 2s watchdog reset before halting\n");
-    exit_panic_watchdog_arm();
-#endif
+    if (hardware_is_real_hw_get()) {
+        dhruva_dprintf_puts("panic: arming a last-resort 2s watchdog reset before halting\n");
+        exit_panic_watchdog_arm();
+    }
     while (1) {
         /* halt -- there is no OS to return to (unless the watchdog
          * arm above fires first on a real-HW build) */
@@ -464,18 +470,19 @@ static void dhruva_oom_fatal(unsigned long requested, unsigned long used, int in
     }
     /* BUG FOUND 2026-11-16 (real board hang, confirmed never recovered):
      * this halt is a raw `while(1)`, completely independent of exit()'s
-     * own halt loop below -- the EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE fix
-     * added to exit() (see that function's own header comment) never
-     * executes for an OOM halt reached straight from dhruva_alloc_bytes,
-     * which is exactly what happened: a real heap-exhaustion FATAL hung
-     * the board for 90+ seconds with no recovery, requiring a physical
-     * power cycle. Same fix, same gate, called directly here instead of
-     * relying on every possible halt path remembering to route through
-     * exit() first. */
-#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
-    dhruva_oom_puts("FATAL: arming a last-resort 2s watchdog reset before halting\n");
-    exit_panic_watchdog_arm();
-#endif
+     * own halt loop below -- the watchdog-arm fix added to exit() (see
+     * that function's own header comment, now runtime-gated by
+     * hardware_is_real_hw_get() same as here) never executes for an OOM
+     * halt reached straight from dhruva_alloc_bytes, which is exactly
+     * what happened: a real heap-exhaustion FATAL hung the board for
+     * 90+ seconds with no recovery, requiring a physical power cycle.
+     * Same fix, same gate, called directly here instead of relying on
+     * every possible halt path remembering to route through exit()
+     * first. */
+    if (hardware_is_real_hw_get()) {
+        dhruva_oom_puts("FATAL: arming a last-resort 2s watchdog reset before halting\n");
+        exit_panic_watchdog_arm();
+    }
     while (1) {
         /* halt -- there is no safe way to continue with a request this
          * function could not satisfy (unless the watchdog arm above

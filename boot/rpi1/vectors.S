@@ -263,10 +263,22 @@ fault_data_abort:
      * reason. Same register protocol, written directly here (not a
      * call out to the C helper) since that function is `static` and
      * this halt must work standalone, consistent with this file's own
-     * "must work even in a corrupted state" philosophy. Gated the same
-     * way as runtime_stubs.c's own fix (EXIT_WATCHDOG_ARM_FOR_REAL_
-     * HARDWARE, see build.sh's VECTORS_CFLAGS and build_real_hw.sh). */
-#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
+     * "must work even in a corrupted state" philosophy.
+     *
+     * REVISED 2026-11-21 (user: "auto detect qemu or real hw... so you
+     * dont have to track manually"): was gated by a compile-time
+     * `#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE` (build.sh's
+     * VECTORS_CFLAGS, build_real_hw.sh); now reads hardware_is_real_hw_
+     * get() (boot/hwdetect_state.S) instead -- a plain 3-instruction
+     * load-and-return with no stack use at all, safe to call even from
+     * a possibly-corrupted fault context, and it only ever reads a
+     * flag some EARLIER, healthy boot moment already cached -- it does
+     * NOT re-run the mailbox probe here. See that flag's own kernel_
+     * main.vani call site for the full detection mechanism and its
+     * fail-safe-to-0 (don't arm) default. */
+    bl hardware_is_real_hw_get
+    cmp r0, #0
+    beq fault_data_abort_skip_wdog
     ldr r0, =0x20100024 /* PM_WDOG */
     ldr r1, =0x5A020000 /* password | 2-second timeout (2 << 16) */
     str r1, [r0]
@@ -277,7 +289,7 @@ fault_data_abort:
     ldr r2, =0x5A000000
     orr r1, r1, r2
     str r1, [r0]
-#endif
+fault_data_abort_skip_wdog:
     b .
 
 .global fault_prefetch_abort
@@ -337,9 +349,12 @@ fault_prefetch_abort:
      * of trying to live-read sp_usr). */
     mrs r0, spsr
     bl abort_dump_task_stacks
-    /* Same 2026-11-16 fix as fault_data_abort's own identical halt --
-     * see that call site's own header comment for the full "why". */
-#ifdef EXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE
+    /* Same 2026-11-16 fix, now 2026-11-21-revised the same way, as
+     * fault_data_abort's own identical halt -- see that call site's
+     * own header comment for the full "why". */
+    bl hardware_is_real_hw_get
+    cmp r0, #0
+    beq fault_prefetch_abort_skip_wdog
     ldr r0, =0x20100024 /* PM_WDOG */
     ldr r1, =0x5A020000 /* password | 2-second timeout (2 << 16) */
     str r1, [r0]
@@ -350,5 +365,5 @@ fault_prefetch_abort:
     ldr r2, =0x5A000000
     orr r1, r1, r2
     str r1, [r0]
-#endif
+fault_prefetch_abort_skip_wdog:
     b .

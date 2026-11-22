@@ -541,6 +541,45 @@ extern "C" fn dharafs_suspect_last_generation_get() -> u32;
 extern "C" fn dharafs_suspect_last_pool_slot_set(v: u32) -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_suspect_last_pool_slot_get() -> u32;
+// Bare-"ls" result cache (2026-11-21, boot/dharafs_lscache_state.S) --
+// see that file's own header comment for the full "why".
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_buf_set(addr: mut ref i64) -> i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_buf_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_valid_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_valid_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_capturing_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_capturing_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_overflow_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_overflow_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_log_start_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_log_start_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_next_block_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_next_block_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_byte_len_set(v: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dharafs_lscache_byte_len_get() -> u32;
+// Runtime real-hardware-vs-QEMU detection (2026-11-21, boot/hwdetect_
+// state.S) -- see hardware_is_real_hw_get's own call site comment
+// (kernel_main, right before watchdog_init) for the full "why".
+#[stack_cost(bytes=1)]
+extern "C" fn hardware_is_real_hw_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn hardware_is_real_hw_set(v: u32) -> u32;
+#[stack_cost(bytes=28)]
+extern "C" fn hwdetect_probe_real_hardware() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn dharafs_stat_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -2147,6 +2186,14 @@ extern "C" fn usb_power_off() -> i64;
 extern "C" fn usb_probe0_pending_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_probe0_pending_set(value: u32) -> i64;
+// 2026-11-20 (real-HW USB2.0 HS bring-up, root-cause follow-up): see
+// boot/usb_power_state.S's own header comment on dwc2_phy_is_hs for
+// the full "why" -- dwc2_reassert_core_config_post_port_reset() needs
+// to know which PHY mode dwc2_select_phy_mode() actually selected.
+#[stack_cost(bytes=1)]
+extern "C" fn dwc2_phy_is_hs_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn dwc2_phy_is_hs_set(value: u32) -> i64;
 // Round 35 (boot/scratch_state.S): dwc2_bulk_out/dwc2_bulk_in's own
 // dedicated 512-byte DMA buffer, separate from dwc2_dma_scratch (64
 // bytes, control transfers only) -- see that state file's own comment
@@ -3345,6 +3392,37 @@ extern "C" fn usb_wifi_fw_upload_len_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_fw_upload_len_set(value: u32) -> u32;
 
+// Round 2026-11-21: runtime TX-pipeline trace (last frame handed to
+// dwc2_wifi_bulk_out) -- see boot/wifi_txtrace_state.S's own comment.
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_bytes_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_begin(devaddr: u32, epaddr: u32, mps: u32, out_len: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_set_usb(hctsiz_written: u32, hcchar_written: u32, hcint_result: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_set_after(hctsiz_after: u32, hcchar_after: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_valid_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_devaddr_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_epaddr_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mps_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_out_len_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_hctsiz_written_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_hcchar_written_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_hcint_result_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_hctsiz_after_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_hcchar_after_get() -> u32;
+
 // Round 2026-11-18: EFUSE-derived per-channel-group TX power state --
 // see boot/wifi_efuse_state.S's own comment.
 #[stack_cost(bytes=1)]
@@ -3357,6 +3435,11 @@ extern "C" fn wifi_efuse_cck_a_get() -> mut ref i64;
 extern "C" fn wifi_efuse_ofdmbase_a_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn wifi_efuse_mcsbase_a_get() -> mut ref i64;
+// Round 2026-11-21: the dongle's own real EFUSE-burned MAC (logical
+// offset 0x16) -- see boot/wifi_efuse_state.S's own comment and
+// wifi_real_own_mac's own header comment for the full "why".
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_efuse_mac_get() -> mut ref i64;
 // A/B kernel slots (task #308): persistent scratch for `kernelupload`/
 // `kernelslot` -- see boot/kernelupload_state.S's own header comment.
 #[stack_cost(bytes=1)]
@@ -5292,7 +5375,7 @@ fn uart_putc(c: i64) -> i64 {
     // as dangerous as the one already fixed in uart_puts.
     let putc_pre_busy_t0: u32 = mmio_read_u32(TIMER_CLO);
     while (dma_uart_tx_busy() == (1 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), putc_pre_busy_t0) < (200000 as u32)) {
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         let _ = watchdog_kick();
       }
     }
@@ -5643,7 +5726,7 @@ fn uart_puts(s: Str) -> i64 {
     // speed-dependent guess.
     let pre_busy_t0: u32 = mmio_read_u32(TIMER_CLO);
     while (dma_uart_tx_busy() == (1 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), pre_busy_t0) < (200000 as u32)) {
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         let _ = watchdog_kick();
       }
     }
@@ -6808,23 +6891,40 @@ fn timer_clear_stale_match_before_handoff() -> i64 {
 // project's own docs already frame in ASIL-D/DO-178C-grade terms
 // (#[wcet(...)]'s own header comment), an unarmed watchdog combined
 // with halt-forever fault handlers is precisely the kind of gap real
-// safety certification would block on. Fixed via a single source-level
-// gate (WATCHDOG_ENABLE_FOR_REAL_HARDWARE below) rather than a runtime
-// QEMU-vs-real-hardware heuristic -- vani has no preprocessor/
-// conditional-compilation, and a runtime heuristic guessing "am I
-// under QEMU" is itself a real, fragile thing to get wrong (a false
-// positive on real hardware would silently ship with no watchdog
-// again; a false negative under some future QEMU machine type could
-// resume the exact permanently-unbootable failure mode this constant
-// exists to prevent). Left at 0 (disabled) as this project's own
-// checked-in default, matching its actual day-to-day QEMU-driven
-// development loop -- flip to 1 and rebuild before flashing an image
-// intended for real, unattended hardware deployment. PM_WDOG/PM_RSTC
-// both require a magic password in their top byte on every write, or
-// the write is silently ignored -- not optional, not a Dhruva
-// convention, this is how the peripheral itself is gated against
-// accidental writes.
-const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = 0;
+// safety certification would block on.
+//
+// REVISED 2026-11-21 (user: "it should auto detect qemu or real hw...
+// so you dont have to track manually"): this used to be a compile-time
+// `const`, gated via build_real_hw.sh's own sed-patch-build-revert
+// dance (vani has no preprocessor/conditional-compilation, so shipping
+// two different binaries was the only way to get this to differ at
+// all) -- and that manual two-binary tracking already caused a real
+// mistake THIS session: a fix got verified with a plain ./build.sh and
+// the stale pre-fix real-HW image got flashed instead, because the
+// second build step was never re-run. The ORIGINAL version of this
+// comment explicitly considered and rejected a runtime heuristic
+// instead, specifically worried about "a false negative under some
+// future QEMU machine type" re-arming the watchdog under an emulator
+// that resets immediately on any PM_RSTC write (the exact unbootable
+// failure this gate exists to prevent) -- a legitimate concern, not
+// dismissed here, just now outweighed by a verified, fail-safe-by-
+// default detection: hardware_is_real_hw_get() (boot/hwdetect_state.S)
+// reads a flag set ONCE, early in kernel_main, by hwdetect_probe_real_
+// hardware() -- a VideoCore mailbox GET_FIRMWARE_REVISION round trip.
+// QEMU's own real source (hw/misc/bcm2835_property.c, v10.0.0, fetched
+// and read directly before relying on this, not guessed) answers that
+// exact tag with an unconditional hardcoded literal (346337) no matter
+// how the machine model is configured, while real Pi firmware answers
+// with its own genuine, unpredictable build revision -- so "exactly
+// 346337" is a QEMU fingerprint, not an assumption. The flag defaults
+// to 0 (treat as QEMU/unknown, today's already-accepted status quo)
+// and only ever flips to 1 on a clean, positive non-346337 reply --
+// any mailbox timeout or unexpected response also stays 0. This still
+// can't rule out a FUTURE QEMU version changing that literal, which
+// would reproduce the exact risk the original comment worried about --
+// a real, bounded, residual risk, not a solved one, accepted here as
+// the explicit trade-off the user asked for in exchange for one binary
+// that self-configures instead of two that must be tracked by hand.
 
 // ROUND 2026-09-17 (RTOS/DharaFS safety-certification audit, Gap A):
 // same gating pattern as WATCHDOG_ENABLE_FOR_REAL_HARDWARE above, for
@@ -6958,16 +7058,21 @@ fn watchdog_disable() -> i64 {
 }
 
 // Gates watchdog_disable's own call site below -- same convention and
-// same reasoning as WATCHDOG_ENABLE_FOR_REAL_HARDWARE above: QEMU
-// resets the whole emulated machine immediately on ANY PM_RSTC write,
-// including this "disable" one, so leaving this on unconditionally
-// would make every QEMU-driven regression test "reset" the instant it
-// reached its own PASS checkpoint -- the ONE place every single one of
-// them currently succeeds. Off (0) by default; flip to 1 (together
-// with stage0_main.c's own matching STAGE0_PREJUMP_WATCHDOG_FOR_REAL_
-// HARDWARE, and rebuild+reflash BOTH stage0.img and the real kernel)
-// only for a real, unattended-deployment image.
-const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = 0;
+// same reasoning as hardware_is_real_hw_get() above: QEMU resets the
+// whole emulated machine immediately on ANY PM_RSTC write, including
+// this "disable" one, so leaving this on unconditionally would make
+// every QEMU-driven regression test "reset" the instant it reached its
+// own PASS checkpoint -- the ONE place every single one of them
+// currently succeeds.
+//
+// REVISED 2026-11-21: was its own separate compile-time const; now
+// just reads the same runtime-detected flag hardware_is_real_hw_get()
+// sets once, early in kernel_main -- see that call site's own comment
+// for the full "why" of the switch. stage0_main.c's own matching
+// STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE went through the identical
+// change (its own stage0_detect_real_hardware(), same mailbox probe,
+// same fail-safe-to-0 default) -- both now self-configure from the
+// same single binary, nothing to flip or rebuild separately anymore.
 
 // Phase 3 -- BCM2835 SDHOST controller (base 0x20202000), the real SD
 // interface Pi 1 (and every earlier/simpler Pi) uses -- not the newer
@@ -7124,7 +7229,7 @@ fn sdhost_cmd(cmd_and_flags: u32, arg: u32) -> u32 {
   let cmd_poll_timeout_us: u32 = 1000000 as u32;
   let iter: i64 = 0;
   while wrapping_sub(sd_mmio_read_u32(TIMER_CLO), cmd_poll_t0) < cmd_poll_timeout_us {
-    if (WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1) && ((iter & 4095) == 0) {
+    if (hardware_is_real_hw_get() == (1 as u32)) && ((iter & 4095) == 0) {
       let _ = watchdog_kick();
     }
     let v: u32 = sd_mmio_read_u32(sdcmd);
@@ -7744,7 +7849,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
       // (unlike uart_puts/dwc2_wait_chan0_done/bcm2835_rng_read_word,
       // never reached during a live kernelupload stream), but still a
       // real watchdog-reset risk during boot's own SD bring-up.
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         let _ = watchdog_kick();
       }
       let cmd55_status: u32 = sdhost_cmd(55 as u32, 0 as u32);
@@ -7839,7 +7944,7 @@ fn sdhost_init_at_speed(target_hz: i64) -> i64 {
     while (mmc_iter < 1000) && (mmc_wedged == 0) {
       // 2026-11-09: same sibling fix as the ACMD41 loop just above --
       // see that loop's own comment for the full "why".
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         let _ = watchdog_kick();
       }
       let cmd1_arg: u32 = if mmc_iter == 0 { 0 as u32 } else { hcs | voltage_window };
@@ -9068,7 +9173,7 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
     // card genuinely wedged going into the very next boot's own first
     // reads. Kicking at the top of every attempt here closes the gap
     // the outer per-iteration kick couldn't reach.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let result: i64 = sdhost_read_block_once(block_num, buf);
@@ -9408,7 +9513,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fifo_drain_timeout_us: u32 = 1000000 as u32;
   let fifo_drain_iter: i64 = 0;
   while wrapping_sub(sd_mmio_read_u32(TIMER_CLO), fifo_drain_t0) < fifo_drain_timeout_us {
-    if (WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1) && ((fifo_drain_iter & 4095) == 0) {
+    if (hardware_is_real_hw_get() == (1 as u32)) && ((fifo_drain_iter & 4095) == 0) {
       let _ = watchdog_kick();
     }
     let edm_drain: u32 = sd_mmio_read_u32(SDEDM);
@@ -9536,7 +9641,7 @@ fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
     // block's own matching kick -- a wedged write retries with a full
     // reinit per failed attempt, which the caller-side per-iteration
     // kicks (dharafs_init, etc.) don't reach into.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let result: i64 = sdhost_write_block_once(block_num, buf);
@@ -10609,7 +10714,7 @@ fn dharafs_dirindex_snapshot_load(expect_generation: u32) -> i64 {
     // many blocks, proportional to directory history) a real
     // contributor. Kicking once per iteration, same convention this
     // codebase already uses for every other slow SD-I/O loop.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let base_slot: i64 = blk * dharafs_dirindex_snapshot_slots_per_block();
@@ -11331,7 +11436,7 @@ fn dharafs_badblock_bitmap_load() -> i64 {
       // read with ECC per iteration (this loop runs twice, once per
       // half), zero watchdog_kick() coverage, running synchronously
       // inside dharafs_init()'s own direct call chain.
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         let _ = watchdog_kick();
       }
       let blk: i64 = dharafs_badblock_bitmap_block_at(half, p);
@@ -11603,7 +11708,7 @@ fn dharafs_suspect_table_load() -> i64 {
     // block read with ECC per iteration, zero watchdog_kick() coverage,
     // running synchronously inside dharafs_init()'s own direct call
     // chain.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let blk: i64 = dharafs_suspect_table_block_at(p);
@@ -12233,7 +12338,7 @@ fn dharafs_recovery_scan_continue(buf: mut ref i64, budget_us: u32) -> i64 {
   let diag_total_bad: i64 = 0;
   let call_t0: u32 = mmio_read_u32(TIMER_CLO);
   while (blk < max_blk) && (real_reads < dharafs_recovery_scan_real_reads_per_call()) && (wrapping_sub(mmio_read_u32(TIMER_CLO), call_t0) < budget_us) {
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     if dharafs_badblock_is_marked(blk) == 1 {
@@ -13441,7 +13546,7 @@ fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
     // by a card with more than 256 distinct real paths -- every miss
     // falls all the way through to here, same cost class as the boot
     // scan, same watchdog window to miss.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let rd_status: i64 = dharafs_block_read(blk, buf);
@@ -13542,7 +13647,7 @@ fn dharafs_find_block_as_of_raw(path_buf: mut ref i64, path_len: i64, max_seq: u
   while (blk as u32) < next_block {
     // Same real-HW watchdog-hang gap as dharafs_find_latest_block_raw's
     // own identical loop -- see its comment for the full "why."
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let rd_status: i64 = dharafs_block_read(blk, buf);
@@ -13696,7 +13801,7 @@ fn dharafs_find_next_seq_for_path_raw(path_buf: mut ref i64, path_len: i64, afte
   let best_seq: u32 = 0 as u32;
   let blk: i64 = 1;
   while (blk as u32) < next_block {
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let rd_status: i64 = dharafs_block_read(blk, buf);
@@ -17391,7 +17496,7 @@ fn dharafs_list_dir_raw(dir_buf: mut ref i64, dir_len: i64, query_buf: mut ref i
     // block_raw again, which can itself trigger a second full scan on
     // a dirindex miss -- `ls`'s own real cost on a card with more
     // distinct paths than dirindex_max_slots() can hold.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let rd_status: i64 = dharafs_block_read(blk, buf);
@@ -17773,6 +17878,79 @@ fn dharafs_directory_hierarchy_self_test() -> i64 {
   return 0;
 }
 
+// Bare-"ls" result cache (2026-11-21) -- see boot/dharafs_lscache_
+// state.S's own header comment for the full "why" and scoping. These
+// four helpers are deliberately dumb: dharafs_list itself still owns
+// all the actual cache-key decisions (when to check it, when to
+// start/stop capturing), these just mirror bytes into the capture
+// buffer (or play them back) without needing to know anything about
+// DharaFS records.
+fn dharafs_lscache_mirror_byte(b: i64) -> i64 {
+  if dharafs_lscache_capturing_get() != (1 as u32) {
+    return 0;
+  }
+  let cache_len: u32 = dharafs_lscache_byte_len_get();
+  if (cache_len as i64) >= 4096 {
+    let _ = dharafs_lscache_overflow_set(1 as u32);
+    return 0;
+  }
+  let buf: mut ref i64 = dharafs_lscache_buf_get();
+  let _ = buf_write_byte(buf, cache_len, b as u32);
+  let _ = dharafs_lscache_byte_len_set(cache_len + (1 as u32));
+  return 0;
+}
+
+fn dharafs_lscache_mirror_str(s: Str) -> i64 {
+  let n: i64 = str_len_bytes(s);
+  let i: i64 = 0;
+  while i < n {
+    let _ = dharafs_lscache_mirror_byte(str_byte_at(s, i));
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Call before a fresh bare-ls scan starts. Any previously-valid cache
+// stays valid (and servable) until this scan either completes cleanly
+// (capture_end below) or the process is interrupted some other way --
+// there's no observable harm in briefly having both an old valid entry
+// and an in-flight new capture, since nothing else reads dharafs_
+// lscache_buf while capturing == 1.
+fn dharafs_lscache_capture_begin() -> i64 {
+  let _ = dharafs_lscache_byte_len_set(0 as u32);
+  let _ = dharafs_lscache_overflow_set(0 as u32);
+  let _ = dharafs_lscache_capturing_set(1 as u32);
+  return 0;
+}
+
+// Call once the scan this capture was started for has fully finished.
+// Only promotes to valid if nothing overflowed the 4096-byte buffer --
+// an oversized listing already printed correctly (mirroring never
+// touches the real uart_puts/uart_putc calls), it just isn't cached.
+fn dharafs_lscache_capture_end(log_start: u32, next_block: u32) -> i64 {
+  let _ = dharafs_lscache_capturing_set(0 as u32);
+  if dharafs_lscache_overflow_get() == (0 as u32) {
+    let _ = dharafs_lscache_log_start_set(log_start);
+    let _ = dharafs_lscache_next_block_set(next_block);
+    let _ = dharafs_lscache_valid_set(1 as u32);
+  } else {
+    let _ = dharafs_lscache_valid_set(0 as u32);
+  }
+  return 0;
+}
+
+fn dharafs_lscache_replay() -> i64 {
+  let buf: mut ref i64 = dharafs_lscache_buf_get();
+  let cache_len: u32 = dharafs_lscache_byte_len_get();
+  let i: u32 = 0 as u32;
+  while i < cache_len {
+    let b: u32 = buf_read_byte(buf, i);
+    let _ = uart_putc(b as i64);
+    i = i + (1 as u32);
+  }
+  return 0;
+}
+
 fn dharafs_list(prefix: Str) -> i64 {
   // RTOS-boot-time hardening round (2026-11-01), sibling audit: same
   // bug class and fix as dharafs_find_latest_block_raw's own matching
@@ -17787,12 +17965,25 @@ fn dharafs_list(prefix: Str) -> i64 {
   let prefix_len: i64 = str_len_bytes(prefix);
   let next_block: u32 = dharafs_state_get_next_block();
   let log_start: u32 = dharafs_state_get_log_start();
+  // Bare "ls" only (see boot/dharafs_lscache_state.S) -- a repeat call
+  // with the exact same [log_start, next_block) scan range as last
+  // time can only ever produce the exact same output, so skip the
+  // real scan entirely and replay what was printed last time.
+  if prefix_len == 0 {
+    if (dharafs_lscache_valid_get() == (1 as u32))
+        && (dharafs_lscache_log_start_get() == log_start)
+        && (dharafs_lscache_next_block_get() == next_block) {
+      let _ = dharafs_lscache_replay();
+      return 0;
+    }
+    let _ = dharafs_lscache_capture_begin();
+  }
   let buf: mut ref i64 = dharafs_sd_scratch_get();
   let blk: i64 = log_start as i64;
   while (blk as u32) < next_block {
     // Same real-HW watchdog-hang gap as dharafs_find_latest_block_raw's
     // own identical loop -- see its comment for the full "why."
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let rd_status: i64 = dharafs_block_read(blk, buf);
@@ -17848,19 +18039,25 @@ fn dharafs_list(prefix: Str) -> i64 {
             let latest_blk: i64 = dharafs_find_latest_block_raw(path_buf, rec_path_len as i64);
             if latest_blk == blk {
               let _ = uart_puts("  ");
+              let _ = dharafs_lscache_mirror_str("  ");
               let p: i64 = 0;
               while (p as u32) < rec_path_len {
                 let pc: u32 = buf_read_byte(path_buf, p as u32);
                 let _ = uart_putc(pc as i64);
+                let _ = dharafs_lscache_mirror_byte(pc as i64);
                 p = p + 1;
               }
               let _ = uart_puts("\n");
+              let _ = dharafs_lscache_mirror_str("\n");
             }
           }
         }
       }
     }
     blk = blk + 1;
+  }
+  if prefix_len == 0 {
+    let _ = dharafs_lscache_capture_end(log_start, next_block);
   }
   return 0;
 }
@@ -18811,14 +19008,13 @@ fn timer_tick_dispatch() -> i64 {
     let _ = uart_rx_deferred_set(0 as u32);
   }
 
-  // ROUND 2026-09-17: wired, gated by the same source-level constant
-  // watchdog_arm's own header comment explains in full -- disabled
-  // by default (real hardware watchdogs cannot be armed here without
-  // permanently breaking every QEMU test run, so this project's own
-  // checked-in default keeps it off), real protection once
-  // WATCHDOG_ENABLE_FOR_REAL_HARDWARE is flipped to 1 for an actual
-  // hardware deployment build.
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  // ROUND 2026-09-17: wired, gated by the same runtime-detected flag
+  // watchdog_arm's own header comment explains in full -- real hardware
+  // watchdogs cannot be armed here without permanently breaking every
+  // QEMU test run, so this stays off under QEMU and on automatically
+  // for an actual hardware deployment build (hardware_is_real_hw_get(),
+  // no manual flag to flip anymore -- see its own call site).
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
 
@@ -23900,7 +24096,7 @@ fn dns_resolve(my_mac: mut ref i64, my_ip: u32, dns_server_ip: u32, hostname: mu
     // wifi_scan_for_ssid's header comment for the full "why"): waiting
     // on a real external peer's (here, a DNS server's) reply with no
     // dedicated kick of its own.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     if dns_resolve_poll(xid, resolved_scratch) == 1 {
@@ -25384,6 +25580,29 @@ fn dwc2_restart_phy_clock() -> i64 {
 // otherwise untouched.
 fn dwc2_core_soft_reset() -> i64 {
   let grstctl: i64 = dwc2_base() + 0x10;
+  // 2026-11-20 (real-HW USB2.0 high-speed bring-up, found by reading
+  // the actual Broadcom/RPi downstream driver's own dwc_otg_core_reset
+  // verbatim, not just mainline Linux/U-Boot): that function's very
+  // FIRST action, before csftrst is ever written, is a bounded poll
+  // for GRSTCTL.AHBIDLE (bit31) -- "Wait for AHB master IDLE state."
+  // This driver has always polled AHBIDLE only AFTER issuing the
+  // reset, never before. Issuing a core soft reset while the AHB
+  // master still has an in-flight transaction is exactly the kind of
+  // undefined-mid-operation state that could leave the PHY/analog
+  // block's own internal calibration in a bad state without producing
+  // an outright register-level error -- a plausible contributor to
+  // this investigation's persistent "chirp resolves FULL_SPEED despite
+  // every PHY-mode register independently confirmed correct" symptom.
+  let pre_ahb_tries: i64 = 0;
+  while pre_ahb_tries < 20 {
+    let pre_v: u32 = mmio_read_u32(grstctl);
+    if (pre_v & (0x80000000 as u32)) != (0 as u32) {
+      pre_ahb_tries = 20;
+    } else {
+      let _ = delay(16100);
+      pre_ahb_tries = pre_ahb_tries + 1;
+    }
+  }
   let _ = mmio_write_u32(grstctl, 1 as u32);
   // 2026-10-23 ROOT-CAUSE AUDIT (same class as the UART overrun-clear
   // fix): this whole DWC2 driver had ZERO mem_barrier() calls anywhere
@@ -25549,10 +25768,16 @@ fn dwc2_select_hs_phy() -> i64 {
     let cleared: u32 = v & (hs_bits_mask ^ (0xFFFFFFFF as u32));
     let _ = mmio_write_u32(gusbcfg, cleared);
     let immediate_before: u32 = mmio_read_u32(gusbcfg);
-    let _ = kernlog_write_simple("USB DIAG PHYSEL/ULPI_UTMI_SEL/PHYIF16 immediately after write (HS select), before reset", immediate_before);
+    // 2026-11-20: uart_puts, not kernlog_write_simple -- see dwc2_
+    // select_phy_mode's own matching comment for why.
+    let _ = uart_puts("USB DIAG GUSBCFG immediately after write (HS select), before reset=");
+    let _ = uart_put_hex32(immediate_before);
+    let _ = uart_puts("\n");
     let _ = dwc2_core_soft_reset();
     let immediate_after: u32 = mmio_read_u32(gusbcfg);
-    let _ = kernlog_write_simple("USB DIAG PHYSEL/ULPI_UTMI_SEL/PHYIF16 immediately after core soft reset (HS select)", immediate_after);
+    let _ = uart_puts("USB DIAG GUSBCFG immediately after core soft reset (HS select)=");
+    let _ = uart_put_hex32(immediate_after);
+    let _ = uart_puts("\n");
   }
   return 0;
 }
@@ -25574,12 +25799,27 @@ fn dwc2_select_phy_mode() -> i64 {
   let ghwcfg2: i64 = dwc2_base() + 0x48;
   let v: u32 = mmio_read_u32(ghwcfg2);
   let hs_phy_type: u32 = (v >> (6 as u32)) & (0x3 as u32);
-  let _ = kernlog_write_simple("USB DIAG GHWCFG2 HS_PHY_TYPE (0=none,1=UTMI,2=ULPI,3=UTMI+ULPI)", hs_phy_type);
-  if hs_phy_type != (0 as u32) {
+  // 2026-11-20: switched from kernlog_write_simple to uart_puts -- the
+  // former persists to a DharaFS-backed log file, not the live UART
+  // console, which silently hid this exact diagnostic from every
+  // real-HW capture taken so far (see dwc2_wait_chan0_done's own
+  // header comment on the same pitfall).
+  let _ = uart_puts("USB DIAG GHWCFG2 HS_PHY_TYPE (0=none,1=UTMI,2=ULPI,3=UTMI+ULPI)=");
+  let _ = uart_put_hex32(hs_phy_type);
+  let _ = uart_puts("\n");
+  // 2026-11-20: HS bring-up paused (chirp still settles FS despite every
+  // register matching both reference drivers byte-for-byte) -- forcing
+  // FS here to return to the known-stable baseline for wifi join work.
+  // Flip this back to `hs_phy_type != (0 as u32)` to resume the HS
+  // investigation; nothing else needs to change.
+  let hs_phy_mode_paused: u32 = 0 as u32;
+  if (hs_phy_type != (0 as u32)) && (hs_phy_mode_paused == (0 as u32)) {
     let _ = dwc2_select_hs_phy();
+    let _ = dwc2_phy_is_hs_set(1 as u32);
     return 1;
   }
   let _ = dwc2_select_fs_phy();
+  let _ = dwc2_phy_is_hs_set(0 as u32);
   return 0;
 }
 
@@ -25748,6 +25988,50 @@ fn dwc2_port_reset() -> i64 {
 
   let not_w1c_mask: u32 = w1c_mask ^ (0xFFFFFFFF as u32);
 
+  // 2026-11-20 (real-HW USB2.0 high-speed bring-up, root-cause follow-
+  // up #3): dwc2_restart_phy_clock() already zeroes PCGCTL (offset
+  // 0xE00, STOPPCLK=bit0) exactly once, right at the very start of
+  // dwc2_init() -- but that's before dwc2_force_host_mode(), dwc2_
+  // config_fifos(), dwc2_port_power_on() (a real HPRT0.PRTPWR
+  // transition) and more all run, on the SAME silicon this project has
+  // already twice confirmed spontaneously reverts other PHY-adjacent
+  // GUSBCFG/GAHBCFG config around exactly this kind of port-power
+  // transition (see dwc2_reassert_core_config_post_port_reset's own
+  // header comment). Linux's real hcd.c (`SetPortFeature ->
+  // USB_PORT_FEAT_RESET`) never assumes a one-time PCGCTL clear at
+  // driver-init time survives either -- it explicitly re-clears
+  // PCGCTL.ENBL_SLEEP_GATING+STOPPCLK, immediately followed by a
+  // blanket zero write ("??? Original driver does this" -- kept
+  // despite not fully understanding why, since it's cheap and matches
+  // the proven-working reference exactly), EVERY single time a port
+  // reset is about to be issued, not just once. If STOPPCLK is back on
+  // by the time THIS reset's real chirp window runs, the UTMI PHY's
+  // own clock would be gated right when HS chirp detection needs it
+  // running -- a plausible, previously untested explanation for why
+  // HPRT0.PrtSpd still reports FULL_SPEED immediately after the first
+  // reset even with PHYSEL/PHYLPWRCLKSEL/FSLSPCLKSEL all independently
+  // confirmed correct going in.
+  let pcgctl_addr: i64 = dwc2_base() + 0xE00;
+  let pcgctl_before: u32 = mmio_read_u32(pcgctl_addr);
+  let _ = uart_puts("USB DIAG PCGCTL immediately before this port reset (expect 0 if dwc2_restart_phy_clock's one-time clear survived)=");
+  let _ = uart_put_hex32(pcgctl_before);
+  let _ = uart_puts("\n");
+  let enbl_sleep_gating_bit: u32 = (1 as u32) << (5 as u32);
+  let stoppclk_bit: u32 = 1 as u32;
+  let pcgctl_cleared: u32 = pcgctl_before & ((enbl_sleep_gating_bit | stoppclk_bit) ^ (0xFFFFFFFF as u32));
+  let _ = mmio_write_u32(pcgctl_addr, pcgctl_cleared);
+  let _ = mmio_write_u32(pcgctl_addr, 0 as u32);
+
+  // 2026-11-20 (finer-grained reset trace, requested to distinguish "a
+  // link that negotiates FS" from "a link whose speed is misread/
+  // sampled at the wrong point" -- we previously only ever captured
+  // the FINAL post-enable-poll HPRT0 value, never anything in between).
+  // Unconditional, not gated: this is diagnostic-only and changes no
+  // behavior, matching this function's own existing discipline.
+  let _ = uart_puts("USB DIAG HPRT0 before reset assert=");
+  let _ = uart_put_hex32(mmio_read_u32(hprt0));
+  let _ = uart_puts("\n");
+
   // Set RST=1, forcing the w1c group to 0 (preserve, clear nothing).
   // 161000, not 50000 -- see dwc2_core_soft_reset's own comment on
   // delay(N)'s real, platform-dependent duration; this is the real
@@ -25762,7 +26046,61 @@ fn dwc2_port_reset() -> i64 {
   // is no reason to rely on that incidentally rather than guaranteeing
   // it explicitly.
   let _ = mem_barrier();
-  let _ = delay(161000);
+  let _ = uart_puts("USB DIAG HPRT0 immediately after reset assert (RST write landed)=");
+  let _ = uart_put_hex32(mmio_read_u32(hprt0));
+  let _ = uart_puts("\n");
+
+  // 2026-11-20 (chirp-window visibility, requested follow-up): the
+  // chirp exchange happens DURING the reset-hold, not after -- the
+  // previous trace only bookended this interval with delay(161000),
+  // leaving it completely unobserved. Replaced with a real-wallclock
+  // (TIMER_CLO, 1MHz free-running, same primitive delay_us_wallclock
+  // already uses) sampling loop that holds for the SAME real ~50ms
+  // duration but buffers HPRT0+GINTSTS samples into local arrays
+  // every ~500us instead of blind-waiting. Deliberately does NOT
+  // print anything inside this loop -- a uart_puts/put_hex32 call
+  // takes multiple milliseconds at this baud rate, which would
+  // completely dominate and corrupt a 500us sampling interval (see
+  // this project's own established "diagnostic prints can perturb
+  // timing" lesson). All printing happens AFTER the hold ends, once
+  // the thing being measured is already over.
+  let gintsts_trace_addr: i64 = dwc2_base() + 0x14;
+  let hold_target_us: u32 = 50000 as u32;
+  let sample_interval_us: u32 = 500 as u32;
+  let sample_capacity: u32 = 100 as u32;
+  let trace_tick: [u32; 100] = [0 as u32; 100];
+  let trace_hprt0: [u32; 100] = [0 as u32; 100];
+  let trace_gintsts: [u32; 100] = [0 as u32; 100];
+  let hold_start: u32 = mmio_read_u32(TIMER_CLO);
+  let last_sample: u32 = hold_start;
+  let sample_count: u32 = 0 as u32;
+  while wrapping_sub(mmio_read_u32(TIMER_CLO), hold_start) < hold_target_us {
+    let now: u32 = mmio_read_u32(TIMER_CLO);
+    if (wrapping_sub(now, last_sample) >= sample_interval_us) && (sample_count < sample_capacity) {
+      trace_tick[sample_count] = wrapping_sub(now, hold_start);
+      trace_hprt0[sample_count] = mmio_read_u32(hprt0);
+      trace_gintsts[sample_count] = mmio_read_u32(gintsts_trace_addr);
+      sample_count = sample_count + (1 as u32);
+      last_sample = now;
+    }
+  }
+  let _ = uart_puts("USB DIAG HPRT0 after ~50ms reset hold, before deassert=");
+  let _ = uart_put_hex32(mmio_read_u32(hprt0));
+  let _ = uart_puts("\n");
+  let _ = uart_puts("USB DIAG reset-hold fine trace samples=");
+  let _ = uart_put_hex32(sample_count);
+  let _ = uart_puts("\n");
+  let print_idx: u32 = 0 as u32;
+  while print_idx < sample_count {
+    let _ = uart_puts("USB DIAG reset-hold sample t_us=");
+    let _ = uart_put_hex32(trace_tick[print_idx]);
+    let _ = uart_puts(" HPRT0=");
+    let _ = uart_put_hex32(trace_hprt0[print_idx]);
+    let _ = uart_puts(" GINTSTS=");
+    let _ = uart_put_hex32(trace_gintsts[print_idx]);
+    let _ = uart_puts("\n");
+    print_idx = print_idx + (1 as u32);
+  }
 
   // Deassert RST, again forcing the w1c group to 0 in the WRITE value
   // -- QEMU's own model sets ENA+ENACHG itself, synchronously, the
@@ -25773,7 +26111,13 @@ fn dwc2_port_reset() -> i64 {
   let _ = mmio_write_u32(hprt0, v2 & clear_rst & not_w1c_mask);
   // 2026-10-23 audit: same mem_barrier() addition as above.
   let _ = mem_barrier();
+  let _ = uart_puts("USB DIAG HPRT0 immediately after reset deassert (RST write landed)=");
+  let _ = uart_put_hex32(mmio_read_u32(hprt0));
+  let _ = uart_puts("\n");
   let _ = delay(161000);
+  let _ = uart_puts("USB DIAG HPRT0 after ~50ms post-deassert settle, before enable-poll=");
+  let _ = uart_put_hex32(mmio_read_u32(hprt0));
+  let _ = uart_puts("\n");
 
   // Poll for ENA, bounded -- real hardware's own response to the
   // reset release, not an instant software-model guarantee. Each
@@ -25784,6 +26128,14 @@ fn dwc2_port_reset() -> i64 {
   let enable_tries: i64 = 0;
   while enable_tries < 20 {
     let ve: u32 = mmio_read_u32(hprt0);
+    // 2026-11-20: per-iteration trace -- find the exact iteration ENA
+    // first goes high and what PrtSpd reads AT THAT MOMENT, rather than
+    // only ever seeing the value after the loop already exited.
+    let _ = uart_puts("USB DIAG HPRT0 enable-poll iter=");
+    let _ = uart_put_hex32(enable_tries as u32);
+    let _ = uart_puts(" val=");
+    let _ = uart_put_hex32(ve);
+    let _ = uart_puts("\n");
     if (ve & (0x4 as u32)) != (0 as u32) {
       enable_tries = 20;
     } else {
@@ -25820,7 +26172,31 @@ fn dwc2_port_reset() -> i64 {
   // redo the reset+enable-poll sequence (not just the register write)
   // before this port is handed back to the caller.
   let prtspd: u32 = (mmio_read_u32(hprt0) >> (17 as u32)) & (0x3 as u32);
-  if (prtspd == (1 as u32)) || (prtspd == (2 as u32)) {
+  // 2026-11-20 (real-HW USB2.0 high-speed bring-up, root-cause follow-
+  // up #2): unconditional, not gated -- this is the actual, direct
+  // chirp-result readback (0=HIGH_SPEED/1=FULL_SPEED/2=LOW_SPEED) this
+  // whole investigation needed and never had; every previous mps=64
+  // finding only ever inferred FS indirectly from the enumerated
+  // device's own endpoint descriptors.
+  let _ = uart_puts("USB DIAG HPRT0.PrtSpd after first reset (0=HIGH,1=FULL,2=LOW)=");
+  let _ = uart_put_hex32(prtspd);
+  let _ = uart_puts("\n");
+  // BUG FOUND 2026-11-20: this whole block is round 16's own PHYLPWRCLKSEL
+  // correction (see its header comment above) -- but PHYLPWRCLKSEL is,
+  // by that same comment's own description and the real Broadcom
+  // downstream driver's own usage, an FS/LS-ONLY low-power-clock-select
+  // bit. Applying it unconditionally whenever prtspd reads FS/LS was
+  // correct back when this driver only ever ran FS -- but now that HS
+  // is a real selectable mode, doing this when HS was the INTENDED mode
+  // doesn't recover anything; it actively cements the port into FS by
+  // writing an FS/LS-specific register value and redoing the reset
+  // under that wrong configuration, foreclosing whatever the real
+  // reason the first HS chirp attempt didn't land was. Gating on
+  // dwc2_phy_is_hs_get()==0 restores the exact original FS-only
+  // behavior unchanged while finally letting an HS attempt's real
+  // prtspd outcome (whatever it is) stand instead of being silently
+  // overwritten by an FS-specific "fix".
+  if ((prtspd == (1 as u32)) || (prtspd == (2 as u32))) && (dwc2_phy_is_hs_get() == (0 as u32)) {
     let gusbcfg_for_speed: i64 = dwc2_base() + 0x0C;
     let phylpwrclksel_bit: u32 = (1 as u32) << (15 as u32);
     let uv: u32 = mmio_read_u32(gusbcfg_for_speed);
@@ -26240,6 +26616,31 @@ fn dwc2_init() -> i64 {
   // ordering bug: real-HW retest with that ordering regressed from a
   // genuine XACTERR back to full silence (HCINT=0x00000000), matching
   // the pre-DMAEN-fix symptom exactly.
+  //
+  // 2026-11-20 (register-write-ledger audit against the real Broadcom
+  // downstream driver, done source-only): `dwc_otg_core_host_init()`
+  // -- a SEPARATE function from `dwc_otg_core_init()`, called later,
+  // once the core is actually entering host mode -- opens with its
+  // OWN unconditional `DWC_WRITE_REG32(core_if->pcgcctl, 0)` ("Restart
+  // the Phy Clock"), immediately followed by `init_fslspclksel()`.
+  // This driver's own dwc2_restart_phy_clock() is called exactly once,
+  // at the very top of dwc2_init(), BEFORE the core reset and PHY
+  // select that follow it -- by the time dwc2_init_fs_ls_pclk_sel runs
+  // here, several resets later, there has been no PCGCTL re-clear
+  // immediately preceding it, unlike the reference. This project's own
+  // dwc2_port_reset() already found PCGCTL drift mattered enough to
+  // need a re-clear directly before ITS register-sensitive operation
+  // (see that function's own header comment) -- this is the same
+  // class of gap, just earlier in the sequence, never previously
+  // checked. Diagnostic print is unconditional (not gated) so the
+  // next real-HW boot shows directly whether PCGCTL actually drifted
+  // here or not, rather than assuming either way.
+  let pcgctl_pre_fslspclksel_addr: i64 = dwc2_base() + 0xE00;
+  let pcgctl_pre_fslspclksel: u32 = mmio_read_u32(pcgctl_pre_fslspclksel_addr);
+  let _ = uart_puts("USB DIAG PCGCTL immediately before FSLSPclkSel (pre-host-init restart, expect 0)=");
+  let _ = uart_put_hex32(pcgctl_pre_fslspclksel);
+  let _ = uart_puts("\n");
+  let _ = mmio_write_u32(pcgctl_pre_fslspclksel_addr, 0 as u32);
   let _ = dwc2_init_fs_ls_pclk_sel(phy_is_hs);
   let _ = dwc2_force_host_mode();
   // Task #325: FIFO RAM partition -- must happen once we're definitely
@@ -26411,8 +26812,28 @@ fn dwc2_reassert_core_config_post_port_reset() -> i64 {
   // assuming it's already 0.
   let force_host_bit: u32 = (1 as u32) << (29 as u32);
   let force_dev_clear: u32 = ((1 as u32) << (30 as u32)) ^ (0xFFFFFFFF as u32);
+  // BUG FOUND 2026-11-20 (real-HW USB2.0 high-speed bring-up, root-
+  // cause of "mps stays 64 no matter what dwc2_select_hs_phy() does"):
+  // physel_bit/phylpwrclksel_bit above used to be unconditionally OR'd
+  // into every restore this function does, at every one of its ~8 call
+  // sites across dwc2_init() and every later control/bulk transfer --
+  // correct for the FS-only mode this function was written for, but it
+  // meant this "restore after the confirmed hardware revert" safety
+  // net was ALSO unconditionally re-forcing FS mode back on moments
+  // after dwc2_select_phy_mode() had correctly selected HS, every
+  // single time this function ran. dwc2_phy_is_hs_get() (boot/usb_
+  // power_state.S) now records which mode dwc2_select_phy_mode()
+  // actually chose, and both speed-sensitive bits are explicitly
+  // cleared first, then re-set only in the FS case -- restoring the
+  // exact previous behavior for FS/LS-only hardware while finally
+  // letting a selected HS PHY mode actually survive this restore.
+  let speed_bits: u32 = physel_bit | phylpwrclksel_bit;
+  let speed_bits_clear: u32 = speed_bits ^ (0xFFFFFFFF as u32);
+  let phy_is_hs: u32 = dwc2_phy_is_hs_get();
   let v: u32 = mmio_read_u32(gusbcfg);
-  let new_v: u32 = (((v | physel_bit | phylpwrclksel_bit | force_host_bit) & force_dev_clear) & toutcal_mask) | toutcal_max;
+  let v_speed_cleared: u32 = v & speed_bits_clear;
+  let v_with_speed: u32 = if phy_is_hs != (0 as u32) { v_speed_cleared } else { v_speed_cleared | speed_bits };
+  let new_v: u32 = ((v_with_speed | force_host_bit) & force_dev_clear & toutcal_mask) | toutcal_max;
   let _ = mmio_write_u32(gusbcfg, new_v);
 
   // Round 26 correction (see dwc2_enable_dma_mode's own header
@@ -26792,7 +27213,7 @@ fn dwc2_wait_chan0_done() -> u32 {
   // present and future (a WiFi/BLE/mass-storage driver not written yet
   // goes through this same function).
   while (tries < 1000000) && (wrapping_sub(mmio_read_u32(TIMER_CLO), wcd_t0) < (2000000 as u32)) {
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       if (tries % 50000) == 0 {
         let _ = watchdog_kick();
       }
@@ -27042,8 +27463,51 @@ fn dwc2_wait_chan0_done() -> u32 {
       let toutcal_clear_mask: u32 = (0x7 as u32) ^ (0xFFFFFFFF as u32);
       let toutcal_max: u32 = 7 as u32;
       let cur_usb: u32 = mmio_read_u32(gusbcfg_addr);
-      if ((cur_usb & physel_bit) == (0 as u32)) || ((cur_usb & phylpwrclksel_bit) == (0 as u32)) {
-        let _ = mmio_write_u32(gusbcfg_addr, ((cur_usb | physel_bit | phylpwrclksel_bit) & toutcal_clear_mask) | toutcal_max);
+      // BUG FOUND 2026-11-20 (real-HW USB2.0 high-speed bring-up, THE
+      // most-frequently-firing sibling of the two already fixed in
+      // dwc2_reassert_core_config_post_port_reset/dwc2_port_reset):
+      // this condition/write pair hardcoded the FS-only expectation
+      // (PHYSEL/PHYLPWRCLKSEL should read 1) the same way those two
+      // did -- except THIS one runs every ~1000 iterations (~0.5ms)
+      // inside the one shared wait primitive every single control/bulk
+      // transfer in the entire system goes through (enumeration, WiFi,
+      // BLE, mass storage, Ethernet), not just once at boot or once per
+      // port reset. With HS correctly selected (PHYSEL/PHYLPWRCLKSEL
+      // both intentionally 0), the old condition `== 0` was true by
+      // design on every single check, so this self-heal was firing
+      // continuously throughout every transfer's wait and forcibly
+      // writing FS-mode PHYSEL=1/PHYLPWRCLKSEL=1 back into GUSBCFG --
+      // very likely the dominant real reason HS never survived past
+      // the very first post-reset transfer even on a boot where the
+      // chirp itself briefly succeeded. Same dwc2_phy_is_hs_get()-aware
+      // split as its two siblings: heal toward the FS values only when
+      // FS was actually selected (unchanged original behavior); heal
+      // toward CLEARED PHYSEL/PHYLPWRCLKSEL when HS was selected and
+      // they've drifted back to 1.
+      let phy_is_hs_wait: u32 = dwc2_phy_is_hs_get();
+      let speed_bits_wrong: i64 = if phy_is_hs_wait != (0 as u32) {
+        if ((cur_usb & physel_bit) != (0 as u32)) || ((cur_usb & phylpwrclksel_bit) != (0 as u32)) { 1 } else { 0 }
+      } else {
+        if ((cur_usb & physel_bit) == (0 as u32)) || ((cur_usb & phylpwrclksel_bit) == (0 as u32)) { 1 } else { 0 }
+      };
+      // Caught before shipping: TOUTCAL's own drift (the original
+      // target of this self-heal, rounds 9-29) must be checked
+      // independently of the speed bits above, not folded into the
+      // same condition -- under HS, PHYSEL/PHYLPWRCLKSEL correctly
+      // staying at 0 the whole time (no drift to react to) would
+      // otherwise mean this self-heal's `if` never fires at all,
+      // silently dropping TOUTCAL correction entirely for an HS boot
+      // even though nothing about TOUTCAL's own drift mechanism is
+      // speed-dependent.
+      let toutcal_field_mask: u32 = 0x7 as u32;
+      let toutcal_wrong: i64 = if (cur_usb & toutcal_field_mask) != toutcal_max { 1 } else { 0 };
+      let gusbcfg_needs_heal: i64 = if (speed_bits_wrong == 1) || (toutcal_wrong == 1) { 1 } else { 0 };
+      if gusbcfg_needs_heal == 1 {
+        let speed_bits: u32 = physel_bit | phylpwrclksel_bit;
+        let speed_bits_clear: u32 = speed_bits ^ (0xFFFFFFFF as u32);
+        let cur_usb_speed_cleared: u32 = cur_usb & speed_bits_clear;
+        let cur_usb_with_speed: u32 = if phy_is_hs_wait != (0 as u32) { cur_usb_speed_cleared } else { cur_usb_speed_cleared | speed_bits };
+        let _ = mmio_write_u32(gusbcfg_addr, (cur_usb_with_speed & toutcal_clear_mask) | toutcal_max);
         if boot_debug_enabled() == 1 {
           let _ = uart_puts("USB DIAG self-heal: GUSBCFG reverted mid-wait, tries=");
           let _ = uart_put_hex32(tries as u32);
@@ -27613,10 +28077,57 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
 
   let _ = dwc2_reset_chan0_for_new_transfer();
   let pktcnt: u32 = if out_len == (0 as u32) { 1 as u32 } else { (out_len + mps - (1 as u32)) / mps };
+  // DIAGNOSTIC (2026-11-21, warm/cold-reboot RTL8188CU firmware-
+  // download investigation): the ONLY chunk-write that's failed,
+  // deterministically, identically, across two completely different
+  // boots (one warm with firmware already running, one genuinely
+  // cold) is the very last chunk of the whole 16094-byte firmware
+  // payload -- 94 bytes, the one chunk size in this entire transfer
+  // that is NOT a multiple of mps (every other chunk is a clean
+  // 128 = 2*64). That is the one concrete difference between this
+  // chunk and the ~124 before it that all succeed: this one's DATA
+  // stage ends in a genuinely SHORT final packet (64 + 30) instead of
+  // two full 64-byte packets. Gated on exactly that shape (out_len
+  // not a multiple of mps) so it fires once per whole download, not
+  // once per chunk -- a readback of HCTSIZ/HCCHAR right after this
+  // phase's own wait returns (success OR failure) tells us whether
+  // the hardware's own byte/packet countdown actually consumed the
+  // short final packet, which the existing "hi=0x..." print alone
+  // (HCINT only) can't show.
+  let is_short_final_pkt: u32 = if ((out_len % mps) != (0 as u32)) && (out_len > (0 as u32)) { 1 as u32 } else { 0 as u32 };
+  if (is_short_final_pkt == (1 as u32)) && (boot_debug_enabled() == 1) {
+    let _ = uart_puts("USB DIAG: short-final-packet DATA phase about to start, out_len=");
+    let _ = uart_put_hex32(out_len);
+    let _ = uart_puts(" mps=");
+    let _ = uart_put_hex32(mps);
+    let _ = uart_puts(" pktcnt=");
+    let _ = uart_put_hex32(pktcnt);
+    let _ = uart_puts("\n");
+  }
   let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), pktcnt, out_len));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let data_result: u32 = dwc2_wait_chan0_done();
+  if is_short_final_pkt == (1 as u32) {
+    // Unconditional (not gated on boot_debug_enabled()) -- this is
+    // exactly the one failure this diagnostic exists to catch, so it
+    // must not be silenceable by the same flag that would hide it.
+    let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
+    let hcchar_after: u32 = mmio_read_u32(hcchar0);
+    let _ = uart_puts("USB DIAG: short-final-packet DATA phase done, hi=0x");
+    let _ = uart_put_hex32(data_result);
+    let _ = uart_puts(" HCTSIZ_after=0x");
+    let _ = uart_put_hex32(hctsiz_after);
+    let _ = uart_puts(" (xfersize_remaining=0x");
+    let _ = uart_put_hex32(hctsiz_after & (0x7FFFF as u32));
+    let _ = uart_puts(" pktcnt_remaining=0x");
+    let _ = uart_put_hex32((hctsiz_after >> (19 as u32)) & (0x3FF as u32));
+    let _ = uart_puts(") HCCHAR_after=0x");
+    let _ = uart_put_hex32(hcchar_after);
+    let _ = uart_puts(" (bit31 CHENA=");
+    let _ = uart_put_hex32((hcchar_after >> (31 as u32)) & (1 as u32));
+    let _ = uart_puts(")\n");
+  }
   if (data_result & (1 as u32)) == (0 as u32) {
     let _ = uart_puts("USB DIAG: dwc2_control_out DATA phase failed, hi=0x");
     let _ = uart_put_hex32(data_result);
@@ -27789,6 +28300,45 @@ fn dwc2_build_set_configuration_setup(config_value: u32) -> i64 {
   let _ = buf_write_byte(dma, 2 as u32, config_value & (0xFF as u32));
   let _ = buf_write_byte(dma, 3 as u32, (config_value >> (8 as u32)) & (0xFF as u32));
   let _ = buf_write_byte(dma, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 5 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 6 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
+  return 0;
+}
+
+// 2026-11-20: USB 2.0 spec section 8.6.1's own data-toggle-synchronization
+// rule, checked against this driver for the first time this investigation
+// (every reference-driver comparison so far was against chip-specific
+// rtl8192cu logic, not the generic USB core layer real OSes rely on for
+// this -- toggle handling is transport-standard, not chip-specific, so no
+// amount of rtl8192cu source-reading would ever have caught a gap here).
+// Per spec, DATA0/DATA1 resets to DATA0 on BOTH host and device only via
+// SET_CONFIGURATION/SET_INTERFACE or CLEAR_FEATURE(ENDPOINT_HALT) -- never
+// implicitly. DhruvaOS's own software toggle (usb_wifi_get/set_out_toggle)
+// starts at 0 at boot, matching the spec-mandated post-SetConfiguration
+// state, so there's no PROVEN violation -- but if it ever silently drifts
+// out of sync with the chip's own internal toggle state by any path this
+// investigation hasn't found (a retried transfer, a missed edge case
+// anywhere in dwc2_wifi_bulk_out's own history), the chip's USB layer
+// would ACK the bulk-OUT transfer as a normal protocol-level duplicate
+// while silently discarding its payload -- which would look EXACTLY like
+// tonight's symptom (XFERCOMPL confirmed, zero actual 802.11 TX) regardless
+// of how correct the frame bytes and MAC registers are. CLEAR_FEATURE(
+// ENDPOINT_HALT) is the one spec-guaranteed way to force BOTH sides back to
+// a known DATA0 state with zero assumptions -- cheap, safe insurance to run
+// once before a join attempt's first bulk-OUT, covering every bulk-OUT
+// this whole join sequence issues (probe request AND Auth Request both).
+// bmRequestType=0x02 (host-to-device, standard, recipient=endpoint),
+// bRequest=1 (CLEAR_FEATURE), wValue=0 (ENDPOINT_HALT), wIndex=ep_addr
+// (the full endpoint address byte, direction bit included -- exactly what
+// usb_wifi_get_bulk_out_epaddr() already returns), wLength=0.
+fn dwc2_build_clear_feature_endpoint_halt_setup(ep_addr: u32) -> i64 {
+  let dma: mut ref i64 = dwc2_dma_scratch_get();
+  let _ = buf_write_byte(dma, 0 as u32, 2 as u32);
+  let _ = buf_write_byte(dma, 1 as u32, 1 as u32);
+  let _ = buf_write_byte(dma, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(dma, 4 as u32, ep_addr & (0xFF as u32));
   let _ = buf_write_byte(dma, 5 as u32, 0 as u32);
   let _ = buf_write_byte(dma, 6 as u32, 0 as u32);
   let _ = buf_write_byte(dma, 7 as u32, 0 as u32);
@@ -28609,11 +29159,68 @@ fn rtl8188cu_mac_queue_setup(devaddr: u32, mps: u32) -> i64 {
   // REG_TRXFF_BNDY+2 = fops->trxff_boundary (0x27ff for rtl8192cu_fops).
   let _ = rtl_reg_write16(devaddr, mps, reg_trxff_bndy + (2 as u32), 0x27FF as u32);
 
+  // BUG FOUND 2026-11-21 (FreeBSD rtwn(4) cross-reference, after the
+  // USB/Linux comparison exhausted every lead without explaining "USB
+  // bulk-OUT completes and ACKs cleanly, chip never transmits"):
+  // REG_TDECTRL (0x208) bits[7:4], R92C_TDECTRL_BLK_DESC_NUM -- the
+  // USB TX-aggregation block-descriptor count -- has never been
+  // written anywhere in this driver for STA/client mode (the only
+  // existing TDECTRL touch is RTL_AP_REG_TDECTRL+2, an entirely
+  // different byte: bit16/BCN_VALID, AP-beacon-specific, nowhere near
+  // this field). FreeBSD's independent rtwn(4) driver
+  // (sys/dev/rtwn/rtl8192c/usb/r92cu_attach.c/r92cu_init.c) sets this
+  // unconditionally during ordinary USB bring-up, not gated on any
+  // chip variant: `tx_agg_desc_num = 6;` written into this exact
+  // field. Confirmed verbatim against FreeBSD's own r92c_reg.h:
+  // R92C_TDECTRL_BLK_DESC_NUM_M=0x000000f0, _S=4 -- bits[7:4], not
+  // overlapping BCN_VALID (bit16) or anything this driver already
+  // touches. Mechanistically plausible for exactly this symptom: if
+  // the chip's own USB-side aggregation logic needs this count to
+  // recognize "a complete TX descriptor+frame block has arrived,
+  // dequeue it to the MAC" rather than just accumulating bytes the
+  // host-side USB transaction itself is fully satisfied by (ACK
+  // requires nothing more than correct byte count/handshake, not that
+  // the receiving block-aggregation logic ever considered the block
+  // complete) -- read-modify-write since this field has never been
+  // touched before and its real post-reset default is unverified; not
+  // overwriting the rest of the byte.
+  let reg_tdectrl: u32 = 0x0208 as u32;
+  let tdectrl_before: u32 = rtl_reg_read8(devaddr, mps, reg_tdectrl);
+  let tdectrl_cleared: u32 = tdectrl_before & ((0xF0 as u32) ^ (0xFF as u32));
+  let tdectrl_val: u32 = tdectrl_cleared | ((6 as u32) << (4 as u32));
+  let _ = rtl_reg_write8(devaddr, mps, reg_tdectrl, tdectrl_val);
+  let _ = uart_puts("USB: RTL8188CU TDECTRL BLK_DESC_NUM set, before=0x");
+  let _ = uart_put_hex32(tdectrl_before);
+  let _ = uart_puts(" after=0x");
+  let _ = uart_put_hex32(tdectrl_val);
+  let _ = uart_puts("\n");
+
   let _ = uart_puts("USB: RTL8188CU MAC queue/page setup complete\n");
   return 0;
 }
 
 fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
+  // BUG FOUND 2026-11-21 (warm-reboot real-HW investigation): this
+  // function's own fw_attempt retry loop below is gated on usb_wifi_
+  // ctrl_fail_streak staying under USB_WIFI_CTRL_FAIL_BREAKER_
+  // THRESHOLD -- correct WITHIN one call (a real "stop grinding, the
+  // device went silent" signal), but this is now also called again on
+  // a fresh outer retry after dwc2_enumerate_one_downstream_device's
+  // own caller re-runs dwc2_hub_power_cycle_port (see that call site's
+  // own comment this same round) -- a genuine per-port VBUS
+  // interruption that gives the device a real fresh start. Without
+  // this reset, a streak tripped by the PREVIOUS (pre-power-cycle)
+  // attempt would still read as already-over-threshold here, and the
+  // retry's own fw_attempt loop would exit on its very first check
+  // without even trying once, defeating the whole point of the power-
+  // cycle recovery this round wires in. Safe to reset unconditionally:
+  // in the ordinary first-call case this boot, anything that could
+  // have tripped the streak earlier (LAN9512/generic enumeration) also
+  // necessarily succeeded again since (every dwc2_control_in/out
+  // success already resets it to 0), so it is already 0 by the time
+  // execution reaches here in practice; this only changes behavior for
+  // the retry case it's meant to fix.
+  let _ = usb_wifi_ctrl_fail_streak_set(0 as u32);
   // 2026-11-08 (real-HW `wifi join` hang, root-caused via a Linux
   // rtl8xxxu comparison): usb_wifi_set_kind(1) used to be set HERE,
   // unconditionally, before firmware was even attempted, and nothing
@@ -29226,7 +29833,7 @@ fn critical_config_table_load() -> i64 {
     // rather than just hoping no future caller ever adds enough extra
     // work (a slower card, a larger value, more AEAD overhead) to
     // cross 15s again.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let _ = sdhost_read_block(chosen_base + blk, block_scratch);
@@ -29251,7 +29858,7 @@ fn critical_config_table_flush_one_copy(base_block: i64, new_generation: u32) ->
     // directly after table_load's up to 18 reads with nothing else in
     // between -- the single biggest contributor to this call's own
     // ~10s+ real SD time.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let _ = ssh_copy(block_scratch, 0, table, blk * (512 as i64), 512);
@@ -29261,7 +29868,7 @@ fn critical_config_table_flush_one_copy(base_block: i64, new_generation: u32) ->
     }
     blk = blk + 1;
   }
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
   let _ = buf_write_u32_be(table, 0, critical_config_magic());
@@ -29895,8 +30502,23 @@ fn rtl_tx_desc_write(out: mut ref i64, frame_len: i64, is_broadcast: i64, seq_nu
   // alone, to avoid silently setting bit20 (NAV_USE_HDR) by accident --
   // that would be a self-inflicted bug distinct from the real one this
   // fix is chasing.
-  let txdesc_macid: i64 = 7; // RATR_INX_WIRELESS_MC
-  let txdesc_rate_id: i64 = (0xC + 7) & 0xF; // 3 (0x13 masked to the real 4-bit field width)
+  // BUG FOUND 2026-11-20 (real usbmon capture of an ACTUAL Auth Request
+  // TX descriptor, from the working Linux driver on the exact same
+  // physical dongle, bus 1 device 015, 62-byte bulk-OUT = 32-byte
+  // descriptor + 30-byte Open-System Auth frame): ground truth proves
+  // the previous values here -- MACID=7/RATE_ID=3 via the "0xC+ratr_
+  // index" formula -- were simply wrong, not just unverified. The real
+  // captured dword1 = 0x00071240: MACID bits[4:0]=0x00 (not 7), RATE_ID
+  // bits[19:16]=0x07 (not 3). This is rtl92cu_tx_fill_desc's OTHER
+  // branch (`if (rtlpriv->dm.useramask) { set_tx_desc_rate_id(ratr_
+  // index); set_tx_desc_macid(mac_id); }` -- ratr_index/mac_id used
+  // directly, no +0xC offset), not the branch previously assumed.
+  // Everything else in the captured descriptor (frame_len=30, offset=32,
+  // flags=0x8c, QUEUE_SEL=0x12/MGNT, dword2=0, dword4=0x100/USE_DRIVER_
+  // RATE, dword5=0x1ff00, dword6=0) already matched this driver's own
+  // computed values exactly -- this was the only real divergence.
+  let txdesc_macid: i64 = 0;
+  let txdesc_rate_id: i64 = 7;
   let txdw1: i64 = txdesc_macid | (RTL_TXDESC_QUEUE_MGNT << 8) | RTL_TXDESC32_AGG_BREAK | (txdesc_rate_id << 16);
   let _ = buf_write_u32_le(out, 4, txdw1 as u32);
 
@@ -29963,7 +30585,7 @@ fn rtl_tx_desc_self_test() -> i64 {
   if buf_read_u16_le(out, 0) != (30 as u32) { ok = 0; }
   if buf_read_byte(out, 2 as u32) != (32 as u32) { ok = 0; }
   if buf_read_byte(out, 3 as u32) != (0x8c as u32) { ok = 0; } // OWN|FS|LS, no broadcast bit
-  if buf_read_u32_le(out, 4) != ((7 | (0x12 << 8) | 0x40 | (3 << 16)) as u32) { ok = 0; } // MACID=7 | QUEUE_MGNT | AGG_BREAK | RATE_ID=3 (0xC+7 masked to the real 4-bit field)
+  if buf_read_u32_le(out, 4) != ((0 | (0x12 << 8) | 0x40 | (7 << 16)) as u32) { ok = 0; } // MACID=0 | QUEUE_MGNT | AGG_BREAK | RATE_ID=7 (real usbmon-captured values, 2026-11-20)
   if buf_read_u32_le(out, 12) != ((1 << 16) as u32) { ok = 0; }
   if buf_read_u32_le(out, 16) != (0x100 as u32) { ok = 0; }
   if buf_read_u32_le(out, 20) != (((0x1F << 8) | (0xF << 13)) as u32) { ok = 0; }
@@ -31421,6 +32043,23 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
   let hctsiz0: i64 = dwc2_hctsiz0_addr();
   let hcdma0: i64 = dwc2_hcdma0_addr();
 
+  // Round 2026-11-21: runtime TX-pipeline trace -- captures this exact
+  // call's real descriptor+frame bytes and raw USB completion
+  // registers into a persistent buffer, overwritten on every TX, with
+  // NO printing and NO extra delay here (just register/byte copies
+  // already being done anyway) -- see boot/wifi_txtrace_state.S's own
+  // header comment for the full "why". Printed only later, by
+  // wifi_real_join's own existing diagnostic path, strictly after
+  // this transfer's own timing-critical window has already closed.
+  let trace_buf: mut ref i64 = wifi_txtrace_bytes_get();
+  let tbi: i64 = 0;
+  let trace_len: i64 = if out_len > (96 as i64) { 96 } else { out_len };
+  while tbi < trace_len {
+    let _ = buf_write_byte(trace_buf, tbi as u32, buf_read_byte(buf, tbi as u32));
+    tbi = tbi + 1;
+  }
+  let _ = wifi_txtrace_begin(devaddr, epaddr, mps, out_len as u32);
+
   let i: i64 = 0;
   while i < out_len {
     let b: u32 = buf_read_byte(buf, i as u32);
@@ -31434,14 +32073,100 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
   let pktcnt: u32 = if out_len == 0 { 1 as u32 } else { ((out_len as u32) + mps - (1 as u32)) / mps };
   let _ = dwc2_reset_chan0_for_new_transfer();
   let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
-  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, out_len as u32));
-  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps));
+  let hctsiz_written: u32 = dwc2_build_hctsiz(pid, pktcnt, out_len as u32);
+  let hcchar_written: u32 = dwc2_build_hcchar(devaddr, 2 as u32, 0 as u32, epnum, mps);
+  let _ = mmio_write_u32(hctsiz0, hctsiz_written);
+  let _ = mmio_write_u32(hcchar0, hcchar_written);
   let result: u32 = dwc2_wait_chan0_done();
+  let _ = wifi_txtrace_set_usb(hctsiz_written, hcchar_written, result);
+  let _ = wifi_txtrace_set_after(mmio_read_u32(hctsiz0), mmio_read_u32(hcchar0));
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
   let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
   let _ = usb_wifi_set_out_toggle(next_toggle);
+  return 0;
+}
+
+// Prints the runtime TX-pipeline trace captured by dwc2_wifi_bulk_out
+// (see that function's own comment, and boot/wifi_txtrace_state.S's
+// header comment, for the full "why"). Unconditional (not gated by
+// boot_debug_enabled()) -- called exactly once, after a join attempt
+// has already concluded, from wifi_real_join's own existing failure-
+// diagnostic path, so this never runs inside any timing-sensitive
+// loop. Dumps the full 32-byte TX descriptor and up to 64 bytes of
+// the real 802.11 frame body that followed it, plus the raw USB
+// completion registers from that exact transfer -- boundaries A/B/C
+// from the runtime-instrumentation request this round: frame
+// construction, descriptor preparation, and USB bulk-OUT submission/
+// completion, all from the SAME captured call, not reconstructed
+// after the fact.
+fn wifi_txtrace_dump() -> i64 {
+  if wifi_txtrace_valid_get() != (1 as u32) {
+    let _ = uart_puts("wifi join DIAG: TX trace -- no frame was ever handed to dwc2_wifi_bulk_out this attempt (nothing to trace)\n");
+    return 0;
+  }
+  let devaddr: u32 = wifi_txtrace_devaddr_get();
+  let epaddr: u32 = wifi_txtrace_epaddr_get();
+  let mps: u32 = wifi_txtrace_mps_get();
+  let out_len: u32 = wifi_txtrace_out_len_get();
+  let _ = uart_puts("wifi join DIAG: TX trace (last frame handed to USB) devaddr=0x");
+  let _ = uart_put_hex32(devaddr);
+  let _ = uart_puts(" epaddr=0x");
+  let _ = uart_put_hex32(epaddr);
+  let _ = uart_puts(" mps=0x");
+  let _ = uart_put_hex32(mps);
+  let _ = uart_puts(" out_len=0x");
+  let _ = uart_put_hex32(out_len);
+  let _ = uart_puts("\n");
+
+  let hctsiz_w: u32 = wifi_txtrace_hctsiz_written_get();
+  let hcchar_w: u32 = wifi_txtrace_hcchar_written_get();
+  let hcint_r: u32 = wifi_txtrace_hcint_result_get();
+  let hctsiz_a: u32 = wifi_txtrace_hctsiz_after_get();
+  let hcchar_a: u32 = wifi_txtrace_hcchar_after_get();
+  let _ = uart_puts("wifi join DIAG: TX trace USB: HCTSIZ_written=0x");
+  let _ = uart_put_hex32(hctsiz_w);
+  let _ = uart_puts(" HCCHAR_written=0x");
+  let _ = uart_put_hex32(hcchar_w);
+  let _ = uart_puts(" HCINT_result=0x");
+  let _ = uart_put_hex32(hcint_r);
+  let _ = uart_puts(" (bit0 XFERCOMPL=");
+  let _ = uart_put_hex32(hcint_r & (1 as u32));
+  let _ = uart_puts(") HCTSIZ_after=0x");
+  let _ = uart_put_hex32(hctsiz_a);
+  let _ = uart_puts(" (xfersize_remaining=0x");
+  let _ = uart_put_hex32(hctsiz_a & (0x7FFFF as u32));
+  let _ = uart_puts(" pktcnt_remaining=0x");
+  let _ = uart_put_hex32((hctsiz_a >> (19 as u32)) & (0x3FF as u32));
+  let _ = uart_puts(") HCCHAR_after=0x");
+  let _ = uart_put_hex32(hcchar_a);
+  let _ = uart_puts(" (CHENA=");
+  let _ = uart_put_hex32((hcchar_a >> (31 as u32)) & (1 as u32));
+  let _ = uart_puts(")\n");
+
+  let trace_buf: mut ref i64 = wifi_txtrace_bytes_get();
+  let _ = uart_puts("wifi join DIAG: TX trace descriptor (32 bytes): ");
+  let di: i64 = 0;
+  while di < 32 {
+    let _ = uart_put_hex_byte(buf_read_byte(trace_buf, di as u32));
+    let _ = uart_puts(" ");
+    di = di + 1;
+  }
+  let _ = uart_puts("\n");
+
+  let out_len_i: i64 = out_len as i64;
+  let cap: i64 = if out_len_i > (96 as i64) { 96 } else { out_len_i };
+  let _ = uart_puts("wifi join DIAG: TX trace frame body (");
+  let _ = uart_put_i64(cap - 32);
+  let _ = uart_puts(" bytes): ");
+  let fj: i64 = 32;
+  while fj < cap {
+    let _ = uart_put_hex_byte(buf_read_byte(trace_buf, fj as u32));
+    let _ = uart_puts(" ");
+    fj = fj + 1;
+  }
+  let _ = uart_puts("\n");
   return 0;
 }
 
@@ -32009,16 +32734,45 @@ fn rtl_rf_reg_read(devaddr: u32, mps: u32, reg: u32) -> u32 {
 
 // The register-write half of MAC bring-up: engine-enable bits, receive
 // filtering, the TX-pause gate, and the station's own MAC address --
-// all confirmed exact bit values against `rtl8xxxu_init_device()`/
-// `regs.h`. `REG_TXPAUSE` is the single easiest piece to miss and the
-// one flagged by this round's own research as causing a completely
-// silent TX blackhole if skipped: the reference driver's own reset/
-// power-down paths write 0xff (pause every queue) and only clear it
-// inside its own RF-enable function -- written explicitly here rather
-// than left to be an implicit side effect of something else.
+// originally "confirmed exact bit values against `rtl8xxxu_init_device()`/
+// `regs.h`" -- but that's the WRONG driver family for this exact chip
+// (same mistake already found and fixed once this investigation, in the
+// TX descriptor's MACID/RATE_ID fields -- see rtl_tx_desc_write's own
+// header comment). Re-checked against the actual correct reference,
+// rtlwifi's rtl8192cu (hw.c, the MAC-init routine that runs before
+// firmware download even starts): its own REG_CR write is a 16-bit
+// read-modify-write that ORs in NINE bits, not eight -- HCI_TXDMA_EN(0)|
+// HCI_RXDMA_EN(1)|TXDMA_EN(2)|RXDMA_EN(3)|PROTOCOL_EN(4)|SCHEDULE_EN(5)|
+// MACTXEN(6)|MACRXEN(7)|**ENSEC(9)** -- unconditionally, not gated behind
+// "only once a key is installed" the way rtl8xxxu's own, DIFFERENT
+// design does it (confirmed separately: rtl8xxxu only sets its own
+// CR_SECURITY_ENABLE bit inside its key-install callback, never at
+// bring-up -- a real, legitimate difference in chip-generation design,
+// not an inconsistency to paper over). A live real-HW register read
+// during an actual failed join attempt confirmed this exactly:
+// REG_CR=0x00FF, bit 9 never set, for the chip's entire lifetime since
+// boot -- this function is the only place REG_CR is ever written, so
+// whatever it leaves out stays out permanently. `REG_TXPAUSE` is the
+// other easiest piece to miss and the one flagged by this round's own
+// earlier research as causing a completely silent TX blackhole if
+// skipped: the reference driver's own reset/power-down paths write 0xff
+// (pause every queue) and only clear it inside its own RF-enable
+// function -- written explicitly here rather than left to be an
+// implicit side effect of something else (confirmed via the same live
+// register read: TXPAUSE=0x00, already correct, not this round's bug).
 fn rtl8188cu_enable_engines(devaddr: u32, mps: u32) -> i64 {
-  let cr_bits: u32 = 0xff as u32; // TXDMA|RXDMA(HCI)|TXDMA|RXDMA|PROTOCOL|SCHEDULE|MAC_TX|MAC_RX enable, all 8 bits
-  let _ = rtl_reg_write8(devaddr, mps, RTL_REG_CR, cr_bits);
+  let cr_existing: u32 = rtl_reg_read16(devaddr, mps, RTL_REG_CR);
+  let hci_txdma_en: u32 = 1 as u32;
+  let hci_rxdma_en: u32 = 1 << 1;
+  let txdma_en: u32 = 1 << 2;
+  let rxdma_en: u32 = 1 << 3;
+  let protocol_en: u32 = 1 << 4;
+  let schedule_en: u32 = 1 << 5;
+  let mactxen: u32 = 1 << 6;
+  let macrxen: u32 = 1 << 7;
+  let ensec: u32 = 1 << 9;
+  let cr_bits: u32 = cr_existing | hci_txdma_en | hci_rxdma_en | txdma_en | rxdma_en | protocol_en | schedule_en | mactxen | macrxen | ensec;
+  let _ = rtl_reg_write16(devaddr, mps, RTL_REG_CR, cr_bits);
   return 0;
 }
 
@@ -33006,6 +33760,20 @@ fn rtl8188cu_efuse_read_and_parse(devaddr: u32, mps: u32) -> i64 {
   let cck_a: mut ref i64 = wifi_efuse_cck_a_get();
   let ofdmbase_a: mut ref i64 = wifi_efuse_ofdmbase_a_get();
   let mcsbase_a: mut ref i64 = wifi_efuse_mcsbase_a_get();
+
+  // Round 2026-11-21: the dongle's own real factory MAC, logical
+  // offset 0x16 -- this same parse already proved (during the round
+  // that first wrote this function) that it correctly reconstructs
+  // this exact field, but nothing stored or used it until now. See
+  // wifi_real_own_mac's own header comment for why this specific
+  // value, not an invented one, is the next thing worth trying.
+  let mac: mut ref i64 = wifi_efuse_mac_get();
+  let mi: i64 = 0;
+  while mi < 6 {
+    let _ = buf_write_byte(mac, mi as u32, buf_read_byte(logical, (0x16 + mi) as u32));
+    mi = mi + 1;
+  }
+
   let g: i64 = 0;
   while g < 3 {
     let cck_idx: i64 = buf_read_byte(logical, (0x5a + g) as u32) as i64;
@@ -33047,6 +33815,14 @@ fn rtl8188cu_efuse_read_and_parse(devaddr: u32, mps: u32) -> i64 {
   let _ = uart_puts("/");
   let _ = uart_put_hex_byte(buf_read_byte(mcsbase_a, 2));
   let _ = uart_puts("\n");
+  let _ = uart_puts("USB: RTL8188CU EFUSE real factory MAC=");
+  let mi2: i64 = 0;
+  while mi2 < 6 {
+    let _ = uart_put_hex_byte(buf_read_byte(mac, mi2 as u32));
+    if mi2 < 5 { let _ = uart_puts(":"); }
+    mi2 = mi2 + 1;
+  }
+  let _ = uart_puts(" (wifi_real_own_mac() now uses this instead of a synthetic address)\n");
 
   // BUG FOUND 2026-11-20 (call-stack trace of rtl8192cu/hw.c's real
   // `_initpabias`, fetched verbatim): a genuine Power Amplifier bias fix,
@@ -33354,13 +34130,37 @@ fn rtl8188cu_init_sta_mac_params(devaddr: u32, mps: u32) -> i64 {
   // (bits[7:0]), both 0x30 (48) -- matches Linux's own set_retry(0x30,0x30).
   let _ = rtl_reg_write16(devaddr, mps, 0x042a as u32, 0x3030 as u32);
 
-  // SIFS timing (steady-state values; the real driver's own transient
-  // double-write of a DIFFERENT spec-SIFS value around its own retry-
-  // limit write is a chip-timing nuance for that specific write
-  // sequence, not a steady-state requirement -- not ported).
-  let _ = rtl_reg_write16(devaddr, mps, 0x063a as u32, 0x100a as u32); // REG_MAC_SPEC_SIFS
-  let _ = rtl_reg_write16(devaddr, mps, 0x0514 as u32, 0x100a as u32); // REG_SIFS_CCK
-  let _ = rtl_reg_write16(devaddr, mps, 0x0516 as u32, 0x100a as u32); // REG_SIFS_OFDM
+  // BUG FOUND 2026-11-20 (methodical full-function re-read of the real
+  // rtl92c_init_edca(), not a reactive single-address grep): that
+  // function writes REG_SIFS_CCK/REG_SIFS_OFDM TWICE each -- once via
+  // rtl92c_set_cck_sifs(0xa,0xa)/rtl92c_set_ofdm_sifs(0xe,0xe) (two
+  // separate byte writes each), then immediately overwritten by an
+  // explicit word write: REG_SIFS_CCK=0x0a0a, REG_SIFS_OFDM=0x1010 --
+  // the SECOND write is what actually survives as the real, final,
+  // steady-state value. This driver had BOTH registers set to the same
+  // wrong value, 0x100a -- matching NEITHER real final value (wrong on
+  // SIFS_CCK's high byte, wrong on BOTH of SIFS_OFDM's bytes). SIFS is
+  // a core, standardized 802.11 CSMA/CA timing parameter the MAC's own
+  // channel-access logic depends on directly -- getting it wrong is
+  // exactly the class of bug that can misalign real backoff/response
+  // timing without producing any error status anywhere.
+  // REG_MAC_SPEC_SIFS (0x063a) left unchanged -- not confirmed against
+  // this exact function (it doesn't appear in rtl92c_init_edca's own
+  // body), flagging rather than guessing a fix for it.
+  let _ = rtl_reg_write16(devaddr, mps, 0x063a as u32, 0x100a as u32); // REG_MAC_SPEC_SIFS (not yet re-verified)
+  let _ = rtl_reg_write16(devaddr, mps, 0x0514 as u32, 0x0a0a as u32); // REG_SIFS_CCK
+  let _ = rtl_reg_write16(devaddr, mps, 0x0516 as u32, 0x1010 as u32); // REG_SIFS_OFDM
+
+  // BUG FOUND 2026-11-20 (sibling-issue sweep after the EDCA/NAV audit):
+  // REG_SPEC_SIFS (0x0428) -- a DIFFERENT register from 0x063a above,
+  // despite the similar name -- is the real rtl92c_init_adaptive_ctrl's
+  // own unconditional, steady-state SIFS write ("SIFS (used in NAV)",
+  // the real driver's own comment), immediately alongside its RRSR and
+  // retry-limit writes above -- not the transient one the comment just
+  // above this already correctly declined to port. Never written
+  // anywhere in this codebase before now; same NAV-timing-family gap
+  // class as REG_RD_CTRL/REG_PROT_MODE_CTRL/REG_NAV_PROT_LEN just above.
+  let _ = rtl_reg_write16(devaddr, mps, 0x0428 as u32, 0x1010 as u32); // REG_SPEC_SIFS
 
   // Round 2026-11-18 (real-HW usbmon ground-truth capture, structural
   // trace of a complete real connect sequence): REG_SLOT (0x051b, the
@@ -33384,6 +34184,29 @@ fn rtl8188cu_init_sta_mac_params(devaddr: u32, mps: u32) -> i64 {
   let _ = rtl_reg_write32(devaddr, mps, 0x050c as u32, 0x0000a44f as u32); // REG_EDCA_BK_PARAM
   let _ = rtl_reg_write32(devaddr, mps, 0x0504 as u32, 0x005ea324 as u32); // REG_EDCA_VI_PARAM
   let _ = rtl_reg_write32(devaddr, mps, 0x0500 as u32, 0x002fa226 as u32); // REG_EDCA_VO_PARAM
+
+  // BUG FOUND 2026-11-20 (real usbmon capture of a genuine reconnect
+  // sequence from the actual working driver on this exact chip, cross-
+  // checked against the real rtl92c_init_edca() source, rtl8192cu/
+  // mac.c): this function only ever ported the 4 EDCA_xx_PARAM queue
+  // writes above out of rtl92c_init_edca()'s real 10 total writes --
+  // the other 6 were never carried over. Of those, these 4 are
+  // genuinely new (the other 2, REG_BCNDMATIM and the NAV_UPPER/
+  // BAR_MODE_CTRL-adjacent ones, were already covered -- see this same
+  // function's own NAV_UPPER/BAR_MODE_CTRL comments below, though that
+  // earlier round's own REG_BAR_MODE_CTRL value turns out to have been
+  // checked against the wrong source too -- corrected there as well).
+  // REG_RD_CTRL's DIS_EDCA_CNT_DWN bit ("disable EDCCA count down, to
+  // reduce collision and retry" -- the real driver's own comment) and
+  // REG_PROT_MODE_CTRL/REG_NAV_PROT_LEN are directly in the same
+  // channel-access/NAV family already suspected of being able to make
+  // a queued frame wait indefinitely for a "clear channel" grant that
+  // never resolves -- exactly this investigation's standing symptom.
+  let rd_ctrl: u32 = rtl_reg_read16(devaddr, mps, 0x0524 as u32); // REG_RD_CTRL
+  let _ = rtl_reg_write16(devaddr, mps, 0x0524 as u32, rd_ctrl | (0x0800 as u32)); // DIS_EDCA_CNT_DWN = BIT(11)
+  let _ = rtl_reg_write16(devaddr, mps, 0x04c8 as u32, 0x0204 as u32); // REG_PROT_MODE_CTRL
+  let _ = rtl_reg_write16(devaddr, mps, 0x0546 as u32, 0x0040 as u32); // REG_NAV_PROT_LEN
+  let _ = rtl_reg_write8(devaddr, mps, 0x055a as u32, 0x02 as u32); // REG_ATIMWND
 
   // Data/response auto-rate-fallback retry-count tables.
   let _ = rtl_reg_write32(devaddr, mps, 0x0430 as u32, 0x00000000 as u32); // REG_DARFRC
@@ -33451,7 +34274,13 @@ fn rtl8188cu_init_sta_mac_params(devaddr: u32, mps: u32) -> i64 {
   let _ = rtl_reg_write8(devaddr, mps, 0x0652 as u32, 0xeb as u32); // REG_NAV_UPPER (30000us cap)
 
   let _ = rtl_reg_write8(devaddr, mps, 0x0423 as u32, 0xff as u32); // REG_HWSEQ_CTRL
-  let _ = rtl_reg_write32(devaddr, mps, 0x04cc as u32, 0x0201ffff as u32); // REG_BAR_MODE_CTRL
+  // BUG FOUND 2026-11-20: this value (0x0201ffff) was checked against
+  // the wrong driver family (same recurring mistake as the TX
+  // descriptor's MACID/RATE_ID fields) -- the real rtl8192cu/rtlwifi
+  // source (mac.c's rtl92c_init_edca, the ONLY write to this register
+  // anywhere in that driver's init path) writes 0x014004, confirmed
+  // directly from source, not inferred.
+  let _ = rtl_reg_write32(devaddr, mps, 0x04cc as u32, 0x014004 as u32); // REG_BAR_MODE_CTRL
   let _ = rtl_reg_write32(devaddr, mps, 0x0670 as u32, 0xC0000000 as u32); // REG_CAM_CMD (CAM_CMD_POLLING|BIT30)
 
   // BUG FOUND 2026-11-19 (same full-stack audit as REG_NAV_UPPER above):
@@ -33625,6 +34454,20 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   // which is why only the first, broadcast-only stage of the join ever
   // worked. Use wifi_real_own_mac() here too, so the hardware filter
   // and every frame's own claimed source address finally agree.
+  // Round 2026-11-18: one-shot EFUSE read -- see rtl8188cu_efuse_read_
+  // and_parse's own header comment. MOVED HERE 2026-11-21 (was
+  // previously at the very end of this function, right before the
+  // "bring-up complete" print): wifi_real_own_mac() (called immediately
+  // below, for REG_MACID) now reads this same EFUSE-derived real MAC --
+  // calling it before this parse has run would reintroduce exactly the
+  // 2026-11-16 REG_MACID/frame-source-address mismatch bug this same
+  // function already fixed once (see that bug's own comment right
+  // below), just via a different path. Still runs before the caller's
+  // first rtl8188cu_set_channel (which applies the TX-power/PA-bias
+  // part of this same parse's result) -- only moved earlier WITHIN this
+  // one-boot-time bring-up function, not past it.
+  let _ = rtl8188cu_efuse_read_and_parse(devaddr, mps);
+
   // BUG FOUND 2026-11-16 (full heap-leak audit) -- see scratch_state.S's
   // own comment on rtl8188cu_mac_buf_scratch_addr.
   let mac_buf: mut ref i64 = rtl8188cu_mac_buf_scratch_get();
@@ -33678,11 +34521,42 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   let fpga_rf_mode_cck: u32 = (1 << 24) as u32;
   let fpga_rf_mode_ofdm: u32 = (1 << 25) as u32;
   let _ = rtl_reg_write32(devaddr, mps, 0x0800 as u32, fpga_rf_mode | fpga_rf_mode_cck | fpga_rf_mode_ofdm);
-  let _ = rtl8188cu_lc_calibrate(devaddr, mps);
+  // BUG FOUND 2026-11-21 (real-HW investigation, after an external
+  // monitor-mode capture independently confirmed ZERO RF energy ever
+  // leaves the antenna during `wifi join` -- 0 of 6112 packets on a
+  // confirmed-busy channel, timing-overlapped with the actual attempt
+  // -- ruling out every digitally-checkable thing already verified
+  // this session byte-for-byte against a real capture: TX descriptor,
+  // TX power, PA bias, antenna/PA-enable switch, MAC address, frame
+  // content/sequencing). A systematic trace of Linux's real rtl92cu_
+  // hw_init() call order (rtlwifi/rtl8192cu/hw.c) found this port's
+  // own calibration order is EXACTLY INVERTED: the real driver always
+  // runs IQ calibration FIRST, then LC calibration -- this port ran
+  // LC-calibrate first, IQK second, ever since IQK was added (BUG
+  // FOUND 2026-11-13's own comment below is a development-sequencing
+  // note about when the code was WRITTEN, not a verified check of the
+  // real runtime order -- nobody went back to confirm it against
+  // rtl92cu_hw_init once IQK existed). IQ calibration measures and
+  // corrects TX/RX mixer I/Q amplitude/phase imbalance at the LO's
+  // CURRENT center frequency via an internal loopback; LC calibration
+  // retunes the LO tank's own absolute frequency -- running LC-cal
+  // first and IQK second (this port's old order) computes the I/Q
+  // correction AFTER the retune (fine), but running IQK first and
+  // LC-cal second means IQK's own correction is computed, then
+  // immediately invalidated by the LC retune that follows it. Swapped
+  // to match the real driver's own order exactly: IQK before LC-cal.
+  // A transmission modulated through a stale/wrong I/Q correction can
+  // be bad enough that no receiver -- including a monitor-mode
+  // capture -- ever locks onto a valid 802.11 PLCP preamble, which is
+  // consistent with zero captured packets (not merely degraded range
+  // or occasional drops), while RX staying unaffected (a separate
+  // chain, already proven healthy before this calibration pair ever
+  // mattered for RX either).
+  let _ = rtl8188cu_iq_calibrate(devaddr, mps);
   // BUG FOUND 2026-11-13 ("wifi listen" still 0/300 raw bulk-IN
   // successes after LC calibration alone -- see rtl8188cu_iq_
   // calibrate's own header comment for the full IQK port this adds).
-  let _ = rtl8188cu_iq_calibrate(devaddr, mps);
+  let _ = rtl8188cu_lc_calibrate(devaddr, mps);
   // BUG FOUND 2026-11-15 (real-HW investigation, continued: TX confirmed
   // completing via HCINT XFERCOMPL on channel-0 bulk-OUT -- see the new
   // dwc2_wifi_bulk_in TX diagnostic this same round -- yet bulk-IN
@@ -33793,18 +34667,6 @@ fn rtl8188cu_mac_bringup(devaddr: u32, mps: u32) -> i64 {
   // leaving our earlier 0x10 as the final state (only the low byte
   // changes -- the high byte, REG_BEACON_CTRL_1/0x0551, is untouched).
   let _ = rtl_reg_write8(devaddr, mps, 0x0550 as u32, 0x18 as u32);
-
-  // Round 2026-11-18: one-shot EFUSE read -- see rtl8188cu_efuse_read_
-  // and_parse's own header comment. Must run before the caller's first
-  // rtl8188cu_set_channel (which is what actually applies the result),
-  // so here, at the very end of bring-up, not inside set_channel
-  // itself (which real joins call repeatedly per retune -- this only
-  // ever needs to run once per boot). Also now does the real driver's
-  // own `_initpabias` PA-bias fix (see that function's own header
-  // comment inside rtl8188cu_efuse_read_and_parse) -- naturally placed
-  // here since it needs the same EFUSE logical map this call already
-  // reads, and the real driver runs it at this same late stage too.
-  let _ = rtl8188cu_efuse_read_and_parse(devaddr, mps);
 
   let _ = uart_puts("USB: RTL8188CU MAC-layer bring-up complete (LLT/CR/RCR/MACID/RF-enable/CCK+OFDM-enable/LC-calibrate/IQK/RXFLTMAP/AGC-IGI) -- caller must still call rtl8188cu_set_channel before expecting real traffic\n");
   return 0;
@@ -36888,7 +37750,7 @@ fn hci_send_command_and_get_complete(devaddr: u32, mps: u32, intr_mps: u32, cmd_
     // same 20-tries-of-a-fast-NAK shape can still add up, and the
     // existing boot-time checkpoint kicks are not guaranteed to land
     // inside this specific window.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let event_len: i64 = dwc2_hci_interrupt_in(devaddr, intr_mps, event_buf, intr_mps as i64);
@@ -36920,7 +37782,7 @@ fn hci_send_command_and_wait_complete(devaddr: u32, mps: u32, intr_mps: u32, cmd
   while tries < 20 {
     // 2026-10-25 fix: same gap, same reason -- see this sibling
     // function's own identical fix just above.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let event_len: i64 = dwc2_hci_interrupt_in(devaddr, intr_mps, event_buf, intr_mps as i64);
@@ -37632,7 +38494,7 @@ fn dwc2_hub_port_debounce_connected(hub_addr: u32, hub_mps: u32, port: u32) -> i
   let stable_since_us: u32 = start_us;
   let result: i64 = 0 - 2; // sentinel: loop exited without a verdict
   while (wrapping_sub(mmio_read_u32(TIMER_CLO), start_us) < total_budget_us) && (result == (0 - 2)) {
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
+    if hardware_is_real_hw_get() == (1 as u32) { let _ = watchdog_kick(); }
     let status_result: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
     if status_result != 0 {
       result = 0 - 1;
@@ -37704,7 +38566,7 @@ fn dwc2_hub_bring_up_port(hub_addr: u32, hub_mps: u32, port: u32) -> i64 {
     // TASK #353 REAL-HW FOLLOW-UP #8: see dwc2_wait_chan0_done's own
     // comment -- this loop's own up-to-20x delay(161000) (~1s worst
     // case per port) is part of the same cross-port accumulation risk.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
+    if hardware_is_real_hw_get() == (1 as u32) { let _ = watchdog_kick(); }
     let status_result: i64 = dwc2_hub_get_port_status(hub_addr, hub_mps, port, status_buf);
     if status_result != 0 {
       let _ = uart_puts("USB: hub GET_PORT_STATUS failed\n");
@@ -37910,7 +38772,7 @@ fn dwc2_enumerate_downstream(hub_mps: u32, real_port_count: i64) -> i64 {
   let connected_count: i64 = 0;
   let port: i64 = 1;
   while port <= port_count {
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = watchdog_kick(); }
+    if hardware_is_real_hw_get() == (1 as u32) { let _ = watchdog_kick(); }
     let addr: u32 = dwc2_downstream_addr_for_port(port);
     // TEMP DIAGNOSTIC (2026-10-29): bracket each port's own attempt so
     // a real-HW capture can tell which specific port succeeded/failed,
@@ -38214,9 +39076,33 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
   // bulk endpoints -- needed for the real TX/RX work below, not just
   // detection. rtl8188cu_probe itself still runs after, unconditional
   // on the config-descriptor walk (see its own comment for why).
-  if is_rtl8188cu == (1 as u32) {
-    let _ = rtl8188cu_probe(downstream_addr, dmps0);
-  }
+  //
+  // BUG FOUND 2026-11-21 (warm-reboot real-HW investigation, user:
+  // "should there not be a way to cleanly handle this with warm boot
+  // too... seems like kernel defect"): this call's own status used to
+  // be thrown away (`let _ =`). A warm `reboot` (no USB power loss)
+  // left the RTL8188CU with firmware already running from the
+  // PREVIOUS boot; rtl8188cu_probe's own already-running/reset-8051
+  // recovery (see its own comment) wasn't enough on its own, every
+  // subsequent control transfer went unanswered, and it correctly
+  // gave up (usb_wifi_ctrl_fail_streak's own breaker) rather than
+  // grinding through more doomed retries. But THIS function (every
+  // downstream device's shared entry point) always `return 0;` at its
+  // own end regardless -- so dwc2_hub_bring_up_and_enumerate_port's
+  // caller saw "outcome=0" (success) and never got a chance to react,
+  // even though it already has exactly the right medicine: a real,
+  // per-port VBUS power-cycle (dwc2_hub_power_cycle_port, fired at its
+  // own retry loop's midpoint attempt) that this project's own 2026-
+  // 11-09 investigation already proved clears a wedge that a bus
+  // reset alone can't -- it was just never wired to this specific
+  // failure signal. Capturing the real status here and returning it
+  // (WiFi only; LAN9512/BT/MSD below are unaffected, same as before)
+  // lets that already-built, already-proven, per-port-scoped recovery
+  // (confirmed via LPSM=1 individual-port-switching -- it does NOT
+  // touch the hub's OTHER port, so the onboard LAN9512 Ethernet is
+  // left running) actually engage for this failure class too, instead
+  // of only for a plain GET_DESCRIPTOR/SET_ADDRESS failure.
+  let rtl8188cu_status: i64 = if is_rtl8188cu == (1 as u32) { rtl8188cu_probe(downstream_addr, dmps0) } else { 0 };
   // Round 56: index 0 might not be a configuration this driver knows
   // how to use at all (found live: QEMU's usb-net device's index 0 is
   // its RNDIS config, which this driver deliberately doesn't drive --
@@ -38273,6 +39159,9 @@ fn dwc2_enumerate_one_downstream_device(downstream_addr: u32) -> i64 {
     // same device, not just the low-level usb_msd_read10/write10
     // primitives round 35 already proved.
     let _ = dharafs_block_dev_self_check();
+  }
+  if rtl8188cu_status != 0 {
+    return rtl8188cu_status;
   }
   return 0;
 }
@@ -41775,7 +42664,7 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
     let raw_blk: i64 = 0;
     let raw_wr_status: i64 = 0;
     while raw_blk < raw_block_count {
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         let _ = watchdog_kick();
       }
       let raw_off: i64 = raw_blk * (512 as i64);
@@ -44125,7 +45014,7 @@ fn shell_dispatch_dharafs_catchup() -> i64 {
   let _ = uart_put_hex32(dharafs_state_get_next_block());
   let _ = uart_puts("\n");
   while calls < max_calls {
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let _ = dharafs_compact(buf, path_buf, data_buf);
@@ -44608,7 +45497,7 @@ fn shell_dispatch_hid(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64
       // fix for the full "why", including shell_dispatch's own
       // ceiling-2 wrap blocking every other task for this command's
       // entire duration.
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         let _ = watchdog_kick();
       }
       got_len = dwc2_hid_interrupt_in(dwc2_downstream_addr(), mps, report, mps as i64);
@@ -46182,7 +47071,7 @@ fn shell_dispatch() -> i64 {
           // cheap kick costs nothing and matches this file's own
           // established convention for every other real-hardware-wait
           // loop.
-          if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+          if hardware_is_real_hw_get() == (1 as u32) {
             let _ = watchdog_kick();
           }
           let arp_result: i64 = arp_resolve_poll(dst_ip);
@@ -46274,7 +47163,7 @@ fn shell_dispatch() -> i64 {
       // ceiling-2 wrap, waiting on a real external host's ICMP reply
       // (which may be slow, or never arrive at all for an unreachable
       // host) with no dedicated kick of its own.
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         let _ = watchdog_kick();
       }
       let poll_result: i64 = icmp_poll(my_mac, my_ip, recv_payload, 4, recv_meta);
@@ -49020,7 +49909,7 @@ fn pbkdf2_hmac_sha256(password: mut ref i64, password_len: i64, salt: mut ref i6
     // Kicked every 500 iterations (20 kicks across the full run),
     // matching the exact pattern already proven for dharafs_init's
     // own scan loop and sdhost_read_block/write_block's retry loops.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       if (iter % (500 as i64)) == 0 {
         let _ = watchdog_kick();
       }
@@ -49353,7 +50242,7 @@ fn pbkdf2_hmac_sha1(password: mut ref i64, password_len: i64, salt: mut ref i64,
       // sha256's own identical loop -- this is the real WPA2-PSK
       // derivation path (4096 iterations), one tight loop with no
       // return to any caller until it finishes.
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         if (iter % (500 as i64)) == 0 {
           let _ = watchdog_kick();
         }
@@ -51753,7 +52642,7 @@ fn bcm2835_rng_init() -> i64 {
 fn bcm2835_rng_read_word() -> u32 {
   let rng_t0: u32 = mmio_read_u32(TIMER_CLO);
   while ((mmio_read_u32(RNG_STATUS) >> (24 as u32)) == (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), rng_t0) < (2000000 as u32)) {
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
   }
@@ -51927,7 +52816,7 @@ fn ieee80211_boot_self_test() -> i64 {
   ssid[3] = 0x74 as u8;
 
   let preq: [u8; 64] = [0 as u8; 64];
-  if probe_request_build(ref own_mac, ref ssid, 4, mut ref preq) != 36 { ok = 0; }
+  if probe_request_build(ref own_mac, ref ssid, 4, 0, mut ref preq) != 36 { ok = 0; }
 
   let presp_buf: [u8; 256] = [0 as u8; 256];
   let fc_presp: i64 = FC_STYPE_PROBE_RESP;
@@ -51950,7 +52839,7 @@ fn ieee80211_boot_self_test() -> i64 {
   if presp_info.has_rsn != 1 { ok = 0; }
 
   let areq: [u8; 30] = [0 as u8; 30];
-  if auth_request_build(ref bssid, ref own_mac, mut ref areq) != 30 { ok = 0; }
+  if auth_request_build(ref bssid, ref own_mac, 1, mut ref areq) != 30 { ok = 0; }
   let aresp_buf: [u8; 256] = [0 as u8; 256];
   let fc_auth: i64 = FC_STYPE_AUTH;
   aresp_buf[0] = (fc_auth & (255 as i64)) as u8;
@@ -51959,7 +52848,7 @@ fn ieee80211_boot_self_test() -> i64 {
   if auth_response_parse(ref aresp_buf, 30) != 1 { ok = 0; }
 
   let assocreq: [u8; 90] = [0 as u8; 90];
-  if assoc_request_build(ref bssid, ref own_mac, ref ssid, 4, ref rsn, mut ref assocreq) != 62 { ok = 0; }
+  if assoc_request_build(ref bssid, ref own_mac, ref ssid, 4, ref rsn, 2, mut ref assocreq) != 62 { ok = 0; }
   let assocresp_buf: [u8; 256] = [0 as u8; 256];
   let fc_assoc: i64 = FC_STYPE_ASSOC_RESP;
   assocresp_buf[0] = (fc_assoc & (255 as i64)) as u8;
@@ -52135,7 +53024,7 @@ fn wpa2_join_start(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], s
     let _ = buf_write_byte(ctx, (WPA2_JOIN_RSN_OFF + i) as u32, rsn[i] as u32);
     i = i + 1;
   }
-  return probe_request_build(own_mac, ssid, ssid_len, out);
+  return probe_request_build(own_mac, ssid, ssid_len, 0, out);
 }
 
 // BUG FOUND 2026-11-16 (live, twice in a row on real HW): wifi_real_join
@@ -52184,7 +53073,11 @@ fn wpa2_join_start_skip_probe(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref
     i = i + 1;
   }
   let auth_frame: [u8; 30] = [0 as u8; 30];
-  let alen: i64 = auth_request_build(bssid, own_mac, mut ref auth_frame);
+  // seq_num=1: matches the literal `1` wifi_real_join's own TX call
+  // for this exact frame already passes to the TX descriptor
+  // (kernel_main.vani's wifi_radio_tx_frame(..., preq_heap, preq_len,
+  // 0, 1) call site) -- see probe_request_build's own header comment.
+  let alen: i64 = auth_request_build(bssid, own_mac, 1, mut ref auth_frame);
   let j: i64 = 0;
   while j < alen { out[j] = auth_frame[j]; j = j + 1; }
   return alen;
@@ -52198,7 +53091,14 @@ fn wpa2_join_start_skip_probe(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref
 // since auth_request_build's own signature takes a differently-sized
 // array type and vani has no way to pass a size-90 array where a
 // size-30 one is expected.
-fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out: mut ref [u8; 90]) -> Wpa2JoinResult {
+// seq_num: the Sequence Control value to embed in whichever request
+// frame this call builds (Auth or Assoc Request) -- the caller must
+// pass the exact same value it's about to hand the TX descriptor for
+// this same frame (wifi_real_join's own `seq` variable), so the real
+// over-the-air bytes and the descriptor finally agree. See probe_
+// request_build's own header comment (vendor/ieee80211/src/core.vani)
+// for the full "why".
+fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, seq_num: i64, out: mut ref [u8; 90]) -> Wpa2JoinResult {
   let state: i64 = buf_read_byte(ctx, WPA2_JOIN_STATE_OFF as u32) as i64;
   let bssid: [u8; 6] = [0 as u8; 6];
   let own_mac: [u8; 6] = [0 as u8; 6];
@@ -52331,7 +53231,7 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out
       return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
     }
     let auth_frame: [u8; 30] = [0 as u8; 30];
-    let alen: i64 = auth_request_build(ref bssid, ref own_mac, mut ref auth_frame);
+    let alen: i64 = auth_request_build(ref bssid, ref own_mac, seq_num, mut ref auth_frame);
     let j: i64 = 0;
     while j < alen { out[j] = auth_frame[j]; j = j + 1; }
     let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_AUTH_RESP as u32);
@@ -52366,7 +53266,7 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, out
     while k < ssid_len { ssid[k] = buf_read_byte(ctx, (WPA2_JOIN_SSID_OFF + k) as u32) as u8; k = k + 1; }
     k = 0;
     while k < 22 { rsn[k] = buf_read_byte(ctx, (WPA2_JOIN_RSN_OFF + k) as u32) as u8; k = k + 1; }
-    let alen2: i64 = assoc_request_build(ref bssid, ref own_mac, ref ssid, ssid_len, ref rsn, out);
+    let alen2: i64 = assoc_request_build(ref bssid, ref own_mac, ref ssid, ssid_len, ref rsn, seq_num, out);
     let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_ASSOC_RESP as u32);
     return Wpa2JoinResult { state: WPA2_JOIN_WAIT_ASSOC_RESP, tx_len: alen2, done: 0, failed: 0 };
   }
@@ -52527,7 +53427,7 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   while ri < 22 { presp[42 + ri] = rsn[ri]; ri = ri + 1; }
 
   let mgmt_out: [u8; 90] = [0 as u8; 90];
-  let r1: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref presp, 42 + 22, mut ref mgmt_out);
+  let r1: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref presp, 42 + 22, 1, mut ref mgmt_out);
   if (r1.state != WPA2_JOIN_WAIT_AUTH_RESP) || (r1.tx_len != 30) || (r1.failed != 0) { ok = 0; }
 
   // Synthetic Auth Response: Open System, transaction 2, success.
@@ -52536,7 +53436,7 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   aresp[0] = (fc_auth & (255 as i64)) as u8;
   aresp[1] = ((fc_auth >> 8) & (255 as i64)) as u8;
   aresp[26] = 2 as u8;
-  let r2: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref aresp, 30, mut ref mgmt_out);
+  let r2: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref aresp, 30, 2, mut ref mgmt_out);
   if (r2.state != WPA2_JOIN_WAIT_ASSOC_RESP) || (r2.tx_len != 62) || (r2.failed != 0) { ok = 0; }
 
   // Synthetic Assoc Response: success, association ID 7.
@@ -52545,7 +53445,7 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   assocresp[0] = (fc_assoc & (255 as i64)) as u8;
   assocresp[1] = ((fc_assoc >> 8) & (255 as i64)) as u8;
   assocresp[28] = 7 as u8;
-  let r3: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref assocresp, 30, mut ref mgmt_out);
+  let r3: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref assocresp, 30, 3, mut ref mgmt_out);
   if (r3.state != WPA2_JOIN_WAIT_EAPOL_MSG1) || (r3.tx_len != 0) || (r3.failed != 0) { ok = 0; }
   if (buf_read_byte(ctx, WPA2_JOIN_ASSOC_ID_OFF as u32) as i64) != 7 { ok = 0; }
 
@@ -52761,7 +53661,29 @@ fn wifi_radio_init_rtl8188cu() -> i64 {
 // suffix from both of those real units' own addresses
 // (80:1f:02:aa:35:11 and 80:1f:02:aa:14:60) so this can't collide with
 // either while they're on the same network.
+//
+// EXPERIMENT 3 (2026-11-21, user: "should wifi mac on rpi be that from
+// dongle rather than some random mac?"): neither experiment above used
+// this dongle's own TRUE, individually-unique, factory-burned address
+// -- both used a synthetic suffix, just with an increasingly-real-
+// looking prefix. rtl8188cu_efuse_read_and_parse already reads and
+// correctly reconstructs this exact chip's own real MAC from its own
+// EFUSE (logical offset 0x16, confirmed during the round that first
+// wrote that parser) but, until now, nothing ever stored or used it.
+// The one client that's ever actually associated with this AP (the
+// real-HW usbmon "ground truth" capture this whole investigation keeps
+// cross-checking against) necessarily used exactly this address, not
+// an invented one -- if this AP has any MAC-based history/allow-list
+// behavior at all (consumer gateways increasingly do), this is the one
+// remaining address that's guaranteed to already be known-good to it.
+// Falls back to the prior synthetic address if EFUSE parsing never ran
+// or failed (wifi_efuse_get_parsed_ok()==0) -- same defensive pattern
+// already used for TX power/PA bias: never trust an unparsed EFUSE.
 fn wifi_real_own_mac() -> [u8; 6] {
+  if wifi_efuse_get_parsed_ok() != (0 as u32) {
+    let mac: mut ref i64 = wifi_efuse_mac_get();
+    return [buf_read_byte(mac, 0 as u32) as u8, buf_read_byte(mac, 1 as u32) as u8, buf_read_byte(mac, 2 as u32) as u8, buf_read_byte(mac, 3 as u32) as u8, buf_read_byte(mac, 4 as u32) as u8, buf_read_byte(mac, 5 as u32) as u8];
+  }
   return [0x80 as u8, 0x1F as u8, 0x02 as u8, 0xAA as u8, 0x99 as u8, 0x99 as u8];
 }
 
@@ -52802,7 +53724,11 @@ fn wifi_scan_channel_at(i: i64) -> u32 {
 // respond to this particular probe, not a parse or protocol failure.
 fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, bssid_out: mut ref [u8; 6]) -> i64 {
   let preq: [u8; 64] = [0 as u8; 64];
-  let preq_len: i64 = probe_request_build(own_mac, ssid, ssid_len, mut ref preq);
+  // seq_num=0: matches the literal `0` this function's own TX call for
+  // this exact frame already passes to the TX descriptor below -- see
+  // probe_request_build's own header comment (vendor/ieee80211/src/
+  // core.vani) for the full "why".
+  let preq_len: i64 = probe_request_build(own_mac, ssid, ssid_len, 0, mut ref preq);
   // BUG FOUND 2026-11-16 (full heap-leak audit) -- see scratch_state.S's
   // own comment on wifi_scan_tx_scratch_addr.
   let tx_heap: mut ref i64 = wifi_scan_tx_scratch_get();
@@ -52919,7 +53845,7 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
       // here (cheap, and this call runs at a real decision point, not a
       // hot inner byte-loop) closes the gap the same way every sibling
       // slow-loop in this file already does.
-      if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+      if hardware_is_real_hw_get() == (1 as u32) {
         let _ = watchdog_kick();
       }
       let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
@@ -53137,7 +54063,7 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   // only reader of this endpoint in this function.
   let poll: i64 = 0;
   while poll < poll_cap {
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
@@ -53234,6 +54160,22 @@ fn wifi_real_join() -> i64 {
   let mps_in: u32 = wifi_radio_get_mps_in();
   let own_mac: [u8; 6] = wifi_real_own_mac();
 
+  // DIAGNOSTIC/INSURANCE (2026-11-20): force the bulk-OUT endpoint's data
+  // toggle back to a spec-guaranteed DATA0 state on BOTH host and device
+  // before this join attempt's first bulk-OUT TX -- see dwc2_build_clear_
+  // feature_endpoint_halt_setup's own header comment for the full "why".
+  // No observable harm if the toggle was already in sync (CLEAR_FEATURE
+  // on an endpoint that isn't halted just resets toggle, a documented,
+  // idempotent no-op otherwise); if it wasn't, this is the one spec-
+  // defined fix that doesn't depend on figuring out how it drifted.
+  let wifi_out_epaddr: u32 = usb_wifi_get_bulk_out_epaddr();
+  let _ = dwc2_build_clear_feature_endpoint_halt_setup(wifi_out_epaddr);
+  let clear_halt_status: i64 = dwc2_control_no_data(devaddr, mps_out);
+  let _ = usb_wifi_set_out_toggle(0 as u32);
+  let _ = uart_puts("wifi join DIAG: pre-join CLEAR_FEATURE(ENDPOINT_HALT) on bulk-OUT ep, status=");
+  let _ = uart_put_hex32(clear_halt_status as u32);
+  let _ = uart_puts(" (0=ok, forces DATA0 toggle sync on both host+device)\n");
+
   let _ = uart_puts("wifi join: scanning for configured SSID on channels 1/6/11...\n");
   let bssid: [u8; 6] = [0 as u8; 6];
   if wifi_scan_for_ssid(devaddr, mps_out, mps_in, ref own_mac, ref ssid, ssid_len, mut ref bssid) != 1 {
@@ -53256,6 +54198,50 @@ fn wifi_real_join() -> i64 {
     let _ = buf_write_byte(preq_heap, p1i as u32, preq[p1i] as u32);
     p1i = p1i + 1;
   }
+  // BUG FOUND 2026-11-20 (real usbmon capture, same capture that fixed
+  // the TX descriptor's MACID/RATE_ID fields): immediately before every
+  // single Auth Request bulk-OUT transfer, the real, working driver
+  // issues SIX single-byte vendor control writes to REG_BSSID (0x0618)
+  // and its following 5 bytes -- the captured values (19 21 e1 69 e1
+  // for bytes 1-5) are an exact byte-for-byte match for this exact
+  // join's target AP, B0:19:21:E1:69:E1. DhruvaOS only ever wrote
+  // REG_BSSID AFTER a successful association completed (see the
+  // "is bssid accounted?" fix a few hundred lines below this same
+  // function, 2026-11-16) -- which, since Auth never succeeds, means
+  // this register was NEVER written during the entire join attempt,
+  // every single time, for this whole investigation. Moved the write
+  // here, immediately before the Auth Request TX, matching the real
+  // driver's own proven ordering exactly rather than deferring it to
+  // "after the handshake, which never arrives."
+  let bssid_pre_auth_heap: mut ref i64 = wifi_join_bssid_scratch_get();
+  let bpa_i: i64 = 0;
+  while bpa_i < 6 {
+    let _ = rtl_reg_write8(devaddr, mps_out, (RTL_AP_REG_BSSID as i64 + bpa_i) as u32, bssid[bpa_i] as u32);
+    bpa_i = bpa_i + 1;
+  }
+
+  // DIAGNOSTIC (2026-11-20, live register snapshot): REG_TXPAUSE (0x522)
+  // is a per-queue "pause MAC TX queue" byte -- 0xFF pauses everything,
+  // 0x00 is fully unpaused (confirmed against the real rtl8192cu driver,
+  // hw.c/phy.c, which both toggle this same register during calibration
+  // and restore it afterward). If any bit covering the management queue
+  // stayed set after the LC-calibrate/IQK save-restore sequence, the Auth
+  // Request would sit in the chip's own TX buffer forever -- the USB
+  // bulk-OUT transfer completes fine (just moving bytes into chip
+  // memory), but the MAC's own queue-pause gate would silently prevent
+  // it from ever being serviced, exactly matching "USB OK, nothing on
+  // air." Reading this (and REG_CR's MACTXEN bit, BIT(6)) HERE, right
+  // before the TX call, is timing-safe -- it happens before transmission,
+  // not in the SIFS-critical gap between TX and the first RX poll (see
+  // this function's own next comment on why THAT gap must stay clean).
+  let pre_tx_txpause: u32 = rtl_reg_read8(devaddr, mps_out, 0x0522 as u32);
+  let pre_tx_cr: u32 = rtl_reg_read16(devaddr, mps_out, 0x0100 as u32);
+  let _ = uart_puts("wifi join DIAG: pre-Auth-TX REG_TXPAUSE(0x522)=0x");
+  let _ = uart_put_hex32(pre_tx_txpause);
+  let _ = uart_puts(" REG_CR(0x100)=0x");
+  let _ = uart_put_hex32(pre_tx_cr);
+  let _ = uart_puts(" (TXPAUSE expect 0x00=unpaused, CR bit6 expect 1=MACTXEN)\n");
+
   // DIAGNOSTIC (2026-11-16): unlike wifi_scan_for_ssid's own probe-
   // request TX (which explicitly captures and prints its result), this
   // Auth Request TX's return value was silently discarded -- if THIS
@@ -53304,7 +54290,7 @@ fn wifi_real_join() -> i64 {
   while (in_eapol == 0) && (mgmt_iter < WIFI_RX_POLL_CAP) {
     // 2026-10-25 fix: same gap, same reason -- see wifi_scan_for_ssid's
     // own identical fix's header comment above for the full "why".
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let rx_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
@@ -53316,7 +54302,7 @@ fn wifi_real_join() -> i64 {
       // len 256") happened in, on the very first real Beacon/Probe-Resp
       // over 256 bytes this driver ever actually received.
       let fixed_len: i64 = wifi_heap_to_fixed256(rx_heap, rx_len, mut ref rx_fixed);
-      let r: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref rx_fixed, fixed_len, mut ref mgmt_out);
+      let r: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref rx_fixed, fixed_len, seq, mut ref mgmt_out);
       if r.failed == 1 {
         let _ = uart_puts("wifi join: authentication/association refused by the AP\n");
         return 0 - 1;
@@ -53369,6 +54355,22 @@ fn wifi_real_join() -> i64 {
     let _ = uart_put_i64(mgmt_iter);
     let _ = uart_puts(" polls\n");
     let _ = uart_puts("wifi join: association never completed (no response from the AP)\n");
+    // DIAGNOSTIC (2026-11-20, live register snapshot, post-mortem): safe
+    // to read here regardless of timing -- the join attempt has already
+    // concluded, nothing further depends on SIFS-level timing. Compares
+    // directly against the pre-TX snapshot already printed above: if
+    // TXPAUSE or CR changed between the two reads, something altered the
+    // MAC's TX-enable state mid-attempt; if they match the pre-TX values
+    // and both already looked wrong there, the fault predates this join
+    // attempt entirely (inherited from MAC bring-up/calibration).
+    let post_txpause: u32 = rtl_reg_read8(devaddr, mps_out, 0x0522 as u32);
+    let post_cr: u32 = rtl_reg_read16(devaddr, mps_out, 0x0100 as u32);
+    let _ = uart_puts("wifi join DIAG: post-mortem REG_TXPAUSE(0x522)=0x");
+    let _ = uart_put_hex32(post_txpause);
+    let _ = uart_puts(" REG_CR(0x100)=0x");
+    let _ = uart_put_hex32(post_cr);
+    let _ = uart_puts("\n");
+    let _ = wifi_txtrace_dump();
     return 0 - 1;
   }
   let _ = uart_puts("wifi join: associated, waiting for the 4-way handshake...\n");
@@ -53390,7 +54392,7 @@ fn wifi_real_join() -> i64 {
     // is the real 4-way-handshake exchange, the single most likely
     // place for a slow-AP real-world round trip to add up across
     // several polls.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let rx2_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
@@ -53524,7 +54526,7 @@ fn hci_send_command_and_wait_status_via_radio(devaddr: u32, mps: u32, intr_mps: 
     // fires after 50,000 tries WITHIN one call, never reached by a
     // normal interrupt-IN NAK. Same gap, same fix, every BLE call site
     // that waits on a real peer's response.
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let event_len: i64 = ble_radio_poll_event(devaddr, intr_mps, event_buf, intr_mps as i64);
@@ -53560,7 +54562,7 @@ fn hci_send_command_and_wait_complete_via_radio(devaddr: u32, mps: u32, intr_mps
     // 2026-10-25 fix: same gap, same reason -- see
     // hci_send_command_and_wait_status_via_radio's own identical fix
     // above for the full "why".
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let event_len: i64 = ble_radio_poll_event(devaddr, intr_mps, event_buf, intr_mps as i64);
@@ -53600,7 +54602,7 @@ fn ble_scan_for_target(devaddr: u32, mps_intr: u32, target_name: mut ref i64, ta
     // 2026-10-25 fix: same gap, same reason -- see
     // hci_send_command_and_wait_status_via_radio's own identical fix
     // for the full "why".
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let event_len: i64 = ble_radio_poll_event(devaddr, mps_intr, event_buf, mps_intr as i64);
@@ -53688,7 +54690,7 @@ fn ble_real_connect() -> i64 {
     // 2026-10-25 fix: same gap, same reason -- see
     // hci_send_command_and_wait_status_via_radio's own identical fix
     // for the full "why".
-    if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+    if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
     let event_len: i64 = ble_radio_poll_event(devaddr, mps_intr, event_buf, mps_intr as i64);
@@ -60060,12 +61062,14 @@ fn kernel_main() -> i64 {
   // logic without an actual reset, and nothing resets a hung board
   // without an independent watchdog. Explicit manual kicks after each
   // major phase below keep a HEALTHY boot from ever tripping this on
-  // its own -- see each kick's own call site. Still gated by
-  // WATCHDOG_ENABLE_FOR_REAL_HARDWARE, still 0 by default: see that
-  // constant's own header comment for why (QEMU's raspi1ap resets
-  // IMMEDIATELY on the very first PM_RSTC write watchdog_arm makes,
-  // regardless of the timeout value -- this entire mechanism can only
-  // be validated on real hardware, never QEMU, by construction).
+  // its own -- see each kick's own call site. Still gated, now by a
+  // runtime probe (hardware_is_real_hw_get(), set right below from
+  // hwdetect_probe_real_hardware() -- see that call's own comment for
+  // the full "why") rather than a compile-time const, but the reason
+  // is unchanged: QEMU's raspi1ap resets IMMEDIATELY on the very first
+  // PM_RSTC write watchdog_arm makes, regardless of the timeout value
+  // -- this entire mechanism can only be validated on real hardware,
+  // never QEMU, by construction.
   // BUG FOUND 2026-11-16 (watchdog audit, after a real hang the 15s
   // safety-net watchdog never recovered): print which branch this boot
   // actually took, unconditionally, regardless of the flag's value --
@@ -60089,10 +61093,20 @@ fn kernel_main() -> i64 {
   // watchdog-arm block past the self-test battery it exists to cover
   // (see this block's own "armed as early as UART diagnostics allow"
   // comment above).
-  let _ = uart_puts("BOOT DIAG: WATCHDOG_ENABLE_FOR_REAL_HARDWARE=");
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 { let _ = uart_puts("1"); } else { let _ = uart_puts("0"); }
+  // Runtime real-hardware-vs-QEMU detection (2026-11-21) -- one
+  // VideoCore mailbox GET_FIRMWARE_REVISION round trip, run exactly
+  // once, here, as early as the self-test battery's own "armed as
+  // early as UART diagnostics allow" comment above already requires,
+  // and before anything else below reads hardware_is_real_hw_get().
+  // See boot/hwdetect_state.S's own header comment for the full
+  // detection mechanism (verified against QEMU's real source, not
+  // guessed) and its explicit fail-safe-to-0 (treat as QEMU/unknown)
+  // default on any timeout or unexpected response.
+  let _ = hardware_is_real_hw_set(hwdetect_probe_real_hardware());
+  let _ = uart_puts("BOOT DIAG: hardware_is_real_hw=");
+  if hardware_is_real_hw_get() == (1 as u32) { let _ = uart_puts("1"); } else { let _ = uart_puts("0"); }
   let _ = uart_puts("\n");
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_init();
   }
 
@@ -60139,6 +61153,9 @@ fn kernel_main() -> i64 {
   // Two-tier bad-block classification's suspect table -- see boot/
   // dharafs_suspect_state.S's own header comment.
   let _ = dharafs_suspect_buf_set(dhruva_alloc_bytes(512));
+  // Bare-"ls" result cache -- see boot/dharafs_lscache_state.S's own
+  // header comment.
+  let _ = dharafs_lscache_buf_set(dhruva_alloc_bytes(4096));
   let _ = dharafs_stat_scratch_set(dhruva_alloc_bytes(12));
   let _ = dharafs_dir_scratch_set(dhruva_alloc_bytes(32));
   let _ = dharafs_log_path_scratch_set(dhruva_alloc_bytes(32));
@@ -60507,7 +61524,7 @@ fn kernel_main() -> i64 {
   // single slowest, most real-hardware-timing-sensitive phase of
   // early boot) gets reset and falls back within one watchdog period,
   // rather than needing a physical power-cycle.
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
 
@@ -60583,7 +61600,7 @@ fn kernel_main() -> i64 {
   // fix matching this project's own five-times-precedented pattern:
   // one more kick, right here, rather than chasing a phantom DMA bug
   // in code that was already confirmed to print nothing at all.
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
   let _ = log_level_init();
@@ -60597,7 +61614,7 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("\n");
   // Task #308 follow-up: kick after DharaFS's own recovery scan --
   // see the kick right after sdhost_init's own matching comment.
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
 
@@ -60745,7 +61762,7 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("BOOT DIAG: checkpoint 10b (pre-eval/governor self-tests), TIMER_CLO=0x");
   let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
   let _ = uart_puts("\n");
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
   // User request (2026-10-18): boot should be as fast and as quiet as
@@ -60778,7 +61795,7 @@ fn kernel_main() -> i64 {
     let _ = eval_self_test("999999999999*999999999999", 0, 1);
     let _ = eval_self_test("5000000000+5000000000", 10000000000, 0);
   }
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
 
@@ -60800,7 +61817,7 @@ fn kernel_main() -> i64 {
   // (scheduler_ready_count() only means anything once start_multitasking
   // has handed off, at the very end of this function -- deterministic
   // logic like this needs no live task juggling to check).
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
   if boot_debug_enabled() == 1 {
@@ -60820,7 +61837,7 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("\n");
   // Task #308 follow-up: kick after eval/governor self-tests -- see
   // the kick right after sdhost_init's own matching comment.
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
 
@@ -60972,7 +61989,7 @@ fn kernel_main() -> i64 {
   // Task #308 follow-up: kick after the media-encryption self-check
   // (its own real SD round trip) -- see the kick right after
   // sdhost_init's own matching comment.
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
   // TASK #353 REAL-HW FOLLOW-UP #5 (2026-10-16): every boot now reaches
@@ -61052,7 +62069,7 @@ fn kernel_main() -> i64 {
   let _ = uart_puts("\n");
   // Task #308 follow-up: kick after USB bring-up -- see the kick
   // right after sdhost_init's own matching comment.
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
 
@@ -61110,7 +62127,7 @@ fn kernel_main() -> i64 {
   // from expiring between the framebuffer self-check above and the
   // timer interrupt starting up (which is what drives watchdog_kick()
   // from here on, every tick -- see that call site's own comment).
-  if WATCHDOG_ENABLE_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
 
@@ -61818,7 +62835,7 @@ fn kernel_main() -> i64 {
   // Task #353: cancel stage0's own pre-jump watchdog now that this
   // boot has proven itself alive -- see watchdog_disable's own header
   // comment for why this can't be unconditional.
-  if STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE == 1 {
+  if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_disable();
   }
 

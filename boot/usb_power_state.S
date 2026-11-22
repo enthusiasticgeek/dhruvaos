@@ -60,6 +60,33 @@ usb_probe0_pending:
                      * connected+enabled port and is deferring the
                      * actual enumeration attempt to task_e. */
 
+/* 2026-11-20 (real-HW USB2.0 high-speed bring-up, root-cause follow-
+ * up): dwc2_select_phy_mode() decides once, at dwc2_init() time,
+ * whether this core's own GHWCFG2.HS_PHY_TYPE self-report means HS
+ * (PHYSEL/ULPI_UTMI_SEL/PHYIF16 cleared) or FS-only (PHYSEL set) was
+ * actually selected -- but dwc2_reassert_core_config_post_port_reset()
+ * (kernel_main.vani), the real-HW workaround for this exact silicon's
+ * own confirmed erratum (GUSBCFG spontaneously reverts PHYSEL/
+ * PHYLPWRCLKSEL/TOUTCAL/FORCEHOSTMODE roughly 0.7s after any HPRT0
+ * PRTPWR/PRTRST transition -- rounds 9/29's own real-HW captures),
+ * runs at ~8 separate call sites throughout dwc2_init() and every
+ * later control/bulk transfer, with no way to know which mode was
+ * actually intended unless it's told. Before this flag existed, that
+ * function hardcoded the FS-only bit pattern unconditionally (the only
+ * mode that existed when it was written) -- silently re-forcing FS
+ * back on at every single one of those call sites regardless of
+ * dwc2_select_phy_mode()'s own choice, which is the real reason a
+ * correctly-selected HS PHY mode was never actually surviving long
+ * enough to matter. RAM-only, exactly like usb_probe0_pending above --
+ * recomputed fresh by dwc2_select_phy_mode() every boot, nothing here
+ * needs to persist across a reset. */
+.align 4
+dwc2_phy_is_hs:
+    .word 0        /* 0 = FS-only PHY mode selected (the historical,
+                     * still-default behavior); 1 = dwc2_select_phy_
+                     * mode() found a real HS PHY via GHWCFG2 and
+                     * selected it. */
+
 .section ".text"
 
 .global usb_probe0_pending_get
@@ -71,6 +98,19 @@ usb_probe0_pending_get:
 .global usb_probe0_pending_set
 usb_probe0_pending_set:
     ldr r1, =usb_probe0_pending
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global dwc2_phy_is_hs_get
+dwc2_phy_is_hs_get:
+    ldr r0, =dwc2_phy_is_hs
+    ldr r0, [r0]
+    bx lr
+
+.global dwc2_phy_is_hs_set
+dwc2_phy_is_hs_set:
+    ldr r1, =dwc2_phy_is_hs
     str r0, [r1]
     mov r0, #0
     bx lr

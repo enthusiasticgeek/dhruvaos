@@ -11,12 +11,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$ROOT/build"
 CPU="arm1176jzf-s"
 
-# Task #353 follow-up (2026-10-15): optional -D override for stage0_main.c's
-# own STAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE gate (checked-in default 0).
-# Example real-hardware deployment build:
-#   STAGE0_CFLAGS="-DSTAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE=1" ./build_stage0.sh
-STAGE0_CFLAGS="${STAGE0_CFLAGS:-}"
-
 mkdir -p "$BUILD_DIR"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -25,7 +19,12 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding -O1 \
   "${ROOT}/boot/stage0/sdread.c" -o "${BUILD_DIR}/stage0_sdread.o"
 
-arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding -O1 ${STAGE0_CFLAGS} \
+# 2026-11-21: stage0_main.c's own real-HW watchdog gate used to need a
+# -D override here (STAGE0_CFLAGS, task #353 follow-up) -- it now
+# self-detects real hardware vs QEMU at runtime (stage0_detect_real_
+# hardware(), same mailbox probe kernel_main.vani's own hardware_is_
+# real_hw_get() uses), so this build is identical for either target.
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding -O1 \
   "${ROOT}/boot/stage0/stage0_main.c" -o "${BUILD_DIR}/stage0_main.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding -O1 \

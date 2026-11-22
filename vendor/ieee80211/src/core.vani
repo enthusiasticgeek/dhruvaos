@@ -202,7 +202,43 @@ const PROBE_REQ_MAX_LEN: i64 = 64;
 // itself defines) -- real rate negotiation beyond "the AP sees at
 // least one rate it also supports" is out of this package's own scope.
 // Returns the actual frame length used (24 + 2+ssid_len + 2+4).
-fn probe_request_build(own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, out: mut ref [u8; 64]) -> i64 {
+//
+// BUG FOUND 2026-11-21 (real-HW investigation: Auth/Probe Requests
+// transmit cleanly at the USB/chip level -- XFERCOMPL, TXPAUSE=0,
+// MACTXEN=1, EFUSE-derived TX power and PA bias both confirmed correct
+// -- yet the AP never answers either, while its own Beacons are heard
+// fine). Cross-checked the rtl92cu TX descriptor's own sequence-number
+// field against Linux's real rtl92cu_tx_fill_desc (trx.c): it COPIES
+// the Sequence Control value already sitting in the caller's own frame
+// header into the descriptor (`seq_number = (hdr->seq_ctrl &
+// IEEE80211_SCTL_SEQ) >> 4`) -- it does not generate one and insert it
+// into the frame. The only hardware auto-insert path (HWSEQ_EN) is
+// gated on firmware leisure power-save, never taken by this driver.
+// This function (and auth_request_build/assoc_request_build, same
+// bug) has hardcoded Sequence Control to 0x0000 in the actual frame
+// bytes on every call, forever -- a spec violation (IEEE 802.11
+// 9.3.2.10/9.4.1.42: Sequence Control must be a real, incrementing
+// per-frame value) with a concrete, mechanistic failure path: this
+// project's own own_mac is fixed (not EFUSE-derived), so every single
+// management frame this driver has EVER transmitted, across this
+// entire investigation's many repeated `wifi join` attempts, carried
+// the IDENTICAL (source MAC, Sequence Control) tuple. A real AP's own
+// duplicate-frame cache (802.11 duplicate detection keys on exactly
+// (Address2, Sequence Control, Fragment Number), independent of
+// association state) would silently drop every attempt after the
+// first one it ever saw from this signature as a perceived
+// retransmission -- consistent with the project's own live capture
+// (3 consecutive `wifi join` attempts in one session, same failure
+// every time) and with a real usbmon capture of a genuinely working
+// Linux client on this exact AP sending its Probe Request ~24 times
+// with real incrementing sequence numbers before falling back to
+// Authentication, which succeeded immediately. Threading the exact
+// same seq_num already passed to the TX descriptor (rtl8188cu_tx_
+// frame's own seq_num parameter, kernel_main.vani) into the frame
+// body too, so the descriptor and the real over-the-air bytes finally
+// agree, matching a real client's own behavior instead of silently
+// repeating the first frame's identity forever.
+fn probe_request_build(own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, seq_num: i64, out: mut ref [u8; 64]) -> i64 {
   let broadcast: [u8; 6] = [0xff as u8; 6];
   out[0] = (FC_STYPE_PROBE_REQ & (255 as i64)) as u8;
   out[1] = ((FC_STYPE_PROBE_REQ >> 8) & (255 as i64)) as u8;
@@ -215,8 +251,9 @@ fn probe_request_build(own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, 
     out[16 + i] = broadcast[i];
     i = i + 1;
   }
-  out[22] = 0 as u8;
-  out[23] = 0 as u8;
+  let seq_ctrl: i64 = (seq_num & 0xfff) << 4;
+  out[22] = (seq_ctrl & (255 as i64)) as u8;
+  out[23] = ((seq_ctrl >> 8) & (255 as i64)) as u8;
 
   let off: i64 = 24;
   out[off] = EID_SSID as u8;
@@ -284,7 +321,10 @@ fn probe_response_parse(buf: ref [u8; 256], frame_len: i64, ssid_out: mut ref [u
 // a request, present for fixed-field-layout symmetry with the
 // response), no Challenge Text (that IE only appears for Shared Key
 // authentication, algorithm 1). Fixed 30-byte frame.
-fn auth_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], out: mut ref [u8; 30]) -> i64 {
+// Sequence Control now a real caller-supplied value, not a hardcoded
+// 0x0000 -- see probe_request_build's own header comment for the full
+// "why" (same bug, same fix, same investigation).
+fn auth_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], seq_num: i64, out: mut ref [u8; 30]) -> i64 {
   out[0] = (FC_STYPE_AUTH & (255 as i64)) as u8;
   out[1] = ((FC_STYPE_AUTH >> 8) & (255 as i64)) as u8;
   out[2] = 0 as u8;
@@ -296,8 +336,9 @@ fn auth_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], out: mut ref [u8
     out[16 + i] = bssid[i];
     i = i + 1;
   }
-  out[22] = 0 as u8;
-  out[23] = 0 as u8;
+  let seq_ctrl: i64 = (seq_num & 0xfff) << 4;
+  out[22] = (seq_ctrl & (255 as i64)) as u8;
+  out[23] = ((seq_ctrl >> 8) & (255 as i64)) as u8;
   out[24] = (WLAN_AUTH_OPEN & (255 as i64)) as u8;
   out[25] = ((WLAN_AUTH_OPEN >> 8) & (255 as i64)) as u8;
   out[26] = 1 as u8;
@@ -337,7 +378,10 @@ const ASSOC_REQ_MAX_LEN: i64 = 90;
 // taken as a parameter rather than called internally so a caller could
 // substitute a different negotiated IE without this function needing
 // to change). Returns the actual frame length used.
-fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, rsn_ie: ref [u8; 22], out: mut ref [u8; 90]) -> i64 {
+// Sequence Control now a real caller-supplied value, not a hardcoded
+// 0x0000 -- see probe_request_build's own header comment for the full
+// "why" (same bug, same fix, same investigation).
+fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, rsn_ie: ref [u8; 22], seq_num: i64, out: mut ref [u8; 90]) -> i64 {
   out[0] = (FC_STYPE_ASSOC_REQ & (255 as i64)) as u8;
   out[1] = ((FC_STYPE_ASSOC_REQ >> 8) & (255 as i64)) as u8;
   out[2] = 0 as u8;
@@ -349,8 +393,9 @@ fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 
     out[16 + i] = bssid[i];
     i = i + 1;
   }
-  out[22] = 0 as u8;
-  out[23] = 0 as u8;
+  let seq_ctrl: i64 = (seq_num & 0xfff) << 4;
+  out[22] = (seq_ctrl & (255 as i64)) as u8;
+  out[23] = ((seq_ctrl >> 8) & (255 as i64)) as u8;
 
   let capab_info: i64 = 0x0011;
   out[24] = (capab_info & (255 as i64)) as u8;

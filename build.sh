@@ -128,7 +128,7 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/swi_entry.S" -o "${BUILD_DIR}/swi_entry.o"
 
-arm-none-eabi-gcc -c -mcpu="${CPU}" -marm ${VECTORS_CFLAGS:-} \
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/rpi1/vectors.S" -o "${BUILD_DIR}/vectors.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
@@ -148,6 +148,12 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/dharafs_suspect_state.S" -o "${BUILD_DIR}/dharafs_suspect_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/dharafs_lscache_state.S" -o "${BUILD_DIR}/dharafs_lscache_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/hwdetect_state.S" -o "${BUILD_DIR}/hwdetect_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/shell_state.S" -o "${BUILD_DIR}/shell_state.o"
@@ -226,6 +232,9 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/wifi_efuse_state.S" -o "${BUILD_DIR}/wifi_efuse_state.o"
+
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
+  "${ROOT}/boot/wifi_txtrace_state.S" -o "${BUILD_DIR}/wifi_txtrace_state.o"
 
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
   "${ROOT}/boot/kernelupload_state.S" -o "${BUILD_DIR}/kernelupload_state.o"
@@ -335,7 +344,7 @@ arm-none-eabi-gcc -c -mcpu="${CPU}" -marm \
 arm-none-eabi-gcc -c -mcpu="${CPU}" -marm ${DMA_UART_STATE_CFLAGS:-} \
   "${ROOT}/boot/dma_uart_state.S" -o "${BUILD_DIR}/dma_uart_state.o"
 
-arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding ${RUNTIME_STUBS_CFLAGS:-} \
+arm-none-eabi-gcc -c -mcpu="${CPU}" -marm -nostdlib -ffreestanding \
   "${ROOT}/boot/rpi1/runtime_stubs.c" -o "${BUILD_DIR}/runtime_stubs.o"
 
 # kernel_main.ll was already produced by the merged `vanic emit
@@ -375,7 +384,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/irq_entry.o" "${BUILD_DIR}/fiq_entry.o" "${BUILD_DIR}/swi_entry.o" "${BUILD_DIR}/vectors.o" \
   "${BUILD_DIR}/sdcard_state.o" "${BUILD_DIR}/dharafs_buf.o" \
   "${BUILD_DIR}/dharafs_state.o" "${BUILD_DIR}/dharafs_ecc_state.o" "${BUILD_DIR}/dharafs_wear_state.o" \
-  "${BUILD_DIR}/dharafs_suspect_state.o" "${BUILD_DIR}/shell_state.o" \
+  "${BUILD_DIR}/dharafs_suspect_state.o" "${BUILD_DIR}/dharafs_lscache_state.o" "${BUILD_DIR}/hwdetect_state.o" "${BUILD_DIR}/shell_state.o" \
   "${BUILD_DIR}/governor_state.o" "${BUILD_DIR}/usb_power_state.o" "${BUILD_DIR}/pmccntr_state.o" \
   "${BUILD_DIR}/uart_clock_state.o" "${BUILD_DIR}/throttled_state.o" \
   "${BUILD_DIR}/log_state.o" \
@@ -396,6 +405,7 @@ arm-none-eabi-gcc -nostdlib -ffreestanding \
   "${BUILD_DIR}/usb_bt_state.o" \
   "${BUILD_DIR}/usb_wifi_state.o" \
   "${BUILD_DIR}/wifi_efuse_state.o" \
+  "${BUILD_DIR}/wifi_txtrace_state.o" \
   "${BUILD_DIR}/kernelupload_state.o" \
   "${BUILD_DIR}/critical_config_state.o" \
   "${BUILD_DIR}/usb_hub_state.o" \

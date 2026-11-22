@@ -1,24 +1,38 @@
 #!/usr/bin/env bash
-# Builds BOTH the kernel and stage0 for a real-hardware deployment,
-# with every real-HW safety flag set TOGETHER, in one command.
+# Builds BOTH the kernel and stage0 for a real-hardware deployment.
 #
 # 2026-11-09 (real-HW board-hang incident): a real board hung at
 # stage0 with no watchdog armed and no serial shell to recover it,
 # requiring a physical power cycle -- root cause was a PROCESS gap,
-# not a code gap. The watchdog mechanism itself (stage0_arm_watchdog,
-# 15s timeout) has existed for a long time; it just wasn't compiled
-# into the binary actually on the card, because enabling it requires
-# a SEPARATE build invocation (build_stage0.sh's own STAGE0_CFLAGS)
-# from the kernel-side flags (build.sh / kernel_main.vani's own
-# WATCHDOG_ENABLE_FOR_REAL_HARDWARE / STAGE0_PREJUMP_WATCHDOG_DISARM_
-# FOR_REAL_HARDWARE) -- two independent build systems, each with its
-# own real-hardware safety flag, nothing ever forcing them to be set
-# together. This whole session's own manual sed-the-vani-consts-then-
-# build.sh-then-revert routine never once also rebuilt stage0 with its
-# matching flag -- an easy, silent, repeatable mistake this script
-# exists specifically to make structurally impossible going forward:
-# there is now exactly one command for "build for real hardware," and
-# it cannot build one half without the other.
+# not a code gap. Enabling the watchdog used to require a SEPARATE
+# build invocation per binary (build_stage0.sh's own STAGE0_CFLAGS,
+# plus build.sh's own kernel_main.vani consts) -- two independent
+# build systems, each with its own manually-tracked real-hardware
+# flag, nothing ever forcing them to be set together. This script was
+# originally written to make that "build one half without the other"
+# mistake structurally impossible by sed-patching both source trees,
+# building, then reverting -- and it still happened anyway, later the
+# same investigation: a kernel fix got verified with a plain
+# ./build.sh and the stale pre-fix real-HW image got flashed and
+# tested instead of this script's own output, because re-running this
+# script was the one step that had to be remembered by hand.
+#
+# REVISED 2026-11-21 (user: "it should auto detect qemu or real hw...
+# so you dont have to track manually"): both binaries now detect real
+# hardware vs QEMU themselves, at runtime, via a VideoCore mailbox
+# GET_FIRMWARE_REVISION probe (kernel_main.vani's hardware_is_real_hw_
+# get(), boot/hwdetect_state.S; stage0_main.c's own matching
+# stage0_detect_real_hardware()) -- see either call site's own header
+# comment for the full detection mechanism, verified against QEMU's
+# real source rather than guessed, and its explicit fail-safe-to-0
+# (treat as QEMU/unknown, watchdog off) default on any doubt. There is
+# no longer a second set of source constants to patch: a plain
+# ./build.sh + ./build_stage0.sh now produces the SAME single binary
+# pair that self-configures correctly on either target. This script
+# now just runs that normal build and reports the same artifact paths
+# it always has, so existing deploy habits/docs that invoke it by name
+# keep working -- it does not patch, revert, or rebuild anything twice
+# anymore.
 #
 # Usage: ./build_real_hw.sh
 #
@@ -29,72 +43,21 @@
 #                                 (./update_stage0.sh /dev/sdX -- needs
 #                                 physical SD card access, NOT reachable
 #                                 over the serial kernel-slot path at all)
-#   build/dhruva.elf          -- left rebuilt at the checked-in-default
-#                                 (non-real-HW) flag values afterward, so
-#                                 the working tree's own build artifact
-#                                 state matches a plain ./build.sh run --
-#                                 only the *_real_hw.img copy carries the
-#                                 real-HW flags.
+#   build/dhruva.elf          -- the same kernel build dhruva_real_hw.img
+#                                 was objcopied from; also what QEMU runs.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-VANI_FILE="kernel/kernel_main.vani"
-WD_PATTERN="const WATCHDOG_ENABLE_FOR_REAL_HARDWARE: i64 = "
-DISARM_PATTERN="const STAGE0_PREJUMP_WATCHDOG_DISARM_FOR_REAL_HARDWARE: i64 = "
-
-require_one_match() {
-    local pattern="$1"
-    local count
-    count=$(grep -c "^${pattern}" "$VANI_FILE")
-    if [ "$count" -ne 1 ]; then
-        echo "ERROR: expected exactly 1 occurrence of '${pattern}...' in $VANI_FILE, found $count." >&2
-        echo "Refusing to proceed -- the sed below would either do nothing or touch the wrong line." >&2
-        exit 1
-    fi
-}
-
-set_flag() {
-    local pattern="$1"
-    local value="$2"
-    sed -i "s/^${pattern}[01];\$/${pattern}${value};/" "$VANI_FILE"
-}
-
-echo "=== Verifying both real-HW flags are present exactly once (not renamed/moved) ==="
-require_one_match "$WD_PATTERN"
-require_one_match "$DISARM_PATTERN"
-
-echo "=== Building kernel with real-HW flags ON ==="
-set_flag "$WD_PATTERN" 1
-set_flag "$DISARM_PATTERN" 1
-grep -n "^${WD_PATTERN}\|^${DISARM_PATTERN}" "$VANI_FILE"
-
-rm -f build/dhruva.elf
-# 2026-11-16: last-resort watchdog arm inside runtime_stubs.c's own
-# exit() AND dhruva_oom_fatal() (see each function's own header
-# comment -- the OOM path is a SEPARATE halt that doesn't go through
-# exit() at all, found the hard way via a real board hang that this
-# fix never covered until it was added there directly too), plus the
-# same fix in vectors.S's fault_data_abort/fault_prefetch_abort (every
-# other halt path in this codebase, previously a bare `b .` with zero
-# recovery). Same real-HW-only compile-time gate convention as
-# STAGE0_CFLAGS below, not a runtime check, since QEMU resets
-# immediately on any PM_RSTC write.
-RUNTIME_STUBS_CFLAGS="-DEXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE=1" VECTORS_CFLAGS="-DEXIT_WATCHDOG_ARM_FOR_REAL_HARDWARE=1" ./build.sh
+echo "=== Building kernel ==="
+./build.sh
 arm-none-eabi-objcopy -O binary build/dhruva.elf build/dhruva_real_hw.img
 echo "Built build/dhruva_real_hw.img: $(sha256sum build/dhruva_real_hw.img)"
 
-echo "=== Reverting kernel real-HW flags to checked-in default (0), rebuilding normal variant ==="
-set_flag "$WD_PATTERN" 0
-set_flag "$DISARM_PATTERN" 0
-grep -n "^${WD_PATTERN}\|^${DISARM_PATTERN}" "$VANI_FILE"
-rm -f build/dhruva.elf
-./build.sh
-
-echo "=== Building stage0 with its own real-HW watchdog ON (the flag this incident found missing) ==="
-STAGE0_CFLAGS="-DSTAGE0_PREJUMP_WATCHDOG_FOR_REAL_HARDWARE=1" ./build_stage0.sh
-echo "Built build/stage0.img (watchdog ON): $(sha256sum build/stage0.img)"
+echo "=== Building stage0 ==="
+./build_stage0.sh
+echo "Built build/stage0.img: $(sha256sum build/stage0.img)"
 
 echo
 echo "=== Done. Deploy: ==="
