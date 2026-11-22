@@ -29159,6 +29159,73 @@ fn rtl8188cu_mac_queue_setup(devaddr: u32, mps: u32) -> i64 {
   // REG_TRXFF_BNDY+2 = fops->trxff_boundary (0x27ff for rtl8192cu_fops).
   let _ = rtl_reg_write16(devaddr, mps, reg_trxff_bndy + (2 as u32), 0x27FF as u32);
 
+  // BUG FOUND 2026-11-21 (Realtek's own 2013 vendor SDK, rtl8188C_8192C_
+  // usb_linux_v4.0.2 -- github.com/KennethThompson/rtl8188cus -- a
+  // DIFFERENT lineage from both rtl8xxxu and rtlwifi/rtl8192cu, closer
+  // to the chip's own original driver): usb_halinit.c's hal_init
+  // sequence runs FOUR register writes this driver has never issued at
+  // all, right alongside the REG_RQPN/REG_TRXDMA_CTRL/REG_TRXFF_BNDY
+  // writes just above (same conceptual group -- the vendor's own
+  // _InitQueueReservedPage/_InitTxBufferBoundary/_InitQueuePriority/
+  // _InitPageBoundary/_InitTransferPageSize all run back-to-back in its
+  // hal_init, confirmed verbatim):
+  // - REG_PBP (0x0104): TX/RX page SIZE (bytes per LLT page). Vendor's
+  //   _InitTransferPageSize: `_PSRX(PBP_128) | _PSTX(PBP_128)` = 0x11.
+  //   Every page-index arithmetic this driver already does (LLT chain,
+  //   RQPN reservation counts) implicitly assumes 128-byte pages --
+  //   this register is what actually tells the chip's own hardware to
+  //   use that page size. Never written before; chip was left at
+  //   whatever its own hardware reset default is, unverified and never
+  //   cross-checked against what our LLT/RQPN math assumes.
+  // - REG_TXPKTBUF_BCNQ_BDNY (0x0424), REG_TXPKTBUF_MGQ_BDNY (0x0425),
+  //   REG_TXPKTBUF_WMAC_LBK_BF_HD (0x045D): per-queue TX buffer
+  //   boundary registers -- confirmed in rtl8192c_spec.h. Vendor's
+  //   _InitTxBufferBoundary writes the SAME boundary value
+  //   (TX_PAGE_BOUNDARY = TX_TOTAL_PAGE_NUMBER+1 = 0xF9) into all three
+  //   PLUS REG_TRXFF_BNDY PLUS REG_TDECTRL+1, as one coherent group --
+  //   this driver already has the REG_TRXFF_BNDY member of that group
+  //   (via a different investigation path) but never the other four.
+  //   REG_TXPKTBUF_MGQ_BDNY is the management-queue boundary
+  //   specifically -- directly relevant to every frame this driver has
+  //   sent so far (Probe/Auth/Assoc are all MGNT-queue, confirmed via
+  //   this same function's own mgq=TRXDMA_QUEUE_HIGH routing above).
+  //   Mechanistically plausible for exactly this investigation's
+  //   standing symptom: a USB bulk-OUT transfer completes and ACKs at
+  //   the USB protocol level regardless of what's configured here (USB
+  //   only cares about byte count/handshake), but if the chip's own
+  //   firmware checks an arriving MGNT-queue descriptor's implied page
+  //   range against a boundary register that was simply never set away
+  //   from its hardware reset default, a mismatch there is exactly the
+  //   kind of internal, firmware-side gate this whole investigation has
+  //   been unable to inspect directly (see wifi_real_join's own "no
+  //   public register-level RTL8188CU datasheet" standing note) -- this
+  //   vendor source is the first direct, named evidence of what that
+  //   gate might actually be.
+  // - REG_TDECTRL+1 (0x0209): a DIFFERENT byte than the existing
+  //   RTL_TXDECTRL BLK_DESC_NUM fix just below (which touches 0x0208
+  //   bits[7:4]) -- this is BCN_HEAD, the beacon-queue head page,
+  //   written to the SAME boundary value by the vendor's own
+  //   _InitTxBufferBoundary. No overlap with the existing fix.
+  // Boundary value matches this driver's own existing RTL_TX_TOTAL_
+  // PAGE_NUM (0xf8, already confirmed correct and already driving the
+  // LLT chain built by rtl8188cu_llt_table_init) +1 = 0xf9 -- not a new
+  // page-count assumption, just the first time it's been written to
+  // these four specific registers.
+  let reg_pbp: u32 = 0x0104 as u32;
+  let _ = rtl_reg_write8(devaddr, mps, reg_pbp, 0x11 as u32);
+  let tx_page_boundary: u32 = (RTL_TX_TOTAL_PAGE_NUM + 1) as u32;
+  let reg_txpktbuf_bcnq_bdny: u32 = 0x0424 as u32;
+  let reg_txpktbuf_mgq_bdny: u32 = 0x0425 as u32;
+  let reg_txpktbuf_wmac_lbk_bf_hd: u32 = 0x045D as u32;
+  let _ = rtl_reg_write8(devaddr, mps, reg_txpktbuf_bcnq_bdny, tx_page_boundary);
+  let _ = rtl_reg_write8(devaddr, mps, reg_txpktbuf_mgq_bdny, tx_page_boundary);
+  let _ = rtl_reg_write8(devaddr, mps, reg_txpktbuf_wmac_lbk_bf_hd, tx_page_boundary);
+  let reg_tdectrl_bcn_head: u32 = 0x0209 as u32; // REG_TDECTRL(0x0208)+1 -- see reg_tdectrl below, declared after this block
+  let _ = rtl_reg_write8(devaddr, mps, reg_tdectrl_bcn_head, tx_page_boundary);
+  let _ = uart_puts("USB: RTL8188CU PBP/TX-buffer-boundary regs set (PBP=0x11, boundary=0x");
+  let _ = uart_put_hex32(tx_page_boundary);
+  let _ = uart_puts(")\n");
+
   // BUG FOUND 2026-11-21 (FreeBSD rtwn(4) cross-reference, after the
   // USB/Linux comparison exhausted every lead without explaining "USB
   // bulk-OUT completes and ACKs cleanly, chip never transmits"):
@@ -32773,6 +32840,40 @@ fn rtl8188cu_enable_engines(devaddr: u32, mps: u32) -> i64 {
   let ensec: u32 = 1 << 9;
   let cr_bits: u32 = cr_existing | hci_txdma_en | hci_rxdma_en | txdma_en | rxdma_en | protocol_en | schedule_en | mactxen | macrxen | ensec;
   let _ = rtl_reg_write16(devaddr, mps, RTL_REG_CR, cr_bits);
+
+  // BUG FOUND 2026-11-21 (Realtek's own 2013 vendor SDK cross-check,
+  // github.com/KennethThompson/rtl8188cus, usb_halinit.c's
+  // _InitNetworkType): REG_CR is a 32-bit register on this chip --
+  // this function (confirmed its own header comment above: "this
+  // function is the only place REG_CR is ever written") has only ever
+  // touched its LOWER 16 bits via rtl_reg_write16 at RTL_REG_CR itself.
+  // The UPPER 16 bits (REG_CR+2, i.e. bits[17:16] of the full 32-bit
+  // register -- MASK_NETTYPE=0x30000, confirmed in rtl8192c_spec.h)
+  // have never been written at all, left at whatever the hardware
+  // reset default is (NT_NO_LINK=0, unverified but the only sane
+  // assumption with nothing else writing it). Every real driver this
+  // investigation has checked -- this vendor source's own
+  // _InitNetworkType, called unconditionally during ordinary (non-FPGA)
+  // bring-up -- sets this to NT_LINK_AP=2 ("linked to an AP", i.e.
+  // normal infrastructure-STA mode; NOT "acting as an AP", that's the
+  // separate NT_AS_AP=3) before any join attempt, not after. Same
+  // mechanistic shape as the TX-buffer-boundary gap just fixed in
+  // rtl8188cu_mac_queue_setup: invisible to USB protocol analysis
+  // (ACK/XFERCOMPL only reflect the USB transaction, not what the
+  // firmware's own internal state machine does with a frame once
+  // received), but directly plausible as a gate on whether queued
+  // MGNT-queue frames (every frame this driver has ever sent) get
+  // treated as real STA traffic at all.
+  let reg_cr_nettype: u32 = RTL_REG_CR + (2 as u32);
+  let nettype_existing: u32 = rtl_reg_read16(devaddr, mps, reg_cr_nettype);
+  let nt_link_ap: u32 = 2 as u32;
+  let nettype_val: u32 = (nettype_existing & ((0x3 as u32) ^ (0xFFFF as u32))) | nt_link_ap;
+  let _ = rtl_reg_write16(devaddr, mps, reg_cr_nettype, nettype_val);
+  let _ = uart_puts("USB: RTL8188CU REG_CR NETTYPE set to NT_LINK_AP, before=0x");
+  let _ = uart_put_hex32(nettype_existing);
+  let _ = uart_puts(" after=0x");
+  let _ = uart_put_hex32(nettype_val);
+  let _ = uart_puts("\n");
   return 0;
 }
 
@@ -54386,6 +54487,16 @@ fn wifi_real_join() -> i64 {
   let connected: i64 = 0;
   let eapol_iter: i64 = 0;
   let eapol_state_before: i64 = WPA2_JOIN_WAIT_EAPOL_MSG1;
+  // BUG FOUND 2026-11-22 (first-ever real association success, now
+  // stalled at "no EAPOL frames received"): unlike the Auth/Assoc wait
+  // loop just above (its own rx_seen_count, printed on failure), this
+  // loop had NO visibility into whether ANY frame arrives at all during
+  // this phase versus frames arriving but never parsing as EAPOL
+  // (data_frame_parse_eapol returning ok=0) -- the exact same "TX/RF
+  // problem" vs "frames arrived but got filtered" distinction that
+  // rx_seen_count already exists to make for Auth/Assoc. Added before
+  // guessing at a root cause blind.
+  let eapol_rx_seen_count: i64 = 0;
   while (connected == 0) && (eapol_iter < WIFI_RX_POLL_CAP) {
     // 2026-10-25 fix: same gap, same reason -- see wifi_scan_for_ssid's
     // own identical fix's header comment above for the full "why". This
@@ -54397,6 +54508,7 @@ fn wifi_real_join() -> i64 {
     }
     let rx2_len: i64 = wifi_radio_rx_frame(devaddr, mps_in, rx_heap);
     if rx2_len >= 0 {
+      eapol_rx_seen_count = eapol_rx_seen_count + 1;
       // See wifi_scan_for_ssid's own identical 2026-11-16 fix comment:
       // use the TRUNCATED length, not the original rx2_len.
       let fixed2_len: i64 = wifi_heap_to_fixed256(rx_heap, rx2_len, mut ref rx_fixed);
@@ -54465,7 +54577,11 @@ fn wifi_real_join() -> i64 {
     let _ = uart_puts("wifi join: CONNECTED (4-way handshake complete, TK/GTK installed)\n");
     return 0;
   }
-  let _ = uart_puts("wifi join: 4-way handshake never completed (no EAPOL frames received from the AP)\n");
+  let _ = uart_puts("wifi join: 4-way handshake never completed, eapol_rx_seen_count=");
+  let _ = uart_put_i64(eapol_rx_seen_count);
+  let _ = uart_puts(" over the last ");
+  let _ = uart_put_i64(eapol_iter);
+  let _ = uart_puts(" polls (0=no frames at all reached RX during this phase, nonzero=frames arrived but never parsed as EAPOL)\n");
   return 0 - 1;
 }
 
