@@ -191,6 +191,21 @@ usb_wifi_out_toggle2:
  * already use. */
 usb_wifi_use_second_bulk_out:
     .word 0
+/* Round 2026-11-22: set once, right after a successful Association
+ * Response, from the AP's own advertised Capability Information
+ * (bit 5, Short Preamble) -- ground-truthed against the real vendor
+ * driver's update_capinfo/start_clnt_join (core/rtw_wlan_util.c,
+ * core/rtw_mlme_ext.c): a STA joining an AP derives its own preamble
+ * mode from the AP it's joining, not a fixed/local policy. Read by
+ * rtl8188cu_tx_frame to set the DATA_SHORT bit (txdw4 bit24) on DATA-
+ * frame TX descriptors, and by whatever sets REG_RRSR+2 (0x442) --
+ * the chip's own ACK-preamble-format register (HW_VAR_ACK_PREAMBLE
+ * in the reference driver) -- neither of which this driver had ever
+ * written before, always leaving both at their long-preamble hardware
+ * default regardless of what the AP actually uses. 1 = AP uses short
+ * preamble, 0 = long (the safe default every chip resets to anyway). */
+usb_wifi_ap_short_preamble:
+    .word 0
 
 .section ".text"
 
@@ -309,6 +324,21 @@ usb_wifi_get_use_second_bulk_out:
 .global usb_wifi_set_use_second_bulk_out
 usb_wifi_set_use_second_bulk_out:
     ldr r1, =usb_wifi_use_second_bulk_out
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_ap_short_preamble
+usb_wifi_get_ap_short_preamble:
+    ldr r0, =usb_wifi_ap_short_preamble
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_ap_short_preamble
+usb_wifi_set_ap_short_preamble:
+    ldr r1, =usb_wifi_ap_short_preamble
     str r0, [r1]
     mov r0, #0
     mov r1, #0

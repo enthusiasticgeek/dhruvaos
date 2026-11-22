@@ -3628,6 +3628,10 @@ extern "C" fn usb_wifi_set_out_toggle2(value: u32) -> u32;
 extern "C" fn usb_wifi_get_use_second_bulk_out() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn usb_wifi_set_use_second_bulk_out(value: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_wifi_get_ap_short_preamble() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn usb_wifi_set_ap_short_preamble(value: u32) -> u32;
 
 // Round 2026-09-16: persistent state backing uart_putc_nonblocking's
 // own TX ring buffer -- see boot/uart_tx_ring_state.S's own header
@@ -30635,7 +30639,22 @@ fn rtl_tx_desc_write(out: mut ref i64, frame_len: i64, is_broadcast: i64, seq_nu
   let txdw3: i64 = (seq_num & 0xfff) << 16;
   let _ = buf_write_u32_le(out, 12, txdw3 as u32);
 
-  let txdw4: i64 = 0x100; // TXDESC32_USE_DRIVER_RATE
+  // Round 2026-11-22: DATA_SHORT (bit24) -- ground-truthed against
+  // the real vendor driver's own EAPOL-specific TX-descriptor branch
+  // (rtl8192cu_xmit.c's update_txdesc, the `ether_type == 0x888e`
+  // case): `if (pmlmeinfo->preamble_mode == PREAMBLE_SHORT) ptxdesc->
+  // txdw4 |= BIT(24);`. Only applies to DATA frames (queue_sel ==
+  // RTL_TXDESC_QUEUE_BE, never MGNT -- the already real-usbmon-
+  // ground-truthed MGNT descriptor this function also builds has no
+  // such bit and must stay untouched). Reads the same AP-advertised
+  // short-preamble flag wpa2_join_step_mgmt sets right after a
+  // successful association (usb_wifi_ap_short_preamble's own header
+  // comment, boot/usb_wifi_state.S, has the full "why": sending a
+  // DATA frame with the wrong PLCP preamble format is a PHY-layer
+  // demodulation failure at the AP, indistinguishable from "never
+  // arrived" at every layer this driver can observe).
+  let data_short: i64 = if (queue_sel == RTL_TXDESC_QUEUE_BE) && (usb_wifi_get_ap_short_preamble() == (1 as u32)) { 0x01000000 } else { 0 };
+  let txdw4: i64 = 0x100 | data_short; // TXDESC32_USE_DRIVER_RATE [| DATA_SHORT]
   let _ = buf_write_u32_le(out, 16, txdw4 as u32);
 
   // BUG FOUND 2026-11-18 (real-HW usbmon capture of a genuine Auth
@@ -53636,6 +53655,20 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, seq
     }
     let _ = buf_write_byte(ctx, WPA2_JOIN_ASSOC_ID_OFF as u32, (info2.association_id & (255 as i64)) as u32);
     let _ = buf_write_byte(ctx, (WPA2_JOIN_ASSOC_ID_OFF + 1) as u32, ((info2.association_id >> 8) & (255 as i64)) as u32);
+    // Round 2026-11-22: ground-truthed against the reference driver's
+    // own start_clnt_join/update_capinfo (called at exactly this point,
+    // right after a successful association) -- this STA's own preamble
+    // mode is derived from the AP it just joined, not a fixed/local
+    // policy. See usb_wifi_ap_short_preamble's own header comment
+    // (boot/usb_wifi_state.S) for what reads this and why it was
+    // needed: EAPOL Message 2 is a DATA frame, and a real AP silently
+    // fails to demodulate a frame sent with the wrong PLCP preamble
+    // format at the PHY layer -- indistinguishable from "never arrived"
+    // at every layer this driver can observe, which is exactly the
+    // symptom that led here (the AP retransmitting Message 1 instead
+    // of ever reaching Message 3).
+    let ap_cap_info_now: i64 = (buf_read_byte(ctx, WPA2_JOIN_AP_CAPINFO_OFF as u32) as i64) | ((buf_read_byte(ctx, (WPA2_JOIN_AP_CAPINFO_OFF + 1) as u32) as i64) << 8);
+    let _ = usb_wifi_set_ap_short_preamble(if (ap_cap_info_now & 0x0020) != 0 { 1 as u32 } else { 0 as u32 });
     // Nothing to transmit yet -- the AP initiates EAPOL-Key Message 1
     // next, over the now-associated data link, not this station.
     let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_EAPOL_MSG1 as u32);
@@ -54695,7 +54728,24 @@ fn wifi_real_join() -> i64 {
         let _ = wifi_radio_tx_frame(devaddr, mps_out, mgmt_heap, r.tx_len, 0, seq);
         seq = seq + 1;
       }
-      if r.state == WPA2_JOIN_WAIT_EAPOL_MSG1 { in_eapol = 1; }
+      if (r.state == WPA2_JOIN_WAIT_EAPOL_MSG1) && (in_eapol == 0) {
+        // Round 2026-11-22: fires exactly once, right on the WAIT_
+        // ASSOC_RESP -> WAIT_EAPOL_MSG1 transition -- same timing as
+        // the reference driver's own HW_VAR_ACK_PREAMBLE write inside
+        // update_capinfo (called from start_clnt_join right after a
+        // successful association, not per-frame). REG_RRSR+2 (0x442)
+        // is this chip's own ACK-preamble-format register
+        // (hal/rtl8192c/usb/usb_halinit.c's HW_VAR_ACK_PREAMBLE case,
+        // ground-truthed: `regTmp = (40MHz-primary-channel-offset)<<5;
+        // if(short) regTmp|=0x80; write8(REG_RRSR+2, regTmp)` -- this
+        // driver is 20MHz-only, so that offset term is always 0 here).
+        // usb_wifi_set_ap_short_preamble was just set inside the
+        // wpa2_join_step_mgmt call above, from the AP's own real
+        // advertised Capability Information.
+        let short_preamble_now: u32 = usb_wifi_get_ap_short_preamble();
+        let _ = rtl_reg_write8(devaddr, mps_out, 0x442 as u32, if short_preamble_now == (1 as u32) { 0x80 as u32 } else { 0 as u32 });
+        in_eapol = 1;
+      }
       // BUG FOUND 2026-11-16 (live, immediately after the BSSID+subtype
       // filters above): with the filters now correctly discarding
       // every ambient frame that isn't the specific awaited response
