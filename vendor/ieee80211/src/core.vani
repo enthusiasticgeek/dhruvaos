@@ -855,7 +855,26 @@ const DATA_FRAME_EAPOL_MAX_LEN: i64 = 140;
 // the join sequence), ADDR2=own MAC, wrapping `payload` (an EAPOL-Key
 // frame, as built by this project's own eapol_key package) behind the
 // LLC/SNAP header above. Returns the real frame length used.
-fn data_frame_build_eapol(bssid: ref [u8; 6], own_mac: ref [u8; 6], payload: ref [u8; 140], payload_len: i64, out: mut ref [u8; 140]) -> i64 {
+//
+// seq_num (round 2026-11-22): this field was hardcoded to 0x0000 in
+// the actual frame header on every single call -- the exact same bug
+// class probe_request_build/auth_request_build/assoc_request_build
+// all had and were already fixed for (see probe_request_build's own
+// header comment for the original "why"), just never ported to this
+// sibling function. Every Message 2/4 this driver ever sent carried
+// Sequence Control 0, every single boot, every single retry -- a
+// real AP's own duplicate-frame filter keys only on (transmitter
+// address, sequence number, fragment number), never on content, so
+// once it has cached seq#0 from this STA from ANY earlier frame (a
+// collision is all but guaranteed this way, not a rare coincidence),
+// every subsequent Message 2/4 -- regardless of how correct its own
+// content/MIC/preamble/rate fields are -- gets silently discarded as
+// an apparent repeat of something already processed, never even
+// reaching the AP's own EAPOL state machine to be rejected loudly.
+// This plausibly explains why none of this investigation's other,
+// independently-verified-correct fixes (content/MIC, capability info,
+// rate set, PHY preamble) ever changed the outcome.
+fn data_frame_build_eapol(bssid: ref [u8; 6], own_mac: ref [u8; 6], payload: ref [u8; 140], payload_len: i64, seq_num: i64, out: mut ref [u8; 140]) -> i64 {
   let fc: i64 = FC_TYPE_DATA | FC_TODS;
   out[0] = (fc & (255 as i64)) as u8;
   out[1] = ((fc >> 8) & (255 as i64)) as u8;
@@ -868,8 +887,9 @@ fn data_frame_build_eapol(bssid: ref [u8; 6], own_mac: ref [u8; 6], payload: ref
     out[16 + i] = bssid[i];
     i = i + 1;
   }
-  out[22] = 0 as u8;
-  out[23] = 0 as u8;
+  let seq_ctrl: i64 = (seq_num & 0xfff) << 4;
+  out[22] = (seq_ctrl & (255 as i64)) as u8;
+  out[23] = ((seq_ctrl >> 8) & (255 as i64)) as u8;
 
   let llc_off: i64 = DATA_HDR_LEN_NONQOS;
   out[llc_off] = 0xaa as u8;

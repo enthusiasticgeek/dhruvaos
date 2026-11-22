@@ -54940,7 +54940,7 @@ fn wifi_real_join() -> i64 {
             eti2 = eti2 + 1;
           }
           let _ = uart_puts("\n");
-          let wrapped_len: i64 = data_frame_build_eapol(ref bssid, ref own_mac, ref eapol_tx_fixed, er.tx_len, mut ref wrapped);
+          let wrapped_len: i64 = data_frame_build_eapol(ref bssid, ref own_mac, ref eapol_tx_fixed, er.tx_len, seq, mut ref wrapped);
           let wj: i64 = 0;
           while wj < wrapped_len {
             let _ = buf_write_byte(wrapped_heap, wj as u32, wrapped[wj] as u32);
