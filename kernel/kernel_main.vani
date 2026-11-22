@@ -44819,6 +44819,62 @@ fn shell_dispatch_kernelslot(line_buf: mut ref i64, cmd_end: i64, line_len: i64)
 // commands) since this store exists specifically to hold things like
 // WiFi passwords; `critconfig list` only ever shows keys/metadata,
 // never values, so it stays unrestricted.
+// DIAGNOSTIC (2026-11-22, independent MIC verification showed the
+// board's own computed Message 2 MIC doesn't match what the REAL
+// password/SSID should produce, despite the user confirming the real
+// password is correct and connects fine on Linux): prints a SHA256
+// hash + length of the already-decrypted, in-memory SSID/password
+// buffers wifi_real_join itself actually uses for PBKDF2 -- NEVER the
+// raw bytes -- so a credential-store round-trip bug (critconfig's own
+// ChaCha20-Poly1305 encrypt/decrypt, or wifi_config_init's own
+// truncate-into-buffer copy) can be ruled in or out without ever
+// exposing the real password. Compare this hash against an
+// independently-computed one over the SAME real credential files.
+fn wificreds_hash_diag() -> i64 {
+  let ssid_len: i64 = wifi_config_ssid_len_get() as i64;
+  let ssid_chunk: [u8; 256] = zero256_bytes();
+  let ssid_src: mut ref i64 = wifi_config_ssid_buf_ptr();
+  let sci: i64 = 0;
+  while sci < ssid_len {
+    ssid_chunk[sci] = buf_read_byte(ssid_src, sci as u32) as u8;
+    sci = sci + 1;
+  }
+  let ssid_ctx: Sha256Ctx = sha256_init();
+  let ssid_ctx2: Sha256Ctx = sha256_update(ref ssid_ctx, mut ref ssid_chunk, ssid_len);
+  let ssid_digest: [u8; 32] = sha256_finalize(ref ssid_ctx2);
+  let _ = uart_puts("wificreds: ssid_len=");
+  let _ = uart_put_i64(ssid_len);
+  let _ = uart_puts(" sha256=");
+  let si: i64 = 0;
+  while si < 32 {
+    let _ = uart_put_hex_byte(ssid_digest[si]);
+    si = si + 1;
+  }
+  let _ = uart_puts("\n");
+
+  let pwd_len: i64 = wifi_config_password_len_get() as i64;
+  let pwd_chunk: [u8; 256] = zero256_bytes();
+  let pwd_src: mut ref i64 = wifi_config_password_buf_ptr();
+  let pci: i64 = 0;
+  while pci < pwd_len {
+    pwd_chunk[pci] = buf_read_byte(pwd_src, pci as u32) as u8;
+    pci = pci + 1;
+  }
+  let pwd_ctx: Sha256Ctx = sha256_init();
+  let pwd_ctx2: Sha256Ctx = sha256_update(ref pwd_ctx, mut ref pwd_chunk, pwd_len);
+  let pwd_digest: [u8; 32] = sha256_finalize(ref pwd_ctx2);
+  let _ = uart_puts("wificreds: password_len=");
+  let _ = uart_put_i64(pwd_len);
+  let _ = uart_puts(" sha256=");
+  let pi: i64 = 0;
+  while pi < 32 {
+    let _ = uart_put_hex_byte(pwd_digest[pi]);
+    pi = pi + 1;
+  }
+  let _ = uart_puts("\n");
+  return 0;
+}
+
 fn shell_dispatch_critconfig(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
   if cmd_end >= line_len {
     let _ = uart_puts("usage: critconfig get <key> | critconfig set <key> <value> [--encrypted] | critconfig list\n");
@@ -46864,6 +46920,9 @@ fn shell_dispatch() -> i64 {
   }
   if shell_word_matches(line_buf, 0, cmd_end, "critconfig") == 1 {
     return shell_dispatch_critconfig(line_buf, cmd_end, line_len);
+  }
+  if shell_word_matches(line_buf, 0, cmd_end, "wificreds") == 1 {
+    return wificreds_hash_diag();
   }
 
   // Round 42: change an existing file's permission bits. Mode is a
