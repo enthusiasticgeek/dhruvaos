@@ -30243,7 +30243,26 @@ fn rtl8188cu_write_firmware_page(devaddr: u32, mps: u32, reg_addr: u32, fw_buf: 
   let done: i64 = 0;
   while done < page_len {
     let remaining: i64 = page_len - done;
-    let this_chunk: i64 = if remaining < (128 as i64) { remaining } else { 128 };
+    // BUG FOUND 2026-11-22 (Realtek's own 2013 vendor SDK, hal/rtl8192c/
+    // rtl8192c_hal_init.c's _BlockWrite -- the deterministic, identical-
+    // every-boot firmware chunk-write failure at the exact tail of the
+    // 16094-byte image, chunk size 94 bytes): the real driver NEVER
+    // sends a single arbitrarily-sized "remainder" write for the tail
+    // of a page. Its own _BlockWrite, after as many full MAX_REG_
+    // BOLCK_SIZE(196) blocks as fit, decomposes whatever's left FURTHER
+    // into MIN_REG_BOLCK_SIZE(8)-byte blocks, and anything still left
+    // under 8 bytes into individual 1-byte writes -- verbatim:
+    // `blockCount = remainSize / blockSize2; ... rtw_writeN(..., 8, ...)`
+    // then `for(i=0;i<remainSize2;i++) rtw_write8(...)`. It never issues
+    // a write of some other, in-between size (82 bytes for its own
+    // 196-block remainder; 94 for our 128-block one) at all -- every
+    // register-write vendor command this real driver ever sends is
+    // exactly 196, 8, or 1 bytes long (adapted here to our own already-
+    // confirmed-correct 128-byte main block size: 128, 8, or 1). Same
+    // decomposition, applied to OUR remaining-byte count instead of
+    // reproducing a single odd-sized write this real driver has never
+    // once sent in its own history.
+    let this_chunk: i64 = if remaining >= (128 as i64) { 128 } else if remaining >= (8 as i64) { 8 } else { 1 };
     let cur_addr: u32 = reg_addr + (done as u32);
     let _ = ssh_copy(chunk, 0, fw_buf, base_off + done, this_chunk);
     // Resilience fix (2026-10-29): see usb_first_contact_retry_count's
@@ -54497,6 +54516,15 @@ fn wifi_real_join() -> i64 {
   // rx_seen_count already exists to make for Auth/Assoc. Added before
   // guessing at a root cause blind.
   let eapol_rx_seen_count: i64 = 0;
+  // BUG FOUND 2026-11-22 (first live eapol_rx_seen_count data: 42/50
+  // polls saw SOME frame, yet none parsed as EAPOL -- too coarse to
+  // tell "ambient Beacon/MGMT noise on a busy channel, correctly
+  // rejected by data_frame_parse_eapol's own ftype!=2 check" apart from
+  // "genuine DATA frames arrived but something else about them doesn't
+  // match". Classifies the FC type field directly (bits[3:2] of byte 0,
+  // same field data_frame_parse_eapol itself reads) before calling that
+  // parser, so the next real-HW run says which of these it actually is.
+  let eapol_data_type_count: i64 = 0;
   while (connected == 0) && (eapol_iter < WIFI_RX_POLL_CAP) {
     // 2026-10-25 fix: same gap, same reason -- see wifi_scan_for_ssid's
     // own identical fix's header comment above for the full "why". This
@@ -54512,6 +54540,32 @@ fn wifi_real_join() -> i64 {
       // See wifi_scan_for_ssid's own identical 2026-11-16 fix comment:
       // use the TRUNCATED length, not the original rx2_len.
       let fixed2_len: i64 = wifi_heap_to_fixed256(rx_heap, rx2_len, mut ref rx_fixed);
+      let eapol_fc: i64 = (rx_fixed[0] as i64) | ((rx_fixed[1] as i64) << 8);
+      let eapol_ftype: i64 = (eapol_fc >> 2) & (3 as i64);
+      if eapol_ftype == 2 {
+        eapol_data_type_count = eapol_data_type_count + 1;
+        // BUG FOUND 2026-11-22 (eapol_data_type_count=3/50, none parsed
+        // as EAPOL -- real DATA frames arrive but data_frame_parse_
+        // eapol rejects every one of them for a reason this coarse
+        // counter can't show). Dump raw bytes live, inline, rather than
+        // storing into a new persistent trace buffer -- RX polling here
+        // isn't timing-critical the way the TX bulk-OUT path was, so
+        // printing directly in the loop is safe and simpler. Enough
+        // bytes to see the full MAC header (up to 30 w/ HT-Control) +
+        // LLC/SNAP (8) + a few ethertype-adjacent bytes.
+        let _ = uart_puts("wifi join DIAG: EAPOL-wait saw a real DATA-type frame (len=");
+        let _ = uart_put_i64(fixed2_len);
+        let _ = uart_puts("), fc=0x");
+        let _ = uart_put_hex32(eapol_fc as u32);
+        let _ = uart_puts(" bytes[0..39]=");
+        let edi: i64 = 0;
+        while (edi < 40) && (edi < fixed2_len) {
+          let _ = uart_put_hex_byte(rx_fixed[edi]);
+          let _ = uart_puts(" ");
+          edi = edi + 1;
+        }
+        let _ = uart_puts("\n");
+      }
       let dinfo: DataFrameEapolResult = data_frame_parse_eapol(ref rx_fixed, fixed2_len, mut ref eapol_payload);
       if dinfo.ok == 1 {
         let ei: i64 = 0;
@@ -54577,11 +54631,19 @@ fn wifi_real_join() -> i64 {
     let _ = uart_puts("wifi join: CONNECTED (4-way handshake complete, TK/GTK installed)\n");
     return 0;
   }
-  let _ = uart_puts("wifi join: 4-way handshake never completed, eapol_rx_seen_count=");
+  let _ = uart_puts("wifi join: 4-way handshake never completed, eapol_state_before=");
+  let _ = uart_put_i64(eapol_state_before);
+  let _ = uart_puts(" (");
+  let _ = uart_put_i64(WPA2_JOIN_WAIT_EAPOL_MSG1);
+  let _ = uart_puts("=wait msg1 ");
+  let _ = uart_put_i64(WPA2_JOIN_WAIT_EAPOL_MSG3);
+  let _ = uart_puts("=wait msg3) eapol_rx_seen_count=");
   let _ = uart_put_i64(eapol_rx_seen_count);
+  let _ = uart_puts(" eapol_data_type_count=");
+  let _ = uart_put_i64(eapol_data_type_count);
   let _ = uart_puts(" over the last ");
   let _ = uart_put_i64(eapol_iter);
-  let _ = uart_puts(" polls (0=no frames at all reached RX during this phase, nonzero=frames arrived but never parsed as EAPOL)\n");
+  let _ = uart_puts(" polls (data_type_count=0 -> every received frame was ambient MGMT/ctrl noise, not even a real 802.11 DATA frame; nonzero -> real DATA frames arrived but didn't parse as EAPOL)\n");
   return 0 - 1;
 }
 
