@@ -43315,6 +43315,13 @@ fn kernelupload_chunk_verify_range(base_block: i64, range_len: i64, want_sha256:
   let partial_bytes: i64 = range_len % 512;
   let rb: i64 = 0;
   while rb < nblocks {
+    // Same missing-watchdog-kick bug as kernelupload commit's own
+    // readback loop (see that loop's own 2026-11-22 comment) -- same
+    // fix, same reason, before a sufficiently large chunk range can
+    // hit the same self-reset mid-verify.
+    if hardware_is_real_hw_get() == (1 as u32) {
+      let _ = watchdog_kick();
+    }
     let rstatus: i64 = sdhost_read_block(base_block + rb, block_buf);
     if rstatus != 0 {
       return 0 - 1;
@@ -44492,6 +44499,21 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     let nblocks: i64 = (actual_len + 511) / 512;
     let rb: i64 = 0;
     while rb < nblocks {
+      // BUG FOUND 2026-11-22 (real-HW investigation: upload succeeded,
+      // then "commit did not report success" with the board going
+      // silent and needing a full re-boot cycle to recover): this
+      // readback-verify loop re-reads every written SD block
+      // sequentially -- 5930 blocks for a 3MB kernel image -- with NO
+      // watchdog_kick() anywhere inside it, unlike every other
+      // long-running real-HW loop in this codebase (wifi scan/join,
+      // the upload's own receive loop, etc.). With a 15s watchdog
+      // timeout and thousands of sequential SD block reads, this
+      // reliably self-resets mid-commit on any upload of meaningful
+      // size, exactly matching the observed symptom. Same one-line
+      // fix as every other long real-HW loop.
+      if hardware_is_real_hw_get() == (1 as u32) {
+        let _ = watchdog_kick();
+      }
       let rstatus: i64 = sdhost_read_block(base_block + rb, block_buf);
       if rstatus != 0 {
         let _ = uart_puts("kernelupload: readback failed, not committing\n");
