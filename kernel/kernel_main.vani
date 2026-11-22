@@ -54941,12 +54941,30 @@ fn wifi_real_join() -> i64 {
           }
           let _ = uart_puts("\n");
           let wrapped_len: i64 = data_frame_build_eapol(ref bssid, ref own_mac, ref eapol_tx_fixed, er.tx_len, seq, mut ref wrapped);
+          // DIAGNOSTIC (2026-11-22): the actual wrapped 802.11 frame
+          // header bytes about to go over the air (not just the EAPOL
+          // payload the earlier diagnostic already shows) -- confirms
+          // directly whether seq_ctrl (bytes 22-23) and the descriptor's
+          // own seq parameter actually agree, rather than inferring it.
+          let _ = uart_puts("wifi join DIAG: wrapped DATA frame header (seq param=");
+          let _ = uart_put_i64(seq);
+          let _ = uart_puts(") bytes[0..24]=");
+          let whi: i64 = 0;
+          while whi < 24 {
+            let _ = uart_put_hex_byte(wrapped[whi]);
+            let _ = uart_puts(" ");
+            whi = whi + 1;
+          }
+          let _ = uart_puts("\n");
           let wj: i64 = 0;
           while wj < wrapped_len {
             let _ = buf_write_byte(wrapped_heap, wj as u32, wrapped[wj] as u32);
             wj = wj + 1;
           }
-          let _ = wifi_radio_tx_frame(devaddr, mps_out, wrapped_heap, wrapped_len, 0, seq);
+          let tx_status: i64 = wifi_radio_tx_frame(devaddr, mps_out, wrapped_heap, wrapped_len, 0, seq);
+          let _ = uart_puts("wifi join DIAG: Message 2/4 TX result=");
+          let _ = uart_put_i64(tx_status);
+          let _ = uart_puts(" (0=XFERCOMPL confirmed)\n");
           seq = seq + 1;
         }
         if er.done == 1 { connected = 1; }
