@@ -30530,6 +30530,17 @@ const RTL_TXDESC_QUEUE_MGNT: i64 = 0x12;
 // above. See rtl8188cu_tx_frame's own header comment for why this
 // driver never needed it until now.
 const RTL_TXDESC_QUEUE_BE: i64 = 0x0;
+// QSLT_VO (0x7), confirmed in the real vendor SDK's own
+// include/rtl8192c_xmit.h (`#define QSLT_VO 0x7`) -- round
+// 2026-11-22, full systematic re-audit: core/rtw_xmit.c's own
+// do_queue_select is literally `qsel = pattrib->priority` (the raw
+// WMM TID, not a fixed per-frame-class constant), and set_qos tags
+// any ether_type==0x888e frame (EAPOL) with priority 7 (AC_VO) --
+// see data_frame_build_eapol's own header comment (vendor/ieee80211)
+// for the full citation. QSLT_BE (0) was never actually correct for
+// EAPOL specifically; it was this driver's only data-frame class
+// before this round, so the distinction never mattered until now.
+const RTL_TXDESC_QUEUE_VO: i64 = 0x7;
 const RTL_TXDESC32_AGG_BREAK: i64 = 0x40; // BIT(6) of txdw1
 
 // Builds the 32-byte hardware TX descriptor this chip family prepends
@@ -32435,7 +32446,13 @@ fn rtl8188cu_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len:
   let tx_fc: i64 = (buf_read_byte(frame_buf, 0 as u32) as i64) | ((buf_read_byte(frame_buf, 1 as u32) as i64) << 8);
   let tx_ftype: i64 = (tx_fc >> 2) & (3 as i64);
   let is_data_frame: i64 = if tx_ftype == 2 { 1 } else { 0 };
-  let queue_sel: i64 = if is_data_frame == 1 { RTL_TXDESC_QUEUE_BE } else { RTL_TXDESC_QUEUE_MGNT };
+  // Round 2026-11-22: every data frame this driver ever builds
+  // (data_frame_build_eapol) is EAPOL, now correctly QoS-tagged
+  // AC_VO (see that function's own header comment) -- so every data
+  // frame reaching here carries the QoS subtype bit, and QSLT_VO is
+  // the right queue for all of them, not QSLT_BE.
+  let is_qos_frame: i64 = if (tx_fc & FC_SUBTYPE_QOS_BIT) != 0 { 1 } else { 0 };
+  let queue_sel: i64 = if is_data_frame == 0 { RTL_TXDESC_QUEUE_MGNT } else if is_qos_frame == 1 { RTL_TXDESC_QUEUE_VO } else { RTL_TXDESC_QUEUE_BE };
   let _ = rtl_tx_desc_write(tx_buf, frame_len, is_broadcast, seq_num, queue_sel);
   let i: i64 = 0;
   while i < frame_len {
