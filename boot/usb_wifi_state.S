@@ -162,6 +162,35 @@ usb_wifi_in_toggle:
     .word 0
 usb_wifi_out_toggle:
     .word 0
+/* 2026-11-22: second bulk-OUT endpoint, BK/BE-data-only on this chip
+ * (see rtl8188cu_tx_frame's own header comment -- out_ep[0]/MGNT-
+ * mapped is what usb_wifi_bulk_out_epaddr already holds; this is
+ * out_ep[1], captured only now that this driver actually sends a
+ * real data-type frame, EAPOL Message 2/4, that this chip's own
+ * queue-priority config (REG_TRXDMA_CTRL) routes to the BE/BK queue,
+ * not MGNT). A dedicated toggle, NOT shared with usb_wifi_out_toggle
+ * -- USB data-toggle state belongs to a (device, endpoint) pair, and
+ * these are two physically different endpoints. Defaults to 0/0,
+ * meaning "not found" until enumeration positively sets it; callers
+ * must fall back to the first endpoint when epaddr2 is still 0. */
+usb_wifi_bulk_out_epaddr2:
+    .word 0
+usb_wifi_bulk_out_mps2:
+    .word 0
+usb_wifi_out_toggle2:
+    .word 0
+/* Set by rtl8188cu_tx_frame right before calling dwc2_wifi_bulk_out,
+ * read (and left as it found it -- never implicitly cleared) by that
+ * same call: 1 = use the second (BK/BE-data) endpoint/mps/toggle for
+ * THIS transfer, 0 = use the first (MGNT-mapped) one. Avoids
+ * threading a new parameter through wifi_radio_tx_frame's own
+ * vendor-agnostic trampoline (boot/wifi_radio_state.S) purely to
+ * carry a single RTL8188CU-specific routing bit two frames down the
+ * call chain -- same .bss-signaling idiom this file's own toggle
+ * fields and wifi_radio_state.S's function-pointer registration
+ * already use. */
+usb_wifi_use_second_bulk_out:
+    .word 0
 
 .section ".text"
 
@@ -220,6 +249,66 @@ usb_wifi_get_bulk_out_mps:
 .global usb_wifi_set_bulk_out_mps
 usb_wifi_set_bulk_out_mps:
     ldr r1, =usb_wifi_bulk_out_mps
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_bulk_out_epaddr2
+usb_wifi_get_bulk_out_epaddr2:
+    ldr r0, =usb_wifi_bulk_out_epaddr2
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_bulk_out_epaddr2
+usb_wifi_set_bulk_out_epaddr2:
+    ldr r1, =usb_wifi_bulk_out_epaddr2
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_bulk_out_mps2
+usb_wifi_get_bulk_out_mps2:
+    ldr r0, =usb_wifi_bulk_out_mps2
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_bulk_out_mps2
+usb_wifi_set_bulk_out_mps2:
+    ldr r1, =usb_wifi_bulk_out_mps2
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_out_toggle2
+usb_wifi_get_out_toggle2:
+    ldr r0, =usb_wifi_out_toggle2
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_out_toggle2
+usb_wifi_set_out_toggle2:
+    ldr r1, =usb_wifi_out_toggle2
+    str r0, [r1]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_get_use_second_bulk_out
+usb_wifi_get_use_second_bulk_out:
+    ldr r0, =usb_wifi_use_second_bulk_out
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global usb_wifi_set_use_second_bulk_out
+usb_wifi_set_use_second_bulk_out:
+    ldr r1, =usb_wifi_use_second_bulk_out
     str r0, [r1]
     mov r0, #0
     mov r1, #0
