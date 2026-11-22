@@ -35,7 +35,33 @@ const FC_STYPE_DEAUTH: i64 = 0x00c0;
 
 const EID_SSID: i64 = 0;
 const EID_SUPP_RATES: i64 = 1;
+const EID_EXT_SUPP_RATES: i64 = 50;
 const EID_RSN: i64 = 48;
+
+// This STA's own real rate capability (round 2026-11-22): the RTL8188CU
+// firmware/MAC bring-up this project's own boot log confirms
+// ("CCK+OFDM-enable") actually enables both CCK and OFDM, so this is
+// the full 12-rate 802.11b/g set, not a CCK-only subset. Basic-rate
+// flagging (bit 7, 0x80) matches the vendor driver's own documented
+// mandatory set (rtw_wlan_util.c's UpdateBrateTbl: "1M, 2M, 5.5M, 11M,
+// 6M, 12M, 24M are mandatory") -- those seven are Basic, the remaining
+// five (9/18/36/48/54M) are supported but optional. Returns 12 (the
+// count written).
+fn sta_rate_capability(out: mut ref [u8; 12]) -> i64 {
+  out[0] = 0x82 as u8;  // 1 Mbps CCK, Basic
+  out[1] = 0x84 as u8;  // 2 Mbps CCK, Basic
+  out[2] = 0x8b as u8;  // 5.5 Mbps CCK, Basic
+  out[3] = 0x96 as u8;  // 11 Mbps CCK, Basic
+  out[4] = 0x8c as u8;  // 6 Mbps OFDM, Basic
+  out[5] = 0x12 as u8;  // 9 Mbps OFDM
+  out[6] = 0x98 as u8;  // 12 Mbps OFDM, Basic
+  out[7] = 0x24 as u8;  // 18 Mbps OFDM
+  out[8] = 0xb0 as u8;  // 24 Mbps OFDM, Basic
+  out[9] = 0x48 as u8;  // 36 Mbps OFDM
+  out[10] = 0x60 as u8; // 48 Mbps OFDM
+  out[11] = 0x6c as u8; // 54 Mbps OFDM
+  return 12;
+}
 
 const WLAN_AUTH_OPEN: i64 = 0;
 const WLAN_STATUS_SUCCESS: i64 = 0;
@@ -190,18 +216,26 @@ fn rsn_ie_supports_wpa2_psk_ccmp(buf: ref [u8; 256], data_off: i64, data_len: i6
   return 1;
 }
 
-const PROBE_REQ_MAX_LEN: i64 = 64;
+// Worst case: 24 (header) + 2+32 (SSID IE, max ssid_len) + 2+8
+// (Supported Rates IE, 8 rates) + 2+4 (Extended Supported Rates IE,
+// remaining 4 of this STA's own 12-rate set) = 74; 80 leaves margin.
+const PROBE_REQ_MAX_LEN: i64 = 80;
 
 // Builds a wildcard-BSSID Probe Request: Address1 (destination) and
 // Address3 (BSSID) both the broadcast address, Address2 (source) the
 // station's own MAC -- the standard way to actively scan for any AP on
 // the current channel rather than a specific already-known one.
-// Contains the SSID IE (the network being searched for) and a fixed,
-// standard 802.11b Supported Rates IE (1/2/5.5/11 Mbps, each with the
-// "basic rate" bit set per the 500 kbit/s-unit encoding IEEE 802.11
-// itself defines) -- real rate negotiation beyond "the AP sees at
-// least one rate it also supports" is out of this package's own scope.
-// Returns the actual frame length used (24 + 2+ssid_len + 2+4).
+// Contains the SSID IE (the network being searched for) and this
+// station's own real, full Supported Rates capability (sta_rate_
+// capability -- round 2026-11-22: this used to be hardcoded to just
+// the 4 legacy-802.11b CCK rates, omitting the OFDM rates this
+// project's own RTL8188CU bring-up log confirms are actually enabled
+// ("CCK+OFDM-enable"); a Probe Request is sent before the AP is known,
+// so per spec this must be the STA's own full capability, not anything
+// AP-dependent), split into a base Supported Rates IE (first 8) plus
+// an Extended Supported Rates IE (the remaining 4) when it exceeds 8,
+// matching the real vendor driver's own issue_probereq/issue_assocreq
+// convention. Returns the actual frame length used.
 //
 // BUG FOUND 2026-11-21 (real-HW investigation: Auth/Probe Requests
 // transmit cleanly at the USB/chip level -- XFERCOMPL, TXPAUSE=0,
@@ -238,7 +272,7 @@ const PROBE_REQ_MAX_LEN: i64 = 64;
 // body too, so the descriptor and the real over-the-air bytes finally
 // agree, matching a real client's own behavior instead of silently
 // repeating the first frame's identity forever.
-fn probe_request_build(own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, seq_num: i64, out: mut ref [u8; 64]) -> i64 {
+fn probe_request_build(own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, seq_num: i64, out: mut ref [u8; 80]) -> i64 {
   let broadcast: [u8; 6] = [0xff as u8; 6];
   out[0] = (FC_STYPE_PROBE_REQ & (255 as i64)) as u8;
   out[1] = ((FC_STYPE_PROBE_REQ >> 8) & (255 as i64)) as u8;
@@ -265,29 +299,62 @@ fn probe_request_build(own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, 
   }
   off = off + 2 + ssid_len;
 
+  let sta_rates: [u8; 12] = [0 as u8; 12];
+  let sta_rates_len: i64 = sta_rate_capability(mut ref sta_rates);
+  let base_len: i64 = if sta_rates_len > 8 { 8 } else { sta_rates_len };
   out[off] = EID_SUPP_RATES as u8;
-  out[off + 1] = 4 as u8;
-  out[off + 2] = 0x82 as u8;
-  out[off + 3] = 0x84 as u8;
-  out[off + 4] = 0x8b as u8;
-  out[off + 5] = 0x96 as u8;
-  off = off + 6;
+  out[off + 1] = base_len as u8;
+  i = 0;
+  while i < base_len {
+    out[off + 2 + i] = sta_rates[i];
+    i = i + 1;
+  }
+  off = off + 2 + base_len;
+
+  if sta_rates_len > 8 {
+    let ext_len: i64 = sta_rates_len - 8;
+    out[off] = EID_EXT_SUPP_RATES as u8;
+    out[off + 1] = ext_len as u8;
+    i = 0;
+    while i < ext_len {
+      out[off + 2 + i] = sta_rates[8 + i];
+      i = i + 1;
+    }
+    off = off + 2 + ext_len;
+  }
 
   return off;
 }
 
-struct ProbeRespInfo { ok: i64, ssid_len: i64, has_rsn: i64 }
+struct ProbeRespInfo { ok: i64, ssid_len: i64, has_rsn: i64, cap_info: i64, rates_len: i64 }
 
 // Parses a Probe Response: fixed fields are Timestamp (8 bytes),
 // Beacon Interval (2 bytes), Capability Information (2 bytes) --
 // 12 bytes total, immediately after the 24-byte MAC header, before any
 // IEs begin. Extracts the SSID (so the caller can confirm this is
-// really the network it asked for, not a same-channel neighbor) and
-// whether a WPA2-PSK/CCMP-compatible RSN IE is present.
-fn probe_response_parse(buf: ref [u8; 256], frame_len: i64, ssid_out: mut ref [u8; 32]) -> ProbeRespInfo {
+// really the network it asked for, not a same-channel neighbor),
+// whether a WPA2-PSK/CCMP-compatible RSN IE is present, the AP's own
+// raw Capability Information value, and the AP's own raw Supported
+// Rates (+ Extended Supported Rates, concatenated) bytes.
+//
+// Round 2026-11-22: both cap_info and the rate bytes exist because
+// assoc_request_build must not invent either one. Ground-truthed
+// against the real vendor driver (rtw_mlme_ext.c's issue_assocreq):
+// Capability Information is copied verbatim from the AP's own IEs
+// (`_rtw_memcpy(pframe, rtw_get_capability_from_ie(...), 2)`), not
+// built from a hardcoded STA-side value -- a real AP in this
+// project's own testing rejected association with status code 19
+// ("does not support short preamble") when the STA's assoc request
+// didn't echo the AP's own Short Preamble bit. Likewise the real
+// driver's Supported Rates IE is the intersection of the STA's own
+// rate capability and the AP's actually-advertised rates (same
+// function, "Check if the AP's supported rates are also supported by
+// STA"), not a fixed list.
+fn probe_response_parse(buf: ref [u8; 256], frame_len: i64, ssid_out: mut ref [u8; 32], rates_out: mut ref [u8; 16]) -> ProbeRespInfo {
   if frame_len < 36 {
-    return ProbeRespInfo { ok: 0, ssid_len: 0, has_rsn: 0 };
+    return ProbeRespInfo { ok: 0, ssid_len: 0, has_rsn: 0, cap_info: 0, rates_len: 0 };
   }
+  let cap_info: i64 = (buf[34] as i64) | ((buf[35] as i64) << 8);
   let ies_off: i64 = 36;
   let ies_len: i64 = frame_len - ies_off;
 
@@ -295,7 +362,7 @@ fn probe_response_parse(buf: ref [u8; 256], frame_len: i64, ssid_out: mut ref [u
   let ssid_len: i64 = 0;
   if ssid_ie.found == 1 {
     if ssid_ie.data_len > 32 {
-      return ProbeRespInfo { ok: 0, ssid_len: 0, has_rsn: 0 };
+      return ProbeRespInfo { ok: 0, ssid_len: 0, has_rsn: 0, cap_info: 0, rates_len: 0 };
     }
     ssid_len = ssid_ie.data_len;
     let i: i64 = 0;
@@ -311,7 +378,30 @@ fn probe_response_parse(buf: ref [u8; 256], frame_len: i64, ssid_out: mut ref [u
     has_rsn = rsn_ie_supports_wpa2_psk_ccmp(buf, rsn_ie.data_off, rsn_ie.data_len);
   }
 
-  return ProbeRespInfo { ok: 1, ssid_len: ssid_len, has_rsn: has_rsn };
+  let rates_len: i64 = 0;
+  let rates_ie: IeFindResult = ie_find(buf, ies_off, ies_len, EID_SUPP_RATES);
+  if rates_ie.found == 1 {
+    let n: i64 = if rates_ie.data_len > 16 { 16 } else { rates_ie.data_len };
+    let i: i64 = 0;
+    while i < n {
+      rates_out[i] = buf[rates_ie.data_off + i];
+      i = i + 1;
+    }
+    rates_len = n;
+  }
+  let ext_rates_ie: IeFindResult = ie_find(buf, ies_off, ies_len, EID_EXT_SUPP_RATES);
+  if ext_rates_ie.found == 1 {
+    let room: i64 = 16 - rates_len;
+    let n: i64 = if ext_rates_ie.data_len > room { room } else { ext_rates_ie.data_len };
+    let i: i64 = 0;
+    while i < n {
+      rates_out[rates_len + i] = buf[ext_rates_ie.data_off + i];
+      i = i + 1;
+    }
+    rates_len = rates_len + n;
+  }
+
+  return ProbeRespInfo { ok: 1, ssid_len: ssid_len, has_rsn: has_rsn, cap_info: cap_info, rates_len: rates_len };
 }
 
 // Builds an Open System Authentication Request: Algorithm Number 0
@@ -365,7 +455,11 @@ fn auth_response_parse(buf: ref [u8; 256], frame_len: i64) -> i64 {
   return 1;
 }
 
-const ASSOC_REQ_MAX_LEN: i64 = 90;
+// Worst case: 24 (header) + 2 (capab) + 2 (listen interval) + 2+32
+// (SSID IE, max ssid_len) + 2+8 (Supported Rates IE) + 2+4 (Extended
+// Supported Rates IE, remaining 4 of the 12-rate joint set) + 22
+// (RSN IE) = 100; 110 leaves margin.
+const ASSOC_REQ_MAX_LEN: i64 = 110;
 
 // Builds an Association Request: Capability Information advertises ESS
 // (infrastructure BSS, bit 0) and Privacy (bit 4 -- required whenever
@@ -381,7 +475,17 @@ const ASSOC_REQ_MAX_LEN: i64 = 90;
 // Sequence Control now a real caller-supplied value, not a hardcoded
 // 0x0000 -- see probe_request_build's own header comment for the full
 // "why" (same bug, same fix, same investigation).
-fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, rsn_ie: ref [u8; 22], seq_num: i64, out: mut ref [u8; 90]) -> i64 {
+//
+// ap_cap_info (round 2026-11-22): the Capability Information value the
+// AP itself advertised in its Probe Response (ProbeRespInfo.cap_info).
+// Short Preamble (bit 5, 0x0020) and Short Slot Time (bit 10, 0x0400)
+// are mirrored from it -- real driver stacks (wpa_supplicant/mac80211)
+// echo these two optional-capability bits back from the AP rather than
+// hardcoding them, and at least one real AP in this project's own
+// testing (status_code=19, "does not support short preamble") strictly
+// enforces the match. ESS/Privacy stay fixed: they describe this STA's
+// own request, not something to mirror.
+fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, rsn_ie: ref [u8; 22], seq_num: i64, ap_cap_info: i64, ap_rates: ref [u8; 16], ap_rates_len: i64, out: mut ref [u8; 110]) -> i64 {
   out[0] = (FC_STYPE_ASSOC_REQ & (255 as i64)) as u8;
   out[1] = ((FC_STYPE_ASSOC_REQ >> 8) & (255 as i64)) as u8;
   out[2] = 0 as u8;
@@ -397,7 +501,7 @@ fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 
   out[22] = (seq_ctrl & (255 as i64)) as u8;
   out[23] = ((seq_ctrl >> 8) & (255 as i64)) as u8;
 
-  let capab_info: i64 = 0x0011;
+  let capab_info: i64 = ap_cap_info;
   out[24] = (capab_info & (255 as i64)) as u8;
   out[25] = ((capab_info >> 8) & (255 as i64)) as u8;
   let listen_interval: i64 = 10;
@@ -414,13 +518,61 @@ fn assoc_request_build(bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 
   }
   off = off + 2 + ssid_len;
 
+  // Joint rate set: every rate the AP itself advertised that this STA
+  // also supports, keeping the AP's own byte (and its own Basic-rate
+  // flag) verbatim -- matches the real driver's own issue_assocreq
+  // rate-matching loop exactly (see probe_response_parse's header
+  // comment for the ground-truth citation). Compared with the Basic-
+  // rate bit (0x80) masked off on both sides, same as the reference's
+  // own `|IEEE80211_BASIC_RATE_MASK` comparison.
+  let sta_rates: [u8; 12] = [0 as u8; 12];
+  let sta_rates_len: i64 = sta_rate_capability(mut ref sta_rates);
+  let matched: [u8; 16] = [0 as u8; 16];
+  let matched_len: i64 = 0;
+  let a: i64 = 0;
+  while a < ap_rates_len {
+    let ap_rate_masked: i64 = (ap_rates[a] as i64) & 0x7f;
+    let b: i64 = 0;
+    let found: i64 = 0;
+    while b < sta_rates_len {
+      if ((sta_rates[b] as i64) & 0x7f) == ap_rate_masked { found = 1; }
+      b = b + 1;
+    }
+    if found == 1 {
+      matched[matched_len] = ap_rates[a];
+      matched_len = matched_len + 1;
+    }
+    a = a + 1;
+  }
+  // No rate in common with the AP: a real STA never sends this
+  // Association Request at all ("don't connect to AP if no joint
+  // supported rate", same reference function). 0 is otherwise
+  // unreachable as a real return value (the header/capab/listen
+  // fields alone already put off at 28), so it's a safe, unambiguous
+  // failure sentinel for the caller to check.
+  if matched_len == 0 { return 0; }
+
+  let base_len: i64 = if matched_len > 8 { 8 } else { matched_len };
   out[off] = EID_SUPP_RATES as u8;
-  out[off + 1] = 4 as u8;
-  out[off + 2] = 0x82 as u8;
-  out[off + 3] = 0x84 as u8;
-  out[off + 4] = 0x8b as u8;
-  out[off + 5] = 0x96 as u8;
-  off = off + 6;
+  out[off + 1] = base_len as u8;
+  i = 0;
+  while i < base_len {
+    out[off + 2 + i] = matched[i];
+    i = i + 1;
+  }
+  off = off + 2 + base_len;
+
+  if matched_len > 8 {
+    let ext_len: i64 = matched_len - 8;
+    out[off] = EID_EXT_SUPP_RATES as u8;
+    out[off + 1] = ext_len as u8;
+    i = 0;
+    while i < ext_len {
+      out[off + 2 + i] = matched[8 + i];
+      i = i + 1;
+    }
+    off = off + 2 + ext_len;
+  }
 
   i = 0;
   while i < 22 {

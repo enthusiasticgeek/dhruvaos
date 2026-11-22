@@ -53095,28 +53095,40 @@ fn ieee80211_boot_self_test() -> i64 {
   ssid[2] = 0x73 as u8;
   ssid[3] = 0x74 as u8;
 
-  let preq: [u8; 64] = [0 as u8; 64];
-  if probe_request_build(ref own_mac, ref ssid, 4, 0, mut ref preq) != 36 { ok = 0; }
+  let preq: [u8; 80] = [0 as u8; 80];
+  if probe_request_build(ref own_mac, ref ssid, 4, 0, mut ref preq) != 46 { ok = 0; }
 
   let presp_buf: [u8; 256] = [0 as u8; 256];
   let fc_presp: i64 = FC_STYPE_PROBE_RESP;
   presp_buf[0] = (fc_presp & (255 as i64)) as u8;
   presp_buf[1] = ((fc_presp >> 8) & (255 as i64)) as u8;
+  let presp_cap_info: i64 = 0x0011;
+  presp_buf[34] = (presp_cap_info & (255 as i64)) as u8;
+  presp_buf[35] = ((presp_cap_info >> 8) & (255 as i64)) as u8;
   presp_buf[36] = EID_SSID as u8;
   presp_buf[37] = 4 as u8;
   presp_buf[38] = 0x74 as u8;
   presp_buf[39] = 0x65 as u8;
   presp_buf[40] = 0x73 as u8;
   presp_buf[41] = 0x74 as u8;
+  presp_buf[42] = EID_SUPP_RATES as u8;
+  presp_buf[43] = 4 as u8;
+  presp_buf[44] = 0x82 as u8;
+  presp_buf[45] = 0x84 as u8;
+  presp_buf[46] = 0x8b as u8;
+  presp_buf[47] = 0x96 as u8;
   let i: i64 = 0;
   while i < 22 {
-    presp_buf[42 + i] = rsn[i];
+    presp_buf[48 + i] = rsn[i];
     i = i + 1;
   }
   let ssid_out: [u8; 32] = [0 as u8; 32];
-  let presp_info: ProbeRespInfo = probe_response_parse(ref presp_buf, 42 + 22, mut ref ssid_out);
+  let presp_rates_out: [u8; 16] = [0 as u8; 16];
+  let presp_info: ProbeRespInfo = probe_response_parse(ref presp_buf, 48 + 22, mut ref ssid_out, mut ref presp_rates_out);
   if presp_info.ok != 1 { ok = 0; }
   if presp_info.has_rsn != 1 { ok = 0; }
+  if presp_info.rates_len != 4 { ok = 0; }
+  if presp_info.cap_info != presp_cap_info { ok = 0; }
 
   let areq: [u8; 30] = [0 as u8; 30];
   if auth_request_build(ref bssid, ref own_mac, 1, mut ref areq) != 30 { ok = 0; }
@@ -53127,8 +53139,8 @@ fn ieee80211_boot_self_test() -> i64 {
   aresp_buf[26] = 2 as u8;
   if auth_response_parse(ref aresp_buf, 30) != 1 { ok = 0; }
 
-  let assocreq: [u8; 90] = [0 as u8; 90];
-  if assoc_request_build(ref bssid, ref own_mac, ref ssid, 4, ref rsn, 2, mut ref assocreq) != 62 { ok = 0; }
+  let assocreq: [u8; 110] = [0 as u8; 110];
+  if assoc_request_build(ref bssid, ref own_mac, ref ssid, 4, ref rsn, 2, presp_info.cap_info, ref presp_rates_out, presp_info.rates_len, mut ref assocreq) != 62 { ok = 0; }
   let assocresp_buf: [u8; 256] = [0 as u8; 256];
   let fc_assoc: i64 = FC_STYPE_ASSOC_RESP;
   assocresp_buf[0] = (fc_assoc & (255 as i64)) as u8;
@@ -53250,7 +53262,7 @@ fn ieee80211_ap_boot_self_test() -> i64 {
 // association is inherently single-instance on this hardware, so
 // either style would work, but this one needed no new boot/*_state.S
 // file or build.sh change at all).
-const WPA2_JOIN_CTX_SIZE: i64 = 169;
+const WPA2_JOIN_CTX_SIZE: i64 = 188;
 const WPA2_JOIN_STATE_OFF: i64 = 0;
 const WPA2_JOIN_SSID_LEN_OFF: i64 = 1;
 const WPA2_JOIN_ASSOC_ID_OFF: i64 = 2;   // 2 bytes
@@ -53267,6 +53279,18 @@ const WPA2_JOIN_RSN_OFF: i64 = 48;       // 22 bytes
 // retransmission as a handshake failure. 99 bytes, matching Message
 // 2's own fixed tx_len everywhere else in this file.
 const WPA2_JOIN_MSG2_CACHE_OFF: i64 = 70; // 99 bytes
+// AP's own Capability Information from its Probe Response, persisted
+// here (round 2026-11-22) so assoc_request_build can echo its Short
+// Preamble/Short Slot Time bits back instead of hardcoding them -- see
+// that function's own header comment for why.
+const WPA2_JOIN_AP_CAPINFO_OFF: i64 = 169; // 2 bytes
+// The AP's own raw Supported Rates (+ Extended Supported Rates)
+// bytes, persisted the same way and for the same reason as
+// WPA2_JOIN_AP_CAPINFO_OFF -- assoc_request_build needs the AP's real
+// advertised rate set to compute the joint rate list, not a hardcoded
+// one (see that function's own header comment).
+const WPA2_JOIN_AP_RATES_LEN_OFF: i64 = 171; // 1 byte
+const WPA2_JOIN_AP_RATES_OFF: i64 = 172;     // 16 bytes
 
 const WPA2_JOIN_IDLE: i64 = 0;
 const WPA2_JOIN_WAIT_PROBE_RESP: i64 = 1;
@@ -53283,7 +53307,7 @@ struct Wpa2JoinResult { state: i64, tx_len: i64, done: i64, failed: i64 }
 // into `ctx` (caller-allocated, WPA2_JOIN_CTX_SIZE bytes) and builds
 // the initial Probe Request into `out`. Returns the frame length to
 // transmit.
-fn wpa2_join_start(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, out: mut ref [u8; 64]) -> i64 {
+fn wpa2_join_start(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, out: mut ref [u8; 80]) -> i64 {
   let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_PROBE_RESP as u32);
   let _ = buf_write_byte(ctx, WPA2_JOIN_SSID_LEN_OFF as u32, ssid_len as u32);
   let i: i64 = 0;
@@ -53331,7 +53355,7 @@ fn wpa2_join_start(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], s
 // needs the original probe-first state machine, since nothing handed
 // it a prior scan's own already-confirmed BSS info the way a real join
 // always has one available.
-fn wpa2_join_start_skip_probe(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, out: mut ref [u8; 64]) -> i64 {
+fn wpa2_join_start_skip_probe(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, out: mut ref [u8; 80]) -> i64 {
   let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_AUTH_RESP as u32);
   let _ = buf_write_byte(ctx, WPA2_JOIN_SSID_LEN_OFF as u32, ssid_len as u32);
   let i: i64 = 0;
@@ -53378,7 +53402,7 @@ fn wpa2_join_start_skip_probe(ctx: mut ref i64, bssid: ref [u8; 6], own_mac: ref
 // over-the-air bytes and the descriptor finally agree. See probe_
 // request_build's own header comment (vendor/ieee80211/src/core.vani)
 // for the full "why".
-fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, seq_num: i64, out: mut ref [u8; 90]) -> Wpa2JoinResult {
+fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, seq_num: i64, out: mut ref [u8; 110]) -> Wpa2JoinResult {
   let state: i64 = buf_read_byte(ctx, WPA2_JOIN_STATE_OFF as u32) as i64;
   let bssid: [u8; 6] = [0 as u8; 6];
   let own_mac: [u8; 6] = [0 as u8; 6];
@@ -53498,7 +53522,8 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, seq
 
   if state == WPA2_JOIN_WAIT_PROBE_RESP {
     let ssid_out: [u8; 32] = [0 as u8; 32];
-    let info: ProbeRespInfo = probe_response_parse(rx_buf, rx_len, mut ref ssid_out);
+    let rates_out: [u8; 16] = [0 as u8; 16];
+    let info: ProbeRespInfo = probe_response_parse(rx_buf, rx_len, mut ref ssid_out, mut ref rates_out);
     if (info.ok != 1) || (info.has_rsn != 1) {
       let _ = uart_puts("wifi join DIAG: probe-response reject -- ok=");
       let _ = uart_put_i64(info.ok);
@@ -53510,6 +53535,11 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, seq
       let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
       return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
     }
+    let _ = buf_write_byte(ctx, WPA2_JOIN_AP_CAPINFO_OFF as u32, (info.cap_info & 0xff) as u32);
+    let _ = buf_write_byte(ctx, (WPA2_JOIN_AP_CAPINFO_OFF + 1) as u32, ((info.cap_info >> 8) & 0xff) as u32);
+    let _ = buf_write_byte(ctx, WPA2_JOIN_AP_RATES_LEN_OFF as u32, info.rates_len as u32);
+    let ri: i64 = 0;
+    while ri < info.rates_len { let _ = buf_write_byte(ctx, (WPA2_JOIN_AP_RATES_OFF + ri) as u32, rates_out[ri] as u32); ri = ri + 1; }
     let auth_frame: [u8; 30] = [0 as u8; 30];
     let alen: i64 = auth_request_build(ref bssid, ref own_mac, seq_num, mut ref auth_frame);
     let j: i64 = 0;
@@ -53546,7 +53576,17 @@ fn wpa2_join_step_mgmt(ctx: mut ref i64, rx_buf: ref [u8; 256], rx_len: i64, seq
     while k < ssid_len { ssid[k] = buf_read_byte(ctx, (WPA2_JOIN_SSID_OFF + k) as u32) as u8; k = k + 1; }
     k = 0;
     while k < 22 { rsn[k] = buf_read_byte(ctx, (WPA2_JOIN_RSN_OFF + k) as u32) as u8; k = k + 1; }
-    let alen2: i64 = assoc_request_build(ref bssid, ref own_mac, ref ssid, ssid_len, ref rsn, seq_num, out);
+    let ap_cap_info: i64 = (buf_read_byte(ctx, WPA2_JOIN_AP_CAPINFO_OFF as u32) as i64) | ((buf_read_byte(ctx, (WPA2_JOIN_AP_CAPINFO_OFF + 1) as u32) as i64) << 8);
+    let ap_rates_len: i64 = buf_read_byte(ctx, WPA2_JOIN_AP_RATES_LEN_OFF as u32) as i64;
+    let ap_rates: [u8; 16] = [0 as u8; 16];
+    k = 0;
+    while k < ap_rates_len { ap_rates[k] = buf_read_byte(ctx, (WPA2_JOIN_AP_RATES_OFF + k) as u32) as u8; k = k + 1; }
+    let alen2: i64 = assoc_request_build(ref bssid, ref own_mac, ref ssid, ssid_len, ref rsn, seq_num, ap_cap_info, ref ap_rates, ap_rates_len, out);
+    if alen2 == 0 {
+      let _ = uart_puts("wifi join DIAG: no rate in common with the AP -- cannot build Association Request\n");
+      let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
+      return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
+    }
     let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_ASSOC_RESP as u32);
     return Wpa2JoinResult { state: WPA2_JOIN_WAIT_ASSOC_RESP, tx_len: alen2, done: 0, failed: 0 };
   }
@@ -53685,7 +53725,7 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   ssid[3] = 0x74 as u8;
 
   let ctx: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_CTX_SIZE as u32);
-  let preq: [u8; 64] = [0 as u8; 64];
+  let preq: [u8; 80] = [0 as u8; 80];
   let preq_len: i64 = wpa2_join_start(ctx, ref bssid, ref own_mac, ref ssid, 4, mut ref preq);
   if preq_len != 36 { ok = 0; }
 
@@ -53706,7 +53746,7 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   let ri: i64 = 0;
   while ri < 22 { presp[42 + ri] = rsn[ri]; ri = ri + 1; }
 
-  let mgmt_out: [u8; 90] = [0 as u8; 90];
+  let mgmt_out: [u8; 110] = [0 as u8; 110];
   let r1: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref presp, 42 + 22, 1, mut ref mgmt_out);
   if (r1.state != WPA2_JOIN_WAIT_AUTH_RESP) || (r1.tx_len != 30) || (r1.failed != 0) { ok = 0; }
 
@@ -54003,7 +54043,7 @@ fn wifi_scan_channel_at(i: i64) -> u32 {
 // AP is on a different channel, out of range, or simply didn't
 // respond to this particular probe, not a parse or protocol failure.
 fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8; 6], ssid: ref [u8; 32], ssid_len: i64, bssid_out: mut ref [u8; 6]) -> i64 {
-  let preq: [u8; 64] = [0 as u8; 64];
+  let preq: [u8; 80] = [0 as u8; 80];
   // seq_num=0: matches the literal `0` this function's own TX call for
   // this exact frame already passes to the TX descriptor below -- see
   // probe_request_build's own header comment (vendor/ieee80211/src/
@@ -54021,6 +54061,7 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
   let rx_heap: mut ref i64 = wifi_scan_rx_scratch_get();
   let rx_fixed: [u8; 256] = [0 as u8; 256];
   let ssid_echo: [u8; 32] = [0 as u8; 32];
+  let rates_echo: [u8; 16] = [0 as u8; 16];
 
   // BUG FOUND 2026-11-18 (real-HW usbmon ground-truth capture of a
   // genuinely working Linux client re-associating to this exact AP,
@@ -54169,7 +54210,7 @@ fn wifi_scan_for_ssid(devaddr: u32, mps_out: u32, mps_in: u32, own_mac: ref [u8;
         // Response, not any frame that happens to parse like one.
         let scan_fc: i64 = (rx_fixed[0] as i64) | ((rx_fixed[1] as i64) << (8 as i64));
         let scan_stype: i64 = scan_fc & (0xFC as i64);
-        let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, fixed_len, mut ref ssid_echo);
+        let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, fixed_len, mut ref ssid_echo, mut ref rates_echo);
         if (info.ok == 1) && (scan_stype == FC_STYPE_PROBE_RESP) {
           let matches: i64 = if info.ssid_len == ssid_len { 1 } else { 0 };
           let si: i64 = 0;
@@ -54324,6 +54365,7 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   let rx_heap: mut ref i64 = wifi_listen_rx_scratch_get();
   let rx_fixed: [u8; 256] = [0 as u8; 256];
   let ssid_echo: [u8; 32] = [0 as u8; 32];
+  let rates_echo: [u8; 16] = [0 as u8; 16];
   let heard_count: i64 = 0;
   // BUG FIX (2026-11-17): the two diagnostics that used to run here
   // (wifi_rx_poll_diag for the first 3 polls, and a raw dwc2_wifi_
@@ -54357,7 +54399,7 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
       let dummy_a3: [u8; 6] = [0 as u8; 6];
       let hdr: Mac80211Hdr = mac_header_parse(ref rx_fixed, mut ref dummy_a1, mut ref dummy_a2, mut ref dummy_a3);
       let stype: i64 = hdr.frame_control & (0xFC as i64);
-      let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, fixed_len, mut ref ssid_echo);
+      let info: ProbeRespInfo = probe_response_parse(ref rx_fixed, fixed_len, mut ref ssid_echo, mut ref rates_echo);
       heard_count = heard_count + 1;
       let _ = uart_puts("wifi listen: heard frame #");
       let _ = uart_put_i64(heard_count);
@@ -54470,7 +54512,7 @@ fn wifi_real_join() -> i64 {
   // own header comment for the live diagnostic that found this) and go
   // straight to Authentication.
   let ctx: mut ref i64 = wifi_join_ctx_scratch_get();
-  let preq: [u8; 64] = [0 as u8; 64];
+  let preq: [u8; 80] = [0 as u8; 80];
   let preq_len: i64 = wpa2_join_start_skip_probe(ctx, ref bssid, ref own_mac, ref ssid, ssid_len, mut ref preq);
   let preq_heap: mut ref i64 = wifi_join_preq_scratch_get();
   let p1i: i64 = 0;
@@ -54547,7 +54589,7 @@ fn wifi_real_join() -> i64 {
 
   let rx_heap: mut ref i64 = wifi_join_rx_scratch_get();
   let rx_fixed: [u8; 256] = [0 as u8; 256];
-  let mgmt_out: [u8; 90] = [0 as u8; 90];
+  let mgmt_out: [u8; 110] = [0 as u8; 110];
   let mgmt_heap: mut ref i64 = wifi_join_mgmt_scratch_get();
 
   let seq: i64 = 2;
