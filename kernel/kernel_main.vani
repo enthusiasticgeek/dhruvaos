@@ -54791,6 +54791,26 @@ fn wifi_real_join() -> i64 {
   let mgmt_heap: mut ref i64 = wifi_join_mgmt_scratch_get();
 
   let seq: i64 = 2;
+  // BUG FOUND 2026-11-23 (after the endpoint-routing fix proved, via a
+  // real monitor-mode capture, that Message 2 now reaches the AP
+  // byte-perfect with an independently-verified-correct MIC -- see
+  // this round's own capture analysis -- yet the AP STILL never sends
+  // Message 3): 802.11-2016 Sec 10.3.2.11 requires a QoS data frame to
+  // use its OWN per-TID sequence-number space, separate from the
+  // single counter non-QoS/management frames share. This driver's
+  // only QoS data frames (EAPOL Message 2/4, tagged AC_VO) were
+  // instead continuing the SAME `seq` counter already used for Probe/
+  // Auth/Assoc (confirmed live: "wrapped DATA frame header (seq
+  // param=3)" directly after Assoc's own seq=2) -- a brand-new
+  // station's first-ever QoS/TID=6 frame arriving with a sequence
+  // number that implies 3 PRIOR frames on that same TID is exactly
+  // the kind of anomaly real AP firmware's own per-TID duplicate/
+  // reorder tracking can use to silently discard a frame without any
+  // visible rejection -- consistent with "cleanly transmitted, never
+  // acknowledged by Message 3" with no other explanation left
+  // standing. Separate counter, starts at 0 like any STA's first use
+  // of a fresh TID.
+  let data_seq: i64 = 0;
   let mgmt_iter: i64 = 0;
   let in_eapol: i64 = 0;
   // 2026-11-16: starting state is now WAIT_AUTH_RESP (wpa2_join_start_
@@ -55066,14 +55086,14 @@ fn wifi_real_join() -> i64 {
           let _ = uart_puts(" REG_RQPN(0x200)=0x");
           let _ = uart_put_hex32(pretx_rqpn);
           let _ = uart_puts(" (TXPAUSE expect 0x00=unpaused, RQPN expect 0x8[...]0CE9-shaped=hq0x0C|pubq0xE9 bits unchanged from boot)\n");
-          let wrapped_len: i64 = data_frame_build_eapol(ref bssid, ref own_mac, ref eapol_tx_fixed, er.tx_len, seq, mut ref wrapped);
+          let wrapped_len: i64 = data_frame_build_eapol(ref bssid, ref own_mac, ref eapol_tx_fixed, er.tx_len, data_seq, mut ref wrapped);
           // DIAGNOSTIC (2026-11-22): the actual wrapped 802.11 frame
           // header bytes about to go over the air (not just the EAPOL
           // payload the earlier diagnostic already shows) -- confirms
           // directly whether seq_ctrl (bytes 22-23) and the descriptor's
           // own seq parameter actually agree, rather than inferring it.
           let _ = uart_puts("wifi join DIAG: wrapped DATA frame header (seq param=");
-          let _ = uart_put_i64(seq);
+          let _ = uart_put_i64(data_seq);
           let _ = uart_puts(") bytes[0..24]=");
           let whi: i64 = 0;
           while whi < 24 {
@@ -55087,11 +55107,11 @@ fn wifi_real_join() -> i64 {
             let _ = buf_write_byte(wrapped_heap, wj as u32, wrapped[wj] as u32);
             wj = wj + 1;
           }
-          let tx_status: i64 = wifi_radio_tx_frame(devaddr, mps_out, wrapped_heap, wrapped_len, 0, seq);
+          let tx_status: i64 = wifi_radio_tx_frame(devaddr, mps_out, wrapped_heap, wrapped_len, 0, data_seq);
           let _ = uart_puts("wifi join DIAG: Message 2/4 TX result=");
           let _ = uart_put_i64(tx_status);
           let _ = uart_puts(" (0=XFERCOMPL confirmed)\n");
-          seq = seq + 1;
+          data_seq = data_seq + 1;
         }
         if er.done == 1 { connected = 1; }
         // 2026-11-16: same per-round-trip budget reset as mgmt_iter's
