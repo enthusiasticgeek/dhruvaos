@@ -32526,7 +32526,32 @@ fn rtl8188cu_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len:
     let _ = buf_write_byte(tx_buf, (RTL_TXDESC_LEN + i) as u32, b);
     i = i + 1;
   }
-  let _ = usb_wifi_set_use_second_bulk_out(if is_data_frame == 1 { 1 as u32 } else { 0 as u32 });
+  // BUG FOUND 2026-11-23 (user's own "investigate driver... throttling
+  // or speed check" prompt, cross-checked against online Linux/
+  // FreeBSD/rtw88 RTL81xx driver source): this used to key endpoint
+  // selection off `is_data_frame` alone -- true for EVERY EAPOL frame,
+  // since data_frame_build_eapol always QoS-tags them AC_VO (see this
+  // function's own `is_qos_frame`/queue_sel comment just above). But
+  // rtl8188cu_mac_queue_setup's own REG_TRXDMA_CTRL programming (this
+  // same file) routes voq=TRXDMA_QUEUE_HIGH(3) -- VO shares the SAME
+  // internal DMA queue as MGNT, not the Normal queue(2) that only beq/
+  // bkq use. So every EAPOL frame was being told "you are HIGH-queue
+  // traffic" by its own TX descriptor's queue_sel field while
+  // physically being pushed out the second bulk-OUT endpoint, which
+  // this chip's own queue-routing only ever associates with the
+  // Normal queue. A real, independently-documented RTL81xx/rtw88 USB
+  // failure mode (kernel.org rtw88 commit log: "packets destined for a
+  // specific priority queue must be sent through the endpoint
+  // corresponding to the queue" -- violating this caused internal TX
+  // stalls/corruption, not a USB-level error, on this exact chip
+  // family) -- exactly consistent with this investigation's own
+  // observed symptom (clean USB XFERCOMPL, corrupted over-the-air
+  // bytes). Fixed: endpoint choice now follows queue_sel itself (BE/BK
+  // only -> second endpoint/Normal queue; MGNT and VO alike -> first
+  // endpoint/HIGH queue, matching dma_ctrl_val's own hiq=mgq=viq=voq=
+  // HIGH(3) grouping exactly) instead of the frame's data/mgmt type.
+  let use_second_ep: u32 = if queue_sel == RTL_TXDESC_QUEUE_BE { 1 as u32 } else { 0 as u32 };
+  let _ = usb_wifi_set_use_second_bulk_out(use_second_ep);
   let tx_status: i64 = dwc2_wifi_bulk_out(devaddr, mps, tx_buf, RTL_TXDESC_LEN + frame_len);
   let _ = usb_wifi_set_use_second_bulk_out(0 as u32);
   return tx_status;
