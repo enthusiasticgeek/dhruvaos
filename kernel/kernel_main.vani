@@ -55042,6 +55042,15 @@ fn wifi_real_join() -> i64 {
   let _ = uart_puts(" over the last ");
   let _ = uart_put_i64(eapol_iter);
   let _ = uart_puts(" polls (data_type_count=0 -> every received frame was ambient MGMT/ctrl noise, not even a real 802.11 DATA frame; nonzero -> real DATA frames arrived but didn't parse as EAPOL)\n");
+  // Round 2026-11-22: wifi_txtrace_dump was only ever wired to the
+  // Auth/Assoc failure path above (a different, already-closed
+  // investigation) -- never to THIS failure path, even though this is
+  // the one a live monitor-mode capture just showed actually matters
+  // now: Message 2 leaves the antenna with one byte missing starting
+  // exactly at its own MIC field, and dwc2_wifi_bulk_out's own trace
+  // (just extended to 200 bytes to cover it) is the most direct way
+  // to see which copy step in the chain introduces that shift.
+  let _ = wifi_txtrace_dump();
   return 0 - 1;
 }
 
