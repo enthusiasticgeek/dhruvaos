@@ -32210,7 +32210,12 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
   if mps_real == (0 as u32) {
     return 0 - 1;
   }
-  if (out_len < 0) || (out_len > (512 as i64)) {
+  // Round 2026-11-22: relaxed from 512 to 1632 to match usb_bulk_
+  // data_scratch/rtl_tx_buf_scratch's own new size (see their header
+  // comments) -- 512 was never a real DWC2 hardware limit, just this
+  // bound matching the buffers' old small size; pktcnt below already
+  // natively handles a multi-max-packet single transfer.
+  if (out_len < 0) || (out_len > (1632 as i64)) {
     return 0 - 1;
   }
   let epnum: u32 = epaddr & (0x0F as u32);
@@ -32427,7 +32432,14 @@ fn dwc2_wifi_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64
 // state the CALLER owns, matching how wpa_hs_process_msg1's own
 // SNonce parameter is caller-supplied by design).
 fn rtl8188cu_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len: i64, is_broadcast: i64, seq_num: i64) -> i64 {
-  if (RTL_TXDESC_LEN + frame_len) > (512 as i64) {
+  // Round 2026-11-22: relaxed from 512 to 1632, matching rtl_tx_buf_
+  // scratch/usb_bulk_data_scratch's own new MTU-scale size and dwc2_
+  // wifi_bulk_out's own matching relaxed cap (see their header
+  // comments) -- this entry-point check was the first of three
+  // separate 512-byte caps in this same call chain, all sized for
+  // this driver's old small MGMT/EAPOL frames, never a real MTU-
+  // scale data frame.
+  if (RTL_TXDESC_LEN + frame_len) > (1632 as i64) {
     return 0 - 1;
   }
   // BUG FOUND 2026-11-16 (same sweep that found rtl8188cu_rx_frame's
@@ -61970,13 +61982,30 @@ fn kernel_main() -> i64 {
   let _ = eval_ops_scratch_set(dhruva_alloc_bytes(64));
   let _ = uart_digits_scratch_set(dhruva_alloc_bytes(24));
   let _ = dwc2_dma_scratch_set(dhruva_alloc_bytes(128));
-  let _ = usb_bulk_data_scratch_set(dhruva_alloc_bytes(512));
+  // Round 2026-11-22: bumped from 512 to 1632 -- dwc2_wifi_bulk_out's
+  // own hard reject of any out_len>512 (now relaxed to match) existed
+  // only because this buffer, and rtl_tx_buf_scratch below, were
+  // sized for this driver's small MGMT/EAPOL frames so far, never a
+  // real MTU-scale data frame: 32-byte TX descriptor + 26-byte QoS
+  // header + 8-byte LLC/SNAP + 1500-byte IP MTU payload = 1566,
+  // 1632 leaves margin (same size as rtl_tx_buf_scratch below, since
+  // this buffer holds an exact copy of that one's full descriptor+
+  // frame content, not just the frame body). The DWC2 controller
+  // already natively splits a single HCTSIZ/HCDMA transfer into as
+  // many max-packet-size (512) USB packets as pktcnt calls for --
+  // this was never a hardware limit, just an artificially small
+  // buffer/cap pair that would have silently rejected any real data
+  // frame larger than one USB packet.
+  let _ = usb_bulk_data_scratch_set(dhruva_alloc_bytes(1632));
   let _ = usb_downstream_desc_scratch_set(dhruva_alloc_bytes(18));
   let _ = hub_port_status_scratch_set(dhruva_alloc_bytes(4));
   let _ = rtl_lan_reg_scratch_set(dhruva_alloc_bytes(4));
   let _ = rtl_rx_raw_scratch_set(dhruva_alloc_bytes(512));
   let _ = rtl_rx_chunk_scratch_set(dhruva_alloc_bytes(64));
-  let _ = rtl_tx_buf_scratch_set(dhruva_alloc_bytes(512));
+  // Round 2026-11-22: bumped from 512 to 1632 (1600 MTU-scale frame
+  // body + 32-byte TX descriptor prefix) -- see usb_bulk_data_
+  // scratch's own header comment just above for the full "why".
+  let _ = rtl_tx_buf_scratch_set(dhruva_alloc_bytes(1632));
   let _ = icmp_poll_src_mac_scratch_set(dhruva_alloc_bytes(8));
   let _ = icmp_poll_echo_payload_scratch_set(dhruva_alloc_bytes(56));
   let _ = wpa2_eapol_bssid_scratch_set(dhruva_alloc_bytes(6));
