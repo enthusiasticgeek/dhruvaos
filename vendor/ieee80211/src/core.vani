@@ -876,28 +876,33 @@ const DATA_FRAME_EAPOL_MAX_LEN: i64 = 140;
 // rate set, PHY preamble) ever changed the outcome.
 //
 // QoS (round 2026-11-22, full systematic re-audit against the
-// reference driver's complete xmit path, not just the TX-descriptor
-// pieces checked so far): core/rtw_xmit.c's set_qos, called from
-// update_attrib whenever pqospriv->qos_option is set (unconditional
-// for this whole chip family -- a local hardware-capability flag,
-// never gated on whether the AP negotiated WMM with THIS STA), tags
-// any ether_type==0x888e frame -- EAPOL -- with UserPriority=7 (AC_VO,
-// the highest WMM access category: "When priority processing of data
-// frames is supported, a STA's SME should send EAPOL-Key frames at
-// the highest priority"), and sends it as a QoS Data subtype (26-byte
-// header, not 24) rather than plain Data. This driver's own data_
-// frame_parse_eapol (below) already anticipated this -- it checks the
-// QoS subtype bit and handles both 24- and 26-byte headers on RX --
-// but this builder, the TX side, was never updated to match: every
-// Message 2/4 this driver has ever sent was a plain non-QoS Data
-// frame. ac_vo_qos_ctrl_tid is just the constant QoS Control field
-// value for "TID=7, nothing else" (0x0007) -- EAPOL never sets EOSP,
-// a non-zero Ack Policy, or A-MSDU, so nothing else in that field
-// ever needs to vary.
-const AC_VO_QOS_CTRL: i64 = 0x0007;
-
+// reference driver's complete xmit path): core/rtw_xmit.c's set_qos
+// tags EAPOL with UserPriority=7 (AC_VO) unconditionally, regardless
+// of whether the AP negotiated WMM with this STA -- this function was
+// changed to match, sending a QoS Data subtype (26-byte header).
+//
+// REVERTED 2026-11-23: that change was never paired with the other
+// half of what a real QoS-capable client does -- advertise QoS/WMM
+// support in the Association Request (a WMM Information Element, or
+// at minimum the QoS capability bit; this package's own assoc_
+// request_build has neither, and never has). A station that never
+// negotiated WMM sending a QoS-tagged data frame is exactly the kind
+// of frame a real AP's own per-TID/QoS handling can silently
+// disregard without any visible protocol-level rejection -- and this
+// round's own real-HW investigation found exactly that symptom: a
+// byte-perfect, independently-MIC-verified, correctly-sequenced
+// Message 2 that one specific AP (REG_TRXDMA_CTRL/endpoint-routing
+// and every other candidate already ruled out) simply never answers,
+// while visibly completing full handshakes with OTHER clients in the
+// very same capture window. This restores this function's own
+// original 2026-10-01 reasoning (still correct, see below) rather
+// than the vendor driver's unconditional-QoS shortcut: a non-QoS Data
+// frame is what 802.11 itself requires every AP to accept regardless
+// of what the BSS otherwise negotiates. If WMM negotiation is ever
+// added to assoc_request_build, QoS-tagging EAPOL again would then be
+// a correctly-paired change, not a one-sided assumption.
 fn data_frame_build_eapol(bssid: ref [u8; 6], own_mac: ref [u8; 6], payload: ref [u8; 140], payload_len: i64, seq_num: i64, out: mut ref [u8; 140]) -> i64 {
-  let fc: i64 = FC_TYPE_DATA | FC_TODS | FC_SUBTYPE_QOS_BIT;
+  let fc: i64 = FC_TYPE_DATA | FC_TODS;
   out[0] = (fc & (255 as i64)) as u8;
   out[1] = ((fc >> 8) & (255 as i64)) as u8;
   out[2] = 0 as u8;
@@ -912,10 +917,8 @@ fn data_frame_build_eapol(bssid: ref [u8; 6], own_mac: ref [u8; 6], payload: ref
   let seq_ctrl: i64 = (seq_num & 0xfff) << 4;
   out[22] = (seq_ctrl & (255 as i64)) as u8;
   out[23] = ((seq_ctrl >> 8) & (255 as i64)) as u8;
-  out[24] = (AC_VO_QOS_CTRL & (255 as i64)) as u8;
-  out[25] = ((AC_VO_QOS_CTRL >> 8) & (255 as i64)) as u8;
 
-  let llc_off: i64 = DATA_HDR_LEN_QOS;
+  let llc_off: i64 = DATA_HDR_LEN_NONQOS;
   out[llc_off] = 0xaa as u8;
   out[llc_off + 1] = 0xaa as u8;
   out[llc_off + 2] = 0x03 as u8;

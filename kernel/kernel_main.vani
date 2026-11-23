@@ -32501,24 +32501,21 @@ fn rtl8188cu_tx_frame(devaddr: u32, mps: u32, frame_buf: mut ref i64, frame_len:
   // buf_scratch_addr): this used to call dhruva_alloc_bytes fresh on
   // every single TX.
   let tx_buf: mut ref i64 = rtl_tx_buf_scratch_get();
-  // BUG FOUND 2026-11-22 (see dwc2_wifi_bulk_out's own header comment
-  // for the full "why"): this is the ONLY place that builds a TX
-  // descriptor for every frame this driver ever sends, so it's the
-  // one place that can tell -- from the frame's own real FC type
-  // field, already sitting in frame_buf -- whether this is a
-  // management frame (Probe/Auth/Assoc, QSLT_MGNT, first bulk-OUT
-  // endpoint) or a genuine data frame (EAPOL Message 2/4, QSLT_BE,
-  // second bulk-OUT endpoint when this chip actually has one).
-  let tx_fc: i64 = (buf_read_byte(frame_buf, 0 as u32) as i64) | ((buf_read_byte(frame_buf, 1 as u32) as i64) << 8);
-  let tx_ftype: i64 = (tx_fc >> 2) & (3 as i64);
-  let is_data_frame: i64 = if tx_ftype == 2 { 1 } else { 0 };
-  // Round 2026-11-22: every data frame this driver ever builds
-  // (data_frame_build_eapol) is EAPOL, now correctly QoS-tagged
-  // AC_VO (see that function's own header comment) -- so every data
-  // frame reaching here carries the QoS subtype bit, and QSLT_VO is
-  // the right queue for all of them, not QSLT_BE.
-  let is_qos_frame: i64 = if (tx_fc & FC_SUBTYPE_QOS_BIT) != 0 { 1 } else { 0 };
-  let queue_sel: i64 = if is_data_frame == 0 { RTL_TXDESC_QUEUE_MGNT } else if is_qos_frame == 1 { RTL_TXDESC_QUEUE_VO } else { RTL_TXDESC_QUEUE_BE };
+  // BUG FOUND 2026-11-22, REVERTED 2026-11-23 (see data_frame_build_
+  // eapol's own header comment, vendor/ieee80211/src/core.vani, for
+  // the full "why"): this used to distinguish management frames
+  // (QSLT_MGNT) from EAPOL data frames (QSLT_VO, since EAPOL was
+  // QoS-tagged AC_VO) by reading the frame's own FC type field. EAPOL
+  // is no longer QoS-tagged, is the only data frame type this driver
+  // ever sends, and must stay on the SAME endpoint management frames
+  // already use (see this same function's own `use_second_ep` comment
+  // below for why the second endpoint must never be used today) -- so
+  // every frame this driver sends now uses QSLT_MGNT unconditionally,
+  // matching dma_ctrl_val's own hiq=mgq=viq=voq=HIGH(3) grouping.
+  // QSLT_BE/the Normal queue stays wired up in rtl8188cu_mac_queue_
+  // setup for whenever this driver sends real bulk IP data after a
+  // join succeeds, just unused by anything today.
+  let queue_sel: i64 = RTL_TXDESC_QUEUE_MGNT;
   let _ = rtl_tx_desc_write(tx_buf, frame_len, is_broadcast, seq_num, queue_sel);
   let i: i64 = 0;
   while i < frame_len {
