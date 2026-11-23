@@ -3423,6 +3423,38 @@ extern "C" fn wifi_txtrace_hctsiz_after_get() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn wifi_txtrace_hcchar_after_get() -> u32;
 
+// Round 2026-11-23: independent copy of the trace above, capturing
+// the LAST MGNT-queue (first bulk-OUT endpoint) frame specifically --
+// see boot/wifi_txtrace_state.S's own header comment on this block.
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_bytes_get() -> mut ref i64;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_begin(devaddr: u32, epaddr: u32, mps: u32, out_len: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_set_usb(hctsiz_written: u32, hcchar_written: u32, hcint_result: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_set_after(hctsiz_after: u32, hcchar_after: u32) -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_valid_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_devaddr_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_epaddr_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_mps_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_out_len_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_hctsiz_written_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_hcchar_written_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_hcint_result_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_hctsiz_after_get() -> u32;
+#[stack_cost(bytes=1)]
+extern "C" fn wifi_txtrace_mgnt_hcchar_after_get() -> u32;
+
 // Round 2026-11-18: EFUSE-derived per-channel-group TX power state --
 // see boot/wifi_efuse_state.S's own comment.
 #[stack_cost(bytes=1)]
@@ -32232,14 +32264,23 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
   // header comment for the full "why". Printed only later, by
   // wifi_real_join's own existing diagnostic path, strictly after
   // this transfer's own timing-critical window has already closed.
-  let trace_buf: mut ref i64 = wifi_txtrace_bytes_get();
+  // Round 2026-11-23: branches into two INDEPENDENT trace buffers
+  // (MGNT/first-endpoint vs. DATA/second-endpoint, see wifi_txtrace_
+  // mgnt_*'s own header comment) instead of one shared one that the
+  // later EAPOL frame would always overwrite before the MGNT frame's
+  // own trace could ever be printed.
+  let trace_buf: mut ref i64 = if use_ep2 == (1 as u32) { wifi_txtrace_bytes_get() } else { wifi_txtrace_mgnt_bytes_get() };
   let tbi: i64 = 0;
   let trace_len: i64 = if out_len > (200 as i64) { 200 } else { out_len };
   while tbi < trace_len {
     let _ = buf_write_byte(trace_buf, tbi as u32, buf_read_byte(buf, tbi as u32));
     tbi = tbi + 1;
   }
-  let _ = wifi_txtrace_begin(devaddr, epaddr, mps_real, out_len as u32);
+  if use_ep2 == (1 as u32) {
+    let _ = wifi_txtrace_begin(devaddr, epaddr, mps_real, out_len as u32);
+  } else {
+    let _ = wifi_txtrace_mgnt_begin(devaddr, epaddr, mps_real, out_len as u32);
+  }
 
   let i: i64 = 0;
   while i < out_len {
@@ -32259,8 +32300,13 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
   let _ = mmio_write_u32(hctsiz0, hctsiz_written);
   let _ = mmio_write_u32(hcchar0, hcchar_written);
   let result: u32 = dwc2_wait_chan0_done();
-  let _ = wifi_txtrace_set_usb(hctsiz_written, hcchar_written, result);
-  let _ = wifi_txtrace_set_after(mmio_read_u32(hctsiz0), mmio_read_u32(hcchar0));
+  if use_ep2 == (1 as u32) {
+    let _ = wifi_txtrace_set_usb(hctsiz_written, hcchar_written, result);
+    let _ = wifi_txtrace_set_after(mmio_read_u32(hctsiz0), mmio_read_u32(hcchar0));
+  } else {
+    let _ = wifi_txtrace_mgnt_set_usb(hctsiz_written, hcchar_written, result);
+    let _ = wifi_txtrace_mgnt_set_after(mmio_read_u32(hctsiz0), mmio_read_u32(hcchar0));
+  }
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
@@ -32286,16 +32332,21 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
 // construction, descriptor preparation, and USB bulk-OUT submission/
 // completion, all from the SAME captured call, not reconstructed
 // after the fact.
-fn wifi_txtrace_dump() -> i64 {
-  if wifi_txtrace_valid_get() != (1 as u32) {
-    let _ = uart_puts("wifi join DIAG: TX trace -- no frame was ever handed to dwc2_wifi_bulk_out this attempt (nothing to trace)\n");
+// Round 2026-11-23: prints either the DATA(ep2)-queue trace or the
+// MGNT(ep1)-queue trace, in the SAME structured layout, so a human
+// (or a diff) can directly compare the two endpoints' real register
+// values from the SAME join attempt -- see wifi_txtrace_mgnt_*'s own
+// header comment (boot/wifi_txtrace_state.S) for the full "why". The
+// `label`/`valid`/`*_get` function pointers are threaded through
+// rather than duplicating this whole body twice.
+fn wifi_txtrace_dump_one(is_mgnt: i64, valid: u32, devaddr: u32, epaddr: u32, mps: u32, out_len: u32, hctsiz_w: u32, hcchar_w: u32, hcint_r: u32, hctsiz_a: u32, hcchar_a: u32, trace_buf: mut ref i64) -> i64 {
+  if valid != (1 as u32) {
+    if is_mgnt == 1 { let _ = uart_puts("wifi join DIAG: TX trace (MGNT/ep1)"); } else { let _ = uart_puts("wifi join DIAG: TX trace (DATA/ep2)"); }
+    let _ = uart_puts(" -- no frame was ever handed to dwc2_wifi_bulk_out this attempt (nothing to trace)\n");
     return 0;
   }
-  let devaddr: u32 = wifi_txtrace_devaddr_get();
-  let epaddr: u32 = wifi_txtrace_epaddr_get();
-  let mps: u32 = wifi_txtrace_mps_get();
-  let out_len: u32 = wifi_txtrace_out_len_get();
-  let _ = uart_puts("wifi join DIAG: TX trace (last frame handed to USB) devaddr=0x");
+  if is_mgnt == 1 { let _ = uart_puts("wifi join DIAG: TX trace (MGNT/ep1)"); } else { let _ = uart_puts("wifi join DIAG: TX trace (DATA/ep2)"); }
+  let _ = uart_puts(" devaddr=0x");
   let _ = uart_put_hex32(devaddr);
   let _ = uart_puts(" epaddr=0x");
   let _ = uart_put_hex32(epaddr);
@@ -32305,12 +32356,8 @@ fn wifi_txtrace_dump() -> i64 {
   let _ = uart_put_hex32(out_len);
   let _ = uart_puts("\n");
 
-  let hctsiz_w: u32 = wifi_txtrace_hctsiz_written_get();
-  let hcchar_w: u32 = wifi_txtrace_hcchar_written_get();
-  let hcint_r: u32 = wifi_txtrace_hcint_result_get();
-  let hctsiz_a: u32 = wifi_txtrace_hctsiz_after_get();
-  let hcchar_a: u32 = wifi_txtrace_hcchar_after_get();
-  let _ = uart_puts("wifi join DIAG: TX trace USB: HCTSIZ_written=0x");
+  if is_mgnt == 1 { let _ = uart_puts("wifi join DIAG: TX trace (MGNT/ep1)"); } else { let _ = uart_puts("wifi join DIAG: TX trace (DATA/ep2)"); }
+  let _ = uart_puts(" USB: HCTSIZ_written=0x");
   let _ = uart_put_hex32(hctsiz_w);
   let _ = uart_puts(" HCCHAR_written=0x");
   let _ = uart_put_hex32(hcchar_w);
@@ -32330,8 +32377,8 @@ fn wifi_txtrace_dump() -> i64 {
   let _ = uart_put_hex32((hcchar_a >> (31 as u32)) & (1 as u32));
   let _ = uart_puts(")\n");
 
-  let trace_buf: mut ref i64 = wifi_txtrace_bytes_get();
-  let _ = uart_puts("wifi join DIAG: TX trace descriptor (32 bytes): ");
+  if is_mgnt == 1 { let _ = uart_puts("wifi join DIAG: TX trace (MGNT/ep1)"); } else { let _ = uart_puts("wifi join DIAG: TX trace (DATA/ep2)"); }
+  let _ = uart_puts(" descriptor (32 bytes): ");
   let di: i64 = 0;
   while di < 32 {
     let _ = uart_put_hex_byte(buf_read_byte(trace_buf, di as u32));
@@ -32342,7 +32389,8 @@ fn wifi_txtrace_dump() -> i64 {
 
   let out_len_i: i64 = out_len as i64;
   let cap: i64 = if out_len_i > (200 as i64) { 200 } else { out_len_i };
-  let _ = uart_puts("wifi join DIAG: TX trace frame body (");
+  if is_mgnt == 1 { let _ = uart_puts("wifi join DIAG: TX trace (MGNT/ep1)"); } else { let _ = uart_puts("wifi join DIAG: TX trace (DATA/ep2)"); }
+  let _ = uart_puts(" frame body (");
   let _ = uart_put_i64(cap - 32);
   let _ = uart_puts(" bytes): ");
   let fj: i64 = 32;
@@ -32352,6 +32400,12 @@ fn wifi_txtrace_dump() -> i64 {
     fj = fj + 1;
   }
   let _ = uart_puts("\n");
+  return 0;
+}
+
+fn wifi_txtrace_dump() -> i64 {
+  let _ = wifi_txtrace_dump_one(1, wifi_txtrace_mgnt_valid_get(), wifi_txtrace_mgnt_devaddr_get(), wifi_txtrace_mgnt_epaddr_get(), wifi_txtrace_mgnt_mps_get(), wifi_txtrace_mgnt_out_len_get(), wifi_txtrace_mgnt_hctsiz_written_get(), wifi_txtrace_mgnt_hcchar_written_get(), wifi_txtrace_mgnt_hcint_result_get(), wifi_txtrace_mgnt_hctsiz_after_get(), wifi_txtrace_mgnt_hcchar_after_get(), wifi_txtrace_mgnt_bytes_get());
+  let _ = wifi_txtrace_dump_one(0, wifi_txtrace_valid_get(), wifi_txtrace_devaddr_get(), wifi_txtrace_epaddr_get(), wifi_txtrace_mps_get(), wifi_txtrace_out_len_get(), wifi_txtrace_hctsiz_written_get(), wifi_txtrace_hcchar_written_get(), wifi_txtrace_hcint_result_get(), wifi_txtrace_hctsiz_after_get(), wifi_txtrace_hcchar_after_get(), wifi_txtrace_bytes_get());
   return 0;
 }
 
@@ -54969,6 +55023,24 @@ fn wifi_real_join() -> i64 {
             eti2 = eti2 + 1;
           }
           let _ = uart_puts("\n");
+          // DIAGNOSTIC (2026-11-23, per-queue FIFO/pause state right
+          // before THIS specific TX -- user's own question: "is there
+          // a throttling or speed check?"): the one existing TXPAUSE
+          // read happens once, before Auth, at the start of the whole
+          // join -- never re-checked right before the data-queue
+          // (BK/BE) transmission that's actually corrupted. REG_RQPN
+          // (0x200) is also re-read live here to confirm the per-queue
+          // FIFO page allocation (Normal Queue=2 pages=256 bytes,
+          // confirmed >> this 133-byte frame body) is still what
+          // rtl8188cu_mac_queue_setup originally programmed, not
+          // reset/cleared by anything since boot.
+          let pretx_txpause: u32 = rtl_reg_read8(devaddr, mps_out, 0x0522 as u32);
+          let pretx_rqpn: u32 = rtl_reg_read32(devaddr, mps_out, 0x0200 as u32);
+          let _ = uart_puts("wifi join DIAG: pre-Msg2-TX REG_TXPAUSE(0x522)=0x");
+          let _ = uart_put_hex32(pretx_txpause);
+          let _ = uart_puts(" REG_RQPN(0x200)=0x");
+          let _ = uart_put_hex32(pretx_rqpn);
+          let _ = uart_puts(" (TXPAUSE expect 0x00=unpaused, RQPN expect 0x8[...]0CE9-shaped=hq0x0C|pubq0xE9 bits unchanged from boot)\n");
           let wrapped_len: i64 = data_frame_build_eapol(ref bssid, ref own_mac, ref eapol_tx_fixed, er.tx_len, seq, mut ref wrapped);
           // DIAGNOSTIC (2026-11-22): the actual wrapped 802.11 frame
           // header bytes about to go over the air (not just the EAPOL

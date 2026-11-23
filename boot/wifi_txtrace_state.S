@@ -55,6 +55,44 @@ wifi_txtrace_hctsiz_after:
 wifi_txtrace_hcchar_after:
     .word 0
 
+/* Round 2026-11-23 (user's own explicit ask, via a pasted technical
+ * analysis: "successful ACK reception [on one endpoint] does not
+ * validate the second endpoint's data path... compare the two
+ * endpoint paths using the actual USB descriptors and runtime
+ * register values"): a second, fully independent copy of every field
+ * above, capturing the LAST MGNT-queue (first bulk-OUT endpoint)
+ * frame specifically -- the wifi_txtrace_* fields above only ever
+ * capture whichever dwc2_wifi_bulk_out call happened LAST, which by
+ * the time wifi_txtrace_dump() runs (strictly after the EAPOL phase
+ * already timed out) is always the EAPOL/second-endpoint frame,
+ * never the earlier, already-proven-working Association Request on
+ * the first endpoint from the SAME join attempt. Having both from
+ * the SAME run, side by side, is what actually answers "what differs
+ * between the two endpoint configurations" rather than comparing
+ * across different runs/dates. */
+wifi_txtrace_mgnt_valid:
+    .word 0
+wifi_txtrace_mgnt_devaddr:
+    .word 0
+wifi_txtrace_mgnt_epaddr:
+    .word 0
+wifi_txtrace_mgnt_mps:
+    .word 0
+wifi_txtrace_mgnt_out_len:
+    .word 0
+wifi_txtrace_mgnt_bytes:
+    .space 200
+wifi_txtrace_mgnt_hctsiz_written:
+    .word 0
+wifi_txtrace_mgnt_hcchar_written:
+    .word 0
+wifi_txtrace_mgnt_hcint_result:
+    .word 0
+wifi_txtrace_mgnt_hctsiz_after:
+    .word 0
+wifi_txtrace_mgnt_hcchar_after:
+    .word 0
+
 .section ".text"
 .global wifi_txtrace_bytes_get
 wifi_txtrace_bytes_get:
@@ -172,6 +210,121 @@ wifi_txtrace_hctsiz_after_get:
 .global wifi_txtrace_hcchar_after_get
 wifi_txtrace_hcchar_after_get:
     ldr r0, =wifi_txtrace_hcchar_after
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_bytes_get
+wifi_txtrace_mgnt_bytes_get:
+    ldr r0, =wifi_txtrace_mgnt_bytes
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_begin
+wifi_txtrace_mgnt_begin:                /* r0=devaddr r1=epaddr r2=mps r3=out_len */
+    ldr r12, =wifi_txtrace_mgnt_devaddr
+    str r0, [r12]
+    ldr r12, =wifi_txtrace_mgnt_epaddr
+    str r1, [r12]
+    ldr r12, =wifi_txtrace_mgnt_mps
+    str r2, [r12]
+    ldr r12, =wifi_txtrace_mgnt_out_len
+    str r3, [r12]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_set_usb
+wifi_txtrace_mgnt_set_usb:               /* r0=hctsiz_written r1=hcchar_written r2=hcint_result */
+    ldr r3, =wifi_txtrace_mgnt_hctsiz_written
+    str r0, [r3]
+    ldr r3, =wifi_txtrace_mgnt_hcchar_written
+    str r1, [r3]
+    ldr r3, =wifi_txtrace_mgnt_hcint_result
+    str r2, [r3]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_set_after
+wifi_txtrace_mgnt_set_after:             /* r0=hctsiz_after r1=hcchar_after */
+    ldr r2, =wifi_txtrace_mgnt_hctsiz_after
+    str r0, [r2]
+    ldr r2, =wifi_txtrace_mgnt_hcchar_after
+    str r1, [r2]
+    ldr r2, =wifi_txtrace_mgnt_valid
+    mov r3, #1
+    str r3, [r2]
+    mov r0, #0
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_valid_get
+wifi_txtrace_mgnt_valid_get:
+    ldr r0, =wifi_txtrace_mgnt_valid
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_devaddr_get
+wifi_txtrace_mgnt_devaddr_get:
+    ldr r0, =wifi_txtrace_mgnt_devaddr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_epaddr_get
+wifi_txtrace_mgnt_epaddr_get:
+    ldr r0, =wifi_txtrace_mgnt_epaddr
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_mps_get
+wifi_txtrace_mgnt_mps_get:
+    ldr r0, =wifi_txtrace_mgnt_mps
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_out_len_get
+wifi_txtrace_mgnt_out_len_get:
+    ldr r0, =wifi_txtrace_mgnt_out_len
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_hctsiz_written_get
+wifi_txtrace_mgnt_hctsiz_written_get:
+    ldr r0, =wifi_txtrace_mgnt_hctsiz_written
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_hcchar_written_get
+wifi_txtrace_mgnt_hcchar_written_get:
+    ldr r0, =wifi_txtrace_mgnt_hcchar_written
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_hcint_result_get
+wifi_txtrace_mgnt_hcint_result_get:
+    ldr r0, =wifi_txtrace_mgnt_hcint_result
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_hctsiz_after_get
+wifi_txtrace_mgnt_hctsiz_after_get:
+    ldr r0, =wifi_txtrace_mgnt_hctsiz_after
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
+.global wifi_txtrace_mgnt_hcchar_after_get
+wifi_txtrace_mgnt_hcchar_after_get:
+    ldr r0, =wifi_txtrace_mgnt_hcchar_after
     ldr r0, [r0]
     mov r1, #0
     bx lr
