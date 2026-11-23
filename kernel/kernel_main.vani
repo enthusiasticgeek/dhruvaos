@@ -32229,7 +32229,7 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
   // this transfer's own timing-critical window has already closed.
   let trace_buf: mut ref i64 = wifi_txtrace_bytes_get();
   let tbi: i64 = 0;
-  let trace_len: i64 = if out_len > (96 as i64) { 96 } else { out_len };
+  let trace_len: i64 = if out_len > (200 as i64) { 200 } else { out_len };
   while tbi < trace_len {
     let _ = buf_write_byte(trace_buf, tbi as u32, buf_read_byte(buf, tbi as u32));
     tbi = tbi + 1;
@@ -32336,7 +32336,7 @@ fn wifi_txtrace_dump() -> i64 {
   let _ = uart_puts("\n");
 
   let out_len_i: i64 = out_len as i64;
-  let cap: i64 = if out_len_i > (96 as i64) { 96 } else { out_len_i };
+  let cap: i64 = if out_len_i > (200 as i64) { 200 } else { out_len_i };
   let _ = uart_puts("wifi join DIAG: TX trace frame body (");
   let _ = uart_put_i64(cap - 32);
   let _ = uart_puts(" bytes): ");

@@ -30,12 +30,20 @@ wifi_txtrace_mps:
 wifi_txtrace_out_len:
     .word 0
 /* Raw bytes handed to dwc2_wifi_bulk_out: bytes 0-31 are the 32-byte
- * RTL TX descriptor (all 8 dwords), bytes 32-95 are the real 802.11
- * frame body that follows it (64 bytes -- covers the 30-byte Auth
- * Request/36-byte Probe Request/62-byte Assoc Request this driver
- * ever sends, with margin). */
+ * RTL TX descriptor (all 8 dwords), bytes 32+ are the real 802.11
+ * frame body that follows it. Round 2026-11-22: bumped from 96 to 200
+ * -- the original 64-byte frame-body margin only ever covered this
+ * driver's MGNT frames (30-byte Auth/36-byte Probe/62-byte Assoc
+ * Request); it never anticipated the 133-byte QoS-tagged EAPOL
+ * Message 2/4 frame (26-byte QoS header + 8-byte LLC/SNAP + 99-byte
+ * EAPOL-Key body) added this same round, whose own MIC field (at
+ * frame-relative offset 115, i.e. byte 147 of the full descriptor+
+ * frame buffer) is exactly where a live monitor-mode capture showed
+ * the actually-transmitted frame diverging from what the board itself
+ * built -- a dropped byte this trace never had the room to see. 200
+ * covers the full 165-byte descriptor+frame with margin. */
 wifi_txtrace_bytes:
-    .space 96
+    .space 200
 wifi_txtrace_hctsiz_written:
     .word 0
 wifi_txtrace_hcchar_written:
