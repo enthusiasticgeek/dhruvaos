@@ -358,6 +358,26 @@ extern "C" fn wifi_join_eapol_tx_scratch_get() -> mut ref i64;
 extern "C" fn wifi_join_gtk_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn wifi_join_gtk_scratch_get() -> mut ref i64;
+
+// 2026-11-26: WiFi STA data path scratch (boot/scratch_state.S).
+extern "C" fn wifi_link_state_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn wifi_link_state_scratch_get() -> mut ref i64;
+extern "C" fn wifi_link_aad_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn wifi_link_aad_scratch_get() -> mut ref i64;
+extern "C" fn wifi_link_nonce_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn wifi_link_nonce_scratch_get() -> mut ref i64;
+extern "C" fn wifi_link_tag_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn wifi_link_tag_scratch_get() -> mut ref i64;
+extern "C" fn wifi_link_key_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn wifi_link_key_scratch_get() -> mut ref i64;
+extern "C" fn wifi_link_tx_body_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn wifi_link_tx_body_scratch_get() -> mut ref i64;
+extern "C" fn wifi_link_tx_frame_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn wifi_link_tx_frame_scratch_get() -> mut ref i64;
+extern "C" fn wifi_link_rx_frame_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn wifi_link_rx_frame_scratch_get() -> mut ref i64;
+extern "C" fn wifi_link_rx_body_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn wifi_link_rx_body_scratch_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn wifi_join_wrapped_scratch_set(addr: mut ref i64) -> i64;
 #[stack_cost(bytes=1)]
@@ -19762,6 +19782,9 @@ fn netif_get_mtu() -> i64 {
 // comment) -- one consistent address either way, not a real vs. fake
 // mismatch.
 fn netif_get_mac(out_buf: mut ref i64) -> i64 {
+  if wifi_link_is_up() == 1 {
+    return wifi_link_get_mac(out_buf);
+  }
   if usb_net_get_kind() == (1 as u32) {
     let mac_ptr: mut ref i64 = usb_net_get_mac_scratch_ptr();
     if ptr_to_u32(mac_ptr) != (0 as u32) {
@@ -19827,6 +19850,11 @@ fn netif_send_frame(buf: mut ref i64, frame_len: i64) -> i64 {
   // (round 37) be exercised on demand in a live session.
   if fault_netdrop_maybe_inject() == (1 as u32) {
     return 0;
+  }
+  // 2026-11-26: a joined WPA2 link takes precedence over the wired/
+  // loopback backends -- see the wifi_link_* section's header.
+  if wifi_link_is_up() == 1 {
+    return wifi_link_send_eth(buf, frame_len);
   }
   if usb_net_get_kind() == (1 as u32) {
     let mps: u32 = usb_net_get_bulk_out_mps();
@@ -20145,6 +20173,20 @@ fn netif_maybe_auto_answer_arp(frame: mut ref i64, frame_len: i64) -> i64 {
 }
 
 fn netif_recv_frame(out_buf: mut ref i64, max_len: i64) -> i64 {
+  // 2026-11-26: WiFi backend (see netif_send_frame's matching branch).
+  if wifi_link_is_up() == 1 {
+    let wlen: i64 = wifi_link_recv_eth(out_buf, max_len);
+    if wlen < 0 {
+      return 0 - 1;
+    }
+    if filter_check_frame(out_buf, wlen, 0 as u32) == (0 as u32) {
+      return 0 - 1;
+    }
+    if netif_maybe_auto_answer_arp(out_buf, wlen) == 1 {
+      return 0 - 1;
+    }
+    return wlen;
+  }
   if usb_net_get_kind() == (1 as u32) {
     let mps: u32 = usb_net_get_bulk_in_mps();
     let devaddr: u32 = usb_net_get_devaddr();
@@ -24284,6 +24326,45 @@ fn dns_resolve_self_test() -> i64 {
 // failing that, full re-acquisition from INIT). Returns 1 if a state
 // transition happened (matching dhcp_client_poll's own frame-handling
 // branches), 0 otherwise.
+// 2026-11-26 (DHCP over WiFi): drains received frames through
+// dhcp_client_poll until the interface's RX queue is empty or
+// `budget_us` of wall-clock time is spent, instead of reading exactly
+// one frame per call. dhcp_client_poll consumes one frame per call and
+// task_e calls it once per wake (~10s); that only works on a quiet
+// wired link. On WiFi the adapter's RX FIFO is a continuous stream of
+// beacons and other stations' traffic, so the single frame read is
+// almost never the OFFER/ACK and the reply is effectively never seen.
+// Stops early after 3 consecutive empty polls (FIFO drained -- each
+// empty poll already waits up to ~40ms inside dwc2_wifi_bulk_in).
+// Bounded: budget_us caps how long the caller (task_e, holding
+// DWC2_MUTEX_ID) can be held here.
+fn dhcp_client_pump(my_mac: mut ref i64, budget_us: u32) -> i64 {
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  let empty_run: i64 = 0;
+  let handled: i64 = 0;
+  while (empty_run < 3) && (wrapping_sub(mmio_read_u32(TIMER_CLO), t0) < budget_us) {
+    let r: i64 = dhcp_client_poll(my_mac);
+    if r < 0 { empty_run = empty_run + 1; } else { empty_run = 0; }
+    if r == 1 { handled = handled + 1; }
+  }
+  return handled;
+}
+
+// Foreground DHCP acquisition (used right after `wifi join` brings the
+// link up): pumps + retries until BOUND or `timeout_us` elapses.
+// Returns 1 if BOUND. Caller holds DWC2_MUTEX_ID.
+fn dhcp_client_acquire_blocking(my_mac: mut ref i64, timeout_us: u32) -> i64 {
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  while wrapping_sub(mmio_read_u32(TIMER_CLO), t0) < timeout_us {
+    let _ = dhcp_client_pump(my_mac, 500000 as u32);
+    if dhcp_state_get_client_state() == dhcp_state_bound() { return 1; }
+    let _ = dhcp_client_check_discover_retry(my_mac);
+    let _ = watchdog_kick();
+  }
+  if dhcp_state_get_client_state() == dhcp_state_bound() { return 1; }
+  return 0;
+}
+
 fn dhcp_client_check_lease(my_mac: mut ref i64) -> i64 {
   let lease_time: u32 = dhcp_state_get_lease_time();
   if lease_time == (0 as u32) {
@@ -32673,7 +32754,20 @@ fn wifi_mgmtlog_record(frame_buf: mut ref i64, frame_len: i64, rssi_dbm: i64) ->
 // USB -- `raw`/`got` are whatever buffer+valid-length the caller
 // already has in hand (either this poll's fresh transfer, or a
 // previous poll's still-unconsumed bundle).
+// 2026-11-26: RX buffer sizing for real data frames (WiFi netif
+// backend / DHCP over WiFi). The whole RX chain was capped at 512
+// bytes -- sized for management frames -- so any encrypted data frame
+// larger than that (a DHCP OFFER/ACK is ~600+ bytes over the air) was
+// silently dropped. RTL_RX_RAW_MAX covers one full-MTU frame plus the
+// 24-byte RX descriptor, drvinfo/PHY-status and alignment padding;
+// WIFI_RX_FRAME_MAX is the hard cap on what this function will copy
+// into a caller's `frame_out` (every caller's buffer is at least that
+// size -- see the boot-time scratch allocations).
+const RTL_RX_RAW_MAX: i64 = 2048;
+const WIFI_RX_FRAME_MAX: i64 = 1600;
+
 fn rtl8188cu_rx_frame_from_desc(raw: mut ref i64, got: i64, info: RtlRxDescInfo, frame_out: mut ref i64) -> RtlRxFrameResult {
+  if info.pkt_len > WIFI_RX_FRAME_MAX { return RtlRxFrameResult { ok: 0, frame_len: 0 }; }
   if info.fcs_ok != 1 {
     let _ = wifi_stat_fcs_bad_count_set(wifi_stat_fcs_bad_count_get() + (1 as u32));
     return RtlRxFrameResult { ok: 0, frame_len: 0 };
@@ -32757,7 +32851,7 @@ fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFr
       }
       done = 1;
     } else {
-      if (total + got_chunk) > 512 {
+      if (total + got_chunk) > RTL_RX_RAW_MAX {
         return RtlRxFrameResult { ok: 0, frame_len: 0 };
       }
       let ci: i64 = 0;
@@ -41171,7 +41265,17 @@ fn task_e() -> i64 {
       let _ = usb_probe0_pending_set(0 as u32);
     }
     let _ = usb_hotplug_poll();
-    let _ = dhcp_client_poll(dhcp_my_mac);
+    // 2026-11-26: the netif's MAC is no longer fixed for the life of
+    // the board -- it becomes the WiFi adapter's own once `wifi join`
+    // brings the link up (netif_get_mac routes there). Refresh it every
+    // poll so DHCP's chaddr/Ethernet source always match the interface
+    // the frames actually leave on.
+    let _ = netif_get_mac(dhcp_my_mac);
+    if wifi_link_is_up() == 1 {
+      let _ = dhcp_client_pump(dhcp_my_mac, 300000 as u32);
+    } else {
+      let _ = dhcp_client_poll(dhcp_my_mac);
+    }
     // See dhcp_client_check_discover_retry's own header for the full
     // "why" -- this is the initial-acquisition retry half of DHCP's
     // own periodic maintenance; the lease renewal/expiry half
@@ -41179,7 +41283,12 @@ fn task_e() -> i64 {
     // inside dhcp_client_poll itself (its own very first check) --
     // kept as two separate functions for two separate RFC 2131
     // concerns rather than one function doing both.
-    let _ = dhcp_client_check_discover_retry(dhcp_my_mac);
+    let dhcp_retried: i64 = dhcp_client_check_discover_retry(dhcp_my_mac);
+    // WiFi: catch the reply to a just-(re)sent DISCOVER/REQUEST now,
+    // while it's at the front of the RX FIFO (see dhcp_client_pump).
+    if (dhcp_retried == 1) && (wifi_link_is_up() == 1) {
+      let _ = dhcp_client_pump(dhcp_my_mac, 300000 as u32);
+    }
     let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
     let gc_dhcp_t1: u32 = mmio_read_u32(TIMER_CLO);
     if gc_log == 1 {
@@ -46208,7 +46317,7 @@ fn shell_dispatch() -> i64 {
   // real AP as of this commit.
   if shell_word_matches(line_buf, 0, cmd_end, "wifi") == 1 {
     if cmd_end >= line_len {
-      let _ = uart_puts("usage: wifi join | wifi listen <channel> | wifi rxstats | wifi mgmtlog\n");
+      let _ = uart_puts("usage: wifi join | wifi link | wifi selftest | wifi listen <channel> | wifi rxstats | wifi mgmtlog\n");
       return 0;
     }
     let sub_start: i64 = cmd_end + 1;
@@ -46235,6 +46344,54 @@ fn shell_dispatch() -> i64 {
     if shell_word_matches(line_buf, sub_start, sub_end, "join") == 1 {
       let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
       let _ = wifi_real_join();
+      let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+      return 0;
+    }
+    // 2026-11-26: data-path status (wifi_link_*). Read-only.
+    if shell_word_matches(line_buf, sub_start, sub_end, "link") == 1 {
+      let st: mut ref i64 = wifi_link_state_scratch_get();
+      if wifi_link_is_up() == 0 {
+        let _ = uart_puts("wifi link: DOWN\n");
+        return 0;
+      }
+      let _ = uart_puts("wifi link: UP bssid=");
+      let li: i64 = 0;
+      while li < 6 {
+        let _ = uart_put_hex_byte(buf_read_byte(st, (WIFI_LINK_BSSID_OFF + li) as u32));
+        if li < 5 { let _ = uart_puts(":"); }
+        li = li + 1;
+      }
+      let _ = uart_puts(" own=");
+      li = 0;
+      while li < 6 {
+        let _ = uart_put_hex_byte(buf_read_byte(st, (WIFI_LINK_OWN_MAC_OFF + li) as u32));
+        if li < 5 { let _ = uart_puts(":"); }
+        li = li + 1;
+      }
+      let _ = uart_puts("\n  tx=");
+      let _ = uart_put_i64(wifi_link_count_get(WIFI_LINK_CNT_TX_OFF) as i64);
+      let _ = uart_puts(" rx_ok=");
+      let _ = uart_put_i64(wifi_link_count_get(WIFI_LINK_CNT_RX_OK_OFF) as i64);
+      let _ = uart_puts(" replay_drop=");
+      let _ = uart_put_i64(wifi_link_count_get(WIFI_LINK_CNT_REPLAY_OFF) as i64);
+      let _ = uart_puts(" mic_fail=");
+      let _ = uart_put_i64(wifi_link_count_get(WIFI_LINK_CNT_MIC_FAIL_OFF) as i64);
+      let _ = uart_puts(" ip=");
+      let _ = uart_put_ip(dhcp_state_get_leased_ip());
+      let _ = uart_puts("\n");
+      return 0;
+    }
+    // 2026-11-26: on-demand WPA2 + CCMP data-path self-tests (otherwise
+    // boot-time only, and only with boot_debug_enabled()). Takes
+    // DWC2_MUTEX_ID because wifi_ccmp_self_test shares the live data
+    // path's CCMP/frame scratch with task_e's DHCP poll. Each run
+    // allocates a few KB of never-freed test buffers -- a diagnostic,
+    // not something to loop.
+    if shell_word_matches(line_buf, sub_start, sub_end, "selftest") == 1 {
+      let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+      let _ = wpa_handshake_self_test();
+      let _ = wpa2_join_orchestrator_self_test();
+      let _ = wifi_ccmp_self_test();
       let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
       return 0;
     }
@@ -51655,7 +51812,12 @@ fn aes128_self_test() -> i64 {
 const CCMP_L: i64 = 2;
 const CCMP_M: i64 = 8;
 const CCMP_NONCE_LEN: i64 = 13;
-const CCMP_MAX_PAYLOAD: i64 = 256;
+// 2026-11-26: raised 256 -> 2304 (802.11's max MSDU) now that real
+// encrypted data frames flow (WiFi netif backend). This was only ever
+// a length check -- no scratch buffer here is sized by it (the CBC-MAC
+// and CTR passes stream over caller-owned buffers block by block), and
+// CCM's L=2 length field covers up to 65535.
+const CCMP_MAX_PAYLOAD: i64 = 2304;
 
 // Builds B_0 (the first CBC-MAC input block, is_counter=0) or a
 // counter block A_i (is_counter=1) into `out` -- both share the same
@@ -54736,7 +54898,577 @@ fn wifi_passive_listen(channel: u32, poll_cap: i64) -> i64 {
   return heard_count;
 }
 
+// ===================================================================
+// WiFi STA data path (2026-11-26): the netif backend that makes the
+// existing ARP/IPv4/UDP/DHCP stack run over a joined WPA2 link.
+//
+// netif_send_frame/netif_recv_frame/netif_get_mac route here whenever
+// wifi_link_is_up() -- an Ethernet frame [dst][src][ethertype][payload]
+// becomes an 802.11 Data MPDU and back:
+//
+//   TX (STA -> AP, ToDS=1):   A1=BSSID  A2=own MAC  A3=Ethernet dst
+//   RX (AP -> STA, FromDS=1): A1=Ethernet dst  A2=BSSID  A3=Ethernet src
+//   body = LLC/SNAP (AA AA 03 00 00 00) + ethertype + payload
+//
+// Confidentiality/integrity is CCMP done in software (aes_ccmp_* in
+// this file) with the TK for unicast and the GTK for group-addressed
+// RX -- the same arrangement Linux's rtl8xxxu uses with nohwcrypt=1.
+// The TX descriptor never sets a hardware SEC_TYPE and REG_SECCFG is
+// never enabled, so the chip transmits our already-encrypted MPDU
+// unchanged and hands received protected frames up still encrypted.
+//
+// CCMP construction per IEEE 802.11-2016 12.5.3.3 (verified against the
+// standard's own CCMP test vector, the same one wifi_ccmp_self_test
+// uses -- an independent Python model reproduced it byte for byte
+// before this was written):
+//   AAD   = FC (subtype b4-b6, Retry, PwrMgt, MoreData masked to 0,
+//           Protected set; Order masked for QoS) | A1 | A2 | A3 |
+//           SC (sequence number masked, fragment number kept) |
+//           [QC (TID only) for QoS data]
+//   Nonce = priority/TID | A2 | PN5..PN0
+//   CCMP header = PN0 PN1 0x00 (ExtIV | KeyID<<6) PN2 PN3 PN4 PN5
+//
+// Replay protection (12.5.3.4.4): a received MPDU whose PN is not
+// strictly greater than the last accepted PN for its key is dropped --
+// checked before decryption, recorded only after the MIC verifies.
+//
+// Known limits, deliberately out of scope for this increment: no group
+// rekey (EAPOL-Key group handshake frames are dropped, so the GTK goes
+// stale at the AP's rekey interval -- broadcast RX then stops, unicast
+// keeps working), no PMF (unprotected deauth/disassoc are honored, as
+// every non-PMF STA must), no A-MSDU, no fragmentation, no power save.
+// ===================================================================
+
+const WIFI_LINK_STATE_SIZE: i64 = 128;
+const WIFI_LINK_CONNECTED_OFF: i64 = 0;      // 1 byte
+const WIFI_LINK_BSSID_OFF: i64 = 1;          // 6
+const WIFI_LINK_OWN_MAC_OFF: i64 = 7;        // 6
+const WIFI_LINK_TX_PN_OFF: i64 = 13;         // 6, PN0 (LSB) first
+const WIFI_LINK_RX_UC_PN_OFF: i64 = 19;      // 6
+const WIFI_LINK_RX_UC_VALID_OFF: i64 = 25;   // 1
+const WIFI_LINK_RX_GRP_PN_OFF: i64 = 26;     // 6
+const WIFI_LINK_RX_GRP_VALID_OFF: i64 = 32;  // 1
+const WIFI_LINK_TX_SEQ_OFF: i64 = 33;        // 2, little-endian
+const WIFI_LINK_GTK_LEN_OFF: i64 = 35;       // 1
+const WIFI_LINK_TK_OFF: i64 = 40;            // 16
+const WIFI_LINK_GTK_OFF: i64 = 56;           // 32
+// u32 counters (little-endian), shown by `wifi link`.
+const WIFI_LINK_CNT_TX_OFF: i64 = 96;
+const WIFI_LINK_CNT_RX_OK_OFF: i64 = 100;
+const WIFI_LINK_CNT_REPLAY_OFF: i64 = 104;
+const WIFI_LINK_CNT_MIC_FAIL_OFF: i64 = 108;
+
+fn wifi_link_count_inc(link: mut ref i64, off: i64) -> i64 {
+  let _ = buf_write_u32_le(link, off, buf_read_u32_le(link, off) + (1 as u32));
+  return 0;
+}
+
+fn wifi_link_count_get(off: i64) -> u32 {
+  let st: mut ref i64 = wifi_link_state_scratch_get();
+  if ptr_to_u32(st) == (0 as u32) { return 0 as u32; }
+  return buf_read_u32_le(st, off);
+}
+// Largest MPDU either direction: 30 (QoS+HT header) + 8 (CCMP hdr) +
+// 8 (LLC/SNAP) + 1500 (MTU) + 8 (MIC) = 1554, rounded up. Must not
+// exceed WIFI_RX_FRAME_MAX (RX) or rtl8188cu_tx_frame's own 1600-byte
+// frame cap (TX).
+const WIFI_LINK_FRAME_MAX: i64 = 1600;
+const WIFI_CCMP_HDR_LEN: i64 = 8;
+const WIFI_CCMP_MIC_LEN: i64 = 8;
+
+fn wifi_link_is_up() -> i64 {
+  let st: mut ref i64 = wifi_link_state_scratch_get();
+  if ptr_to_u32(st) == (0 as u32) { return 0; }
+  if buf_read_byte(st, WIFI_LINK_CONNECTED_OFF as u32) == (1 as u32) { return 1; }
+  return 0;
+}
+
+fn wifi_link_get_mac(out_buf: mut ref i64) -> i64 {
+  let st: mut ref i64 = wifi_link_state_scratch_get();
+  let i: i64 = 0;
+  while i < 6 {
+    let _ = buf_write_byte(out_buf, i as u32, buf_read_byte(st, (WIFI_LINK_OWN_MAC_OFF + i) as u32));
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn wifi_link_down(reason: i64) -> i64 {
+  let st: mut ref i64 = wifi_link_state_scratch_get();
+  if ptr_to_u32(st) == (0 as u32) { return 0; }
+  let was_up: u32 = buf_read_byte(st, WIFI_LINK_CONNECTED_OFF as u32);
+  let _ = buf_write_byte(st, WIFI_LINK_CONNECTED_OFF as u32, 0 as u32);
+  if was_up == (1 as u32) {
+    let _ = uart_puts("wifi link: DOWN (reason=");
+    let _ = uart_put_i64(reason);
+    let _ = uart_puts(") -- netif back on wired/loopback\n");
+  }
+  return 0;
+}
+
+// Installs the just-negotiated keys and addresses and marks the link
+// up. `link` is the state blob to fill (the live one, or a self-test's
+// own); `tk` is 16 bytes, `gtk` gtk_len (16 for CCMP) bytes. TX PN
+// restarts at 0 (first transmitted PN is 1) and RX replay windows
+// reset -- both correct for a freshly installed key (12.5.3.4.4).
+fn wifi_link_install(link: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], tk: mut ref i64, gtk: mut ref i64, gtk_len: i64, next_seq: i64) -> i64 {
+  let i: i64 = 0;
+  while i < WIFI_LINK_STATE_SIZE { let _ = buf_write_byte(link, i as u32, 0 as u32); i = i + 1; }
+  i = 0;
+  while i < 6 {
+    let _ = buf_write_byte(link, (WIFI_LINK_BSSID_OFF + i) as u32, bssid[i] as u32);
+    let _ = buf_write_byte(link, (WIFI_LINK_OWN_MAC_OFF + i) as u32, own_mac[i] as u32);
+    i = i + 1;
+  }
+  i = 0;
+  while i < 16 { let _ = buf_write_byte(link, (WIFI_LINK_TK_OFF + i) as u32, buf_read_byte(tk, i as u32)); i = i + 1; }
+  let gl: i64 = if (gtk_len < 0) || (gtk_len > 32) { 0 } else { gtk_len };
+  i = 0;
+  while i < gl { let _ = buf_write_byte(link, (WIFI_LINK_GTK_OFF + i) as u32, buf_read_byte(gtk, i as u32)); i = i + 1; }
+  let _ = buf_write_byte(link, WIFI_LINK_GTK_LEN_OFF as u32, gl as u32);
+  let _ = buf_write_u16_le(link, WIFI_LINK_TX_SEQ_OFF, (next_seq & 0xfff) as u32);
+  let _ = buf_write_byte(link, WIFI_LINK_CONNECTED_OFF as u32, 1 as u32);
+  return 0;
+}
+
+// Builds the CCMP AAD and nonce for the MPDU in `frame`, whose 802.11
+// header occupies [0, hdr_len) and whose CCMP header (carrying the PN)
+// sits at [hdr_len, hdr_len + 8). Returns the AAD length (22, or 24
+// with a QoS Control field). Only 3-address frames reach here (both
+// callers reject ToDS+FromDS), so A4 never appears.
+fn wifi_ccmp_build_aad_nonce(frame: mut ref i64, hdr_len: i64, is_qos: i64, aad: mut ref i64, nonce: mut ref i64) -> i64 {
+  let fc0: u32 = buf_read_byte(frame, 0 as u32);
+  let fc1: u32 = buf_read_byte(frame, 1 as u32);
+  let _ = buf_write_byte(aad, 0 as u32, fc0 & (0x8f as u32));
+  let fc1m: u32 = (fc1 & (0xc7 as u32)) | (0x40 as u32);
+  let _ = buf_write_byte(aad, 1 as u32, if is_qos == 1 { fc1m & (0x7f as u32) } else { fc1m });
+  let i: i64 = 0;
+  while i < 18 { let _ = buf_write_byte(aad, (2 + i) as u32, buf_read_byte(frame, (4 + i) as u32)); i = i + 1; }
+  let _ = buf_write_byte(aad, 20 as u32, buf_read_byte(frame, 22 as u32) & (0x0f as u32));
+  let _ = buf_write_byte(aad, 21 as u32, 0 as u32);
+  let aad_len: i64 = 22;
+  let tid: u32 = 0 as u32;
+  if is_qos == 1 {
+    tid = buf_read_byte(frame, 24 as u32) & (0x0f as u32);
+    let _ = buf_write_byte(aad, 22 as u32, tid);
+    let _ = buf_write_byte(aad, 23 as u32, 0 as u32);
+    aad_len = 24;
+  }
+  let _ = buf_write_byte(nonce, 0 as u32, tid);
+  i = 0;
+  while i < 6 { let _ = buf_write_byte(nonce, (1 + i) as u32, buf_read_byte(frame, (10 + i) as u32)); i = i + 1; }
+  // PN5..PN0 (big-endian) from the CCMP header's PN0 PN1 _ _ PN2..PN5.
+  let _ = buf_write_byte(nonce, 7 as u32, buf_read_byte(frame, (hdr_len + 7) as u32));
+  let _ = buf_write_byte(nonce, 8 as u32, buf_read_byte(frame, (hdr_len + 6) as u32));
+  let _ = buf_write_byte(nonce, 9 as u32, buf_read_byte(frame, (hdr_len + 5) as u32));
+  let _ = buf_write_byte(nonce, 10 as u32, buf_read_byte(frame, (hdr_len + 4) as u32));
+  let _ = buf_write_byte(nonce, 11 as u32, buf_read_byte(frame, (hdr_len + 1) as u32));
+  let _ = buf_write_byte(nonce, 12 as u32, buf_read_byte(frame, hdr_len as u32));
+  return aad_len;
+}
+
+// Reads the 48-bit PN out of a CCMP header at frame[off..off+8) into
+// pn_out[0..6) as PN0..PN5.
+fn wifi_ccmp_read_pn(frame: mut ref i64, off: i64, pn_out: mut ref i64) -> i64 {
+  let _ = buf_write_byte(pn_out, 0 as u32, buf_read_byte(frame, off as u32));
+  let _ = buf_write_byte(pn_out, 1 as u32, buf_read_byte(frame, (off + 1) as u32));
+  let _ = buf_write_byte(pn_out, 2 as u32, buf_read_byte(frame, (off + 4) as u32));
+  let _ = buf_write_byte(pn_out, 3 as u32, buf_read_byte(frame, (off + 5) as u32));
+  let _ = buf_write_byte(pn_out, 4 as u32, buf_read_byte(frame, (off + 6) as u32));
+  let _ = buf_write_byte(pn_out, 5 as u32, buf_read_byte(frame, (off + 7) as u32));
+  return 0;
+}
+
+// 1 if the 48-bit PN in a[a_off..+6) is strictly greater than the one
+// in b[b_off..+6) (both PN0-first), else 0.
+fn wifi_pn_greater(a: mut ref i64, a_off: i64, b: mut ref i64, b_off: i64) -> i64 {
+  let i: i64 = 5;
+  while i >= 0 {
+    let x: u32 = buf_read_byte(a, (a_off + i) as u32);
+    let y: u32 = buf_read_byte(b, (b_off + i) as u32);
+    if x > y { return 1; }
+    if x < y { return 0; }
+    i = i - 1;
+  }
+  return 0;
+}
+
+// Copies the 16-byte key at link[key_off..) into the shared active-key
+// scratch (aes_ccmp_* read their key from offset 0 of a buffer).
+fn wifi_link_load_key(link: mut ref i64, key_off: i64) -> mut ref i64 {
+  let key: mut ref i64 = wifi_link_key_scratch_get();
+  let i: i64 = 0;
+  while i < 16 { let _ = buf_write_byte(key, i as u32, buf_read_byte(link, (key_off + i) as u32)); i = i + 1; }
+  return key;
+}
+
+// Pure (no radio access): builds the encrypted ToDS Data MPDU for an
+// Ethernet frame into `frame_out`, advancing link's TX PN and sequence
+// number. Returns the MPDU length, or 0 - 1 if the Ethernet frame is
+// malformed or too large. Non-QoS Data (24-byte header): this STA
+// never negotiates WMM (no WMM IE in assoc_request_build), so a QoS
+// subtype would be wrong here -- see data_frame_build_eapol's own
+// 2026-11-23 note for the same reasoning.
+fn wifi_link_build_mpdu(link: mut ref i64, eth: mut ref i64, eth_len: i64, frame_out: mut ref i64) -> i64 {
+  if eth_len < 14 { return 0 - 1; }
+  let payload_len: i64 = eth_len - 14;
+  let body_len: i64 = 8 + payload_len;
+  let hdr_len: i64 = 24;
+  if (hdr_len + WIFI_CCMP_HDR_LEN + body_len + WIFI_CCMP_MIC_LEN) > WIFI_LINK_FRAME_MAX { return 0 - 1; }
+
+  // Header: Data, ToDS=1, Protected=1.
+  let _ = buf_write_byte(frame_out, 0 as u32, 0x08 as u32);
+  let _ = buf_write_byte(frame_out, 1 as u32, 0x41 as u32);
+  let _ = buf_write_byte(frame_out, 2 as u32, 0 as u32);
+  let _ = buf_write_byte(frame_out, 3 as u32, 0 as u32);
+  let i: i64 = 0;
+  while i < 6 {
+    let _ = buf_write_byte(frame_out, (4 + i) as u32, buf_read_byte(link, (WIFI_LINK_BSSID_OFF + i) as u32));
+    let _ = buf_write_byte(frame_out, (10 + i) as u32, buf_read_byte(link, (WIFI_LINK_OWN_MAC_OFF + i) as u32));
+    let _ = buf_write_byte(frame_out, (16 + i) as u32, buf_read_byte(eth, i as u32));
+    i = i + 1;
+  }
+  let seq: i64 = buf_read_u16_le(link, WIFI_LINK_TX_SEQ_OFF) as i64;
+  let sc: i64 = (seq & 0xfff) << 4;
+  let _ = buf_write_byte(frame_out, 22 as u32, (sc & 255) as u32);
+  let _ = buf_write_byte(frame_out, 23 as u32, ((sc >> 8) & 255) as u32);
+  let _ = buf_write_u16_le(link, WIFI_LINK_TX_SEQ_OFF, ((seq + 1) & 0xfff) as u32);
+
+  // PN += 1 (48-bit, little-endian bytes). A PN must never repeat
+  // under one key; 2^48 frames cannot be reached in practice, and a
+  // wrap would require a rekey, not reuse.
+  let carry: u32 = 1 as u32;
+  i = 0;
+  while i < 6 {
+    let v: u32 = buf_read_byte(link, (WIFI_LINK_TX_PN_OFF + i) as u32) + carry;
+    let _ = buf_write_byte(link, (WIFI_LINK_TX_PN_OFF + i) as u32, v & (0xff as u32));
+    carry = if v > (0xff as u32) { 1 as u32 } else { 0 as u32 };
+    i = i + 1;
+  }
+  let pn0: u32 = buf_read_byte(link, (WIFI_LINK_TX_PN_OFF + 0) as u32);
+  let pn1: u32 = buf_read_byte(link, (WIFI_LINK_TX_PN_OFF + 1) as u32);
+  let _ = buf_write_byte(frame_out, 24 as u32, pn0);
+  let _ = buf_write_byte(frame_out, 25 as u32, pn1);
+  let _ = buf_write_byte(frame_out, 26 as u32, 0 as u32);
+  let _ = buf_write_byte(frame_out, 27 as u32, 0x20 as u32); // ExtIV, KeyID 0 (pairwise)
+  i = 2;
+  while i < 6 {
+    let _ = buf_write_byte(frame_out, (26 + i) as u32, buf_read_byte(link, (WIFI_LINK_TX_PN_OFF + i) as u32));
+    i = i + 1;
+  }
+
+  // Plaintext body: LLC/SNAP + ethertype + payload.
+  let body: mut ref i64 = wifi_link_tx_body_scratch_get();
+  let _ = buf_write_byte(body, 0 as u32, 0xaa as u32);
+  let _ = buf_write_byte(body, 1 as u32, 0xaa as u32);
+  let _ = buf_write_byte(body, 2 as u32, 0x03 as u32);
+  let _ = buf_write_byte(body, 3 as u32, 0 as u32);
+  let _ = buf_write_byte(body, 4 as u32, 0 as u32);
+  let _ = buf_write_byte(body, 5 as u32, 0 as u32);
+  let _ = buf_write_byte(body, 6 as u32, buf_read_byte(eth, 12 as u32));
+  let _ = buf_write_byte(body, 7 as u32, buf_read_byte(eth, 13 as u32));
+  i = 0;
+  while i < payload_len { let _ = buf_write_byte(body, (8 + i) as u32, buf_read_byte(eth, (14 + i) as u32)); i = i + 1; }
+
+  let aad: mut ref i64 = wifi_link_aad_scratch_get();
+  let nonce: mut ref i64 = wifi_link_nonce_scratch_get();
+  let tag: mut ref i64 = wifi_link_tag_scratch_get();
+  let aad_len: i64 = wifi_ccmp_build_aad_nonce(frame_out, hdr_len, 0, aad, nonce);
+  let key: mut ref i64 = wifi_link_load_key(link, WIFI_LINK_TK_OFF);
+  // In place: aes_ccmp_encrypt finishes the CBC-MAC over the plaintext
+  // before the CTR pass, and the CTR pass reads byte i before writing
+  // byte i.
+  if aes_ccmp_encrypt(key, nonce, aad, aad_len, body, body_len, body, tag) != 0 { return 0 - 1; }
+  let ct_off: i64 = hdr_len + WIFI_CCMP_HDR_LEN;
+  i = 0;
+  while i < body_len { let _ = buf_write_byte(frame_out, (ct_off + i) as u32, buf_read_byte(body, i as u32)); i = i + 1; }
+  i = 0;
+  while i < WIFI_CCMP_MIC_LEN { let _ = buf_write_byte(frame_out, (ct_off + body_len + i) as u32, buf_read_byte(tag, i as u32)); i = i + 1; }
+  let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_TX_OFF);
+  return ct_off + body_len + WIFI_CCMP_MIC_LEN;
+}
+
+// Pure (no radio access): validates, replay-checks and decrypts one
+// received MPDU, writing the resulting Ethernet frame into eth_out.
+// Returns the Ethernet length; 0 - 1 for anything that isn't a valid
+// protected FromDS data frame for us from our BSSID (the normal outcome
+// for most received frames -- beacons, other BSSes' traffic, ...);
+// 0 - 2 for a deauth/disassoc from our AP addressed to us (the caller
+// takes the link down).
+fn wifi_link_parse_mpdu(link: mut ref i64, frame: mut ref i64, frame_len: i64, eth_out: mut ref i64, eth_max: i64) -> i64 {
+  if frame_len < 24 { return 0 - 1; }
+  let fc0: u32 = buf_read_byte(frame, 0 as u32);
+  let fc1: u32 = buf_read_byte(frame, 1 as u32);
+  let ftype: u32 = (fc0 >> (2 as u32)) & (3 as u32);
+  let i: i64 = 0;
+
+  let a1_is_us: i64 = 1;
+  let a2_is_bssid: i64 = 1;
+  let a3_is_us: i64 = 1;
+  while i < 6 {
+    let own_b: u32 = buf_read_byte(link, (WIFI_LINK_OWN_MAC_OFF + i) as u32);
+    if buf_read_byte(frame, (4 + i) as u32) != own_b { a1_is_us = 0; }
+    if buf_read_byte(frame, (10 + i) as u32) != buf_read_byte(link, (WIFI_LINK_BSSID_OFF + i) as u32) { a2_is_bssid = 0; }
+    if buf_read_byte(frame, (16 + i) as u32) != own_b { a3_is_us = 0; }
+    i = i + 1;
+  }
+
+  // Management: deauthentication (0xC0) / disassociation (0xA0) from
+  // our AP to us ends the association.
+  if ftype == (0 as u32) {
+    let st: u32 = fc0 & (0xf0 as u32);
+    if ((st == (0xc0 as u32)) || (st == (0xa0 as u32))) && (a1_is_us == 1) && (a2_is_bssid == 1) { return 0 - 2; }
+    return 0 - 1;
+  }
+  if ftype != (2 as u32) { return 0 - 1; }
+  if (fc0 & (0x40 as u32)) != (0 as u32) { return 0 - 1; }          // no-data subtypes (Null etc.)
+  if (fc1 & (0x03 as u32)) != (0x02 as u32) { return 0 - 1; }       // FromDS only
+  if (fc1 & (0x04 as u32)) != (0 as u32) { return 0 - 1; }          // More Fragments: unsupported
+  if (buf_read_byte(frame, 22 as u32) & (0x0f as u32)) != (0 as u32) { return 0 - 1; } // fragment != 0
+  let a1_group: i64 = if (buf_read_byte(frame, 4 as u32) & (1 as u32)) != (0 as u32) { 1 } else { 0 };
+  if (a1_is_us == 0) && (a1_group == 0) { return 0 - 1; }
+  if a2_is_bssid == 0 { return 0 - 1; }
+  if a3_is_us == 1 { return 0 - 1; }                                 // our own broadcast, relayed back
+  if (fc1 & (0x40 as u32)) == (0 as u32) { return 0 - 1; }          // unprotected data: never accepted
+
+  let is_qos: i64 = if (fc0 & (0x80 as u32)) != (0 as u32) { 1 } else { 0 };
+  let hdr_len: i64 = 24;
+  if is_qos == 1 {
+    hdr_len = 26;
+    if (fc1 & (0x80 as u32)) != (0 as u32) { hdr_len = 30; }         // +HT Control
+    if (buf_read_byte(frame, 24 as u32) & (0x80 as u32)) != (0 as u32) { return 0 - 1; } // A-MSDU: unsupported
+  }
+  let ct_off: i64 = hdr_len + WIFI_CCMP_HDR_LEN;
+  let body_len: i64 = frame_len - ct_off - WIFI_CCMP_MIC_LEN;
+  if body_len < 8 { return 0 - 1; }
+  if (buf_read_byte(frame, (hdr_len + 3) as u32) & (0x20 as u32)) == (0 as u32) { return 0 - 1; } // ExtIV
+
+  let key_off: i64 = WIFI_LINK_TK_OFF;
+  let pn_off: i64 = WIFI_LINK_RX_UC_PN_OFF;
+  let valid_off: i64 = WIFI_LINK_RX_UC_VALID_OFF;
+  if a1_group == 1 {
+    if buf_read_byte(link, WIFI_LINK_GTK_LEN_OFF as u32) != (16 as u32) { return 0 - 1; }
+    key_off = WIFI_LINK_GTK_OFF;
+    pn_off = WIFI_LINK_RX_GRP_PN_OFF;
+    valid_off = WIFI_LINK_RX_GRP_VALID_OFF;
+  }
+  // Replay check before spending any AES work on the frame. pn_tmp is
+  // the nonce scratch -- wifi_ccmp_build_aad_nonce below overwrites
+  // it, which is why the PN is re-read after the MIC verifies.
+  let pn_tmp: mut ref i64 = wifi_link_nonce_scratch_get();
+  let _ = wifi_ccmp_read_pn(frame, hdr_len, pn_tmp);
+  if buf_read_byte(link, valid_off as u32) == (1 as u32) {
+    if wifi_pn_greater(pn_tmp, 0, link, pn_off) == 0 {
+      let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_REPLAY_OFF);
+      return 0 - 1;
+    }
+  }
+
+  let body: mut ref i64 = wifi_link_rx_body_scratch_get();
+  i = 0;
+  while i < body_len { let _ = buf_write_byte(body, i as u32, buf_read_byte(frame, (ct_off + i) as u32)); i = i + 1; }
+  let tag: mut ref i64 = wifi_link_tag_scratch_get();
+  i = 0;
+  while i < WIFI_CCMP_MIC_LEN { let _ = buf_write_byte(tag, i as u32, buf_read_byte(frame, (ct_off + body_len + i) as u32)); i = i + 1; }
+  let aad: mut ref i64 = wifi_link_aad_scratch_get();
+  let nonce: mut ref i64 = wifi_link_nonce_scratch_get();
+  let aad_len: i64 = wifi_ccmp_build_aad_nonce(frame, hdr_len, is_qos, aad, nonce);
+  let key: mut ref i64 = wifi_link_load_key(link, key_off);
+  // In place: CTR reads byte i before writing it, then the CBC-MAC runs
+  // over the recovered plaintext.
+  if aes_ccmp_decrypt(key, nonce, aad, aad_len, body, body_len, tag, body) != 0 {
+    let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_MIC_FAIL_OFF);
+    return 0 - 1;
+  }
+  // MIC verified: only now may this PN advance the replay window.
+  let _ = wifi_ccmp_read_pn(frame, hdr_len, pn_tmp);
+  i = 0;
+  while i < 6 { let _ = buf_write_byte(link, (pn_off + i) as u32, buf_read_byte(pn_tmp, i as u32)); i = i + 1; }
+  let _ = buf_write_byte(link, valid_off as u32, 1 as u32);
+
+  // LLC/SNAP: RFC 1042 (00-00-00) or 802.1H bridge-tunnel (00-00-F8).
+  if (buf_read_byte(body, 0 as u32) != (0xaa as u32)) || (buf_read_byte(body, 1 as u32) != (0xaa as u32)) || (buf_read_byte(body, 2 as u32) != (0x03 as u32)) { return 0 - 1; }
+  if (buf_read_byte(body, 3 as u32) != (0 as u32)) || (buf_read_byte(body, 4 as u32) != (0 as u32)) { return 0 - 1; }
+  let oui2: u32 = buf_read_byte(body, 5 as u32);
+  if (oui2 != (0 as u32)) && (oui2 != (0xf8 as u32)) { return 0 - 1; }
+  // EAPOL after the link is up means a group rekey (or a PTK rekey) --
+  // not supported yet (see this section's header); never hand it to
+  // the IP stack.
+  if (buf_read_byte(body, 6 as u32) == (0x88 as u32)) && (buf_read_byte(body, 7 as u32) == (0x8e as u32)) { return 0 - 1; }
+
+  let payload_len: i64 = body_len - 8;
+  let eth_len: i64 = 14 + payload_len;
+  if eth_len > eth_max { return 0 - 1; }
+  let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_RX_OK_OFF);
+  i = 0;
+  while i < 6 {
+    let _ = buf_write_byte(eth_out, i as u32, buf_read_byte(frame, (4 + i) as u32));
+    let _ = buf_write_byte(eth_out, (6 + i) as u32, buf_read_byte(frame, (16 + i) as u32));
+    i = i + 1;
+  }
+  let _ = buf_write_byte(eth_out, 12 as u32, buf_read_byte(body, 6 as u32));
+  let _ = buf_write_byte(eth_out, 13 as u32, buf_read_byte(body, 7 as u32));
+  i = 0;
+  while i < payload_len { let _ = buf_write_byte(eth_out, (14 + i) as u32, buf_read_byte(body, (8 + i) as u32)); i = i + 1; }
+  return eth_len;
+}
+
+// netif backend TX: Ethernet frame -> encrypted MPDU -> radio. Caller
+// (every netif_send_frame user) already holds DWC2_MUTEX_ID, exactly
+// as for the wired backends.
+fn wifi_link_send_eth(eth: mut ref i64, eth_len: i64) -> i64 {
+  let link: mut ref i64 = wifi_link_state_scratch_get();
+  let frame: mut ref i64 = wifi_link_tx_frame_scratch_get();
+  let seq: i64 = buf_read_u16_le(link, WIFI_LINK_TX_SEQ_OFF) as i64;
+  let mpdu_len: i64 = wifi_link_build_mpdu(link, eth, eth_len, frame);
+  if mpdu_len < 0 { return 0 - 1; }
+  // is_broadcast=0 even for a broadcast Ethernet destination: in an
+  // infrastructure BSS every STA->AP frame is unicast to the AP at the
+  // MAC layer (A1=BSSID), so it must be ACKed/retried like one.
+  let st: i64 = wifi_radio_tx_frame(wifi_radio_get_devaddr(), wifi_radio_get_mps_out(), frame, mpdu_len, 0, seq);
+  if st != 0 { return 0 - 1; }
+  return 0;
+}
+
+// netif backend RX: one radio poll; returns an Ethernet frame length,
+// or 0 - 1 if nothing for us arrived this poll.
+fn wifi_link_recv_eth(out_buf: mut ref i64, max_len: i64) -> i64 {
+  let link: mut ref i64 = wifi_link_state_scratch_get();
+  let frame: mut ref i64 = wifi_link_rx_frame_scratch_get();
+  let rx_len: i64 = wifi_radio_rx_frame(wifi_radio_get_devaddr(), wifi_radio_get_mps_in(), frame);
+  if rx_len < 0 { return 0 - 1; }
+  let eth_len: i64 = wifi_link_parse_mpdu(link, frame, rx_len, out_buf, max_len);
+  if eth_len == (0 - 2) {
+    let _ = wifi_link_down(2);
+    return 0 - 1;
+  }
+  return eth_len;
+}
+
+// Known-answer + round-trip tests for the data path. Runs from
+// `wifi selftest` (and boot when boot_debug_enabled()). Uses its own
+// link-state blob, never the live one.
+//
+// Vector 1: IEEE 802.11 CCMP test vector (TK c97c1f67..., PN
+// 0xB5039776E70C, 24-byte header 08 48 c3 2c ...) -- expected CCMP
+// header, ciphertext and MIC exactly as published; an independent
+// Python model (cryptography.hazmat AESCCM + the AAD/nonce rules above)
+// reproduced them byte for byte first.
+// Vector 2: wifi_link_build_mpdu on a fixed Ethernet frame/TK/MACs vs
+// the same Python model's output (PN 1, seq 5).
+// Vector 3: wifi_link_parse_mpdu on a Python-built FromDS frame (PN 7)
+// -> exact Ethernet frame; then the identical frame again must be
+// rejected as a replay, and a one-bit-corrupted copy with a fresh PN
+// must fail the MIC.
+fn wifi_ccmp_self_test() -> i64 {
+  let ok: i64 = 1;
+
+  // --- Vector 1 ---
+  let tk1: [u8; 16] = [0xc9 as u8, 0x7c as u8, 0x1f as u8, 0x67 as u8, 0xce as u8, 0x37 as u8, 0x11 as u8, 0x85 as u8, 0x51 as u8, 0x4a as u8, 0x8a as u8, 0x19 as u8, 0xf2 as u8, 0xbd as u8, 0xd5 as u8, 0x2f as u8];
+  let hdr1: [u8; 24] = [0x08 as u8, 0x48 as u8, 0xc3 as u8, 0x2c as u8, 0x0f as u8, 0xd2 as u8, 0xe1 as u8, 0x28 as u8, 0xa5 as u8, 0x7c as u8, 0x50 as u8, 0x30 as u8, 0xf1 as u8, 0x84 as u8, 0x44 as u8, 0x08 as u8, 0xab as u8, 0xae as u8, 0xa5 as u8, 0xb8 as u8, 0xfc as u8, 0xba as u8, 0x80 as u8, 0x33 as u8];
+  let ccmph1: [u8; 8] = [0x0c as u8, 0xe7 as u8, 0x00 as u8, 0x20 as u8, 0x76 as u8, 0x97 as u8, 0x03 as u8, 0xb5 as u8];
+  let pt1: [u8; 20] = [0xf8 as u8, 0xba as u8, 0x1a as u8, 0x55 as u8, 0xd0 as u8, 0x2f as u8, 0x85 as u8, 0xae as u8, 0x96 as u8, 0x7b as u8, 0xb6 as u8, 0x2f as u8, 0xb6 as u8, 0xcd as u8, 0xa8 as u8, 0xeb as u8, 0x7e as u8, 0x78 as u8, 0xa0 as u8, 0x50 as u8];
+  let ct1: [u8; 28] = [0xf3 as u8, 0xd0 as u8, 0xa2 as u8, 0xfe as u8, 0x9a as u8, 0x3d as u8, 0xbf as u8, 0x23 as u8, 0x42 as u8, 0xa6 as u8, 0x43 as u8, 0xe4 as u8, 0x32 as u8, 0x46 as u8, 0xe8 as u8, 0x0c as u8, 0x3c as u8, 0x04 as u8, 0xd0 as u8, 0x19 as u8, 0x78 as u8, 0x45 as u8, 0xce as u8, 0x0b as u8, 0x16 as u8, 0xf9 as u8, 0x76 as u8, 0x23 as u8];
+  let f1: mut ref i64 = dhruva_alloc_bytes(64);
+  let key1: mut ref i64 = dhruva_alloc_bytes(16);
+  let body1: mut ref i64 = dhruva_alloc_bytes(32);
+  let aad1: mut ref i64 = dhruva_alloc_bytes(32);
+  let nonce1: mut ref i64 = dhruva_alloc_bytes(16);
+  let tag1: mut ref i64 = dhruva_alloc_bytes(16);
+  let i: i64 = 0;
+  while i < 16 { let _ = buf_write_byte(key1, i as u32, tk1[i] as u32); i = i + 1; }
+  i = 0;
+  while i < 24 { let _ = buf_write_byte(f1, i as u32, hdr1[i] as u32); i = i + 1; }
+  i = 0;
+  while i < 8 { let _ = buf_write_byte(f1, (24 + i) as u32, ccmph1[i] as u32); i = i + 1; }
+  i = 0;
+  while i < 20 { let _ = buf_write_byte(body1, i as u32, pt1[i] as u32); i = i + 1; }
+  let al1: i64 = wifi_ccmp_build_aad_nonce(f1, 24, 0, aad1, nonce1);
+  if al1 != 22 { ok = 0; }
+  if aes_ccmp_encrypt(key1, nonce1, aad1, al1, body1, 20, body1, tag1) != 0 { ok = 0; }
+  i = 0;
+  while i < 20 { if buf_read_byte(body1, i as u32) != (ct1[i] as u32) { ok = 0; } i = i + 1; }
+  i = 0;
+  while i < 8 { if buf_read_byte(tag1, i as u32) != (ct1[20 + i] as u32) { ok = 0; } i = i + 1; }
+  if aes_ccmp_decrypt(key1, nonce1, aad1, al1, body1, 20, tag1, body1) != 0 { ok = 0; }
+  i = 0;
+  while i < 20 { if buf_read_byte(body1, i as u32) != (pt1[i] as u32) { ok = 0; } i = i + 1; }
+
+  // --- Vector 2: build ---
+  let link: mut ref i64 = dhruva_alloc_bytes(WIFI_LINK_STATE_SIZE);
+  let bssid: [u8; 6] = [0x02 as u8, 0x11 as u8, 0x22 as u8, 0x33 as u8, 0x44 as u8, 0x55 as u8];
+  let own: [u8; 6] = [0x02 as u8, 0xaa as u8, 0xbb as u8, 0xcc as u8, 0xdd as u8, 0xee as u8];
+  let tk: mut ref i64 = dhruva_alloc_bytes(16);
+  let gtk: mut ref i64 = dhruva_alloc_bytes(16);
+  i = 0;
+  while i < 16 {
+    let _ = buf_write_byte(tk, i as u32, (0x10 + i) as u32);
+    let _ = buf_write_byte(gtk, i as u32, (0x30 + i) as u32);
+    i = i + 1;
+  }
+  let _ = wifi_link_install(link, ref bssid, ref own, tk, gtk, 16, 5);
+  // Ethernet: dst ff..ff, src own, IPv4, 10-byte payload 00..09.
+  let eth: mut ref i64 = dhruva_alloc_bytes(64);
+  i = 0;
+  while i < 6 {
+    let _ = buf_write_byte(eth, i as u32, 0xff as u32);
+    let _ = buf_write_byte(eth, (6 + i) as u32, own[i] as u32);
+    i = i + 1;
+  }
+  let _ = buf_write_byte(eth, 12 as u32, 0x08 as u32);
+  let _ = buf_write_byte(eth, 13 as u32, 0x00 as u32);
+  i = 0;
+  while i < 10 { let _ = buf_write_byte(eth, (14 + i) as u32, i as u32); i = i + 1; }
+  let mpdu: mut ref i64 = dhruva_alloc_bytes(128);
+  let mlen: i64 = wifi_link_build_mpdu(link, eth, 24, mpdu);
+  let exp2: [u8; 58] = [0x08 as u8, 0x41 as u8, 0x00 as u8, 0x00 as u8, 0x02 as u8, 0x11 as u8, 0x22 as u8, 0x33 as u8, 0x44 as u8, 0x55 as u8, 0x02 as u8, 0xaa as u8, 0xbb as u8, 0xcc as u8, 0xdd as u8, 0xee as u8, 0xff as u8, 0xff as u8, 0xff as u8, 0xff as u8, 0xff as u8, 0xff as u8, 0x50 as u8, 0x00 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8, 0x20 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0xb1 as u8, 0x59 as u8, 0xb7 as u8, 0x3d as u8, 0x17 as u8, 0x3b as u8, 0x7b as u8, 0x20 as u8, 0x2e as u8, 0x7a as u8, 0x0d as u8, 0xef as u8, 0x2a as u8, 0xaf as u8, 0x9b as u8, 0x43 as u8, 0x36 as u8, 0x38 as u8, 0xb9 as u8, 0xa2 as u8, 0x46 as u8, 0x32 as u8, 0xa6 as u8, 0x07 as u8, 0x57 as u8, 0x83 as u8];
+  if mlen != 58 { ok = 0; }
+  i = 0;
+  while i < 58 { if buf_read_byte(mpdu, i as u32) != (exp2[i] as u32) { ok = 0; } i = i + 1; }
+  if (buf_read_u16_le(link, WIFI_LINK_TX_SEQ_OFF) as i64) != 6 { ok = 0; }
+
+  // --- Vector 3: parse ---
+  let rx3: [u8; 58] = [0x08 as u8, 0x42 as u8, 0x00 as u8, 0x00 as u8, 0x02 as u8, 0xaa as u8, 0xbb as u8, 0xcc as u8, 0xdd as u8, 0xee as u8, 0x02 as u8, 0x11 as u8, 0x22 as u8, 0x33 as u8, 0x44 as u8, 0x55 as u8, 0x02 as u8, 0x99 as u8, 0x88 as u8, 0x77 as u8, 0x66 as u8, 0x55 as u8, 0x90 as u8, 0x00 as u8, 0x07 as u8, 0x00 as u8, 0x00 as u8, 0x20 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0xd8 as u8, 0x91 as u8, 0x1b as u8, 0x75 as u8, 0x7a as u8, 0x74 as u8, 0x32 as u8, 0x51 as u8, 0xac as u8, 0x98 as u8, 0x7b as u8, 0xf0 as u8, 0x84 as u8, 0x4b as u8, 0x38 as u8, 0x8f as u8, 0x68 as u8, 0xdf as u8, 0xd9 as u8, 0x3f as u8, 0x64 as u8, 0x1e as u8, 0x62 as u8, 0xaa as u8, 0x5a as u8, 0xd2 as u8];
+  let rxf: mut ref i64 = dhruva_alloc_bytes(128);
+  i = 0;
+  while i < 58 { let _ = buf_write_byte(rxf, i as u32, rx3[i] as u32); i = i + 1; }
+  let eth_out: mut ref i64 = dhruva_alloc_bytes(64);
+  let elen: i64 = wifi_link_parse_mpdu(link, rxf, 58, eth_out, 64);
+  let exp3: [u8; 24] = [0x02 as u8, 0xaa as u8, 0xbb as u8, 0xcc as u8, 0xdd as u8, 0xee as u8, 0x02 as u8, 0x99 as u8, 0x88 as u8, 0x77 as u8, 0x66 as u8, 0x55 as u8, 0x08 as u8, 0x00 as u8, 0xa0 as u8, 0xa1 as u8, 0xa2 as u8, 0xa3 as u8, 0xa4 as u8, 0xa5 as u8, 0xa6 as u8, 0xa7 as u8, 0xa8 as u8, 0xa9 as u8];
+  if elen != 24 { ok = 0; }
+  i = 0;
+  while i < 24 { if buf_read_byte(eth_out, i as u32) != (exp3[i] as u32) { ok = 0; } i = i + 1; }
+  // Same frame again: replay.
+  if wifi_link_parse_mpdu(link, rxf, 58, eth_out, 64) != (0 - 1) { ok = 0; }
+  // Fresh (higher) PN but a flipped ciphertext bit: MIC failure, and
+  // the replay window must NOT have advanced to that PN.
+  let _ = buf_write_byte(rxf, 24 as u32, 0x08 as u32); // PN0 7 -> 8
+  let _ = buf_write_byte(rxf, 40 as u32, buf_read_byte(rxf, 40 as u32) ^ (1 as u32));
+  if wifi_link_parse_mpdu(link, rxf, 58, eth_out, 64) != (0 - 1) { ok = 0; }
+  if buf_read_byte(link, WIFI_LINK_RX_UC_PN_OFF as u32) != (7 as u32) { ok = 0; }
+  // A deauth from our AP to us is reported as such.
+  let deauth: mut ref i64 = dhruva_alloc_bytes(32);
+  i = 0;
+  while i < 26 { let _ = buf_write_byte(deauth, i as u32, 0 as u32); i = i + 1; }
+  let _ = buf_write_byte(deauth, 0 as u32, 0xc0 as u32);
+  i = 0;
+  while i < 6 {
+    let _ = buf_write_byte(deauth, (4 + i) as u32, own[i] as u32);
+    let _ = buf_write_byte(deauth, (10 + i) as u32, bssid[i] as u32);
+    let _ = buf_write_byte(deauth, (16 + i) as u32, bssid[i] as u32);
+    i = i + 1;
+  }
+  if wifi_link_parse_mpdu(link, deauth, 26, eth_out, 64) != (0 - 2) { ok = 0; }
+
+  let _ = uart_puts("WIFI: CCMP data path (IEEE 802.11 CCMP vector, ToDS build, FromDS parse, replay + MIC-tamper rejection, deauth)");
+  if ok == 1 { let _ = uart_puts(" (PASS)\n"); } else { let _ = uart_puts(" (FAIL)\n"); }
+  return ok;
+}
+
 fn wifi_real_join() -> i64 {
+  // 2026-11-26: a (re)join tears down any existing data-path link
+  // first -- its keys/PNs belong to the old association.
+  let _ = wifi_link_down(1);
   let ssid_len: i64 = wifi_config_ssid_len_get() as i64;
   let password_len: i64 = wifi_config_password_len_get() as i64;
   if ssid_len == 0 {
@@ -55258,7 +55990,30 @@ fn wifi_real_join() -> i64 {
       bi2 = bi2 + 1;
     }
     let _ = wifi_radio_report_connect(devaddr, mps_out, bssid_heap);
+    // 2026-11-26: bring up the data path (software CCMP with the TK/
+    // GTK just negotiated) and point the netif at it, then start DHCP
+    // on it -- task_e's periodic dhcp_client_poll/retry drive it from
+    // here exactly as on the wired backends. GTK length is 16: the
+    // RSNE this STA sent (rsn_ie_build_wpa2_psk_ccmp) only offers a
+    // CCMP group cipher, so an AP that associated us uses a CCMP GTK.
+    let _ = wifi_link_install(wifi_link_state_scratch_get(), ref bssid, ref own_mac, wpa_hs_tk_ptr(), gtk_out, 16, data_seq);
     let _ = uart_puts("wifi join: CONNECTED (4-way handshake complete, TK/GTK installed)\n");
+    let _ = uart_puts("wifi link: UP -- netif now routed over WiFi, starting DHCP\n");
+    let dhcp_mac: mut ref i64 = wpa2_eapol_own_mac_scratch_get();
+    let _ = wifi_link_get_mac(dhcp_mac);
+    let dhcp_st: i64 = dhcp_client_start(dhcp_mac, scheduler_get_tick_count());
+    let _ = uart_puts("DHCP (wifi): client_start status=");
+    let _ = uart_put_hex32(dhcp_st as u32);
+    let _ = uart_puts(" (0=DISCOVER sent)\n");
+    if dhcp_client_acquire_blocking(dhcp_mac, 20000000 as u32) == 1 {
+      let _ = uart_puts("DHCP (wifi): BOUND ip=");
+      let _ = uart_put_ip(dhcp_state_get_leased_ip());
+      let _ = uart_puts(" server=");
+      let _ = uart_put_ip(dhcp_state_get_server_ip());
+      let _ = uart_puts("\n");
+    } else {
+      let _ = uart_puts("DHCP (wifi): not bound after 20s (task_e keeps retrying in the background) -- see 'wifi link' counters\n");
+    }
     return 0;
   }
   let eapol_phase_elapsed_us: u32 = wrapping_sub(mmio_read_u32(TIMER_CLO), eapol_phase_t0);
@@ -62226,8 +62981,14 @@ fn kernel_main() -> i64 {
   let _ = usb_downstream_desc_scratch_set(dhruva_alloc_bytes(18));
   let _ = hub_port_status_scratch_set(dhruva_alloc_bytes(4));
   let _ = rtl_lan_reg_scratch_set(dhruva_alloc_bytes(4));
-  let _ = rtl_rx_raw_scratch_set(dhruva_alloc_bytes(512));
-  let _ = rtl_rx_chunk_scratch_set(dhruva_alloc_bytes(64));
+  // 2026-11-26: raw 512 -> RTL_RX_RAW_MAX (see that const). chunk
+  // 64 -> 512: BUG -- rtl8188cu_rx_frame asks dwc2_wifi_bulk_in for
+  // `mps` bytes per chunk, and since the 2026 USB2.0 high-speed fix the
+  // bulk-IN mps is 512, not 64 -- every RX chunk over 64 bytes overran
+  // this buffer into the next allocation (rtl_tx_buf_scratch, harmless
+  // only because every TX rebuilds it from scratch first).
+  let _ = rtl_rx_raw_scratch_set(dhruva_alloc_bytes(RTL_RX_RAW_MAX));
+  let _ = rtl_rx_chunk_scratch_set(dhruva_alloc_bytes(512));
   // Round 2026-11-22: bumped from 512 to 1632 (1600 MTU-scale frame
   // body + 32-byte TX descriptor prefix) -- see usb_bulk_data_
   // scratch's own header comment just above for the full "why".
@@ -62253,7 +63014,7 @@ fn kernel_main() -> i64 {
   // size mismatch would make merely wasteful instead of corrupting).
   let _ = wifi_join_ctx_scratch_set(dhruva_alloc_bytes(WPA2_JOIN_CTX_SIZE as u32));
   let _ = wifi_join_preq_scratch_set(dhruva_alloc_bytes(PROBE_REQ_MAX_LEN as u32));
-  let _ = wifi_join_rx_scratch_set(dhruva_alloc_bytes(512));
+  let _ = wifi_join_rx_scratch_set(dhruva_alloc_bytes(WIFI_RX_FRAME_MAX));
   let _ = wifi_join_mgmt_scratch_set(dhruva_alloc_bytes(ASSOC_REQ_MAX_LEN as u32));
   // 2026-11-26: sized from the same constants the EAPOL path uses
   // (were literal 140/99 -- too small for a real Message 3 / the
@@ -62262,10 +63023,23 @@ fn kernel_main() -> i64 {
   let _ = wifi_join_eapol_tx_scratch_set(dhruva_alloc_bytes(WPA2_JOIN_MSG2_LEN as u32));
   let _ = wifi_join_gtk_scratch_set(dhruva_alloc_bytes(32));
   let _ = wifi_join_wrapped_scratch_set(dhruva_alloc_bytes(256));
+  // 2026-11-26: WiFi STA data path (wifi_link_*), allocated once.
+  let wifi_link_st: mut ref i64 = dhruva_alloc_bytes(WIFI_LINK_STATE_SIZE);
+  let wli: i64 = 0;
+  while wli < WIFI_LINK_STATE_SIZE { let _ = buf_write_byte(wifi_link_st, wli as u32, 0 as u32); wli = wli + 1; }
+  let _ = wifi_link_state_scratch_set(wifi_link_st);
+  let _ = wifi_link_aad_scratch_set(dhruva_alloc_bytes(32));
+  let _ = wifi_link_nonce_scratch_set(dhruva_alloc_bytes(16));
+  let _ = wifi_link_tag_scratch_set(dhruva_alloc_bytes(16));
+  let _ = wifi_link_key_scratch_set(dhruva_alloc_bytes(16));
+  let _ = wifi_link_tx_body_scratch_set(dhruva_alloc_bytes(WIFI_LINK_FRAME_MAX));
+  let _ = wifi_link_tx_frame_scratch_set(dhruva_alloc_bytes(WIFI_LINK_FRAME_MAX));
+  let _ = wifi_link_rx_frame_scratch_set(dhruva_alloc_bytes(WIFI_LINK_FRAME_MAX));
+  let _ = wifi_link_rx_body_scratch_set(dhruva_alloc_bytes(WIFI_LINK_FRAME_MAX));
   let _ = wifi_join_bssid_scratch_set(dhruva_alloc_bytes(6));
   let _ = wifi_scan_tx_scratch_set(dhruva_alloc_bytes(64));
-  let _ = wifi_scan_rx_scratch_set(dhruva_alloc_bytes(512));
-  let _ = wifi_listen_rx_scratch_set(dhruva_alloc_bytes(512));
+  let _ = wifi_scan_rx_scratch_set(dhruva_alloc_bytes(WIFI_RX_FRAME_MAX));
+  let _ = wifi_listen_rx_scratch_set(dhruva_alloc_bytes(WIFI_RX_FRAME_MAX));
   let _ = rtl8188cu_mac_buf_scratch_set(dhruva_alloc_bytes(6));
   let _ = rtl8188cu_fw_load_scratch_set(dhruva_alloc_bytes(512));
   let _ = wifi_mgmtlog_scratch_set(dhruva_alloc_bytes(512));
@@ -62801,6 +63575,7 @@ fn kernel_main() -> i64 {
   // state, same as wpa_handshake_self_test does independently, so
   // this has no ordering dependency on that (or any other) self-test.
   if boot_debug_enabled() == 1 { let _ = wpa2_join_orchestrator_self_test(); }
+  if boot_debug_enabled() == 1 { let _ = wifi_ccmp_self_test(); }
 
   // Round 44: crypto primitives foundation, symmetric-cipher half.
   if boot_debug_enabled() == 1 { let _ = chacha20_self_test(); }

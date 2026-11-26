@@ -2782,3 +2782,146 @@ wifi_stat_report_frame_count_get:
 .global ptr_to_u32
 ptr_to_u32:
     bx lr
+
+/* 2026-11-26: WiFi STA data path (netif backend kind 3) -- persistent,
+ * boot-allocated scratch (never-free heap pattern). See wifi_link_*
+ * in kernel/kernel_main.vani. */
+.section ".bss"
+.align 4
+wifi_link_state_addr:
+    .word 0             /* 128 bytes -- WiFi STA data-path link state (connected flag, BSSID, own MAC, TX PN, RX replay PNs, TX seq, TK, GTK). Offsets: WIFI_LINK_* consts in kernel_main.vani. */
+wifi_link_aad_addr:
+    .word 0             /* 32 bytes -- CCMP AAD build buffer (22/24/28/30 bytes used). */
+wifi_link_nonce_addr:
+    .word 0             /* 16 bytes -- CCMP 13-byte nonce build buffer. */
+wifi_link_tag_addr:
+    .word 0             /* 16 bytes -- CCMP 8-byte MIC in/out. */
+wifi_link_key_addr:
+    .word 0             /* 16 bytes -- active CCMP key (TK or GTK) copy. */
+wifi_link_tx_body_addr:
+    .word 0             /* WIFI_LINK_FRAME_MAX bytes -- TX plaintext MSDU body (LLC/SNAP + payload). */
+wifi_link_tx_frame_addr:
+    .word 0             /* WIFI_LINK_FRAME_MAX bytes -- TX 802.11 MPDU (hdr + CCMP hdr + ciphertext + MIC). */
+wifi_link_rx_frame_addr:
+    .word 0             /* WIFI_LINK_FRAME_MAX bytes -- RX 802.11 MPDU as delivered by the radio. */
+wifi_link_rx_body_addr:
+    .word 0             /* WIFI_LINK_FRAME_MAX bytes -- RX decrypted MSDU body. */
+
+.section ".text"
+
+.global wifi_link_state_scratch_set
+wifi_link_state_scratch_set:
+    ldr r1, =wifi_link_state_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_link_state_scratch_get
+wifi_link_state_scratch_get:
+    ldr r0, =wifi_link_state_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_link_aad_scratch_set
+wifi_link_aad_scratch_set:
+    ldr r1, =wifi_link_aad_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_link_aad_scratch_get
+wifi_link_aad_scratch_get:
+    ldr r0, =wifi_link_aad_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_link_nonce_scratch_set
+wifi_link_nonce_scratch_set:
+    ldr r1, =wifi_link_nonce_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_link_nonce_scratch_get
+wifi_link_nonce_scratch_get:
+    ldr r0, =wifi_link_nonce_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_link_tag_scratch_set
+wifi_link_tag_scratch_set:
+    ldr r1, =wifi_link_tag_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_link_tag_scratch_get
+wifi_link_tag_scratch_get:
+    ldr r0, =wifi_link_tag_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_link_tx_body_scratch_set
+wifi_link_tx_body_scratch_set:
+    ldr r1, =wifi_link_tx_body_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_link_tx_body_scratch_get
+wifi_link_tx_body_scratch_get:
+    ldr r0, =wifi_link_tx_body_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_link_tx_frame_scratch_set
+wifi_link_tx_frame_scratch_set:
+    ldr r1, =wifi_link_tx_frame_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_link_tx_frame_scratch_get
+wifi_link_tx_frame_scratch_get:
+    ldr r0, =wifi_link_tx_frame_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_link_rx_frame_scratch_set
+wifi_link_rx_frame_scratch_set:
+    ldr r1, =wifi_link_rx_frame_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_link_rx_frame_scratch_get
+wifi_link_rx_frame_scratch_get:
+    ldr r0, =wifi_link_rx_frame_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_link_rx_body_scratch_set
+wifi_link_rx_body_scratch_set:
+    ldr r1, =wifi_link_rx_body_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_link_rx_body_scratch_get
+wifi_link_rx_body_scratch_get:
+    ldr r0, =wifi_link_rx_body_addr
+    ldr r0, [r0]
+    bx lr
+
+.global wifi_link_key_scratch_set
+wifi_link_key_scratch_set:
+    ldr r1, =wifi_link_key_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global wifi_link_key_scratch_get
+wifi_link_key_scratch_get:
+    ldr r0, =wifi_link_key_addr
+    ldr r0, [r0]
+    bx lr
