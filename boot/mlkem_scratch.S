@@ -156,3 +156,28 @@ MLKEM_SCRATCH_PAIR mlkem_rprime_buf
 MLKEM_SCRATCH_PAIR mlkem_kbar_buf
 MLKEM_SCRATCH_PAIR mlkem_ekpke_buf
 MLKEM_SCRATCH_PAIR mlkem_cprime_buf
+
+/* 2026-11-26: ML-KEM-768 (k=3) polynomial pool -- 26 x 1024-byte
+ * polynomials (256 coefficients x u32) in one boot-time allocation.
+ * mlkem3_poly(idx) returns pool + idx*1024 (vani has no pointer
+ * arithmetic, hence this accessor). Index map: see MLKEM3_* in
+ * kernel_main.vani. Caller guarantees idx < 26. */
+.section ".bss"
+.align 4
+mlkem3_pool_addr:
+    .word 0
+
+.section ".text"
+.global mlkem3_pool_set
+mlkem3_pool_set:
+    ldr r1, =mlkem3_pool_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global mlkem3_poly
+mlkem3_poly:
+    ldr r1, =mlkem3_pool_addr
+    ldr r1, [r1]
+    add r0, r1, r0, lsl #10
+    bx lr

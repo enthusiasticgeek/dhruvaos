@@ -384,7 +384,10 @@ def main() -> int:
     ap.add_argument("--go-timeout", type=float, default=10, help="seconds to wait for the board's 'GO <len>' response")
     ap.add_argument("--stall-timeout", type=float, default=30,
                      help="abort if the final DONE doesn't arrive within this many seconds of the last window's ACK")
-    ap.add_argument("--commit-timeout", type=float, default=60, help="commit does a full SD readback+re-hash, give it real time")
+    ap.add_argument("--commit-timeout", type=float, default=600,
+                    help="commit re-reads and re-hashes the whole slot from SD -- a 3 MB kernel takes over a minute "
+                         "(2026-11-26: the old 60s default timed out on a real-HW commit that then succeeded on the "
+                         "board, and the retry needlessly re-streamed the full image twice)")
     ap.add_argument("--ready-timeout", type=float, default=30, help="seconds to wait for the board to answer 'ready' at all")
     ap.add_argument("--log", default="/tmp/kernel_upload_full.log", help="path to write the raw captured serial log")
     ap.add_argument("--sig", default=None,
