@@ -370,6 +370,13 @@ extern "C" fn wifi_link_tag_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn wifi_link_tag_scratch_get() -> mut ref i64;
 extern "C" fn wifi_link_key_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn wifi_link_key_scratch_get() -> mut ref i64;
+// 2026-11-26: kernel image signing scratch (boot/scratch_state.S).
+extern "C" fn kernelupload_sig_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn kernelupload_sig_scratch_get() -> mut ref i64;
+extern "C" fn kernelsig_pub_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn kernelsig_pub_scratch_get() -> mut ref i64;
+extern "C" fn kernelsig_msg_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn kernelsig_msg_scratch_get() -> mut ref i64;
 extern "C" fn wifi_link_tx_body_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn wifi_link_tx_body_scratch_get() -> mut ref i64;
 extern "C" fn wifi_link_tx_frame_scratch_set(addr: mut ref i64) -> i64;
@@ -44108,6 +44115,226 @@ fn maintenance_mode_is_active() -> u32 {
   return 1 as u32;
 }
 
+// ===================================================================
+// Kernel image signing (2026-11-26). An uploaded kernel is only marked
+// ready if it carries an Ed25519 signature, by the provisioned trusted
+// key, over
+//   M = "DHRUVA-KSIG-v1\0\0" (16) || image length (u32 LE, 4) ||
+//       SHA-256(image) (32)                                   = 52 bytes
+// -- verified at `kernelupload commit` AFTER the existing SD readback
+// re-hash, so the digest being authorized is the one actually on the
+// card. The slot isn't bound into M: one signed image may go to either
+// slot. Transport-independent (UART today, the TLS network path next):
+// a compromised or spoofed channel still cannot get an unsigned kernel
+// marked bootable.
+//
+// Trusted key: critical config store key "ksig_pub" (32 bytes),
+// managed by the root-only `kernelsig setkey <hex64>`. Policy: once a
+// key is provisioned, a valid signature is MANDATORY; before that,
+// commits still succeed but say UNSIGNED loudly (otherwise the very
+// first deployment of this feature could never be committed). Host
+// side: test/kernel_sign.py (keygen + sign), test/kernel_upload.py
+// (sends kernelupload sig1/sig2 automatically when <img>.sig exists).
+// ===================================================================
+
+const KERNELSIG_MSG_LEN: i64 = 52;
+// kernelupload_sig scratch layout: [0,64) signature, 64/65 half-received
+// flags, 66 authorized flag, [68,72) authorized length (u32 LE),
+// [72,104) authorized digest.
+const KERNELSIG_PENDING_SIZE: i64 = 112;
+const KERNELSIG_AUTH_FLAG_OFF: i64 = 66;
+const KERNELSIG_AUTH_LEN_OFF: i64 = 68;
+const KERNELSIG_AUTH_DIGEST_OFF: i64 = 72;
+
+fn kernelsig_build_msg(digest: mut ref i64, digest_off: i64, image_len: i64, out: mut ref i64) -> i64 {
+  let tag: Str = "DHRUVA-KSIG-v1";
+  let i: i64 = 0;
+  while i < 16 {
+    let b: u32 = if i < 14 { str_byte_at(tag, i) as u32 } else { 0 as u32 };
+    let _ = buf_write_byte(out, i as u32, b);
+    i = i + 1;
+  }
+  let _ = buf_write_u32_le(out, 16, image_len as u32);
+  i = 0;
+  while i < 32 { let _ = buf_write_byte(out, (20 + i) as u32, buf_read_byte(digest, (digest_off + i) as u32)); i = i + 1; }
+  return KERNELSIG_MSG_LEN;
+}
+
+// Returns 32 if a trusted key is provisioned (now in kernelsig_pub
+// scratch), otherwise <= 0.
+fn kernelsig_load_pub() -> i64 {
+  let pk: mut ref i64 = kernelsig_pub_scratch_get();
+  let n: i64 = critical_config_read("ksig_pub", pk);
+  if n != 32 { return 0; }
+  return 32;
+}
+
+fn kernelsig_print_fingerprint(pk: mut ref i64) -> i64 {
+  let i: i64 = 0;
+  while i < 8 {
+    let _ = uart_put_hex_byte(buf_read_byte(pk, i as u32));
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn kernelsig_clear_pending() -> i64 {
+  let sig: mut ref i64 = kernelupload_sig_scratch_get();
+  let i: i64 = 0;
+  while i < KERNELSIG_PENDING_SIZE { let _ = buf_write_byte(sig, i as u32, 0 as u32); i = i + 1; }
+  return 0;
+}
+
+// Verifies the pending signature over (digest, image_len) and, if
+// valid, records that exact pair as authorized. Run as its own shell
+// step (`kernelsig authorize <len> <sha256>`, straight off
+// shell_dispatch) rather than inside commit: Ed25519 verification
+// (~600 bytes of arrays + SHA-512) nested under the commit handler's
+// own SHA chunk buffers pushed task_f past its #[bounded_stack] budget.
+// Security is unchanged -- commit still requires a signature-verified
+// (len, digest) pair identical to the one it re-hashes off the card.
+// Returns 0 on success.
+// The candidate digest must already be staged at
+// kernelupload_sig[KERNELSIG_AUTH_DIGEST_OFF, +32) (the shell handler
+// does that); it only counts as authorized once the flag is set below.
+fn kernelsig_authorize_staged(image_len: i64) -> i64 {
+  let sig: mut ref i64 = kernelupload_sig_scratch_get();
+  let _ = buf_write_byte(sig, KERNELSIG_AUTH_FLAG_OFF as u32, 0 as u32);
+  if kernelsig_load_pub() != 32 {
+    let _ = uart_puts("kernelsig: no trusted key provisioned -- nothing to authorize against\n");
+    return 1;
+  }
+  let pk: mut ref i64 = kernelsig_pub_scratch_get();
+  if (buf_read_byte(sig, 64 as u32) != (1 as u32)) || (buf_read_byte(sig, 65 as u32) != (1 as u32)) {
+    let _ = uart_puts("kernelsig: no complete signature pending (send kernelupload sig1/sig2 first)\n");
+    return 2;
+  }
+  let msg: mut ref i64 = kernelsig_msg_scratch_get();
+  let mlen: i64 = kernelsig_build_msg(sig, KERNELSIG_AUTH_DIGEST_OFF, image_len, msg);
+  if ed25519_verify_heap(pk, msg, mlen, sig) != 1 {
+    let _ = kernelsig_clear_pending();
+    let _ = uart_puts("kernelsig: image signature INVALID for trusted key ");
+    let _ = kernelsig_print_fingerprint(pk);
+    let _ = uart_puts("...\n");
+    return 3;
+  }
+  let _ = buf_write_u32_le(sig, KERNELSIG_AUTH_LEN_OFF, image_len as u32);
+  let _ = buf_write_byte(sig, KERNELSIG_AUTH_FLAG_OFF as u32, 1 as u32);
+  let _ = uart_puts("ok, image signature valid (key ");
+  let _ = kernelsig_print_fingerprint(pk);
+  let _ = uart_puts("...) -- authorized for commit\n");
+  return 0;
+}
+
+// Commit-time gate (no crypto here -- see kernelsig_authorize).
+// 0 = proceed (authorized pair matches exactly, or no key provisioned
+// yet -- warned), nonzero = refuse. Always consumes the pending state.
+fn kernelsig_check_commit(digest: mut ref i64, image_len: i64) -> i64 {
+  let sig: mut ref i64 = kernelupload_sig_scratch_get();
+  if kernelsig_load_pub() != 32 {
+    let _ = kernelsig_clear_pending();
+    let _ = uart_puts("kernelupload: WARNING committing an UNSIGNED-checked image -- no trusted signing key provisioned (see 'kernelsig setkey')\n");
+    return 0;
+  }
+  let match_ok: i64 = 1;
+  if buf_read_byte(sig, KERNELSIG_AUTH_FLAG_OFF as u32) != (1 as u32) { match_ok = 0; }
+  if buf_read_u32_le(sig, KERNELSIG_AUTH_LEN_OFF) != (image_len as u32) { match_ok = 0; }
+  let i: i64 = 0;
+  while i < 32 {
+    if buf_read_byte(sig, (KERNELSIG_AUTH_DIGEST_OFF + i) as u32) != buf_read_byte(digest, i as u32) { match_ok = 0; }
+    i = i + 1;
+  }
+  let _ = kernelsig_clear_pending();
+  if match_ok == 0 {
+    let _ = uart_puts("kernelupload: signature REQUIRED -- this (length, sha256) was not authorized by 'kernelsig authorize' with a valid signature\n");
+    return 1;
+  }
+  let _ = uart_puts("kernelupload: commit matches the signature-authorized image\n");
+  return 0;
+}
+
+// `kernelsig status | setkey <hex64>` -- setkey is root-only.
+fn shell_dispatch_kernelsig(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  if cmd_end >= line_len {
+    let _ = uart_puts("usage: kernelsig status | kernelsig setkey <64-hex-char ed25519 public key>\n");
+    return 0;
+  }
+  let sub_start: i64 = cmd_end + 1;
+  let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
+  if shell_word_matches(line_buf, sub_start, sub_end, "status") == 1 {
+    if kernelsig_load_pub() != 32 {
+      let _ = uart_puts("kernelsig: no trusted key provisioned -- uploads are NOT signature-checked\n");
+      return 0;
+    }
+    let _ = uart_puts("kernelsig: trusted key ");
+    let _ = kernelsig_print_fingerprint(kernelsig_pub_scratch_get());
+    let _ = uart_puts("... -- uploads REQUIRE a valid signature\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "setkey") == 1 {
+    if dharafs_user_get_uid() != (0 as u32) {
+      let _ = uart_puts("kernelsig: permission denied (root only)\n");
+      return 0;
+    }
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: kernelsig setkey <64-hex-char ed25519 public key>\n");
+      return 0;
+    }
+    let ks: i64 = sub_end + 1;
+    let ke: i64 = shell_find_space(line_buf, ks, line_len);
+    if (ke - ks) != 64 {
+      let _ = uart_puts("kernelsig: expected exactly 64 hex chars (32-byte key)\n");
+      return 0;
+    }
+    let pk: mut ref i64 = kernelsig_pub_scratch_get();
+    if shell_parse_hex_bytes(line_buf, ks, ke, pk, 32) != 0 {
+      let _ = uart_puts("kernelsig: invalid hex\n");
+      return 0;
+    }
+    if critical_config_write("ksig_pub", pk, 32, 0 as u32) < 0 {
+      let _ = uart_puts("kernelsig: failed to store key\n");
+      return 0;
+    }
+    if kernelsig_load_pub() != 32 {
+      let _ = uart_puts("kernelsig: key stored but did not read back -- NOT active\n");
+      return 0;
+    }
+    let _ = uart_puts("ok, trusted kernel-signing key set: ");
+    let _ = kernelsig_print_fingerprint(kernelsig_pub_scratch_get());
+    let _ = uart_puts("... -- signatures now REQUIRED for kernelupload commit\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "authorize") == 1 {
+    if sub_end >= line_len {
+      let _ = uart_puts("usage: kernelsig authorize <total_len_bytes> <sha256_hex>\n");
+      return 0;
+    }
+    let ls: i64 = sub_end + 1;
+    let le: i64 = shell_find_space(line_buf, ls, line_len);
+    if le >= line_len {
+      let _ = uart_puts("usage: kernelsig authorize <total_len_bytes> <sha256_hex>\n");
+      return 0;
+    }
+    let alen: i64 = shell_parse_decimal(line_buf, ls, le);
+    let hs: i64 = le + 1;
+    let he: i64 = shell_find_space(line_buf, hs, line_len);
+    let dtmp: mut ref i64 = kernelsig_msg_scratch_get();
+    if (alen <= 0) || ((he - hs) != 64) || (shell_parse_hex_bytes(line_buf, hs, he, dtmp, 32) != 0) {
+      let _ = uart_puts("kernelsig: invalid length or sha256 hex\n");
+      return 0;
+    }
+    // Stage the candidate digest (msg scratch gets overwritten by
+    // kernelsig_build_msg, so it can't stay there).
+    let pend: mut ref i64 = kernelupload_sig_scratch_get();
+    let di: i64 = 0;
+    while di < 32 { let _ = buf_write_byte(pend, (KERNELSIG_AUTH_DIGEST_OFF + di) as u32, buf_read_byte(dtmp, di as u32)); di = di + 1; }
+    let _ = kernelsig_authorize_staged(alen);
+    return 0;
+  }
+  let _ = uart_puts("usage: kernelsig status | kernelsig setkey <hex64> | kernelsig authorize <len> <sha256>\n");
+  return 0;
+}
+
 // `kernelupload chunk <hex>` / `kernelupload commit <len> <sha256>` /
 // `kernelupload abort` -- same 48-byte/96-hex-char per-line cap as
 // `wifikey chunk` (shared 128-byte shell line buffer, see
@@ -44116,6 +44343,247 @@ fn maintenance_mode_is_active() -> u32 {
 // fit in this project's 768KB heap, let alone .bss), this streams:
 // accumulate into one 512-byte block buffer, flush+hash every time it
 // fills, never holding more than one block of the image in memory.
+// 2026-11-26: split out of shell_dispatch_kernelupload so the commit
+// path's worst-case stack (now including Ed25519 verification via
+// kernelsig_check_commit) doesn't also carry every other subcommand's
+// locals -- task_f's #[bounded_stack] gate (16747 > 16384) caught it.
+fn kernelupload_commit_cmd(line_buf: mut ref i64, sub_end: i64, line_len: i64) -> i64 {
+  if kernelupload_active_get() == (0 as u32) {
+    let _ = uart_puts("kernelupload: nothing to commit (no chunks uploaded yet)\n");
+    return 0;
+  }
+  if sub_end >= line_len {
+    let _ = uart_puts("usage: kernelupload commit <total_len_bytes> <sha256_hex>\n");
+    return 0;
+  }
+  let len_start: i64 = sub_end + 1;
+  let len_end: i64 = shell_find_space(line_buf, len_start, line_len);
+  if len_end >= line_len {
+    let _ = uart_puts("usage: kernelupload commit <total_len_bytes> <sha256_hex>\n");
+    return 0;
+  }
+  let claimed_len: i64 = shell_parse_decimal(line_buf, len_start, len_end);
+  let actual_len: i64 = kernelupload_total_len_get() as i64;
+  if (claimed_len <= 0) || (claimed_len != actual_len) {
+    let _ = uart_puts("kernelupload: total_len mismatch or invalid (claimed ");
+    let _ = uart_put_i64(claimed_len);
+    let _ = uart_puts(", received ");
+    let _ = uart_put_i64(actual_len);
+    let _ = uart_puts(") -- not committing\n");
+    return 0;
+  }
+  if claimed_len > kernelslot_size_bytes() {
+    let _ = uart_puts("kernelupload: total_len exceeds slot size, not committing\n");
+    let _ = kernelupload_active_set(0 as u32);
+    return 0;
+  }
+
+  let sha_start: i64 = len_end + 1;
+  let sha_end: i64 = shell_find_space(line_buf, sha_start, line_len);
+  if (sha_end - sha_start) != 64 {
+    let _ = uart_puts("kernelupload: expected a 64-char (32-byte) sha256 hex digest\n");
+    return 0;
+  }
+  let claimed_digest: mut ref i64 = kernelupload_chunk_decode_buf_get();
+  let hex_status: i64 = shell_parse_hex_bytes(line_buf, sha_start, sha_end, claimed_digest, 32);
+  if hex_status != 0 {
+    let _ = uart_puts("kernelupload: invalid sha256 hex\n");
+    return 0;
+  }
+
+  let target_slot: u32 = kernelupload_target_slot_get();
+  let base_block: i64 = if target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() };
+  let block_buf: mut ref i64 = kernelupload_block_buf_get();
+  let ctx: Sha256Ctx = kernelupload_ctx_load();
+  let partial_bytes: i64 = actual_len % 512;
+
+  if partial_bytes != 0 {
+    let pad_i: i64 = partial_bytes;
+    while pad_i < 512 {
+      let _ = buf_write_byte(block_buf, pad_i as u32, 0 as u32);
+      pad_i = pad_i + 1;
+    }
+    let block_index: i64 = actual_len / 512;
+    let wstatus: i64 = sdhost_write_block(base_block + block_index, block_buf);
+    if wstatus != 0 {
+      let _ = uart_puts("kernelupload: final block SD write failed\n");
+      let _ = kernelupload_active_set(0 as u32);
+      return 0;
+    }
+    let pchunk1: [u8; 256] = zero256_bytes();
+    let pchunk2: [u8; 256] = zero256_bytes();
+    let pci: i64 = 0;
+    while pci < 256 {
+      pchunk1[pci] = buf_read_byte(block_buf, pci as u32) as u8;
+      pci = pci + 1;
+    }
+    let first_n: i64 = if partial_bytes < 256 { partial_bytes } else { 256 };
+    ctx = sha256_update(ref ctx, mut ref pchunk1, first_n);
+    if partial_bytes > 256 {
+      let pcj: i64 = 0;
+      while pcj < 256 {
+        pchunk2[pcj] = buf_read_byte(block_buf, (256 + pcj) as u32) as u8;
+        pcj = pcj + 1;
+      }
+      ctx = sha256_update(ref ctx, mut ref pchunk2, partial_bytes - 256);
+    }
+  }
+  let uploaded_digest: [u8; 32] = sha256_finalize(ref ctx);
+
+  let digest_cmp_buf: mut ref i64 = dharafs_sd_scratch_get();
+  let di: i64 = 0;
+  while di < 32 {
+    let _ = buf_write_byte(digest_cmp_buf, di as u32, uploaded_digest[di] as u32);
+    di = di + 1;
+  }
+  if sha256_bytes_equal(digest_cmp_buf, claimed_digest, 32) != 1 {
+    let _ = uart_puts("kernelupload: uploaded data does not match the claimed sha256 -- not committing\n");
+    let _ = kernelupload_active_set(0 as u32);
+    return 0;
+  }
+
+  // Readback verify: re-read every written block straight from SD
+  // and recompute SHA-256 over THAT, independent of the upload-time
+  // hash above -- catches a write-cycle fault the upload-time hash
+  // alone can't.
+  let readback_ctx: Sha256Ctx = sha256_init();
+  let nblocks: i64 = (actual_len + 511) / 512;
+  let rb: i64 = 0;
+  while rb < nblocks {
+    // BUG FOUND 2026-11-22 (real-HW investigation: upload succeeded,
+    // then "commit did not report success" with the board going
+    // silent and needing a full re-boot cycle to recover): this
+    // readback-verify loop re-reads every written SD block
+    // sequentially -- 5930 blocks for a 3MB kernel image -- with NO
+    // watchdog_kick() anywhere inside it, unlike every other
+    // long-running real-HW loop in this codebase (wifi scan/join,
+    // the upload's own receive loop, etc.). With a 15s watchdog
+    // timeout and thousands of sequential SD block reads, this
+    // reliably self-resets mid-commit on any upload of meaningful
+    // size, exactly matching the observed symptom. Same one-line
+    // fix as every other long real-HW loop.
+    if hardware_is_real_hw_get() == (1 as u32) {
+      let _ = watchdog_kick();
+    }
+    let rstatus: i64 = sdhost_read_block(base_block + rb, block_buf);
+    if rstatus != 0 {
+      let _ = uart_puts("kernelupload: readback failed, not committing\n");
+      let _ = kernelupload_active_set(0 as u32);
+      return 0;
+    }
+    let is_last: i64 = if (rb + 1) == nblocks { 1 } else { 0 };
+    let valid_in_block: i64 = if is_last == 1 { (if partial_bytes == 0 { 512 } else { partial_bytes }) } else { 512 };
+    let rchunk1: [u8; 256] = zero256_bytes();
+    let rchunk2: [u8; 256] = zero256_bytes();
+    let rci: i64 = 0;
+    while rci < 256 {
+      rchunk1[rci] = buf_read_byte(block_buf, rci as u32) as u8;
+      rci = rci + 1;
+    }
+    let rfirst_n: i64 = if valid_in_block < 256 { valid_in_block } else { 256 };
+    readback_ctx = sha256_update(ref readback_ctx, mut ref rchunk1, rfirst_n);
+    if valid_in_block > 256 {
+      let rcj: i64 = 0;
+      while rcj < 256 {
+        rchunk2[rcj] = buf_read_byte(block_buf, (256 + rcj) as u32) as u8;
+        rcj = rcj + 1;
+      }
+      readback_ctx = sha256_update(ref readback_ctx, mut ref rchunk2, valid_in_block - 256);
+    }
+    rb = rb + 1;
+  }
+  let readback_digest: [u8; 32] = sha256_finalize(ref readback_ctx);
+  let readback_cmp_buf: mut ref i64 = dharafs_sd_scratch_get();
+  let rdi: i64 = 0;
+  while rdi < 32 {
+    let _ = buf_write_byte(readback_cmp_buf, rdi as u32, readback_digest[rdi] as u32);
+    rdi = rdi + 1;
+  }
+  if sha256_bytes_equal(readback_cmp_buf, claimed_digest, 32) != 1 {
+    let _ = uart_puts("kernelupload: readback sha256 mismatch (write-cycle fault?) -- not committing\n");
+    let _ = kernelupload_active_set(0 as u32);
+    return 0;
+  }
+  // 2026-11-26: signature gate -- after the readback re-hash, so what
+  // gets authorized is the digest actually on the card.
+  if kernelsig_check_commit(claimed_digest, actual_len) != 0 {
+    let _ = uart_puts("kernelupload: not committing (slot NOT marked ready)\n");
+    let _ = kernelupload_active_set(0 as u32);
+    return 0;
+  }
+
+  let lookup: KernelSlotRecord = kernelslot_lookup();
+  if lookup.valid != 1 {
+    let _ = uart_puts("kernelupload: slot-state record vanished mid-commit (unexpected)\n");
+    let _ = kernelupload_active_set(0 as u32);
+    return 0;
+  }
+  let digest_arr: [u8; 32] = [0 as u8; 32];
+  let dgi: i64 = 0;
+  while dgi < 32 {
+    digest_arr[dgi] = buf_read_byte(claimed_digest, dgi as u32) as u8;
+    dgi = dgi + 1;
+  }
+  let stale: i64 = kernelslot_stale_block(ref lookup);
+  let new_rec: KernelSlotRecord = if target_slot == (0 as u32) {
+    KernelSlotRecord {
+      valid: 1, chosen_block: lookup.chosen_block,
+      generation: lookup.generation + 1,
+      active_slot: lookup.active_slot,
+      preferred_slot: lookup.preferred_slot,
+      last_reset_reason: lookup.last_reset_reason,
+      attempt_count: lookup.attempt_count,
+      bootlimit: lookup.bootlimit,
+      slot_a_ready: 1 as u8,
+      slot_b_ready: lookup.slot_b_ready,
+      slot_a_len: actual_len as u32,
+      slot_b_len: lookup.slot_b_len,
+      slot_a_sha256: digest_arr,
+      slot_b_sha256: lookup.slot_b_sha256,
+    }
+  } else {
+    KernelSlotRecord {
+      valid: 1, chosen_block: lookup.chosen_block,
+      generation: lookup.generation + 1,
+      active_slot: lookup.active_slot,
+      preferred_slot: lookup.preferred_slot,
+      last_reset_reason: lookup.last_reset_reason,
+      attempt_count: lookup.attempt_count,
+      bootlimit: lookup.bootlimit,
+      slot_a_ready: lookup.slot_a_ready,
+      slot_b_ready: 1 as u8,
+      slot_a_len: lookup.slot_a_len,
+      slot_b_len: actual_len as u32,
+      slot_a_sha256: lookup.slot_a_sha256,
+      slot_b_sha256: digest_arr,
+    }
+  };
+  let wstatus2: i64 = kernelslot_write_record(ref new_rec, stale);
+  let _ = kernelupload_active_set(0 as u32);
+  if wstatus2 != 0 {
+    let _ = uart_puts("kernelupload: slot-state write-back failed\n");
+    return 0;
+  }
+  // 2026-10-23 (resumable chunked upload): this image is now fully
+  // committed and the slot marked ready -- any resumable-upload
+  // progress record for the SAME target slot has served its purpose
+  // and would otherwise linger as stale "in progress" state that a
+  // later, unrelated `resumebegin` might misread. Only clears when
+  // it actually matches this slot, so a commit for slot A never
+  // clobbers a genuinely-still-in-progress resumable upload for
+  // slot B (or vice versa).
+  let chunk_prog: KernelUploadChunkProgress = kernelupload_chunk_progress_lookup();
+  if (chunk_prog.valid == 1) && (chunk_prog.target_slot == target_slot) {
+    let _ = kernelupload_chunk_progress_clear();
+  }
+  let _ = uart_puts("ok, slot ");
+  let _ = uart_puts(if target_slot == (0 as u32) { "A" } else { "B" });
+  let _ = uart_puts(" verified and marked ready, ");
+  let _ = uart_put_i64(actual_len);
+  let _ = uart_puts(" bytes\n");
+  return 0;
+}
+
 fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
   if dharafs_user_get_uid() != (0 as u32) {
     let _ = uart_puts("kernelupload: permission denied (root only)\n");
@@ -44789,234 +45257,35 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     return 0;
   }
 
-  if shell_word_matches(line_buf, sub_start, sub_end, "commit") == 1 {
-    if kernelupload_active_get() == (0 as u32) {
-      let _ = uart_puts("kernelupload: nothing to commit (no chunks uploaded yet)\n");
-      return 0;
-    }
+  // 2026-11-26: the image's Ed25519 signature, in two 32-byte halves
+  // (the shell line buffer is 128 bytes -- one 128-hex-char line won't
+  // fit). See kernelsig_check_commit.
+  if (shell_word_matches(line_buf, sub_start, sub_end, "sig1") == 1) || (shell_word_matches(line_buf, sub_start, sub_end, "sig2") == 1) {
+    let half: i64 = if shell_word_matches(line_buf, sub_start, sub_end, "sig1") == 1 { 0 } else { 1 };
     if sub_end >= line_len {
-      let _ = uart_puts("usage: kernelupload commit <total_len_bytes> <sha256_hex>\n");
+      let _ = uart_puts("usage: kernelupload sig1|sig2 <64 hex chars>\n");
       return 0;
     }
-    let len_start: i64 = sub_end + 1;
-    let len_end: i64 = shell_find_space(line_buf, len_start, line_len);
-    if len_end >= line_len {
-      let _ = uart_puts("usage: kernelupload commit <total_len_bytes> <sha256_hex>\n");
+    let hs: i64 = sub_end + 1;
+    let he: i64 = shell_find_space(line_buf, hs, line_len);
+    if (he - hs) != 64 {
+      let _ = uart_puts("kernelupload: expected exactly 64 hex chars per signature half\n");
       return 0;
     }
-    let claimed_len: i64 = shell_parse_decimal(line_buf, len_start, len_end);
-    let actual_len: i64 = kernelupload_total_len_get() as i64;
-    if (claimed_len <= 0) || (claimed_len != actual_len) {
-      let _ = uart_puts("kernelupload: total_len mismatch or invalid (claimed ");
-      let _ = uart_put_i64(claimed_len);
-      let _ = uart_puts(", received ");
-      let _ = uart_put_i64(actual_len);
-      let _ = uart_puts(") -- not committing\n");
+    let tmp: mut ref i64 = kernelsig_msg_scratch_get();
+    if shell_parse_hex_bytes(line_buf, hs, he, tmp, 32) != 0 {
+      let _ = uart_puts("kernelupload: invalid signature hex\n");
       return 0;
     }
-    if claimed_len > kernelslot_size_bytes() {
-      let _ = uart_puts("kernelupload: total_len exceeds slot size, not committing\n");
-      let _ = kernelupload_active_set(0 as u32);
-      return 0;
-    }
-
-    let sha_start: i64 = len_end + 1;
-    let sha_end: i64 = shell_find_space(line_buf, sha_start, line_len);
-    if (sha_end - sha_start) != 64 {
-      let _ = uart_puts("kernelupload: expected a 64-char (32-byte) sha256 hex digest\n");
-      return 0;
-    }
-    let claimed_digest: mut ref i64 = kernelupload_chunk_decode_buf_get();
-    let hex_status: i64 = shell_parse_hex_bytes(line_buf, sha_start, sha_end, claimed_digest, 32);
-    if hex_status != 0 {
-      let _ = uart_puts("kernelupload: invalid sha256 hex\n");
-      return 0;
-    }
-
-    let target_slot: u32 = kernelupload_target_slot_get();
-    let base_block: i64 = if target_slot == (0 as u32) { kernelslot_a_base_block() } else { kernelslot_b_base_block() };
-    let block_buf: mut ref i64 = kernelupload_block_buf_get();
-    let ctx: Sha256Ctx = kernelupload_ctx_load();
-    let partial_bytes: i64 = actual_len % 512;
-
-    if partial_bytes != 0 {
-      let pad_i: i64 = partial_bytes;
-      while pad_i < 512 {
-        let _ = buf_write_byte(block_buf, pad_i as u32, 0 as u32);
-        pad_i = pad_i + 1;
-      }
-      let block_index: i64 = actual_len / 512;
-      let wstatus: i64 = sdhost_write_block(base_block + block_index, block_buf);
-      if wstatus != 0 {
-        let _ = uart_puts("kernelupload: final block SD write failed\n");
-        let _ = kernelupload_active_set(0 as u32);
-        return 0;
-      }
-      let pchunk1: [u8; 256] = zero256_bytes();
-      let pchunk2: [u8; 256] = zero256_bytes();
-      let pci: i64 = 0;
-      while pci < 256 {
-        pchunk1[pci] = buf_read_byte(block_buf, pci as u32) as u8;
-        pci = pci + 1;
-      }
-      let first_n: i64 = if partial_bytes < 256 { partial_bytes } else { 256 };
-      ctx = sha256_update(ref ctx, mut ref pchunk1, first_n);
-      if partial_bytes > 256 {
-        let pcj: i64 = 0;
-        while pcj < 256 {
-          pchunk2[pcj] = buf_read_byte(block_buf, (256 + pcj) as u32) as u8;
-          pcj = pcj + 1;
-        }
-        ctx = sha256_update(ref ctx, mut ref pchunk2, partial_bytes - 256);
-      }
-    }
-    let uploaded_digest: [u8; 32] = sha256_finalize(ref ctx);
-
-    let digest_cmp_buf: mut ref i64 = dharafs_sd_scratch_get();
-    let di: i64 = 0;
-    while di < 32 {
-      let _ = buf_write_byte(digest_cmp_buf, di as u32, uploaded_digest[di] as u32);
-      di = di + 1;
-    }
-    if sha256_bytes_equal(digest_cmp_buf, claimed_digest, 32) != 1 {
-      let _ = uart_puts("kernelupload: uploaded data does not match the claimed sha256 -- not committing\n");
-      let _ = kernelupload_active_set(0 as u32);
-      return 0;
-    }
-
-    // Readback verify: re-read every written block straight from SD
-    // and recompute SHA-256 over THAT, independent of the upload-time
-    // hash above -- catches a write-cycle fault the upload-time hash
-    // alone can't.
-    let readback_ctx: Sha256Ctx = sha256_init();
-    let nblocks: i64 = (actual_len + 511) / 512;
-    let rb: i64 = 0;
-    while rb < nblocks {
-      // BUG FOUND 2026-11-22 (real-HW investigation: upload succeeded,
-      // then "commit did not report success" with the board going
-      // silent and needing a full re-boot cycle to recover): this
-      // readback-verify loop re-reads every written SD block
-      // sequentially -- 5930 blocks for a 3MB kernel image -- with NO
-      // watchdog_kick() anywhere inside it, unlike every other
-      // long-running real-HW loop in this codebase (wifi scan/join,
-      // the upload's own receive loop, etc.). With a 15s watchdog
-      // timeout and thousands of sequential SD block reads, this
-      // reliably self-resets mid-commit on any upload of meaningful
-      // size, exactly matching the observed symptom. Same one-line
-      // fix as every other long real-HW loop.
-      if hardware_is_real_hw_get() == (1 as u32) {
-        let _ = watchdog_kick();
-      }
-      let rstatus: i64 = sdhost_read_block(base_block + rb, block_buf);
-      if rstatus != 0 {
-        let _ = uart_puts("kernelupload: readback failed, not committing\n");
-        let _ = kernelupload_active_set(0 as u32);
-        return 0;
-      }
-      let is_last: i64 = if (rb + 1) == nblocks { 1 } else { 0 };
-      let valid_in_block: i64 = if is_last == 1 { (if partial_bytes == 0 { 512 } else { partial_bytes }) } else { 512 };
-      let rchunk1: [u8; 256] = zero256_bytes();
-      let rchunk2: [u8; 256] = zero256_bytes();
-      let rci: i64 = 0;
-      while rci < 256 {
-        rchunk1[rci] = buf_read_byte(block_buf, rci as u32) as u8;
-        rci = rci + 1;
-      }
-      let rfirst_n: i64 = if valid_in_block < 256 { valid_in_block } else { 256 };
-      readback_ctx = sha256_update(ref readback_ctx, mut ref rchunk1, rfirst_n);
-      if valid_in_block > 256 {
-        let rcj: i64 = 0;
-        while rcj < 256 {
-          rchunk2[rcj] = buf_read_byte(block_buf, (256 + rcj) as u32) as u8;
-          rcj = rcj + 1;
-        }
-        readback_ctx = sha256_update(ref readback_ctx, mut ref rchunk2, valid_in_block - 256);
-      }
-      rb = rb + 1;
-    }
-    let readback_digest: [u8; 32] = sha256_finalize(ref readback_ctx);
-    let readback_cmp_buf: mut ref i64 = dharafs_sd_scratch_get();
-    let rdi: i64 = 0;
-    while rdi < 32 {
-      let _ = buf_write_byte(readback_cmp_buf, rdi as u32, readback_digest[rdi] as u32);
-      rdi = rdi + 1;
-    }
-    if sha256_bytes_equal(readback_cmp_buf, claimed_digest, 32) != 1 {
-      let _ = uart_puts("kernelupload: readback sha256 mismatch (write-cycle fault?) -- not committing\n");
-      let _ = kernelupload_active_set(0 as u32);
-      return 0;
-    }
-
-    let lookup: KernelSlotRecord = kernelslot_lookup();
-    if lookup.valid != 1 {
-      let _ = uart_puts("kernelupload: slot-state record vanished mid-commit (unexpected)\n");
-      let _ = kernelupload_active_set(0 as u32);
-      return 0;
-    }
-    let digest_arr: [u8; 32] = [0 as u8; 32];
-    let dgi: i64 = 0;
-    while dgi < 32 {
-      digest_arr[dgi] = buf_read_byte(claimed_digest, dgi as u32) as u8;
-      dgi = dgi + 1;
-    }
-    let stale: i64 = kernelslot_stale_block(ref lookup);
-    let new_rec: KernelSlotRecord = if target_slot == (0 as u32) {
-      KernelSlotRecord {
-        valid: 1, chosen_block: lookup.chosen_block,
-        generation: lookup.generation + 1,
-        active_slot: lookup.active_slot,
-        preferred_slot: lookup.preferred_slot,
-        last_reset_reason: lookup.last_reset_reason,
-        attempt_count: lookup.attempt_count,
-        bootlimit: lookup.bootlimit,
-        slot_a_ready: 1 as u8,
-        slot_b_ready: lookup.slot_b_ready,
-        slot_a_len: actual_len as u32,
-        slot_b_len: lookup.slot_b_len,
-        slot_a_sha256: digest_arr,
-        slot_b_sha256: lookup.slot_b_sha256,
-      }
-    } else {
-      KernelSlotRecord {
-        valid: 1, chosen_block: lookup.chosen_block,
-        generation: lookup.generation + 1,
-        active_slot: lookup.active_slot,
-        preferred_slot: lookup.preferred_slot,
-        last_reset_reason: lookup.last_reset_reason,
-        attempt_count: lookup.attempt_count,
-        bootlimit: lookup.bootlimit,
-        slot_a_ready: lookup.slot_a_ready,
-        slot_b_ready: 1 as u8,
-        slot_a_len: lookup.slot_a_len,
-        slot_b_len: actual_len as u32,
-        slot_a_sha256: lookup.slot_a_sha256,
-        slot_b_sha256: digest_arr,
-      }
-    };
-    let wstatus2: i64 = kernelslot_write_record(ref new_rec, stale);
-    let _ = kernelupload_active_set(0 as u32);
-    if wstatus2 != 0 {
-      let _ = uart_puts("kernelupload: slot-state write-back failed\n");
-      return 0;
-    }
-    // 2026-10-23 (resumable chunked upload): this image is now fully
-    // committed and the slot marked ready -- any resumable-upload
-    // progress record for the SAME target slot has served its purpose
-    // and would otherwise linger as stale "in progress" state that a
-    // later, unrelated `resumebegin` might misread. Only clears when
-    // it actually matches this slot, so a commit for slot A never
-    // clobbers a genuinely-still-in-progress resumable upload for
-    // slot B (or vice versa).
-    let chunk_prog: KernelUploadChunkProgress = kernelupload_chunk_progress_lookup();
-    if (chunk_prog.valid == 1) && (chunk_prog.target_slot == target_slot) {
-      let _ = kernelupload_chunk_progress_clear();
-    }
-    let _ = uart_puts("ok, slot ");
-    let _ = uart_puts(if target_slot == (0 as u32) { "A" } else { "B" });
-    let _ = uart_puts(" verified and marked ready, ");
-    let _ = uart_put_i64(actual_len);
-    let _ = uart_puts(" bytes\n");
+    let sig: mut ref i64 = kernelupload_sig_scratch_get();
+    let si: i64 = 0;
+    while si < 32 { let _ = buf_write_byte(sig, (half * 32 + si) as u32, buf_read_byte(tmp, si as u32)); si = si + 1; }
+    let _ = buf_write_byte(sig, (64 + half) as u32, 1 as u32);
+    let _ = uart_puts(if half == 0 { "ok, sig1 stored\n" } else { "ok, sig2 stored\n" });
     return 0;
+  }
+  if shell_word_matches(line_buf, sub_start, sub_end, "commit") == 1 {
+    return kernelupload_commit_cmd(line_buf, sub_end, line_len);
   }
 
   let _ = uart_puts("usage: kernelupload stream <len> | kernelupload commit <len> <sha256> | kernelupload resumebegin <len> <chunk_count> <sha256> | kernelupload resumechunk <idx> <len> | kernelupload resumeverify <idx> <sha256> | kernelupload resumestatus | kernelupload resumeabort | kernelupload abort\n");
@@ -47279,6 +47548,9 @@ fn shell_dispatch() -> i64 {
   }
   if shell_word_matches(line_buf, 0, cmd_end, "kernelslot") == 1 {
     return shell_dispatch_kernelslot(line_buf, cmd_end, line_len);
+  }
+  if shell_word_matches(line_buf, 0, cmd_end, "kernelsig") == 1 {
+    return shell_dispatch_kernelsig(line_buf, cmd_end, line_len);
   }
   if shell_word_matches(line_buf, 0, cmd_end, "critconfig") == 1 {
     return shell_dispatch_critconfig(line_buf, cmd_end, line_len);
@@ -63150,6 +63422,12 @@ fn kernel_main() -> i64 {
   let _ = wifi_link_tx_frame_scratch_set(dhruva_alloc_bytes(WIFI_LINK_FRAME_MAX));
   let _ = wifi_link_rx_frame_scratch_set(dhruva_alloc_bytes(WIFI_LINK_FRAME_MAX));
   let _ = wifi_link_rx_body_scratch_set(dhruva_alloc_bytes(WIFI_LINK_FRAME_MAX));
+  let ksig_buf: mut ref i64 = dhruva_alloc_bytes(KERNELSIG_PENDING_SIZE);
+  let ksi: i64 = 0;
+  while ksi < KERNELSIG_PENDING_SIZE { let _ = buf_write_byte(ksig_buf, ksi as u32, 0 as u32); ksi = ksi + 1; }
+  let _ = kernelupload_sig_scratch_set(ksig_buf);
+  let _ = kernelsig_pub_scratch_set(dhruva_alloc_bytes(64));
+  let _ = kernelsig_msg_scratch_set(dhruva_alloc_bytes(64));
   let _ = wifi_join_bssid_scratch_set(dhruva_alloc_bytes(6));
   let _ = wifi_scan_tx_scratch_set(dhruva_alloc_bytes(64));
   let _ = wifi_scan_rx_scratch_set(dhruva_alloc_bytes(WIFI_RX_FRAME_MAX));

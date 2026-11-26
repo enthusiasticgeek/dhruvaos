@@ -2783,6 +2783,11 @@ wifi_stat_report_frame_count_get:
 ptr_to_u32:
     bx lr
 
+/* Flush the literal pool for every accessor above, before the
+ * 2026-11-26 additions below -- otherwise the file outgrows ldr=
+ * literal reach (4 KB) and the assembler rejects the early ones. */
+.ltorg
+
 /* 2026-11-26: WiFi STA data path (netif backend kind 3) -- persistent,
  * boot-allocated scratch (never-free heap pattern). See wifi_link_*
  * in kernel/kernel_main.vani. */
@@ -2923,5 +2928,56 @@ wifi_link_key_scratch_set:
 .global wifi_link_key_scratch_get
 wifi_link_key_scratch_get:
     ldr r0, =wifi_link_key_addr
+    ldr r0, [r0]
+    bx lr
+
+/* 2026-11-26: kernel image signing (kernelsig / kernelupload sig1|sig2). */
+.section ".bss"
+.align 4
+kernelupload_sig_addr:
+    .word 0             /* 68 bytes -- pending kernel-image Ed25519 signature (64) + 2 half-received flags (kernelupload sig1/sig2). */
+kernelsig_pub_addr:
+    .word 0             /* 64 bytes -- trusted kernel-signing public key read back from the critical config store (32 used). */
+kernelsig_msg_addr:
+    .word 0             /* 64 bytes -- kernel-signature message M build buffer (52 used). */
+
+.section ".text"
+
+.global kernelupload_sig_scratch_set
+kernelupload_sig_scratch_set:
+    ldr r1, =kernelupload_sig_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global kernelupload_sig_scratch_get
+kernelupload_sig_scratch_get:
+    ldr r0, =kernelupload_sig_addr
+    ldr r0, [r0]
+    bx lr
+
+.global kernelsig_pub_scratch_set
+kernelsig_pub_scratch_set:
+    ldr r1, =kernelsig_pub_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global kernelsig_pub_scratch_get
+kernelsig_pub_scratch_get:
+    ldr r0, =kernelsig_pub_addr
+    ldr r0, [r0]
+    bx lr
+
+.global kernelsig_msg_scratch_set
+kernelsig_msg_scratch_set:
+    ldr r1, =kernelsig_msg_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global kernelsig_msg_scratch_get
+kernelsig_msg_scratch_get:
+    ldr r0, =kernelsig_msg_addr
     ldr r0, [r0]
     bx lr

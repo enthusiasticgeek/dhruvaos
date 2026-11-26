@@ -90,6 +90,7 @@ ACK_LINE_RE = re.compile(rb"ACK ([0-9A-Fa-f]{8}) ")
 MEASURED_BYTES_PER_SEC = 3071.0
 
 UART_LOGGER_UNIT = "dhruva-uart-logger.service"
+LOGGER_DEVICE = "/dev/ttyUSB0"  # what dhruva-uart-logger.service reads
 
 
 def logger_is_active() -> bool:
@@ -386,6 +387,10 @@ def main() -> int:
     ap.add_argument("--commit-timeout", type=float, default=60, help="commit does a full SD readback+re-hash, give it real time")
     ap.add_argument("--ready-timeout", type=float, default=30, help="seconds to wait for the board to answer 'ready' at all")
     ap.add_argument("--log", default="/tmp/kernel_upload_full.log", help="path to write the raw captured serial log")
+    ap.add_argument("--sig", default=None,
+                    help="64-byte Ed25519 signature file from test/kernel_sign.py (default: <kernel_img>.sig if it "
+                         "exists). Sent as kernelupload sig1/sig2 + kernelsig authorize before commit; a board "
+                         "with a provisioned trusted key refuses to commit without it.")
     ap.add_argument("--window-size", type=int, default=ACK_INTERVAL_BYTES,
                      help="2026-10-23 (replaces the old fixed-delay --chunk-size/--chunk-delay pacing, which "
                           "assumed a bounded ~50ms SD-write worst case that a 13-year-old test card blew past at "
@@ -452,7 +457,10 @@ def main() -> int:
     # restart in `finally` so it's never left down across a failure/
     # exception either.
     stopped_logger = False
-    if logger_is_active():
+    # 2026-11-26: only when uploading over the logger's OWN device -- a
+    # QEMU /dev/pts/N run must never take down (or later restart) the
+    # real-HW logger, which could collide with a real-HW session.
+    if os.path.realpath(args.device) == os.path.realpath(LOGGER_DEVICE) and logger_is_active():
         print(f"stopping {UART_LOGGER_UNIT} for the duration of this upload...")
         subprocess.run(["systemctl", "--user", "stop", UART_LOGGER_UNIT], timeout=10)
         stopped_logger = True
@@ -545,6 +553,26 @@ def _attempt_upload(args, data: bytes, real_len: int, real_sha256: str) -> int:
         elapsed = time.time() - t0
         rate = real_len / elapsed if elapsed > 0 else 0
         print(f"[ok] got DONE after {elapsed:.1f}s ({rate:.0f} bytes/sec)")
+
+        sig_path = args.sig if args.sig else (args.kernel_img + ".sig" if os.path.exists(args.kernel_img + ".sig") else None)
+        if sig_path:
+            sig = open(sig_path, "rb").read()
+            if len(sig) != 64:
+                print(f"[FAIL] {sig_path} is {len(sig)} bytes, expected a 64-byte Ed25519 signature")
+                return 1
+            print(f"sending image signature from {sig_path}...")
+            if not session.step(f"kernelupload sig1 {sig[:32].hex()}", "ok, sig1 stored", timeout=10, attempts=2) or \
+               not session.step(f"kernelupload sig2 {sig[32:].hex()}", "ok, sig2 stored", timeout=10, attempts=2):
+                print(f"[FAIL] board did not accept the signature halves -- check {args.log}")
+                return 1
+            # Ed25519 verify on the ARM11 takes a few seconds.
+            if not session.step(f"kernelsig authorize {real_len} {real_sha256}", "authorized for commit",
+                                timeout=60, attempts=1):
+                print(f"[FAIL] board did not authorize the signature -- check {args.log} (wrong key? not provisioned?)")
+                return 1
+            print("[ok] signature verified by the board")
+        else:
+            print("no signature file -- committing unsigned (only accepted while the board has no trusted key)")
 
         print("committing (board re-reads every written block from SD and re-verifies -- may take a while)...")
         commit_needle = "verified and marked ready"
