@@ -9276,6 +9276,17 @@ fn sdhost_read_block(block_num: i64, buf: mut ref i64) -> i64 {
     if result == 3 {
       return 3;
     }
+    // 2026-11-26 (SD audit): ECC-uncorrectable (9) means the transfer
+    // itself succeeded (SD's own CRC16 protects the bus -- a bus error
+    // is result 3) and the bytes deterministically fail the stored
+    // parity. Resetting the controller, dropping the clock to 500 kHz
+    // and re-reading cannot change that outcome; it only cost three
+    // full card re-inits per block. Report it (same suspect/bad-block
+    // escalation as before) and return straight away.
+    if result == 9 {
+      let _ = dharafs_badblock_report_failure(block_num);
+      return 9;
+    }
     attempt = attempt + 1;
     if attempt < SD_MAX_ATTEMPTS {
       let backoff_hz: i64 = if attempt == 1 { SD_SPEED_BACKOFF_HZ } else { 0 };
@@ -9678,8 +9689,54 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
     // this path).
     return 3;
   }
+  // See sdhost_wait_card_ready: the write isn't done until the card
+  // leaves PRG. A timeout returns 2 (FSM stuck) so sdhost_write_block's
+  // existing reset-and-retry path handles it.
+  if sdhost_wait_card_ready(500000 as u32) != 0 {
+    return 2;
+  }
   return 0;
 }
+
+// 2026-11-26 (SD audit): after a write's data phase the card stays in
+// the PRG (programming) state, holding DAT0 busy, for up to 250 ms
+// (SDSC) / 500 ms (SDHC/SDXC) -- SD Physical Layer spec 4.6.2.2.
+// CMD16/CMD17/CMD24 are only legal in TRAN state, so a command issued
+// while the card is still programming gets no response: it fails with
+// CMD_TIME_OUT (SDHSTS=0x40) and surfaces as a "wedge" that only a
+// controller reset + retry hides. Neither reference driver leaves this
+// to chance -- Linux's mmc core polls CMD13 after every write
+// (card_busy_detect: until READY_FOR_DATA && state == TRAN, since
+// bcm2835 has no hardware busy detect for data writes), and U-Boot's
+// mmc_write_blocks is followed by mmc_poll_for_busy (the same CMD13
+// loop, bcm2835_sdhost having no wait_dat0 op). This driver never did:
+// the only CMD13 anywhere was in the failure-diagnostic branch. Same
+// loop here. CMD13 is legal in PRG state, so a transient CMD13
+// failure is retried until the deadline rather than treated as fatal.
+// Returns 0 once the card is ready, 1 on timeout.
+fn sdhost_wait_card_ready(timeout_us: u32) -> i64 {
+  let t0: u32 = sd_mmio_read_u32(TIMER_CLO);
+  let iter: i64 = 0;
+  while wrapping_sub(sd_mmio_read_u32(TIMER_CLO), t0) < timeout_us {
+    if (hardware_is_real_hw_get() == (1 as u32)) && ((iter & 63) == 0) {
+      let _ = watchdog_kick();
+    }
+    let st: u32 = sdhost_cmd(13 as u32, sd_state_get_rca() as u32);
+    if (sdhost_cmd_timed_out(st) == 0) && (sdhost_cmd_failed(st) == 0) {
+      let r1: u32 = sd_mmio_read_u32(SDRSP0);
+      let state: u32 = (r1 >> (9 as u32)) & (0xF as u32);
+      if ((r1 & (0x100 as u32)) != (0 as u32)) && (state == (4 as u32)) {
+        return 0;
+      }
+    }
+    iter = iter + 1;
+  }
+  let _ = uart_puts("SD DIAG: card never returned to TRAN/READY_FOR_DATA after write (CMD13 R1=0x");
+  let _ = uart_put_hex32(sd_mmio_read_u32(SDRSP0));
+  let _ = uart_puts(")\n");
+  return 1;
+}
+
 
 fn sdhost_write_block(block_num: i64, buf: mut ref i64) -> i64 {
   // 2026-10-31: captured ONCE, right here, before any early-return
@@ -9953,9 +10010,16 @@ fn dharafs_ecc_cache_ensure(sector_num: i64) -> i64 {
 // trusted. Uses sdhost_write_block_once directly, same cycle-avoidance
 // reasoning as dharafs_ecc_cache_ensure above.
 fn dharafs_ecc_cache_flush() -> i64 {
+  // 2026-11-26 (SD audit): only mark clean once the parity write really
+  // succeeded -- a failed write used to be dropped silently (dirty
+  // cleared regardless), leaving the on-card parity stale. Returns 0
+  // on success / nothing to do, the write's error otherwise.
   let cur: u32 = dharafs_ecc_cache_get_sector_num();
   if (cur != (0 as u32)) && (dharafs_ecc_cache_get_dirty() == (1 as u32)) {
-    let _ = sdhost_write_block_once(cur as i64, dharafs_ecc_cache_buf_get());
+    let wst: i64 = sdhost_write_block_once(cur as i64, dharafs_ecc_cache_buf_get());
+    if wst != 0 {
+      return wst;
+    }
     let _ = dharafs_ecc_cache_set_dirty(0 as u32);
   }
   return 0;
@@ -9995,7 +10059,7 @@ fn dharafs_ecc_protect_on_write(block_num: i64, buf: mut ref i64, skip_protect: 
     let off: i64 = dharafs_ecc_table_offset_for(block_num);
     let _ = buf_write_u32_be(cache_buf, off as u32, 0 as u32);
     let _ = dharafs_ecc_cache_set_dirty(1 as u32);
-    return 0;
+    return dharafs_ecc_cache_flush();
   }
   let plain: [u8; 512] = [0 as u8; 512];
   let i: i64 = 0;
@@ -10022,7 +10086,24 @@ fn dharafs_ecc_protect_on_write(block_num: i64, buf: mut ref i64, skip_protect: 
     pi = pi + 1;
   }
   let _ = dharafs_ecc_cache_set_dirty(1 as u32);
-  return 0;
+  // BUG FIXED 2026-11-26 (SD audit): write-through, not write-back.
+  // The parity table used to be a write-back cache flushed only on
+  // compaction, `shutdown` and `reboot`. Any other reset after an
+  // ordinary DharaFS write (watchdog, crash/abort, power loss) left the
+  // card holding NEW data with OLD parity for every block written since
+  // the last flush. Those blocks then decode as UNCORRECTABLE on every
+  // read even though their bytes are intact; sdhost_read_block treated
+  // that as a wedge (3 controller re-inits each) and
+  // dharafs_badblock_report_failure escalated the deterministic repeat
+  // to a permanent bad-block mark -- losing intact records. Seen live:
+  // contiguous runs of uncorrectable blocks at the log tail after an
+  // unclean boot (0x1D3C-0x1D3F, 0x1D67-0x1D71, each failing exactly
+  // once per retry). Writing the parity sector right after the data
+  // block shrinks the stale window from "everything since the last
+  // flush" to the single in-flight block, which an append-only log's
+  // recovery already treats as torn. Cost: one extra SD write per
+  // protected block write.
+  return dharafs_ecc_cache_flush();
 }
 
 // Verifies this block against its stored ECC parity, correcting it in
