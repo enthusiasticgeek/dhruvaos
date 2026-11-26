@@ -931,7 +931,7 @@ wifi_join_ssid_scratch_addr:
 wifi_join_pmk_scratch_addr:
     .word 0             /* 32 bytes -- wifi_real_join's own derived PMK. */
 wifi_join_ctx_scratch_addr:
-    .word 0             /* 169 bytes (WPA2_JOIN_CTX_SIZE) -- wifi_real_
+    .word 0             /* WPA2_JOIN_CTX_SIZE bytes -- wifi_real_
                          * join's own WPA2 join-state context. */
 wifi_join_preq_scratch_addr:
     .word 0             /* 64 bytes -- wifi_real_join's own built Probe
@@ -947,16 +947,18 @@ wifi_join_mgmt_scratch_addr:
     .word 0             /* 90 bytes -- wifi_real_join's own built mgmt
                          * (Auth/Assoc Request) frame. */
 wifi_join_eapol_rx_scratch_addr:
-    .word 0             /* 140 bytes -- wifi_real_join's own copy of a
-                         * received EAPOL frame's payload. */
+    .word 0             /* DATA_FRAME_EAPOL_MAX_LEN (224) bytes --
+                         * wifi_real_join's own copy of a received
+                         * EAPOL frame's payload. */
 wifi_join_eapol_tx_scratch_addr:
-    .word 0             /* 99 bytes -- wifi_real_join's own built EAPOL
-                         * response (Message 2/4). */
+    .word 0             /* WPA2_JOIN_MSG2_LEN (121) bytes -- wifi_real_
+                         * join's own built EAPOL response (Message 2
+                         * with RSNE Key Data = 121, Message 4 = 99). */
 wifi_join_gtk_scratch_addr:
     .word 0             /* 32 bytes -- wifi_real_join's own decrypted GTK
                          * output. */
 wifi_join_wrapped_scratch_addr:
-    .word 0             /* 140 bytes -- wifi_real_join's own built,
+    .word 0             /* 256 bytes -- wifi_real_join's own built,
                          * fully-wrapped outgoing EAPOL data frame. */
 wifi_join_bssid_scratch_addr:
     .word 0             /* 6 bytes -- wifi_real_join's own copy of the

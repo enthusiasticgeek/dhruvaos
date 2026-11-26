@@ -51524,6 +51524,11 @@ fn aes_key_unwrap_heap(kek: mut ref i64, buf: mut ref i64, buf_off: i64, ciphert
   let kek_arr: [u8; 16] = zero16_bytes();
   let i: i64 = 0;
   while i < 16 { kek_arr[i] = buf_read_byte(kek, i as u32) as u8; i = i + 1; }
+  // 2026-11-26: bound the copy into the fixed 72-byte array -- a real
+  // AP's Message 3 Key Data length is attacker/AP-controlled (e.g. an
+  // RSNE + GTK + IGTK KDE wraps to 88 bytes) and previously overran
+  // ct_arr. aes_key_unwrap itself rejects > AES_KW_MAX_BLOCKS anyway.
+  if (ciphertext_len < 24) || (ciphertext_len > 72) { return 0 - 1; }
   let ct_arr: [u8; 72] = zero72_bytes();
   i = 0;
   while i < ciphertext_len { ct_arr[i] = buf_read_byte(buf, (buf_off + i) as u32) as u8; i = i + 1; }
@@ -52622,12 +52627,31 @@ fn wpa_replay_counter_greater(new_buf: mut ref i64, new_off: i64, old_buf: mut r
 }
 
 // Processes Message 1 (extracts ANonce + replay counter, derives the
-// PTK, builds Message 2 with the caller-supplied SNonce). `msg2_out`
-// must be a 99-byte buffer (no Key Data -- see this section's own
-// header comment on why). Returns WPA_HS_OK, or WPA_HS_ERR_PARSE if
-// the frame doesn't parse as a valid, unauthenticated (no-MIC) EAPOL-Key
-// frame with the ACK bit set.
-fn wpa_hs_process_msg1(msg1_buf: mut ref i64, msg1_len: i64, snonce: mut ref i64, msg2_out: mut ref i64) -> i64 {
+// PTK, builds Message 2 with the caller-supplied SNonce).
+//
+// BUG FIXED 2026-11-26 (real-HW root cause of "AP never sends Message
+// 3, keeps resending Message 1"): Message 2 was built with an EMPTY
+// Key Data field (fixed 99-byte frame). IEEE Std 802.11-2016
+// 12.7.6.3 requires Message 2's Key Data to carry the STA's own RSNE,
+// byte-for-byte identical to the one in its (Re)Association Request;
+// the Authenticator compares the two (hostapd: wpa_compare_rsn_ie,
+// "WPA IE from (Re)AssocReq did not match with msg 2/4") as downgrade
+// protection and discards Message 2 on mismatch/absence -- AFTER the
+// MIC already verified, which is why every independent MIC check of
+// our Message 2 passed while the AP still ignored it. The caller now
+// passes the exact RSNE bytes it put in the Association Request
+// (`ie_buf[ie_off .. ie_off + ie_len)`), and they are appended as Key
+// Data before the MIC is computed over the whole frame.
+//
+// Key Length is 0 in Message 2 (802.11-2016 12.7.6.3; wpa_supplicant's
+// wpa_supplicant_send_2_of_4 writes 0 for RSN) -- previously 16, the
+// value only Message 1/3 carry.
+//
+// `msg2_out` must hold EAPOL_KEY_DATA_OFF + ie_len bytes; the built
+// frame's total length is exactly that. Returns WPA_HS_OK, or
+// WPA_HS_ERR_PARSE if the frame doesn't parse as a valid,
+// unauthenticated (no-MIC) EAPOL-Key frame with the ACK bit set.
+fn wpa_hs_process_msg1(msg1_buf: mut ref i64, msg1_len: i64, snonce: mut ref i64, ie_buf: mut ref i64, ie_off: i64, ie_len: i64, msg2_out: mut ref i64) -> i64 {
   let parsed: EapolKeyParsed = eapol_key_parse(msg1_buf, msg1_len);
   if parsed.ok != 0 { return WPA_HS_ERR_PARSE; }
   if (parsed.key_info & EAPOL_KEY_INFO_MIC) != 0 { return WPA_HS_ERR_PARSE; }
@@ -52650,12 +52674,14 @@ fn wpa_hs_process_msg1(msg1_buf: mut ref i64, msg1_len: i64, snonce: mut ref i64
   let _ = wpa_ptk_derive(pmk, 32, aa, sa, anonce, snonce, kck, kek, tk);
 
   let key_info2: i64 = EAPOL_KEY_INFO_DESC_V2_HMAC_SHA1_AES | EAPOL_KEY_INFO_KEY_TYPE_PAIRWISE | EAPOL_KEY_INFO_MIC;
-  let _ = eapol_key_build_header(msg2_out, 2, key_info2, 16, 0);
+  let _ = eapol_key_build_header(msg2_out, 2, key_info2, 0, ie_len);
   i = 0;
   while i < 8 { let _ = buf_write_byte(msg2_out, (EAPOL_KEY_REPLAY_OFF + i) as u32, buf_read_byte(rc, i as u32)); i = i + 1; }
   i = 0;
   while i < 32 { let _ = buf_write_byte(msg2_out, (EAPOL_KEY_NONCE_OFF + i) as u32, buf_read_byte(snonce, i as u32)); i = i + 1; }
-  let _ = eapol_key_set_mic(msg2_out, 99, kck, 16);
+  i = 0;
+  while i < ie_len { let _ = buf_write_byte(msg2_out, (EAPOL_KEY_DATA_OFF + i) as u32, buf_read_byte(ie_buf, (ie_off + i) as u32)); i = i + 1; }
+  let _ = eapol_key_set_mic(msg2_out, EAPOL_KEY_DATA_OFF + ie_len, kck, 16);
   return WPA_HS_OK;
 }
 
@@ -52672,23 +52698,45 @@ fn wpa_hs_process_msg1(msg1_buf: mut ref i64, msg1_len: i64, snonce: mut ref i64
 // this increment's own testable slice. Returns the extracted GTK's
 // length (>= 0) on success, or 0 - 1 if the KDE doesn't parse as
 // expected.
+//
+// BUG FIXED 2026-11-26: the "EXACTLY one KDE" assumption above does
+// not hold for any real AP -- 802.11-2016 12.7.6.4 has Message 3's Key
+// Data carry the AP's own RSNE FIRST, then the GTK KDE (then optional
+// IGTK/other KDEs, then 0xdd-00 padding when wrapped). The old version
+// rejected every real Message 3 because byte 0 was 0x30, not 0xdd.
+// Now walks the element list (same TLV walk as wpa_supplicant's
+// wpa_parse_kde_ies): skips non-GTK elements, stops at the 0xdd/len-0
+// padding marker, and bounds-checks every element against
+// key_data_len. GTK is capped at 32 bytes (gtk_out's own size, and the
+// largest GTK any cipher this project supports uses).
 fn wpa_gtk_kde_extract(buf: mut ref i64, key_data_off: i64, key_data_len: i64, gtk_out: mut ref i64) -> i64 {
-  if key_data_len < 8 { return 0 - 1; }
-  if buf_read_byte(buf, key_data_off as u32) != (0xdd as u32) { return 0 - 1; }
-  let kde_len: i64 = buf_read_byte(buf, (key_data_off + 1) as u32) as i64;
-  if (2 + kde_len) > key_data_len { return 0 - 1; }
-  if buf_read_byte(buf, (key_data_off + 2) as u32) != (0x00 as u32) { return 0 - 1; }
-  if buf_read_byte(buf, (key_data_off + 3) as u32) != (0x0f as u32) { return 0 - 1; }
-  if buf_read_byte(buf, (key_data_off + 4) as u32) != (0xac as u32) { return 0 - 1; }
-  if buf_read_byte(buf, (key_data_off + 5) as u32) != (0x01 as u32) { return 0 - 1; }
-  let gtk_len: i64 = kde_len - 6;
-  if gtk_len < 1 { return 0 - 1; }
-  let i: i64 = 0;
-  while i < gtk_len {
-    let _ = buf_write_byte(gtk_out, i as u32, buf_read_byte(buf, (key_data_off + 8 + i) as u32));
-    i = i + 1;
+  let pos: i64 = 0;
+  while (pos + 2) <= key_data_len {
+    let eid: i64 = buf_read_byte(buf, (key_data_off + pos) as u32) as i64;
+    let elen: i64 = buf_read_byte(buf, (key_data_off + pos + 1) as u32) as i64;
+    if (eid == 0xdd) && (elen == 0) { return 0 - 1; }
+    if (pos + 2 + elen) > key_data_len { return 0 - 1; }
+    if (eid == 0xdd) && (elen >= 6) {
+      let o: i64 = key_data_off + pos + 2;
+      let is_gtk: i64 = 1;
+      if buf_read_byte(buf, o as u32) != (0x00 as u32) { is_gtk = 0; }
+      if buf_read_byte(buf, (o + 1) as u32) != (0x0f as u32) { is_gtk = 0; }
+      if buf_read_byte(buf, (o + 2) as u32) != (0xac as u32) { is_gtk = 0; }
+      if buf_read_byte(buf, (o + 3) as u32) != (0x01 as u32) { is_gtk = 0; }
+      if is_gtk == 1 {
+        let gtk_len: i64 = elen - 6;
+        if (gtk_len < 1) || (gtk_len > 32) { return 0 - 1; }
+        let i: i64 = 0;
+        while i < gtk_len {
+          let _ = buf_write_byte(gtk_out, i as u32, buf_read_byte(buf, (o + 6 + i) as u32));
+          i = i + 1;
+        }
+        return gtk_len;
+      }
+    }
+    pos = pos + 2 + elen;
   }
-  return gtk_len;
+  return 0 - 1;
 }
 
 // Processes Message 3: verifies its MIC (using the KCK derived from
@@ -52738,7 +52786,9 @@ fn wpa_hs_process_msg3(msg3_buf: mut ref i64, msg3_len: i64, msg4_out: mut ref i
   }
 
   let key_info4: i64 = EAPOL_KEY_INFO_DESC_V2_HMAC_SHA1_AES | EAPOL_KEY_INFO_KEY_TYPE_PAIRWISE | EAPOL_KEY_INFO_MIC | EAPOL_KEY_INFO_SECURE;
-  let _ = eapol_key_build_header(msg4_out, 2, key_info4, 16, 0);
+  // Key Length 0 in Message 4 (802.11-2016 12.7.6.5), same fix as
+  // Message 2 in wpa_hs_process_msg1 -- 16 is only ever Message 1/3's.
+  let _ = eapol_key_build_header(msg4_out, 2, key_info4, 0, 0);
   i = 0;
   while i < 8 { let _ = buf_write_byte(msg4_out, (EAPOL_KEY_REPLAY_OFF + i) as u32, buf_read_byte(rc, i as u32)); i = i + 1; }
   let _ = eapol_key_set_mic(msg4_out, 99, kck, 16);
@@ -52802,13 +52852,31 @@ fn wpa_handshake_self_test() -> i64 {
   let ni1: i64 = 0;
   while ni1 < 32 { let _ = buf_write_byte(msg1, (EAPOL_KEY_NONCE_OFF + ni1) as u32, buf_read_byte(anonce, ni1 as u32)); ni1 = ni1 + 1; }
 
-  let msg2: mut ref i64 = dhruva_alloc_bytes(99);
-  if wpa_hs_process_msg1(msg1, 99, snonce, msg2) != 0 { ok = 0; }
+  // Message 2 now carries the STA's own RSNE (the exact 22 bytes
+  // rsn_ie_build_wpa2_psk_ccmp produces, as sent in the Association
+  // Request) as Key Data, and Key Length 0. Expected MIC recomputed
+  // 2026-11-26 by an independent Python hmac/hashlib PRF-384 + HMAC-
+  // SHA1 replay of this frame layout -- that same script first
+  // reproduced all three PREVIOUS known-answer MICs of this test
+  // (0x1f7ecce5..., 0x0a10edce..., 0x8f1b49ae...) exactly, before
+  // being trusted for the new values.
+  let rsn_fixed: [u8; 22] = [0 as u8; 22];
+  let _ = rsn_ie_build_wpa2_psk_ccmp(mut ref rsn_fixed);
+  let rsn_heap: mut ref i64 = dhruva_alloc_bytes(22);
+  let rhi: i64 = 0;
+  while rhi < 22 { let _ = buf_write_byte(rsn_heap, rhi as u32, rsn_fixed[rhi] as u32); rhi = rhi + 1; }
+  let msg2: mut ref i64 = dhruva_alloc_bytes(EAPOL_KEY_DATA_OFF + 22);
+  if wpa_hs_process_msg1(msg1, 99, snonce, rsn_heap, 0, 22, msg2) != 0 { ok = 0; }
+  // Key Data really is the RSNE, and the header lengths agree with it.
+  if (buf_read_byte(msg2, (EAPOL_KEY_DATALEN_OFF + 1) as u32) as i64) != 22 { ok = 0; }
+  if (buf_read_byte(msg2, 3 as u32) as i64) != (EAPOL_KEY_FIXED_BODY_LEN + 22) { ok = 0; }
+  if (buf_read_byte(msg2, EAPOL_KEY_DATA_OFF as u32) as i64) != 0x30 { ok = 0; }
+  if (buf_read_byte(msg2, (EAPOL_KEY_LENGTH_OFF + 1) as u32) as i64) != 0 { ok = 0; }
 
   let exp_msg2_mic: mut ref i64 = dhruva_alloc_bytes(16);
   let em2: [u8; 16] = [
-    0x1f as u8, 0x7e as u8, 0xcc as u8, 0xe5 as u8, 0xa6 as u8, 0xa5 as u8, 0xc1 as u8, 0xe6 as u8,
-    0x0f as u8, 0xd0 as u8, 0x84 as u8, 0x7b as u8, 0xf5 as u8, 0x9e as u8, 0x92 as u8, 0x68 as u8
+    0x68 as u8, 0x87 as u8, 0x87 as u8, 0xe5 as u8, 0x19 as u8, 0xa7 as u8, 0x9f as u8, 0x72 as u8,
+    0x30 as u8, 0xda as u8, 0xc6 as u8, 0x4e as u8, 0x7f as u8, 0x72 as u8, 0xe1 as u8, 0x55 as u8
   ];
   let em2i: i64 = 0;
   while em2i < 16 { let _ = buf_write_byte(exp_msg2_mic, em2i as u32, em2[em2i] as u32); em2i = em2i + 1; }
@@ -52848,8 +52916,8 @@ fn wpa_handshake_self_test() -> i64 {
 
   let exp_msg4_mic: mut ref i64 = dhruva_alloc_bytes(16);
   let em4: [u8; 16] = [
-    0x0a as u8, 0x10 as u8, 0xed as u8, 0xce as u8, 0x11 as u8, 0xc9 as u8, 0x70 as u8, 0xa1 as u8,
-    0xef as u8, 0x90 as u8, 0x45 as u8, 0x54 as u8, 0x70 as u8, 0xa2 as u8, 0x6c as u8, 0x25 as u8
+    0x33 as u8, 0x2e as u8, 0x8d as u8, 0x61 as u8, 0x9f as u8, 0xf6 as u8, 0x5c as u8, 0xfd as u8,
+    0xea as u8, 0x05 as u8, 0x3b as u8, 0x66 as u8, 0x44 as u8, 0x79 as u8, 0x54 as u8, 0x9d as u8
   ];
   let em4i: i64 = 0;
   while em4i < 16 { let _ = buf_write_byte(exp_msg4_mic, em4i as u32, em4[em4i] as u32); em4i = em4i + 1; }
@@ -52927,8 +52995,8 @@ fn wpa_handshake_self_test() -> i64 {
 
   let exp_msg4_enc_mic: mut ref i64 = dhruva_alloc_bytes(16);
   let em4e: [u8; 16] = [
-    0x8f as u8, 0x1b as u8, 0x49 as u8, 0xae as u8, 0xc6 as u8, 0xde as u8, 0x46 as u8, 0x83 as u8,
-    0xc1 as u8, 0xe0 as u8, 0x5e as u8, 0x87 as u8, 0x97 as u8, 0x6a as u8, 0x9b as u8, 0xc6 as u8
+    0xbb as u8, 0x29 as u8, 0xef as u8, 0x87 as u8, 0x72 as u8, 0x55 as u8, 0x79 as u8, 0xcb as u8,
+    0x11 as u8, 0x67 as u8, 0xb3 as u8, 0x29 as u8, 0x0d as u8, 0x2a as u8, 0x17 as u8, 0xc4 as u8
   ];
   let em4ei: i64 = 0;
   while em4ei < 16 { let _ = buf_write_byte(exp_msg4_enc_mic, em4ei as u32, em4e[em4ei] as u32); em4ei = em4ei + 1; }
@@ -52954,7 +53022,7 @@ fn wpa_handshake_self_test() -> i64 {
   let gtk_bad_kd: mut ref i64 = dhruva_alloc_bytes(32);
   if wpa_hs_process_msg3(msg3_bad_kd, 99 + wrapped_len, msg4_bad_kd, gtk_bad_kd) != WPA_HS_ERR_KEY_UNWRAP { ok = 0; }
 
-  let _ = uart_puts("CRYPTO: WPA2 4-way handshake state machine (Msg1->Msg2, Msg3->Msg4, GTK extraction incl. AES key-unwrap) vs an independently-computed reference + tamper/unwrap-integrity detection -- Msg2 own RSN IE and nonce generation remain separately scoped");
+  let _ = uart_puts("CRYPTO: WPA2 4-way handshake state machine (Msg1->Msg2 incl. STA RSNE Key Data, Msg3->Msg4, GTK extraction incl. AES key-unwrap) vs an independently-computed reference + tamper/unwrap-integrity detection");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -53386,35 +53454,39 @@ fn ieee80211_ap_boot_self_test() -> i64 {
 // association is inherently single-instance on this hardware, so
 // either style would work, but this one needed no new boot/*_state.S
 // file or build.sh change at all).
-const WPA2_JOIN_CTX_SIZE: i64 = 188;
+const WPA2_JOIN_CTX_SIZE: i64 = 89;
 const WPA2_JOIN_STATE_OFF: i64 = 0;
 const WPA2_JOIN_SSID_LEN_OFF: i64 = 1;
 const WPA2_JOIN_ASSOC_ID_OFF: i64 = 2;   // 2 bytes
 const WPA2_JOIN_BSSID_OFF: i64 = 4;      // 6 bytes
 const WPA2_JOIN_OWN_MAC_OFF: i64 = 10;   // 6 bytes
 const WPA2_JOIN_SSID_OFF: i64 = 16;      // 32 bytes
+// The exact RSNE sent in the Association Request. Also Message 2's
+// own Key Data (802.11-2016 12.7.6.3 requires the two to match byte
+// for byte) -- wpa2_join_step_eapol reads it from here.
 const WPA2_JOIN_RSN_OFF: i64 = 48;       // 22 bytes
-// Caches the already-built Message 2 (round 2026-10-04, found via a
-// fork's full wpa_supplicant/wpa.c trace): a lost Message 2 makes the
-// AP legitimately retransmit Message 1 instead of ever reaching
-// Message 3 -- real wpa_supplicant resends the SAME cached Message 2
-// (not a freshly recomputed one, since the PTK already derived from
-// the first SNonce must stay consistent) rather than treating that
-// retransmission as a handshake failure. 99 bytes, matching Message
-// 2's own fixed tx_len everywhere else in this file.
-const WPA2_JOIN_MSG2_CACHE_OFF: i64 = 70; // 99 bytes
+const WPA2_JOIN_RSN_LEN: i64 = 22;
+// Message 2's total length: fixed EAPOL-Key frame + the RSNE Key Data.
+const WPA2_JOIN_MSG2_LEN: i64 = 121;     // EAPOL_KEY_DATA_OFF (99) + WPA2_JOIN_RSN_LEN
+// Message 4's total length (no Key Data).
+const WPA2_JOIN_MSG4_LEN: i64 = 99;
+// (2026-11-26: the former 99-byte WPA2_JOIN_MSG2_CACHE_OFF field at
+// offset 70 is gone -- a retransmitted Message 1 now rebuilds Message 2
+// with the NEW replay counter instead of resending cached bytes; see
+// wpa2_join_step_eapol's WAIT_EAPOL_MSG3 branch. Later fields shifted
+// down accordingly.)
 // AP's own Capability Information from its Probe Response, persisted
 // here (round 2026-11-22) so assoc_request_build can echo its Short
 // Preamble/Short Slot Time bits back instead of hardcoding them -- see
 // that function's own header comment for why.
-const WPA2_JOIN_AP_CAPINFO_OFF: i64 = 169; // 2 bytes
+const WPA2_JOIN_AP_CAPINFO_OFF: i64 = 70; // 2 bytes
 // The AP's own raw Supported Rates (+ Extended Supported Rates)
 // bytes, persisted the same way and for the same reason as
 // WPA2_JOIN_AP_CAPINFO_OFF -- assoc_request_build needs the AP's real
 // advertised rate set to compute the joint rate list, not a hardcoded
 // one (see that function's own header comment).
-const WPA2_JOIN_AP_RATES_LEN_OFF: i64 = 171; // 1 byte
-const WPA2_JOIN_AP_RATES_OFF: i64 = 172;     // 16 bytes
+const WPA2_JOIN_AP_RATES_LEN_OFF: i64 = 72; // 1 byte
+const WPA2_JOIN_AP_RATES_OFF: i64 = 73;     // 16 bytes
 
 const WPA2_JOIN_IDLE: i64 = 0;
 const WPA2_JOIN_WAIT_PROBE_RESP: i64 = 1;
@@ -53818,38 +53890,47 @@ fn wpa2_join_step_eapol(ctx: mut ref i64, rx_buf: mut ref i64, rx_len: i64, pmk:
     let _ = wpa_hs_init(pmk, bssid_h, own_mac_h);
     let snonce: mut ref i64 = wpa2_eapol_snonce_scratch_get();
     let _ = wpa_nonce_generate_heap(snonce);
-    if wpa_hs_process_msg1(rx_buf, rx_len, snonce, tx_out) != WPA_HS_OK {
+    // Message 2's Key Data = the exact RSNE this ctx sent in the
+    // Association Request (see wpa_hs_process_msg1's header comment).
+    if wpa_hs_process_msg1(rx_buf, rx_len, snonce, ctx, WPA2_JOIN_RSN_OFF, WPA2_JOIN_RSN_LEN, tx_out) != WPA_HS_OK {
       let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_FAILED as u32);
       return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
     }
-    let ci: i64 = 0;
-    while ci < 99 {
-      let _ = buf_write_byte(ctx, (WPA2_JOIN_MSG2_CACHE_OFF + ci) as u32, buf_read_byte(tx_out, ci as u32));
-      ci = ci + 1;
-    }
     let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_WAIT_EAPOL_MSG3 as u32);
-    return Wpa2JoinResult { state: WPA2_JOIN_WAIT_EAPOL_MSG3, tx_len: 99, done: 0, failed: 0 };
+    return Wpa2JoinResult { state: WPA2_JOIN_WAIT_EAPOL_MSG3, tx_len: WPA2_JOIN_MSG2_LEN, done: 0, failed: 0 };
   }
 
   if state == WPA2_JOIN_WAIT_EAPOL_MSG3 {
     // BUG (found via a fork's full wpa_supplicant/wpa.c trace,
     // 2026-10-04): this state previously assumed the next EAPOL-Key
-    // frame could only be a real Message 3, so a lost Message 2 (an
-    // entirely ordinary RF event -- it's the reason Message 1's own
-    // retry timer exists at all) made the AP's legitimate Message-1
-    // retransmission permanently fail the whole join. Classify the
-    // frame first: a retransmitted Message 1 has no MIC bit set
-    // (Message 3 always does) -- resend the cached Message 2 and keep
-    // waiting, exactly like real wpa_supplicant's wpa_sm_rx_eapol,
-    // instead of treating it as fatal.
+    // frame could only be a real Message 3, so a lost Message 2 made
+    // the AP's legitimate Message-1 retransmission permanently fail
+    // the whole join. A retransmitted Message 1 has no MIC bit set
+    // (Message 3 always does).
+    //
+    // BUG FIXED 2026-11-26: the 2026-10-04 fix answered a
+    // retransmitted Message 1 by resending CACHED Message 2 bytes --
+    // which echo the FIRST Message 1's replay counter. An AP increments
+    // the replay counter on every EAPOL-level retransmission (hostapd
+    // __wpa_send_eapol: inc_byte_array(sm->key_replay...)), and many
+    // AP implementations only accept a Message 2 echoing the LATEST
+    // one. Real wpa_supplicant (wpa_supplicant_process_1_of_4) does
+    // not resend cached bytes either: it reprocesses the new Message 1
+    // with the SAME SNonce (renew_snonce already cleared), echoing the
+    // new replay counter, re-deriving the PTK from the (possibly new)
+    // ANonce, and recomputing the MIC. Do exactly that: keep the
+    // persistent SNonce (do NOT regenerate it), re-run
+    // wpa_hs_process_msg1 on the new frame. wpa_hs_init's PMK/AA/SA
+    // are still in place from the first Message 1.
     let classify: EapolKeyParsed = eapol_key_parse(rx_buf, rx_len);
     if (classify.ok == 0) && ((classify.key_info & EAPOL_KEY_INFO_MIC) == 0) {
-      let ri: i64 = 0;
-      while ri < 99 {
-        let _ = buf_write_byte(tx_out, ri as u32, buf_read_byte(ctx, (WPA2_JOIN_MSG2_CACHE_OFF + ri) as u32));
-        ri = ri + 1;
+      let snonce_r: mut ref i64 = wpa2_eapol_snonce_scratch_get();
+      if wpa_hs_process_msg1(rx_buf, rx_len, snonce_r, ctx, WPA2_JOIN_RSN_OFF, WPA2_JOIN_RSN_LEN, tx_out) != WPA_HS_OK {
+        // Not a usable Message 1 (e.g. ACK bit clear) -- ignore it and
+        // keep waiting for Message 3 rather than failing the join.
+        return Wpa2JoinResult { state: WPA2_JOIN_WAIT_EAPOL_MSG3, tx_len: 0, done: 0, failed: 0 };
       }
-      return Wpa2JoinResult { state: WPA2_JOIN_WAIT_EAPOL_MSG3, tx_len: 99, done: 0, failed: 0 };
+      return Wpa2JoinResult { state: WPA2_JOIN_WAIT_EAPOL_MSG3, tx_len: WPA2_JOIN_MSG2_LEN, done: 0, failed: 0 };
     }
     // wpa_hs_process_msg3's own contract: Message 4 is built (and, in
     // a real deployment, arguably still worth transmitting) even on
@@ -53865,7 +53946,7 @@ fn wpa2_join_step_eapol(ctx: mut ref i64, rx_buf: mut ref i64, rx_len: i64, pmk:
       return Wpa2JoinResult { state: WPA2_JOIN_FAILED, tx_len: 0, done: 0, failed: 1 };
     }
     let _ = buf_write_byte(ctx, WPA2_JOIN_STATE_OFF as u32, WPA2_JOIN_CONNECTED as u32);
-    return Wpa2JoinResult { state: WPA2_JOIN_CONNECTED, tx_len: 99, done: 1, failed: 0 };
+    return Wpa2JoinResult { state: WPA2_JOIN_CONNECTED, tx_len: WPA2_JOIN_MSG4_LEN, done: 1, failed: 0 };
   }
 
   return Wpa2JoinResult { state: state, tx_len: 0, done: 0, failed: 1 };
@@ -53974,26 +54055,55 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   // internally self-consistent between what msg2 used to derive it and
   // what msg3's own MIC verification checks it against -- not on
   // SNonce matching any EXTERNAL fixed value.
-  let msg2: mut ref i64 = dhruva_alloc_bytes(99);
+  let msg2: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_MSG2_LEN);
   let r4: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg1, 99, pmk, msg2, msg2);
-  if (r4.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4.tx_len != 99) || (r4.failed != 0) { ok = 0; }
+  if (r4.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4.tx_len != WPA2_JOIN_MSG2_LEN) || (r4.failed != 0) { ok = 0; }
+  // 2026-11-26: Message 2's Key Data must be byte-identical to the
+  // RSNE stored in ctx (the one the Association Request carried).
+  let kdc: i64 = 0;
+  while kdc < WPA2_JOIN_RSN_LEN {
+    if buf_read_byte(msg2, (EAPOL_KEY_DATA_OFF + kdc) as u32) != buf_read_byte(ctx, (WPA2_JOIN_RSN_OFF + kdc) as u32) { ok = 0; }
+    kdc = kdc + 1;
+  }
+  if (buf_read_byte(msg2, (EAPOL_KEY_DATALEN_OFF + 1) as u32) as i64) != WPA2_JOIN_RSN_LEN { ok = 0; }
+  // Message 2's MIC must verify under the KCK the orchestrator derived.
+  let kck_m2: mut ref i64 = wpa_hs_kck_ptr();
+  if eapol_key_verify_mic(msg2, WPA2_JOIN_MSG2_LEN, kck_m2, 16) != 0 { ok = 0; }
 
-  // Round 2026-10-04: directly exercises the retransmitted-Message-1
-  // fix found via a fork's full wpa_supplicant/wpa.c trace -- feed the
-  // SAME Message 1 bytes again while still in WAIT_EAPOL_MSG3 (as a
-  // real AP would if its own Message-2 response timer expired because
-  // our Message 2 was lost over the air) and confirm this orchestrator
-  // resends the EXACT already-cached Message 2 rather than failing the
-  // whole handshake or re-deriving a different one from a fresh SNonce.
-  let msg2_retrans: mut ref i64 = dhruva_alloc_bytes(99);
-  let r4b: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg1, 99, pmk, msg2_retrans, msg2_retrans);
-  if (r4b.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4b.tx_len != 99) || (r4b.done != 0) || (r4b.failed != 0) { ok = 0; }
-  if sha256_bytes_equal(msg2_retrans, msg2, 99) == 0 { ok = 0; }
+  // Retransmitted Message 1 (2026-10-04 case, corrected 2026-11-26):
+  // a real AP's EAPOL-level retransmission carries an INCREMENTED
+  // replay counter (1 -> 2 here). The resent Message 2 must echo the
+  // NEW counter, keep the SAME SNonce (no fresh nonce mid-handshake),
+  // still carry the RSNE, and carry a MIC valid under the re-derived
+  // KCK -- not be a byte copy of the first Message 2.
+  let msg1_retx: mut ref i64 = dhruva_alloc_bytes(99);
+  let mri: i64 = 0;
+  while mri < 99 { let _ = buf_write_byte(msg1_retx, mri as u32, buf_read_byte(msg1, mri as u32)); mri = mri + 1; }
+  let _ = buf_write_byte(msg1_retx, (EAPOL_KEY_REPLAY_OFF + 7) as u32, 2 as u32);
+  let msg2_retrans: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_MSG2_LEN);
+  let r4b: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg1_retx, 99, pmk, msg2_retrans, msg2_retrans);
+  if (r4b.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4b.tx_len != WPA2_JOIN_MSG2_LEN) || (r4b.done != 0) || (r4b.failed != 0) { ok = 0; }
+  if (buf_read_byte(msg2_retrans, (EAPOL_KEY_REPLAY_OFF + 7) as u32) as i64) != 2 { ok = 0; }
+  let sni2: i64 = 0;
+  while sni2 < 32 {
+    if buf_read_byte(msg2_retrans, (EAPOL_KEY_NONCE_OFF + sni2) as u32) != buf_read_byte(msg2, (EAPOL_KEY_NONCE_OFF + sni2) as u32) { ok = 0; }
+    sni2 = sni2 + 1;
+  }
+  if (buf_read_byte(msg2_retrans, EAPOL_KEY_DATA_OFF as u32) as i64) != 0x30 { ok = 0; }
+  let kck_m2b: mut ref i64 = wpa_hs_kck_ptr();
+  if eapol_key_verify_mic(msg2_retrans, WPA2_JOIN_MSG2_LEN, kck_m2b, 16) != 0 { ok = 0; }
 
+  // Message 3 shaped like a real AP's (802.11-2016 12.7.6.4): the AP's
+  // own RSNE FIRST, then the GTK KDE -- the old single-KDE parser
+  // rejected exactly this layout. Replay counter 3 (> the
+  // retransmitted Message 1's 2).
+  let ap_rsn: [u8; 22] = [0 as u8; 22];
+  let _ = rsn_ie_build_wpa2_psk_ccmp(mut ref ap_rsn);
   let gtk_kde_len: i64 = 24;
-  let msg3: mut ref i64 = dhruva_alloc_bytes(99 + gtk_kde_len);
-  let _ = eapol_key_build_header(msg3, 2, 0x03ca, 16, gtk_kde_len);
-  let _ = buf_write_byte(msg3, (EAPOL_KEY_REPLAY_OFF + 7) as u32, 2 as u32);
+  let kd_len: i64 = 22 + gtk_kde_len;
+  let msg3: mut ref i64 = dhruva_alloc_bytes(99 + kd_len);
+  let _ = eapol_key_build_header(msg3, 2, 0x03ca, 16, kd_len);
+  let _ = buf_write_byte(msg3, (EAPOL_KEY_REPLAY_OFF + 7) as u32, 3 as u32);
   let ni3: i64 = 0;
   while ni3 < 32 { let _ = buf_write_byte(msg3, (EAPOL_KEY_NONCE_OFF + ni3) as u32, buf_read_byte(anonce, ni3 as u32)); ni3 = ni3 + 1; }
   let gtk_kde: [u8; 24] = [
@@ -54001,15 +54111,17 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
     0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8,
     0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8, 0xaa as u8
   ];
+  let ari3: i64 = 0;
+  while ari3 < 22 { let _ = buf_write_byte(msg3, (EAPOL_KEY_DATA_OFF + ari3) as u32, ap_rsn[ari3] as u32); ari3 = ari3 + 1; }
   let kdi: i64 = 0;
-  while kdi < gtk_kde_len { let _ = buf_write_byte(msg3, (EAPOL_KEY_DATA_OFF + kdi) as u32, gtk_kde[kdi] as u32); kdi = kdi + 1; }
+  while kdi < gtk_kde_len { let _ = buf_write_byte(msg3, (EAPOL_KEY_DATA_OFF + 22 + kdi) as u32, gtk_kde[kdi] as u32); kdi = kdi + 1; }
   let kck_for_test: mut ref i64 = wpa_hs_kck_ptr();
-  let _ = eapol_key_set_mic(msg3, 99 + gtk_kde_len, kck_for_test, 16);
+  let _ = eapol_key_set_mic(msg3, 99 + kd_len, kck_for_test, 16);
 
   let msg4: mut ref i64 = dhruva_alloc_bytes(99);
   let gtk_result: mut ref i64 = dhruva_alloc_bytes(32);
-  let r5: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg3, 99 + gtk_kde_len, pmk, msg4, gtk_result);
-  if (r5.state != WPA2_JOIN_CONNECTED) || (r5.done != 1) || (r5.failed != 0) { ok = 0; }
+  let r5: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg3, 99 + kd_len, pmk, msg4, gtk_result);
+  if (r5.state != WPA2_JOIN_CONNECTED) || (r5.tx_len != WPA2_JOIN_MSG4_LEN) || (r5.done != 1) || (r5.failed != 0) { ok = 0; }
 
   let exp_gtk: mut ref i64 = dhruva_alloc_bytes(16);
   let egi: i64 = 0;
@@ -54929,12 +55041,12 @@ fn wifi_real_join() -> i64 {
   }
   let _ = uart_puts("wifi join: associated, waiting for the 4-way handshake...\n");
 
-  let eapol_payload: [u8; 140] = [0 as u8; 140];
+  let eapol_payload: [u8; 224] = [0 as u8; 224];
   let eapol_rx_heap: mut ref i64 = wifi_join_eapol_rx_scratch_get();
   let eapol_tx_heap: mut ref i64 = wifi_join_eapol_tx_scratch_get();
-  let eapol_tx_fixed: [u8; 140] = [0 as u8; 140];
+  let eapol_tx_fixed: [u8; 224] = [0 as u8; 224];
   let gtk_out: mut ref i64 = wifi_join_gtk_scratch_get();
-  let wrapped: [u8; 140] = [0 as u8; 140];
+  let wrapped: [u8; 256] = [0 as u8; 256];
   let wrapped_heap: mut ref i64 = wifi_join_wrapped_scratch_get();
 
   let connected: i64 = 0;
@@ -62143,10 +62255,13 @@ fn kernel_main() -> i64 {
   let _ = wifi_join_preq_scratch_set(dhruva_alloc_bytes(PROBE_REQ_MAX_LEN as u32));
   let _ = wifi_join_rx_scratch_set(dhruva_alloc_bytes(512));
   let _ = wifi_join_mgmt_scratch_set(dhruva_alloc_bytes(ASSOC_REQ_MAX_LEN as u32));
-  let _ = wifi_join_eapol_rx_scratch_set(dhruva_alloc_bytes(140));
-  let _ = wifi_join_eapol_tx_scratch_set(dhruva_alloc_bytes(99));
+  // 2026-11-26: sized from the same constants the EAPOL path uses
+  // (were literal 140/99 -- too small for a real Message 3 / the
+  // RSNE-carrying Message 2; see DATA_FRAME_EAPOL_MAX_LEN).
+  let _ = wifi_join_eapol_rx_scratch_set(dhruva_alloc_bytes(DATA_FRAME_EAPOL_MAX_LEN as u32));
+  let _ = wifi_join_eapol_tx_scratch_set(dhruva_alloc_bytes(WPA2_JOIN_MSG2_LEN as u32));
   let _ = wifi_join_gtk_scratch_set(dhruva_alloc_bytes(32));
-  let _ = wifi_join_wrapped_scratch_set(dhruva_alloc_bytes(140));
+  let _ = wifi_join_wrapped_scratch_set(dhruva_alloc_bytes(256));
   let _ = wifi_join_bssid_scratch_set(dhruva_alloc_bytes(6));
   let _ = wifi_scan_tx_scratch_set(dhruva_alloc_bytes(64));
   let _ = wifi_scan_rx_scratch_set(dhruva_alloc_bytes(512));
