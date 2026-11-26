@@ -54209,6 +54209,11 @@ fn wpa2_join_step_eapol(ctx: mut ref i64, rx_buf: mut ref i64, rx_len: i64, pmk:
 // investigation -- see rtl8188cu_probe's own header comment.
 fn wpa2_join_orchestrator_self_test() -> i64 {
   let ok: i64 = 1;
+  // 2026-11-26: number of the first failing check (1-based, in source
+  // order), printed on FAIL -- the bare PASS/FAIL gave no way to tell
+  // which of ~20 checks broke.
+  let first_fail: i64 = 0;
+  let fail_mask: i64 = 0;
 
   let bssid: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x01 as u8];
   let own_mac: [u8; 6] = [0x02 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x02 as u8];
@@ -54221,7 +54226,7 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   let ctx: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_CTX_SIZE as u32);
   let preq: [u8; 80] = [0 as u8; 80];
   let preq_len: i64 = wpa2_join_start(ctx, ref bssid, ref own_mac, ref ssid, 4, mut ref preq);
-  if preq_len != 36 { ok = 0; }
+  if preq_len != 46 { if first_fail == 0 { first_fail = 1; } fail_mask = fail_mask | (1 << 1); ok = 0; }
 
   // Synthetic Probe Response (same shape ieee80211_boot_self_test's
   // own presp_buf uses): SSID + this same RSN IE.
@@ -54239,10 +54244,30 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   presp[41] = 0x74 as u8;
   let ri: i64 = 0;
   while ri < 22 { presp[42 + ri] = rsn[ri]; ri = ri + 1; }
+  // 2026-11-26: fixtures updated to look like real AP frames. Since the
+  // from_bss filter (A2 must be the target BSSID) and the joint-rate-set
+  // Association Request (needs the AP's Supported Rates) were added,
+  // the old fixtures -- A2 all-zero, no rates IE -- were silently
+  // ignored at the probe stage, so every later check ran against a
+  // never-advancing state machine. A2=A3=BSSID on every response, ESS|
+  // Privacy capability, 8 rates all within sta_rate_capability's set.
+  let rates8: [u8; 8] = [0x82 as u8, 0x84 as u8, 0x8b as u8, 0x96 as u8, 0x0c as u8, 0x12 as u8, 0x18 as u8, 0x24 as u8];
+  presp[64] = EID_SUPP_RATES as u8;
+  presp[65] = 8 as u8;
+  ri = 0;
+  while ri < 8 { presp[66 + ri] = rates8[ri]; ri = ri + 1; }
+  presp[34] = 0x11 as u8; // capability: ESS | Privacy
+  presp[35] = 0x00 as u8;
+  let bi0: i64 = 0;
+  while bi0 < 6 {
+    presp[10 + bi0] = bssid[bi0];
+    presp[16 + bi0] = bssid[bi0];
+    bi0 = bi0 + 1;
+  }
 
   let mgmt_out: [u8; 110] = [0 as u8; 110];
-  let r1: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref presp, 42 + 22, 1, mut ref mgmt_out);
-  if (r1.state != WPA2_JOIN_WAIT_AUTH_RESP) || (r1.tx_len != 30) || (r1.failed != 0) { ok = 0; }
+  let r1: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref presp, 74, 1, mut ref mgmt_out);
+  if (r1.state != WPA2_JOIN_WAIT_AUTH_RESP) || (r1.tx_len != 30) || (r1.failed != 0) { if first_fail == 0 { first_fail = 2; } fail_mask = fail_mask | (1 << 2); ok = 0; }
 
   // Synthetic Auth Response: Open System, transaction 2, success.
   let aresp: [u8; 256] = [0 as u8; 256];
@@ -54250,8 +54275,10 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   aresp[0] = (fc_auth & (255 as i64)) as u8;
   aresp[1] = ((fc_auth >> 8) & (255 as i64)) as u8;
   aresp[26] = 2 as u8;
+  bi0 = 0;
+  while bi0 < 6 { aresp[10 + bi0] = bssid[bi0]; aresp[16 + bi0] = bssid[bi0]; bi0 = bi0 + 1; }
   let r2: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref aresp, 30, 2, mut ref mgmt_out);
-  if (r2.state != WPA2_JOIN_WAIT_ASSOC_RESP) || (r2.tx_len != 62) || (r2.failed != 0) { ok = 0; }
+  if (r2.state != WPA2_JOIN_WAIT_ASSOC_RESP) || (r2.tx_len != 66) || (r2.failed != 0) { if first_fail == 0 { first_fail = 3; } fail_mask = fail_mask | (1 << 3); ok = 0; }
 
   // Synthetic Assoc Response: success, association ID 7.
   let assocresp: [u8; 256] = [0 as u8; 256];
@@ -54259,9 +54286,11 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   assocresp[0] = (fc_assoc & (255 as i64)) as u8;
   assocresp[1] = ((fc_assoc >> 8) & (255 as i64)) as u8;
   assocresp[28] = 7 as u8;
+  bi0 = 0;
+  while bi0 < 6 { assocresp[10 + bi0] = bssid[bi0]; assocresp[16 + bi0] = bssid[bi0]; bi0 = bi0 + 1; }
   let r3: Wpa2JoinResult = wpa2_join_step_mgmt(ctx, ref assocresp, 30, 3, mut ref mgmt_out);
-  if (r3.state != WPA2_JOIN_WAIT_EAPOL_MSG1) || (r3.tx_len != 0) || (r3.failed != 0) { ok = 0; }
-  if (buf_read_byte(ctx, WPA2_JOIN_ASSOC_ID_OFF as u32) as i64) != 7 { ok = 0; }
+  if (r3.state != WPA2_JOIN_WAIT_EAPOL_MSG1) || (r3.tx_len != 0) || (r3.failed != 0) { if first_fail == 0 { first_fail = 4; } fail_mask = fail_mask | (1 << 4); ok = 0; }
+  if (buf_read_byte(ctx, WPA2_JOIN_ASSOC_ID_OFF as u32) as i64) != 7 { if first_fail == 0 { first_fail = 5; } fail_mask = fail_mask | (1 << 5); ok = 0; }
 
   // Same known-answer PMK/ANonce/SNonce as wpa_handshake_self_test --
   // reusing that exact expected MIC/GTK below is what actually proves
@@ -54300,18 +54329,18 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   // SNonce matching any EXTERNAL fixed value.
   let msg2: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_MSG2_LEN);
   let r4: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg1, 99, pmk, msg2, msg2);
-  if (r4.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4.tx_len != WPA2_JOIN_MSG2_LEN) || (r4.failed != 0) { ok = 0; }
+  if (r4.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4.tx_len != WPA2_JOIN_MSG2_LEN) || (r4.failed != 0) { if first_fail == 0 { first_fail = 6; } fail_mask = fail_mask | (1 << 6); ok = 0; }
   // 2026-11-26: Message 2's Key Data must be byte-identical to the
   // RSNE stored in ctx (the one the Association Request carried).
   let kdc: i64 = 0;
   while kdc < WPA2_JOIN_RSN_LEN {
-    if buf_read_byte(msg2, (EAPOL_KEY_DATA_OFF + kdc) as u32) != buf_read_byte(ctx, (WPA2_JOIN_RSN_OFF + kdc) as u32) { ok = 0; }
+    if buf_read_byte(msg2, (EAPOL_KEY_DATA_OFF + kdc) as u32) != buf_read_byte(ctx, (WPA2_JOIN_RSN_OFF + kdc) as u32) { if first_fail == 0 { first_fail = 7; } fail_mask = fail_mask | (1 << 7); ok = 0; }
     kdc = kdc + 1;
   }
-  if (buf_read_byte(msg2, (EAPOL_KEY_DATALEN_OFF + 1) as u32) as i64) != WPA2_JOIN_RSN_LEN { ok = 0; }
+  if (buf_read_byte(msg2, (EAPOL_KEY_DATALEN_OFF + 1) as u32) as i64) != WPA2_JOIN_RSN_LEN { if first_fail == 0 { first_fail = 8; } fail_mask = fail_mask | (1 << 8); ok = 0; }
   // Message 2's MIC must verify under the KCK the orchestrator derived.
   let kck_m2: mut ref i64 = wpa_hs_kck_ptr();
-  if eapol_key_verify_mic(msg2, WPA2_JOIN_MSG2_LEN, kck_m2, 16) != 0 { ok = 0; }
+  if eapol_key_verify_mic(msg2, WPA2_JOIN_MSG2_LEN, kck_m2, 16) != 0 { if first_fail == 0 { first_fail = 9; } fail_mask = fail_mask | (1 << 9); ok = 0; }
 
   // Retransmitted Message 1 (2026-10-04 case, corrected 2026-11-26):
   // a real AP's EAPOL-level retransmission carries an INCREMENTED
@@ -54325,16 +54354,16 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   let _ = buf_write_byte(msg1_retx, (EAPOL_KEY_REPLAY_OFF + 7) as u32, 2 as u32);
   let msg2_retrans: mut ref i64 = dhruva_alloc_bytes(WPA2_JOIN_MSG2_LEN);
   let r4b: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg1_retx, 99, pmk, msg2_retrans, msg2_retrans);
-  if (r4b.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4b.tx_len != WPA2_JOIN_MSG2_LEN) || (r4b.done != 0) || (r4b.failed != 0) { ok = 0; }
-  if (buf_read_byte(msg2_retrans, (EAPOL_KEY_REPLAY_OFF + 7) as u32) as i64) != 2 { ok = 0; }
+  if (r4b.state != WPA2_JOIN_WAIT_EAPOL_MSG3) || (r4b.tx_len != WPA2_JOIN_MSG2_LEN) || (r4b.done != 0) || (r4b.failed != 0) { if first_fail == 0 { first_fail = 10; } fail_mask = fail_mask | (1 << 10); ok = 0; }
+  if (buf_read_byte(msg2_retrans, (EAPOL_KEY_REPLAY_OFF + 7) as u32) as i64) != 2 { if first_fail == 0 { first_fail = 11; } fail_mask = fail_mask | (1 << 11); ok = 0; }
   let sni2: i64 = 0;
   while sni2 < 32 {
-    if buf_read_byte(msg2_retrans, (EAPOL_KEY_NONCE_OFF + sni2) as u32) != buf_read_byte(msg2, (EAPOL_KEY_NONCE_OFF + sni2) as u32) { ok = 0; }
+    if buf_read_byte(msg2_retrans, (EAPOL_KEY_NONCE_OFF + sni2) as u32) != buf_read_byte(msg2, (EAPOL_KEY_NONCE_OFF + sni2) as u32) { if first_fail == 0 { first_fail = 12; } fail_mask = fail_mask | (1 << 12); ok = 0; }
     sni2 = sni2 + 1;
   }
-  if (buf_read_byte(msg2_retrans, EAPOL_KEY_DATA_OFF as u32) as i64) != 0x30 { ok = 0; }
+  if (buf_read_byte(msg2_retrans, EAPOL_KEY_DATA_OFF as u32) as i64) != 0x30 { if first_fail == 0 { first_fail = 13; } fail_mask = fail_mask | (1 << 13); ok = 0; }
   let kck_m2b: mut ref i64 = wpa_hs_kck_ptr();
-  if eapol_key_verify_mic(msg2_retrans, WPA2_JOIN_MSG2_LEN, kck_m2b, 16) != 0 { ok = 0; }
+  if eapol_key_verify_mic(msg2_retrans, WPA2_JOIN_MSG2_LEN, kck_m2b, 16) != 0 { if first_fail == 0 { first_fail = 14; } fail_mask = fail_mask | (1 << 14); ok = 0; }
 
   // Message 3 shaped like a real AP's (802.11-2016 12.7.6.4): the AP's
   // own RSNE FIRST, then the GTK KDE -- the old single-KDE parser
@@ -54364,12 +54393,12 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   let msg4: mut ref i64 = dhruva_alloc_bytes(99);
   let gtk_result: mut ref i64 = dhruva_alloc_bytes(32);
   let r5: Wpa2JoinResult = wpa2_join_step_eapol(ctx, msg3, 99 + kd_len, pmk, msg4, gtk_result);
-  if (r5.state != WPA2_JOIN_CONNECTED) || (r5.tx_len != WPA2_JOIN_MSG4_LEN) || (r5.done != 1) || (r5.failed != 0) { ok = 0; }
+  if (r5.state != WPA2_JOIN_CONNECTED) || (r5.tx_len != WPA2_JOIN_MSG4_LEN) || (r5.done != 1) || (r5.failed != 0) { if first_fail == 0 { first_fail = 15; } fail_mask = fail_mask | (1 << 15); ok = 0; }
 
   let exp_gtk: mut ref i64 = dhruva_alloc_bytes(16);
   let egi: i64 = 0;
   while egi < 16 { let _ = buf_write_byte(exp_gtk, egi as u32, 0xaa as u32); egi = egi + 1; }
-  if sha256_bytes_equal(gtk_result, exp_gtk, 16) == 0 { ok = 0; }
+  if sha256_bytes_equal(gtk_result, exp_gtk, 16) == 0 { if first_fail == 0 { first_fail = 16; } fail_mask = fail_mask | (1 << 16); ok = 0; }
 
   // The whole point: a real TK is now sitting in wpa_hs_tk_ptr(),
   // ready for AES-CCMP data-frame encryption (aes_ccmp_encrypt/
@@ -54390,13 +54419,17 @@ fn wpa2_join_orchestrator_self_test() -> i64 {
   // something rather than a degenerate all-zero result -- the
   // byte-level correctness of TK derivation itself is already fully
   // covered by wpa_ptk_derive's own dedicated self-test.)
-  if tk_nonzero != 1 { ok = 0; }
+  if tk_nonzero != 1 { if first_fail == 0 { first_fail = 17; } fail_mask = fail_mask | (1 << 17); ok = 0; }
 
   let _ = uart_puts("WPA2: join-sequence orchestrator (probe->auth->assoc->4-way-handshake->TK/GTK ready) end-to-end against a synthetic peer, reusing wpa_handshake_self_test's own known-answer PMK/GTK");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
-    let _ = uart_puts(" (FAIL)\n");
+    let _ = uart_puts(" (FAIL, first failing check #");
+    let _ = uart_put_i64(first_fail);
+    let _ = uart_puts(", mask=0x");
+    let _ = uart_put_hex32(fail_mask as u32);
+    let _ = uart_puts(")\n");
   }
   return 0;
 }
