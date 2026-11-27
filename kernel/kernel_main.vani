@@ -27910,7 +27910,18 @@ fn dwc2_wait_chan0_done_bounded(max_tries: i64) -> u32 {
         }
       } else {
         if (hi & transient_mask) != (0 as u32) {
-          let _ = mmio_write_u32(hcint0, hi & transient_mask);
+          // 2026-11-27: NAK/ACK may come WITH CHHLTD (bit 1) -- the
+          // channel halted on the NAK. Clearing only NAK/ACK left CHHLTD
+          // latched, so the very next poll saw hi=0x2 alone and failed
+          // the transfer ("halted, reason unknown") -- 270 of 280
+          // STATUS-stage failures in the log history, deterministic while
+          // the RTL8188CU NAKs its status stage. Linux dwc2_hc_nak_intr
+          // continues the same transfer from the channel's current
+          // progress (error count reset); re-enabling with HCTSIZ/HCDMA
+          // as the hardware left them does exactly that. Clear CHHLTD
+          // too when it is set, so the halt isn't mistaken for a result.
+          let chhltd_bit: u32 = 0x2 as u32;
+          let _ = mmio_write_u32(hcint0, hi & (transient_mask | chhltd_bit));
           let rearm_nak: u32 = mmio_read_u32(hcchar0) | chena_bit;
           let _ = mmio_write_u32(hcchar0, rearm_nak);
         } else {
