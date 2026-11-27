@@ -48885,6 +48885,23 @@ fn shell_dispatch() -> i64 {
   if shell_word_matches(line_buf, 0, cmd_end, "sshd") == 1 {
     return ssh_real_server_cmd();
   }
+  if shell_word_matches(line_buf, 0, cmd_end, "fsrepair") == 1 {
+    if dharafs_user_get_uid() != (0 as u32) {
+      let _ = uart_puts("fsrepair: permission denied (root only)\n");
+      return 0;
+    }
+    if (cmd_end < line_len) && (shell_word_matches(line_buf, cmd_end + 1, shell_find_space(line_buf, cmd_end + 1, line_len), "selftest") == 1) {
+      let _ = dhruva_prio_lock(2);
+      let st_ok: i64 = fsrepair_self_test();
+      let _ = dhruva_prio_unlock(2);
+      return st_ok;
+    }
+    let do_apply: i64 = if (cmd_end < line_len) && (shell_word_matches(line_buf, cmd_end + 1, shell_find_space(line_buf, cmd_end + 1, line_len), "apply") == 1) { 1 } else { 0 };
+    let _ = dhruva_prio_lock(2);
+    let fr: i64 = fsrepair_cmd(do_apply);
+    let _ = dhruva_prio_unlock(2);
+    return fr;
+  }
   if shell_word_matches(line_buf, 0, cmd_end, "tlsd") == 1 {
     return shell_dispatch_tlsd(line_buf, cmd_end, line_len);
   }
@@ -62984,6 +63001,123 @@ fn shell_dispatch_tlsd(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
     return 0;
   }
   return tlsd_usage();
+}
+
+// 2026-11-26: `fsrepair [apply]` -- recovers blocks the pre-797ca8f
+// write-back ECC parity bug wrongly classified as bad. After an unclean
+// reset, rewritten blocks were left with the previous content's parity,
+// decoded as UNCORRECTABLE, and the two-tier classifier escalated them to
+// permanent bad marks -- making intact log records unreadable.
+// (The bitmap is also the recovery scan's "no valid record here" cache,
+// so empty blocks are marked too; they never pass the record check.)
+// For each block in the DharaFS log region that is marked bad or pending
+// as a suspect: raw-read it (no ECC, no bad-block gate). It is restored
+// ONLY if the read succeeds and it carries a valid DharaFS record
+// (stored checksum == buf_checksum(4..512) and seq != 0 -- the same test
+// the log scan uses); then its parity is rewritten from the actual bytes
+// and it leaves the bad/suspect tables. Anything else stays marked.
+// Without `apply` it only reports. Root only.
+// fsrepair's own end-to-end check (`fsrepair selftest`, root): reproduce
+// exactly the old failure -- an intact record whose block got marked bad
+// -- then repair it and require the original bytes back.
+fn fsrepair_self_test() -> i64 {
+  let ok: i64 = 1;
+  let _ = dharafs_append("/fsrepair_t", "fsrepair-selftest-payload");
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let pth: Str = "/fsrepair_t";
+  let pl: i64 = str_len_bytes(pth);
+  let i: i64 = 0;
+  while i < pl { let _ = buf_write_byte(path_buf, i as u32, str_byte_at(pth, i) as u32); i = i + 1; }
+  let blk: i64 = dharafs_find_latest_block_raw(path_buf, pl);
+  if blk < 0 { ok = 0; }
+  let out: mut ref i64 = dhruva_alloc_bytes(512);
+  if ok == 1 {
+    let _ = dharafs_badblock_mark(blk);
+    if dharafs_badblock_is_marked(blk) != 1 { ok = 0; }
+    let _ = fsrepair_cmd(1);
+    if dharafs_badblock_is_marked(blk) != 0 { ok = 0; }
+    let n: i64 = dharafs_read("/fsrepair_t", out);
+    if n != 25 { ok = 0; }
+    if (n == 25) && (buf_read_byte(out, 0 as u32) != (0x66 as u32)) { ok = 0; }
+  }
+  let _ = uart_puts("DHARAFS: fsrepair restores an intact record wrongly marked bad");
+  if ok == 1 { let _ = uart_puts(" (PASS)\n"); } else { let _ = uart_puts(" (FAIL)\n"); }
+  return ok;
+}
+
+fn fsrepair_cmd(apply: i64) -> i64 {
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let marked: i64 = 0;
+  let restorable: i64 = 0;
+  let restored: i64 = 0;
+  let unreadable: i64 = 0;
+  let n_bad: i64 = 0;
+  let n_sus: i64 = 0;
+  let blk: i64 = 0;
+  while blk < dharafs_log_max_blk() {
+    let _ = watchdog_kick();
+    let is_bad: i64 = dharafs_badblock_is_marked(blk);
+    let is_sus: i64 = dharafs_suspect_is_pending(blk);
+    if (is_bad == 1) || (is_sus == 1) {
+      marked = marked + 1;
+      if is_bad == 1 { n_bad = n_bad + 1; }
+      if is_sus == 1 { n_sus = n_sus + 1; }
+      if sdhost_read_block_once(blk, buf) != 0 {
+        unreadable = unreadable + 1;
+      } else {
+        let stored: u32 = buf_read_u32(buf, 0 as u32);
+        let computed: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+        let seq: u32 = buf_read_u32(buf, 4 as u32);
+        if (stored == computed) && (seq != (0 as u32)) {
+          restorable = restorable + 1;
+          let _ = uart_puts("fsrepair: block 0x");
+          let _ = uart_put_hex32(blk as u32);
+          let _ = uart_puts(if is_bad == 1 { " (bad)" } else { " (suspect)" });
+          let _ = uart_puts(" holds a valid record seq=0x");
+          let _ = uart_put_hex32(seq);
+          if apply == 1 {
+            if dharafs_ecc_protect_on_write(blk, buf, 0 as u32) == 0 {
+              if is_sus == 1 { let _ = dharafs_suspect_remove(blk); }
+              if is_bad == 1 { let _ = dharafs_badblock_clear(blk); }
+              restored = restored + 1;
+              let _ = uart_puts(" -- parity rewritten, restored");
+            } else {
+              let _ = uart_puts(" -- parity write FAILED, left marked");
+            }
+          }
+          let _ = uart_puts("\n");
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  if (apply == 1) && (restored > 0) {
+    let _ = dharafs_suspect_table_persist();
+    let _ = dharafs_badblock_bitmap_persist(0 as u32);
+  }
+  let _ = uart_puts("fsrepair: ");
+  let _ = uart_put_i64(marked);
+  // Note: the bad-block bitmap doubles as the recovery scan's negative-
+  // lookup cache ("no valid record here", cleared again on append), so
+  // on a sparsely used card most "bad" blocks are simply empty -- only
+  // blocks that actually hold a valid record are restorable.
+  let _ = uart_puts(" marked block(s) in the log region (bad-or-empty=");
+  let _ = uart_put_i64(n_bad);
+  let _ = uart_puts(" suspect=");
+  let _ = uart_put_i64(n_sus);
+  let _ = uart_puts("), ");
+  let _ = uart_put_i64(restorable);
+  let _ = uart_puts(" hold valid records, ");
+  let _ = uart_put_i64(unreadable);
+  let _ = uart_puts(" unreadable");
+  if apply == 1 {
+    let _ = uart_puts(", ");
+    let _ = uart_put_i64(restored);
+    let _ = uart_puts(" restored\n");
+  } else {
+    let _ = uart_puts(" (dry run -- 'fsrepair apply' to restore)\n");
+  }
+  return 0;
 }
 
 fn ssh_real_server_cmd() -> i64 {
