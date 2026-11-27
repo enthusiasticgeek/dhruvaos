@@ -27741,8 +27741,7 @@ const NET_BULK_IN_POLL_CAP: i64 = 20000;
 fn dwc2_wait_chan0_done_bounded(max_tries: i64) -> u32 {
   let hcint0: i64 = dwc2_hcint0_addr();
   let hcchar0: i64 = dwc2_hcchar0_addr();
-  let hard_error_mask: u32 = (0x8 as u32) | (0x4 as u32) | (0x80 as u32) | (0x100 as u32); // STALL|AHBERR|XACTERR|BBLERR
-  let xacterr_bit: u32 = 0x80 as u32;
+  let seen: u32 = 0 as u32;
   let datatglerr_bit: u32 = 0x400 as u32;
   let chena_bit: u32 = (1 as u32) << (31 as u32);
   let transient_mask: u32 = (0x10 as u32) | (0x20 as u32); // NAK|ACK
@@ -27752,64 +27751,31 @@ fn dwc2_wait_chan0_done_bounded(max_tries: i64) -> u32 {
   let wcb_budget_us: u32 = (max_tries * 2) as u32;
   while (tries < max_tries) && (wrapping_sub(mmio_read_u32(TIMER_CLO), wcb_t0) < wcb_budget_us) {
     let hi: u32 = mmio_read_u32(hcint0);
+    // 2026-11-27: decide only at CHHLTD -- see dwc2_wait_chan0_done.
+    // Timeout (no halt) still returns 0 with the channel armed, which is
+    // this function's fail-fast contract for speculative polls.
     if hi != (0 as u32) {
-      if (hi & (1 as u32)) != (0 as u32) {
-        // 2026-11-27: in DMA mode XFERCOMPL can latch a few us before
-        // CHHLTD. Returning on XFERCOMPL alone left that CHHLTD to land
-        // after the caller cleared HCINT and enabled the NEXT phase,
-        // which then "halted with no reason" 11-16 us after enable
-        // (hi=0x2, HCTSIZ untouched) -- every STATUS-stage failure seen
-        // on real HW. Linux processes completion only at the channel-
-        // halted interrupt (DMA mode unmasks CHHLTD alone). Wait for the
-        // halt (bounded, 1 ms wall clock), then clear everything seen.
-        let all: u32 = hi;
-        let h_t0: u32 = mmio_read_u32(TIMER_CLO);
-        while ((all & (0x2 as u32)) == (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), h_t0) < (1000 as u32)) {
-          all = all | mmio_read_u32(hcint0);
+      seen = seen | hi;
+      if (hi & (0x2 as u32)) != (0 as u32) {
+        let _ = mmio_write_u32(hcint0, hi);
+        let why: u32 = seen & ((0x7FF as u32) ^ (0x2 as u32));
+        if (why & (1 as u32)) != (0 as u32) {
+          return seen;
         }
-        let _ = mmio_write_u32(hcint0, all);
-        return all;
-      }
-      if (hi & hard_error_mask) != (0 as u32) {
-        if (hi & hard_error_mask) == xacterr_bit {
+        if (why & ((0x8 as u32) | (0x4 as u32) | (0x100 as u32))) != (0 as u32) {
+          return seen;
+        }
+        if (why & (transient_mask | datatglerr_bit)) != (0 as u32) {
+          xacterr_count = 0;
+        } else {
           xacterr_count = xacterr_count + 1;
-          let _ = mmio_write_u32(hcint0, hi);
-          if xacterr_count >= 3 {
-            return hi;
-          }
-          let rearm: u32 = mmio_read_u32(hcchar0) | chena_bit;
-          let _ = mmio_write_u32(hcchar0, rearm);
-        } else {
-          let _ = mmio_write_u32(hcint0, hi);
-          return hi;
         }
-      } else {
-        if (hi & transient_mask) != (0 as u32) {
-          // 2026-11-27: NAK/ACK may come WITH CHHLTD (bit 1) -- the
-          // channel halted on the NAK. Clearing only NAK/ACK left CHHLTD
-          // latched, so the very next poll saw hi=0x2 alone and failed
-          // the transfer ("halted, reason unknown") -- 270 of 280
-          // STATUS-stage failures in the log history, deterministic while
-          // the RTL8188CU NAKs its status stage. Linux dwc2_hc_nak_intr
-          // continues the same transfer from the channel's current
-          // progress (error count reset); re-enabling with HCTSIZ/HCDMA
-          // as the hardware left them does exactly that. Clear CHHLTD
-          // too when it is set, so the halt isn't mistaken for a result.
-          let chhltd_bit: u32 = 0x2 as u32;
-          let _ = mmio_write_u32(hcint0, hi & (transient_mask | chhltd_bit));
-          let rearm_nak: u32 = mmio_read_u32(hcchar0) | chena_bit;
-          let _ = mmio_write_u32(hcchar0, rearm_nak);
-        } else {
-          if (hi & datatglerr_bit) != (0 as u32) {
-            xacterr_count = 0;
-            let _ = mmio_write_u32(hcint0, hi);
-            let rearm_dtg: u32 = mmio_read_u32(hcchar0) | chena_bit;
-            let _ = mmio_write_u32(hcchar0, rearm_dtg);
-          } else {
-            let _ = mmio_write_u32(hcint0, hi);
-            return hi;
-          }
+        if xacterr_count >= 3 {
+          return seen;
         }
+        let chdis_clear: u32 = ((1 as u32) << (30 as u32)) ^ (0xFFFFFFFF as u32);
+        let _ = mmio_write_u32(hcchar0, (mmio_read_u32(hcchar0) | chena_bit) & chdis_clear);
+        seen = 0 as u32;
       }
     }
     tries = tries + 1;
@@ -32371,15 +32337,17 @@ fn dwc2_reset_chan0_for_new_transfer() -> i64 {
     // the data: a possible regression is not an acceptable price for a
     // diagnostic, especially not one in a path this widely shared.
     let _ = mmio_write_u32(hcchar0, current | chena_bit_local | chdis_bit_local);
-    let halt_tries: i64 = 0;
-    while halt_tries < 50 {
+    // 2026-11-27 (USB/DMA audit): poll the halt continuously (same 250 ms
+    // bound). The old loop checked once and then slept ~5 ms, and the
+    // halt takes microseconds -- so every cancelled speculative bulk-IN
+    // poll (each WiFi/LAN RX poll that found no frame) cost ~5 ms.
+    let h_t0: u32 = mmio_read_u32(TIMER_CLO);
+    let halted: i64 = 0;
+    while (halted == 0) && (wrapping_sub(mmio_read_u32(TIMER_CLO), h_t0) < (250000 as u32)) {
       let hi: u32 = mmio_read_u32(hcint0);
       if (hi & chhltd_bit_local) != (0 as u32) {
         let _ = mmio_write_u32(hcint0, hi);
-        halt_tries = 50;
-      } else {
-        let _ = delay(16100); // ~5ms real, same per-iteration cost used throughout this driver's own short real-HW waits
-        halt_tries = halt_tries + 1;
+        halted = 1;
       }
     }
   }
@@ -32699,23 +32667,49 @@ fn dwc2_wifi_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(pid, pktcnt, want_len as u32));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 2 as u32, 1 as u32, epnum, mps));
   let result: u32 = dwc2_wait_chan0_done_bounded(WIFI_BULK_IN_POLL_CAP);
+  // 2026-11-27 (USB/DMA audit): a poll that times out is cancelled HERE,
+  // and the halt is inspected, instead of leaving the channel armed for
+  // the next transfer's reset to kill blind. A frame that arrived in that
+  // window was already ACKed by the core and DMA'd -- it used to be
+  // discarded, and the software toggle left stale, so the device's next
+  // frame was then dropped as a toggle mismatch: two frames lost per
+  // race, under steady RX. The toggle now comes from hardware
+  // (HCTSIZ.PID after halt), as Linux dwc2_hcd_save_data_toggle does.
+  let got: u32 = result;
   if (result & (1 as u32)) == (0 as u32) {
-    return 0 - 1;
+    let cur: u32 = mmio_read_u32(hcchar0);
+    if (cur & ((1 as u32) << (31 as u32))) != (0 as u32) {
+      let _ = mmio_write_u32(hcchar0, cur | ((1 as u32) << (30 as u32)));
+      let c_t0: u32 = mmio_read_u32(TIMER_CLO);
+      let c_seen: u32 = 0 as u32;
+      while ((c_seen & (0x2 as u32)) == (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), c_t0) < (250000 as u32)) {
+        c_seen = c_seen | mmio_read_u32(dwc2_hcint0_addr());
+      }
+      let _ = mmio_write_u32(dwc2_hcint0_addr(), c_seen);
+      got = c_seen;
+    }
   }
-  // BUG FIX (2026-11-01): sibling of dwc2_control_in's own matching
-  // fix -- see that function's own comment for the full "why".
   let _ = mem_barrier();
   let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
+  let hw_pid: u32 = (hctsiz_after >> (29 as u32)) & (3 as u32);
+  if (hw_pid == (0 as u32)) || (hw_pid == (2 as u32)) {
+    let _ = usb_wifi_set_in_toggle(if hw_pid == (2 as u32) { 1 as u32 } else { 0 as u32 });
+  }
   let bytes_left: u32 = hctsiz_after & (0x7FFFF as u32);
   let actual_len: i64 = want_len - (bytes_left as i64);
+  if ((got & (1 as u32)) == (0 as u32)) && (actual_len <= 0) {
+    return 0 - 1;   // nothing arrived
+  }
   let i: i64 = 0;
   while i < actual_len {
     let b: u32 = buf_read_byte(dma, i as u32);
     let _ = buf_write_byte(out_buf, i as u32, b);
     i = i + 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
-  let _ = usb_wifi_set_in_toggle(next_toggle);
+  if (hw_pid != (0 as u32)) && (hw_pid != (2 as u32)) {
+    let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+    let _ = usb_wifi_set_in_toggle(next_toggle);
+  }
   return actual_len;
 }
 
