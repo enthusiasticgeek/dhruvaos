@@ -55976,9 +55976,12 @@ fn wifi_rtl_cam_write_entry(devaddr: u32, entry: u32, keyidx: u32, is_group: u32
   return 0;
 }
 
+// CALLER MUST HOLD DWC2_MUTEX_ID (wifi_real_join's only caller, `wifi
+// join`, holds it for the whole join). Taking it here self-deadlocked the
+// shell task on real HW (2026-11-27: non-recursive mutex, join stuck after
+// Message 2/4 forever, watchdog still kicked by the other tasks).
 fn wifi_rtl_cam_install(devaddr: u32, bssid: mut ref i64, tk: mut ref i64, gtk: mut ref i64, gtk_keyid: u32) -> i64 {
   let _ = wifi_hwcrypt_on_set(0 as u32);
-  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   let _ = wifi_rtl_cam_write_entry(devaddr, 0 as u32, 0 as u32, 0 as u32, bssid, tk);
   if (gtk_keyid >= (1 as u32)) && (gtk_keyid <= (3 as u32)) {
     let _ = wifi_rtl_cam_write_entry(devaddr, gtk_keyid, gtk_keyid, 1 as u32, bssid, gtk);
@@ -55987,7 +55990,6 @@ fn wifi_rtl_cam_install(devaddr: u32, bssid: mut ref i64, tk: mut ref i64, gtk: 
   let _ = rtl_reg_write16(devaddr, 64 as u32, 0x0100 as u32, cr | ((1 as u32) << (9 as u32)));            // CR_SECURITY_ENABLE
   // SEC_CFG: RX_USE_DEFKEY | RX_SEC_ENABLE | RXBC_USE_DEFKEY -- no TX bits
   let _ = rtl_reg_write8(devaddr, 64 as u32, 0x0680 as u32, ((1 as u32) << (1 as u32)) | ((1 as u32) << (3 as u32)) | ((1 as u32) << (7 as u32)));
-  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
   let _ = wifi_hwcrypt_on_set(1 as u32);
   let _ = uart_puts("wifi: RX CCMP offloaded to RTL8188CU security engine (CAM entry 0 = PTK, GTK keyid=");
   let _ = uart_put_i64(gtk_keyid as i64);
