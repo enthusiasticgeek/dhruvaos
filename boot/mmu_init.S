@@ -384,7 +384,7 @@ mmu_init:
      * privileged code always gets read+execute here, never write.
      * TEX=001/C=0/B=0 = Normal Non-cacheable (0x1000), XN=0
      * (executable), domain 0, section type. */
-    ldr r5, =0x00009C02
+    ldr r5, =0x00009C0E
     str r5, [r4, #0]
 
     /* Section 1 (0x00100000-0x001FFFFF): TASK #163 FIX (2026-09-12) --
@@ -461,10 +461,15 @@ mmu_init:
      * executable anyway is harmless (same "comfortable margin" choice
      * Section 0's own original comment already made), not a
      * correctness requirement. */
-    ldr r5, =0x00009C02
+    /* 2026-11-27: code sections 0 and 2-4 use 0x9C0E = the previous
+     * 0x9C02 (APX=1 read-only, TEX=001, AP=11, section) plus C=1,B=1
+     * (Normal write-back cacheable) so the instruction cache can hold
+     * them; see the SCTLR write at the end of mmu_init. Data stays
+     * uncached because SCTLR.C is still clear. */
+    ldr r5, =0x00009C0E
     orr r5, r5, #0x00200000
     str r5, [r4, #8]
-    ldr r5, =0x00009C02
+    ldr r5, =0x00009C0E
     orr r5, r5, #0x00300000
     str r5, [r4, #12]
 
@@ -495,7 +500,7 @@ mmu_init:
      * so real hardware took a Prefetch Abort on the very first
      * `bl kernel_main` (QEMU doesn't enforce XN here and booted fine).
      * link.ld now ASSERTs the code window and pins .data to 0x00500000. */
-    ldr r5, =0x00009C02
+    ldr r5, =0x00009C0E
     orr r5, r5, #0x00400000
     str r5, [r4, #16]
     /* Section 5 (0x00500000-0x005FFFFF): the guard-page-capable coarse
@@ -886,6 +891,22 @@ mmu_init_domain_outer_done:
     mrc p15, 0, r5, c1, c0, 0
     orr r5, r5, #0x1
     orr r5, r5, #0x800000
+    /* 2026-11-27: SCTLR.I (bit 12, instruction cache) and SCTLR.Z (bit
+     * 11, branch prediction). With every mapping non-cacheable and both
+     * off, each instruction fetch went to SDRAM -- measured on the Pi 1B
+     * as ~300 ms of software CCMP per 600-byte WiFi frame, enough for the
+     * radio's RX FIFO to overflow and TCP to stall. Only the read-only
+     * code sections (0, 2-4) are now marked cacheable (C=B=1, see their
+     * descriptors); SCTLR.C (bit 2, DATA cache) stays OFF, so on ARM1176
+     * every data access remains uncached exactly as before: DMA coherency
+     * and the data-side timing properties this file's header describes
+     * are unchanged. Code is never written at runtime (the vector table
+     * is copied to 0x0 before this, and boot.S invalidated I+D and the
+     * branch predictor at checkpoint 1), so the I-cache cannot go stale.
+     * The crypto is constant-time (no secret-dependent branches or
+     * table lookups), so instruction-cache/branch-predictor state carries
+     * no key-dependent signal. */
+    orr r5, r5, #0x1800
     mcr p15, 0, r5, c1, c0, 0
 
     /* TASK #352 FIX (2026-10-12, real-HW dress rehearsal, THIRD attempt):
