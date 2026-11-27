@@ -28364,7 +28364,12 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), pktcnt, out_len));
   let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 0 as u32, 0 as u32, mps));
   let data_result: u32 = dwc2_wait_chan0_done();
-  if is_short_final_pkt == (1 as u32) {
+  // 2026-11-27: printed only when the DATA phase did NOT complete (or
+  // with boot debug on). It used to print on every successful 1/2/4-byte
+  // register write too (hi=0x23 = XFERCOMPL|CHHLTD|ACK) -- ~200 chars,
+  // ~17 ms of UART per write -- flooding the shell and perturbing USB
+  // timing for the whole RTL8188CU bring-up.
+  if (is_short_final_pkt == (1 as u32)) && (((data_result & (1 as u32)) == (0 as u32)) || (boot_debug_enabled() == 1)) {
     // Unconditional (not gated on boot_debug_enabled()) -- this is
     // exactly the one failure this diagnostic exists to catch, so it
     // must not be silenceable by the same flag that would hide it.
@@ -28416,15 +28421,26 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
     let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
     let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
     let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
+    let st_t0: u32 = mmio_read_u32(TIMER_CLO);
     status_result = dwc2_wait_chan0_done();
+    let st_us: u32 = wrapping_sub(mmio_read_u32(TIMER_CLO), st_t0);
     if (status_result & (1 as u32)) != (0 as u32) {
       status_ok = 1;
     } else {
       let _ = uart_puts("USB DIAG: dwc2_control_out STATUS phase failed, hi=0x");
       let _ = uart_put_hex32(status_result);
+      let _ = uart_puts(" after_us=");
+      let _ = uart_put_i64(st_us as i64);
+      let _ = uart_puts(" HCTSIZ=0x");
+      let _ = uart_put_hex32(mmio_read_u32(hctsiz0));
+      let _ = uart_puts(" HCCHAR=0x");
+      let _ = uart_put_hex32(mmio_read_u32(hcchar0));
       let _ = uart_puts(" try=");
       let _ = uart_put_i64(status_try + 1);
       let _ = uart_puts("/3\n");
+      // Back off before re-issuing (Linux re-queues the qtd, so a retry
+      // never goes out in the same microframe): 1 ms, then 4 ms.
+      let _ = delay_us_wallclock(if status_try == 0 { 1000 as u32 } else { 4000 as u32 });
       // STALL is a deliberate protocol answer, not a transaction error.
       if (status_result & (0x8 as u32)) != (0 as u32) {
         status_try = 3;
@@ -29630,10 +29646,12 @@ fn wifi_radio_orderly_power_off() -> i64 {
   if wifi_radio_get_present() != (1 as u32) {
     return 0;
   }
+  let _ = uart_puts("wifi: orderly radio power-off...\n");
   let _ = wifi_link_down(3);
   let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   let _ = rtl8188cu_power_off(wifi_radio_get_devaddr(), wifi_radio_get_mps_out());
   let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+  let _ = uart_puts("wifi: radio powered off\n");
   return 0;
 }
 
