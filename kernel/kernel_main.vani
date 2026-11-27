@@ -46734,6 +46734,12 @@ fn shell_dispatch() -> i64 {
   // requested reboot the way watchdog_init/_kick's own 2-second
   // supervision timeout needs to.
   if shell_word_matches(line_buf, 0, cmd_end, "reboot") == 1 {
+    // 2026-11-27: radio power-off FIRST, before the priority ceiling
+    // below -- it takes the DWC2 mutex, and blocking under a ceiling lock
+    // is the known-open ceiling-across-sleep bug: real HW deadlocked
+    // here until the watchdog reset the board ("rebooting..." never
+    // printed; chip left running on 4/6 soak reboots).
+    let _ = wifi_radio_orderly_power_off();
     // ROOT-CAUSE FIX (2026-10-24, real-HW cross-reboot DharaFS
     // persistence investigation): this command used to arm the
     // watchdog with NO guarantee that task_e's own periodic GC/
@@ -46818,7 +46824,6 @@ fn shell_dispatch() -> i64 {
     let reboot_snapshot_status: i64 = dharafs_dirindex_snapshot_persist(reboot_ckpt_generation);
     let reboot_clean: u32 = if reboot_snapshot_status == 0 { 1 as u32 } else { 0 as u32 };
     let _ = dharafs_checkpoint_write(reboot_ckpt_generation, reboot_log_start, reboot_next_block, reboot_ckpt_target_slot, reboot_clean, reboot_next_seq, dharafs_write_cursor_last_generation_get());
-    let _ = wifi_radio_orderly_power_off();
     let _ = uart_puts("rebooting...\n");
     let _ = watchdog_arm(1 as u32);
     return 0;
