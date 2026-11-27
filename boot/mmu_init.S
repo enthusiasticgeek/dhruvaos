@@ -488,9 +488,22 @@ mmu_init:
      * used to live at Section 1, moved to Section 2 when .text/.rodata
      * first outgrew Section 0 alone. Same class of bug as THIS fix,
      * one link-address-shift later. */
+    /* 2026-11-26: Section 4 (0x00400000-0x004FFFFF) is now CODE too,
+     * same read-only/executable encoding as sections 2-3. The kernel's
+     * .text grew past 2 MB (2,225,425 bytes): kernel_main itself linked
+     * at 0x00403A54, inside what used to be the XN guard-page section,
+     * so real hardware took a Prefetch Abort on the very first
+     * `bl kernel_main` (QEMU doesn't enforce XN here and booted fine).
+     * link.ld now ASSERTs the code window and pins .data to 0x00500000. */
+    ldr r5, =0x00009C02
+    orr r5, r5, #0x00400000
+    str r5, [r4, #16]
+    /* Section 5 (0x00500000-0x005FFFFF): the guard-page-capable coarse
+     * table, moved up from Section 4 together with .data/.bss/heap/boot
+     * stacks (link.ld pins .data to exactly 0x00500000). */
     ldr r5, =mmu_l2_table_data
     orr r5, r5, #1
-    str r5, [r4, #16]
+    str r5, [r4, #20]
 
     /* Populate all 256 small-page entries. Small-page descriptor
      * format (DIFFERENT bit layout from the section format above --
@@ -506,7 +519,7 @@ mmu_init:
      * type+XN(0x3) = 0x53. Physical base now 0x00400000 (Section 4,
      * TASK #352 FIX) -- see this section's own comment above. */
     ldr r6, =mmu_l2_table_data
-    ldr r7, =0x00400000    /* first page's physical base */
+    ldr r7, =0x00500000    /* first page's physical base (Section 5, 2026-11-26) */
     mov r5, #0
 mmu_init_l2_data_loop:
     ldr r0, =0x73
@@ -558,8 +571,8 @@ mmu_init_l2_data_loop:
      * owns sections 3-4. Still ends at section 9 (5 sections of plain
      * RW RAM instead of 7), comfortable headroom before the per-task
      * domains start at Section 10 (0x00A00000). */
-    mov r6, #5
-    ldr r7, =0x00500000
+    mov r6, #6                 /* 2026-11-26: sections 6-9 (5 is the coarse table) */
+    ldr r7, =0x00600000
 mmu_init_ram_ext_loop:
     ldr r5, =0x00001C12
     orr r5, r5, r7
@@ -939,7 +952,7 @@ mmu_init_domain_outer_done:
  * stale, now-wrong TLB entry from its previous (valid, RW) mapping. */
 .global mmu_guard_page_install
 mmu_guard_page_install:
-    sub r1, r0, #0x00400000   /* TASK #352 FIX: Section 4, not 2 */
+    sub r1, r0, #0x00500000   /* 2026-11-26: Section 5 (was 4, TASK #352) -- see mmu_init */
     lsr r1, r1, #12
     ldr r2, =mmu_l2_table_data
     mov r3, #0

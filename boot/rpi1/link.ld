@@ -88,7 +88,16 @@ SECTIONS
      * without a second-level (4KB page) table, out of this round's
      * scope. Costs unused ADDRESS SPACE only (~896KB here), not
      * physical RAM commitment -- a trivial trade on a 512MB board. */
-    . = ALIGN(0x100000);
+    __code_end = .;
+    /* 2026-11-26: fixed layout, matching boot/mmu_init.S's section map:
+     * sections 2-4 (0x00200000-0x004FFFFF) are the only EXECUTABLE RAM;
+     * section 5 (0x00500000-0x005FFFFF) is the guard-page-capable coarse
+     * table that .data/.bss/heap/boot stacks must live in. These used to
+     * be implicit (ALIGN to the next 1 MB) -- when .text crossed 2 MB the
+     * kernel silently landed in an XN section and the data in a section
+     * without guard-page support. Now the build fails instead. */
+    ASSERT(__code_end <= 0x00500000, "code+rodata exceed the 3 MB executable window (mmu_init sections 2-4)")
+    . = 0x00500000;
 
     .data : { *(.data*) }
 
@@ -143,6 +152,7 @@ SECTIONS
     . = ALIGN(16);
     . = . + 0x1000;
     _abort_stack_top = .;
+    ASSERT(_abort_stack_top <= 0x00600000, "data/bss/heap/boot stacks exceed the guard-page section (mmu_init section 5)")
 
     /* No exception unwinding on bare metal, and no real .ARM.exidx
      * content to keep either -- but libgcc.a's unwind-arm.o (pulled in
