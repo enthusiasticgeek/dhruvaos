@@ -7,6 +7,40 @@ self-test + `phase4_milestone.py` battery, `heap_stress.py`/
 `power_yank.py`, commit). S/M/L/XL below is sized against that unit,
 not calendar time.
 
+## Current status — 2026-11-27 (read this first; supersedes older notes below where they conflict)
+
+**Pi 1B (real hardware available — priority):**
+- DONE, real-HW verified: WPA2 join (Message 2 now carries the STA RSNE;
+  eae666b) and DHCP over WiFi via software CCMP (4a70259); SD fixes —
+  post-write CMD13 busy wait, write-through ECC parity, no reset on ECC
+  failure (797ca8f); A/B kernel slots incl. automatic fallback (exercised
+  live 2026-11-26); boot fix for .text outgrowing the 2 MB executable
+  window + guard pages in the wrong section (f7dc84f, link.ld ASSERTs).
+- DONE, QEMU-verified, real-HW pending: TCP real-peer fixes (0b62be3);
+  bitsliced constant-time AES + per-frame key schedule (df8fe30);
+  tlsd TLS 1.3 server — X25519MLKEM768 + CHACHA20_POLY1305 + mutual
+  Ed25519, interop + 3 refusal cases vs OpenSSL 3.5
+  (test/qemu_tlsd_interop.py); Ed25519-signed kernel images (0ee9ee1);
+  ML-KEM-768 (a89ddfe); fsrepair (192cbb6); instruction cache + branch
+  prediction for code (9607f2f) with wall-clock delay() (ddf902c);
+  RTL8188CU power-off on warm start / reboot / shutdown (55bd9b2).
+- OPEN (in progress): WiFi bulk TCP stalled on real HW — measured
+  ~300 ms software CCMP per frame with caches off; option A (I-cache)
+  under test, option B (D-cache for stack pages only) if still needed.
+- OPEN: `kernelupload net` over tlsd + host script; provision
+  kernelsig/tlsd keys on the real board; run `fsrepair` on the real card
+  (/config/mode and /config/name unreadable since an unclean reset);
+  deploy stage0 CMD13 fix (7aeb631, needs SD card access); SD read
+  result-3 (CRC) retry; DharaFS log near full (7533/7600 blocks).
+- Notes: the bad-block bitmap doubles as the recovery scan's
+  "no valid record" cache (empty blocks are marked); netif has a single
+  consumer (foreground sessions set netif_fg_session).
+
+**Pi 4/5 (no hardware — after Pi 1B):** TCP fixes ported (a2ea802) but the
+ISN is not random (no RNG200 driver yet) and there is no IPv4 header
+checksum check; 4 boot self-tests already failing before 2026-11-26
+(FW rule matching, FW egress, TCP header/SYN, TCP lifecycle).
+
 ## Storage & USB portability (Pi 4 / Pi 5 / Compute Module)
 
 The filesystem layer below is named **DharaFS** ("dhara" — धर,
