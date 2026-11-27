@@ -377,6 +377,12 @@ extern "C" fn kernelsig_pub_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn kernelsig_pub_scratch_get() -> mut ref i64;
 extern "C" fn kernelsig_msg_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn kernelsig_msg_scratch_get() -> mut ref i64;
+extern "C" fn tcp_isn_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tcp_isn_scratch_get() -> mut ref i64;
+extern "C" fn tcpsink_frame_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tcpsink_frame_scratch_get() -> mut ref i64;
+extern "C" fn tcpsink_payload_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn tcpsink_payload_scratch_get() -> mut ref i64;
 extern "C" fn wifi_link_tx_body_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn wifi_link_tx_body_scratch_get() -> mut ref i64;
 extern "C" fn wifi_link_tx_frame_scratch_set(addr: mut ref i64) -> i64;
@@ -7107,6 +7113,15 @@ fn watchdog_init() -> i64 {
 }
 
 fn watchdog_kick() -> i64 {
+  // 2026-11-26: a no-op off real hardware. QEMU's PM model resets the
+  // machine on ANY PM_RSTC write (see watchdog_arm's callers above), so
+  // a kick under QEMU is always a reset. Every existing caller already
+  // guarded on hardware_is_real_hw_get() itself; two new loops
+  // (tcpsink, the WiFi DHCP acquire) didn't and rebooted QEMU mid-test.
+  // Centralizing the guard here makes that mistake impossible.
+  if hardware_is_real_hw_get() != (1 as u32) {
+    return 0;
+  }
   let fifteen_seconds_in_ticks: u32 = 983040 as u32;
   let _ = watchdog_arm(fifteen_seconds_in_ticks);
   return 0;
@@ -22708,7 +22723,7 @@ fn tcp_conn_active_open(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64,
   let _ = tcp_conn_set_rtx_count(conn_id, 0 as u32);
   let _ = tcp_conn_set_rtx_deadline(conn_id, scheduler_get_tick_count() + tcp_rtx_timeout_ticks());
   let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
-  return tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, initial_seq, 0 as u32, tcp_flag_syn(), 65535 as u32, empty_payload, 0);
+  return tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, initial_seq, 0 as u32, tcp_flag_syn(), TCP_RCV_WINDOW as u32, empty_payload, 0);
 }
 
 // Passive open (the listening/"server" side): records only the local
@@ -22738,6 +22753,19 @@ fn tcp_conn_passive_open(conn_id: u32, local_ip: u32, local_port: u32) -> i64 {
 //         (silently ignored, matching a real TCP's own tolerance of
 //         duplicate/out-of-order segments in a scope this minimal
 //         implementation doesn't attempt to handle)
+// 2026-11-26: advertised receive window. 65535 invited bursts this
+// stack can't absorb -- it consumes one in-order segment per netif poll
+// and drops anything out of order, and a radio's RX FIFO overflows
+// under a 44-segment burst. 3 x 1460 keeps at most a few segments in
+// flight.
+const TCP_RCV_WINDOW: i64 = 4380;
+
+fn tcp_random_isn() -> u32 {
+  let r: mut ref i64 = tcp_isn_scratch_get();
+  let _ = csprng_generate_heap(csprng_state_ptr(), csprng_counter_ptr(), r, 4);
+  return buf_read_u32_le(r, 0);
+}
+
 fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_mac: mut ref i64, dst_mac: mut ref i64, out_payload: mut ref i64, max_payload_len: i64) -> i64 {
   // BUG (round 8 audit, 2026-08-27): this function -- the live TCP
   // receive path -- never checked an incoming segment's checksum
@@ -22765,7 +22793,18 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
   if ipv4_verify_checksum(frame, 14) != 1 {
     return 0 - 1;
   }
-  let tcp_seg_len: i64 = recv_len - 34;
+  // BUG FIXED 2026-11-26: the TCP length was recv_len - 34, i.e. derived
+  // from the FRAME length. Ethernet pads short frames to 60 bytes (and
+  // QEMU's CDC-ECM delivers them padded), so every short segment -- a
+  // SYN, a pure ACK -- was checksummed over padding and silently
+  // dropped: no real peer could even connect (found by tcpsink against
+  // Linux via QEMU hostfwd: frame_len=60, ip_total_len=44). Use the IP
+  // header's total length, bounded by what was actually received.
+  let ip_total_len: i64 = ipv4_get_total_len(frame, 14) as i64;
+  if (ip_total_len < 40) || ((14 + ip_total_len) > recv_len) {
+    return 0 - 1;
+  }
+  let tcp_seg_len: i64 = ip_total_len - 20;
   let checksum_src_ip: u32 = ipv4_get_src_ip(frame, 14);
   let checksum_dst_ip: u32 = ipv4_get_dst_ip(frame, 14);
   if tcp_verify_checksum(checksum_src_ip, checksum_dst_ip, frame, 34, tcp_seg_len) != 1 {
@@ -22792,17 +22831,30 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
   // tcp_conn_send_data, closing the "accepted, never enforced" gap.
   let _ = tcp_conn_set_remote_window(conn_id, tcp_get_window(frame, 34));
 
+  // 2026-11-26: RST was never handled -- a reset peer left the
+  // connection open forever. Only an exactly in-sequence RST is honored
+  // (RFC 5961 3.2), so a blind off-path RST can't tear it down.
+  if ((flags & tcp_flag_rst()) != (0 as u32)) && (state != tcp_state_closed()) {
+    if seg_seq == tcp_conn_get_remote_seq(conn_id) {
+      let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
+      let _ = tcp_conn_set_state(conn_id, tcp_state_closed_final());
+    }
+    return 0 - 1;
+  }
+
   // Passive open, first SYN arriving: only reachable from CLOSED with
   // a local_port already configured by tcp_conn_passive_open.
   if (state == tcp_state_closed()) && (has_syn == 1) && (tcp_get_dst_port(frame, 34) == local_port) {
     let _ = tcp_conn_set_remote_ip(conn_id, ipv4_get_src_ip(frame, 14));
     let _ = tcp_conn_set_remote_port(conn_id, tcp_get_src_port(frame, 34));
     let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32)); // SYN consumes one seq number
-    let server_isn: u32 = 5000 as u32;
+    // 2026-11-26: random ISN (RFC 6528 intent) -- the fixed 5000 made
+    // sequence numbers trivially predictable for off-path injection.
+    let server_isn: u32 = tcp_random_isn();
     let _ = tcp_conn_set_local_seq(conn_id, server_isn);
     let _ = tcp_conn_set_state(conn_id, tcp_state_syn_rcvd());
     let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
-    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), server_isn, tcp_conn_get_remote_seq(conn_id), tcp_flag_syn() | tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), server_isn, tcp_conn_get_remote_seq(conn_id), tcp_flag_syn() | tcp_flag_ack(), TCP_RCV_WINDOW as u32, empty_payload, 0);
     return 0;
   }
 
@@ -22819,7 +22871,7 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
     let _ = tcp_conn_set_local_seq(conn_id, new_local_seq);
     let _ = tcp_conn_set_state(conn_id, tcp_state_established());
     let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
-    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), new_local_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), new_local_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), TCP_RCV_WINDOW as u32, empty_payload, 0);
     return 0;
   }
 
@@ -22841,53 +22893,61 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
     let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
     let _ = tcp_conn_set_state(conn_id, tcp_state_syn_rcvd());
     let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
-    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_syn() | tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_syn() | tcp_flag_ack(), TCP_RCV_WINDOW as u32, empty_payload, 0);
     return 0;
   }
 
   // Passive-open side receiving the final ACK of the handshake.
-  if (state == tcp_state_syn_rcvd()) && (has_ack == 1) && (seg_ack == (tcp_conn_get_local_seq(conn_id) + (1 as u32))) {
-    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32));
-    let _ = tcp_conn_set_state(conn_id, tcp_state_established());
+  // 2026-11-26: our SYN-ACK was lost and the peer retransmitted its SYN
+  // -- previously matched no branch, leaving the handshake stuck.
+  if (state == tcp_state_syn_rcvd()) && (has_syn == 1) && (has_ack == 0) && (wrapping_add(seg_seq, 1 as u32) == tcp_conn_get_remote_seq(conn_id)) {
+    let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_syn() | tcp_flag_ack(), TCP_RCV_WINDOW as u32, empty_payload, 0);
     return 0;
   }
 
-  // Established, a data segment arrives in order: copy the payload
-  // out, advance what we expect next, and acknowledge it.
-  //
-  // BUG (found via audit, 2026-08-27, same shape and same "never
-  // actually triggered yet" caveat as socket_udp_recv's identical
-  // fix -- see that function's own comment for the full reasoning):
-  // payload_len came entirely from the segment's OWN self-reported
-  // IPv4 total-length field, untrusted data carried inside the frame
-  // being parsed, never checked against recv_len (what netif actually
-  // received) or against out_payload's real capacity. A malformed or
-  // hostile segment on any real link could drive the copy loop to
-  // read past frame's real bounds and write past out_payload's real
-  // allocation. Same three-fold guard as socket_udp_recv: reject
-  // (don't truncate) a negative length, a declared extent past
-  // recv_len, or a payload bigger than the caller's own buffer
-  // (max_payload_len, now a required parameter for the same reason).
-  // data_offset also gets a sanity floor -- a value under 20 bytes
-  // isn't a valid TCP header at all (this stack never sends or
-  // expects options, so it should always read exactly 20, but a
-  // malformed segment could claim otherwise) and would otherwise let
-  // the "payload" start being read from inside the header itself.
-  if (state == tcp_state_established()) && (has_psh == 1) && (seg_seq == tcp_conn_get_remote_seq(conn_id)) {
+  // Handshake-completing ACK. Falls through: the same segment may
+  // already carry data (it used to be dropped here).
+  if (state == tcp_state_syn_rcvd()) && (has_ack == 1) && (seg_ack == (tcp_conn_get_local_seq(conn_id) + (1 as u32))) {
+    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32));
+    let _ = tcp_conn_set_state(conn_id, tcp_state_established());
+  }
+
+  // 2026-11-26: ESTABLISHED rewritten for real peers. Previously data
+  // was accepted ONLY with PSH set (Linux sets PSH just on the last
+  // segment of a write, so bulk segments were silently dropped,
+  // unACKed, until retransmission timeouts), an ACK riding on a data
+  // segment never cleared the retransmit timer, and an old/out-of-order
+  // segment got no ACK at all (defeating the peer's fast retransmit).
+  // Now: every segment's ACK field is processed; in-order data is
+  // accepted with or without PSH; anything else is answered with a
+  // duplicate ACK of rcv_nxt; FIN is honored only in sequence.
+  if (has_syn == 0) && (tcp_conn_get_state(conn_id) == tcp_state_established()) {
+    if (has_ack == 1) && (tcp_conn_get_rtx_deadline(conn_id) != (0 as u32)) {
+      let rtx_seq: u32 = tcp_conn_get_rtx_seq(conn_id);
+      let rtx_len: u32 = tcp_conn_get_rtx_len(conn_id);
+      let target: u32 = wrapping_add(rtx_seq, rtx_len);
+      let diff: u32 = wrapping_sub(seg_ack, target);
+      if diff < (0x80000000 as u32) {
+        let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
+      }
+    }
     let tcp_len: i64 = ipv4_get_total_len(frame, 14) as i64 - 20;
     let data_offset: i64 = tcp_get_data_offset_bytes(frame, 34);
     let payload_len: i64 = tcp_len - data_offset;
-    if data_offset < 20 {
+    if (data_offset < 20) || (payload_len < 0) || ((34 + data_offset + payload_len) > recv_len) {
       return 0 - 1;
     }
-    if payload_len < 0 {
-      return 0 - 1;
+    if (payload_len == 0) && (has_fin == 0) {
+      return 0; // pure ACK (or window update)
     }
-    if (34 + data_offset + payload_len) > recv_len {
-      return 0 - 1;
+    if seg_seq != tcp_conn_get_remote_seq(conn_id) {
+      let dup_empty: mut ref i64 = tcp_empty_payload_scratch_get();
+      let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), TCP_RCV_WINDOW as u32, dup_empty, 0);
+      return 0;
     }
     if payload_len > max_payload_len {
-      return 0 - 1;
+      return 0 - 1; // caller's buffer too small: not ACKed, peer retransmits
     }
     let i: i64 = 0;
     while i < payload_len {
@@ -22897,89 +22957,25 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
     }
     let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (payload_len as u32));
     let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
-    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+    if has_fin == 1 {
+      // Passive close, same collapsed CLOSE_WAIT->LAST_ACK behavior as
+      // before: ACK the FIN and send ours in one segment.
+      let _ = tcp_conn_set_remote_seq(conn_id, tcp_conn_get_remote_seq(conn_id) + (1 as u32)); // FIN consumes one seq number
+      let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait());
+      let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack() | tcp_flag_fin(), TCP_RCV_WINDOW as u32, empty_payload, 0);
+      let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // our own FIN
+      return payload_len;
+    }
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), TCP_RCV_WINDOW as u32, empty_payload, 0);
     return payload_len;
   }
 
-  // Established, a pure ACK for data we sent. Round 37: if a data
-  // retransmission is pending (rtx_deadline != 0) and this ACK covers
-  // it (seg_ack has advanced at least to the byte past the pending
-  // segment's own last byte), the peer got it -- cancel the timer.
-  // rtx_len==0 would mean no data is pending (only a SYN could be,
-  // and a SYN's own retransmission is cancelled by the two branches
-  // above instead, never here), so this check is naturally a no-op in
-  // that case without needing a separate guard.
-  if (state == tcp_state_established()) && (has_ack == 1) && (has_fin == 0) && (has_psh == 0) && (has_syn == 0) {
-    if tcp_conn_get_rtx_deadline(conn_id) != (0 as u32) {
-      let rtx_seq: u32 = tcp_conn_get_rtx_seq(conn_id);
-      let rtx_len: u32 = tcp_conn_get_rtx_len(conn_id);
-      // Protocol audit: plain unsigned >= breaks the instant sequence
-      // numbers wrap past 0xFFFFFFFF (never hit by this project's own
-      // short test ISNs, but a real latent bug for any long-lived
-      // connection) -- vani has no i32 to mirror Linux's own
-      // before()/after() (include/net/tcp.h) signed-subtraction
-      // macros directly, so get the same wraparound-safe result with
-      // unsigned-only arithmetic: a wrapping u32 subtraction's result
-      // has the same bit pattern as the signed difference would, so
-      // checking its top bit is clear (< 0x80000000) is exactly
-      // "(i32)(seg_ack - target) >= 0". MUST use wrapping_add/
-      // wrapping_sub, not plain +/- -- plain u32 `-` traps on
-      // underflow in vani (found live: this exact line crashed every
-      // boot with "integer overflow in u32 sub" the moment seg_ack <
-      // target, which is the ordinary not-yet-caught-up case, not a
-      // real wraparound), it does not silently wrap like C.
-      let target: u32 = wrapping_add(rtx_seq, rtx_len);
-      let diff: u32 = wrapping_sub(seg_ack, target);
-      if diff < (0x80000000 as u32) {
-        let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
-      }
-    }
-    return 0;
-  }
-
-  // Established, the peer starts closing: this side has nothing more
-  // to send either, so it piggybacks its own FIN onto the ACK
-  // (a real, legitimate simplified-close shape, not a shortcut this
-  // implementation invented) and moves to FIN_WAIT for the final ACK.
-  if (state == tcp_state_established()) && (has_fin == 1) {
-    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32)); // FIN consumes one seq number
-    let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait());
-    let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
-    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack() | tcp_flag_fin(), 65535 as u32, empty_payload, 0);
-    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // our own FIN
-    return 0;
-  }
-
-  // The initiating closer receiving the peer's response to its own
-  // FIN. BUG (found live, via the self-test's own final ACK never
-  // showing up in the loopback queue): the peer's response here is
-  // the SAME simplified-close shape this side's own ESTABLISHED/FIN
-  // branch above produces when IT'S the one responding to a FIN --
-  // a single segment carrying BOTH the ACK of this side's FIN AND the
-  // peer's own piggybacked closing FIN, not just a bare ACK. The
-  // first version of this branch checked only has_ack and moved
-  // straight to CLOSED_FINAL, silently never acknowledging the peer's
-  // own FIN bit riding along in that same segment -- the peer was
-  // then left waiting forever in FIN_WAIT for an ACK that this side
-  // never sends. Fixed: if the peer's FIN bit is ALSO set here, send
-  // that ACK before considering the connection closed.
-  //
-  // Round 72: this used to treat ANY ack while in FIN_WAIT as proof
-  // our own FIN was acknowledged -- correct for the normal one-sided
-  // close above (the peer was ESTABLISHED, saw our FIN, and its
-  // response necessarily acknowledges it), but WRONG for simultaneous
-  // close: if the peer independently called tcp_conn_close before
-  // ever seeing ours, its FIN+ACK segment acknowledges only whatever
-  // it last knew from us, not our FIN specifically. our_fin_acked
-  // checks that explicitly (seg_ack must equal our own local_seq,
-  // which tcp_conn_close already advanced past our FIN's own sequence
-  // number) rather than assuming any ack qualifies.
   if (state == tcp_state_fin_wait()) && (has_ack == 1) {
     let our_fin_acked: i64 = if seg_ack == tcp_conn_get_local_seq(conn_id) { 1 } else { 0 };
     if has_fin == 1 {
       let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
       let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
-      let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+      let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), TCP_RCV_WINDOW as u32, empty_payload, 0);
       if our_fin_acked == 1 {
         let _ = tcp_conn_set_state(conn_id, tcp_state_closed_final());
       } else {
@@ -23037,7 +23033,7 @@ fn tcp_conn_send_data(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, p
     return 0 - 1;
   }
   let seq_before: u32 = tcp_conn_get_local_seq(conn_id);
-  let status: i64 = tcp_send_segment(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), seq_before, tcp_conn_get_remote_seq(conn_id), tcp_flag_psh() | tcp_flag_ack(), 65535 as u32, payload, payload_len);
+  let status: i64 = tcp_send_segment(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), seq_before, tcp_conn_get_remote_seq(conn_id), tcp_flag_psh() | tcp_flag_ack(), TCP_RCV_WINDOW as u32, payload, payload_len);
   let _ = tcp_conn_set_local_seq(conn_id, seq_before + (payload_len as u32));
   if status == 0 {
     let rtx_buf: mut ref i64 = tcp_conn_get_rtx_buf(conn_id);
@@ -23062,7 +23058,7 @@ fn tcp_conn_send_data(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64, p
 // side is waiting for.
 fn tcp_conn_close(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref i64) -> i64 {
   let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
-  let status: i64 = tcp_send_segment(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_fin() | tcp_flag_ack(), 65535 as u32, empty_payload, 0);
+  let status: i64 = tcp_send_segment(my_mac, dst_mac, tcp_conn_get_local_ip(conn_id), tcp_conn_get_remote_ip(conn_id), tcp_conn_get_local_port(conn_id), tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_fin() | tcp_flag_ack(), TCP_RCV_WINDOW as u32, empty_payload, 0);
   let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // FIN consumes one
   let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait());
   return status;
@@ -23111,7 +23107,7 @@ fn tcp_conn_check_retransmit(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref
     // Bare-SYN retransmission -- active_open's own SYN never got a
     // reply.
     let empty_payload: mut ref i64 = tcp_empty_payload_scratch_get();
-    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, rtx_seq, 0 as u32, tcp_flag_syn(), 65535 as u32, empty_payload, 0);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, rtx_seq, 0 as u32, tcp_flag_syn(), TCP_RCV_WINDOW as u32, empty_payload, 0);
   } else {
     // Data-segment retransmission -- send_data's own segment never
     // got acked. Uses the CURRENT remote_seq for the ack field (this
@@ -23119,7 +23115,7 @@ fn tcp_conn_check_retransmit(conn_id: u32, my_mac: mut ref i64, dst_mac: mut ref
     // because a retransmit is happening), same as every other
     // outgoing segment this project builds.
     let rtx_buf: mut ref i64 = tcp_conn_get_rtx_buf(conn_id);
-    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, rtx_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_psh() | tcp_flag_ack(), 65535 as u32, rtx_buf, rtx_len);
+    let _ = tcp_send_segment(my_mac, dst_mac, local_ip, remote_ip, local_port, remote_port, rtx_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_psh() | tcp_flag_ack(), TCP_RCV_WINDOW as u32, rtx_buf, rtx_len);
   }
   let _ = tcp_conn_set_rtx_count(conn_id, count + (1 as u32));
   let _ = tcp_conn_set_rtx_deadline(conn_id, scheduler_get_tick_count() + tcp_rtx_timeout_ticks());
@@ -23194,7 +23190,9 @@ fn tcp_send_rst_for_unmatched(frame: mut ref i64, frame_len: i64, my_mac: mut re
   let seg_seq: u32 = tcp_get_seq(frame, 34);
   let seg_ack: u32 = tcp_get_ack(frame, 34);
   let data_offset: i64 = tcp_get_data_offset_bytes(frame, 34);
-  let payload_len: i64 = frame_len - 34 - data_offset;
+  // 2026-11-26: from the IP total length, not the (possibly padded)
+  // frame length -- see tcp_conn_handle_segment.
+  let payload_len: i64 = (ipv4_get_total_len(frame, 14) as i64) - 20 - data_offset;
   if payload_len < 0 {
     return 0 - 1;
   }
@@ -48864,6 +48862,14 @@ fn shell_dispatch() -> i64 {
   if shell_word_matches(line_buf, 0, cmd_end, "sshd") == 1 {
     return ssh_real_server_cmd();
   }
+  if shell_word_matches(line_buf, 0, cmd_end, "tcpsink") == 1 {
+    let tp: i64 = if cmd_end >= line_len { 5555 } else { shell_parse_decimal(line_buf, cmd_end + 1, shell_find_space(line_buf, cmd_end + 1, line_len)) };
+    if (tp <= 0) || (tp > 65535) {
+      let _ = uart_puts("usage: tcpsink [port]\n");
+      return 0;
+    }
+    return tcpsink_cmd(tp as u32);
+  }
 
   // Round 108: HTTPS -- the `http` kosh package's own request/response
   // build+parse layered directly on top of tlsecho's own proven real
@@ -61729,6 +61735,115 @@ fn ssh_real_server_session(conn_id: u32, my_mac: mut ref i64) -> i64 {
   return 0;
 }
 
+// 2026-11-26: `tcpsink <port>` -- accepts ONE TCP connection on the
+// netif's current IP, consumes the byte stream until the peer closes
+// (FIN) or 30 s of silence, and reports byte count, SHA-256 and rate.
+// A raw-TCP throughput/correctness probe against a real peer stack
+// (QEMU hostfwd or the board's WiFi link) -- and the transport the
+// network kernel upload builds on. Uses connection slot 1 (same as sshd;
+// both are foreground and never concurrent).
+fn sha256_update_heap(ctx: Sha256Ctx, buf: mut ref i64, data_len: i64) -> Sha256Ctx {
+  let c: Sha256Ctx = ctx;
+  let off: i64 = 0;
+  while off < data_len {
+    let n: i64 = if (data_len - off) < 256 { data_len - off } else { 256 };
+    let chunk: [u8; 256] = zero256_bytes();
+    let i: i64 = 0;
+    while i < n { chunk[i] = buf_read_byte(buf, (off + i) as u32) as u8; i = i + 1; }
+    c = sha256_update(ref c, mut ref chunk, n);
+    off = off + n;
+  }
+  return c;
+}
+
+fn tcpsink_cmd(port: u32) -> i64 {
+  let conn_id: u32 = 1 as u32;
+  let my_mac: mut ref i64 = shell_my_mac_scratch_get();
+  let _ = netif_get_mac(my_mac);
+  let dst_mac: mut ref i64 = ssh_dst_mac_get();
+  let frame: mut ref i64 = tcpsink_frame_scratch_get();
+  let payload: mut ref i64 = tcpsink_payload_scratch_get();
+  let _ = tcp_conn_passive_open(conn_id, dhcp_state_get_leased_ip(), port);
+  let _ = uart_puts("tcpsink: listening on ");
+  let _ = uart_put_ip(dhcp_state_get_leased_ip());
+  let _ = uart_puts(":");
+  let _ = uart_put_i64(port as i64);
+  let _ = uart_puts("\n");
+  let ctx: Sha256Ctx = sha256_init();
+  let total: i64 = 0;
+  let t_accept_deadline: u32 = mmio_read_u32(TIMER_CLO);
+  let t_first: u32 = 0 as u32;
+  let t_last: u32 = mmio_read_u32(TIMER_CLO);
+  let done: i64 = 0;
+  let n_frames: i64 = 0;
+  let n_ipv4: i64 = 0;
+  let n_tcp_port: i64 = 0;
+  let n_syn: i64 = 0;
+  while done == 0 {
+    let _ = watchdog_kick();
+    let now: u32 = mmio_read_u32(TIMER_CLO);
+    let st: u32 = tcp_conn_get_state(conn_id);
+    if (st == tcp_state_closed()) && (wrapping_sub(now, t_accept_deadline) > (60000000 as u32)) {
+      let _ = uart_puts("tcpsink: no connection within 60 s (frames=");
+      let _ = uart_put_i64(n_frames);
+      let _ = uart_puts(" ipv4=");
+      let _ = uart_put_i64(n_ipv4);
+      let _ = uart_puts(" tcp_to_port=");
+      let _ = uart_put_i64(n_tcp_port);
+      let _ = uart_puts(" syn=");
+      let _ = uart_put_i64(n_syn);
+      let _ = uart_puts(")\n");
+      return 0 - 1;
+    }
+    if (st != tcp_state_closed()) && (wrapping_sub(now, t_last) > (30000000 as u32)) {
+      let _ = uart_puts("tcpsink: 30 s idle, giving up\n");
+      done = 1;
+    }
+    if (st == tcp_state_fin_wait()) || (st == tcp_state_closed_final()) || (st == tcp_state_closing()) {
+      done = 1;
+    }
+    let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+    let flen: i64 = netif_recv_frame(frame, 1514);
+    if flen > 0 {
+      n_frames = n_frames + 1;
+      if buf_read_u16_be(frame, 12) == (0x0800 as u32) { n_ipv4 = n_ipv4 + 1; }
+      if (buf_read_u16_be(frame, 12) == (0x0800 as u32)) && (ipv4_get_protocol(frame, 14) == (6 as u32)) && (tcp_get_dst_port(frame, 34) == port) {
+        n_tcp_port = n_tcp_port + 1;
+        if (tcp_get_flags(frame, 34) & tcp_flag_syn()) != (0 as u32) { n_syn = n_syn + 1; }
+        if tcp_conn_get_state(conn_id) == tcp_state_closed() {
+          let mi: i64 = 0;
+          while mi < 6 { let _ = buf_write_byte(dst_mac, mi as u32, buf_read_byte(frame, (6 + mi) as u32)); mi = mi + 1; }
+        }
+        let n: i64 = tcp_conn_handle_segment(conn_id, frame, flen, my_mac, dst_mac, payload, 1514);
+        if n > 0 {
+          if total == 0 { t_first = mmio_read_u32(TIMER_CLO); }
+          ctx = sha256_update_heap(ctx, payload, n);
+          total = total + n;
+          t_last = mmio_read_u32(TIMER_CLO);
+        }
+      }
+    }
+    let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+  }
+  let digest: [u8; 32] = sha256_finalize(ref ctx);
+  let el: u32 = wrapping_sub(t_last, t_first);
+  let _ = uart_puts("tcpsink: received ");
+  let _ = uart_put_i64(total);
+  let _ = uart_puts(" bytes sha256=");
+  let di: i64 = 0;
+  while di < 32 { let _ = uart_put_hex_byte(digest[di] as u32); di = di + 1; }
+  let _ = uart_puts(" in ");
+  let _ = uart_put_i64(el as i64);
+  let _ = uart_puts(" us");
+  if el > (0 as u32) {
+    let _ = uart_puts(" (");
+    let _ = uart_put_i64((total * 1000000) / (el as i64));
+    let _ = uart_puts(" B/s)");
+  }
+  let _ = uart_puts("\n");
+  return 0;
+}
+
 fn ssh_real_server_cmd() -> i64 {
   // 2026-10-23 (same fix as `ping`'s own entry-point comment, DWC2_
   // MUTEX_ID's own header): drop shell_dispatch's OUTER dhruva_prio_
@@ -63657,6 +63772,9 @@ fn kernel_main() -> i64 {
   let _ = kernelupload_sig_scratch_set(ksig_buf);
   let _ = kernelsig_pub_scratch_set(dhruva_alloc_bytes(64));
   let _ = kernelsig_msg_scratch_set(dhruva_alloc_bytes(64));
+  let _ = tcp_isn_scratch_set(dhruva_alloc_bytes(8));
+  let _ = tcpsink_frame_scratch_set(dhruva_alloc_bytes(1514));
+  let _ = tcpsink_payload_scratch_set(dhruva_alloc_bytes(1514));
   let _ = wifi_join_bssid_scratch_set(dhruva_alloc_bytes(6));
   let _ = wifi_scan_tx_scratch_set(dhruva_alloc_bytes(64));
   let _ = wifi_scan_rx_scratch_set(dhruva_alloc_bytes(WIFI_RX_FRAME_MAX));

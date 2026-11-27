@@ -2981,3 +2981,54 @@ kernelsig_msg_scratch_get:
     ldr r0, =kernelsig_msg_addr
     ldr r0, [r0]
     bx lr
+
+/* 2026-11-26: TCP ISN + tcpsink scratch. */
+.section ".bss"
+.align 4
+tcp_isn_addr:
+    .word 0             /* 8 bytes -- tcp_random_isn CSPRNG output. */
+tcpsink_frame_addr:
+    .word 0             /* 1514 bytes -- tcpsink frame buffer. */
+tcpsink_payload_addr:
+    .word 0             /* 1514 bytes -- tcpsink segment payload buffer. */
+
+.section ".text"
+
+.global tcp_isn_scratch_set
+tcp_isn_scratch_set:
+    ldr r1, =tcp_isn_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global tcp_isn_scratch_get
+tcp_isn_scratch_get:
+    ldr r0, =tcp_isn_addr
+    ldr r0, [r0]
+    bx lr
+
+.global tcpsink_frame_scratch_set
+tcpsink_frame_scratch_set:
+    ldr r1, =tcpsink_frame_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global tcpsink_frame_scratch_get
+tcpsink_frame_scratch_get:
+    ldr r0, =tcpsink_frame_addr
+    ldr r0, [r0]
+    bx lr
+
+.global tcpsink_payload_scratch_set
+tcpsink_payload_scratch_set:
+    ldr r1, =tcpsink_payload_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global tcpsink_payload_scratch_get
+tcpsink_payload_scratch_get:
+    ldr r0, =tcpsink_payload_addr
+    ldr r0, [r0]
+    bx lr
