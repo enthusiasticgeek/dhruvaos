@@ -707,6 +707,27 @@ int stage0_sd_write_block(unsigned int block_num, const void *buf) {
     mmio_w(SDHSTS_ADDR, sdhsts2);
     if (sdhsts2 != 0) return -9;
 
+    /* 2026-11-26 (SD audit, same fix as the kernel's
+     * sdhost_wait_card_ready): the write isn't finished until the card
+     * leaves PRG -- poll CMD13 until READY_FOR_DATA (bit 8) and
+     * CURRENT_STATE == TRAN (4), up to the SD spec's 500 ms write
+     * timeout. Without this, the kernel-image reads that immediately
+     * follow this slot-state write can hit a still-programming card
+     * (CMD16/CMD17 are illegal outside TRAN). Linux mmc core and
+     * U-Boot both poll CMD13 after every write. */
+    {
+        unsigned int t1 = now_us();
+        for (;;) {
+            struct cmd_result st;
+            stage0_send_cmd(13, s_rca << 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, &st);
+            if (st.err == 0) {
+                unsigned int r1 = st.response[0];
+                if ((r1 & 0x100u) && (((r1 >> 9) & 0xFu) == 4u)) break;
+            }
+            if (elapsed_at_least(t1, 500000u)) return -9;
+        }
+    }
+
     return 0;
 }
 
