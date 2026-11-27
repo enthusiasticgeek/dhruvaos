@@ -2204,8 +2204,32 @@ fn tcp_conn_passive_open_rpi4(conn_id: u32, local_ip: u32, local_port: u32) -> i
 // Direct port of kernel_main.vani's own tcp_conn_handle_segment,
 // including its own round-8-audit checksum verification and
 // round-8-audit data-segment bounds checks.
+// 2026-11-26 (ported from Pi 1): advertised receive window, see the Pi 1
+// kernel's TCP_RCV_WINDOW comment.
+const TCP_RCV_WINDOW_RPI4: i64 = 4380;
+
+// 2026-11-26: replaces the constant ISN 5000. NOT cryptographically
+// random -- this kernel has no entropy source yet (the BCM2711 RNG200
+// driver is a separate, unwritten piece); a tick-count mix only avoids
+// the trivially-predictable constant. Swap for an RNG200 draw once that
+// driver exists.
+fn tcp_isn_rpi4() -> u32 {
+  let t: u32 = rpi4_timer_tick_count_get() as u32;
+  return ((t << (16 as u32)) ^ (t >> (3 as u32))) ^ (0x6d2b79f5 as u32);
+}
+
 fn tcp_conn_handle_segment_rpi4(conn_id: u32, frame: ref [u8; 512], recv_len: i64, my_mac: ref [u8; 6], dst_mac: ref [u8; 6], out_payload: mut ref [u8; 512], max_payload_len: i64) -> i64 {
-  let tcp_seg_len: i64 = recv_len - 34;
+  // BUG FIXED 2026-11-26 (ported from the Pi 1 kernel): TCP length from
+  // the IP total length, not the frame length -- Ethernet pads short
+  // frames to 60 bytes, so every SYN/pure ACK failed its checksum and no
+  // real peer could connect. (Still missing here vs Pi 1: an IPv4
+  // header-checksum check -- ipv4_verify_checksum_rpi4 needs a mutable
+  // frame this read-only handler doesn't have.)
+  let ip_total_len: i64 = ipv4_get_total_len_rpi4(frame, 14) as i64;
+  if (ip_total_len < 40) || ((14 + ip_total_len) > recv_len) {
+    return 0 - 1;
+  }
+  let tcp_seg_len: i64 = ip_total_len - 20;
   let checksum_src_ip: u32 = ipv4_get_src_ip_rpi4(frame, 14);
   let checksum_dst_ip: u32 = ipv4_get_dst_ip_rpi4(frame, 14);
   if tcp_verify_checksum_rpi4(checksum_src_ip, checksum_dst_ip, frame, 34, tcp_seg_len) != 1 {
@@ -2231,15 +2255,24 @@ fn tcp_conn_handle_segment_rpi4(conn_id: u32, frame: ref [u8; 512], recv_len: i6
 
   let empty_payload: [u8; 512] = netif_zero_frame_rpi4();
 
+  // 2026-11-26 (ported): honor only an exactly in-sequence RST (RFC 5961).
+  if ((flags & tcp_flag_rst_rpi4()) != (0 as u32)) && (state != tcp_state_closed_rpi4()) {
+    if seg_seq == tcp_conn_get_remote_seq(conn_id) {
+      let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
+      let _ = tcp_conn_set_state(conn_id, tcp_state_closed_final_rpi4());
+    }
+    return 0 - 1;
+  }
+
   // Passive open, first SYN arriving.
   if (state == tcp_state_closed_rpi4()) && (has_syn == 1) && (tcp_get_dst_port_rpi4(frame, 34) == local_port) {
     let _ = tcp_conn_set_remote_ip(conn_id, ipv4_get_src_ip_rpi4(frame, 14));
     let _ = tcp_conn_set_remote_port(conn_id, tcp_get_src_port_rpi4(frame, 34));
     let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32)); // SYN consumes one seq number
-    let server_isn: u32 = 5000 as u32;
+    let server_isn: u32 = tcp_isn_rpi4();
     let _ = tcp_conn_set_local_seq(conn_id, server_isn);
     let _ = tcp_conn_set_state(conn_id, tcp_state_syn_rcvd_rpi4());
-    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), server_isn, tcp_conn_get_remote_seq(conn_id), tcp_flag_syn_rpi4() | tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), server_isn, tcp_conn_get_remote_seq(conn_id), tcp_flag_syn_rpi4() | tcp_flag_ack_rpi4(), TCP_RCV_WINDOW_RPI4 as u32, ref empty_payload, 0);
     return 0;
   }
 
@@ -2251,7 +2284,7 @@ fn tcp_conn_handle_segment_rpi4(conn_id: u32, frame: ref [u8; 512], recv_len: i6
     let new_local_seq: u32 = tcp_conn_get_local_seq(conn_id) + (1 as u32); // our own SYN consumed one
     let _ = tcp_conn_set_local_seq(conn_id, new_local_seq);
     let _ = tcp_conn_set_state(conn_id, tcp_state_established_rpi4());
-    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), new_local_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), new_local_seq, tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), TCP_RCV_WINDOW_RPI4 as u32, ref empty_payload, 0);
     return 0;
   }
 
@@ -2264,35 +2297,45 @@ fn tcp_conn_handle_segment_rpi4(conn_id: u32, frame: ref [u8; 512], recv_len: i6
     let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32); // peer answered
     let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
     let _ = tcp_conn_set_state(conn_id, tcp_state_syn_rcvd_rpi4());
-    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_syn_rpi4() | tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_syn_rpi4() | tcp_flag_ack_rpi4(), TCP_RCV_WINDOW_RPI4 as u32, ref empty_payload, 0);
     return 0;
   }
 
   // Passive-open side receiving the final ACK of the handshake.
-  if (state == tcp_state_syn_rcvd_rpi4()) && (has_ack == 1) && (seg_ack == (tcp_conn_get_local_seq(conn_id) + (1 as u32))) {
-    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32));
-    let _ = tcp_conn_set_state(conn_id, tcp_state_established_rpi4());
+  // 2026-11-26 (ported): retransmitted SYN while in SYN_RCVD -> resend SYN-ACK.
+  if (state == tcp_state_syn_rcvd_rpi4()) && (has_syn == 1) && (has_ack == 0) && (wrapping_add(seg_seq, 1 as u32) == tcp_conn_get_remote_seq(conn_id)) {
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_syn_rpi4() | tcp_flag_ack_rpi4(), TCP_RCV_WINDOW_RPI4 as u32, ref empty_payload, 0);
     return 0;
   }
 
-  // Established, a data segment arrives in order: copy the payload
-  // out, advance what we expect next, and acknowledge it. Same
-  // round-8-audit bounds checks as kernel_main.vani's own version
-  // (reject a negative length, a declared extent past recv_len, a
-  // payload bigger than the caller's own buffer, or a data_offset
-  // under 20 bytes).
-  if (state == tcp_state_established_rpi4()) && (has_psh == 1) && (seg_seq == tcp_conn_get_remote_seq(conn_id)) {
-    let tcp_len: i64 = (ipv4_get_total_len_rpi4(frame, 14) as i64) - 20;
+  // Handshake-completing ACK; falls through (may carry data).
+  if (state == tcp_state_syn_rcvd_rpi4()) && (has_ack == 1) && (seg_ack == (tcp_conn_get_local_seq(conn_id) + (1 as u32))) {
+    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32));
+    let _ = tcp_conn_set_state(conn_id, tcp_state_established_rpi4());
+  }
+
+  // 2026-11-26 (ported from Pi 1): ESTABLISHED for real peers -- ACK on
+  // every segment (wrap-safe), in-order data with or without PSH, dup
+  // ACK otherwise, in-sequence FIN.
+  if (has_syn == 0) && (tcp_conn_get_state(conn_id) == tcp_state_established_rpi4()) {
+    if (has_ack == 1) && (tcp_conn_get_rtx_deadline(conn_id) != (0 as u32)) {
+      let target: u32 = wrapping_add(tcp_conn_get_rtx_seq(conn_id), tcp_conn_get_rtx_len(conn_id));
+      if wrapping_sub(seg_ack, target) < (0x80000000 as u32) {
+        let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
+      }
+    }
+    let tcp_len: i64 = ip_total_len - 20;
     let data_offset: i64 = tcp_get_data_offset_bytes_rpi4(frame, 34);
     let payload_len: i64 = tcp_len - data_offset;
-    if data_offset < 20 {
+    if (data_offset < 20) || (payload_len < 0) || ((34 + data_offset + payload_len) > recv_len) {
       return 0 - 1;
     }
-    if payload_len < 0 {
-      return 0 - 1;
+    if (payload_len == 0) && (has_fin == 0) {
+      return 0;
     }
-    if (34 + data_offset + payload_len) > recv_len {
-      return 0 - 1;
+    if seg_seq != tcp_conn_get_remote_seq(conn_id) {
+      let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), TCP_RCV_WINDOW_RPI4 as u32, ref empty_payload, 0);
+      return 0;
     }
     if payload_len > max_payload_len {
       return 0 - 1;
@@ -2303,45 +2346,22 @@ fn tcp_conn_handle_segment_rpi4(conn_id: u32, frame: ref [u8; 512], recv_len: i6
       i = i + 1;
     }
     let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (payload_len as u32));
-    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+    if has_fin == 1 {
+      let _ = tcp_conn_set_remote_seq(conn_id, tcp_conn_get_remote_seq(conn_id) + (1 as u32));
+      let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait_rpi4());
+      let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4() | tcp_flag_fin_rpi4(), TCP_RCV_WINDOW_RPI4 as u32, ref empty_payload, 0);
+      let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32));
+      return payload_len;
+    }
+    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), TCP_RCV_WINDOW_RPI4 as u32, ref empty_payload, 0);
     return payload_len;
   }
 
-  // Established, a pure ACK for data we sent -- cancel a pending
-  // retransmission if this ACK covers it.
-  if (state == tcp_state_established_rpi4()) && (has_ack == 1) && (has_fin == 0) && (has_psh == 0) && (has_syn == 0) {
-    if tcp_conn_get_rtx_deadline(conn_id) != (0 as u32) {
-      let rtx_seq: u32 = tcp_conn_get_rtx_seq(conn_id);
-      let rtx_len: u32 = tcp_conn_get_rtx_len(conn_id);
-      if seg_ack >= (rtx_seq + rtx_len) {
-        let _ = tcp_conn_set_rtx_deadline(conn_id, 0 as u32);
-      }
-    }
-    return 0;
-  }
-
-  // Established, the peer starts closing: piggyback our own FIN onto
-  // the ACK and move to FIN_WAIT for the final ACK.
-  if (state == tcp_state_established_rpi4()) && (has_fin == 1) {
-    let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32)); // FIN consumes one seq number
-    let _ = tcp_conn_set_state(conn_id, tcp_state_fin_wait_rpi4());
-    let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4() | tcp_flag_fin_rpi4(), 65535 as u32, ref empty_payload, 0);
-    let _ = tcp_conn_set_local_seq(conn_id, tcp_conn_get_local_seq(conn_id) + (1 as u32)); // our own FIN
-    return 0;
-  }
-
-  // The initiating closer receiving the peer's response to its own
-  // FIN -- may carry the peer's own piggybacked FIN too (one-sided
-  // close) or arrive as a separate, independent FIN (simultaneous
-  // close, RFC 793 CLOSING) if the peer never saw ours first.
-  // our_fin_acked checks seg_ack against our own local_seq (already
-  // advanced past our FIN's own sequence number by tcp_conn_close_
-  // rpi4) rather than assuming any ack qualifies.
   if (state == tcp_state_fin_wait_rpi4()) && (has_ack == 1) {
     let our_fin_acked: i64 = if seg_ack == tcp_conn_get_local_seq(conn_id) { 1 } else { 0 };
     if has_fin == 1 {
       let _ = tcp_conn_set_remote_seq(conn_id, seg_seq + (1 as u32));
-      let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), 65535 as u32, ref empty_payload, 0);
+      let _ = tcp_send_segment_rpi4(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack_rpi4(), TCP_RCV_WINDOW_RPI4 as u32, ref empty_payload, 0);
       if our_fin_acked == 1 {
         let _ = tcp_conn_set_state(conn_id, tcp_state_closed_final_rpi4());
       } else {
