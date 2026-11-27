@@ -29508,6 +29508,88 @@ fn rtl8188cu_mac_queue_setup(devaddr: u32, mps: u32) -> i64 {
   return 0;
 }
 
+// 2026-11-27 (audit: "why does the RTL8188CU firmware need a hard power
+// cycle?"). Exact port of Linux rtl8192cu_power_off (drivers/net/
+// wireless/realtek/rtl8xxxu/8192c.c, fetched from upstream master),
+// which Linux runs on every disconnect/stop. DhruvaOS never powered the
+// chip down: a reboot, watchdog or crash reset only the Pi while the
+// dongle kept USB power with its 8051 firmware, MAC DMA engines and RF
+// still running. The next boot's warm path only toggled CPU_ENABLE
+// (reset_8051) and then re-ran the cold power-on + LLT init on top of
+// live DMA -- firmware downloads then failed their checksum, increasingly
+// so across repeated soft reboots, until a real power cut. Running this
+// first on a warm chip puts it in the same disabled state Linux leaves
+// it in, so the normal cold bring-up applies. Not ported: the 8188RU
+// LNA-leakage workaround (different chip) and the UMC chip-cut-1
+// SPS0_CTRL bit (this driver doesn't identify vendor/cut).
+fn rtl8188cu_power_off(devaddr: u32, mps: u32) -> i64 {
+  // _DisableRFAFEAndResetBB
+  let _ = rtl_reg_write8(devaddr, mps, 0x0522 as u32, 0xff as u32);                 // REG_TXPAUSE
+  let rf0: u32 = rtl_rf_reg_read(devaddr, mps, 0x00 as u32);                        // RF6052_REG_AC
+  let _ = rtl_rf_reg_write(devaddr, mps, 0x00 as u32, rf0 & (0xFFFFFF00 as u32));   // mask 0xff -> 0
+  let apsd: u32 = rtl_reg_read8(devaddr, mps, 0x0600 as u32);                       // REG_APSD_CTRL
+  let _ = rtl_reg_write8(devaddr, mps, 0x0600 as u32, apsd | (0x40 as u32));        // APSD_CTRL_OFF
+  let xcd: u32 = rtl_reg_read32(devaddr, mps, 0x087c as u32);                       // REG_FPGA0_XCD_RF_PARM
+  let _ = rtl_reg_write32(devaddr, mps, 0x087c as u32, xcd | (0x80000000 as u32));  // FPGA0_RF_PARM_CLK_GATE
+  let _ = rtl_reg_write8(devaddr, mps, 0x0002 as u32, (0x04 | 0x10 | 0x02) as u32); // SYS_FUNC: USBA|USBD|BB_GLB_RSTN
+  let _ = rtl_reg_write8(devaddr, mps, 0x0002 as u32, (0x04 | 0x10) as u32);        // SYS_FUNC: USBA|USBD
+  // _ResetDigitalProcedure1: ask a running firmware to reset itself.
+  if (rtl_reg_read8(devaddr, mps, 0x0080 as u32) & (0x02 as u32)) != (0 as u32) {   // MCU_FW_DL_READY
+    let _ = rtl_reg_write8(devaddr, mps, 0x0080 as u32, 0 as u32);
+    let _ = rtl_reg_write8(devaddr, mps, 0x0130 as u32, 0x20 as u32);               // REG_FWIMR
+    let _ = rtl_reg_write8(devaddr, mps, (0x01cc + 3) as u32, 0x20 as u32);         // REG_HMTFR + 3
+    let i: i64 = 0;
+    let stopped: i64 = 0;
+    while (i < 100) && (stopped == 0) {
+      if (rtl_reg_read16(devaddr, mps, 0x0002 as u32) & (0x0400 as u32)) == (0 as u32) { stopped = 1; } // CPU_ENABLE clear
+      else { let _ = delay_us_wallclock(50 as u32); }
+      i = i + 1;
+    }
+    if stopped == 0 {
+      let _ = rtl_reg_write8(devaddr, mps, (0x0002 + 1) as u32, ((0x4000 | 0x1000) >> 8) as u32); // HWPDN|ELDR
+      let _ = delay_us_wallclock(10000 as u32);
+    }
+  }
+  let _ = rtl_reg_write8(devaddr, mps, (0x0002 + 1) as u32, ((0x4000 | 0x1000 | 0x0400) >> 8) as u32); // HWPDN|ELDR|CPU_ENABLE
+  // _DisableGPIO
+  let _ = rtl_reg_write16(devaddr, mps, (0x0044 + 2) as u32, 0 as u32);
+  let g: u32 = rtl_reg_read32(devaddr, mps, 0x0044 as u32) & (0xffff00ff as u32);
+  let g2: u32 = (g | ((g & (0xff as u32)) << (8 as u32))) | (0x00ff0000 as u32);
+  let _ = rtl_reg_write32(devaddr, mps, 0x0044 as u32, g2);
+  let _ = rtl_reg_write8(devaddr, mps, (0x0040 + 3) as u32, 0 as u32);
+  let m: u32 = rtl_reg_read16(devaddr, mps, (0x0040 + 2) as u32) & (0xff0f as u32);
+  let m2: u32 = (m | ((m & (0xf as u32)) << (4 as u32))) | (0x0780 as u32);
+  let _ = rtl_reg_write16(devaddr, mps, (0x0040 + 2) as u32, m2);
+  // _DisableAnalog
+  let _ = rtl_reg_write8(devaddr, mps, 0x0011 as u32, 0x23 as u32);                 // REG_SPS0_CTRL
+  let _ = rtl_reg_write16(devaddr, mps, 0x0004 as u32, (0x4000 | 0x0800 | 0x0002) as u32); // APS_FSMCO: HOST|HW_SUSPEND|PFM_ALDN
+  let _ = rtl_reg_write8(devaddr, mps, 0x001c as u32, 0x0e as u32);                 // REG_RSV_CTRL lock
+  return 0;
+}
+
+// Linux rtl8xxxu_init_device's own warm-MAC test (REG_CR / REG_SYS_CLKR),
+// plus "firmware running in RAM" (MCU_FW_DL RAM_SEL, bit 7).
+fn rtl8188cu_is_warm(devaddr: u32, mps: u32) -> i64 {
+  let cr: u32 = rtl_reg_read8(devaddr, mps, 0x0100 as u32);
+  let clkr: u32 = rtl_reg_read16(devaddr, mps, 0x0008 as u32);
+  let macpower: i64 = if (cr == (0xea as u32)) || ((clkr & (0x0800 as u32)) == (0 as u32)) { 0 } else { 1 };
+  let ram_sel: i64 = if (rtl_reg_read8(devaddr, mps, 0x0080 as u32) & (0x80 as u32)) != (0 as u32) { 1 } else { 0 };
+  return if (macpower == 1) || (ram_sel == 1) { 1 } else { 0 };
+}
+
+// 2026-11-27: orderly WiFi chip power-down before a reboot/shutdown (see
+// rtl8188cu_power_off) -- no-op if no radio was brought up.
+fn wifi_radio_orderly_power_off() -> i64 {
+  if wifi_radio_get_present() != (1 as u32) {
+    return 0;
+  }
+  let _ = wifi_link_down(3);
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+  let _ = rtl8188cu_power_off(wifi_radio_get_devaddr(), wifi_radio_get_mps_out());
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+  return 0;
+}
+
 fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
   // BUG FOUND 2026-11-21 (warm-reboot real-HW investigation): this
   // function's own fw_attempt retry loop below is gated on usb_wifi_
@@ -29606,6 +29688,14 @@ fn rtl8188cu_probe(devaddr: u32, mps: u32) -> i64 {
   // for the full "why" (matches Linux's real rtl8xxxu_init_device
   // call order exactly: fops->power_on() always runs immediately
   // before rtl8xxxu_download_firmware(), never after).
+  // 2026-11-27: a chip left running by the previous boot (soft reboot,
+  // watchdog, crash -- the dongle keeps USB power) is powered down first,
+  // exactly as Linux does on disconnect; see rtl8188cu_power_off.
+  if rtl8188cu_is_warm(devaddr, mps) == 1 {
+    let _ = uart_puts("USB: RTL8188CU found still running from a previous boot -- powering it off first (Linux rtl8192cu_power_off)\n");
+    let _ = rtl8188cu_power_off(devaddr, mps);
+    let _ = delay_us_wallclock(20000 as u32);
+  }
   let pwr_status: i64 = rtl8188cu_power_on(devaddr, mps);
   if pwr_status != 0 {
     let _ = uart_puts("USB: RTL8188CU power-on sequence FAILED -- not attempting firmware download\n");
@@ -45851,6 +45941,7 @@ fn shell_dispatch_shutdown() -> i64 {
   let _ = dharafs_checkpoint_write(shutdown_ckpt_generation, shutdown_log_start, shutdown_next_block, shutdown_ckpt_target_slot, shutdown_clean, shutdown_next_seq, dharafs_write_cursor_last_generation_get());
   let _ = uart_puts("\n");
   let _ = uart_puts("Dhruva: halting. No further writes will occur.\n");
+  let _ = wifi_radio_orderly_power_off();
   let _ = uart_puts("*** SAFE TO POWER OFF NOW ***\n");
   return shutdown_halt_forever();
 }
@@ -46671,6 +46762,7 @@ fn shell_dispatch() -> i64 {
     let reboot_snapshot_status: i64 = dharafs_dirindex_snapshot_persist(reboot_ckpt_generation);
     let reboot_clean: u32 = if reboot_snapshot_status == 0 { 1 as u32 } else { 0 as u32 };
     let _ = dharafs_checkpoint_write(reboot_ckpt_generation, reboot_log_start, reboot_next_block, reboot_ckpt_target_slot, reboot_clean, reboot_next_seq, dharafs_write_cursor_last_generation_get());
+    let _ = wifi_radio_orderly_power_off();
     let _ = uart_puts("rebooting...\n");
     let _ = watchdog_arm(1 as u32);
     return 0;
