@@ -27466,8 +27466,21 @@ fn dwc2_wait_chan0_done() -> u32 {
     let hi: u32 = mmio_read_u32(hcint0);
     if hi != (0 as u32) {
       if (hi & (1 as u32)) != (0 as u32) {
-        let _ = mmio_write_u32(hcint0, hi);
-        return hi;
+        // 2026-11-27: in DMA mode XFERCOMPL can latch a few us before
+        // CHHLTD. Returning on XFERCOMPL alone left that CHHLTD to land
+        // after the caller cleared HCINT and enabled the NEXT phase,
+        // which then "halted with no reason" 11-16 us after enable
+        // (hi=0x2, HCTSIZ untouched) -- every STATUS-stage failure seen
+        // on real HW. Linux processes completion only at the channel-
+        // halted interrupt (DMA mode unmasks CHHLTD alone). Wait for the
+        // halt (bounded, 1 ms wall clock), then clear everything seen.
+        let all: u32 = hi;
+        let h_t0: u32 = mmio_read_u32(TIMER_CLO);
+        while ((all & (0x2 as u32)) == (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), h_t0) < (1000 as u32)) {
+          all = all | mmio_read_u32(hcint0);
+        }
+        let _ = mmio_write_u32(hcint0, all);
+        return all;
       }
       if (hi & hard_error_mask) != (0 as u32) {
         if (hi & hard_error_mask) == xacterr_bit {
@@ -27892,8 +27905,21 @@ fn dwc2_wait_chan0_done_bounded(max_tries: i64) -> u32 {
     let hi: u32 = mmio_read_u32(hcint0);
     if hi != (0 as u32) {
       if (hi & (1 as u32)) != (0 as u32) {
-        let _ = mmio_write_u32(hcint0, hi);
-        return hi;
+        // 2026-11-27: in DMA mode XFERCOMPL can latch a few us before
+        // CHHLTD. Returning on XFERCOMPL alone left that CHHLTD to land
+        // after the caller cleared HCINT and enabled the NEXT phase,
+        // which then "halted with no reason" 11-16 us after enable
+        // (hi=0x2, HCTSIZ untouched) -- every STATUS-stage failure seen
+        // on real HW. Linux processes completion only at the channel-
+        // halted interrupt (DMA mode unmasks CHHLTD alone). Wait for the
+        // halt (bounded, 1 ms wall clock), then clear everything seen.
+        let all: u32 = hi;
+        let h_t0: u32 = mmio_read_u32(TIMER_CLO);
+        while ((all & (0x2 as u32)) == (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), h_t0) < (1000 as u32)) {
+          all = all | mmio_read_u32(hcint0);
+        }
+        let _ = mmio_write_u32(hcint0, all);
+        return all;
       }
       if (hi & hard_error_mask) != (0 as u32) {
         if (hi & hard_error_mask) == xacterr_bit {
@@ -29643,13 +29669,19 @@ fn rtl8188cu_is_warm(devaddr: u32, mps: u32) -> i64 {
 // 2026-11-27: orderly WiFi chip power-down before a reboot/shutdown (see
 // rtl8188cu_power_off) -- no-op if no radio was brought up.
 fn wifi_radio_orderly_power_off() -> i64 {
-  if wifi_radio_get_present() != (1 as u32) {
+  // Gate on the probe's own success (usb_wifi kind 1 = RTL8188CU fully
+  // brought up), not wifi_radio_get_present(): that is only set by
+  // `wifi join`/`listen`, so every boot without a join skipped the
+  // power-off and the next boot found the chip still running (soak
+  // 2026-11-27). Register access is on EP0, whose max packet size is
+  // 64 for every high-speed device (USB 2.0 9.6.1) -- not the bulk mps.
+  if usb_wifi_get_kind() != (1 as u32) {
     return 0;
   }
   let _ = uart_puts("wifi: orderly radio power-off...\n");
   let _ = wifi_link_down(3);
   let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
-  let _ = rtl8188cu_power_off(wifi_radio_get_devaddr(), wifi_radio_get_mps_out());
+  let _ = rtl8188cu_power_off(usb_wifi_get_devaddr(), 64 as u32);
   let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
   let _ = uart_puts("wifi: radio powered off\n");
   return 0;
@@ -46843,6 +46875,12 @@ fn shell_dispatch() -> i64 {
     let reboot_clean: u32 = if reboot_snapshot_status == 0 { 1 as u32 } else { 0 as u32 };
     let _ = dharafs_checkpoint_write(reboot_ckpt_generation, reboot_log_start, reboot_next_block, reboot_ckpt_target_slot, reboot_clean, reboot_next_seq, dharafs_write_cursor_last_generation_get());
     let _ = uart_puts("rebooting...\n");
+    // 2026-11-27: the last <=16 bytes sit in the PL011 FIFO when
+    // uart_puts returns, and watchdog_arm(1) resets within microseconds
+    // -- nothing printed after `reboot` ever reached the host. Wait for
+    // FR.BUSY (bit 3) to clear, bounded at 50 ms.
+    let fr_t0: u32 = mmio_read_u32(TIMER_CLO);
+    while ((mmio_read_u32(UART_FR) & (0x8 as u32)) != (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), fr_t0) < (50000 as u32)) { }
     let _ = watchdog_arm(1 as u32);
     return 0;
   }
