@@ -28383,17 +28383,50 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
     return 0 - 1;
   }
 
-  let _ = dwc2_reset_chan0_for_new_transfer();
-  let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
-  let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
-  let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
-  let status_result: u32 = dwc2_wait_chan0_done();
-  if (status_result & (1 as u32)) == (0 as u32) {
-    let _ = uart_puts("USB DIAG: dwc2_control_out STATUS phase failed, hi=0x");
-    let _ = uart_put_hex32(status_result);
-    let _ = uart_puts("\n");
+  // 2026-11-27: STATUS-stage retry, Linux dwc2 semantics. Linux's
+  // dwc2_hc_chhltd_intr_dma treats "ChHltd set, but reason is unknown"
+  // (hi=0x2 here) and XACTERR on a control transfer with the 3-strikes
+  // rule *within the current control phase* (qtd->control_phase) -- it
+  // re-issues the STATUS IN token, never SETUP/DATA. USB 2.0 8.5.3: a
+  // device whose status ZLP the host missed keeps it and sends it again
+  // on the next IN. Before this, a STATUS failure failed the whole
+  // transfer and callers resent SETUP+DATA: harmless for register
+  // writes, fatal for RTL8188CU firmware download, whose hardware
+  // checksum then counted the resent chunk twice -- in the full UART
+  // history, 167/167 downloads with a STATUS failure failed their
+  // checksum and 0/132 successful ones had one.
+  // Returns 0 - 2 when DATA was accepted but no status handshake ever
+  // completed, so callers whose writes are not idempotent can tell.
+  let status_try: i64 = 0;
+  let status_ok: i64 = 0;
+  let status_result: u32 = 0 as u32;
+  while (status_try < 3) && (status_ok == 0) {
+    let _ = dwc2_reset_chan0_for_new_transfer();
+    let _ = mmio_write_u32(hcdma0, dwc2_dma_bus_addr(dma));
+    let _ = mmio_write_u32(hctsiz0, dwc2_build_hctsiz(dwc2_pid_data1(), 1 as u32, 0 as u32));
+    let _ = mmio_write_u32(hcchar0, dwc2_build_hcchar(devaddr, 0 as u32, 1 as u32, 0 as u32, mps));
+    status_result = dwc2_wait_chan0_done();
+    if (status_result & (1 as u32)) != (0 as u32) {
+      status_ok = 1;
+    } else {
+      let _ = uart_puts("USB DIAG: dwc2_control_out STATUS phase failed, hi=0x");
+      let _ = uart_put_hex32(status_result);
+      let _ = uart_puts(" try=");
+      let _ = uart_put_i64(status_try + 1);
+      let _ = uart_puts("/3\n");
+      // STALL is a deliberate protocol answer, not a transaction error.
+      if (status_result & (0x8 as u32)) != (0 as u32) {
+        status_try = 3;
+      }
+    }
+    status_try = status_try + 1;
+  }
+  if status_ok == 0 {
     let _ = usb_wifi_ctrl_fail_streak_set(usb_wifi_ctrl_fail_streak_get() + (1 as u32));
-    return 0 - 1;
+    return 0 - 2;
+  }
+  if status_try > 1 {
+    let _ = uart_puts("USB DIAG: dwc2_control_out STATUS phase recovered on retry (DATA not resent)\n");
   }
   let _ = usb_wifi_ctrl_fail_streak_set(0 as u32);
   return 0;
@@ -30615,6 +30648,15 @@ fn rtl8188cu_write_firmware_page(devaddr: u32, mps: u32, reg_addr: u32, fw_buf: 
       let _ = dwc2_build_rtl_reg_write_setup(cur_addr, this_chunk as u32);
       status = dwc2_control_out(devaddr, mps, chunk, this_chunk as u32);
       attempt = attempt + 1;
+      // 2026-11-27: 0 - 2 = the device accepted this chunk's DATA but the
+      // status handshake never completed. Resending would make the
+      // download engine's checksum count these bytes twice (the
+      // root cause of most "checksum poll timed out" failures), so give
+      // up on this download; the caller's next attempt resets the
+      // checksum and starts over cleanly.
+      if status == (0 - 2) {
+        attempt = usb_first_contact_retry_count();
+      }
     }
     if status != 0 {
       // TASK #164 FOLLOW-UP (2026-10-12): this chunk-write failure was
