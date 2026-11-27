@@ -382,6 +382,8 @@ extern "C" fn tcp_isn_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn tlsd_mem_set(addr: mut ref i64) -> i64;
 extern "C" fn netif_fg_session_set(v: u32) -> i64;
 extern "C" fn netif_fg_session_get() -> u32;
+extern "C" fn dwc2_hcint_seen_set(v: u32) -> i64;
+extern "C" fn dwc2_hcint_seen_get() -> u32;
 // 2026-11-27: option B -- data cache for task-stack pages (boot/rpi1/runtime_stubs.c).
 extern "C" fn dhruva_stack_cache_set(on: u32) -> u32;   // C long = 32-bit
 extern "C" fn dhruva_stack_cache_get() -> u32;
@@ -27403,6 +27405,7 @@ fn dwc2_wait_chan0_done() -> u32 {
   // primitive every USB control/bulk transfer in the system goes
   // through, so a tighter bound here protects every caller at once.
   let wcd_t0: u32 = mmio_read_u32(TIMER_CLO);
+  let _ = dwc2_hcint_seen_set(0 as u32);
 
   // Round 15 real-HW finding: all 5 round-14 checkpoints (every
   // 200000 iterations, ~100ms apart) showed GAHBCFG/GUSBCFG ALREADY
@@ -27465,6 +27468,7 @@ fn dwc2_wait_chan0_done() -> u32 {
     }
     let hi: u32 = mmio_read_u32(hcint0);
     if hi != (0 as u32) {
+      let _ = dwc2_hcint_seen_set(dwc2_hcint_seen_get() | hi);
       if (hi & (1 as u32)) != (0 as u32) {
         // 2026-11-27: in DMA mode XFERCOMPL can latch a few us before
         // CHHLTD. Returning on XFERCOMPL alone left that CHHLTD to land
@@ -28455,6 +28459,8 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
     } else {
       let _ = uart_puts("USB DIAG: dwc2_control_out STATUS phase failed, hi=0x");
       let _ = uart_put_hex32(status_result);
+      let _ = uart_puts(" seen=0x");
+      let _ = uart_put_hex32(dwc2_hcint_seen_get());
       let _ = uart_puts(" after_us=");
       let _ = uart_put_i64(st_us as i64);
       let _ = uart_puts(" HCTSIZ=0x");

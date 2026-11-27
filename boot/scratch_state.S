@@ -3074,3 +3074,23 @@ netif_fg_session_get:
     ldr r0, =netif_fg_session_word
     ldr r0, [r0]
     bx lr
+
+/* 2026-11-27: OR of every HCINT value dwc2_wait_chan0_done observed during
+ * its current wait, so a failure report shows the whole sequence (e.g.
+ * XACTERR then a bare CHHLTD), not only the last read. */
+.section ".bss"
+.align 4
+dwc2_hcint_seen_word:
+    .word 0
+.section ".text"
+.global dwc2_hcint_seen_set
+dwc2_hcint_seen_set:
+    ldr r1, =dwc2_hcint_seen_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global dwc2_hcint_seen_get
+dwc2_hcint_seen_get:
+    ldr r0, =dwc2_hcint_seen_word
+    ldr r0, [r0]
+    bx lr
