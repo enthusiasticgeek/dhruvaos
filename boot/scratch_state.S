@@ -3094,3 +3094,23 @@ dwc2_hcint_seen_get:
     ldr r0, =dwc2_hcint_seen_word
     ldr r0, [r0]
     bx lr
+
+/* 2026-11-27: count of GUSBCFG/GAHBCFG reverts found (and re-asserted) at
+ * transfer start / mid-wait -- the BCM2835 USB power-domain register-loss
+ * symptom. Reported by `usbstat`. */
+.section ".bss"
+.align 4
+dwc2_revert_count_word:
+    .word 0
+.section ".text"
+.global dwc2_revert_count_set
+dwc2_revert_count_set:
+    ldr r1, =dwc2_revert_count_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global dwc2_revert_count_get
+dwc2_revert_count_get:
+    ldr r0, =dwc2_revert_count_word
+    ldr r0, [r0]
+    bx lr

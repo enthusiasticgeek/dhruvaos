@@ -384,6 +384,8 @@ extern "C" fn netif_fg_session_set(v: u32) -> i64;
 extern "C" fn netif_fg_session_get() -> u32;
 extern "C" fn dwc2_hcint_seen_set(v: u32) -> i64;
 extern "C" fn dwc2_hcint_seen_get() -> u32;
+extern "C" fn dwc2_revert_count_set(v: u32) -> i64;
+extern "C" fn dwc2_revert_count_get() -> u32;
 // 2026-11-27: option B -- data cache for task-stack pages (boot/rpi1/runtime_stubs.c).
 extern "C" fn dhruva_stack_cache_set(on: u32) -> u32;   // C long = 32-bit
 extern "C" fn dhruva_stack_cache_get() -> u32;
@@ -27081,7 +27083,15 @@ fn dwc2_reassert_core_config_post_port_reset() -> i64 {
   let v_speed_cleared: u32 = v & speed_bits_clear;
   let v_with_speed: u32 = if phy_is_hs != (0 as u32) { v_speed_cleared } else { v_speed_cleared | speed_bits };
   let new_v: u32 = ((v_with_speed | force_host_bit) & force_dev_clear & toutcal_mask) | toutcal_max;
-  let _ = mmio_write_u32(gusbcfg, new_v);
+  // 2026-11-27 (USB/DMA audit): write only if it actually reverted. This
+  // runs before EVERY control transfer; unconditionally rewriting PHY
+  // select / ForceHostMode / TOUTCAL thousands of times while the PHY
+  // carries traffic is something no reference driver does, and it hid
+  // whether the power-domain register loss still happens at all.
+  if new_v != v {
+    let _ = mmio_write_u32(gusbcfg, new_v);
+    let _ = dwc2_revert_count_set(dwc2_revert_count_get() + (1 as u32));
+  }
 
   // Round 26 correction (see dwc2_enable_dma_mode's own header
   // comment for the full finding): round 18's fix here had the same
@@ -27097,7 +27107,10 @@ fn dwc2_reassert_core_config_post_port_reset() -> i64 {
   let dmaen: u32 = (1 as u32) << (5 as u32);
   let v2: u32 = mmio_read_u32(gahbcfg);
   let new_v2: u32 = (v2 & hbstlen_mask) | hbstlen_incr4 | dmaen;
-  let _ = mmio_write_u32(gahbcfg, new_v2);
+  if new_v2 != v2 {
+    let _ = mmio_write_u32(gahbcfg, new_v2);
+    let _ = dwc2_revert_count_set(dwc2_revert_count_get() + (1 as u32));
+  }
 
   // Round 18: switched from kernlog_write_simple to uart_puts --
   // same real indirect-recursion risk documented in dwc2_wait_chan0_
@@ -27379,8 +27392,6 @@ fn dwc2_build_hctsiz(pid: u32, pktcnt: u32, xfersize: u32) -> u32 {
 fn dwc2_wait_chan0_done() -> u32 {
   let hcint0: i64 = dwc2_hcint0_addr();
   let hcchar0: i64 = dwc2_hcchar0_addr();
-  let hard_error_mask: u32 = (0x8 as u32) | (0x4 as u32) | (0x80 as u32) | (0x100 as u32); // STALL|AHBERR|XACTERR|BBLERR
-  let xacterr_bit: u32 = 0x80 as u32;
   let datatglerr_bit: u32 = 0x400 as u32;
   let chena_bit: u32 = (1 as u32) << (31 as u32);
   let transient_mask: u32 = (0x10 as u32) | (0x20 as u32); // NAK|ACK
@@ -27467,221 +27478,53 @@ fn dwc2_wait_chan0_done() -> u32 {
       }
     }
     let hi: u32 = mmio_read_u32(hcint0);
+    // 2026-11-27 (USB/DMA audit): decide ONLY at the channel-halted
+    // event, like Linux dwc2_hc_chhltd_intr_dma (DMA mode unmasks CHHLTD
+    // alone). In buffer-DMA mode the reason bits (XFERCOMPL, XACTERR,
+    // NAK, ...) can latch microseconds BEFORE CHHLTD. The old loop acted
+    // on the reason bit at once: XACTERR -> clear + "re-arm" CHENA on a
+    // channel still running (a no-op), then the real halt arrived with
+    // no reason left and the loop returned a bare 0x2 -- real-HW HCINT
+    // history seen=0x82/0x92. So the XACTERR 3-strikes retry never
+    // retried anything: every transient transaction error, on every
+    // transfer type, became a hard failure on its first occurrence.
+    // Now: accumulate reason bits until CHHLTD; then complete, fail, or
+    // re-enable the (really halted) channel, which resumes from the
+    // HCTSIZ/HCDMA progress the core left -- Linux's re-queue from
+    // current progress. NAK/ACK/DATATGLERR reset the strike count
+    // (Linux resets error_count on NAK); a halt with no reason at all
+    // counts as a strike (Linux: "ChHltd set, but reason is unknown" ->
+    // 3-strikes rule).
     if hi != (0 as u32) {
       let _ = dwc2_hcint_seen_set(dwc2_hcint_seen_get() | hi);
-      if (hi & (1 as u32)) != (0 as u32) {
-        // 2026-11-27: in DMA mode XFERCOMPL can latch a few us before
-        // CHHLTD. Returning on XFERCOMPL alone left that CHHLTD to land
-        // after the caller cleared HCINT and enabled the NEXT phase,
-        // which then "halted with no reason" 11-16 us after enable
-        // (hi=0x2, HCTSIZ untouched) -- every STATUS-stage failure seen
-        // on real HW. Linux processes completion only at the channel-
-        // halted interrupt (DMA mode unmasks CHHLTD alone). Wait for the
-        // halt (bounded, 1 ms wall clock), then clear everything seen.
-        let all: u32 = hi;
-        let h_t0: u32 = mmio_read_u32(TIMER_CLO);
-        while ((all & (0x2 as u32)) == (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), h_t0) < (1000 as u32)) {
-          all = all | mmio_read_u32(hcint0);
+      if (hi & (0x2 as u32)) != (0 as u32) {
+        let _ = mmio_write_u32(hcint0, hi);
+        let why: u32 = (dwc2_hcint_seen_get() | hi) & ((0x7FF as u32) ^ (0x2 as u32));
+        if (why & (1 as u32)) != (0 as u32) {
+          return dwc2_hcint_seen_get() | hi;
         }
-        let _ = mmio_write_u32(hcint0, all);
-        return all;
-      }
-      if (hi & hard_error_mask) != (0 as u32) {
-        if (hi & hard_error_mask) == xacterr_bit {
-          xacterr_count = xacterr_count + 1;
-          let _ = mmio_write_u32(hcint0, hi);
-          if xacterr_count >= 3 {
-            return hi;
-          }
-          let rearm: u32 = mmio_read_u32(hcchar0) | chena_bit;
-          let _ = mmio_write_u32(hcchar0, rearm);
-        } else {
-          // STALL/AHBERR/BBLERR -- genuinely terminal (a protocol
-          // violation, not a transient bus condition), same as
-          // before: no retry for any of these. DATATGLERR used to be
-          // lumped in here too; see its own dedicated branch below
-          // for why that was wrong.
-          // Round 26 diagnostic (task #325): how many iterations
-          // elapsed before this hard error actually appeared --
-          // distinguishes "device responded quickly with a real,
-          // deliberate error" (small tries) from "something else
-          // delayed the response first" (large tries, close to the
-          // loop's own 1000000 budget).
+        if (why & ((0x8 as u32) | (0x4 as u32) | (0x100 as u32))) != (0 as u32) {
           let _ = uart_puts("USB DIAG: hard error at tries=");
           let _ = uart_put_hex32(tries as u32);
-          let _ = uart_puts(" hi=0x");
-          let _ = uart_put_hex32(hi);
+          let _ = uart_puts(" seen=0x");
+          let _ = uart_put_hex32(dwc2_hcint_seen_get() | hi);
           let _ = uart_puts("\n");
-          let _ = mmio_write_u32(hcint0, hi);
-          return hi;
+          return dwc2_hcint_seen_get() | hi;
         }
-      } else {
-        if (hi & transient_mask) != (0 as u32) {
-          // BUG (found via a fork's full U-Boot/RPi dwc_otg_cil.c
-          // call-stack trace, 2026-10-03): a NAK halts the channel in
-          // hardware -- clearing the sticky status bit WITHOUT
-          // re-arming CHENA left the channel permanently halted, so
-          // nothing could ever set another interrupt again. This is
-          // exactly what regressed real-HW behavior from a genuine
-          // XACTERR (seen before this retry rewrite existed) back to
-          // full silence (HCINT=0x00000000 forever) once this retry
-          // rewrite started surviving past XACTERR into a NAK on a
-          // later attempt. U-Boot's own `chunk_msg`/`_submit_control_
-          // msg` retry loop (dwc2.c) fully re-programs the channel on
-          // every NAK (not just clears a bit and keeps polling the
-          // same halted attempt); RPi's own dwc_otg_hc_init unmasks
-          // nak/ack specifically so its real interrupt handler reacts
-          // and resubmits, never "ignore and keep waiting". Re-arming
-          // CHENA here (same pattern already used for the XACTERR
-          // retry above) restarts the transaction instead of leaving
-          // it dead.
-          let _ = mmio_write_u32(hcint0, hi & transient_mask);
-          let rearm_nak: u32 = mmio_read_u32(hcchar0) | chena_bit;
-          let _ = mmio_write_u32(hcchar0, rearm_nak);
-        } else {
-        if (hi & datatglerr_bit) != (0 as u32) {
-          // Round 63 (task #197, real-HW BLE finding, 2026-10-10):
-          // DATATGLERR used to sit in hard_error_mask as unconditionally
-          // terminal, same as STALL/AHBERR/BBLERR. Checked against BOTH
-          // mainline Linux dwc2 (`dwc2_hc_datatglerr_intr`, hcd_intr.c)
-          // AND Raspberry Pi's own downstream dwc_otg driver for this
-          // exact BCM2835 silicon (`handle_hc_datatglerr_intr`,
-          // dwc_otg_hcd_intr.c) -- both agree a DATATGLERR on a
-          // non-split transaction is NOT a real failure at all, just an
-          // informational re-sync: the real driver does `error_count =
-          // 0` (RPi's own comment: "for the sole purpose of resetting
-          // error counts") and keeps the transfer going, only halting
-          // on the SPLIT-transaction case. This driver has no split
-          // transactions at all (HCSPLT is unconditionally zeroed in
-          // dwc2_build_hcchar), so the non-split, non-fatal behavior is
-          // the ONLY behavior that ever applies here -- there is no
-          // direction-dependent (IN vs OUT) distinction worth encoding
-          // either, since mainline's own OUT branch is a no-op besides
-          // a debug log.
-          //
-          // Found live: the real Broadcom BT dongle (idVendor:idProduct
-          // 0x0A5C:0x21E8, reachable only after this same session's
-          // 3-port hub fix) answered HCI_Reset with a genuine Command
-          // Complete event -- the first real response this project's
-          // Bluetooth transport has ever received from actual hardware
-          // -- then its very next interrupt-IN poll (LE_Set_Scan_
-          // Parameters's own response) hit exactly this bit pattern
-          // (hi=0x00000402, CHHLTD|DATATGLERR) and was wrongly reported
-          // fatal, silently ending the HCI bring-up sequence right
-          // after it had just proven the transport layer genuinely
-          // works end-to-end. Resetting xacterr_count to 0 (matching
-          // Linux's own `error_count = 0`, not counted as a retryable-
-          // but-budgeted error the way XACTERR is) and re-arming CHENA
-          // (same mechanism already used for XACTERR/NAK) lets the
-          // transfer actually complete -- bounded only by this loop's
-          // own outer 1,000,000-iteration cap, the same bound every
-          // other retryable condition here already relies on instead
-          // of a dedicated sub-counter.
+        if (why & (transient_mask | datatglerr_bit)) != (0 as u32) {
           xacterr_count = 0;
-          let _ = mmio_write_u32(hcint0, hi);
-          let rearm_dtg: u32 = mmio_read_u32(hcchar0) | chena_bit;
-          let _ = mmio_write_u32(hcchar0, rearm_dtg);
         } else {
-          // Round 18 (task #325, the real bug this entire investigation
-          // was chasing): U-Boot's own `wait_for_chhltd` (dwc2.c) -- the
-          // ONE function every transfer type in that reference polls on
-          // -- waits SPECIFICALLY for HCINTMSK_CHHLTD (bit1, Channel
-          // Halted) FIRST, THEN inspects XFERCOMPL/NAK/FRMOVRUN to
-          // classify the result. This driver's own loop never checked
-          // bit1 AT ALL -- it only recognizes bit0 (XFERCOMPL), the
-          // hard_error_mask bits (STALL/AHBERR/XACTERR/BBLERR), and
-          // transient_mask (NAK/ACK). Real-HW evidence
-          // (round 18 retest, GET_DESCRIPTOR SETUP stage): the failure
-          // snapshot showed GINTSTS bit25 (HCHINT, "Host Channels
-          // Interrupt") SET -- a per-channel interrupt genuinely fired
-          // and was never serviced -- while HCCHAR0 showed CHENA
-          // (bit31) already cleared with every OTHER field (MULTICNT,
-          // MPS) intact, exactly matching real DWC2 silicon's
-          // documented CHENA-self-clears-on-halt behavior, not a
-          // "register reverted to power-on defaults" event at all.
-          // Before this fix, a CHHLTD-alone (or any other bit pattern
-          // this loop doesn't recognize) silently falls through with
-          // NOTHING cleared and NOTHING re-armed -- hcint0 stays
-          // exactly the same on every subsequent read (nothing ever
-          // writes it), so the loop spins uselessly for the FULL
-          // 1,000,000 iterations before giving up and reporting
-          // HCINT=0x00000000 (this function's own "nothing recognized"
-          // return value), which is what every single prior round of
-          // this investigation saw and interpreted as genuine silence.
-          // Mirroring U-Boot's own model: an unrecognized nonzero hi
-          // (almost certainly CHHLTD alone, or some combination this
-          // loop's three existing categories don't cover) is a real,
-          // terminal signal -- clear it and return it immediately
-          // instead of spinning blind. The caller's own `(result & 1)
-          // == 0` check already treats any non-XFERCOMPL return as
-          // failure, so this doesn't change success-path behavior at
-          // all, only how fast and how informatively a genuine
-          // unrecognized halt is reported.
-          let _ = mmio_write_u32(hcint0, hi);
-          return hi;
+          xacterr_count = xacterr_count + 1;   // XACTERR, or no reason at all
         }
+        if xacterr_count >= 3 {
+          return dwc2_hcint_seen_get() | hi;
         }
+        let chdis_clear: u32 = ((1 as u32) << (30 as u32)) ^ (0xFFFFFFFF as u32);
+        let rearm: u32 = (mmio_read_u32(hcchar0) | chena_bit) & chdis_clear;
+        let _ = dwc2_hcint_seen_set(0 as u32);
+        let _ = mmio_write_u32(hcchar0, rearm);
       }
     }
-    // Task #325 real-HW diagnostic (round 14, TEMPORARY -- remove
-    // once the real cause is pinned down): three consecutive retests
-    // all showed GAHBCFG/GUSBCFG reverted to the exact same fixed
-    // values by the time this loop exhausts and the caller's own
-    // failure snapshot is taken, while HCFG/HCCHAR0 (registers in a
-    // DIFFERENT functional block of the same core) stay stable --
-    // suggesting this is NOT a whole-domain/whole-core event. This
-    // single checkpoint (round 14b: collapsed from 5 separate `if
-    // tries == N` branches into one modulo check) samples GAHBCFG/
-    // GUSBCFG partway through this exact loop to pin down WHEN the
-    // revert actually happens (a fixed real-world delay matching this
-    // loop's own ~500ms real duration at 1,000,000 tight-spin
-    // iterations, vs. something else entirely) -- directly testable
-    // with real HW data instead of more guessing.
-    //
-    // Round 14c (real bug, not just slow analysis): the 14b version
-    // used kernlog_write_simple here, which builds the stack-depth
-    // analyzer's own call graph straight back into this function --
-    // kernlog_write_simple -> kernlog_flush -> dharafs_log_append_raw
-    // -> dharafs_block_write[_raw] -> usb_msd_write10 ->
-    // usb_msd_scsi_command -> dwc2_bulk_out -> dwc2_wait_chan0_done
-    // (THIS function). DharaFS can write through USB mass storage,
-    // so this is genuine indirect recursion in the call graph, not a
-    // false positive -- `vanic stack-depth` correctly rejected the
-    // build with "worst-case stack depth is UNBOUNDED" on task_e/
-    // task_f (both reach this loop). This hottest, most fundamental
-    // USB wait primitive must never depend on a logging path that can
-    // itself route through USB. Switched to direct uart_puts/
-    // uart_put_hex32 -- confirmed via the same call-graph analysis to
-    // never reach back into the USB/DharaFS stack -- which the live
-    // serial session already monitoring this retest captures in real
-    // time, same practical visibility without the recursion risk.
-    // Round 15 follow-up: the tries==0 entry checkpoint above and the
-    // coarse 200000-interval checkpoints below leave a 100ms gap
-    // ("already reverted by the first coarse checkpoint, status at
-    // entry unknown yet") -- these three finer early samples (~10ms/
-    // ~25ms/~50ms in, at ~0.5us/iteration) subdivide exactly that gap
-    // instead of guessing where within it the revert actually lands.
-    // Round 25 (task #325): this project's own confirmed, documented
-    // BCM2835 USB-power-domain register-loss erratum (real Linux
-    // maintainer mailing-list citation already in this driver's own
-    // history: "dwc2: Implement recovery after PM domain off") was
-    // previously only ever corrected ONCE, by the caller, before
-    // entering this wait loop. Round 12's own real-HW retest already
-    // found the revert recurs ~0.5-0.7s later "regardless of how
-    // close to the transfer the reassert runs" -- and THIS round's
-    // fresh real-HW retest reconfirms the exact same pattern
-    // (GAHBCFG=0x1F, DMAEN/full HBSTLEN missing; GUSBCFG missing
-    // PHYSEL) in the failure snapshot taken after this exact loop
-    // gave up. A one-time reassert before the loop cannot survive a
-    // revert that recurs DURING the loop's own ~500ms wait window.
-    // Self-heals here instead, checked only when hi==0 (nothing in
-    // flight at the top of this same iteration -- never races a real
-    // in-progress completion event's own register state), every 1000
-    // iterations (~0.5ms apart at this loop's own measured per-
-    // iteration cost) -- frequent enough to give an eventual real
-    // wire-level transaction a continuously-correct register window
-    // to actually complete in, without writing these registers on
-    // literally every single spin.
     if tries % 1000 == 999 {
       let gahbcfg_addr: i64 = dwc2_base() + 0x08;
       let gusbcfg_addr: i64 = dwc2_base() + 0x0C;
@@ -27702,6 +27545,7 @@ fn dwc2_wait_chan0_done() -> u32 {
       // fix -- see its header comment).
       if ((cur_ahb & hbstlen_field_mask) != hbstlen_incr4) || ((cur_ahb & dmaen_bit) == (0 as u32)) {
         let _ = mmio_write_u32(gahbcfg_addr, (cur_ahb & hbstlen_clear_mask) | hbstlen_incr4 | dmaen_bit);
+        let _ = dwc2_revert_count_set(dwc2_revert_count_get() + (1 as u32));
         if boot_debug_enabled() == 1 {
           let _ = uart_puts("USB DIAG self-heal: GAHBCFG reverted mid-wait, tries=");
           let _ = uart_put_hex32(tries as u32);
@@ -27770,6 +27614,7 @@ fn dwc2_wait_chan0_done() -> u32 {
         let cur_usb_speed_cleared: u32 = cur_usb & speed_bits_clear;
         let cur_usb_with_speed: u32 = if phy_is_hs_wait != (0 as u32) { cur_usb_speed_cleared } else { cur_usb_speed_cleared | speed_bits };
         let _ = mmio_write_u32(gusbcfg_addr, (cur_usb_with_speed & toutcal_clear_mask) | toutcal_max);
+        let _ = dwc2_revert_count_set(dwc2_revert_count_get() + (1 as u32));
         if boot_debug_enabled() == 1 {
           let _ = uart_puts("USB DIAG self-heal: GUSBCFG reverted mid-wait, tries=");
           let _ = uart_put_hex32(tries as u32);
@@ -49123,6 +48968,18 @@ fn shell_dispatch() -> i64 {
   // real, unpredictable bytes instead of a synthetic self-test peer.
   if shell_word_matches(line_buf, 0, cmd_end, "sshd") == 1 {
     return ssh_real_server_cmd();
+  }
+  if shell_word_matches(line_buf, 0, cmd_end, "usbstat") == 1 {
+    let _ = uart_puts("usbstat: GUSBCFG/GAHBCFG reverts re-asserted=");
+    let _ = uart_put_i64(dwc2_revert_count_get() as i64);
+    let _ = uart_puts(" GUSBCFG=0x");
+    let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x0C));
+    let _ = uart_puts(" GAHBCFG=0x");
+    let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x08));
+    let _ = uart_puts(" HPRT0=0x");
+    let _ = uart_put_hex32(mmio_read_u32(dwc2_base() + 0x440));
+    let _ = uart_puts("\n");
+    return 0;
   }
   if shell_word_matches(line_buf, 0, cmd_end, "bench") == 1 {
     return bench_cmd();
