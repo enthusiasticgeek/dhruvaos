@@ -382,6 +382,9 @@ extern "C" fn tcp_isn_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn tlsd_mem_set(addr: mut ref i64) -> i64;
 extern "C" fn netif_fg_session_set(v: u32) -> i64;
 extern "C" fn netif_fg_session_get() -> u32;
+// 2026-11-27: option B -- data cache for task-stack pages (boot/rpi1/runtime_stubs.c).
+extern "C" fn dhruva_stack_cache_set(on: u32) -> u32;   // C long = 32-bit
+extern "C" fn dhruva_stack_cache_get() -> u32;
 extern "C" fn tlsd_mem(off: u32) -> mut ref i64;
 extern "C" fn tcp_isn_scratch_get() -> mut ref i64;
 extern "C" fn tcpsink_frame_scratch_set(addr: mut ref i64) -> i64;
@@ -48992,6 +48995,35 @@ fn shell_dispatch() -> i64 {
   if shell_word_matches(line_buf, 0, cmd_end, "sshd") == 1 {
     return ssh_real_server_cmd();
   }
+  if shell_word_matches(line_buf, 0, cmd_end, "bench") == 1 {
+    return bench_cmd();
+  }
+  if shell_word_matches(line_buf, 0, cmd_end, "cachectl") == 1 {
+    let cs: i64 = cmd_end + 1;
+    let ce: i64 = shell_find_space(line_buf, cs, line_len);
+    let as_: i64 = ce + 1;
+    let ae: i64 = shell_find_space(line_buf, as_, line_len);
+    if (cmd_end < line_len) && (shell_word_matches(line_buf, cs, ce, "stack") == 1) && (ce < line_len) {
+      if shell_word_matches(line_buf, as_, ae, "on") == 1 {
+        let n_on: i64 = dhruva_stack_cache_set(1 as u32) as i64;
+        let _ = uart_puts("cachectl: stack data cache ON (");
+        let _ = uart_put_i64(n_on);
+        let _ = uart_puts(" pages)\n");
+        return 0;
+      }
+      if shell_word_matches(line_buf, as_, ae, "off") == 1 {
+        let n_off: i64 = dhruva_stack_cache_set(0 as u32) as i64;
+        let _ = uart_puts("cachectl: stack data cache OFF (");
+        let _ = uart_put_i64(n_off);
+        let _ = uart_puts(" pages)\n");
+        return 0;
+      }
+    }
+    let _ = uart_puts("cachectl: stack data cache is ");
+    let _ = uart_puts(if dhruva_stack_cache_get() == (1 as u32) { "ON" } else { "OFF" });
+    let _ = uart_puts(" -- usage: cachectl stack on|off\n");
+    return 0;
+  }
   if shell_word_matches(line_buf, 0, cmd_end, "fsrepair") == 1 {
     if dharafs_user_get_uid() != (0 as u32) {
       let _ = uart_puts("fsrepair: permission denied (root only)\n");
@@ -63158,6 +63190,63 @@ fn shell_dispatch_tlsd(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
 // fsrepair's own end-to-end check (`fsrepair selftest`, root): reproduce
 // exactly the old failure -- an intact record whose block got marked bad
 // -- then repair it and require the original bytes back.
+// 2026-11-27: `bench` -- wall-clock micro-benchmarks (TIMER_CLO) of the
+// paths that dominate software CCMP, to measure the cache options on
+// real hardware rather than guess. `cachectl stack on|off|status`
+// toggles data caching of task-stack pages (option B).
+fn bench_report(label: Str, t0: u32) -> i64 {
+  let _ = uart_puts("  ");
+  let _ = uart_puts(label);
+  let _ = uart_puts(": ");
+  let _ = uart_put_i64(wrapping_sub(mmio_read_u32(TIMER_CLO), t0) as i64);
+  let _ = uart_puts(" us\n");
+  return 0;
+}
+
+fn bench_cmd() -> i64 {
+  let _ = uart_puts("bench (stack data cache ");
+  let _ = uart_puts(if dhruva_stack_cache_get() == (1 as u32) { "ON" } else { "OFF" });
+  let _ = uart_puts("):\n");
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  let i: i64 = 0;
+  let acc: i64 = 0;
+  while i < 100000 { acc = acc + (i & 3); i = i + 1; }
+  let _ = bench_report("100000 empty loop iterations", t0);
+  let hb: mut ref i64 = dhruva_alloc_bytes(64);
+  t0 = mmio_read_u32(TIMER_CLO);
+  i = 0;
+  let x: u32 = 0 as u32;
+  while i < 10000 { x = x ^ buf_read_byte(hb, (i & 63) as u32); i = i + 1; }
+  let _ = bench_report("10000 heap buf_read_byte", t0);
+  let key: [u8; 16] = zero16_bytes();
+  let w: [u8; 176] = zero176_bytes();
+  let _ = aes128_key_expansion(ref key, mut ref w);
+  let blk: [u8; 16] = zero16_bytes();
+  let outb: [u8; 16] = zero16_bytes();
+  t0 = mmio_read_u32(TIMER_CLO);
+  i = 0;
+  while i < 100 { let _ = aes128_encrypt_block_w(ref w, ref blk, mut ref outb); blk[0] = outb[0]; i = i + 1; }
+  let _ = bench_report("100 AES blocks, state on stack", t0);
+  let wh: mut ref i64 = dhruva_alloc_bytes(176);
+  let bh: mut ref i64 = dhruva_alloc_bytes(16);
+  let oh: mut ref i64 = dhruva_alloc_bytes(16);
+  let kh: mut ref i64 = dhruva_alloc_bytes(16);
+  let _ = aes128_key_expand_heap(kh, wh);
+  t0 = mmio_read_u32(TIMER_CLO);
+  i = 0;
+  while i < 100 { let _ = aes128_encrypt_block_heap_w(wh, bh, oh); i = i + 1; }
+  let _ = bench_report("100 AES blocks via heap wrapper", t0);
+  let nonce: mut ref i64 = dhruva_alloc_bytes(16);
+  let aad: mut ref i64 = dhruva_alloc_bytes(32);
+  let body: mut ref i64 = dhruva_alloc_bytes(640);
+  let tag: mut ref i64 = dhruva_alloc_bytes(16);
+  t0 = mmio_read_u32(TIMER_CLO);
+  let _ = aes_ccmp_decrypt(kh, nonce, aad, 22, body, 600, tag, body);
+  let _ = bench_report("CCMP decrypt, 600-byte frame", t0);
+  if (acc == 0 - 1) || (x == (0x1234 as u32)) { let _ = uart_puts(""); }
+  return 0;
+}
+
 fn fsrepair_self_test() -> i64 {
   let ok: i64 = 1;
   let _ = dharafs_append("/fsrepair_t", "fsrepair-selftest-payload");

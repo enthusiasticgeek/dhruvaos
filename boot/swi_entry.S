@@ -221,6 +221,8 @@ swi_entry_skip_usr_sp_capture:
     beq swi_do_sd_drain_fifo
     cmp r7, #7
     beq swi_do_uart_tx_ring
+    cmp r7, #8
+    beq swi_do_stack_cache
     b swi_return_to_usr        /* unknown syscall number -- no-op,
                                * fall straight through to the restore
                                * rather than doing anything undefined */
@@ -291,6 +293,12 @@ swi_do_sd_fill_fifo:
  * same reason syscall #5 isn't -- see that syscall's own comment. */
 swi_do_sd_drain_fifo:
     bl sdhost_drain_fifo_to_buffer_impl
+    b swi_return_to_usr
+
+/* Syscall #8 (2026-11-27): dhruva_stack_cache_set -- toggles data
+ * caching of task-stack pages (CP15 writes, privileged only). */
+swi_do_stack_cache:
+    bl dhruva_stack_cache_set_impl
     b swi_return_to_usr
 
 /* Syscall #7 (2026-09-26): uart_tx_ring_push_and_drain -- see
@@ -674,6 +682,16 @@ sdhost_drain_fifo_to_buffer:
     push {r4, r7}
     mov r4, lr
     mov r7, #6
+    swi #0
+    mov lr, r4
+    pop {r4, r7}
+    bx lr
+
+.global dhruva_stack_cache_set
+dhruva_stack_cache_set:
+    push {r4, r7}
+    mov r4, lr
+    mov r7, #8
     swi #0
     mov lr, r4
     pop {r4, r7}

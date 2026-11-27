@@ -596,6 +596,37 @@ void *dhruva_alloc_bytes(long n) {
  * small scratch allocations should pay. */
 extern void mmu_guard_page_install(unsigned long addr);
 
+/* 2026-11-27 (option B): data caching for task-stack pages only.
+ * dhruva_stack_cache_set_impl runs privileged (SWI #8, boot/swi_entry.S;
+ * the shell is a USR-mode task, where CP15 writes are undefined).
+ * Order matters: turning ON, mark the pages cacheable and only then
+ * enable SCTLR.C; turning OFF, disable SCTLR.C with a full
+ * clean+invalidate first, so no dirty line is ever left behind a page
+ * that has become non-cacheable. */
+static unsigned long dhruva_stack_cache_on = 0;
+extern unsigned long mmu_task_domains_set_cacheable(unsigned long on);
+extern void dcache_enable_seq(void);
+extern void dcache_disable_seq(void);
+
+long dhruva_stack_cache_set_impl(long on) {
+    unsigned long saved_cpsr;
+    unsigned long pages;
+    __asm__ volatile ("mrs %0, cpsr\n\tcpsid if" : "=r"(saved_cpsr) :: "memory");
+    if (on) {
+        pages = mmu_task_domains_set_cacheable(1UL);
+        if (!dhruva_stack_cache_on) dcache_enable_seq();
+        dhruva_stack_cache_on = 1UL;
+    } else {
+        if (dhruva_stack_cache_on) dcache_disable_seq();
+        pages = mmu_task_domains_set_cacheable(0UL);
+        dhruva_stack_cache_on = 0UL;
+    }
+    __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
+    return (long)pages;
+}
+
+long dhruva_stack_cache_get(void) { return (long)dhruva_stack_cache_on; }
+
 void *dhruva_alloc_stack_guarded(long n) {
     unsigned long need = (unsigned long)n;
     unsigned long saved_cpsr;
@@ -619,7 +650,6 @@ void *dhruva_alloc_stack_guarded(long n) {
     __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
 
     mmu_guard_page_install((unsigned long)guard_ptr);
-
     unsigned long i = 0;
     while (i < need) {
         usable_ptr[i] = 0;

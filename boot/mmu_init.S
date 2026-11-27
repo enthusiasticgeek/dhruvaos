@@ -1026,3 +1026,69 @@ mmu_guard_page_install_domain:
     mov r0, #0
     pop {r4}
     bx lr
+
+/* ------------------------------------------------------------------
+ * 2026-11-27, option B: data caching for task-stack pages ONLY.
+ *
+ * mmu_task_domains_set_cacheable(on): every task stack lives in its own
+ * 1 MB domain (0x00A00000 + idx*1MB, dhruva_alloc_stack_domain), mapped
+ * by mmu_l2_table_task_domains as 0x73 small pages (TEX=001, C=B=0:
+ * Normal non-cacheable). Sets (on != 0) or clears C|B on every non-guard
+ * entry (guard pages are 0 and stay 0) -- TEX=001,C=B=1 is Normal
+ * write-back write-allocate -- then invalidates the whole TLB. No DMA
+ * ever targets these regions (all DWC2 DMA goes through two dedicated
+ * heap scratch buffers; mailbox buffers are in .bss; SD is PIO).
+ * Privileged: called from SWI #8 only. Returns pages changed.
+ * ------------------------------------------------------------------ */
+.global mmu_task_domains_set_cacheable
+mmu_task_domains_set_cacheable:
+    ldr r3, =mmu_l2_table_task_domains
+    mov r2, #0                      /* index 0 .. 15*256-1 */
+    mov r12, r0                     /* on flag */
+    mov r0, #0                      /* count */
+1:  ldr r1, [r3, r2, lsl #2]
+    cmp r1, #0
+    beq 2f
+    bic r1, r1, #0xC
+    cmp r12, #0
+    orrne r1, r1, #0xC
+    str r1, [r3, r2, lsl #2]
+    add r0, r0, #1
+2:  add r2, r2, #1
+    cmp r2, #3840
+    blo 1b
+    mov r1, #0
+    mcr p15, 0, r1, c7, c10, 4      /* DSB: table writes visible to the walker */
+    mcr p15, 0, r1, c8, c7, 0       /* invalidate entire unified TLB */
+    mcr p15, 0, r1, c7, c5, 6       /* invalidate branch predictor */
+    mcr p15, 0, r1, c7, c5, 4       /* ISB */
+    bx lr
+
+.global dcache_enable_seq
+dcache_enable_seq:
+    mov r0, #0
+    mcr p15, 0, r0, c7, c6, 0       /* invalidate entire D-cache */
+    mcr p15, 0, r0, c7, c10, 4      /* DSB */
+    mrc p15, 0, r1, c1, c0, 0
+    orr r1, r1, #0x4
+    mcr p15, 0, r1, c1, c0, 0
+    mcr p15, 0, r0, c7, c5, 4       /* ISB */
+    bx lr
+
+/* D-cache off without losing the running code's own dirty stack lines:
+ * clean+invalidate, clear SCTLR.C, then clean+invalidate again (catches
+ * anything dirtied between the first clean and the disable -- cache
+ * maintenance works with the cache disabled). No memory access in this
+ * routine besides those the CPU does itself. */
+.global dcache_disable_seq
+dcache_disable_seq:
+    mov r0, #0
+    mcr p15, 0, r0, c7, c14, 0      /* clean+invalidate entire D-cache */
+    mcr p15, 0, r0, c7, c10, 4      /* DSB */
+    mrc p15, 0, r1, c1, c0, 0
+    bic r1, r1, #0x4
+    mcr p15, 0, r1, c1, c0, 0
+    mcr p15, 0, r0, c7, c14, 0      /* clean+invalidate again */
+    mcr p15, 0, r0, c7, c10, 4      /* DSB */
+    mcr p15, 0, r0, c7, c5, 4       /* ISB */
+    bx lr
