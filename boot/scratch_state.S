@@ -3032,3 +3032,25 @@ tcpsink_payload_scratch_get:
     ldr r0, =tcpsink_payload_addr
     ldr r0, [r0]
     bx lr
+
+/* 2026-11-26: tlsd (TLS 1.3 server) working memory -- one boot-time
+ * allocation; tlsd_mem(off) = base + off (offsets: TLSD_* consts). */
+.section ".bss"
+.align 4
+tlsd_mem_addr:
+    .word 0
+
+.section ".text"
+.global tlsd_mem_set
+tlsd_mem_set:
+    ldr r1, =tlsd_mem_addr
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+
+.global tlsd_mem
+tlsd_mem:
+    ldr r1, =tlsd_mem_addr
+    ldr r1, [r1]
+    add r0, r1, r0
+    bx lr

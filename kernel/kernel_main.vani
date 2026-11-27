@@ -378,6 +378,9 @@ extern "C" fn kernelsig_pub_scratch_get() -> mut ref i64;
 extern "C" fn kernelsig_msg_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn kernelsig_msg_scratch_get() -> mut ref i64;
 extern "C" fn tcp_isn_scratch_set(addr: mut ref i64) -> i64;
+// 2026-11-26: tlsd working memory (boot/scratch_state.S).
+extern "C" fn tlsd_mem_set(addr: mut ref i64) -> i64;
+extern "C" fn tlsd_mem(off: u32) -> mut ref i64;
 extern "C" fn tcp_isn_scratch_get() -> mut ref i64;
 extern "C" fn tcpsink_frame_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn tcpsink_frame_scratch_get() -> mut ref i64;
@@ -48862,6 +48865,9 @@ fn shell_dispatch() -> i64 {
   if shell_word_matches(line_buf, 0, cmd_end, "sshd") == 1 {
     return ssh_real_server_cmd();
   }
+  if shell_word_matches(line_buf, 0, cmd_end, "tlsd") == 1 {
+    return shell_dispatch_tlsd(line_buf, cmd_end, line_len);
+  }
   if shell_word_matches(line_buf, 0, cmd_end, "tcpsink") == 1 {
     let tp: i64 = if cmd_end >= line_len { 5555 } else { shell_parse_decimal(line_buf, cmd_end + 1, shell_find_space(line_buf, cmd_end + 1, line_len)) };
     if (tp <= 0) || (tp > 65535) {
@@ -61844,6 +61850,1055 @@ fn tcpsink_cmd(port: u32) -> i64 {
   return 0;
 }
 
+// ===================================================================
+// tlsd: a real, interoperable TLS 1.3 server (RFC 8446), 2026-11-26.
+//
+// The older tls_* code in this file is a loopback demo (hard-coded
+// private keys, fixed-offset ClientHello parsing, only ever spoke to its
+// own client). tlsd replaces it for real use, tested against OpenSSL 3.5
+// and Python's ssl module.
+//
+// Deliberately narrow profile -- every piece is checkable:
+//   version   TLS 1.3 only
+//   cipher    TLS_CHACHA20_POLY1305_SHA256 (0x1303)
+//   group     X25519MLKEM768 (0x11EC) ONLY -- hybrid post-quantum key
+//             exchange (draft-ietf-tls-ecdhe-mlkem): client share =
+//             ML-KEM-768 ek (1184) || X25519 (32); server share = ML-KEM
+//             ciphertext (1088) || X25519 (32); shared secret = ML-KEM ss
+//             || X25519 ss. A client without that key share is refused
+//             (no HelloRetryRequest, no classical fallback -- so no
+//             downgrade).
+//   auth      Ed25519 (0x0807) both ways. Server: X.509 certificate
+//             issued by the operator's CA (test/tls_pki.py), stored at
+//             /config/tlsd.crt; private key generated ON the board
+//             (`tlsd keygen`), kept encrypted in the critical config
+//             store. Client: mandatory certificate whose Ed25519 key must
+//             equal the provisioned `tlsd client` key (pinning; the
+//             CertificateVerify signature proves possession).
+// Not implemented: PSK/resumption, 0-RTT, HelloRetryRequest, KeyUpdate,
+// NewSessionTicket, fragmentation of server records beyond one per
+// message.
+// ===================================================================
+
+const TLSD_MEM_SIZE: i64 = 66560;
+const TLSD_RX_OFF: i64 = 0;          // TCP byte stream, 24576
+const TLSD_RX_CAP: i64 = 24576;
+const TLSD_REC_OFF: i64 = 24576;     // one record body (<= 16384+256)
+const TLSD_HS_OFF: i64 = 41280;      // handshake reassembly, 8192
+const TLSD_HS_CAP: i64 = 8192;
+const TLSD_TX_OFF: i64 = 49472;      // outgoing message/record build, 8192
+const TLSD_SEG_OFF: i64 = 57664;     // TCP segment payload in, 1600
+const TLSD_FRAME_OFF: i64 = 59264;   // netif frame, 1600
+const TLSD_CERT_OFF: i64 = 60864;    // own certificate DER, 1024
+const TLSD_CERT_CAP: i64 = 1024;
+const TLSD_EK_OFF: i64 = 61888;      // client ML-KEM ek, 1184
+const TLSD_CT_OFF: i64 = 63072;      // ML-KEM ciphertext, 1088
+const TLSD_SMALL_OFF: i64 = 64160;   // 32 x 64-byte slots
+const TLSD_MSG_OFF: i64 = 66208;     // 256-byte scratch (CV content)
+
+// 64-byte small slots
+const TS_SRAND: i64 = 0;
+const TS_XPRIV: i64 = 1;
+const TS_XPUB: i64 = 2;
+const TS_XPEER: i64 = 3;
+const TS_XSS: i64 = 4;
+const TS_KEM_M: i64 = 5;
+const TS_KEM_SS: i64 = 6;
+const TS_SHARED: i64 = 7;     // 64 bytes: kem_ss || x_ss
+const TS_ID_SEED: i64 = 8;
+const TS_ID_PUB: i64 = 9;
+const TS_CLIENT_AUTH: i64 = 10;
+const TS_C_HS_KEY: i64 = 11;
+const TS_C_HS_IV: i64 = 12;
+const TS_S_HS_KEY: i64 = 13;
+const TS_S_HS_IV: i64 = 14;
+const TS_C_AP_KEY: i64 = 15;
+const TS_C_AP_IV: i64 = 16;
+const TS_S_AP_KEY: i64 = 17;
+const TS_S_AP_IV: i64 = 18;
+const TS_NONCE: i64 = 19;
+const TS_AAD: i64 = 20;
+const TS_TAG: i64 = 21;
+const TS_SIG: i64 = 22;
+const TS_SESSID: i64 = 23;
+const TS_TMP: i64 = 24;
+const TS_PEER_PUB: i64 = 25;
+const TS_BASEPT: i64 = 26;
+const TS_DSTMAC: i64 = 30;
+const TS_STATE: i64 = 31;     // u32 fields below
+const TST_RX_START: i64 = 0;
+const TST_RX_END: i64 = 4;
+const TST_HS_START: i64 = 8;
+const TST_HS_END: i64 = 12;
+const TST_SEQ_IN: i64 = 16;
+const TST_SEQ_OUT: i64 = 20;
+const TST_PORT: i64 = 24;
+const TST_IN_KEY: i64 = 28;   // 0 plaintext, 1 handshake keys, 2 app keys
+const TST_OUT_KEY: i64 = 32;
+const TST_SESSID_LEN: i64 = 36;
+const TST_CLOSED: i64 = 40;
+const TST_CERT_LEN: i64 = 44;
+const TST_CERT_CUR: i64 = 48;
+
+const TLSD_CONN: u32 = 1;
+const TLSD_MSS: i64 = 536;    // RFC 1122 default; we don't parse the peer's MSS option
+
+fn tlsd_p(off: i64) -> mut ref i64 {
+  return tlsd_mem(off as u32);
+}
+fn tlsd_s(slot: i64) -> mut ref i64 {
+  return tlsd_mem((TLSD_SMALL_OFF + 64 * slot) as u32);
+}
+fn tlsd_st_get(field: i64) -> i64 {
+  return buf_read_u32_le(tlsd_s(TS_STATE), field) as i64;
+}
+fn tlsd_st_set(field: i64, v: i64) -> i64 {
+  return buf_write_u32_le(tlsd_s(TS_STATE), field, v as u32);
+}
+
+fn tlsd_copy(dst: mut ref i64, doff: i64, src: mut ref i64, soff: i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    let _ = buf_write_byte(dst, (doff + i) as u32, buf_read_byte(src, (soff + i) as u32));
+    i = i + 1;
+  }
+  return 0;
+}
+fn tlsd_rd16(b: mut ref i64, off: i64) -> i64 {
+  return ((buf_read_byte(b, off as u32) as i64) << 8) | (buf_read_byte(b, (off + 1) as u32) as i64);
+}
+fn tlsd_rd24(b: mut ref i64, off: i64) -> i64 {
+  return ((buf_read_byte(b, off as u32) as i64) << 16) | ((buf_read_byte(b, (off + 1) as u32) as i64) << 8) | (buf_read_byte(b, (off + 2) as u32) as i64);
+}
+fn tlsd_wr8(b: mut ref i64, off: i64, v: i64) -> i64 {
+  let _ = buf_write_byte(b, off as u32, (v & 255) as u32);
+  return off + 1;
+}
+fn tlsd_wr16(b: mut ref i64, off: i64, v: i64) -> i64 {
+  let _ = buf_write_byte(b, off as u32, ((v >> 8) & 255) as u32);
+  let _ = buf_write_byte(b, (off + 1) as u32, (v & 255) as u32);
+  return off + 2;
+}
+fn tlsd_wr24(b: mut ref i64, off: i64, v: i64) -> i64 {
+  let _ = buf_write_byte(b, off as u32, ((v >> 16) & 255) as u32);
+  let _ = buf_write_byte(b, (off + 1) as u32, ((v >> 8) & 255) as u32);
+  let _ = buf_write_byte(b, (off + 2) as u32, (v & 255) as u32);
+  return off + 3;
+}
+fn tlsd_to32(b: mut ref i64, off: i64) -> [u8; 32] {
+  let a: [u8; 32] = [0 as u8; 32];
+  let i: i64 = 0;
+  while i < 32 { a[i] = buf_read_byte(b, (off + i) as u32) as u8; i = i + 1; }
+  return a;
+}
+fn tlsd_from32(b: mut ref i64, off: i64, a: ref [u8; 32], n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n { let _ = buf_write_byte(b, (off + i) as u32, a[i] as u32); i = i + 1; }
+  return 0;
+}
+fn tlsd_random(dst: mut ref i64, n: i64) -> i64 {
+  return csprng_generate_heap(csprng_state_ptr(), csprng_counter_ptr(), dst, n);
+}
+
+// ------------------------------------------------------------------
+// TCP transport (connection slot TLSD_CONN, foreground, polled).
+// ------------------------------------------------------------------
+
+// Processes at most one received frame. Incoming payload for our
+// connection is appended to the RX stream. Returns 1 if a frame for us
+// was handled, 0 otherwise, 0 - 1 on RX overflow (cannot happen while
+// the consumer drains records: RX_CAP exceeds one max record plus the
+// advertised window).
+fn tlsd_pump_once(my_mac: mut ref i64) -> i64 {
+  let frame: mut ref i64 = tlsd_p(TLSD_FRAME_OFF);
+  let port: u32 = tlsd_st_get(TST_PORT) as u32;
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+  let flen: i64 = netif_recv_frame(frame, 1514);
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+  if flen <= 0 { return 0; }
+  if buf_read_u16_be(frame, 12) != (0x0800 as u32) { return 0; }
+  if ipv4_get_protocol(frame, 14) != (6 as u32) { return 0; }
+  if tcp_get_dst_port(frame, 34) != port { return 0; }
+  let dmac: mut ref i64 = tlsd_s(TS_DSTMAC);
+  if tcp_conn_get_state(TLSD_CONN) == tcp_state_closed() {
+    let _ = tlsd_copy(dmac, 0, frame, 6, 6);
+  }
+  let seg: mut ref i64 = tlsd_p(TLSD_SEG_OFF);
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+  let n: i64 = tcp_conn_handle_segment(TLSD_CONN, frame, flen, my_mac, dmac, seg, 1514);
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+  if n > 0 {
+    let rx_start: i64 = tlsd_st_get(TST_RX_START);
+    let rx_end: i64 = tlsd_st_get(TST_RX_END);
+    if (rx_end + n) > TLSD_RX_CAP {
+      // compact
+      let live: i64 = rx_end - rx_start;
+      let _ = tlsd_copy(tlsd_p(TLSD_RX_OFF), 0, tlsd_p(TLSD_RX_OFF), rx_start, live);
+      rx_end = live;
+      let _ = tlsd_st_set(TST_RX_START, 0);
+      if (rx_end + n) > TLSD_RX_CAP { return 0 - 1; }
+    }
+    let _ = tlsd_copy(tlsd_p(TLSD_RX_OFF), rx_end, seg, 0, n);
+    let _ = tlsd_st_set(TST_RX_END, rx_end + n);
+  }
+  let st: u32 = tcp_conn_get_state(TLSD_CONN);
+  if (st == tcp_state_fin_wait()) || (st == tcp_state_closed_final()) || (st == tcp_state_closing()) {
+    let _ = tlsd_st_set(TST_CLOSED, 1);
+  }
+  return 1;
+}
+
+fn tlsd_rx_avail() -> i64 {
+  return tlsd_st_get(TST_RX_END) - tlsd_st_get(TST_RX_START);
+}
+
+// Waits until at least `need` stream bytes are buffered. 1 ok, 0 timeout
+// / peer closed with too little data.
+fn tlsd_rx_wait(my_mac: mut ref i64, need: i64, timeout_us: u32) -> i64 {
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  while tlsd_rx_avail() < need {
+    let _ = watchdog_kick();
+    if tlsd_pump_once(my_mac) < 0 { return 0; }
+    if (tlsd_st_get(TST_CLOSED) == 1) && (tlsd_rx_avail() < need) { return 0; }
+    if wrapping_sub(mmio_read_u32(TIMER_CLO), t0) > timeout_us { return 0; }
+  }
+  return 1;
+}
+
+// Reliable send: stop-and-wait segments of <= TLSD_MSS, each retransmitted
+// every 400 ms until ACKed (max 12 tries). Incoming data that arrives
+// meanwhile still lands in the RX stream (tlsd_pump_once). Returns 0 ok.
+fn tlsd_tcp_send(my_mac: mut ref i64, src: mut ref i64, src_off: i64, n: i64) -> i64 {
+  let dmac: mut ref i64 = tlsd_s(TS_DSTMAC);
+  let sent: i64 = 0;
+  while sent < n {
+    let take: i64 = if (n - sent) < TLSD_MSS { n - sent } else { TLSD_MSS };
+    let seq0: u32 = tcp_conn_get_local_seq(TLSD_CONN);
+    let target: u32 = wrapping_add(seq0, take as u32);
+    let tries: i64 = 0;
+    let acked: i64 = 0;
+    while (acked == 0) && (tries < 12) {
+      // staging area at TX+7600 (records are built below TX+5200)
+      let _ = tlsd_copy(tlsd_p(TLSD_TX_OFF + 7600), 0, src, src_off + sent, take);
+      let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+      let _ = tcp_send_segment(my_mac, dmac, tcp_conn_get_local_ip(TLSD_CONN), tcp_conn_get_remote_ip(TLSD_CONN), tcp_conn_get_local_port(TLSD_CONN), tcp_conn_get_remote_port(TLSD_CONN), seq0, tcp_conn_get_remote_seq(TLSD_CONN), tcp_flag_psh() | tcp_flag_ack(), TCP_RCV_WINDOW as u32, tlsd_p(TLSD_TX_OFF + 7600), take);
+      let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+      // Our seq advances once (first try); the rtx timer in tcp_conn is
+      // used only as the ACK detector: rtx_seq/len describe this segment.
+      let _ = tcp_conn_set_local_seq(TLSD_CONN, target);
+      let _ = tcp_conn_set_rtx_seq(TLSD_CONN, seq0);
+      let _ = tcp_conn_set_rtx_len(TLSD_CONN, take as u32);
+      let _ = tcp_conn_set_rtx_deadline(TLSD_CONN, 1 as u32); // nonzero = awaiting ACK
+      let t0: u32 = mmio_read_u32(TIMER_CLO);
+      while (tcp_conn_get_rtx_deadline(TLSD_CONN) != (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), t0) < (400000 as u32)) {
+        let _ = watchdog_kick();
+        if tlsd_pump_once(my_mac) < 0 { return 0 - 1; }
+        if tlsd_st_get(TST_CLOSED) == 1 { return 0 - 1; }
+      }
+      if tcp_conn_get_rtx_deadline(TLSD_CONN) == (0 as u32) { acked = 1; }
+      tries = tries + 1;
+    }
+    if acked == 0 { return 0 - 1; }
+    sent = sent + take;
+  }
+  return 0;
+}
+
+// ------------------------------------------------------------------
+// Record layer
+// ------------------------------------------------------------------
+
+fn tlsd_nonce(iv_slot: i64, seq: i64) -> mut ref i64 {
+  let iv: mut ref i64 = tlsd_s(iv_slot);
+  let nonce: mut ref i64 = tlsd_s(TS_NONCE);
+  let i: i64 = 0;
+  while i < 12 {
+    let sh: i64 = if i >= 4 { 8 * (11 - i) } else { 0 };
+    let sb: i64 = if i >= 4 { (seq >> (sh & 63)) & 255 } else { 0 };
+    let _ = buf_write_byte(nonce, i as u32, buf_read_byte(iv, i as u32) ^ (sb as u32));
+    i = i + 1;
+  }
+  return nonce;
+}
+
+// Sends one record. ctype = content type (22 handshake, 23 app, 21
+// alert). Encrypted under the current outbound key unless OUT_KEY == 0.
+fn tlsd_send_record(my_mac: mut ref i64, ctype: i64, data: mut ref i64, data_off: i64, n: i64) -> i64 {
+  let out: mut ref i64 = tlsd_p(TLSD_TX_OFF + 4096);   // record build area (TX second half)
+  let ok_key: i64 = tlsd_st_get(TST_OUT_KEY);
+  if ok_key == 0 {
+    let _ = tlsd_wr8(out, 0, ctype);
+    let _ = tlsd_wr16(out, 1, 0x0303);
+    let _ = tlsd_wr16(out, 3, n);
+    let _ = tlsd_copy(out, 5, data, data_off, n);
+    return tlsd_tcp_send(my_mac, out, 0, 5 + n);
+  }
+  // TLSInnerPlaintext = content || ctype; no padding.
+  let pt_len: i64 = n + 1;
+  let ct_len: i64 = pt_len + 16;
+  let _ = tlsd_wr8(out, 0, 23);
+  let _ = tlsd_wr16(out, 1, 0x0303);
+  let _ = tlsd_wr16(out, 3, ct_len);
+  let plain: mut ref i64 = tlsd_p(TLSD_TX_OFF);
+  let _ = tlsd_copy(plain, 0, data, data_off, n);
+  let _ = buf_write_byte(plain, n as u32, ctype as u32);
+  let key_slot: i64 = if ok_key == 1 { TS_S_HS_KEY } else { TS_S_AP_KEY };
+  let iv_slot: i64 = if ok_key == 1 { TS_S_HS_IV } else { TS_S_AP_IV };
+  let seq: i64 = tlsd_st_get(TST_SEQ_OUT);
+  let nonce: mut ref i64 = tlsd_nonce(iv_slot, seq);
+  let aad: mut ref i64 = tlsd_s(TS_AAD);
+  let _ = tlsd_copy(aad, 0, out, 0, 5);
+  let ctb: mut ref i64 = tlsd_p(TLSD_TX_OFF + 2048);
+  let tag: mut ref i64 = tlsd_s(TS_TAG);
+  let _ = chacha20_poly1305_encrypt_heap(tlsd_s(key_slot), nonce, aad, 5, plain, pt_len, ctb, tag);
+  let _ = tlsd_copy(out, 5, ctb, 0, pt_len);
+  let _ = tlsd_copy(out, 5 + pt_len, tag, 0, 16);
+  let _ = tlsd_st_set(TST_SEQ_OUT, seq + 1);
+  return tlsd_tcp_send(my_mac, out, 0, 5 + ct_len);
+}
+
+// Reads the next record into REC. Returns its (inner) content type, with
+// the plaintext length in TS_TMP[0..4) (u32 LE); 0 - 1 on timeout/close/
+// error, 0 - 2 on AEAD failure. ChangeCipherSpec records are skipped.
+fn tlsd_read_record(my_mac: mut ref i64, timeout_us: u32) -> i64 {
+  let keep: i64 = 1;
+  while keep == 1 {
+    if tlsd_rx_wait(my_mac, 5, timeout_us) == 0 { return 0 - 1; }
+    let rx: mut ref i64 = tlsd_p(TLSD_RX_OFF);
+    let st: i64 = tlsd_st_get(TST_RX_START);
+    let rtype: i64 = buf_read_byte(rx, st as u32) as i64;
+    let rlen: i64 = tlsd_rd16(rx, st + 3);
+    if (rlen > (16384 + 256)) || (rlen < 1) { return 0 - 1; }
+    if tlsd_rx_wait(my_mac, 5 + rlen, timeout_us) == 0 { return 0 - 1; }
+    let st2: i64 = tlsd_st_get(TST_RX_START);   // may have been compacted
+    let rec: mut ref i64 = tlsd_p(TLSD_REC_OFF);
+    let aad: mut ref i64 = tlsd_s(TS_AAD);
+    let _ = tlsd_copy(aad, 0, tlsd_p(TLSD_RX_OFF), st2, 5);
+    let _ = tlsd_copy(rec, 0, tlsd_p(TLSD_RX_OFF), st2 + 5, rlen);
+    let _ = tlsd_st_set(TST_RX_START, st2 + 5 + rlen);
+    if rtype == 20 {
+      keep = 1;   // middlebox-compat ChangeCipherSpec: ignore
+    } else {
+      let in_key: i64 = tlsd_st_get(TST_IN_KEY);
+      if (in_key == 0) || (rtype != 23) {
+        if in_key != 0 { return 0 - 1; }   // plaintext record after keys switched
+        let _ = buf_write_u32_le(tlsd_s(TS_TMP), 0, rlen as u32);
+        return rtype;
+      }
+      if rlen < 17 { return 0 - 1; }
+      let ct_len: i64 = rlen - 16;
+      let tag: mut ref i64 = tlsd_s(TS_TAG);
+      let _ = tlsd_copy(tag, 0, rec, ct_len, 16);
+      let key_slot: i64 = if in_key == 1 { TS_C_HS_KEY } else { TS_C_AP_KEY };
+      let iv_slot: i64 = if in_key == 1 { TS_C_HS_IV } else { TS_C_AP_IV };
+      let seq: i64 = tlsd_st_get(TST_SEQ_IN);
+      let nonce: mut ref i64 = tlsd_nonce(iv_slot, seq);
+      if chacha20_poly1305_decrypt_heap(tlsd_s(key_slot), nonce, aad, 5, rec, ct_len, tag, rec) != 0 {
+        return 0 - 2;
+      }
+      let _ = tlsd_st_set(TST_SEQ_IN, seq + 1);
+      // strip zero padding; last nonzero byte is the inner content type
+      let k: i64 = ct_len - 1;
+      while (k >= 0) && (buf_read_byte(rec, k as u32) == (0 as u32)) { k = k - 1; }
+      if k < 0 { return 0 - 1; }
+      let inner: i64 = buf_read_byte(rec, k as u32) as i64;
+      let _ = buf_write_u32_le(tlsd_s(TS_TMP), 0, k as u32);
+      return inner;
+    }
+  }
+  return 0 - 1;
+}
+
+// Next complete handshake message into HS (reassembled across records).
+// Returns the message length (header included) at HS[HS_START..], or
+// < 0 on error. The caller consumes it with tlsd_hs_consume.
+fn tlsd_hs_next(my_mac: mut ref i64, timeout_us: u32) -> i64 {
+  let hs: mut ref i64 = tlsd_p(TLSD_HS_OFF);
+  let keep: i64 = 1;
+  while keep == 1 {
+    let hs_start: i64 = tlsd_st_get(TST_HS_START);
+    let hs_end: i64 = tlsd_st_get(TST_HS_END);
+    if (hs_end - hs_start) >= 4 {
+      let mlen: i64 = 4 + tlsd_rd24(hs, hs_start + 1);
+      if (hs_end - hs_start) >= mlen { return mlen; }
+      if mlen > TLSD_HS_CAP { return 0 - 1; }
+    }
+    let t: i64 = tlsd_read_record(my_mac, timeout_us);
+    if t < 0 { return t; }
+    if t == 21 { return 0 - 3; }      // alert from peer
+    if t != 22 { return 0 - 1; }
+    let n: i64 = buf_read_u32_le(tlsd_s(TS_TMP), 0) as i64;
+    // compact then append
+    let live: i64 = hs_end - hs_start;
+    let _ = tlsd_copy(hs, 0, hs, hs_start, live);
+    if (live + n) > TLSD_HS_CAP { return 0 - 1; }
+    let _ = tlsd_copy(hs, live, tlsd_p(TLSD_REC_OFF), 0, n);
+    let _ = tlsd_st_set(TST_HS_START, 0);
+    let _ = tlsd_st_set(TST_HS_END, live + n);
+  }
+  return 0 - 1;
+}
+fn tlsd_hs_consume(n: i64) -> i64 {
+  return tlsd_st_set(TST_HS_START, tlsd_st_get(TST_HS_START) + n);
+}
+
+// ------------------------------------------------------------------
+// Key schedule (RFC 8446 7.1, SHA-256)
+// ------------------------------------------------------------------
+
+fn tlsd_derive_secret(secret: ref [u8; 32], label: Str, thash: ref [u8; 32]) -> [u8; 32] {
+  return tls_hkdf_expand_label(secret, label, thash, 32, 32);
+}
+fn tlsd_traffic_keys(secret: ref [u8; 32], key_slot: i64, iv_slot: i64) -> i64 {
+  let empty: [u8; 32] = [0 as u8; 32];
+  let k: [u8; 32] = tls_hkdf_expand_label(secret, "key", ref empty, 0, 32);
+  let iv: [u8; 32] = tls_hkdf_expand_label(secret, "iv", ref empty, 0, 12);
+  let _ = tlsd_from32(tlsd_s(key_slot), 0, ref k, 32);
+  let _ = tlsd_from32(tlsd_s(iv_slot), 0, ref iv, 12);
+  return 0;
+}
+fn tlsd_finished(base: ref [u8; 32], thash: ref [u8; 32]) -> [u8; 32] {
+  let empty: [u8; 32] = [0 as u8; 32];
+  let fk: [u8; 32] = tls_hkdf_expand_label(base, "finished", ref empty, 0, 32);
+  let m: [u8; 256] = [0 as u8; 256];
+  let i: i64 = 0;
+  while i < 32 { m[i] = thash[i]; i = i + 1; }
+  return tls_hmac_sha256(ref fk, ref m, 32);
+}
+fn tlsd_hash_snapshot(ctx: Sha256Ctx) -> [u8; 32] {
+  let c: Sha256Ctx = ctx;
+  return sha256_finalize(ref c);
+}
+fn tlsd_empty_hash() -> [u8; 32] {
+  let c: Sha256Ctx = sha256_init();
+  return sha256_finalize(ref c);
+}
+
+// CertificateVerify signed content: 64 x 0x20 || context || 0 || hash.
+fn tlsd_cv_content(is_server: i64, thash: ref [u8; 32], out: mut ref i64) -> i64 {
+  let o: i64 = 0;
+  while o < 64 { let _ = buf_write_byte(out, o as u32, 0x20 as u32); o = o + 1; }
+  let ctxs: Str = if is_server == 1 { "TLS 1.3, server CertificateVerify" } else { "TLS 1.3, client CertificateVerify" };
+  let cl: i64 = str_len_bytes(ctxs);
+  let i: i64 = 0;
+  while i < cl { let _ = buf_write_byte(out, (o + i) as u32, str_byte_at(ctxs, i) as u32); i = i + 1; }
+  o = o + cl;
+  let _ = buf_write_byte(out, o as u32, 0 as u32);
+  o = o + 1;
+  let _ = tlsd_from32(out, o, thash, 32);
+  return o + 32;
+}
+
+// Finds the single Ed25519 SubjectPublicKeyInfo in a DER certificate and
+// copies its 32-byte key to out. 1 found exactly once, else 0.
+fn tlsd_cert_ed25519_key(cert: mut ref i64, cert_off: i64, cert_len: i64, out: mut ref i64) -> i64 {
+  let pfx: [u8; 12] = [0x30 as u8, 0x2a as u8, 0x30 as u8, 0x05 as u8, 0x06 as u8, 0x03 as u8, 0x2b as u8, 0x65 as u8, 0x70 as u8, 0x03 as u8, 0x21 as u8, 0x00 as u8];
+  let found: i64 = 0;
+  let i: i64 = 0;
+  while (i + 44) <= cert_len {
+    let m: i64 = 1;
+    let j: i64 = 0;
+    while (j < 12) && (m == 1) {
+      if buf_read_byte(cert, (cert_off + i + j) as u32) != (pfx[j] as u32) { m = 0; }
+      j = j + 1;
+    }
+    if m == 1 {
+      found = found + 1;
+      let _ = tlsd_copy(out, 0, cert, cert_off + i + 12, 32);
+    }
+    i = i + 1;
+  }
+  return if found == 1 { 1 } else { 0 };
+}
+
+// Loads identity seed, derives its public key, loads the certificate and
+// checks it carries that key, loads the authorized client key. 0 ok.
+fn tlsd_load_identity() -> i64 {
+  if critical_config_read("tlsd_id", tlsd_s(TS_ID_SEED)) != 32 {
+    let _ = uart_puts("tlsd: no identity key (run 'tlsd keygen')\n");
+    return 0 - 1;
+  }
+  let _ = ed25519_secret_to_public_heap(tlsd_s(TS_ID_SEED), tlsd_s(TS_ID_PUB));
+  let cl: i64 = dharafs_read("/config/tlsd.crt", tlsd_p(TLSD_CERT_OFF));
+  if (cl <= 0) || (cl > TLSD_CERT_CAP) {
+    let _ = uart_puts("tlsd: no certificate at /config/tlsd.crt (provision with tlsd certbegin/certchunk/certend)\n");
+    return 0 - 1;
+  }
+  let _ = tlsd_st_set(TST_CERT_LEN, cl);
+  if tlsd_cert_ed25519_key(tlsd_p(TLSD_CERT_OFF), 0, cl, tlsd_s(TS_PEER_PUB)) != 1 {
+    let _ = uart_puts("tlsd: certificate has no single Ed25519 key\n");
+    return 0 - 1;
+  }
+  if sha256_bytes_equal(tlsd_s(TS_PEER_PUB), tlsd_s(TS_ID_PUB), 32) == 0 {
+    let _ = uart_puts("tlsd: certificate does not match this board's identity key\n");
+    return 0 - 1;
+  }
+  if critical_config_read("tlsd_client", tlsd_s(TS_CLIENT_AUTH)) != 32 {
+    let _ = uart_puts("tlsd: no authorized client key (run 'tlsd client <hex>')\n");
+    return 0 - 1;
+  }
+  return 0;
+}
+
+// ------------------------------------------------------------------
+// Handshake (server side)
+// ------------------------------------------------------------------
+
+// Parses the ClientHello at HS[hs_start .. hs_start+mlen). Stores session
+// id, copies the X25519MLKEM768 share (ek -> EK, x25519 -> XPEER).
+// 0 ok; negative = reason.
+fn tlsd_parse_client_hello(hs: mut ref i64, base: i64, mlen: i64) -> i64 {
+  if buf_read_byte(hs, base as u32) != (1 as u32) { return 0 - 1; }
+  let p: i64 = base + 4;
+  let lim: i64 = base + mlen;
+  p = p + 2 + 32;  // legacy_version, random
+  if p >= lim { return 0 - 2; }
+  let sid_len: i64 = buf_read_byte(hs, p as u32) as i64;
+  if (sid_len > 32) || ((p + 1 + sid_len) > lim) { return 0 - 2; }
+  let _ = tlsd_copy(tlsd_s(TS_SESSID), 0, hs, p + 1, sid_len);
+  let _ = tlsd_st_set(TST_SESSID_LEN, sid_len);
+  p = p + 1 + sid_len;
+  let cs_len: i64 = tlsd_rd16(hs, p);
+  let has_chacha: i64 = 0;
+  let ci: i64 = 0;
+  while ci < cs_len {
+    if tlsd_rd16(hs, p + 2 + ci) == 0x1303 { has_chacha = 1; }
+    ci = ci + 2;
+  }
+  p = p + 2 + cs_len;
+  let comp_len: i64 = buf_read_byte(hs, p as u32) as i64;
+  p = p + 1 + comp_len;
+  if (p + 2) > lim { return 0 - 2; }
+  let ext_total: i64 = tlsd_rd16(hs, p);
+  p = p + 2;
+  let ext_end: i64 = p + ext_total;
+  if ext_end > lim { return 0 - 2; }
+  let has_v13: i64 = 0;
+  let has_ed: i64 = 0;
+  let has_share: i64 = 0;
+  while (p + 4) <= ext_end {
+    let et: i64 = tlsd_rd16(hs, p);
+    let el: i64 = tlsd_rd16(hs, p + 2);
+    let ed: i64 = p + 4;
+    if (ed + el) > ext_end { return 0 - 2; }
+    if et == 43 {
+      let vl: i64 = buf_read_byte(hs, ed as u32) as i64;
+      let vi: i64 = 0;
+      while (vi + 1) < vl {
+        if tlsd_rd16(hs, ed + 1 + vi) == 0x0304 { has_v13 = 1; }
+        vi = vi + 2;
+      }
+    }
+    if et == 13 {
+      let sl: i64 = tlsd_rd16(hs, ed);
+      let si: i64 = 0;
+      while (si + 1) < sl {
+        if tlsd_rd16(hs, ed + 2 + si) == 0x0807 { has_ed = 1; }
+        si = si + 2;
+      }
+    }
+    if et == 51 {
+      let kl: i64 = tlsd_rd16(hs, ed);
+      let kp: i64 = ed + 2;
+      let kend: i64 = kp + kl;
+      while (kp + 4) <= kend {
+        let grp: i64 = tlsd_rd16(hs, kp);
+        let kxl: i64 = tlsd_rd16(hs, kp + 2);
+        if (kp + 4 + kxl) > kend { return 0 - 2; }
+        if (grp == 0x11EC) && (kxl == (MLKEM3_EK_LEN + 32)) {
+          let _ = tlsd_copy(tlsd_p(TLSD_EK_OFF), 0, hs, kp + 4, MLKEM3_EK_LEN);
+          let _ = tlsd_copy(tlsd_s(TS_XPEER), 0, hs, kp + 4 + MLKEM3_EK_LEN, 32);
+          has_share = 1;
+        }
+        kp = kp + 4 + kxl;
+      }
+    }
+    p = ed + el;
+  }
+  if has_v13 == 0 { return 0 - 10; }
+  if has_chacha == 0 { return 0 - 11; }
+  if has_ed == 0 { return 0 - 12; }
+  if has_share == 0 { return 0 - 13; }
+  return 0;
+}
+
+// Full server handshake on an ESTABLISHED TCP connection. 0 = keys for
+// application data installed and the client authenticated.
+fn tlsd_handshake(my_mac: mut ref i64) -> i64 {
+  let tmo: u32 = 20000000 as u32;
+  let _ = tlsd_st_set(TST_IN_KEY, 0);
+  let _ = tlsd_st_set(TST_OUT_KEY, 0);
+  let _ = tlsd_st_set(TST_SEQ_IN, 0);
+  let _ = tlsd_st_set(TST_SEQ_OUT, 0);
+  let _ = tlsd_st_set(TST_HS_START, 0);
+  let _ = tlsd_st_set(TST_HS_END, 0);
+  let hs: mut ref i64 = tlsd_p(TLSD_HS_OFF);
+
+  // ---- ClientHello
+  let chl: i64 = tlsd_hs_next(my_mac, tmo);
+  if chl < 0 { let _ = uart_puts("tlsd: no ClientHello\n"); return 0 - 1; }
+  let ch_base: i64 = tlsd_st_get(TST_HS_START);
+  let pr: i64 = tlsd_parse_client_hello(hs, ch_base, chl);
+  if pr != 0 {
+    let _ = uart_puts("tlsd: ClientHello rejected, reason=");
+    let _ = uart_put_i64(pr);
+    let _ = uart_puts(" (-10 no TLS1.3, -11 no CHACHA20_POLY1305, -12 no ed25519, -13 no X25519MLKEM768 key share)\n");
+    return 0 - 2;
+  }
+  let th: Sha256Ctx = sha256_init();
+  th = sha256_update_heap_off(th, hs, ch_base, chl);
+  let _ = tlsd_hs_consume(chl);
+
+  // ---- key exchange: X25519 + ML-KEM-768 encapsulation
+  let _ = tlsd_random(tlsd_s(TS_XPRIV), 32);
+  let bp: mut ref i64 = tlsd_s(TS_BASEPT);
+  let _ = tls_x25519_basepoint_heap(bp);
+  let _ = x25519_scalarmult_heap(tlsd_s(TS_XPRIV), bp, tlsd_s(TS_XPUB));
+  let _ = x25519_scalarmult_heap(tlsd_s(TS_XPRIV), tlsd_s(TS_XPEER), tlsd_s(TS_XSS));
+  let zacc: u32 = 0 as u32;
+  let zi: i64 = 0;
+  while zi < 32 { zacc = zacc | buf_read_byte(tlsd_s(TS_XSS), zi as u32); zi = zi + 1; }
+  if zacc == (0 as u32) { let _ = uart_puts("tlsd: X25519 shared secret all-zero (low-order point)\n"); return 0 - 3; }
+  let _ = mlkem_init();
+  let _ = tlsd_random(tlsd_s(TS_KEM_M), 32);
+  if mlkem768_encaps(tlsd_p(TLSD_EK_OFF), tlsd_s(TS_KEM_M), tlsd_s(TS_KEM_SS), tlsd_p(TLSD_CT_OFF)) != 0 {
+    let _ = uart_puts("tlsd: client ML-KEM-768 key fails the FIPS 203 modulus check\n");
+    return 0 - 3;
+  }
+  let shared: mut ref i64 = tlsd_s(TS_SHARED);
+  let _ = tlsd_copy(shared, 0, tlsd_s(TS_KEM_SS), 0, 32);
+  let _ = tlsd_copy(shared, 32, tlsd_s(TS_XSS), 0, 32);
+
+  // ---- ServerHello
+  let tx: mut ref i64 = tlsd_p(TLSD_TX_OFF);
+  let _ = tlsd_random(tlsd_s(TS_SRAND), 32);
+  let sid_len: i64 = tlsd_st_get(TST_SESSID_LEN);
+  let o: i64 = 4;
+  o = tlsd_wr16(tx, o, 0x0303);
+  let _ = tlsd_copy(tx, o, tlsd_s(TS_SRAND), 0, 32);
+  o = o + 32;
+  o = tlsd_wr8(tx, o, sid_len);
+  let _ = tlsd_copy(tx, o, tlsd_s(TS_SESSID), 0, sid_len);
+  o = o + sid_len;
+  o = tlsd_wr16(tx, o, 0x1303);
+  o = tlsd_wr8(tx, o, 0);
+  let ext_len_pos: i64 = o;
+  o = o + 2;
+  o = tlsd_wr16(tx, o, 43);
+  o = tlsd_wr16(tx, o, 2);
+  o = tlsd_wr16(tx, o, 0x0304);
+  o = tlsd_wr16(tx, o, 51);
+  o = tlsd_wr16(tx, o, 4 + MLKEM3_CT_LEN + 32);
+  o = tlsd_wr16(tx, o, 0x11EC);
+  o = tlsd_wr16(tx, o, MLKEM3_CT_LEN + 32);
+  let _ = tlsd_copy(tx, o, tlsd_p(TLSD_CT_OFF), 0, MLKEM3_CT_LEN);
+  o = o + MLKEM3_CT_LEN;
+  let _ = tlsd_copy(tx, o, tlsd_s(TS_XPUB), 0, 32);
+  o = o + 32;
+  let _ = tlsd_wr16(tx, ext_len_pos, o - ext_len_pos - 2);
+  let _ = tlsd_wr8(tx, 0, 2);
+  let _ = tlsd_wr24(tx, 1, o - 4);
+  th = sha256_update_heap_off(th, tx, 0, o);
+  // Copy SH out of TX before tlsd_send_record reuses TX's first half.
+  let _ = tlsd_copy(tlsd_p(TLSD_HS_OFF + 4096), 0, tx, 0, o);
+  if tlsd_send_record(my_mac, 22, tlsd_p(TLSD_HS_OFF + 4096), 0, o) != 0 { return 0 - 4; }
+
+  // ---- handshake secrets
+  let zero32: [u8; 32] = [0 as u8; 32];
+  let early: [u8; 32] = tls_hkdf_extract(ref zero32, ref zero32);
+  let eh: [u8; 32] = tlsd_empty_hash();
+  let derived1: [u8; 32] = tlsd_derive_secret(ref early, "derived", ref eh);
+  let ikm: [u8; 256] = [0 as u8; 256];
+  let ii: i64 = 0;
+  while ii < 64 { ikm[ii] = buf_read_byte(shared, ii as u32) as u8; ii = ii + 1; }
+  let hs_secret: [u8; 32] = tls_hmac_sha256(ref derived1, ref ikm, 64);
+  let h_chsh: [u8; 32] = tlsd_hash_snapshot(th);
+  let c_hs: [u8; 32] = tlsd_derive_secret(ref hs_secret, "c hs traffic", ref h_chsh);
+  let s_hs: [u8; 32] = tlsd_derive_secret(ref hs_secret, "s hs traffic", ref h_chsh);
+  let _ = tlsd_traffic_keys(ref c_hs, TS_C_HS_KEY, TS_C_HS_IV);
+  let _ = tlsd_traffic_keys(ref s_hs, TS_S_HS_KEY, TS_S_HS_IV);
+  let _ = tlsd_st_set(TST_OUT_KEY, 1);
+  let _ = tlsd_st_set(TST_IN_KEY, 1);
+  let _ = tlsd_st_set(TST_SEQ_OUT, 0);
+  let _ = tlsd_st_set(TST_SEQ_IN, 0);
+
+  // ---- EncryptedExtensions (empty)
+  let m: mut ref i64 = tlsd_p(TLSD_HS_OFF + 4096);
+  let _ = tlsd_wr8(m, 0, 8);
+  let _ = tlsd_wr24(m, 1, 2);
+  let _ = tlsd_wr16(m, 4, 0);
+  th = sha256_update_heap_off(th, m, 0, 6);
+  if tlsd_send_record(my_mac, 22, m, 0, 6) != 0 { return 0 - 4; }
+
+  // ---- CertificateRequest: context "", signature_algorithms {ed25519}
+  o = 0;
+  o = tlsd_wr8(m, o, 13);
+  o = tlsd_wr24(m, o, 11);
+  o = tlsd_wr8(m, o, 0);
+  o = tlsd_wr16(m, o, 8);
+  o = tlsd_wr16(m, o, 13);
+  o = tlsd_wr16(m, o, 4);
+  o = tlsd_wr16(m, o, 2);
+  o = tlsd_wr16(m, o, 0x0807);
+  th = sha256_update_heap_off(th, m, 0, o);
+  if tlsd_send_record(my_mac, 22, m, 0, o) != 0 { return 0 - 4; }
+
+  // ---- Certificate
+  let cl: i64 = tlsd_st_get(TST_CERT_LEN);
+  o = 0;
+  o = tlsd_wr8(m, o, 11);
+  o = tlsd_wr24(m, o, 1 + 3 + 3 + cl + 2);
+  o = tlsd_wr8(m, o, 0);
+  o = tlsd_wr24(m, o, 3 + cl + 2);
+  o = tlsd_wr24(m, o, cl);
+  let _ = tlsd_copy(m, o, tlsd_p(TLSD_CERT_OFF), 0, cl);
+  o = o + cl;
+  o = tlsd_wr16(m, o, 0);
+  th = sha256_update_heap_off(th, m, 0, o);
+  if tlsd_send_record(my_mac, 22, m, 0, o) != 0 { return 0 - 4; }
+
+  // ---- CertificateVerify
+  let h_cert: [u8; 32] = tlsd_hash_snapshot(th);
+  let cvc: mut ref i64 = tlsd_p(TLSD_MSG_OFF);
+  let cvl: i64 = tlsd_cv_content(1, ref h_cert, cvc);
+  let _ = ed25519_sign_heap(tlsd_s(TS_ID_SEED), cvc, cvl, tlsd_s(TS_SIG));
+  o = 0;
+  o = tlsd_wr8(m, o, 15);
+  o = tlsd_wr24(m, o, 4 + 64);
+  o = tlsd_wr16(m, o, 0x0807);
+  o = tlsd_wr16(m, o, 64);
+  let _ = tlsd_copy(m, o, tlsd_s(TS_SIG), 0, 64);
+  o = o + 64;
+  th = sha256_update_heap_off(th, m, 0, o);
+  if tlsd_send_record(my_mac, 22, m, 0, o) != 0 { return 0 - 4; }
+
+  // ---- server Finished
+  let h_cv: [u8; 32] = tlsd_hash_snapshot(th);
+  let s_fin: [u8; 32] = tlsd_finished(ref s_hs, ref h_cv);
+  o = 0;
+  o = tlsd_wr8(m, o, 20);
+  o = tlsd_wr24(m, o, 32);
+  let _ = tlsd_from32(m, o, ref s_fin, 32);
+  o = o + 32;
+  th = sha256_update_heap_off(th, m, 0, o);
+  if tlsd_send_record(my_mac, 22, m, 0, o) != 0 { return 0 - 4; }
+
+  // ---- application secrets (transcript through server Finished)
+  let h_sfin: [u8; 32] = tlsd_hash_snapshot(th);
+  let derived2: [u8; 32] = tlsd_derive_secret(ref hs_secret, "derived", ref eh);
+  let master: [u8; 32] = tls_hkdf_extract(ref derived2, ref zero32);
+  let c_ap: [u8; 32] = tlsd_derive_secret(ref master, "c ap traffic", ref h_sfin);
+  let s_ap: [u8; 32] = tlsd_derive_secret(ref master, "s ap traffic", ref h_sfin);
+
+  // ---- client Certificate
+  let ccl: i64 = tlsd_hs_next(my_mac, tmo);
+  if ccl < 0 { let _ = uart_puts("tlsd: no client Certificate (code "); let _ = uart_put_i64(ccl); let _ = uart_puts(")\n"); return 0 - 5; }
+  let cb: i64 = tlsd_st_get(TST_HS_START);
+  if buf_read_byte(hs, cb as u32) != (11 as u32) { let _ = uart_puts("tlsd: expected client Certificate\n"); return 0 - 5; }
+  // context(1)=0, list len(3), first cert len(3)
+  if (ccl < 11) || (buf_read_byte(hs, (cb + 4) as u32) != (0 as u32)) { return 0 - 5; }
+  let first_len: i64 = tlsd_rd24(hs, cb + 8);
+  if (first_len <= 0) || ((11 + first_len) > ccl) { let _ = uart_puts("tlsd: client sent no certificate\n"); return 0 - 5; }
+  if tlsd_cert_ed25519_key(hs, cb + 11, first_len, tlsd_s(TS_PEER_PUB)) != 1 {
+    let _ = uart_puts("tlsd: client certificate has no single Ed25519 key\n");
+    return 0 - 6;
+  }
+  if sha256_bytes_equal(tlsd_s(TS_PEER_PUB), tlsd_s(TS_CLIENT_AUTH), 32) == 0 {
+    let _ = uart_puts("tlsd: client key is NOT the authorized one -- refused\n");
+    return 0 - 6;
+  }
+  th = sha256_update_heap_off(th, hs, cb, ccl);
+  let _ = tlsd_hs_consume(ccl);
+
+  // ---- client CertificateVerify
+  let h_ccert: [u8; 32] = tlsd_hash_snapshot(th);
+  let cvl2: i64 = tlsd_hs_next(my_mac, tmo);
+  if cvl2 < 0 { return 0 - 7; }
+  let vb: i64 = tlsd_st_get(TST_HS_START);
+  if (buf_read_byte(hs, vb as u32) != (15 as u32)) || (cvl2 != 72) || (tlsd_rd16(hs, vb + 4) != 0x0807) || (tlsd_rd16(hs, vb + 6) != 64) {
+    let _ = uart_puts("tlsd: bad client CertificateVerify\n");
+    return 0 - 7;
+  }
+  let _ = tlsd_copy(tlsd_s(TS_SIG), 0, hs, vb + 8, 64);
+  let cvl3: i64 = tlsd_cv_content(0, ref h_ccert, cvc);
+  if ed25519_verify_heap(tlsd_s(TS_PEER_PUB), cvc, cvl3, tlsd_s(TS_SIG)) != 1 {
+    let _ = uart_puts("tlsd: client CertificateVerify signature INVALID\n");
+    return 0 - 7;
+  }
+  th = sha256_update_heap_off(th, hs, vb, cvl2);
+  let _ = tlsd_hs_consume(cvl2);
+
+  // ---- client Finished
+  let h_ccv: [u8; 32] = tlsd_hash_snapshot(th);
+  let c_fin_exp: [u8; 32] = tlsd_finished(ref c_hs, ref h_ccv);
+  let fl: i64 = tlsd_hs_next(my_mac, tmo);
+  if fl < 0 { return 0 - 8; }
+  let fb: i64 = tlsd_st_get(TST_HS_START);
+  if (buf_read_byte(hs, fb as u32) != (20 as u32)) || (fl != 36) { return 0 - 8; }
+  let _ = tlsd_from32(tlsd_s(TS_TMP), 16, ref c_fin_exp, 32);
+  if sha256_bytes_equal_off(hs, fb + 4, tlsd_s(TS_TMP), 16, 32) == 0 {
+    let _ = uart_puts("tlsd: client Finished verify_data mismatch\n");
+    return 0 - 8;
+  }
+  let _ = tlsd_hs_consume(fl);
+
+  // ---- switch to application keys
+  let _ = tlsd_traffic_keys(ref c_ap, TS_C_AP_KEY, TS_C_AP_IV);
+  let _ = tlsd_traffic_keys(ref s_ap, TS_S_AP_KEY, TS_S_AP_IV);
+  let _ = tlsd_st_set(TST_IN_KEY, 2);
+  let _ = tlsd_st_set(TST_OUT_KEY, 2);
+  let _ = tlsd_st_set(TST_SEQ_IN, 0);
+  let _ = tlsd_st_set(TST_SEQ_OUT, 0);
+  return 0;
+}
+
+// constant-time-ish compare of a[ao..ao+n) vs b[bo..bo+n): 1 equal.
+fn sha256_bytes_equal_off(a: mut ref i64, ao: i64, b: mut ref i64, bo: i64, n: i64) -> i64 {
+  let d: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < n {
+    d = d | (buf_read_byte(a, (ao + i) as u32) ^ buf_read_byte(b, (bo + i) as u32));
+    i = i + 1;
+  }
+  return if d == (0 as u32) { 1 } else { 0 };
+}
+
+fn sha256_update_heap_off(ctx: Sha256Ctx, buf: mut ref i64, off: i64, n: i64) -> Sha256Ctx {
+  let c: Sha256Ctx = ctx;
+  let p: i64 = 0;
+  while p < n {
+    let k: i64 = if (n - p) < 256 { n - p } else { 256 };
+    let chunk: [u8; 256] = zero256_bytes();
+    let i: i64 = 0;
+    while i < k { chunk[i] = buf_read_byte(buf, (off + p + i) as u32) as u8; i = i + 1; }
+    c = sha256_update(ref c, mut ref chunk, k);
+    p = p + k;
+  }
+  return c;
+}
+
+// Accept one TCP connection on `port` and complete the TLS handshake.
+// 0 = ready for application data.
+fn tlsd_accept(my_mac: mut ref i64, port: u32, accept_timeout_us: u32) -> i64 {
+  let _ = tlsd_st_set(TST_RX_START, 0);
+  let _ = tlsd_st_set(TST_RX_END, 0);
+  let _ = tlsd_st_set(TST_CLOSED, 0);
+  let _ = tlsd_st_set(TST_PORT, port as i64);
+  let _ = tcp_conn_passive_open(TLSD_CONN, dhcp_state_get_leased_ip(), port);
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  while tcp_conn_get_state(TLSD_CONN) != tcp_state_established() {
+    let _ = watchdog_kick();
+    let _ = tlsd_pump_once(my_mac);
+    if wrapping_sub(mmio_read_u32(TIMER_CLO), t0) > accept_timeout_us { return 0 - 1; }
+  }
+  let ht0: u32 = mmio_read_u32(TIMER_CLO);
+  let r: i64 = tlsd_handshake(my_mac);
+  if r == 0 {
+    let _ = uart_puts("tlsd: TLS 1.3 handshake complete (X25519MLKEM768, CHACHA20_POLY1305, mutual Ed25519) in ");
+    let _ = uart_put_i64(wrapping_sub(mmio_read_u32(TIMER_CLO), ht0) as i64);
+    let _ = uart_puts(" us\n");
+  } else {
+    let _ = uart_puts("tlsd: handshake failed, code=");
+    let _ = uart_put_i64(r);
+    let _ = uart_puts("\n");
+  }
+  return r;
+}
+
+// Application data: next record's plaintext into REC; returns length,
+// 0 on close_notify / TCP close, < 0 on error.
+fn tlsd_app_read(my_mac: mut ref i64, timeout_us: u32) -> i64 {
+  let keep: i64 = 1;
+  while keep == 1 {
+    let t: i64 = tlsd_read_record(my_mac, timeout_us);
+    if t < 0 { return if tlsd_st_get(TST_CLOSED) == 1 { 0 } else { t }; }
+    if t == 23 { return buf_read_u32_le(tlsd_s(TS_TMP), 0) as i64; }
+    if t == 21 { return 0; }       // alert (close_notify or error)
+    // t == 22: post-handshake message (NewSessionTicket is server->client
+    // only; KeyUpdate unsupported) -- ignore it.
+  }
+  return 0 - 1;
+}
+fn tlsd_app_write(my_mac: mut ref i64, data: mut ref i64, data_off: i64, n: i64) -> i64 {
+  let sent: i64 = 0;
+  while sent < n {
+    let k: i64 = if (n - sent) < 1024 { n - sent } else { 1024 };
+    if tlsd_send_record(my_mac, 23, data, data_off + sent, k) != 0 { return 0 - 1; }
+    sent = sent + k;
+  }
+  return 0;
+}
+fn tlsd_close(my_mac: mut ref i64) -> i64 {
+  let a: mut ref i64 = tlsd_s(TS_TMP);
+  let _ = buf_write_byte(a, 0 as u32, 1 as u32);   // warning
+  let _ = buf_write_byte(a, 1 as u32, 0 as u32);   // close_notify
+  let _ = tlsd_send_record(my_mac, 21, a, 0, 2);
+  let dmac: mut ref i64 = tlsd_s(TS_DSTMAC);
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+  let _ = tcp_conn_close(TLSD_CONN, my_mac, dmac);
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  while (tcp_conn_get_state(TLSD_CONN) != tcp_state_closed_final()) && (wrapping_sub(mmio_read_u32(TIMER_CLO), t0) < (2000000 as u32)) {
+    let _ = tlsd_pump_once(my_mac);
+  }
+  return 0;
+}
+
+// `tlsd serve [port]`: handshake, then echo every application record
+// back until the client closes. Interop test harness.
+fn tlsd_serve_cmd(port: u32) -> i64 {
+  let my_mac: mut ref i64 = shell_my_mac_scratch_get();
+  let _ = netif_get_mac(my_mac);
+  if tlsd_load_identity() != 0 { return 0 - 1; }
+  let _ = uart_puts("tlsd: listening on ");
+  let _ = uart_put_ip(dhcp_state_get_leased_ip());
+  let _ = uart_puts(":");
+  let _ = uart_put_i64(port as i64);
+  let _ = uart_puts("\n");
+  if tlsd_accept(my_mac, port, 120000000 as u32) != 0 { return 0 - 1; }
+  let total: i64 = 0;
+  let keep: i64 = 1;
+  while keep == 1 {
+    let n: i64 = tlsd_app_read(my_mac, 30000000 as u32);
+    if n <= 0 {
+      keep = 0;
+    } else {
+      total = total + n;
+      if tlsd_app_write(my_mac, tlsd_p(TLSD_REC_OFF), 0, n) != 0 { keep = 0; }
+    }
+  }
+  let _ = uart_puts("tlsd: echoed ");
+  let _ = uart_put_i64(total);
+  let _ = uart_puts(" bytes, closing\n");
+  let _ = tlsd_close(my_mac);
+  return 0;
+}
+
+fn tlsd_usage() -> i64 {
+  let _ = uart_puts("usage: tlsd status | keygen | pubkey | client <hex64> | certbegin | certchunk <hex<=96> | certend | serve [port]\n");
+  return 0;
+}
+
+fn shell_dispatch_tlsd(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64 {
+  if cmd_end >= line_len { return tlsd_usage(); }
+  let ss: i64 = cmd_end + 1;
+  let se: i64 = shell_find_space(line_buf, ss, line_len);
+  if shell_word_matches(line_buf, ss, se, "status") == 1 {
+    let has_id: i64 = if critical_config_read("tlsd_id", tlsd_s(TS_ID_SEED)) == 32 { 1 } else { 0 };
+    let has_cl: i64 = if critical_config_read("tlsd_client", tlsd_s(TS_CLIENT_AUTH)) == 32 { 1 } else { 0 };
+    let crt: i64 = dharafs_read("/config/tlsd.crt", tlsd_p(TLSD_CERT_OFF));
+    let _ = uart_puts("tlsd: identity key ");
+    let _ = uart_puts(if has_id == 1 { "present" } else { "MISSING" });
+    let _ = uart_puts(", certificate ");
+    if crt > 0 { let _ = uart_put_i64(crt); let _ = uart_puts(" bytes"); } else { let _ = uart_puts("MISSING"); }
+    let _ = uart_puts(", authorized client ");
+    let _ = uart_puts(if has_cl == 1 { "set" } else { "MISSING" });
+    let _ = uart_puts("\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, ss, se, "serve") == 1 {
+    let tp: i64 = if se >= line_len { 4433 } else { shell_parse_decimal(line_buf, se + 1, shell_find_space(line_buf, se + 1, line_len)) };
+    if (tp <= 0) || (tp > 65535) { return tlsd_usage(); }
+    return tlsd_serve_cmd(tp as u32);
+  }
+  if shell_word_matches(line_buf, ss, se, "pubkey") == 1 {
+    if critical_config_read("tlsd_id", tlsd_s(TS_ID_SEED)) != 32 {
+      let _ = uart_puts("tlsd: no identity key (run 'tlsd keygen')\n");
+      return 0;
+    }
+    let _ = ed25519_secret_to_public_heap(tlsd_s(TS_ID_SEED), tlsd_s(TS_ID_PUB));
+    let _ = uart_puts("tlsd pubkey ");
+    let i: i64 = 0;
+    while i < 32 { let _ = uart_put_hex_byte(buf_read_byte(tlsd_s(TS_ID_PUB), i as u32)); i = i + 1; }
+    let _ = uart_puts("\n");
+    return 0;
+  }
+  // everything below changes trust state: root only
+  if dharafs_user_get_uid() != (0 as u32) {
+    let _ = uart_puts("tlsd: permission denied (root only)\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, ss, se, "keygen") == 1 {
+    let _ = tlsd_random(tlsd_s(TS_ID_SEED), 32);
+    if critical_config_write("tlsd_id", tlsd_s(TS_ID_SEED), 32, 1 as u32) < 0 {
+      let _ = uart_puts("tlsd: failed to store identity key\n");
+      return 0;
+    }
+    let _ = ed25519_secret_to_public_heap(tlsd_s(TS_ID_SEED), tlsd_s(TS_ID_PUB));
+    let _ = uart_puts("ok, new identity key generated (stored encrypted). tlsd pubkey ");
+    let i: i64 = 0;
+    while i < 32 { let _ = uart_put_hex_byte(buf_read_byte(tlsd_s(TS_ID_PUB), i as u32)); i = i + 1; }
+    let _ = uart_puts("\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, ss, se, "client") == 1 {
+    let ks: i64 = se + 1;
+    let ke: i64 = shell_find_space(line_buf, ks, line_len);
+    if (se >= line_len) || ((ke - ks) != 64) || (shell_parse_hex_bytes(line_buf, ks, ke, tlsd_s(TS_CLIENT_AUTH), 32) != 0) {
+      let _ = uart_puts("usage: tlsd client <64-hex-char ed25519 public key>\n");
+      return 0;
+    }
+    if critical_config_write("tlsd_client", tlsd_s(TS_CLIENT_AUTH), 32, 0 as u32) < 0 {
+      let _ = uart_puts("tlsd: failed to store client key\n");
+      return 0;
+    }
+    let _ = uart_puts("ok, authorized client key set\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, ss, se, "certbegin") == 1 {
+    let _ = tlsd_st_set(TST_CERT_CUR, 0);
+    let _ = uart_puts("ok, certbegin\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, ss, se, "certchunk") == 1 {
+    let hs2: i64 = se + 1;
+    let he2: i64 = shell_find_space(line_buf, hs2, line_len);
+    let hl: i64 = he2 - hs2;
+    let cur: i64 = tlsd_st_get(TST_CERT_CUR);
+    if (se >= line_len) || (hl <= 0) || (hl > 96) || ((hl % 2) != 0) || ((cur + hl / 2) > TLSD_CERT_CAP) {
+      let _ = uart_puts("tlsd: certchunk needs 2..96 hex chars and the cert must stay <= 1024 bytes\n");
+      return 0;
+    }
+    let tmpb: mut ref i64 = tlsd_p(TLSD_MSG_OFF);
+    if shell_parse_hex_bytes(line_buf, hs2, he2, tmpb, hl / 2) != 0 {
+      let _ = uart_puts("tlsd: invalid hex\n");
+      return 0;
+    }
+    let _ = tlsd_copy(tlsd_p(TLSD_CERT_OFF), cur, tmpb, 0, hl / 2);
+    let _ = tlsd_st_set(TST_CERT_CUR, cur + hl / 2);
+    let _ = uart_puts("ok, ");
+    let _ = uart_put_i64(cur + hl / 2);
+    let _ = uart_puts("\n");
+    return 0;
+  }
+  if shell_word_matches(line_buf, ss, se, "certend") == 1 {
+    let cur2: i64 = tlsd_st_get(TST_CERT_CUR);
+    if critical_config_read("tlsd_id", tlsd_s(TS_ID_SEED)) != 32 {
+      let _ = uart_puts("tlsd: run 'tlsd keygen' first\n");
+      return 0;
+    }
+    let _ = ed25519_secret_to_public_heap(tlsd_s(TS_ID_SEED), tlsd_s(TS_ID_PUB));
+    if (tlsd_cert_ed25519_key(tlsd_p(TLSD_CERT_OFF), 0, cur2, tlsd_s(TS_PEER_PUB)) != 1) || (sha256_bytes_equal(tlsd_s(TS_PEER_PUB), tlsd_s(TS_ID_PUB), 32) == 0) {
+      let _ = uart_puts("tlsd: certificate does not carry this board's identity key -- not saved\n");
+      return 0;
+    }
+    let pathb: mut ref i64 = tlsd_p(TLSD_MSG_OFF);
+    let pth: Str = "/config/tlsd.crt";
+    let pl: i64 = str_len_bytes(pth);
+    let pi: i64 = 0;
+    while pi < pl { let _ = buf_write_byte(pathb, pi as u32, str_byte_at(pth, pi) as u32); pi = pi + 1; }
+    if dharafs_append_raw(pathb, pl, tlsd_p(TLSD_CERT_OFF), cur2, 0 as u32, 0 as u32, 0x1a4 as u32) < 0 {
+      let _ = uart_puts("tlsd: failed to write /config/tlsd.crt\n");
+      return 0;
+    }
+    let _ = uart_puts("ok, certificate saved (");
+    let _ = uart_put_i64(cur2);
+    let _ = uart_puts(" bytes)\n");
+    return 0;
+  }
+  return tlsd_usage();
+}
+
 fn ssh_real_server_cmd() -> i64 {
   // 2026-10-23 (same fix as `ping`'s own entry-point comment, DWC2_
   // MUTEX_ID's own header): drop shell_dispatch's OUTER dhruva_prio_
@@ -63773,6 +64828,7 @@ fn kernel_main() -> i64 {
   let _ = kernelsig_pub_scratch_set(dhruva_alloc_bytes(64));
   let _ = kernelsig_msg_scratch_set(dhruva_alloc_bytes(64));
   let _ = tcp_isn_scratch_set(dhruva_alloc_bytes(8));
+  let _ = tlsd_mem_set(dhruva_alloc_bytes(TLSD_MEM_SIZE));
   let _ = tcpsink_frame_scratch_set(dhruva_alloc_bytes(1514));
   let _ = tcpsink_payload_scratch_set(dhruva_alloc_bytes(1514));
   let _ = wifi_join_bssid_scratch_set(dhruva_alloc_bytes(6));
