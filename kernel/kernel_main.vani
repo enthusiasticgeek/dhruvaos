@@ -380,6 +380,8 @@ extern "C" fn kernelsig_msg_scratch_get() -> mut ref i64;
 extern "C" fn tcp_isn_scratch_set(addr: mut ref i64) -> i64;
 // 2026-11-26: tlsd working memory (boot/scratch_state.S).
 extern "C" fn tlsd_mem_set(addr: mut ref i64) -> i64;
+extern "C" fn netif_fg_session_set(v: u32) -> i64;
+extern "C" fn netif_fg_session_get() -> u32;
 extern "C" fn tlsd_mem(off: u32) -> mut ref i64;
 extern "C" fn tcp_isn_scratch_get() -> mut ref i64;
 extern "C" fn tcpsink_frame_scratch_set(addr: mut ref i64) -> i64;
@@ -41363,10 +41365,19 @@ fn task_e() -> i64 {
     // poll so DHCP's chaddr/Ethernet source always match the interface
     // the frames actually leave on.
     let _ = netif_get_mac(dhcp_my_mac);
-    if wifi_link_is_up() == 1 {
-      let _ = dhcp_client_pump(dhcp_my_mac, 300000 as u32);
+    // 2026-11-26: while a foreground network session (tcpsink/tlsd/sshd)
+    // owns the RX stream, this background drain would consume -- and
+    // discard -- its frames (netif has a single consumer). Seen live as
+    // TCP stalls over WiFi. Lease timers keep running; renewal happens
+    // once the session ends.
+    if netif_fg_session_get() != (0 as u32) {
+      // skip
     } else {
-      let _ = dhcp_client_poll(dhcp_my_mac);
+      if wifi_link_is_up() == 1 {
+        let _ = dhcp_client_pump(dhcp_my_mac, 300000 as u32);
+      } else {
+        let _ = dhcp_client_poll(dhcp_my_mac);
+      }
     }
     // See dhcp_client_check_discover_retry's own header for the full
     // "why" -- this is the initial-acquisition retry half of DHCP's
@@ -41375,7 +41386,7 @@ fn task_e() -> i64 {
     // inside dhcp_client_poll itself (its own very first check) --
     // kept as two separate functions for two separate RFC 2131
     // concerns rather than one function doing both.
-    let dhcp_retried: i64 = dhcp_client_check_discover_retry(dhcp_my_mac);
+    let dhcp_retried: i64 = if netif_fg_session_get() != (0 as u32) { 0 } else { dhcp_client_check_discover_retry(dhcp_my_mac) };
     // WiFi: catch the reply to a just-(re)sent DISCOVER/REQUEST now,
     // while it's at the front of the RX FIFO (see dhcp_client_pump).
     if (dhcp_retried == 1) && (wifi_link_is_up() == 1) {
@@ -46730,6 +46741,13 @@ fn shell_dispatch() -> i64 {
       let _ = uart_put_i64(wifi_link_count_get(WIFI_LINK_CNT_REPLAY_OFF) as i64);
       let _ = uart_puts(" mic_fail=");
       let _ = uart_put_i64(wifi_link_count_get(WIFI_LINK_CNT_MIC_FAIL_OFF) as i64);
+      let dn: u32 = wifi_link_count_get(WIFI_LINK_CNT_DEC_N_OFF);
+      let _ = uart_puts(" decrypts=");
+      let _ = uart_put_i64(dn as i64);
+      if dn != (0 as u32) {
+        let _ = uart_puts(" avg_decrypt_us=");
+        let _ = uart_put_i64((wifi_link_count_get(WIFI_LINK_CNT_DEC_US_OFF) / dn) as i64);
+      }
       let _ = uart_puts(" ip=");
       let _ = uart_put_ip(dhcp_state_get_leased_ip());
       let _ = uart_puts("\n");
@@ -46746,6 +46764,8 @@ fn shell_dispatch() -> i64 {
       let _ = wpa_handshake_self_test();
       let _ = wpa2_join_orchestrator_self_test();
       let _ = wifi_ccmp_self_test();
+      let _ = aes128_self_test();
+      let _ = aes_ccmp_self_test();
       let _ = keccak_self_test();
       let _ = mlkem_self_test();
       let _ = mlkem768_self_test();
@@ -49565,7 +49585,13 @@ fn shell_dispatch() -> i64 {
 // per the task_stack_depth_check gate below) -- this annotation is a
 // static WCET input, not a reflection of actual overflow risk.
 #[no_mangle]
-#[bounded_stack(bytes=16384)]
+// 2026-11-26 (tlsd + WiFi CCMP): bumped 16384->20480. New measured
+// worst case 16951 bytes: tlsd serve -> handshake -> record read -> TCP
+// segment -> ACK send -> WiFi CCMP encrypt -> bitsliced AES SubBytes
+// (tlsd_handshake's key-schedule secrets dominate). Same reasoning as the
+// 2026-10-23 bump: a static analysis input, still ~12x below task_f's
+// real 262144-byte allocation (task_stack_depth_check gate).
+#[bounded_stack(bytes=20480)]
 fn task_f() -> i64 {
   // 2026-11-08: removed the 2026-11-06/2026-11-07 TEMP DIAG machinery
   // that used to live here (kup_last_ack_us/kup_iter_count/
@@ -51995,6 +52021,34 @@ use "../vendor/aes/src/core.vani";
 // verified) needed only a name change, not a signature change -- a
 // smaller, lower-risk diff than also restructuring every CCMP function
 // that threads those scratch pointers through.
+// 2026-11-26: AES-128 with a key schedule expanded once into heap `w`
+// (176 bytes) -- see aes128_encrypt_block_w. Used by CCMP, which used to
+// re-expand the key for every one of its ~2 blocks per 16 frame bytes.
+fn aes128_key_expand_heap(key: mut ref i64, w_out: mut ref i64) -> i64 {
+  let key_arr: [u8; 16] = zero16_bytes();
+  let i: i64 = 0;
+  while i < 16 { key_arr[i] = buf_read_byte(key, i as u32) as u8; i = i + 1; }
+  let w: [u8; 176] = zero176_bytes();
+  let _ = aes128_key_expansion(ref key_arr, mut ref w);
+  i = 0;
+  while i < 176 { let _ = buf_write_byte(w_out, i as u32, w[i] as u32); i = i + 1; }
+  return 0;
+}
+
+fn aes128_encrypt_block_heap_w(w_heap: mut ref i64, block: mut ref i64, out: mut ref i64) -> i64 {
+  let w: [u8; 176] = zero176_bytes();
+  let i: i64 = 0;
+  while i < 176 { w[i] = buf_read_byte(w_heap, i as u32) as u8; i = i + 1; }
+  let block_arr: [u8; 16] = zero16_bytes();
+  i = 0;
+  while i < 16 { block_arr[i] = buf_read_byte(block, i as u32) as u8; i = i + 1; }
+  let out_arr: [u8; 16] = zero16_bytes();
+  let _ = aes128_encrypt_block_w(ref w, ref block_arr, mut ref out_arr);
+  i = 0;
+  while i < 16 { let _ = buf_write_byte(out, i as u32, out_arr[i] as u32); i = i + 1; }
+  return 0;
+}
+
 fn aes128_encrypt_block_heap(key: mut ref i64, block: mut ref i64, out: mut ref i64,
                               _w_scratch: mut ref i64, _state_scratch: mut ref i64, _temp_scratch: mut ref i64) -> i64 {
   let key_arr: [u8; 16] = zero16_bytes();
@@ -52156,7 +52210,22 @@ fn aes128_self_test() -> i64 {
     ok = 0; // a single flipped key bit produced the SAME ciphertext -- broken
   }
 
-  let _ = uart_puts("CRYPTO: AES-128 (constant-time, table-free S-box) vs FIPS-197 Appendix B");
+  // 2026-11-26: the bitsliced SubBytes must match the per-byte
+  // reference S-box on all 256 inputs (16 lanes at a time).
+  let sbx: i64 = 0;
+  while sbx < 256 {
+    let lane: [u8; 16] = zero16_bytes();
+    let li: i64 = 0;
+    while li < 16 { lane[li] = (sbx + li) as u8; li = li + 1; }
+    let _ = aes_sub_bytes(mut ref lane);
+    li = 0;
+    while li < 16 {
+      if (lane[li] as u32) != aes_sbox((sbx + li) as u32) { ok = 0; }
+      li = li + 1;
+    }
+    sbx = sbx + 16;
+  }
+  let _ = uart_puts("CRYPTO: AES-128 (constant-time bitsliced S-box, exhaustive vs reference) vs FIPS-197 Appendix B");
   if ok == 1 {
     let _ = uart_puts(" (PASS)\n");
   } else {
@@ -52256,7 +52325,7 @@ fn aes_ccmp_compute_mac(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, 
                          w_scratch: mut ref i64, state_scratch: mut ref i64, temp_scratch: mut ref i64,
                          b_block: mut ref i64, x_block: mut ref i64) -> i64 {
   let _ = aes_ccmp_build_block(nonce, aad_len, data_len, 0, b_block);
-  let _ = aes128_encrypt_block_heap(key, b_block, x_block, w_scratch, state_scratch, temp_scratch);
+  let _ = aes128_encrypt_block_heap_w(w_scratch, b_block, x_block);
 
   if aad_len > 0 {
     let num_aad_bytes: i64 = 2 + aad_len;
@@ -52270,7 +52339,7 @@ fn aes_ccmp_compute_mac(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, 
         let _ = buf_write_byte(b_block, i as u32, vb ^ xb);
         i = i + 1;
       }
-      let _ = aes128_encrypt_block_heap(key, b_block, x_block, w_scratch, state_scratch, temp_scratch);
+      let _ = aes128_encrypt_block_heap_w(w_scratch, b_block, x_block);
       blk = blk + 1;
     }
   }
@@ -52285,7 +52354,7 @@ fn aes_ccmp_compute_mac(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, 
       let _ = buf_write_byte(b_block, i as u32, vb ^ xb);
       i = i + 1;
     }
-    let _ = aes128_encrypt_block_heap(key, b_block, x_block, w_scratch, state_scratch, temp_scratch);
+    let _ = aes128_encrypt_block_heap_w(w_scratch, b_block, x_block);
     dblk = dblk + 1;
   }
   return 0;
@@ -52303,7 +52372,7 @@ fn aes_ccmp_ctr_crypt(key: mut ref i64, nonce: mut ref i64, in_buf: mut ref i64,
   let out_pos: i64 = 0;
   while blk <= num_blocks {
     let _ = aes_ccmp_build_block(nonce, 0, blk, 1, a_block);
-    let _ = aes128_encrypt_block_heap(key, a_block, s_block, w_scratch, state_scratch, temp_scratch);
+    let _ = aes128_encrypt_block_heap_w(w_scratch, a_block, s_block);
     let remaining: i64 = data_len - out_pos;
     let this_n: i64 = if remaining < 16 { remaining } else { 16 };
     let i: i64 = 0;
@@ -52329,6 +52398,7 @@ fn aes_ccmp_encrypt(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, aad_
     return 0 - 1;
   }
   let w_scratch: mut ref i64 = aes_ccmp_w_ptr();
+  let _ = aes128_key_expand_heap(key, w_scratch);   // once per frame
   let state_scratch: mut ref i64 = aes_ccmp_state_ptr();
   let temp_scratch: mut ref i64 = aes_ccmp_temp_ptr();
   let b_block: mut ref i64 = aes_ccmp_b_block_ptr();
@@ -52340,7 +52410,7 @@ fn aes_ccmp_encrypt(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, aad_
                                 w_scratch, state_scratch, temp_scratch, b_block, x_block);
 
   let _ = aes_ccmp_build_block(nonce, 0, 0, 1, a_block);
-  let _ = aes128_encrypt_block_heap(key, a_block, s_block, w_scratch, state_scratch, temp_scratch);
+  let _ = aes128_encrypt_block_heap_w(w_scratch, a_block, s_block);
   let i: i64 = 0;
   while i < CCMP_M {
     let tb: u32 = buf_read_byte(x_block, i as u32);
@@ -52368,6 +52438,7 @@ fn aes_ccmp_decrypt(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, aad_
     return 0 - 1;
   }
   let w_scratch: mut ref i64 = aes_ccmp_w_ptr();
+  let _ = aes128_key_expand_heap(key, w_scratch);   // once per frame
   let state_scratch: mut ref i64 = aes_ccmp_state_ptr();
   let temp_scratch: mut ref i64 = aes_ccmp_temp_ptr();
   let b_block: mut ref i64 = aes_ccmp_b_block_ptr();
@@ -52381,7 +52452,7 @@ fn aes_ccmp_decrypt(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, aad_
   let _ = aes_ccmp_compute_mac(key, nonce, aad, aad_len, plaintext_out, ciphertext_len,
                                 w_scratch, state_scratch, temp_scratch, b_block, x_block);
   let _ = aes_ccmp_build_block(nonce, 0, 0, 1, a_block);
-  let _ = aes128_encrypt_block_heap(key, a_block, s_block, w_scratch, state_scratch, temp_scratch);
+  let _ = aes128_encrypt_block_heap_w(w_scratch, a_block, s_block);
 
   let computed_tag: mut ref i64 = aes_ccmp_computed_tag_ptr();
   let i: i64 = 0;
@@ -55361,6 +55432,8 @@ const WIFI_LINK_CNT_TX_OFF: i64 = 96;
 const WIFI_LINK_CNT_RX_OK_OFF: i64 = 100;
 const WIFI_LINK_CNT_REPLAY_OFF: i64 = 104;
 const WIFI_LINK_CNT_MIC_FAIL_OFF: i64 = 108;
+const WIFI_LINK_CNT_DEC_US_OFF: i64 = 112;   // total us spent in CCMP decrypt
+const WIFI_LINK_CNT_DEC_N_OFF: i64 = 116;    // decrypt attempts
 
 fn wifi_link_count_inc(link: mut ref i64, off: i64) -> i64 {
   let _ = buf_write_u32_le(link, off, buf_read_u32_le(link, off) + (1 as u32));
@@ -55680,7 +55753,11 @@ fn wifi_link_parse_mpdu(link: mut ref i64, frame: mut ref i64, frame_len: i64, e
   let key: mut ref i64 = wifi_link_load_key(link, key_off);
   // In place: CTR reads byte i before writing it, then the CBC-MAC runs
   // over the recovered plaintext.
-  if aes_ccmp_decrypt(key, nonce, aad, aad_len, body, body_len, tag, body) != 0 {
+  let dec_t0: u32 = mmio_read_u32(TIMER_CLO);
+  let dec_st: i64 = aes_ccmp_decrypt(key, nonce, aad, aad_len, body, body_len, tag, body);
+  let _ = buf_write_u32_le(link, WIFI_LINK_CNT_DEC_US_OFF, wrapping_add(buf_read_u32_le(link, WIFI_LINK_CNT_DEC_US_OFF), wrapping_sub(mmio_read_u32(TIMER_CLO), dec_t0)));
+  let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_DEC_N_OFF);
+  if dec_st != 0 {
     let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_MIC_FAIL_OFF);
     return 0 - 1;
   }
@@ -61770,6 +61847,7 @@ fn tcpsink_cmd(port: u32) -> i64 {
   let frame: mut ref i64 = tcpsink_frame_scratch_get();
   let payload: mut ref i64 = tcpsink_payload_scratch_get();
   let _ = tcp_conn_passive_open(conn_id, dhcp_state_get_leased_ip(), port);
+  let _ = netif_fg_session_set(1 as u32);
   let _ = uart_puts("tcpsink: listening on ");
   let _ = uart_put_ip(dhcp_state_get_leased_ip());
   let _ = uart_puts(":");
@@ -61799,6 +61877,7 @@ fn tcpsink_cmd(port: u32) -> i64 {
       let _ = uart_puts(" syn=");
       let _ = uart_put_i64(n_syn);
       let _ = uart_puts(")\n");
+      let _ = netif_fg_session_set(0 as u32);
       return 0 - 1;
     }
     if (st != tcp_state_closed()) && (wrapping_sub(now, t_last) > (30000000 as u32)) {
@@ -61831,6 +61910,7 @@ fn tcpsink_cmd(port: u32) -> i64 {
     }
     let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
   }
+  let _ = netif_fg_session_set(0 as u32);
   let digest: [u8; 32] = sha256_finalize(ref ctx);
   let el: u32 = wrapping_sub(t_last, t_first);
   let _ = uart_puts("tcpsink: received ");
@@ -62747,6 +62827,13 @@ fn tlsd_close(my_mac: mut ref i64) -> i64 {
 // `tlsd serve [port]`: handshake, then echo every application record
 // back until the client closes. Interop test harness.
 fn tlsd_serve_cmd(port: u32) -> i64 {
+  let _ = netif_fg_session_set(1 as u32);
+  let r: i64 = tlsd_serve_inner(port);
+  let _ = netif_fg_session_set(0 as u32);
+  return r;
+}
+
+fn tlsd_serve_inner(port: u32) -> i64 {
   let my_mac: mut ref i64 = shell_my_mac_scratch_get();
   let _ = netif_get_mac(my_mac);
   if tlsd_load_identity() != 0 { return 0 - 1; }
@@ -62900,6 +62987,13 @@ fn shell_dispatch_tlsd(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
 }
 
 fn ssh_real_server_cmd() -> i64 {
+  let _ = netif_fg_session_set(1 as u32);
+  let r: i64 = ssh_real_server_cmd_inner();
+  let _ = netif_fg_session_set(0 as u32);
+  return r;
+}
+
+fn ssh_real_server_cmd_inner() -> i64 {
   // 2026-10-23 (same fix as `ping`'s own entry-point comment, DWC2_
   // MUTEX_ID's own header): drop shell_dispatch's OUTER dhruva_prio_
   // lock(2) wrap immediately on entry -- sshd's own netif_recv_frame

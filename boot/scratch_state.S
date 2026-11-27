@@ -3054,3 +3054,23 @@ tlsd_mem:
     ldr r1, [r1]
     add r0, r1, r0
     bx lr
+
+/* 2026-11-26: nonzero while a foreground network session (tcpsink, tlsd,
+ * sshd) owns the netif RX stream -- task_e's background DHCP drain must
+ * not consume its frames meanwhile. */
+.section ".bss"
+.align 4
+netif_fg_session_word:
+    .word 0
+.section ".text"
+.global netif_fg_session_set
+netif_fg_session_set:
+    ldr r1, =netif_fg_session_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global netif_fg_session_get
+netif_fg_session_get:
+    ldr r0, =netif_fg_session_word
+    ldr r0, [r0]
+    bx lr
