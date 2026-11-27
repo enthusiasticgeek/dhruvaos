@@ -4266,10 +4266,25 @@ extern "C" fn shell_get_echo_state() -> u32;
 #[stack_cost(bytes=1)]
 extern "C" fn shell_set_echo_state(value: u32) -> u32;
 
+// 2026-11-27: delay(count) is now WALL-CLOCK. It used to be a raw spin
+// count whose real duration depended on how fast the core happened to
+// run: every call site's magic number was tuned on the real Pi 1B with
+// caches OFF at 700 MHz, where one iteration measured 0.310044 us
+// (delay(3000000) = 930133 us, see the calibration history below). With
+// the instruction cache enabled (mmu_init, 2026-11-27) the same loop ran
+// many times faster, silently shrinking every hardware settle delay
+// (USB reset timing, RTL8188CU power-on, ...); DVFS throttling already
+// stretched them the other way. Busy-waiting on TIMER_CLO (free-running
+// 1 MHz, independent of core clock and caches) for count * 0.310044 us
+// reproduces exactly the durations those call sites were tuned to.
 fn delay(count: i64) -> i64 {
-  let i: i64 = 0;
-  while i < count {
-    i = i + 1;
+  if count <= 0 {
+    return 0;
+  }
+  let target_us: i64 = (count * 310044) / 1000000;
+  let t: u32 = if target_us < 1 { 1 as u32 } else { target_us as u32 };
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  while wrapping_sub(mmio_read_u32(TIMER_CLO), t0) < t {
   }
   return 0;
 }
