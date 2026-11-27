@@ -62693,7 +62693,12 @@ fn tlsd_handshake(my_mac: mut ref i64) -> i64 {
   let cb: i64 = tlsd_st_get(TST_HS_START);
   if buf_read_byte(hs, cb as u32) != (11 as u32) { let _ = uart_puts("tlsd: expected client Certificate\n"); return 0 - 5; }
   // context(1)=0, list len(3), first cert len(3)
-  if (ccl < 11) || (buf_read_byte(hs, (cb + 4) as u32) != (0 as u32)) { return 0 - 5; }
+  if (ccl < 11) || (buf_read_byte(hs, (cb + 4) as u32) != (0 as u32)) {
+    // An empty certificate_list (8-byte message) is how TLS 1.3 says
+    // "no client certificate"; client authentication is mandatory here.
+    let _ = uart_puts("tlsd: client sent no certificate -- refused\n");
+    return 0 - 5;
+  }
   let first_len: i64 = tlsd_rd24(hs, cb + 8);
   if (first_len <= 0) || ((11 + first_len) > ccl) { let _ = uart_puts("tlsd: client sent no certificate\n"); return 0 - 5; }
   if tlsd_cert_ed25519_key(hs, cb + 11, first_len, tlsd_s(TS_PEER_PUB)) != 1 {
@@ -62798,8 +62803,34 @@ fn tlsd_accept(my_mac: mut ref i64, port: u32, accept_timeout_us: u32) -> i64 {
     let _ = uart_puts("tlsd: handshake failed, code=");
     let _ = uart_put_i64(r);
     let _ = uart_puts("\n");
+    // 2026-11-26: tell the peer and close -- previously the board just
+    // abandoned the connection, leaving the client waiting forever (seen
+    // with openssl s_client) and the TCP slot ESTABLISHED. Fatal alert
+    // under whatever outbound key state the handshake reached:
+    // handshake_failure (40), or certificate_unknown (46) / decrypt_error
+    // (51) for the client-authentication failures.
+    let desc: i64 = if (r == (0 - 6)) || (r == (0 - 5)) { 46 } else { if (r == (0 - 7)) || (r == (0 - 8)) { 51 } else { 40 } };
+    let _ = tlsd_abort(my_mac, desc);
   }
   return r;
+}
+
+fn tlsd_abort(my_mac: mut ref i64, desc: i64) -> i64 {
+  let a: mut ref i64 = tlsd_s(TS_TMP);
+  let _ = buf_write_byte(a, 0 as u32, 2 as u32);   // fatal
+  let _ = buf_write_byte(a, 1 as u32, desc as u32);
+  if tcp_conn_get_state(TLSD_CONN) == tcp_state_established() {
+    let _ = tlsd_send_record(my_mac, 21, a, 0, 2);
+  }
+  let dmac: mut ref i64 = tlsd_s(TS_DSTMAC);
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+  let _ = tcp_conn_close(TLSD_CONN, my_mac, dmac);
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+  let t0: u32 = mmio_read_u32(TIMER_CLO);
+  while (tcp_conn_get_state(TLSD_CONN) != tcp_state_closed_final()) && (wrapping_sub(mmio_read_u32(TIMER_CLO), t0) < (2000000 as u32)) {
+    let _ = tlsd_pump_once(my_mac);
+  }
+  return 0;
 }
 
 // Application data: next record's plaintext into REC; returns length,
