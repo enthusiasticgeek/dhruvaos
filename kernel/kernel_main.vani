@@ -386,6 +386,12 @@ extern "C" fn dwc2_hcint_seen_set(v: u32) -> i64;
 extern "C" fn dwc2_hcint_seen_get() -> u32;
 extern "C" fn dwc2_revert_count_set(v: u32) -> i64;
 extern "C" fn dwc2_revert_count_get() -> u32;
+extern "C" fn wifi_gtk_keyid_set(v: u32) -> i64;
+extern "C" fn wifi_gtk_keyid_get() -> u32;
+extern "C" fn wifi_rx_hwdec_set(v: u32) -> i64;
+extern "C" fn wifi_rx_hwdec_get() -> u32;
+extern "C" fn wifi_hwcrypt_on_set(v: u32) -> i64;
+extern "C" fn wifi_hwcrypt_on_get() -> u32;
 // 2026-11-27: option B -- data cache for task-stack pages (boot/rpi1/runtime_stubs.c).
 extern "C" fn dhruva_stack_cache_set(on: u32) -> u32;   // C long = 32-bit
 extern "C" fn dhruva_stack_cache_get() -> u32;
@@ -28260,7 +28266,10 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   // keeps retrying such a control transfer -- dwc2 resets the 3-strikes
   // count on every NAK -- until the URB's own timeout (rtl8xxxu: 500 ms,
   // RTW_USB_CONTROL_MSG_TIMEOUT). Same here: re-issue the STATUS IN,
-  // freshly programmed, every ~1 ms for up to 500 ms; stop only on STALL.
+  // freshly programmed, every ~1 ms; stop only on STALL. Window 50 ms
+  // (was 500 ms, Linux's URB timeout): in 8/8 real-HW episodes the device
+  // never answered at all once the handshake was lost, so 500 ms bought
+  // nothing but half a second of boot time per episode.
   let status_try: i64 = 0;
   let status_ok: i64 = 0;
   let status_stall: i64 = 0;
@@ -28268,7 +28277,7 @@ fn dwc2_control_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: u32) -> i
   let first_seen: u32 = 0 as u32;
   let first_us: u32 = 0 as u32;
   let sw_t0: u32 = mmio_read_u32(TIMER_CLO);
-  while (status_ok == 0) && (status_stall == 0) && ((status_try == 0) || (wrapping_sub(mmio_read_u32(TIMER_CLO), sw_t0) < (500000 as u32))) {
+  while (status_ok == 0) && (status_stall == 0) && ((status_try == 0) || (wrapping_sub(mmio_read_u32(TIMER_CLO), sw_t0) < (50000 as u32))) {
     if status_try > 0 {
       let _ = delay_us_wallclock(1000 as u32);
     }
@@ -30545,6 +30554,20 @@ fn rtl8188cu_write_firmware_page(devaddr: u32, mps: u32, reg_addr: u32, fw_buf: 
         attempt = usb_first_contact_retry_count();
       }
     }
+    // 2026-11-27 (real HW): 0 - 2 means the DATA stage was ACKed and only
+    // the status handshake was lost (XACTERR, then the device never
+    // answers the status IN again -- it already considers the transfer
+    // done). The chunk DID land: in the full log history, resending it
+    // failed the checksum 167/167 times, which is only possible if the
+    // first copy had been committed. So carry on with the next chunk; the
+    // download engine's own checksum at the end is the arbiter, and a
+    // mismatch restarts the whole download cleanly as before.
+    if status == (0 - 2) {
+      let _ = uart_puts("USB: RTL8188CU firmware chunk at fw offset ");
+      let _ = uart_put_i64(base_off + done);
+      let _ = uart_puts(" lost only its status handshake -- continuing (checksum will verify)\n");
+      status = 0;
+    }
     if status != 0 {
       // TASK #164 FOLLOW-UP (2026-10-12): this chunk-write failure was
       // completely silent before -- "firmware download FAILED" from
@@ -31021,7 +31044,7 @@ const RTL_RXDESC_LEN: i64 = 24;
 // explicitly rather than assumed away, since treating a C2H event as
 // frame data would misparse garbage as if it were a real received
 // packet.
-struct RtlRxDescInfo { fcs_ok: i64, pkt_len: i64, frame_start_off: i64, is_report: i64, rssi_dbm: i64, has_phystats: i64, pkt_cnt: i64, pkt_offset: i64 }
+struct RtlRxDescInfo { fcs_ok: i64, pkt_len: i64, frame_start_off: i64, is_report: i64, rssi_dbm: i64, has_phystats: i64, pkt_cnt: i64, pkt_offset: i64, hw_dec: i64 }
 
 // DIAGNOSTIC (2026-11-16, "use something non-disruptive" -- after the
 // monitor-mode over-the-air capture plan turned out to risk cutting off
@@ -31063,6 +31086,12 @@ fn rtl_rx_desc_parse(buf: mut ref i64, off: i64) -> RtlRxDescInfo {
   let dword0: i64 = buf_read_u32_le(buf, off as u32) as i64;
   let pkt_len: i64 = dword0 & 0x3fff;
   let crc32_bad: i64 = (dword0 >> 14) & 1;
+  // 2026-11-27: Linux rtl8xxxu: decrypted by the chip iff security (bits
+  // 20-22) != NONE and swdec (bit 27) clear; icverr (bit 15) = MIC/ICV bad.
+  let sec_type: i64 = (dword0 >> 20) & 0x7;
+  let swdec: i64 = (dword0 >> 27) & 1;
+  let icverr: i64 = (dword0 >> 15) & 1;
+  let hw_dec: i64 = if (sec_type != 0) && (swdec == 0) && (icverr == 0) { 1 } else { 0 };
   let drvinfo_sz_units: i64 = (dword0 >> 16) & 0xf;
   let shift: i64 = (dword0 >> 24) & 0x3;
 
@@ -31128,7 +31157,7 @@ fn rtl_rx_desc_parse(buf: mut ref i64, off: i64) -> RtlRxDescInfo {
     }
   }
 
-  return RtlRxDescInfo { fcs_ok: fcs_ok, pkt_len: pkt_len, frame_start_off: frame_start_off, is_report: is_report, rssi_dbm: rssi_dbm, has_phystats: has_phystats, pkt_cnt: pkt_cnt, pkt_offset: pkt_offset };
+  return RtlRxDescInfo { fcs_ok: fcs_ok, pkt_len: pkt_len, frame_start_off: frame_start_off, is_report: is_report, rssi_dbm: rssi_dbm, has_phystats: has_phystats, pkt_cnt: pkt_cnt, pkt_offset: pkt_offset, hw_dec: hw_dec };
 }
 
 fn rtl_rx_desc_self_test() -> i64 {
@@ -32386,34 +32415,45 @@ fn dwc2_net_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64)
   // can safely use a far shorter cap without affecting any other USB
   // transfer class.
   let result: u32 = dwc2_wait_chan0_done_bounded(NET_BULK_IN_POLL_CAP);
+  // 2026-11-27: same cancel-in-place + hardware toggle as dwc2_wifi_bulk_in
+  // (see its comment): a frame landing between the poll timeout and a
+  // later blind cancel was ACKed+DMA'd then discarded, and the software
+  // toggle went stale so the next frame was dropped too.
+  let got: u32 = result;
   if (result & (1 as u32)) == (0 as u32) {
-    return 0 - 1;
+    let cur: u32 = mmio_read_u32(hcchar0);
+    if (cur & ((1 as u32) << (31 as u32))) != (0 as u32) {
+      let _ = mmio_write_u32(hcchar0, cur | ((1 as u32) << (30 as u32)));
+      let c_t0: u32 = mmio_read_u32(TIMER_CLO);
+      let c_seen: u32 = 0 as u32;
+      while ((c_seen & (0x2 as u32)) == (0 as u32)) && (wrapping_sub(mmio_read_u32(TIMER_CLO), c_t0) < (250000 as u32)) {
+        c_seen = c_seen | mmio_read_u32(dwc2_hcint0_addr());
+      }
+      let _ = mmio_write_u32(dwc2_hcint0_addr(), c_seen);
+      got = c_seen;
+    }
   }
-  // BUG FIX (2026-11-01): sibling of dwc2_control_in's own matching
-  // fix -- see that function's own comment for the full "why".
   let _ = mem_barrier();
-  // dwc2_control_in never needed this (every control transfer it
-  // issues asks for an exact, already-known length and trusts
-  // XFERCOMPL alone) -- this is this driver's first genuine short-read
-  // case, confirmed against the real Linux dwc2 driver
-  // (drivers/usb/dwc2/hcd_intr.c, dwc2_hc_get_actual_xfer_length-style
-  // logic): on a clean XFERCOMPL (not a halted/errored transfer, which
-  // is a different, pktcnt-based calculation this driver doesn't need
-  // since it already returns -1 for that case above), HCTSIZ's
-  // xfersize field holds the REMAINING (not transferred) byte count,
-  // counting down from want_len as bytes actually moved over USB --
-  // read it back and subtract to recover the real short-packet length.
   let hctsiz_after: u32 = mmio_read_u32(hctsiz0);
+  let hw_pid: u32 = (hctsiz_after >> (29 as u32)) & (3 as u32);
+  if (hw_pid == (0 as u32)) || (hw_pid == (2 as u32)) {
+    let _ = usb_net_set_in_toggle(if hw_pid == (2 as u32) { 1 as u32 } else { 0 as u32 });
+  }
   let bytes_left: u32 = hctsiz_after & (0x7FFFF as u32);
   let actual_len: i64 = want_len - (bytes_left as i64);
+  if ((got & (1 as u32)) == (0 as u32)) && (actual_len <= 0) {
+    return 0 - 1;   // nothing arrived
+  }
   let i: i64 = 0;
   while i < actual_len {
     let b: u32 = buf_read_byte(dma, i as u32);
     let _ = buf_write_byte(out_buf, i as u32, b);
     i = i + 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
-  let _ = usb_net_set_in_toggle(next_toggle);
+  if (hw_pid != (0 as u32)) && (hw_pid != (2 as u32)) {
+    let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+    let _ = usb_net_set_in_toggle(next_toggle);
+  }
   return actual_len;
 }
 
@@ -32649,7 +32689,7 @@ fn dwc2_wifi_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64
   if mps == (0 as u32) {
     return 0 - 1;
   }
-  if (want_len < 0) || (want_len > (512 as i64)) {
+  if (want_len < 0) || (want_len > (2048 as i64)) {   // 2026-11-27: multi-packet (was 512)
     return 0 - 1;
   }
   let epaddr: u32 = usb_wifi_get_bulk_in_epaddr();
@@ -32965,6 +33005,7 @@ fn rtl8188cu_rx_frame_from_desc(raw: mut ref i64, got: i64, info: RtlRxDescInfo,
   // caller's own BSSID/subtype filtering -- see wifi_mgmtlog_record's
   // own header comment.
   let _ = wifi_mgmtlog_record(frame_out, info.pkt_len, if info.has_phystats == 1 { info.rssi_dbm } else { 0 - 1000 });
+  let _ = wifi_rx_hwdec_set(info.hw_dec as u32);
   return RtlRxFrameResult { ok: 1, frame_len: info.pkt_len };
 }
 
@@ -33003,7 +33044,15 @@ fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFr
   let total: i64 = 0;
   let done: i64 = 0;
   while done == 0 {
-    let got_chunk: i64 = dwc2_wifi_bulk_in(devaddr, mps, chunk_buf, if mps == (0 as u32) { 0 } else { mps as i64 });
+    // 2026-11-27: one multi-packet bulk-IN for the whole frame (ends at the
+    // device's short packet), as Linux's RX URBs do -- was one transfer per
+    // 512-byte packet, i.e. 4 channel setups + waits per 1500-byte frame.
+    let room: i64 = RTL_RX_RAW_MAX - total;
+    let want: i64 = if mps == (0 as u32) { 0 } else { (room / (mps as i64)) * (mps as i64) };
+    if want <= 0 {
+      return RtlRxFrameResult { ok: 0, frame_len: 0 };
+    }
+    let got_chunk: i64 = dwc2_wifi_bulk_in(devaddr, mps, chunk_buf, want);
     if got_chunk < 0 {
       if total == 0 {
         return RtlRxFrameResult { ok: 0, frame_len: 0 };
@@ -33020,8 +33069,8 @@ fn rtl8188cu_rx_frame(devaddr: u32, mps: u32, frame_out: mut ref i64) -> RtlRxFr
         ci = ci + 1;
       }
       total = total + got_chunk;
-      if (got_chunk as u32) < mps {
-        done = 1;
+      if got_chunk < want {
+        done = 1;   // short packet: end of this USB transfer
       }
     }
   }
@@ -44427,6 +44476,268 @@ fn shell_dispatch_kernelsig(line_buf: mut ref i64, cmd_end: i64, line_len: i64) 
 // path's worst-case stack (now including Ed25519 verification via
 // kernelsig_check_commit) doesn't also carry every other subcommand's
 // locals -- task_f's #[bounded_stack] gate (16747 > 16384) caught it.
+// 2026-11-27: `kernelupload net [port]` -- receive a new kernel into the
+// INACTIVE A/B slot over the network, inside the board's TLS 1.3 server
+// (tlsd: X25519MLKEM768 + CHACHA20_POLY1305, mutual Ed25519 -- only the
+// pinned uploader key gets in). Nothing new is trusted on the board side:
+// the bytes go through the exact UART-stream path (kernelupload_
+// accumulate_bytes: SD writes + running SHA-256), the image must carry a
+// valid Ed25519 signature from the provisioned kernelsig key (mandatory
+// here -- unsigned network uploads are refused), and the unchanged
+// `kernelupload commit` handler then re-reads the whole slot from SD and
+// re-hashes it before marking it ready. Host side: test/kernel_upload_net.py.
+//
+// Wire format, first 108 bytes of the TLS application stream:
+//   "DKU1" | len u32 LE | flags u32 LE (bit0: activate slot after commit)
+//   | sha256[32] | ed25519 sig[64]  -- then exactly `len` image bytes.
+// Reply: one line, "OK <len> slot=<a|b>[ activated]\n" or "FAIL <why>\n".
+fn kunet_put_str(buf: mut ref i64, off: i64, txt: Str) -> i64 {
+  let i: i64 = 0;
+  while i < str_len_bytes(txt) { let _ = buf_write_byte(buf, (off + i) as u32, str_byte_at(txt, i) as u32); i = i + 1; }
+  return off + i;
+}
+fn kunet_put_dec(buf: mut ref i64, off: i64, v: i64) -> i64 {
+  let digits: [u8; 32] = zero32_bytes_heap();
+  let n: i64 = 0;
+  let x: i64 = v;
+  if x == 0 { digits[0] = 48 as u8; n = 1; }
+  while x > 0 { digits[n] = (48 + (x % 10)) as u8; x = x / 10; n = n + 1; }
+  let i: i64 = 0;
+  while i < n { let _ = buf_write_byte(buf, (off + i) as u32, digits[n - 1 - i] as u32); i = i + 1; }
+  return off + n;
+}
+fn kunet_put_hex(buf: mut ref i64, off: i64, src: mut ref i64, src_off: i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    let b: u32 = buf_read_byte(src, (src_off + i) as u32);
+    let hi: u32 = (b >> (4 as u32)) & (0xf as u32);
+    let lo: u32 = b & (0xf as u32);
+    let _ = buf_write_byte(buf, (off + 2 * i) as u32, if hi < (10 as u32) { hi + (48 as u32) } else { hi + (87 as u32) });
+    let _ = buf_write_byte(buf, (off + 2 * i + 1) as u32, if lo < (10 as u32) { lo + (48 as u32) } else { lo + (87 as u32) });
+    i = i + 1;
+  }
+  return off + 2 * n;
+}
+fn kunet_reply(my_mac: mut ref i64, txt: Str) -> i64 {
+  let rb: mut ref i64 = tlsd_s(TS_TMP);
+  let e: i64 = kunet_put_str(rb, 0, txt);
+  let _ = tlsd_app_write(my_mac, rb, 0, e);
+  let _ = uart_puts("kernelupload net: ");
+  let _ = uart_puts(txt);
+  return 0;
+}
+
+fn kernelupload_net_cmd(line_buf: mut ref i64, port: u32) -> i64 {
+  let _ = netif_fg_session_set(1 as u32);
+  let r: i64 = kernelupload_net_inner(line_buf, port);
+  let _ = netif_fg_session_set(0 as u32);
+  return r;
+}
+
+fn kernelupload_net_inner(line_buf: mut ref i64, port: u32) -> i64 {
+  let my_mac: mut ref i64 = shell_my_mac_scratch_get();
+  let _ = netif_get_mac(my_mac);
+  if tlsd_load_identity() != 0 { return 0 - 1; }
+  if kernelsig_load_pub() != 32 {
+    let _ = uart_puts("kernelupload net: no trusted kernelsig key provisioned -- refusing (network uploads must be signed)\n");
+    return 0 - 1;
+  }
+  let before: KernelSlotRecord = kernelslot_lookup();
+  if before.valid != 1 {
+    let _ = uart_puts("kernelupload net: no valid slot-state record -- card not seeded?\n");
+    return 0 - 1;
+  }
+  let target: u32 = if before.active_slot == (0 as u8) { 1 as u32 } else { 0 as u32 };
+  let _ = uart_puts("kernelupload net: waiting for the uploader on ");
+  let _ = uart_put_ip(dhcp_state_get_leased_ip());
+  let _ = uart_puts(":");
+  let _ = uart_put_i64(port as i64);
+  let _ = uart_puts(" (target slot ");
+  let _ = uart_puts(if target == (0 as u32) { "A" } else { "B" });
+  let _ = uart_puts(")\n");
+  if tlsd_accept(my_mac, port, 300000000 as u32) != 0 { return 0 - 1; }
+  // ---- header ----
+  let rec: mut ref i64 = tlsd_p(TLSD_REC_OFF);
+  let have: i64 = 0;
+  let n: i64 = 0;
+  let pos: i64 = 0;
+  while have < 108 {
+    n = tlsd_app_read(my_mac, 30000000 as u32);
+    if n <= 0 {
+      let _ = uart_puts("kernelupload net: connection ended inside the header\n");
+      let _ = tlsd_close(my_mac);
+      return 0 - 1;
+    }
+    pos = 0;
+    while (pos < n) && (have < 108) {
+      let _ = buf_write_byte(line_buf, have as u32, buf_read_byte(rec, pos as u32));
+      have = have + 1;
+      pos = pos + 1;
+    }
+  }
+  if (buf_read_byte(line_buf, 0 as u32) != (0x44 as u32)) || (buf_read_byte(line_buf, 1 as u32) != (0x4b as u32)) || (buf_read_byte(line_buf, 2 as u32) != (0x55 as u32)) || (buf_read_byte(line_buf, 3 as u32) != (0x31 as u32)) {
+    let _ = kunet_reply(my_mac, "FAIL bad header magic\n");
+    let _ = tlsd_close(my_mac);
+    return 0 - 1;
+  }
+  let total: i64 = buf_read_u32_le(line_buf, 4 as u32) as i64;
+  let flags: u32 = buf_read_u32_le(line_buf, 8 as u32);
+  if (total <= 0) || (total > kernelslot_size_bytes()) {
+    let _ = kunet_reply(my_mac, "FAIL image length out of range\n");
+    let _ = tlsd_close(my_mac);
+    return 0 - 1;
+  }
+  let sigb: mut ref i64 = kernelupload_sig_scratch_get();
+  let k: i64 = 0;
+  while k < 64 { let _ = buf_write_byte(sigb, k as u32, buf_read_byte(line_buf, (44 + k) as u32)); k = k + 1; }
+  let _ = buf_write_byte(sigb, 64 as u32, 1 as u32);
+  let _ = buf_write_byte(sigb, 65 as u32, 1 as u32);
+  k = 0;
+  while k < 32 { let _ = buf_write_byte(sigb, (KERNELSIG_AUTH_DIGEST_OFF + k) as u32, buf_read_byte(line_buf, (12 + k) as u32)); k = k + 1; }
+  // ---- stream state: same fields `kernelupload stream` initializes ----
+  let _ = kernelupload_target_slot_set(target);
+  let _ = kernelupload_total_len_set(0 as u32);
+  let _ = kernelupload_chunk_base_block_offset_set(0 as u32);
+  let fresh_ctx: Sha256Ctx = sha256_init();
+  let _ = kernelupload_ctx_store(ref fresh_ctx);
+  let _ = kernelupload_active_set(1 as u32);
+  let _ = kernelupload_sd_write_worst_us_set(0 as u32);
+  let t_start: u32 = mmio_read_u32(TIMER_CLO);
+  let net_us: u32 = 0 as u32;
+  let acc_us: u32 = 0 as u32;
+  let records: i64 = 0;
+  let received: i64 = 0;
+  if pos < n {
+    let first: i64 = n - pos;
+    if first > total {
+      let _ = kunet_reply(my_mac, "FAIL more data than the header length\n");
+      let _ = tlsd_close(my_mac);
+      return 0 - 1;
+    }
+    let _ = tlsd_copy(rec, 0, rec, pos, first);
+    if kernelupload_accumulate_bytes(rec, first) != 0 {
+      let _ = kunet_reply(my_mac, "FAIL SD write\n");
+      let _ = tlsd_close(my_mac);
+      return 0 - 1;
+    }
+    received = first;
+  }
+  let next_report: i64 = 262144;
+  while received < total {
+    let r0: u32 = mmio_read_u32(TIMER_CLO);
+    n = tlsd_app_read(my_mac, 30000000 as u32);
+    let r1: u32 = mmio_read_u32(TIMER_CLO);
+    net_us = wrapping_add(net_us, wrapping_sub(r1, r0));
+    if n <= 0 {
+      let _ = uart_puts("kernelupload net: connection ended after ");
+      let _ = uart_put_i64(received);
+      let _ = uart_puts(" bytes\n");
+      let _ = tlsd_close(my_mac);
+      return 0 - 1;
+    }
+    if (received + n) > total {
+      let _ = kunet_reply(my_mac, "FAIL more data than the header length\n");
+      let _ = tlsd_close(my_mac);
+      return 0 - 1;
+    }
+    if kernelupload_accumulate_bytes(rec, n) != 0 {
+      let _ = kunet_reply(my_mac, "FAIL SD write\n");
+      let _ = tlsd_close(my_mac);
+      return 0 - 1;
+    }
+    acc_us = wrapping_add(acc_us, wrapping_sub(mmio_read_u32(TIMER_CLO), r1));
+    received = received + n;
+    records = records + 1;
+    if received >= next_report {
+      let _ = uart_puts("kernelupload net: ");
+      let _ = uart_put_i64(received);
+      let _ = uart_puts(" / ");
+      let _ = uart_put_i64(total);
+      let _ = uart_puts("\n");
+      next_report = next_report + 262144;
+    }
+  }
+  let stream_us: u32 = wrapping_sub(mmio_read_u32(TIMER_CLO), t_start);
+  let _ = uart_puts("kernelupload net: received ");
+  let _ = uart_put_i64(received);
+  let _ = uart_puts(" bytes in ");
+  let _ = uart_put_i64(stream_us as i64);
+  let _ = uart_puts(" us (");
+  let _ = uart_put_i64(if stream_us > (0 as u32) { (received * 1000000) / (stream_us as i64) } else { 0 });
+  let _ = uart_puts(" B/s; network+TLS ");
+  let _ = uart_put_i64(net_us as i64);
+  let _ = uart_puts(" us, SD+SHA ");
+  let _ = uart_put_i64(acc_us as i64);
+  let _ = uart_puts(" us, ");
+  let _ = uart_put_i64(records);
+  let _ = uart_puts(" records, worst SD block write ");
+  let _ = uart_put_i64(kernelupload_sd_write_worst_us_get() as i64);
+  let _ = uart_puts(" us)\n");
+  // ---- signature (mandatory), then the unchanged commit handler ----
+  if kernelsig_authorize_staged(total) != 0 {
+    let _ = kunet_reply(my_mac, "FAIL signature not valid for the trusted key -- nothing committed\n");
+    let _ = kernelupload_active_set(0 as u32);
+    let _ = tlsd_close(my_mac);
+    return 0 - 1;
+  }
+  // commit consumes (clears) the pending authorization, digest included --
+  // keep our own copy to verify the committed record against.
+  let want_sha: [u8; 32] = zero32_bytes_heap();
+  k = 0;
+  while k < 32 { want_sha[k] = buf_read_byte(sigb, (KERNELSIG_AUTH_DIGEST_OFF + k) as u32) as u8; k = k + 1; }
+  let e: i64 = kunet_put_str(line_buf, 0, "kernelupload commit ");
+  e = kunet_put_dec(line_buf, e, total);
+  let _ = buf_write_byte(line_buf, e as u32, 32 as u32);
+  e = kunet_put_hex(line_buf, e + 1, sigb, KERNELSIG_AUTH_DIGEST_OFF, 32);
+  let _ = kernelupload_commit_cmd(line_buf, 19, e);
+  let after: KernelSlotRecord = kernelslot_lookup();
+  let ok: i64 = 0;
+  if (after.valid == 1) && (after.generation != before.generation) {
+    let rdy: u8 = if target == (0 as u32) { after.slot_a_ready } else { after.slot_b_ready };
+    let ln: u32 = if target == (0 as u32) { after.slot_a_len } else { after.slot_b_len };
+    if (rdy == (1 as u8)) && (ln == (total as u32)) {
+      ok = 1;
+      k = 0;
+      while k < 32 {
+        let want_b: u32 = want_sha[k] as u32;
+        let got_b: u32 = if target == (0 as u32) { after.slot_a_sha256[k] as u32 } else { after.slot_b_sha256[k] as u32 };
+        if want_b != got_b { ok = 0; }
+        k = k + 1;
+      }
+    }
+  }
+  if ok == 0 {
+    let _ = uart_puts("kernelupload net: post-commit check: valid=");
+    let _ = uart_put_i64(after.valid);
+    let _ = uart_puts(" gen ");
+    let _ = uart_put_i64(before.generation as i64);
+    let _ = uart_puts("->");
+    let _ = uart_put_i64(after.generation as i64);
+    let _ = uart_puts(" ready=");
+    let _ = uart_put_i64((if target == (0 as u32) { after.slot_a_ready } else { after.slot_b_ready }) as i64);
+    let _ = uart_puts(" len=");
+    let _ = uart_put_i64((if target == (0 as u32) { after.slot_a_len } else { after.slot_b_len }) as i64);
+    let _ = uart_puts(" sha0 want=");
+    let _ = uart_put_hex32(want_sha[0] as u32);
+    let _ = uart_puts(" got=");
+    let _ = uart_put_hex32((if target == (0 as u32) { after.slot_a_sha256[0] } else { after.slot_b_sha256[0] }) as u32);
+    let _ = uart_puts("\n");
+    let _ = kunet_reply(my_mac, "FAIL commit did not verify (see board UART) -- slot not marked ready\n");
+    let _ = tlsd_close(my_mac);
+    return 0 - 1;
+  }
+  let activated: i64 = 0;
+  if (flags & (1 as u32)) != (0 as u32) {
+    let e2: i64 = kunet_put_str(line_buf, 0, if target == (0 as u32) { "kernelslot activate a" } else { "kernelslot activate b" });
+    let _ = shell_dispatch_kernelslot(line_buf, 10, e2);
+    let a2: KernelSlotRecord = kernelslot_lookup();
+    if (a2.valid == 1) && ((a2.preferred_slot as u32) == target) { activated = 1; }
+  }
+  let _ = kunet_reply(my_mac, if target == (0 as u32) { if activated == 1 { "OK slot=a activated\n" } else { "OK slot=a\n" } } else { if activated == 1 { "OK slot=b activated\n" } else { "OK slot=b\n" } });
+  let _ = tlsd_close(my_mac);
+  return 0;
+}
+
 fn kernelupload_commit_cmd(line_buf: mut ref i64, sub_end: i64, line_len: i64) -> i64 {
   if kernelupload_active_get() == (0 as u32) {
     let _ = uart_puts("kernelupload: nothing to commit (no chunks uploaded yet)\n");
@@ -44747,6 +45058,11 @@ fn shell_dispatch_kernelupload(line_buf: mut ref i64, cmd_end: i64, line_len: i6
     return 0;
   }
 
+  if shell_word_matches(line_buf, sub_start, sub_end, "net") == 1 {
+    let np_s: i64 = sub_end + 1;
+    let np: i64 = if sub_end < line_len { shell_parse_decimal(line_buf, np_s, shell_find_space(line_buf, np_s, line_len)) } else { 4433 };
+    return kernelupload_net_cmd(line_buf, if (np > 0) && (np < 65536) { np as u32 } else { 4433 as u32 });
+  }
   if shell_word_matches(line_buf, sub_start, sub_end, "stream") == 1 {
     if sub_end >= line_len {
       let _ = uart_puts("usage: kernelupload stream <total_len_bytes> -- then blast raw binary, no hex/no per-chunk ack\n");
@@ -46826,6 +47142,8 @@ fn shell_dispatch() -> i64 {
         let _ = uart_puts(" avg_decrypt_us=");
         let _ = uart_put_i64((wifi_link_count_get(WIFI_LINK_CNT_DEC_US_OFF) / dn) as i64);
       }
+      let _ = uart_puts(" hw_decrypts=");
+      let _ = uart_put_i64(wifi_link_count_get(WIFI_LINK_CNT_HWDEC_OFF) as i64);
       let _ = uart_puts(" ip=");
       let _ = uart_put_ip(dhcp_state_get_leased_ip());
       let _ = uart_puts("\n");
@@ -53466,6 +53784,8 @@ fn wpa_gtk_kde_extract(buf: mut ref i64, key_data_off: i64, key_data_len: i64, g
       if is_gtk == 1 {
         let gtk_len: i64 = elen - 6;
         if (gtk_len < 1) || (gtk_len > 32) { return 0 - 1; }
+        // GTK KDE data byte 0: KeyID (bits 0-1), Tx (bit 2) -- IEEE 802.11-2020 12.7.2
+        let _ = wifi_gtk_keyid_set(buf_read_byte(buf, (o + 4) as u32) & (3 as u32));
         let i: i64 = 0;
         while i < gtk_len {
           let _ = buf_write_byte(gtk_out, i as u32, buf_read_byte(buf, (o + 6 + i) as u32));
@@ -55570,6 +55890,7 @@ const WIFI_LINK_CNT_REPLAY_OFF: i64 = 104;
 const WIFI_LINK_CNT_MIC_FAIL_OFF: i64 = 108;
 const WIFI_LINK_CNT_DEC_US_OFF: i64 = 112;   // total us spent in CCMP decrypt
 const WIFI_LINK_CNT_DEC_N_OFF: i64 = 116;    // decrypt attempts
+const WIFI_LINK_CNT_HWDEC_OFF: i64 = 120;    // frames decrypted by the RTL8188CU security engine
 
 fn wifi_link_count_inc(link: mut ref i64, off: i64) -> i64 {
   let _ = buf_write_u32_le(link, off, buf_read_u32_le(link, off) + (1 as u32));
@@ -55624,6 +55945,56 @@ fn wifi_link_down(reason: i64) -> i64 {
 // own); `tk` is 16 bytes, `gtk` gtk_len (16 for CCMP) bytes. TX PN
 // restarts at 0 (first transmitted PN is 1) and RX replay windows
 // reset -- both correct for a freshly installed key (12.5.3.4.4).
+// 2026-11-27: RTL8188CU hardware CCMP for RX -- port of Linux rtl8xxxu
+// rtl8xxxu_cam_write / rtl8xxxu_set_key (core.c). Software CCMP cost
+// ~43 ms per frame even with stack caching -- THE WiFi throughput
+// ceiling; the chip's security engine decrypts and MIC-checks at line
+// rate. RX only on purpose: SECURITY_CFG enables RX security, never TX,
+// so outgoing frames stay software-encrypted (a hardware-TX mistake would
+// put plaintext on the air; an RX mistake falls back to software in
+// wifi_link_parse_mpdu). CAM entry = key index (default-key lookup):
+// PTK at entry 0 (WPA2 pairwise KeyID is always 0), GTK at its KeyID.
+fn wifi_rtl_cam_write_entry(devaddr: u32, entry: u32, keyidx: u32, is_group: u32, mac: mut ref i64, key: mut ref i64) -> i64 {
+  let ctrl: u32 = ((4 as u32) << (2 as u32)) | (keyidx & (3 as u32)) | ((1 as u32) << (15 as u32)) | (if is_group == (1 as u32) { (1 as u32) << (6 as u32) } else { 0 as u32 });
+  let j: i64 = 5;
+  while j >= 0 {
+    let val: u32 = if j == 0 {
+      ctrl | (buf_read_byte(mac, 0 as u32) << (16 as u32)) | (buf_read_byte(mac, 1 as u32) << (24 as u32))
+    } else {
+      if j == 1 {
+        buf_read_byte(mac, 2 as u32) | (buf_read_byte(mac, 3 as u32) << (8 as u32)) | (buf_read_byte(mac, 4 as u32) << (16 as u32)) | (buf_read_byte(mac, 5 as u32) << (24 as u32))
+      } else {
+        buf_read_u32_le(key, ((j - 2) * 4) as u32)
+      }
+    };
+    let _ = rtl_reg_write32(devaddr, 64 as u32, 0x0674 as u32, val);                                       // REG_CAM_WRITE
+    let cmd: u32 = ((1 as u32) << (31 as u32)) | ((1 as u32) << (16 as u32)) | ((entry << (3 as u32)) + (j as u32)); // POLLING|WRITE|addr
+    let _ = rtl_reg_write32(devaddr, 64 as u32, 0x0670 as u32, cmd);                                       // REG_CAM_CMD
+    let _ = delay_us_wallclock(100 as u32);
+    j = j - 1;
+  }
+  return 0;
+}
+
+fn wifi_rtl_cam_install(devaddr: u32, bssid: mut ref i64, tk: mut ref i64, gtk: mut ref i64, gtk_keyid: u32) -> i64 {
+  let _ = wifi_hwcrypt_on_set(0 as u32);
+  let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
+  let _ = wifi_rtl_cam_write_entry(devaddr, 0 as u32, 0 as u32, 0 as u32, bssid, tk);
+  if (gtk_keyid >= (1 as u32)) && (gtk_keyid <= (3 as u32)) {
+    let _ = wifi_rtl_cam_write_entry(devaddr, gtk_keyid, gtk_keyid, 1 as u32, bssid, gtk);
+  }
+  let cr: u32 = rtl_reg_read16(devaddr, 64 as u32, 0x0100 as u32);
+  let _ = rtl_reg_write16(devaddr, 64 as u32, 0x0100 as u32, cr | ((1 as u32) << (9 as u32)));            // CR_SECURITY_ENABLE
+  // SEC_CFG: RX_USE_DEFKEY | RX_SEC_ENABLE | RXBC_USE_DEFKEY -- no TX bits
+  let _ = rtl_reg_write8(devaddr, 64 as u32, 0x0680 as u32, ((1 as u32) << (1 as u32)) | ((1 as u32) << (3 as u32)) | ((1 as u32) << (7 as u32)));
+  let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+  let _ = wifi_hwcrypt_on_set(1 as u32);
+  let _ = uart_puts("wifi: RX CCMP offloaded to RTL8188CU security engine (CAM entry 0 = PTK, GTK keyid=");
+  let _ = uart_put_i64(gtk_keyid as i64);
+  let _ = uart_puts(")\n");
+  return 0;
+}
+
 fn wifi_link_install(link: mut ref i64, bssid: ref [u8; 6], own_mac: ref [u8; 6], tk: mut ref i64, gtk: mut ref i64, gtk_len: i64, next_seq: i64) -> i64 {
   let i: i64 = 0;
   while i < WIFI_LINK_STATE_SIZE { let _ = buf_write_byte(link, i as u32, 0 as u32); i = i + 1; }
@@ -55886,13 +56257,33 @@ fn wifi_link_parse_mpdu(link: mut ref i64, frame: mut ref i64, frame_len: i64, e
   let aad: mut ref i64 = wifi_link_aad_scratch_get();
   let nonce: mut ref i64 = wifi_link_nonce_scratch_get();
   let aad_len: i64 = wifi_ccmp_build_aad_nonce(frame, hdr_len, is_qos, aad, nonce);
-  let key: mut ref i64 = wifi_link_load_key(link, key_off);
-  // In place: CTR reads byte i before writing it, then the CBC-MAC runs
-  // over the recovered plaintext.
-  let dec_t0: u32 = mmio_read_u32(TIMER_CLO);
-  let dec_st: i64 = aes_ccmp_decrypt(key, nonce, aad, aad_len, body, body_len, tag, body);
-  let _ = buf_write_u32_le(link, WIFI_LINK_CNT_DEC_US_OFF, wrapping_add(buf_read_u32_le(link, WIFI_LINK_CNT_DEC_US_OFF), wrapping_sub(mmio_read_u32(TIMER_CLO), dec_t0)));
-  let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_DEC_N_OFF);
+  // 2026-11-27: frames the RTL8188CU security engine already decrypted
+  // (CAM keys installed by wifi_rtl_cam_install; MIC verified by the chip,
+  // which drops MIC failures since RCR has no ACCEPT_ICV) arrive with the
+  // same layout -- CCMP header kept, plaintext body, 8-byte MIC appended
+  // -- exactly as Linux mac80211 receives them with RX_FLAG_DECRYPTED.
+  // PN replay protection above still applies. The plaintext must also
+  // pass an LLC/SNAP plausibility check; if it does not, fall back to
+  // software decryption of the untouched original frame, so a wrong or
+  // missing CAM entry can cost speed but never correctness.
+  let hw_ok: i64 = 0;
+  if (wifi_hwcrypt_on_get() == (1 as u32)) && (wifi_rx_hwdec_get() == (1 as u32)) {
+    if (buf_read_byte(body, 0 as u32) == (0xaa as u32)) && (buf_read_byte(body, 1 as u32) == (0xaa as u32)) && (buf_read_byte(body, 2 as u32) == (0x03 as u32)) {
+      hw_ok = 1;
+    }
+  }
+  let dec_st: i64 = 0;
+  if hw_ok == 1 {
+    let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_HWDEC_OFF);
+  } else {
+    let key: mut ref i64 = wifi_link_load_key(link, key_off);
+    // In place: CTR reads byte i before writing it, then the CBC-MAC runs
+    // over the recovered plaintext.
+    let dec_t0: u32 = mmio_read_u32(TIMER_CLO);
+    dec_st = aes_ccmp_decrypt(key, nonce, aad, aad_len, body, body_len, tag, body);
+    let _ = buf_write_u32_le(link, WIFI_LINK_CNT_DEC_US_OFF, wrapping_add(buf_read_u32_le(link, WIFI_LINK_CNT_DEC_US_OFF), wrapping_sub(mmio_read_u32(TIMER_CLO), dec_t0)));
+    let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_DEC_N_OFF);
+  }
   if dec_st != 0 {
     let _ = wifi_link_count_inc(link, WIFI_LINK_CNT_MIC_FAIL_OFF);
     return 0 - 1;
@@ -56614,6 +57005,7 @@ fn wifi_real_join() -> i64 {
     // RSNE this STA sent (rsn_ie_build_wpa2_psk_ccmp) only offers a
     // CCMP group cipher, so an AP that associated us uses a CCMP GTK.
     let _ = wifi_link_install(wifi_link_state_scratch_get(), ref bssid, ref own_mac, wpa_hs_tk_ptr(), gtk_out, 16, data_seq);
+    let _ = wifi_rtl_cam_install(devaddr, bssid_heap, wpa_hs_tk_ptr(), gtk_out, wifi_gtk_keyid_get());
     let _ = uart_puts("wifi join: CONNECTED (4-way handshake complete, TK/GTK installed)\n");
     let _ = uart_puts("wifi link: UP -- netif now routed over WiFi, starting DHCP\n");
     let dhcp_mac: mut ref i64 = wpa2_eapol_own_mac_scratch_get();
@@ -65197,7 +65589,7 @@ fn kernel_main() -> i64 {
   // this was never a hardware limit, just an artificially small
   // buffer/cap pair that would have silently rejected any real data
   // frame larger than one USB packet.
-  let _ = usb_bulk_data_scratch_set(dhruva_alloc_bytes(1632));
+  let _ = usb_bulk_data_scratch_set(dhruva_alloc_bytes(2048));   // 2026-11-27: 1632 -> 2048, one-transfer WiFi RX frames
   let _ = usb_downstream_desc_scratch_set(dhruva_alloc_bytes(18));
   let _ = hub_port_status_scratch_set(dhruva_alloc_bytes(4));
   let _ = rtl_lan_reg_scratch_set(dhruva_alloc_bytes(4));
@@ -65208,7 +65600,7 @@ fn kernel_main() -> i64 {
   // this buffer into the next allocation (rtl_tx_buf_scratch, harmless
   // only because every TX rebuilds it from scratch first).
   let _ = rtl_rx_raw_scratch_set(dhruva_alloc_bytes(RTL_RX_RAW_MAX));
-  let _ = rtl_rx_chunk_scratch_set(dhruva_alloc_bytes(512));
+  let _ = rtl_rx_chunk_scratch_set(dhruva_alloc_bytes(2048));   // 2026-11-27: whole-frame bulk-IN
   // Round 2026-11-22: bumped from 512 to 1632 (1600 MTU-scale frame
   // body + 32-byte TX descriptor prefix) -- see usb_bulk_data_
   // scratch's own header comment just above for the full "why".

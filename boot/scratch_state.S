@@ -3114,3 +3114,51 @@ dwc2_revert_count_get:
     ldr r0, =dwc2_revert_count_word
     ldr r0, [r0]
     bx lr
+
+/* 2026-11-27: RTL8188CU hardware CCMP RX decryption state.
+ *  wifi_gtk_keyid      -- KeyID of the installed GTK (GTK KDE byte 0 bits 0-1)
+ *  wifi_rx_hwdec       -- 1 if the frame just handed up was decrypted by the
+ *                         chip's security engine (RX desc security!=0, swdec=0)
+ *  wifi_hwcrypt_on     -- 1 once the CAM holds this link's keys */
+.section ".bss"
+.align 4
+wifi_gtk_keyid_word:
+    .word 0
+wifi_rx_hwdec_word:
+    .word 0
+wifi_hwcrypt_on_word:
+    .word 0
+.section ".text"
+.global wifi_gtk_keyid_set
+wifi_gtk_keyid_set:
+    ldr r1, =wifi_gtk_keyid_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global wifi_gtk_keyid_get
+wifi_gtk_keyid_get:
+    ldr r0, =wifi_gtk_keyid_word
+    ldr r0, [r0]
+    bx lr
+.global wifi_rx_hwdec_set
+wifi_rx_hwdec_set:
+    ldr r1, =wifi_rx_hwdec_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global wifi_rx_hwdec_get
+wifi_rx_hwdec_get:
+    ldr r0, =wifi_rx_hwdec_word
+    ldr r0, [r0]
+    bx lr
+.global wifi_hwcrypt_on_set
+wifi_hwcrypt_on_set:
+    ldr r1, =wifi_hwcrypt_on_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global wifi_hwcrypt_on_get
+wifi_hwcrypt_on_get:
+    ldr r0, =wifi_hwcrypt_on_word
+    ldr r0, [r0]
+    bx lr
