@@ -314,7 +314,7 @@ irq_relocate_loop:
     mov r1, r9                    /* r1 = was_timer_tick, for
                                    * scheduler_switch_from_irq to gate its
                                    * tick_count increment on */
-    bl scheduler_switch_from_irq   /* returns r0 = the SP to resume,
+    bl scheduler_switch_from_irq_if_usr   /* returns r0 = the SP to resume,
                                    * possibly a different task's -- also
                                    * always a real per-task-stack pointer,
                                    * now a 68-byte frame */

@@ -241,6 +241,9 @@ static void exit_panic_watchdog_arm(void) {
     *pm_rstc = pm_password | (cur & wrcfg_clr) | wrcfg_full_reset;
 }
 
+/* 2026-11-28: callable from asm (swi_entry's privileged-SWI guard). */
+void dhruva_panic_watchdog_arm_public(void) { exit_panic_watchdog_arm(); }
+
 static void dhruva_halt_forever(void);   /* defined with dhruva_crit_enter, below */
 
 void exit(int code) {
@@ -720,6 +723,18 @@ static volatile unsigned int dharafs_media_key_state_v = 0;
 long dharafs_media_key_state_get(void) { return (long)dharafs_media_key_state_v; }
 long dharafs_media_key_state_set(long v) { dharafs_media_key_state_v = (unsigned int)v; return 0; }
 
+/* 2026-11-28: critical-config table cache (valid flag + the generation the
+ * cached table was loaded at) and the lazily decrypted WiFi password. */
+static volatile unsigned int critconfig_cache_valid_v = 0;
+static volatile long long critconfig_cache_gen_v = -1;
+long critconfig_cache_valid_get(void) { return (long)critconfig_cache_valid_v; }
+long critconfig_cache_valid_set(long v) { critconfig_cache_valid_v = (unsigned int)v; return 0; }
+long long critconfig_cache_gen_get(void) { return critconfig_cache_gen_v; }
+long critconfig_cache_gen_set(long long g) { critconfig_cache_gen_v = g; return 0; }
+static volatile unsigned int wifi_pw_loaded_v = 0;
+long wifi_pw_loaded_get(void) { return (long)wifi_pw_loaded_v; }
+long wifi_pw_loaded_set(long v) { wifi_pw_loaded_v = (unsigned int)v; return 0; }
+
 void *dhruva_alloc_stack_guarded(long n) {
     unsigned long need = (unsigned long)n;
     unsigned long crit = dhruva_crit_enter();
@@ -926,3 +941,19 @@ long long host_virtual_disk_write(long long block_num, void *buf) {
     (void)buf;
     return -1;
 }
+
+
+/* 2026-11-28: kernel-upload-over-network profile counters (see
+ * kernelupload_net_inner's summary line). Index meanings live there. */
+static volatile unsigned int kuprof_v[16];
+long kuprof_add(long i, long v) { if (i >= 0 && i < 16) kuprof_v[i] += (unsigned int)v; return 0; }
+long kuprof_get(long i) { return (i >= 0 && i < 16) ? (long)kuprof_v[i] : 0; }
+long kuprof_reset(void) { for (int i = 0; i < 16; i++) kuprof_v[i] = 0; return 0; }
+
+/* 2026-11-28: DharaFS next_seq at the end of the last compaction pass that
+ * left the log fully compacted; a new pass starts only once it moves. */
+static volatile unsigned int dharafs_compact_clean_seq_v = 0;
+static volatile unsigned int dharafs_compact_clean_valid_v = 0;
+long dharafs_compact_clean_seq_get(void) { return (long)dharafs_compact_clean_seq_v; }
+long dharafs_compact_clean_valid_get(void) { return (long)dharafs_compact_clean_valid_v; }
+long dharafs_compact_clean_mark(long seq) { dharafs_compact_clean_seq_v = (unsigned int)seq; dharafs_compact_clean_valid_v = 1; return 0; }

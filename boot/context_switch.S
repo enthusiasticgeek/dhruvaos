@@ -201,6 +201,9 @@ syscall_reschedule_count:
                          * <=1) before trusting the comparison -- see
                          * scheduling_decision_prelude's own updated
                          * comment. */
+.global sched_svc_preempt_deferred_count
+sched_svc_preempt_deferred_count:
+    .word 0
 .global context_switch_count
 context_switch_count:
     .word 0             /* Round 53: total number of times scheduler_
@@ -1765,6 +1768,51 @@ dacr_open_all:
  * Fixed by having irq_entry.S pass through irq_dispatch's own new
  * return value (1 iff this IRQ was actually the timer) as a second
  * argument here, and only incrementing when it's nonzero. */
+/* 2026-11-28: ROOT CAUSE of the long-open "SENTINEL: corrupted resume
+ * state" crash. A SWI enters SVC mode with IRQs masked by hardware but
+ * FIQs (the timer tick) still enabled until swi_entry's first
+ * instruction; a tick landing in that window switched the task out while
+ * it was in SVC mode, and the exit path's `msr spsr_cxsf` + `ldm ... ^`
+ * then left spsr_svc = that frame's 0x93. On resume swi_entry read 0x93
+ * as the task's USER status word, so the SWI "returned to user mode" in
+ * SVC with IRQs masked: the task then ran privileged, and its next SWI
+ * clobbered the shared SVC state (resume PC = SVC-stack fill 0xC0C0C0C0,
+ * a Thumb-mode jump, or the sentinel). Reproduced on real HW on demand
+ * (`kernelupload net` with WiFi down: a tight loop of 4 mutex SWIs per
+ * iteration), caught by swi_entry's privileged-SWI guard
+ * (caller_cpsr=0x93, empty SVC stack).
+ * Rule now: never preempt kernel code. A switch happens only when the
+ * interrupted context was USR mode; otherwise the tick is counted and the
+ * interrupted kernel code resumes (every SWI handler runs with IRQ+FIQ
+ * masked after its first instruction and blocks only via explicit
+ * yields, so this window is the only async SVC preemption).
+ * r0 = context frame (word 0 = interrupted spsr), r1 = was_timer_tick. */
+.global scheduler_switch_from_irq_if_usr
+scheduler_switch_from_irq_if_usr:
+    ldr r2, [r0, #0]
+    and r2, r2, #0x1F
+    cmp r2, #0x10
+    beq scheduler_switch_from_irq
+    cmp r1, #0
+    beq scheduler_switch_from_irq_if_usr_stay
+    ldr r2, =tick_count
+    ldr r3, [r2]
+    add r3, r3, #1
+    str r3, [r2]
+    ldr r2, =sched_svc_preempt_deferred_count
+    ldr r3, [r2]
+    add r3, r3, #1
+    str r3, [r2]
+scheduler_switch_from_irq_if_usr_stay:
+    bx lr                       /* r0 unchanged: resume the same context */
+
+.global sched_svc_preempt_deferred_count_get
+sched_svc_preempt_deferred_count_get:
+    ldr r0, =sched_svc_preempt_deferred_count
+    ldr r0, [r0]
+    mov r1, #0
+    bx lr
+
 .global scheduler_switch_from_irq
 scheduler_switch_from_irq:
     mov r9, r1                     /* stash was_timer_tick -- r1 is about

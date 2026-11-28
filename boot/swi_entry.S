@@ -135,6 +135,21 @@ swi_entry:
     push {r5, r8, r9, r11}
     mrs r11, spsr             /* r11 = interrupted cpsr, temporarily */
     mov r5, lr                /* r5 = resume pc, temporarily */
+    /* 2026-11-28: a SWI must come from USR mode once the scheduler runs. A
+     * SWI from SVC (kernel code already inside an exception) overwrites the
+     * outer exception's lr_svc/spsr_svc and stores a kernel return address
+     * + SVC spsr as the TASK's resume state -- the long-open "SENTINEL:
+     * corrupted resume state" crash and the 0xC0C0C0C0 prefetch abort, both
+     * reproduced on real HW by `kernelupload net` with WiFi down. Report
+     * the offender (r7 = syscall number, r5 = return address) and halt. */
+    and r9, r11, #0x1F
+    cmp r9, #0x10
+    beq swi_entry_from_usr
+    ldr r9, =context_switch_count
+    ldr r9, [r9]
+    cmp r9, #0
+    bne swi_from_privileged       /* before the scheduler starts: allowed */
+swi_entry_from_usr:
 
     ldr r8, =current_task
     ldr r8, [r8]
@@ -752,6 +767,91 @@ dhruva_swi_crit_exit:
     pop {r4, r7}
     bx lr
 
+swi_from_privileged:
+    cpsid if
+    /* Polled PL011 output only: interrupts are masked, so the TX ring
+     * (sched_diag_putc) would never drain -- the first real-HW hit printed
+     * 16 characters before the watchdog reset. r4 = string, r6 = value. */
+    ldr r4, =swi_priv_msg1
+    bl swi_priv_puts
+    mov r6, r7
+    bl swi_priv_hex32
+    ldr r4, =swi_priv_msg2
+    bl swi_priv_puts
+    mov r6, r5
+    bl swi_priv_hex32
+    ldr r4, =swi_priv_msg3
+    bl swi_priv_puts
+    mov r6, r11
+    bl swi_priv_hex32
+    ldr r4, =swi_priv_msg4
+    bl swi_priv_puts
+    ldr r6, =current_task
+    ldr r6, [r6]
+    bl swi_priv_hex32
+    ldr r4, =swi_priv_msg6
+    bl swi_priv_puts
+    mov r6, sp
+    bl swi_priv_hex32
+    ldr r4, =swi_priv_msg7
+    bl swi_priv_puts
+    /* the first 8 words on the SVC stack (the interrupted context's
+     * frame: whoever trapped into SVC first) */
+    mov r8, #0
+swi_priv_stack_loop:
+    cmp r8, #24
+    bge swi_priv_stack_done
+    ldr r6, [sp, r8, lsl #2]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    add r8, r8, #1
+    b swi_priv_stack_loop
+swi_priv_stack_done:
+    ldr r4, =swi_priv_msg5
+    bl swi_priv_puts
+    bl dhruva_panic_watchdog_arm_public
+swi_from_privileged_spin:
+    b swi_from_privileged_spin
+
+/* r0 = char. Clobbers r1, r2. */
+swi_priv_putc:
+    ldr r1, =0x20201018          /* PL011 FR */
+swi_priv_putc_wait:
+    ldr r2, [r1]
+    tst r2, #0x20                /* TXFF */
+    bne swi_priv_putc_wait
+    ldr r1, =0x20201000          /* PL011 DR */
+    str r0, [r1]
+    bx lr
+
+/* r4 = NUL-terminated string (advanced). Clobbers r0-r2, r4. */
+swi_priv_puts:
+    mov r3, lr
+swi_priv_puts_loop:
+    ldrb r0, [r4], #1
+    cmp r0, #0
+    beq swi_priv_puts_done
+    bl swi_priv_putc
+    b swi_priv_puts_loop
+swi_priv_puts_done:
+    bx r3
+
+/* r6 = value. Clobbers r0-r3, r9, r10. */
+swi_priv_hex32:
+    mov r10, lr
+    mov r9, #28
+swi_priv_hex_loop:
+    mov r0, r6, lsr r9
+    and r0, r0, #0xF
+    cmp r0, #10
+    addlt r0, r0, #'0'
+    addge r0, r0, #('A' - 10)
+    bl swi_priv_putc
+    subs r9, r9, #4
+    bge swi_priv_hex_loop
+    bx r10
+
 .global dhruva_swi_fatal_halt
 dhruva_swi_fatal_halt:
     mov r7, #11
@@ -772,3 +872,12 @@ dhruva_stack_cache_set:
 swi_return_diag_msg:
     .asciz "SWI_RETURN: task_a resume_pc=0x"
 .section ".text"
+
+.section ".rodata"
+swi_priv_msg1: .asciz "\nFATAL: SWI issued from a privileged mode (nested exception) -- r7(syscall)=0x"
+swi_priv_msg2: .asciz " return_addr=0x"
+swi_priv_msg3: .asciz " caller_cpsr=0x"
+swi_priv_msg4: .asciz " current_task=0x"
+swi_priv_msg5: .asciz "\n -- halting (watchdog armed)\n"
+swi_priv_msg6: .asciz " sp_svc=0x"
+swi_priv_msg7: .asciz "\n svc_stack[0..23]: "

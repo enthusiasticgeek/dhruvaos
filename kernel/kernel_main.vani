@@ -3680,6 +3680,19 @@ extern "C" fn critical_config_key_scratch_get() -> mut ref i64;
 extern "C" fn critical_config_crypto_key_get() -> mut ref i64;
 #[stack_cost(bytes=1)]
 extern "C" fn critical_config_crypto_key_ready_get() -> u32;
+extern "C" fn critconfig_cache_valid_get() -> u32;
+extern "C" fn critconfig_cache_valid_set(v: u32) -> i64;
+extern "C" fn critconfig_cache_gen_get() -> i64;
+extern "C" fn critconfig_cache_gen_set(g: i64) -> i64;
+extern "C" fn wifi_pw_loaded_get() -> u32;
+extern "C" fn wifi_pw_loaded_set(v: u32) -> i64;
+extern "C" fn kuprof_add(i: u32, v: u32) -> i64;
+extern "C" fn kuprof_get(i: u32) -> u32;
+extern "C" fn kuprof_reset() -> i64;
+extern "C" fn sched_svc_preempt_deferred_count_get() -> u32;
+extern "C" fn dharafs_compact_clean_seq_get() -> u32;
+extern "C" fn dharafs_compact_clean_valid_get() -> u32;
+extern "C" fn dharafs_compact_clean_mark(seq: u32) -> i64;
 #[stack_cost(bytes=1)]
 extern "C" fn critical_config_crypto_key_ready_set(value: u32) -> u32;
 #[stack_cost(bytes=1)]
@@ -14799,6 +14812,9 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     let _ = dharafs_compact_set_resume_block(0 as u32);
     let _ = dharafs_compact_set_failed(0 as u32);
     let _ = dharafs_compact_set_pass_target(0 as u32);
+    if verify_ok == 1 {
+      let _ = dharafs_compact_clean_mark(dharafs_state_get_next_seq());
+    }
     return 0;
   }
 
@@ -14813,6 +14829,13 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
   let resume_block: u32 = dharafs_compact_get_resume_block();
   if resume_block == (0 as u32) {
     if (current_next_block - log_start) < (4 as u32) {
+      return 0;
+    }
+    // 2026-11-28: nothing written since the last pass left the log fully
+    // compacted -> nothing can have been superseded; stay idle. (Was: a
+    // full log scan + checkpoint write every task_e iteration, ~every 5 s
+    // on real HW, reclaiming nothing -- needless SD wear.)
+    if (dharafs_compact_clean_valid_get() == (1 as u32)) && (dharafs_compact_clean_seq_get() == dharafs_state_get_next_seq()) {
       return 0;
     }
   }
@@ -15070,7 +15093,16 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     let _ = uart_put_hex32(write_cursor as u32);
     let _ = uart_puts(" of ");
     let _ = uart_put_hex32(old_next_block);
-    let _ = uart_puts(if all_ok == 1 { " -> erasing the rest\n" } else { " -> pass ABANDONED (nothing reclaimed)\n" });
+    let nothing_to_reclaim: i64 = if (all_ok == 1) && ((write_cursor as u32) == old_next_block) { 1 } else { 0 };
+    let _ = uart_puts(if nothing_to_reclaim == 1 { " -> already compact, nothing to erase\n" } else { if all_ok == 1 { " -> erasing the rest\n" } else { " -> pass ABANDONED (nothing reclaimed)\n" } });
+    if nothing_to_reclaim == 1 {
+      // On-card state is unchanged: no erase phase, no checkpoint write.
+      let _ = dharafs_compact_set_resume_block(0 as u32);
+      let _ = dharafs_compact_set_pass_target(0 as u32);
+      let _ = dharafs_compact_set_failed(0 as u32);
+      let _ = dharafs_compact_clean_mark(dharafs_state_get_next_seq());
+      return 0;
+    }
     // The whole [log_start, old_next_block) range has now been
     // scanned -- possibly across several resumed calls. Only true if
     // every relocation across the WHOLE pass actually succeeded
@@ -23395,6 +23427,7 @@ fn tcp_conn_handle_segment(conn_id: u32, frame: mut ref i64, recv_len: i64, my_m
       return 0; // pure ACK (or window update)
     }
     if seg_seq != tcp_conn_get_remote_seq(conn_id) {
+      let _ = kuprof_add(5 as u32, 1 as u32);   // out-of-order / duplicate segment discarded
       let dup_empty: mut ref i64 = tcp_empty_payload_scratch_get();
       let _ = tcp_send_segment(my_mac, dst_mac, local_ip, tcp_conn_get_remote_ip(conn_id), local_port, tcp_conn_get_remote_port(conn_id), tcp_conn_get_local_seq(conn_id), tcp_conn_get_remote_seq(conn_id), tcp_flag_ack(), TCP_RCV_WINDOW as u32, dup_empty, 0);
       return 0;
@@ -30526,7 +30559,15 @@ fn critical_config_header_generation(base_block: i64) -> i64 {
 // slot in critical_config_table_scratch is then left zeroed by this
 // function, i.e. correctly reads back as "not found" for every key
 // rather than stale/undefined memory).
+// Returns the loaded generation, -1 if neither copy is valid (fresh store),
+// or -2 if the chosen copy (and the other, if valid) could not be read --
+// callers must never act on a partial table.
+// 2026-11-28: the table is cached after a clean load (was 18 SD reads on
+// EVERY critical_config_read); every write drops the cache.
 fn critical_config_table_load() -> i64 {
+  if critconfig_cache_valid_get() == (1 as u32) {
+    return critconfig_cache_gen_get();
+  }
   let gen_a: i64 = critical_config_header_generation(critical_config_base_block_copy_a());
   let gen_b: i64 = critical_config_header_generation(critical_config_base_block_copy_b());
   let chosen_base: i64 = 0 - 1;
@@ -30556,6 +30597,7 @@ fn critical_config_table_load() -> i64 {
   // else a sub-buffer-at-an-offset is needed, e.g. dharafs_read_raw's
   // own multi-block assembly).
   let block_scratch: mut ref i64 = dhruva_scratch_slot(3, 512)   ;  // persistent slot 3 (was a per-call leak)
+  let fallback_from: i64 = 0 - 1;
   let blk: i64 = 0;
   while blk < critical_config_blocks_per_copy() {
     // 2026-11-08 (real-HW watchdog reset investigation): sdhost_write_
@@ -30587,10 +30629,28 @@ fn critical_config_table_load() -> i64 {
     if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
-    let _ = sdhost_read_block(chosen_base + blk, block_scratch);
-    let _ = ssh_copy(table, blk * (512 as i64), block_scratch, 0, 512);
-    blk = blk + 1;
+    // 2026-11-28: a failed read used to be ignored, copying the PREVIOUS
+    // block's bytes into this part of the table (and a later write would
+    // commit that to both copies). Fall back to the other copy once.
+    if sdhost_read_block(chosen_base + blk, block_scratch) != 0 {
+      let other_base: i64 = if chosen_base == critical_config_base_block_copy_a() { critical_config_base_block_copy_b() } else { critical_config_base_block_copy_a() };
+      let other_gen: i64 = if chosen_base == critical_config_base_block_copy_a() { gen_b } else { gen_a };
+      if (other_gen < 0) || (other_base == fallback_from) {
+        let _ = uart_puts("critconfig: table unreadable (both copies) -- not loaded\n");
+        return 0 - 2;
+      }
+      let _ = uart_puts("critconfig: read failure in the newer copy -- loading the other copy\n");
+      fallback_from = chosen_base;
+      chosen_base = other_base;
+      chosen_gen = other_gen;
+      blk = 0;
+    } else {
+      let _ = ssh_copy(table, blk * (512 as i64), block_scratch, 0, 512);
+      blk = blk + 1;
+    }
   }
+  let _ = critconfig_cache_gen_set(chosen_gen);
+  let _ = critconfig_cache_valid_set(1 as u32);
   return chosen_gen;
 }
 
@@ -30726,7 +30786,9 @@ fn critical_config_crypto_key_ensure() -> i64 {
 // slot, the AEAD tag fails to verify (tamper or corruption -- fails
 // closed, same posture as dharafs_crypto_decrypt_block's own).
 fn critical_config_read_raw(key_buf: mut ref i64, key_len: i64, out_buf: mut ref i64) -> i64 {
-  let _ = critical_config_table_load();
+  if critical_config_table_load() == (0 - 2) {
+    return 0 - 2;
+  }
   let slot: i64 = critical_config_find_slot(key_buf, key_len);
   if slot < 0 {
     return 0 - 1;
@@ -30780,6 +30842,14 @@ fn critical_config_write_raw(key_buf: mut ref i64, key_len: i64, value_buf: mut 
     return 0 - 1;
   }
   let loaded_gen: i64 = critical_config_table_load();
+  if loaded_gen == (0 - 2) {
+    let _ = uart_puts("critconfig: refusing to write -- the stored table could not be read (would overwrite it from a partial copy)\n");
+    return 0 - 2;
+  }
+  // Whatever happens below (in-RAM edit, flush success or failure), the
+  // cached table and any value derived from it are stale afterwards.
+  let _ = critconfig_cache_valid_set(0 as u32);
+  let _ = wifi_pw_loaded_set(0 as u32);
   let slot: i64 = critical_config_find_slot(key_buf, key_len);
   if slot < 0 {
     slot = critical_config_find_free_slot();
@@ -42150,7 +42220,20 @@ fn wifi_config_init() -> i64 {
     let _ = wifi_config_ssid_len_set(ssid_cap as u32);
   }
 
-  let pwd_heap: mut ref i64 = dhruva_alloc_bytes(200);
+  // 2026-11-28: the password is encrypted, and its first decryption runs
+  // the 10,000-iteration PBKDF2 key derivation (~2.4 s on the Pi 1B) --
+  // previously on EVERY boot, WiFi used or not. Now decrypted on first use
+  // (wifi_config_password_ensure, called by every reader).
+  let _ = wifi_pw_loaded_set(0 as u32);
+  return 0;
+}
+
+fn wifi_config_password_ensure() -> i64 {
+  if wifi_pw_loaded_get() == (1 as u32) {
+    return 0;
+  }
+  let _ = wifi_config_password_len_set(0 as u32);
+  let pwd_heap: mut ref i64 = dhruva_scratch_slot(34, 200);
   let pwd_read_len: i64 = critical_config_read("wifi_password", pwd_heap);
   if pwd_read_len > 0 {
     let pwd_cap: i64 = if pwd_read_len > 64 { 64 } else { pwd_read_len };
@@ -42162,6 +42245,12 @@ fn wifi_config_init() -> i64 {
       i = i + 1;
     }
     let _ = wifi_config_password_len_set(pwd_cap as u32);
+  }
+  // Only a definite answer (value, or -1 = not configured) is cached; a
+  // transient failure (-2: unreadable table / CRC / decrypt) retries on
+  // the next use instead of reporting "no password" until reboot.
+  if (pwd_read_len > 0) || (pwd_read_len == (0 - 1)) {
+    let _ = wifi_pw_loaded_set(1 as u32);
   }
   return 0;
 }
@@ -45070,6 +45159,7 @@ fn kernelupload_net_inner(line_buf: mut ref i64, port: u32) -> i64 {
   let _ = kernelupload_ctx_store(ref fresh_ctx);
   let _ = kernelupload_active_set(1 as u32);
   let _ = kernelupload_sd_write_worst_us_set(0 as u32);
+  let _ = kuprof_reset();
   let t_start: u32 = mmio_read_u32(TIMER_CLO);
   let net_us: u32 = 0 as u32;
   let acc_us: u32 = 0 as u32;
@@ -45141,6 +45231,14 @@ fn kernelupload_net_inner(line_buf: mut ref i64, port: u32) -> i64 {
   let _ = uart_puts(" records, worst SD block write ");
   let _ = uart_put_i64(kernelupload_sd_write_worst_us_get() as i64);
   let _ = uart_puts(" us)\n");
+  let _ = uart_puts("kernelupload net profile:");
+  let pk: u32 = 0 as u32;
+  while pk < (9 as u32) {
+    let _ = uart_puts(if pk == (0 as u32) { " rx_frame_us=" } else { if pk == (1 as u32) { " rx_empty_us=" } else { if pk == (2 as u32) { " frames=" } else { if pk == (3 as u32) { " empty_polls=" } else { if pk == (4 as u32) { " tcp_us=" } else { if pk == (5 as u32) { " ooo_dropped=" } else { if pk == (6 as u32) { " decrypt_us=" } else { if pk == (7 as u32) { " records=" } else { " data_segs=" } } } } } } } });
+    let _ = uart_put_i64(kuprof_get(pk) as i64);
+    pk = pk + (1 as u32);
+  }
+  let _ = uart_puts("\n");
   // ---- signature (mandatory), then the unchanged commit handler ----
   if kernelsig_authorize_staged(total) != 0 {
     let _ = kunet_reply(my_mac, "FAIL signature not valid for the trusted key -- nothing committed\n");
@@ -46278,6 +46376,7 @@ fn shell_dispatch_kernelslot(line_buf: mut ref i64, cmd_end: i64, line_len: i64)
 // exposing the real password. Compare this hash against an
 // independently-computed one over the SAME real credential files.
 fn wificreds_hash_diag() -> i64 {
+  let _ = wifi_config_password_ensure();
   let ssid_len: i64 = wifi_config_ssid_len_get() as i64;
   let ssid_chunk: [u8; 256] = zero256_bytes();
   let ssid_src: mut ref i64 = wifi_config_ssid_buf_ptr();
@@ -49189,6 +49288,9 @@ fn shell_dispatch() -> i64 {
     let ticks: u32 = scheduler_get_tick_count();
     let _ = uart_puts("  uptime_ticks: ");
     let _ = uart_put_i64(ticks as i64);
+    let _ = uart_puts("\n");
+    let _ = uart_puts("  svc_preempt_deferred: ");   // ticks that landed in kernel code (switch deferred)
+    let _ = uart_put_i64(sched_svc_preempt_deferred_count_get() as i64);
     let _ = uart_puts("\n");
 
     let ready: i64 = scheduler_ready_count();
@@ -56945,6 +57047,7 @@ fn wifi_ccmp_self_test() -> i64 {
 }
 
 fn wifi_real_join() -> i64 {
+  let _ = wifi_config_password_ensure();   // lazy: first use decrypts (PBKDF2 once)
   // 2026-11-26: a (re)join tears down any existing data-path link
   // first -- its keys/PNs belong to the old association.
   let _ = wifi_link_down(1);
@@ -56955,7 +57058,7 @@ fn wifi_real_join() -> i64 {
     return 0 - 1;
   }
   if password_len == 0 {
-    let _ = uart_puts("wifi join: no password configured (critconfig set wifi_password <pw> --encrypted, reboot, then retry)\n");
+    let _ = uart_puts("wifi join: no password configured (critconfig set wifi_password <pw> --encrypted, then retry)\n");
     return 0 - 1;
   }
   if wifi_radio_init_rtl8188cu() == 0 {
@@ -63091,10 +63194,18 @@ fn tlsd_random(dst: mut ref i64, n: i64) -> i64 {
 fn tlsd_pump_once(my_mac: mut ref i64) -> i64 {
   let frame: mut ref i64 = tlsd_p(TLSD_FRAME_OFF);
   let port: u32 = tlsd_st_get(TST_PORT) as u32;
+  let pf0: u32 = mmio_read_u32(TIMER_CLO);
   let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   let flen: i64 = netif_recv_frame(frame, 1514);
   let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
-  if flen <= 0 { return 0; }
+  let pf1: u32 = mmio_read_u32(TIMER_CLO);
+  if flen <= 0 {
+    let _ = kuprof_add(1 as u32, wrapping_sub(pf1, pf0));   // empty poll time
+    let _ = kuprof_add(3 as u32, 1 as u32);
+    return 0;
+  }
+  let _ = kuprof_add(0 as u32, wrapping_sub(pf1, pf0));     // receive time, frame returned
+  let _ = kuprof_add(2 as u32, 1 as u32);
   if buf_read_u16_be(frame, 12) != (0x0800 as u32) { return 0; }
   if ipv4_get_protocol(frame, 14) != (6 as u32) { return 0; }
   if tcp_get_dst_port(frame, 34) != port { return 0; }
@@ -63103,9 +63214,12 @@ fn tlsd_pump_once(my_mac: mut ref i64) -> i64 {
     let _ = tlsd_copy(dmac, 0, frame, 6, 6);
   }
   let seg: mut ref i64 = tlsd_p(TLSD_SEG_OFF);
+  let pt0: u32 = mmio_read_u32(TIMER_CLO);
   let _ = dhruva_mutex_lock(DWC2_MUTEX_ID);
   let n: i64 = tcp_conn_handle_segment(TLSD_CONN, frame, flen, my_mac, dmac, seg, 1514);
   let _ = dhruva_mutex_unlock(DWC2_MUTEX_ID);
+  let _ = kuprof_add(4 as u32, wrapping_sub(mmio_read_u32(TIMER_CLO), pt0));   // TCP handling incl. ACK TX
+  if n > 0 { let _ = kuprof_add(8 as u32, 1 as u32); }
   if n > 0 {
     let rx_start: i64 = tlsd_st_get(TST_RX_START);
     let rx_end: i64 = tlsd_st_get(TST_RX_END);
@@ -63272,7 +63386,11 @@ fn tlsd_read_record(my_mac: mut ref i64, timeout_us: u32) -> i64 {
       let iv_slot: i64 = if in_key == 1 { TS_C_HS_IV } else { TS_C_AP_IV };
       let seq: i64 = tlsd_st_get(TST_SEQ_IN);
       let nonce: mut ref i64 = tlsd_nonce(iv_slot, seq);
-      if chacha20_poly1305_decrypt_heap(tlsd_s(key_slot), nonce, aad, 5, rec, ct_len, tag, rec) != 0 {
+      let pd0: u32 = mmio_read_u32(TIMER_CLO);
+      let pd_rc: i64 = chacha20_poly1305_decrypt_heap(tlsd_s(key_slot), nonce, aad, 5, rec, ct_len, tag, rec);
+      let _ = kuprof_add(6 as u32, wrapping_sub(mmio_read_u32(TIMER_CLO), pd0));
+      let _ = kuprof_add(7 as u32, 1 as u32);
+      if pd_rc != 0 {
         return 0 - 2;
       }
       let _ = tlsd_st_set(TST_SEQ_IN, seq + 1);
@@ -66407,12 +66525,33 @@ fn kernel_main() -> i64 {
   if hardware_is_real_hw_get() == (1 as u32) {
     let _ = watchdog_kick();
   }
+  let t8_0: u32 = mmio_read_u32(TIMER_CLO);
   let _ = log_level_init();
+  let t8_1: u32 = mmio_read_u32(TIMER_CLO);
   let _ = kernlog_config_init();
+  let t8_2: u32 = mmio_read_u32(TIMER_CLO);
   let _ = wifi_config_init();
+  let t8_3: u32 = mmio_read_u32(TIMER_CLO);
   let _ = ble_config_init();
+  let t8_4: u32 = mmio_read_u32(TIMER_CLO);
   let _ = dhdl_init();
+  let t8_5: u32 = mmio_read_u32(TIMER_CLO);
   let _ = crashlog_boot_increment();
+  let t8_6: u32 = mmio_read_u32(TIMER_CLO);
+  let _ = uart_puts("BOOT DIAG: 8->9 split us:");
+  let _ = uart_puts(" log_level=");
+  let _ = uart_put_i64(wrapping_sub(t8_1, t8_0) as i64);
+  let _ = uart_puts(" kernlog_config=");
+  let _ = uart_put_i64(wrapping_sub(t8_2, t8_1) as i64);
+  let _ = uart_puts(" wifi_config=");
+  let _ = uart_put_i64(wrapping_sub(t8_3, t8_2) as i64);
+  let _ = uart_puts(" ble_config=");
+  let _ = uart_put_i64(wrapping_sub(t8_4, t8_3) as i64);
+  let _ = uart_puts(" dhdl=");
+  let _ = uart_put_i64(wrapping_sub(t8_5, t8_4) as i64);
+  let _ = uart_puts(" crashlog=");
+  let _ = uart_put_i64(wrapping_sub(t8_6, t8_5) as i64);
+  let _ = uart_puts("\n");
   let _ = uart_puts("BOOT DIAG: checkpoint 9 (post-crashlog_boot_increment), TIMER_CLO=0x");
   let _ = uart_put_hex32(mmio_read_u32(TIMER_CLO));
   let _ = uart_puts("\n");

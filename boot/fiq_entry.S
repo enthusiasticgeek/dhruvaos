@@ -390,7 +390,7 @@ fiq_entry_true_lr_done:
 
     mov r0, r6
     mov r1, r9
-    bl scheduler_switch_from_irq     /* returns r0 = the SP to resume,
+    bl scheduler_switch_from_irq_if_usr     /* returns r0 = the SP to resume,
                                       * possibly a different task's --
                                       * mode-agnostic (only touches
                                       * memory-resident scheduler state
