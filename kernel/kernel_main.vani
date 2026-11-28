@@ -32452,7 +32452,12 @@ fn dwc2_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i64 
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  // 2026-11-28: toggle from hardware (HCTSIZ.PID after completion), as Linux
+  // dwc2_hcd_save_data_toggle does -- flipping once per transfer was wrong for
+  // multi-packet transfers: a 2-packet WiFi TX frame left the toggle out of step,
+  // so the device silently discarded the NEXT frame (real HW: TLS ServerHello).
+  let hw_pid_t: u32 = (mmio_read_u32(dwc2_hctsiz0_addr()) >> (29 as u32)) & (3 as u32);
+  let next_toggle: u32 = if hw_pid_t == (2 as u32) { 1 as u32 } else { if hw_pid_t == (0 as u32) { 0 as u32 } else { if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 } } };
   let _ = usb_msd_set_out_toggle(next_toggle);
   return 0;
 }
@@ -32496,7 +32501,12 @@ fn dwc2_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) -> 
     let _ = buf_write_byte(out_buf, i as u32, b);
     i = i + 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  // 2026-11-28: toggle from hardware (HCTSIZ.PID after completion), as Linux
+  // dwc2_hcd_save_data_toggle does -- flipping once per transfer was wrong for
+  // multi-packet transfers: a 2-packet WiFi TX frame left the toggle out of step,
+  // so the device silently discarded the NEXT frame (real HW: TLS ServerHello).
+  let hw_pid_t: u32 = (mmio_read_u32(dwc2_hctsiz0_addr()) >> (29 as u32)) & (3 as u32);
+  let next_toggle: u32 = if hw_pid_t == (2 as u32) { 1 as u32 } else { if hw_pid_t == (0 as u32) { 0 as u32 } else { if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 } } };
   let _ = usb_msd_set_in_toggle(next_toggle);
   return want_len;
 }
@@ -32555,7 +32565,12 @@ fn dwc2_net_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> 
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  // 2026-11-28: toggle from hardware (HCTSIZ.PID after completion), as Linux
+  // dwc2_hcd_save_data_toggle does -- flipping once per transfer was wrong for
+  // multi-packet transfers: a 2-packet WiFi TX frame left the toggle out of step,
+  // so the device silently discarded the NEXT frame (real HW: TLS ServerHello).
+  let hw_pid_t: u32 = (mmio_read_u32(dwc2_hctsiz0_addr()) >> (29 as u32)) & (3 as u32);
+  let next_toggle: u32 = if hw_pid_t == (2 as u32) { 1 as u32 } else { if hw_pid_t == (0 as u32) { 0 as u32 } else { if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 } } };
   let _ = usb_net_set_out_toggle(next_toggle);
   return 0;
 }
@@ -32900,7 +32915,12 @@ fn dwc2_wifi_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) ->
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  // 2026-11-28: toggle from hardware (HCTSIZ.PID after completion), as Linux
+  // dwc2_hcd_save_data_toggle does -- flipping once per transfer was wrong for
+  // multi-packet transfers: a 2-packet WiFi TX frame left the toggle out of step,
+  // so the device silently discarded the NEXT frame (real HW: TLS ServerHello).
+  let hw_pid_t: u32 = (mmio_read_u32(dwc2_hctsiz0_addr()) >> (29 as u32)) & (3 as u32);
+  let next_toggle: u32 = if hw_pid_t == (2 as u32) { 1 as u32 } else { if hw_pid_t == (0 as u32) { 0 as u32 } else { if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 } } };
   if use_ep2 == (1 as u32) {
     let _ = usb_wifi_set_out_toggle2(next_toggle);
   } else {
@@ -36427,7 +36447,12 @@ fn dwc2_bt_bulk_out(devaddr: u32, mps: u32, buf: mut ref i64, out_len: i64) -> i
   if (result & (1 as u32)) == (0 as u32) {
     return 0 - 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  // 2026-11-28: toggle from hardware (HCTSIZ.PID after completion), as Linux
+  // dwc2_hcd_save_data_toggle does -- flipping once per transfer was wrong for
+  // multi-packet transfers: a 2-packet WiFi TX frame left the toggle out of step,
+  // so the device silently discarded the NEXT frame (real HW: TLS ServerHello).
+  let hw_pid_t: u32 = (mmio_read_u32(dwc2_hctsiz0_addr()) >> (29 as u32)) & (3 as u32);
+  let next_toggle: u32 = if hw_pid_t == (2 as u32) { 1 as u32 } else { if hw_pid_t == (0 as u32) { 0 as u32 } else { if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 } } };
   let _ = usb_bt_set_bulk_out_toggle(next_toggle);
   return 0;
 }
@@ -36469,7 +36494,12 @@ fn dwc2_bt_bulk_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len: i64) 
     let _ = buf_write_byte(out_buf, i as u32, b);
     i = i + 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  // 2026-11-28: toggle from hardware (HCTSIZ.PID after completion), as Linux
+  // dwc2_hcd_save_data_toggle does -- flipping once per transfer was wrong for
+  // multi-packet transfers: a 2-packet WiFi TX frame left the toggle out of step,
+  // so the device silently discarded the NEXT frame (real HW: TLS ServerHello).
+  let hw_pid_t: u32 = (mmio_read_u32(dwc2_hctsiz0_addr()) >> (29 as u32)) & (3 as u32);
+  let next_toggle: u32 = if hw_pid_t == (2 as u32) { 1 as u32 } else { if hw_pid_t == (0 as u32) { 0 as u32 } else { if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 } } };
   let _ = usb_bt_set_bulk_in_toggle(next_toggle);
   return actual_len;
 }
@@ -38194,7 +38224,12 @@ fn dwc2_hci_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len:
     let _ = buf_write_byte(out_buf, i as u32, b);
     i = i + 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  // 2026-11-28: toggle from hardware (HCTSIZ.PID after completion), as Linux
+  // dwc2_hcd_save_data_toggle does -- flipping once per transfer was wrong for
+  // multi-packet transfers: a 2-packet WiFi TX frame left the toggle out of step,
+  // so the device silently discarded the NEXT frame (real HW: TLS ServerHello).
+  let hw_pid_t: u32 = (mmio_read_u32(dwc2_hctsiz0_addr()) >> (29 as u32)) & (3 as u32);
+  let next_toggle: u32 = if hw_pid_t == (2 as u32) { 1 as u32 } else { if hw_pid_t == (0 as u32) { 0 as u32 } else { if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 } } };
   let _ = usb_bt_set_intr_in_toggle(next_toggle);
   return actual_len;
 }
@@ -38247,7 +38282,12 @@ fn dwc2_hid_interrupt_in(devaddr: u32, mps: u32, out_buf: mut ref i64, want_len:
     let _ = buf_write_byte(out_buf, i as u32, b);
     i = i + 1;
   }
-  let next_toggle: u32 = if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 };
+  // 2026-11-28: toggle from hardware (HCTSIZ.PID after completion), as Linux
+  // dwc2_hcd_save_data_toggle does -- flipping once per transfer was wrong for
+  // multi-packet transfers: a 2-packet WiFi TX frame left the toggle out of step,
+  // so the device silently discarded the NEXT frame (real HW: TLS ServerHello).
+  let hw_pid_t: u32 = (mmio_read_u32(dwc2_hctsiz0_addr()) >> (29 as u32)) & (3 as u32);
+  let next_toggle: u32 = if hw_pid_t == (2 as u32) { 1 as u32 } else { if hw_pid_t == (0 as u32) { 0 as u32 } else { if toggle == (0 as u32) { 1 as u32 } else { 0 as u32 } } };
   let _ = usb_hid_set_intr_in_toggle(next_toggle);
   return actual_len;
 }
