@@ -187,3 +187,95 @@ command's own reply (prompt or marker) instead of a fixed `SETTLE_S`.
   - **Real-time invariance:** a periodic task's real-time rate is the
     same at a 500 ms and a 1 ms tick. This is the property the three
     earlier attempts broke.
+
+## 8. Privilege model: USR tasks, SVC kernel (added 2026-11-28)
+
+Tasks run in **USR mode**, which is right for isolation. But much
+kernel-side code was written as if it always ran privileged. Three live
+bug classes came from that on 2026-11-27, and all are now fixed:
+
+| Assumption | Reality in USR mode | Fix |
+|---|---|---|
+| `cpsid`/`mrs`-`msr cpsr` brackets give a critical section | `cpsid` is a **silent no-op**: the allocator was not atomic across tasks (and masked IRQ only, not the FIQ tick) | SWI #9/#10 `crit_enter`/`crit_exit` set I+F in the task's saved CPSR; `dhruva_crit_enter/exit` choose direct `cpsid if` when privileged or the SWI from USR (`46c5415`) |
+| A panic or FATAL that spins halts the machine | The scheduler keeps running the other tasks, whose `watchdog_kick()` (74 sites) re-armed it forever | Fatal-halt kick flag (`901fd51`) plus SWI #11 `fatal_halt` (`46c5415`) |
+| CP15 can be written from anywhere | Undefined-instruction trap (the first `cachectl` attempt hung) | SWI #8 (`2b29787`) |
+
+**Rule from here on:** task-reachable code never executes `cps*`,
+`msr cpsr*`, `mcr`/`mrc p15` or privileged MMIO. Privileged operations
+go through the SWI table only. **Enforcement:** extend
+`asm_safety_audit.py`, which already gates every build, to flag those
+instructions in any function reachable from a task entry point, unless
+it is the SWI dispatcher or an exception handler.
+
+## 9. Dynamic tasks (P5, P6), added 2026-11-28
+
+Today there are `MAX_TASKS = 16` fixed slots:
+- 0–5: the built-in tasks;
+- 6–15: given out by `task_create`.
+
+There is **no exit or delete**, so a slot, its stack domain and its
+table entries are used once and never reused. 16 is also the ARMv6 MMU
+**domain** count, and every task gets a private domain (1–15; 0 is the
+kernel) for stack isolation.
+
+### P5: full lifecycle inside the 16 slots
+
+- **Slot states:** FREE → READY ⇄ RUNNING ⇄ SLEEPING/BLOCKED → ZOMBIE →
+  FREE.
+- **Handles:** `task_create(entry, stack_bytes, prio)` returns a
+  **handle**: slot index plus a per-slot generation counter, so a stale
+  handle to a reused slot is rejected (no ABA).
+- **API:** `task_exit(code)`, `task_kill(handle)` (root or owner),
+  `task_join(handle, timeout_us)` (uses P3 events), and
+  `task_stat(handle)`.
+- **What exit releases:**
+  - The domain-window stack: zeroed and its guard page re-armed before
+    reuse.
+  - Every per-task table entry: `eff_prio` sentinel, sleep, heartbeat,
+    deadline, WCET counters, canary, `usr_sp`, SPSR and PC.
+  - Event registrations.
+- **Safety rule:** exiting while holding a mutex or ceiling is a
+  *fault*. Locks are released and the owner is flagged, never silently
+  dropped, and the condition is reported. The built-in tasks (0–5)
+  cannot be killed.
+- **Reaping** runs in the exiting task's own SWI context, with I+F
+  masked, so no half-dead slot is ever scheduled.
+
+### P6: more than 16 tasks
+
+Two independent limits have to go:
+1. **Table sizes.** Every per-task assembly table becomes sized from one
+   `.equ MAX_TASKS`. Hard-coded `#16` loop bounds get audited. Target 64.
+2. **Isolation without one domain per task.** Use ARMv6's split
+   **TTBR0/TTBR1 with ASIDs**, which the ARM1176 supports:
+   - each task gets a small private TTBR0 table for its user region
+     (stack plus private data), tagged with an 8-bit ASID;
+   - the kernel and shared regions live in TTBR1;
+   - a context switch writes TTBR0 and CONTEXTIDR, needing no TLB flush
+     thanks to the ASID tag.
+
+   This is the standard ARMv6 process model and scales to 255 address
+   spaces. Domains then go back to coarse use: kernel, devices, user.
+
+### Picker at N up to 64
+
+The O(N) scan stays correct but grows. Replace it with a **16-bit
+ready-priority bitmap** (`clz` picks the highest ready level in O(1))
+plus a **FIFO ready queue per level**. That keeps round-robin among
+ties, and keeps the ceiling-incumbent tie rule exactly: a
+ceiling-holding incumbent is not rotated to the tail.
+
+### Gates
+
+- **P5:** create, exit, reuse churn of 10,000 cycles with no slot,
+  stack or heap leak (allocation counter flat); a stale handle is
+  rejected; a killed lock holder is detected and reported; phase4 18/18.
+- **P6:** isolation tests (a task cannot read or write another task's
+  stack: data abort), 64-task soak, picker WCET measured at N = 64.
+
+### Updated order
+
+P1 → P2 → P3 → P5 → P4 (tickless) → P6.
+
+P5 needs P3's events for `task_join`. P6 is the largest change and comes
+last, behind a stable P1–P5.
