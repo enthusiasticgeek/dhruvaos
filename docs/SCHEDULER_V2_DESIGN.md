@@ -310,3 +310,28 @@ mutex`), checks the expected detection, and the task exits. So:
 **Gate:** every `fault` injector still reports its detection; phase4
 18/18. The test harness's dependency on demo-task output is removed
 first.
+
+## 10. P1 status and the P2 checklist (2026-11-28)
+
+**P1 batch 1 is done (`9410722`).** These are now stated in real time,
+through `sched_ms_to_ticks` and `task_sleep_ms`:
+- all 9 literal task sleeps;
+- the GC cadence;
+- every heartbeat bound and declared deadline;
+- maintenance staleness;
+- kernel-upload inactivity.
+
+DHCP, TCP retransmit and the `su` lockout were already derived from the
+tick interval. The remaining `scheduler_get_tick_count()` uses are
+timestamps (crash log, management log, diagnostics), the shadow
+predictor, and test-only seeds. None of them is a period or timeout.
+
+**P2 must also rescale these scheduler-internal tick semantics**, found
+in the P1 audit:
+
+| Item | Today | At a 1 ms tick, unless rescaled | Rule |
+|---|---|---|---|
+| `AGING_SHIFT = 4` (context_switch.S) | 16 passed-over ticks earn one priority level of boost: about **8 s** | about **16 ms**, which collapses priority separation | Derive from the tick rate: keep about 8 s per level (shift about 13 at 1 kHz) |
+| `UART_RX_IRQ_BUDGET_PER_TICK` | per-tick byte budget (sporadic server) | 500× more bytes per second | Bytes **per second**, replenished by elapsed µs |
+| `SPN_SHADOW_AGING_SHIFT = 4` | mirrors `AGING_SHIFT` | same | Keep equal to `AGING_SHIFT` (the shadow predictor must match the real picker) |
+| `task_run_ticks_table`, stuck and deadline counters | tick-granular statistics | finer granularity (fine) | Report in ms in `ps` |
