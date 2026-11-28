@@ -14499,6 +14499,15 @@ fn dharafs_gc_erase_range_step(buf: mut ref i64, cursor: i64, target: i64) -> i6
   let budget: i64 = dharafs_compact_blocks_per_call();
   let done: i64 = 0;
   while ((c as u32) < (target as u32)) && (done < budget) {
+    // The bad-block bitmap doubles as the "no record here" cache, and
+    // sdhost_read_block refuses (returns 9) any marked block. Blocks past
+    // the write cursor are old dead records -- often marked -- so the
+    // read-back of a freshly zeroed block was refused EVERY time (real
+    // card: every block from 0xC2 on, so every pass was abandoned and the
+    // log stayed full). The append paths already clear the mark before
+    // writing; erase must too. A clean write + all-zero read-back proves
+    // the block good; one that really fails is re-marked bad below.
+    let _ = dharafs_badblock_clear(c);
     let attempt: i64 = 0;
     let ok: i64 = 0;
     let why: i64 = 0;
