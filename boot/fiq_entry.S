@@ -125,6 +125,40 @@ fiq_entry:
     ldmia sp!, {r0-r7}
     movs pc, lr
 fiq_entry_not_irq_race:
+    /* 2026-11-28: ROOT CAUSE of the long-open "SENTINEL: corrupted resume
+     * state" crash (and the 0xC0C0C0C0 / Thumb-mode jumps). A SWI enters
+     * SVC with IRQs masked but FIQs still enabled until swi_entry's first
+     * instruction (`cpsid f`). A tick landing in that window went down the
+     * normal path below, whose exit (`msr spsr_cxsf` in SVC + `ldm ... ^`)
+     * uses spsr_svc as the return vehicle -- overwriting the in-flight
+     * SWI's spsr_svc (the task's real USER status) with 0x93. swi_entry
+     * then read 0x93 as the caller's mode and the task came back from the
+     * SWI running privileged. Caught on real HW by the lr_capture_ring:
+     * FIQ-from-SVC at the SWI entry, resume at 0x93, then swi_entry's
+     * privileged-SWI guard (caller_cpsr=0x93).
+     * Fix: once the scheduler runs, an FIQ that interrupted SVC code never
+     * enters SVC. Mask FIQ in the interrupted context (exactly what its
+     * next instruction, `cpsid f`, was about to do) and return from FIQ
+     * mode -- spsr_fiq is the vehicle, spsr_svc is untouched. The timer
+     * FIQ stays pending and is taken as soon as the SWI returns to USR.
+     * (Every SVC context with FIQ enabled after scheduler start is that
+     * one-instruction SWI-entry window; all other SVC code runs with FIQ
+     * masked.) */
+    cmp r2, #0x13
+    bne fiq_entry_not_svc
+    ldr r1, =context_switch_count
+    ldr r1, [r1]
+    cmp r1, #0
+    beq fiq_entry_not_svc
+    orr r0, r0, #0x40
+    msr spsr_cxsf, r0              /* spsr_fiq: interrupted SVC context, F now masked */
+    ldr r1, =sched_svc_preempt_deferred_count
+    ldr r2, [r1]
+    add r2, r2, #1
+    str r2, [r1]
+    ldmia sp!, {r0-r7}
+    movs pc, lr                    /* back to the SWI entry, in SVC, F masked */
+fiq_entry_not_svc:
     mov r1, lr                        /* r1 = resume pc -- same reasoning,
                                         * r1's real value already staged */
     stmdb sp!, {r0, r1}                /* staged block, low-to-high in
@@ -280,7 +314,7 @@ fiq_entry_true_lr_done:
      * investigation is chasing (those ARE written, correctly offset,
      * on every save -- verified line-by-line against this exact
      * layout) -- a real, separate, now-fixed gap found along the way. */
-    mov r4, #0
+    mov r4, #0xF1                     /* builder tag 0xF1 (FIQ) */
     str r4, [r3, #4]                  /* F+4 = pad (deterministic 0, not
                                         * stale leftover stack content) */
     ldr r4, [r0], #4                  /* staged resume_pc */

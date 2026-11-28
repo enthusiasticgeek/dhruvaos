@@ -1967,8 +1967,9 @@ task_sleep_ticks_impl:
      * live state at all. */
     mov r2, #0xD3
     str r2, [sp, #0]                 /* spsr */
-    mov r3, #0
+    mov r3, #0x51                    /* pad = builder tag 0x51 (sleep) */
     str r3, [sp, #4]                 /* pad */
+    mov r3, #0
 
     mov r4, sp                      /* r4 = this context's sp */
     ldr r5, =current_task
@@ -2327,6 +2328,29 @@ sched_diag_put_hex32_loop:
  * either way. */
 .global resume_pc_sentinel_check
 resume_pc_sentinel_check:
+    /* 2026-11-28: mode/PC consistency at EVERY task resume (all five
+     * restore sites call this with r0 = resume pc, r1 = true lr, spsr =
+     * the status about to be restored, [sp, #-4] = the frame's pad word =
+     * its builder's tag). After the scheduler starts, a non-USR frame may
+     * only resume inside swi_entry.S's handlers (the blocking _impl
+     * routines are reached by `bl` from swi_do_*). Anything else is the
+     * corrupted-resume bug: report which builder made the frame. */
+    ldr r12, [sp, #-4]
+    mrs r2, spsr
+    and r3, r2, #0x1F
+    cmp r3, #0x10
+    beq resume_mode_ok
+    ldr r3, =context_switch_count
+    ldr r3, [r3]
+    cmp r3, #0
+    beq resume_mode_ok
+    ldr r3, =swi_entry
+    cmp r0, r3
+    blo resume_mode_bad
+    ldr r3, =swi_handlers_end
+    cmp r0, r3
+    bhs resume_mode_bad
+resume_mode_ok:
     push {r2, r3}
     push {r4, r5, r6, r7}
     /* DIAGNOSTIC (2026-10-22, true_lr=0 investigation, round 3): the
@@ -2356,7 +2380,7 @@ resume_pc_sentinel_check:
     add r6, r6, r5
     mov r7, #9
     str r7, [r6, #0]
-    str r1, [r6, #4]
+    str r2, [r6, #4]                /* 2026-11-28: the spsr being restored (was true_lr) */
     str r0, [r6, #8]
     ldr r7, =0x20003004
     ldr r7, [r7]
@@ -2862,8 +2886,9 @@ dml_contended:
      * window, so it carries the identical race exposure. */
     mov r4, #0xD3
     str r4, [sp, #0]                  /* spsr */
-    mov r5, #0
+    mov r5, #0x4D                     /* pad = builder tag 0x4D (mutex wait) */
     str r5, [sp, #4]                  /* pad */
+    mov r5, #0
     mov r4, sp                       /* r4 = frame base */
     mov r5, #0
     str r5, [r4, #8]                 /* patch saved r0 -> 0 (this call's
@@ -3680,8 +3705,9 @@ prepare_stack_common_usr:
     mov r2, #0x10          /* spsr = USR mode -- the one difference from
                              * prepare_stack_common's own 0x13 */
     str r2, [r0, #0]       /* spsr */
-    mov r2, #0
+    mov r2, #0x1A          /* pad = builder tag 0x1A (task init) */
     str r2, [r0, #4]       /* pad */
+    mov r2, #0
     str r2, [r0, #8]       /* r0 */
     str r2, [r0, #12]      /* r1 */
     str r2, [r0, #16]      /* r2 */
@@ -3964,8 +3990,9 @@ prepare_stack_common:
     sub r0, r0, #68
     mov r2, #0x13
     str r2, [r0, #0]       /* spsr */
-    mov r2, #0
+    mov r2, #0x1A          /* pad = builder tag 0x1A (task init) */
     str r2, [r0, #4]       /* pad */
+    mov r2, #0
     str r2, [r0, #8]       /* r0 */
     str r2, [r0, #12]      /* r1 */
     str r2, [r0, #16]      /* r2 */

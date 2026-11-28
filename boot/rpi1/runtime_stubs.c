@@ -957,3 +957,19 @@ static volatile unsigned int dharafs_compact_clean_valid_v = 0;
 long dharafs_compact_clean_seq_get(void) { return (long)dharafs_compact_clean_seq_v; }
 long dharafs_compact_clean_valid_get(void) { return (long)dharafs_compact_clean_valid_v; }
 long dharafs_compact_clean_mark(long seq) { dharafs_compact_clean_seq_v = (unsigned int)seq; dharafs_compact_clean_valid_v = 1; return 0; }
+
+/* 2026-11-28: work deferred until the DharaFS background recovery scan
+ * completes (lookups during the scan can return a false "not found"). */
+static volatile unsigned int post_recovery_pending_v = 0;
+long post_recovery_pending_get(void) { return (long)post_recovery_pending_v; }
+long post_recovery_pending_set(long v) { post_recovery_pending_v = (unsigned int)v; return 0; }
+
+/* 2026-11-28: governor utilization window (idle-task run ticks + tick). */
+static volatile unsigned int gov_util_idle_v = 0, gov_util_tick_v = 0, gov_util_valid_v = 0;
+long gov_util_idle_get(void) { return (long)gov_util_idle_v; }
+long gov_util_tick_get(void) { return (long)gov_util_tick_v; }
+long gov_util_valid_get(void) { return (long)gov_util_valid_v; }
+long gov_util_mark(long idle, long tick) { gov_util_idle_v = (unsigned int)idle; gov_util_tick_v = (unsigned int)tick; gov_util_valid_v = 1; return 0; }
+static volatile unsigned int gov_util_busy_pct_v = 0;
+long gov_util_busy_pct_get(void) { return (long)gov_util_busy_pct_v; }
+long gov_util_busy_pct_set(long v) { gov_util_busy_pct_v = (unsigned int)v; return 0; }

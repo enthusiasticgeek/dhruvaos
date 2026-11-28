@@ -3689,6 +3689,14 @@ extern "C" fn wifi_pw_loaded_set(v: u32) -> i64;
 extern "C" fn kuprof_add(i: u32, v: u32) -> i64;
 extern "C" fn kuprof_get(i: u32) -> u32;
 extern "C" fn kuprof_reset() -> i64;
+extern "C" fn gov_util_idle_get() -> u32;
+extern "C" fn gov_util_tick_get() -> u32;
+extern "C" fn gov_util_valid_get() -> u32;
+extern "C" fn gov_util_mark(idle: u32, tick: u32) -> i64;
+extern "C" fn gov_util_busy_pct_get() -> u32;
+extern "C" fn gov_util_busy_pct_set(v: u32) -> i64;
+extern "C" fn post_recovery_pending_get() -> u32;
+extern "C" fn post_recovery_pending_set(v: u32) -> i64;
 extern "C" fn sched_svc_preempt_deferred_count_get() -> u32;
 extern "C" fn dharafs_compact_clean_seq_get() -> u32;
 extern "C" fn dharafs_compact_clean_valid_get() -> u32;
@@ -13059,7 +13067,9 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
     let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
     let _ = buf_write_u32(buf, 0 as u32, checksum);
 
+    let at0: u32 = mmio_read_u32(TIMER_CLO);
     let wr_status: i64 = dharafs_block_write(next_block as i64, buf);
+    let at1: u32 = mmio_read_u32(TIMER_CLO);
     if wr_status != 0 {
       return 1;
     }
@@ -13069,13 +13079,27 @@ fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i6
     // at the time; it just received real, verified-written data, so
     // any such mark no longer applies.
     let _ = dharafs_badblock_clear(next_block as i64);
+    let at2: u32 = mmio_read_u32(TIMER_CLO);
 
     let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
     // Three-tier recovery plan, Tier 2 (2026-10-31): see dharafs_write_
     // cursor_persist_fast's own header comment. Reuses `buf` (the just-
     // completed real write no longer needs its content).
     let _ = dharafs_write_cursor_persist_fast(buf, next_block + (1 as u32), next_seq + (1 as u32));
+    let at3: u32 = mmio_read_u32(TIMER_CLO);
     let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, next_block as i64);
+    let at4: u32 = mmio_read_u32(TIMER_CLO);
+    if wrapping_sub(at4, at0) > (100000 as u32) {
+      let _ = uart_puts("DharaFS DIAG: slow append us: block_write=");
+      let _ = uart_put_i64(wrapping_sub(at1, at0) as i64);
+      let _ = uart_puts(" badblock_clear=");
+      let _ = uart_put_i64(wrapping_sub(at2, at1) as i64);
+      let _ = uart_puts(" cursor_persist=");
+      let _ = uart_put_i64(wrapping_sub(at3, at2) as i64);
+      let _ = uart_puts(" dirindex_upsert=");
+      let _ = uart_put_i64(wrapping_sub(at4, at3) as i64);
+      let _ = uart_puts("\n");
+    }
     return 0;
   }
 
@@ -16802,7 +16826,12 @@ fn crashlog_record_crash(crash_type: u32, fault_addr: u32, status: u32, pc: u32,
 // #[no_heap] needed), but built from the exact same primitives for
 // consistency.
 fn crashlog_boot_increment() -> i64 {
+  let cb0: u32 = mmio_read_u32(TIMER_CLO);
   let _ = crashlog_read_meta();
+  let cb1: u32 = mmio_read_u32(TIMER_CLO);
+  let _ = uart_puts("BOOT DIAG: crashlog read_meta us=");
+  let _ = uart_put_i64(wrapping_sub(cb1, cb0) as i64);
+  let _ = uart_puts("\n");
   let meta: mut ref i64 = crashlog_meta_scratch_get();
   let count: u32 = buf_read_u32(meta, 0 as u32);
   let boot_count: u32 = buf_read_u32(meta, 4 as u32);
@@ -41320,7 +41349,28 @@ fn governor_step() -> i64 {
   let h1: i64 = governor_history_get1();
   let h2: i64 = governor_history_get2();
   let h3: i64 = governor_history_get3();
-  let desired: i64 = governor_desired_freq_mhz_v2(h0, h1, h2, h3);
+  let desired_by_queue: i64 = governor_desired_freq_mhz_v2(h0, h1, h2, h3);
+  // 2026-11-28: utilization, not just run-queue depth. One CPU-bound task
+  // (e.g. a WiFi kernel upload doing TLS + CCMP) reads ready_count == 1
+  // forever and was held at 250 MHz -- the lowest step -- for the whole
+  // transfer. busy% = 1 - idle task's (task_d, index 3) share of the
+  // ticks since the last 4-tick window.
+  let now_tick: u32 = scheduler_get_tick_count();
+  let idle_ticks: u32 = task_run_ticks_get_at(3 as u32);
+  if gov_util_valid_get() == (0 as u32) {
+    let _ = gov_util_mark(idle_ticks, now_tick);
+  } else {
+    let dt: u32 = wrapping_sub(now_tick, gov_util_tick_get());
+    if dt >= (4 as u32) {
+      let di: u32 = wrapping_sub(idle_ticks, gov_util_idle_get());
+      let idle_pct: u32 = if di >= dt { 100 as u32 } else { (di * (100 as u32)) / dt };
+      let _ = gov_util_busy_pct_set((100 as u32) - idle_pct);
+      let _ = gov_util_mark(idle_ticks, now_tick);
+    }
+  }
+  let busy_pct: i64 = gov_util_busy_pct_get() as i64;
+  let desired_by_util: i64 = if busy_pct >= 75 { governor_freq_high() } else { if busy_pct >= 40 { governor_freq_mid() } else { governor_freq_low() } };
+  let desired: i64 = if desired_by_util > desired_by_queue { desired_by_util } else { desired_by_queue };
   let last: i64 = governor_get_last_applied_mhz();
   if desired != last {
     let status: i64 = governor_apply_freq_mhz(desired);
@@ -41885,6 +41935,14 @@ fn task_e() -> i64 {
       let _ = dharafs_print_data(gc_buf, gc_mode_len);
       let _ = uart_puts("\"\n");
     }
+    }
+    // Deferred boot work, the same iteration the recovery scan completes
+    // (also covers a scan that finished before this task first ran).
+    if (post_recovery_pending_get() == (1 as u32)) && (dharafs_recovery_active_get() == (0 as u32)) {
+      let _ = post_recovery_pending_set(0 as u32);
+      let _ = crashlog_boot_increment();
+      let _ = log_level_init();        // re-read: the boot-time read may have missed
+      let _ = kernlog_config_init();
     }
     let gc_dharafs_t1: u32 = mmio_read_u32(TIMER_CLO);
     let _ = dhruva_prio_unlock(3);
@@ -45233,8 +45291,8 @@ fn kernelupload_net_inner(line_buf: mut ref i64, port: u32) -> i64 {
   let _ = uart_puts(" us)\n");
   let _ = uart_puts("kernelupload net profile:");
   let pk: u32 = 0 as u32;
-  while pk < (9 as u32) {
-    let _ = uart_puts(if pk == (0 as u32) { " rx_frame_us=" } else { if pk == (1 as u32) { " rx_empty_us=" } else { if pk == (2 as u32) { " frames=" } else { if pk == (3 as u32) { " empty_polls=" } else { if pk == (4 as u32) { " tcp_us=" } else { if pk == (5 as u32) { " ooo_dropped=" } else { if pk == (6 as u32) { " decrypt_us=" } else { if pk == (7 as u32) { " records=" } else { " data_segs=" } } } } } } } });
+  while pk < (12 as u32) {
+    let _ = uart_puts(if pk == (0 as u32) { " rx_frame_us=" } else { if pk == (1 as u32) { " rx_empty_us=" } else { if pk == (2 as u32) { " frames=" } else { if pk == (3 as u32) { " empty_polls=" } else { if pk == (4 as u32) { " tcp_us=" } else { if pk == (5 as u32) { " ooo_dropped=" } else { if pk == (6 as u32) { " decrypt_us=" } else { if pk == (7 as u32) { " records=" } else { if pk == (8 as u32) { " data_segs=" } else { if pk == (9 as u32) { " tx_ccmp_us=" } else { if pk == (10 as u32) { " tx_usb_us=" } else { " tx_frames=" } } } } } } } } } } });
     let _ = uart_put_i64(kuprof_get(pk) as i64);
     pk = pk + (1 as u32);
   }
@@ -49289,6 +49347,10 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("  uptime_ticks: ");
     let _ = uart_put_i64(ticks as i64);
     let _ = uart_puts("\n");
+    let _ = crashlog_read_meta();
+    let _ = uart_puts("  boot_count: ");
+    let _ = uart_put_i64(buf_read_u32(crashlog_meta_scratch_get(), 4 as u32) as i64);
+    let _ = uart_puts(if post_recovery_pending_get() == (1 as u32) { " (this boot's increment pending: recovery scan running)\n" } else { "\n" });
     let _ = uart_puts("  svc_preempt_deferred: ");   // ticks that landed in kernel code (switch deferred)
     let _ = uart_put_i64(sched_svc_preempt_deferred_count_get() as i64);
     let _ = uart_puts("\n");
@@ -49316,7 +49378,9 @@ fn shell_dispatch() -> i64 {
     let cur_mhz: i64 = governor_get_last_applied_mhz();
     let _ = uart_puts("  cpu freq: ");
     let _ = uart_put_i64(cur_mhz);
-    let _ = uart_puts(" MHz (recent history: ");
+    let _ = uart_puts(" MHz (cpu busy ");
+    let _ = uart_put_i64(gov_util_busy_pct_get() as i64);
+    let _ = uart_puts("%; recent history: ");
     let _ = uart_put_i64(governor_history_get0());
     let _ = uart_puts(", ");
     let _ = uart_put_i64(governor_history_get1());
@@ -51877,42 +51941,61 @@ fn pbkdf2_hmac_sha256(password: mut ref i64, password_len: i64, salt: mut ref i6
     i = i + 1;
   }
 
+  // 2026-11-28: iterations 2..n with the HMAC key pads hashed ONCE (the
+  // standard PBKDF2 optimization: RFC 2104 HMAC state reuse). Was a full
+  // hmac_sha256 per iteration -- 4 SHA-256 compressions plus ~800 byte-copy
+  // calls each; now 2 compressions on local arrays. Output is bit-identical
+  // (pbkdf2_hmac_sha256_self_test's RFC 7914 vectors, 1/2/4096 iterations).
+  // Real HW: this derivation (10,000 iterations) cost 2.36 s of every boot.
+  let pads: [u8; 256] = zero256_bytes();
+  let pk: i64 = 0;
+  let keylen_eff: i64 = if password_len > 64 { 32 } else { password_len };
+  if password_len > 64 {
+    let kh: mut ref i64 = hmac_key_block_ptr();
+    let _ = sha256_hash(password, password_len, kh);
+    while pk < 32 { pads[pk] = buf_read_byte(kh, pk as u32) as u8; pk = pk + 1; }
+  } else {
+    while pk < password_len { pads[pk] = buf_read_byte(password, pk as u32) as u8; pk = pk + 1; }
+  }
+  let keyb: [u8; 64] = [0 as u8; 64];
+  pk = 0;
+  while pk < 64 { keyb[pk] = if pk < keylen_eff { pads[pk] } else { 0 as u8 }; pk = pk + 1; }
+  pk = 0;
+  while pk < 64 { pads[pk] = keyb[pk] ^ (0x36 as u8); pk = pk + 1; }
+  let c0: Sha256Ctx = sha256_init();
+  let ctx_in: Sha256Ctx = sha256_update(ref c0, mut ref pads, 64);
+  pk = 0;
+  while pk < 64 { pads[pk] = keyb[pk] ^ (0x5c as u8); pk = pk + 1; }
+  let c1: Sha256Ctx = sha256_init();
+  let ctx_out: Sha256Ctx = sha256_update(ref c1, mut ref pads, 64);
+  let ucur: [u8; 32] = [0 as u8; 32];
+  let tacc: [u8; 32] = [0 as u8; 32];
+  pk = 0;
+  while pk < 32 { ucur[pk] = buf_read_byte(u, pk as u32) as u8; tacc[pk] = buf_read_byte(t, pk as u32) as u8; pk = pk + 1; }
+  let blk: [u8; 256] = zero256_bytes();
   let iter: i64 = 1;
   while iter < iterations {
-    // TASK #353 REAL-HW FOLLOW-UP #7 (2026-10-16): root cause of the
-    // real watchdog boot loop that widening watchdog_kick()'s own
-    // window (follow-up #6) did NOT fix -- this is dharafs_crypto_
-    // key_init()'s own PBKDF2-HMAC-SHA256 call, 10000 iterations,
-    // ONE tight loop with no return to any caller (hence no caller-
-    // side kick, at any window size) until all 10000 complete. Every
-    // PRIOR gap this investigation found was "a real phase slower
-    // than assumed" (fixable by widening the window or kicking
-    // between operations); this one is qualitatively different --
-    // no amount of window-widening helps a single uninterrupted loop.
-    // Kicked every 500 iterations (20 kicks across the full run),
-    // matching the exact pattern already proven for dharafs_init's
-    // own scan loop and sdhost_read_block/write_block's retry loops.
     if hardware_is_real_hw_get() == (1 as u32) {
       if (iter % (500 as i64)) == 0 {
         let _ = watchdog_kick();
       }
     }
-    // Safe to alias msg==out==u here: hmac_sha256 fully copies msg into
-    // its own persistent scratch before it ever writes a single byte
-    // of `out` (see its own body -- the msg copy loop runs to
-    // completion, THEN sha256_hash writes into `out` only at its very
-    // end), so U_i overwriting the U_{i-1} it was computed from is not
-    // a read-after-write hazard.
-    let _ = hmac_sha256(password, password_len, u, 32, u);
-    let j: i64 = 0;
-    while j < 32 {
-      let tb: u32 = buf_read_byte(t, j as u32);
-      let ub: u32 = buf_read_byte(u, j as u32);
-      let _ = buf_write_byte(t, j as u32, tb ^ ub);
-      j = j + 1;
-    }
+    let q: i64 = 0;
+    while q < 32 { blk[q] = ucur[q]; q = q + 1; }
+    let ci: Sha256Ctx = ctx_in;
+    let ci2: Sha256Ctx = sha256_update(ref ci, mut ref blk, 32);
+    let inner: [u8; 32] = sha256_finalize(ref ci2);
+    q = 0;
+    while q < 32 { blk[q] = inner[q]; q = q + 1; }
+    let co: Sha256Ctx = ctx_out;
+    let co2: Sha256Ctx = sha256_update(ref co, mut ref blk, 32);
+    ucur = sha256_finalize(ref co2);
+    q = 0;
+    while q < 32 { tacc[q] = tacc[q] ^ ucur[q]; q = q + 1; }
     iter = iter + 1;
   }
+  pk = 0;
+  while pk < 32 { let _ = buf_write_byte(t, pk as u32, tacc[pk] as u32); pk = pk + 1; }
 
   i = 0;
   while i < 32 {
@@ -56774,7 +56857,15 @@ fn wifi_link_parse_mpdu(link: mut ref i64, frame: mut ref i64, frame_len: i64, e
   // our AP to us ends the association.
   if ftype == (0 as u32) {
     let st: u32 = fc0 & (0xf0 as u32);
-    if ((st == (0xc0 as u32)) || (st == (0xa0 as u32))) && (a1_is_us == 1) && (a2_is_bssid == 1) { return 0 - 2; }
+    if ((st == (0xc0 as u32)) || (st == (0xa0 as u32))) && (a1_is_us == 1) && (a2_is_bssid == 1) {
+      // 2026-11-28: log WHY the AP dropped us (802.11 reason code, the
+      // 2 bytes after the 24-byte header): 4 = inactivity, 15 = 4-way
+      // handshake timeout, 16 = group-key (GTK rekey) handshake timeout.
+      let _ = uart_puts(if st == (0xc0 as u32) { "wifi: AP sent DEAUTH, reason=" } else { "wifi: AP sent DISASSOC, reason=" });
+      let _ = uart_put_i64((if frame_len >= 26 { buf_read_u16_le(frame, 24 as u32) } else { 0 as u32 }) as i64);
+      let _ = uart_puts("\n");
+      return 0 - 2;
+    }
     return 0 - 1;
   }
   if ftype != (2 as u32) { return 0 - 1; }
@@ -56901,12 +56992,17 @@ fn wifi_link_send_eth(eth: mut ref i64, eth_len: i64) -> i64 {
   let link: mut ref i64 = wifi_link_state_scratch_get();
   let frame: mut ref i64 = wifi_link_tx_frame_scratch_get();
   let seq: i64 = buf_read_u16_le(link, WIFI_LINK_TX_SEQ_OFF) as i64;
-  let mpdu_len: i64 = wifi_link_build_mpdu(link, eth, eth_len, frame);
+  let pw0: u32 = mmio_read_u32(TIMER_CLO);
+  let mpdu_len: i64 = wifi_link_build_mpdu(link, eth, eth_len, frame);   // 802.11 header + software CCMP
+  let pw1: u32 = mmio_read_u32(TIMER_CLO);
+  let _ = kuprof_add(9 as u32, wrapping_sub(pw1, pw0));    // TX build + CCMP encrypt
   if mpdu_len < 0 { return 0 - 1; }
   // is_broadcast=0 even for a broadcast Ethernet destination: in an
   // infrastructure BSS every STA->AP frame is unicast to the AP at the
   // MAC layer (A1=BSSID), so it must be ACKed/retried like one.
   let st: i64 = wifi_radio_tx_frame(wifi_radio_get_devaddr(), wifi_radio_get_mps_out(), frame, mpdu_len, 0, seq);
+  let _ = kuprof_add(10 as u32, wrapping_sub(mmio_read_u32(TIMER_CLO), pw1));   // TX descriptor + USB bulk OUT
+  let _ = kuprof_add(11 as u32, 1 as u32);                                       // TX frames
   if st != 0 { return 0 - 1; }
   return 0;
 }
@@ -63518,7 +63614,9 @@ fn tlsd_load_identity() -> i64 {
   let _ = ed25519_secret_to_public_heap(tlsd_s(TS_ID_SEED), tlsd_s(TS_ID_PUB));
   let cl: i64 = dharafs_read("/config/tlsd.crt", tlsd_p(TLSD_CERT_OFF));
   if (cl <= 0) || (cl > TLSD_CERT_CAP) {
-    let _ = uart_puts("tlsd: no certificate at /config/tlsd.crt (provision with tlsd certbegin/certchunk/certend)\n");
+    let _ = uart_puts("tlsd: no certificate at /config/tlsd.crt (read returned ");
+    let _ = uart_put_i64(cl);
+    let _ = uart_puts("; provision with tlsd certbegin/certchunk/certend)\n");
     return 0 - 1;
   }
   let _ = tlsd_st_set(TST_CERT_LEN, cl);
@@ -66536,7 +66634,16 @@ fn kernel_main() -> i64 {
   let t8_4: u32 = mmio_read_u32(TIMER_CLO);
   let _ = dhdl_init();
   let t8_5: u32 = mmio_read_u32(TIMER_CLO);
-  let _ = crashlog_boot_increment();
+  // 2026-11-28: while the background recovery scan runs, a lookup for a
+  // path not yet indexed returns "not found" -- so the boot counter read
+  // 0 and wrote 1 on EVERY such boot (real HW: every crash record said
+  // "boot 1"), and /config/loglevel etc. were silently ignored. Defer to
+  // the first task_e pass after the scan completes; immediate otherwise.
+  if dharafs_recovery_active_get() == (1 as u32) {
+    let _ = post_recovery_pending_set(1 as u32);
+  } else {
+    let _ = crashlog_boot_increment();
+  }
   let t8_6: u32 = mmio_read_u32(TIMER_CLO);
   let _ = uart_puts("BOOT DIAG: 8->9 split us:");
   let _ = uart_puts(" log_level=");

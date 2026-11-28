@@ -150,6 +150,10 @@ swi_entry:
     cmp r9, #0
     bne swi_from_privileged       /* before the scheduler starts: allowed */
 swi_entry_from_usr:
+    ldr r8, =current_task
+    ldr r8, [r8]
+    ldr r9, =swi_last_num_table
+    str r7, [r9, r8, lsl #2]      /* this task's in-flight syscall number */
 
     ldr r8, =current_task
     ldr r8, [r8]
@@ -496,6 +500,16 @@ swi_return_skip_usr_sp_restore:
 
     ldr r3, =usr_resume_spsr_table
     ldr r3, [r3, r2, lsl #2]
+    /* 2026-11-28: a SWI must return to USR mode. Catch the SWI whose
+     * return would put a task into a privileged mode. */
+    and r12, r3, #0x1F
+    cmp r12, #0x10
+    beq swi_return_mode_ok
+    ldr r12, =context_switch_count
+    ldr r12, [r12]
+    cmp r12, #0
+    bne swi_return_bad_mode
+swi_return_mode_ok:
     msr spsr_cxsf, r3
 
     /* Task #253 Phase 3 bug investigation continued (2026-09-19):
@@ -578,6 +592,108 @@ swi_return_diag_skip:
     ldr r3, =usr_resume_pc_table
     ldr lr, [r3, r2, lsl #2]
     movs pc, lr
+.global swi_handlers_end
+swi_handlers_end:
+
+/* Reached from resume_pc_sentinel_check: r0 = resume pc, r1 = true lr,
+ * r2 = spsr being restored, r12 = frame builder tag, sp = frame (r0 slot). */
+/* r2 = current_task, r3 = the spsr about to be restored */
+swi_return_bad_mode:
+    cpsid if
+    ldr r9, =swi_priv_regs
+    str r2, [r9, #0]
+    str r3, [r9, #4]
+    ldr r10, =usr_resume_pc_table
+    ldr r10, [r10, r2, lsl #2]
+    str r10, [r9, #8]
+    ldr r10, =swi_last_num_table
+    ldr r10, [r10, r2, lsl #2]
+    str r10, [r9, #12]
+    str lr, [r9, #16]
+    ldr r4, =srb_msg1
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #0]
+    bl swi_priv_hex32
+    ldr r4, =srb_msg2
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #12]
+    bl swi_priv_hex32
+    ldr r4, =srb_msg3
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #4]
+    bl swi_priv_hex32
+    ldr r4, =srb_msg4
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #8]
+    bl swi_priv_hex32
+    ldr r4, =srb_msg5
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #16]
+    bl swi_priv_hex32
+    ldr r4, =swi_priv_msg5
+    bl swi_priv_puts
+    bl dhruva_panic_watchdog_arm_public
+srb_spin:
+    b srb_spin
+
+.global resume_mode_bad
+resume_mode_bad:
+    cpsid if
+    ldr r9, =swi_priv_regs
+    stmia r9, {r0, r1, r2, r12}
+    mov r11, sp
+    ldr r4, =rmb_msg1
+    bl swi_priv_puts
+    ldr r6, =current_task
+    ldr r6, [r6]
+    bl swi_priv_hex32
+    ldr r4, =rmb_msg2
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #8]
+    bl swi_priv_hex32
+    ldr r4, =rmb_msg3
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #0]
+    bl swi_priv_hex32
+    ldr r4, =rmb_msg4
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #12]
+    bl swi_priv_hex32
+    ldr r4, =rmb_msg5
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #4]
+    bl swi_priv_hex32
+    ldr r4, =swi_priv_msg6
+    bl swi_priv_puts
+    mov r6, r11
+    bl swi_priv_hex32
+    ldr r4, =rmb_msg6
+    bl swi_priv_puts
+    mov r8, #0
+rmb_frame_loop:
+    cmp r8, #15
+    bge rmb_frame_done
+    ldr r6, [r11, r8, lsl #2]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    add r8, r8, #1
+    b rmb_frame_loop
+rmb_frame_done:
+    ldr r4, =swi_priv_msg5
+    bl swi_priv_puts
+    bl dhruva_panic_watchdog_arm_public
+rmb_spin:
+    b rmb_spin
 
 /* Trampolines -- RE-WIRED into the live call graph as of 2026-09-19
  * (task #253 Phase 3 continued): these now carry the real, plain
@@ -769,6 +885,10 @@ dhruva_swi_crit_exit:
 
 swi_from_privileged:
     cpsid if
+    /* save the caller's registers first: r4 = the SWI wrapper's own caller
+     * (dhruva_mutex_lock & co. keep lr in r4 across the svc) */
+    ldr r9, =swi_priv_regs
+    stmia r9, {r0-r4, r12}
     /* Polled PL011 output only: interrupts are masked, so the TX ring
      * (sched_diag_putc) would never drain -- the first real-HW hit printed
      * 16 characters before the watchdog reset. r4 = string, r6 = value. */
@@ -789,6 +909,36 @@ swi_from_privileged:
     ldr r6, =current_task
     ldr r6, [r6]
     bl swi_priv_hex32
+    ldr r4, =swi_priv_msg8
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #16]
+    bl swi_priv_hex32
+    ldr r4, =swi_priv_msg9
+    bl swi_priv_puts
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #0]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #4]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #8]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #12]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    ldr r8, =swi_priv_regs
+    ldr r6, [r8, #20]
+    bl swi_priv_hex32
     ldr r4, =swi_priv_msg6
     bl swi_priv_puts
     mov r6, sp
@@ -808,6 +958,43 @@ swi_priv_stack_loop:
     add r8, r8, #1
     b swi_priv_stack_loop
 swi_priv_stack_done:
+    ldr r4, =swi_priv_msg10
+    bl swi_priv_puts
+    ldr r8, =lr_capture_ring_idx
+    ldr r8, [r8]
+    mov r11, #0
+swi_priv_ring_loop:
+    cmp r11, #16
+    bge swi_priv_ring_done
+    add r9, r8, r11
+    and r9, r9, #15
+    mov r10, #20
+    mul r9, r10, r9
+    ldr r10, =lr_capture_ring
+    add r5, r10, r9
+    mov r0, #10
+    bl swi_priv_putc
+    ldr r6, [r5, #0]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    ldr r6, [r5, #4]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    ldr r6, [r5, #8]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    ldr r6, [r5, #12]
+    bl swi_priv_hex32
+    mov r0, #' '
+    bl swi_priv_putc
+    ldr r6, [r5, #16]
+    bl swi_priv_hex32
+    add r11, r11, #1
+    b swi_priv_ring_loop
+swi_priv_ring_done:
     ldr r4, =swi_priv_msg5
     bl swi_priv_puts
     bl dhruva_panic_watchdog_arm_public
@@ -881,3 +1068,24 @@ swi_priv_msg4: .asciz " current_task=0x"
 swi_priv_msg5: .asciz "\n -- halting (watchdog armed)\n"
 swi_priv_msg6: .asciz " sp_svc=0x"
 swi_priv_msg7: .asciz "\n svc_stack[0..23]: "
+swi_priv_msg8: .asciz "\n wrapper_caller(r4)=0x"
+swi_priv_msg9: .asciz " r0-r3,r12="
+swi_priv_msg10: .asciz "\n event ring (tag value pc/spsr time task), oldest first:"
+srb_msg1: .asciz "\nFATAL: SWI returning to a privileged mode -- task=0x"
+srb_msg2: .asciz " syscall=0x"
+srb_msg3: .asciz " table_spsr=0x"
+srb_msg4: .asciz " table_pc=0x"
+srb_msg5: .asciz " (handler lr=0x"
+rmb_msg1: .asciz "\nFATAL: corrupt resume -- task=0x"
+rmb_msg2: .asciz " restoring cpsr=0x"
+rmb_msg3: .asciz " at pc=0x"
+rmb_msg4: .asciz " (frame builder tag=0x"
+rmb_msg5: .asciz "; 51=sleep 4D=mutex-wait 1A=task-init F1=FIQ, other=IRQ) true_lr=0x"
+rmb_msg6: .asciz "\n frame r0..r12,lr,pc: "
+
+.section ".bss"
+.align 2
+swi_priv_regs: .space 24
+.align 2
+.global swi_last_num_table
+swi_last_num_table: .space 64
