@@ -2455,7 +2455,7 @@ resume_pc_sentinel_dump_done:
      * r1=high, MUST be explicit per this file's own repeated history
      * of silent register-pairing bugs on this exact pattern), r2=buf. */
     mov r2, r10
-    ldr r0, =8226
+    ldr r0, =9842     /* 2026-11-27: was 8226, inside critical config copy A */
     mov r1, #0
     bl sdhost_write_block_once
     /* DIAGNOSTIC (2026-10-22, true_lr=0 investigation): dump the
@@ -2517,7 +2517,7 @@ resume_pc_sentinel_ring_dump_loop:
     b resume_pc_sentinel_ring_dump_loop
 resume_pc_sentinel_ring_dump_done:
     mov r2, r10
-    ldr r0, =8227
+    ldr r0, =9843     /* 2026-11-27: was 8227, inside critical config copy A */
     mov r1, #0
     bl sdhost_write_block_once
 resume_pc_sentinel_halt:

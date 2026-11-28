@@ -55,22 +55,19 @@
  * project's AAPCS callee-saved-register bug class) -- path bytes use
  * combined_index = slot*32 + byte_offset. */
 
-.section ".bss"
-.align 4
-dirindex_valid:
-    .space 1024  /* 256 words */
-dirindex_hash:
-    .space 1024
-dirindex_pathlen:
-    .space 1024
-dirindex_block:
-    .space 1024
-dirindex_last_used:
-    .space 1024  /* 256 words -- dirindex_clock tick stamped on every
-                  * hit or insert; the eviction victim on a full table
-                  * is whichever slot has the smallest value here. */
-dirindex_path_bytes:
-    .space 8192  /* 256 slots * 32 bytes max path each, byte-addressed */
+/* 2026-11-27 PERFORMANCE: 16384 slots (was 256), moved out of .bss into
+ * RAM section 6 (0x00600000-0x006FFFFF: mapped read-write by mmu_init's
+ * sections 6-9 loop, never used by the linked image -- link.ld asserts
+ * everything writable ends below 0x00600000 -- nor by stage0, which loads
+ * the kernel at 0x00200000). 832 KB total, ending at 0x006D0000. Not
+ * zero-initialised by the runtime: dharafs_dirindex_reset clears every
+ * slot's valid word (and dharafs_init always calls it first). */
+.equ dirindex_valid,      0x00600000   /* 16384 words */
+.equ dirindex_hash,       0x00610000   /* 16384 words */
+.equ dirindex_pathlen,    0x00620000   /* 16384 words */
+.equ dirindex_block,      0x00630000   /* 16384 words */
+.equ dirindex_last_used,  0x00640000   /* 16384 words -- LRU stamp (eviction only if ever full) */
+.equ dirindex_path_bytes, 0x00650000   /* 16384 slots * 32 bytes, byte-addressed, ends 0x006D0000 */
 
 .section ".bss"
 .align 4

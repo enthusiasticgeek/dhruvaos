@@ -48,9 +48,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--force-kernelsig", action="store_true",
                     help="replace an already-provisioned, different kernel-signing key")
+    ap.add_argument("--cert-only", action="store_true",
+                    help="keep the board's existing tlsd identity; only (re)issue and install its certificate")
     a = ap.parse_args()
     py = [sys.executable, "-I"]
-    out = send_and_wait("tlsd keygen", r"tlsd pubkey [0-9A-Fa-f]{64}", 120)
+    out = send_and_wait("tlsd pubkey" if a.cert_only else "tlsd keygen", r"tlsd pubkey [0-9A-Fa-f]{64}", 120)
     board_pub = re.search(r"tlsd pubkey ([0-9A-Fa-f]{64})", out).group(1).lower()
     print("board TLS identity:", board_pub[:16] + "...")
     lines = subprocess.run([*py, os.path.join(HERE, "tls_pki.py"), "board", board_pub, "--dir", PKI],
@@ -67,6 +69,11 @@ def main() -> int:
                 pass
     send_and_wait("tlsd certend", r"certificate", 30)
     print("board certificate installed")
+    if a.cert_only:
+        st = send_and_wait("tlsd status", r"tlsd: identity", 20)
+        last = st.strip().splitlines()[-1]
+        print(last)
+        return 0 if "MISSING" not in last else 1
     client = subprocess.run([*py, os.path.join(HERE, "tls_pki.py"), "client-pubkey", "--dir", PKI],
                             check=True, capture_output=True, text=True).stdout.strip()
     send_and_wait(f"tlsd client {client}", r"authorized", 30)

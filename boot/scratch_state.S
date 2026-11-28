@@ -3162,3 +3162,77 @@ wifi_hwcrypt_on_get:
     ldr r0, =wifi_hwcrypt_on_word
     ldr r0, [r0]
     bx lr
+
+/* 2026-11-27: read failures seen by the current DharaFS recovery scan
+ * (spans its resumable calls). Non-zero -> the rebuilt dirindex may be
+ * missing paths, so it must not be declared complete. */
+.section ".bss"
+.align 4
+dharafs_recovery_read_fail_word:
+    .word 0
+.section ".text"
+.global dharafs_recovery_read_fail_set
+dharafs_recovery_read_fail_set:
+    ldr r1, =dharafs_recovery_read_fail_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global dharafs_recovery_read_fail_get
+dharafs_recovery_read_fail_get:
+    ldr r0, =dharafs_recovery_read_fail_word
+    ldr r0, [r0]
+    bx lr
+
+/* 2026-11-27: sticky "an LRU eviction happened since the last
+ * dharafs_dirindex_reset" flag -- once set, the index cannot be complete
+ * (some path is unindexed), whatever a scan later concludes. */
+.section ".bss"
+.align 4
+dharafs_dirindex_overflowed_word:
+    .word 0
+.section ".text"
+.global dharafs_dirindex_overflowed_set
+dharafs_dirindex_overflowed_set:
+    ldr r1, =dharafs_dirindex_overflowed_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global dharafs_dirindex_overflowed_get
+dharafs_dirindex_overflowed_get:
+    ldr r0, =dharafs_dirindex_overflowed_word
+    ldr r0, [r0]
+    bx lr
+
+/* 2026-11-27: DharaFS ECC byte-table BCH encoder state -- 3328-byte table
+ * (256 entries x 13 bytes, built once from the generator polynomial) and
+ * a state word: 0 = not built, 1 = built and self-checked, 2 = disabled
+ * (self-check mismatch -> bit-serial path only). */
+.section ".bss"
+.align 4
+dharafs_ecc_fast_table_word:
+    .word 0
+dharafs_ecc_fast_state_word:
+    .word 0
+.section ".text"
+.global dharafs_ecc_fast_table_set
+dharafs_ecc_fast_table_set:
+    ldr r1, =dharafs_ecc_fast_table_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global dharafs_ecc_fast_table_get
+dharafs_ecc_fast_table_get:
+    ldr r0, =dharafs_ecc_fast_table_word
+    ldr r0, [r0]
+    bx lr
+.global dharafs_ecc_fast_state_set
+dharafs_ecc_fast_state_set:
+    ldr r1, =dharafs_ecc_fast_state_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global dharafs_ecc_fast_state_get
+dharafs_ecc_fast_state_get:
+    ldr r0, =dharafs_ecc_fast_state_word
+    ldr r0, [r0]
+    bx lr

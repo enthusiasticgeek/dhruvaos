@@ -392,6 +392,14 @@ extern "C" fn wifi_rx_hwdec_set(v: u32) -> i64;
 extern "C" fn wifi_rx_hwdec_get() -> u32;
 extern "C" fn wifi_hwcrypt_on_set(v: u32) -> i64;
 extern "C" fn wifi_hwcrypt_on_get() -> u32;
+extern "C" fn dharafs_recovery_read_fail_set(v: u32) -> i64;
+extern "C" fn dharafs_recovery_read_fail_get() -> u32;
+extern "C" fn dharafs_dirindex_overflowed_set(v: u32) -> i64;
+extern "C" fn dharafs_dirindex_overflowed_get() -> u32;
+extern "C" fn dharafs_ecc_fast_table_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_ecc_fast_table_get() -> mut ref i64;
+extern "C" fn dharafs_ecc_fast_state_set(v: u32) -> i64;
+extern "C" fn dharafs_ecc_fast_state_get() -> u32;
 // 2026-11-27: option B -- data cache for task-stack pages (boot/rpi1/runtime_stubs.c).
 extern "C" fn dhruva_stack_cache_set(on: u32) -> u32;   // C long = 32-bit
 extern "C" fn dhruva_stack_cache_get() -> u32;
@@ -9238,8 +9246,9 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
 // counters are all plain memory, readable from vani, and persisted to
 // SD survive the watchdog's own hardware reset (a .bss snapshot would
 // not). Read back on the next boot via the `sdckpt` shell command.
-const SD_WEDGE_CKPT_BLOCK_PRE: i64 = 8224;
-const SD_WEDGE_CKPT_BLOCK_POST: i64 = 8225;
+// 2026-11-27: were 8224/8225 -- INSIDE critical config copy A (8224-8239).
+const SD_WEDGE_CKPT_BLOCK_PRE: i64 = 9840;
+const SD_WEDGE_CKPT_BLOCK_POST: i64 = 9841;
 fn sd_wedge_checkpoint(block_num: i64, tag: u32, attempt: u32, result: u32) -> i64 {
   let buf: mut ref i64 = sd_wedge_ckpt_scratch_get();
   let cur: u32 = current_task_get();
@@ -9971,7 +9980,18 @@ fn dharafs_ecc_gen_poly() -> [u8; 32] {
 // vetoed by ECC before its own real CRC32 check ever ran. 8801-9215
 // was already documented spare/unused (this round's own research),
 // so narrowing scope here protects nothing real that it used to.
-fn dharafs_ecc_scope_end() -> i64 { return 9216; }
+// 2026-11-27 LAYOUT FIX: ECC protects the DharaFS LOG ONLY (blocks
+// 0-7599). The old scope (0-9215) covered metadata written by non-ECC-
+// aware paths (crypto-meta 7600-8074 and the self-check block 8100 via
+// dharafs_block_write_raw, stage0/PC tooling, diagnostics), and the old
+// table location 8228-8804 OVERLAPPED the critical config store
+// (8224-8255, added 2026-11-08) and write-cursor pool slots 2-5
+// (8801-8804): every critical-config write clobbered parity for log
+// blocks 0-447 (false UNCORRECTABLE -> records "unreadable" -> hidden)
+// and every parity update for those blocks clobbered critical config.
+// Log-only scope: its sole writer is DharaFS's own ECC-aware path; the
+// metadata has its own checksums + N-way/two-copy redundancy.
+fn dharafs_ecc_scope_end() -> i64 { return 7600; }
 // The ECC table's own backing blocks must be excluded from self-
 // coverage, or encoding/decoding a block of the table would recurse
 // into protecting the table itself.
@@ -9985,8 +10005,43 @@ fn dharafs_ecc_scope_end() -> i64 { return 9216; }
 // widening the block-map search from named sector-accessor functions
 // to every raw numeric literal in the file before trusting "free" --
 // exactly the kind of near-miss that's worth it.
-fn dharafs_ecc_table_base() -> i64 { return 8228; }
-fn dharafs_ecc_table_sector_count() -> i64 { return 577; } // ceil(9220/16)
+// 2026-11-27: relocated to 9365-9839 -- after the wear table (9220-9364),
+// before kernel slot A (10240); verified free by scanning every decimal
+// AND hex literal in kernel/boot/stage0/tools (the 8228 lesson above).
+fn dharafs_ecc_table_base() -> i64 { return 9365; }
+fn dharafs_ecc_table_sector_count() -> i64 { return 475; } // ceil(7600/16)
+// Marker for the one-time zeroing of the relocated table (see
+// dharafs_ecc_layout_v2_init): whatever a card held at 9365-9839 before
+// must never be taken for valid parity.
+fn dharafs_ecc_layout_marker_block() -> i64 { return 9844; }
+
+// One-time (per card) zeroing of the relocated ECC table, gated by a
+// marker block. Until a log block is rewritten its parity entry is then
+// absent ("DECC" magic missing), so it is simply unverified -- never a
+// false UNCORRECTABLE from stale or foreign bytes. Returns 1 if it ran.
+fn dharafs_ecc_layout_v2_init() -> i64 {
+  let buf: mut ref i64 = dharafs_ecc_cache_buf_get();
+  let rd: i64 = sdhost_read_block_once(dharafs_ecc_layout_marker_block(), buf);
+  if (rd == 0) && (buf_read_u32_be(buf, 0 as u32) == (0x45434332 as u32)) {   // "ECC2"
+    return 0;
+  }
+  let z: i64 = 0;
+  while z < 512 { let _ = buf_write_byte(buf, z as u32, 0 as u32); z = z + 1; }
+  let s: i64 = 0;
+  while s < dharafs_ecc_table_sector_count() {
+    if hardware_is_real_hw_get() == (1 as u32) {
+      let _ = watchdog_kick();
+    }
+    let _ = sdhost_write_block_once(dharafs_ecc_table_base() + s, buf);
+    s = s + 1;
+  }
+  let _ = buf_write_u32_be(buf, 0 as u32, 0x45434332 as u32);
+  let _ = sdhost_write_block_once(dharafs_ecc_layout_marker_block(), buf);
+  let _ = dharafs_ecc_cache_set_sector_num(0 as u32);
+  let _ = dharafs_ecc_cache_set_dirty(0 as u32);
+  let _ = uart_puts("DharaFS ECC: relocated parity table initialized (9365-9839, log-only scope)\n");
+  return 1;
+}
 
 fn dharafs_ecc_in_scope(block_num: i64) -> i64 {
   if block_num < 0 {
@@ -10089,6 +10144,110 @@ fn dharafs_ecc_cache_flush() -> i64 {
 // second physical SD round trip on the common case of writing several
 // blocks that share one table sector). Called from sdhost_write_block_
 // once, before any hardware register is touched.
+// 2026-11-27 PERFORMANCE: byte-table BCH encoder. bch_encode (vendor/
+// galois) is bit-serial with a function call per register bit -- ~4096 x
+// 104 calls per 512-byte block, on EVERY DharaFS write; and every read
+// ran the full 16-syndrome decode even when the block is clean. The
+// shift register is linear over GF(2), so 8 serial steps collapse to
+// R' = (R << 8) ^ T[R_top8 ^ data_byte] with T[x] = 8 serial steps from a
+// register holding x in its top byte (the standard CRC-style table
+// method). Register = 104 bits = exactly 13 bytes (little-endian, as in
+// bch_small_get_bit), top byte = R[12]; data enters MSB-first from byte
+// 511 down (bch_data_get_bit order). Proven identical to bch_encode
+// offline (42 blocks incl. all-0/all-1) and re-checked at first use
+// against bch_encode itself (dharafs_ecc_fast_ensure); on any mismatch
+// the fast path disables itself and the bit-serial path is used.
+// Read side: BCH syndromes are all zero exactly when re-encoding the data
+// reproduces the stored parity, so a clean block costs one fast encode
+// + a 13-byte compare; only a mismatch runs bch_decode_correct.
+fn dharafs_ecc_fast_build_table(table: mut ref i64) -> i64 {
+  let gen: [u8; 32] = dharafs_ecc_gen_poly();
+  let x: i64 = 0;
+  while x < 256 {
+    let reg: [u8; 32] = bch_zero32_bytes();
+    reg[12] = x as u8;
+    let shift_n: i64 = 0;   // ("step" is reserved in vani)
+    while shift_n < 8 {
+      let fb: u32 = ((reg[12] as u32) >> (7 as u32)) & (1 as u32);
+      // reg <<= 1 across 13 bytes (bit 103 drops out)
+      let k: i64 = 12;
+      while k > 0 {
+        reg[k] = (((reg[k] as u32) << (1 as u32)) | ((reg[k - 1] as u32) >> (7 as u32))) as u8;
+        k = k - 1;
+      }
+      reg[0] = ((reg[0] as u32) << (1 as u32)) as u8;
+      if fb == (1 as u32) {
+        let g: i64 = 0;
+        while g < 13 { reg[g] = ((reg[g] as u32) ^ (gen[g] as u32)) as u8; g = g + 1; }
+      }
+      shift_n = shift_n + 1;
+    }
+    let b: i64 = 0;
+    while b < 13 { let _ = buf_write_byte(table, (x * 13 + b) as u32, reg[b] as u32); b = b + 1; }
+    x = x + 1;
+  }
+  return 0;
+}
+
+// parity of a 512-byte heap block into out[0..12] (out[13..31] zeroed)
+fn dharafs_ecc_fast_parity(table: mut ref i64, buf: mut ref i64, out: mut ref [u8; 32]) -> i64 {
+  let r: [u8; 32] = bch_zero32_bytes();
+  let b: i64 = 511;
+  while b >= 0 {
+    let x: i64 = (((r[12] as u32) ^ buf_read_byte(buf, b as u32)) & (0xff as u32)) as i64;
+    let k: i64 = 12;
+    while k > 0 { r[k] = r[k - 1]; k = k - 1; }
+    r[0] = 0 as u8;
+    let t0: i64 = x * 13;
+    let j: i64 = 0;
+    while j < 13 { r[j] = ((r[j] as u32) ^ buf_read_byte(table, (t0 + j) as u32)) as u8; j = j + 1; }
+    b = b - 1;
+  }
+  let m: i64 = 0;
+  while m < 32 { out[m] = if m < 13 { r[m] } else { 0 as u8 }; m = m + 1; }
+  return 0;
+}
+
+// Returns the table when the fast path is usable, building + self-checking
+// it on first use; state 2 = disabled after a self-check mismatch.
+fn dharafs_ecc_fast_ensure() -> i64 {
+  let st: u32 = dharafs_ecc_fast_state_get();
+  if st == (1 as u32) { return 1; }
+  if st == (2 as u32) { return 0; }
+  let table: mut ref i64 = dhruva_alloc_bytes(3328);   // once per boot (never-free pattern: built exactly once)
+  let _ = dharafs_ecc_fast_build_table(table);
+  let _ = dharafs_ecc_fast_table_set(table);
+  // self-check against the reference bit-serial encoder on two patterns
+  let probe: mut ref i64 = dhruva_alloc_bytes(512);
+  let gen: [u8; 32] = dharafs_ecc_gen_poly();
+  let ok: i64 = 1;
+  let pat: i64 = 0;
+  while pat < 2 {
+    let plain: [u8; 512] = [0 as u8; 512];
+    let i: i64 = 0;
+    while i < 512 {
+      let v: u32 = if pat == 0 { ((i * 37 + 11) & 0xff) as u32 } else { (((i * i) ^ (i >> 3)) & 0xff) as u32 };
+      plain[i] = v as u8;
+      let _ = buf_write_byte(probe, i as u32, v);
+      i = i + 1;
+    }
+    let ref_par: [u8; 32] = bch_zero32_bytes();
+    let _ = bch_encode(ref plain, dharafs_ecc_param_data_bits(), ref gen, dharafs_ecc_param_parity_bits(), mut ref ref_par);
+    let fast_par: [u8; 32] = bch_zero32_bytes();
+    let _ = dharafs_ecc_fast_parity(table, probe, mut ref fast_par);
+    let q: i64 = 0;
+    while q < 13 { if ref_par[q] != fast_par[q] { ok = 0; } q = q + 1; }
+    pat = pat + 1;
+  }
+  if ok == 1 {
+    let _ = dharafs_ecc_fast_state_set(1 as u32);
+    return 1;
+  }
+  let _ = dharafs_ecc_fast_state_set(2 as u32);
+  let _ = uart_puts("DharaFS ECC: byte-table encoder self-check MISMATCH -- using bit-serial BCH only\n");
+  return 0;
+}
+
 fn dharafs_ecc_protect_on_write(block_num: i64, buf: mut ref i64, skip_protect: u32) -> i64 {
   if dharafs_ecc_in_scope(block_num) == 0 {
     return 0;
@@ -10119,15 +10278,19 @@ fn dharafs_ecc_protect_on_write(block_num: i64, buf: mut ref i64, skip_protect: 
     let _ = dharafs_ecc_cache_set_dirty(1 as u32);
     return dharafs_ecc_cache_flush();
   }
-  let plain: [u8; 512] = [0 as u8; 512];
-  let i: i64 = 0;
-  while i < 512 {
-    plain[i] = buf_read_byte(buf, i as u32) as u8;
-    i = i + 1;
-  }
-  let gen: [u8; 32] = dharafs_ecc_gen_poly();
   let parity: [u8; 32] = bch_zero32_bytes();
-  let _ = bch_encode(ref plain, dharafs_ecc_param_data_bits(), ref gen, dharafs_ecc_param_parity_bits(), mut ref parity);
+  if dharafs_ecc_fast_ensure() == 1 {
+    let _ = dharafs_ecc_fast_parity(dharafs_ecc_fast_table_get(), buf, mut ref parity);
+  } else {
+    let plain: [u8; 512] = [0 as u8; 512];
+    let i: i64 = 0;
+    while i < 512 {
+      plain[i] = buf_read_byte(buf, i as u32) as u8;
+      i = i + 1;
+    }
+    let gen: [u8; 32] = dharafs_ecc_gen_poly();
+    let _ = bch_encode(ref plain, dharafs_ecc_param_data_bits(), ref gen, dharafs_ecc_param_parity_bits(), mut ref parity);
+  }
 
   let sector_num: i64 = dharafs_ecc_table_sector_for(block_num);
   let _ = dharafs_ecc_cache_ensure(sector_num);
@@ -10183,6 +10346,20 @@ fn dharafs_ecc_verify_on_read(block_num: i64, buf: mut ref i64) -> i64 {
   let magic: u32 = buf_read_u32_be(cache_buf, off as u32);
   if magic != (0x44454343 as u32) {
     return 0;
+  }
+  // fast path: clean block <=> recomputed parity == stored parity
+  if dharafs_ecc_fast_ensure() == 1 {
+    let fp: [u8; 32] = bch_zero32_bytes();
+    let _ = dharafs_ecc_fast_parity(dharafs_ecc_fast_table_get(), buf, mut ref fp);
+    let same: i64 = 1;
+    let q: i64 = 0;
+    while q < 13 {
+      if (fp[q] as u32) != buf_read_byte(cache_buf, (off + 8 + q) as u32) { same = 0; }
+      q = q + 1;
+    }
+    if same == 1 {
+      return 0;
+    }
   }
   let plain: [u8; 512] = [0 as u8; 512];
   let i: i64 = 0;
@@ -10772,10 +10949,17 @@ fn dharafs_check_permission(owner_uid: u32, owner_gid: u32, mode: u32, req_uid: 
   }
   return 0;
 }
-fn dirindex_max_slots() -> i64 { return 256; }
+// 2026-11-27 PERFORMANCE: 16384 slots (was 256) in RAM section 6
+// (boot/dirindex_state.S). The log holds at most 7600 blocks, so it can
+// never hold more than 7600 distinct paths: the index can no longer need
+// to evict, stays complete, and a lookup miss is answered from RAM. At 256
+// slots every write of a new path past the 256th cost a full log scan
+// (~16 s per write measured under QEMU). Load factor <= 7600/16384 = 0.46.
+fn dirindex_max_slots() -> i64 { return 16384; }
 fn dirindex_max_path_bytes() -> i64 { return 32; }
 
 fn dharafs_dirindex_reset() -> i64 {
+  let _ = dharafs_dirindex_overflowed_set(0 as u32);
   let i: i64 = 0;
   while i < dirindex_max_slots() {
     let _ = dirindex_set_valid_at(i as u32, 0 as u32);
@@ -10820,63 +11004,74 @@ fn dharafs_dirindex_snapshot_offset_for(slot: i64) -> i64 {
 // (shutdown/reboot) must NOT then write a clean_shutdown=1 checkpoint,
 // exactly the same "only promise what actually committed" discipline
 // badblock-bitmap-persist-before-checkpoint-write already uses.
+// 2026-11-27 PERFORMANCE: packed snapshot of the (now 16384-slot) index.
+// Old format: slot-indexed, 24 blocks x 11 slots -- could only ever hold
+// the first 264 slots. New: header 8108 ("DXI2" | generation | byte 8
+// complete | u32 count @12), then count entries packed 12 per block at
+// 9845.. (each block: u32 checksum | 12 x [hash4 | pathlen1 | path32 |
+// block4]); room for 4572 entries (9845-10225, free per the full literal
+// scan). More valid entries than that -> saved as NOT complete, so the
+// next boot does a full scan instead (slower boot, never wrong).
+fn dharafs_dirindex_snapshot_entries_per_block() -> i64 { return 12; }
+fn dharafs_dirindex_snapshot_entry_bytes() -> i64 { return 41; }
+fn dharafs_dirindex_snapshot_v2_base() -> i64 { return 9845; }
+fn dharafs_dirindex_snapshot_v2_blocks() -> i64 { return 381; }
+
 fn dharafs_dirindex_snapshot_persist(generation: u32) -> i64 {
   let scratch: mut ref i64 = dhruva_alloc_bytes(512);
-  let blk: i64 = 0;
-  while blk < dharafs_dirindex_snapshot_data_blocks() {
+  let per_blk: i64 = dharafs_dirindex_snapshot_entries_per_block();
+  let cap: i64 = per_blk * dharafs_dirindex_snapshot_v2_blocks();
+  let count: i64 = 0;
+  let slot: i64 = 0;
+  while slot < dirindex_max_slots() {
+    if dirindex_get_valid_at(slot as u32) == 1 { count = count + 1; }
+    slot = slot + 1;
+  }
+  let complete: u32 = if (dharafs_dirindex_complete_get() == (1 as u32)) && (count <= cap) { 1 as u32 } else { 0 as u32 };
+  if complete == (1 as u32) {
+    let in_blk: i64 = 0;
+    let blk: i64 = 0;
     let z: i64 = 0;
-    while z < 512 {
-      let _ = buf_write_byte(scratch, z as u32, 0 as u32);
-      z = z + 1;
-    }
-    let base_slot: i64 = blk * dharafs_dirindex_snapshot_slots_per_block();
-    let s: i64 = 0;
-    while s < dharafs_dirindex_snapshot_slots_per_block() {
-      let slot: i64 = base_slot + s;
-      if slot < dirindex_max_slots() {
-        if dirindex_get_valid_at(slot as u32) == 1 {
-          let off: i64 = 4 + s * dharafs_dirindex_snapshot_slot_bytes();
-          let path_len: i64 = dirindex_get_pathlen_at(slot as u32);
-          let _ = buf_write_byte(scratch, off as u32, 1 as u32);
-          let _ = buf_write_u32(scratch, (off + 1) as u32, dirindex_get_hash_at(slot as u32) as u32);
-          let _ = buf_write_byte(scratch, (off + 5) as u32, path_len as u32);
-          let k: i64 = 0;
-          while k < path_len {
-            let pb: u32 = dirindex_get_path_byte((slot * dirindex_max_path_bytes() + k) as u32) as u32;
-            let _ = buf_write_byte(scratch, (off + 6 + k) as u32, pb);
-            k = k + 1;
-          }
-          let _ = buf_write_u32(scratch, (off + 38) as u32, dirindex_get_block_at(slot as u32) as u32);
+    while z < 512 { let _ = buf_write_byte(scratch, z as u32, 0 as u32); z = z + 1; }
+    slot = 0;
+    while slot < dirindex_max_slots() {
+      if dirindex_get_valid_at(slot as u32) == 1 {
+        let off: i64 = 4 + in_blk * dharafs_dirindex_snapshot_entry_bytes();
+        let path_len: i64 = dirindex_get_pathlen_at(slot as u32);
+        let _ = buf_write_u32(scratch, off as u32, dirindex_get_hash_at(slot as u32) as u32);
+        let _ = buf_write_byte(scratch, (off + 4) as u32, path_len as u32);
+        let k: i64 = 0;
+        while k < path_len {
+          let _ = buf_write_byte(scratch, (off + 5 + k) as u32, dirindex_get_path_byte((slot * dirindex_max_path_bytes() + k) as u32) as u32);
+          k = k + 1;
+        }
+        let _ = buf_write_u32(scratch, (off + 37) as u32, dirindex_get_block_at(slot as u32) as u32);
+        in_blk = in_blk + 1;
+        if in_blk == per_blk {
+          let _ = buf_write_u32(scratch, 0 as u32, buf_checksum(scratch, 4 as u32, 508 as u32));
+          if sdhost_write_block(dharafs_dirindex_snapshot_v2_base() + blk, scratch) != 0 { return 0 - 1; }
+          blk = blk + 1;
+          in_blk = 0;
+          z = 0;
+          while z < 512 { let _ = buf_write_byte(scratch, z as u32, 0 as u32); z = z + 1; }
         }
       }
-      s = s + 1;
+      slot = slot + 1;
     }
-    let computed: u32 = buf_checksum(scratch, 4 as u32, 508 as u32);
-    let _ = buf_write_u32(scratch, 0 as u32, computed);
-    let wr_status: i64 = sdhost_write_block(dharafs_dirindex_snapshot_block_for(base_slot), scratch);
-    if wr_status != 0 {
-      return 0 - 1;
+    if in_blk > 0 {
+      let _ = buf_write_u32(scratch, 0 as u32, buf_checksum(scratch, 4 as u32, 508 as u32));
+      if sdhost_write_block(dharafs_dirindex_snapshot_v2_base() + blk, scratch) != 0 { return 0 - 1; }
     }
-    blk = blk + 1;
   }
-  // Header last -- see dharafs_dirindex_snapshot_load's own comment
-  // for why it's read FIRST but written LAST (the generation stamp
-  // only becomes trustworthy once every data block it refers to has
-  // already committed successfully).
   let header: mut ref i64 = dhruva_alloc_bytes(512);
   let hz: i64 = 0;
-  while hz < 512 {
-    let _ = buf_write_byte(header, hz as u32, 0 as u32);
-    hz = hz + 1;
-  }
-  let _ = buf_write_u32(header, 0 as u32, 0x44584944 as u32); // "DXID"
+  while hz < 512 { let _ = buf_write_byte(header, hz as u32, 0 as u32); hz = hz + 1; }
+  let _ = buf_write_u32(header, 0 as u32, 0x44584932 as u32); // "DXI2"
   let _ = buf_write_u32(header, 4 as u32, generation);
-  let header_checksum: u32 = buf_checksum(header, 8 as u32, 504 as u32);
-  let _ = buf_write_u32(header, 504 as u32, header_checksum);
-  let header_wr_status: i64 = sdhost_write_block(dharafs_dirindex_snapshot_header_block(), header);
-  if header_wr_status != 0 {
-    return 0 - 1;
-  }
+  let _ = buf_write_byte(header, 8 as u32, complete);
+  let _ = buf_write_u32(header, 12 as u32, count as u32);
+  let _ = buf_write_u32(header, 504 as u32, buf_checksum(header, 8 as u32, 504 as u32));
+  if sdhost_write_block(dharafs_dirindex_snapshot_header_block(), header) != 0 { return 0 - 1; }
   return 0;
 }
 
@@ -10888,82 +11083,52 @@ fn dharafs_dirindex_snapshot_persist(generation: u32) -> i64 {
 // path always falls back to a real scan regardless.
 fn dharafs_dirindex_snapshot_load(expect_generation: u32) -> i64 {
   let header: mut ref i64 = dhruva_alloc_bytes(512);
-  // Bare single-attempt reads throughout -- same bootstrap philosophy
-  // as dharafs_badblock_bitmap_load/dharafs_suspect_table_load: a
-  // failure here just means "take the slower path," never worth a
-  // real retry-ladder cost.
-  let header_rd: i64 = dharafs_block_read_once_with_ecc(dharafs_dirindex_snapshot_header_block(), header);
-  if header_rd != 0 {
+  if sdhost_read_block(dharafs_dirindex_snapshot_header_block(), header) != 0 { return 0; }
+  if buf_read_u32(header, 0 as u32) != (0x44584932 as u32) { return 0; }   // not "DXI2" (incl. the old format)
+  if buf_read_u32(header, 4 as u32) != expect_generation { return 0; }
+  if buf_checksum(header, 8 as u32, 504 as u32) != buf_read_u32(header, 504 as u32) { return 0; }
+  if buf_read_byte(header, 8 as u32) != (1 as u32) {
+    let _ = uart_puts("DharaFS: directory-index snapshot was saved incomplete -- not trusting it, full scan\n");
     return 0;
   }
-  let magic: u32 = buf_read_u32(header, 0 as u32);
-  if magic != (0x44584944 as u32) {
-    return 0;
-  }
-  let gen_stored: u32 = buf_read_u32(header, 4 as u32);
-  if gen_stored != expect_generation {
-    return 0;
-  }
-  let header_computed: u32 = buf_checksum(header, 8 as u32, 504 as u32);
-  let header_stored_checksum: u32 = buf_read_u32(header, 504 as u32);
-  if header_computed != header_stored_checksum {
-    return 0;
-  }
-
+  let count: i64 = buf_read_u32(header, 12 as u32) as i64;
+  let per_blk: i64 = dharafs_dirindex_snapshot_entries_per_block();
+  if (count < 0) || (count > per_blk * dharafs_dirindex_snapshot_v2_blocks()) { return 0; }
   let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let loaded: i64 = 0;
   let blk: i64 = 0;
-  while blk < dharafs_dirindex_snapshot_data_blocks() {
-    // BUG FOUND 2026-11-19 (watchdog-coverage audit prompted by the
-    // real-HW stage0 hang this session, investigating whether stage0's
-    // own disabled-by-default pre-jump watchdog could safely be
-    // enabled): this loop does one real SD block read with ECC per
-    // iteration and had zero watchdog_kick() coverage, despite running
-    // synchronously inside dharafs_init()'s own direct call chain --
-    // measured real-HW timing shows checkpoint7->8 (which wraps this
-    // entire call) at 23s, already at the hardware watchdog's own
-    // ~15-16s single-arm ceiling, with this snapshot load (potentially
-    // many blocks, proportional to directory history) a real
-    // contributor. Kicking once per iteration, same convention this
-    // codebase already uses for every other slow SD-I/O loop.
+  while loaded < count {
     if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
-    let base_slot: i64 = blk * dharafs_dirindex_snapshot_slots_per_block();
-    let rd_status: i64 = dharafs_block_read_once_with_ecc(dharafs_dirindex_snapshot_block_for(base_slot), scratch);
-    if rd_status != 0 {
+    if sdhost_read_block(dharafs_dirindex_snapshot_v2_base() + blk, scratch) != 0 {
       let _ = dharafs_dirindex_reset();
       return 0;
     }
-    let stored: u32 = buf_read_u32(scratch, 0 as u32);
-    let computed: u32 = buf_checksum(scratch, 4 as u32, 508 as u32);
-    if stored != computed {
+    if buf_read_u32(scratch, 0 as u32) != buf_checksum(scratch, 4 as u32, 508 as u32) {
       let _ = dharafs_dirindex_reset();
       return 0;
     }
-    let s: i64 = 0;
-    while s < dharafs_dirindex_snapshot_slots_per_block() {
-      let slot: i64 = base_slot + s;
-      if slot < dirindex_max_slots() {
-        let off: i64 = 4 + s * dharafs_dirindex_snapshot_slot_bytes();
-        let slot_valid: u32 = buf_read_byte(scratch, off as u32);
-        if slot_valid == (1 as u32) {
-          let path_len: i64 = buf_read_byte(scratch, (off + 5) as u32) as i64;
-          let _ = dirindex_set_valid_at(slot as u32, 1 as u32);
-          let _ = dirindex_set_hash_at(slot as u32, buf_read_u32(scratch, (off + 1) as u32));
-          let _ = dirindex_set_pathlen_at(slot as u32, path_len as u32);
-          let k: i64 = 0;
-          while k < path_len {
-            let pb: u32 = buf_read_byte(scratch, (off + 6 + k) as u32);
-            let _ = dirindex_set_path_byte((slot * dirindex_max_path_bytes() + k) as u32, pb);
-            k = k + 1;
-          }
-          let _ = dirindex_set_block_at(slot as u32, buf_read_u32(scratch, (off + 38) as u32));
-          let _ = dirindex_set_last_used_at(slot as u32, dirindex_clock_tick());
-        }
+    let e: i64 = 0;
+    while (e < per_blk) && (loaded < count) {
+      let off: i64 = 4 + e * dharafs_dirindex_snapshot_entry_bytes();
+      let path_len: i64 = buf_read_byte(scratch, (off + 4) as u32) as i64;
+      if (path_len <= 0) || (path_len > dirindex_max_path_bytes()) {
+        let _ = dharafs_dirindex_reset();
+        return 0;
       }
-      s = s + 1;
+      if dharafs_dirindex_upsert(scratch, off + 5, path_len, buf_read_u32(scratch, (off + 37) as u32) as i64) != 0 {
+        let _ = dharafs_dirindex_reset();
+        return 0;
+      }
+      loaded = loaded + 1;
+      e = e + 1;
     }
     blk = blk + 1;
+  }
+  if dharafs_dirindex_overflowed_get() == (1 as u32) {
+    let _ = dharafs_dirindex_reset();
+    return 0;
   }
   return 1;
 }
@@ -11082,6 +11247,14 @@ fn dharafs_dirindex_evict_lru(buf: mut ref i64, path_offset: i64, path_len: i64,
   }
   let _ = dirindex_set_block_at(victim as u32, block as u32);
   let _ = dirindex_set_last_used_at(victim as u32, dirindex_clock_tick());
+  // 2026-11-27: the evicted path is no longer indexed, so the index can no
+  // longer answer "absent" authoritatively. Leaving complete=1 here made an
+  // evicted file "not found" without a scan and made compaction drop its
+  // records as dead -- silent, progressive data loss past 256 paths.
+  // Sticky until the next dharafs_dirindex_reset: a later scan finishing
+  // must not re-declare the index complete either.
+  let _ = dharafs_dirindex_complete_set(0 as u32);
+  let _ = dharafs_dirindex_overflowed_set(1 as u32);
   return 0;
 }
 
@@ -12213,6 +12386,8 @@ fn dharafs_write_cursor_forward_scan(hint_next_block: u32, hint_next_seq: u32, m
 }
 
 fn dharafs_init() -> i64 {
+  let _ = dharafs_recovery_read_fail_set(0 as u32);
+  let _ = dharafs_ecc_layout_v2_init();   // per-init: only this init's scan may set it
   let _ = dharafs_dirindex_reset();
   let _ = dharafs_snapshot_reset();
   let _ = dharafs_dirindex_complete_set(0 as u32);
@@ -12343,6 +12518,7 @@ fn dharafs_init() -> i64 {
         // found nothing.
         let _ = dharafs_recovery_highest_seq_found_set(scan_result.next_seq - (1 as u32));
         let _ = dharafs_recovery_scan_target_blk_set(scan_result.next_block);
+        let _ = dharafs_recovery_read_fail_set(0 as u32);
         let _ = dharafs_recovery_active_set(1 as u32);
         let _ = uart_puts("DharaFS: checkpoint TRUSTED (Tier 2 cursor fast path) gen=");
         let _ = uart_put_hex32(checkpoint.generation);
@@ -12453,6 +12629,7 @@ fn dharafs_init() -> i64 {
   // real end of the log, same as always (dharafs_recovery_scan_continue
   // used to hardcode exactly this).
   let _ = dharafs_recovery_scan_target_blk_set(scan_max_blk);
+  let _ = dharafs_recovery_read_fail_set(0 as u32);
   let _ = dharafs_recovery_active_set(1 as u32);
   let _ = uart_puts("DharaFS: checkpoint ");
   if checkpoint.valid == 1 {
@@ -12562,7 +12739,19 @@ fn dharafs_recovery_scan_continue(buf: mut ref i64, budget_us: u32) -> i64 {
     let this_seq: u32 = buf_read_u32(buf, 4 as u32);
     let block_ok: i64 = if (rd_status != 0) || (stored_checksum != computed_checksum) || (this_seq == (0 as u32)) { 0 } else { 1 };
     if block_ok == 0 {
-      let _ = dharafs_badblock_mark(blk);
+      // 2026-11-27 (real card, `fsrepair` dry run: 261 blocks marked
+      // "bad-or-empty" held VALID records -- runs of consecutive newest
+      // records, i.e. hidden by read errors, not bad media): a FAILED read
+      // is not evidence that a block holds no record. Only a clean read
+      // with no valid record (bad checksum / seq 0) feeds the negative
+      // cache; an I/O failure goes through the suspect policy instead,
+      // which marks a block only after a second failure on a later boot.
+      if rd_status != 0 {
+        let _ = dharafs_badblock_report_failure(blk);
+        let _ = dharafs_recovery_read_fail_set(dharafs_recovery_read_fail_get() + (1 as u32));
+      } else {
+        let _ = dharafs_badblock_mark(blk);
+      }
       diag_total_bad = diag_total_bad + 1;
       if (diag_total_bad % 64) == 0 {
         let _ = dharafs_badblock_bitmap_persist(0 as u32);
@@ -12637,7 +12826,24 @@ fn dharafs_recovery_scan_continue(buf: mut ref i64, budget_us: u32) -> i64 {
     // that just finished covered the whole log, so the dirindex it built
     // along the way is now complete/authoritative too -- any lookup miss
     // after this point is real, never worth another scan.
-    let _ = dharafs_dirindex_complete_set(1 as u32);
+    // 2026-11-27: complete only if every block in range was actually read.
+    // A block that failed to read may hold the latest record of some path;
+    // declaring the index complete anyway made lookups answer "not found"
+    // without scanning and made compaction treat that path's records as
+    // dead. Unreadable blocks stay unmarked (suspect policy), so the next
+    // boot retries them; a block that fails again becomes marked-bad and is
+    // then legitimately excluded.
+    if (dharafs_recovery_read_fail_get() == (0 as u32)) && (dharafs_dirindex_overflowed_get() == (0 as u32)) {
+      let _ = dharafs_dirindex_complete_set(1 as u32);
+    } else {
+      if dharafs_dirindex_overflowed_get() == (1 as u32) {
+        let _ = uart_puts("DharaFS: more paths than directory-index slots -- index NOT complete; lookup misses fall back to log scans\n");
+      }
+      let _ = dharafs_dirindex_complete_set(0 as u32);
+      let _ = uart_puts("DharaFS: recovery scan hit ");
+      let _ = uart_put_i64(dharafs_recovery_read_fail_get() as i64);
+      let _ = uart_puts(" unreadable block(s) -- directory index NOT complete; lookups fall back to log scans, compaction deferred\n");
+    }
     let _ = uart_puts("DharaFS: background recovery scan complete. next_block=");
     let _ = uart_put_hex32(next_free_blk as u32);
     let _ = uart_puts(" highest_seq=");
@@ -14311,6 +14517,16 @@ fn dharafs_gc_erase_range_step(buf: mut ref i64, cursor: i64, target: i64) -> i6
 }
 
 fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) -> i64 {
+  // 2026-11-27: liveness below is dharafs_find_latest_block_raw(path) == blk.
+  // That is only trustworthy -- and only bounded in cost -- with a COMPLETE
+  // directory index: an incomplete one turns every miss into a full log
+  // scan under the DharaFS lock (minutes on a full card), and a wrongly
+  // "complete" one (the bugs fixed alongside this) made live records look
+  // dead. No new pass starts without a complete index; an erase phase
+  // already in progress (liveness already decided) may finish.
+  if (dharafs_dirindex_complete_get() != (1 as u32)) && (dharafs_gc_get_erase_cursor() == (0 as u32)) && (dharafs_compact_get_resume_block() == (0 as u32)) {
+    return 0;
+  }
   // Round B: the scan phase below already finished (cleanly) on a
   // prior call, and this pass is now working through the bounded
   // erase phase that comes after it -- see boot/dharafs_state.S's own
@@ -16761,7 +16977,7 @@ fn shell_dispatch_usbhubpowercycle() -> i64 {
 fn shell_dispatch_sentdump() -> i64 {
   let _ = uart_puts("\n");
   let buf: mut ref i64 = sd_wedge_ckpt_scratch_get();
-  let status: i64 = sdhost_read_block_once(8226 as i64, buf);
+  let status: i64 = sdhost_read_block_once(9842 as i64, buf);   // was 8226 (inside critical config copy A)
   if status != 0 {
     let _ = uart_puts("sentdump: read failed, status=");
     let _ = uart_put_i64(status);
@@ -16801,7 +17017,7 @@ fn shell_dispatch_sentdump() -> i64 {
 fn shell_dispatch_lrdump() -> i64 {
   let _ = uart_puts("\n");
   let buf: mut ref i64 = sd_wedge_ckpt_scratch_get();
-  let status: i64 = sdhost_read_block_once(8227 as i64, buf);
+  let status: i64 = sdhost_read_block_once(9843 as i64, buf);   // was 8227 (inside critical config copy A)
   if status != 0 {
     let _ = uart_puts("lrdump: read failed, status=");
     let _ = uart_put_i64(status);
@@ -63617,6 +63833,28 @@ fn bench_cmd() -> i64 {
   t0 = mmio_read_u32(TIMER_CLO);
   let _ = aes_ccmp_decrypt(kh, nonce, aad, 22, body, 600, tag, body);
   let _ = bench_report("CCMP decrypt, 600-byte frame", t0);
+  // DharaFS read path (read-only): raw SD block read vs ECC-verified read
+  // of log block 1, and one parity computation, fast vs bit-serial.
+  let fsb: mut ref i64 = dhruva_alloc_bytes(512);
+  t0 = mmio_read_u32(TIMER_CLO);
+  i = 0;
+  while i < 20 { let _ = sdhost_read_block_once(1, fsb); i = i + 1; }
+  let _ = bench_report("20 raw SD block reads", t0);
+  t0 = mmio_read_u32(TIMER_CLO);
+  i = 0;
+  while i < 20 { let _ = dharafs_block_read(1, fsb); i = i + 1; }
+  let _ = bench_report("20 DharaFS block reads (ECC verify)", t0);
+  let par: [u8; 32] = bch_zero32_bytes();
+  if dharafs_ecc_fast_ensure() == 1 {
+    t0 = mmio_read_u32(TIMER_CLO);
+    let _ = dharafs_ecc_fast_parity(dharafs_ecc_fast_table_get(), fsb, mut ref par);
+    let _ = bench_report("1 BCH parity, byte-table", t0);
+  }
+  let plainb: [u8; 512] = [0 as u8; 512];
+  let gpb: [u8; 32] = dharafs_ecc_gen_poly();
+  t0 = mmio_read_u32(TIMER_CLO);
+  let _ = bch_encode(ref plainb, dharafs_ecc_param_data_bits(), ref gpb, dharafs_ecc_param_parity_bits(), mut ref par);
+  let _ = bench_report("1 BCH parity, bit-serial (reference)", t0);
   if (acc == 0 - 1) || (x == (0x1234 as u32)) { let _ = uart_puts(""); }
   return 0;
 }
@@ -63695,6 +63933,18 @@ fn fsrepair_cmd(apply: i64) -> i64 {
   if (apply == 1) && (restored > 0) {
     let _ = dharafs_suspect_table_persist();
     let _ = dharafs_badblock_bitmap_persist(0 as u32);
+    // 2026-11-27: the in-memory directory index (and its persisted
+    // snapshot) were built while these records were hidden -- they omit
+    // them or point at older versions. Stop trusting the index now (misses
+    // fall back to log scans) and invalidate the snapshot so the next boot
+    // rebuilds it with a full scan instead of reloading the stale one.
+    let _ = dharafs_dirindex_reset();
+    let _ = dharafs_dirindex_complete_set(0 as u32);
+    let zhdr: mut ref i64 = dharafs_sd_scratch_get();
+    let zi: i64 = 0;
+    while zi < 512 { let _ = buf_write_byte(zhdr, zi as u32, 0 as u32); zi = zi + 1; }
+    let _ = sdhost_write_block(dharafs_dirindex_snapshot_header_block(), zhdr);
+    let _ = uart_puts("fsrepair: directory index invalidated -- reboot to rebuild it with a full log scan\n");
   }
   let _ = uart_puts("fsrepair: ");
   let _ = uart_put_i64(marked);
