@@ -16486,7 +16486,7 @@ fn task_holds_any_mutex_self_test() -> i64 {
 // not a periodic hard-RT task with a real deadline to model.
 fn task_fsq() -> i64 {
   while true {
-    let _ = task_sleep_ticks(5);
+    let _ = task_sleep_ms(2500);
     // 2026-10-23 (real-HW kernelupload-stream stall root cause --
     // maintenance-mode precedence, see task_e's own matching comment
     // for the full "why"): task_fsq's own base priority (2) already
@@ -19126,9 +19126,9 @@ fn spn_shadow_report_mismatch(predicted: u32, actual: u32, tick: u32) -> i64 {
 // best-effort by design (see Gap C's own task_e/task_f WCET-tag
 // exclusion reasoning, same argument applies here).
 fn task_deadlines_init() -> i64 {
-  let _ = task_deadline_ticks_table_set_at(0 as u32, 3 as u32);
-  let _ = task_deadline_ticks_table_set_at(1 as u32, 1 as u32);
-  let _ = task_deadline_ticks_table_set_at(2 as u32, 2 as u32);
+  let _ = task_deadline_ticks_table_set_at(0 as u32, sched_ms_to_ticks(1500));
+  let _ = task_deadline_ticks_table_set_at(1 as u32, sched_ms_to_ticks(500));
+  let _ = task_deadline_ticks_table_set_at(2 as u32, sched_ms_to_ticks(1000));
   return 0;
 }
 
@@ -19162,23 +19162,23 @@ fn task_heartbeat_init() -> i64 {
   // becomes nonzero" hold by construction, not by lucky boot-order
   // timing that a future change to the boot sequence could quietly
   // break.
-  let _ = task_heartbeat_bound_table_set_at(0 as u32, 15 as u32);  // task_a, period 3
+  let _ = task_heartbeat_bound_table_set_at(0 as u32, sched_ms_to_ticks(7500));  // task_a, period 3
   let _ = task_heartbeat_last_tick_table_set_at(0 as u32, now);
-  let _ = task_heartbeat_bound_table_set_at(1 as u32, 10 as u32);  // task_b, period 1
+  let _ = task_heartbeat_bound_table_set_at(1 as u32, sched_ms_to_ticks(5000));  // task_b, period 1
   let _ = task_heartbeat_last_tick_table_set_at(1 as u32, now);
-  let _ = task_heartbeat_bound_table_set_at(2 as u32, 10 as u32);  // task_c, period 2
+  let _ = task_heartbeat_bound_table_set_at(2 as u32, sched_ms_to_ticks(5000));  // task_c, period 2
   let _ = task_heartbeat_last_tick_table_set_at(2 as u32, now);
-  let _ = task_heartbeat_bound_table_set_at(4 as u32, 100 as u32); // task_e, period 20
+  let _ = task_heartbeat_bound_table_set_at(4 as u32, sched_ms_to_ticks(50000)); // task_e, period 20
   let _ = task_heartbeat_last_tick_table_set_at(4 as u32, now);
-  let _ = task_heartbeat_bound_table_set_at(5 as u32, 20 as u32);  // task_f, period 2
+  let _ = task_heartbeat_bound_table_set_at(5 as u32, sched_ms_to_ticks(10000));  // task_f, period 2
   let _ = task_heartbeat_last_tick_table_set_at(5 as u32, now);
-  let _ = task_heartbeat_bound_table_set_at(6 as u32, 35 as u32);  // task_custom_demo, period 7
+  let _ = task_heartbeat_bound_table_set_at(6 as u32, sched_ms_to_ticks(17500));  // task_custom_demo, period 7
   let _ = task_heartbeat_last_tick_table_set_at(6 as u32, now);
-  let _ = task_heartbeat_bound_table_set_at(7 as u32, 10 as u32);  // task_mutex_demo_low, period 2
+  let _ = task_heartbeat_bound_table_set_at(7 as u32, sched_ms_to_ticks(5000));  // task_mutex_demo_low, period 2
   let _ = task_heartbeat_last_tick_table_set_at(7 as u32, now);
-  let _ = task_heartbeat_bound_table_set_at(8 as u32, 10 as u32);  // task_mutex_demo_high, period 2
+  let _ = task_heartbeat_bound_table_set_at(8 as u32, sched_ms_to_ticks(5000));  // task_mutex_demo_high, period 2
   let _ = task_heartbeat_last_tick_table_set_at(8 as u32, now);
-  let _ = task_heartbeat_bound_table_set_at(9 as u32, 25 as u32);  // task_fsq, period 5
+  let _ = task_heartbeat_bound_table_set_at(9 as u32, sched_ms_to_ticks(12500));  // task_fsq, period 5
   let _ = task_heartbeat_last_tick_table_set_at(9 as u32, now);
   return 0;
 }
@@ -23061,6 +23061,19 @@ fn tcp_state_closing() -> u32 { return 6 as u32; }
 // PERIOD itself is deliberately still untouched this round; this is
 // the prerequisite task #243/#247's own findings called for before
 // ever revisiting that.)
+// Scheduler v2, P1 (docs/SCHEDULER_V2_DESIGN.md): every period and timeout
+// is stated in real time and converted here, so the tick rate no longer
+// leaks into any task's real-time behavior -- the reason three earlier
+// finer-tick attempts (rounds 191, #243, #288) failed. Rounds UP, never 0.
+fn sched_ms_to_ticks(ms: i64) -> u32 {
+  let tick_us: i64 = scheduler_tick_interval_us() as i64;
+  let t: i64 = ((ms * 1000) + tick_us - 1) / tick_us;
+  return if t < 1 { 1 as u32 } else { t as u32 };
+}
+fn task_sleep_ms(ms: i64) -> i64 {
+  return task_sleep_ticks(sched_ms_to_ticks(ms) as i64);
+}
+
 fn tcp_rtx_timeout_ticks() -> u32 {
   let tick_us: u32 = scheduler_tick_interval_us();
   let real_us: u32 = 2000000 as u32; // 2 real seconds
@@ -40806,7 +40819,7 @@ fn task_a_wake_body() -> i64 {
 #[bounded_stack(bytes=512)]
 fn task_a() -> i64 {
   while true {
-    let _ = task_sleep_ticks(3);
+    let _ = task_sleep_ms(1500);
     let _ = task_a_wake_body();
   }
   return 0;
@@ -40842,7 +40855,7 @@ fn task_b_wake_body() -> i64 {
 #[bounded_stack(bytes=512)]
 fn task_b() -> i64 {
   while true {
-    let _ = task_sleep_ticks(1);
+    let _ = task_sleep_ms(500);
     let _ = task_b_wake_body();
   }
   return 0;
@@ -40945,7 +40958,7 @@ fn task_c() -> i64 {
     }
     let _ = dhruva_prio_unlock(2);
     }
-    let _ = task_sleep_ticks(2);
+    let _ = task_sleep_ms(1000);
   }
   return 0;
 }
@@ -41637,7 +41650,7 @@ fn task_e() -> i64 {
     // again to erase, with every write failing ENOSPC meanwhile.
     let log_used_blocks: u32 = dharafs_state_get_next_block() - dharafs_state_get_log_start();
     let gc_urgent: i64 = if (log_used_blocks > ((dharafs_log_max_blk() * 3 / 4) as u32)) || (dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32)) { 1 } else { 0 };
-    let task_e_sleep_ticks: i64 = if (dharafs_recovery_active_get() == (1 as u32)) || (gc_urgent == 1) { 1 } else { 20 };
+    let task_e_sleep_ticks: i64 = (if (dharafs_recovery_active_get() == (1 as u32)) || (gc_urgent == 1) { sched_ms_to_ticks(500) } else { sched_ms_to_ticks(10000) }) as i64;
     let _ = task_sleep_ticks(task_e_sleep_ticks);
     // 2026-10-23 (real-HW kernelupload-stream stall ROOT CAUSE, user
     // request: "scheduler should be smart enough to know precedence
@@ -44588,7 +44601,7 @@ fn kernelupload_stream_report_done(total_len: u32) -> i64 {
 // call site (kernelupload's stream start/progress/end, wifikey's
 // chunk/commit/abort) shares the exact same engage/touch/check logic
 // rather than five places each hand-rolling their own tick math.
-const MAINTENANCE_MODE_STALE_TICKS: i64 = 60; // 30s @ 500ms/tick -- a
+const MAINTENANCE_MODE_STALE_MS: i64 = 30000; // 30 s (was 60 ticks @ 500 ms) -- a
 // deliberately generous, protocol-agnostic bound (kernelupload's own
 // specific 10s-inactivity auto-abort is tighter and separate, tuned
 // for its own tight busy-poll loop; this one has to stay safe for a
@@ -44621,7 +44634,7 @@ fn maintenance_mode_is_active() -> u32 {
   // round -- plain `-` on a tick counter, same ~34-year practical wrap
   // period as task_heartbeat's own matching fix, kept consistent with
   // this project's standing wrapping_sub policy.
-  if wrapping_sub(now_tick, last_touch) > (MAINTENANCE_MODE_STALE_TICKS as u32) {
+  if wrapping_sub(now_tick, last_touch) > sched_ms_to_ticks(MAINTENANCE_MODE_STALE_MS) {
     let _ = maintenance_mode_active_set(0 as u32);
     return 0 as u32;
   }
@@ -50555,7 +50568,7 @@ fn task_f() -> i64 {
         // and same practically-34-year wrap period as task_heartbeat's
         // own matching fix, kept consistent per this project's
         // standing wrapping_sub policy).
-        if wrapping_sub(now_tick, last_tick) > (20 as u32) {
+        if wrapping_sub(now_tick, last_tick) > sched_ms_to_ticks(10000) {   // 10 s inactivity
           // TASK #355/#356 follow-up (2026-10-15): live register dump
           // BEFORE declaring the abort, to root-cause a real-HW find --
           // a continuous, full-line-rate host transmission (confirmed
@@ -50788,7 +50801,7 @@ fn task_f() -> i64 {
     } else {
     let ready: u32 = shell_get_line_ready();
     if ready == (0 as u32) {
-      let _ = task_sleep_ticks(2);
+      let _ = task_sleep_ms(1000);
     } else {
       // Round 76: shell_dispatch handles every command, most of which
       // touch DharaFS's shared state (ls/cat/write/rm/mkdir/stat/...)
@@ -50890,7 +50903,7 @@ fn task_custom_demo() -> i64 {
       let _ = task_custom_demo_stuck_spin(stuck_ticks);
       let _ = uart_puts("CUSTOM: stuck spin finished, resuming normal operation\n");
     } else {
-      let _ = task_sleep_ticks(7);
+      let _ = task_sleep_ms(3500);
     }
     let _ = task_custom_demo_wake_body();
   }
@@ -50957,7 +50970,7 @@ fn task_mutex_demo_low_wake_body() -> i64 {
   if mlow_log == 1 {
     let _ = uart_puts_bounded("MUTEX-LOW: holding demo mutex, now sleeping 5 ticks while still holding it\n");
   }
-  let _ = task_sleep_ticks(5);
+  let _ = task_sleep_ms(2500);
   let boosted: u32 = current_eff_prio();
   if mlow_log == 1 {
     let _ = uart_puts_bounded("MUTEX-LOW: woke up still holding demo mutex, eff_prio now=");
@@ -51018,7 +51031,7 @@ fn task_mutex_demo_low_stuck_body(stuck_ticks: u32) -> i64 {
 #[bounded_stack(bytes=512)]
 fn task_mutex_demo_low() -> i64 {
   while true {
-    let _ = task_sleep_ticks(2);
+    let _ = task_sleep_ms(1000);
     let stuck_mutex_ticks: u32 = fault_stuck_mutex_ticks_take();
     if stuck_mutex_ticks > (0 as u32) {
       let _ = task_mutex_demo_low_stuck_body(stuck_mutex_ticks);
@@ -51126,7 +51139,7 @@ fn task_mutex_demo_high_wake_body() -> i64 {
 #[bounded_stack(bytes=512)]
 fn task_mutex_demo_high() -> i64 {
   while true {
-    let _ = task_sleep_ticks(2);
+    let _ = task_sleep_ms(1000);
     let _ = task_mutex_demo_high_wake_body();
   }
   return 0;
