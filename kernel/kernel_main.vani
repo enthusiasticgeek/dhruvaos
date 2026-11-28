@@ -10034,11 +10034,25 @@ fn dharafs_ecc_layout_v2_init() -> i64 {
     if hardware_is_real_hw_get() == (1 as u32) {
       let _ = watchdog_kick();
     }
-    let _ = sdhost_write_block_once(dharafs_ecc_table_base() + s, buf);
+    // retrying write + checked: an unchecked single-attempt write left the
+    // marker unwritten on the real card, so EVERY boot re-zeroed the table
+    // (all parity wiped each boot)
+    if sdhost_write_block(dharafs_ecc_table_base() + s, buf) != 0 {
+      let _ = uart_puts("DharaFS ECC: relocated table init write failed -- will retry next boot\n");
+      return 0 - 1;
+    }
     s = s + 1;
   }
   let _ = buf_write_u32_be(buf, 0 as u32, 0x45434332 as u32);
-  let _ = sdhost_write_block_once(dharafs_ecc_layout_marker_block(), buf);
+  if sdhost_write_block(dharafs_ecc_layout_marker_block(), buf) != 0 {
+    let _ = uart_puts("DharaFS ECC: relocated table marker write failed -- will retry next boot\n");
+    return 0 - 1;
+  }
+  let vbuf: mut ref i64 = dharafs_sd_scratch_get();
+  if (sdhost_read_block(dharafs_ecc_layout_marker_block(), vbuf) != 0) || (buf_read_u32_be(vbuf, 0 as u32) != (0x45434332 as u32)) {
+    let _ = uart_puts("DharaFS ECC: relocated table marker did not read back -- will retry next boot\n");
+    return 0 - 1;
+  }
   let _ = dharafs_ecc_cache_set_sector_num(0 as u32);
   let _ = dharafs_ecc_cache_set_dirty(0 as u32);
   let _ = uart_puts("DharaFS ECC: relocated parity table initialized (9365-9839, log-only scope)\n");
@@ -14472,41 +14486,62 @@ fn dharafs_compact_blocks_per_call() -> i64 {
 // abandon the pass, not retry from the failure point -- see this
 // function's own caller for why that's the right posture here).
 fn dharafs_gc_erase_range_step(buf: mut ref i64, cursor: i64, target: i64) -> i64 {
+  // 2026-11-27: a block that will not erase (write zeros + read back all
+  // zero) no longer abandons the whole pass. On the real card a single such
+  // block threw away every successful scan (kept 147 records in 194 blocks
+  // of a full 7600-block log), so the log stayed full forever. Each block
+  // gets two attempts; one that still fails is marked bad -- scans and
+  // compaction skip marked blocks, so its stale contents can never be
+  // resurrected as a "valid" record -- and the erase carries on. More than
+  // 16 failures in one pass means something systemic (the write path
+  // itself), so that still abandons the pass, loudly.
   let c: i64 = cursor;
   let budget: i64 = dharafs_compact_blocks_per_call();
   let done: i64 = 0;
   while ((c as u32) < (target as u32)) && (done < budget) {
-    let z: i64 = 0;
-    while z < 512 {
-      let _ = buf_write_byte(buf, z as u32, 0 as u32);
-      z = z + 1;
-    }
-    // See dharafs_ecc_protect_on_write's own comment -- only safe to
-    // skip BCH-encoding this write when encryption is off, since an
-    // encrypted "blank" page is NOT actually all-zero ciphertext on
-    // disk (the AEAD nonce/tag mixing means there's real content
-    // worth protecting even for all-zero plaintext).
-    if dharafs_crypto_get_enabled() == (0 as u32) {
-      let _ = dharafs_ecc_skip_next_protect_set(1 as u32);
-    }
-    let wr_status: i64 = dharafs_block_write(c, buf);
-    if wr_status != 0 {
-      return 0 - 1;
-    }
-    let rd_status: i64 = dharafs_block_read(c, buf);
-    if rd_status != 0 {
-      return 0 - 1;
-    }
-    let zz: i64 = 0;
-    let all_zero: i64 = 1;
-    while zz < 512 {
-      if buf_read_byte(buf, zz as u32) != (0 as u32) {
-        all_zero = 0;
+    let attempt: i64 = 0;
+    let ok: i64 = 0;
+    let why: i64 = 0;
+    while (attempt < 2) && (ok == 0) {
+      let z: i64 = 0;
+      while z < 512 {
+        let _ = buf_write_byte(buf, z as u32, 0 as u32);
+        z = z + 1;
       }
-      zz = zz + 1;
+      if dharafs_crypto_get_enabled() == (0 as u32) {
+        let _ = dharafs_ecc_skip_next_protect_set(1 as u32);
+      }
+      if dharafs_block_write(c, buf) != 0 {
+        why = 1;
+      } else {
+        if dharafs_block_read(c, buf) != 0 {
+          why = 2;
+        } else {
+          let zz: i64 = 0;
+          let all_zero: i64 = 1;
+          while zz < 512 {
+            if buf_read_byte(buf, zz as u32) != (0 as u32) {
+              all_zero = 0;
+            }
+            zz = zz + 1;
+          }
+          if all_zero == 1 { ok = 1; } else { why = 3; }
+        }
+      }
+      attempt = attempt + 1;
     }
-    if all_zero == 0 {
-      return 0 - 1;
+    if ok == 0 {
+      let fails: u32 = dharafs_cstat_get(2 as u32) + (1 as u32);
+      let _ = dharafs_cstat_set(2 as u32, fails);
+      let _ = uart_puts("DharaFS GC: block ");
+      let _ = uart_put_hex32(c as u32);
+      let _ = uart_puts(if why == 1 { " failed to erase (write)" } else { if why == 2 { " failed to erase (read-back)" } else { " failed to erase (not zero on read-back)" } });
+      if fails > (16 as u32) {
+        let _ = uart_puts(" -- more than 16 in this pass, abandoning it (systemic?)\n");
+        return 0 - 1;
+      }
+      let _ = uart_puts(" -- marked bad, continuing\n");
+      let _ = dharafs_badblock_mark(c);
     }
     let _ = dharafs_gc_set_erase_cursor((c + 1) as u32);
     c = c + 1;
@@ -14554,6 +14589,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
     let erase_target: i64 = dharafs_compact_get_pass_target() as i64;
     let erase_step_result: i64 = dharafs_gc_erase_range_step(buf, erase_cursor as i64, erase_target);
     if erase_step_result < 0 {
+      let _ = uart_puts("DharaFS compact: erase phase ABANDONED -- nothing reclaimed this pass\n");
       // Abandon this pass entirely -- log_start was never advanced for
       // this pass, so a future fresh pass naturally retries the same
       // region from scratch. Same posture the scan phase's own
