@@ -3689,6 +3689,8 @@ extern "C" fn wifi_pw_loaded_set(v: u32) -> i64;
 extern "C" fn kuprof_add(i: u32, v: u32) -> i64;
 extern "C" fn kuprof_get(i: u32) -> u32;
 extern "C" fn kuprof_reset() -> i64;
+extern "C" fn dharafs_stale_index_count_bump() -> i64;
+extern "C" fn dharafs_stale_index_count_get() -> u32;
 extern "C" fn gov_util_idle_get() -> u32;
 extern "C" fn gov_util_tick_get() -> u32;
 extern "C" fn gov_util_valid_get() -> u32;
@@ -15992,10 +15994,49 @@ fn dharafs_stat(path: Str, meta_buf: mut ref i64) -> i64 {
   return dharafs_stat_raw(path_buf, path_len, meta_buf);
 }
 
+// 2026-11-28: a record's head block must actually be THIS path's record.
+// dharafs_read_from_block_raw trusted the directory index blindly, so a
+// stale index entry returned whatever the block now held -- real HW: the
+// tlsd certificate read as another file's bytes ("certificate has no
+// single Ed25519 key") or as nothing, right after boot.
+fn dharafs_block_holds_path(blk: i64, path_buf: mut ref i64, path_len: i64) -> i64 {
+  let hb: mut ref i64 = dharafs_sd_scratch_get();
+  if dharafs_block_read(blk, hb) != 0 { return 0; }
+  if buf_read_u32(hb, 0 as u32) != buf_checksum(hb, 4 as u32, 508 as u32) { return 0; }
+  if buf_read_u32(hb, 4 as u32) == (0 as u32) { return 0; }
+  if (buf_read_u32(hb, 8 as u32) as i64) != path_len { return 0; }
+  let k: i64 = 0;
+  while k < path_len {
+    if buf_read_byte(hb, (12 + k) as u32) != buf_read_byte(path_buf, k as u32) { return 0; }
+    k = k + 1;
+  }
+  return 1;
+}
+
 fn dharafs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i64 {
   let blk: i64 = dharafs_find_latest_block_raw(path_buf, path_len);
   if blk < 0 {
     return 0 - 1;
+  }
+  if dharafs_block_holds_path(blk, path_buf, path_len) == 0 {
+    let _ = uart_puts("DharaFS: STALE directory-index entry for ");
+    let _ = dharafs_print_data(path_buf, path_len);
+    let _ = uart_puts(" -> block ");
+    let _ = uart_put_hex32(blk as u32);
+    let _ = uart_puts(" holds other data; rescanning the log\n");
+    let h: u32 = dharafs_dirindex_hash(path_buf, 0, path_len);
+    let slot: i64 = dharafs_dirindex_find_slot(path_buf, 0, path_len, h);
+    if slot >= 0 { let _ = dirindex_set_valid_at(slot as u32, 0 as u32); }
+    let was_complete: u32 = dharafs_dirindex_complete_get();
+    let _ = dharafs_dirindex_complete_set(0 as u32);   // force the log scan for this lookup
+    let blk2: i64 = dharafs_find_latest_block_raw(path_buf, path_len);
+    let _ = dharafs_dirindex_complete_set(was_complete);
+    if (blk2 < 0) || (dharafs_block_holds_path(blk2, path_buf, path_len) == 0) {
+      return 0 - 1;
+    }
+    let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, blk2);
+    let _ = dharafs_stale_index_count_bump();
+    return dharafs_read_from_block_raw(blk2, out_buf);
   }
   return dharafs_read_from_block_raw(blk, out_buf);
 }
@@ -49351,6 +49392,9 @@ fn shell_dispatch() -> i64 {
     let _ = uart_puts("  boot_count: ");
     let _ = uart_put_i64(buf_read_u32(crashlog_meta_scratch_get(), 4 as u32) as i64);
     let _ = uart_puts(if post_recovery_pending_get() == (1 as u32) { " (this boot's increment pending: recovery scan running)\n" } else { "\n" });
+    let _ = uart_puts("  dharafs_stale_index_repairs: ");
+    let _ = uart_put_i64(dharafs_stale_index_count_get() as i64);
+    let _ = uart_puts("\n");
     let _ = uart_puts("  svc_preempt_deferred: ");   // ticks that landed in kernel code (switch deferred)
     let _ = uart_put_i64(sched_svc_preempt_deferred_count_get() as i64);
     let _ = uart_puts("\n");

@@ -973,3 +973,7 @@ long gov_util_mark(long idle, long tick) { gov_util_idle_v = (unsigned int)idle;
 static volatile unsigned int gov_util_busy_pct_v = 0;
 long gov_util_busy_pct_get(void) { return (long)gov_util_busy_pct_v; }
 long gov_util_busy_pct_set(long v) { gov_util_busy_pct_v = (unsigned int)v; return 0; }
+
+static volatile unsigned int dharafs_stale_index_count_v = 0;
+long dharafs_stale_index_count_bump(void) { dharafs_stale_index_count_v++; return 0; }
+long dharafs_stale_index_count_get(void) { return (long)dharafs_stale_index_count_v; }
