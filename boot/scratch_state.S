@@ -3236,3 +3236,25 @@ dharafs_ecc_fast_state_get:
     ldr r0, =dharafs_ecc_fast_state_word
     ldr r0, [r0]
     bx lr
+
+/* 2026-11-27: per-pass DharaFS compaction statistics (reset when a pass
+ * starts, reported when its scan phase ends): kept-latest, kept-for-
+ * snapshot, dropped, relocation failures, first failing block, and the
+ * failing step (1 = delete-relocate, 2 = read-from-block, 3 = append-
+ * relocate). */
+.section ".bss"
+.align 4
+dharafs_cstat_words:
+    .space 24
+.section ".text"
+.global dharafs_cstat_get
+dharafs_cstat_get:
+    ldr r1, =dharafs_cstat_words
+    ldr r0, [r1, r0, lsl #2]
+    bx lr
+.global dharafs_cstat_set
+dharafs_cstat_set:
+    ldr r2, =dharafs_cstat_words
+    str r1, [r2, r0, lsl #2]
+    mov r0, #0
+    bx lr

@@ -400,6 +400,8 @@ extern "C" fn dharafs_ecc_fast_table_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_ecc_fast_table_get() -> mut ref i64;
 extern "C" fn dharafs_ecc_fast_state_set(v: u32) -> i64;
 extern "C" fn dharafs_ecc_fast_state_get() -> u32;
+extern "C" fn dharafs_cstat_get(i: u32) -> u32;
+extern "C" fn dharafs_cstat_set(i: u32, v: u32) -> i64;
 // 2026-11-27: option B -- data cache for task-stack pages (boot/rpi1/runtime_stubs.c).
 extern "C" fn dhruva_stack_cache_set(on: u32) -> u32;   // C long = 32-bit
 extern "C" fn dhruva_stack_cache_get() -> u32;
@@ -14516,6 +14518,17 @@ fn dharafs_gc_erase_range_step(buf: mut ref i64, cursor: i64, target: i64) -> i6
   return 0;
 }
 
+// 2026-11-27: records the first relocation failure of a compaction pass
+// (block + step: 1 delete-relocate, 2 read-from-block, 3 append-relocate).
+fn dharafs_compact_note_fail(blk: i64, why: i64) -> i64 {
+  if dharafs_cstat_get(3 as u32) == (0 as u32) {
+    let _ = dharafs_cstat_set(4 as u32, blk as u32);
+    let _ = dharafs_cstat_set(5 as u32, why as u32);
+  }
+  let _ = dharafs_cstat_set(3 as u32, dharafs_cstat_get(3 as u32) + (1 as u32));
+  return 0;
+}
+
 fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) -> i64 {
   // 2026-11-27: liveness below is dharafs_find_latest_block_raw(path) == blk.
   // That is only trustworthy -- and only bounded in cost -- with a COMPLETE
@@ -14701,6 +14714,8 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
   if resume_block == (0 as u32) {
     let _ = dharafs_compact_set_pass_target(old_next_block);
     let _ = dharafs_compact_set_failed(0 as u32);
+    let ci: u32 = 0 as u32;
+    while ci < (6 as u32) { let _ = dharafs_cstat_set(ci, 0 as u32); ci = ci + (1 as u32); }
   }
   let start_blk: u32 = if resume_block == (0 as u32) { log_start } else { resume_block };
   // Round B: where THIS pass's own relocated records land. Reset to
@@ -14789,6 +14804,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
         let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
         let needed_by_snapshot: i64 = if is_latest == 1 { 0 } else { dharafs_gc_record_needed_by_live_snapshot(path_buf, rec_path_len as i64, rec_seq) };
         if (is_latest == 1) || (needed_by_snapshot == 1) {
+          let _ = dharafs_cstat_set(if is_latest == 1 { 0 as u32 } else { 1 as u32 }, dharafs_cstat_get(if is_latest == 1 { 0 as u32 } else { 1 as u32 }) + (1 as u32));
           // Relocate into this pass's own write_cursor -- NEVER into
           // dharafs_state_get_next_block() (today's real append
           // frontier, which every OTHER writer in the system targets).
@@ -14804,6 +14820,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
             let del_status: i64 = dharafs_delete_raw_relocate(path_buf, rec_path_len as i64, write_cursor, rec_seq, is_latest);
             if del_status != 0 {
               all_ok = 0;
+              let _ = dharafs_compact_note_fail(blk, 1);
             } else {
               write_cursor = write_cursor + 1;
             }
@@ -14848,6 +14865,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
             let full_len: i64 = dharafs_read_from_block_raw(blk, data_buf);
             if full_len < 0 {
               all_ok = 0;
+              let _ = dharafs_compact_note_fail(blk, 2);
             } else {
               // Round 42: preserve the existing owner/group/mode --
               // compaction relocates a record's storage, it must never
@@ -14862,6 +14880,7 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
               let blocks_written: i64 = dharafs_append_raw_relocate(path_buf, rec_path_len as i64, data_buf, full_len, rec_uid, rec_gid, rec_mode, write_cursor, rec_seq, is_latest);
               if blocks_written <= 0 {
                 all_ok = 0;
+                let _ = dharafs_compact_note_fail(blk, 3);
               } else {
                 write_cursor = write_cursor + blocks_written;
               }
@@ -14880,6 +14899,24 @@ fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i6
   }
 
   if (blk as u32) >= old_next_block {
+    let _ = uart_puts("DharaFS compact: scan done -- kept_latest=");
+    let _ = uart_put_i64(dharafs_cstat_get(0 as u32) as i64);
+    let _ = uart_puts(" kept_for_snapshot=");
+    let _ = uart_put_i64(dharafs_cstat_get(1 as u32) as i64);
+    let _ = uart_puts(" reloc_fail=");
+    let _ = uart_put_i64(dharafs_cstat_get(3 as u32) as i64);
+    if dharafs_cstat_get(3 as u32) != (0 as u32) {
+      let _ = uart_puts(" (first at block ");
+      let _ = uart_put_hex32(dharafs_cstat_get(4 as u32));
+      let _ = uart_puts(", step ");
+      let _ = uart_put_i64(dharafs_cstat_get(5 as u32) as i64);
+      let _ = uart_puts(")");
+    }
+    let _ = uart_puts(" write_cursor=");
+    let _ = uart_put_hex32(write_cursor as u32);
+    let _ = uart_puts(" of ");
+    let _ = uart_put_hex32(old_next_block);
+    let _ = uart_puts(if all_ok == 1 { " -> erasing the rest\n" } else { " -> pass ABANDONED (nothing reclaimed)\n" });
     // The whole [log_start, old_next_block) range has now been
     // scanned -- possibly across several resumed calls. Only true if
     // every relocation across the WHOLE pass actually succeeded
