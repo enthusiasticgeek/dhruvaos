@@ -406,6 +406,8 @@ extern "C" fn dharafs_bb_persist_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_bb_persist_scratch_get() -> mut ref i64;
 extern "C" fn dhruva_fatal_halt_get() -> u32;   // C long = 32-bit
 extern "C" fn dhruva_scratch_slot(id: i64, n: i64) -> mut ref i64;
+extern "C" fn dharafs_media_key_state_get() -> u32;
+extern "C" fn dharafs_media_key_state_set(v: u32) -> u32;
 // 2026-11-27: option B -- data cache for task-stack pages (boot/rpi1/runtime_stubs.c).
 extern "C" fn dhruva_stack_cache_set(on: u32) -> u32;   // C long = 32-bit
 extern "C" fn dhruva_stack_cache_get() -> u32;
@@ -46466,6 +46468,7 @@ fn shell_dispatch_crypto(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> 
   let sub_end: i64 = shell_find_space(line_buf, sub_start, line_len);
 
   if shell_word_matches(line_buf, sub_start, sub_end, "on") == 1 {
+    let _ = dharafs_crypto_key_ensure();
     let _ = dharafs_crypto_set_enabled(1 as u32);
     let _ = uart_puts("DharaFS media encryption: ON (AEAD, tamper-detected)\n");
     return 0;
@@ -64981,7 +64984,17 @@ fn dharafs_crypto_meta_write_entry(block_num: i64, counter: i64, tag: mut ref i6
 // ever been observed under the REAL post-multitasking scheduler), so a
 // real, security-appropriate iteration count is safe to use here,
 // unlike pbkdf2_auth_iterations's own per-request, in-shell call.
-fn dharafs_crypto_key_init() -> i64 {
+// 2026-11-27 BOOT TIME: derived on first need, not on every boot. This
+// 10000-iteration PBKDF2 was ~25 s of every real-HW boot (88% of kernel
+// boot) -- run even with media encryption OFF (the default). Note its
+// inputs are public constants, so the result is a public constant too:
+// laziness changes no security property (see the security note in the
+// commit/TODO -- the key needs a per-device secret to mean anything).
+fn dharafs_crypto_key_ensure() -> i64 {
+  if dharafs_media_key_state_get() == (1 as u32) {
+    return 0;
+  }
+  let _ = uart_puts("DharaFS: deriving the media-encryption key (PBKDF2, a few seconds)...\n");
   let passphrase: mut ref i64 = dharafs_crypto_scratch_ptr();
   let pass_len: i64 = str_len_bytes("dhruva-media-encryption-key-v1");
   let _ = str_copy_to_buf("dhruva-media-encryption-key-v1", passphrase);
@@ -64990,6 +65003,7 @@ fn dharafs_crypto_key_init() -> i64 {
   let _ = str_copy_to_buf("dhruva-dharafs-media-salt", salt);
   let key: mut ref i64 = dharafs_crypto_key_ptr();
   let _ = pbkdf2_hmac_sha256(passphrase, pass_len, salt, salt_len, 10000, key);
+  let _ = dharafs_media_key_state_set(1 as u32);
   return 0;
 }
 
@@ -65006,6 +65020,7 @@ fn dharafs_crypto_key_init() -> i64 {
 // metadata region as part of this same call; a caller never touches
 // metadata directly.
 fn dharafs_crypto_encrypt_block(block_num: i64, plaintext: mut ref i64, out_ciphertext: mut ref i64) -> i64 {
+  if dharafs_media_key_state_get() == (0 as u32) { let _ = dharafs_crypto_key_ensure(); }
   let counter: i64 = dharafs_crypto_meta_read_counter(block_num) + 1;
 
   let nonce: mut ref i64 = dharafs_crypto_nonce_ptr();
@@ -65038,6 +65053,7 @@ fn dharafs_crypto_encrypt_block(block_num: i64, plaintext: mut ref i64, out_ciph
 // read/write's own pre-existing "encryption off" passthrough for the
 // not-yet-encrypted portion of a disk.
 fn dharafs_crypto_decrypt_block(block_num: i64, ciphertext: mut ref i64, out_plaintext: mut ref i64) -> i64 {
+  if dharafs_media_key_state_get() == (0 as u32) { let _ = dharafs_crypto_key_ensure(); }
   let counter: i64 = dharafs_crypto_meta_read_counter(block_num);
   if counter == 0 {
     let i: i64 = 0;
@@ -65175,6 +65191,16 @@ fn dharafs_encryption_self_check() -> i64 {
 
   let sd_ok: i64 = 1;
   let prev_enabled: u32 = dharafs_crypto_get_enabled();
+  // A round-trip self-check proves the cipher path with ANY key; it must
+  // not force the (slow) production derivation onto every boot.
+  let test_key_loaded: i64 = 0;
+  if dharafs_media_key_state_get() != (1 as u32) {
+    let tk: mut ref i64 = dharafs_crypto_key_ptr();
+    let ki: i64 = 0;
+    while ki < 32 { let _ = buf_write_byte(tk, ki as u32, ((ki * 29 + 7) & 0xff) as u32); ki = ki + 1; }
+    let _ = dharafs_media_key_state_set(2 as u32);
+    test_key_loaded = 1;
+  }
   let _ = dharafs_crypto_set_enabled(1 as u32);
 
   let write_status: i64 = dharafs_block_write(test_block, plaintext);
@@ -65215,6 +65241,12 @@ fn dharafs_encryption_self_check() -> i64 {
   }
 
   let _ = dharafs_crypto_set_enabled(prev_enabled);
+  if test_key_loaded == 1 {
+    let tk2: mut ref i64 = dharafs_crypto_key_ptr();
+    let kz: i64 = 0;
+    while kz < 32 { let _ = buf_write_byte(tk2, kz as u32, 0 as u32); kz = kz + 1; }
+    let _ = dharafs_media_key_state_set(0 as u32);
+  }
 
   let _ = uart_puts("CRYPTO: DharaFS media encryption real SD round trip (on-disk bytes != plaintext, decrypt reproduces plaintext, corrupted on-disk block is rejected)");
   if sd_ok == 1 {
@@ -66614,7 +66646,7 @@ fn kernel_main() -> i64 {
   // cipher above. Key derivation runs once here, single-threaded,
   // before start_multitasking. The self-check needs a working SD
   // controller, already brought up above.
-  let _ = dharafs_crypto_key_init();
+  // media key: derived lazily (dharafs_crypto_key_ensure) -- was ~25 s here
   if boot_debug_enabled() == 1 { let _ = dharafs_encryption_self_check(); }
   // Task #308 follow-up: kick after the media-encryption self-check
   // (its own real SD round trip) -- see the kick right after

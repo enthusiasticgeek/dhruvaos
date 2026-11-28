@@ -664,6 +664,12 @@ void *dhruva_scratch_slot(long long id, long long n) {
     return dhruva_scratch_ptr[id];
 }
 
+/* 2026-11-27: DharaFS media-key state: 0 = not derived, 1 = derived
+ * (production key), 2 = encryption self-check's fixed test key loaded. */
+static volatile unsigned int dharafs_media_key_state_v = 0;
+long dharafs_media_key_state_get(void) { return (long)dharafs_media_key_state_v; }
+long dharafs_media_key_state_set(long v) { dharafs_media_key_state_v = (unsigned int)v; return 0; }
+
 void *dhruva_alloc_stack_guarded(long n) {
     unsigned long need = (unsigned long)n;
     unsigned long saved_cpsr;
