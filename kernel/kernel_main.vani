@@ -10033,7 +10033,13 @@ fn dharafs_ecc_layout_marker_block() -> i64 { return 9844; }
 // absent ("DECC" magic missing), so it is simply unverified -- never a
 // false UNCORRECTABLE from stale or foreign bytes. Returns 1 if it ran.
 fn dharafs_ecc_layout_v2_init() -> i64 {
-  let buf: mut ref i64 = dharafs_ecc_cache_buf_get();
+  // 2026-11-28: a dedicated buffer, never the ECC cache's. Reading the
+  // marker into the cache buffer left the cache claiming its sector while
+  // holding the marker block: verifies for that sector's 16 log blocks
+  // read the wrong bytes (silently unprotected), and the next protected
+  // write flushed marker bytes over that table sector (15 other blocks'
+  // parity wiped). This runs at every dharafs_init, not only first boot.
+  let buf: mut ref i64 = dhruva_scratch_slot(29, 512);
   // 2026-11-28: the marker check must use the RETRYING read, and a read
   // that still fails must never be taken as "not initialized": a transient
   // single-attempt read failure early in boot re-zeroed the whole table on
@@ -10047,6 +10053,12 @@ fn dharafs_ecc_layout_v2_init() -> i64 {
   if buf_read_u32_be(buf, 0 as u32) == (0x45434332 as u32) {   // "ECC2"
     return 0;
   }
+  // Diagnostic (real HW re-initialized on every boot although the marker
+  // read back right after writing): show what the block holds instead.
+  let _ = uart_puts("DharaFS ECC: marker block 9844 holds ");
+  let dq: i64 = 0;
+  while dq < 16 { let _ = uart_put_hex_byte(buf_read_byte(buf, dq as u32)); dq = dq + 1; }
+  let _ = uart_puts(" -- (re)initializing the parity table\n");
   let z: i64 = 0;
   while z < 512 { let _ = buf_write_byte(buf, z as u32, 0 as u32); z = z + 1; }
   let s: i64 = 0;
@@ -10068,7 +10080,10 @@ fn dharafs_ecc_layout_v2_init() -> i64 {
     let _ = uart_puts("DharaFS ECC: relocated table marker write failed -- will retry next boot\n");
     return 0 - 1;
   }
-  let vbuf: mut ref i64 = dharafs_sd_scratch_get();
+  // The table was just rewritten underneath any cached sector: drop it.
+  let _ = dharafs_ecc_cache_set_sector_num(0 as u32);
+  let _ = dharafs_ecc_cache_set_dirty(0 as u32);
+  let vbuf: mut ref i64 = dhruva_scratch_slot(30, 512);
   if (sdhost_read_block(dharafs_ecc_layout_marker_block(), vbuf) != 0) || (buf_read_u32_be(vbuf, 0 as u32) != (0x45434332 as u32)) {
     let _ = uart_puts("DharaFS ECC: relocated table marker did not read back -- will retry next boot\n");
     return 0 - 1;
@@ -11054,7 +11069,7 @@ fn dharafs_dirindex_snapshot_v2_base() -> i64 { return 9845; }
 fn dharafs_dirindex_snapshot_v2_blocks() -> i64 { return 381; }
 
 fn dharafs_dirindex_snapshot_persist(generation: u32) -> i64 {
-  let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let scratch: mut ref i64 = dhruva_scratch_slot(31, 512);   // was a per-call 512 B leak
   let per_blk: i64 = dharafs_dirindex_snapshot_entries_per_block();
   let cap: i64 = per_blk * dharafs_dirindex_snapshot_v2_blocks();
   let count: i64 = 0;
@@ -11099,7 +11114,7 @@ fn dharafs_dirindex_snapshot_persist(generation: u32) -> i64 {
       if sdhost_write_block(dharafs_dirindex_snapshot_v2_base() + blk, scratch) != 0 { return 0 - 1; }
     }
   }
-  let header: mut ref i64 = dhruva_alloc_bytes(512);
+  let header: mut ref i64 = dhruva_scratch_slot(32, 512);   // was a per-call 512 B leak
   let hz: i64 = 0;
   while hz < 512 { let _ = buf_write_byte(header, hz as u32, 0 as u32); hz = hz + 1; }
   let _ = buf_write_u32(header, 0 as u32, 0x44584932 as u32); // "DXI2"
