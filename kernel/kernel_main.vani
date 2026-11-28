@@ -10034,8 +10034,17 @@ fn dharafs_ecc_layout_marker_block() -> i64 { return 9844; }
 // false UNCORRECTABLE from stale or foreign bytes. Returns 1 if it ran.
 fn dharafs_ecc_layout_v2_init() -> i64 {
   let buf: mut ref i64 = dharafs_ecc_cache_buf_get();
-  let rd: i64 = sdhost_read_block_once(dharafs_ecc_layout_marker_block(), buf);
-  if (rd == 0) && (buf_read_u32_be(buf, 0 as u32) == (0x45434332 as u32)) {   // "ECC2"
+  // 2026-11-28: the marker check must use the RETRYING read, and a read
+  // that still fails must never be taken as "not initialized": a transient
+  // single-attempt read failure early in boot re-zeroed the whole table on
+  // every real-HW boot (all parity wiped, +1.5 s), even though the marker
+  // was on the card. Only a clean read without the marker means "fresh".
+  let rd: i64 = sdhost_read_block(dharafs_ecc_layout_marker_block(), buf);
+  if rd != 0 {
+    let _ = uart_puts("DharaFS ECC: marker block unreadable this boot -- leaving the parity table untouched\n");
+    return 0;
+  }
+  if buf_read_u32_be(buf, 0 as u32) == (0x45434332 as u32) {   // "ECC2"
     return 0;
   }
   let z: i64 = 0;
@@ -63919,6 +63928,26 @@ fn shell_dispatch_tlsd(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i6
   }
   if shell_word_matches(line_buf, ss, se, "certend") == 1 {
     let cur2: i64 = tlsd_st_get(TST_CERT_CUR);
+    // 2026-11-28: the assembled bytes must be exactly one complete DER
+    // SEQUENCE. A lost `certchunk` line (real UART) stored a truncated
+    // 224-of-272-byte certificate that still carried the identity key (it
+    // sits early in the DER), and TLS clients then failed "ASN1 lib".
+    let cb: mut ref i64 = tlsd_p(TLSD_CERT_OFF);
+    let der_total: i64 = if (cur2 >= 4) && (buf_read_byte(cb, 0 as u32) == (0x30 as u32)) && (buf_read_byte(cb, 1 as u32) == (0x82 as u32)) {
+      4 + ((buf_read_byte(cb, 2 as u32) as i64) * 256) + (buf_read_byte(cb, 3 as u32) as i64)
+    } else {
+      if (cur2 >= 3) && (buf_read_byte(cb, 0 as u32) == (0x30 as u32)) && (buf_read_byte(cb, 1 as u32) == (0x81 as u32)) {
+        3 + (buf_read_byte(cb, 2 as u32) as i64)
+      } else { 0 - 1 }
+    };
+    if der_total != cur2 {
+      let _ = uart_puts("tlsd: certificate is not one complete DER SEQUENCE (got ");
+      let _ = uart_put_i64(cur2);
+      let _ = uart_puts(" bytes, header says ");
+      let _ = uart_put_i64(der_total);
+      let _ = uart_puts(") -- a certchunk line was lost? not saved; redo certbegin..certend\n");
+      return 0;
+    }
     if critical_config_read("tlsd_id", tlsd_s(TS_ID_SEED)) != 32 {
       let _ = uart_puts("tlsd: run 'tlsd keygen' first\n");
       return 0;

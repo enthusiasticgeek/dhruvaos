@@ -61,14 +61,29 @@ def main() -> int:
     # intact -- they are echoed back whole), so per-chunk acks are only a
     # pacing hint; certend (which parses and checks the assembled
     # certificate) and `tlsd status` below are the real verification.
-    for line in lines:
-        if line.startswith("tlsd ") and not line.endswith("certend"):
-            try:
-                send_and_wait(line, r"k, ", 5)
-            except SystemExit:
-                pass
-    send_and_wait("tlsd certend", r"certificate", 30)
-    print("board certificate installed")
+    # The board's UART input can lose a whole line (2026-11-28: one 48-byte
+    # certchunk vanished and certend stored a 224-byte certificate for a
+    # 272-byte DER -- TLS clients then failed "ASN1 lib"). Verify the size the
+    # board reports at certend against the real DER and redo the whole
+    # certificate on any mismatch (resending one chunk would append twice).
+    der_len = os.path.getsize(os.path.join(PKI, "board_cert.der"))
+    for attempt in range(1, 6):
+        for line in lines:
+            if line.startswith("tlsd ") and not line.endswith("certend"):
+                try:
+                    send_and_wait(line, r"k, ", 5)
+                except SystemExit:
+                    pass
+                time.sleep(0.3)
+        out = send_and_wait("tlsd certend", r"certificate[^\n]*\n|not saved", 30)
+        m = re.search(r"certificate saved \((\d+) bytes\)", out)
+        if m and int(m.group(1)) == der_len:
+            break
+        print(f"certificate attempt {attempt}: board stored {m.group(1) if m else '?'} bytes, expected {der_len} -- redoing")
+    else:
+        print("could not install the full certificate")
+        return 1
+    print(f"board certificate installed ({der_len} bytes, size verified)")
     if a.cert_only:
         st = send_and_wait("tlsd status", r"tlsd: identity", 20)
         last = st.strip().splitlines()[-1]
