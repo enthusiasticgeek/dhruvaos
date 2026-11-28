@@ -279,3 +279,34 @@ P1 → P2 → P3 → P5 → P4 (tickless) → P6.
 
 P5 needs P3's events for `task_join`. P6 is the largest change and comes
 last, behind a stable P1–P5.
+
+### P5b: retire the demo tasks (added 2026-11-28, per the owner's direction)
+
+The always-on demo tasks are `task_a` (HIGH), `task_b` (MEDIUM),
+`task_c` (LOW), `task_custom_demo`, `task_mutex_demo_low` and
+`task_mutex_demo_high`. They exist only for demonstration and as targets
+for the `fault stuck / stuckceiling / stuckmutex` injectors. Removing
+them frees 6 of the 16 slots, plus their periodic wake-ups and prints.
+That print volume is one of the things that broke the earlier
+finer-tick attempts.
+
+**Kept:** `task_d` (idle: `WFI` and the governor; the picker needs an
+always-ready task), `task_e` (DharaFS GC), `task_f` (shell) and
+`task_fsq` (DharaFS request queue).
+
+**Safety coverage is not given up.** The fault injectors exist to prove
+that the watchdog, heartbeat, WCET-eviction and ceiling enforcement
+catch a misbehaving task. With P5's lifecycle each test spawns a
+short-lived **test task** on demand (`selftest sched stuck|ceiling|
+mutex`), checks the expected detection, and the task exits. So:
+
+1. Land P5.
+2. Convert the injectors to spawn-on-demand, with the same assertions.
+3. Delete the demo tasks.
+4. Replace the fixed-index assumptions with handles: the deadline table
+   keyed to indices 0–2, `task_f`'s hard-coded heartbeat slot 5, and the
+   "indices 0–5 are fixed" comments and checks.
+
+**Gate:** every `fault` injector still reports its detection; phase4
+18/18. The test harness's dependency on demo-task output is removed
+first.
