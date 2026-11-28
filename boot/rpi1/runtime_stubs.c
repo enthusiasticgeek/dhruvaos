@@ -241,6 +241,8 @@ static void exit_panic_watchdog_arm(void) {
     *pm_rstc = pm_password | (cur & wrcfg_clr) | wrcfg_full_reset;
 }
 
+static void dhruva_halt_forever(void);   /* defined with dhruva_crit_enter, below */
+
 void exit(int code) {
     (void)code;
     unsigned int exit_fp;
@@ -261,6 +263,7 @@ void exit(int code) {
         dhruva_dprintf_puts("panic: arming a last-resort 2s watchdog reset before halting\n");
         exit_panic_watchdog_arm();
     }
+    dhruva_halt_forever();
     while (1) {
         /* halt -- there is no OS to return to (unless the watchdog
          * arm above fires first on a real-HW build) */
@@ -440,6 +443,51 @@ static void dhruva_oom_put_u64(unsigned long long v) {
     }
 }
 
+/* 2026-11-27: mode-aware critical sections. `cpsid` is a NO-OP in USR mode,
+ * and DhruvaOS tasks run in USR mode -- so the old `mrs cpsr; cpsid i`
+ * brackets were not atomic when a task called them (two tasks allocating
+ * at once could be handed the same memory), and they masked IRQ only, not
+ * the FIQ that drives the scheduler tick. Privileged callers mask I+F
+ * directly; USR callers go through SWI #9/#10 (boot/swi_entry.S), which
+ * set/clear I+F in the task's saved CPSR so it resumes genuinely masked. */
+extern unsigned long dhruva_swi_crit_enter(void);
+extern void dhruva_swi_crit_exit(unsigned long token);
+extern void dhruva_swi_fatal_halt(void);
+static inline int dhruva_in_usr_mode(void) {
+    unsigned long c;
+    __asm__ volatile ("mrs %0, cpsr" : "=r"(c));
+    return (c & 0x1FUL) == 0x10UL;
+}
+unsigned long dhruva_crit_enter(void) {
+    if (dhruva_in_usr_mode()) {
+        return dhruva_swi_crit_enter();
+    }
+    unsigned long c;
+    __asm__ volatile ("mrs %0, cpsr\n\tcpsid if" : "=r"(c) :: "memory");
+    return c & 0xC0UL;
+}
+void dhruva_crit_exit(unsigned long token) {
+    if (dhruva_in_usr_mode()) {
+        dhruva_swi_crit_exit(token);
+        return;
+    }
+    unsigned long c;
+    __asm__ volatile ("mrs %0, cpsr" : "=r"(c));
+    c = (c & ~0xC0UL) | (token & 0xC0UL);
+    __asm__ volatile ("msr cpsr_c, %0" :: "r"(c) : "memory");
+}
+/* Final halt for panic/FATAL: from a USR task, `while(1)` let the scheduler
+ * keep running every other task; halting in SVC with I+F masked stops the
+ * machine so the armed watchdog actually fires. */
+static void dhruva_halt_forever(void) {
+    if (dhruva_in_usr_mode()) {
+        dhruva_swi_fatal_halt();
+    }
+    __asm__ volatile ("cpsid if" ::: "memory");
+    while (1) {
+    }
+}
+
 static void dhruva_oom_fatal(unsigned long requested, unsigned long used, int injected) {
     /* BUG (found via round 51's own fault-injection testing -- live
      * QEMU verification, not just code review, is what actually
@@ -493,6 +541,7 @@ static void dhruva_oom_fatal(unsigned long requested, unsigned long used, int in
         dhruva_oom_puts("FATAL: arming a last-resort 2s watchdog reset before halting\n");
         exit_panic_watchdog_arm();
     }
+    dhruva_halt_forever();
     while (1) {
         /* halt -- there is no safe way to continue with a request this
          * function could not satisfy (unless the watchdog arm above
@@ -522,8 +571,7 @@ long long dhruva_alloc_count_get(void) {
 
 void *dhruva_alloc_bytes(long n) {
     unsigned long need = (unsigned long)n;
-    unsigned long saved_cpsr;
-    __asm__ volatile ("mrs %0, cpsr\n\tcpsid i" : "=r"(saved_cpsr) :: "memory");
+    unsigned long crit = dhruva_crit_enter();
 
     /* Round 51 fault injection -- checked BEFORE the real exhaustion
      * check below, so it can fire deterministically even when genuine
@@ -558,7 +606,7 @@ void *dhruva_alloc_bytes(long n) {
     unsigned char *p = dhruva_heap + aligned_used;
     dhruva_heap_used = aligned_used + need;
     dhruva_alloc_count = dhruva_alloc_count + 1;
-    __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
+    dhruva_crit_exit(crit);
     unsigned long i = 0;
     while (i < need) {
         p[i] = 0;
@@ -655,10 +703,12 @@ void *dhruva_scratch_slot(long long id, long long n) {
     if (id < 0 || id >= DHRUVA_SCRATCH_SLOTS || n <= 0) {
         return dhruva_alloc_bytes((long)n);   /* out of range: old behavior */
     }
+    unsigned long crit = dhruva_crit_enter();
     if (dhruva_scratch_ptr[id] == 0 || n > dhruva_scratch_len[id]) {
         dhruva_scratch_ptr[id] = dhruva_alloc_bytes((long)n);
         dhruva_scratch_len[id] = n;
     }
+    dhruva_crit_exit(crit);
     unsigned char *p = (unsigned char *)dhruva_scratch_ptr[id];
     for (long long i = 0; i < n; i++) p[i] = 0;
     return dhruva_scratch_ptr[id];
@@ -672,8 +722,7 @@ long dharafs_media_key_state_set(long v) { dharafs_media_key_state_v = (unsigned
 
 void *dhruva_alloc_stack_guarded(long n) {
     unsigned long need = (unsigned long)n;
-    unsigned long saved_cpsr;
-    __asm__ volatile ("mrs %0, cpsr\n\tcpsid i" : "=r"(saved_cpsr) :: "memory");
+    unsigned long crit = dhruva_crit_enter();
 
     unsigned long base = (unsigned long)dhruva_heap;
     unsigned long cur_abs = base + dhruva_heap_used;
@@ -690,7 +739,7 @@ void *dhruva_alloc_stack_guarded(long n) {
     unsigned char *usable_ptr = dhruva_heap + usable_offset;
     dhruva_heap_used = usable_offset + need;
     dhruva_alloc_count = dhruva_alloc_count + 1;
-    __asm__ volatile ("msr cpsr_c, %0" :: "r"(saved_cpsr) : "memory");
+    dhruva_crit_exit(crit);
 
     mmu_guard_page_install((unsigned long)guard_ptr);
     unsigned long i = 0;

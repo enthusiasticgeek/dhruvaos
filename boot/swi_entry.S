@@ -223,6 +223,12 @@ swi_entry_skip_usr_sp_capture:
     beq swi_do_uart_tx_ring
     cmp r7, #8
     beq swi_do_stack_cache
+    cmp r7, #9
+    beq swi_do_crit_enter
+    cmp r7, #10
+    beq swi_do_crit_exit
+    cmp r7, #11
+    beq swi_do_fatal_halt
     b swi_return_to_usr        /* unknown syscall number -- no-op,
                                * fall straight through to the restore
                                * rather than doing anything undefined */
@@ -300,6 +306,45 @@ swi_do_sd_drain_fifo:
 swi_do_stack_cache:
     bl dhruva_stack_cache_set_impl
     b swi_return_to_usr
+
+/* Syscalls #9/#10 (2026-11-27): a REAL critical section for USR-mode
+ * tasks. `cpsid` is a no-op in USR mode, so code that bracketed shared
+ * state with `mrs cpsr; cpsid i` (dhruva_alloc_bytes, ...) was not atomic
+ * when called from a task. These set/clear I+F in the caller's saved
+ * CPSR (usr_resume_spsr_table[current_task], restored by swi_return_to_
+ * usr's `msr spsr_cxsf`): the task resumes in USR mode with IRQ and FIQ
+ * masked -- the hardware honours I/F in USR, USR code just can't change
+ * them itself. #9 returns the previous I/F bits as the token for #10. */
+swi_do_crit_enter:
+    ldr r2, =current_task
+    ldr r2, [r2]
+    ldr r3, =usr_resume_spsr_table
+    ldr r1, [r3, r2, lsl #2]
+    and r0, r1, #0xC0
+    orr r1, r1, #0xC0
+    str r1, [r3, r2, lsl #2]
+    b swi_return_to_usr
+
+swi_do_crit_exit:
+    ldr r2, =current_task
+    ldr r2, [r2]
+    ldr r3, =usr_resume_spsr_table
+    ldr r1, [r3, r2, lsl #2]
+    bic r1, r1, #0xC0
+    and r0, r0, #0xC0
+    orr r1, r1, r0
+    str r1, [r3, r2, lsl #2]
+    mov r0, #0
+    b swi_return_to_usr
+
+/* Syscall #11: a USR task's panic/FATAL path cannot stop the system by
+ * itself (it can't mask interrupts, so the scheduler kept running other
+ * tasks). This halts in SVC with IRQ+FIQ masked: nothing else runs, so
+ * the last-resort watchdog the caller already armed fires. Never returns. */
+swi_do_fatal_halt:
+    cpsid if
+swi_fatal_halt_spin:
+    b swi_fatal_halt_spin
 
 /* Syscall #7 (2026-09-26): uart_tx_ring_push_and_drain -- see
  * boot/uart_tx_ring_state.S's own header comment for the full "why".
@@ -686,6 +731,32 @@ sdhost_drain_fifo_to_buffer:
     mov lr, r4
     pop {r4, r7}
     bx lr
+
+.global dhruva_swi_crit_enter
+dhruva_swi_crit_enter:
+    push {r4, r7}
+    mov r4, lr
+    mov r7, #9
+    swi #0
+    mov lr, r4
+    pop {r4, r7}
+    bx lr
+
+.global dhruva_swi_crit_exit
+dhruva_swi_crit_exit:
+    push {r4, r7}
+    mov r4, lr
+    mov r7, #10
+    swi #0
+    mov lr, r4
+    pop {r4, r7}
+    bx lr
+
+.global dhruva_swi_fatal_halt
+dhruva_swi_fatal_halt:
+    mov r7, #11
+    swi #0
+    b dhruva_swi_fatal_halt
 
 .global dhruva_stack_cache_set
 dhruva_stack_cache_set:
