@@ -41469,7 +41469,15 @@ fn task_e() -> i64 {
     // of 10 seconds apart. Reverts to the normal 20-tick cadence the
     // moment recovery completes -- this never changes compaction's own
     // behavior or cost.
-    let task_e_sleep_ticks: i64 = if dharafs_recovery_active_get() == (1 as u32) { 1 } else { 20 };
+    // 2026-11-27: also run every tick while reclaim is urgent -- log over 75%
+    // full, or a compaction pass mid-scan/mid-erase. Each dharafs_compact
+    // call still touches ONE block (unchanged per-call WCET); only the
+    // cadence rises, ~20x reclaim throughput exactly when space is needed.
+    // At 20 ticks a full 7600-block card took ~25 min to scan and as long
+    // again to erase, with every write failing ENOSPC meanwhile.
+    let log_used_blocks: u32 = dharafs_state_get_next_block() - dharafs_state_get_log_start();
+    let gc_urgent: i64 = if (log_used_blocks > ((dharafs_log_max_blk() * 3 / 4) as u32)) || (dharafs_compact_get_resume_block() != (0 as u32)) || (dharafs_gc_get_erase_cursor() != (0 as u32)) { 1 } else { 0 };
+    let task_e_sleep_ticks: i64 = if (dharafs_recovery_active_get() == (1 as u32)) || (gc_urgent == 1) { 1 } else { 20 };
     let _ = task_sleep_ticks(task_e_sleep_ticks);
     // 2026-10-23 (real-HW kernelupload-stream stall ROOT CAUSE, user
     // request: "scheduler should be smart enough to know precedence
@@ -46503,10 +46511,10 @@ fn shell_dispatch_dharafs_catchup() -> i64 {
       let _ = uart_put_hex32(dharafs_state_get_next_block());
       let _ = uart_puts("\n");
     }
-    if dharafs_compact_get_resume_block() == (0 as u32) {
-      // No pass left in progress -- either this call found nothing
-      // worth reclaiming (already caught up), or it just finished the
-      // one that was running. Either way, nothing more to do right now.
+    // 2026-11-27: also drive the ERASE phase. Stopping when resume_block
+    // hit 0 ended at the scan->erase handoff, before any space was
+    // reclaimed (real card: "pass complete", next_block unchanged).
+    if (dharafs_compact_get_resume_block() == (0 as u32)) && (dharafs_gc_get_erase_cursor() == (0 as u32)) {
       break;
     }
   }
@@ -46516,7 +46524,7 @@ fn shell_dispatch_dharafs_catchup() -> i64 {
   let _ = uart_put_hex32(dharafs_state_get_log_start());
   let _ = uart_puts(" next_block=");
   let _ = uart_put_hex32(dharafs_state_get_next_block());
-  if dharafs_compact_get_resume_block() == (0 as u32) {
+  if (dharafs_compact_get_resume_block() == (0 as u32)) && (dharafs_gc_get_erase_cursor() == (0 as u32)) {
     let _ = uart_puts(" (pass complete)\n");
   } else {
     let _ = uart_puts(" (pass NOT complete -- run 'catchup' again)\n");
