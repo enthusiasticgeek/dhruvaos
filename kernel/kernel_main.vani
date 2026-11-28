@@ -402,6 +402,8 @@ extern "C" fn dharafs_ecc_fast_state_set(v: u32) -> i64;
 extern "C" fn dharafs_ecc_fast_state_get() -> u32;
 extern "C" fn dharafs_cstat_get(i: u32) -> u32;
 extern "C" fn dharafs_cstat_set(i: u32, v: u32) -> i64;
+extern "C" fn dharafs_bb_persist_scratch_set(addr: mut ref i64) -> i64;
+extern "C" fn dharafs_bb_persist_scratch_get() -> mut ref i64;
 // 2026-11-27: option B -- data cache for task-stack pages (boot/rpi1/runtime_stubs.c).
 extern "C" fn dhruva_stack_cache_set(on: u32) -> u32;   // C long = 32-bit
 extern "C" fn dhruva_stack_cache_get() -> u32;
@@ -11891,7 +11893,14 @@ fn dharafs_badblock_bitmap_persist(extra_rotation: u32) -> i64 {
     return 0;
   }
   let ram: mut ref i64 = dharafs_badblock_bitmap_buf_get();
-  let sd_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  // 2026-11-27: one persistent scratch, allocated on first use -- this used
+  // to dhruva_alloc_bytes(512) on EVERY persist (never freed), i.e. on every
+  // append that cleared a marked block; the GC erase phase exhausted the
+  // whole 768 KB heap on real HW (FATAL out of memory).
+  if ptr_to_u32(dharafs_bb_persist_scratch_get()) == (0 as u32) {
+    let _ = dharafs_bb_persist_scratch_set(dhruva_alloc_bytes(512));
+  }
+  let sd_scratch: mut ref i64 = dharafs_bb_persist_scratch_get();
   let half: i64 = 0;
   while half < 2 {
     let ram_off: u32 = (half * (dharafs_badblock_bitmap_data_bytes_per_half() as i64)) as u32;
@@ -12319,6 +12328,26 @@ fn dharafs_suspect_classification_self_test() -> i64 {
 // common steady-state case (same boot, or Tier 1/2 skipping the full
 // scan entirely) never marked this block in the first place, so this
 // stays a free no-op for every ordinary append.
+// Clears the mark in RAM only (dirty); the caller persists the bitmap once
+// later. Used by the GC erase phase, which persists at erase completion --
+// clearing ~7400 marks with an immediate 2-block persist each cost two SD
+// writes per erased block.
+fn dharafs_badblock_clear_deferred(blk: i64) -> i64 {
+  if (blk < 0) || (blk >= 8192) {
+    return 0;
+  }
+  let ram: mut ref i64 = dharafs_badblock_bitmap_buf_get();
+  let byte_idx: u32 = (blk / 8) as u32;
+  let bit_idx: u32 = (blk % 8) as u32;
+  let b: u32 = buf_read_byte(ram, byte_idx);
+  let bit: u32 = (1 as u32) << bit_idx;
+  if (b & bit) != (0 as u32) {
+    let _ = buf_write_byte(ram, byte_idx, b & (bit ^ (0xFFFFFFFF as u32)));
+    let _ = dharafs_badblock_bitmap_dirty_set(1 as u32);
+  }
+  return 0;
+}
+
 fn dharafs_badblock_clear(blk: i64) -> i64 {
   if (blk < 0) || (blk >= 8192) {
     return 0;
@@ -14507,7 +14536,7 @@ fn dharafs_gc_erase_range_step(buf: mut ref i64, cursor: i64, target: i64) -> i6
     // log stayed full). The append paths already clear the mark before
     // writing; erase must too. A clean write + all-zero read-back proves
     // the block good; one that really fails is re-marked bad below.
-    let _ = dharafs_badblock_clear(c);
+    let _ = dharafs_badblock_clear_deferred(c);   // persisted once at erase completion
     let attempt: i64 = 0;
     let ok: i64 = 0;
     let why: i64 = 0;

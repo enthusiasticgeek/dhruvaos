@@ -3258,3 +3258,23 @@ dharafs_cstat_set:
     str r1, [r2, r0, lsl #2]
     mov r0, #0
     bx lr
+
+/* 2026-11-27: persistent 512-byte scratch for dharafs_badblock_bitmap_persist
+ * (it used to dhruva_alloc_bytes(512) on EVERY call -- a never-free leak per
+ * bitmap persist; the erase phase exhausted the 768 KB heap on real HW). */
+.section ".bss"
+.align 4
+dharafs_bb_persist_scratch_word:
+    .word 0
+.section ".text"
+.global dharafs_bb_persist_scratch_set
+dharafs_bb_persist_scratch_set:
+    ldr r1, =dharafs_bb_persist_scratch_word
+    str r0, [r1]
+    mov r0, #0
+    bx lr
+.global dharafs_bb_persist_scratch_get
+dharafs_bb_persist_scratch_get:
+    ldr r0, =dharafs_bb_persist_scratch_word
+    ldr r0, [r0]
+    bx lr
