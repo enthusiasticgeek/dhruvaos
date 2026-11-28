@@ -217,7 +217,17 @@ int dprintf(int fd, const char *fmt, ...) {
  * (don't arm) on any doubt. */
 extern unsigned int hardware_is_real_hw_get(void);
 
+/* 2026-11-27: set once a panic/FATAL has armed its last-resort reset.
+ * watchdog_kick() (kernel_main.vani) checks it and stops kicking: tasks
+ * run in USR mode, where the halting task cannot mask interrupts, so the
+ * scheduler kept running the OTHER tasks -- 74 watchdog_kick() call sites,
+ * each re-arming 15 s -- and the 2 s reset never fired (two real-HW halts,
+ * 2026-11-16 panic and 2026-11-27 out-of-memory FATAL, neither recovered). */
+static volatile unsigned int dhruva_fatal_halt_flag = 0;
+long dhruva_fatal_halt_get(void) { return (long)dhruva_fatal_halt_flag; }
+
 static void exit_panic_watchdog_arm(void) {
+    dhruva_fatal_halt_flag = 1;
     volatile unsigned int *pm_rstc = (volatile unsigned int *)0x2010001C;
     volatile unsigned int *pm_wdog = (volatile unsigned int *)0x20100024;
     unsigned int pm_password = 0x5A000000u;
@@ -626,6 +636,33 @@ long dhruva_stack_cache_set_impl(long on) {
 }
 
 long dhruva_stack_cache_get(void) { return (long)dhruva_stack_cache_on; }
+
+/* 2026-11-27: persistent per-call-site scratch. Runtime paths that called
+ * dhruva_alloc_bytes on EVERY call (this allocator never frees) leaked heap
+ * on every use: critical-config reads/writes (every tlsd accept, kernel-
+ * upload, wifi join), USB mass-storage block I/O, BLE GATT/L2CAP polls, DNS,
+ * several shell commands. Each such call site now owns a fixed slot id:
+ * allocated once on first use, zeroed on every use (callers may rely on
+ * the zero-filled memory a fresh bump allocation gave them). Every slot's
+ * site runs from a single task context, so a slot is never shared by two
+ * concurrent callers. Arguments are long long: vani passes i64 in register
+ * pairs. */
+#define DHRUVA_SCRATCH_SLOTS 64
+static void *dhruva_scratch_ptr[DHRUVA_SCRATCH_SLOTS];
+static long long dhruva_scratch_len[DHRUVA_SCRATCH_SLOTS];
+extern void *dhruva_alloc_bytes(long n);
+void *dhruva_scratch_slot(long long id, long long n) {
+    if (id < 0 || id >= DHRUVA_SCRATCH_SLOTS || n <= 0) {
+        return dhruva_alloc_bytes((long)n);   /* out of range: old behavior */
+    }
+    if (dhruva_scratch_ptr[id] == 0 || n > dhruva_scratch_len[id]) {
+        dhruva_scratch_ptr[id] = dhruva_alloc_bytes((long)n);
+        dhruva_scratch_len[id] = n;
+    }
+    unsigned char *p = (unsigned char *)dhruva_scratch_ptr[id];
+    for (long long i = 0; i < n; i++) p[i] = 0;
+    return dhruva_scratch_ptr[id];
+}
 
 void *dhruva_alloc_stack_guarded(long n) {
     unsigned long need = (unsigned long)n;

@@ -404,6 +404,8 @@ extern "C" fn dharafs_cstat_get(i: u32) -> u32;
 extern "C" fn dharafs_cstat_set(i: u32, v: u32) -> i64;
 extern "C" fn dharafs_bb_persist_scratch_set(addr: mut ref i64) -> i64;
 extern "C" fn dharafs_bb_persist_scratch_get() -> mut ref i64;
+extern "C" fn dhruva_fatal_halt_get() -> u32;   // C long = 32-bit
+extern "C" fn dhruva_scratch_slot(id: i64, n: i64) -> mut ref i64;
 // 2026-11-27: option B -- data cache for task-stack pages (boot/rpi1/runtime_stubs.c).
 extern "C" fn dhruva_stack_cache_set(on: u32) -> u32;   // C long = 32-bit
 extern "C" fn dhruva_stack_cache_get() -> u32;
@@ -7165,6 +7167,11 @@ fn watchdog_kick() -> i64 {
   // (tcpsink, the WiFi DHCP acquire) didn't and rebooted QEMU mid-test.
   // Centralizing the guard here makes that mistake impossible.
   if hardware_is_real_hw_get() != (1 as u32) {
+    return 0;
+  }
+  // 2026-11-27: a panic/FATAL armed a last-resort reset -- never kick it
+  // away (see dhruva_fatal_halt_flag in boot/rpi1/runtime_stubs.c).
+  if dhruva_fatal_halt_get() != (0 as u32) {
     return 0;
   }
   let fifteen_seconds_in_ticks: u32 = 983040 as u32;
@@ -24618,7 +24625,7 @@ fn dns_resolve(my_mac: mut ref i64, my_ip: u32, dns_server_ip: u32, hostname: mu
   if start_status != 0 {
     return 0 as u32;
   }
-  let resolved_scratch: mut ref i64 = dhruva_alloc_bytes(4);
+  let resolved_scratch: mut ref i64 = dhruva_scratch_slot(1, 4)   ;  // persistent slot 1 (was a per-call leak)
   let iter: i64 = 0;
   let resolved: i64 = 0;
   // 2026-10-23 (critical-section WCET audit, user request): was 20 --
@@ -30409,7 +30416,7 @@ fn critical_config_magic() -> u32 { return 0x43524346 as u32; } // "CRCF"
 // copies' generations before committing to a full 16-block read of
 // the chosen one.
 fn critical_config_header_generation(base_block: i64) -> i64 {
-  let hdr_buf: mut ref i64 = dhruva_alloc_bytes(512);
+  let hdr_buf: mut ref i64 = dhruva_scratch_slot(2, 512)   ;  // persistent slot 2 (was a per-call leak)
   let rd_status: i64 = sdhost_read_block(base_block, hdr_buf);
   if rd_status != 0 {
     return 0 - 1;
@@ -30462,7 +30469,7 @@ fn critical_config_table_load() -> i64 {
   // src,src_off,len) shape this codebase already uses everywhere
   // else a sub-buffer-at-an-offset is needed, e.g. dharafs_read_raw's
   // own multi-block assembly).
-  let block_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let block_scratch: mut ref i64 = dhruva_scratch_slot(3, 512)   ;  // persistent slot 3 (was a per-call leak)
   let blk: i64 = 0;
   while blk < critical_config_blocks_per_copy() {
     // 2026-11-08 (real-HW watchdog reset investigation): sdhost_write_
@@ -30507,7 +30514,7 @@ fn critical_config_table_load() -> i64 {
 // write safety" comment above for why that order matters.
 fn critical_config_table_flush_one_copy(base_block: i64, new_generation: u32) -> i64 {
   let table: mut ref i64 = critical_config_table_scratch_get();
-  let block_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let block_scratch: mut ref i64 = dhruva_scratch_slot(4, 512)   ;  // persistent slot 4 (was a per-call leak)
   let blk: i64 = 1;
   while blk < critical_config_blocks_per_copy() {
     // 2026-11-08: see critical_config_table_load's own matching kick
@@ -30531,7 +30538,7 @@ fn critical_config_table_flush_one_copy(base_block: i64, new_generation: u32) ->
   }
   let _ = buf_write_u32_be(table, 0, critical_config_magic());
   let _ = buf_write_u32_be(table, 4, new_generation);
-  let header_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let header_scratch: mut ref i64 = dhruva_scratch_slot(5, 512)   ;  // persistent slot 5 (was a per-call leak)
   let _ = ssh_copy(header_scratch, 0, table, 0, 512);
   let header_crc: u32 = kernelslot_crc32(header_scratch, 8);
   let _ = buf_write_u32_be(header_scratch, 8, header_crc);
@@ -30641,7 +30648,7 @@ fn critical_config_read_raw(key_buf: mut ref i64, key_len: i64, out_buf: mut ref
   let table: mut ref i64 = critical_config_table_scratch_get();
   let slot_off: i64 = slot * critical_config_slot_size();
   let stored_crc: u32 = buf_read_u32_be(table, slot_off + 52);
-  let crc_scratch: mut ref i64 = dhruva_alloc_bytes(52);
+  let crc_scratch: mut ref i64 = dhruva_scratch_slot(6, 52)   ;  // persistent slot 6 (was a per-call leak)
   let _ = ssh_copy(crc_scratch, 0, table, slot_off, 52);
   let computed_crc: u32 = kernelslot_crc32(crc_scratch, 52);
   if stored_crc != computed_crc {
@@ -30662,9 +30669,9 @@ fn critical_config_read_raw(key_buf: mut ref i64, key_len: i64, out_buf: mut ref
   let aad: mut ref i64 = critical_config_aad_scratch_get();
   let _ = buf_write_u32_be(aad, 0, 0 as u32);
   let _ = buf_write_u32_be(aad, 4, slot as u32);
-  let value_scratch: mut ref i64 = dhruva_alloc_bytes(200);
+  let value_scratch: mut ref i64 = dhruva_scratch_slot(7, 200)   ;  // persistent slot 7 (was a per-call leak)
   let _ = ssh_copy(value_scratch, 0, table, slot_off + 56, value_len);
-  let tag_scratch: mut ref i64 = dhruva_alloc_bytes(16);
+  let tag_scratch: mut ref i64 = dhruva_scratch_slot(8, 16)   ;  // persistent slot 8 (was a per-call leak)
   let _ = ssh_copy(tag_scratch, 0, table, slot_off + 36, 16);
   let key: mut ref i64 = critical_config_crypto_key_get();
   let dec_status: i64 = chacha20_poly1305_decrypt_heap(key, nonce, aad, 8, value_scratch, value_len, tag_scratch, out_buf);
@@ -30720,8 +30727,8 @@ fn critical_config_write_raw(key_buf: mut ref i64, key_len: i64, value_buf: mut 
     let aad: mut ref i64 = critical_config_aad_scratch_get();
     let _ = buf_write_u32_be(aad, 0, 0 as u32);
     let _ = buf_write_u32_be(aad, 4, slot as u32);
-    let cipher_scratch: mut ref i64 = dhruva_alloc_bytes(200);
-    let tag_scratch: mut ref i64 = dhruva_alloc_bytes(16);
+    let cipher_scratch: mut ref i64 = dhruva_scratch_slot(9, 200)   ;  // persistent slot 9 (was a per-call leak)
+    let tag_scratch: mut ref i64 = dhruva_scratch_slot(10, 16)   ;  // persistent slot 10 (was a per-call leak)
     let key: mut ref i64 = critical_config_crypto_key_get();
     let _ = chacha20_poly1305_encrypt_heap(key, nonce, aad, 8, value_buf, value_len, cipher_scratch, tag_scratch);
     let _ = ssh_copy(table, slot_off + 56, cipher_scratch, 0, value_len);
@@ -30731,7 +30738,7 @@ fn critical_config_write_raw(key_buf: mut ref i64, key_len: i64, value_buf: mut 
   let flags: u32 = (1 as u32) | (if encrypted != (0 as u32) { 2 as u32 } else { 0 as u32 });
   let _ = buf_write_u32_be(table, slot_off + 24, flags);
   let _ = buf_write_u32_be(table, slot_off + 28, value_len as u32);
-  let crc_scratch: mut ref i64 = dhruva_alloc_bytes(52);
+  let crc_scratch: mut ref i64 = dhruva_scratch_slot(11, 52)   ;  // persistent slot 11 (was a per-call leak)
   let _ = ssh_copy(crc_scratch, 0, table, slot_off, 52);
   let record_crc: u32 = kernelslot_crc32(crc_scratch, 52);
   let _ = buf_write_u32_be(table, slot_off + 52, record_crc);
@@ -37245,7 +37252,7 @@ fn l2cap_sig_recv(devaddr: u32, mps: u32, out_sig_pdu: mut ref i64) -> i64 {
 // normal receive-dispatch-respond cycle, -1 if nothing was waiting or
 // it wasn't a Connection Parameter Update Request.
 fn l2cap_sig_poll(devaddr: u32, mps: u32, conn_handle: u32) -> i64 {
-  let req: mut ref i64 = dhruva_alloc_bytes(256);
+  let req: mut ref i64 = dhruva_scratch_slot(12, 256)   ;  // persistent slot 12 (was a per-call leak)
   let req_len: i64 = l2cap_sig_recv(devaddr, mps, req);
   if req_len < 0 {
     return 0 - 1;
@@ -37255,7 +37262,7 @@ fn l2cap_sig_poll(devaddr: u32, mps: u32, conn_handle: u32) -> i64 {
     return 0 - 1;
   }
   let identifier: u32 = l2cap_sig_get_identifier(req);
-  let rsp: mut ref i64 = dhruva_alloc_bytes(6);
+  let rsp: mut ref i64 = dhruva_scratch_slot(13, 6)   ;  // persistent slot 13 (was a per-call leak)
   let rsp_len: i64 = l2cap_build_conn_param_update_response(rsp, identifier, l2cap_conn_param_update_result_accepted());
   let send_status: i64 = l2cap_sig_send(devaddr, mps, conn_handle, rsp, rsp_len);
   if send_status != 0 {
@@ -37697,7 +37704,7 @@ fn gatt_client_find_char_index_for_value_handle(handle: u32) -> i64 {
 // signature. Returns -1 if nothing was waiting or it wasn't a
 // Notification/Indication.
 fn gatt_client_poll_notifications(devaddr: u32, mps: u32, conn_handle: u32, out_value: mut ref i64) -> i64 {
-  let pdu: mut ref i64 = dhruva_alloc_bytes(256);
+  let pdu: mut ref i64 = dhruva_scratch_slot(14, 256)   ;  // persistent slot 14 (was a per-call leak)
   let pdu_len: i64 = gatt_att_recv(devaddr, mps, pdu);
   if pdu_len < 0 {
     return 0 - 1;
@@ -37711,7 +37718,7 @@ fn gatt_client_poll_notifications(devaddr: u32, mps: u32, conn_handle: u32, out_
   let value_len: i64 = att_handle_value_get_value(pdu, pdu_len, out_value);
   let _ = gatt_last_notify_handle_set(handle);
   if is_indication == 1 {
-    let conf: mut ref i64 = dhruva_alloc_bytes(1);
+    let conf: mut ref i64 = dhruva_scratch_slot(15, 1)   ;  // persistent slot 15 (was a per-call leak)
     let conf_len: i64 = att_build_handle_value_confirmation(conf);
     let _ = gatt_att_send(devaddr, mps, conn_handle, conf, conf_len);
   }
@@ -38077,12 +38084,12 @@ fn gatt_server_handle_request(req: mut ref i64, req_len: i64, out_rsp: mut ref i
 // loop for as long as the connection stays open, same shape as this
 // project's own other poll-style drivers (usb_bt_poll, ...).
 fn gatt_server_poll(devaddr: u32, mps: u32, conn_handle: u32) -> i64 {
-  let req: mut ref i64 = dhruva_alloc_bytes(256);
+  let req: mut ref i64 = dhruva_scratch_slot(16, 256)   ;  // persistent slot 16 (was a per-call leak)
   let req_len: i64 = gatt_att_recv(devaddr, mps, req);
   if req_len < 0 {
     return 0 - 1;
   }
-  let rsp: mut ref i64 = dhruva_alloc_bytes(256);
+  let rsp: mut ref i64 = dhruva_scratch_slot(17, 256)   ;  // persistent slot 17 (was a per-call leak)
   let rsp_len: i64 = gatt_server_handle_request(req, req_len, rsp);
   let send_status: i64 = gatt_att_send(devaddr, mps, conn_handle, rsp, rsp_len);
   if send_status != 0 {
@@ -38956,7 +38963,7 @@ fn usb_msd_scsi_command(devaddr: u32, cdb: mut ref i64, cdb_len: i64, tag: u32, 
   let out_mps: u32 = usb_msd_get_bulk_out_mps();
   let in_mps: u32 = usb_msd_get_bulk_in_mps();
   let flags: u32 = if (data_len > (0 as u32)) && (is_write == 0) { 0x80 as u32 } else { 0 as u32 }; // bit7: IN
-  let cbw: mut ref i64 = dhruva_alloc_bytes(31);
+  let cbw: mut ref i64 = dhruva_scratch_slot(18, 31)   ;  // persistent slot 18 (was a per-call leak)
   let _ = bot_build_cbw(cbw, tag, data_len, flags, cdb_len as u32, cdb, cdb_len);
   let out_status: i64 = dwc2_bulk_out(devaddr, out_mps, cbw, 31);
   if out_status != 0 {
@@ -38980,7 +38987,7 @@ fn usb_msd_scsi_command(devaddr: u32, cdb: mut ref i64, cdb_len: i64, tag: u32, 
     }
   }
 
-  let csw: mut ref i64 = dhruva_alloc_bytes(13);
+  let csw: mut ref i64 = dhruva_scratch_slot(19, 13)   ;  // persistent slot 19 (was a per-call leak)
   let in_status: i64 = dwc2_bulk_in(devaddr, in_mps, csw, 13);
   if in_status != (13 as i64) {
     let _ = uart_puts("USB: BOT CSW receive failed\n");
@@ -39128,7 +39135,7 @@ fn usb_msd_read_capacity10(devaddr: u32) -> i64 {
 // usb_bulk_data_scratch's real 512-byte capacity (round 34's CDB/CSW
 // traffic never exceeded 64 bytes).
 fn usb_msd_read10(devaddr: u32, lba: u32, out_data: mut ref i64) -> i64 {
-  let cdb: mut ref i64 = dhruva_alloc_bytes(10);
+  let cdb: mut ref i64 = dhruva_scratch_slot(20, 10)   ;  // persistent slot 20 (was a per-call leak)
   let _ = buf_write_byte(cdb, 0 as u32, 0x28 as u32); // READ(10)
   let _ = buf_write_u32_be(cdb, 2, lba);
   let _ = buf_write_u16_be(cdb, 7, 1 as u32); // transfer length: 1 block
@@ -39147,7 +39154,7 @@ fn usb_msd_read10(devaddr: u32, lba: u32, out_data: mut ref i64) -> i64 {
 // READ(10) above, same one-512-byte-block scope, data stage direction
 // flipped to OUT (usb_msd_scsi_command's is_write=1 path).
 fn usb_msd_write10(devaddr: u32, lba: u32, data: mut ref i64) -> i64 {
-  let cdb: mut ref i64 = dhruva_alloc_bytes(10);
+  let cdb: mut ref i64 = dhruva_scratch_slot(21, 10)   ;  // persistent slot 21 (was a per-call leak)
   let _ = buf_write_byte(cdb, 0 as u32, 0x2A as u32); // WRITE(10)
   let _ = buf_write_u32_be(cdb, 2, lba);
   let _ = buf_write_u16_be(cdb, 7, 1 as u32);
@@ -43644,7 +43651,7 @@ fn shell_dispatch_wifikey(line_buf: mut ref i64, cmd_end: i64, line_len: i64) ->
     }
 
     let raw_base: i64 = rtl8188cu_fw_raw_sd_base_block();
-    let raw_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+    let raw_scratch: mut ref i64 = dhruva_scratch_slot(22, 512)   ;  // persistent slot 22 (was a per-call leak)
     let raw_blk: i64 = 0;
     let raw_wr_status: i64 = 0;
     while raw_blk < raw_block_count {
@@ -46247,9 +46254,9 @@ fn shell_dispatch_critconfig(line_buf: mut ref i64, cmd_end: i64, line_len: i64)
       let _ = uart_puts("critconfig: key must be 1-24 characters\n");
       return 0;
     }
-    let key_buf: mut ref i64 = dhruva_alloc_bytes(24);
+    let key_buf: mut ref i64 = dhruva_scratch_slot(23, 24)   ;  // persistent slot 23 (was a per-call leak)
     let _ = shell_copy_range(line_buf, key_start, key_end, key_buf);
-    let out_buf: mut ref i64 = dhruva_alloc_bytes(200);
+    let out_buf: mut ref i64 = dhruva_scratch_slot(24, 200)   ;  // persistent slot 24 (was a per-call leak)
     let read_len: i64 = critical_config_read_raw(key_buf, key_len, out_buf);
     if read_len == (0 - 1) {
       let _ = uart_puts("critconfig: not found\n");
@@ -46288,7 +46295,7 @@ fn shell_dispatch_critconfig(line_buf: mut ref i64, cmd_end: i64, line_len: i64)
       let _ = uart_puts("usage: critconfig set <key> <value> [--encrypted]\n");
       return 0;
     }
-    let key_buf: mut ref i64 = dhruva_alloc_bytes(24);
+    let key_buf: mut ref i64 = dhruva_scratch_slot(25, 24)   ;  // persistent slot 25 (was a per-call leak)
     let _ = shell_copy_range(line_buf, key_start, key_end, key_buf);
     let value_start: i64 = key_end + 1;
     let value_end: i64 = line_len;
@@ -46310,7 +46317,7 @@ fn shell_dispatch_critconfig(line_buf: mut ref i64, cmd_end: i64, line_len: i64)
       let _ = uart_puts("critconfig: value must be 0-200 characters\n");
       return 0;
     }
-    let value_buf: mut ref i64 = dhruva_alloc_bytes(200);
+    let value_buf: mut ref i64 = dhruva_scratch_slot(26, 200)   ;  // persistent slot 26 (was a per-call leak)
     let _ = shell_copy_range(line_buf, value_start, value_end, value_buf);
     let status: i64 = critical_config_write_raw(key_buf, key_len, value_buf, value_len, encrypted);
     if status == 0 {
@@ -47075,7 +47082,7 @@ fn shell_dispatch_hid(line_buf: mut ref i64, cmd_end: i64, line_len: i64) -> i64
       return 0;
     }
     let mps: u32 = usb_hid_get_intr_in_mps();
-    let report: mut ref i64 = dhruva_alloc_bytes(8);
+    let report: mut ref i64 = dhruva_scratch_slot(27, 8)   ;  // persistent slot 27 (was a per-call leak)
     let tries: i64 = 0;
     let got_len: i64 = 0 - 1;
     while (tries < 20) && (got_len < 0) {
@@ -47845,7 +47852,7 @@ fn shell_dispatch() -> i64 {
         let _ = uart_puts("(not found)\n");
         return 0;
       }
-      let cap_buf: mut ref i64 = dhruva_alloc_bytes(256);
+      let cap_buf: mut ref i64 = dhruva_scratch_slot(28, 256)   ;  // persistent slot 28 (was a per-call leak)
       let cap_len: i64 = dhdl_call_by_id_captured(name_id, cap_buf, 256 as u32);
       let _ = dharafs_print_data(cap_buf, cap_len);
       let _ = uart_puts("\n");
