@@ -7603,7 +7603,17 @@ fn sd_read_scr(rca: u32) -> i64 {
   let sdcmd_read: u32 = 0x40 as u32;
   let fsm_readwait: u32 = 4 as u32;
 
-  let _ = sd_mmio_write_u32(SDHCFG, 0x418 as u32);
+  // 2026-11-28: 0x40A = WIDE_INT_BUS|SLOW_CARD|BUSY_IRPT_EN -- exactly the
+  // real-HW-proven 1-bit value sdhost_read_block_once and stage0 already use
+  // (stage0's "FIXED vs. the original port" note; this path never got it).
+  // WIDE_INT_BUS (0x2) is what Linux bcm2835 always sets. With
+  // it clear (0x418) the FIFO took ONE WORD PER BYTE, so the 8-byte SCR
+  // filled 8 words, the drain took 2, and 6 stale words stayed in the
+  // FIFO: the kernel's first block read of every boot then returned SCR
+  // bytes with success (real HW: ECC marker "missing", table wiped every
+  // boot). The 4-bit parser reads bytes 0..3 in arrival order, which is
+  // only right with 4 bytes per word.
+  let _ = sd_mmio_write_u32(SDHCFG, 0x40A as u32);
   let _ = sd_mmio_write_u32(sdhbct, 8 as u32);
   let _ = sd_mmio_write_u32(sdhblc, 1 as u32);
 
@@ -7678,6 +7688,12 @@ fn sd_read_scr(rca: u32) -> i64 {
   let _ = sd_scr_drain_diag(scr_buf);
   let edm_after_pio: u32 = sd_mmio_read_u32(SDEDM);
   let wait_status: i64 = sdhost_wait_transfer_complete(fsm_readwait);
+  let scr_stale: i64 = sdhost_fifo_discard_stale();
+  if scr_stale != 0 {
+    let _ = uart_puts("SD: SCR read left ");
+    let _ = uart_put_i64(scr_stale);
+    let _ = uart_puts(" extra FIFO word(s) -- discarded\n");
+  }
   let errs: u32 = sd_mmio_read_u32(sdhsts) & (0xF8 as u32);
   let _ = sd_mmio_write_u32(sdhsts, errs);
   if wait_status != 0 {
@@ -8968,6 +8984,35 @@ const SD_SPEED_BACKOFF_HZ: i64 = 500000;
 // named, documented hardware errata match for every real-hardware
 // symptom observed so far -- not yet confirmed by a real-hardware log
 // with this fix in place.
+// Invariant for every data transfer: the FIFO is empty when the command is
+// issued, so no transfer can return (or write) another transfer's words.
+// Returns the number of stale words discarded (0 normally); bounded by the
+// 16-word physical FIFO plus margin.
+fn sdhost_fifo_discard_stale() -> i64 {
+  let n: i64 = 0;
+  while n < 32 {
+    let fill: u32 = (sd_mmio_read_u32(SDEDM) >> (4 as u32)) & (0x1F as u32);
+    if fill == (0 as u32) { return n; }
+    let _ = sd_mmio_read_u32(SDDATA);
+    n = n + 1;
+  }
+  return n;
+}
+
+fn sdhost_fifo_check_before(what: Str, block_num: i64) -> i64 {
+  let stale: i64 = sdhost_fifo_discard_stale();
+  if stale != 0 {
+    let _ = uart_puts("SD: ");
+    let _ = uart_put_i64(stale);
+    let _ = uart_puts(" stale FIFO word(s) discarded before ");
+    let _ = uart_puts(what);
+    let _ = uart_puts(" of block ");
+    let _ = uart_put_i64(block_num);
+    let _ = uart_puts("\n");
+  }
+  return stale;
+}
+
 fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let sdhbct: i64 = SDHBCT;
   let sdhblc: i64 = SDHBLC;
@@ -8976,6 +9021,7 @@ fn sdhost_read_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_readwait: u32 = 4 as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
+  let _ = sdhost_fifo_check_before("CMD17", block_num);
   // 34th SD round follow-up (2026-09-26): read-side half of the same
   // fix -- see sdhost_write_block_once's own matching comment for the
   // full "why" (real U-Boot reissues CMD16/SET_BLOCKLEN before every
@@ -9483,6 +9529,7 @@ fn sdhost_write_block_once(block_num: i64, buf: mut ref i64) -> i64 {
   let fsm_writestart1: u32 = 0xA as u32;
 
   let addr: u32 = sdhost_card_addr(block_num);
+  let _ = sdhost_fifo_check_before("CMD24", block_num);
   // 38th SD round follow-up (2026-09-27): a temporary diagnostic print
   // right here (block_num/is_sdhc/addr) previously confirmed via a
   // real-HW trace (picocom_20260927_084408.log) that sd_state_get_
@@ -11133,7 +11180,7 @@ fn dharafs_dirindex_snapshot_persist(generation: u32) -> i64 {
 // every slot invalid and dharafs_find_latest_block_raw's own miss
 // path always falls back to a real scan regardless.
 fn dharafs_dirindex_snapshot_load(expect_generation: u32) -> i64 {
-  let header: mut ref i64 = dhruva_alloc_bytes(512);
+  let header: mut ref i64 = dhruva_scratch_slot(32, 512);   // shared with persist (never nested); was a per-call leak
   if sdhost_read_block(dharafs_dirindex_snapshot_header_block(), header) != 0 { return 0; }
   if buf_read_u32(header, 0 as u32) != (0x44584932 as u32) { return 0; }   // not "DXI2" (incl. the old format)
   if buf_read_u32(header, 4 as u32) != expect_generation { return 0; }
@@ -11145,7 +11192,7 @@ fn dharafs_dirindex_snapshot_load(expect_generation: u32) -> i64 {
   let count: i64 = buf_read_u32(header, 12 as u32) as i64;
   let per_blk: i64 = dharafs_dirindex_snapshot_entries_per_block();
   if (count < 0) || (count > per_blk * dharafs_dirindex_snapshot_v2_blocks()) { return 0; }
-  let scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let scratch: mut ref i64 = dhruva_scratch_slot(31, 512);   // shared with persist (never nested); was a per-call leak
   let loaded: i64 = 0;
   let blk: i64 = 0;
   while loaded < count {
@@ -11848,7 +11895,7 @@ fn dharafs_log_max_blk() -> i64 { return 7600; }
 // (re-discovering what was already known), never incorrect behavior.
 fn dharafs_badblock_bitmap_load() -> i64 {
   let ram: mut ref i64 = dharafs_badblock_bitmap_buf_get();
-  let sd_scratch: mut ref i64 = dhruva_alloc_bytes(512);
+  let sd_scratch: mut ref i64 = dhruva_scratch_slot(33, 512);   // was a per-init leak (fsrepair re-inits)
   let half: i64 = 0;
   while half < 2 {
     let ram_off: u32 = (half * (dharafs_badblock_bitmap_data_bytes_per_half() as i64)) as u32;
